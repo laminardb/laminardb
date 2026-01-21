@@ -1,0 +1,66 @@
+[workspace]
+members = [
+    "crates/laminar-core",
+    "crates/laminar-sql",
+    "crates/laminar-storage",
+    "crates/laminar-connectors",
+    "crates/laminar-auth",
+    "crates/laminar-admin",
+    "crates/laminar-observe",
+    "crates/laminar-server",
+]
+resolver = "2"
+
+[workspace.package]
+version = "0.1.0"
+authors = ["LaminarDB Contributors"]
+edition = "2021"
+license = "Apache-2.0"
+repository = "https://github.com/laminardb/laminardb"
+homepage = "https://laminardb.io"
+documentation = "https://docs.laminardb.io"
+readme = "README.md"
+keywords = ["streaming", "database", "sql", "embedded", "real-time"]
+categories = ["database", "embedded", "data-structures"]
+
+[workspace.dependencies]
+# Core dependencies
+tokio = { version = "1.35", features = ["full"] }
+async-trait = "0.1"
+serde = { version = "1.0", features = ["derive"] }
+serde_json = "1.0"
+bincode = "1.3"
+bytes = "1.5"
+thiserror = "1.0"
+anyhow = "1.0"
+tracing = "0.1"
+tracing-subscriber = { version = "0.3", features = ["env-filter"] }
+
+# Performance-critical
+fxhash = "0.2"  # Faster than std HashMap
+crossbeam = "0.8"  # Lock-free data structures
+parking_lot = "0.12"  # Faster Mutex/RwLock
+
+# DataFusion and Arrow - temporarily disabled due to arrow-arith compilation issue
+# arrow = "52.0"
+# arrow-array = "52.0"
+# arrow-schema = "52.0"
+# datafusion = "39.0"
+# datafusion-common = "39.0"
+# datafusion-expr = "39.0"
+# datafusion-sql = "39.0"
+
+# Testing
+criterion = { version = "0.5", features = ["html_reports"] }
+proptest = "1.4"
+tempfile = "3.8"
+
+[profile.release]
+lto = "fat"
+codegen-units = 1
+opt-level = 3
+debug = false
+
+[profile.bench]
+inherits = "release"
+debug = true

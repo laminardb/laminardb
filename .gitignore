@@ -1,0 +1,51 @@
+# Rust
+/target/
+**/*.rs.bk
+Cargo.lock
+
+# IDE
+.idea/
+.vscode/
+*.swp
+*.swo
+*~
+
+# OS
+.DS_Store
+Thumbs.db
+
+# Benchmarks
+/target/criterion/
+
+# Test data
+*.test
+test-data/
+
+# Logs
+*.log
+
+# Environment
+.env
+.env.local
+
+# Build artifacts
+dist/
+build/
+
+# Documentation
+/target/doc/
+
+# Temporary files
+*.tmp
+tmp/
+
+# Coverage
+tarpaulin-report.html
+cobertura.xml
+coverage/
+
+# LaminarDB specific
+laminardb.toml
+data/
+checkpoints/
+wal/

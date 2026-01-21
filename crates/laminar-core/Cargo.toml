@@ -1,0 +1,55 @@
+[package]
+name = "laminar-core"
+version.workspace = true
+authors.workspace = true
+edition.workspace = true
+license.workspace = true
+repository.workspace = true
+homepage.workspace = true
+documentation = "https://docs.laminardb.io/laminar-core"
+description = "Core streaming engine for LaminarDB - reactor, operators, and state management"
+
+[dependencies]
+# Performance critical - no allocations on hot path
+fxhash = { workspace = true }
+crossbeam = { workspace = true }
+parking_lot = { workspace = true }
+bytes = { workspace = true }
+
+# Arrow for columnar data - temporarily disabled
+# arrow = { workspace = true }
+# arrow-array = { workspace = true }
+# arrow-schema = { workspace = true }
+
+# Error handling
+thiserror = { workspace = true }
+anyhow = { workspace = true }
+
+# Serialization for state
+bincode = { workspace = true }
+serde = { workspace = true }
+
+# Async for Ring 1 communication
+tokio = { workspace = true, features = ["sync", "time"] }
+async-trait = { workspace = true }
+
+# Observability
+tracing = { workspace = true }
+
+[dev-dependencies]
+criterion = { workspace = true }
+proptest = { workspace = true }
+tokio = { workspace = true, features = ["test-util", "macros"] }
+tempfile = { workspace = true }
+
+[[bench]]
+name = "reactor_bench"
+harness = false
+
+[[bench]]
+name = "state_bench"
+harness = false
+
+[[bench]]
+name = "throughput_bench"
+harness = false

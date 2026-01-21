@@ -1,0 +1,44 @@
+[package]
+name = "laminar-sql"
+version.workspace = true
+authors.workspace = true
+edition.workspace = true
+license.workspace = true
+repository.workspace = true
+homepage.workspace = true
+documentation = "https://docs.laminardb.io/laminar-sql"
+description = "SQL layer for LaminarDB with streaming extensions"
+
+[dependencies]
+# Core dependency
+laminar-core = { path = "../laminar-core" }
+
+# DataFusion for SQL processing - temporarily disabled
+# datafusion = { workspace = true }
+# datafusion-common = { workspace = true }
+# datafusion-expr = { workspace = true }
+# datafusion-sql = { workspace = true }
+
+# Arrow for columnar data - temporarily disabled
+# arrow = { workspace = true }
+# arrow-array = { workspace = true }
+# arrow-schema = { workspace = true }
+
+# SQL parsing
+sqlparser = "0.43"
+
+# Error handling
+thiserror = { workspace = true }
+anyhow = { workspace = true }
+
+# Async
+tokio = { workspace = true }
+async-trait = { workspace = true }
+
+# Observability
+tracing = { workspace = true }
+
+[dev-dependencies]
+criterion = { workspace = true }
+proptest = { workspace = true }
+tokio = { workspace = true, features = ["test-util", "macros"] }

@@ -1,0 +1,31 @@
+[package]
+name = "laminar-admin"
+version.workspace = true
+authors.workspace = true
+edition.workspace = true
+license.workspace = true
+repository.workspace = true
+homepage.workspace = true
+documentation = "https://docs.laminardb.io/laminar-admin"
+description = "Administration interface for LaminarDB"
+
+[dependencies]
+# Web framework
+axum = "0.7"
+tower = "0.4"
+tower-http = { version = "0.5", features = ["fs", "cors"] }
+
+# API documentation
+utoipa = { version = "4.1", features = ["axum_extras"] }
+utoipa-swagger-ui = { version = "6.0", features = ["axum"] }
+
+# Common
+tokio = { workspace = true }
+async-trait = { workspace = true }
+serde = { workspace = true }
+serde_json = { workspace = true }
+thiserror = { workspace = true }
+tracing = { workspace = true }
+
+[dev-dependencies]
+tower = { version = "0.4", features = ["util"] }

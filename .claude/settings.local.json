@@ -1,0 +1,12 @@
+{
+  "permissions": {
+    "allow": [
+      "Bash(for crate in laminar-storage laminar-connectors laminar-auth laminar-admin laminar-observe laminar-server)",
+      "Bash(do mkdir -p crates/$crate/src)",
+      "Bash(done)",
+      "Bash(cargo check:*)",
+      "Bash(cargo test:*)",
+      "Bash(git add:*)"
+    ]
+  }
+}

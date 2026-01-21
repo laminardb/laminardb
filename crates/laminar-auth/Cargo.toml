@@ -1,0 +1,28 @@
+[package]
+name = "laminar-auth"
+version.workspace = true
+authors.workspace = true
+edition.workspace = true
+license.workspace = true
+repository.workspace = true
+homepage.workspace = true
+documentation = "https://docs.laminardb.io/laminar-auth"
+description = "Authentication and authorization for LaminarDB"
+
+[dependencies]
+# JWT support
+jsonwebtoken = "9.2"
+
+# Cryptography
+ring = "0.17"
+
+# Common
+tokio = { workspace = true }
+async-trait = { workspace = true }
+serde = { workspace = true }
+serde_json = { workspace = true }
+thiserror = { workspace = true }
+tracing = { workspace = true }
+
+[dev-dependencies]
+tempfile = { workspace = true }

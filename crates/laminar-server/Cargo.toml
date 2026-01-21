@@ -1,0 +1,44 @@
+[package]
+name = "laminar-server"
+version.workspace = true
+authors.workspace = true
+edition.workspace = true
+license.workspace = true
+repository.workspace = true
+homepage.workspace = true
+documentation = "https://docs.laminardb.io/laminar-server"
+description = "Standalone server binary for LaminarDB"
+
+[[bin]]
+name = "laminardb"
+path = "src/main.rs"
+
+[dependencies]
+# All LaminarDB crates
+laminar-core = { path = "../laminar-core" }
+laminar-sql = { path = "../laminar-sql" }
+laminar-storage = { path = "../laminar-storage" }
+laminar-connectors = { path = "../laminar-connectors" }
+laminar-auth = { path = "../laminar-auth" }
+laminar-admin = { path = "../laminar-admin" }
+laminar-observe = { path = "../laminar-observe" }
+
+# CLI and configuration
+clap = { version = "4.5", features = ["derive", "env"] }
+config = "0.14"
+directories = "5.0"
+
+# Async runtime
+tokio = { workspace = true, features = ["full"] }
+
+# Logging
+tracing = { workspace = true }
+tracing-subscriber = { workspace = true }
+
+# Error handling
+anyhow = { workspace = true }
+
+# Serialization
+serde = { workspace = true }
+serde_json = { workspace = true }
+toml = "0.8"

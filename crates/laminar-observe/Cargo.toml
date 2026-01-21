@@ -1,0 +1,30 @@
+[package]
+name = "laminar-observe"
+version.workspace = true
+authors.workspace = true
+edition.workspace = true
+license.workspace = true
+repository.workspace = true
+homepage.workspace = true
+documentation = "https://docs.laminardb.io/laminar-observe"
+description = "Observability for LaminarDB - metrics, tracing, health checks"
+
+[dependencies]
+# Metrics
+prometheus = "0.13"
+opentelemetry = "0.21"
+opentelemetry-prometheus = "0.14"
+
+# Tracing
+tracing = { workspace = true }
+tracing-opentelemetry = "0.22"
+
+# Health checks
+axum = "0.7"
+
+# Common
+tokio = { workspace = true }
+async-trait = { workspace = true }
+serde = { workspace = true }
+serde_json = { workspace = true }
+thiserror = { workspace = true }

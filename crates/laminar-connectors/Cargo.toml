@@ -1,0 +1,39 @@
+[package]
+name = "laminar-connectors"
+version.workspace = true
+authors.workspace = true
+edition.workspace = true
+license.workspace = true
+repository.workspace = true
+homepage.workspace = true
+documentation = "https://docs.laminardb.io/laminar-connectors"
+description = "External system connectors for LaminarDB - Kafka, CDC, lookup tables"
+
+[dependencies]
+# Core dependencies
+laminar-core = { path = "../laminar-core" }
+laminar-storage = { path = "../laminar-storage" }
+
+# Kafka
+rdkafka = { version = "0.36", optional = true }
+
+# Database drivers for CDC
+tokio-postgres = { version = "0.7", optional = true }
+mysql_async = { version = "0.34", optional = true }
+
+# Common
+tokio = { workspace = true }
+async-trait = { workspace = true }
+serde = { workspace = true }
+serde_json = { workspace = true }
+thiserror = { workspace = true }
+tracing = { workspace = true }
+
+[features]
+default = []
+kafka = ["dep:rdkafka"]
+postgres-cdc = ["dep:tokio-postgres"]
+mysql-cdc = ["dep:mysql_async"]
+
+[dev-dependencies]
+tempfile = { workspace = true }

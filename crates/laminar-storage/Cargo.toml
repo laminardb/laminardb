@@ -1,0 +1,45 @@
+[package]
+name = "laminar-storage"
+version.workspace = true
+authors.workspace = true
+edition.workspace = true
+license.workspace = true
+repository.workspace = true
+homepage.workspace = true
+documentation = "https://docs.laminardb.io/laminar-storage"
+description = "Storage layer for LaminarDB - WAL, checkpointing, and lakehouse integration"
+
+[dependencies]
+# Core dependency
+laminar-core = { path = "../laminar-core" }
+
+# Storage
+rocksdb = { version = "0.21", optional = true }
+object_store = "0.9"  # For cloud storage
+# parquet = "52.0"  # For lakehouse formats - temporarily disabled
+delta_kernel = { version = "0.1", optional = true }  # Delta Lake
+
+# Serialization
+bincode = { workspace = true }
+serde = { workspace = true }
+bytes = { workspace = true }
+
+# Async
+tokio = { workspace = true }
+async-trait = { workspace = true }
+
+# Error handling
+thiserror = { workspace = true }
+anyhow = { workspace = true }
+
+# Observability
+tracing = { workspace = true }
+
+[features]
+default = ["rocksdb"]
+rocksdb = ["dep:rocksdb"]
+delta = ["dep:delta_kernel"]
+
+[dev-dependencies]
+tempfile = { workspace = true }
+criterion = { workspace = true }
