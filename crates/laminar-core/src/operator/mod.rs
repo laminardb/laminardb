@@ -17,7 +17,7 @@ use arrow_array::RecordBatch;
 pub struct Event {
     /// Timestamp of the event
     pub timestamp: i64,
-    /// Event payload as Arrow RecordBatch
+    /// Event payload as Arrow `RecordBatch`
     pub data: RecordBatch,
 }
 
@@ -60,6 +60,11 @@ pub trait Operator: Send {
     fn checkpoint(&self) -> OperatorState;
 
     /// Restore from a checkpoint
+    ///
+    /// # Errors
+    ///
+    /// Returns `OperatorError::StateAccessFailed` if the state cannot be accessed
+    /// Returns `OperatorError::SerializationFailed` if the state cannot be deserialized
     fn restore(&mut self, state: OperatorState) -> Result<(), OperatorError>;
 }
 

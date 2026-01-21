@@ -1,0 +1,1 @@
+//! React-based admin dashboard

@@ -1,19 +1,13 @@
-//! # LaminarDB Admin Interface
+//! # `LaminarDB` Admin Interface
 
 #![deny(missing_docs)]
 #![warn(clippy::all, clippy::pedantic)]
 
-/// REST API
-pub mod api {
-    //! Admin REST API endpoints
-}
+/// REST API - Admin REST API endpoints
+pub mod api;
 
-/// Web dashboard
-pub mod dashboard {
-    //! React-based admin dashboard
-}
+/// Web dashboard - React-based admin dashboard
+pub mod dashboard;
 
-/// Command-line tools
-pub mod cli {
-    //! CLI administration tools
-}
+/// Command-line tools - CLI administration tools
+pub mod cli;

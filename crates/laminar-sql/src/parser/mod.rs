@@ -26,6 +26,10 @@ pub enum StreamingStatement {
 }
 
 /// Parses SQL with streaming extensions
+///
+/// # Errors
+///
+/// Returns `ParseError` if the SQL syntax is invalid
 pub fn parse_streaming_sql(sql: &str) -> Result<Vec<StreamingStatement>, ParseError> {
     // TODO: Implement streaming SQL parser
     let dialect = GenericDialect {};

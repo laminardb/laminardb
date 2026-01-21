@@ -18,16 +18,19 @@ pub struct Watermark(pub i64);
 
 impl Watermark {
     /// Creates a new watermark
+    #[must_use]
     pub fn new(timestamp: i64) -> Self {
         Self(timestamp)
     }
 
     /// Gets the watermark timestamp
+    #[must_use]
     pub fn timestamp(&self) -> i64 {
         self.0
     }
 
     /// Checks if an event is late relative to this watermark
+    #[must_use]
     pub fn is_late(&self, event_time: i64) -> bool {
         event_time < self.0
     }
@@ -50,6 +53,7 @@ pub struct BoundedOutOfOrdernessGenerator {
 
 impl BoundedOutOfOrdernessGenerator {
     /// Creates a new generator allowing events to be at most `max_out_of_orderness` late
+    #[must_use]
     pub fn new(max_out_of_orderness: i64) -> Self {
         Self {
             max_out_of_orderness,
@@ -107,6 +111,7 @@ pub struct TimerService {
 
 impl TimerService {
     /// Creates a new timer service
+    #[must_use]
     pub fn new() -> Self {
         Self {
             timers: BinaryHeap::new(),
@@ -129,6 +134,11 @@ impl TimerService {
     }
 
     /// Gets all timers that should fire at or before the given timestamp
+    ///
+    /// # Panics
+    ///
+    /// This function should not panic under normal circumstances as the unwrap is only called
+    /// after verifying the heap is not empty
     pub fn poll_timers(&mut self, current_time: i64) -> Vec<TimerRegistration> {
         let mut fired = Vec::new();
 

@@ -29,11 +29,13 @@ pub struct TumblingWindow {
 
 impl TumblingWindow {
     /// Get the window duration
+    #[must_use]
     pub fn duration(&self) -> Duration {
         self.config.duration
     }
 
     /// Get the allowed lateness
+    #[must_use]
     pub fn allowed_lateness(&self) -> Duration {
         self.config.allowed_lateness
     }
@@ -41,6 +43,7 @@ impl TumblingWindow {
 
 impl TumblingWindow {
     /// Creates a new tumbling window operator
+    #[must_use]
     pub fn new(config: TumblingWindowConfig) -> Self {
         Self { config }
     }

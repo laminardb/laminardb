@@ -1,21 +1,15 @@
-//! # LaminarDB Storage
+//! # `LaminarDB` Storage
 //!
-//! Durability layer for LaminarDB - WAL, checkpointing, and lakehouse integration.
+//! Durability layer for `LaminarDB` - WAL, checkpointing, and lakehouse integration.
 
 #![deny(missing_docs)]
 #![warn(clippy::all, clippy::pedantic)]
 
-/// Write-ahead log implementation
-pub mod wal {
-    //! WAL for durability and exactly-once semantics
-}
+/// Write-ahead log implementation - WAL for durability and exactly-once semantics
+pub mod wal;
 
-/// Checkpointing for state persistence
-pub mod checkpoint {
-    //! Incremental and full checkpointing
-}
+/// Checkpointing for state persistence - Incremental and full checkpointing
+pub mod checkpoint;
 
-/// Lakehouse format integration
-pub mod lakehouse {
-    //! Delta Lake and Iceberg sink support
-}
+/// Lakehouse format integration - Delta Lake and Iceberg sink support
+pub mod lakehouse;

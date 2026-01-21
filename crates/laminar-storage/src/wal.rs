@@ -1,0 +1,1 @@
+//! WAL for durability and exactly-once semantics

@@ -1,19 +1,13 @@
-//! # LaminarDB Observability
+//! # `LaminarDB` Observability
 
 #![deny(missing_docs)]
 #![warn(clippy::all, clippy::pedantic)]
 
-/// Metrics collection and export
-pub mod metrics {
-    //! Prometheus and OpenTelemetry metrics
-}
+/// Metrics collection and export - Prometheus and OpenTelemetry metrics
+pub mod metrics;
 
-/// Distributed tracing
-pub mod tracing {
-    //! OpenTelemetry tracing integration
-}
+/// Distributed tracing - OpenTelemetry tracing integration
+pub mod tracing;
 
-/// Health check endpoints
-pub mod health {
-    //! Liveness and readiness probes
-}
+/// Health check endpoints - Liveness and readiness probes
+pub mod health;

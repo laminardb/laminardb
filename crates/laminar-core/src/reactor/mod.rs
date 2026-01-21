@@ -1,6 +1,6 @@
 //! # Reactor Module
 //!
-//! The core event loop for LaminarDB, implementing a single-threaded reactor pattern
+//! The core event loop for `LaminarDB`, implementing a single-threaded reactor pattern
 //! optimized for streaming workloads.
 //!
 //! ## Design Goals
@@ -70,6 +70,10 @@ pub struct Reactor {
 
 impl Reactor {
     /// Creates a new reactor with the given configuration
+    ///
+    /// # Errors
+    ///
+    /// Currently does not return any errors, but may in the future if initialization fails
     pub fn new(config: Config) -> Result<Self, ReactorError> {
         let event_queue = VecDeque::with_capacity(config.event_buffer_size);
         let watermark_generator = Box::new(
@@ -96,6 +100,10 @@ impl Reactor {
     }
 
     /// Submit an event for processing
+    ///
+    /// # Errors
+    ///
+    /// Returns `ReactorError::QueueFull` if the event queue is at capacity
     pub fn submit(&mut self, event: Event) -> Result<(), ReactorError> {
         if self.event_queue.len() >= self.config.event_buffer_size {
             return Err(ReactorError::QueueFull {
@@ -108,6 +116,10 @@ impl Reactor {
     }
 
     /// Submit multiple events for processing
+    ///
+    /// # Errors
+    ///
+    /// Returns `ReactorError::QueueFull` if there's insufficient capacity for all events
     pub fn submit_batch(&mut self, events: Vec<Event>) -> Result<(), ReactorError> {
         let available = self.config.event_buffer_size - self.event_queue.len();
         if events.len() > available {
@@ -212,32 +224,49 @@ impl Reactor {
     }
 
     /// Get current processing time in microseconds since reactor start
+    #[allow(clippy::cast_possible_truncation)]
     fn get_processing_time(&self) -> i64 {
-        self.start_time.elapsed().as_micros() as i64
+        // Saturating conversion - after ~292 years this will saturate at i64::MAX
+        let micros = self.start_time.elapsed().as_micros();
+        if micros > i64::MAX as u128 {
+            i64::MAX
+        } else {
+            micros as i64
+        }
     }
 
     /// Get the number of events processed
+    #[must_use]
     pub fn events_processed(&self) -> u64 {
         self.events_processed
     }
 
     /// Get the number of events in the queue
+    #[must_use]
     pub fn queue_size(&self) -> usize {
         self.event_queue.len()
     }
 
     /// Set CPU affinity if configured
+    ///
+    /// # Errors
+    ///
+    /// Returns `ReactorError` if CPU affinity cannot be set (platform-specific)
     pub fn set_cpu_affinity(&self) -> Result<(), ReactorError> {
         if let Some(cpu_id) = self.config.cpu_affinity {
             // Note: CPU affinity setting is platform-specific
             // This would need platform-specific implementation
             // For now, we'll just return Ok
-            eprintln!("CPU affinity setting to core {} not implemented yet", cpu_id);
+            eprintln!("CPU affinity setting to core {cpu_id} not implemented yet");
         }
         Ok(())
     }
 
     /// Runs the event loop continuously until shutdown
+    ///
+    /// # Errors
+    ///
+    /// Returns `ReactorError` if CPU affinity cannot be set or if shutdown fails
     pub fn run(&mut self) -> Result<(), ReactorError> {
         self.set_cpu_affinity()?;
 
@@ -267,6 +296,10 @@ impl Reactor {
     }
 
     /// Stops the reactor gracefully
+    ///
+    /// # Errors
+    ///
+    /// Currently does not return any errors, but may in the future if shutdown fails
     pub fn shutdown(&mut self) -> Result<(), ReactorError> {
         // Process remaining events
         while !self.event_queue.is_empty() {

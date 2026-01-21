@@ -1,10 +1,10 @@
-//! # LaminarDB SQL
+//! # `LaminarDB` SQL
 //!
-//! SQL interface for LaminarDB with streaming extensions.
+//! SQL interface for `LaminarDB` with streaming extensions.
 //!
 //! This crate provides:
 //! - SQL parsing with streaming extensions (windows, watermarks, EMIT)
-//! - Query planning and optimization via DataFusion
+//! - Query planning and optimization via `DataFusion`
 //! - Streaming-aware physical operators
 //! - SQL-to-operator translation
 //!
@@ -53,7 +53,7 @@ pub enum Error {
     #[error("Planning error: {0}")]
     PlanningError(#[from] planner::PlanningError),
 
-    /// DataFusion error
+    /// `DataFusion` error
     #[error("DataFusion error: {0}")]
     DataFusionError(#[from] datafusion_common::DataFusionError),
 

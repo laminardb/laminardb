@@ -11,8 +11,8 @@
 //!
 //! ## State Backends
 //!
-//! - **InMemory**: HashMap-based, fastest for small state
-//! - **MemoryMapped**: mmap-based, supports larger-than-memory state
+//! - **`InMemory`**: HashMap-based, fastest for small state
+//! - **`MemoryMapped`**: mmap-based, supports larger-than-memory state
 //! - **Hybrid**: Combination with hot/cold separation
 
 use bytes::Bytes;
@@ -24,9 +24,17 @@ pub trait StateStore: Send {
     fn get(&self, key: &[u8]) -> Option<Bytes>;
 
     /// Put a key-value pair
+    ///
+    /// # Errors
+    ///
+    /// Returns `StateError` if the operation fails (e.g., disk full, I/O error)
     fn put(&mut self, key: &[u8], value: &[u8]) -> Result<(), StateError>;
 
     /// Delete a key
+    ///
+    /// # Errors
+    ///
+    /// Returns `StateError` if the operation fails (e.g., I/O error)
     fn delete(&mut self, key: &[u8]) -> Result<(), StateError>;
 
     /// Scan keys with a given prefix
@@ -39,12 +47,16 @@ pub trait StateStore: Send {
     fn size_bytes(&self) -> usize;
 
     /// Flush any pending writes
+    ///
+    /// # Errors
+    ///
+    /// Returns `StateError` if the flush operation fails
     fn flush(&mut self) -> Result<(), StateError> {
         Ok(()) // Default no-op
     }
 }
 
-/// In-memory state store using FxHashMap
+/// In-memory state store using `FxHashMap`
 pub struct InMemoryStore {
     // TODO: Use FxHashMap for better performance
     data: std::collections::HashMap<Vec<u8>, Bytes>,
@@ -52,6 +64,7 @@ pub struct InMemoryStore {
 
 impl InMemoryStore {
     /// Creates a new in-memory store
+    #[must_use]
     pub fn new() -> Self {
         Self {
             data: std::collections::HashMap::new(),

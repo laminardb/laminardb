@@ -1,6 +1,6 @@
-//! # LaminarDB Core
+//! # `LaminarDB` Core
 //!
-//! The core streaming engine for LaminarDB, implementing the Ring 0 (hot path) components.
+//! The core streaming engine for `LaminarDB`, implementing the Ring 0 (hot path) components.
 //!
 //! This crate provides:
 //! - **Reactor**: Single-threaded event loop with zero allocations

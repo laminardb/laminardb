@@ -1,6 +1,6 @@
-//! # LaminarDB Connectors
+//! # `LaminarDB` Connectors
 //!
-//! External system connectors for streaming data in and out of LaminarDB.
+//! External system connectors for streaming data in and out of `LaminarDB`.
 
 #![deny(missing_docs)]
 #![warn(clippy::all, clippy::pedantic)]
@@ -9,12 +9,8 @@
 #[cfg(feature = "kafka")]
 pub mod kafka;
 
-/// Change Data Capture connectors
-pub mod cdc {
-    //! CDC connectors for databases
-}
+/// Change Data Capture connectors - CDC connectors for databases
+pub mod cdc;
 
-/// Lookup table support
-pub mod lookup {
-    //! External lookup tables for enrichment joins
-}
+/// Lookup table support - External lookup tables for enrichment joins
+pub mod lookup;

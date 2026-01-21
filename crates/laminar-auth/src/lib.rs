@@ -1,19 +1,13 @@
-//! # LaminarDB Authentication & Authorization
+//! # `LaminarDB` Authentication & Authorization
 
 #![deny(missing_docs)]
 #![warn(clippy::all, clippy::pedantic)]
 
-/// Authentication mechanisms
-pub mod authn {
-    //! JWT, mTLS, and other auth methods
-}
+/// Authentication mechanisms - JWT, mTLS, and other auth methods
+pub mod authn;
 
-/// Authorization (RBAC/ABAC)
-pub mod authz {
-    //! Role and attribute based access control
-}
+/// Authorization (RBAC/ABAC) - Role and attribute based access control
+pub mod authz;
 
-/// Row-level security
-pub mod rls {
-    //! Fine-grained access control
-}
+/// Row-level security - Fine-grained access control
+pub mod rls;
