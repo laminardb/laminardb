@@ -1,0 +1,325 @@
+//! Streaming scan execution plan for `DataFusion`
+//!
+//! This module provides `StreamingScanExec`, a `DataFusion` execution plan
+//! that reads from a `StreamSource`. It serves as the leaf node in query
+//! plans for streaming data.
+
+use std::any::Any;
+use std::fmt::{Debug, Formatter};
+use std::sync::Arc;
+
+use arrow_schema::SchemaRef;
+use datafusion::execution::{SendableRecordBatchStream, TaskContext};
+use datafusion::physical_expr::{EquivalenceProperties, LexOrdering, Partitioning};
+use datafusion::physical_plan::execution_plan::{Boundedness, EmissionType};
+use datafusion::physical_plan::{DisplayAs, DisplayFormatType, ExecutionPlan, PlanProperties};
+use datafusion_common::DataFusionError;
+use datafusion_expr::Expr;
+
+use super::source::StreamSourceRef;
+
+/// A `DataFusion` execution plan that scans from a streaming source.
+///
+/// This is a leaf node in the query plan tree that pulls data from
+/// a `StreamSource` implementation. It handles projection and filter
+/// pushdown to the source when supported.
+///
+/// # Properties
+///
+/// - Single partition (streaming sources are typically not partitioned)
+/// - Unbounded execution mode (streaming)
+/// - No inherent ordering (unless specified by source)
+pub struct StreamingScanExec {
+    /// The streaming source to read from
+    source: StreamSourceRef,
+    /// Output schema (after projection)
+    schema: SchemaRef,
+    /// Column projection (None = all columns)
+    projection: Option<Vec<usize>>,
+    /// Filters pushed down to source
+    filters: Vec<Expr>,
+    /// Cached plan properties
+    properties: PlanProperties,
+}
+
+impl StreamingScanExec {
+    /// Creates a new streaming scan execution plan.
+    ///
+    /// # Arguments
+    ///
+    /// * `source` - The streaming source to read from
+    /// * `projection` - Optional column projection indices
+    /// * `filters` - Filters to push down to the source
+    ///
+    /// # Returns
+    ///
+    /// A new `StreamingScanExec` instance.
+    pub fn new(
+        source: StreamSourceRef,
+        projection: Option<Vec<usize>>,
+        filters: Vec<Expr>,
+    ) -> Self {
+        let source_schema = source.schema();
+        let schema = match &projection {
+            Some(indices) => {
+                let fields: Vec<_> = indices
+                    .iter()
+                    .map(|&i| source_schema.field(i).clone())
+                    .collect();
+                Arc::new(arrow_schema::Schema::new(fields))
+            }
+            None => source_schema,
+        };
+
+        // Build plan properties for an unbounded streaming source
+        let properties = PlanProperties::new(
+            EquivalenceProperties::new(Arc::clone(&schema)),
+            Partitioning::UnknownPartitioning(1), // Single partition for streaming
+            EmissionType::Incremental,            // Streaming emits incrementally
+            Boundedness::Unbounded {
+                requires_infinite_memory: false,
+            }, // Streaming is unbounded
+        );
+
+        Self {
+            source,
+            schema,
+            projection,
+            filters,
+            properties,
+        }
+    }
+
+    /// Returns the streaming source.
+    #[must_use]
+    pub fn source(&self) -> &StreamSourceRef {
+        &self.source
+    }
+
+    /// Returns the column projection.
+    #[must_use]
+    pub fn projection(&self) -> Option<&[usize]> {
+        self.projection.as_deref()
+    }
+
+    /// Returns the pushed-down filters.
+    #[must_use]
+    pub fn filters(&self) -> &[Expr] {
+        &self.filters
+    }
+}
+
+impl Debug for StreamingScanExec {
+    fn fmt(&self, f: &mut Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("StreamingScanExec")
+            .field("source", &self.source)
+            .field("schema", &self.schema)
+            .field("projection", &self.projection)
+            .field("filters", &self.filters)
+            .finish_non_exhaustive()
+    }
+}
+
+impl DisplayAs for StreamingScanExec {
+    fn fmt_as(&self, t: DisplayFormatType, f: &mut Formatter<'_>) -> std::fmt::Result {
+        match t {
+            DisplayFormatType::Default | DisplayFormatType::Verbose => {
+                write!(f, "StreamingScanExec: ")?;
+                if let Some(proj) = &self.projection {
+                    write!(f, "projection=[{proj:?}]")?;
+                } else {
+                    write!(f, "projection=[*]")?;
+                }
+                if !self.filters.is_empty() {
+                    write!(f, ", filters={:?}", self.filters)?;
+                }
+                Ok(())
+            }
+            DisplayFormatType::TreeRender => {
+                write!(f, "StreamingScanExec")
+            }
+        }
+    }
+}
+
+impl ExecutionPlan for StreamingScanExec {
+    fn name(&self) -> &'static str {
+        "StreamingScanExec"
+    }
+
+    fn as_any(&self) -> &dyn Any {
+        self
+    }
+
+    fn schema(&self) -> SchemaRef {
+        Arc::clone(&self.schema)
+    }
+
+    fn properties(&self) -> &PlanProperties {
+        &self.properties
+    }
+
+    fn children(&self) -> Vec<&Arc<dyn ExecutionPlan>> {
+        // Leaf node - no children
+        vec![]
+    }
+
+    fn with_new_children(
+        self: Arc<Self>,
+        children: Vec<Arc<dyn ExecutionPlan>>,
+    ) -> Result<Arc<dyn ExecutionPlan>, DataFusionError> {
+        if children.is_empty() {
+            // No changes needed for leaf node
+            Ok(self)
+        } else {
+            Err(DataFusionError::Plan(
+                "StreamingScanExec cannot have children".to_string(),
+            ))
+        }
+    }
+
+    fn execute(
+        &self,
+        partition: usize,
+        _context: Arc<TaskContext>,
+    ) -> Result<SendableRecordBatchStream, DataFusionError> {
+        if partition != 0 {
+            return Err(DataFusionError::Plan(format!(
+                "StreamingScanExec only supports partition 0, got {partition}"
+            )));
+        }
+
+        self.source
+            .stream(self.projection.clone(), self.filters.clone())
+    }
+}
+
+// Required for `DataFusion` to use this execution plan
+impl datafusion::physical_plan::ExecutionPlanProperties for StreamingScanExec {
+    fn output_partitioning(&self) -> &Partitioning {
+        self.properties.output_partitioning()
+    }
+
+    fn output_ordering(&self) -> Option<&LexOrdering> {
+        None // Streaming sources don't have inherent ordering
+    }
+
+    fn boundedness(&self) -> Boundedness {
+        Boundedness::Unbounded {
+            requires_infinite_memory: false,
+        }
+    }
+
+    fn pipeline_behavior(&self) -> EmissionType {
+        EmissionType::Incremental
+    }
+
+    fn equivalence_properties(&self) -> &EquivalenceProperties {
+        self.properties.equivalence_properties()
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::datafusion::source::StreamSource;
+    use arrow_schema::{DataType, Field, Schema};
+    use async_trait::async_trait;
+
+    #[derive(Debug)]
+    struct MockSource {
+        schema: SchemaRef,
+    }
+
+    #[async_trait]
+    impl StreamSource for MockSource {
+        fn schema(&self) -> SchemaRef {
+            Arc::clone(&self.schema)
+        }
+
+        fn stream(
+            &self,
+            _projection: Option<Vec<usize>>,
+            _filters: Vec<Expr>,
+        ) -> Result<SendableRecordBatchStream, DataFusionError> {
+            Err(DataFusionError::NotImplemented("mock".to_string()))
+        }
+    }
+
+    fn test_schema() -> SchemaRef {
+        Arc::new(Schema::new(vec![
+            Field::new("id", DataType::Int64, false),
+            Field::new("name", DataType::Utf8, true),
+            Field::new("value", DataType::Float64, true),
+        ]))
+    }
+
+    #[test]
+    fn test_scan_exec_schema() {
+        let schema = test_schema();
+        let source: StreamSourceRef = Arc::new(MockSource {
+            schema: Arc::clone(&schema),
+        });
+        let exec = StreamingScanExec::new(source, None, vec![]);
+
+        assert_eq!(exec.schema(), schema);
+    }
+
+    #[test]
+    fn test_scan_exec_projection() {
+        let schema = test_schema();
+        let source: StreamSourceRef = Arc::new(MockSource {
+            schema: Arc::clone(&schema),
+        });
+        let exec = StreamingScanExec::new(source, Some(vec![0, 2]), vec![]);
+
+        let output_schema = exec.schema();
+        assert_eq!(output_schema.fields().len(), 2);
+        assert_eq!(output_schema.field(0).name(), "id");
+        assert_eq!(output_schema.field(1).name(), "value");
+    }
+
+    #[test]
+    fn test_scan_exec_properties() {
+        use datafusion::physical_plan::ExecutionPlanProperties;
+
+        let schema = test_schema();
+        let source: StreamSourceRef = Arc::new(MockSource { schema });
+        let exec = StreamingScanExec::new(source, None, vec![]);
+
+        // Should be unbounded (streaming)
+        assert!(matches!(
+            exec.boundedness(),
+            Boundedness::Unbounded { .. }
+        ));
+
+        // Should be single partition
+        let partitioning = exec.properties().output_partitioning();
+        assert!(matches!(partitioning, Partitioning::UnknownPartitioning(1)));
+
+        // Leaf node has no children
+        assert!(exec.children().is_empty());
+    }
+
+    #[test]
+    fn test_scan_exec_display() {
+        let schema = test_schema();
+        let source: StreamSourceRef = Arc::new(MockSource { schema });
+        let exec = StreamingScanExec::new(source, Some(vec![0, 1]), vec![]);
+
+        // Verify it implements DisplayAs by checking the name
+        assert_eq!(exec.name(), "StreamingScanExec");
+        // Debug format should contain the struct info
+        let debug = format!("{:?}", exec);
+        assert!(debug.contains("StreamingScanExec"));
+    }
+
+    #[test]
+    fn test_scan_exec_name() {
+        let schema = test_schema();
+        let source: StreamSourceRef = Arc::new(MockSource { schema });
+        let exec = StreamingScanExec::new(source, None, vec![]);
+
+        assert_eq!(exec.name(), "StreamingScanExec");
+    }
+}

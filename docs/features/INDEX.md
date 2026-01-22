@@ -4,12 +4,12 @@
 
 | Phase | Total | Draft | In Progress | Done |
 |-------|-------|-------|-------------|------|
-| Phase 1 | 12 | 8 | 0 | 4 |
+| Phase 1 | 12 | 7 | 0 | 5 |
 | Phase 2 | 12 | 12 | 0 | 0 |
 | Phase 3 | 10 | 10 | 0 | 0 |
 | Phase 4 | 11 | 11 | 0 | 0 |
 | Phase 5 | 10 | 10 | 0 | 0 |
-| **Total** | **55** | **51** | **0** | **4** |
+| **Total** | **55** | **50** | **0** | **5** |
 
 ## Status Legend
 
@@ -29,7 +29,7 @@
 | F002 | Memory-Mapped State Store | P0 | ✅ | [Link](phase-1/F002-memory-mapped-state-store.md) |
 | F003 | State Store Interface | P0 | ✅ | [Link](phase-1/F003-state-store-interface.md) |
 | F004 | Tumbling Windows | P0 | ✅ | [Link](phase-1/F004-tumbling-windows.md) |
-| F005 | DataFusion Integration | P0 | 📝 | [Link](phase-1/F005-datafusion-integration.md) |
+| F005 | DataFusion Integration | P0 | ✅ | [Link](phase-1/F005-datafusion-integration.md) |
 | F006 | Basic SQL Parser | P0 | 📝 | [Link](phase-1/F006-basic-sql-parser.md) |
 | F007 | Write-Ahead Log | P1 | 📝 | [Link](phase-1/F007-write-ahead-log.md) |
 | F008 | Basic Checkpointing | P1 | 📝 | [Link](phase-1/F008-basic-checkpointing.md) |
