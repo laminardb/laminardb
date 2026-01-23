@@ -1,29 +1,15 @@
 //! SQL parser with streaming extensions
 
-use sqlparser::ast::Statement;
-use sqlparser::dialect::GenericDialect;
-use sqlparser::parser::Parser;
+mod parser_simple;
+mod statements;
+mod window_rewriter;
 
-/// Streaming-specific SQL statements
-#[derive(Debug, Clone)]
-pub enum StreamingStatement {
-    /// Standard SQL statement
-    Standard(Statement),
-    /// CREATE STREAM statement
-    CreateStream {
-        /// Stream name
-        name: String,
-        /// Source configuration
-        source: String,
-    },
-    /// CREATE CONTINUOUS QUERY
-    CreateContinuousQuery {
-        /// Query name
-        name: String,
-        /// SQL query
-        query: Statement,
-    },
-}
+pub use parser_simple::StreamingParser;
+pub use statements::{
+    CreateSinkStatement, CreateSourceStatement, EmitClause, SinkFrom,
+    StreamingStatement, WatermarkDef, WindowFunction,
+};
+pub use window_rewriter::WindowRewriter;
 
 /// Parses SQL with streaming extensions
 ///
@@ -31,14 +17,7 @@ pub enum StreamingStatement {
 ///
 /// Returns `ParseError` if the SQL syntax is invalid
 pub fn parse_streaming_sql(sql: &str) -> Result<Vec<StreamingStatement>, ParseError> {
-    // TODO: Implement streaming SQL parser
-    let dialect = GenericDialect {};
-    let statements = Parser::parse_sql(&dialect, sql)?;
-
-    Ok(statements
-        .into_iter()
-        .map(StreamingStatement::Standard)
-        .collect())
+    StreamingParser::parse_sql(sql).map_err(ParseError::SqlParseError)
 }
 
 /// SQL parsing errors
@@ -51,4 +30,8 @@ pub enum ParseError {
     /// Streaming extension parse error
     #[error("Streaming SQL error: {0}")]
     StreamingError(String),
+
+    /// Window function error
+    #[error("Window function error: {0}")]
+    WindowError(String),
 }

@@ -8,17 +8,17 @@
 
 ### Sprint Priority
 
-1. **F001 - Core Reactor Event Loop** (P0)
-   - Single-threaded event loop foundation
-   - Must achieve 500K events/sec baseline
+1. **F007 - Write-Ahead Log** (P1)
+   - Durability layer for state stores
+   - Must support group commit and recovery
 
-2. **F003 - State Store Interface** (P0)
-   - Key-value storage for operator state
-   - Target: < 500ns lookup latency
+2. **F008 - Basic Checkpointing** (P1)
+   - Periodic state snapshots
+   - Target: < 10s recovery time
 
-3. **F004 - Tumbling Windows** (P0)
-   - First window type implementation
-   - Validates operator framework
+3. **F009 - Event Time Processing** (P1)
+   - Time-based event semantics
+   - Foundation for watermarks
 
 ## Active Decisions
 
@@ -47,6 +47,9 @@
 
 ## Technical Debt
 
+- [ ] **CRITICAL: Production SQL Parser** - Current F006 implementation is POC only
+  - See ADR-003 and F006-sql-parser-improvements.md
+  - Required before Phase 2 features (joins, advanced windows)
 - [ ] Add property-based tests for serialization
 - [ ] Document unsafe blocks in core crate
 - [ ] Add tracing spans for debugging

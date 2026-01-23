@@ -4,40 +4,43 @@
 
 ## Last Session
 
-**Date**: 2026-01-22
+**Date**: 2026-01-23
 **Duration**: ~1 hour
 
 ### What Was Accomplished
-- ✅ Migrated serialization from bincode to rkyv for zero-copy deserialization
-- ✅ Updated all Cargo.toml files (workspace, laminar-core, laminar-storage)
-- ✅ Migrated state module (`state/mod.rs`):
-  - Updated `StateSnapshot` to derive rkyv traits
-  - Updated `StateStoreExt` trait with rkyv-compatible bounds
-  - Updated `to_bytes()`/`from_bytes()` to use rkyv
-- ✅ Migrated window operator (`operator/window.rs`):
-  - Updated `WindowId` and all accumulators with rkyv derives
-  - Updated `checkpoint()`/`restore()` methods
-  - Added proper trait bounds to impl blocks
-- ✅ Updated documentation (STEERING.md, checkpoint-recovery skill)
-- ✅ All 89 tests passing (54 laminar-core + 35 laminar-sql)
-- ✅ Clippy clean
+- ✅ Implemented F006 - Basic SQL Parser with streaming extensions
+- ✅ Created comprehensive parser module structure:
+  - `statements.rs` - Streaming statement types (CreateSource, CreateSink, etc.)
+  - `parser_simple.rs` - Simple parser implementation for streaming SQL
+  - `window_rewriter.rs` - Window function rewriting infrastructure
+- ✅ Implemented support for:
+  - CREATE SOURCE with watermark definitions
+  - CREATE SINK with connector options
+  - CREATE CONTINUOUS QUERY with EMIT clauses
+  - Window functions (TUMBLE, HOP, SESSION) structures
+  - EMIT clauses (AFTER WATERMARK, ON WINDOW CLOSE, PERIODICALLY)
+- ✅ All 45 tests passing in laminar-sql
+- ✅ Updated sqlparser 0.60 compatibility
 
 ### Where We Left Off
-Successfully migrated from bincode to rkyv. The rkyv library provides zero-copy deserialization with ~1.2ns access times, which is critical for Ring 0 hot path performance.
+Successfully implemented F006 - Basic SQL Parser. The parser module now supports streaming SQL extensions including CREATE SOURCE/SINK, window functions, watermark definitions, and EMIT clauses. The implementation uses a simplified approach compatible with sqlparser 0.60 and provides the foundation for streaming SQL support.
 
 ### Immediate Next Steps
-1. **F006 - Basic SQL Parser** (P0) - Streaming SQL extensions (TUMBLE, WATERMARK, EMIT)
-2. **F007 - Write-Ahead Log** (P1) - Durability
-3. **F008 - Basic Checkpointing** (P1) - Recovery
+1. **F007 - Write-Ahead Log** (P1) - Durability layer for state persistence
+2. **F008 - Basic Checkpointing** (P1) - Recovery mechanism for state stores
+3. **F009 - Event Time Processing** (P1) - Time-based semantics
 
 ### Open Issues
-- None currently - F001, F002, F003, F004, F005 are complete
+- None currently - F001, F002, F003, F004, F005, F006 are complete
 
 ### Code Pointers
 - **StateStoreExt with rkyv**: `crates/laminar-core/src/state/mod.rs:229-280`
 - **StateSnapshot rkyv**: `crates/laminar-core/src/state/mod.rs:305-395`
 - **WindowId rkyv**: `crates/laminar-core/src/operator/window.rs:45-85`
 - **Accumulator derives**: `crates/laminar-core/src/operator/window.rs:268-545`
+- **Streaming statements**: `crates/laminar-sql/src/parser/statements.rs`
+- **Parser implementation**: `crates/laminar-sql/src/parser/parser_simple.rs`
+- **Window rewriter**: `crates/laminar-sql/src/parser/window_rewriter.rs`
 
 ---
 
@@ -78,8 +81,8 @@ let owned: MyType = rkyv::deserialize::<MyType, Error>(archived)?;
 
 ### Current Focus
 - **Phase**: 1 - Core Engine
-- **Completed**: F001 (Reactor), F002 (Memory-Mapped State Store), F003 (State Store Interface), F004 (Tumbling Windows), F005 (DataFusion Integration)
-- **Next**: F006 (Basic SQL Parser), F007 (Write-Ahead Log)
+- **Completed**: F001 (Reactor), F002 (Memory-Mapped State Store), F003 (State Store Interface), F004 (Tumbling Windows), F005 (DataFusion Integration), F006 (Basic SQL Parser)
+- **Next**: F007 (Write-Ahead Log), F008 (Basic Checkpointing)
 
 ### Key Files
 ```
