@@ -6,11 +6,11 @@
 |-------|-------|-------|-------------|-----------|------|
 | Phase 1 | 12 | 0 | 0 | 1 | 11 |
 | Phase 1.5 | 1 | 1 | 0 | 0 | 0 |
-| Phase 2 | 12 | 5 | 0 | 0 | 7 |
-| Phase 3 | 10 | 10 | 0 | 0 | 0 |
+| Phase 2 | 14 | 7 | 0 | 0 | 7 |
+| Phase 3 | 11 | 11 | 0 | 0 | 0 |
 | Phase 4 | 11 | 11 | 0 | 0 | 0 |
 | Phase 5 | 10 | 10 | 0 | 0 | 0 |
-| **Total** | **56** | **37** | **0** | **1** | **18** |
+| **Total** | **59** | **40** | **0** | **1** | **18** |
 
 ## Status Legend
 
@@ -102,6 +102,20 @@
 | F022 | Incremental Checkpointing | P1 | 📝 | [Link](phase-2/F022-incremental-checkpointing.md) |
 | F023 | Exactly-Once Sinks | P0 | 📝 | [Link](phase-2/F023-exactly-once-sinks.md) |
 | F024 | Two-Phase Commit | P1 | 📝 | [Link](phase-2/F024-two-phase-commit.md) |
+| F056 | ASOF Joins | P1 | 📝 | [Link](phase-2/F056-asof-joins.md) |
+| F057 | Stream Join Optimizations | P1 | 📝 | [Link](phase-2/F057-stream-join-optimizations.md) |
+
+### Phase 2 Join Research Gap Analysis
+
+> Based on [Stream Joins Research Review 2026](../research/laminardb-stream-joins-research-review-2026.md)
+
+| Gap | Source | Current | Target | Feature |
+|-----|--------|---------|--------|---------|
+| ASOF Joins | DuckDB/Pinot 2025 | ❌ Missing | Full support | F056 |
+| CPU-Friendly Encoding | RisingWave July 2025 | ❌ Missing | 50% perf gain | F057 |
+| Asymmetric Compaction | Epsio 2025 | ❌ Missing | Reduced overhead | F057 |
+| Temporal Join (versioned) | RisingWave 2025 | 📝 Draft | Full impl | F021 |
+| Async State Access | Flink 2.0 | ❌ Missing | Phase 3 | F058 |
 
 ---
 
@@ -119,6 +133,7 @@
 | F032 | Iceberg Sink | P1 | 📝 | [Link](phase-3/F032-iceberg-sink.md) |
 | F033 | Parquet File Source | P2 | 📝 | [Link](phase-3/F033-parquet-source.md) |
 | F034 | Connector SDK | P1 | 📝 | [Link](phase-3/F034-connector-sdk.md) |
+| F058 | Async State Access | P1 | 📝 | [Link](phase-3/F058-async-state-access.md) |
 
 ---
 
@@ -191,10 +206,14 @@ Phase 2:
 F001 ──▶ F013 (Thread-per-Core) ──▶ F014 (SPSC) ──▶ F015 (CPU Pinning)
 F004 ──▶ F016 (Sliding) ──▶ F017 (Session) ──▶ F018 (Hopping)
 F003 ──▶ F019 (Stream Joins) ──▶ F020 (Lookup) ──▶ F021 (Temporal)
+                    │
+                    ├──▶ F056 (ASOF Joins) ◀── Financial/TimeSeries
+                    └──▶ F057 (Join Optimizations) ◀── Research 2025-2026
 F008 ──▶ F022 (Incremental) ──▶ F023 (Exactly-Once) ──▶ F024 (2PC)
 
 Phase 3 (blocked by F006B for DDL parsing):
 F006B ──▶ F025-F034 (Connectors need CREATE SOURCE/SINK)
+F013 + F019 ──▶ F058 (Async State Access) ◀── Flink 2.0 Innovation
 ```
 
 ---
@@ -226,6 +245,17 @@ F006B ──▶ F025-F034 (Connectors need CREATE SOURCE/SINK)
 | No CoW mmap | F002 | Can't isolate snapshots |
 | No io_uring | F001 | Blocking I/O on hot path |
 
+### P1 - High (Research Gaps - 2025-2026)
+
+> From [Stream Joins Research Review](../research/laminardb-stream-joins-research-review-2026.md)
+
+| Gap | Feature | Source | Fix |
+|-----|---------|--------|-----|
+| **No ASOF joins** | F056 | DuckDB/Pinot 2025 | NEW SPEC |
+| **No CPU-friendly encoding** | F057 | RisingWave July 2025 | NEW SPEC |
+| **No async state access** | F058 | Flink 2.0 VLDB 2025 | NEW SPEC (Phase 3) |
+| Temporal join incomplete | F021 | RisingWave 2025 | UPDATED SPEC |
+
 ### P2 - Medium (Phase 2+)
 
 | Gap | Feature | Impact |
@@ -234,3 +264,5 @@ F006B ──▶ F025-F034 (Connectors need CREATE SOURCE/SINK)
 | No incremental checkpoints | F008 | Large checkpoint overhead |
 | No retractions | F012 | Required for joins |
 | No madvise hints | F002 | Suboptimal TLB usage |
+| Multi-way join optimization | - | Static join order, no adaptive |
+| DBSP incrementalization | - | No formal Z-set, no auto-incr |
