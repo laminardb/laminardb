@@ -25,10 +25,12 @@
 //! );
 //! ```
 
-use super::{Event, Operator, OperatorContext, OperatorError, OperatorState, Output, OutputVec, Timer};
+use super::{
+    Event, Operator, OperatorContext, OperatorError, OperatorState, Output, OutputVec, Timer,
+};
+use crate::state::{StateStore, StateStoreExt};
 use arrow_array::{Int64Array, RecordBatch};
 use arrow_schema::{DataType, Field, Schema, SchemaRef};
-use crate::state::{StateStore, StateStoreExt};
 use rkyv::{
     api::high::{HighDeserializer, HighSerializer, HighValidator},
     bytecheck::CheckBytes,
@@ -38,8 +40,8 @@ use rkyv::{
     Archive, Deserialize as RkyvDeserialize, Serialize as RkyvSerialize,
 };
 use std::marker::PhantomData;
-use std::sync::Arc;
 use std::sync::atomic::{AtomicU64, Ordering};
+use std::sync::Arc;
 use std::time::Duration;
 
 /// Unique identifier for a window.
@@ -651,8 +653,8 @@ fn create_window_output_schema() -> SchemaRef {
 impl<A: Aggregator> TumblingWindowOperator<A>
 where
     A::Acc: Archive + for<'a> RkyvSerialize<HighSerializer<AlignedVec, ArenaHandle<'a>, RkyvError>>,
-    <A::Acc as Archive>::Archived:
-        for<'a> CheckBytes<HighValidator<'a, RkyvError>> + RkyvDeserialize<A::Acc, HighDeserializer<RkyvError>>,
+    <A::Acc as Archive>::Archived: for<'a> CheckBytes<HighValidator<'a, RkyvError>>
+        + RkyvDeserialize<A::Acc, HighDeserializer<RkyvError>>,
 {
     /// Creates a new tumbling window operator.
     ///
@@ -663,7 +665,11 @@ where
     /// * `allowed_lateness` - Grace period for late data after window close
     #[must_use]
     #[allow(clippy::cast_possible_truncation)]
-    pub fn new(assigner: TumblingWindowAssigner, aggregator: A, allowed_lateness: Duration) -> Self {
+    pub fn new(
+        assigner: TumblingWindowAssigner,
+        aggregator: A,
+        allowed_lateness: Duration,
+    ) -> Self {
         let operator_num = OPERATOR_COUNTER.fetch_add(1, Ordering::Relaxed);
         Self {
             assigner,
@@ -671,7 +677,7 @@ where
             // Truncation is acceptable: lateness > 2^63 ms (~292 million years) is not practical
             allowed_lateness_ms: allowed_lateness.as_millis() as i64,
             registered_windows: std::collections::HashSet::new(),
-            operator_id: format!("tumbling_window_{}", operator_num),
+            operator_id: format!("tumbling_window_{operator_num}"),
             output_schema: create_window_output_schema(),
             _phantom: PhantomData,
         }
@@ -771,7 +777,8 @@ where
         if !self.registered_windows.contains(&window_id) {
             // Register timer at window_end + allowed_lateness
             let trigger_time = window_id.end + self.allowed_lateness_ms;
-            ctx.timers.register_timer(trigger_time, Some(window_id.to_key()));
+            ctx.timers
+                .register_timer(trigger_time, Some(window_id.to_key()));
             self.registered_windows.insert(window_id);
         }
     }
@@ -782,8 +789,8 @@ where
     A::Acc: 'static
         + Archive
         + for<'a> RkyvSerialize<HighSerializer<AlignedVec, ArenaHandle<'a>, RkyvError>>,
-    <A::Acc as Archive>::Archived:
-        for<'a> CheckBytes<HighValidator<'a, RkyvError>> + RkyvDeserialize<A::Acc, HighDeserializer<RkyvError>>,
+    <A::Acc as Archive>::Archived: for<'a> CheckBytes<HighValidator<'a, RkyvError>>
+        + RkyvDeserialize<A::Acc, HighDeserializer<RkyvError>>,
 {
     fn process(&mut self, event: &Event, ctx: &mut OperatorContext) -> OutputVec {
         let event_time = event.timestamp;
@@ -898,9 +905,8 @@ where
         }
 
         // Deserialize using rkyv
-        let archived =
-            rkyv::access::<rkyv::Archived<Vec<WindowId>>, RkyvError>(&state.data)
-                .map_err(|e| OperatorError::SerializationFailed(e.to_string()))?;
+        let archived = rkyv::access::<rkyv::Archived<Vec<WindowId>>, RkyvError>(&state.data)
+            .map_err(|e| OperatorError::SerializationFailed(e.to_string()))?;
         let windows: Vec<WindowId> = rkyv::deserialize::<Vec<WindowId>, RkyvError>(archived)
             .map_err(|e| OperatorError::SerializationFailed(e.to_string()))?;
 
@@ -983,10 +989,17 @@ mod tests {
     use std::sync::Arc;
 
     fn create_test_event(timestamp: i64, value: i64) -> Event {
-        let schema = Arc::new(Schema::new(vec![Field::new("value", DataType::Int64, false)]));
-        let batch = RecordBatch::try_new(schema, vec![Arc::new(Int64Array::from(vec![value]))])
-            .unwrap();
-        Event { timestamp, data: batch }
+        let schema = Arc::new(Schema::new(vec![Field::new(
+            "value",
+            DataType::Int64,
+            false,
+        )]));
+        let batch =
+            RecordBatch::try_new(schema, vec![Arc::new(Int64Array::from(vec![value]))]).unwrap();
+        Event {
+            timestamp,
+            data: batch,
+        }
     }
 
     fn create_test_context<'a>(
@@ -1154,7 +1167,9 @@ mod tests {
 
         // Check that a timer was registered
         assert_eq!(operator.registered_windows.len(), 1);
-        assert!(operator.registered_windows.contains(&WindowId::new(0, 1000)));
+        assert!(operator
+            .registered_windows
+            .contains(&WindowId::new(0, 1000)));
     }
 
     #[test]
@@ -1192,12 +1207,9 @@ mod tests {
         match &outputs[0] {
             Output::Event(event) => {
                 assert_eq!(event.timestamp, 1000); // window end
-                // Check the result column (count = 3)
+                                                   // Check the result column (count = 3)
                 let result_col = event.data.column(2);
-                let result_array = result_col
-                    .as_any()
-                    .downcast_ref::<Int64Array>()
-                    .unwrap();
+                let result_array = result_col.as_any().downcast_ref::<Int64Array>().unwrap();
                 assert_eq!(result_array.value(0), 3);
             }
             _ => panic!("Expected Event output"),
@@ -1224,11 +1236,11 @@ mod tests {
 
         // Events in different windows
         let events = [
-            create_test_event(100, 1),   // Window [0, 1000)
-            create_test_event(500, 2),   // Window [0, 1000)
-            create_test_event(1100, 3),  // Window [1000, 2000)
-            create_test_event(1500, 4),  // Window [1000, 2000)
-            create_test_event(2500, 5),  // Window [2000, 3000)
+            create_test_event(100, 1),  // Window [0, 1000)
+            create_test_event(500, 2),  // Window [0, 1000)
+            create_test_event(1100, 3), // Window [1000, 2000)
+            create_test_event(1500, 4), // Window [1000, 2000)
+            create_test_event(2500, 5), // Window [2000, 3000)
         ];
 
         for event in &events {
@@ -1253,7 +1265,9 @@ mod tests {
 
         // Register some windows
         operator.registered_windows.insert(WindowId::new(0, 1000));
-        operator.registered_windows.insert(WindowId::new(1000, 2000));
+        operator
+            .registered_windows
+            .insert(WindowId::new(1000, 2000));
 
         // Checkpoint
         let checkpoint = operator.checkpoint();
@@ -1268,8 +1282,12 @@ mod tests {
         restored_operator.restore(checkpoint).unwrap();
 
         assert_eq!(restored_operator.registered_windows.len(), 2);
-        assert!(restored_operator.registered_windows.contains(&WindowId::new(0, 1000)));
-        assert!(restored_operator.registered_windows.contains(&WindowId::new(1000, 2000)));
+        assert!(restored_operator
+            .registered_windows
+            .contains(&WindowId::new(0, 1000)));
+        assert!(restored_operator
+            .registered_windows
+            .contains(&WindowId::new(1000, 2000)));
     }
 
     #[test]

@@ -7,6 +7,8 @@
 //!
 //! Run with: cargo bench --bench window_bench
 
+use arrow_array::{Int64Array, RecordBatch};
+use arrow_schema::{DataType, Field, Schema};
 use criterion::{black_box, criterion_group, criterion_main, BenchmarkId, Criterion, Throughput};
 use laminar_core::operator::window::{
     Accumulator, CountAccumulator, CountAggregator, SumAccumulator, SumAggregator,
@@ -15,17 +17,22 @@ use laminar_core::operator::window::{
 use laminar_core::operator::{Event, Operator, OperatorContext, Timer};
 use laminar_core::state::InMemoryStore;
 use laminar_core::time::{BoundedOutOfOrdernessGenerator, TimerService};
-use arrow_array::{Int64Array, RecordBatch};
-use arrow_schema::{DataType, Field, Schema};
 use std::sync::Arc;
 use std::time::Duration;
 
 /// Create a test event with the given timestamp and value
 fn create_event(timestamp: i64, value: i64) -> Event {
-    let schema = Arc::new(Schema::new(vec![Field::new("value", DataType::Int64, false)]));
+    let schema = Arc::new(Schema::new(vec![Field::new(
+        "value",
+        DataType::Int64,
+        false,
+    )]));
     let batch =
         RecordBatch::try_new(schema, vec![Arc::new(Int64Array::from(vec![value]))]).unwrap();
-    Event { timestamp, data: batch }
+    Event {
+        timestamp,
+        data: batch,
+    }
 }
 
 /// Benchmark window assignment (target: < 10ns)

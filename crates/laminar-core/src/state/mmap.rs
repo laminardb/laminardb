@@ -536,7 +536,6 @@ impl StateStore for MmapStateStore {
     }
 }
 
-
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -726,7 +725,10 @@ mod tests {
         for i in 0..100 {
             let key = format!("key{i:04}");
             let expected = format!("value{i:04}");
-            assert_eq!(store.get(key.as_bytes()).unwrap().as_ref(), expected.as_bytes());
+            assert_eq!(
+                store.get(key.as_bytes()).unwrap().as_ref(),
+                expected.as_bytes()
+            );
         }
     }
 

@@ -131,10 +131,8 @@ pub trait StateStore: Send {
     ///
     /// This is O(n) where n is the total number of keys. Use sparingly
     /// on the hot path.
-    fn prefix_scan<'a>(
-        &'a self,
-        prefix: &'a [u8],
-    ) -> Box<dyn Iterator<Item = (Bytes, Bytes)> + 'a>;
+    fn prefix_scan<'a>(&'a self, prefix: &'a [u8])
+        -> Box<dyn Iterator<Item = (Bytes, Bytes)> + 'a>;
 
     /// Range scan between two keys (exclusive end).
     ///
@@ -386,9 +384,8 @@ impl StateSnapshot {
     ///
     /// Returns an error if deserialization fails.
     pub fn from_bytes(bytes: &[u8]) -> Result<Self, StateError> {
-        let archived =
-            rkyv::access::<<Self as Archive>::Archived, RkyvError>(bytes)
-                .map_err(|e| StateError::Serialization(e.to_string()))?;
+        let archived = rkyv::access::<<Self as Archive>::Archived, RkyvError>(bytes)
+            .map_err(|e| StateError::Serialization(e.to_string()))?;
         rkyv::deserialize::<Self, RkyvError>(archived)
             .map_err(|e| StateError::Serialization(e.to_string()))
     }
@@ -435,10 +432,7 @@ impl InMemoryStore {
     #[must_use]
     pub fn with_capacity(capacity: usize) -> Self {
         Self {
-            data: FxHashMap::with_capacity_and_hasher(
-                capacity,
-                fxhash::FxBuildHasher::default(),
-            ),
+            data: FxHashMap::with_capacity_and_hasher(capacity, fxhash::FxBuildHasher::default()),
             size_bytes: 0,
         }
     }
@@ -767,9 +761,7 @@ mod tests {
         assert_eq!(val, 1);
 
         // Update to delete
-        store
-            .update(b"counter", |_| None)
-            .unwrap();
+        store.update(b"counter", |_| None).unwrap();
         assert!(store.get(b"counter").is_none());
     }
 

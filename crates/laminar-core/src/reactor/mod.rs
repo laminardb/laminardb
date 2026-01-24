@@ -119,9 +119,9 @@ impl Reactor {
     /// Currently does not return any errors, but may in the future if initialization fails
     pub fn new(config: Config) -> Result<Self, ReactorError> {
         let event_queue = VecDeque::with_capacity(config.event_buffer_size);
-        let watermark_generator = Box::new(
-            BoundedOutOfOrdernessGenerator::new(config.max_out_of_orderness)
-        );
+        let watermark_generator = Box::new(BoundedOutOfOrdernessGenerator::new(
+            config.max_out_of_orderness,
+        ));
 
         Ok(Self {
             config,
@@ -152,6 +152,7 @@ impl Reactor {
     }
 
     /// Get a handle to the shutdown flag
+    #[must_use]
     pub fn shutdown_handle(&self) -> Arc<AtomicBool> {
         Arc::clone(&self.shutdown)
     }
@@ -232,7 +233,8 @@ impl Reactor {
 
             // Generate watermark if needed
             if let Some(watermark) = self.watermark_generator.on_event(event.timestamp) {
-                self.output_buffer.push(Output::Watermark(watermark.timestamp()));
+                self.output_buffer
+                    .push(Output::Watermark(watermark.timestamp()));
             }
 
             // Process through operator chain using pre-allocated buffers
@@ -281,7 +283,7 @@ impl Reactor {
             } else {
                 &mut self.operator_buffer_2
             };
-            self.output_buffer.extend(final_buffer.drain(..));
+            self.output_buffer.append(final_buffer);
             self.events_processed += 1;
             events_in_batch += 1;
 
@@ -347,18 +349,20 @@ impl Reactor {
 
                     let result = sched_setaffinity(0, mem::size_of::<cpu_set_t>(), &set);
                     if result != 0 {
-                        return Err(ReactorError::InitializationFailed(
-                            format!("Failed to set CPU affinity to core {}: {}", cpu_id, std::io::Error::last_os_error())
-                        ));
+                        return Err(ReactorError::InitializationFailed(format!(
+                            "Failed to set CPU affinity to core {}: {}",
+                            cpu_id,
+                            std::io::Error::last_os_error()
+                        )));
                     }
                 }
             }
 
             #[cfg(target_os = "windows")]
             {
+                use winapi::shared::basetsd::DWORD_PTR;
                 use winapi::um::processthreadsapi::GetCurrentThread;
                 use winapi::um::winbase::SetThreadAffinityMask;
-                use winapi::shared::basetsd::DWORD_PTR;
 
                 // SAFETY: We're calling Windows API functions with valid parameters.
                 // GetCurrentThread returns a pseudo-handle that doesn't need to be closed.
@@ -368,9 +372,11 @@ impl Reactor {
                     let mask: DWORD_PTR = 1 << cpu_id;
                     let result = SetThreadAffinityMask(GetCurrentThread(), mask);
                     if result == 0 {
-                        return Err(ReactorError::InitializationFailed(
-                            format!("Failed to set CPU affinity to core {}: {}", cpu_id, std::io::Error::last_os_error())
-                        ));
+                        return Err(ReactorError::InitializationFailed(format!(
+                            "Failed to set CPU affinity to core {}: {}",
+                            cpu_id,
+                            std::io::Error::last_os_error()
+                        )));
                     }
                 }
             }
@@ -399,7 +405,7 @@ impl Reactor {
             if !outputs.is_empty() {
                 if let Some(sink) = &mut self.sink {
                     if let Err(e) = sink.write(outputs) {
-                        eprintln!("Failed to write to sink: {}", e);
+                        eprintln!("Failed to write to sink: {e}");
                         // Continue processing even if sink fails
                     }
                 }
@@ -411,7 +417,7 @@ impl Reactor {
             }
 
             // Periodically check for shutdown signal
-            if self.events_processed % 1000 == 0 && self.shutdown.load(Ordering::Relaxed) {
+            if self.events_processed.is_multiple_of(1000) && self.shutdown.load(Ordering::Relaxed) {
                 break;
             }
         }
@@ -419,7 +425,7 @@ impl Reactor {
         // Flush sink before shutdown
         if let Some(sink) = &mut self.sink {
             if let Err(e) = sink.flush() {
-                eprintln!("Failed to flush sink during shutdown: {}", e);
+                eprintln!("Failed to flush sink during shutdown: {e}");
             }
         }
 
@@ -443,7 +449,7 @@ impl Reactor {
             if !outputs.is_empty() {
                 if let Some(sink) = &mut self.sink {
                     if let Err(e) = sink.write(outputs) {
-                        eprintln!("Failed to write final outputs during shutdown: {}", e);
+                        eprintln!("Failed to write final outputs during shutdown: {e}");
                     }
                 }
             }
@@ -452,7 +458,7 @@ impl Reactor {
         // Final flush
         if let Some(sink) = &mut self.sink {
             if let Err(e) = sink.flush() {
-                eprintln!("Failed to flush sink during shutdown: {}", e);
+                eprintln!("Failed to flush sink during shutdown: {e}");
             }
         }
 
@@ -491,13 +497,19 @@ impl Sink for StdoutSink {
         for output in outputs {
             match output {
                 Output::Event(event) => {
-                    println!("Event: timestamp={}, data={:?}", event.timestamp, event.data);
+                    println!(
+                        "Event: timestamp={}, data={:?}",
+                        event.timestamp, event.data
+                    );
                 }
                 Output::Watermark(timestamp) => {
-                    println!("Watermark: {}", timestamp);
+                    println!("Watermark: {timestamp}");
                 }
                 Output::LateEvent(event) => {
-                    println!("Late Event: timestamp={}, data={:?}", event.timestamp, event.data);
+                    println!(
+                        "Late Event: timestamp={}, data={:?}",
+                        event.timestamp, event.data
+                    );
                 }
             }
         }
@@ -510,6 +522,7 @@ impl Sink for StdoutSink {
 }
 
 /// A buffering sink that collects outputs (for testing).
+#[derive(Default)]
 pub struct BufferingSink {
     buffer: Vec<Output>,
 }
@@ -518,9 +531,7 @@ impl BufferingSink {
     /// Create a new buffering sink.
     #[must_use]
     pub fn new() -> Self {
-        Self {
-            buffer: Vec::new(),
-        }
+        Self::default()
     }
 
     /// Get the buffered outputs.
@@ -558,7 +569,11 @@ mod tests {
             output
         }
 
-        fn on_timer(&mut self, _timer: crate::operator::Timer, _ctx: &mut OperatorContext) -> OutputVec {
+        fn on_timer(
+            &mut self,
+            _timer: crate::operator::Timer,
+            _ctx: &mut OperatorContext,
+        ) -> OutputVec {
             OutputVec::new()
         }
 
@@ -569,7 +584,10 @@ mod tests {
             }
         }
 
-        fn restore(&mut self, _state: crate::operator::OperatorState) -> Result<(), crate::operator::OperatorError> {
+        fn restore(
+            &mut self,
+            _state: crate::operator::OperatorState,
+        ) -> Result<(), crate::operator::OperatorError> {
             Ok(())
         }
     }
@@ -663,7 +681,10 @@ mod tests {
             timestamp: 100,
             data: batch,
         };
-        assert!(matches!(reactor.submit(event), Err(ReactorError::QueueFull { .. })));
+        assert!(matches!(
+            reactor.submit(event),
+            Err(ReactorError::QueueFull { .. })
+        ));
     }
 
     #[test]
@@ -747,10 +768,12 @@ mod tests {
 
         // Submit some events
         for i in 0..5 {
-            reactor.submit(Event {
-                timestamp: i * 1000,
-                data: batch.clone(),
-            }).unwrap();
+            reactor
+                .submit(Event {
+                    timestamp: i * 1000,
+                    data: batch.clone(),
+                })
+                .unwrap();
         }
 
         // Shutdown should process remaining events

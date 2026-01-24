@@ -8,6 +8,28 @@
 //! - **Processing Time**: Timestamp when the event is processed
 //! - **Watermark**: Assertion that no events with timestamp < watermark will arrive
 //! - **Timer**: Scheduled callback for window triggers or timeouts
+//!
+//! ## Event Time Extraction
+//!
+//! Use [`EventTimeExtractor`] to extract timestamps from Arrow `RecordBatch` columns:
+//!
+//! ```ignore
+//! use laminar_core::time::{EventTimeExtractor, TimestampFormat, ExtractionMode};
+//!
+//! // Extract millisecond timestamps from a column
+//! let mut extractor = EventTimeExtractor::from_column("event_time", TimestampFormat::UnixMillis);
+//!
+//! // Use Max mode for multi-row batches
+//! let extractor = extractor.with_mode(ExtractionMode::Max);
+//!
+//! let timestamp = extractor.extract(&batch)?;
+//! ```
+
+mod event_time;
+
+pub use event_time::{
+    EventTimeError, EventTimeExtractor, ExtractionMode, TimestampField, TimestampFormat,
+};
 
 use std::cmp::Ordering;
 use std::collections::BinaryHeap;
@@ -124,11 +146,7 @@ impl TimerService {
         let id = self.next_timer_id;
         self.next_timer_id += 1;
 
-        self.timers.push(TimerRegistration {
-            id,
-            timestamp,
-            key,
-        });
+        self.timers.push(TimerRegistration { id, timestamp, key });
 
         id
     }

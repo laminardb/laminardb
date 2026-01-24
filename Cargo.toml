@@ -35,6 +35,7 @@ thiserror = "2.0"
 anyhow = "1.0"
 tracing = "0.1"
 tracing-subscriber = { version = "0.3", features = ["env-filter"] }
+chrono = "0.4"
 
 # Performance-critical
 fxhash = "0.2"  # Faster than std HashMap
@@ -50,6 +51,7 @@ arrow-array = "57.2"
 arrow-schema = "57.2"
 arrow-buffer = "57.2"
 arrow-data = "57.2"
+arrow-cast = "57.2"
 datafusion = "52.0"
 datafusion-common = "52.0"
 datafusion-expr = "52.0"

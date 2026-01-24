@@ -87,7 +87,9 @@ fn bench_state_put(c: &mut Criterion) {
             b.iter(|| {
                 let key = format!("newkey:{counter:08}");
                 let value = b"newvalue";
-                store.put(black_box(key.as_bytes()), black_box(value)).unwrap();
+                store
+                    .put(black_box(key.as_bytes()), black_box(value))
+                    .unwrap();
                 counter += 1;
             })
         });
@@ -99,7 +101,9 @@ fn bench_state_put(c: &mut Criterion) {
             let mut counter = 0u64;
             b.iter(|| {
                 let value = counter.to_le_bytes();
-                store.put(black_box(key.as_bytes()), black_box(&value)).unwrap();
+                store
+                    .put(black_box(key.as_bytes()), black_box(&value))
+                    .unwrap();
                 counter += 1;
             })
         });
@@ -184,12 +188,16 @@ fn bench_snapshot(c: &mut Criterion) {
         });
 
         let snapshot = store.snapshot();
-        group.bench_with_input(BenchmarkId::new("restore", size), &snapshot, |b, snapshot| {
-            let mut store = InMemoryStore::new();
-            b.iter(|| {
-                store.restore(black_box(snapshot.clone()));
-            })
-        });
+        group.bench_with_input(
+            BenchmarkId::new("restore", size),
+            &snapshot,
+            |b, snapshot| {
+                let mut store = InMemoryStore::new();
+                b.iter(|| {
+                    store.restore(black_box(snapshot.clone()));
+                })
+            },
+        );
 
         // Serialize snapshot
         let snapshot = store.snapshot();
@@ -218,7 +226,9 @@ fn bench_typed_access(c: &mut Criterion) {
     group.bench_function("put_u64", |b| {
         let mut counter = 0u64;
         b.iter(|| {
-            store.put_typed(black_box(b"counter"), black_box(&counter)).unwrap();
+            store
+                .put_typed(black_box(b"counter"), black_box(&counter))
+                .unwrap();
             counter += 1;
         })
     });
@@ -338,7 +348,9 @@ fn bench_mmap_put(c: &mut Criterion) {
             b.iter(|| {
                 let key = format!("newkey:{counter:08}");
                 let value = b"newvalue";
-                store.put(black_box(key.as_bytes()), black_box(value)).unwrap();
+                store
+                    .put(black_box(key.as_bytes()), black_box(value))
+                    .unwrap();
                 counter += 1;
             })
         });
@@ -350,7 +362,9 @@ fn bench_mmap_put(c: &mut Criterion) {
             let mut counter = 0u64;
             b.iter(|| {
                 let value = counter.to_le_bytes();
-                store.put(black_box(key.as_bytes()), black_box(&value)).unwrap();
+                store
+                    .put(black_box(key.as_bytes()), black_box(&value))
+                    .unwrap();
                 counter += 1;
             })
         });
@@ -408,12 +422,16 @@ fn bench_mmap_snapshot(c: &mut Criterion) {
         });
 
         let snapshot = store.snapshot();
-        group.bench_with_input(BenchmarkId::new("restore", size), &snapshot, |b, snapshot| {
-            let mut store = MmapStateStore::in_memory(size * 64);
-            b.iter(|| {
-                store.restore(black_box(snapshot.clone()));
-            })
-        });
+        group.bench_with_input(
+            BenchmarkId::new("restore", size),
+            &snapshot,
+            |b, snapshot| {
+                let mut store = MmapStateStore::in_memory(size * 64);
+                b.iter(|| {
+                    store.restore(black_box(snapshot.clone()));
+                })
+            },
+        );
     }
 
     group.finish();
