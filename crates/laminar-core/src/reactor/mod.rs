@@ -25,6 +25,7 @@ use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::Arc;
 use std::time::{Duration, Instant};
 
+use crate::alloc::HotPathGuard;
 use crate::operator::{Event, Operator, OperatorContext, Output};
 use crate::state::{InMemoryStore, StateStore};
 use crate::time::{BoundedOutOfOrdernessGenerator, TimerService, WatermarkGenerator};
@@ -193,6 +194,9 @@ impl Reactor {
     /// Run one iteration of the event loop
     /// Returns outputs ready for downstream
     pub fn poll(&mut self) -> Vec<Output> {
+        // Hot path guard - will panic on allocation when allocation-tracking is enabled
+        let _guard = HotPathGuard::enter("Reactor::poll");
+
         let poll_start = Instant::now();
         let processing_time = self.get_processing_time();
 

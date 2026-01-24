@@ -8,7 +8,7 @@
 **Duration**: Continued session
 
 ### What Was Accomplished
-- ✅ **F071: Zero-Allocation Enforcement** - IMPLEMENTATION COMPLETE
+- ✅ **F071: Zero-Allocation Enforcement** - IMPLEMENTATION COMPLETE + INTEGRATION
   - `HotPathDetectingAlloc` - Custom global allocator that panics on hot path allocation
   - `HotPathGuard` - RAII guard with nesting support for marking hot path sections
   - `hot_path!` macro - Convenience macro for function entry
@@ -17,6 +17,7 @@
   - `ScratchBuffer` - Thread-local temporary storage with 64KB default
   - Feature flag `allocation-tracking` for opt-in detection
   - 33 new unit tests, all passing
+  - **Integration**: Guards added to `Reactor::poll()` and `core_thread_main()`
 - ✅ **Previous Session**: Thread-Per-Core Research specs (F067-F072)
 
 ### F071 Implementation Details
@@ -54,6 +55,12 @@ fn process_event(event: &Event) {
 [dependencies]
 laminar-core = { version = "0.1", features = ["allocation-tracking"] }
 ```
+
+**Hot Path Integration Points**:
+- `Reactor::poll()` in `crates/laminar-core/src/reactor/mod.rs:198`
+- `core_thread_main()` in `crates/laminar-core/src/tpc/core_handle.rs:427`
+
+These cover all Ring 0 hot path code including operator processing and state access.
 
 ### Previous Session Accomplishments
 

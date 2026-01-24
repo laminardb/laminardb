@@ -22,6 +22,7 @@ use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::sync::Arc;
 use std::thread::{self, JoinHandle};
 
+use crate::alloc::HotPathGuard;
 use crate::operator::{Event, Operator, Output};
 use crate::reactor::{Config as ReactorConfig, Reactor};
 
@@ -421,6 +422,9 @@ fn core_thread_main(
         if ctx.shutdown.load(Ordering::Acquire) {
             break;
         }
+
+        // Hot path guard for inbox processing
+        let _guard = HotPathGuard::enter("CoreThread::process_inbox");
 
         // Drain inbox and track messages processed for credit release
         let mut had_work = false;

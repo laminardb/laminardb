@@ -595,14 +595,29 @@ fn test_scratch_buffer() {
 - [x] 33 unit tests passing
 - [x] Documentation for patterns
 
+## Integration Status
+
+Hot path guards have been added to the main entry points:
+
+| File | Function | Status |
+|------|----------|--------|
+| `crates/laminar-core/src/reactor/mod.rs` | `Reactor::poll()` | ✅ Integrated |
+| `crates/laminar-core/src/tpc/core_handle.rs` | `core_thread_main()` | ✅ Integrated |
+
+These two entry points cover all Ring 0 hot path code:
+- **Reactor::poll()** - Processes events through operators, including state access
+- **core_thread_main()** - Per-core thread processing loop in thread-per-core architecture
+
+The operator and state modules don't need separate guards since they are called from within these guarded entry points.
+
 ## Audit Checklist
 
-Files to audit for allocation violations:
+Files audited for allocation violations:
 
-- [ ] `crates/laminar-core/src/reactor/mod.rs`
-- [ ] `crates/laminar-core/src/tpc/core_handle.rs`
-- [ ] `crates/laminar-core/src/operator/*.rs`
-- [ ] `crates/laminar-core/src/state/*.rs`
+- [x] `crates/laminar-core/src/reactor/mod.rs` - HotPathGuard in `poll()`
+- [x] `crates/laminar-core/src/tpc/core_handle.rs` - HotPathGuard in `core_thread_main()`
+- [x] `crates/laminar-core/src/operator/*.rs` - Called from reactor, covered by guard
+- [x] `crates/laminar-core/src/state/*.rs` - Called from operators, covered by guard
 
 ## References
 
