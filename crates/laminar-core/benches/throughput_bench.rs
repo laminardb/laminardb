@@ -7,7 +7,8 @@ use criterion::{criterion_group, criterion_main, Criterion, Throughput};
 use laminar_core::operator::{
     Event, Operator, OperatorContext, OperatorError, OperatorState, Output, Timer,
 };
-use laminar_core::reactor::{Config, Reactor};
+use laminar_core::{ReactorConfig, Reactor};
+use smallvec::SmallVec;
 use std::hint::black_box;
 use std::sync::Arc;
 use std::time::{Duration, Instant};
@@ -16,13 +17,13 @@ use std::time::{Duration, Instant};
 struct MinimalOperator;
 
 impl Operator for MinimalOperator {
-    fn process(&mut self, _event: &Event, _ctx: &mut OperatorContext) -> Vec<Output> {
+    fn process(&mut self, _event: &Event, _ctx: &mut OperatorContext) -> SmallVec<[Output; 4]> {
         // Return nothing to minimize overhead
-        vec![]
+        SmallVec::new()
     }
 
-    fn on_timer(&mut self, _timer: Timer, _ctx: &mut OperatorContext) -> Vec<Output> {
-        vec![]
+    fn on_timer(&mut self, _timer: Timer, _ctx: &mut OperatorContext) -> SmallVec<[Output; 4]> {
+        SmallVec::new()
     }
 
     fn checkpoint(&self) -> OperatorState {
@@ -55,7 +56,7 @@ fn bench_max_throughput(c: &mut Criterion) {
     for event_count in &[10000u64, 50000, 100000, 500000] {
         group.throughput(Throughput::Elements(*event_count));
         group.bench_function(format!("{}_events", event_count), |b| {
-            let mut config = Config::default();
+            let mut config = ReactorConfig::default();
             config.batch_size = 50000; // Very large batch
             config.event_buffer_size = (*event_count as usize) + 1000;
             config.max_iteration_time = Duration::from_secs(1); // Don't limit by time
@@ -91,7 +92,7 @@ fn bench_max_throughput(c: &mut Criterion) {
 /// Benchmark sustained throughput over time
 fn bench_sustained_throughput(c: &mut Criterion) {
     c.bench_function("sustained_throughput_1s", |b| {
-        let mut config = Config::default();
+        let mut config = ReactorConfig::default();
         config.batch_size = 10000;
         config.event_buffer_size = 100000;
 
@@ -141,7 +142,7 @@ fn bench_sustained_throughput(c: &mut Criterion) {
 /// Benchmark to verify 500K events/sec target
 fn bench_verify_target_throughput(c: &mut Criterion) {
     c.bench_function("verify_500k_events_per_sec", |b| {
-        let mut config = Config::default();
+        let mut config = ReactorConfig::default();
         config.batch_size = 10000;
         config.event_buffer_size = 100000;
 

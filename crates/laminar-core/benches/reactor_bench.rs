@@ -7,20 +7,21 @@ use criterion::{criterion_group, criterion_main, BenchmarkId, Criterion, Through
 use laminar_core::operator::{
     Event, Operator, OperatorContext, OperatorError, OperatorState, Output, Timer,
 };
-use laminar_core::reactor::{Config, Reactor};
+use laminar_core::{ReactorConfig, Reactor};
 use std::hint::black_box;
 use std::sync::Arc;
+use smallvec::SmallVec;
 
 /// A simple passthrough operator for benchmarking
 struct PassthroughOperator;
 
 impl Operator for PassthroughOperator {
-    fn process(&mut self, event: &Event, _ctx: &mut OperatorContext) -> Vec<Output> {
-        vec![Output::Event(event.clone())]
+    fn process(&mut self, event: &Event, _ctx: &mut OperatorContext) -> SmallVec<[Output; 4]> {
+        SmallVec::from(vec![Output::Event(event.clone())])
     }
 
-    fn on_timer(&mut self, _timer: Timer, _ctx: &mut OperatorContext) -> Vec<Output> {
-        vec![]
+    fn on_timer(&mut self, _timer: Timer, _ctx: &mut OperatorContext) -> SmallVec<[Output; 4]> {
+        vec![].into()
     }
 
     fn checkpoint(&self) -> OperatorState {
@@ -47,7 +48,7 @@ fn create_test_event(timestamp: i64) -> Event {
 
 /// Benchmark event submission
 fn bench_reactor_submit(c: &mut Criterion) {
-    let config = Config::default();
+    let config = ReactorConfig::default();
     let mut reactor = Reactor::new(config).unwrap();
 
     let event = create_test_event(12345);
@@ -64,7 +65,7 @@ fn bench_reactor_submit(c: &mut Criterion) {
 
 /// Benchmark processing a single event through the reactor
 fn bench_reactor_poll_single_event(c: &mut Criterion) {
-    let config = Config::default();
+    let config = ReactorConfig::default();
     let mut reactor = Reactor::new(config).unwrap();
     reactor.add_operator(Box::new(PassthroughOperator));
 
@@ -88,7 +89,7 @@ fn bench_reactor_throughput(c: &mut Criterion) {
             BenchmarkId::from_parameter(batch_size),
             batch_size,
             |b, &batch_size| {
-                let mut config = Config::default();
+                let mut config = ReactorConfig::default();
                 config.batch_size = batch_size;
                 let mut reactor = Reactor::new(config).unwrap();
                 reactor.add_operator(Box::new(PassthroughOperator));
@@ -119,7 +120,7 @@ fn bench_reactor_events_per_second(c: &mut Criterion) {
     group.throughput(Throughput::Elements(100000)); // 100k events
 
     group.bench_function("100k_events", |b| {
-        let mut config = Config::default();
+        let mut config = ReactorConfig::default();
         config.batch_size = 10000;
         config.event_buffer_size = 100000;
         let mut reactor = Reactor::new(config).unwrap();
@@ -149,7 +150,7 @@ fn bench_reactor_operator_chain(c: &mut Criterion) {
             BenchmarkId::from_parameter(num_operators),
             num_operators,
             |b, &num_operators| {
-                let config = Config::default();
+                let config = ReactorConfig::default();
                 let mut reactor = Reactor::new(config).unwrap();
 
                 // Add multiple operators
@@ -172,7 +173,7 @@ fn bench_reactor_operator_chain(c: &mut Criterion) {
 
 /// Benchmark timer performance
 fn bench_reactor_timer_performance(c: &mut Criterion) {
-    let config = Config::default();
+    let config = ReactorConfig::default();
     let mut reactor = Reactor::new(config).unwrap();
     reactor.add_operator(Box::new(PassthroughOperator));
 

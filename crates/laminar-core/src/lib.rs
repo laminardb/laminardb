@@ -43,7 +43,7 @@ pub mod time;
 pub mod tpc;
 
 // Re-export key types
-pub use reactor::{ReactorConfig as Config, Reactor};
+pub use reactor::{ReactorConfig, Reactor};
 
 /// Result type for laminar-core operations
 pub type Result<T> = std::result::Result<T, Error>;
