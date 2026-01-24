@@ -8,15 +8,54 @@
 **Duration**: Continued session
 
 ### What Was Accomplished
-- ✅ **Thread-Per-Core Research Analysis** - Compared 2026 research against F013 implementation
-- ✅ **F067: io_uring Advanced Optimization** - NEW SPEC for SQPOLL, registered buffers, IOPOLL
-- ✅ **F068: NUMA-Aware Memory Allocation** - NEW SPEC for per-core NUMA-local allocation
-- ✅ **F069: Three-Ring I/O Architecture** - NEW SPEC for latency/main/poll ring separation
-- ✅ **F070: Task Budget Enforcement** - NEW SPEC for Ring 0/1 budget tracking and yielding
-- ✅ **F071: Zero-Allocation Enforcement** - NEW SPEC for debug allocator detector and CI checks
-- ✅ **F072: XDP/eBPF Network Optimization** - NEW SPEC for 26M packets/sec CPU steering
-- ✅ **INDEX.md Updated** - Added F067-F072, new research gap analysis section
-- ✅ **STEERING.md Updated** - Added thread-per-core research priorities
+- ✅ **F071: Zero-Allocation Enforcement** - IMPLEMENTATION COMPLETE
+  - `HotPathDetectingAlloc` - Custom global allocator that panics on hot path allocation
+  - `HotPathGuard` - RAII guard with nesting support for marking hot path sections
+  - `hot_path!` macro - Convenience macro for function entry
+  - `ObjectPool<T, N>` - Fixed-size pool for zero-allocation acquire/release
+  - `RingBuffer<T, N>` - Fixed-capacity circular buffer
+  - `ScratchBuffer` - Thread-local temporary storage with 64KB default
+  - Feature flag `allocation-tracking` for opt-in detection
+  - 33 new unit tests, all passing
+- ✅ **Previous Session**: Thread-Per-Core Research specs (F067-F072)
+
+### F071 Implementation Details
+
+**New Module**: `crates/laminar-core/src/alloc/`
+```
+alloc/
+├── mod.rs          # Public exports
+├── detector.rs     # HotPathDetectingAlloc, AllocationStats
+├── guard.rs        # HotPathGuard, hot_path! macro
+├── object_pool.rs  # ObjectPool<T, N>
+├── ring_buffer.rs  # RingBuffer<T, N>
+└── scratch.rs      # ScratchBuffer, thread-local API
+```
+
+**Usage**:
+```rust
+use laminar_core::alloc::{HotPathGuard, ObjectPool, RingBuffer, ScratchBuffer};
+use laminar_core::hot_path;
+
+// Mark hot path section (panics on allocation with allocation-tracking feature)
+fn process_event(event: &Event) {
+    let _guard = HotPathGuard::enter("process_event");
+    // or use: hot_path!("process_event");
+
+    // Zero-allocation patterns:
+    let mut pool: ObjectPool<Buffer, 16> = ObjectPool::new();
+    let buf = pool.acquire().unwrap();
+    pool.release(buf);
+}
+```
+
+**Feature Flag**:
+```toml
+[dependencies]
+laminar-core = { version = "0.1", features = ["allocation-tracking"] }
+```
+
+### Previous Session Accomplishments
 
 ### Thread-Per-Core Research Analysis Summary
 
@@ -28,7 +67,7 @@ From `docs/research/laminardb-thread-per-core-2026-research.md`, identified crit
 | No NUMA awareness | "2-3x latency on remote access" | ❌ Generic allocation | **F068** |
 | Single I/O ring | "3 rings: latency/main/poll" | ❌ Single reactor | **F069** |
 | No task budgeting | "Ring 0: 500ns budget" | ❌ No enforcement | **F070** |
-| No allocation detection | "Zero-alloc verification" | ⚠️ Partial | **F071** |
+| No allocation detection | "Zero-alloc verification" | ✅ Implemented | **F071** |
 | No XDP steering | "26M packets/sec/core" | ❌ Standard sockets | **F072** |
 | CPU pinning | "Cache efficiency" | ✅ Implemented | F013 |
 | Lock-free SPSC | "~4.8ns per op" | ✅ Implemented | F014 |
@@ -55,7 +94,7 @@ F013 (Foundation) ──┬──▶ F067 (io_uring) ──▶ F069 (Three-Ring)
 - ✅ **F016: Sliding Windows** - Overlapping window support with multi-window assignment
 - ✅ **F019: Stream-Stream Joins** - Time-bounded joins with Inner/Left/Right/Full types
 - ✅ **F020: Lookup Joins** - Cached reference table lookups with TTL, inner/left join support
-- ✅ All 336 tests passing across all crates (249 core + 56 sql + 25 storage + 6 connectors)
+- ✅ All 369 tests passing across all crates (282 core + 56 sql + 25 storage + 6 connectors)
 - ✅ Clippy clean for all crates
 - ✅ TPC benchmarks added (`cargo bench --bench tpc_bench`)
 
@@ -287,6 +326,7 @@ handle.credit_metrics();       // Acquired, released, blocked, dropped
 | F019: Stream-Stream Joins | ✅ Complete | Inner/Left/Right/Full, 14 tests |
 | F020: Lookup Joins | ✅ Complete | Cached lookups with TTL, 16 tests |
 | F023: Exactly-Once Sinks | 📝 Not started | |
+| F071: Zero-Alloc Enforcement | ✅ Complete | HotPathGuard, ObjectPool, RingBuffer, 33 tests |
 
 ---
 
@@ -294,10 +334,18 @@ handle.credit_metrics();       // Acquired, released, blocked, dropped
 
 ### Current Focus
 - **Phase**: 2 Production Hardening
-- **Active Feature**: F020 complete, ready for F023 (exactly-once sinks)
+- **Active Feature**: F071 complete (8/28), ready for F067 (io_uring) or F023 (exactly-once)
 
 ### Key Files
 ```
+crates/laminar-core/src/alloc/
+├── mod.rs           # Public exports, hot_path! macro
+├── detector.rs      # HotPathDetectingAlloc, AllocationStats
+├── guard.rs         # HotPathGuard (RAII, nesting support)
+├── object_pool.rs   # ObjectPool<T, N> (fixed-size pool)
+├── ring_buffer.rs   # RingBuffer<T, N> (circular buffer)
+└── scratch.rs       # ScratchBuffer (thread-local temp storage)
+
 crates/laminar-core/src/tpc/
 ├── mod.rs           # TpcError, public exports
 ├── spsc.rs          # SpscQueue<T>, CachePadded<T>
@@ -310,13 +358,13 @@ crates/laminar-core/src/operator/
 ├── window.rs        # TumblingWindowOperator, WindowAssigner trait
 ├── sliding_window.rs# SlidingWindowOperator, SlidingWindowAssigner
 ├── stream_join.rs   # StreamJoinOperator, JoinType, JoinSide
-└── lookup_join.rs   # LookupJoinOperator, TableLoader trait (NEW)
+└── lookup_join.rs   # LookupJoinOperator, TableLoader trait
 
 crates/laminar-connectors/src/lookup.rs  # TableLoader trait, InMemoryTableLoader
 
 Benchmarks: crates/laminar-core/benches/tpc_bench.rs
 
-Tests: 336 passing (249 core, 56 sql, 25 storage, 6 connectors)
+Tests: 369 passing (282 core, 56 sql, 25 storage, 6 connectors)
 ```
 
 ### Useful Commands

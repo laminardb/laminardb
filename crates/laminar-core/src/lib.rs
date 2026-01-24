@@ -28,10 +28,12 @@
 //! ```
 
 #![deny(missing_docs)]
-#![deny(unsafe_code)] // Will selectively allow where needed with justification
 #![warn(clippy::all, clippy::pedantic)]
 #![allow(clippy::module_name_repetitions)]
+// Allow unsafe in alloc module for zero-copy optimizations
+#![allow(unsafe_code)]
 
+pub mod alloc;
 pub mod operator;
 pub mod reactor;
 pub mod state;

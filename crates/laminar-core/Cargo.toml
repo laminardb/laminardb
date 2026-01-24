@@ -9,6 +9,11 @@ homepage.workspace = true
 documentation = "https://docs.laminardb.io/laminar-core"
 description = "Core streaming engine for LaminarDB - reactor, operators, and state management"
 
+[features]
+default = []
+# Enable hot path allocation detection - panics on allocation in marked sections
+allocation-tracking = []
+
 [dependencies]
 # Performance critical - no allocations on hot path
 fxhash = { workspace = true }
@@ -19,6 +24,7 @@ memmap2 = { workspace = true }
 bumpalo = { workspace = true }
 uuid = { workspace = true }
 smallvec = { workspace = true }
+arrayvec = { workspace = true }
 
 # Arrow for columnar data
 arrow = { workspace = true }

@@ -60,6 +60,7 @@ datafusion-sql = "52.0"
 
 # Collections
 smallvec = { version = "1.15", features = ["const_new", "union"] }
+arrayvec = "0.7"
 
 # Platform-specific
 libc = "0.2"
