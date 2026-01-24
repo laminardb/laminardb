@@ -28,6 +28,9 @@ struct CheckpointMetadataInternal {
 
     /// Size of the state snapshot in bytes
     pub state_size: u64,
+
+    /// Current watermark at checkpoint time (for recovery)
+    pub watermark: Option<i64>,
 }
 
 /// Checkpoint metadata stored alongside checkpoint data
@@ -47,6 +50,9 @@ pub struct CheckpointMetadata {
 
     /// Size of the state snapshot in bytes
     pub state_size: u64,
+
+    /// Current watermark at checkpoint time (for recovery)
+    pub watermark: Option<i64>,
 }
 
 /// A completed checkpoint on disk
@@ -144,6 +150,13 @@ impl CheckpointManager {
 
     /// Create a new checkpoint from the given state snapshot.
     ///
+    /// # Arguments
+    ///
+    /// * `state_snapshot` - The serialized state to checkpoint
+    /// * `wal_position` - Current WAL position for recovery
+    /// * `source_offsets` - Source offsets for exactly-once semantics
+    /// * `watermark` - Current watermark for recovery
+    ///
     /// # Errors
     ///
     /// Returns an error if the checkpoint directory cannot be created,
@@ -157,6 +170,7 @@ impl CheckpointManager {
         state_snapshot: &[u8],
         wal_position: WalPosition,
         source_offsets: HashMap<String, u64>,
+        watermark: Option<i64>,
     ) -> Result<Checkpoint> {
         // Generate checkpoint ID
         let checkpoint_id = self.next_id.fetch_add(1, Ordering::SeqCst);
@@ -178,6 +192,7 @@ impl CheckpointManager {
             wal_position,
             source_offsets,
             state_size: state_snapshot.len() as u64,
+            watermark,
         };
 
         // Write state snapshot
@@ -200,6 +215,7 @@ impl CheckpointManager {
             timestamp: metadata.timestamp,
             wal_position: metadata.wal_position,
             state_size: metadata.state_size,
+            watermark: metadata.watermark,
         };
 
         let metadata_path = checkpoint_path.join("metadata.rkyv");
@@ -288,6 +304,7 @@ impl CheckpointManager {
             wal_position: metadata_internal.wal_position,
             source_offsets: HashMap::new(), // Will be loaded separately
             state_size: metadata_internal.state_size,
+            watermark: metadata_internal.watermark,
         };
 
         // Verify state file exists
@@ -421,12 +438,14 @@ mod tests {
             state,
             wal_position,
             offsets.clone(),
+            Some(5000), // watermark
         ).unwrap();
 
         assert_eq!(checkpoint.metadata.id, 0);
         assert_eq!(checkpoint.metadata.wal_position, wal_position);
         assert_eq!(checkpoint.metadata.source_offsets, offsets);
         assert_eq!(checkpoint.metadata.state_size, state.len() as u64);
+        assert_eq!(checkpoint.metadata.watermark, Some(5000));
 
         // Verify files exist
         assert!(checkpoint.metadata_path().exists());
@@ -456,6 +475,7 @@ mod tests {
                 b"state",
                 wal_position,
                 HashMap::new(),
+                Some(i as i64 * 1000),
             ).unwrap();
         }
 
@@ -481,6 +501,7 @@ mod tests {
                 b"state",
                 wal_position,
                 HashMap::new(),
+                None, // no watermark for this test
             ).unwrap();
         }
 
@@ -517,6 +538,7 @@ mod tests {
                 b"state data",
                 WalPosition { offset: 123 },
                 HashMap::new(),
+                Some(9999),
             ).unwrap();
 
             checkpoint.metadata.id
@@ -533,13 +555,16 @@ mod tests {
         let loaded = manager.load_checkpoint(checkpoint_id).unwrap();
         assert_eq!(loaded.metadata.id, checkpoint_id);
         assert_eq!(loaded.metadata.wal_position.offset, 123);
+        assert_eq!(loaded.metadata.watermark, Some(9999));
 
         // Next checkpoint should have incremented ID
         let next = manager.create_checkpoint(
             b"new state",
             WalPosition { offset: 200 },
             HashMap::new(),
+            Some(12345),
         ).unwrap();
         assert_eq!(next.metadata.id, checkpoint_id + 1);
+        assert_eq!(next.metadata.watermark, Some(12345));
     }
 }

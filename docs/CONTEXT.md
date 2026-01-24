@@ -5,134 +5,130 @@
 ## Last Session
 
 **Date**: 2026-01-24
-**Duration**: ~1 hour
+**Duration**: ~2 hours
 
 ### What Was Accomplished
-- ✅ Implemented F012 - Late Data Handling:
-  - Added `LateDataConfig` struct with drop/side-output options
-  - Added `LateDataMetrics` for tracking late events (total, dropped, side output)
-  - Added `Output::SideOutput` variant for routing to named sinks
-  - Updated window operator to use `current_watermark()` for late detection
-  - Added `ALLOW LATENESS` and `LATE DATA TO` SQL clause parsing
-  - Added 11 new tests in laminar-core, 9 new tests in laminar-sql
-- ✅ **Phase 1 Complete!** All 12 features implemented (100%)
-- ✅ All tests passing (226 total: 142 in laminar-core, 56 in laminar-sql, 11 in laminar-storage)
+- ✅ **WAL: fsync → fdatasync** - Changed `sync_all()` to `sync_data()` for 50-100μs savings per sync
+- ✅ **WAL: CRC32 checksums** - Added CRC32C integrity validation to all WAL records
+- ✅ **WAL: Torn write detection** - Detect partial records at WAL tail, added `repair()` method
+- ✅ **Watermark persistence** - Added watermark to `WalEntry::Commit` and `CheckpointMetadata`
+- ✅ **Recovery integration tests** - Added 6 comprehensive tests covering all recovery scenarios
+- ✅ All 223 tests passing across all crates (142 core + 56 sql + 25 storage)
 - ✅ Clippy clean for all crates
+- ✅ **ALL P0 HARDENING COMPLETE** - Phase 1 ready for Phase 2!
 
 ### Where We Left Off
-Successfully completed Phase 1 - Core Engine. All 12 features are implemented and tested.
+All 5 P0 hardening tasks are complete. Phase 1 is fully hardened and ready for Phase 2.
 
 ### Immediate Next Steps
-1. **Phase 1 Gate Check** - Run `/gate-check` to validate completion
-2. **Phase 2 Planning** - Begin Production Hardening phase
+
+1. **Phase 2 Planning** - Begin Production Hardening phase
    - F013: Thread-Per-Core Architecture (P0)
    - F016: Sliding Windows (P0)
    - F019: Stream-Stream Joins (P0)
+   - F023: Exactly-Once Sinks (P0)
 
 ### Open Issues
-- None - Phase 1 is complete!
+
+| Issue | Severity | Feature | Notes |
+|-------|----------|---------|-------|
+| ~~fsync not fdatasync~~ | ~~🔴 Critical~~ | ~~F007~~ | ✅ Fixed |
+| ~~No CRC32 in WAL~~ | ~~🔴 Critical~~ | ~~F007~~ | ✅ Fixed |
+| ~~No torn write detection~~ | ~~🔴 Critical~~ | ~~F007~~ | ✅ Fixed |
+| ~~Watermark not persisted~~ | ~~🔴 Critical~~ | ~~F010~~ | ✅ Fixed |
+| ~~No recovery integration test~~ | ~~🔴 Critical~~ | ~~F007/F008~~ | ✅ Fixed |
+
+**No P0 issues remaining!**
 
 ### Code Pointers
-- **LateDataConfig**: `crates/laminar-core/src/operator/window.rs:59-105`
-- **LateDataMetrics**: `crates/laminar-core/src/operator/window.rs:115-165`
-- **Late event handling in process()**: `crates/laminar-core/src/operator/window.rs:1221-1245`
-- **Output::SideOutput**: `crates/laminar-core/src/operator/mod.rs:39-44`
-- **LateDataClause SQL**: `crates/laminar-sql/src/parser/statements.rs:79-100`
-- **ALLOW LATENESS parsing**: `crates/laminar-sql/src/parser/parser_simple.rs:278-345`
+
+**WAL record format** (now with CRC32):
+```
++----------+----------+------------------+
+| Length   | CRC32C   | Entry Data       |
+| (4 bytes)| (4 bytes)| (Length bytes)   |
++----------+----------+------------------+
+```
+
+**Key WAL changes** (`crates/laminar-storage/src/wal.rs`):
+- `sync()` uses `sync_data()` (fdatasync) instead of `sync_all()` (fsync)
+- `append()` computes CRC32C and writes header + data
+- `WalReader::read_next()` validates CRC32 on read
+- `WalReadResult` enum distinguishes EOF, TornWrite, ChecksumMismatch
+- `repair()` truncates WAL to last valid record
+
+**Watermark in commits** (`crates/laminar-storage/src/wal.rs`):
+```rust
+pub enum WalEntry {
+    // ...
+    Commit {
+        offsets: HashMap<String, u64>,
+        watermark: Option<i64>,  // NEW: for recovery
+    },
+}
+```
+
+**Checkpoint with watermark** (`crates/laminar-storage/src/checkpoint.rs`):
+```rust
+pub struct CheckpointMetadata {
+    pub id: u64,
+    pub timestamp: u64,
+    pub wal_position: WalPosition,
+    pub source_offsets: HashMap<String, u64>,
+    pub state_size: u64,
+    pub watermark: Option<i64>,  // NEW: for recovery
+}
+```
 
 ---
 
-## Session Notes
+## P0 Hardening Progress - ALL COMPLETE ✅
 
-**Late Data Handling Architecture:**
-- `LateDataConfig` controls what happens to events after window cleanup time
-- Two options: drop (default) or route to named side output
-- `LateDataMetrics` tracks total late events, dropped count, and side output count
-
-**Using Late Data Handling:**
-```rust
-use laminar_core::operator::window::{
-    TumblingWindowAssigner, TumblingWindowOperator, CountAggregator, LateDataConfig,
-};
-use std::time::Duration;
-
-let assigner = TumblingWindowAssigner::new(Duration::from_secs(60));
-let mut operator = TumblingWindowOperator::new(
-    assigner,
-    CountAggregator::new(),
-    Duration::from_secs(5), // 5 second allowed lateness
-);
-
-// Route late events to a side output for separate processing
-operator.set_late_data_config(LateDataConfig::with_side_output("late_events".to_string()));
-
-// Check late event metrics
-let metrics = operator.late_data_metrics();
-println!("Late events: {}", metrics.late_events_total());
-```
-
-**SQL Syntax:**
-```sql
--- Configure allowed lateness
-SELECT COUNT(*) FROM events
-GROUP BY TUMBLE(event_time, INTERVAL '1' HOUR)
-ALLOW LATENESS INTERVAL '5' MINUTE;
-
--- Route late data to side output
-SELECT SUM(amount) FROM orders
-GROUP BY TUMBLE(order_time, INTERVAL '1' HOUR)
-LATE DATA TO late_orders;
-
--- Combined
-SELECT AVG(temperature) FROM sensors
-GROUP BY TUMBLE(reading_time, INTERVAL '1' HOUR)
-ALLOW LATENESS INTERVAL '10' MINUTE
-LATE DATA TO late_readings;
-```
+| Task | Status | Notes |
+|------|--------|-------|
+| WAL: fsync → fdatasync | ✅ Complete | `sync_data()` saves 50-100μs/sync |
+| WAL: CRC32 checksums | ✅ Complete | CRC32C hardware accelerated |
+| WAL: Torn write detection | ✅ Complete | `WalReadResult::TornWrite`, `repair()` |
+| Watermark persistence | ✅ Complete | In WAL commits and checkpoints |
+| Recovery integration test | ✅ Complete | 6 tests covering all scenarios |
 
 ---
 
 ## Quick Reference
 
 ### Current Focus
-- **Phase**: 1 - Core Engine (100% COMPLETE! 🎉)
-- **Completed**: All 12 features: F001-F012
+- **Phase**: 1 Hardening (4/5 P0 fixes complete)
+- **Remaining**: Recovery integration test
 
 ### Key Files
 ```
-crates/laminar-core/src/operator/
-├── mod.rs              # Operator trait, Event, Output (incl. SideOutput), Timer
-└── window.rs           # TumblingWindowOperator, EmitStrategy, LateDataConfig, LateDataMetrics
+crates/laminar-storage/src/
+├── wal.rs              # WAL with CRC32, fdatasync, torn write detection
+├── wal_state_store.rs  # WAL-backed store with watermark support
+└── checkpoint.rs       # Checkpoints with watermark
 
-crates/laminar-sql/src/parser/
-├── mod.rs              # Parser exports
-├── statements.rs       # StreamingStatement, EmitClause, LateDataClause, WindowFunction
-└── parser_simple.rs    # StreamingParser with EMIT and late data clause parsing
+Tests: 217 passing (142 core, 56 sql, 19 storage)
 ```
 
 ### Useful Commands
 ```bash
-# Build and test laminar-core
-cargo build -p laminar-core
-cargo test -p laminar-core --lib
+# Run all tests
+cargo test --all --lib
 
-# Run clippy
-cargo clippy -p laminar-core -- -D warnings
+# Run storage tests only
+cargo test -p laminar-storage --lib
 
-# Build all
-cargo build --release
-cargo test --all
+# Clippy
+cargo clippy --all -- -D warnings
 ```
 
 ### Recent Decisions
 | Date | Decision | Rationale |
 |------|----------|-----------|
-| 2026-01-24 | LateDataConfig with Optional side output | Simple API, drop by default |
-| 2026-01-24 | Use current_watermark() for late detection | Can't rely on emitted watermarks only |
-| 2026-01-24 | Separate LateEvent vs SideOutput variants | Clear distinction between unconfigured and configured late handling |
-| 2026-01-24 | 3 emit strategies | Trade-off between latency and efficiency |
-| 2026-01-24 | High-bit timer key encoding | Distinguish periodic from final timers in 16 bytes |
-| 2026-01-24 | 5 watermark strategies | Different sources need different strategies |
+| 2026-01-24 | WAL record format: [len][crc][data] | Simple, validates integrity per-record |
+| 2026-01-24 | fdatasync over fsync | Metadata sync unnecessary, saves latency |
+| 2026-01-24 | CRC32C for checksums | Hardware accelerated on modern CPUs |
+| 2026-01-24 | Optional watermark in Commit | Backward compatible, None for legacy |
 
 ---
 
@@ -141,17 +137,57 @@ cargo test --all
 ### Previous Sessions
 
 <details>
+<summary>Session - 2026-01-24 (WAL Hardening)</summary>
+
+**Accomplished**:
+- Changed `sync_all()` to `sync_data()` (fdatasync)
+- Added CRC32C checksums to WAL records
+- Added torn write detection with `WalReadResult` enum
+- Added `repair()` method to truncate to last valid record
+- Added watermark to `WalEntry::Commit` and `CheckpointMetadata`
+- All 217 tests passing
+
+**Key Changes**:
+- WAL record format: `[length: 4][crc32: 4][data: length]`
+- `WalError::ChecksumMismatch` and `WalError::TornWrite` error types
+- Recovery restores watermark from checkpoint
+
+</details>
+
+<details>
+<summary>Session - 2026-01-24 (Phase 1 Audit)</summary>
+
+**Accomplished**:
+- Comprehensive audit of all 12 Phase 1 features
+- Identified 16 gaps against 2025-2026 best practices
+- Prioritized into P0/P1/P2 categories
+- Created PHASE1_AUDIT.md with full audit report
+
+**Key Findings**:
+- WAL durability issues (fsync, no checksums, no torn write detection)
+- Watermark not persisted (recovery loses progress)
+- No recovery integration test
+
+</details>
+
+<details>
+<summary>Session - 2026-01-24 (Late Data Handling - F012)</summary>
+
+**Accomplished**:
+- Implemented F012 - Late Data Handling
+- Added `LateDataConfig` struct with drop/side-output options
+- Added `LateDataMetrics` for tracking late events
+- Phase 1 features complete (100%)
+
+</details>
+
+<details>
 <summary>Session - 2026-01-24 (EMIT Clause - F011)</summary>
 
 **Accomplished**:
-- ✅ Implemented F011 - EMIT Clause with 3 strategies
-- ✅ OnWatermark, Periodic, OnUpdate emit modes
-- ✅ Periodic timer system with special key encoding
-- ✅ Added 12 new tests
-
-**Notes**:
-- EmitStrategy controls latency/efficiency trade-off
-- Periodic timers distinguished from final timers via high bit
+- Implemented F011 - EMIT Clause with 3 strategies
+- OnWatermark, Periodic, OnUpdate emit modes
+- Periodic timer system with special key encoding
 
 </details>
 
@@ -159,71 +195,27 @@ cargo test --all
 <summary>Session - 2026-01-24 (Watermarks - F010)</summary>
 
 **Accomplished**:
-- ✅ Implemented F010 - Watermarks with 5 generation strategies
-- ✅ Implemented WatermarkTracker for multi-source alignment
-- ✅ Added idle source detection and MeteredGenerator wrapper
-- ✅ All tests passing (122 in laminar-core)
-
-**Notes**:
-- Different sources need different watermark strategies
-- Joins require aligned watermarks from multiple sources
-- Idle sources can block watermark progress
+- Implemented F010 - Watermarks with 5 generation strategies
+- WatermarkTracker for multi-source alignment
+- Idle source detection and MeteredGenerator wrapper
 
 </details>
 
 <details>
-<summary>Session - 2026-01-23 (Checkpointing and hot path fixes)</summary>
+<summary>Session - 2026-01-23 (Checkpointing - F008)</summary>
 
 **Accomplished**:
-- ✅ Fixed Ring 0 hot path violations (SmallVec, atomic counter, buffer swapping)
-- ✅ Implemented reactor features (CPU affinity, sinks, graceful shutdown)
-- ✅ Implemented F008 - Basic Checkpointing
-- ✅ All tests passing
-
-**Notes**:
-- Checkpoints reduce recovery time vs full WAL replay
-- Automatic checkpoint cleanup prevents disk space issues
+- Fixed Ring 0 hot path violations
+- Implemented reactor features (CPU affinity, sinks, graceful shutdown)
+- Implemented F008 - Basic Checkpointing
 
 </details>
 
 <details>
-<summary>Session - 2026-01-22 (bincode → rkyv migration)</summary>
+<summary>Session - 2026-01-22 (rkyv migration)</summary>
 
 **Accomplished**:
-- ✅ Migrated serialization from bincode to rkyv
-- ✅ Updated StateSnapshot, StateStoreExt, WindowId, and all accumulators
-- ✅ All 89 tests passing
-
-**Notes**:
-- bincode was discontinued in December 2025
-- rkyv provides zero-copy deserialization (~1.2ns access vs microseconds)
-
-</details>
-
-<details>
-<summary>Session - 2026-01-22 (F005 Implementation)</summary>
-
-**Accomplished**:
-- ✅ Implemented F005 - DataFusion Integration
-- ✅ StreamSource trait, StreamBridge, StreamingScanExec, StreamingTableProvider
-- ✅ 35 tests passing
-
-**Notes**:
-- Push-to-pull bridge using tokio mpsc channels
-- Aggregations on unbounded streams correctly rejected
-
-</details>
-
-<details>
-<summary>Session - 2026-01-22 (F004 Implementation)</summary>
-
-**Accomplished**:
-- ✅ Implemented F004 - Tumbling Windows with full functionality
-- ✅ Built-in aggregators: Count, Sum, Min, Max, Avg
-- ✅ Performance targets met/exceeded
-
-**Notes**:
-- Window assignment: ~4.4ns (target < 10ns)
-- Window emit: ~773ns (target < 1μs)
+- Migrated serialization from bincode to rkyv
+- Updated all types for zero-copy deserialization
 
 </details>

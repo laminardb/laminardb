@@ -25,6 +25,9 @@ serde = { workspace = true }
 serde_json = { workspace = true }
 bytes = { workspace = true }
 
+# CRC32 for WAL integrity
+crc32c = "0.6"
+
 # Async
 tokio = { workspace = true }
 async-trait = { workspace = true }

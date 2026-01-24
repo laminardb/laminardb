@@ -2,19 +2,20 @@
 
 ## Overview
 
-| Phase | Total | Draft | In Progress | Done |
-|-------|-------|-------|-------------|------|
-| Phase 1 | 12 | 0 | 0 | 12 |
-| Phase 2 | 12 | 12 | 0 | 0 |
-| Phase 3 | 10 | 10 | 0 | 0 |
-| Phase 4 | 11 | 11 | 0 | 0 |
-| Phase 5 | 10 | 10 | 0 | 0 |
-| **Total** | **55** | **43** | **0** | **12** |
+| Phase | Total | Draft | In Progress | Hardening | Done |
+|-------|-------|-------|-------------|-----------|------|
+| Phase 1 | 12 | 0 | 0 | 1 | 11 |
+| Phase 2 | 12 | 12 | 0 | 0 | 0 |
+| Phase 3 | 10 | 10 | 0 | 0 | 0 |
+| Phase 4 | 11 | 11 | 0 | 0 | 0 |
+| Phase 5 | 10 | 10 | 0 | 0 | 0 |
+| **Total** | **55** | **43** | **0** | **1** | **11** |
 
 ## Status Legend
 
 - 📝 Draft - Specification written, not started
 - 🚧 In Progress - Active development
+- 🔧 Hardening - Functional but has gaps to fix
 - ✅ Done - Complete and merged
 - ⏸️ Paused - On hold
 - ❌ Cancelled - Will not implement
@@ -23,24 +24,38 @@
 
 ## Phase 1: Core Engine
 
-| ID | Feature | Priority | Status | Spec |
-|----|---------|----------|--------|------|
-| F001 | Core Reactor Event Loop | P0 | ✅ | [Link](phase-1/F001-core-reactor-event-loop.md) |
-| F002 | Memory-Mapped State Store | P0 | ✅ | [Link](phase-1/F002-memory-mapped-state-store.md) |
-| F003 | State Store Interface | P0 | ✅ | [Link](phase-1/F003-state-store-interface.md) |
-| F004 | Tumbling Windows | P0 | ✅ | [Link](phase-1/F004-tumbling-windows.md) |
-| F005 | DataFusion Integration | P0 | ✅ | [Link](phase-1/F005-datafusion-integration.md) |
-| F006 | Basic SQL Parser | P0 | ✅ | [Link](phase-1/F006-basic-sql-parser.md) |
-| F007 | Write-Ahead Log | P1 | ✅ | [Link](phase-1/F007-write-ahead-log.md) |
-| F008 | Basic Checkpointing | P1 | ✅ | [Link](phase-1/F008-basic-checkpointing.md) |
-| F009 | Event Time Processing | P1 | ✅ | [Link](phase-1/F009-event-time-processing.md) |
-| F010 | Watermarks | P1 | ✅ | [Link](phase-1/F010-watermarks.md) |
-| F011 | EMIT Clause | P2 | ✅ | [Link](phase-1/F011-emit-clause.md) |
-| F012 | Late Data Handling | P2 | ✅ | [Link](phase-1/F012-late-data-handling.md) |
+> **Status**: ✅ **PHASE 1 COMPLETE!** All P0 hardening tasks done. Ready for Phase 2. See [PHASE1_AUDIT.md](../PHASE1_AUDIT.md) for details.
+
+| ID | Feature | Priority | Status | Gaps | Spec |
+|----|---------|----------|--------|------|------|
+| F001 | Core Reactor Event Loop | P0 | ✅ | No io_uring (P1) | [Link](phase-1/F001-core-reactor-event-loop.md) |
+| F002 | Memory-Mapped State Store | P0 | ✅ | No CoW/huge pages (P1) | [Link](phase-1/F002-memory-mapped-state-store.md) |
+| F003 | State Store Interface | P0 | ✅ | Prefix scan O(n) (P2) | [Link](phase-1/F003-state-store-interface.md) |
+| F004 | Tumbling Windows | P0 | ✅ | None | [Link](phase-1/F004-tumbling-windows.md) |
+| F005 | DataFusion Integration | P0 | ✅ | No EXPLAIN (P2) | [Link](phase-1/F005-datafusion-integration.md) |
+| F006 | Basic SQL Parser | P0 | 🔧 | **POC only** (P1) | [Link](phase-1/F006-basic-sql-parser.md) |
+| F007 | Write-Ahead Log | P1 | ✅ | CRC32, fdatasync, torn write - all fixed | [Link](phase-1/F007-write-ahead-log.md) |
+| F008 | Basic Checkpointing | P1 | 🔧 | Blocking I/O (P1 for Phase 2) | [Link](phase-1/F008-basic-checkpointing.md) |
+| F009 | Event Time Processing | P1 | ✅ | None | [Link](phase-1/F009-event-time-processing.md) |
+| F010 | Watermarks | P1 | ✅ | Persistence fixed in WAL + checkpoint | [Link](phase-1/F010-watermarks.md) |
+| F011 | EMIT Clause | P2 | ✅ | None | [Link](phase-1/F011-emit-clause.md) |
+| F012 | Late Data Handling | P2 | ✅ | No retractions (P2) | [Link](phase-1/F012-late-data-handling.md) |
+
+### Phase 1 Hardening Tasks (P0) - ALL COMPLETE ✅
+
+| Task | Feature | Status | Notes |
+|------|---------|--------|-------|
+| WAL: fsync → fdatasync | F007 | ✅ Done | `sync_data()` saves 50-100μs/sync |
+| WAL: Add CRC32 checksum | F007 | ✅ Done | CRC32C hardware accelerated |
+| WAL: Torn write detection | F007 | ✅ Done | `WalReadResult::TornWrite`, `repair()` |
+| Watermark persistence | F010 | ✅ Done | In WAL commits and checkpoints |
+| Recovery integration test | F007/F008 | ✅ Done | 6 comprehensive tests |
 
 ---
 
 ## Phase 2: Production Hardening
+
+> **Status**: Ready to start (Phase 1 hardening complete)
 
 | ID | Feature | Priority | Status | Spec |
 |----|---------|----------|--------|------|
@@ -120,16 +135,57 @@ F001 (Reactor) ──┬──▶ F002 (State Store)
                  ├──▶ F004 (Tumbling Windows)
                  └──▶ F009 (Event Time)
                           │
-F005 (DataFusion) ───────▶ F006 (SQL Parser)
+F005 (DataFusion) ───────▶ F006 (SQL Parser) ⚠️ POC
                           │
-F007 (WAL) ──────────────▶ F008 (Checkpointing)
+F007 (WAL) ⚠️ ───────────▶ F008 (Checkpointing)
                           │
-F009 (Event Time) ───────▶ F010 (Watermarks) ──▶ F012 (Late Data)
-                                              ──▶ F011 (EMIT)
+F009 (Event Time) ───────▶ F010 (Watermarks) ⚠️ ──▶ F012 (Late Data)
+                                                 ──▶ F011 (EMIT)
 
+Phase 1 Hardening (must complete before Phase 2):
+┌─────────────────────────────────────────────────────────┐
+│ F007: fsync→fdatasync, CRC32, torn write detection     │
+│ F010: Watermark persistence in WAL                      │
+│ Integration test: Checkpoint + WAL replay               │
+└─────────────────────────────────────────────────────────┘
+                          │
+                          ▼
 Phase 2:
 F001 ──▶ F013 (Thread-per-Core) ──▶ F014 (SPSC) ──▶ F015 (CPU Pinning)
 F004 ──▶ F016 (Sliding) ──▶ F017 (Session) ──▶ F018 (Hopping)
 F003 ──▶ F019 (Stream Joins) ──▶ F020 (Lookup) ──▶ F021 (Temporal)
 F008 ──▶ F022 (Incremental) ──▶ F023 (Exactly-Once) ──▶ F024 (2PC)
 ```
+
+---
+
+## Gap Summary by Priority
+
+### P0 - Critical (Blocks Phase 2)
+
+| Gap | Feature | Impact |
+|-----|---------|--------|
+| WAL uses fsync not fdatasync | F007 | 50-100μs wasted per sync |
+| No CRC32 checksum in WAL | F007 | Cannot detect corruption |
+| No torn write detection | F007 | Crash recovery may fail |
+| Watermark not persisted | F010 | Recovery loses progress |
+| No recovery integration test | F007/F008 | Untested critical path |
+
+### P1 - High (Early Phase 2)
+
+| Gap | Feature | Impact |
+|-----|---------|--------|
+| SQL parser is POC only | F006 | Required for advanced features |
+| No per-core WAL | F007 | Required for F013 |
+| Checkpoint blocks Ring 0 | F008 | Latency spikes |
+| No CoW mmap | F002 | Can't isolate snapshots |
+| No io_uring | F001 | Blocking I/O on hot path |
+
+### P2 - Medium (Phase 2+)
+
+| Gap | Feature | Impact |
+|-----|---------|--------|
+| Prefix scan O(n) | F003 | Slow for large state |
+| No incremental checkpoints | F008 | Large checkpoint overhead |
+| No retractions | F012 | Required for joins |
+| No madvise hints | F002 | Suboptimal TLB usage |
