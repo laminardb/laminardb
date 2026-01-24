@@ -124,6 +124,7 @@ pub enum OperatorError {
     ProcessingFailed(String),
 }
 
+pub mod sliding_window;
 pub mod window;
 
 #[cfg(test)]

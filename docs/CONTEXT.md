@@ -11,7 +11,8 @@
 - ✅ **F013: Thread-Per-Core Architecture** - Full implementation complete
 - ✅ **F014: SPSC Queue** - Lock-free bounded queue with cache padding
 - ✅ **Credit-Based Backpressure** - Apache Flink-style flow control added
-- ✅ All 275 tests passing across all crates (194 core + 56 sql + 25 storage)
+- ✅ **F016: Sliding Windows** - Overlapping window support with multi-window assignment
+- ✅ All 300 tests passing across all crates (219 core + 56 sql + 25 storage)
 - ✅ Clippy clean for all crates
 - ✅ TPC benchmarks added (`cargo bench --bench tpc_bench`)
 
@@ -59,14 +60,52 @@ crates/laminar-core/src/tpc/
   - submit/poll/stats operations
   - OperatorFactory for per-core operators
 
+### F016 Sliding Windows Implementation
+
+**Module**: `crates/laminar-core/src/operator/sliding_window.rs`
+
+**Key Components**:
+- `SlidingWindowAssigner` - Assigns events to multiple overlapping windows
+  - Configurable size and slide interval
+  - `windows_per_event` cached for performance (ceil(size/slide))
+  - Handles negative timestamps correctly
+  - Returns windows in chronological order via `SmallVec<[WindowId; 4]>`
+
+- `SlidingWindowOperator<A: Aggregator>` - Processes events through overlapping windows
+  - Each event updates `ceil(size/slide)` windows
+  - Supports all EmitStrategies (OnWatermark, Periodic, OnUpdate)
+  - Late data handling with side outputs
+  - Checkpoint/restore for fault tolerance
+  - Skips closed windows when processing late (but within lateness) events
+
+**Example**:
+```rust
+use laminar_core::operator::sliding_window::{
+    SlidingWindowAssigner, SlidingWindowOperator,
+};
+use laminar_core::operator::window::CountAggregator;
+use std::time::Duration;
+
+// 1-hour window with 15-minute slide (4 windows per event)
+let assigner = SlidingWindowAssigner::new(
+    Duration::from_secs(3600),  // 1 hour
+    Duration::from_secs(900),   // 15 minutes
+);
+let operator = SlidingWindowOperator::new(
+    assigner,
+    CountAggregator::new(),
+    Duration::from_secs(60),  // 1 minute grace period
+);
+```
+
 ### Where We Left Off
-Phase 2 P0 feature F013 is complete with backpressure. Ready to continue with remaining Phase 2 work.
+Phase 2 P0 features F013 and F016 complete. Ready to continue with joins and exactly-once sinks.
 
 ### Immediate Next Steps
 
 1. **Continue Phase 2** - Production Hardening
-   - F016: Sliding Windows (P0)
    - F019: Stream-Stream Joins (P0)
+   - F020: Lookup Joins (P0)
    - F023: Exactly-Once Sinks (P0)
 
 ### Open Issues
@@ -125,8 +164,12 @@ handle.credit_metrics();       // Acquired, released, blocked, dropped
 |---------|--------|-------|
 | F013: Thread-Per-Core | ✅ Complete | SPSC queues, key routing, CPU pinning |
 | F014: SPSC Queues | ✅ Complete | Part of F013 implementation |
-| F016: Sliding Windows | 📝 Not started | |
+| F015: CPU Pinning | ✅ Complete | Included in F013 |
+| F016: Sliding Windows | ✅ Complete | Multi-window assignment, 25 tests |
+| F017: Session Windows | 📝 Not started | |
+| F018: Hopping Windows | ✅ Complete | Alias for sliding windows |
 | F019: Stream-Stream Joins | 📝 Not started | |
+| F020: Lookup Joins | 📝 Not started | |
 | F023: Exactly-Once Sinks | 📝 Not started | |
 
 ---
@@ -135,7 +178,7 @@ handle.credit_metrics();       // Acquired, released, blocked, dropped
 
 ### Current Focus
 - **Phase**: 2 Production Hardening
-- **Active Feature**: F013 complete, ready for F016
+- **Active Feature**: F016 complete, ready for F019 (joins)
 
 ### Key Files
 ```
@@ -146,9 +189,14 @@ crates/laminar-core/src/tpc/
 ├── core_handle.rs   # CoreHandle, CoreConfig, CoreMessage
 └── runtime.rs       # ThreadPerCoreRuntime, TpcConfig
 
+crates/laminar-core/src/operator/
+├── mod.rs           # Operator trait, Event, Output types
+├── window.rs        # TumblingWindowOperator, WindowAssigner trait
+└── sliding_window.rs# SlidingWindowOperator, SlidingWindowAssigner
+
 Benchmarks: crates/laminar-core/benches/tpc_bench.rs
 
-Tests: 267 passing (186 core, 56 sql, 25 storage)
+Tests: 300 passing (219 core, 56 sql, 25 storage)
 ```
 
 ### Useful Commands

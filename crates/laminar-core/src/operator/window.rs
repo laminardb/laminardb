@@ -148,13 +148,13 @@ impl LateDataMetrics {
     }
 
     /// Records a dropped late event.
-    fn record_dropped(&mut self) {
+    pub fn record_dropped(&mut self) {
         self.late_events_total += 1;
         self.late_events_dropped += 1;
     }
 
     /// Records a late event routed to side output.
-    fn record_side_output(&mut self) {
+    pub fn record_side_output(&mut self) {
         self.late_events_total += 1;
         self.late_events_side_output += 1;
     }
