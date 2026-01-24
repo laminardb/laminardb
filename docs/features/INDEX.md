@@ -6,11 +6,11 @@
 |-------|-------|-------|-------------|-----------|------|
 | Phase 1 | 12 | 0 | 0 | 1 | 11 |
 | Phase 1.5 | 1 | 1 | 0 | 0 | 0 |
-| Phase 2 | 16 | 9 | 0 | 0 | 7 |
+| Phase 2 | 17 | 10 | 0 | 0 | 7 |
 | Phase 3 | 12 | 12 | 0 | 0 | 0 |
 | Phase 4 | 11 | 11 | 0 | 0 | 0 |
 | Phase 5 | 10 | 10 | 0 | 0 | 0 |
-| **Total** | **62** | **43** | **0** | **1** | **18** |
+| **Total** | **63** | **44** | **0** | **1** | **18** |
 
 ## Status Legend
 
@@ -106,6 +106,26 @@
 | F057 | Stream Join Optimizations | P1 | 📝 | [Link](phase-2/F057-stream-join-optimizations.md) |
 | F059 | FIRST/LAST Value Aggregates | P0 | 📝 | [Link](phase-2/F059-first-last-aggregates.md) |
 | F060 | Cascading Materialized Views | P1 | 📝 | [Link](phase-2/F060-cascading-materialized-views.md) |
+| F062 | Per-Core WAL Segments | P1 | 📝 | [Link](phase-2/F062-per-core-wal.md) |
+
+### Phase 2 Checkpoint/Recovery Gap Analysis
+
+> Based on [Checkpoint Implementation Prompt](../research/checkpoint-implementation-prompt.md) and [ADR-004: Checkpoint Strategy](../adr/ADR-004-checkpoint-strategy.md)
+
+| Gap | Research Finding | Current | Target | Feature |
+|-----|------------------|---------|--------|---------|
+| **Checkpoint blocks Ring 0** | "Ring 0 <500ns, checkpoint in Ring 1" | ❌ Blocking | Async in Ring 1 | F022 |
+| **No changelog buffer** | "Zero-alloc offset references" | ❌ Missing | ChangelogRef in Ring 0 | F022 |
+| **No incremental checkpoints** | "RocksDB hard-linked SSTables" | ❌ Full snapshots | <10% for 1% changes | F022 |
+| **No per-core WAL** | "Required for thread-per-core" | ❌ Single WAL | Per-core segments | F062 |
+| **No WAL truncation** | "Bound storage after checkpoint" | ❌ Growing WAL | Truncate after checkpoint | F022 |
+
+**Three-Tier Architecture (Target)**:
+```
+Ring 0: mmap + ChangelogBuffer (zero-alloc) ──▶ Ring 1: WAL + RocksDB ──▶ Ring 2: Object Storage (future)
+```
+
+**Core Invariant**: `Checkpoint(epoch) + WAL.replay(epoch..current) = Consistent State`
 
 ### Phase 2 Join Research Gap Analysis
 
@@ -226,7 +246,16 @@ F003 ──▶ F019 (Stream Joins) ──▶ F020 (Lookup) ──▶ F021 (Tempo
                     │
                     ├──▶ F056 (ASOF Joins) ◀── Financial/TimeSeries
                     └──▶ F057 (Join Optimizations) ◀── Research 2025-2026
-F008 ──▶ F022 (Incremental) ──▶ F023 (Exactly-Once) ──▶ F024 (2PC)
+F007 + F013 ──▶ F062 (Per-Core WAL) ──┐
+                                      │
+F008 ──▶ F022 (Incremental) ◀─────────┘ ──▶ F023 (Exactly-Once) ──▶ F024 (2PC)
+
+Checkpoint Architecture (Phase 2):
+┌───────────────────────────────────────────────────────────────────────────┐
+│ Ring 0: Changelog ──▶ Ring 1: Per-Core WAL ──▶ RocksDB ──▶ Checkpoint    │
+│                                                                           │
+│ F002 (mmap) + F022 (ChangelogBuffer) ──▶ F062 (Per-Core WAL) ──▶ F022    │
+└───────────────────────────────────────────────────────────────────────────┘
 
 Financial Analytics (Phase 2):
 F004 (Tumbling) ──▶ F059 (FIRST/LAST) ──▶ F060 (Cascading MVs) ◀── OHLC Bars
@@ -262,12 +291,13 @@ F060 + F031/F032 ──▶ F061 (Historical Backfill) ◀── Live+Historical 
 
 ### P1 - High (Phase 2/3)
 
-| Gap | Feature | Impact |
-|-----|---------|--------|
-| No per-core WAL | F007 | Required for F013 |
-| Checkpoint blocks Ring 0 | F008 | Latency spikes |
-| No CoW mmap | F002 | Can't isolate snapshots |
-| No io_uring | F001 | Blocking I/O on hot path |
+| Gap | Feature | Impact | Fix |
+|-----|---------|--------|-----|
+| ~~No per-core WAL~~ | F062 | Required for F013 | **NEW SPEC** |
+| ~~Checkpoint blocks Ring 0~~ | F022 | Latency spikes | **UPDATED SPEC** |
+| ~~No incremental checkpoints~~ | F022 | Large checkpoint size | **UPDATED SPEC** |
+| No CoW mmap | F002 | Can't isolate snapshots | Phase 3 |
+| No io_uring | F001 | Blocking I/O on hot path | Phase 3 |
 
 ### P1 - High (Research Gaps - 2025-2026)
 
@@ -296,7 +326,6 @@ F060 + F031/F032 ──▶ F061 (Historical Backfill) ◀── Live+Historical 
 | Gap | Feature | Impact |
 |-----|---------|--------|
 | Prefix scan O(n) | F003 | Slow for large state |
-| No incremental checkpoints | F008 | Large checkpoint overhead |
 | No retractions | F012 | Required for joins |
 | No madvise hints | F002 | Suboptimal TLB usage |
 | Multi-way join optimization | - | Static join order, no adaptive |
