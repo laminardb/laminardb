@@ -489,7 +489,7 @@ impl LookupJoinOperator {
         // Register TTL timer
         let expiry_time = ctx.processing_time + self.cache_ttl_us;
         let timer_key = Self::make_timer_key(&cache_key);
-        ctx.timers.register_timer(expiry_time, Some(timer_key));
+        ctx.timers.register_timer(expiry_time, Some(timer_key), Some(ctx.operator_index));
 
         // Process pending events for this key
         let events_to_process: Vec<_> = self
@@ -577,7 +577,7 @@ impl LookupJoinOperator {
             // Register TTL timer
             let expiry_time = ctx.processing_time + self.cache_ttl_us;
             let timer_key = Self::make_timer_key(&cache_key);
-            ctx.timers.register_timer(expiry_time, Some(timer_key));
+            ctx.timers.register_timer(expiry_time, Some(timer_key), Some(ctx.operator_index));
         }
 
         self.emit_result(event, result.as_ref(), ctx)

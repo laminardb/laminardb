@@ -13,6 +13,8 @@ description = "Core streaming engine for LaminarDB - reactor, operators, and sta
 default = []
 # Enable hot path allocation detection - panics on allocation in marked sections
 allocation-tracking = []
+# Enable io_uring support (Linux 5.10+ only)
+io-uring = ["dep:io-uring"]
 
 [dependencies]
 # Performance critical - no allocations on hot path
@@ -55,6 +57,7 @@ num_cpus = "1.16"
 # Platform-specific dependencies
 [target.'cfg(target_os = "linux")'.dependencies]
 libc = { workspace = true }
+io-uring = { workspace = true, optional = true }
 
 [target.'cfg(target_os = "windows")'.dependencies]
 winapi = { version = "0.3", features = ["processthreadsapi", "winbase", "basetsd"] }
@@ -83,4 +86,8 @@ harness = false
 
 [[bench]]
 name = "tpc_bench"
+harness = false
+
+[[bench]]
+name = "io_uring_bench"
 harness = false

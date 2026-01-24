@@ -7,9 +7,10 @@
 //! Each `CoreHandle` spawns a dedicated thread that:
 //! 1. Sets CPU affinity to pin to a specific core
 //! 2. Creates a `Reactor` with its own state partition
-//! 3. Drains the inbox SPSC queue for incoming events
-//! 4. Processes events through the reactor
-//! 5. Pushes outputs to the outbox SPSC queue
+//! 3. Optionally initializes an `io_uring` ring for async I/O (Linux only)
+//! 4. Drains the inbox SPSC queue for incoming events
+//! 5. Processes events through the reactor
+//! 6. Pushes outputs to the outbox SPSC queue
 //!
 //! ## Communication
 //!
@@ -17,10 +18,21 @@
 //! - **Outbox**: Core thread → Main thread (outputs)
 //!
 //! Both use lock-free SPSC queues for minimal latency.
+//!
+//! ## `io_uring` Integration
+//!
+//! On Linux with the `io-uring` feature enabled, each core thread can have its own
+//! `io_uring` ring for high-performance async I/O. This enables:
+//! - SQPOLL mode for syscall-free submission
+//! - Registered buffers for zero-copy I/O
+//! - Per-core I/O isolation for thread-per-core architecture
 
 use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::sync::Arc;
 use std::thread::{self, JoinHandle};
+
+#[cfg(all(target_os = "linux", feature = "io-uring"))]
+use crate::io_uring::{CoreRingManager, IoUringConfig};
 
 use crate::alloc::HotPathGuard;
 use crate::operator::{Event, Operator, Output};
@@ -60,6 +72,9 @@ pub struct CoreConfig {
     pub reactor_config: ReactorConfig,
     /// Backpressure configuration
     pub backpressure: BackpressureConfig,
+    /// `io_uring` configuration (Linux only, requires `io-uring` feature)
+    #[cfg(all(target_os = "linux", feature = "io-uring"))]
+    pub io_uring_config: Option<IoUringConfig>,
 }
 
 impl Default for CoreConfig {
@@ -71,6 +86,8 @@ impl Default for CoreConfig {
             outbox_capacity: 65536,
             reactor_config: ReactorConfig::default(),
             backpressure: BackpressureConfig::default(),
+            #[cfg(all(target_os = "linux", feature = "io-uring"))]
+            io_uring_config: None,
         }
     }
 }
@@ -139,6 +156,8 @@ impl CoreHandle {
             shutdown: Arc::clone(&shutdown),
             events_processed: Arc::clone(&events_processed),
             is_running: Arc::clone(&is_running),
+            #[cfg(all(target_os = "linux", feature = "io-uring"))]
+            io_uring_config: config.io_uring_config,
         };
 
         let thread = thread::Builder::new()
@@ -387,6 +406,8 @@ struct CoreThreadContext {
     shutdown: Arc<AtomicBool>,
     events_processed: Arc<AtomicU64>,
     is_running: Arc<AtomicBool>,
+    #[cfg(all(target_os = "linux", feature = "io-uring"))]
+    io_uring_config: Option<IoUringConfig>,
 }
 
 /// Main function for the core thread.
@@ -398,6 +419,23 @@ fn core_thread_main(
     if let Some(cpu_id) = ctx.cpu_affinity {
         set_cpu_affinity(ctx.core_id, cpu_id)?;
     }
+
+    // Initialize io_uring ring manager if configured (Linux only)
+    #[cfg(all(target_os = "linux", feature = "io-uring"))]
+    let _ring_manager = if let Some(ref io_uring_config) = ctx.io_uring_config {
+        match CoreRingManager::new(ctx.core_id, io_uring_config) {
+            Ok(manager) => Some(manager),
+            Err(e) => {
+                eprintln!(
+                    "Core {}: Failed to initialize io_uring ring: {e}. Falling back to standard I/O.",
+                    ctx.core_id
+                );
+                None
+            }
+        }
+    } else {
+        None
+    };
 
     // Create the reactor with configured settings
     let mut reactor_config = ctx.reactor_config;

@@ -438,7 +438,7 @@ impl StreamJoinOperator {
         // Register cleanup timer
         let cleanup_time = event_time + self.time_bound_ms;
         let timer_key = Self::make_timer_key(side, &state_key);
-        ctx.timers.register_timer(cleanup_time, Some(timer_key));
+        ctx.timers.register_timer(cleanup_time, Some(timer_key), Some(ctx.operator_index));
 
         // For outer joins, register unmatched emission timer
         if (side == JoinSide::Left && self.join_type.emits_unmatched_left())
@@ -446,7 +446,7 @@ impl StreamJoinOperator {
         {
             let unmatched_timer_key = Self::make_unmatched_timer_key(side, &state_key);
             ctx.timers
-                .register_timer(cleanup_time, Some(unmatched_timer_key));
+                .register_timer(cleanup_time, Some(unmatched_timer_key), Some(ctx.operator_index));
         }
 
         // Probe the opposite side for matches

@@ -34,6 +34,7 @@
 #![allow(unsafe_code)]
 
 pub mod alloc;
+pub mod io_uring;
 pub mod operator;
 pub mod reactor;
 pub mod state;
@@ -68,4 +69,8 @@ pub enum Error {
     /// Thread-per-core runtime errors
     #[error("TPC error: {0}")]
     Tpc(#[from] tpc::TpcError),
+
+    /// `io_uring` errors
+    #[error("io_uring error: {0}")]
+    IoUring(#[from] io_uring::IoUringError),
 }

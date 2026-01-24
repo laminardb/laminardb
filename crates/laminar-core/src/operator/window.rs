@@ -1077,7 +1077,7 @@ where
             // Register timer at window_end + allowed_lateness
             let trigger_time = window_id.end + self.allowed_lateness_ms;
             ctx.timers
-                .register_timer(trigger_time, Some(window_id.to_key()));
+                .register_timer(trigger_time, Some(window_id.to_key()), Some(ctx.operator_index));
             self.registered_windows.insert(window_id);
         }
     }
@@ -1102,7 +1102,7 @@ where
                 // Create a key with high bit set to distinguish from final timers
                 let key = Self::periodic_timer_key(&window_id);
 
-                ctx.timers.register_timer(trigger_time, Some(key));
+                ctx.timers.register_timer(trigger_time, Some(key), Some(ctx.operator_index));
                 self.periodic_timer_windows.insert(window_id);
             }
         }
@@ -1203,7 +1203,7 @@ where
             let window_close_time = window_id.end + self.allowed_lateness_ms;
             if next_trigger < window_close_time {
                 let key = Self::periodic_timer_key(&window_id);
-                ctx.timers.register_timer(next_trigger, Some(key));
+                ctx.timers.register_timer(next_trigger, Some(key), Some(ctx.operator_index));
             }
         }
 

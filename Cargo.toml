@@ -64,6 +64,7 @@ arrayvec = "0.7"
 
 # Platform-specific
 libc = "0.2"
+io-uring = "0.7"  # Low-level io_uring bindings (Linux only)
 
 # Testing
 criterion = { version = "0.8", features = ["html_reports"] }

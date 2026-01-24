@@ -43,6 +43,7 @@ tracing = { workspace = true }
 default = ["rocksdb"]
 rocksdb = ["dep:rocksdb"]
 delta = ["dep:delta_kernel"]
+io-uring = ["laminar-core/io-uring"]
 
 [dev-dependencies]
 tempfile = { workspace = true }

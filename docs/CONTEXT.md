@@ -8,6 +8,17 @@
 **Duration**: Continued session
 
 ### What Was Accomplished
+- ✅ **F067: io_uring Advanced Optimization** - IMPLEMENTATION COMPLETE + INTEGRATION
+  - SQPOLL mode for syscall elimination (kernel polling thread)
+  - Registered buffer pool for zero-copy I/O
+  - IOPOLL mode for NVMe storage operations
+  - Per-core ring manager for thread-per-core integration
+  - Linux-only with graceful fallback on other platforms
+  - 13 new unit tests, all passing
+  - Feature flag `io-uring` for opt-in on Linux
+  - **Integration with WAL**: `IoUringWal` in laminar-storage for async durability
+  - **Integration with CoreHandle**: Optional `io_uring_config` per-core thread
+  - **Integration with Reactor**: `IoUringSink` for async output
 - ✅ **F071: Zero-Allocation Enforcement** - IMPLEMENTATION COMPLETE + INTEGRATION
   - `HotPathDetectingAlloc` - Custom global allocator that panics on hot path allocation
   - `HotPathGuard` - RAII guard with nesting support for marking hot path sections
@@ -62,6 +73,102 @@ laminar-core = { version = "0.1", features = ["allocation-tracking"] }
 
 These cover all Ring 0 hot path code including operator processing and state access.
 
+### F067 Implementation Details
+
+**New Modules**:
+
+`crates/laminar-core/src/io_uring/`
+```
+io_uring/
+├── mod.rs          # Public exports, platform detection
+├── config.rs       # IoUringConfig, RingMode (SqPoll, IoPoll, etc.)
+├── error.rs        # IoUringError enum
+├── ring.rs         # Ring creation (create_optimized_ring, create_iopoll_ring)
+├── buffer_pool.rs  # RegisteredBufferPool (zero-copy I/O)
+├── manager.rs      # CoreRingManager (per-core ring management)
+└── sink.rs         # IoUringSink (async Reactor sink)
+```
+
+`crates/laminar-storage/src/io_uring_wal.rs` - `io_uring`-backed WAL
+
+**Usage**:
+```rust
+use laminar_core::io_uring::{IoUringConfig, RingMode, CoreRingManager};
+
+// Configure optimized ring with SQPOLL
+let config = IoUringConfig::builder()
+    .ring_entries(256)
+    .enable_sqpoll(1000)  // 1s idle timeout
+    .sqpoll_cpu(0)        // Pin to CPU 0
+    .buffer_size(64 * 1024)
+    .buffer_count(256)
+    .build()?;
+
+// Create per-core manager
+let mut manager = CoreRingManager::new(0, &config)?;
+
+// Zero-copy write using registered buffer
+let (idx, buf) = manager.acquire_buffer()?;
+buf[..5].copy_from_slice(b"hello");
+let user_data = manager.submit_write(fd, idx, 0, 5)?;
+manager.submit()?;
+
+// Poll for completions
+let completions = manager.poll_completions();
+for c in completions {
+    if c.is_success() {
+        println!("Wrote {} bytes", c.bytes_transferred().unwrap());
+    }
+}
+manager.release_buffer(idx);
+```
+
+**Feature Flag**:
+```toml
+[dependencies]
+laminar-core = { version = "0.1", features = ["io-uring"] }
+laminar-storage = { version = "0.1", features = ["io-uring"] }
+```
+
+**Integration Usage**:
+```rust
+// CoreHandle with io_uring
+use laminar_core::tpc::{CoreConfig, CoreHandle};
+use laminar_core::io_uring::{IoUringConfig, RingMode};
+
+let config = CoreConfig {
+    io_uring_config: Some(IoUringConfig::builder()
+        .ring_entries(256)
+        .mode(RingMode::SqPoll)
+        .buffer_size(64 * 1024)
+        .buffer_count(64)
+        .build_unchecked()),
+    ..Default::default()
+};
+let handle = CoreHandle::spawn(config)?;
+
+// io_uring-backed WAL
+use laminar_storage::IoUringWal;
+use std::time::Duration;
+
+let wal = IoUringWal::new("/tmp/data.wal", Duration::from_millis(100), None)?;
+
+// io_uring-backed Reactor Sink
+use laminar_core::io_uring::IoUringSink;
+
+let sink = IoUringSink::new("/tmp/output.log", config)?;
+reactor.set_sink(Box::new(sink));
+```
+
+**Key Components**:
+- `IoUringConfig` - Builder for ring configuration (entries, mode, buffers)
+- `RingMode` - Standard, SqPoll, IoPoll, SqPollIoPoll
+- `RegisteredBufferPool` - Pre-registered buffers for zero-copy I/O
+- `CoreRingManager` - Per-core ring with pending operation tracking
+- `Completion` - Result type with latency tracking and error handling
+- `IoUringSink` - Reactor sink for async file output
+- `IoUringWal` - Write-ahead log with group commit support
+
 ### Previous Session Accomplishments
 
 ### Thread-Per-Core Research Analysis Summary
@@ -70,7 +177,7 @@ From `docs/research/laminardb-thread-per-core-2026-research.md`, identified crit
 
 | Gap | Research Finding | Current (F013) | Fix |
 |-----|------------------|----------------|-----|
-| io_uring basic only | "2.05x improvement with SQPOLL" | ❌ No io_uring | **F067** |
+| io_uring basic only | "2.05x improvement with SQPOLL" | ✅ Implemented | **F067** |
 | No NUMA awareness | "2-3x latency on remote access" | ❌ Generic allocation | **F068** |
 | Single I/O ring | "3 rings: latency/main/poll" | ❌ Single reactor | **F069** |
 | No task budgeting | "Ring 0: 500ns budget" | ❌ No enforcement | **F070** |
@@ -82,9 +189,11 @@ From `docs/research/laminardb-thread-per-core-2026-research.md`, identified crit
 **Thread-Per-Core Evolution Path**:
 ```
 F013 (Foundation) ──┬──▶ F067 (io_uring) ──▶ F069 (Three-Ring)
-      ✅ Complete   ├──▶ F068 (NUMA) ──▶ Production Deployment
+      ✅ Complete   │         ✅ Complete
+                    ├──▶ F068 (NUMA) ──▶ Production Deployment
                     ├──▶ F070 (Task Budget) ──▶ Latency SLAs
                     └──▶ F071 (Zero-Alloc) ──▶ F072 (XDP) [P2]
+                              ✅ Complete
 ```
 
 ### Previous Session Accomplishments
@@ -333,6 +442,7 @@ handle.credit_metrics();       // Acquired, released, blocked, dropped
 | F019: Stream-Stream Joins | ✅ Complete | Inner/Left/Right/Full, 14 tests |
 | F020: Lookup Joins | ✅ Complete | Cached lookups with TTL, 16 tests |
 | F023: Exactly-Once Sinks | 📝 Not started | |
+| F067: io_uring Advanced | ✅ Complete | SQPOLL, IOPOLL, registered buffers, 13 tests |
 | F071: Zero-Alloc Enforcement | ✅ Complete | HotPathGuard, ObjectPool, RingBuffer, 33 tests |
 
 ---
@@ -341,10 +451,18 @@ handle.credit_metrics();       // Acquired, released, blocked, dropped
 
 ### Current Focus
 - **Phase**: 2 Production Hardening
-- **Active Feature**: F071 complete (8/28), ready for F067 (io_uring) or F023 (exactly-once)
+- **Active Feature**: F067 complete (9/28), ready for F068 (NUMA) or F023 (exactly-once)
 
 ### Key Files
 ```
+crates/laminar-core/src/io_uring/
+├── mod.rs           # Public exports, platform detection
+├── config.rs        # IoUringConfig, RingMode (SqPoll, IoPoll)
+├── error.rs         # IoUringError enum
+├── ring.rs          # Ring creation (SQPOLL, IOPOLL modes)
+├── buffer_pool.rs   # RegisteredBufferPool (zero-copy I/O)
+└── manager.rs       # CoreRingManager (per-core ring management)
+
 crates/laminar-core/src/alloc/
 ├── mod.rs           # Public exports, hot_path! macro
 ├── detector.rs      # HotPathDetectingAlloc, AllocationStats
@@ -369,9 +487,9 @@ crates/laminar-core/src/operator/
 
 crates/laminar-connectors/src/lookup.rs  # TableLoader trait, InMemoryTableLoader
 
-Benchmarks: crates/laminar-core/benches/tpc_bench.rs
+Benchmarks: crates/laminar-core/benches/tpc_bench.rs, io_uring_bench.rs
 
-Tests: 369 passing (282 core, 56 sql, 25 storage, 6 connectors)
+Tests: 382 passing (295 core, 56 sql, 25 storage, 6 connectors)
 ```
 
 ### Useful Commands

@@ -203,27 +203,49 @@ impl Reactor {
         // 1. Fire expired timers
         let fired_timers = self.timer_service.poll_timers(self.current_event_time);
         for mut timer in fired_timers {
-            // Find the operator that registered this timer
-            // For now, we'll process timers for all operators
-            for (idx, operator) in self.operators.iter_mut().enumerate() {
-                // Move key out of timer to avoid clone allocation
-                let timer_key = timer.key.take().unwrap_or_default();
-                let timer_for_operator = crate::operator::Timer {
-                    key: timer_key,
-                    timestamp: timer.timestamp,
-                };
+            if let Some(idx) = timer.operator_index {
+                // Route to specific operator
+                if let Some(operator) = self.operators.get_mut(idx) {
+                    let timer_key = timer.key.take().unwrap_or_default();
+                    let timer_for_operator = crate::operator::Timer {
+                        key: timer_key,
+                        timestamp: timer.timestamp,
+                    };
 
-                let mut ctx = OperatorContext {
-                    event_time: self.current_event_time,
-                    processing_time,
-                    timers: &mut self.timer_service,
-                    state: self.state_store.as_mut(),
-                    watermark_generator: self.watermark_generator.as_mut(),
-                    operator_index: idx,
-                };
+                    let mut ctx = OperatorContext {
+                        event_time: self.current_event_time,
+                        processing_time,
+                        timers: &mut self.timer_service,
+                        state: self.state_store.as_mut(),
+                        watermark_generator: self.watermark_generator.as_mut(),
+                        operator_index: idx,
+                    };
 
-                let outputs = operator.on_timer(timer_for_operator, &mut ctx);
-                self.output_buffer.extend(outputs);
+                    let outputs = operator.on_timer(timer_for_operator, &mut ctx);
+                    self.output_buffer.extend(outputs);
+                }
+            } else {
+                // Legacy: Broadcast to all operators (warning: creates key contention)
+                for (idx, operator) in self.operators.iter_mut().enumerate() {
+                    // Move key out of timer (only first operator gets it!)
+                    let timer_key = timer.key.take().unwrap_or_default();
+                    let timer_for_operator = crate::operator::Timer {
+                        key: timer_key,
+                        timestamp: timer.timestamp,
+                    };
+
+                    let mut ctx = OperatorContext {
+                        event_time: self.current_event_time,
+                        processing_time,
+                        timers: &mut self.timer_service,
+                        state: self.state_store.as_mut(),
+                        watermark_generator: self.watermark_generator.as_mut(),
+                        operator_index: idx,
+                    };
+
+                    let outputs = operator.on_timer(timer_for_operator, &mut ctx);
+                    self.output_buffer.extend(outputs);
+                }
             }
         }
 

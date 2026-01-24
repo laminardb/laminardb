@@ -177,12 +177,17 @@ pub struct TimerRegistration {
     /// Timer key (for keyed operators).
     /// Uses `TimerKey` (`SmallVec`) to avoid heap allocation for keys up to 16 bytes.
     pub key: Option<TimerKey>,
+    /// The index of the operator that registered this timer
+    pub operator_index: Option<usize>,
 }
 
 impl Ord for TimerRegistration {
     fn cmp(&self, other: &Self) -> Ordering {
         // Reverse ordering for min-heap behavior (earliest first)
-        other.timestamp.cmp(&self.timestamp)
+        match other.timestamp.cmp(&self.timestamp) {
+            Ordering::Equal => other.id.cmp(&self.id),
+            ord => ord,
+        }
     }
 }
 
@@ -206,8 +211,8 @@ impl PartialOrd for TimerRegistration {
 /// let mut service = TimerService::new();
 ///
 /// // Register timers at different times
-/// let id1 = service.register_timer(100, None);
-/// let id2 = service.register_timer(50, Some(TimerKey::from_slice(&[1, 2, 3])));
+/// let id1 = service.register_timer(100, None, None);
+/// let id2 = service.register_timer(50, Some(TimerKey::from_slice(&[1, 2, 3])), None);
 ///
 /// // Poll for timers that should fire at time 75
 /// let fired = service.poll_timers(75);
@@ -237,12 +242,13 @@ impl TimerService {
     ///
     /// * `timestamp` - The event time at which the timer should fire
     /// * `key` - Optional key for keyed operators
-    pub fn register_timer(&mut self, timestamp: i64, key: Option<TimerKey>) -> u64 {
+    /// * `operator_index` - Optional index of the operator registering the timer(must match the index in the reactor)
+    pub fn register_timer(&mut self, timestamp: i64, key: Option<TimerKey>, operator_index: Option<usize>) -> u64 {
         let id = self.next_timer_id;
         self.next_timer_id += 1;
 
         self.timers
-            .push(TimerRegistration { id, timestamp, key });
+            .push(TimerRegistration { id, timestamp, key, operator_index });
 
         id
     }
@@ -393,8 +399,8 @@ mod tests {
     fn test_timer_registration() {
         let mut service = TimerService::new();
 
-        let id1 = service.register_timer(100, None);
-        let id2 = service.register_timer(50, Some(TimerKey::from_slice(&[1, 2, 3])));
+        let id1 = service.register_timer(100, None, None);
+        let id2 = service.register_timer(50, Some(TimerKey::from_slice(&[1, 2, 3])), Some(1));
 
         assert_eq!(service.pending_count(), 2);
         assert_ne!(id1, id2);
@@ -404,9 +410,9 @@ mod tests {
     fn test_timer_poll_order() {
         let mut service = TimerService::new();
 
-        let id1 = service.register_timer(100, None);
-        let id2 = service.register_timer(50, Some(TimerKey::from_slice(&[1, 2, 3])));
-        let _id3 = service.register_timer(150, None);
+        let id1 = service.register_timer(100, None, None);
+        let id2 = service.register_timer(50, Some(TimerKey::from_slice(&[1, 2, 3])), Some(0));
+        let _id3 = service.register_timer(150, None, None);
 
         // Poll at time 75 - should get timer at t=50
         let fired = service.poll_timers(75);
@@ -430,9 +436,9 @@ mod tests {
     fn test_timer_poll_multiple() {
         let mut service = TimerService::new();
 
-        service.register_timer(50, None);
-        service.register_timer(75, None);
-        service.register_timer(100, None);
+        service.register_timer(50, None, None);
+        service.register_timer(75, None, None);
+        service.register_timer(100, None, None);
 
         // Poll at time 80 - should get timers at t=50 and t=75
         let fired = service.poll_timers(80);
@@ -446,8 +452,8 @@ mod tests {
     fn test_timer_cancel() {
         let mut service = TimerService::new();
 
-        let id1 = service.register_timer(100, None);
-        let id2 = service.register_timer(200, None);
+        let id1 = service.register_timer(100, None, None);
+        let id2 = service.register_timer(200, None, None);
 
         assert!(service.cancel_timer(id1));
         assert_eq!(service.pending_count(), 1);
@@ -466,10 +472,10 @@ mod tests {
 
         assert_eq!(service.next_timer_timestamp(), None);
 
-        service.register_timer(100, None);
+        service.register_timer(100, None, None);
         assert_eq!(service.next_timer_timestamp(), Some(100));
 
-        service.register_timer(50, None);
+        service.register_timer(50, None, None);
         assert_eq!(service.next_timer_timestamp(), Some(50));
     }
 
@@ -477,9 +483,9 @@ mod tests {
     fn test_timer_clear() {
         let mut service = TimerService::new();
 
-        service.register_timer(100, None);
-        service.register_timer(200, None);
-        service.register_timer(300, None);
+        service.register_timer(100, None, None);
+        service.register_timer(200, None, None);
+        service.register_timer(300, None, None);
 
         service.clear();
         assert_eq!(service.pending_count(), 0);
