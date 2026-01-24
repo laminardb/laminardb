@@ -14,10 +14,10 @@ description = "Storage layer for LaminarDB - WAL, checkpointing, and lakehouse i
 laminar-core = { path = "../laminar-core" }
 
 # Storage
-rocksdb = { version = "0.21", optional = true }
+rocksdb = { version = "0.24", optional = true }
 object_store = "0.13"  # For cloud storage
 parquet = "57.2"  # For lakehouse formats
-delta_kernel = { version = "0.1", optional = true }  # Delta Lake
+delta_kernel = { version = "0.19", optional = true }  # Delta Lake
 
 # Serialization (rkyv for zero-copy performance)
 rkyv = { workspace = true }

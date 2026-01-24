@@ -25,7 +25,8 @@
       "Bash(cargo fmt:*)",
       "Skill(gate-check)",
       "Bash(tree:*)",
-      "Bash(cd:*)"
+      "Bash(cd:*)",
+      "Bash(find:*)"
     ]
   }
 }

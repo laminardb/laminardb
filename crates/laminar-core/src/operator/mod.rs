@@ -124,6 +124,7 @@ pub enum OperatorError {
     ProcessingFailed(String),
 }
 
+pub mod lookup_join;
 pub mod sliding_window;
 pub mod stream_join;
 pub mod window;

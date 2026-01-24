@@ -5,11 +5,11 @@
 | Phase | Total | Draft | In Progress | Hardening | Done |
 |-------|-------|-------|-------------|-----------|------|
 | Phase 1 | 12 | 0 | 0 | 1 | 11 |
-| Phase 2 | 12 | 6 | 0 | 0 | 6 |
+| Phase 2 | 12 | 5 | 0 | 0 | 7 |
 | Phase 3 | 10 | 10 | 0 | 0 | 0 |
 | Phase 4 | 11 | 11 | 0 | 0 | 0 |
 | Phase 5 | 10 | 10 | 0 | 0 | 0 |
-| **Total** | **55** | **37** | **0** | **1** | **17** |
+| **Total** | **55** | **36** | **0** | **1** | **18** |
 
 ## Status Legend
 
@@ -55,7 +55,7 @@
 
 ## Phase 2: Production Hardening
 
-> **Status**: 🚧 In Progress (3/12 features complete)
+> **Status**: 🚧 In Progress (7/12 features complete)
 
 | ID | Feature | Priority | Status | Spec |
 |----|---------|----------|--------|------|
@@ -66,7 +66,7 @@
 | F017 | Session Windows | P1 | 📝 | [Link](phase-2/F017-session-windows.md) |
 | F018 | Hopping Windows | P1 | ✅ | Same as F016 (sliding) |
 | F019 | Stream-Stream Joins | P0 | ✅ | [Link](phase-2/F019-stream-stream-joins.md) |
-| F020 | Lookup Joins | P0 | 📝 | [Link](phase-2/F020-lookup-joins.md) |
+| F020 | Lookup Joins | P0 | ✅ | [Link](phase-2/F020-lookup-joins.md) |
 | F021 | Temporal Joins | P2 | 📝 | [Link](phase-2/F021-temporal-joins.md) |
 | F022 | Incremental Checkpointing | P1 | 📝 | [Link](phase-2/F022-incremental-checkpointing.md) |
 | F023 | Exactly-Once Sinks | P0 | 📝 | [Link](phase-2/F023-exactly-once-sinks.md) |

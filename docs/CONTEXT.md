@@ -13,7 +13,8 @@
 - ✅ **Credit-Based Backpressure** - Apache Flink-style flow control added
 - ✅ **F016: Sliding Windows** - Overlapping window support with multi-window assignment
 - ✅ **F019: Stream-Stream Joins** - Time-bounded joins with Inner/Left/Right/Full types
-- ✅ All 314 tests passing across all crates (233 core + 56 sql + 25 storage)
+- ✅ **F020: Lookup Joins** - Cached reference table lookups with TTL, inner/left join support
+- ✅ All 336 tests passing across all crates (249 core + 56 sql + 25 storage + 6 connectors)
 - ✅ Clippy clean for all crates
 - ✅ TPC benchmarks added (`cargo bench --bench tpc_bench`)
 
@@ -222,7 +223,7 @@ handle.credit_metrics();       // Acquired, released, blocked, dropped
 | F017: Session Windows | 📝 Not started | |
 | F018: Hopping Windows | ✅ Complete | Alias for sliding windows |
 | F019: Stream-Stream Joins | ✅ Complete | Inner/Left/Right/Full, 14 tests |
-| F020: Lookup Joins | 📝 Not started | |
+| F020: Lookup Joins | ✅ Complete | Cached lookups with TTL, 16 tests |
 | F023: Exactly-Once Sinks | 📝 Not started | |
 
 ---
@@ -231,7 +232,7 @@ handle.credit_metrics();       // Acquired, released, blocked, dropped
 
 ### Current Focus
 - **Phase**: 2 Production Hardening
-- **Active Feature**: F019 complete, ready for F020 (lookup joins)
+- **Active Feature**: F020 complete, ready for F023 (exactly-once sinks)
 
 ### Key Files
 ```
@@ -246,11 +247,14 @@ crates/laminar-core/src/operator/
 ├── mod.rs           # Operator trait, Event, Output types
 ├── window.rs        # TumblingWindowOperator, WindowAssigner trait
 ├── sliding_window.rs# SlidingWindowOperator, SlidingWindowAssigner
-└── stream_join.rs   # StreamJoinOperator, JoinType, JoinSide
+├── stream_join.rs   # StreamJoinOperator, JoinType, JoinSide
+└── lookup_join.rs   # LookupJoinOperator, TableLoader trait (NEW)
+
+crates/laminar-connectors/src/lookup.rs  # TableLoader trait, InMemoryTableLoader
 
 Benchmarks: crates/laminar-core/benches/tpc_bench.rs
 
-Tests: 314 passing (233 core, 56 sql, 25 storage)
+Tests: 336 passing (249 core, 56 sql, 25 storage, 6 connectors)
 ```
 
 ### Useful Commands
