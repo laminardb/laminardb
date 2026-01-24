@@ -8,7 +8,24 @@
       "Bash(cargo test:*)",
       "Bash(git add:*)",
       "Bash(git commit:*)",
-      "WebSearch"
+      "WebSearch",
+      "Bash(cargo build:*)",
+      "Bash(cargo bench:*)",
+      "Bash(dir:*)",
+      "Bash(findstr:*)",
+      "Skill(status)",
+      "Bash(cargo clippy:*)",
+      "Bash(cargo tree:*)",
+      "Bash(cargo doc:*)",
+      "WebFetch(domain:docs.rs)",
+      "WebFetch(domain:github.com)",
+      "Bash(cargo search:*)",
+      "Skill(arrow-datafusion)",
+      "Bash(grep:*)",
+      "Bash(cargo fmt:*)",
+      "Skill(gate-check)",
+      "Bash(tree:*)",
+      "Bash(cd:*)"
     ]
   }
 }

@@ -36,6 +36,7 @@ pub mod operator;
 pub mod reactor;
 pub mod state;
 pub mod time;
+pub mod tpc;
 
 // Re-export key types
 pub use reactor::{Config, Reactor};
@@ -61,4 +62,8 @@ pub enum Error {
     /// Time-related errors
     #[error("Time error: {0}")]
     Time(#[from] time::TimeError),
+
+    /// Thread-per-core runtime errors
+    #[error("TPC error: {0}")]
+    Tpc(#[from] tpc::TpcError),
 }

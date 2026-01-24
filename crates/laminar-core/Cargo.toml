@@ -36,6 +36,16 @@ async-trait = { workspace = true }
 # Observability
 tracing = { workspace = true }
 
+# Thread-per-core
+num_cpus = "1.16"
+
+# Platform-specific dependencies
+[target.'cfg(target_os = "linux")'.dependencies]
+libc = { workspace = true }
+
+[target.'cfg(target_os = "windows")'.dependencies]
+winapi = { version = "0.3", features = ["processthreadsapi", "winbase", "basetsd"] }
+
 [dev-dependencies]
 criterion = { workspace = true }
 proptest = { workspace = true }
@@ -52,4 +62,8 @@ harness = false
 
 [[bench]]
 name = "throughput_bench"
+harness = false
+
+[[bench]]
+name = "tpc_bench"
 harness = false
