@@ -4,109 +4,101 @@
 
 ## Last Session
 
-**Date**: 2026-01-23
-**Duration**: ~4 hours
+**Date**: 2026-01-24
+**Duration**: ~1 hour
 
 ### What Was Accomplished
-- ✅ Fixed Ring 0 hot path violations identified by performance audit:
-  - Replaced Vec allocations with SmallVec (stack-based)
-  - Removed UUID string formatting in favor of atomic counter
-  - Eliminated timer key cloning
-  - Implemented buffer swapping for operator chains
-- ✅ Implemented missing reactor features:
-  - Platform-specific CPU affinity (Linux/Windows)
-  - Sink infrastructure with trait and implementations
-  - Graceful shutdown mechanism with atomic flag
-- ✅ Implemented F008 - Basic Checkpointing:
-  - Created CheckpointManager for periodic snapshots
-  - Integrated checkpointing into WalStateStore
-  - Recovery now loads checkpoint first, then replays WAL
-  - Automatic cleanup of old checkpoints
-- ✅ All tests passing (11 tests in laminar-storage)
+- ✅ Implemented F010 - Watermarks:
+  - Created comprehensive watermark generation module (`time/watermark.rs`)
+  - Implemented 5 watermark generation strategies:
+    - `BoundedOutOfOrdernessGenerator` - allows bounded lateness
+    - `AscendingTimestampsGenerator` - for strictly ordered sources
+    - `PeriodicGenerator` - emits at wall-clock intervals
+    - `PunctuatedGenerator` - emits based on marker events
+    - `SourceProvidedGenerator` - for sources with embedded watermarks
+  - Implemented `WatermarkTracker` for multi-source alignment (joins/unions)
+  - Added idle source detection with configurable timeout
+  - Added `MeteredGenerator` wrapper for collecting watermark metrics
+  - Enhanced `Watermark` struct with ordering, min/max, and conversions
+  - Enhanced `TimerService` with pending_count, next_timer_timestamp, clear methods
+  - Added `TimeError::WatermarkRegression` for debugging
+- ✅ All tests passing (122 tests in laminar-core, 39 watermark-specific)
+- ✅ Clippy clean
 
 ### Where We Left Off
-Successfully completed F008 - Basic Checkpointing. The system now supports periodic state snapshots that dramatically reduce recovery time. Instead of replaying the entire WAL from the beginning, recovery can load the latest checkpoint and only replay subsequent WAL entries. Checkpoint management includes automatic cleanup to prevent disk space issues.
+Successfully completed F010 - Watermarks. The system now has comprehensive watermark support including multiple generation strategies, multi-source alignment for join operators, idle source handling, and metrics collection.
 
 ### Immediate Next Steps
-1. **F009 - Event Time Processing** (P1) - Time-based semantics
-2. **F010 - Watermarks** (P1) - Late data handling
-3. **F011 - EMIT Clause** (P2) - Control output timing
+1. **F011 - EMIT Clause** (P2) - Control output timing in SQL
+2. **F012 - Late Data Handling** (P2) - Side output for late events
 
 ### Open Issues
-- None currently - F001 through F008 are complete (8/12 Phase 1 features done, 67% complete)
+- None currently - F001 through F010 are complete (10/12 Phase 1 features done, 83% complete)
 
 ### Code Pointers
-- **Hot path fixes**: `crates/laminar-core/src/operator/mod.rs:41` (OutputVec)
-- **CPU affinity**: `crates/laminar-core/src/reactor/mod.rs:184-223` (platform-specific)
-- **Sink trait**: `crates/laminar-core/src/reactor/mod.rs:69-137` (implementations)
-- **Checkpoint manager**: `crates/laminar-storage/src/checkpoint.rs`
-- **WalStateStore checkpoint**: `crates/laminar-storage/src/wal_state_store.rs:213-270`
-- **StateSnapshot rkyv**: `crates/laminar-core/src/state/mod.rs:377-394`
-- **WindowId rkyv**: `crates/laminar-core/src/operator/window.rs:45-85`
-- **WAL implementation**: `crates/laminar-storage/src/wal.rs`
-- **Checkpoint benchmarks**: `crates/laminar-storage/benches/checkpoint_bench.rs`
+- **Watermark module**: `crates/laminar-core/src/time/watermark.rs`
+- **WatermarkGenerator trait**: `crates/laminar-core/src/time/watermark.rs:44-57`
+- **BoundedOutOfOrdernessGenerator**: `crates/laminar-core/src/time/watermark.rs:69-113`
+- **WatermarkTracker**: `crates/laminar-core/src/time/watermark.rs:279-390`
+- **MeteredGenerator**: `crates/laminar-core/src/time/watermark.rs:429-485`
+- **Time module exports**: `crates/laminar-core/src/time/mod.rs`
 
 ---
 
 ## Session Notes
 
-**bincode → rkyv Migration:**
-- bincode discontinued in December 2025 (maintainer harassment, intentionally broken builds)
-- rkyv chosen for zero-copy deserialization (~1.2ns access vs microseconds)
-- Uses `aligned` feature for Ring 0 hot path (AlignedVec for proper memory alignment)
-- Breaking change: Types need `#[derive(Archive, Serialize, Deserialize)]` from rkyv
+**Watermark Architecture:**
+- `WatermarkGenerator` trait defines the interface for all generators
+- `Watermark` is a simple newtype wrapper around i64 (milliseconds)
+- Reactor generates watermarks from events and propagates through operators
+- Window operators use watermarks to trigger emissions and detect late events
 
-**rkyv Usage Patterns:**
+**Multi-Source Watermark Tracking:**
 ```rust
-use rkyv::{Archive, Deserialize, Serialize, rancor::Error};
-use rkyv::util::AlignedVec;
+use laminar_core::time::WatermarkTracker;
 
-// Derive rkyv traits
-#[derive(Archive, Serialize, Deserialize)]
-struct MyType { ... }
+// Track watermarks from multiple sources (e.g., for joins)
+let mut tracker = WatermarkTracker::new(2);
+tracker.update_source(0, 5000);
+tracker.update_source(1, 3000);
+// Combined watermark is minimum: 3000
 
-// Serialize to aligned bytes
-let bytes: AlignedVec = rkyv::to_bytes::<Error>(&value)?;
-
-// Zero-copy access (hot path)
-let archived = rkyv::access::<Archived<MyType>, Error>(&bytes)?;
-
-// Full deserialization when needed
-let owned: MyType = rkyv::deserialize::<MyType, Error>(archived)?;
+// Mark slow source as idle to unblock progress
+tracker.mark_idle(1);
+// Now watermark advances to 5000
 ```
 
-**Trait Bounds for StateStoreExt:**
-- `get_typed<T>` requires: `T: Archive`, `T::Archived: CheckBytes + Deserialize<T>`
-- `put_typed<T>` requires: `T: Serialize<HighSerializer<...>>`
+**Idle Source Detection:**
+- Sources that stop producing events can block watermark progress
+- `WatermarkTracker` has configurable idle timeout (default 30 seconds)
+- Call `check_idle_sources()` periodically to auto-detect stalled sources
+- Idle sources are excluded from min watermark calculation
 
 ---
 
 ## Quick Reference
 
 ### Current Focus
-- **Phase**: 1 - Core Engine (67% complete)
-- **Completed**: F001 (Reactor), F002 (Memory-Mapped State Store), F003 (State Store Interface), F004 (Tumbling Windows), F005 (DataFusion Integration), F006 (Basic SQL Parser), F007 (Write-Ahead Log), F008 (Basic Checkpointing)
-- **Next**: F009 (Event Time Processing), F010 (Watermarks)
+- **Phase**: 1 - Core Engine (83% complete)
+- **Completed**: F001 (Reactor), F002 (Memory-Mapped State Store), F003 (State Store Interface), F004 (Tumbling Windows), F005 (DataFusion Integration), F006 (Basic SQL Parser), F007 (Write-Ahead Log), F008 (Basic Checkpointing), F009 (Event Time Processing), F010 (Watermarks)
+- **Remaining**: F011 (EMIT Clause), F012 (Late Data Handling)
 
 ### Key Files
 ```
-crates/laminar-sql/src/datafusion/
-├── mod.rs              # Module exports and integration functions
-├── source.rs           # StreamSource trait
-├── bridge.rs           # StreamBridge channel bridge
-├── exec.rs             # StreamingScanExec (ExecutionPlan)
-├── table_provider.rs   # StreamingTableProvider
-└── channel_source.rs   # ChannelStreamSource implementation
+crates/laminar-core/src/time/
+├── mod.rs              # Module exports, Watermark, TimerService, TimeError
+├── event_time.rs       # EventTimeExtractor for Arrow batches
+└── watermark.rs        # WatermarkGenerator trait and implementations
 ```
 
 ### Useful Commands
 ```bash
-# Build and test laminar-sql
-cargo build -p laminar-sql
-cargo test -p laminar-sql --lib
+# Build and test laminar-core
+cargo build -p laminar-core
+cargo test -p laminar-core --lib
 
 # Run clippy
-cargo clippy -p laminar-sql -- -D warnings
+cargo clippy -p laminar-core -- -D warnings
 
 # Build all
 cargo build --release
@@ -116,21 +108,33 @@ cargo test --all
 ### Recent Decisions
 | Date | Decision | Rationale |
 |------|----------|-----------|
-| 2026-01-22 | Migrate bincode → rkyv | Zero-copy deserialization (~1.2ns access), bincode discontinued |
+| 2026-01-24 | 5 watermark strategies | Different sources need different strategies |
+| 2026-01-24 | WatermarkTracker for multi-source | Joins need aligned watermarks |
+| 2026-01-24 | Idle source timeout | Prevent stalled sources from blocking progress |
+| 2026-01-24 | MeteredGenerator wrapper | Composable metrics without modifying generators |
+| 2026-01-22 | Migrate bincode → rkyv | Zero-copy deserialization (~1.2ns access) |
 | 2026-01-22 | Use aligned buffers (rkyv) | Ring 0 state store uses AlignedVec for optimal CPU access |
-| 2026-01-22 | `take_sender()` pattern | Ensures channel closure for proper stream termination |
-| 2026-01-22 | Unbounded stream boundedness | Correctly marks streaming sources as unbounded |
-| 2026-01-22 | Aggregation rejection | Aggregations on unbounded streams fail (require windows/F006) |
-| 2026-01-22 | Channel-based bridge | tokio mpsc provides efficient push-to-pull conversion |
-| 2026-01-22 | Cache output schema in operator | Reduces emit time by 57% (1.8μs → 773ns) |
-| 2026-01-22 | Defer SQL syntax to F005/F006 | Keep F004 focused on core windowing logic |
-| 2026-01-22 | Separate Assigner from Operator | Enables reuse for sliding/hopping windows |
 
 ---
 
 ## History
 
 ### Previous Sessions
+
+<details>
+<summary>Session - 2026-01-23 (Checkpointing and hot path fixes)</summary>
+
+**Accomplished**:
+- ✅ Fixed Ring 0 hot path violations (SmallVec, atomic counter, buffer swapping)
+- ✅ Implemented reactor features (CPU affinity, sinks, graceful shutdown)
+- ✅ Implemented F008 - Basic Checkpointing
+- ✅ All tests passing
+
+**Notes**:
+- Checkpoints reduce recovery time vs full WAL replay
+- Automatic checkpoint cleanup prevents disk space issues
+
+</details>
 
 <details>
 <summary>Session - 2026-01-22 (bincode → rkyv migration)</summary>
@@ -143,8 +147,6 @@ cargo test --all
 **Notes**:
 - bincode was discontinued in December 2025
 - rkyv provides zero-copy deserialization (~1.2ns access vs microseconds)
-- Uses aligned buffers for Ring 0 hot path operations
-- Breaking change: Types must now derive `rkyv::Archive, Serialize, Deserialize`
 
 </details>
 
@@ -158,7 +160,7 @@ cargo test --all
 
 **Notes**:
 - Push-to-pull bridge using tokio mpsc channels
-- Aggregations on unbounded streams correctly rejected (require windows)
+- Aggregations on unbounded streams correctly rejected
 
 </details>
 
@@ -167,27 +169,11 @@ cargo test --all
 
 **Accomplished**:
 - ✅ Implemented F004 - Tumbling Windows with full functionality
-- ✅ Created comprehensive window operator infrastructure
 - ✅ Built-in aggregators: Count, Sum, Min, Max, Avg
 - ✅ Performance targets met/exceeded
 
 **Notes**:
 - Window assignment: ~4.4ns (target < 10ns)
-- Accumulator add: < 1ns (target < 100ns)
 - Window emit: ~773ns (target < 1μs)
-
-</details>
-
-<details>
-<summary>Session - 2026-01-22 (F002 Implementation)</summary>
-
-**Accomplished**:
-- ✅ Implemented F002 - Memory-Mapped State Store with full functionality
-- ✅ Created `MmapStateStore` with two storage modes (in-memory and persistent)
-- ✅ Performance: ~39ns get (12x better than 500ns target)
-
-**Notes**:
-- Deferred index persistence to F007 (WAL)
-- Two-tier architecture: FxHashMap index + data storage
 
 </details>

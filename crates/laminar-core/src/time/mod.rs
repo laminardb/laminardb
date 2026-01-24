@@ -24,97 +24,164 @@
 //!
 //! let timestamp = extractor.extract(&batch)?;
 //! ```
+//!
+//! ## Watermark Generation
+//!
+//! Use watermark generators to track event-time progress:
+//!
+//! ```rust
+//! use laminar_core::time::{BoundedOutOfOrdernessGenerator, WatermarkGenerator, Watermark};
+//!
+//! // Allow events to be up to 1 second late
+//! let mut generator = BoundedOutOfOrdernessGenerator::new(1000);
+//!
+//! // Process events
+//! let wm = generator.on_event(5000);
+//! assert_eq!(wm, Some(Watermark::new(4000))); // 5000 - 1000
+//! ```
+//!
+//! ## Multi-Source Watermark Tracking
+//!
+//! For operators with multiple inputs, use [`WatermarkTracker`]:
+//!
+//! ```rust
+//! use laminar_core::time::{WatermarkTracker, Watermark};
+//!
+//! let mut tracker = WatermarkTracker::new(2);
+//! tracker.update_source(0, 5000);
+//! tracker.update_source(1, 3000);
+//!
+//! // Combined watermark is the minimum
+//! assert_eq!(tracker.current_watermark(), Some(Watermark::new(3000)));
+//! ```
 
 mod event_time;
+mod watermark;
 
 pub use event_time::{
     EventTimeError, EventTimeExtractor, ExtractionMode, TimestampField, TimestampFormat,
 };
 
+pub use watermark::{
+    AscendingTimestampsGenerator, BoundedOutOfOrdernessGenerator, MeteredGenerator,
+    PeriodicGenerator, PunctuatedGenerator, SourceProvidedGenerator, WatermarkGenerator,
+    WatermarkMetrics, WatermarkTracker,
+};
+
+use smallvec::SmallVec;
 use std::cmp::Ordering;
 use std::collections::BinaryHeap;
 
-/// A watermark indicating event time progress
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+/// Timer key type optimized for window IDs (16 bytes).
+///
+/// Uses `SmallVec` to avoid heap allocation for keys up to 16 bytes,
+/// which covers the common case of `WindowId` keys.
+pub type TimerKey = SmallVec<[u8; 16]>;
+
+/// Collection type for fired timers.
+///
+/// Uses `SmallVec` to avoid heap allocation when few timers fire per poll.
+/// Size 8 covers most practical cases where timers fire in small batches.
+pub type FiredTimersVec = SmallVec<[TimerRegistration; 8]>;
+
+/// A watermark indicating event time progress.
+///
+/// Watermarks are monotonically increasing assertions that no events with
+/// timestamps earlier than the watermark will arrive. They are used to:
+///
+/// - Trigger window emissions
+/// - Detect late events
+/// - Coordinate time progress across operators
+///
+/// # Example
+///
+/// ```rust
+/// use laminar_core::time::Watermark;
+///
+/// let watermark = Watermark::new(1000);
+///
+/// // Check if an event is late
+/// assert!(watermark.is_late(999));  // Before watermark
+/// assert!(!watermark.is_late(1000)); // At watermark
+/// assert!(!watermark.is_late(1001)); // After watermark
+/// ```
+#[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Hash)]
 pub struct Watermark(pub i64);
 
 impl Watermark {
-    /// Creates a new watermark
+    /// Creates a new watermark with the given timestamp.
+    #[inline]
     #[must_use]
     pub fn new(timestamp: i64) -> Self {
         Self(timestamp)
     }
 
-    /// Gets the watermark timestamp
+    /// Returns the watermark timestamp in milliseconds.
+    #[inline]
     #[must_use]
     pub fn timestamp(&self) -> i64 {
         self.0
     }
 
-    /// Checks if an event is late relative to this watermark
+    /// Checks if an event is late relative to this watermark.
+    ///
+    /// An event is considered late if its timestamp is strictly less than
+    /// the watermark timestamp.
+    #[inline]
     #[must_use]
     pub fn is_late(&self, event_time: i64) -> bool {
         event_time < self.0
     }
-}
 
-/// Watermark generator that tracks event time progress
-pub trait WatermarkGenerator: Send {
-    /// Process an event timestamp and potentially emit a new watermark
-    fn on_event(&mut self, timestamp: i64) -> Option<Watermark>;
-
-    /// Called periodically to emit watermarks based on wall clock time
-    fn on_periodic(&mut self) -> Option<Watermark>;
-}
-
-/// Periodic watermark generator with bounded out-of-orderness
-pub struct BoundedOutOfOrdernessGenerator {
-    max_out_of_orderness: i64,
-    current_max_timestamp: i64,
-}
-
-impl BoundedOutOfOrdernessGenerator {
-    /// Creates a new generator allowing events to be at most `max_out_of_orderness` late
+    /// Returns the minimum (earlier) of two watermarks.
     #[must_use]
-    pub fn new(max_out_of_orderness: i64) -> Self {
-        Self {
-            max_out_of_orderness,
-            current_max_timestamp: i64::MIN,
-        }
+    pub fn min(self, other: Self) -> Self {
+        Self(self.0.min(other.0))
+    }
+
+    /// Returns the maximum (later) of two watermarks.
+    #[must_use]
+    pub fn max(self, other: Self) -> Self {
+        Self(self.0.max(other.0))
     }
 }
 
-impl WatermarkGenerator for BoundedOutOfOrdernessGenerator {
-    fn on_event(&mut self, timestamp: i64) -> Option<Watermark> {
-        if timestamp > self.current_max_timestamp {
-            self.current_max_timestamp = timestamp;
-            let watermark = timestamp.saturating_sub(self.max_out_of_orderness);
-            Some(Watermark::new(watermark))
-        } else {
-            None
-        }
-    }
-
-    fn on_periodic(&mut self) -> Option<Watermark> {
-        // For bounded out-of-orderness, we don't emit periodic watermarks
-        None
+impl Default for Watermark {
+    fn default() -> Self {
+        Self(i64::MIN)
     }
 }
 
-/// A timer registration for delayed processing
+impl From<i64> for Watermark {
+    fn from(timestamp: i64) -> Self {
+        Self(timestamp)
+    }
+}
+
+impl From<Watermark> for i64 {
+    fn from(watermark: Watermark) -> Self {
+        watermark.0
+    }
+}
+
+/// A timer registration for delayed processing.
+///
+/// Timers are used by operators to schedule future actions, typically for
+/// window triggering or timeouts.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct TimerRegistration {
-    /// Timer ID
+    /// Unique timer ID
     pub id: u64,
-    /// Scheduled timestamp
+    /// Scheduled timestamp (event time, in milliseconds)
     pub timestamp: i64,
-    /// Timer key (for keyed operators)
-    pub key: Option<Vec<u8>>,
+    /// Timer key (for keyed operators).
+    /// Uses `TimerKey` (`SmallVec`) to avoid heap allocation for keys up to 16 bytes.
+    pub key: Option<TimerKey>,
 }
 
 impl Ord for TimerRegistration {
     fn cmp(&self, other: &Self) -> Ordering {
-        // Reverse ordering for min-heap behavior
+        // Reverse ordering for min-heap behavior (earliest first)
         other.timestamp.cmp(&self.timestamp)
     }
 }
@@ -125,14 +192,35 @@ impl PartialOrd for TimerRegistration {
     }
 }
 
-/// Timer service for scheduling callbacks
+/// Timer service for scheduling and managing timers.
+///
+/// The timer service maintains a priority queue of timer registrations,
+/// ordered by timestamp. Operators can register timers to be fired at
+/// specific event times.
+///
+/// # Example
+///
+/// ```rust
+/// use laminar_core::time::{TimerService, TimerKey};
+///
+/// let mut service = TimerService::new();
+///
+/// // Register timers at different times
+/// let id1 = service.register_timer(100, None);
+/// let id2 = service.register_timer(50, Some(TimerKey::from_slice(&[1, 2, 3])));
+///
+/// // Poll for timers that should fire at time 75
+/// let fired = service.poll_timers(75);
+/// assert_eq!(fired.len(), 1);
+/// assert_eq!(fired[0].id, id2); // Timer at t=50 fires first
+/// ```
 pub struct TimerService {
     timers: BinaryHeap<TimerRegistration>,
     next_timer_id: u64,
 }
 
 impl TimerService {
-    /// Creates a new timer service
+    /// Creates a new timer service.
     #[must_use]
     pub fn new() -> Self {
         Self {
@@ -141,28 +229,41 @@ impl TimerService {
         }
     }
 
-    /// Registers a new timer
-    pub fn register_timer(&mut self, timestamp: i64, key: Option<Vec<u8>>) -> u64 {
+    /// Registers a new timer.
+    ///
+    /// Returns the unique timer ID that can be used to cancel the timer.
+    ///
+    /// # Arguments
+    ///
+    /// * `timestamp` - The event time at which the timer should fire
+    /// * `key` - Optional key for keyed operators
+    pub fn register_timer(&mut self, timestamp: i64, key: Option<TimerKey>) -> u64 {
         let id = self.next_timer_id;
         self.next_timer_id += 1;
 
-        self.timers.push(TimerRegistration { id, timestamp, key });
+        self.timers
+            .push(TimerRegistration { id, timestamp, key });
 
         id
     }
 
-    /// Gets all timers that should fire at or before the given timestamp
+    /// Polls for timers that should fire at or before the given timestamp.
+    ///
+    /// Returns all timers with timestamps <= `current_time`, in order.
+    /// Uses `FiredTimersVec` (`SmallVec`) to avoid heap allocation when few timers fire.
     ///
     /// # Panics
     ///
-    /// This function should not panic under normal circumstances as the unwrap is only called
-    /// after verifying the heap is not empty
-    pub fn poll_timers(&mut self, current_time: i64) -> Vec<TimerRegistration> {
-        let mut fired = Vec::new();
+    /// This function should not panic under normal circumstances. The internal
+    /// `expect` is only called after verifying the heap is not empty via `peek`.
+    #[inline]
+    pub fn poll_timers(&mut self, current_time: i64) -> FiredTimersVec {
+        let mut fired = FiredTimersVec::new();
 
         while let Some(timer) = self.timers.peek() {
             if timer.timestamp <= current_time {
-                fired.push(self.timers.pop().unwrap());
+                // SAFETY: We just peeked and confirmed the heap is not empty
+                fired.push(self.timers.pop().expect("heap should not be empty"));
             } else {
                 break;
             }
@@ -171,11 +272,30 @@ impl TimerService {
         fired
     }
 
-    /// Cancels a timer by ID
+    /// Cancels a timer by ID.
+    ///
+    /// Returns `true` if the timer was found and cancelled.
     pub fn cancel_timer(&mut self, id: u64) -> bool {
         let count_before = self.timers.len();
         self.timers.retain(|t| t.id != id);
         self.timers.len() < count_before
+    }
+
+    /// Returns the number of pending timers.
+    #[must_use]
+    pub fn pending_count(&self) -> usize {
+        self.timers.len()
+    }
+
+    /// Returns the timestamp of the next timer to fire, if any.
+    #[must_use]
+    pub fn next_timer_timestamp(&self) -> Option<i64> {
+        self.timers.peek().map(|t| t.timestamp)
+    }
+
+    /// Clears all pending timers.
+    pub fn clear(&mut self) {
+        self.timers.clear();
     }
 }
 
@@ -185,21 +305,38 @@ impl Default for TimerService {
     }
 }
 
-/// Errors that can occur in time operations
+/// Errors that can occur in time operations.
 #[derive(Debug, thiserror::Error)]
 pub enum TimeError {
-    /// Invalid timestamp
+    /// Invalid timestamp value
     #[error("Invalid timestamp: {0}")]
     InvalidTimestamp(i64),
 
     /// Timer not found
     #[error("Timer not found: {0}")]
     TimerNotFound(u64),
+
+    /// Watermark regression (going backwards)
+    #[error("Watermark regression: current={current}, new={new}")]
+    WatermarkRegression {
+        /// Current watermark value
+        current: i64,
+        /// Attempted new watermark value
+        new: i64,
+    },
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    // ==================== Watermark Tests ====================
+
+    #[test]
+    fn test_watermark_creation() {
+        let watermark = Watermark::new(1000);
+        assert_eq!(watermark.timestamp(), 1000);
+    }
 
     #[test]
     fn test_watermark_late_detection() {
@@ -208,6 +345,148 @@ mod tests {
         assert!(!watermark.is_late(1000));
         assert!(!watermark.is_late(1001));
     }
+
+    #[test]
+    fn test_watermark_min_max() {
+        let w1 = Watermark::new(1000);
+        let w2 = Watermark::new(2000);
+
+        assert_eq!(w1.min(w2), Watermark::new(1000));
+        assert_eq!(w1.max(w2), Watermark::new(2000));
+    }
+
+    #[test]
+    fn test_watermark_ordering() {
+        let w1 = Watermark::new(1000);
+        let w2 = Watermark::new(2000);
+
+        assert!(w1 < w2);
+        assert!(w2 > w1);
+        assert_eq!(w1, Watermark::new(1000));
+    }
+
+    #[test]
+    fn test_watermark_conversions() {
+        let wm = Watermark::from(1000i64);
+        assert_eq!(wm.timestamp(), 1000);
+
+        let ts: i64 = wm.into();
+        assert_eq!(ts, 1000);
+    }
+
+    #[test]
+    fn test_watermark_default() {
+        let wm = Watermark::default();
+        assert_eq!(wm.timestamp(), i64::MIN);
+    }
+
+    // ==================== TimerService Tests ====================
+
+    #[test]
+    fn test_timer_service_creation() {
+        let service = TimerService::new();
+        assert_eq!(service.pending_count(), 0);
+        assert_eq!(service.next_timer_timestamp(), None);
+    }
+
+    #[test]
+    fn test_timer_registration() {
+        let mut service = TimerService::new();
+
+        let id1 = service.register_timer(100, None);
+        let id2 = service.register_timer(50, Some(TimerKey::from_slice(&[1, 2, 3])));
+
+        assert_eq!(service.pending_count(), 2);
+        assert_ne!(id1, id2);
+    }
+
+    #[test]
+    fn test_timer_poll_order() {
+        let mut service = TimerService::new();
+
+        let id1 = service.register_timer(100, None);
+        let id2 = service.register_timer(50, Some(TimerKey::from_slice(&[1, 2, 3])));
+        let _id3 = service.register_timer(150, None);
+
+        // Poll at time 75 - should get timer at t=50
+        let fired = service.poll_timers(75);
+        assert_eq!(fired.len(), 1);
+        assert_eq!(fired[0].id, id2);
+        assert_eq!(fired[0].key, Some(TimerKey::from_slice(&[1, 2, 3])));
+
+        // Poll at time 125 - should get timer at t=100
+        let fired = service.poll_timers(125);
+        assert_eq!(fired.len(), 1);
+        assert_eq!(fired[0].id, id1);
+
+        // Poll at time 200 - should get timer at t=150
+        let fired = service.poll_timers(200);
+        assert_eq!(fired.len(), 1);
+
+        assert_eq!(service.pending_count(), 0);
+    }
+
+    #[test]
+    fn test_timer_poll_multiple() {
+        let mut service = TimerService::new();
+
+        service.register_timer(50, None);
+        service.register_timer(75, None);
+        service.register_timer(100, None);
+
+        // Poll at time 80 - should get timers at t=50 and t=75
+        let fired = service.poll_timers(80);
+        assert_eq!(fired.len(), 2);
+        // Should be in timestamp order
+        assert_eq!(fired[0].timestamp, 50);
+        assert_eq!(fired[1].timestamp, 75);
+    }
+
+    #[test]
+    fn test_timer_cancel() {
+        let mut service = TimerService::new();
+
+        let id1 = service.register_timer(100, None);
+        let id2 = service.register_timer(200, None);
+
+        assert!(service.cancel_timer(id1));
+        assert_eq!(service.pending_count(), 1);
+
+        // Should not be able to cancel again
+        assert!(!service.cancel_timer(id1));
+
+        // Cancel the remaining timer
+        assert!(service.cancel_timer(id2));
+        assert_eq!(service.pending_count(), 0);
+    }
+
+    #[test]
+    fn test_timer_next_timestamp() {
+        let mut service = TimerService::new();
+
+        assert_eq!(service.next_timer_timestamp(), None);
+
+        service.register_timer(100, None);
+        assert_eq!(service.next_timer_timestamp(), Some(100));
+
+        service.register_timer(50, None);
+        assert_eq!(service.next_timer_timestamp(), Some(50));
+    }
+
+    #[test]
+    fn test_timer_clear() {
+        let mut service = TimerService::new();
+
+        service.register_timer(100, None);
+        service.register_timer(200, None);
+        service.register_timer(300, None);
+
+        service.clear();
+        assert_eq!(service.pending_count(), 0);
+        assert_eq!(service.next_timer_timestamp(), None);
+    }
+
+    // ==================== WatermarkGenerator Trait Tests ====================
 
     #[test]
     fn test_bounded_watermark_generator() {
@@ -227,26 +506,44 @@ mod tests {
     }
 
     #[test]
-    fn test_timer_service() {
-        let mut service = TimerService::new();
+    fn test_ascending_watermark_generator() {
+        let mut generator = AscendingTimestampsGenerator::new();
 
-        // Register timers
-        let id1 = service.register_timer(100, None);
-        let id2 = service.register_timer(50, Some(vec![1, 2, 3]));
-        let _id3 = service.register_timer(150, None);
+        let wm1 = generator.on_event(1000);
+        assert_eq!(wm1, Some(Watermark::new(1000)));
 
-        // Poll at time 75 - should get timer 2
-        let fired = service.poll_timers(75);
-        assert_eq!(fired.len(), 1);
-        assert_eq!(fired[0].id, id2);
+        let wm2 = generator.on_event(2000);
+        assert_eq!(wm2, Some(Watermark::new(2000)));
 
-        // Poll at time 125 - should get timer 1
-        let fired = service.poll_timers(125);
-        assert_eq!(fired.len(), 1);
-        assert_eq!(fired[0].id, id1);
+        // Out of order - no watermark
+        let wm3 = generator.on_event(1500);
+        assert_eq!(wm3, None);
+    }
 
-        // Poll at time 200 - should get timer 3
-        let fired = service.poll_timers(200);
-        assert_eq!(fired.len(), 1);
+    // ==================== WatermarkTracker Tests ====================
+
+    #[test]
+    fn test_watermark_tracker_basic() {
+        let mut tracker = WatermarkTracker::new(2);
+
+        tracker.update_source(0, 1000);
+        let wm = tracker.update_source(1, 500);
+
+        assert_eq!(wm, Some(Watermark::new(500)));
+    }
+
+    #[test]
+    fn test_watermark_tracker_idle() {
+        let mut tracker = WatermarkTracker::new(2);
+
+        tracker.update_source(0, 5000);
+        tracker.update_source(1, 1000);
+
+        // Mark slow source as idle
+        let wm = tracker.mark_idle(1);
+        assert_eq!(wm, Some(Watermark::new(5000)));
+
+        assert!(tracker.is_idle(1));
+        assert!(!tracker.is_idle(0));
     }
 }

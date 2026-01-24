@@ -4,12 +4,12 @@
 
 | Phase | Total | Draft | In Progress | Done |
 |-------|-------|-------|-------------|------|
-| Phase 1 | 12 | 3 | 0 | 9 |
+| Phase 1 | 12 | 2 | 0 | 10 |
 | Phase 2 | 12 | 12 | 0 | 0 |
 | Phase 3 | 10 | 10 | 0 | 0 |
 | Phase 4 | 11 | 11 | 0 | 0 |
 | Phase 5 | 10 | 10 | 0 | 0 |
-| **Total** | **55** | **46** | **0** | **9** |
+| **Total** | **55** | **45** | **0** | **10** |
 
 ## Status Legend
 
@@ -34,7 +34,7 @@
 | F007 | Write-Ahead Log | P1 | ✅ | [Link](phase-1/F007-write-ahead-log.md) |
 | F008 | Basic Checkpointing | P1 | ✅ | [Link](phase-1/F008-basic-checkpointing.md) |
 | F009 | Event Time Processing | P1 | ✅ | [Link](phase-1/F009-event-time-processing.md) |
-| F010 | Watermarks | P1 | 📝 | [Link](phase-1/F010-watermarks.md) |
+| F010 | Watermarks | P1 | ✅ | [Link](phase-1/F010-watermarks.md) |
 | F011 | EMIT Clause | P2 | 📝 | [Link](phase-1/F011-emit-clause.md) |
 | F012 | Late Data Handling | P2 | 📝 | [Link](phase-1/F012-late-data-handling.md) |
 

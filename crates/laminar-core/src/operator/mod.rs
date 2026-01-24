@@ -13,6 +13,10 @@
 use arrow_array::RecordBatch;
 use smallvec::SmallVec;
 
+/// Timer key type optimized for window IDs (16 bytes).
+/// Re-exported from time module for convenience.
+pub type TimerKey = SmallVec<[u8; 16]>;
+
 /// An event flowing through the system
 #[derive(Debug, Clone)]
 pub struct Event {
@@ -82,8 +86,8 @@ pub trait Operator: Send {
 /// A timer registration
 #[derive(Debug, Clone)]
 pub struct Timer {
-    /// Timer key
-    pub key: Vec<u8>,
+    /// Timer key (uses `SmallVec` to avoid heap allocation for keys up to 16 bytes)
+    pub key: TimerKey,
     /// Expiration timestamp
     pub timestamp: i64,
 }

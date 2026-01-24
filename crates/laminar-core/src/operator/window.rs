@@ -31,6 +31,7 @@ use super::{
 use crate::state::{StateStore, StateStoreExt};
 use arrow_array::{Int64Array, RecordBatch};
 use arrow_schema::{DataType, Field, Schema, SchemaRef};
+use smallvec::SmallVec;
 use rkyv::{
     api::high::{HighDeserializer, HighSerializer, HighValidator},
     bytecheck::CheckBytes,
@@ -71,11 +72,12 @@ impl WindowId {
 
     /// Converts the window ID to a byte key for state storage.
     ///
-    /// This method allocates a `Vec<u8>`. For hot path operations,
-    /// prefer [`to_key_inline`] which returns a stack-allocated array.
+    /// Uses `TimerKey` (`SmallVec`) which stores the 16-byte key inline,
+    /// avoiding heap allocation on the hot path.
+    #[inline]
     #[must_use]
-    pub fn to_key(&self) -> Vec<u8> {
-        self.to_key_inline().to_vec()
+    pub fn to_key(&self) -> super::TimerKey {
+        super::TimerKey::from(self.to_key_inline())
     }
 
     /// Converts the window ID to a stack-allocated byte key.
@@ -107,13 +109,20 @@ impl WindowId {
     }
 }
 
+/// Collection type for window assignments.
+///
+/// Uses `SmallVec` to avoid heap allocation for common cases:
+/// - 1 window: tumbling windows (most common)
+/// - 2-4 windows: sliding windows with small overlap
+pub type WindowIdVec = SmallVec<[WindowId; 4]>;
+
 /// Trait for assigning events to windows.
 pub trait WindowAssigner: Send {
     /// Assigns an event timestamp to zero or more windows.
     ///
     /// For tumbling windows, this returns exactly one window.
     /// For sliding windows, this may return multiple windows.
-    fn assign_windows(&self, timestamp: i64) -> Vec<WindowId>;
+    fn assign_windows(&self, timestamp: i64) -> WindowIdVec;
 
     /// Returns the maximum timestamp that could still be assigned to a window
     /// ending at `window_end`.
@@ -189,8 +198,11 @@ impl TumblingWindowAssigner {
 }
 
 impl WindowAssigner for TumblingWindowAssigner {
-    fn assign_windows(&self, timestamp: i64) -> Vec<WindowId> {
-        vec![self.assign(timestamp)]
+    #[inline]
+    fn assign_windows(&self, timestamp: i64) -> WindowIdVec {
+        let mut windows = WindowIdVec::new();
+        windows.push(self.assign(timestamp));
+        windows
     }
 }
 
