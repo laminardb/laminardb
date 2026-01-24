@@ -6,11 +6,11 @@
 |-------|-------|-------|-------------|-----------|------|
 | Phase 1 | 12 | 0 | 0 | 1 | 11 |
 | Phase 1.5 | 1 | 1 | 0 | 0 | 0 |
-| Phase 2 | 19 | 12 | 0 | 0 | 7 |
+| Phase 2 | 22 | 15 | 0 | 0 | 7 |
 | Phase 3 | 12 | 12 | 0 | 0 | 0 |
 | Phase 4 | 11 | 11 | 0 | 0 | 0 |
 | Phase 5 | 10 | 10 | 0 | 0 | 0 |
-| **Total** | **65** | **46** | **0** | **1** | **18** |
+| **Total** | **68** | **49** | **0** | **1** | **18** |
 
 ## Status Legend
 
@@ -109,8 +109,33 @@
 | F062 | Per-Core WAL Segments | P1 | 📝 | [Link](phase-2/F062-per-core-wal.md) |
 | **F011B** | **EMIT Clause Extension** | **P0** | 📝 | [Link](phase-2/F011B-emit-clause-extension.md) |
 | **F063** | **Changelog/Retraction (Z-Sets)** | **P0** | 📝 | [Link](phase-2/F063-changelog-retraction.md) |
+| **F064** | **Per-Partition Watermarks** | **P1** | 📝 | [Link](phase-2/F064-per-partition-watermarks.md) |
+| **F065** | **Keyed Watermarks** | **P1** | 📝 | [Link](phase-2/F065-keyed-watermarks.md) |
+| **F066** | **Watermark Alignment Groups** | **P2** | 📝 | [Link](phase-2/F066-watermark-alignment-groups.md) |
 
-### Phase 2 Emit Patterns Gap Analysis (NEW)
+### Phase 2 Watermark Research Gap Analysis (NEW)
+
+> Based on [Watermark Generator Research 2026](../research/watermark-generator-research-2026.md)
+
+| Gap | Research Finding | Current (F010) | Target | Feature |
+|-----|------------------|----------------|--------|---------|
+| **Keyed Watermarks** | "99%+ accuracy vs 63-67% global" | ❌ Global only | Per-key tracking | **F065** |
+| **Per-Partition Tracking** | "Kafka partitions need independent watermarks" | ❌ Per-source only | Per-partition | **F064** |
+| **Alignment Groups** | "Prevent unbounded state growth" | ❌ No drift limits | Bounded drift + pause | **F066** |
+| Idle Detection | "Critical for pipeline progress" | ✅ Implemented | - | F010 |
+| Bounded Out-of-Orderness | "Default strategy" | ✅ Implemented | - | F010 |
+
+**Key Research Finding:**
+> "Keyed watermarks achieve **99%+ accuracy** compared to **63-67%** with global watermarks." - ScienceDirect, March 2025
+
+**Watermark Evolution Path:**
+```
+F010 (Global) ──► F064 (Per-Partition) ──► F065 (Per-Key)
+                        │
+                        └──► F066 (Alignment Groups)
+```
+
+### Phase 2 Emit Patterns Gap Analysis
 
 > Based on [Emit Patterns Research 2026](../research/emit-patterns-research-2026.md)
 
@@ -300,6 +325,26 @@ F004 (Tumbling) ──▶ F059 (FIRST/LAST) ──▶ F060 (Cascading MVs) ◀�
                                               ▼
                                     F061 (Historical Backfill) [Phase 3]
 
+Watermark Evolution (Phase 2 - NEW):
+┌───────────────────────────────────────────────────────────────────────────┐
+│ F010 (Watermarks) - Phase 1 Foundation                                    │
+│      │  • BoundedOutOfOrderness, Ascending, Periodic, Punctuated         │
+│      │  • WatermarkTracker (multi-source minimum)                        │
+│      │  • Idle detection, MeteredGenerator                               │
+│      │                                                                    │
+│      ├──▶ F064 (Per-Partition) ──┬──▶ F025 (Kafka Source)                │
+│      │        • Per-partition tracking                                   │
+│      │        • Thread-per-core integration                              │
+│      │                           │                                        │
+│      │                           └──▶ F065 (Keyed Watermarks)            │
+│      │                                   • Per-key tracking              │
+│      │                                   • 99%+ accuracy                 │
+│      │                                                                    │
+│      └──▶ F066 (Alignment Groups) ──▶ F019 (Stream Joins)                │
+│               • Bounded drift                                            │
+│               • Pause fast sources                                       │
+└───────────────────────────────────────────────────────────────────────────┘
+
 Phase 3 (blocked by F006B for DDL parsing):
 F006B ──▶ F025-F034 (Connectors need CREATE SOURCE/SINK)
 F013 + F019 ──▶ F058 (Async State Access) ◀── Flink 2.0 Innovation
@@ -371,6 +416,16 @@ F063 ──▶ F027/F028 (CDC Connectors need changelog format)
 | **EMIT FINAL** | F011B | Spark, RisingWave | Included in F011B |
 | **CDC Envelope Format** | F063 | Debezium standard | Included in F063 |
 
+### P1 - High (Watermark Research Gaps - 2026)
+
+> From [Watermark Generator Research 2026](../research/watermark-generator-research-2026.md)
+
+| Gap | Feature | Source | Fix |
+|-----|---------|--------|-----|
+| **No keyed watermarks** | F065 | ScienceDirect March 2025 | **NEW SPEC (P1)** - 99%+ accuracy |
+| **No per-partition tracking** | F064 | Flink best practices | **NEW SPEC (P1)** - Kafka integration |
+| **No alignment groups** | F066 | Flink 1.17+ | **NEW SPEC (P2)** - Prevents state growth |
+
 ### P2 - Medium (Phase 2+)
 
 | Gap | Feature | Impact |
@@ -380,3 +435,4 @@ F063 ──▶ F027/F028 (CDC Connectors need changelog format)
 | No madvise hints | F002 | Suboptimal TLB usage |
 | Multi-way join optimization | - | Static join order, no adaptive |
 | ~~DBSP incrementalization~~ | - | ~~No formal Z-set~~ | **F063 adds Z-set foundation** |
+| Watermark alignment groups | F066 | Join state growth | NEW SPEC (P2) |

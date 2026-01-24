@@ -127,3 +127,18 @@ println!("Watermark lag: {}ms", metrics.lag());
 - [x] Idle source detection
 - [x] Metrics collection (MeteredGenerator)
 - [x] Unit tests passing (39 watermark-related tests)
+
+## Phase 2 Extensions
+
+F010 provides the foundation. The following Phase 2 features extend watermark capabilities based on [Watermark Generator Research 2026](../../research/watermark-generator-research-2026.md):
+
+| Feature | Description | Benefit |
+|---------|-------------|---------|
+| [F064: Per-Partition Watermarks](../phase-2/F064-per-partition-watermarks.md) | Track watermarks per Kafka partition | Required for Kafka integration |
+| [F065: Keyed Watermarks](../phase-2/F065-keyed-watermarks.md) | Per-key watermark tracking | 99%+ accuracy vs 63-67% global |
+| [F066: Watermark Alignment Groups](../phase-2/F066-watermark-alignment-groups.md) | Multi-source coordination with bounded drift | Prevents unbounded state growth |
+
+**Research Summary:**
+- Current F010 implementation matches Phase 1 recommendations
+- Keyed watermarks (F065) are a **major 2025 advancement** from recent research
+- Per-partition tracking (F064) required for production Kafka integration
