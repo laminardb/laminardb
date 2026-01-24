@@ -7,13 +7,13 @@ use sqlparser::ast::{ColumnDef, Expr, Ident, ObjectName};
 #[derive(Debug, Clone, PartialEq)]
 pub enum StreamingStatement {
     /// Standard SQL statement
-    Standard(sqlparser::ast::Statement),
+    Standard(Box<sqlparser::ast::Statement>),
 
     /// CREATE SOURCE statement
-    CreateSource(CreateSourceStatement),
+    CreateSource(Box<CreateSourceStatement>),
 
     /// CREATE SINK statement
-    CreateSink(CreateSinkStatement),
+    CreateSink(Box<CreateSinkStatement>),
 
     /// CREATE CONTINUOUS QUERY
     CreateContinuousQuery {
@@ -99,7 +99,7 @@ pub enum EmitClause {
     /// Final results are still emitted on watermark.
     Periodically {
         /// The interval expression (e.g., INTERVAL '5' SECOND)
-        interval: Expr,
+        interval: Box<Expr>,
     },
 
     /// EMIT ON UPDATE
@@ -115,25 +115,25 @@ pub enum WindowFunction {
     /// TUMBLE(column, interval)
     Tumble {
         /// The time column to window on
-        time_column: Expr,
+        time_column: Box<Expr>,
         /// The window interval
-        interval: Expr,
+        interval: Box<Expr>,
     },
     /// HOP(column, slide, size)
     Hop {
         /// The time column to window on
-        time_column: Expr,
+        time_column: Box<Expr>,
         /// The slide interval (how often to create a new window)
-        slide_interval: Expr,
+        slide_interval: Box<Expr>,
         /// The window size interval
-        window_interval: Expr,
+        window_interval: Box<Expr>,
     },
     /// SESSION(column, gap)
     Session {
         /// The time column to window on
-        time_column: Expr,
+        time_column: Box<Expr>,
         /// The gap interval (max gap between events in same session)
-        gap_interval: Expr,
+        gap_interval: Box<Expr>,
     },
 }
 
@@ -181,7 +181,7 @@ mod tests {
         let emit1 = EmitClause::AfterWatermark;
         let emit2 = EmitClause::OnWindowClose;
         let emit3 = EmitClause::Periodically {
-            interval: Expr::Identifier(Ident::new("5_SECONDS")),
+            interval: Box::new(Expr::Identifier(Ident::new("5_SECONDS"))),
         };
         let emit4 = EmitClause::OnUpdate;
 
@@ -209,14 +209,14 @@ mod tests {
     #[test]
     fn test_window_functions() {
         let tumble = WindowFunction::Tumble {
-            time_column: Expr::Identifier(Ident::new("event_time")),
-            interval: Expr::Identifier(Ident::new("5_MINUTES")),
+            time_column: Box::new(Expr::Identifier(Ident::new("event_time"))),
+            interval: Box::new(Expr::Identifier(Ident::new("5_MINUTES"))),
         };
 
         let hop = WindowFunction::Hop {
-            time_column: Expr::Identifier(Ident::new("event_time")),
-            slide_interval: Expr::Identifier(Ident::new("1_MINUTE")),
-            window_interval: Expr::Identifier(Ident::new("5_MINUTES")),
+            time_column: Box::new(Expr::Identifier(Ident::new("event_time"))),
+            slide_interval: Box::new(Expr::Identifier(Ident::new("1_MINUTE"))),
+            window_interval: Box::new(Expr::Identifier(Ident::new("5_MINUTES"))),
         };
 
         match tumble {

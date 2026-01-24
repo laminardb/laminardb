@@ -60,28 +60,38 @@ pub struct Checkpoint {
 }
 
 impl Checkpoint {
-    /// Path to the metadata file
+    /// Path to the metadata file.
+    #[must_use]
     pub fn metadata_path(&self) -> PathBuf {
         self.path.join("metadata.rkyv")
     }
 
-    /// Path to the state snapshot file
+    /// Path to the state snapshot file.
+    #[must_use]
     pub fn state_path(&self) -> PathBuf {
         self.path.join("state.rkyv")
     }
 
-    /// Path to the source offsets file
+    /// Path to the source offsets file.
+    #[must_use]
     pub fn offsets_path(&self) -> PathBuf {
         self.path.join("offsets.json")
     }
 
-    /// Load the state snapshot from disk
+    /// Load the state snapshot from disk.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error if the state file cannot be read.
     pub fn load_state(&self) -> Result<Vec<u8>> {
-        fs::read(self.state_path())
-            .context("Failed to read state snapshot")
+        fs::read(self.state_path()).context("Failed to read state snapshot")
     }
 
-    /// Load source offsets from disk
+    /// Load source offsets from disk.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error if the offsets file cannot be read or parsed.
     pub fn load_offsets(&self) -> Result<HashMap<String, u64>> {
         let path = self.offsets_path();
         if path.exists() {
@@ -111,16 +121,18 @@ pub struct CheckpointManager {
 }
 
 impl CheckpointManager {
-    /// Create a new checkpoint manager
+    /// Create a new checkpoint manager.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error if the checkpoint directory cannot be created
+    /// or if existing checkpoints cannot be scanned.
     pub fn new(checkpoint_dir: PathBuf, interval: Duration, max_retained: usize) -> Result<Self> {
         // Ensure checkpoint directory exists
-        fs::create_dir_all(&checkpoint_dir)
-            .context("Failed to create checkpoint directory")?;
+        fs::create_dir_all(&checkpoint_dir).context("Failed to create checkpoint directory")?;
 
         // Find the highest checkpoint ID to continue from
-        let next_id = Self::find_highest_checkpoint_id(&checkpoint_dir)?
-            .map(|id| id + 1)
-            .unwrap_or(0);
+        let next_id = Self::find_highest_checkpoint_id(&checkpoint_dir)?.map_or(0, |id| id + 1);
 
         Ok(Self {
             checkpoint_dir,
@@ -130,7 +142,16 @@ impl CheckpointManager {
         })
     }
 
-    /// Create a new checkpoint from the given state snapshot
+    /// Create a new checkpoint from the given state snapshot.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error if the checkpoint directory cannot be created,
+    /// if files cannot be written, or if serialization fails.
+    ///
+    /// # Panics
+    ///
+    /// Panics if the system time is before the Unix epoch.
     pub fn create_checkpoint(
         &self,
         state_snapshot: &[u8],
@@ -194,7 +215,11 @@ impl CheckpointManager {
         Ok(checkpoint)
     }
 
-    /// Find the latest valid checkpoint
+    /// Find the latest valid checkpoint.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error if the checkpoint directory cannot be read.
     pub fn find_latest_checkpoint(&self) -> Result<Option<Checkpoint>> {
         let mut latest: Option<Checkpoint> = None;
         let mut latest_id = 0u64;
@@ -231,7 +256,12 @@ impl CheckpointManager {
         Ok(latest)
     }
 
-    /// Load a checkpoint by ID
+    /// Load a checkpoint by ID.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error if the checkpoint metadata or state cannot be read,
+    /// or if the checkpoint ID does not match.
     pub fn load_checkpoint(&self, checkpoint_id: u64) -> Result<Checkpoint> {
         let checkpoint_path = self.checkpoint_path(checkpoint_id);
 
@@ -263,7 +293,7 @@ impl CheckpointManager {
         // Verify state file exists
         let state_path = checkpoint_path.join("state.rkyv");
         if !state_path.exists() {
-            anyhow::bail!("State file missing for checkpoint {}", checkpoint_id);
+            anyhow::bail!("State file missing for checkpoint {checkpoint_id}");
         }
 
         // Load source offsets if they exist
@@ -279,7 +309,12 @@ impl CheckpointManager {
         Ok(checkpoint)
     }
 
-    /// Clean up old checkpoints, keeping only the most recent ones
+    /// Clean up old checkpoints, keeping only the most recent ones.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error if the checkpoint directory cannot be read
+    /// or if old checkpoints cannot be removed.
     pub fn cleanup_old_checkpoints(&self) -> Result<()> {
         // Get all checkpoint IDs
         let mut checkpoint_ids = Vec::new();
@@ -311,21 +346,23 @@ impl CheckpointManager {
 
             for (id, path) in checkpoint_ids.into_iter().take(to_remove) {
                 fs::remove_dir_all(&path)
-                    .with_context(|| format!("Failed to remove checkpoint {}", id))?;
+                    .with_context(|| format!("Failed to remove checkpoint {id}"))?;
             }
         }
 
         Ok(())
     }
 
-    /// Get the checkpoint interval
+    /// Get the checkpoint interval.
+    #[must_use]
     pub fn interval(&self) -> Duration {
         self.interval
     }
 
     /// Generate checkpoint directory path
     fn checkpoint_path(&self, checkpoint_id: u64) -> PathBuf {
-        self.checkpoint_dir.join(format!("checkpoint-{:020}", checkpoint_id))
+        self.checkpoint_dir
+            .join(format!("checkpoint-{checkpoint_id:020}"))
     }
 
     /// Parse checkpoint ID from directory name

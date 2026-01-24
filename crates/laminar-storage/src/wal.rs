@@ -4,7 +4,6 @@
 //! are applied. This enables recovery after crashes and supports exactly-once
 //! processing semantics.
 
-use std::collections::HashMap;
 use std::fs::{File, OpenOptions};
 use std::io::{BufReader, BufWriter, Read, Write};
 use std::path::{Path, PathBuf};
@@ -22,7 +21,8 @@ use rkyv::{
 mod wal_types {
     #![allow(missing_docs)]  // Allow for derive-generated code
 
-    use super::*;
+    use std::collections::HashMap;
+    use rkyv::{Archive, Deserialize as RkyvDeserialize, Serialize as RkyvSerialize};
 
     /// WAL entry types representing different operations.
     #[derive(Debug, Clone, Archive, RkyvSerialize, RkyvDeserialize)]
@@ -106,9 +106,9 @@ impl WriteAheadLog {
     /// * `path` - Path to the WAL file
     /// * `sync_interval` - Interval for group commit
     ///
-    /// # Returns
+    /// # Errors
     ///
-    /// A new WAL instance or an error.
+    /// Returns `WalError::Io` if the file cannot be created or opened.
     pub fn new<P: AsRef<Path>>(path: P, sync_interval: Duration) -> Result<Self, WalError> {
         let path = path.as_ref().to_path_buf();
         let file = OpenOptions::new()
@@ -139,22 +139,26 @@ impl WriteAheadLog {
     ///
     /// * `entry` - The entry to append
     ///
-    /// # Returns
+    /// # Errors
     ///
-    /// The position of the entry in the log.
-    pub fn append(&mut self, entry: WalEntry) -> Result<u64, WalError> {
+    /// Returns `WalError::Serialization` if the entry cannot be serialized,
+    /// or `WalError::Io` if the write fails.
+    pub fn append(&mut self, entry: &WalEntry) -> Result<u64, WalError> {
         let start_pos = self.position;
 
         // Serialize the entry using rkyv
-        let bytes: AlignedVec = rkyv::to_bytes::<RkyvError>(&entry)
+        let bytes: AlignedVec = rkyv::to_bytes::<RkyvError>(entry)
             .map_err(|e| WalError::Serialization(e.to_string()))?;
 
         // Write entry length (4 bytes) followed by the entry
+        #[allow(clippy::cast_possible_truncation)]
         let len = bytes.len() as u32;
         self.writer.write_all(&len.to_le_bytes())?;
         self.writer.write_all(&bytes)?;
 
-        self.position += 4 + bytes.len() as u64;
+        #[allow(clippy::cast_possible_truncation)]
+        let bytes_len = bytes.len() as u64;
+        self.position += 4 + bytes_len;
 
         // Check if we need to sync (group commit)
         if self.sync_on_write || self.last_sync.elapsed() >= self.sync_interval {
@@ -165,6 +169,10 @@ impl WriteAheadLog {
     }
 
     /// Force sync to disk.
+    ///
+    /// # Errors
+    ///
+    /// Returns `WalError::Io` if the sync fails.
     pub fn sync(&mut self) -> Result<(), WalError> {
         self.writer.flush()?;
         self.writer.get_ref().sync_all()?;
@@ -178,15 +186,16 @@ impl WriteAheadLog {
     ///
     /// * `position` - Starting position to read from
     ///
-    /// # Returns
+    /// # Errors
     ///
-    /// An iterator over WAL entries.
+    /// Returns `WalError::Io` if the file cannot be opened or seeked.
     pub fn read_from(&self, position: u64) -> Result<WalReader, WalError> {
+        use std::io::Seek;
+
         let file = File::open(&self.path)?;
         let mut reader = BufReader::new(file);
 
         // Seek to position
-        use std::io::Seek;
         reader.seek(std::io::SeekFrom::Start(position))?;
 
         Ok(WalReader {
@@ -196,6 +205,7 @@ impl WriteAheadLog {
     }
 
     /// Get the current position in the log.
+    #[must_use]
     pub fn position(&self) -> u64 {
         self.position
     }
@@ -203,6 +213,10 @@ impl WriteAheadLog {
     /// Truncate the log at the specified position.
     ///
     /// Used after successful checkpointing to remove old entries.
+    ///
+    /// # Errors
+    ///
+    /// Returns `WalError::Io` if the truncation or file operations fail.
     pub fn truncate(&mut self, position: u64) -> Result<(), WalError> {
         self.sync()?;
 
@@ -240,7 +254,7 @@ impl Iterator for WalReader {
         // Read entry length
         let mut len_bytes = [0u8; 4];
         match self.reader.read_exact(&mut len_bytes) {
-            Ok(_) => {},
+            Ok(()) => {}
             Err(e) if e.kind() == std::io::ErrorKind::UnexpectedEof => return None,
             Err(e) => return Some(Err(e.into())),
         }
@@ -266,6 +280,8 @@ impl Iterator for WalReader {
 
 #[cfg(test)]
 mod tests {
+    use std::collections::HashMap;
+
     use super::*;
     use tempfile::NamedTempFile;
 
@@ -275,14 +291,18 @@ mod tests {
         let mut wal = WriteAheadLog::new(temp_file.path(), Duration::from_secs(1)).unwrap();
 
         // Append entries
-        let pos1 = wal.append(WalEntry::Put {
-            key: b"key1".to_vec(),
-            value: b"value1".to_vec(),
-        }).unwrap();
+        let pos1 = wal
+            .append(&WalEntry::Put {
+                key: b"key1".to_vec(),
+                value: b"value1".to_vec(),
+            })
+            .unwrap();
 
-        let _pos2 = wal.append(WalEntry::Delete {
-            key: b"key2".to_vec(),
-        }).unwrap();
+        let _pos2 = wal
+            .append(&WalEntry::Delete {
+                key: b"key2".to_vec(),
+            })
+            .unwrap();
 
         wal.sync().unwrap();
 
@@ -314,17 +334,19 @@ mod tests {
         let mut wal = WriteAheadLog::new(temp_file.path(), Duration::from_secs(1)).unwrap();
 
         // Append entries
-        wal.append(WalEntry::Put {
+        wal.append(&WalEntry::Put {
             key: b"key1".to_vec(),
             value: b"value1".to_vec(),
-        }).unwrap();
+        })
+        .unwrap();
 
-        let checkpoint_pos = wal.append(WalEntry::Checkpoint { id: 1 }).unwrap();
+        let checkpoint_pos = wal.append(&WalEntry::Checkpoint { id: 1 }).unwrap();
 
-        wal.append(WalEntry::Put {
+        wal.append(&WalEntry::Put {
             key: b"key2".to_vec(),
             value: b"value2".to_vec(),
-        }).unwrap();
+        })
+        .unwrap();
 
         wal.sync().unwrap();
 
@@ -348,17 +370,19 @@ mod tests {
         let mut wal = WriteAheadLog::new(temp_file.path(), Duration::from_secs(1)).unwrap();
 
         // Append entries
-        wal.append(WalEntry::Put {
+        wal.append(&WalEntry::Put {
             key: b"key1".to_vec(),
             value: b"value1".to_vec(),
-        }).unwrap();
+        })
+        .unwrap();
 
         let truncate_pos = wal.position();
 
-        wal.append(WalEntry::Put {
+        wal.append(&WalEntry::Put {
             key: b"key2".to_vec(),
             value: b"value2".to_vec(),
-        }).unwrap();
+        })
+        .unwrap();
 
         wal.sync().unwrap();
 
@@ -382,7 +406,10 @@ mod tests {
         offsets.insert("topic1".to_string(), 100);
         offsets.insert("topic2".to_string(), 200);
 
-        wal.append(WalEntry::Commit { offsets: offsets.clone() }).unwrap();
+        wal.append(&WalEntry::Commit {
+            offsets: offsets.clone(),
+        })
+        .unwrap();
         wal.sync().unwrap();
 
         // Read and verify

@@ -17,7 +17,11 @@ use super::ParseError;
 pub struct StreamingParser;
 
 impl StreamingParser {
-    /// Parse a SQL string with streaming extensions
+    /// Parse a SQL string with streaming extensions.
+    ///
+    /// # Errors
+    ///
+    /// Returns `ParserError` if the SQL syntax is invalid.
     pub fn parse_sql(sql: &str) -> Result<Vec<StreamingStatement>, ParserError> {
         // First, try to parse as standard SQL
         let dialect = GenericDialect {};
@@ -41,7 +45,7 @@ impl StreamingParser {
         let mut streaming_statements = Vec::new();
         for statement in statements {
             // TODO: Check for window functions in SELECT statements
-            streaming_statements.push(StreamingStatement::Standard(statement));
+            streaming_statements.push(StreamingStatement::Standard(Box::new(statement)));
         }
 
         Ok(streaming_statements)
@@ -53,23 +57,23 @@ impl StreamingParser {
 
         if sql_upper.starts_with("CREATE SOURCE") {
             // Simplified CREATE SOURCE parsing
-            Ok(StreamingStatement::CreateSource(CreateSourceStatement {
+            Ok(StreamingStatement::CreateSource(Box::new(CreateSourceStatement {
                 name: ObjectName(vec![ObjectNamePart::Identifier(Ident::new("events"))]),
                 columns: vec![],
                 watermark: None,
                 with_options: HashMap::new(),
                 or_replace: sql_upper.contains("OR REPLACE"),
                 if_not_exists: sql_upper.contains("IF NOT EXISTS"),
-            }))
+            })))
         } else if sql_upper.starts_with("CREATE SINK") {
             // Simplified CREATE SINK parsing
-            Ok(StreamingStatement::CreateSink(CreateSinkStatement {
+            Ok(StreamingStatement::CreateSink(Box::new(CreateSinkStatement {
                 name: ObjectName(vec![ObjectNamePart::Identifier(Ident::new("output_sink"))]),
                 from: SinkFrom::Table(ObjectName(vec![ObjectNamePart::Identifier(Ident::new("events"))])),
                 with_options: HashMap::new(),
                 or_replace: sql_upper.contains("OR REPLACE"),
                 if_not_exists: sql_upper.contains("IF NOT EXISTS"),
-            }))
+            })))
         } else if sql_upper.starts_with("CREATE CONTINUOUS QUERY") {
             // Parse the EMIT clause using the improved parser
             let emit_clause = Self::parse_emit_clause(sql).ok().flatten();
@@ -84,17 +88,17 @@ impl StreamingParser {
             let query_stmt = if query_sql.len() > 2 && query_sql.starts_with("AS") {
                 let actual_query = query_sql[2..].trim();
                 if let Ok(mut stmts) = Parser::parse_sql(&GenericDialect {}, actual_query) {
-                    if !stmts.is_empty() {
-                        StreamingStatement::Standard(stmts.remove(0))
-                    } else {
+                    if stmts.is_empty() {
                         // Default to a simple SELECT
-                        StreamingStatement::Standard(Parser::parse_sql(&GenericDialect {}, "SELECT 1").unwrap().remove(0))
+                        StreamingStatement::Standard(Box::new(Parser::parse_sql(&GenericDialect {}, "SELECT 1").unwrap().remove(0)))
+                    } else {
+                        StreamingStatement::Standard(Box::new(stmts.remove(0)))
                     }
                 } else {
-                    StreamingStatement::Standard(Parser::parse_sql(&GenericDialect {}, "SELECT 1").unwrap().remove(0))
+                    StreamingStatement::Standard(Box::new(Parser::parse_sql(&GenericDialect {}, "SELECT 1").unwrap().remove(0)))
                 }
             } else {
-                StreamingStatement::Standard(Parser::parse_sql(&GenericDialect {}, "SELECT 1").unwrap().remove(0))
+                StreamingStatement::Standard(Box::new(Parser::parse_sql(&GenericDialect {}, "SELECT 1").unwrap().remove(0)))
             };
 
             Ok(StreamingStatement::CreateContinuousQuery {
@@ -109,7 +113,8 @@ impl StreamingParser {
         }
     }
 
-    /// Check if an expression contains a window function
+    /// Check if an expression contains a window function.
+    #[must_use]
     pub fn has_window_function(expr: &Expr) -> bool {
         match expr {
             Expr::Function(func) => {
@@ -163,8 +168,10 @@ impl StreamingParser {
         // EMIT EVERY INTERVAL or EMIT PERIODICALLY INTERVAL
         if emit_clause.contains("EVERY") || emit_clause.contains("PERIODICALLY") {
             // Extract the interval portion
-            let interval_expr = Self::parse_interval_from_emit(sql, emit_pos)?;
-            return Ok(Some(EmitClause::Periodically { interval: interval_expr }));
+            let interval_expr = Self::parse_interval_from_emit(sql, emit_pos);
+            return Ok(Some(EmitClause::Periodically {
+                interval: Box::new(interval_expr),
+            }));
         }
 
         // Unknown EMIT clause
@@ -177,7 +184,7 @@ impl StreamingParser {
     /// Parse interval expression from EMIT clause.
     ///
     /// Handles: `EMIT EVERY INTERVAL '10' SECOND` or `EMIT PERIODICALLY INTERVAL '5' MINUTE`
-    fn parse_interval_from_emit(sql: &str, emit_pos: usize) -> Result<Expr, ParseError> {
+    fn parse_interval_from_emit(sql: &str, emit_pos: usize) -> Expr {
         let sql_upper = sql.to_uppercase();
         let emit_clause = &sql_upper[emit_pos..];
 
@@ -194,36 +201,59 @@ impl StreamingParser {
 
         // Try to parse the interval using sqlparser
         let dialect = GenericDialect {};
-        let wrapped_sql = format!("SELECT {}", interval_sql.split_whitespace().take(4).collect::<Vec<_>>().join(" "));
+        let wrapped_sql = format!(
+            "SELECT {}",
+            interval_sql
+                .split_whitespace()
+                .take(4)
+                .collect::<Vec<_>>()
+                .join(" ")
+        );
 
         match Parser::parse_sql(&dialect, &wrapped_sql) {
             Ok(stmts) if !stmts.is_empty() => {
                 if let sqlparser::ast::Statement::Query(query) = &stmts[0] {
                     if let sqlparser::ast::SetExpr::Select(select) = query.body.as_ref() {
                         if !select.projection.is_empty() {
-                            if let sqlparser::ast::SelectItem::UnnamedExpr(expr) = &select.projection[0] {
-                                return Ok(expr.clone());
+                            if let sqlparser::ast::SelectItem::UnnamedExpr(expr) =
+                                &select.projection[0]
+                            {
+                                return expr.clone();
                             }
                         }
                     }
                 }
                 // Fallback to identifier
-                Ok(Expr::Identifier(Ident::new(interval_sql.split_whitespace().take(4).collect::<Vec<_>>().join(" "))))
+                Expr::Identifier(Ident::new(
+                    interval_sql
+                        .split_whitespace()
+                        .take(4)
+                        .collect::<Vec<_>>()
+                        .join(" "),
+                ))
             }
             _ => {
                 // Fallback: return the interval portion as an identifier
-                Ok(Expr::Identifier(Ident::new(interval_sql.split_whitespace().take(4).collect::<Vec<_>>().join(" "))))
+                Expr::Identifier(Ident::new(
+                    interval_sql
+                        .split_whitespace()
+                        .take(4)
+                        .collect::<Vec<_>>()
+                        .join(" "),
+                ))
             }
         }
     }
 
     /// Parse a simple interval like "10 SECONDS" or "5 MINUTES".
-    fn parse_simple_interval(emit_clause: &str) -> Result<Expr, ParseError> {
+    fn parse_simple_interval(emit_clause: &str) -> Expr {
         // Look for patterns like "EVERY 10 SECOND" or "PERIODICALLY 5 MINUTE"
         let words: Vec<&str> = emit_clause.split_whitespace().collect();
 
         // Find the index after EVERY or PERIODICALLY
-        let start_idx = words.iter().position(|&w| w == "EVERY" || w == "PERIODICALLY")
+        let start_idx = words
+            .iter()
+            .position(|&w| w == "EVERY" || w == "PERIODICALLY")
             .map(|i| i + 1);
 
         if let Some(idx) = start_idx {
@@ -233,12 +263,12 @@ impl StreamingParser {
 
                 // Create an interval expression
                 let interval_sql = format!("INTERVAL '{}'", remaining.replace('\'', ""));
-                return Ok(Expr::Identifier(Ident::new(interval_sql)));
+                return Expr::Identifier(Ident::new(interval_sql));
             }
         }
 
         // Default fallback
-        Ok(Expr::Identifier(Ident::new("INTERVAL '1' SECOND")))
+        Expr::Identifier(Ident::new("INTERVAL '1' SECOND"))
     }
 }
 

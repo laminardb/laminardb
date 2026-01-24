@@ -18,7 +18,7 @@ use crate::{CheckpointManager, WriteAheadLog, WalEntry, WalPosition};
 ///
 /// This wraps `MmapStateStore` and logs all mutations to a WAL before
 /// applying them. On recovery, it replays the WAL to rebuild the index
-/// that was lost (since MmapStateStore doesn't persist the index).
+/// that was lost (since `MmapStateStore` doesn't persist the index).
 pub struct WalStateStore {
     /// The underlying state store.
     store: MmapStateStore,
@@ -41,7 +41,7 @@ impl WalStateStore {
     ///
     /// # Arguments
     ///
-    /// * `state_path` - Path to the state file (for MmapStateStore)
+    /// * `state_path` - Path to the state file (for `MmapStateStore`)
     /// * `wal_path` - Path to the WAL file
     /// * `initial_capacity` - Initial capacity for the state store
     /// * `sync_interval` - WAL sync interval for group commit
@@ -57,7 +57,7 @@ impl WalStateStore {
     ) -> Result<Self, StateError> {
         let wal_path_buf = wal_path.to_path_buf();
         let wal = WriteAheadLog::new(&wal_path_buf, sync_interval)
-            .map_err(|e| StateError::Io(std::io::Error::new(std::io::ErrorKind::Other, e)))?;
+            .map_err(|e| StateError::Io(std::io::Error::other(e)))?;
 
         let store = MmapStateStore::persistent(state_path, initial_capacity)?;
 
@@ -79,6 +79,10 @@ impl WalStateStore {
     /// * `wal_path` - Path to the WAL file
     /// * `capacity` - Initial capacity for the in-memory store
     /// * `sync_interval` - WAL sync interval
+    ///
+    /// # Errors
+    ///
+    /// Returns an error if the WAL file cannot be created.
     pub fn in_memory(
         wal_path: &Path,
         capacity: usize,
@@ -86,7 +90,7 @@ impl WalStateStore {
     ) -> Result<Self, StateError> {
         let wal_path_buf = wal_path.to_path_buf();
         let wal = WriteAheadLog::new(&wal_path_buf, sync_interval)
-            .map_err(|e| StateError::Io(std::io::Error::new(std::io::ErrorKind::Other, e)))?;
+            .map_err(|e| StateError::Io(std::io::Error::other(e)))?;
 
         let store = MmapStateStore::in_memory(capacity);
 
@@ -114,6 +118,10 @@ impl WalStateStore {
     /// * `checkpoint_dir` - Directory to store checkpoint files
     /// * `interval` - How often to create checkpoints
     /// * `max_retained` - Maximum number of checkpoints to retain
+    ///
+    /// # Errors
+    ///
+    /// Returns an error if the checkpoint directory cannot be created.
     pub fn enable_checkpointing(
         &mut self,
         checkpoint_dir: PathBuf,
@@ -121,13 +129,18 @@ impl WalStateStore {
         max_retained: usize,
     ) -> Result<(), StateError> {
         let manager = CheckpointManager::new(checkpoint_dir, interval, max_retained)
-            .map_err(|e| StateError::Io(std::io::Error::new(std::io::ErrorKind::Other, e)))?;
+            .map_err(|e| StateError::Io(std::io::Error::other(e)))?;
 
         self.checkpoint_manager = Some(manager);
         Ok(())
     }
 
     /// Check if it's time to create a checkpoint.
+    ///
+    /// # Panics
+    ///
+    /// Panics if the system time is before the Unix epoch.
+    #[must_use]
     pub fn should_checkpoint(&self) -> bool {
         if let Some(ref manager) = self.checkpoint_manager {
             let last = self.last_checkpoint.load(Ordering::Relaxed);
@@ -150,8 +163,13 @@ impl WalStateStore {
     /// Recover state from WAL.
     ///
     /// This reads the WAL from the beginning and replays all entries
-    /// to rebuild the state. This is necessary because MmapStateStore
+    /// to rebuild the state. This is necessary because `MmapStateStore`
     /// doesn't persist its index.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error if the checkpoint or WAL cannot be read,
+    /// or if state restoration fails.
     pub fn recover(&mut self) -> Result<(), StateError> {
         let mut start_position = 0u64;
 
@@ -160,7 +178,7 @@ impl WalStateStore {
             if let Ok(Some(checkpoint)) = manager.find_latest_checkpoint() {
                 // Load checkpoint state
                 let state_data = checkpoint.load_state()
-                    .map_err(|e| StateError::Io(std::io::Error::new(std::io::ErrorKind::Other, e)))?;
+                    .map_err(|e| StateError::Io(std::io::Error::other(e)))?;
 
                 // Deserialize and restore snapshot
                 let snapshot = StateSnapshot::from_bytes(&state_data)?;
@@ -168,19 +186,20 @@ impl WalStateStore {
 
                 // Update recovery state
                 start_position = checkpoint.metadata.wal_position.offset;
-                self.source_offsets = checkpoint.metadata.source_offsets.clone();
-                self.last_checkpoint.store(checkpoint.metadata.timestamp, Ordering::Relaxed);
+                self.source_offsets.clone_from(&checkpoint.metadata.source_offsets);
+                self.last_checkpoint
+                    .store(checkpoint.metadata.timestamp, Ordering::Relaxed);
             }
         }
 
         // Read WAL entries from start position
         let reader = self.wal.read_from(start_position)
-            .map_err(|e| StateError::Io(std::io::Error::new(std::io::ErrorKind::Other, e)))?;
+            .map_err(|e| StateError::Io(std::io::Error::other(e)))?;
 
         // Replay entries after checkpoint
         for entry_result in reader {
             let entry = entry_result
-                .map_err(|e| StateError::Corruption(format!("WAL read error: {}", e)))?;
+                .map_err(|e| StateError::Corruption(format!("WAL read error: {e}")))?;
 
             match entry {
                 WalEntry::Put { key, value } => {
@@ -210,12 +229,16 @@ impl WalStateStore {
     ///
     /// This creates a snapshot of the current state and writes it to disk,
     /// along with a checkpoint marker in the WAL.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error if the checkpoint cannot be created or written.
     pub fn checkpoint(&mut self) -> Result<(), StateError> {
         if let Some(ref manager) = self.checkpoint_manager {
             // Get current state snapshot
             let snapshot = self.store.snapshot();
             let state_data = snapshot.to_bytes()
-                .map_err(|e| StateError::Io(std::io::Error::new(std::io::ErrorKind::Other, e)))?;
+                .map_err(|e| StateError::Io(std::io::Error::other(e)))?;
 
             // Get current WAL position
             let wal_position = WalPosition {
@@ -228,23 +251,25 @@ impl WalStateStore {
                 wal_position,
                 self.source_offsets.clone(),
             )
-            .map_err(|e| StateError::Io(std::io::Error::new(std::io::ErrorKind::Other, e)))?;
+            .map_err(|e| StateError::Io(std::io::Error::other(e)))?;
 
             // Write checkpoint marker to WAL
             self.wal
-                .append(WalEntry::Checkpoint { id: checkpoint.metadata.id })
-                .map_err(|e| StateError::Io(std::io::Error::new(std::io::ErrorKind::Other, e)))?;
+                .append(&WalEntry::Checkpoint {
+                    id: checkpoint.metadata.id,
+                })
+                .map_err(|e| StateError::Io(std::io::Error::other(e)))?;
 
             // Force sync after checkpoint
             self.wal.sync()
-                .map_err(|e| StateError::Io(std::io::Error::new(std::io::ErrorKind::Other, e)))?;
+                .map_err(|e| StateError::Io(std::io::Error::other(e)))?;
 
             // Update last checkpoint time
             self.last_checkpoint.store(checkpoint.metadata.timestamp, Ordering::Relaxed);
 
             // Clean up old checkpoints
             manager.cleanup_old_checkpoints()
-                .map_err(|e| StateError::Io(std::io::Error::new(std::io::ErrorKind::Other, e)))?;
+                .map_err(|e| StateError::Io(std::io::Error::other(e)))?;
 
             // Optionally truncate WAL if safe
             // This would require tracking minimum required WAL position
@@ -255,6 +280,7 @@ impl WalStateStore {
     }
 
     /// Get the current WAL position.
+    #[must_use]
     pub fn wal_position(&self) -> u64 {
         self.wal.position()
     }
@@ -262,9 +288,13 @@ impl WalStateStore {
     /// Truncate the WAL at the given position.
     ///
     /// Used after successful checkpointing to remove old entries.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error if the WAL cannot be truncated.
     pub fn truncate_wal(&mut self, position: u64) -> Result<(), StateError> {
         self.wal.truncate(position)
-            .map_err(|e| StateError::Io(std::io::Error::new(std::io::ErrorKind::Other, e)))?;
+            .map_err(|e| StateError::Io(std::io::Error::other(e)))?;
         Ok(())
     }
 }
@@ -278,11 +308,11 @@ impl StateStore for WalStateStore {
     fn put(&mut self, key: &[u8], value: &[u8]) -> Result<(), StateError> {
         // Log to WAL first
         self.wal
-            .append(WalEntry::Put {
+            .append(&WalEntry::Put {
                 key: key.to_vec(),
                 value: value.to_vec(),
             })
-            .map_err(|e| StateError::Io(std::io::Error::new(std::io::ErrorKind::Other, e)))?;
+            .map_err(|e| StateError::Io(std::io::Error::other(e)))?;
 
         // Then apply to store
         self.store.put(key, value)
@@ -291,10 +321,10 @@ impl StateStore for WalStateStore {
     fn delete(&mut self, key: &[u8]) -> Result<(), StateError> {
         // Log to WAL first
         self.wal
-            .append(WalEntry::Delete {
+            .append(&WalEntry::Delete {
                 key: key.to_vec(),
             })
-            .map_err(|e| StateError::Io(std::io::Error::new(std::io::ErrorKind::Other, e)))?;
+            .map_err(|e| StateError::Io(std::io::Error::other(e)))?;
 
         // Then apply to store
         self.store.delete(key)
@@ -346,7 +376,7 @@ impl StateStore for WalStateStore {
     fn flush(&mut self) -> Result<(), StateError> {
         // Sync WAL first
         self.wal.sync()
-            .map_err(|e| StateError::Io(std::io::Error::new(std::io::ErrorKind::Other, e)))?;
+            .map_err(|e| StateError::Io(std::io::Error::other(e)))?;
 
         // Then flush the store
         self.store.flush()

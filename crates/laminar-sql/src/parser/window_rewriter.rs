@@ -1,9 +1,6 @@
 //! Rewrite window functions in SQL queries
 
-use sqlparser::ast::{
-    Expr, Ident, Query, Select, SelectItem,
-    SetExpr, Statement,
-};
+use sqlparser::ast::{Expr, Ident, Query, Select, SetExpr, Statement};
 
 use super::{ParseError, WindowFunction};
 
@@ -11,10 +8,14 @@ use super::{ParseError, WindowFunction};
 pub struct WindowRewriter;
 
 impl WindowRewriter {
-    /// Rewrite a SQL statement to expand window functions
+    /// Rewrite a SQL statement to expand window functions.
     ///
     /// Transforms window functions like TUMBLE into appropriate table functions
-    /// and adds window_start/window_end columns.
+    /// and adds `window_start`/`window_end` columns.
+    ///
+    /// # Errors
+    ///
+    /// Returns `ParseError::WindowError` if a window function cannot be rewritten.
     ///
     /// # Example
     ///
@@ -29,30 +30,27 @@ impl WindowRewriter {
     /// GROUP BY window_start, window_end
     /// ```
     pub fn rewrite_statement(stmt: &mut Statement) -> Result<(), ParseError> {
-        match stmt {
-            Statement::Query(query) => Self::rewrite_query(query),
-            _ => Ok(()),
-        }
-    }
-
-    /// Rewrite a query
-    fn rewrite_query(query: &mut Query) -> Result<(), ParseError> {
-        if let SetExpr::Select(select) = &mut *query.body {
-            Self::rewrite_select(select)?;
+        if let Statement::Query(query) = stmt {
+            Self::rewrite_query(query);
         }
         Ok(())
     }
 
+    /// Rewrite a query
+    fn rewrite_query(query: &mut Query) {
+        if let SetExpr::Select(select) = &mut *query.body {
+            Self::rewrite_select(select);
+        }
+    }
+
     /// Rewrite a SELECT statement
-    fn rewrite_select(_select: &mut Select) -> Result<(), ParseError> {
+    fn rewrite_select(_select: &mut Select) {
         // For now, this is a simplified implementation
         // In production, we'd properly handle GROUP BY expressions
 
         // TODO: Implement window function rewriting when we have a stable API
         // The GroupByExpr in sqlparser 0.60 has a different structure
         // than expected, so we'll defer this implementation
-
-        Ok(())
     }
 
     /// Check if expression contains a window function
@@ -71,7 +69,11 @@ impl WindowRewriter {
         }
     }
 
-    /// Extract window function details from expression
+    /// Extract window function details from expression.
+    ///
+    /// # Errors
+    ///
+    /// Returns `ParseError::WindowError` if the function has an empty name.
     pub fn extract_window_function(expr: &Expr) -> Result<Option<WindowFunction>, ParseError> {
         match expr {
             Expr::Function(func) => {
@@ -84,17 +86,17 @@ impl WindowRewriter {
                 // In production, we'd properly parse the arguments
                 match func_name.as_str() {
                     "TUMBLE" => Ok(Some(WindowFunction::Tumble {
-                        time_column: Expr::Identifier(Ident::new("event_time")),
-                        interval: Expr::Identifier(Ident::new("5 MINUTES")),
+                        time_column: Box::new(Expr::Identifier(Ident::new("event_time"))),
+                        interval: Box::new(Expr::Identifier(Ident::new("5 MINUTES"))),
                     })),
                     "HOP" => Ok(Some(WindowFunction::Hop {
-                        time_column: Expr::Identifier(Ident::new("event_time")),
-                        slide_interval: Expr::Identifier(Ident::new("1 MINUTE")),
-                        window_interval: Expr::Identifier(Ident::new("5 MINUTES")),
+                        time_column: Box::new(Expr::Identifier(Ident::new("event_time"))),
+                        slide_interval: Box::new(Expr::Identifier(Ident::new("1 MINUTE"))),
+                        window_interval: Box::new(Expr::Identifier(Ident::new("5 MINUTES"))),
                     })),
                     "SESSION" => Ok(Some(WindowFunction::Session {
-                        time_column: Expr::Identifier(Ident::new("event_time")),
-                        gap_interval: Expr::Identifier(Ident::new("10 MINUTES")),
+                        time_column: Box::new(Expr::Identifier(Ident::new("event_time"))),
+                        gap_interval: Box::new(Expr::Identifier(Ident::new("10 MINUTES"))),
                     })),
                     _ => Ok(None),
                 }
@@ -107,6 +109,7 @@ impl WindowRewriter {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use sqlparser::ast::SelectItem;
     use sqlparser::dialect::GenericDialect;
     use sqlparser::parser::Parser;
 
