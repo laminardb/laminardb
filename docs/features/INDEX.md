@@ -5,11 +5,12 @@
 | Phase | Total | Draft | In Progress | Hardening | Done |
 |-------|-------|-------|-------------|-----------|------|
 | Phase 1 | 12 | 0 | 0 | 1 | 11 |
+| Phase 1.5 | 1 | 1 | 0 | 0 | 0 |
 | Phase 2 | 12 | 5 | 0 | 0 | 7 |
 | Phase 3 | 10 | 10 | 0 | 0 | 0 |
 | Phase 4 | 11 | 11 | 0 | 0 | 0 |
 | Phase 5 | 10 | 10 | 0 | 0 | 0 |
-| **Total** | **55** | **36** | **0** | **1** | **18** |
+| **Total** | **56** | **37** | **0** | **1** | **18** |
 
 ## Status Legend
 
@@ -50,6 +51,36 @@
 | WAL: Torn write detection | F007 | ✅ Done | `WalReadResult::TornWrite`, `repair()` |
 | Watermark persistence | F010 | ✅ Done | In WAL commits and checkpoints |
 | Recovery integration test | F007/F008 | ✅ Done | 6 comprehensive tests |
+
+---
+
+## Phase 1.5: SQL Parser Production Upgrade
+
+> **Status**: 📝 Draft - Blocks Phase 3 connectors and advanced SQL features
+
+| ID | Feature | Priority | Status | Effort | Spec |
+|----|---------|----------|--------|--------|------|
+| F006B | Production SQL Parser | P0 | 📝 | L (2-3 weeks) | [Link](phase-1/F006B-production-sql-parser.md) |
+
+### F006B Implementation Phases
+
+| Phase | Scope | Effort | Dependencies |
+|-------|-------|--------|--------------|
+| 1 | CREATE SOURCE/SINK parsing | 2-3 days | None |
+| 2 | Window function extraction (TUMBLE/HOP/SESSION) | 3-4 days | Phase 1 |
+| 3 | EMIT/Late Data integration | 2-3 days | Phase 2 |
+| 4 | Join query parsing (stream-stream, lookup) | 3-4 days | Phase 1 |
+| 5 | Query planner integration | 4-5 days | Phases 2, 3, 4 |
+| 6 | Aggregator detection (COUNT/SUM/MIN/MAX/AVG) | 2-3 days | Phase 4 |
+
+### Key Deliverables
+
+- [ ] Fix hardcoded CREATE SOURCE/SINK (`parser_simple.rs:60-76`)
+- [ ] Fix hardcoded window args (`window_rewriter.rs:88-100`)
+- [ ] Implement `rewrite_select()` (`window_rewriter.rs:47-54`)
+- [ ] Replace `todo!()` in planner (`planner/mod.rs:22-25`)
+- [ ] New modules: `translator/`, `parser/join_parser.rs`, `parser/aggregation_parser.rs`
+- [ ] 30+ new test cases
 
 ---
 
@@ -137,17 +168,23 @@ F001 (Reactor) ──┬──▶ F002 (State Store)
                           │
 F005 (DataFusion) ───────▶ F006 (SQL Parser) ⚠️ POC
                           │
-F007 (WAL) ⚠️ ───────────▶ F008 (Checkpointing)
+F007 (WAL) ──────────────▶ F008 (Checkpointing)
                           │
-F009 (Event Time) ───────▶ F010 (Watermarks) ⚠️ ──▶ F012 (Late Data)
-                                                 ──▶ F011 (EMIT)
+F009 (Event Time) ───────▶ F010 (Watermarks) ──▶ F012 (Late Data)
+                                              ──▶ F011 (EMIT)
 
-Phase 1 Hardening (must complete before Phase 2):
-┌─────────────────────────────────────────────────────────┐
-│ F007: fsync→fdatasync, CRC32, torn write detection     │
-│ F010: Watermark persistence in WAL                      │
-│ Integration test: Checkpoint + WAL replay               │
-└─────────────────────────────────────────────────────────┘
+Phase 1.5 (SQL Parser Production - F006B):
+┌─────────────────────────────────────────────────────────────────┐
+│   F006 ──▶ Phase1 (CREATE SOURCE/SINK)                          │
+│                │                                                │
+│                ├──▶ Phase2 (Windows) ──▶ Phase3 (EMIT)          │
+│                │                              │                 │
+│                └──▶ Phase4 (Joins) ───────────┤                 │
+│                                               ▼                 │
+│                                        Phase5 (Planner)         │
+│                                               │                 │
+│   Configures: F004, F016, F019, F020 ◀────────┘                 │
+└─────────────────────────────────────────────────────────────────┘
                           │
                           ▼
 Phase 2:
@@ -155,27 +192,35 @@ F001 ──▶ F013 (Thread-per-Core) ──▶ F014 (SPSC) ──▶ F015 (CPU 
 F004 ──▶ F016 (Sliding) ──▶ F017 (Session) ──▶ F018 (Hopping)
 F003 ──▶ F019 (Stream Joins) ──▶ F020 (Lookup) ──▶ F021 (Temporal)
 F008 ──▶ F022 (Incremental) ──▶ F023 (Exactly-Once) ──▶ F024 (2PC)
+
+Phase 3 (blocked by F006B for DDL parsing):
+F006B ──▶ F025-F034 (Connectors need CREATE SOURCE/SINK)
 ```
 
 ---
 
 ## Gap Summary by Priority
 
-### P0 - Critical (Blocks Phase 2)
+### P0 - Critical (Blocks Phase 2) - ✅ ALL COMPLETE
+
+| Gap | Feature | Status | Notes |
+|-----|---------|--------|-------|
+| ~~WAL uses fsync not fdatasync~~ | F007 | ✅ Fixed | `sync_data()` |
+| ~~No CRC32 checksum in WAL~~ | F007 | ✅ Fixed | CRC32C hardware accelerated |
+| ~~No torn write detection~~ | F007 | ✅ Fixed | `WalReadResult::TornWrite` |
+| ~~Watermark not persisted~~ | F010 | ✅ Fixed | In WAL + checkpoint |
+| ~~No recovery integration test~~ | F007/F008 | ✅ Fixed | 6 tests |
+
+### P0 - Critical (Blocks Phase 3)
+
+| Gap | Feature | Impact | Fix |
+|-----|---------|--------|-----|
+| **SQL parser is POC only** | F006 | Connectors need DDL parsing | **F006B** (2-3 weeks) |
+
+### P1 - High (Phase 2/3)
 
 | Gap | Feature | Impact |
 |-----|---------|--------|
-| WAL uses fsync not fdatasync | F007 | 50-100μs wasted per sync |
-| No CRC32 checksum in WAL | F007 | Cannot detect corruption |
-| No torn write detection | F007 | Crash recovery may fail |
-| Watermark not persisted | F010 | Recovery loses progress |
-| No recovery integration test | F007/F008 | Untested critical path |
-
-### P1 - High (Early Phase 2)
-
-| Gap | Feature | Impact |
-|-----|---------|--------|
-| SQL parser is POC only | F006 | Required for advanced features |
 | No per-core WAL | F007 | Required for F013 |
 | Checkpoint blocks Ring 0 | F008 | Latency spikes |
 | No CoW mmap | F002 | Can't isolate snapshots |
