@@ -5,25 +5,66 @@
 ## Last Session
 
 **Date**: 2026-01-24
-**Duration**: ~2 hours
+**Duration**: Continued session
 
 ### What Was Accomplished
-- ✅ **WAL: fsync → fdatasync** - Changed `sync_all()` to `sync_data()` for 50-100μs savings per sync
-- ✅ **WAL: CRC32 checksums** - Added CRC32C integrity validation to all WAL records
-- ✅ **WAL: Torn write detection** - Detect partial records at WAL tail, added `repair()` method
-- ✅ **Watermark persistence** - Added watermark to `WalEntry::Commit` and `CheckpointMetadata`
-- ✅ **Recovery integration tests** - Added 6 comprehensive tests covering all recovery scenarios
-- ✅ All 223 tests passing across all crates (142 core + 56 sql + 25 storage)
+- ✅ **F013: Thread-Per-Core Architecture** - Full implementation complete
+- ✅ **F014: SPSC Queue** - Lock-free bounded queue with cache padding
+- ✅ **Credit-Based Backpressure** - Apache Flink-style flow control added
+- ✅ All 275 tests passing across all crates (194 core + 56 sql + 25 storage)
 - ✅ Clippy clean for all crates
-- ✅ **ALL P0 HARDENING COMPLETE** - Phase 1 ready for Phase 2!
+- ✅ TPC benchmarks added (`cargo bench --bench tpc_bench`)
+
+### F013/F014 Implementation Details
+
+**Module Structure**:
+```
+crates/laminar-core/src/tpc/
+├── mod.rs           # Public exports, TpcError enum
+├── spsc.rs          # Lock-free SPSC queue with CachePadded<T>
+├── router.rs        # KeyRouter for event partitioning
+├── core_handle.rs   # CoreHandle per-core reactor wrapper
+├── backpressure.rs  # Credit-based flow control (NEW)
+└── runtime.rs       # ThreadPerCoreRuntime multi-core orchestration
+```
+
+**Key Components**:
+- `SpscQueue<T>` - Lock-free single-producer single-consumer queue
+  - Atomic head/tail with Acquire/Release ordering
+  - Power-of-2 capacity for fast modulo
+  - Batch push/pop operations
+  - Achieved: ~4.8ns per operation (10x better than 50ns target)
+
+- `CachePadded<T>` - 64-byte aligned wrapper to prevent false sharing
+
+- `KeyRouter` - Routes events to cores by key hash
+  - FxHash for fast, consistent hashing
+  - Supports column names, indices, round-robin, all-columns
+
+- `CoreHandle` - Per-core reactor thread management
+  - CPU affinity (Linux/Windows)
+  - SPSC inbox/outbox queues
+  - Credit-based backpressure integration
+  - CoreMessage enum for events, watermarks, checkpoints
+
+- `CreditGate` / `BackpressureConfig` - Credit-based flow control
+  - Exclusive + floating credits (like Flink's network stack)
+  - High/low watermarks for hysteresis
+  - Three overflow strategies: Block, Drop, Error
+  - Lock-free atomic credit tracking
+  - Per-core metrics (acquired, released, blocked, dropped)
+
+- `ThreadPerCoreRuntime` - Multi-core orchestration
+  - Builder pattern for configuration
+  - submit/poll/stats operations
+  - OperatorFactory for per-core operators
 
 ### Where We Left Off
-All 5 P0 hardening tasks are complete. Phase 1 is fully hardened and ready for Phase 2.
+Phase 2 P0 feature F013 is complete with backpressure. Ready to continue with remaining Phase 2 work.
 
 ### Immediate Next Steps
 
-1. **Phase 2 Planning** - Begin Production Hardening phase
-   - F013: Thread-Per-Core Architecture (P0)
+1. **Continue Phase 2** - Production Hardening
    - F016: Sliding Windows (P0)
    - F019: Stream-Stream Joins (P0)
    - F023: Exactly-Once Sinks (P0)
@@ -32,82 +73,82 @@ All 5 P0 hardening tasks are complete. Phase 1 is fully hardened and ready for P
 
 | Issue | Severity | Feature | Notes |
 |-------|----------|---------|-------|
-| ~~fsync not fdatasync~~ | ~~🔴 Critical~~ | ~~F007~~ | ✅ Fixed |
-| ~~No CRC32 in WAL~~ | ~~🔴 Critical~~ | ~~F007~~ | ✅ Fixed |
-| ~~No torn write detection~~ | ~~🔴 Critical~~ | ~~F007~~ | ✅ Fixed |
-| ~~Watermark not persisted~~ | ~~🔴 Critical~~ | ~~F010~~ | ✅ Fixed |
-| ~~No recovery integration test~~ | ~~🔴 Critical~~ | ~~F007/F008~~ | ✅ Fixed |
-
-**No P0 issues remaining!**
+| None | - | - | Phase 2 underway |
 
 ### Code Pointers
 
-**WAL record format** (now with CRC32):
-```
-+----------+----------+------------------+
-| Length   | CRC32C   | Entry Data       |
-| (4 bytes)| (4 bytes)| (Length bytes)   |
-+----------+----------+------------------+
-```
-
-**Key WAL changes** (`crates/laminar-storage/src/wal.rs`):
-- `sync()` uses `sync_data()` (fdatasync) instead of `sync_all()` (fsync)
-- `append()` computes CRC32C and writes header + data
-- `WalReader::read_next()` validates CRC32 on read
-- `WalReadResult` enum distinguishes EOF, TornWrite, ChecksumMismatch
-- `repair()` truncates WAL to last valid record
-
-**Watermark in commits** (`crates/laminar-storage/src/wal.rs`):
+**TPC Public API**:
 ```rust
-pub enum WalEntry {
-    // ...
-    Commit {
-        offsets: HashMap<String, u64>,
-        watermark: Option<i64>,  // NEW: for recovery
-    },
-}
+use laminar_core::tpc::{TpcConfig, ThreadPerCoreRuntime, KeySpec};
+
+// Configure for 4 cores, routing by "user_id" column
+let config = TpcConfig::builder()
+    .num_cores(4)
+    .key_columns(vec!["user_id".to_string()])
+    .cpu_pinning(true)
+    .build()?;
+
+let runtime = ThreadPerCoreRuntime::new(config)?;
+
+// Submit events - automatically routed by key
+runtime.submit(event)?;
+
+// Poll all cores for outputs
+let outputs = runtime.poll();
 ```
 
-**Checkpoint with watermark** (`crates/laminar-storage/src/checkpoint.rs`):
+**Backpressure Configuration**:
 ```rust
-pub struct CheckpointMetadata {
-    pub id: u64,
-    pub timestamp: u64,
-    pub wal_position: WalPosition,
-    pub source_offsets: HashMap<String, u64>,
-    pub state_size: u64,
-    pub watermark: Option<i64>,  // NEW: for recovery
-}
+use laminar_core::tpc::{BackpressureConfig, OverflowStrategy, CoreConfig};
+
+// Configure credit-based flow control
+let bp_config = BackpressureConfig::builder()
+    .exclusive_credits(4)      // Per-sender reserved credits
+    .floating_credits(8)       // Shared pool for backlog priority
+    .high_watermark(0.8)       // Start throttling at 80% queue usage
+    .low_watermark(0.5)        // Resume at 50% queue usage
+    .overflow_strategy(OverflowStrategy::Block)  // or Drop, Error
+    .build();
+
+// CoreHandle exposes backpressure state
+let handle: &CoreHandle = ...;
+handle.is_backpressured();     // Check if throttling active
+handle.available_credits();    // Current credit count
+handle.credit_metrics();       // Acquired, released, blocked, dropped
 ```
 
 ---
 
-## P0 Hardening Progress - ALL COMPLETE ✅
+## Phase 2 Progress
 
-| Task | Status | Notes |
-|------|--------|-------|
-| WAL: fsync → fdatasync | ✅ Complete | `sync_data()` saves 50-100μs/sync |
-| WAL: CRC32 checksums | ✅ Complete | CRC32C hardware accelerated |
-| WAL: Torn write detection | ✅ Complete | `WalReadResult::TornWrite`, `repair()` |
-| Watermark persistence | ✅ Complete | In WAL commits and checkpoints |
-| Recovery integration test | ✅ Complete | 6 tests covering all scenarios |
+| Feature | Status | Notes |
+|---------|--------|-------|
+| F013: Thread-Per-Core | ✅ Complete | SPSC queues, key routing, CPU pinning |
+| F014: SPSC Queues | ✅ Complete | Part of F013 implementation |
+| F016: Sliding Windows | 📝 Not started | |
+| F019: Stream-Stream Joins | 📝 Not started | |
+| F023: Exactly-Once Sinks | 📝 Not started | |
 
 ---
 
 ## Quick Reference
 
 ### Current Focus
-- **Phase**: 1 Hardening (4/5 P0 fixes complete)
-- **Remaining**: Recovery integration test
+- **Phase**: 2 Production Hardening
+- **Active Feature**: F013 complete, ready for F016
 
 ### Key Files
 ```
-crates/laminar-storage/src/
-├── wal.rs              # WAL with CRC32, fdatasync, torn write detection
-├── wal_state_store.rs  # WAL-backed store with watermark support
-└── checkpoint.rs       # Checkpoints with watermark
+crates/laminar-core/src/tpc/
+├── mod.rs           # TpcError, public exports
+├── spsc.rs          # SpscQueue<T>, CachePadded<T>
+├── router.rs        # KeyRouter, KeySpec
+├── core_handle.rs   # CoreHandle, CoreConfig, CoreMessage
+└── runtime.rs       # ThreadPerCoreRuntime, TpcConfig
 
-Tests: 217 passing (142 core, 56 sql, 19 storage)
+Benchmarks: crates/laminar-core/benches/tpc_bench.rs
+
+Tests: 267 passing (186 core, 56 sql, 25 storage)
 ```
 
 ### Useful Commands
@@ -115,8 +156,11 @@ Tests: 217 passing (142 core, 56 sql, 19 storage)
 # Run all tests
 cargo test --all --lib
 
-# Run storage tests only
-cargo test -p laminar-storage --lib
+# Run TPC tests only
+cargo test -p laminar-core tpc --lib
+
+# Run TPC benchmarks
+cargo bench --bench tpc_bench
 
 # Clippy
 cargo clippy --all -- -D warnings
@@ -125,16 +169,35 @@ cargo clippy --all -- -D warnings
 ### Recent Decisions
 | Date | Decision | Rationale |
 |------|----------|-----------|
-| 2026-01-24 | WAL record format: [len][crc][data] | Simple, validates integrity per-record |
-| 2026-01-24 | fdatasync over fsync | Metadata sync unnecessary, saves latency |
-| 2026-01-24 | CRC32C for checksums | Hardware accelerated on modern CPUs |
-| 2026-01-24 | Optional watermark in Commit | Backward compatible, None for legacy |
+| 2026-01-24 | Custom SPSC over crossbeam | Precise cache layout control |
+| 2026-01-24 | `#[repr(C, align(64))]` for CachePadded | Hardware cache line alignment |
+| 2026-01-24 | FxHash for key routing | Faster than std HashMap for small keys |
+| 2026-01-24 | Factory pattern for per-core operators | No shared state between cores |
 
 ---
 
 ## History
 
 ### Previous Sessions
+
+<details>
+<summary>Session - 2026-01-24 (F013 Thread-Per-Core)</summary>
+
+**Accomplished**:
+- Implemented F013 Thread-Per-Core Architecture
+- Created tpc module with spsc.rs, router.rs, core_handle.rs, runtime.rs
+- Lock-free SPSC queue with CachePadded wrapper
+- KeyRouter for FxHash-based event partitioning
+- CoreHandle with CPU affinity (Linux/Windows)
+- ThreadPerCoreRuntime with builder pattern
+- Added tpc_bench.rs with comprehensive benchmarks
+- All 267 tests passing, clippy clean
+
+**Key Files**:
+- `crates/laminar-core/src/tpc/` - TPC module
+- `crates/laminar-core/benches/tpc_bench.rs` - Benchmarks
+
+</details>
 
 <details>
 <summary>Session - 2026-01-24 (WAL Hardening)</summary>
