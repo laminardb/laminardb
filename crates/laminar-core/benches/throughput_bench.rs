@@ -4,7 +4,9 @@
 
 use arrow_array::{Int64Array, RecordBatch};
 use criterion::{criterion_group, criterion_main, Criterion, Throughput};
-use laminar_core::operator::{Event, Operator, OperatorContext, OperatorError, OperatorState, Output, Timer};
+use laminar_core::operator::{
+    Event, Operator, OperatorContext, OperatorError, OperatorState, Output, Timer,
+};
 use laminar_core::reactor::{Config, Reactor};
 use std::hint::black_box;
 use std::sync::Arc;
@@ -39,7 +41,10 @@ impl Operator for MinimalOperator {
 fn create_minimal_event(timestamp: i64) -> Event {
     let array = Arc::new(Int64Array::from(vec![timestamp]));
     let batch = RecordBatch::try_from_iter(vec![("v", array as _)]).unwrap();
-    Event { timestamp, data: batch }
+    Event {
+        timestamp,
+        data: batch,
+    }
 }
 
 /// Benchmark maximum sustainable throughput

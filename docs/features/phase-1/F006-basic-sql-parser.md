@@ -5,12 +5,12 @@
 | Field | Value |
 |-------|-------|
 | **ID** | F006 |
-| **Status** | 📝 Draft |
+| **Status** | ✅ Done |
 | **Priority** | P0 |
 | **Phase** | 1 |
 | **Effort** | M (3-5 days) |
 | **Dependencies** | F005 |
-| **Owner** | TBD |
+| **Owner** | Completed |
 
 ## Summary
 
@@ -48,7 +48,17 @@ pub struct WatermarkDef {
 
 ## Completion Checklist
 
-- [ ] DDL parsing implemented
-- [ ] Window functions parsed
-- [ ] EMIT clause supported
-- [ ] Unit tests passing
+- [x] DDL parsing implemented (POC level)
+- [x] Window functions parsed (structure only)
+- [x] EMIT clause supported (basic detection)
+- [x] Unit tests passing
+
+## Production Status
+
+**⚠️ IMPORTANT**: The current implementation is a proof-of-concept and NOT production-ready.
+
+See:
+- [SQL Parser Improvements Plan](F006-sql-parser-improvements.md)
+- [ADR-003: SQL Parser Strategy](../../adr/ADR-003-sql-parser-strategy.md)
+
+Production implementation is required before Phase 2 features can be built.

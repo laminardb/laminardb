@@ -11,64 +11,441 @@
 //!
 //! ## State Backends
 //!
-//! - **`InMemory`**: HashMap-based, fastest for small state
-//! - **`MemoryMapped`**: mmap-based, supports larger-than-memory state
-//! - **Hybrid**: Combination with hot/cold separation
+//! - **[`InMemoryStore`]**: FxHashMap-based, fastest for small state
+//! - **[`MmapStateStore`]**: Memory-mapped, supports larger-than-memory state with optional persistence
+//! - **Hybrid**: Combination with hot/cold separation (future)
+//!
+//! ## Example
+//!
+//! ```rust
+//! use laminar_core::state::{StateStore, StateStoreExt, InMemoryStore};
+//!
+//! let mut store = InMemoryStore::new();
+//!
+//! // Basic key-value operations
+//! store.put(b"user:1", b"alice").unwrap();
+//! assert_eq!(store.get(b"user:1").unwrap().as_ref(), b"alice");
+//!
+//! // Typed state access (requires StateStoreExt)
+//! store.put_typed(b"count", &42u64).unwrap();
+//! let count: u64 = store.get_typed(b"count").unwrap().unwrap();
+//! assert_eq!(count, 42);
+//!
+//! // Snapshots for checkpointing
+//! let snapshot = store.snapshot();
+//! store.delete(b"user:1").unwrap();
+//! assert!(store.get(b"user:1").is_none());
+//!
+//! // Restore from snapshot
+//! store.restore(snapshot);
+//! assert_eq!(store.get(b"user:1").unwrap().as_ref(), b"alice");
+//! ```
+//!
+//! ## Memory-Mapped Store Example
+//!
+//! ```rust,no_run
+//! use laminar_core::state::{StateStore, MmapStateStore};
+//! use std::path::Path;
+//!
+//! // In-memory mode (fast, not persistent)
+//! let mut store = MmapStateStore::in_memory(1024 * 1024);
+//! store.put(b"key", b"value").unwrap();
+//!
+//! // Persistent mode (survives restarts)
+//! let mut persistent = MmapStateStore::persistent(
+//!     Path::new("/tmp/state.db"),
+//!     1024 * 1024
+//! ).unwrap();
+//! persistent.put(b"key", b"value").unwrap();
+//! persistent.flush().unwrap();
+//! ```
 
 use bytes::Bytes;
+use fxhash::FxHashMap;
+use rkyv::{
+    api::high::{HighDeserializer, HighSerializer, HighValidator},
+    bytecheck::CheckBytes,
+    rancor::Error as RkyvError,
+    ser::allocator::ArenaHandle,
+    util::AlignedVec,
+    Archive, Deserialize as RkyvDeserialize, Serialize as RkyvSerialize,
+};
 use std::ops::Range;
 
-/// Trait for state store implementations
+/// Trait for state store implementations.
+///
+/// This is the core abstraction for operator state in Ring 0 (hot path).
+/// All implementations must achieve < 500ns lookup latency for point queries.
+///
+/// # Thread Safety
+///
+/// State stores are `Send` but not `Sync`. They are designed for single-threaded
+/// access within a reactor. Cross-thread communication uses SPSC queues.
+///
+/// # Memory Model
+///
+/// - `get()` returns `Bytes` which is a cheap reference-counted handle
+/// - `put()` copies the input to internal storage
+/// - Snapshots are copy-on-write where possible
+///
+/// # Dyn Compatibility
+///
+/// This trait is dyn-compatible for use with `Box<dyn StateStore>`. For generic
+/// convenience methods like `get_typed` and `put_typed`, use the [`StateStoreExt`]
+/// extension trait.
 pub trait StateStore: Send {
-    /// Get a value by key
+    /// Get a value by key.
+    ///
+    /// Returns `None` if the key does not exist.
+    ///
+    /// # Performance
+    ///
+    /// Target: < 500ns for in-memory stores.
     fn get(&self, key: &[u8]) -> Option<Bytes>;
 
-    /// Put a key-value pair
+    /// Store a key-value pair.
+    ///
+    /// If the key already exists, the value is overwritten.
     ///
     /// # Errors
     ///
-    /// Returns `StateError` if the operation fails (e.g., disk full, I/O error)
+    /// Returns `StateError` if the operation fails (e.g., disk full for
+    /// memory-mapped stores).
     fn put(&mut self, key: &[u8], value: &[u8]) -> Result<(), StateError>;
 
-    /// Delete a key
+    /// Delete a key.
+    ///
+    /// No error is returned if the key does not exist.
     ///
     /// # Errors
     ///
-    /// Returns `StateError` if the operation fails (e.g., I/O error)
+    /// Returns `StateError` if the operation fails.
     fn delete(&mut self, key: &[u8]) -> Result<(), StateError>;
 
-    /// Scan keys with a given prefix
-    fn prefix_scan<'a>(&'a self, prefix: &'a [u8]) -> Box<dyn Iterator<Item = (Bytes, Bytes)> + 'a>;
+    /// Scan all keys with a given prefix.
+    ///
+    /// Returns an iterator over matching (key, value) pairs.
+    /// The iteration order is not guaranteed.
+    ///
+    /// # Performance
+    ///
+    /// This is O(n) where n is the total number of keys. Use sparingly
+    /// on the hot path.
+    fn prefix_scan<'a>(&'a self, prefix: &'a [u8])
+        -> Box<dyn Iterator<Item = (Bytes, Bytes)> + 'a>;
 
-    /// Range scan between two keys
-    fn range_scan<'a>(&'a self, range: Range<&'a [u8]>) -> Box<dyn Iterator<Item = (Bytes, Bytes)> + 'a>;
+    /// Range scan between two keys (exclusive end).
+    ///
+    /// Returns an iterator over keys where `start <= key < end`.
+    /// Keys are compared lexicographically.
+    fn range_scan<'a>(
+        &'a self,
+        range: Range<&'a [u8]>,
+    ) -> Box<dyn Iterator<Item = (Bytes, Bytes)> + 'a>;
 
-    /// Get approximate size in bytes
+    /// Check if a key exists.
+    ///
+    /// More efficient than `get()` when you don't need the value.
+    fn contains(&self, key: &[u8]) -> bool {
+        self.get(key).is_some()
+    }
+
+    /// Get approximate size in bytes.
+    ///
+    /// This includes both keys and values. The exact accounting may vary
+    /// by implementation.
     fn size_bytes(&self) -> usize;
 
-    /// Flush any pending writes
+    /// Get the number of entries in the store.
+    fn len(&self) -> usize;
+
+    /// Check if the store is empty.
+    fn is_empty(&self) -> bool {
+        self.len() == 0
+    }
+
+    /// Create a snapshot for checkpointing.
+    ///
+    /// The snapshot captures the current state and can be used to restore
+    /// the store to this point in time. Snapshots are serializable for
+    /// persistence.
+    ///
+    /// # Implementation Notes
+    ///
+    /// For in-memory stores, this clones the data. For memory-mapped stores,
+    /// this may use copy-on-write semantics.
+    fn snapshot(&self) -> StateSnapshot;
+
+    /// Restore from a snapshot.
+    ///
+    /// This replaces the current state with the snapshot's state.
+    /// Any changes since the snapshot was taken are lost.
+    fn restore(&mut self, snapshot: StateSnapshot);
+
+    /// Clear all entries.
+    fn clear(&mut self);
+
+    /// Flush any pending writes to durable storage.
+    ///
+    /// For in-memory stores, this is a no-op. For memory-mapped or
+    /// disk-backed stores, this ensures data is persisted.
     ///
     /// # Errors
     ///
-    /// Returns `StateError` if the flush operation fails
+    /// Returns `StateError` if the flush operation fails.
     fn flush(&mut self) -> Result<(), StateError> {
-        Ok(()) // Default no-op
+        Ok(()) // Default no-op for in-memory stores
+    }
+
+    /// Get a value or insert a default.
+    ///
+    /// If the key doesn't exist, the default is inserted and returned.
+    ///
+    /// # Errors
+    ///
+    /// Returns `StateError` if inserting the default value fails.
+    fn get_or_insert(&mut self, key: &[u8], default: &[u8]) -> Result<Bytes, StateError> {
+        if let Some(value) = self.get(key) {
+            Ok(value)
+        } else {
+            self.put(key, default)?;
+            Ok(Bytes::copy_from_slice(default))
+        }
     }
 }
 
-/// In-memory state store using `FxHashMap`
+/// Extension trait for [`StateStore`] providing typed access methods.
+///
+/// These methods use generics and thus cannot be part of the dyn-compatible
+/// `StateStore` trait. Import this trait to use typed access on any state store.
+///
+/// Uses rkyv for zero-copy serialization. Types must derive `Archive`,
+/// `rkyv::Serialize`, and `rkyv::Deserialize`.
+///
+/// # Example
+///
+/// ```rust,ignore
+/// use laminar_core::state::{StateStore, StateStoreExt, InMemoryStore};
+/// use rkyv::{Archive, Deserialize, Serialize};
+///
+/// #[derive(Archive, Serialize, Deserialize)]
+/// #[rkyv(check_bytes)]
+/// struct Counter { value: u64 }
+///
+/// let mut store = InMemoryStore::new();
+/// store.put_typed(b"count", &Counter { value: 42 }).unwrap();
+/// let count: Counter = store.get_typed(b"count").unwrap().unwrap();
+/// assert_eq!(count.value, 42);
+/// ```
+pub trait StateStoreExt: StateStore {
+    /// Get a value and deserialize it using rkyv.
+    ///
+    /// Uses zero-copy access where possible, falling back to full
+    /// deserialization to return an owned value.
+    ///
+    /// # Errors
+    ///
+    /// Returns `StateError::Serialization` if deserialization fails.
+    fn get_typed<T>(&self, key: &[u8]) -> Result<Option<T>, StateError>
+    where
+        T: Archive,
+        T::Archived: for<'a> CheckBytes<HighValidator<'a, RkyvError>>
+            + RkyvDeserialize<T, HighDeserializer<RkyvError>>,
+    {
+        match self.get(key) {
+            Some(bytes) => {
+                let archived = rkyv::access::<T::Archived, RkyvError>(&bytes)
+                    .map_err(|e| StateError::Serialization(e.to_string()))?;
+                let value = rkyv::deserialize::<T, RkyvError>(archived)
+                    .map_err(|e| StateError::Serialization(e.to_string()))?;
+                Ok(Some(value))
+            }
+            None => Ok(None),
+        }
+    }
+
+    /// Serialize and store a value using rkyv.
+    ///
+    /// Uses aligned buffers for optimal performance on the hot path.
+    ///
+    /// # Errors
+    ///
+    /// Returns `StateError::Serialization` if serialization fails.
+    fn put_typed<T>(&mut self, key: &[u8], value: &T) -> Result<(), StateError>
+    where
+        T: for<'a> RkyvSerialize<HighSerializer<AlignedVec, ArenaHandle<'a>, RkyvError>>,
+    {
+        let bytes = rkyv::to_bytes::<RkyvError>(value)
+            .map_err(|e| StateError::Serialization(e.to_string()))?;
+        self.put(key, &bytes)
+    }
+
+    /// Update a value in place using a closure.
+    ///
+    /// The update function receives the current value (or None) and returns
+    /// the new value. If `None` is returned, the key is deleted.
+    ///
+    /// # Errors
+    ///
+    /// Returns `StateError` if the put or delete operation fails.
+    fn update<F>(&mut self, key: &[u8], f: F) -> Result<(), StateError>
+    where
+        F: FnOnce(Option<Bytes>) -> Option<Vec<u8>>,
+    {
+        let current = self.get(key);
+        match f(current) {
+            Some(new_value) => self.put(key, &new_value),
+            None => self.delete(key),
+        }
+    }
+}
+
+// Blanket implementation for all StateStore types
+impl<T: StateStore + ?Sized> StateStoreExt for T {}
+
+/// A snapshot of state store contents for checkpointing.
+///
+/// Snapshots can be serialized for persistence and restored later.
+/// They capture the complete state at a point in time.
+///
+/// Uses rkyv for zero-copy deserialization on the hot path.
+#[derive(Debug, Clone, Archive, RkyvSerialize, RkyvDeserialize)]
+pub struct StateSnapshot {
+    /// Serialized state data
+    data: Vec<(Vec<u8>, Vec<u8>)>,
+    /// Timestamp when snapshot was created (nanoseconds since epoch)
+    timestamp_ns: u64,
+    /// Version for forward compatibility
+    version: u32,
+}
+
+impl StateSnapshot {
+    /// Create a new snapshot from key-value pairs.
+    #[must_use]
+    #[allow(clippy::cast_possible_truncation)]
+    pub fn new(data: Vec<(Vec<u8>, Vec<u8>)>) -> Self {
+        Self {
+            data,
+            // Truncation is acceptable here - we won't hit u64 overflow until ~584 years from epoch
+            timestamp_ns: std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .map(|d| d.as_nanos() as u64)
+                .unwrap_or(0),
+            version: 1,
+        }
+    }
+
+    /// Get the snapshot data.
+    #[must_use]
+    pub fn data(&self) -> &[(Vec<u8>, Vec<u8>)] {
+        &self.data
+    }
+
+    /// Get the snapshot timestamp.
+    #[must_use]
+    pub fn timestamp_ns(&self) -> u64 {
+        self.timestamp_ns
+    }
+
+    /// Get the number of entries in the snapshot.
+    #[must_use]
+    pub fn len(&self) -> usize {
+        self.data.len()
+    }
+
+    /// Check if the snapshot is empty.
+    #[must_use]
+    pub fn is_empty(&self) -> bool {
+        self.data.is_empty()
+    }
+
+    /// Get the approximate size in bytes.
+    #[must_use]
+    pub fn size_bytes(&self) -> usize {
+        self.data.iter().map(|(k, v)| k.len() + v.len()).sum()
+    }
+
+    /// Serialize the snapshot to bytes using rkyv.
+    ///
+    /// Returns an aligned byte vector for optimal zero-copy access.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error if serialization fails.
+    pub fn to_bytes(&self) -> Result<AlignedVec, StateError> {
+        rkyv::to_bytes::<RkyvError>(self).map_err(|e| StateError::Serialization(e.to_string()))
+    }
+
+    /// Deserialize a snapshot from bytes using rkyv.
+    ///
+    /// Uses zero-copy access internally for performance.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error if deserialization fails.
+    pub fn from_bytes(bytes: &[u8]) -> Result<Self, StateError> {
+        let archived = rkyv::access::<<Self as Archive>::Archived, RkyvError>(bytes)
+            .map_err(|e| StateError::Serialization(e.to_string()))?;
+        rkyv::deserialize::<Self, RkyvError>(archived)
+            .map_err(|e| StateError::Serialization(e.to_string()))
+    }
+}
+
+/// In-memory state store using `FxHashMap` for maximum performance.
+///
+/// This is the fastest state store implementation, suitable for state that
+/// fits in memory. It uses `FxHashMap` which is optimized for small keys
+/// (like the ones typically used in streaming operators).
+///
+/// # Performance Characteristics
+///
+/// - **Get**: O(1), < 500ns typical
+/// - **Put**: O(1) amortized, may allocate
+/// - **Delete**: O(1)
+/// - **Prefix scan**: O(n) where n is total entries
+///
+/// # Memory Usage
+///
+/// Keys and values are stored as owned `Vec<u8>` and `Bytes` respectively.
+/// Use `size_bytes()` to monitor memory usage.
 pub struct InMemoryStore {
-    // TODO: Use FxHashMap for better performance
-    data: std::collections::HashMap<Vec<u8>, Bytes>,
+    /// The underlying hash map
+    data: FxHashMap<Vec<u8>, Bytes>,
+    /// Track total size for monitoring
+    size_bytes: usize,
 }
 
 impl InMemoryStore {
-    /// Creates a new in-memory store
+    /// Creates a new empty in-memory store.
     #[must_use]
     pub fn new() -> Self {
         Self {
-            data: std::collections::HashMap::new(),
+            data: FxHashMap::default(),
+            size_bytes: 0,
         }
+    }
+
+    /// Creates a new in-memory store with pre-allocated capacity.
+    ///
+    /// Use this when you know the approximate number of entries
+    /// to avoid rehashing.
+    #[must_use]
+    pub fn with_capacity(capacity: usize) -> Self {
+        Self {
+            data: FxHashMap::with_capacity_and_hasher(capacity, fxhash::FxBuildHasher::default()),
+            size_bytes: 0,
+        }
+    }
+
+    /// Returns the capacity of the underlying hash map.
+    #[must_use]
+    pub fn capacity(&self) -> usize {
+        self.data.capacity()
+    }
+
+    /// Shrinks the capacity of the store as much as possible.
+    pub fn shrink_to_fit(&mut self) {
+        self.data.shrink_to_fit();
     }
 }
 
@@ -79,21 +456,40 @@ impl Default for InMemoryStore {
 }
 
 impl StateStore for InMemoryStore {
+    #[inline]
     fn get(&self, key: &[u8]) -> Option<Bytes> {
         self.data.get(key).cloned()
     }
 
     fn put(&mut self, key: &[u8], value: &[u8]) -> Result<(), StateError> {
-        self.data.insert(key.to_vec(), Bytes::copy_from_slice(value));
+        let key_vec = key.to_vec();
+        let value_bytes = Bytes::copy_from_slice(value);
+
+        // Update size tracking
+        if let Some(old_value) = self.data.get(&key_vec) {
+            // Key exists, subtract old value size
+            self.size_bytes -= old_value.len();
+        } else {
+            // New key, add key size
+            self.size_bytes += key_vec.len();
+        }
+        self.size_bytes += value.len();
+
+        self.data.insert(key_vec, value_bytes);
         Ok(())
     }
 
     fn delete(&mut self, key: &[u8]) -> Result<(), StateError> {
-        self.data.remove(key);
+        if let Some(old_value) = self.data.remove(key) {
+            self.size_bytes -= key.len() + old_value.len();
+        }
         Ok(())
     }
 
-    fn prefix_scan<'a>(&'a self, prefix: &'a [u8]) -> Box<dyn Iterator<Item = (Bytes, Bytes)> + 'a> {
+    fn prefix_scan<'a>(
+        &'a self,
+        prefix: &'a [u8],
+    ) -> Box<dyn Iterator<Item = (Bytes, Bytes)> + 'a> {
         Box::new(
             self.data
                 .iter()
@@ -102,7 +498,10 @@ impl StateStore for InMemoryStore {
         )
     }
 
-    fn range_scan<'a>(&'a self, range: Range<&'a [u8]>) -> Box<dyn Iterator<Item = (Bytes, Bytes)> + 'a> {
+    fn range_scan<'a>(
+        &'a self,
+        range: Range<&'a [u8]>,
+    ) -> Box<dyn Iterator<Item = (Bytes, Bytes)> + 'a> {
         Box::new(
             self.data
                 .iter()
@@ -111,22 +510,52 @@ impl StateStore for InMemoryStore {
         )
     }
 
+    #[inline]
+    fn contains(&self, key: &[u8]) -> bool {
+        self.data.contains_key(key)
+    }
+
     fn size_bytes(&self) -> usize {
-        self.data
+        self.size_bytes
+    }
+
+    fn len(&self) -> usize {
+        self.data.len()
+    }
+
+    fn snapshot(&self) -> StateSnapshot {
+        let data: Vec<(Vec<u8>, Vec<u8>)> = self
+            .data
             .iter()
-            .map(|(k, v)| k.len() + v.len())
-            .sum()
+            .map(|(k, v)| (k.clone(), v.to_vec()))
+            .collect();
+        StateSnapshot::new(data)
+    }
+
+    fn restore(&mut self, snapshot: StateSnapshot) {
+        self.data.clear();
+        self.size_bytes = 0;
+
+        for (key, value) in snapshot.data {
+            self.size_bytes += key.len() + value.len();
+            self.data.insert(key, Bytes::from(value));
+        }
+    }
+
+    fn clear(&mut self) {
+        self.data.clear();
+        self.size_bytes = 0;
     }
 }
 
-/// Errors that can occur in state operations
+/// Errors that can occur in state operations.
 #[derive(Debug, thiserror::Error)]
 pub enum StateError {
     /// I/O error (for memory-mapped stores)
     #[error("I/O error: {0}")]
     Io(#[from] std::io::Error),
 
-    /// Serialization error
+    /// Serialization/deserialization error
     #[error("Serialization error: {0}")]
     Serialization(String),
 
@@ -134,10 +563,24 @@ pub enum StateError {
     #[error("State corruption: {0}")]
     Corruption(String),
 
-    /// Operation not supported
+    /// Operation not supported by this store type
     #[error("Operation not supported: {0}")]
     NotSupported(String),
+
+    /// Key not found (for operations that require existing key)
+    #[error("Key not found")]
+    KeyNotFound,
+
+    /// Store capacity exceeded
+    #[error("Store capacity exceeded: {0}")]
+    CapacityExceeded(String),
 }
+
+mod mmap;
+
+// Re-export main types
+pub use self::StateError as Error;
+pub use mmap::MmapStateStore;
 
 #[cfg(test)]
 mod tests {
@@ -150,10 +593,32 @@ mod tests {
         // Test put and get
         store.put(b"key1", b"value1").unwrap();
         assert_eq!(store.get(b"key1").unwrap(), Bytes::from("value1"));
+        assert_eq!(store.len(), 1);
+
+        // Test overwrite
+        store.put(b"key1", b"value2").unwrap();
+        assert_eq!(store.get(b"key1").unwrap(), Bytes::from("value2"));
+        assert_eq!(store.len(), 1);
 
         // Test delete
         store.delete(b"key1").unwrap();
         assert!(store.get(b"key1").is_none());
+        assert_eq!(store.len(), 0);
+
+        // Test delete non-existent key (should not error)
+        store.delete(b"nonexistent").unwrap();
+    }
+
+    #[test]
+    fn test_contains() {
+        let mut store = InMemoryStore::new();
+        assert!(!store.contains(b"key1"));
+
+        store.put(b"key1", b"value1").unwrap();
+        assert!(store.contains(b"key1"));
+
+        store.delete(b"key1").unwrap();
+        assert!(!store.contains(b"key1"));
     }
 
     #[test]
@@ -161,9 +626,187 @@ mod tests {
         let mut store = InMemoryStore::new();
         store.put(b"prefix:1", b"value1").unwrap();
         store.put(b"prefix:2", b"value2").unwrap();
+        store.put(b"prefix:10", b"value10").unwrap();
         store.put(b"other:1", b"value3").unwrap();
 
         let results: Vec<_> = store.prefix_scan(b"prefix:").collect();
+        assert_eq!(results.len(), 3);
+
+        // All results should have the prefix
+        for (key, _) in &results {
+            assert!(key.starts_with(b"prefix:"));
+        }
+
+        // Empty prefix returns all
+        let all: Vec<_> = store.prefix_scan(b"").collect();
+        assert_eq!(all.len(), 4);
+    }
+
+    #[test]
+    fn test_range_scan() {
+        let mut store = InMemoryStore::new();
+        store.put(b"a", b"1").unwrap();
+        store.put(b"b", b"2").unwrap();
+        store.put(b"c", b"3").unwrap();
+        store.put(b"d", b"4").unwrap();
+
+        let results: Vec<_> = store.range_scan(b"b"..b"d").collect();
         assert_eq!(results.len(), 2);
+
+        let keys: Vec<_> = results.iter().map(|(k, _)| k.as_ref()).collect();
+        assert!(keys.contains(&b"b".as_slice()));
+        assert!(keys.contains(&b"c".as_slice()));
+    }
+
+    #[test]
+    fn test_snapshot_and_restore() {
+        let mut store = InMemoryStore::new();
+        store.put(b"key1", b"value1").unwrap();
+        store.put(b"key2", b"value2").unwrap();
+
+        // Take snapshot
+        let snapshot = store.snapshot();
+        assert_eq!(snapshot.len(), 2);
+
+        // Modify store
+        store.put(b"key1", b"modified").unwrap();
+        store.put(b"key3", b"value3").unwrap();
+        store.delete(b"key2").unwrap();
+
+        assert_eq!(store.len(), 2);
+        assert_eq!(store.get(b"key1").unwrap(), Bytes::from("modified"));
+
+        // Restore from snapshot
+        store.restore(snapshot);
+
+        assert_eq!(store.len(), 2);
+        assert_eq!(store.get(b"key1").unwrap(), Bytes::from("value1"));
+        assert_eq!(store.get(b"key2").unwrap(), Bytes::from("value2"));
+        assert!(store.get(b"key3").is_none());
+    }
+
+    #[test]
+    fn test_snapshot_serialization() {
+        let mut store = InMemoryStore::new();
+        store.put(b"key1", b"value1").unwrap();
+        store.put(b"key2", b"value2").unwrap();
+
+        let snapshot = store.snapshot();
+
+        // Serialize and deserialize
+        let bytes = snapshot.to_bytes().unwrap();
+        let restored = StateSnapshot::from_bytes(&bytes).unwrap();
+
+        assert_eq!(restored.len(), snapshot.len());
+        assert_eq!(restored.data(), snapshot.data());
+    }
+
+    #[test]
+    fn test_typed_access() {
+        let mut store = InMemoryStore::new();
+
+        // Test with integer
+        store.put_typed(b"count", &42u64).unwrap();
+        let count: u64 = store.get_typed(b"count").unwrap().unwrap();
+        assert_eq!(count, 42);
+
+        // Test with string
+        store.put_typed(b"name", &String::from("alice")).unwrap();
+        let name: String = store.get_typed(b"name").unwrap().unwrap();
+        assert_eq!(name, "alice");
+
+        // Test with vector (complex type)
+        let nums = vec![1i64, 2, 3, 4, 5];
+        store.put_typed(b"nums", &nums).unwrap();
+        let restored: Vec<i64> = store.get_typed(b"nums").unwrap().unwrap();
+        assert_eq!(restored, nums);
+
+        // Test non-existent key
+        let missing: Option<u64> = store.get_typed(b"missing").unwrap();
+        assert!(missing.is_none());
+    }
+
+    #[test]
+    fn test_get_or_insert() {
+        let mut store = InMemoryStore::new();
+
+        // First call inserts default
+        let value = store.get_or_insert(b"key1", b"default").unwrap();
+        assert_eq!(value, Bytes::from("default"));
+        assert_eq!(store.len(), 1);
+
+        // Second call returns existing
+        store.put(b"key1", b"modified").unwrap();
+        let value = store.get_or_insert(b"key1", b"default").unwrap();
+        assert_eq!(value, Bytes::from("modified"));
+    }
+
+    #[test]
+    fn test_update() {
+        let mut store = InMemoryStore::new();
+        store.put(b"counter", b"\x00\x00\x00\x00").unwrap();
+
+        // Update existing
+        store
+            .update(b"counter", |current| {
+                let val = current.map_or(0u32, |b| {
+                    u32::from_le_bytes(b.as_ref().try_into().unwrap_or([0; 4]))
+                });
+                Some((val + 1).to_le_bytes().to_vec())
+            })
+            .unwrap();
+
+        let bytes = store.get(b"counter").unwrap();
+        let val = u32::from_le_bytes(bytes.as_ref().try_into().unwrap());
+        assert_eq!(val, 1);
+
+        // Update to delete
+        store.update(b"counter", |_| None).unwrap();
+        assert!(store.get(b"counter").is_none());
+    }
+
+    #[test]
+    fn test_size_tracking() {
+        let mut store = InMemoryStore::new();
+        assert_eq!(store.size_bytes(), 0);
+
+        store.put(b"key1", b"value1").unwrap();
+        assert_eq!(store.size_bytes(), 4 + 6); // "key1" + "value1"
+
+        store.put(b"key2", b"value2").unwrap();
+        assert_eq!(store.size_bytes(), (4 + 6) * 2);
+
+        // Overwrite with smaller value
+        store.put(b"key1", b"v1").unwrap();
+        assert_eq!(store.size_bytes(), 4 + 2 + 4 + 6); // "key1" + "v1" + "key2" + "value2"
+
+        store.delete(b"key1").unwrap();
+        assert_eq!(store.size_bytes(), 4 + 6);
+
+        store.clear();
+        assert_eq!(store.size_bytes(), 0);
+    }
+
+    #[test]
+    fn test_with_capacity() {
+        let store = InMemoryStore::with_capacity(1000);
+        assert!(store.capacity() >= 1000);
+        assert!(store.is_empty());
+    }
+
+    #[test]
+    fn test_clear() {
+        let mut store = InMemoryStore::new();
+        store.put(b"key1", b"value1").unwrap();
+        store.put(b"key2", b"value2").unwrap();
+
+        assert_eq!(store.len(), 2);
+        assert!(store.size_bytes() > 0);
+
+        store.clear();
+
+        assert_eq!(store.len(), 0);
+        assert_eq!(store.size_bytes(), 0);
+        assert!(store.get(b"key1").is_none());
     }
 }

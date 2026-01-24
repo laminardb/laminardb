@@ -34,6 +34,10 @@ anyhow = { workspace = true }
 # Async
 tokio = { workspace = true }
 async-trait = { workspace = true }
+futures = "0.3"
+
+# Concurrency
+parking_lot = { workspace = true }
 
 # Observability
 tracing = { workspace = true }

@@ -23,22 +23,22 @@
       }
     ]
   },
-  "model": "claude-opus-4-20250514",
+  "model": "claude-opus-4-5-20251101",
   "agents": {
     "architect": {
-      "model": "claude-opus-4-20250514"
+      "model": "claude-opus-4-5-20251101"
     },
     "security-reviewer": {
-      "model": "claude-opus-4-20250514"
+      "model": "claude-opus-4-5-20251101"
     },
     "performance-auditor": {
-      "model": "claude-opus-4-20250514"
+      "model": "claude-opus-4-5-20251101"
     },
     "stage-gate": {
-      "model": "claude-opus-4-20250514"
+      "model": "claude-opus-4-5-20251101"
     },
     "feature-spec-writer": {
-      "model": "claude-opus-4-20250514"
+      "model": "claude-opus-4-5-20251101"
     }
   }
 }

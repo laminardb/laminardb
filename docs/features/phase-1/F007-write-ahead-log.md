@@ -5,11 +5,11 @@
 | Field | Value |
 |-------|-------|
 | **ID** | F007 |
-| **Status** | 📝 Draft |
+| **Status** | ✅ Done |
 | **Priority** | P1 |
 | **Phase** | 1 |
 | **Effort** | M (3-5 days) |
-| **Dependencies** | F001 |
+| **Dependencies** | F001, F002 |
 | **Owner** | TBD |
 
 ## Summary
@@ -22,6 +22,7 @@ Implement a write-ahead log (WAL) for durability. All state mutations are logged
 - Configurable sync intervals
 - Log rotation and cleanup
 - Recovery replay support
+- MmapStateStore index reconstruction on recovery (deferred from F002)
 
 ## Technical Design
 
@@ -48,12 +49,12 @@ impl WriteAheadLog {
 
 ## Benchmarks
 
-- [ ] `bench_wal_append` - Target: < 1μs (buffered)
-- [ ] `bench_wal_sync` - Target: < 10ms (fsync)
+- [x] `bench_wal_append` - Target: < 1μs (buffered) - **Result: ~215ns ✓**
+- [x] `bench_wal_sync` - Target: < 10ms (fsync) - **Result: ~2.3ms ✓**
 
 ## Completion Checklist
 
-- [ ] WAL writing implemented
-- [ ] Group commit working
-- [ ] Recovery replay tested
-- [ ] Benchmarks passing
+- [x] WAL writing implemented
+- [x] Group commit working
+- [x] Recovery replay tested
+- [x] Benchmarks passing

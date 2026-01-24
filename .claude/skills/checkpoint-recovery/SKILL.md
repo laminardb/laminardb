@@ -40,6 +40,8 @@ description: WAL, checkpointing, and recovery patterns for exactly-once semantic
 ```rust
 use std::io::{BufWriter, Write};
 use std::fs::{File, OpenOptions};
+use rkyv::{Archive, Deserialize, Serialize, rancor::Error};
+use rkyv::util::AlignedVec;
 
 pub struct WriteAheadLog {
     writer: BufWriter<File>,
@@ -48,7 +50,8 @@ pub struct WriteAheadLog {
     position: u64,
 }
 
-#[derive(Serialize, Deserialize)]
+/// WAL entry with rkyv for zero-copy deserialization during recovery.
+#[derive(Archive, Serialize, Deserialize)]
 pub struct WalEntry {
     pub sequence: u64,
     pub timestamp: u64,
@@ -56,7 +59,7 @@ pub struct WalEntry {
     pub checksum: u32,
 }
 
-#[derive(Serialize, Deserialize)]
+#[derive(Archive, Serialize, Deserialize)]
 pub enum WalOperation {
     Put { key: Vec<u8>, value: Vec<u8> },
     Delete { key: Vec<u8> },
@@ -72,26 +75,27 @@ impl WriteAheadLog {
             operation: op,
             checksum: 0,  // Calculated below
         };
-        
-        let bytes = bincode::serialize(&entry)?;
+
+        // Use rkyv for zero-copy serialization
+        let bytes: AlignedVec = rkyv::to_bytes::<Error>(&entry)?;
         let checksum = crc32fast::hash(&bytes);
-        
+
         // Write length-prefixed entry
         self.writer.write_all(&(bytes.len() as u32).to_le_bytes())?;
         self.writer.write_all(&bytes)?;
         self.writer.write_all(&checksum.to_le_bytes())?;
-        
+
         // Group commit for efficiency
         if self.last_sync.elapsed() >= self.sync_interval {
             self.writer.flush()?;
             self.writer.get_ref().sync_data()?;
             self.last_sync = Instant::now();
         }
-        
+
         self.position += bytes.len() as u64 + 8;
         Ok(self.position)
     }
-    
+
     pub fn sync(&mut self) -> Result<(), WalError> {
         self.writer.flush()?;
         self.writer.get_ref().sync_data()?;
@@ -103,6 +107,8 @@ impl WriteAheadLog {
 ## Checkpointing
 
 ```rust
+use rkyv::{Archive, Deserialize, Serialize};
+
 pub struct CheckpointManager {
     state_store: Arc<StateStore>,
     wal: Arc<Mutex<WriteAheadLog>>,
@@ -110,7 +116,8 @@ pub struct CheckpointManager {
     checkpoint_dir: PathBuf,
 }
 
-#[derive(Serialize, Deserialize)]
+/// Checkpoint metadata with rkyv for fast serialization.
+#[derive(Archive, Serialize, Deserialize)]
 pub struct Checkpoint {
     pub id: u64,
     pub timestamp: u64,

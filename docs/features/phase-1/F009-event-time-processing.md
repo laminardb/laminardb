@@ -5,12 +5,13 @@
 | Field | Value |
 |-------|-------|
 | **ID** | F009 |
-| **Status** | 📝 Draft |
+| **Status** | ✅ Done |
 | **Priority** | P1 |
 | **Phase** | 1 |
 | **Effort** | S (1-2 days) |
 | **Dependencies** | F001 |
 | **Owner** | TBD |
+| **Completed** | 2026-01-24 |
 
 ## Summary
 
@@ -26,25 +27,56 @@ Implement event-time semantics where events are processed according to their emb
 ## Technical Design
 
 ```rust
+pub enum TimestampFormat {
+    UnixMillis,    // i64 milliseconds (default)
+    UnixSeconds,   // i64 seconds -> millis
+    UnixMicros,    // i64 micros -> millis
+    UnixNanos,     // i64 nanos -> millis
+    Iso8601,       // String parsing
+    ArrowNative,   // Auto-detect from Arrow Timestamp type
+}
+
+pub enum TimestampField {
+    Name(String),  // Column name (cached after first lookup)
+    Index(usize),  // Column index (most efficient)
+}
+
+pub enum ExtractionMode {
+    First,  // Default, O(1)
+    Last,   // O(1)
+    Max,    // O(n)
+    Min,    // O(n)
+}
+
 pub struct EventTimeExtractor {
-    field: String,
+    field: TimestampField,
     format: TimestampFormat,
+    mode: ExtractionMode,
+    cached_index: Option<usize>,
 }
 
 impl EventTimeExtractor {
-    pub fn extract(&self, event: &Event) -> Result<u64>;
-}
-
-pub enum TimestampFormat {
-    UnixMillis,
-    UnixSeconds,
-    Iso8601,
-    Custom(String),
+    pub fn from_column(name: &str, format: TimestampFormat) -> Self;
+    pub fn from_index(index: usize, format: TimestampFormat) -> Self;
+    pub fn with_mode(self, mode: ExtractionMode) -> Self;
+    pub fn extract(&mut self, batch: &RecordBatch) -> Result<i64, EventTimeError>;
+    pub fn validate_schema(&self, schema: &Schema) -> Result<(), EventTimeError>;
 }
 ```
 
+## Implementation
+
+| File | Description |
+|------|-------------|
+| `crates/laminar-core/src/time/event_time.rs` | EventTimeExtractor implementation |
+| `crates/laminar-core/src/time/mod.rs` | Module exports and re-exports |
+
 ## Completion Checklist
 
-- [ ] Timestamp extraction working
-- [ ] Multiple formats supported
-- [ ] Unit tests passing
+- [x] Timestamp extraction working
+- [x] Multiple formats supported (6 formats)
+- [x] Multiple extraction modes (First, Last, Max, Min)
+- [x] Column name caching for performance
+- [x] Schema validation
+- [x] Comprehensive error handling
+- [x] Unit tests passing (27 tests)

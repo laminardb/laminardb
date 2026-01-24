@@ -11,6 +11,11 @@
 //! directed acyclic graphs (DAGs) for complex stream processing.
 
 use arrow_array::RecordBatch;
+use smallvec::SmallVec;
+
+/// Timer key type optimized for window IDs (16 bytes).
+/// Re-exported from time module for convenience.
+pub type TimerKey = SmallVec<[u8; 16]>;
 
 /// An event flowing through the system
 #[derive(Debug, Clone)]
@@ -28,9 +33,26 @@ pub enum Output {
     Event(Event),
     /// Watermark update
     Watermark(i64),
-    /// Late event that arrived after watermark
+    /// Late event that arrived after watermark (no side output configured)
     LateEvent(Event),
+    /// Late event routed to a named side output
+    SideOutput {
+        /// The name of the side output to route to
+        name: String,
+        /// The late event
+        event: Event,
+    },
 }
+
+/// Collection type for operator outputs.
+///
+/// Uses `SmallVec` to avoid heap allocation for common cases (0-3 outputs).
+/// The size 4 is chosen based on typical operator patterns:
+/// - 0 outputs: filter that drops events
+/// - 1 output: most common case (map, regular processing)
+/// - 2 outputs: event + watermark
+/// - 3+ outputs: flatmap or window emission
+pub type OutputVec = SmallVec<[Output; 4]>;
 
 /// Context provided to operators during processing
 pub struct OperatorContext<'a> {
@@ -51,10 +73,10 @@ pub struct OperatorContext<'a> {
 /// Trait implemented by all streaming operators
 pub trait Operator: Send {
     /// Process an incoming event
-    fn process(&mut self, event: &Event, ctx: &mut OperatorContext) -> Vec<Output>;
+    fn process(&mut self, event: &Event, ctx: &mut OperatorContext) -> OutputVec;
 
     /// Handle timer expiration
-    fn on_timer(&mut self, timer: Timer, ctx: &mut OperatorContext) -> Vec<Output>;
+    fn on_timer(&mut self, timer: Timer, ctx: &mut OperatorContext) -> OutputVec;
 
     /// Checkpoint the operator's state
     fn checkpoint(&self) -> OperatorState;
@@ -71,8 +93,8 @@ pub trait Operator: Send {
 /// A timer registration
 #[derive(Debug, Clone)]
 pub struct Timer {
-    /// Timer key
-    pub key: Vec<u8>,
+    /// Timer key (uses `SmallVec` to avoid heap allocation for keys up to 16 bytes)
+    pub key: TimerKey,
     /// Expiration timestamp
     pub timestamp: i64,
 }
