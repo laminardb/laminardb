@@ -1,7 +1,15 @@
 //! Streaming SQL statement types
+//!
+//! This module defines AST types for streaming SQL extensions and provides
+//! conversion methods to translate them to runtime operator configurations.
 
 use std::collections::HashMap;
+use std::time::Duration;
+
 use sqlparser::ast::{ColumnDef, Expr, Ident, ObjectName};
+
+use super::window_rewriter::WindowRewriter;
+use super::ParseError;
 
 /// Streaming-specific SQL statements
 #[derive(Debug, Clone, PartialEq)]
@@ -116,6 +124,49 @@ impl LateDataClause {
             side_output: Some(side_output),
         }
     }
+
+    /// Convert to allowed lateness Duration.
+    ///
+    /// # Errors
+    ///
+    /// Returns `ParseError::WindowError` if the interval cannot be parsed.
+    pub fn to_allowed_lateness(&self) -> Result<Duration, ParseError> {
+        match &self.allowed_lateness {
+            Some(expr) => WindowRewriter::parse_interval_to_duration(expr),
+            None => Ok(Duration::ZERO),
+        }
+    }
+
+    /// Check if this clause has a side output configured.
+    #[must_use]
+    pub fn has_side_output(&self) -> bool {
+        self.side_output.is_some()
+    }
+
+    /// Get the side output name, if configured.
+    #[must_use]
+    pub fn get_side_output(&self) -> Option<&str> {
+        self.side_output.as_deref()
+    }
+}
+
+/// Emit strategy for runtime operator configuration.
+///
+/// This is the runtime representation that operators use.
+#[derive(Debug, Clone, PartialEq)]
+pub enum EmitStrategy {
+    /// Emit when watermark passes window end
+    OnWatermark,
+    /// Emit only when window closes (no intermediate results)
+    OnWindowClose,
+    /// Emit at fixed intervals
+    Periodic(Duration),
+    /// Emit on every state change
+    OnUpdate,
+    /// Emit changelog records with Z-set weights
+    Changelog,
+    /// Emit only final results, suppress all intermediate
+    FinalOnly,
 }
 
 /// EMIT clause for controlling output timing.
@@ -176,6 +227,42 @@ pub enum EmitClause {
     /// Also drops late data entirely after window close.
     /// Use for BI reporting where only final, exact results matter.
     Final,
+}
+
+impl EmitClause {
+    /// Convert to runtime EmitStrategy.
+    ///
+    /// # Errors
+    ///
+    /// Returns `ParseError::WindowError` if the periodic interval cannot be parsed.
+    pub fn to_emit_strategy(&self) -> Result<EmitStrategy, ParseError> {
+        match self {
+            EmitClause::AfterWatermark => Ok(EmitStrategy::OnWatermark),
+            EmitClause::OnWindowClose => Ok(EmitStrategy::OnWindowClose),
+            EmitClause::Periodically { interval } => {
+                let duration = WindowRewriter::parse_interval_to_duration(interval)?;
+                Ok(EmitStrategy::Periodic(duration))
+            }
+            EmitClause::OnUpdate => Ok(EmitStrategy::OnUpdate),
+            EmitClause::Changes => Ok(EmitStrategy::Changelog),
+            EmitClause::Final => Ok(EmitStrategy::FinalOnly),
+        }
+    }
+
+    /// Check if this emit strategy requires changelog/retraction support.
+    #[must_use]
+    pub fn requires_changelog(&self) -> bool {
+        matches!(self, EmitClause::Changes | EmitClause::OnUpdate)
+    }
+
+    /// Check if this emit strategy is append-only (no retractions).
+    #[must_use]
+    pub fn is_append_only(&self) -> bool {
+        matches!(
+            self,
+            EmitClause::OnWindowClose | EmitClause::Final | EmitClause::AfterWatermark
+        )
+    }
 }
 
 /// Window function types

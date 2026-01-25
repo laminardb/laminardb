@@ -1,13 +1,15 @@
 //! SQL parser with streaming extensions
 
+pub mod aggregation_parser;
+pub mod join_parser;
 mod parser_simple;
 mod statements;
 mod window_rewriter;
 
 pub use parser_simple::StreamingParser;
 pub use statements::{
-    CreateSinkStatement, CreateSourceStatement, EmitClause, SinkFrom,
-    StreamingStatement, WatermarkDef, WindowFunction,
+    CreateSinkStatement, CreateSourceStatement, EmitClause, EmitStrategy, LateDataClause,
+    SinkFrom, StreamingStatement, WatermarkDef, WindowFunction,
 };
 pub use window_rewriter::WindowRewriter;
 
