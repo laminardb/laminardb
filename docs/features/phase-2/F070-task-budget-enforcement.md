@@ -5,13 +5,15 @@
 | Field | Value |
 |-------|-------|
 | **ID** | F070 |
-| **Status** | 📝 Draft |
+| **Status** | ✅ Done |
 | **Priority** | P1 |
 | **Phase** | 2 |
 | **Effort** | M (3-5 days) |
 | **Dependencies** | F013 |
 | **Owner** | TBD |
 | **Research** | [Thread-Per-Core 2026 Research](../../research/laminardb-thread-per-core-2026-research.md) |
+| **Completed** | 2026-01-25 |
+| **Tests** | 47 unit tests |
 
 ## Summary
 

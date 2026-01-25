@@ -8,9 +8,9 @@
 
 ### Sprint Priority: Phase 2 In Progress
 
-Phase 1 P0 hardening is complete. Phase 2 is underway with 18/29 features complete.
+Phase 1 P0 hardening is complete. Phase 2 is underway with 19/29 features complete.
 
-**Completed**: F013 (Thread-Per-Core), F014 (SPSC), F015 (CPU Pinning), F016 (Sliding Windows), F017 (Session Windows), F018 (Hopping), F019 (Stream-Stream Joins), F020 (Lookup Joins), F067 (io_uring), F068 (NUMA), F071 (Zero-Alloc), F011B (EMIT Extension), F063 (Changelog/Retraction), F059 (FIRST/LAST), F023 (Exactly-Once Sinks), F022 (Incremental Checkpointing), F062 (Per-Core WAL), F069 (Three-Ring I/O)
+**Completed**: F013 (Thread-Per-Core), F014 (SPSC), F015 (CPU Pinning), F016 (Sliding Windows), F017 (Session Windows), F018 (Hopping), F019 (Stream-Stream Joins), F020 (Lookup Joins), F067 (io_uring), F068 (NUMA), F071 (Zero-Alloc), F011B (EMIT Extension), F063 (Changelog/Retraction), F059 (FIRST/LAST), F023 (Exactly-Once Sinks), F022 (Incremental Checkpointing), F062 (Per-Core WAL), F069 (Three-Ring I/O), F070 (Task Budget)
 
 **Next Priority** (updated based on research reviews):
 
@@ -18,7 +18,7 @@ Phase 1 P0 hardening is complete. Phase 2 is underway with 18/29 features comple
 1. ~~**F071 (Zero-Allocation Enforcement)**~~ - ✅ COMPLETE
 2. ~~**F067 (io_uring Advanced)**~~ - ✅ COMPLETE
 3. ~~**F068 (NUMA-Aware Memory)**~~ - ✅ COMPLETE
-4. F070 (Task Budget Enforcement) - P1, latency SLA guarantees
+4. ~~**F070 (Task Budget Enforcement)**~~ - ✅ COMPLETE - latency SLA guarantees
 5. ~~**F069 (Three-Ring I/O)**~~ - ✅ COMPLETE - latency/main/poll ring separation
 
 **Emit & Checkpoint** (from [Emit Patterns Research](research/emit-patterns-research-2026.md)):

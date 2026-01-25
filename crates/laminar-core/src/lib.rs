@@ -34,6 +34,7 @@
 #![allow(unsafe_code)]
 
 pub mod alloc;
+pub mod budget;
 pub mod io_uring;
 pub mod numa;
 pub mod operator;

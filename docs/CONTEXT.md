@@ -8,7 +8,23 @@
 **Duration**: Continued session
 
 ### What Was Accomplished
-- ✅ **F069: Three-Ring I/O Architecture** - IMPLEMENTATION COMPLETE
+- ✅ **F070: Task Budget Enforcement** - IMPLEMENTATION COMPLETE
+  - New `budget` module in `crates/laminar-core/src/budget/`
+  - `TaskBudget` - RAII budget tracker with automatic metrics on drop
+  - Ring 0 budgets: event (500ns), batch (5μs), lookup (200ns), window (10μs)
+  - Ring 1 budgets: chunk (1ms), checkpoint (10ms), WAL flush (100μs)
+  - `YieldReason` - Enum for Ring 1 cooperative yielding (8 variants)
+  - `BudgetMetrics` - Global lock-free metrics with atomic counters
+  - `BudgetMetricsSnapshot` - Point-in-time snapshot with rate calculations
+  - `BudgetMonitor` - Windowed violation tracking with alerting
+  - `BudgetAlert` - Alert with severity levels (critical/high/medium/low)
+  - `ViolationWindow` - Per-task sliding window for rate calculation
+  - Integration with `Reactor::poll()` - iteration budget tracking
+  - Integration with `core_thread_main()` - batch budget with early exit
+  - 47 new unit tests, all passing
+  - **Total tests**: 682 (495 core + 61 sql + 120 storage + 6 connectors)
+
+- ✅ **F069: Three-Ring I/O Architecture** - IMPLEMENTATION COMPLETE (previous session)
   - New `three_ring` module in `crates/laminar-core/src/io_uring/three_ring/`
   - `ThreeRingReactor` - Main reactor with latency/main/poll rings
   - `ThreeRingConfig` - Builder pattern configuration for all three rings
@@ -717,15 +733,15 @@ let outputs = operator.process_side(&payment_event, JoinSide::Right, &mut ctx);
 ```
 
 ### Where We Left Off
-Phase 2 features continue. F069 Three-Ring I/O is now complete (18/29 features).
+Phase 2 features continue. F070 Task Budget Enforcement is now complete (19/29 features).
 
 ### Immediate Next Steps
 
 1. **Continue Phase 2** - Production Hardening
-   - F070: Task Budget Enforcement (P1)
+   - F073: Zero-Allocation Polling (P1)
    - F060: Cascading Materialized Views (P1)
    - F021: Temporal Joins (P2)
-   - F073: Zero-Allocation Polling (P1)
+   - F056: ASOF Joins (P1)
 
 ### Open Issues
 
@@ -799,6 +815,7 @@ handle.credit_metrics();       // Acquired, released, blocked, dropped
 | F022: Incremental Checkpointing | ✅ Complete | RocksDB backend, SPSC changelog, recovery, 37 tests |
 | F062: Per-Core WAL Segments | ✅ Complete | Lock-free per-core writers, epoch ordering, 58 tests |
 | F069: Three-Ring I/O | ✅ Complete | Latency/Main/Poll rings, RingHandler trait, 40+ tests |
+| F070: Task Budget Enforcement | ✅ Complete | TaskBudget, YieldReason, BudgetMonitor, 47 tests |
 
 ---
 
@@ -806,10 +823,17 @@ handle.credit_metrics();       // Acquired, released, blocked, dropped
 
 ### Current Focus
 - **Phase**: 2 Production Hardening
-- **Active Feature**: F069 complete (18/29), ready for F070 (task budget) or F060 (cascading MVs)
+- **Active Feature**: F070 complete (19/29), ready for F073 (zero-alloc polling) or F060 (cascading MVs)
 
 ### Key Files
 ```
+crates/laminar-core/src/budget/
+├── mod.rs           # Public exports, module tests
+├── task_budget.rs   # TaskBudget struct, Ring 0/1 budget constants
+├── yield_reason.rs  # YieldReason enum (8 variants)
+├── stats.rs         # BudgetMetrics, BudgetMetricsSnapshot, TaskStats
+└── monitor.rs       # BudgetMonitor, ViolationWindow, BudgetAlert
+
 crates/laminar-core/src/sink/
 ├── mod.rs           # Public exports, ExactlyOnceSink trait
 ├── error.rs         # SinkError enum
@@ -887,7 +911,7 @@ crates/laminar-storage/src/per_core_wal/
 
 Benchmarks: crates/laminar-core/benches/tpc_bench.rs, io_uring_bench.rs
 
-Tests: 635 passing (448 core, 61 sql, 120 storage, 6 connectors)
+Tests: 682 passing (495 core, 61 sql, 120 storage, 6 connectors)
 ```
 
 ### Useful Commands

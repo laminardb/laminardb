@@ -26,6 +26,7 @@ use std::sync::Arc;
 use std::time::{Duration, Instant};
 
 use crate::alloc::HotPathGuard;
+use crate::budget::TaskBudget;
 use crate::operator::{Event, Operator, OperatorContext, Output};
 use crate::state::{InMemoryStore, StateStore};
 use crate::time::{BoundedOutOfOrdernessGenerator, TimerService, WatermarkGenerator};
@@ -196,6 +197,9 @@ impl Reactor {
     pub fn poll(&mut self) -> Vec<Output> {
         // Hot path guard - will panic on allocation when allocation-tracking is enabled
         let _guard = HotPathGuard::enter("Reactor::poll");
+
+        // Task budget tracking - records metrics on drop
+        let _iteration_budget = TaskBudget::ring0_iteration();
 
         let poll_start = Instant::now();
         let processing_time = self.get_processing_time();

@@ -6,11 +6,11 @@
 |-------|-------|-------|-------------|-----------|------|
 | Phase 1 | 12 | 0 | 0 | 1 | 11 |
 | Phase 1.5 | 1 | 1 | 0 | 0 | 0 |
-| Phase 2 | 29 | 12 | 0 | 0 | 17 |
+| Phase 2 | 29 | 11 | 0 | 0 | 18 |
 | Phase 3 | 12 | 12 | 0 | 0 | 0 |
 | Phase 4 | 11 | 11 | 0 | 0 | 0 |
 | Phase 5 | 10 | 10 | 0 | 0 | 0 |
-| **Total** | **75** | **46** | **0** | **1** | **28** |
+| **Total** | **75** | **45** | **0** | **1** | **29** |
 
 ## Status Legend
 
@@ -115,7 +115,7 @@
 | **F067** | **io_uring Advanced Optimization** | **P0** | ✅ | [Link](phase-2/F067-io-uring-optimization.md) |
 | **F068** | **NUMA-Aware Memory Allocation** | **P0** | ✅ | [Link](phase-2/F068-numa-aware-memory.md) |
 | **F069** | **Three-Ring I/O Architecture** | **P1** | ✅ | [Link](phase-2/F069-three-ring-io.md) |
-| **F070** | **Task Budget Enforcement** | **P1** | 📝 | [Link](phase-2/F070-task-budget-enforcement.md) |
+| **F070** | **Task Budget Enforcement** | **P1** | ✅ | [Link](phase-2/F070-task-budget-enforcement.md) |
 | **F071** | **Zero-Allocation Enforcement** | **P0** | ✅ | [Link](phase-2/F071-zero-allocation-enforcement.md) |
 | **F072** | **XDP/eBPF Network Optimization** | **P2** | 📝 | [Link](phase-2/F072-xdp-network-optimization.md) |
 | **F073** | **Zero-Allocation Polling** | **P1** | 📝 | [Link](phase-2/F073-zero-allocation-polling.md) |

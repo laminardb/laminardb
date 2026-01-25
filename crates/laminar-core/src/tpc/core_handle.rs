@@ -35,6 +35,7 @@ use std::thread::{self, JoinHandle};
 use crate::io_uring::{CoreRingManager, IoUringConfig};
 
 use crate::alloc::HotPathGuard;
+use crate::budget::TaskBudget;
 use crate::numa::{NumaAllocator, NumaTopology};
 use crate::operator::{Event, Operator, Output};
 use crate::reactor::{Reactor, ReactorConfig};
@@ -506,6 +507,9 @@ fn core_thread_main(
         // Hot path guard for inbox processing
         let _guard = HotPathGuard::enter("CoreThread::process_inbox");
 
+        // Task budget tracking for batch processing
+        let batch_budget = TaskBudget::ring0_batch();
+
         // Drain inbox and track messages processed for credit release
         let mut had_work = false;
         let mut messages_processed = 0usize;
@@ -538,6 +542,12 @@ fn core_thread_main(
                     }
                     break;
                 }
+            }
+
+            // Check if batch budget is almost exceeded and break to process reactor
+            // This ensures Ring 0 latency guarantees by limiting batch processing time
+            if batch_budget.almost_exceeded() {
+                break;
             }
         }
 
