@@ -47,6 +47,7 @@ mod error;
 mod idempotent;
 mod traits;
 mod transaction;
+mod two_phase;
 
 pub use checkpoint::{SinkCheckpoint, SinkCheckpointManager, SinkOffset};
 pub use dedup::{DeduplicationStore, InMemoryDedup, RecordId};
@@ -54,6 +55,10 @@ pub use error::SinkError;
 pub use idempotent::IdempotentSink;
 pub use traits::{ExactlyOnceSink, TransactionId, SinkCapabilities, SinkState};
 pub use transaction::{TransactionCoordinator, TransactionState, TwoPhaseCommitSink};
+pub use two_phase::{
+    CoordinatorDecision, ParticipantVote, ParticipantState, TransactionRecord,
+    TransactionLog, TransactionLogEntry, TwoPhaseConfig, TwoPhaseCoordinator, TwoPhaseResult,
+};
 
 #[cfg(test)]
 mod tests {

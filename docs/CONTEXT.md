@@ -8,6 +8,7 @@
 **Date**: 2026-01-25
 
 ### What Was Accomplished
+- F024: Two-Phase Commit - complete (20 new tests, presumed abort semantics, crash recovery)
 - F057: Stream Join Optimizations - complete (15 new tests, CPU-friendly encoding, asymmetric compaction, per-key tracking)
 - F065: Keyed Watermarks - complete (23 tests, per-key tracking with 99%+ accuracy)
 - F064: Per-Partition Watermarks - complete (26 tests, TPC integration)
@@ -19,16 +20,15 @@
 - F062: Per-Core WAL Segments - complete
 - F022: Incremental Checkpointing - complete
 
-**Total tests**: 832 (645 core + 61 sql + 120 storage + 6 connectors)
+**Total tests**: 852 (665 core + 61 sql + 120 storage + 6 connectors)
 
 ### Where We Left Off
-Phase 2 Production Hardening: 25/29 features complete (86%).
+Phase 2 Production Hardening: 26/29 features complete (90%).
 
 ### Immediate Next Steps
 1. F021: Temporal Joins (P2)
-2. F024: Two-Phase Commit (P1)
-3. F066: Watermark Alignment Groups (P2)
-4. F072: XDP/eBPF Network Optimization (P2)
+2. F066: Watermark Alignment Groups (P2)
+3. F072: XDP/eBPF Network Optimization (P2)
 
 ### Open Issues
 None - Phase 2 underway.
@@ -64,6 +64,7 @@ None - Phase 2 underway.
 | F064: Per-Partition Watermarks | Done | PartitionedWatermarkTracker, CoreWatermarkState |
 | F065: Keyed Watermarks | Done | KeyedWatermarkTracker, per-key 99%+ accuracy |
 | F057: Stream Join Optimizations | Done | CPU-friendly encoding, asymmetric compaction, per-key tracking |
+| F024: Two-Phase Commit | Done | Presumed abort, crash recovery, 20 tests |
 | F021: Temporal Joins | Draft | P2 |
 
 ---

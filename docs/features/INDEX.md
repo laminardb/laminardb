@@ -6,11 +6,11 @@
 |-------|-------|-------|-------------|-----------|------|
 | Phase 1 | 12 | 0 | 0 | 1 | 11 |
 | Phase 1.5 | 1 | 1 | 0 | 0 | 0 |
-| Phase 2 | 29 | 5 | 0 | 0 | 24 |
+| Phase 2 | 29 | 4 | 0 | 0 | 25 |
 | Phase 3 | 12 | 12 | 0 | 0 | 0 |
 | Phase 4 | 11 | 11 | 0 | 0 | 0 |
 | Phase 5 | 10 | 10 | 0 | 0 | 0 |
-| **Total** | **75** | **39** | **0** | **1** | **35** |
+| **Total** | **75** | **38** | **0** | **1** | **36** |
 
 ## Status Legend
 
@@ -101,7 +101,7 @@
 | F021 | Temporal Joins | P2 | 📝 | [Link](phase-2/F021-temporal-joins.md) |
 | F022 | Incremental Checkpointing | P1 | ✅ | [Link](phase-2/F022-incremental-checkpointing.md) |
 | F023 | Exactly-Once Sinks | P0 | 📝 | [Link](phase-2/F023-exactly-once-sinks.md) |
-| F024 | Two-Phase Commit | P1 | 📝 | [Link](phase-2/F024-two-phase-commit.md) |
+| F024 | Two-Phase Commit | P1 | ✅ | [Link](phase-2/F024-two-phase-commit.md) |
 | F056 | ASOF Joins | P1 | ✅ | [Link](phase-2/F056-asof-joins.md) |
 | F057 | Stream Join Optimizations | P1 | ✅ | [Link](phase-2/F057-stream-join-optimizations.md) |
 | F059 | FIRST/LAST Value Aggregates | P0 | ✅ | [Link](phase-2/F059-first-last-aggregates.md) |
