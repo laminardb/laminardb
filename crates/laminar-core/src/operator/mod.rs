@@ -131,6 +131,7 @@ pub enum OperatorError {
 
 pub mod changelog;
 pub mod lookup_join;
+pub mod session_window;
 pub mod sliding_window;
 pub mod stream_join;
 pub mod window;

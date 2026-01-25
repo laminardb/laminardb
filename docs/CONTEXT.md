@@ -8,7 +8,21 @@
 **Duration**: Continued session
 
 ### What Was Accomplished
-- ✅ **F023: Exactly-Once Sinks** - IMPLEMENTATION COMPLETE
+- ✅ **F017: Session Windows** - IMPLEMENTATION COMPLETE
+  - New `session_window` module in `crates/laminar-core/src/operator/session_window.rs`
+  - `SessionWindowOperator` - Dynamic windows based on activity gaps
+  - `SessionState` - Per-key session tracking (start, end, key)
+  - Gap-based session detection and closure via timers
+  - Per-key session tracking with configurable key column
+  - Session extension when events arrive within gap period
+  - All emit strategies supported (OnWatermark, OnUpdate, Changelog, Final, OnWindowClose)
+  - Late data handling (drop, side output, or silent drop with Final)
+  - Checkpoint/restore support via rkyv serialization
+  - Prepared for future session merging when late data bridges sessions
+  - 23 new unit tests, all passing
+  - **Total tests**: 540 (448 core + 61 sql + 25 storage + 6 connectors)
+
+- ✅ **F023: Exactly-Once Sinks** - IMPLEMENTATION COMPLETE (previous session)
   - New `sink` module in `crates/laminar-core/src/sink/`
   - `ExactlyOnceSink` trait for transactional sinks
   - `IdempotentSink` wrapper for non-transactional sinks with deduplication
@@ -663,9 +677,9 @@ Phase 2 P0 features F013, F016, and F019 complete. Ready to continue with lookup
 ### Immediate Next Steps
 
 1. **Continue Phase 2** - Production Hardening
-   - F020: Lookup Joins (P0)
-   - F023: Exactly-Once Sinks (P0)
-   - F017: Session Windows (P1)
+   - F022: Incremental Checkpointing (P1)
+   - F062: Per-Core WAL Segments (P1)
+   - F021: Temporal Joins (P2)
 
 ### Open Issues
 
@@ -725,7 +739,7 @@ handle.credit_metrics();       // Acquired, released, blocked, dropped
 | F014: SPSC Queues | ✅ Complete | Part of F013 implementation |
 | F015: CPU Pinning | ✅ Complete | Included in F013 |
 | F016: Sliding Windows | ✅ Complete | Multi-window assignment, 25 tests |
-| F017: Session Windows | 📝 Not started | |
+| F017: Session Windows | ✅ Complete | Gap-based sessions, per-key tracking, 23 tests |
 | F018: Hopping Windows | ✅ Complete | Alias for sliding windows |
 | F019: Stream-Stream Joins | ✅ Complete | Inner/Left/Right/Full, 14 tests |
 | F020: Lookup Joins | ✅ Complete | Cached lookups with TTL, 16 tests |
@@ -743,7 +757,7 @@ handle.credit_metrics();       // Acquired, released, blocked, dropped
 
 ### Current Focus
 - **Phase**: 2 Production Hardening
-- **Active Feature**: F023 complete (14/29), ready for F022 (incremental checkpointing) or F017 (session windows)
+- **Active Feature**: F017 complete (15/29), ready for F022 (incremental checkpointing) or F021 (temporal joins)
 
 ### Key Files
 ```
@@ -786,19 +800,20 @@ crates/laminar-core/src/tpc/
 └── runtime.rs       # ThreadPerCoreRuntime, TpcConfig
 
 crates/laminar-core/src/operator/
-├── mod.rs            # Operator trait, Event, Output types
-├── window.rs         # TumblingWindowOperator, WindowAssigner trait, CdcOperation
-├── sliding_window.rs # SlidingWindowOperator, SlidingWindowAssigner
-├── stream_join.rs    # StreamJoinOperator, JoinType, JoinSide
-├── lookup_join.rs    # LookupJoinOperator, TableLoader trait
-└── changelog.rs      # F063: ChangelogRef, ChangelogBuffer, RetractableAccumulator,
-                      #       LateDataRetractionGenerator, CdcEnvelope, CdcSource
+├── mod.rs             # Operator trait, Event, Output types
+├── window.rs          # TumblingWindowOperator, WindowAssigner trait, CdcOperation
+├── sliding_window.rs  # SlidingWindowOperator, SlidingWindowAssigner
+├── session_window.rs  # F017: SessionWindowOperator, SessionState (gap-based sessions)
+├── stream_join.rs     # StreamJoinOperator, JoinType, JoinSide
+├── lookup_join.rs     # LookupJoinOperator, TableLoader trait
+└── changelog.rs       # F063: ChangelogRef, ChangelogBuffer, RetractableAccumulator,
+                       #       LateDataRetractionGenerator, CdcEnvelope, CdcSource
 
 crates/laminar-connectors/src/lookup.rs  # TableLoader trait, InMemoryTableLoader
 
 Benchmarks: crates/laminar-core/benches/tpc_bench.rs, io_uring_bench.rs
 
-Tests: 517 passing (425 core, 61 sql, 25 storage, 6 connectors)
+Tests: 540 passing (448 core, 61 sql, 25 storage, 6 connectors)
 ```
 
 ### Useful Commands

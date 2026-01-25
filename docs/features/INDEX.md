@@ -6,11 +6,11 @@
 |-------|-------|-------|-------------|-----------|------|
 | Phase 1 | 12 | 0 | 0 | 1 | 11 |
 | Phase 1.5 | 1 | 1 | 0 | 0 | 0 |
-| Phase 2 | 29 | 16 | 0 | 0 | 13 |
+| Phase 2 | 29 | 15 | 0 | 0 | 14 |
 | Phase 3 | 12 | 12 | 0 | 0 | 0 |
 | Phase 4 | 11 | 11 | 0 | 0 | 0 |
 | Phase 5 | 10 | 10 | 0 | 0 | 0 |
-| **Total** | **75** | **50** | **0** | **1** | **24** |
+| **Total** | **75** | **49** | **0** | **1** | **25** |
 
 ## Status Legend
 
@@ -86,7 +86,7 @@
 
 ## Phase 2: Production Hardening
 
-> **Status**: 🚧 In Progress (7/19 features complete)
+> **Status**: 🚧 In Progress (14/29 features complete)
 
 | ID | Feature | Priority | Status | Spec |
 |----|---------|----------|--------|------|
@@ -94,7 +94,7 @@
 | F014 | SPSC Queue Communication | P0 | ✅ | [Link](phase-2/F014-spsc-queues.md) |
 | F015 | CPU Pinning | P1 | ✅ | Included in F013 |
 | F016 | Sliding Windows | P0 | ✅ | [Link](phase-2/F016-sliding-windows.md) |
-| F017 | Session Windows | P1 | 📝 | [Link](phase-2/F017-session-windows.md) |
+| F017 | Session Windows | P1 | ✅ | [Link](phase-2/F017-session-windows.md) |
 | F018 | Hopping Windows | P1 | ✅ | Same as F016 (sliding) |
 | F019 | Stream-Stream Joins | P0 | ✅ | [Link](phase-2/F019-stream-stream-joins.md) |
 | F020 | Lookup Joins | P0 | ✅ | [Link](phase-2/F020-lookup-joins.md) |
