@@ -5,7 +5,7 @@
 | Field | Value |
 |-------|-------|
 | **ID** | F064 |
-| **Status** | 📝 Draft |
+| **Status** | ✅ Done |
 | **Priority** | P1 |
 | **Phase** | 2 |
 | **Effort** | M (3-5 days) |
@@ -341,22 +341,38 @@ function check_idle_partitions():
 
 ### Unit Tests
 
-- [ ] `test_partitioned_tracker_single_partition_updates_watermark`
-- [ ] `test_partitioned_tracker_multiple_partitions_uses_minimum`
-- [ ] `test_partitioned_tracker_idle_partition_excluded_from_min`
-- [ ] `test_partitioned_tracker_all_idle_uses_max`
-- [ ] `test_partitioned_tracker_partition_reactivated_on_update`
-- [ ] `test_partitioned_tracker_add_partition_during_operation`
-- [ ] `test_partitioned_tracker_remove_partition_recalculates_watermark`
-- [ ] `test_partitioned_tracker_check_idle_marks_stale_partitions`
-- [ ] `test_partitioned_tracker_source_watermark_aggregates_partitions`
-- [ ] `test_partitioned_tracker_metrics_accurate`
+- [x] `test_partitioned_tracker_single_partition_updates_watermark`
+- [x] `test_partitioned_tracker_multiple_partitions_uses_minimum`
+- [x] `test_partitioned_tracker_idle_partition_excluded_from_min`
+- [x] `test_partitioned_tracker_all_idle_uses_max`
+- [x] `test_partitioned_tracker_partition_reactivated_on_update`
+- [x] `test_partitioned_tracker_add_partition_during_operation`
+- [x] `test_partitioned_tracker_remove_partition_recalculates_watermark`
+- [x] `test_partitioned_tracker_check_idle_marks_stale_partitions`
+- [x] `test_partitioned_tracker_source_watermark_aggregates_partitions`
+- [x] `test_partitioned_tracker_metrics_accurate`
+- [x] `test_partition_id_creation`
+- [x] `test_partition_id_equality`
+- [x] `test_partition_id_display`
+- [x] `test_partitioned_tracker_core_assignment`
+- [x] `test_partitioned_tracker_multiple_sources`
+- [x] `test_partitioned_tracker_update_from_event`
+- [x] `test_partitioned_tracker_add_partition_error`
+- [x] `test_core_watermark_state_creation`
+- [x] `test_core_watermark_state_with_partitions`
+- [x] `test_core_watermark_state_update`
+- [x] `test_core_watermark_state_idle`
+- [x] `test_core_watermark_state_assign_remove`
+- [x] `test_global_collector_creation`
+- [x] `test_global_collector_update`
+- [x] `test_global_collector_advancement`
+- [x] `test_global_collector_no_regression`
 
 ### Integration Tests
 
-- [ ] Kafka source with multiple partitions advancing at different rates
-- [ ] Partition rebalancing during stream processing
-- [ ] Thread-per-core with partition assignment
+- [ ] Kafka source with multiple partitions advancing at different rates (Phase 3)
+- [ ] Partition rebalancing during stream processing (Phase 3)
+- [x] Thread-per-core with partition assignment (CoreWatermarkState)
 
 ### Benchmarks
 
@@ -375,14 +391,14 @@ function check_idle_partitions():
 
 ## Completion Checklist
 
-- [ ] `PartitionedWatermarkTracker` implemented
-- [ ] Per-partition idle detection working
-- [ ] Thread-per-core integration (CoreWatermarkState)
-- [ ] Partition rebalancing support
-- [ ] Unit tests passing (10+ tests)
-- [ ] Benchmarks meet targets
-- [ ] Documentation updated
-- [ ] Integration with F025 (Kafka Source)
+- [x] `PartitionedWatermarkTracker` implemented
+- [x] Per-partition idle detection working
+- [x] Thread-per-core integration (`CoreWatermarkState`, `GlobalWatermarkCollector`)
+- [x] Partition rebalancing support (add/remove partitions)
+- [x] Unit tests passing (26 tests)
+- [ ] Benchmarks meet targets (deferred - no benchmark infra yet)
+- [x] Documentation updated
+- [ ] Integration with F025 (Kafka Source) - Phase 3
 
 ## Open Questions
 

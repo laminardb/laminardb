@@ -54,12 +54,42 @@
 //! // Combined watermark is the minimum
 //! assert_eq!(tracker.current_watermark(), Some(Watermark::new(3000)));
 //! ```
+//!
+//! ## Per-Partition Watermark Tracking
+//!
+//! For Kafka sources with multiple partitions, use [`PartitionedWatermarkTracker`]:
+//!
+//! ```rust
+//! use laminar_core::time::{PartitionedWatermarkTracker, PartitionId, Watermark};
+//!
+//! let mut tracker = PartitionedWatermarkTracker::new();
+//!
+//! // Register a Kafka source with 4 partitions
+//! tracker.register_source(0, 4);
+//!
+//! // Update individual partitions
+//! tracker.update_partition(PartitionId::new(0, 0), 5000);
+//! tracker.update_partition(PartitionId::new(0, 1), 3000);
+//!
+//! // Combined watermark is minimum across active partitions
+//! assert_eq!(tracker.current_watermark(), Some(Watermark::new(3000)));
+//!
+//! // Mark slow partition as idle to allow progress
+//! tracker.mark_partition_idle(PartitionId::new(0, 1));
+//! assert_eq!(tracker.current_watermark(), Some(Watermark::new(5000)));
+//! ```
 
 mod event_time;
+mod partitioned_watermark;
 mod watermark;
 
 pub use event_time::{
     EventTimeError, EventTimeExtractor, ExtractionMode, TimestampField, TimestampFormat,
+};
+
+pub use partitioned_watermark::{
+    CoreWatermarkState, GlobalWatermarkCollector, PartitionId, PartitionWatermarkState,
+    PartitionedWatermarkMetrics, PartitionedWatermarkTracker, WatermarkError,
 };
 
 pub use watermark::{
