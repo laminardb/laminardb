@@ -8,6 +8,7 @@
 **Date**: 2026-01-25
 
 ### What Was Accomplished
+- F065: Keyed Watermarks - complete (23 tests, per-key tracking with 99%+ accuracy)
 - F064: Per-Partition Watermarks - complete (26 tests, TPC integration)
 - F056: ASOF Joins - complete (22 tests, Backward/Forward/Nearest directions)
 - F060: Cascading Materialized Views - complete
@@ -17,16 +18,16 @@
 - F062: Per-Core WAL Segments - complete
 - F022: Incremental Checkpointing - complete
 
-**Total tests**: 794 (607 core + 61 sql + 120 storage + 6 connectors)
+**Total tests**: 817 (630 core + 61 sql + 120 storage + 6 connectors)
 
 ### Where We Left Off
-Phase 2 Production Hardening: 23/29 features complete.
+Phase 2 Production Hardening: 24/29 features complete.
 
 ### Immediate Next Steps
-1. F065: Keyed Watermarks (P1)
-2. F057: Stream Join Optimizations (P1)
-3. F021: Temporal Joins (P2)
-4. F024: Two-Phase Commit (P1)
+1. F057: Stream Join Optimizations (P1)
+2. F021: Temporal Joins (P2)
+3. F024: Two-Phase Commit (P1)
+4. F066: Watermark Alignment Groups (P2)
 
 ### Open Issues
 None - Phase 2 underway.
@@ -60,8 +61,8 @@ None - Phase 2 underway.
 | F060: Cascading MVs | Done | MvRegistry |
 | F056: ASOF Joins | Done | Backward/Forward/Nearest, tolerance |
 | F064: Per-Partition Watermarks | Done | PartitionedWatermarkTracker, CoreWatermarkState |
+| F065: Keyed Watermarks | Done | KeyedWatermarkTracker, per-key 99%+ accuracy |
 | F021: Temporal Joins | Draft | P2 |
-| F065: Keyed Watermarks | Draft | P1 |
 
 ---
 
@@ -70,7 +71,7 @@ None - Phase 2 underway.
 ### Key Modules
 ```
 laminar-core/src/
-  time/         # F010, F064: Watermarks, partitioned tracking
+  time/         # F010, F064, F065: Watermarks, partitioned + keyed tracking
   mv/           # F060: Cascading MVs
   budget/       # F070: Task budgets
   sink/         # F023: Exactly-once sinks

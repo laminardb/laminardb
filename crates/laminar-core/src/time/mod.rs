@@ -78,13 +78,48 @@
 //! tracker.mark_partition_idle(PartitionId::new(0, 1));
 //! assert_eq!(tracker.current_watermark(), Some(Watermark::new(5000)));
 //! ```
+//!
+//! ## Per-Key Watermark Tracking (F065)
+//!
+//! For multi-tenant workloads or scenarios with significant event-time skew between
+//! keys, use [`KeyedWatermarkTracker`] to achieve 99%+ accuracy vs 63-67% with global:
+//!
+//! ```rust
+//! use laminar_core::time::{KeyedWatermarkTracker, KeyedWatermarkConfig, Watermark};
+//! use std::time::Duration;
+//!
+//! let config = KeyedWatermarkConfig::with_bounded_delay(Duration::from_secs(5));
+//! let mut tracker: KeyedWatermarkTracker<String> = KeyedWatermarkTracker::new(config);
+//!
+//! // Fast tenant advances quickly
+//! tracker.update("tenant_a".to_string(), 15_000);
+//!
+//! // Slow tenant at earlier time
+//! tracker.update("tenant_b".to_string(), 5_000);
+//!
+//! // Per-key watermarks differ - each key has independent tracking
+//! assert_eq!(tracker.watermark_for_key(&"tenant_a".to_string()), Some(10_000));
+//! assert_eq!(tracker.watermark_for_key(&"tenant_b".to_string()), Some(0));
+//!
+//! // Events for tenant_b at 3000 are NOT late (their key watermark is 0)
+//! assert!(!tracker.is_late(&"tenant_b".to_string(), 3000));
+//!
+//! // But events for tenant_a at 3000 ARE late (their key watermark is 10000)
+//! assert!(tracker.is_late(&"tenant_a".to_string(), 3000));
+//! ```
 
 mod event_time;
+mod keyed_watermark;
 mod partitioned_watermark;
 mod watermark;
 
 pub use event_time::{
     EventTimeError, EventTimeExtractor, ExtractionMode, TimestampField, TimestampFormat,
+};
+
+pub use keyed_watermark::{
+    KeyEvictionPolicy, KeyWatermarkState, KeyedWatermarkConfig, KeyedWatermarkError,
+    KeyedWatermarkMetrics, KeyedWatermarkTracker, KeyedWatermarkTrackerWithLateHandling,
 };
 
 pub use partitioned_watermark::{

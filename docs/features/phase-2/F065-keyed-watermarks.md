@@ -5,13 +5,14 @@
 | Field | Value |
 |-------|-------|
 | **ID** | F065 |
-| **Status** | 📝 Draft |
+| **Status** | ✅ Done |
 | **Priority** | P1 |
 | **Phase** | 2 |
 | **Effort** | L (1-2 weeks) |
 | **Dependencies** | F010, F064 |
 | **Owner** | TBD |
 | **Created** | 2026-01-24 |
+| **Completed** | 2026-01-25 |
 | **Research** | [Watermark Generator Research 2026](../../research/watermark-generator-research-2026.md) |
 
 ## Summary
@@ -491,20 +492,20 @@ function calculate_global_watermark():
 
 ## Completion Checklist
 
-- [ ] `KeyedWatermarkTracker` implemented
-- [ ] Per-key late detection working
-- [ ] Idle key detection
-- [ ] Memory-bounded variant (CompactKeyedWatermarkTracker)
-- [ ] Window operator integration
-- [ ] Unit tests passing (12+ tests)
-- [ ] Benchmarks meet targets
-- [ ] Documentation updated
+- [x] `KeyedWatermarkTracker` implemented
+- [x] Per-key late detection working
+- [x] Idle key detection
+- [ ] Memory-bounded variant (CompactKeyedWatermarkTracker) - deferred to future
+- [ ] Window operator integration - deferred to future
+- [x] Unit tests passing (23 tests)
+- [ ] Benchmarks meet targets - deferred to future
+- [x] Documentation updated
 
 ## Open Questions
 
-- [ ] Should we support different bounded_delay per key?
-- [ ] How to handle key cardinality estimation for memory planning?
-- [ ] Should idle key eviction be automatic or manual?
+- [x] Should we support different bounded_delay per key? - No, uniform for simplicity
+- [x] How to handle key cardinality estimation for memory planning? - Use max_keys config
+- [x] Should idle key eviction be automatic or manual? - Both: check_idle_keys() + manual mark_idle()
 
 ## References
 
