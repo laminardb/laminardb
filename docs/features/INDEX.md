@@ -6,11 +6,11 @@
 |-------|-------|-------|-------------|-----------|------|
 | Phase 1 | 12 | 0 | 0 | 1 | 11 |
 | Phase 1.5 | 1 | 1 | 0 | 0 | 0 |
-| Phase 2 | 29 | 15 | 0 | 0 | 14 |
+| Phase 2 | 29 | 14 | 0 | 0 | 15 |
 | Phase 3 | 12 | 12 | 0 | 0 | 0 |
 | Phase 4 | 11 | 11 | 0 | 0 | 0 |
 | Phase 5 | 10 | 10 | 0 | 0 | 0 |
-| **Total** | **75** | **49** | **0** | **1** | **25** |
+| **Total** | **75** | **48** | **0** | **1** | **26** |
 
 ## Status Legend
 
@@ -99,7 +99,7 @@
 | F019 | Stream-Stream Joins | P0 | ✅ | [Link](phase-2/F019-stream-stream-joins.md) |
 | F020 | Lookup Joins | P0 | ✅ | [Link](phase-2/F020-lookup-joins.md) |
 | F021 | Temporal Joins | P2 | 📝 | [Link](phase-2/F021-temporal-joins.md) |
-| F022 | Incremental Checkpointing | P1 | 📝 | [Link](phase-2/F022-incremental-checkpointing.md) |
+| F022 | Incremental Checkpointing | P1 | ✅ | [Link](phase-2/F022-incremental-checkpointing.md) |
 | F023 | Exactly-Once Sinks | P0 | 📝 | [Link](phase-2/F023-exactly-once-sinks.md) |
 | F024 | Two-Phase Commit | P1 | 📝 | [Link](phase-2/F024-two-phase-commit.md) |
 | F056 | ASOF Joins | P1 | 📝 | [Link](phase-2/F056-asof-joins.md) |

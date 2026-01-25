@@ -8,9 +8,9 @@
 
 ### Sprint Priority: Phase 2 In Progress
 
-Phase 1 P0 hardening is complete. Phase 2 is underway with 13/29 features complete.
+Phase 1 P0 hardening is complete. Phase 2 is underway with 16/29 features complete.
 
-**Completed**: F013 (Thread-Per-Core), F014 (SPSC), F015 (CPU Pinning), F016 (Sliding Windows), F018 (Hopping), F019 (Stream-Stream Joins), F020 (Lookup Joins), F067 (io_uring), F068 (NUMA), F071 (Zero-Alloc), F011B (EMIT Extension), F063 (Changelog/Retraction), F059 (FIRST/LAST)
+**Completed**: F013 (Thread-Per-Core), F014 (SPSC), F015 (CPU Pinning), F016 (Sliding Windows), F017 (Session Windows), F018 (Hopping), F019 (Stream-Stream Joins), F020 (Lookup Joins), F067 (io_uring), F068 (NUMA), F071 (Zero-Alloc), F011B (EMIT Extension), F063 (Changelog/Retraction), F059 (FIRST/LAST), F023 (Exactly-Once Sinks), F022 (Incremental Checkpointing)
 
 **Next Priority** (updated based on research reviews):
 
@@ -25,8 +25,8 @@ Phase 1 P0 hardening is complete. Phase 2 is underway with 13/29 features comple
 6. ~~**F011B (EMIT Clause Extension)**~~ - ✅ COMPLETE - OnWindowClose/Changelog/Final
 7. ~~**F063 (Changelog/Retraction)**~~ - ✅ COMPLETE - Z-set foundation, unblocks F023, F060
 8. ~~**F059 (FIRST/LAST Value Aggregates)**~~ - ✅ COMPLETE - Essential for OHLC, unblocks F060
-9. F023 (Exactly-Once Sinks) - P0, now unblocked by F063
-10. F022 (Incremental Checkpointing) - P1, async checkpoint + RocksDB
+9. ~~**F023 (Exactly-Once Sinks)**~~ - ✅ COMPLETE - Transactional + idempotent sinks
+10. ~~**F022 (Incremental Checkpointing)**~~ - ✅ COMPLETE - RocksDB backend, SPSC changelog
 11. F062 (Per-Core WAL) - P1, required for F013 integration
 
 ### Phase 1 Hardening (Complete)

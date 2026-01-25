@@ -28,6 +28,9 @@ bytes = { workspace = true }
 # CRC32 for WAL integrity
 crc32c = "0.6"
 
+# Fast hash for changelog entries
+fxhash = "0.2"
+
 # Async
 tokio = { workspace = true }
 async-trait = { workspace = true }

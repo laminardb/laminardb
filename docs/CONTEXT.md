@@ -8,7 +8,21 @@
 **Duration**: Continued session
 
 ### What Was Accomplished
-- ✅ **F017: Session Windows** - IMPLEMENTATION COMPLETE
+- ✅ **F022: Incremental Checkpointing** - IMPLEMENTATION COMPLETE
+  - New `incremental` module in `crates/laminar-storage/src/incremental/`
+  - `StateChangelogEntry` - 32-byte zero-allocation changelog entry for Ring 0
+  - `StateChangelogBuffer` - SPSC ring buffer for changelog with atomic indices
+  - `IncrementalCheckpointManager` - RocksDB-backed incremental checkpoints
+  - `RecoveryManager` - Checkpoint + WAL replay recovery
+  - `CheckpointConfig` - Configuration with interval, retention, WAL truncation
+  - `RecoveryConfig` - Configuration with WAL repair, state change collection
+  - Supports incremental checkpoints via RocksDB hard-linked SSTables
+  - Core invariant: `Checkpoint(epoch) + WAL.replay(epoch..current) = Consistent State`
+  - Automatic cleanup of old checkpoints beyond retention limit
+  - 37 new unit tests, all passing
+  - **Total tests**: 577 (448 core + 61 sql + 62 storage + 6 connectors)
+
+- ✅ **F017: Session Windows** - IMPLEMENTATION COMPLETE (previous session)
   - New `session_window` module in `crates/laminar-core/src/operator/session_window.rs`
   - `SessionWindowOperator` - Dynamic windows based on activity gaps
   - `SessionState` - Per-key session tracking (start, end, key)
@@ -20,7 +34,6 @@
   - Checkpoint/restore support via rkyv serialization
   - Prepared for future session merging when late data bridges sessions
   - 23 new unit tests, all passing
-  - **Total tests**: 540 (448 core + 61 sql + 25 storage + 6 connectors)
 
 - ✅ **F023: Exactly-Once Sinks** - IMPLEMENTATION COMPLETE (previous session)
   - New `sink` module in `crates/laminar-core/src/sink/`
@@ -672,14 +685,15 @@ let outputs = operator.process_side(&payment_event, JoinSide::Right, &mut ctx);
 ```
 
 ### Where We Left Off
-Phase 2 P0 features F013, F016, and F019 complete. Ready to continue with lookup joins and exactly-once sinks.
+Phase 2 features continue. F022 Incremental Checkpointing is now complete (15/29 features).
 
 ### Immediate Next Steps
 
 1. **Continue Phase 2** - Production Hardening
-   - F022: Incremental Checkpointing (P1)
    - F062: Per-Core WAL Segments (P1)
    - F021: Temporal Joins (P2)
+   - F069: Three-Ring I/O Architecture (P1)
+   - F070: Task Budget Enforcement (P1)
 
 ### Open Issues
 
@@ -750,6 +764,7 @@ handle.credit_metrics();       // Acquired, released, blocked, dropped
 | F067: io_uring Advanced | ✅ Complete | SQPOLL, IOPOLL, registered buffers, 13 tests |
 | F068: NUMA-Aware Memory | ✅ Complete | NumaAllocator, NumaTopology, 11 tests |
 | F071: Zero-Alloc Enforcement | ✅ Complete | HotPathGuard, ObjectPool, RingBuffer, 33 tests |
+| F022: Incremental Checkpointing | ✅ Complete | RocksDB backend, SPSC changelog, recovery, 37 tests |
 
 ---
 
@@ -757,7 +772,7 @@ handle.credit_metrics();       // Acquired, released, blocked, dropped
 
 ### Current Focus
 - **Phase**: 2 Production Hardening
-- **Active Feature**: F017 complete (15/29), ready for F022 (incremental checkpointing) or F021 (temporal joins)
+- **Active Feature**: F022 complete (16/29), ready for F062 (per-core WAL) or F021 (temporal joins)
 
 ### Key Files
 ```
@@ -811,9 +826,16 @@ crates/laminar-core/src/operator/
 
 crates/laminar-connectors/src/lookup.rs  # TableLoader trait, InMemoryTableLoader
 
+crates/laminar-storage/src/incremental/
+├── mod.rs           # Public exports, module documentation
+├── error.rs         # IncrementalCheckpointError enum
+├── changelog.rs     # F022: StateChangelogEntry, StateChangelogBuffer (SPSC)
+├── manager.rs       # IncrementalCheckpointManager, CheckpointConfig
+└── recovery.rs      # RecoveryManager, RecoveryConfig, RecoveredState
+
 Benchmarks: crates/laminar-core/benches/tpc_bench.rs, io_uring_bench.rs
 
-Tests: 540 passing (448 core, 61 sql, 25 storage, 6 connectors)
+Tests: 577 passing (448 core, 61 sql, 62 storage, 6 connectors)
 ```
 
 ### Useful Commands
