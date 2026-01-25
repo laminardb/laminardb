@@ -9,6 +9,7 @@
 //! - **Registered Buffers**: Avoids per-operation buffer mapping overhead
 //! - **IOPOLL Mode**: Polls completions directly from `NVMe` queue (no interrupts)
 //! - **Per-Core Rings**: Each core has its own `io_uring` instance for thread-per-core
+//! - **Three-Ring I/O (F069)**: Separate latency/main/poll rings for optimal scheduling
 //!
 //! ## Research Background
 //!
@@ -39,6 +40,22 @@
 //! let user_data = manager.submit_read(fd, offset, len)?;
 //! let completions = manager.poll_completions();
 //! ```
+//!
+//! ## Three-Ring I/O (F069)
+//!
+//! For optimal latency/throughput balance, use the three-ring reactor:
+//!
+//! ```rust,ignore
+//! use laminar_core::io_uring::three_ring::{ThreeRingConfig, ThreeRingReactor};
+//!
+//! let config = ThreeRingConfig::builder()
+//!     .latency_entries(256)
+//!     .main_entries(1024)
+//!     .build()?;
+//!
+//! let mut reactor = ThreeRingReactor::new(0, config)?;
+//! // Latency ring for network, main ring for WAL, poll ring for NVMe
+//! ```
 
 mod config;
 mod error;
@@ -51,6 +68,8 @@ mod manager;
 mod ring;
 #[cfg(all(target_os = "linux", feature = "io-uring"))]
 mod sink;
+#[cfg(all(target_os = "linux", feature = "io-uring"))]
+pub mod three_ring;
 
 pub use config::{IoUringConfig, IoUringConfigBuilder, RingMode};
 pub use error::IoUringError;

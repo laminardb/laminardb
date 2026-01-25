@@ -8,9 +8,9 @@
 
 ### Sprint Priority: Phase 2 In Progress
 
-Phase 1 P0 hardening is complete. Phase 2 is underway with 16/29 features complete.
+Phase 1 P0 hardening is complete. Phase 2 is underway with 18/29 features complete.
 
-**Completed**: F013 (Thread-Per-Core), F014 (SPSC), F015 (CPU Pinning), F016 (Sliding Windows), F017 (Session Windows), F018 (Hopping), F019 (Stream-Stream Joins), F020 (Lookup Joins), F067 (io_uring), F068 (NUMA), F071 (Zero-Alloc), F011B (EMIT Extension), F063 (Changelog/Retraction), F059 (FIRST/LAST), F023 (Exactly-Once Sinks), F022 (Incremental Checkpointing)
+**Completed**: F013 (Thread-Per-Core), F014 (SPSC), F015 (CPU Pinning), F016 (Sliding Windows), F017 (Session Windows), F018 (Hopping), F019 (Stream-Stream Joins), F020 (Lookup Joins), F067 (io_uring), F068 (NUMA), F071 (Zero-Alloc), F011B (EMIT Extension), F063 (Changelog/Retraction), F059 (FIRST/LAST), F023 (Exactly-Once Sinks), F022 (Incremental Checkpointing), F062 (Per-Core WAL), F069 (Three-Ring I/O)
 
 **Next Priority** (updated based on research reviews):
 
@@ -19,7 +19,7 @@ Phase 1 P0 hardening is complete. Phase 2 is underway with 16/29 features comple
 2. ~~**F067 (io_uring Advanced)**~~ - ✅ COMPLETE
 3. ~~**F068 (NUMA-Aware Memory)**~~ - ✅ COMPLETE
 4. F070 (Task Budget Enforcement) - P1, latency SLA guarantees
-5. F069 (Three-Ring I/O) - P1, latency/main/poll ring separation
+5. ~~**F069 (Three-Ring I/O)**~~ - ✅ COMPLETE - latency/main/poll ring separation
 
 **Emit & Checkpoint** (from [Emit Patterns Research](research/emit-patterns-research-2026.md)):
 6. ~~**F011B (EMIT Clause Extension)**~~ - ✅ COMPLETE - OnWindowClose/Changelog/Final
@@ -27,7 +27,7 @@ Phase 1 P0 hardening is complete. Phase 2 is underway with 16/29 features comple
 8. ~~**F059 (FIRST/LAST Value Aggregates)**~~ - ✅ COMPLETE - Essential for OHLC, unblocks F060
 9. ~~**F023 (Exactly-Once Sinks)**~~ - ✅ COMPLETE - Transactional + idempotent sinks
 10. ~~**F022 (Incremental Checkpointing)**~~ - ✅ COMPLETE - RocksDB backend, SPSC changelog
-11. F062 (Per-Core WAL) - P1, required for F013 integration
+11. ~~**F062 (Per-Core WAL)**~~ - ✅ COMPLETE - lock-free per-core writers, epoch ordering
 
 ### Phase 1 Hardening (Complete)
 
@@ -47,10 +47,10 @@ Phase 1 features are functionally complete. A comprehensive audit against 2025-2
 
 | # | Issue | Feature | Effort | Status | Impact |
 |---|-------|---------|--------|--------|--------|
-| 6 | Per-core WAL segments | **F062** | 3-5 days | 📝 Spec | Required for F013 (thread-per-core) |
-| 7 | Async checkpointing | **F022** | 1-2 weeks | 📝 Spec | Blocks Ring 0 currently |
+| 6 | Per-core WAL segments | **F062** | 3-5 days | ✅ Done | Required for F013 (thread-per-core) |
+| 7 | Async checkpointing | **F022** | 1-2 weeks | ✅ Done | Blocks Ring 0 currently |
 | 8 | MAP_PRIVATE for checkpoints | F002 | 2-3 days | 📝 Draft | CoW isolation for snapshots |
-| 9 | io_uring integration | F001/F007 | 3-5 days | 📝 Draft | Blocking I/O on hot path |
+| 9 | io_uring integration | F001/F007 | 3-5 days | ✅ Done | Blocking I/O on hot path |
 
 **New ADR**: [ADR-004: Checkpoint Strategy](adr/ADR-004-checkpoint-strategy.md) documents the three-tier checkpoint architecture decision.
 

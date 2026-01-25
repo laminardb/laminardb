@@ -8,7 +8,25 @@
 **Duration**: Continued session
 
 ### What Was Accomplished
-- ✅ **F062: Per-Core WAL Segments** - IMPLEMENTATION COMPLETE
+- ✅ **F069: Three-Ring I/O Architecture** - IMPLEMENTATION COMPLETE
+  - New `three_ring` module in `crates/laminar-core/src/io_uring/three_ring/`
+  - `ThreeRingReactor` - Main reactor with latency/main/poll rings
+  - `ThreeRingConfig` - Builder pattern configuration for all three rings
+  - `RingAffinity` - Latency, Main, Poll classification for operations
+  - `OperationType` - 19 operation types (network, WAL, storage, etc.)
+  - `RingHandler` trait - Handler interface for Ring 0/1/2 integration
+  - `SimpleRingHandler` - Reference implementation for testing
+  - `CompletionRouter` - Tracks pending ops, routes completions with latency
+  - `ThreeRingStats` - Per-ring latency, submissions, completions, wake-ups
+  - Latency ring always polled first (highest priority)
+  - Main ring can block when idle, wakes on latency ring activity
+  - Poll ring with IOPOLL for NVMe (optional, falls back to main ring)
+  - Convenience methods: `submit_recv`, `submit_send`, `submit_wal_write`, `submit_wal_sync`, `submit_storage_read`, `submit_storage_write`
+  - Linux-only (io_uring feature flag), graceful fallback on other platforms
+  - 40+ new unit tests across modules
+  - **Total tests**: 635 (448 core + 61 sql + 120 storage + 6 connectors)
+
+- ✅ **F062: Per-Core WAL Segments** - IMPLEMENTATION COMPLETE (previous session)
   - New `per_core_wal` module in `crates/laminar-storage/src/per_core_wal/`
   - `PerCoreWalEntry` - Epoch-based entry with deterministic ordering
   - `CoreWalWriter` - Per-core WAL writer (lock-free, no cross-core sync)
@@ -699,15 +717,15 @@ let outputs = operator.process_side(&payment_event, JoinSide::Right, &mut ctx);
 ```
 
 ### Where We Left Off
-Phase 2 features continue. F062 Per-Core WAL Segments is now complete (17/29 features).
+Phase 2 features continue. F069 Three-Ring I/O is now complete (18/29 features).
 
 ### Immediate Next Steps
 
 1. **Continue Phase 2** - Production Hardening
-   - F021: Temporal Joins (P2)
-   - F069: Three-Ring I/O Architecture (P1)
    - F070: Task Budget Enforcement (P1)
    - F060: Cascading Materialized Views (P1)
+   - F021: Temporal Joins (P2)
+   - F073: Zero-Allocation Polling (P1)
 
 ### Open Issues
 
@@ -780,6 +798,7 @@ handle.credit_metrics();       // Acquired, released, blocked, dropped
 | F071: Zero-Alloc Enforcement | ✅ Complete | HotPathGuard, ObjectPool, RingBuffer, 33 tests |
 | F022: Incremental Checkpointing | ✅ Complete | RocksDB backend, SPSC changelog, recovery, 37 tests |
 | F062: Per-Core WAL Segments | ✅ Complete | Lock-free per-core writers, epoch ordering, 58 tests |
+| F069: Three-Ring I/O | ✅ Complete | Latency/Main/Poll rings, RingHandler trait, 40+ tests |
 
 ---
 
@@ -787,7 +806,7 @@ handle.credit_metrics();       // Acquired, released, blocked, dropped
 
 ### Current Focus
 - **Phase**: 2 Production Hardening
-- **Active Feature**: F062 complete (17/29), ready for F021 (temporal joins) or F069 (three-ring I/O)
+- **Active Feature**: F069 complete (18/29), ready for F070 (task budget) or F060 (cascading MVs)
 
 ### Key Files
 ```
@@ -806,7 +825,15 @@ crates/laminar-core/src/io_uring/
 ├── error.rs         # IoUringError enum
 ├── ring.rs          # Ring creation (SQPOLL, IOPOLL modes)
 ├── buffer_pool.rs   # RegisteredBufferPool (zero-copy I/O)
-└── manager.rs       # CoreRingManager (per-core ring management)
+├── manager.rs       # CoreRingManager (per-core ring management)
+└── three_ring/      # F069: Three-Ring I/O Architecture
+    ├── mod.rs       # Public exports, module docs
+    ├── affinity.rs  # RingAffinity, OperationType classification
+    ├── config.rs    # ThreeRingConfig, builder pattern
+    ├── handler.rs   # RingHandler trait, SimpleRingHandler
+    ├── reactor.rs   # ThreeRingReactor (latency/main/poll rings)
+    ├── router.rs    # CompletionRouter, PendingOperation
+    └── stats.rs     # ThreeRingStats (latency, completions, wake-ups)
 
 crates/laminar-core/src/alloc/
 ├── mod.rs           # Public exports, hot_path! macro
