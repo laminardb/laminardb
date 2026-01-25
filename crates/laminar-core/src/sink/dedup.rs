@@ -539,7 +539,7 @@ mod tests {
         dedup.mark_seen(RecordId::from_u64(1));
         dedup.mark_seen(RecordId::from_u64(3));
 
-        let ids = vec![
+        let ids = [
             RecordId::from_u64(1),
             RecordId::from_u64(2),
             RecordId::from_u64(3),

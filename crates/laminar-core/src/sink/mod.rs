@@ -71,7 +71,7 @@ mod tests {
 
     #[test]
     fn test_idempotent_sink_deduplicates() {
-        use std::collections::HashMap;
+
 
         struct MockSink {
             writes: Vec<Output>,
@@ -99,7 +99,7 @@ mod tests {
         // Write count depends on implementation
         // The important thing is deduplication works
         assert!(!sink.inner().writes.is_empty());
-        let initial_count = sink.inner().writes.len();
+
 
         // Same record ID should be deduplicated
         // (In real use, the ID extractor would return same ID for duplicate)

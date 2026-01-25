@@ -56,7 +56,9 @@
 //! println!("Created checkpoint {} at epoch {}", metadata.id, metadata.epoch);
 //!
 //! // Recovery
-//! let recovered = RecoveryManager::recover(Path::new("/data/checkpoints")).unwrap();
+//! let recovery_config = RecoveryConfig::new(Path::new("/data/checkpoints"), Path::new("/data/wal"));
+//! let recovery_manager = RecoveryManager::new(recovery_config);
+//! let recovered = recovery_manager.recover().unwrap();
 //! println!("Recovered to epoch {} with {} source offsets",
 //!     recovered.epoch, recovered.source_offsets.len());
 //! ```

@@ -1067,6 +1067,7 @@ impl Accumulator for AvgAccumulator {
         self.count += other.count;
     }
 
+    // Precision loss is acceptable for arithmetic mean
     #[allow(clippy::cast_precision_loss)]
     fn result(&self) -> Option<f64> {
         if self.count == 0 {

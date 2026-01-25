@@ -319,7 +319,7 @@ mod tests {
 
     #[test]
     fn test_sorting_multiple_entries() {
-        let mut entries = vec![
+        let mut entries = [
             PerCoreWalEntry {
                 epoch: 2,
                 sequence: 1,

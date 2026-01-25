@@ -522,7 +522,7 @@ mod tests {
         coord.register_participant("sink-1".to_string());
         coord.register_participant("sink-2".to_string());
 
-        let tx_id = coord.begin().unwrap();
+        let _tx_id = coord.begin().unwrap();
         assert!(coord.current_transaction().is_some());
 
         coord.mark_prepared("sink-1").unwrap();
