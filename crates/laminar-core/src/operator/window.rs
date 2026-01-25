@@ -470,6 +470,33 @@ impl CdcOperation {
             Self::UpdateBefore | Self::UpdateAfter => 'u',
         }
     }
+
+    /// Converts the operation to a u8 for compact storage.
+    ///
+    /// Used by `ChangelogRef` to store operation type in a single byte.
+    #[inline]
+    #[must_use]
+    pub fn to_u8(self) -> u8 {
+        match self {
+            Self::Insert => 0,
+            Self::Delete => 1,
+            Self::UpdateBefore => 2,
+            Self::UpdateAfter => 3,
+        }
+    }
+
+    /// Converts from u8 (defaults to Insert for unknown values).
+    #[inline]
+    #[must_use]
+    pub fn from_u8(value: u8) -> Self {
+        match value {
+            1 => Self::Delete,
+            2 => Self::UpdateBefore,
+            3 => Self::UpdateAfter,
+            // 0 and unknown values default to Insert
+            _ => Self::Insert,
+        }
+    }
 }
 
 /// A changelog record with Z-set weight for CDC pipelines.

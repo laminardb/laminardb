@@ -8,7 +8,117 @@
 **Duration**: Continued session
 
 ### What Was Accomplished
-- ✅ **F011B: EMIT Clause Extension** - IMPLEMENTATION COMPLETE
+- ✅ **F063: Changelog/Retraction (Z-Sets)** - IMPLEMENTATION COMPLETE
+  - New `changelog` module in `crates/laminar-core/src/operator/changelog.rs`
+  - `ChangelogRef` - Zero-allocation changelog reference for Ring 0 (12 bytes)
+  - `ChangelogBuffer` - Pre-allocated buffer for hot path (no allocation after warmup)
+  - `RetractableAccumulator` trait - Extension for aggregators supporting retraction
+  - `RetractableCountAccumulator` - O(1) retraction for count
+  - `RetractableSumAccumulator` - O(1) retraction for sum
+  - `RetractableAvgAccumulator` - O(1) retraction for average
+  - `RetractableMinAccumulator` - Value-tracking min with retraction (O(n) worst case)
+  - `RetractableMaxAccumulator` - Value-tracking max with retraction (O(n) worst case)
+  - `LateDataRetractionGenerator` - Generates retractions for late data corrections
+  - `CdcEnvelope<T>` - Debezium-compatible CDC format (insert/update/delete/read)
+  - `CdcSource` - Source metadata for CDC envelope
+  - Added `to_u8()`/`from_u8()` to `CdcOperation` for compact storage
+  - 31 new unit tests, all passing
+  - **Total tests**: 451 (359 core + 61 sql + 25 storage + 6 connectors)
+
+### F063 Implementation Details
+
+**New Module**: `crates/laminar-core/src/operator/changelog.rs`
+
+**Ring 0 Zero-Allocation Types**:
+```rust
+// Compact changelog reference (12 bytes)
+pub struct ChangelogRef {
+    pub batch_offset: u32,
+    pub row_index: u32,
+    pub weight: i16,
+    operation_raw: u8,
+}
+
+// Pre-allocated buffer for hot path
+pub struct ChangelogBuffer {
+    refs: Vec<ChangelogRef>,  // Pre-warmed
+    len: usize,
+    capacity: usize,
+}
+```
+
+**Retractable Aggregators**:
+```rust
+pub trait RetractableAccumulator: Default + Clone + Send {
+    type Input;
+    type Output;
+
+    fn add(&mut self, value: Self::Input);
+    fn retract(&mut self, value: &Self::Input);  // Inverse of add
+    fn merge(&mut self, other: &Self);
+    fn result(&self) -> Self::Output;
+    fn is_empty(&self) -> bool;
+    fn supports_efficient_retraction(&self) -> bool;
+    fn reset(&mut self);
+}
+
+// Implementations: RetractableCountAccumulator, RetractableSumAccumulator,
+// RetractableAvgAccumulator, RetractableMinAccumulator, RetractableMaxAccumulator
+```
+
+**Late Data Retraction**:
+```rust
+pub struct LateDataRetractionGenerator {
+    emitted_results: FxHashMap<WindowId, EmittedResult>,
+    enabled: bool,
+}
+
+impl LateDataRetractionGenerator {
+    // Returns (old_data, new_data) if retraction needed
+    pub fn check_retraction(&mut self, window_id: &WindowId,
+                            new_data: &[u8], timestamp: i64)
+        -> Option<(Vec<u8>, Vec<u8>)>;
+}
+```
+
+**CDC Envelope (Debezium-Compatible)**:
+```rust
+pub struct CdcEnvelope<T> {
+    pub op: String,        // "c" (create), "u" (update), "d" (delete), "r" (read)
+    pub ts_ms: i64,
+    pub source: CdcSource,
+    pub before: Option<T>, // For updates/deletes
+    pub after: Option<T>,  // For inserts/updates
+}
+```
+
+**Usage Example**:
+```rust
+use laminar_core::operator::changelog::{
+    ChangelogBuffer, ChangelogRef, RetractableSumAccumulator,
+    RetractableAccumulator, CdcEnvelope, CdcSource,
+};
+
+// Ring 0: Zero-allocation changelog tracking
+let mut buffer = ChangelogBuffer::with_capacity(1024);
+buffer.push(ChangelogRef::insert(0, 0));
+buffer.push_retraction(0, 1, 2);  // UpdateBefore + UpdateAfter pair
+
+// Ring 1: Retractable aggregation
+let mut agg = RetractableSumAccumulator::default();
+agg.add(10);
+agg.add(20);
+assert_eq!(agg.result(), 30);
+agg.retract(&10);
+assert_eq!(agg.result(), 20);
+
+// CDC envelope for sinks
+let source = CdcSource::new("laminardb", "default", "orders");
+let envelope = CdcEnvelope::insert(json!({"id": 1}), source, 1000);
+let json = envelope.to_json().unwrap();
+```
+
+### Previous Session: F011B: EMIT Clause Extension - IMPLEMENTATION COMPLETE
   - Extended `EmitStrategy` enum with `OnWindowClose`, `Changelog`, `Final`
   - Added helper methods: `emits_intermediate()`, `requires_changelog()`, `is_append_only_compatible()`, `generates_retractions()`, `suppresses_intermediate()`, `drops_late_data()`
   - Added `CdcOperation` enum: Insert, Delete, UpdateBefore, UpdateAfter with Z-set weights
@@ -597,8 +707,8 @@ handle.credit_metrics();       // Acquired, released, blocked, dropped
 | F019: Stream-Stream Joins | ✅ Complete | Inner/Left/Right/Full, 14 tests |
 | F020: Lookup Joins | ✅ Complete | Cached lookups with TTL, 16 tests |
 | F011B: EMIT Clause Extension | ✅ Complete | OnWindowClose, Changelog, Final, 15 tests |
-| F023: Exactly-Once Sinks | 📝 Not started | Depends on F011B (complete) + F063 |
-| F063: Changelog/Retraction | 📝 Not started | Z-set foundation for F023 |
+| F023: Exactly-Once Sinks | 📝 Not started | Now unblocked by F063 |
+| F063: Changelog/Retraction | ✅ Complete | Z-set foundation, 31 tests |
 | F067: io_uring Advanced | ✅ Complete | SQPOLL, IOPOLL, registered buffers, 13 tests |
 | F068: NUMA-Aware Memory | ✅ Complete | NumaAllocator, NumaTopology, 11 tests |
 | F071: Zero-Alloc Enforcement | ✅ Complete | HotPathGuard, ObjectPool, RingBuffer, 33 tests |
@@ -609,7 +719,7 @@ handle.credit_metrics();       // Acquired, released, blocked, dropped
 
 ### Current Focus
 - **Phase**: 2 Production Hardening
-- **Active Feature**: F011B complete (11/29), ready for F063 (changelog/retraction) or F017 (session windows)
+- **Active Feature**: F063 complete (12/29), ready for F023 (exactly-once sinks) or F059 (FIRST/LAST)
 
 ### Key Files
 ```
@@ -643,17 +753,19 @@ crates/laminar-core/src/tpc/
 └── runtime.rs       # ThreadPerCoreRuntime, TpcConfig
 
 crates/laminar-core/src/operator/
-├── mod.rs           # Operator trait, Event, Output types
-├── window.rs        # TumblingWindowOperator, WindowAssigner trait
-├── sliding_window.rs# SlidingWindowOperator, SlidingWindowAssigner
-├── stream_join.rs   # StreamJoinOperator, JoinType, JoinSide
-└── lookup_join.rs   # LookupJoinOperator, TableLoader trait
+├── mod.rs            # Operator trait, Event, Output types
+├── window.rs         # TumblingWindowOperator, WindowAssigner trait, CdcOperation
+├── sliding_window.rs # SlidingWindowOperator, SlidingWindowAssigner
+├── stream_join.rs    # StreamJoinOperator, JoinType, JoinSide
+├── lookup_join.rs    # LookupJoinOperator, TableLoader trait
+└── changelog.rs      # F063: ChangelogRef, ChangelogBuffer, RetractableAccumulator,
+                      #       LateDataRetractionGenerator, CdcEnvelope, CdcSource
 
 crates/laminar-connectors/src/lookup.rs  # TableLoader trait, InMemoryTableLoader
 
 Benchmarks: crates/laminar-core/benches/tpc_bench.rs, io_uring_bench.rs
 
-Tests: 406 passing (319 core, 56 sql, 25 storage, 6 connectors)
+Tests: 451 passing (359 core, 61 sql, 25 storage, 6 connectors)
 ```
 
 ### Useful Commands
