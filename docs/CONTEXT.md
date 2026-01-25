@@ -8,7 +8,22 @@
 **Duration**: Continued session
 
 ### What Was Accomplished
-- ✅ **F073: Zero-Allocation Polling** - IMPLEMENTATION COMPLETE
+- ✅ **F060: Cascading Materialized Views** - IMPLEMENTATION COMPLETE
+  - New `mv` module in `crates/laminar-core/src/mv/`
+  - `MvRegistry` - View registry with dependency tracking, cycle detection, topological ordering
+  - `MaterializedView` - View definition with sources, schema, and state
+  - `MvState` - Running, Paused, Error, Dropping states
+  - `CascadingWatermarkTracker` - Watermark propagation with min semantics
+  - `MvPipelineExecutor` - Processes events through MV DAG in topological order
+  - `MvPipelineCheckpoint` - Checkpoint/restore for pipeline state
+  - `PassThroughOperator` - Simple operator for testing
+  - `PipelineMetrics` - Events processed, per-MV counts, watermark advances
+  - Cascade drops: `unregister_cascade` removes view and all dependents
+  - Dependency chain introspection: `dependency_chain()`, `get_dependents()`
+  - 33 new unit tests, all passing
+  - **Total tests**: 746 (559 core + 61 sql + 120 storage + 6 connectors)
+
+- ✅ **F073: Zero-Allocation Polling** - IMPLEMENTATION COMPLETE (previous session)
   - New zero-allocation APIs for SPSC queue: `pop_batch_into()`, `pop_each()`
   - New zero-allocation APIs for CoreHandle: `poll_outputs_into()`, `poll_each()`
   - New zero-allocation APIs for ThreadPerCoreRuntime: `poll_into()`, `poll_each()`, `poll_core_into()`, `poll_core_each()`
@@ -744,15 +759,15 @@ let outputs = operator.process_side(&payment_event, JoinSide::Right, &mut ctx);
 ```
 
 ### Where We Left Off
-Phase 2 features continue. F070 Task Budget Enforcement is now complete (19/29 features).
+Phase 2 features continue. F060 Cascading Materialized Views is now complete (21/29 features).
 
 ### Immediate Next Steps
 
 1. **Continue Phase 2** - Production Hardening
-   - F073: Zero-Allocation Polling (P1)
-   - F060: Cascading Materialized Views (P1)
    - F021: Temporal Joins (P2)
    - F056: ASOF Joins (P1)
+   - F064: Per-Partition Watermarks (P1)
+   - F065: Keyed Watermarks (P1)
 
 ### Open Issues
 
@@ -827,6 +842,8 @@ handle.credit_metrics();       // Acquired, released, blocked, dropped
 | F062: Per-Core WAL Segments | ✅ Complete | Lock-free per-core writers, epoch ordering, 58 tests |
 | F069: Three-Ring I/O | ✅ Complete | Latency/Main/Poll rings, RingHandler trait, 40+ tests |
 | F070: Task Budget Enforcement | ✅ Complete | TaskBudget, YieldReason, BudgetMonitor, 47 tests |
+| F073: Zero-Alloc Polling | ✅ Complete | Zero-alloc APIs for SPSC/CoreHandle/Runtime, 31 tests |
+| F060: Cascading MVs | ✅ Complete | MvRegistry, CascadingWatermarkTracker, MvPipelineExecutor, 33 tests |
 
 ---
 
@@ -834,10 +851,17 @@ handle.credit_metrics();       // Acquired, released, blocked, dropped
 
 ### Current Focus
 - **Phase**: 2 Production Hardening
-- **Active Feature**: F070 complete (19/29), ready for F073 (zero-alloc polling) or F060 (cascading MVs)
+- **Active Feature**: F060 complete (21/29), ready for F021/F056 (joins) or F064/F065 (watermarks)
 
 ### Key Files
 ```
+crates/laminar-core/src/mv/
+├── mod.rs           # Public exports, module docs, F060: Cascading MVs
+├── error.rs         # MvError enum, MvState (Running/Paused/Error/Dropping)
+├── registry.rs      # MvRegistry, MaterializedView, dependency tracking
+├── watermark.rs     # CascadingWatermarkTracker, min-semantics propagation
+└── executor.rs      # MvPipelineExecutor, PassThroughOperator, PipelineMetrics
+
 crates/laminar-core/src/budget/
 ├── mod.rs           # Public exports, module tests
 ├── task_budget.rs   # TaskBudget struct, Ring 0/1 budget constants
@@ -922,7 +946,7 @@ crates/laminar-storage/src/per_core_wal/
 
 Benchmarks: crates/laminar-core/benches/tpc_bench.rs, io_uring_bench.rs
 
-Tests: 682 passing (495 core, 61 sql, 120 storage, 6 connectors)
+Tests: 746 passing (559 core, 61 sql, 120 storage, 6 connectors)
 ```
 
 ### Useful Commands

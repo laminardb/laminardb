@@ -36,6 +36,7 @@
 pub mod alloc;
 pub mod budget;
 pub mod io_uring;
+pub mod mv;
 pub mod numa;
 pub mod operator;
 pub mod reactor;
@@ -84,4 +85,8 @@ pub enum Error {
     /// Sink errors
     #[error("Sink error: {0}")]
     Sink(#[from] sink::SinkError),
+
+    /// Materialized view errors
+    #[error("MV error: {0}")]
+    Mv(#[from] mv::MvError),
 }

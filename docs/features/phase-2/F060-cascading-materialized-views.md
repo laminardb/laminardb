@@ -5,7 +5,7 @@
 | Field | Value |
 |-------|-------|
 | **ID** | F060 |
-| **Status** | 📝 Draft |
+| **Status** | ✅ Done |
 | **Priority** | P1 |
 | **Phase** | 2 |
 | **Effort** | L (1-2 weeks) |
