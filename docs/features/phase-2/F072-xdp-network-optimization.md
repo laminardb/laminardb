@@ -5,7 +5,7 @@
 | Field | Value |
 |-------|-------|
 | **ID** | F072 |
-| **Status** | 📝 Draft |
+| **Status** | ✅ Done |
 | **Priority** | P2 |
 | **Phase** | 2 |
 | **Effort** | XL (2-3 weeks) |

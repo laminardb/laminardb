@@ -6,11 +6,11 @@
 |-------|-------|-------|-------------|-----------|------|
 | Phase 1 | 12 | 0 | 0 | 1 | 11 |
 | Phase 1.5 | 1 | 1 | 0 | 0 | 0 |
-| Phase 2 | 29 | 2 | 0 | 0 | 27 |
+| Phase 2 | 29 | 1 | 0 | 0 | 28 |
 | Phase 3 | 12 | 12 | 0 | 0 | 0 |
 | Phase 4 | 11 | 11 | 0 | 0 | 0 |
 | Phase 5 | 10 | 10 | 0 | 0 | 0 |
-| **Total** | **75** | **36** | **0** | **1** | **38** |
+| **Total** | **75** | **35** | **0** | **1** | **39** |
 
 ## Status Legend
 
@@ -117,7 +117,7 @@
 | **F069** | **Three-Ring I/O Architecture** | **P1** | ✅ | [Link](phase-2/F069-three-ring-io.md) |
 | **F070** | **Task Budget Enforcement** | **P1** | ✅ | [Link](phase-2/F070-task-budget-enforcement.md) |
 | **F071** | **Zero-Allocation Enforcement** | **P0** | ✅ | [Link](phase-2/F071-zero-allocation-enforcement.md) |
-| **F072** | **XDP/eBPF Network Optimization** | **P2** | 📝 | [Link](phase-2/F072-xdp-network-optimization.md) |
+| **F072** | **XDP/eBPF Network Optimization** | **P2** | ✅ | [Link](phase-2/F072-xdp-network-optimization.md) |
 | **F073** | **Zero-Allocation Polling** | **P1** | ✅ | [Link](phase-2/F073-zero-allocation-polling.md) |
 
 ### Phase 2 Thread-Per-Core Research Gap Analysis (NEW)
@@ -131,7 +131,7 @@
 | **Single I/O ring** | "3 rings: latency/main/poll" | ❌ Single reactor | Priority-based rings | **F069** |
 | **No task budgeting** | "Ring 0: 500ns, Ring 1: 1ms budgets" | ❌ No enforcement | Budget + metrics + yielding | **F070** |
 | **No allocation detection** | "Zero-alloc hot path verification" | ✅ Implemented | Debug-mode detector + CI | **F071** |
-| **No XDP steering** | "26M packets/sec/core" | ❌ Standard sockets | CPU steering by partition | **F072** |
+| ~~No XDP steering~~ | "26M packets/sec/core" | ✅ Implemented | CPU steering by partition | **F072** |
 | CPU pinning | "Cache efficiency" | ✅ Implemented | - | F013/F015 |
 | Lock-free SPSC | "~4.8ns per operation" | ✅ Implemented | - | F014 |
 | Credit-based backpressure | "Flink-style flow control" | ✅ Implemented | - | F014 |
