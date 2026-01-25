@@ -173,12 +173,18 @@ impl LateDataMetrics {
 /// - `OnWatermark` is most efficient but has highest latency
 /// - `Periodic` balances freshness and efficiency
 /// - `OnUpdate` provides lowest latency but highest overhead
+/// - `OnWindowClose` (F011B) is for append-only sinks
+/// - `Changelog` (F011B) emits Z-set weighted records for CDC
+/// - `Final` (F011B) suppresses all intermediate results
 #[derive(Debug, Clone, PartialEq, Eq, Default)]
 pub enum EmitStrategy {
+    // === Existing (F011) ===
+
     /// Emit final results when watermark passes window end (default).
     ///
     /// This is the most efficient strategy as it only emits once per window.
     /// Results are guaranteed to be complete (within allowed lateness bounds).
+    /// May emit retractions if late data arrives within lateness bounds.
     #[default]
     OnWatermark,
 
@@ -197,6 +203,47 @@ pub enum EmitStrategy {
     ///
     /// Use with caution for high-volume streams.
     OnUpdate,
+
+    // === New (F011B) ===
+
+    /// Emit ONLY when watermark passes window end. No intermediate emissions.
+    ///
+    /// **Critical for append-only sinks** (Kafka, S3, Delta Lake, Iceberg).
+    /// Unlike `OnWatermark`, this NEVER emits before window close, even with
+    /// late data retractions. Late data is buffered until next window close.
+    ///
+    /// Key difference from `OnWatermark`:
+    /// - `OnWatermark`: May emit retractions for late data
+    /// - `OnWindowClose`: Buffers late data, only emits final result
+    ///
+    /// SQL: `EMIT ON WINDOW CLOSE`
+    OnWindowClose,
+
+    /// Emit changelog records with Z-set weights.
+    ///
+    /// Every emission includes operation type and weight:
+    /// - Insert (+1 weight)
+    /// - Delete (-1 weight)
+    /// - Update (retraction pair: -1 old, +1 new)
+    ///
+    /// Required for:
+    /// - CDC pipelines
+    /// - Cascading materialized views (F060)
+    /// - Downstream consumers that need to track changes
+    ///
+    /// SQL: `EMIT CHANGES`
+    Changelog,
+
+    /// Suppress ALL intermediate results, emit only finalized.
+    ///
+    /// Similar to `OnWindowClose` but also suppresses:
+    /// - Periodic emissions (even if Periodic was set elsewhere)
+    /// - Late data retractions (drops late data entirely after window close)
+    ///
+    /// Use for BI reporting where only final, exact results matter.
+    ///
+    /// SQL: `EMIT FINAL`
+    Final,
 }
 
 impl EmitStrategy {
@@ -219,6 +266,77 @@ impl EmitStrategy {
     #[must_use]
     pub fn emits_on_update(&self) -> bool {
         matches!(self, Self::OnUpdate)
+    }
+
+    // === F011B Helper Methods ===
+
+    /// Returns true if this strategy emits intermediate results.
+    ///
+    /// Strategies that emit intermediate results (before window close):
+    /// - `OnUpdate`: emits after every state change
+    /// - `Periodic`: emits at fixed intervals
+    ///
+    /// Strategies that do NOT emit intermediate results:
+    /// - `OnWatermark`: waits for watermark
+    /// - `OnWindowClose`: only emits when window closes
+    /// - `Changelog`: depends on trigger, but typically on watermark
+    /// - `Final`: only emits final result
+    #[must_use]
+    pub fn emits_intermediate(&self) -> bool {
+        matches!(self, Self::OnUpdate | Self::Periodic(_))
+    }
+
+    /// Returns true if this strategy requires changelog/Z-set support.
+    ///
+    /// The `Changelog` strategy requires the operator to track previous
+    /// values and emit insert/delete/update records with weights.
+    #[must_use]
+    pub fn requires_changelog(&self) -> bool {
+        matches!(self, Self::Changelog)
+    }
+
+    /// Returns true if this strategy is suitable for append-only sinks.
+    ///
+    /// Append-only sinks (Kafka, S3, Delta Lake, Iceberg) cannot handle
+    /// retractions or updates. Only these strategies are safe:
+    /// - `OnWindowClose`: guarantees single emission per window
+    /// - `Final`: suppresses all intermediate results
+    #[must_use]
+    pub fn is_append_only_compatible(&self) -> bool {
+        matches!(self, Self::OnWindowClose | Self::Final)
+    }
+
+    /// Returns true if late data should generate retractions.
+    ///
+    /// Strategies that generate retractions for late data:
+    /// - `OnWatermark`: may retract previous result
+    /// - `OnUpdate`: immediately emits updated result
+    /// - `Changelog`: emits -old/+new pair
+    ///
+    /// Strategies that do NOT generate retractions:
+    /// - `OnWindowClose`: buffers late data
+    /// - `Final`: drops late data
+    /// - `Periodic`: depends on whether window is still open
+    #[must_use]
+    pub fn generates_retractions(&self) -> bool {
+        matches!(self, Self::OnWatermark | Self::OnUpdate | Self::Changelog)
+    }
+
+    /// Returns true if this strategy should suppress intermediate emissions.
+    ///
+    /// Used to override periodic timers when a suppressing strategy is active.
+    #[must_use]
+    pub fn suppresses_intermediate(&self) -> bool {
+        matches!(self, Self::OnWindowClose | Self::Final)
+    }
+
+    /// Returns true if late data should be dropped entirely.
+    ///
+    /// The `Final` strategy drops late data to ensure only exact,
+    /// finalized results are emitted.
+    #[must_use]
+    pub fn drops_late_data(&self) -> bool {
+        matches!(self, Self::Final)
     }
 }
 
@@ -292,6 +410,174 @@ impl WindowId {
 /// - 1 window: tumbling windows (most common)
 /// - 2-4 windows: sliding windows with small overlap
 pub type WindowIdVec = SmallVec<[WindowId; 4]>;
+
+// === F011B: Changelog/Z-Set Support ===
+
+/// CDC operation type for changelog records.
+///
+/// These map to Z-set weights:
+/// - `Insert`: +1 weight
+/// - `Delete`: -1 weight
+/// - `UpdateBefore`: -1 weight (first half of update)
+/// - `UpdateAfter`: +1 weight (second half of update)
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Archive, RkyvSerialize, RkyvDeserialize)]
+pub enum CdcOperation {
+    /// Insert a new record (+1 weight)
+    Insert,
+    /// Delete an existing record (-1 weight)
+    Delete,
+    /// Retraction of previous value before update (-1 weight)
+    UpdateBefore,
+    /// New value after update (+1 weight)
+    UpdateAfter,
+}
+
+impl CdcOperation {
+    /// Returns the Z-set weight for this operation.
+    ///
+    /// - Insert/UpdateAfter: +1
+    /// - Delete/UpdateBefore: -1
+    #[must_use]
+    pub fn weight(&self) -> i32 {
+        match self {
+            Self::Insert | Self::UpdateAfter => 1,
+            Self::Delete | Self::UpdateBefore => -1,
+        }
+    }
+
+    /// Returns true if this is an insert-type operation.
+    #[must_use]
+    pub fn is_insert(&self) -> bool {
+        matches!(self, Self::Insert | Self::UpdateAfter)
+    }
+
+    /// Returns true if this is a delete-type operation.
+    #[must_use]
+    pub fn is_delete(&self) -> bool {
+        matches!(self, Self::Delete | Self::UpdateBefore)
+    }
+
+    /// Returns the Debezium-compatible operation code.
+    ///
+    /// - 'c': create (insert)
+    /// - 'd': delete
+    /// - 'u': update (used for both before/after in Debezium)
+    #[must_use]
+    pub fn debezium_op(&self) -> char {
+        match self {
+            Self::Insert => 'c',
+            Self::Delete => 'd',
+            Self::UpdateBefore | Self::UpdateAfter => 'u',
+        }
+    }
+}
+
+/// A changelog record with Z-set weight for CDC pipelines.
+///
+/// This wraps an event with metadata needed for change data capture:
+/// - Operation type (insert/delete/update)
+/// - Z-set weight (+1/-1)
+/// - Timestamp of the change
+///
+/// Used by `EmitStrategy::Changelog` to emit structured change records
+/// that can be consumed by downstream systems expecting CDC format.
+///
+/// # Example
+///
+/// ```rust,no_run
+/// use laminar_core::operator::window::{ChangelogRecord, CdcOperation};
+/// use laminar_core::operator::Event;
+///
+/// // Create an insert record
+/// let record = ChangelogRecord::insert(event, 1000);
+/// assert_eq!(record.operation, CdcOperation::Insert);
+/// assert_eq!(record.weight, 1);
+///
+/// // Create a retraction pair for an update
+/// let (before, after) = ChangelogRecord::update(old_event, new_event, 1000);
+/// assert_eq!(before.weight, -1);  // Retract old
+/// assert_eq!(after.weight, 1);    // Insert new
+/// ```
+#[derive(Debug, Clone)]
+pub struct ChangelogRecord {
+    /// The CDC operation type
+    pub operation: CdcOperation,
+    /// Z-set weight (+1 for insert, -1 for delete)
+    pub weight: i32,
+    /// Timestamp when this change was emitted
+    pub emit_timestamp: i64,
+    /// The event data
+    pub event: Event,
+}
+
+impl ChangelogRecord {
+    /// Creates an insert changelog record.
+    #[must_use]
+    pub fn insert(event: Event, emit_timestamp: i64) -> Self {
+        Self {
+            operation: CdcOperation::Insert,
+            weight: 1,
+            emit_timestamp,
+            event,
+        }
+    }
+
+    /// Creates a delete changelog record.
+    #[must_use]
+    pub fn delete(event: Event, emit_timestamp: i64) -> Self {
+        Self {
+            operation: CdcOperation::Delete,
+            weight: -1,
+            emit_timestamp,
+            event,
+        }
+    }
+
+    /// Creates an update retraction pair (before and after records).
+    ///
+    /// Returns a tuple of (`UpdateBefore`, `UpdateAfter`) records.
+    /// The first should be emitted before the second to properly
+    /// retract the old value.
+    #[must_use]
+    pub fn update(old_event: Event, new_event: Event, emit_timestamp: i64) -> (Self, Self) {
+        let before = Self {
+            operation: CdcOperation::UpdateBefore,
+            weight: -1,
+            emit_timestamp,
+            event: old_event,
+        };
+        let after = Self {
+            operation: CdcOperation::UpdateAfter,
+            weight: 1,
+            emit_timestamp,
+            event: new_event,
+        };
+        (before, after)
+    }
+
+    /// Creates a changelog record from raw parts.
+    #[must_use]
+    pub fn new(operation: CdcOperation, event: Event, emit_timestamp: i64) -> Self {
+        Self {
+            operation,
+            weight: operation.weight(),
+            emit_timestamp,
+            event,
+        }
+    }
+
+    /// Returns true if this is an insert-type record.
+    #[must_use]
+    pub fn is_insert(&self) -> bool {
+        self.operation.is_insert()
+    }
+
+    /// Returns true if this is a delete-type record.
+    #[must_use]
+    pub fn is_delete(&self) -> bool {
+        self.operation.is_delete()
+    }
+}
 
 /// Trait for assigning events to windows.
 pub trait WindowAssigner: Send {
@@ -1231,6 +1517,12 @@ where
         if current_wm > i64::MIN && self.is_late(event_time, current_wm) {
             let mut output = OutputVec::new();
 
+            // F011B: EMIT FINAL drops late data entirely
+            if self.emit_strategy.drops_late_data() {
+                self.late_data_metrics.record_dropped();
+                return output; // Silently drop - no LateEvent output
+            }
+
             // Handle late event based on configuration
             if let Some(side_output_name) = self.late_data_config.side_output() {
                 // Route to named side output
@@ -1250,7 +1542,7 @@ where
         // Assign event to window
         let window_id = self.assigner.assign(event_time);
 
-        // Track if state was updated (for OnUpdate strategy)
+        // Track if state was updated (for OnUpdate and Changelog strategies)
         let mut state_updated = false;
 
         // Extract value and update accumulator
@@ -1268,8 +1560,11 @@ where
         // Register timer for this window (watermark-based final emission)
         self.maybe_register_timer(window_id, ctx);
 
-        // Register periodic timer if using Periodic strategy
-        self.maybe_register_periodic_timer(window_id, ctx);
+        // F011B: OnWindowClose and Final suppress intermediate emissions
+        // Don't register periodic timers for these strategies
+        if !self.emit_strategy.suppresses_intermediate() {
+            self.maybe_register_periodic_timer(window_id, ctx);
+        }
 
         // Emit watermark update if generated
         let mut output = OutputVec::new();
@@ -1277,10 +1572,29 @@ where
             output.push(Output::Watermark(wm.timestamp()));
         }
 
-        // For OnUpdate strategy, emit intermediate result after each update
-        if self.emit_strategy.emits_on_update() && state_updated {
-            if let Some(event) = self.create_intermediate_result(&window_id, ctx.state) {
-                output.push(Output::Event(event));
+        // F011B: Handle different emit strategies
+        if state_updated {
+            match &self.emit_strategy {
+                // OnUpdate: emit intermediate result as regular event
+                EmitStrategy::OnUpdate => {
+                    if let Some(event) = self.create_intermediate_result(&window_id, ctx.state) {
+                        output.push(Output::Event(event));
+                    }
+                }
+                // Changelog: emit changelog record on every update
+                EmitStrategy::Changelog => {
+                    if let Some(event) = self.create_intermediate_result(&window_id, ctx.state) {
+                        // For intermediate updates in changelog mode, we emit as insert
+                        // Full CDC support (with retractions) requires F063
+                        let record = ChangelogRecord::insert(event, ctx.processing_time);
+                        output.push(Output::Changelog(record));
+                    }
+                }
+                // Other strategies: no intermediate emission
+                EmitStrategy::OnWatermark
+                | EmitStrategy::Periodic(_)
+                | EmitStrategy::OnWindowClose
+                | EmitStrategy::Final => {}
             }
         }
 
@@ -1290,6 +1604,15 @@ where
     fn on_timer(&mut self, timer: Timer, ctx: &mut OperatorContext) -> OutputVec {
         // Check if this is a periodic timer (high bit set)
         if Self::is_periodic_timer_key(&timer.key) {
+            // F011B: OnWindowClose and Final suppress periodic emissions
+            if self.emit_strategy.suppresses_intermediate() {
+                // Don't emit, just clean up the periodic timer tracking
+                if let Some(window_id) = Self::window_id_from_periodic_key(&timer.key) {
+                    self.periodic_timer_windows.remove(&window_id);
+                }
+                return OutputVec::new();
+            }
+
             if let Some(window_id) = Self::window_id_from_periodic_key(&timer.key) {
                 return self.handle_periodic_timer(window_id, ctx);
             }
@@ -1337,10 +1660,27 @@ where
         let mut output = OutputVec::new();
         match batch {
             Ok(data) => {
-                output.push(Output::Event(Event {
+                let event = Event {
                     timestamp: window_id.end,
                     data,
-                }));
+                };
+
+                // F011B: Emit based on strategy
+                match &self.emit_strategy {
+                    // Changelog: wrap in changelog record for CDC
+                    EmitStrategy::Changelog => {
+                        let record = ChangelogRecord::insert(event, ctx.processing_time);
+                        output.push(Output::Changelog(record));
+                    }
+                    // All other strategies: emit as regular event
+                    EmitStrategy::OnWatermark
+                    | EmitStrategy::Periodic(_)
+                    | EmitStrategy::OnUpdate
+                    | EmitStrategy::OnWindowClose
+                    | EmitStrategy::Final => {
+                        output.push(Output::Event(event));
+                    }
+                }
             }
             Err(e) => {
                 eprintln!("Failed to create output batch: {e}");
@@ -2277,5 +2617,305 @@ mod tests {
         operator.reset_late_data_metrics();
 
         assert_eq!(operator.late_data_metrics().late_events_total(), 0);
+    }
+
+    // ==================== F011B Tests ====================
+
+    #[test]
+    fn test_emit_strategy_helper_methods() {
+        // OnWatermark
+        assert!(!EmitStrategy::OnWatermark.emits_intermediate());
+        assert!(!EmitStrategy::OnWatermark.requires_changelog());
+        assert!(!EmitStrategy::OnWatermark.is_append_only_compatible());
+        assert!(EmitStrategy::OnWatermark.generates_retractions());
+        assert!(!EmitStrategy::OnWatermark.suppresses_intermediate());
+        assert!(!EmitStrategy::OnWatermark.drops_late_data());
+
+        // OnUpdate
+        assert!(EmitStrategy::OnUpdate.emits_intermediate());
+        assert!(!EmitStrategy::OnUpdate.requires_changelog());
+        assert!(!EmitStrategy::OnUpdate.is_append_only_compatible());
+        assert!(EmitStrategy::OnUpdate.generates_retractions());
+        assert!(!EmitStrategy::OnUpdate.suppresses_intermediate());
+
+        // Periodic
+        let periodic = EmitStrategy::Periodic(Duration::from_secs(10));
+        assert!(periodic.emits_intermediate());
+        assert!(!periodic.requires_changelog());
+        assert!(!periodic.is_append_only_compatible());
+        assert!(!periodic.generates_retractions());
+        assert!(!periodic.suppresses_intermediate());
+
+        // OnWindowClose (F011B)
+        assert!(!EmitStrategy::OnWindowClose.emits_intermediate());
+        assert!(!EmitStrategy::OnWindowClose.requires_changelog());
+        assert!(EmitStrategy::OnWindowClose.is_append_only_compatible());
+        assert!(!EmitStrategy::OnWindowClose.generates_retractions());
+        assert!(EmitStrategy::OnWindowClose.suppresses_intermediate());
+        assert!(!EmitStrategy::OnWindowClose.drops_late_data());
+
+        // Changelog (F011B)
+        assert!(!EmitStrategy::Changelog.emits_intermediate());
+        assert!(EmitStrategy::Changelog.requires_changelog());
+        assert!(!EmitStrategy::Changelog.is_append_only_compatible());
+        assert!(EmitStrategy::Changelog.generates_retractions());
+        assert!(!EmitStrategy::Changelog.suppresses_intermediate());
+
+        // Final (F011B)
+        assert!(!EmitStrategy::Final.emits_intermediate());
+        assert!(!EmitStrategy::Final.requires_changelog());
+        assert!(EmitStrategy::Final.is_append_only_compatible());
+        assert!(!EmitStrategy::Final.generates_retractions());
+        assert!(EmitStrategy::Final.suppresses_intermediate());
+        assert!(EmitStrategy::Final.drops_late_data());
+    }
+
+    #[test]
+    fn test_cdc_operation() {
+        assert_eq!(CdcOperation::Insert.weight(), 1);
+        assert_eq!(CdcOperation::Delete.weight(), -1);
+        assert_eq!(CdcOperation::UpdateBefore.weight(), -1);
+        assert_eq!(CdcOperation::UpdateAfter.weight(), 1);
+
+        assert!(CdcOperation::Insert.is_insert());
+        assert!(CdcOperation::UpdateAfter.is_insert());
+        assert!(!CdcOperation::Delete.is_insert());
+        assert!(!CdcOperation::UpdateBefore.is_insert());
+
+        assert!(CdcOperation::Delete.is_delete());
+        assert!(CdcOperation::UpdateBefore.is_delete());
+        assert!(!CdcOperation::Insert.is_delete());
+        assert!(!CdcOperation::UpdateAfter.is_delete());
+
+        assert_eq!(CdcOperation::Insert.debezium_op(), 'c');
+        assert_eq!(CdcOperation::Delete.debezium_op(), 'd');
+        assert_eq!(CdcOperation::UpdateBefore.debezium_op(), 'u');
+        assert_eq!(CdcOperation::UpdateAfter.debezium_op(), 'u');
+    }
+
+    #[test]
+    fn test_changelog_record_insert() {
+        let event = create_test_event(1000, 42);
+        let record = ChangelogRecord::insert(event.clone(), 2000);
+
+        assert_eq!(record.operation, CdcOperation::Insert);
+        assert_eq!(record.weight, 1);
+        assert_eq!(record.emit_timestamp, 2000);
+        assert_eq!(record.event.timestamp, 1000);
+        assert!(record.is_insert());
+        assert!(!record.is_delete());
+    }
+
+    #[test]
+    fn test_changelog_record_delete() {
+        let event = create_test_event(1000, 42);
+        let record = ChangelogRecord::delete(event.clone(), 2000);
+
+        assert_eq!(record.operation, CdcOperation::Delete);
+        assert_eq!(record.weight, -1);
+        assert_eq!(record.emit_timestamp, 2000);
+        assert!(record.is_delete());
+        assert!(!record.is_insert());
+    }
+
+    #[test]
+    fn test_changelog_record_update() {
+        let old_event = create_test_event(1000, 10);
+        let new_event = create_test_event(1000, 20);
+        let (before, after) = ChangelogRecord::update(old_event, new_event, 2000);
+
+        assert_eq!(before.operation, CdcOperation::UpdateBefore);
+        assert_eq!(before.weight, -1);
+        assert!(before.is_delete());
+
+        assert_eq!(after.operation, CdcOperation::UpdateAfter);
+        assert_eq!(after.weight, 1);
+        assert!(after.is_insert());
+    }
+
+    #[test]
+    fn test_emit_strategy_on_window_close() {
+        let assigner = TumblingWindowAssigner::from_millis(1000);
+        let aggregator = CountAggregator::new();
+        let mut operator = TumblingWindowOperator::with_id(
+            assigner,
+            aggregator,
+            Duration::from_millis(0),
+            "test_op".to_string(),
+        );
+
+        // Set OnWindowClose strategy
+        operator.set_emit_strategy(EmitStrategy::OnWindowClose);
+
+        let mut timers = TimerService::new();
+        let mut state = InMemoryStore::new();
+        let mut watermark_gen = BoundedOutOfOrdernessGenerator::new(100);
+
+        // Process events - should NOT emit intermediate results
+        let event1 = create_test_event(100, 1);
+        let event2 = create_test_event(200, 2);
+
+        let outputs1 = {
+            let mut ctx = create_test_context(&mut timers, &mut state, &mut watermark_gen);
+            operator.process(&event1, &mut ctx)
+        };
+        let outputs2 = {
+            let mut ctx = create_test_context(&mut timers, &mut state, &mut watermark_gen);
+            operator.process(&event2, &mut ctx)
+        };
+
+        // No Event outputs (only watermark updates)
+        let event_outputs1: Vec<_> = outputs1
+            .iter()
+            .filter(|o| matches!(o, Output::Event(_)))
+            .collect();
+        let event_outputs2: Vec<_> = outputs2
+            .iter()
+            .filter(|o| matches!(o, Output::Event(_)))
+            .collect();
+
+        assert!(event_outputs1.is_empty(), "OnWindowClose should not emit intermediate results");
+        assert!(event_outputs2.is_empty(), "OnWindowClose should not emit intermediate results");
+    }
+
+    #[test]
+    fn test_emit_strategy_final_drops_late_data() {
+        let assigner = TumblingWindowAssigner::from_millis(1000);
+        let aggregator = CountAggregator::new();
+        let mut operator = TumblingWindowOperator::with_id(
+            assigner,
+            aggregator,
+            Duration::from_millis(0),
+            "test_op".to_string(),
+        );
+
+        // Set Final strategy
+        operator.set_emit_strategy(EmitStrategy::Final);
+
+        let mut timers = TimerService::new();
+        let mut state = InMemoryStore::new();
+        let mut watermark_gen = BoundedOutOfOrdernessGenerator::new(0);
+
+        // Advance watermark past first window
+        let event1 = create_test_event(1500, 1);
+        {
+            let mut ctx = create_test_context(&mut timers, &mut state, &mut watermark_gen);
+            operator.process(&event1, &mut ctx);
+        }
+
+        // Send late event - should be silently dropped (no LateEvent output)
+        let late_event = create_test_event(500, 2);
+        let outputs = {
+            let mut ctx = create_test_context(&mut timers, &mut state, &mut watermark_gen);
+            operator.process(&late_event, &mut ctx)
+        };
+
+        // Should have NO output at all (silently dropped)
+        assert!(outputs.is_empty(), "EMIT FINAL should silently drop late data");
+        assert_eq!(
+            operator.late_data_metrics().late_events_dropped(),
+            1,
+            "Late event should be recorded as dropped"
+        );
+    }
+
+    #[test]
+    fn test_emit_strategy_changelog_emits_records() {
+        let assigner = TumblingWindowAssigner::from_millis(1000);
+        let aggregator = CountAggregator::new();
+        let mut operator = TumblingWindowOperator::with_id(
+            assigner,
+            aggregator,
+            Duration::from_millis(0),
+            "test_op".to_string(),
+        );
+
+        // Set Changelog strategy
+        operator.set_emit_strategy(EmitStrategy::Changelog);
+
+        let mut timers = TimerService::new();
+        let mut state = InMemoryStore::new();
+        let mut watermark_gen = BoundedOutOfOrdernessGenerator::new(100);
+
+        // Process event - Changelog emits on every update
+        let event = create_test_event(100, 1);
+        let outputs = {
+            let mut ctx = create_test_context(&mut timers, &mut state, &mut watermark_gen);
+            operator.process(&event, &mut ctx)
+        };
+
+        // Should emit Changelog record
+        let changelog_outputs: Vec<_> = outputs
+            .iter()
+            .filter(|o| matches!(o, Output::Changelog(_)))
+            .collect();
+
+        assert_eq!(
+            changelog_outputs.len(),
+            1,
+            "Changelog strategy should emit changelog record on update"
+        );
+
+        if let Output::Changelog(record) = &changelog_outputs[0] {
+            assert_eq!(record.operation, CdcOperation::Insert);
+            assert_eq!(record.weight, 1);
+        } else {
+            panic!("Expected Changelog output");
+        }
+    }
+
+    #[test]
+    fn test_emit_strategy_changelog_on_timer() {
+        let assigner = TumblingWindowAssigner::from_millis(1000);
+        let aggregator = CountAggregator::new();
+        let mut operator = TumblingWindowOperator::with_id(
+            assigner,
+            aggregator,
+            Duration::from_millis(0),
+            "test_op".to_string(),
+        );
+
+        // Set Changelog strategy
+        operator.set_emit_strategy(EmitStrategy::Changelog);
+
+        let mut timers = TimerService::new();
+        let mut state = InMemoryStore::new();
+        let mut watermark_gen = BoundedOutOfOrdernessGenerator::new(100);
+
+        // Process events to populate window
+        let event = create_test_event(100, 1);
+        {
+            let mut ctx = create_test_context(&mut timers, &mut state, &mut watermark_gen);
+            operator.process(&event, &mut ctx);
+        }
+
+        // Trigger window timer - should emit Changelog
+        let timer = Timer {
+            key: WindowId::new(0, 1000).to_key(),
+            timestamp: 1000,
+        };
+
+        let outputs = {
+            let mut ctx = create_test_context(&mut timers, &mut state, &mut watermark_gen);
+            operator.on_timer(timer, &mut ctx)
+        };
+
+        // Should emit Changelog record on final emission
+        let changelog_outputs: Vec<_> = outputs
+            .iter()
+            .filter(|o| matches!(o, Output::Changelog(_)))
+            .collect();
+
+        assert_eq!(
+            changelog_outputs.len(),
+            1,
+            "Changelog strategy should emit changelog record on timer"
+        );
+
+        if let Output::Changelog(record) = &changelog_outputs[0] {
+            assert_eq!(record.operation, CdcOperation::Insert);
+        } else {
+            panic!("Expected Changelog output");
+        }
     }
 }

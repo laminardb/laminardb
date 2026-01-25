@@ -124,6 +124,8 @@ impl LateDataClause {
 /// See `laminar_core::operator::window::EmitStrategy` for the runtime representation.
 #[derive(Debug, Clone, PartialEq)]
 pub enum EmitClause {
+    // === Existing (F011) ===
+
     /// EMIT AFTER WATERMARK (or EMIT ON WATERMARK)
     ///
     /// Emit results when the watermark passes the window end.
@@ -132,7 +134,9 @@ pub enum EmitClause {
 
     /// EMIT ON WINDOW CLOSE
     ///
-    /// Synonym for `AfterWatermark` - emit when window closes.
+    /// For append-only sinks (Kafka, S3, Delta Lake, Iceberg).
+    /// Only emits when window closes, no intermediate results.
+    /// Unlike `AfterWatermark`, this is NOT a synonym - it has distinct behavior.
     OnWindowClose,
 
     /// EMIT EVERY INTERVAL 'N' unit (or EMIT PERIODICALLY)
@@ -149,6 +153,29 @@ pub enum EmitClause {
     /// Emit updated results after every state change.
     /// This provides lowest latency but highest overhead.
     OnUpdate,
+
+    // === New (F011B) ===
+
+    /// EMIT CHANGES
+    ///
+    /// Emit changelog records with Z-set weights for CDC pipelines.
+    /// Every emission includes operation type and weight:
+    /// - Insert (+1 weight)
+    /// - Delete (-1 weight)
+    /// - Update (retraction pair: -1 old, +1 new)
+    ///
+    /// Required for:
+    /// - CDC pipelines
+    /// - Cascading materialized views
+    /// - Downstream consumers that need to track changes
+    Changes,
+
+    /// EMIT FINAL
+    ///
+    /// Suppress ALL intermediate results, emit only finalized.
+    /// Also drops late data entirely after window close.
+    /// Use for BI reporting where only final, exact results matter.
+    Final,
 }
 
 /// Window function types

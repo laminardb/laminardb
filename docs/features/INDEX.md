@@ -6,11 +6,11 @@
 |-------|-------|-------|-------------|-----------|------|
 | Phase 1 | 12 | 0 | 0 | 1 | 11 |
 | Phase 1.5 | 1 | 1 | 0 | 0 | 0 |
-| Phase 2 | 29 | 19 | 0 | 0 | 10 |
+| Phase 2 | 29 | 18 | 0 | 0 | 11 |
 | Phase 3 | 12 | 12 | 0 | 0 | 0 |
 | Phase 4 | 11 | 11 | 0 | 0 | 0 |
 | Phase 5 | 10 | 10 | 0 | 0 | 0 |
-| **Total** | **75** | **53** | **0** | **1** | **21** |
+| **Total** | **75** | **52** | **0** | **1** | **22** |
 
 ## Status Legend
 
@@ -107,7 +107,7 @@
 | F059 | FIRST/LAST Value Aggregates | P0 | 📝 | [Link](phase-2/F059-first-last-aggregates.md) |
 | F060 | Cascading Materialized Views | P1 | 📝 | [Link](phase-2/F060-cascading-materialized-views.md) |
 | F062 | Per-Core WAL Segments | P1 | 📝 | [Link](phase-2/F062-per-core-wal.md) |
-| **F011B** | **EMIT Clause Extension** | **P0** | 📝 | [Link](phase-2/F011B-emit-clause-extension.md) |
+| **F011B** | **EMIT Clause Extension** | **P0** | ✅ | [Link](phase-2/F011B-emit-clause-extension.md) |
 | **F063** | **Changelog/Retraction (Z-Sets)** | **P0** | 📝 | [Link](phase-2/F063-changelog-retraction.md) |
 | **F064** | **Per-Partition Watermarks** | **P1** | 📝 | [Link](phase-2/F064-per-partition-watermarks.md) |
 | **F065** | **Keyed Watermarks** | **P1** | 📝 | [Link](phase-2/F065-keyed-watermarks.md) |

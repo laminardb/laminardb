@@ -47,8 +47,8 @@
 //! ```
 
 use super::window::{
-    Accumulator, Aggregator, EmitStrategy, LateDataConfig, LateDataMetrics, ResultToI64,
-    WindowAssigner, WindowId, WindowIdVec,
+    Accumulator, Aggregator, ChangelogRecord, EmitStrategy, LateDataConfig, LateDataMetrics,
+    ResultToI64, WindowAssigner, WindowId, WindowIdVec,
 };
 use super::{
     Event, Operator, OperatorContext, OperatorError, OperatorState, Output, OutputVec, Timer,
@@ -608,6 +608,12 @@ where
         if current_wm > i64::MIN && self.is_late(event_time, current_wm) {
             let mut output = OutputVec::new();
 
+            // F011B: EMIT FINAL drops late data entirely
+            if self.emit_strategy.drops_late_data() {
+                self.late_data_metrics.record_dropped();
+                return output; // Silently drop - no LateEvent output
+            }
+
             if let Some(side_output_name) = self.late_data_config.side_output() {
                 self.late_data_metrics.record_side_output();
                 output.push(Output::SideOutput {
@@ -624,7 +630,7 @@ where
         // Assign event to all overlapping windows
         let windows = self.assigner.assign_windows(event_time);
 
-        // Track windows that were updated (for OnUpdate strategy)
+        // Track windows that were updated (for OnUpdate and Changelog strategies)
         let mut updated_windows = Vec::new();
 
         // Update accumulator for each window
@@ -646,7 +652,11 @@ where
 
             // Register timers for this window
             self.maybe_register_timer(*window_id, ctx);
-            self.maybe_register_periodic_timer(*window_id, ctx);
+
+            // F011B: OnWindowClose and Final suppress intermediate emissions
+            if !self.emit_strategy.suppresses_intermediate() {
+                self.maybe_register_periodic_timer(*window_id, ctx);
+            }
         }
 
         // Build output
@@ -657,12 +667,31 @@ where
             output.push(Output::Watermark(wm.timestamp()));
         }
 
-        // For OnUpdate strategy, emit intermediate results for all updated windows
-        if self.emit_strategy.emits_on_update() {
-            for window_id in &updated_windows {
-                if let Some(event) = self.create_intermediate_result(window_id, ctx.state) {
-                    output.push(Output::Event(event));
+        // F011B: Handle different emit strategies for intermediate emissions
+        if !updated_windows.is_empty() {
+            match &self.emit_strategy {
+                // OnUpdate: emit intermediate result as regular event
+                EmitStrategy::OnUpdate => {
+                    for window_id in &updated_windows {
+                        if let Some(event) = self.create_intermediate_result(window_id, ctx.state) {
+                            output.push(Output::Event(event));
+                        }
+                    }
                 }
+                // Changelog: emit changelog record on every update
+                EmitStrategy::Changelog => {
+                    for window_id in &updated_windows {
+                        if let Some(event) = self.create_intermediate_result(window_id, ctx.state) {
+                            let record = ChangelogRecord::insert(event, ctx.processing_time);
+                            output.push(Output::Changelog(record));
+                        }
+                    }
+                }
+                // Other strategies: no intermediate emission
+                EmitStrategy::OnWatermark
+                | EmitStrategy::Periodic(_)
+                | EmitStrategy::OnWindowClose
+                | EmitStrategy::Final => {}
             }
         }
 
@@ -672,6 +701,15 @@ where
     fn on_timer(&mut self, timer: Timer, ctx: &mut OperatorContext) -> OutputVec {
         // Check if this is a periodic timer
         if Self::is_periodic_timer_key(&timer.key) {
+            // F011B: OnWindowClose and Final suppress periodic emissions
+            if self.emit_strategy.suppresses_intermediate() {
+                // Don't emit, just clean up the periodic timer tracking
+                if let Some(window_id) = Self::window_id_from_periodic_key(&timer.key) {
+                    self.periodic_timer_windows.remove(&window_id);
+                }
+                return OutputVec::new();
+            }
+
             if let Some(window_id) = Self::window_id_from_periodic_key(&timer.key) {
                 return self.handle_periodic_timer(window_id, ctx);
             }
@@ -718,10 +756,27 @@ where
         let mut output = OutputVec::new();
         match batch {
             Ok(data) => {
-                output.push(Output::Event(Event {
+                let event = Event {
                     timestamp: window_id.end,
                     data,
-                }));
+                };
+
+                // F011B: Emit based on strategy
+                match &self.emit_strategy {
+                    // Changelog: wrap in changelog record for CDC
+                    EmitStrategy::Changelog => {
+                        let record = ChangelogRecord::insert(event, ctx.processing_time);
+                        output.push(Output::Changelog(record));
+                    }
+                    // All other strategies: emit as regular event
+                    EmitStrategy::OnWatermark
+                    | EmitStrategy::Periodic(_)
+                    | EmitStrategy::OnUpdate
+                    | EmitStrategy::OnWindowClose
+                    | EmitStrategy::Final => {
+                        output.push(Output::Event(event));
+                    }
+                }
             }
             Err(e) => {
                 eprintln!("Failed to create output batch: {e}");

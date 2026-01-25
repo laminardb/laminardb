@@ -136,6 +136,8 @@ impl StreamingParser {
     /// - `EMIT ON WINDOW CLOSE`
     /// - `EMIT EVERY INTERVAL 'N' SECOND|MINUTE|HOUR` or `EMIT PERIODICALLY INTERVAL ...`
     /// - `EMIT ON UPDATE`
+    /// - `EMIT CHANGES` (F011B)
+    /// - `EMIT FINAL` (F011B)
     ///
     /// # Errors
     ///
@@ -163,6 +165,16 @@ impl StreamingParser {
         // EMIT ON UPDATE
         if emit_clause.contains("ON UPDATE") {
             return Ok(Some(EmitClause::OnUpdate));
+        }
+
+        // F011B: EMIT CHANGES (changelog/Z-set)
+        if emit_clause.starts_with("EMIT CHANGES") {
+            return Ok(Some(EmitClause::Changes));
+        }
+
+        // F011B: EMIT FINAL (suppress intermediate)
+        if emit_clause.starts_with("EMIT FINAL") {
+            return Ok(Some(EmitClause::Final));
         }
 
         // EMIT EVERY INTERVAL or EMIT PERIODICALLY INTERVAL
@@ -523,5 +535,67 @@ mod tests {
         assert!(clause.is_some());
         let clause = clause.unwrap();
         assert_eq!(clause.side_output, Some("my_side_output".to_string()));
+    }
+
+    // ==================== F011B Tests ====================
+
+    #[test]
+    fn test_emit_clause_changes() {
+        let emit = StreamingParser::parse_emit_clause("SELECT * EMIT CHANGES").unwrap();
+        assert!(matches!(emit, Some(EmitClause::Changes)));
+    }
+
+    #[test]
+    fn test_emit_clause_final() {
+        let emit = StreamingParser::parse_emit_clause("SELECT * EMIT FINAL").unwrap();
+        assert!(matches!(emit, Some(EmitClause::Final)));
+    }
+
+    #[test]
+    fn test_continuous_query_with_emit_changes() {
+        let sql = "CREATE CONTINUOUS QUERY cdc_pipeline AS SELECT * FROM orders EMIT CHANGES";
+        let statements = StreamingParser::parse_sql(sql).unwrap();
+        assert_eq!(statements.len(), 1);
+
+        match &statements[0] {
+            StreamingStatement::CreateContinuousQuery { emit_clause, .. } => {
+                assert!(matches!(emit_clause, Some(EmitClause::Changes)));
+            }
+            _ => panic!("Expected CreateContinuousQuery"),
+        }
+    }
+
+    #[test]
+    fn test_continuous_query_with_emit_final() {
+        let sql = "CREATE CONTINUOUS QUERY bi_report AS SELECT SUM(amount) FROM sales EMIT FINAL";
+        let statements = StreamingParser::parse_sql(sql).unwrap();
+        assert_eq!(statements.len(), 1);
+
+        match &statements[0] {
+            StreamingStatement::CreateContinuousQuery { emit_clause, .. } => {
+                assert!(matches!(emit_clause, Some(EmitClause::Final)));
+            }
+            _ => panic!("Expected CreateContinuousQuery"),
+        }
+    }
+
+    #[test]
+    fn test_emit_on_window_close_is_distinct() {
+        // Test that ON WINDOW CLOSE is parsed correctly
+        let emit1 = StreamingParser::parse_emit_clause("SELECT * EMIT ON WINDOW CLOSE").unwrap();
+        assert!(matches!(emit1, Some(EmitClause::OnWindowClose)));
+
+        // Test that it's distinct from AFTER WATERMARK
+        let emit2 = StreamingParser::parse_emit_clause("SELECT * EMIT AFTER WATERMARK").unwrap();
+        assert!(matches!(emit2, Some(EmitClause::AfterWatermark)));
+
+        // They should be different variants - compare the inner enum
+        let inner1 = emit1.unwrap();
+        let inner2 = emit2.unwrap();
+        assert_ne!(
+            std::mem::discriminant(&inner1),
+            std::mem::discriminant(&inner2),
+            "OnWindowClose and AfterWatermark should be distinct"
+        );
     }
 }

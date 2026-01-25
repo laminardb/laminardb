@@ -8,24 +8,24 @@
 
 ### Sprint Priority: Phase 2 In Progress
 
-Phase 1 P0 hardening is complete. Phase 2 is underway with 7/28 features complete.
+Phase 1 P0 hardening is complete. Phase 2 is underway with 11/29 features complete.
 
-**Completed**: F013 (Thread-Per-Core), F014 (SPSC), F015 (CPU Pinning), F016 (Sliding Windows), F018 (Hopping), F019 (Stream-Stream Joins), F020 (Lookup Joins)
+**Completed**: F013 (Thread-Per-Core), F014 (SPSC), F015 (CPU Pinning), F016 (Sliding Windows), F018 (Hopping), F019 (Stream-Stream Joins), F020 (Lookup Joins), F067 (io_uring), F068 (NUMA), F071 (Zero-Alloc), F011B (EMIT Extension)
 
 **Next Priority** (updated based on research reviews):
 
 **Thread-Per-Core Optimizations** (from [TPC 2026 Research](research/laminardb-thread-per-core-2026-research.md)):
-1. **F071 (Zero-Allocation Enforcement)** - P0, debug detector + CI - verify hot path constraints
-2. **F067 (io_uring Advanced)** - P0, SQPOLL + registered buffers - 2.05x improvement
-3. **F068 (NUMA-Aware Memory)** - P0, per-core local allocation - 2-3x latency fix
+1. ~~**F071 (Zero-Allocation Enforcement)**~~ - ✅ COMPLETE
+2. ~~**F067 (io_uring Advanced)**~~ - ✅ COMPLETE
+3. ~~**F068 (NUMA-Aware Memory)**~~ - ✅ COMPLETE
 4. F070 (Task Budget Enforcement) - P1, latency SLA guarantees
 5. F069 (Three-Ring I/O) - P1, latency/main/poll ring separation
 
 **Emit & Checkpoint** (from [Emit Patterns Research](research/emit-patterns-research-2026.md)):
-6. **F011B (EMIT Clause Extension)** - P0, OnWindowClose/Changelog/Final - blocks F023
+6. ~~**F011B (EMIT Clause Extension)**~~ - ✅ COMPLETE - OnWindowClose/Changelog/Final
 7. **F063 (Changelog/Retraction)** - P0, Z-set foundation - blocks F023, F060
 8. F059 (FIRST/LAST Value Aggregates) - P0, essential for OHLC
-9. F023 (Exactly-Once Sinks) - P0, depends on F011B + F063
+9. F023 (Exactly-Once Sinks) - P0, depends on F063 (F011B complete)
 10. F022 (Incremental Checkpointing) - P1, async checkpoint + RocksDB
 11. F062 (Per-Core WAL) - P1, required for F013 integration
 

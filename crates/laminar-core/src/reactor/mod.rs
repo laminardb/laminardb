@@ -543,6 +543,16 @@ impl Sink for StdoutSink {
                         name, event.timestamp, event.data
                     );
                 }
+                Output::Changelog(record) => {
+                    println!(
+                        "Changelog: op={:?}, weight={}, emit_ts={}, event_ts={}, data={:?}",
+                        record.operation,
+                        record.weight,
+                        record.emit_timestamp,
+                        record.event.timestamp,
+                        record.event.data
+                    );
+                }
             }
         }
         Ok(())

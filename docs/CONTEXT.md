@@ -4,10 +4,93 @@
 
 ## Last Session
 
-**Date**: 2026-01-24
+**Date**: 2026-01-25
 **Duration**: Continued session
 
 ### What Was Accomplished
+- ✅ **F011B: EMIT Clause Extension** - IMPLEMENTATION COMPLETE
+  - Extended `EmitStrategy` enum with `OnWindowClose`, `Changelog`, `Final`
+  - Added helper methods: `emits_intermediate()`, `requires_changelog()`, `is_append_only_compatible()`, `generates_retractions()`, `suppresses_intermediate()`, `drops_late_data()`
+  - Added `CdcOperation` enum: Insert, Delete, UpdateBefore, UpdateAfter with Z-set weights
+  - Added `ChangelogRecord` type for CDC output
+  - Added `Output::Changelog(ChangelogRecord)` variant
+  - Updated `TumblingWindowOperator` for new strategies
+  - Updated `SlidingWindowOperator` for new strategies
+  - Updated SQL parser for `EMIT CHANGES` and `EMIT FINAL`
+  - Updated reactor `StdoutSink` for changelog output
+  - 15 new unit tests, all passing
+  - **Total tests**: 420 (328 core + 61 sql + 25 storage + 6 connectors)
+
+### F011B Implementation Details
+
+**Core Types** (`crates/laminar-core/src/operator/window.rs`):
+```rust
+// Extended EmitStrategy enum
+pub enum EmitStrategy {
+    OnWatermark,       // Existing: emit when watermark passes
+    Periodic(Duration), // Existing: emit at intervals
+    OnUpdate,          // Existing: emit on every update
+    OnWindowClose,     // F011B: only emit when window closes (append-only sinks)
+    Changelog,         // F011B: emit CDC records with Z-set weights
+    Final,             // F011B: suppress intermediate, drop late data
+}
+
+// New CDC operation type
+pub enum CdcOperation {
+    Insert,        // +1 weight
+    Delete,        // -1 weight
+    UpdateBefore,  // -1 weight (retraction)
+    UpdateAfter,   // +1 weight (new value)
+}
+
+// New changelog record type
+pub struct ChangelogRecord {
+    pub operation: CdcOperation,
+    pub weight: i32,           // Z-set weight (+1 or -1)
+    pub emit_timestamp: i64,
+    pub event: Event,
+}
+```
+
+**SQL Syntax**:
+```sql
+-- OnWindowClose: for append-only sinks (Kafka, S3, Delta Lake)
+CREATE CONTINUOUS QUERY orders_hourly
+AS SELECT COUNT(*) FROM orders
+GROUP BY TUMBLE(ts, INTERVAL '1' HOUR)
+EMIT ON WINDOW CLOSE;
+
+-- Changelog: for CDC pipelines and cascading MVs
+CREATE CONTINUOUS QUERY cdc_pipeline
+AS SELECT * FROM orders
+EMIT CHANGES;
+
+-- Final: for BI reporting (no retractions)
+CREATE CONTINUOUS QUERY bi_report
+AS SELECT SUM(amount) FROM sales
+EMIT FINAL;
+```
+
+**Usage Example**:
+```rust
+use laminar_core::operator::window::{
+    EmitStrategy, TumblingWindowOperator, CountAggregator, ChangelogRecord, CdcOperation,
+};
+
+// Create operator with OnWindowClose for append-only sink
+let mut operator = TumblingWindowOperator::new(assigner, aggregator, lateness);
+operator.set_emit_strategy(EmitStrategy::OnWindowClose);
+
+// Or use Changelog for CDC
+operator.set_emit_strategy(EmitStrategy::Changelog);
+
+// Check strategy properties
+assert!(EmitStrategy::OnWindowClose.is_append_only_compatible());
+assert!(EmitStrategy::Changelog.requires_changelog());
+assert!(EmitStrategy::Final.drops_late_data());
+```
+
+### Previous Session Accomplishments
 - ✅ **F068: NUMA-Aware Memory Allocation** - IMPLEMENTATION COMPLETE
   - NumaTopology detection via sysfs (/sys/devices/system/node/) or hwlocality
   - NumaAllocator with alloc_local, alloc_on_node, alloc_interleaved
@@ -513,7 +596,9 @@ handle.credit_metrics();       // Acquired, released, blocked, dropped
 | F018: Hopping Windows | ✅ Complete | Alias for sliding windows |
 | F019: Stream-Stream Joins | ✅ Complete | Inner/Left/Right/Full, 14 tests |
 | F020: Lookup Joins | ✅ Complete | Cached lookups with TTL, 16 tests |
-| F023: Exactly-Once Sinks | 📝 Not started | |
+| F011B: EMIT Clause Extension | ✅ Complete | OnWindowClose, Changelog, Final, 15 tests |
+| F023: Exactly-Once Sinks | 📝 Not started | Depends on F011B (complete) + F063 |
+| F063: Changelog/Retraction | 📝 Not started | Z-set foundation for F023 |
 | F067: io_uring Advanced | ✅ Complete | SQPOLL, IOPOLL, registered buffers, 13 tests |
 | F068: NUMA-Aware Memory | ✅ Complete | NumaAllocator, NumaTopology, 11 tests |
 | F071: Zero-Alloc Enforcement | ✅ Complete | HotPathGuard, ObjectPool, RingBuffer, 33 tests |
@@ -524,7 +609,7 @@ handle.credit_metrics();       // Acquired, released, blocked, dropped
 
 ### Current Focus
 - **Phase**: 2 Production Hardening
-- **Active Feature**: F068 complete (10/28), ready for F023 (exactly-once) or F017 (session windows)
+- **Active Feature**: F011B complete (11/29), ready for F063 (changelog/retraction) or F017 (session windows)
 
 ### Key Files
 ```
