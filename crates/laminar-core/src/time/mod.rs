@@ -107,11 +107,50 @@
 //! // But events for tenant_a at 3000 ARE late (their key watermark is 10000)
 //! assert!(tracker.is_late(&"tenant_a".to_string(), 3000));
 //! ```
+//!
+//! ## Watermark Alignment Groups (F066)
+//!
+//! For stream-stream joins and multi-source operators, use [`WatermarkAlignmentGroup`]
+//! to prevent unbounded state growth when sources have different processing speeds:
+//!
+//! ```rust
+//! use laminar_core::time::{
+//!     WatermarkAlignmentGroup, AlignmentGroupConfig, AlignmentGroupId,
+//!     EnforcementMode, AlignmentAction,
+//! };
+//! use std::time::Duration;
+//!
+//! let config = AlignmentGroupConfig::new("orders-payments")
+//!     .with_max_drift(Duration::from_secs(300)); // 5 minute max drift
+//!
+//! let mut group = WatermarkAlignmentGroup::new(config);
+//! group.register_source(0); // orders
+//! group.register_source(1); // payments
+//!
+//! // Both start at 0
+//! group.report_watermark(0, 0);
+//! group.report_watermark(1, 0);
+//!
+//! // Orders advances within limit - OK
+//! let action = group.report_watermark(0, 200_000); // 200 seconds
+//! assert_eq!(action, AlignmentAction::Continue);
+//!
+//! // Orders advances beyond limit - PAUSED
+//! let action = group.report_watermark(0, 400_000); // 400 seconds (drift > 300)
+//! assert_eq!(action, AlignmentAction::Pause);
+//! ```
 
+mod alignment_group;
 mod event_time;
 mod keyed_watermark;
 mod partitioned_watermark;
 mod watermark;
+
+pub use alignment_group::{
+    AlignmentAction, AlignmentError, AlignmentGroupConfig, AlignmentGroupCoordinator,
+    AlignmentGroupId, AlignmentGroupMetrics, AlignmentSourceState, EnforcementMode,
+    WatermarkAlignmentGroup,
+};
 
 pub use event_time::{
     EventTimeError, EventTimeExtractor, ExtractionMode, TimestampField, TimestampFormat,

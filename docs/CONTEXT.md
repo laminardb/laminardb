@@ -8,6 +8,7 @@
 **Date**: 2026-01-25
 
 ### What Was Accomplished
+- F066: Watermark Alignment Groups - complete (25 tests, Pause/WarnOnly/DropExcess modes, coordinator)
 - F021: Temporal Joins - complete (22 tests, event-time/process-time, append-only/non-append-only)
 - F024: Two-Phase Commit - complete (20 new tests, presumed abort semantics, crash recovery)
 - F057: Stream Join Optimizations - complete (15 new tests, CPU-friendly encoding, asymmetric compaction, per-key tracking)
@@ -21,14 +22,13 @@
 - F062: Per-Core WAL Segments - complete
 - F022: Incremental Checkpointing - complete
 
-**Total tests**: 874 (687 core + 61 sql + 120 storage + 6 connectors)
+**Total tests**: 899 (712 core + 61 sql + 120 storage + 6 connectors)
 
 ### Where We Left Off
-Phase 2 Production Hardening: 27/29 features complete (93%).
+Phase 2 Production Hardening: 28/29 features complete (97%).
 
 ### Immediate Next Steps
-1. F066: Watermark Alignment Groups (P2)
-2. F072: XDP/eBPF Network Optimization (P2)
+1. F072: XDP/eBPF Network Optimization (P2)
 
 ### Open Issues
 None - Phase 2 underway.
@@ -66,6 +66,7 @@ None - Phase 2 underway.
 | F057: Stream Join Optimizations | Done | CPU-friendly encoding, asymmetric compaction, per-key tracking |
 | F024: Two-Phase Commit | Done | Presumed abort, crash recovery, 20 tests |
 | F021: Temporal Joins | Done | Event-time/process-time, append-only/non-append-only, 22 tests |
+| F066: Watermark Alignment Groups | Done | Pause/WarnOnly/DropExcess, coordinator, 25 tests |
 
 ---
 
@@ -74,7 +75,8 @@ None - Phase 2 underway.
 ### Key Modules
 ```
 laminar-core/src/
-  time/         # F010, F064, F065: Watermarks, partitioned + keyed tracking
+  time/         # F010, F064, F065, F066: Watermarks, partitioned + keyed + alignment
+    alignment_group # F066: Watermark alignment groups
   mv/           # F060: Cascading MVs
   budget/       # F070: Task budgets
   sink/         # F023: Exactly-once sinks

@@ -6,11 +6,11 @@
 |-------|-------|-------|-------------|-----------|------|
 | Phase 1 | 12 | 0 | 0 | 1 | 11 |
 | Phase 1.5 | 1 | 1 | 0 | 0 | 0 |
-| Phase 2 | 29 | 3 | 0 | 0 | 26 |
+| Phase 2 | 29 | 2 | 0 | 0 | 27 |
 | Phase 3 | 12 | 12 | 0 | 0 | 0 |
 | Phase 4 | 11 | 11 | 0 | 0 | 0 |
 | Phase 5 | 10 | 10 | 0 | 0 | 0 |
-| **Total** | **75** | **37** | **0** | **1** | **37** |
+| **Total** | **75** | **36** | **0** | **1** | **38** |
 
 ## Status Legend
 
@@ -86,7 +86,7 @@
 
 ## Phase 2: Production Hardening
 
-> **Status**: 🚧 In Progress (23/29 features complete)
+> **Status**: 🚧 In Progress (28/29 features complete)
 
 | ID | Feature | Priority | Status | Spec |
 |----|---------|----------|--------|------|
@@ -111,7 +111,7 @@
 | **F063** | **Changelog/Retraction (Z-Sets)** | **P0** | ✅ | [Link](phase-2/F063-changelog-retraction.md) |
 | **F064** | **Per-Partition Watermarks** | **P1** | ✅ | [Link](phase-2/F064-per-partition-watermarks.md) |
 | **F065** | **Keyed Watermarks** | **P1** | ✅ | [Link](phase-2/F065-keyed-watermarks.md) |
-| **F066** | **Watermark Alignment Groups** | **P2** | 📝 | [Link](phase-2/F066-watermark-alignment-groups.md) |
+| **F066** | **Watermark Alignment Groups** | **P2** | ✅ | [Link](phase-2/F066-watermark-alignment-groups.md) |
 | **F067** | **io_uring Advanced Optimization** | **P0** | ✅ | [Link](phase-2/F067-io-uring-optimization.md) |
 | **F068** | **NUMA-Aware Memory Allocation** | **P0** | ✅ | [Link](phase-2/F068-numa-aware-memory.md) |
 | **F069** | **Three-Ring I/O Architecture** | **P1** | ✅ | [Link](phase-2/F069-three-ring-io.md) |
