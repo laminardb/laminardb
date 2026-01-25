@@ -5,7 +5,7 @@
 | Field | Value |
 |-------|-------|
 | **ID** | F021 |
-| **Status** | 📝 Draft |
+| **Status** | ✅ Done |
 | **Priority** | P2 |
 | **Phase** | 2 |
 | **Effort** | M (5-7 days) |
@@ -387,13 +387,13 @@ fn test_left_join_no_match() {
 
 ## Acceptance Criteria
 
-- [ ] Append-only temporal join working
-- [ ] Event-time point-in-time lookup correct
-- [ ] Non-append-only with retraction support
-- [ ] Process-time semantics implemented
-- [ ] SQL syntax parsed correctly
-- [ ] Checkpoint/restore working
-- [ ] 12+ unit tests passing
+- [x] Append-only temporal join working
+- [x] Event-time point-in-time lookup correct
+- [x] Non-append-only with retraction support
+- [x] Process-time semantics implemented
+- [ ] SQL syntax parsed correctly (deferred to F006B)
+- [x] Checkpoint/restore working
+- [x] 22 unit tests passing
 
 ## Performance Targets
 
