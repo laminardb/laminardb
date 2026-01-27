@@ -64,22 +64,40 @@
 mod bridge;
 mod channel_source;
 mod exec;
+/// End-to-end streaming SQL execution
+pub mod execute;
 mod source;
 mod table_provider;
+/// Watermark UDF for current watermark access
+pub mod watermark_udf;
+/// Window function UDFs (TUMBLE, HOP, SESSION)
+pub mod window_udf;
 
 pub use bridge::{BridgeSendError, BridgeSender, BridgeStream, BridgeTrySendError, StreamBridge};
 pub use channel_source::ChannelStreamSource;
 pub use exec::StreamingScanExec;
-pub use source::{StreamSource, StreamSourceRef};
+pub use execute::{execute_streaming_sql, DdlResult, QueryResult, StreamingSqlResult};
+pub use source::{SortColumn, StreamSource, StreamSourceRef};
 pub use table_provider::StreamingTableProvider;
+pub use watermark_udf::WatermarkUdf;
+pub use window_udf::{HopWindowStart, SessionWindowStart, TumbleWindowStart};
+
+use std::sync::atomic::AtomicI64;
+use std::sync::Arc;
 
 use datafusion::prelude::*;
+use datafusion_expr::ScalarUDF;
 
 /// Creates a `DataFusion` session context configured for streaming queries.
 ///
 /// The context is configured with:
 /// - Batch size of 8192 (balanced for streaming throughput)
 /// - Single partition (streaming sources are typically not partitioned)
+/// - All streaming UDFs registered (TUMBLE, HOP, SESSION, WATERMARK)
+///
+/// The watermark UDF is initialized with no watermark set (returns NULL).
+/// Use [`register_streaming_functions_with_watermark`] to provide a live
+/// watermark source.
 ///
 /// # Example
 ///
@@ -94,23 +112,46 @@ pub fn create_streaming_context() -> SessionContext {
         .with_batch_size(8192)
         .with_target_partitions(1); // Single partition for streaming
 
-    SessionContext::new_with_config(config)
+    let ctx = SessionContext::new_with_config(config);
+    register_streaming_functions(&ctx);
+    ctx
 }
 
-/// Registers `LaminarDB` custom functions with a session context.
+/// Registers `LaminarDB` streaming UDFs with a session context.
 ///
-/// Currently registers:
-/// - (Future) TUMBLE window function
-/// - (Future) HOP window function
-/// - (Future) SESSION window function
-/// - (Future) WATERMARK function
+/// Registers the following scalar functions:
+/// - `tumble(timestamp, interval)` — tumbling window start
+/// - `hop(timestamp, slide, size)` — hopping window start
+/// - `session(timestamp, gap)` — session window pass-through
+/// - `watermark()` — current watermark (returns NULL, no live source)
 ///
-/// Note: Streaming SQL extensions (windows, watermarks, EMIT) are
-/// deferred to F006.
-pub fn register_streaming_functions(_ctx: &SessionContext) {
-    // TODO: Register TUMBLE, HOP, SESSION window functions (F006)
-    // TODO: Register WATERMARK function (F006)
-    // TODO: Register streaming-specific UDFs
+/// Use [`register_streaming_functions_with_watermark`] to provide a
+/// live watermark source from Ring 0.
+pub fn register_streaming_functions(ctx: &SessionContext) {
+    ctx.register_udf(ScalarUDF::new_from_impl(TumbleWindowStart::new()));
+    ctx.register_udf(ScalarUDF::new_from_impl(HopWindowStart::new()));
+    ctx.register_udf(ScalarUDF::new_from_impl(SessionWindowStart::new()));
+    ctx.register_udf(ScalarUDF::new_from_impl(WatermarkUdf::unset()));
+}
+
+/// Registers streaming UDFs with a live watermark source.
+///
+/// Same as [`register_streaming_functions`] but connects the `watermark()`
+/// UDF to a shared atomic value that Ring 0 updates in real time.
+///
+/// # Arguments
+///
+/// * `ctx` - `DataFusion` session context
+/// * `watermark_ms` - Shared atomic holding the current watermark in
+///   milliseconds since epoch. Values < 0 mean "no watermark" (returns NULL).
+pub fn register_streaming_functions_with_watermark(
+    ctx: &SessionContext,
+    watermark_ms: Arc<AtomicI64>,
+) {
+    ctx.register_udf(ScalarUDF::new_from_impl(TumbleWindowStart::new()));
+    ctx.register_udf(ScalarUDF::new_from_impl(HopWindowStart::new()));
+    ctx.register_udf(ScalarUDF::new_from_impl(SessionWindowStart::new()));
+    ctx.register_udf(ScalarUDF::new_from_impl(WatermarkUdf::new(watermark_ms)));
 }
 
 #[cfg(test)]
@@ -118,6 +159,7 @@ mod tests {
     use super::*;
     use arrow_array::{Float64Array, Int64Array, RecordBatch};
     use arrow_schema::{DataType, Field, Schema};
+    use datafusion::execution::FunctionRegistry;
     use futures::StreamExt;
     use std::sync::Arc;
 
@@ -327,5 +369,228 @@ mod tests {
 
         send_task.await.unwrap();
         assert_eq!(received, batch_count);
+    }
+
+    // ── F005B Integration Tests ──────────────────────────────────────────
+
+    #[test]
+    fn test_streaming_functions_registered() {
+        let ctx = create_streaming_context();
+        // Verify all 4 UDFs are registered
+        assert!(ctx.udf("tumble").is_ok(), "tumble UDF not registered");
+        assert!(ctx.udf("hop").is_ok(), "hop UDF not registered");
+        assert!(ctx.udf("session").is_ok(), "session UDF not registered");
+        assert!(ctx.udf("watermark").is_ok(), "watermark UDF not registered");
+    }
+
+    #[test]
+    fn test_streaming_functions_with_watermark() {
+        use std::sync::atomic::AtomicI64;
+
+        let ctx = SessionContext::new();
+        let wm = Arc::new(AtomicI64::new(42_000));
+        register_streaming_functions_with_watermark(&ctx, wm);
+
+        assert!(ctx.udf("tumble").is_ok());
+        assert!(ctx.udf("watermark").is_ok());
+    }
+
+    #[tokio::test]
+    async fn test_tumble_udf_via_datafusion() {
+        use arrow_array::TimestampMillisecondArray;
+        use arrow_schema::TimeUnit;
+
+        let ctx = create_streaming_context();
+
+        // Create schema with timestamp and value columns
+        let schema = Arc::new(Schema::new(vec![
+            Field::new(
+                "event_time",
+                DataType::Timestamp(TimeUnit::Millisecond, None),
+                false,
+            ),
+            Field::new("value", DataType::Float64, false),
+        ]));
+
+        let source = Arc::new(ChannelStreamSource::new(Arc::clone(&schema)));
+        let sender = source.take_sender().expect("sender available");
+        let provider = StreamingTableProvider::new("events", source);
+        ctx.register_table("events", Arc::new(provider)).unwrap();
+
+        // Send events across two 5-minute windows:
+        // Window [0, 300_000): timestamps 60_000, 120_000
+        // Window [300_000, 600_000): timestamps 360_000
+        let batch = RecordBatch::try_new(
+            Arc::clone(&schema),
+            vec![
+                Arc::new(TimestampMillisecondArray::from(vec![
+                    60_000i64, 120_000, 360_000,
+                ])),
+                Arc::new(Float64Array::from(vec![10.0, 20.0, 30.0])),
+            ],
+        )
+        .unwrap();
+        sender.send(batch).await.unwrap();
+        drop(sender);
+
+        // Verify the tumble UDF computes correct window starts via DataFusion
+        // (GROUP BY aggregation and ORDER BY on unbounded streams are handled by Ring 0)
+        let df = ctx
+            .sql(
+                "SELECT tumble(event_time, INTERVAL '5' MINUTE) as window_start, \
+                 value \
+                 FROM events",
+            )
+            .await
+            .unwrap();
+
+        let batches = df.collect().await.unwrap();
+        let total_rows: usize = batches.iter().map(RecordBatch::num_rows).sum();
+        assert_eq!(total_rows, 3);
+
+        // Verify the window_start values (single batch, order preserved)
+        let ws_col = batches[0]
+            .column(0)
+            .as_any()
+            .downcast_ref::<TimestampMillisecondArray>()
+            .expect("window_start should be TimestampMillisecond");
+        // 60_000 and 120_000 → window [0, 300_000), start = 0
+        assert_eq!(ws_col.value(0), 0);
+        assert_eq!(ws_col.value(1), 0);
+        // 360_000 → window [300_000, 600_000), start = 300_000
+        assert_eq!(ws_col.value(2), 300_000);
+    }
+
+    #[tokio::test]
+    async fn test_logical_plan_from_windowed_query() {
+        use arrow_schema::TimeUnit;
+
+        let ctx = create_streaming_context();
+
+        let schema = Arc::new(Schema::new(vec![
+            Field::new(
+                "event_time",
+                DataType::Timestamp(TimeUnit::Millisecond, None),
+                false,
+            ),
+            Field::new("value", DataType::Float64, false),
+        ]));
+
+        let source = Arc::new(ChannelStreamSource::new(schema));
+        let _sender = source.take_sender();
+        let provider = StreamingTableProvider::new("events", source);
+        ctx.register_table("events", Arc::new(provider)).unwrap();
+
+        // Create a LogicalPlan for a windowed query
+        let df = ctx
+            .sql(
+                "SELECT tumble(event_time, INTERVAL '5' MINUTE) as w, \
+                 COUNT(*) as cnt \
+                 FROM events \
+                 GROUP BY tumble(event_time, INTERVAL '5' MINUTE)",
+            )
+            .await;
+
+        // Should succeed in creating the logical plan (UDFs are registered)
+        assert!(df.is_ok(), "Failed to create logical plan: {df:?}");
+    }
+
+    #[tokio::test]
+    async fn test_end_to_end_execute_streaming_sql() {
+        use crate::planner::StreamingPlanner;
+
+        let ctx = create_streaming_context();
+
+        let schema = Arc::new(Schema::new(vec![
+            Field::new("id", DataType::Int64, false),
+            Field::new("name", DataType::Utf8, true),
+        ]));
+
+        let source = Arc::new(ChannelStreamSource::new(Arc::clone(&schema)));
+        let sender = source.take_sender().expect("sender available");
+        let provider = StreamingTableProvider::new("items", source);
+        ctx.register_table("items", Arc::new(provider)).unwrap();
+
+        let batch = RecordBatch::try_new(
+            Arc::clone(&schema),
+            vec![
+                Arc::new(Int64Array::from(vec![1, 2, 3])),
+                Arc::new(arrow_array::StringArray::from(vec!["a", "b", "c"])),
+            ],
+        )
+        .unwrap();
+        sender.send(batch).await.unwrap();
+        drop(sender);
+
+        let mut planner = StreamingPlanner::new();
+        let result =
+            execute_streaming_sql("SELECT id FROM items WHERE id > 1", &ctx, &mut planner)
+                .await
+                .unwrap();
+
+        match result {
+            StreamingSqlResult::Query(qr) => {
+                let mut stream = qr.stream;
+                let mut total = 0;
+                while let Some(batch) = stream.next().await {
+                    total += batch.unwrap().num_rows();
+                }
+                assert_eq!(total, 2); // id=2, id=3
+            }
+            _ => panic!("Expected Query result"),
+        }
+    }
+
+    #[tokio::test]
+    async fn test_watermark_function_in_filter() {
+        use std::sync::atomic::AtomicI64;
+        use arrow_array::TimestampMillisecondArray;
+        use arrow_schema::TimeUnit;
+
+        // Create context with a specific watermark value
+        let config = SessionConfig::new()
+            .with_batch_size(8192)
+            .with_target_partitions(1);
+        let ctx = SessionContext::new_with_config(config);
+        let wm = Arc::new(AtomicI64::new(200_000)); // watermark at 200s
+        register_streaming_functions_with_watermark(&ctx, wm);
+
+        let schema = Arc::new(Schema::new(vec![
+            Field::new(
+                "event_time",
+                DataType::Timestamp(TimeUnit::Millisecond, None),
+                false,
+            ),
+            Field::new("value", DataType::Float64, false),
+        ]));
+
+        let source = Arc::new(ChannelStreamSource::new(Arc::clone(&schema)));
+        let sender = source.take_sender().expect("sender available");
+        let provider = StreamingTableProvider::new("events", source);
+        ctx.register_table("events", Arc::new(provider)).unwrap();
+
+        // Events: 100s, 200s, 300s - watermark is at 200s
+        let batch = RecordBatch::try_new(
+            Arc::clone(&schema),
+            vec![
+                Arc::new(TimestampMillisecondArray::from(vec![
+                    100_000i64, 200_000, 300_000,
+                ])),
+                Arc::new(Float64Array::from(vec![1.0, 2.0, 3.0])),
+            ],
+        )
+        .unwrap();
+        sender.send(batch).await.unwrap();
+        drop(sender);
+
+        // Filter events after watermark
+        let df = ctx
+            .sql("SELECT value FROM events WHERE event_time > watermark()")
+            .await
+            .unwrap();
+        let batches = df.collect().await.unwrap();
+        let total_rows: usize = batches.iter().map(RecordBatch::num_rows).sum();
+        // Only event at 300s is after watermark (200s)
+        assert_eq!(total_rows, 1);
     }
 }

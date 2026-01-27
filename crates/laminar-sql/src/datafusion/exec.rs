@@ -8,15 +8,17 @@ use std::any::Any;
 use std::fmt::{Debug, Formatter};
 use std::sync::Arc;
 
-use arrow_schema::SchemaRef;
+use arrow_schema::{SchemaRef, SortOptions};
 use datafusion::execution::{SendableRecordBatchStream, TaskContext};
-use datafusion::physical_expr::{EquivalenceProperties, LexOrdering, Partitioning};
+use datafusion::physical_expr::{
+    expressions::Column, EquivalenceProperties, LexOrdering, Partitioning, PhysicalSortExpr,
+};
 use datafusion::physical_plan::execution_plan::{Boundedness, EmissionType};
 use datafusion::physical_plan::{DisplayAs, DisplayFormatType, ExecutionPlan, PlanProperties};
 use datafusion_common::DataFusionError;
 use datafusion_expr::Expr;
 
-use super::source::StreamSourceRef;
+use super::source::{SortColumn, StreamSourceRef};
 
 /// A `DataFusion` execution plan that scans from a streaming source.
 ///
@@ -54,12 +56,19 @@ impl StreamingScanExec {
     /// # Returns
     ///
     /// A new `StreamingScanExec` instance.
+    /// Creates a new streaming scan execution plan.
+    ///
+    /// If the source declares an `output_ordering`, the plan's
+    /// `EquivalenceProperties` will include it so `DataFusion` can elide
+    /// `SortExec` for matching ORDER BY queries.
     pub fn new(
         source: StreamSourceRef,
         projection: Option<Vec<usize>>,
         filters: Vec<Expr>,
     ) -> Self {
         let source_schema = source.schema();
+        let source_ordering = source.output_ordering();
+
         let schema = match &projection {
             Some(indices) => {
                 let fields: Vec<_> = indices
@@ -71,9 +80,13 @@ impl StreamingScanExec {
             None => source_schema,
         };
 
+        // Build equivalence properties, optionally with source ordering
+        let eq_properties =
+            Self::build_equivalence_properties(&schema, source_ordering.as_deref());
+
         // Build plan properties for an unbounded streaming source
         let properties = PlanProperties::new(
-            EquivalenceProperties::new(Arc::clone(&schema)),
+            eq_properties,
             Partitioning::UnknownPartitioning(1), // Single partition for streaming
             EmissionType::Incremental,            // Streaming emits incrementally
             Boundedness::Unbounded {
@@ -88,6 +101,44 @@ impl StreamingScanExec {
             filters,
             properties,
         }
+    }
+
+    /// Builds `EquivalenceProperties` with optional source ordering.
+    ///
+    /// Converts `SortColumn` declarations into `DataFusion` `PhysicalSortExpr`
+    /// entries. Only columns present in the output schema are included.
+    fn build_equivalence_properties(
+        schema: &SchemaRef,
+        ordering: Option<&[SortColumn]>,
+    ) -> EquivalenceProperties {
+        let mut eq = EquivalenceProperties::new(Arc::clone(schema));
+
+        if let Some(sort_columns) = ordering {
+            let sort_exprs: Vec<PhysicalSortExpr> = sort_columns
+                .iter()
+                .filter_map(|sc| {
+                    // Find column index in the output schema
+                    schema
+                        .index_of(&sc.name)
+                        .ok()
+                        .map(|idx| {
+                            PhysicalSortExpr::new(
+                                Arc::new(Column::new(&sc.name, idx)),
+                                SortOptions {
+                                    descending: sc.descending,
+                                    nulls_first: sc.nulls_first,
+                                },
+                            )
+                        })
+                })
+                .collect();
+
+            if !sort_exprs.is_empty() {
+                eq.add_ordering(sort_exprs);
+            }
+        }
+
+        eq
     }
 
     /// Returns the streaming source.
@@ -201,7 +252,7 @@ impl datafusion::physical_plan::ExecutionPlanProperties for StreamingScanExec {
     }
 
     fn output_ordering(&self) -> Option<&LexOrdering> {
-        None // Streaming sources don't have inherent ordering
+        self.properties.output_ordering()
     }
 
     fn boundedness(&self) -> Boundedness {
@@ -229,6 +280,21 @@ mod tests {
     #[derive(Debug)]
     struct MockSource {
         schema: SchemaRef,
+        ordering: Option<Vec<SortColumn>>,
+    }
+
+    impl MockSource {
+        fn new(schema: SchemaRef) -> Self {
+            Self {
+                schema,
+                ordering: None,
+            }
+        }
+
+        fn with_ordering(mut self, ordering: Vec<SortColumn>) -> Self {
+            self.ordering = Some(ordering);
+            self
+        }
     }
 
     #[async_trait]
@@ -244,6 +310,10 @@ mod tests {
         ) -> Result<SendableRecordBatchStream, DataFusionError> {
             Err(DataFusionError::NotImplemented("mock".to_string()))
         }
+
+        fn output_ordering(&self) -> Option<Vec<SortColumn>> {
+            self.ordering.clone()
+        }
     }
 
     fn test_schema() -> SchemaRef {
@@ -257,9 +327,7 @@ mod tests {
     #[test]
     fn test_scan_exec_schema() {
         let schema = test_schema();
-        let source: StreamSourceRef = Arc::new(MockSource {
-            schema: Arc::clone(&schema),
-        });
+        let source: StreamSourceRef = Arc::new(MockSource::new(Arc::clone(&schema)));
         let exec = StreamingScanExec::new(source, None, vec![]);
 
         assert_eq!(exec.schema(), schema);
@@ -268,9 +336,7 @@ mod tests {
     #[test]
     fn test_scan_exec_projection() {
         let schema = test_schema();
-        let source: StreamSourceRef = Arc::new(MockSource {
-            schema: Arc::clone(&schema),
-        });
+        let source: StreamSourceRef = Arc::new(MockSource::new(Arc::clone(&schema)));
         let exec = StreamingScanExec::new(source, Some(vec![0, 2]), vec![]);
 
         let output_schema = exec.schema();
@@ -284,7 +350,7 @@ mod tests {
         use datafusion::physical_plan::ExecutionPlanProperties;
 
         let schema = test_schema();
-        let source: StreamSourceRef = Arc::new(MockSource { schema });
+        let source: StreamSourceRef = Arc::new(MockSource::new(schema));
         let exec = StreamingScanExec::new(source, None, vec![]);
 
         // Should be unbounded (streaming)
@@ -304,7 +370,7 @@ mod tests {
     #[test]
     fn test_scan_exec_display() {
         let schema = test_schema();
-        let source: StreamSourceRef = Arc::new(MockSource { schema });
+        let source: StreamSourceRef = Arc::new(MockSource::new(schema));
         let exec = StreamingScanExec::new(source, Some(vec![0, 1]), vec![]);
 
         // Verify it implements DisplayAs by checking the name
@@ -317,9 +383,94 @@ mod tests {
     #[test]
     fn test_scan_exec_name() {
         let schema = test_schema();
-        let source: StreamSourceRef = Arc::new(MockSource { schema });
+        let source: StreamSourceRef = Arc::new(MockSource::new(schema));
         let exec = StreamingScanExec::new(source, None, vec![]);
 
         assert_eq!(exec.name(), "StreamingScanExec");
+    }
+
+    // --- Tier 1 ordering tests ---
+
+    #[test]
+    fn test_scan_exec_no_ordering() {
+        use datafusion::physical_plan::ExecutionPlanProperties;
+
+        let schema = test_schema();
+        let source: StreamSourceRef = Arc::new(MockSource::new(schema));
+        let exec = StreamingScanExec::new(source, None, vec![]);
+
+        // No ordering declared -> output_ordering returns None
+        assert!(exec.output_ordering().is_none());
+    }
+
+    #[test]
+    fn test_scan_exec_with_ordering() {
+        use datafusion::physical_plan::ExecutionPlanProperties;
+
+        let schema = test_schema();
+        let source: StreamSourceRef = Arc::new(
+            MockSource::new(Arc::clone(&schema))
+                .with_ordering(vec![SortColumn::ascending("id")]),
+        );
+        let exec = StreamingScanExec::new(source, None, vec![]);
+
+        // Source ordering declared -> output_ordering returns Some
+        let ordering = exec.output_ordering();
+        assert!(ordering.is_some());
+        let lex = ordering.unwrap();
+        assert_eq!(lex.len(), 1);
+    }
+
+    #[test]
+    fn test_scan_exec_output_ordering_returns_some() {
+        use datafusion::physical_plan::ExecutionPlanProperties;
+
+        let schema = test_schema();
+        let source: StreamSourceRef = Arc::new(
+            MockSource::new(Arc::clone(&schema))
+                .with_ordering(vec![
+                    SortColumn::ascending("id"),
+                    SortColumn::descending("value"),
+                ]),
+        );
+        let exec = StreamingScanExec::new(source, None, vec![]);
+
+        let ordering = exec.output_ordering().unwrap();
+        assert_eq!(ordering.len(), 2);
+    }
+
+    #[test]
+    fn test_scan_exec_ordering_with_projection() {
+        use datafusion::physical_plan::ExecutionPlanProperties;
+
+        let schema = test_schema();
+        // Source ordered by "id" ascending
+        let source: StreamSourceRef = Arc::new(
+            MockSource::new(Arc::clone(&schema))
+                .with_ordering(vec![SortColumn::ascending("id")]),
+        );
+        // Project only "id" and "value" (indices 0, 2)
+        let exec = StreamingScanExec::new(source, Some(vec![0, 2]), vec![]);
+
+        // "id" is in the projection -> ordering should still be present
+        let ordering = exec.output_ordering();
+        assert!(ordering.is_some());
+    }
+
+    #[test]
+    fn test_scan_exec_ordering_column_not_in_projection() {
+        use datafusion::physical_plan::ExecutionPlanProperties;
+
+        let schema = test_schema();
+        // Source ordered by "name" ascending
+        let source: StreamSourceRef = Arc::new(
+            MockSource::new(Arc::clone(&schema))
+                .with_ordering(vec![SortColumn::ascending("name")]),
+        );
+        // Project only "id" and "value" (indices 0, 2) -- "name" is NOT projected
+        let exec = StreamingScanExec::new(source, Some(vec![0, 2]), vec![]);
+
+        // "name" is not in the projection -> ordering should be None
+        assert!(exec.output_ordering().is_none());
     }
 }

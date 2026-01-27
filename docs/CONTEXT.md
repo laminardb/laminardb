@@ -8,29 +8,30 @@
 **Date**: 2026-01-26
 
 ### What Was Accomplished
-- F023: Exactly-Once Sinks - COMPLETE (28 new tests)
-  - `TransactionalSink<S>`: buffers writes, flushes only on commit, rollback discards
-  - `ExactlyOnceSinkAdapter<E>`: epoch-based transaction management bridging reactor::Sink to ExactlyOnceSink
-  - 5 recovery integration tests: transactional recovery, idempotent recovery, full adapter pipeline, multiple sink types, checkpoint manager
-  - New modules: `sink/transactional.rs`, `sink/adapter.rs`
+- F005B: Advanced DataFusion Integration - COMPLETE (31 new tests)
+  - `window_udf.rs`: TumbleWindowStart, HopWindowStart, SessionWindowStart scalar UDFs (17 tests)
+  - `watermark_udf.rs`: WatermarkUdf via Arc<AtomicI64> with Nullary signature (4 tests)
+  - `execute.rs`: execute_streaming_sql(), StreamingSqlResult, DdlResult, QueryResult (5 tests)
+  - `planner/mod.rs`: async to_logical_plan() via SessionContext + SQL re-parse
+  - `mod.rs`: register_streaming_functions(), register_streaming_functions_with_watermark() (5 integration tests)
+  - `lib.rs`: re-exports for all new public types
 
 Previous session:
+- F023: Exactly-Once Sinks - COMPLETE (28 new tests)
 - F006B: Production SQL Parser - COMPLETE (129 tests)
-- F005B: Advanced DataFusion Integration spec created
 - F072, F066, F021-F024, F056-F057, F060-F073 all complete
 
-**Total tests**: 1029 (774 core + 129 sql + 120 storage + 6 connectors)
+**Total tests**: 1060 (774 core + 160 sql + 120 storage + 6 connectors)
 
 ### Where We Left Off
-**Phase 2 Production Hardening: 29/30 features complete (97%)**
-- Remaining: F005B (Advanced DataFusion Integration)
+**Phase 2 Production Hardening: 30/30 features COMPLETE (100%)**
 
 ### Immediate Next Steps
-1. F005B: Advanced DataFusion Integration (P1) - streaming UDFs, LogicalPlan
-2. Phase 3: Connectors & Integration (F025-F034)
+1. Phase 3: Connectors & Integration (F025-F034)
+2. Update feature INDEX.md to mark F005B as Done
 
 ### Open Issues
-None - Phase 2 nearly complete.
+None - Phase 2 complete.
 
 ---
 
@@ -67,7 +68,7 @@ None - Phase 2 nearly complete.
 | F021: Temporal Joins | Done | Event-time/process-time, append-only/non-append-only, 22 tests |
 | F066: Watermark Alignment Groups | Done | Pause/WarnOnly/DropExcess, coordinator, 25 tests |
 | F072: XDP/eBPF | Done | Packet header, CPU steering, Linux loader, 34 tests |
-| F005B: Advanced DataFusion | Spec | Streaming UDFs, LogicalPlan creation |
+| F005B: Advanced DataFusion | Done | Window/Watermark UDFs, async LogicalPlan, execute_streaming_sql, 31 tests |
 
 ---
 
@@ -112,7 +113,10 @@ laminar-sql/src/       # F006B: Production SQL Parser
   translator/          # Operator configuration builders
     window_translator  # WindowOperatorConfig
     join_translator    # JoinOperatorConfig (stream/lookup)
-  datafusion/          # F005: DataFusion integration (F005B extends)
+  datafusion/          # F005/F005B: DataFusion integration
+    window_udf         # F005B: TUMBLE/HOP/SESSION scalar UDFs
+    watermark_udf      # F005B: watermark() UDF via Arc<AtomicI64>
+    execute            # F005B: execute_streaming_sql end-to-end
 
 laminar-storage/src/
   incremental/  # F022: Checkpointing

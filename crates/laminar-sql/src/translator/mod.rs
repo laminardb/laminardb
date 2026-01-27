@@ -4,9 +4,15 @@
 //! that can be instantiated and executed.
 
 mod join_translator;
+/// ORDER BY operator configuration builder
+pub mod order_translator;
 mod window_translator;
 
 pub use join_translator::{
     JoinOperatorConfig, LookupJoinConfig, LookupJoinType, StreamJoinConfig, StreamJoinType,
+};
+pub use order_translator::{
+    OrderOperatorConfig, PerGroupTopKConfig, TopKConfig, WatermarkSortConfig,
+    WindowLocalSortConfig,
 };
 pub use window_translator::{WindowOperatorConfig, WindowType};

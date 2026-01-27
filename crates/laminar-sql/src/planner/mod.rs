@@ -7,14 +7,16 @@
 use std::collections::HashMap;
 
 use datafusion::logical_expr::LogicalPlan;
+use datafusion::prelude::SessionContext;
 use sqlparser::ast::{ObjectName, SetExpr, Statement};
 
 use crate::parser::join_parser::analyze_join;
+use crate::parser::order_analyzer::analyze_order_by;
 use crate::parser::{
     CreateSinkStatement, CreateSourceStatement, EmitClause, SinkFrom, StreamingStatement,
     WindowFunction, WindowRewriter,
 };
-use crate::translator::{JoinOperatorConfig, WindowOperatorConfig};
+use crate::translator::{JoinOperatorConfig, OrderOperatorConfig, WindowOperatorConfig};
 
 /// Streaming query planner
 pub struct StreamingPlanner {
@@ -48,6 +50,7 @@ pub struct SinkInfo {
 
 /// Result of planning a streaming statement
 #[derive(Debug)]
+#[allow(clippy::large_enum_variant)]
 pub enum StreamingPlan {
     /// Source registration (DDL)
     RegisterSource(SourceInfo),
@@ -71,6 +74,8 @@ pub struct QueryPlan {
     pub window_config: Option<WindowOperatorConfig>,
     /// Join configuration if the query has joins
     pub join_config: Option<JoinOperatorConfig>,
+    /// ORDER BY configuration if the query has ordering
+    pub order_config: Option<OrderOperatorConfig>,
     /// Emit strategy
     pub emit_clause: Option<EmitClause>,
     /// The underlying SQL statement
@@ -192,6 +197,7 @@ impl StreamingPlanner {
             name: Some(object_name_to_string(name)),
             window_config: query_plan.window_config,
             join_config: query_plan.join_config,
+            order_config: query_plan.order_config,
             emit_clause: emit_clause.cloned(),
             statement: Box::new(stmt),
         }))
@@ -209,7 +215,16 @@ impl StreamingPlanner {
                 let join_analysis = analyze_join(select)
                     .map_err(|e| PlanningError::InvalidQuery(format!("Join analysis failed: {e}")))?;
 
-                if window_function.is_some() || join_analysis.is_some() {
+                // Check for ORDER BY
+                let order_analysis = analyze_order_by(stmt);
+                let order_config = OrderOperatorConfig::from_analysis(&order_analysis)
+                    .map_err(PlanningError::InvalidQuery)?;
+
+                let has_streaming_features = window_function.is_some()
+                    || join_analysis.is_some()
+                    || order_config.is_some();
+
+                if has_streaming_features {
                     let window_config = match window_function {
                         Some(w) => Some(
                             WindowOperatorConfig::from_window_function(&w)
@@ -224,6 +239,7 @@ impl StreamingPlanner {
                         name: None,
                         window_config,
                         join_config,
+                        order_config,
                         emit_clause: None,
                         statement: Box::new(stmt.clone()),
                     }));
@@ -267,6 +283,11 @@ impl StreamingPlanner {
                 }
             }
         }
+
+        // Extract ORDER BY info
+        let order_analysis = analyze_order_by(stmt);
+        analysis.order_config = OrderOperatorConfig::from_analysis(&order_analysis)
+            .map_err(PlanningError::InvalidQuery)?;
 
         Ok(analysis)
     }
@@ -315,16 +336,33 @@ impl StreamingPlanner {
 
     /// Creates a `DataFusion` logical plan from a query plan.
     ///
-    /// This is a placeholder for future `DataFusion` integration.
+    /// Converts the query plan's SQL statement into a `DataFusion`
+    /// `LogicalPlan` using the session context's state. Window UDFs
+    /// (TUMBLE, HOP, SESSION) must be registered on the context via
+    /// [`register_streaming_functions`](crate::datafusion::register_streaming_functions)
+    /// for windowed queries to resolve correctly.
+    ///
+    /// # Arguments
+    ///
+    /// * `plan` - The streaming query plan containing the SQL statement
+    /// * `ctx` - `DataFusion` session context with registered UDFs
     ///
     /// # Errors
     ///
-    /// Returns `PlanningError` if the plan cannot be created.
-    pub fn to_logical_plan(&self, _plan: &QueryPlan) -> Result<LogicalPlan, PlanningError> {
-        // TODO: Integrate with DataFusion context to create actual LogicalPlan
-        Err(PlanningError::UnsupportedSql(
-            "DataFusion LogicalPlan creation not yet implemented".to_string(),
-        ))
+    /// Returns `PlanningError` if `DataFusion` cannot create the logical plan.
+    pub async fn to_logical_plan(
+        &self,
+        plan: &QueryPlan,
+        ctx: &SessionContext,
+    ) -> Result<LogicalPlan, PlanningError> {
+        // Convert the AST statement back to SQL and let DataFusion re-parse
+        // it with its own sqlparser version. This avoids version mismatches
+        // between our sqlparser (0.60) and DataFusion's (0.59).
+        let sql = plan.statement.to_string();
+        ctx.state()
+            .create_logical_plan(&sql)
+            .await
+            .map_err(PlanningError::DataFusion)
     }
 }
 
@@ -336,9 +374,11 @@ impl Default for StreamingPlanner {
 
 /// Intermediate query analysis result
 #[derive(Debug, Default)]
+#[allow(clippy::struct_field_names)]
 struct QueryAnalysis {
     window_config: Option<WindowOperatorConfig>,
     join_config: Option<JoinOperatorConfig>,
+    order_config: Option<OrderOperatorConfig>,
 }
 
 /// Helper to convert `ObjectName` to String
@@ -364,6 +404,10 @@ pub enum PlanningError {
     /// Sink not found
     #[error("Sink not found: {0}")]
     SinkNotFound(String),
+
+    /// `DataFusion` error during logical plan creation
+    #[error("DataFusion error: {0}")]
+    DataFusion(#[from] datafusion_common::DataFusionError),
 }
 
 #[cfg(test)]

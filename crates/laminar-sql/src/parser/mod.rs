@@ -2,6 +2,7 @@
 
 pub mod aggregation_parser;
 pub mod join_parser;
+pub mod order_analyzer;
 mod parser_simple;
 mod statements;
 mod window_rewriter;
