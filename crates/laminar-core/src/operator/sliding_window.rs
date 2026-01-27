@@ -780,7 +780,7 @@ where
                 }
             }
             Err(e) => {
-                eprintln!("Failed to create output batch: {e}");
+                tracing::error!("Failed to create output batch: {e}");
             }
         }
         output

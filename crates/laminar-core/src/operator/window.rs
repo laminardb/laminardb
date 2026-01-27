@@ -2810,13 +2810,15 @@ impl DynAccumulator for LastValueF64DynAccumulator {
 pub struct CompositeAggregator {
     /// Factories for creating sub-accumulators
     factories: Vec<Box<dyn DynAggregatorFactory>>,
+    /// Cached output schema (built once in constructor)
+    cached_schema: SchemaRef,
 }
 
 impl std::fmt::Debug for CompositeAggregator {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         f.debug_struct("CompositeAggregator")
             .field("num_factories", &self.factories.len())
-            .finish()
+            .finish_non_exhaustive()
     }
 }
 
@@ -2824,7 +2826,16 @@ impl CompositeAggregator {
     /// Creates a new composite aggregator from a list of factories.
     #[must_use]
     pub fn new(factories: Vec<Box<dyn DynAggregatorFactory>>) -> Self {
-        Self { factories }
+        let mut fields = vec![
+            Field::new("window_start", DataType::Int64, false),
+            Field::new("window_end", DataType::Int64, false),
+        ];
+        fields.extend(factories.iter().map(|f| f.result_field()));
+        let cached_schema = Arc::new(Schema::new(fields));
+        Self {
+            factories,
+            cached_schema,
+        }
     }
 
     /// Returns the number of sub-aggregates.
@@ -2849,19 +2860,17 @@ impl CompositeAggregator {
     /// Creates the output schema: `window_start, window_end, [aggregate fields]`.
     #[must_use]
     pub fn output_schema(&self) -> SchemaRef {
-        let mut fields = vec![
-            Field::new("window_start", DataType::Int64, false),
-            Field::new("window_end", DataType::Int64, false),
-        ];
-        fields.extend(self.result_fields());
-        Arc::new(Schema::new(fields))
+        Arc::clone(&self.cached_schema)
     }
 }
 
 impl Clone for CompositeAggregator {
     fn clone(&self) -> Self {
+        let factories: Vec<Box<dyn DynAggregatorFactory>> =
+            self.factories.iter().map(|f| f.clone_box()).collect();
         Self {
-            factories: self.factories.iter().map(|f| f.clone_box()).collect(),
+            cached_schema: Arc::clone(&self.cached_schema),
+            factories,
         }
     }
 }
@@ -3482,7 +3491,7 @@ where
             acc.add(value);
             if let Err(e) = self.put_accumulator(&window_id, &acc, ctx.state) {
                 // Log error but don't fail - we'll retry on next event
-                eprintln!("Failed to store window state: {e}");
+                tracing::error!("Failed to store window state: {e}");
             } else {
                 state_updated = true;
             }
@@ -3614,7 +3623,7 @@ where
                 }
             }
             Err(e) => {
-                eprintln!("Failed to create output batch: {e}");
+                tracing::error!("Failed to create output batch: {e}");
             }
         }
         output

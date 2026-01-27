@@ -94,6 +94,9 @@ impl ThreeRingReactor {
 
         // Create eventfd for wake-up coordination
         #[cfg(target_os = "linux")]
+        // SAFETY: eventfd() is a simple syscall that creates a new file descriptor.
+        // EFD_NONBLOCK and EFD_CLOEXEC are valid flags. The returned fd is checked
+        // for errors immediately below (< 0 check). No memory or aliasing concerns.
         let eventfd = unsafe {
             libc::eventfd(0, libc::EFD_NONBLOCK | libc::EFD_CLOEXEC)
         };

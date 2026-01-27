@@ -266,6 +266,9 @@ impl NumaAllocator {
 
             // Try to enable huge pages (non-fatal if fails)
             #[cfg(target_os = "linux")]
+            // SAFETY: `ptr` was just returned successfully from mmap (not MAP_FAILED),
+            // `size` matches the mmap region size, and MADV_HUGEPAGE is an advisory hint
+            // that cannot cause memory unsafety even if it fails.
             unsafe {
                 libc::madvise(ptr, size, libc::MADV_HUGEPAGE);
             }

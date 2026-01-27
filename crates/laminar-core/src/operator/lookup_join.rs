@@ -90,6 +90,7 @@ use super::{
     TimerKey,
 };
 use crate::state::StateStoreExt;
+use fxhash::FxHashMap;
 use arrow_array::{Array, ArrayRef, Int64Array, RecordBatch, StringArray};
 use arrow_schema::{DataType, Field, Schema, SchemaRef};
 use rkyv::{
@@ -386,6 +387,9 @@ pub struct LookupJoinOperator {
     pending_keys: Vec<Vec<u8>>,
     /// Events waiting for pending lookups.
     pending_events: Vec<(Event, Vec<u8>)>,
+    /// In-memory cache of deserialized batches to avoid repeated Arrow IPC deserialization.
+    /// Maps cache key bytes to the deserialized `RecordBatch`.
+    batch_cache: FxHashMap<Vec<u8>, Option<RecordBatch>>,
 }
 
 impl LookupJoinOperator {
@@ -410,6 +414,7 @@ impl LookupJoinOperator {
             cache_ttl_us,
             pending_keys: Vec::new(),
             pending_events: Vec::new(),
+            batch_cache: FxHashMap::default(),
         }
     }
 
@@ -485,6 +490,10 @@ impl LookupJoinOperator {
         if ctx.state.put_typed(&cache_key, &entry).is_err() {
             return output;
         }
+
+        // Populate in-memory batch cache
+        self.batch_cache
+            .insert(cache_key.clone(), result.cloned());
 
         // Register TTL timer
         let expiry_time = ctx.processing_time + self.cache_ttl_us;
@@ -574,6 +583,10 @@ impl LookupJoinOperator {
         };
 
         if ctx.state.put_typed(&cache_key, &entry).is_ok() {
+            // Populate in-memory batch cache
+            self.batch_cache
+                .insert(cache_key.clone(), result.clone());
+
             // Register TTL timer
             let expiry_time = ctx.processing_time + self.cache_ttl_us;
             let timer_key = Self::make_timer_key(&cache_key);
@@ -589,9 +602,12 @@ impl LookupJoinOperator {
     /// - `None` if cache miss (key not found or expired)
     /// - `Some(None)` if cached "not found" result
     /// - `Some(Some(batch))` if cached found result
+    ///
+    /// Uses an in-memory batch cache to avoid repeated Arrow IPC deserialization
+    /// when the same cache key is looked up multiple times.
     #[allow(clippy::option_option)]
     fn lookup_cache(
-        &self,
+        &mut self,
         cache_key: &[u8],
         ctx: &OperatorContext,
     ) -> Option<Option<RecordBatch>> {
@@ -599,11 +615,19 @@ impl LookupJoinOperator {
 
         // Check if expired
         if entry.is_expired(ctx.processing_time, self.cache_ttl_us) {
+            self.batch_cache.remove(cache_key);
             return None;
         }
 
-        // Return cached result
-        entry.to_batch().ok()
+        // Check in-memory batch cache first
+        if let Some(cached) = self.batch_cache.get(cache_key) {
+            return Some(cached.clone());
+        }
+
+        // Deserialize and cache the batch
+        let result = entry.to_batch().ok()?;
+        self.batch_cache.insert(cache_key.to_vec(), result.clone());
+        Some(result)
     }
 
     /// Emits the join result for an event.
@@ -758,6 +782,7 @@ impl LookupJoinOperator {
     /// Handles cache TTL timer expiration.
     fn handle_cache_expiry(&mut self, cache_key: &[u8], ctx: &mut OperatorContext) -> OutputVec {
         if ctx.state.delete(cache_key).is_ok() {
+            self.batch_cache.remove(cache_key);
             self.metrics.cache_expirations += 1;
         }
         OutputVec::new()
@@ -844,6 +869,7 @@ impl Operator for LookupJoinOperator {
         self.metrics.cache_misses = cache_misses;
         self.metrics.lookups_found = lookups_found;
         self.metrics.lookups_not_found = lookups_not_found;
+        self.batch_cache.clear();
 
         Ok(())
     }

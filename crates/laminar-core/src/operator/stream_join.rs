@@ -76,6 +76,7 @@ use super::{
     Event, Operator, OperatorContext, OperatorError, OperatorState, Output, OutputVec, Timer,
     TimerKey,
 };
+use bytes::Bytes;
 use crate::state::{StateStore, StateStoreExt};
 use arrow_array::{Array, ArrayRef, RecordBatch, StringArray, Int64Array, Float64Array};
 use arrow_schema::{DataType, Field, Schema, SchemaRef};
@@ -1050,6 +1051,8 @@ pub struct StreamJoinOperator {
     left_watermark: i64,
     /// Right-side watermark.
     right_watermark: i64,
+    /// Reusable buffer for `prune_build_side` to avoid per-call allocation.
+    prune_buffer: Vec<Bytes>,
 }
 
 impl StreamJoinOperator {
@@ -1093,6 +1096,7 @@ impl StreamJoinOperator {
             key_metadata: HashMap::new(),
             left_watermark: i64::MIN,
             right_watermark: i64::MIN,
+            prune_buffer: Vec::with_capacity(100),
         }
     }
 
@@ -1129,6 +1133,7 @@ impl StreamJoinOperator {
             key_metadata: HashMap::new(),
             left_watermark: i64::MIN,
             right_watermark: i64::MIN,
+            prune_buffer: Vec::with_capacity(100),
         }
     }
 
@@ -1184,6 +1189,7 @@ impl StreamJoinOperator {
             key_metadata: HashMap::new(),
             left_watermark: i64::MIN,
             right_watermark: i64::MIN,
+            prune_buffer: Vec::with_capacity(100),
         }
     }
 
@@ -1505,32 +1511,33 @@ impl StreamJoinOperator {
                 JoinSide::Right => RIGHT_STATE_PREFIX,
             };
 
-            // Scan and collect keys to delete
-            let keys_to_delete: Vec<Vec<u8>> = ctx.state
-                .prefix_scan(prefix)
-                .filter_map(|(key, value)| {
-                    // Try to get timestamp from the key (bytes 12-20)
-                    if key.len() >= 20 {
-                        let ts_bytes: [u8; 8] = key[12..20].try_into().ok()?;
+            // Reuse prune_buffer to avoid per-call allocation
+            self.prune_buffer.clear();
+            let time_bound = self.time_bound_ms;
+            for (key, value) in ctx.state.prefix_scan(prefix) {
+                if self.prune_buffer.len() >= 100 {
+                    break; // Limit per-event pruning to avoid latency spikes
+                }
+                // Try to get timestamp from the key (bytes 12-20)
+                if key.len() >= 20 {
+                    if let Ok(ts_bytes) = <[u8; 8]>::try_from(&key[12..20]) {
                         let timestamp = i64::from_be_bytes(ts_bytes);
-                        if timestamp + self.time_bound_ms < prune_threshold {
+                        if timestamp + time_bound < prune_threshold {
                             // Also verify via deserialization
                             if let Ok(row) = rkyv::access::<rkyv::Archived<JoinRow>, RkyvError>(&value)
                                 .and_then(rkyv::deserialize::<JoinRow, RkyvError>)
                             {
-                                if row.timestamp + self.time_bound_ms < prune_threshold {
-                                    return Some(key.to_vec());
+                                if row.timestamp + time_bound < prune_threshold {
+                                    self.prune_buffer.push(key);
                                 }
                             }
                         }
                     }
-                    None
-                })
-                .take(100) // Limit per-event pruning to avoid latency spikes
-                .collect();
+                }
+            }
 
-            for key in keys_to_delete {
-                if ctx.state.delete(&key).is_ok() {
+            for key in &self.prune_buffer {
+                if ctx.state.delete(key).is_ok() {
                     self.metrics.build_side_prunes += 1;
                 }
             }

@@ -100,3 +100,11 @@ harness = false
 [[bench]]
 name = "io_uring_bench"
 harness = false
+
+[[bench]]
+name = "join_bench"
+harness = false
+
+[[bench]]
+name = "latency_bench"
+harness = false

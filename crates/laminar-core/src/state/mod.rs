@@ -462,20 +462,17 @@ impl StateStore for InMemoryStore {
     }
 
     fn put(&mut self, key: &[u8], value: &[u8]) -> Result<(), StateError> {
-        let key_vec = key.to_vec();
         let value_bytes = Bytes::copy_from_slice(value);
 
-        // Update size tracking
-        if let Some(old_value) = self.data.get(&key_vec) {
-            // Key exists, subtract old value size
-            self.size_bytes -= old_value.len();
+        // Update existing key in-place to avoid key allocation
+        if let Some(existing) = self.data.get_mut(key) {
+            self.size_bytes -= existing.len();
+            self.size_bytes += value.len();
+            *existing = value_bytes;
         } else {
-            // New key, add key size
-            self.size_bytes += key_vec.len();
+            self.size_bytes += key.len() + value.len();
+            self.data.insert(key.to_vec(), value_bytes);
         }
-        self.size_bytes += value.len();
-
-        self.data.insert(key_vec, value_bytes);
         Ok(())
     }
 

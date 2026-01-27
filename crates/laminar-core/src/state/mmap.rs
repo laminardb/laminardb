@@ -426,16 +426,14 @@ impl StateStore for MmapStateStore {
         };
         self.next_version += 1;
 
-        // Update size tracking
-        if let Some(old_entry) = self.index.get(key) {
-            // Key exists, only update value size (old space becomes fragmentation)
-            self.size_bytes = self.size_bytes - old_entry.len + value.len();
+        // Update existing key in-place to avoid key allocation
+        if let Some(existing) = self.index.get_mut(key) {
+            self.size_bytes = self.size_bytes - existing.len + value.len();
+            *existing = entry;
         } else {
-            // New key
             self.size_bytes += key.len() + value.len();
+            self.index.insert(key.to_vec(), entry);
         }
-
-        self.index.insert(key.to_vec(), entry);
         Ok(())
     }
 
