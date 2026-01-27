@@ -61,6 +61,8 @@
 //! let df = ctx.sql("SELECT * FROM events WHERE value > 100").await?;
 //! ```
 
+/// F075: DataFusion aggregate bridge for streaming aggregation
+pub mod aggregate_bridge;
 mod bridge;
 mod channel_source;
 mod exec;
@@ -73,6 +75,10 @@ pub mod watermark_udf;
 /// Window function UDFs (TUMBLE, HOP, SESSION)
 pub mod window_udf;
 
+pub use aggregate_bridge::{
+    create_aggregate_factory, lookup_aggregate_udf, scalar_value_to_result,
+    result_to_scalar_value, DataFusionAccumulatorAdapter, DataFusionAggregateFactory,
+};
 pub use bridge::{BridgeSendError, BridgeSender, BridgeStream, BridgeTrySendError, StreamBridge};
 pub use channel_source::ChannelStreamSource;
 pub use exec::StreamingScanExec;

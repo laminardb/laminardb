@@ -6,11 +6,11 @@
 |-------|-------|-------|-------------|-----------|------|
 | Phase 1 | 12 | 0 | 0 | 1 | 11 |
 | Phase 1.5 | 1 | 0 | 0 | 0 | 1 |
-| Phase 2 | 30 | 0 | 0 | 0 | 30 |
+| Phase 2 | 34 | 0 | 0 | 0 | 34 |
 | Phase 3 | 12 | 12 | 0 | 0 | 0 |
 | Phase 4 | 11 | 11 | 0 | 0 | 0 |
 | Phase 5 | 10 | 10 | 0 | 0 | 0 |
-| **Total** | **76** | **33** | **0** | **1** | **42** |
+| **Total** | **80** | **33** | **0** | **1** | **46** |
 
 ## Status Legend
 
@@ -123,6 +123,10 @@
 | **F072** | **XDP/eBPF Network Optimization** | **P2** | ✅ | [Link](phase-2/F072-xdp-network-optimization.md) |
 | **F073** | **Zero-Allocation Polling** | **P1** | ✅ | [Link](phase-2/F073-zero-allocation-polling.md) |
 | **F005B** | **Advanced DataFusion Integration** | **P1** | ✅ | [Link](phase-2/F005B-advanced-datafusion-integration.md) |
+| **F074** | **Composite Aggregator & f64 Type Support** | **P0** | ✅ | [Link](phase-2/F074-composite-aggregator.md) |
+| **F075** | **DataFusion Aggregate Bridge** | **P1** | ✅ | [Link](phase-2/F075-datafusion-aggregate-bridge.md) |
+| **F076** | **Retractable FIRST/LAST Accumulators** | **P0** | ✅ | [Link](phase-2/F076-retractable-first-last.md) |
+| **F077** | **Extended Aggregation Parser** | **P1** | ✅ | [Link](phase-2/F077-extended-aggregation-parser.md) |
 
 ### Phase 2 Thread-Per-Core Research Gap Analysis (NEW)
 

@@ -1093,6 +1093,432 @@ impl<T: Serialize> CdcEnvelope<T> {
 }
 
 // ============================================================================
+// F076: Retractable FIRST/LAST Accumulators
+// ============================================================================
+
+/// Retractable `FIRST_VALUE` accumulator for changelog/retraction mode.
+///
+/// Stores all `(timestamp, value)` entries sorted by timestamp ascending.
+/// On retraction, removes the entry and recomputes the first value.
+/// This is necessary for `EMIT CHANGES` with OHLC queries where the
+/// open price may need to be retracted.
+///
+/// # Ring Architecture
+///
+/// This is a Ring 1 structure (allocates). Ring 0 uses the non-retractable
+/// [`super::window::FirstValueAccumulator`] via the static dispatch path.
+#[derive(Debug, Clone, Default)]
+pub struct RetractableFirstValueAccumulator {
+    /// Sorted entries: `(timestamp, value)`, ascending by timestamp
+    entries: Vec<(i64, i64)>,
+}
+
+impl RetractableFirstValueAccumulator {
+    /// Creates a new empty accumulator.
+    #[must_use]
+    pub fn new() -> Self {
+        Self::default()
+    }
+
+    /// Returns the number of stored entries.
+    #[must_use]
+    pub fn len(&self) -> usize {
+        self.entries.len()
+    }
+
+    /// Returns true if no entries are stored.
+    #[must_use]
+    pub fn is_empty(&self) -> bool {
+        self.entries.is_empty()
+    }
+}
+
+impl RetractableAccumulator for RetractableFirstValueAccumulator {
+    type Input = (i64, i64); // (timestamp, value)
+    type Output = Option<i64>;
+
+    fn add(&mut self, (timestamp, value): (i64, i64)) {
+        // Insert in sorted order by timestamp, preserving insertion order
+        // for duplicate timestamps (append after existing same-timestamp entries)
+        let pos = match self
+            .entries
+            .binary_search_by_key(&timestamp, |(ts, _)| *ts)
+        {
+            Ok(mut p) => {
+                // Skip past all entries with the same timestamp
+                while p < self.entries.len() && self.entries[p].0 == timestamp {
+                    p += 1;
+                }
+                p
+            }
+            Err(p) => p,
+        };
+        self.entries.insert(pos, (timestamp, value));
+    }
+
+    fn retract(&mut self, (timestamp, value): &(i64, i64)) {
+        // Find and remove the exact entry
+        if let Some(pos) = self
+            .entries
+            .iter()
+            .position(|(ts, val)| ts == timestamp && val == value)
+        {
+            self.entries.remove(pos);
+        }
+    }
+
+    fn merge(&mut self, other: &Self) {
+        // Merge sorted lists
+        let mut merged = Vec::with_capacity(self.entries.len() + other.entries.len());
+        let mut i = 0;
+        let mut j = 0;
+        while i < self.entries.len() && j < other.entries.len() {
+            if self.entries[i].0 <= other.entries[j].0 {
+                merged.push(self.entries[i]);
+                i += 1;
+            } else {
+                merged.push(other.entries[j]);
+                j += 1;
+            }
+        }
+        merged.extend_from_slice(&self.entries[i..]);
+        merged.extend_from_slice(&other.entries[j..]);
+        self.entries = merged;
+    }
+
+    fn result(&self) -> Option<i64> {
+        // First entry has the earliest timestamp
+        self.entries.first().map(|(_, val)| *val)
+    }
+
+    fn is_empty(&self) -> bool {
+        self.entries.is_empty()
+    }
+
+    fn supports_efficient_retraction(&self) -> bool {
+        true
+    }
+
+    fn reset(&mut self) {
+        self.entries.clear();
+    }
+}
+
+/// Retractable `LAST_VALUE` accumulator for changelog/retraction mode.
+///
+/// Stores all `(timestamp, value)` entries sorted by timestamp ascending.
+/// On retraction, removes the entry and recomputes the last value.
+/// This is necessary for `EMIT CHANGES` with OHLC queries where the
+/// close price may need to be retracted.
+#[derive(Debug, Clone, Default)]
+pub struct RetractableLastValueAccumulator {
+    /// Sorted entries: `(timestamp, value)`, ascending by timestamp
+    entries: Vec<(i64, i64)>,
+}
+
+impl RetractableLastValueAccumulator {
+    /// Creates a new empty accumulator.
+    #[must_use]
+    pub fn new() -> Self {
+        Self::default()
+    }
+
+    /// Returns the number of stored entries.
+    #[must_use]
+    pub fn len(&self) -> usize {
+        self.entries.len()
+    }
+
+    /// Returns true if no entries are stored.
+    #[must_use]
+    pub fn is_empty(&self) -> bool {
+        self.entries.is_empty()
+    }
+}
+
+impl RetractableAccumulator for RetractableLastValueAccumulator {
+    type Input = (i64, i64); // (timestamp, value)
+    type Output = Option<i64>;
+
+    fn add(&mut self, (timestamp, value): (i64, i64)) {
+        // Insert in sorted order by timestamp, preserving insertion order
+        let pos = match self
+            .entries
+            .binary_search_by_key(&timestamp, |(ts, _)| *ts)
+        {
+            Ok(mut p) => {
+                while p < self.entries.len() && self.entries[p].0 == timestamp {
+                    p += 1;
+                }
+                p
+            }
+            Err(p) => p,
+        };
+        self.entries.insert(pos, (timestamp, value));
+    }
+
+    fn retract(&mut self, (timestamp, value): &(i64, i64)) {
+        if let Some(pos) = self
+            .entries
+            .iter()
+            .position(|(ts, val)| ts == timestamp && val == value)
+        {
+            self.entries.remove(pos);
+        }
+    }
+
+    fn merge(&mut self, other: &Self) {
+        let mut merged = Vec::with_capacity(self.entries.len() + other.entries.len());
+        let mut i = 0;
+        let mut j = 0;
+        while i < self.entries.len() && j < other.entries.len() {
+            if self.entries[i].0 <= other.entries[j].0 {
+                merged.push(self.entries[i]);
+                i += 1;
+            } else {
+                merged.push(other.entries[j]);
+                j += 1;
+            }
+        }
+        merged.extend_from_slice(&self.entries[i..]);
+        merged.extend_from_slice(&other.entries[j..]);
+        self.entries = merged;
+    }
+
+    fn result(&self) -> Option<i64> {
+        // Last entry has the latest timestamp
+        self.entries.last().map(|(_, val)| *val)
+    }
+
+    fn is_empty(&self) -> bool {
+        self.entries.is_empty()
+    }
+
+    fn supports_efficient_retraction(&self) -> bool {
+        true
+    }
+
+    fn reset(&mut self) {
+        self.entries.clear();
+    }
+}
+
+/// Retractable `FIRST_VALUE` accumulator for f64 values.
+///
+/// Uses `f64::to_bits()` / `f64::from_bits()` for lossless i64 storage
+/// within the sorted entry list.
+#[derive(Debug, Clone, Default)]
+pub struct RetractableFirstValueF64Accumulator {
+    /// Sorted entries: `(timestamp, value_bits)`, ascending by timestamp
+    entries: Vec<(i64, i64)>,
+}
+
+impl RetractableFirstValueF64Accumulator {
+    /// Creates a new empty accumulator.
+    #[must_use]
+    pub fn new() -> Self {
+        Self::default()
+    }
+
+    /// Returns the number of stored entries.
+    #[must_use]
+    pub fn len(&self) -> usize {
+        self.entries.len()
+    }
+
+    /// Returns true if no entries are stored.
+    #[must_use]
+    pub fn is_empty(&self) -> bool {
+        self.entries.is_empty()
+    }
+
+    /// Returns the result as f64.
+    #[must_use]
+    #[allow(clippy::cast_sign_loss)]
+    pub fn result_f64(&self) -> Option<f64> {
+        self.entries
+            .first()
+            .map(|(_, bits)| f64::from_bits(*bits as u64))
+    }
+}
+
+impl RetractableAccumulator for RetractableFirstValueF64Accumulator {
+    type Input = (i64, f64); // (timestamp, value)
+    type Output = Option<i64>; // value_bits for compatibility
+
+    #[allow(clippy::cast_possible_wrap)]
+    fn add(&mut self, (timestamp, value): (i64, f64)) {
+        let value_bits = value.to_bits() as i64;
+        let pos = match self
+            .entries
+            .binary_search_by_key(&timestamp, |(ts, _)| *ts)
+        {
+            Ok(mut p) => {
+                while p < self.entries.len() && self.entries[p].0 == timestamp {
+                    p += 1;
+                }
+                p
+            }
+            Err(p) => p,
+        };
+        self.entries.insert(pos, (timestamp, value_bits));
+    }
+
+    fn retract(&mut self, (timestamp, value): &(i64, f64)) {
+        #[allow(clippy::cast_possible_wrap)]
+        let value_bits = value.to_bits() as i64;
+        if let Some(pos) = self
+            .entries
+            .iter()
+            .position(|(ts, val)| *ts == *timestamp && *val == value_bits)
+        {
+            self.entries.remove(pos);
+        }
+    }
+
+    fn merge(&mut self, other: &Self) {
+        let mut merged = Vec::with_capacity(self.entries.len() + other.entries.len());
+        let mut i = 0;
+        let mut j = 0;
+        while i < self.entries.len() && j < other.entries.len() {
+            if self.entries[i].0 <= other.entries[j].0 {
+                merged.push(self.entries[i]);
+                i += 1;
+            } else {
+                merged.push(other.entries[j]);
+                j += 1;
+            }
+        }
+        merged.extend_from_slice(&self.entries[i..]);
+        merged.extend_from_slice(&other.entries[j..]);
+        self.entries = merged;
+    }
+
+    fn result(&self) -> Option<i64> {
+        self.entries.first().map(|(_, val)| *val)
+    }
+
+    fn is_empty(&self) -> bool {
+        self.entries.is_empty()
+    }
+
+    fn supports_efficient_retraction(&self) -> bool {
+        true
+    }
+
+    fn reset(&mut self) {
+        self.entries.clear();
+    }
+}
+
+/// Retractable `LAST_VALUE` accumulator for f64 values.
+///
+/// Uses `f64::to_bits()` / `f64::from_bits()` for lossless i64 storage.
+#[derive(Debug, Clone, Default)]
+pub struct RetractableLastValueF64Accumulator {
+    /// Sorted entries: `(timestamp, value_bits)`, ascending by timestamp
+    entries: Vec<(i64, i64)>,
+}
+
+impl RetractableLastValueF64Accumulator {
+    /// Creates a new empty accumulator.
+    #[must_use]
+    pub fn new() -> Self {
+        Self::default()
+    }
+
+    /// Returns the number of stored entries.
+    #[must_use]
+    pub fn len(&self) -> usize {
+        self.entries.len()
+    }
+
+    /// Returns true if no entries are stored.
+    #[must_use]
+    pub fn is_empty(&self) -> bool {
+        self.entries.is_empty()
+    }
+
+    /// Returns the result as f64.
+    #[must_use]
+    #[allow(clippy::cast_sign_loss)]
+    pub fn result_f64(&self) -> Option<f64> {
+        self.entries
+            .last()
+            .map(|(_, bits)| f64::from_bits(*bits as u64))
+    }
+}
+
+impl RetractableAccumulator for RetractableLastValueF64Accumulator {
+    type Input = (i64, f64); // (timestamp, value)
+    type Output = Option<i64>; // value_bits for compatibility
+
+    #[allow(clippy::cast_possible_wrap)]
+    fn add(&mut self, (timestamp, value): (i64, f64)) {
+        let value_bits = value.to_bits() as i64;
+        let pos = match self
+            .entries
+            .binary_search_by_key(&timestamp, |(ts, _)| *ts)
+        {
+            Ok(mut p) => {
+                while p < self.entries.len() && self.entries[p].0 == timestamp {
+                    p += 1;
+                }
+                p
+            }
+            Err(p) => p,
+        };
+        self.entries.insert(pos, (timestamp, value_bits));
+    }
+
+    fn retract(&mut self, (timestamp, value): &(i64, f64)) {
+        #[allow(clippy::cast_possible_wrap)]
+        let value_bits = value.to_bits() as i64;
+        if let Some(pos) = self
+            .entries
+            .iter()
+            .position(|(ts, val)| *ts == *timestamp && *val == value_bits)
+        {
+            self.entries.remove(pos);
+        }
+    }
+
+    fn merge(&mut self, other: &Self) {
+        let mut merged = Vec::with_capacity(self.entries.len() + other.entries.len());
+        let mut i = 0;
+        let mut j = 0;
+        while i < self.entries.len() && j < other.entries.len() {
+            if self.entries[i].0 <= other.entries[j].0 {
+                merged.push(self.entries[i]);
+                i += 1;
+            } else {
+                merged.push(other.entries[j]);
+                j += 1;
+            }
+        }
+        merged.extend_from_slice(&self.entries[i..]);
+        merged.extend_from_slice(&other.entries[j..]);
+        self.entries = merged;
+    }
+
+    fn result(&self) -> Option<i64> {
+        self.entries.last().map(|(_, val)| *val)
+    }
+
+    fn is_empty(&self) -> bool {
+        self.entries.is_empty()
+    }
+
+    fn supports_efficient_retraction(&self) -> bool {
+        true
+    }
+
+    fn reset(&mut self) {
+        self.entries.clear();
+    }
+}
+
+// ============================================================================
 // Tests
 // ============================================================================
 
@@ -1564,5 +1990,387 @@ mod tests {
     fn test_cdc_operation_unknown_u8() {
         // Unknown values default to Insert
         assert_eq!(CdcOperation::from_u8(255), CdcOperation::Insert);
+    }
+
+    // ════════════════════════════════════════════════════════════════════════
+    // F076: Retractable FIRST/LAST Accumulator Tests
+    // ════════════════════════════════════════════════════════════════════════
+
+    // ── RetractableFirstValueAccumulator ─────────────────────────────────────
+
+    #[test]
+    fn test_retractable_first_value_basic() {
+        let mut acc = RetractableFirstValueAccumulator::new();
+        assert!(acc.is_empty());
+        assert_eq!(acc.result(), None);
+
+        // Add entries out of order
+        acc.add((200, 20));
+        acc.add((100, 10));
+        acc.add((300, 30));
+
+        assert!(!acc.is_empty());
+        assert_eq!(acc.len(), 3);
+        // First value = earliest timestamp (100) → value 10
+        assert_eq!(acc.result(), Some(10));
+    }
+
+    #[test]
+    fn test_retractable_first_value_retract_non_first() {
+        let mut acc = RetractableFirstValueAccumulator::new();
+        acc.add((100, 10));
+        acc.add((200, 20));
+        acc.add((300, 30));
+
+        // Retract a non-first entry → first value unchanged
+        acc.retract(&(200, 20));
+        assert_eq!(acc.len(), 2);
+        assert_eq!(acc.result(), Some(10));
+    }
+
+    #[test]
+    fn test_retractable_first_value_retract_first() {
+        let mut acc = RetractableFirstValueAccumulator::new();
+        acc.add((100, 10));
+        acc.add((200, 20));
+        acc.add((300, 30));
+
+        // Retract the first entry → next earliest becomes first
+        acc.retract(&(100, 10));
+        assert_eq!(acc.len(), 2);
+        assert_eq!(acc.result(), Some(20)); // ts=200
+    }
+
+    #[test]
+    fn test_retractable_first_value_retract_all() {
+        let mut acc = RetractableFirstValueAccumulator::new();
+        acc.add((100, 10));
+        acc.add((200, 20));
+
+        acc.retract(&(100, 10));
+        acc.retract(&(200, 20));
+        assert!(acc.is_empty());
+        assert_eq!(acc.result(), None);
+    }
+
+    #[test]
+    fn test_retractable_first_value_retract_nonexistent() {
+        let mut acc = RetractableFirstValueAccumulator::new();
+        acc.add((100, 10));
+
+        // Retract something that doesn't exist → no effect
+        acc.retract(&(999, 99));
+        assert_eq!(acc.len(), 1);
+        assert_eq!(acc.result(), Some(10));
+    }
+
+    #[test]
+    fn test_retractable_first_value_duplicate_timestamps() {
+        let mut acc = RetractableFirstValueAccumulator::new();
+        acc.add((100, 10));
+        acc.add((100, 20)); // Same timestamp, different value
+
+        assert_eq!(acc.len(), 2);
+        // First at timestamp 100, first inserted value
+        assert_eq!(acc.result(), Some(10));
+
+        // Retract one → other remains
+        acc.retract(&(100, 10));
+        assert_eq!(acc.result(), Some(20));
+    }
+
+    // ── RetractableLastValueAccumulator ──────────────────────────────────────
+
+    #[test]
+    fn test_retractable_last_value_basic() {
+        let mut acc = RetractableLastValueAccumulator::new();
+        assert!(acc.is_empty());
+        assert_eq!(acc.result(), None);
+
+        acc.add((100, 10));
+        acc.add((300, 30));
+        acc.add((200, 20));
+
+        assert_eq!(acc.len(), 3);
+        // Last value = latest timestamp (300) → value 30
+        assert_eq!(acc.result(), Some(30));
+    }
+
+    #[test]
+    fn test_retractable_last_value_retract_non_last() {
+        let mut acc = RetractableLastValueAccumulator::new();
+        acc.add((100, 10));
+        acc.add((200, 20));
+        acc.add((300, 30));
+
+        // Retract a non-last entry → last value unchanged
+        acc.retract(&(200, 20));
+        assert_eq!(acc.result(), Some(30));
+    }
+
+    #[test]
+    fn test_retractable_last_value_retract_last() {
+        let mut acc = RetractableLastValueAccumulator::new();
+        acc.add((100, 10));
+        acc.add((200, 20));
+        acc.add((300, 30));
+
+        // Retract the last entry → next latest becomes last
+        acc.retract(&(300, 30));
+        assert_eq!(acc.result(), Some(20)); // ts=200
+    }
+
+    #[test]
+    fn test_retractable_last_value_retract_all() {
+        let mut acc = RetractableLastValueAccumulator::new();
+        acc.add((100, 10));
+        acc.retract(&(100, 10));
+        assert!(acc.is_empty());
+        assert_eq!(acc.result(), None);
+    }
+
+    // ── Merge tests ─────────────────────────────────────────────────────────
+
+    #[test]
+    fn test_retractable_first_value_merge() {
+        let mut acc1 = RetractableFirstValueAccumulator::new();
+        let mut acc2 = RetractableFirstValueAccumulator::new();
+
+        acc1.add((200, 20));
+        acc1.add((400, 40));
+        acc2.add((100, 10));
+        acc2.add((300, 30));
+
+        acc1.merge(&acc2);
+        assert_eq!(acc1.len(), 4);
+        // Merged: sorted by timestamp, first = (100, 10)
+        assert_eq!(acc1.result(), Some(10));
+    }
+
+    #[test]
+    fn test_retractable_last_value_merge() {
+        let mut acc1 = RetractableLastValueAccumulator::new();
+        let mut acc2 = RetractableLastValueAccumulator::new();
+
+        acc1.add((100, 10));
+        acc1.add((300, 30));
+        acc2.add((200, 20));
+        acc2.add((400, 40));
+
+        acc1.merge(&acc2);
+        assert_eq!(acc1.len(), 4);
+        // Last = (400, 40)
+        assert_eq!(acc1.result(), Some(40));
+    }
+
+    #[test]
+    fn test_retractable_first_value_merge_empty() {
+        let mut acc1 = RetractableFirstValueAccumulator::new();
+        let acc2 = RetractableFirstValueAccumulator::new();
+
+        acc1.add((100, 10));
+        acc1.merge(&acc2); // Merge empty into non-empty
+        assert_eq!(acc1.result(), Some(10));
+
+        let mut acc3 = RetractableFirstValueAccumulator::new();
+        let acc4 = RetractableFirstValueAccumulator::new();
+        acc3.merge(&acc4); // Merge empty into empty
+        assert!(acc3.is_empty());
+    }
+
+    // ── Reset/clear tests ───────────────────────────────────────────────────
+
+    #[test]
+    fn test_retractable_first_value_reset() {
+        let mut acc = RetractableFirstValueAccumulator::new();
+        acc.add((100, 10));
+        acc.add((200, 20));
+        assert!(!acc.is_empty());
+
+        acc.reset();
+        assert!(acc.is_empty());
+        assert_eq!(acc.result(), None);
+    }
+
+    #[test]
+    fn test_retractable_last_value_reset() {
+        let mut acc = RetractableLastValueAccumulator::new();
+        acc.add((100, 10));
+        acc.reset();
+        assert!(acc.is_empty());
+    }
+
+    // ── f64 variant tests ───────────────────────────────────────────────────
+
+    #[test]
+    fn test_retractable_first_value_f64_basic() {
+        let mut acc = RetractableFirstValueF64Accumulator::new();
+        acc.add((200, 20.5));
+        acc.add((100, 10.5));
+        acc.add((300, 30.5));
+
+        assert_eq!(acc.len(), 3);
+        // First = earliest timestamp (100) → value 10.5
+        let result = acc.result_f64().unwrap();
+        assert!((result - 10.5).abs() < f64::EPSILON);
+    }
+
+    #[test]
+    fn test_retractable_first_value_f64_retract() {
+        let mut acc = RetractableFirstValueF64Accumulator::new();
+        acc.add((100, 10.5));
+        acc.add((200, 20.5));
+
+        // Retract first → next becomes first
+        acc.retract(&(100, 10.5));
+        let result = acc.result_f64().unwrap();
+        assert!((result - 20.5).abs() < f64::EPSILON);
+    }
+
+    #[test]
+    fn test_retractable_last_value_f64_basic() {
+        let mut acc = RetractableLastValueF64Accumulator::new();
+        acc.add((100, 10.5));
+        acc.add((300, 30.5));
+        acc.add((200, 20.5));
+
+        let result = acc.result_f64().unwrap();
+        assert!((result - 30.5).abs() < f64::EPSILON);
+    }
+
+    #[test]
+    fn test_retractable_last_value_f64_retract() {
+        let mut acc = RetractableLastValueF64Accumulator::new();
+        acc.add((100, 10.5));
+        acc.add((200, 20.5));
+        acc.add((300, 30.5));
+
+        acc.retract(&(300, 30.5));
+        let result = acc.result_f64().unwrap();
+        assert!((result - 20.5).abs() < f64::EPSILON);
+    }
+
+    #[test]
+    fn test_retractable_first_value_f64_merge() {
+        let mut acc1 = RetractableFirstValueF64Accumulator::new();
+        let mut acc2 = RetractableFirstValueF64Accumulator::new();
+        acc1.add((200, 20.5));
+        acc2.add((100, 10.5));
+        acc1.merge(&acc2);
+        let result = acc1.result_f64().unwrap();
+        assert!((result - 10.5).abs() < f64::EPSILON);
+    }
+
+    #[test]
+    fn test_retractable_last_value_f64_merge() {
+        let mut acc1 = RetractableLastValueF64Accumulator::new();
+        let mut acc2 = RetractableLastValueF64Accumulator::new();
+        acc1.add((100, 10.5));
+        acc2.add((300, 30.5));
+        acc1.merge(&acc2);
+        let result = acc1.result_f64().unwrap();
+        assert!((result - 30.5).abs() < f64::EPSILON);
+    }
+
+    // ── Edge cases ──────────────────────────────────────────────────────────
+
+    #[test]
+    fn test_retractable_first_value_single_entry() {
+        let mut acc = RetractableFirstValueAccumulator::new();
+        acc.add((100, 42));
+        assert_eq!(acc.result(), Some(42));
+        acc.retract(&(100, 42));
+        assert_eq!(acc.result(), None);
+    }
+
+    #[test]
+    fn test_retractable_last_value_single_entry() {
+        let mut acc = RetractableLastValueAccumulator::new();
+        acc.add((100, 42));
+        assert_eq!(acc.result(), Some(42));
+        acc.retract(&(100, 42));
+        assert_eq!(acc.result(), None);
+    }
+
+    #[test]
+    fn test_retractable_first_value_negative_values() {
+        let mut acc = RetractableFirstValueAccumulator::new();
+        acc.add((100, -10));
+        acc.add((200, -20));
+        assert_eq!(acc.result(), Some(-10));
+    }
+
+    #[test]
+    fn test_retractable_supports_efficient_retraction() {
+        let acc = RetractableFirstValueAccumulator::new();
+        assert!(acc.supports_efficient_retraction());
+
+        let acc2 = RetractableLastValueAccumulator::new();
+        assert!(acc2.supports_efficient_retraction());
+
+        let acc3 = RetractableFirstValueF64Accumulator::new();
+        assert!(acc3.supports_efficient_retraction());
+
+        let acc4 = RetractableLastValueF64Accumulator::new();
+        assert!(acc4.supports_efficient_retraction());
+    }
+
+    // ── OHLC retraction simulation ──────────────────────────────────────────
+
+    #[test]
+    fn test_ohlc_retraction_simulation() {
+        // Simulate an OHLC window where trades arrive out of order
+        // and one needs to be retracted
+        let mut open_acc = RetractableFirstValueAccumulator::new();
+        let mut close_acc = RetractableLastValueAccumulator::new();
+
+        // Trade 1: price=100 at t=1000
+        open_acc.add((1000, 100));
+        close_acc.add((1000, 100));
+
+        // Trade 2: price=105 at t=2000
+        open_acc.add((2000, 105));
+        close_acc.add((2000, 105));
+
+        // Trade 3: price=98 at t=3000
+        open_acc.add((3000, 98));
+        close_acc.add((3000, 98));
+
+        assert_eq!(open_acc.result(), Some(100)); // Open = earliest
+        assert_eq!(close_acc.result(), Some(98)); // Close = latest
+
+        // Retract trade 1 (correction: it was a bad trade)
+        open_acc.retract(&(1000, 100));
+        close_acc.retract(&(1000, 100));
+
+        // Open now = trade 2 (earliest remaining)
+        assert_eq!(open_acc.result(), Some(105));
+        // Close still = trade 3 (latest)
+        assert_eq!(close_acc.result(), Some(98));
+    }
+
+    #[test]
+    fn test_ohlc_retraction_f64_simulation() {
+        let mut open_acc = RetractableFirstValueF64Accumulator::new();
+        let mut close_acc = RetractableLastValueF64Accumulator::new();
+
+        open_acc.add((1000, 100.50));
+        close_acc.add((1000, 100.50));
+        open_acc.add((2000, 105.25));
+        close_acc.add((2000, 105.25));
+        open_acc.add((3000, 98.75));
+        close_acc.add((3000, 98.75));
+
+        let open = open_acc.result_f64().unwrap();
+        let close = close_acc.result_f64().unwrap();
+        assert!((open - 100.50).abs() < f64::EPSILON);
+        assert!((close - 98.75).abs() < f64::EPSILON);
+
+        // Retract trade at t=1000
+        open_acc.retract(&(1000, 100.50));
+        close_acc.retract(&(1000, 100.50));
+
+        let open2 = open_acc.result_f64().unwrap();
+        assert!((open2 - 105.25).abs() < f64::EPSILON);
     }
 }

@@ -5,30 +5,43 @@
 
 ## Last Session
 
-**Date**: 2026-01-26
+**Date**: 2026-01-27
 
 ### What Was Accomplished
-- F005B: Advanced DataFusion Integration - COMPLETE (31 new tests)
-  - `window_udf.rs`: TumbleWindowStart, HopWindowStart, SessionWindowStart scalar UDFs (17 tests)
-  - `watermark_udf.rs`: WatermarkUdf via Arc<AtomicI64> with Nullary signature (4 tests)
-  - `execute.rs`: execute_streaming_sql(), StreamingSqlResult, DdlResult, QueryResult (5 tests)
-  - `planner/mod.rs`: async to_logical_plan() via SessionContext + SQL re-parse
-  - `mod.rs`: register_streaming_functions(), register_streaming_functions_with_watermark() (5 integration tests)
-  - `lib.rs`: re-exports for all new public types
+- F074-F077: Aggregation Semantics Enhancement - ALL COMPLETE (219 new tests)
+  - F074: Composite Aggregator & f64 Type Support (122 tests in laminar-core)
+    - `ScalarResult` enum, `DynAccumulator` trait, `DynAggregatorFactory` trait
+    - `CompositeAggregator` + `CompositeAccumulator` for multi-aggregate windows
+    - `SumF64`, `MinF64`, `MaxF64`, `AvgF64` aggregators (indexed variants)
+    - `FirstValueF64DynAccumulator`, `LastValueF64DynAccumulator`
+    - `CountDynAccumulator`, composite output in window operators
+  - F075: DataFusion Aggregate Bridge (40 tests in laminar-sql)
+    - `DataFusionAccumulatorAdapter` wraps DataFusion `Accumulator` as `DynAccumulator`
+    - `DataFusionAggregateFactory` wraps `AggregateUDF` as `DynAggregatorFactory`
+    - `scalar_value_to_result()` / `result_to_scalar_value()` conversions
+    - `lookup_aggregate_udf()` / `create_aggregate_factory()` lookup APIs
+  - F076: Retractable FIRST/LAST Accumulators (26 tests in laminar-core)
+    - `RetractableFirstValueAccumulator`, `RetractableLastValueAccumulator`
+    - f64 variants using bits-as-i64 pattern
+    - Fixed duplicate timestamp insertion order bug
+  - F077: Extended Aggregation Parser (57 tests in laminar-sql)
+    - 20+ new `AggregateType` variants (StdDev, Variance, Percentile, Median, etc.)
+    - SQL alias recognition (STDDEV_SAMP, VAR_SAMP, EVERY, LISTAGG, GROUP_CONCAT)
+    - FILTER clause and WITHIN GROUP detection
+    - `datafusion_name()` mapping method, `arity()`, updated `is_decomposable()`
 
 Previous session:
-- F023: Exactly-Once Sinks - COMPLETE (28 new tests)
+- F005B: Advanced DataFusion Integration - COMPLETE (31 tests)
+- F023: Exactly-Once Sinks - COMPLETE (28 tests)
 - F006B: Production SQL Parser - COMPLETE (129 tests)
-- F072, F066, F021-F024, F056-F057, F060-F073 all complete
 
-**Total tests**: 1060 (774 core + 160 sql + 120 storage + 6 connectors)
+**Total tests**: 1176 (896 core + 280 sql + 120 storage + 6 connectors)
 
 ### Where We Left Off
-**Phase 2 Production Hardening: 30/30 features COMPLETE (100%)**
+**Phase 2 Production Hardening: 34/34 features COMPLETE (100%)**
 
 ### Immediate Next Steps
 1. Phase 3: Connectors & Integration (F025-F034)
-2. Update feature INDEX.md to mark F005B as Done
 
 ### Open Issues
 None - Phase 2 complete.
@@ -69,6 +82,10 @@ None - Phase 2 complete.
 | F066: Watermark Alignment Groups | Done | Pause/WarnOnly/DropExcess, coordinator, 25 tests |
 | F072: XDP/eBPF | Done | Packet header, CPU steering, Linux loader, 34 tests |
 | F005B: Advanced DataFusion | Done | Window/Watermark UDFs, async LogicalPlan, execute_streaming_sql, 31 tests |
+| F074: Composite Aggregator | Done | ScalarResult, DynAccumulator, CompositeAggregator, f64 aggregators, 122 tests |
+| F075: DataFusion Aggregate Bridge | Done | DataFusionAccumulatorAdapter, DataFusionAggregateFactory, 40 tests |
+| F076: Retractable FIRST/LAST | Done | RetractableFirst/LastValue, f64 variants, 26 tests |
+| F077: Extended Aggregation Parser | Done | 20+ new AggregateType variants, FILTER, WITHIN GROUP, 57 tests |
 
 ---
 
@@ -98,6 +115,8 @@ laminar-core/src/
   numa/         # F068: NUMA awareness
   tpc/          # F013/F014: Thread-per-core
   operator/     # Windows, joins, changelog
+    window      # F074: CompositeAggregator, DynAccumulator, f64 aggregators
+    changelog   # F076: RetractableFirst/LastValueAccumulator
     asof_join   # F056: ASOF joins
     temporal_join # F021: Temporal joins
 
@@ -108,7 +127,7 @@ laminar-sql/src/       # F006B: Production SQL Parser
     emit_parser        # EMIT clause parsing
     late_data_parser   # Late data handling
     join_parser        # Stream-stream/lookup join analysis
-    aggregation_parser # COUNT/SUM/MIN/MAX/AVG/FIRST/LAST detection
+    aggregation_parser # F077: 30+ aggregates, FILTER, WITHIN GROUP, datafusion_name()
   planner/             # StreamingPlanner, QueryPlan
   translator/          # Operator configuration builders
     window_translator  # WindowOperatorConfig
@@ -117,6 +136,7 @@ laminar-sql/src/       # F006B: Production SQL Parser
     window_udf         # F005B: TUMBLE/HOP/SESSION scalar UDFs
     watermark_udf      # F005B: watermark() UDF via Arc<AtomicI64>
     execute            # F005B: execute_streaming_sql end-to-end
+    aggregate_bridge   # F075: DataFusion Accumulator ↔ DynAccumulator bridge
 
 laminar-storage/src/
   incremental/  # F022: Checkpointing
