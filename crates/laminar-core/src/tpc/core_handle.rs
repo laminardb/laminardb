@@ -118,6 +118,8 @@ pub struct CoreHandle {
     shutdown: Arc<AtomicBool>,
     /// Events processed counter
     events_processed: Arc<AtomicU64>,
+    /// Outputs dropped due to full outbox
+    outputs_dropped: Arc<AtomicU64>,
     /// Running state
     is_running: Arc<AtomicBool>,
 }
@@ -158,6 +160,7 @@ impl CoreHandle {
         let credit_gate = Arc::new(CreditGate::new(config.backpressure.clone()));
         let shutdown = Arc::new(AtomicBool::new(false));
         let events_processed = Arc::new(AtomicU64::new(0));
+        let outputs_dropped = Arc::new(AtomicU64::new(0));
         let is_running = Arc::new(AtomicBool::new(false));
 
         let thread_context = CoreThreadContext {
@@ -171,6 +174,7 @@ impl CoreHandle {
             credit_gate: Arc::clone(&credit_gate),
             shutdown: Arc::clone(&shutdown),
             events_processed: Arc::clone(&events_processed),
+            outputs_dropped: Arc::clone(&outputs_dropped),
             is_running: Arc::clone(&is_running),
             #[cfg(all(target_os = "linux", feature = "io-uring"))]
             io_uring_config: config.io_uring_config,
@@ -178,7 +182,7 @@ impl CoreHandle {
 
         let thread = thread::Builder::new()
             .name(format!("laminar-core-{core_id}"))
-            .spawn(move || core_thread_main(thread_context, operators))
+            .spawn(move || core_thread_main(&thread_context, operators))
             .map_err(|e| TpcError::SpawnFailed {
                 core_id,
                 message: e.to_string(),
@@ -198,6 +202,7 @@ impl CoreHandle {
             thread: Some(thread),
             shutdown,
             events_processed,
+            outputs_dropped,
             is_running,
         })
     }
@@ -224,6 +229,12 @@ impl CoreHandle {
     #[must_use]
     pub fn events_processed(&self) -> u64 {
         self.events_processed.load(Ordering::Relaxed)
+    }
+
+    /// Returns the number of outputs dropped due to a full outbox.
+    #[must_use]
+    pub fn outputs_dropped(&self) -> u64 {
+        self.outputs_dropped.load(Ordering::Relaxed)
     }
 
     /// Sends a message to the core with credit-based flow control.
@@ -479,6 +490,7 @@ impl std::fmt::Debug for CoreHandle {
             .field("numa_node", &self.numa_node)
             .field("is_running", &self.is_running())
             .field("events_processed", &self.events_processed())
+            .field("outputs_dropped", &self.outputs_dropped())
             .field("inbox_len", &self.inbox_len())
             .field("outbox_len", &self.outbox_len())
             .field("available_credits", &self.available_credits())
@@ -499,16 +511,17 @@ struct CoreThreadContext {
     credit_gate: Arc<CreditGate>,
     shutdown: Arc<AtomicBool>,
     events_processed: Arc<AtomicU64>,
+    outputs_dropped: Arc<AtomicU64>,
     is_running: Arc<AtomicBool>,
     #[cfg(all(target_os = "linux", feature = "io-uring"))]
     io_uring_config: Option<IoUringConfig>,
 }
 
-/// Main function for the core thread.
-fn core_thread_main(
-    ctx: CoreThreadContext,
+/// Initializes the core thread: sets CPU affinity, NUMA allocator, `io_uring`, and creates the reactor.
+fn init_core_thread(
+    ctx: &CoreThreadContext,
     operators: Vec<Box<dyn Operator>>,
-) -> Result<(), TpcError> {
+) -> Result<Reactor, TpcError> {
     // Set CPU affinity if requested
     if let Some(cpu_id) = ctx.cpu_affinity {
         set_cpu_affinity(ctx.core_id, cpu_id)?;
@@ -524,12 +537,10 @@ fn core_thread_main(
     }
 
     // Create NUMA allocator for this core (optional - for future state store integration)
-    let _numa_allocator = if ctx.numa_aware {
+    if ctx.numa_aware {
         let topology = NumaTopology::detect();
-        Some(NumaAllocator::new(&topology))
-    } else {
-        None
-    };
+        let _numa_allocator = NumaAllocator::new(&topology);
+    }
 
     // Initialize io_uring ring manager if configured (Linux only)
     #[cfg(all(target_os = "linux", feature = "io-uring"))]
@@ -549,7 +560,7 @@ fn core_thread_main(
     };
 
     // Create the reactor with configured settings
-    let mut reactor_config = ctx.reactor_config;
+    let mut reactor_config = ctx.reactor_config.clone();
     reactor_config.cpu_affinity = ctx.cpu_affinity;
 
     let mut reactor = Reactor::new(reactor_config).map_err(|e| TpcError::ReactorError {
@@ -561,6 +572,16 @@ fn core_thread_main(
     for op in operators {
         reactor.add_operator(op);
     }
+
+    Ok(reactor)
+}
+
+/// Main function for the core thread.
+fn core_thread_main(
+    ctx: &CoreThreadContext,
+    operators: Vec<Box<dyn Operator>>,
+) -> Result<(), TpcError> {
+    let mut reactor = init_core_thread(ctx, operators)?;
 
     // Signal that we're running
     ctx.is_running.store(true, Ordering::Release);
@@ -592,14 +613,23 @@ fn core_thread_main(
                     had_work = true;
                 }
                 CoreMessage::Watermark(timestamp) => {
-                    // TODO: Propagate watermark to reactor
-                    // For now, we create a synthetic event with the watermark timestamp
-                    let _ = timestamp;
+                    // Advance the reactor's watermark so downstream operators
+                    // see the updated event-time progress on the next poll().
+                    reactor.advance_watermark(timestamp);
                     messages_processed += 1;
                     had_work = true;
                 }
-                CoreMessage::CheckpointRequest(_checkpoint_id) => {
-                    // TODO: Trigger checkpoint
+                CoreMessage::CheckpointRequest(checkpoint_id) => {
+                    // Snapshot all operator states and push to outbox
+                    // for Ring 1 to persist via WAL + RocksDB.
+                    let operator_states = reactor.trigger_checkpoint();
+                    let checkpoint_output = Output::CheckpointComplete {
+                        checkpoint_id,
+                        operator_states,
+                    };
+                    if ctx.outbox.push(checkpoint_output).is_err() {
+                        ctx.outputs_dropped.fetch_add(1, Ordering::Relaxed);
+                    }
                     messages_processed += 1;
                     had_work = true;
                 }
@@ -631,11 +661,8 @@ fn core_thread_main(
 
         // Push outputs to outbox
         for output in outputs {
-            // If outbox is full, we may need to drop or buffer
-            // For now, just try to push (may fail silently)
             if ctx.outbox.push(output).is_err() {
-                // Outbox full - outputs are dropped
-                // TODO: Track dropped outputs in metrics
+                ctx.outputs_dropped.fetch_add(1, Ordering::Relaxed);
             }
             had_work = true;
         }
@@ -1041,6 +1068,119 @@ mod tests {
         // There should be more items remaining
         let remaining = handle.outbox_len();
         assert!(remaining > 0);
+
+        handle.shutdown_and_join().unwrap();
+    }
+
+    #[test]
+    fn test_watermark_propagation() {
+        let config = CoreConfig {
+            core_id: 0,
+            cpu_affinity: None,
+            inbox_capacity: 1024,
+            outbox_capacity: 1024,
+            reactor_config: ReactorConfig::default(),
+            backpressure: super::BackpressureConfig::default(),
+            numa_aware: false,
+            #[cfg(all(target_os = "linux", feature = "io-uring"))]
+            io_uring_config: None,
+        };
+
+        let handle = CoreHandle::spawn_with_operators(
+            config,
+            vec![Box::new(PassthroughOperator)],
+        ).unwrap();
+
+        // Send a watermark advancement
+        handle.send(CoreMessage::Watermark(5000)).unwrap();
+
+        // Wait for processing
+        thread::sleep(Duration::from_millis(50));
+
+        // Poll outputs - should contain a watermark
+        let outputs = handle.poll_outputs(100);
+        let has_watermark = outputs.iter().any(|o| matches!(o, Output::Watermark(_)));
+        assert!(has_watermark, "Expected watermark output after Watermark message");
+
+        handle.shutdown_and_join().unwrap();
+    }
+
+    #[test]
+    fn test_checkpoint_triggering() {
+        let config = CoreConfig {
+            core_id: 0,
+            cpu_affinity: None,
+            inbox_capacity: 1024,
+            outbox_capacity: 1024,
+            reactor_config: ReactorConfig::default(),
+            backpressure: super::BackpressureConfig::default(),
+            numa_aware: false,
+            #[cfg(all(target_os = "linux", feature = "io-uring"))]
+            io_uring_config: None,
+        };
+
+        let handle = CoreHandle::spawn_with_operators(
+            config,
+            vec![Box::new(PassthroughOperator)],
+        ).unwrap();
+
+        // Send a checkpoint request
+        handle.send(CoreMessage::CheckpointRequest(42)).unwrap();
+
+        // Wait for processing
+        thread::sleep(Duration::from_millis(50));
+
+        // Poll outputs - should contain a CheckpointComplete
+        let outputs = handle.poll_outputs(100);
+        let checkpoint = outputs.iter().find(|o| {
+            matches!(o, Output::CheckpointComplete { .. })
+        });
+        assert!(checkpoint.is_some(), "Expected CheckpointComplete output");
+
+        if let Some(Output::CheckpointComplete {
+            checkpoint_id,
+            operator_states,
+        }) = checkpoint
+        {
+            assert_eq!(*checkpoint_id, 42);
+            // One operator (PassthroughOperator)
+            assert_eq!(operator_states.len(), 1);
+            assert_eq!(operator_states[0].operator_id, "passthrough");
+        }
+
+        handle.shutdown_and_join().unwrap();
+    }
+
+    #[test]
+    fn test_outputs_dropped_counter() {
+        let config = CoreConfig {
+            core_id: 0,
+            cpu_affinity: None,
+            inbox_capacity: 1024,
+            outbox_capacity: 4, // Very small outbox to force drops
+            reactor_config: ReactorConfig::default(),
+            backpressure: super::BackpressureConfig::default(),
+            numa_aware: false,
+            #[cfg(all(target_os = "linux", feature = "io-uring"))]
+            io_uring_config: None,
+        };
+
+        let handle = CoreHandle::spawn_with_operators(
+            config,
+            vec![Box::new(PassthroughOperator)],
+        ).unwrap();
+
+        // Send many events without polling - outbox should fill up
+        for i in 0..100 {
+            let _ = handle.send_event(make_event(i));
+        }
+
+        // Wait for processing to fill and overflow the outbox
+        thread::sleep(Duration::from_millis(200));
+
+        // Some outputs should have been dropped
+        let dropped = handle.outputs_dropped();
+        assert!(dropped > 0, "Expected some outputs to be dropped with outbox_capacity=4");
 
         handle.shutdown_and_join().unwrap();
     }

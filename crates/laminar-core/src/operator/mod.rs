@@ -47,6 +47,16 @@ pub enum Output {
     /// Used by `EmitStrategy::Changelog` to emit structured change records
     /// for CDC pipelines and cascading materialized views.
     Changelog(window::ChangelogRecord),
+    /// Checkpoint completion with snapshotted operator states.
+    ///
+    /// Emitted when a `CheckpointRequest` is processed by a core thread.
+    /// Carries the checkpoint ID and all operator states for persistence by Ring 1.
+    CheckpointComplete {
+        /// The checkpoint ID from the request
+        checkpoint_id: u64,
+        /// Snapshotted states from all operators on this core
+        operator_states: Vec<OperatorState>,
+    },
 }
 
 /// Collection type for operator outputs.

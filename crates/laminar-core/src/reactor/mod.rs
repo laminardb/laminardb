@@ -27,7 +27,7 @@ use std::time::{Duration, Instant};
 
 use crate::alloc::HotPathGuard;
 use crate::budget::TaskBudget;
-use crate::operator::{Event, Operator, OperatorContext, Output};
+use crate::operator::{Event, Operator, OperatorContext, OperatorState, Output};
 use crate::state::{InMemoryStore, StateStore};
 use crate::time::{BoundedOutOfOrdernessGenerator, TimerService, WatermarkGenerator};
 
@@ -332,6 +332,33 @@ impl Reactor {
         std::mem::take(&mut self.output_buffer)
     }
 
+    /// Advances the watermark to the given timestamp.
+    ///
+    /// Called when an external watermark message arrives (e.g., from TPC coordination).
+    /// Updates the reactor's event time tracking and watermark generator state.
+    /// Any resulting watermark output will be included in the next `poll()` result.
+    pub fn advance_watermark(&mut self, timestamp: i64) {
+        // Update current event time if this watermark is newer
+        if timestamp > self.current_event_time {
+            self.current_event_time = timestamp;
+        }
+
+        // Feed the timestamp to the watermark generator so it can advance
+        if let Some(watermark) = self.watermark_generator.on_event(timestamp) {
+            self.output_buffer
+                .push(Output::Watermark(watermark.timestamp()));
+        }
+    }
+
+    /// Triggers a checkpoint by snapshotting all operator states.
+    ///
+    /// Called when a `CheckpointRequest` arrives from the control plane.
+    /// Collects the serialized state from each operator and returns it
+    /// for persistence by Ring 1.
+    pub fn trigger_checkpoint(&mut self) -> Vec<OperatorState> {
+        self.operators.iter().map(|op| op.checkpoint()).collect()
+    }
+
     /// Get current processing time in microseconds since reactor start
     #[allow(clippy::cast_possible_truncation)]
     fn get_processing_time(&self) -> i64 {
@@ -555,6 +582,15 @@ impl Sink for StdoutSink {
                         record.emit_timestamp,
                         record.event.timestamp,
                         record.event.data
+                    );
+                }
+                Output::CheckpointComplete {
+                    checkpoint_id,
+                    operator_states,
+                } => {
+                    println!(
+                        "Checkpoint: id={checkpoint_id}, operators={}",
+                        operator_states.len()
                     );
                 }
             }
