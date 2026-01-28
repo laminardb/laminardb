@@ -159,6 +159,9 @@ fn parse_error_to_parser_error(e: ParseError) -> sqlparser::parser::ParserError 
         ParseError::WindowError(msg) => {
             sqlparser::parser::ParserError::ParserError(format!("Window error: {msg}"))
         }
+        ParseError::ValidationError(msg) => {
+            sqlparser::parser::ParserError::ParserError(format!("Validation error: {msg}"))
+        }
     }
 }
 
@@ -176,4 +179,8 @@ pub enum ParseError {
     /// Window function error
     #[error("Window function error: {0}")]
     WindowError(String),
+
+    /// Validation error (e.g., invalid option values)
+    #[error("Validation error: {0}")]
+    ValidationError(String),
 }

@@ -7,10 +7,10 @@
 | Phase 1 | 12 | 0 | 0 | 0 | 12 |
 | Phase 1.5 | 1 | 0 | 0 | 0 | 1 |
 | Phase 2 | 34 | 0 | 0 | 0 | 34 |
-| Phase 3 | 12 | 12 | 0 | 0 | 0 |
+| Phase 3 | 21 | 14 | 0 | 0 | 7 |
 | Phase 4 | 11 | 11 | 0 | 0 | 0 |
 | Phase 5 | 10 | 10 | 0 | 0 | 0 |
-| **Total** | **80** | **33** | **0** | **0** | **47** |
+| **Total** | **89** | **35** | **0** | **0** | **54** |
 
 ## Status Legend
 
@@ -254,6 +254,30 @@ Ring 0: mmap + ChangelogBuffer (zero-alloc) ──▶ Ring 1: WAL + RocksDB ─�
 ---
 
 ## Phase 3: Connectors & Integration
+
+### Streaming API (In-Memory Sources/Sinks)
+
+> **NEW**: In-memory streaming API - embedded Kafka Streams-like semantics.
+> See [Streaming API Index](phase-3/streaming/INDEX.md) for details.
+
+| ID | Feature | Priority | Status | Spec |
+|----|---------|----------|--------|------|
+| F-STREAM-001 | Ring Buffer | P0 | ✅ | [Link](phase-3/streaming/F-STREAM-001-ring-buffer.md) |
+| F-STREAM-002 | SPSC Channel | P0 | ✅ | [Link](phase-3/streaming/F-STREAM-002-spsc-channel.md) |
+| F-STREAM-003 | MPSC Auto-Upgrade | P0 | ✅ | [Link](phase-3/streaming/F-STREAM-003-mpsc-upgrade.md) |
+| F-STREAM-004 | Source | P0 | ✅ | [Link](phase-3/streaming/F-STREAM-004-source.md) |
+| F-STREAM-005 | Sink | P0 | ✅ | [Link](phase-3/streaming/F-STREAM-005-sink.md) |
+| F-STREAM-006 | Subscription | P0 | ✅ | [Link](phase-3/streaming/F-STREAM-006-subscription.md) |
+| F-STREAM-007 | SQL DDL | P0 | ✅ | [Link](phase-3/streaming/F-STREAM-007-sql-ddl.md) |
+| F-STREAM-010 | Broadcast Channel | P1 | 📝 | [Link](phase-3/streaming/F-STREAM-010-broadcast-channel.md) |
+| F-STREAM-013 | Checkpointing | P1 | 📝 | [Link](phase-3/streaming/F-STREAM-013-checkpointing.md) |
+
+**Key Design Principles**:
+- Channel type is NEVER user-specified (auto-derived)
+- SPSC → MPSC upgrades automatically on `source.clone()`
+- Checkpointing is OPTIONAL (zero overhead when disabled)
+
+### External Connectors
 
 | ID | Feature | Priority | Status | Spec |
 |----|---------|----------|--------|------|

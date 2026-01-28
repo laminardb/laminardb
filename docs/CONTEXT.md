@@ -5,46 +5,57 @@
 
 ## Last Session
 
-**Date**: 2026-01-27
+**Date**: 2026-01-28
 
 ### What Was Accomplished
-- F074-F077: Aggregation Semantics Enhancement - ALL COMPLETE (219 new tests)
-  - F074: Composite Aggregator & f64 Type Support (122 tests in laminar-core)
-    - `ScalarResult` enum, `DynAccumulator` trait, `DynAggregatorFactory` trait
-    - `CompositeAggregator` + `CompositeAccumulator` for multi-aggregate windows
-    - `SumF64`, `MinF64`, `MaxF64`, `AvgF64` aggregators (indexed variants)
-    - `FirstValueF64DynAccumulator`, `LastValueF64DynAccumulator`
-    - `CountDynAccumulator`, composite output in window operators
-  - F075: DataFusion Aggregate Bridge (40 tests in laminar-sql)
-    - `DataFusionAccumulatorAdapter` wraps DataFusion `Accumulator` as `DynAccumulator`
-    - `DataFusionAggregateFactory` wraps `AggregateUDF` as `DynAggregatorFactory`
-    - `scalar_value_to_result()` / `result_to_scalar_value()` conversions
-    - `lookup_aggregate_udf()` / `create_aggregate_factory()` lookup APIs
-  - F076: Retractable FIRST/LAST Accumulators (26 tests in laminar-core)
-    - `RetractableFirstValueAccumulator`, `RetractableLastValueAccumulator`
-    - f64 variants using bits-as-i64 pattern
-    - Fixed duplicate timestamp insertion order bug
-  - F077: Extended Aggregation Parser (57 tests in laminar-sql)
-    - 20+ new `AggregateType` variants (StdDev, Variance, Percentile, Median, etc.)
-    - SQL alias recognition (STDDEV_SAMP, VAR_SAMP, EVERY, LISTAGG, GROUP_CONCAT)
-    - FILTER clause and WITHIN GROUP detection
-    - `datafusion_name()` mapping method, `arity()`, updated `is_decomposable()`
+- F-STREAM-001 to F-STREAM-007: Streaming API Implementation - ALL COMPLETE (99 tests)
+  - F-STREAM-001: Ring Buffer (15 tests)
+    - Lock-free heap-allocated ring buffer with CachePadded indices
+    - Power-of-2 capacity with bitmask indexing, Acquire/Release ordering
+    - push/pop/peek, batch operations (push_batch, pop_batch, pop_each, pop_batch_into)
+  - F-STREAM-002: SPSC Channel (22 tests)
+    - Producer/Consumer handles with Arc<Inner>
+    - Backpressure strategies: Block, DropOldest, Reject
+    - Wait strategies: Spin, SpinYield, Park
+  - F-STREAM-003: MPSC Auto-Upgrade (integrated with F-STREAM-002)
+    - `producer_count: AtomicUsize` tracks clones
+    - Clone increments count and sets mode to MPSC
+    - Spin-lock serialization for MPSC producers
+  - F-STREAM-004: Source API (15 tests)
+    - `Record` trait with to_record_batch(), schema(), event_time()
+    - Source<T> with push(), try_push(), push_batch(), push_arrow(), watermark()
+    - clone() triggers automatic SPSC → MPSC upgrade
+  - F-STREAM-005: Sink API (7 tests)
+    - Sink<T> receives records from Source
+    - subscribe() returns Subscription, supports broadcast mode
+  - F-STREAM-006: Subscription API (16 tests)
+    - poll(), recv(), recv_timeout(), poll_batch(), poll_each()
+    - SubscriptionMessage for raw messages including watermarks
+    - Iterator implementation for Subscription
+  - F-STREAM-007: SQL DDL Translator (18 tests)
+    - SourceDefinition, SinkDefinition types
+    - translate_create_source(), translate_create_sink()
+    - SQL type → Arrow DataType conversion
+    - Validation: rejects 'channel' option (channel type is auto-derived)
 
 Previous session:
-- F005B: Advanced DataFusion Integration - COMPLETE (31 tests)
-- F023: Exactly-Once Sinks - COMPLETE (28 tests)
-- F006B: Production SQL Parser - COMPLETE (129 tests)
+- F074-F077: Aggregation Semantics Enhancement - COMPLETE (219 tests)
 
-**Total tests**: 1176 (896 core + 280 sql + 120 storage + 6 connectors)
+**Total tests**: 1275 (977 core + 298 sql + 120 storage + 6 connectors)
 
 ### Where We Left Off
-**Phase 2 Production Hardening: 34/34 features COMPLETE (100%)**
+**Phase 3 Connectors & Integration: 7/21 features COMPLETE (33%)**
+- Streaming API core complete (F-STREAM-001 to F-STREAM-007)
+- Next: External connectors (F025-F034)
 
 ### Immediate Next Steps
-1. Phase 3: Connectors & Integration (F025-F034)
+1. F025: Kafka Source Connector
+2. F026: Kafka Sink Connector
+3. F-STREAM-010: Broadcast Channel (optional enhancement)
+4. F-STREAM-013: Checkpointing (optional)
 
 ### Open Issues
-None - Phase 2 complete.
+None - Streaming API foundation complete.
 
 ---
 

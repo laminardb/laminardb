@@ -42,6 +42,7 @@ pub mod operator;
 pub mod reactor;
 pub mod sink;
 pub mod state;
+pub mod streaming;
 pub mod time;
 pub mod tpc;
 pub mod xdp;
