@@ -517,6 +517,7 @@ impl TransactionLog {
                 "Unexpected end of log".to_string(),
             ));
         }
+        // SAFETY: Bounds check above guarantees slice is exactly 4 bytes
         let num_entries = u32::from_le_bytes(bytes[pos..pos + 4].try_into().unwrap()) as usize;
         pos += 4;
 
@@ -529,6 +530,7 @@ impl TransactionLog {
                     "Unexpected end of log".to_string(),
                 ));
             }
+            // SAFETY: Bounds check above guarantees slice is exactly 4 bytes
             let entry_len = u32::from_le_bytes(bytes[pos..pos + 4].try_into().unwrap()) as usize;
             pos += 4;
 

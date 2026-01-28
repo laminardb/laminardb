@@ -225,21 +225,15 @@ static ASOF_OPERATOR_COUNTER: AtomicU64 = AtomicU64::new(0);
 pub struct AsofRow {
     /// Event timestamp in milliseconds.
     pub timestamp: i64,
-    /// Serialized key value (as bytes).
-    pub key_value: Vec<u8>,
     /// Serialized record batch data.
     pub data: Vec<u8>,
 }
 
 impl AsofRow {
-    /// Creates a new ASOF row from an event and extracted key.
-    fn new(timestamp: i64, key_value: Vec<u8>, batch: &RecordBatch) -> Result<Self, OperatorError> {
+    /// Creates a new ASOF row from an event timestamp and batch.
+    fn new(timestamp: i64, batch: &RecordBatch) -> Result<Self, OperatorError> {
         let data = Self::serialize_batch(batch)?;
-        Ok(Self {
-            timestamp,
-            key_value,
-            data,
-        })
+        Ok(Self { timestamp, data })
     }
 
     /// Serializes a record batch to bytes.
@@ -562,8 +556,8 @@ impl AsofJoinOperator {
             // Still store it as it might match future left events for Backward direction
         }
 
-        // Create row and store in state
-        let Ok(row) = AsofRow::new(event.timestamp, key_value.clone(), &event.data) else {
+        // Create row and store in state (key is stored in HashMap, not in row)
+        let Ok(row) = AsofRow::new(event.timestamp, &event.data) else {
             return output;
         };
 
@@ -1558,12 +1552,10 @@ mod tests {
         // Insert some rows
         let row1 = AsofRow {
             timestamp: 100,
-            key_value: b"test".to_vec(),
             data: vec![],
         };
         let row2 = AsofRow {
             timestamp: 200,
-            key_value: b"test".to_vec(),
             data: vec![],
         };
 
@@ -1595,7 +1587,7 @@ mod tests {
         )
         .unwrap();
 
-        let row = AsofRow::new(1000, b"AAPL".to_vec(), &batch).unwrap();
+        let row = AsofRow::new(1000, &batch).unwrap();
 
         // Verify round-trip
         let restored_batch = row.to_batch().unwrap();

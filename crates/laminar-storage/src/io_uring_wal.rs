@@ -256,6 +256,7 @@ mod linux_impl {
                 .iter()
                 .position(|p| p.user_data == completion.user_data)
             {
+                // SAFETY: `pos` was just returned by `.position()`, so it's guaranteed to be valid
                 let pending = self.pending_writes.remove(pos).unwrap();
 
                 // Release the buffer
