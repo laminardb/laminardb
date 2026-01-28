@@ -27,17 +27,8 @@
 //!
 //! This design prevents buffer overflow while maximizing throughput.
 
-// Allow casting between numeric types for credit accounting.
-// These casts are safe because:
-// - Credit counts are bounded (max ~65536), well within i64/u64/usize range
-// - We handle negative values explicitly where needed
-// - Precision loss in f64 conversion is acceptable for watermark ratios
-#![allow(
-    clippy::cast_possible_wrap,
-    clippy::cast_sign_loss,
-    clippy::cast_precision_loss,
-    clippy::cast_possible_truncation
-)]
+// Credits are bounded by configuration to be within safe range for casting
+// Max credits: 65535 (u16::MAX) to ensure clean i64/f64 conversions
 
 use std::sync::atomic::{AtomicI64, AtomicU64, Ordering};
 use std::sync::Arc;
@@ -141,8 +132,8 @@ impl BackpressureConfigBuilder {
     #[must_use]
     pub fn build(self) -> BackpressureConfig {
         BackpressureConfig {
-            exclusive_credits: self.exclusive_credits.unwrap_or(4),
-            floating_credits: self.floating_credits.unwrap_or(8),
+            exclusive_credits: self.exclusive_credits.unwrap_or(4).min(u16::MAX as usize),
+            floating_credits: self.floating_credits.unwrap_or(8).min(u16::MAX as usize),
             overflow_strategy: self.overflow_strategy.unwrap_or(OverflowStrategy::Block),
             high_watermark: self.high_watermark.unwrap_or(0.8),
             low_watermark: self.low_watermark.unwrap_or(0.5),
@@ -198,6 +189,7 @@ impl CreditGate {
     pub fn new(config: BackpressureConfig) -> Self {
         let max_credits = config.total_credits();
         Self {
+            #[allow(clippy::cast_possible_wrap)] // Safe: bounded by u16::MAX in build()
             available: AtomicI64::new(max_credits as i64),
             max_credits,
             config,
@@ -214,7 +206,7 @@ impl CreditGate {
 
     /// Attempts to acquire N credits.
     pub fn try_acquire_n(&self, n: usize) -> CreditAcquireResult {
-        let n = n as i64;
+        let n = i64::try_from(n).unwrap_or(i64::MAX);
 
         // Try to acquire credits atomically
         let mut current = self.available.load(Ordering::Acquire);
@@ -224,7 +216,7 @@ impl CreditGate {
                 self.metrics.record_blocked();
                 return match self.config.overflow_strategy {
                     OverflowStrategy::Drop => {
-                        self.metrics.record_dropped(n as u64);
+                        self.metrics.record_dropped(u64::try_from(n).unwrap_or(0));
                         CreditAcquireResult::Dropped
                     }
                     // Both Block and Error return WouldBlock - caller handles differently
@@ -241,7 +233,7 @@ impl CreditGate {
                 Ordering::Acquire,
             ) {
                 Ok(_) => {
-                    self.metrics.record_acquired(n as u64);
+                    self.metrics.record_acquired(u64::try_from(n).unwrap_or(0));
                     return CreditAcquireResult::Acquired;
                 }
                 Err(actual) => current = actual,
@@ -269,28 +261,38 @@ impl CreditGate {
     ///
     /// Called by receiver after processing data.
     pub fn release(&self, n: usize) {
-        let n = n as i64;
+        let n = i64::try_from(n).unwrap_or(i64::MAX);
         let prev = self.available.fetch_add(n, Ordering::Release);
 
         // Clamp to max (in case of over-release)
         let new_val = prev + n;
-        if new_val > self.max_credits as i64 {
+        if new_val > {
+            #[allow(clippy::cast_possible_wrap)]
+            let max = self.max_credits as i64;
+            max
+        } {
             // Try to correct, but don't worry if it fails (another thread may have acquired)
             let _ = self.available.compare_exchange(
                 new_val,
-                self.max_credits as i64,
+                {
+                    #[allow(clippy::cast_possible_wrap)]
+                    let max = self.max_credits as i64;
+                    max
+                },
                 Ordering::AcqRel,
                 Ordering::Relaxed,
             );
         }
 
-        self.metrics.record_released(n as u64);
+        self.metrics.record_released(u64::try_from(n).unwrap_or(0));
     }
 
     /// Returns the number of available credits.
     #[must_use]
     pub fn available(&self) -> usize {
-        self.available.load(Ordering::Relaxed).max(0) as usize
+        #[allow(clippy::cast_possible_truncation, clippy::cast_sign_loss)] // Safe: load().max(0) is >= 0
+        let val = self.available.load(Ordering::Relaxed).max(0) as usize;
+        val
     }
 
     /// Returns the maximum credits.
@@ -302,7 +304,9 @@ impl CreditGate {
     /// Returns true if backpressure is active (credits below threshold).
     #[must_use]
     pub fn is_backpressured(&self) -> bool {
+        #[allow(clippy::cast_precision_loss)] // Acceptable for ratio
         let available = self.available() as f64;
+        #[allow(clippy::cast_precision_loss)] // Acceptable for ratio calculation
         let max = self.max_credits as f64;
         (available / max) < (1.0 - self.config.high_watermark)
     }
@@ -310,7 +314,9 @@ impl CreditGate {
     /// Returns true if backpressure has cleared (credits above low watermark).
     #[must_use]
     pub fn is_recovered(&self) -> bool {
+        #[allow(clippy::cast_precision_loss)] // Acceptable for ratio
         let available = self.available() as f64;
+        #[allow(clippy::cast_precision_loss)] // Acceptable for ratio calculation
         let max = self.max_credits as f64;
         (available / max) >= (1.0 - self.config.low_watermark)
     }
@@ -329,6 +335,7 @@ impl CreditGate {
 
     /// Resets the gate to initial state.
     pub fn reset(&self) {
+        #[allow(clippy::cast_possible_wrap)] // Safe: max_credits bounded to u16::MAX
         self.available.store(self.max_credits as i64, Ordering::Release);
         self.metrics.reset();
     }
@@ -433,9 +440,10 @@ pub struct CreditMetricsSnapshot {
 
 impl CreditMetricsSnapshot {
     /// Returns credits currently in flight (acquired - released).
+    #[allow(clippy::cast_possible_wrap)] // Metrics are u64, difference fits in i64 unless skewed
     #[must_use]
     pub fn credits_in_flight(&self) -> i64 {
-        self.credits_acquired as i64 - self.credits_released as i64
+        (self.credits_acquired as i64).saturating_sub(self.credits_released as i64)
     }
 }
 
@@ -705,8 +713,8 @@ mod tests {
         assert_eq!(config.exclusive_credits, 8);
         assert_eq!(config.floating_credits, 16);
         assert_eq!(config.overflow_strategy, OverflowStrategy::Drop);
-        assert_eq!(config.high_watermark, 0.9);
-        assert_eq!(config.low_watermark, 0.6);
+        assert!((config.high_watermark - 0.9).abs() < f64::EPSILON);
+        assert!((config.low_watermark - 0.6).abs() < f64::EPSILON);
         assert_eq!(config.total_credits(), 24);
     }
 

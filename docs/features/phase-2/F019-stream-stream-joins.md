@@ -5,7 +5,7 @@
 | Field | Value |
 |-------|-------|
 | **ID** | F019 |
-| **Status** | 📝 Draft |
+| **Status** | ✅ Done |
 | **Priority** | P0 |
 | **Phase** | 2 |
 | **Effort** | L (1-2 weeks) |
@@ -62,7 +62,7 @@ JOIN payments p
 
 ## Completion Checklist
 
-- [ ] All join types working
-- [ ] State cleanup on watermark
-- [ ] SQL syntax complete
-- [ ] Performance benchmarks passing
+- [x] All join types working (Inner, Left, Right, Full)
+- [x] State cleanup on watermark
+- [ ] SQL syntax complete (deferred to Phase 2 SQL work)
+- [ ] Performance benchmarks passing (deferred)

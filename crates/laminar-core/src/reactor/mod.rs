@@ -25,7 +25,9 @@ use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::Arc;
 use std::time::{Duration, Instant};
 
-use crate::operator::{Event, Operator, OperatorContext, Output};
+use crate::alloc::HotPathGuard;
+use crate::budget::TaskBudget;
+use crate::operator::{Event, Operator, OperatorContext, OperatorState, Output};
 use crate::state::{InMemoryStore, StateStore};
 use crate::time::{BoundedOutOfOrdernessGenerator, TimerService, WatermarkGenerator};
 
@@ -64,7 +66,7 @@ pub enum SinkError {
 
 /// Configuration for the reactor
 #[derive(Debug, Clone)]
-pub struct Config {
+pub struct ReactorConfig {
     /// Maximum events to process per poll
     pub batch_size: usize,
     /// CPU core to pin the reactor thread to (None = no pinning)
@@ -77,7 +79,7 @@ pub struct Config {
     pub max_out_of_orderness: i64,
 }
 
-impl Default for Config {
+impl Default for ReactorConfig {
     fn default() -> Self {
         Self {
             batch_size: 1024,
@@ -91,7 +93,7 @@ impl Default for Config {
 
 /// The main reactor for event processing
 pub struct Reactor {
-    config: Config,
+    config: ReactorConfig,
     operators: Vec<Box<dyn Operator>>,
     timer_service: TimerService,
     event_queue: VecDeque<Event>,
@@ -117,7 +119,7 @@ impl Reactor {
     /// # Errors
     ///
     /// Currently does not return any errors, but may in the future if initialization fails
-    pub fn new(config: Config) -> Result<Self, ReactorError> {
+    pub fn new(config: ReactorConfig) -> Result<Self, ReactorError> {
         let event_queue = VecDeque::with_capacity(config.event_buffer_size);
         let watermark_generator = Box::new(BoundedOutOfOrdernessGenerator::new(
             config.max_out_of_orderness,
@@ -193,33 +195,61 @@ impl Reactor {
     /// Run one iteration of the event loop
     /// Returns outputs ready for downstream
     pub fn poll(&mut self) -> Vec<Output> {
+        // Hot path guard - will panic on allocation when allocation-tracking is enabled
+        let _guard = HotPathGuard::enter("Reactor::poll");
+
+        // Task budget tracking - records metrics on drop
+        let _iteration_budget = TaskBudget::ring0_iteration();
+
         let poll_start = Instant::now();
         let processing_time = self.get_processing_time();
 
         // 1. Fire expired timers
         let fired_timers = self.timer_service.poll_timers(self.current_event_time);
         for mut timer in fired_timers {
-            // Find the operator that registered this timer
-            // For now, we'll process timers for all operators
-            for (idx, operator) in self.operators.iter_mut().enumerate() {
-                // Move key out of timer to avoid clone allocation
-                let timer_key = timer.key.take().unwrap_or_default();
-                let timer_for_operator = crate::operator::Timer {
-                    key: timer_key,
-                    timestamp: timer.timestamp,
-                };
+            if let Some(idx) = timer.operator_index {
+                // Route to specific operator
+                if let Some(operator) = self.operators.get_mut(idx) {
+                    let timer_key = timer.key.take().unwrap_or_default();
+                    let timer_for_operator = crate::operator::Timer {
+                        key: timer_key,
+                        timestamp: timer.timestamp,
+                    };
 
-                let mut ctx = OperatorContext {
-                    event_time: self.current_event_time,
-                    processing_time,
-                    timers: &mut self.timer_service,
-                    state: self.state_store.as_mut(),
-                    watermark_generator: self.watermark_generator.as_mut(),
-                    operator_index: idx,
-                };
+                    let mut ctx = OperatorContext {
+                        event_time: self.current_event_time,
+                        processing_time,
+                        timers: &mut self.timer_service,
+                        state: self.state_store.as_mut(),
+                        watermark_generator: self.watermark_generator.as_mut(),
+                        operator_index: idx,
+                    };
 
-                let outputs = operator.on_timer(timer_for_operator, &mut ctx);
-                self.output_buffer.extend(outputs);
+                    let outputs = operator.on_timer(timer_for_operator, &mut ctx);
+                    self.output_buffer.extend(outputs);
+                }
+            } else {
+                // Legacy: Broadcast to all operators (warning: creates key contention)
+                for (idx, operator) in self.operators.iter_mut().enumerate() {
+                    // Move key out of timer (only first operator gets it!)
+                    let timer_key = timer.key.take().unwrap_or_default();
+                    let timer_for_operator = crate::operator::Timer {
+                        key: timer_key,
+                        timestamp: timer.timestamp,
+                    };
+
+                    let mut ctx = OperatorContext {
+                        event_time: self.current_event_time,
+                        processing_time,
+                        timers: &mut self.timer_service,
+                        state: self.state_store.as_mut(),
+                        watermark_generator: self.watermark_generator.as_mut(),
+                        operator_index: idx,
+                    };
+
+                    let outputs = operator.on_timer(timer_for_operator, &mut ctx);
+                    self.output_buffer.extend(outputs);
+                }
             }
         }
 
@@ -300,6 +330,33 @@ impl Reactor {
 
         // 3. Return outputs
         std::mem::take(&mut self.output_buffer)
+    }
+
+    /// Advances the watermark to the given timestamp.
+    ///
+    /// Called when an external watermark message arrives (e.g., from TPC coordination).
+    /// Updates the reactor's event time tracking and watermark generator state.
+    /// Any resulting watermark output will be included in the next `poll()` result.
+    pub fn advance_watermark(&mut self, timestamp: i64) {
+        // Update current event time if this watermark is newer
+        if timestamp > self.current_event_time {
+            self.current_event_time = timestamp;
+        }
+
+        // Feed the timestamp to the watermark generator so it can advance
+        if let Some(watermark) = self.watermark_generator.on_event(timestamp) {
+            self.output_buffer
+                .push(Output::Watermark(watermark.timestamp()));
+        }
+    }
+
+    /// Triggers a checkpoint by snapshotting all operator states.
+    ///
+    /// Called when a `CheckpointRequest` arrives from the control plane.
+    /// Collects the serialized state from each operator and returns it
+    /// for persistence by Ring 1.
+    pub fn trigger_checkpoint(&mut self) -> Vec<OperatorState> {
+        self.operators.iter().map(|op| op.checkpoint()).collect()
     }
 
     /// Get current processing time in microseconds since reactor start
@@ -517,6 +574,25 @@ impl Sink for StdoutSink {
                         name, event.timestamp, event.data
                     );
                 }
+                Output::Changelog(record) => {
+                    println!(
+                        "Changelog: op={:?}, weight={}, emit_ts={}, event_ts={}, data={:?}",
+                        record.operation,
+                        record.weight,
+                        record.emit_timestamp,
+                        record.event.timestamp,
+                        record.event.data
+                    );
+                }
+                Output::CheckpointComplete {
+                    checkpoint_id,
+                    operator_states,
+                } => {
+                    println!(
+                        "Checkpoint: id={checkpoint_id}, operators={}",
+                        operator_states.len()
+                    );
+                }
             }
         }
         Ok(())
@@ -600,21 +676,21 @@ mod tests {
 
     #[test]
     fn test_default_config() {
-        let config = Config::default();
+        let config = ReactorConfig::default();
         assert_eq!(config.batch_size, 1024);
         assert_eq!(config.event_buffer_size, 65536);
     }
 
     #[test]
     fn test_reactor_creation() {
-        let config = Config::default();
+        let config = ReactorConfig::default();
         let reactor = Reactor::new(config);
         assert!(reactor.is_ok());
     }
 
     #[test]
     fn test_reactor_add_operator() {
-        let config = Config::default();
+        let config = ReactorConfig::default();
         let mut reactor = Reactor::new(config).unwrap();
 
         let operator = Box::new(PassthroughOperator);
@@ -625,7 +701,7 @@ mod tests {
 
     #[test]
     fn test_reactor_submit_event() {
-        let config = Config::default();
+        let config = ReactorConfig::default();
         let mut reactor = Reactor::new(config).unwrap();
 
         let array = Arc::new(Int64Array::from(vec![1, 2, 3]));
@@ -641,7 +717,7 @@ mod tests {
 
     #[test]
     fn test_reactor_poll_processes_events() {
-        let config = Config::default();
+        let config = ReactorConfig::default();
         let mut reactor = Reactor::new(config).unwrap();
 
         // Add a passthrough operator
@@ -666,8 +742,10 @@ mod tests {
 
     #[test]
     fn test_reactor_queue_full() {
-        let mut config = Config::default();
-        config.event_buffer_size = 2; // Very small buffer
+        let config = ReactorConfig {
+            event_buffer_size: 2, // Very small buffer
+            ..ReactorConfig::default()
+        };
         let mut reactor = Reactor::new(config).unwrap();
 
         let array = Arc::new(Int64Array::from(vec![1]));
@@ -676,7 +754,7 @@ mod tests {
         // Fill the queue
         for i in 0..2 {
             let event = Event {
-                timestamp: i as i64,
+                timestamp: i64::from(i),
                 data: batch.clone(),
             };
             assert!(reactor.submit(event).is_ok());
@@ -695,8 +773,10 @@ mod tests {
 
     #[test]
     fn test_reactor_batch_processing() {
-        let mut config = Config::default();
-        config.batch_size = 2; // Small batch size
+        let config = ReactorConfig {
+            batch_size: 2, // Small batch size
+            ..ReactorConfig::default()
+        };
         let mut reactor = Reactor::new(config).unwrap();
 
         reactor.add_operator(Box::new(PassthroughOperator));
@@ -707,7 +787,7 @@ mod tests {
         // Submit 5 events
         for i in 0..5 {
             let event = Event {
-                timestamp: i as i64,
+                timestamp: i64::from(i),
                 data: batch.clone(),
             };
             reactor.submit(event).unwrap();
@@ -731,7 +811,7 @@ mod tests {
 
     #[test]
     fn test_reactor_with_sink() {
-        let config = Config::default();
+        let config = ReactorConfig::default();
         let mut reactor = Reactor::new(config).unwrap();
 
         // Add a buffering sink
@@ -762,7 +842,7 @@ mod tests {
 
     #[test]
     fn test_reactor_shutdown() {
-        let config = Config::default();
+        let config = ReactorConfig::default();
         let mut reactor = Reactor::new(config).unwrap();
 
         // Get shutdown handle

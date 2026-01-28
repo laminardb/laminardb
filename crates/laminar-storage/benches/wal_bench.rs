@@ -19,7 +19,7 @@ fn bench_wal_append(c: &mut Criterion) {
                 key: black_box(b"test_key").to_vec(),
                 value: black_box(b"test_value_with_some_data").to_vec(),
             };
-            wal.append(black_box(entry)).unwrap()
+            wal.append(black_box(&entry)).unwrap()
         });
     });
 
@@ -36,7 +36,7 @@ fn bench_wal_append(c: &mut Criterion) {
                     key: b"key".to_vec(),
                     value: black_box(value.clone()),
                 };
-                wal.append(entry).unwrap()
+                wal.append(&entry).unwrap()
             });
         });
     }
@@ -55,7 +55,7 @@ fn bench_wal_sync(c: &mut Criterion) {
                 let mut wal = WriteAheadLog::new(&wal_path, Duration::from_secs(10)).unwrap();
                 // Write some data to make sync meaningful
                 for i in 0..100 {
-                    wal.append(WalEntry::Put {
+                    wal.append(&WalEntry::Put {
                         key: format!("key_{}", i).into_bytes(),
                         value: vec![0u8; 128],
                     }).unwrap();
@@ -63,7 +63,8 @@ fn bench_wal_sync(c: &mut Criterion) {
                 wal
             },
             |mut wal| {
-                black_box(wal.sync().unwrap())
+                wal.sync().unwrap();
+                black_box(());
             },
             BatchSize::SmallInput,
         );
@@ -85,7 +86,7 @@ fn bench_wal_group_commit(c: &mut Criterion) {
                     key: format!("key_{}", i).into_bytes(),
                     value: vec![0u8; 64],
                 };
-                black_box(wal.append(entry).unwrap());
+                black_box(wal.append(&entry).unwrap());
             }
         });
     });
@@ -100,7 +101,7 @@ fn bench_wal_read(c: &mut Criterion) {
     let mut wal = WriteAheadLog::new(&wal_path, Duration::from_secs(10)).unwrap();
 
     for i in 0..1000 {
-        wal.append(WalEntry::Put {
+        wal.append(&WalEntry::Put {
             key: format!("key_{}", i).into_bytes(),
             value: vec![0u8; 128],
         }).unwrap();

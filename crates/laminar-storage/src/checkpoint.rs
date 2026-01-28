@@ -475,7 +475,7 @@ mod tests {
                 b"state",
                 wal_position,
                 HashMap::new(),
-                Some(i as i64 * 1000),
+                Some(i64::try_from(i * 1000).unwrap()),
             ).unwrap();
         }
 

@@ -833,7 +833,7 @@ mod tests {
                 .unwrap();
             // Write incomplete record: length says 100 bytes but only 5 bytes follow
             let len: u32 = 100;
-            let crc: u32 = 0xDEADBEEF;
+            let crc: u32 = 0xDEAD_BEEF;
             file.write_all(&len.to_le_bytes()).unwrap();
             file.write_all(&crc.to_le_bytes()).unwrap();
             file.write_all(&[1, 2, 3, 4, 5]).unwrap(); // Only 5 bytes, not 100

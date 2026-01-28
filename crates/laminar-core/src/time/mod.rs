@@ -54,12 +54,116 @@
 //! // Combined watermark is the minimum
 //! assert_eq!(tracker.current_watermark(), Some(Watermark::new(3000)));
 //! ```
+//!
+//! ## Per-Partition Watermark Tracking
+//!
+//! For Kafka sources with multiple partitions, use [`PartitionedWatermarkTracker`]:
+//!
+//! ```rust
+//! use laminar_core::time::{PartitionedWatermarkTracker, PartitionId, Watermark};
+//!
+//! let mut tracker = PartitionedWatermarkTracker::new();
+//!
+//! // Register a Kafka source with 4 partitions
+//! tracker.register_source(0, 4);
+//!
+//! // Update individual partitions
+//! tracker.update_partition(PartitionId::new(0, 0), 5000);
+//! tracker.update_partition(PartitionId::new(0, 1), 3000);
+//!
+//! // Combined watermark is minimum across active partitions
+//! assert_eq!(tracker.current_watermark(), Some(Watermark::new(3000)));
+//!
+//! // Mark slow partition as idle to allow progress
+//! tracker.mark_partition_idle(PartitionId::new(0, 1));
+//! assert_eq!(tracker.current_watermark(), Some(Watermark::new(5000)));
+//! ```
+//!
+//! ## Per-Key Watermark Tracking (F065)
+//!
+//! For multi-tenant workloads or scenarios with significant event-time skew between
+//! keys, use [`KeyedWatermarkTracker`] to achieve 99%+ accuracy vs 63-67% with global:
+//!
+//! ```rust
+//! use laminar_core::time::{KeyedWatermarkTracker, KeyedWatermarkConfig, Watermark};
+//! use std::time::Duration;
+//!
+//! let config = KeyedWatermarkConfig::with_bounded_delay(Duration::from_secs(5));
+//! let mut tracker: KeyedWatermarkTracker<String> = KeyedWatermarkTracker::new(config);
+//!
+//! // Fast tenant advances quickly
+//! tracker.update("tenant_a".to_string(), 15_000);
+//!
+//! // Slow tenant at earlier time
+//! tracker.update("tenant_b".to_string(), 5_000);
+//!
+//! // Per-key watermarks differ - each key has independent tracking
+//! assert_eq!(tracker.watermark_for_key(&"tenant_a".to_string()), Some(10_000));
+//! assert_eq!(tracker.watermark_for_key(&"tenant_b".to_string()), Some(0));
+//!
+//! // Events for tenant_b at 3000 are NOT late (their key watermark is 0)
+//! assert!(!tracker.is_late(&"tenant_b".to_string(), 3000));
+//!
+//! // But events for tenant_a at 3000 ARE late (their key watermark is 10000)
+//! assert!(tracker.is_late(&"tenant_a".to_string(), 3000));
+//! ```
+//!
+//! ## Watermark Alignment Groups (F066)
+//!
+//! For stream-stream joins and multi-source operators, use [`WatermarkAlignmentGroup`]
+//! to prevent unbounded state growth when sources have different processing speeds:
+//!
+//! ```rust
+//! use laminar_core::time::{
+//!     WatermarkAlignmentGroup, AlignmentGroupConfig, AlignmentGroupId,
+//!     EnforcementMode, AlignmentAction,
+//! };
+//! use std::time::Duration;
+//!
+//! let config = AlignmentGroupConfig::new("orders-payments")
+//!     .with_max_drift(Duration::from_secs(300)); // 5 minute max drift
+//!
+//! let mut group = WatermarkAlignmentGroup::new(config);
+//! group.register_source(0); // orders
+//! group.register_source(1); // payments
+//!
+//! // Both start at 0
+//! group.report_watermark(0, 0);
+//! group.report_watermark(1, 0);
+//!
+//! // Orders advances within limit - OK
+//! let action = group.report_watermark(0, 200_000); // 200 seconds
+//! assert_eq!(action, AlignmentAction::Continue);
+//!
+//! // Orders advances beyond limit - PAUSED
+//! let action = group.report_watermark(0, 400_000); // 400 seconds (drift > 300)
+//! assert_eq!(action, AlignmentAction::Pause);
+//! ```
 
+mod alignment_group;
 mod event_time;
+mod keyed_watermark;
+mod partitioned_watermark;
 mod watermark;
+
+pub use alignment_group::{
+    AlignmentAction, AlignmentError, AlignmentGroupConfig, AlignmentGroupCoordinator,
+    AlignmentGroupId, AlignmentGroupMetrics, AlignmentSourceState, EnforcementMode,
+    WatermarkAlignmentGroup,
+};
 
 pub use event_time::{
     EventTimeError, EventTimeExtractor, ExtractionMode, TimestampField, TimestampFormat,
+};
+
+pub use keyed_watermark::{
+    KeyEvictionPolicy, KeyWatermarkState, KeyedWatermarkConfig, KeyedWatermarkError,
+    KeyedWatermarkMetrics, KeyedWatermarkTracker, KeyedWatermarkTrackerWithLateHandling,
+};
+
+pub use partitioned_watermark::{
+    CoreWatermarkState, GlobalWatermarkCollector, PartitionId, PartitionWatermarkState,
+    PartitionedWatermarkMetrics, PartitionedWatermarkTracker, WatermarkError,
 };
 
 pub use watermark::{
@@ -177,12 +281,17 @@ pub struct TimerRegistration {
     /// Timer key (for keyed operators).
     /// Uses `TimerKey` (`SmallVec`) to avoid heap allocation for keys up to 16 bytes.
     pub key: Option<TimerKey>,
+    /// The index of the operator that registered this timer
+    pub operator_index: Option<usize>,
 }
 
 impl Ord for TimerRegistration {
     fn cmp(&self, other: &Self) -> Ordering {
         // Reverse ordering for min-heap behavior (earliest first)
-        other.timestamp.cmp(&self.timestamp)
+        match other.timestamp.cmp(&self.timestamp) {
+            Ordering::Equal => other.id.cmp(&self.id),
+            ord => ord,
+        }
     }
 }
 
@@ -206,8 +315,8 @@ impl PartialOrd for TimerRegistration {
 /// let mut service = TimerService::new();
 ///
 /// // Register timers at different times
-/// let id1 = service.register_timer(100, None);
-/// let id2 = service.register_timer(50, Some(TimerKey::from_slice(&[1, 2, 3])));
+/// let id1 = service.register_timer(100, None, None);
+/// let id2 = service.register_timer(50, Some(TimerKey::from_slice(&[1, 2, 3])), None);
 ///
 /// // Poll for timers that should fire at time 75
 /// let fired = service.poll_timers(75);
@@ -237,12 +346,13 @@ impl TimerService {
     ///
     /// * `timestamp` - The event time at which the timer should fire
     /// * `key` - Optional key for keyed operators
-    pub fn register_timer(&mut self, timestamp: i64, key: Option<TimerKey>) -> u64 {
+    /// * `operator_index` - Optional index of the operator registering the timer(must match the index in the reactor)
+    pub fn register_timer(&mut self, timestamp: i64, key: Option<TimerKey>, operator_index: Option<usize>) -> u64 {
         let id = self.next_timer_id;
         self.next_timer_id += 1;
 
         self.timers
-            .push(TimerRegistration { id, timestamp, key });
+            .push(TimerRegistration { id, timestamp, key, operator_index });
 
         id
     }
@@ -393,8 +503,8 @@ mod tests {
     fn test_timer_registration() {
         let mut service = TimerService::new();
 
-        let id1 = service.register_timer(100, None);
-        let id2 = service.register_timer(50, Some(TimerKey::from_slice(&[1, 2, 3])));
+        let id1 = service.register_timer(100, None, None);
+        let id2 = service.register_timer(50, Some(TimerKey::from_slice(&[1, 2, 3])), Some(1));
 
         assert_eq!(service.pending_count(), 2);
         assert_ne!(id1, id2);
@@ -404,9 +514,9 @@ mod tests {
     fn test_timer_poll_order() {
         let mut service = TimerService::new();
 
-        let id1 = service.register_timer(100, None);
-        let id2 = service.register_timer(50, Some(TimerKey::from_slice(&[1, 2, 3])));
-        let _id3 = service.register_timer(150, None);
+        let id1 = service.register_timer(100, None, None);
+        let id2 = service.register_timer(50, Some(TimerKey::from_slice(&[1, 2, 3])), Some(0));
+        let _id3 = service.register_timer(150, None, None);
 
         // Poll at time 75 - should get timer at t=50
         let fired = service.poll_timers(75);
@@ -430,9 +540,9 @@ mod tests {
     fn test_timer_poll_multiple() {
         let mut service = TimerService::new();
 
-        service.register_timer(50, None);
-        service.register_timer(75, None);
-        service.register_timer(100, None);
+        service.register_timer(50, None, None);
+        service.register_timer(75, None, None);
+        service.register_timer(100, None, None);
 
         // Poll at time 80 - should get timers at t=50 and t=75
         let fired = service.poll_timers(80);
@@ -446,8 +556,8 @@ mod tests {
     fn test_timer_cancel() {
         let mut service = TimerService::new();
 
-        let id1 = service.register_timer(100, None);
-        let id2 = service.register_timer(200, None);
+        let id1 = service.register_timer(100, None, None);
+        let id2 = service.register_timer(200, None, None);
 
         assert!(service.cancel_timer(id1));
         assert_eq!(service.pending_count(), 1);
@@ -466,10 +576,10 @@ mod tests {
 
         assert_eq!(service.next_timer_timestamp(), None);
 
-        service.register_timer(100, None);
+        service.register_timer(100, None, None);
         assert_eq!(service.next_timer_timestamp(), Some(100));
 
-        service.register_timer(50, None);
+        service.register_timer(50, None, None);
         assert_eq!(service.next_timer_timestamp(), Some(50));
     }
 
@@ -477,9 +587,9 @@ mod tests {
     fn test_timer_clear() {
         let mut service = TimerService::new();
 
-        service.register_timer(100, None);
-        service.register_timer(200, None);
-        service.register_timer(300, None);
+        service.register_timer(100, None, None);
+        service.register_timer(200, None, None);
+        service.register_timer(300, None, None);
 
         service.clear();
         assert_eq!(service.pending_count(), 0);

@@ -276,7 +276,7 @@ mod tests {
 
         // Send multiple batches
         for i in 0..5 {
-            let batch = test_batch(&schema, vec![i as i64]);
+            let batch = test_batch(&schema, vec![i64::from(i)]);
             sender.send(batch).await.unwrap();
         }
         drop(sender);

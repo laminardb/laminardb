@@ -12,6 +12,61 @@ use datafusion::physical_plan::SendableRecordBatchStream;
 use datafusion_common::DataFusionError;
 use datafusion_expr::Expr;
 
+/// Declares a column's sort ordering for a streaming source.
+///
+/// When a source declares output ordering, `DataFusion` can elide unnecessary
+/// `SortExec` nodes from the physical plan, enabling ORDER BY queries on
+/// pre-sorted unbounded streams.
+///
+/// # Example
+///
+/// ```rust,ignore
+/// // Source sorted by event_time ascending
+/// let ordering = vec![SortColumn {
+///     name: "event_time".to_string(),
+///     descending: false,
+///     nulls_first: false,
+/// }];
+/// ```
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct SortColumn {
+    /// Column name to sort by
+    pub name: String,
+    /// Whether the sort is descending (false = ascending)
+    pub descending: bool,
+    /// Whether nulls sort first (before non-null values)
+    pub nulls_first: bool,
+}
+
+impl SortColumn {
+    /// Creates a new ascending sort column with nulls last.
+    #[must_use]
+    pub fn ascending(name: impl Into<String>) -> Self {
+        Self {
+            name: name.into(),
+            descending: false,
+            nulls_first: false,
+        }
+    }
+
+    /// Creates a new descending sort column with nulls last.
+    #[must_use]
+    pub fn descending(name: impl Into<String>) -> Self {
+        Self {
+            name: name.into(),
+            descending: true,
+            nulls_first: false,
+        }
+    }
+
+    /// Sets whether nulls sort first.
+    #[must_use]
+    pub fn with_nulls_first(mut self, nulls_first: bool) -> Self {
+        self.nulls_first = nulls_first;
+        self
+    }
+}
+
 /// A source of streaming data for `DataFusion` queries.
 ///
 /// This trait enables integration between `LaminarDB`'s push-based event
@@ -79,6 +134,19 @@ pub trait StreamSource: Send + Sync + Debug {
     fn supports_filters(&self, filters: &[Expr]) -> Vec<bool> {
         vec![false; filters.len()]
     }
+
+    /// Returns the output ordering of this source, if any.
+    ///
+    /// When a source is pre-sorted (e.g., by event time from an ordered
+    /// Kafka partition), declaring the ordering allows `DataFusion` to
+    /// elide `SortExec` from the physical plan for ORDER BY queries that
+    /// match the declared ordering.
+    ///
+    /// The default implementation returns `None`, indicating the source
+    /// has no guaranteed output ordering.
+    fn output_ordering(&self) -> Option<Vec<SortColumn>> {
+        None
+    }
 }
 
 /// A shared reference to a stream source.
@@ -137,5 +205,67 @@ mod tests {
         )];
         let supported = source.supports_filters(&filters);
         assert_eq!(supported, vec![false]);
+    }
+
+    #[test]
+    fn test_sort_column_creation() {
+        let col = SortColumn::ascending("event_time");
+        assert_eq!(col.name, "event_time");
+        assert!(!col.descending);
+        assert!(!col.nulls_first);
+
+        let col = SortColumn::descending("price");
+        assert_eq!(col.name, "price");
+        assert!(col.descending);
+        assert!(!col.nulls_first);
+
+        let col = SortColumn::ascending("ts").with_nulls_first(true);
+        assert!(!col.descending);
+        assert!(col.nulls_first);
+    }
+
+    #[test]
+    fn test_stream_source_default_ordering() {
+        let schema = Arc::new(Schema::new(vec![Field::new("id", DataType::Int64, false)]));
+        let source = MockSource { schema };
+
+        // Default implementation returns None
+        assert!(source.output_ordering().is_none());
+    }
+
+    #[test]
+    fn test_stream_source_with_ordering() {
+        #[derive(Debug)]
+        struct OrderedSource {
+            schema: SchemaRef,
+        }
+
+        #[async_trait]
+        impl StreamSource for OrderedSource {
+            fn schema(&self) -> SchemaRef {
+                Arc::clone(&self.schema)
+            }
+
+            fn stream(
+                &self,
+                _projection: Option<Vec<usize>>,
+                _filters: Vec<Expr>,
+            ) -> Result<SendableRecordBatchStream, DataFusionError> {
+                Err(DataFusionError::NotImplemented("mock".to_string()))
+            }
+
+            fn output_ordering(&self) -> Option<Vec<SortColumn>> {
+                Some(vec![SortColumn::ascending("event_time")])
+            }
+        }
+
+        let schema = Arc::new(Schema::new(vec![
+            Field::new("event_time", DataType::Int64, false),
+        ]));
+        let source = OrderedSource { schema };
+        let ordering = source.output_ordering().unwrap();
+        assert_eq!(ordering.len(), 1);
+        assert_eq!(ordering[0].name, "event_time");
+        assert!(!ordering[0].descending);
     }
 }

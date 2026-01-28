@@ -78,6 +78,24 @@ Enhanced `WalStateStore` to support checkpointing:
 - Recovery time dramatically reduced (seconds instead of minutes for large state)
 - WAL can be truncated after checkpoint (future optimization)
 
+### Known Limitations (Addressed in F022)
+
+**Current Implementation Issues:**
+- **Checkpoint blocks Ring 0**: Synchronous file I/O blocks the reactor thread
+- **Full snapshots only**: No incremental mechanism, checkpoint size = full state size
+- **No delta tracking**: Cannot identify changed keys since last checkpoint
+- **Single WAL**: Contention with thread-per-core (F013)
+
+**Addressed by:**
+- [F022: Incremental Checkpointing](../phase-2/F022-incremental-checkpointing.md) - Async checkpoint, ChangelogBuffer, RocksDB
+- [F062: Per-Core WAL Segments](../phase-2/F062-per-core-wal.md) - Eliminates WAL contention
+- [ADR-004: Checkpoint Strategy](../../adr/ADR-004-checkpoint-strategy.md) - Architecture decision
+
+F008 remains suitable for:
+- Simple use cases without RocksDB
+- Testing and development
+- Fallback if RocksDB unavailable
+
 ### Files Modified
 
 - `crates/laminar-storage/src/checkpoint.rs` - New checkpoint management module

@@ -304,6 +304,11 @@ impl<T> SpscQueue<T> {
     /// # Safety
     ///
     /// This method must only be called by the single consumer thread.
+    ///
+    /// # Note
+    ///
+    /// This method allocates memory. For zero-allocation polling, use
+    /// [`pop_batch_into`](Self::pop_batch_into) or [`pop_each`](Self::pop_each) instead.
     pub fn pop_batch(&self, max_count: usize) -> Vec<T> {
         let mut items = Vec::with_capacity(max_count.min(self.len()));
         for _ in 0..max_count {
@@ -314,6 +319,163 @@ impl<T> SpscQueue<T> {
             }
         }
         items
+    }
+
+    /// Pop multiple items into a caller-provided buffer (zero-allocation).
+    ///
+    /// Items are written to `buffer` starting at index 0. Returns the number
+    /// of items actually popped (0 if queue empty or buffer full).
+    ///
+    /// # Safety
+    ///
+    /// This method must only be called by the single consumer thread.
+    ///
+    /// After this method returns `n`, the first `n` elements of `buffer`
+    /// are initialized and can be safely read with `assume_init_read()`.
+    ///
+    /// # Example
+    ///
+    /// ```rust
+    /// use laminar_core::tpc::SpscQueue;
+    /// use std::mem::MaybeUninit;
+    ///
+    /// let queue: SpscQueue<i32> = SpscQueue::new(16);
+    /// queue.push(1).unwrap();
+    /// queue.push(2).unwrap();
+    ///
+    /// let mut buffer: [MaybeUninit<i32>; 8] = [MaybeUninit::uninit(); 8];
+    /// let count = queue.pop_batch_into(&mut buffer);
+    ///
+    /// assert_eq!(count, 2);
+    /// // SAFETY: We just initialized these elements
+    /// unsafe {
+    ///     assert_eq!(buffer[0].assume_init(), 1);
+    ///     assert_eq!(buffer[1].assume_init(), 2);
+    /// }
+    /// ```
+    #[inline]
+    pub fn pop_batch_into(&self, buffer: &mut [MaybeUninit<T>]) -> usize {
+        if buffer.is_empty() {
+            return 0;
+        }
+
+        let mut current_head = self.head.load(Ordering::Relaxed);
+        let tail = self.tail.load(Ordering::Acquire);
+
+        // Calculate available items (handle wrap-around)
+        let available = if tail >= current_head {
+            tail - current_head
+        } else {
+            (self.capacity_mask + 1) - current_head + tail
+        };
+
+        let count = available.min(buffer.len());
+
+        if count == 0 {
+            return 0;
+        }
+
+        // Copy items to buffer
+        for slot in buffer.iter_mut().take(count) {
+            // SAFETY: We have exclusive read access to slots between head and tail.
+            // The producer only writes to slots where tail > head, and we've verified
+            // that these slots contain valid data by checking tail.
+            #[allow(unsafe_code)]
+            unsafe {
+                let src = (*self.buffer[current_head].get()).assume_init_read();
+                slot.write(src);
+            }
+
+            // Advance head with wrap-around
+            current_head = self.next_index(current_head);
+        }
+
+        // Update head to release slots
+        self.head.store(current_head, Ordering::Release);
+
+        count
+    }
+
+    /// Pop items and call a callback for each one (zero-allocation).
+    ///
+    /// Processing stops when either:
+    /// - `max_count` items have been processed
+    /// - The queue becomes empty
+    /// - The callback returns `false`
+    ///
+    /// Returns the number of items processed.
+    ///
+    /// # Safety
+    ///
+    /// This method must only be called by the single consumer thread.
+    ///
+    /// # Example
+    ///
+    /// ```rust
+    /// use laminar_core::tpc::SpscQueue;
+    ///
+    /// let queue: SpscQueue<i32> = SpscQueue::new(16);
+    /// queue.push(1).unwrap();
+    /// queue.push(2).unwrap();
+    /// queue.push(3).unwrap();
+    ///
+    /// let mut sum = 0;
+    /// let count = queue.pop_each(10, |item| {
+    ///     sum += item;
+    ///     true // Continue processing
+    /// });
+    ///
+    /// assert_eq!(count, 3);
+    /// assert_eq!(sum, 6);
+    /// ```
+    #[inline]
+    pub fn pop_each<F>(&self, max_count: usize, mut f: F) -> usize
+    where
+        F: FnMut(T) -> bool,
+    {
+        if max_count == 0 {
+            return 0;
+        }
+
+        let mut current_head = self.head.load(Ordering::Relaxed);
+        let tail = self.tail.load(Ordering::Acquire);
+
+        // Calculate available items (handle wrap-around)
+        let available = if tail >= current_head {
+            tail - current_head
+        } else {
+            (self.capacity_mask + 1) - current_head + tail
+        };
+
+        let to_pop = available.min(max_count);
+
+        if to_pop == 0 {
+            return 0;
+        }
+
+        let mut popped = 0;
+        for _ in 0..to_pop {
+            // SAFETY: We have exclusive read access to slots between head and tail.
+            #[allow(unsafe_code)]
+            let item = unsafe { (*self.buffer[current_head].get()).assume_init_read() };
+
+            popped += 1;
+
+            // Advance head with wrap-around
+            current_head = self.next_index(current_head);
+
+            // Call the callback; stop if it returns false
+            if !f(item) {
+                break;
+            }
+        }
+
+        // Update head to release processed slots
+        if popped > 0 {
+            self.head.store(current_head, Ordering::Release);
+        }
+
+        popped
     }
 
     /// Peek at the next item without removing it.
@@ -499,11 +661,10 @@ mod tests {
 
     #[test]
     fn test_concurrent_producer_consumer() {
+        const ITEMS: i32 = 10_000;
         let queue = Arc::new(SpscQueue::<i32>::new(1024));
         let queue_producer = Arc::clone(&queue);
         let queue_consumer = Arc::clone(&queue);
-
-        const ITEMS: i32 = 10_000;
 
         // Producer thread
         let producer = thread::spawn(move || {
@@ -533,7 +694,16 @@ mod tests {
         // Verify all items received in order
         assert_eq!(received.len(), ITEMS as usize);
         for (i, &item) in received.iter().enumerate() {
-            assert_eq!(item, i as i32, "Item out of order at index {i}");
+            assert_eq!(item, i32::try_from(i).unwrap(), "Item out of order at index {i}");
+        }
+    }
+
+    #[derive(Debug)]
+    struct DropCounter(Arc<AtomicUsize>);
+
+    impl Drop for DropCounter {
+        fn drop(&mut self) {
+            self.0.fetch_add(1, Ordering::SeqCst);
         }
     }
 
@@ -544,13 +714,7 @@ mod tests {
 
         let drop_count = Arc::new(AtomicUsize::new(0));
 
-        #[derive(Debug)]
-        struct DropCounter(Arc<AtomicUsize>);
-        impl Drop for DropCounter {
-            fn drop(&mut self) {
-                self.0.fetch_add(1, Ordering::SeqCst);
-            }
-        }
+
 
         {
             let queue: SpscQueue<DropCounter> = SpscQueue::new(8);
@@ -573,7 +737,7 @@ mod tests {
         queue.push(1).unwrap();
         queue.push(2).unwrap();
 
-        let debug_str = format!("{:?}", queue);
+        let debug_str = format!("{queue:?}");
         assert!(debug_str.contains("SpscQueue"));
         assert!(debug_str.contains("capacity"));
         assert!(debug_str.contains("len"));
@@ -583,5 +747,217 @@ mod tests {
     #[should_panic(expected = "capacity must be > 0")]
     fn test_zero_capacity_panics() {
         let _: SpscQueue<i32> = SpscQueue::new(0);
+    }
+
+    #[test]
+    fn test_pop_batch_into() {
+        let queue: SpscQueue<i32> = SpscQueue::new(16);
+
+        // Push some items
+        queue.push(1).unwrap();
+        queue.push(2).unwrap();
+        queue.push(3).unwrap();
+
+        // Pop into buffer
+        let mut buffer: [MaybeUninit<i32>; 8] = [MaybeUninit::uninit(); 8];
+        let count = queue.pop_batch_into(&mut buffer);
+
+        assert_eq!(count, 3);
+
+        // SAFETY: We just initialized these elements
+        #[allow(unsafe_code)]
+        unsafe {
+            assert_eq!(buffer[0].assume_init(), 1);
+            assert_eq!(buffer[1].assume_init(), 2);
+            assert_eq!(buffer[2].assume_init(), 3);
+        }
+
+        assert!(queue.is_empty());
+    }
+
+    #[test]
+    fn test_pop_batch_into_partial() {
+        let queue: SpscQueue<i32> = SpscQueue::new(16);
+
+        // Push 5 items
+        for i in 0..5 {
+            queue.push(i).unwrap();
+        }
+
+        // Pop only 3 (buffer smaller than available)
+        let mut buffer: [MaybeUninit<i32>; 3] = [MaybeUninit::uninit(); 3];
+        let count = queue.pop_batch_into(&mut buffer);
+
+        assert_eq!(count, 3);
+        assert_eq!(queue.len(), 2); // 2 items remaining
+
+        // SAFETY: We just initialized these elements
+        #[allow(unsafe_code)]
+        unsafe {
+            assert_eq!(buffer[0].assume_init(), 0);
+            assert_eq!(buffer[1].assume_init(), 1);
+            assert_eq!(buffer[2].assume_init(), 2);
+        }
+    }
+
+    #[test]
+    fn test_pop_batch_into_empty() {
+        let queue: SpscQueue<i32> = SpscQueue::new(16);
+
+        let mut buffer: [MaybeUninit<i32>; 8] = [MaybeUninit::uninit(); 8];
+        let count = queue.pop_batch_into(&mut buffer);
+
+        assert_eq!(count, 0);
+    }
+
+    #[test]
+    fn test_pop_batch_into_empty_buffer() {
+        let queue: SpscQueue<i32> = SpscQueue::new(16);
+        queue.push(1).unwrap();
+
+        let mut buffer: [MaybeUninit<i32>; 0] = [];
+        let count = queue.pop_batch_into(&mut buffer);
+
+        assert_eq!(count, 0);
+        assert_eq!(queue.len(), 1); // Item still in queue
+    }
+
+    #[test]
+    fn test_pop_each() {
+        let queue: SpscQueue<i32> = SpscQueue::new(16);
+
+        queue.push(1).unwrap();
+        queue.push(2).unwrap();
+        queue.push(3).unwrap();
+
+        let mut sum = 0;
+        let count = queue.pop_each(10, |item| {
+            sum += item;
+            true
+        });
+
+        assert_eq!(count, 3);
+        assert_eq!(sum, 6);
+        assert!(queue.is_empty());
+    }
+
+    #[test]
+    fn test_pop_each_early_stop() {
+        let queue: SpscQueue<i32> = SpscQueue::new(16);
+
+        queue.push(1).unwrap();
+        queue.push(2).unwrap();
+        queue.push(3).unwrap();
+        queue.push(4).unwrap();
+        queue.push(5).unwrap();
+
+        let mut items = Vec::new();
+        let count = queue.pop_each(10, |item| {
+            items.push(item);
+            item < 3 // Stop after item 3
+        });
+
+        assert_eq!(count, 3); // Processed 1, 2, 3
+        assert_eq!(items, vec![1, 2, 3]);
+        assert_eq!(queue.len(), 2); // 4, 5 remaining
+    }
+
+    #[test]
+    fn test_pop_each_max_count() {
+        let queue: SpscQueue<i32> = SpscQueue::new(16);
+
+        for i in 0..10 {
+            queue.push(i).unwrap();
+        }
+
+        let mut count_processed = 0;
+        let count = queue.pop_each(5, |_| {
+            count_processed += 1;
+            true
+        });
+
+        assert_eq!(count, 5);
+        assert_eq!(count_processed, 5);
+        assert_eq!(queue.len(), 5); // 5 remaining
+    }
+
+    #[test]
+    fn test_pop_each_empty() {
+        let queue: SpscQueue<i32> = SpscQueue::new(16);
+
+        let mut called = false;
+        let count = queue.pop_each(10, |_| {
+            called = true;
+            true
+        });
+
+        assert_eq!(count, 0);
+        assert!(!called);
+    }
+
+    #[test]
+    fn test_pop_each_zero_max() {
+        let queue: SpscQueue<i32> = SpscQueue::new(16);
+        queue.push(1).unwrap();
+
+        let count = queue.pop_each(0, |_| true);
+
+        assert_eq!(count, 0);
+        assert_eq!(queue.len(), 1); // Item still in queue
+    }
+
+    #[test]
+    fn test_pop_batch_into_wrap_around() {
+        let queue: SpscQueue<i32> = SpscQueue::new(4); // Capacity 4
+
+        // Fill and empty to advance indices
+        for _ in 0..3 {
+            for i in 0..3 {
+                queue.push(i).unwrap();
+            }
+            for _ in 0..3 {
+                queue.pop();
+            }
+        }
+
+        // Now indices are wrapped, push new items
+        queue.push(10).unwrap();
+        queue.push(11).unwrap();
+
+        let mut buffer: [MaybeUninit<i32>; 4] = [MaybeUninit::uninit(); 4];
+        let count = queue.pop_batch_into(&mut buffer);
+
+        assert_eq!(count, 2);
+
+        #[allow(unsafe_code)]
+        unsafe {
+            assert_eq!(buffer[0].assume_init(), 10);
+            assert_eq!(buffer[1].assume_init(), 11);
+        }
+    }
+
+    #[test]
+    fn test_pop_each_wrap_around() {
+        let queue: SpscQueue<i32> = SpscQueue::new(4);
+
+        // Fill and empty to advance indices
+        for _ in 0..3 {
+            for i in 0..3 {
+                queue.push(i).unwrap();
+            }
+            let _ = queue.pop_batch(3);
+        }
+
+        // Now push with wrapped indices
+        queue.push(100).unwrap();
+        queue.push(200).unwrap();
+
+        let mut items = Vec::new();
+        queue.pop_each(10, |item| {
+            items.push(item);
+            true
+        });
+
+        assert_eq!(items, vec![100, 200]);
     }
 }

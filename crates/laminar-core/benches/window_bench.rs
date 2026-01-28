@@ -7,9 +7,10 @@
 //!
 //! Run with: cargo bench --bench window_bench
 
+use std::hint::black_box;
 use arrow_array::{Int64Array, RecordBatch};
 use arrow_schema::{DataType, Field, Schema};
-use criterion::{black_box, criterion_group, criterion_main, BenchmarkId, Criterion, Throughput};
+use criterion::{criterion_group, criterion_main, BenchmarkId, Criterion, Throughput};
 use laminar_core::operator::window::{
     Accumulator, CountAccumulator, CountAggregator, SumAccumulator, SumAggregator,
     TumblingWindowAssigner, WindowId,
@@ -95,7 +96,8 @@ fn bench_accumulator(c: &mut Criterion) {
     group.bench_function("count_add", |b| {
         let mut acc = CountAccumulator::default();
         b.iter(|| {
-            acc.add(black_box(()));
+            black_box(());
+            acc.add(());
         })
     });
 

@@ -1,121 +1,50 @@
 # Session Context
 
 > This file tracks session continuity. Update at the end of each session.
+> For historical details, see [CONTEXT_ARCHIVE.md](./CONTEXT_ARCHIVE.md)
 
 ## Last Session
 
-**Date**: 2026-01-24
-**Duration**: Continued session
+**Date**: 2026-01-27
 
 ### What Was Accomplished
-- ✅ **F013: Thread-Per-Core Architecture** - Full implementation complete
-- ✅ **F014: SPSC Queue** - Lock-free bounded queue with cache padding
-- ✅ **Credit-Based Backpressure** - Apache Flink-style flow control added
-- ✅ All 275 tests passing across all crates (194 core + 56 sql + 25 storage)
-- ✅ Clippy clean for all crates
-- ✅ TPC benchmarks added (`cargo bench --bench tpc_bench`)
+- F074-F077: Aggregation Semantics Enhancement - ALL COMPLETE (219 new tests)
+  - F074: Composite Aggregator & f64 Type Support (122 tests in laminar-core)
+    - `ScalarResult` enum, `DynAccumulator` trait, `DynAggregatorFactory` trait
+    - `CompositeAggregator` + `CompositeAccumulator` for multi-aggregate windows
+    - `SumF64`, `MinF64`, `MaxF64`, `AvgF64` aggregators (indexed variants)
+    - `FirstValueF64DynAccumulator`, `LastValueF64DynAccumulator`
+    - `CountDynAccumulator`, composite output in window operators
+  - F075: DataFusion Aggregate Bridge (40 tests in laminar-sql)
+    - `DataFusionAccumulatorAdapter` wraps DataFusion `Accumulator` as `DynAccumulator`
+    - `DataFusionAggregateFactory` wraps `AggregateUDF` as `DynAggregatorFactory`
+    - `scalar_value_to_result()` / `result_to_scalar_value()` conversions
+    - `lookup_aggregate_udf()` / `create_aggregate_factory()` lookup APIs
+  - F076: Retractable FIRST/LAST Accumulators (26 tests in laminar-core)
+    - `RetractableFirstValueAccumulator`, `RetractableLastValueAccumulator`
+    - f64 variants using bits-as-i64 pattern
+    - Fixed duplicate timestamp insertion order bug
+  - F077: Extended Aggregation Parser (57 tests in laminar-sql)
+    - 20+ new `AggregateType` variants (StdDev, Variance, Percentile, Median, etc.)
+    - SQL alias recognition (STDDEV_SAMP, VAR_SAMP, EVERY, LISTAGG, GROUP_CONCAT)
+    - FILTER clause and WITHIN GROUP detection
+    - `datafusion_name()` mapping method, `arity()`, updated `is_decomposable()`
 
-### F013/F014 Implementation Details
+Previous session:
+- F005B: Advanced DataFusion Integration - COMPLETE (31 tests)
+- F023: Exactly-Once Sinks - COMPLETE (28 tests)
+- F006B: Production SQL Parser - COMPLETE (129 tests)
 
-**Module Structure**:
-```
-crates/laminar-core/src/tpc/
-├── mod.rs           # Public exports, TpcError enum
-├── spsc.rs          # Lock-free SPSC queue with CachePadded<T>
-├── router.rs        # KeyRouter for event partitioning
-├── core_handle.rs   # CoreHandle per-core reactor wrapper
-├── backpressure.rs  # Credit-based flow control (NEW)
-└── runtime.rs       # ThreadPerCoreRuntime multi-core orchestration
-```
-
-**Key Components**:
-- `SpscQueue<T>` - Lock-free single-producer single-consumer queue
-  - Atomic head/tail with Acquire/Release ordering
-  - Power-of-2 capacity for fast modulo
-  - Batch push/pop operations
-  - Achieved: ~4.8ns per operation (10x better than 50ns target)
-
-- `CachePadded<T>` - 64-byte aligned wrapper to prevent false sharing
-
-- `KeyRouter` - Routes events to cores by key hash
-  - FxHash for fast, consistent hashing
-  - Supports column names, indices, round-robin, all-columns
-
-- `CoreHandle` - Per-core reactor thread management
-  - CPU affinity (Linux/Windows)
-  - SPSC inbox/outbox queues
-  - Credit-based backpressure integration
-  - CoreMessage enum for events, watermarks, checkpoints
-
-- `CreditGate` / `BackpressureConfig` - Credit-based flow control
-  - Exclusive + floating credits (like Flink's network stack)
-  - High/low watermarks for hysteresis
-  - Three overflow strategies: Block, Drop, Error
-  - Lock-free atomic credit tracking
-  - Per-core metrics (acquired, released, blocked, dropped)
-
-- `ThreadPerCoreRuntime` - Multi-core orchestration
-  - Builder pattern for configuration
-  - submit/poll/stats operations
-  - OperatorFactory for per-core operators
+**Total tests**: 1176 (896 core + 280 sql + 120 storage + 6 connectors)
 
 ### Where We Left Off
-Phase 2 P0 feature F013 is complete with backpressure. Ready to continue with remaining Phase 2 work.
+**Phase 2 Production Hardening: 34/34 features COMPLETE (100%)**
 
 ### Immediate Next Steps
-
-1. **Continue Phase 2** - Production Hardening
-   - F016: Sliding Windows (P0)
-   - F019: Stream-Stream Joins (P0)
-   - F023: Exactly-Once Sinks (P0)
+1. Phase 3: Connectors & Integration (F025-F034)
 
 ### Open Issues
-
-| Issue | Severity | Feature | Notes |
-|-------|----------|---------|-------|
-| None | - | - | Phase 2 underway |
-
-### Code Pointers
-
-**TPC Public API**:
-```rust
-use laminar_core::tpc::{TpcConfig, ThreadPerCoreRuntime, KeySpec};
-
-// Configure for 4 cores, routing by "user_id" column
-let config = TpcConfig::builder()
-    .num_cores(4)
-    .key_columns(vec!["user_id".to_string()])
-    .cpu_pinning(true)
-    .build()?;
-
-let runtime = ThreadPerCoreRuntime::new(config)?;
-
-// Submit events - automatically routed by key
-runtime.submit(event)?;
-
-// Poll all cores for outputs
-let outputs = runtime.poll();
-```
-
-**Backpressure Configuration**:
-```rust
-use laminar_core::tpc::{BackpressureConfig, OverflowStrategy, CoreConfig};
-
-// Configure credit-based flow control
-let bp_config = BackpressureConfig::builder()
-    .exclusive_credits(4)      // Per-sender reserved credits
-    .floating_credits(8)       // Shared pool for backlog priority
-    .high_watermark(0.8)       // Start throttling at 80% queue usage
-    .low_watermark(0.5)        // Resume at 50% queue usage
-    .overflow_strategy(OverflowStrategy::Block)  // or Drop, Error
-    .build();
-
-// CoreHandle exposes backpressure state
-let handle: &CoreHandle = ...;
-handle.is_backpressured();     // Check if throttling active
-handle.available_credits();    // Current credit count
-handle.credit_metrics();       // Acquired, released, blocked, dropped
-```
+None - Phase 2 complete.
 
 ---
 
@@ -123,162 +52,100 @@ handle.credit_metrics();       // Acquired, released, blocked, dropped
 
 | Feature | Status | Notes |
 |---------|--------|-------|
-| F013: Thread-Per-Core | ✅ Complete | SPSC queues, key routing, CPU pinning |
-| F014: SPSC Queues | ✅ Complete | Part of F013 implementation |
-| F016: Sliding Windows | 📝 Not started | |
-| F019: Stream-Stream Joins | 📝 Not started | |
-| F023: Exactly-Once Sinks | 📝 Not started | |
+| F013: Thread-Per-Core | Done | SPSC queues, key routing, CPU pinning |
+| F014: SPSC Queues | Done | Part of F013 |
+| F015: CPU Pinning | Done | Part of F013 |
+| F016: Sliding Windows | Done | Multi-window assignment |
+| F017: Session Windows | Done | Gap-based sessions |
+| F018: Hopping Windows | Done | Alias for sliding |
+| F019: Stream-Stream Joins | Done | Inner/Left/Right/Full |
+| F020: Lookup Joins | Done | Cached with TTL |
+| F011B: EMIT Extension | Done | OnWindowClose, Changelog, Final |
+| F023: Exactly-Once Sinks | Done | TransactionalSink, ExactlyOnceSinkAdapter, 28 tests |
+| F059: FIRST/LAST | Done | Essential for OHLC |
+| F063: Changelog/Retraction | Done | Z-set foundation |
+| F067: io_uring Advanced | Done | SQPOLL, IOPOLL |
+| F068: NUMA-Aware Memory | Done | NumaAllocator |
+| F071: Zero-Alloc Enforcement | Done | HotPathGuard |
+| F022: Incremental Checkpoint | Done | RocksDB backend |
+| F062: Per-Core WAL | Done | Lock-free per-core |
+| F069: Three-Ring I/O | Done | Latency/Main/Poll |
+| F070: Task Budget | Done | BudgetMonitor |
+| F073: Zero-Alloc Polling | Done | Callback APIs |
+| F060: Cascading MVs | Done | MvRegistry |
+| F056: ASOF Joins | Done | Backward/Forward/Nearest, tolerance |
+| F064: Per-Partition Watermarks | Done | PartitionedWatermarkTracker, CoreWatermarkState |
+| F065: Keyed Watermarks | Done | KeyedWatermarkTracker, per-key 99%+ accuracy |
+| F057: Stream Join Optimizations | Done | CPU-friendly encoding, asymmetric compaction, per-key tracking |
+| F024: Two-Phase Commit | Done | Presumed abort, crash recovery, 20 tests |
+| F021: Temporal Joins | Done | Event-time/process-time, append-only/non-append-only, 22 tests |
+| F066: Watermark Alignment Groups | Done | Pause/WarnOnly/DropExcess, coordinator, 25 tests |
+| F072: XDP/eBPF | Done | Packet header, CPU steering, Linux loader, 34 tests |
+| F005B: Advanced DataFusion | Done | Window/Watermark UDFs, async LogicalPlan, execute_streaming_sql, 31 tests |
+| F074: Composite Aggregator | Done | ScalarResult, DynAccumulator, CompositeAggregator, f64 aggregators, 122 tests |
+| F075: DataFusion Aggregate Bridge | Done | DataFusionAccumulatorAdapter, DataFusionAggregateFactory, 40 tests |
+| F076: Retractable FIRST/LAST | Done | RetractableFirst/LastValue, f64 variants, 26 tests |
+| F077: Extended Aggregation Parser | Done | 20+ new AggregateType variants, FILTER, WITHIN GROUP, 57 tests |
+
+---
+
+## Phase 1.5 Progress (SQL Parser)
+
+| Feature | Status | Notes |
+|---------|--------|-------|
+| F006B: Production SQL Parser | Done | 129 tests, all 6 phases complete |
 
 ---
 
 ## Quick Reference
 
-### Current Focus
-- **Phase**: 2 Production Hardening
-- **Active Feature**: F013 complete, ready for F016
-
-### Key Files
+### Key Modules
 ```
-crates/laminar-core/src/tpc/
-├── mod.rs           # TpcError, public exports
-├── spsc.rs          # SpscQueue<T>, CachePadded<T>
-├── router.rs        # KeyRouter, KeySpec
-├── core_handle.rs   # CoreHandle, CoreConfig, CoreMessage
-└── runtime.rs       # ThreadPerCoreRuntime, TpcConfig
+laminar-core/src/
+  time/         # F010, F064, F065, F066: Watermarks, partitioned + keyed + alignment
+    alignment_group # F066: Watermark alignment groups
+  mv/           # F060: Cascading MVs
+  budget/       # F070: Task budgets
+  sink/         # F023: Exactly-once sinks
+    transactional  # F023: TransactionalSink<S> with buffer+commit
+    adapter        # F023: ExactlyOnceSinkAdapter epoch-based bridge
+  io_uring/     # F067, F069: io_uring + three-ring
+  xdp/          # F072: XDP/eBPF network optimization
+  alloc/        # F071: Zero-allocation
+  numa/         # F068: NUMA awareness
+  tpc/          # F013/F014: Thread-per-core
+  operator/     # Windows, joins, changelog
+    window      # F074: CompositeAggregator, DynAccumulator, f64 aggregators
+    changelog   # F076: RetractableFirst/LastValueAccumulator
+    asof_join   # F056: ASOF joins
+    temporal_join # F021: Temporal joins
 
-Benchmarks: crates/laminar-core/benches/tpc_bench.rs
+laminar-sql/src/       # F006B: Production SQL Parser
+  parser/              # SQL parsing with streaming extensions
+    streaming_parser   # CREATE SOURCE/SINK
+    window_rewriter    # TUMBLE/HOP/SESSION extraction
+    emit_parser        # EMIT clause parsing
+    late_data_parser   # Late data handling
+    join_parser        # Stream-stream/lookup join analysis
+    aggregation_parser # F077: 30+ aggregates, FILTER, WITHIN GROUP, datafusion_name()
+  planner/             # StreamingPlanner, QueryPlan
+  translator/          # Operator configuration builders
+    window_translator  # WindowOperatorConfig
+    join_translator    # JoinOperatorConfig (stream/lookup)
+  datafusion/          # F005/F005B: DataFusion integration
+    window_udf         # F005B: TUMBLE/HOP/SESSION scalar UDFs
+    watermark_udf      # F005B: watermark() UDF via Arc<AtomicI64>
+    execute            # F005B: execute_streaming_sql end-to-end
+    aggregate_bridge   # F075: DataFusion Accumulator ↔ DynAccumulator bridge
 
-Tests: 267 passing (186 core, 56 sql, 25 storage)
+laminar-storage/src/
+  incremental/  # F022: Checkpointing
+  per_core_wal/ # F062: Per-core WAL
 ```
 
 ### Useful Commands
 ```bash
-# Run all tests
-cargo test --all --lib
-
-# Run TPC tests only
-cargo test -p laminar-core tpc --lib
-
-# Run TPC benchmarks
-cargo bench --bench tpc_bench
-
-# Clippy
+cargo test --all --lib          # Run all tests
+cargo bench --bench tpc_bench   # TPC benchmarks
 cargo clippy --all -- -D warnings
 ```
-
-### Recent Decisions
-| Date | Decision | Rationale |
-|------|----------|-----------|
-| 2026-01-24 | Custom SPSC over crossbeam | Precise cache layout control |
-| 2026-01-24 | `#[repr(C, align(64))]` for CachePadded | Hardware cache line alignment |
-| 2026-01-24 | FxHash for key routing | Faster than std HashMap for small keys |
-| 2026-01-24 | Factory pattern for per-core operators | No shared state between cores |
-
----
-
-## History
-
-### Previous Sessions
-
-<details>
-<summary>Session - 2026-01-24 (F013 Thread-Per-Core)</summary>
-
-**Accomplished**:
-- Implemented F013 Thread-Per-Core Architecture
-- Created tpc module with spsc.rs, router.rs, core_handle.rs, runtime.rs
-- Lock-free SPSC queue with CachePadded wrapper
-- KeyRouter for FxHash-based event partitioning
-- CoreHandle with CPU affinity (Linux/Windows)
-- ThreadPerCoreRuntime with builder pattern
-- Added tpc_bench.rs with comprehensive benchmarks
-- All 267 tests passing, clippy clean
-
-**Key Files**:
-- `crates/laminar-core/src/tpc/` - TPC module
-- `crates/laminar-core/benches/tpc_bench.rs` - Benchmarks
-
-</details>
-
-<details>
-<summary>Session - 2026-01-24 (WAL Hardening)</summary>
-
-**Accomplished**:
-- Changed `sync_all()` to `sync_data()` (fdatasync)
-- Added CRC32C checksums to WAL records
-- Added torn write detection with `WalReadResult` enum
-- Added `repair()` method to truncate to last valid record
-- Added watermark to `WalEntry::Commit` and `CheckpointMetadata`
-- All 217 tests passing
-
-**Key Changes**:
-- WAL record format: `[length: 4][crc32: 4][data: length]`
-- `WalError::ChecksumMismatch` and `WalError::TornWrite` error types
-- Recovery restores watermark from checkpoint
-
-</details>
-
-<details>
-<summary>Session - 2026-01-24 (Phase 1 Audit)</summary>
-
-**Accomplished**:
-- Comprehensive audit of all 12 Phase 1 features
-- Identified 16 gaps against 2025-2026 best practices
-- Prioritized into P0/P1/P2 categories
-- Created PHASE1_AUDIT.md with full audit report
-
-**Key Findings**:
-- WAL durability issues (fsync, no checksums, no torn write detection)
-- Watermark not persisted (recovery loses progress)
-- No recovery integration test
-
-</details>
-
-<details>
-<summary>Session - 2026-01-24 (Late Data Handling - F012)</summary>
-
-**Accomplished**:
-- Implemented F012 - Late Data Handling
-- Added `LateDataConfig` struct with drop/side-output options
-- Added `LateDataMetrics` for tracking late events
-- Phase 1 features complete (100%)
-
-</details>
-
-<details>
-<summary>Session - 2026-01-24 (EMIT Clause - F011)</summary>
-
-**Accomplished**:
-- Implemented F011 - EMIT Clause with 3 strategies
-- OnWatermark, Periodic, OnUpdate emit modes
-- Periodic timer system with special key encoding
-
-</details>
-
-<details>
-<summary>Session - 2026-01-24 (Watermarks - F010)</summary>
-
-**Accomplished**:
-- Implemented F010 - Watermarks with 5 generation strategies
-- WatermarkTracker for multi-source alignment
-- Idle source detection and MeteredGenerator wrapper
-
-</details>
-
-<details>
-<summary>Session - 2026-01-23 (Checkpointing - F008)</summary>
-
-**Accomplished**:
-- Fixed Ring 0 hot path violations
-- Implemented reactor features (CPU affinity, sinks, graceful shutdown)
-- Implemented F008 - Basic Checkpointing
-
-</details>
-
-<details>
-<summary>Session - 2026-01-22 (rkyv migration)</summary>
-
-**Accomplished**:
-- Migrated serialization from bincode to rkyv
-- Updated all types for zero-copy deserialization
-
-</details>

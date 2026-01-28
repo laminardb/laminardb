@@ -25,7 +25,14 @@
       "Bash(cargo fmt:*)",
       "Skill(gate-check)",
       "Bash(tree:*)",
-      "Bash(cd:*)"
+      "Bash(cd:*)",
+      "Bash(find:*)",
+      "Bash(xargs ls:*)",
+      "Bash(wc:*)",
+      "Bash(where /r C:Userssujit.cargoregistrysrc *ScalarFunctionArgs*)",
+      "Bash(powershell -Command \"Get-ChildItem -Path ''C:\\\\Users\\\\sujit\\\\.cargo\\\\registry\\\\src'' -Recurse -Filter ''*.rs'' | Select-String -Pattern ''pub struct ScalarFunctionArgs'' | Select-Object -First 3 -ExpandProperty Path\")",
+      "Bash(powershell -Command \"Get-Content ''C:\\\\Users\\\\sujit\\\\.claude\\\\projects\\\\C--Users-sujit-source-laminardb\\\\64a8e73e-b0ce-47cb-b8fb-7b82ccce6163\\\\tool-results\\\\toolu_01N2Aa3K8T3BSWggHkVABsvQ.txt'' | Select-Object -Last 30\")",
+      "Bash(powershell -Command:*)"
     ]
   }
 }

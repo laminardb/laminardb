@@ -215,13 +215,19 @@ impl WriteAheadLog {
         let crc = crc32c::crc32c(&bytes);
 
         // Write record: [length: 4 bytes][crc32: 4 bytes][data: length bytes]
+        if bytes.len() > u32::MAX as usize {
+            return Err(WalError::Serialization(format!(
+                "Entry too large: {} bytes (max {})",
+                bytes.len(),
+                u32::MAX
+            )));
+        }
         #[allow(clippy::cast_possible_truncation)]
         let len = bytes.len() as u32;
         self.writer.write_all(&len.to_le_bytes())?;
         self.writer.write_all(&crc.to_le_bytes())?;
         self.writer.write_all(&bytes)?;
 
-        #[allow(clippy::cast_possible_truncation)]
         let bytes_len = bytes.len() as u64;
         self.position += RECORD_HEADER_SIZE + bytes_len;
 
@@ -420,8 +426,7 @@ impl WriteAheadLog {
         }
 
         // Read data and validate CRC
-        #[allow(clippy::cast_possible_truncation)]
-        let mut data = vec![0u8; len as usize];
+        let mut data = vec![0u8; usize::try_from(len).unwrap_or(usize::MAX)];
         reader.read_exact(&mut data)?;
 
         let actual_crc = crc32c::crc32c(&data);
@@ -527,8 +532,7 @@ impl WalReader {
         }
 
         // Read data
-        #[allow(clippy::cast_possible_truncation)]
-        let mut data = vec![0u8; len as usize];
+        let mut data = vec![0u8; usize::try_from(len).unwrap_or(usize::MAX)];
         self.reader.read_exact(&mut data)?;
         self.position += len;
 
@@ -753,7 +757,7 @@ mod tests {
             WalReadResult::ChecksumMismatch { position } => {
                 assert_eq!(position, 0);
             }
-            other => panic!("Expected ChecksumMismatch, got {:?}", other),
+            other => panic!("Expected ChecksumMismatch, got {other:?}"),
         }
     }
 
@@ -791,7 +795,7 @@ mod tests {
             WalReadResult::Entry(WalEntry::Put { key, .. }) => {
                 assert_eq!(key, b"key1");
             }
-            other => panic!("Expected valid entry, got {:?}", other),
+            other => panic!("Expected valid entry, got {other:?}"),
         }
 
         // Second read should detect torn write
@@ -799,7 +803,7 @@ mod tests {
             WalReadResult::TornWrite { position, .. } => {
                 assert_eq!(position, valid_pos);
             }
-            other => panic!("Expected TornWrite, got {:?}", other),
+            other => panic!("Expected TornWrite, got {other:?}"),
         }
     }
 
@@ -827,7 +831,7 @@ mod tests {
                 .unwrap();
             // Write length (100 bytes) + CRC (dummy) + only 10 bytes of data
             let len: u32 = 100;
-            let crc: u32 = 0x12345678;
+            let crc: u32 = 0x1234_5678;
             file.write_all(&len.to_le_bytes()).unwrap();
             file.write_all(&crc.to_le_bytes()).unwrap();
             file.write_all(&[0u8; 10]).unwrap(); // Only 10 bytes, not 100
@@ -842,7 +846,7 @@ mod tests {
             WalReadResult::Entry(WalEntry::Put { key, .. }) => {
                 assert_eq!(key, b"key1");
             }
-            other => panic!("Expected valid entry, got {:?}", other),
+            other => panic!("Expected valid entry, got {other:?}"),
         }
 
         // Second read should detect torn write (incomplete data)
@@ -851,7 +855,7 @@ mod tests {
                 assert_eq!(position, valid_pos);
                 assert!(reason.contains("incomplete data"));
             }
-            other => panic!("Expected TornWrite, got {:?}", other),
+            other => panic!("Expected TornWrite, got {other:?}"),
         }
     }
 
@@ -968,11 +972,11 @@ mod tests {
             WalReadResult::Entry(WalEntry::Put { key, .. }) => {
                 assert_eq!(key, b"key1");
             }
-            other => panic!("Expected Entry, got {:?}", other),
+            other => panic!("Expected Entry, got {other:?}"),
         }
         match reader1.read_next().unwrap() {
             WalReadResult::Eof => {}
-            other => panic!("Expected Eof, got {:?}", other),
+            other => panic!("Expected Eof, got {other:?}"),
         }
 
         // Test Iterator
@@ -990,7 +994,7 @@ mod tests {
         let mut reader = wal.read_from(0).unwrap();
         match reader.read_next().unwrap() {
             WalReadResult::Eof => {}
-            other => panic!("Expected Eof, got {:?}", other),
+            other => panic!("Expected Eof, got {other:?}"),
         }
     }
 

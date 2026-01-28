@@ -42,6 +42,21 @@ pub enum Output {
         /// The late event
         event: Event,
     },
+    /// Changelog record with Z-set weight (F011B).
+    ///
+    /// Used by `EmitStrategy::Changelog` to emit structured change records
+    /// for CDC pipelines and cascading materialized views.
+    Changelog(window::ChangelogRecord),
+    /// Checkpoint completion with snapshotted operator states.
+    ///
+    /// Emitted when a `CheckpointRequest` is processed by a core thread.
+    /// Carries the checkpoint ID and all operator states for persistence by Ring 1.
+    CheckpointComplete {
+        /// The checkpoint ID from the request
+        checkpoint_id: u64,
+        /// Snapshotted states from all operators on this core
+        operator_states: Vec<OperatorState>,
+    },
 }
 
 /// Collection type for operator outputs.
@@ -124,7 +139,18 @@ pub enum OperatorError {
     ProcessingFailed(String),
 }
 
+pub mod asof_join;
+pub mod changelog;
+pub mod lookup_join;
+pub mod partitioned_topk;
+pub mod session_window;
+pub mod sliding_window;
+pub mod stream_join;
+pub mod temporal_join;
+pub mod topk;
+pub mod watermark_sort;
 pub mod window;
+pub mod window_sort;
 
 #[cfg(test)]
 mod tests {

@@ -11,7 +11,7 @@
 //!
 //! ## State Backends
 //!
-//! - **[`InMemoryStore`]**: FxHashMap-based, fastest for small state
+//! - **[`InMemoryStore`]**: BTreeMap-based, fast lookups with O(log n + k) prefix/range scans
 //! - **[`MmapStateStore`]**: Memory-mapped, supports larger-than-memory state with optional persistence
 //! - **Hybrid**: Combination with hot/cold separation (future)
 //!
@@ -61,7 +61,8 @@
 //! ```
 
 use bytes::Bytes;
-use fxhash::FxHashMap;
+use std::collections::BTreeMap;
+use std::ops::Bound;
 use rkyv::{
     api::high::{HighDeserializer, HighSerializer, HighValidator},
     bytecheck::CheckBytes,
@@ -71,6 +72,27 @@ use rkyv::{
     Archive, Deserialize as RkyvDeserialize, Serialize as RkyvSerialize,
 };
 use std::ops::Range;
+
+/// Compute the lexicographic successor of a byte prefix.
+///
+/// Returns `None` if no successor exists (empty prefix or all bytes are 0xFF).
+/// Used by `BTreeMap::range()` to efficiently bound prefix scans.
+fn prefix_successor(prefix: &[u8]) -> Option<Vec<u8>> {
+    if prefix.is_empty() {
+        return None;
+    }
+    let mut successor = prefix.to_vec();
+    // Walk backwards, incrementing the last non-0xFF byte
+    while let Some(last) = successor.last_mut() {
+        if *last < 0xFF {
+            *last += 1;
+            return Some(successor);
+        }
+        successor.pop();
+    }
+    // All bytes were 0xFF — no successor exists
+    None
+}
 
 /// Trait for state store implementations.
 ///
@@ -124,20 +146,25 @@ pub trait StateStore: Send {
 
     /// Scan all keys with a given prefix.
     ///
-    /// Returns an iterator over matching (key, value) pairs.
-    /// The iteration order is not guaranteed.
+    /// Returns an iterator over matching (key, value) pairs in
+    /// lexicographic order.
     ///
     /// # Performance
     ///
-    /// This is O(n) where n is the total number of keys. Use sparingly
-    /// on the hot path.
+    /// O(log n + k) where n is the total number of keys and k is the
+    /// number of matching entries.
     fn prefix_scan<'a>(&'a self, prefix: &'a [u8])
         -> Box<dyn Iterator<Item = (Bytes, Bytes)> + 'a>;
 
     /// Range scan between two keys (exclusive end).
     ///
-    /// Returns an iterator over keys where `start <= key < end`.
-    /// Keys are compared lexicographically.
+    /// Returns an iterator over keys where `start <= key < end`
+    /// in lexicographic order.
+    ///
+    /// # Performance
+    ///
+    /// O(log n + k) where n is the total number of keys and k is the
+    /// number of matching entries.
     fn range_scan<'a>(
         &'a self,
         range: Range<&'a [u8]>,
@@ -391,26 +418,27 @@ impl StateSnapshot {
     }
 }
 
-/// In-memory state store using `FxHashMap` for maximum performance.
+/// In-memory state store using `BTreeMap` for sorted key access.
 ///
-/// This is the fastest state store implementation, suitable for state that
-/// fits in memory. It uses `FxHashMap` which is optimized for small keys
-/// (like the ones typically used in streaming operators).
+/// This state store is suitable for state that fits in memory. It uses
+/// `BTreeMap` which provides O(log n + k) prefix and range scans, making
+/// it efficient for join state and windowed aggregation lookups.
 ///
 /// # Performance Characteristics
 ///
-/// - **Get**: O(1), < 500ns typical
-/// - **Put**: O(1) amortized, may allocate
-/// - **Delete**: O(1)
-/// - **Prefix scan**: O(n) where n is total entries
+/// - **Get**: O(log n), < 500ns typical
+/// - **Put**: O(log n), may allocate
+/// - **Delete**: O(log n)
+/// - **Prefix scan**: O(log n + k) where k is matching entries
+/// - **Range scan**: O(log n + k) where k is matching entries
 ///
 /// # Memory Usage
 ///
 /// Keys and values are stored as owned `Vec<u8>` and `Bytes` respectively.
 /// Use `size_bytes()` to monitor memory usage.
 pub struct InMemoryStore {
-    /// The underlying hash map
-    data: FxHashMap<Vec<u8>, Bytes>,
+    /// The underlying sorted map
+    data: BTreeMap<Vec<u8>, Bytes>,
     /// Track total size for monitoring
     size_bytes: usize,
 }
@@ -420,32 +448,35 @@ impl InMemoryStore {
     #[must_use]
     pub fn new() -> Self {
         Self {
-            data: FxHashMap::default(),
+            data: BTreeMap::new(),
             size_bytes: 0,
         }
     }
 
-    /// Creates a new in-memory store with pre-allocated capacity.
+    /// Creates a new in-memory store.
     ///
-    /// Use this when you know the approximate number of entries
-    /// to avoid rehashing.
+    /// The capacity hint is accepted for API compatibility but has no
+    /// effect — `BTreeMap` does not support pre-allocation.
     #[must_use]
-    pub fn with_capacity(capacity: usize) -> Self {
-        Self {
-            data: FxHashMap::with_capacity_and_hasher(capacity, fxhash::FxBuildHasher::default()),
-            size_bytes: 0,
-        }
+    pub fn with_capacity(_capacity: usize) -> Self {
+        Self::new()
     }
 
-    /// Returns the capacity of the underlying hash map.
+    /// Returns the number of entries in the store.
+    ///
+    /// `BTreeMap` does not expose a capacity concept, so this returns
+    /// the current entry count.
     #[must_use]
     pub fn capacity(&self) -> usize {
-        self.data.capacity()
+        self.data.len()
     }
 
-    /// Shrinks the capacity of the store as much as possible.
+    /// No-op for API compatibility.
+    ///
+    /// `BTreeMap` manages its own memory and does not support
+    /// explicit shrinking.
     pub fn shrink_to_fit(&mut self) {
-        self.data.shrink_to_fit();
+        // BTreeMap does not support shrink_to_fit
     }
 }
 
@@ -461,21 +492,22 @@ impl StateStore for InMemoryStore {
         self.data.get(key).cloned()
     }
 
+    #[inline]
     fn put(&mut self, key: &[u8], value: &[u8]) -> Result<(), StateError> {
-        let key_vec = key.to_vec();
         let value_bytes = Bytes::copy_from_slice(value);
 
-        // Update size tracking
-        if let Some(old_value) = self.data.get(&key_vec) {
-            // Key exists, subtract old value size
-            self.size_bytes -= old_value.len();
-        } else {
-            // New key, add key size
-            self.size_bytes += key_vec.len();
+        // Entry API: single tree traversal for both insert and update
+        match self.data.entry(key.to_vec()) {
+            std::collections::btree_map::Entry::Occupied(mut entry) => {
+                self.size_bytes -= entry.get().len();
+                self.size_bytes += value.len();
+                *entry.get_mut() = value_bytes;
+            }
+            std::collections::btree_map::Entry::Vacant(entry) => {
+                self.size_bytes += key.len() + value.len();
+                entry.insert(value_bytes);
+            }
         }
-        self.size_bytes += value.len();
-
-        self.data.insert(key_vec, value_bytes);
         Ok(())
     }
 
@@ -490,12 +522,28 @@ impl StateStore for InMemoryStore {
         &'a self,
         prefix: &'a [u8],
     ) -> Box<dyn Iterator<Item = (Bytes, Bytes)> + 'a> {
-        Box::new(
-            self.data
-                .iter()
-                .filter(move |(k, _)| k.starts_with(prefix))
-                .map(|(k, v)| (Bytes::copy_from_slice(k), v.clone())),
-        )
+        if prefix.is_empty() {
+            // Empty prefix matches everything
+            return Box::new(
+                self.data
+                    .iter()
+                    .map(|(k, v)| (Bytes::copy_from_slice(k), v.clone())),
+            );
+        }
+        if let Some(end) = prefix_successor(prefix) {
+            Box::new(
+                self.data
+                    .range::<[u8], _>((Bound::Included(prefix), Bound::Excluded(end.as_slice())))
+                    .map(|(k, v)| (Bytes::copy_from_slice(k), v.clone())),
+            )
+        } else {
+            // All-0xFF prefix: scan from prefix to end
+            Box::new(
+                self.data
+                    .range::<[u8], _>((Bound::Included(prefix), Bound::Unbounded))
+                    .map(|(k, v)| (Bytes::copy_from_slice(k), v.clone())),
+            )
+        }
     }
 
     fn range_scan<'a>(
@@ -504,15 +552,14 @@ impl StateStore for InMemoryStore {
     ) -> Box<dyn Iterator<Item = (Bytes, Bytes)> + 'a> {
         Box::new(
             self.data
-                .iter()
-                .filter(move |(k, _)| k.as_slice() >= range.start && k.as_slice() < range.end)
+                .range::<[u8], _>((Bound::Included(range.start), Bound::Excluded(range.end)))
                 .map(|(k, v)| (Bytes::copy_from_slice(k), v.clone())),
         )
     }
 
     #[inline]
     fn contains(&self, key: &[u8]) -> bool {
-        self.data.contains_key(key)
+        self.data.contains_key(key.as_ref())
     }
 
     fn size_bytes(&self) -> usize {
@@ -790,7 +837,8 @@ mod tests {
     #[test]
     fn test_with_capacity() {
         let store = InMemoryStore::with_capacity(1000);
-        assert!(store.capacity() >= 1000);
+        // BTreeMap does not pre-allocate; capacity() returns len() which is 0
+        assert_eq!(store.capacity(), 0);
         assert!(store.is_empty());
     }
 
@@ -808,5 +856,87 @@ mod tests {
         assert_eq!(store.len(), 0);
         assert_eq!(store.size_bytes(), 0);
         assert!(store.get(b"key1").is_none());
+    }
+
+    #[test]
+    fn test_prefix_successor() {
+        // Normal case
+        assert_eq!(prefix_successor(b"abc"), Some(b"abd".to_vec()));
+
+        // Empty prefix
+        assert_eq!(prefix_successor(b""), None);
+
+        // All 0xFF bytes — no successor
+        assert_eq!(prefix_successor(&[0xFF, 0xFF, 0xFF]), None);
+
+        // Trailing 0xFF bytes are truncated and previous byte incremented
+        assert_eq!(prefix_successor(&[0x01, 0xFF]), Some(vec![0x02]));
+        assert_eq!(
+            prefix_successor(&[0x01, 0x02, 0xFF]),
+            Some(vec![0x01, 0x03])
+        );
+
+        // Single byte
+        assert_eq!(prefix_successor(&[0x00]), Some(vec![0x01]));
+        assert_eq!(prefix_successor(&[0xFE]), Some(vec![0xFF]));
+        assert_eq!(prefix_successor(&[0xFF]), None);
+    }
+
+    #[test]
+    fn test_prefix_scan_binary_keys() {
+        let mut store = InMemoryStore::new();
+
+        // Simulate join state keys: partition_prefix + key_hash
+        let prefix_a = [0x00, 0x01]; // partition 0, stream 1
+        let prefix_b = [0x00, 0x02]; // partition 0, stream 2
+
+        store
+            .put(&[0x00, 0x01, 0xAA], b"val1")
+            .unwrap();
+        store
+            .put(&[0x00, 0x01, 0xBB], b"val2")
+            .unwrap();
+        store
+            .put(&[0x00, 0x02, 0xCC], b"val3")
+            .unwrap();
+        store
+            .put(&[0x00, 0x02, 0xDD], b"val4")
+            .unwrap();
+        store
+            .put(&[0x01, 0x01, 0xEE], b"val5")
+            .unwrap();
+
+        // Prefix scan for partition_a
+        let results_a: Vec<_> = store.prefix_scan(&prefix_a).collect();
+        assert_eq!(results_a.len(), 2);
+        for (key, _) in &results_a {
+            assert!(key.starts_with(&prefix_a));
+        }
+
+        // Prefix scan for partition_b
+        let results_b: Vec<_> = store.prefix_scan(&prefix_b).collect();
+        assert_eq!(results_b.len(), 2);
+        for (key, _) in &results_b {
+            assert!(key.starts_with(&prefix_b));
+        }
+
+        // Prefix scan with all-0xFF prefix
+        let results_ff: Vec<_> = store.prefix_scan(&[0xFF, 0xFF]).collect();
+        assert_eq!(results_ff.len(), 0);
+    }
+
+    #[test]
+    fn test_prefix_scan_returns_sorted() {
+        let mut store = InMemoryStore::new();
+        store.put(b"prefix:c", b"3").unwrap();
+        store.put(b"prefix:a", b"1").unwrap();
+        store.put(b"prefix:b", b"2").unwrap();
+
+        let results: Vec<_> = store.prefix_scan(b"prefix:").collect();
+        let keys: Vec<_> = results.iter().map(|(k, _)| k.as_ref().to_vec()).collect();
+        assert_eq!(
+            keys,
+            vec![b"prefix:a".to_vec(), b"prefix:b".to_vec(), b"prefix:c".to_vec()]
+        );
     }
 }

@@ -28,11 +28,168 @@
 //! let outputs = runtime.poll();
 //! ```
 
+use std::ops::Deref;
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::Arc;
 
 use crate::operator::{Event, Operator, Output};
-use crate::reactor::Config as ReactorConfig;
+use crate::reactor::ReactorConfig;
+
+// ============================================================================
+// OutputBuffer - Pre-allocated buffer for zero-allocation polling
+// ============================================================================
+
+/// A pre-allocated buffer for collecting outputs without allocation.
+///
+/// This buffer can be reused across multiple poll cycles, avoiding
+/// memory allocation on the hot path.
+///
+/// # Example
+///
+/// ```rust,ignore
+/// use laminar_core::tpc::OutputBuffer;
+///
+/// // Create buffer once at startup
+/// let mut buffer = OutputBuffer::with_capacity(1024);
+///
+/// // Poll loop - no allocation after warmup
+/// loop {
+///     let count = runtime.poll_into(&mut buffer, 256);
+///     for output in buffer.iter() {
+///         process(output);
+///     }
+///     buffer.clear();
+/// }
+/// ```
+#[derive(Debug)]
+pub struct OutputBuffer {
+    /// Internal storage (pre-allocated)
+    items: Vec<Output>,
+}
+
+impl OutputBuffer {
+    /// Creates a new output buffer with the given capacity.
+    ///
+    /// The buffer will not allocate until `capacity` items are added.
+    #[must_use]
+    pub fn with_capacity(capacity: usize) -> Self {
+        Self {
+            items: Vec::with_capacity(capacity),
+        }
+    }
+
+    /// Clears the buffer for reuse (no deallocation).
+    ///
+    /// The capacity remains unchanged, allowing zero-allocation reuse.
+    #[inline]
+    pub fn clear(&mut self) {
+        self.items.clear();
+    }
+
+    /// Returns the number of items in the buffer.
+    #[inline]
+    #[must_use]
+    pub fn len(&self) -> usize {
+        self.items.len()
+    }
+
+    /// Returns true if the buffer is empty.
+    #[inline]
+    #[must_use]
+    pub fn is_empty(&self) -> bool {
+        self.items.is_empty()
+    }
+
+    /// Returns the current capacity of the buffer.
+    #[inline]
+    #[must_use]
+    pub fn capacity(&self) -> usize {
+        self.items.capacity()
+    }
+
+    /// Returns the remaining capacity before reallocation.
+    #[inline]
+    #[must_use]
+    pub fn remaining(&self) -> usize {
+        self.items.capacity() - self.items.len()
+    }
+
+    /// Returns a slice of the collected outputs.
+    #[inline]
+    #[must_use]
+    pub fn as_slice(&self) -> &[Output] {
+        &self.items
+    }
+
+    /// Returns an iterator over the outputs.
+    #[inline]
+    pub fn iter(&self) -> impl Iterator<Item = &Output> {
+        self.items.iter()
+    }
+
+    /// Consumes the buffer and returns the inner Vec.
+    #[must_use]
+    pub fn into_vec(self) -> Vec<Output> {
+        self.items
+    }
+
+    /// Extends the buffer with outputs from an iterator.
+    ///
+    /// Note: This may allocate if the iterator produces more items than
+    /// the remaining capacity.
+    #[inline]
+    pub fn extend<I: IntoIterator<Item = Output>>(&mut self, iter: I) {
+        self.items.extend(iter);
+    }
+
+    /// Pushes a single output to the buffer.
+    ///
+    /// Note: This may allocate if the buffer is at capacity.
+    #[inline]
+    pub fn push(&mut self, output: Output) {
+        self.items.push(output);
+    }
+
+    /// Returns a mutable reference to the internal Vec.
+    ///
+    /// This is useful for passing to functions that expect `&mut Vec<Output>`.
+    #[inline]
+    pub fn as_vec_mut(&mut self) -> &mut Vec<Output> {
+        &mut self.items
+    }
+}
+
+impl Default for OutputBuffer {
+    fn default() -> Self {
+        Self::with_capacity(1024)
+    }
+}
+
+impl Deref for OutputBuffer {
+    type Target = [Output];
+
+    fn deref(&self) -> &Self::Target {
+        &self.items
+    }
+}
+
+impl<'a> IntoIterator for &'a OutputBuffer {
+    type Item = &'a Output;
+    type IntoIter = std::slice::Iter<'a, Output>;
+
+    fn into_iter(self) -> Self::IntoIter {
+        self.items.iter()
+    }
+}
+
+impl IntoIterator for OutputBuffer {
+    type Item = Output;
+    type IntoIter = std::vec::IntoIter<Output>;
+
+    fn into_iter(self) -> Self::IntoIter {
+        self.items.into_iter()
+    }
+}
 
 use super::core_handle::{CoreConfig, CoreHandle};
 use super::router::{KeyRouter, KeySpec};
@@ -55,6 +212,8 @@ pub struct TpcConfig {
     pub outbox_capacity: usize,
     /// Reactor configuration (applied to all cores)
     pub reactor_config: ReactorConfig,
+    /// Enable NUMA-aware memory allocation
+    pub numa_aware: bool,
 }
 
 impl Default for TpcConfig {
@@ -67,6 +226,7 @@ impl Default for TpcConfig {
             inbox_capacity: 65536,
             outbox_capacity: 65536,
             reactor_config: ReactorConfig::default(),
+            numa_aware: false,
         }
     }
 }
@@ -107,6 +267,7 @@ pub struct TpcConfigBuilder {
     inbox_capacity: Option<usize>,
     outbox_capacity: Option<usize>,
     reactor_config: Option<ReactorConfig>,
+    numa_aware: Option<bool>,
 }
 
 impl TpcConfigBuilder {
@@ -165,6 +326,16 @@ impl TpcConfigBuilder {
         self
     }
 
+    /// Enables or disables NUMA-aware memory allocation.
+    ///
+    /// When enabled, per-core state stores and buffers are allocated
+    /// on the NUMA node local to that core, improving memory access latency.
+    #[must_use]
+    pub fn numa_aware(mut self, enabled: bool) -> Self {
+        self.numa_aware = Some(enabled);
+        self
+    }
+
     /// Builds the configuration.
     ///
     /// # Errors
@@ -179,6 +350,7 @@ impl TpcConfigBuilder {
             inbox_capacity: self.inbox_capacity.unwrap_or(65536),
             outbox_capacity: self.outbox_capacity.unwrap_or(65536),
             reactor_config: self.reactor_config.unwrap_or_default(),
+            numa_aware: self.numa_aware.unwrap_or(false),
         };
         config.validate()?;
         Ok(config)
@@ -261,6 +433,9 @@ impl ThreadPerCoreRuntime {
                 outbox_capacity: config.outbox_capacity,
                 reactor_config: config.reactor_config.clone(),
                 backpressure: super::backpressure::BackpressureConfig::default(),
+                numa_aware: config.numa_aware,
+                #[cfg(all(target_os = "linux", feature = "io-uring"))]
+                io_uring_config: None,
             };
 
             let operators = factory.create(core_id);
@@ -349,6 +524,11 @@ impl ThreadPerCoreRuntime {
     /// Polls all cores for outputs.
     ///
     /// Returns all available outputs from all cores.
+    ///
+    /// # Note
+    ///
+    /// This method allocates memory. For zero-allocation polling, use
+    /// [`poll_into`](Self::poll_into) or [`poll_each`](Self::poll_each) instead.
     #[must_use]
     pub fn poll(&self) -> Vec<Output> {
         let mut outputs = Vec::new();
@@ -358,13 +538,157 @@ impl ThreadPerCoreRuntime {
         outputs
     }
 
+    /// Polls all cores for outputs into a pre-allocated buffer (zero-allocation).
+    ///
+    /// Returns the total number of outputs collected across all cores.
+    ///
+    /// # Arguments
+    ///
+    /// * `buffer` - Pre-allocated buffer to receive outputs. Use [`OutputBuffer`]
+    ///   for optimal performance.
+    /// * `max_per_core` - Maximum outputs to collect from each core.
+    ///
+    /// # Example
+    ///
+    /// ```rust,ignore
+    /// use laminar_core::tpc::OutputBuffer;
+    ///
+    /// // Create buffer once
+    /// let mut buffer = OutputBuffer::with_capacity(4096);
+    ///
+    /// // Poll loop - no allocation after warmup
+    /// loop {
+    ///     let count = runtime.poll_into(&mut buffer, 256);
+    ///
+    ///     for output in buffer.iter() {
+    ///         process(output);
+    ///     }
+    ///
+    ///     buffer.clear(); // Reuse buffer
+    /// }
+    /// ```
+    pub fn poll_into(&self, buffer: &mut OutputBuffer, max_per_core: usize) -> usize {
+        let start_len = buffer.len();
+
+        for core in &self.cores {
+            // Check remaining capacity to avoid overflowing
+            let remaining = buffer.remaining();
+            if remaining == 0 {
+                break;
+            }
+
+            let max = max_per_core.min(remaining);
+            core.poll_outputs_into(buffer.as_vec_mut(), max);
+        }
+
+        buffer.len() - start_len
+    }
+
+    /// Polls all cores with a callback for each output (zero-allocation).
+    ///
+    /// Processing continues until:
+    /// - All cores have been polled up to `max_per_core`
+    /// - The callback returns `ControlFlow::Break`
+    ///
+    /// Returns the total number of outputs processed.
+    ///
+    /// # Arguments
+    ///
+    /// * `max_per_core` - Maximum outputs to process from each core.
+    /// * `f` - Callback function for each output. Return `true` to continue, `false` to stop.
+    ///
+    /// # Example
+    ///
+    /// ```rust,ignore
+    /// // Process outputs without any allocation
+    /// let count = runtime.poll_each(256, |output| {
+    ///     match output {
+    ///         Output::Event(event) => {
+    ///             send_to_sink(event);
+    ///         }
+    ///         _ => {}
+    ///     }
+    ///     true // Continue processing
+    /// });
+    ///
+    /// // Or stop early on condition
+    /// let count = runtime.poll_each(256, |output| {
+    ///     if should_stop() {
+    ///         false // Stop processing
+    ///     } else {
+    ///         process(output);
+    ///         true
+    ///     }
+    /// });
+    /// ```
+    pub fn poll_each<F>(&self, max_per_core: usize, mut f: F) -> usize
+    where
+        F: FnMut(Output) -> bool,
+    {
+        let mut total = 0;
+        let mut should_continue = true;
+
+        for core in &self.cores {
+            if !should_continue {
+                break;
+            }
+
+            let count = core.poll_each(max_per_core, |output| {
+                let result = f(output);
+                if !result {
+                    should_continue = false;
+                }
+                result
+            });
+
+            total += count;
+        }
+
+        total
+    }
+
     /// Polls a specific core for outputs.
+    ///
+    /// # Note
+    ///
+    /// This method allocates memory. For zero-allocation polling, use
+    /// [`poll_core_into`](Self::poll_core_into) or [`poll_core_each`](Self::poll_core_each) instead.
     #[must_use]
     pub fn poll_core(&self, core_id: usize) -> Vec<Output> {
         if core_id < self.cores.len() {
             self.cores[core_id].poll_outputs(1024)
         } else {
             Vec::new()
+        }
+    }
+
+    /// Polls a specific core into a pre-allocated buffer (zero-allocation).
+    ///
+    /// Returns the number of outputs collected.
+    pub fn poll_core_into(
+        &self,
+        core_id: usize,
+        buffer: &mut OutputBuffer,
+        max_count: usize,
+    ) -> usize {
+        if core_id < self.cores.len() {
+            self.cores[core_id].poll_outputs_into(buffer.as_vec_mut(), max_count)
+        } else {
+            0
+        }
+    }
+
+    /// Polls a specific core with a callback for each output (zero-allocation).
+    ///
+    /// Returns the number of outputs processed.
+    pub fn poll_core_each<F>(&self, core_id: usize, max_count: usize, f: F) -> usize
+    where
+        F: FnMut(Output) -> bool,
+    {
+        if core_id < self.cores.len() {
+            self.cores[core_id].poll_each(max_count, f)
+        } else {
+            0
         }
     }
 
@@ -376,6 +700,7 @@ impl ThreadPerCoreRuntime {
             .iter()
             .map(|core| CoreStats {
                 core_id: core.core_id(),
+                numa_node: core.numa_node(),
                 events_processed: core.events_processed(),
                 inbox_len: core.inbox_len(),
                 outbox_len: core.outbox_len(),
@@ -478,6 +803,8 @@ pub struct RuntimeStats {
 pub struct CoreStats {
     /// Core ID
     pub core_id: usize,
+    /// NUMA node for this core
+    pub numa_node: usize,
     /// Events processed by this core
     pub events_processed: u64,
     /// Current inbox queue length
@@ -744,7 +1071,7 @@ mod tests {
 
         let runtime = ThreadPerCoreRuntime::new(config).unwrap();
 
-        let debug_str = format!("{:?}", runtime);
+        let debug_str = format!("{runtime:?}");
         assert!(debug_str.contains("ThreadPerCoreRuntime"));
         assert!(debug_str.contains("num_cores"));
 
@@ -772,6 +1099,262 @@ mod tests {
             .unwrap();
 
         let runtime = ThreadPerCoreRuntime::new(config).unwrap();
+        runtime.shutdown().unwrap();
+    }
+
+    #[test]
+    fn test_numa_aware_config() {
+        let config = TpcConfig::builder()
+            .num_cores(2)
+            .cpu_pinning(false)
+            .numa_aware(true)
+            .build()
+            .unwrap();
+
+        assert!(config.numa_aware);
+
+        let runtime = ThreadPerCoreRuntime::new(config).unwrap();
+        assert_eq!(runtime.num_cores(), 2);
+
+        // Stats should include NUMA node info
+        let stats = runtime.stats();
+        for core_stat in &stats.cores {
+            // On any system, numa_node should be valid (0 on non-NUMA)
+            assert!(core_stat.numa_node < 64);
+        }
+
+        runtime.shutdown().unwrap();
+    }
+
+    #[test]
+    fn test_output_buffer_basic() {
+        let mut buffer = OutputBuffer::with_capacity(100);
+
+        assert!(buffer.is_empty());
+        assert_eq!(buffer.len(), 0);
+        assert_eq!(buffer.capacity(), 100);
+        assert_eq!(buffer.remaining(), 100);
+
+        // Push some items
+        let event = make_event(1, 1000);
+        buffer.push(Output::Event(event));
+
+        assert!(!buffer.is_empty());
+        assert_eq!(buffer.len(), 1);
+        assert_eq!(buffer.remaining(), 99);
+
+        // Clear and reuse
+        buffer.clear();
+        assert!(buffer.is_empty());
+        assert_eq!(buffer.capacity(), 100); // Capacity preserved
+    }
+
+    #[test]
+    fn test_output_buffer_iteration() {
+        let mut buffer = OutputBuffer::with_capacity(10);
+
+        for i in 0..5 {
+            buffer.push(Output::Event(make_event(i, i * 1000)));
+        }
+
+        // Test iter()
+        let count = buffer.iter().count();
+        assert_eq!(count, 5);
+
+        // Test Deref to slice
+        assert_eq!(buffer.as_slice().len(), 5);
+
+        // Test IntoIterator for reference
+        let mut ref_count = 0;
+        for _ in &buffer {
+            ref_count += 1;
+        }
+        assert_eq!(ref_count, 5);
+    }
+
+    #[test]
+    fn test_output_buffer_into_vec() {
+        let mut buffer = OutputBuffer::with_capacity(10);
+
+        for i in 0..3 {
+            buffer.push(Output::Event(make_event(i, i * 1000)));
+        }
+
+        let vec = buffer.into_vec();
+        assert_eq!(vec.len(), 3);
+    }
+
+    #[test]
+    fn test_poll_into() {
+        let config = TpcConfig::builder()
+            .num_cores(2)
+            .cpu_pinning(false)
+            .build()
+            .unwrap();
+
+        let runtime = ThreadPerCoreRuntime::new_with_factory(config, &|core_id| {
+            vec![Box::new(PassthroughOperator { core_id }) as Box<dyn Operator>]
+        }).unwrap();
+
+        // Submit events
+        for i in 0..20 {
+            runtime.submit(make_event(i, i * 1000)).unwrap();
+        }
+
+        // Wait for processing
+        std::thread::sleep(Duration::from_millis(100));
+
+        // Poll into buffer
+        let mut buffer = OutputBuffer::with_capacity(100);
+        let count = runtime.poll_into(&mut buffer, 256);
+
+        assert!(count > 0);
+        assert_eq!(buffer.len(), count);
+
+        // Reuse buffer - no new allocation
+        let cap_before = buffer.capacity();
+        buffer.clear();
+        let _ = runtime.poll_into(&mut buffer, 256);
+        assert_eq!(buffer.capacity(), cap_before);
+
+        runtime.shutdown().unwrap();
+    }
+
+    #[test]
+    fn test_poll_each() {
+        let config = TpcConfig::builder()
+            .num_cores(2)
+            .cpu_pinning(false)
+            .build()
+            .unwrap();
+
+        let runtime = ThreadPerCoreRuntime::new_with_factory(config, &|core_id| {
+            vec![Box::new(PassthroughOperator { core_id }) as Box<dyn Operator>]
+        }).unwrap();
+
+        // Submit events
+        for i in 0..20 {
+            runtime.submit(make_event(i, i * 1000)).unwrap();
+        }
+
+        // Wait for processing
+        std::thread::sleep(Duration::from_millis(100));
+
+        // Poll with callback
+        let mut event_count = 0;
+        let count = runtime.poll_each(256, |output| {
+            if matches!(output, Output::Event(_)) {
+                event_count += 1;
+            }
+            true
+        });
+
+        assert!(count > 0);
+        assert!(event_count > 0);
+
+        runtime.shutdown().unwrap();
+    }
+
+    #[test]
+    fn test_poll_each_early_stop() {
+        let config = TpcConfig::builder()
+            .num_cores(2)
+            .cpu_pinning(false)
+            .build()
+            .unwrap();
+
+        let runtime = ThreadPerCoreRuntime::new_with_factory(config, &|core_id| {
+            vec![Box::new(PassthroughOperator { core_id }) as Box<dyn Operator>]
+        }).unwrap();
+
+        // Submit many events
+        for i in 0..50 {
+            runtime.submit(make_event(i, i * 1000)).unwrap();
+        }
+
+        // Wait for processing
+        std::thread::sleep(Duration::from_millis(100));
+
+        // Poll with early stop after 10 items
+        let mut processed = 0;
+        let count = runtime.poll_each(256, |_| {
+            processed += 1;
+            processed < 10 // Stop after 10
+        });
+
+        assert_eq!(count, 10);
+        assert_eq!(processed, 10);
+
+        runtime.shutdown().unwrap();
+    }
+
+    #[test]
+    fn test_poll_core_into() {
+        let config = TpcConfig::builder()
+            .num_cores(2)
+            .cpu_pinning(false)
+            .build()
+            .unwrap();
+
+        let runtime = ThreadPerCoreRuntime::new_with_factory(config, &|core_id| {
+            vec![Box::new(PassthroughOperator { core_id }) as Box<dyn Operator>]
+        }).unwrap();
+
+        // Submit to specific core
+        runtime.submit_to_core(0, make_event(1, 1000)).unwrap();
+        runtime.submit_to_core(0, make_event(2, 2000)).unwrap();
+
+        // Wait for processing
+        std::thread::sleep(Duration::from_millis(100));
+
+        // Poll core 0 into buffer
+        let mut buffer = OutputBuffer::with_capacity(100);
+        let count = runtime.poll_core_into(0, &mut buffer, 100);
+
+        assert!(count > 0);
+        assert_eq!(buffer.len(), count);
+
+        // Invalid core returns 0
+        let count = runtime.poll_core_into(99, &mut buffer, 100);
+        assert_eq!(count, 0);
+
+        runtime.shutdown().unwrap();
+    }
+
+    #[test]
+    fn test_poll_core_each() {
+        let config = TpcConfig::builder()
+            .num_cores(2)
+            .cpu_pinning(false)
+            .build()
+            .unwrap();
+
+        let runtime = ThreadPerCoreRuntime::new_with_factory(config, &|core_id| {
+            vec![Box::new(PassthroughOperator { core_id }) as Box<dyn Operator>]
+        }).unwrap();
+
+        // Submit to specific core
+        runtime.submit_to_core(1, make_event(1, 1000)).unwrap();
+
+        // Wait for processing
+        std::thread::sleep(Duration::from_millis(100));
+
+        // Poll core 1 with callback
+        let mut event_count = 0;
+        let count = runtime.poll_core_each(1, 100, |output| {
+            if matches!(output, Output::Event(_)) {
+                event_count += 1;
+            }
+            true
+        });
+
+        assert!(count > 0);
+        assert!(event_count > 0);
+
+        // Invalid core returns 0
+        let count = runtime.poll_core_each(99, 100, |_| true);
+        assert_eq!(count, 0);
+
         runtime.shutdown().unwrap();
     }
 }

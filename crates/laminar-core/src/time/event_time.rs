@@ -812,38 +812,38 @@ mod tests {
 
     #[test]
     fn test_unix_millis_extraction() {
-        let batch = make_int64_batch("event_time", &[Some(1705312200000)]);
+        let batch = make_int64_batch("event_time", &[Some(1_705_312_200_000)]);
         let mut extractor =
             EventTimeExtractor::from_column("event_time", TimestampFormat::UnixMillis);
         let ts = extractor.extract(&batch).unwrap();
-        assert_eq!(ts, 1705312200000);
+        assert_eq!(ts, 1_705_312_200_000);
     }
 
     #[test]
     fn test_unix_seconds_extraction() {
-        let batch = make_int64_batch("event_time", &[Some(1705312200)]);
+        let batch = make_int64_batch("event_time", &[Some(1_705_312_200)]);
         let mut extractor =
             EventTimeExtractor::from_column("event_time", TimestampFormat::UnixSeconds);
         let ts = extractor.extract(&batch).unwrap();
-        assert_eq!(ts, 1705312200000);
+        assert_eq!(ts, 1_705_312_200_000);
     }
 
     #[test]
     fn test_unix_micros_extraction() {
-        let batch = make_int64_batch("event_time", &[Some(1705312200000000)]);
+        let batch = make_int64_batch("event_time", &[Some(1_705_312_200_000_000)]);
         let mut extractor =
             EventTimeExtractor::from_column("event_time", TimestampFormat::UnixMicros);
         let ts = extractor.extract(&batch).unwrap();
-        assert_eq!(ts, 1705312200000);
+        assert_eq!(ts, 1_705_312_200_000);
     }
 
     #[test]
     fn test_unix_nanos_extraction() {
-        let batch = make_int64_batch("event_time", &[Some(1705312200000000000)]);
+        let batch = make_int64_batch("event_time", &[Some(1_705_312_200_000_000_000)]);
         let mut extractor =
             EventTimeExtractor::from_column("event_time", TimestampFormat::UnixNanos);
         let ts = extractor.extract(&batch).unwrap();
-        assert_eq!(ts, 1705312200000);
+        assert_eq!(ts, 1_705_312_200_000);
     }
 
     #[test]
@@ -862,11 +862,11 @@ mod tests {
 
     #[test]
     fn test_arrow_native_millis_extraction() {
-        let batch = make_timestamp_millis_batch("event_time", &[Some(1705312200000)]);
+        let batch = make_timestamp_millis_batch("event_time", &[Some(1_705_312_200_000)]);
         let mut extractor =
             EventTimeExtractor::from_column("event_time", TimestampFormat::ArrowNative);
         let ts = extractor.extract(&batch).unwrap();
-        assert_eq!(ts, 1705312200000);
+        assert_eq!(ts, 1_705_312_200_000);
     }
 
     // ==================== Extraction Mode Tests ====================

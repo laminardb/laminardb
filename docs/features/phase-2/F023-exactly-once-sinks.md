@@ -5,16 +5,25 @@
 | Field | Value |
 |-------|-------|
 | **ID** | F023 |
-| **Status** | 📝 Draft |
+| **Status** | ✅ Done |
 | **Priority** | P0 |
 | **Phase** | 2 |
 | **Effort** | L (1-2 weeks) |
-| **Dependencies** | F008 |
+| **Dependencies** | F008, F011B, F063 |
 | **Owner** | TBD |
+| **Research** | [Emit Patterns Research 2026](../../research/emit-patterns-research-2026.md) |
 
 ## Summary
 
 Ensure exactly-once delivery semantics to sinks by tracking committed offsets atomically with output. Prevents duplicates on recovery.
+
+## Critical Dependencies (from Research)
+
+From the 2026 emit patterns research, two features are **required** for exactly-once:
+
+1. **F011B (EMIT ON WINDOW CLOSE)**: For append-only sinks (Kafka, S3), must only emit when window closes to prevent duplicates. Without this, late data causes retraction emissions that cannot be handled by append-only sinks.
+
+2. **F063 (Changelog/Retraction)**: For upsert-capable sinks, must track and emit retractions when late data arrives. Without this, late data corrections are lost.
 
 ## Goals
 
@@ -54,7 +63,7 @@ impl IdempotentSink {
 
 ## Completion Checklist
 
-- [ ] Transactional sinks working
-- [ ] Idempotent fallback implemented
-- [ ] Recovery tested (no duplicates)
-- [ ] Multiple sink types supported
+- [x] Transactional sinks working — `TransactionalSink<S>` buffers writes, flushes on commit
+- [x] Idempotent fallback implemented — `IdempotentSink` with deduplication (pre-existing)
+- [x] Recovery tested (no duplicates) — 5 integration tests in `sink/mod.rs`
+- [x] Multiple sink types supported — TransactionalSink + IdempotentSink via `ExactlyOnceSinkAdapter`

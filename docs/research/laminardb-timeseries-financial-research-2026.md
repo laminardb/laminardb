@@ -278,175 +278,190 @@ Source: Independent benchmark (September 2025)
 
 ## Part 4: Architecture Recommendations for LaminarDB
 
-### 4.1 Financial Data Model Extensions
+### 4.1 Financial Data Model — No Custom Types Needed
+
+**Design Decision:** Use standard SQL types and aggregates. No custom `Price`, `Quantity`, `OhlcBar`, or `MarketTimestamp` types.
+
+**Rationale:**
+- OHLC is just `FIRST_VALUE`, `MAX`, `MIN`, `LAST_VALUE`, `SUM` — standard SQL
+- DataFusion already provides these aggregates
+- Prices and quantities are just `f64` (DOUBLE)
+- Timestamps are just `i64` nanoseconds (TIMESTAMP with precision)
+- Custom types add complexity without clear benefit
+- Can add specialized types later if users demand them
+
+**What you actually need to implement:**
+
+| Component | Status | Notes |
+|-----------|--------|-------|
+| `FIRST_VALUE()` aggregate | ✅ In DataFusion | Works in window functions |
+| `LAST_VALUE()` aggregate | ✅ In DataFusion | Works in window functions |
+| `MAX/MIN/SUM` aggregates | ✅ In DataFusion | Standard SQL |
+| Tumbling window operator | 🔨 You build | Groups by time intervals |
+| Watermark handling | 🔨 You build | Triggers window close |
+| `SAMPLE BY` syntax (optional) | 🔨 Nice to have | Sugar for `GROUP BY TUMBLE()` |
+
+**Example: OHLC bars with pure SQL (no custom types)**
+
+```sql
+-- This just works once you have tumbling windows
+SELECT 
+    symbol,
+    TUMBLE_START(event_time, INTERVAL '1 minute') as bar_time,
+    FIRST_VALUE(price) as open,
+    MAX(price) as high,
+    MIN(price) as low,
+    LAST_VALUE(price) as close,
+    SUM(quantity) as volume,
+    COUNT(*) as trade_count
+FROM trades
+GROUP BY symbol, TUMBLE(event_time, INTERVAL '1 minute');
+```
+
+**Table schema — just standard types:**
+
+```sql
+CREATE TABLE trades (
+    symbol VARCHAR,
+    price DOUBLE,           -- f64, no custom type
+    quantity DOUBLE,        -- f64, no custom type
+    side VARCHAR,           -- 'buy' or 'sell'
+    event_time TIMESTAMP(9) -- i64 nanoseconds internally
+);
+```
+
+### 4.2 Streaming ASOF JOIN — The Key Differentiator
+
+ASOF JOIN is where LaminarDB can truly differentiate. This is a **Phase 2** feature that requires state management.
+
+**What ASOF JOIN does:**
+```sql
+-- Match each trade to the most recent quote for that symbol
+SELECT t.*, q.bid, q.ask
+FROM trades t
+ASOF JOIN quotes q 
+    ON t.symbol = q.symbol 
+    AND t.event_time >= q.event_time;
+```
+
+**Implementation approach (Phase 2):**
 
 ```rust
-// Core financial primitives in Ring 0
-pub mod financial {
-    /// Nanosecond-precision timestamp with venue metadata
-    pub struct MarketTimestamp {
-        nanos: i64,
-        venue_id: u16,
-        sequence: u64,
+/// Streaming ASOF JOIN operator
+/// Keeps latest quote per symbol in state, joins incoming trades
+pub struct AsofJoinOperator {
+    /// Right side state: symbol -> latest row
+    /// Just store as Arrow RecordBatch or raw bytes
+    right_state: HashMap<String, Vec<u8>>,
+    
+    /// Maximum lookback tolerance (nanoseconds)
+    tolerance_nanos: i64,
+    
+    /// Watermark for state cleanup
+    watermark_nanos: i64,
+}
+
+impl AsofJoinOperator {
+    /// O(1) lookup - critical for sub-μs latency
+    pub fn lookup(&self, symbol: &str, timestamp_nanos: i64) -> Option<&[u8]> {
+        // Return latest quote for symbol if within tolerance
+        self.right_state.get(symbol)
     }
     
-    /// Price with configurable precision (up to 18 decimals)
-    pub struct Price(i128);  // Fixed-point, 10^-18 precision
-    
-    /// Quantity with configurable precision
-    pub struct Quantity(i128);
-    
-    /// Trade record optimized for streaming
-    #[derive(Archive, Serialize)]
-    pub struct Trade {
-        pub symbol_id: u32,
-        pub price: Price,
-        pub quantity: Quantity,
-        pub side: Side,
-        pub exchange_time: MarketTimestamp,
-        pub capture_time: MarketTimestamp,
-    }
-    
-    /// L1 Quote (Best Bid/Offer)
-    #[derive(Archive, Serialize)]
-    pub struct Quote {
-        pub symbol_id: u32,
-        pub bid: Price,
-        pub bid_size: Quantity,
-        pub ask: Price,
-        pub ask_size: Quantity,
-        pub exchange_time: MarketTimestamp,
+    /// Update state with new quote
+    pub fn update_right(&mut self, symbol: String, row_bytes: Vec<u8>) {
+        self.right_state.insert(symbol, row_bytes);
     }
 }
 ```
 
-### 4.2 Streaming ASOF JOIN Implementation
-
-```rust
-/// Streaming ASOF JOIN operator for Ring 0
-pub struct AsofJoinOperator<L, R> {
-    /// Left stream buffer (trades)
-    left_buffer: VecDeque<(Timestamp, L)>,
-    
-    /// Right stream state (quotes), keyed by symbol
-    /// Uses rkyv zero-copy for sub-μs lookups
-    right_state: HashMap<Symbol, ArchivedQuote>,
-    
-    /// Maximum lookback for ASOF matching
-    tolerance: Duration,
-    
-    /// Watermark for garbage collection
-    watermark: Timestamp,
-}
-
-impl<L, R> AsofJoinOperator<L, R> {
-    /// O(1) ASOF lookup - critical for sub-μs latency
-    pub fn lookup(&self, symbol: &Symbol, timestamp: Timestamp) -> Option<&ArchivedQuote> {
-        self.right_state.get(symbol).filter(|q| {
-            q.exchange_time.nanos <= timestamp.nanos &&
-            timestamp.nanos - q.exchange_time.nanos <= self.tolerance.as_nanos() as i64
-        })
-    }
-    
-    /// Process right stream update (quote)
-    pub fn update_right(&mut self, quote: Quote) {
-        // Zero-copy update using rkyv
-        self.right_state.insert(quote.symbol_id, quote.archive());
-    }
-}
+**Note:** No custom `Quote` or `Trade` types needed — just work with Arrow RecordBatches or raw serialized rows.
 ```
 
-### 4.3 Order Book State Store
+### 4.3 Order Book State — Phase 2/3 Feature
 
-```rust
-/// Efficient order book state for streaming
-pub struct OrderBookStore {
-    /// Symbol -> Order Book mapping
-    /// Uses mmap for persistence + zero-copy access
-    books: MmapStateStore<Symbol, OrderBook>,
-    
-    /// Delta log for incremental checkpointing
-    delta_log: RingBuffer<OrderBookDelta>,
-    
-    /// Snapshot interval for checkpoint efficiency
-    snapshot_interval: u64,
-}
+Order book storage is complex and should be deferred until core streaming works.
 
-impl OrderBookStore {
-    /// Apply delta in Ring 0 - must be < 500ns
-    pub fn apply_delta(&mut self, delta: &OrderBookDelta) {
-        match delta {
-            OrderBookDelta::Add { side, price, order } => {
-                let book = self.books.get_mut(&order.symbol);
-                book.add(*side, *price, order.clone());
-            }
-            // ... other delta types
-        }
-        self.delta_log.push(delta.clone());
-    }
-    
-    /// Generate snapshot when delta log reaches threshold
-    pub fn maybe_snapshot(&mut self, symbol: &Symbol) {
-        if self.delta_log.len() >= self.snapshot_interval as usize {
-            let book = self.books.get(symbol).unwrap();
-            self.delta_log.clear();
-            self.delta_log.push(OrderBookDelta::Snapshot { 
-                book: book.clone() 
-            });
-        }
-    }
-}
+**The challenge:** Order books are 2D structures (price levels × orders at each level) that update thousands of times per second.
+
+**Approach options (decide later):**
+
+1. **Flat table** — Store each order as a row, reconstruct book via query
+   ```sql
+   SELECT price, SUM(quantity) as size
+   FROM orders
+   WHERE symbol = 'AAPL' AND side = 'bid'
+   GROUP BY price
+   ORDER BY price DESC
+   LIMIT 10;
+   ```
+
+2. **Materialized view** — Pre-aggregate order book state
+   ```sql
+   CREATE MATERIALIZED VIEW order_book AS
+   SELECT symbol, side, price, SUM(quantity) as size
+   FROM orders
+   GROUP BY symbol, side, price;
+   ```
+
+3. **Custom state store** — Only if flat table is too slow (probably Phase 3+)
+
+**Recommendation:** Start with flat table + materialized view. Add custom order book state only if benchmarks show it's needed.
 ```
 
-### 4.4 Cascading OHLC Aggregation
+### 4.4 Cascading Aggregations — Just Chained Materialized Views
 
-```rust
-/// Multi-resolution OHLC bar generator
-pub struct OhlcCascade {
-    /// Base resolution bars (e.g., 1 second)
-    base_bars: HashMap<Symbol, OhlcBar>,
-    
-    /// Higher resolution bars built from base
-    derived_bars: Vec<(Duration, HashMap<Symbol, OhlcBar>)>,
-    
-    /// Materialized view outputs
-    outputs: Vec<MaterializedViewSink>,
-}
+Multi-resolution OHLC (1s → 1m → 1h) doesn't need custom types. It's just materialized views feeding into each other.
 
-impl OhlcCascade {
-    /// Process trade in Ring 0
-    pub fn process_trade(&mut self, trade: &Trade) {
-        let symbol = trade.symbol_id;
-        let bar = self.base_bars.entry(symbol).or_insert_with(OhlcBar::new);
-        
-        bar.update(trade.price, trade.quantity, trade.exchange_time);
-        
-        // Check if base bar should close
-        if bar.should_close(self.base_resolution) {
-            self.close_bar(symbol);
-        }
-    }
-    
-    /// Close bar and cascade to higher resolutions
-    fn close_bar(&mut self, symbol: Symbol) {
-        let base = self.base_bars.remove(&symbol).unwrap();
-        
-        // Emit to base output
-        self.outputs[0].emit(base.clone());
-        
-        // Update derived bars
-        for (i, (resolution, bars)) in self.derived_bars.iter_mut().enumerate() {
-            let derived = bars.entry(symbol).or_insert_with(OhlcBar::new);
-            derived.merge(&base);
-            
-            if derived.should_close(*resolution) {
-                self.outputs[i + 1].emit(derived.clone());
-                *derived = OhlcBar::new();
-            }
-        }
-    }
-}
+**SQL approach:**
+
+```sql
+-- Base: 1-second bars from raw trades
+CREATE MATERIALIZED VIEW ohlc_1s AS
+SELECT 
+    symbol,
+    TUMBLE_START(event_time, INTERVAL '1 second') as bar_time,
+    FIRST_VALUE(price) as open,
+    MAX(price) as high,
+    MIN(price) as low,
+    LAST_VALUE(price) as close,
+    SUM(quantity) as volume
+FROM trades
+GROUP BY symbol, TUMBLE(event_time, INTERVAL '1 second');
+
+-- Derived: 1-minute bars from 1-second bars
+CREATE MATERIALIZED VIEW ohlc_1m AS
+SELECT 
+    symbol,
+    TUMBLE_START(bar_time, INTERVAL '1 minute') as bar_time,
+    FIRST_VALUE(open) as open,    -- First 1s bar's open
+    MAX(high) as high,             -- Highest high
+    MIN(low) as low,               -- Lowest low
+    LAST_VALUE(close) as close,   -- Last 1s bar's close
+    SUM(volume) as volume
+FROM ohlc_1s
+GROUP BY symbol, TUMBLE(bar_time, INTERVAL '1 minute');
+
+-- Derived: 1-hour bars from 1-minute bars  
+CREATE MATERIALIZED VIEW ohlc_1h AS
+SELECT 
+    symbol,
+    TUMBLE_START(bar_time, INTERVAL '1 hour') as bar_time,
+    FIRST_VALUE(open) as open,
+    MAX(high) as high,
+    MIN(low) as low,
+    LAST_VALUE(close) as close,
+    SUM(volume) as volume
+FROM ohlc_1m
+GROUP BY symbol, TUMBLE(bar_time, INTERVAL '1 hour');
 ```
+
+**What you need to implement:**
+1. Tumbling window operator (Phase 1)
+2. Materialized views that can read from other MVs (Phase 2)
+3. Proper watermark propagation through the chain (Phase 2)
+
+**No custom `OhlcBar` type needed** — it's all standard aggregates.
 
 ---
 
@@ -454,37 +469,40 @@ impl OhlcCascade {
 
 ### When to Implement (Phase Alignment)
 
+**Design Decision:** No custom types. Use standard SQL types (`DOUBLE`, `TIMESTAMP`) and standard aggregates (`FIRST_VALUE`, `MAX`, `MIN`, `LAST_VALUE`, `SUM`).
+
 | Feature | Phase | Dependencies | Priority |
 |---------|-------|--------------|----------|
-| Nanosecond timestamps | **Phase 1** | Core types | P0 |
-| Financial data types (Price, Quantity) | **Phase 1** | Core types | P0 |
-| Basic OHLC aggregation | **Phase 1** | Tumbling windows | P0 |
+| Tumbling window operator | **Phase 1** | Core reactor | P0 |
+| `FIRST_VALUE`/`LAST_VALUE` aggregates | **Phase 1** | Check if in DataFusion | P0 |
+| Watermark handling | **Phase 1** | Event time tracking | P0 |
 | ASOF JOIN (batch) | Phase 2 | State store | P1 |
 | Streaming ASOF JOIN | Phase 2 | Watermarks, state | P1 |
-| Order book state type | Phase 2 | State store | P1 |
 | Cascading materialized views | Phase 2 | MV infrastructure | P1 |
-| Order book delta encoding | Phase 3 | Checkpointing | P2 |
+| Order book via MVs | Phase 2 | Materialized views | P2 |
 | Cross-venue alignment | Phase 3 | Multi-source | P2 |
 | Historical backfill | Phase 4 | Cold storage | P2 |
 
-### Recommended Phase 1 Extensions
+### Recommended Phase 1 Focus
 
 Since you're in Phase 1, focus on:
 
-1. **Core Financial Types** (extend existing types)
-   - Add `Timestamp(9)` with nanosecond precision
-   - Add `Price` and `Quantity` fixed-point types
-   - Add `Symbol` interned string type for efficiency
+1. **Tumbling Window Operator**
+   - Groups events by time intervals
+   - Triggers on watermark advancement
+   - Runs standard aggregates per group
 
-2. **OHLC Window Function**
-   - Implement in tumbling window operator
-   - Support `FIRST_VALUE`, `LAST_VALUE` for open/close
-   - Add `SAMPLE BY` SQL extension
+2. **Verify DataFusion Aggregates**
+   - `FIRST_VALUE()` — needed for OHLC open
+   - `LAST_VALUE()` — needed for OHLC close
+   - If missing, implement as custom UDAFs
 
 3. **Benchmark Framework**
    - Set up tick data ingestion benchmark
-   - Compare against QuestDB, kdb+
+   - Compare against QuestDB
    - Target: match QuestDB throughput with lower latency
+
+**No custom types to implement!** OHLC is just a SQL query once you have tumbling windows.
 
 ---
 
@@ -497,180 +515,123 @@ Save this as `docs/research/financial-timeseries-implementation.md` for use with
 
 ## Summary
 
-Extend LaminarDB with financial-specific time-series capabilities. This builds on
-the core streaming engine to add tick data primitives, OHLC aggregations, and
-ASOF JOINs optimized for capital markets use cases.
+Extend LaminarDB with financial-specific time-series capabilities using **standard SQL types and aggregates only**. No custom types needed.
+
+## Design Decisions
+
+- **No custom types** — Use standard `DOUBLE`, `TIMESTAMP`, `VARCHAR`
+- **OHLC = standard aggregates** — `FIRST_VALUE`, `MAX`, `MIN`, `LAST_VALUE`, `SUM`
+- **Keep it simple** — Add specialized types only if benchmarks demand it
 
 ## Current Phase: 1 (Core Engine)
 
-This implementation is appropriate for **late Phase 1** when:
-- Core reactor and state stores are working
-- Tumbling window operator is implemented
+This implementation is appropriate for **Phase 1** when:
+- Core reactor is working
 - Basic SQL parsing (via DataFusion) is integrated
 
-## Research Context
+## What to Implement
 
-See: `docs/research/financial-timeseries-research-2026.md` for full analysis.
+### 1. Tumbling Window Operator (P0)
 
-Key gaps LaminarDB addresses:
-1. No embedded sub-μs streaming SQL for financial data
-2. Missing streaming ASOF JOIN with bounded state
-3. No native order book state management
-4. Lack of nanosecond timestamp precision
-5. No cascading OHLC materialized views
-
-## Technical Requirements
-
-### Core Types (Phase 1)
+The key building block. Groups events by time intervals and runs aggregates.
 
 ```rust
-// In crates/laminar-types/src/financial.rs
-
-/// Nanosecond-precision timestamp
-#[derive(Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Archive, Serialize, Deserialize)]
-pub struct NanoTimestamp(i64);
-
-impl NanoTimestamp {
-    pub fn now() -> Self {
-        Self(std::time::SystemTime::now()
-            .duration_since(std::time::UNIX_EPOCH)
-            .unwrap()
-            .as_nanos() as i64)
-    }
+/// Tumbling window operator - groups events by fixed time intervals
+pub struct TumblingWindowOperator {
+    /// Window size in nanoseconds
+    window_size_nanos: i64,
     
-    pub fn from_nanos(nanos: i64) -> Self {
-        Self(nanos)
-    }
+    /// Current windows, keyed by (group_key, window_start)
+    windows: HashMap<(GroupKey, i64), WindowState>,
     
-    pub fn as_nanos(&self) -> i64 {
-        self.0
-    }
+    /// Aggregates to compute per window
+    aggregates: Vec<Box<dyn Aggregate>>,
+    
+    /// Current watermark (nanoseconds)
+    watermark_nanos: i64,
 }
 
-/// Fixed-point price with 8 decimal places (sufficient for most markets)
-/// Max value: ~92 quadrillion (i64::MAX / 10^8)
-#[derive(Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Archive, Serialize, Deserialize)]
-pub struct Price(i64);
-
-impl Price {
-    const SCALE: i64 = 100_000_000; // 10^8
-    
-    pub fn from_f64(value: f64) -> Self {
-        Self((value * Self::SCALE as f64) as i64)
+impl TumblingWindowOperator {
+    /// Process an event
+    pub fn process(&mut self, event: &RecordBatch, event_time_nanos: i64) {
+        let window_start = self.align_to_window(event_time_nanos);
+        // Update aggregates for this window
+        // ...
     }
     
-    pub fn to_f64(&self) -> f64 {
-        self.0 as f64 / Self::SCALE as f64
-    }
-}
-
-/// Fixed-point quantity with 8 decimal places
-#[derive(Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Archive, Serialize, Deserialize)]
-pub struct Quantity(i64);
-
-// Same implementation as Price
-```
-
-### OHLC Aggregation (Phase 1)
-
-```rust
-// In crates/laminar-operators/src/aggregate/ohlc.rs
-
-/// OHLC bar accumulator - used in tumbling window
-#[derive(Clone, Default, Archive, Serialize, Deserialize)]
-pub struct OhlcAccumulator {
-    pub open: Option<Price>,
-    pub high: Option<Price>,
-    pub low: Option<Price>,
-    pub close: Option<Price>,
-    pub volume: Quantity,
-    pub trade_count: u64,
-    pub vwap_numerator: i128,  // Sum of price * quantity
-    pub first_time: Option<NanoTimestamp>,
-    pub last_time: Option<NanoTimestamp>,
-}
-
-impl OhlcAccumulator {
-    /// Update with new trade - must be < 100ns
-    #[inline]
-    pub fn update(&mut self, price: Price, quantity: Quantity, time: NanoTimestamp) {
-        if self.open.is_none() {
-            self.open = Some(price);
-            self.first_time = Some(time);
-        }
-        
-        self.high = Some(self.high.map_or(price, |h| h.max(price)));
-        self.low = Some(self.low.map_or(price, |l| l.min(price)));
-        self.close = Some(price);
-        self.last_time = Some(time);
-        
-        self.volume = Quantity(self.volume.0 + quantity.0);
-        self.trade_count += 1;
-        self.vwap_numerator += price.0 as i128 * quantity.0 as i128;
+    /// Called when watermark advances - emit closed windows
+    pub fn on_watermark(&mut self, watermark_nanos: i64) -> Vec<RecordBatch> {
+        self.watermark_nanos = watermark_nanos;
+        // Emit and remove windows where window_end <= watermark
+        // ...
     }
     
-    /// Compute VWAP
-    pub fn vwap(&self) -> Option<Price> {
-        if self.volume.0 > 0 {
-            Some(Price((self.vwap_numerator / self.volume.0 as i128) as i64))
-        } else {
-            None
-        }
-    }
-    
-    /// Merge two accumulators (for cascading)
-    pub fn merge(&mut self, other: &Self) {
-        if let Some(o) = other.open {
-            if self.first_time.map_or(true, |t| other.first_time.map_or(false, |ot| ot < t)) {
-                self.open = Some(o);
-                self.first_time = other.first_time;
-            }
-        }
-        
-        if let Some(h) = other.high {
-            self.high = Some(self.high.map_or(h, |sh| sh.max(h)));
-        }
-        
-        if let Some(l) = other.low {
-            self.low = Some(self.low.map_or(l, |sl| sl.min(l)));
-        }
-        
-        if let Some(c) = other.close {
-            if self.last_time.map_or(true, |t| other.last_time.map_or(false, |ot| ot > t)) {
-                self.close = Some(c);
-                self.last_time = other.last_time;
-            }
-        }
-        
-        self.volume = Quantity(self.volume.0 + other.volume.0);
-        self.trade_count += other.trade_count;
-        self.vwap_numerator += other.vwap_numerator;
+    fn align_to_window(&self, time_nanos: i64) -> i64 {
+        (time_nanos / self.window_size_nanos) * self.window_size_nanos
     }
 }
 ```
 
-### SQL Extensions (Phase 1)
+### 2. Verify/Add FIRST_VALUE and LAST_VALUE Aggregates
 
-Extend DataFusion SQL parser to support:
+Check if DataFusion has these. If not, implement as UDAFs:
+
+```rust
+/// FIRST_VALUE aggregate - returns first value seen in window
+pub struct FirstValueAccumulator {
+    value: Option<ScalarValue>,
+    time: Option<i64>,
+}
+
+impl Accumulator for FirstValueAccumulator {
+    fn update_batch(&mut self, values: &[ArrayRef]) -> Result<()> {
+        // Track value with earliest timestamp
+    }
+    
+    fn evaluate(&self) -> Result<ScalarValue> {
+        self.value.clone().unwrap_or(ScalarValue::Null)
+    }
+}
+
+/// LAST_VALUE aggregate - returns last value seen in window  
+pub struct LastValueAccumulator {
+    value: Option<ScalarValue>,
+    time: Option<i64>,
+}
+```
+
+### 3. SAMPLE BY Syntax (Nice to Have)
+
+Sugar for `GROUP BY TUMBLE()`:
 
 ```sql
--- SAMPLE BY extension (like QuestDB)
-SELECT symbol, 
-       FIRST(price) as open,
-       MAX(price) as high,
-       MIN(price) as low,
-       LAST(price) as close,
-       SUM(quantity) as volume
+-- QuestDB-style syntax
+SELECT symbol, FIRST(price), MAX(price), MIN(price), LAST(price)
 FROM trades
-SAMPLE BY 1m;  -- 1 minute bars
+SAMPLE BY 1m;
 
--- Equivalent to standard SQL
-SELECT symbol,
-       FIRST_VALUE(price) as open,
-       MAX(price) as high,
-       MIN(price) as low,
-       LAST_VALUE(price) as close,
-       SUM(quantity) as volume
+-- Translates to standard SQL
+SELECT symbol, 
+       FIRST_VALUE(price), MAX(price), MIN(price), LAST_VALUE(price)
+FROM trades  
+GROUP BY symbol, TUMBLE(event_time, INTERVAL '1 minute');
+```
+
+## Example: OHLC Query (No Custom Types!)
+
+Once tumbling windows work, OHLC is just a query:
+
+```sql
+SELECT 
+    symbol,
+    TUMBLE_START(event_time, INTERVAL '1 minute') as bar_time,
+    FIRST_VALUE(price) as open,
+    MAX(price) as high,
+    MIN(price) as low,
+    LAST_VALUE(price) as close,
+    SUM(quantity) as volume,
+    COUNT(*) as trade_count,
+    SUM(price * quantity) / SUM(quantity) as vwap
 FROM trades
 GROUP BY symbol, TUMBLE(event_time, INTERVAL '1 minute');
 ```
@@ -679,53 +640,51 @@ GROUP BY symbol, TUMBLE(event_time, INTERVAL '1 minute');
 
 ```rust
 #[test]
-fn test_ohlc_accumulator() {
-    let mut acc = OhlcAccumulator::default();
+fn test_tumbling_window_basic() {
+    let mut op = TumblingWindowOperator::new(
+        Duration::from_secs(60).as_nanos() as i64,  // 1 minute windows
+        vec![/* MAX, MIN, SUM aggregates */],
+    );
     
-    // Simulate trades
-    acc.update(Price::from_f64(100.0), Quantity::from_f64(10.0), NanoTimestamp::from_nanos(1000));
-    acc.update(Price::from_f64(102.0), Quantity::from_f64(5.0), NanoTimestamp::from_nanos(2000));
-    acc.update(Price::from_f64(98.0), Quantity::from_f64(15.0), NanoTimestamp::from_nanos(3000));
-    acc.update(Price::from_f64(101.0), Quantity::from_f64(20.0), NanoTimestamp::from_nanos(4000));
+    // Send events
+    op.process(&make_trade(100.0, 10.0), nanos("09:30:05"));
+    op.process(&make_trade(102.0, 5.0),  nanos("09:30:30"));
+    op.process(&make_trade(98.0,  15.0), nanos("09:30:45"));
     
-    assert_eq!(acc.open.unwrap().to_f64(), 100.0);
-    assert_eq!(acc.high.unwrap().to_f64(), 102.0);
-    assert_eq!(acc.low.unwrap().to_f64(), 98.0);
-    assert_eq!(acc.close.unwrap().to_f64(), 101.0);
-    assert_eq!(acc.volume.to_f64(), 50.0);
+    // Advance watermark past window end
+    let results = op.on_watermark(nanos("09:31:01"));
+    
+    assert_eq!(results.len(), 1);
+    // Check aggregates...
 }
 
 #[test]
-fn test_ohlc_merge() {
-    let mut bar1 = OhlcAccumulator::default();
-    bar1.update(Price::from_f64(100.0), Quantity::from_f64(10.0), NanoTimestamp::from_nanos(1000));
-    
-    let mut bar2 = OhlcAccumulator::default();
-    bar2.update(Price::from_f64(105.0), Quantity::from_f64(5.0), NanoTimestamp::from_nanos(2000));
-    
-    bar1.merge(&bar2);
-    
-    assert_eq!(bar1.open.unwrap().to_f64(), 100.0);  // First bar's open
-    assert_eq!(bar1.close.unwrap().to_f64(), 105.0); // Second bar's close
-    assert_eq!(bar1.high.unwrap().to_f64(), 105.0);
-    assert_eq!(bar1.volume.to_f64(), 15.0);
+fn test_first_last_value_aggregates() {
+    // Test that FIRST_VALUE returns earliest, LAST_VALUE returns latest
 }
 ```
 
 ## Benchmark Targets
 
-| Operation | Target | Baseline (QuestDB) |
-|-----------|--------|-------------------|
-| OHLC update | < 100ns | N/A (not streaming) |
-| 5-min OHLC query | < 10ms | 25ms |
-| Tick ingestion | > 1M/sec | ~2M/sec |
-| State lookup | < 500ns | N/A |
+| Operation | Target | Notes |
+|-----------|--------|-------|
+| Window update | < 1μs | Per event |
+| Window close + emit | < 10μs | Per window |
+| Tick ingestion | > 500K/sec | Phase 1 |
+| OHLC query (1 day) | < 50ms | Via tumbling windows |
+
+## What NOT to Implement (Yet)
+
+- Custom `Price`/`Quantity` types — use `f64`
+- Custom `OhlcBar` struct — use SQL aggregates
+- Custom `Timestamp` wrapper — use `i64` nanoseconds
+- Order book state store — use flat tables + MVs first
+- Streaming ASOF JOIN — Phase 2
 
 ## References
 
-- QuestDB tick data: https://www.timestored.com/data/questdb-for-tick-data-2025
-- kdb+ comparison: https://questdb.com/compare/questdb-vs-kdb/
-- Financial time-series research: docs/research/financial-timeseries-research-2026.md
+- DataFusion aggregates: https://datafusion.apache.org/user-guide/sql/aggregate_functions.html
+- QuestDB SAMPLE BY: https://questdb.io/docs/reference/sql/sample-by/
 ```
 
 ---
@@ -737,67 +696,94 @@ Save as `docs/research/financial-timeseries-quick-ref.md`:
 ```markdown
 # Financial Time-Series Quick Reference
 
+## Design Philosophy
+
+**No custom types unless benchmarks demand them.**
+
+- `DOUBLE` for prices/quantities (same as QuestDB, kdb+)
+- `TIMESTAMP` for event times (nanosecond precision via `i64`)
+- OHLC = just SQL aggregates (`FIRST_VALUE`, `MAX`, `MIN`, `LAST_VALUE`)
+- Order books = flat tables + materialized views
+
 ## Key Gaps LaminarDB Fills
 
-1. **Embedded sub-μs streaming** - No competitor offers this
-2. **Streaming ASOF JOINs** - Only batch support elsewhere
-3. **Native order book state** - Others use flat tables
-4. **Nanosecond precision** - Most use microseconds
-5. **Cascading OHLC** - No streaming database does this well
+1. **Embedded sub-μs streaming** — No competitor offers this
+2. **Streaming ASOF JOINs** — Only batch support elsewhere  
+3. **Cascading MVs** — MVs feeding into other MVs
 
 ## Phase 1 Focus (Current)
 
-- [ ] NanoTimestamp type (i64 nanoseconds)
-- [ ] Price/Quantity fixed-point types
-- [ ] OhlcAccumulator for tumbling windows
-- [ ] SAMPLE BY SQL extension
-- [ ] Benchmark vs QuestDB
+- [ ] Tumbling window operator
+- [ ] Verify `FIRST_VALUE`/`LAST_VALUE` in DataFusion
+- [ ] Watermark handling for window close
+- [ ] Basic tick ingestion benchmark
 
 ## Phase 2 Focus (Later)
 
 - [ ] Streaming ASOF JOIN operator
-- [ ] Order book state store
 - [ ] Cascading materialized views
-- [ ] Cross-venue timestamp alignment
+- [ ] `SAMPLE BY` syntax sugar
+
+## OHLC is Just a Query
+
+```sql
+SELECT 
+    symbol,
+    TUMBLE_START(event_time, INTERVAL '1 minute') as bar_time,
+    FIRST_VALUE(price) as open,
+    MAX(price) as high,
+    MIN(price) as low,
+    LAST_VALUE(price) as close,
+    SUM(quantity) as volume
+FROM trades
+GROUP BY symbol, TUMBLE(event_time, INTERVAL '1 minute');
+```
+
+**No `OhlcBar` type needed!**
 
 ## Performance Targets
 
 | Metric | Phase 1 | Phase 2 |
 |--------|---------|---------|
-| OHLC update | < 100ns | < 50ns |
-| State lookup | < 500ns | < 200ns |
+| Window update | < 1μs | < 500ns |
 | Tick ingestion | 500K/sec | 1M/sec |
-| 5-min OHLC query | < 20ms | < 10ms |
+| OHLC query | < 50ms | < 20ms |
 
 ## Claude Code Prompts
 
-### Add financial types
+### Implement tumbling windows
 ```
 @docs/research/financial-timeseries-quick-ref.md
-Add NanoTimestamp, Price, and Quantity types to laminar-types crate
+Implement TumblingWindowOperator that groups by time intervals and runs aggregates
 ```
 
-### Add OHLC aggregation
-```
-@docs/research/financial-timeseries-implementation.md
-Implement OhlcAccumulator for tumbling window operator
-```
-
-### Benchmark setup
+### Add FIRST_VALUE/LAST_VALUE
 ```
 @docs/research/financial-timeseries-quick-ref.md
-Create tick data ingestion benchmark comparing to QuestDB
+Check if DataFusion has FIRST_VALUE/LAST_VALUE, if not implement as UDAFs
 ```
+
+### Benchmark tick ingestion  
+```
+@docs/research/financial-timeseries-quick-ref.md
+Create benchmark for tick data ingestion throughput
 ```
 
 ---
 
 ## Conclusion
 
-LaminarDB has a unique opportunity to fill the gap between high-performance tick databases and streaming SQL engines. By implementing financial-specific primitives with sub-microsecond latency, you can capture a market segment that currently has no viable solution.
+LaminarDB has a unique opportunity to fill the gap between high-performance tick databases and streaming SQL engines.
+
+**Key insight:** You don't need custom financial types. OHLC bars, VWAP, and most financial analytics are just standard SQL aggregates over tumbling windows.
 
 **Recommended next steps:**
-1. Add core financial types (NanoTimestamp, Price, Quantity) in late Phase 1
-2. Implement OhlcAccumulator for tumbling windows
-3. Set up benchmark framework comparing to QuestDB
+1. Implement tumbling window operator (Phase 1 core)
+2. Verify `FIRST_VALUE`/`LAST_VALUE` work in DataFusion
+3. Set up tick ingestion benchmark
 4. Plan streaming ASOF JOIN for Phase 2
+
+**Add custom types later only if:**
+- Users complain about `f64` precision
+- Benchmarks show specialized structs are faster
+- Order book performance requires specialized state

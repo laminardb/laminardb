@@ -2,8 +2,9 @@
 
 use std::time::Duration;
 
-use criterion::{black_box, criterion_group, criterion_main, Criterion};
-use laminar_core::state::{StateSnapshot, StateStore};
+use std::hint::black_box;
+use criterion::{criterion_group, criterion_main, Criterion};
+use laminar_core::state::StateStore;
 use laminar_storage::{CheckpointManager, WalStateStore};
 use tempfile::TempDir;
 
@@ -35,7 +36,8 @@ fn bench_checkpoint_creation(c: &mut Criterion) {
 
     c.bench_function("checkpoint_creation", |b| {
         b.iter(|| {
-            black_box(store.checkpoint().unwrap());
+            store.checkpoint().unwrap();
+            black_box(());
         });
     });
 }
@@ -86,7 +88,8 @@ fn bench_checkpoint_recovery(c: &mut Criterion) {
                 .enable_checkpointing(checkpoint_dir.clone(), Duration::from_secs(60), 3)
                 .unwrap();
 
-            black_box(store.recover().unwrap());
+            store.recover().unwrap();
+            black_box(());
         });
     });
 }
@@ -107,6 +110,7 @@ fn bench_checkpoint_manager_operations(c: &mut Criterion) {
                     &state_data,
                     laminar_storage::WalPosition { offset: 12345 },
                     std::collections::HashMap::new(),
+                    None,
                 )
                 .unwrap();
             black_box(checkpoint);
@@ -120,6 +124,7 @@ fn bench_checkpoint_manager_operations(c: &mut Criterion) {
                 &state_data,
                 laminar_storage::WalPosition { offset: 12345 },
                 std::collections::HashMap::new(),
+                None,
             )
             .unwrap();
     }

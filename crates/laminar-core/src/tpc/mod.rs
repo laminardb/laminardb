@@ -68,6 +68,8 @@ mod core_handle;
 mod router;
 mod runtime;
 mod spsc;
+#[cfg(test)]
+mod zero_alloc_tests;
 
 pub use backpressure::{
     BackpressureConfig, BackpressureConfigBuilder, CreditAcquireResult, CreditChannel,
@@ -75,8 +77,8 @@ pub use backpressure::{
     OverflowStrategy,
 };
 pub use core_handle::{CoreConfig, CoreHandle, CoreMessage};
-pub use router::{KeyRouter, KeySpec};
-pub use runtime::{ThreadPerCoreRuntime, TpcConfig, TpcConfigBuilder};
+pub use router::{KeyRouter, KeySpec, RouterError};
+pub use runtime::{OutputBuffer, ThreadPerCoreRuntime, TpcConfig, TpcConfigBuilder};
 pub use spsc::{CachePadded, SpscQueue};
 
 /// Errors that can occur in the TPC runtime.
@@ -139,6 +141,10 @@ pub enum TpcError {
     /// Key extraction failed
     #[error("Key extraction failed: {0}")]
     KeyExtractionFailed(String),
+
+    /// Router error (zero-allocation variant)
+    #[error("Router error: {0}")]
+    RouterError(#[from] RouterError),
 }
 
 #[cfg(test)]

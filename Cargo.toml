@@ -43,7 +43,7 @@ crossbeam = "0.8"  # Lock-free data structures
 parking_lot = "0.12"  # Faster Mutex/RwLock
 memmap2 = "0.9"  # Memory-mapped files
 bumpalo = "3.19"  # Arena allocator
-uuid = { version = "1.11", features = ["v4"] }  # Unique IDs
+uuid = { version = "1.19", features = ["v4"] }  # Unique IDs
 
 # DataFusion and Arrow - using latest versions
 arrow = "57.2"
@@ -52,6 +52,7 @@ arrow-schema = "57.2"
 arrow-buffer = "57.2"
 arrow-data = "57.2"
 arrow-cast = "57.2"
+arrow-ipc = "57.2"
 datafusion = "52.0"
 datafusion-common = "52.0"
 datafusion-expr = "52.0"
@@ -59,9 +60,11 @@ datafusion-sql = "52.0"
 
 # Collections
 smallvec = { version = "1.15", features = ["const_new", "union"] }
+arrayvec = "0.7"
 
 # Platform-specific
 libc = "0.2"
+io-uring = "0.7"  # Low-level io_uring bindings (Linux only)
 
 # Testing
 criterion = { version = "0.8", features = ["html_reports"] }

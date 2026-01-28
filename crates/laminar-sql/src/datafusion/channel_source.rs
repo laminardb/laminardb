@@ -18,7 +18,7 @@ use futures::Stream;
 use parking_lot::Mutex;
 
 use super::bridge::{BridgeSender, StreamBridge};
-use super::source::StreamSource;
+use super::source::{SortColumn, StreamSource};
 
 /// Default channel capacity for the stream source.
 const DEFAULT_CHANNEL_CAPACITY: usize = 1024;
@@ -67,6 +67,8 @@ pub struct ChannelStreamSource {
     sender: Mutex<Option<BridgeSender>>,
     /// Channel capacity
     capacity: usize,
+    /// Declared output ordering (for ORDER BY elision)
+    ordering: Option<Vec<SortColumn>>,
 }
 
 impl ChannelStreamSource {
@@ -95,7 +97,22 @@ impl ChannelStreamSource {
             bridge: Mutex::new(Some(bridge)),
             sender: Mutex::new(Some(sender)),
             capacity,
+            ordering: None,
         }
+    }
+
+    /// Declares that this source produces data in the given sort order.
+    ///
+    /// When set, `DataFusion` can elide `SortExec` for ORDER BY queries
+    /// that match the declared ordering.
+    ///
+    /// # Arguments
+    ///
+    /// * `ordering` - The columns that the output is sorted by
+    #[must_use]
+    pub fn with_ordering(mut self, ordering: Vec<SortColumn>) -> Self {
+        self.ordering = Some(ordering);
+        self
     }
 
     /// Takes the sender for pushing batches into this source.
@@ -151,6 +168,10 @@ impl Debug for ChannelStreamSource {
 impl StreamSource for ChannelStreamSource {
     fn schema(&self) -> SchemaRef {
         Arc::clone(&self.schema)
+    }
+
+    fn output_ordering(&self) -> Option<Vec<SortColumn>> {
+        self.ordering.clone()
     }
 
     fn stream(
@@ -420,8 +441,30 @@ mod tests {
         let schema = test_schema();
         let source = ChannelStreamSource::new(Arc::clone(&schema));
 
-        let debug_str = format!("{:?}", source);
+        let debug_str = format!("{source:?}");
         assert!(debug_str.contains("ChannelStreamSource"));
         assert!(debug_str.contains("capacity"));
+    }
+
+    #[test]
+    fn test_channel_source_default_no_ordering() {
+        let schema = test_schema();
+        let source = ChannelStreamSource::new(Arc::clone(&schema));
+
+        assert!(source.output_ordering().is_none());
+    }
+
+    #[test]
+    fn test_channel_source_with_ordering() {
+        let schema = test_schema();
+        let source = ChannelStreamSource::new(Arc::clone(&schema))
+            .with_ordering(vec![SortColumn::ascending("id")]);
+
+        let ordering = source.output_ordering();
+        assert!(ordering.is_some());
+        let cols = ordering.unwrap();
+        assert_eq!(cols.len(), 1);
+        assert_eq!(cols[0].name, "id");
+        assert!(!cols[0].descending);
     }
 }

@@ -26,6 +26,37 @@ use std::hash::{Hash, Hasher};
 
 use crate::operator::Event;
 
+// ============================================================================
+// RouterError - Static error variants for zero-allocation error paths
+// ============================================================================
+
+/// Routing errors with no heap allocation.
+///
+/// All error variants use static strings to avoid allocation on error paths,
+/// which is critical for Ring 0 hot path performance.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, thiserror::Error)]
+pub enum RouterError {
+    /// A column specified by name was not found in the schema.
+    #[error("column not found by name")]
+    ColumnNotFoundByName,
+
+    /// A column index is out of range for the batch.
+    #[error("column index out of range")]
+    ColumnIndexOutOfRange,
+
+    /// A row index is out of range for the array.
+    #[error("row index out of range")]
+    RowIndexOutOfRange,
+
+    /// The data type is not supported for key extraction.
+    #[error("unsupported data type for routing")]
+    UnsupportedDataType,
+
+    /// The batch is empty and cannot be routed.
+    #[error("empty batch")]
+    EmptyBatch,
+}
+
 /// Specifies how to extract routing keys from events.
 ///
 /// The key determines which core processes an event. All events with the
@@ -170,10 +201,10 @@ impl KeyRouter {
         let mut hasher = FxHasher::default();
 
         for col_name in columns {
-            let col_idx = batch.schema().index_of(col_name)
-                .map_err(|_| super::TpcError::KeyExtractionFailed(
-                    format!("Column '{col_name}' not found in schema")
-                ))?;
+            let col_idx = batch
+                .schema()
+                .index_of(col_name)
+                .map_err(|_| RouterError::ColumnNotFoundByName)?;
 
             hash_column(&mut hasher, batch.column(col_idx))?;
         }
@@ -188,10 +219,7 @@ impl KeyRouter {
 
         for &idx in indices {
             if idx >= batch.num_columns() {
-                return Err(super::TpcError::KeyExtractionFailed(
-                    format!("Column index {idx} out of range (batch has {} columns)",
-                           batch.num_columns())
-                ));
+                return Err(RouterError::ColumnIndexOutOfRange.into());
             }
             hash_column(&mut hasher, batch.column(idx))?;
         }
@@ -212,14 +240,19 @@ impl KeyRouter {
     }
 
     /// Route a specific row by column names
-    fn route_row_by_columns(&self, batch: &RecordBatch, row: usize, columns: &[String]) -> Result<usize, super::TpcError> {
+    fn route_row_by_columns(
+        &self,
+        batch: &RecordBatch,
+        row: usize,
+        columns: &[String],
+    ) -> Result<usize, super::TpcError> {
         let mut hasher = FxHasher::default();
 
         for col_name in columns {
-            let col_idx = batch.schema().index_of(col_name)
-                .map_err(|_| super::TpcError::KeyExtractionFailed(
-                    format!("Column '{col_name}' not found in schema")
-                ))?;
+            let col_idx = batch
+                .schema()
+                .index_of(col_name)
+                .map_err(|_| RouterError::ColumnNotFoundByName)?;
 
             hash_row_value(&mut hasher, batch.column(col_idx), row)?;
         }
@@ -228,14 +261,17 @@ impl KeyRouter {
     }
 
     /// Route a specific row by column indices
-    fn route_row_by_indices(&self, batch: &RecordBatch, row: usize, indices: &[usize]) -> Result<usize, super::TpcError> {
+    fn route_row_by_indices(
+        &self,
+        batch: &RecordBatch,
+        row: usize,
+        indices: &[usize],
+    ) -> Result<usize, super::TpcError> {
         let mut hasher = FxHasher::default();
 
         for &idx in indices {
             if idx >= batch.num_columns() {
-                return Err(super::TpcError::KeyExtractionFailed(
-                    format!("Column index {idx} out of range")
-                ));
+                return Err(RouterError::ColumnIndexOutOfRange.into());
             }
             hash_row_value(&mut hasher, batch.column(idx), row)?;
         }
@@ -244,7 +280,11 @@ impl KeyRouter {
     }
 
     /// Route a specific row using all columns
-    fn route_row_all_columns(&self, batch: &RecordBatch, row: usize) -> Result<usize, super::TpcError> {
+    fn route_row_all_columns(
+        &self,
+        batch: &RecordBatch,
+        row: usize,
+    ) -> Result<usize, super::TpcError> {
         let mut hasher = FxHasher::default();
 
         for col in batch.columns() {
@@ -256,7 +296,7 @@ impl KeyRouter {
 }
 
 /// Hash an entire column (for single-row batches)
-fn hash_column(hasher: &mut FxHasher, array: &dyn Array) -> Result<(), super::TpcError> {
+fn hash_column(hasher: &mut FxHasher, array: &dyn Array) -> Result<(), RouterError> {
     // Hash first row for single-row batches (common case for events)
     if array.is_empty() {
         0u8.hash(hasher);
@@ -267,19 +307,15 @@ fn hash_column(hasher: &mut FxHasher, array: &dyn Array) -> Result<(), super::Tp
 }
 
 /// Hash a specific row value from an array
-fn hash_row_value(hasher: &mut FxHasher, array: &dyn Array, row: usize) -> Result<(), super::TpcError> {
+fn hash_row_value(hasher: &mut FxHasher, array: &dyn Array, row: usize) -> Result<(), RouterError> {
     use arrow_array::{
-        Int8Array, Int16Array, Int32Array, Int64Array,
-        UInt8Array, UInt16Array, UInt32Array, UInt64Array,
-        Float32Array, Float64Array, StringArray, BinaryArray,
-        BooleanArray,
+        BinaryArray, BooleanArray, Float32Array, Float64Array, Int16Array, Int32Array, Int64Array,
+        Int8Array, StringArray, UInt16Array, UInt32Array, UInt64Array, UInt8Array,
     };
     use arrow_schema::DataType;
 
     if row >= array.len() {
-        return Err(super::TpcError::KeyExtractionFailed(
-            format!("Row {row} out of range (array has {} rows)", array.len())
-        ));
+        return Err(RouterError::RowIndexOutOfRange);
     }
 
     if array.is_null(row) {
@@ -450,7 +486,10 @@ mod tests {
         let event = make_event(100, "alice", 1000);
 
         let result = router.route(&event);
-        assert!(matches!(result, Err(super::super::TpcError::KeyExtractionFailed(_))));
+        assert!(matches!(
+            result,
+            Err(super::super::TpcError::RouterError(RouterError::ColumnNotFoundByName))
+        ));
     }
 
     #[test]
@@ -459,7 +498,29 @@ mod tests {
         let event = make_event(100, "alice", 1000);
 
         let result = router.route(&event);
-        assert!(matches!(result, Err(super::super::TpcError::KeyExtractionFailed(_))));
+        assert!(matches!(
+            result,
+            Err(super::super::TpcError::RouterError(RouterError::ColumnIndexOutOfRange))
+        ));
+    }
+
+    #[test]
+    fn test_router_error_no_allocation() {
+        // Verify that RouterError variants are Copy (no heap allocation)
+        let err1 = RouterError::ColumnNotFoundByName;
+        let err2 = err1; // Copy, not move
+        assert_eq!(err1, err2);
+
+        let err3 = RouterError::ColumnIndexOutOfRange;
+        let err4 = RouterError::RowIndexOutOfRange;
+        let err5 = RouterError::UnsupportedDataType;
+        let err6 = RouterError::EmptyBatch;
+
+        // All errors should be different
+        assert_ne!(err1, err3);
+        assert_ne!(err3, err4);
+        assert_ne!(err4, err5);
+        assert_ne!(err5, err6);
     }
 
     #[test]
