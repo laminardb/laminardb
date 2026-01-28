@@ -250,7 +250,14 @@ impl<T: Record> Source<T> {
 
     /// Pushes multiple records, returning the number successfully pushed.
     ///
-    /// Stops at the first failure.
+    /// Stops at the first failure. Requires `Clone` because records are cloned
+    /// before being sent.
+    ///
+    /// # Performance Warning
+    ///
+    /// **This method clones each record.** For zero-clone batch insertion,
+    /// use [`push_batch_drain`](Self::push_batch_drain) which takes ownership
+    /// via an iterator.
     pub fn push_batch(&self, records: &[T]) -> usize
     where
         T: Clone,
@@ -258,6 +265,41 @@ impl<T: Record> Source<T> {
         let mut count = 0;
         for record in records {
             if self.try_push(record.clone()).is_err() {
+                break;
+            }
+            count += 1;
+        }
+        count
+    }
+
+    /// Pushes records from an iterator, consuming them (zero-clone).
+    ///
+    /// Returns the number of records successfully pushed. Stops at the first
+    /// failure (channel full or closed).
+    ///
+    /// # Example
+    ///
+    /// ```rust,ignore
+    /// let events = vec![event1, event2, event3];
+    /// let pushed = source.push_batch_drain(events.into_iter());
+    /// ```
+    pub fn push_batch_drain<I>(&self, records: I) -> usize
+    where
+        I: IntoIterator<Item = T>,
+    {
+        let mut count = 0;
+        for record in records {
+            // Update watermark if record has event time
+            if let Some(event_time) = record.event_time() {
+                self.inner.watermark.update(event_time);
+            }
+
+            if self
+                .inner
+                .producer
+                .try_push(SourceMessage::Record(record))
+                .is_err()
+            {
                 break;
             }
             count += 1;
@@ -366,6 +408,16 @@ impl<T: Record> Source<T> {
 }
 
 impl<T: Record> Clone for Source<T> {
+    /// Clones the source, triggering automatic SPSC → MPSC upgrade.
+    ///
+    /// # Performance Warning
+    ///
+    /// **This method allocates a new `Arc<SourceInner>`.** The first clone also
+    /// triggers an upgrade from SPSC to MPSC mode, which adds synchronization
+    /// overhead to all subsequent `push` operations.
+    ///
+    /// For maximum performance with a single producer, avoid cloning the source.
+    /// Use clones only when you genuinely need multiple producer threads.
     fn clone(&self) -> Self {
         // Clone the producer (triggers MPSC upgrade)
         let producer = self.inner.producer.clone();

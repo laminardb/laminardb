@@ -104,37 +104,42 @@ impl<T> RingBuffer<T> {
     /// Returns true if the buffer is empty.
     ///
     /// Note: This is a snapshot and may change immediately after returning.
+    /// Uses Relaxed ordering since this is an approximate query.
     #[inline]
     #[must_use]
     pub fn is_empty(&self) -> bool {
-        let head = self.head.load(Ordering::Acquire);
-        let tail = self.tail.load(Ordering::Acquire);
+        let head = self.head.load(Ordering::Relaxed);
+        let tail = self.tail.load(Ordering::Relaxed);
         head == tail
     }
 
     /// Returns true if the buffer is full.
     ///
     /// Note: This is a snapshot and may change immediately after returning.
+    /// Uses Relaxed ordering since this is an approximate query.
     #[inline]
     #[must_use]
     pub fn is_full(&self) -> bool {
-        let head = self.head.load(Ordering::Acquire);
-        let tail = self.tail.load(Ordering::Acquire);
+        let head = self.head.load(Ordering::Relaxed);
+        let tail = self.tail.load(Ordering::Relaxed);
         self.next_index(tail) == head
     }
 
     /// Returns the current number of items in the buffer.
     ///
     /// Note: This is a snapshot and may change immediately after returning.
+    /// Uses Relaxed ordering since this is an approximate query.
     #[inline]
     #[must_use]
     pub fn len(&self) -> usize {
-        let head = self.head.load(Ordering::Acquire);
-        let tail = self.tail.load(Ordering::Acquire);
+        let head = self.head.load(Ordering::Relaxed);
+        let tail = self.tail.load(Ordering::Relaxed);
         tail.wrapping_sub(head) & self.capacity_mask
     }
 
     /// Returns the number of free slots in the buffer.
+    ///
+    /// Note: This is a snapshot and may change immediately after returning.
     #[inline]
     #[must_use]
     pub fn free_slots(&self) -> usize {
@@ -335,9 +340,12 @@ impl<T> RingBuffer<T> {
     ///
     /// This must only be called by the single consumer thread.
     ///
-    /// # Note
+    /// # Performance Warning
     ///
-    /// This allocates. For zero-allocation, use `pop_each`.
+    /// **This method allocates a `Vec` on every call.** Do not use on hot paths
+    /// where allocation overhead matters. For zero-allocation consumption, use
+    /// [`pop_each`](Self::pop_each) or [`pop_batch_into`](Self::pop_batch_into).
+    #[cold]
     #[must_use]
     pub fn pop_batch(&self, max_count: usize) -> Vec<T> {
         let mut items = Vec::with_capacity(max_count.min(self.len()));

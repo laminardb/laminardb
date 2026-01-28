@@ -24,6 +24,8 @@ use std::sync::Arc;
 use std::thread;
 use std::time::{Duration, Instant};
 
+use crate::tpc::CachePadded;
+
 use super::config::{BackpressureStrategy, ChannelConfig, ChannelStats, WaitStrategy};
 use super::error::{RecvError, StreamingError, TryPushError};
 use super::ring_buffer::RingBuffer;
@@ -74,19 +76,26 @@ struct ChannelInner<T> {
 }
 
 /// Internal statistics counters.
+///
+/// `items_pushed` and `items_popped` are cache-padded to prevent false sharing
+/// between producer and consumer threads.
 struct ChannelStatsInner {
-    items_pushed: AtomicU64,
-    items_popped: AtomicU64,
+    /// Items pushed by producer (cache-padded to avoid false sharing).
+    items_pushed: CachePadded<AtomicU64>,
+    /// Items popped by consumer (cache-padded to avoid false sharing).
+    items_popped: CachePadded<AtomicU64>,
+    /// Producer-side counters (grouped together).
     push_blocked: AtomicU64,
     items_dropped: AtomicU64,
+    /// Consumer-side counter.
     pop_empty: AtomicU64,
 }
 
 impl ChannelStatsInner {
     fn new() -> Self {
         Self {
-            items_pushed: AtomicU64::new(0),
-            items_popped: AtomicU64::new(0),
+            items_pushed: CachePadded::new(AtomicU64::new(0)),
+            items_popped: CachePadded::new(AtomicU64::new(0)),
             push_blocked: AtomicU64::new(0),
             items_dropped: AtomicU64::new(0),
             pop_empty: AtomicU64::new(0),
@@ -117,16 +126,35 @@ impl<T> ChannelInner<T> {
         }
     }
 
-    /// Acquire the MPSC lock (spin until acquired).
+    /// Acquire the MPSC lock (spin with exponential backoff).
+    ///
+    /// Uses exponential backoff to reduce contention under load:
+    /// - First 4 attempts: `spin_loop`
+    /// - Next 4 attempts: yield
+    /// - After that: short sleep
     #[inline]
     fn acquire_mpsc_lock(&self) {
+        let mut attempts = 0u32;
+
         while self
             .mpsc_lock
             .compare_exchange_weak(0, 1, Ordering::Acquire, Ordering::Relaxed)
             .is_err()
         {
-            // Spin with backoff
-            std::hint::spin_loop();
+            attempts = attempts.saturating_add(1);
+
+            if attempts <= 4 {
+                // Fast path: spin
+                std::hint::spin_loop();
+            } else if attempts <= 8 {
+                // Medium contention: yield to OS
+                thread::yield_now();
+            } else {
+                // High contention: brief sleep with exponential backoff
+                // Cap at 100us to avoid excessive latency
+                let sleep_us = (1 << (attempts - 8).min(6)).min(100);
+                thread::sleep(Duration::from_micros(sleep_us));
+            }
         }
     }
 
@@ -390,8 +418,9 @@ impl<T> Producer<T> {
                 }
             }
             WaitStrategy::Park => {
+                // Use 100us timeout to balance latency vs syscall overhead
                 while self.inner.buffer.is_full() {
-                    thread::park_timeout(Duration::from_micros(10));
+                    thread::park_timeout(Duration::from_micros(100));
                 }
             }
         }
@@ -501,6 +530,13 @@ impl<T> Consumer<T> {
     /// Pops multiple items from the buffer.
     ///
     /// Returns a vector of up to `max_count` items.
+    ///
+    /// # Performance Warning
+    ///
+    /// **This method allocates a `Vec` on every call.** Do not use on hot paths
+    /// where allocation overhead matters. For zero-allocation consumption, use
+    /// [`pop_each`](Self::pop_each) or [`pop_batch_into`](Self::pop_batch_into).
+    #[cold]
     #[must_use]
     pub fn pop_batch(&self, max_count: usize) -> Vec<T> {
         let mut items = Vec::with_capacity(max_count.min(self.len()));
@@ -512,6 +548,38 @@ impl<T> Consumer<T> {
             }
         }
         items
+    }
+
+    /// Pops multiple items into a pre-allocated vector (zero-allocation).
+    ///
+    /// Appends up to `max_count` items to the provided vector.
+    /// Returns the number of items added.
+    ///
+    /// # Example
+    ///
+    /// ```rust,ignore
+    /// let mut buffer = Vec::with_capacity(100);
+    /// loop {
+    ///     buffer.clear();
+    ///     let count = consumer.pop_batch_into(&mut buffer, 100);
+    ///     if count == 0 { break; }
+    ///     for item in &buffer {
+    ///         process(item);
+    ///     }
+    /// }
+    /// ```
+    #[inline]
+    pub fn pop_batch_into(&self, buffer: &mut Vec<T>, max_count: usize) -> usize {
+        let mut count = 0;
+        for _ in 0..max_count {
+            if let Some(item) = self.poll() {
+                buffer.push(item);
+                count += 1;
+            } else {
+                break;
+            }
+        }
+        count
     }
 
     /// Pops items and calls a callback for each (zero-allocation).

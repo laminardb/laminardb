@@ -79,6 +79,13 @@ pub(crate) struct SinkInner<T: Record> {
 /// automatically enters broadcast mode where each subscriber gets a
 /// copy of every record.
 ///
+/// ## Performance Notes
+///
+/// - Single subscriber mode: Zero overhead, direct channel access
+/// - Broadcast mode: Uses `RwLock` for subscriber list (read-heavy optimization)
+/// - `poll_and_distribute()`: Takes a read lock (fast, non-blocking with other readers)
+/// - `subscribe()`: Takes a write lock (rare, happens at setup time)
+///
 /// ## Example
 ///
 /// ```rust,ignore
@@ -95,7 +102,8 @@ pub(crate) struct SinkInner<T: Record> {
 pub struct Sink<T: Record> {
     inner: Arc<SinkInner<T>>,
     /// Subscribers (only used in broadcast mode).
-    subscribers: Arc<std::sync::Mutex<Vec<SubscriberInner<T>>>>,
+    /// Uses `RwLock` for fast read access on hot path.
+    subscribers: Arc<std::sync::RwLock<Vec<SubscriberInner<T>>>>,
 }
 
 impl<T: Record> Sink<T> {
@@ -113,7 +121,7 @@ impl<T: Record> Sink<T> {
                 subscriber_count: AtomicUsize::new(0),
                 disconnected: std::sync::atomic::AtomicBool::new(false),
             }),
-            subscribers: Arc::new(std::sync::Mutex::new(Vec::new())),
+            subscribers: Arc::new(std::sync::RwLock::new(Vec::new())),
         }
     }
 
@@ -126,9 +134,14 @@ impl<T: Record> Sink<T> {
     ///
     /// A `Subscription` that can be used to poll or receive records.
     ///
+    /// # Performance
+    ///
+    /// This method takes a write lock and should only be called during setup,
+    /// not on the hot path. Subscription setup is O(1).
+    ///
     /// # Panics
     ///
-    /// Panics if the internal mutex is poisoned (should not happen in normal use).
+    /// Panics if the internal lock is poisoned (should not happen in normal use).
     #[must_use]
     pub fn subscribe(&self) -> Subscription<T> {
         let count = self.inner.subscriber_count.fetch_add(1, Ordering::AcqRel);
@@ -141,9 +154,9 @@ impl<T: Record> Sink<T> {
             let (producer, consumer) =
                 channel_with_config::<SourceMessage<T>>(self.inner.channel_config.clone());
 
-            // Store producer for broadcasting
+            // Store producer for broadcasting (write lock, not hot path)
             {
-                let mut subs = self.subscribers.lock().unwrap();
+                let mut subs = self.subscribers.write().unwrap();
                 subs.push(SubscriberInner { producer });
             }
 
@@ -192,26 +205,31 @@ impl<T: Record> Sink<T> {
     ///
     /// Returns the number of records distributed.
     ///
+    /// # Performance
+    ///
+    /// Uses a read lock which is fast and non-blocking with other readers.
+    /// The lock is held for the minimum time necessary.
+    ///
     /// # Panics
     ///
-    /// Panics if the internal mutex is poisoned (should not happen in normal use).
+    /// Panics if the internal lock is poisoned (should not happen in normal use).
     #[must_use]
     pub fn poll_and_distribute(&self) -> usize
     where
         T: Clone,
     {
-        let mut count = 0;
-
         // Only needed in broadcast mode
         if self.mode() != SinkMode::Broadcast {
             return 0;
         }
 
-        // Get subscribers
-        let subscribers = self.subscribers.lock().unwrap();
+        // Take read lock (fast, doesn't block other readers)
+        let subscribers = self.subscribers.read().unwrap();
         if subscribers.is_empty() {
             return 0;
         }
+
+        let mut count = 0;
 
         // Poll records from source and broadcast
         while let Some(msg) = self.inner.consumer.poll() {

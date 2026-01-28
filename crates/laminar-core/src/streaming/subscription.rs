@@ -157,6 +157,13 @@ impl<T: Record> Subscription<T> {
     /// Polls multiple record batches into a vector.
     ///
     /// Returns up to `max_count` batches.
+    ///
+    /// # Performance Warning
+    ///
+    /// **This method allocates a `Vec` on every call.** Do not use on hot paths
+    /// where allocation overhead matters. For zero-allocation consumption, use
+    /// [`poll_each`](Self::poll_each) or [`poll_batch_into`](Self::poll_batch_into).
+    #[cold]
     #[must_use]
     pub fn poll_batch(&self, max_count: usize) -> Vec<RecordBatch> {
         let mut batches = Vec::with_capacity(max_count);
@@ -170,6 +177,39 @@ impl<T: Record> Subscription<T> {
         }
 
         batches
+    }
+
+    /// Polls multiple record batches into a pre-allocated vector (zero-allocation).
+    ///
+    /// Appends up to `max_count` batches to the provided vector.
+    /// Returns the number of batches added.
+    ///
+    /// # Example
+    ///
+    /// ```rust,ignore
+    /// let mut buffer = Vec::with_capacity(100);
+    /// loop {
+    ///     buffer.clear();
+    ///     let count = subscription.poll_batch_into(&mut buffer, 100);
+    ///     if count == 0 { break; }
+    ///     for batch in &buffer {
+    ///         process(batch);
+    ///     }
+    /// }
+    /// ```
+    pub fn poll_batch_into(&self, buffer: &mut Vec<RecordBatch>, max_count: usize) -> usize {
+        let mut count = 0;
+
+        for _ in 0..max_count {
+            if let Some(batch) = self.poll() {
+                buffer.push(batch);
+                count += 1;
+            } else {
+                break;
+            }
+        }
+
+        count
     }
 
     /// Processes records with a callback (zero-allocation).

@@ -38,6 +38,16 @@
     - SQL type → Arrow DataType conversion
     - Validation: rejects 'channel' option (channel type is auto-derived)
 
+- Performance Audit: ALL 10 issues fixed
+  - P0: Replaced Mutex with RwLock in sink.rs for fast read access on hot path
+  - P1: Relaxed memory ordering for snapshot methods (is_empty, is_full, len)
+  - P1: Added exponential backoff in MPSC spin-lock (spin → yield → sleep)
+  - P1: Increased park timeout from 10μs to 100μs to reduce spurious wakes
+  - P2: Cache-padded stats counters to prevent false sharing
+  - P2: Added `#[cold]` + warnings to allocating methods (pop_batch, poll_batch)
+  - P2: Documented Source::clone allocation overhead
+  - P2: Added zero-allocation variants (push_batch_drain, pop_batch_into, poll_batch_into)
+
 Previous session:
 - F074-F077: Aggregation Semantics Enhancement - COMPLETE (219 tests)
 
@@ -113,6 +123,12 @@ None - Streaming API foundation complete.
 ### Key Modules
 ```
 laminar-core/src/
+  streaming/    # F-STREAM-001 to F-STREAM-006: In-memory streaming API
+    ring_buffer   # Lock-free SPSC ring buffer
+    channel       # SPSC/MPSC channel with auto-upgrade
+    source        # Source<T> with push/watermark
+    sink          # Sink<T> with broadcast mode
+    subscription  # poll/recv/Iterator APIs
   time/         # F010, F064, F065, F066: Watermarks, partitioned + keyed + alignment
     alignment_group # F066: Watermark alignment groups
   mv/           # F060: Cascading MVs
@@ -143,6 +159,7 @@ laminar-sql/src/       # F006B: Production SQL Parser
   translator/          # Operator configuration builders
     window_translator  # WindowOperatorConfig
     join_translator    # JoinOperatorConfig (stream/lookup)
+    streaming_ddl      # F-STREAM-007: CREATE SOURCE/SINK → SourceDefinition/SinkDefinition
   datafusion/          # F005/F005B: DataFusion integration
     window_udf         # F005B: TUMBLE/HOP/SESSION scalar UDFs
     watermark_udf      # F005B: watermark() UDF via Arc<AtomicI64>
