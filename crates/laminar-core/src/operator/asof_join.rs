@@ -197,20 +197,26 @@ impl AsofJoinConfigBuilder {
 
     /// Builds the configuration.
     ///
-    /// # Panics
+    /// # Errors
     ///
-    /// Panics if required fields are not set.
-    #[must_use]
-    pub fn build(self) -> AsofJoinConfig {
-        AsofJoinConfig {
-            key_column: self.key_column.expect("key_column is required"),
-            left_time_column: self.left_time_column.expect("left_time_column is required"),
-            right_time_column: self.right_time_column.expect("right_time_column is required"),
+    /// Returns `OperatorError::ConfigError` if required fields
+    /// (`key_column`, `left_time_column`, `right_time_column`) are not set.
+    pub fn build(self) -> Result<AsofJoinConfig, OperatorError> {
+        Ok(AsofJoinConfig {
+            key_column: self.key_column.ok_or_else(|| {
+                OperatorError::ConfigError("key_column is required".into())
+            })?,
+            left_time_column: self.left_time_column.ok_or_else(|| {
+                OperatorError::ConfigError("left_time_column is required".into())
+            })?,
+            right_time_column: self.right_time_column.ok_or_else(|| {
+                OperatorError::ConfigError("right_time_column is required".into())
+            })?,
             direction: self.direction.unwrap_or_default(),
             tolerance: self.tolerance,
             join_type: self.join_type.unwrap_or_default(),
             operator_id: self.operator_id,
-        }
+        })
     }
 }
 
@@ -972,7 +978,8 @@ mod tests {
             .tolerance(Duration::from_secs(5))
             .join_type(AsofJoinType::Left)
             .operator_id("test_op".to_string())
-            .build();
+            .build()
+            .unwrap();
 
         assert_eq!(config.key_column, "symbol");
         assert_eq!(config.left_time_column, "trade_time");
@@ -992,7 +999,8 @@ mod tests {
             .direction(AsofDirection::Backward)
             .tolerance(Duration::from_secs(10))
             .join_type(AsofJoinType::Inner)
-            .build();
+            .build()
+            .unwrap();
 
         let mut operator = AsofJoinOperator::with_id(config, "test_asof".to_string());
 
@@ -1039,7 +1047,8 @@ mod tests {
             .direction(AsofDirection::Forward)
             .tolerance(Duration::from_secs(10))
             .join_type(AsofJoinType::Inner)
-            .build();
+            .build()
+            .unwrap();
 
         let mut operator = AsofJoinOperator::with_id(config, "test_asof".to_string());
 
@@ -1076,7 +1085,8 @@ mod tests {
             .direction(AsofDirection::Nearest)
             .tolerance(Duration::from_secs(10))
             .join_type(AsofJoinType::Inner)
-            .build();
+            .build()
+            .unwrap();
 
         let mut operator = AsofJoinOperator::with_id(config, "test_asof".to_string());
 
@@ -1113,7 +1123,8 @@ mod tests {
             .direction(AsofDirection::Backward)
             .tolerance(Duration::from_millis(50)) // 50ms tolerance
             .join_type(AsofJoinType::Inner)
-            .build();
+            .build()
+            .unwrap();
 
         let mut operator = AsofJoinOperator::with_id(config, "test_asof".to_string());
 
@@ -1149,7 +1160,8 @@ mod tests {
             .direction(AsofDirection::Backward)
             .tolerance(Duration::from_millis(100)) // 100ms tolerance
             .join_type(AsofJoinType::Inner)
-            .build();
+            .build()
+            .unwrap();
 
         let mut operator = AsofJoinOperator::with_id(config, "test_asof".to_string());
 
@@ -1183,7 +1195,8 @@ mod tests {
             .right_time_column("quote_time".to_string())
             .direction(AsofDirection::Backward)
             .join_type(AsofJoinType::Inner)
-            .build();
+            .build()
+            .unwrap();
 
         let mut operator = AsofJoinOperator::with_id(config, "test_asof".to_string());
 
@@ -1211,7 +1224,8 @@ mod tests {
             .direction(AsofDirection::Backward)
             .tolerance(Duration::from_secs(10))
             .join_type(AsofJoinType::Inner)
-            .build();
+            .build()
+            .unwrap();
 
         let mut operator = AsofJoinOperator::with_id(config, "test_asof".to_string());
 
@@ -1255,7 +1269,8 @@ mod tests {
             .direction(AsofDirection::Backward)
             .tolerance(Duration::from_secs(10))
             .join_type(AsofJoinType::Inner)
-            .build();
+            .build()
+            .unwrap();
 
         let mut operator = AsofJoinOperator::with_id(config, "test_asof".to_string());
 
@@ -1289,7 +1304,8 @@ mod tests {
             .direction(AsofDirection::Backward)
             .tolerance(Duration::from_millis(50))
             .join_type(AsofJoinType::Left) // Left outer join
-            .build();
+            .build()
+            .unwrap();
 
         let mut operator = AsofJoinOperator::with_id(config, "test_asof".to_string());
 
@@ -1333,7 +1349,8 @@ mod tests {
             .direction(AsofDirection::Backward)
             .tolerance(Duration::from_millis(50))
             .join_type(AsofJoinType::Inner)
-            .build();
+            .build()
+            .unwrap();
 
         let mut operator = AsofJoinOperator::with_id(config, "test_asof".to_string());
 
@@ -1361,7 +1378,8 @@ mod tests {
             .direction(AsofDirection::Backward)
             .tolerance(Duration::from_millis(100))
             .join_type(AsofJoinType::Inner)
-            .build();
+            .build()
+            .unwrap();
 
         let mut operator = AsofJoinOperator::with_id(config, "test_asof".to_string());
 
@@ -1397,7 +1415,8 @@ mod tests {
             .direction(AsofDirection::Backward)
             .tolerance(Duration::from_secs(10))
             .join_type(AsofJoinType::Inner)
-            .build();
+            .build()
+            .unwrap();
 
         let mut operator = AsofJoinOperator::with_id(config, "test_asof".to_string());
 
@@ -1429,7 +1448,8 @@ mod tests {
             .direction(AsofDirection::Backward)
             .tolerance(Duration::from_secs(10))
             .join_type(AsofJoinType::Inner)
-            .build();
+            .build()
+            .unwrap();
 
         let mut operator = AsofJoinOperator::with_id(config.clone(), "test_asof".to_string());
 
@@ -1472,7 +1492,8 @@ mod tests {
             .direction(AsofDirection::Backward)
             .tolerance(Duration::from_secs(10))
             .join_type(AsofJoinType::Inner)
-            .build();
+            .build()
+            .unwrap();
 
         let mut operator = AsofJoinOperator::with_id(config, "test_asof".to_string());
 
@@ -1517,7 +1538,8 @@ mod tests {
             .direction(AsofDirection::Backward)
             .tolerance(Duration::from_secs(10))
             .join_type(AsofJoinType::Inner)
-            .build();
+            .build()
+            .unwrap();
 
         let mut operator = AsofJoinOperator::with_id(config, "test_asof".to_string());
 
@@ -1616,7 +1638,8 @@ mod tests {
             .direction(AsofDirection::Backward)
             // No tolerance set - unlimited
             .join_type(AsofJoinType::Inner)
-            .build();
+            .build()
+            .unwrap();
 
         assert_eq!(config.tolerance_ms(), i64::MAX);
 

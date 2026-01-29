@@ -3240,8 +3240,7 @@ where
     /// Returns a stack-allocated fixed-size array to avoid heap allocation
     /// on the hot path. This is critical for Ring 0 performance.
     #[inline]
-    #[allow(clippy::unused_self)] // May use self for namespacing in the future
-    fn state_key(&self, window_id: &WindowId) -> [u8; WINDOW_STATE_KEY_SIZE] {
+    fn state_key(window_id: &WindowId) -> [u8; WINDOW_STATE_KEY_SIZE] {
         let mut key = [0u8; WINDOW_STATE_KEY_SIZE];
         key[..4].copy_from_slice(WINDOW_STATE_PREFIX);
         let window_key = window_id.to_key_inline();
@@ -3251,7 +3250,7 @@ where
 
     /// Gets the accumulator for a window, creating a new one if needed.
     fn get_accumulator(&self, window_id: &WindowId, state: &dyn StateStore) -> A::Acc {
-        let key = self.state_key(window_id);
+        let key = Self::state_key(window_id);
         state
             .get_typed::<A::Acc>(&key)
             .ok()
@@ -3261,12 +3260,11 @@ where
 
     /// Stores the accumulator for a window.
     fn put_accumulator(
-        &self,
         window_id: &WindowId,
         acc: &A::Acc,
         state: &mut dyn StateStore,
     ) -> Result<(), OperatorError> {
-        let key = self.state_key(window_id);
+        let key = Self::state_key(window_id);
         state
             .put_typed(&key, acc)
             .map_err(|e| OperatorError::StateAccessFailed(e.to_string()))
@@ -3274,11 +3272,10 @@ where
 
     /// Deletes the accumulator for a window.
     fn delete_accumulator(
-        &self,
         window_id: &WindowId,
         state: &mut dyn StateStore,
     ) -> Result<(), OperatorError> {
-        let key = self.state_key(window_id);
+        let key = Self::state_key(window_id);
         state
             .delete(&key)
             .map_err(|e| OperatorError::StateAccessFailed(e.to_string()))
@@ -3481,7 +3478,7 @@ where
         if let Some(value) = self.aggregator.extract(event) {
             let mut acc = self.get_accumulator(&window_id, ctx.state);
             acc.add(value);
-            if let Err(e) = self.put_accumulator(&window_id, &acc, ctx.state) {
+            if let Err(e) = Self::put_accumulator(&window_id, &acc, ctx.state) {
                 // Log error but don't fail - we'll retry on next event
                 tracing::error!("Failed to store window state: {e}");
             } else {
@@ -3562,7 +3559,7 @@ where
         // Skip empty windows
         if acc.is_empty() {
             // Clean up state
-            let _ = self.delete_accumulator(&window_id, ctx.state);
+            let _ = Self::delete_accumulator(&window_id, ctx.state);
             self.registered_windows.remove(&window_id);
             self.periodic_timer_windows.remove(&window_id);
             return OutputVec::new();
@@ -3572,7 +3569,7 @@ where
         let result = acc.result();
 
         // Clean up window state
-        let _ = self.delete_accumulator(&window_id, ctx.state);
+        let _ = Self::delete_accumulator(&window_id, ctx.state);
         self.registered_windows.remove(&window_id);
         self.periodic_timer_windows.remove(&window_id);
 

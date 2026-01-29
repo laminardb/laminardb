@@ -423,9 +423,7 @@ where
     }
 
     /// Stores session state and accumulator.
-    #[allow(clippy::unused_self)]
     fn put_session(
-        &self,
         key_hash: u64,
         session: &SessionState,
         acc: &A::Acc,
@@ -601,7 +599,7 @@ where
             session = SessionState::new(event_time, self.gap_ms, key);
             // Reset accumulator for new session
             let new_acc = self.aggregator.create_accumulator();
-            let _ = self.put_session(key_hash, &session, &new_acc, ctx.state);
+            let _ = Self::put_session(key_hash, &session, &new_acc, ctx.state);
         }
 
         // Get and update accumulator
@@ -611,7 +609,7 @@ where
         }
 
         // Store updated state
-        if self.put_session(key_hash, &session, &acc, ctx.state).is_ok() {
+        if Self::put_session(key_hash, &session, &acc, ctx.state).is_ok() {
             self.active_sessions.insert(key_hash, session.clone());
         }
 

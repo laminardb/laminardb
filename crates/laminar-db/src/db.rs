@@ -54,11 +54,19 @@ pub struct LaminarDB {
 
 impl LaminarDB {
     /// Create an embedded in-memory database with default settings.
+    ///
+    /// # Errors
+    ///
+    /// Returns `DbError` if `DataFusion` context creation fails.
     pub fn open() -> Result<Self, DbError> {
         Self::open_with_config(LaminarConfig::default())
     }
 
     /// Create with custom configuration.
+    ///
+    /// # Errors
+    ///
+    /// Returns `DbError` if `DataFusion` context creation fails.
     pub fn open_with_config(config: LaminarConfig) -> Result<Self, DbError> {
         let ctx = SessionContext::new();
         register_streaming_functions(&ctx);
@@ -94,6 +102,10 @@ impl LaminarDB {
     /// - `INSERT INTO source_name VALUES (...)` — insert data
     /// - `CREATE MATERIALIZED VIEW` — create a streaming materialized view
     /// - `EXPLAIN SELECT ...` — show query plan
+    ///
+    /// # Errors
+    ///
+    /// Returns `DbError` if SQL parsing, planning, or execution fails.
     pub async fn execute(&self, sql: &str) -> Result<ExecuteResult, DbError> {
         if self.shutdown.load(std::sync::atomic::Ordering::Relaxed) {
             return Err(DbError::Shutdown);
@@ -330,7 +342,6 @@ impl LaminarDB {
         &self,
         statement: &StreamingStatement,
     ) -> Result<ExecuteResult, DbError> {
-        #![allow(clippy::unnecessary_wraps)]
         let mut planner = self.planner.lock();
 
         // Plan the inner statement to extract streaming info
@@ -392,7 +403,7 @@ impl LaminarDB {
                 Arc::new(StringArray::from(values)),
             ],
         )
-        .unwrap();
+        .map_err(|e| DbError::InvalidOperation(format!("explain metadata: {e}")))?;
 
         Ok(ExecuteResult::Metadata(batch))
     }
@@ -490,6 +501,10 @@ impl LaminarDB {
     /// Get a typed source handle for pushing data.
     ///
     /// The source must have been created via `CREATE SOURCE`.
+    ///
+    /// # Errors
+    ///
+    /// Returns `DbError::SourceNotFound` if the source is not registered.
     pub fn source<T: laminar_core::streaming::Record>(
         &self,
         name: &str,
@@ -502,6 +517,10 @@ impl LaminarDB {
     }
 
     /// Get an untyped source handle for pushing `RecordBatch` data.
+    ///
+    /// # Errors
+    ///
+    /// Returns `DbError::SourceNotFound` if the source is not registered.
     pub fn source_untyped(&self, name: &str) -> Result<UntypedSourceHandle, DbError> {
         let entry = self
             .catalog
@@ -552,6 +571,10 @@ impl LaminarDB {
     /// watermarks.
     ///
     /// Returns the checkpoint ID on success.
+    ///
+    /// # Errors
+    ///
+    /// Returns `DbError::Checkpoint` if the checkpoint operation fails.
     pub fn checkpoint(&self) -> Result<Option<u64>, DbError> {
         self.checkpoint_manager
             .lock()
@@ -560,6 +583,10 @@ impl LaminarDB {
     }
 
     /// Returns the most recent streaming checkpoint for restore.
+    ///
+    /// # Errors
+    ///
+    /// Returns `DbError::Checkpoint` if no checkpoint is available.
     pub fn restore_checkpoint(
         &self,
     ) -> Result<streaming::StreamCheckpoint, DbError> {
@@ -585,6 +612,10 @@ impl LaminarDB {
     ///
     /// Marks the query as inactive in the catalog. Future subscription
     /// polls for this query will receive no more data.
+    ///
+    /// # Errors
+    ///
+    /// Returns `DbError` if the query is not found.
     pub fn cancel_query(&self, query_id: u64) -> Result<(), DbError> {
         self.catalog.deactivate_query(query_id);
         Ok(())
@@ -618,7 +649,8 @@ impl LaminarDB {
             DataType::Utf8,
             false,
         )]));
-        RecordBatch::try_new(schema, vec![Arc::new(StringArray::from(names))]).unwrap()
+        RecordBatch::try_new(schema, vec![Arc::new(StringArray::from(names))])
+            .expect("show sources: schema matches columns")
     }
 
     /// Build a SHOW SINKS metadata result.
@@ -630,7 +662,8 @@ impl LaminarDB {
             DataType::Utf8,
             false,
         )]));
-        RecordBatch::try_new(schema, vec![Arc::new(StringArray::from(names))]).unwrap()
+        RecordBatch::try_new(schema, vec![Arc::new(StringArray::from(names))])
+            .expect("show sinks: schema matches columns")
     }
 
     /// Build a SHOW QUERIES metadata result.
@@ -652,7 +685,7 @@ impl LaminarDB {
                 Arc::new(BooleanArray::from(actives)),
             ],
         )
-        .unwrap()
+        .expect("show queries: schema matches columns")
     }
 
     /// Build a DESCRIBE result.
@@ -687,7 +720,7 @@ impl LaminarDB {
             Field::new("nullable", DataType::Boolean, false),
         ]));
 
-        Ok(RecordBatch::try_new(
+        RecordBatch::try_new(
             result_schema,
             vec![
                 Arc::new(StringArray::from(names_ref)),
@@ -695,7 +728,7 @@ impl LaminarDB {
                 Arc::new(BooleanArray::from(col_nullable)),
             ],
         )
-        .unwrap())
+        .map_err(|e| DbError::InvalidOperation(format!("describe metadata: {e}")))
     }
 }
 

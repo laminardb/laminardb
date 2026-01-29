@@ -137,6 +137,10 @@ pub enum OperatorError {
     /// Processing error
     #[error("Processing failed: {0}")]
     ProcessingFailed(String),
+
+    /// Configuration error (e.g., missing required builder field)
+    #[error("Configuration error: {0}")]
+    ConfigError(String),
 }
 
 pub mod asof_join;

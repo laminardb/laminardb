@@ -75,6 +75,7 @@ pub struct SourceCatalog {
 
 impl SourceCatalog {
     /// Create a new empty catalog.
+    #[must_use]
     pub fn new(buffer_size: usize, backpressure: BackpressureStrategy) -> Self {
         Self {
             sources: RwLock::new(HashMap::new()),

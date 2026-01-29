@@ -176,6 +176,11 @@ mod tests {
         ]))
     }
 
+    /// Take the sender from a `ChannelStreamSource`, panicking if already taken.
+    fn take_test_sender(source: &ChannelStreamSource) -> super::bridge::BridgeSender {
+        source.take_sender().expect("sender already taken")
+    }
+
     fn test_batch(schema: &Arc<Schema>, ids: Vec<i64>, values: Vec<f64>) -> RecordBatch {
         RecordBatch::try_new(
             Arc::clone(schema),
@@ -204,7 +209,7 @@ mod tests {
 
         // Create source and take the sender (important for channel closure)
         let source = Arc::new(ChannelStreamSource::new(Arc::clone(&schema)));
-        let sender = source.take_sender().expect("sender available");
+        let sender = take_test_sender(&source);
         let provider = StreamingTableProvider::new("events", source);
         ctx.register_table("events", Arc::new(provider)).unwrap();
 
@@ -234,7 +239,7 @@ mod tests {
         let schema = test_schema();
 
         let source = Arc::new(ChannelStreamSource::new(Arc::clone(&schema)));
-        let sender = source.take_sender().expect("sender available");
+        let sender = take_test_sender(&source);
         let provider = StreamingTableProvider::new("events", source);
         ctx.register_table("events", Arc::new(provider)).unwrap();
 
@@ -259,7 +264,7 @@ mod tests {
         let schema = test_schema();
 
         let source = Arc::new(ChannelStreamSource::new(Arc::clone(&schema)));
-        let sender = source.take_sender().expect("sender available");
+        let sender = take_test_sender(&source);
         let provider = StreamingTableProvider::new("events", source);
         ctx.register_table("events", Arc::new(provider)).unwrap();
 
@@ -292,7 +297,7 @@ mod tests {
         let schema = test_schema();
 
         let source = Arc::new(ChannelStreamSource::new(Arc::clone(&schema)));
-        let sender = source.take_sender().expect("sender available");
+        let sender = take_test_sender(&source);
         let provider = StreamingTableProvider::new("events", source);
         ctx.register_table("events", Arc::new(provider)).unwrap();
 
@@ -322,7 +327,7 @@ mod tests {
         let schema = test_schema();
 
         let source = Arc::new(ChannelStreamSource::new(Arc::clone(&schema)));
-        let sender = source.take_sender().expect("sender available");
+        let sender = take_test_sender(&source);
         let provider = StreamingTableProvider::new("events", source);
         ctx.register_table("events", Arc::new(provider)).unwrap();
 
@@ -419,7 +424,7 @@ mod tests {
         ]));
 
         let source = Arc::new(ChannelStreamSource::new(Arc::clone(&schema)));
-        let sender = source.take_sender().expect("sender available");
+        let sender = take_test_sender(&source);
         let provider = StreamingTableProvider::new("events", source);
         ctx.register_table("events", Arc::new(provider)).unwrap();
 
@@ -513,7 +518,7 @@ mod tests {
         ]));
 
         let source = Arc::new(ChannelStreamSource::new(Arc::clone(&schema)));
-        let sender = source.take_sender().expect("sender available");
+        let sender = take_test_sender(&source);
         let provider = StreamingTableProvider::new("items", source);
         ctx.register_table("items", Arc::new(provider)).unwrap();
 
@@ -571,7 +576,7 @@ mod tests {
         ]));
 
         let source = Arc::new(ChannelStreamSource::new(Arc::clone(&schema)));
-        let sender = source.take_sender().expect("sender available");
+        let sender = take_test_sender(&source);
         let provider = StreamingTableProvider::new("events", source);
         ctx.register_table("events", Arc::new(provider)).unwrap();
 
