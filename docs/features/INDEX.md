@@ -7,10 +7,10 @@
 | Phase 1 | 12 | 0 | 0 | 0 | 12 |
 | Phase 1.5 | 1 | 0 | 0 | 0 | 1 |
 | Phase 2 | 34 | 0 | 0 | 0 | 34 |
-| Phase 3 | 21 | 13 | 0 | 0 | 8 |
+| Phase 3 | 28 | 20 | 0 | 0 | 8 |
 | Phase 4 | 11 | 11 | 0 | 0 | 0 |
 | Phase 5 | 10 | 10 | 0 | 0 | 0 |
-| **Total** | **89** | **34** | **0** | **0** | **55** |
+| **Total** | **96** | **41** | **0** | **0** | **55** |
 
 ## Status Legend
 
@@ -276,6 +276,27 @@ Ring 0: mmap + ChangelogBuffer (zero-alloc) ──▶ Ring 1: WAL + RocksDB ─�
 - Channel type is NEVER user-specified (auto-derived)
 - SPSC → MPSC upgrades automatically on `source.clone()`
 - Checkpointing is OPTIONAL (zero overhead when disabled)
+
+### DAG Pipeline
+
+> **NEW**: DAG pipeline with shared intermediate stages, fan-out/fan-in, zero-copy multicast.
+> See [DAG Pipeline Index](phase-3/dag/INDEX.md) for details.
+
+| ID | Feature | Priority | Status | Spec |
+|----|---------|----------|--------|------|
+| F-DAG-001 | Core DAG Topology | P0 | 📝 | [Link](phase-3/dag/F-DAG-001-core-topology.md) |
+| F-DAG-002 | Multicast & Routing | P0 | 📝 | [Link](phase-3/dag/F-DAG-002-multicast-routing.md) |
+| F-DAG-003 | DAG Executor | P0 | 📝 | [Link](phase-3/dag/F-DAG-003-dag-executor.md) |
+| F-DAG-004 | DAG Checkpointing | P1 | 📝 | [Link](phase-3/dag/F-DAG-004-dag-checkpointing.md) |
+| F-DAG-005 | SQL & MV Integration | P1 | 📝 | [Link](phase-3/dag/F-DAG-005-sql-mv-integration.md) |
+| F-DAG-006 | Connector Bridge | P1 | 📝 | [Link](phase-3/dag/F-DAG-006-connector-bridge.md) |
+| F-DAG-007 | Performance Validation | P2 | 📝 | [Link](phase-3/dag/F-DAG-007-performance-validation.md) |
+
+**Key Design Principles**:
+- Pre-computed routing table for O(1) hot path dispatch
+- Channel type auto-derived from topology (SPSC/SPMC/MPSC)
+- Zero-copy multicast via reference-counted slot buffers
+- Barrier-based checkpointing (Chandy-Lamport) through DAG edges
 
 ### External Connectors
 
