@@ -8,6 +8,19 @@
 **Date**: 2026-01-31
 
 ### What Was Accomplished
+- **Performance Optimization: Event.data → Arc<RecordBatch>** - COMPLETE
+  - Changed `Event.data` from owned `RecordBatch` to `Arc<RecordBatch>` for zero-copy multicast
+  - Added `Event::new(timestamp, batch)` constructor that wraps internally
+  - Updated ~100 construction sites across 35 files (operators, reactor, sinks, connectors, benchmarks)
+  - Multicast fan-out clone cost: O(columns) → O(1) (~2ns atomic increment)
+  - For 50-column schema with 4-way fan-out: ~200-1000ns → ~6ns per event
+  - Performance audit: no P0 hot path violations, no double-Arc, no unnecessary clones
+  - DAG executor multicast (`executor.rs:497`) now clones Arc instead of RecordBatch
+  - Benchmark PassthroughOperator correctly clones Arc in struct literal form
+  - All clippy clean with `-D warnings`, all 1709 tests pass
+  - Resolves open issue R3 from F-DAG-007 performance audit
+
+Previous session (2026-01-31):
 - **F-DAG-007: Performance Validation** - IMPLEMENTATION COMPLETE
   - `benches/dag_bench.rs`: 11 Criterion benchmarks in 5 groups (routing, multicast, executor latency, throughput, checkpoint/recovery)
   - `benches/dag_stress.rs`: 5 stress test scenarios (20-node mixed, 8-way fan-out, deep linear 10, diamond stateful, checkpoint under load with p99 latency)
@@ -88,7 +101,7 @@ Previous session (2026-01-28):
 3. F034: Connector SDK
 
 ### Open Issues
-- Performance audit R3 (medium): Consider wrapping Event.data in Arc<RecordBatch> to make multicast zero-allocation for wide schemas. Deferred — requires cross-codebase Event type change.
+- ~~Performance audit R3 (medium): Consider wrapping Event.data in Arc<RecordBatch> to make multicast zero-allocation for wide schemas.~~ ✅ RESOLVED — Event.data is now `Arc<RecordBatch>`, multicast clone is O(1).
 
 ---
 
