@@ -173,7 +173,7 @@ impl DagExecutor {
         for _ in 0..slot_count {
             operators.push(None);
             runtimes.push(Some(NodeRuntime::default()));
-            input_queues.push(VecDeque::new());
+            input_queues.push(VecDeque::with_capacity(16));
             sink_outputs.push(Vec::new());
             node_types.push(DagNodeType::StatelessOperator);
         }

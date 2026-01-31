@@ -112,3 +112,11 @@ harness = false
 [[bench]]
 name = "streaming_bench"
 harness = false
+
+[[bench]]
+name = "dag_bench"
+harness = false
+
+[[bench]]
+name = "dag_stress"
+harness = false
