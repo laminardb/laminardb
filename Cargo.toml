@@ -10,7 +10,6 @@ members = [
     "crates/laminar-server",
     "crates/laminar-derive",
     "crates/laminar-db",
-    "crates/laminardb",
 ]
 resolver = "2"
 

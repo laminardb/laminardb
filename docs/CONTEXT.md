@@ -71,7 +71,7 @@ Previous session (2026-01-28):
 ### Where We Left Off
 **Phase 3 Connectors & Integration: 19/29 features COMPLETE (66%)**
 - Streaming API core complete (F-STREAM-001 to F-STREAM-007, F-STREAM-013)
-- Developer API overhaul complete (laminar-derive, laminar-db, laminardb crates)
+- Developer API overhaul complete (laminar-derive, laminar-db crates)
 - DAG pipeline complete (F-DAG-001 to F-DAG-007)
 - Kafka Source Connector complete (F025)
 - Kafka Sink Connector complete (F026)
