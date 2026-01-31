@@ -130,6 +130,7 @@ pub async fn execute_streaming_sql(
                 query_plan: None,
             }))
         }
+        StreamingPlan::DagExplain(_) => Ok(StreamingSqlResult::Ddl(DdlResult { plan })),
     }
 }
 

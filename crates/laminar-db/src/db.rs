@@ -379,6 +379,9 @@ impl LaminarDB {
                     laminar_sql::planner::StreamingPlan::Standard(_) => {
                         rows.push(("execution".into(), "DataFusion pass-through".into()));
                     }
+                    laminar_sql::planner::StreamingPlan::DagExplain(output) => {
+                        rows.push(("dag_topology".into(), output.topology_text.clone()));
+                    }
                 }
             }
             Err(e) => {
@@ -451,6 +454,12 @@ impl LaminarDB {
                 let stream = df.execute_stream().await?;
 
                 Ok(self.bridge_query_stream(sql, stream))
+            }
+            laminar_sql::planner::StreamingPlan::DagExplain(output) => {
+                Ok(ExecuteResult::Ddl(DdlInfo {
+                    statement_type: "EXPLAIN DAG".to_string(),
+                    object_name: output.topology_text,
+                }))
             }
         }
     }

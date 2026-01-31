@@ -76,4 +76,8 @@ pub enum DagError {
         /// Description of the failure.
         reason: String,
     },
+
+    /// A base table schema was not provided for DAG construction from `MvRegistry`.
+    #[error("base table schema not found: {0}")]
+    BaseTableSchemaNotFound(String),
 }

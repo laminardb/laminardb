@@ -16,7 +16,9 @@ use crate::parser::{
     CreateSinkStatement, CreateSourceStatement, EmitClause, SinkFrom, StreamingStatement,
     WindowFunction, WindowRewriter,
 };
-use crate::translator::{JoinOperatorConfig, OrderOperatorConfig, WindowOperatorConfig};
+use crate::translator::{
+    DagExplainOutput, JoinOperatorConfig, OrderOperatorConfig, WindowOperatorConfig,
+};
 
 /// Streaming query planner
 pub struct StreamingPlanner {
@@ -63,6 +65,9 @@ pub enum StreamingPlan {
 
     /// Standard SQL statement (pass-through to DataFusion)
     Standard(Box<Statement>),
+
+    /// DAG topology explanation (from EXPLAIN DAG)
+    DagExplain(DagExplainOutput),
 }
 
 /// A query plan with streaming operator configurations

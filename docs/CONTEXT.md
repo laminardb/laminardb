@@ -8,6 +8,19 @@
 **Date**: 2026-01-31
 
 ### What Was Accomplished
+- **F-DAG-005: SQL & MV Integration** - IMPLEMENTATION COMPLETE (18 new tests, 100 total DAG tests + 2 SQL tests)
+  - `dag/watermark.rs`: DagWatermarkTracker — Vec-indexed O(1) propagation, min-semantics at fan-in, checkpoint/restore (5 tests)
+  - `dag/changelog.rs`: DagChangelogPropagator — per-node ChangelogBuffer management, global/per-node enable, drain/record (4 tests)
+  - `dag/topology.rs`: `StreamingDag::from_mv_registry()` — automatic DAG construction from MvRegistry + base table schemas (6 tests)
+  - `dag/error.rs`: `BaseTableSchemaNotFound` variant
+  - `dag/mod.rs`: New module exports
+  - `mv/registry.rs`: `base_tables()` accessor
+  - `translator/dag_planner.rs`: `format_dag_explain()` + `DagExplainOutput` struct (2 tests)
+  - `planner/mod.rs`: `DagExplain` variant in `StreamingPlan`
+  - `translator/mod.rs`: `dag_planner` module export
+  - All clippy clean with `-D warnings`
+
+Previous session (2026-01-31):
 - **F027B: PostgreSQL Sink** - IMPLEMENTATION COMPLETE (84 new tests, 155 total connector tests with postgres-sink)
   - `postgres/types.rs`: Arrow→PG type mapping — DDL types, UNNEST array casts, SQL types (12 tests)
   - `postgres/sink_config.rs`: PostgresSinkConfig with WriteMode, DeliveryGuarantee, SslMode enums, validation, ConnectorConfig parsing (20 tests)
@@ -44,24 +57,25 @@ Previous session (2026-01-28):
 - Performance Audit: ALL 10 issues fixed
 - F074-F077: Aggregation Semantics Enhancement - COMPLETE (219 tests)
 
-**Total tests**: 1666 base + 84 postgres-sink + 107 postgres-cdc + 118 kafka = 1975 (1082 core + 365 sql + 120 storage + 28 laminar-db + 155 connectors-base-with-pg-sink + 107 postgres-cdc-only + 118 kafka-only)
+**Total tests**: 1684 base + 84 postgres-sink + 107 postgres-cdc + 118 kafka = 1993 (1098 core + 367 sql + 120 storage + 28 laminar-db + 155 connectors-base-with-pg-sink + 107 postgres-cdc-only + 118 kafka-only)
 
 ### Where We Left Off
-**Phase 3 Connectors & Integration: 16/29 features COMPLETE (55%)**
+**Phase 3 Connectors & Integration: 17/29 features COMPLETE (59%)**
 - Streaming API core complete (F-STREAM-001 to F-STREAM-007, F-STREAM-013)
 - Developer API overhaul complete (laminar-derive, laminar-db, laminardb crates)
-- DAG pipeline complete (F-DAG-001, F-DAG-002, F-DAG-003, F-DAG-004)
+- DAG pipeline complete (F-DAG-001 to F-DAG-005)
 - Kafka Source Connector complete (F025)
 - Kafka Sink Connector complete (F026)
 - PostgreSQL CDC Source complete (F027) — 107 tests, full pgoutput decoder
 - PostgreSQL Sink complete (F027B) — 84 tests, COPY BINARY + upsert + exactly-once
+- SQL & MV Integration complete (F-DAG-005) — 18 new tests, DAG from MvRegistry, watermarks, changelog
 - Next: F031 Delta Lake Sink or F028 MySQL CDC Source
 
 ### Immediate Next Steps
 1. F031: Delta Lake Sink
 2. F028: MySQL CDC Source
-3. F-DAG-005: SQL & MV Integration
-4. F034: Connector SDK
+3. F034: Connector SDK
+4. F-DAG-006: Connector Bridge
 
 ### Open Issues
 None.

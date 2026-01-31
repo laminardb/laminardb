@@ -1,11 +1,14 @@
-//! Unit tests for DAG topology, builder, multicast, routing, executor, and checkpointing.
+//! Unit tests for DAG topology, builder, multicast, routing, executor, checkpointing,
+//! MV integration, watermark tracking, and changelog propagation.
 
 use std::sync::Arc;
 
 use arrow_array::{Int64Array, RecordBatch};
-use arrow_schema::{DataType, Field, Schema};
+use arrow_schema::{DataType, Field, Schema, SchemaRef};
+use fxhash::FxHashMap;
 
 use super::builder::DagBuilder;
+use super::changelog::DagChangelogPropagator;
 use super::checkpoint::{
     AlignmentResult, BarrierAligner, BarrierType, CheckpointBarrier, DagCheckpointConfig,
     DagCheckpointCoordinator,
@@ -16,6 +19,9 @@ use super::multicast::MulticastBuffer;
 use super::recovery::{DagCheckpointSnapshot, DagRecoveryManager, SerializableOperatorState};
 use super::routing::{RoutingEntry, RoutingTable};
 use super::topology::*;
+use super::watermark::DagWatermarkTracker;
+use crate::mv::{MaterializedView, MvRegistry};
+use crate::operator::changelog::ChangelogRef;
 use crate::operator::{
     Event, Operator, OperatorContext, OperatorError, OperatorState, Output, OutputVec, Timer,
 };
@@ -2206,4 +2212,541 @@ fn test_full_checkpoint_recovery_cycle() {
     let outputs = executor2.take_sink_outputs(snk_id);
     assert_eq!(outputs.len(), 1);
     assert_eq!(event_value(&outputs[0]), 20); // 10 * 2
+}
+
+// ===========================================================================
+// F-DAG-005: SQL & MV Integration tests
+// ===========================================================================
+
+/// Helper: create a simple MV registry with base tables and schemas map.
+fn make_mv_schema() -> SchemaRef {
+    Arc::new(Schema::new(vec![Field::new(
+        "value",
+        DataType::Int64,
+        false,
+    )]))
+}
+
+fn make_base_schemas(names: &[&str]) -> FxHashMap<String, SchemaRef> {
+    let schema = make_mv_schema();
+    names
+        .iter()
+        .map(|n| (n.to_string(), schema.clone()))
+        .collect()
+}
+
+// ---- from_mv_registry tests ----
+
+#[test]
+fn test_dag_from_mv_registry_linear() {
+    // trades -> ohlc_1s -> ohlc_1m (linear chain)
+    let mut registry = MvRegistry::new();
+    registry.register_base_table("trades");
+
+    let schema = make_mv_schema();
+    registry
+        .register(MaterializedView::new(
+            "ohlc_1s",
+            "SELECT ...",
+            vec!["trades".into()],
+            schema.clone(),
+        ))
+        .unwrap();
+    registry
+        .register(MaterializedView::new(
+            "ohlc_1m",
+            "SELECT ...",
+            vec!["ohlc_1s".into()],
+            schema,
+        ))
+        .unwrap();
+
+    let base_schemas = make_base_schemas(&["trades"]);
+    let dag = StreamingDag::from_mv_registry(&registry, &base_schemas).unwrap();
+
+    assert_eq!(dag.node_count(), 3); // trades, ohlc_1s, ohlc_1m
+    assert_eq!(dag.edge_count(), 2);
+    assert_eq!(dag.sources().len(), 1);
+    assert!(dag.is_finalized());
+
+    // Verify topological order
+    let order = dag.execution_order();
+    let pos =
+        |name: &str| order.iter().position(|&id| dag.node_name(id).unwrap() == name).unwrap();
+    assert!(pos("trades") < pos("ohlc_1s"));
+    assert!(pos("ohlc_1s") < pos("ohlc_1m"));
+
+    // Node types
+    let trades_id = dag.node_id_by_name("trades").unwrap();
+    assert_eq!(dag.node(trades_id).unwrap().node_type, DagNodeType::Source);
+    let ohlc_id = dag.node_id_by_name("ohlc_1s").unwrap();
+    assert_eq!(
+        dag.node(ohlc_id).unwrap().node_type,
+        DagNodeType::MaterializedView
+    );
+}
+
+#[test]
+fn test_dag_from_mv_registry_fan_out() {
+    // trades -> {vwap, anomaly, position} (fan-out, SPMC)
+    let mut registry = MvRegistry::new();
+    registry.register_base_table("trades");
+
+    let schema = make_mv_schema();
+    for name in &["vwap", "anomaly", "position"] {
+        registry
+            .register(MaterializedView::new(
+                *name,
+                "SELECT ...",
+                vec!["trades".into()],
+                schema.clone(),
+            ))
+            .unwrap();
+    }
+
+    let base_schemas = make_base_schemas(&["trades"]);
+    let dag = StreamingDag::from_mv_registry(&registry, &base_schemas).unwrap();
+
+    assert_eq!(dag.node_count(), 4); // trades + 3 MVs
+    assert_eq!(dag.edge_count(), 3);
+
+    // trades has fan-out > 1, so it should be a shared stage
+    let trades_id = dag.node_id_by_name("trades").unwrap();
+    assert!(dag.shared_stages().contains_key(&trades_id));
+    assert_eq!(dag.shared_stages()[&trades_id].consumer_count, 3);
+
+    // Edges from trades should be SPMC
+    let trades_node = dag.node(trades_id).unwrap();
+    for &eid in &trades_node.outputs {
+        assert_eq!(dag.edge(eid).unwrap().channel_type, DagChannelType::Spmc);
+    }
+}
+
+#[test]
+fn test_dag_from_mv_registry_empty() {
+    let registry = MvRegistry::new();
+    let base_schemas = FxHashMap::default();
+    let result = StreamingDag::from_mv_registry(&registry, &base_schemas);
+    assert!(matches!(result, Err(DagError::EmptyDag)));
+}
+
+#[test]
+fn test_dag_from_mv_registry_single_mv() {
+    let mut registry = MvRegistry::new();
+    registry.register_base_table("events");
+
+    let schema = make_mv_schema();
+    registry
+        .register(MaterializedView::new(
+            "count_mv",
+            "SELECT COUNT(*) FROM events",
+            vec!["events".into()],
+            schema,
+        ))
+        .unwrap();
+
+    let base_schemas = make_base_schemas(&["events"]);
+    let dag = StreamingDag::from_mv_registry(&registry, &base_schemas).unwrap();
+
+    assert_eq!(dag.node_count(), 2);
+    assert_eq!(dag.edge_count(), 1);
+    assert_eq!(dag.sources().len(), 1);
+}
+
+#[test]
+fn test_dag_from_mv_registry_diamond() {
+    //       source
+    //       /    \
+    //      a      b
+    //       \    /
+    //         c
+    let mut registry = MvRegistry::new();
+    registry.register_base_table("source");
+
+    let schema = make_mv_schema();
+    registry
+        .register(MaterializedView::new(
+            "a",
+            "SELECT ...",
+            vec!["source".into()],
+            schema.clone(),
+        ))
+        .unwrap();
+    registry
+        .register(MaterializedView::new(
+            "b",
+            "SELECT ...",
+            vec!["source".into()],
+            schema.clone(),
+        ))
+        .unwrap();
+    registry
+        .register(MaterializedView::new(
+            "c",
+            "SELECT ...",
+            vec!["a".into(), "b".into()],
+            schema,
+        ))
+        .unwrap();
+
+    let base_schemas = make_base_schemas(&["source"]);
+    let dag = StreamingDag::from_mv_registry(&registry, &base_schemas).unwrap();
+
+    assert_eq!(dag.node_count(), 4); // source, a, b, c
+    assert_eq!(dag.edge_count(), 4); // source->a, source->b, a->c, b->c
+
+    // c is a fan-in node: edges to it should be MPSC
+    let c_id = dag.node_id_by_name("c").unwrap();
+    let c_node = dag.node(c_id).unwrap();
+    assert_eq!(c_node.inputs.len(), 2);
+    for &eid in &c_node.inputs {
+        assert_eq!(dag.edge(eid).unwrap().channel_type, DagChannelType::Mpsc);
+    }
+
+    // source has fan-out > 1: shared stage with SPMC edges
+    let source_id = dag.node_id_by_name("source").unwrap();
+    assert!(dag.shared_stages().contains_key(&source_id));
+}
+
+#[test]
+fn test_dag_from_mv_registry_missing_schema() {
+    let mut registry = MvRegistry::new();
+    registry.register_base_table("trades");
+
+    let schema = make_mv_schema();
+    registry
+        .register(MaterializedView::new(
+            "ohlc",
+            "SELECT ...",
+            vec!["trades".into()],
+            schema,
+        ))
+        .unwrap();
+
+    // Empty schemas map — should fail
+    let base_schemas = FxHashMap::default();
+    let result = StreamingDag::from_mv_registry(&registry, &base_schemas);
+    assert!(matches!(result, Err(DagError::BaseTableSchemaNotFound(_))));
+}
+
+// ---- DagWatermarkTracker tests ----
+
+#[test]
+fn test_watermark_linear_propagation() {
+    // src -> a -> b (linear chain)
+    let schema = int_schema();
+    let dag = DagBuilder::new()
+        .source("src", schema.clone())
+        .operator("a", schema.clone())
+        .sink_for("a", "b", schema.clone())
+        .connect("src", "a")
+        .build()
+        .unwrap();
+
+    let src_id = dag.node_id_by_name("src").unwrap();
+    let a_id = dag.node_id_by_name("a").unwrap();
+    let b_id = dag.node_id_by_name("b").unwrap();
+
+    let mut tracker = DagWatermarkTracker::from_dag(&dag);
+
+    // Initially no watermarks
+    assert_eq!(tracker.get_watermark(src_id), None);
+    assert_eq!(tracker.get_watermark(a_id), None);
+
+    // Update source watermark
+    let updated = tracker.update_watermark(src_id, 1000);
+    assert!(!updated.is_empty());
+
+    // Source watermark should be set
+    assert_eq!(tracker.get_watermark(src_id), Some(1000));
+
+    // Downstream nodes should have propagated watermark
+    assert_eq!(tracker.get_watermark(a_id), Some(1000));
+    assert_eq!(tracker.get_watermark(b_id), Some(1000));
+}
+
+#[test]
+fn test_watermark_fan_in_min() {
+    // {src_a, src_b} -> merge -> snk
+    let schema = int_schema();
+    let dag = DagBuilder::new()
+        .source("src_a", schema.clone())
+        .source("src_b", schema.clone())
+        .operator("merge", schema.clone())
+        .sink_for("merge", "snk", schema.clone())
+        .connect("src_a", "merge")
+        .connect("src_b", "merge")
+        .build()
+        .unwrap();
+
+    let src_a = dag.node_id_by_name("src_a").unwrap();
+    let src_b = dag.node_id_by_name("src_b").unwrap();
+    let merge_id = dag.node_id_by_name("merge").unwrap();
+
+    let mut tracker = DagWatermarkTracker::from_dag(&dag);
+
+    // Only src_a advances — merge should NOT advance (src_b is unset)
+    tracker.update_watermark(src_a, 1000);
+    assert_eq!(tracker.get_watermark(merge_id), None);
+
+    // Now src_b advances — merge should get min(1000, 500) = 500
+    tracker.update_watermark(src_b, 500);
+    assert_eq!(tracker.get_watermark(merge_id), Some(500));
+
+    // Advance src_b past src_a — merge should stay at 1000 (limited by src_a)
+    tracker.update_watermark(src_b, 2000);
+    assert_eq!(tracker.get_watermark(merge_id), Some(1000));
+}
+
+#[test]
+fn test_watermark_fan_out_forward() {
+    // src -> {a, b} -> {sink_a, sink_b}
+    let schema = int_schema();
+    let dag = DagBuilder::new()
+        .source("src", schema.clone())
+        .operator("a", schema.clone())
+        .operator("b", schema.clone())
+        .sink_for("a", "sink_a", schema.clone())
+        .sink_for("b", "sink_b", schema.clone())
+        .connect("src", "a")
+        .connect("src", "b")
+        .build()
+        .unwrap();
+
+    let src_id = dag.node_id_by_name("src").unwrap();
+    let a_id = dag.node_id_by_name("a").unwrap();
+    let b_id = dag.node_id_by_name("b").unwrap();
+
+    let mut tracker = DagWatermarkTracker::from_dag(&dag);
+    tracker.update_watermark(src_id, 5000);
+
+    // Both branches should receive the watermark
+    assert_eq!(tracker.get_watermark(a_id), Some(5000));
+    assert_eq!(tracker.get_watermark(b_id), Some(5000));
+}
+
+#[test]
+fn test_watermark_independent_branches() {
+    // src_a -> branch_a -> sink_a
+    // src_b -> branch_b -> sink_b
+    let schema = int_schema();
+    let dag = DagBuilder::new()
+        .source("src_a", schema.clone())
+        .source("src_b", schema.clone())
+        .operator("branch_a", schema.clone())
+        .operator("branch_b", schema.clone())
+        .sink_for("branch_a", "sink_a", schema.clone())
+        .sink_for("branch_b", "sink_b", schema.clone())
+        .connect("src_a", "branch_a")
+        .connect("src_b", "branch_b")
+        .build()
+        .unwrap();
+
+    let src_a = dag.node_id_by_name("src_a").unwrap();
+    let src_b = dag.node_id_by_name("src_b").unwrap();
+    let branch_a = dag.node_id_by_name("branch_a").unwrap();
+    let branch_b = dag.node_id_by_name("branch_b").unwrap();
+
+    let mut tracker = DagWatermarkTracker::from_dag(&dag);
+
+    tracker.update_watermark(src_a, 1000);
+    tracker.update_watermark(src_b, 5000);
+
+    // Each branch has its own independent watermark
+    assert_eq!(tracker.get_watermark(branch_a), Some(1000));
+    assert_eq!(tracker.get_watermark(branch_b), Some(5000));
+}
+
+#[test]
+fn test_watermark_checkpoint_restore() {
+    let schema = int_schema();
+    let dag = DagBuilder::new()
+        .source("src", schema.clone())
+        .operator("op", schema.clone())
+        .sink_for("op", "snk", schema.clone())
+        .connect("src", "op")
+        .build()
+        .unwrap();
+
+    let src_id = dag.node_id_by_name("src").unwrap();
+    let op_id = dag.node_id_by_name("op").unwrap();
+
+    let mut tracker = DagWatermarkTracker::from_dag(&dag);
+    tracker.update_watermark(src_id, 3000);
+
+    // Checkpoint
+    let checkpoint = tracker.checkpoint();
+
+    // Create a fresh tracker and restore
+    let mut tracker2 = DagWatermarkTracker::from_dag(&dag);
+    assert_eq!(tracker2.get_watermark(src_id), None);
+
+    tracker2.restore(&checkpoint);
+    assert_eq!(tracker2.get_watermark(src_id), Some(3000));
+    assert_eq!(tracker2.get_watermark(op_id), Some(3000));
+}
+
+// ---- DagChangelogPropagator tests ----
+
+#[test]
+fn test_changelog_record_output() {
+    let schema = int_schema();
+    let dag = DagBuilder::new()
+        .source("src", schema.clone())
+        .operator("op", schema.clone())
+        .sink_for("op", "snk", schema.clone())
+        .connect("src", "op")
+        .build()
+        .unwrap();
+
+    let op_id = dag.node_id_by_name("op").unwrap();
+
+    let mut propagator = DagChangelogPropagator::from_dag(&dag, 1024);
+
+    // Record inserts and deletes
+    assert!(propagator.record(op_id, ChangelogRef::insert(0, 0)));
+    assert!(propagator.record(op_id, ChangelogRef::insert(0, 1)));
+    assert!(propagator.record(op_id, ChangelogRef::delete(0, 2)));
+
+    assert_eq!(propagator.pending_count(op_id), 3);
+    assert!(propagator.has_pending());
+
+    // Drain
+    let refs = propagator.drain_node(op_id);
+    assert_eq!(refs.len(), 3);
+    assert!(refs[0].is_insert());
+    assert!(refs[1].is_insert());
+    assert!(refs[2].is_delete());
+
+    // After drain, buffer should be empty
+    assert_eq!(propagator.pending_count(op_id), 0);
+    assert!(!propagator.has_pending());
+}
+
+#[test]
+fn test_changelog_drain() {
+    let schema = int_schema();
+    let dag = DagBuilder::new()
+        .source("src", schema.clone())
+        .operator("a", schema.clone())
+        .operator("b", schema.clone())
+        .sink_for("a", "sink_a", schema.clone())
+        .sink_for("b", "sink_b", schema.clone())
+        .connect("src", "a")
+        .connect("src", "b")
+        .build()
+        .unwrap();
+
+    let a_id = dag.node_id_by_name("a").unwrap();
+    let b_id = dag.node_id_by_name("b").unwrap();
+
+    let mut propagator = DagChangelogPropagator::from_dag(&dag, 1024);
+
+    propagator.record(a_id, ChangelogRef::insert(0, 0));
+    propagator.record(b_id, ChangelogRef::insert(0, 0));
+    propagator.record(b_id, ChangelogRef::insert(0, 1));
+
+    assert!(propagator.has_pending());
+
+    // drain_all clears everything
+    propagator.drain_all();
+    assert!(!propagator.has_pending());
+    assert_eq!(propagator.pending_count(a_id), 0);
+    assert_eq!(propagator.pending_count(b_id), 0);
+}
+
+#[test]
+fn test_changelog_disabled() {
+    let schema = int_schema();
+    let dag = DagBuilder::new()
+        .source("src", schema.clone())
+        .sink_for("src", "snk", schema.clone())
+        .build()
+        .unwrap();
+
+    let src_id = dag.node_id_by_name("src").unwrap();
+
+    // Disabled propagator
+    let mut propagator = DagChangelogPropagator::disabled(dag.node_count());
+
+    // Recording should return false (disabled)
+    assert!(!propagator.record(src_id, ChangelogRef::insert(0, 0)));
+    assert!(!propagator.has_pending());
+    assert_eq!(propagator.pending_count(src_id), 0);
+    assert!(!propagator.is_globally_enabled());
+
+    // Re-enable globally
+    propagator.set_globally_enabled(true);
+    // Still node-level disabled
+    assert!(!propagator.record(src_id, ChangelogRef::insert(0, 0)));
+
+    // Enable node
+    propagator.set_node_enabled(src_id, true);
+    // Now the buffer capacity is 0 (created with disabled()), so push returns false
+    assert!(!propagator.record(src_id, ChangelogRef::insert(0, 0)));
+}
+
+#[test]
+fn test_changelog_retraction() {
+    let schema = int_schema();
+    let dag = DagBuilder::new()
+        .source("src", schema.clone())
+        .operator("op", schema.clone())
+        .sink_for("op", "snk", schema.clone())
+        .connect("src", "op")
+        .build()
+        .unwrap();
+
+    let op_id = dag.node_id_by_name("op").unwrap();
+
+    let mut propagator = DagChangelogPropagator::from_dag(&dag, 1024);
+
+    // Record a retraction pair
+    assert!(propagator.record_retraction(op_id, 0, 5, 10));
+
+    // Should have 2 entries (update_before + update_after)
+    assert_eq!(propagator.pending_count(op_id), 2);
+
+    let refs = propagator.drain_node(op_id);
+    assert_eq!(refs.len(), 2);
+    // First is delete (old value), second is insert (new value)
+    assert!(refs[0].is_delete());
+    assert!(refs[1].is_insert());
+}
+
+// ---- Effective watermark tests ----
+
+#[test]
+fn test_watermark_effective_watermark() {
+    // {src_a, src_b} -> merge -> snk
+    let schema = int_schema();
+    let dag = DagBuilder::new()
+        .source("src_a", schema.clone())
+        .source("src_b", schema.clone())
+        .operator("merge", schema.clone())
+        .sink_for("merge", "snk", schema.clone())
+        .connect("src_a", "merge")
+        .connect("src_b", "merge")
+        .build()
+        .unwrap();
+
+    let src_a = dag.node_id_by_name("src_a").unwrap();
+    let src_b = dag.node_id_by_name("src_b").unwrap();
+    let merge_id = dag.node_id_by_name("merge").unwrap();
+
+    let mut tracker = DagWatermarkTracker::from_dag(&dag);
+
+    // Effective watermark for merge: None (neither input has watermark)
+    assert_eq!(tracker.effective_watermark(merge_id), None);
+
+    // Set src_a only — merge still None (src_b missing)
+    tracker.update_watermark(src_a, 1000);
+    assert_eq!(tracker.effective_watermark(merge_id), None);
+
+    // Set src_b — merge effective = min(1000, 500)
+    tracker.update_watermark(src_b, 500);
+    assert_eq!(tracker.effective_watermark(merge_id), Some(500));
+
+    // Source node effective watermark = own watermark
+    assert_eq!(tracker.effective_watermark(src_a), Some(1000));
 }

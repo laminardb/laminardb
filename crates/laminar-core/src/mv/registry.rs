@@ -315,6 +315,12 @@ impl MvRegistry {
         self.views.values()
     }
 
+    /// Returns the set of registered base tables.
+    #[must_use]
+    pub fn base_tables(&self) -> &FxHashSet<String> {
+        &self.base_tables
+    }
+
     /// Returns the full dependency chain for a view (including transitive).
     ///
     /// The chain is returned in topological order (dependencies first).

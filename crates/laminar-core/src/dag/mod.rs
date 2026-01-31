@@ -62,6 +62,7 @@
 //! ```
 
 pub mod builder;
+pub mod changelog;
 pub mod checkpoint;
 pub mod error;
 pub mod executor;
@@ -69,6 +70,7 @@ pub mod multicast;
 pub mod recovery;
 pub mod routing;
 pub mod topology;
+pub mod watermark;
 
 #[cfg(test)]
 mod tests;
@@ -90,3 +92,5 @@ pub use topology::{
     DagChannelType, DagEdge, DagNode, DagNodeType, EdgeId, NodeId, PartitioningStrategy,
     SharedStageMetadata, StatePartitionId, StreamingDag, MAX_FAN_OUT,
 };
+pub use changelog::DagChangelogPropagator;
+pub use watermark::{DagWatermarkCheckpoint, DagWatermarkTracker};

@@ -736,6 +736,69 @@ impl StreamingDag {
     }
 }
 
+impl StreamingDag {
+    /// Constructs a DAG from an `MvRegistry` and base table schemas.
+    ///
+    /// Creates a Source node for each base table and a `MaterializedView` node
+    /// for each MV, then connects them according to the registry's dependency
+    /// graph. The resulting DAG is finalized and ready for execution.
+    ///
+    /// # Arguments
+    ///
+    /// * `registry` - The MV registry with dependency information
+    /// * `base_table_schemas` - Schemas for each base table referenced by MVs
+    ///
+    /// # Errors
+    ///
+    /// Returns `DagError::EmptyDag` if the registry is empty and has no base tables.
+    /// Returns `DagError::BaseTableSchemaNotFound` if a base table schema is missing.
+    pub fn from_mv_registry(
+        registry: &crate::mv::MvRegistry,
+        base_table_schemas: &FxHashMap<String, SchemaRef>,
+    ) -> Result<Self, DagError> {
+        if registry.is_empty() && registry.base_tables().is_empty() {
+            return Err(DagError::EmptyDag);
+        }
+
+        let mut dag = Self::new();
+
+        // Add source nodes for base tables that are actually referenced by MVs
+        for base_table in registry.base_tables() {
+            let schema = base_table_schemas
+                .get(base_table)
+                .ok_or_else(|| DagError::BaseTableSchemaNotFound(base_table.clone()))?;
+            dag.add_node(base_table, DagNodeType::Source, schema.clone())?;
+        }
+
+        // Add MV nodes in topological order
+        for mv_name in registry.topo_order() {
+            let mv = registry
+                .get(mv_name)
+                .ok_or_else(|| DagError::NodeNotFound(mv_name.clone()))?;
+            dag.add_node(mv_name, DagNodeType::MaterializedView, mv.schema.clone())?;
+        }
+
+        // Connect edges: for each MV, connect its sources to it
+        for mv_name in registry.topo_order() {
+            let mv = registry
+                .get(mv_name)
+                .ok_or_else(|| DagError::NodeNotFound(mv_name.clone()))?;
+            let target_id = dag
+                .node_id_by_name(mv_name)
+                .ok_or_else(|| DagError::NodeNotFound(mv_name.clone()))?;
+            for source_name in &mv.sources {
+                let source_id = dag
+                    .node_id_by_name(source_name)
+                    .ok_or_else(|| DagError::NodeNotFound(source_name.clone()))?;
+                dag.add_edge(source_id, target_id)?;
+            }
+        }
+
+        dag.finalize()?;
+        Ok(dag)
+    }
+}
+
 impl Default for StreamingDag {
     fn default() -> Self {
         Self::new()
