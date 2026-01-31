@@ -378,7 +378,11 @@ fn convert_column(col: &ColumnDef) -> Result<ColumnDefinition, ParseError> {
 }
 
 /// Converts SQL data type to Arrow data type.
-fn sql_type_to_arrow(sql_type: &SqlDataType) -> Result<DataType, ParseError> {
+///
+/// # Errors
+///
+/// Returns `ParseError::ValidationError` for unsupported SQL data types.
+pub fn sql_type_to_arrow(sql_type: &SqlDataType) -> Result<DataType, ParseError> {
     match sql_type {
         // Integer types
         SqlDataType::TinyInt(_) => Ok(DataType::Int8),

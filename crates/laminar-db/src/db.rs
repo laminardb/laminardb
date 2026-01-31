@@ -560,13 +560,23 @@ impl LaminarDB {
             .columns
             .iter()
             .map(|col| {
-                let data_type = sql_utils::sql_type_to_arrow(&col.data_type);
+                let data_type =
+                    streaming_ddl::sql_type_to_arrow(&col.data_type).map_err(|e| {
+                        DbError::InvalidOperation(format!(
+                            "unsupported column type for '{}': {e}",
+                            col.name
+                        ))
+                    })?;
                 let nullable = !col.options.iter().any(|opt| {
                     matches!(opt.option, sqlparser::ast::ColumnOption::NotNull)
                 });
-                arrow::datatypes::Field::new(col.name.to_string(), data_type, nullable)
+                Ok(arrow::datatypes::Field::new(
+                    col.name.to_string(),
+                    data_type,
+                    nullable,
+                ))
             })
-            .collect();
+            .collect::<Result<Vec<_>, DbError>>()?;
 
         let schema = Arc::new(arrow::datatypes::Schema::new(fields));
 

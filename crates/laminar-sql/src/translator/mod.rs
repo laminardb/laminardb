@@ -22,6 +22,7 @@ pub use order_translator::{
 pub use streaming_ddl::{
     BackpressureStrategy as StreamingBackpressure, ColumnDefinition, SinkDefinition,
     SourceConfigOptions, SourceDefinition, WaitStrategy as StreamingWaitStrategy, WatermarkSpec,
+    sql_type_to_arrow,
 };
 pub use window_translator::{WindowOperatorConfig, WindowType};
 pub use dag_planner::{format_dag_explain, DagExplainOutput};

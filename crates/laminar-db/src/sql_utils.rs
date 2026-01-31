@@ -2,97 +2,92 @@
 
 use std::collections::HashMap;
 
+use sqlparser::dialect::GenericDialect;
+use sqlparser::tokenizer::{Token, Tokenizer};
+
 use crate::error::DbError;
+
+/// Build a byte-offset index for each line in `sql`.
+///
+/// Returns a `Vec` where entry `i` is the byte offset of the start of
+/// 1-based line `i+1`. Line 1 always starts at byte 0.
+fn build_line_starts(sql: &str) -> Vec<usize> {
+    let mut starts = vec![0usize];
+    for (i, b) in sql.bytes().enumerate() {
+        if b == b'\n' {
+            starts.push(i + 1);
+        }
+    }
+    starts
+}
+
+/// Convert a 1-based `(line, column)` from sqlparser's `Location` to a byte
+/// offset in `sql`.
+///
+/// sqlparser's `column` counts *characters* (via `Peekable<Chars>`), not
+/// bytes, so we walk with `char_indices()` for multi-byte correctness.
+fn location_to_byte_offset(sql: &str, line_starts: &[usize], line: u64, column: u64) -> usize {
+    let line_idx = usize::try_from(line).unwrap_or(1).saturating_sub(1);
+    let line_start = line_starts.get(line_idx).copied().unwrap_or(0);
+    let col_chars = usize::try_from(column).unwrap_or(1).saturating_sub(1); // 1-based → 0-based
+
+    // Walk `col_chars` characters from `line_start` to find the byte offset.
+    sql[line_start..]
+        .char_indices()
+        .nth(col_chars)
+        .map_or(sql.len(), |(byte_off, _)| line_start + byte_off)
+}
 
 /// Split a SQL string into individual statements on unquoted semicolons.
 ///
-/// Handles single-quoted strings, double-quoted strings, and `--` line comments.
+/// Uses the sqlparser tokenizer to correctly handle quoted strings,
+/// single-line comments (`--`), and block comments (`/* ... */`).
 /// Empty statements (whitespace/comments only) are skipped.
 pub fn split_statements(sql: &str) -> Vec<&str> {
-    let mut statements = Vec::new();
-    let bytes = sql.as_bytes();
-    let len = bytes.len();
-    let mut i = 0;
-    let mut start = 0;
+    let dialect = GenericDialect {};
+    // On tokenizer failure, return the whole string as one statement
+    // so that the downstream parser can produce a proper error.
+    let Ok(tokens) = Tokenizer::new(&dialect, sql).tokenize_with_location() else {
+        let trimmed = sql.trim();
+        if trimmed.is_empty() {
+            return Vec::new();
+        }
+        return vec![trimmed];
+    };
 
-    while i < len {
-        match bytes[i] {
-            b'\'' => {
-                // Single-quoted string — skip to closing quote
-                i += 1;
-                while i < len {
-                    if bytes[i] == b'\'' {
-                        if i + 1 < len && bytes[i + 1] == b'\'' {
-                            i += 2; // escaped quote ''
-                        } else {
-                            break;
-                        }
-                    } else {
-                        i += 1;
-                    }
-                }
-                i += 1; // skip closing quote
-            }
-            b'"' => {
-                // Double-quoted string — skip to closing quote
-                i += 1;
-                while i < len && bytes[i] != b'"' {
-                    i += 1;
-                }
-                i += 1; // skip closing quote
-            }
-            b'-' if i + 1 < len && bytes[i + 1] == b'-' => {
-                // Line comment — skip to end of line
-                i += 2;
-                while i < len && bytes[i] != b'\n' {
-                    i += 1;
-                }
-            }
-            b';' => {
-                let stmt = sql[start..i].trim();
-                if !stmt.is_empty() && !is_only_comments(stmt) {
+    let line_starts = build_line_starts(sql);
+    let mut statements = Vec::new();
+    let mut seg_start: usize = 0;
+    let mut has_significant = false;
+
+    for tws in &tokens {
+        if tws.token == Token::SemiColon {
+            if has_significant {
+                let end =
+                    location_to_byte_offset(sql, &line_starts, tws.span.start.line, tws.span.start.column);
+                let stmt = sql[seg_start..end].trim();
+                if !stmt.is_empty() {
                     statements.push(stmt);
                 }
-                start = i + 1;
-                i += 1;
             }
-            _ => {
-                i += 1;
-            }
+            let after_semi =
+                location_to_byte_offset(sql, &line_starts, tws.span.end.line, tws.span.end.column);
+            seg_start = after_semi;
+            has_significant = false;
+        } else if !matches!(tws.token, Token::Whitespace(_) | Token::EOF) {
+            has_significant = true;
         }
     }
 
-    // Trailing statement without semicolon
-    let stmt = sql[start..].trim();
-    if !stmt.is_empty() && !is_only_comments(stmt) {
-        statements.push(stmt);
+    // Trailing segment (no semicolon)
+    if has_significant {
+        let stmt = sql[seg_start..].trim();
+        if !stmt.is_empty() {
+            statements.push(stmt);
+        }
     }
 
     statements
-}
-
-/// Check if a string contains only whitespace and/or SQL comments.
-fn is_only_comments(s: &str) -> bool {
-    let mut i = 0;
-    let bytes = s.as_bytes();
-    let len = bytes.len();
-
-    while i < len {
-        match bytes[i] {
-            b' ' | b'\t' | b'\n' | b'\r' => {
-                i += 1;
-            }
-            b'-' if i + 1 < len && bytes[i + 1] == b'-' => {
-                // Skip to end of line
-                i += 2;
-                while i < len && bytes[i] != b'\n' {
-                    i += 1;
-                }
-            }
-            _ => return false,
-        }
-    }
-    true
 }
 
 /// Resolve `${VAR_NAME}` placeholders in a SQL string with values from the given map.
@@ -149,44 +144,6 @@ pub fn resolve_config_vars(
     }
 
     Ok(result)
-}
-
-
-// -- SQL type conversion helpers -----------------------------------------
-
-/// Convert a `sqlparser` SQL type to an Arrow `DataType`.
-///
-/// Covers the most commonly used SQL types. Unrecognized types fall back
-/// to `Utf8` so that they can still be stored as text.
-#[allow(clippy::cast_possible_truncation)] // SQL precision/scale values are small (< 38)
-pub fn sql_type_to_arrow(sql_type: &sqlparser::ast::DataType) -> arrow::datatypes::DataType {
-    use arrow::datatypes::DataType as AT;
-    use sqlparser::ast::DataType as ST;
-
-    match sql_type {
-        ST::Bool | ST::Boolean => AT::Boolean,
-        ST::TinyInt(_) => AT::Int8,
-        ST::SmallInt(_) | ST::Int16 => AT::Int16,
-        ST::Int(_) | ST::Integer(_) | ST::Int32 => AT::Int32,
-        ST::BigInt(_) | ST::Int64 | ST::Int8(_) => AT::Int64,
-        ST::Float(_) | ST::Real => AT::Float32,
-        ST::Double(_) | ST::DoublePrecision => AT::Float64,
-        ST::Timestamp(_, _) => {
-            AT::Timestamp(arrow::datatypes::TimeUnit::Microsecond, None)
-        }
-        ST::Date => AT::Date32,
-        ST::Decimal(info) | ST::Numeric(info) => match info {
-            sqlparser::ast::ExactNumberInfo::PrecisionAndScale(p, s) => {
-                AT::Decimal128(*p as u8, *s as i8)
-            }
-            sqlparser::ast::ExactNumberInfo::Precision(p) => {
-                AT::Decimal128(*p as u8, 0)
-            }
-            sqlparser::ast::ExactNumberInfo::None => AT::Decimal128(38, 10),
-        },
-        ST::Binary(_) | ST::Blob(_) => AT::Binary,
-        _ => AT::Utf8, // Varchar, Text, String, Char, JSON, JSONB, and fallback
-    }
 }
 
 // -- SQL value extraction helpers ----------------------------------------
@@ -421,6 +378,22 @@ mod tests {
     fn test_double_quoted_identifiers() {
         let stmts = split_statements(r#"SELECT "col;name" FROM t; SELECT 2"#);
         assert_eq!(stmts.len(), 2);
+    }
+
+    #[test]
+    fn test_block_comment_with_semicolon() {
+        // The old hand-rolled splitter couldn't handle /* ; */ — this is
+        // the primary motivation for switching to the tokenizer.
+        let stmts = split_statements("SELECT /* ; */ 1; SELECT 2");
+        assert_eq!(stmts.len(), 2);
+        assert_eq!(stmts[0], "SELECT /* ; */ 1");
+        assert_eq!(stmts[1], "SELECT 2");
+    }
+
+    #[test]
+    fn test_block_comment_only_segment() {
+        let stmts = split_statements("/* just a block comment */");
+        assert!(stmts.is_empty());
     }
 
     // ── resolve_config_vars tests ───────────────────────────────────
