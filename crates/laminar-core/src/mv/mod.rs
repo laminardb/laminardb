@@ -211,7 +211,7 @@ mod tests {
         ])
         .unwrap();
 
-        Event { timestamp, data: batch }
+        Event::new(timestamp, batch)
     }
 
     #[test]

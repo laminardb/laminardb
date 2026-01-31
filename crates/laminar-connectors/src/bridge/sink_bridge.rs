@@ -305,10 +305,7 @@ mod tests {
         let (mut executor, src_id, snk_id) = build_dag_and_executor(schema.clone());
 
         // Inject an event at the source so it flows to the sink
-        let event = Event {
-            timestamp: 1000,
-            data: test_batch(10),
-        };
+        let event = Event::new(1000, test_batch(10));
         executor.process_event(src_id, event).unwrap();
 
         let connector = MockSinkConnector::new();
@@ -384,10 +381,7 @@ mod tests {
         assert_eq!(bridge.current_epoch(), 1);
 
         // Write some data
-        let event = Event {
-            timestamp: 2000,
-            data: test_batch(5),
-        };
+        let event = Event::new(2000, test_batch(5));
         executor.process_event(src_id, event).unwrap();
         bridge.flush_outputs(&mut executor).await.unwrap();
 

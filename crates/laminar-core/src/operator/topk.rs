@@ -413,10 +413,7 @@ impl Operator for StreamingTopKOperator {
             ));
             self.entries.push(TopKEntry {
                 sort_key,
-                event: Event {
-                    timestamp,
-                    data: batch,
-                },
+                event: Event::new(timestamp, batch),
             });
         }
 
@@ -530,10 +527,7 @@ mod tests {
             vec![Arc::new(Float64Array::from(vec![price]))],
         )
         .unwrap();
-        Event {
-            timestamp,
-            data: batch,
-        }
+        Event::new(timestamp, batch)
     }
 
     fn make_event_i64(timestamp: i64, value: i64) -> Event {
@@ -547,10 +541,7 @@ mod tests {
             vec![Arc::new(Int64Array::from(vec![value]))],
         )
         .unwrap();
-        Event {
-            timestamp,
-            data: batch,
-        }
+        Event::new(timestamp, batch)
     }
 
     fn make_event_str(timestamp: i64, name: &str) -> Event {
@@ -564,10 +555,7 @@ mod tests {
             vec![Arc::new(StringArray::from(vec![name]))],
         )
         .unwrap();
-        Event {
-            timestamp,
-            data: batch,
-        }
+        Event::new(timestamp, batch)
     }
 
     fn make_multi_column_event(timestamp: i64, category: &str, price: f64) -> Event {
@@ -583,10 +571,7 @@ mod tests {
             ],
         )
         .unwrap();
-        Event {
-            timestamp,
-            data: batch,
-        }
+        Event::new(timestamp, batch)
     }
 
     fn create_topk(
@@ -688,10 +673,7 @@ mod tests {
             )],
         )
         .unwrap();
-        let event = Event {
-            timestamp: 1,
-            data: batch,
-        };
+        let event = Event::new(1, batch);
 
         let op = create_topk(
             3,
@@ -915,10 +897,7 @@ mod tests {
         let null_array = Int64Array::new_null(1);
         let batch =
             RecordBatch::try_new(schema, vec![Arc::new(null_array)]).unwrap();
-        let null_event = Event {
-            timestamp: 1,
-            data: batch,
-        };
+        let null_event = Event::new(1, batch);
 
         let val_event = make_event_i64(2, 100);
 
@@ -950,10 +929,7 @@ mod tests {
         let null_array = Int64Array::new_null(1);
         let batch =
             RecordBatch::try_new(schema, vec![Arc::new(null_array)]).unwrap();
-        let null_event = Event {
-            timestamp: 1,
-            data: batch,
-        };
+        let null_event = Event::new(1, batch);
 
         let val_event = make_event_i64(2, 100);
 

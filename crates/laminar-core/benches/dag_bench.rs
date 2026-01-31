@@ -79,10 +79,7 @@ fn make_event(timestamp: i64) -> Event {
     let array = Arc::new(Int64Array::from(vec![timestamp]));
     let batch =
         RecordBatch::try_new(int_schema(), vec![array as _]).unwrap();
-    Event {
-        timestamp,
-        data: batch,
-    }
+    Event::new(timestamp, batch)
 }
 
 /// Pre-allocates a pool of events. Event::clone() is cheap (Arc increments)

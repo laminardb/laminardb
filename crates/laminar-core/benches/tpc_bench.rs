@@ -25,14 +25,14 @@ use std::time::Duration;
 fn make_event(user_id: i64, timestamp: i64) -> Event {
     let user_ids = Arc::new(Int64Array::from(vec![user_id]));
     let batch = RecordBatch::try_from_iter(vec![("user_id", user_ids as _)]).unwrap();
-    Event { timestamp, data: batch }
+    Event::new(timestamp, batch)
 }
 
 /// Create a test event with string user_id (for hashing variety)
 fn make_event_string(user_id: &str, timestamp: i64) -> Event {
     let user_ids = Arc::new(StringArray::from(vec![user_id]));
     let batch = RecordBatch::try_from_iter(vec![("user_id", user_ids as _)]).unwrap();
-    Event { timestamp, data: batch }
+    Event::new(timestamp, batch)
 }
 
 // SPSC Queue Benchmarks

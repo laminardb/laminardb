@@ -550,10 +550,7 @@ where
         )
         .ok()?;
 
-        Some(Event {
-            timestamp: window_id.end,
-            data: batch,
-        })
+        Some(Event::new(window_id.end, batch))
     }
 
     /// Handles periodic timer expiration for intermediate emissions.
@@ -754,10 +751,7 @@ where
         let mut output = OutputVec::new();
         match batch {
             Ok(data) => {
-                let event = Event {
-                    timestamp: window_id.end,
-                    data,
-                };
+                let event = Event::new(window_id.end, data);
 
                 // F011B: Emit based on strategy
                 match &self.emit_strategy {
@@ -848,10 +842,7 @@ mod tests {
         )]));
         let batch =
             RecordBatch::try_new(schema, vec![Arc::new(Int64Array::from(vec![value]))]).unwrap();
-        Event {
-            timestamp,
-            data: batch,
-        }
+        Event::new(timestamp, batch)
     }
 
     fn create_test_context<'a>(

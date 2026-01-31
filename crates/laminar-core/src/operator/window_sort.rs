@@ -294,10 +294,7 @@ impl Operator for WindowLocalSortOperator {
                 ));
                 buffer.push(BufferedEvent {
                     sort_key: Vec::new(),
-                    event: Event {
-                        timestamp: ts,
-                        data: batch,
-                    },
+                    event: Event::new(ts, batch),
                 });
             }
             self.window_buffers.insert(window_start, buffer);
@@ -328,10 +325,7 @@ mod tests {
             vec![Arc::new(Float64Array::from(vec![price]))],
         )
         .unwrap();
-        Event {
-            timestamp,
-            data: batch,
-        }
+        Event::new(timestamp, batch)
     }
 
     fn make_event_i64(timestamp: i64, value: i64) -> Event {
@@ -345,10 +339,7 @@ mod tests {
             vec![Arc::new(Int64Array::from(vec![value]))],
         )
         .unwrap();
-        Event {
-            timestamp,
-            data: batch,
-        }
+        Event::new(timestamp, batch)
     }
 
     fn create_test_context<'a>(

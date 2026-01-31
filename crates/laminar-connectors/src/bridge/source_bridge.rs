@@ -146,10 +146,7 @@ impl DagSourceBridge {
             .map(|p| vec![(p.id.clone(), p.offset.clone())])
             .unwrap_or_default();
 
-        let event = Event {
-            timestamp,
-            data: batch.records,
-        };
+        let event = Event::new(timestamp, batch.records);
 
         executor
             .process_event(self.node_id, event)

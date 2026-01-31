@@ -276,10 +276,7 @@ impl Operator for WatermarkBoundedSortOperator {
             ));
             self.buffer.push(SortBufferEntry {
                 sort_key: Vec::new(),
-                event: Event {
-                    timestamp: ts,
-                    data: batch,
-                },
+                event: Event::new(ts, batch),
             });
         }
 
@@ -308,10 +305,7 @@ mod tests {
             vec![Arc::new(Int64Array::from(vec![value]))],
         )
         .unwrap();
-        Event {
-            timestamp,
-            data: batch,
-        }
+        Event::new(timestamp, batch)
     }
 
     fn make_event_f64(timestamp: i64, price: f64) -> Event {
@@ -325,10 +319,7 @@ mod tests {
             vec![Arc::new(Float64Array::from(vec![price]))],
         )
         .unwrap();
-        Event {
-            timestamp,
-            data: batch,
-        }
+        Event::new(timestamp, batch)
     }
 
     fn create_test_context<'a>(

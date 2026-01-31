@@ -752,10 +752,7 @@ impl TemporalJoinOperator {
             if record.table_version == version {
                 // Emit retraction (reconstruct the joined event and mark as retraction)
                 if let Ok(event_batch) = TableRow::deserialize_batch(&record.event_data) {
-                    let event = Event {
-                        timestamp: record.event_timestamp,
-                        data: event_batch,
-                    };
+                    let event = Event::new(record.event_timestamp, event_batch);
 
                     // Look up the old table row to reconstruct the join
                     if let Some(key_state) = self.table_state.get(key) {
@@ -804,10 +801,7 @@ impl TemporalJoinOperator {
         if let Some(key_state) = self.table_state.get(key) {
             for (event_ts, event_data) in &events_to_rejoin {
                 if let Ok(event_batch) = TableRow::deserialize_batch(event_data) {
-                    let event = Event {
-                        timestamp: *event_ts,
-                        data: event_batch,
-                    };
+                    let event = Event::new(*event_ts, event_batch);
                     if let Some(new_row) = key_state.lookup_at_time(*event_ts) {
                         if let Some(joined) = self.create_joined_event(&event, new_row) {
                             output.push(Output::Event(joined));
@@ -947,10 +941,7 @@ impl TemporalJoinOperator {
 
         let joined_batch = RecordBatch::try_new(Arc::clone(schema), columns).ok()?;
 
-        Some(Event {
-            timestamp: stream_event.timestamp,
-            data: joined_batch,
-        })
+        Some(Event::new(stream_event.timestamp, joined_batch))
     }
 
     /// Creates an unmatched event for left outer joins (with null table columns).
@@ -968,10 +959,7 @@ impl TemporalJoinOperator {
 
         let joined_batch = RecordBatch::try_new(Arc::clone(schema), columns).ok()?;
 
-        Some(Event {
-            timestamp: stream_event.timestamp,
-            data: joined_batch,
-        })
+        Some(Event::new(stream_event.timestamp, joined_batch))
     }
 
     /// Creates a null array of the given type and length.
@@ -1115,7 +1103,7 @@ mod tests {
             ],
         )
         .unwrap();
-        Event { timestamp, data: batch }
+        Event::new(timestamp, batch)
     }
 
     /// Creates a currency rate event for testing.
@@ -1134,7 +1122,7 @@ mod tests {
             ],
         )
         .unwrap();
-        Event { timestamp, data: batch }
+        Event::new(timestamp, batch)
     }
 
     fn create_test_context<'a>(

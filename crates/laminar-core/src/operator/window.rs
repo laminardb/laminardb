@@ -519,7 +519,7 @@ impl CdcOperation {
 /// # use arrow_schema::Schema;
 /// # let schema = Arc::new(Schema::empty());
 /// # let batch = RecordBatch::new_empty(schema);
-/// # let event = Event { timestamp: 0, data: batch.clone() };
+/// # let event = Event::new(0, batch.clone());
 /// # let old_event = event.clone();
 /// # let new_event = event.clone();
 ///
@@ -3383,10 +3383,7 @@ where
             ],
         ).ok()?;
 
-        Some(Event {
-            timestamp: window_id.end,
-            data: batch,
-        })
+        Some(Event::new(window_id.end, batch))
     }
 
     /// Handles periodic timer expiration for intermediate emissions.
@@ -3589,10 +3586,7 @@ where
         let mut output = OutputVec::new();
         match batch {
             Ok(data) => {
-                let event = Event {
-                    timestamp: window_id.end,
-                    data,
-                };
+                let event = Event::new(window_id.end, data);
 
                 // F011B: Emit based on strategy
                 match &self.emit_strategy {
@@ -3681,10 +3675,7 @@ mod tests {
         )]));
         let batch =
             RecordBatch::try_new(schema, vec![Arc::new(Int64Array::from(vec![value]))]).unwrap();
-        Event {
-            timestamp,
-            data: batch,
-        }
+        Event::new(timestamp, batch)
     }
 
     fn create_test_context<'a>(
@@ -4920,10 +4911,7 @@ mod tests {
             ],
         )
         .unwrap();
-        let event = Event {
-            timestamp: 1000,
-            data: batch,
-        };
+        let event = Event::new(1000, batch);
 
         let extracted = aggregator.extract(&event);
         assert_eq!(extracted, Some((100, 1000)));
@@ -4945,10 +4933,7 @@ mod tests {
             ],
         )
         .unwrap();
-        let event = Event {
-            timestamp: 1000,
-            data: batch,
-        };
+        let event = Event::new(1000, batch);
 
         let extracted = aggregator.extract(&event);
         assert_eq!(extracted, Some((100, 1000)));
@@ -4965,10 +4950,7 @@ mod tests {
         )]));
         let batch =
             RecordBatch::try_new(schema, vec![Arc::new(Int64Array::from(vec![100]))]).unwrap();
-        let event = Event {
-            timestamp: 1000,
-            data: batch,
-        };
+        let event = Event::new(1000, batch);
 
         assert_eq!(aggregator.extract(&event), None);
     }
@@ -5128,10 +5110,7 @@ mod tests {
             vec![Arc::new(arrow_array::Float64Array::from(values.to_vec()))],
         )
         .unwrap();
-        Event {
-            timestamp: 1000,
-            data: batch,
-        }
+        Event::new(1000, batch)
     }
 
     #[test]
@@ -5263,10 +5242,7 @@ mod tests {
             ],
         )
         .unwrap();
-        Event {
-            timestamp: 1000,
-            data: batch,
-        }
+        Event::new(1000, batch)
     }
 
     #[test]
@@ -5476,10 +5452,7 @@ mod tests {
             ],
         )
         .unwrap();
-        acc.add_event(&Event {
-            timestamp: 1000,
-            data: batch1,
-        });
+        acc.add_event(&Event::new(1000, batch1));
 
         // Trade 2: price=105.0 at t=2000
         let batch2 = RecordBatch::try_new(
@@ -5490,10 +5463,7 @@ mod tests {
             ],
         )
         .unwrap();
-        acc.add_event(&Event {
-            timestamp: 2000,
-            data: batch2,
-        });
+        acc.add_event(&Event::new(2000, batch2));
 
         // Trade 3: price=98.0 at t=3000
         let batch3 = RecordBatch::try_new(
@@ -5504,10 +5474,7 @@ mod tests {
             ],
         )
         .unwrap();
-        acc.add_event(&Event {
-            timestamp: 3000,
-            data: batch3,
-        });
+        acc.add_event(&Event::new(3000, batch3));
 
         // Trade 4: price=102.0 at t=4000
         let batch4 = RecordBatch::try_new(
@@ -5518,10 +5485,7 @@ mod tests {
             ],
         )
         .unwrap();
-        acc.add_event(&Event {
-            timestamp: 4000,
-            data: batch4,
-        });
+        acc.add_event(&Event::new(4000, batch4));
 
         let results = acc.results();
         // OHLC: Open=100, High=105, Low=98, Close=102, Count=4

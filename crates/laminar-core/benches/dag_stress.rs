@@ -106,10 +106,7 @@ fn make_event(timestamp: i64) -> Event {
     let array = Arc::new(Int64Array::from(vec![timestamp]));
     let batch =
         RecordBatch::try_new(int_schema(), vec![array as _]).unwrap();
-    Event {
-        timestamp,
-        data: batch,
-    }
+    Event::new(timestamp, batch)
 }
 
 fn register_passthrough(executor: &mut DagExecutor, dag: &StreamingDag) {

@@ -28,10 +28,7 @@ fn create_event(timestamp: i64, value: i64) -> Event {
     )]));
     let batch =
         RecordBatch::try_new(schema, vec![Arc::new(Int64Array::from(vec![value]))]).unwrap();
-    Event {
-        timestamp,
-        data: batch,
-    }
+    Event::new(timestamp, batch)
 }
 
 /// Benchmark passthrough event latency (baseline)

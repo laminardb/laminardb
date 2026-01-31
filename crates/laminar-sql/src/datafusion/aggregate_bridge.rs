@@ -396,7 +396,7 @@ mod tests {
             vec![Arc::new(Float64Array::from(values))],
         )
         .unwrap();
-        Event { timestamp: ts, data: batch }
+        Event::new(ts, batch)
     }
 
     fn int_event(ts: i64, values: Vec<i64>) -> Event {
@@ -410,7 +410,7 @@ mod tests {
             vec![Arc::new(Int64Array::from(values))],
         )
         .unwrap();
-        Event { timestamp: ts, data: batch }
+        Event::new(ts, batch)
     }
 
     fn two_col_float_event(ts: i64, col0: Vec<f64>, col1: Vec<f64>) -> Event {
@@ -426,7 +426,7 @@ mod tests {
             ],
         )
         .unwrap();
-        Event { timestamp: ts, data: batch }
+        Event::new(ts, batch)
     }
 
     // ── ScalarValue Conversion Tests ────────────────────────────────────

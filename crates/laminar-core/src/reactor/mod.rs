@@ -706,10 +706,7 @@ mod tests {
 
         let array = Arc::new(Int64Array::from(vec![1, 2, 3]));
         let batch = RecordBatch::try_from_iter(vec![("col1", array as _)]).unwrap();
-        let event = Event {
-            timestamp: 12345,
-            data: batch,
-        };
+        let event = Event::new(12345, batch);
 
         assert!(reactor.submit(event).is_ok());
         assert_eq!(reactor.queue_size(), 1);
@@ -726,10 +723,7 @@ mod tests {
         // Submit an event
         let array = Arc::new(Int64Array::from(vec![1, 2, 3]));
         let batch = RecordBatch::try_from_iter(vec![("col1", array as _)]).unwrap();
-        let event = Event {
-            timestamp: 12345,
-            data: batch,
-        };
+        let event = Event::new(12345, batch);
 
         reactor.submit(event.clone()).unwrap();
 
@@ -753,18 +747,12 @@ mod tests {
 
         // Fill the queue
         for i in 0..2 {
-            let event = Event {
-                timestamp: i64::from(i),
-                data: batch.clone(),
-            };
+            let event = Event::new(i64::from(i), batch.clone());
             assert!(reactor.submit(event).is_ok());
         }
 
         // Next submit should fail
-        let event = Event {
-            timestamp: 100,
-            data: batch,
-        };
+        let event = Event::new(100, batch);
         assert!(matches!(
             reactor.submit(event),
             Err(ReactorError::QueueFull { .. })
@@ -786,10 +774,7 @@ mod tests {
 
         // Submit 5 events
         for i in 0..5 {
-            let event = Event {
-                timestamp: i64::from(i),
-                data: batch.clone(),
-            };
+            let event = Event::new(i64::from(i), batch.clone());
             reactor.submit(event).unwrap();
         }
 
@@ -823,10 +808,7 @@ mod tests {
 
         let array = Arc::new(Int64Array::from(vec![42]));
         let batch = RecordBatch::try_from_iter(vec![("value", array as _)]).unwrap();
-        let event = Event {
-            timestamp: 1000,
-            data: batch,
-        };
+        let event = Event::new(1000, batch);
 
         // Submit an event
         reactor.submit(event).unwrap();
@@ -855,10 +837,7 @@ mod tests {
         // Submit some events
         for i in 0..5 {
             reactor
-                .submit(Event {
-                    timestamp: i * 1000,
-                    data: batch.clone(),
-                })
+                .submit(Event::new(i * 1000, batch.clone()))
                 .unwrap();
         }
 

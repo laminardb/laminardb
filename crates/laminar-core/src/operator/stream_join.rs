@@ -1726,10 +1726,7 @@ impl StreamJoinOperator {
 
         let joined_batch = self.concat_batches(&left_batch, &right_batch)?;
 
-        Some(Event {
-            timestamp: output_timestamp,
-            data: joined_batch,
-        })
+        Some(Event::new(output_timestamp, joined_batch))
     }
 
     /// Concatenates two batches horizontally.
@@ -1784,10 +1781,7 @@ impl StreamJoinOperator {
 
         let joined_batch = RecordBatch::try_new(Arc::clone(schema), columns).ok()?;
 
-        Some(Event {
-            timestamp: row.timestamp,
-            data: joined_batch,
-        })
+        Some(Event::new(row.timestamp, joined_batch))
     }
 
     /// Creates a null array of the given type and length.
@@ -2057,7 +2051,7 @@ mod tests {
             ],
         )
         .unwrap();
-        Event { timestamp, data: batch }
+        Event::new(timestamp, batch)
     }
 
     fn create_payment_event(timestamp: i64, order_id: &str, status: &str) -> Event {
@@ -2073,7 +2067,7 @@ mod tests {
             ],
         )
         .unwrap();
-        Event { timestamp, data: batch }
+        Event::new(timestamp, batch)
     }
 
     fn create_test_context<'a>(
@@ -2468,7 +2462,7 @@ mod tests {
                 ],
             )
             .unwrap();
-            Event { timestamp, data: batch }
+            Event::new(timestamp, batch)
         }
 
         let mut operator = StreamJoinOperator::with_id(

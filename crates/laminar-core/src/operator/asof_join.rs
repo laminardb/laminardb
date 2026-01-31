@@ -783,10 +783,7 @@ impl AsofJoinOperator {
 
         let joined_batch = RecordBatch::try_new(Arc::clone(schema), columns).ok()?;
 
-        Some(Event {
-            timestamp: left_event.timestamp,
-            data: joined_batch,
-        })
+        Some(Event::new(left_event.timestamp, joined_batch))
     }
 
     /// Creates an unmatched event for left outer joins (with null right columns).
@@ -804,10 +801,7 @@ impl AsofJoinOperator {
 
         let joined_batch = RecordBatch::try_new(Arc::clone(schema), columns).ok()?;
 
-        Some(Event {
-            timestamp: left_event.timestamp,
-            data: joined_batch,
-        })
+        Some(Event::new(left_event.timestamp, joined_batch))
     }
 
     /// Creates a null array of the given type and length.
@@ -920,7 +914,7 @@ mod tests {
             ],
         )
         .unwrap();
-        Event { timestamp, data: batch }
+        Event::new(timestamp, batch)
     }
 
     /// Creates a quote event for testing.
@@ -939,7 +933,7 @@ mod tests {
             ],
         )
         .unwrap();
-        Event { timestamp, data: batch }
+        Event::new(timestamp, batch)
     }
 
     fn create_test_context<'a>(

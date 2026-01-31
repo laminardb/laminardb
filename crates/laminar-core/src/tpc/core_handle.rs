@@ -783,10 +783,7 @@ mod tests {
     fn make_event(value: i64) -> Event {
         let array = Arc::new(Int64Array::from(vec![value]));
         let batch = RecordBatch::try_from_iter(vec![("value", array as _)]).unwrap();
-        Event {
-            timestamp: value,
-            data: batch,
-        }
+        Event::new(value, batch)
     }
 
     #[test]

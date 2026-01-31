@@ -40,10 +40,7 @@ impl Operator for PassthroughOperator {
 fn create_test_event(timestamp: i64) -> Event {
     let array = Arc::new(Int64Array::from(vec![timestamp]));
     let batch = RecordBatch::try_from_iter(vec![("value", array as _)]).unwrap();
-    Event {
-        timestamp,
-        data: batch,
-    }
+    Event::new(timestamp, batch)
 }
 
 /// Benchmark event submission

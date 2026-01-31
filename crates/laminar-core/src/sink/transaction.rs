@@ -553,10 +553,7 @@ mod tests {
 
         let array = Arc::new(Int64Array::from(vec![1, 2, 3]));
         let batch = RecordBatch::try_from_iter(vec![("col", array as _)]).unwrap();
-        let event = Event {
-            timestamp: 1000,
-            data: batch,
-        };
+        let event = Event::new(1000, batch);
 
         buffer.push(vec![Output::Event(event)]);
 

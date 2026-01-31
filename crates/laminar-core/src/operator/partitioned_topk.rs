@@ -450,10 +450,7 @@ impl Operator for PartitionedTopKOperator {
                 ));
                 entries.push(PartitionEntry {
                     sort_key,
-                    event: Event {
-                        timestamp,
-                        data: batch,
-                    },
+                    event: Event::new(timestamp, batch),
                 });
             }
 
@@ -487,10 +484,7 @@ mod tests {
             ],
         )
         .unwrap();
-        Event {
-            timestamp,
-            data: batch,
-        }
+        Event::new(timestamp, batch)
     }
 
     fn make_trade_int(timestamp: i64, category: &str, value: i64) -> Event {
@@ -506,10 +500,7 @@ mod tests {
             ],
         )
         .unwrap();
-        Event {
-            timestamp,
-            data: batch,
-        }
+        Event::new(timestamp, batch)
     }
 
     fn create_test_context<'a>(
@@ -934,10 +925,7 @@ mod tests {
             ],
         )
         .unwrap();
-        let null_event = Event {
-            timestamp: 1,
-            data: batch,
-        };
+        let null_event = Event::new(1, batch);
 
         let mut ctx = create_test_context(&mut timers, &mut state, &mut wm);
         op.process(&null_event, &mut ctx);

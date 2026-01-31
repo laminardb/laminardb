@@ -10,6 +10,8 @@
 //! All operators implement the `Operator` trait and can be composed into
 //! directed acyclic graphs (DAGs) for complex stream processing.
 
+use std::sync::Arc;
+
 use arrow_array::RecordBatch;
 use smallvec::SmallVec;
 
@@ -22,8 +24,22 @@ pub type TimerKey = SmallVec<[u8; 16]>;
 pub struct Event {
     /// Timestamp of the event
     pub timestamp: i64,
-    /// Event payload as Arrow `RecordBatch`
-    pub data: RecordBatch,
+    /// Event payload as Arrow `RecordBatch` wrapped in `Arc` for zero-copy multicast.
+    ///
+    /// Cloning an `Event` increments the `Arc` reference count (~2ns, O(1))
+    /// instead of copying all column `Arc` pointers (O(columns)).
+    pub data: Arc<RecordBatch>,
+}
+
+impl Event {
+    /// Create a new event, wrapping the batch in `Arc` for zero-copy sharing.
+    #[must_use]
+    pub fn new(timestamp: i64, data: RecordBatch) -> Self {
+        Self {
+            timestamp,
+            data: Arc::new(data),
+        }
+    }
 }
 
 /// Output from an operator
@@ -167,10 +183,7 @@ mod tests {
         let array = Arc::new(Int64Array::from(vec![1, 2, 3]));
         let batch = RecordBatch::try_from_iter(vec![("col1", array as _)]).unwrap();
 
-        let event = Event {
-            timestamp: 12345,
-            data: batch,
-        };
+        let event = Event::new(12345, batch);
 
         assert_eq!(event.timestamp, 12345);
         assert_eq!(event.data.num_rows(), 3);

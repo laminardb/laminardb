@@ -509,10 +509,7 @@ where
         )
         .ok()?;
 
-        Some(Event {
-            timestamp: session.end,
-            data: batch,
-        })
+        Some(Event::new(session.end, batch))
     }
 
     /// Finds overlapping sessions for potential merging.
@@ -761,7 +758,7 @@ mod tests {
         )]));
         let batch =
             RecordBatch::try_new(schema, vec![Arc::new(Int64Array::from(vec![value]))]).unwrap();
-        Event { timestamp, data: batch }
+        Event::new(timestamp, batch)
     }
 
     fn create_keyed_event(timestamp: i64, key: i64, value: i64) -> Event {
@@ -777,7 +774,7 @@ mod tests {
             ],
         )
         .unwrap();
-        Event { timestamp, data: batch }
+        Event::new(timestamp, batch)
     }
 
     fn create_test_context<'a>(

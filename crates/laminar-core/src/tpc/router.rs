@@ -410,7 +410,7 @@ mod tests {
             ("user_id", user_ids as _),
             ("name", names as _),
         ]).unwrap();
-        Event { timestamp, data: batch }
+        Event::new(timestamp, batch)
     }
 
     #[test]

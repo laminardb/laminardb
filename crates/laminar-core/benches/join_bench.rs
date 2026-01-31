@@ -34,10 +34,7 @@ fn create_join_event(key: &str, timestamp: i64, value: i64) -> Event {
         ],
     )
     .unwrap();
-    Event {
-        timestamp,
-        data: batch,
-    }
+    Event::new(timestamp, batch)
 }
 
 /// Benchmark stream-stream join throughput

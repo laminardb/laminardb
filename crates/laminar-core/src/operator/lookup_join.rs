@@ -744,10 +744,7 @@ impl LookupJoinOperator {
 
         let joined_batch = RecordBatch::try_new(Arc::clone(schema), columns).ok()?;
 
-        Some(Event {
-            timestamp: event.timestamp,
-            data: joined_batch,
-        })
+        Some(Event::new(event.timestamp, joined_batch))
     }
 
     /// Creates an unmatched event for left joins (with null lookup columns).
@@ -765,10 +762,7 @@ impl LookupJoinOperator {
 
         let joined_batch = RecordBatch::try_new(Arc::clone(schema), columns).ok()?;
 
-        Some(Event {
-            timestamp: event.timestamp,
-            data: joined_batch,
-        })
+        Some(Event::new(event.timestamp, joined_batch))
     }
 
     /// Creates a null array of the given type and length.
@@ -897,7 +891,7 @@ mod tests {
             ],
         )
         .unwrap();
-        Event { timestamp, data: batch }
+        Event::new(timestamp, batch)
     }
 
     fn create_customer_batch(id: &str, name: &str, tier: &str) -> RecordBatch {
@@ -1239,7 +1233,7 @@ mod tests {
                 ],
             )
             .unwrap();
-            Event { timestamp, data: batch }
+            Event::new(timestamp, batch)
         }
 
         fn create_int_key_lookup(key: i64, data: &str) -> RecordBatch {

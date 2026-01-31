@@ -425,7 +425,7 @@ mod tests {
     fn create_test_event(value: i64, timestamp: i64) -> Event {
         let array = Arc::new(Int64Array::from(vec![value]));
         let batch = RecordBatch::try_from_iter(vec![("value", array as _)]).unwrap();
-        Event { timestamp, data: batch }
+        Event::new(timestamp, batch)
     }
 
     fn create_context() -> (InMemoryStore, TimerService, BoundedOutOfOrdernessGenerator) {

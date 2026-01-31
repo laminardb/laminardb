@@ -855,7 +855,7 @@ mod tests {
         let batch = RecordBatch::try_from_iter(vec![
             ("user_id", user_ids as _),
         ]).unwrap();
-        Event { timestamp, data: batch }
+        Event::new(timestamp, batch)
     }
 
     #[test]
