@@ -91,6 +91,9 @@ async fn run_embedded_mode() -> Result<(), Box<dyn std::error::Error>> {
     let mut generator = MarketGenerator::new();
     let mut app = App::new();
 
+    // Capture pipeline topology for DAG view
+    app.set_topology(db.pipeline_topology());
+
     // Push initial batch so there's data right away
     let ts = chrono::Utc::now().timestamp_millis();
     let ticks = generator.generate_ticks(10, ts);
@@ -169,6 +172,9 @@ fn run_loop(
                         }
                         KeyCode::Char(' ') => {
                             app.paused = !app.paused;
+                        }
+                        KeyCode::Char('d') => {
+                            app.toggle_dag();
                         }
                         _ => {}
                     }
@@ -288,6 +294,7 @@ async fn run_kafka_mode() -> Result<(), Box<dyn std::error::Error>> {
     let anomaly_sub = db.subscribe::<AnomalyAlert>("anomaly_alerts")?;
 
     let mut app = App::new();
+    app.set_topology(db.pipeline_topology());
 
     enable_raw_mode()?;
     let mut stdout = io::stdout();
@@ -312,6 +319,7 @@ async fn run_kafka_mode() -> Result<(), Box<dyn std::error::Error>> {
                         KeyCode::Char('q') | KeyCode::Esc => break,
                         KeyCode::Tab => app.next_symbol(),
                         KeyCode::Char(' ') => app.paused = !app.paused,
+                        KeyCode::Char('d') => app.toggle_dag(),
                         _ => {}
                     }
                 }

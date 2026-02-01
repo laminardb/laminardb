@@ -20,8 +20,8 @@ LaminarDB's DAG pipeline enables complex streaming topologies with fan-out, fan-
 | Tier | Total | Draft | In Progress | Done |
 |------|-------|-------|-------------|------|
 | Core (P0) | 3 | 0 | 0 | 3 |
-| Integration (P1) | 3 | 3 | 0 | 0 |
-| Validation (P2) | 1 | 1 | 0 | 0 |
+| Integration (P1) | 4 | 1 | 0 | 3 |
+| Validation (P2) | 1 | 0 | 0 | 1 |
 
 ---
 
@@ -39,9 +39,10 @@ LaminarDB's DAG pipeline enables complex streaming topologies with fan-out, fan-
 
 | ID | Feature | Priority | Status | Spec |
 |----|---------|----------|--------|------|
-| F-DAG-004 | DAG Checkpointing | P1 | 📝 | [Link](F-DAG-004-dag-checkpointing.md) |
-| F-DAG-005 | SQL & MV Integration | P1 | 📝 | [Link](F-DAG-005-sql-mv-integration.md) |
-| F-DAG-006 | Connector Bridge | P1 | 📝 | [Link](F-DAG-006-connector-bridge.md) |
+| F-DAG-004 | DAG Checkpointing | P1 | ✅ | [Link](F-DAG-004-dag-checkpointing.md) |
+| F-DAG-005 | SQL & MV Integration | P1 | ✅ | [Link](F-DAG-005-sql-mv-integration.md) |
+| F-DAG-006 | Connector Bridge | P1 | ✅ | [Link](F-DAG-006-connector-bridge.md) |
+| F-DAG-008 | Pipeline Introspection | P1 | 📝 | [Link](F-DAG-008-pipeline-introspection.md) |
 
 ---
 
@@ -49,7 +50,7 @@ LaminarDB's DAG pipeline enables complex streaming topologies with fan-out, fan-
 
 | ID | Feature | Priority | Status | Spec |
 |----|---------|----------|--------|------|
-| F-DAG-007 | Performance Validation | P2 | 📝 | [Link](F-DAG-007-performance-validation.md) |
+| F-DAG-007 | Performance Validation | P2 | ✅ | [Link](F-DAG-007-performance-validation.md) |
 
 ---
 
@@ -82,7 +83,7 @@ F034 (Connector SDK) ──► F-DAG-006
 | ID | Feature | Priority | Status |
 |----|---------|----------|--------|
 | F-DAG-010 | Dynamic Topology | P2 | 📝 Idea |
-| F-DAG-011 | DAG Visualization (Web UI) | P2 | 📝 Idea |
+| F-DAG-011 | DAG Visualization (Web UI) | P2 | 📝 Idea (requires F-DAG-008) |
 | F-DAG-012 | Operator Fusion | P2 | 📝 Idea |
 | F-DAG-013 | Distributed DAG | P3 | 📝 Idea |
 

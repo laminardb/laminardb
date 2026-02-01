@@ -263,6 +263,11 @@ impl SourceCatalog {
         self.sinks.read().keys().cloned().collect()
     }
 
+    /// Get the input name for a registered sink.
+    pub fn get_sink_input(&self, name: &str) -> Option<String> {
+        self.sinks.read().get(name).map(|e| e.input.clone())
+    }
+
     /// Register a query and return its ID.
     pub(crate) fn register_query(&self, sql: &str) -> u64 {
         let id = self.next_query_id.fetch_add(1, Ordering::Relaxed);

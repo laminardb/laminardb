@@ -3,6 +3,8 @@
 use std::collections::{HashMap, VecDeque};
 use std::time::{Duration, Instant};
 
+use laminar_db::PipelineTopology;
+
 use crate::generator::SYMBOLS;
 use crate::types::{AnomalyAlert, OhlcBar, SpreadMetrics, VolumeMetrics};
 
@@ -36,6 +38,10 @@ pub struct App {
 
     // -- Alerts --
     pub alerts: VecDeque<AlertEntry>,
+
+    // -- DAG view --
+    pub show_dag: bool,
+    pub topology: Option<PipelineTopology>,
 
     // -- Previous anomaly state for threshold detection --
     prev_anomaly: HashMap<String, i64>,
@@ -73,6 +79,8 @@ impl App {
             price_history,
             selected_symbol_idx: 0,
             alerts: VecDeque::with_capacity(MAX_ALERTS),
+            show_dag: false,
+            topology: None,
             prev_anomaly: HashMap::new(),
         }
     }
@@ -80,6 +88,16 @@ impl App {
     /// Currently selected symbol name for sparkline display.
     pub fn selected_symbol(&self) -> &str {
         SYMBOLS[self.selected_symbol_idx].0
+    }
+
+    /// Toggle between dashboard and DAG view.
+    pub fn toggle_dag(&mut self) {
+        self.show_dag = !self.show_dag;
+    }
+
+    /// Set the pipeline topology for the DAG view.
+    pub fn set_topology(&mut self, topology: PipelineTopology) {
+        self.topology = Some(topology);
     }
 
     /// Cycle to next symbol for sparkline.

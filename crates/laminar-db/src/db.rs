@@ -934,6 +934,125 @@ impl LaminarDB {
             .collect()
     }
 
+    /// List all registered streams with their SQL definitions.
+    pub fn streams(&self) -> Vec<crate::handle::StreamInfo> {
+        let mgr = self.connector_manager.lock();
+        mgr.streams()
+            .iter()
+            .map(|(name, reg)| crate::handle::StreamInfo {
+                name: name.clone(),
+                sql: Some(reg.query_sql.clone()),
+            })
+            .collect()
+    }
+
+    /// Build the pipeline topology graph from registered sources, streams,
+    /// and sinks.
+    ///
+    /// Returns a [`PipelineTopology`] with nodes for every source, stream,
+    /// and sink, plus edges derived from stream SQL `FROM` references and
+    /// sink `input` fields.
+    pub fn pipeline_topology(&self) -> crate::handle::PipelineTopology {
+        use crate::handle::{PipelineEdge, PipelineNode, PipelineNodeType};
+
+        let mut nodes = Vec::new();
+        let mut edges = Vec::new();
+
+        // Collect source names for FROM matching
+        let source_names = self.catalog.list_sources();
+
+        // Source nodes
+        for name in &source_names {
+            let schema = self.catalog.get_source(name).map(|e| e.schema.clone());
+            nodes.push(PipelineNode {
+                name: name.clone(),
+                node_type: PipelineNodeType::Source,
+                schema,
+                sql: None,
+            });
+        }
+
+        // Stream nodes + edges from SQL FROM references
+        let mgr = self.connector_manager.lock();
+        let stream_names: Vec<String> = mgr.streams().keys().cloned().collect();
+        for (name, reg) in mgr.streams() {
+            nodes.push(PipelineNode {
+                name: name.clone(),
+                node_type: PipelineNodeType::Stream,
+                schema: None,
+                sql: Some(reg.query_sql.clone()),
+            });
+
+            // Extract FROM references by checking which known sources/streams
+            // appear in the query SQL. This is a lightweight heuristic that
+            // avoids a full SQL parse.
+            let sql_upper = reg.query_sql.to_uppercase();
+            for src in &source_names {
+                if sql_upper.contains(&src.to_uppercase()) {
+                    edges.push(PipelineEdge {
+                        from: src.clone(),
+                        to: name.clone(),
+                    });
+                }
+            }
+            // Also check for stream-to-stream references (cascading)
+            for other in &stream_names {
+                if other != name && sql_upper.contains(&other.to_uppercase()) {
+                    edges.push(PipelineEdge {
+                        from: other.clone(),
+                        to: name.clone(),
+                    });
+                }
+            }
+        }
+
+        // Sink nodes + edges from input field
+        for (name, reg) in mgr.sinks() {
+            nodes.push(PipelineNode {
+                name: name.clone(),
+                node_type: PipelineNodeType::Sink,
+                schema: None,
+                sql: None,
+            });
+
+            // Sinks read from their `input` field
+            if !reg.input.is_empty() {
+                edges.push(PipelineEdge {
+                    from: reg.input.clone(),
+                    to: name.clone(),
+                });
+            }
+        }
+
+        // Also add catalog-only sinks (no connector type) that aren't
+        // already in the connector manager
+        let cm_sink_names: std::collections::HashSet<&String> =
+            mgr.sinks().keys().collect();
+        for name in self.catalog.list_sinks() {
+            if !cm_sink_names.contains(&name) {
+                // Check if there's a sink entry in the catalog with input info
+                if let Some(input) = self.catalog.get_sink_input(&name) {
+                    nodes.push(PipelineNode {
+                        name: name.clone(),
+                        node_type: PipelineNodeType::Sink,
+                        schema: None,
+                        sql: None,
+                    });
+                    if !input.is_empty() {
+                        edges.push(PipelineEdge {
+                            from: input,
+                            to: name,
+                        });
+                    }
+                }
+            }
+        }
+
+        drop(mgr);
+
+        crate::handle::PipelineTopology { nodes, edges }
+    }
+
     /// List all active queries.
     pub fn queries(&self) -> Vec<QueryInfo> {
         self.catalog
@@ -2610,5 +2729,160 @@ mod tests {
             debug.contains("materialized_views: 0"),
             "Debug should include MV count, got: {debug}"
         );
+    }
+
+    // ── Pipeline Topology Introspection tests ──
+
+    #[tokio::test]
+    async fn test_pipeline_topology_empty() {
+        let db = LaminarDB::open().unwrap();
+        let topo = db.pipeline_topology();
+        assert!(topo.nodes.is_empty());
+        assert!(topo.edges.is_empty());
+    }
+
+    #[tokio::test]
+    async fn test_pipeline_topology_sources_only() {
+        use crate::handle::PipelineNodeType;
+
+        let db = LaminarDB::open().unwrap();
+        db.execute("CREATE SOURCE events (id INT, value DOUBLE)")
+            .await
+            .unwrap();
+        db.execute("CREATE SOURCE clicks (url VARCHAR, ts BIGINT)")
+            .await
+            .unwrap();
+
+        let topo = db.pipeline_topology();
+        assert_eq!(topo.nodes.len(), 2);
+        assert!(topo.edges.is_empty());
+
+        for node in &topo.nodes {
+            assert_eq!(node.node_type, PipelineNodeType::Source);
+            assert!(node.schema.is_some());
+            assert!(node.sql.is_none());
+        }
+    }
+
+    #[tokio::test]
+    async fn test_pipeline_topology_full_pipeline() {
+        use crate::handle::PipelineNodeType;
+
+        let db = LaminarDB::open().unwrap();
+        db.execute("CREATE SOURCE events (id INT, value DOUBLE)")
+            .await
+            .unwrap();
+        db.execute("CREATE STREAM agg AS SELECT COUNT(*) as cnt FROM events GROUP BY id")
+            .await
+            .unwrap();
+        db.execute("CREATE SINK output FROM agg")
+            .await
+            .unwrap();
+
+        let topo = db.pipeline_topology();
+
+        // Nodes: 1 source + 1 stream + 1 sink = 3
+        assert_eq!(topo.nodes.len(), 3);
+
+        let sources: Vec<_> = topo
+            .nodes
+            .iter()
+            .filter(|n| n.node_type == PipelineNodeType::Source)
+            .collect();
+        let streams: Vec<_> = topo
+            .nodes
+            .iter()
+            .filter(|n| n.node_type == PipelineNodeType::Stream)
+            .collect();
+        let sinks: Vec<_> = topo
+            .nodes
+            .iter()
+            .filter(|n| n.node_type == PipelineNodeType::Sink)
+            .collect();
+
+        assert_eq!(sources.len(), 1);
+        assert_eq!(streams.len(), 1);
+        assert_eq!(sinks.len(), 1);
+
+        assert_eq!(sources[0].name, "events");
+        assert_eq!(streams[0].name, "agg");
+        assert!(streams[0].sql.is_some());
+        assert_eq!(sinks[0].name, "output");
+
+        // Edges: events->agg, agg->output
+        assert_eq!(topo.edges.len(), 2);
+        assert!(topo.edges.iter().any(|e| e.from == "events" && e.to == "agg"));
+        assert!(topo.edges.iter().any(|e| e.from == "agg" && e.to == "output"));
+    }
+
+    #[tokio::test]
+    async fn test_pipeline_topology_fan_out() {
+        let db = LaminarDB::open().unwrap();
+        db.execute("CREATE SOURCE ticks (symbol VARCHAR, price DOUBLE)")
+            .await
+            .unwrap();
+        db.execute("CREATE STREAM ohlc AS SELECT symbol, MIN(price) FROM ticks GROUP BY symbol")
+            .await
+            .unwrap();
+        db.execute("CREATE STREAM vol AS SELECT symbol, COUNT(*) FROM ticks GROUP BY symbol")
+            .await
+            .unwrap();
+
+        let topo = db.pipeline_topology();
+
+        // 1 source + 2 streams = 3 nodes
+        assert_eq!(topo.nodes.len(), 3);
+
+        // Both streams should have an edge from ticks
+        let ticks_edges: Vec<_> = topo
+            .edges
+            .iter()
+            .filter(|e| e.from == "ticks")
+            .collect();
+        assert_eq!(ticks_edges.len(), 2);
+
+        let targets: Vec<&str> = ticks_edges.iter().map(|e| e.to.as_str()).collect();
+        assert!(targets.contains(&"ohlc"));
+        assert!(targets.contains(&"vol"));
+    }
+
+    #[tokio::test]
+    async fn test_streams_method() {
+        let db = LaminarDB::open().unwrap();
+        assert!(db.streams().is_empty());
+
+        db.execute("CREATE STREAM counts AS SELECT COUNT(*) FROM events")
+            .await
+            .unwrap();
+
+        let streams = db.streams();
+        assert_eq!(streams.len(), 1);
+        assert_eq!(streams[0].name, "counts");
+        assert!(streams[0].sql.is_some());
+        assert!(
+            streams[0].sql.as_ref().unwrap().contains("COUNT"),
+            "SQL should contain the query: {:?}",
+            streams[0].sql,
+        );
+    }
+
+    #[tokio::test]
+    async fn test_pipeline_node_types() {
+        use crate::handle::PipelineNodeType;
+
+        let db = LaminarDB::open().unwrap();
+        db.execute("CREATE SOURCE src (id INT)").await.unwrap();
+        db.execute("CREATE STREAM st AS SELECT * FROM src")
+            .await
+            .unwrap();
+        db.execute("CREATE SINK sk FROM st").await.unwrap();
+
+        let topo = db.pipeline_topology();
+
+        let find = |name: &str| topo.nodes.iter().find(|n| n.name == name).unwrap();
+
+        assert_eq!(find("src").node_type, PipelineNodeType::Source);
+        assert_eq!(find("st").node_type, PipelineNodeType::Stream);
+        assert_eq!(find("sk").node_type, PipelineNodeType::Sink);
     }
 }

@@ -6,6 +6,8 @@ use ratatui::text::{Line, Span};
 use ratatui::widgets::{Block, Borders, Cell, Paragraph, Row, Sparkline, Table};
 use ratatui::Frame;
 
+use laminar_db::PipelineNodeType;
+
 use crate::app::App;
 
 /// Draw the entire dashboard.
@@ -22,8 +24,12 @@ pub fn draw(f: &mut Frame, app: &App) {
 
     draw_header(f, app, chunks[0]);
     draw_kpi_bar(f, app, chunks[1]);
-    draw_main_content(f, app, chunks[2]);
-    draw_footer(f, chunks[3]);
+    if app.show_dag {
+        draw_dag(f, app, chunks[2]);
+    } else {
+        draw_main_content(f, app, chunks[2]);
+    }
+    draw_footer(f, app, chunks[3]);
 }
 
 /// Header: title, status, uptime, throughput.
@@ -296,8 +302,208 @@ fn draw_alerts(f: &mut Frame, app: &App, area: Rect) {
     f.render_widget(paragraph, area);
 }
 
+/// DAG pipeline view: renders the topology as a layered graph.
+fn draw_dag(f: &mut Frame, app: &App, area: Rect) {
+    let topo = match &app.topology {
+        Some(t) => t,
+        None => {
+            let msg = Paragraph::new(" No topology available. Start the pipeline first.")
+                .block(
+                    Block::default()
+                        .title(" PIPELINE TOPOLOGY ")
+                        .borders(Borders::ALL)
+                        .border_style(Style::default().fg(Color::Blue)),
+                );
+            f.render_widget(msg, area);
+            return;
+        }
+    };
+
+    let mut lines: Vec<Line<'_>> = Vec::new();
+    lines.push(Line::from(""));
+
+    // Partition nodes into layers
+    let sources: Vec<_> = topo
+        .nodes
+        .iter()
+        .filter(|n| n.node_type == PipelineNodeType::Source)
+        .collect();
+    let streams: Vec<_> = topo
+        .nodes
+        .iter()
+        .filter(|n| n.node_type == PipelineNodeType::Stream)
+        .collect();
+    let sinks: Vec<_> = topo
+        .nodes
+        .iter()
+        .filter(|n| n.node_type == PipelineNodeType::Sink)
+        .collect();
+
+    // --- Source layer ---
+    if !sources.is_empty() {
+        let mut spans = vec![Span::raw("  ")];
+        for (i, node) in sources.iter().enumerate() {
+            if i > 0 {
+                spans.push(Span::raw("    "));
+            }
+            let col_count = node
+                .schema
+                .as_ref()
+                .map_or(0, |s| s.fields().len());
+            spans.push(Span::styled(
+                format!("[{}]", node.name),
+                Style::default()
+                    .fg(Color::Cyan)
+                    .add_modifier(Modifier::BOLD),
+            ));
+            spans.push(Span::styled(
+                format!(" SOURCE ({col_count} cols)"),
+                Style::default().fg(Color::DarkGray),
+            ));
+        }
+        lines.push(Line::from(spans));
+    }
+
+    // --- Arrows from sources to streams ---
+    if !sources.is_empty() && !streams.is_empty() {
+        // Build a connection indicator line
+        let mut arrow_spans = vec![Span::raw("  ")];
+        for (i, src) in sources.iter().enumerate() {
+            if i > 0 {
+                arrow_spans.push(Span::raw("    "));
+            }
+            // Count how many streams this source feeds
+            let feeds_any = topo
+                .edges
+                .iter()
+                .any(|e| e.from == src.name);
+            let indicator = if feeds_any {
+                format!("  {:1$}", "|", src.name.len())
+            } else {
+                format!("  {:1$}", " ", src.name.len())
+            };
+            arrow_spans.push(Span::styled(
+                indicator,
+                Style::default().fg(Color::DarkGray),
+            ));
+        }
+        lines.push(Line::from(arrow_spans));
+    }
+
+    // --- Stream layer ---
+    if !streams.is_empty() {
+        let mut spans = vec![Span::raw("  ")];
+        for (i, node) in streams.iter().enumerate() {
+            if i > 0 {
+                spans.push(Span::raw("    "));
+            }
+            spans.push(Span::styled(
+                format!("[{}]", node.name),
+                Style::default()
+                    .fg(Color::Green)
+                    .add_modifier(Modifier::BOLD),
+            ));
+            spans.push(Span::styled(
+                " STREAM",
+                Style::default().fg(Color::DarkGray),
+            ));
+        }
+        lines.push(Line::from(spans));
+
+        // Show SQL for each stream
+        for node in &streams {
+            if let Some(sql) = &node.sql {
+                let truncated = if sql.len() > 70 {
+                    format!("    {} ...", &sql[..67])
+                } else {
+                    format!("    {sql}")
+                };
+                lines.push(Line::from(Span::styled(
+                    truncated,
+                    Style::default().fg(Color::DarkGray),
+                )));
+            }
+        }
+    }
+
+    // --- Arrows from streams to sinks ---
+    if !streams.is_empty() && !sinks.is_empty() {
+        let mut arrow_spans = vec![Span::raw("  ")];
+        for (i, stream) in streams.iter().enumerate() {
+            if i > 0 {
+                arrow_spans.push(Span::raw("    "));
+            }
+            let feeds_sink = topo
+                .edges
+                .iter()
+                .any(|e| e.from == stream.name);
+            let indicator = if feeds_sink {
+                format!("  {:1$}", "|", stream.name.len())
+            } else {
+                format!("  {:1$}", " ", stream.name.len())
+            };
+            arrow_spans.push(Span::styled(
+                indicator,
+                Style::default().fg(Color::DarkGray),
+            ));
+        }
+        lines.push(Line::from(arrow_spans));
+    }
+
+    // --- Sink layer ---
+    if !sinks.is_empty() {
+        let mut spans = vec![Span::raw("  ")];
+        for (i, node) in sinks.iter().enumerate() {
+            if i > 0 {
+                spans.push(Span::raw("    "));
+            }
+            spans.push(Span::styled(
+                format!("[{}]", node.name),
+                Style::default()
+                    .fg(Color::Yellow)
+                    .add_modifier(Modifier::BOLD),
+            ));
+            spans.push(Span::styled(
+                " SINK",
+                Style::default().fg(Color::DarkGray),
+            ));
+        }
+        lines.push(Line::from(spans));
+    }
+
+    // --- Edge summary ---
+    lines.push(Line::from(""));
+    lines.push(Line::from(Span::styled(
+        format!(
+            "  {} nodes, {} edges",
+            topo.nodes.len(),
+            topo.edges.len()
+        ),
+        Style::default().fg(Color::DarkGray),
+    )));
+
+    // List edges
+    for edge in &topo.edges {
+        lines.push(Line::from(vec![
+            Span::raw("    "),
+            Span::styled(&edge.from, Style::default().fg(Color::White)),
+            Span::styled(" -> ", Style::default().fg(Color::DarkGray)),
+            Span::styled(&edge.to, Style::default().fg(Color::White)),
+        ]));
+    }
+
+    let paragraph = Paragraph::new(lines).block(
+        Block::default()
+            .title(" PIPELINE TOPOLOGY ")
+            .borders(Borders::ALL)
+            .border_style(Style::default().fg(Color::Blue)),
+    );
+    f.render_widget(paragraph, area);
+}
+
 /// Footer: keyboard shortcuts.
-fn draw_footer(f: &mut Frame, area: Rect) {
+fn draw_footer(f: &mut Frame, app: &App, area: Rect) {
+    let dag_label = if app.show_dag { "Dashboard" } else { "Pipeline" };
     let footer = Paragraph::new(Line::from(vec![
         Span::styled(" [q] ", Style::default().fg(Color::Yellow)),
         Span::raw("Quit  "),
@@ -305,6 +511,8 @@ fn draw_footer(f: &mut Frame, area: Rect) {
         Span::raw("Symbol  "),
         Span::styled("[Space] ", Style::default().fg(Color::Yellow)),
         Span::raw("Pause  "),
+        Span::styled("[d] ", Style::default().fg(Color::Yellow)),
+        Span::raw(dag_label),
     ]))
     .block(Block::default().borders(Borders::ALL));
     f.render_widget(footer, area);

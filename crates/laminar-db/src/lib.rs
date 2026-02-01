@@ -41,7 +41,8 @@ pub use db::LaminarDB;
 pub use error::DbError;
 pub use handle::{
     ExecuteResult, DdlInfo, FromBatch, QueryHandle, SourceHandle, UntypedSourceHandle,
-    TypedSubscription, QueryInfo, SourceInfo, SinkInfo,
+    TypedSubscription, QueryInfo, SourceInfo, SinkInfo, StreamInfo,
+    PipelineTopology, PipelineNode, PipelineEdge, PipelineNodeType,
 };
 
 /// Re-export the connector registry for custom connector registration.

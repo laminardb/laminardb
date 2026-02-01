@@ -368,6 +368,57 @@ impl std::fmt::Debug for UntypedSourceHandle {
     }
 }
 
+/// Type of a node in the pipeline topology.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum PipelineNodeType {
+    /// A data source (CREATE SOURCE).
+    Source,
+    /// A continuous stream (CREATE STREAM).
+    Stream,
+    /// A data sink (CREATE SINK).
+    Sink,
+}
+
+/// A node in the pipeline topology graph.
+#[derive(Debug, Clone)]
+pub struct PipelineNode {
+    /// Node name.
+    pub name: String,
+    /// Node type (source, stream, or sink).
+    pub node_type: PipelineNodeType,
+    /// Arrow schema, if available (sources have schemas).
+    pub schema: Option<SchemaRef>,
+    /// SQL definition, if applicable (streams have query SQL).
+    pub sql: Option<String>,
+}
+
+/// A directed edge in the pipeline topology graph.
+#[derive(Debug, Clone)]
+pub struct PipelineEdge {
+    /// Source node name.
+    pub from: String,
+    /// Target node name.
+    pub to: String,
+}
+
+/// The complete pipeline topology: nodes and edges.
+#[derive(Debug, Clone)]
+pub struct PipelineTopology {
+    /// All nodes in the pipeline.
+    pub nodes: Vec<PipelineNode>,
+    /// All edges (data flow connections).
+    pub edges: Vec<PipelineEdge>,
+}
+
+/// Metadata about a registered stream.
+#[derive(Debug, Clone)]
+pub struct StreamInfo {
+    /// Stream name.
+    pub name: String,
+    /// The SQL query that defines the stream.
+    pub sql: Option<String>,
+}
+
 /// Information about a registered source.
 #[derive(Debug, Clone)]
 pub struct SourceInfo {
