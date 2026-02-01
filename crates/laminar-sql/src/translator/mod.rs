@@ -13,7 +13,8 @@ pub mod streaming_ddl;
 mod window_translator;
 
 pub use join_translator::{
-    JoinOperatorConfig, LookupJoinConfig, LookupJoinType, StreamJoinConfig, StreamJoinType,
+    AsofJoinTranslatorConfig, AsofSqlJoinType, JoinOperatorConfig, LookupJoinConfig,
+    LookupJoinType, StreamJoinConfig, StreamJoinType,
 };
 pub use order_translator::{
     OrderOperatorConfig, PerGroupTopKConfig, TopKConfig, WatermarkSortConfig,

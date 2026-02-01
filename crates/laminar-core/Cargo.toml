@@ -120,3 +120,7 @@ harness = false
 [[bench]]
 name = "dag_stress"
 harness = false
+
+[[bench]]
+name = "subscription_bench"
+harness = false
