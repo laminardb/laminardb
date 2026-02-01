@@ -316,6 +316,17 @@ Ring 0: mmap + ChangelogBuffer (zero-alloc) ──▶ Ring 1: WAL + RocksDB ─�
 | F058 | Async State Access | P1 | 📝 | [Link](phase-3/F058-async-state-access.md) |
 | F061 | Historical Backfill | P2 | 📝 | [Link](phase-3/F061-historical-backfill.md) |
 
+### Production Demo
+
+> Market data demo with Ratatui TUI dashboard.
+> See [Demo Index](phase-3/demo/INDEX.md) for details.
+
+| ID | Feature | Priority | Status | Spec |
+|----|---------|----------|--------|------|
+| F-DEMO-001 | Market Data Pipeline | P0 | 📝 | [Link](phase-3/demo/F-DEMO-001-market-data-pipeline.md) |
+| F-DEMO-002 | Ratatui TUI Dashboard | P0 | 📝 | [Link](phase-3/demo/F-DEMO-002-ratatui-tui.md) |
+| F-DEMO-003 | Kafka Integration & Docker | P1 | 📝 | [Link](phase-3/demo/F-DEMO-003-kafka-docker.md) |
+
 ---
 
 ## Phase 4: Enterprise & Security

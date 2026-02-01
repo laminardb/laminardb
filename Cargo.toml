@@ -11,6 +11,7 @@ members = [
     "crates/laminar-derive",
     "crates/laminar-db",
     "examples/shopstream",
+    "examples/demo",
 ]
 resolver = "2"
 

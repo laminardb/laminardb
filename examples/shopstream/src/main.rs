@@ -31,11 +31,16 @@
 mod generator;
 mod types;
 
-use std::time::Instant;
+use std::collections::HashMap;
+use std::io::{self, Write};
+use std::time::{Duration, Instant};
 
 use laminar_db::{ExecuteResult, LaminarDB};
 
-use types::{ClickEvent, InventoryUpdate, OrderEvent};
+use types::{
+    ClickEvent, InventoryUpdate, OrderEvent, OrderTotals, ProductActivity,
+    SessionActivity,
+};
 
 /// SQL files embedded at compile time.
 const TABLES_SQL: &str = include_str!("../sql/tables.sql");
@@ -51,6 +56,320 @@ const STREAMS_KAFKA_SQL: &str = include_str!("../sql/streams_kafka.sql");
 #[cfg(feature = "kafka")]
 const SINKS_KAFKA_SQL: &str = include_str!("../sql/sinks_kafka.sql");
 
+// ── Dashboard state ─────────────────────────────────────────────────
+
+/// Accumulated dashboard state for the live TUI display.
+struct DashboardState {
+    // Counters
+    total_clicks: u64,
+    total_orders: u64,
+    total_inventory: u64,
+    cycle: u64,
+
+    // Latest stream results
+    sessions: Vec<SessionActivity>,
+    order_totals: Vec<OrderTotals>,
+    product_activity: HashMap<String, ProductActivityRow>,
+}
+
+/// Merged product activity across event types.
+struct ProductActivityRow {
+    product_id: String,
+    views: i64,
+    carts: i64,
+    checkouts: i64,
+    total: i64,
+}
+
+impl DashboardState {
+    fn new() -> Self {
+        Self {
+            total_clicks: 0,
+            total_orders: 0,
+            total_inventory: 0,
+            cycle: 0,
+            sessions: Vec::new(),
+            order_totals: Vec::new(),
+            product_activity: HashMap::new(),
+        }
+    }
+
+    fn ingest_sessions(&mut self, rows: Vec<SessionActivity>) {
+        for row in rows {
+            // Update or insert: keep latest per session_id
+            if let Some(existing) = self
+                .sessions
+                .iter_mut()
+                .find(|s| s.session_id == row.session_id)
+            {
+                *existing = row;
+            } else {
+                self.sessions.push(row);
+            }
+        }
+        // Keep most active sessions at the top
+        self.sessions
+            .sort_by(|a, b| b.event_count.cmp(&a.event_count));
+        self.sessions.truncate(10);
+    }
+
+    fn ingest_order_totals(&mut self, rows: Vec<OrderTotals>) {
+        for row in rows {
+            if let Some(existing) = self
+                .order_totals
+                .iter_mut()
+                .find(|o| o.user_id == row.user_id)
+            {
+                *existing = row;
+            } else {
+                self.order_totals.push(row);
+            }
+        }
+        self.order_totals
+            .sort_by(|a, b| b.gross_revenue.partial_cmp(&a.gross_revenue).unwrap());
+        self.order_totals.truncate(10);
+    }
+
+    fn ingest_product_activity(&mut self, rows: Vec<ProductActivity>) {
+        for row in rows {
+            let entry = self
+                .product_activity
+                .entry(row.product_id.clone())
+                .or_insert_with(|| ProductActivityRow {
+                    product_id: row.product_id.clone(),
+                    views: 0,
+                    carts: 0,
+                    checkouts: 0,
+                    total: 0,
+                });
+            match row.event_type.as_str() {
+                "product_view" => entry.views = row.event_count,
+                "add_to_cart" => entry.carts = row.event_count,
+                "checkout" => entry.checkouts = row.event_count,
+                _ => {}
+            }
+            entry.total = entry.views + entry.carts + entry.checkouts;
+        }
+    }
+
+    fn top_products(&self) -> Vec<&ProductActivityRow> {
+        let mut sorted: Vec<_> = self.product_activity.values().collect();
+        sorted.sort_by(|a, b| b.total.cmp(&a.total));
+        sorted.truncate(8);
+        sorted
+    }
+
+    fn total_revenue(&self) -> f64 {
+        self.order_totals.iter().map(|o| o.gross_revenue).sum()
+    }
+
+    fn total_order_count(&self) -> i64 {
+        self.order_totals.iter().map(|o| o.order_count).sum()
+    }
+
+    fn avg_order_value(&self) -> f64 {
+        let count = self.total_order_count();
+        if count > 0 {
+            self.total_revenue() / count as f64
+        } else {
+            0.0
+        }
+    }
+}
+
+// ── Dashboard renderer ──────────────────────────────────────────────
+
+fn render_dashboard(state: &DashboardState, uptime: Duration) {
+    // Clear screen (ANSI escape)
+    print!("\x1B[2J\x1B[1;1H");
+
+    let uptime_secs = uptime.as_secs();
+    let mins = uptime_secs / 60;
+    let secs = uptime_secs % 60;
+    let events_per_sec = if uptime_secs > 0 {
+        (state.total_clicks + state.total_orders + state.total_inventory)
+            / uptime_secs
+    } else {
+        0
+    };
+
+    println!(
+        "+=============================================================================+"
+    );
+    println!(
+        "|          SHOPSTREAM REAL-TIME ANALYTICS DASHBOARD                           |"
+    );
+    println!(
+        "|                    Powered by LaminarDB                                     |"
+    );
+    println!(
+        "+=============================================================================+"
+    );
+    println!(
+        "| Uptime: {:02}:{:02} | Cycle: {:>4} | Throughput: ~{} events/s{:>18}|",
+        mins,
+        secs,
+        state.cycle,
+        events_per_sec,
+        ""
+    );
+    println!(
+        "+=============================================================================+"
+    );
+
+    // KPI Row
+    println!(
+        "| KEY PERFORMANCE INDICATORS                                                  |"
+    );
+    println!(
+        "+-------------------+-------------------+-------------------+-----------------+"
+    );
+    println!(
+        "| Revenue           | Orders            | Avg Order Value   | Events Pushed   |"
+    );
+    println!(
+        "| ${:>15.2} | {:>17} | ${:>15.2} | {:>15} |",
+        state.total_revenue(),
+        state.total_order_count(),
+        state.avg_order_value(),
+        state.total_clicks + state.total_orders + state.total_inventory,
+    );
+    println!(
+        "+-------------------+-------------------+-------------------+-----------------+"
+    );
+
+    // Event breakdown
+    println!(
+        "| Clicks: {:>8}  | Orders: {:>8}  | Inventory: {:>5}  | Sessions: {:>5} |",
+        state.total_clicks,
+        state.total_orders,
+        state.total_inventory,
+        state.sessions.len(),
+    );
+    println!(
+        "+=============================================================================+"
+    );
+
+    // Trending products
+    println!(
+        "| PRODUCT ACTIVITY                                                            |"
+    );
+    println!(
+        "+----------------+----------+----------+----------+-----------+---------------+"
+    );
+    println!(
+        "| Product        | Views    | Carts    | Checkout | Total     | Engagement    |"
+    );
+    println!(
+        "+----------------+----------+----------+----------+-----------+---------------+"
+    );
+    let products = state.top_products();
+    if products.is_empty() {
+        println!(
+            "| (waiting for data...)                                                       |"
+        );
+    }
+    for p in &products {
+        let bar_len = (p.total as usize).min(12);
+        let bar: String = "#".repeat(bar_len);
+        println!(
+            "| {:>14} | {:>8} | {:>8} | {:>8} | {:>9} | {:<13} |",
+            truncate(&p.product_id, 14),
+            p.views,
+            p.carts,
+            p.checkouts,
+            p.total,
+            bar,
+        );
+    }
+    println!(
+        "+----------------+----------+----------+----------+-----------+---------------+"
+    );
+
+    // User sessions
+    println!(
+        "| USER SESSIONS (Top 10 by activity)                                          |"
+    );
+    println!(
+        "+----------------+--------------+-------------------------------------------+"
+    );
+    println!(
+        "| Session        | User         | Events                                    |"
+    );
+    println!(
+        "+----------------+--------------+-------------------------------------------+"
+    );
+    if state.sessions.is_empty() {
+        println!(
+            "| (waiting for data...)                                                       |"
+        );
+    }
+    for s in state.sessions.iter().take(8) {
+        let bar_len = (s.event_count as usize).min(40);
+        let bar: String = "=".repeat(bar_len);
+        println!(
+            "| {:>14} | {:>12} | {:>3} {:<38} |",
+            truncate(&s.session_id, 14),
+            truncate(&s.user_id, 12),
+            s.event_count,
+            bar,
+        );
+    }
+    println!(
+        "+----------------+--------------+-------------------------------------------+"
+    );
+
+    // Order totals
+    println!(
+        "| REVENUE BY USER                                                             |"
+    );
+    println!(
+        "+----------------+----------+------------------+----------------------------+"
+    );
+    println!(
+        "| User           | Orders   | Revenue          | Avg Order Value            |"
+    );
+    println!(
+        "+----------------+----------+------------------+----------------------------+"
+    );
+    if state.order_totals.is_empty() {
+        println!(
+            "| (waiting for data...)                                                       |"
+        );
+    }
+    for o in state.order_totals.iter().take(5) {
+        println!(
+            "| {:>14} | {:>8} | ${:>15.2} | ${:>25.2} |",
+            truncate(&o.user_id, 14),
+            o.order_count,
+            o.gross_revenue,
+            o.avg_order_value,
+        );
+    }
+    println!(
+        "+----------------+----------+------------------+----------------------------+"
+    );
+
+    println!(
+        "| Press Ctrl+C to exit                                                        |"
+    );
+    println!(
+        "+=============================================================================+"
+    );
+
+    io::stdout().flush().unwrap();
+}
+
+fn truncate(s: &str, max: usize) -> String {
+    if s.len() > max {
+        format!("{}..", &s[..max - 2])
+    } else {
+        format!("{:width$}", s, width = max)
+    }
+}
+
+// ── Main ────────────────────────────────────────────────────────────
+
 #[tokio::main]
 async fn main() -> Result<(), Box<dyn std::error::Error>> {
     let mode = std::env::var("SHOPSTREAM_MODE").unwrap_or_else(|_| "embedded".into());
@@ -62,12 +381,12 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     }
 }
 
-/// Embedded mode: in-memory sources, synthetic data, no external dependencies.
+/// Embedded mode: in-memory sources, continuous data generation, live dashboard.
 async fn run_embedded_mode() -> Result<(), Box<dyn std::error::Error>> {
     println!("=== ShopStream: E-Commerce Analytics Demo (Embedded Mode) ===");
     println!();
 
-    // ── Step 1: Build LaminarDB with config vars ──────────────────────
+    // ── Step 1: Build LaminarDB ─────────────────────────────────────
     println!("[1/7] Building LaminarDB with config variables...");
     let db = LaminarDB::builder()
         .config_var("KAFKA_BROKERS", "localhost:9092")
@@ -76,31 +395,27 @@ async fn run_embedded_mode() -> Result<(), Box<dyn std::error::Error>> {
         .buffer_size(65536)
         .build()
         .await?;
-
     println!("  Pipeline state: {}", db.pipeline_state());
 
-    // ── Step 2: Create reference tables ───────────────────────────────
-    println!("[2/7] Creating reference tables (multi-statement SQL)...");
-    let t0 = Instant::now();
+    // ── Step 2: Create reference tables ─────────────────────────────
+    println!("[2/7] Creating reference tables...");
     db.execute(TABLES_SQL).await?;
-    println!("  Created users + products tables in {:?}", t0.elapsed());
-
     verify_table_counts(&db).await;
 
-    // ── Step 3: Create streaming sources ──────────────────────────────
-    println!("[3/7] Creating streaming sources (multi-statement SQL)...");
+    // ── Step 3: Create streaming sources ────────────────────────────
+    println!("[3/7] Creating streaming sources...");
     db.execute(SOURCES_SQL).await?;
     println!(
         "  Sources: {:?}",
         db.sources().iter().map(|s| &s.name).collect::<Vec<_>>()
     );
 
-    // ── Step 4: Create streaming pipelines ────────────────────────────
+    // ── Step 4: Create streaming pipelines ──────────────────────────
     println!("[4/7] Creating streaming pipelines...");
     db.execute(STREAMS_SQL).await?;
-    println!("  Streams created via multi-statement execution");
+    println!("  Streams created");
 
-    // ── Step 5: Create sinks ──────────────────────────────────────────
+    // ── Step 5: Create sinks ────────────────────────────────────────
     println!("[5/7] Creating sinks...");
     db.execute(SINKS_SQL).await?;
     println!(
@@ -108,42 +423,82 @@ async fn run_embedded_mode() -> Result<(), Box<dyn std::error::Error>> {
         db.sinks().iter().map(|s| &s.name).collect::<Vec<_>>()
     );
 
-    // ── Step 6: Start pipeline ────────────────────────────────────────
+    // ── Step 6: Start pipeline ──────────────────────────────────────
     println!("[6/7] Starting pipeline...");
     db.start().await?;
     println!("  Pipeline state: {}", db.pipeline_state());
 
-    // ── Step 7: Generate and push data ────────────────────────────────
-    println!("[7/7] Generating and pushing synthetic events...");
+    // ── Step 7: Acquire handles and subscribe to output streams ─────
+    println!("[7/7] Connecting data generators and subscribing to streams...");
+
+    let sources = SourceHandles {
+        clicks: db.source::<ClickEvent>("clickstream")?,
+        orders: db.source::<OrderEvent>("orders")?,
+        inventory: db.source::<InventoryUpdate>("inventory_updates")?,
+    };
+
+    let session_sub =
+        db.subscribe::<SessionActivity>("session_activity")?;
+    let order_sub = db.subscribe::<OrderTotals>("order_totals")?;
+    let product_sub =
+        db.subscribe::<ProductActivity>("product_activity")?;
+
+    println!("  Subscribed to: session_activity, order_totals, product_activity");
+    println!();
+    println!("Pipeline running. Press Ctrl+C to stop.");
     println!();
 
-    let base_ts = chrono::Utc::now().timestamp_millis();
+    // Brief pause so the user can read the startup messages
+    tokio::time::sleep(Duration::from_secs(2)).await;
 
-    let click_source = db.source::<ClickEvent>("clickstream")?;
-    let order_source = db.source::<OrderEvent>("orders")?;
-    let inventory_source = db.source::<InventoryUpdate>("inventory_updates")?;
+    // ── Continuous dashboard loop ───────────────────────────────────
+    let start_time = Instant::now();
+    let mut state = DashboardState::new();
 
-    let clicks = generator::generate_clicks(50, base_ts);
-    let orders = generator::generate_orders(10, base_ts);
-    let inventory = generator::generate_inventory(5, base_ts);
+    // Push an initial batch so there's data right away
+    let ts = chrono::Utc::now().timestamp_millis();
+    sources.push_batch(&mut state, ts, 50, 10, 5);
 
-    let click_count = click_source.push_batch(clicks);
-    let order_count = order_source.push_batch(orders);
-    let inv_count = inventory_source.push_batch(inventory);
+    loop {
+        tokio::select! {
+            _ = tokio::signal::ctrl_c() => {
+                break;
+            }
+            _ = tokio::time::sleep(Duration::from_secs(2)) => {
+                state.cycle += 1;
 
-    println!("  Pushed {} clickstream events", click_count);
-    println!("  Pushed {} order events", order_count);
-    println!("  Pushed {} inventory updates", inv_count);
+                // Generate and push new events
+                let ts = chrono::Utc::now().timestamp_millis();
+                sources.push_batch(
+                    &mut state,
+                    ts,
+                    20,  // clicks per cycle
+                    5,   // orders per cycle
+                    2,   // inventory updates per cycle
+                );
 
-    click_source.watermark(base_ts + 10_000);
-    order_source.watermark(base_ts + 10_000);
-    inventory_source.watermark(base_ts + 10_000);
+                // Advance watermarks
+                sources.clicks.watermark(ts + 5_000);
+                sources.orders.watermark(ts + 5_000);
+                sources.inventory.watermark(ts + 5_000);
 
-    // ── Summary ───────────────────────────────────────────────────────
-    print_summary(&db).await;
-    print_reference_queries(&db).await;
+                // Drain subscription channels
+                drain_subscriptions(
+                    &session_sub,
+                    &order_sub,
+                    &product_sub,
+                    &mut state,
+                );
 
-    // ── Shutdown ──────────────────────────────────────────────────────
+                // Render
+                render_dashboard(&state, start_time.elapsed());
+            }
+        }
+    }
+
+    // ── Shutdown ────────────────────────────────────────────────────
+    // Move cursor below dashboard
+    println!();
     println!();
     println!("Shutting down pipeline...");
     db.shutdown().await?;
@@ -153,6 +508,68 @@ async fn run_embedded_mode() -> Result<(), Box<dyn std::error::Error>> {
 
     Ok(())
 }
+
+/// Source handles bundled for convenience.
+struct SourceHandles {
+    clicks: laminar_db::SourceHandle<ClickEvent>,
+    orders: laminar_db::SourceHandle<OrderEvent>,
+    inventory: laminar_db::SourceHandle<InventoryUpdate>,
+}
+
+impl SourceHandles {
+    /// Push a batch of synthetic events into the three sources.
+    fn push_batch(
+        &self,
+        state: &mut DashboardState,
+        ts: i64,
+        click_count: usize,
+        order_count: usize,
+        inv_count: usize,
+    ) {
+        let c = self
+            .clicks
+            .push_batch(generator::generate_clicks(click_count, ts));
+        let o = self
+            .orders
+            .push_batch(generator::generate_orders(order_count, ts));
+        let i = self
+            .inventory
+            .push_batch(generator::generate_inventory(inv_count, ts));
+        state.total_clicks += c as u64;
+        state.total_orders += o as u64;
+        state.total_inventory += i as u64;
+    }
+}
+
+/// Poll all subscription channels and merge results into dashboard state.
+fn drain_subscriptions(
+    session_sub: &laminar_db::TypedSubscription<SessionActivity>,
+    order_sub: &laminar_db::TypedSubscription<OrderTotals>,
+    product_sub: &laminar_db::TypedSubscription<ProductActivity>,
+    state: &mut DashboardState,
+) {
+    // Drain up to 64 batches per poll cycle
+    for _ in 0..64 {
+        match session_sub.poll() {
+            Some(rows) => state.ingest_sessions(rows),
+            None => break,
+        }
+    }
+    for _ in 0..64 {
+        match order_sub.poll() {
+            Some(rows) => state.ingest_order_totals(rows),
+            None => break,
+        }
+    }
+    for _ in 0..64 {
+        match product_sub.poll() {
+            Some(rows) => state.ingest_product_activity(rows),
+            None => break,
+        }
+    }
+}
+
+// ── Kafka mode ──────────────────────────────────────────────────────
 
 /// Kafka mode: reads from Kafka topics, writes to Kafka output topics.
 #[cfg(feature = "kafka")]
@@ -176,7 +593,7 @@ async fn run_kafka_mode() -> Result<(), Box<dyn std::error::Error>> {
     println!("  Generator rate: {gen_rate} events/batch");
     println!();
 
-    // ── Step 1: Build LaminarDB ───────────────────────────────────────
+    // ── Step 1: Build LaminarDB ─────────────────────────────────────
     println!("[1/7] Building LaminarDB with Kafka config...");
     let db = LaminarDB::builder()
         .config_var("KAFKA_BROKERS", &brokers)
@@ -186,11 +603,11 @@ async fn run_kafka_mode() -> Result<(), Box<dyn std::error::Error>> {
         .build()
         .await?;
 
-    // ── Step 2: Create reference tables ───────────────────────────────
+    // ── Step 2: Create reference tables ─────────────────────────────
     println!("[2/7] Creating reference tables...");
     db.execute(TABLES_SQL).await?;
 
-    // ── Step 3: Create Kafka sources ──────────────────────────────────
+    // ── Step 3: Create Kafka sources ────────────────────────────────
     println!("[3/7] Creating Kafka sources (FROM KAFKA)...");
     db.execute(SOURCES_KAFKA_SQL).await?;
     println!(
@@ -198,11 +615,11 @@ async fn run_kafka_mode() -> Result<(), Box<dyn std::error::Error>> {
         db.sources().iter().map(|s| &s.name).collect::<Vec<_>>()
     );
 
-    // ── Step 4: Create streaming pipelines ────────────────────────────
+    // ── Step 4: Create streaming pipelines ──────────────────────────
     println!("[4/7] Creating streaming pipelines...");
     db.execute(STREAMS_KAFKA_SQL).await?;
 
-    // ── Step 5: Create Kafka sinks ────────────────────────────────────
+    // ── Step 5: Create Kafka sinks ──────────────────────────────────
     println!("[5/7] Creating Kafka sinks (INTO KAFKA + WHERE)...");
     db.execute(SINKS_KAFKA_SQL).await?;
     println!(
@@ -210,12 +627,12 @@ async fn run_kafka_mode() -> Result<(), Box<dyn std::error::Error>> {
         db.sinks().iter().map(|s| &s.name).collect::<Vec<_>>()
     );
 
-    // ── Step 6: Start pipeline ────────────────────────────────────────
+    // ── Step 6: Start pipeline ──────────────────────────────────────
     println!("[6/7] Starting Kafka pipeline...");
     db.start().await?;
     println!("  Pipeline state: {}", db.pipeline_state());
 
-    // ── Step 7: Generate data and produce to Kafka ────────────────────
+    // ── Step 7: Generate data and produce to Kafka ──────────────────
     println!("[7/7] Producing synthetic events to Kafka...");
     println!();
 
@@ -228,7 +645,8 @@ async fn run_kafka_mode() -> Result<(), Box<dyn std::error::Error>> {
 
     let clicks = generator::generate_kafka_clicks(gen_rate, base_ts);
     let orders = generator::generate_kafka_orders(gen_rate / 5, base_ts);
-    let inventory = generator::generate_kafka_inventory(gen_rate / 10, base_ts);
+    let inventory =
+        generator::generate_kafka_inventory(gen_rate / 10, base_ts);
 
     let click_count =
         generator::produce_to_kafka(&producer, "clickstream", &clicks).await?;
@@ -245,7 +663,7 @@ async fn run_kafka_mode() -> Result<(), Box<dyn std::error::Error>> {
     println!("  Produced {} order events to Kafka", order_count);
     println!("  Produced {} inventory updates to Kafka", inv_count);
 
-    // ── Live dashboard loop ───────────────────────────────────────────
+    // ── Live dashboard loop ─────────────────────────────────────────
     println!();
     println!("Pipeline running. Press Ctrl+C to stop.");
     println!();
@@ -260,7 +678,7 @@ async fn run_kafka_mode() -> Result<(), Box<dyn std::error::Error>> {
                 println!("Ctrl+C received, shutting down...");
                 break;
             }
-            _ = tokio::time::sleep(std::time::Duration::from_secs(5)) => {
+            _ = tokio::time::sleep(Duration::from_secs(5)) => {
                 cycle += 1;
                 let uptime = start_time.elapsed();
                 println!(
@@ -287,7 +705,7 @@ async fn run_kafka_mode() -> Result<(), Box<dyn std::error::Error>> {
         }
     }
 
-    // ── Shutdown ──────────────────────────────────────────────────────
+    // ── Shutdown ────────────────────────────────────────────────────
     println!("Shutting down pipeline...");
     db.shutdown().await?;
     println!("  Pipeline state: {}", db.pipeline_state());
@@ -297,13 +715,13 @@ async fn run_kafka_mode() -> Result<(), Box<dyn std::error::Error>> {
     Ok(())
 }
 
-// ── Helper functions ──────────────────────────────────────────────────
+// ── Helper functions ────────────────────────────────────────────────
 
 async fn verify_table_counts(db: &LaminarDB) {
     let result = db.execute("SELECT COUNT(*) as cnt FROM users").await;
     if let Ok(ExecuteResult::Query(mut q)) = result {
         if let Ok(rows) = q.subscribe::<CountResult>() {
-            if let Ok(batch) = rows.recv_timeout(std::time::Duration::from_secs(2)) {
+            if let Ok(batch) = rows.recv_timeout(Duration::from_secs(2)) {
                 for r in &batch {
                     println!("  users table: {} rows", r.cnt);
                 }
@@ -314,7 +732,7 @@ async fn verify_table_counts(db: &LaminarDB) {
     let result = db.execute("SELECT COUNT(*) as cnt FROM products").await;
     if let Ok(ExecuteResult::Query(mut q)) = result {
         if let Ok(rows) = q.subscribe::<CountResult>() {
-            if let Ok(batch) = rows.recv_timeout(std::time::Duration::from_secs(2)) {
+            if let Ok(batch) = rows.recv_timeout(Duration::from_secs(2)) {
                 for r in &batch {
                     println!("  products table: {} rows", r.cnt);
                 }
@@ -323,88 +741,9 @@ async fn verify_table_counts(db: &LaminarDB) {
     }
 }
 
-async fn print_summary(db: &LaminarDB) {
-    println!();
-    println!("=== Pipeline Summary ===");
-    println!("  Sources:  {}", db.source_count());
-    println!("  Sinks:    {}", db.sink_count());
-    println!("  State:    {}", db.pipeline_state());
-    println!();
-
-    let result = db.execute("SHOW SOURCES").await;
-    if let Ok(ExecuteResult::Metadata(batch)) = result {
-        println!("  SHOW SOURCES: {} rows", batch.num_rows());
-    }
-
-    let result = db.execute("SHOW STREAMS").await;
-    if let Ok(ExecuteResult::Metadata(batch)) = result {
-        println!("  SHOW STREAMS: {} rows", batch.num_rows());
-    }
-
-    let result = db.execute("SHOW SINKS").await;
-    if let Ok(ExecuteResult::Metadata(batch)) = result {
-        println!("  SHOW SINKS:   {} rows", batch.num_rows());
-    }
-}
-
-async fn print_reference_queries(db: &LaminarDB) {
-    println!();
-    println!("=== Reference Table Queries ===");
-
-    let result = db
-        .execute("SELECT user_id, tier, lifetime_value FROM users WHERE tier = 'gold'")
-        .await;
-    if let Ok(ExecuteResult::Query(mut q)) = result {
-        if let Ok(rows) = q.subscribe::<UserRow>() {
-            if let Ok(batch) = rows.recv_timeout(std::time::Duration::from_secs(2)) {
-                println!("  Gold tier users:");
-                for user in &batch {
-                    println!(
-                        "    {} | tier={} | ltv=${:.2}",
-                        user.user_id, user.tier, user.lifetime_value
-                    );
-                }
-            }
-        }
-    }
-
-    let result = db
-        .execute(
-            "SELECT name, category, price FROM products WHERE category = 'Electronics'",
-        )
-        .await;
-    if let Ok(ExecuteResult::Query(mut q)) = result {
-        if let Ok(rows) = q.subscribe::<ProductRow>() {
-            if let Ok(batch) = rows.recv_timeout(std::time::Duration::from_secs(2)) {
-                println!("  Electronics products:");
-                for prod in &batch {
-                    println!(
-                        "    {} | {} | ${:.2}",
-                        prod.name, prod.category, prod.price
-                    );
-                }
-            }
-        }
-    }
-}
-
-// ── Helper types for ad-hoc queries ──────────────────────────────────
+// ── Helper types for ad-hoc queries ─────────────────────────────────
 
 #[derive(Debug, laminar_derive::FromRow)]
 struct CountResult {
     cnt: i64,
-}
-
-#[derive(Debug, laminar_derive::FromRow)]
-struct UserRow {
-    user_id: String,
-    tier: String,
-    lifetime_value: f64,
-}
-
-#[derive(Debug, laminar_derive::FromRow)]
-struct ProductRow {
-    name: String,
-    category: String,
-    price: f64,
 }

@@ -1,41 +1,32 @@
 #!/bin/bash
-# Create Kafka topics for the ShopStream demo.
+# Create Kafka topics for the ShopStream demo (using Redpanda's rpk).
 # Run after docker-compose up:
 #   bash examples/shopstream/scripts/setup-kafka.sh
 
 set -e
 
-KAFKA_BROKER="${KAFKA_BROKERS:-localhost:9092}"
+CONTAINER="${CONTAINER:-shopstream-redpanda}"
 PARTITIONS="${PARTITIONS:-3}"
-REPLICATION="${REPLICATION:-1}"
 
-echo "Creating ShopStream Kafka topics on $KAFKA_BROKER..."
+echo "Creating ShopStream topics via rpk in $CONTAINER..."
 
 # Input topics
 for topic in clickstream orders inventory_updates; do
     echo "  Creating topic: $topic"
-    docker exec shopstream-kafka \
-        kafka-topics.sh --create \
-        --bootstrap-server "$KAFKA_BROKER" \
-        --topic "$topic" \
-        --partitions "$PARTITIONS" \
-        --replication-factor "$REPLICATION" \
-        --if-not-exists
+    docker exec "$CONTAINER" \
+        rpk topic create "$topic" \
+        --partitions "$PARTITIONS"
 done
 
 # Output topics
 for topic in session-analytics sales-kpis fraud-alerts inventory-alerts \
-             trending-products user-segments revenue-by-category; do
+             trending-products revenue-by-category; do
     echo "  Creating topic: $topic"
-    docker exec shopstream-kafka \
-        kafka-topics.sh --create \
-        --bootstrap-server "$KAFKA_BROKER" \
-        --topic "$topic" \
-        --partitions "$PARTITIONS" \
-        --replication-factor "$REPLICATION" \
-        --if-not-exists
+    docker exec "$CONTAINER" \
+        rpk topic create "$topic" \
+        --partitions "$PARTITIONS"
 done
 
+echo ""
 echo "Done. Topics:"
-docker exec shopstream-kafka \
-    kafka-topics.sh --list --bootstrap-server "$KAFKA_BROKER"
+docker exec "$CONTAINER" rpk topic list

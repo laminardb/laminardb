@@ -1033,18 +1033,145 @@ impl LaminarDB {
         if has_external {
             self.start_connector_pipeline(source_regs, sink_regs, stream_regs)
                 .await?;
+        } else if !stream_regs.is_empty() {
+            self.start_embedded_pipeline(&stream_regs);
         } else {
             tracing::info!(
                 sources = source_regs.len(),
                 sinks = sink_regs.len(),
-                streams = stream_regs.len(),
-                "Starting in embedded (in-memory) mode"
+                "Starting in embedded (in-memory) mode — no streams"
             );
         }
 
         self.state
             .store(STATE_RUNNING, std::sync::atomic::Ordering::Release);
         Ok(())
+    }
+
+    /// Start a lightweight embedded processing loop for in-memory sources.
+    ///
+    /// When no external connectors are registered but named streams exist,
+    /// this spawns a background task that:
+    ///
+    /// 1. Polls each source's sink for pushed `RecordBatch` data.
+    /// 2. Executes registered stream queries via `DataFusion`.
+    /// 3. Pushes query results into the corresponding stream sources so
+    ///    that callers of [`subscribe`](Self::subscribe) receive data.
+    fn start_embedded_pipeline(
+        &self,
+        stream_regs: &HashMap<
+            String,
+            crate::connector_manager::StreamRegistration,
+        >,
+    ) {
+        use crate::stream_executor::StreamExecutor;
+
+        // Build StreamExecutor with the registered stream queries
+        let ctx = SessionContext::new();
+        register_streaming_functions(&ctx);
+        let mut executor = StreamExecutor::new(ctx);
+
+        for reg in stream_regs.values() {
+            executor.add_query(reg.name.clone(), reg.query_sql.clone());
+        }
+
+        // Subscribe to every source's sink so we can read pushed data.
+        let mut source_subs: Vec<(
+            String,
+            streaming::Subscription<crate::catalog::ArrowRecord>,
+        )> = Vec::new();
+        for name in self.catalog.list_sources() {
+            if let Some(entry) = self.catalog.get_source(&name) {
+                let sub = entry.sink.subscribe();
+                source_subs.push((name, sub));
+            }
+        }
+
+        // Get stream source handles for pushing results.
+        let mut stream_sources: Vec<(
+            String,
+            streaming::Source<crate::catalog::ArrowRecord>,
+        )> = Vec::new();
+        for reg in stream_regs.values() {
+            if let Some(src) = self.catalog.get_stream_source(&reg.name) {
+                stream_sources.push((reg.name.clone(), src));
+            }
+        }
+
+        tracing::info!(
+            sources = source_subs.len(),
+            streams = stream_sources.len(),
+            "Starting embedded pipeline"
+        );
+
+        let shutdown = self.shutdown_signal.clone();
+
+        let handle = tokio::spawn(async move {
+            let mut cycle_count: u64 = 0;
+            loop {
+                // Check for shutdown
+                tokio::select! {
+                    () = shutdown.notified() => {
+                        tracing::info!("Embedded pipeline shutdown signal received");
+                        break;
+                    }
+                    () = tokio::time::sleep(std::time::Duration::from_millis(100)) => {}
+                }
+
+                // Drain source subscriptions into batches
+                let mut source_batches: HashMap<String, Vec<RecordBatch>> =
+                    HashMap::new();
+                for (name, sub) in &source_subs {
+                    for _ in 0..256 {
+                        match sub.poll() {
+                            Some(batch) if batch.num_rows() > 0 => {
+                                source_batches
+                                    .entry(name.clone())
+                                    .or_default()
+                                    .push(batch);
+                            }
+                            _ => break,
+                        }
+                    }
+                }
+
+                if source_batches.is_empty() {
+                    continue;
+                }
+
+                // Execute stream queries
+                match executor.execute_cycle(&source_batches).await {
+                    Ok(results) => {
+                        // Push results to stream sources for subscriber delivery
+                        for (stream_name, src) in &stream_sources {
+                            if let Some(batches) = results.get(stream_name) {
+                                for batch in batches {
+                                    if batch.num_rows() > 0 {
+                                        let _ = src.push_arrow(batch.clone());
+                                    }
+                                }
+                            }
+                        }
+                    }
+                    Err(e) => {
+                        tracing::warn!(error = %e, "Embedded stream execution error");
+                    }
+                }
+
+                cycle_count += 1;
+                if cycle_count.is_multiple_of(100) {
+                    tracing::debug!(
+                        cycles = cycle_count,
+                        "Embedded pipeline processing"
+                    );
+                }
+            }
+            tracing::info!(
+                "Embedded pipeline stopped after {cycle_count} cycles"
+            );
+        });
+
+        *self.runtime_handle.lock() = Some(handle);
     }
 
     /// Build and start the connector pipeline with external sources/sinks.
@@ -2211,7 +2338,9 @@ mod tests {
 
         // With feature flags enabled, built-in connectors are auto-registered.
         // Without any features, registry should be empty.
+        #[allow(unused_mut)]
         let mut expected_sources = 0;
+        #[allow(unused_mut)]
         let mut expected_sinks = 0;
 
         #[cfg(feature = "kafka")]

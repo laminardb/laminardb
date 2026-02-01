@@ -1,41 +1,64 @@
-# ShopStream Kafka Infrastructure
+# ShopStream Kafka-compatible Infrastructure (Redpanda)
 # Usage: docker-compose -f examples/shopstream/docker-compose.yml up -d
 #
-# This starts a single-node KRaft Kafka broker (no Zookeeper) and Kafka UI.
+# Redpanda is a Kafka-compatible streaming platform — no JVM, no Zookeeper.
+# Console UI: http://localhost:8080
+# Schema Registry: http://localhost:18081
+# Kafka API: localhost:9092
 
 services:
-  kafka:
-    image: apache/kafka:3.8.0
-    container_name: shopstream-kafka
+  redpanda:
+    image: docker.redpanda.com/redpandadata/redpanda:v24.2.5
+    container_name: shopstream-redpanda
+    command:
+      - redpanda
+      - start
+      - --kafka-addr internal://0.0.0.0:9093,external://0.0.0.0:19092
+      - --advertise-kafka-addr internal://redpanda:9093,external://localhost:9092
+      - --pandaproxy-addr internal://0.0.0.0:8082,external://0.0.0.0:18082
+      - --advertise-pandaproxy-addr internal://redpanda:8082,external://localhost:18082
+      - --schema-registry-addr internal://0.0.0.0:8081,external://0.0.0.0:18081
+      - --rpc-addr redpanda:33145
+      - --advertise-rpc-addr redpanda:33145
+      - --mode dev-container
+      - --smp 1
+      - --memory 512M
+      - --default-log-level=warn
+    volumes:
+      - redpanda_data:/var/lib/redpanda/data
     ports:
-      - "9092:9092"
-    environment:
-      KAFKA_NODE_ID: 1
-      KAFKA_PROCESS_ROLES: broker,controller
-      KAFKA_LISTENERS: PLAINTEXT://0.0.0.0:9092,CONTROLLER://0.0.0.0:9093
-      KAFKA_ADVERTISED_LISTENERS: PLAINTEXT://localhost:9092
-      KAFKA_CONTROLLER_LISTENER_NAMES: CONTROLLER
-      KAFKA_LISTENER_SECURITY_PROTOCOL_MAP: CONTROLLER:PLAINTEXT,PLAINTEXT:PLAINTEXT
-      KAFKA_CONTROLLER_QUORUM_VOTERS: 1@kafka:9093
-      KAFKA_OFFSETS_TOPIC_REPLICATION_FACTOR: 1
-      KAFKA_TRANSACTION_STATE_LOG_REPLICATION_FACTOR: 1
-      KAFKA_TRANSACTION_STATE_LOG_MIN_ISR: 1
-      KAFKA_LOG_DIRS: /tmp/kraft-combined-logs
-      CLUSTER_ID: MkU3OEVBNTcwNTJENDM2Qk
+      - "9092:19092"
+      - "18081:18081"
+      - "18082:18082"
+      - "9644:9644"
     healthcheck:
-      test: ["CMD", "kafka-topics.sh", "--bootstrap-server", "localhost:9092", "--list"]
+      test: ["CMD", "rpk", "cluster", "health", "--api-urls", "localhost:9644"]
       interval: 10s
       timeout: 5s
       retries: 5
 
-  kafka-ui:
-    image: provectuslabs/kafka-ui:latest
-    container_name: shopstream-kafka-ui
+  console:
+    image: docker.redpanda.com/redpandadata/console:v2.7.2
+    container_name: shopstream-console
+    entrypoint: /bin/sh
+    command: -c 'echo "$$CONSOLE_CONFIG_FILE" > /tmp/config.yml; /app/console'
+    environment:
+      CONFIG_FILEPATH: /tmp/config.yml
+      CONSOLE_CONFIG_FILE: |
+        kafka:
+          brokers: ["redpanda:9093"]
+          schemaRegistry:
+            enabled: true
+            urls: ["http://redpanda:8081"]
+        redpanda:
+          adminApi:
+            enabled: true
+            urls: ["http://redpanda:9644"]
     ports:
       - "8080:8080"
-    environment:
-      KAFKA_CLUSTERS_0_NAME: shopstream
-      KAFKA_CLUSTERS_0_BOOTSTRAPSERVERS: kafka:9092
     depends_on:
-      kafka:
+      redpanda:
         condition: service_healthy
+
+volumes:
+  redpanda_data:

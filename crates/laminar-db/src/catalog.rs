@@ -232,6 +232,17 @@ impl SourceCatalog {
             .map(|entry| entry.sink.subscribe())
     }
 
+    /// Get a clone of the stream's source handle (for pushing results).
+    pub(crate) fn get_stream_source(
+        &self,
+        name: &str,
+    ) -> Option<streaming::Source<ArrowRecord>> {
+        self.streams
+            .read()
+            .get(name)
+            .map(|entry| entry.source.clone())
+    }
+
     /// Remove a stream by name.
     pub fn drop_stream(&self, name: &str) -> bool {
         self.streams.write().remove(name).is_some()
