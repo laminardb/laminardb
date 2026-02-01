@@ -138,8 +138,7 @@ impl LaminarHeader {
         let partition_key = u32::from_ne_bytes([bytes[4], bytes[5], bytes[6], bytes[7]]);
         let payload_len = u32::from_ne_bytes([bytes[8], bytes[9], bytes[10], bytes[11]]);
         let sequence = u64::from_ne_bytes([
-            bytes[12], bytes[13], bytes[14], bytes[15],
-            bytes[16], bytes[17], bytes[18], bytes[19],
+            bytes[12], bytes[13], bytes[14], bytes[15], bytes[16], bytes[17], bytes[18], bytes[19],
         ]);
 
         let header = Self {
@@ -170,8 +169,8 @@ impl LaminarHeader {
             partition_key: u32::from_ne_bytes([bytes[4], bytes[5], bytes[6], bytes[7]]),
             payload_len: u32::from_ne_bytes([bytes[8], bytes[9], bytes[10], bytes[11]]),
             sequence: u64::from_ne_bytes([
-                bytes[12], bytes[13], bytes[14], bytes[15],
-                bytes[16], bytes[17], bytes[18], bytes[19],
+                bytes[12], bytes[13], bytes[14], bytes[15], bytes[16], bytes[17], bytes[18],
+                bytes[19],
             ]),
         }
     }
@@ -223,11 +222,8 @@ impl PacketBuilder {
     #[must_use]
     #[allow(clippy::cast_possible_truncation)]
     pub fn build(&self, payload: &[u8]) -> Vec<u8> {
-        let header = LaminarHeader::with_sequence(
-            self.partition_key,
-            payload.len() as u32,
-            self.sequence,
-        );
+        let header =
+            LaminarHeader::with_sequence(self.partition_key, payload.len() as u32, self.sequence);
 
         let mut packet = Vec::with_capacity(LaminarHeader::SIZE + payload.len());
         packet.extend_from_slice(&header.to_bytes());
@@ -245,11 +241,8 @@ impl PacketBuilder {
             return None;
         }
 
-        let header = LaminarHeader::with_sequence(
-            self.partition_key,
-            payload.len() as u32,
-            self.sequence,
-        );
+        let header =
+            LaminarHeader::with_sequence(self.partition_key, payload.len() as u32, self.sequence);
 
         buffer[..LaminarHeader::SIZE].copy_from_slice(&header.to_bytes());
         buffer[LaminarHeader::SIZE..total_size].copy_from_slice(payload);
@@ -338,7 +331,7 @@ mod tests {
         let header = LaminarHeader::from_bytes(&packet).unwrap();
         assert_eq!(header.partition_key(), 42);
         assert_eq!(header.sequence(), 100);
-        assert_eq!(header.payload_len(), payload.len() as u32);
+        assert_eq!(header.payload_len(), u32::try_from(payload.len()).unwrap());
 
         assert_eq!(&packet[LaminarHeader::SIZE..], payload);
     }

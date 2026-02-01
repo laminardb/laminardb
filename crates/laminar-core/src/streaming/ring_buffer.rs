@@ -147,7 +147,6 @@ impl<T> RingBuffer<T> {
         self.capacity() - 1 - self.len()
     }
 
-
     /// Pushes an item to the buffer (SPSC mode).
     ///
     /// Returns `Ok(())` if successful, or `Err(item)` if the buffer is full.
@@ -232,7 +231,6 @@ impl<T> RingBuffer<T> {
         unsafe { Some((*self.buffer[head].get()).assume_init_ref()) }
     }
 
-
     /// Claims a slot for writing (MPSC mode).
     ///
     /// Returns the slot index if successful, or `None` if the buffer is full.
@@ -248,7 +246,7 @@ impl<T> RingBuffer<T> {
         // Convert claim to slot index
         // We use u64 for claim_counter to avoid wrap-around issues
         #[allow(clippy::cast_possible_truncation)]
-        let slot = (claim as usize) & self.capacity_mask;
+        let slot = usize::try_from(claim).unwrap_or(usize::MAX) & self.capacity_mask;
 
         // Calculate how many slots are claimed but not yet published
         let tail = self.tail.load(Ordering::Acquire);
@@ -308,7 +306,6 @@ impl<T> RingBuffer<T> {
             false
         }
     }
-
 
     /// Pushes multiple items to the buffer.
     ///
@@ -455,7 +452,6 @@ impl<T> RingBuffer<T> {
         self.head.store(current_head, Ordering::Release);
         count
     }
-
 
     /// Calculate the next index with wrap-around.
     #[inline]
@@ -698,7 +694,7 @@ mod tests {
 
         assert_eq!(received.len(), ITEMS as usize);
         for (i, &item) in received.iter().enumerate() {
-            assert_eq!(item, i as i32);
+            assert_eq!(item, i32::try_from(i).unwrap());
         }
     }
 

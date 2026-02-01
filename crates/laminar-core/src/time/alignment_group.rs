@@ -475,9 +475,7 @@ impl WatermarkAlignmentGroup {
     /// Returns whether a specific source is paused.
     #[must_use]
     pub fn is_paused(&self, source_id: usize) -> bool {
-        self.sources
-            .get(&source_id)
-            .is_some_and(|s| s.is_paused)
+        self.sources.get(&source_id).is_some_and(|s| s.is_paused)
     }
 
     /// Returns the minimum watermark in the group.
@@ -706,7 +704,11 @@ impl AlignmentGroupCoordinator {
     /// Reports a watermark update.
     ///
     /// Returns the action for the source, or `None` if source not in any group.
-    pub fn report_watermark(&mut self, source_id: usize, watermark: i64) -> Option<AlignmentAction> {
+    pub fn report_watermark(
+        &mut self,
+        source_id: usize,
+        watermark: i64,
+    ) -> Option<AlignmentAction> {
         let group_id = self.source_groups.get(&source_id)?;
         let group = self.groups.get_mut(group_id)?;
         Some(group.report_watermark(source_id, watermark))
@@ -793,14 +795,12 @@ impl AlignmentGroupCoordinator {
 mod tests {
     use super::*;
 
-
     #[test]
     fn test_alignment_group_id() {
         let id = AlignmentGroupId::new("test-group");
         assert_eq!(id.as_str(), "test-group");
-        assert_eq!(format!("{}", id), "test-group");
+        assert_eq!(format!("{id}"), "test-group");
     }
-
 
     #[test]
     fn test_alignment_group_config_builder() {
@@ -815,11 +815,9 @@ mod tests {
         assert_eq!(config.enforcement_mode, EnforcementMode::WarnOnly);
     }
 
-
     #[test]
     fn test_alignment_group_single_source_no_pause() {
-        let config = AlignmentGroupConfig::new("test")
-            .with_max_drift(Duration::from_secs(60));
+        let config = AlignmentGroupConfig::new("test").with_max_drift(Duration::from_secs(60));
         let mut group = WatermarkAlignmentGroup::new(config);
 
         group.register_source(0);
@@ -832,8 +830,7 @@ mod tests {
 
     #[test]
     fn test_alignment_group_two_sources_fast_paused() {
-        let config = AlignmentGroupConfig::new("test")
-            .with_max_drift(Duration::from_secs(60)); // 60 second max drift
+        let config = AlignmentGroupConfig::new("test").with_max_drift(Duration::from_secs(60)); // 60 second max drift
         let mut group = WatermarkAlignmentGroup::new(config);
 
         group.register_source(0);
@@ -856,8 +853,7 @@ mod tests {
 
     #[test]
     fn test_alignment_group_resume_when_slow_catches_up() {
-        let config = AlignmentGroupConfig::new("test")
-            .with_max_drift(Duration::from_secs(60));
+        let config = AlignmentGroupConfig::new("test").with_max_drift(Duration::from_secs(60));
         let mut group = WatermarkAlignmentGroup::new(config);
 
         group.register_source(0);
@@ -873,7 +869,7 @@ mod tests {
 
         // Source 1 catches up
         group.report_watermark(1, 50_000); // 50 seconds
-        // Drift is now 100 - 50 = 50 seconds, within limit
+                                           // Drift is now 100 - 50 = 50 seconds, within limit
         assert!(group.should_resume(0));
     }
 
@@ -928,8 +924,7 @@ mod tests {
 
     #[test]
     fn test_alignment_group_drift_calculation() {
-        let config = AlignmentGroupConfig::new("test")
-            .with_max_drift(Duration::from_secs(300)); // 5 minutes
+        let config = AlignmentGroupConfig::new("test").with_max_drift(Duration::from_secs(300)); // 5 minutes
         let mut group = WatermarkAlignmentGroup::new(config);
 
         group.register_source(0);
@@ -948,8 +943,7 @@ mod tests {
 
     #[test]
     fn test_alignment_group_metrics_accurate() {
-        let config = AlignmentGroupConfig::new("test")
-            .with_max_drift(Duration::from_secs(60));
+        let config = AlignmentGroupConfig::new("test").with_max_drift(Duration::from_secs(60));
         let mut group = WatermarkAlignmentGroup::new(config);
 
         group.register_source(0);
@@ -974,8 +968,7 @@ mod tests {
 
     #[test]
     fn test_alignment_group_unregister_source() {
-        let config = AlignmentGroupConfig::new("test")
-            .with_max_drift(Duration::from_secs(60));
+        let config = AlignmentGroupConfig::new("test").with_max_drift(Duration::from_secs(60));
         let mut group = WatermarkAlignmentGroup::new(config);
 
         group.register_source(0);
@@ -997,8 +990,7 @@ mod tests {
 
     #[test]
     fn test_alignment_group_source_state() {
-        let config = AlignmentGroupConfig::new("test")
-            .with_max_drift(Duration::from_secs(60));
+        let config = AlignmentGroupConfig::new("test").with_max_drift(Duration::from_secs(60));
         let mut group = WatermarkAlignmentGroup::new(config);
 
         group.register_source(0);
@@ -1010,15 +1002,12 @@ mod tests {
         assert!(!state.is_paused);
     }
 
-
     #[test]
     fn test_coordinator_multiple_groups() {
         let mut coordinator = AlignmentGroupCoordinator::new();
 
-        let config1 = AlignmentGroupConfig::new("group1")
-            .with_max_drift(Duration::from_secs(60));
-        let config2 = AlignmentGroupConfig::new("group2")
-            .with_max_drift(Duration::from_secs(120));
+        let config1 = AlignmentGroupConfig::new("group1").with_max_drift(Duration::from_secs(60));
+        let config2 = AlignmentGroupConfig::new("group2").with_max_drift(Duration::from_secs(120));
 
         coordinator.add_group(config1);
         coordinator.add_group(config2);
@@ -1030,8 +1019,8 @@ mod tests {
     fn test_coordinator_source_assignment() {
         let mut coordinator = AlignmentGroupCoordinator::new();
 
-        let config = AlignmentGroupConfig::new("test-group")
-            .with_max_drift(Duration::from_secs(60));
+        let config =
+            AlignmentGroupConfig::new("test-group").with_max_drift(Duration::from_secs(60));
         coordinator.add_group(config);
 
         let group_id = AlignmentGroupId::new("test-group");
@@ -1066,7 +1055,10 @@ mod tests {
 
         // Try to assign to different group
         let result = coordinator.assign_source_to_group(0, &group2);
-        assert!(matches!(result, Err(AlignmentError::SourceAlreadyInGroup { .. })));
+        assert!(matches!(
+            result,
+            Err(AlignmentError::SourceAlreadyInGroup { .. })
+        ));
 
         // Assigning to same group should be fine
         let result = coordinator.assign_source_to_group(0, &group1);
@@ -1085,8 +1077,8 @@ mod tests {
     fn test_coordinator_report_watermark() {
         let mut coordinator = AlignmentGroupCoordinator::new();
 
-        let config = AlignmentGroupConfig::new("test-group")
-            .with_max_drift(Duration::from_secs(60));
+        let config =
+            AlignmentGroupConfig::new("test-group").with_max_drift(Duration::from_secs(60));
         coordinator.add_group(config);
 
         let group_id = AlignmentGroupId::new("test-group");
@@ -1146,8 +1138,8 @@ mod tests {
     fn test_coordinator_is_paused() {
         let mut coordinator = AlignmentGroupCoordinator::new();
 
-        let config = AlignmentGroupConfig::new("test-group")
-            .with_max_drift(Duration::from_secs(60));
+        let config =
+            AlignmentGroupConfig::new("test-group").with_max_drift(Duration::from_secs(60));
         coordinator.add_group(config);
 
         let group_id = AlignmentGroupId::new("test-group");
@@ -1178,7 +1170,6 @@ mod tests {
         assert!(metrics.contains_key(&AlignmentGroupId::new("group2")));
     }
 
-
     #[test]
     fn test_alignment_group_empty() {
         let config = AlignmentGroupConfig::new("test");
@@ -1191,8 +1182,7 @@ mod tests {
 
     #[test]
     fn test_alignment_group_all_paused() {
-        let config = AlignmentGroupConfig::new("test")
-            .with_max_drift(Duration::from_secs(10));
+        let config = AlignmentGroupConfig::new("test").with_max_drift(Duration::from_secs(10));
         let mut group = WatermarkAlignmentGroup::new(config);
 
         group.register_source(0);
@@ -1213,8 +1203,7 @@ mod tests {
 
     #[test]
     fn test_alignment_group_negative_watermarks() {
-        let config = AlignmentGroupConfig::new("test")
-            .with_max_drift(Duration::from_secs(60));
+        let config = AlignmentGroupConfig::new("test").with_max_drift(Duration::from_secs(60));
         let mut group = WatermarkAlignmentGroup::new(config);
 
         group.register_source(0);
@@ -1274,6 +1263,8 @@ mod tests {
         group.report_watermark(1, 50_000); // Slow source catches up
         let actions = group.check_alignment();
         // Should have a Resume action for source 0
-        assert!(actions.iter().any(|(id, action)| *id == 0 && *action == AlignmentAction::Resume));
+        assert!(actions
+            .iter()
+            .any(|(id, action)| *id == 0 && *action == AlignmentAction::Resume));
     }
 }

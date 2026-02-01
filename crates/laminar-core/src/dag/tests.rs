@@ -1,6 +1,8 @@
 //! Unit tests for DAG topology, builder, multicast, routing, executor, checkpointing,
 //! MV integration, watermark tracking, and changelog propagation.
 
+#![allow(clippy::similar_names)]
+
 use std::sync::Arc;
 
 use arrow_array::{Int64Array, RecordBatch};
@@ -28,7 +30,11 @@ use crate::operator::{
 
 /// Helper to create a simple int64 schema.
 fn int_schema() -> Arc<Schema> {
-    Arc::new(Schema::new(vec![Field::new("value", DataType::Int64, false)]))
+    Arc::new(Schema::new(vec![Field::new(
+        "value",
+        DataType::Int64,
+        false,
+    )]))
 }
 
 /// Helper to create a schema with two int64 fields.
@@ -547,10 +553,7 @@ fn test_max_fan_out_limit() {
     }
 
     let result = dag.finalize();
-    assert!(matches!(
-        result,
-        Err(DagError::FanOutLimitExceeded { .. })
-    ));
+    assert!(matches!(result, Err(DagError::FanOutLimitExceeded { .. })));
 }
 
 #[test]
@@ -1062,7 +1065,10 @@ impl Operator for AddOperator {
     fn process(&mut self, event: &Event, _ctx: &mut OperatorContext) -> OutputVec {
         let val = event_value(event);
         let mut v = OutputVec::new();
-        v.push(Output::Event(test_event(event.timestamp, val + self.addend)));
+        v.push(Output::Event(test_event(
+            event.timestamp,
+            val + self.addend,
+        )));
         v
     }
     fn on_timer(&mut self, _timer: Timer, _ctx: &mut OperatorContext) -> OutputVec {
@@ -1095,7 +1101,9 @@ fn test_executor_linear_dag() {
     let snk_id = dag.node_id_by_name("snk").unwrap();
 
     let mut executor = DagExecutor::from_dag(&dag);
-    executor.process_event(src_id, test_event(1000, 42)).unwrap();
+    executor
+        .process_event(src_id, test_event(1000, 42))
+        .unwrap();
 
     let outputs = executor.take_sink_outputs(snk_id);
     assert_eq!(outputs.len(), 1);
@@ -1112,8 +1120,7 @@ fn test_executor_fan_out() {
         .operator("shared", schema.clone())
         .connect("src", "shared")
         .fan_out("shared", |b| {
-            b.branch("a", schema.clone())
-                .branch("b", schema.clone())
+            b.branch("a", schema.clone()).branch("b", schema.clone())
         })
         .sink_for("a", "sink_a", schema.clone())
         .sink_for("b", "sink_b", schema.clone())
@@ -1125,7 +1132,9 @@ fn test_executor_fan_out() {
     let sink_b_id = dag.node_id_by_name("sink_b").unwrap();
 
     let mut executor = DagExecutor::from_dag(&dag);
-    executor.process_event(src_id, test_event(1000, 99)).unwrap();
+    executor
+        .process_event(src_id, test_event(1000, 99))
+        .unwrap();
 
     // Both sinks should receive the event.
     let out_a = executor.take_sink_outputs(sink_a_id);
@@ -1422,8 +1431,7 @@ fn test_executor_take_all_sink_outputs() {
         .operator("shared", schema.clone())
         .connect("src", "shared")
         .fan_out("shared", |b| {
-            b.branch("a", schema.clone())
-                .branch("b", schema.clone())
+            b.branch("a", schema.clone()).branch("b", schema.clone())
         })
         .sink_for("a", "sink_a", schema.clone())
         .sink_for("b", "sink_b", schema.clone())
@@ -1433,7 +1441,9 @@ fn test_executor_take_all_sink_outputs() {
     let src_id = dag.node_id_by_name("src").unwrap();
 
     let mut executor = DagExecutor::from_dag(&dag);
-    executor.process_event(src_id, test_event(1000, 55)).unwrap();
+    executor
+        .process_event(src_id, test_event(1000, 55))
+        .unwrap();
 
     let all_outputs = executor.take_all_sink_outputs();
     assert_eq!(all_outputs.len(), 2);
@@ -1519,8 +1529,7 @@ fn test_executor_multicast_metrics() {
         .operator("shared", schema.clone())
         .connect("src", "shared")
         .fan_out("shared", |b| {
-            b.branch("a", schema.clone())
-                .branch("b", schema.clone())
+            b.branch("a", schema.clone()).branch("b", schema.clone())
         })
         .sink_for("a", "sink_a", schema.clone())
         .sink_for("b", "sink_b", schema.clone())
@@ -2018,9 +2027,7 @@ fn test_checkpoint_linear_dag() {
     executor.register_operator(double_id, Box::new(DoublingOperator));
 
     // Process some events.
-    executor
-        .process_event(src_id, test_event(1000, 5))
-        .unwrap();
+    executor.process_event(src_id, test_event(1000, 5)).unwrap();
     let outputs = executor.take_sink_outputs(snk_id);
     assert_eq!(outputs.len(), 1);
     assert_eq!(event_value(&outputs[0]), 10);
@@ -2049,8 +2056,7 @@ fn test_checkpoint_fan_out_dag() {
         .operator("shared", schema.clone())
         .connect("src", "shared")
         .fan_out("shared", |b| {
-            b.branch("a", schema.clone())
-                .branch("b", schema.clone())
+            b.branch("a", schema.clone()).branch("b", schema.clone())
         })
         .sink_for("a", "sink_a", schema.clone())
         .sink_for("b", "sink_b", schema.clone())
@@ -2065,9 +2071,7 @@ fn test_checkpoint_fan_out_dag() {
     executor.register_operator(a_id, Box::new(DoublingOperator));
     executor.register_operator(b_id, Box::new(AddOperator { addend: 100 }));
 
-    executor
-        .process_event(src_id, test_event(1000, 5))
-        .unwrap();
+    executor.process_event(src_id, test_event(1000, 5)).unwrap();
 
     let barrier = CheckpointBarrier {
         checkpoint_id: 1,
@@ -2150,9 +2154,7 @@ fn test_full_checkpoint_recovery_cycle() {
     let mut executor = DagExecutor::from_dag(&dag);
     executor.register_operator(double_id, Box::new(DoublingOperator));
 
-    executor
-        .process_event(src_id, test_event(1000, 7))
-        .unwrap();
+    executor.process_event(src_id, test_event(1000, 7)).unwrap();
     let outputs = executor.take_sink_outputs(snk_id);
     assert_eq!(event_value(&outputs[0]), 14);
 
@@ -2268,8 +2270,12 @@ fn test_dag_from_mv_registry_linear() {
 
     // Verify topological order
     let order = dag.execution_order();
-    let pos =
-        |name: &str| order.iter().position(|&id| dag.node_name(id).unwrap() == name).unwrap();
+    let pos = |name: &str| {
+        order
+            .iter()
+            .position(|&id| dag.node_name(id).unwrap() == name)
+            .unwrap()
+    };
     assert!(pos("trades") < pos("ohlc_1s"));
     assert!(pos("ohlc_1s") < pos("ohlc_1m"));
 

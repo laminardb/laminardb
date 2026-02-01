@@ -171,14 +171,18 @@
 mod error;
 mod executor;
 mod registry;
-mod watermark;
+
+pub mod watermark;
 
 pub use error::{MvError, MvState};
-pub use executor::{MvPipelineCheckpoint, MvPipelineExecutor, PassThroughOperator, PipelineMetrics};
+pub use executor::{
+    MvPipelineCheckpoint, MvPipelineExecutor, PassThroughOperator, PipelineMetrics,
+};
 pub use registry::{MaterializedView, MvRegistry};
 pub use watermark::{CascadingWatermarkTracker, WatermarkTrackerCheckpoint};
 
 #[cfg(test)]
+#[allow(clippy::similar_names)]
 mod tests {
     use super::*;
     use crate::operator::{Event, OperatorContext};
@@ -287,7 +291,9 @@ mod tests {
         ];
 
         for trade in trades {
-            executor.process_source_event("trades", trade, &mut ctx).unwrap();
+            executor
+                .process_source_event("trades", trade, &mut ctx)
+                .unwrap();
         }
 
         // Verify events propagated through all levels
@@ -310,7 +316,12 @@ mod tests {
 
         let schema = Arc::new(Schema::new(vec![Field::new("v", DataType::Int64, false)]));
         let mv = |n: &str, s: Vec<&str>| {
-            MaterializedView::new(n, "", s.into_iter().map(String::from).collect(), schema.clone())
+            MaterializedView::new(
+                n,
+                "",
+                s.into_iter().map(String::from).collect(),
+                schema.clone(),
+            )
         };
 
         registry.register(mv("a", vec!["trades"])).unwrap();
@@ -329,7 +340,12 @@ mod tests {
 
         let schema = Arc::new(Schema::new(vec![Field::new("v", DataType::Int64, false)]));
         let mv = |n: &str, s: Vec<&str>| {
-            MaterializedView::new(n, "", s.into_iter().map(String::from).collect(), schema.clone())
+            MaterializedView::new(
+                n,
+                "",
+                s.into_iter().map(String::from).collect(),
+                schema.clone(),
+            )
         };
 
         registry.register(mv("ohlc_1s", vec!["trades"])).unwrap();

@@ -12,7 +12,7 @@ use std::time::{Duration, SystemTime, UNIX_EPOCH};
 use bytes::Bytes;
 use laminar_core::state::{MmapStateStore, StateError, StateSnapshot, StateStore};
 
-use crate::{CheckpointManager, WriteAheadLog, WalEntry, WalPosition};
+use crate::{CheckpointManager, WalEntry, WalPosition, WriteAheadLog};
 
 /// A state store backed by Write-Ahead Log for durability.
 ///
@@ -199,7 +199,8 @@ impl WalStateStore {
             .map_err(|e| StateError::Io(std::io::Error::other(e)))?;
 
         if self.sync_on_write {
-            self.wal.sync()
+            self.wal
+                .sync()
                 .map_err(|e| StateError::Io(std::io::Error::other(e)))?;
         }
 
@@ -223,7 +224,8 @@ impl WalStateStore {
         if let Some(ref manager) = self.checkpoint_manager {
             if let Ok(Some(checkpoint)) = manager.find_latest_checkpoint() {
                 // Load checkpoint state
-                let state_data = checkpoint.load_state()
+                let state_data = checkpoint
+                    .load_state()
                     .map_err(|e| StateError::Io(std::io::Error::other(e)))?;
 
                 // Deserialize and restore snapshot
@@ -232,7 +234,8 @@ impl WalStateStore {
 
                 // Update recovery state
                 start_position = checkpoint.metadata.wal_position.offset;
-                self.source_offsets.clone_from(&checkpoint.metadata.source_offsets);
+                self.source_offsets
+                    .clone_from(&checkpoint.metadata.source_offsets);
                 self.current_watermark = checkpoint.metadata.watermark;
                 self.last_checkpoint
                     .store(checkpoint.metadata.timestamp, Ordering::Relaxed);
@@ -240,7 +243,9 @@ impl WalStateStore {
         }
 
         // Read WAL entries from start position
-        let mut reader = self.wal.read_from(start_position)
+        let mut reader = self
+            .wal
+            .read_from(start_position)
             .map_err(|e| StateError::Io(std::io::Error::other(e)))?;
 
         // Replay entries after checkpoint
@@ -291,10 +296,7 @@ impl WalStateStore {
                 Ok(WalReadResult::ChecksumMismatch { position }) => {
                     // Checksum error - corruption or torn write
                     // Treat as end of valid data
-                    tracing::warn!(
-                        position,
-                        "CRC mismatch during recovery - truncating WAL"
-                    );
+                    tracing::warn!(position, "CRC mismatch during recovery - truncating WAL");
                     break;
                 }
                 Err(e) => {
@@ -319,7 +321,8 @@ impl WalStateStore {
         if let Some(ref manager) = self.checkpoint_manager {
             // Get current state snapshot
             let snapshot = self.store.snapshot();
-            let state_data = snapshot.to_bytes()
+            let state_data = snapshot
+                .to_bytes()
                 .map_err(|e| StateError::Io(std::io::Error::other(e)))?;
 
             // Get current WAL position
@@ -328,13 +331,14 @@ impl WalStateStore {
             };
 
             // Create checkpoint
-            let checkpoint = manager.create_checkpoint(
-                &state_data,
-                wal_position,
-                self.source_offsets.clone(),
-                self.current_watermark,
-            )
-            .map_err(|e| StateError::Io(std::io::Error::other(e)))?;
+            let checkpoint = manager
+                .create_checkpoint(
+                    &state_data,
+                    wal_position,
+                    self.source_offsets.clone(),
+                    self.current_watermark,
+                )
+                .map_err(|e| StateError::Io(std::io::Error::other(e)))?;
 
             // Write checkpoint marker to WAL
             self.wal
@@ -344,14 +348,17 @@ impl WalStateStore {
                 .map_err(|e| StateError::Io(std::io::Error::other(e)))?;
 
             // Force sync after checkpoint
-            self.wal.sync()
+            self.wal
+                .sync()
                 .map_err(|e| StateError::Io(std::io::Error::other(e)))?;
 
             // Update last checkpoint time
-            self.last_checkpoint.store(checkpoint.metadata.timestamp, Ordering::Relaxed);
+            self.last_checkpoint
+                .store(checkpoint.metadata.timestamp, Ordering::Relaxed);
 
             // Clean up old checkpoints
-            manager.cleanup_old_checkpoints()
+            manager
+                .cleanup_old_checkpoints()
                 .map_err(|e| StateError::Io(std::io::Error::other(e)))?;
 
             // Optionally truncate WAL if safe
@@ -376,7 +383,8 @@ impl WalStateStore {
     ///
     /// Returns an error if the WAL cannot be truncated.
     pub fn truncate_wal(&mut self, position: u64) -> Result<(), StateError> {
-        self.wal.truncate(position)
+        self.wal
+            .truncate(position)
             .map_err(|e| StateError::Io(std::io::Error::other(e)))?;
         Ok(())
     }
@@ -404,9 +412,7 @@ impl StateStore for WalStateStore {
     fn delete(&mut self, key: &[u8]) -> Result<(), StateError> {
         // Log to WAL first
         self.wal
-            .append(&WalEntry::Delete {
-                key: key.to_vec(),
-            })
+            .append(&WalEntry::Delete { key: key.to_vec() })
             .map_err(|e| StateError::Io(std::io::Error::other(e)))?;
 
         // Then apply to store
@@ -458,7 +464,8 @@ impl StateStore for WalStateStore {
 
     fn flush(&mut self) -> Result<(), StateError> {
         // Sync WAL first
-        self.wal.sync()
+        self.wal
+            .sync()
             .map_err(|e| StateError::Io(std::io::Error::other(e)))?;
 
         // Then flush the store
@@ -477,12 +484,9 @@ mod tests {
         let state_path = temp_dir.path().join("state.db");
         let wal_path = temp_dir.path().join("state.wal");
 
-        let mut store = WalStateStore::new(
-            &state_path,
-            &wal_path,
-            1024 * 1024,
-            Duration::from_secs(1),
-        ).unwrap();
+        let mut store =
+            WalStateStore::new(&state_path, &wal_path, 1024 * 1024, Duration::from_secs(1))
+                .unwrap();
 
         // Test put and get
         store.put(b"key1", b"value1").unwrap();
@@ -506,12 +510,9 @@ mod tests {
 
         // Create store and add data
         {
-            let mut store = WalStateStore::new(
-                &state_path,
-                &wal_path,
-                1024 * 1024,
-                Duration::from_secs(1),
-            ).unwrap();
+            let mut store =
+                WalStateStore::new(&state_path, &wal_path, 1024 * 1024, Duration::from_secs(1))
+                    .unwrap();
 
             store.put(b"key1", b"value1").unwrap();
             store.put(b"key2", b"value2").unwrap();
@@ -522,20 +523,20 @@ mod tests {
 
         // Create new store and recover
         {
-            let mut store = WalStateStore::new(
-                &state_path,
-                &wal_path,
-                1024 * 1024,
-                Duration::from_secs(1),
-            ).unwrap();
+            let mut store =
+                WalStateStore::new(&state_path, &wal_path, 1024 * 1024, Duration::from_secs(1))
+                    .unwrap();
 
-            // Before recovery, the index is empty (MmapStateStore doesn't persist it)
-            assert_eq!(store.len(), 0);
+            // With index persistence, data is available immediately!
+            // assert_eq!(store.len(), 0);
+            // Note: Even though we satisfy len check, we still run recover() to ensure WAL replay
+            // respects existing state and doesn't duplicate/corrupt.
+            // Actually, recover() is needed to restore watermarks/offsets which are NOT in the index yet.
 
-            // Recover from WAL
+            // Recover from WAL (should be idempotent regarding data)
             store.recover().unwrap();
 
-            // After recovery, data should be restored
+            // After recovery, data should be restored (and correctly maintained)
             assert_eq!(store.len(), 2);
             assert!(store.get(b"key1").is_none()); // Was deleted
             assert_eq!(store.get(b"key2").unwrap().as_ref(), b"value2");
@@ -549,12 +550,9 @@ mod tests {
         let state_path = temp_dir.path().join("state.db");
         let wal_path = temp_dir.path().join("state.wal");
 
-        let mut store = WalStateStore::new(
-            &state_path,
-            &wal_path,
-            1024 * 1024,
-            Duration::from_secs(1),
-        ).unwrap();
+        let mut store =
+            WalStateStore::new(&state_path, &wal_path, 1024 * 1024, Duration::from_secs(1))
+                .unwrap();
 
         // Add some data
         store.put(b"key1", b"value1").unwrap();
@@ -598,15 +596,14 @@ mod tests {
                 &wal_path,
                 1024 * 1024,
                 Duration::from_millis(10),
-            ).unwrap();
+            )
+            .unwrap();
             store.set_sync_on_write(true);
 
             // Enable checkpointing
-            store.enable_checkpointing(
-                checkpoint_dir.clone(),
-                Duration::from_secs(60),
-                3,
-            ).unwrap();
+            store
+                .enable_checkpointing(checkpoint_dir.clone(), Duration::from_secs(60), 3)
+                .unwrap();
 
             // Add initial data
             store.put(b"key1", b"value1").unwrap();
@@ -642,14 +639,13 @@ mod tests {
                 &wal_path,
                 1024 * 1024,
                 Duration::from_millis(10),
-            ).unwrap();
+            )
+            .unwrap();
 
             // Enable checkpointing (needed to find checkpoint)
-            store.enable_checkpointing(
-                checkpoint_dir.clone(),
-                Duration::from_secs(60),
-                3,
-            ).unwrap();
+            store
+                .enable_checkpointing(checkpoint_dir.clone(), Duration::from_secs(60), 3)
+                .unwrap();
 
             // Recover from checkpoint + WAL
             store.recover().unwrap();
@@ -689,14 +685,13 @@ mod tests {
                 &wal_path,
                 1024 * 1024,
                 Duration::from_millis(10),
-            ).unwrap();
+            )
+            .unwrap();
             store.set_sync_on_write(true);
 
-            store.enable_checkpointing(
-                checkpoint_dir.clone(),
-                Duration::from_secs(60),
-                3,
-            ).unwrap();
+            store
+                .enable_checkpointing(checkpoint_dir.clone(), Duration::from_secs(60), 3)
+                .unwrap();
 
             store.put(b"data", b"test").unwrap();
             store.update_watermark(12345);
@@ -718,13 +713,12 @@ mod tests {
                 &wal_path,
                 1024 * 1024,
                 Duration::from_millis(10),
-            ).unwrap();
+            )
+            .unwrap();
 
-            store.enable_checkpointing(
-                checkpoint_dir.clone(),
-                Duration::from_secs(60),
-                3,
-            ).unwrap();
+            store
+                .enable_checkpointing(checkpoint_dir.clone(), Duration::from_secs(60), 3)
+                .unwrap();
 
             store.recover().unwrap();
 
@@ -756,7 +750,8 @@ mod tests {
                 &wal_path,
                 1024 * 1024,
                 Duration::from_millis(10),
-            ).unwrap();
+            )
+            .unwrap();
             store.set_sync_on_write(true);
 
             store.put(b"key1", b"value1").unwrap();
@@ -783,7 +778,8 @@ mod tests {
                 &wal_path,
                 1024 * 1024,
                 Duration::from_millis(10),
-            ).unwrap();
+            )
+            .unwrap();
 
             // Recovery should succeed despite torn write
             // The torn write at the tail is ignored
@@ -813,7 +809,8 @@ mod tests {
                 &wal_path,
                 1024 * 1024,
                 Duration::from_millis(10),
-            ).unwrap();
+            )
+            .unwrap();
             store.set_sync_on_write(true);
 
             store.put(b"good1", b"data1").unwrap();
@@ -860,7 +857,8 @@ mod tests {
                 &wal_path,
                 1024 * 1024,
                 Duration::from_millis(10),
-            ).unwrap();
+            )
+            .unwrap();
 
             store.recover().unwrap();
 
@@ -886,14 +884,17 @@ mod tests {
                 &wal_path,
                 1024 * 1024,
                 Duration::from_millis(10),
-            ).unwrap();
+            )
+            .unwrap();
             store.set_sync_on_write(true);
 
-            store.enable_checkpointing(
-                checkpoint_dir.clone(),
-                Duration::from_secs(60),
-                5, // Keep 5 checkpoints
-            ).unwrap();
+            store
+                .enable_checkpointing(
+                    checkpoint_dir.clone(),
+                    Duration::from_secs(60),
+                    5, // Keep 5 checkpoints
+                )
+                .unwrap();
 
             // Checkpoint 1: only key1
             store.put(b"key1", b"v1").unwrap();
@@ -923,13 +924,12 @@ mod tests {
                 &wal_path,
                 1024 * 1024,
                 Duration::from_millis(10),
-            ).unwrap();
+            )
+            .unwrap();
 
-            store.enable_checkpointing(
-                checkpoint_dir.clone(),
-                Duration::from_secs(60),
-                5,
-            ).unwrap();
+            store
+                .enable_checkpointing(checkpoint_dir.clone(), Duration::from_secs(60), 5)
+                .unwrap();
 
             store.recover().unwrap();
 
@@ -959,7 +959,8 @@ mod tests {
                 &wal_path,
                 1024 * 1024,
                 Duration::from_millis(10),
-            ).unwrap();
+            )
+            .unwrap();
             store.set_sync_on_write(true);
 
             store.put(b"a", b"1").unwrap();
@@ -981,7 +982,8 @@ mod tests {
                 &wal_path,
                 1024 * 1024,
                 Duration::from_millis(10),
-            ).unwrap();
+            )
+            .unwrap();
 
             // No checkpointing enabled - pure WAL replay
             store.recover().unwrap();

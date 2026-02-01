@@ -298,7 +298,10 @@ mod tests {
         assert_eq!(config.effective_buffer_size(), 128); // Next power of 2
 
         let config = ChannelConfig::with_buffer_size(1);
-        assert_eq!(config.effective_buffer_size(), MIN_BUFFER_SIZE.next_power_of_two());
+        assert_eq!(
+            config.effective_buffer_size(),
+            MIN_BUFFER_SIZE.next_power_of_two()
+        );
     }
 
     #[test]
@@ -333,8 +336,10 @@ mod tests {
 
     #[test]
     fn test_channel_stats() {
-        let mut stats = ChannelStats::default();
-        stats.items_pushed = 100;
+        let mut stats = ChannelStats {
+            items_pushed: 100,
+            ..ChannelStats::default()
+        };
         stats.items_popped = 80;
         stats.items_dropped = 5;
 

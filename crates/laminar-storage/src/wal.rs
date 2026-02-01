@@ -39,19 +39,16 @@ use std::path::{Path, PathBuf};
 use std::time::{Duration, Instant};
 
 use rkyv::{
-    Archive,
-    Deserialize as RkyvDeserialize,
+    rancor::Error as RkyvError, util::AlignedVec, Archive, Deserialize as RkyvDeserialize,
     Serialize as RkyvSerialize,
-    rancor::Error as RkyvError,
-    util::AlignedVec,
 };
 
 // Module to contain types that use derive macros with generated code
 mod wal_types {
-    #![allow(missing_docs)]  // Allow for derive-generated code
+    #![allow(missing_docs)] // Allow for derive-generated code
 
-    use std::collections::HashMap;
     use rkyv::{Archive, Deserialize as RkyvDeserialize, Serialize as RkyvSerialize};
+    use std::collections::HashMap;
 
     /// WAL entry types representing different operations.
     #[derive(Debug, Clone, Archive, RkyvSerialize, RkyvDeserialize)]
@@ -170,10 +167,7 @@ impl WriteAheadLog {
     /// Returns `WalError::Io` if the file cannot be created or opened.
     pub fn new<P: AsRef<Path>>(path: P, sync_interval: Duration) -> Result<Self, WalError> {
         let path = path.as_ref().to_path_buf();
-        let file = OpenOptions::new()
-            .create(true)
-            .append(true)
-            .open(&path)?;
+        let file = OpenOptions::new().create(true).append(true).open(&path)?;
 
         let position = file.metadata()?.len();
 
@@ -224,9 +218,14 @@ impl WriteAheadLog {
         }
         #[allow(clippy::cast_possible_truncation)]
         let len = bytes.len() as u32;
-        self.writer.write_all(&len.to_le_bytes())?;
-        self.writer.write_all(&crc.to_le_bytes())?;
-        self.writer.write_all(&bytes)?;
+
+        // Optimize: Coalesce writes into a single buffer to reduce syscalls/locking overhead
+        let mut buffer = Vec::with_capacity(RECORD_HEADER_SIZE as usize + bytes.len());
+        buffer.extend_from_slice(&len.to_le_bytes());
+        buffer.extend_from_slice(&crc.to_le_bytes());
+        buffer.extend_from_slice(&bytes);
+
+        self.writer.write_all(&buffer)?;
 
         let bytes_len = bytes.len() as u64;
         self.position += RECORD_HEADER_SIZE + bytes_len;
@@ -312,9 +311,7 @@ impl WriteAheadLog {
         file.set_len(position)?;
 
         // Reopen for append
-        let file = OpenOptions::new()
-            .append(true)
-            .open(&self.path)?;
+        let file = OpenOptions::new().append(true).open(&self.path)?;
 
         self.writer = BufWriter::new(file);
         self.position = position;
@@ -716,7 +713,10 @@ mod tests {
         assert_eq!(entries.len(), 1);
 
         match &entries[0] {
-            WalEntry::Commit { offsets: read_offsets, watermark } => {
+            WalEntry::Commit {
+                offsets: read_offsets,
+                watermark,
+            } => {
                 assert_eq!(read_offsets.get("topic1"), Some(&100));
                 assert_eq!(read_offsets.get("topic2"), Some(&200));
                 assert_eq!(*watermark, Some(1000));

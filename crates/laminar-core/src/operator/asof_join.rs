@@ -128,8 +128,7 @@ impl AsofJoinConfig {
     #[must_use]
     #[allow(clippy::cast_possible_truncation)]
     pub fn tolerance_ms(&self) -> i64 {
-        self.tolerance
-            .map_or(i64::MAX, |d| d.as_millis() as i64)
+        self.tolerance.map_or(i64::MAX, |d| d.as_millis() as i64)
     }
 }
 
@@ -203,12 +202,12 @@ impl AsofJoinConfigBuilder {
     /// (`key_column`, `left_time_column`, `right_time_column`) are not set.
     pub fn build(self) -> Result<AsofJoinConfig, OperatorError> {
         Ok(AsofJoinConfig {
-            key_column: self.key_column.ok_or_else(|| {
-                OperatorError::ConfigError("key_column is required".into())
-            })?,
-            left_time_column: self.left_time_column.ok_or_else(|| {
-                OperatorError::ConfigError("left_time_column is required".into())
-            })?,
+            key_column: self
+                .key_column
+                .ok_or_else(|| OperatorError::ConfigError("key_column is required".into()))?,
+            left_time_column: self
+                .left_time_column
+                .ok_or_else(|| OperatorError::ConfigError("left_time_column is required".into()))?,
             right_time_column: self.right_time_column.ok_or_else(|| {
                 OperatorError::ConfigError("right_time_column is required".into())
             })?,
@@ -750,8 +749,7 @@ impl AsofJoinOperator {
     /// Updates the output schema when both input schemas are known.
     fn update_output_schema(&mut self) {
         if let (Some(left), Some(right)) = (&self.left_schema, &self.right_schema) {
-            let mut fields: Vec<Field> =
-                left.fields().iter().map(|f| f.as_ref().clone()).collect();
+            let mut fields: Vec<Field> = left.fields().iter().map(|f| f.as_ref().clone()).collect();
 
             // Add right fields, prefixing duplicates
             for field in right.fields() {
@@ -816,7 +814,6 @@ impl AsofJoinOperator {
             _ => Arc::new(Int64Array::from(vec![None; num_rows])) as ArrayRef,
         }
     }
-
 }
 
 impl Operator for AsofJoinOperator {
@@ -861,7 +858,14 @@ impl Operator for AsofJoinOperator {
     }
 
     fn restore(&mut self, state: OperatorState) -> Result<(), OperatorError> {
-        type CheckpointData = (i64, u64, u64, u64, u64, Vec<(Vec<u8>, SerializableKeyState)>);
+        type CheckpointData = (
+            i64,
+            u64,
+            u64,
+            u64,
+            u64,
+            Vec<(Vec<u8>, SerializableKeyState)>,
+        );
 
         if state.operator_id != self.operator_id {
             return Err(OperatorError::StateAccessFailed(format!(
@@ -1023,7 +1027,13 @@ mod tests {
             operator.process_left(&trade, &mut ctx)
         };
 
-        assert_eq!(outputs.iter().filter(|o| matches!(o, Output::Event(_))).count(), 1);
+        assert_eq!(
+            outputs
+                .iter()
+                .filter(|o| matches!(o, Output::Event(_)))
+                .count(),
+            1
+        );
         assert_eq!(operator.metrics().matches, 1);
 
         // Verify output has both trade and quote columns
@@ -1066,7 +1076,13 @@ mod tests {
             operator.process_left(&trade, &mut ctx)
         };
 
-        assert_eq!(outputs.iter().filter(|o| matches!(o, Output::Event(_))).count(), 1);
+        assert_eq!(
+            outputs
+                .iter()
+                .filter(|o| matches!(o, Output::Event(_)))
+                .count(),
+            1
+        );
         assert_eq!(operator.metrics().matches, 1);
     }
 
@@ -1105,7 +1121,13 @@ mod tests {
             operator.process_left(&trade, &mut ctx)
         };
 
-        assert_eq!(outputs.iter().filter(|o| matches!(o, Output::Event(_))).count(), 1);
+        assert_eq!(
+            outputs
+                .iter()
+                .filter(|o| matches!(o, Output::Event(_)))
+                .count(),
+            1
+        );
     }
 
     #[test]
@@ -1177,7 +1199,13 @@ mod tests {
             operator.process_left(&trade, &mut ctx)
         };
 
-        assert_eq!(outputs.iter().filter(|o| matches!(o, Output::Event(_))).count(), 1);
+        assert_eq!(
+            outputs
+                .iter()
+                .filter(|o| matches!(o, Output::Event(_)))
+                .count(),
+            1
+        );
         assert_eq!(operator.metrics().within_tolerance, 1);
     }
 
@@ -1241,7 +1269,13 @@ mod tests {
             operator.process_left(&trade, &mut ctx)
         };
 
-        assert_eq!(outputs.iter().filter(|o| matches!(o, Output::Event(_))).count(), 1);
+        assert_eq!(
+            outputs
+                .iter()
+                .filter(|o| matches!(o, Output::Event(_)))
+                .count(),
+            1
+        );
 
         // Trade for GOOG should match GOOG quote
         let trade2 = create_trade_event(1000, "GOOG", 2800.5);
@@ -1250,7 +1284,13 @@ mod tests {
             operator.process_left(&trade2, &mut ctx)
         };
 
-        assert_eq!(outputs2.iter().filter(|o| matches!(o, Output::Event(_))).count(), 1);
+        assert_eq!(
+            outputs2
+                .iter()
+                .filter(|o| matches!(o, Output::Event(_)))
+                .count(),
+            1
+        );
         assert_eq!(operator.metrics().matches, 2);
     }
 
@@ -1276,7 +1316,8 @@ mod tests {
         {
             let mut ctx = create_test_context(&mut timers, &mut state, &mut watermark_gen);
             operator.process_right(&create_quote_event(950, "AAPL", 150.0, 151.0), &mut ctx);
-            operator.process_right(&create_quote_event(950, "AAPL", 150.5, 151.5), &mut ctx); // Same ts
+            operator.process_right(&create_quote_event(950, "AAPL", 150.5, 151.5), &mut ctx);
+            // Same ts
         }
 
         // Trade should match (last quote at that timestamp for Backward)
@@ -1286,7 +1327,13 @@ mod tests {
             operator.process_left(&trade, &mut ctx)
         };
 
-        assert_eq!(outputs.iter().filter(|o| matches!(o, Output::Event(_))).count(), 1);
+        assert_eq!(
+            outputs
+                .iter()
+                .filter(|o| matches!(o, Output::Event(_)))
+                .count(),
+            1
+        );
     }
 
     #[test]
@@ -1325,7 +1372,13 @@ mod tests {
         };
 
         // Left join should emit with nulls
-        assert_eq!(outputs.iter().filter(|o| matches!(o, Output::Event(_))).count(), 1);
+        assert_eq!(
+            outputs
+                .iter()
+                .filter(|o| matches!(o, Output::Event(_)))
+                .count(),
+            1
+        );
         assert_eq!(operator.metrics().unmatched_left, 1);
 
         if let Some(Output::Event(event)) = outputs.first() {
@@ -1650,12 +1703,18 @@ mod tests {
         }
 
         // Trade much later should still match with unlimited tolerance
-        let trade = create_trade_event(1000000, "AAPL", 150.5);
+        let trade = create_trade_event(1_000_000, "AAPL", 150.5);
         let outputs = {
             let mut ctx = create_test_context(&mut timers, &mut state, &mut watermark_gen);
             operator.process_left(&trade, &mut ctx)
         };
 
-        assert_eq!(outputs.iter().filter(|o| matches!(o, Output::Event(_))).count(), 1);
+        assert_eq!(
+            outputs
+                .iter()
+                .filter(|o| matches!(o, Output::Event(_)))
+                .count(),
+            1
+        );
     }
 }

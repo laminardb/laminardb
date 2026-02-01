@@ -61,8 +61,6 @@
 //! ```
 
 use bytes::Bytes;
-use std::collections::BTreeMap;
-use std::ops::Bound;
 use rkyv::{
     api::high::{HighDeserializer, HighSerializer, HighValidator},
     bytecheck::CheckBytes,
@@ -71,6 +69,8 @@ use rkyv::{
     util::AlignedVec,
     Archive, Deserialize as RkyvDeserialize, Serialize as RkyvSerialize,
 };
+use std::collections::BTreeMap;
+use std::ops::Bound;
 use std::ops::Range;
 
 /// Compute the lexicographic successor of a byte prefix.
@@ -598,16 +598,20 @@ impl StateStore for InMemoryStore {
 /// Errors that can occur in state operations.
 #[derive(Debug, thiserror::Error)]
 pub enum StateError {
-    /// I/O error (for memory-mapped stores)
+    /// I/O error
     #[error("I/O error: {0}")]
     Io(#[from] std::io::Error),
 
-    /// Serialization/deserialization error
+    /// Serialization error
     #[error("Serialization error: {0}")]
     Serialization(String),
 
-    /// State corruption detected
-    #[error("State corruption: {0}")]
+    /// Deserialization error
+    #[error("Deserialization error: {0}")]
+    Deserialization(String),
+
+    /// Corruption error
+    #[error("Corruption error: {0}")]
     Corruption(String),
 
     /// Operation not supported by this store type
@@ -697,7 +701,7 @@ mod tests {
         store.put(b"c", b"3").unwrap();
         store.put(b"d", b"4").unwrap();
 
-        let results: Vec<_> = store.range_scan(b"b"..b"d").collect();
+        let results: Vec<_> = store.range_scan(b"b".as_slice()..b"d".as_slice()).collect();
         assert_eq!(results.len(), 2);
 
         let keys: Vec<_> = results.iter().map(|(k, _)| k.as_ref()).collect();
@@ -890,21 +894,11 @@ mod tests {
         let prefix_a = [0x00, 0x01]; // partition 0, stream 1
         let prefix_b = [0x00, 0x02]; // partition 0, stream 2
 
-        store
-            .put(&[0x00, 0x01, 0xAA], b"val1")
-            .unwrap();
-        store
-            .put(&[0x00, 0x01, 0xBB], b"val2")
-            .unwrap();
-        store
-            .put(&[0x00, 0x02, 0xCC], b"val3")
-            .unwrap();
-        store
-            .put(&[0x00, 0x02, 0xDD], b"val4")
-            .unwrap();
-        store
-            .put(&[0x01, 0x01, 0xEE], b"val5")
-            .unwrap();
+        store.put(&[0x00, 0x01, 0xAA], b"val1").unwrap();
+        store.put(&[0x00, 0x01, 0xBB], b"val2").unwrap();
+        store.put(&[0x00, 0x02, 0xCC], b"val3").unwrap();
+        store.put(&[0x00, 0x02, 0xDD], b"val4").unwrap();
+        store.put(&[0x01, 0x01, 0xEE], b"val5").unwrap();
 
         // Prefix scan for partition_a
         let results_a: Vec<_> = store.prefix_scan(&prefix_a).collect();
@@ -936,7 +930,11 @@ mod tests {
         let keys: Vec<_> = results.iter().map(|(k, _)| k.as_ref().to_vec()).collect();
         assert_eq!(
             keys,
-            vec![b"prefix:a".to_vec(), b"prefix:b".to_vec(), b"prefix:c".to_vec()]
+            vec![
+                b"prefix:a".to_vec(),
+                b"prefix:b".to_vec(),
+                b"prefix:c".to_vec()
+            ]
         );
     }
 }
