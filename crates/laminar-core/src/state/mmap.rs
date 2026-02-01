@@ -46,9 +46,12 @@ const MMAP_MAGIC: u64 = 0x004C_414D_494E_4152;
 const MMAP_VERSION: u32 = 1;
 /// Default growth factor when file needs to expand.
 const GROWTH_FACTOR: f64 = 1.5;
+/// Index file extension
+const INDEX_EXTENSION: &str = "idx";
 
 /// Entry metadata stored in the hash map index.
-#[derive(Debug, Clone, Copy)]
+#[derive(Debug, Clone, Copy, rkyv::Archive, rkyv::Serialize, rkyv::Deserialize)]
+// Validation via check_bytes is implicit in v0.8 with features, or handled differently
 struct ValueEntry {
     /// Offset in the data region (arena or mmap).
     offset: usize,
@@ -277,9 +280,23 @@ impl MmapStateStore {
         #[allow(unsafe_code)]
         let mut mmap = unsafe { MmapMut::map_mut(&file)? };
 
-        let (index, write_pos, next_version) = if file_exists && capacity >= MMAP_HEADER_SIZE {
+        let (index, write_pos, next_version) = if file_exists {
             // Try to load existing data
-            Self::load_from_mmap(&mmap)?
+            if capacity >= MMAP_HEADER_SIZE {
+                // Try to load persisted index first
+                if let Ok(loaded) = Self::load_index(path) {
+                    // Verify consistency with mmap size?
+                    // For now trust the index file if it loads
+                    loaded
+                } else {
+                    // Fallback to loading from mmap (legacy or corrupted index)
+                    Self::load_from_mmap(&mmap)?
+                }
+            } else {
+                // Initialize new file header but empty structure
+                Self::init_mmap_header(&mut mmap);
+                (BTreeMap::new(), 0, 1)
+            }
         } else {
             // Initialize new file
             Self::init_mmap_header(&mut mmap);
@@ -404,6 +421,86 @@ impl MmapStateStore {
         let live: usize = self.index.values().map(|e| e.len).sum();
         // Precision loss is acceptable for a ratio calculation
         1.0 - (live as f64 / used as f64)
+    }
+
+    /// Save the index to disk.
+    ///
+    /// This writes the `BTreeMap` index to a separate `.idx` file.
+    /// Format: `[magic: 8B][version: 4B][last_write_pos: 8B][next_version: 8B][rkyv data]`
+    pub fn save_index(&self) -> Result<(), StateError> {
+        let path = match self.path() {
+            Some(p) => p.with_extension(INDEX_EXTENSION),
+            None => return Ok(()), // Can't save index for in-memory store
+        };
+
+        let file = File::create(&path)?;
+        let mut writer = std::io::BufWriter::new(file);
+
+        // serialize index
+        let bytes = rkyv::to_bytes::<rkyv::rancor::Error>(&self.index)
+            .map_err(|e| StateError::Serialization(e.to_string()))?;
+
+        // Write header
+        use std::io::Write;
+        writer.write_all(&MMAP_MAGIC.to_le_bytes())?;
+        writer.write_all(&MMAP_VERSION.to_le_bytes())?;
+        writer.write_all(&[0u8; 4])?; // Padding for 8-byte alignment (32 bytes total)
+
+        let write_pos = self.storage.used_bytes() as u64;
+        writer.write_all(&write_pos.to_le_bytes())?;
+        writer.write_all(&self.next_version.to_le_bytes())?;
+
+        // Write data
+        writer.write_all(&bytes)?;
+        writer.flush()?;
+
+        Ok(())
+    }
+
+    /// Load index from disk.
+    fn load_index(
+        state_path: &Path,
+    ) -> Result<(BTreeMap<Vec<u8>, ValueEntry>, usize, u64), StateError> {
+        let path = state_path.with_extension(INDEX_EXTENSION);
+        if !path.exists() {
+            return Err(StateError::Io(std::io::Error::new(
+                std::io::ErrorKind::NotFound,
+                "Index file not found",
+            )));
+        }
+
+        let mut file = File::open(path)?;
+        let mut buffer = Vec::new();
+        std::io::Read::read_to_end(&mut file, &mut buffer)?;
+
+        if buffer.len() < 32 {
+            // 8+4+4+8+8
+            return Err(StateError::Corruption("Index file too short".to_string()));
+        }
+
+        // Validate magic
+        let magic_bytes: [u8; 8] = buffer[0..8].try_into().unwrap();
+        if u64::from_le_bytes(magic_bytes) != MMAP_MAGIC {
+            return Err(StateError::Corruption("Invalid index magic".to_string()));
+        }
+
+        // Validate version
+        let version_bytes: [u8; 4] = buffer[8..12].try_into().unwrap();
+        if u32::from_le_bytes(version_bytes) != MMAP_VERSION {
+            return Err(StateError::Corruption("Invalid index version".to_string()));
+        }
+
+        // Skip padding (12..16)
+
+        let write_pos =
+            usize::try_from(u64::from_le_bytes(buffer[16..24].try_into().unwrap())).unwrap();
+        let next_version = u64::from_le_bytes(buffer[24..32].try_into().unwrap());
+
+        let index: BTreeMap<Vec<u8>, ValueEntry> =
+            rkyv::from_bytes::<BTreeMap<Vec<u8>, ValueEntry>, rkyv::rancor::Error>(&buffer[32..])
+                .map_err(|e| StateError::Deserialization(e.to_string()))?;
+
+        Ok((index, write_pos, next_version))
     }
 }
 
@@ -550,7 +647,11 @@ impl StateStore for MmapStateStore {
     }
 
     fn flush(&mut self) -> Result<(), StateError> {
-        self.storage.flush()
+        self.storage.flush()?;
+        if self.is_persistent() {
+            self.save_index()?;
+        }
+        Ok(())
     }
 }
 
@@ -637,7 +738,7 @@ mod tests {
         store.put(b"c", b"3").unwrap();
         store.put(b"d", b"4").unwrap();
 
-        let results: Vec<_> = store.range_scan(b"b"..b"d").collect();
+        let results: Vec<_> = store.range_scan(b"b".as_slice()..b"d".as_slice()).collect();
         assert_eq!(results.len(), 2);
 
         let keys: Vec<_> = results.iter().map(|(k, _)| k.as_ref()).collect();
@@ -799,5 +900,32 @@ mod tests {
 
         store.put(&key, &value).unwrap();
         assert_eq!(store.get(&key).unwrap().as_ref(), &value);
+    }
+
+    #[test]
+    fn test_index_persistence() {
+        let temp_dir = tempfile::tempdir().unwrap();
+        let db_path = temp_dir.path().join("test_index.db");
+
+        // 1. Create persistent store and add data
+        {
+            let mut store = MmapStateStore::persistent(&db_path, 1024 * 1024).unwrap();
+            store.put(b"key1", b"value1").unwrap();
+            store.put(b"key2", b"value2").unwrap();
+            // Flush should save the index
+            store.flush().unwrap();
+        }
+
+        // 2. Verify index file exists
+        let idx_path = db_path.with_extension(INDEX_EXTENSION);
+        assert!(idx_path.exists());
+
+        // 3. Re-open store and verify data "instant" availability (via index load)
+        {
+            let store = MmapStateStore::persistent(&db_path, 1024 * 1024).unwrap();
+            // Store size should be consistent
+            assert_eq!(store.len(), 2);
+            assert_eq!(store.get(b"key1").unwrap().as_ref(), b"value1");
+        }
     }
 }

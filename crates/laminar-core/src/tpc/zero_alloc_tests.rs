@@ -123,9 +123,9 @@ mod tests {
             }
 
             // Hot path: pop using zero-alloc API
-            let _guard = HotPathGuard::enter("batch_perf");
+            let guard = HotPathGuard::enter("batch_perf");
             let count = queue.pop_batch_into(&mut buffer);
-            drop(_guard);
+            drop(guard);
 
             assert_eq!(count, BATCH_SIZE);
         }

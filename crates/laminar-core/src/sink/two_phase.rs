@@ -149,7 +149,10 @@ impl ParticipantState {
     /// Check if participant voted no or timed out
     #[must_use]
     pub fn voted_no_or_timeout(&self) -> bool {
-        matches!(self.vote, Some(ParticipantVote::No | ParticipantVote::Timeout))
+        matches!(
+            self.vote,
+            Some(ParticipantVote::No | ParticipantVote::Timeout)
+        )
     }
 }
 
@@ -437,8 +440,9 @@ impl TransactionLog {
     /// - Committed: need to re-send commit
     /// - To abort: were in PREPARING state (presumed abort)
     #[must_use]
-    pub fn get_pending_for_recovery(&self) -> (Vec<&TransactionLogEntry>, Vec<&TransactionLogEntry>)
-    {
+    pub fn get_pending_for_recovery(
+        &self,
+    ) -> (Vec<&TransactionLogEntry>, Vec<&TransactionLogEntry>) {
         let mut committed = Vec::new();
         let mut to_abort = Vec::new();
 
@@ -460,7 +464,8 @@ impl TransactionLog {
         let ids_to_remove: std::collections::HashSet<u64> =
             tx_ids.iter().map(TransactionId::id).collect();
 
-        self.entries.retain(|e| !ids_to_remove.contains(&e.tx_id.id()));
+        self.entries
+            .retain(|e| !ids_to_remove.contains(&e.tx_id.id()));
 
         // Rebuild index
         self.index.clear();
@@ -711,9 +716,10 @@ impl TwoPhaseCoordinator {
         participant_id: &str,
         vote: ParticipantVote,
     ) -> Result<(), SinkError> {
-        let record = self.active.get_mut(&tx_id.id()).ok_or_else(|| {
-            SinkError::Internal(format!("Transaction not found: {}", tx_id.id()))
-        })?;
+        let record = self
+            .active
+            .get_mut(&tx_id.id())
+            .ok_or_else(|| SinkError::Internal(format!("Transaction not found: {}", tx_id.id())))?;
 
         if let Some(participant) = record.participants.get_mut(participant_id) {
             participant.record_vote(vote);
@@ -725,9 +731,9 @@ impl TwoPhaseCoordinator {
     /// Check if we can make a decision (all votes received or any no/timeout)
     #[must_use]
     pub fn can_decide(&self, tx_id: &TransactionId) -> bool {
-        self.active.get(&tx_id.id()).is_some_and(|record| {
-            record.all_voted_yes() || record.any_voted_no_or_timeout()
-        })
+        self.active
+            .get(&tx_id.id())
+            .is_some_and(|record| record.all_voted_yes() || record.any_voted_no_or_timeout())
     }
 
     /// Make the commit/abort decision
@@ -738,9 +744,10 @@ impl TwoPhaseCoordinator {
     ///
     /// Returns an error if the transaction is not found.
     pub fn decide(&mut self, tx_id: &TransactionId) -> Result<CoordinatorDecision, SinkError> {
-        let record = self.active.get_mut(&tx_id.id()).ok_or_else(|| {
-            SinkError::Internal(format!("Transaction not found: {}", tx_id.id()))
-        })?;
+        let record = self
+            .active
+            .get_mut(&tx_id.id())
+            .ok_or_else(|| SinkError::Internal(format!("Transaction not found: {}", tx_id.id())))?;
 
         let decision = if record.all_voted_yes() {
             CoordinatorDecision::Committed
@@ -839,7 +846,10 @@ impl TwoPhaseCoordinator {
     ///
     /// Returns a tuple of committed and to-abort entries that need action.
     #[must_use]
-    pub fn recover(&mut self, log_bytes: &[u8]) -> (Vec<TransactionLogEntry>, Vec<TransactionLogEntry>) {
+    pub fn recover(
+        &mut self,
+        log_bytes: &[u8],
+    ) -> (Vec<TransactionLogEntry>, Vec<TransactionLogEntry>) {
         match TransactionLog::from_bytes(log_bytes) {
             Ok(log) => {
                 let (committed, to_abort) = log.get_pending_for_recovery();
@@ -860,7 +870,8 @@ impl TwoPhaseCoordinator {
     pub fn force_abort(&mut self, tx_id: &TransactionId) -> Result<(), SinkError> {
         if let Some(record) = self.active.get_mut(&tx_id.id()) {
             record.make_decision(CoordinatorDecision::Aborted);
-            self.log.update_decision(tx_id, CoordinatorDecision::Aborted);
+            self.log
+                .update_decision(tx_id, CoordinatorDecision::Aborted);
             Ok(())
         } else {
             Err(SinkError::Internal(format!(
@@ -941,12 +952,20 @@ mod tests {
         assert_eq!(record.pending_voters().len(), 2);
 
         // Vote yes from sink-1
-        record.participants.get_mut("sink-1").unwrap().record_vote(ParticipantVote::Yes);
+        record
+            .participants
+            .get_mut("sink-1")
+            .unwrap()
+            .record_vote(ParticipantVote::Yes);
         assert!(!record.all_voted_yes());
         assert_eq!(record.pending_voters().len(), 1);
 
         // Vote yes from sink-2
-        record.participants.get_mut("sink-2").unwrap().record_vote(ParticipantVote::Yes);
+        record
+            .participants
+            .get_mut("sink-2")
+            .unwrap()
+            .record_vote(ParticipantVote::Yes);
         assert!(record.all_voted_yes());
         assert!(record.pending_voters().is_empty());
     }
@@ -957,8 +976,16 @@ mod tests {
         let participants = vec!["sink-1".to_string(), "sink-2".to_string()];
         let mut record = TransactionRecord::new(tx_id, &participants);
 
-        record.participants.get_mut("sink-1").unwrap().record_vote(ParticipantVote::Yes);
-        record.participants.get_mut("sink-2").unwrap().record_vote(ParticipantVote::No);
+        record
+            .participants
+            .get_mut("sink-1")
+            .unwrap()
+            .record_vote(ParticipantVote::Yes);
+        record
+            .participants
+            .get_mut("sink-2")
+            .unwrap()
+            .record_vote(ParticipantVote::No);
 
         assert!(!record.all_voted_yes());
         assert!(record.any_voted_no_or_timeout());
@@ -970,7 +997,7 @@ mod tests {
             tx_id: TransactionId::new(123),
             decision: CoordinatorDecision::Committed,
             participants: vec!["sink-1".to_string(), "sink-2".to_string()],
-            timestamp: 1706000000000,
+            timestamp: 1_706_000_000_000,
         };
 
         let bytes = entry.to_bytes();
@@ -979,7 +1006,7 @@ mod tests {
         assert_eq!(restored.tx_id.id(), 123);
         assert_eq!(restored.decision, CoordinatorDecision::Committed);
         assert_eq!(restored.participants, vec!["sink-1", "sink-2"]);
-        assert_eq!(restored.timestamp, 1706000000000);
+        assert_eq!(restored.timestamp, 1_706_000_000_000);
     }
 
     #[test]
@@ -1035,7 +1062,10 @@ mod tests {
         let bytes = log.to_bytes();
         let restored = TransactionLog::from_bytes(&bytes).unwrap();
 
-        assert_eq!(restored.get_decision(&tx1), Some(CoordinatorDecision::Committed));
+        assert_eq!(
+            restored.get_decision(&tx1),
+            Some(CoordinatorDecision::Committed)
+        );
         assert_eq!(restored.entries().len(), 1);
     }
 
@@ -1074,10 +1104,14 @@ mod tests {
         coord.mark_prepare_sent(&tx_id, "sink-2");
 
         // Record votes
-        coord.record_vote(&tx_id, "sink-1", ParticipantVote::Yes).unwrap();
+        coord
+            .record_vote(&tx_id, "sink-1", ParticipantVote::Yes)
+            .unwrap();
         assert!(!coord.can_decide(&tx_id));
 
-        coord.record_vote(&tx_id, "sink-2", ParticipantVote::Yes).unwrap();
+        coord
+            .record_vote(&tx_id, "sink-2", ParticipantVote::Yes)
+            .unwrap();
         assert!(coord.can_decide(&tx_id));
 
         // Make decision
@@ -1104,8 +1138,12 @@ mod tests {
 
         let tx_id = coord.begin_transaction().unwrap();
 
-        coord.record_vote(&tx_id, "sink-1", ParticipantVote::Yes).unwrap();
-        coord.record_vote(&tx_id, "sink-2", ParticipantVote::No).unwrap();
+        coord
+            .record_vote(&tx_id, "sink-1", ParticipantVote::Yes)
+            .unwrap();
+        coord
+            .record_vote(&tx_id, "sink-2", ParticipantVote::No)
+            .unwrap();
 
         assert!(coord.can_decide(&tx_id));
 
@@ -1155,7 +1193,9 @@ mod tests {
         coord1.register_participant("sink-1");
 
         let tx_id = coord1.begin_transaction().unwrap();
-        coord1.record_vote(&tx_id, "sink-1", ParticipantVote::Yes).unwrap();
+        coord1
+            .record_vote(&tx_id, "sink-1", ParticipantVote::Yes)
+            .unwrap();
         coord1.decide(&tx_id).unwrap();
 
         // Serialize the log
@@ -1210,8 +1250,12 @@ mod tests {
 
         // After voting and decision, get commit targets
         coord.mark_prepare_sent(&tx_id, "sink-2");
-        coord.record_vote(&tx_id, "sink-1", ParticipantVote::Yes).unwrap();
-        coord.record_vote(&tx_id, "sink-2", ParticipantVote::Yes).unwrap();
+        coord
+            .record_vote(&tx_id, "sink-1", ParticipantVote::Yes)
+            .unwrap();
+        coord
+            .record_vote(&tx_id, "sink-2", ParticipantVote::Yes)
+            .unwrap();
         coord.decide(&tx_id).unwrap();
 
         let commit_targets = coord.get_commit_targets(&tx_id);

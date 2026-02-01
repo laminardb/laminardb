@@ -218,8 +218,8 @@ mod tests {
     #[test]
     fn test_xdp_stats_rates_zero_total() {
         let stats = XdpStats::default();
-        assert_eq!(stats.drop_rate(), 0.0);
-        assert_eq!(stats.redirect_rate(), 0.0);
+        assert!(stats.drop_rate().abs() < f64::EPSILON);
+        assert!(stats.redirect_rate().abs() < f64::EPSILON);
     }
 
     #[test]

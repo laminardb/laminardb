@@ -328,7 +328,6 @@ impl<T> Producer<T> {
         self.inner.stats.snapshot()
     }
 
-
     fn push_blocking(&self, mut item: T) -> Result<(), StreamingError> {
         loop {
             match self.try_push(item) {
@@ -633,7 +632,6 @@ impl<T> Consumer<T> {
         self.inner.stats.snapshot()
     }
 
-
     #[inline]
     fn poll_spsc(&self) -> Option<T> {
         let item = self.inner.buffer.pop();
@@ -895,7 +893,10 @@ mod tests {
 
         // Push should fail with closed error
         assert!(producer.is_closed());
-        assert!(matches!(producer.push(1), Err(StreamingError::ChannelClosed)));
+        assert!(matches!(
+            producer.push(1),
+            Err(StreamingError::ChannelClosed)
+        ));
     }
 
     #[test]
@@ -966,8 +967,8 @@ mod tests {
 
         let stats = producer.stats();
         assert_eq!(stats.items_pushed, 5);
-        assert_eq!(stats.items_popped, 5);  // All 5 items popped (3 + 2)
-        assert!(stats.pop_empty >= 2);  // At least 2 empty polls
+        assert_eq!(stats.items_popped, 5); // All 5 items popped (3 + 2)
+        assert!(stats.pop_empty >= 2); // At least 2 empty polls
     }
 
     #[test]
@@ -1000,7 +1001,7 @@ mod tests {
 
         assert_eq!(received.len(), ITEMS as usize);
         for (i, &item) in received.iter().enumerate() {
-            assert_eq!(item, i as i32);
+            assert_eq!(item, i32::try_from(i).unwrap());
         }
     }
 
@@ -1017,7 +1018,7 @@ mod tests {
             let p = producer.clone();
             handles.push(thread::spawn(move || {
                 for i in 0..ITEMS_PER_PRODUCER {
-                    let value = (id as i32) * ITEMS_PER_PRODUCER + i;
+                    let value = i32::try_from(id).unwrap() * ITEMS_PER_PRODUCER + i;
                     while p.try_push(value).is_err() {
                         thread::yield_now();
                     }

@@ -142,7 +142,11 @@ impl CascadingWatermarkTracker {
 
     fn propagate_watermarks(&mut self, source: &str, updated: &mut Vec<(String, i64)>) {
         // Get dependents in topological order
-        let dependents: Vec<_> = self.registry.get_dependents(source).map(String::from).collect();
+        let dependents: Vec<_> = self
+            .registry
+            .get_dependents(source)
+            .map(String::from)
+            .collect();
 
         for dependent in dependents {
             if let Some(new_watermark) = self.compute_min_watermark(&dependent) {
@@ -220,7 +224,12 @@ mod tests {
 
         let schema = Arc::new(Schema::new(vec![Field::new("v", DataType::Int64, false)]));
         let mv = |n: &str, s: Vec<&str>| {
-            MaterializedView::new(n, "", s.into_iter().map(String::from).collect(), schema.clone())
+            MaterializedView::new(
+                n,
+                "",
+                s.into_iter().map(String::from).collect(),
+                schema.clone(),
+            )
         };
 
         registry.register(mv("ohlc_1s", vec!["trades"])).unwrap();
@@ -336,9 +345,8 @@ mod tests {
         let mut tracker = CascadingWatermarkTracker::new(registry);
 
         let updates = vec![("trades".to_string(), 1000)];
-        let updated = tracker.update_watermarks_batch(updates);
-
-        assert!(!updated.is_empty());
+        let new_watermarks = tracker.update_watermarks_batch(updates);
+        assert_eq!(new_watermarks.len(), 1);
         assert_eq!(tracker.get_watermark("trades"), Some(1000));
         assert_eq!(tracker.get_watermark("ohlc_1s"), Some(1000));
     }
@@ -366,7 +374,12 @@ mod tests {
 
         let schema = Arc::new(Schema::new(vec![Field::new("v", DataType::Int64, false)]));
         let mv = |n: &str, s: Vec<&str>| {
-            MaterializedView::new(n, "", s.into_iter().map(String::from).collect(), schema.clone())
+            MaterializedView::new(
+                n,
+                "",
+                s.into_iter().map(String::from).collect(),
+                schema.clone(),
+            )
         };
 
         //       source
