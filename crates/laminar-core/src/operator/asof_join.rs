@@ -226,56 +226,82 @@ const ASOF_TIMER_PREFIX: u8 = 0x50;
 /// Static counter for generating unique operator IDs.
 static ASOF_OPERATOR_COUNTER: AtomicU64 = AtomicU64::new(0);
 
+/// Stack-allocated key buffer for join keys.
+/// 24 bytes covers most string symbol names and all numeric keys.
+type AsofKey = SmallVec<[u8; 24]>;
+
 /// A stored right-side event for ASOF matching.
-#[derive(Debug, Clone, Archive, RkyvSerialize, RkyvDeserialize)]
+///
+/// Stores `Arc<RecordBatch>` directly for zero-copy access on the hot path.
+/// IPC serialization is only used during checkpoint/restore (Ring 1).
+#[derive(Debug, Clone)]
 pub struct AsofRow {
     /// Event timestamp in milliseconds.
     pub timestamp: i64,
-    /// Serialized record batch data.
-    pub data: Vec<u8>,
+    /// The record batch data (zero-copy via Arc).
+    batch: Arc<RecordBatch>,
 }
 
 impl AsofRow {
-    /// Creates a new ASOF row from an event timestamp and batch.
-    fn new(timestamp: i64, batch: &RecordBatch) -> Result<Self, OperatorError> {
-        let data = Self::serialize_batch(batch)?;
-        Ok(Self { timestamp, data })
+    /// Creates a new ASOF row from an event.
+    ///
+    /// Cost: O(1) — just an atomic increment on the Arc.
+    fn new(timestamp: i64, batch: &Arc<RecordBatch>) -> Self {
+        Self {
+            timestamp,
+            batch: Arc::clone(batch),
+        }
     }
 
-    /// Serializes a record batch to bytes.
-    fn serialize_batch(batch: &RecordBatch) -> Result<Vec<u8>, OperatorError> {
+    /// Returns a reference to the record batch.
+    #[must_use]
+    pub fn batch(&self) -> &RecordBatch {
+        &self.batch
+    }
+}
+
+/// Serializable version of [`AsofRow`] for checkpointing.
+/// IPC serialization lives here, not on the hot path.
+#[derive(Debug, Clone, Archive, RkyvSerialize, RkyvDeserialize)]
+struct SerializableAsofRow {
+    timestamp: i64,
+    data: Vec<u8>,
+}
+
+impl SerializableAsofRow {
+    /// Serializes an `AsofRow` to IPC bytes for checkpointing.
+    fn from_row(row: &AsofRow) -> Result<Self, OperatorError> {
         let mut buf = Vec::new();
         {
-            let mut writer = arrow_ipc::writer::StreamWriter::try_new(&mut buf, &batch.schema())
-                .map_err(|e| OperatorError::SerializationFailed(e.to_string()))?;
+            let mut writer =
+                arrow_ipc::writer::StreamWriter::try_new(&mut buf, &row.batch.schema())
+                    .map_err(|e| OperatorError::SerializationFailed(e.to_string()))?;
             writer
-                .write(batch)
+                .write(&row.batch)
                 .map_err(|e| OperatorError::SerializationFailed(e.to_string()))?;
             writer
                 .finish()
                 .map_err(|e| OperatorError::SerializationFailed(e.to_string()))?;
         }
-        Ok(buf)
+        Ok(Self {
+            timestamp: row.timestamp,
+            data: buf,
+        })
     }
 
-    /// Deserializes a record batch from bytes.
-    fn deserialize_batch(data: &[u8]) -> Result<RecordBatch, OperatorError> {
-        let cursor = std::io::Cursor::new(data);
+    /// Deserializes IPC bytes back to an `AsofRow` during restore.
+    fn to_row(&self) -> Result<AsofRow, OperatorError> {
+        let cursor = std::io::Cursor::new(&self.data);
         let mut reader = arrow_ipc::reader::StreamReader::try_new(cursor, None)
             .map_err(|e| OperatorError::SerializationFailed(e.to_string()))?;
-        reader
+        let batch = reader
             .next()
             .ok_or_else(|| OperatorError::SerializationFailed("Empty batch data".to_string()))?
-            .map_err(|e| OperatorError::SerializationFailed(e.to_string()))
-    }
-
-    /// Converts this row back to a record batch.
-    ///
-    /// # Errors
-    ///
-    /// Returns `OperatorError::SerializationFailed` if the batch data is invalid.
-    pub fn to_batch(&self) -> Result<RecordBatch, OperatorError> {
-        Self::deserialize_batch(&self.data)
+            .map_err(|e| OperatorError::SerializationFailed(e.to_string()))?;
+        Ok(AsofRow {
+            timestamp: self.timestamp,
+            batch: Arc::new(batch),
+        })
     }
 }
 
@@ -334,36 +360,43 @@ impl KeyState {
 /// Serializable version of `KeyState` for checkpointing.
 #[derive(Debug, Clone, Archive, RkyvSerialize, RkyvDeserialize)]
 struct SerializableKeyState {
-    events: Vec<(i64, Vec<AsofRow>)>,
+    events: Vec<(i64, Vec<SerializableAsofRow>)>,
     min_timestamp: i64,
     max_timestamp: i64,
 }
 
-impl From<&KeyState> for SerializableKeyState {
-    fn from(state: &KeyState) -> Self {
-        Self {
-            events: state
-                .events
-                .iter()
-                .map(|(ts, rows)| (*ts, rows.to_vec()))
-                .collect(),
-            min_timestamp: state.min_timestamp,
-            max_timestamp: state.max_timestamp,
-        }
-    }
-}
-
-impl From<SerializableKeyState> for KeyState {
-    fn from(state: SerializableKeyState) -> Self {
-        let mut events = BTreeMap::new();
-        for (ts, rows) in state.events {
-            events.insert(ts, SmallVec::from_vec(rows));
-        }
-        Self {
+impl SerializableKeyState {
+    /// Converts a `KeyState` to serializable form for checkpointing.
+    fn from_key_state(state: &KeyState) -> Result<Self, OperatorError> {
+        let events = state
+            .events
+            .iter()
+            .map(|(ts, rows)| {
+                let ser_rows: Result<Vec<_>, _> =
+                    rows.iter().map(SerializableAsofRow::from_row).collect();
+                ser_rows.map(|r| (*ts, r))
+            })
+            .collect::<Result<Vec<_>, _>>()?;
+        Ok(Self {
             events,
             min_timestamp: state.min_timestamp,
             max_timestamp: state.max_timestamp,
+        })
+    }
+
+    /// Converts serialized form back to a `KeyState` during restore.
+    fn to_key_state(&self) -> Result<KeyState, OperatorError> {
+        let mut events = BTreeMap::new();
+        for (ts, rows) in &self.events {
+            let asof_rows: Result<SmallVec<[AsofRow; 1]>, _> =
+                rows.iter().map(SerializableAsofRow::to_row).collect();
+            events.insert(*ts, asof_rows?);
         }
+        Ok(KeyState {
+            events,
+            min_timestamp: self.min_timestamp,
+            max_timestamp: self.max_timestamp,
+        })
     }
 }
 
@@ -423,7 +456,7 @@ pub struct AsofJoinOperator {
     /// Operator ID.
     operator_id: String,
     /// Per-key right-side state.
-    right_state: FxHashMap<Vec<u8>, KeyState>,
+    right_state: FxHashMap<AsofKey, KeyState>,
     /// Current watermark.
     watermark: i64,
     /// Metrics.
@@ -434,6 +467,10 @@ pub struct AsofJoinOperator {
     left_schema: Option<SchemaRef>,
     /// Right schema (captured from first right event).
     right_schema: Option<SchemaRef>,
+    /// Cached column index for join key in left schema.
+    left_key_index: Option<usize>,
+    /// Cached column index for join key in right schema.
+    right_key_index: Option<usize>,
 }
 
 impl AsofJoinOperator {
@@ -454,6 +491,8 @@ impl AsofJoinOperator {
             output_schema: None,
             left_schema: None,
             right_schema: None,
+            left_key_index: None,
+            right_key_index: None,
         }
     }
 
@@ -506,7 +545,9 @@ impl AsofJoinOperator {
         let mut output = OutputVec::new();
 
         // Extract join key
-        let Some(key_value) = Self::extract_key(&event.data, &self.config.key_column) else {
+        let Some(key_value) =
+            Self::extract_key(&event.data, &self.config.key_column, &mut self.left_key_index)
+        else {
             return output;
         };
 
@@ -552,7 +593,9 @@ impl AsofJoinOperator {
         let output = OutputVec::new();
 
         // Extract join key
-        let Some(key_value) = Self::extract_key(&event.data, &self.config.key_column) else {
+        let Some(key_value) =
+            Self::extract_key(&event.data, &self.config.key_column, &mut self.right_key_index)
+        else {
             return output;
         };
 
@@ -563,9 +606,7 @@ impl AsofJoinOperator {
         }
 
         // Create row and store in state (key is stored in HashMap, not in row)
-        let Ok(row) = AsofRow::new(event.timestamp, &event.data) else {
-            return output;
-        };
+        let row = AsofRow::new(event.timestamp, &event.data);
 
         // Calculate cleanup time before borrowing state
         let cleanup_time = self.calculate_cleanup_time(event.timestamp);
@@ -718,22 +759,34 @@ impl AsofJoinOperator {
     }
 
     /// Extracts the join key value from a record batch.
-    fn extract_key(batch: &RecordBatch, column_name: &str) -> Option<Vec<u8>> {
-        let column_index = batch.schema().index_of(column_name).ok()?;
+    ///
+    /// Uses a cached column index to avoid O(n) schema lookups after the first call.
+    fn extract_key(
+        batch: &RecordBatch,
+        column_name: &str,
+        cached_index: &mut Option<usize>,
+    ) -> Option<AsofKey> {
+        let column_index = if let Some(idx) = *cached_index {
+            idx
+        } else {
+            let idx = batch.schema().index_of(column_name).ok()?;
+            *cached_index = Some(idx);
+            idx
+        };
         let column = batch.column(column_index);
 
         if let Some(string_array) = column.as_any().downcast_ref::<StringArray>() {
             if string_array.is_empty() || string_array.is_null(0) {
                 return None;
             }
-            return Some(string_array.value(0).as_bytes().to_vec());
+            return Some(AsofKey::from_slice(string_array.value(0).as_bytes()));
         }
 
         if let Some(int_array) = column.as_any().downcast_ref::<Int64Array>() {
             if int_array.is_empty() || int_array.is_null(0) {
                 return None;
             }
-            return Some(int_array.value(0).to_le_bytes().to_vec());
+            return Some(AsofKey::from_slice(&int_array.value(0).to_le_bytes()));
         }
 
         None
@@ -774,10 +827,9 @@ impl AsofJoinOperator {
     /// Creates a joined event from left event and matched right row.
     fn create_joined_event(&self, left_event: &Event, right_row: &AsofRow) -> Option<Event> {
         let schema = self.output_schema.as_ref()?;
-        let right_batch = right_row.to_batch().ok()?;
 
         let mut columns: Vec<ArrayRef> = left_event.data.columns().to_vec();
-        for column in right_batch.columns() {
+        for column in right_row.batch().columns() {
             columns.push(Arc::clone(column));
         }
 
@@ -838,7 +890,11 @@ impl Operator for AsofJoinOperator {
         let state_entries: Vec<(Vec<u8>, SerializableKeyState)> = self
             .right_state
             .iter()
-            .map(|(k, v)| (k.clone(), v.into()))
+            .filter_map(|(k, v)| {
+                SerializableKeyState::from_key_state(v)
+                    .ok()
+                    .map(|s| (k.to_vec(), s))
+            })
             .collect();
 
         let checkpoint_data = (
@@ -885,7 +941,9 @@ impl Operator for AsofJoinOperator {
         // Restore state
         self.right_state.clear();
         for (key, serializable) in state_entries {
-            self.right_state.insert(key, serializable.into());
+            let key_state = serializable.to_key_state()?;
+            self.right_state
+                .insert(AsofKey::from_slice(&key), key_state);
         }
 
         Ok(())
@@ -1566,14 +1624,9 @@ mod tests {
         assert!(key_state.is_empty());
 
         // Insert some rows
-        let row1 = AsofRow {
-            timestamp: 100,
-            data: vec![],
-        };
-        let row2 = AsofRow {
-            timestamp: 200,
-            data: vec![],
-        };
+        let empty_batch = Arc::new(RecordBatch::new_empty(Arc::new(Schema::empty())));
+        let row1 = AsofRow::new(100, &empty_batch);
+        let row2 = AsofRow::new(200, &empty_batch);
 
         key_state.insert(row1);
         key_state.insert(row2);
@@ -1594,21 +1647,25 @@ mod tests {
             Field::new("symbol", DataType::Utf8, false),
             Field::new("value", DataType::Float64, false),
         ]));
-        let batch = RecordBatch::try_new(
-            schema,
-            vec![
-                Arc::new(StringArray::from(vec!["AAPL"])),
-                Arc::new(Float64Array::from(vec![150.5])),
-            ],
-        )
-        .unwrap();
+        let batch = Arc::new(
+            RecordBatch::try_new(
+                schema,
+                vec![
+                    Arc::new(StringArray::from(vec!["AAPL"])),
+                    Arc::new(Float64Array::from(vec![150.5])),
+                ],
+            )
+            .unwrap(),
+        );
 
-        let row = AsofRow::new(1000, &batch).unwrap();
+        let row = AsofRow::new(1000, &batch);
 
-        // Verify round-trip
-        let restored_batch = row.to_batch().unwrap();
-        assert_eq!(restored_batch.num_rows(), 1);
-        assert_eq!(restored_batch.num_columns(), 2);
+        // Verify round-trip through serializable form (checkpoint path)
+        let serializable = SerializableAsofRow::from_row(&row).unwrap();
+        let restored = serializable.to_row().unwrap();
+        assert_eq!(restored.batch().num_rows(), 1);
+        assert_eq!(restored.batch().num_columns(), 2);
+        assert_eq!(restored.timestamp, 1000);
     }
 
     #[test]
