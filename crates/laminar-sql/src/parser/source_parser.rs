@@ -52,11 +52,11 @@ pub fn parse_create_source(parser: &mut Parser) -> Result<CreateSourceStatement,
         .parse_object_name(false)
         .map_err(ParseError::SqlParseError)?;
 
-    // Check for FROM <connector> (...) syntax
-    let (connector_type, connector_options) = parse_from_connector(parser)?;
+    // Check for FROM <connector> (...) syntax (connector-first ordering)
+    let (mut connector_type, mut connector_options) = parse_from_connector(parser)?;
 
-    // Check for FORMAT <type> syntax
-    let format = parse_format_clause(parser)?;
+    // Check for FORMAT <type> syntax (after connector, before columns)
+    let mut format = parse_format_clause(parser)?;
 
     // SCHEMA (...) or (...) for column definitions with optional WATERMARK
     // If we have a connector, columns come after FORMAT/SCHEMA; otherwise right after name
@@ -71,6 +71,19 @@ pub fn parse_create_source(parser: &mut Parser) -> Result<CreateSourceStatement,
             (vec![], None)
         }
     };
+
+    // Check for FROM <connector> (...) syntax AFTER columns (columns-first ordering).
+    // Supports: CREATE SOURCE name (columns) FROM KAFKA (options)
+    if connector_type.is_none() {
+        let (ct, co) = parse_from_connector(parser)?;
+        if ct.is_some() {
+            connector_type = ct;
+            connector_options = co;
+        }
+        if format.is_none() {
+            format = parse_format_clause(parser)?;
+        }
+    }
 
     // WITH options (optional) — contains watermark config like event_time, watermark_delay
     let with_options = parse_with_options(parser)?;
@@ -530,5 +543,55 @@ mod tests {
         );
         assert_eq!(source.connector_type, Some("KAFKA".to_string()));
         assert_eq!(source.columns.len(), 0);
+    }
+
+    #[test]
+    fn test_columns_first_from_kafka() {
+        // Columns-first ordering: CREATE SOURCE name (cols) FROM KAFKA (opts)
+        let source = parse(
+            "CREATE SOURCE market_ticks (
+                symbol VARCHAR NOT NULL,
+                price DOUBLE NOT NULL,
+                ts BIGINT NOT NULL
+            ) FROM KAFKA (
+                brokers = 'localhost:19092',
+                topic = 'market-ticks',
+                group_id = 'laminar-demo',
+                format = 'json',
+                offset_reset = 'earliest'
+            )",
+        );
+        assert_eq!(source.name.to_string(), "market_ticks");
+        assert_eq!(source.connector_type, Some("KAFKA".to_string()));
+        assert_eq!(source.columns.len(), 3);
+        assert_eq!(
+            source.connector_options.get("brokers"),
+            Some(&"localhost:19092".to_string())
+        );
+        assert_eq!(
+            source.connector_options.get("topic"),
+            Some(&"market-ticks".to_string())
+        );
+        assert_eq!(
+            source.connector_options.get("group_id"),
+            Some(&"laminar-demo".to_string())
+        );
+        assert_eq!(source.connector_options.len(), 5);
+    }
+
+    #[test]
+    fn test_columns_first_from_kafka_with_format() {
+        let source = parse(
+            "CREATE SOURCE events (
+                id BIGINT,
+                data VARCHAR
+            ) FROM KAFKA (
+                topic = 'events'
+            ) FORMAT JSON",
+        );
+        assert_eq!(source.connector_type, Some("KAFKA".to_string()));
+        assert_eq!(source.columns.len(), 2);
+        assert!(source.format.is_some());
+        assert_eq!(source.format.as_ref().unwrap().format_type, "JSON");
     }
 }

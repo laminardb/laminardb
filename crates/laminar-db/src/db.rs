@@ -1149,12 +1149,41 @@ impl LaminarDB {
             )
         };
 
+        // Log which sources have external connectors for debugging.
+        for (name, reg) in &source_regs {
+            eprintln!(
+                "[laminar-db] Source '{}': connector_type={:?}",
+                name,
+                reg.connector_type
+            );
+        }
+        for (name, reg) in &sink_regs {
+            eprintln!(
+                "[laminar-db] Sink '{}': connector_type={:?}",
+                name,
+                reg.connector_type
+            );
+        }
+
         if has_external {
+            eprintln!(
+                "[laminar-db] Starting CONNECTOR pipeline ({} sources, {} sinks, {} streams)",
+                source_regs.len(),
+                sink_regs.len(),
+                stream_regs.len(),
+            );
             self.start_connector_pipeline(source_regs, sink_regs, stream_regs)
                 .await?;
         } else if !stream_regs.is_empty() {
+            eprintln!(
+                "[laminar-db] Starting EMBEDDED pipeline ({} streams)",
+                stream_regs.len(),
+            );
             self.start_embedded_pipeline(&stream_regs);
         } else {
+            eprintln!(
+                "[laminar-db] Starting in embedded mode (no streams)"
+            );
             tracing::info!(
                 sources = source_regs.len(),
                 sinks = sink_regs.len(),
@@ -1334,7 +1363,15 @@ impl LaminarDB {
             if reg.connector_type.is_none() {
                 continue;
             }
-            let config = build_source_config(reg)?;
+            let mut config = build_source_config(reg)?;
+
+            // Pass the SQL-defined Arrow schema to the connector so it can
+            // deserialize records with the correct column names and types.
+            if let Some(entry) = self.catalog.get_source(name) {
+                let schema_str = encode_arrow_schema(&entry.schema);
+                config.set("_arrow_schema".to_string(), schema_str);
+            }
+
             let source = self
                 .connector_registry
                 .create_source(&config)
@@ -1395,10 +1432,30 @@ impl LaminarDB {
             })?;
         }
 
+        // Get stream source handles so results also flow to db.subscribe().
+        let mut stream_sources: Vec<(
+            String,
+            streaming::Source<crate::catalog::ArrowRecord>,
+        )> = Vec::new();
+        for reg in stream_regs.values() {
+            if let Some(src) = self.catalog.get_stream_source(&reg.name) {
+                stream_sources.push((reg.name.clone(), src));
+            }
+        }
+
+        eprintln!(
+            "[laminar-db] Starting connector pipeline: {} sources, {} sinks, \
+             {} streams, {} subscriptions",
+            sources.len(),
+            sinks.len(),
+            stream_regs.len(),
+            stream_sources.len(),
+        );
         tracing::info!(
             sources = sources.len(),
             sinks = sinks.len(),
             streams = stream_regs.len(),
+            subscriptions = stream_sources.len(),
             "Starting connector pipeline"
         );
 
@@ -1407,7 +1464,10 @@ impl LaminarDB {
         let max_poll = self.config.default_buffer_size.min(1024);
 
         let handle = tokio::spawn(async move {
+            eprintln!("[laminar-db] Connector pipeline task started");
             let mut cycle_count: u64 = 0;
+            let mut total_batches: u64 = 0;
+            let mut total_records: u64 = 0;
             loop {
                 // Check for shutdown
                 tokio::select! {
@@ -1423,6 +1483,8 @@ impl LaminarDB {
                 for (name, source, _) in &mut sources {
                     match source.poll_batch(max_poll).await {
                         Ok(Some(batch)) => {
+                            total_batches += 1;
+                            total_records += batch.records.num_rows() as u64;
                             source_batches
                                 .entry(name.clone())
                                 .or_insert_with(Vec::new)
@@ -1430,6 +1492,13 @@ impl LaminarDB {
                         }
                         Ok(None) => {}
                         Err(e) => {
+                            if cycle_count < 5
+                                || cycle_count.is_multiple_of(100)
+                            {
+                                eprintln!(
+                                    "[laminar-db] Source '{name}' poll error: {e}"
+                                );
+                            }
                             tracing::warn!(
                                 source = %name,
                                 error = %e,
@@ -1441,9 +1510,41 @@ impl LaminarDB {
 
                 // Execute stream queries
                 if !source_batches.is_empty() {
+                    if total_batches <= 3 {
+                        let src_summary: Vec<_> = source_batches
+                            .iter()
+                            .map(|(k, v)| {
+                                let rows: usize = v
+                                    .iter()
+                                    .map(arrow::array::RecordBatch::num_rows)
+                                    .sum();
+                                format!("{k}({rows} rows)")
+                            })
+                            .collect();
+                        eprintln!(
+                            "[laminar-db] Executing queries with: [{}]",
+                            src_summary.join(", "),
+                        );
+                    }
                     match executor.execute_cycle(&source_batches).await {
                         Ok(results) => {
-                            // Route results to sinks
+                            // Push results to stream sources for
+                            // db.subscribe() delivery (same as
+                            // embedded pipeline).
+                            for (stream_name, src) in &stream_sources {
+                                if let Some(batches) =
+                                    results.get(stream_name)
+                                {
+                                    for batch in batches {
+                                        if batch.num_rows() > 0 {
+                                            let _ = src
+                                                .push_arrow(batch.clone());
+                                        }
+                                    }
+                                }
+                            }
+
+                            // Route results to external sinks
                             for (sink_name, sink, _, filter_expr) in
                                 &mut sinks
                             {
@@ -1493,16 +1594,30 @@ impl LaminarDB {
                             }
                         }
                         Err(e) => {
+                            if cycle_count < 5
+                                || cycle_count.is_multiple_of(100)
+                            {
+                                eprintln!(
+                                    "[laminar-db] Stream execution error: {e}"
+                                );
+                            }
                             tracing::warn!(error = %e, "Stream execution cycle error");
                         }
                     }
                 }
 
                 cycle_count += 1;
-                if cycle_count.is_multiple_of(100) {
+                if cycle_count.is_multiple_of(50) {
+                    eprintln!(
+                        "[laminar-db] Pipeline cycle {cycle_count}: {total_batches} batches, {total_records} records total",
+                    );
                     tracing::debug!(cycles = cycle_count, "Pipeline processing");
                 }
             }
+
+            eprintln!(
+                "[laminar-db] Pipeline stopping after {cycle_count} cycles ({total_batches} batches, {total_records} records)",
+            );
 
             // Close all connectors
             for (name, source, _) in &mut sources {
@@ -1875,6 +1990,19 @@ impl LaminarDB {
 
 /// Internal table name used by the sink WHERE filter.
 const FILTER_INPUT_TABLE: &str = "__laminar_filter_input";
+
+/// Encode an Arrow schema as a compact string for passing through `ConnectorConfig`.
+///
+/// Format: `name:type,name:type,...` where type is the Arrow `DataType` debug name.
+/// Example: `symbol:Utf8,price:Float64,volume:Int64`
+fn encode_arrow_schema(schema: &arrow_schema::Schema) -> String {
+    schema
+        .fields()
+        .iter()
+        .map(|f| format!("{}:{:?}", f.name(), f.data_type()))
+        .collect::<Vec<_>>()
+        .join(",")
+}
 
 /// Apply a SQL WHERE filter to a `RecordBatch`.
 ///

@@ -26,6 +26,18 @@ docker exec "$CONTAINER" rpk topic create anomaly-alerts \
     --partitions 1 \
     --config retention.ms=3600000
 
+docker exec "$CONTAINER" rpk topic create book-updates \
+    --partitions 5 \
+    --config retention.ms=3600000
+
+docker exec "$CONTAINER" rpk topic create book-imbalance \
+    --partitions 5 \
+    --config retention.ms=3600000
+
+docker exec "$CONTAINER" rpk topic create depth-metrics \
+    --partitions 5 \
+    --config retention.ms=3600000
+
 echo ""
 echo "=== Topics created ==="
 docker exec "$CONTAINER" rpk topic list

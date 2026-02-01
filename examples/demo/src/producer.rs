@@ -42,15 +42,18 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
 
         let ticks = gen.generate_kafka_ticks(rate, ts);
         let orders = gen.generate_kafka_orders(rate / 2, ts);
+        let book_updates = gen.generate_kafka_book_updates(ts);
 
         let tick_count =
             generator::produce_to_kafka(&producer, "market-ticks", &ticks).await?;
         let order_count =
             generator::produce_to_kafka(&producer, "order-events", &orders).await?;
+        let book_count =
+            generator::produce_to_kafka(&producer, "book-updates", &book_updates).await?;
 
         eprintln!(
-            "[cycle {}] Produced {} ticks, {} orders",
-            cycle, tick_count, order_count
+            "[cycle {}] Produced {} ticks, {} orders, {} book updates",
+            cycle, tick_count, order_count, book_count
         );
 
         tokio::time::sleep(Duration::from_secs(1)).await;

@@ -21,3 +21,17 @@ INTO KAFKA (
     topic = 'anomaly-alerts',
     format = 'json'
 );
+
+CREATE SINK imbalance_output FROM book_imbalance
+INTO KAFKA (
+    brokers = '${KAFKA_BROKERS}',
+    topic = 'book-imbalance',
+    format = 'json'
+);
+
+CREATE SINK depth_output FROM depth_metrics
+INTO KAFKA (
+    brokers = '${KAFKA_BROKERS}',
+    topic = 'depth-metrics',
+    format = 'json'
+);

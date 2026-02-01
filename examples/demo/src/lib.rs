@@ -3,5 +3,6 @@
 pub mod app;
 pub mod asof_merge;
 pub mod generator;
+pub mod system_stats;
 pub mod tui;
 pub mod types;

@@ -19,3 +19,13 @@ CREATE SOURCE order_events (
     price           DOUBLE NOT NULL,
     ts              BIGINT NOT NULL
 );
+
+CREATE SOURCE book_updates (
+    symbol          VARCHAR NOT NULL,
+    side            VARCHAR NOT NULL,
+    action          VARCHAR NOT NULL,
+    price_level     DOUBLE NOT NULL,
+    quantity        BIGINT NOT NULL,
+    order_count     BIGINT NOT NULL,
+    ts              BIGINT NOT NULL
+);

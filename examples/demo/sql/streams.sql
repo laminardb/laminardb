@@ -50,3 +50,26 @@ GROUP BY symbol, tumble(ts, INTERVAL '5' SECOND);
 --        t.price as market_price, t.bid, t.ask, o.price - t.price as slippage
 -- FROM order_events o
 -- ASOF JOIN market_ticks t MATCH_CONDITION(o.ts >= t.ts) ON o.symbol = t.symbol
+
+-- 6. Book imbalance: bid/ask depth ratio (5-second tumbling windows)
+CREATE STREAM book_imbalance AS
+SELECT
+    symbol,
+    SUM(CASE WHEN side = 'bid' THEN quantity ELSE 0 END) as bid_qty_total,
+    SUM(CASE WHEN side = 'ask' THEN quantity ELSE 0 END) as ask_qty_total,
+    CAST(SUM(CASE WHEN side = 'bid' THEN quantity ELSE 0 END) AS DOUBLE) /
+        CAST(SUM(quantity) AS DOUBLE) as imbalance
+FROM book_updates
+WHERE action != 'delete'
+GROUP BY symbol, tumble(ts, INTERVAL '5' SECOND);
+
+-- 7. Depth metrics: total quantities per side (5-second tumbling windows)
+CREATE STREAM depth_metrics AS
+SELECT
+    symbol,
+    SUM(CASE WHEN side = 'bid' THEN quantity ELSE 0 END) as total_bid_qty,
+    SUM(CASE WHEN side = 'ask' THEN quantity ELSE 0 END) as total_ask_qty,
+    COUNT(*) as update_count
+FROM book_updates
+WHERE action != 'delete'
+GROUP BY symbol, tumble(ts, INTERVAL '5' SECOND);

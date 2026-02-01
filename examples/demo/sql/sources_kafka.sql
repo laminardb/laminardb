@@ -31,3 +31,19 @@ CREATE SOURCE order_events (
     format = 'json',
     offset_reset = 'earliest'
 );
+
+CREATE SOURCE book_updates (
+    symbol          VARCHAR NOT NULL,
+    side            VARCHAR NOT NULL,
+    action          VARCHAR NOT NULL,
+    price_level     DOUBLE NOT NULL,
+    quantity        BIGINT NOT NULL,
+    order_count     BIGINT NOT NULL,
+    ts              BIGINT NOT NULL
+) FROM KAFKA (
+    brokers = '${KAFKA_BROKERS}',
+    topic = 'book-updates',
+    group_id = '${GROUP_ID}',
+    format = 'json',
+    offset_reset = 'earliest'
+);

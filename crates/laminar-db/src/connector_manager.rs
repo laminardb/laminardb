@@ -58,6 +58,16 @@ pub(crate) struct StreamRegistration {
 /// Normalizes `connector_type` to lowercase, copies all options,
 /// and validates the format property (rejecting unknown formats
 /// at build time instead of silently defaulting).
+/// Map SQL-friendly option names to connector-native names.
+fn normalize_option_key(key: &str) -> String {
+    match key {
+        "brokers" => "bootstrap.servers".to_string(),
+        "group_id" => "group.id".to_string(),
+        "offset_reset" => "auto.offset.reset".to_string(),
+        other => other.to_string(),
+    }
+}
+
 pub(crate) fn build_source_config(
     reg: &SourceRegistration,
 ) -> Result<ConnectorConfig, DbError> {
@@ -73,7 +83,7 @@ pub(crate) fn build_source_config(
 
     let mut config = ConnectorConfig::new(connector_type.to_lowercase());
     for (k, v) in &reg.connector_options {
-        config.set(k.clone(), v.clone());
+        config.set(normalize_option_key(k), v.clone());
     }
 
     if let Some(ref fmt_str) = reg.format {
@@ -112,7 +122,7 @@ pub(crate) fn build_sink_config(
 
     let mut config = ConnectorConfig::new(connector_type.to_lowercase());
     for (k, v) in &reg.connector_options {
-        config.set(k.clone(), v.clone());
+        config.set(normalize_option_key(k), v.clone());
     }
 
     if let Some(ref fmt_str) = reg.format {
