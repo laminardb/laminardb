@@ -1,0 +1,82 @@
+<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 120 140">
+  <defs>
+    <!-- Wave layer gradients, dark bottom-left to light top-right -->
+    <linearGradient id="w1" x1="0" y1="1" x2="1" y2="0">
+      <stop offset="0%" stop-color="#0b2540"/>
+      <stop offset="100%" stop-color="#134e6f"/>
+    </linearGradient>
+    <linearGradient id="w2" x1="0" y1="1" x2="1" y2="0">
+      <stop offset="0%" stop-color="#134e6f"/>
+      <stop offset="100%" stop-color="#1a6fa0"/>
+    </linearGradient>
+    <linearGradient id="w3" x1="0" y1="1" x2="1" y2="0">
+      <stop offset="0%" stop-color="#1a6fa0"/>
+      <stop offset="100%" stop-color="#2196c4"/>
+    </linearGradient>
+    <linearGradient id="w4" x1="0" y1="1" x2="1" y2="0">
+      <stop offset="0%" stop-color="#2196c4"/>
+      <stop offset="100%" stop-color="#38bdf8"/>
+    </linearGradient>
+    <linearGradient id="w5" x1="0" y1="1" x2="1" y2="0">
+      <stop offset="0%" stop-color="#38bdf8"/>
+      <stop offset="100%" stop-color="#7dd3fc"/>
+    </linearGradient>
+    <!-- L-shaped clip path: vertical bar + horizontal foot with rounded bottom-right -->
+    <clipPath id="L-shape">
+      <path d="
+        M 10,4
+        C 10,1.8 11.8,0 14,0
+        L 50,0
+        C 52.2,0 54,1.8 54,4
+        L 54,96
+        L 110,96
+        C 112.2,96 114,97.8 114,100
+        L 114,130
+        C 114,132.2 112.2,134 110,134
+        L 14,134
+        C 11.8,134 10,132.2 10,130
+        Z
+      "/>
+    </clipPath>
+  </defs>
+  <g clip-path="url(#L-shape)">
+    <!-- Base: darkest layer fills entire shape -->
+    <rect x="10" y="0" width="104" height="134" fill="url(#w1)"/>
+    <!-- Wave 2: sweeps from lower-left to mid-right -->
+    <path d="
+      M 10,134
+      L 10,90
+      C 30,60 50,75 70,55
+      C 85,40 100,50 114,30
+      L 114,134
+      Z
+    " fill="url(#w2)"/>
+    <!-- Wave 3 -->
+    <path d="
+      M 10,134
+      L 10,105
+      C 30,78 50,90 70,72
+      C 85,60 100,65 114,48
+      L 114,134
+      Z
+    " fill="url(#w3)"/>
+    <!-- Wave 4 -->
+    <path d="
+      M 10,134
+      L 10,118
+      C 30,95 50,105 75,90
+      C 90,82 102,80 114,68
+      L 114,134
+      Z
+    " fill="url(#w4)"/>
+    <!-- Wave 5: lightest, top-right curl -->
+    <path d="
+      M 10,134
+      L 10,128
+      C 35,112 55,120 80,108
+      C 95,100 105,95 114,88
+      L 114,134
+      Z
+    " fill="url(#w5)"/>
+  </g>
+</svg>

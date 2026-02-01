@@ -1,0 +1,1075 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+  <meta charset="UTF-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1.0">
+  <title>LaminarDB - Embedded Streaming Database | Sub-Microsecond SQL Stream Processing</title>
+  <meta name="description" content="LaminarDB is an embedded streaming database in Rust. Sub-microsecond latency, full SQL support, exactly-once semantics. DuckDB for stream processing.">
+  <meta name="keywords" content="streaming database, embedded database, real-time analytics, stream processing, Rust, Apache Arrow, DataFusion, SQL streaming, sub-microsecond latency">
+  <link rel="canonical" href="https://laminardb.io">
+
+  <!-- Open Graph -->
+  <meta property="og:title" content="LaminarDB - The Embedded Streaming Database">
+  <meta property="og:description" content="Sub-microsecond SQL stream processing. No cluster required. MIT.">
+  <meta property="og:image" content="https://laminardb.io/img/logo.jpg">
+  <meta property="og:url" content="https://laminardb.io">
+  <meta property="og:type" content="website">
+
+  <!-- Twitter -->
+  <meta name="twitter:card" content="summary_large_image">
+  <meta name="twitter:title" content="LaminarDB - The Embedded Streaming Database">
+  <meta name="twitter:description" content="Sub-microsecond SQL stream processing. No cluster required.">
+  <meta name="twitter:image" content="https://laminardb.io/img/logo.jpg">
+
+  <!-- Favicon -->
+  <link rel="icon" type="image/svg+xml" href="favicon.svg">
+
+  <!-- Fonts -->
+  <link rel="preconnect" href="https://fonts.googleapis.com">
+  <link rel="preconnect" href="https://fonts.gstatic.com" crossorigin>
+  <link href="https://fonts.googleapis.com/css2?family=Inter:wght@400;500;600;700;800&family=JetBrains+Mono:wght@400;500;700&display=swap" rel="stylesheet">
+
+  <!-- Prism.js for syntax highlighting -->
+  <link href="https://cdnjs.cloudflare.com/ajax/libs/prism/1.29.0/themes/prism-tomorrow.min.css" rel="stylesheet">
+
+  <!-- Styles -->
+  <link rel="stylesheet" href="css/style.css">
+
+  <!-- JSON-LD -->
+  <script type="application/ld+json">
+  {
+    "@context": "https://schema.org",
+    "@type": "SoftwareApplication",
+    "name": "LaminarDB",
+    "description": "High-performance embedded streaming database in Rust with sub-microsecond latency",
+    "applicationCategory": "Database",
+    "operatingSystem": "Linux, macOS, Windows",
+    "license": "https://opensource.org/licenses/MIT",
+    "url": "https://laminardb.io",
+    "codeRepository": "https://github.com/laminardb/laminardb",
+    "programmingLanguage": "Rust"
+  }
+  </script>
+</head>
+<body>
+
+  <!-- ======== Navigation ======== -->
+  <header class="nav" role="banner">
+    <div class="nav-inner">
+      <a href="#" class="nav-brand" aria-label="LaminarDB home">
+        <img src="img/logo-mark.svg" alt="LaminarDB logo">
+        <span>LaminarDB</span>
+      </a>
+
+      <nav class="nav-links" aria-label="Main navigation">
+        <a href="#why">Why</a>
+        <a href="#performance">Performance</a>
+        <a href="#code">Code</a>
+        <a href="#architecture">Architecture</a>
+        <a href="#use-cases">Use Cases</a>
+        <a href="#features">Features</a>
+      </nav>
+
+      <div class="nav-actions">
+        <a href="https://github.com/laminardb/laminardb" class="github-stars" target="_blank" rel="noopener" aria-label="Star on GitHub">
+          <svg viewBox="0 0 16 16" fill="currentColor"><path d="M8 0C3.58 0 0 3.58 0 8c0 3.54 2.29 6.53 5.47 7.59.4.07.55-.17.55-.38 0-.19-.01-.82-.01-1.49-2.01.37-2.53-.49-2.69-.94-.09-.23-.48-.94-.82-1.13-.28-.15-.68-.52-.01-.53.63-.01 1.08.58 1.23.82.72 1.21 1.87.87 2.33.66.07-.52.28-.87.51-1.07-1.78-.2-3.64-.89-3.64-3.95 0-.87.31-1.59.82-2.15-.08-.2-.36-1.02.08-2.12 0 0 .67-.21 2.2.82.64-.18 1.32-.27 2-.27.68 0 1.36.09 2 .27 1.53-1.04 2.2-.82 2.2-.82.44 1.1.16 1.92.08 2.12.51.56.82 1.27.82 2.15 0 3.07-1.87 3.75-3.65 3.95.29.25.54.73.54 1.48 0 1.07-.01 1.93-.01 2.2 0 .21.15.46.55.38A8.013 8.013 0 0016 8c0-4.42-3.58-8-8-8z"/></svg>
+          <span>Star</span>
+        </a>
+        <a href="#get-started" class="btn btn-primary">Get Started</a>
+      </div>
+
+      <button class="nav-toggle" aria-label="Toggle menu">
+        <span></span><span></span><span></span>
+      </button>
+
+      <!-- Mobile menu -->
+      <div class="mobile-menu">
+        <a href="#why">Why LaminarDB</a>
+        <a href="#performance">Performance</a>
+        <a href="#code">Code Examples</a>
+        <a href="#architecture">Architecture</a>
+        <a href="#use-cases">Use Cases</a>
+        <a href="#features">Features</a>
+        <a href="#comparison">Comparison</a>
+        <a href="https://github.com/laminardb/laminardb" class="btn btn-secondary" target="_blank" rel="noopener">GitHub</a>
+        <a href="#get-started" class="btn btn-primary">Get Started</a>
+      </div>
+    </div>
+  </header>
+
+  <main>
+    <!-- ======== Hero ======== -->
+    <section class="hero" id="hero">
+      <div class="hero-bg" aria-hidden="true">
+        <svg class="wave-1" viewBox="0 0 2880 320" preserveAspectRatio="none">
+          <path fill="#38bdf8" d="M0,160 C480,320 960,0 1440,160 C1920,320 2400,0 2880,160 L2880,320 L0,320 Z"/>
+        </svg>
+        <svg class="wave-2" viewBox="0 0 2880 320" preserveAspectRatio="none">
+          <path fill="#1e6091" d="M0,200 C480,80 960,280 1440,200 C1920,80 2400,280 2880,200 L2880,320 L0,320 Z"/>
+        </svg>
+        <svg class="wave-3" viewBox="0 0 2880 320" preserveAspectRatio="none">
+          <path fill="#7dd3fc" d="M0,240 C480,160 960,320 1440,240 C1920,160 2400,320 2880,240 L2880,320 L0,320 Z"/>
+        </svg>
+      </div>
+
+      <div class="hero-content">
+        <h1 class="gradient-text">The Embedded<br>Streaming Database</h1>
+        <p class="hero-subtitle">Sub-microsecond SQL stream processing. No cluster required.</p>
+
+        <div class="hero-latency reveal">
+          <span class="latency-number" id="latency-counter">0</span>
+          <span class="latency-unit">ns</span>
+          <span class="latency-label">&lt; 1&micro;s end-to-end</span>
+        </div>
+
+        <div class="hero-actions">
+          <a href="#get-started" class="btn btn-primary">Get Started</a>
+          <a href="https://github.com/laminardb/laminardb" class="btn btn-secondary" target="_blank" rel="noopener">
+            <svg width="16" height="16" viewBox="0 0 16 16" fill="currentColor"><path d="M8 0C3.58 0 0 3.58 0 8c0 3.54 2.29 6.53 5.47 7.59.4.07.55-.17.55-.38 0-.19-.01-.82-.01-1.49-2.01.37-2.53-.49-2.69-.94-.09-.23-.48-.94-.82-1.13-.28-.15-.68-.52-.01-.53.63-.01 1.08.58 1.23.82.72 1.21 1.87.87 2.33.66.07-.52.28-.87.51-1.07-1.78-.2-3.64-.89-3.64-3.95 0-.87.31-1.59.82-2.15-.08-.2-.36-1.02.08-2.12 0 0 .67-.21 2.2.82.64-.18 1.32-.27 2-.27.68 0 1.36.09 2 .27 1.53-1.04 2.2-.82 2.2-.82.44 1.1.16 1.92.08 2.12.51.56.82 1.27.82 2.15 0 3.07-1.87 3.75-3.65 3.95.29.25.54.73.54 1.48 0 1.07-.01 1.93-.01 2.2 0 .21.15.46.55.38A8.013 8.013 0 0016 8c0-4.42-3.58-8-8-8z"/></svg>
+            View on GitHub
+          </a>
+          <a href="https://github.com/laminardb/laminardb/tree/main/docs" class="btn btn-ghost" target="_blank" rel="noopener">Read the Docs</a>
+        </div>
+
+        <div class="hero-badges">
+          <span class="badge">MIT</span>
+          <span class="badge">Rust</span>
+          <span class="badge">2000+ Tests</span>
+          <span class="badge">65 Features</span>
+        </div>
+      </div>
+    </section>
+
+    <!-- ======== Why LaminarDB ======== -->
+    <section class="why" id="why">
+      <div class="container text-center">
+        <h2 class="section-heading reveal">Why <span class="gradient-text">LaminarDB</span></h2>
+        <p class="section-subheading reveal">Think DuckDB, but for streaming. Embed a full streaming database directly in your application.</p>
+      </div>
+      <div class="container">
+        <div class="why-grid">
+          <div class="glass-card reveal reveal-delay-1">
+            <div class="card-icon">
+              <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><polyline points="13 2 3 14 12 14 11 22 21 10 12 10 13 2"/></svg>
+            </div>
+            <h3>Sub-Microsecond Latency</h3>
+            <p>Zero allocations on the hot path. No GC pauses, no JVM warmup. 325ns measured through a 3-node pipeline.</p>
+            <span class="card-metric">&lt; 1&micro;s hot path &bull; 325ns measured</span>
+          </div>
+
+          <div class="glass-card reveal reveal-delay-2">
+            <div class="card-icon">
+              <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><rect x="2" y="3" width="20" height="14" rx="2" ry="2"/><line x1="8" y1="21" x2="16" y2="21"/><line x1="12" y1="17" x2="12" y2="21"/></svg>
+            </div>
+            <h3>Embedded-First</h3>
+            <p>Single binary, no cluster, no external dependencies. Embed in your application like DuckDB.</p>
+            <span class="card-metric">cargo add laminar-db</span>
+          </div>
+
+          <div class="glass-card reveal reveal-delay-3">
+            <div class="card-icon">
+              <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><polyline points="16 18 22 12 16 6"/><polyline points="8 6 2 12 8 18"/></svg>
+            </div>
+            <h3>SQL-Native Streaming</h3>
+            <p>Full SQL via DataFusion with streaming extensions: TUMBLE, HOP, SESSION, EMIT, ASOF JOIN, and 30+ aggregates.</p>
+            <span class="card-metric">DataFusion + streaming SQL</span>
+          </div>
+
+          <div class="glass-card reveal reveal-delay-4">
+            <div class="card-icon">
+              <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><path d="M12 22s8-4 8-10V5l-8-3-8 3v7c0 6 8 10 8 10z"/></svg>
+            </div>
+            <h3>Exactly-Once Guaranteed</h3>
+            <p>Write-ahead log, incremental checkpointing, two-phase commit, and co-transactional sinks.</p>
+            <span class="card-metric">WAL + 2PC + epoch tracking</span>
+          </div>
+        </div>
+      </div>
+    </section>
+
+    <!-- ======== Deep Dives ======== -->
+    <section class="deep-dives" id="deep-dives">
+      <div class="container">
+        <div class="deep-dives-grid">
+
+          <div class="deep-dive-block reveal">
+            <h2 class="section-heading">Why <span class="gradient-text">DuckDB for Streaming</span>?</h2>
+            <p>DuckDB changed analytics by proving you don't need a cluster to run fast SQL queries &mdash; just embed it in your process. No deployment, no network hops, no operational overhead.</p>
+            <p>Streaming has the same problem today. Running real-time aggregations or CDC pipelines typically means deploying and maintaining a distributed system like Apache Flink or RisingWave &mdash; even when your workload fits on a single machine.</p>
+            <p>LaminarDB takes the DuckDB approach for stream processing:</p>
+            <ul class="deep-dive-list">
+              <li><strong>Add a dependency, not a cluster.</strong> <code>cargo add laminar-db</code> gives you windowed aggregations, stream joins, watermarks, and exactly-once semantics inside your application.</li>
+              <li><strong>No serialization boundary.</strong> Data stays in Apache Arrow columnar format in your process. No network encoding/decoding overhead.</li>
+              <li><strong>Same SQL you know.</strong> Full DataFusion SQL engine with streaming extensions (TUMBLE, HOP, SESSION, EMIT, ASOF JOIN).</li>
+              <li><strong>Production semantics.</strong> Write-ahead log, incremental checkpointing, and two-phase commit &mdash; the same guarantees distributed systems provide, without the distributed part.</li>
+            </ul>
+            <p class="deep-dive-note">If your streaming workload fits on one machine, you don't need a cluster. Most workloads do.</p>
+          </div>
+
+          <div class="deep-dive-block reveal">
+            <h2 class="section-heading">Thread-Per-Core <span class="gradient-text">Architecture</span></h2>
+            <p>Most streaming systems use thread pools with shared state, which means locks, contention, and unpredictable latency spikes from context switching. LaminarDB uses a thread-per-core model instead &mdash; the same architecture behind ScyllaDB, Redpanda, and Seastar.</p>
+            <div class="deep-dive-how">
+              <h3>How it works</h3>
+              <ul class="deep-dive-list">
+                <li><strong>One reactor per CPU core.</strong> Each core runs its own event loop, pinned with CPU affinity. No thread migration, no cache thrashing.</li>
+                <li><strong>Shared-nothing state.</strong> Each core owns its partition of the keyspace. No locks anywhere on the hot path.</li>
+                <li><strong>SPSC queues between cores.</strong> Lock-free single-producer single-consumer queues (~4.8ns per operation) for cross-core communication.</li>
+                <li><strong>Zero allocations on hot path.</strong> Arena allocators and pre-allocated buffers. A debug-mode allocation detector verifies this in CI.</li>
+              </ul>
+            </div>
+            <div class="deep-dive-how">
+              <h3>Why it matters</h3>
+              <ul class="deep-dive-list">
+                <li><strong>Predictable latency.</strong> No GC pauses (Rust), no lock contention, no thread pool scheduling jitter. The p99 stays close to the median.</li>
+                <li><strong>Linear scaling.</strong> Adding cores adds proportional throughput. 4 cores = ~4x throughput, not diminishing returns from lock contention.</li>
+                <li><strong>Cache efficiency.</strong> Pinned cores keep working data in L1/L2 cache. No cross-core cache invalidation on the hot path.</li>
+              </ul>
+            </div>
+          </div>
+
+        </div>
+      </div>
+    </section>
+
+    <!-- ======== Performance ======== -->
+    <section class="performance" id="performance">
+      <div class="container text-center">
+        <h2 class="section-heading reveal">Measured <span class="gradient-text">Performance</span></h2>
+        <p class="section-subheading reveal">Criterion benchmarks on a 3-node DAG pipeline. All numbers from <code>cargo bench</code>.</p>
+      </div>
+      <div class="container">
+        <div class="perf-bars reveal">
+          <div class="perf-bar-row">
+            <div class="perf-bar-label">Routing lookup</div>
+            <div class="perf-bar-track">
+              <div class="perf-bar-fill laminar" style="--bar-width: 8%">4ns</div>
+            </div>
+          </div>
+          <div class="perf-bar-row">
+            <div class="perf-bar-label highlight">3-node latency</div>
+            <div class="perf-bar-track">
+              <div class="perf-bar-fill laminar" style="--bar-width: 35%">325ns</div>
+            </div>
+          </div>
+          <div class="perf-bar-row">
+            <div class="perf-bar-label">State lookup p99</div>
+            <div class="perf-bar-track">
+              <div class="perf-bar-fill laminar" style="--bar-width: 50%">&lt; 500ns</div>
+            </div>
+          </div>
+          <div class="perf-bar-row">
+            <div class="perf-bar-label">Target budget</div>
+            <div class="perf-bar-track">
+              <div class="perf-bar-fill target" style="--bar-width: 100%">1&micro;s</div>
+            </div>
+          </div>
+        </div>
+
+        <div class="metrics-grid reveal">
+          <div class="metric-card">
+            <div class="metric-value">2.24M</div>
+            <div class="metric-label">events/sec per core (linear pipeline)</div>
+          </div>
+          <div class="metric-card">
+            <div class="metric-value">660K</div>
+            <div class="metric-label">events/sec (10-operator deep pipeline)</div>
+          </div>
+          <div class="metric-card">
+            <div class="metric-value">&lt; 10s</div>
+            <div class="metric-label">checkpoint recovery target</div>
+          </div>
+        </div>
+      </div>
+    </section>
+
+    <!-- ======== Code Examples ======== -->
+    <section class="code-section" id="code">
+      <div class="container text-center">
+        <h2 class="section-heading reveal">See It In <span class="gradient-text">Action</span></h2>
+        <p class="section-subheading reveal">Streaming SQL, real-time joins, embedded Rust API, and CDC pipelines.</p>
+      </div>
+      <div class="container">
+        <div class="code-tabs reveal">
+          <div class="tab-buttons">
+            <button class="tab-btn active" data-tab="tab-sql">Streaming SQL</button>
+            <button class="tab-btn" data-tab="tab-joins">Stream Joins</button>
+            <button class="tab-btn" data-tab="tab-rust">Rust API</button>
+            <button class="tab-btn" data-tab="tab-cdc">CDC Pipeline</button>
+          </div>
+
+          <div class="tab-panel active" id="tab-sql">
+            <button class="copy-btn" aria-label="Copy code">Copy</button>
+            <pre><code class="language-sql">-- Real-time OHLC bars from a trade stream
+CREATE MATERIALIZED VIEW ohlc_1m AS
+SELECT
+  symbol,
+  TUMBLE_START(event_time, INTERVAL '1' MINUTE) AS bar_start,
+  FIRST_VALUE(price) AS open,
+  MAX(price) AS high,
+  MIN(price) AS low,
+  LAST_VALUE(price) AS close,
+  SUM(volume) AS volume
+FROM trades
+GROUP BY
+  symbol,
+  TUMBLE(event_time, INTERVAL '1' MINUTE)
+EMIT ON WINDOW CLOSE;</code></pre>
+          </div>
+
+          <div class="tab-panel" id="tab-joins">
+            <button class="copy-btn" aria-label="Copy code">Copy</button>
+            <pre><code class="language-sql">-- ASOF JOIN: enrich trades with latest quote
+SELECT
+  t.symbol,
+  t.price AS trade_price,
+  t.quantity,
+  q.bid,
+  q.ask,
+  t.price - q.bid AS spread
+FROM trades t
+ASOF JOIN quotes q
+  ON t.symbol = q.symbol
+  AND t.event_time >= q.event_time
+  TOLERANCE INTERVAL '5' SECOND;</code></pre>
+          </div>
+
+          <div class="tab-panel" id="tab-rust">
+            <button class="copy-btn" aria-label="Copy code">Copy</button>
+            <pre><code class="language-rust">use laminar_db::LaminarDB;
+
+#[tokio::main]
+async fn main() -> Result<(), Box<dyn std::error::Error>> {
+    let db = LaminarDB::open("./my_stream_db").await?;
+
+    // Create a streaming query
+    db.execute("
+        CREATE MATERIALIZED VIEW alerts AS
+        SELECT sensor_id, AVG(temperature) AS avg_temp
+        FROM sensors
+        GROUP BY sensor_id, TUMBLE(event_time, INTERVAL '10' SECOND)
+        HAVING AVG(temperature) > 100.0
+        EMIT ON WINDOW CLOSE
+    ").await?;
+
+    // Ingest events
+    let source = db.source("sensors").await?;
+    source.push(sensor_event).await?;
+
+    // Query results
+    let results = db.query("SELECT * FROM alerts").await?;
+    println!("{:?}", results);
+
+    Ok(())
+}</code></pre>
+          </div>
+
+          <div class="tab-panel" id="tab-cdc">
+            <button class="copy-btn" aria-label="Copy code">Copy</button>
+            <pre><code class="language-sql">-- Stream changes from PostgreSQL to Kafka
+CREATE SOURCE orders_cdc
+WITH (
+  connector = 'postgres-cdc',
+  hostname = 'db.example.com',
+  port = '5432',
+  database = 'shop',
+  table = 'orders',
+  slot.name = 'laminar_orders'
+);
+
+CREATE SINK order_totals_kafka
+WITH (
+  connector = 'kafka',
+  brokers = 'kafka:9092',
+  topic = 'order-totals',
+  format = 'json'
+) AS
+SELECT
+  customer_id,
+  COUNT(*) AS total_orders,
+  SUM(amount) AS total_spent
+FROM orders_cdc
+WHERE _op IN ('I', 'U')
+GROUP BY customer_id
+EMIT CHANGES;</code></pre>
+          </div>
+        </div>
+      </div>
+    </section>
+
+    <!-- ======== Architecture ======== -->
+    <section class="architecture" id="architecture">
+      <div class="container text-center">
+        <h2 class="section-heading reveal">Three-Ring <span class="gradient-text">Architecture</span></h2>
+        <p class="section-subheading reveal">Strict isolation between hot path, background I/O, and control plane.</p>
+      </div>
+      <div class="container">
+        <div class="arch-diagram reveal">
+          <div class="ring ring-0">
+            <div class="ring-header">
+              <span class="ring-title">Ring 0: Hot Path</span>
+              <span class="ring-constraint">&lt; 1&micro;s &bull; zero allocations &bull; no locks</span>
+            </div>
+            <div class="ring-components">
+              <div class="ring-component">Reactor</div>
+              <div class="ring-component">Operators</div>
+              <div class="ring-component">State Store</div>
+              <div class="ring-component">Emit</div>
+            </div>
+          </div>
+
+          <div class="ring-arrow"><span>SPSC Queues (lock-free)</span></div>
+
+          <div class="ring ring-1">
+            <div class="ring-header">
+              <span class="ring-title">Ring 1: Background</span>
+              <span class="ring-constraint">async I/O &bull; bounded latency impact</span>
+            </div>
+            <div class="ring-components">
+              <div class="ring-component">Checkpoint</div>
+              <div class="ring-component">WAL</div>
+              <div class="ring-component">Compaction</div>
+              <div class="ring-component">io_uring</div>
+            </div>
+          </div>
+
+          <div class="ring-arrow"><span>Bounded Channels</span></div>
+
+          <div class="ring ring-2">
+            <div class="ring-header">
+              <span class="ring-title">Ring 2: Control Plane</span>
+              <span class="ring-constraint">no latency requirements &bull; full flexibility</span>
+            </div>
+            <div class="ring-components">
+              <div class="ring-component">Admin API</div>
+              <div class="ring-component">Metrics</div>
+              <div class="ring-component">Auth</div>
+              <div class="ring-component">Config</div>
+            </div>
+          </div>
+        </div>
+      </div>
+    </section>
+
+    <!-- ======== Use Cases ======== -->
+    <section class="use-cases" id="use-cases">
+      <div class="container text-center">
+        <h2 class="section-heading reveal">Built For <span class="gradient-text">Real Workloads</span></h2>
+        <p class="section-subheading reveal">From financial analytics to IoT edge processing.</p>
+      </div>
+      <div class="container">
+        <div class="use-cases-grid">
+          <div class="use-case-card reveal reveal-delay-1">
+            <h3>Financial Analytics</h3>
+            <ul>
+              <li>OHLC bars with FIRST/LAST aggregates</li>
+              <li>ASOF joins for trade-quote enrichment</li>
+              <li>Cascading MVs for multi-resolution (1s, 1m, 1h)</li>
+              <li>Keyed watermarks for 99%+ accuracy</li>
+            </ul>
+          </div>
+          <div class="use-case-card reveal reveal-delay-2">
+            <h3>IoT &amp; Edge Processing</h3>
+            <ul>
+              <li>Embedded deployment, single binary</li>
+              <li>Local aggregation before cloud</li>
+              <li>Sub-millisecond response times</li>
+              <li>Thread-per-core for sensor data</li>
+            </ul>
+          </div>
+          <div class="use-case-card reveal reveal-delay-3">
+            <h3>Real-Time Applications</h3>
+            <ul>
+              <li>Gaming leaderboards and scoring</li>
+              <li>Fraud detection pipelines</li>
+              <li>Dynamic pricing engines</li>
+              <li>Event-driven architectures</li>
+            </ul>
+          </div>
+          <div class="use-case-card reveal reveal-delay-4">
+            <h3>Data Infrastructure</h3>
+            <ul>
+              <li>CDC from PostgreSQL and MySQL</li>
+              <li>Stream-to-lake (Delta Lake, Iceberg)</li>
+              <li>Lightweight alternative for single-node workloads</li>
+              <li>Kafka source and sink connectors</li>
+            </ul>
+          </div>
+        </div>
+      </div>
+    </section>
+
+    <!-- ======== Features Grid ======== -->
+    <section class="features" id="features">
+      <div class="container text-center">
+        <h2 class="section-heading reveal">65 Features <span class="gradient-text">And Counting</span></h2>
+        <p class="section-subheading reveal">Production-grade streaming across engine, SQL, durability, and connectors.</p>
+      </div>
+      <div class="container">
+        <div class="features-categories reveal">
+
+          <div class="feature-category open">
+            <button class="feature-category-header">
+              <h3>Core Engine</h3>
+              <div><span class="count">12 features</span> <span class="chevron">&#9660;</span></div>
+            </button>
+            <div class="feature-list">
+              <div class="feature-item">
+                <span class="feature-name">Reactor Event Loop</span>
+                <span class="feature-desc">Single-threaded, CPU-pinned event processing</span>
+                <span class="feature-badge done">Done</span>
+              </div>
+              <div class="feature-item">
+                <span class="feature-name">Memory-Mapped State</span>
+                <span class="feature-desc">FxHashMap with cache-aligned lookups &lt; 500ns</span>
+                <span class="feature-badge done">Done</span>
+              </div>
+              <div class="feature-item">
+                <span class="feature-name">Tumbling Windows</span>
+                <span class="feature-desc">Fixed-size non-overlapping time windows</span>
+                <span class="feature-badge done">Done</span>
+              </div>
+              <div class="feature-item">
+                <span class="feature-name">Sliding &amp; Session Windows</span>
+                <span class="feature-desc">Overlapping and gap-based windows</span>
+                <span class="feature-badge done">Done</span>
+              </div>
+              <div class="feature-item">
+                <span class="feature-name">Event Time &amp; Watermarks</span>
+                <span class="feature-desc">Per-partition, per-key, alignment groups</span>
+                <span class="feature-badge done">Done</span>
+              </div>
+              <div class="feature-item">
+                <span class="feature-name">EMIT Clause</span>
+                <span class="feature-desc">ON WINDOW CLOSE, CHANGES, FINAL modes</span>
+                <span class="feature-badge done">Done</span>
+              </div>
+              <div class="feature-item">
+                <span class="feature-name">Changelog / Retraction</span>
+                <span class="feature-desc">Z-set foundation for correct incremental updates</span>
+                <span class="feature-badge done">Done</span>
+              </div>
+              <div class="feature-item">
+                <span class="feature-name">Cascading MVs</span>
+                <span class="feature-desc">Materialized views reading from other MVs</span>
+                <span class="feature-badge done">Done</span>
+              </div>
+              <div class="feature-item">
+                <span class="feature-name">Late Data Handling</span>
+                <span class="feature-desc">Configurable allowed lateness with side output</span>
+                <span class="feature-badge done">Done</span>
+              </div>
+              <div class="feature-item">
+                <span class="feature-name">DAG Pipeline</span>
+                <span class="feature-desc">Multi-node topology with fan-out, multicast, routing</span>
+                <span class="feature-badge done">Done</span>
+              </div>
+              <div class="feature-item">
+                <span class="feature-name">Composite Aggregator</span>
+                <span class="feature-desc">30+ aggregates, FILTER, WITHIN GROUP support</span>
+                <span class="feature-badge done">Done</span>
+              </div>
+              <div class="feature-item">
+                <span class="feature-name">FIRST/LAST Value</span>
+                <span class="feature-desc">Retractable accumulators for OHLC patterns</span>
+                <span class="feature-badge done">Done</span>
+              </div>
+            </div>
+          </div>
+
+          <div class="feature-category">
+            <button class="feature-category-header">
+              <h3>SQL &amp; DataFusion</h3>
+              <div><span class="count">8 features</span> <span class="chevron">&#9660;</span></div>
+            </button>
+            <div class="feature-list">
+              <div class="feature-item">
+                <span class="feature-name">DataFusion Integration</span>
+                <span class="feature-desc">Full Apache DataFusion query engine</span>
+                <span class="feature-badge done">Done</span>
+              </div>
+              <div class="feature-item">
+                <span class="feature-name">Streaming SQL Parser</span>
+                <span class="feature-desc">CREATE SOURCE/SINK, window functions, EMIT</span>
+                <span class="feature-badge done">Done</span>
+              </div>
+              <div class="feature-item">
+                <span class="feature-name">Window UDFs</span>
+                <span class="feature-desc">TUMBLE, HOP, SESSION as scalar UDFs</span>
+                <span class="feature-badge done">Done</span>
+              </div>
+              <div class="feature-item">
+                <span class="feature-name">Watermark UDF</span>
+                <span class="feature-desc">Real-time watermark() function via AtomicI64</span>
+                <span class="feature-badge done">Done</span>
+              </div>
+              <div class="feature-item">
+                <span class="feature-name">Aggregate Bridge</span>
+                <span class="feature-desc">DataFusion Accumulator &#8596; streaming DynAccumulator</span>
+                <span class="feature-badge done">Done</span>
+              </div>
+              <div class="feature-item">
+                <span class="feature-name">Query Planner</span>
+                <span class="feature-desc">Streaming-aware plan generation</span>
+                <span class="feature-badge done">Done</span>
+              </div>
+              <div class="feature-item">
+                <span class="feature-name">Join Analysis</span>
+                <span class="feature-desc">Auto-detect stream-stream, lookup, temporal joins</span>
+                <span class="feature-badge done">Done</span>
+              </div>
+              <div class="feature-item">
+                <span class="feature-name">SQL DDL</span>
+                <span class="feature-desc">CREATE SOURCE/SINK &#8594; connector configs</span>
+                <span class="feature-badge done">Done</span>
+              </div>
+            </div>
+          </div>
+
+          <div class="feature-category">
+            <button class="feature-category-header">
+              <h3>Joins</h3>
+              <div><span class="count">5 features</span> <span class="chevron">&#9660;</span></div>
+            </button>
+            <div class="feature-list">
+              <div class="feature-item">
+                <span class="feature-name">Stream-Stream Joins</span>
+                <span class="feature-desc">Inner, Left, Right, Full outer with time bounds</span>
+                <span class="feature-badge done">Done</span>
+              </div>
+              <div class="feature-item">
+                <span class="feature-name">Lookup Joins</span>
+                <span class="feature-desc">Cached with TTL for dimension enrichment</span>
+                <span class="feature-badge done">Done</span>
+              </div>
+              <div class="feature-item">
+                <span class="feature-name">Temporal Joins</span>
+                <span class="feature-desc">Event-time and process-time versioned joins</span>
+                <span class="feature-badge done">Done</span>
+              </div>
+              <div class="feature-item">
+                <span class="feature-name">ASOF Joins</span>
+                <span class="feature-desc">Backward, Forward, Nearest with tolerance</span>
+                <span class="feature-badge done">Done</span>
+              </div>
+              <div class="feature-item">
+                <span class="feature-name">Join Optimizations</span>
+                <span class="feature-desc">CPU-friendly encoding, asymmetric compaction</span>
+                <span class="feature-badge done">Done</span>
+              </div>
+            </div>
+          </div>
+
+          <div class="feature-category">
+            <button class="feature-category-header">
+              <h3>Durability &amp; Exactly-Once</h3>
+              <div><span class="count">6 features</span> <span class="chevron">&#9660;</span></div>
+            </button>
+            <div class="feature-list">
+              <div class="feature-item">
+                <span class="feature-name">Write-Ahead Log</span>
+                <span class="feature-desc">CRC32C, fdatasync, torn write detection</span>
+                <span class="feature-badge done">Done</span>
+              </div>
+              <div class="feature-item">
+                <span class="feature-name">Per-Core WAL</span>
+                <span class="feature-desc">Lock-free per-core writers with epoch ordering</span>
+                <span class="feature-badge done">Done</span>
+              </div>
+              <div class="feature-item">
+                <span class="feature-name">Incremental Checkpointing</span>
+                <span class="feature-desc">RocksDB backend, SPSC changelog, async I/O</span>
+                <span class="feature-badge done">Done</span>
+              </div>
+              <div class="feature-item">
+                <span class="feature-name">Exactly-Once Sinks</span>
+                <span class="feature-desc">Transactional + idempotent sink adapters</span>
+                <span class="feature-badge done">Done</span>
+              </div>
+              <div class="feature-item">
+                <span class="feature-name">Two-Phase Commit</span>
+                <span class="feature-desc">Presumed abort with crash recovery</span>
+                <span class="feature-badge done">Done</span>
+              </div>
+              <div class="feature-item">
+                <span class="feature-name">DAG Checkpointing</span>
+                <span class="feature-desc">Chandy-Lamport barrier-based through DAG edges</span>
+                <span class="feature-badge done">Done</span>
+              </div>
+            </div>
+          </div>
+
+          <div class="feature-category">
+            <button class="feature-category-header">
+              <h3>Performance</h3>
+              <div><span class="count">9 features</span> <span class="chevron">&#9660;</span></div>
+            </button>
+            <div class="feature-list">
+              <div class="feature-item">
+                <span class="feature-name">Thread-Per-Core</span>
+                <span class="feature-desc">SPSC queues, key routing, CPU pinning</span>
+                <span class="feature-badge done">Done</span>
+              </div>
+              <div class="feature-item">
+                <span class="feature-name">SPSC Queues</span>
+                <span class="feature-desc">Lock-free ~4.8ns per operation</span>
+                <span class="feature-badge done">Done</span>
+              </div>
+              <div class="feature-item">
+                <span class="feature-name">io_uring Advanced</span>
+                <span class="feature-desc">SQPOLL, registered buffers, IOPOLL for NVMe</span>
+                <span class="feature-badge done">Done</span>
+              </div>
+              <div class="feature-item">
+                <span class="feature-name">NUMA-Aware Memory</span>
+                <span class="feature-desc">Per-core NUMA-local allocation</span>
+                <span class="feature-badge done">Done</span>
+              </div>
+              <div class="feature-item">
+                <span class="feature-name">Three-Ring I/O</span>
+                <span class="feature-desc">Latency, main, poll ring separation</span>
+                <span class="feature-badge done">Done</span>
+              </div>
+              <div class="feature-item">
+                <span class="feature-name">Task Budget</span>
+                <span class="feature-desc">Ring 0: 500ns, Ring 1: 1ms budget enforcement</span>
+                <span class="feature-badge done">Done</span>
+              </div>
+              <div class="feature-item">
+                <span class="feature-name">Zero-Allocation Hot Path</span>
+                <span class="feature-desc">Debug-mode detector + CI enforcement</span>
+                <span class="feature-badge done">Done</span>
+              </div>
+              <div class="feature-item">
+                <span class="feature-name">Zero-Alloc Polling</span>
+                <span class="feature-desc">Pre-allocated buffers, callback-based APIs</span>
+                <span class="feature-badge done">Done</span>
+              </div>
+              <div class="feature-item">
+                <span class="feature-name">XDP/eBPF</span>
+                <span class="feature-desc">Wire-speed packet filtering, CPU steering</span>
+                <span class="feature-badge done">Done</span>
+              </div>
+            </div>
+          </div>
+
+          <div class="feature-category">
+            <button class="feature-category-header">
+              <h3>Connectors</h3>
+              <div><span class="count">5 features</span> <span class="chevron">&#9660;</span></div>
+            </button>
+            <div class="feature-list">
+              <div class="feature-item">
+                <span class="feature-name">Kafka Source</span>
+                <span class="feature-desc">Consumer groups, backpressure, Schema Registry</span>
+                <span class="feature-badge done">Done</span>
+              </div>
+              <div class="feature-item">
+                <span class="feature-name">Kafka Sink</span>
+                <span class="feature-desc">Transactional, idempotent, partitioning strategies</span>
+                <span class="feature-badge done">Done</span>
+              </div>
+              <div class="feature-item">
+                <span class="feature-name">PostgreSQL CDC</span>
+                <span class="feature-desc">Full pgoutput protocol, Z-set changelog</span>
+                <span class="feature-badge done">Done</span>
+              </div>
+              <div class="feature-item">
+                <span class="feature-name">PostgreSQL Sink</span>
+                <span class="feature-desc">COPY BINARY, upsert, co-transactional exactly-once</span>
+                <span class="feature-badge done">Done</span>
+              </div>
+              <div class="feature-item">
+                <span class="feature-name">Connector Bridge</span>
+                <span class="feature-desc">DAG &harr; external connectors with runtime orchestration</span>
+                <span class="feature-badge done">Done</span>
+              </div>
+            </div>
+          </div>
+
+          <div class="feature-category">
+            <button class="feature-category-header">
+              <h3>Coming Soon</h3>
+              <div><span class="count">10+ features</span> <span class="chevron">&#9660;</span></div>
+            </button>
+            <div class="feature-list">
+              <div class="feature-item">
+                <span class="feature-name">Delta Lake Sink</span>
+                <span class="feature-desc">Stream to Delta Lake tables</span>
+                <span class="feature-badge soon">Coming Soon</span>
+              </div>
+              <div class="feature-item">
+                <span class="feature-name">Iceberg Sink</span>
+                <span class="feature-desc">Stream to Apache Iceberg tables</span>
+                <span class="feature-badge soon">Coming Soon</span>
+              </div>
+              <div class="feature-item">
+                <span class="feature-name">MySQL CDC Source</span>
+                <span class="feature-desc">Binlog-based change data capture</span>
+                <span class="feature-badge soon">Coming Soon</span>
+              </div>
+              <div class="feature-item">
+                <span class="feature-name">Connector SDK</span>
+                <span class="feature-desc">Build custom source/sink connectors</span>
+                <span class="feature-badge soon">Coming Soon</span>
+              </div>
+              <div class="feature-item">
+                <span class="feature-name">RBAC / ABAC</span>
+                <span class="feature-desc">Role and attribute-based access control</span>
+                <span class="feature-badge soon">Coming Soon</span>
+              </div>
+              <div class="feature-item">
+                <span class="feature-name">Admin Dashboard</span>
+                <span class="feature-desc">Web UI for pipeline management</span>
+                <span class="feature-badge soon">Coming Soon</span>
+              </div>
+              <div class="feature-item">
+                <span class="feature-name">Prometheus Export</span>
+                <span class="feature-desc">Metrics export for monitoring</span>
+                <span class="feature-badge soon">Coming Soon</span>
+              </div>
+              <div class="feature-item">
+                <span class="feature-name">OpenTelemetry</span>
+                <span class="feature-desc">Distributed tracing support</span>
+                <span class="feature-badge soon">Coming Soon</span>
+              </div>
+            </div>
+          </div>
+
+        </div>
+      </div>
+    </section>
+
+    <!-- ======== Comparison Table ======== -->
+    <section class="comparison" id="comparison">
+      <div class="container text-center">
+        <h2 class="section-heading reveal">How We <span class="gradient-text">Compare</span></h2>
+        <p class="section-subheading reveal">Different tools for different needs. LaminarDB is embedded-first and optimized for single-node, low-latency workloads.</p>
+      </div>
+      <div class="container">
+        <div class="comparison-wrapper reveal">
+          <table class="comparison-table">
+            <thead>
+              <tr>
+                <th>Feature</th>
+                <th class="highlight">LaminarDB</th>
+                <th>Flink</th>
+                <th>Kafka Streams</th>
+                <th>RisingWave</th>
+                <th>Materialize</th>
+              </tr>
+            </thead>
+            <tbody>
+              <tr>
+                <td>Deployment</td>
+                <td class="highlight">Embedded</td>
+                <td>Distributed</td>
+                <td>Embedded</td>
+                <td>Distributed</td>
+                <td>Distributed</td>
+              </tr>
+              <tr>
+                <td>Latency (in-process)</td>
+                <td class="highlight">&lt; 1&micro;s</td>
+                <td>N/A*</td>
+                <td>~1ms</td>
+                <td>N/A*</td>
+                <td>N/A*</td>
+              </tr>
+              <tr>
+                <td>SQL Support</td>
+                <td class="highlight"><span class="check">&#10003;</span> Full</td>
+                <td>Limited</td>
+                <td><span class="cross">&#10007;</span> None</td>
+                <td><span class="check">&#10003;</span> Full</td>
+                <td><span class="check">&#10003;</span> Full</td>
+              </tr>
+              <tr>
+                <td>Exactly-Once</td>
+                <td class="highlight"><span class="check">&#10003;</span></td>
+                <td><span class="check">&#10003;</span></td>
+                <td><span class="check">&#10003;</span></td>
+                <td><span class="check">&#10003;</span></td>
+                <td><span class="check">&#10003;</span></td>
+              </tr>
+              <tr>
+                <td>Thread-per-Core</td>
+                <td class="highlight"><span class="check">&#10003;</span></td>
+                <td><span class="cross">&#10007;</span></td>
+                <td><span class="cross">&#10007;</span></td>
+                <td><span class="cross">&#10007;</span></td>
+                <td><span class="cross">&#10007;</span></td>
+              </tr>
+              <tr>
+                <td>Language</td>
+                <td class="highlight">Rust</td>
+                <td>Java</td>
+                <td>Java</td>
+                <td>Rust</td>
+                <td>Rust / C++</td>
+              </tr>
+              <tr>
+                <td>Lakehouse</td>
+                <td class="highlight">Planned</td>
+                <td>Limited</td>
+                <td><span class="cross">&#10007;</span></td>
+                <td><span class="check">&#10003;</span></td>
+                <td><span class="cross">&#10007;</span></td>
+              </tr>
+              <tr>
+                <td>Embedded Mode</td>
+                <td class="highlight"><span class="check">&#10003;</span></td>
+                <td><span class="cross">&#10007;</span></td>
+                <td><span class="check">&#10003;</span></td>
+                <td><span class="cross">&#10007;</span></td>
+                <td><span class="cross">&#10007;</span></td>
+              </tr>
+              <tr>
+                <td>License</td>
+                <td class="highlight">MIT</td>
+                <td>Apache 2.0</td>
+                <td>Apache 2.0</td>
+                <td>Apache 2.0</td>
+                <td>BSL</td>
+              </tr>
+            </tbody>
+          </table>
+        </div>
+        <p class="comparison-footnote reveal">* Flink, RisingWave, and Materialize are distributed systems — their latency includes network hops and is not directly comparable to in-process embedded latency. Kafka Streams is the closest comparison as it is also embedded.</p>
+      </div>
+    </section>
+
+    <!-- ======== Get Started ======== -->
+    <section class="get-started" id="get-started">
+      <div class="container text-center">
+        <h2 class="section-heading reveal">Get <span class="gradient-text">Started</span></h2>
+        <p class="section-subheading reveal">Up and running in three steps.</p>
+      </div>
+      <div class="container">
+        <div class="steps">
+          <div class="step reveal">
+            <div class="step-number">1</div>
+            <div class="step-content">
+              <h3>Add the dependency</h3>
+              <pre><code class="language-bash">cargo add laminar-db</code></pre>
+            </div>
+          </div>
+          <div class="step reveal">
+            <div class="step-number">2</div>
+            <div class="step-content">
+              <h3>Create and query</h3>
+              <pre><code class="language-rust">use laminar_db::LaminarDB;
+
+#[tokio::main]
+async fn main() -> Result<(), Box<dyn std::error::Error>> {
+    let db = LaminarDB::open("./my_db").await?;
+
+    db.execute("
+        CREATE MATERIALIZED VIEW summary AS
+        SELECT key, COUNT(*) AS total
+        FROM events
+        GROUP BY key, TUMBLE(event_time, INTERVAL '1' MINUTE)
+        EMIT ON WINDOW CLOSE
+    ").await?;
+
+    let results = db.query("SELECT * FROM summary").await?;
+    println!("{:?}", results);
+    Ok(())
+}</code></pre>
+            </div>
+          </div>
+          <div class="step reveal">
+            <div class="step-number">3</div>
+            <div class="step-content">
+              <h3>Run it</h3>
+              <pre><code class="language-bash">cargo run</code></pre>
+            </div>
+          </div>
+        </div>
+
+        <div class="get-started-links reveal">
+          <a href="https://github.com/laminardb/laminardb/tree/main/docs" class="btn btn-primary" target="_blank" rel="noopener">Documentation</a>
+          <a href="https://github.com/laminardb/laminardb/tree/main/examples" class="btn btn-secondary" target="_blank" rel="noopener">Examples</a>
+          <a href="https://github.com/laminardb/laminardb" class="btn btn-secondary" target="_blank" rel="noopener">API Reference</a>
+        </div>
+      </div>
+    </section>
+
+    <!-- ======== Community ======== -->
+    <section class="community" id="community">
+      <div class="container">
+        <div class="community-content reveal">
+          <h2 class="section-heading">Open Source.<br><span class="gradient-text">MIT.</span></h2>
+          <p class="section-subheading" style="margin: 1rem auto 0">LaminarDB is open source and free to use. Contributions welcome.</p>
+
+          <div class="community-actions">
+            <a href="https://github.com/laminardb/laminardb" class="btn btn-primary" target="_blank" rel="noopener">
+              <svg width="16" height="16" viewBox="0 0 16 16" fill="currentColor"><path d="M8 0C3.58 0 0 3.58 0 8c0 3.54 2.29 6.53 5.47 7.59.4.07.55-.17.55-.38 0-.19-.01-.82-.01-1.49-2.01.37-2.53-.49-2.69-.94-.09-.23-.48-.94-.82-1.13-.28-.15-.68-.52-.01-.53.63-.01 1.08.58 1.23.82.72 1.21 1.87.87 2.33.66.07-.52.28-.87.51-1.07-1.78-.2-3.64-.89-3.64-3.95 0-.87.31-1.59.82-2.15-.08-.2-.36-1.02.08-2.12 0 0 .67-.21 2.2.82.64-.18 1.32-.27 2-.27.68 0 1.36.09 2 .27 1.53-1.04 2.2-.82 2.2-.82.44 1.1.16 1.92.08 2.12.51.56.82 1.27.82 2.15 0 3.07-1.87 3.75-3.65 3.95.29.25.54.73.54 1.48 0 1.07-.01 1.93-.01 2.2 0 .21.15.46.55.38A8.013 8.013 0 0016 8c0-4.42-3.58-8-8-8z"/></svg>
+              View on GitHub
+            </a>
+            <a href="https://github.com/laminardb/laminardb/blob/main/CONTRIBUTING.md" class="btn btn-secondary" target="_blank" rel="noopener">Contributing Guide</a>
+          </div>
+
+          <div class="built-with">
+            <div class="built-with-item">
+              <svg width="16" height="16" viewBox="0 0 24 24" fill="#fb923c"><path d="M23.837 8.237a1.006 1.006 0 0 0-.795-.465l-7.003-.575L13.14.532a1.004 1.004 0 0 0-1.88 0L8.36 7.197l-7.003.575A1 1 0 0 0 .781 9.39l5.296 4.635-1.577 6.89a1.001 1.001 0 0 0 1.483 1.078L12 18.63l5.017 3.363a1.001 1.001 0 0 0 1.483-1.078l-1.577-6.89 5.296-4.635a1 1 0 0 0 .618-1.153z"/></svg>
+              Rust
+            </div>
+            <div class="built-with-item">
+              <svg width="16" height="16" viewBox="0 0 24 24" fill="var(--accent-primary)"><path d="M12 2L2 7l10 5 10-5-10-5zM2 17l10 5 10-5M2 12l10 5 10-5"/></svg>
+              Apache Arrow
+            </div>
+            <div class="built-with-item">
+              <svg width="16" height="16" viewBox="0 0 24 24" fill="#4ade80"><circle cx="12" cy="12" r="10"/></svg>
+              DataFusion
+            </div>
+          </div>
+        </div>
+      </div>
+    </section>
+  </main>
+
+  <!-- ======== Footer ======== -->
+  <footer class="footer">
+    <div class="footer-grid">
+      <div class="footer-brand">
+        <a href="#" class="nav-brand">
+          <img src="img/logo-mark.svg" alt="LaminarDB">
+          <span>LaminarDB</span>
+        </a>
+        <p>The embedded streaming database. Sub-microsecond SQL stream processing.</p>
+      </div>
+      <div>
+        <h4>Resources</h4>
+        <div class="footer-links">
+          <a href="https://github.com/laminardb/laminardb/tree/main/docs" target="_blank" rel="noopener">Documentation</a>
+          <a href="https://github.com/laminardb/laminardb" target="_blank" rel="noopener">GitHub</a>
+          <a href="https://github.com/laminardb/laminardb/blob/main/CONTRIBUTING.md" target="_blank" rel="noopener">Contributing</a>
+          <a href="https://github.com/laminardb/laminardb/blob/main/LICENSE" target="_blank" rel="noopener">License</a>
+        </div>
+      </div>
+      <div>
+        <h4>Product</h4>
+        <div class="footer-links">
+          <a href="#features">Features</a>
+          <a href="#performance">Performance</a>
+          <a href="#architecture">Architecture</a>
+          <a href="#use-cases">Use Cases</a>
+        </div>
+      </div>
+    </div>
+    <div class="footer-bottom">
+      <p>&copy; 2026 LaminarDB. Built with Rust + Apache Arrow + DataFusion. <a href="https://github.com/laminardb/laminardb/blob/main/LICENSE" target="_blank" rel="noopener">MIT License</a>.</p>
+    </div>
+  </footer>
+
+  <!-- Prism.js -->
+  <script src="https://cdnjs.cloudflare.com/ajax/libs/prism/1.29.0/prism.min.js"></script>
+  <script src="https://cdnjs.cloudflare.com/ajax/libs/prism/1.29.0/components/prism-sql.min.js"></script>
+  <script src="https://cdnjs.cloudflare.com/ajax/libs/prism/1.29.0/components/prism-rust.min.js"></script>
+  <script src="https://cdnjs.cloudflare.com/ajax/libs/prism/1.29.0/components/prism-bash.min.js"></script>
+
+  <!-- Main JS -->
+  <script src="js/main.js"></script>
+</body>
+</html>
