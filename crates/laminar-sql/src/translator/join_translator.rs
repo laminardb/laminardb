@@ -5,7 +5,7 @@
 
 use std::time::Duration;
 
-use crate::parser::join_parser::{JoinAnalysis, JoinType};
+use crate::parser::join_parser::{AsofSqlDirection, JoinAnalysis, JoinType};
 
 /// Configuration for stream-stream join operator
 #[derive(Debug, Clone)]
@@ -55,6 +55,32 @@ pub enum LookupJoinType {
     Left,
 }
 
+/// Configuration for ASOF join operator
+#[derive(Debug, Clone)]
+pub struct AsofJoinTranslatorConfig {
+    /// Key column for partitioning (e.g., symbol)
+    pub key_column: String,
+    /// Left side time column
+    pub left_time_column: String,
+    /// Right side time column
+    pub right_time_column: String,
+    /// Join direction (Backward or Forward)
+    pub direction: AsofSqlDirection,
+    /// Maximum allowed time difference
+    pub tolerance: Option<Duration>,
+    /// ASOF join type (Inner or Left)
+    pub join_type: AsofSqlJoinType,
+}
+
+/// ASOF join type
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum AsofSqlJoinType {
+    /// Both sides required
+    Inner,
+    /// Left side always emitted
+    Left,
+}
+
 /// Union type for join operator configurations
 #[derive(Debug, Clone)]
 pub enum JoinOperatorConfig {
@@ -62,12 +88,33 @@ pub enum JoinOperatorConfig {
     StreamStream(StreamJoinConfig),
     /// Lookup join
     Lookup(LookupJoinConfig),
+    /// ASOF join
+    Asof(AsofJoinTranslatorConfig),
 }
 
 impl JoinOperatorConfig {
     /// Create from join analysis.
     #[must_use]
     pub fn from_analysis(analysis: &JoinAnalysis) -> Self {
+        if analysis.is_asof_join {
+            return JoinOperatorConfig::Asof(AsofJoinTranslatorConfig {
+                key_column: analysis.left_key_column.clone(),
+                left_time_column: analysis
+                    .left_time_column
+                    .clone()
+                    .unwrap_or_default(),
+                right_time_column: analysis
+                    .right_time_column
+                    .clone()
+                    .unwrap_or_default(),
+                direction: analysis
+                    .asof_direction
+                    .unwrap_or(AsofSqlDirection::Backward),
+                tolerance: analysis.asof_tolerance,
+                join_type: AsofSqlJoinType::Left, // ASOF is always left-style
+            });
+        }
+
         if analysis.is_lookup_join {
             JoinOperatorConfig::Lookup(LookupJoinConfig {
                 stream_key: analysis.left_key_column.clone(),
@@ -85,7 +132,7 @@ impl JoinOperatorConfig {
                 time_bound: analysis.time_bound.unwrap_or(Duration::from_secs(3600)),
                 join_type: match analysis.join_type {
                     JoinType::Inner => StreamJoinType::Inner,
-                    JoinType::Left => StreamJoinType::Left,
+                    JoinType::Left | JoinType::AsOf => StreamJoinType::Left,
                     JoinType::Right => StreamJoinType::Right,
                     JoinType::Full => StreamJoinType::Full,
                 },
@@ -105,12 +152,19 @@ impl JoinOperatorConfig {
         matches!(self, JoinOperatorConfig::Lookup(_))
     }
 
+    /// Check if this is an ASOF join.
+    #[must_use]
+    pub fn is_asof(&self) -> bool {
+        matches!(self, JoinOperatorConfig::Asof(_))
+    }
+
     /// Get the left key column name.
     #[must_use]
     pub fn left_key(&self) -> &str {
         match self {
             JoinOperatorConfig::StreamStream(config) => &config.left_key,
             JoinOperatorConfig::Lookup(config) => &config.stream_key,
+            JoinOperatorConfig::Asof(config) => &config.key_column,
         }
     }
 
@@ -120,6 +174,7 @@ impl JoinOperatorConfig {
         match self {
             JoinOperatorConfig::StreamStream(config) => &config.right_key,
             JoinOperatorConfig::Lookup(config) => &config.lookup_key,
+            JoinOperatorConfig::Asof(config) => &config.key_column,
         }
     }
 }
@@ -268,6 +323,86 @@ mod tests {
             assert_eq!(stream_config.time_bound, Duration::from_secs(3600));
             assert_eq!(stream_config.join_type, StreamJoinType::Inner);
         }
+    }
+
+    #[test]
+    fn test_from_analysis_asof() {
+        let analysis = JoinAnalysis::asof(
+            "trades".to_string(),
+            "quotes".to_string(),
+            "symbol".to_string(),
+            "symbol".to_string(),
+            AsofSqlDirection::Backward,
+            "ts".to_string(),
+            "ts".to_string(),
+            Some(Duration::from_secs(5)),
+        );
+
+        let config = JoinOperatorConfig::from_analysis(&analysis);
+        assert!(config.is_asof());
+        assert!(!config.is_stream_stream());
+        assert!(!config.is_lookup());
+    }
+
+    #[test]
+    fn test_asof_config_fields() {
+        let analysis = JoinAnalysis::asof(
+            "trades".to_string(),
+            "quotes".to_string(),
+            "symbol".to_string(),
+            "symbol".to_string(),
+            AsofSqlDirection::Forward,
+            "trade_ts".to_string(),
+            "quote_ts".to_string(),
+            Some(Duration::from_millis(5000)),
+        );
+
+        let config = JoinOperatorConfig::from_analysis(&analysis);
+        if let JoinOperatorConfig::Asof(asof) = config {
+            assert_eq!(asof.direction, AsofSqlDirection::Forward);
+            assert_eq!(asof.left_time_column, "trade_ts");
+            assert_eq!(asof.right_time_column, "quote_ts");
+            assert_eq!(asof.tolerance, Some(Duration::from_millis(5000)));
+            assert_eq!(asof.key_column, "symbol");
+            assert_eq!(asof.join_type, AsofSqlJoinType::Left);
+        } else {
+            panic!("Expected Asof config");
+        }
+    }
+
+    #[test]
+    fn test_asof_is_asof() {
+        let analysis = JoinAnalysis::asof(
+            "a".to_string(),
+            "b".to_string(),
+            "id".to_string(),
+            "id".to_string(),
+            AsofSqlDirection::Backward,
+            "ts".to_string(),
+            "ts".to_string(),
+            None,
+        );
+
+        let config = JoinOperatorConfig::from_analysis(&analysis);
+        assert!(config.is_asof());
+    }
+
+    #[test]
+    fn test_asof_key_accessors() {
+        let analysis = JoinAnalysis::asof(
+            "trades".to_string(),
+            "quotes".to_string(),
+            "sym".to_string(),
+            "sym".to_string(),
+            AsofSqlDirection::Backward,
+            "ts".to_string(),
+            "ts".to_string(),
+            None,
+        );
+
+        let config = JoinOperatorConfig::from_analysis(&analysis);
+        assert_eq!(config.left_key(), "sym");
+        assert_eq!(config.right_key(), "sym");
     }
 
     #[test]

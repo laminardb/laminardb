@@ -5,14 +5,21 @@ use std::time::{Duration, Instant};
 
 use laminar_db::PipelineTopology;
 
+use crate::asof_merge::TickIndex;
 use crate::generator::SYMBOLS;
-use crate::types::{AnomalyAlert, OhlcBar, SpreadMetrics, VolumeMetrics};
+use crate::types::{AnomalyAlert, EnrichedOrder, MarketTick, OhlcBar, SpreadMetrics, VolumeMetrics};
 
 /// Maximum number of price history points for sparklines.
 const SPARKLINE_HISTORY: usize = 60;
 
 /// Maximum number of alerts to keep.
 const MAX_ALERTS: usize = 20;
+
+/// Maximum number of enriched orders to display.
+const MAX_ENRICHED_ORDERS: usize = 8;
+
+/// How long to keep ticks in the ASOF buffer (30 seconds in ms).
+const TICK_BUFFER_WINDOW_MS: i64 = 30_000;
 
 /// Volume threshold multiplier for anomaly detection.
 const ANOMALY_VOLUME_THRESHOLD: i64 = 2000;
@@ -42,6 +49,10 @@ pub struct App {
     // -- DAG view --
     pub show_dag: bool,
     pub topology: Option<PipelineTopology>,
+
+    // -- ASOF join state --
+    pub tick_buffer: TickIndex,
+    pub enriched_orders: VecDeque<EnrichedOrder>,
 
     // -- Previous anomaly state for threshold detection --
     prev_anomaly: HashMap<String, i64>,
@@ -81,6 +92,8 @@ impl App {
             alerts: VecDeque::with_capacity(MAX_ALERTS),
             show_dag: false,
             topology: None,
+            tick_buffer: TickIndex::new(),
+            enriched_orders: VecDeque::with_capacity(MAX_ENRICHED_ORDERS),
             prev_anomaly: HashMap::new(),
         }
     }
@@ -158,6 +171,35 @@ impl App {
             }
 
             self.prev_anomaly.insert(row.symbol.clone(), row.total_volume);
+        }
+    }
+
+    /// Buffer raw ticks for ASOF join matching.
+    pub fn ingest_ticks_for_asof(&mut self, ticks: &[MarketTick]) {
+        for tick in ticks {
+            self.tick_buffer
+                .entry(tick.symbol.clone())
+                .or_default()
+                .insert(tick.ts, (tick.price, tick.bid, tick.ask));
+        }
+    }
+
+    /// Clean up old ticks from the ASOF buffer.
+    pub fn cleanup_tick_buffer(&mut self, current_ts: i64) {
+        let cutoff = current_ts - TICK_BUFFER_WINDOW_MS;
+        for ticks in self.tick_buffer.values_mut() {
+            // Remove all entries before cutoff
+            *ticks = ticks.split_off(&cutoff);
+        }
+    }
+
+    /// Store enriched orders from ASOF merge.
+    pub fn ingest_enriched_orders(&mut self, orders: Vec<EnrichedOrder>) {
+        for order in orders {
+            if self.enriched_orders.len() >= MAX_ENRICHED_ORDERS {
+                self.enriched_orders.pop_back();
+            }
+            self.enriched_orders.push_front(order);
         }
     }
 

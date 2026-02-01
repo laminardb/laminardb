@@ -71,6 +71,20 @@ pub struct AnomalyAlert {
     pub total_volume: i64,
 }
 
+/// Enriched order with ASOF-joined market data.
+#[derive(Debug, Clone)]
+pub struct EnrichedOrder {
+    pub order_id: String,
+    pub symbol: String,
+    pub side: String,
+    pub quantity: i64,
+    pub order_price: f64,
+    pub market_price: f64,
+    pub bid: f64,
+    pub ask: f64,
+    pub slippage: f64,
+}
+
 // -- Kafka-mode types for JSON serialization --
 
 #[cfg(feature = "kafka")]

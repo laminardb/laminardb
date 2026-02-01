@@ -32,6 +32,7 @@ use ratatui::Terminal;
 use laminar_db::LaminarDB;
 
 use laminardb_demo::app::App;
+use laminardb_demo::asof_merge;
 use laminardb_demo::generator::MarketGenerator;
 use laminardb_demo::types::{
     AnomalyAlert, MarketTick, OhlcBar, OrderEvent, SpreadMetrics, VolumeMetrics,
@@ -193,6 +194,33 @@ fn run_loop(
             // Generate and push data
             let ticks = generator.generate_ticks(6, ts); // 6 ticks/symbol = 30 total
             let orders = generator.generate_orders(5, ts);
+
+            // Buffer raw ticks for ASOF matching
+            app.ingest_ticks_for_asof(&ticks);
+
+            // Run ASOF merge: enrich orders with latest market data
+            let order_tuples: Vec<_> = orders
+                .iter()
+                .map(|o| {
+                    (
+                        o.order_id.clone(),
+                        o.symbol.clone(),
+                        o.side.clone(),
+                        o.quantity,
+                        o.price,
+                        o.ts,
+                    )
+                })
+                .collect();
+            let enriched = asof_merge::merge_orders_with_ticks(
+                &order_tuples,
+                &app.tick_buffer,
+            );
+            app.ingest_enriched_orders(enriched);
+
+            // Cleanup old ticks periodically
+            app.cleanup_tick_buffer(ts);
+
             app.total_ticks += tick_source.push_batch(ticks) as u64;
             app.total_orders += order_source.push_batch(orders) as u64;
 

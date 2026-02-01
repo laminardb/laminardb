@@ -7,10 +7,10 @@
 | Phase 1 | 12 | 0 | 0 | 0 | 12 |
 | Phase 1.5 | 1 | 0 | 0 | 0 | 1 |
 | Phase 2 | 34 | 0 | 0 | 0 | 34 |
-| Phase 3 | 31 | 13 | 0 | 0 | 18 |
+| Phase 3 | 33 | 13 | 1 | 0 | 19 |
 | Phase 4 | 11 | 11 | 0 | 0 | 0 |
 | Phase 5 | 10 | 10 | 0 | 0 | 0 |
-| **Total** | **99** | **34** | **0** | **0** | **65** |
+| **Total** | **101** | **34** | **1** | **0** | **66** |
 
 ## Status Legend
 
@@ -297,6 +297,12 @@ Ring 0: mmap + ChangelogBuffer (zero-alloc) ──▶ Ring 1: WAL + RocksDB ─�
 - Channel type auto-derived from topology (SPSC/SPMC/MPSC)
 - Zero-copy multicast via reference-counted slot buffers
 - Barrier-based checkpointing (Chandy-Lamport) through DAG edges
+
+### SQL Extensions
+
+| ID | Feature | Priority | Status | Spec |
+|----|---------|----------|--------|------|
+| F-SQL-001 | ASOF JOIN SQL Support | P1 | 🚧 In Progress | [Link](phase-3/F-SQL-001-asof-join-sql.md) |
 
 ### External Connectors
 

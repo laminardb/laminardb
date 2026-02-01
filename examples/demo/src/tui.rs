@@ -123,14 +123,19 @@ fn draw_main_content(f: &mut Frame, app: &App, area: Rect) {
     draw_ohlc_table(f, app, top_cols[0]);
     draw_order_flow(f, app, top_cols[1]);
 
-    // Bottom row: Sparkline | Alerts
+    // Bottom row: Sparkline | Enriched Orders | Alerts
     let bot_cols = Layout::default()
         .direction(Direction::Horizontal)
-        .constraints([Constraint::Percentage(50), Constraint::Percentage(50)])
+        .constraints([
+            Constraint::Percentage(33),
+            Constraint::Percentage(40),
+            Constraint::Percentage(27),
+        ])
         .split(rows[1]);
 
     draw_sparkline(f, app, bot_cols[0]);
-    draw_alerts(f, app, bot_cols[1]);
+    draw_enriched_orders(f, app, bot_cols[1]);
+    draw_alerts(f, app, bot_cols[2]);
 }
 
 /// OHLC bars table.
@@ -273,6 +278,67 @@ fn draw_sparkline(f: &mut Frame, app: &App, area: Rect) {
         .data(&data)
         .style(Style::default().fg(Color::Green));
     f.render_widget(sparkline, area);
+}
+
+/// Enriched orders table (ASOF JOIN results).
+fn draw_enriched_orders(f: &mut Frame, app: &App, area: Rect) {
+    let header = Row::new(vec!["Order", "Sym", "Side", "Qty", "Price", "Mkt", "Slip"])
+        .style(
+            Style::default()
+                .fg(Color::Yellow)
+                .add_modifier(Modifier::BOLD),
+        );
+
+    let max_rows = area.height.saturating_sub(3) as usize;
+    let rows: Vec<Row> = app
+        .enriched_orders
+        .iter()
+        .take(max_rows)
+        .map(|eo| {
+            let slip_color = if eo.slippage >= 0.0 {
+                Color::Green
+            } else {
+                Color::Red
+            };
+            let slip_str = if eo.slippage >= 0.0 {
+                format!("+{:.2}", eo.slippage)
+            } else {
+                format!("{:.2}", eo.slippage)
+            };
+            Row::new(vec![
+                Cell::from(eo.order_id.chars().skip(4).collect::<String>())
+                    .style(Style::default().fg(Color::DarkGray)),
+                Cell::from(eo.symbol.clone())
+                    .style(Style::default().fg(Color::Cyan)),
+                Cell::from(eo.side.clone()),
+                Cell::from(eo.quantity.to_string()),
+                Cell::from(format!("{:.2}", eo.order_price)),
+                Cell::from(format!("{:.2}", eo.market_price)),
+                Cell::from(slip_str).style(Style::default().fg(slip_color)),
+            ])
+        })
+        .collect();
+
+    let table = Table::new(
+        rows,
+        [
+            Constraint::Length(9),
+            Constraint::Length(6),
+            Constraint::Length(5),
+            Constraint::Length(4),
+            Constraint::Length(7),
+            Constraint::Length(7),
+            Constraint::Length(7),
+        ],
+    )
+    .header(header)
+    .block(
+        Block::default()
+            .title(" ENRICHED ORDERS (ASOF) ")
+            .borders(Borders::ALL)
+            .border_style(Style::default().fg(Color::Magenta)),
+    );
+    f.render_widget(table, area);
 }
 
 /// Alert list.
