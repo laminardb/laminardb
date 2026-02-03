@@ -141,7 +141,7 @@ impl XdpLoader {
             .map_err(|e: libbpf_rs::Error| XdpError::AttachFailed(e.to_string()))?;
 
         // Configure CPU map if present
-        if let Some(mut cpu_map) = obj.maps_mut().find(|m| m.name() == "cpu_map") {
+        if let Some(cpu_map) = obj.maps_mut().find(|m| m.name() == "cpu_map") {
             for cpu in 0..num_cores {
                 let key = (cpu as u32).to_ne_bytes();
                 // CpumapValue format: qsize as u32

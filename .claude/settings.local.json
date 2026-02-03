@@ -43,7 +43,28 @@
       "Bash(for f in F025-kafka-source.md F026-kafka-sink.md F027-postgres-cdc.md F031-delta-lake-sink.md F034-connector-sdk.md F-DAG-001-dag-pipeline.md)",
       "WebFetch(domain:arrow.apache.org)",
       "WebFetch(domain:docs.confluent.io)",
-      "Bash(cmake:*)"
+      "Bash(cmake:*)",
+      "Bash(git -C \"C:\\\\Users\\\\sujit\\\\source\\\\laminardb\" branch:*)",
+      "Bash(git -C \"C:\\\\Users\\\\sujit\\\\source\\\\laminardb\" log --oneline -20)",
+      "Bash(git -C \"C:\\\\Users\\\\sujit\\\\source\\\\laminardb\" remote -v)",
+      "Bash(start \"\" \"C:/Users/sujit/source/laminardb/site/index.html\")",
+      "Bash(magick identify:*)",
+      "Bash(ffprobe:*)",
+      "Bash(Measure-Object -Line)",
+      "Bash(powershell.exe -NoProfile -Command:*)",
+      "WebFetch(domain:)",
+      "Bash(git status:*)",
+      "Bash(git -C \"C:\\\\Users\\\\sujit\\\\source\\\\laminardb\" status -u)",
+      "Bash(git -C \"C:\\\\Users\\\\sujit\\\\source\\\\laminardb\" diff)",
+      "Bash(git -C \"C:\\\\Users\\\\sujit\\\\source\\\\laminardb\" log --oneline -5)",
+      "Bash(git -C \"C:\\\\Users\\\\sujit\\\\source\\\\laminardb\" add crates/laminar-core/src/mv/watermark.rs crates/laminar-core/src/state/mmap.rs crates/laminar-storage/src/wal.rs)",
+      "Bash(git -C \"C:\\\\Users\\\\sujit\\\\source\\\\laminardb\" commit -m \"$\\(cat <<''EOF''\nfix test regression and clippy errors from Rust 1.93 upgrade\n\n- Fix watermark batch_update test: assertion expected 1 but propagation\n  yields 4 entries \\(trades → ohlc_1s → ohlc_1m → ohlc_1h\\)\n- Move `use std::io::Write` to module imports \\(items_after_statements\\)\n- Add `# Errors` doc to save_index \\(missing_errors_doc\\)\n- Allow type_complexity on private load_index return type\n- Allow cast_possible_truncation on RECORD_HEADER_SIZE \\(constant 8\\)\n\nCo-Authored-By: Claude Opus 4.5 <noreply@anthropic.com>\nEOF\n\\)\")",
+      "Bash(git -C \"C:\\\\Users\\\\sujit\\\\source\\\\laminardb\" status)",
+      "Bash(Select-String -Pattern \"test result:\" C:Userssujit.claudeprojectsC--Users-sujit-source-laminardb04a739e4-150d-4e1a-b0f6-488d711f0ef2tool-resultstoolu_019qSnAT7HmTgFgd67Fxh53v.txt)",
+      "WebFetch(domain:crates.io)",
+      "Bash(bc:*)",
+      "WebFetch(domain:raw.githubusercontent.com)",
+      "Bash(cargo fix:*)"
     ]
   }
 }

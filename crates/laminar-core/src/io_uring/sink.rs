@@ -175,7 +175,7 @@ mod linux_impl {
                     format!("SIDE_OUTPUT name={} ts={}\n", name, event.timestamp).into_bytes()
                 }
                 Output::Changelog(record) => {
-                    format!("CHANGELOG key={:?}\n", record.key).into_bytes()
+                    format!("CHANGELOG op={:?}\n", record.operation).into_bytes()
                 }
                 Output::CheckpointComplete { checkpoint_id, .. } => {
                     format!("CHECKPOINT_COMPLETE id={checkpoint_id}\n").into_bytes()
