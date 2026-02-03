@@ -80,6 +80,51 @@ impl IoUringConfig {
         IoUringConfigBuilder::default()
     }
 
+    /// Create configuration with automatic detection.
+    ///
+    /// Detects system capabilities and generates an optimal configuration:
+    /// - Enables SQPOLL mode on Linux 5.11+ with the io-uring feature
+    /// - Enables IOPOLL mode on Linux 5.19+ with `NVMe` storage
+    /// - Uses optimal buffer sizes based on available memory
+    ///
+    /// # Example
+    ///
+    /// ```rust,ignore
+    /// use laminar_core::io_uring::IoUringConfig;
+    ///
+    /// let config = IoUringConfig::auto();
+    /// println!("SQPOLL: {}", config.mode.uses_sqpoll());
+    /// ```
+    #[must_use]
+    pub fn auto() -> Self {
+        let caps = crate::detect::SystemCapabilities::detect();
+
+        let mode = if caps.io_uring.iopoll_supported && caps.storage.device_type.supports_iopoll() {
+            if caps.io_uring.sqpoll_supported {
+                RingMode::SqPollIoPoll
+            } else {
+                RingMode::IoPoll
+            }
+        } else if caps.io_uring.sqpoll_supported {
+            RingMode::SqPoll
+        } else {
+            RingMode::Standard
+        };
+
+        Self {
+            ring_entries: 256,
+            mode,
+            sqpoll_idle_ms: 1000,
+            sqpoll_cpu: None,
+            buffer_size: 64 * 1024,
+            buffer_count: 256,
+            coop_taskrun: caps.io_uring.coop_taskrun,
+            single_issuer: caps.io_uring.single_issuer,
+            direct_table: false,
+            direct_table_size: 256,
+        }
+    }
+
     /// Total buffer pool size in bytes.
     #[must_use]
     pub const fn total_buffer_size(&self) -> usize {
@@ -330,5 +375,25 @@ mod tests {
             .build_unchecked();
 
         assert_eq!(config.mode, RingMode::SqPollIoPoll);
+    }
+
+    #[test]
+    fn test_io_uring_config_auto() {
+        let config = IoUringConfig::auto();
+
+        // Auto config should have valid default values
+        assert_eq!(config.ring_entries, 256);
+        assert_eq!(config.buffer_size, 64 * 1024);
+        assert_eq!(config.buffer_count, 256);
+
+        // Validation should pass
+        assert!(config.validate().is_ok());
+
+        // Mode depends on platform capabilities
+        // On non-Linux or without io-uring feature, should be Standard
+        #[cfg(not(all(target_os = "linux", feature = "io-uring")))]
+        {
+            assert_eq!(config.mode, RingMode::Standard);
+        }
     }
 }

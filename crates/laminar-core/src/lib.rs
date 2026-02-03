@@ -36,6 +36,7 @@
 pub mod alloc;
 pub mod budget;
 pub mod dag;
+pub mod detect;
 pub mod io_uring;
 pub mod mv;
 pub mod numa;

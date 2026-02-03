@@ -54,6 +54,71 @@ impl XdpConfig {
         XdpConfigBuilder::default()
     }
 
+    /// Create configuration with automatic detection.
+    ///
+    /// Detects system capabilities and generates an optimal configuration:
+    /// - Enables XDP only on Linux 4.8+ with the xdp feature
+    /// - Prefers native mode on Linux 5.3+, falls back to generic mode
+    /// - Sizes CPU queues based on available memory
+    ///
+    /// # Note
+    ///
+    /// XDP requires additional setup (BPF object file, `CAP_NET_ADMIN` capability)
+    /// that cannot be auto-detected. This method sets `enabled: false` by default;
+    /// call `.enabled(true)` on the builder to enable XDP after ensuring
+    /// prerequisites are met.
+    ///
+    /// # Example
+    ///
+    /// ```rust,ignore
+    /// use laminar_core::xdp::XdpConfig;
+    ///
+    /// let config = XdpConfig::auto();
+    /// println!("XDP available: {}", config.xdp_available());
+    /// ```
+    #[must_use]
+    pub fn auto() -> Self {
+        let caps = crate::detect::SystemCapabilities::detect();
+
+        let attach_mode = if caps.xdp.native_supported {
+            super::XdpAttachMode::Native
+        } else if caps.xdp.generic_supported {
+            super::XdpAttachMode::Generic
+        } else {
+            super::XdpAttachMode::Auto
+        };
+
+        // Scale queue size based on memory
+        let cpu_queue_size = if caps.memory.total_memory > 32 * 1024 * 1024 * 1024 {
+            4096
+        } else if caps.memory.total_memory > 8 * 1024 * 1024 * 1024 {
+            2048
+        } else {
+            1024
+        };
+
+        Self {
+            // XDP is disabled by default - requires manual setup
+            enabled: false,
+            bpf_object_path: std::path::PathBuf::from("/usr/share/laminardb/laminar_xdp.o"),
+            interface: "eth0".to_string(),
+            port: 9999,
+            attach_mode,
+            cpu_queue_size,
+            collect_stats: true,
+            fallback_on_error: true,
+        }
+    }
+
+    /// Check if XDP is available on this system.
+    ///
+    /// Returns `true` if the kernel supports XDP and the feature is enabled.
+    #[must_use]
+    pub fn xdp_available() -> bool {
+        let caps = crate::detect::SystemCapabilities::detect();
+        caps.xdp.is_usable()
+    }
+
     /// Validates the configuration.
     ///
     /// # Errors
@@ -230,5 +295,35 @@ mod tests {
             .build()
             .unwrap();
         assert!(!config.enabled);
+    }
+
+    #[test]
+    fn test_xdp_config_auto() {
+        let config = XdpConfig::auto();
+
+        // Auto config should have XDP disabled by default
+        // (requires manual setup)
+        assert!(!config.enabled);
+
+        // Should have valid defaults
+        assert_eq!(config.interface, "eth0");
+        assert!(config.fallback_on_error);
+        assert!(config.collect_stats);
+        assert!(config.cpu_queue_size >= 1024);
+
+        // Validation should pass when disabled
+        assert!(config.validate().is_ok());
+    }
+
+    #[test]
+    fn test_xdp_available() {
+        // Should not panic on any platform
+        let available = XdpConfig::xdp_available();
+
+        // On non-Linux or without xdp feature, should be false
+        #[cfg(not(all(target_os = "linux", feature = "xdp")))]
+        {
+            assert!(!available);
+        }
     }
 }

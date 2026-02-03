@@ -236,6 +236,38 @@ impl TpcConfig {
         TpcConfigBuilder::default()
     }
 
+    /// Creates configuration with automatic detection.
+    ///
+    /// Detects system capabilities and generates an optimal configuration:
+    /// - Uses all available physical cores (minus 1 on systems with >8 cores)
+    /// - Enables CPU pinning on multi-core systems
+    /// - Enables NUMA-aware allocation on multi-socket systems
+    ///
+    /// # Example
+    ///
+    /// ```rust,ignore
+    /// use laminar_core::tpc::TpcConfig;
+    ///
+    /// let config = TpcConfig::auto();
+    /// println!("Using {} cores", config.num_cores);
+    /// ```
+    #[must_use]
+    pub fn auto() -> Self {
+        let caps = crate::detect::SystemCapabilities::detect();
+        let recommended = caps.recommended_config();
+
+        Self {
+            num_cores: recommended.num_cores,
+            key_spec: KeySpec::RoundRobin,
+            cpu_pinning: recommended.cpu_pinning,
+            cpu_start: 0,
+            inbox_capacity: recommended.queue_capacity,
+            outbox_capacity: recommended.queue_capacity,
+            reactor_config: ReactorConfig::default(),
+            numa_aware: recommended.numa_aware,
+        }
+    }
+
     /// Validates the configuration.
     ///
     /// # Errors
@@ -1352,6 +1384,38 @@ mod tests {
         // Invalid core returns 0
         let count = runtime.poll_core_each(99, 100, |_| true);
         assert_eq!(count, 0);
+
+        runtime.shutdown().unwrap();
+    }
+
+    #[test]
+    fn test_tpc_config_auto() {
+        let config = TpcConfig::auto();
+
+        // Auto config should have valid values
+        assert!(config.num_cores >= 1);
+        assert!(config.inbox_capacity > 0);
+        assert!(config.outbox_capacity > 0);
+
+        // On multi-core systems, cpu_pinning should be enabled
+        if config.num_cores > 1 {
+            assert!(config.cpu_pinning);
+        }
+
+        // Validation should pass
+        assert!(config.validate().is_ok());
+    }
+
+    #[test]
+    fn test_tpc_config_auto_creates_runtime() {
+        // Auto config should be usable to create a runtime
+        // (but with cpu_pinning disabled to avoid permission issues in tests)
+        let mut config = TpcConfig::auto();
+        config.cpu_pinning = false; // Disable for test environments
+        config.num_cores = config.num_cores.min(2); // Limit cores for faster test
+
+        let runtime = ThreadPerCoreRuntime::new(config).unwrap();
+        assert!(runtime.is_running());
 
         runtime.shutdown().unwrap();
     }
