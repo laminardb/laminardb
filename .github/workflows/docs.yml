@@ -30,6 +30,9 @@ jobs:
       - uses: dtolnay/rust-toolchain@nightly
       - uses: Swatinem/rust-cache@v2
 
+      - name: Install system dependencies
+        run: sudo apt-get update && sudo apt-get install -y libhwloc-dev libelf-dev zlib1g-dev
+
       - name: Build API documentation
         run: cargo +nightly doc --workspace --no-deps --all-features
         env:
