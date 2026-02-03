@@ -5,9 +5,24 @@
 
 ## Last Session
 
-**Date**: 2026-02-02
+**Date**: 2026-02-03
 
 ### What Was Accomplished
+- **F028: MySQL CDC Source** - IMPLEMENTATION COMPLETE (119 new tests, 359 total connector-base tests)
+  - `cdc/mysql/config.rs`: MySqlCdcConfig with SslMode, SnapshotMode enums, from_config() parsing, validation (15 tests)
+  - `cdc/mysql/gtid.rs`: Gtid, GtidRange, GtidSet types with parsing and ordering (21 tests)
+  - `cdc/mysql/types.rs`: MySqlColumn, mysql_type_to_arrow mapping for 20+ MySQL types (14 tests)
+  - `cdc/mysql/decoder.rs`: BinlogMessage enum, BinlogPosition, TableMapMessage, row event types (14 tests)
+  - `cdc/mysql/schema.rs`: TableInfo, TableCache for binlog TABLE_MAP events (12 tests)
+  - `cdc/mysql/changelog.rs`: CdcOperation, ChangeEvent, Z-set changelog format, events_to_record_batch (17 tests)
+  - `cdc/mysql/metrics.rs`: MySqlCdcMetrics with 11 AtomicU64 counters, MetricsSnapshot (12 tests)
+  - `cdc/mysql/source.rs`: MySqlCdcSource implementing SourceConnector — open/poll_batch/checkpoint/restore/health_check/close (14 tests)
+  - `cdc/mysql/mod.rs`: Re-exports, register_mysql_cdc_source factory, 19 config key specs (4 tests)
+  - Feature-gated behind `mysql-cdc` Cargo feature (business logic only, no mysql_async dependency)
+  - Follows Delta Lake pattern: all business logic without actual I/O (F028A will add binlog I/O)
+  - All clippy clean with `-D warnings`
+
+Previous session (2026-02-02):
 - **F-CLOUD-001, F-CLOUD-002, F-CLOUD-003: Cloud Storage Infrastructure** - ALL 3 COMPLETE (82 new tests, 256 total connector base tests)
   - `storage/provider.rs`: StorageProvider enum (AwsS3, AzureAdls, Gcs, Local), detect() from URI scheme, 18 tests
   - `storage/resolver.rs`: StorageCredentialResolver with resolve() and resolve_with_env(), env var fallback for AWS (7 vars), Azure (6), GCS (2), 22 tests
@@ -118,10 +133,10 @@ Previous session (2026-01-28):
 - Performance Audit: ALL 10 issues fixed
 - F074-F077: Aggregation Semantics Enhancement - COMPLETE (219 tests)
 
-**Total tests**: 1241 core + 401 sql + 115 storage + 120 laminar-db + 169 connectors-base + 84 postgres-sink-only + 107 postgres-cdc-only + 118 kafka-only = 2355
+**Total tests**: 1241 core + 401 sql + 115 storage + 120 laminar-db + 359 connectors-base + 84 postgres-sink-only + 107 postgres-cdc-only + 118 kafka-only = 2545
 
 ### Where We Left Off
-**Phase 3 Connectors & Integration: 32/48 features COMPLETE (67%)**
+**Phase 3 Connectors & Integration: 33/48 features COMPLETE (69%)**
 - Streaming API core complete (F-STREAM-001 to F-STREAM-007, F-STREAM-013)
 - Developer API overhaul complete (laminar-derive, laminar-db crates)
 - DAG pipeline complete (F-DAG-001 to F-DAG-007)
@@ -129,23 +144,25 @@ Previous session (2026-01-28):
 - Kafka Sink Connector complete (F026)
 - PostgreSQL CDC Source complete (F027) — 107 tests, full pgoutput decoder
 - PostgreSQL Sink complete (F027B) — 84 tests, COPY BINARY + upsert + exactly-once
+- **MySQL CDC Source complete (F028)** — 119 tests, binlog decoder + GTID + Z-set changelog
 - Delta Lake Sink business logic complete (F031) — 73 tests, buffering + epoch management + changelog splitting
 - SQL & MV Integration complete (F-DAG-005) — 18 new tests, DAG from MvRegistry, watermarks, changelog
 - Connector Bridge complete (F-DAG-006) — 25 new tests, source/sink bridge + runtime orchestration
 - Performance Validation complete (F-DAG-007) — 16 benchmarks, performance audit + optimizations
 - Reactive Subscription System complete (F-SUB-001 to F-SUB-008) — 8 features, 10 new modules
-- **Cloud Storage Infrastructure complete (F-CLOUD-001/002/003)** — 82 tests, integrated with Delta Lake Sink
+- Cloud Storage Infrastructure complete (F-CLOUD-001/002/003) — 82 tests, integrated with Delta Lake Sink
 - Delta Lake I/O extension specs created (F031A/B/C/D) — blocked by deltalake crate
-- Next: F028 MySQL CDC Source or F032 Iceberg Sink
+- Next: F032 Iceberg Sink or F034 Connector SDK
 
 ### Immediate Next Steps
-1. F028: MySQL CDC Source
-2. F032: Iceberg Sink
-3. F034: Connector SDK
+1. F032: Iceberg Sink
+2. F034: Connector SDK
+3. F028A: MySQL CDC binlog I/O (when mysql_async can be added without OpenSSL issues)
 4. F031A/B/C/D: Delta Lake I/O (when deltalake crate version aligns)
 
 ### Open Issues
 - **deltalake crate version**: Incompatible with workspace DataFusion version. F031A/B/C/D blocked until resolved. Track [delta-rs releases](https://github.com/delta-io/delta-rs/releases).
+- **mysql_async crate**: Requires OpenSSL on Windows. F028A (binlog I/O) deferred until dependency resolved. Business logic complete in F028.
 - None currently blocking.
 
 ---
@@ -296,6 +313,15 @@ laminar-connectors/src/
     changelog         # Z-set ChangeEvent, tuple_to_json, events_to_record_batch
     metrics           # CdcMetrics (11 atomic counters)
     source            # PostgresCdcSource (SourceConnector impl, transaction buffering)
+  cdc/mysql/          # F028: MySQL CDC Source Connector
+    config            # MySqlCdcConfig, SslMode, SnapshotMode
+    gtid              # Gtid, GtidRange, GtidSet (GTID-based replication)
+    types             # MySqlColumn, mysql_type_to_arrow mapping (20+ types)
+    decoder           # BinlogMessage enum, BinlogPosition, row event types
+    schema            # TableInfo, TableCache (TABLE_MAP event handling)
+    changelog         # CdcOperation, ChangeEvent, Z-set format, events_to_record_batch
+    metrics           # MySqlCdcMetrics (11 atomic counters)
+    source            # MySqlCdcSource (SourceConnector impl)
   lakehouse/          # F031: Delta Lake Sink (Lakehouse connectors)
     delta             # DeltaLakeSink (SinkConnector impl, buffering + epoch + changelog)
     delta_config      # DeltaLakeSinkConfig, DeltaWriteMode, DeliveryGuarantee, CompactionConfig
