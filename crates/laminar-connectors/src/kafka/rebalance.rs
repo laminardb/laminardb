@@ -84,10 +84,7 @@ mod tests {
     #[test]
     fn test_revoke() {
         let mut state = RebalanceState::new();
-        state.on_assign(&[
-            ("events".into(), 0),
-            ("events".into(), 1),
-        ]);
+        state.on_assign(&[("events".into(), 0), ("events".into(), 1)]);
         state.on_revoke(&[("events".into(), 1)]);
 
         assert_eq!(state.assigned_partitions().len(), 1);

@@ -145,11 +145,8 @@ impl std::fmt::Debug for HotPathGuard {
 #[macro_export]
 macro_rules! hot_path {
     () => {
-        let _hot_path_guard = $crate::alloc::HotPathGuard::enter(concat!(
-            module_path!(),
-            "::",
-            stringify!(fn)
-        ));
+        let _hot_path_guard =
+            $crate::alloc::HotPathGuard::enter(concat!(module_path!(), "::", stringify!(fn)));
     };
     ($section:expr) => {
         let _hot_path_guard = $crate::alloc::HotPathGuard::enter($section);

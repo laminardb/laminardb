@@ -228,9 +228,7 @@ mod tests {
 
     fn gcs_env(var: &str) -> Option<String> {
         match var {
-            "GOOGLE_APPLICATION_CREDENTIALS" => {
-                Some("/path/to/creds.json".to_string())
-            }
+            "GOOGLE_APPLICATION_CREDENTIALS" => Some("/path/to/creds.json".to_string()),
             _ => None,
         }
     }
@@ -251,8 +249,7 @@ mod tests {
     fn test_resolve_local_preserves_explicit() {
         let mut opts = HashMap::new();
         opts.insert("custom_key".to_string(), "value".to_string());
-        let resolved =
-            StorageCredentialResolver::resolve_with_env("/data/table", &opts, env_none);
+        let resolved = StorageCredentialResolver::resolve_with_env("/data/table", &opts, env_none);
         assert_eq!(resolved.options.get("custom_key").unwrap(), "value");
     }
 
@@ -299,8 +296,12 @@ mod tests {
         // Explicit region preserved; env keys and secret filled from env.
         assert_eq!(resolved.options["aws_region"], "ap-southeast-1");
         assert_eq!(resolved.options["aws_access_key_id"], "AKID_FROM_ENV");
-        assert!(!resolved.env_resolved_keys.contains(&"aws_region".to_string()));
-        assert!(resolved.env_resolved_keys.contains(&"aws_access_key_id".to_string()));
+        assert!(!resolved
+            .env_resolved_keys
+            .contains(&"aws_region".to_string()));
+        assert!(resolved
+            .env_resolved_keys
+            .contains(&"aws_access_key_id".to_string()));
     }
 
     #[test]
@@ -322,11 +323,8 @@ mod tests {
                 _ => None,
             }
         };
-        let resolved = StorageCredentialResolver::resolve_with_env(
-            "s3://bucket/path",
-            &empty_opts(),
-            env,
-        );
+        let resolved =
+            StorageCredentialResolver::resolve_with_env("s3://bucket/path", &empty_opts(), env);
         assert_eq!(resolved.options["aws_session_token"], "token123");
     }
 
@@ -348,10 +346,7 @@ mod tests {
             "aws_endpoint".to_string(),
             "http://localhost:9000".to_string(),
         );
-        opts.insert(
-            "aws_s3_allow_unsafe_rename".to_string(),
-            "true".to_string(),
-        );
+        opts.insert("aws_s3_allow_unsafe_rename".to_string(), "true".to_string());
         opts.insert("aws_access_key_id".to_string(), "minioadmin".to_string());
         opts.insert(
             "aws_secret_access_key".to_string(),
@@ -374,24 +369,15 @@ mod tests {
             azure_env,
         );
         assert_eq!(resolved.provider, StorageProvider::AzureAdls);
-        assert_eq!(
-            resolved.options["azure_storage_account_name"],
-            "myaccount"
-        );
-        assert_eq!(
-            resolved.options["azure_storage_account_key"],
-            "base64key=="
-        );
+        assert_eq!(resolved.options["azure_storage_account_name"], "myaccount");
+        assert_eq!(resolved.options["azure_storage_account_key"], "base64key==");
         assert!(resolved.has_credentials());
     }
 
     #[test]
     fn test_resolve_azure_sas_token() {
         let mut opts = HashMap::new();
-        opts.insert(
-            "azure_storage_account_name".to_string(),
-            "acct".to_string(),
-        );
+        opts.insert("azure_storage_account_name".to_string(), "acct".to_string());
         opts.insert(
             "azure_storage_sas_token".to_string(),
             "sv=2021-06&sig=abc".to_string(),
@@ -412,10 +398,7 @@ mod tests {
     #[test]
     fn test_resolve_azure_client_id() {
         let mut opts = HashMap::new();
-        opts.insert(
-            "azure_storage_account_name".to_string(),
-            "acct".to_string(),
-        );
+        opts.insert("azure_storage_account_name".to_string(), "acct".to_string());
         opts.insert(
             "azure_storage_client_id".to_string(),
             "client-id-123".to_string(),
@@ -440,11 +423,8 @@ mod tests {
 
     #[test]
     fn test_resolve_gcs_env_fallback() {
-        let resolved = StorageCredentialResolver::resolve_with_env(
-            "gs://bucket/path",
-            &empty_opts(),
-            gcs_env,
-        );
+        let resolved =
+            StorageCredentialResolver::resolve_with_env("gs://bucket/path", &empty_opts(), gcs_env);
         assert_eq!(resolved.provider, StorageProvider::Gcs);
         assert_eq!(
             resolved.options["google_service_account_path"],
@@ -482,11 +462,15 @@ mod tests {
     fn test_env_resolved_keys_tracked() {
         let resolved =
             StorageCredentialResolver::resolve_with_env("s3://bucket/path", &empty_opts(), aws_env);
-        assert!(resolved.env_resolved_keys.contains(&"aws_access_key_id".to_string()));
+        assert!(resolved
+            .env_resolved_keys
+            .contains(&"aws_access_key_id".to_string()));
         assert!(resolved
             .env_resolved_keys
             .contains(&"aws_secret_access_key".to_string()));
-        assert!(resolved.env_resolved_keys.contains(&"aws_region".to_string()));
+        assert!(resolved
+            .env_resolved_keys
+            .contains(&"aws_region".to_string()));
     }
 
     #[test]
@@ -497,11 +481,8 @@ mod tests {
                 _ => None,
             }
         };
-        let resolved = StorageCredentialResolver::resolve_with_env(
-            "s3://bucket/path",
-            &empty_opts(),
-            env,
-        );
+        let resolved =
+            StorageCredentialResolver::resolve_with_env("s3://bucket/path", &empty_opts(), env);
         assert!(!resolved.options.contains_key("aws_region"));
     }
 

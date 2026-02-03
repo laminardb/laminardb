@@ -232,12 +232,12 @@ impl<'a> Cursor<'a> {
 
     fn read_i32(&mut self) -> Result<i32, DecoderError> {
         self.check_remaining(4)?;
-        let bytes: [u8; 4] = self.data[self.pos..self.pos + 4]
-            .try_into()
-            .map_err(|_| DecoderError::UnexpectedEof {
+        let bytes: [u8; 4] = self.data[self.pos..self.pos + 4].try_into().map_err(|_| {
+            DecoderError::UnexpectedEof {
                 offset: self.pos,
                 needed: 4,
-            })?;
+            }
+        })?;
         let val = i32::from_be_bytes(bytes);
         self.pos += 4;
         Ok(val)
@@ -245,12 +245,12 @@ impl<'a> Cursor<'a> {
 
     fn read_u32(&mut self) -> Result<u32, DecoderError> {
         self.check_remaining(4)?;
-        let bytes: [u8; 4] = self.data[self.pos..self.pos + 4]
-            .try_into()
-            .map_err(|_| DecoderError::UnexpectedEof {
+        let bytes: [u8; 4] = self.data[self.pos..self.pos + 4].try_into().map_err(|_| {
+            DecoderError::UnexpectedEof {
                 offset: self.pos,
                 needed: 4,
-            })?;
+            }
+        })?;
         let val = u32::from_be_bytes(bytes);
         self.pos += 4;
         Ok(val)
@@ -258,12 +258,12 @@ impl<'a> Cursor<'a> {
 
     fn read_i64(&mut self) -> Result<i64, DecoderError> {
         self.check_remaining(8)?;
-        let bytes: [u8; 8] = self.data[self.pos..self.pos + 8]
-            .try_into()
-            .map_err(|_| DecoderError::UnexpectedEof {
+        let bytes: [u8; 8] = self.data[self.pos..self.pos + 8].try_into().map_err(|_| {
+            DecoderError::UnexpectedEof {
                 offset: self.pos,
                 needed: 8,
-            })?;
+            }
+        })?;
         let val = i64::from_be_bytes(bytes);
         self.pos += 8;
         Ok(val)
@@ -271,12 +271,12 @@ impl<'a> Cursor<'a> {
 
     fn read_u64(&mut self) -> Result<u64, DecoderError> {
         self.check_remaining(8)?;
-        let bytes: [u8; 8] = self.data[self.pos..self.pos + 8]
-            .try_into()
-            .map_err(|_| DecoderError::UnexpectedEof {
+        let bytes: [u8; 8] = self.data[self.pos..self.pos + 8].try_into().map_err(|_| {
+            DecoderError::UnexpectedEof {
                 offset: self.pos,
                 needed: 8,
-            })?;
+            }
+        })?;
         let val = u64::from_be_bytes(bytes);
         self.pos += 8;
         Ok(val)
@@ -288,9 +288,7 @@ impl<'a> Cursor<'a> {
         let nul_pos = self.data[self.pos..]
             .iter()
             .position(|&b| b == 0)
-            .ok_or(DecoderError::InvalidData(
-                "unterminated string".to_string(),
-            ))?;
+            .ok_or(DecoderError::InvalidData("unterminated string".to_string()))?;
 
         let s = std::str::from_utf8(&self.data[self.pos..self.pos + nul_pos])
             .map_err(|_| DecoderError::InvalidUtf8(start))?;
@@ -381,9 +379,8 @@ fn decode_relation(cur: &mut Cursor<'_>) -> Result<WalMessage, DecoderError> {
     let name = cur.read_cstring()?;
     let replica_identity = cur.read_u8()?;
     let n_cols_raw = cur.read_i16()?;
-    let n_cols = usize::try_from(n_cols_raw).map_err(|_| {
-        DecoderError::InvalidData(format!("negative column count: {n_cols_raw}"))
-    })?;
+    let n_cols = usize::try_from(n_cols_raw)
+        .map_err(|_| DecoderError::InvalidData(format!("negative column count: {n_cols_raw}")))?;
 
     let mut columns = Vec::with_capacity(n_cols);
     for _ in 0..n_cols {
@@ -503,9 +500,8 @@ fn decode_type(cur: &mut Cursor<'_>) -> Result<WalMessage, DecoderError> {
 
 fn decode_tuple_data(cur: &mut Cursor<'_>) -> Result<TupleData, DecoderError> {
     let n_cols_raw = cur.read_i16()?;
-    let n_cols = usize::try_from(n_cols_raw).map_err(|_| {
-        DecoderError::InvalidData(format!("negative column count: {n_cols_raw}"))
-    })?;
+    let n_cols = usize::try_from(n_cols_raw)
+        .map_err(|_| DecoderError::InvalidData(format!("negative column count: {n_cols_raw}")))?;
     let mut columns = Vec::with_capacity(n_cols);
 
     for _ in 0..n_cols {
@@ -590,8 +586,7 @@ mod tests {
 
         fn text_col(mut self, s: &str) -> Self {
             self.buf.push(b't');
-            self.buf
-                .extend_from_slice(&(s.len() as i32).to_be_bytes());
+            self.buf.extend_from_slice(&(s.len() as i32).to_be_bytes());
             self.buf.extend_from_slice(s.as_bytes());
             self
         }
@@ -629,10 +624,7 @@ mod tests {
             WalMessage::Begin(b) => {
                 assert_eq!(b.final_lsn.as_u64(), 0x1234_ABCD);
                 assert_eq!(b.xid, 42);
-                assert_eq!(
-                    b.commit_ts_ms,
-                    (pg_ts_us + PG_EPOCH_OFFSET_US) / 1000
-                );
+                assert_eq!(b.commit_ts_ms, (pg_ts_us + PG_EPOCH_OFFSET_US) / 1000);
             }
             _ => panic!("expected Begin"),
         }
@@ -894,10 +886,7 @@ mod tests {
         match msg {
             WalMessage::Insert(ins) => {
                 assert_eq!(ins.new_tuple.columns[0].as_text(), Some("42"));
-                assert!(matches!(
-                    ins.new_tuple.columns[1],
-                    ColumnValue::Unchanged
-                ));
+                assert!(matches!(ins.new_tuple.columns[1], ColumnValue::Unchanged));
             }
             _ => panic!("expected Insert"),
         }

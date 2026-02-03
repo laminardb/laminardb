@@ -688,11 +688,8 @@ where
 
     fn checkpoint(&self) -> OperatorState {
         // Serialize active session key hashes and their timer times
-        let checkpoint_data: Vec<(u64, i64)> = self
-            .pending_timers
-            .iter()
-            .map(|(&k, &v)| (k, v))
-            .collect();
+        let checkpoint_data: Vec<(u64, i64)> =
+            self.pending_timers.iter().map(|(&k, &v)| (k, v)).collect();
 
         let data = rkyv::to_bytes::<RkyvError>(&checkpoint_data)
             .map(|v| v.to_vec())
@@ -744,7 +741,7 @@ pub struct SessionMetrics {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::operator::window::{CountAggregator, CountAccumulator, SumAggregator};
+    use crate::operator::window::{CountAccumulator, CountAggregator, SumAggregator};
     use crate::state::InMemoryStore;
     use crate::time::{BoundedOutOfOrdernessGenerator, TimerService};
     use arrow_array::{Int64Array, RecordBatch};
@@ -791,7 +788,6 @@ mod tests {
             operator_index: 0,
         }
     }
-
 
     #[test]
     fn test_session_operator_creation() {
@@ -872,7 +868,6 @@ mod tests {
         assert_eq!(state1.start, 1000);
         assert_eq!(state1.end, 13000); // max(6000, 13000)
     }
-
 
     #[test]
     fn test_session_single_event() {
@@ -958,7 +953,10 @@ mod tests {
         };
 
         // Should have emitted old session (OnUpdate) and new session update
-        let event_count = outputs.iter().filter(|o| matches!(o, Output::Event(_))).count();
+        let event_count = outputs
+            .iter()
+            .filter(|o| matches!(o, Output::Event(_)))
+            .count();
         assert!(event_count >= 1);
     }
 
@@ -1002,7 +1000,13 @@ mod tests {
         match &outputs[0] {
             Output::Event(e) => {
                 assert_eq!(e.timestamp, 1500); // 500 + gap (1000)
-                let result = e.data.column(2).as_any().downcast_ref::<Int64Array>().unwrap().value(0);
+                let result = e
+                    .data
+                    .column(2)
+                    .as_any()
+                    .downcast_ref::<Int64Array>()
+                    .unwrap()
+                    .value(0);
                 assert_eq!(result, 1);
             }
             _ => panic!("Expected Event output"),
@@ -1141,7 +1145,10 @@ mod tests {
         };
 
         // Should emit intermediate result
-        let event_count = outputs.iter().filter(|o| matches!(o, Output::Event(_))).count();
+        let event_count = outputs
+            .iter()
+            .filter(|o| matches!(o, Output::Event(_)))
+            .count();
         assert_eq!(event_count, 1);
     }
 
@@ -1167,7 +1174,10 @@ mod tests {
         };
 
         // Should emit changelog record
-        let changelog_count = outputs.iter().filter(|o| matches!(o, Output::Changelog(_))).count();
+        let changelog_count = outputs
+            .iter()
+            .filter(|o| matches!(o, Output::Changelog(_)))
+            .count();
         assert_eq!(changelog_count, 1);
     }
 
@@ -1355,7 +1365,13 @@ mod tests {
 
         match &outputs[0] {
             Output::Event(e) => {
-                let result = e.data.column(2).as_any().downcast_ref::<Int64Array>().unwrap().value(0);
+                let result = e
+                    .data
+                    .column(2)
+                    .as_any()
+                    .downcast_ref::<Int64Array>()
+                    .unwrap()
+                    .value(0);
                 assert_eq!(result, 60); // 10 + 20 + 30
             }
             _ => panic!("Expected Event output"),

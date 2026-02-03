@@ -124,9 +124,8 @@ pub trait RecordDeserializer: Send + Sync {
             .collect();
         let batches = batches?;
 
-        arrow_select::concat::concat_batches(schema, &batches).map_err(|e| {
-            SerdeError::MalformedInput(format!("failed to concat batches: {e}"))
-        })
+        arrow_select::concat::concat_batches(schema, &batches)
+            .map_err(|e| SerdeError::MalformedInput(format!("failed to concat batches: {e}")))
     }
 
     /// Returns the format this deserializer handles.

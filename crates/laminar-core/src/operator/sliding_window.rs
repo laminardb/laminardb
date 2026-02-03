@@ -165,7 +165,8 @@ impl SlidingWindowAssigner {
         );
 
         // Truncation is acceptable: number of windows per event will never exceed reasonable limits
-        let windows_per_event = usize::try_from((size_ms + slide_ms - 1) / slide_ms).unwrap_or(usize::MAX);
+        let windows_per_event =
+            usize::try_from((size_ms + slide_ms - 1) / slide_ms).unwrap_or(usize::MAX);
 
         Self {
             size_ms,
@@ -478,8 +479,11 @@ where
     fn maybe_register_timer(&mut self, window_id: WindowId, ctx: &mut OperatorContext) {
         if !self.registered_windows.contains(&window_id) {
             let trigger_time = window_id.end + self.allowed_lateness_ms;
-            ctx.timers
-                .register_timer(trigger_time, Some(window_id.to_key()), Some(ctx.operator_index));
+            ctx.timers.register_timer(
+                trigger_time,
+                Some(window_id.to_key()),
+                Some(ctx.operator_index),
+            );
             self.registered_windows.insert(window_id);
         }
     }
@@ -488,10 +492,12 @@ where
     fn maybe_register_periodic_timer(&mut self, window_id: WindowId, ctx: &mut OperatorContext) {
         if let EmitStrategy::Periodic(interval) = &self.emit_strategy {
             if !self.periodic_timer_windows.contains(&window_id) {
-                let interval_ms = i64::try_from(interval.as_millis()).expect("Interval must fit in i64");
+                let interval_ms =
+                    i64::try_from(interval.as_millis()).expect("Interval must fit in i64");
                 let trigger_time = ctx.processing_time + interval_ms;
                 let key = Self::periodic_timer_key(&window_id);
-                ctx.timers.register_timer(trigger_time, Some(key), Some(ctx.operator_index));
+                ctx.timers
+                    .register_timer(trigger_time, Some(key), Some(ctx.operator_index));
                 self.periodic_timer_windows.insert(window_id);
             }
         }
@@ -571,12 +577,14 @@ where
         }
 
         if let EmitStrategy::Periodic(interval) = &self.emit_strategy {
-            let interval_ms = i64::try_from(interval.as_millis()).expect("Interval must fit in i64");
+            let interval_ms =
+                i64::try_from(interval.as_millis()).expect("Interval must fit in i64");
             let next_trigger = ctx.processing_time + interval_ms;
             let window_close_time = window_id.end + self.allowed_lateness_ms;
             if next_trigger < window_close_time {
                 let key = Self::periodic_timer_key(&window_id);
-                ctx.timers.register_timer(next_trigger, Some(key), Some(ctx.operator_index));
+                ctx.timers
+                    .register_timer(next_trigger, Some(key), Some(ctx.operator_index));
             }
         }
 
@@ -828,7 +836,7 @@ where
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::operator::window::{CountAggregator, CountAccumulator, SumAggregator};
+    use crate::operator::window::{CountAccumulator, CountAggregator, SumAggregator};
     use crate::state::InMemoryStore;
     use crate::time::{BoundedOutOfOrdernessGenerator, TimerService};
     use arrow_array::{Int64Array, RecordBatch};
@@ -860,11 +868,9 @@ mod tests {
         }
     }
 
-
     #[test]
     fn test_sliding_assigner_creation() {
-        let assigner =
-            SlidingWindowAssigner::new(Duration::from_secs(60), Duration::from_secs(20));
+        let assigner = SlidingWindowAssigner::new(Duration::from_secs(60), Duration::from_secs(20));
 
         assert_eq!(assigner.size_ms(), 60_000);
         assert_eq!(assigner.slide_ms(), 20_000);
@@ -977,7 +983,6 @@ mod tests {
         let windows = assigner.assign_windows(500);
         assert_eq!(windows.len(), 10);
     }
-
 
     #[test]
     fn test_sliding_operator_creation() {
@@ -1295,7 +1300,10 @@ mod tests {
         };
 
         // Should have 2 Event outputs (one per window)
-        let event_count = outputs.iter().filter(|o| matches!(o, Output::Event(_))).count();
+        let event_count = outputs
+            .iter()
+            .filter(|o| matches!(o, Output::Event(_)))
+            .count();
         assert_eq!(event_count, 2);
     }
 
@@ -1312,9 +1320,7 @@ mod tests {
 
         // Register some windows
         operator.registered_windows.insert(WindowId::new(0, 1000));
-        operator
-            .registered_windows
-            .insert(WindowId::new(500, 1500));
+        operator.registered_windows.insert(WindowId::new(500, 1500));
         operator
             .periodic_timer_windows
             .insert(WindowId::new(0, 1000));

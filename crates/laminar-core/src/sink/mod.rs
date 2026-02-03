@@ -54,12 +54,12 @@ pub use checkpoint::{SinkCheckpoint, SinkCheckpointManager, SinkOffset};
 pub use dedup::{DeduplicationStore, InMemoryDedup, RecordId};
 pub use error::SinkError;
 pub use idempotent::IdempotentSink;
-pub use traits::{ExactlyOnceSink, TransactionId, SinkCapabilities, SinkState};
+pub use traits::{ExactlyOnceSink, SinkCapabilities, SinkState, TransactionId};
 pub use transaction::{TransactionCoordinator, TransactionState, TwoPhaseCommitSink};
 pub use transactional::{TransactionalSink, TransactionalSinkConfig, TransactionalSinkStats};
 pub use two_phase::{
-    CoordinatorDecision, ParticipantVote, ParticipantState, TransactionRecord,
-    TransactionLog, TransactionLogEntry, TwoPhaseConfig, TwoPhaseCoordinator, TwoPhaseResult,
+    CoordinatorDecision, ParticipantState, ParticipantVote, TransactionLog, TransactionLogEntry,
+    TransactionRecord, TwoPhaseConfig, TwoPhaseCoordinator, TwoPhaseResult,
 };
 
 #[cfg(test)]
@@ -78,8 +78,6 @@ mod tests {
 
     #[test]
     fn test_idempotent_sink_deduplicates() {
-
-
         struct MockSink {
             writes: Vec<Output>,
         }
@@ -107,7 +105,6 @@ mod tests {
         // The important thing is deduplication works
         assert!(!sink.inner().writes.is_empty());
 
-
         // Same record ID should be deduplicated
         // (In real use, the ID extractor would return same ID for duplicate)
         // For this test, we verify the dedup store works
@@ -128,8 +125,14 @@ mod tests {
         let restored = SinkCheckpoint::from_bytes(&serialized).unwrap();
 
         assert_eq!(restored.sink_id(), "test-sink");
-        assert_eq!(restored.get_offset("partition-0"), Some(&SinkOffset::Numeric(100)));
-        assert_eq!(restored.get_offset("partition-1"), Some(&SinkOffset::Numeric(200)));
+        assert_eq!(
+            restored.get_offset("partition-0"),
+            Some(&SinkOffset::Numeric(100))
+        );
+        assert_eq!(
+            restored.get_offset("partition-1"),
+            Some(&SinkOffset::Numeric(200))
+        );
         assert!(restored.pending_transaction_id().is_some());
     }
 
@@ -306,7 +309,11 @@ mod tests {
         let dedup = InMemoryDedup::new(1000);
         let mut idem_sink = IdempotentSink::new(inner2, dedup);
         assert!(idem_sink.capabilities().supports_idempotent_writes());
-        Sink::write(&mut idem_sink, vec![Output::Event(make_test_event(1000, 1))]).unwrap();
+        Sink::write(
+            &mut idem_sink,
+            vec![Output::Event(make_test_event(1000, 1))],
+        )
+        .unwrap();
         Sink::flush(&mut idem_sink).unwrap();
 
         // Both support ExactlyOnceSink API

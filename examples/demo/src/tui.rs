@@ -3,9 +3,7 @@
 use ratatui::layout::{Constraint, Direction, Layout, Rect};
 use ratatui::style::{Color, Modifier, Style};
 use ratatui::text::{Line, Span};
-use ratatui::widgets::{
-    Block, Borders, Cell, Gauge, Paragraph, Row, Sparkline, Table,
-};
+use ratatui::widgets::{Block, Borders, Cell, Gauge, Paragraph, Row, Sparkline, Table};
 use ratatui::Frame;
 
 use laminar_db::PipelineNodeType;
@@ -20,7 +18,7 @@ pub fn draw(f: &mut Frame, app: &App) {
         .constraints([
             Constraint::Length(3), // Header
             Constraint::Length(3), // KPI bar
-            Constraint::Min(8),   // Main content
+            Constraint::Min(8),    // Main content
             Constraint::Length(3), // Footer
         ])
         .split(f.area());
@@ -138,19 +136,13 @@ fn draw_kpi_bar(f: &mut Frame, app: &App, area: Rect) {
 fn draw_main_content(f: &mut Frame, app: &App, area: Rect) {
     let rows = Layout::default()
         .direction(Direction::Vertical)
-        .constraints([
-            Constraint::Percentage(55),
-            Constraint::Percentage(45),
-        ])
+        .constraints([Constraint::Percentage(55), Constraint::Percentage(45)])
         .split(area);
 
     // Top row: OHLC | Order Flow
     let top_cols = Layout::default()
         .direction(Direction::Horizontal)
-        .constraints([
-            Constraint::Percentage(50),
-            Constraint::Percentage(50),
-        ])
+        .constraints([Constraint::Percentage(50), Constraint::Percentage(50)])
         .split(rows[0]);
 
     draw_ohlc_table(f, app, top_cols[0]);
@@ -173,10 +165,7 @@ fn draw_main_content(f: &mut Frame, app: &App, area: Rect) {
 
 /// OHLC bars table.
 fn draw_ohlc_table(f: &mut Frame, app: &App, area: Rect) {
-    let header = Row::new(vec![
-        "Symbol", "Low", "High", "VWAP", "Volume", "Trades",
-    ])
-    .style(
+    let header = Row::new(vec!["Symbol", "Low", "High", "VWAP", "Volume", "Trades"]).style(
         Style::default()
             .fg(Color::Yellow)
             .add_modifier(Modifier::BOLD),
@@ -193,19 +182,16 @@ fn draw_ohlc_table(f: &mut Frame, app: &App, area: Rect) {
                     Color::Red
                 };
                 Row::new(vec![
-                    Cell::from(sym.to_string())
-                        .style(Style::default().fg(Color::Cyan)),
+                    Cell::from(sym.to_string()).style(Style::default().fg(Color::Cyan)),
                     Cell::from(format!("{:.2}", bar.min_price)),
                     Cell::from(format!("{:.2}", bar.max_price)),
-                    Cell::from(format!("{:.2}", bar.vwap))
-                        .style(Style::default().fg(color)),
+                    Cell::from(format!("{:.2}", bar.vwap)).style(Style::default().fg(color)),
                     Cell::from(format_count(bar.total_volume as u64)),
                     Cell::from(format_count(bar.trade_count as u64)),
                 ])
             } else {
                 Row::new(vec![
-                    Cell::from(sym.to_string())
-                        .style(Style::default().fg(Color::DarkGray)),
+                    Cell::from(sym.to_string()).style(Style::default().fg(Color::DarkGray)),
                     Cell::from("--"),
                     Cell::from("--"),
                     Cell::from("--"),
@@ -239,12 +225,11 @@ fn draw_ohlc_table(f: &mut Frame, app: &App, area: Rect) {
 
 /// Order flow table (buy/sell volume).
 fn draw_order_flow(f: &mut Frame, app: &App, area: Rect) {
-    let header =
-        Row::new(vec!["Symbol", "Buys", "Sells", "Net", "Trades"]).style(
-            Style::default()
-                .fg(Color::Yellow)
-                .add_modifier(Modifier::BOLD),
-        );
+    let header = Row::new(vec!["Symbol", "Buys", "Sells", "Net", "Trades"]).style(
+        Style::default()
+            .fg(Color::Yellow)
+            .add_modifier(Modifier::BOLD),
+    );
 
     let symbols = app.symbols_ordered();
     let rows: Vec<Row> = symbols
@@ -262,20 +247,17 @@ fn draw_order_flow(f: &mut Frame, app: &App, area: Rect) {
                     format!("-{}", format_count((-vol.net_volume) as u64))
                 };
                 Row::new(vec![
-                    Cell::from(sym.to_string())
-                        .style(Style::default().fg(Color::Cyan)),
+                    Cell::from(sym.to_string()).style(Style::default().fg(Color::Cyan)),
                     Cell::from(format_count(vol.buy_volume as u64))
                         .style(Style::default().fg(Color::Green)),
                     Cell::from(format_count(vol.sell_volume as u64))
                         .style(Style::default().fg(Color::Red)),
-                    Cell::from(net_str)
-                        .style(Style::default().fg(net_color)),
+                    Cell::from(net_str).style(Style::default().fg(net_color)),
                     Cell::from(format_count(vol.trade_count as u64)),
                 ])
             } else {
                 Row::new(vec![
-                    Cell::from(sym.to_string())
-                        .style(Style::default().fg(Color::DarkGray)),
+                    Cell::from(sym.to_string()).style(Style::default().fg(Color::DarkGray)),
                     Cell::from("--"),
                     Cell::from("--"),
                     Cell::from("--"),
@@ -324,10 +306,7 @@ fn draw_sparkline(f: &mut Frame, app: &App, area: Rect) {
 
 /// Enriched orders table (ASOF JOIN results).
 fn draw_enriched_orders(f: &mut Frame, app: &App, area: Rect) {
-    let header = Row::new(vec![
-        "Order", "Sym", "Side", "Qty", "Price", "Mkt", "Slip",
-    ])
-    .style(
+    let header = Row::new(vec!["Order", "Sym", "Side", "Qty", "Price", "Mkt", "Slip"]).style(
         Style::default()
             .fg(Color::Yellow)
             .add_modifier(Modifier::BOLD),
@@ -350,18 +329,14 @@ fn draw_enriched_orders(f: &mut Frame, app: &App, area: Rect) {
                 format!("{:.2}", eo.slippage)
             };
             Row::new(vec![
-                Cell::from(
-                    eo.order_id.chars().skip(4).collect::<String>(),
-                )
-                .style(Style::default().fg(Color::DarkGray)),
-                Cell::from(eo.symbol.clone())
-                    .style(Style::default().fg(Color::Cyan)),
+                Cell::from(eo.order_id.chars().skip(4).collect::<String>())
+                    .style(Style::default().fg(Color::DarkGray)),
+                Cell::from(eo.symbol.clone()).style(Style::default().fg(Color::Cyan)),
                 Cell::from(eo.side.clone()),
                 Cell::from(eo.quantity.to_string()),
                 Cell::from(format!("{:.2}", eo.order_price)),
                 Cell::from(format!("{:.2}", eo.market_price)),
-                Cell::from(slip_str)
-                    .style(Style::default().fg(slip_color)),
+                Cell::from(slip_str).style(Style::default().fg(slip_color)),
             ])
         })
         .collect();
@@ -401,10 +376,7 @@ fn draw_alerts(f: &mut Frame, app: &App, area: Rect) {
                     format!("{} ", alert.time),
                     Style::default().fg(Color::DarkGray),
                 ),
-                Span::styled(
-                    &alert.message,
-                    Style::default().fg(Color::Yellow),
-                ),
+                Span::styled(&alert.message, Style::default().fg(Color::Yellow)),
             ])
         })
         .collect();
@@ -424,10 +396,7 @@ fn draw_alerts(f: &mut Frame, app: &App, area: Rect) {
 fn draw_order_book_view(f: &mut Frame, app: &App, area: Rect) {
     let cols = Layout::default()
         .direction(Direction::Horizontal)
-        .constraints([
-            Constraint::Percentage(55),
-            Constraint::Percentage(45),
-        ])
+        .constraints([Constraint::Percentage(55), Constraint::Percentage(45)])
         .split(area);
 
     draw_order_book_depth(f, app, cols[0]);
@@ -459,9 +428,7 @@ fn draw_order_book_depth(f: &mut Frame, app: &App, area: Rect) {
                 Span::styled("  ASK ", Style::default().fg(Color::Red)),
                 Span::styled(
                     format!("{:>9.2}", level.price),
-                    Style::default()
-                        .fg(Color::Red)
-                        .add_modifier(Modifier::BOLD),
+                    Style::default().fg(Color::Red).add_modifier(Modifier::BOLD),
                 ),
                 Span::styled(
                     format!("  {:>5}", level.quantity),
@@ -501,10 +468,7 @@ fn draw_order_book_depth(f: &mut Frame, app: &App, area: Rect) {
         for level in &bids {
             let bar = qty_bar(level.quantity, max_qty, 10);
             lines.push(Line::from(vec![
-                Span::styled(
-                    "  BID ",
-                    Style::default().fg(Color::Green),
-                ),
+                Span::styled("  BID ", Style::default().fg(Color::Green)),
                 Span::styled(
                     format!("{:>9.2}", level.price),
                     Style::default()
@@ -546,7 +510,7 @@ fn draw_book_analytics(f: &mut Frame, app: &App, area: Rect) {
         .constraints([
             Constraint::Length(10), // Book metrics
             Constraint::Length(5),  // System stats
-            Constraint::Min(4),    // Imbalance sparkline
+            Constraint::Min(4),     // Imbalance sparkline
         ])
         .split(area);
 
@@ -573,15 +537,10 @@ fn draw_book_metrics(f: &mut Frame, app: &App, area: Rect) {
         };
 
         lines.push(Line::from(vec![
-            Span::styled(
-                "  Imbalance: ",
-                Style::default().fg(Color::DarkGray),
-            ),
+            Span::styled("  Imbalance: ", Style::default().fg(Color::DarkGray)),
             Span::styled(
                 format!("{}%", imb_pct),
-                Style::default()
-                    .fg(imb_color)
-                    .add_modifier(Modifier::BOLD),
+                Style::default().fg(imb_color).add_modifier(Modifier::BOLD),
             ),
             Span::styled(
                 if imb > 0.6 {
@@ -598,10 +557,7 @@ fn draw_book_metrics(f: &mut Frame, app: &App, area: Rect) {
         // Microprice
         if let Some(&mp) = app.microprices.get(sym) {
             lines.push(Line::from(vec![
-                Span::styled(
-                    "  Microprice: $",
-                    Style::default().fg(Color::DarkGray),
-                ),
+                Span::styled("  Microprice: $", Style::default().fg(Color::DarkGray)),
                 Span::styled(
                     format!("{:.3}", mp),
                     Style::default()
@@ -613,20 +569,14 @@ fn draw_book_metrics(f: &mut Frame, app: &App, area: Rect) {
 
         // Depth
         lines.push(Line::from(vec![
-            Span::styled(
-                "  Bid Depth: ",
-                Style::default().fg(Color::DarkGray),
-            ),
+            Span::styled("  Bid Depth: ", Style::default().fg(Color::DarkGray)),
             Span::styled(
                 format_count(book.bid_depth() as u64),
                 Style::default().fg(Color::Green),
             ),
         ]));
         lines.push(Line::from(vec![
-            Span::styled(
-                "  Ask Depth: ",
-                Style::default().fg(Color::DarkGray),
-            ),
+            Span::styled("  Ask Depth: ", Style::default().fg(Color::DarkGray)),
             Span::styled(
                 format_count(book.ask_depth() as u64),
                 Style::default().fg(Color::Red),
@@ -638,14 +588,8 @@ fn draw_book_metrics(f: &mut Frame, app: &App, area: Rect) {
             let spread = ba.price - bb.price;
             let spread_bps = spread / bb.price * 10000.0;
             lines.push(Line::from(vec![
-                Span::styled(
-                    "  Spread: $",
-                    Style::default().fg(Color::DarkGray),
-                ),
-                Span::styled(
-                    format!("{:.2}", spread),
-                    Style::default().fg(Color::Yellow),
-                ),
+                Span::styled("  Spread: $", Style::default().fg(Color::DarkGray)),
+                Span::styled(format!("{:.2}", spread), Style::default().fg(Color::Yellow)),
                 Span::styled(
                     format!(" ({:.1} bps)", spread_bps),
                     Style::default().fg(Color::DarkGray),
@@ -654,16 +598,14 @@ fn draw_book_metrics(f: &mut Frame, app: &App, area: Rect) {
         }
 
         // Levels count
-        lines.push(Line::from(vec![
-            Span::styled(
-                format!(
-                    "  Levels: {} bids / {} asks",
-                    book.bids.len(),
-                    book.asks.len()
-                ),
-                Style::default().fg(Color::DarkGray),
+        lines.push(Line::from(vec![Span::styled(
+            format!(
+                "  Levels: {} bids / {} asks",
+                book.bids.len(),
+                book.asks.len()
             ),
-        ]));
+            Style::default().fg(Color::DarkGray),
+        )]));
     } else {
         lines.push(Line::from(Span::styled(
             "  No book data",
@@ -739,10 +681,7 @@ fn draw_dag(f: &mut Frame, app: &App, area: Rect) {
     let topo = match &app.topology {
         Some(t) => t,
         None => {
-            let msg = Paragraph::new(
-                " No topology available. Start the pipeline first.",
-            )
-            .block(
+            let msg = Paragraph::new(" No topology available. Start the pipeline first.").block(
                 Block::default()
                     .title(" PIPELINE TOPOLOGY ")
                     .borders(Borders::ALL)
@@ -780,10 +719,7 @@ fn draw_dag(f: &mut Frame, app: &App, area: Rect) {
             if i > 0 {
                 spans.push(Span::raw("    "));
             }
-            let col_count = node
-                .schema
-                .as_ref()
-                .map_or(0, |s| s.fields().len());
+            let col_count = node.schema.as_ref().map_or(0, |s| s.fields().len());
             spans.push(Span::styled(
                 format!("[{}]", node.name),
                 Style::default()
@@ -805,8 +741,7 @@ fn draw_dag(f: &mut Frame, app: &App, area: Rect) {
             if i > 0 {
                 arrow_spans.push(Span::raw("    "));
             }
-            let feeds_any =
-                topo.edges.iter().any(|e| e.from == src.name);
+            let feeds_any = topo.edges.iter().any(|e| e.from == src.name);
             let indicator = if feeds_any {
                 format!("  {:1$}", "|", src.name.len())
             } else {
@@ -863,8 +798,7 @@ fn draw_dag(f: &mut Frame, app: &App, area: Rect) {
             if i > 0 {
                 arrow_spans.push(Span::raw("    "));
             }
-            let feeds_sink =
-                topo.edges.iter().any(|e| e.from == stream.name);
+            let feeds_sink = topo.edges.iter().any(|e| e.from == stream.name);
             let indicator = if feeds_sink {
                 format!("  {:1$}", "|", stream.name.len())
             } else {
@@ -891,10 +825,7 @@ fn draw_dag(f: &mut Frame, app: &App, area: Rect) {
                     .fg(Color::Yellow)
                     .add_modifier(Modifier::BOLD),
             ));
-            spans.push(Span::styled(
-                " SINK",
-                Style::default().fg(Color::DarkGray),
-            ));
+            spans.push(Span::styled(" SINK", Style::default().fg(Color::DarkGray)));
         }
         lines.push(Line::from(spans));
     }
@@ -902,11 +833,7 @@ fn draw_dag(f: &mut Frame, app: &App, area: Rect) {
     // --- Edge summary ---
     lines.push(Line::from(""));
     lines.push(Line::from(Span::styled(
-        format!(
-            "  {} nodes, {} edges",
-            topo.nodes.len(),
-            topo.edges.len()
-        ),
+        format!("  {} nodes, {} edges", topo.nodes.len(), topo.edges.len()),
         Style::default().fg(Color::DarkGray),
     )));
 
@@ -914,14 +841,8 @@ fn draw_dag(f: &mut Frame, app: &App, area: Rect) {
     for edge in &topo.edges {
         lines.push(Line::from(vec![
             Span::raw("    "),
-            Span::styled(
-                &edge.from,
-                Style::default().fg(Color::White),
-            ),
-            Span::styled(
-                " -> ",
-                Style::default().fg(Color::DarkGray),
-            ),
+            Span::styled(&edge.from, Style::default().fg(Color::White)),
+            Span::styled(" -> ", Style::default().fg(Color::DarkGray)),
             Span::styled(&edge.to, Style::default().fg(Color::White)),
         ]));
     }

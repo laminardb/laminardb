@@ -452,13 +452,7 @@ mod tests {
 
     #[test]
     fn test_delay_capped_at_max() {
-        let policy = RetryPolicy::new(
-            10,
-            Duration::from_secs(1),
-            Duration::from_secs(5),
-            2.0,
-            0.0,
-        );
+        let policy = RetryPolicy::new(10, Duration::from_secs(1), Duration::from_secs(5), 2.0, 0.0);
 
         // After several attempts, should be capped at 5 seconds
         assert_eq!(policy.delay_for_attempt(10), Duration::from_secs(5));
@@ -566,8 +560,7 @@ mod tests {
 
     #[test]
     fn test_circuit_breaker_half_open_to_closed() {
-        let cb = CircuitBreaker::new(2, Duration::from_millis(10))
-            .with_half_open_successes(2);
+        let cb = CircuitBreaker::new(2, Duration::from_millis(10)).with_half_open_successes(2);
 
         cb.record_failure();
         cb.record_failure();

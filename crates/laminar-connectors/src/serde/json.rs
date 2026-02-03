@@ -65,9 +65,8 @@ impl RecordDeserializer for JsonDeserializer {
             columns.push(array);
         }
 
-        RecordBatch::try_new(schema.clone(), columns).map_err(|e| {
-            SerdeError::MalformedInput(format!("failed to create RecordBatch: {e}"))
-        })
+        RecordBatch::try_new(schema.clone(), columns)
+            .map_err(|e| SerdeError::MalformedInput(format!("failed to create RecordBatch: {e}")))
     }
 
     fn deserialize_batch(
@@ -88,14 +87,17 @@ impl RecordDeserializer for JsonDeserializer {
         let mut columns: Vec<ArrayRef> = Vec::with_capacity(schema.fields().len());
 
         for field in schema.fields() {
-            let array =
-                build_column_from_json_values(field.data_type(), field.name(), &values, field.is_nullable())?;
+            let array = build_column_from_json_values(
+                field.data_type(),
+                field.name(),
+                &values,
+                field.is_nullable(),
+            )?;
             columns.push(array);
         }
 
-        RecordBatch::try_new(schema.clone(), columns).map_err(|e| {
-            SerdeError::MalformedInput(format!("failed to create RecordBatch: {e}"))
-        })
+        RecordBatch::try_new(schema.clone(), columns)
+            .map_err(|e| SerdeError::MalformedInput(format!("failed to create RecordBatch: {e}")))
     }
 
     fn format(&self) -> Format {
@@ -145,8 +147,8 @@ impl RecordSerializer for JsonSerializer {
                 obj.insert(field.name().clone(), value);
             }
 
-            let json_bytes =
-                serde_json::to_vec(&Value::Object(obj)).map_err(|e| SerdeError::Json(e.to_string()))?;
+            let json_bytes = serde_json::to_vec(&Value::Object(obj))
+                .map_err(|e| SerdeError::Json(e.to_string()))?;
             records.push(json_bytes);
         }
 
@@ -209,7 +211,8 @@ fn build_array_from_json(
                         expected: "Float32".into(),
                         message: format!("cannot convert {n}"),
                     })?;
-                    #[allow(clippy::cast_possible_truncation)] // f64 → f32: precision loss acceptable for Float32 columns
+                    #[allow(clippy::cast_possible_truncation)]
+                    // f64 → f32: precision loss acceptable for Float32 columns
                     builder.append_value(v as f32);
                 }
                 Some(Value::Null) | None => builder.append_null(),
@@ -566,13 +569,11 @@ fn arrow_column_to_json(
         DataType::Float32 => {
             let arr = column.as_any().downcast_ref::<Float32Array>().unwrap();
             let v = f64::from(arr.value(row));
-            Ok(serde_json::Number::from_f64(v)
-                .map_or(Value::Null, Value::Number))
+            Ok(serde_json::Number::from_f64(v).map_or(Value::Null, Value::Number))
         }
         DataType::Float64 => {
             let arr = column.as_any().downcast_ref::<Float64Array>().unwrap();
-            Ok(serde_json::Number::from_f64(arr.value(row))
-                .map_or(Value::Null, Value::Number))
+            Ok(serde_json::Number::from_f64(arr.value(row)).map_or(Value::Null, Value::Number))
         }
         DataType::Utf8 => {
             let arr = column.as_any().downcast_ref::<StringArray>().unwrap();
@@ -689,9 +690,11 @@ mod tests {
     #[test]
     fn test_json_type_coercion() {
         let deser = JsonDeserializer::new();
-        let schema = Arc::new(Schema::new(vec![
-            Field::new("value", DataType::Utf8, false),
-        ]));
+        let schema = Arc::new(Schema::new(vec![Field::new(
+            "value",
+            DataType::Utf8,
+            false,
+        )]));
 
         // Numbers should be coerced to string
         let data = br#"{"value": 42}"#;

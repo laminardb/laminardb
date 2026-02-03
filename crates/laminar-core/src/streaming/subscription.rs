@@ -264,7 +264,6 @@ impl<T: Record> Subscription<T> {
         Arc::clone(&self.schema)
     }
 
-
     fn message_to_batch(msg: SourceMessage<T>) -> Option<RecordBatch> {
         match msg {
             SourceMessage::Record(record) => Some(record.to_record_batch()),
@@ -410,12 +409,8 @@ mod tests {
         let (source, sink) = create::<TestEvent>(16);
         let sub = sink.subscribe();
 
-        source
-            .push(TestEvent { id: 1, value: 1.0 })
-            .unwrap();
-        source
-            .push(TestEvent { id: 2, value: 2.0 })
-            .unwrap();
+        source.push(TestEvent { id: 1, value: 1.0 }).unwrap();
+        source.push(TestEvent { id: 2, value: 2.0 }).unwrap();
 
         let batch1 = sub.poll().unwrap();
         assert_eq!(batch1.num_rows(), 1);
@@ -431,9 +426,7 @@ mod tests {
         let (source, sink) = create::<TestEvent>(16);
         let sub = sink.subscribe();
 
-        source
-            .push(TestEvent { id: 1, value: 1.0 })
-            .unwrap();
+        source.push(TestEvent { id: 1, value: 1.0 }).unwrap();
 
         let msg = sub.poll_message().unwrap();
         assert!(msg.is_record());
@@ -454,9 +447,7 @@ mod tests {
         let (source, sink) = create::<TestEvent>(16);
         let sub = sink.subscribe();
 
-        source
-            .push(TestEvent { id: 1, value: 1.0 })
-            .unwrap();
+        source.push(TestEvent { id: 1, value: 1.0 }).unwrap();
 
         let result = sub.recv_timeout(Duration::from_secs(1));
         assert!(result.is_ok());
@@ -467,15 +458,9 @@ mod tests {
         let (source, sink) = create::<TestEvent>(16);
         let sub = sink.subscribe();
 
-        source
-            .push(TestEvent { id: 1, value: 1.0 })
-            .unwrap();
-        source
-            .push(TestEvent { id: 2, value: 2.0 })
-            .unwrap();
-        source
-            .push(TestEvent { id: 3, value: 3.0 })
-            .unwrap();
+        source.push(TestEvent { id: 1, value: 1.0 }).unwrap();
+        source.push(TestEvent { id: 2, value: 2.0 }).unwrap();
+        source.push(TestEvent { id: 3, value: 3.0 }).unwrap();
 
         let batches = sub.poll_batch(10);
         assert_eq!(batches.len(), 3);
@@ -486,12 +471,8 @@ mod tests {
         let (source, sink) = create::<TestEvent>(16);
         let sub = sink.subscribe();
 
-        source
-            .push(TestEvent { id: 1, value: 1.0 })
-            .unwrap();
-        source
-            .push(TestEvent { id: 2, value: 2.0 })
-            .unwrap();
+        source.push(TestEvent { id: 1, value: 1.0 }).unwrap();
+        source.push(TestEvent { id: 2, value: 2.0 }).unwrap();
 
         let mut total_rows = 0;
         let count = sub.poll_each(10, |batch| {
@@ -508,15 +489,9 @@ mod tests {
         let (source, sink) = create::<TestEvent>(16);
         let sub = sink.subscribe();
 
-        source
-            .push(TestEvent { id: 1, value: 1.0 })
-            .unwrap();
-        source
-            .push(TestEvent { id: 2, value: 2.0 })
-            .unwrap();
-        source
-            .push(TestEvent { id: 3, value: 3.0 })
-            .unwrap();
+        source.push(TestEvent { id: 1, value: 1.0 }).unwrap();
+        source.push(TestEvent { id: 2, value: 2.0 }).unwrap();
+        source.push(TestEvent { id: 3, value: 3.0 }).unwrap();
 
         let mut seen = 0;
         let count = sub.poll_each(10, |_| {
@@ -548,12 +523,8 @@ mod tests {
 
         assert_eq!(sub.pending(), 0);
 
-        source
-            .push(TestEvent { id: 1, value: 1.0 })
-            .unwrap();
-        source
-            .push(TestEvent { id: 2, value: 2.0 })
-            .unwrap();
+        source.push(TestEvent { id: 1, value: 1.0 }).unwrap();
+        source.push(TestEvent { id: 2, value: 2.0 }).unwrap();
 
         assert_eq!(sub.pending(), 2);
     }
@@ -587,12 +558,8 @@ mod tests {
         let (source, sink) = create::<TestEvent>(16);
         let mut sub = sink.subscribe();
 
-        source
-            .push(TestEvent { id: 1, value: 1.0 })
-            .unwrap();
-        source
-            .push(TestEvent { id: 2, value: 2.0 })
-            .unwrap();
+        source.push(TestEvent { id: 1, value: 1.0 }).unwrap();
+        source.push(TestEvent { id: 2, value: 2.0 }).unwrap();
 
         drop(source);
 

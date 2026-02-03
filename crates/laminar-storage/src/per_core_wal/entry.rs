@@ -178,13 +178,11 @@ impl PerCoreWalEntry {
     /// Returns current timestamp in nanoseconds.
     fn now_ns() -> i64 {
         use std::time::{SystemTime, UNIX_EPOCH};
-        SystemTime::now()
-            .duration_since(UNIX_EPOCH)
-            .map_or(0, |d| {
-                #[allow(clippy::cast_possible_truncation)] // i64 ns won't overflow for ~292 years
-                let ns = d.as_nanos() as i64;
-                ns
-            })
+        SystemTime::now().duration_since(UNIX_EPOCH).map_or(0, |d| {
+            #[allow(clippy::cast_possible_truncation)] // i64 ns won't overflow for ~292 years
+            let ns = d.as_nanos() as i64;
+            ns
+        })
     }
 }
 

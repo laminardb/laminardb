@@ -49,7 +49,6 @@ impl fmt::Display for HealthStatus {
     }
 }
 
-
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -74,7 +73,11 @@ mod tests {
     #[test]
     fn test_health_status_display() {
         assert_eq!(HealthStatus::Healthy.to_string(), "Healthy");
-        assert!(HealthStatus::Degraded("slow".into()).to_string().contains("slow"));
-        assert!(HealthStatus::Unhealthy("down".into()).to_string().contains("down"));
+        assert!(HealthStatus::Degraded("slow".into())
+            .to_string()
+            .contains("slow"));
+        assert!(HealthStatus::Unhealthy("down".into())
+            .to_string()
+            .contains("down"));
     }
 }

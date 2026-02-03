@@ -25,9 +25,7 @@ impl XdpLoader {
     /// Always returns `XdpError::NotAvailable` on non-Linux.
     pub fn load_and_attach(config: &XdpConfig, _num_cores: usize) -> Result<Self, XdpError> {
         if config.fallback_on_error {
-            tracing::warn!(
-                "XDP not available on this platform, falling back to standard sockets"
-            );
+            tracing::warn!("XDP not available on this platform, falling back to standard sockets");
             Ok(Self {
                 stats: super::stats::AtomicXdpStats::new(),
             })

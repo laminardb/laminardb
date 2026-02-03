@@ -168,8 +168,9 @@ impl<T> SpscQueue<T> {
         let capacity = capacity.next_power_of_two();
 
         // Allocate the buffer
-        let buffer: Vec<UnsafeCell<MaybeUninit<T>>> =
-            (0..capacity).map(|_| UnsafeCell::new(MaybeUninit::uninit())).collect();
+        let buffer: Vec<UnsafeCell<MaybeUninit<T>>> = (0..capacity)
+            .map(|_| UnsafeCell::new(MaybeUninit::uninit()))
+            .collect();
 
         Self {
             buffer: buffer.into_boxed_slice(),
@@ -694,7 +695,11 @@ mod tests {
         // Verify all items received in order
         assert_eq!(received.len(), ITEMS as usize);
         for (i, &item) in received.iter().enumerate() {
-            assert_eq!(item, i32::try_from(i).unwrap(), "Item out of order at index {i}");
+            assert_eq!(
+                item,
+                i32::try_from(i).unwrap(),
+                "Item out of order at index {i}"
+            );
         }
     }
 
@@ -713,8 +718,6 @@ mod tests {
         use std::sync::Arc;
 
         let drop_count = Arc::new(AtomicUsize::new(0));
-
-
 
         {
             let queue: SpscQueue<DropCounter> = SpscQueue::new(8);

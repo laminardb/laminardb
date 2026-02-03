@@ -97,9 +97,7 @@ impl ThreeRingReactor {
         // SAFETY: eventfd() is a simple syscall that creates a new file descriptor.
         // EFD_NONBLOCK and EFD_CLOEXEC are valid flags. The returned fd is checked
         // for errors immediately below (< 0 check). No memory or aliasing concerns.
-        let eventfd = unsafe {
-            libc::eventfd(0, libc::EFD_NONBLOCK | libc::EFD_CLOEXEC)
-        };
+        let eventfd = unsafe { libc::eventfd(0, libc::EFD_NONBLOCK | libc::EFD_CLOEXEC) };
         #[cfg(target_os = "linux")]
         if eventfd < 0 {
             return Err(IoUringError::RingCreation(io::Error::last_os_error()));
@@ -342,10 +340,8 @@ impl ThreeRingReactor {
         let user_data = entry.get_user_data();
 
         // Track the operation
-        self.router.track(
-            PendingOperation::new(user_data, affinity)
-                .with_op_type(op_type),
-        );
+        self.router
+            .track(PendingOperation::new(user_data, affinity).with_op_type(op_type));
 
         match affinity {
             RingAffinity::Latency => self.submit_to_latency(entry),
@@ -366,8 +362,14 @@ impl ThreeRingReactor {
 
         let mut total = 0;
 
-        total += self.latency_ring.submit().map_err(IoUringError::SubmissionFailed)?;
-        total += self.main_ring.submit().map_err(IoUringError::SubmissionFailed)?;
+        total += self
+            .latency_ring
+            .submit()
+            .map_err(IoUringError::SubmissionFailed)?;
+        total += self
+            .main_ring
+            .submit()
+            .map_err(IoUringError::SubmissionFailed)?;
 
         if let Some(ref mut ring) = self.poll_ring {
             total += ring.submit().map_err(IoUringError::SubmissionFailed)?;
@@ -404,7 +406,8 @@ impl ThreeRingReactor {
         let mut cq = self.latency_ring.completion();
         while let Some(cqe) = cq.next() {
             let completion = self.process_cqe(cqe, RingAffinity::Latency);
-            self.stats.record_latency_completion(completion.latency(), completion.is_success());
+            self.stats
+                .record_latency_completion(completion.latency(), completion.is_success());
             completions.push(completion);
         }
     }
@@ -414,7 +417,8 @@ impl ThreeRingReactor {
         let mut cq = self.main_ring.completion();
         while let Some(cqe) = cq.next() {
             let completion = self.process_cqe(cqe, RingAffinity::Main);
-            self.stats.record_main_completion(completion.latency(), completion.is_success());
+            self.stats
+                .record_main_completion(completion.latency(), completion.is_success());
             completions.push(completion);
         }
     }
@@ -425,7 +429,8 @@ impl ThreeRingReactor {
             let mut cq = ring.completion();
             while let Some(cqe) = cq.next() {
                 let completion = self.process_cqe(cqe, RingAffinity::Poll);
-                self.stats.record_poll_completion(completion.latency(), completion.is_success());
+                self.stats
+                    .record_poll_completion(completion.latency(), completion.is_success());
                 completions.push(completion);
             }
         }
@@ -524,12 +529,7 @@ impl ThreeRingReactor {
     /// # Errors
     ///
     /// Returns an error if submission fails.
-    pub fn submit_recv(
-        &mut self,
-        fd: RawFd,
-        buf: *mut u8,
-        len: u32,
-    ) -> Result<u64, IoUringError> {
+    pub fn submit_recv(&mut self, fd: RawFd, buf: *mut u8, len: u32) -> Result<u64, IoUringError> {
         let user_data = self.next_user_data();
 
         let entry = opcode::Recv::new(Fd(fd), buf, len)
@@ -616,9 +616,7 @@ impl ThreeRingReactor {
                 .build()
                 .user_data(user_data)
         } else {
-            opcode::Fsync::new(Fd(fd))
-                .build()
-                .user_data(user_data)
+            opcode::Fsync::new(Fd(fd)).build().user_data(user_data)
         };
 
         self.router.track(

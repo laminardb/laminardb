@@ -66,8 +66,7 @@ fn bench_stream_join(c: &mut Criterion) {
                 watermark_generator: &mut watermark_gen,
                 operator_index: 0,
             };
-            let output =
-                operator.process_side(black_box(&event), JoinSide::Left, &mut ctx);
+            let output = operator.process_side(black_box(&event), JoinSide::Left, &mut ctx);
             ts += 100;
             black_box(output)
         })
@@ -111,8 +110,7 @@ fn bench_stream_join(c: &mut Criterion) {
                     watermark_generator: &mut watermark_gen,
                     operator_index: 0,
                 };
-                let output =
-                    operator.process_side(black_box(&right), JoinSide::Right, &mut ctx);
+                let output = operator.process_side(black_box(&right), JoinSide::Right, &mut ctx);
                 black_box(output)
             },
             criterion::BatchSize::SmallInput,
@@ -148,8 +146,7 @@ fn bench_join_state_scaling(c: &mut Criterion) {
                         // Pre-populate left side with many keys
                         for i in 0..size {
                             let key = format!("key_{i}");
-                            let event =
-                                create_join_event(&key, i as i64 * 100, i as i64);
+                            let event = create_join_event(&key, i as i64 * 100, i as i64);
                             let mut ctx = OperatorContext {
                                 event_time: i as i64 * 100,
                                 processing_time: 0,
@@ -158,11 +155,7 @@ fn bench_join_state_scaling(c: &mut Criterion) {
                                 watermark_generator: &mut watermark_gen,
                                 operator_index: 0,
                             };
-                            operator.process_side(
-                                &event,
-                                JoinSide::Left,
-                                &mut ctx,
-                            );
+                            operator.process_side(&event, JoinSide::Left, &mut ctx);
                         }
 
                         (operator, timers, state, watermark_gen)
@@ -178,11 +171,8 @@ fn bench_join_state_scaling(c: &mut Criterion) {
                             watermark_generator: &mut watermark_gen,
                             operator_index: 0,
                         };
-                        let output = operator.process_side(
-                            black_box(&right),
-                            JoinSide::Right,
-                            &mut ctx,
-                        );
+                        let output =
+                            operator.process_side(black_box(&right), JoinSide::Right, &mut ctx);
                         black_box(output)
                     },
                     criterion::BatchSize::SmallInput,

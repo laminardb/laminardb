@@ -278,10 +278,14 @@ impl TpcConfig {
             return Err(TpcError::InvalidConfig("num_cores must be > 0".to_string()));
         }
         if self.inbox_capacity == 0 {
-            return Err(TpcError::InvalidConfig("inbox_capacity must be > 0".to_string()));
+            return Err(TpcError::InvalidConfig(
+                "inbox_capacity must be > 0".to_string(),
+            ));
         }
         if self.outbox_capacity == 0 {
-            return Err(TpcError::InvalidConfig("outbox_capacity must be > 0".to_string()));
+            return Err(TpcError::InvalidConfig(
+                "outbox_capacity must be > 0".to_string(),
+            ));
         }
         Ok(())
     }
@@ -522,7 +526,9 @@ impl ThreadPerCoreRuntime {
         }
         if core_id >= self.cores.len() {
             return Err(TpcError::InvalidConfig(format!(
-                "core_id {} out of range (0..{})", core_id, self.cores.len()
+                "core_id {} out of range (0..{})",
+                core_id,
+                self.cores.len()
             )));
         }
         self.cores[core_id].send_event(event)
@@ -860,13 +866,21 @@ mod tests {
     }
 
     impl Operator for PassthroughOperator {
-        fn process(&mut self, event: &Event, _ctx: &mut crate::operator::OperatorContext) -> OutputVec {
+        fn process(
+            &mut self,
+            event: &Event,
+            _ctx: &mut crate::operator::OperatorContext,
+        ) -> OutputVec {
             let mut output = OutputVec::new();
             output.push(Output::Event(event.clone()));
             output
         }
 
-        fn on_timer(&mut self, _timer: Timer, _ctx: &mut crate::operator::OperatorContext) -> OutputVec {
+        fn on_timer(
+            &mut self,
+            _timer: Timer,
+            _ctx: &mut crate::operator::OperatorContext,
+        ) -> OutputVec {
             OutputVec::new()
         }
 
@@ -884,9 +898,7 @@ mod tests {
 
     fn make_event(user_id: i64, timestamp: i64) -> Event {
         let user_ids = Arc::new(Int64Array::from(vec![user_id]));
-        let batch = RecordBatch::try_from_iter(vec![
-            ("user_id", user_ids as _),
-        ]).unwrap();
+        let batch = RecordBatch::try_from_iter(vec![("user_id", user_ids as _)]).unwrap();
         Event::new(timestamp, batch)
     }
 
@@ -908,15 +920,11 @@ mod tests {
     #[test]
     fn test_config_validation() {
         // Zero cores should fail
-        let result = TpcConfig::builder()
-            .num_cores(0)
-            .build();
+        let result = TpcConfig::builder().num_cores(0).build();
         assert!(result.is_err());
 
         // Zero inbox capacity should fail
-        let result = TpcConfig::builder()
-            .inbox_capacity(0)
-            .build();
+        let result = TpcConfig::builder().inbox_capacity(0).build();
         assert!(result.is_err());
     }
 
@@ -945,7 +953,8 @@ mod tests {
 
         let runtime = ThreadPerCoreRuntime::new_with_factory(config, &|core_id| {
             vec![Box::new(PassthroughOperator { core_id }) as Box<dyn Operator>]
-        }).unwrap();
+        })
+        .unwrap();
 
         assert_eq!(runtime.num_cores(), 2);
 
@@ -998,9 +1007,7 @@ mod tests {
 
         let runtime = ThreadPerCoreRuntime::new(config).unwrap();
 
-        let events: Vec<Event> = (0..100)
-            .map(|i| make_event(i, i * 1000))
-            .collect();
+        let events: Vec<Event> = (0..100).map(|i| make_event(i, i * 1000)).collect();
 
         let (submitted, error) = runtime.submit_batch(events);
         assert_eq!(submitted, 100);
@@ -1019,7 +1026,8 @@ mod tests {
 
         let runtime = ThreadPerCoreRuntime::new_with_factory(config, &|core_id| {
             vec![Box::new(PassthroughOperator { core_id }) as Box<dyn Operator>]
-        }).unwrap();
+        })
+        .unwrap();
 
         // Submit some events
         for i in 0..50 {
@@ -1076,7 +1084,8 @@ mod tests {
 
         let runtime = ThreadPerCoreRuntime::new_with_factory(config, &|core_id| {
             vec![Box::new(PassthroughOperator { core_id }) as Box<dyn Operator>]
-        }).unwrap();
+        })
+        .unwrap();
 
         // Submit to core 0
         runtime.submit_to_core(0, make_event(1, 1000)).unwrap();
@@ -1224,7 +1233,8 @@ mod tests {
 
         let runtime = ThreadPerCoreRuntime::new_with_factory(config, &|core_id| {
             vec![Box::new(PassthroughOperator { core_id }) as Box<dyn Operator>]
-        }).unwrap();
+        })
+        .unwrap();
 
         // Submit events
         for i in 0..20 {
@@ -1260,7 +1270,8 @@ mod tests {
 
         let runtime = ThreadPerCoreRuntime::new_with_factory(config, &|core_id| {
             vec![Box::new(PassthroughOperator { core_id }) as Box<dyn Operator>]
-        }).unwrap();
+        })
+        .unwrap();
 
         // Submit events
         for i in 0..20 {
@@ -1295,7 +1306,8 @@ mod tests {
 
         let runtime = ThreadPerCoreRuntime::new_with_factory(config, &|core_id| {
             vec![Box::new(PassthroughOperator { core_id }) as Box<dyn Operator>]
-        }).unwrap();
+        })
+        .unwrap();
 
         // Submit many events
         for i in 0..50 {
@@ -1328,7 +1340,8 @@ mod tests {
 
         let runtime = ThreadPerCoreRuntime::new_with_factory(config, &|core_id| {
             vec![Box::new(PassthroughOperator { core_id }) as Box<dyn Operator>]
-        }).unwrap();
+        })
+        .unwrap();
 
         // Submit to specific core
         runtime.submit_to_core(0, make_event(1, 1000)).unwrap();
@@ -1361,7 +1374,8 @@ mod tests {
 
         let runtime = ThreadPerCoreRuntime::new_with_factory(config, &|core_id| {
             vec![Box::new(PassthroughOperator { core_id }) as Box<dyn Operator>]
-        }).unwrap();
+        })
+        .unwrap();
 
         // Submit to specific core
         runtime.submit_to_core(1, make_event(1, 1000)).unwrap();

@@ -276,10 +276,7 @@ mod tests {
     fn test_gtid_parse() {
         let gtid: Gtid = format!("{TEST_UUID}:23").parse().unwrap();
         assert_eq!(gtid.transaction_id(), 23);
-        assert_eq!(
-            gtid.source_id(),
-            uuid::Uuid::parse_str(TEST_UUID).unwrap()
-        );
+        assert_eq!(gtid.source_id(), uuid::Uuid::parse_str(TEST_UUID).unwrap());
     }
 
     #[test]

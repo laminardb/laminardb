@@ -86,7 +86,10 @@ mod linux_impl {
         /// # Errors
         ///
         /// Returns an error if the file cannot be opened or `io_uring` initialization fails.
-        pub fn append<P: AsRef<Path>>(path: P, config: IoUringConfig) -> Result<Self, IoUringError> {
+        pub fn append<P: AsRef<Path>>(
+            path: P,
+            config: IoUringConfig,
+        ) -> Result<Self, IoUringError> {
             let path = path.as_ref().to_path_buf();
 
             let file = OpenOptions::new()
@@ -158,8 +161,12 @@ mod linux_impl {
             let bytes = match output {
                 Output::Event(event) => {
                     // For events, we serialize a simple representation
-                    format!("EVENT ts={} rows={}\n", event.timestamp, event.data.num_rows())
-                        .into_bytes()
+                    format!(
+                        "EVENT ts={} rows={}\n",
+                        event.timestamp,
+                        event.data.num_rows()
+                    )
+                    .into_bytes()
                 }
                 Output::Watermark(ts) => format!("WATERMARK ts={ts}\n").into_bytes(),
                 Output::LateEvent { event, .. } => {
@@ -168,9 +175,10 @@ mod linux_impl {
             };
 
             // Acquire a buffer
-            let (buf_index, buf) = self.ring_manager.acquire_buffer().map_err(|e| {
-                SinkError::WriteFailed(format!("Failed to acquire buffer: {e}"))
-            })?;
+            let (buf_index, buf) = self
+                .ring_manager
+                .acquire_buffer()
+                .map_err(|e| SinkError::WriteFailed(format!("Failed to acquire buffer: {e}")))?;
 
             // Copy data to buffer
             let len = bytes.len().min(buf.len());

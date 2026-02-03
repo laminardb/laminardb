@@ -42,8 +42,7 @@ use std::time::Duration;
 use crossterm::event::{self, Event, KeyCode, KeyEventKind};
 use crossterm::execute;
 use crossterm::terminal::{
-    disable_raw_mode, enable_raw_mode, EnterAlternateScreen,
-    LeaveAlternateScreen,
+    disable_raw_mode, enable_raw_mode, EnterAlternateScreen, LeaveAlternateScreen,
 };
 use ratatui::backend::CrosstermBackend;
 use ratatui::Terminal;
@@ -54,11 +53,11 @@ use laminardb_demo::app::App;
 use laminardb_demo::asof_merge;
 use laminardb_demo::generator::MarketGenerator;
 use laminardb_demo::system_stats::StatsCollector;
-use laminardb_demo::types::{
-    AnomalyAlert, BookImbalanceMetrics, DepthMetrics, MarketTick, OhlcBar,
-    OrderBookUpdate, OrderEvent, SpreadMetrics, ViewMode, VolumeMetrics,
-};
 use laminardb_demo::tui;
+use laminardb_demo::types::{
+    AnomalyAlert, BookImbalanceMetrics, DepthMetrics, MarketTick, OhlcBar, OrderBookUpdate,
+    OrderEvent, SpreadMetrics, ViewMode, VolumeMetrics,
+};
 
 /// SQL files embedded at compile time.
 const SOURCES_SQL: &str = include_str!("../sql/sources.sql");
@@ -74,8 +73,7 @@ const SINKS_KAFKA_SQL: &str = include_str!("../sql/sinks_kafka.sql");
 
 #[tokio::main]
 async fn main() -> Result<(), Box<dyn std::error::Error>> {
-    let mode =
-        std::env::var("DEMO_MODE").unwrap_or_else(|_| "embedded".into());
+    let mode = std::env::var("DEMO_MODE").unwrap_or_else(|_| "embedded".into());
 
     match mode.as_str() {
         #[cfg(feature = "kafka")]
@@ -110,8 +108,7 @@ async fn run_embedded_mode() -> Result<(), Box<dyn std::error::Error>> {
     let volume_sub = db.subscribe::<VolumeMetrics>("volume_metrics")?;
     let spread_sub = db.subscribe::<SpreadMetrics>("spread_metrics")?;
     let anomaly_sub = db.subscribe::<AnomalyAlert>("anomaly_alerts")?;
-    let imbalance_sub =
-        db.subscribe::<BookImbalanceMetrics>("book_imbalance")?;
+    let imbalance_sub = db.subscribe::<BookImbalanceMetrics>("book_imbalance")?;
     let depth_sub = db.subscribe::<DepthMetrics>("depth_metrics")?;
 
     // -- Initialize generator, stats, and app state --
@@ -258,10 +255,7 @@ fn run_loop(
                     )
                 })
                 .collect();
-            let enriched = asof_merge::merge_orders_with_ticks(
-                &order_tuples,
-                &app.tick_buffer,
-            );
+            let enriched = asof_merge::merge_orders_with_ticks(&order_tuples, &app.tick_buffer);
             app.ingest_enriched_orders(enriched);
 
             // Apply book updates to in-memory L2 book
@@ -352,10 +346,8 @@ async fn run_kafka_mode() -> Result<(), Box<dyn std::error::Error>> {
     use rdkafka::config::ClientConfig;
     use rdkafka::producer::FutureProducer;
 
-    let brokers = std::env::var("KAFKA_BROKERS")
-        .unwrap_or_else(|_| "localhost:9092".into());
-    let group_id = std::env::var("GROUP_ID")
-        .unwrap_or_else(|_| "laminardb-demo".into());
+    let brokers = std::env::var("KAFKA_BROKERS").unwrap_or_else(|_| "localhost:9092".into());
+    let group_id = std::env::var("GROUP_ID").unwrap_or_else(|_| "laminardb-demo".into());
 
     // -- Build LaminarDB with Kafka config --
     let db = LaminarDB::builder()
@@ -383,18 +375,9 @@ async fn run_kafka_mode() -> Result<(), Box<dyn std::error::Error>> {
     let ticks = gen.generate_kafka_ticks(20, base_ts);
     let orders = gen.generate_kafka_orders(10, base_ts);
     let book_updates = gen.generate_kafka_book_updates(base_ts);
-    let tick_count =
-        generator::produce_to_kafka(&producer, "market-ticks", &ticks)
-            .await?;
-    let order_count =
-        generator::produce_to_kafka(&producer, "order-events", &orders)
-            .await?;
-    let book_count = generator::produce_to_kafka(
-        &producer,
-        "book-updates",
-        &book_updates,
-    )
-    .await?;
+    let tick_count = generator::produce_to_kafka(&producer, "market-ticks", &ticks).await?;
+    let order_count = generator::produce_to_kafka(&producer, "order-events", &orders).await?;
+    let book_count = generator::produce_to_kafka(&producer, "book-updates", &book_updates).await?;
 
     eprintln!(
         "Produced {} ticks, {} orders, {} book updates to Kafka",
@@ -406,8 +389,7 @@ async fn run_kafka_mode() -> Result<(), Box<dyn std::error::Error>> {
     let volume_sub = db.subscribe::<VolumeMetrics>("volume_metrics")?;
     let spread_sub = db.subscribe::<SpreadMetrics>("spread_metrics")?;
     let anomaly_sub = db.subscribe::<AnomalyAlert>("anomaly_alerts")?;
-    let imbalance_sub =
-        db.subscribe::<BookImbalanceMetrics>("book_imbalance")?;
+    let imbalance_sub = db.subscribe::<BookImbalanceMetrics>("book_imbalance")?;
     let depth_sub = db.subscribe::<DepthMetrics>("depth_metrics")?;
 
     let mut app = App::new();
@@ -415,8 +397,7 @@ async fn run_kafka_mode() -> Result<(), Box<dyn std::error::Error>> {
     app.set_topology(db.pipeline_topology());
 
     // Seed app state from initial batch
-    let app_ticks: Vec<_> =
-        ticks.iter().map(|t| t.to_market_tick()).collect();
+    let app_ticks: Vec<_> = ticks.iter().map(|t| t.to_market_tick()).collect();
     let app_book: Vec<_> = book_updates
         .iter()
         .map(|b| b.to_order_book_update())
@@ -449,12 +430,8 @@ async fn run_kafka_mode() -> Result<(), Box<dyn std::error::Error>> {
                         KeyCode::Char('q') | KeyCode::Esc => break,
                         KeyCode::Tab => app.next_symbol(),
                         KeyCode::Char(' ') => app.paused = !app.paused,
-                        KeyCode::Char('b') => {
-                            app.set_or_toggle_view(ViewMode::OrderBook)
-                        }
-                        KeyCode::Char('d') => {
-                            app.set_or_toggle_view(ViewMode::Dag)
-                        }
+                        KeyCode::Char('b') => app.set_or_toggle_view(ViewMode::OrderBook),
+                        KeyCode::Char('d') => app.set_or_toggle_view(ViewMode::Dag),
                         _ => {}
                     }
                 }
@@ -473,8 +450,7 @@ async fn run_kafka_mode() -> Result<(), Box<dyn std::error::Error>> {
             let book_updates = gen.generate_kafka_book_updates(ts);
 
             // Update app-level state from generated data
-            let app_ticks: Vec<_> =
-                ticks.iter().map(|t| t.to_market_tick()).collect();
+            let app_ticks: Vec<_> = ticks.iter().map(|t| t.to_market_tick()).collect();
             let app_book: Vec<_> = book_updates
                 .iter()
                 .map(|b| b.to_order_book_update())
@@ -499,32 +475,14 @@ async fn run_kafka_mode() -> Result<(), Box<dyn std::error::Error>> {
                     )
                 })
                 .collect();
-            let enriched = asof_merge::merge_orders_with_ticks(
-                &order_tuples,
-                &app.tick_buffer,
-            );
+            let enriched = asof_merge::merge_orders_with_ticks(&order_tuples, &app.tick_buffer);
             app.ingest_enriched_orders(enriched);
             app.cleanup_tick_buffer(ts);
 
             // Produce to Kafka topics
-            let _ = generator::produce_to_kafka(
-                &producer,
-                "market-ticks",
-                &ticks,
-            )
-            .await;
-            let _ = generator::produce_to_kafka(
-                &producer,
-                "order-events",
-                &orders,
-            )
-            .await;
-            let _ = generator::produce_to_kafka(
-                &producer,
-                "book-updates",
-                &book_updates,
-            )
-            .await;
+            let _ = generator::produce_to_kafka(&producer, "market-ticks", &ticks).await;
+            let _ = generator::produce_to_kafka(&producer, "order-events", &orders).await;
+            let _ = generator::produce_to_kafka(&producer, "book-updates", &book_updates).await;
 
             // Drain pipeline output subscriptions
             drain_subscriptions(

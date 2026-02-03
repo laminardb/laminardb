@@ -343,8 +343,7 @@ where
         // Restore stats
         if let Some(stats_bytes) = checkpoint.get_metadata("total_written") {
             if stats_bytes.len() >= 8 {
-                self.total_written =
-                    u64::from_le_bytes(stats_bytes[0..8].try_into().unwrap());
+                self.total_written = u64::from_le_bytes(stats_bytes[0..8].try_into().unwrap());
             }
         }
 

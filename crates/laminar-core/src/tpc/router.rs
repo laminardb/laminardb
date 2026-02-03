@@ -144,19 +144,14 @@ impl KeyRouter {
         match &self.key_spec {
             KeySpec::RoundRobin => {
                 // Atomic increment with wrap-around
-                let counter = self.round_robin_counter
+                let counter = self
+                    .round_robin_counter
                     .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
                 Ok(counter % self.num_cores)
             }
-            KeySpec::Columns(columns) => {
-                self.route_by_columns(event, columns)
-            }
-            KeySpec::ColumnIndices(indices) => {
-                self.route_by_indices(event, indices)
-            }
-            KeySpec::AllColumns => {
-                self.route_all_columns(event)
-            }
+            KeySpec::Columns(columns) => self.route_by_columns(event, columns),
+            KeySpec::ColumnIndices(indices) => self.route_by_indices(event, indices),
+            KeySpec::AllColumns => self.route_all_columns(event),
         }
     }
 
@@ -170,19 +165,14 @@ impl KeyRouter {
     pub fn route_row(&self, batch: &RecordBatch, row: usize) -> Result<usize, super::TpcError> {
         match &self.key_spec {
             KeySpec::RoundRobin => {
-                let counter = self.round_robin_counter
+                let counter = self
+                    .round_robin_counter
                     .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
                 Ok(counter % self.num_cores)
             }
-            KeySpec::Columns(columns) => {
-                self.route_row_by_columns(batch, row, columns)
-            }
-            KeySpec::ColumnIndices(indices) => {
-                self.route_row_by_indices(batch, row, indices)
-            }
-            KeySpec::AllColumns => {
-                self.route_row_all_columns(batch, row)
-            }
+            KeySpec::Columns(columns) => self.route_row_by_columns(batch, row, columns),
+            KeySpec::ColumnIndices(indices) => self.route_row_by_indices(batch, row, indices),
+            KeySpec::AllColumns => self.route_row_all_columns(batch, row),
         }
     }
 
@@ -194,7 +184,11 @@ impl KeyRouter {
     }
 
     /// Route by column names
-    fn route_by_columns(&self, event: &Event, columns: &[String]) -> Result<usize, super::TpcError> {
+    fn route_by_columns(
+        &self,
+        event: &Event,
+        columns: &[String],
+    ) -> Result<usize, super::TpcError> {
         let batch = &event.data;
         let mut hasher = FxHasher::default();
 
@@ -379,8 +373,8 @@ fn hash_row_value(hasher: &mut FxHasher, array: &dyn Array, row: usize) -> Resul
         _ => {
             // For unsupported types, hash the string representation
             // This is slower but ensures we can route any data type
-            let formatted = arrow_cast::display::array_value_to_string(array, row)
-                .unwrap_or_default();
+            let formatted =
+                arrow_cast::display::array_value_to_string(array, row).unwrap_or_default();
             formatted.hash(hasher);
         }
     }
@@ -406,10 +400,9 @@ mod tests {
     fn make_event(user_id: i64, name: &str, timestamp: i64) -> Event {
         let user_ids = Arc::new(Int64Array::from(vec![user_id]));
         let names = Arc::new(StringArray::from(vec![name]));
-        let batch = RecordBatch::try_from_iter(vec![
-            ("user_id", user_ids as _),
-            ("name", names as _),
-        ]).unwrap();
+        let batch =
+            RecordBatch::try_from_iter(vec![("user_id", user_ids as _), ("name", names as _)])
+                .unwrap();
         Event::new(timestamp, batch)
     }
 
@@ -434,8 +427,8 @@ mod tests {
 
         // Same user_id should always route to the same core
         let event1 = make_event(100, "alice", 1000);
-        let event2 = make_event(100, "bob", 2000);  // Different name, same user_id
-        let event3 = make_event(200, "charlie", 3000);  // Different user_id
+        let event2 = make_event(100, "bob", 2000); // Different name, same user_id
+        let event3 = make_event(200, "charlie", 3000); // Different user_id
 
         let core1 = router.route(&event1).unwrap();
         let core2 = router.route(&event2).unwrap();
@@ -465,8 +458,8 @@ mod tests {
         let router = KeyRouter::new(4, KeySpec::AllColumns);
 
         let event1 = make_event(100, "alice", 1000);
-        let event2 = make_event(100, "alice", 2000);  // Same data, different timestamp
-        let event3 = make_event(100, "bob", 3000);    // Different name
+        let event2 = make_event(100, "alice", 2000); // Same data, different timestamp
+        let event3 = make_event(100, "bob", 3000); // Different name
 
         let core1 = router.route(&event1).unwrap();
         let core2 = router.route(&event2).unwrap();
@@ -486,7 +479,9 @@ mod tests {
         let result = router.route(&event);
         assert!(matches!(
             result,
-            Err(super::super::TpcError::RouterError(RouterError::ColumnNotFoundByName))
+            Err(super::super::TpcError::RouterError(
+                RouterError::ColumnNotFoundByName
+            ))
         ));
     }
 
@@ -498,7 +493,9 @@ mod tests {
         let result = router.route(&event);
         assert!(matches!(
             result,
-            Err(super::super::TpcError::RouterError(RouterError::ColumnIndexOutOfRange))
+            Err(super::super::TpcError::RouterError(
+                RouterError::ColumnIndexOutOfRange
+            ))
         ));
     }
 
@@ -547,10 +544,9 @@ mod tests {
         // Create batch with multiple rows
         let user_ids = Arc::new(Int64Array::from(vec![100, 200, 100, 300]));
         let names = Arc::new(StringArray::from(vec!["a", "b", "c", "d"]));
-        let batch = RecordBatch::try_from_iter(vec![
-            ("user_id", user_ids as _),
-            ("name", names as _),
-        ]).unwrap();
+        let batch =
+            RecordBatch::try_from_iter(vec![("user_id", user_ids as _), ("name", names as _)])
+                .unwrap();
 
         // Same user_id should route to same core
         let core0 = router.route_row(&batch, 0).unwrap();
@@ -570,9 +566,7 @@ mod tests {
 
         // Create batch with null value
         let user_ids = Arc::new(Int64Array::from(vec![Some(100), None, Some(100)]));
-        let batch = RecordBatch::try_from_iter(vec![
-            ("user_id", user_ids as _),
-        ]).unwrap();
+        let batch = RecordBatch::try_from_iter(vec![("user_id", user_ids as _)]).unwrap();
 
         // Should handle nulls without error
         let core0 = router.route_row(&batch, 0).unwrap();

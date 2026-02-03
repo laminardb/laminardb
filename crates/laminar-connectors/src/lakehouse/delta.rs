@@ -203,7 +203,8 @@ impl DeltaLakeSink {
         self.buffered_bytes = 0;
         self.buffer_start_time = None;
 
-        self.metrics.record_flush(total_rows as u64, estimated_bytes);
+        self.metrics
+            .record_flush(total_rows as u64, estimated_bytes);
 
         debug!(
             rows = total_rows,
@@ -254,9 +255,7 @@ impl DeltaLakeSink {
             .as_any()
             .downcast_ref::<arrow_array::StringArray>()
             .ok_or_else(|| {
-                ConnectorError::ConfigurationError(
-                    "'_op' column must be String (Utf8) type".into(),
-                )
+                ConnectorError::ConfigurationError("'_op' column must be String (Utf8) type".into())
             })?;
 
         let mut insert_indices = Vec::new();
@@ -313,10 +312,7 @@ impl SinkConnector for DeltaLakeSink {
         Ok(())
     }
 
-    async fn write_batch(
-        &mut self,
-        batch: &RecordBatch,
-    ) -> Result<WriteResult, ConnectorError> {
+    async fn write_batch(&mut self, batch: &RecordBatch) -> Result<WriteResult, ConnectorError> {
         if self.state != ConnectorState::Running {
             return Err(ConnectorError::InvalidState {
                 expected: "Running".into(),
@@ -354,9 +350,9 @@ impl SinkConnector for DeltaLakeSink {
     }
 
     fn schema(&self) -> SchemaRef {
-        self.schema.clone().unwrap_or_else(|| {
-            Arc::new(arrow_schema::Schema::empty())
-        })
+        self.schema
+            .clone()
+            .unwrap_or_else(|| Arc::new(arrow_schema::Schema::empty()))
     }
 
     async fn begin_epoch(&mut self, epoch: u64) -> Result<(), ConnectorError> {
@@ -428,15 +424,9 @@ impl SinkConnector for DeltaLakeSink {
     fn health_check(&self) -> HealthStatus {
         match self.state {
             ConnectorState::Running => HealthStatus::Healthy,
-            ConnectorState::Created | ConnectorState::Initializing => {
-                HealthStatus::Unknown
-            }
-            ConnectorState::Paused => {
-                HealthStatus::Degraded("connector paused".into())
-            }
-            ConnectorState::Recovering => {
-                HealthStatus::Degraded("recovering".into())
-            }
+            ConnectorState::Created | ConnectorState::Initializing => HealthStatus::Unknown,
+            ConnectorState::Paused => HealthStatus::Degraded("connector paused".into()),
+            ConnectorState::Recovering => HealthStatus::Degraded("recovering".into()),
             ConnectorState::Closed => HealthStatus::Unhealthy("closed".into()),
             ConnectorState::Failed => HealthStatus::Unhealthy("failed".into()),
         }
@@ -544,9 +534,7 @@ fn filter_batch_by_indices(
         .filter(|(_, f)| !f.name().starts_with('_'))
         .map(|(i, _)| {
             arrow_select::take::take(batch.column(i), &indices_array, None)
-                .map_err(|e| {
-                    ConnectorError::Internal(format!("arrow take failed: {e}"))
-                })
+                .map_err(|e| ConnectorError::Internal(format!("arrow take failed: {e}")))
         })
         .collect::<Result<Vec<_>, _>>()?;
 
@@ -776,10 +764,7 @@ mod tests {
 
         // Metrics should show 1 commit
         let m = sink.metrics();
-        let commits = m
-            .custom
-            .iter()
-            .find(|(k, _)| k == "delta.commits");
+        let commits = m.custom.iter().find(|(k, _)| k == "delta.commits");
         assert_eq!(commits.unwrap().1, 1.0);
     }
 
@@ -1086,8 +1071,7 @@ mod tests {
     #[test]
     fn test_split_changelog_batch() {
         let batch = changelog_batch();
-        let (inserts, deletes) =
-            DeltaLakeSink::split_changelog_batch(&batch).unwrap();
+        let (inserts, deletes) = DeltaLakeSink::split_changelog_batch(&batch).unwrap();
 
         // Inserts: rows 0 (I), 1 (U), 3 (I) = 3 rows
         assert_eq!(inserts.num_rows(), 3);
@@ -1132,8 +1116,7 @@ mod tests {
         )
         .unwrap();
 
-        let (inserts, deletes) =
-            DeltaLakeSink::split_changelog_batch(&batch).unwrap();
+        let (inserts, deletes) = DeltaLakeSink::split_changelog_batch(&batch).unwrap();
         assert_eq!(inserts.num_rows(), 2);
         assert_eq!(deletes.num_rows(), 0);
     }
@@ -1152,22 +1135,16 @@ mod tests {
         )
         .unwrap();
 
-        let (inserts, deletes) =
-            DeltaLakeSink::split_changelog_batch(&batch).unwrap();
+        let (inserts, deletes) = DeltaLakeSink::split_changelog_batch(&batch).unwrap();
         assert_eq!(inserts.num_rows(), 0);
         assert_eq!(deletes.num_rows(), 2);
     }
 
     #[test]
     fn test_split_changelog_missing_op_column() {
-        let schema = Arc::new(Schema::new(vec![
-            Field::new("id", DataType::Int64, false),
-        ]));
-        let batch = RecordBatch::try_new(
-            schema,
-            vec![Arc::new(Int64Array::from(vec![1]))],
-        )
-        .unwrap();
+        let schema = Arc::new(Schema::new(vec![Field::new("id", DataType::Int64, false)]));
+        let batch =
+            RecordBatch::try_new(schema, vec![Arc::new(Int64Array::from(vec![1]))]).unwrap();
 
         let result = DeltaLakeSink::split_changelog_batch(&batch);
         assert!(result.is_err());
@@ -1187,8 +1164,7 @@ mod tests {
         )
         .unwrap();
 
-        let (inserts, deletes) =
-            DeltaLakeSink::split_changelog_batch(&batch).unwrap();
+        let (inserts, deletes) = DeltaLakeSink::split_changelog_batch(&batch).unwrap();
         assert_eq!(inserts.num_rows(), 1);
         assert_eq!(deletes.num_rows(), 0);
     }

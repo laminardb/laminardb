@@ -128,10 +128,8 @@ impl NotificationBatcher {
         for (&source_id, buffer) in &mut self.buffers {
             if !buffer.is_empty() {
                 let events = std::mem::take(buffer);
-                let first_seq =
-                    events.first().and_then(ChangeEvent::sequence).unwrap_or(0);
-                let last_seq =
-                    events.last().and_then(ChangeEvent::sequence).unwrap_or(0);
+                let first_seq = events.first().and_then(ChangeEvent::sequence).unwrap_or(0);
+                let last_seq = events.last().and_then(ChangeEvent::sequence).unwrap_or(0);
                 results.push((
                     source_id,
                     ChangeEventBatch::new(String::new(), events, first_seq, last_seq),
@@ -165,19 +163,12 @@ impl NotificationBatcher {
             if let Some(buffer) = self.buffers.get_mut(&source_id) {
                 if !buffer.is_empty() {
                     let events = std::mem::take(buffer);
-                    let first_seq =
-                        events.first().and_then(ChangeEvent::sequence).unwrap_or(0);
-                    let last_seq =
-                        events.last().and_then(ChangeEvent::sequence).unwrap_or(0);
+                    let first_seq = events.first().and_then(ChangeEvent::sequence).unwrap_or(0);
+                    let last_seq = events.last().and_then(ChangeEvent::sequence).unwrap_or(0);
                     self.last_flush.insert(source_id, now);
                     results.push((
                         source_id,
-                        ChangeEventBatch::new(
-                            String::new(),
-                            events,
-                            first_seq,
-                            last_seq,
-                        ),
+                        ChangeEventBatch::new(String::new(), events, first_seq, last_seq),
                     ));
                 }
             }
@@ -211,15 +202,9 @@ mod tests {
     use std::sync::Arc;
 
     fn make_event(seq: u64) -> ChangeEvent {
-        let schema = Arc::new(Schema::new(vec![Field::new(
-            "v",
-            DataType::Int64,
-            false,
-        )]));
+        let schema = Arc::new(Schema::new(vec![Field::new("v", DataType::Int64, false)]));
         let array = Int64Array::from(vec![seq as i64]);
-        let batch = Arc::new(
-            RecordBatch::try_new(schema, vec![Arc::new(array)]).unwrap(),
-        );
+        let batch = Arc::new(RecordBatch::try_new(schema, vec![Arc::new(array)]).unwrap());
         ChangeEvent::insert(batch, 1000 + seq as i64, seq)
     }
 

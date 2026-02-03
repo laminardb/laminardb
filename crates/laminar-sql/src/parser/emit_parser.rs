@@ -90,7 +90,9 @@ fn parse_emit_on(parser: &mut Parser) -> Result<Option<EmitClause>, ParseError> 
         }
 
         // EMIT ON WINDOW CLOSE
-        Token::Word(w) if w.keyword == Keyword::WINDOW || w.value.eq_ignore_ascii_case("WINDOW") => {
+        Token::Word(w)
+            if w.keyword == Keyword::WINDOW || w.value.eq_ignore_ascii_case("WINDOW") =>
+        {
             parser.next_token(); // consume WINDOW
             expect_close_keyword(parser)?;
             Ok(Some(EmitClause::OnWindowClose))

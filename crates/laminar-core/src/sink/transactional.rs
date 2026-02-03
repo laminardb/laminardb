@@ -86,7 +86,11 @@ impl<S: Sink> TransactionalSink<S> {
     }
 
     /// Create with custom configuration
-    pub fn with_config(inner: S, sink_id: impl Into<String>, config: TransactionalSinkConfig) -> Self {
+    pub fn with_config(
+        inner: S,
+        sink_id: impl Into<String>,
+        config: TransactionalSinkConfig,
+    ) -> Self {
         Self {
             inner,
             tx_state: TransactionState::new(),
@@ -183,7 +187,9 @@ impl<S: Sink> ExactlyOnceSink for TransactionalSink<S> {
         // Validate transaction
         if self.tx_state.current_transaction() != Some(tx_id) {
             return Err(SinkError::TransactionIdMismatch {
-                expected: self.tx_state.current_transaction()
+                expected: self
+                    .tx_state
+                    .current_transaction()
                     .map_or_else(|| "none".to_string(), ToString::to_string),
                 actual: tx_id.to_string(),
             });
@@ -300,16 +306,19 @@ impl<S: Sink> Sink for TransactionalSink<S> {
                 crate::reactor::SinkError::WriteFailed("No active transaction".to_string())
             })?;
 
-        ExactlyOnceSink::write(self, &tx_id, outputs)
-            .map_err(crate::reactor::SinkError::from)
+        ExactlyOnceSink::write(self, &tx_id, outputs).map_err(crate::reactor::SinkError::from)
     }
 
     fn flush(&mut self) -> Result<(), crate::reactor::SinkError> {
         // Commit active transaction on flush
         if self.tx_state.is_active() {
-            let tx_id = self.tx_state.current_transaction().cloned().ok_or_else(|| {
-                crate::reactor::SinkError::FlushFailed("No active transaction".to_string())
-            })?;
+            let tx_id = self
+                .tx_state
+                .current_transaction()
+                .cloned()
+                .ok_or_else(|| {
+                    crate::reactor::SinkError::FlushFailed("No active transaction".to_string())
+                })?;
             self.commit(&tx_id)
                 .map_err(|e| crate::reactor::SinkError::FlushFailed(e.to_string()))?;
         }
@@ -494,12 +503,8 @@ mod tests {
 
         // Rollback another
         let tx_id2 = sink.begin_transaction().unwrap();
-        ExactlyOnceSink::write(
-            &mut sink,
-            &tx_id2,
-            vec![Output::Event(make_event(3000, 3))],
-        )
-        .unwrap();
+        ExactlyOnceSink::write(&mut sink, &tx_id2, vec![Output::Event(make_event(3000, 3))])
+            .unwrap();
         sink.rollback(&tx_id2).unwrap();
 
         let stats = sink.stats();
@@ -535,12 +540,8 @@ mod tests {
         let mut sink = TransactionalSink::new(inner, "test-sink");
 
         let tx_id = sink.begin_transaction().unwrap();
-        ExactlyOnceSink::write(
-            &mut sink,
-            &tx_id,
-            vec![Output::Event(make_event(1000, 42))],
-        )
-        .unwrap();
+        ExactlyOnceSink::write(&mut sink, &tx_id, vec![Output::Event(make_event(1000, 42))])
+            .unwrap();
 
         sink.close().unwrap();
         assert_eq!(sink.state(), SinkState::Idle);

@@ -46,8 +46,8 @@ pub use translator::{OrderOperatorConfig, WindowOperatorConfig, WindowType};
 // Re-export F005B types
 pub use datafusion::execute::execute_streaming_sql;
 pub use datafusion::{
-    register_streaming_functions, register_streaming_functions_with_watermark,
-    DdlResult, QueryResult, StreamingSqlResult,
+    register_streaming_functions, register_streaming_functions_with_watermark, DdlResult,
+    QueryResult, StreamingSqlResult,
 };
 
 /// Result type for SQL operations

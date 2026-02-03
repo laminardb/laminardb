@@ -316,9 +316,7 @@ impl IcebergSinkConfig {
     }
 
     /// Parses a single partition field like `DAYS(event_time)` or `BUCKET(16, user_id)`.
-    fn parse_single_partition_field(
-        spec: &str,
-    ) -> Result<IcebergPartitionField, ConnectorError> {
+    fn parse_single_partition_field(spec: &str) -> Result<IcebergPartitionField, ConnectorError> {
         let open = spec.find('(').ok_or_else(|| {
             ConnectorError::ConfigurationError(format!(
                 "invalid partition field '{spec}': expected TRANSFORM(column)"
@@ -448,9 +446,7 @@ impl IcebergSinkConfig {
         if self.table_name.is_empty() {
             return Err(ConnectorError::MissingConfig("table.name".into()));
         }
-        if self.write_mode == IcebergWriteMode::Upsert
-            && self.equality_delete_columns.is_empty()
-        {
+        if self.write_mode == IcebergWriteMode::Upsert && self.equality_delete_columns.is_empty() {
             return Err(ConnectorError::ConfigurationError(
                 "upsert mode requires 'equality.delete.columns' to be set".into(),
             ));
@@ -829,28 +825,19 @@ mod tests {
 
     #[test]
     fn test_missing_warehouse() {
-        let config = make_config(&[
-            ("namespace", "analytics"),
-            ("table.name", "trades"),
-        ]);
+        let config = make_config(&[("namespace", "analytics"), ("table.name", "trades")]);
         assert!(IcebergSinkConfig::from_config(&config).is_err());
     }
 
     #[test]
     fn test_missing_namespace() {
-        let config = make_config(&[
-            ("warehouse", "/data/warehouse"),
-            ("table.name", "trades"),
-        ]);
+        let config = make_config(&[("warehouse", "/data/warehouse"), ("table.name", "trades")]);
         assert!(IcebergSinkConfig::from_config(&config).is_err());
     }
 
     #[test]
     fn test_missing_table_name() {
-        let config = make_config(&[
-            ("warehouse", "/data/warehouse"),
-            ("namespace", "analytics"),
-        ]);
+        let config = make_config(&[("warehouse", "/data/warehouse"), ("namespace", "analytics")]);
         assert!(IcebergSinkConfig::from_config(&config).is_err());
     }
 
@@ -860,7 +847,10 @@ mod tests {
         pairs.extend_from_slice(&[
             ("catalog.type", "glue"),
             ("catalog.uri", "arn:aws:glue:us-east-1:123456789:catalog"),
-            ("partition.spec", "DAYS(event_time), BUCKET(16, customer_id)"),
+            (
+                "partition.spec",
+                "DAYS(event_time), BUCKET(16, customer_id)",
+            ),
             ("target.file.size", "67108864"),
             ("max.buffer.records", "50000"),
             ("max.buffer.duration.ms", "30000"),
@@ -1025,8 +1015,7 @@ mod tests {
         let fields = IcebergSinkConfig::parse_partition_spec(None).unwrap();
         assert!(fields.is_empty());
 
-        let fields =
-            IcebergSinkConfig::parse_partition_spec(Some(&String::new())).unwrap();
+        let fields = IcebergSinkConfig::parse_partition_spec(Some(&String::new())).unwrap();
         assert!(fields.is_empty());
     }
 
@@ -1272,8 +1261,10 @@ mod tests {
         let mut cfg = IcebergSinkConfig::new("s3://bucket/warehouse", "db", "table");
         cfg.storage_options
             .insert("aws_region".to_string(), "us-east-1".to_string());
-        cfg.storage_options
-            .insert("aws_secret_access_key".to_string(), "TOP_SECRET".to_string());
+        cfg.storage_options.insert(
+            "aws_secret_access_key".to_string(),
+            "TOP_SECRET".to_string(),
+        );
 
         let display = cfg.display_storage_options();
         assert!(display.contains("aws_region=us-east-1"));
@@ -1290,7 +1281,13 @@ mod tests {
         let cfg = IcebergSinkConfig::from_config(&config).unwrap();
 
         assert_eq!(cfg.catalog_properties.len(), 2);
-        assert_eq!(cfg.catalog_properties.get("token"), Some(&"my-token".to_string()));
-        assert_eq!(cfg.catalog_properties.get("scope"), Some(&"catalog:read".to_string()));
+        assert_eq!(
+            cfg.catalog_properties.get("token"),
+            Some(&"my-token".to_string())
+        );
+        assert_eq!(
+            cfg.catalog_properties.get("scope"),
+            Some(&"catalog:read".to_string())
+        );
     }
 }

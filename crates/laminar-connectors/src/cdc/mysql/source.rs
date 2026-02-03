@@ -208,7 +208,10 @@ impl MySqlCdcSource {
     /// # Errors
     ///
     /// Returns error if batch conversion fails.
-    pub fn flush_events(&mut self, table_info: &TableInfo) -> Result<Option<RecordBatch>, ConnectorError> {
+    pub fn flush_events(
+        &mut self,
+        table_info: &TableInfo,
+    ) -> Result<Option<RecordBatch>, ConnectorError> {
         if self.event_buffer.is_empty() {
             return Ok(None);
         }
@@ -306,7 +309,10 @@ impl SourceConnector for MySqlCdcSource {
         }
 
         // Check error count
-        let errors = self.metrics.errors.load(std::sync::atomic::Ordering::Relaxed);
+        let errors = self
+            .metrics
+            .errors
+            .load(std::sync::atomic::Ordering::Relaxed);
         if errors > 100 {
             return HealthStatus::Degraded(format!("{errors} errors encountered"));
         }
@@ -422,7 +428,10 @@ mod tests {
         source.position = Some(BinlogPosition::new("mysql-bin.000003".to_string(), 9999));
 
         let checkpoint = source.create_checkpoint();
-        assert_eq!(checkpoint.get_offset("binlog_file"), Some("mysql-bin.000003"));
+        assert_eq!(
+            checkpoint.get_offset("binlog_file"),
+            Some("mysql-bin.000003")
+        );
         assert_eq!(checkpoint.get_offset("binlog_position"), Some("9999"));
     }
 

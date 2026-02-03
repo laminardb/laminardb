@@ -121,9 +121,13 @@ impl DagSinkBridge {
         let batch_count = events.len();
 
         for event in &events {
-            let result = self.connector.write_batch(&event.data).await.inspect_err(|_| {
-                self.metrics.errors.fetch_add(1, Ordering::Relaxed);
-            })?;
+            let result = self
+                .connector
+                .write_batch(&event.data)
+                .await
+                .inspect_err(|_| {
+                    self.metrics.errors.fetch_add(1, Ordering::Relaxed);
+                })?;
             total_rows += result.records_written;
             total_bytes += result.bytes_written;
         }
@@ -309,12 +313,7 @@ mod tests {
         executor.process_event(src_id, event).unwrap();
 
         let connector = MockSinkConnector::new();
-        let mut bridge = DagSinkBridge::new(
-            Box::new(connector),
-            snk_id,
-            "test-sink",
-            schema,
-        );
+        let mut bridge = DagSinkBridge::new(Box::new(connector), snk_id, "test-sink", schema);
 
         bridge.open(&ConnectorConfig::new("mock")).await.unwrap();
         assert_eq!(bridge.state(), SinkBridgeState::Open);
@@ -324,14 +323,8 @@ mod tests {
         assert!(result.bytes_written > 0);
         assert_eq!(result.batches_written, 1);
 
-        assert_eq!(
-            bridge.metrics().batches_written.load(Ordering::Relaxed),
-            1
-        );
-        assert_eq!(
-            bridge.metrics().events_output.load(Ordering::Relaxed),
-            10
-        );
+        assert_eq!(bridge.metrics().batches_written.load(Ordering::Relaxed), 1);
+        assert_eq!(bridge.metrics().events_output.load(Ordering::Relaxed), 10);
 
         bridge.close().await.unwrap();
         assert_eq!(bridge.state(), SinkBridgeState::Closed);
@@ -343,12 +336,7 @@ mod tests {
         let (mut executor, _src_id, snk_id) = build_dag_and_executor(schema.clone());
 
         let connector = MockSinkConnector::new();
-        let mut bridge = DagSinkBridge::new(
-            Box::new(connector),
-            snk_id,
-            "empty-sink",
-            schema,
-        );
+        let mut bridge = DagSinkBridge::new(Box::new(connector), snk_id, "empty-sink", schema);
 
         bridge.open(&ConnectorConfig::new("mock")).await.unwrap();
 
@@ -365,12 +353,7 @@ mod tests {
         let (mut executor, src_id, snk_id) = build_dag_and_executor(schema.clone());
 
         let connector = MockSinkConnector::new();
-        let mut bridge = DagSinkBridge::new(
-            Box::new(connector),
-            snk_id,
-            "epoch-sink",
-            schema,
-        );
+        let mut bridge = DagSinkBridge::new(Box::new(connector), snk_id, "epoch-sink", schema);
 
         bridge.open(&ConnectorConfig::new("mock")).await.unwrap();
         assert!(bridge.is_exactly_once());
@@ -388,10 +371,7 @@ mod tests {
         // Commit epoch
         bridge.commit_epoch(1).await.unwrap();
         assert_eq!(bridge.state(), SinkBridgeState::Open);
-        assert_eq!(
-            bridge.metrics().epochs_committed.load(Ordering::Relaxed),
-            1
-        );
+        assert_eq!(bridge.metrics().epochs_committed.load(Ordering::Relaxed), 1);
     }
 
     #[tokio::test]
@@ -400,12 +380,7 @@ mod tests {
         let (_executor, _src_id, snk_id) = build_dag_and_executor(schema.clone());
 
         let connector = MockSinkConnector::new();
-        let mut bridge = DagSinkBridge::new(
-            Box::new(connector),
-            snk_id,
-            "rollback-sink",
-            schema,
-        );
+        let mut bridge = DagSinkBridge::new(Box::new(connector), snk_id, "rollback-sink", schema);
 
         bridge.open(&ConnectorConfig::new("mock")).await.unwrap();
 
@@ -417,10 +392,7 @@ mod tests {
             bridge.metrics().epochs_rolled_back.load(Ordering::Relaxed),
             1
         );
-        assert_eq!(
-            bridge.metrics().epochs_committed.load(Ordering::Relaxed),
-            0
-        );
+        assert_eq!(bridge.metrics().epochs_committed.load(Ordering::Relaxed), 0);
     }
 
     #[tokio::test]
@@ -429,12 +401,7 @@ mod tests {
         let (_executor, _src_id, snk_id) = build_dag_and_executor(schema.clone());
 
         let connector = MockSinkConnector::new();
-        let bridge = DagSinkBridge::new(
-            Box::new(connector),
-            snk_id,
-            "cap-sink",
-            schema,
-        );
+        let bridge = DagSinkBridge::new(Box::new(connector), snk_id, "cap-sink", schema);
 
         let caps = bridge.capabilities();
         assert!(caps.exactly_once);

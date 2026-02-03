@@ -411,9 +411,7 @@ mod tests {
 
     #[test]
     fn test_binlog_position_with_gtid() {
-        let gtid: Gtid = "3E11FA47-71CA-11E1-9E33-C80AA9429562:5"
-            .parse()
-            .unwrap();
+        let gtid: Gtid = "3E11FA47-71CA-11E1-9E33-C80AA9429562:5".parse().unwrap();
         let pos = BinlogPosition::with_gtid("mysql-bin.000003".to_string(), 12345, gtid);
         assert!(pos.gtid.is_some());
         let s = pos.to_string();

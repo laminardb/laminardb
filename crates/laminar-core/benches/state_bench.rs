@@ -4,9 +4,9 @@
 //!
 //! Run with: cargo bench --bench state_bench
 
-use std::hint::black_box;
 use criterion::{criterion_group, criterion_main, BenchmarkId, Criterion, Throughput};
 use laminar_core::state::{InMemoryStore, MmapStateStore, StateStore, StateStoreExt};
+use std::hint::black_box;
 
 /// Pre-populate a store with N entries
 fn populate_store(n: usize) -> InMemoryStore {

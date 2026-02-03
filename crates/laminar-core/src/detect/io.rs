@@ -574,10 +574,10 @@ impl MemoryInfo {
         info.huge_pages_available = info.huge_page_size > 0;
 
         // Check THP status
-        if let Ok(thp_enabled) = fs::read_to_string("/sys/kernel/mm/transparent_hugepage/enabled")
-        {
+        if let Ok(thp_enabled) = fs::read_to_string("/sys/kernel/mm/transparent_hugepage/enabled") {
             // Format is: "[always] madvise never" where brackets indicate current setting
-            info.thp_enabled = thp_enabled.contains("[always]") || thp_enabled.contains("[madvise]");
+            info.thp_enabled =
+                thp_enabled.contains("[always]") || thp_enabled.contains("[madvise]");
         }
 
         info
@@ -765,7 +765,7 @@ mod tests {
     #[test]
     fn test_memory_info_gb_conversion() {
         let info = MemoryInfo {
-            total_memory: 16 * 1024 * 1024 * 1024, // 16 GB
+            total_memory: 16 * 1024 * 1024 * 1024,    // 16 GB
             available_memory: 8 * 1024 * 1024 * 1024, // 8 GB
             ..Default::default()
         };

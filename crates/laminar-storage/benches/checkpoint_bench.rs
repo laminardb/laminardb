@@ -2,10 +2,10 @@
 
 use std::time::Duration;
 
-use std::hint::black_box;
 use criterion::{criterion_group, criterion_main, Criterion};
 use laminar_core::state::StateStore;
 use laminar_storage::{CheckpointManager, WalStateStore};
+use std::hint::black_box;
 use tempfile::TempDir;
 
 fn bench_checkpoint_creation(c: &mut Criterion) {

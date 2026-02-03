@@ -352,7 +352,11 @@ impl NumaTopology {
 
     /// Log the detected topology for debugging.
     pub fn log_topology(&self) {
-        tracing::info!("NUMA Topology: {} nodes, {} CPUs", self.num_nodes, self.num_cpus);
+        tracing::info!(
+            "NUMA Topology: {} nodes, {} CPUs",
+            self.num_nodes,
+            self.num_cpus
+        );
         for node in 0..self.num_nodes {
             let cpus = self.cpus_for_node(node);
             let memory_gb = self.memory_for_node(node) / (1024 * 1024 * 1024);
@@ -371,10 +375,7 @@ impl NumaTopology {
     pub fn summary(&self) -> String {
         use std::fmt::Write;
 
-        let mut s = format!(
-            "NUMA: {} nodes, {} CPUs",
-            self.num_nodes, self.num_cpus
-        );
+        let mut s = format!("NUMA: {} nodes, {} CPUs", self.num_nodes, self.num_cpus);
         for node in 0..self.num_nodes {
             let cpus = self.cpus_for_node(node);
             let memory_gb = self.memory_for_node(node) / (1024 * 1024 * 1024);

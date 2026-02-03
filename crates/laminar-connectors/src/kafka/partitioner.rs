@@ -40,7 +40,11 @@ impl KafkaPartitioner for KeyHashPartitioner {
     fn partition(&mut self, key: Option<&[u8]>, num_partitions: i32) -> Option<i32> {
         key.map(|k| {
             let hash = murmur2(k) & 0x7fff_ffff;
-            #[allow(clippy::cast_possible_truncation, clippy::cast_possible_wrap, clippy::cast_sign_loss)]
+            #[allow(
+                clippy::cast_possible_truncation,
+                clippy::cast_possible_wrap,
+                clippy::cast_sign_loss
+            )]
             let partition = (hash % num_partitions as u32) as i32;
             partition
         })

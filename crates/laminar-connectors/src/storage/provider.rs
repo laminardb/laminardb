@@ -87,17 +87,26 @@ mod tests {
 
     #[test]
     fn test_detect_s3_scheme() {
-        assert_eq!(StorageProvider::detect("s3://bucket/path"), StorageProvider::AwsS3);
+        assert_eq!(
+            StorageProvider::detect("s3://bucket/path"),
+            StorageProvider::AwsS3
+        );
     }
 
     #[test]
     fn test_detect_s3a_scheme() {
-        assert_eq!(StorageProvider::detect("s3a://bucket/path"), StorageProvider::AwsS3);
+        assert_eq!(
+            StorageProvider::detect("s3a://bucket/path"),
+            StorageProvider::AwsS3
+        );
     }
 
     #[test]
     fn test_detect_s3_case_insensitive() {
-        assert_eq!(StorageProvider::detect("S3://Bucket/Path"), StorageProvider::AwsS3);
+        assert_eq!(
+            StorageProvider::detect("S3://Bucket/Path"),
+            StorageProvider::AwsS3
+        );
     }
 
     // ── Azure detection ──
@@ -138,39 +147,60 @@ mod tests {
 
     #[test]
     fn test_detect_gs_scheme() {
-        assert_eq!(StorageProvider::detect("gs://bucket/path"), StorageProvider::Gcs);
+        assert_eq!(
+            StorageProvider::detect("gs://bucket/path"),
+            StorageProvider::Gcs
+        );
     }
 
     #[test]
     fn test_detect_gcs_scheme() {
-        assert_eq!(StorageProvider::detect("gcs://bucket/path"), StorageProvider::Gcs);
+        assert_eq!(
+            StorageProvider::detect("gcs://bucket/path"),
+            StorageProvider::Gcs
+        );
     }
 
     // ── Local detection ──
 
     #[test]
     fn test_detect_local_absolute() {
-        assert_eq!(StorageProvider::detect("/data/tables/t1"), StorageProvider::Local);
+        assert_eq!(
+            StorageProvider::detect("/data/tables/t1"),
+            StorageProvider::Local
+        );
     }
 
     #[test]
     fn test_detect_local_relative() {
-        assert_eq!(StorageProvider::detect("./data/tables"), StorageProvider::Local);
+        assert_eq!(
+            StorageProvider::detect("./data/tables"),
+            StorageProvider::Local
+        );
     }
 
     #[test]
     fn test_detect_file_scheme() {
-        assert_eq!(StorageProvider::detect("file:///data/tables"), StorageProvider::Local);
+        assert_eq!(
+            StorageProvider::detect("file:///data/tables"),
+            StorageProvider::Local
+        );
     }
 
     #[test]
     fn test_detect_windows_path() {
-        assert_eq!(StorageProvider::detect("C:\\data\\tables"), StorageProvider::Local);
+        assert_eq!(
+            StorageProvider::detect("C:\\data\\tables"),
+            StorageProvider::Local
+        );
     }
 
     #[test]
     fn test_detect_windows_forward_slash() {
-        assert_eq!(StorageProvider::detect("C:/data/tables"), StorageProvider::Local);
+        assert_eq!(
+            StorageProvider::detect("C:/data/tables"),
+            StorageProvider::Local
+        );
     }
 
     // ── Properties ──

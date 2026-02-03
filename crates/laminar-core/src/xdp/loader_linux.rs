@@ -215,7 +215,8 @@ impl XdpLoader {
     #[must_use]
     pub fn stats(&self) -> XdpStats {
         if self.is_active() {
-            self.read_bpf_stats().unwrap_or_else(|_| self.stats.snapshot())
+            self.read_bpf_stats()
+                .unwrap_or_else(|_| self.stats.snapshot())
         } else {
             self.stats.snapshot()
         }

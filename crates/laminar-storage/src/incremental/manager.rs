@@ -476,7 +476,8 @@ impl IncrementalCheckpointManager {
         let state_path = checkpoint_path.join("state.bin");
         fs::write(&state_path, state_data)?;
 
-        #[allow(clippy::cast_possible_truncation)] // usize → u64: lossless on 64-bit, acceptable on 32-bit
+        #[allow(clippy::cast_possible_truncation)]
+        // usize → u64: lossless on 64-bit, acceptable on 32-bit
         {
             metadata.size_bytes = state_data.len() as u64;
         }
@@ -628,7 +629,10 @@ impl IncrementalCheckpointManager {
     /// # Errors
     ///
     /// Returns an error if cleanup fails.
-    pub fn cleanup_old_checkpoints_keep(&self, keep_count: usize) -> Result<(), IncrementalCheckpointError> {
+    pub fn cleanup_old_checkpoints_keep(
+        &self,
+        keep_count: usize,
+    ) -> Result<(), IncrementalCheckpointError> {
         let checkpoints = self.list_checkpoints()?;
 
         if checkpoints.len() <= keep_count {
@@ -639,10 +643,7 @@ impl IncrementalCheckpointManager {
         for checkpoint in checkpoints.iter().skip(keep_count) {
             let checkpoint_dir = checkpoint.checkpoint_path(&self.config.checkpoint_dir);
             if checkpoint_dir.exists() {
-                debug!(
-                    checkpoint_id = checkpoint.id,
-                    "Removing old checkpoint"
-                );
+                debug!(checkpoint_id = checkpoint.id, "Removing old checkpoint");
                 fs::remove_dir_all(&checkpoint_dir)?;
             }
         }
@@ -803,7 +804,10 @@ mod tests {
         let metadata = IncrementalCheckpointMetadata::new(0x1234_5678_9abc_def0, 1);
         let base = Path::new("/data/checkpoints");
         let path = metadata.checkpoint_path(base);
-        assert_eq!(path, PathBuf::from("/data/checkpoints/checkpoint_123456789abcdef0"));
+        assert_eq!(
+            path,
+            PathBuf::from("/data/checkpoints/checkpoint_123456789abcdef0")
+        );
     }
 
     #[test]

@@ -13,11 +13,14 @@
 //! Same as the global top-K: `OnUpdate`, `OnWatermark`, or `Periodic`.
 //! Changelog records are emitted per-partition.
 
+use super::topk::{
+    encode_f64, encode_i64, encode_not_null, encode_null, encode_utf8, TopKEmitStrategy,
+    TopKSortColumn,
+};
+use super::window::ChangelogRecord;
 use super::{
     Event, Operator, OperatorContext, OperatorError, OperatorState, Output, OutputVec, Timer,
 };
-use super::topk::{TopKEmitStrategy, TopKSortColumn, encode_i64, encode_f64, encode_utf8, encode_null, encode_not_null};
-use super::window::ChangelogRecord;
 use arrow_array::{Array, Float64Array, Int64Array, StringArray, TimestampMicrosecondArray};
 use arrow_schema::DataType;
 use fxhash::FxHashMap;
@@ -112,9 +115,7 @@ impl PartitionedTopKOperator {
     /// Returns the number of entries in a specific partition.
     #[must_use]
     pub fn partition_size(&self, partition_key: &[u8]) -> usize {
-        self.partitions
-            .get(partition_key)
-            .map_or(0, Vec::len)
+        self.partitions.get(partition_key).map_or(0, Vec::len)
     }
 
     /// Returns the number of pending changelog records.
@@ -258,7 +259,11 @@ impl PartitionedTopKOperator {
         changes.push(ChangelogRecord::insert(event.clone(), emit_timestamp));
 
         // Generate rank change retractions for shifted entries
-        for entry in entries.iter().take(entries.len().min(self.k)).skip(insert_pos + 1) {
+        for entry in entries
+            .iter()
+            .take(entries.len().min(self.k))
+            .skip(insert_pos + 1)
+        {
             let shifted_event = &entry.event;
             let (before, after) = ChangelogRecord::update(
                 shifted_event.clone(),
@@ -463,8 +468,8 @@ impl Operator for PartitionedTopKOperator {
 
 #[cfg(test)]
 mod tests {
-    use super::*;
     use super::super::window::CdcOperation;
+    use super::*;
     use crate::state::InMemoryStore;
     use crate::time::{BoundedOutOfOrdernessGenerator, TimerService};
     use arrow_array::{Float64Array, Int64Array, RecordBatch, StringArray};
@@ -518,10 +523,7 @@ mod tests {
         }
     }
 
-    fn create_partitioned_topk(
-        k: usize,
-        max_partitions: usize,
-    ) -> PartitionedTopKOperator {
+    fn create_partitioned_topk(k: usize, max_partitions: usize) -> PartitionedTopKOperator {
         PartitionedTopKOperator::new(
             "test_ptopk".to_string(),
             k,
@@ -770,9 +772,7 @@ mod tests {
             "test_ptopk".to_string(),
             3,
             vec![PartitionColumn::new("category")],
-            vec![
-                TopKSortColumn::descending("price"),
-            ],
+            vec![TopKSortColumn::descending("price")],
             TopKEmitStrategy::OnUpdate,
             100,
         );
@@ -870,7 +870,7 @@ mod tests {
         let trades = vec![
             make_trade(1, "tech", 100.0),
             make_trade(2, "tech", 200.0),
-            make_trade(3, "tech", 150.0),  // evicts 100
+            make_trade(3, "tech", 150.0), // evicts 100
             make_trade(4, "finance", 300.0),
             make_trade(5, "finance", 250.0),
         ];

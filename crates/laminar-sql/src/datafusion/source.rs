@@ -259,9 +259,11 @@ mod tests {
             }
         }
 
-        let schema = Arc::new(Schema::new(vec![
-            Field::new("event_time", DataType::Int64, false),
-        ]));
+        let schema = Arc::new(Schema::new(vec![Field::new(
+            "event_time",
+            DataType::Int64,
+            false,
+        )]));
         let source = OrderedSource { schema };
         let ordering = source.output_ordering().unwrap();
         assert_eq!(ordering.len(), 1);

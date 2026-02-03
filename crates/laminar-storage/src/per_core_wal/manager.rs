@@ -43,7 +43,9 @@ impl PerCoreWalConfig {
     /// Returns the path to a segment file for a given core.
     #[must_use]
     pub fn segment_path(&self, core_id: usize) -> PathBuf {
-        let filename = self.segment_pattern.replace("{core_id}", &core_id.to_string());
+        let filename = self
+            .segment_pattern
+            .replace("{core_id}", &core_id.to_string());
         self.base_dir.join(filename)
     }
 }
@@ -165,7 +167,10 @@ impl PerCoreWalManager {
     /// # Errors
     ///
     /// Returns an error if `core_id >= num_cores`.
-    pub fn writer_checked(&mut self, core_id: usize) -> Result<&mut CoreWalWriter, PerCoreWalError> {
+    pub fn writer_checked(
+        &mut self,
+        core_id: usize,
+    ) -> Result<&mut CoreWalWriter, PerCoreWalError> {
         if core_id >= self.config.num_cores {
             return Err(PerCoreWalError::InvalidCoreId {
                 core_id,

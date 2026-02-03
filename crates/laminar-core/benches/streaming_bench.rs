@@ -199,8 +199,7 @@ fn bench_spsc_channel_push(c: &mut Criterion) {
                     wait_strategy: WaitStrategy::Spin,
                     track_stats: false,
                 };
-                let (producer, consumer) =
-                    streaming::channel_with_config::<u64>(config);
+                let (producer, consumer) = streaming::channel_with_config::<u64>(config);
 
                 let mut val = 0u64;
                 b.iter(|| {
@@ -369,8 +368,7 @@ fn bench_source_push_batch_drain(c: &mut Criterion) {
                 b.iter(|| {
                     // Drain subscription to avoid backpressure
                     sub.poll_each(size, |_| true);
-                    let events: Vec<BenchEvent> =
-                        (0..size as i64).map(|i| make_event(i)).collect();
+                    let events: Vec<BenchEvent> = (0..size as i64).map(|i| make_event(i)).collect();
                     let pushed = source.push_batch_drain(black_box(events.into_iter()));
                     black_box(pushed)
                 })

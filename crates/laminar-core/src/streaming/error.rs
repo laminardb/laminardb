@@ -136,8 +136,14 @@ mod tests {
     #[test]
     fn test_streaming_error_display() {
         assert_eq!(StreamingError::ChannelFull.to_string(), "channel is full");
-        assert_eq!(StreamingError::ChannelClosed.to_string(), "channel is closed");
-        assert_eq!(StreamingError::Disconnected.to_string(), "channel is disconnected");
+        assert_eq!(
+            StreamingError::ChannelClosed.to_string(),
+            "channel is closed"
+        );
+        assert_eq!(
+            StreamingError::Disconnected.to_string(),
+            "channel is disconnected"
+        );
         assert_eq!(
             StreamingError::InvalidConfig("bad".to_string()).to_string(),
             "invalid configuration: bad"

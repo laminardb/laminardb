@@ -164,7 +164,8 @@ impl CompletionRouter {
 
     /// Track a simple operation with just user_data and affinity.
     pub fn track_simple(&mut self, user_data: u64, affinity: RingAffinity) {
-        self.pending.insert(user_data, PendingOperation::new(user_data, affinity));
+        self.pending
+            .insert(user_data, PendingOperation::new(user_data, affinity));
     }
 
     /// Route a completion to produce a `RoutedCompletion`.
@@ -220,7 +221,10 @@ impl CompletionRouter {
     /// Get the number of pending operations by affinity.
     #[must_use]
     pub fn pending_by_affinity(&self, affinity: RingAffinity) -> usize {
-        self.pending.values().filter(|op| op.affinity == affinity).count()
+        self.pending
+            .values()
+            .filter(|op| op.affinity == affinity)
+            .count()
     }
 
     /// Clear all pending operations.

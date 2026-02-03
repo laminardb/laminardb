@@ -83,7 +83,10 @@ impl<T, const N: usize> ObjectPool<T, N> {
             // and ArrayVec<T, N> has capacity N
             let _ = free_list.try_push(factory());
         }
-        Self { free_list, in_use: 0 }
+        Self {
+            free_list,
+            in_use: 0,
+        }
     }
 
     /// Acquire an object from the pool.

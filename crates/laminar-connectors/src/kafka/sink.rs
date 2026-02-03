@@ -169,14 +169,11 @@ impl KafkaSink {
             return Ok(None);
         };
 
-        let col_idx = batch
-            .schema()
-            .index_of(key_col)
-            .map_err(|_| {
-                ConnectorError::ConfigurationError(format!(
-                    "key column '{key_col}' not found in schema"
-                ))
-            })?;
+        let col_idx = batch.schema().index_of(key_col).map_err(|_| {
+            ConnectorError::ConfigurationError(format!(
+                "key column '{key_col}' not found in schema"
+            ))
+        })?;
 
         let array = batch.column(col_idx);
         let mut keys = Vec::with_capacity(batch.num_rows());
@@ -192,16 +189,15 @@ impl KafkaSink {
             }
         } else {
             // For non-string columns, use the Arrow array formatter.
-            let formatter =
-                arrow_cast::display::ArrayFormatter::try_new(
-                    array,
-                    &arrow_cast::display::FormatOptions::default(),
-                )
-                    .map_err(|e| {
-                        ConnectorError::Internal(format!(
-                            "failed to create array formatter for key column: {e}"
-                        ))
-                    })?;
+            let formatter = arrow_cast::display::ArrayFormatter::try_new(
+                array,
+                &arrow_cast::display::FormatOptions::default(),
+            )
+            .map_err(|e| {
+                ConnectorError::Internal(format!(
+                    "failed to create array formatter for key column: {e}"
+                ))
+            })?;
             for i in 0..batch.num_rows() {
                 if array.is_null(i) {
                     keys.push(Vec::new());
@@ -221,12 +217,14 @@ impl KafkaSink {
         key: Option<&[u8]>,
         error_msg: &str,
     ) -> Result<(), ConnectorError> {
-        let dlq_producer = self.dlq_producer.as_ref().ok_or_else(|| {
-            ConnectorError::ConfigurationError("DLQ topic not configured".into())
-        })?;
-        let dlq_topic = self.config.dlq_topic.as_ref().ok_or_else(|| {
-            ConnectorError::ConfigurationError("DLQ topic not configured".into())
-        })?;
+        let dlq_producer = self
+            .dlq_producer
+            .as_ref()
+            .ok_or_else(|| ConnectorError::ConfigurationError("DLQ topic not configured".into()))?;
+        let dlq_topic =
+            self.config.dlq_topic.as_ref().ok_or_else(|| {
+                ConnectorError::ConfigurationError("DLQ topic not configured".into())
+            })?;
 
         let now = std::time::SystemTime::now()
             .duration_since(std::time::UNIX_EPOCH)
@@ -264,9 +262,7 @@ impl KafkaSink {
         dlq_producer
             .send(record, Duration::from_secs(5))
             .await
-            .map_err(|(e, _)| {
-                ConnectorError::WriteError(format!("DLQ send failed: {e}"))
-            })?;
+            .map_err(|(e, _)| ConnectorError::WriteError(format!("DLQ send failed: {e}")))?;
 
         self.metrics.record_dlq();
         Ok(())
@@ -305,9 +301,7 @@ impl SinkConnector for KafkaSink {
             producer
                 .init_transactions(self.config.transaction_timeout)
                 .map_err(|e| {
-                    ConnectorError::TransactionError(format!(
-                        "failed to init transactions: {e}"
-                    ))
+                    ConnectorError::TransactionError(format!("failed to init transactions: {e}"))
                 })?;
         }
 
@@ -318,9 +312,7 @@ impl SinkConnector for KafkaSink {
                 .set("enable.idempotence", "true")
                 .create()
                 .map_err(|e| {
-                    ConnectorError::ConnectionFailed(format!(
-                        "failed to create DLQ producer: {e}"
-                    ))
+                    ConnectorError::ConnectionFailed(format!("failed to create DLQ producer: {e}"))
                 })?;
             self.dlq_producer = Some(dlq_producer);
         }
@@ -328,9 +320,10 @@ impl SinkConnector for KafkaSink {
         // Initialize Schema Registry client if configured.
         if let Some(ref url) = self.config.schema_registry_url {
             if self.schema_registry.is_none() {
-                self.schema_registry = Some(Arc::new(Mutex::new(
-                    SchemaRegistryClient::new(url, self.config.schema_registry_auth.clone()),
-                )));
+                self.schema_registry = Some(Arc::new(Mutex::new(SchemaRegistryClient::new(
+                    url,
+                    self.config.schema_registry_auth.clone(),
+                ))));
             }
         }
 
@@ -352,21 +345,19 @@ impl SinkConnector for KafkaSink {
             });
         }
 
-        let producer = self.producer.as_ref().ok_or_else(|| {
-            ConnectorError::InvalidState {
+        let producer = self
+            .producer
+            .as_ref()
+            .ok_or_else(|| ConnectorError::InvalidState {
                 expected: "producer initialized".into(),
                 actual: "producer is None".into(),
-            }
-        })?;
+            })?;
 
         // Serialize the RecordBatch into per-row byte payloads.
-        let payloads = self
-            .serializer
-            .serialize(batch)
-            .map_err(|e| {
-                self.metrics.record_serialization_error();
-                ConnectorError::Serde(e)
-            })?;
+        let payloads = self.serializer.serialize(batch).map_err(|e| {
+            self.metrics.record_serialization_error();
+            ConnectorError::Serde(e)
+        })?;
 
         // Extract keys if key column is configured.
         let keys = self.extract_keys(batch)?;
@@ -435,12 +426,13 @@ impl SinkConnector for KafkaSink {
         self.current_epoch = epoch;
 
         if self.config.delivery_guarantee == DeliveryGuarantee::ExactlyOnce {
-            let producer = self.producer.as_ref().ok_or_else(|| {
-                ConnectorError::InvalidState {
+            let producer = self
+                .producer
+                .as_ref()
+                .ok_or_else(|| ConnectorError::InvalidState {
                     expected: "Running".into(),
                     actual: self.state.to_string(),
-                }
-            })?;
+                })?;
 
             producer.begin_transaction().map_err(|e| {
                 ConnectorError::TransactionError(format!(
@@ -465,21 +457,18 @@ impl SinkConnector for KafkaSink {
         }
 
         if self.config.delivery_guarantee == DeliveryGuarantee::ExactlyOnce {
-            let producer = self.producer.as_ref().ok_or_else(|| {
-                ConnectorError::InvalidState {
+            let producer = self
+                .producer
+                .as_ref()
+                .ok_or_else(|| ConnectorError::InvalidState {
                     expected: "Running".into(),
                     actual: self.state.to_string(),
-                }
-            })?;
+                })?;
 
             // Flush all pending messages.
-            producer
-                .flush(self.config.delivery_timeout)
-                .map_err(|e| {
-                    ConnectorError::TransactionError(format!(
-                        "failed to flush before commit: {e}"
-                    ))
-                })?;
+            producer.flush(self.config.delivery_timeout).map_err(|e| {
+                ConnectorError::TransactionError(format!("failed to flush before commit: {e}"))
+            })?;
 
             // Commit the Kafka transaction.
             producer
@@ -494,13 +483,11 @@ impl SinkConnector for KafkaSink {
         } else {
             // At-least-once: just flush pending messages.
             if let Some(ref producer) = self.producer {
-                producer
-                    .flush(self.config.delivery_timeout)
-                    .map_err(|e| {
-                        ConnectorError::TransactionError(format!(
-                            "failed to flush for epoch {epoch}: {e}"
-                        ))
-                    })?;
+                producer.flush(self.config.delivery_timeout).map_err(|e| {
+                    ConnectorError::TransactionError(format!(
+                        "failed to flush for epoch {epoch}: {e}"
+                    ))
+                })?;
             }
         }
 
@@ -514,12 +501,13 @@ impl SinkConnector for KafkaSink {
         if self.config.delivery_guarantee == DeliveryGuarantee::ExactlyOnce
             && self.transaction_active
         {
-            let producer = self.producer.as_ref().ok_or_else(|| {
-                ConnectorError::InvalidState {
+            let producer = self
+                .producer
+                .as_ref()
+                .ok_or_else(|| ConnectorError::InvalidState {
                     expected: "Running".into(),
                     actual: self.state.to_string(),
-                }
-            })?;
+                })?;
 
             producer
                 .abort_transaction(self.config.transaction_timeout)
@@ -541,12 +529,8 @@ impl SinkConnector for KafkaSink {
         match self.state {
             ConnectorState::Running => HealthStatus::Healthy,
             ConnectorState::Created | ConnectorState::Initializing => HealthStatus::Unknown,
-            ConnectorState::Paused => {
-                HealthStatus::Degraded("connector paused".into())
-            }
-            ConnectorState::Recovering => {
-                HealthStatus::Degraded("recovering".into())
-            }
+            ConnectorState::Paused => HealthStatus::Degraded("connector paused".into()),
+            ConnectorState::Recovering => HealthStatus::Degraded("recovering".into()),
             ConnectorState::Closed => HealthStatus::Unhealthy("closed".into()),
             ConnectorState::Failed => HealthStatus::Unhealthy("failed".into()),
         }
@@ -576,9 +560,7 @@ impl SinkConnector for KafkaSink {
         if let Some(ref producer) = self.producer {
             producer
                 .flush(self.config.delivery_timeout)
-                .map_err(|e| {
-                    ConnectorError::WriteError(format!("flush failed: {e}"))
-                })?;
+                .map_err(|e| ConnectorError::WriteError(format!("flush failed: {e}")))?;
         }
         Ok(())
     }

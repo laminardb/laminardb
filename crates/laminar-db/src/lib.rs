@@ -35,14 +35,14 @@ mod sql_utils;
 mod stream_executor;
 
 pub use builder::LaminarDbBuilder;
-pub use catalog::{SourceEntry, SourceCatalog};
+pub use catalog::{SourceCatalog, SourceEntry};
 pub use config::LaminarConfig;
 pub use db::LaminarDB;
 pub use error::DbError;
 pub use handle::{
-    ExecuteResult, DdlInfo, FromBatch, QueryHandle, SourceHandle, UntypedSourceHandle,
-    TypedSubscription, QueryInfo, SourceInfo, SinkInfo, StreamInfo,
-    PipelineTopology, PipelineNode, PipelineEdge, PipelineNodeType,
+    DdlInfo, ExecuteResult, FromBatch, PipelineEdge, PipelineNode, PipelineNodeType,
+    PipelineTopology, QueryHandle, QueryInfo, SinkInfo, SourceHandle, SourceInfo, StreamInfo,
+    TypedSubscription, UntypedSourceHandle,
 };
 
 /// Re-export the connector registry for custom connector registration.

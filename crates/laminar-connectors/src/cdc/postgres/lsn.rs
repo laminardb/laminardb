@@ -88,8 +88,8 @@ impl FromStr for Lsn {
 
         let high = u32::from_str_radix(high, 16)
             .map_err(|_| LsnParseError::InvalidHex(high.to_string()))?;
-        let low = u32::from_str_radix(low, 16)
-            .map_err(|_| LsnParseError::InvalidHex(low.to_string()))?;
+        let low =
+            u32::from_str_radix(low, 16).map_err(|_| LsnParseError::InvalidHex(low.to_string()))?;
 
         Ok(Lsn((u64::from(high) << 32) | u64::from(low)))
     }

@@ -6,8 +6,8 @@
 
 use std::collections::HashMap;
 
-use rdkafka::TopicPartitionList;
 use rdkafka::Offset;
+use rdkafka::TopicPartitionList;
 
 use crate::checkpoint::SourceCheckpoint;
 
@@ -31,8 +31,7 @@ impl OffsetTracker {
 
     /// Updates the offset for a topic-partition.
     pub fn update(&mut self, topic: &str, partition: i32, offset: i64) {
-        self.offsets
-            .insert((topic.to_string(), partition), offset);
+        self.offsets.insert((topic.to_string(), partition), offset);
     }
 
     /// Gets the last-consumed offset for a topic-partition.

@@ -158,9 +158,9 @@ impl MySqlCdcConfig {
         };
 
         if let Some(port) = config.get("port") {
-            cfg.port = port.parse().map_err(|_| {
-                ConnectorError::ConfigurationError(format!("invalid port: {port}"))
-            })?;
+            cfg.port = port
+                .parse()
+                .map_err(|_| ConnectorError::ConfigurationError(format!("invalid port: {port}")))?;
         }
         cfg.database = config.get("database").map(String::from);
         cfg.password = config.get("password").map(String::from);
@@ -268,9 +268,11 @@ impl MySqlCdcConfig {
         let full_name = format!("{database}.{table}");
 
         // Check exclude list first
-        if self.table_exclude.iter().any(|t| {
-            t == table || t == &full_name || t.ends_with(&format!(".{table}"))
-        }) {
+        if self
+            .table_exclude
+            .iter()
+            .any(|t| t == table || t == &full_name || t.ends_with(&format!(".{table}")))
+        {
             return false;
         }
 
@@ -286,9 +288,9 @@ impl MySqlCdcConfig {
             return true;
         }
 
-        self.table_include.iter().any(|t| {
-            t == table || t == &full_name || t.ends_with(&format!(".{table}"))
-        })
+        self.table_include
+            .iter()
+            .any(|t| t == table || t == &full_name || t.ends_with(&format!(".{table}")))
     }
 
     /// Returns the replication mode description.
@@ -419,7 +421,10 @@ mod tests {
         assert_eq!(cfg.connection_url(), "mysql://myuser@db.example.com:3306");
 
         cfg.database = Some("mydb".to_string());
-        assert_eq!(cfg.connection_url(), "mysql://myuser@db.example.com:3306/mydb");
+        assert_eq!(
+            cfg.connection_url(),
+            "mysql://myuser@db.example.com:3306/mydb"
+        );
     }
 
     #[test]

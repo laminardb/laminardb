@@ -290,7 +290,8 @@ impl CreditGate {
     /// Returns the number of available credits.
     #[must_use]
     pub fn available(&self) -> usize {
-        #[allow(clippy::cast_possible_truncation, clippy::cast_sign_loss)] // Safe: load().max(0) is >= 0
+        #[allow(clippy::cast_possible_truncation, clippy::cast_sign_loss)]
+        // Safe: load().max(0) is >= 0
         let val = self.available.load(Ordering::Relaxed).max(0) as usize;
         val
     }
@@ -336,7 +337,8 @@ impl CreditGate {
     /// Resets the gate to initial state.
     pub fn reset(&self) {
         #[allow(clippy::cast_possible_wrap)] // Safe: max_credits bounded to u16::MAX
-        self.available.store(self.max_credits as i64, Ordering::Release);
+        self.available
+            .store(self.max_credits as i64, Ordering::Release);
         self.metrics.reset();
     }
 }
@@ -662,7 +664,7 @@ mod tests {
         let config = BackpressureConfig {
             exclusive_credits: 10,
             floating_credits: 0,
-            high_watermark: 0.8,  // Backpressure when <20% available
+            high_watermark: 0.8, // Backpressure when <20% available
             low_watermark: 0.5,  // Recovered when >50% available
             ..Default::default()
         };

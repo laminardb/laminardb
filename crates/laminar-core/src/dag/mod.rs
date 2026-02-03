@@ -77,6 +77,7 @@ mod tests;
 
 // Re-export key types
 pub use builder::{DagBuilder, FanOutBuilder};
+pub use changelog::DagChangelogPropagator;
 pub use checkpoint::{
     AlignmentResult, BarrierAligner, BarrierType, CheckpointBarrier, CheckpointId,
     DagCheckpointConfig, DagCheckpointCoordinator,
@@ -92,5 +93,4 @@ pub use topology::{
     DagChannelType, DagEdge, DagNode, DagNodeType, EdgeId, NodeId, PartitioningStrategy,
     SharedStageMetadata, StatePartitionId, StreamingDag, MAX_FAN_OUT,
 };
-pub use changelog::DagChangelogPropagator;
 pub use watermark::{DagWatermarkCheckpoint, DagWatermarkTracker};

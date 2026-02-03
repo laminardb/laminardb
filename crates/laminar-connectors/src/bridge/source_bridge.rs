@@ -6,9 +6,9 @@
 
 use std::sync::atomic::Ordering;
 
-use arrow_array::Array;
 use arrow_array::cast::AsArray;
 use arrow_array::types::Int64Type;
+use arrow_array::Array;
 use arrow_schema::SchemaRef;
 
 use laminar_core::dag::{DagExecutor, NodeId};
@@ -125,7 +125,9 @@ impl DagSourceBridge {
         let batch_opt = self.connector.poll_batch(max_records).await?;
 
         let Some(batch) = batch_opt else {
-            self.metrics.poll_empty_count.fetch_add(1, Ordering::Relaxed);
+            self.metrics
+                .poll_empty_count
+                .fetch_add(1, Ordering::Relaxed);
             return Ok(PollResult {
                 events_processed: 0,
                 bytes_processed: 0,
@@ -181,10 +183,7 @@ impl DagSourceBridge {
     /// # Errors
     ///
     /// Returns `ConnectorError` if restore fails.
-    pub async fn restore(
-        &mut self,
-        checkpoint: &SourceCheckpoint,
-    ) -> Result<(), ConnectorError> {
+    pub async fn restore(&mut self, checkpoint: &SourceCheckpoint) -> Result<(), ConnectorError> {
         self.connector.restore(checkpoint).await?;
         self.last_checkpoint = checkpoint.clone();
         Ok(())
@@ -304,12 +303,7 @@ mod tests {
         let (mut executor, src_id, snk_id) = build_dag_and_executor(schema.clone());
 
         let connector = MockSourceConnector::with_batches(3, 5);
-        let mut bridge = DagSourceBridge::new(
-            Box::new(connector),
-            src_id,
-            "test-source",
-            schema,
-        );
+        let mut bridge = DagSourceBridge::new(Box::new(connector), src_id, "test-source", schema);
 
         bridge.open(&ConnectorConfig::new("mock")).await.unwrap();
         assert_eq!(bridge.state(), SourceBridgeState::Open);
@@ -323,14 +317,8 @@ mod tests {
         assert_eq!(outputs.len(), 1);
         assert_eq!(outputs[0].data.num_rows(), 5);
 
-        assert_eq!(
-            bridge.metrics().batches_polled.load(Ordering::Relaxed),
-            1
-        );
-        assert_eq!(
-            bridge.metrics().events_ingested.load(Ordering::Relaxed),
-            5
-        );
+        assert_eq!(bridge.metrics().batches_polled.load(Ordering::Relaxed), 1);
+        assert_eq!(bridge.metrics().events_ingested.load(Ordering::Relaxed), 5);
 
         bridge.close().await.unwrap();
         assert_eq!(bridge.state(), SourceBridgeState::Closed);
@@ -343,12 +331,7 @@ mod tests {
 
         // Source with 0 batches → immediately returns None
         let connector = MockSourceConnector::with_batches(0, 5);
-        let mut bridge = DagSourceBridge::new(
-            Box::new(connector),
-            src_id,
-            "empty-source",
-            schema,
-        );
+        let mut bridge = DagSourceBridge::new(Box::new(connector), src_id, "empty-source", schema);
 
         bridge.open(&ConnectorConfig::new("mock")).await.unwrap();
 
@@ -357,14 +340,8 @@ mod tests {
         assert_eq!(result.bytes_processed, 0);
         assert!(result.partition_offsets.is_empty());
 
-        assert_eq!(
-            bridge.metrics().poll_empty_count.load(Ordering::Relaxed),
-            1
-        );
-        assert_eq!(
-            bridge.metrics().batches_polled.load(Ordering::Relaxed),
-            0
-        );
+        assert_eq!(bridge.metrics().poll_empty_count.load(Ordering::Relaxed), 1);
+        assert_eq!(bridge.metrics().batches_polled.load(Ordering::Relaxed), 0);
     }
 
     #[tokio::test]
@@ -373,12 +350,7 @@ mod tests {
         let (mut executor, src_id, _snk_id) = build_dag_and_executor(schema.clone());
 
         let connector = MockSourceConnector::with_batches(5, 3);
-        let mut bridge = DagSourceBridge::new(
-            Box::new(connector),
-            src_id,
-            "cp-source",
-            schema,
-        );
+        let mut bridge = DagSourceBridge::new(Box::new(connector), src_id, "cp-source", schema);
 
         bridge.open(&ConnectorConfig::new("mock")).await.unwrap();
 
@@ -404,13 +376,8 @@ mod tests {
 
         // Build a source that uses a custom batch with timestamp column
         let connector = TimestampMockSource::new(schema.clone(), 42_000);
-        let mut bridge = DagSourceBridge::new(
-            Box::new(connector),
-            src_id,
-            "ts-source",
-            schema,
-        )
-        .with_timestamp_column("ts");
+        let mut bridge = DagSourceBridge::new(Box::new(connector), src_id, "ts-source", schema)
+            .with_timestamp_column("ts");
 
         bridge.open(&ConnectorConfig::new("mock")).await.unwrap();
 

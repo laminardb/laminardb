@@ -519,10 +519,7 @@ mod tests {
     fn test_tumble_zero_timestamp() {
         let udf = TumbleWindowStart::new();
         let result = udf
-            .invoke_with_args(make_args(
-                vec![ts_ms(Some(0)), interval_dt(0, 300_000)],
-                1,
-            ))
+            .invoke_with_args(make_args(vec![ts_ms(Some(0)), interval_dt(0, 300_000)], 1))
             .unwrap();
         assert_eq!(expect_ts_ms(result), Some(0));
     }
@@ -531,10 +528,7 @@ mod tests {
     fn test_tumble_null_handling() {
         let udf = TumbleWindowStart::new();
         let result = udf
-            .invoke_with_args(make_args(
-                vec![ts_ms(None), interval_dt(0, 300_000)],
-                1,
-            ))
+            .invoke_with_args(make_args(vec![ts_ms(None), interval_dt(0, 300_000)], 1))
             .unwrap();
         assert_eq!(expect_ts_ms(result), None);
     }
@@ -585,10 +579,7 @@ mod tests {
     #[test]
     fn test_tumble_rejects_zero_interval() {
         let udf = TumbleWindowStart::new();
-        let result = udf.invoke_with_args(make_args(
-            vec![ts_ms(Some(1000)), interval_dt(0, 0)],
-            1,
-        ));
+        let result = udf.invoke_with_args(make_args(vec![ts_ms(Some(1000)), interval_dt(0, 0)], 1));
         assert!(result.is_err());
     }
 
@@ -668,10 +659,7 @@ mod tests {
     fn test_session_passthrough_null() {
         let udf = SessionWindowStart::new();
         let result = udf
-            .invoke_with_args(make_args(
-                vec![ts_ms(None), interval_dt(0, 60_000)],
-                1,
-            ))
+            .invoke_with_args(make_args(vec![ts_ms(None), interval_dt(0, 60_000)], 1))
             .unwrap();
         assert_eq!(expect_ts_ms(result), None);
     }

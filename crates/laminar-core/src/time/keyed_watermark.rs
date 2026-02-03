@@ -366,7 +366,8 @@ impl<K: Hash + Eq + Clone> KeyedWatermarkTracker<K> {
                     }
                 }
             }
-            self.key_states.insert(key.clone(), KeyWatermarkState::new());
+            self.key_states
+                .insert(key.clone(), KeyWatermarkState::new());
             self.metrics.total_keys = self.key_states.len();
         }
 
@@ -761,7 +762,6 @@ impl<K: Hash + Eq + Clone> KeyedWatermarkTrackerWithLateHandling<K> {
 mod tests {
     use super::*;
 
-
     #[test]
     fn test_key_watermark_state_creation() {
         let state = KeyWatermarkState::new();
@@ -802,14 +802,16 @@ mod tests {
         assert!(!state.is_late(1000)); // After watermark
     }
 
-
     #[test]
     fn test_config_defaults() {
         let config = KeyedWatermarkConfig::default();
         assert_eq!(config.bounded_delay, Duration::from_secs(5));
         assert_eq!(config.idle_timeout, Duration::from_secs(60));
         assert!(config.max_keys.is_none());
-        assert_eq!(config.eviction_policy, KeyEvictionPolicy::LeastRecentlyActive);
+        assert_eq!(
+            config.eviction_policy,
+            KeyEvictionPolicy::LeastRecentlyActive
+        );
     }
 
     #[test]
@@ -824,7 +826,6 @@ mod tests {
         assert_eq!(config.max_keys, Some(1000));
         assert_eq!(config.eviction_policy, KeyEvictionPolicy::LowestWatermark);
     }
-
 
     #[test]
     fn test_keyed_tracker_single_key_updates_watermark() {
@@ -1131,7 +1132,6 @@ mod tests {
         let pairs: Vec<_> = tracker.iter().collect();
         assert_eq!(pairs.len(), 2);
     }
-
 
     #[test]
     fn test_late_handling_tracker() {

@@ -262,7 +262,9 @@ impl ScratchBuffer<DEFAULT_SCRATCH_SIZE> {
         THREAD_SCRATCH.with(|scratch| {
             // SAFETY: We're only reading.
             #[allow(unsafe_code)]
-            unsafe { (*scratch.get()).remaining() }
+            unsafe {
+                (*scratch.get()).remaining()
+            }
         })
     }
 
@@ -273,7 +275,9 @@ impl ScratchBuffer<DEFAULT_SCRATCH_SIZE> {
         THREAD_SCRATCH.with(|scratch| {
             // SAFETY: We're only reading.
             #[allow(unsafe_code)]
-            unsafe { (*scratch.get()).used() }
+            unsafe {
+                (*scratch.get()).used()
+            }
         })
     }
 }

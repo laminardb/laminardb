@@ -305,7 +305,6 @@ pub enum EmitStrategy {
 #[derive(Debug, Clone, PartialEq)]
 pub enum EmitClause {
     // === Existing (F011) ===
-
     /// EMIT AFTER WATERMARK (or EMIT ON WATERMARK)
     ///
     /// Emit results when the watermark passes the window end.
@@ -335,7 +334,6 @@ pub enum EmitClause {
     OnUpdate,
 
     // === New (F011B) ===
-
     /// EMIT CHANGES
     ///
     /// Emit changelog records with Z-set weights for CDC pipelines.
@@ -461,7 +459,10 @@ mod tests {
         // Check the statement fields
         assert_eq!(stmt.columns.len(), 2);
         assert!(stmt.watermark.is_some());
-        assert_eq!(stmt.with_options.get("connector"), Some(&"kafka".to_string()));
+        assert_eq!(
+            stmt.with_options.get("connector"),
+            Some(&"kafka".to_string())
+        );
     }
 
     #[test]
@@ -518,7 +519,6 @@ mod tests {
         }
     }
 
-
     #[test]
     fn test_late_data_clause_default() {
         let clause = LateDataClause::default();
@@ -549,7 +549,6 @@ mod tests {
         assert_eq!(clause.side_output, Some("late_events".to_string()));
     }
 
-
     #[test]
     fn test_show_command_variants() {
         let sources = ShowCommand::Sources;
@@ -569,7 +568,6 @@ mod tests {
         let cloned = cmd.clone();
         assert_eq!(cmd, cloned);
     }
-
 
     #[test]
     fn test_drop_source_statement() {

@@ -93,8 +93,8 @@ pub struct EnrichedOrder {
 #[derive(Debug, Clone, Record)]
 pub struct OrderBookUpdate {
     pub symbol: String,
-    pub side: String,      // "bid" or "ask"
-    pub action: String,    // "add", "modify", "delete", "trade"
+    pub side: String,   // "bid" or "ask"
+    pub action: String, // "add", "modify", "delete", "trade"
     pub price_level: f64,
     pub quantity: i64,
     pub order_count: i64,

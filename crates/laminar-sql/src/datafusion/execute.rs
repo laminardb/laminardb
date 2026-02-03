@@ -97,9 +97,9 @@ pub async fn execute_streaming_sql(
     let statements = parse_streaming_sql(sql)?;
 
     if statements.is_empty() {
-        return Err(Error::ParseError(crate::parser::ParseError::StreamingError(
-            "Empty SQL statement".to_string(),
-        )));
+        return Err(Error::ParseError(
+            crate::parser::ParseError::StreamingError("Empty SQL statement".to_string()),
+        ));
     }
 
     // Process the first statement
@@ -171,10 +171,9 @@ mod tests {
         .await
         .unwrap();
 
-        let result =
-            execute_streaming_sql("CREATE SINK output FROM events", &ctx, &mut planner)
-                .await
-                .unwrap();
+        let result = execute_streaming_sql("CREATE SINK output FROM events", &ctx, &mut planner)
+            .await
+            .unwrap();
 
         assert!(matches!(result, StreamingSqlResult::Ddl(_)));
     }
@@ -227,8 +226,9 @@ mod tests {
             Field::new("name", DataType::Utf8, true),
         ]));
 
-        let source =
-            Arc::new(crate::datafusion::ChannelStreamSource::new(Arc::clone(&schema)));
+        let source = Arc::new(crate::datafusion::ChannelStreamSource::new(Arc::clone(
+            &schema,
+        )));
         let sender = source.take_sender().expect("sender available");
         let provider = crate::datafusion::StreamingTableProvider::new("users", source);
         ctx.register_table("users", Arc::new(provider)).unwrap();
@@ -246,10 +246,9 @@ mod tests {
         drop(sender);
 
         let mut planner = StreamingPlanner::new();
-        let result =
-            execute_streaming_sql("SELECT id, name FROM users", &ctx, &mut planner)
-                .await
-                .unwrap();
+        let result = execute_streaming_sql("SELECT id, name FROM users", &ctx, &mut planner)
+            .await
+            .unwrap();
 
         match result {
             StreamingSqlResult::Query(qr) => {

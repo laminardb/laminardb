@@ -203,10 +203,8 @@ mod tests {
 
     #[test]
     fn test_tumbling_config() {
-        let config = WindowOperatorConfig::tumbling(
-            "event_time".to_string(),
-            Duration::from_secs(300),
-        );
+        let config =
+            WindowOperatorConfig::tumbling("event_time".to_string(), Duration::from_secs(300));
 
         assert_eq!(config.window_type, WindowType::Tumbling);
         assert_eq!(config.time_column, "event_time");
@@ -230,10 +228,8 @@ mod tests {
 
     #[test]
     fn test_session_config() {
-        let config = WindowOperatorConfig::session(
-            "click_time".to_string(),
-            Duration::from_secs(1800),
-        );
+        let config =
+            WindowOperatorConfig::session("click_time".to_string(), Duration::from_secs(1800));
 
         assert_eq!(config.window_type, WindowType::Session);
         assert_eq!(config.gap, Some(Duration::from_secs(1800)));
@@ -251,28 +247,19 @@ mod tests {
 
     #[test]
     fn test_with_emit_clause() {
-        let config = WindowOperatorConfig::tumbling(
-            "ts".to_string(),
-            Duration::from_secs(300),
-        );
+        let config = WindowOperatorConfig::tumbling("ts".to_string(), Duration::from_secs(300));
 
         let config = config.with_emit_clause(&EmitClause::OnWindowClose).unwrap();
         assert_eq!(config.emit_strategy, EmitStrategy::OnWindowClose);
 
-        let config2 = WindowOperatorConfig::tumbling(
-            "ts".to_string(),
-            Duration::from_secs(300),
-        );
+        let config2 = WindowOperatorConfig::tumbling("ts".to_string(), Duration::from_secs(300));
         let config2 = config2.with_emit_clause(&EmitClause::Changes).unwrap();
         assert_eq!(config2.emit_strategy, EmitStrategy::Changelog);
     }
 
     #[test]
     fn test_with_late_data_clause() {
-        let config = WindowOperatorConfig::tumbling(
-            "ts".to_string(),
-            Duration::from_secs(300),
-        );
+        let config = WindowOperatorConfig::tumbling("ts".to_string(), Duration::from_secs(300));
 
         let late_clause = LateDataClause::side_output_only("late_events".to_string());
         let config = config.with_late_data_clause(&late_clause).unwrap();
@@ -308,7 +295,9 @@ mod tests {
         assert!(!config.has_late_data_handling());
 
         // With allowed lateness
-        let config2 = config.clone().with_allowed_lateness(Duration::from_secs(60));
+        let config2 = config
+            .clone()
+            .with_allowed_lateness(Duration::from_secs(60));
         assert!(config2.has_late_data_handling());
 
         // With side output

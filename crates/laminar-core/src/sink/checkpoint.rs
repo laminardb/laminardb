@@ -4,8 +4,8 @@
 
 use std::collections::HashMap;
 
-use super::traits::TransactionId;
 use super::error::SinkError;
+use super::traits::TransactionId;
 
 /// Offset tracking for sink partitions
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -258,10 +258,12 @@ impl SinkCheckpoint {
     /// # Panics
     ///
     /// Will not panic - all array conversions are bounds-checked before unwrapping.
-    #[allow(clippy::missing_panics_doc)]
+    #[allow(clippy::missing_panics_doc, clippy::too_many_lines)]
     pub fn from_bytes(bytes: &[u8]) -> Result<Self, SinkError> {
         if bytes.is_empty() {
-            return Err(SinkError::CheckpointError("Empty checkpoint data".to_string()));
+            return Err(SinkError::CheckpointError(
+                "Empty checkpoint data".to_string(),
+            ));
         }
 
         let mut pos = 0;
@@ -278,7 +280,9 @@ impl SinkCheckpoint {
         // Helper to read u32 length
         let read_u32 = |pos: &mut usize| -> Result<u32, SinkError> {
             if *pos + 4 > bytes.len() {
-                return Err(SinkError::CheckpointError("Unexpected end of data".to_string()));
+                return Err(SinkError::CheckpointError(
+                    "Unexpected end of data".to_string(),
+                ));
             }
             let val = u32::from_le_bytes(bytes[*pos..*pos + 4].try_into().unwrap());
             *pos += 4;
@@ -288,7 +292,9 @@ impl SinkCheckpoint {
         // Helper to read u64
         let read_u64 = |pos: &mut usize| -> Result<u64, SinkError> {
             if *pos + 8 > bytes.len() {
-                return Err(SinkError::CheckpointError("Unexpected end of data".to_string()));
+                return Err(SinkError::CheckpointError(
+                    "Unexpected end of data".to_string(),
+                ));
             }
             let val = u64::from_le_bytes(bytes[*pos..*pos + 8].try_into().unwrap());
             *pos += 8;
@@ -298,7 +304,9 @@ impl SinkCheckpoint {
         // Sink ID
         let sink_id_len = read_u32(&mut pos)? as usize;
         if pos + sink_id_len > bytes.len() {
-            return Err(SinkError::CheckpointError("Invalid sink_id length".to_string()));
+            return Err(SinkError::CheckpointError(
+                "Invalid sink_id length".to_string(),
+            ));
         }
         let sink_id = String::from_utf8_lossy(&bytes[pos..pos + sink_id_len]).to_string();
         pos += sink_id_len;
@@ -309,7 +317,9 @@ impl SinkCheckpoint {
 
         // Pending transaction
         if pos >= bytes.len() {
-            return Err(SinkError::CheckpointError("Unexpected end of data".to_string()));
+            return Err(SinkError::CheckpointError(
+                "Unexpected end of data".to_string(),
+            ));
         }
         let has_tx = bytes[pos] == 1;
         pos += 1;
@@ -317,10 +327,13 @@ impl SinkCheckpoint {
         let pending_transaction = if has_tx {
             let tx_len = read_u32(&mut pos)? as usize;
             if pos + tx_len > bytes.len() {
-                return Err(SinkError::CheckpointError("Invalid transaction length".to_string()));
+                return Err(SinkError::CheckpointError(
+                    "Invalid transaction length".to_string(),
+                ));
             }
-            let tx = TransactionId::from_bytes(&bytes[pos..pos + tx_len])
-                .ok_or_else(|| SinkError::CheckpointError("Invalid transaction data".to_string()))?;
+            let tx = TransactionId::from_bytes(&bytes[pos..pos + tx_len]).ok_or_else(|| {
+                SinkError::CheckpointError("Invalid transaction data".to_string())
+            })?;
             pos += tx_len;
             Some(tx)
         } else {
@@ -333,14 +346,18 @@ impl SinkCheckpoint {
         for _ in 0..num_offsets {
             let partition_len = read_u32(&mut pos)? as usize;
             if pos + partition_len > bytes.len() {
-                return Err(SinkError::CheckpointError("Invalid partition length".to_string()));
+                return Err(SinkError::CheckpointError(
+                    "Invalid partition length".to_string(),
+                ));
             }
             let partition = String::from_utf8_lossy(&bytes[pos..pos + partition_len]).to_string();
             pos += partition_len;
 
             let offset_len = read_u32(&mut pos)? as usize;
             if pos + offset_len > bytes.len() {
-                return Err(SinkError::CheckpointError("Invalid offset length".to_string()));
+                return Err(SinkError::CheckpointError(
+                    "Invalid offset length".to_string(),
+                ));
             }
             let (offset, _) = SinkOffset::from_bytes(&bytes[pos..pos + offset_len])
                 .ok_or_else(|| SinkError::CheckpointError("Invalid offset data".to_string()))?;
@@ -355,14 +372,18 @@ impl SinkCheckpoint {
         for _ in 0..num_metadata {
             let key_len = read_u32(&mut pos)? as usize;
             if pos + key_len > bytes.len() {
-                return Err(SinkError::CheckpointError("Invalid metadata key length".to_string()));
+                return Err(SinkError::CheckpointError(
+                    "Invalid metadata key length".to_string(),
+                ));
             }
             let key = String::from_utf8_lossy(&bytes[pos..pos + key_len]).to_string();
             pos += key_len;
 
             let value_len = read_u32(&mut pos)? as usize;
             if pos + value_len > bytes.len() {
-                return Err(SinkError::CheckpointError("Invalid metadata value length".to_string()));
+                return Err(SinkError::CheckpointError(
+                    "Invalid metadata value length".to_string(),
+                ));
             }
             let value = bytes[pos..pos + value_len].to_vec();
             pos += value_len;
@@ -468,7 +489,9 @@ impl SinkCheckpointManager {
     #[allow(clippy::missing_panics_doc)]
     pub fn from_bytes(bytes: &[u8]) -> Result<Self, SinkError> {
         if bytes.len() < 12 {
-            return Err(SinkError::CheckpointError("Checkpoint data too short".to_string()));
+            return Err(SinkError::CheckpointError(
+                "Checkpoint data too short".to_string(),
+            ));
         }
 
         let mut pos = 0;
@@ -485,13 +508,17 @@ impl SinkCheckpointManager {
 
         for _ in 0..num_checkpoints {
             if pos + 4 > bytes.len() {
-                return Err(SinkError::CheckpointError("Unexpected end of data".to_string()));
+                return Err(SinkError::CheckpointError(
+                    "Unexpected end of data".to_string(),
+                ));
             }
             let cp_len = u32::from_le_bytes(bytes[pos..pos + 4].try_into().unwrap()) as usize;
             pos += 4;
 
             if pos + cp_len > bytes.len() {
-                return Err(SinkError::CheckpointError("Invalid checkpoint length".to_string()));
+                return Err(SinkError::CheckpointError(
+                    "Invalid checkpoint length".to_string(),
+                ));
             }
             let checkpoint = SinkCheckpoint::from_bytes(&bytes[pos..pos + cp_len])?;
             pos += cp_len;
@@ -554,8 +581,14 @@ mod tests {
         checkpoint.set_offset("topic-0", SinkOffset::Numeric(100));
         checkpoint.set_offset("topic-1", SinkOffset::Numeric(200));
 
-        assert_eq!(checkpoint.get_offset("topic-0"), Some(&SinkOffset::Numeric(100)));
-        assert_eq!(checkpoint.get_offset("topic-1"), Some(&SinkOffset::Numeric(200)));
+        assert_eq!(
+            checkpoint.get_offset("topic-0"),
+            Some(&SinkOffset::Numeric(100))
+        );
+        assert_eq!(
+            checkpoint.get_offset("topic-1"),
+            Some(&SinkOffset::Numeric(200))
+        );
         assert_eq!(checkpoint.get_offset("topic-2"), None);
     }
 
@@ -573,10 +606,19 @@ mod tests {
 
         assert_eq!(restored.sink_id(), "test-sink");
         assert_eq!(restored.epoch(), 42);
-        assert_eq!(restored.get_offset("partition-0"), Some(&SinkOffset::Numeric(1000)));
-        assert_eq!(restored.get_offset("partition-1"), Some(&SinkOffset::String("abc".to_string())));
+        assert_eq!(
+            restored.get_offset("partition-0"),
+            Some(&SinkOffset::Numeric(1000))
+        );
+        assert_eq!(
+            restored.get_offset("partition-1"),
+            Some(&SinkOffset::String("abc".to_string()))
+        );
         assert!(restored.pending_transaction_id().is_some());
-        assert_eq!(restored.get_metadata("custom-key"), Some(b"custom-value".as_ref()));
+        assert_eq!(
+            restored.get_metadata("custom-key"),
+            Some(b"custom-value".as_ref())
+        );
     }
 
     #[test]

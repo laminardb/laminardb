@@ -24,12 +24,12 @@ use crate::error::ConnectorError;
 use crate::health::HealthStatus;
 use crate::metrics::ConnectorMetrics;
 
-use super::changelog::{CdcOperation, ChangeEvent, events_to_record_batch, tuple_to_json};
+use super::changelog::{events_to_record_batch, tuple_to_json, CdcOperation, ChangeEvent};
 use super::config::PostgresCdcConfig;
-use super::decoder::{WalMessage, decode_message};
+use super::decoder::{decode_message, WalMessage};
 use super::lsn::Lsn;
 use super::metrics::CdcMetrics;
-use super::schema::{RelationCache, RelationInfo, cdc_envelope_schema};
+use super::schema::{cdc_envelope_schema, RelationCache, RelationInfo};
 /// `PostgreSQL` CDC source connector.
 ///
 /// Streams row-level changes from `PostgreSQL` using logical replication
@@ -453,9 +453,7 @@ impl SourceConnector for PostgresCdcSource {
                     HealthStatus::Healthy
                 }
             }
-            ConnectorState::Failed => {
-                HealthStatus::Unhealthy("connector failed".to_string())
-            }
+            ConnectorState::Failed => HealthStatus::Unhealthy("connector failed".to_string()),
             _ => HealthStatus::Unknown,
         }
     }
@@ -769,8 +767,7 @@ mod tests {
         assert_eq!(op_col.value(0), "I");
 
         let after_col = records.column(5).as_string::<i32>();
-        let after_json: serde_json::Value =
-            serde_json::from_str(after_col.value(0)).unwrap();
+        let after_json: serde_json::Value = serde_json::from_str(after_col.value(0)).unwrap();
         assert_eq!(after_json["id"], "42");
         assert_eq!(after_json["name"], "Alice");
 
@@ -829,10 +826,7 @@ mod tests {
 
         // Begin + Insert but NO commit
         src.enqueue_wal_data(PostgresCdcSource::build_begin_message(0x100, 0, 1));
-        src.enqueue_wal_data(PostgresCdcSource::build_insert_message(
-            16384,
-            &[Some("1")],
-        ));
+        src.enqueue_wal_data(PostgresCdcSource::build_insert_message(16384, &[Some("1")]));
 
         // Poll should return nothing (events in txn buffer)
         let result = src.poll_batch(100).await.unwrap();
@@ -926,10 +920,7 @@ mod tests {
         src.enqueue_wal_data(rel_msg);
 
         src.enqueue_wal_data(PostgresCdcSource::build_begin_message(0x100, 0, 1));
-        src.enqueue_wal_data(PostgresCdcSource::build_insert_message(
-            16384,
-            &[Some("1")],
-        ));
+        src.enqueue_wal_data(PostgresCdcSource::build_insert_message(16384, &[Some("1")]));
         src.enqueue_wal_data(PostgresCdcSource::build_commit_message(0x100, 0x200, 0));
 
         let result = src.poll_batch(100).await.unwrap();
@@ -1024,14 +1015,8 @@ mod tests {
         src.enqueue_wal_data(rel_msg);
 
         src.enqueue_wal_data(PostgresCdcSource::build_begin_message(0x100, 0, 1));
-        src.enqueue_wal_data(PostgresCdcSource::build_insert_message(
-            16384,
-            &[Some("1")],
-        ));
-        src.enqueue_wal_data(PostgresCdcSource::build_insert_message(
-            16384,
-            &[Some("2")],
-        ));
+        src.enqueue_wal_data(PostgresCdcSource::build_insert_message(16384, &[Some("1")]));
+        src.enqueue_wal_data(PostgresCdcSource::build_insert_message(16384, &[Some("2")]));
         src.enqueue_wal_data(PostgresCdcSource::build_commit_message(0x100, 0x200, 0));
 
         let _ = src.poll_batch(100).await.unwrap();
@@ -1058,10 +1043,7 @@ mod tests {
 
         // Insert without prior Relation message
         src.enqueue_wal_data(PostgresCdcSource::build_begin_message(0x100, 0, 1));
-        src.enqueue_wal_data(PostgresCdcSource::build_insert_message(
-            99999,
-            &[Some("1")],
-        ));
+        src.enqueue_wal_data(PostgresCdcSource::build_insert_message(99999, &[Some("1")]));
 
         let result = src.poll_batch(100).await;
         assert!(result.is_err());
@@ -1088,10 +1070,7 @@ mod tests {
         ));
 
         src.enqueue_wal_data(PostgresCdcSource::build_begin_message(0x500, 0, 5));
-        src.enqueue_wal_data(PostgresCdcSource::build_insert_message(
-            100,
-            &[Some("1")],
-        ));
+        src.enqueue_wal_data(PostgresCdcSource::build_insert_message(100, &[Some("1")]));
         src.enqueue_wal_data(PostgresCdcSource::build_insert_message(
             200,
             &[Some("1001")],

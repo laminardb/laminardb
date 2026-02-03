@@ -256,8 +256,7 @@ async fn callback_runner<C: SubscriptionCallback>(
         match receiver.recv().await {
             Ok(event) => {
                 let cb = Arc::clone(&callback);
-                let result =
-                    std::panic::catch_unwind(AssertUnwindSafe(|| cb.on_change(event)));
+                let result = std::panic::catch_unwind(AssertUnwindSafe(|| cb.on_change(event)));
                 if let Err(panic) = result {
                     let msg = if let Some(s) = panic.downcast_ref::<&str>() {
                         format!("callback panicked: {s}")
@@ -296,11 +295,7 @@ mod tests {
     use crate::subscription::registry::SubscriptionState;
 
     fn make_batch(n: usize) -> arrow_array::RecordBatch {
-        let schema = Arc::new(Schema::new(vec![Field::new(
-            "v",
-            DataType::Int64,
-            false,
-        )]));
+        let schema = Arc::new(Schema::new(vec![Field::new("v", DataType::Int64, false)]));
         let values: Vec<i64> = (0..n as i64).collect();
         let array = Int64Array::from(values);
         arrow_array::RecordBatch::try_new(schema, vec![Arc::new(array)]).unwrap()
@@ -381,13 +376,7 @@ mod tests {
         let errors = Arc::clone(&cb.errors);
         let events = Arc::clone(&cb.events);
 
-        let _handle = subscribe_callback(
-            Arc::clone(&registry),
-            "trades".into(),
-            0,
-            cfg,
-            cb,
-        );
+        let _handle = subscribe_callback(Arc::clone(&registry), "trades".into(), 0, cfg, cb);
 
         let senders = registry.get_senders_for_source(0);
 
@@ -487,19 +476,13 @@ mod tests {
         );
 
         assert!(handle.pause());
-        assert_eq!(
-            registry.state(handle.id()),
-            Some(SubscriptionState::Paused)
-        );
+        assert_eq!(registry.state(handle.id()), Some(SubscriptionState::Paused));
 
         // Already paused
         assert!(!handle.pause());
 
         assert!(handle.resume());
-        assert_eq!(
-            registry.state(handle.id()),
-            Some(SubscriptionState::Active)
-        );
+        assert_eq!(registry.state(handle.id()), Some(SubscriptionState::Active));
 
         // Already active
         assert!(!handle.resume());

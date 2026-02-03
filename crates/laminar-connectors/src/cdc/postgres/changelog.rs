@@ -18,7 +18,7 @@ use arrow_schema::SchemaRef;
 
 use super::decoder::{ColumnValue, TupleData};
 use super::lsn::Lsn;
-use super::schema::{RelationInfo, cdc_envelope_schema};
+use super::schema::{cdc_envelope_schema, RelationInfo};
 
 /// A CDC operation type.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -135,9 +135,9 @@ pub fn events_to_record_batch(
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::cdc::postgres::types::{INT8_OID, TEXT_OID};
     use crate::cdc::postgres::schema::RelationInfo;
     use crate::cdc::postgres::types::PgColumn;
+    use crate::cdc::postgres::types::{INT8_OID, TEXT_OID};
 
     fn sample_relation() -> RelationInfo {
         RelationInfo {
@@ -172,10 +172,7 @@ mod tests {
     fn test_tuple_to_json_with_null() {
         let relation = sample_relation();
         let tuple = TupleData {
-            columns: vec![
-                ColumnValue::Text("42".to_string()),
-                ColumnValue::Null,
-            ],
+            columns: vec![ColumnValue::Text("42".to_string()), ColumnValue::Null],
         };
 
         let json = tuple_to_json(&tuple, &relation);
@@ -188,10 +185,7 @@ mod tests {
     fn test_tuple_to_json_unchanged_omitted() {
         let relation = sample_relation();
         let tuple = TupleData {
-            columns: vec![
-                ColumnValue::Text("42".to_string()),
-                ColumnValue::Unchanged,
-            ],
+            columns: vec![ColumnValue::Text("42".to_string()), ColumnValue::Unchanged],
         };
 
         let json = tuple_to_json(&tuple, &relation);

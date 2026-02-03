@@ -631,7 +631,8 @@ impl WatermarkMetrics {
     /// Returns the watermark lag (difference between max event time and watermark).
     #[must_use]
     pub fn lag(&self) -> i64 {
-        self.max_event_timestamp.saturating_sub(self.current_watermark)
+        self.max_event_timestamp
+            .saturating_sub(self.current_watermark)
     }
 }
 
@@ -701,7 +702,6 @@ impl<G: WatermarkGenerator> WatermarkGenerator for MeteredGenerator<G> {
 mod tests {
     use super::*;
 
-
     #[test]
     fn test_bounded_generator_first_event() {
         let mut gen = BoundedOutOfOrdernessGenerator::new(100);
@@ -745,7 +745,6 @@ mod tests {
         assert_eq!(gen.on_periodic(), None);
     }
 
-
     #[test]
     fn test_ascending_generator_advances_on_each_event() {
         let mut gen = AscendingTimestampsGenerator::new();
@@ -768,7 +767,6 @@ mod tests {
         assert_eq!(gen.current_watermark(), 2000);
     }
 
-
     #[test]
     fn test_periodic_generator_passes_through() {
         let inner = BoundedOutOfOrdernessGenerator::new(100);
@@ -785,7 +783,6 @@ mod tests {
 
         assert_eq!(gen.inner().max_out_of_orderness(), 100);
     }
-
 
     #[test]
     fn test_punctuated_generator_predicate() {
@@ -814,7 +811,6 @@ mod tests {
         assert_eq!(wm, None);
         assert_eq!(gen.current_watermark(), 2000);
     }
-
 
     #[test]
     fn test_tracker_single_source() {
@@ -919,7 +915,6 @@ mod tests {
         assert_eq!(wm, None);
     }
 
-
     #[test]
     fn test_source_provided_fallback() {
         let mut gen = SourceProvidedGenerator::new(100, false);
@@ -936,7 +931,6 @@ mod tests {
         assert_eq!(wm, Some(Watermark::new(500)));
         assert_eq!(gen.current_watermark(), 500);
     }
-
 
     #[test]
     fn test_metered_generator_tracks_metrics() {
@@ -973,7 +967,6 @@ mod tests {
 
         assert_eq!(gen.metrics().late_events, 2);
     }
-
 
     #[test]
     fn test_watermark_metrics_default() {

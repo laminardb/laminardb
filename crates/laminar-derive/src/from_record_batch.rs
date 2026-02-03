@@ -64,10 +64,7 @@ fn parse_fields(input: &DeriveInput, macro_name: &str) -> Result<Vec<FieldInfo>,
     Ok(field_infos)
 }
 /// Generate the inherent `from_batch` and `from_batch_all` method implementations.
-fn generate_inherent_methods(
-    name: &syn::Ident,
-    field_infos: &[FieldInfo],
-) -> TokenStream {
+fn generate_inherent_methods(name: &syn::Ident, field_infos: &[FieldInfo]) -> TokenStream {
     let field_extractions = field_infos.iter().map(|f| {
         let ident = &f.ident;
         let col_name = &f.column_name;
@@ -167,12 +164,7 @@ fn extract_option_inner(ty: &Type) -> Option<&Type> {
 }
 
 /// Build the extraction code for a field from a `RecordBatch`.
-fn build_extraction(
-    ident: &Ident,
-    ty: &Type,
-    column_name: &str,
-    is_option: bool,
-) -> TokenStream {
+fn build_extraction(ident: &Ident, ty: &Type, column_name: &str, is_option: bool) -> TokenStream {
     if is_option {
         if let Some(inner) = extract_option_inner(ty) {
             return build_option_extraction(ident, inner, column_name);
@@ -229,7 +221,9 @@ fn build_extraction(
                     .value(row)
                     .to_vec();
             },
-            _ => quote! { compile_error!(concat!("Unsupported type for FromRecordBatch: ", stringify!(#ty))); },
+            _ => {
+                quote! { compile_error!(concat!("Unsupported type for FromRecordBatch: ", stringify!(#ty))); }
+            }
         }
     } else {
         quote! { compile_error!("Unsupported type for FromRecordBatch"); }
@@ -253,11 +247,7 @@ fn build_primitive_extraction(
     }
 }
 
-fn build_option_extraction(
-    ident: &Ident,
-    inner_ty: &Type,
-    column_name: &str,
-) -> TokenStream {
+fn build_option_extraction(ident: &Ident, inner_ty: &Type, column_name: &str) -> TokenStream {
     if let Type::Path(type_path) = inner_ty {
         let type_str = type_path
             .path
@@ -297,11 +287,7 @@ fn build_option_extraction(
     }
 }
 
-fn build_option_primitive(
-    ident: &Ident,
-    column_name: &str,
-    array_type: &str,
-) -> TokenStream {
+fn build_option_primitive(ident: &Ident, column_name: &str, array_type: &str) -> TokenStream {
     let array_ident = syn::Ident::new(array_type, proc_macro2::Span::call_site());
     quote! {
         let col_idx = batch.schema().index_of(#column_name)

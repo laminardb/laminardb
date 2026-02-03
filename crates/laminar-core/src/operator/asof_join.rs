@@ -544,9 +544,11 @@ impl AsofJoinOperator {
         let mut output = OutputVec::new();
 
         // Extract join key
-        let Some(key_value) =
-            Self::extract_key(&event.data, &self.config.key_column, &mut self.left_key_index)
-        else {
+        let Some(key_value) = Self::extract_key(
+            &event.data,
+            &self.config.key_column,
+            &mut self.left_key_index,
+        ) else {
             return output;
         };
 
@@ -592,9 +594,11 @@ impl AsofJoinOperator {
         let output = OutputVec::new();
 
         // Extract join key
-        let Some(key_value) =
-            Self::extract_key(&event.data, &self.config.key_column, &mut self.right_key_index)
-        else {
+        let Some(key_value) = Self::extract_key(
+            &event.data,
+            &self.config.key_column,
+            &mut self.right_key_index,
+        ) else {
             return output;
         };
 

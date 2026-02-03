@@ -92,10 +92,7 @@ impl AvroDeserializer {
     /// # Errors
     ///
     /// Returns `SerdeError` if the schema cannot be fetched or registered.
-    pub async fn ensure_schema_registered(
-        &mut self,
-        schema_id: i32,
-    ) -> Result<(), SerdeError> {
+    pub async fn ensure_schema_registered(&mut self, schema_id: i32) -> Result<(), SerdeError> {
         if self.known_ids.contains(&schema_id) {
             return Ok(());
         }
@@ -112,9 +109,7 @@ impl AvroDeserializer {
             .resolve_confluent_id(schema_id)
             .await
             .map_err(|e| {
-                SerdeError::MalformedInput(format!(
-                    "failed to fetch schema ID {schema_id}: {e}"
-                ))
+                SerdeError::MalformedInput(format!("failed to fetch schema ID {schema_id}: {e}"))
             })?;
 
         self.register_schema(schema_id, &cached.schema_str)?;
@@ -163,9 +158,9 @@ impl RecordDeserializer for AvroDeserializer {
         for record in records {
             let mut offset = 0;
             while offset < record.len() {
-                let consumed = decoder.decode(&record[offset..]).map_err(|e| {
-                    SerdeError::MalformedInput(format!("Avro decode error: {e}"))
-                })?;
+                let consumed = decoder
+                    .decode(&record[offset..])
+                    .map_err(|e| SerdeError::MalformedInput(format!("Avro decode error: {e}")))?;
                 if consumed == 0 {
                     break;
                 }

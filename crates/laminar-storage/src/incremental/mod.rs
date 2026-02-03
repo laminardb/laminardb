@@ -71,4 +71,6 @@ mod recovery;
 pub use changelog::{ChangelogEntryBuilder, StateChangelogBuffer, StateChangelogEntry, StateOp};
 pub use error::IncrementalCheckpointError;
 pub use manager::{CheckpointConfig, IncrementalCheckpointManager, IncrementalCheckpointMetadata};
-pub use recovery::{validate_checkpoint, wal_size, RecoveredState, RecoveryConfig, RecoveryManager};
+pub use recovery::{
+    validate_checkpoint, wal_size, RecoveredState, RecoveryConfig, RecoveryManager,
+};

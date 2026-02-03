@@ -7,10 +7,10 @@ use criterion::{criterion_group, criterion_main, BenchmarkId, Criterion, Through
 use laminar_core::operator::{
     Event, Operator, OperatorContext, OperatorError, OperatorState, Output, Timer,
 };
-use laminar_core::{ReactorConfig, Reactor};
+use laminar_core::{Reactor, ReactorConfig};
+use smallvec::SmallVec;
 use std::hint::black_box;
 use std::sync::Arc;
-use smallvec::SmallVec;
 
 /// A simple passthrough operator for benchmarking
 struct PassthroughOperator;
@@ -89,7 +89,8 @@ fn bench_reactor_throughput(c: &mut Criterion) {
                 let mut reactor = Reactor::new(ReactorConfig {
                     batch_size,
                     ..Default::default()
-                }).unwrap();
+                })
+                .unwrap();
                 reactor.add_operator(Box::new(PassthroughOperator));
 
                 // Pre-create events
@@ -122,7 +123,8 @@ fn bench_reactor_events_per_second(c: &mut Criterion) {
             batch_size: 10000,
             event_buffer_size: 100000,
             ..Default::default()
-        }).unwrap();
+        })
+        .unwrap();
         reactor.add_operator(Box::new(PassthroughOperator));
 
         b.iter(|| {

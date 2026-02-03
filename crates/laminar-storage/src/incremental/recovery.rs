@@ -26,7 +26,9 @@ use laminar_core::state::StateSnapshot;
 use tracing::{debug, info, warn};
 
 use super::error::IncrementalCheckpointError;
-use super::manager::{CheckpointConfig, IncrementalCheckpointManager, IncrementalCheckpointMetadata};
+use super::manager::{
+    CheckpointConfig, IncrementalCheckpointManager, IncrementalCheckpointMetadata,
+};
 use crate::wal::{WalEntry, WalReadResult, WriteAheadLog};
 
 /// Result of WAL replay operation.
@@ -246,7 +248,10 @@ impl RecoveryManager {
     }
 
     /// Replays WAL from the given position.
-    fn replay_wal(&self, start_position: u64) -> Result<WalReplayResult, IncrementalCheckpointError> {
+    fn replay_wal(
+        &self,
+        start_position: u64,
+    ) -> Result<WalReplayResult, IncrementalCheckpointError> {
         let mut wal = WriteAheadLog::new(&self.config.wal_path, Duration::from_millis(100))
             .map_err(|e| IncrementalCheckpointError::Wal(e.to_string()))?;
 
@@ -277,10 +282,7 @@ impl RecoveryManager {
 
         loop {
             if result.entries_replayed >= max_entries {
-                debug!(
-                    max_entries,
-                    "Reached max WAL entries limit"
-                );
+                debug!(max_entries, "Reached max WAL entries limit");
                 break;
             }
 
@@ -318,18 +320,11 @@ impl RecoveryManager {
                     break;
                 }
                 Ok(WalReadResult::TornWrite { position, reason }) => {
-                    warn!(
-                        position,
-                        reason,
-                        "Torn write detected, stopping replay"
-                    );
+                    warn!(position, reason, "Torn write detected, stopping replay");
                     break;
                 }
                 Ok(WalReadResult::ChecksumMismatch { position }) => {
-                    warn!(
-                        position,
-                        "CRC mismatch detected, stopping replay"
-                    );
+                    warn!(position, "CRC mismatch detected, stopping replay");
                     break;
                 }
                 Err(e) => {
@@ -366,8 +361,7 @@ impl RecoveryManager {
         checkpoint_dir: &Path,
         wal_path: &Path,
     ) -> Result<RecoveredState, IncrementalCheckpointError> {
-        let config = RecoveryConfig::new(checkpoint_dir, wal_path)
-            .with_collect_state_changes(true);
+        let config = RecoveryConfig::new(checkpoint_dir, wal_path).with_collect_state_changes(true);
         let manager = RecoveryManager::new(config);
         manager.recover()
     }
@@ -378,12 +372,14 @@ impl RecoveryManager {
 /// # Errors
 ///
 /// Returns an error if the checkpoint is invalid.
-pub fn validate_checkpoint(checkpoint_dir: &Path) -> Result<IncrementalCheckpointMetadata, IncrementalCheckpointError> {
+pub fn validate_checkpoint(
+    checkpoint_dir: &Path,
+) -> Result<IncrementalCheckpointMetadata, IncrementalCheckpointError> {
     let metadata_path = checkpoint_dir.join("metadata.json");
 
     if !metadata_path.exists() {
         return Err(IncrementalCheckpointError::NotFound(
-            "metadata.json not found".to_string()
+            "metadata.json not found".to_string(),
         ));
     }
 
@@ -432,13 +428,10 @@ mod tests {
 
     #[test]
     fn test_recovery_config() {
-        let config = RecoveryConfig::new(
-            Path::new("/checkpoints"),
-            Path::new("/wal.log"),
-        )
-        .with_repair_wal(true)
-        .with_collect_state_changes(true)
-        .with_max_wal_entries(1000);
+        let config = RecoveryConfig::new(Path::new("/checkpoints"), Path::new("/wal.log"))
+            .with_repair_wal(true)
+            .with_collect_state_changes(true)
+            .with_max_wal_entries(1000);
 
         assert!(config.repair_wal);
         assert!(config.collect_state_changes);
@@ -480,7 +473,9 @@ mod tests {
         let state_data = StateSnapshot::new(vec![
             (b"key1".to_vec(), b"value1".to_vec()),
             (b"key2".to_vec(), b"value2".to_vec()),
-        ]).to_bytes().unwrap();
+        ])
+        .to_bytes()
+        .unwrap();
 
         let metadata = ckpt_manager
             .create_checkpoint_with_state(500, offsets, Some(5000), &state_data)
@@ -518,26 +513,29 @@ mod tests {
             wal.append(&WalEntry::Put {
                 key: b"key1".to_vec(),
                 value: b"value1".to_vec(),
-            }).unwrap();
+            })
+            .unwrap();
 
             wal.append(&WalEntry::Put {
                 key: b"key2".to_vec(),
                 value: b"value2".to_vec(),
-            }).unwrap();
+            })
+            .unwrap();
 
             let mut offsets = HashMap::new();
             offsets.insert("source1".to_string(), 50);
             wal.append(&WalEntry::Commit {
                 offsets,
                 watermark: Some(1000),
-            }).unwrap();
+            })
+            .unwrap();
 
             wal.sync().unwrap();
         }
 
         // Recover with state changes collection
-        let config = RecoveryConfig::new(&checkpoint_dir, &wal_path)
-            .with_collect_state_changes(true);
+        let config =
+            RecoveryConfig::new(&checkpoint_dir, &wal_path).with_collect_state_changes(true);
         let manager = RecoveryManager::new(config);
 
         let result = manager.recover().unwrap();
@@ -559,9 +557,9 @@ mod tests {
         let mut ckpt_manager = IncrementalCheckpointManager::new(config).unwrap();
         ckpt_manager.set_epoch(10);
 
-        let state_data = StateSnapshot::new(vec![
-            (b"key1".to_vec(), b"value1".to_vec()),
-        ]).to_bytes().unwrap();
+        let state_data = StateSnapshot::new(vec![(b"key1".to_vec(), b"value1".to_vec())])
+            .to_bytes()
+            .unwrap();
 
         ckpt_manager
             .create_checkpoint_with_state(0, HashMap::new(), Some(1000), &state_data)
@@ -575,25 +573,28 @@ mod tests {
             wal.append(&WalEntry::Put {
                 key: b"key2".to_vec(),
                 value: b"value2".to_vec(),
-            }).unwrap();
+            })
+            .unwrap();
 
             wal.append(&WalEntry::Delete {
                 key: b"key1".to_vec(),
-            }).unwrap();
+            })
+            .unwrap();
 
             let mut offsets = HashMap::new();
             offsets.insert("source1".to_string(), 100);
             wal.append(&WalEntry::Commit {
                 offsets,
                 watermark: Some(2000),
-            }).unwrap();
+            })
+            .unwrap();
 
             wal.sync().unwrap();
         }
 
         // Recover
-        let recovery_config = RecoveryConfig::new(&checkpoint_dir, &wal_path)
-            .with_collect_state_changes(true);
+        let recovery_config =
+            RecoveryConfig::new(&checkpoint_dir, &wal_path).with_collect_state_changes(true);
         let recovery_manager = RecoveryManager::new(recovery_config);
 
         let result = recovery_manager.recover().unwrap();
@@ -615,9 +616,9 @@ mod tests {
         let mut manager = IncrementalCheckpointManager::new(config).unwrap();
         manager.set_epoch(5);
 
-        let state_data = StateSnapshot::new(vec![
-            (b"key".to_vec(), b"value".to_vec()),
-        ]).to_bytes().unwrap();
+        let state_data = StateSnapshot::new(vec![(b"key".to_vec(), b"value".to_vec())])
+            .to_bytes()
+            .unwrap();
 
         let metadata = manager
             .create_checkpoint_with_state(100, HashMap::new(), None, &state_data)
@@ -644,7 +645,8 @@ mod tests {
             wal.append(&WalEntry::Put {
                 key: b"key".to_vec(),
                 value: b"value".to_vec(),
-            }).unwrap();
+            })
+            .unwrap();
             wal.sync().unwrap();
         }
 
@@ -669,14 +671,14 @@ mod tests {
                 wal.append(&WalEntry::Put {
                     key: format!("key{i}").into_bytes(),
                     value: format!("value{i}").into_bytes(),
-                }).unwrap();
+                })
+                .unwrap();
             }
             wal.sync().unwrap();
         }
 
         // Recover with limit
-        let config = RecoveryConfig::new(&checkpoint_dir, &wal_path)
-            .with_max_wal_entries(10);
+        let config = RecoveryConfig::new(&checkpoint_dir, &wal_path).with_max_wal_entries(10);
         let manager = RecoveryManager::new(config);
 
         let result = manager.recover().unwrap();

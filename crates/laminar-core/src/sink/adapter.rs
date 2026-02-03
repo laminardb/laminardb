@@ -205,14 +205,12 @@ impl<E: ExactlyOnceSink> ExactlyOnceSinkAdapter<E> {
 
         if let Some(bytes) = checkpoint.get_metadata("committed_epochs") {
             if bytes.len() >= 8 {
-                self.stats.committed_epochs =
-                    u64::from_le_bytes(bytes[0..8].try_into().unwrap());
+                self.stats.committed_epochs = u64::from_le_bytes(bytes[0..8].try_into().unwrap());
             }
         }
         if let Some(bytes) = checkpoint.get_metadata("total_outputs") {
             if bytes.len() >= 8 {
-                self.stats.total_outputs =
-                    u64::from_le_bytes(bytes[0..8].try_into().unwrap());
+                self.stats.total_outputs = u64::from_le_bytes(bytes[0..8].try_into().unwrap());
             }
         }
 
@@ -272,8 +270,8 @@ mod tests {
     use super::*;
     use crate::operator::Event;
     use crate::reactor::{BufferingSink, Sink as ReactorSink};
-    use crate::sink::transactional::TransactionalSink;
     use crate::sink::idempotent::IdempotentSink;
+    use crate::sink::transactional::TransactionalSink;
     use crate::sink::InMemoryDedup;
     use arrow_array::{Int64Array, RecordBatch};
     use std::sync::Arc;
@@ -424,8 +422,7 @@ mod tests {
     fn test_compose_with_idempotent_sink() {
         let inner_sink = BufferingSink::new();
         let dedup = InMemoryDedup::new(1000);
-        let idem_sink = IdempotentSink::new(inner_sink, dedup)
-            .with_sink_id("idem-sink");
+        let idem_sink = IdempotentSink::new(inner_sink, dedup).with_sink_id("idem-sink");
         let mut adapter = ExactlyOnceSinkAdapter::new(idem_sink);
 
         let event = make_event(1000, 42);

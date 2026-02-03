@@ -113,7 +113,8 @@ pub fn infer_schema_from_samples(
             "cannot infer schema from raw format".to_string(),
         )),
         Format::Avro => Err(ConnectorError::ConfigurationError(
-            "Avro schema discovery not supported - Avro schemas are embedded in the data".to_string(),
+            "Avro schema discovery not supported - Avro schemas are embedded in the data"
+                .to_string(),
         )),
     }
 }
@@ -183,18 +184,20 @@ fn infer_schema_from_csv(
     hints: &SchemaDiscoveryHints,
 ) -> Result<SchemaRef, ConnectorError> {
     // For CSV, first line is typically headers
-    let first_sample = samples.first().ok_or_else(|| {
-        ConnectorError::ConfigurationError("no samples provided".to_string())
-    })?;
+    let first_sample = samples
+        .first()
+        .ok_or_else(|| ConnectorError::ConfigurationError("no samples provided".to_string()))?;
 
     let first_line = std::str::from_utf8(first_sample)
         .map_err(|e| ConnectorError::ConfigurationError(format!("invalid UTF-8 in CSV: {e}")))?;
 
     // Parse headers (or use hints)
-    let headers: Vec<String> = hints
-        .field_names
-        .clone()
-        .unwrap_or_else(|| first_line.split(',').map(|s| s.trim().to_string()).collect());
+    let headers: Vec<String> = hints.field_names.clone().unwrap_or_else(|| {
+        first_line
+            .split(',')
+            .map(|s| s.trim().to_string())
+            .collect()
+    });
 
     // Analyze remaining samples to infer types
     let mut field_types: HashMap<String, Vec<InferredType>> = HashMap::new();
@@ -203,8 +206,9 @@ fn infer_schema_from_csv(
     }
 
     for sample in samples.iter().skip(1) {
-        let line = std::str::from_utf8(sample)
-            .map_err(|e| ConnectorError::ConfigurationError(format!("invalid UTF-8 in CSV: {e}")))?;
+        let line = std::str::from_utf8(sample).map_err(|e| {
+            ConnectorError::ConfigurationError(format!("invalid UTF-8 in CSV: {e}"))
+        })?;
 
         let values: Vec<&str> = line.split(',').map(str::trim).collect();
 
@@ -252,7 +256,10 @@ enum InferredType {
     Array,
 }
 
-fn infer_type_from_json_value(value: &serde_json::Value, hints: &SchemaDiscoveryHints) -> InferredType {
+fn infer_type_from_json_value(
+    value: &serde_json::Value,
+    hints: &SchemaDiscoveryHints,
+) -> InferredType {
     match value {
         serde_json::Value::Null => InferredType::Null,
         serde_json::Value::Bool(_) => InferredType::Bool,
@@ -341,10 +348,9 @@ fn inferred_to_arrow(inferred: &InferredType, _hints: &SchemaDiscoveryHints) -> 
         InferredType::Int => DataType::Int64,
         InferredType::Float => DataType::Float64,
         // Null, String, Object, Array all map to Utf8
-        InferredType::Null
-        | InferredType::String
-        | InferredType::Object
-        | InferredType::Array => DataType::Utf8,
+        InferredType::Null | InferredType::String | InferredType::Object | InferredType::Array => {
+            DataType::Utf8
+        }
     }
 }
 
@@ -360,7 +366,9 @@ mod tests {
             .prefer_larger_types();
 
         assert_eq!(hints.type_hints.get("id"), Some(&DataType::Int32));
-        assert!(hints.nullable_fields.contains(&"optional_field".to_string()));
+        assert!(hints
+            .nullable_fields
+            .contains(&"optional_field".to_string()));
         assert!(hints.prefer_larger_types);
     }
 
@@ -371,7 +379,9 @@ mod tests {
             br#"{"id": 2, "name": "Bob"}"#,
         ];
 
-        let schema = infer_schema_from_samples(&samples, Format::Json, &SchemaDiscoveryHints::new()).unwrap();
+        let schema =
+            infer_schema_from_samples(&samples, Format::Json, &SchemaDiscoveryHints::new())
+                .unwrap();
 
         assert_eq!(schema.fields().len(), 2);
         assert!(schema.field_with_name("id").is_ok());
@@ -380,26 +390,38 @@ mod tests {
 
     #[test]
     fn test_infer_json_types() {
-        let samples: Vec<&[u8]> = vec![
-            br#"{"int": 42, "float": 3.14, "bool": true, "str": "hello"}"#,
-        ];
+        let samples: Vec<&[u8]> =
+            vec![br#"{"int": 42, "float": 3.14, "bool": true, "str": "hello"}"#];
 
-        let schema = infer_schema_from_samples(&samples, Format::Json, &SchemaDiscoveryHints::new()).unwrap();
+        let schema =
+            infer_schema_from_samples(&samples, Format::Json, &SchemaDiscoveryHints::new())
+                .unwrap();
 
-        assert_eq!(schema.field_with_name("int").unwrap().data_type(), &DataType::Int64);
-        assert_eq!(schema.field_with_name("float").unwrap().data_type(), &DataType::Float64);
-        assert_eq!(schema.field_with_name("bool").unwrap().data_type(), &DataType::Boolean);
-        assert_eq!(schema.field_with_name("str").unwrap().data_type(), &DataType::Utf8);
+        assert_eq!(
+            schema.field_with_name("int").unwrap().data_type(),
+            &DataType::Int64
+        );
+        assert_eq!(
+            schema.field_with_name("float").unwrap().data_type(),
+            &DataType::Float64
+        );
+        assert_eq!(
+            schema.field_with_name("bool").unwrap().data_type(),
+            &DataType::Boolean
+        );
+        assert_eq!(
+            schema.field_with_name("str").unwrap().data_type(),
+            &DataType::Utf8
+        );
     }
 
     #[test]
     fn test_infer_json_nullable() {
-        let samples: Vec<&[u8]> = vec![
-            br#"{"value": 1}"#,
-            br#"{"value": null}"#,
-        ];
+        let samples: Vec<&[u8]> = vec![br#"{"value": 1}"#, br#"{"value": null}"#];
 
-        let schema = infer_schema_from_samples(&samples, Format::Json, &SchemaDiscoveryHints::new()).unwrap();
+        let schema =
+            infer_schema_from_samples(&samples, Format::Json, &SchemaDiscoveryHints::new())
+                .unwrap();
 
         assert!(schema.field_with_name("value").unwrap().is_nullable());
     }
@@ -411,18 +433,18 @@ mod tests {
         let hints = SchemaDiscoveryHints::new().with_type_hint("id", DataType::Int32);
         let schema = infer_schema_from_samples(&samples, Format::Json, &hints).unwrap();
 
-        assert_eq!(schema.field_with_name("id").unwrap().data_type(), &DataType::Int32);
+        assert_eq!(
+            schema.field_with_name("id").unwrap().data_type(),
+            &DataType::Int32
+        );
     }
 
     #[test]
     fn test_infer_csv_basic() {
-        let samples: Vec<&[u8]> = vec![
-            b"id,name,age",
-            b"1,Alice,30",
-            b"2,Bob,25",
-        ];
+        let samples: Vec<&[u8]> = vec![b"id,name,age", b"1,Alice,30", b"2,Bob,25"];
 
-        let schema = infer_schema_from_samples(&samples, Format::Csv, &SchemaDiscoveryHints::new()).unwrap();
+        let schema =
+            infer_schema_from_samples(&samples, Format::Csv, &SchemaDiscoveryHints::new()).unwrap();
 
         assert_eq!(schema.fields().len(), 3);
         assert!(schema.field_with_name("id").is_ok());
@@ -438,18 +460,32 @@ mod tests {
             b"100,2.71,false,world",
         ];
 
-        let schema = infer_schema_from_samples(&samples, Format::Csv, &SchemaDiscoveryHints::new()).unwrap();
+        let schema =
+            infer_schema_from_samples(&samples, Format::Csv, &SchemaDiscoveryHints::new()).unwrap();
 
-        assert_eq!(schema.field_with_name("int_col").unwrap().data_type(), &DataType::Int64);
-        assert_eq!(schema.field_with_name("float_col").unwrap().data_type(), &DataType::Float64);
-        assert_eq!(schema.field_with_name("bool_col").unwrap().data_type(), &DataType::Boolean);
-        assert_eq!(schema.field_with_name("str_col").unwrap().data_type(), &DataType::Utf8);
+        assert_eq!(
+            schema.field_with_name("int_col").unwrap().data_type(),
+            &DataType::Int64
+        );
+        assert_eq!(
+            schema.field_with_name("float_col").unwrap().data_type(),
+            &DataType::Float64
+        );
+        assert_eq!(
+            schema.field_with_name("bool_col").unwrap().data_type(),
+            &DataType::Boolean
+        );
+        assert_eq!(
+            schema.field_with_name("str_col").unwrap().data_type(),
+            &DataType::Utf8
+        );
     }
 
     #[test]
     fn test_infer_empty_samples_error() {
         let samples: Vec<&[u8]> = vec![];
-        let result = infer_schema_from_samples(&samples, Format::Json, &SchemaDiscoveryHints::new());
+        let result =
+            infer_schema_from_samples(&samples, Format::Json, &SchemaDiscoveryHints::new());
         assert!(result.is_err());
     }
 
@@ -462,25 +498,25 @@ mod tests {
 
     #[test]
     fn test_infer_mixed_int_float() {
-        let samples: Vec<&[u8]> = vec![
-            br#"{"value": 1}"#,
-            br#"{"value": 2.5}"#,
-        ];
+        let samples: Vec<&[u8]> = vec![br#"{"value": 1}"#, br#"{"value": 2.5}"#];
 
-        let schema = infer_schema_from_samples(&samples, Format::Json, &SchemaDiscoveryHints::new()).unwrap();
+        let schema =
+            infer_schema_from_samples(&samples, Format::Json, &SchemaDiscoveryHints::new())
+                .unwrap();
 
         // Should promote to float
-        assert_eq!(schema.field_with_name("value").unwrap().data_type(), &DataType::Float64);
+        assert_eq!(
+            schema.field_with_name("value").unwrap().data_type(),
+            &DataType::Float64
+        );
     }
 
     #[test]
     fn test_infer_with_field_names_hint() {
-        let samples: Vec<&[u8]> = vec![
-            br#"{"a": 1, "b": 2, "c": 3}"#,
-        ];
+        let samples: Vec<&[u8]> = vec![br#"{"a": 1, "b": 2, "c": 3}"#];
 
-        let hints = SchemaDiscoveryHints::new()
-            .with_field_names(vec!["c".to_string(), "a".to_string()]);
+        let hints =
+            SchemaDiscoveryHints::new().with_field_names(vec!["c".to_string(), "a".to_string()]);
 
         let schema = infer_schema_from_samples(&samples, Format::Json, &hints).unwrap();
 
@@ -492,10 +528,7 @@ mod tests {
 
     #[test]
     fn test_empty_as_null_hint() {
-        let samples: Vec<&[u8]> = vec![
-            br#"{"value": ""}"#,
-            br#"{"value": "text"}"#,
-        ];
+        let samples: Vec<&[u8]> = vec![br#"{"value": ""}"#, br#"{"value": "text"}"#];
 
         let hints = SchemaDiscoveryHints::new().empty_as_null();
         let schema = infer_schema_from_samples(&samples, Format::Json, &hints).unwrap();

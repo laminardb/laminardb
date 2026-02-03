@@ -243,17 +243,17 @@ impl StreamingPlanner {
                 let window_function = Self::extract_window_from_select(select);
 
                 // Check for joins
-                let join_analysis = analyze_join(select)
-                    .map_err(|e| PlanningError::InvalidQuery(format!("Join analysis failed: {e}")))?;
+                let join_analysis = analyze_join(select).map_err(|e| {
+                    PlanningError::InvalidQuery(format!("Join analysis failed: {e}"))
+                })?;
 
                 // Check for ORDER BY
                 let order_analysis = analyze_order_by(stmt);
                 let order_config = OrderOperatorConfig::from_analysis(&order_analysis)
                     .map_err(PlanningError::InvalidQuery)?;
 
-                let has_streaming_features = window_function.is_some()
-                    || join_analysis.is_some()
-                    || order_config.is_some();
+                let has_streaming_features =
+                    window_function.is_some() || join_analysis.is_some() || order_config.is_some();
 
                 if has_streaming_features {
                     let window_config = match window_function {
@@ -307,9 +307,9 @@ impl StreamingPlanner {
                 }
 
                 // Extract join info
-                if let Some(join) = analyze_join(select)
-                    .map_err(|e| PlanningError::InvalidQuery(format!("Join analysis failed: {e}")))?
-                {
+                if let Some(join) = analyze_join(select).map_err(|e| {
+                    PlanningError::InvalidQuery(format!("Join analysis failed: {e}"))
+                })? {
                     analysis.join_config = Some(JoinOperatorConfig::from_analysis(&join));
                 }
             }
@@ -501,10 +501,9 @@ mod tests {
         planner.plan(&statements[0]).unwrap();
 
         // IF NOT EXISTS should succeed
-        let statements = StreamingParser::parse_sql(
-            "CREATE SOURCE IF NOT EXISTS events (id INT, name VARCHAR)",
-        )
-        .unwrap();
+        let statements =
+            StreamingParser::parse_sql("CREATE SOURCE IF NOT EXISTS events (id INT, name VARCHAR)")
+                .unwrap();
         let result = planner.plan(&statements[0]);
         assert!(result.is_ok());
     }

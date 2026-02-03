@@ -114,9 +114,7 @@ impl RecordSerializer for RawBytesSerializer {
             .as_any()
             .downcast_ref::<StringArray>()
             .ok_or_else(|| {
-                SerdeError::UnsupportedFormat(
-                    "raw serializer expects Utf8 column".into(),
-                )
+                SerdeError::UnsupportedFormat("raw serializer expects Utf8 column".into())
             })?;
 
         let mut records = Vec::with_capacity(batch.num_rows());

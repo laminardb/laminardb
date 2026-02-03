@@ -144,10 +144,7 @@ impl PerCoreRecoveryManager {
             let path = self.wal_config.segment_path(core_id);
 
             if path.exists() {
-                let start_pos = starting_positions
-                    .get(core_id)
-                    .copied()
-                    .unwrap_or(0);
+                let start_pos = starting_positions.get(core_id).copied().unwrap_or(0);
 
                 let mut reader = PerCoreWalReader::open_from(core_id, &path, start_pos)?;
                 let entries = reader.read_all()?;
@@ -332,7 +329,8 @@ mod tests {
             let wal_config = PerCoreWalConfig::new(&wal_dir, 2);
             let wal_manager = PerCoreWalManager::new(wal_config).unwrap();
             let checkpoint_config = CheckpointConfig::new(&checkpoint_dir).with_wal_path(&wal_dir);
-            let mut coordinator = CheckpointCoordinator::new(wal_manager, checkpoint_config).unwrap();
+            let mut coordinator =
+                CheckpointCoordinator::new(wal_manager, checkpoint_config).unwrap();
 
             coordinator.wal_manager_mut().set_epoch_all(1);
             coordinator
@@ -475,7 +473,8 @@ mod tests {
             let wal_config = PerCoreWalConfig::new(&wal_dir, 2);
             let wal_manager = PerCoreWalManager::new(wal_config).unwrap();
             let checkpoint_config = CheckpointConfig::new(&checkpoint_dir).with_wal_path(&wal_dir);
-            let mut coordinator = CheckpointCoordinator::new(wal_manager, checkpoint_config).unwrap();
+            let mut coordinator =
+                CheckpointCoordinator::new(wal_manager, checkpoint_config).unwrap();
             coordinator.create_checkpoint(1).unwrap();
         }
 

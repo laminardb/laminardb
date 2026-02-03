@@ -18,36 +18,36 @@
 //! - [`ChangeEvent`] — Rich change event with Arrow data for Ring 1 delivery
 //! - [`ChangeEventBatch`] — Coalesced batch of change events
 
-mod event;
-mod notification;
-mod registry;
-mod dispatcher;
-mod handle;
-mod callback;
-mod stream;
 mod backpressure;
 mod batcher;
+mod callback;
+mod dispatcher;
+mod event;
 mod filter;
+mod handle;
+mod notification;
+mod registry;
+mod stream;
 
+pub use backpressure::{BackpressureController, DemandBackpressure, DemandHandle};
+pub use batcher::{BatchConfig, NotificationBatcher};
+pub use callback::{
+    subscribe_callback, subscribe_fn, CallbackSubscriptionHandle, SubscriptionCallback,
+};
+pub use dispatcher::{
+    DispatcherConfig, DispatcherMetrics, NotificationDataSource, SubscriptionDispatcher,
+};
 pub use event::{ChangeEvent, ChangeEventBatch, EventType, NotificationRef};
+pub use filter::{
+    compile_filter, FilterCompileError, Ring0Predicate, Ring1Predicate, ScalarValue,
+    StringInternTable, SubscriptionFilter,
+};
+pub use handle::{PushSubscription, PushSubscriptionError};
 pub use notification::{NotificationHub, NotificationRing, NotificationSlot};
 pub use registry::{
     BackpressureStrategy, SubscriptionConfig, SubscriptionEntry, SubscriptionId,
     SubscriptionMetrics, SubscriptionRegistry, SubscriptionState,
 };
-pub use dispatcher::{
-    DispatcherConfig, DispatcherMetrics, NotificationDataSource, SubscriptionDispatcher,
-};
-pub use handle::{PushSubscription, PushSubscriptionError};
-pub use callback::{
-    subscribe_callback, subscribe_fn, CallbackSubscriptionHandle, SubscriptionCallback,
-};
 pub use stream::{
     subscribe_stream, subscribe_stream_with_errors, ChangeEventResultStream, ChangeEventStream,
-};
-pub use backpressure::{BackpressureController, DemandBackpressure, DemandHandle};
-pub use batcher::{BatchConfig, NotificationBatcher};
-pub use filter::{
-    compile_filter, FilterCompileError, Ring0Predicate, Ring1Predicate, ScalarValue,
-    StringInternTable, SubscriptionFilter,
 };

@@ -76,10 +76,7 @@ impl KafkaSourceMetrics {
             "kafka.batches_polled",
             self.batches_polled.load(Ordering::Relaxed) as f64,
         );
-        m.add_custom(
-            "kafka.commits",
-            self.commits.load(Ordering::Relaxed) as f64,
-        );
+        m.add_custom("kafka.commits", self.commits.load(Ordering::Relaxed) as f64);
         m.add_custom(
             "kafka.rebalances",
             self.rebalances.load(Ordering::Relaxed) as f64,

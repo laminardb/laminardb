@@ -836,9 +836,7 @@ mod tests {
 
         // Submit some events
         for i in 0..5 {
-            reactor
-                .submit(Event::new(i * 1000, batch.clone()))
-                .unwrap();
+            reactor.submit(Event::new(i * 1000, batch.clone())).unwrap();
         }
 
         // Shutdown should process remaining events

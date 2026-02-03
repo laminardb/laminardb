@@ -219,10 +219,7 @@ impl SubscriptionDispatcher {
     /// Drains all notification rings and dispatches events.
     ///
     /// Returns the total number of notifications drained.
-    pub fn drain_and_dispatch(
-        &self,
-        batch_buffer: &mut Vec<(u32, Vec<NotificationRef>)>,
-    ) -> usize {
+    pub fn drain_and_dispatch(&self, batch_buffer: &mut Vec<(u32, Vec<NotificationRef>)>) -> usize {
         batch_buffer.clear();
         let mut total_drained: usize = 0;
 
@@ -514,12 +511,7 @@ mod tests {
         let registry = Arc::new(SubscriptionRegistry::new());
         // No subscriptions registered
         let ds = Arc::new(MockDataSource) as Arc<dyn NotificationDataSource>;
-        let dispatcher = make_dispatcher(
-            vec![ring],
-            registry,
-            ds,
-            DispatcherConfig::default(),
-        );
+        let dispatcher = make_dispatcher(vec![ring], registry, ds, DispatcherConfig::default());
 
         let mut buf = Vec::new();
         let drained = dispatcher.drain_and_dispatch(&mut buf);
@@ -648,13 +640,7 @@ mod tests {
         cfg.idle_sleep = Duration::from_millis(1); // fast idle for test
         cfg.spin_iterations = 0;
 
-        let dispatcher = SubscriptionDispatcher::new(
-            vec![ring],
-            registry,
-            ds,
-            cfg,
-            shutdown_rx,
-        );
+        let dispatcher = SubscriptionDispatcher::new(vec![ring], registry, ds, cfg, shutdown_rx);
 
         let metrics = Arc::clone(dispatcher.metrics());
 
@@ -682,7 +668,8 @@ mod tests {
         let source_id = hub.register_source().unwrap();
 
         let registry = Arc::new(SubscriptionRegistry::new());
-        let (_, mut rx) = registry.create("mv_orders".into(), source_id, SubscriptionConfig::default());
+        let (_, mut rx) =
+            registry.create("mv_orders".into(), source_id, SubscriptionConfig::default());
 
         // Notify through the hub
         hub.notify_source(source_id, EventType::Insert, 10, 5000, 0);

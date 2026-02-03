@@ -127,9 +127,7 @@ impl SimpleRingHandler {
     /// Get total completions collected.
     #[must_use]
     pub fn total_completions(&self) -> usize {
-        self.latency_completions.len()
-            + self.main_completions.len()
-            + self.poll_completions.len()
+        self.latency_completions.len() + self.main_completions.len() + self.poll_completions.len()
     }
 
     /// Request shutdown.

@@ -58,9 +58,7 @@ impl ConnectorRegistry {
         info: ConnectorInfo,
         factory: SourceFactory,
     ) {
-        self.sources
-            .write()
-            .insert(name.into(), (info, factory));
+        self.sources.write().insert(name.into(), (info, factory));
     }
 
     /// Registers a sink connector factory.
@@ -70,9 +68,7 @@ impl ConnectorRegistry {
         info: ConnectorInfo,
         factory: SinkFactory,
     ) {
-        self.sinks
-            .write()
-            .insert(name.into(), (info, factory));
+        self.sinks.write().insert(name.into(), (info, factory));
     }
 
     /// Creates a new source connector instance.
@@ -88,14 +84,12 @@ impl ConnectorRegistry {
         config: &ConnectorConfig,
     ) -> Result<Box<dyn SourceConnector>, ConnectorError> {
         let sources = self.sources.read();
-        let (_, factory) = sources
-            .get(config.connector_type())
-            .ok_or_else(|| {
-                ConnectorError::ConfigurationError(format!(
-                    "unknown source connector type: '{}'",
-                    config.connector_type()
-                ))
-            })?;
+        let (_, factory) = sources.get(config.connector_type()).ok_or_else(|| {
+            ConnectorError::ConfigurationError(format!(
+                "unknown source connector type: '{}'",
+                config.connector_type()
+            ))
+        })?;
         Ok(factory())
     }
 
@@ -112,14 +106,12 @@ impl ConnectorRegistry {
         config: &ConnectorConfig,
     ) -> Result<Box<dyn SinkConnector>, ConnectorError> {
         let sinks = self.sinks.read();
-        let (_, factory) = sinks
-            .get(config.connector_type())
-            .ok_or_else(|| {
-                ConnectorError::ConfigurationError(format!(
-                    "unknown sink connector type: '{}'",
-                    config.connector_type()
-                ))
-            })?;
+        let (_, factory) = sinks.get(config.connector_type()).ok_or_else(|| {
+            ConnectorError::ConfigurationError(format!(
+                "unknown sink connector type: '{}'",
+                config.connector_type()
+            ))
+        })?;
         Ok(factory())
     }
 

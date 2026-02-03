@@ -120,31 +120,23 @@ impl DeltaLakeSinkConfig {
         }
         if let Some(v) = config.get("target.file.size") {
             cfg.target_file_size = v.parse().map_err(|_| {
-                ConnectorError::ConfigurationError(format!(
-                    "invalid target.file.size: '{v}'"
-                ))
+                ConnectorError::ConfigurationError(format!("invalid target.file.size: '{v}'"))
             })?;
         }
         if let Some(v) = config.get("max.buffer.records") {
             cfg.max_buffer_records = v.parse().map_err(|_| {
-                ConnectorError::ConfigurationError(format!(
-                    "invalid max.buffer.records: '{v}'"
-                ))
+                ConnectorError::ConfigurationError(format!("invalid max.buffer.records: '{v}'"))
             })?;
         }
         if let Some(v) = config.get("max.buffer.duration.ms") {
             let ms: u64 = v.parse().map_err(|_| {
-                ConnectorError::ConfigurationError(format!(
-                    "invalid max.buffer.duration.ms: '{v}'"
-                ))
+                ConnectorError::ConfigurationError(format!("invalid max.buffer.duration.ms: '{v}'"))
             })?;
             cfg.max_buffer_duration = Duration::from_millis(ms);
         }
         if let Some(v) = config.get("checkpoint.interval") {
             cfg.checkpoint_interval = v.parse().map_err(|_| {
-                ConnectorError::ConfigurationError(format!(
-                    "invalid checkpoint.interval: '{v}'"
-                ))
+                ConnectorError::ConfigurationError(format!("invalid checkpoint.interval: '{v}'"))
             })?;
         }
         if let Some(v) = config.get("schema.evolution") {
@@ -184,16 +176,12 @@ impl DeltaLakeSinkConfig {
         }
         if let Some(v) = config.get("compaction.min-files") {
             cfg.compaction.min_files_for_compaction = v.parse().map_err(|_| {
-                ConnectorError::ConfigurationError(format!(
-                    "invalid compaction.min-files: '{v}'"
-                ))
+                ConnectorError::ConfigurationError(format!("invalid compaction.min-files: '{v}'"))
             })?;
         }
         if let Some(v) = config.get("vacuum.retention.hours") {
             let hours: u64 = v.parse().map_err(|_| {
-                ConnectorError::ConfigurationError(format!(
-                    "invalid vacuum.retention.hours: '{v}'"
-                ))
+                ConnectorError::ConfigurationError(format!("invalid vacuum.retention.hours: '{v}'"))
             })?;
             cfg.vacuum_retention = Duration::from_secs(hours * 3600);
         }
@@ -225,8 +213,7 @@ impl DeltaLakeSinkConfig {
         if self.table_path.is_empty() {
             return Err(ConnectorError::MissingConfig("table.path".into()));
         }
-        if self.write_mode == DeltaWriteMode::Upsert && self.merge_key_columns.is_empty()
-        {
+        if self.write_mode == DeltaWriteMode::Upsert && self.merge_key_columns.is_empty() {
             return Err(ConnectorError::ConfigurationError(
                 "upsert mode requires 'merge.key.columns' to be set".into(),
             ));
@@ -431,10 +418,7 @@ mod tests {
         assert_eq!(cfg.checkpoint_interval, 20);
         assert!(cfg.schema_evolution);
         assert_eq!(cfg.write_mode, DeltaWriteMode::Upsert);
-        assert_eq!(
-            cfg.merge_key_columns,
-            vec!["customer_id", "order_id"]
-        );
+        assert_eq!(cfg.merge_key_columns, vec!["customer_id", "order_id"]);
         assert_eq!(cfg.delivery_guarantee, DeliveryGuarantee::AtLeastOnce);
         assert!(cfg.compaction.enabled);
         assert_eq!(
@@ -524,7 +508,9 @@ mod tests {
         assert_eq!(cfg.storage_options.len(), 2);
         assert!(cfg.storage_options.contains_key("aws_access_key_id"));
         assert!(cfg.storage_options.contains_key("aws_secret_access_key"));
-        assert!(!cfg.storage_options.contains_key("storage.aws_access_key_id"));
+        assert!(!cfg
+            .storage_options
+            .contains_key("storage.aws_access_key_id"));
     }
 
     #[test]
@@ -601,14 +587,8 @@ mod tests {
 
     #[test]
     fn test_delivery_guarantee_display() {
-        assert_eq!(
-            DeliveryGuarantee::AtLeastOnce.to_string(),
-            "at-least-once"
-        );
-        assert_eq!(
-            DeliveryGuarantee::ExactlyOnce.to_string(),
-            "exactly-once"
-        );
+        assert_eq!(DeliveryGuarantee::AtLeastOnce.to_string(), "at-least-once");
+        assert_eq!(DeliveryGuarantee::ExactlyOnce.to_string(), "exactly-once");
     }
 
     #[test]
@@ -683,10 +663,7 @@ mod tests {
         let result = DeltaLakeSinkConfig::from_config(&config);
         assert!(result.is_err());
         let err = result.unwrap_err().to_string();
-        assert!(
-            err.contains("azure_storage_account_name"),
-            "error: {err}"
-        );
+        assert!(err.contains("azure_storage_account_name"), "error: {err}");
     }
 
     #[test]
@@ -717,8 +694,10 @@ mod tests {
         let mut cfg = DeltaLakeSinkConfig::new("s3://bucket/path");
         cfg.storage_options
             .insert("aws_region".to_string(), "us-east-1".to_string());
-        cfg.storage_options
-            .insert("aws_secret_access_key".to_string(), "TOP_SECRET".to_string());
+        cfg.storage_options.insert(
+            "aws_secret_access_key".to_string(),
+            "TOP_SECRET".to_string(),
+        );
 
         let display = cfg.display_storage_options();
         assert!(display.contains("aws_region=us-east-1"));

@@ -19,18 +19,15 @@ use std::time::Instant;
 
 use arrow_array::{Int64Array, RecordBatch};
 use arrow_schema::{DataType, Field, Schema, SchemaRef};
-use criterion::{
-    criterion_group, criterion_main, BenchmarkId, Criterion, Throughput,
-};
+use criterion::{criterion_group, criterion_main, BenchmarkId, Criterion, Throughput};
 
 use laminar_core::dag::{
-    DagBuilder, DagCheckpointConfig, DagCheckpointCoordinator,
-    DagCheckpointSnapshot, DagExecutor, DagRecoveryManager, MulticastBuffer,
-    NodeId, RoutingTable, SerializableOperatorState, StreamingDag,
+    DagBuilder, DagCheckpointConfig, DagCheckpointCoordinator, DagCheckpointSnapshot, DagExecutor,
+    DagRecoveryManager, MulticastBuffer, NodeId, RoutingTable, SerializableOperatorState,
+    StreamingDag,
 };
 use laminar_core::operator::{
-    Event, Operator, OperatorContext, OperatorError, OperatorState, Output,
-    OutputVec, Timer,
+    Event, Operator, OperatorContext, OperatorError, OperatorState, Output, OutputVec, Timer,
 };
 
 // ---------------------------------------------------------------------------
@@ -66,19 +63,21 @@ impl Operator for PassthroughOperator {
     }
 }
 
-
 // ---------------------------------------------------------------------------
 // Helper functions
 // ---------------------------------------------------------------------------
 
 fn int_schema() -> SchemaRef {
-    Arc::new(Schema::new(vec![Field::new("value", DataType::Int64, false)]))
+    Arc::new(Schema::new(vec![Field::new(
+        "value",
+        DataType::Int64,
+        false,
+    )]))
 }
 
 fn make_event(timestamp: i64) -> Event {
     let array = Arc::new(Int64Array::from(vec![timestamp]));
-    let batch =
-        RecordBatch::try_new(int_schema(), vec![array as _]).unwrap();
+    let batch = RecordBatch::try_new(int_schema(), vec![array as _]).unwrap();
     Event::new(timestamp, batch)
 }
 
@@ -97,7 +96,9 @@ fn build_linear_dag(node_count: usize) -> StreamingDag {
 
     // First operator connects to src
     let first_op = "op_0".to_string();
-    b = b.operator(&first_op, schema.clone()).connect("src", &first_op);
+    b = b
+        .operator(&first_op, schema.clone())
+        .connect("src", &first_op);
 
     // Chain remaining operators
     for i in 1..op_count {
@@ -343,8 +344,7 @@ fn bench_executor_complex_10(c: &mut Criterion) {
         .connect("src2", "e")
         .connect("e", "b")
         .fan_out("b", |f| {
-            f.branch("c", schema.clone())
-                .branch("d", schema.clone())
+            f.branch("c", schema.clone()).branch("d", schema.clone())
         })
         .operator("merge", schema.clone())
         .connect("c", "merge")
@@ -401,9 +401,7 @@ fn bench_throughput_linear(c: &mut Criterion) {
 
                         let start = Instant::now();
                         for event in &pool {
-                            executor
-                                .process_event(src_id, event.clone())
-                                .unwrap();
+                            executor.process_event(src_id, event.clone()).unwrap();
                         }
                         let _ = executor.take_sink_outputs(snk_id);
                         total += start.elapsed();
@@ -455,9 +453,7 @@ fn bench_throughput_fan_out(c: &mut Criterion) {
 
                         let start = Instant::now();
                         for event in &pool {
-                            executor
-                                .process_event(src_id, event.clone())
-                                .unwrap();
+                            executor.process_event(src_id, event.clone()).unwrap();
                         }
                         let _ = executor.take_all_sink_outputs();
                         total += start.elapsed();
@@ -496,9 +492,7 @@ fn bench_checkpoint_overhead(c: &mut Criterion) {
 
                 let start = Instant::now();
                 for event in &pool {
-                    executor
-                        .process_event(src_id, event.clone())
-                        .unwrap();
+                    executor.process_event(src_id, event.clone()).unwrap();
                 }
                 let _ = executor.take_sink_outputs(snk_id);
                 total += start.elapsed();
@@ -515,10 +509,8 @@ fn bench_checkpoint_overhead(c: &mut Criterion) {
                 let mut executor = DagExecutor::from_dag(&dag);
                 register_passthrough_operators(&mut executor, &dag);
 
-                let all_nodes: Vec<NodeId> =
-                    dag.execution_order().to_vec();
-                let source_nodes: Vec<NodeId> =
-                    dag.sources().to_vec();
+                let all_nodes: Vec<NodeId> = dag.execution_order().to_vec();
+                let source_nodes: Vec<NodeId> = dag.sources().to_vec();
                 let mut coordinator = DagCheckpointCoordinator::new(
                     source_nodes,
                     all_nodes.clone(),
@@ -527,19 +519,14 @@ fn bench_checkpoint_overhead(c: &mut Criterion) {
 
                 let start = Instant::now();
                 for (i, event) in pool.iter().enumerate() {
-                    executor
-                        .process_event(src_id, event.clone())
-                        .unwrap();
+                    executor.process_event(src_id, event.clone()).unwrap();
 
                     // Trigger checkpoint every 10K events
                     if i > 0 && i % 10_000 == 0 {
-                        let barrier =
-                            coordinator.trigger_checkpoint().unwrap();
-                        let states =
-                            executor.process_checkpoint_barrier(&barrier);
+                        let barrier = coordinator.trigger_checkpoint().unwrap();
+                        let states = executor.process_checkpoint_barrier(&barrier);
                         for (node_id, state) in &states {
-                            coordinator
-                                .on_node_snapshot_complete(*node_id, state.clone());
+                            coordinator.on_node_snapshot_complete(*node_id, state.clone());
                         }
                         let _ = coordinator.finalize_checkpoint();
                     }
@@ -602,9 +589,7 @@ fn bench_recovery(c: &mut Criterion) {
                         let recovered = recovery.recover_latest().unwrap();
                         let mut executor = DagExecutor::from_dag(&dag);
                         register_passthrough_operators(&mut executor, &dag);
-                        executor
-                            .restore(&recovered.operator_states)
-                            .unwrap();
+                        executor.restore(&recovered.operator_states).unwrap();
                         black_box(recovered.snapshot.epoch);
                     },
                     criterion::BatchSize::PerIteration,

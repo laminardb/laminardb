@@ -3,7 +3,7 @@
 use std::sync::atomic::{AtomicU64, Ordering};
 
 use super::error::SinkError;
-use super::traits::{TransactionId, SinkState};
+use super::traits::{SinkState, TransactionId};
 use crate::operator::Output;
 
 /// State machine for transaction lifecycle
@@ -468,7 +468,10 @@ mod tests {
         state.begin(TransactionId::new(1)).unwrap();
 
         let result = state.begin(TransactionId::new(2));
-        assert!(matches!(result, Err(SinkError::TransactionAlreadyActive(_))));
+        assert!(matches!(
+            result,
+            Err(SinkError::TransactionAlreadyActive(_))
+        ));
     }
 
     #[test]
@@ -489,7 +492,10 @@ mod tests {
         state.begin(TransactionId::new(1)).unwrap();
 
         let result = state.commit(&TransactionId::new(2));
-        assert!(matches!(result, Err(SinkError::TransactionIdMismatch { .. })));
+        assert!(matches!(
+            result,
+            Err(SinkError::TransactionIdMismatch { .. })
+        ));
     }
 
     #[test]

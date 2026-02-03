@@ -5,8 +5,8 @@
 //! It determines the aggregation strategy and maps to DataFusion names.
 
 use sqlparser::ast::{
-    Expr, Function, FunctionArg, FunctionArgExpr, GroupByExpr, OrderByExpr, Select,
-    SelectItem, SetExpr, Statement,
+    Expr, Function, FunctionArg, FunctionArgExpr, GroupByExpr, OrderByExpr, Select, SelectItem,
+    SetExpr, Statement,
 };
 
 /// Types of aggregate functions supported.
@@ -382,12 +382,8 @@ fn resolve_aggregate_type(name: &str, func: &Function) -> Option<AggregateType> 
         "ARRAY_AGG" => Some(AggregateType::ArrayAgg),
 
         // ── Approximate ────────────────────────────────────────────
-        "APPROX_COUNT_DISTINCT" | "APPROX_DISTINCT" => {
-            Some(AggregateType::ApproxCountDistinct)
-        }
-        "APPROX_PERCENTILE_CONT" | "APPROX_PERCENTILE" => {
-            Some(AggregateType::ApproxPercentile)
-        }
+        "APPROX_COUNT_DISTINCT" | "APPROX_DISTINCT" => Some(AggregateType::ApproxCountDistinct),
+        "APPROX_PERCENTILE_CONT" | "APPROX_PERCENTILE" => Some(AggregateType::ApproxPercentile),
         "APPROX_MEDIAN" => Some(AggregateType::ApproxMedian),
 
         // ── Correlation / Regression ───────────────────────────────
@@ -592,8 +588,7 @@ mod tests {
 
     #[test]
     fn test_analyze_group_by() {
-        let stmt =
-            parse_statement("SELECT category, COUNT(*) FROM products GROUP BY category");
+        let stmt = parse_statement("SELECT category, COUNT(*) FROM products GROUP BY category");
         let analysis = analyze_aggregates(&stmt);
 
         assert_eq!(analysis.aggregates.len(), 1);
@@ -651,9 +646,8 @@ mod tests {
 
     #[test]
     fn test_decomposable() {
-        let stmt = parse_statement(
-            "SELECT COUNT(*), SUM(amount), MIN(price), MAX(price) FROM orders",
-        );
+        let stmt =
+            parse_statement("SELECT COUNT(*), SUM(amount), MIN(price), MAX(price) FROM orders");
         let analysis = analyze_aggregates(&stmt);
         assert!(analysis.all_decomposable());
 
@@ -688,14 +682,20 @@ mod tests {
     fn test_stddev_pop() {
         let stmt = parse_statement("SELECT STDDEV_POP(latency) FROM requests");
         let analysis = analyze_aggregates(&stmt);
-        assert_eq!(analysis.aggregates[0].aggregate_type, AggregateType::StdDevPop);
+        assert_eq!(
+            analysis.aggregates[0].aggregate_type,
+            AggregateType::StdDevPop
+        );
     }
 
     #[test]
     fn test_variance() {
         let stmt = parse_statement("SELECT VARIANCE(price) FROM trades");
         let analysis = analyze_aggregates(&stmt);
-        assert_eq!(analysis.aggregates[0].aggregate_type, AggregateType::Variance);
+        assert_eq!(
+            analysis.aggregates[0].aggregate_type,
+            AggregateType::Variance
+        );
     }
 
     #[test]
@@ -739,7 +739,10 @@ mod tests {
     fn test_bool_and() {
         let stmt = parse_statement("SELECT BOOL_AND(is_active) FROM users");
         let analysis = analyze_aggregates(&stmt);
-        assert_eq!(analysis.aggregates[0].aggregate_type, AggregateType::BoolAnd);
+        assert_eq!(
+            analysis.aggregates[0].aggregate_type,
+            AggregateType::BoolAnd
+        );
     }
 
     #[test]
@@ -753,7 +756,10 @@ mod tests {
     fn test_string_agg() {
         let stmt = parse_statement("SELECT STRING_AGG(name, ',') FROM users");
         let analysis = analyze_aggregates(&stmt);
-        assert_eq!(analysis.aggregates[0].aggregate_type, AggregateType::StringAgg);
+        assert_eq!(
+            analysis.aggregates[0].aggregate_type,
+            AggregateType::StringAgg
+        );
         assert!(analysis.aggregates[0].aggregate_type.is_order_sensitive());
     }
 
@@ -761,7 +767,10 @@ mod tests {
     fn test_array_agg() {
         let stmt = parse_statement("SELECT ARRAY_AGG(id) FROM events");
         let analysis = analyze_aggregates(&stmt);
-        assert_eq!(analysis.aggregates[0].aggregate_type, AggregateType::ArrayAgg);
+        assert_eq!(
+            analysis.aggregates[0].aggregate_type,
+            AggregateType::ArrayAgg
+        );
     }
 
     #[test]
@@ -805,7 +814,10 @@ mod tests {
     fn test_covar_pop() {
         let stmt = parse_statement("SELECT COVAR_POP(x, y) FROM points");
         let analysis = analyze_aggregates(&stmt);
-        assert_eq!(analysis.aggregates[0].aggregate_type, AggregateType::CovarPop);
+        assert_eq!(
+            analysis.aggregates[0].aggregate_type,
+            AggregateType::CovarPop
+        );
     }
 
     #[test]
@@ -837,9 +849,8 @@ mod tests {
 
     #[test]
     fn test_bit_aggregates() {
-        let stmt = parse_statement(
-            "SELECT BIT_AND(flags), BIT_OR(flags), BIT_XOR(flags) FROM events",
-        );
+        let stmt =
+            parse_statement("SELECT BIT_AND(flags), BIT_OR(flags), BIT_XOR(flags) FROM events");
         let analysis = analyze_aggregates(&stmt);
         assert_eq!(analysis.aggregates.len(), 3);
         assert_eq!(analysis.aggregates[0].aggregate_type, AggregateType::BitAnd);
@@ -860,14 +871,20 @@ mod tests {
     fn test_alias_var_samp() {
         let stmt = parse_statement("SELECT VAR_SAMP(price) FROM trades");
         let analysis = analyze_aggregates(&stmt);
-        assert_eq!(analysis.aggregates[0].aggregate_type, AggregateType::Variance);
+        assert_eq!(
+            analysis.aggregates[0].aggregate_type,
+            AggregateType::Variance
+        );
     }
 
     #[test]
     fn test_alias_every() {
         let stmt = parse_statement("SELECT EVERY(is_valid) FROM checks");
         let analysis = analyze_aggregates(&stmt);
-        assert_eq!(analysis.aggregates[0].aggregate_type, AggregateType::BoolAnd);
+        assert_eq!(
+            analysis.aggregates[0].aggregate_type,
+            AggregateType::BoolAnd
+        );
     }
 
     #[test]
@@ -894,9 +911,7 @@ mod tests {
 
     #[test]
     fn test_filter_clause_count() {
-        let stmt = parse_statement(
-            "SELECT COUNT(*) FILTER (WHERE status = 'active') FROM users",
-        );
+        let stmt = parse_statement("SELECT COUNT(*) FILTER (WHERE status = 'active') FROM users");
         let analysis = analyze_aggregates(&stmt);
         assert_eq!(analysis.aggregates.len(), 1);
         assert!(analysis.aggregates[0].has_filter());
@@ -915,9 +930,7 @@ mod tests {
 
     #[test]
     fn test_filter_clause_mixed() {
-        let stmt = parse_statement(
-            "SELECT COUNT(*), COUNT(*) FILTER (WHERE x > 0) FROM t",
-        );
+        let stmt = parse_statement("SELECT COUNT(*), COUNT(*) FILTER (WHERE x > 0) FROM t");
         let analysis = analyze_aggregates(&stmt);
         assert_eq!(analysis.aggregates.len(), 2);
         assert!(!analysis.aggregates[0].has_filter());
@@ -936,9 +949,8 @@ mod tests {
 
     #[test]
     fn test_within_group_percentile_cont() {
-        let stmt = parse_statement(
-            "SELECT PERCENTILE_CONT(0.5) WITHIN GROUP (ORDER BY latency) FROM req",
-        );
+        let stmt =
+            parse_statement("SELECT PERCENTILE_CONT(0.5) WITHIN GROUP (ORDER BY latency) FROM req");
         let analysis = analyze_aggregates(&stmt);
         assert_eq!(analysis.aggregates.len(), 1);
         assert!(analysis.aggregates[0].has_within_group());
@@ -948,9 +960,8 @@ mod tests {
 
     #[test]
     fn test_within_group_string_agg() {
-        let stmt = parse_statement(
-            "SELECT STRING_AGG(name, ',') WITHIN GROUP (ORDER BY name) FROM users",
-        );
+        let stmt =
+            parse_statement("SELECT STRING_AGG(name, ',') WITHIN GROUP (ORDER BY name) FROM users");
         let analysis = analyze_aggregates(&stmt);
         assert!(analysis.aggregates[0].has_within_group());
     }
@@ -977,7 +988,10 @@ mod tests {
     #[test]
     fn test_datafusion_name_statistical() {
         assert_eq!(AggregateType::StdDev.datafusion_name(), Some("stddev"));
-        assert_eq!(AggregateType::StdDevPop.datafusion_name(), Some("stddev_pop"));
+        assert_eq!(
+            AggregateType::StdDevPop.datafusion_name(),
+            Some("stddev_pop")
+        );
         assert_eq!(AggregateType::Variance.datafusion_name(), Some("variance"));
         assert_eq!(
             AggregateType::VariancePop.datafusion_name(),
@@ -1052,7 +1066,10 @@ mod tests {
         assert_eq!(analysis.aggregates.len(), 4);
         assert_eq!(analysis.aggregates[0].aggregate_type, AggregateType::Avg);
         assert_eq!(analysis.aggregates[1].aggregate_type, AggregateType::StdDev);
-        assert_eq!(analysis.aggregates[2].aggregate_type, AggregateType::Variance);
+        assert_eq!(
+            analysis.aggregates[2].aggregate_type,
+            AggregateType::Variance
+        );
         assert_eq!(analysis.aggregates[3].aggregate_type, AggregateType::Median);
         assert!(!analysis.all_decomposable());
     }
@@ -1092,6 +1109,9 @@ mod tests {
         let analysis = analyze_aggregates(&stmt);
         assert_eq!(analysis.aggregates.len(), 2);
         assert_eq!(analysis.aggregates[0].aggregate_type, AggregateType::StdDev);
-        assert_eq!(analysis.aggregates[1].aggregate_type, AggregateType::Variance);
+        assert_eq!(
+            analysis.aggregates[1].aggregate_type,
+            AggregateType::Variance
+        );
     }
 }

@@ -290,9 +290,10 @@ impl SchemaRegistryClient {
             req = req.basic_auth(&auth.username, Some(&auth.password));
         }
 
-        let resp = req.send().await.map_err(|e| {
-            ConnectorError::ConnectionFailed(format!("schema registry: {e}"))
-        })?;
+        let resp = req
+            .send()
+            .await
+            .map_err(|e| ConnectorError::ConnectionFailed(format!("schema registry: {e}")))?;
 
         if !resp.status().is_success() {
             let status = resp.status();
@@ -346,9 +347,10 @@ impl SchemaRegistryClient {
             req = req.basic_auth(&auth.username, Some(&auth.password));
         }
 
-        let resp = req.send().await.map_err(|e| {
-            ConnectorError::ConnectionFailed(format!("schema registry: {e}"))
-        })?;
+        let resp = req
+            .send()
+            .await
+            .map_err(|e| ConnectorError::ConnectionFailed(format!("schema registry: {e}")))?;
 
         if !resp.status().is_success() {
             let status = resp.status();
@@ -369,10 +371,7 @@ impl SchemaRegistryClient {
     /// # Errors
     ///
     /// Returns `ConnectorError` if the schema cannot be fetched.
-    pub async fn resolve_confluent_id(
-        &mut self,
-        id: i32,
-    ) -> Result<CachedSchema, ConnectorError> {
+    pub async fn resolve_confluent_id(&mut self, id: i32) -> Result<CachedSchema, ConnectorError> {
         self.get_schema_by_id(id).await
     }
 
@@ -407,9 +406,10 @@ impl SchemaRegistryClient {
             req = req.basic_auth(&auth.username, Some(&auth.password));
         }
 
-        let resp = req.send().await.map_err(|e| {
-            ConnectorError::ConnectionFailed(format!("schema registry: {e}"))
-        })?;
+        let resp = req
+            .send()
+            .await
+            .map_err(|e| ConnectorError::ConnectionFailed(format!("schema registry: {e}")))?;
 
         if !resp.status().is_success() {
             let status = resp.status();
@@ -420,9 +420,7 @@ impl SchemaRegistryClient {
         }
 
         let result: RegisterSchemaResponse = resp.json().await.map_err(|e| {
-            ConnectorError::Internal(format!(
-                "failed to parse register schema response: {e}"
-            ))
+            ConnectorError::Internal(format!("failed to parse register schema response: {e}"))
         })?;
 
         let arrow_schema = avro_to_arrow_schema(schema_str)?;
@@ -434,8 +432,7 @@ impl SchemaRegistryClient {
             arrow_schema,
         };
         self.cache.insert(result.id, cached.clone());
-        self.subject_cache
-            .insert(subject.to_string(), cached);
+        self.subject_cache.insert(subject.to_string(), cached);
 
         Ok(result.id)
     }
@@ -462,9 +459,10 @@ impl SchemaRegistryClient {
             req = req.basic_auth(&auth.username, Some(&auth.password));
         }
 
-        let resp = req.send().await.map_err(|e| {
-            ConnectorError::ConnectionFailed(format!("schema registry: {e}"))
-        })?;
+        let resp = req
+            .send()
+            .await
+            .map_err(|e| ConnectorError::ConnectionFailed(format!("schema registry: {e}")))?;
 
         if !resp.status().is_success() {
             let status = resp.status();
@@ -500,9 +498,8 @@ impl std::fmt::Debug for SchemaRegistryClient {
 /// Returns `ConnectorError::SchemaMismatch` if the schema JSON is invalid
 /// or contains unsupported types.
 pub fn avro_to_arrow_schema(avro_schema_str: &str) -> Result<SchemaRef, ConnectorError> {
-    let avro: serde_json::Value = serde_json::from_str(avro_schema_str).map_err(|e| {
-        ConnectorError::SchemaMismatch(format!("invalid Avro schema JSON: {e}"))
-    })?;
+    let avro: serde_json::Value = serde_json::from_str(avro_schema_str)
+        .map_err(|e| ConnectorError::SchemaMismatch(format!("invalid Avro schema JSON: {e}")))?;
 
     let fields_val = avro.get("fields").ok_or_else(|| {
         ConnectorError::SchemaMismatch("Avro schema missing 'fields' array".into())
@@ -517,9 +514,7 @@ pub fn avro_to_arrow_schema(avro_schema_str: &str) -> Result<SchemaRef, Connecto
         let name = field
             .get("name")
             .and_then(|v| v.as_str())
-            .ok_or_else(|| {
-                ConnectorError::SchemaMismatch("Avro field missing 'name'".into())
-            })?;
+            .ok_or_else(|| ConnectorError::SchemaMismatch("Avro field missing 'name'".into()))?;
 
         let (data_type, nullable) = parse_avro_type(field.get("type").ok_or_else(|| {
             ConnectorError::SchemaMismatch(format!("Avro field '{name}' missing 'type'"))
@@ -532,9 +527,7 @@ pub fn avro_to_arrow_schema(avro_schema_str: &str) -> Result<SchemaRef, Connecto
 }
 
 /// Parses an Avro type definition to an Arrow `DataType` and nullable flag.
-fn parse_avro_type(
-    avro_type: &serde_json::Value,
-) -> Result<(DataType, bool), ConnectorError> {
+fn parse_avro_type(avro_type: &serde_json::Value) -> Result<(DataType, bool), ConnectorError> {
     match avro_type {
         serde_json::Value::String(s) => Ok((avro_primitive_to_arrow(s)?, false)),
         serde_json::Value::Array(union) => {
@@ -601,10 +594,7 @@ fn avro_primitive_to_arrow(avro_type: &str) -> Result<DataType, ConnectorError> 
 /// # Errors
 ///
 /// Returns `SerdeError` if an Arrow type has no Avro equivalent.
-pub fn arrow_to_avro_schema(
-    schema: &SchemaRef,
-    record_name: &str,
-) -> Result<String, SerdeError> {
+pub fn arrow_to_avro_schema(schema: &SchemaRef, record_name: &str) -> Result<String, SerdeError> {
     let mut fields = Vec::with_capacity(schema.fields().len());
 
     for field in schema.fields() {
@@ -628,9 +618,8 @@ pub fn arrow_to_avro_schema(
         "fields": fields,
     });
 
-    serde_json::to_string(&schema).map_err(|e| {
-        SerdeError::MalformedInput(format!("failed to serialize Avro schema: {e}"))
-    })
+    serde_json::to_string(&schema)
+        .map_err(|e| SerdeError::MalformedInput(format!("failed to serialize Avro schema: {e}")))
 }
 
 /// Maps an Arrow `DataType` to an Avro type string.

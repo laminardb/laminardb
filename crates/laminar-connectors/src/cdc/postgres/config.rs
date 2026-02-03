@@ -140,9 +140,9 @@ impl PostgresCdcConfig {
         };
 
         if let Some(port) = config.get("port") {
-            cfg.port = port.parse().map_err(|_| {
-                ConnectorError::ConfigurationError(format!("invalid port: {port}"))
-            })?;
+            cfg.port = port
+                .parse()
+                .map_err(|_| ConnectorError::ConfigurationError(format!("invalid port: {port}")))?;
         }
         if let Some(user) = config.get("username") {
             cfg.username = user.to_string();

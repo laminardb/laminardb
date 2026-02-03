@@ -368,12 +368,8 @@ mod tests {
 
         assert_eq!(sink.pending(), 0);
 
-        source
-            .push(TestEvent { id: 1, value: 1.0 })
-            .unwrap();
-        source
-            .push(TestEvent { id: 2, value: 2.0 })
-            .unwrap();
+        source.push(TestEvent { id: 1, value: 1.0 }).unwrap();
+        source.push(TestEvent { id: 2, value: 2.0 }).unwrap();
 
         assert_eq!(sink.pending(), 2);
     }

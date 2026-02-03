@@ -132,7 +132,7 @@ pub fn cdc_envelope_schema() -> SchemaRef {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::cdc::postgres::types::{INT4_OID, TEXT_OID, INT8_OID};
+    use crate::cdc::postgres::types::{INT4_OID, INT8_OID, TEXT_OID};
 
     fn sample_relation() -> RelationInfo {
         RelationInfo {
@@ -196,12 +196,9 @@ mod tests {
         cache.insert(sample_relation());
 
         let mut updated = sample_relation();
-        updated.columns.push(PgColumn::new(
-            "email".to_string(),
-            TEXT_OID,
-            -1,
-            false,
-        ));
+        updated
+            .columns
+            .push(PgColumn::new("email".to_string(), TEXT_OID, -1, false));
         cache.insert(updated);
 
         assert_eq!(cache.len(), 1);

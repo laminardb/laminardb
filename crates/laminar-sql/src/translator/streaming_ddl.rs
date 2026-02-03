@@ -41,8 +41,8 @@ use std::time::Duration;
 use arrow::datatypes::{DataType, Field, Schema, SchemaRef, TimeUnit};
 use sqlparser::ast::{ColumnDef, DataType as SqlDataType};
 
-use crate::parser::{CreateSinkStatement, CreateSourceStatement, SinkFrom, WatermarkDef};
 use crate::parser::ParseError;
+use crate::parser::{CreateSinkStatement, CreateSourceStatement, SinkFrom, WatermarkDef};
 
 /// Minimum buffer size for streaming channels.
 pub const MIN_BUFFER_SIZE: usize = 4;
@@ -206,7 +206,9 @@ impl TryFrom<CreateSinkStatement> for SinkDefinition {
 /// - The `channel` option is specified (not user-configurable)
 /// - An invalid option value is provided
 /// - Column types cannot be converted to Arrow types
-pub fn translate_create_source(stmt: CreateSourceStatement) -> Result<SourceDefinition, ParseError> {
+pub fn translate_create_source(
+    stmt: CreateSourceStatement,
+) -> Result<SourceDefinition, ParseError> {
     // Validate options first - reject 'channel' option
     validate_source_options(&stmt.with_options)?;
 
@@ -283,7 +285,8 @@ fn validate_source_options(options: &HashMap<String, String>) -> Result<(), Pars
     // Reject 'type' option for same reason
     if options.contains_key("type") {
         return Err(ParseError::ValidationError(
-            "the 'type' option is not user-configurable for in-memory streaming sources".to_string(),
+            "the 'type' option is not user-configurable for in-memory streaming sources"
+                .to_string(),
         ));
     }
 
@@ -291,7 +294,9 @@ fn validate_source_options(options: &HashMap<String, String>) -> Result<(), Pars
 }
 
 /// Parses source options from WITH clause.
-fn parse_source_options(options: &HashMap<String, String>) -> Result<SourceConfigOptions, ParseError> {
+fn parse_source_options(
+    options: &HashMap<String, String>,
+) -> Result<SourceConfigOptions, ParseError> {
     let mut config = SourceConfigOptions::default();
 
     for (key, value) in options {
@@ -321,7 +326,10 @@ fn parse_source_options(options: &HashMap<String, String>) -> Result<SourceConfi
 /// Parses buffer_size option.
 fn parse_buffer_size(value: &str) -> Result<usize, ParseError> {
     let size: usize = value.parse().map_err(|_| {
-        ParseError::ValidationError(format!("invalid buffer_size: '{}' - must be a number", value))
+        ParseError::ValidationError(format!(
+            "invalid buffer_size: '{}' - must be a number",
+            value
+        ))
     })?;
 
     if size < MIN_BUFFER_SIZE {
@@ -363,12 +371,10 @@ fn convert_column(col: &ColumnDef) -> Result<ColumnDefinition, ParseError> {
     let data_type = sql_type_to_arrow(&col.data_type)?;
 
     // Check for NOT NULL constraint
-    let nullable = !col.options.iter().any(|opt| {
-        matches!(
-            opt.option,
-            sqlparser::ast::ColumnOption::NotNull
-        )
-    });
+    let nullable = !col
+        .options
+        .iter()
+        .any(|opt| matches!(opt.option, sqlparser::ast::ColumnOption::NotNull));
 
     Ok(ColumnDefinition {
         name: col.name.to_string(),
@@ -434,7 +440,9 @@ pub fn sql_type_to_arrow(sql_type: &SqlDataType) -> Result<DataType, ParseError>
         SqlDataType::Timestamp(_, _) => Ok(DataType::Timestamp(TimeUnit::Microsecond, None)),
 
         // Interval type
-        SqlDataType::Interval { .. } => Ok(DataType::Interval(arrow::datatypes::IntervalUnit::MonthDayNano)),
+        SqlDataType::Interval { .. } => Ok(DataType::Interval(
+            arrow::datatypes::IntervalUnit::MonthDayNano,
+        )),
 
         // Unsupported types
         _ => Err(ParseError::ValidationError(format!(
@@ -445,7 +453,10 @@ pub fn sql_type_to_arrow(sql_type: &SqlDataType) -> Result<DataType, ParseError>
 }
 
 /// Parses watermark definition.
-fn parse_watermark(wm: &WatermarkDef, columns: &[ColumnDefinition]) -> Result<WatermarkSpec, ParseError> {
+fn parse_watermark(
+    wm: &WatermarkDef,
+    columns: &[ColumnDefinition],
+) -> Result<WatermarkSpec, ParseError> {
     let column_name = wm.column.to_string();
 
     // Verify column exists and is a timestamp type
@@ -549,21 +560,22 @@ mod tests {
 
     fn parse_and_translate(sql: &str) -> Result<SourceDefinition, ParseError> {
         let statements = parse_streaming_sql(sql)?;
-        let stmt = statements.into_iter().next().ok_or_else(|| {
-            ParseError::StreamingError("No statement found".to_string())
-        })?;
+        let stmt = statements
+            .into_iter()
+            .next()
+            .ok_or_else(|| ParseError::StreamingError("No statement found".to_string()))?;
         match stmt {
             StreamingStatement::CreateSource(source) => translate_create_source(*source),
-            _ => Err(ParseError::StreamingError("Expected CREATE SOURCE".to_string())),
+            _ => Err(ParseError::StreamingError(
+                "Expected CREATE SOURCE".to_string(),
+            )),
         }
     }
 
     #[test]
     fn test_basic_source() {
-        let def = parse_and_translate(
-            "CREATE SOURCE events (id BIGINT NOT NULL, name VARCHAR)",
-        )
-        .unwrap();
+        let def =
+            parse_and_translate("CREATE SOURCE events (id BIGINT NOT NULL, name VARCHAR)").unwrap();
 
         assert_eq!(def.name, "events");
         assert_eq!(def.columns.len(), 2);
@@ -607,9 +619,8 @@ mod tests {
 
     #[test]
     fn test_reject_channel_option() {
-        let result = parse_and_translate(
-            "CREATE SOURCE events (id BIGINT) WITH ('channel' = 'mpsc')",
-        );
+        let result =
+            parse_and_translate("CREATE SOURCE events (id BIGINT) WITH ('channel' = 'mpsc')");
 
         assert!(result.is_err());
         let err = result.unwrap_err();
@@ -618,9 +629,7 @@ mod tests {
 
     #[test]
     fn test_reject_type_option() {
-        let result = parse_and_translate(
-            "CREATE SOURCE events (id BIGINT) WITH ('type' = 'spsc')",
-        );
+        let result = parse_and_translate("CREATE SOURCE events (id BIGINT) WITH ('type' = 'spsc')");
 
         assert!(result.is_err());
     }
@@ -628,9 +637,8 @@ mod tests {
     #[test]
     fn test_buffer_size_bounds() {
         // Too small
-        let result = parse_and_translate(
-            "CREATE SOURCE events (id BIGINT) WITH ('buffer_size' = '1')",
-        );
+        let result =
+            parse_and_translate("CREATE SOURCE events (id BIGINT) WITH ('buffer_size' = '1')");
         assert!(result.is_err());
 
         // Too large
@@ -640,9 +648,8 @@ mod tests {
         assert!(result.is_err());
 
         // Valid
-        let result = parse_and_translate(
-            "CREATE SOURCE events (id BIGINT) WITH ('buffer_size' = '1024')",
-        );
+        let result =
+            parse_and_translate("CREATE SOURCE events (id BIGINT) WITH ('buffer_size' = '1024')");
         assert!(result.is_ok());
     }
 
@@ -705,7 +712,10 @@ mod tests {
         assert_eq!(def.columns[7].data_type, DataType::Utf8);
         assert_eq!(def.columns[8].data_type, DataType::Utf8);
         assert_eq!(def.columns[9].data_type, DataType::Boolean);
-        assert!(matches!(def.columns[10].data_type, DataType::Timestamp(_, _)));
+        assert!(matches!(
+            def.columns[10].data_type,
+            DataType::Timestamp(_, _)
+        ));
         assert_eq!(def.columns[11].data_type, DataType::Date32);
     }
 
@@ -782,20 +792,18 @@ mod tests {
 
     #[test]
     fn test_track_stats_option() {
-        let def = parse_and_translate(
-            "CREATE SOURCE events (id BIGINT) WITH ('track_stats' = 'true')",
-        )
-        .unwrap();
+        let def =
+            parse_and_translate("CREATE SOURCE events (id BIGINT) WITH ('track_stats' = 'true')")
+                .unwrap();
 
         assert!(def.config.track_stats);
     }
 
     #[test]
     fn test_wait_strategy_option() {
-        let def = parse_and_translate(
-            "CREATE SOURCE events (id BIGINT) WITH ('wait_strategy' = 'park')",
-        )
-        .unwrap();
+        let def =
+            parse_and_translate("CREATE SOURCE events (id BIGINT) WITH ('wait_strategy' = 'park')")
+                .unwrap();
 
         assert_eq!(def.config.wait_strategy, WaitStrategy::Park);
     }

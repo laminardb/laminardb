@@ -300,7 +300,8 @@ impl DagCheckpointCoordinator {
         let epoch = self.next_epoch;
         self.next_epoch += 1;
 
-        #[allow(clippy::cast_possible_truncation)] // Timestamp ms fits i64 for ~292 years from epoch
+        #[allow(clippy::cast_possible_truncation)]
+        // Timestamp ms fits i64 for ~292 years from epoch
         let timestamp = std::time::SystemTime::now()
             .duration_since(std::time::UNIX_EPOCH)
             .map_or(0, |d| d.as_millis() as i64);
@@ -327,11 +328,7 @@ impl DagCheckpointCoordinator {
     ///
     /// Returns `true` if all nodes have now reported (checkpoint is ready
     /// to finalize).
-    pub fn on_node_snapshot_complete(
-        &mut self,
-        node_id: NodeId,
-        state: OperatorState,
-    ) -> bool {
+    pub fn on_node_snapshot_complete(&mut self, node_id: NodeId, state: OperatorState) -> bool {
         if let Some(ref mut progress) = self.in_progress {
             progress.pending_nodes.retain(|&n| n != node_id);
             progress.completed_nodes.insert(node_id, state);

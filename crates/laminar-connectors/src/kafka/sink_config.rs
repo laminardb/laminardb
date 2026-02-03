@@ -124,9 +124,7 @@ impl KafkaSinkConfig {
 
         if let Some(v) = config.get("transaction.timeout.ms") {
             let ms: u64 = v.parse().map_err(|_| {
-                ConnectorError::ConfigurationError(format!(
-                    "invalid transaction.timeout.ms: '{v}'"
-                ))
+                ConnectorError::ConfigurationError(format!("invalid transaction.timeout.ms: '{v}'"))
             })?;
             cfg.transaction_timeout = Duration::from_millis(ms);
         }
@@ -155,9 +153,7 @@ impl KafkaSinkConfig {
 
         if let Some(c) = config.get("compression.type") {
             cfg.compression = c.parse().map_err(|_| {
-                ConnectorError::ConfigurationError(format!(
-                    "invalid compression.type: '{c}'"
-                ))
+                ConnectorError::ConfigurationError(format!("invalid compression.type: '{c}'"))
             })?;
         }
 
@@ -171,17 +167,13 @@ impl KafkaSinkConfig {
 
         if let Some(v) = config.get("max.in.flight.requests") {
             cfg.max_in_flight = v.parse().map_err(|_| {
-                ConnectorError::ConfigurationError(format!(
-                    "invalid max.in.flight.requests: '{v}'"
-                ))
+                ConnectorError::ConfigurationError(format!("invalid max.in.flight.requests: '{v}'"))
             })?;
         }
 
         if let Some(v) = config.get("delivery.timeout.ms") {
             let ms: u64 = v.parse().map_err(|_| {
-                ConnectorError::ConfigurationError(format!(
-                    "invalid delivery.timeout.ms: '{v}'"
-                ))
+                ConnectorError::ConfigurationError(format!("invalid delivery.timeout.ms: '{v}'"))
             })?;
             cfg.delivery_timeout = Duration::from_millis(ms);
         }
@@ -190,9 +182,7 @@ impl KafkaSinkConfig {
 
         if let Some(v) = config.get("flush.batch.size") {
             cfg.flush_batch_size = v.parse().map_err(|_| {
-                ConnectorError::ConfigurationError(format!(
-                    "invalid flush.batch.size: '{v}'"
-                ))
+                ConnectorError::ConfigurationError(format!("invalid flush.batch.size: '{v}'"))
             })?;
         }
 
@@ -210,9 +200,7 @@ impl KafkaSinkConfig {
 
         if let Some(c) = config.get("schema.compatibility") {
             cfg.schema_compatibility = Some(c.parse().map_err(|_| {
-                ConnectorError::ConfigurationError(format!(
-                    "invalid schema.compatibility: '{c}'"
-                ))
+                ConnectorError::ConfigurationError(format!("invalid schema.compatibility: '{c}'"))
             })?);
         }
 
@@ -251,9 +239,7 @@ impl KafkaSinkConfig {
         }
 
         // Exactly-once requires max 5 in-flight for idempotent producer
-        if self.delivery_guarantee == DeliveryGuarantee::ExactlyOnce
-            && self.max_in_flight > 5
-        {
+        if self.delivery_guarantee == DeliveryGuarantee::ExactlyOnce && self.max_in_flight > 5 {
             return Err(ConnectorError::ConfigurationError(
                 "exactly-once requires max.in.flight.requests <= 5".into(),
             ));
@@ -603,7 +589,10 @@ mod tests {
         pairs.push(("kafka.queue.buffering.max.messages", "100000"));
         let config = make_config(&pairs);
         let cfg = KafkaSinkConfig::from_config(&config).unwrap();
-        assert_eq!(cfg.kafka_properties.get("socket.timeout.ms").unwrap(), "5000");
+        assert_eq!(
+            cfg.kafka_properties.get("socket.timeout.ms").unwrap(),
+            "5000"
+        );
     }
 
     #[test]
@@ -632,15 +621,42 @@ mod tests {
 
     #[test]
     fn test_enum_parse() {
-        assert_eq!("at-least-once".parse::<DeliveryGuarantee>().unwrap(), DeliveryGuarantee::AtLeastOnce);
-        assert_eq!("exactly-once".parse::<DeliveryGuarantee>().unwrap(), DeliveryGuarantee::ExactlyOnce);
-        assert_eq!("key-hash".parse::<PartitionStrategy>().unwrap(), PartitionStrategy::KeyHash);
-        assert_eq!("round-robin".parse::<PartitionStrategy>().unwrap(), PartitionStrategy::RoundRobin);
-        assert_eq!("sticky".parse::<PartitionStrategy>().unwrap(), PartitionStrategy::Sticky);
-        assert_eq!("gzip".parse::<CompressionType>().unwrap(), CompressionType::Gzip);
-        assert_eq!("snappy".parse::<CompressionType>().unwrap(), CompressionType::Snappy);
-        assert_eq!("lz4".parse::<CompressionType>().unwrap(), CompressionType::Lz4);
-        assert_eq!("zstd".parse::<CompressionType>().unwrap(), CompressionType::Zstd);
+        assert_eq!(
+            "at-least-once".parse::<DeliveryGuarantee>().unwrap(),
+            DeliveryGuarantee::AtLeastOnce
+        );
+        assert_eq!(
+            "exactly-once".parse::<DeliveryGuarantee>().unwrap(),
+            DeliveryGuarantee::ExactlyOnce
+        );
+        assert_eq!(
+            "key-hash".parse::<PartitionStrategy>().unwrap(),
+            PartitionStrategy::KeyHash
+        );
+        assert_eq!(
+            "round-robin".parse::<PartitionStrategy>().unwrap(),
+            PartitionStrategy::RoundRobin
+        );
+        assert_eq!(
+            "sticky".parse::<PartitionStrategy>().unwrap(),
+            PartitionStrategy::Sticky
+        );
+        assert_eq!(
+            "gzip".parse::<CompressionType>().unwrap(),
+            CompressionType::Gzip
+        );
+        assert_eq!(
+            "snappy".parse::<CompressionType>().unwrap(),
+            CompressionType::Snappy
+        );
+        assert_eq!(
+            "lz4".parse::<CompressionType>().unwrap(),
+            CompressionType::Lz4
+        );
+        assert_eq!(
+            "zstd".parse::<CompressionType>().unwrap(),
+            CompressionType::Zstd
+        );
         assert_eq!("all".parse::<Acks>().unwrap(), Acks::All);
         assert_eq!("1".parse::<Acks>().unwrap(), Acks::Leader);
         assert_eq!("0".parse::<Acks>().unwrap(), Acks::None);

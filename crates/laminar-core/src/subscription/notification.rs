@@ -205,7 +205,8 @@ impl NotificationRing {
         unsafe {
             *self.buffer[idx].get() = notif;
         }
-        self.write_pos.store(write.wrapping_add(1), Ordering::Release);
+        self.write_pos
+            .store(write.wrapping_add(1), Ordering::Release);
         true
     }
 
@@ -518,7 +519,7 @@ mod tests {
     #[test]
     fn test_notification_ring_wraparound() {
         let ring = NotificationRing::new(4); // capacity = 4
-        // Fill and drain multiple times to exercise wraparound
+                                             // Fill and drain multiple times to exercise wraparound
         for round in 0..5u64 {
             for i in 0..4u64 {
                 let seq = round * 4 + i;
@@ -641,8 +642,7 @@ mod tests {
         let writer = thread::spawn(move || {
             let mut pushed = 0u64;
             while pushed < n {
-                let notif =
-                    NotificationRef::new(pushed, 0, EventType::Insert, 0, 0, 0);
+                let notif = NotificationRef::new(pushed, 0, EventType::Insert, 0, 0, 0);
                 if ring_writer.push(notif) {
                     pushed += 1;
                 } else {

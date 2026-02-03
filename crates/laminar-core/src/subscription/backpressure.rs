@@ -177,12 +177,7 @@ impl DemandBackpressure {
             }
             if self
                 .pending
-                .compare_exchange_weak(
-                    current,
-                    current - 1,
-                    Ordering::AcqRel,
-                    Ordering::Relaxed,
-                )
+                .compare_exchange_weak(current, current - 1, Ordering::AcqRel, Ordering::Relaxed)
                 .is_ok()
             {
                 return true;
@@ -272,10 +267,8 @@ mod tests {
 
     #[test]
     fn test_lagging_subscriber_detection() {
-        let ctrl = BackpressureController::with_lag_threshold(
-            BackpressureStrategy::DropOldest,
-            500,
-        );
+        let ctrl =
+            BackpressureController::with_lag_threshold(BackpressureStrategy::DropOldest, 500);
         assert!(!ctrl.is_lagging(499));
         assert!(ctrl.is_lagging(500));
         assert!(ctrl.is_lagging(1000));

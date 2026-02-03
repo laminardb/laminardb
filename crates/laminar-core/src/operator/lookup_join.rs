@@ -91,9 +91,9 @@ use super::{
     TimerKey,
 };
 use crate::state::StateStoreExt;
-use fxhash::FxHashMap;
 use arrow_array::{Array, ArrayRef, Int64Array, RecordBatch, StringArray};
 use arrow_schema::{DataType, Field, Schema, SchemaRef};
+use fxhash::FxHashMap;
 use rkyv::{
     rancor::Error as RkyvError, Archive, Deserialize as RkyvDeserialize, Serialize as RkyvSerialize,
 };
@@ -493,13 +493,13 @@ impl LookupJoinOperator {
         }
 
         // Populate in-memory batch cache
-        self.batch_cache
-            .insert(cache_key.clone(), result.cloned());
+        self.batch_cache.insert(cache_key.clone(), result.cloned());
 
         // Register TTL timer
         let expiry_time = ctx.processing_time + self.cache_ttl_us;
         let timer_key = Self::make_timer_key(&cache_key);
-        ctx.timers.register_timer(expiry_time, Some(timer_key), Some(ctx.operator_index));
+        ctx.timers
+            .register_timer(expiry_time, Some(timer_key), Some(ctx.operator_index));
 
         // Process pending events for this key
         let events_to_process: Vec<_> = self
@@ -585,13 +585,13 @@ impl LookupJoinOperator {
 
         if ctx.state.put_typed(&cache_key, &entry).is_ok() {
             // Populate in-memory batch cache
-            self.batch_cache
-                .insert(cache_key.clone(), result.clone());
+            self.batch_cache.insert(cache_key.clone(), result.clone());
 
             // Register TTL timer
             let expiry_time = ctx.processing_time + self.cache_ttl_us;
             let timer_key = Self::make_timer_key(&cache_key);
-            ctx.timers.register_timer(expiry_time, Some(timer_key), Some(ctx.operator_index));
+            ctx.timers
+                .register_timer(expiry_time, Some(timer_key), Some(ctx.operator_index));
         }
 
         self.emit_result(event, result.as_ref(), ctx)
@@ -990,12 +990,17 @@ mod tests {
         let order = create_order_event(1000, "cust_1", 100);
         let mut ctx = create_test_context(&mut timers, &mut state, &mut watermark_gen);
 
-        let outputs = operator.process_with_lookup(&order, &mut ctx, |key| {
-            lookup_table.get(key).cloned()
-        });
+        let outputs =
+            operator.process_with_lookup(&order, &mut ctx, |key| lookup_table.get(key).cloned());
 
         // Should emit joined event
-        assert_eq!(outputs.iter().filter(|o| matches!(o, Output::Event(_))).count(), 1);
+        assert_eq!(
+            outputs
+                .iter()
+                .filter(|o| matches!(o, Output::Event(_)))
+                .count(),
+            1
+        );
 
         // Check output schema has both stream and lookup columns
         if let Some(Output::Event(event)) = outputs.first() {
@@ -1027,9 +1032,8 @@ mod tests {
         let order = create_order_event(1000, "cust_999", 100);
         let mut ctx = create_test_context(&mut timers, &mut state, &mut watermark_gen);
 
-        let outputs = operator.process_with_lookup(&order, &mut ctx, |key| {
-            lookup_table.get(key).cloned()
-        });
+        let outputs =
+            operator.process_with_lookup(&order, &mut ctx, |key| lookup_table.get(key).cloned());
 
         // Inner join should emit nothing for missing lookup
         assert_eq!(outputs.len(), 0);
@@ -1064,7 +1068,13 @@ mod tests {
         let outputs = operator.process_with_lookup(&order2, &mut ctx, |_| None);
 
         // Left join should emit event with nulls
-        assert_eq!(outputs.iter().filter(|o| matches!(o, Output::Event(_))).count(), 1);
+        assert_eq!(
+            outputs
+                .iter()
+                .filter(|o| matches!(o, Output::Event(_)))
+                .count(),
+            1
+        );
 
         if let Some(Output::Event(event)) = outputs.first() {
             assert_eq!(event.data.num_columns(), 5); // Stream cols + null lookup cols
@@ -1260,7 +1270,10 @@ mod tests {
         let mut operator = LookupJoinOperator::with_id(config, "test_join".to_string());
 
         let mut lookup_table: HashMap<Vec<u8>, RecordBatch> = HashMap::new();
-        lookup_table.insert(42i64.to_le_bytes().to_vec(), create_int_key_lookup(42, "matched"));
+        lookup_table.insert(
+            42i64.to_le_bytes().to_vec(),
+            create_int_key_lookup(42, "matched"),
+        );
 
         let mut timers = TimerService::new();
         let mut state = InMemoryStore::new();
@@ -1269,11 +1282,16 @@ mod tests {
         let event = create_int_key_event(1000, 42, 100);
         let mut ctx = create_test_context(&mut timers, &mut state, &mut watermark_gen);
 
-        let outputs = operator.process_with_lookup(&event, &mut ctx, |key| {
-            lookup_table.get(key).cloned()
-        });
+        let outputs =
+            operator.process_with_lookup(&event, &mut ctx, |key| lookup_table.get(key).cloned());
 
-        assert_eq!(outputs.iter().filter(|o| matches!(o, Output::Event(_))).count(), 1);
+        assert_eq!(
+            outputs
+                .iter()
+                .filter(|o| matches!(o, Output::Event(_)))
+                .count(),
+            1
+        );
         assert_eq!(operator.metrics().lookups_found, 1);
     }
 
@@ -1310,7 +1328,13 @@ mod tests {
             let outputs = operator.provide_lookup(b"cust_1", Some(&lookup_result), &mut ctx);
 
             // Now should emit
-            assert_eq!(outputs.iter().filter(|o| matches!(o, Output::Event(_))).count(), 1);
+            assert_eq!(
+                outputs
+                    .iter()
+                    .filter(|o| matches!(o, Output::Event(_)))
+                    .count(),
+                1
+            );
         }
 
         // Pending should be cleared
@@ -1385,9 +1409,15 @@ mod tests {
             let order = create_order_event(1000 + i * 100, "cust_1", 100 + i);
             let mut ctx = create_test_context(&mut timers, &mut state, &mut watermark_gen);
             ctx.processing_time = 1_000_000 + i * 100_000;
-            let outputs =
-                operator.process_with_lookup(&order, &mut ctx, |key| lookup_table.get(key).cloned());
-            assert_eq!(outputs.iter().filter(|o| matches!(o, Output::Event(_))).count(), 1);
+            let outputs = operator
+                .process_with_lookup(&order, &mut ctx, |key| lookup_table.get(key).cloned());
+            assert_eq!(
+                outputs
+                    .iter()
+                    .filter(|o| matches!(o, Output::Event(_)))
+                    .count(),
+                1
+            );
         }
 
         // Should have 1 miss and 4 hits

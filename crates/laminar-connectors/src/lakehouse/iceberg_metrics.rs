@@ -78,7 +78,8 @@ impl IcebergSinkMetrics {
 
     /// Records equality delete files written (upsert mode).
     pub fn record_delete_files(&self, count: u64) {
-        self.delete_files_written.fetch_add(count, Ordering::Relaxed);
+        self.delete_files_written
+            .fetch_add(count, Ordering::Relaxed);
     }
 
     /// Records a successful epoch commit with the snapshot ID.
@@ -224,10 +225,7 @@ mod tests {
         assert_eq!(cm.records_total, 300);
         assert_eq!(cm.bytes_total, 15_000);
 
-        let flushes = cm
-            .custom
-            .iter()
-            .find(|(k, _)| k == "iceberg.flush_count");
+        let flushes = cm.custom.iter().find(|(k, _)| k == "iceberg.flush_count");
         assert_eq!(flushes.unwrap().1, 2.0);
     }
 
@@ -238,10 +236,7 @@ mod tests {
         m.record_commit(12350);
 
         let cm = m.to_connector_metrics();
-        let commits = cm
-            .custom
-            .iter()
-            .find(|(k, _)| k == "iceberg.commits");
+        let commits = cm.custom.iter().find(|(k, _)| k == "iceberg.commits");
         assert_eq!(commits.unwrap().1, 2.0);
 
         let snapshot_id = cm
@@ -250,10 +245,7 @@ mod tests {
             .find(|(k, _)| k == "iceberg.last_snapshot_id");
         assert_eq!(snapshot_id.unwrap().1, 12350.0);
 
-        let version = cm
-            .custom
-            .iter()
-            .find(|(k, _)| k == "iceberg.table_version");
+        let version = cm.custom.iter().find(|(k, _)| k == "iceberg.table_version");
         assert_eq!(version.unwrap().1, 2.0);
     }
 

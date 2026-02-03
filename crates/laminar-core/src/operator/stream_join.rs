@@ -76,13 +76,12 @@ use super::{
     Event, Operator, OperatorContext, OperatorError, OperatorState, Output, OutputVec, Timer,
     TimerKey,
 };
-use bytes::Bytes;
 use crate::state::{StateStore, StateStoreExt};
-use arrow_array::{Array, ArrayRef, RecordBatch, StringArray, Int64Array, Float64Array};
+use arrow_array::{Array, ArrayRef, Float64Array, Int64Array, RecordBatch, StringArray};
 use arrow_schema::{DataType, Field, Schema, SchemaRef};
+use bytes::Bytes;
 use rkyv::{
-    rancor::Error as RkyvError,
-    Archive, Deserialize as RkyvDeserialize, Serialize as RkyvSerialize,
+    rancor::Error as RkyvError, Archive, Deserialize as RkyvDeserialize, Serialize as RkyvSerialize,
 };
 use std::collections::HashMap;
 use std::sync::atomic::{AtomicU64, Ordering};
@@ -166,7 +165,9 @@ impl std::str::FromStr for JoinRowEncoding {
         match s.to_lowercase().as_str() {
             "compact" => Ok(Self::Compact),
             "cpu_friendly" | "cpufriendly" | "cpu-friendly" => Ok(Self::CpuFriendly),
-            _ => Err(format!("Unknown encoding: {s}. Expected 'compact' or 'cpu_friendly'")),
+            _ => Err(format!(
+                "Unknown encoding: {s}. Expected 'compact' or 'cpu_friendly'"
+            )),
         }
     }
 }
@@ -230,7 +231,7 @@ impl Default for StreamJoinConfig {
             operator_id: None,
             row_encoding: JoinRowEncoding::Compact,
             asymmetric_compaction: true,
-            idle_threshold_ms: 60_000,      // 1 minute
+            idle_threshold_ms: 60_000, // 1 minute
             per_key_tracking: true,
             key_idle_threshold_ms: 300_000, // 5 minutes
             build_side_pruning: true,
@@ -606,8 +607,14 @@ impl JoinRow {
     }
 
     /// Writes an Int64 column in CPU-friendly format.
-    fn write_int64_column(buf: &mut Vec<u8>, column: &ArrayRef, num_rows: usize) -> Result<(), OperatorError> {
-        let arr = column.as_any().downcast_ref::<Int64Array>()
+    fn write_int64_column(
+        buf: &mut Vec<u8>,
+        column: &ArrayRef,
+        num_rows: usize,
+    ) -> Result<(), OperatorError> {
+        let arr = column
+            .as_any()
+            .downcast_ref::<Int64Array>()
             .ok_or_else(|| OperatorError::SerializationFailed("Expected Int64Array".into()))?;
 
         // Validity bitmap (1 bit per row, padded to bytes)
@@ -630,17 +637,22 @@ impl JoinRow {
         // SAFETY: Converting i64 slice to bytes for zero-copy serialization.
         // The pointer cast is safe because we're reinterpreting the same memory.
         let values = arr.values();
-        let value_bytes = unsafe {
-            std::slice::from_raw_parts(values.as_ptr().cast::<u8>(), values.len() * 8)
-        };
+        let value_bytes =
+            unsafe { std::slice::from_raw_parts(values.as_ptr().cast::<u8>(), values.len() * 8) };
         buf.extend_from_slice(value_bytes);
 
         Ok(())
     }
 
     /// Writes a Float64 column in CPU-friendly format.
-    fn write_float64_column(buf: &mut Vec<u8>, column: &ArrayRef, num_rows: usize) -> Result<(), OperatorError> {
-        let arr = column.as_any().downcast_ref::<Float64Array>()
+    fn write_float64_column(
+        buf: &mut Vec<u8>,
+        column: &ArrayRef,
+        num_rows: usize,
+    ) -> Result<(), OperatorError> {
+        let arr = column
+            .as_any()
+            .downcast_ref::<Float64Array>()
             .ok_or_else(|| OperatorError::SerializationFailed("Expected Float64Array".into()))?;
 
         // Validity bitmap
@@ -659,9 +671,8 @@ impl JoinRow {
         // Raw values (8 bytes each)
         // SAFETY: Converting f64 slice to bytes for zero-copy serialization.
         let values = arr.values();
-        let value_bytes = unsafe {
-            std::slice::from_raw_parts(values.as_ptr().cast::<u8>(), values.len() * 8)
-        };
+        let value_bytes =
+            unsafe { std::slice::from_raw_parts(values.as_ptr().cast::<u8>(), values.len() * 8) };
         buf.extend_from_slice(value_bytes);
 
         Ok(())
@@ -669,8 +680,14 @@ impl JoinRow {
 
     /// Writes a Utf8 column in CPU-friendly format.
     #[allow(clippy::cast_sign_loss)]
-    fn write_utf8_column(buf: &mut Vec<u8>, column: &ArrayRef, num_rows: usize) -> Result<(), OperatorError> {
-        let arr = column.as_any().downcast_ref::<StringArray>()
+    fn write_utf8_column(
+        buf: &mut Vec<u8>,
+        column: &ArrayRef,
+        num_rows: usize,
+    ) -> Result<(), OperatorError> {
+        let arr = column
+            .as_any()
+            .downcast_ref::<StringArray>()
             .ok_or_else(|| OperatorError::SerializationFailed("Expected StringArray".into()))?;
 
         // Validity bitmap
@@ -723,7 +740,9 @@ impl JoinRow {
     /// Deserializes from CPU-friendly format (F057).
     fn deserialize_cpu_friendly(data: &[u8]) -> Result<RecordBatch, OperatorError> {
         if data.len() < 10 {
-            return Err(OperatorError::SerializationFailed("Buffer too short".into()));
+            return Err(OperatorError::SerializationFailed(
+                "Buffer too short".into(),
+            ));
         }
 
         // Parse header
@@ -736,7 +755,9 @@ impl JoinRow {
 
         for _ in 0..num_cols {
             if offset + 2 > data.len() {
-                return Err(OperatorError::SerializationFailed("Truncated column header".into()));
+                return Err(OperatorError::SerializationFailed(
+                    "Truncated column header".into(),
+                ));
             }
 
             // Read column name
@@ -744,13 +765,17 @@ impl JoinRow {
             offset += 2;
 
             if offset + name_len > data.len() {
-                return Err(OperatorError::SerializationFailed("Truncated column name".into()));
+                return Err(OperatorError::SerializationFailed(
+                    "Truncated column name".into(),
+                ));
             }
             let name = String::from_utf8_lossy(&data[offset..offset + name_len]).to_string();
             offset += name_len;
 
             if offset + 2 > data.len() {
-                return Err(OperatorError::SerializationFailed("Truncated type info".into()));
+                return Err(OperatorError::SerializationFailed(
+                    "Truncated type info".into(),
+                ));
             }
 
             // Read nullable and type
@@ -764,19 +789,22 @@ impl JoinRow {
 
             match type_tag {
                 t if t == CpuFriendlyType::Int64 as u8 => {
-                    let (arr, new_offset) = Self::read_int64_column(data, offset, num_rows, validity_bytes)?;
+                    let (arr, new_offset) =
+                        Self::read_int64_column(data, offset, num_rows, validity_bytes)?;
                     offset = new_offset;
                     fields.push(Field::new(&name, DataType::Int64, nullable));
                     columns.push(Arc::new(arr));
                 }
                 t if t == CpuFriendlyType::Float64 as u8 => {
-                    let (arr, new_offset) = Self::read_float64_column(data, offset, num_rows, validity_bytes)?;
+                    let (arr, new_offset) =
+                        Self::read_float64_column(data, offset, num_rows, validity_bytes)?;
                     offset = new_offset;
                     fields.push(Field::new(&name, DataType::Float64, nullable));
                     columns.push(Arc::new(arr));
                 }
                 t if t == CpuFriendlyType::Utf8 as u8 => {
-                    let (arr, new_offset) = Self::read_utf8_column(data, offset, num_rows, validity_bytes)?;
+                    let (arr, new_offset) =
+                        Self::read_utf8_column(data, offset, num_rows, validity_bytes)?;
                     offset = new_offset;
                     fields.push(Field::new(&name, DataType::Utf8, nullable));
                     columns.push(Arc::new(arr));
@@ -805,22 +833,32 @@ impl JoinRow {
 
         // Skip validity bitmap (we don't reconstruct it for simplicity)
         if pos + validity_bytes > data.len() {
-            return Err(OperatorError::SerializationFailed("Truncated validity".into()));
+            return Err(OperatorError::SerializationFailed(
+                "Truncated validity".into(),
+            ));
         }
         pos += validity_bytes;
 
         // Read values
         let values_bytes = num_rows * 8;
         if pos + values_bytes > data.len() {
-            return Err(OperatorError::SerializationFailed("Truncated int64 values".into()));
+            return Err(OperatorError::SerializationFailed(
+                "Truncated int64 values".into(),
+            ));
         }
 
         let mut values = Vec::with_capacity(num_rows);
         for i in 0..num_rows {
             let start = pos + i * 8;
             let bytes = [
-                data[start], data[start + 1], data[start + 2], data[start + 3],
-                data[start + 4], data[start + 5], data[start + 6], data[start + 7],
+                data[start],
+                data[start + 1],
+                data[start + 2],
+                data[start + 3],
+                data[start + 4],
+                data[start + 5],
+                data[start + 6],
+                data[start + 7],
             ];
             values.push(i64::from_le_bytes(bytes));
         }
@@ -840,22 +878,32 @@ impl JoinRow {
 
         // Skip validity bitmap
         if pos + validity_bytes > data.len() {
-            return Err(OperatorError::SerializationFailed("Truncated validity".into()));
+            return Err(OperatorError::SerializationFailed(
+                "Truncated validity".into(),
+            ));
         }
         pos += validity_bytes;
 
         // Read values
         let values_bytes = num_rows * 8;
         if pos + values_bytes > data.len() {
-            return Err(OperatorError::SerializationFailed("Truncated float64 values".into()));
+            return Err(OperatorError::SerializationFailed(
+                "Truncated float64 values".into(),
+            ));
         }
 
         let mut values = Vec::with_capacity(num_rows);
         for i in 0..num_rows {
             let start = pos + i * 8;
             let bytes = [
-                data[start], data[start + 1], data[start + 2], data[start + 3],
-                data[start + 4], data[start + 5], data[start + 6], data[start + 7],
+                data[start],
+                data[start + 1],
+                data[start + 2],
+                data[start + 3],
+                data[start + 4],
+                data[start + 5],
+                data[start + 6],
+                data[start + 7],
             ];
             values.push(f64::from_le_bytes(bytes));
         }
@@ -875,20 +923,29 @@ impl JoinRow {
 
         // Skip validity bitmap
         if pos + validity_bytes > data.len() {
-            return Err(OperatorError::SerializationFailed("Truncated validity".into()));
+            return Err(OperatorError::SerializationFailed(
+                "Truncated validity".into(),
+            ));
         }
         pos += validity_bytes;
 
         // Read offsets
         let offsets_bytes = (num_rows + 1) * 4;
         if pos + offsets_bytes > data.len() {
-            return Err(OperatorError::SerializationFailed("Truncated offsets".into()));
+            return Err(OperatorError::SerializationFailed(
+                "Truncated offsets".into(),
+            ));
         }
 
         let mut offsets = Vec::with_capacity(num_rows + 1);
         for i in 0..=num_rows {
             let start = pos + i * 4;
-            let bytes = [data[start], data[start + 1], data[start + 2], data[start + 3]];
+            let bytes = [
+                data[start],
+                data[start + 1],
+                data[start + 2],
+                data[start + 3],
+            ];
             offsets.push(u32::from_le_bytes(bytes) as usize);
         }
         pos += offsets_bytes;
@@ -896,7 +953,9 @@ impl JoinRow {
         // Calculate data length and read string data
         let data_len = offsets.last().copied().unwrap_or(0);
         if pos + data_len > data.len() {
-            return Err(OperatorError::SerializationFailed("Truncated string data".into()));
+            return Err(OperatorError::SerializationFailed(
+                "Truncated string data".into(),
+            ));
         }
 
         let string_data = &data[pos..pos + data_len];
@@ -1254,8 +1313,12 @@ impl StreamJoinOperator {
     #[must_use]
     pub fn is_side_idle(&self, side: JoinSide, current_time: i64) -> bool {
         match side {
-            JoinSide::Left => self.left_stats.is_idle(current_time, self.idle_threshold_ms),
-            JoinSide::Right => self.right_stats.is_idle(current_time, self.idle_threshold_ms),
+            JoinSide::Left => self
+                .left_stats
+                .is_idle(current_time, self.idle_threshold_ms),
+            JoinSide::Right => self
+                .right_stats
+                .is_idle(current_time, self.idle_threshold_ms),
         }
     }
 
@@ -1422,15 +1485,19 @@ impl StreamJoinOperator {
         // Register cleanup timer
         let cleanup_time = event_time + self.time_bound_ms;
         let timer_key = Self::make_timer_key(side, &state_key);
-        ctx.timers.register_timer(cleanup_time, Some(timer_key), Some(ctx.operator_index));
+        ctx.timers
+            .register_timer(cleanup_time, Some(timer_key), Some(ctx.operator_index));
 
         // For outer joins, register unmatched emission timer
         if (side == JoinSide::Left && self.join_type.emits_unmatched_left())
             || (side == JoinSide::Right && self.join_type.emits_unmatched_right())
         {
             let unmatched_timer_key = Self::make_unmatched_timer_key(side, &state_key);
-            ctx.timers
-                .register_timer(cleanup_time, Some(unmatched_timer_key), Some(ctx.operator_index));
+            ctx.timers.register_timer(
+                cleanup_time,
+                Some(unmatched_timer_key),
+                Some(ctx.operator_index),
+            );
         }
 
         // F057: Build-side pruning - prune entries that can no longer produce matches
@@ -1522,8 +1589,9 @@ impl StreamJoinOperator {
                         let timestamp = i64::from_be_bytes(ts_bytes);
                         if timestamp + time_bound < prune_threshold {
                             // Also verify via deserialization
-                            if let Ok(row) = rkyv::access::<rkyv::Archived<JoinRow>, RkyvError>(&value)
-                                .and_then(rkyv::deserialize::<JoinRow, RkyvError>)
+                            if let Ok(row) =
+                                rkyv::access::<rkyv::Archived<JoinRow>, RkyvError>(&value)
+                                    .and_then(rkyv::deserialize::<JoinRow, RkyvError>)
                             {
                                 if row.timestamp + time_bound < prune_threshold {
                                     self.prune_buffer.push(key);
@@ -1554,7 +1622,8 @@ impl StreamJoinOperator {
         let threshold = ctx.processing_time - self.key_idle_threshold_ms;
 
         // Find idle keys
-        let idle_keys: Vec<u64> = self.key_metadata
+        let idle_keys: Vec<u64> = self
+            .key_metadata
             .iter()
             .filter(|(_, meta)| meta.last_activity < threshold && meta.state_entries == 0)
             .map(|(k, _)| *k)
@@ -1578,8 +1647,12 @@ impl StreamJoinOperator {
 
         // Skip compaction if side is idle
         let is_idle = match side {
-            JoinSide::Left => self.left_stats.is_idle(current_time, self.idle_threshold_ms),
-            JoinSide::Right => self.right_stats.is_idle(current_time, self.idle_threshold_ms),
+            JoinSide::Left => self
+                .left_stats
+                .is_idle(current_time, self.idle_threshold_ms),
+            JoinSide::Right => self
+                .right_stats
+                .is_idle(current_time, self.idle_threshold_ms),
         };
 
         if is_idle {
@@ -1744,11 +1817,7 @@ impl StreamJoinOperator {
     }
 
     /// Creates an unmatched event for outer joins.
-    fn create_unmatched_event(
-        &self,
-        side: JoinSide,
-        row: &JoinRow,
-    ) -> Option<Event> {
+    fn create_unmatched_event(&self, side: JoinSide, row: &JoinRow) -> Option<Event> {
         let batch = row.to_batch().ok()?;
         let schema = self.output_schema.as_ref()?;
 
@@ -1787,13 +1856,8 @@ impl StreamJoinOperator {
     /// Creates a null array of the given type and length.
     fn create_null_array(data_type: &DataType, num_rows: usize) -> ArrayRef {
         match data_type {
-            DataType::Int64 => {
-                Arc::new(Int64Array::from(vec![None; num_rows])) as ArrayRef
-            }
-            DataType::Utf8 => {
-                Arc::new(StringArray::from(vec![None::<&str>; num_rows])) as ArrayRef
-            }
-            // Add more types as needed
+            DataType::Utf8 => Arc::new(StringArray::from(vec![None::<&str>; num_rows])) as ArrayRef,
+            // Default to Int64 for all other types (add more specific cases as needed)
             _ => Arc::new(Int64Array::from(vec![None; num_rows])) as ArrayRef,
         }
     }
@@ -1973,10 +2037,10 @@ impl Operator for StreamJoinOperator {
     fn restore(&mut self, state: OperatorState) -> Result<(), OperatorError> {
         // Extended checkpoint data type with F057 fields using nested tuples
         type CheckpointData = (
-            (String, String, i64),       // config
-            (u64, u64, u64),             // core metrics
-            (u64, u64, u64, u64, u64),   // F057 metrics
-            (u64, u64, i64, i64),        // F057 side stats
+            (String, String, i64),     // config
+            (u64, u64, u64),           // core metrics
+            (u64, u64, u64, u64, u64), // F057 metrics
+            (u64, u64, i64, i64),      // F057 side stats
         );
         // Legacy checkpoint type for backward compatibility
         type LegacyCheckpointData = (String, String, i64, u64, u64, u64);
@@ -1989,12 +2053,19 @@ impl Operator for StreamJoinOperator {
         }
 
         // Try to restore full F057 checkpoint first
-        if let Ok(archived) = rkyv::access::<rkyv::Archived<CheckpointData>, RkyvError>(&state.data) {
+        if let Ok(archived) = rkyv::access::<rkyv::Archived<CheckpointData>, RkyvError>(&state.data)
+        {
             if let Ok(data) = rkyv::deserialize::<CheckpointData, RkyvError>(archived) {
                 let (
                     _config,
                     (left_events, right_events, matches),
-                    (cpu_friendly_encodes, compact_encodes, asymmetric_skips, idle_key_cleanups, build_side_prunes),
+                    (
+                        cpu_friendly_encodes,
+                        compact_encodes,
+                        asymmetric_skips,
+                        idle_key_cleanups,
+                        build_side_prunes,
+                    ),
                     (left_received, right_received, left_wm, right_wm),
                 ) = data;
 
@@ -2147,7 +2218,13 @@ mod tests {
             let mut ctx = create_test_context(&mut timers, &mut state, &mut watermark_gen);
             let outputs = operator.process_side(&order, JoinSide::Left, &mut ctx);
             // No match yet, should produce no output
-            assert!(outputs.iter().filter(|o| matches!(o, Output::Event(_))).count() == 0);
+            assert!(
+                outputs
+                    .iter()
+                    .filter(|o| matches!(o, Output::Event(_)))
+                    .count()
+                    == 0
+            );
         }
 
         // Process right event (payment) - should produce a match
@@ -2156,7 +2233,13 @@ mod tests {
             let mut ctx = create_test_context(&mut timers, &mut state, &mut watermark_gen);
             let outputs = operator.process_side(&payment, JoinSide::Right, &mut ctx);
             // Should have one match
-            assert_eq!(outputs.iter().filter(|o| matches!(o, Output::Event(_))).count(), 1);
+            assert_eq!(
+                outputs
+                    .iter()
+                    .filter(|o| matches!(o, Output::Event(_)))
+                    .count(),
+                1
+            );
         }
 
         assert_eq!(operator.metrics().matches, 1);
@@ -2191,7 +2274,13 @@ mod tests {
             let mut ctx = create_test_context(&mut timers, &mut state, &mut watermark_gen);
             let outputs = operator.process_side(&payment, JoinSide::Right, &mut ctx);
             // No match due to different key
-            assert_eq!(outputs.iter().filter(|o| matches!(o, Output::Event(_))).count(), 0);
+            assert_eq!(
+                outputs
+                    .iter()
+                    .filter(|o| matches!(o, Output::Event(_)))
+                    .count(),
+                0
+            );
         }
 
         assert_eq!(operator.metrics().matches, 0);
@@ -2224,7 +2313,13 @@ mod tests {
             let mut ctx = create_test_context(&mut timers, &mut state, &mut watermark_gen);
             let outputs = operator.process_side(&payment, JoinSide::Right, &mut ctx);
             // No match due to time bound
-            assert_eq!(outputs.iter().filter(|o| matches!(o, Output::Event(_))).count(), 0);
+            assert_eq!(
+                outputs
+                    .iter()
+                    .filter(|o| matches!(o, Output::Event(_)))
+                    .count(),
+                0
+            );
         }
 
         assert_eq!(operator.metrics().matches, 0);
@@ -2257,7 +2352,13 @@ mod tests {
             let mut ctx = create_test_context(&mut timers, &mut state, &mut watermark_gen);
             let outputs = operator.process_side(&payment, JoinSide::Right, &mut ctx);
             // Should have two matches
-            assert_eq!(outputs.iter().filter(|o| matches!(o, Output::Event(_))).count(), 2);
+            assert_eq!(
+                outputs
+                    .iter()
+                    .filter(|o| matches!(o, Output::Event(_)))
+                    .count(),
+                2
+            );
         }
 
         assert_eq!(operator.metrics().matches, 2);
@@ -2433,7 +2534,13 @@ mod tests {
         {
             let mut ctx = create_test_context(&mut timers, &mut state, &mut watermark_gen);
             let outputs = operator.process_side(&payment, JoinSide::Right, &mut ctx);
-            assert_eq!(outputs.iter().filter(|o| matches!(o, Output::Event(_))).count(), 0);
+            assert_eq!(
+                outputs
+                    .iter()
+                    .filter(|o| matches!(o, Output::Event(_)))
+                    .count(),
+                0
+            );
         }
 
         // Left event arrives and matches
@@ -2441,7 +2548,13 @@ mod tests {
         {
             let mut ctx = create_test_context(&mut timers, &mut state, &mut watermark_gen);
             let outputs = operator.process_side(&order, JoinSide::Left, &mut ctx);
-            assert_eq!(outputs.iter().filter(|o| matches!(o, Output::Event(_))).count(), 1);
+            assert_eq!(
+                outputs
+                    .iter()
+                    .filter(|o| matches!(o, Output::Event(_)))
+                    .count(),
+                1
+            );
         }
 
         assert_eq!(operator.metrics().matches, 1);
@@ -2489,7 +2602,13 @@ mod tests {
         {
             let mut ctx = create_test_context(&mut timers, &mut state, &mut watermark_gen);
             let outputs = operator.process_side(&right, JoinSide::Right, &mut ctx);
-            assert_eq!(outputs.iter().filter(|o| matches!(o, Output::Event(_))).count(), 1);
+            assert_eq!(
+                outputs
+                    .iter()
+                    .filter(|o| matches!(o, Output::Event(_)))
+                    .count(),
+                1
+            );
         }
 
         assert_eq!(operator.metrics().matches, 1);
@@ -2503,9 +2622,18 @@ mod tests {
         assert_eq!(format!("{}", JoinRowEncoding::Compact), "compact");
         assert_eq!(format!("{}", JoinRowEncoding::CpuFriendly), "cpu_friendly");
 
-        assert_eq!("compact".parse::<JoinRowEncoding>().unwrap(), JoinRowEncoding::Compact);
-        assert_eq!("cpu_friendly".parse::<JoinRowEncoding>().unwrap(), JoinRowEncoding::CpuFriendly);
-        assert_eq!("cpu-friendly".parse::<JoinRowEncoding>().unwrap(), JoinRowEncoding::CpuFriendly);
+        assert_eq!(
+            "compact".parse::<JoinRowEncoding>().unwrap(),
+            JoinRowEncoding::Compact
+        );
+        assert_eq!(
+            "cpu_friendly".parse::<JoinRowEncoding>().unwrap(),
+            JoinRowEncoding::CpuFriendly
+        );
+        assert_eq!(
+            "cpu-friendly".parse::<JoinRowEncoding>().unwrap(),
+            JoinRowEncoding::CpuFriendly
+        );
         assert!("invalid".parse::<JoinRowEncoding>().is_err());
     }
 
@@ -2575,7 +2703,9 @@ mod tests {
         .unwrap();
 
         // Test CPU-friendly encoding
-        let row = JoinRow::with_encoding(1000, b"key".to_vec(), &batch, JoinRowEncoding::CpuFriendly).unwrap();
+        let row =
+            JoinRow::with_encoding(1000, b"key".to_vec(), &batch, JoinRowEncoding::CpuFriendly)
+                .unwrap();
         assert_eq!(row.encoding(), JoinRowEncoding::CpuFriendly);
 
         // Verify roundtrip
@@ -2584,13 +2714,25 @@ mod tests {
         assert_eq!(restored.num_columns(), 3);
 
         // Verify values
-        let id_col = restored.column(0).as_any().downcast_ref::<StringArray>().unwrap();
+        let id_col = restored
+            .column(0)
+            .as_any()
+            .downcast_ref::<StringArray>()
+            .unwrap();
         assert_eq!(id_col.value(0), "test_key");
 
-        let value_col = restored.column(1).as_any().downcast_ref::<Int64Array>().unwrap();
+        let value_col = restored
+            .column(1)
+            .as_any()
+            .downcast_ref::<Int64Array>()
+            .unwrap();
         assert_eq!(value_col.value(0), 42);
 
-        let price_col = restored.column(2).as_any().downcast_ref::<Float64Array>().unwrap();
+        let price_col = restored
+            .column(2)
+            .as_any()
+            .downcast_ref::<Float64Array>()
+            .unwrap();
         assert!((price_col.value(0) - 99.99).abs() < 0.001);
     }
 
@@ -2609,7 +2751,8 @@ mod tests {
         )
         .unwrap();
 
-        let row = JoinRow::with_encoding(1000, b"key".to_vec(), &batch, JoinRowEncoding::Compact).unwrap();
+        let row = JoinRow::with_encoding(1000, b"key".to_vec(), &batch, JoinRowEncoding::Compact)
+            .unwrap();
         assert_eq!(row.encoding(), JoinRowEncoding::Compact);
 
         let restored = row.to_batch().unwrap();
@@ -2696,7 +2839,7 @@ mod tests {
                 .time_bound(Duration::from_secs(3600))
                 .join_type(JoinType::Inner)
                 .row_encoding(JoinRowEncoding::Compact)
-                .build()
+                .build(),
         );
 
         let mut timers = TimerService::new();
@@ -2719,7 +2862,7 @@ mod tests {
                 .time_bound(Duration::from_secs(3600))
                 .join_type(JoinType::Inner)
                 .row_encoding(JoinRowEncoding::CpuFriendly)
-                .build()
+                .build(),
         );
 
         let mut state2 = InMemoryStore::new();
@@ -2823,7 +2966,13 @@ mod tests {
         {
             let mut ctx = create_test_context(&mut timers, &mut state, &mut watermark_gen);
             let outputs = operator.process_side(&payment, JoinSide::Right, &mut ctx);
-            assert_eq!(outputs.iter().filter(|o| matches!(o, Output::Event(_))).count(), 1);
+            assert_eq!(
+                outputs
+                    .iter()
+                    .filter(|o| matches!(o, Output::Event(_)))
+                    .count(),
+                1
+            );
         }
 
         assert_eq!(operator.metrics().matches, 1);
@@ -2929,11 +3078,21 @@ mod tests {
         )
         .unwrap();
 
-        let row = JoinRow::with_encoding(1000, b"key".to_vec(), &batch, JoinRowEncoding::CpuFriendly).unwrap();
+        let row =
+            JoinRow::with_encoding(1000, b"key".to_vec(), &batch, JoinRowEncoding::CpuFriendly)
+                .unwrap();
         let restored = row.to_batch().unwrap();
 
-        let id_col = restored.column(0).as_any().downcast_ref::<Int64Array>().unwrap();
-        let name_col = restored.column(1).as_any().downcast_ref::<StringArray>().unwrap();
+        let id_col = restored
+            .column(0)
+            .as_any()
+            .downcast_ref::<Int64Array>()
+            .unwrap();
+        let name_col = restored
+            .column(1)
+            .as_any()
+            .downcast_ref::<StringArray>()
+            .unwrap();
 
         assert_eq!(id_col.value(0), 1);
         assert_eq!(name_col.value(0), "Alice");

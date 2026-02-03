@@ -102,10 +102,7 @@ impl IoUringError {
     /// Check if this error indicates a transient condition.
     #[must_use]
     pub const fn is_transient(&self) -> bool {
-        matches!(
-            self,
-            Self::SubmissionQueueFull | Self::BufferPoolExhausted
-        )
+        matches!(self, Self::SubmissionQueueFull | Self::BufferPoolExhausted)
     }
 }
 

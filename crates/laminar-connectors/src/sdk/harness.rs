@@ -679,7 +679,10 @@ mod tests {
 
         // Create new source and restore
         let mut new_source = TestSourceConnector::with_generated_batches(5, 10);
-        new_source.open(&ConnectorConfig::new("test")).await.unwrap();
+        new_source
+            .open(&ConnectorConfig::new("test"))
+            .await
+            .unwrap();
         new_source.restore(&cp).await.unwrap();
 
         assert_eq!(new_source.records_produced(), 20);

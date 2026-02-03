@@ -275,7 +275,8 @@ impl PartitionedWatermarkTracker {
         self.source_partition_counts[source_id] = num_partitions;
 
         // Create partition state for each partition
-        #[allow(clippy::cast_possible_truncation)] // Partition count bounded by Kafka max (< u32::MAX)
+        #[allow(clippy::cast_possible_truncation)]
+        // Partition count bounded by Kafka max (< u32::MAX)
         for partition in 0..num_partitions {
             let pid = PartitionId::new(source_id, partition as u32);
             self.partitions.entry(pid).or_default();
@@ -345,10 +346,7 @@ impl PartitionedWatermarkTracker {
             if state.is_idle {
                 state.is_idle = false;
                 self.metrics.active_partitions += 1;
-                self.metrics.idle_partitions = self
-                    .metrics
-                    .idle_partitions
-                    .saturating_sub(1);
+                self.metrics.idle_partitions = self.metrics.idle_partitions.saturating_sub(1);
             }
             state.last_activity = Instant::now();
 
@@ -386,10 +384,7 @@ impl PartitionedWatermarkTracker {
             if !state.is_idle {
                 state.is_idle = true;
                 self.metrics.idle_partitions += 1;
-                self.metrics.active_partitions = self
-                    .metrics
-                    .active_partitions
-                    .saturating_sub(1);
+                self.metrics.active_partitions = self.metrics.active_partitions.saturating_sub(1);
                 return self.try_advance_combined();
             }
         }
@@ -406,10 +401,7 @@ impl PartitionedWatermarkTracker {
                 state.is_idle = false;
                 state.last_activity = Instant::now();
                 self.metrics.active_partitions += 1;
-                self.metrics.idle_partitions = self
-                    .metrics
-                    .idle_partitions
-                    .saturating_sub(1);
+                self.metrics.idle_partitions = self.metrics.idle_partitions.saturating_sub(1);
             }
         }
     }
@@ -479,9 +471,7 @@ impl PartitionedWatermarkTracker {
     /// Returns whether a partition is idle.
     #[must_use]
     pub fn is_partition_idle(&self, partition: PartitionId) -> bool {
-        self.partitions
-            .get(&partition)
-            .is_some_and(|s| s.is_idle)
+        self.partitions.get(&partition).is_some_and(|s| s.is_idle)
     }
 
     /// Returns the number of active partitions for a source.
@@ -610,12 +600,9 @@ impl PartitionedWatermarkTracker {
     /// Updates metrics counts.
     fn update_metrics(&mut self) {
         self.metrics.total_partitions = self.partitions.len();
-        self.metrics.idle_partitions = self
-            .partitions
-            .values()
-            .filter(|s| s.is_idle)
-            .count();
-        self.metrics.active_partitions = self.metrics.total_partitions - self.metrics.idle_partitions;
+        self.metrics.idle_partitions = self.partitions.values().filter(|s| s.is_idle).count();
+        self.metrics.active_partitions =
+            self.metrics.total_partitions - self.metrics.idle_partitions;
     }
 }
 
@@ -687,7 +674,11 @@ impl CoreWatermarkState {
 
     /// Removes a partition from this core.
     pub fn remove_partition(&mut self, partition: PartitionId) -> bool {
-        if let Some(idx) = self.assigned_partitions.iter().position(|p| *p == partition) {
+        if let Some(idx) = self
+            .assigned_partitions
+            .iter()
+            .position(|p| *p == partition)
+        {
             self.assigned_partitions.swap_remove(idx);
             self.partition_watermarks.swap_remove(idx);
             self.idle_status.swap_remove(idx);
@@ -705,7 +696,11 @@ impl CoreWatermarkState {
     /// `Some(i64)` with the new local watermark if it advances.
     #[inline]
     pub fn update_partition(&mut self, partition: PartitionId, watermark: i64) -> Option<i64> {
-        if let Some(idx) = self.assigned_partitions.iter().position(|p| *p == partition) {
+        if let Some(idx) = self
+            .assigned_partitions
+            .iter()
+            .position(|p| *p == partition)
+        {
             if watermark > self.partition_watermarks[idx] {
                 self.partition_watermarks[idx] = watermark;
                 self.idle_status[idx] = false;
@@ -723,7 +718,11 @@ impl CoreWatermarkState {
 
     /// Marks a partition as idle on this core.
     pub fn mark_idle(&mut self, partition: PartitionId) -> Option<i64> {
-        if let Some(idx) = self.assigned_partitions.iter().position(|p| *p == partition) {
+        if let Some(idx) = self
+            .assigned_partitions
+            .iter()
+            .position(|p| *p == partition)
+        {
             if !self.idle_status[idx] {
                 self.idle_status[idx] = true;
 
@@ -871,7 +870,6 @@ impl GlobalWatermarkCollector {
 mod tests {
     use super::*;
 
-
     #[test]
     fn test_partition_id_creation() {
         let pid = PartitionId::new(1, 3);
@@ -894,7 +892,6 @@ mod tests {
         let pid = PartitionId::new(2, 5);
         assert_eq!(format!("{pid}"), "2:5");
     }
-
 
     #[test]
     fn test_partitioned_tracker_single_partition_updates_watermark() {
@@ -1119,7 +1116,6 @@ mod tests {
         assert!(matches!(result, Err(WatermarkError::PartitionExists(_))));
     }
 
-
     #[test]
     fn test_core_watermark_state_creation() {
         let state = CoreWatermarkState::new(0);
@@ -1130,10 +1126,7 @@ mod tests {
 
     #[test]
     fn test_core_watermark_state_with_partitions() {
-        let partitions = vec![
-            PartitionId::new(0, 0),
-            PartitionId::new(0, 1),
-        ];
+        let partitions = vec![PartitionId::new(0, 0), PartitionId::new(0, 1)];
         let state = CoreWatermarkState::with_partitions(1, partitions);
 
         assert_eq!(state.core_id(), 1);
@@ -1204,7 +1197,6 @@ mod tests {
         assert_eq!(state.partition_count(), 1);
         assert_eq!(state.local_watermark(), 5000);
     }
-
 
     #[test]
     fn test_global_collector_creation() {

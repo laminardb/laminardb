@@ -84,9 +84,7 @@ impl ConnectorConfig {
     {
         match self.get(key) {
             Some(v) => v.parse::<T>().map(Some).map_err(|e| {
-                ConnectorError::ConfigurationError(format!(
-                    "invalid value for '{key}': {e}"
-                ))
+                ConnectorError::ConfigurationError(format!("invalid value for '{key}': {e}"))
             }),
             None => Ok(None),
         }
@@ -104,9 +102,7 @@ impl ConnectorConfig {
     {
         let value = self.require(key)?;
         value.parse::<T>().map_err(|e| {
-            ConnectorError::ConfigurationError(format!(
-                "invalid value for '{key}': {e}"
-            ))
+            ConnectorError::ConfigurationError(format!("invalid value for '{key}': {e}"))
         })
     }
 
@@ -332,10 +328,7 @@ mod tests {
             kafka_props.get("bootstrap.servers"),
             Some(&"localhost:9092".to_string())
         );
-        assert_eq!(
-            kafka_props.get("group.id"),
-            Some(&"my-group".to_string())
-        );
+        assert_eq!(kafka_props.get("group.id"), Some(&"my-group".to_string()));
     }
 
     #[test]

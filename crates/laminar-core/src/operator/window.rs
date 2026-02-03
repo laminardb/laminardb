@@ -42,7 +42,6 @@ use super::{
 use crate::state::{StateStore, StateStoreExt};
 use arrow_array::{Array as ArrowArray, Int64Array, RecordBatch};
 use arrow_schema::{DataType, Field, Schema, SchemaRef};
-use smallvec::SmallVec;
 use rkyv::{
     api::high::{HighDeserializer, HighSerializer, HighValidator},
     bytecheck::CheckBytes,
@@ -51,6 +50,7 @@ use rkyv::{
     util::AlignedVec,
     Archive, Deserialize as RkyvDeserialize, Serialize as RkyvSerialize,
 };
+use smallvec::SmallVec;
 use std::marker::PhantomData;
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::Arc;
@@ -179,7 +179,6 @@ impl LateDataMetrics {
 #[derive(Debug, Clone, PartialEq, Eq, Default)]
 pub enum EmitStrategy {
     // === Existing (F011) ===
-
     /// Emit final results when watermark passes window end (default).
     ///
     /// This is the most efficient strategy as it only emits once per window.
@@ -205,7 +204,6 @@ pub enum EmitStrategy {
     OnUpdate,
 
     // === New (F011B) ===
-
     /// Emit ONLY when watermark passes window end. No intermediate emissions.
     ///
     /// **Critical for append-only sinks** (Kafka, S3, Delta Lake, Iceberg).
@@ -1935,7 +1933,10 @@ impl DynAccumulator for SumF64IndexedAccumulator {
         if self.column_index >= batch.num_columns() {
             return;
         }
-        if let Some(array) = batch.column(self.column_index).as_primitive_opt::<Float64Type>() {
+        if let Some(array) = batch
+            .column(self.column_index)
+            .as_primitive_opt::<Float64Type>()
+        {
             for val in array.iter().flatten() {
                 self.sum += val;
                 self.count += 1;
@@ -2056,7 +2057,10 @@ impl DynAccumulator for MinF64IndexedAccumulator {
         if self.column_index >= batch.num_columns() {
             return;
         }
-        if let Some(array) = batch.column(self.column_index).as_primitive_opt::<Float64Type>() {
+        if let Some(array) = batch
+            .column(self.column_index)
+            .as_primitive_opt::<Float64Type>()
+        {
             for val in array.iter().flatten() {
                 self.min = Some(self.min.map_or(val, |m: f64| m.min(val)));
             }
@@ -2175,7 +2179,10 @@ impl DynAccumulator for MaxF64IndexedAccumulator {
         if self.column_index >= batch.num_columns() {
             return;
         }
-        if let Some(array) = batch.column(self.column_index).as_primitive_opt::<Float64Type>() {
+        if let Some(array) = batch
+            .column(self.column_index)
+            .as_primitive_opt::<Float64Type>()
+        {
             for val in array.iter().flatten() {
                 self.max = Some(self.max.map_or(val, |m: f64| m.max(val)));
             }
@@ -2297,7 +2304,10 @@ impl DynAccumulator for AvgF64IndexedAccumulator {
         if self.column_index >= batch.num_columns() {
             return;
         }
-        if let Some(array) = batch.column(self.column_index).as_primitive_opt::<Float64Type>() {
+        if let Some(array) = batch
+            .column(self.column_index)
+            .as_primitive_opt::<Float64Type>()
+        {
             for val in array.iter().flatten() {
                 self.sum += val;
                 self.count += 1;
@@ -2841,7 +2851,11 @@ impl CompositeAggregator {
     /// Creates a new composite accumulator with all sub-accumulators.
     #[must_use]
     pub fn create_accumulator(&self) -> CompositeAccumulator {
-        let accumulators = self.factories.iter().map(|f| f.create_accumulator()).collect();
+        let accumulators = self
+            .factories
+            .iter()
+            .map(|f| f.create_accumulator())
+            .collect();
         CompositeAccumulator { accumulators }
     }
 
@@ -2913,7 +2927,10 @@ impl CompositeAccumulator {
     /// Returns all results as [`ScalarResult`] values.
     #[must_use]
     pub fn results(&self) -> Vec<ScalarResult> {
-        self.accumulators.iter().map(|a| a.result_scalar()).collect()
+        self.accumulators
+            .iter()
+            .map(|a| a.result_scalar())
+            .collect()
     }
 
     /// Returns true if all sub-accumulators are empty.
@@ -2951,11 +2968,7 @@ impl CompositeAccumulator {
     ///
     /// Returns `None` if the batch cannot be created.
     #[must_use]
-    pub fn to_record_batch(
-        &self,
-        window_id: &WindowId,
-        schema: &SchemaRef,
-    ) -> Option<RecordBatch> {
+    pub fn to_record_batch(&self, window_id: &WindowId, schema: &SchemaRef) -> Option<RecordBatch> {
         use arrow_array::{Float64Array, UInt64Array};
 
         let mut columns: Vec<Arc<dyn arrow_array::Array>> = vec![
@@ -2968,12 +2981,8 @@ impl CompositeAccumulator {
                 ScalarResult::Int64(v) => Arc::new(Int64Array::from(vec![v])),
                 ScalarResult::Float64(v) => Arc::new(Float64Array::from(vec![v])),
                 ScalarResult::UInt64(v) => Arc::new(UInt64Array::from(vec![v])),
-                ScalarResult::OptionalInt64(v) => {
-                    Arc::new(Int64Array::from(vec![v]))
-                }
-                ScalarResult::OptionalFloat64(v) => {
-                    Arc::new(Float64Array::from(vec![v]))
-                }
+                ScalarResult::OptionalInt64(v) => Arc::new(Int64Array::from(vec![v])),
+                ScalarResult::OptionalFloat64(v) => Arc::new(Float64Array::from(vec![v])),
                 ScalarResult::Null => Arc::new(Int64Array::new_null(1)),
             };
             columns.push(col);
@@ -3293,8 +3302,11 @@ where
         if !self.registered_windows.contains(&window_id) {
             // Register timer at window_end + allowed_lateness
             let trigger_time = window_id.end + self.allowed_lateness_ms;
-            ctx.timers
-                .register_timer(trigger_time, Some(window_id.to_key()), Some(ctx.operator_index));
+            ctx.timers.register_timer(
+                trigger_time,
+                Some(window_id.to_key()),
+                Some(ctx.operator_index),
+            );
             self.registered_windows.insert(window_id);
         }
     }
@@ -3304,21 +3316,19 @@ where
     /// The timer key uses a special encoding to distinguish from final timers:
     /// - Final timers: raw `WindowId` bytes (16 bytes)
     /// - Periodic timers: `WindowId` with high bit set in first byte
-    fn maybe_register_periodic_timer(
-        &mut self,
-        window_id: WindowId,
-        ctx: &mut OperatorContext,
-    ) {
+    fn maybe_register_periodic_timer(&mut self, window_id: WindowId, ctx: &mut OperatorContext) {
         if let EmitStrategy::Periodic(interval) = &self.emit_strategy {
             if !self.periodic_timer_windows.contains(&window_id) {
                 // Register first periodic timer at processing_time + interval
-                let interval_ms = i64::try_from(interval.as_millis()).expect("Interval must fit in i64");
+                let interval_ms =
+                    i64::try_from(interval.as_millis()).expect("Interval must fit in i64");
                 let trigger_time = ctx.processing_time + interval_ms;
 
                 // Create a key with high bit set to distinguish from final timers
                 let key = Self::periodic_timer_key(&window_id);
 
-                ctx.timers.register_timer(trigger_time, Some(key), Some(ctx.operator_index));
+                ctx.timers
+                    .register_timer(trigger_time, Some(key), Some(ctx.operator_index));
                 self.periodic_timer_windows.insert(window_id);
             }
         }
@@ -3381,7 +3391,8 @@ where
                 Arc::new(Int64Array::from(vec![window_id.end])),
                 Arc::new(Int64Array::from(vec![result_i64])),
             ],
-        ).ok()?;
+        )
+        .ok()?;
 
         Some(Event::new(window_id.end, batch))
     }
@@ -3408,14 +3419,16 @@ where
 
         // Schedule next periodic timer if still within window
         if let EmitStrategy::Periodic(interval) = &self.emit_strategy {
-            let interval_ms = i64::try_from(interval.as_millis()).expect("Interval must fit in i64");
+            let interval_ms =
+                i64::try_from(interval.as_millis()).expect("Interval must fit in i64");
             let next_trigger = ctx.processing_time + interval_ms;
 
             // Only schedule if the window hasn't closed yet
             let window_close_time = window_id.end + self.allowed_lateness_ms;
             if next_trigger < window_close_time {
                 let key = Self::periodic_timer_key(&window_id);
-                ctx.timers.register_timer(next_trigger, Some(key), Some(ctx.operator_index));
+                ctx.timers
+                    .register_timer(next_trigger, Some(key), Some(ctx.operator_index));
             }
         }
 
@@ -3638,8 +3651,12 @@ where
         }
 
         // Try to deserialize as the new format (tuple of two vectors)
-        if let Ok(archived) = rkyv::access::<rkyv::Archived<(Vec<WindowId>, Vec<WindowId>)>, RkyvError>(&state.data) {
-            if let Ok((windows, periodic_windows)) = rkyv::deserialize::<(Vec<WindowId>, Vec<WindowId>), RkyvError>(archived) {
+        if let Ok(archived) =
+            rkyv::access::<rkyv::Archived<(Vec<WindowId>, Vec<WindowId>)>, RkyvError>(&state.data)
+        {
+            if let Ok((windows, periodic_windows)) =
+                rkyv::deserialize::<(Vec<WindowId>, Vec<WindowId>), RkyvError>(archived)
+            {
                 self.registered_windows = windows.into_iter().collect();
                 self.periodic_timer_windows = periodic_windows.into_iter().collect();
                 return Ok(());
@@ -4096,7 +4113,10 @@ mod tests {
 
         // Should have at least one event output (intermediate result)
         let has_event = outputs1.iter().any(|o| matches!(o, Output::Event(_)));
-        assert!(has_event, "OnUpdate should emit intermediate result after first event");
+        assert!(
+            has_event,
+            "OnUpdate should emit intermediate result after first event"
+        );
 
         // Process second event - should emit another intermediate result
         let event2 = create_test_event(500, 2);
@@ -4114,7 +4134,10 @@ mod tests {
             }
         });
 
-        assert!(event_output.is_some(), "OnUpdate should emit after second event");
+        assert!(
+            event_output.is_some(),
+            "OnUpdate should emit after second event"
+        );
         if let Some(event) = event_output {
             let result_col = event.data.column(2);
             let result_array = result_col.as_any().downcast_ref::<Int64Array>().unwrap();
@@ -4167,7 +4190,9 @@ mod tests {
         // Set emit strategy and register some windows
         operator.set_emit_strategy(EmitStrategy::Periodic(Duration::from_secs(10)));
         operator.registered_windows.insert(WindowId::new(0, 1000));
-        operator.periodic_timer_windows.insert(WindowId::new(0, 1000));
+        operator
+            .periodic_timer_windows
+            .insert(WindowId::new(0, 1000));
 
         // Checkpoint
         let checkpoint = operator.checkpoint();
@@ -4198,7 +4223,8 @@ mod tests {
         let window_id = WindowId::new(1000, 2000);
 
         // Create periodic key using the helper
-        let periodic_key = TumblingWindowOperator::<CountAggregator>::periodic_timer_key(&window_id);
+        let periodic_key =
+            TumblingWindowOperator::<CountAggregator>::periodic_timer_key(&window_id);
 
         // Periodic key should be 16 bytes (same as window key, but with high bit set)
         assert_eq!(periodic_key.len(), 16);
@@ -4207,14 +4233,14 @@ mod tests {
         assert!(TumblingWindowOperator::<CountAggregator>::is_periodic_timer_key(&periodic_key));
 
         // Extract window ID from periodic key
-        let extracted = TumblingWindowOperator::<CountAggregator>::window_id_from_periodic_key(&periodic_key);
+        let extracted =
+            TumblingWindowOperator::<CountAggregator>::window_id_from_periodic_key(&periodic_key);
         assert_eq!(extracted, Some(window_id));
 
         // Regular window key should not be detected as periodic
         let regular_key = window_id.to_key();
         assert!(!TumblingWindowOperator::<CountAggregator>::is_periodic_timer_key(&regular_key));
     }
-
 
     #[test]
     fn test_late_data_config_default() {
@@ -4417,8 +4443,13 @@ mod tests {
         };
 
         // Should NOT be a late event - should be processed normally
-        let is_late_event = outputs.iter().any(|o| matches!(o, Output::LateEvent(_) | Output::SideOutput { .. }));
-        assert!(!is_late_event, "Event within lateness period should not be marked as late");
+        let is_late_event = outputs
+            .iter()
+            .any(|o| matches!(o, Output::LateEvent(_) | Output::SideOutput { .. }));
+        assert!(
+            !is_late_event,
+            "Event within lateness period should not be marked as late"
+        );
 
         // No late events recorded
         assert_eq!(operator.late_data_metrics().late_events_total(), 0);
@@ -4458,7 +4489,6 @@ mod tests {
 
         assert_eq!(operator.late_data_metrics().late_events_total(), 0);
     }
-
 
     #[test]
     fn test_emit_strategy_helper_methods() {
@@ -4613,8 +4643,14 @@ mod tests {
             .filter(|o| matches!(o, Output::Event(_)))
             .collect();
 
-        assert!(event_outputs1.is_empty(), "OnWindowClose should not emit intermediate results");
-        assert!(event_outputs2.is_empty(), "OnWindowClose should not emit intermediate results");
+        assert!(
+            event_outputs1.is_empty(),
+            "OnWindowClose should not emit intermediate results"
+        );
+        assert!(
+            event_outputs2.is_empty(),
+            "OnWindowClose should not emit intermediate results"
+        );
     }
 
     #[test]
@@ -4650,7 +4686,10 @@ mod tests {
         };
 
         // Should have NO output at all (silently dropped)
-        assert!(outputs.is_empty(), "EMIT FINAL should silently drop late data");
+        assert!(
+            outputs.is_empty(),
+            "EMIT FINAL should silently drop late data"
+        );
         assert_eq!(
             operator.late_data_metrics().late_events_dropped(),
             1,
@@ -5102,9 +5141,11 @@ mod tests {
     // ── f64 aggregator tests ────────────────────────────────────────────────
 
     fn make_f64_event(values: &[f64]) -> Event {
-        let schema = Arc::new(Schema::new(vec![
-            Field::new("value", DataType::Float64, false),
-        ]));
+        let schema = Arc::new(Schema::new(vec![Field::new(
+            "value",
+            DataType::Float64,
+            false,
+        )]));
         let batch = RecordBatch::try_new(
             schema,
             vec![Arc::new(arrow_array::Float64Array::from(values.to_vec()))],
@@ -5396,15 +5437,27 @@ mod tests {
         assert_eq!(batch.num_columns(), 5);
 
         // window_start = 0
-        let ws = batch.column(0).as_any().downcast_ref::<Int64Array>().unwrap();
+        let ws = batch
+            .column(0)
+            .as_any()
+            .downcast_ref::<Int64Array>()
+            .unwrap();
         assert_eq!(ws.value(0), 0);
 
         // window_end = 60000
-        let we = batch.column(1).as_any().downcast_ref::<Int64Array>().unwrap();
+        let we = batch
+            .column(1)
+            .as_any()
+            .downcast_ref::<Int64Array>()
+            .unwrap();
         assert_eq!(we.value(0), 60000);
 
         // count = 4
-        let cnt = batch.column(2).as_any().downcast_ref::<Int64Array>().unwrap();
+        let cnt = batch
+            .column(2)
+            .as_any()
+            .downcast_ref::<Int64Array>()
+            .unwrap();
         assert_eq!(cnt.value(0), 4);
 
         // min = 1.0
@@ -5536,9 +5589,7 @@ mod tests {
 
     #[test]
     fn test_composite_accumulator_clone() {
-        let agg = CompositeAggregator::new(vec![
-            Box::new(CountDynFactory::new("cnt")),
-        ]);
+        let agg = CompositeAggregator::new(vec![Box::new(CountDynFactory::new("cnt"))]);
         let mut acc = agg.create_accumulator();
         acc.add_event(&make_f64_event(&[1.0, 2.0]));
 

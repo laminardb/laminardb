@@ -264,8 +264,7 @@ pub fn derive_channel_types_detailed(
         .filter(|(_, ct)| matches!(ct, DerivedChannelType::Spsc))
         .filter(|(name, _)| {
             // Check if this source actually has any consumers
-            !mvs.iter()
-                .any(|mv| mv.source_refs.contains(*name))
+            !mvs.iter().any(|mv| mv.source_refs.contains(*name))
         })
         .map(|(name, _)| name.clone())
         .collect();
@@ -300,10 +299,7 @@ mod tests {
 
         let channel_types = derive_channel_types(&sources, &mvs);
 
-        assert_eq!(
-            channel_types.get("trades"),
-            Some(&DerivedChannelType::Spsc)
-        );
+        assert_eq!(channel_types.get("trades"), Some(&DerivedChannelType::Spsc));
     }
 
     #[test]
@@ -343,10 +339,7 @@ mod tests {
         );
 
         // orders: 1 consumer → SPSC
-        assert_eq!(
-            channel_types.get("orders"),
-            Some(&DerivedChannelType::Spsc)
-        );
+        assert_eq!(channel_types.get("orders"), Some(&DerivedChannelType::Spsc));
     }
 
     #[test]
@@ -357,10 +350,7 @@ mod tests {
         let channel_types = derive_channel_types(&sources, &mvs);
 
         // No consumers → SPSC (default)
-        assert_eq!(
-            channel_types.get("orphan"),
-            Some(&DerivedChannelType::Spsc)
-        );
+        assert_eq!(channel_types.get("orphan"), Some(&DerivedChannelType::Spsc));
     }
 
     #[test]
@@ -377,10 +367,7 @@ mod tests {
         let channel_types = derive_channel_types(&sources, &mvs);
 
         // Both sources have 1 consumer → SPSC
-        assert_eq!(
-            channel_types.get("orders"),
-            Some(&DerivedChannelType::Spsc)
-        );
+        assert_eq!(channel_types.get("orders"), Some(&DerivedChannelType::Spsc));
         assert_eq!(
             channel_types.get("payments"),
             Some(&DerivedChannelType::Spsc)

@@ -75,14 +75,10 @@ pub fn parse_late_data_clause_from_sql(sql: &str) -> Result<Option<LateDataClaus
     let start_pos = if has_allow_lateness {
         sql_upper.find("ALLOW").unwrap_or(0)
     } else {
-        sql_upper
-            .find("LATE DATA TO")
-            .map_or(0, |p| {
-                // Find the "LATE" word start (not "ALLOW LATENESS" overlap)
-                sql_upper[..p]
-                    .rfind("LATE")
-                    .unwrap_or(p)
-            })
+        sql_upper.find("LATE DATA TO").map_or(0, |p| {
+            // Find the "LATE" word start (not "ALLOW LATENESS" overlap)
+            sql_upper[..p].rfind("LATE").unwrap_or(p)
+        })
     };
 
     let clause_sql = &sql[start_pos..];
@@ -137,9 +133,7 @@ mod tests {
 
     #[test]
     fn test_parse_no_late_data_clause() {
-        let clause = parse_from_sql(
-            "SELECT * FROM events GROUP BY TUMBLE(ts, INTERVAL '1' HOUR)",
-        );
+        let clause = parse_from_sql("SELECT * FROM events GROUP BY TUMBLE(ts, INTERVAL '1' HOUR)");
         assert!(clause.is_none());
     }
 

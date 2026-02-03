@@ -5,9 +5,7 @@
 
 use std::sync::Arc;
 
-use arrow_array::{
-    ArrayRef, Int64Array, RecordBatch, StringArray, UInt64Array,
-};
+use arrow_array::{ArrayRef, Int64Array, RecordBatch, StringArray, UInt64Array};
 use arrow_schema::{DataType, Field, Schema};
 
 use super::decoder::{
@@ -124,14 +122,16 @@ pub fn insert_to_events(
 
     msg.rows
         .iter()
-        .map(|row| ChangeEvent::insert(
-            table.clone(),
-            msg.timestamp_ms,
-            binlog_file.to_string(),
-            msg.binlog_position,
-            gtid.map(String::from),
-            row.clone(),
-        ))
+        .map(|row| {
+            ChangeEvent::insert(
+                table.clone(),
+                msg.timestamp_ms,
+                binlog_file.to_string(),
+                msg.binlog_position,
+                gtid.map(String::from),
+                row.clone(),
+            )
+        })
         .collect()
 }
 
@@ -187,14 +187,16 @@ pub fn delete_to_events(
 
     msg.rows
         .iter()
-        .map(|row| ChangeEvent::delete(
-            table.clone(),
-            msg.timestamp_ms,
-            binlog_file.to_string(),
-            msg.binlog_position,
-            gtid.map(String::from),
-            row.clone(),
-        ))
+        .map(|row| {
+            ChangeEvent::delete(
+                table.clone(),
+                msg.timestamp_ms,
+                binlog_file.to_string(),
+                msg.binlog_position,
+                gtid.map(String::from),
+                row.clone(),
+            )
+        })
         .collect()
 }
 
@@ -236,14 +238,9 @@ pub fn events_to_record_batch(
         .iter()
         .map(|e| Some(e.binlog_file.as_str()))
         .collect();
-    let binlog_positions: Vec<Option<u64>> = events
-        .iter()
-        .map(|e| Some(e.binlog_position))
-        .collect();
-    let gtids: Vec<Option<&str>> = events
-        .iter()
-        .map(|e| e.gtid.as_deref())
-        .collect();
+    let binlog_positions: Vec<Option<u64>> =
+        events.iter().map(|e| Some(e.binlog_position)).collect();
+    let gtids: Vec<Option<&str>> = events.iter().map(|e| e.gtid.as_deref()).collect();
 
     let mut columns: Vec<ArrayRef> = vec![
         Arc::new(StringArray::from(tables)),
@@ -325,15 +322,11 @@ pub fn column_value_to_json(value: &ColumnValue) -> serde_json::Value {
                     "{y:04}-{mo:02}-{d:02}T{h:02}:{mi:02}:{s:02}.{us:06}"
                 ))
             } else {
-                serde_json::json!(format!(
-                    "{y:04}-{mo:02}-{d:02}T{h:02}:{mi:02}:{s:02}"
-                ))
+                serde_json::json!(format!("{y:04}-{mo:02}-{d:02}T{h:02}:{mi:02}:{s:02}"))
             }
         }
         ColumnValue::Timestamp(us) => serde_json::json!(us),
-        ColumnValue::Json(s) => {
-            serde_json::from_str(s).unwrap_or_else(|_| serde_json::json!(s))
-        }
+        ColumnValue::Json(s) => serde_json::from_str(s).unwrap_or_else(|_| serde_json::json!(s)),
     }
 }
 
@@ -482,10 +475,22 @@ mod tests {
 
     #[test]
     fn test_column_value_to_json() {
-        assert_eq!(column_value_to_json(&ColumnValue::Null), serde_json::Value::Null);
-        assert_eq!(column_value_to_json(&ColumnValue::SignedInt(42)), serde_json::json!(42));
-        assert_eq!(column_value_to_json(&ColumnValue::String("hello".to_string())), serde_json::json!("hello"));
-        assert_eq!(column_value_to_json(&ColumnValue::Date(2024, 6, 15)), serde_json::json!("2024-06-15"));
+        assert_eq!(
+            column_value_to_json(&ColumnValue::Null),
+            serde_json::Value::Null
+        );
+        assert_eq!(
+            column_value_to_json(&ColumnValue::SignedInt(42)),
+            serde_json::json!(42)
+        );
+        assert_eq!(
+            column_value_to_json(&ColumnValue::String("hello".to_string())),
+            serde_json::json!("hello")
+        );
+        assert_eq!(
+            column_value_to_json(&ColumnValue::Date(2024, 6, 15)),
+            serde_json::json!("2024-06-15")
+        );
     }
 
     #[test]

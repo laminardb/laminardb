@@ -10,12 +10,11 @@
 use std::sync::atomic::Ordering;
 use std::time::Instant;
 
-use laminar_core::dag::{
-    DagCheckpointConfig, DagCheckpointCoordinator, DagExecutor, DagNodeType, NodeId,
-    StreamingDag,
-};
 use laminar_core::dag::recovery::{DagRecoveryManager, RecoveredDagState};
 use laminar_core::dag::watermark::DagWatermarkTracker;
+use laminar_core::dag::{
+    DagCheckpointConfig, DagCheckpointCoordinator, DagExecutor, DagNodeType, NodeId, StreamingDag,
+};
 use laminar_core::operator::Operator;
 
 use crate::checkpoint::SourceCheckpoint;
@@ -81,16 +80,11 @@ impl ConnectorBridgeRuntime {
         let executor = DagExecutor::from_dag(&dag);
         let watermark_tracker = DagWatermarkTracker::from_dag(&dag);
 
-        let all_nodes: Vec<NodeId> = dag
-            .execution_order()
-            .to_vec();
+        let all_nodes: Vec<NodeId> = dag.execution_order().to_vec();
         let source_nodes: Vec<NodeId> = dag.sources().to_vec();
 
-        let coordinator = DagCheckpointCoordinator::new(
-            source_nodes,
-            all_nodes,
-            DagCheckpointConfig::default(),
-        );
+        let coordinator =
+            DagCheckpointCoordinator::new(source_nodes, all_nodes, DagCheckpointConfig::default());
         let recovery_manager = DagRecoveryManager::new();
 
         Self {
@@ -121,24 +115,13 @@ impl ConnectorBridgeRuntime {
         connector: Box<dyn SourceConnector>,
         _config: &ConnectorConfig,
     ) -> Result<NodeId, ConnectorError> {
-        let node_id = self
-            .dag
-            .node_id_by_name(name)
-            .ok_or_else(|| {
-                ConnectorError::ConfigurationError(format!(
-                    "source node '{name}' not found in DAG"
-                ))
-            })?;
+        let node_id = self.dag.node_id_by_name(name).ok_or_else(|| {
+            ConnectorError::ConfigurationError(format!("source node '{name}' not found in DAG"))
+        })?;
 
-        let node_type = self
-            .dag
-            .node(node_id)
-            .map(|n| n.node_type)
-            .ok_or_else(|| {
-                ConnectorError::ConfigurationError(format!(
-                    "node '{name}' not found in DAG"
-                ))
-            })?;
+        let node_type = self.dag.node(node_id).map(|n| n.node_type).ok_or_else(|| {
+            ConnectorError::ConfigurationError(format!("node '{name}' not found in DAG"))
+        })?;
 
         if node_type != DagNodeType::Source {
             return Err(ConnectorError::ConfigurationError(format!(
@@ -166,24 +149,13 @@ impl ConnectorBridgeRuntime {
         connector: Box<dyn SinkConnector>,
         _config: &ConnectorConfig,
     ) -> Result<NodeId, ConnectorError> {
-        let node_id = self
-            .dag
-            .node_id_by_name(name)
-            .ok_or_else(|| {
-                ConnectorError::ConfigurationError(format!(
-                    "sink node '{name}' not found in DAG"
-                ))
-            })?;
+        let node_id = self.dag.node_id_by_name(name).ok_or_else(|| {
+            ConnectorError::ConfigurationError(format!("sink node '{name}' not found in DAG"))
+        })?;
 
-        let node_type = self
-            .dag
-            .node(node_id)
-            .map(|n| n.node_type)
-            .ok_or_else(|| {
-                ConnectorError::ConfigurationError(format!(
-                    "node '{name}' not found in DAG"
-                ))
-            })?;
+        let node_type = self.dag.node(node_id).map(|n| n.node_type).ok_or_else(|| {
+            ConnectorError::ConfigurationError(format!("node '{name}' not found in DAG"))
+        })?;
 
         if node_type != DagNodeType::Sink {
             return Err(ConnectorError::ConfigurationError(format!(
@@ -250,7 +222,9 @@ impl ConnectorBridgeRuntime {
         }
 
         // 3. Update runtime metrics
-        self.metrics.cycles_completed.fetch_add(1, Ordering::Relaxed);
+        self.metrics
+            .cycles_completed
+            .fetch_add(1, Ordering::Relaxed);
         self.metrics
             .total_events_in
             .fetch_add(total_in, Ordering::Relaxed);
@@ -370,10 +344,10 @@ impl ConnectorBridgeRuntime {
             return Ok(None);
         }
 
-        let recovered: RecoveredDagState =
-            self.recovery_manager.recover_latest().map_err(|e| {
-                ConnectorError::CheckpointError(format!("recovery failed: {e}"))
-            })?;
+        let recovered: RecoveredDagState = self
+            .recovery_manager
+            .recover_latest()
+            .map_err(|e| ConnectorError::CheckpointError(format!("recovery failed: {e}")))?;
 
         let epoch = recovered.snapshot.epoch;
 
@@ -381,9 +355,7 @@ impl ConnectorBridgeRuntime {
         self.executor
             .restore(&recovered.operator_states)
             .map_err(|e| {
-                ConnectorError::CheckpointError(format!(
-                    "executor restore failed: {e}"
-                ))
+                ConnectorError::CheckpointError(format!("executor restore failed: {e}"))
             })?;
 
         // 2. Restore source connectors from saved checkpoint offsets
@@ -652,10 +624,7 @@ mod tests {
         // Recover
         let recovered_epoch = runtime.recover().await.unwrap();
         assert_eq!(recovered_epoch, Some(epoch));
-        assert_eq!(
-            runtime.metrics().recoveries.load(Ordering::Relaxed),
-            1
-        );
+        assert_eq!(runtime.metrics().recoveries.load(Ordering::Relaxed), 1);
     }
 
     #[tokio::test]
@@ -739,11 +708,7 @@ mod tests {
             )
             .unwrap();
         runtime
-            .attach_sink(
-                "snk",
-                Box::new(MockSinkConnector::new()),
-                &conn_config,
-            )
+            .attach_sink("snk", Box::new(MockSinkConnector::new()), &conn_config)
             .unwrap();
 
         runtime.open().await.unwrap();
@@ -770,28 +735,15 @@ mod tests {
         let conn_config = ConnectorConfig::new("mock");
 
         // Trying to attach a source to a sink node
-        let result = runtime.attach_source(
-            "snk",
-            Box::new(MockSourceConnector::new()),
-            &conn_config,
-        );
+        let result =
+            runtime.attach_source("snk", Box::new(MockSourceConnector::new()), &conn_config);
         assert!(result.is_err());
-        assert!(result
-            .unwrap_err()
-            .to_string()
-            .contains("not Source"));
+        assert!(result.unwrap_err().to_string().contains("not Source"));
 
         // Trying to attach a sink to a source node
-        let result = runtime.attach_sink(
-            "src",
-            Box::new(MockSinkConnector::new()),
-            &conn_config,
-        );
+        let result = runtime.attach_sink("src", Box::new(MockSinkConnector::new()), &conn_config);
         assert!(result.is_err());
-        assert!(result
-            .unwrap_err()
-            .to_string()
-            .contains("not Sink"));
+        assert!(result.unwrap_err().to_string().contains("not Sink"));
     }
 
     #[tokio::test]
@@ -809,9 +761,6 @@ mod tests {
             &conn_config,
         );
         assert!(result.is_err());
-        assert!(result
-            .unwrap_err()
-            .to_string()
-            .contains("not found"));
+        assert!(result.unwrap_err().to_string().contains("not found"));
     }
 }

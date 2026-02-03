@@ -157,7 +157,12 @@ impl PostgresSink {
         let non_key_columns: Vec<&str> = columns
             .iter()
             .copied()
-            .filter(|c| !config.primary_key_columns.iter().any(|pk| pk.as_str() == *c))
+            .filter(|c| {
+                !config
+                    .primary_key_columns
+                    .iter()
+                    .any(|pk| pk.as_str() == *c)
+            })
             .collect();
 
         let update_clause: Vec<String> = non_key_columns
@@ -231,10 +236,7 @@ impl PostgresSink {
     /// )
     /// ```
     #[must_use]
-    pub fn build_create_table_sql(
-        schema: &SchemaRef,
-        config: &PostgresSinkConfig,
-    ) -> String {
+    pub fn build_create_table_sql(schema: &SchemaRef, config: &PostgresSinkConfig) -> String {
         let fields = user_fields(schema);
 
         let column_defs: Vec<String> = fields
@@ -319,9 +321,7 @@ impl PostgresSink {
             .as_any()
             .downcast_ref::<arrow_array::StringArray>()
             .ok_or_else(|| {
-                ConnectorError::ConfigurationError(
-                    "'_op' column must be String (Utf8) type".into(),
-                )
+                ConnectorError::ConfigurationError("'_op' column must be String (Utf8) type".into())
             })?;
 
         let mut insert_indices = Vec::new();
@@ -355,15 +355,11 @@ impl PostgresSink {
         self.copy_sql = Some(Self::build_copy_sql(&self.schema, &self.config));
 
         if self.config.write_mode == WriteMode::Upsert {
-            self.upsert_sql =
-                Some(Self::build_upsert_sql(&self.schema, &self.config));
+            self.upsert_sql = Some(Self::build_upsert_sql(&self.schema, &self.config));
         }
 
         if self.config.auto_create_table {
-            self.create_table_sql = Some(Self::build_create_table_sql(
-                &self.schema,
-                &self.config,
-            ));
+            self.create_table_sql = Some(Self::build_create_table_sql(&self.schema, &self.config));
         }
     }
 
@@ -382,7 +378,8 @@ impl PostgresSink {
         self.buffered_rows = 0;
         self.last_flush = Instant::now();
 
-        self.metrics.record_write(total_rows as u64, estimated_bytes);
+        self.metrics
+            .record_write(total_rows as u64, estimated_bytes);
         self.metrics.record_flush();
 
         match self.config.write_mode {
@@ -434,10 +431,7 @@ impl SinkConnector for PostgresSink {
     }
 
     #[allow(clippy::cast_possible_truncation)] // Record batch row/column counts fit in narrower types
-    async fn write_batch(
-        &mut self,
-        batch: &RecordBatch,
-    ) -> Result<WriteResult, ConnectorError> {
+    async fn write_batch(&mut self, batch: &RecordBatch) -> Result<WriteResult, ConnectorError> {
         if self.state != ConnectorState::Running {
             return Err(ConnectorError::InvalidState {
                 expected: "Running".into(),
@@ -521,15 +515,9 @@ impl SinkConnector for PostgresSink {
     fn health_check(&self) -> HealthStatus {
         match self.state {
             ConnectorState::Running => HealthStatus::Healthy,
-            ConnectorState::Created | ConnectorState::Initializing => {
-                HealthStatus::Unknown
-            }
-            ConnectorState::Paused => {
-                HealthStatus::Degraded("connector paused".into())
-            }
-            ConnectorState::Recovering => {
-                HealthStatus::Degraded("recovering".into())
-            }
+            ConnectorState::Created | ConnectorState::Initializing => HealthStatus::Unknown,
+            ConnectorState::Paused => HealthStatus::Degraded("connector paused".into()),
+            ConnectorState::Recovering => HealthStatus::Degraded("recovering".into()),
             ConnectorState::Closed => HealthStatus::Unhealthy("closed".into()),
             ConnectorState::Failed => HealthStatus::Unhealthy("failed".into()),
         }
@@ -598,7 +586,7 @@ impl std::fmt::Debug for PostgresSink {
             .field("last_committed_epoch", &self.last_committed_epoch)
             .field("buffered_rows", &self.buffered_rows)
             .finish_non_exhaustive()
-        }
+    }
 }
 
 // ── Helper functions ────────────────────────────────────────────────
@@ -664,9 +652,7 @@ fn filter_batch_by_indices(
         .filter(|(_, f)| !f.name().starts_with('_'))
         .map(|(i, _)| {
             arrow_select::take::take(batch.column(i), &indices_array, None)
-                .map_err(|e| {
-                    ConnectorError::Internal(format!("arrow take failed: {e}"))
-                })
+                .map_err(|e| ConnectorError::Internal(format!("arrow take failed: {e}")))
         })
         .collect::<Result<Vec<_>, _>>()?;
 
@@ -767,10 +753,7 @@ mod tests {
         ]));
         let config = test_config();
         let sql = PostgresSink::build_copy_sql(&schema, &config);
-        assert_eq!(
-            sql,
-            "COPY public.events (id, value) FROM STDIN BINARY"
-        );
+        assert_eq!(sql, "COPY public.events (id, value) FROM STDIN BINARY");
     }
 
     #[test]
@@ -807,9 +790,7 @@ mod tests {
 
     #[test]
     fn test_build_upsert_sql_key_only_table() {
-        let schema = Arc::new(Schema::new(vec![
-            Field::new("id", DataType::Int64, false),
-        ]));
+        let schema = Arc::new(Schema::new(vec![Field::new("id", DataType::Int64, false)]));
         let mut config = test_config();
         config.write_mode = WriteMode::Upsert;
         config.primary_key_columns = vec!["id".to_string()];
@@ -824,10 +805,7 @@ mod tests {
         let config = upsert_config();
         let sql = PostgresSink::build_delete_sql(&schema, &config);
 
-        assert_eq!(
-            sql,
-            "DELETE FROM public.events WHERE id = ANY($1::int8[])"
-        );
+        assert_eq!(sql, "DELETE FROM public.events WHERE id = ANY($1::int8[])");
     }
 
     #[test]
@@ -913,8 +891,7 @@ mod tests {
     #[test]
     fn test_split_changelog_batch() {
         let batch = changelog_batch();
-        let (inserts, deletes) =
-            PostgresSink::split_changelog_batch(&batch).unwrap();
+        let (inserts, deletes) = PostgresSink::split_changelog_batch(&batch).unwrap();
 
         // Inserts: rows 0 (I), 1 (U), 3 (I) = 3 rows
         assert_eq!(inserts.num_rows(), 3);
@@ -959,8 +936,7 @@ mod tests {
         )
         .unwrap();
 
-        let (inserts, deletes) =
-            PostgresSink::split_changelog_batch(&batch).unwrap();
+        let (inserts, deletes) = PostgresSink::split_changelog_batch(&batch).unwrap();
         assert_eq!(inserts.num_rows(), 2);
         assert_eq!(deletes.num_rows(), 0);
     }
@@ -979,22 +955,16 @@ mod tests {
         )
         .unwrap();
 
-        let (inserts, deletes) =
-            PostgresSink::split_changelog_batch(&batch).unwrap();
+        let (inserts, deletes) = PostgresSink::split_changelog_batch(&batch).unwrap();
         assert_eq!(inserts.num_rows(), 0);
         assert_eq!(deletes.num_rows(), 2);
     }
 
     #[test]
     fn test_split_changelog_missing_op_column() {
-        let schema = Arc::new(Schema::new(vec![
-            Field::new("id", DataType::Int64, false),
-        ]));
-        let batch = RecordBatch::try_new(
-            schema,
-            vec![Arc::new(Int64Array::from(vec![1]))],
-        )
-        .unwrap();
+        let schema = Arc::new(Schema::new(vec![Field::new("id", DataType::Int64, false)]));
+        let batch =
+            RecordBatch::try_new(schema, vec![Arc::new(Int64Array::from(vec![1]))]).unwrap();
 
         let result = PostgresSink::split_changelog_batch(&batch);
         assert!(result.is_err());
@@ -1014,8 +984,7 @@ mod tests {
         )
         .unwrap();
 
-        let (inserts, deletes) =
-            PostgresSink::split_changelog_batch(&batch).unwrap();
+        let (inserts, deletes) = PostgresSink::split_changelog_batch(&batch).unwrap();
         assert_eq!(inserts.num_rows(), 1);
         assert_eq!(deletes.num_rows(), 0);
     }
@@ -1170,10 +1139,7 @@ mod tests {
 
         // Metrics should show 1 commit
         let m = sink.metrics();
-        let committed = m
-            .custom
-            .iter()
-            .find(|(k, _)| k == "pg.epochs_committed");
+        let committed = m.custom.iter().find(|(k, _)| k == "pg.epochs_committed");
         assert_eq!(committed.unwrap().1, 1.0);
     }
 

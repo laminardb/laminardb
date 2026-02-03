@@ -156,7 +156,8 @@ impl PerCoreWalReader {
         }
 
         // Read data
-        #[allow(clippy::cast_possible_truncation)] // u32 → usize: lossless on all supported platforms
+        #[allow(clippy::cast_possible_truncation)]
+        // u32 → usize: lossless on all supported platforms
         let mut data = vec![0u8; len as usize];
         self.reader.read_exact(&mut data)?;
         self.position += len;
@@ -198,7 +199,10 @@ impl PerCoreWalReader {
     /// # Errors
     ///
     /// Returns an error if reading fails.
-    pub fn read_up_to_epoch(&mut self, max_epoch: u64) -> Result<Vec<PerCoreWalEntry>, PerCoreWalError> {
+    pub fn read_up_to_epoch(
+        &mut self,
+        max_epoch: u64,
+    ) -> Result<Vec<PerCoreWalEntry>, PerCoreWalError> {
         let mut entries = Vec::new();
 
         while let WalReadResult::Entry(entry) = self.read_next()? {
@@ -443,10 +447,7 @@ mod tests {
         // Corrupt the data
         {
             use std::io::Write;
-            let mut file = std::fs::OpenOptions::new()
-                .write(true)
-                .open(&path)
-                .unwrap();
+            let mut file = std::fs::OpenOptions::new().write(true).open(&path).unwrap();
             // Seek past header and corrupt data
             file.seek(SeekFrom::Start(10)).unwrap();
             file.write_all(&[0xFF]).unwrap();

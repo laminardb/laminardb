@@ -189,10 +189,7 @@ impl SourceCatalog {
     }
 
     /// Register a named stream.
-    pub(crate) fn register_stream(
-        &self,
-        name: &str,
-    ) -> Result<(), crate::DbError> {
+    pub(crate) fn register_stream(&self, name: &str) -> Result<(), crate::DbError> {
         let mut streams = self.streams.write();
         if streams.contains_key(name) {
             return Err(crate::DbError::StreamAlreadyExists(name.to_string()));
@@ -233,10 +230,7 @@ impl SourceCatalog {
     }
 
     /// Get a clone of the stream's source handle (for pushing results).
-    pub(crate) fn get_stream_source(
-        &self,
-        name: &str,
-    ) -> Option<streaming::Source<ArrowRecord>> {
+    pub(crate) fn get_stream_source(&self, name: &str) -> Option<streaming::Source<ArrowRecord>> {
         self.streams
             .read()
             .get(name)
@@ -333,7 +327,10 @@ mod tests {
             .register_source("test", test_schema(), None, None, None)
             .unwrap();
         let result = catalog.register_source("test", test_schema(), None, None, None);
-        assert!(matches!(result, Err(crate::DbError::SourceAlreadyExists(_))));
+        assert!(matches!(
+            result,
+            Err(crate::DbError::SourceAlreadyExists(_))
+        ));
     }
 
     #[test]
@@ -404,7 +401,13 @@ mod tests {
         catalog
             .register_source("test", test_schema(), None, None, None)
             .unwrap();
-        let entry = catalog.register_source_or_replace("test", test_schema(), Some("ts".into()), None, None);
+        let entry = catalog.register_source_or_replace(
+            "test",
+            test_schema(),
+            Some("ts".into()),
+            None,
+            None,
+        );
         assert_eq!(entry.watermark_column, Some("ts".to_string()));
     }
 }

@@ -7,9 +7,9 @@ use std::sync::atomic::{AtomicU64, Ordering};
 use std::time::{Duration, SystemTime, UNIX_EPOCH};
 
 use anyhow::{Context, Result};
-use rkyv::{Archive, Deserialize, Serialize};
-use rkyv::util::AlignedVec;
 use rkyv::rancor::Error;
+use rkyv::util::AlignedVec;
+use rkyv::{Archive, Deserialize, Serialize};
 
 use crate::wal::WalPosition;
 
@@ -101,10 +101,8 @@ impl Checkpoint {
     pub fn load_offsets(&self) -> Result<HashMap<String, u64>> {
         let path = self.offsets_path();
         if path.exists() {
-            let data = fs::read_to_string(&path)
-                .context("Failed to read source offsets")?;
-            serde_json::from_str(&data)
-                .context("Failed to parse source offsets")
+            let data = fs::read_to_string(&path).context("Failed to read source offsets")?;
+            serde_json::from_str(&data).context("Failed to parse source offsets")
         } else {
             Ok(HashMap::new())
         }
@@ -177,8 +175,7 @@ impl CheckpointManager {
 
         // Create checkpoint directory
         let checkpoint_path = self.checkpoint_path(checkpoint_id);
-        fs::create_dir_all(&checkpoint_path)
-            .context("Failed to create checkpoint directory")?;
+        fs::create_dir_all(&checkpoint_path).context("Failed to create checkpoint directory")?;
 
         // Create metadata
         let timestamp = SystemTime::now()
@@ -197,16 +194,14 @@ impl CheckpointManager {
 
         // Write state snapshot
         let state_path = checkpoint_path.join("state.rkyv");
-        fs::write(&state_path, state_snapshot)
-            .context("Failed to write state snapshot")?;
+        fs::write(&state_path, state_snapshot).context("Failed to write state snapshot")?;
 
         // Write source offsets as JSON (since HashMap<String, u64> doesn't serialize well with rkyv)
         if !metadata.source_offsets.is_empty() {
             let offsets_path = checkpoint_path.join("offsets.json");
             let offsets_json = serde_json::to_string_pretty(&metadata.source_offsets)
                 .context("Failed to serialize source offsets")?;
-            fs::write(&offsets_path, offsets_json)
-                .context("Failed to write source offsets")?;
+            fs::write(&offsets_path, offsets_json).context("Failed to write source offsets")?;
         }
 
         // Write metadata (convert to internal format)
@@ -241,8 +236,8 @@ impl CheckpointManager {
         let mut latest_id = 0u64;
 
         // Scan checkpoint directory
-        let entries = fs::read_dir(&self.checkpoint_dir)
-            .context("Failed to read checkpoint directory")?;
+        let entries =
+            fs::read_dir(&self.checkpoint_dir).context("Failed to read checkpoint directory")?;
 
         for entry in entries {
             let entry = entry?;
@@ -254,9 +249,7 @@ impl CheckpointManager {
             }
 
             // Try to parse checkpoint ID from directory name
-            let dir_name = path.file_name()
-                .and_then(|n| n.to_str())
-                .unwrap_or("");
+            let dir_name = path.file_name().and_then(|n| n.to_str()).unwrap_or("");
 
             if let Some(id) = Self::parse_checkpoint_id(dir_name) {
                 if id > latest_id {
@@ -283,18 +276,23 @@ impl CheckpointManager {
 
         // Load metadata
         let metadata_path = checkpoint_path.join("metadata.rkyv");
-        let metadata_bytes = fs::read(&metadata_path)
-            .context("Failed to read checkpoint metadata")?;
+        let metadata_bytes =
+            fs::read(&metadata_path).context("Failed to read checkpoint metadata")?;
 
         let mut aligned_bytes = AlignedVec::<16>::with_capacity(metadata_bytes.len());
         aligned_bytes.extend_from_slice(&metadata_bytes);
-        let archived = rkyv::access::<rkyv::Archived<CheckpointMetadataInternal>, Error>(&aligned_bytes)?;
+        let archived =
+            rkyv::access::<rkyv::Archived<CheckpointMetadataInternal>, Error>(&aligned_bytes)?;
         let metadata_internal: CheckpointMetadataInternal =
             rkyv::deserialize::<CheckpointMetadataInternal, Error>(archived)?;
 
         // Verify checkpoint ID matches
         if metadata_internal.id != checkpoint_id {
-            anyhow::bail!("Checkpoint ID mismatch: expected {}, got {}", checkpoint_id, metadata_internal.id);
+            anyhow::bail!(
+                "Checkpoint ID mismatch: expected {}, got {}",
+                checkpoint_id,
+                metadata_internal.id
+            );
         }
 
         // Convert to public metadata
@@ -336,17 +334,15 @@ impl CheckpointManager {
         // Get all checkpoint IDs
         let mut checkpoint_ids = Vec::new();
 
-        let entries = fs::read_dir(&self.checkpoint_dir)
-            .context("Failed to read checkpoint directory")?;
+        let entries =
+            fs::read_dir(&self.checkpoint_dir).context("Failed to read checkpoint directory")?;
 
         for entry in entries {
             let entry = entry?;
             let path = entry.path();
 
             if path.is_dir() {
-                let dir_name = path.file_name()
-                    .and_then(|n| n.to_str())
-                    .unwrap_or("");
+                let dir_name = path.file_name().and_then(|n| n.to_str()).unwrap_or("");
 
                 if let Some(id) = Self::parse_checkpoint_id(dir_name) {
                     checkpoint_ids.push((id, path));
@@ -384,7 +380,8 @@ impl CheckpointManager {
 
     /// Parse checkpoint ID from directory name
     fn parse_checkpoint_id(dir_name: &str) -> Option<u64> {
-        dir_name.strip_prefix("checkpoint-")
+        dir_name
+            .strip_prefix("checkpoint-")
             .and_then(|id_str| id_str.parse().ok())
     }
 
@@ -398,9 +395,7 @@ impl CheckpointManager {
                 let path = entry.path();
 
                 if path.is_dir() {
-                    let dir_name = path.file_name()
-                        .and_then(|n| n.to_str())
-                        .unwrap_or("");
+                    let dir_name = path.file_name().and_then(|n| n.to_str()).unwrap_or("");
 
                     if let Some(id) = Self::parse_checkpoint_id(dir_name) {
                         highest_id = Some(highest_id.map_or(id, |h: u64| h.max(id)));
@@ -421,11 +416,9 @@ mod tests {
     #[test]
     fn test_checkpoint_creation() {
         let temp_dir = TempDir::new().unwrap();
-        let manager = CheckpointManager::new(
-            temp_dir.path().to_path_buf(),
-            Duration::from_secs(60),
-            3,
-        ).unwrap();
+        let manager =
+            CheckpointManager::new(temp_dir.path().to_path_buf(), Duration::from_secs(60), 3)
+                .unwrap();
 
         // Create test state
         let state = b"test state data";
@@ -434,12 +427,14 @@ mod tests {
         offsets.insert("source1".to_string(), 42);
 
         // Create checkpoint
-        let checkpoint = manager.create_checkpoint(
-            state,
-            wal_position,
-            offsets.clone(),
-            Some(5000), // watermark
-        ).unwrap();
+        let checkpoint = manager
+            .create_checkpoint(
+                state,
+                wal_position,
+                offsets.clone(),
+                Some(5000), // watermark
+            )
+            .unwrap();
 
         assert_eq!(checkpoint.metadata.id, 0);
         assert_eq!(checkpoint.metadata.wal_position, wal_position);
@@ -459,11 +454,9 @@ mod tests {
     #[test]
     fn test_find_latest_checkpoint() {
         let temp_dir = TempDir::new().unwrap();
-        let manager = CheckpointManager::new(
-            temp_dir.path().to_path_buf(),
-            Duration::from_secs(60),
-            3,
-        ).unwrap();
+        let manager =
+            CheckpointManager::new(temp_dir.path().to_path_buf(), Duration::from_secs(60), 3)
+                .unwrap();
 
         // No checkpoints yet
         assert!(manager.find_latest_checkpoint().unwrap().is_none());
@@ -471,12 +464,14 @@ mod tests {
         // Create multiple checkpoints
         for i in 0..3 {
             let wal_position = WalPosition { offset: i * 100 };
-            manager.create_checkpoint(
-                b"state",
-                wal_position,
-                HashMap::new(),
-                Some(i64::try_from(i * 1000).unwrap()),
-            ).unwrap();
+            manager
+                .create_checkpoint(
+                    b"state",
+                    wal_position,
+                    HashMap::new(),
+                    Some(i64::try_from(i * 1000).unwrap()),
+                )
+                .unwrap();
         }
 
         // Find latest
@@ -492,17 +487,20 @@ mod tests {
             temp_dir.path().to_path_buf(),
             Duration::from_secs(60),
             2, // Keep only 2
-        ).unwrap();
+        )
+        .unwrap();
 
         // Create 5 checkpoints
         for i in 0..5 {
             let wal_position = WalPosition { offset: i * 100 };
-            manager.create_checkpoint(
-                b"state",
-                wal_position,
-                HashMap::new(),
-                None, // no watermark for this test
-            ).unwrap();
+            manager
+                .create_checkpoint(
+                    b"state",
+                    wal_position,
+                    HashMap::new(),
+                    None, // no watermark for this test
+                )
+                .unwrap();
         }
 
         // Cleanup
@@ -518,8 +516,14 @@ mod tests {
         assert_eq!(count, 2);
 
         // Verify the latest ones are kept
-        assert!(temp_dir.path().join("checkpoint-00000000000000000003").exists());
-        assert!(temp_dir.path().join("checkpoint-00000000000000000004").exists());
+        assert!(temp_dir
+            .path()
+            .join("checkpoint-00000000000000000003")
+            .exists());
+        assert!(temp_dir
+            .path()
+            .join("checkpoint-00000000000000000004")
+            .exists());
     }
 
     #[test]
@@ -528,28 +532,26 @@ mod tests {
 
         // Create first manager and checkpoint
         let checkpoint_id = {
-            let manager = CheckpointManager::new(
-                temp_dir.path().to_path_buf(),
-                Duration::from_secs(60),
-                3,
-            ).unwrap();
+            let manager =
+                CheckpointManager::new(temp_dir.path().to_path_buf(), Duration::from_secs(60), 3)
+                    .unwrap();
 
-            let checkpoint = manager.create_checkpoint(
-                b"state data",
-                WalPosition { offset: 123 },
-                HashMap::new(),
-                Some(9999),
-            ).unwrap();
+            let checkpoint = manager
+                .create_checkpoint(
+                    b"state data",
+                    WalPosition { offset: 123 },
+                    HashMap::new(),
+                    Some(9999),
+                )
+                .unwrap();
 
             checkpoint.metadata.id
         };
 
         // Create new manager (simulating restart)
-        let manager = CheckpointManager::new(
-            temp_dir.path().to_path_buf(),
-            Duration::from_secs(60),
-            3,
-        ).unwrap();
+        let manager =
+            CheckpointManager::new(temp_dir.path().to_path_buf(), Duration::from_secs(60), 3)
+                .unwrap();
 
         // Load checkpoint
         let loaded = manager.load_checkpoint(checkpoint_id).unwrap();
@@ -558,12 +560,14 @@ mod tests {
         assert_eq!(loaded.metadata.watermark, Some(9999));
 
         // Next checkpoint should have incremented ID
-        let next = manager.create_checkpoint(
-            b"new state",
-            WalPosition { offset: 200 },
-            HashMap::new(),
-            Some(12345),
-        ).unwrap();
+        let next = manager
+            .create_checkpoint(
+                b"new state",
+                WalPosition { offset: 200 },
+                HashMap::new(),
+                Some(12345),
+            )
+            .unwrap();
         assert_eq!(next.metadata.id, checkpoint_id + 1);
         assert_eq!(next.metadata.watermark, Some(12345));
     }

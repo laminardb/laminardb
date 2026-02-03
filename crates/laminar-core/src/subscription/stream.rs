@@ -342,11 +342,7 @@ mod tests {
     use crate::subscription::registry::SubscriptionState;
 
     fn make_batch(n: usize) -> arrow_array::RecordBatch {
-        let schema = Arc::new(Schema::new(vec![Field::new(
-            "v",
-            DataType::Int64,
-            false,
-        )]));
+        let schema = Arc::new(Schema::new(vec![Field::new("v", DataType::Int64, false)]));
         let values: Vec<i64> = (0..n as i64).collect();
         let array = Int64Array::from(values);
         arrow_array::RecordBatch::try_new(schema, vec![Arc::new(array)]).unwrap()
@@ -372,10 +368,7 @@ mod tests {
     }
 
     /// Helper: send N insert events to the first sender.
-    fn send_events(
-        senders: &[tokio::sync::broadcast::Sender<ChangeEvent>],
-        count: usize,
-    ) {
+    fn send_events(senders: &[tokio::sync::broadcast::Sender<ChangeEvent>], count: usize) {
         for i in 0..count {
             let batch = Arc::new(make_batch(1));
             senders[0]
@@ -461,9 +454,7 @@ mod tests {
         senders[0]
             .send(ChangeEvent::insert(Arc::clone(&batch), 1000, 1))
             .unwrap();
-        senders[0]
-            .send(ChangeEvent::watermark(2000))
-            .unwrap();
+        senders[0].send(ChangeEvent::watermark(2000)).unwrap();
         senders[0]
             .send(ChangeEvent::insert(Arc::clone(&batch), 3000, 3))
             .unwrap();
@@ -540,12 +531,8 @@ mod tests {
         let mut cfg = SubscriptionConfig::default();
         cfg.buffer_size = 4;
 
-        let mut stream = subscribe_stream_with_errors(
-            Arc::clone(&registry),
-            "trades".into(),
-            0,
-            cfg,
-        );
+        let mut stream =
+            subscribe_stream_with_errors(Arc::clone(&registry), "trades".into(), 0, cfg);
 
         let senders = registry.get_senders_for_source(0);
 
@@ -612,18 +599,12 @@ mod tests {
         let (reg, stream, _senders) = make_stream("trades");
 
         assert!(stream.pause());
-        assert_eq!(
-            reg.state(stream.id()),
-            Some(SubscriptionState::Paused)
-        );
+        assert_eq!(reg.state(stream.id()), Some(SubscriptionState::Paused));
 
         assert!(!stream.pause()); // already paused
 
         assert!(stream.resume());
-        assert_eq!(
-            reg.state(stream.id()),
-            Some(SubscriptionState::Active)
-        );
+        assert_eq!(reg.state(stream.id()), Some(SubscriptionState::Active));
 
         assert!(!stream.resume()); // already active
     }

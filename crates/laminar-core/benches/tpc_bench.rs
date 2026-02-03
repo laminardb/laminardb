@@ -9,13 +9,13 @@
 //!
 //! Run with: cargo bench --bench tpc_bench
 
-use std::hint::black_box;
 use criterion::{criterion_group, criterion_main, BenchmarkId, Criterion, Throughput};
 use laminar_core::operator::Event;
 use laminar_core::tpc::{
     CachePadded, CoreConfig, CoreHandle, KeyRouter, KeySpec, SpscQueue, ThreadPerCoreRuntime,
     TpcConfig,
 };
+use std::hint::black_box;
 
 use arrow_array::{Int64Array, RecordBatch, StringArray};
 use std::sync::Arc;
@@ -44,17 +44,21 @@ fn bench_spsc_push(c: &mut Criterion) {
     for capacity in [1024, 4096, 16384, 65536] {
         group.throughput(Throughput::Elements(1));
 
-        group.bench_with_input(BenchmarkId::new("single", capacity), &capacity, |b, &cap| {
-            let queue: SpscQueue<u64> = SpscQueue::new(cap);
-            let mut value = 0u64;
-            b.iter(|| {
-                // Pop to make room, then push
-                let _ = queue.pop();
-                let result = queue.push(black_box(value));
-                value = value.wrapping_add(1);
-                black_box(result)
-            })
-        });
+        group.bench_with_input(
+            BenchmarkId::new("single", capacity),
+            &capacity,
+            |b, &cap| {
+                let queue: SpscQueue<u64> = SpscQueue::new(cap);
+                let mut value = 0u64;
+                b.iter(|| {
+                    // Pop to make room, then push
+                    let _ = queue.pop();
+                    let result = queue.push(black_box(value));
+                    value = value.wrapping_add(1);
+                    black_box(result)
+                })
+            },
+        );
     }
 
     group.finish();
@@ -67,22 +71,26 @@ fn bench_spsc_pop(c: &mut Criterion) {
     for capacity in [1024, 4096, 16384, 65536] {
         group.throughput(Throughput::Elements(1));
 
-        group.bench_with_input(BenchmarkId::new("single", capacity), &capacity, |b, &cap| {
-            let queue: SpscQueue<u64> = SpscQueue::new(cap);
-            // Pre-fill with some items
-            for i in 0..(cap / 2) as u64 {
-                let _ = queue.push(i);
-            }
+        group.bench_with_input(
+            BenchmarkId::new("single", capacity),
+            &capacity,
+            |b, &cap| {
+                let queue: SpscQueue<u64> = SpscQueue::new(cap);
+                // Pre-fill with some items
+                for i in 0..(cap / 2) as u64 {
+                    let _ = queue.push(i);
+                }
 
-            let mut value = (cap / 2) as u64;
-            b.iter(|| {
-                // Push to ensure there's something to pop
-                let _ = queue.push(value);
-                value = value.wrapping_add(1);
-                let result = queue.pop();
-                black_box(result)
-            })
-        });
+                let mut value = (cap / 2) as u64;
+                b.iter(|| {
+                    // Push to ensure there's something to pop
+                    let _ = queue.push(value);
+                    value = value.wrapping_add(1);
+                    let result = queue.pop();
+                    black_box(result)
+                })
+            },
+        );
     }
 
     group.finish();
@@ -268,7 +276,11 @@ fn bench_router_string_key(c: &mut Criterion) {
     let router = KeyRouter::new(8, KeySpec::Columns(vec!["user_id".to_string()]));
 
     // Various key lengths
-    for key in ["short", "medium_length_key", "this_is_a_very_long_user_identifier_string"] {
+    for key in [
+        "short",
+        "medium_length_key",
+        "this_is_a_very_long_user_identifier_string",
+    ] {
         let event = make_event_string(key, 1000);
 
         group.bench_with_input(BenchmarkId::new("route", key.len()), &event, |b, event| {

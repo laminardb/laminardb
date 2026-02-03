@@ -107,9 +107,7 @@ impl YieldReason {
     pub fn can_resume_immediately(&self) -> bool {
         matches!(
             self,
-            YieldReason::BudgetExceeded
-                | YieldReason::Ring0Priority
-                | YieldReason::FairScheduling
+            YieldReason::BudgetExceeded | YieldReason::Ring0Priority | YieldReason::FairScheduling
         )
     }
 
@@ -195,14 +193,20 @@ mod tests {
 
     #[test]
     fn test_metric_labels() {
-        assert_eq!(YieldReason::BudgetExceeded.metric_label(), "budget_exceeded");
+        assert_eq!(
+            YieldReason::BudgetExceeded.metric_label(),
+            "budget_exceeded"
+        );
         assert_eq!(YieldReason::Ring0Priority.metric_label(), "ring0_priority");
         assert_eq!(YieldReason::QueueEmpty.metric_label(), "queue_empty");
         assert_eq!(YieldReason::ShutdownRequested.metric_label(), "shutdown");
         assert_eq!(YieldReason::Interrupted.metric_label(), "interrupted");
         assert_eq!(YieldReason::CheckpointBarrier.metric_label(), "checkpoint");
         assert_eq!(YieldReason::Backpressure.metric_label(), "backpressure");
-        assert_eq!(YieldReason::FairScheduling.metric_label(), "fair_scheduling");
+        assert_eq!(
+            YieldReason::FairScheduling.metric_label(),
+            "fair_scheduling"
+        );
     }
 
     #[test]

@@ -367,8 +367,14 @@ mod tests {
         let loader = InMemoryTableLoader::new();
 
         // Insert test data
-        loader.insert(b"cust_1".to_vec(), create_customer_batch("cust_1", "Alice", "gold"));
-        loader.insert(b"cust_2".to_vec(), create_customer_batch("cust_2", "Bob", "silver"));
+        loader.insert(
+            b"cust_1".to_vec(),
+            create_customer_batch("cust_1", "Alice", "gold"),
+        );
+        loader.insert(
+            b"cust_2".to_vec(),
+            create_customer_batch("cust_2", "Bob", "silver"),
+        );
 
         assert_eq!(loader.len(), 2);
 
@@ -401,7 +407,10 @@ mod tests {
     #[tokio::test]
     async fn test_in_memory_loader_remove() {
         let loader = InMemoryTableLoader::new();
-        loader.insert(b"key".to_vec(), create_customer_batch("key", "Test", "gold"));
+        loader.insert(
+            b"key".to_vec(),
+            create_customer_batch("key", "Test", "gold"),
+        );
 
         assert_eq!(loader.len(), 1);
 

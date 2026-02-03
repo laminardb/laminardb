@@ -72,10 +72,7 @@ pub fn format_dag_explain(dag: &StreamingDag) -> DagExplainOutput {
     let shared_stages: Vec<(String, usize)> = dag
         .shared_stages()
         .iter()
-        .filter_map(|(id, meta)| {
-            dag.node_name(*id)
-                .map(|name| (name, meta.consumer_count))
-        })
+        .filter_map(|(id, meta)| dag.node_name(*id).map(|name| (name, meta.consumer_count)))
         .collect();
 
     // Build text output
@@ -91,11 +88,7 @@ pub fn format_dag_explain(dag: &StreamingDag) -> DagExplainOutput {
     let _ = writeln!(text, "Sources: [{}]", sources.join(", "));
 
     // Execution order line
-    let _ = writeln!(
-        text,
-        "Execution order: {}",
-        execution_order.join(" -> ")
-    );
+    let _ = writeln!(text, "Execution order: {}", execution_order.join(" -> "));
 
     // Shared stages
     if !shared_stages.is_empty() {

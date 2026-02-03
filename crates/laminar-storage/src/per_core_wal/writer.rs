@@ -49,10 +49,7 @@ impl CoreWalWriter {
     ///
     /// Returns an error if the file cannot be created or opened.
     pub fn new(core_id: usize, path: &Path) -> Result<Self, PerCoreWalError> {
-        let file = OpenOptions::new()
-            .create(true)
-            .append(true)
-            .open(path)?;
+        let file = OpenOptions::new().create(true).append(true).open(path)?;
 
         let position = file.metadata()?.len();
 
@@ -76,16 +73,12 @@ impl CoreWalWriter {
     ///
     /// Returns an error if the file cannot be opened or truncated.
     pub fn open_at(core_id: usize, path: &Path, position: u64) -> Result<Self, PerCoreWalError> {
-        let file = OpenOptions::new()
-            .write(true)
-            .open(path)?;
+        let file = OpenOptions::new().write(true).open(path)?;
 
         // Truncate to the specified position (in case of torn writes)
         file.set_len(position)?;
 
-        let file = OpenOptions::new()
-            .append(true)
-            .open(path)?;
+        let file = OpenOptions::new().append(true).open(path)?;
 
         Ok(Self {
             core_id,
@@ -166,12 +159,8 @@ impl CoreWalWriter {
     #[inline]
     #[allow(clippy::cast_possible_truncation)] // core_id bounded by physical CPU count (< u16::MAX)
     pub fn append_delete(&mut self, key: &[u8]) -> Result<u64, PerCoreWalError> {
-        let entry = PerCoreWalEntry::delete(
-            self.core_id as u16,
-            self.epoch,
-            self.sequence,
-            key.to_vec(),
-        );
+        let entry =
+            PerCoreWalEntry::delete(self.core_id as u16, self.epoch, self.sequence, key.to_vec());
         self.append(&entry)
     }
 
@@ -193,7 +182,8 @@ impl CoreWalWriter {
         let crc = crc32c::crc32c(&bytes);
 
         // Write record: [length: 4 bytes][crc32: 4 bytes][data: length bytes]
-        #[allow(clippy::cast_possible_truncation)] // rkyv entry serialization is well below u32::MAX
+        #[allow(clippy::cast_possible_truncation)]
+        // rkyv entry serialization is well below u32::MAX
         let len = bytes.len() as u32;
         self.writer.write_all(&len.to_le_bytes())?;
         self.writer.write_all(&crc.to_le_bytes())?;
@@ -231,11 +221,7 @@ impl CoreWalWriter {
     /// Returns an error if serialization or I/O fails.
     #[allow(clippy::cast_possible_truncation)] // core_id bounded by physical CPU count (< u16::MAX)
     pub fn append_epoch_barrier(&mut self) -> Result<u64, PerCoreWalError> {
-        let entry = PerCoreWalEntry::epoch_barrier(
-            self.core_id as u16,
-            self.epoch,
-            self.sequence,
-        );
+        let entry = PerCoreWalEntry::epoch_barrier(self.core_id as u16, self.epoch, self.sequence);
         self.append(&entry)
     }
 
@@ -295,9 +281,7 @@ impl CoreWalWriter {
         file.set_len(position)?;
 
         // Reopen for append
-        let file = OpenOptions::new()
-            .append(true)
-            .open(&self.path)?;
+        let file = OpenOptions::new().append(true).open(&self.path)?;
 
         self.writer = BufWriter::with_capacity(64 * 1024, file);
         self.position = position;

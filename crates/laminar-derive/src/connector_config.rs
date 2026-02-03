@@ -329,11 +329,7 @@ fn generate_config_keys(fields: &[FieldInfo]) -> Result<TokenStream, Error> {
         .iter()
         .map(|f| {
             let key = f.config.key.as_ref().unwrap();
-            let description = f
-                .config
-                .description
-                .as_deref()
-                .unwrap_or("No description");
+            let description = f.config.description.as_deref().unwrap_or("No description");
             let required = f.config.required;
             let default = &f.config.default;
 

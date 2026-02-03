@@ -68,9 +68,7 @@ pub mod iceberg_metrics;
 
 // Re-export Delta Lake types at module level.
 pub use delta::DeltaLakeSink;
-pub use delta_config::{
-    CompactionConfig, DeliveryGuarantee, DeltaLakeSinkConfig, DeltaWriteMode,
-};
+pub use delta_config::{CompactionConfig, DeliveryGuarantee, DeltaLakeSinkConfig, DeltaWriteMode};
 pub use delta_metrics::DeltaLakeSinkMetrics;
 
 // Re-export Iceberg types at module level.
@@ -100,9 +98,7 @@ pub fn register_delta_lake_sink(registry: &ConnectorRegistry) {
     registry.register_sink(
         "delta-lake",
         info,
-        Arc::new(|| {
-            Box::new(DeltaLakeSink::new(DeltaLakeSinkConfig::default()))
-        }),
+        Arc::new(|| Box::new(DeltaLakeSink::new(DeltaLakeSinkConfig::default()))),
     );
 }
 
@@ -120,9 +116,7 @@ pub fn register_iceberg_sink(registry: &ConnectorRegistry) {
     registry.register_sink(
         "iceberg",
         info,
-        Arc::new(|| {
-            Box::new(IcebergSink::new(IcebergSinkConfig::default()))
-        }),
+        Arc::new(|| Box::new(IcebergSink::new(IcebergSinkConfig::default()))),
     );
 }
 
@@ -325,11 +319,7 @@ fn iceberg_config_keys() -> Vec<ConfigKeySpec> {
             "parquet",
         ),
         // ── Write mode ──
-        ConfigKeySpec::optional(
-            "write.mode",
-            "Write mode: append, upsert",
-            "append",
-        ),
+        ConfigKeySpec::optional("write.mode", "Write mode: append, upsert", "append"),
         ConfigKeySpec::optional(
             "equality.delete.columns",
             "Columns for equality deletes in upsert mode (required for upsert)",

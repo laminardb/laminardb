@@ -166,7 +166,10 @@ fn detect_create_ddl(significant: &[&TokenWithSpan]) -> StreamingDdlKind {
             if significant.len() >= 4 {
                 let is_replace = matches!(
                     &significant[2].token,
-                    Token::Word(Word { keyword: Keyword::REPLACE, .. })
+                    Token::Word(Word {
+                        keyword: Keyword::REPLACE,
+                        ..
+                    })
                 );
                 if is_replace {
                     return classify_after_or_replace(&significant[3].token, significant);
@@ -274,11 +277,17 @@ fn has_if_exists(significant: &[&TokenWithSpan], offset: usize) -> bool {
     if significant.len() > offset + 1 {
         let is_if = matches!(
             &significant[offset].token,
-            Token::Word(Word { keyword: Keyword::IF, .. })
+            Token::Word(Word {
+                keyword: Keyword::IF,
+                ..
+            })
         );
         let is_exists = matches!(
             &significant[offset + 1].token,
-            Token::Word(Word { keyword: Keyword::EXISTS, .. })
+            Token::Word(Word {
+                keyword: Keyword::EXISTS,
+                ..
+            })
         );
         is_if && is_exists
     } else {
@@ -290,10 +299,7 @@ fn has_if_exists(significant: &[&TokenWithSpan], offset: usize) -> bool {
 ///
 /// Also handles `CREATE OR REPLACE MATERIALIZED VIEW` by checking the
 /// next token in the significant tokens array.
-fn classify_after_or_replace(
-    token: &Token,
-    significant: &[&TokenWithSpan],
-) -> StreamingDdlKind {
+fn classify_after_or_replace(token: &Token, significant: &[&TokenWithSpan]) -> StreamingDdlKind {
     match token {
         Token::Word(w) if is_word_ci(w, "SOURCE") => {
             StreamingDdlKind::CreateSource { or_replace: true }
@@ -540,14 +546,11 @@ mod tests {
     #[test]
     fn test_parse_with_options_empty() {
         let dialect = GenericDialect {};
-        let mut parser = Parser::new(&dialect)
-            .try_with_sql("SELECT 1")
-            .unwrap();
+        let mut parser = Parser::new(&dialect).try_with_sql("SELECT 1").unwrap();
 
         let options = parse_with_options(&mut parser).unwrap();
         assert!(options.is_empty());
     }
-
 
     #[test]
     fn test_detect_drop_source() {

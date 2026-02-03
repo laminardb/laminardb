@@ -65,9 +65,7 @@ pub fn register_postgres_cdc(registry: &ConnectorRegistry) {
     registry.register_source(
         "postgres-cdc",
         info,
-        Arc::new(|| {
-            Box::new(PostgresCdcSource::new(PostgresCdcConfig::default()))
-        }),
+        Arc::new(|| Box::new(PostgresCdcSource::new(PostgresCdcConfig::default()))),
     );
 }
 

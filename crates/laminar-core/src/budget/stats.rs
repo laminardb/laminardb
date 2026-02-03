@@ -85,23 +85,27 @@ impl BudgetMetrics {
     pub fn record_task(&self, _name: &'static str, ring: u8, budget_ns: u64, elapsed_ns: u64) {
         // Update global counters
         self.total_tasks.fetch_add(1, Ordering::Relaxed);
-        self.total_duration_ns.fetch_add(elapsed_ns, Ordering::Relaxed);
+        self.total_duration_ns
+            .fetch_add(elapsed_ns, Ordering::Relaxed);
 
         // Check for violation
         if elapsed_ns > budget_ns {
             let exceeded_by = elapsed_ns - budget_ns;
             self.total_violations.fetch_add(1, Ordering::Relaxed);
-            self.total_exceeded_ns.fetch_add(exceeded_by, Ordering::Relaxed);
+            self.total_exceeded_ns
+                .fetch_add(exceeded_by, Ordering::Relaxed);
 
             // Update ring-specific counters
             match ring {
                 0 => {
                     self.ring0_violations.fetch_add(1, Ordering::Relaxed);
-                    self.ring0_exceeded_ns.fetch_add(exceeded_by, Ordering::Relaxed);
+                    self.ring0_exceeded_ns
+                        .fetch_add(exceeded_by, Ordering::Relaxed);
                 }
                 1 => {
                     self.ring1_violations.fetch_add(1, Ordering::Relaxed);
-                    self.ring1_exceeded_ns.fetch_add(exceeded_by, Ordering::Relaxed);
+                    self.ring1_exceeded_ns
+                        .fetch_add(exceeded_by, Ordering::Relaxed);
                 }
                 _ => {}
             }

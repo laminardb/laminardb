@@ -375,8 +375,7 @@ mod tests {
 
     #[test]
     fn test_analyze_order_by_multiple_columns() {
-        let stmt =
-            parse_stmt("SELECT * FROM events ORDER BY category ASC, price DESC NULLS LAST");
+        let stmt = parse_stmt("SELECT * FROM events ORDER BY category ASC, price DESC NULLS LAST");
         let analysis = analyze_order_by(&stmt);
         assert_eq!(analysis.order_columns.len(), 2);
         assert_eq!(analysis.order_columns[0].column, "category");

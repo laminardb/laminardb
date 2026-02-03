@@ -92,9 +92,9 @@ impl QueryHandle {
 
     /// Subscribe to raw `RecordBatch` results.
     pub(crate) fn subscribe_raw(&mut self) -> Result<Subscription<ArrowRecord>, DbError> {
-        self.subscription.take().ok_or_else(|| {
-            DbError::InvalidOperation("Subscription already consumed".to_string())
-        })
+        self.subscription
+            .take()
+            .ok_or_else(|| DbError::InvalidOperation("Subscription already consumed".to_string()))
     }
 
     /// Subscribe to typed results.

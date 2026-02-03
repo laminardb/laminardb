@@ -285,8 +285,7 @@ impl DataFusionAggregateFactory {
             .udf
             .return_type(&self.input_types)
             .unwrap_or(DataType::Float64);
-        let return_field: FieldRef =
-            Arc::new(Field::new(self.udf.name(), return_type, true));
+        let return_field: FieldRef = Arc::new(Field::new(self.udf.name(), return_type, true));
         let schema = Schema::new(
             self.input_types
                 .iter()
@@ -391,11 +390,8 @@ mod tests {
             DataType::Float64,
             false,
         )]));
-        let batch = RecordBatch::try_new(
-            schema,
-            vec![Arc::new(Float64Array::from(values))],
-        )
-        .unwrap();
+        let batch =
+            RecordBatch::try_new(schema, vec![Arc::new(Float64Array::from(values))]).unwrap();
         Event::new(ts, batch)
     }
 
@@ -405,11 +401,7 @@ mod tests {
             DataType::Int64,
             false,
         )]));
-        let batch = RecordBatch::try_new(
-            schema,
-            vec![Arc::new(Int64Array::from(values))],
-        )
-        .unwrap();
+        let batch = RecordBatch::try_new(schema, vec![Arc::new(Int64Array::from(values))]).unwrap();
         Event::new(ts, batch)
     }
 
@@ -526,10 +518,16 @@ mod tests {
 
         // Optional None roundtrips back to OptionalNone (ScalarValue preserves type)
         let sv = result_to_scalar_value(&ScalarResult::OptionalInt64(None));
-        assert_eq!(scalar_value_to_result(&sv), ScalarResult::OptionalInt64(None));
+        assert_eq!(
+            scalar_value_to_result(&sv),
+            ScalarResult::OptionalInt64(None)
+        );
 
         let sv = result_to_scalar_value(&ScalarResult::OptionalFloat64(None));
-        assert_eq!(scalar_value_to_result(&sv), ScalarResult::OptionalFloat64(None));
+        assert_eq!(
+            scalar_value_to_result(&sv),
+            ScalarResult::OptionalFloat64(None)
+        );
 
         // Null roundtrips correctly
         let sv = result_to_scalar_value(&ScalarResult::Null);
@@ -565,14 +563,20 @@ mod tests {
     fn test_factory_stddev() {
         let ctx = SessionContext::new();
         let factory = create_aggregate_factory(&ctx, "stddev", vec![0], vec![DataType::Float64]);
-        assert!(factory.is_some(), "stddev should be available in DataFusion");
+        assert!(
+            factory.is_some(),
+            "stddev should be available in DataFusion"
+        );
     }
 
     #[test]
     fn test_factory_unknown() {
         let ctx = SessionContext::new();
         let factory = create_aggregate_factory(
-            &ctx, "nonexistent_aggregate_xyz", vec![0], vec![DataType::Int64],
+            &ctx,
+            "nonexistent_aggregate_xyz",
+            vec![0],
+            vec![DataType::Int64],
         );
         assert!(factory.is_none());
     }

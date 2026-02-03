@@ -123,8 +123,22 @@ mod tests {
         tick_index.insert("GOOGL".to_string(), googl);
 
         let orders = vec![
-            ("ORD-1".to_string(), "AAPL".to_string(), "buy".to_string(), 10, 150.5, 1500),
-            ("ORD-2".to_string(), "GOOGL".to_string(), "sell".to_string(), 20, 174.0, 1500),
+            (
+                "ORD-1".to_string(),
+                "AAPL".to_string(),
+                "buy".to_string(),
+                10,
+                150.5,
+                1500,
+            ),
+            (
+                "ORD-2".to_string(),
+                "GOOGL".to_string(),
+                "sell".to_string(),
+                20,
+                174.0,
+                1500,
+            ),
         ];
 
         let result = merge_orders_with_ticks(&orders, &tick_index);

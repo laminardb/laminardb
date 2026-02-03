@@ -196,10 +196,7 @@ mod tests {
 
     use super::*;
 
-    fn make_resolved(
-        provider: StorageProvider,
-        keys: &[(&str, &str)],
-    ) -> ResolvedStorageOptions {
+    fn make_resolved(provider: StorageProvider, keys: &[(&str, &str)]) -> ResolvedStorageOptions {
         let mut options = HashMap::new();
         for (k, v) in keys {
             options.insert((*k).to_string(), (*v).to_string());
@@ -240,18 +237,12 @@ mod tests {
         let result = CloudConfigValidator::validate(&resolved);
         assert!(!result.is_valid());
         assert!(result.errors.iter().any(|e| e.key == "aws_region"));
-        assert_eq!(
-            result.errors[0].env_var.as_deref(),
-            Some("AWS_REGION")
-        );
+        assert_eq!(result.errors[0].env_var.as_deref(), Some("AWS_REGION"));
     }
 
     #[test]
     fn test_validate_s3_missing_credentials_warns() {
-        let resolved = make_resolved(
-            StorageProvider::AwsS3,
-            &[("aws_region", "us-east-1")],
-        );
+        let resolved = make_resolved(StorageProvider::AwsS3, &[("aws_region", "us-east-1")]);
         let result = CloudConfigValidator::validate(&resolved);
         assert!(result.is_valid()); // Warning, not error.
         assert!(!result.warnings.is_empty());
@@ -261,10 +252,7 @@ mod tests {
     fn test_validate_s3_access_key_without_secret() {
         let resolved = make_resolved(
             StorageProvider::AwsS3,
-            &[
-                ("aws_access_key_id", "AKID"),
-                ("aws_region", "us-east-1"),
-            ],
+            &[("aws_access_key_id", "AKID"), ("aws_region", "us-east-1")],
         );
         let result = CloudConfigValidator::validate(&resolved);
         assert!(!result.is_valid());
@@ -285,10 +273,7 @@ mod tests {
         );
         let result = CloudConfigValidator::validate(&resolved);
         assert!(!result.is_valid());
-        assert!(result
-            .errors
-            .iter()
-            .any(|e| e.key == "aws_access_key_id"));
+        assert!(result.errors.iter().any(|e| e.key == "aws_access_key_id"));
     }
 
     #[test]
@@ -387,7 +372,10 @@ mod tests {
     fn test_validate_gcs_inline_key_sufficient() {
         let resolved = make_resolved(
             StorageProvider::Gcs,
-            &[("google_service_account_key", "{\"type\":\"service_account\"}")],
+            &[(
+                "google_service_account_key",
+                "{\"type\":\"service_account\"}",
+            )],
         );
         let result = CloudConfigValidator::validate(&resolved);
         assert!(result.is_valid());
@@ -427,7 +415,11 @@ mod tests {
     fn test_error_includes_env_var_hint() {
         let resolved = make_resolved(StorageProvider::AwsS3, &[]);
         let result = CloudConfigValidator::validate(&resolved);
-        let region_err = result.errors.iter().find(|e| e.key == "aws_region").unwrap();
+        let region_err = result
+            .errors
+            .iter()
+            .find(|e| e.key == "aws_region")
+            .unwrap();
         assert_eq!(region_err.env_var.as_deref(), Some("AWS_REGION"));
         assert!(region_err.message.contains("AWS_REGION"));
     }

@@ -118,7 +118,8 @@ impl DagBuilder {
         let fan_out = branches(FanOutBuilder::new(shared_node.to_string()));
         for (branch_name, branch_type, branch_schema) in fan_out.branches {
             let idx = self.nodes.len();
-            self.nodes.push((branch_name.clone(), branch_type, branch_schema));
+            self.nodes
+                .push((branch_name.clone(), branch_type, branch_schema));
             self.name_index.insert(branch_name.clone(), idx);
             self.edges.push((shared_node.to_string(), branch_name));
         }
@@ -127,12 +128,7 @@ impl DagBuilder {
 
     /// Adds a sink node and connects it to an upstream node.
     #[must_use]
-    pub fn sink_for(
-        mut self,
-        upstream: &str,
-        sink_name: &str,
-        schema: SchemaRef,
-    ) -> Self {
+    pub fn sink_for(mut self, upstream: &str, sink_name: &str, schema: SchemaRef) -> Self {
         let idx = self.nodes.len();
         self.nodes
             .push((sink_name.to_string(), DagNodeType::Sink, schema));
@@ -217,22 +213,16 @@ impl FanOutBuilder {
     /// Adds a stateful operator branch from the shared stage.
     #[must_use]
     pub fn branch(mut self, name: &str, schema: SchemaRef) -> Self {
-        self.branches.push((
-            name.to_string(),
-            DagNodeType::StatefulOperator,
-            schema,
-        ));
+        self.branches
+            .push((name.to_string(), DagNodeType::StatefulOperator, schema));
         self
     }
 
     /// Adds a stateless operator branch from the shared stage.
     #[must_use]
     pub fn stateless_branch(mut self, name: &str, schema: SchemaRef) -> Self {
-        self.branches.push((
-            name.to_string(),
-            DagNodeType::StatelessOperator,
-            schema,
-        ));
+        self.branches
+            .push((name.to_string(), DagNodeType::StatelessOperator, schema));
         self
     }
 }

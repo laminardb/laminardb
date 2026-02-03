@@ -51,7 +51,7 @@ pub mod tpc;
 pub mod xdp;
 
 // Re-export key types
-pub use reactor::{ReactorConfig, Reactor};
+pub use reactor::{Reactor, ReactorConfig};
 
 /// Result type for laminar-core operations
 pub type Result<T> = std::result::Result<T, Error>;

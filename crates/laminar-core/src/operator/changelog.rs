@@ -339,8 +339,7 @@ pub trait RetractableAccumulator: Default + Clone + Send {
 ///
 /// Uses signed integer to support negative counts from retractions.
 /// In a correct pipeline, the count should never go negative.
-#[derive(Debug, Clone, Default)]
-#[derive(rkyv::Archive, rkyv::Serialize, rkyv::Deserialize)]
+#[derive(Debug, Clone, Default, rkyv::Archive, rkyv::Serialize, rkyv::Deserialize)]
 pub struct RetractableCountAccumulator {
     /// Signed count to support retraction
     count: i64,
@@ -394,8 +393,7 @@ impl RetractableAccumulator for RetractableCountAccumulator {
 /// Retractable sum accumulator.
 ///
 /// Supports O(1) retraction by simple subtraction.
-#[derive(Debug, Clone, Default)]
-#[derive(rkyv::Archive, rkyv::Serialize, rkyv::Deserialize)]
+#[derive(Debug, Clone, Default, rkyv::Archive, rkyv::Serialize, rkyv::Deserialize)]
 pub struct RetractableSumAccumulator {
     /// Running sum (signed)
     sum: i64,
@@ -455,8 +453,7 @@ impl RetractableAccumulator for RetractableSumAccumulator {
 /// Retractable average accumulator.
 ///
 /// Supports O(1) retraction by updating sum and count.
-#[derive(Debug, Clone, Default)]
-#[derive(rkyv::Archive, rkyv::Serialize, rkyv::Deserialize)]
+#[derive(Debug, Clone, Default, rkyv::Archive, rkyv::Serialize, rkyv::Deserialize)]
 pub struct RetractableAvgAccumulator {
     /// Running sum
     sum: i64,
@@ -1130,10 +1127,7 @@ impl RetractableAccumulator for RetractableFirstValueAccumulator {
     fn add(&mut self, (timestamp, value): (i64, i64)) {
         // Insert in sorted order by timestamp, preserving insertion order
         // for duplicate timestamps (append after existing same-timestamp entries)
-        let pos = match self
-            .entries
-            .binary_search_by_key(&timestamp, |(ts, _)| *ts)
-        {
+        let pos = match self.entries.binary_search_by_key(&timestamp, |(ts, _)| *ts) {
             Ok(mut p) => {
                 // Skip past all entries with the same timestamp
                 while p < self.entries.len() && self.entries[p].0 == timestamp {
@@ -1232,10 +1226,7 @@ impl RetractableAccumulator for RetractableLastValueAccumulator {
 
     fn add(&mut self, (timestamp, value): (i64, i64)) {
         // Insert in sorted order by timestamp, preserving insertion order
-        let pos = match self
-            .entries
-            .binary_search_by_key(&timestamp, |(ts, _)| *ts)
-        {
+        let pos = match self.entries.binary_search_by_key(&timestamp, |(ts, _)| *ts) {
             Ok(mut p) => {
                 while p < self.entries.len() && self.entries[p].0 == timestamp {
                     p += 1;
@@ -1339,10 +1330,7 @@ impl RetractableAccumulator for RetractableFirstValueF64Accumulator {
     #[allow(clippy::cast_possible_wrap)]
     fn add(&mut self, (timestamp, value): (i64, f64)) {
         let value_bits = value.to_bits() as i64;
-        let pos = match self
-            .entries
-            .binary_search_by_key(&timestamp, |(ts, _)| *ts)
-        {
+        let pos = match self.entries.binary_search_by_key(&timestamp, |(ts, _)| *ts) {
             Ok(mut p) => {
                 while p < self.entries.len() && self.entries[p].0 == timestamp {
                     p += 1;
@@ -1446,10 +1434,7 @@ impl RetractableAccumulator for RetractableLastValueF64Accumulator {
     #[allow(clippy::cast_possible_wrap)]
     fn add(&mut self, (timestamp, value): (i64, f64)) {
         let value_bits = value.to_bits() as i64;
-        let pos = match self
-            .entries
-            .binary_search_by_key(&timestamp, |(ts, _)| *ts)
-        {
+        let pos = match self.entries.binary_search_by_key(&timestamp, |(ts, _)| *ts) {
             Ok(mut p) => {
                 while p < self.entries.len() && self.entries[p].0 == timestamp {
                     p += 1;
@@ -1873,8 +1858,7 @@ mod tests {
     #[test]
     fn test_cdc_envelope_delete() {
         let source = CdcSource::new("laminardb", "default", "orders");
-        let envelope =
-            CdcEnvelope::delete(serde_json::json!({"id": 1}), source, 1_706_140_800_000);
+        let envelope = CdcEnvelope::delete(serde_json::json!({"id": 1}), source, 1_706_140_800_000);
 
         assert_eq!(envelope.op, "d");
         assert!(envelope.is_delete());

@@ -154,12 +154,7 @@ impl DagExecutor {
     /// * `dag` - A finalized `StreamingDag` topology
     #[must_use]
     pub fn from_dag(dag: &StreamingDag) -> Self {
-        let slot_count = dag
-            .nodes()
-            .keys()
-            .map(|n| n.0)
-            .max()
-            .map_or(0, |n| n + 1) as usize;
+        let slot_count = dag.nodes().keys().map(|n| n.0).max().map_or(0, |n| n + 1) as usize;
 
         let routing = RoutingTable::from_dag(dag);
 
@@ -236,11 +231,7 @@ impl DagExecutor {
     /// # Errors
     ///
     /// Returns [`DagError::NodeNotFound`] if the source node is out of bounds.
-    pub fn process_event(
-        &mut self,
-        source_node: NodeId,
-        event: Event,
-    ) -> Result<(), DagError> {
+    pub fn process_event(&mut self, source_node: NodeId, event: Event) -> Result<(), DagError> {
         let idx = source_node.0 as usize;
         if idx >= self.slot_count {
             return Err(DagError::NodeNotFound(format!("{source_node}")));
@@ -322,7 +313,8 @@ impl DagExecutor {
         let mut states = FxHashMap::default();
         for (idx, op) in self.operators.iter().enumerate() {
             if let Some(operator) = op {
-                #[allow(clippy::cast_possible_truncation)] // DAG node count bounded by topology (< u32::MAX)
+                #[allow(clippy::cast_possible_truncation)]
+                // DAG node count bounded by topology (< u32::MAX)
                 let node_id = NodeId(idx as u32);
                 states.insert(node_id, operator.checkpoint());
             }
@@ -338,20 +330,17 @@ impl DagExecutor {
     /// # Errors
     ///
     /// Returns [`DagError::RestoreFailed`] if any operator fails to restore.
-    pub fn restore(
-        &mut self,
-        states: &FxHashMap<NodeId, OperatorState>,
-    ) -> Result<(), DagError> {
+    pub fn restore(&mut self, states: &FxHashMap<NodeId, OperatorState>) -> Result<(), DagError> {
         for (node_id, state) in states {
             let idx = node_id.0 as usize;
             if idx < self.slot_count {
                 if let Some(ref mut operator) = self.operators[idx] {
-                    operator.restore(state.clone()).map_err(|e| {
-                        DagError::RestoreFailed {
+                    operator
+                        .restore(state.clone())
+                        .map_err(|e| DagError::RestoreFailed {
                             node_id: format!("{node_id}"),
                             reason: e.to_string(),
-                        }
-                    })?;
+                        })?;
                 }
             }
         }

@@ -324,11 +324,15 @@ impl CoreRingManager {
             return Err(IoUringError::RingClosed);
         }
 
-        let pool = self.buffer_pool.as_mut().ok_or(IoUringError::InvalidConfig(
-            "No buffer pool configured".to_string(),
-        ))?;
+        let pool = self
+            .buffer_pool
+            .as_mut()
+            .ok_or(IoUringError::InvalidConfig(
+                "No buffer pool configured".to_string(),
+            ))?;
 
-        let user_data = pool.submit_read_fixed(self.main_ring.ring_mut(), fd, buf_index, offset, len)?;
+        let user_data =
+            pool.submit_read_fixed(self.main_ring.ring_mut(), fd, buf_index, offset, len)?;
 
         self.pending.insert(
             user_data,
@@ -359,11 +363,15 @@ impl CoreRingManager {
             return Err(IoUringError::RingClosed);
         }
 
-        let pool = self.buffer_pool.as_mut().ok_or(IoUringError::InvalidConfig(
-            "No buffer pool configured".to_string(),
-        ))?;
+        let pool = self
+            .buffer_pool
+            .as_mut()
+            .ok_or(IoUringError::InvalidConfig(
+                "No buffer pool configured".to_string(),
+            ))?;
 
-        let user_data = pool.submit_write_fixed(self.main_ring.ring_mut(), fd, buf_index, offset, len)?;
+        let user_data =
+            pool.submit_write_fixed(self.main_ring.ring_mut(), fd, buf_index, offset, len)?;
 
         self.pending.insert(
             user_data,

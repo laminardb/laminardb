@@ -208,33 +208,44 @@ impl Ring0Predicate {
     /// This runs on the Ring 0 hot path.
     #[inline]
     #[must_use]
-    pub fn evaluate(
-        &self,
-        batch: &RecordBatch,
-        row: usize,
-        intern: &StringInternTable,
-    ) -> bool {
+    pub fn evaluate(&self, batch: &RecordBatch, row: usize, intern: &StringInternTable) -> bool {
         match self {
-            Ring0Predicate::Eq { column_index, value } => {
-                compare_eq(batch, *column_index, row, value, intern)
-            }
-            Ring0Predicate::NotEq { column_index, value } => {
-                !compare_eq(batch, *column_index, row, value, intern)
-            }
-            Ring0Predicate::Gt { column_index, value } => {
-                compare_ord(batch, *column_index, row, value, std::cmp::Ordering::Greater)
-            }
-            Ring0Predicate::GtEq { column_index, value } => {
+            Ring0Predicate::Eq {
+                column_index,
+                value,
+            } => compare_eq(batch, *column_index, row, value, intern),
+            Ring0Predicate::NotEq {
+                column_index,
+                value,
+            } => !compare_eq(batch, *column_index, row, value, intern),
+            Ring0Predicate::Gt {
+                column_index,
+                value,
+            } => compare_ord(
+                batch,
+                *column_index,
+                row,
+                value,
+                std::cmp::Ordering::Greater,
+            ),
+            Ring0Predicate::GtEq {
+                column_index,
+                value,
+            } => {
                 let ord = compare_ord_raw(batch, *column_index, row, value);
                 matches!(
                     ord,
                     Some(std::cmp::Ordering::Greater | std::cmp::Ordering::Equal)
                 )
             }
-            Ring0Predicate::Lt { column_index, value } => {
-                compare_ord(batch, *column_index, row, value, std::cmp::Ordering::Less)
-            }
-            Ring0Predicate::LtEq { column_index, value } => {
+            Ring0Predicate::Lt {
+                column_index,
+                value,
+            } => compare_ord(batch, *column_index, row, value, std::cmp::Ordering::Less),
+            Ring0Predicate::LtEq {
+                column_index,
+                value,
+            } => {
                 let ord = compare_ord_raw(batch, *column_index, row, value);
                 matches!(
                     ord,
@@ -256,12 +267,8 @@ impl Ring0Predicate {
                 );
                 ge_low && le_high
             }
-            Ring0Predicate::IsNull { column_index } => {
-                batch.column(*column_index).is_null(row)
-            }
-            Ring0Predicate::IsNotNull { column_index } => {
-                batch.column(*column_index).is_valid(row)
-            }
+            Ring0Predicate::IsNull { column_index } => batch.column(*column_index).is_null(row),
+            Ring0Predicate::IsNotNull { column_index } => batch.column(*column_index).is_valid(row),
             Ring0Predicate::In {
                 column_index,
                 values,
@@ -538,20 +545,16 @@ fn classify_predicate(
             let bin_op = bin_op?;
 
             // Try column op literal
-            if let Some(pred) =
-                try_column_op_literal(left, bin_op, right, schema, intern)
-            {
+            if let Some(pred) = try_column_op_literal(left, bin_op, right, schema, intern) {
                 return Some(Classification::Ring0(pred));
             }
             // Try literal op column (swap)
-            if let Some(pred) =
-                try_column_op_literal(right, bin_op.swap(), left, schema, intern)
-            {
+            if let Some(pred) = try_column_op_literal(right, bin_op.swap(), left, schema, intern) {
                 return Some(Classification::Ring0(pred));
             }
-            Some(Classification::Ring1(Ring1Predicate::Expression(
-                format!("{expr}"),
-            )))
+            Some(Classification::Ring1(Ring1Predicate::Expression(format!(
+                "{expr}"
+            ))))
         }
         Expr::IsNull(inner) => {
             let col_name = extract_column_name(inner)?;
@@ -573,9 +576,9 @@ fn classify_predicate(
             negated,
         } => {
             if *negated || list.len() > 8 {
-                return Some(Classification::Ring1(Ring1Predicate::Expression(
-                    format!("{expr}"),
-                )));
+                return Some(Classification::Ring1(Ring1Predicate::Expression(format!(
+                    "{expr}"
+                ))));
             }
             let col_name = extract_column_name(inner)?;
             let col_idx = schema.index_of(&col_name).ok()?;
@@ -585,9 +588,9 @@ fn classify_predicate(
                 if let Some(scalar) = expr_to_scalar(item, intern) {
                     values.push(scalar);
                 } else {
-                    return Some(Classification::Ring1(Ring1Predicate::Expression(
-                        format!("{expr}"),
-                    )));
+                    return Some(Classification::Ring1(Ring1Predicate::Expression(format!(
+                        "{expr}"
+                    ))));
                 }
             }
             Some(Classification::Ring0(Ring0Predicate::In {
@@ -602,9 +605,9 @@ fn classify_predicate(
             high,
         } => {
             if *negated {
-                return Some(Classification::Ring1(Ring1Predicate::Expression(
-                    format!("{expr}"),
-                )));
+                return Some(Classification::Ring1(Ring1Predicate::Expression(format!(
+                    "{expr}"
+                ))));
             }
             let col_name = extract_column_name(inner)?;
             let col_idx = schema.index_of(&col_name).ok()?;
@@ -616,9 +619,9 @@ fn classify_predicate(
                 high: high_scalar,
             }))
         }
-        _ => Some(Classification::Ring1(Ring1Predicate::Expression(
-            format!("{expr}"),
-        ))),
+        _ => Some(Classification::Ring1(Ring1Predicate::Expression(format!(
+            "{expr}"
+        )))),
     }
 }
 
@@ -949,22 +952,14 @@ mod tests {
         let intern = StringInternTable::new();
         let pred = Ring0Predicate::IsNull { column_index: 0 };
         assert!(pred.evaluate(&make_nullable_batch(None, 100.0, 10), 0, &intern));
-        assert!(!pred.evaluate(
-            &make_nullable_batch(Some("AAPL"), 100.0, 10),
-            0,
-            &intern
-        ));
+        assert!(!pred.evaluate(&make_nullable_batch(Some("AAPL"), 100.0, 10), 0, &intern));
     }
 
     #[test]
     fn test_ring0_predicate_is_not_null() {
         let intern = StringInternTable::new();
         let pred = Ring0Predicate::IsNotNull { column_index: 0 };
-        assert!(pred.evaluate(
-            &make_nullable_batch(Some("AAPL"), 100.0, 10),
-            0,
-            &intern
-        ));
+        assert!(pred.evaluate(&make_nullable_batch(Some("AAPL"), 100.0, 10), 0, &intern));
         assert!(!pred.evaluate(&make_nullable_batch(None, 100.0, 10), 0, &intern));
     }
 
@@ -1037,8 +1032,7 @@ mod tests {
     #[test]
     fn test_filter_compile_and_split() {
         let schema = test_schema();
-        let filter =
-            compile_filter("price > 100.0 AND UPPER(symbol) = 'AAPL'", &schema).unwrap();
+        let filter = compile_filter("price > 100.0 AND UPPER(symbol) = 'AAPL'", &schema).unwrap();
         assert_eq!(filter.ring0_predicates.len(), 1);
         assert_eq!(filter.ring1_predicates.len(), 1);
     }
@@ -1074,8 +1068,7 @@ mod tests {
     #[test]
     fn test_filter_compile_between() {
         let schema = test_schema();
-        let filter =
-            compile_filter("price BETWEEN 100.0 AND 200.0", &schema).unwrap();
+        let filter = compile_filter("price BETWEEN 100.0 AND 200.0", &schema).unwrap();
         assert_eq!(filter.ring0_predicates.len(), 1);
         assert!(matches!(
             &filter.ring0_predicates[0],
@@ -1089,8 +1082,7 @@ mod tests {
     #[test]
     fn test_filter_compile_in_list() {
         let schema = test_schema();
-        let filter =
-            compile_filter("symbol IN ('AAPL', 'GOOG', 'MSFT')", &schema).unwrap();
+        let filter = compile_filter("symbol IN ('AAPL', 'GOOG', 'MSFT')", &schema).unwrap();
         assert_eq!(filter.ring0_predicates.len(), 1);
         assert!(matches!(
             &filter.ring0_predicates[0],
@@ -1124,11 +1116,8 @@ mod tests {
     #[test]
     fn test_filter_compile_end_to_end() {
         let schema = test_schema();
-        let filter = compile_filter(
-            "symbol = 'AAPL' AND price > 100.0 AND qty >= 10",
-            &schema,
-        )
-        .unwrap();
+        let filter =
+            compile_filter("symbol = 'AAPL' AND price > 100.0 AND qty >= 10", &schema).unwrap();
         assert_eq!(filter.ring0_predicates.len(), 3);
         assert!(filter.ring1_predicates.is_empty());
 

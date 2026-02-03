@@ -119,9 +119,7 @@ impl BudgetMonitor {
     /// Get current violation count for a task.
     #[must_use]
     pub fn violation_count(&self, task: &str) -> u64 {
-        self.violations
-            .get(task)
-            .map_or(0, |w| w.count)
+        self.violations.get(task).map_or(0, |w| w.count)
     }
 
     /// Get the alert threshold (violations per second).
@@ -423,7 +421,10 @@ mod tests {
         };
         assert_eq!(alert.ring_name(), "Ring 0 (Hot Path)");
 
-        let alert1 = BudgetAlert { ring: 1, ..alert.clone() };
+        let alert1 = BudgetAlert {
+            ring: 1,
+            ..alert.clone()
+        };
         assert_eq!(alert1.ring_name(), "Ring 1 (Background)");
 
         let alert2 = BudgetAlert { ring: 2, ..alert };

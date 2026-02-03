@@ -155,11 +155,10 @@ impl WindowRewriter {
     pub fn extract_window_function(expr: &Expr) -> Result<Option<WindowFunction>, ParseError> {
         match expr {
             Expr::Function(func) => {
-                let name = func
-                    .name
-                    .0
-                    .last()
-                    .ok_or_else(|| ParseError::WindowError("Empty function name".to_string()))?;
+                let name =
+                    func.name.0.last().ok_or_else(|| {
+                        ParseError::WindowError("Empty function name".to_string())
+                    })?;
 
                 let func_name = name.to_string().to_uppercase();
 
@@ -281,9 +280,7 @@ impl WindowRewriter {
     /// # Errors
     ///
     /// Returns `ParseError::WindowError` if the expression is not a valid interval.
-    pub fn parse_interval_to_duration(
-        expr: &Expr,
-    ) -> Result<std::time::Duration, ParseError> {
+    pub fn parse_interval_to_duration(expr: &Expr) -> Result<std::time::Duration, ParseError> {
         match expr {
             Expr::Interval(interval) => {
                 // Extract the value
@@ -295,21 +292,22 @@ impl WindowRewriter {
                     .clone()
                     .unwrap_or(sqlparser::ast::DateTimeField::Second);
 
-                let seconds = match unit {
-                    sqlparser::ast::DateTimeField::Second
-                    | sqlparser::ast::DateTimeField::Seconds => value,
-                    sqlparser::ast::DateTimeField::Minute
-                    | sqlparser::ast::DateTimeField::Minutes => value * 60,
-                    sqlparser::ast::DateTimeField::Hour
-                    | sqlparser::ast::DateTimeField::Hours => value * 3600,
-                    sqlparser::ast::DateTimeField::Day
-                    | sqlparser::ast::DateTimeField::Days => value * 86400,
-                    _ => {
-                        return Err(ParseError::WindowError(format!(
-                            "Unsupported interval unit: {unit:?}"
-                        )))
-                    }
-                };
+                let seconds =
+                    match unit {
+                        sqlparser::ast::DateTimeField::Second
+                        | sqlparser::ast::DateTimeField::Seconds => value,
+                        sqlparser::ast::DateTimeField::Minute
+                        | sqlparser::ast::DateTimeField::Minutes => value * 60,
+                        sqlparser::ast::DateTimeField::Hour
+                        | sqlparser::ast::DateTimeField::Hours => value * 3600,
+                        sqlparser::ast::DateTimeField::Day
+                        | sqlparser::ast::DateTimeField::Days => value * 86400,
+                        _ => {
+                            return Err(ParseError::WindowError(format!(
+                                "Unsupported interval unit: {unit:?}"
+                            )))
+                        }
+                    };
 
                 Ok(std::time::Duration::from_secs(seconds))
             }
@@ -338,9 +336,9 @@ impl WindowRewriter {
             Expr::Value(value_with_span) => {
                 use sqlparser::ast::Value;
                 match &value_with_span.value {
-                    Value::Number(n, _) => n
-                        .parse::<u64>()
-                        .map_err(|_| ParseError::WindowError(format!("Invalid interval value: {n}"))),
+                    Value::Number(n, _) => n.parse::<u64>().map_err(|_| {
+                        ParseError::WindowError(format!("Invalid interval value: {n}"))
+                    }),
                     Value::SingleQuotedString(s) => {
                         // Handle '5' or '5 MINUTE'
                         let num_str = s.split_whitespace().next().unwrap_or(s);
@@ -363,9 +361,7 @@ impl WindowRewriter {
     fn parse_interval_string(s: &str) -> Result<std::time::Duration, ParseError> {
         let parts: Vec<&str> = s.split_whitespace().collect();
         if parts.is_empty() {
-            return Err(ParseError::WindowError(
-                "Empty interval string".to_string(),
-            ));
+            return Err(ParseError::WindowError("Empty interval string".to_string()));
         }
 
         let value: u64 = parts[0].parse().map_err(|_| {

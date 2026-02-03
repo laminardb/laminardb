@@ -56,23 +56,14 @@ impl StreamExecutor {
     ///
     /// Unlike source tables, these persist across cycles.
     #[allow(dead_code)] // Public API for Phase 3 CREATE TABLE support
-    pub fn register_table(
-        &self,
-        name: &str,
-        batch: RecordBatch,
-    ) -> Result<(), DbError> {
+    pub fn register_table(&self, name: &str, batch: RecordBatch) -> Result<(), DbError> {
         let schema = batch.schema();
-        let mem_table = datafusion::datasource::MemTable::try_new(
-            schema,
-            vec![vec![batch]],
-        )
-        .map_err(|e| DbError::Pipeline(format!("Failed to create table '{name}': {e}")))?;
+        let mem_table = datafusion::datasource::MemTable::try_new(schema, vec![vec![batch]])
+            .map_err(|e| DbError::Pipeline(format!("Failed to create table '{name}': {e}")))?;
 
         self.ctx
             .register_table(name, Arc::new(mem_table))
-            .map_err(|e| {
-                DbError::Pipeline(format!("Failed to register table '{name}': {e}"))
-            })?;
+            .map_err(|e| DbError::Pipeline(format!("Failed to register table '{name}': {e}")))?;
         Ok(())
     }
 
@@ -132,15 +123,10 @@ impl StreamExecutor {
             }
 
             let schema = batches[0].schema();
-            let mem_table = datafusion::datasource::MemTable::try_new(
-                schema,
-                vec![batches.clone()],
-            )
-            .map_err(|e| {
-                DbError::Pipeline(format!(
-                    "Failed to create temp table '{name}': {e}"
-                ))
-            })?;
+            let mem_table =
+                datafusion::datasource::MemTable::try_new(schema, vec![batches.clone()]).map_err(
+                    |e| DbError::Pipeline(format!("Failed to create temp table '{name}': {e}")),
+                )?;
 
             // Deregister first if it exists (from previous cycle)
             let _ = self.ctx.deregister_table(name);
@@ -148,9 +134,7 @@ impl StreamExecutor {
             self.ctx
                 .register_table(name, Arc::new(mem_table))
                 .map_err(|e| {
-                    DbError::Pipeline(format!(
-                        "Failed to register temp table '{name}': {e}"
-                    ))
+                    DbError::Pipeline(format!("Failed to register temp table '{name}': {e}"))
                 })?;
 
             self.registered_sources.push(name.clone());
@@ -289,10 +273,7 @@ mod tests {
         register_streaming_functions(&ctx);
         let mut executor = StreamExecutor::new(ctx);
 
-        executor.add_query(
-            "pass".to_string(),
-            "SELECT * FROM events".to_string(),
-        );
+        executor.add_query("pass".to_string(), "SELECT * FROM events".to_string());
 
         // First cycle
         let mut source_batches = HashMap::new();
@@ -329,8 +310,7 @@ mod tests {
 
         executor.add_query(
             "joined".to_string(),
-            "SELECT e.name, d.label FROM events e JOIN dim d ON e.id = d.id"
-                .to_string(),
+            "SELECT e.name, d.label FROM events e JOIN dim d ON e.id = d.id".to_string(),
         );
 
         let mut source_batches = HashMap::new();

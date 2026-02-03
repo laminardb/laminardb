@@ -8,9 +8,9 @@ use laminar_db::PipelineTopology;
 use crate::asof_merge::TickIndex;
 use crate::generator::SYMBOLS;
 use crate::types::{
-    AnomalyAlert, BookImbalanceMetrics, DepthMetrics, EnrichedOrder, MarketTick,
-    OhlcBar, OrderBookLevel, OrderBookUpdate, SpreadMetrics, SymbolBookState,
-    SystemStats, ViewMode, VolumeMetrics,
+    AnomalyAlert, BookImbalanceMetrics, DepthMetrics, EnrichedOrder, MarketTick, OhlcBar,
+    OrderBookLevel, OrderBookUpdate, SpreadMetrics, SymbolBookState, SystemStats, ViewMode,
+    VolumeMetrics,
 };
 
 /// Maximum number of price history points for sparklines.
@@ -95,10 +95,7 @@ impl App {
     pub fn new() -> Self {
         let mut price_history = HashMap::new();
         for (sym, _, _) in SYMBOLS {
-            price_history.insert(
-                sym.to_string(),
-                VecDeque::with_capacity(SPARKLINE_HISTORY),
-            );
+            price_history.insert(sym.to_string(), VecDeque::with_capacity(SPARKLINE_HISTORY));
         }
 
         Self {
@@ -159,8 +156,7 @@ impl App {
 
     /// Cycle to next symbol for sparkline.
     pub fn next_symbol(&mut self) {
-        self.selected_symbol_idx =
-            (self.selected_symbol_idx + 1) % SYMBOLS.len();
+        self.selected_symbol_idx = (self.selected_symbol_idx + 1) % SYMBOLS.len();
     }
 
     /// Uptime since start.
@@ -205,11 +201,7 @@ impl App {
     /// Ingest anomaly alerts and detect threshold crossings.
     pub fn ingest_anomaly(&mut self, rows: Vec<AnomalyAlert>) {
         for row in rows {
-            let prev = self
-                .prev_anomaly
-                .get(&row.symbol)
-                .copied()
-                .unwrap_or(0);
+            let prev = self.prev_anomaly.get(&row.symbol).copied().unwrap_or(0);
             let delta = row.total_volume - prev;
 
             if delta > ANOMALY_VOLUME_THRESHOLD {
@@ -256,10 +248,7 @@ impl App {
     /// Apply order book updates to maintain in-memory L2 book per symbol.
     pub fn apply_book_updates(&mut self, updates: &[OrderBookUpdate]) {
         for update in updates {
-            let book = self
-                .order_books
-                .entry(update.symbol.clone())
-                .or_default();
+            let book = self.order_books.entry(update.symbol.clone()).or_default();
             let key = (update.price_level * 100.0) as i64;
             let side_map = if update.side == "bid" {
                 &mut book.bids
@@ -309,8 +298,7 @@ impl App {
                 let ask_qty = ba.quantity as f64;
                 let total = bid_qty + ask_qty;
                 if total > 0.0 {
-                    let microprice =
-                        (bid_qty * ba.price + ask_qty * bb.price) / total;
+                    let microprice = (bid_qty * ba.price + ask_qty * bb.price) / total;
                     self.microprices.insert(sym.clone(), microprice);
                 }
             }
@@ -324,9 +312,7 @@ impl App {
             let history = self
                 .imbalance_history
                 .entry(row.symbol.clone())
-                .or_insert_with(|| {
-                    VecDeque::with_capacity(IMBALANCE_HISTORY_LEN)
-                });
+                .or_insert_with(|| VecDeque::with_capacity(IMBALANCE_HISTORY_LEN));
             if history.len() >= IMBALANCE_HISTORY_LEN {
                 history.pop_front();
             }
@@ -360,10 +346,7 @@ impl App {
         if self.alerts.len() >= MAX_ALERTS {
             self.alerts.pop_back();
         }
-        self.alerts.push_front(AlertEntry {
-            time: now,
-            message,
-        });
+        self.alerts.push_front(AlertEntry { time: now, message });
     }
 
     /// Total volume across all symbols.
@@ -407,10 +390,8 @@ impl App {
                 return vec![];
             }
             // Normalize to 0-100 range for sparkline display
-            let min =
-                history.iter().cloned().fold(f64::INFINITY, f64::min);
-            let max =
-                history.iter().cloned().fold(f64::NEG_INFINITY, f64::max);
+            let min = history.iter().cloned().fold(f64::INFINITY, f64::min);
+            let max = history.iter().cloned().fold(f64::NEG_INFINITY, f64::max);
             let range = (max - min).max(0.01);
             history
                 .iter()

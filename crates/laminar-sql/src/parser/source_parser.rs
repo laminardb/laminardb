@@ -44,8 +44,7 @@ pub fn parse_create_source(parser: &mut Parser) -> Result<CreateSourceStatement,
     expect_custom_keyword(parser, "SOURCE")?;
 
     // IF NOT EXISTS (optional)
-    let if_not_exists =
-        parser.parse_keywords(&[Keyword::IF, Keyword::NOT, Keyword::EXISTS]);
+    let if_not_exists = parser.parse_keywords(&[Keyword::IF, Keyword::NOT, Keyword::EXISTS]);
 
     // Object name (handles quoted identifiers, schema-qualified names)
     let name = parser

@@ -142,9 +142,15 @@ mod tests {
         m.record_rollback();
 
         let cm = m.to_connector_metrics();
-        let committed = cm.custom.iter().find(|(k, _)| k == "kafka.epochs_committed");
+        let committed = cm
+            .custom
+            .iter()
+            .find(|(k, _)| k == "kafka.epochs_committed");
         assert_eq!(committed.unwrap().1, 2.0);
-        let rolled_back = cm.custom.iter().find(|(k, _)| k == "kafka.epochs_rolled_back");
+        let rolled_back = cm
+            .custom
+            .iter()
+            .find(|(k, _)| k == "kafka.epochs_rolled_back");
         assert_eq!(rolled_back.unwrap().1, 1.0);
     }
 
@@ -160,7 +166,10 @@ mod tests {
         assert_eq!(cm.errors_total, 1);
         let dlq = cm.custom.iter().find(|(k, _)| k == "kafka.dlq_records");
         assert_eq!(dlq.unwrap().1, 2.0);
-        let serde = cm.custom.iter().find(|(k, _)| k == "kafka.serialization_errors");
+        let serde = cm
+            .custom
+            .iter()
+            .find(|(k, _)| k == "kafka.serialization_errors");
         assert_eq!(serde.unwrap().1, 1.0);
     }
 }

@@ -224,9 +224,9 @@ impl XdpConfigBuilder {
     pub fn build(self) -> Result<XdpConfig, super::XdpError> {
         let config = XdpConfig {
             enabled: self.enabled.unwrap_or(false),
-            bpf_object_path: self.bpf_object_path.unwrap_or_else(|| {
-                PathBuf::from("/usr/share/laminardb/laminar_xdp.o")
-            }),
+            bpf_object_path: self
+                .bpf_object_path
+                .unwrap_or_else(|| PathBuf::from("/usr/share/laminardb/laminar_xdp.o")),
             interface: self.interface.unwrap_or_else(|| "eth0".to_string()),
             port: self.port.unwrap_or(9999),
             attach_mode: self.attach_mode.unwrap_or_default(),
@@ -270,19 +270,13 @@ mod tests {
 
     #[test]
     fn test_validation_empty_interface() {
-        let result = XdpConfig::builder()
-            .enabled(true)
-            .interface("")
-            .build();
+        let result = XdpConfig::builder().enabled(true).interface("").build();
         assert!(result.is_err());
     }
 
     #[test]
     fn test_validation_zero_port() {
-        let result = XdpConfig::builder()
-            .enabled(true)
-            .port(0)
-            .build();
+        let result = XdpConfig::builder().enabled(true).port(0).build();
         assert!(result.is_err());
     }
 

@@ -167,10 +167,8 @@ pub fn pg_type_to_arrow(oid: u32) -> DataType {
         XML_OID => DataType::Utf8,
 
         // Array types (represented as JSON strings)
-        BOOL_ARRAY_OID | INT2_ARRAY_OID | INT4_ARRAY_OID | INT8_ARRAY_OID
-        | FLOAT4_ARRAY_OID | FLOAT8_ARRAY_OID | TEXT_ARRAY_OID | VARCHAR_ARRAY_OID => {
-            DataType::Utf8
-        }
+        BOOL_ARRAY_OID | INT2_ARRAY_OID | INT4_ARRAY_OID | INT8_ARRAY_OID | FLOAT4_ARRAY_OID
+        | FLOAT8_ARRAY_OID | TEXT_ARRAY_OID | VARCHAR_ARRAY_OID => DataType::Utf8,
 
         // Unknown types → text fallback
         _ => DataType::Utf8,

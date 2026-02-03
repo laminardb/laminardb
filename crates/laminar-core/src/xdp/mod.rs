@@ -115,12 +115,12 @@ mod tests {
 
     #[test]
     fn test_xdp_action_from_u32() {
-        assert_eq!(XdpAction::from(0), XdpAction::Aborted);  // 0 maps to Aborted
+        assert_eq!(XdpAction::from(0), XdpAction::Aborted); // 0 maps to Aborted
         assert_eq!(XdpAction::from(1), XdpAction::Drop);
         assert_eq!(XdpAction::from(2), XdpAction::Pass);
         assert_eq!(XdpAction::from(3), XdpAction::Tx);
         assert_eq!(XdpAction::from(4), XdpAction::Redirect);
-        assert_eq!(XdpAction::from(99), XdpAction::Aborted);  // Unknown maps to Aborted
+        assert_eq!(XdpAction::from(99), XdpAction::Aborted); // Unknown maps to Aborted
     }
 
     #[test]

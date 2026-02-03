@@ -12,18 +12,17 @@ pub mod order_translator;
 pub mod streaming_ddl;
 mod window_translator;
 
+pub use dag_planner::{format_dag_explain, DagExplainOutput};
 pub use join_translator::{
     AsofJoinTranslatorConfig, AsofSqlJoinType, JoinOperatorConfig, LookupJoinConfig,
     LookupJoinType, StreamJoinConfig, StreamJoinType,
 };
 pub use order_translator::{
-    OrderOperatorConfig, PerGroupTopKConfig, TopKConfig, WatermarkSortConfig,
-    WindowLocalSortConfig,
+    OrderOperatorConfig, PerGroupTopKConfig, TopKConfig, WatermarkSortConfig, WindowLocalSortConfig,
 };
 pub use streaming_ddl::{
-    BackpressureStrategy as StreamingBackpressure, ColumnDefinition, SinkDefinition,
-    SourceConfigOptions, SourceDefinition, WaitStrategy as StreamingWaitStrategy, WatermarkSpec,
-    sql_type_to_arrow,
+    sql_type_to_arrow, BackpressureStrategy as StreamingBackpressure, ColumnDefinition,
+    SinkDefinition, SourceConfigOptions, SourceDefinition, WaitStrategy as StreamingWaitStrategy,
+    WatermarkSpec,
 };
 pub use window_translator::{WindowOperatorConfig, WindowType};
-pub use dag_planner::{format_dag_explain, DagExplainOutput};

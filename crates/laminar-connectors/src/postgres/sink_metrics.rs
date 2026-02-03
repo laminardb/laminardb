@@ -174,15 +174,9 @@ mod tests {
         m.record_copy();
 
         let cm = m.to_connector_metrics();
-        let flushed = cm
-            .custom
-            .iter()
-            .find(|(k, _)| k == "pg.batches_flushed");
+        let flushed = cm.custom.iter().find(|(k, _)| k == "pg.batches_flushed");
         assert_eq!(flushed.unwrap().1, 2.0);
-        let copies = cm
-            .custom
-            .iter()
-            .find(|(k, _)| k == "pg.copy_operations");
+        let copies = cm.custom.iter().find(|(k, _)| k == "pg.copy_operations");
         assert_eq!(copies.unwrap().1, 1.0);
     }
 
@@ -194,15 +188,9 @@ mod tests {
         m.record_rollback();
 
         let cm = m.to_connector_metrics();
-        let committed = cm
-            .custom
-            .iter()
-            .find(|(k, _)| k == "pg.epochs_committed");
+        let committed = cm.custom.iter().find(|(k, _)| k == "pg.epochs_committed");
         assert_eq!(committed.unwrap().1, 2.0);
-        let rolled_back = cm
-            .custom
-            .iter()
-            .find(|(k, _)| k == "pg.epochs_rolled_back");
+        let rolled_back = cm.custom.iter().find(|(k, _)| k == "pg.epochs_rolled_back");
         assert_eq!(rolled_back.unwrap().1, 1.0);
     }
 
@@ -213,10 +201,7 @@ mod tests {
         m.record_deletes(30);
 
         let cm = m.to_connector_metrics();
-        let deletes = cm
-            .custom
-            .iter()
-            .find(|(k, _)| k == "pg.changelog_deletes");
+        let deletes = cm.custom.iter().find(|(k, _)| k == "pg.changelog_deletes");
         assert_eq!(deletes.unwrap().1, 80.0);
     }
 
@@ -237,10 +222,7 @@ mod tests {
         m.record_upsert();
 
         let cm = m.to_connector_metrics();
-        let upserts = cm
-            .custom
-            .iter()
-            .find(|(k, _)| k == "pg.upsert_operations");
+        let upserts = cm.custom.iter().find(|(k, _)| k == "pg.upsert_operations");
         assert_eq!(upserts.unwrap().1, 1.0);
     }
 }

@@ -80,8 +80,8 @@ mod types;
 
 // Primary types
 pub use changelog::{
-    column_value_to_json, delete_to_events, events_to_record_batch, insert_to_events,
-    row_to_json, update_to_events, CdcOperation, ChangeEvent,
+    column_value_to_json, delete_to_events, events_to_record_batch, insert_to_events, row_to_json,
+    update_to_events, CdcOperation, ChangeEvent,
 };
 pub use config::{MySqlCdcConfig, SnapshotMode, SslMode};
 pub use decoder::{
@@ -120,7 +120,9 @@ pub fn register_mysql_cdc_source(registry: &ConnectorRegistry) {
     registry.register_source(
         "mysql-cdc",
         info,
-        Arc::new(|| Box::new(MySqlCdcSource::new(MySqlCdcConfig::default())) as Box<dyn SourceConnector>),
+        Arc::new(|| {
+            Box::new(MySqlCdcSource::new(MySqlCdcConfig::default())) as Box<dyn SourceConnector>
+        }),
     );
 }
 
@@ -165,7 +167,9 @@ pub fn config_key_specs() -> Vec<ConfigKeySpec> {
         // SSL settings
         ConfigKeySpec {
             key: "ssl_mode".to_string(),
-            description: "SSL connection mode (disabled/preferred/required/verify_ca/verify_identity)".to_string(),
+            description:
+                "SSL connection mode (disabled/preferred/required/verify_ca/verify_identity)"
+                    .to_string(),
             required: false,
             default: Some("preferred".to_string()),
         },

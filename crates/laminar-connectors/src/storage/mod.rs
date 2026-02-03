@@ -52,6 +52,5 @@ pub use masking::SecretMasker;
 pub use provider::StorageProvider;
 pub use resolver::{ResolvedStorageOptions, StorageCredentialResolver};
 pub use validation::{
-    CloudConfigValidator, CloudValidationError, CloudValidationResult,
-    CloudValidationWarning,
+    CloudConfigValidator, CloudValidationError, CloudValidationResult, CloudValidationWarning,
 };

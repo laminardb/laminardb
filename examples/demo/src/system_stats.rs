@@ -56,8 +56,7 @@ impl StatsCollector {
             })
             .unwrap_or((0.0, 0.0));
 
-        let total_memory_mb =
-            self.system.total_memory() as f64 / (1024.0 * 1024.0);
+        let total_memory_mb = self.system.total_memory() as f64 / (1024.0 * 1024.0);
 
         SystemStats {
             cpu_usage,

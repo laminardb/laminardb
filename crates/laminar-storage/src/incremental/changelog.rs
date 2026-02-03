@@ -328,8 +328,7 @@ impl StateChangelogBuffer {
     /// Pushes a Delete operation for the given key.
     #[inline]
     pub fn push_delete(&self, key: &[u8]) -> bool {
-        let entry =
-            StateChangelogEntry::from_key(key, self.current_epoch, 0, 0, StateOp::Delete);
+        let entry = StateChangelogEntry::from_key(key, self.current_epoch, 0, 0, StateOp::Delete);
         self.push(entry)
     }
 

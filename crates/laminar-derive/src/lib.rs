@@ -106,7 +106,6 @@ pub fn derive_from_record_batch(input: TokenStream) -> TokenStream {
         .into()
 }
 
-
 /// Derive `FromRow` for a struct.
 ///
 /// Like `FromRecordBatch`, generates inherent `from_batch` and

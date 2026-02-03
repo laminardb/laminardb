@@ -37,8 +37,7 @@ pub fn parse_create_sink(parser: &mut Parser) -> Result<CreateSinkStatement, Par
     expect_custom_keyword(parser, "SINK")?;
 
     // IF NOT EXISTS (optional)
-    let if_not_exists =
-        parser.parse_keywords(&[Keyword::IF, Keyword::NOT, Keyword::EXISTS]);
+    let if_not_exists = parser.parse_keywords(&[Keyword::IF, Keyword::NOT, Keyword::EXISTS]);
 
     // Object name
     let name = parser
@@ -53,9 +52,7 @@ pub fn parse_create_sink(parser: &mut Parser) -> Result<CreateSinkStatement, Par
     // Table reference or subquery
     let from = if parser.consume_token(&Token::LParen) {
         // Subquery: parse as SQL query
-        let query = parser
-            .parse_query()
-            .map_err(ParseError::SqlParseError)?;
+        let query = parser.parse_query().map_err(ParseError::SqlParseError)?;
         parser
             .expect_token(&Token::RParen)
             .map_err(ParseError::SqlParseError)?;
@@ -316,9 +313,7 @@ mod tests {
 
     #[test]
     fn test_sink_format_json_no_connector() {
-        let sink = parse(
-            "CREATE SINK output FROM events FORMAT JSON WITH (key = 'id')",
-        );
+        let sink = parse("CREATE SINK output FROM events FORMAT JSON WITH (key = 'id')");
         assert!(sink.connector_type.is_none());
         assert!(sink.format.is_some());
         assert_eq!(sink.format.as_ref().unwrap().format_type, "JSON");

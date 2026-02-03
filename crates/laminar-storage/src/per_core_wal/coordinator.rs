@@ -6,7 +6,9 @@
 use std::collections::HashMap;
 use std::path::{Path, PathBuf};
 
-use crate::incremental::{CheckpointConfig, IncrementalCheckpointManager, IncrementalCheckpointMetadata};
+use crate::incremental::{
+    CheckpointConfig, IncrementalCheckpointManager, IncrementalCheckpointMetadata,
+};
 
 use super::entry::{PerCoreWalEntry, WalOperation};
 use super::error::PerCoreWalError;
@@ -185,7 +187,8 @@ impl CheckpointCoordinator {
                 WalOperation::Commit { offsets, watermark } => {
                     // Update source offsets and watermark in checkpoint manager
                     for (source, offset) in offsets {
-                        self.checkpoint_manager.set_source_offset(source.clone(), *offset);
+                        self.checkpoint_manager
+                            .set_source_offset(source.clone(), *offset);
                     }
                     if let Some(wm) = watermark {
                         self.checkpoint_manager.set_watermark(*wm);
@@ -243,7 +246,9 @@ impl CheckpointCoordinator {
     ///
     /// Returns an error if cleanup fails.
     pub fn cleanup_old_checkpoints(&mut self, keep_count: usize) -> Result<(), PerCoreWalError> {
-        Ok(self.checkpoint_manager.cleanup_old_checkpoints_keep(keep_count)?)
+        Ok(self
+            .checkpoint_manager
+            .cleanup_old_checkpoints_keep(keep_count)?)
     }
 }
 

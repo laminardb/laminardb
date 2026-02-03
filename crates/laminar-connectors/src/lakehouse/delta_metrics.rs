@@ -105,10 +105,7 @@ impl DeltaLakeSinkMetrics {
             "delta.flush_count",
             self.flush_count.load(Ordering::Relaxed) as f64,
         );
-        m.add_custom(
-            "delta.commits",
-            self.commits.load(Ordering::Relaxed) as f64,
-        );
+        m.add_custom("delta.commits", self.commits.load(Ordering::Relaxed) as f64);
         m.add_custom(
             "delta.epochs_rolled_back",
             self.epochs_rolled_back.load(Ordering::Relaxed) as f64,
@@ -158,10 +155,7 @@ mod tests {
         assert_eq!(cm.records_total, 300);
         assert_eq!(cm.bytes_total, 15_000);
 
-        let flushes = cm
-            .custom
-            .iter()
-            .find(|(k, _)| k == "delta.flush_count");
+        let flushes = cm.custom.iter().find(|(k, _)| k == "delta.flush_count");
         assert_eq!(flushes.unwrap().1, 2.0);
     }
 
@@ -172,16 +166,10 @@ mod tests {
         m.record_commit(5);
 
         let cm = m.to_connector_metrics();
-        let commits = cm
-            .custom
-            .iter()
-            .find(|(k, _)| k == "delta.commits");
+        let commits = cm.custom.iter().find(|(k, _)| k == "delta.commits");
         assert_eq!(commits.unwrap().1, 2.0);
 
-        let version = cm
-            .custom
-            .iter()
-            .find(|(k, _)| k == "delta.last_version");
+        let version = cm.custom.iter().find(|(k, _)| k == "delta.last_version");
         assert_eq!(version.unwrap().1, 5.0);
     }
 

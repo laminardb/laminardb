@@ -64,8 +64,8 @@ impl Default for CsvDeserializer {
 
 impl RecordDeserializer for CsvDeserializer {
     fn deserialize(&self, data: &[u8], schema: &SchemaRef) -> Result<RecordBatch, SerdeError> {
-        let line =
-            std::str::from_utf8(data).map_err(|e| SerdeError::Csv(format!("invalid UTF-8: {e}")))?;
+        let line = std::str::from_utf8(data)
+            .map_err(|e| SerdeError::Csv(format!("invalid UTF-8: {e}")))?;
         let line = line.trim();
         if line.is_empty() {
             return Ok(RecordBatch::new_empty(schema.clone()));

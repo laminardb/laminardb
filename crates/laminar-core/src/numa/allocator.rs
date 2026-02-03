@@ -185,11 +185,7 @@ impl NumaAllocator {
     /// # Errors
     ///
     /// Returns error if allocation fails.
-    pub fn alloc_layout_on_node(
-        &self,
-        layout: Layout,
-        node: usize,
-    ) -> Result<*mut u8, NumaError> {
+    pub fn alloc_layout_on_node(&self, layout: Layout, node: usize) -> Result<*mut u8, NumaError> {
         self.alloc_on_node(node, layout.size(), layout.align())
     }
 
@@ -230,7 +226,9 @@ impl NumaAllocator {
         #[cfg(not(target_os = "linux"))]
         {
             // On non-Linux, we used std alloc with matching alignment
-            if let Ok(layout) = Layout::from_size_align(size, align.max(std::mem::align_of::<usize>())) {
+            if let Ok(layout) =
+                Layout::from_size_align(size, align.max(std::mem::align_of::<usize>()))
+            {
                 std::alloc::dealloc(ptr, layout);
             }
         }
@@ -325,11 +323,7 @@ impl NumaAllocator {
             // mbind failure is non-fatal on single-node systems
             let err = std::io::Error::last_os_error();
             if err.raw_os_error() != Some(libc::ENOSYS) {
-                tracing::warn!(
-                    "mbind to node {} failed (non-fatal): {}",
-                    node,
-                    err
-                );
+                tracing::warn!("mbind to node {} failed (non-fatal): {}", node, err);
             }
         }
 
@@ -449,7 +443,12 @@ impl NumaBuffer {
     pub fn new(allocator: &NumaAllocator, node: usize, size: usize) -> Result<Self, NumaError> {
         let align = Self::DEFAULT_ALIGN;
         let ptr = allocator.alloc_on_node(node, size, align)?;
-        Ok(Self { ptr, size, align, node })
+        Ok(Self {
+            ptr,
+            size,
+            align,
+            node,
+        })
     }
 
     /// Allocate a buffer local to the current CPU's NUMA node.
@@ -569,8 +568,8 @@ impl<T> NumaVec<T> {
             return Ok(Self::new());
         }
 
-        let layout = Layout::array::<T>(capacity)
-            .map_err(|e| NumaError::AllocationFailed(e.to_string()))?;
+        let layout =
+            Layout::array::<T>(capacity).map_err(|e| NumaError::AllocationFailed(e.to_string()))?;
 
         let ptr = allocator.alloc_on_node(node, layout.size(), layout.align())?;
 
@@ -828,8 +827,7 @@ mod tests {
         let topo = NumaTopology::detect();
         let allocator = NumaAllocator::new(&topo);
 
-        let mut vec: NumaVec<i32> =
-            NumaVec::with_capacity_on_node(&allocator, 100, 0).unwrap();
+        let mut vec: NumaVec<i32> = NumaVec::with_capacity_on_node(&allocator, 100, 0).unwrap();
 
         assert!(vec.is_empty());
         assert_eq!(vec.capacity(), 100);
@@ -855,8 +853,7 @@ mod tests {
         let topo = NumaTopology::detect();
         let allocator = NumaAllocator::new(&topo);
 
-        let mut vec: NumaVec<i32> =
-            NumaVec::with_capacity_on_node(&allocator, 10, 0).unwrap();
+        let mut vec: NumaVec<i32> = NumaVec::with_capacity_on_node(&allocator, 10, 0).unwrap();
 
         vec.push(10);
         vec.push(20);

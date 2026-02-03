@@ -189,24 +189,23 @@ impl StreamSource for ChannelStreamSource {
         let inner_stream = bridge.into_stream();
 
         // Apply projection if specified
-        let stream: datafusion::physical_plan::SendableRecordBatchStream = if let Some(indices) =
-            projection
-        {
-            let projected_schema = {
-                let fields: Vec<_> = indices
-                    .iter()
-                    .map(|&i| self.schema.field(i).clone())
-                    .collect();
-                Arc::new(arrow_schema::Schema::new(fields))
+        let stream: datafusion::physical_plan::SendableRecordBatchStream =
+            if let Some(indices) = projection {
+                let projected_schema = {
+                    let fields: Vec<_> = indices
+                        .iter()
+                        .map(|&i| self.schema.field(i).clone())
+                        .collect();
+                    Arc::new(arrow_schema::Schema::new(fields))
+                };
+                Box::pin(ProjectingStream::new(
+                    inner_stream,
+                    projected_schema,
+                    indices,
+                ))
+            } else {
+                Box::pin(inner_stream)
             };
-            Box::pin(ProjectingStream::new(
-                inner_stream,
-                projected_schema,
-                indices,
-            ))
-        } else {
-            Box::pin(inner_stream)
-        };
 
         Ok(stream)
     }

@@ -52,12 +52,14 @@ impl MaterializedView {
     /// Creates a simple view with no schema (for testing).
     #[cfg(test)]
     pub fn simple(name: impl Into<String>, sources: Vec<String>) -> Self {
-        use arrow_schema::{Field, DataType, Schema};
+        use arrow_schema::{DataType, Field, Schema};
         use std::sync::Arc;
 
-        let schema = Arc::new(Schema::new(vec![
-            Field::new("value", DataType::Int64, false),
-        ]));
+        let schema = Arc::new(Schema::new(vec![Field::new(
+            "value",
+            DataType::Int64,
+            false,
+        )]));
         Self::new(name, "", sources, schema)
     }
 
@@ -380,10 +382,9 @@ impl MvRegistry {
 
         // Initialize in-degrees (count only MV dependencies, not base tables)
         for name in self.views.keys() {
-            let deps = self
-                .dependencies
-                .get(name)
-                .map_or(0, |d| d.iter().filter(|dep| self.views.contains_key(*dep)).count());
+            let deps = self.dependencies.get(name).map_or(0, |d| {
+                d.iter().filter(|dep| self.views.contains_key(*dep)).count()
+            });
             in_degree.insert(name.clone(), deps);
             if deps == 0 {
                 queue.push_back(name.clone());

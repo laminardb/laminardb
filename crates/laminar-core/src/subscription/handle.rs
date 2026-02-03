@@ -31,9 +31,7 @@ use std::sync::Arc;
 use tokio::sync::broadcast;
 
 use crate::subscription::event::ChangeEvent;
-use crate::subscription::registry::{
-    SubscriptionId, SubscriptionMetrics, SubscriptionRegistry,
-};
+use crate::subscription::registry::{SubscriptionId, SubscriptionMetrics, SubscriptionRegistry};
 
 // ---------------------------------------------------------------------------
 // PushSubscriptionError
@@ -126,12 +124,8 @@ impl PushSubscription {
 
         match self.receiver.recv().await {
             Ok(event) => Ok(event),
-            Err(broadcast::error::RecvError::Lagged(n)) => {
-                Err(PushSubscriptionError::Lagged(n))
-            }
-            Err(broadcast::error::RecvError::Closed) => {
-                Err(PushSubscriptionError::Closed)
-            }
+            Err(broadcast::error::RecvError::Lagged(n)) => Err(PushSubscriptionError::Lagged(n)),
+            Err(broadcast::error::RecvError::Closed) => Err(PushSubscriptionError::Closed),
         }
     }
 
@@ -149,9 +143,7 @@ impl PushSubscription {
             Err(broadcast::error::TryRecvError::Lagged(n)) => {
                 Some(Err(PushSubscriptionError::Lagged(n)))
             }
-            Err(broadcast::error::TryRecvError::Closed) => {
-                Some(Err(PushSubscriptionError::Closed))
-            }
+            Err(broadcast::error::TryRecvError::Closed) => Some(Err(PushSubscriptionError::Closed)),
             Err(broadcast::error::TryRecvError::Empty) => None,
         }
     }
@@ -359,12 +351,7 @@ mod tests {
         assert_eq!(registry.subscription_count(), 1);
 
         {
-            let _sub = PushSubscription::new(
-                id,
-                rx,
-                Arc::clone(&registry),
-                "trades".into(),
-            );
+            let _sub = PushSubscription::new(id, rx, Arc::clone(&registry), "trades".into());
             // sub is active
             assert_eq!(registry.subscription_count(), 1);
         }
@@ -384,17 +371,14 @@ mod tests {
         let senders = registry.get_senders_for_source(0);
         let sender = senders.into_iter().next().unwrap();
 
-        let mut sub = PushSubscription::new(
-            id,
-            rx,
-            Arc::clone(&registry),
-            "trades".into(),
-        );
+        let mut sub = PushSubscription::new(id, rx, Arc::clone(&registry), "trades".into());
 
         // Fill past capacity to cause lag
         for i in 0..10u64 {
             let batch = Arc::new(make_batch(1));
-            sender.send(ChangeEvent::insert(batch, i as i64, i)).unwrap();
+            sender
+                .send(ChangeEvent::insert(batch, i as i64, i))
+                .unwrap();
         }
 
         // First recv should report lag
@@ -416,12 +400,7 @@ mod tests {
         let registry = Arc::new(SubscriptionRegistry::new());
         let (id, rx) = registry.create("trades".into(), 0, SubscriptionConfig::default());
 
-        let mut sub = PushSubscription::new(
-            id,
-            rx,
-            Arc::clone(&registry),
-            "trades".into(),
-        );
+        let mut sub = PushSubscription::new(id, rx, Arc::clone(&registry), "trades".into());
 
         // Cancel the subscription from the registry side to drop the sender
         // (broadcast::Sender is inside the registry entry, cancel removes it)
@@ -486,18 +465,8 @@ mod tests {
         let (id1, rx1) = registry.create("trades".into(), 0, SubscriptionConfig::default());
         let (id2, rx2) = registry.create("trades".into(), 0, SubscriptionConfig::default());
 
-        let mut sub1 = PushSubscription::new(
-            id1,
-            rx1,
-            Arc::clone(&registry),
-            "trades".into(),
-        );
-        let mut sub2 = PushSubscription::new(
-            id2,
-            rx2,
-            Arc::clone(&registry),
-            "trades".into(),
-        );
+        let mut sub1 = PushSubscription::new(id1, rx1, Arc::clone(&registry), "trades".into());
+        let mut sub2 = PushSubscription::new(id2, rx2, Arc::clone(&registry), "trades".into());
 
         // Get senders and broadcast
         let senders = registry.get_senders_for_source(0);
@@ -543,17 +512,9 @@ mod tests {
         let registry = Arc::new(SubscriptionRegistry::new());
 
         // 2. Create push subscription
-        let (sub_id, rx) = registry.create(
-            "mv_trades".into(),
-            source_id,
-            SubscriptionConfig::default(),
-        );
-        let mut sub = PushSubscription::new(
-            sub_id,
-            rx,
-            Arc::clone(&registry),
-            "mv_trades".into(),
-        );
+        let (sub_id, rx) =
+            registry.create("mv_trades".into(), source_id, SubscriptionConfig::default());
+        let mut sub = PushSubscription::new(sub_id, rx, Arc::clone(&registry), "mv_trades".into());
 
         // 3. Notify through the hub (Ring 0)
         hub.notify_source(source_id, EventType::Insert, 10, 7000, 0);

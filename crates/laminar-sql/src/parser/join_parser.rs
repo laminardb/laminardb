@@ -327,18 +327,14 @@ fn get_join_constraint(op: &JoinOperator) -> Result<&JoinConstraint, ParseError>
         | JoinOperator::Anti(constraint)
         | JoinOperator::StraightJoin(constraint)
         | JoinOperator::AsOf { constraint, .. } => Ok(constraint),
-        JoinOperator::CrossJoin(_)
-        | JoinOperator::CrossApply
-        | JoinOperator::OuterApply => Err(ParseError::StreamingError(
-            "CROSS JOIN not supported for streaming".to_string(),
-        )),
+        JoinOperator::CrossJoin(_) | JoinOperator::CrossApply | JoinOperator::OuterApply => Err(
+            ParseError::StreamingError("CROSS JOIN not supported for streaming".to_string()),
+        ),
     }
 }
 
 /// Analyze ON expression to extract key columns and time bound.
-fn analyze_on_expression(
-    expr: &Expr,
-) -> Result<(String, String, Option<Duration>), ParseError> {
+fn analyze_on_expression(expr: &Expr) -> Result<(String, String, Option<Duration>), ParseError> {
     // Handle compound expressions (AND)
     match expr {
         Expr::BinaryOp {
@@ -352,12 +348,8 @@ fn analyze_on_expression(
 
             // Combine results - one should have keys, the other might have time bound
             match (left_result, right_result) {
-                (Ok((lk, rk, None)), Ok((_, _, time))) if !lk.is_empty() => {
-                    Ok((lk, rk, time))
-                }
-                (Ok((_, _, time)), Ok((lk, rk, None))) if !lk.is_empty() => {
-                    Ok((lk, rk, time))
-                }
+                (Ok((lk, rk, None)), Ok((_, _, time))) if !lk.is_empty() => Ok((lk, rk, time)),
+                (Ok((_, _, time)), Ok((lk, rk, None))) if !lk.is_empty() => Ok((lk, rk, time)),
                 (Ok(result), Err(_)) | (Err(_), Ok(result)) => Ok(result),
                 (Ok((lk, rk, t1)), Ok((_, _, t2))) => {
                     // If both have keys, prefer the first
@@ -396,7 +388,8 @@ fn analyze_on_expression(
         // Comparison operators for time bounds
         Expr::BinaryOp {
             left: _,
-            op: BinaryOperator::LtEq | BinaryOperator::Lt | BinaryOperator::GtEq | BinaryOperator::Gt,
+            op:
+                BinaryOperator::LtEq | BinaryOperator::Lt | BinaryOperator::GtEq | BinaryOperator::Gt,
             right,
         } => {
             // Try to extract time bound from right side
@@ -472,8 +465,7 @@ fn analyze_asof_match_condition(
                     (Ok((d, l, r)), Ok(t)) => Ok((d, l, r, Some(t))),
                     (Ok((d, l, r)), Err(_)) => Ok((d, l, r, None)),
                     _ => Err(ParseError::StreamingError(
-                        "Cannot extract ASOF direction from MATCH_CONDITION"
-                            .to_string(),
+                        "Cannot extract ASOF direction from MATCH_CONDITION".to_string(),
                     )),
                 }
             }
@@ -485,9 +477,7 @@ fn analyze_asof_match_condition(
 }
 
 /// Extract ASOF direction and time columns from a comparison expression.
-fn analyze_asof_direction(
-    expr: &Expr,
-) -> Result<(AsofSqlDirection, String, String), ParseError> {
+fn analyze_asof_direction(expr: &Expr) -> Result<(AsofSqlDirection, String, String), ParseError> {
     match expr {
         Expr::BinaryOp {
             left,
@@ -551,14 +541,11 @@ fn extract_asof_tolerance(expr: &Expr) -> Result<Duration, ParseError> {
                         Ok(Duration::from_millis(ms))
                     } else {
                         Err(ParseError::StreamingError(
-                            "ASOF tolerance must be a number or INTERVAL"
-                                .to_string(),
+                            "ASOF tolerance must be a number or INTERVAL".to_string(),
                         ))
                     }
                 }
-                Expr::Interval(_) => {
-                    WindowRewriter::parse_interval_to_duration(right)
-                }
+                Expr::Interval(_) => WindowRewriter::parse_interval_to_duration(right),
                 _ => Err(ParseError::StreamingError(
                     "ASOF tolerance must be a number or INTERVAL".to_string(),
                 )),
@@ -571,9 +558,7 @@ fn extract_asof_tolerance(expr: &Expr) -> Result<Duration, ParseError> {
 }
 
 /// Extract key columns from an ASOF JOIN constraint (ON clause).
-fn analyze_asof_constraint(
-    constraint: &JoinConstraint,
-) -> Result<(String, String), ParseError> {
+fn analyze_asof_constraint(constraint: &JoinConstraint) -> Result<(String, String), ParseError> {
     match constraint {
         JoinConstraint::On(expr) => extract_equality_columns(expr),
         JoinConstraint::Using(cols) => {
@@ -600,14 +585,10 @@ fn extract_equality_columns(expr: &Expr) -> Result<(String, String), ParseError>
             right,
         } => {
             let left_col = extract_column_ref(left).ok_or_else(|| {
-                ParseError::StreamingError(
-                    "Cannot extract left key column".to_string(),
-                )
+                ParseError::StreamingError("Cannot extract left key column".to_string())
             })?;
             let right_col = extract_column_ref(right).ok_or_else(|| {
-                ParseError::StreamingError(
-                    "Cannot extract right key column".to_string(),
-                )
+                ParseError::StreamingError("Cannot extract right key column".to_string())
             })?;
             Ok((left_col, right_col))
         }
@@ -616,10 +597,7 @@ fn extract_equality_columns(expr: &Expr) -> Result<(String, String), ParseError>
             left,
             op: BinaryOperator::And,
             right,
-        } => {
-            extract_equality_columns(left)
-                .or_else(|_| extract_equality_columns(right))
-        }
+        } => extract_equality_columns(left).or_else(|_| extract_equality_columns(right)),
         _ => Err(ParseError::StreamingError(
             "ASOF JOIN ON clause must contain an equality condition".to_string(),
         )),
@@ -645,9 +623,9 @@ pub fn count_joins(select: &Select) -> usize {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use sqlparser::ast::{SetExpr, Statement};
     use sqlparser::dialect::GenericDialect;
     use sqlparser::parser::Parser;
-    use sqlparser::ast::{SetExpr, Statement};
 
     fn parse_select(sql: &str) -> Select {
         let dialect = GenericDialect {};

@@ -106,7 +106,7 @@ mod linux_impl {
                     .ring_entries(256)
                     .mode(RingMode::SqPoll)
                     .buffer_size(64 * 1024) // 64KB buffers
-                    .buffer_count(64)       // 64 buffers for concurrent writes
+                    .buffer_count(64) // 64 buffers for concurrent writes
                     .build_unchecked()
             });
 
@@ -151,9 +151,10 @@ mod linux_impl {
             let crc = crc32c::crc32c(&bytes);
 
             // Acquire a registered buffer
-            let (buf_index, buf) = self.ring_manager.acquire_buffer().map_err(|e| {
-                WalError::Io(io::Error::new(io::ErrorKind::Other, e.to_string()))
-            })?;
+            let (buf_index, buf) = self
+                .ring_manager
+                .acquire_buffer()
+                .map_err(|e| WalError::Io(io::Error::new(io::ErrorKind::Other, e.to_string())))?;
 
             // Write record format: [length: 4][crc32: 4][data: length]
             #[allow(clippy::cast_possible_truncation)] // WAL records are validated < u32::MAX above
@@ -184,9 +185,9 @@ mod linux_impl {
             self.records_since_sync += 1;
 
             // Submit to kernel
-            self.ring_manager.submit().map_err(|e| {
-                WalError::Io(io::Error::new(io::ErrorKind::Other, e.to_string()))
-            })?;
+            self.ring_manager
+                .submit()
+                .map_err(|e| WalError::Io(io::Error::new(io::ErrorKind::Other, e.to_string())))?;
 
             // Check if we need to sync
             if self.sync_on_write || self.last_sync.elapsed() >= self.sync_interval {
@@ -218,9 +219,10 @@ mod linux_impl {
             }
 
             // Submit fdatasync
-            let sync_user_data = self.ring_manager.submit_sync(self.fd, true).map_err(|e| {
-                WalError::Io(io::Error::new(io::ErrorKind::Other, e.to_string()))
-            })?;
+            let sync_user_data = self
+                .ring_manager
+                .submit_sync(self.fd, true)
+                .map_err(|e| WalError::Io(io::Error::new(io::ErrorKind::Other, e.to_string())))?;
 
             // Wait for sync to complete
             loop {
@@ -265,7 +267,11 @@ mod linux_impl {
                 if !completion.is_success() {
                     return Err(WalError::Io(io::Error::new(
                         io::ErrorKind::Other,
-                        format!("Write failed at offset {}: {:?}", pending.offset, completion.error()),
+                        format!(
+                            "Write failed at offset {}: {:?}",
+                            pending.offset,
+                            completion.error()
+                        ),
                     )));
                 }
             }
@@ -349,7 +355,8 @@ mod linux_impl {
             let dir = tempdir().unwrap();
             let path = dir.path().join("test.wal");
 
-            let mut wal = match IoUringWal::new(&path, Duration::from_secs(1), Some(make_config())) {
+            let mut wal = match IoUringWal::new(&path, Duration::from_secs(1), Some(make_config()))
+            {
                 Ok(w) => w,
                 Err(_) => return, // Skip if io_uring not available
             };
@@ -372,7 +379,8 @@ mod linux_impl {
             let dir = tempdir().unwrap();
             let path = dir.path().join("test.wal");
 
-            let mut wal = match IoUringWal::new(&path, Duration::from_secs(1), Some(make_config())) {
+            let mut wal = match IoUringWal::new(&path, Duration::from_secs(1), Some(make_config()))
+            {
                 Ok(w) => w,
                 Err(_) => return,
             };
@@ -398,7 +406,8 @@ mod linux_impl {
             let dir = tempdir().unwrap();
             let path = dir.path().join("test.wal");
 
-            let mut wal = match IoUringWal::new(&path, Duration::from_secs(1), Some(make_config())) {
+            let mut wal = match IoUringWal::new(&path, Duration::from_secs(1), Some(make_config()))
+            {
                 Ok(w) => w,
                 Err(_) => return,
             };

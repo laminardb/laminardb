@@ -7,7 +7,7 @@ use criterion::{criterion_group, criterion_main, Criterion, Throughput};
 use laminar_core::operator::{
     Event, Operator, OperatorContext, OperatorError, OperatorState, Output, Timer,
 };
-use laminar_core::{ReactorConfig, Reactor};
+use laminar_core::{Reactor, ReactorConfig};
 use smallvec::SmallVec;
 use std::hint::black_box;
 use std::sync::Arc;
@@ -95,7 +95,8 @@ fn bench_sustained_throughput(c: &mut Criterion) {
             batch_size: 10000,
             event_buffer_size: 100000,
             ..Default::default()
-        }).unwrap();
+        })
+        .unwrap();
         reactor.add_operator(Box::new(MinimalOperator));
 
         b.iter_custom(|iters| {
@@ -145,7 +146,8 @@ fn bench_verify_target_throughput(c: &mut Criterion) {
             batch_size: 10000,
             event_buffer_size: 100000,
             ..Default::default()
-        }).unwrap();
+        })
+        .unwrap();
         reactor.add_operator(Box::new(MinimalOperator));
 
         b.iter_custom(|iters| {

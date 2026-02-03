@@ -483,9 +483,9 @@ impl StreamCheckpoint {
         let version = data[pos];
         pos += 1;
         if version != 1 {
-            return Err(CheckpointError::IoError(
-                format!("unsupported checkpoint version: {version}"),
-            ));
+            return Err(CheckpointError::IoError(format!(
+                "unsupported checkpoint version: {version}"
+            )));
         }
 
         // Header
@@ -527,9 +527,7 @@ impl StreamCheckpoint {
             let name = read_string(&mut pos)?;
             let data_len = read_u32(&mut pos)? as usize;
             if pos + data_len > data.len() {
-                return Err(CheckpointError::IoError(
-                    "truncated operator state".into(),
-                ));
+                return Err(CheckpointError::IoError("truncated operator state".into()));
             }
             let state_data = data[pos..pos + data_len].to_vec();
             pos += data_len;
@@ -661,10 +659,8 @@ impl StreamCheckpointManager {
         let mut source_sequences = HashMap::with_capacity(self.sources.len());
         let mut watermarks = HashMap::with_capacity(self.sources.len());
         for (name, src) in &self.sources {
-            source_sequences
-                .insert(name.clone(), src.sequence.load(Ordering::Acquire));
-            watermarks
-                .insert(name.clone(), src.watermark.load(Ordering::Acquire));
+            source_sequences.insert(name.clone(), src.sequence.load(Ordering::Acquire));
+            watermarks.insert(name.clone(), src.watermark.load(Ordering::Acquire));
         }
 
         // Capture sink positions
@@ -903,8 +899,7 @@ mod tests {
         let mut buf = StreamChangelogBuffer::new(4, OverflowPolicy::DropNew);
         assert!(buf.is_empty());
 
-        let entry =
-            StreamChangelogEntry::new(0, StreamChangeOp::Push, 1, i64::MIN);
+        let entry = StreamChangelogEntry::new(0, StreamChangeOp::Push, 1, i64::MIN);
         assert!(buf.push(entry));
         assert_eq!(buf.len(), 1);
 
@@ -917,12 +912,9 @@ mod tests {
     fn test_changelog_buffer_overflow() {
         // DropNew policy
         let mut buf = StreamChangelogBuffer::new(2, OverflowPolicy::DropNew);
-        let e1 =
-            StreamChangelogEntry::new(0, StreamChangeOp::Push, 1, i64::MIN);
-        let e2 =
-            StreamChangelogEntry::new(0, StreamChangeOp::Push, 2, i64::MIN);
-        let e3 =
-            StreamChangelogEntry::new(0, StreamChangeOp::Push, 3, i64::MIN);
+        let e1 = StreamChangelogEntry::new(0, StreamChangeOp::Push, 1, i64::MIN);
+        let e2 = StreamChangelogEntry::new(0, StreamChangeOp::Push, 2, i64::MIN);
+        let e3 = StreamChangelogEntry::new(0, StreamChangeOp::Push, 3, i64::MIN);
 
         assert!(buf.push(e1));
         assert!(buf.push(e2));
@@ -934,8 +926,7 @@ mod tests {
         assert_eq!(buf.pop().unwrap().sequence, 1);
 
         // OverwriteOldest policy
-        let mut buf2 =
-            StreamChangelogBuffer::new(2, OverflowPolicy::OverwriteOldest);
+        let mut buf2 = StreamChangelogBuffer::new(2, OverflowPolicy::OverwriteOldest);
         assert!(buf2.push(e1));
         assert!(buf2.push(e2));
         assert!(buf2.push(e3)); // overwrites e1
@@ -998,21 +989,12 @@ mod tests {
         assert_eq!(restored.id, 42);
         assert_eq!(restored.epoch, 7);
         assert_eq!(restored.created_at, 1_706_400_000_000);
-        assert_eq!(
-            restored.source_sequences.get("src1"),
-            Some(&100)
-        );
-        assert_eq!(
-            restored.source_sequences.get("src2"),
-            Some(&200)
-        );
+        assert_eq!(restored.source_sequences.get("src1"), Some(&100));
+        assert_eq!(restored.source_sequences.get("src2"), Some(&200));
         assert_eq!(restored.sink_positions.get("sink1"), Some(&50));
         assert_eq!(restored.watermarks.get("src1"), Some(&5000));
         assert_eq!(restored.watermarks.get("src2"), Some(&6000));
-        assert_eq!(
-            restored.operator_states.get("op1"),
-            Some(&vec![1, 2, 3, 4])
-        );
+        assert_eq!(restored.operator_states.get("op1"), Some(&vec![1, 2, 3, 4]));
     }
 
     #[test]

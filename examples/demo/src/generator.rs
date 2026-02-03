@@ -52,8 +52,7 @@ impl SymbolState {
 
         // Ornstein-Uhlenbeck mean-reverting spread
         let spread_noise: f64 = rng.gen_range(-0.3..=0.3) * self.spread_mean;
-        self.spread_current += 0.3 * (self.spread_mean - self.spread_current)
-            + spread_noise;
+        self.spread_current += 0.3 * (self.spread_mean - self.spread_current) + spread_noise;
         self.spread_current = self.spread_current.max(self.price * 0.0001); // min 1 bps
 
         // Spread widens occasionally
@@ -97,11 +96,7 @@ impl MarketGenerator {
     }
 
     /// Generate a batch of market ticks across all symbols.
-    pub fn generate_ticks(
-        &mut self,
-        count_per_symbol: usize,
-        base_ts: i64,
-    ) -> Vec<MarketTick> {
+    pub fn generate_ticks(&mut self, count_per_symbol: usize, base_ts: i64) -> Vec<MarketTick> {
         let mut rng = rand::thread_rng();
         let mut ticks = Vec::with_capacity(count_per_symbol * self.states.len());
         self.cycle += 1;

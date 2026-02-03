@@ -2,8 +2,8 @@
 
 #![allow(clippy::cast_possible_truncation)]
 
-use super::error::SinkError;
 use super::checkpoint::SinkCheckpoint;
+use super::error::SinkError;
 use crate::operator::Output;
 
 /// Unique identifier for a transaction
@@ -372,9 +372,7 @@ mod tests {
         assert!(!caps.supports_transactions());
         assert!(!caps.supports_upsert());
 
-        let caps = SinkCapabilities::new()
-            .with_transactions()
-            .with_upsert();
+        let caps = SinkCapabilities::new().with_transactions().with_upsert();
         assert!(caps.supports_transactions());
         assert!(caps.supports_upsert());
         assert!(!caps.supports_changelog());

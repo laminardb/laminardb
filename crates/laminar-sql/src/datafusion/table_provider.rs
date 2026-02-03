@@ -263,7 +263,10 @@ mod tests {
         let ctx = SessionContext::new();
         let session_state = ctx.state();
 
-        let exec = provider.scan(&session_state, None, &[], None).await.unwrap();
+        let exec = provider
+            .scan(&session_state, None, &[], None)
+            .await
+            .unwrap();
 
         // Verify it's a StreamingScanExec
         assert!(exec.as_any().is::<StreamingScanExec>());

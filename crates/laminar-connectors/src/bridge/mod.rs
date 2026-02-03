@@ -29,9 +29,9 @@
 
 pub mod config;
 pub mod metrics;
+pub mod runtime;
 pub mod sink_bridge;
 pub mod source_bridge;
-pub mod runtime;
 
 pub use config::BridgeRuntimeConfig;
 pub use metrics::{BridgeRuntimeMetrics, SinkBridgeMetrics, SourceBridgeMetrics};

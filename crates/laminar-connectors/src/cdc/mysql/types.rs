@@ -168,9 +168,7 @@ pub fn mysql_type_to_arrow(type_id: u8, unsigned: bool, _metadata: u16) -> DataT
         TIMESTAMP | TIMESTAMP2 => {
             DataType::Timestamp(arrow_schema::TimeUnit::Microsecond, Some("UTC".into()))
         }
-        DATETIME | DATETIME2 => {
-            DataType::Timestamp(arrow_schema::TimeUnit::Microsecond, None)
-        }
+        DATETIME | DATETIME2 => DataType::Timestamp(arrow_schema::TimeUnit::Microsecond, None),
 
         // String types
         VARCHAR | VAR_STRING | STRING | ENUM | SET => DataType::Utf8,
@@ -397,7 +395,10 @@ mod tests {
             mysql_type_to_sql(mysql_type::TINY, true, 0),
             "TINYINT UNSIGNED"
         );
-        assert_eq!(mysql_type_to_sql(mysql_type::VARCHAR, false, 255), "VARCHAR(255)");
+        assert_eq!(
+            mysql_type_to_sql(mysql_type::VARCHAR, false, 255),
+            "VARCHAR(255)"
+        );
         // DECIMAL with precision 10, scale 2
         let metadata = (10u16 << 8) | 2u16;
         assert_eq!(

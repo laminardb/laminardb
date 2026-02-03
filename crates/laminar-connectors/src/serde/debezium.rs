@@ -113,17 +113,13 @@ impl RecordDeserializer for DebeziumDeserializer {
         let op = DebeziumOp::from_str(op_str)?;
 
         // Extract timestamp
-        let ts_ms = obj
-            .get("ts_ms")
-            .and_then(Value::as_i64)
-            .unwrap_or(0);
+        let ts_ms = obj.get("ts_ms").and_then(Value::as_i64).unwrap_or(0);
 
         // Extract payload: `after` for create/update/read, `before` for delete
         let payload = match op {
-            DebeziumOp::Create | DebeziumOp::Update | DebeziumOp::Read => {
-                obj.get("after")
-                    .ok_or_else(|| SerdeError::MissingField("after".into()))?
-            }
+            DebeziumOp::Create | DebeziumOp::Update | DebeziumOp::Read => obj
+                .get("after")
+                .ok_or_else(|| SerdeError::MissingField("after".into()))?,
             DebeziumOp::Delete => obj
                 .get("before")
                 .ok_or_else(|| SerdeError::MissingField("before".into()))?,
@@ -136,7 +132,8 @@ impl RecordDeserializer for DebeziumDeserializer {
         }
 
         // Deserialize the payload as a JSON record
-        let payload_bytes = serde_json::to_vec(payload).map_err(|e| SerdeError::Json(e.to_string()))?;
+        let payload_bytes =
+            serde_json::to_vec(payload).map_err(|e| SerdeError::Json(e.to_string()))?;
         let data_batch = self.json_deser.deserialize(&payload_bytes, schema)?;
 
         // Append __op and __ts_ms columns
@@ -156,9 +153,8 @@ impl RecordDeserializer for DebeziumDeserializer {
         fields.push(Arc::new(Field::new("__ts_ms", DataType::Int64, false)));
         let extended_schema = Arc::new(Schema::new(fields));
 
-        RecordBatch::try_new(extended_schema, columns).map_err(|e| {
-            SerdeError::MalformedInput(format!("failed to create RecordBatch: {e}"))
-        })
+        RecordBatch::try_new(extended_schema, columns)
+            .map_err(|e| SerdeError::MalformedInput(format!("failed to create RecordBatch: {e}")))
     }
 
     fn format(&self) -> Format {
@@ -196,16 +192,32 @@ mod tests {
         // data columns + __op + __ts_ms
         assert_eq!(batch.num_columns(), 4);
 
-        let ids = batch.column(0).as_any().downcast_ref::<Int64Array>().unwrap();
+        let ids = batch
+            .column(0)
+            .as_any()
+            .downcast_ref::<Int64Array>()
+            .unwrap();
         assert_eq!(ids.value(0), 1);
 
-        let names = batch.column(1).as_any().downcast_ref::<StringArray>().unwrap();
+        let names = batch
+            .column(1)
+            .as_any()
+            .downcast_ref::<StringArray>()
+            .unwrap();
         assert_eq!(names.value(0), "Alice");
 
-        let ops = batch.column(2).as_any().downcast_ref::<StringArray>().unwrap();
+        let ops = batch
+            .column(2)
+            .as_any()
+            .downcast_ref::<StringArray>()
+            .unwrap();
         assert_eq!(ops.value(0), "c");
 
-        let ts = batch.column(3).as_any().downcast_ref::<Int64Array>().unwrap();
+        let ts = batch
+            .column(3)
+            .as_any()
+            .downcast_ref::<Int64Array>()
+            .unwrap();
         assert_eq!(ts.value(0), 1_700_000_000_000);
     }
 
@@ -222,10 +234,18 @@ mod tests {
         }"#;
 
         let batch = deser.deserialize(data, &schema).unwrap();
-        let names = batch.column(1).as_any().downcast_ref::<StringArray>().unwrap();
+        let names = batch
+            .column(1)
+            .as_any()
+            .downcast_ref::<StringArray>()
+            .unwrap();
         assert_eq!(names.value(0), "Alicia");
 
-        let ops = batch.column(2).as_any().downcast_ref::<StringArray>().unwrap();
+        let ops = batch
+            .column(2)
+            .as_any()
+            .downcast_ref::<StringArray>()
+            .unwrap();
         assert_eq!(ops.value(0), "u");
     }
 
@@ -242,10 +262,18 @@ mod tests {
         }"#;
 
         let batch = deser.deserialize(data, &schema).unwrap();
-        let ids = batch.column(0).as_any().downcast_ref::<Int64Array>().unwrap();
+        let ids = batch
+            .column(0)
+            .as_any()
+            .downcast_ref::<Int64Array>()
+            .unwrap();
         assert_eq!(ids.value(0), 1);
 
-        let ops = batch.column(2).as_any().downcast_ref::<StringArray>().unwrap();
+        let ops = batch
+            .column(2)
+            .as_any()
+            .downcast_ref::<StringArray>()
+            .unwrap();
         assert_eq!(ops.value(0), "d");
     }
 

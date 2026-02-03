@@ -35,7 +35,11 @@ impl KernelVersion {
     /// Creates a new kernel version.
     #[must_use]
     pub const fn new(major: u32, minor: u32, patch: u32) -> Self {
-        Self { major, minor, patch }
+        Self {
+            major,
+            minor,
+            patch,
+        }
     }
 
     /// Detects the current kernel version.
@@ -126,7 +130,11 @@ impl KernelVersion {
         let minor: u32 = parts.next().and_then(|s| s.parse().ok()).unwrap_or(0);
         let patch: u32 = parts.next().and_then(|s| s.parse().ok()).unwrap_or(0);
 
-        Some(Self { major, minor, patch })
+        Some(Self {
+            major,
+            minor,
+            patch,
+        })
     }
 
     // ===== io_uring Feature Checks =====

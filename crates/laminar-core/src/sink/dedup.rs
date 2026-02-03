@@ -284,19 +284,23 @@ impl BloomFilterDedup {
     /// * `expected_elements` - Expected number of elements to track
     /// * `false_positive_rate` - Target false positive rate (0.0 to 1.0)
     #[must_use]
-    #[allow(clippy::cast_sign_loss, clippy::cast_precision_loss, clippy::cast_possible_truncation)]
+    #[allow(
+        clippy::cast_sign_loss,
+        clippy::cast_precision_loss,
+        clippy::cast_possible_truncation
+    )]
     pub fn new(expected_elements: usize, false_positive_rate: f64) -> Self {
         // Calculate optimal size
         // m = -n * ln(p) / (ln(2)^2)
         let ln2_squared = std::f64::consts::LN_2 * std::f64::consts::LN_2;
-        let num_bits = (-(expected_elements as f64) * false_positive_rate.ln() / ln2_squared)
-            .ceil() as usize;
+        let num_bits =
+            (-(expected_elements as f64) * false_positive_rate.ln() / ln2_squared).ceil() as usize;
         let num_bits = num_bits.max(64); // Minimum 64 bits
 
         // Calculate optimal number of hash functions
         // k = (m/n) * ln(2)
-        let num_hashes = ((num_bits as f64 / expected_elements as f64) * std::f64::consts::LN_2)
-            .ceil() as usize;
+        let num_hashes =
+            ((num_bits as f64 / expected_elements as f64) * std::f64::consts::LN_2).ceil() as usize;
         let num_hashes = num_hashes.clamp(1, 16);
 
         let num_words = num_bits.div_ceil(64);

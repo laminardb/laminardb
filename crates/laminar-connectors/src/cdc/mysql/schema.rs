@@ -32,13 +32,7 @@ impl TableInfo {
         let fields: Vec<Field> = msg
             .columns
             .iter()
-            .map(|col| {
-                Field::new(
-                    &col.name,
-                    col.to_arrow_type(),
-                    col.nullable,
-                )
-            })
+            .map(|col| Field::new(&col.name, col.to_arrow_type(), col.nullable))
             .collect();
 
         Self {
@@ -65,7 +59,10 @@ impl TableInfo {
     /// Finds a column by name.
     #[must_use]
     pub fn find_column(&self, name: &str) -> Option<(usize, &MySqlColumn)> {
-        self.columns.iter().enumerate().find(|(_, c)| c.name == name)
+        self.columns
+            .iter()
+            .enumerate()
+            .find(|(_, c)| c.name == name)
     }
 }
 
@@ -167,16 +164,8 @@ pub fn cdc_envelope_schema(table_schema: &Schema) -> Schema {
         Field::new("_binlog_file", DataType::Utf8, true),
         Field::new("_binlog_pos", DataType::UInt64, true),
         Field::new("_gtid", DataType::Utf8, true),
-        Field::new(
-            "_before",
-            DataType::Struct(before_fields.into()),
-            true,
-        ),
-        Field::new(
-            "_after",
-            DataType::Struct(after_fields.into()),
-            true,
-        ),
+        Field::new("_before", DataType::Struct(before_fields.into()), true),
+        Field::new("_after", DataType::Struct(after_fields.into()), true),
     ])
 }
 
@@ -189,7 +178,13 @@ mod tests {
         vec![
             MySqlColumn::new("id".to_string(), mysql_type::LONGLONG, 0, false, false),
             MySqlColumn::new("name".to_string(), mysql_type::VARCHAR, 255, true, false),
-            MySqlColumn::new("created_at".to_string(), mysql_type::TIMESTAMP, 0, true, false),
+            MySqlColumn::new(
+                "created_at".to_string(),
+                mysql_type::TIMESTAMP,
+                0,
+                true,
+                false,
+            ),
         ]
     }
 

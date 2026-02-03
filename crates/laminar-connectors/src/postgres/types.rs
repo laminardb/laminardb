@@ -159,14 +159,8 @@ mod tests {
 
     #[test]
     fn test_uuid_mapping() {
-        assert_eq!(
-            arrow_type_to_pg_sql(&DataType::FixedSizeBinary(16)),
-            "uuid"
-        );
-        assert_eq!(
-            arrow_to_pg_ddl_type(&DataType::FixedSizeBinary(16)),
-            "UUID"
-        );
+        assert_eq!(arrow_type_to_pg_sql(&DataType::FixedSizeBinary(16)), "uuid");
+        assert_eq!(arrow_to_pg_ddl_type(&DataType::FixedSizeBinary(16)), "UUID");
         // Non-16 byte fixed binary falls back to bytea
         assert_eq!(
             arrow_type_to_pg_sql(&DataType::FixedSizeBinary(32)),

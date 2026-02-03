@@ -89,8 +89,7 @@ impl<T> MulticastBuffer<T> {
 
         let slots: Vec<UnsafeCell<Option<T>>> =
             (0..capacity).map(|_| UnsafeCell::new(None)).collect();
-        let refcounts: Vec<AtomicU32> =
-            (0..capacity).map(|_| AtomicU32::new(0)).collect();
+        let refcounts: Vec<AtomicU32> = (0..capacity).map(|_| AtomicU32::new(0)).collect();
         let read_positions: Vec<AtomicU64> =
             (0..consumer_count).map(|_| AtomicU64::new(0)).collect();
 

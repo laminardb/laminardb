@@ -19,12 +19,11 @@ use arrow_schema::{DataType, Field, Schema, SchemaRef};
 use criterion::{criterion_group, criterion_main, Criterion, Throughput};
 
 use laminar_core::dag::{
-    DagBuilder, DagCheckpointConfig, DagCheckpointCoordinator,
-    DagExecutor, DagNodeType, NodeId, StreamingDag,
+    DagBuilder, DagCheckpointConfig, DagCheckpointCoordinator, DagExecutor, DagNodeType, NodeId,
+    StreamingDag,
 };
 use laminar_core::operator::{
-    Event, Operator, OperatorContext, OperatorError, OperatorState, Output,
-    OutputVec, Timer,
+    Event, Operator, OperatorContext, OperatorError, OperatorState, Output, OutputVec, Timer,
 };
 
 // ---------------------------------------------------------------------------
@@ -99,13 +98,16 @@ impl Operator for StatefulCounterOperator {
 // ---------------------------------------------------------------------------
 
 fn int_schema() -> SchemaRef {
-    Arc::new(Schema::new(vec![Field::new("value", DataType::Int64, false)]))
+    Arc::new(Schema::new(vec![Field::new(
+        "value",
+        DataType::Int64,
+        false,
+    )]))
 }
 
 fn make_event(timestamp: i64) -> Event {
     let array = Arc::new(Int64Array::from(vec![timestamp]));
-    let batch =
-        RecordBatch::try_new(int_schema(), vec![array as _]).unwrap();
+    let batch = RecordBatch::try_new(int_schema(), vec![array as _]).unwrap();
     Event::new(timestamp, batch)
 }
 
@@ -174,8 +176,7 @@ fn stress_20_node_mixed(c: &mut Criterion) {
         .connect("f", "g")
         // Fan-out from g
         .fan_out("g", |f| {
-            f.branch("h", schema.clone())
-                .branch("i", schema.clone())
+            f.branch("h", schema.clone()).branch("i", schema.clone())
         })
         // Merge paths
         .operator("merge1", schema.clone())
@@ -323,7 +324,9 @@ fn build_linear_dag(node_count: usize) -> StreamingDag {
     let op_count = node_count - 2;
 
     let first_op = "op_0".to_string();
-    b = b.operator(&first_op, schema.clone()).connect("src", &first_op);
+    b = b
+        .operator(&first_op, schema.clone())
+        .connect("src", &first_op);
 
     for i in 1..op_count {
         let prev = format!("op_{}", i - 1);
@@ -423,15 +426,10 @@ fn stress_checkpoint_under_load(c: &mut Criterion) {
 
                     // Trigger checkpoint every 10K events
                     if i > 0 && i % 10_000 == 0 {
-                        let barrier =
-                            coordinator.trigger_checkpoint().unwrap();
-                        let states =
-                            executor.process_checkpoint_barrier(&barrier);
+                        let barrier = coordinator.trigger_checkpoint().unwrap();
+                        let states = executor.process_checkpoint_barrier(&barrier);
                         for (node_id, state) in &states {
-                            coordinator.on_node_snapshot_complete(
-                                *node_id,
-                                state.clone(),
-                            );
+                            coordinator.on_node_snapshot_complete(*node_id, state.clone());
                         }
                         let _ = coordinator.finalize_checkpoint();
                     }
@@ -452,10 +450,7 @@ fn stress_checkpoint_under_load(c: &mut Criterion) {
                 eprintln!(
                     "\n  [dag_stress checkpoint_under_load] p50={} ns, \
                      p99={} ns, p99.9={} ns, max={} ns",
-                    latencies[p50_idx],
-                    latencies[p99_idx],
-                    latencies[p999_idx],
-                    latencies[max_idx],
+                    latencies[p50_idx], latencies[p99_idx], latencies[p999_idx], latencies[max_idx],
                 );
             }
 

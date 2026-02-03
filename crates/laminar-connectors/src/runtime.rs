@@ -350,9 +350,7 @@ impl ConnectorRuntime {
         match self.sources.read().get(name) {
             Some(handle) => match handle.state() {
                 ConnectorState::Running => HealthStatus::Healthy,
-                ConnectorState::Recovering => {
-                    HealthStatus::Degraded("recovering".into())
-                }
+                ConnectorState::Recovering => HealthStatus::Degraded("recovering".into()),
                 ConnectorState::Failed => HealthStatus::Unhealthy("failed".into()),
                 ConnectorState::Closed => HealthStatus::Unhealthy("closed".into()),
                 _ => HealthStatus::Unknown,
@@ -367,9 +365,7 @@ impl ConnectorRuntime {
         match self.sinks.read().get(name) {
             Some(handle) => match handle.state() {
                 ConnectorState::Running => HealthStatus::Healthy,
-                ConnectorState::Recovering => {
-                    HealthStatus::Degraded("recovering".into())
-                }
+                ConnectorState::Recovering => HealthStatus::Degraded("recovering".into()),
                 ConnectorState::Failed => HealthStatus::Unhealthy("failed".into()),
                 ConnectorState::Closed => HealthStatus::Unhealthy("closed".into()),
                 _ => HealthStatus::Unknown,

@@ -299,9 +299,7 @@ impl KafkaSourceConfig {
             .get_parsed::<usize>("max.poll.records")?
             .unwrap_or(1000);
 
-        let poll_timeout_ms = config
-            .get_parsed::<u64>("poll.timeout.ms")?
-            .unwrap_or(100);
+        let poll_timeout_ms = config.get_parsed::<u64>("poll.timeout.ms")?.unwrap_or(100);
 
         let partition_assignment_strategy = match config.get("partition.assignment.strategy") {
             Some(s) => s.parse::<AssignmentStrategy>()?,
@@ -412,10 +410,7 @@ impl KafkaSourceConfig {
         config.set("bootstrap.servers", &self.bootstrap_servers);
         config.set("group.id", &self.group_id);
         config.set("enable.auto.commit", "false");
-        config.set(
-            "auto.offset.reset",
-            self.auto_offset_reset.as_rdkafka_str(),
-        );
+        config.set("auto.offset.reset", self.auto_offset_reset.as_rdkafka_str());
         config.set(
             "partition.assignment.strategy",
             self.partition_assignment_strategy.as_rdkafka_str(),
@@ -472,10 +467,7 @@ mod tests {
         assert_eq!(cfg.auto_offset_reset, OffsetReset::Earliest);
         assert_eq!(cfg.max_poll_records, 1000);
         assert_eq!(cfg.poll_timeout, Duration::from_millis(100));
-        assert_eq!(
-            cfg.partition_assignment_strategy,
-            AssignmentStrategy::Range
-        );
+        assert_eq!(cfg.partition_assignment_strategy, AssignmentStrategy::Range);
         assert_eq!(cfg.commit_interval, Duration::from_secs(5));
         assert!(!cfg.include_metadata);
         assert!(cfg.schema_registry_url.is_none());
@@ -543,7 +535,10 @@ mod tests {
         let auth = cfg.schema_registry_auth.unwrap();
         assert_eq!(auth.username, "user");
         assert_eq!(auth.password, "pass");
-        assert_eq!(cfg.schema_compatibility, Some(CompatibilityLevel::FullTransitive));
+        assert_eq!(
+            cfg.schema_compatibility,
+            Some(CompatibilityLevel::FullTransitive)
+        );
     }
 
     #[test]
@@ -596,8 +591,14 @@ mod tests {
 
     #[test]
     fn test_offset_reset_parsing() {
-        assert_eq!("earliest".parse::<OffsetReset>().unwrap(), OffsetReset::Earliest);
-        assert_eq!("latest".parse::<OffsetReset>().unwrap(), OffsetReset::Latest);
+        assert_eq!(
+            "earliest".parse::<OffsetReset>().unwrap(),
+            OffsetReset::Earliest
+        );
+        assert_eq!(
+            "latest".parse::<OffsetReset>().unwrap(),
+            OffsetReset::Latest
+        );
         assert_eq!("none".parse::<OffsetReset>().unwrap(), OffsetReset::None);
         assert!("invalid".parse::<OffsetReset>().is_err());
     }

@@ -150,10 +150,8 @@ impl CoreHandle {
 
         // Detect NUMA topology for NUMA-aware allocation
         let topology = NumaTopology::detect();
-        let numa_node = cpu_affinity.map_or_else(
-            || topology.current_node(),
-            |cpu| topology.node_for_cpu(cpu),
-        );
+        let numa_node =
+            cpu_affinity.map_or_else(|| topology.current_node(), |cpu| topology.node_for_cpu(cpu));
 
         let inbox = Arc::new(SpscQueue::new(config.inbox_capacity));
         let outbox = Arc::new(SpscQueue::new(config.outbox_capacity));
@@ -252,21 +250,23 @@ impl CoreHandle {
         match self.credit_gate.try_acquire() {
             CreditAcquireResult::Acquired => {
                 // Have credit, try to push
-                self.inbox
-                    .push(message)
-                    .map_err(|_| TpcError::QueueFull { core_id: self.core_id })
+                self.inbox.push(message).map_err(|_| TpcError::QueueFull {
+                    core_id: self.core_id,
+                })
             }
             CreditAcquireResult::WouldBlock => {
                 // Check overflow strategy
                 if self.credit_gate.config().overflow_strategy == OverflowStrategy::Block {
                     // Spin until we get a credit
                     self.credit_gate.acquire_blocking(1);
-                    self.inbox
-                        .push(message)
-                        .map_err(|_| TpcError::QueueFull { core_id: self.core_id })
+                    self.inbox.push(message).map_err(|_| TpcError::QueueFull {
+                        core_id: self.core_id,
+                    })
                 } else {
                     // Error strategy - return error
-                    Err(TpcError::Backpressure { core_id: self.core_id })
+                    Err(TpcError::Backpressure {
+                        core_id: self.core_id,
+                    })
                 }
             }
             CreditAcquireResult::Dropped => {
@@ -287,12 +287,14 @@ impl CoreHandle {
     pub fn try_send(&self, message: CoreMessage) -> Result<(), TpcError> {
         match self.credit_gate.try_acquire() {
             CreditAcquireResult::Acquired => {
-                self.inbox
-                    .push(message)
-                    .map_err(|_| TpcError::QueueFull { core_id: self.core_id })
+                self.inbox.push(message).map_err(|_| TpcError::QueueFull {
+                    core_id: self.core_id,
+                })
             }
             CreditAcquireResult::WouldBlock | CreditAcquireResult::Dropped => {
-                Err(TpcError::Backpressure { core_id: self.core_id })
+                Err(TpcError::Backpressure {
+                    core_id: self.core_id,
+                })
             }
         }
     }
@@ -447,12 +449,10 @@ impl CoreHandle {
     /// Returns an error if the thread panicked or returned an error.
     pub fn join(mut self) -> Result<(), TpcError> {
         if let Some(handle) = self.thread.take() {
-            handle
-                .join()
-                .map_err(|_| TpcError::SpawnFailed {
-                    core_id: self.core_id,
-                    message: "Thread panicked".to_string(),
-                })?
+            handle.join().map_err(|_| TpcError::SpawnFailed {
+                core_id: self.core_id,
+                message: "Thread panicked".to_string(),
+            })?
         } else {
             Ok(())
         }
@@ -657,7 +657,8 @@ fn core_thread_main(
 
         // Process events in reactor
         let outputs = reactor.poll();
-        ctx.events_processed.fetch_add(outputs.len() as u64, Ordering::Relaxed);
+        ctx.events_processed
+            .fetch_add(outputs.len() as u64, Ordering::Relaxed);
 
         // Push outputs to outbox
         for output in outputs {
@@ -758,13 +759,21 @@ mod tests {
     struct PassthroughOperator;
 
     impl Operator for PassthroughOperator {
-        fn process(&mut self, event: &Event, _ctx: &mut crate::operator::OperatorContext) -> OutputVec {
+        fn process(
+            &mut self,
+            event: &Event,
+            _ctx: &mut crate::operator::OperatorContext,
+        ) -> OutputVec {
             let mut output = OutputVec::new();
             output.push(Output::Event(event.clone()));
             output
         }
 
-        fn on_timer(&mut self, _timer: Timer, _ctx: &mut crate::operator::OperatorContext) -> OutputVec {
+        fn on_timer(
+            &mut self,
+            _timer: Timer,
+            _ctx: &mut crate::operator::OperatorContext,
+        ) -> OutputVec {
             OutputVec::new()
         }
 
@@ -821,10 +830,8 @@ mod tests {
             io_uring_config: None,
         };
 
-        let handle = CoreHandle::spawn_with_operators(
-            config,
-            vec![Box::new(PassthroughOperator)],
-        ).unwrap();
+        let handle =
+            CoreHandle::spawn_with_operators(config, vec![Box::new(PassthroughOperator)]).unwrap();
 
         // Send an event
         let event = make_event(42);
@@ -854,10 +861,8 @@ mod tests {
             io_uring_config: None,
         };
 
-        let handle = CoreHandle::spawn_with_operators(
-            config,
-            vec![Box::new(PassthroughOperator)],
-        ).unwrap();
+        let handle =
+            CoreHandle::spawn_with_operators(config, vec![Box::new(PassthroughOperator)]).unwrap();
 
         // Send multiple events
         for i in 0..100 {
@@ -954,10 +959,8 @@ mod tests {
             io_uring_config: None,
         };
 
-        let handle = CoreHandle::spawn_with_operators(
-            config,
-            vec![Box::new(PassthroughOperator)],
-        ).unwrap();
+        let handle =
+            CoreHandle::spawn_with_operators(config, vec![Box::new(PassthroughOperator)]).unwrap();
 
         // Send events
         for i in 0..10 {
@@ -997,10 +1000,8 @@ mod tests {
             io_uring_config: None,
         };
 
-        let handle = CoreHandle::spawn_with_operators(
-            config,
-            vec![Box::new(PassthroughOperator)],
-        ).unwrap();
+        let handle =
+            CoreHandle::spawn_with_operators(config, vec![Box::new(PassthroughOperator)]).unwrap();
 
         // Send events
         for i in 0..10 {
@@ -1039,10 +1040,8 @@ mod tests {
             io_uring_config: None,
         };
 
-        let handle = CoreHandle::spawn_with_operators(
-            config,
-            vec![Box::new(PassthroughOperator)],
-        ).unwrap();
+        let handle =
+            CoreHandle::spawn_with_operators(config, vec![Box::new(PassthroughOperator)]).unwrap();
 
         // Send events
         for i in 0..20 {
@@ -1083,10 +1082,8 @@ mod tests {
             io_uring_config: None,
         };
 
-        let handle = CoreHandle::spawn_with_operators(
-            config,
-            vec![Box::new(PassthroughOperator)],
-        ).unwrap();
+        let handle =
+            CoreHandle::spawn_with_operators(config, vec![Box::new(PassthroughOperator)]).unwrap();
 
         // Send a watermark advancement
         handle.send(CoreMessage::Watermark(5000)).unwrap();
@@ -1097,7 +1094,10 @@ mod tests {
         // Poll outputs - should contain a watermark
         let outputs = handle.poll_outputs(100);
         let has_watermark = outputs.iter().any(|o| matches!(o, Output::Watermark(_)));
-        assert!(has_watermark, "Expected watermark output after Watermark message");
+        assert!(
+            has_watermark,
+            "Expected watermark output after Watermark message"
+        );
 
         handle.shutdown_and_join().unwrap();
     }
@@ -1116,10 +1116,8 @@ mod tests {
             io_uring_config: None,
         };
 
-        let handle = CoreHandle::spawn_with_operators(
-            config,
-            vec![Box::new(PassthroughOperator)],
-        ).unwrap();
+        let handle =
+            CoreHandle::spawn_with_operators(config, vec![Box::new(PassthroughOperator)]).unwrap();
 
         // Send a checkpoint request
         handle.send(CoreMessage::CheckpointRequest(42)).unwrap();
@@ -1129,9 +1127,9 @@ mod tests {
 
         // Poll outputs - should contain a CheckpointComplete
         let outputs = handle.poll_outputs(100);
-        let checkpoint = outputs.iter().find(|o| {
-            matches!(o, Output::CheckpointComplete { .. })
-        });
+        let checkpoint = outputs
+            .iter()
+            .find(|o| matches!(o, Output::CheckpointComplete { .. }));
         assert!(checkpoint.is_some(), "Expected CheckpointComplete output");
 
         if let Some(Output::CheckpointComplete {
@@ -1162,10 +1160,8 @@ mod tests {
             io_uring_config: None,
         };
 
-        let handle = CoreHandle::spawn_with_operators(
-            config,
-            vec![Box::new(PassthroughOperator)],
-        ).unwrap();
+        let handle =
+            CoreHandle::spawn_with_operators(config, vec![Box::new(PassthroughOperator)]).unwrap();
 
         // Send many events without polling - outbox should fill up
         for i in 0..100 {
@@ -1177,7 +1173,10 @@ mod tests {
 
         // Some outputs should have been dropped
         let dropped = handle.outputs_dropped();
-        assert!(dropped > 0, "Expected some outputs to be dropped with outbox_capacity=4");
+        assert!(
+            dropped > 0,
+            "Expected some outputs to be dropped with outbox_capacity=4"
+        );
 
         handle.shutdown_and_join().unwrap();
     }

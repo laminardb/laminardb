@@ -93,7 +93,9 @@ impl MvPipelineExecutor {
     /// Checks if all MVs have registered operators.
     #[must_use]
     pub fn is_ready(&self) -> bool {
-        self.registry.views().all(|v| self.operators.contains_key(&v.name))
+        self.registry
+            .views()
+            .all(|v| self.operators.contains_key(&v.name))
     }
 
     /// Returns MVs that are missing operators.
@@ -276,7 +278,11 @@ impl MvPipelineExecutor {
         let mut outputs = Vec::new();
         for input in inputs {
             let op_outputs = operator.process(&input, ctx);
-            *self.metrics.events_per_mv.entry(mv_name.to_string()).or_default() += 1;
+            *self
+                .metrics
+                .events_per_mv
+                .entry(mv_name.to_string())
+                .or_default() += 1;
 
             for output in op_outputs {
                 match output {
@@ -346,14 +352,16 @@ impl MvPipelineExecutor {
         }
 
         // Restore watermarks
-        self.watermarks.restore(super::watermark::WatermarkTrackerCheckpoint {
-            watermarks: checkpoint.watermarks,
-        });
+        self.watermarks
+            .restore(super::watermark::WatermarkTrackerCheckpoint {
+                watermarks: checkpoint.watermarks,
+            });
 
         // Restore pending events
         self.output_queues.clear();
         for (name, events) in checkpoint.pending_events {
-            self.output_queues.insert(name, events.into_iter().collect());
+            self.output_queues
+                .insert(name, events.into_iter().collect());
         }
 
         Ok(())
@@ -382,7 +390,11 @@ impl Operator for PassThroughOperator {
         outputs
     }
 
-    fn on_timer(&mut self, _timer: crate::operator::Timer, _ctx: &mut OperatorContext) -> OutputVec {
+    fn on_timer(
+        &mut self,
+        _timer: crate::operator::Timer,
+        _ctx: &mut OperatorContext,
+    ) -> OutputVec {
         OutputVec::new()
     }
 
@@ -411,9 +423,18 @@ mod tests {
         let mut registry = MvRegistry::new();
         registry.register_base_table("trades");
 
-        let schema = Arc::new(Schema::new(vec![Field::new("value", DataType::Int64, false)]));
+        let schema = Arc::new(Schema::new(vec![Field::new(
+            "value",
+            DataType::Int64,
+            false,
+        )]));
         let mv = |n: &str, s: Vec<&str>| {
-            MaterializedView::new(n, "", s.into_iter().map(String::from).collect(), schema.clone())
+            MaterializedView::new(
+                n,
+                "",
+                s.into_iter().map(String::from).collect(),
+                schema.clone(),
+            )
         };
 
         registry.register(mv("ohlc_1s", vec!["trades"])).unwrap();
@@ -467,7 +488,8 @@ mod tests {
         let registry = setup_registry();
         let mut executor = MvPipelineExecutor::new(registry);
 
-        let result = executor.register_operator("nonexistent", Box::new(PassThroughOperator::new("x")));
+        let result =
+            executor.register_operator("nonexistent", Box::new(PassThroughOperator::new("x")));
         assert!(matches!(result, Err(MvError::ViewNotFound(_))));
     }
 
@@ -494,7 +516,9 @@ mod tests {
         };
 
         let event = create_test_event(100, 1000);
-        let _outputs = executor.process_source_event("trades", event, &mut ctx).unwrap();
+        let _outputs = executor
+            .process_source_event("trades", event, &mut ctx)
+            .unwrap();
 
         // Check metrics
         assert_eq!(executor.metrics().events_processed, 1);
@@ -535,7 +559,9 @@ mod tests {
             create_test_event(300, 3000),
         ];
 
-        executor.process_source_events("trades", events, &mut ctx).unwrap();
+        executor
+            .process_source_events("trades", events, &mut ctx)
+            .unwrap();
 
         assert_eq!(executor.metrics().events_processed, 3);
         assert_eq!(executor.metrics().events_per_mv.get("ohlc_1s"), Some(&3));

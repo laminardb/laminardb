@@ -48,9 +48,9 @@ pub fn parse_continuous_query(parser: &mut Parser) -> Result<StreamingStatement,
     expect_custom_keyword(parser, "QUERY")?;
 
     // Query name
-    let name = parser.parse_object_name(false).unwrap_or_else(|_| {
-        ObjectName(vec![ObjectNamePart::Identifier(Ident::new("query"))])
-    });
+    let name = parser
+        .parse_object_name(false)
+        .unwrap_or_else(|_| ObjectName(vec![ObjectNamePart::Identifier(Ident::new("query"))]));
 
     // AS
     parser
@@ -69,23 +69,20 @@ pub fn parse_continuous_query(parser: &mut Parser) -> Result<StreamingStatement,
             "Expected SELECT query after AS".to_string(),
         ));
     } else {
-        let mut query_parser =
-            Parser::new(&dialect).with_tokens_with_locations(query_tokens);
+        let mut query_parser = Parser::new(&dialect).with_tokens_with_locations(query_tokens);
         query_parser
             .parse_query()
             .map_err(ParseError::SqlParseError)?
     };
 
-    let query_stmt = StreamingStatement::Standard(Box::new(
-        sqlparser::ast::Statement::Query(query),
-    ));
+    let query_stmt =
+        StreamingStatement::Standard(Box::new(sqlparser::ast::Statement::Query(query)));
 
     // Parse optional EMIT clause from the remaining tokens
     let emit_clause = if emit_tokens.is_empty() {
         None
     } else {
-        let mut emit_parser =
-            Parser::new(&dialect).with_tokens_with_locations(emit_tokens);
+        let mut emit_parser = Parser::new(&dialect).with_tokens_with_locations(emit_tokens);
         parse_emit_clause(&mut emit_parser)?
     };
 
@@ -159,9 +156,7 @@ mod tests {
         let stmt = parse("CREATE CONTINUOUS QUERY live_stats AS SELECT COUNT(*) FROM events");
         match stmt {
             StreamingStatement::CreateContinuousQuery {
-                name,
-                emit_clause,
-                ..
+                name, emit_clause, ..
             } => {
                 assert_eq!(name.to_string(), "live_stats");
                 assert!(emit_clause.is_none());
@@ -211,9 +206,8 @@ mod tests {
 
     #[test]
     fn test_continuous_query_with_emit_changes() {
-        let stmt = parse(
-            "CREATE CONTINUOUS QUERY cdc_pipeline AS SELECT * FROM orders EMIT CHANGES",
-        );
+        let stmt =
+            parse("CREATE CONTINUOUS QUERY cdc_pipeline AS SELECT * FROM orders EMIT CHANGES");
         match stmt {
             StreamingStatement::CreateContinuousQuery { emit_clause, .. } => {
                 assert!(matches!(emit_clause, Some(EmitClause::Changes)));
@@ -224,9 +218,8 @@ mod tests {
 
     #[test]
     fn test_continuous_query_with_emit_final() {
-        let stmt = parse(
-            "CREATE CONTINUOUS QUERY bi_report AS SELECT SUM(amount) FROM sales EMIT FINAL",
-        );
+        let stmt =
+            parse("CREATE CONTINUOUS QUERY bi_report AS SELECT SUM(amount) FROM sales EMIT FINAL");
         match stmt {
             StreamingStatement::CreateContinuousQuery { emit_clause, .. } => {
                 assert!(matches!(emit_clause, Some(EmitClause::Final)));

@@ -69,8 +69,7 @@ mod kernel;
 
 pub use config::{PerformanceTier, RecommendedConfig};
 pub use cpu::{
-    CpuFeatures, SimdLevel, cache_line_size, is_smt_enabled, logical_cpu_count,
-    physical_cpu_count,
+    cache_line_size, is_smt_enabled, logical_cpu_count, physical_cpu_count, CpuFeatures, SimdLevel,
 };
 pub use io::{IoUringCapabilities, MemoryInfo, StorageInfo, StorageType, XdpCapabilities};
 pub use kernel::KernelVersion;
@@ -219,9 +218,7 @@ impl SystemCapabilities {
     /// Check if all advanced features are available.
     #[must_use]
     pub fn is_fully_optimized(&self) -> bool {
-        self.io_uring.is_usable()
-            && self.io_uring.sqpoll_supported
-            && self.cpu_count > 1
+        self.io_uring.is_usable() && self.io_uring.sqpoll_supported && self.cpu_count > 1
     }
 
     /// Check if the system meets minimum requirements for `LaminarDB`.

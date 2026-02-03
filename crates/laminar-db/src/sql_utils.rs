@@ -63,8 +63,12 @@ pub fn split_statements(sql: &str) -> Vec<&str> {
     for tws in &tokens {
         if tws.token == Token::SemiColon {
             if has_significant {
-                let end =
-                    location_to_byte_offset(sql, &line_starts, tws.span.start.line, tws.span.start.column);
+                let end = location_to_byte_offset(
+                    sql,
+                    &line_starts,
+                    tws.span.start.line,
+                    tws.span.start.column,
+                );
                 let stmt = sql[seg_start..end].trim();
                 if !stmt.is_empty() {
                     statements.push(stmt);
@@ -158,9 +162,7 @@ pub fn expr_to_string(expr: Option<&sqlparser::ast::Expr>) -> Option<String> {
     let expr = expr?;
     match expr {
         Expr::Value(vws) => match &vws.value {
-            Value::SingleQuotedString(s) | Value::DoubleQuotedString(s) => {
-                Some(s.clone())
-            }
+            Value::SingleQuotedString(s) | Value::DoubleQuotedString(s) => Some(s.clone()),
             Value::Number(n, _) => Some(n.clone()),
             Value::Boolean(b) => Some(b.to_string()),
             Value::Null => None,
@@ -239,13 +241,12 @@ pub fn sql_values_to_record_batch(
     values: &[Vec<sqlparser::ast::Expr>],
 ) -> Result<arrow::array::RecordBatch, DbError> {
     use arrow::array::{
-        Array, BooleanArray, Float32Array, Float64Array, Int8Array, Int16Array,
-        Int32Array, Int64Array, RecordBatch, StringArray,
+        Array, BooleanArray, Float32Array, Float64Array, Int16Array, Int32Array, Int64Array,
+        Int8Array, RecordBatch, StringArray,
     };
     use arrow::datatypes::DataType;
 
-    let mut columns: Vec<std::sync::Arc<dyn Array>> =
-        Vec::with_capacity(schema.fields().len());
+    let mut columns: Vec<std::sync::Arc<dyn Array>> = Vec::with_capacity(schema.fields().len());
 
     for (col_idx, field) in schema.fields().iter().enumerate() {
         match field.data_type() {
@@ -304,8 +305,7 @@ pub fn sql_values_to_record_batch(
                     .iter()
                     .map(|row| expr_to_string(row.get(col_idx)))
                     .collect();
-                let arr: StringArray =
-                    strs.iter().map(|s| s.as_deref()).collect();
+                let arr: StringArray = strs.iter().map(|s| s.as_deref()).collect();
                 columns.push(std::sync::Arc::new(arr));
             }
         }
@@ -362,9 +362,7 @@ mod tests {
 
     #[test]
     fn test_comments_between_statements() {
-        let stmts = split_statements(
-            "SELECT 1;\n-- this is a comment\nSELECT 2",
-        );
+        let stmts = split_statements("SELECT 1;\n-- this is a comment\nSELECT 2");
         assert_eq!(stmts.len(), 2);
     }
 
@@ -403,8 +401,7 @@ mod tests {
         let mut vars = HashMap::new();
         vars.insert("KAFKA_BROKERS".to_string(), "localhost:9092".to_string());
         let result =
-            resolve_config_vars("'bootstrap.servers' = '${KAFKA_BROKERS}'", &vars, true)
-                .unwrap();
+            resolve_config_vars("'bootstrap.servers' = '${KAFKA_BROKERS}'", &vars, true).unwrap();
         assert_eq!(result, "'bootstrap.servers' = 'localhost:9092'");
     }
 

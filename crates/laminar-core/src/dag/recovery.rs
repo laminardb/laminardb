@@ -177,10 +177,7 @@ impl DagRecoveryManager {
     ///
     /// Returns [`DagError::CheckpointNotFound`] if the checkpoint ID
     /// does not exist.
-    pub fn recover_by_id(
-        &self,
-        checkpoint_id: u64,
-    ) -> Result<RecoveredDagState, DagError> {
+    pub fn recover_by_id(&self, checkpoint_id: u64) -> Result<RecoveredDagState, DagError> {
         let snapshot = self
             .snapshots
             .iter()

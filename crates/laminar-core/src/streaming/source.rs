@@ -379,7 +379,10 @@ impl<T: Record> Source<T> {
 
         // Best-effort send of watermark message
         // It's okay if this fails - the atomic watermark state is updated
-        let _ = self.inner.producer.try_push(SourceMessage::Watermark(timestamp));
+        let _ = self
+            .inner
+            .producer
+            .try_push(SourceMessage::Watermark(timestamp));
     }
 
     /// Returns the current watermark value.
@@ -648,9 +651,11 @@ mod tests {
         let (source, _sink) = create::<TestEvent>(16);
 
         // Create batch with different schema
-        let wrong_schema = Arc::new(Schema::new(vec![
-            Field::new("wrong", DataType::Utf8, false),
-        ]));
+        let wrong_schema = Arc::new(Schema::new(vec![Field::new(
+            "wrong",
+            DataType::Utf8,
+            false,
+        )]));
 
         let batch = RecordBatch::try_new(
             wrong_schema,

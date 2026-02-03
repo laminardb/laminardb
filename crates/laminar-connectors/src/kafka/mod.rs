@@ -59,9 +59,7 @@ pub mod schema_registry;
 
 // Source re-exports
 pub use avro::AvroDeserializer;
-pub use config::{
-    AssignmentStrategy, CompatibilityLevel, KafkaSourceConfig, OffsetReset, SrAuth,
-};
+pub use config::{AssignmentStrategy, CompatibilityLevel, KafkaSourceConfig, OffsetReset, SrAuth};
 pub use metrics::KafkaSourceMetrics;
 pub use offsets::OffsetTracker;
 pub use source::KafkaSource;
@@ -78,9 +76,7 @@ pub use sink_config::{
 pub use sink_metrics::KafkaSinkMetrics;
 
 // Shared re-exports
-pub use schema_registry::{
-    CachedSchema, CompatibilityResult, SchemaRegistryClient, SchemaType,
-};
+pub use schema_registry::{CachedSchema, CompatibilityResult, SchemaRegistryClient, SchemaType};
 
 use std::sync::Arc;
 
@@ -112,7 +108,10 @@ pub fn register_kafka_source(registry: &ConnectorRegistry) {
                 Field::new("key", DataType::Utf8, true),
                 Field::new("value", DataType::Utf8, false),
             ]));
-            Box::new(KafkaSource::new(default_schema, KafkaSourceConfig::default()))
+            Box::new(KafkaSource::new(
+                default_schema,
+                KafkaSourceConfig::default(),
+            ))
         }),
     );
 }
@@ -154,11 +153,19 @@ fn kafka_source_config_keys() -> Vec<ConfigKeySpec> {
         ConfigKeySpec::required("group.id", "Consumer group identifier"),
         ConfigKeySpec::required("topic", "Comma-separated list of topics"),
         ConfigKeySpec::optional("format", "Data format (json/csv/avro/raw/debezium)", "json"),
-        ConfigKeySpec::optional("auto.offset.reset", "Where to start (earliest/latest)", "earliest"),
+        ConfigKeySpec::optional(
+            "auto.offset.reset",
+            "Where to start (earliest/latest)",
+            "earliest",
+        ),
         ConfigKeySpec::optional("max.poll.records", "Max records per poll", "1000"),
         ConfigKeySpec::optional("poll.timeout.ms", "Poll timeout in milliseconds", "100"),
         ConfigKeySpec::optional("commit.interval.ms", "Offset commit interval", "5000"),
-        ConfigKeySpec::optional("include.metadata", "Include _partition/_offset columns", "false"),
+        ConfigKeySpec::optional(
+            "include.metadata",
+            "Include _partition/_offset columns",
+            "false",
+        ),
         ConfigKeySpec::optional(
             "schema.registry.url",
             "Confluent Schema Registry URL (required for Avro)",
@@ -184,7 +191,11 @@ fn kafka_sink_config_keys() -> Vec<ConfigKeySpec> {
             "Partitioning strategy (key-hash/round-robin/sticky)",
             "key-hash",
         ),
-        ConfigKeySpec::optional("compression.type", "Compression (none/gzip/snappy/lz4/zstd)", "none"),
+        ConfigKeySpec::optional(
+            "compression.type",
+            "Compression (none/gzip/snappy/lz4/zstd)",
+            "none",
+        ),
         ConfigKeySpec::optional("acks", "Acknowledgment level (none/leader/all)", "all"),
         ConfigKeySpec::optional("linger.ms", "Producer linger time in milliseconds", "5"),
         ConfigKeySpec::optional("batch.size", "Producer batch size in bytes", "65536"),
@@ -193,7 +204,11 @@ fn kafka_sink_config_keys() -> Vec<ConfigKeySpec> {
             "Confluent Schema Registry URL (required for Avro)",
             "",
         ),
-        ConfigKeySpec::optional("dlq.topic", "Dead letter queue topic for failed records", ""),
+        ConfigKeySpec::optional(
+            "dlq.topic",
+            "Dead letter queue topic for failed records",
+            "",
+        ),
     ]
 }
 

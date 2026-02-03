@@ -133,9 +133,9 @@ impl PostgresSinkConfig {
             cfg.password = v.to_string();
         }
         if let Some(v) = config.get("port") {
-            cfg.port = v.parse().map_err(|_| {
-                ConnectorError::ConfigurationError(format!("invalid port: '{v}'"))
-            })?;
+            cfg.port = v
+                .parse()
+                .map_err(|_| ConnectorError::ConfigurationError(format!("invalid port: '{v}'")))?;
         }
         if let Some(v) = config.get("schema.name") {
             cfg.schema_name = v.to_string();
@@ -148,8 +148,7 @@ impl PostgresSinkConfig {
             })?;
         }
         if let Some(v) = config.get("primary.key") {
-            cfg.primary_key_columns =
-                v.split(',').map(|c| c.trim().to_string()).collect();
+            cfg.primary_key_columns = v.split(',').map(|c| c.trim().to_string()).collect();
         }
         if let Some(v) = config.get("batch.size") {
             cfg.batch_size = v.parse().map_err(|_| {
@@ -158,9 +157,7 @@ impl PostgresSinkConfig {
         }
         if let Some(v) = config.get("flush.interval.ms") {
             let ms: u64 = v.parse().map_err(|_| {
-                ConnectorError::ConfigurationError(format!(
-                    "invalid flush.interval.ms: '{v}'"
-                ))
+                ConnectorError::ConfigurationError(format!("invalid flush.interval.ms: '{v}'"))
             })?;
             cfg.flush_interval = Duration::from_millis(ms);
         }
@@ -171,9 +168,7 @@ impl PostgresSinkConfig {
         }
         if let Some(v) = config.get("connect.timeout.ms") {
             let ms: u64 = v.parse().map_err(|_| {
-                ConnectorError::ConfigurationError(format!(
-                    "invalid connect.timeout.ms: '{v}'"
-                ))
+                ConnectorError::ConfigurationError(format!("invalid connect.timeout.ms: '{v}'"))
             })?;
             cfg.connect_timeout = Duration::from_millis(ms);
         }
@@ -391,41 +386,25 @@ mod tests {
 
     #[test]
     fn test_missing_hostname() {
-        let config = make_config(&[
-            ("database", "db"),
-            ("username", "u"),
-            ("table.name", "t"),
-        ]);
+        let config = make_config(&[("database", "db"), ("username", "u"), ("table.name", "t")]);
         assert!(PostgresSinkConfig::from_config(&config).is_err());
     }
 
     #[test]
     fn test_missing_database() {
-        let config = make_config(&[
-            ("hostname", "h"),
-            ("username", "u"),
-            ("table.name", "t"),
-        ]);
+        let config = make_config(&[("hostname", "h"), ("username", "u"), ("table.name", "t")]);
         assert!(PostgresSinkConfig::from_config(&config).is_err());
     }
 
     #[test]
     fn test_missing_username() {
-        let config = make_config(&[
-            ("hostname", "h"),
-            ("database", "db"),
-            ("table.name", "t"),
-        ]);
+        let config = make_config(&[("hostname", "h"), ("database", "db"), ("table.name", "t")]);
         assert!(PostgresSinkConfig::from_config(&config).is_err());
     }
 
     #[test]
     fn test_missing_table_name() {
-        let config = make_config(&[
-            ("hostname", "h"),
-            ("database", "db"),
-            ("username", "u"),
-        ]);
+        let config = make_config(&[("hostname", "h"), ("database", "db"), ("username", "u")]);
         assert!(PostgresSinkConfig::from_config(&config).is_err());
     }
 
@@ -563,14 +542,8 @@ mod tests {
 
     #[test]
     fn test_delivery_guarantee_display() {
-        assert_eq!(
-            DeliveryGuarantee::AtLeastOnce.to_string(),
-            "at_least_once"
-        );
-        assert_eq!(
-            DeliveryGuarantee::ExactlyOnce.to_string(),
-            "exactly_once"
-        );
+        assert_eq!(DeliveryGuarantee::AtLeastOnce.to_string(), "at_least_once");
+        assert_eq!(DeliveryGuarantee::ExactlyOnce.to_string(), "exactly_once");
     }
 
     #[test]
@@ -578,10 +551,7 @@ mod tests {
         assert_eq!("disable".parse::<SslMode>().unwrap(), SslMode::Disable);
         assert_eq!("prefer".parse::<SslMode>().unwrap(), SslMode::Prefer);
         assert_eq!("require".parse::<SslMode>().unwrap(), SslMode::Require);
-        assert_eq!(
-            "verify-ca".parse::<SslMode>().unwrap(),
-            SslMode::VerifyCa
-        );
+        assert_eq!("verify-ca".parse::<SslMode>().unwrap(), SslMode::VerifyCa);
         assert_eq!(
             "verify-full".parse::<SslMode>().unwrap(),
             SslMode::VerifyFull

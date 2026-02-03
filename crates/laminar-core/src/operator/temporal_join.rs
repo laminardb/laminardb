@@ -227,9 +227,7 @@ impl TemporalJoinConfigBuilder {
             stream_key_column: self
                 .stream_key_column
                 .expect("stream_key_column is required"),
-            table_key_column: self
-                .table_key_column
-                .expect("table_key_column is required"),
+            table_key_column: self.table_key_column.expect("table_key_column is required"),
             table_version_column: self
                 .table_version_column
                 .expect("table_version_column is required"),
@@ -393,7 +391,12 @@ impl VersionedKeyState {
         let removed = self.versions.remove(&version);
         if removed.is_some() {
             self.min_version = self.versions.keys().next().copied().unwrap_or(i64::MAX);
-            self.max_version = self.versions.keys().next_back().copied().unwrap_or(i64::MIN);
+            self.max_version = self
+                .versions
+                .keys()
+                .next_back()
+                .copied()
+                .unwrap_or(i64::MIN);
         }
         removed
     }
@@ -661,9 +664,8 @@ impl TemporalJoinOperator {
             return OutputVec::new();
         };
 
-        let version_ts =
-            Self::extract_timestamp(&event.data, &self.config.table_version_column)
-                .unwrap_or(event.timestamp);
+        let version_ts = Self::extract_timestamp(&event.data, &self.config.table_version_column)
+            .unwrap_or(event.timestamp);
 
         // Create and store table row
         let Ok(row) = TableRow::new(version_ts, key_value.clone(), &event.data) else {
@@ -709,7 +711,11 @@ impl TemporalJoinOperator {
                 self.metrics.table_updates += 1;
 
                 // Emit retractions for events that joined with old version
-                self.emit_retractions_for_version(&old.key_value, old.version_timestamp, &mut output);
+                self.emit_retractions_for_version(
+                    &old.key_value,
+                    old.version_timestamp,
+                    &mut output,
+                );
 
                 // Update table state
                 if let Some(key_state) = self.table_state.get_mut(&old.key_value) {
@@ -725,7 +731,11 @@ impl TemporalJoinOperator {
                 self.metrics.table_deletes += 1;
 
                 // Emit retractions for events that joined with deleted version
-                self.emit_retractions_for_version(&row.key_value, row.version_timestamp, &mut output);
+                self.emit_retractions_for_version(
+                    &row.key_value,
+                    row.version_timestamp,
+                    &mut output,
+                );
 
                 // Remove from table state
                 if let Some(key_state) = self.table_state.get_mut(&row.key_value) {
@@ -738,12 +748,7 @@ impl TemporalJoinOperator {
     }
 
     /// Emits retractions for all stream events that joined with a specific table version.
-    fn emit_retractions_for_version(
-        &mut self,
-        key: &[u8],
-        version: i64,
-        output: &mut OutputVec,
-    ) {
+    fn emit_retractions_for_version(&mut self, key: &[u8], version: i64, output: &mut OutputVec) {
         let Some(records) = self.stream_state.get(key) else {
             return;
         };
@@ -814,7 +819,10 @@ impl TemporalJoinOperator {
         // Update tracked versions
         if let Some(records) = self.stream_state.get_mut(key) {
             for record in records.iter_mut() {
-                if events_to_rejoin.iter().any(|(ts, _)| *ts == record.event_timestamp) {
+                if events_to_rejoin
+                    .iter()
+                    .any(|(ts, _)| *ts == record.event_timestamp)
+                {
                     record.table_version = new_version;
                 }
             }
@@ -1179,7 +1187,10 @@ mod tests {
         assert_eq!(config.table_key_column, "currency");
         assert_eq!(config.table_version_column, "valid_from");
         assert_eq!(config.semantics, TemporalJoinSemantics::EventTime);
-        assert_eq!(config.table_characteristics, TableCharacteristics::AppendOnly);
+        assert_eq!(
+            config.table_characteristics,
+            TableCharacteristics::AppendOnly
+        );
         assert_eq!(config.join_type, TemporalJoinType::Left);
         assert_eq!(config.max_versions_per_key, 100);
     }
@@ -1229,7 +1240,13 @@ mod tests {
             operator.process_stream(&order, &mut ctx)
         };
 
-        assert_eq!(outputs.iter().filter(|o| matches!(o, Output::Event(_))).count(), 1);
+        assert_eq!(
+            outputs
+                .iter()
+                .filter(|o| matches!(o, Output::Event(_)))
+                .count(),
+            1
+        );
         assert_eq!(operator.metrics().matches, 1);
 
         // Verify output has both order and rate columns
@@ -1268,7 +1285,13 @@ mod tests {
             let mut ctx = create_test_context(&mut timers, &mut state, &mut watermark_gen);
             operator.process_stream(&order1, &mut ctx)
         };
-        assert_eq!(outputs1.iter().filter(|o| matches!(o, Output::Event(_))).count(), 1);
+        assert_eq!(
+            outputs1
+                .iter()
+                .filter(|o| matches!(o, Output::Event(_)))
+                .count(),
+            1
+        );
 
         // Order at t=250 should join with rate 1.1 (valid from t=200)
         let order2 = create_order_event(250, "USD", 100.0);
@@ -1276,7 +1299,13 @@ mod tests {
             let mut ctx = create_test_context(&mut timers, &mut state, &mut watermark_gen);
             operator.process_stream(&order2, &mut ctx)
         };
-        assert_eq!(outputs2.iter().filter(|o| matches!(o, Output::Event(_))).count(), 1);
+        assert_eq!(
+            outputs2
+                .iter()
+                .filter(|o| matches!(o, Output::Event(_)))
+                .count(),
+            1
+        );
 
         // Order at t=350 should join with rate 1.2 (valid from t=300)
         let order3 = create_order_event(350, "USD", 100.0);
@@ -1284,7 +1313,13 @@ mod tests {
             let mut ctx = create_test_context(&mut timers, &mut state, &mut watermark_gen);
             operator.process_stream(&order3, &mut ctx)
         };
-        assert_eq!(outputs3.iter().filter(|o| matches!(o, Output::Event(_))).count(), 1);
+        assert_eq!(
+            outputs3
+                .iter()
+                .filter(|o| matches!(o, Output::Event(_)))
+                .count(),
+            1
+        );
 
         assert_eq!(operator.metrics().matches, 3);
     }
@@ -1357,7 +1392,13 @@ mod tests {
         };
 
         // Left join should emit with nulls
-        assert_eq!(outputs.iter().filter(|o| matches!(o, Output::Event(_))).count(), 1);
+        assert_eq!(
+            outputs
+                .iter()
+                .filter(|o| matches!(o, Output::Event(_)))
+                .count(),
+            1
+        );
         assert_eq!(operator.metrics().unmatched, 1);
 
         if let Some(Output::Event(event)) = outputs.first() {
@@ -1398,7 +1439,13 @@ mod tests {
             operator.process_stream(&order, &mut ctx)
         };
 
-        assert_eq!(outputs.iter().filter(|o| matches!(o, Output::Event(_))).count(), 1);
+        assert_eq!(
+            outputs
+                .iter()
+                .filter(|o| matches!(o, Output::Event(_)))
+                .count(),
+            1
+        );
     }
 
     #[test]
@@ -1505,7 +1552,10 @@ mod tests {
 
         // Should emit retraction
         assert_eq!(operator.metrics().table_deletes, 1);
-        assert!(operator.metrics().retractions >= 1 || outputs.iter().any(|o| matches!(o, Output::LateEvent(_))));
+        assert!(
+            operator.metrics().retractions >= 1
+                || outputs.iter().any(|o| matches!(o, Output::LateEvent(_)))
+        );
     }
 
     #[test]
@@ -1533,14 +1583,28 @@ mod tests {
         // Orders for different currencies
         {
             let mut ctx = create_test_context(&mut timers, &mut state, &mut watermark_gen);
-            let outputs1 = operator.process_stream(&create_order_event(600, "USD", 100.0), &mut ctx);
-            assert_eq!(outputs1.iter().filter(|o| matches!(o, Output::Event(_))).count(), 1);
+            let outputs1 =
+                operator.process_stream(&create_order_event(600, "USD", 100.0), &mut ctx);
+            assert_eq!(
+                outputs1
+                    .iter()
+                    .filter(|o| matches!(o, Output::Event(_)))
+                    .count(),
+                1
+            );
         }
 
         {
             let mut ctx = create_test_context(&mut timers, &mut state, &mut watermark_gen);
-            let outputs2 = operator.process_stream(&create_order_event(600, "EUR", 100.0), &mut ctx);
-            assert_eq!(outputs2.iter().filter(|o| matches!(o, Output::Event(_))).count(), 1);
+            let outputs2 =
+                operator.process_stream(&create_order_event(600, "EUR", 100.0), &mut ctx);
+            assert_eq!(
+                outputs2
+                    .iter()
+                    .filter(|o| matches!(o, Output::Event(_)))
+                    .count(),
+                1
+            );
         }
 
         assert_eq!(operator.metrics().matches, 2);
@@ -1563,7 +1627,8 @@ mod tests {
 
         // Insert 5 versions
         for i in 0..5 {
-            let rate = create_rate_event(100 * (i + 1), "USD", 1.0 + (i as f64) * 0.1, 100 * (i + 1));
+            let rate =
+                create_rate_event(100 * (i + 1), "USD", 1.0 + (i as f64) * 0.1, 100 * (i + 1));
             let mut ctx = create_test_context(&mut timers, &mut state, &mut watermark_gen);
             operator.process_table_insert(&rate, &mut ctx);
         }
@@ -1588,7 +1653,8 @@ mod tests {
             .table_characteristics(TableCharacteristics::NonAppendOnly)
             .build();
 
-        let mut operator = TemporalJoinOperator::with_id(config.clone(), "test_temporal".to_string());
+        let mut operator =
+            TemporalJoinOperator::with_id(config.clone(), "test_temporal".to_string());
 
         let mut timers = TimerService::new();
         let mut state = InMemoryStore::new();
@@ -1731,9 +1797,18 @@ mod tests {
 
         // Lookup at different times
         assert!(key_state.lookup_at_time(50).is_none()); // Before first version
-        assert_eq!(key_state.lookup_at_time(150).unwrap().version_timestamp, 100);
-        assert_eq!(key_state.lookup_at_time(250).unwrap().version_timestamp, 200);
-        assert_eq!(key_state.lookup_at_time(350).unwrap().version_timestamp, 300);
+        assert_eq!(
+            key_state.lookup_at_time(150).unwrap().version_timestamp,
+            100
+        );
+        assert_eq!(
+            key_state.lookup_at_time(250).unwrap().version_timestamp,
+            200
+        );
+        assert_eq!(
+            key_state.lookup_at_time(350).unwrap().version_timestamp,
+            300
+        );
 
         // Latest lookup
         assert_eq!(key_state.lookup_latest().unwrap().version_timestamp, 300);

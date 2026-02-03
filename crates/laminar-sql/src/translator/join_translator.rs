@@ -99,14 +99,8 @@ impl JoinOperatorConfig {
         if analysis.is_asof_join {
             return JoinOperatorConfig::Asof(AsofJoinTranslatorConfig {
                 key_column: analysis.left_key_column.clone(),
-                left_time_column: analysis
-                    .left_time_column
-                    .clone()
-                    .unwrap_or_default(),
-                right_time_column: analysis
-                    .right_time_column
-                    .clone()
-                    .unwrap_or_default(),
+                left_time_column: analysis.left_time_column.clone().unwrap_or_default(),
+                right_time_column: analysis.right_time_column.clone().unwrap_or_default(),
                 direction: analysis
                     .asof_direction
                     .unwrap_or(AsofSqlDirection::Backward),

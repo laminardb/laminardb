@@ -142,16 +142,27 @@ impl RecommendedConfig {
         let mut s = String::new();
 
         let _ = writeln!(s, "Recommended Configuration:");
-        let _ = writeln!(s, "  Cores: {} (pinned: {})", self.num_cores, self.cpu_pinning);
+        let _ = writeln!(
+            s,
+            "  Cores: {} (pinned: {})",
+            self.num_cores, self.cpu_pinning
+        );
         let _ = writeln!(s, "  NUMA-aware: {}", self.numa_aware);
 
-        let _ = writeln!(s, "  io_uring: {} (SQPOLL: {}, IOPOLL: {})",
-            self.use_io_uring, self.io_uring_sqpoll, self.io_uring_iopoll);
+        let _ = writeln!(
+            s,
+            "  io_uring: {} (SQPOLL: {}, IOPOLL: {})",
+            self.use_io_uring, self.io_uring_sqpoll, self.io_uring_iopoll
+        );
         let _ = writeln!(s, "  XDP: {}", self.use_xdp);
 
         let _ = writeln!(s, "  Huge pages: {}", self.use_huge_pages);
         let _ = writeln!(s, "  Arena size: {} MB", self.arena_size / (1024 * 1024));
-        let _ = writeln!(s, "  State store: {} MB", self.state_store_size / (1024 * 1024));
+        let _ = writeln!(
+            s,
+            "  State store: {} MB",
+            self.state_store_size / (1024 * 1024)
+        );
         let _ = writeln!(s, "  Queue capacity: {}", self.queue_capacity);
         let _ = writeln!(s, "  Cache line: {} bytes", self.cache_line_size);
 
@@ -224,8 +235,8 @@ impl std::fmt::Display for PerformanceTier {
 
 #[cfg(test)]
 mod tests {
-    use super::*;
     use super::super::SystemCapabilities;
+    use super::*;
 
     #[test]
     fn test_recommended_config_default() {

@@ -1,8 +1,8 @@
 //! Benchmarks for Write-Ahead Log operations.
 
-use criterion::{criterion_group, criterion_main, Criterion, BatchSize};
+use criterion::{criterion_group, criterion_main, BatchSize, Criterion};
+use laminar_storage::{WalEntry, WriteAheadLog};
 use std::hint::black_box;
-use laminar_storage::{WriteAheadLog, WalEntry};
 use std::time::Duration;
 use tempfile::TempDir;
 
@@ -58,7 +58,8 @@ fn bench_wal_sync(c: &mut Criterion) {
                     wal.append(&WalEntry::Put {
                         key: format!("key_{}", i).into_bytes(),
                         value: vec![0u8; 128],
-                    }).unwrap();
+                    })
+                    .unwrap();
                 }
                 wal
             },
@@ -104,7 +105,8 @@ fn bench_wal_read(c: &mut Criterion) {
         wal.append(&WalEntry::Put {
             key: format!("key_{}", i).into_bytes(),
             value: vec![0u8; 128],
-        }).unwrap();
+        })
+        .unwrap();
     }
     wal.sync().unwrap();
     drop(wal);

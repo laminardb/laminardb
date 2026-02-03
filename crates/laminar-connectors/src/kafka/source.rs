@@ -182,9 +182,7 @@ impl KafkaSource {
                 consumer
                     .commit(&tpl, rdkafka::consumer::CommitMode::Async)
                     .map_err(|e| {
-                        ConnectorError::CheckpointError(format!(
-                            "offset commit failed: {e}"
-                        ))
+                        ConnectorError::CheckpointError(format!("offset commit failed: {e}"))
                     })?;
                 self.metrics.record_commit();
                 debug!(
@@ -241,9 +239,9 @@ impl SourceConnector for KafkaSource {
 
         // Subscribe to topics.
         let topics: Vec<&str> = kafka_config.topics.iter().map(String::as_str).collect();
-        consumer.subscribe(&topics).map_err(|e| {
-            ConnectorError::ConnectionFailed(format!("failed to subscribe: {e}"))
-        })?;
+        consumer
+            .subscribe(&topics)
+            .map_err(|e| ConnectorError::ConnectionFailed(format!("failed to subscribe: {e}")))?;
 
         self.consumer = Some(consumer);
         self.state = ConnectorState::Running;
@@ -277,12 +275,13 @@ impl SourceConnector for KafkaSource {
             return Ok(None);
         }
 
-        let consumer = self.consumer.as_ref().ok_or_else(|| {
-            ConnectorError::InvalidState {
+        let consumer = self
+            .consumer
+            .as_ref()
+            .ok_or_else(|| ConnectorError::InvalidState {
                 expected: "consumer initialized".into(),
                 actual: "consumer is None".into(),
-            }
-        })?;
+            })?;
 
         let limit = max_records.min(self.config.max_poll_records);
         let timeout = self.config.poll_timeout;
@@ -366,7 +365,10 @@ impl SourceConnector for KafkaSource {
     }
 
     async fn restore(&mut self, checkpoint: &SourceCheckpoint) -> Result<(), ConnectorError> {
-        info!(epoch = checkpoint.epoch(), "restoring Kafka source from checkpoint");
+        info!(
+            epoch = checkpoint.epoch(),
+            "restoring Kafka source from checkpoint"
+        );
 
         self.offsets = OffsetTracker::from_checkpoint(checkpoint);
 
@@ -394,12 +396,8 @@ impl SourceConnector for KafkaSource {
                 }
             }
             ConnectorState::Created | ConnectorState::Initializing => HealthStatus::Unknown,
-            ConnectorState::Paused => {
-                HealthStatus::Degraded("connector paused".into())
-            }
-            ConnectorState::Recovering => {
-                HealthStatus::Degraded("recovering".into())
-            }
+            ConnectorState::Paused => HealthStatus::Degraded("connector paused".into()),
+            ConnectorState::Recovering => HealthStatus::Degraded("recovering".into()),
             ConnectorState::Closed => HealthStatus::Unhealthy("closed".into()),
             ConnectorState::Failed => HealthStatus::Unhealthy("failed".into()),
         }
@@ -416,9 +414,7 @@ impl SourceConnector for KafkaSource {
         if let Some(ref consumer) = self.consumer {
             if self.offsets.partition_count() > 0 {
                 let tpl = self.offsets.to_topic_partition_list();
-                if let Err(e) =
-                    consumer.commit(&tpl, rdkafka::consumer::CommitMode::Sync)
-                {
+                if let Err(e) = consumer.commit(&tpl, rdkafka::consumer::CommitMode::Sync) {
                     warn!(error = %e, "failed to commit final offsets");
                 }
             }

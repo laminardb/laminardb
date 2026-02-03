@@ -11,10 +11,12 @@
 //! Memory is bounded by the maximum number of events per window.
 //! Each window buffer is released immediately after sorting and emission.
 
+use super::topk::{
+    encode_f64, encode_i64, encode_not_null, encode_null, encode_utf8, TopKSortColumn,
+};
 use super::{
     Event, Operator, OperatorContext, OperatorError, OperatorState, Output, OutputVec, Timer,
 };
-use super::topk::{TopKSortColumn, encode_i64, encode_f64, encode_utf8, encode_null, encode_not_null};
 use arrow_array::{Array, Float64Array, Int64Array, StringArray, TimestampMicrosecondArray};
 use arrow_schema::DataType;
 use fxhash::FxHashMap;
@@ -320,11 +322,8 @@ mod tests {
             DataType::Float64,
             false,
         )]));
-        let batch = RecordBatch::try_new(
-            schema,
-            vec![Arc::new(Float64Array::from(vec![price]))],
-        )
-        .unwrap();
+        let batch =
+            RecordBatch::try_new(schema, vec![Arc::new(Float64Array::from(vec![price]))]).unwrap();
         Event::new(timestamp, batch)
     }
 
@@ -334,11 +333,8 @@ mod tests {
             DataType::Int64,
             false,
         )]));
-        let batch = RecordBatch::try_new(
-            schema,
-            vec![Arc::new(Int64Array::from(vec![value]))],
-        )
-        .unwrap();
+        let batch =
+            RecordBatch::try_new(schema, vec![Arc::new(Int64Array::from(vec![value]))]).unwrap();
         Event::new(timestamp, batch)
     }
 

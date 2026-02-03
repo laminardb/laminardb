@@ -315,7 +315,11 @@ mod tests {
 
         // simd_level should return a valid level
         match level {
-            SimdLevel::None | SimdLevel::Neon | SimdLevel::Sse42 | SimdLevel::Avx2 | SimdLevel::Avx512 => {}
+            SimdLevel::None
+            | SimdLevel::Neon
+            | SimdLevel::Sse42
+            | SimdLevel::Avx2
+            | SimdLevel::Avx512 => {}
         }
 
         // Display should work

@@ -287,9 +287,9 @@ impl ChangeEvent {
     #[must_use]
     pub fn row_count(&self) -> usize {
         match self {
-            Self::Insert { data, .. }
-            | Self::Delete { data, .. }
-            | Self::Snapshot { data, .. } => data.num_rows(),
+            Self::Insert { data, .. } | Self::Delete { data, .. } | Self::Snapshot { data, .. } => {
+                data.num_rows()
+            }
             Self::Update { new, .. } => new.num_rows(),
             Self::Watermark { .. } => 0,
         }
@@ -311,20 +311,16 @@ impl ChangeEvent {
         let data = Arc::clone(&record.event.data);
         let timestamp = record.emit_timestamp;
         match record.operation {
-            CdcOperation::Insert | CdcOperation::UpdateAfter => {
-                Self::Insert {
-                    data,
-                    timestamp,
-                    sequence,
-                }
-            }
-            CdcOperation::Delete | CdcOperation::UpdateBefore => {
-                Self::Delete {
-                    data,
-                    timestamp,
-                    sequence,
-                }
-            }
+            CdcOperation::Insert | CdcOperation::UpdateAfter => Self::Insert {
+                data,
+                timestamp,
+                sequence,
+            },
+            CdcOperation::Delete | CdcOperation::UpdateBefore => Self::Delete {
+                data,
+                timestamp,
+                sequence,
+            },
         }
     }
 }

@@ -808,7 +808,6 @@ mod tests {
         RecordBatch::try_new(schema, vec![array]).unwrap()
     }
 
-
     #[test]
     fn test_unix_millis_extraction() {
         let batch = make_int64_batch("event_time", &[Some(1_705_312_200_000)]);
@@ -868,7 +867,6 @@ mod tests {
         assert_eq!(ts, 1_705_312_200_000);
     }
 
-
     #[test]
     fn test_extraction_mode_first() {
         let batch = make_int64_batch("ts", &[Some(100), Some(200), Some(150)]);
@@ -922,7 +920,6 @@ mod tests {
         let ts = extractor.extract(&batch).unwrap();
         assert_eq!(ts, 50);
     }
-
 
     #[test]
     fn test_column_not_found() {
@@ -1004,7 +1001,6 @@ mod tests {
         assert!(matches!(result, Err(EventTimeError::ParseError { .. })));
     }
 
-
     #[test]
     fn test_column_index_caching() {
         let batch = make_int64_batch("event_time", &[Some(100)]);
@@ -1033,7 +1029,6 @@ mod tests {
         assert_eq!(ts, 100);
     }
 
-
     #[test]
     fn test_validate_schema_success() {
         let schema = Schema::new(vec![Field::new("ts", DataType::Int64, true)]);
@@ -1059,7 +1054,6 @@ mod tests {
             Err(EventTimeError::IncompatibleType { .. })
         ));
     }
-
 
     #[test]
     fn test_format_accessor() {

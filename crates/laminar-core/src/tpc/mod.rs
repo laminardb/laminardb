@@ -72,9 +72,8 @@ mod spsc;
 mod zero_alloc_tests;
 
 pub use backpressure::{
-    BackpressureConfig, BackpressureConfigBuilder, CreditAcquireResult, CreditChannel,
-    CreditGate, CreditMetrics, CreditMetricsSnapshot, CreditReceiver, CreditSender,
-    OverflowStrategy,
+    BackpressureConfig, BackpressureConfigBuilder, CreditAcquireResult, CreditChannel, CreditGate,
+    CreditMetrics, CreditMetricsSnapshot, CreditReceiver, CreditSender, OverflowStrategy,
 };
 pub use core_handle::{CoreConfig, CoreHandle, CoreMessage};
 pub use router::{KeyRouter, KeySpec, RouterError};

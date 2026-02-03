@@ -271,11 +271,7 @@ impl StreamingDag {
     ///
     /// Returns `DagError::NodeNotFound` if either node does not exist.
     /// Returns `DagError::CycleDetected` if the edge would create a self-loop.
-    pub fn add_edge(
-        &mut self,
-        source: NodeId,
-        target: NodeId,
-    ) -> Result<EdgeId, DagError> {
+    pub fn add_edge(&mut self, source: NodeId, target: NodeId) -> Result<EdgeId, DagError> {
         // Self-loop check
         if source == target {
             let name = self.node_name(source).unwrap_or_default();
@@ -294,15 +290,9 @@ impl StreamingDag {
 
         // Port indices are bounded by MAX_FAN_OUT (8), so truncation is safe.
         #[allow(clippy::cast_possible_truncation)]
-        let source_port = self
-            .nodes
-            .get(&source)
-            .map_or(0, |n| n.outputs.len() as u8);
+        let source_port = self.nodes.get(&source).map_or(0, |n| n.outputs.len() as u8);
         #[allow(clippy::cast_possible_truncation)]
-        let target_port = self
-            .nodes
-            .get(&target)
-            .map_or(0, |n| n.inputs.len() as u8);
+        let target_port = self.nodes.get(&target).map_or(0, |n| n.inputs.len() as u8);
 
         let edge = DagEdge {
             id,
@@ -539,9 +529,7 @@ impl StreamingDag {
                 let target_schema = &target.output_schema;
 
                 // Empty schemas are compatible with anything (type-erased).
-                if source_schema.fields().is_empty()
-                    || target_schema.fields().is_empty()
-                {
+                if source_schema.fields().is_empty() || target_schema.fields().is_empty() {
                     continue;
                 }
 
@@ -699,9 +687,7 @@ impl StreamingDag {
                 let consumer_nodes: Vec<NodeId> = node
                     .outputs
                     .iter()
-                    .filter_map(|&edge_id| {
-                        self.edges.get(&edge_id).map(|e| e.target)
-                    })
+                    .filter_map(|&edge_id| self.edges.get(&edge_id).map(|e| e.target))
                     .collect();
 
                 self.shared_stages.insert(

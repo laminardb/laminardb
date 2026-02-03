@@ -68,18 +68,10 @@ fn normalize_option_key(key: &str) -> String {
     }
 }
 
-pub(crate) fn build_source_config(
-    reg: &SourceRegistration,
-) -> Result<ConnectorConfig, DbError> {
-    let connector_type = reg
-        .connector_type
-        .as_deref()
-        .ok_or_else(|| {
-            DbError::Connector(format!(
-                "Source '{}' has no connector type",
-                reg.name
-            ))
-        })?;
+pub(crate) fn build_source_config(reg: &SourceRegistration) -> Result<ConnectorConfig, DbError> {
+    let connector_type = reg.connector_type.as_deref().ok_or_else(|| {
+        DbError::Connector(format!("Source '{}' has no connector type", reg.name))
+    })?;
 
     let mut config = ConnectorConfig::new(connector_type.to_lowercase());
     for (k, v) in &reg.connector_options {
@@ -87,13 +79,12 @@ pub(crate) fn build_source_config(
     }
 
     if let Some(ref fmt_str) = reg.format {
-        laminar_connectors::serde::Format::parse(&fmt_str.to_lowercase())
-            .map_err(|e| {
-                DbError::Connector(format!(
-                    "Invalid format '{}' for source '{}': {e}",
-                    fmt_str, reg.name,
-                ))
-            })?;
+        laminar_connectors::serde::Format::parse(&fmt_str.to_lowercase()).map_err(|e| {
+            DbError::Connector(format!(
+                "Invalid format '{}' for source '{}': {e}",
+                fmt_str, reg.name,
+            ))
+        })?;
         config.set("format".to_string(), fmt_str.to_lowercase());
     }
 
@@ -107,18 +98,11 @@ pub(crate) fn build_source_config(
 /// Build a [`ConnectorConfig`] from a [`SinkRegistration`].
 ///
 /// Same normalization and validation as [`build_source_config`].
-pub(crate) fn build_sink_config(
-    reg: &SinkRegistration,
-) -> Result<ConnectorConfig, DbError> {
+pub(crate) fn build_sink_config(reg: &SinkRegistration) -> Result<ConnectorConfig, DbError> {
     let connector_type = reg
         .connector_type
         .as_deref()
-        .ok_or_else(|| {
-            DbError::Connector(format!(
-                "Sink '{}' has no connector type",
-                reg.name
-            ))
-        })?;
+        .ok_or_else(|| DbError::Connector(format!("Sink '{}' has no connector type", reg.name)))?;
 
     let mut config = ConnectorConfig::new(connector_type.to_lowercase());
     for (k, v) in &reg.connector_options {
@@ -126,13 +110,12 @@ pub(crate) fn build_sink_config(
     }
 
     if let Some(ref fmt_str) = reg.format {
-        laminar_connectors::serde::Format::parse(&fmt_str.to_lowercase())
-            .map_err(|e| {
-                DbError::Connector(format!(
-                    "Invalid format '{}' for sink '{}': {e}",
-                    fmt_str, reg.name,
-                ))
-            })?;
+        laminar_connectors::serde::Format::parse(&fmt_str.to_lowercase()).map_err(|e| {
+            DbError::Connector(format!(
+                "Invalid format '{}' for sink '{}': {e}",
+                fmt_str, reg.name,
+            ))
+        })?;
         config.set("format".to_string(), fmt_str.to_lowercase());
     }
 
@@ -485,12 +468,13 @@ mod tests {
             connector_type: Some("KAFKA".to_string()),
             connector_options: HashMap::from([
                 ("topic".to_string(), "clicks".to_string()),
-                ("bootstrap.servers".to_string(), "localhost:9092".to_string()),
+                (
+                    "bootstrap.servers".to_string(),
+                    "localhost:9092".to_string(),
+                ),
             ]),
             format: Some("JSON".to_string()),
-            format_options: HashMap::from([
-                ("include_schema".to_string(), "true".to_string()),
-            ]),
+            format_options: HashMap::from([("include_schema".to_string(), "true".to_string())]),
         };
         let config = build_source_config(&reg).unwrap();
         assert_eq!(config.connector_type(), "kafka"); // normalized lowercase
@@ -547,9 +531,7 @@ mod tests {
             name: "output".to_string(),
             input: "events".to_string(),
             connector_type: Some("KAFKA".to_string()),
-            connector_options: HashMap::from([
-                ("topic".to_string(), "output".to_string()),
-            ]),
+            connector_options: HashMap::from([("topic".to_string(), "output".to_string())]),
             format: Some("JSON".to_string()),
             format_options: HashMap::new(),
             filter_expr: Some("id > 10".to_string()),

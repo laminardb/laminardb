@@ -81,8 +81,7 @@ impl StreamingScanExec {
         };
 
         // Build equivalence properties, optionally with source ordering
-        let eq_properties =
-            Self::build_equivalence_properties(&schema, source_ordering.as_deref());
+        let eq_properties = Self::build_equivalence_properties(&schema, source_ordering.as_deref());
 
         // Build plan properties for an unbounded streaming source
         let properties = PlanProperties::new(
@@ -118,18 +117,15 @@ impl StreamingScanExec {
                 .iter()
                 .filter_map(|sc| {
                     // Find column index in the output schema
-                    schema
-                        .index_of(&sc.name)
-                        .ok()
-                        .map(|idx| {
-                            PhysicalSortExpr::new(
-                                Arc::new(Column::new(&sc.name, idx)),
-                                SortOptions {
-                                    descending: sc.descending,
-                                    nulls_first: sc.nulls_first,
-                                },
-                            )
-                        })
+                    schema.index_of(&sc.name).ok().map(|idx| {
+                        PhysicalSortExpr::new(
+                            Arc::new(Column::new(&sc.name, idx)),
+                            SortOptions {
+                                descending: sc.descending,
+                                nulls_first: sc.nulls_first,
+                            },
+                        )
+                    })
                 })
                 .collect();
 
@@ -354,10 +350,7 @@ mod tests {
         let exec = StreamingScanExec::new(source, None, vec![]);
 
         // Should be unbounded (streaming)
-        assert!(matches!(
-            exec.boundedness(),
-            Boundedness::Unbounded { .. }
-        ));
+        assert!(matches!(exec.boundedness(), Boundedness::Unbounded { .. }));
 
         // Should be single partition
         let partitioning = exec.properties().output_partitioning();
@@ -409,8 +402,7 @@ mod tests {
 
         let schema = test_schema();
         let source: StreamSourceRef = Arc::new(
-            MockSource::new(Arc::clone(&schema))
-                .with_ordering(vec![SortColumn::ascending("id")]),
+            MockSource::new(Arc::clone(&schema)).with_ordering(vec![SortColumn::ascending("id")]),
         );
         let exec = StreamingScanExec::new(source, None, vec![]);
 
@@ -426,13 +418,11 @@ mod tests {
         use datafusion::physical_plan::ExecutionPlanProperties;
 
         let schema = test_schema();
-        let source: StreamSourceRef = Arc::new(
-            MockSource::new(Arc::clone(&schema))
-                .with_ordering(vec![
-                    SortColumn::ascending("id"),
-                    SortColumn::descending("value"),
-                ]),
-        );
+        let source: StreamSourceRef =
+            Arc::new(MockSource::new(Arc::clone(&schema)).with_ordering(vec![
+                SortColumn::ascending("id"),
+                SortColumn::descending("value"),
+            ]));
         let exec = StreamingScanExec::new(source, None, vec![]);
 
         let ordering = exec.output_ordering().unwrap();
@@ -446,8 +436,7 @@ mod tests {
         let schema = test_schema();
         // Source ordered by "id" ascending
         let source: StreamSourceRef = Arc::new(
-            MockSource::new(Arc::clone(&schema))
-                .with_ordering(vec![SortColumn::ascending("id")]),
+            MockSource::new(Arc::clone(&schema)).with_ordering(vec![SortColumn::ascending("id")]),
         );
         // Project only "id" and "value" (indices 0, 2)
         let exec = StreamingScanExec::new(source, Some(vec![0, 2]), vec![]);
@@ -464,8 +453,7 @@ mod tests {
         let schema = test_schema();
         // Source ordered by "name" ascending
         let source: StreamSourceRef = Arc::new(
-            MockSource::new(Arc::clone(&schema))
-                .with_ordering(vec![SortColumn::ascending("name")]),
+            MockSource::new(Arc::clone(&schema)).with_ordering(vec![SortColumn::ascending("name")]),
         );
         // Project only "id" and "value" (indices 0, 2) -- "name" is NOT projected
         let exec = StreamingScanExec::new(source, Some(vec![0, 2]), vec![]);

@@ -89,9 +89,7 @@ impl OrderOperatorConfig {
     /// # Errors
     ///
     /// Returns error string for `OrderPattern::Unbounded`.
-    pub fn from_analysis(
-        analysis: &OrderAnalysis,
-    ) -> Result<Option<Self>, String> {
+    pub fn from_analysis(analysis: &OrderAnalysis) -> Result<Option<Self>, String> {
         match &analysis.pattern {
             OrderPattern::None => Ok(None),
             OrderPattern::SourceSatisfied => Ok(Some(Self::SourceSatisfied)),
@@ -176,7 +174,9 @@ mod tests {
             is_windowed: false,
             pattern: OrderPattern::TopK { k: 10 },
         };
-        let config = OrderOperatorConfig::from_analysis(&analysis).unwrap().unwrap();
+        let config = OrderOperatorConfig::from_analysis(&analysis)
+            .unwrap()
+            .unwrap();
         match config {
             OrderOperatorConfig::TopK(cfg) => {
                 assert_eq!(cfg.k, 10);
@@ -198,7 +198,9 @@ mod tests {
                 partition_columns: vec!["category".to_string()],
             },
         };
-        let config = OrderOperatorConfig::from_analysis(&analysis).unwrap().unwrap();
+        let config = OrderOperatorConfig::from_analysis(&analysis)
+            .unwrap()
+            .unwrap();
         match config {
             OrderOperatorConfig::PerGroupTopK(cfg) => {
                 assert_eq!(cfg.k, 5);
@@ -217,7 +219,9 @@ mod tests {
             is_windowed: true,
             pattern: OrderPattern::WindowLocal,
         };
-        let config = OrderOperatorConfig::from_analysis(&analysis).unwrap().unwrap();
+        let config = OrderOperatorConfig::from_analysis(&analysis)
+            .unwrap()
+            .unwrap();
         match config {
             OrderOperatorConfig::WindowLocalSort(cfg) => {
                 assert_eq!(cfg.sort_columns.len(), 1);
@@ -235,7 +239,9 @@ mod tests {
             is_windowed: false,
             pattern: OrderPattern::SourceSatisfied,
         };
-        let config = OrderOperatorConfig::from_analysis(&analysis).unwrap().unwrap();
+        let config = OrderOperatorConfig::from_analysis(&analysis)
+            .unwrap()
+            .unwrap();
         assert_eq!(config, OrderOperatorConfig::SourceSatisfied);
     }
 

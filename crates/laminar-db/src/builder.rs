@@ -10,8 +10,7 @@ use crate::db::LaminarDB;
 use crate::error::DbError;
 
 /// Callback for registering custom connectors.
-type ConnectorCallback =
-    Box<dyn FnOnce(&laminar_connectors::registry::ConnectorRegistry) + Send>;
+type ConnectorCallback = Box<dyn FnOnce(&laminar_connectors::registry::ConnectorRegistry) + Send>;
 
 /// Fluent builder for constructing a [`LaminarDB`] instance.
 ///
@@ -108,10 +107,7 @@ impl LaminarDbBuilder {
     /// Returns `DbError` if database creation fails.
     #[allow(clippy::unused_async)]
     pub async fn build(self) -> Result<LaminarDB, DbError> {
-        let db = LaminarDB::open_with_config_and_vars(
-            self.config,
-            self.config_vars,
-        )?;
+        let db = LaminarDB::open_with_config_and_vars(self.config, self.config_vars)?;
         for callback in self.connector_callbacks {
             callback(db.connector_registry());
         }
