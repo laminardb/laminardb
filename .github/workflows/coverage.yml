@@ -20,6 +20,9 @@ jobs:
           key: coverage
       - uses: taiki-e/install-action@cargo-llvm-cov
 
+      - name: Install system dependencies
+        run: sudo apt-get update && sudo apt-get install -y libhwloc-dev
+
       - name: Generate coverage
         run: |
           cargo llvm-cov --workspace --all-features \
