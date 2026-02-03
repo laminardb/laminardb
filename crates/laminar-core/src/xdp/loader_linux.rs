@@ -3,7 +3,6 @@
 //! This module provides the actual XDP loading and attachment functionality
 //! using libbpf-rs when the `xdp` feature is enabled.
 
-use std::path::Path;
 use std::sync::atomic::{AtomicBool, Ordering};
 
 use super::{XdpAttachMode, XdpConfig, XdpError, XdpStats};
@@ -121,22 +120,28 @@ impl XdpLoader {
         ifindex: u32,
         num_cores: usize,
     ) -> Result<Self, XdpError> {
-        use libbpf_rs::{MapFlags, ObjectBuilder, ProgramType, XdpFlags};
+        use libbpf_rs::{MapFlags, ObjectBuilder};
 
         // Load BPF object
-        let obj = ObjectBuilder::default()
+        let mut obj = ObjectBuilder::default()
             .open_file(&config.bpf_object_path)
             .map_err(|e| XdpError::LoadFailed(e.to_string()))?
             .load()
             .map_err(|e| XdpError::LoadFailed(e.to_string()))?;
 
-        // Get XDP program
+        // Get XDP program by iterating progs()
         let prog = obj
-            .prog("laminar_ingress")
-            .ok_or(XdpError::MapNotFound("laminar_ingress program".to_string()))?;
+            .progs_mut()
+            .find(|p| p.name() == "laminar_ingress")
+            .ok_or_else(|| XdpError::MapNotFound("laminar_ingress program".to_string()))?;
 
-        // Configure CPU map
-        if let Some(cpu_map) = obj.map("cpu_map") {
+        // Attach to interface
+        let _link = prog
+            .attach_xdp(ifindex as i32)
+            .map_err(|e: libbpf_rs::Error| XdpError::AttachFailed(e.to_string()))?;
+
+        // Configure CPU map if present
+        if let Some(mut cpu_map) = obj.maps_mut().find(|m| m.name() == "cpu_map") {
             for cpu in 0..num_cores {
                 let key = (cpu as u32).to_ne_bytes();
                 // CpumapValue format: qsize as u32
@@ -144,21 +149,9 @@ impl XdpLoader {
                 let value = qsize.to_ne_bytes();
                 cpu_map
                     .update(&key, &value, MapFlags::ANY)
-                    .map_err(|e| XdpError::MapUpdateFailed(e.to_string()))?;
+                    .map_err(|e: libbpf_rs::Error| XdpError::MapUpdateFailed(e.to_string()))?;
             }
         }
-
-        // Determine XDP flags based on attach mode
-        let xdp_flags = match config.attach_mode {
-            XdpAttachMode::Auto => XdpFlags::empty(),
-            XdpAttachMode::Generic => XdpFlags::SKB_MODE,
-            XdpAttachMode::Native => XdpFlags::DRV_MODE,
-            XdpAttachMode::Offload => XdpFlags::HW_MODE,
-        };
-
-        // Attach to interface
-        prog.attach_xdp(ifindex as i32)
-            .map_err(|e| XdpError::AttachFailed(e.to_string()))?;
 
         tracing::info!(
             "XDP program attached to interface {} (index {})",

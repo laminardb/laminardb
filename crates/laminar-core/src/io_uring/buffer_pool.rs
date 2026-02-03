@@ -206,12 +206,13 @@ impl RegisteredBufferPool {
         offset: u64,
         len: u32,
     ) -> Result<u64, IoUringError> {
+        // Get user_data first to avoid borrow conflict
+        let user_data = self.next_user_data();
+
         let buf = self
             .buffers
             .get_mut(buf_index as usize)
             .ok_or(IoUringError::InvalidBufferIndex(buf_index))?;
-
-        let user_data = self.next_user_data();
 
         let entry = opcode::ReadFixed::new(Fd(fd), buf.as_mut_ptr(), len, buf_index)
             .offset(offset)

@@ -532,28 +532,34 @@ impl CoreRingManager {
 
     /// Poll completions from a specific ring.
     fn poll_ring_completions(&mut self, completions: &mut Vec<Completion>, iopoll: bool) {
-        let ring = if iopoll {
-            match &mut self.iopoll_ring {
-                Some(r) => r.ring_mut(),
-                None => return,
+        // Collect CQE data first to avoid borrow conflict
+        let cqe_data: Vec<(u64, i32, u32)> = {
+            let ring = if iopoll {
+                match &mut self.iopoll_ring {
+                    Some(r) => r.ring_mut(),
+                    None => return,
+                }
+            } else {
+                self.main_ring.ring_mut()
+            };
+
+            let mut cq = ring.completion();
+            let mut data = Vec::new();
+            while let Some(cqe) = cq.next() {
+                data.push((cqe.user_data(), cqe.result(), cqe.flags()));
             }
-        } else {
-            self.main_ring.ring_mut()
+            data
         };
 
-        let mut cq = ring.completion();
-        while let Some(cqe) = cq.next() {
-            let completion = self.process_completion(cqe);
+        // Process collected completions
+        for (user_data, result, flags) in cqe_data {
+            let completion = self.process_completion_data(user_data, result, flags);
             completions.push(completion);
         }
     }
 
-    /// Process a completion queue entry.
-    fn process_completion(&mut self, cqe: CqEntry) -> Completion {
-        let user_data = cqe.user_data();
-        let result = cqe.result();
-        let flags = cqe.flags();
-
+    /// Process completion data from a CQE.
+    fn process_completion_data(&mut self, user_data: u64, result: i32, flags: u32) -> Completion {
         let op = self.pending.remove(&user_data);
         let latency = op.as_ref().map(|o| o.submitted_at().elapsed());
 
@@ -562,10 +568,10 @@ impl CoreRingManager {
             self.metrics.completions_success += 1;
             if let Some(ref op) = op {
                 match op {
-                    PendingOp::Read { len, .. } => {
+                    PendingOp::Read { .. } => {
                         self.metrics.bytes_read += result as u64;
                     }
-                    PendingOp::Write { len, .. } => {
+                    PendingOp::Write { .. } => {
                         self.metrics.bytes_written += result as u64;
                     }
                     _ => {}

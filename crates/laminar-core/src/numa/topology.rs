@@ -87,15 +87,13 @@ impl NumaTopology {
         let mut cpu_to_node = vec![0usize; num_cpus];
 
         for (node_idx, numa_node) in numa_nodes.iter().enumerate() {
-            // Get memory for this node
-            if let Some(memory) = numa_node.total_memory() {
-                memory_per_node[node_idx] = memory;
-            }
+            // Get memory for this node (total_memory returns u64 directly)
+            memory_per_node[node_idx] = numa_node.total_memory();
 
             // Get CPUs for this node
             if let Some(cpuset) = numa_node.cpuset() {
                 for cpu in cpuset.iter_set() {
-                    let cpu_idx = cpu as usize;
+                    let cpu_idx = usize::from(cpu);
                     if cpu_idx < num_cpus {
                         cpus_per_node[node_idx].push(cpu_idx);
                         cpu_to_node[cpu_idx] = node_idx;

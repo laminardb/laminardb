@@ -5,17 +5,29 @@
 //! - IOPOLL: Poll completions from NVMe device queue
 //! - Combined: Maximum performance for NVMe storage
 
+use io_uring::squeue::Entry;
 use io_uring::IoUring;
 
 use super::config::{IoUringConfig, RingMode};
 use super::error::IoUringError;
 
+/// Type alias for standard IoUring with default entry types.
+pub type StandardIoUring = IoUring<Entry, io_uring::cqueue::Entry>;
+
 /// Wrapper around io_uring with mode information.
-#[derive(Debug)]
 pub struct IoUringRing {
-    ring: IoUring,
+    ring: StandardIoUring,
     mode: RingMode,
     entries: u32,
+}
+
+impl std::fmt::Debug for IoUringRing {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("IoUringRing")
+            .field("mode", &self.mode)
+            .field("entries", &self.entries)
+            .finish_non_exhaustive()
+    }
 }
 
 impl IoUringRing {
@@ -43,13 +55,13 @@ impl IoUringRing {
 
     /// Get a reference to the underlying io_uring.
     #[must_use]
-    pub fn ring(&self) -> &IoUring {
+    pub fn ring(&self) -> &StandardIoUring {
         &self.ring
     }
 
     /// Get a mutable reference to the underlying io_uring.
     #[must_use]
-    pub fn ring_mut(&mut self) -> &mut IoUring {
+    pub fn ring_mut(&mut self) -> &mut StandardIoUring {
         &mut self.ring
     }
 
@@ -79,7 +91,7 @@ impl IoUringRing {
 }
 
 /// Create a standard io_uring ring.
-fn create_standard_ring(config: &IoUringConfig) -> Result<IoUring, IoUringError> {
+fn create_standard_ring(config: &IoUringConfig) -> Result<StandardIoUring, IoUringError> {
     let mut builder = IoUring::builder();
 
     if config.coop_taskrun {
@@ -118,7 +130,7 @@ pub fn create_optimized_ring(
     entries: u32,
     sqpoll_idle_ms: u32,
     sqpoll_cpu: Option<u32>,
-) -> Result<IoUring, IoUringError> {
+) -> Result<StandardIoUring, IoUringError> {
     let config = IoUringConfig {
         ring_entries: entries,
         mode: RingMode::SqPoll,
@@ -130,7 +142,7 @@ pub fn create_optimized_ring(
 }
 
 /// Create a SQPOLL-enabled ring.
-fn create_sqpoll_ring(config: &IoUringConfig) -> Result<IoUring, IoUringError> {
+fn create_sqpoll_ring(config: &IoUringConfig) -> Result<StandardIoUring, IoUringError> {
     let mut builder = IoUring::builder();
 
     // Enable SQPOLL - kernel thread polls submission queue
@@ -173,7 +185,7 @@ fn create_sqpoll_ring(config: &IoUringConfig) -> Result<IoUring, IoUringError> {
 /// # Errors
 ///
 /// Returns an error if the ring cannot be created.
-pub fn create_iopoll_ring(entries: u32) -> Result<IoUring, IoUringError> {
+pub fn create_iopoll_ring(entries: u32) -> Result<StandardIoUring, IoUringError> {
     let config = IoUringConfig {
         ring_entries: entries,
         mode: RingMode::IoPoll,
@@ -183,7 +195,7 @@ pub fn create_iopoll_ring(entries: u32) -> Result<IoUring, IoUringError> {
 }
 
 /// Create an IOPOLL-enabled ring.
-fn create_iopoll_ring_internal(config: &IoUringConfig) -> Result<IoUring, IoUringError> {
+fn create_iopoll_ring_internal(config: &IoUringConfig) -> Result<StandardIoUring, IoUringError> {
     let mut builder = IoUring::builder();
 
     // Enable IOPOLL - poll completions from device
@@ -203,7 +215,7 @@ fn create_iopoll_ring_internal(config: &IoUringConfig) -> Result<IoUring, IoUrin
 }
 
 /// Create a ring with both SQPOLL and IOPOLL.
-fn create_sqpoll_iopoll_ring(config: &IoUringConfig) -> Result<IoUring, IoUringError> {
+fn create_sqpoll_iopoll_ring(config: &IoUringConfig) -> Result<StandardIoUring, IoUringError> {
     let mut builder = IoUring::builder();
 
     // Enable both SQPOLL and IOPOLL
@@ -231,7 +243,8 @@ fn create_sqpoll_iopoll_ring(config: &IoUringConfig) -> Result<IoUring, IoUringE
 #[must_use]
 pub fn probe_features() -> SupportedFeatures {
     // Try to create a minimal ring to probe features
-    let ring = match IoUring::builder().build(8) {
+    let ring: Result<StandardIoUring, _> = IoUring::builder().build(8);
+    let ring = match ring {
         Ok(r) => r,
         Err(_) => {
             return SupportedFeatures {
@@ -246,10 +259,12 @@ pub fn probe_features() -> SupportedFeatures {
     };
 
     // Check for SQPOLL support
-    let sqpoll = IoUring::builder().setup_sqpoll(1000).build(8).is_ok();
+    let sqpoll: Result<StandardIoUring, _> = IoUring::builder().setup_sqpoll(1000).build(8);
+    let sqpoll = sqpoll.is_ok();
 
     // Check for IOPOLL support
-    let iopoll = IoUring::builder().setup_iopoll().build(8).is_ok();
+    let iopoll: Result<StandardIoUring, _> = IoUring::builder().setup_iopoll().build(8);
+    let iopoll = iopoll.is_ok();
 
     // Registered buffers and files are available on all io_uring versions
     let registered_buffers = true;

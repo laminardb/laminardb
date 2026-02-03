@@ -20,7 +20,6 @@
 #[cfg(all(target_os = "linux", feature = "io-uring"))]
 mod linux_impl {
     use std::fs::{File, OpenOptions};
-    use std::io::Write;
     use std::os::unix::io::AsRawFd;
     use std::path::{Path, PathBuf};
 
@@ -65,7 +64,7 @@ mod linux_impl {
                 .write(true)
                 .truncate(true)
                 .open(&path)
-                .map_err(|e| IoUringError::RingCreation(e.to_string()))?;
+                .map_err(IoUringError::RingCreation)?;
 
             let position = 0;
             let ring_manager = CoreRingManager::new(0, &config)?;
@@ -96,11 +95,11 @@ mod linux_impl {
                 .create(true)
                 .append(true)
                 .open(&path)
-                .map_err(|e| IoUringError::RingCreation(e.to_string()))?;
+                .map_err(IoUringError::RingCreation)?;
 
             let position = file
                 .metadata()
-                .map_err(|e| IoUringError::RingCreation(e.to_string()))?
+                .map_err(IoUringError::RingCreation)?
                 .len();
 
             let ring_manager = CoreRingManager::new(0, &config)?;
@@ -169,7 +168,7 @@ mod linux_impl {
                     .into_bytes()
                 }
                 Output::Watermark(ts) => format!("WATERMARK ts={ts}\n").into_bytes(),
-                Output::LateEvent { event, .. } => {
+                Output::LateEvent(event) => {
                     format!("LATE_EVENT ts={}\n", event.timestamp).into_bytes()
                 }
             };

@@ -402,9 +402,18 @@ impl ThreeRingReactor {
 
     /// Poll only the latency ring.
     fn poll_latency_ring(&mut self, completions: &mut Vec<RoutedCompletion>) {
-        let mut cq = self.latency_ring.completion();
-        while let Some(cqe) = cq.next() {
-            let completion = self.process_cqe(cqe, RingAffinity::Latency);
+        // Collect CQE data first to avoid borrow conflict
+        let cqe_data: Vec<(u64, i32, u32)> = {
+            let mut cq = self.latency_ring.completion();
+            let mut data = Vec::new();
+            while let Some(cqe) = cq.next() {
+                data.push((cqe.user_data(), cqe.result(), cqe.flags()));
+            }
+            data
+        };
+
+        for (user_data, result, flags) in cqe_data {
+            let completion = self.process_cqe_data(user_data, result, flags, RingAffinity::Latency);
             self.stats
                 .record_latency_completion(completion.latency(), completion.is_success());
             completions.push(completion);
@@ -413,9 +422,18 @@ impl ThreeRingReactor {
 
     /// Poll only the main ring.
     fn poll_main_ring(&mut self, completions: &mut Vec<RoutedCompletion>) {
-        let mut cq = self.main_ring.completion();
-        while let Some(cqe) = cq.next() {
-            let completion = self.process_cqe(cqe, RingAffinity::Main);
+        // Collect CQE data first to avoid borrow conflict
+        let cqe_data: Vec<(u64, i32, u32)> = {
+            let mut cq = self.main_ring.completion();
+            let mut data = Vec::new();
+            while let Some(cqe) = cq.next() {
+                data.push((cqe.user_data(), cqe.result(), cqe.flags()));
+            }
+            data
+        };
+
+        for (user_data, result, flags) in cqe_data {
+            let completion = self.process_cqe_data(user_data, result, flags, RingAffinity::Main);
             self.stats
                 .record_main_completion(completion.latency(), completion.is_success());
             completions.push(completion);
@@ -424,23 +442,35 @@ impl ThreeRingReactor {
 
     /// Poll only the poll ring.
     fn poll_poll_ring(&mut self, completions: &mut Vec<RoutedCompletion>) {
-        if let Some(ref mut ring) = self.poll_ring {
+        // Collect CQE data first to avoid borrow conflict
+        let cqe_data: Vec<(u64, i32, u32)> = {
+            let Some(ref mut ring) = self.poll_ring else {
+                return;
+            };
             let mut cq = ring.completion();
+            let mut data = Vec::new();
             while let Some(cqe) = cq.next() {
-                let completion = self.process_cqe(cqe, RingAffinity::Poll);
-                self.stats
-                    .record_poll_completion(completion.latency(), completion.is_success());
-                completions.push(completion);
+                data.push((cqe.user_data(), cqe.result(), cqe.flags()));
             }
+            data
+        };
+
+        for (user_data, result, flags) in cqe_data {
+            let completion = self.process_cqe_data(user_data, result, flags, RingAffinity::Poll);
+            self.stats
+                .record_poll_completion(completion.latency(), completion.is_success());
+            completions.push(completion);
         }
     }
 
-    /// Process a completion queue entry.
-    fn process_cqe(&mut self, cqe: CqEntry, default_affinity: RingAffinity) -> RoutedCompletion {
-        let user_data = cqe.user_data();
-        let result = cqe.result();
-        let flags = cqe.flags();
-
+    /// Process completion data from a CQE.
+    fn process_cqe_data(
+        &mut self,
+        user_data: u64,
+        result: i32,
+        flags: u32,
+        default_affinity: RingAffinity,
+    ) -> RoutedCompletion {
         // Try to route through our router first
         if self.router.is_pending(user_data) {
             self.router.route(user_data, result, flags)

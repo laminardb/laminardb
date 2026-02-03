@@ -353,7 +353,7 @@ impl StorageInfo {
         let minor = dev & 0xFF;
 
         // Read /proc/diskstats or /sys/dev/block to find the device name
-        let block_path = format!("/sys/dev/block/{major}:{minor}/device/../");
+        let _block_path = format!("/sys/dev/block/{major}:{minor}/device/../");
 
         if let Ok(entries) = fs::read_dir("/sys/block") {
             for entry in entries.flatten() {
