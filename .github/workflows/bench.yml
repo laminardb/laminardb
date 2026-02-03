@@ -1,0 +1,90 @@
+name: Benchmarks
+
+on:
+  push:
+    branches: [main]
+  workflow_dispatch:
+
+permissions:
+  contents: write
+  deployments: write
+
+jobs:
+  benchmark:
+    name: Run Benchmarks
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+      - uses: Swatinem/rust-cache@v2
+        with:
+          key: bench
+
+      - name: Run benchmarks
+        run: |
+          # Run criterion benchmarks
+          cargo bench --workspace -- --noplot 2>&1 | tee bench_output.txt
+
+      - name: Parse benchmark results
+        id: parse
+        run: |
+          echo "## Benchmark Results" >> $GITHUB_STEP_SUMMARY
+          echo "" >> $GITHUB_STEP_SUMMARY
+
+          # Extract key results
+          if grep -q "time:" bench_output.txt; then
+            echo "### Timing Results" >> $GITHUB_STEP_SUMMARY
+            echo "\`\`\`" >> $GITHUB_STEP_SUMMARY
+            grep -A2 "time:" bench_output.txt | head -50 >> $GITHUB_STEP_SUMMARY
+            echo "\`\`\`" >> $GITHUB_STEP_SUMMARY
+          fi
+
+      - name: Store benchmark result
+        uses: benchmark-action/github-action-benchmark@v1
+        with:
+          name: LaminarDB Benchmarks
+          tool: 'cargo'
+          output-file-path: bench_output.txt
+          github-token: ${{ secrets.GITHUB_TOKEN }}
+          auto-push: true
+          alert-threshold: '150%'
+          comment-on-alert: true
+          fail-on-alert: false
+          benchmark-data-dir-path: bench
+        continue-on-error: true
+
+      - name: Upload benchmark artifacts
+        uses: actions/upload-artifact@v4
+        with:
+          name: benchmark-results
+          path: |
+            bench_output.txt
+            target/criterion/
+          if-no-files-found: ignore
+
+  # Latency validation against targets
+  latency-check:
+    name: Latency Validation
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+      - uses: Swatinem/rust-cache@v2
+        with:
+          key: bench-latency
+
+      - name: Run latency benchmarks
+        run: |
+          # Run specific latency-critical benchmarks
+          cargo bench -p laminar-core --bench state_bench -- --noplot 2>&1 | tee latency.txt || true
+          cargo bench -p laminar-core --bench dag_bench -- --noplot 2>&1 | tee -a latency.txt || true
+
+      - name: Check latency targets
+        run: |
+          echo "## Latency Targets" >> $GITHUB_STEP_SUMMARY
+          echo "" >> $GITHUB_STEP_SUMMARY
+          echo "| Target | Requirement | Status |" >> $GITHUB_STEP_SUMMARY
+          echo "|--------|-------------|--------|" >> $GITHUB_STEP_SUMMARY
+          echo "| State lookup | < 500ns | TBD |" >> $GITHUB_STEP_SUMMARY
+          echo "| Event processing | < 1μs | TBD |" >> $GITHUB_STEP_SUMMARY
+          echo "| Routing lookup | < 50ns | TBD |" >> $GITHUB_STEP_SUMMARY

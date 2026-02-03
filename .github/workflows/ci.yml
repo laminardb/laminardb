@@ -1,0 +1,227 @@
+name: CI
+
+on:
+  push:
+    branches: [main, develop, "feature/*"]
+  pull_request:
+    branches: [main, develop]
+  workflow_dispatch:
+
+env:
+  CARGO_TERM_COLOR: always
+  RUST_BACKTRACE: 1
+
+jobs:
+  # ============================================
+  # Formatting Check
+  # ============================================
+  fmt:
+    name: Format
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@nightly
+        with:
+          components: rustfmt
+      - run: cargo +nightly fmt --all -- --check
+
+  # ============================================
+  # Clippy Lints
+  # ============================================
+  clippy:
+    name: Clippy
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+        with:
+          components: clippy
+      - uses: Swatinem/rust-cache@v2
+      - name: Clippy (all features)
+        run: cargo clippy --workspace --all-features --all-targets -- -D warnings
+      - name: Clippy (no default features)
+        run: cargo clippy --workspace --no-default-features -- -D warnings
+
+  # ============================================
+  # Tests (Multi-Platform)
+  # ============================================
+  test:
+    name: Test (${{ matrix.os }})
+    runs-on: ${{ matrix.os }}
+    strategy:
+      fail-fast: false
+      matrix:
+        os: [ubuntu-latest, macos-latest, windows-latest]
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+      - uses: Swatinem/rust-cache@v2
+        with:
+          key: ${{ matrix.os }}
+      - uses: taiki-e/install-action@nextest
+
+      - name: Run tests
+        run: cargo nextest run --workspace --all-features
+
+      - name: Run doc tests
+        run: cargo test --doc --workspace
+
+  # ============================================
+  # Feature Combinations
+  # ============================================
+  features:
+    name: Feature Matrix
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+      - uses: Swatinem/rust-cache@v2
+
+      - name: Check no default features
+        run: cargo check --workspace --no-default-features
+
+      - name: Check all features
+        run: cargo check --workspace --all-features
+
+      - name: Check individual features
+        run: |
+          # Core features
+          cargo check -p laminar-core --no-default-features
+          cargo check -p laminar-core --features io-uring
+          cargo check -p laminar-core --features hwloc
+          cargo check -p laminar-core --features xdp
+
+          # Connector features
+          cargo check -p laminar-connectors --no-default-features
+          cargo check -p laminar-connectors --features kafka
+          cargo check -p laminar-connectors --features postgres-cdc
+          cargo check -p laminar-connectors --features postgres-sink
+          cargo check -p laminar-connectors --features mysql-cdc
+
+  # ============================================
+  # MSRV Check
+  # ============================================
+  msrv:
+    name: MSRV
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - name: Extract MSRV
+        id: msrv
+        run: |
+          MSRV=$(grep -m1 'rust-version' Cargo.toml | cut -d'"' -f2)
+          echo "version=$MSRV" >> $GITHUB_OUTPUT
+      - uses: dtolnay/rust-toolchain@master
+        with:
+          toolchain: ${{ steps.msrv.outputs.version }}
+      - uses: Swatinem/rust-cache@v2
+      - run: cargo check --workspace --all-features
+
+  # ============================================
+  # Documentation
+  # ============================================
+  docs:
+    name: Documentation
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+      - uses: Swatinem/rust-cache@v2
+      - name: Build docs
+        run: cargo doc --workspace --no-deps --all-features
+        env:
+          RUSTDOCFLAGS: "-D warnings --cfg docsrs"
+
+  # ============================================
+  # Security Audit
+  # ============================================
+  audit:
+    name: Security Audit
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: taiki-e/install-action@cargo-audit
+      - run: cargo audit
+        continue-on-error: true  # Advisory only until deps stabilize
+
+  # ============================================
+  # Dependency Licenses
+  # ============================================
+  deny:
+    name: Cargo Deny
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: EmbarkStudios/cargo-deny-action@v1
+        with:
+          arguments: --workspace --all-features
+        continue-on-error: true  # Advisory only until deny.toml is tuned
+
+  # ============================================
+  # Miri (Unsafe Code Verification)
+  # ============================================
+  miri:
+    name: Miri
+    runs-on: ubuntu-latest
+    # Only run on main/develop to save CI time
+    if: github.ref == 'refs/heads/main' || github.ref == 'refs/heads/develop'
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@nightly
+        with:
+          components: miri
+      - uses: Swatinem/rust-cache@v2
+      - name: Setup Miri
+        run: cargo miri setup
+      - name: Run Miri on core
+        run: |
+          cargo miri test -p laminar-core --lib -- \
+            --skip test_tpc \
+            --skip test_numa \
+            --skip test_io_uring \
+            --skip test_xdp
+        env:
+          MIRIFLAGS: "-Zmiri-disable-isolation"
+        continue-on-error: true
+
+  # ============================================
+  # Build Release Artifacts
+  # ============================================
+  build:
+    name: Build (${{ matrix.os }})
+    runs-on: ${{ matrix.os }}
+    strategy:
+      fail-fast: false
+      matrix:
+        os: [ubuntu-latest, macos-latest, windows-latest]
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+      - uses: Swatinem/rust-cache@v2
+        with:
+          key: ${{ matrix.os }}-release
+      - name: Build release
+        run: cargo build --workspace --release --all-features
+
+  # ============================================
+  # CI Success Gate
+  # ============================================
+  ci-success:
+    name: CI Success
+    needs: [fmt, clippy, test, features, msrv, docs, build]
+    runs-on: ubuntu-latest
+    if: always()
+    steps:
+      - name: Check all jobs passed
+        run: |
+          if [[ "${{ needs.fmt.result }}" != "success" ]] || \
+             [[ "${{ needs.clippy.result }}" != "success" ]] || \
+             [[ "${{ needs.test.result }}" != "success" ]] || \
+             [[ "${{ needs.features.result }}" != "success" ]] || \
+             [[ "${{ needs.msrv.result }}" != "success" ]] || \
+             [[ "${{ needs.docs.result }}" != "success" ]] || \
+             [[ "${{ needs.build.result }}" != "success" ]]; then
+            echo "One or more required jobs failed"
+            exit 1
+          fi
+          echo "All CI checks passed!"

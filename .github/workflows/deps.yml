@@ -1,0 +1,113 @@
+name: Dependencies
+
+on:
+  schedule:
+    - cron: '0 0 * * 0'  # Weekly on Sunday
+  workflow_dispatch:
+
+permissions:
+  contents: write
+  pull-requests: write
+
+jobs:
+  check:
+    name: Check for Updates
+    runs-on: ubuntu-latest
+    outputs:
+      has_updates: ${{ steps.check.outputs.has_updates }}
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+      - uses: Swatinem/rust-cache@v2
+
+      - name: Install cargo-outdated
+        run: cargo install cargo-outdated
+
+      - name: Check for outdated dependencies
+        id: check
+        run: |
+          echo "## Dependency Report" > deps_report.md
+          echo "" >> deps_report.md
+
+          echo "### Outdated Dependencies" >> deps_report.md
+          echo "\`\`\`" >> deps_report.md
+          cargo outdated --workspace --root-deps-only 2>&1 | tee -a deps_report.md
+          echo "\`\`\`" >> deps_report.md
+
+          # Check if there are updates
+          if cargo outdated --workspace --root-deps-only 2>&1 | grep -q "^Name"; then
+            echo "has_updates=true" >> $GITHUB_OUTPUT
+          else
+            echo "has_updates=false" >> $GITHUB_OUTPUT
+          fi
+
+      - name: Upload report
+        uses: actions/upload-artifact@v4
+        with:
+          name: dependency-report
+          path: deps_report.md
+
+  update:
+    name: Create Update PR
+    needs: check
+    runs-on: ubuntu-latest
+    if: needs.check.outputs.has_updates == 'true'
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+      - uses: Swatinem/rust-cache@v2
+
+      - name: Update dependencies
+        run: cargo update
+
+      - name: Check for changes
+        id: changes
+        run: |
+          if git diff --quiet Cargo.lock; then
+            echo "has_changes=false" >> $GITHUB_OUTPUT
+          else
+            echo "has_changes=true" >> $GITHUB_OUTPUT
+          fi
+
+      - name: Create Pull Request
+        if: steps.changes.outputs.has_changes == 'true'
+        uses: peter-evans/create-pull-request@v6
+        with:
+          token: ${{ secrets.GITHUB_TOKEN }}
+          commit-message: "chore(deps): update dependencies"
+          title: "chore(deps): weekly dependency updates"
+          body: |
+            ## Automated Dependency Update
+
+            This PR updates dependencies to their latest compatible versions.
+
+            ### Changes
+            - Updated `Cargo.lock` with latest dependency versions
+
+            ### Checklist
+            - [ ] CI passes
+            - [ ] No breaking changes
+            - [ ] Benchmarks show no regression
+
+            ---
+            *This PR was automatically created by the dependency update workflow.*
+          branch: deps/weekly-update
+          delete-branch: true
+          labels: |
+            dependencies
+            automated
+
+  audit:
+    name: Security Audit
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: taiki-e/install-action@cargo-audit
+
+      - name: Run security audit
+        run: |
+          echo "## Security Audit" >> $GITHUB_STEP_SUMMARY
+          echo "" >> $GITHUB_STEP_SUMMARY
+          echo "\`\`\`" >> $GITHUB_STEP_SUMMARY
+          cargo audit 2>&1 | tee -a $GITHUB_STEP_SUMMARY || true
+          echo "\`\`\`" >> $GITHUB_STEP_SUMMARY

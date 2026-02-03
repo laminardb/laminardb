@@ -1,0 +1,21 @@
+# .github/CODEOWNERS
+# Default owners for everything
+* @laminardb/core-team
+
+# CI/CD
+/.github/ @laminardb/devops
+
+# Core crates need extra review
+/crates/laminar-core/ @laminardb/core-team @laminardb/performance
+
+# SQL crate
+/crates/laminar-sql/ @laminardb/core-team
+
+# Storage crate
+/crates/laminar-storage/ @laminardb/core-team
+
+# Connectors
+/crates/laminar-connectors/ @laminardb/core-team @laminardb/integrations
+
+# Documentation
+/docs/ @laminardb/docs-team

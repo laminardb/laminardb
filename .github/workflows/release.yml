@@ -1,0 +1,294 @@
+name: Release
+
+on:
+  push:
+    tags: ['v*']
+
+permissions:
+  contents: write
+  id-token: write
+
+env:
+  CARGO_TERM_COLOR: always
+
+jobs:
+  # ============================================
+  # Verify Tag Matches Cargo.toml
+  # ============================================
+  verify:
+    name: Verify Release
+    runs-on: ubuntu-latest
+    outputs:
+      version: ${{ steps.version.outputs.version }}
+      prerelease: ${{ steps.version.outputs.prerelease }}
+    steps:
+      - uses: actions/checkout@v4
+      - name: Extract and verify version
+        id: version
+        run: |
+          TAG_VERSION="${GITHUB_REF_NAME#v}"
+          CARGO_VERSION=$(grep -m1 '^version' Cargo.toml | cut -d'"' -f2)
+
+          if [ "$TAG_VERSION" != "$CARGO_VERSION" ]; then
+            echo "::error::Tag version ($TAG_VERSION) doesn't match Cargo.toml ($CARGO_VERSION)"
+            exit 1
+          fi
+
+          echo "version=$TAG_VERSION" >> $GITHUB_OUTPUT
+
+          # Check if prerelease
+          if [[ "$TAG_VERSION" == *"-"* ]]; then
+            echo "prerelease=true" >> $GITHUB_OUTPUT
+          else
+            echo "prerelease=false" >> $GITHUB_OUTPUT
+          fi
+
+  # ============================================
+  # Run CI First
+  # ============================================
+  ci:
+    name: CI
+    needs: verify
+    uses: ./.github/workflows/ci.yml
+
+  # ============================================
+  # Build Release Artifacts
+  # ============================================
+  build:
+    name: Build (${{ matrix.target }})
+    needs: [verify, ci]
+    runs-on: ${{ matrix.os }}
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - os: ubuntu-latest
+            target: x86_64-unknown-linux-gnu
+            cross: false
+          - os: ubuntu-latest
+            target: aarch64-unknown-linux-gnu
+            cross: true
+          - os: ubuntu-latest
+            target: x86_64-unknown-linux-musl
+            cross: true
+          - os: macos-13  # Intel
+            target: x86_64-apple-darwin
+            cross: false
+          - os: macos-14  # ARM64
+            target: aarch64-apple-darwin
+            cross: false
+          - os: windows-latest
+            target: x86_64-pc-windows-msvc
+            cross: false
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+        with:
+          targets: ${{ matrix.target }}
+      - uses: Swatinem/rust-cache@v2
+        with:
+          key: release-${{ matrix.target }}
+
+      - name: Install cross
+        if: matrix.cross
+        run: cargo install cross --git https://github.com/cross-rs/cross
+
+      - name: Build (cross)
+        if: matrix.cross
+        run: cross build --workspace --release --target ${{ matrix.target }}
+
+      - name: Build (native)
+        if: "!matrix.cross"
+        run: cargo build --workspace --release --target ${{ matrix.target }}
+
+      - name: Package artifacts
+        shell: bash
+        run: |
+          VERSION="${{ needs.verify.outputs.version }}"
+          mkdir -p artifacts
+
+          # Copy release binaries
+          if [[ "${{ matrix.os }}" == "windows-latest" ]]; then
+            cp target/${{ matrix.target }}/release/*.exe artifacts/ 2>/dev/null || true
+            cp target/${{ matrix.target }}/release/*.dll artifacts/ 2>/dev/null || true
+          else
+            # Copy library files
+            cp target/${{ matrix.target }}/release/*.so artifacts/ 2>/dev/null || true
+            cp target/${{ matrix.target }}/release/*.dylib artifacts/ 2>/dev/null || true
+            cp target/${{ matrix.target }}/release/*.a artifacts/ 2>/dev/null || true
+          fi
+
+          # Create archive
+          cd artifacts
+          if [[ "${{ matrix.os }}" == "windows-latest" ]]; then
+            7z a ../laminardb-${{ matrix.target }}-v${VERSION}.zip *
+          else
+            tar -czvf ../laminardb-${{ matrix.target }}-v${VERSION}.tar.gz *
+          fi
+
+      - name: Upload artifact
+        uses: actions/upload-artifact@v4
+        with:
+          name: build-${{ matrix.target }}
+          path: laminardb-${{ matrix.target }}-v*.tar.gz
+          if-no-files-found: ignore
+
+      - name: Upload artifact (Windows)
+        if: matrix.os == 'windows-latest'
+        uses: actions/upload-artifact@v4
+        with:
+          name: build-${{ matrix.target }}
+          path: laminardb-${{ matrix.target }}-v*.zip
+
+  # ============================================
+  # Create GitHub Release
+  # ============================================
+  release:
+    name: Create Release
+    needs: [verify, build]
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Download all artifacts
+        uses: actions/download-artifact@v4
+        with:
+          path: artifacts/
+          pattern: build-*
+          merge-multiple: true
+
+      - name: Generate checksums
+        run: |
+          cd artifacts
+          sha256sum * > checksums.sha256
+          cat checksums.sha256
+
+      - name: Extract release notes
+        id: notes
+        run: |
+          VERSION="${{ needs.verify.outputs.version }}"
+          if [ -f CHANGELOG.md ]; then
+            awk "/^## \[?${VERSION}\]?/,/^## \[/" CHANGELOG.md | head -n -1 > notes.md || true
+          fi
+          if [ ! -s notes.md ]; then
+            echo "Release v${VERSION}" > notes.md
+            echo "" >> notes.md
+            echo "See [CHANGELOG.md](CHANGELOG.md) for details." >> notes.md
+          fi
+
+      - name: Create GitHub Release
+        uses: softprops/action-gh-release@v2
+        with:
+          draft: false
+          prerelease: ${{ needs.verify.outputs.prerelease == 'true' }}
+          body_path: notes.md
+          files: |
+            artifacts/laminardb-*.tar.gz
+            artifacts/laminardb-*.zip
+            artifacts/checksums.sha256
+        env:
+          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+
+  # ============================================
+  # Publish to crates.io
+  # ============================================
+  publish:
+    name: Publish to crates.io
+    needs: [verify, release]
+    runs-on: ubuntu-latest
+    if: needs.verify.outputs.prerelease == 'false'
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+      - uses: Swatinem/rust-cache@v2
+
+      # Publish in dependency order
+      - name: Publish laminar-derive
+        run: cargo publish -p laminar-derive --token ${{ secrets.CARGO_REGISTRY_TOKEN }}
+        continue-on-error: true
+
+      - name: Wait for index
+        run: sleep 30
+
+      - name: Publish laminar-core
+        run: cargo publish -p laminar-core --token ${{ secrets.CARGO_REGISTRY_TOKEN }}
+        continue-on-error: true
+
+      - name: Wait for index
+        run: sleep 30
+
+      - name: Publish laminar-sql
+        run: cargo publish -p laminar-sql --token ${{ secrets.CARGO_REGISTRY_TOKEN }}
+        continue-on-error: true
+
+      - name: Wait for index
+        run: sleep 30
+
+      - name: Publish laminar-storage
+        run: cargo publish -p laminar-storage --token ${{ secrets.CARGO_REGISTRY_TOKEN }}
+        continue-on-error: true
+
+      - name: Wait for index
+        run: sleep 30
+
+      - name: Publish laminar-connectors
+        run: cargo publish -p laminar-connectors --token ${{ secrets.CARGO_REGISTRY_TOKEN }}
+        continue-on-error: true
+
+      - name: Wait for index
+        run: sleep 30
+
+      - name: Publish laminar-db
+        run: cargo publish -p laminar-db --token ${{ secrets.CARGO_REGISTRY_TOKEN }}
+        continue-on-error: true
+
+  # ============================================
+  # Update Compatibility Manifest
+  # ============================================
+  update-manifest:
+    name: Update Compatibility Manifest
+    needs: [verify, release]
+    runs-on: ubuntu-latest
+    permissions:
+      contents: write
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          ref: main
+          token: ${{ secrets.GITHUB_TOKEN }}
+
+      - name: Download checksums
+        run: |
+          gh release download ${{ github.ref_name }} --pattern checksums.sha256
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+
+      - name: Update compatibility.json
+        run: |
+          VERSION="${{ needs.verify.outputs.version }}"
+
+          cat > compatibility.json << EOF
+          {
+            "latest_version": "${VERSION}",
+            "abi_version": 1,
+            "released_at": "$(date -u +%Y-%m-%dT%H:%M:%SZ)",
+            "minimum_supported": "0.1.0",
+            "platforms": [
+              "x86_64-unknown-linux-gnu",
+              "aarch64-unknown-linux-gnu",
+              "x86_64-unknown-linux-musl",
+              "x86_64-apple-darwin",
+              "aarch64-apple-darwin",
+              "x86_64-pc-windows-msvc"
+            ],
+            "download_base_url": "https://github.com/${{ github.repository }}/releases/download/v${VERSION}"
+          }
+          EOF
+
+      - name: Commit and push
+        run: |
+          git config user.name "github-actions[bot]"
+          git config user.email "github-actions[bot]@users.noreply.github.com"
+          git add compatibility.json
+          git commit -m "chore: update compatibility.json for v${{ needs.verify.outputs.version }}" || exit 0
+          git push
