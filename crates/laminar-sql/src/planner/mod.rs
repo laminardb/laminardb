@@ -4,6 +4,8 @@
 //! It integrates with the parser and translator modules to produce complete
 //! operator configurations for Ring 0 execution.
 
+pub mod channel_derivation;
+
 use std::collections::HashMap;
 
 use datafusion::logical_expr::LogicalPlan;

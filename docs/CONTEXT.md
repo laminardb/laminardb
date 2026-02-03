@@ -8,6 +8,26 @@
 **Date**: 2026-02-03
 
 ### What Was Accomplished
+- **F-STREAM-010: Broadcast Channel** - IMPLEMENTATION COMPLETE (42 new tests)
+  - `streaming/broadcast.rs`: BroadcastChannel<T> (shared ring buffer SPMC), BroadcastConfig, BroadcastConfigBuilder, SlowSubscriberPolicy (Block/DropSlow/SkipForSlow), SubscriberInfo, BroadcastError (31 tests)
+  - `planner/channel_derivation.rs`: DerivedChannelType (Spsc/Broadcast), derive_channel_types(), SourceDefinition, MvDefinition, analyze_mv_sources(), derive_channel_types_detailed() (11 tests)
+  - Key design: Users never specify broadcast mode - derived from query plan analysis when multiple MVs read from same source
+  - Features: per-subscriber cursors, lag tracking, configurable slow subscriber policies, dynamic subscribe/unsubscribe
+  - All clippy clean with `-D warnings`, 2350 total tests pass
+
+Previous session (2026-02-03):
+- **F034: Connector SDK** - IMPLEMENTATION COMPLETE (68 new tests, 427 total connector-base tests)
+  - `sdk/retry.rs`: RetryPolicy (exponential backoff, jitter), with_retry async helper, with_retry_and_handler, CircuitBreaker (Closed/Open/HalfOpen state machine), with_circuit_breaker helper (18 tests)
+  - `sdk/rate_limit.rs`: RateLimiter trait, TokenBucket (tokens/sec + burst), LeakyBucket (requests/sec + queue), NoopRateLimiter (13 tests)
+  - `sdk/harness.rs`: ConnectorTestHarness with test_source, test_sink, test_checkpoint_recovery, test_exactly_once methods; TestSourceConnector and TestSinkConnector with configurable batches/errors/delays (12 tests)
+  - `sdk/builder.rs`: SourceConnectorBuilder and SinkConnectorBuilder for fluent connector configuration with retry policies, rate limiters, and circuit breakers; ConfiguredSource and ConfiguredSink wrappers (8 tests)
+  - `sdk/defaults.rs`: register_all_connectors(), register_mock_connectors(), default_registry() with auto-registration of mock/delta-lake/iceberg/kafka/postgres/mysql connectors based on features (7 tests)
+  - `sdk/schema.rs`: SchemaDiscoveryHints (type_hints, nullable_fields, field_names, prefer_larger_types, empty_as_null), infer_schema_from_samples() for JSON/CSV formats (10 tests)
+  - `sdk/mod.rs`: Re-exports all SDK types
+  - `laminar-derive/connector_config.rs`: #[derive(ConnectorConfig)] macro generates from_config(), validate(), config_keys() from struct fields with #[config(key, required, default, env, description, duration_ms)] attributes
+  - All clippy clean with `-D warnings`, 2308 total tests pass
+
+Previous session (2026-02-03):
 - **F032: Apache Iceberg Sink** - IMPLEMENTATION COMPLETE (103 new tests, 359 total connector-base tests)
   - `lakehouse/iceberg_config.rs`: IcebergSinkConfig with IcebergCatalogType (REST/Glue/Hive/Memory), IcebergWriteMode, IcebergPartitionField, IcebergTransform (Identity/Bucket/Truncate/Year/Month/Day/Hour), MaintenanceConfig, SortField, IcebergFileFormat enums, from_config() parsing with parentheses-aware partition spec splitting, validation (49 tests)
   - `lakehouse/iceberg_metrics.rs`: IcebergSinkMetrics with 11 atomic counters (rows, bytes, flushes, commits, errors, rollbacks, data_files, delete_files, changelog_deletes, snapshot_id, table_version), MetricsSnapshot (9 tests)
@@ -144,10 +164,10 @@ Previous session (2026-01-28):
 - Performance Audit: ALL 10 issues fixed
 - F074-F077: Aggregation Semantics Enhancement - COMPLETE (219 tests)
 
-**Total tests**: 1241 core + 401 sql + 115 storage + 120 laminar-db + 359 connectors + 4 demo = 2240 (base), +84 postgres-sink-only + 107 postgres-cdc-only + 118 kafka-only = 2549 (with feature flags)
+**Total tests**: 1272 core + 412 sql + 115 storage + 120 laminar-db + 427 connectors + 4 demo = 2350 (base), +84 postgres-sink-only + 107 postgres-cdc-only + 118 kafka-only = 2659 (with feature flags)
 
 ### Where We Left Off
-**Phase 3 Connectors & Integration: 34/48 features COMPLETE (71%)**
+**Phase 3 Connectors & Integration: 36/48 features COMPLETE (75%)**
 - Streaming API core complete (F-STREAM-001 to F-STREAM-007, F-STREAM-013)
 - Developer API overhaul complete (laminar-derive, laminar-db crates)
 - DAG pipeline complete (F-DAG-001 to F-DAG-007)
@@ -157,18 +177,20 @@ Previous session (2026-01-28):
 - PostgreSQL Sink complete (F027B) — 84 tests, COPY BINARY + upsert + exactly-once
 - MySQL CDC Source complete (F028) — 119 tests, binlog decoder + GTID + Z-set changelog
 - Delta Lake Sink business logic complete (F031) — 73 tests, buffering + epoch management + changelog splitting
-- **Apache Iceberg Sink business logic complete (F032)** — 103 tests, REST/Glue/Hive catalogs + partition transforms + equality deletes
+- Apache Iceberg Sink business logic complete (F032) — 103 tests, REST/Glue/Hive catalogs + partition transforms + equality deletes
+- **Connector SDK complete (F034)** — 68 tests, retry/circuit breaker + rate limiting + test harness + builders + defaults + schema discovery
+- **Broadcast Channel complete (F-STREAM-010)** — 42 tests, shared ring buffer SPMC + query plan derivation + slow subscriber policies
 - SQL & MV Integration complete (F-DAG-005) — 18 new tests, DAG from MvRegistry, watermarks, changelog
 - Connector Bridge complete (F-DAG-006) — 25 new tests, source/sink bridge + runtime orchestration
 - Performance Validation complete (F-DAG-007) — 16 benchmarks, performance audit + optimizations
 - Reactive Subscription System complete (F-SUB-001 to F-SUB-008) — 8 features, 10 new modules
 - Cloud Storage Infrastructure complete (F-CLOUD-001/002/003) — 82 tests, integrated with Delta Lake Sink
 - Delta Lake I/O extension specs created (F031A/B/C/D) — blocked by deltalake crate
-- Next: F034 Connector SDK or F029 MongoDB CDC Source
+- Next: F029 MongoDB CDC Source or F033 Parquet File Source
 
 ### Immediate Next Steps
-1. F034: Connector SDK
-2. F029: MongoDB CDC Source
+1. F029: MongoDB CDC Source
+2. F033: Parquet File Source
 3. F028A: MySQL CDC binlog I/O (when mysql_async can be added without OpenSSL issues)
 4. F031A/B/C/D: Delta Lake I/O (when deltalake crate version aligns)
 5. F032A: Iceberg I/O (when iceberg-rust crate can be added)

@@ -111,6 +111,7 @@
 //! - **`DropOldest`**: Overwrite oldest data (real-time systems)
 //! - **Reject**: Return error immediately (caller decides)
 
+pub mod broadcast;
 pub mod channel;
 pub mod checkpoint;
 pub mod config;
@@ -133,3 +134,9 @@ pub use ring_buffer::RingBuffer;
 pub use sink::{Sink, SinkMode};
 pub use source::{create, create_with_config, Record, Source};
 pub use subscription::{Subscription, SubscriptionMessage};
+
+// Broadcast channel re-exports
+pub use broadcast::{
+    BroadcastChannel, BroadcastConfig, BroadcastConfigBuilder, BroadcastError,
+    SlowSubscriberPolicy, SubscriberInfo,
+};

@@ -7,10 +7,10 @@
 | Phase 1 | 12 | 0 | 0 | 0 | 12 |
 | Phase 1.5 | 1 | 0 | 0 | 0 | 1 |
 | Phase 2 | 34 | 0 | 0 | 0 | 34 |
-| Phase 3 | 48 | 14 | 0 | 0 | 34 |
+| Phase 3 | 48 | 12 | 0 | 0 | 36 |
 | Phase 4 | 11 | 11 | 0 | 0 | 0 |
 | Phase 5 | 10 | 10 | 0 | 0 | 0 |
-| **Total** | **116** | **35** | **0** | **0** | **81** |
+| **Total** | **116** | **33** | **0** | **0** | **83** |
 
 ## Status Legend
 
@@ -101,7 +101,7 @@
 
 ## Phase 3: Connectors & Integration
 
-> **Status**: 34/48 features complete (71%)
+> **Status**: 36/48 features complete (75%)
 
 ### Streaming API ✅
 
@@ -116,7 +116,7 @@ See [Streaming API Index](phase-3/streaming/INDEX.md).
 | F-STREAM-005 | Sink | ✅ | [Link](phase-3/streaming/F-STREAM-005-sink.md) |
 | F-STREAM-006 | Subscription | ✅ | [Link](phase-3/streaming/F-STREAM-006-subscription.md) |
 | F-STREAM-007 | SQL DDL | ✅ | [Link](phase-3/streaming/F-STREAM-007-sql-ddl.md) |
-| F-STREAM-010 | Broadcast Channel | 📝 | [Link](phase-3/streaming/F-STREAM-010-broadcast-channel.md) |
+| F-STREAM-010 | Broadcast Channel | ✅ | [Link](phase-3/streaming/F-STREAM-010-broadcast-channel.md) |
 | F-STREAM-013 | Checkpointing | ✅ | [Link](phase-3/streaming/F-STREAM-013-checkpointing.md) |
 
 ### DAG Pipeline ✅
@@ -176,7 +176,7 @@ See [Cloud Storage Index](phase-3/cloud/INDEX.md).
 | F031D | Delta Lake Schema Evolution | 📝 | [Link](phase-3/F031D-delta-lake-schema-evolution.md) |
 | F032 | Iceberg Sink | ✅ | [Link](phase-3/F032-iceberg-sink.md) |
 | F033 | Parquet File Source | 📝 | [Link](phase-3/F033-parquet-source.md) |
-| F034 | Connector SDK | 📝 | [Link](phase-3/F034-connector-sdk.md) |
+| F034 | Connector SDK | ✅ | [Link](phase-3/F034-connector-sdk.md) |
 | F058 | Async State Access | 📝 | [Link](phase-3/F058-async-state-access.md) |
 | F061 | Historical Backfill | 📝 | [Link](phase-3/F061-historical-backfill.md) |
 
