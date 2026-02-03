@@ -18,6 +18,9 @@
 use std::cmp::Ordering;
 use std::fmt;
 
+#[cfg(any(target_os = "linux", target_os = "macos"))]
+use libc;
+
 /// Linux kernel version.
 ///
 /// Parsed from `/proc/version` or `uname -r`.

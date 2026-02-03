@@ -21,7 +21,7 @@ jobs:
       - uses: taiki-e/install-action@cargo-llvm-cov
 
       - name: Install system dependencies
-        run: sudo apt-get update && sudo apt-get install -y libhwloc-dev libelf-dev zlib1g-dev
+        run: sudo apt-get update && sudo apt-get install -y libhwloc-dev libelf-dev zlib1g-dev libcurl4-openssl-dev cmake pkg-config libsasl2-dev
 
       - name: Generate coverage
         run: |

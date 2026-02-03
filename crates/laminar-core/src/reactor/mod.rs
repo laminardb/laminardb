@@ -388,6 +388,7 @@ impl Reactor {
     /// # Errors
     ///
     /// Returns `ReactorError` if CPU affinity cannot be set (platform-specific)
+    #[allow(unused_variables)]
     pub fn set_cpu_affinity(&self) -> Result<(), ReactorError> {
         if let Some(cpu_id) = self.config.cpu_affinity {
             #[cfg(target_os = "linux")]
