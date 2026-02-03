@@ -7,10 +7,10 @@
 | Phase 1 | 12 | 0 | 0 | 0 | 12 |
 | Phase 1.5 | 1 | 0 | 0 | 0 | 1 |
 | Phase 2 | 34 | 0 | 0 | 0 | 34 |
-| Phase 3 | 48 | 15 | 0 | 0 | 33 |
+| Phase 3 | 48 | 14 | 0 | 0 | 34 |
 | Phase 4 | 11 | 11 | 0 | 0 | 0 |
 | Phase 5 | 10 | 10 | 0 | 0 | 0 |
-| **Total** | **116** | **36** | **0** | **0** | **80** |
+| **Total** | **116** | **35** | **0** | **0** | **81** |
 
 ## Status Legend
 
@@ -101,7 +101,7 @@
 
 ## Phase 3: Connectors & Integration
 
-> **Status**: 33/48 features complete (69%)
+> **Status**: 34/48 features complete (71%)
 
 ### Streaming API ✅
 
@@ -174,7 +174,7 @@ See [Cloud Storage Index](phase-3/cloud/INDEX.md).
 | F031B | Delta Lake Recovery | 📝 | [Link](phase-3/F031B-delta-lake-recovery.md) |
 | F031C | Delta Lake Compaction | 📝 | [Link](phase-3/F031C-delta-lake-compaction.md) |
 | F031D | Delta Lake Schema Evolution | 📝 | [Link](phase-3/F031D-delta-lake-schema-evolution.md) |
-| F032 | Iceberg Sink | 📝 | [Link](phase-3/F032-iceberg-sink.md) |
+| F032 | Iceberg Sink | ✅ | [Link](phase-3/F032-iceberg-sink.md) |
 | F033 | Parquet File Source | 📝 | [Link](phase-3/F033-parquet-source.md) |
 | F034 | Connector SDK | 📝 | [Link](phase-3/F034-connector-sdk.md) |
 | F058 | Async State Access | 📝 | [Link](phase-3/F058-async-state-access.md) |
@@ -241,7 +241,7 @@ Remaining work for Phase 3:
 |-----|---------|----------|-------|
 | Delta Lake I/O | F031A-D | P0/P1 | Blocked by deltalake crate version |
 | MySQL CDC I/O | F028A | P1 | Business logic done; I/O blocked by mysql_async/OpenSSL |
-| Iceberg Sink | F032 | P1 | Next connector |
+| Iceberg I/O | F032A | P1 | Business logic done; iceberg-rust crate deferred |
 | Connector SDK | F034 | P1 | Developer tooling |
 
 For historical gap analysis, see the [research documents](../research/).

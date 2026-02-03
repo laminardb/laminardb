@@ -8,6 +8,17 @@
 **Date**: 2026-02-03
 
 ### What Was Accomplished
+- **F032: Apache Iceberg Sink** - IMPLEMENTATION COMPLETE (103 new tests, 359 total connector-base tests)
+  - `lakehouse/iceberg_config.rs`: IcebergSinkConfig with IcebergCatalogType (REST/Glue/Hive/Memory), IcebergWriteMode, IcebergPartitionField, IcebergTransform (Identity/Bucket/Truncate/Year/Month/Day/Hour), MaintenanceConfig, SortField, IcebergFileFormat enums, from_config() parsing with parentheses-aware partition spec splitting, validation (49 tests)
+  - `lakehouse/iceberg_metrics.rs`: IcebergSinkMetrics with 11 atomic counters (rows, bytes, flushes, commits, errors, rollbacks, data_files, delete_files, changelog_deletes, snapshot_id, table_version), MetricsSnapshot (9 tests)
+  - `lakehouse/iceberg.rs`: IcebergSink implementing SinkConnector — buffering with size/time/rows flush triggers, epoch management with exactly-once skip, Z-set changelog splitting with Iceberg v2 equality delete file support, upsert mode, health checks, capabilities (45 tests)
+  - `lakehouse/mod.rs`: Re-exports, register_iceberg_sink() and register_lakehouse_sinks() factories, 33 config key specs including catalog, partition, maintenance, and cloud storage options (6 tests)
+  - Follows Delta Lake Sink pattern: all business logic without actual iceberg-rust crate dependency
+  - Supports REST, Glue, Hive, and Memory catalogs
+  - Iceberg-native partition transforms: IDENTITY, BUCKET(n), TRUNCATE(w), YEAR, MONTH, DAY, HOUR
+  - All clippy clean with `-D warnings`, 2240 total tests pass
+
+Previous session (2026-02-03):
 - **F028: MySQL CDC Source** - IMPLEMENTATION COMPLETE (119 new tests, 359 total connector-base tests)
   - `cdc/mysql/config.rs`: MySqlCdcConfig with SslMode, SnapshotMode enums, from_config() parsing, validation (15 tests)
   - `cdc/mysql/gtid.rs`: Gtid, GtidRange, GtidSet types with parsing and ordering (21 tests)
@@ -133,10 +144,10 @@ Previous session (2026-01-28):
 - Performance Audit: ALL 10 issues fixed
 - F074-F077: Aggregation Semantics Enhancement - COMPLETE (219 tests)
 
-**Total tests**: 1241 core + 401 sql + 115 storage + 120 laminar-db + 359 connectors-base + 84 postgres-sink-only + 107 postgres-cdc-only + 118 kafka-only = 2545
+**Total tests**: 1241 core + 401 sql + 115 storage + 120 laminar-db + 359 connectors + 4 demo = 2240 (base), +84 postgres-sink-only + 107 postgres-cdc-only + 118 kafka-only = 2549 (with feature flags)
 
 ### Where We Left Off
-**Phase 3 Connectors & Integration: 33/48 features COMPLETE (69%)**
+**Phase 3 Connectors & Integration: 34/48 features COMPLETE (71%)**
 - Streaming API core complete (F-STREAM-001 to F-STREAM-007, F-STREAM-013)
 - Developer API overhaul complete (laminar-derive, laminar-db crates)
 - DAG pipeline complete (F-DAG-001 to F-DAG-007)
@@ -144,25 +155,28 @@ Previous session (2026-01-28):
 - Kafka Sink Connector complete (F026)
 - PostgreSQL CDC Source complete (F027) — 107 tests, full pgoutput decoder
 - PostgreSQL Sink complete (F027B) — 84 tests, COPY BINARY + upsert + exactly-once
-- **MySQL CDC Source complete (F028)** — 119 tests, binlog decoder + GTID + Z-set changelog
+- MySQL CDC Source complete (F028) — 119 tests, binlog decoder + GTID + Z-set changelog
 - Delta Lake Sink business logic complete (F031) — 73 tests, buffering + epoch management + changelog splitting
+- **Apache Iceberg Sink business logic complete (F032)** — 103 tests, REST/Glue/Hive catalogs + partition transforms + equality deletes
 - SQL & MV Integration complete (F-DAG-005) — 18 new tests, DAG from MvRegistry, watermarks, changelog
 - Connector Bridge complete (F-DAG-006) — 25 new tests, source/sink bridge + runtime orchestration
 - Performance Validation complete (F-DAG-007) — 16 benchmarks, performance audit + optimizations
 - Reactive Subscription System complete (F-SUB-001 to F-SUB-008) — 8 features, 10 new modules
 - Cloud Storage Infrastructure complete (F-CLOUD-001/002/003) — 82 tests, integrated with Delta Lake Sink
 - Delta Lake I/O extension specs created (F031A/B/C/D) — blocked by deltalake crate
-- Next: F032 Iceberg Sink or F034 Connector SDK
+- Next: F034 Connector SDK or F029 MongoDB CDC Source
 
 ### Immediate Next Steps
-1. F032: Iceberg Sink
-2. F034: Connector SDK
+1. F034: Connector SDK
+2. F029: MongoDB CDC Source
 3. F028A: MySQL CDC binlog I/O (when mysql_async can be added without OpenSSL issues)
 4. F031A/B/C/D: Delta Lake I/O (when deltalake crate version aligns)
+5. F032A: Iceberg I/O (when iceberg-rust crate can be added)
 
 ### Open Issues
 - **deltalake crate version**: Incompatible with workspace DataFusion version. F031A/B/C/D blocked until resolved. Track [delta-rs releases](https://github.com/delta-io/delta-rs/releases).
 - **mysql_async crate**: Requires OpenSSL on Windows. F028A (binlog I/O) deferred until dependency resolved. Business logic complete in F028.
+- **iceberg-rust crate**: Deferred until version compatible with workspace. Business logic complete in F032.
 - None currently blocking.
 
 ---
@@ -322,10 +336,13 @@ laminar-connectors/src/
     changelog         # CdcOperation, ChangeEvent, Z-set format, events_to_record_batch
     metrics           # MySqlCdcMetrics (11 atomic counters)
     source            # MySqlCdcSource (SourceConnector impl)
-  lakehouse/          # F031: Delta Lake Sink (Lakehouse connectors)
+  lakehouse/          # F031, F032: Lakehouse connectors (Delta Lake, Iceberg)
     delta             # DeltaLakeSink (SinkConnector impl, buffering + epoch + changelog)
     delta_config      # DeltaLakeSinkConfig, DeltaWriteMode, DeliveryGuarantee, CompactionConfig
     delta_metrics     # DeltaLakeSinkMetrics (9 AtomicU64 counters)
+    iceberg           # F032: IcebergSink (SinkConnector impl, buffering + epoch + equality deletes)
+    iceberg_config    # IcebergSinkConfig, IcebergCatalogType, IcebergWriteMode, IcebergTransform, IcebergPartitionField
+    iceberg_metrics   # IcebergSinkMetrics (11 AtomicU64 counters)
   storage/            # F-CLOUD-001/002/003: Cloud Storage Infrastructure
     provider          # StorageProvider enum (AwsS3, AzureAdls, Gcs, Local), detect() from URI
     resolver          # StorageCredentialResolver, resolve() + resolve_with_env(), env var fallback
