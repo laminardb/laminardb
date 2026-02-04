@@ -93,8 +93,7 @@ fn register_kafka(registry: &ConnectorRegistry) {
 
 #[cfg(feature = "postgres-cdc")]
 fn register_postgres_cdc(registry: &ConnectorRegistry) {
-    use crate::cdc::postgres::register_postgres_cdc_source;
-    register_postgres_cdc_source(registry);
+    crate::cdc::postgres::register_postgres_cdc(registry);
 }
 
 #[cfg(feature = "postgres-sink")]
