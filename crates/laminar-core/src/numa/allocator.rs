@@ -294,7 +294,11 @@ impl NumaAllocator {
 
     /// Bind memory to a specific NUMA node using mbind syscall.
     #[cfg(target_os = "linux")]
-    #[allow(clippy::unused_self, clippy::unnecessary_wraps, clippy::items_after_statements)]
+    #[allow(
+        clippy::unused_self,
+        clippy::unnecessary_wraps,
+        clippy::items_after_statements
+    )]
     fn bind_to_node(&self, ptr: *mut u8, size: usize, node: usize) -> Result<(), NumaError> {
         // MPOL_BIND = 2 - strictly bind to the specified nodes
         const MPOL_BIND: i32 = 2;
