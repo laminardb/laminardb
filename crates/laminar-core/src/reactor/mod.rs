@@ -405,7 +405,7 @@ impl Reactor {
                     CPU_ZERO(&mut set);
                     CPU_SET(cpu_id, &mut set);
 
-                    let result = sched_setaffinity(0, mem::size_of::<cpu_set_t>(), &set);
+                    let result = sched_setaffinity(0, mem::size_of::<cpu_set_t>(), &raw const set);
                     if result != 0 {
                         return Err(ReactorError::InitializationFailed(format!(
                             "Failed to set CPU affinity to core {}: {}",

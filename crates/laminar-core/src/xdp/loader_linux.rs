@@ -61,7 +61,7 @@ impl XdpLoader {
     ///
     /// Returns an error if:
     /// - XDP program file not found
-    /// - Permission denied (requires CAP_NET_ADMIN or root)
+    /// - Permission denied (requires `CAP_NET_ADMIN` or root)
     /// - Network interface not found
     /// - BPF program loading fails
     pub fn load_and_attach(config: &XdpConfig, num_cores: usize) -> Result<Self, XdpError> {
@@ -101,6 +101,7 @@ impl XdpLoader {
     }
 
     /// Creates an inactive loader (fallback mode).
+    #[allow(clippy::unnecessary_wraps)]
     fn create_inactive(config: &XdpConfig, num_cores: usize) -> Result<Self, XdpError> {
         Ok(Self {
             interface: config.interface.clone(),
@@ -136,12 +137,14 @@ impl XdpLoader {
             .ok_or_else(|| XdpError::MapNotFound("laminar_ingress program".to_string()))?;
 
         // Attach to interface
+        #[allow(clippy::cast_possible_wrap)]
         let _link = prog
             .attach_xdp(ifindex as i32)
             .map_err(|e: libbpf_rs::Error| XdpError::AttachFailed(e.to_string()))?;
 
         // Configure CPU map if present
         if let Some(cpu_map) = obj.maps_mut().find(|m| m.name() == "cpu_map") {
+            #[allow(clippy::cast_possible_truncation)]
             for cpu in 0..num_cores {
                 let key = (cpu as u32).to_ne_bytes();
                 // CpumapValue format: qsize as u32

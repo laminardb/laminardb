@@ -294,17 +294,18 @@ impl NumaAllocator {
 
     /// Bind memory to a specific NUMA node using mbind syscall.
     #[cfg(target_os = "linux")]
+    #[allow(clippy::unused_self, clippy::unnecessary_wraps, clippy::items_after_statements)]
     fn bind_to_node(&self, ptr: *mut u8, size: usize, node: usize) -> Result<(), NumaError> {
+        // MPOL_BIND = 2 - strictly bind to the specified nodes
+        const MPOL_BIND: i32 = 2;
+        // MPOL_MF_MOVE = 2 - move pages to the node if they're already faulted
+        const MPOL_MF_MOVE: u32 = 2;
+
         // Build nodemask - a bitmask where bit N is set if node N should be used
         let mut nodemask: u64 = 0;
         if node < 64 {
             nodemask = 1u64 << node;
         }
-
-        // MPOL_BIND = 2 - strictly bind to the specified nodes
-        const MPOL_BIND: i32 = 2;
-        // MPOL_MF_MOVE = 2 - move pages to the node if they're already faulted
-        const MPOL_MF_MOVE: u32 = 2;
 
         // SAFETY: mbind is a valid syscall when called with proper arguments
         let result = unsafe {
@@ -313,7 +314,7 @@ impl NumaAllocator {
                 ptr,
                 size,
                 MPOL_BIND,
-                &nodemask as *const u64,
+                &raw const nodemask,
                 64usize, // maxnode
                 MPOL_MF_MOVE,
             )
@@ -332,15 +333,16 @@ impl NumaAllocator {
 
     /// Bind memory interleaved across all nodes using mbind syscall.
     #[cfg(target_os = "linux")]
+    #[allow(clippy::unnecessary_wraps, clippy::items_after_statements)]
     fn bind_interleaved(&self, ptr: *mut u8, size: usize) -> Result<(), NumaError> {
+        // MPOL_INTERLEAVE = 3 - interleave pages across nodes
+        const MPOL_INTERLEAVE: i32 = 3;
+
         // Build nodemask with all nodes enabled
         let mut nodemask: u64 = 0;
         for node in 0..self.topology.num_nodes().min(64) {
             nodemask |= 1u64 << node;
         }
-
-        // MPOL_INTERLEAVE = 3 - interleave pages across nodes
-        const MPOL_INTERLEAVE: i32 = 3;
 
         // SAFETY: mbind is a valid syscall when called with proper arguments
         let result = unsafe {
@@ -349,7 +351,7 @@ impl NumaAllocator {
                 ptr,
                 size,
                 MPOL_INTERLEAVE,
-                &nodemask as *const u64,
+                &raw const nodemask,
                 64usize, // maxnode
                 0u32,    // flags
             )
@@ -384,13 +386,14 @@ impl NumaAllocator {
                 libc::SYS_move_pages,
                 0i32, // self
                 1usize,
-                &page_ptr as *const *mut libc::c_void,
+                &raw const page_ptr,
                 ptr::null::<i32>(), // NULL = query only
-                &mut status as *mut i32,
+                &raw mut status,
                 0i32, // flags
             )
         };
 
+        #[allow(clippy::cast_sign_loss)]
         if result == 0 && status >= 0 {
             Some(status as usize)
         } else {

@@ -77,6 +77,7 @@ impl ThreeRingStats {
     }
 
     /// Record a latency ring completion.
+    #[allow(clippy::cast_possible_truncation)]
     pub fn record_latency_completion(&mut self, latency: Option<Duration>, success: bool) {
         self.latency_completions += 1;
         if !success {
@@ -92,6 +93,7 @@ impl ThreeRingStats {
     }
 
     /// Record a main ring completion.
+    #[allow(clippy::cast_possible_truncation)]
     pub fn record_main_completion(&mut self, latency: Option<Duration>, success: bool) {
         self.main_completions += 1;
         if !success {
@@ -107,6 +109,7 @@ impl ThreeRingStats {
     }
 
     /// Record a poll ring completion.
+    #[allow(clippy::cast_possible_truncation)]
     pub fn record_poll_completion(&mut self, latency: Option<Duration>, success: bool) {
         self.poll_completions += 1;
         if !success {
@@ -188,6 +191,7 @@ impl ThreeRingStats {
     ///
     /// Higher ratio means latency ring is effectively waking the main ring.
     #[must_use]
+    #[allow(clippy::cast_precision_loss)]
     pub fn wake_up_efficiency(&self) -> f64 {
         if self.main_ring_sleeps > 0 {
             self.latency_wake_ups as f64 / self.main_ring_sleeps as f64
@@ -198,6 +202,7 @@ impl ThreeRingStats {
 
     /// Get success rate across all rings.
     #[must_use]
+    #[allow(clippy::cast_precision_loss)]
     pub fn success_rate(&self) -> f64 {
         let total = self.total_completions();
         if total > 0 {

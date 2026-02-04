@@ -133,8 +133,8 @@ impl NumaTopology {
                 .map_err(|e| NumaError::TopologyError(format!("Failed to read entry: {e}")))?;
             let name = entry.file_name();
             let name_str = name.to_string_lossy();
-            if name_str.starts_with("node") {
-                if let Ok(node_id) = name_str[4..].parse::<usize>() {
+            if let Some(suffix) = name_str.strip_prefix("node") {
+                if let Ok(node_id) = suffix.parse::<usize>() {
                     node_dirs.push(node_id);
                 }
             }
@@ -237,7 +237,7 @@ impl NumaTopology {
                 for (i, part) in parts.iter().enumerate() {
                     if let Ok(val) = part.parse::<u64>() {
                         // Check if next part is "kB"
-                        if parts.get(i + 1).map_or(false, |&u| u == "kB") {
+                        if parts.get(i + 1).is_some_and(|&u| u == "kB") {
                             return val * 1024;
                         }
                         return val;
@@ -334,6 +334,7 @@ impl NumaTopology {
             // SAFETY: sched_getcpu is a simple syscall that returns the current CPU
             let cpu = unsafe { libc::sched_getcpu() };
             if cpu >= 0 {
+                #[allow(clippy::cast_sign_loss)]
                 return cpu as usize;
             }
         }
