@@ -1090,6 +1090,8 @@ impl Operator for TemporalJoinOperator {
 }
 
 #[cfg(test)]
+#[allow(clippy::cast_precision_loss)]
+#[allow(clippy::unnecessary_to_owned)]
 mod tests {
     use super::*;
     use crate::state::{InMemoryStore, StateStore};

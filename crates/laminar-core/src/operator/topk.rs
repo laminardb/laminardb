@@ -507,6 +507,7 @@ pub fn encode_utf8(val: &str, descending: bool, key: &mut Vec<u8>) {
 }
 
 #[cfg(test)]
+#[allow(clippy::cast_possible_wrap)]
 mod tests {
     use super::super::window::CdcOperation;
     use super::*;
@@ -1031,7 +1032,7 @@ mod tests {
                     CdcOperation::Insert => has_insert = true,
                     CdcOperation::UpdateBefore => has_update_before = true,
                     CdcOperation::UpdateAfter => has_update_after = true,
-                    _ => {}
+                    CdcOperation::Delete => {}
                 }
             }
         }

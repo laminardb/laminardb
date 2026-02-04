@@ -215,6 +215,9 @@ impl Drop for PushSubscription {
 // ===========================================================================
 
 #[cfg(test)]
+#[allow(clippy::cast_possible_wrap)]
+#[allow(clippy::field_reassign_with_default)]
+#[allow(clippy::ignored_unit_patterns)]
 mod tests {
     use super::*;
     use std::sync::Arc;

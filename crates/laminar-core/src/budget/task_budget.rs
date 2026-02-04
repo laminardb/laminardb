@@ -395,7 +395,7 @@ mod tests {
 
         // Very early, should be low percentage
         let pct = budget.percentage_used();
-        assert!(pct < 50, "Early percentage {} should be low", pct);
+        assert!(pct < 50, "Early percentage {pct} should be low");
     }
 
     #[test]

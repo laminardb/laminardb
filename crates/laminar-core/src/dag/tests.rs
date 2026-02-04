@@ -2,6 +2,9 @@
 //! MV integration, watermark tracking, and changelog propagation.
 
 #![allow(clippy::similar_names)]
+#![allow(clippy::cast_possible_wrap)]
+#![allow(clippy::cast_possible_truncation)]
+#![allow(clippy::cast_sign_loss)]
 
 use std::sync::Arc;
 
@@ -45,7 +48,7 @@ fn two_field_schema() -> Arc<Schema> {
     ]))
 }
 
-/// Helper to create a float64 schema (incompatible with int_schema).
+/// Helper to create a float64 schema (incompatible with `int_schema`).
 fn float_schema() -> Arc<Schema> {
     Arc::new(Schema::new(vec![Field::new(
         "value",
@@ -1449,7 +1452,7 @@ fn test_executor_take_all_sink_outputs() {
     assert_eq!(all_outputs.len(), 2);
 
     // Both sinks should have received the event.
-    for (_sink_id, events) in &all_outputs {
+    for events in all_outputs.values() {
         assert_eq!(events.len(), 1);
         assert_eq!(event_value(&events[0]), 55);
     }
@@ -2230,7 +2233,7 @@ fn make_base_schemas(names: &[&str]) -> FxHashMap<String, SchemaRef> {
     let schema = make_mv_schema();
     names
         .iter()
-        .map(|n| (n.to_string(), schema.clone()))
+        .map(|n| ((*n).to_string(), schema.clone()))
         .collect()
 }
 

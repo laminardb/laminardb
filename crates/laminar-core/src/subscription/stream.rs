@@ -330,6 +330,10 @@ pub fn subscribe_stream_with_errors(
 // ===========================================================================
 
 #[cfg(test)]
+#[allow(clippy::cast_possible_wrap)]
+#[allow(clippy::cast_sign_loss)]
+#[allow(clippy::field_reassign_with_default)]
+#[allow(clippy::ignored_unit_patterns)]
 mod tests {
     use super::*;
     use std::sync::Arc;

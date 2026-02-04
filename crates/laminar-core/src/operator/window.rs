@@ -5103,9 +5103,9 @@ mod tests {
 
     #[test]
     fn test_scalar_result_float64_conversions() {
-        let r = ScalarResult::Float64(3.14);
+        let r = ScalarResult::Float64(3.125);
         assert_eq!(r.to_i64_lossy(), 3); // truncated
-        assert!((r.to_f64_lossy() - 3.14).abs() < f64::EPSILON);
+        assert!((r.to_f64_lossy() - 3.125).abs() < f64::EPSILON);
         assert!(!r.is_null());
         assert_eq!(r.data_type(), DataType::Float64);
     }

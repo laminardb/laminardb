@@ -285,6 +285,9 @@ async fn callback_runner<C: SubscriptionCallback>(
 // ===========================================================================
 
 #[cfg(test)]
+#[allow(clippy::cast_sign_loss)]
+#[allow(clippy::cast_possible_wrap)]
+#[allow(clippy::field_reassign_with_default)]
 mod tests {
     use super::*;
     use std::sync::Mutex;

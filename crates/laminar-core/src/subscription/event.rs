@@ -386,13 +386,14 @@ impl ChangeEventBatch {
 // ===========================================================================
 
 #[cfg(test)]
+#[allow(clippy::cast_possible_wrap)]
 mod tests {
     use super::*;
     use arrow_array::Int64Array;
     use arrow_schema::{DataType, Field, Schema};
     use std::mem;
 
-    /// Helper: create a RecordBatch with `n` rows.
+    /// Helper: create a `RecordBatch` with `n` rows.
     fn make_batch(n: usize) -> RecordBatch {
         let schema = Arc::new(Schema::new(vec![Field::new("v", DataType::Int64, false)]));
         let values: Vec<i64> = (0..n as i64).collect();

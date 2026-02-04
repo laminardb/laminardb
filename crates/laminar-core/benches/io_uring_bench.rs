@@ -5,6 +5,11 @@
 use criterion::{criterion_group, criterion_main, Criterion};
 
 #[cfg(all(target_os = "linux", feature = "io-uring"))]
+use criterion::{BenchmarkId, Throughput};
+#[cfg(all(target_os = "linux", feature = "io-uring"))]
+use std::hint::black_box;
+
+#[cfg(all(target_os = "linux", feature = "io-uring"))]
 mod linux_benchmarks {
     use super::*;
     use laminar_core::io_uring::{CoreRingManager, IoUringConfig, RingMode};

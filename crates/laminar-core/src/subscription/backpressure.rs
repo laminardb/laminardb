@@ -328,8 +328,8 @@ mod tests {
         });
 
         requester.join().unwrap();
-        let consumed = consumer.join().unwrap();
-        assert_eq!(consumed, 10_000);
+        let total_consumed = consumer.join().unwrap();
+        assert_eq!(total_consumed, 10_000);
         assert_eq!(demand.pending(), 0);
     }
 

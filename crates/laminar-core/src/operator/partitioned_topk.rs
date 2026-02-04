@@ -467,6 +467,8 @@ impl Operator for PartitionedTopKOperator {
 }
 
 #[cfg(test)]
+#[allow(clippy::uninlined_format_args)]
+#[allow(clippy::cast_precision_loss)]
 mod tests {
     use super::super::window::CdcOperation;
     use super::*;

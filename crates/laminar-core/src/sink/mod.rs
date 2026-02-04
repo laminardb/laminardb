@@ -293,7 +293,7 @@ mod tests {
         assert_eq!(adapter.stats().committed_epochs, 2);
     }
 
-    /// Both TransactionalSink and IdempotentSink implement ExactlyOnceSink + reactor::Sink.
+    /// Both `TransactionalSink` and `IdempotentSink` implement `ExactlyOnceSink` + `reactor::Sink`.
     #[test]
     fn test_multiple_sink_types_supported() {
         // TransactionalSink
@@ -321,7 +321,7 @@ mod tests {
         idem_sink.commit(&tx_id).unwrap();
     }
 
-    /// Adapter with SinkCheckpointManager: multi-sink checkpoint serialization.
+    /// Adapter with `SinkCheckpointManager`: multi-sink checkpoint serialization.
     #[test]
     fn test_adapter_with_checkpoint_manager() {
         // Create two adapters

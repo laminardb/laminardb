@@ -368,7 +368,7 @@ fn bench_source_push_batch_drain(c: &mut Criterion) {
                 b.iter(|| {
                     // Drain subscription to avoid backpressure
                     sub.poll_each(size, |_| true);
-                    let events: Vec<BenchEvent> = (0..size as i64).map(|i| make_event(i)).collect();
+                    let events: Vec<BenchEvent> = (0..size as i64).map(make_event).collect();
                     let pushed = source.push_batch_drain(black_box(events.into_iter()));
                     black_box(pushed)
                 })

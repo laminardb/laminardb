@@ -266,6 +266,7 @@ impl<E: ExactlyOnceSink> Sink for ExactlyOnceSinkAdapter<E> {
 }
 
 #[cfg(test)]
+#[allow(clippy::cast_sign_loss)]
 mod tests {
     use super::*;
     use crate::operator::Event;

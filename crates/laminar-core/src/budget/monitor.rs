@@ -320,6 +320,7 @@ mod tests {
     use std::thread;
 
     #[test]
+    #[allow(clippy::float_cmp)]
     fn test_monitor_new() {
         let monitor = BudgetMonitor::new(Duration::from_secs(60), 10.0);
         assert_eq!(monitor.threshold(), 10.0);
@@ -442,6 +443,7 @@ mod tests {
     }
 
     #[test]
+    #[allow(clippy::float_cmp)]
     fn test_set_threshold() {
         let mut monitor = BudgetMonitor::new(Duration::from_secs(60), 10.0);
         assert_eq!(monitor.threshold(), 10.0);

@@ -418,6 +418,7 @@ impl Default for SubscriptionRegistry {
 // ===========================================================================
 
 #[cfg(test)]
+#[allow(clippy::cast_possible_wrap)]
 mod tests {
     use super::*;
     use std::sync::Arc;

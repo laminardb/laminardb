@@ -195,6 +195,7 @@ impl NotificationBatcher {
 // ===========================================================================
 
 #[cfg(test)]
+#[allow(clippy::cast_possible_wrap)]
 mod tests {
     use super::*;
     use arrow_array::{Int64Array, RecordBatch};
@@ -203,8 +204,10 @@ mod tests {
 
     fn make_event(seq: u64) -> ChangeEvent {
         let schema = Arc::new(Schema::new(vec![Field::new("v", DataType::Int64, false)]));
+        #[allow(clippy::cast_possible_wrap)]
         let array = Int64Array::from(vec![seq as i64]);
         let batch = Arc::new(RecordBatch::try_new(schema, vec![Arc::new(array)]).unwrap());
+        #[allow(clippy::cast_possible_wrap)]
         ChangeEvent::insert(batch, 1000 + seq as i64, seq)
     }
 
@@ -277,10 +280,10 @@ mod tests {
         batcher.add(0, "mv_a", make_event(2));
         batcher.add(1, "mv_b", make_event(3));
 
-        let batches = batcher.flush_all();
-        assert_eq!(batches.len(), 2);
+        let flushed = batcher.flush_all();
+        assert_eq!(flushed.len(), 2);
 
-        let total_events: usize = batches.iter().map(|(_, b)| b.len()).sum();
+        let total_events: usize = flushed.iter().map(|(_, b)| b.len()).sum();
         assert_eq!(total_events, 3);
         assert_eq!(batcher.buffered_count(), 0);
     }
@@ -299,9 +302,9 @@ mod tests {
 
         std::thread::sleep(Duration::from_millis(5));
 
-        let batches = batcher.flush_expired();
-        assert_eq!(batches.len(), 1);
-        assert_eq!(batches[0].1.len(), 2);
+        let expired = batcher.flush_expired();
+        assert_eq!(expired.len(), 1);
+        assert_eq!(expired[0].1.len(), 2);
         assert_eq!(batcher.buffered_count(), 0);
     }
 

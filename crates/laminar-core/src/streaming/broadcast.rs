@@ -899,6 +899,10 @@ pub struct SubscriberInfo {
 // ===========================================================================
 
 #[cfg(test)]
+#[allow(clippy::default_trait_access)]
+#[allow(clippy::unnecessary_map_or)]
+#[allow(clippy::cast_possible_truncation)]
+#[allow(clippy::cast_possible_wrap)]
 mod tests {
     use super::*;
     use std::sync::Arc;

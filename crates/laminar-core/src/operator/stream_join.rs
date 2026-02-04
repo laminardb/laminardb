@@ -2102,6 +2102,7 @@ impl Operator for StreamJoinOperator {
 }
 
 #[cfg(test)]
+#[allow(clippy::cast_possible_wrap)]
 mod tests {
     use super::*;
     use crate::state::InMemoryStore;

@@ -255,7 +255,8 @@ fn bench_lookup_join(c: &mut Criterion) {
             .stream_key_column("key".to_string())
             .lookup_key_column("key".to_string())
             .cache_ttl(Duration::from_secs(300))
-            .build();
+            .build()
+            .unwrap();
         let mut operator = LookupJoinOperator::new(config);
         let mut timers = TimerService::new();
         let mut state = InMemoryStore::new();

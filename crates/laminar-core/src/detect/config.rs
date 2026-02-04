@@ -234,6 +234,7 @@ impl std::fmt::Display for PerformanceTier {
 }
 
 #[cfg(test)]
+#[allow(clippy::field_reassign_with_default)]
 mod tests {
     use super::super::SystemCapabilities;
     use super::*;
