@@ -7,6 +7,12 @@ on:
     branches: [main, develop]
   workflow_dispatch:
 
+# Cancel redundant runs: when pushing multiple commits quickly or when
+# both push and PR events fire for the same commit
+concurrency:
+  group: ${{ github.workflow }}-${{ github.ref }}
+  cancel-in-progress: true
+
 env:
   CARGO_TERM_COLOR: always
   RUST_BACKTRACE: 1
