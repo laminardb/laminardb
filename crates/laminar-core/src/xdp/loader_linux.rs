@@ -177,7 +177,7 @@ impl XdpLoader {
     #[cfg(not(feature = "xdp"))]
     fn do_load_and_attach(
         config: &XdpConfig,
-        ifindex: u32,
+        _ifindex: u32,
         num_cores: usize,
     ) -> Result<Self, XdpError> {
         tracing::warn!("XDP feature not enabled, using stub implementation");
