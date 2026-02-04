@@ -207,7 +207,7 @@ mod tests {
                 let batch = stream.next().await.unwrap().unwrap();
                 assert_eq!(batch.num_rows(), 1);
             }
-            _ => panic!("Expected Query result"),
+            StreamingSqlResult::Ddl(_) => panic!("Expected Query result"),
         }
     }
 
@@ -260,7 +260,7 @@ mod tests {
                 }
                 assert_eq!(total, 2);
             }
-            _ => panic!("Expected Query result"),
+            StreamingSqlResult::Ddl(_) => panic!("Expected Query result"),
         }
     }
 }

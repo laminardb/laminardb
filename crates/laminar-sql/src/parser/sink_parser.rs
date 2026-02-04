@@ -213,7 +213,7 @@ mod tests {
             SinkFrom::Table(table) => {
                 assert_eq!(table.to_string(), "processed_orders");
             }
-            _ => panic!("Expected SinkFrom::Table"),
+            SinkFrom::Query(_) => panic!("Expected SinkFrom::Table"),
         }
     }
 

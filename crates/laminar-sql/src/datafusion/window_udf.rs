@@ -558,7 +558,7 @@ mod tests {
                 assert_eq!(r.value(3), 300_000);
                 assert!(r.is_null(4));
             }
-            _ => panic!("Expected array result"),
+            ColumnarValue::Scalar(_) => panic!("Expected array result"),
         }
     }
 

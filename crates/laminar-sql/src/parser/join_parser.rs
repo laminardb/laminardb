@@ -715,11 +715,11 @@ mod tests {
     fn test_count_joins() {
         let sql_one = "SELECT * FROM a JOIN b ON a.id = b.id";
         let sql_two = "SELECT * FROM a JOIN b ON a.id = b.id JOIN c ON b.id = c.id";
-        let sql_none = "SELECT * FROM a";
+        let sql_zero = "SELECT * FROM a";
 
         assert_eq!(count_joins(&parse_select(sql_one)), 1);
         assert_eq!(count_joins(&parse_select(sql_two)), 2);
-        assert_eq!(count_joins(&parse_select(sql_none)), 0);
+        assert_eq!(count_joins(&parse_select(sql_zero)), 0);
     }
 
     #[test]

@@ -544,7 +544,7 @@ mod tests {
                 }
                 assert_eq!(total, 2); // id=2, id=3
             }
-            _ => panic!("Expected Query result"),
+            StreamingSqlResult::Ddl(_) => panic!("Expected Query result"),
         }
     }
 

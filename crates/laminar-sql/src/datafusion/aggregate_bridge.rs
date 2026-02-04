@@ -431,8 +431,8 @@ mod tests {
 
     #[test]
     fn test_scalar_value_to_result_float64() {
-        let sv = ScalarValue::Float64(Some(3.14));
-        assert_eq!(scalar_value_to_result(&sv), ScalarResult::Float64(3.14));
+        let sv = ScalarValue::Float64(Some(3.125));
+        assert_eq!(scalar_value_to_result(&sv), ScalarResult::Float64(3.125));
     }
 
     #[test]
@@ -499,7 +499,7 @@ mod tests {
         // Exact roundtrip for non-optional variants
         let exact_cases = vec![
             ScalarResult::Int64(42),
-            ScalarResult::Float64(3.14),
+            ScalarResult::Float64(3.125),
             ScalarResult::UInt64(100),
         ];
         for sr in &exact_cases {
@@ -513,8 +513,8 @@ mod tests {
         let sv = result_to_scalar_value(&ScalarResult::OptionalInt64(Some(7)));
         assert_eq!(scalar_value_to_result(&sv), ScalarResult::Int64(7));
 
-        let sv = result_to_scalar_value(&ScalarResult::OptionalFloat64(Some(2.718)));
-        assert_eq!(scalar_value_to_result(&sv), ScalarResult::Float64(2.718));
+        let sv = result_to_scalar_value(&ScalarResult::OptionalFloat64(Some(2.72)));
+        assert_eq!(scalar_value_to_result(&sv), ScalarResult::Float64(2.72));
 
         // Optional None roundtrips back to OptionalNone (ScalarValue preserves type)
         let sv = result_to_scalar_value(&ScalarResult::OptionalInt64(None));

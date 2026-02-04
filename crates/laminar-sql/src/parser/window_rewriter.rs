@@ -472,8 +472,8 @@ mod tests {
                             window_interval,
                         } => {
                             assert_eq!(time_column.to_string(), "ts");
-                            assert!(slide_interval.to_string().contains("1"));
-                            assert!(window_interval.to_string().contains("5"));
+                            assert!(slide_interval.to_string().contains('1'));
+                            assert!(window_interval.to_string().contains('5'));
                         }
                         _ => panic!("Expected Hop window"),
                     }
