@@ -9,38 +9,203 @@ permissions:
   contents: write
   deployments: write
 
+env:
+  CARGO_TERM_COLOR: always
+
 jobs:
-  benchmark:
-    name: Run Benchmarks
+  # Build once, cache for all benchmark jobs
+  build:
+    name: Build Benchmarks
     runs-on: ubuntu-latest
+    timeout-minutes: 30
     steps:
       - uses: actions/checkout@v4
       - uses: dtolnay/rust-toolchain@stable
       - uses: Swatinem/rust-cache@v2
         with:
-          key: bench
+          key: bench-build
+          save-if: ${{ github.ref == 'refs/heads/main' }}
 
       - name: Install system dependencies
         run: sudo apt-get update && sudo apt-get install -y libhwloc-dev libelf-dev zlib1g-dev libcurl4-openssl-dev cmake pkg-config libsasl2-dev libudev-dev
 
-      - name: Run benchmarks
-        run: |
-          # Run criterion benchmarks
-          cargo bench --workspace -- --noplot 2>&1 | tee bench_output.txt
+      - name: Build all benchmarks
+        run: cargo build --release -p laminar-core -p laminar-storage --benches
 
-      - name: Parse benchmark results
-        id: parse
+  # Core latency-critical benchmarks
+  bench-latency:
+    name: Latency Benchmarks
+    needs: build
+    runs-on: ubuntu-latest
+    timeout-minutes: 20
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+      - uses: Swatinem/rust-cache@v2
+        with:
+          key: bench-build
+
+      - name: Install system dependencies
+        run: sudo apt-get update && sudo apt-get install -y libhwloc-dev libelf-dev zlib1g-dev libcurl4-openssl-dev cmake pkg-config libsasl2-dev libudev-dev
+
+      - name: Run latency benchmarks
+        run: |
+          cargo bench -p laminar-core --bench state_bench -- --noplot 2>&1 | tee results.txt
+          cargo bench -p laminar-core --bench latency_bench -- --noplot 2>&1 | tee -a results.txt
+          cargo bench -p laminar-core --bench reactor_bench -- --noplot 2>&1 | tee -a results.txt
+
+      - name: Upload results
+        uses: actions/upload-artifact@v4
+        with:
+          name: bench-latency
+          path: results.txt
+
+  # DAG pipeline benchmarks
+  bench-dag:
+    name: DAG Benchmarks
+    needs: build
+    runs-on: ubuntu-latest
+    timeout-minutes: 20
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+      - uses: Swatinem/rust-cache@v2
+        with:
+          key: bench-build
+
+      - name: Install system dependencies
+        run: sudo apt-get update && sudo apt-get install -y libhwloc-dev libelf-dev zlib1g-dev libcurl4-openssl-dev cmake pkg-config libsasl2-dev libudev-dev
+
+      - name: Run DAG benchmarks
+        run: |
+          cargo bench -p laminar-core --bench dag_bench -- --noplot 2>&1 | tee results.txt
+          cargo bench -p laminar-core --bench dag_stress -- --noplot 2>&1 | tee -a results.txt
+
+      - name: Upload results
+        uses: actions/upload-artifact@v4
+        with:
+          name: bench-dag
+          path: results.txt
+
+  # Operator benchmarks (windows, joins, streaming)
+  bench-operators:
+    name: Operator Benchmarks
+    needs: build
+    runs-on: ubuntu-latest
+    timeout-minutes: 20
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+      - uses: Swatinem/rust-cache@v2
+        with:
+          key: bench-build
+
+      - name: Install system dependencies
+        run: sudo apt-get update && sudo apt-get install -y libhwloc-dev libelf-dev zlib1g-dev libcurl4-openssl-dev cmake pkg-config libsasl2-dev libudev-dev
+
+      - name: Run operator benchmarks
+        run: |
+          cargo bench -p laminar-core --bench window_bench -- --noplot 2>&1 | tee results.txt
+          cargo bench -p laminar-core --bench join_bench -- --noplot 2>&1 | tee -a results.txt
+          cargo bench -p laminar-core --bench streaming_bench -- --noplot 2>&1 | tee -a results.txt
+          cargo bench -p laminar-core --bench subscription_bench -- --noplot 2>&1 | tee -a results.txt
+
+      - name: Upload results
+        uses: actions/upload-artifact@v4
+        with:
+          name: bench-operators
+          path: results.txt
+
+  # Throughput and TPC benchmarks
+  bench-throughput:
+    name: Throughput Benchmarks
+    needs: build
+    runs-on: ubuntu-latest
+    timeout-minutes: 20
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+      - uses: Swatinem/rust-cache@v2
+        with:
+          key: bench-build
+
+      - name: Install system dependencies
+        run: sudo apt-get update && sudo apt-get install -y libhwloc-dev libelf-dev zlib1g-dev libcurl4-openssl-dev cmake pkg-config libsasl2-dev libudev-dev
+
+      - name: Run throughput benchmarks
+        run: |
+          cargo bench -p laminar-core --bench throughput_bench -- --noplot 2>&1 | tee results.txt
+          cargo bench -p laminar-core --bench tpc_bench -- --noplot 2>&1 | tee -a results.txt
+          cargo bench -p laminar-core --bench io_uring_bench -- --noplot 2>&1 | tee -a results.txt
+
+      - name: Upload results
+        uses: actions/upload-artifact@v4
+        with:
+          name: bench-throughput
+          path: results.txt
+
+  # Storage benchmarks (WAL, checkpointing)
+  bench-storage:
+    name: Storage Benchmarks
+    needs: build
+    runs-on: ubuntu-latest
+    timeout-minutes: 20
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+      - uses: Swatinem/rust-cache@v2
+        with:
+          key: bench-build
+
+      - name: Install system dependencies
+        run: sudo apt-get update && sudo apt-get install -y libhwloc-dev libelf-dev zlib1g-dev libcurl4-openssl-dev cmake pkg-config libsasl2-dev libudev-dev
+
+      - name: Run storage benchmarks
+        run: |
+          cargo bench -p laminar-storage --bench wal_bench -- --noplot 2>&1 | tee results.txt
+          cargo bench -p laminar-storage --bench checkpoint_bench -- --noplot 2>&1 | tee -a results.txt
+
+      - name: Upload results
+        uses: actions/upload-artifact@v4
+        with:
+          name: bench-storage
+          path: results.txt
+
+  # Collect and publish results
+  publish-results:
+    name: Publish Results
+    needs: [bench-latency, bench-dag, bench-operators, bench-throughput, bench-storage]
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Download all artifacts
+        uses: actions/download-artifact@v4
+        with:
+          path: bench-results
+
+      - name: Combine results
+        run: |
+          echo "# Benchmark Results" > bench_output.txt
+          echo "" >> bench_output.txt
+          for dir in bench-results/*/; do
+            name=$(basename "$dir")
+            echo "## $name" >> bench_output.txt
+            cat "$dir/results.txt" >> bench_output.txt
+            echo "" >> bench_output.txt
+          done
+
+      - name: Generate summary
         run: |
           echo "## Benchmark Results" >> $GITHUB_STEP_SUMMARY
           echo "" >> $GITHUB_STEP_SUMMARY
-
-          # Extract key results
-          if grep -q "time:" bench_output.txt; then
-            echo "### Timing Results" >> $GITHUB_STEP_SUMMARY
-            echo "\`\`\`" >> $GITHUB_STEP_SUMMARY
-            grep -A2 "time:" bench_output.txt | head -50 >> $GITHUB_STEP_SUMMARY
-            echo "\`\`\`" >> $GITHUB_STEP_SUMMARY
-          fi
+          echo "### Latency Targets" >> $GITHUB_STEP_SUMMARY
+          echo "| Metric | Target | Status |" >> $GITHUB_STEP_SUMMARY
+          echo "|--------|--------|--------|" >> $GITHUB_STEP_SUMMARY
+          echo "| State lookup | < 500ns | See artifacts |" >> $GITHUB_STEP_SUMMARY
+          echo "| Routing lookup | < 50ns | See artifacts |" >> $GITHUB_STEP_SUMMARY
+          echo "| 3-node latency | < 500ns | See artifacts |" >> $GITHUB_STEP_SUMMARY
+          echo "| Throughput/core | > 500K/s | See artifacts |" >> $GITHUB_STEP_SUMMARY
 
       - name: Store benchmark result
         uses: benchmark-action/github-action-benchmark@v1
@@ -56,41 +221,8 @@ jobs:
           benchmark-data-dir-path: bench
         continue-on-error: true
 
-      - name: Upload benchmark artifacts
+      - name: Upload combined results
         uses: actions/upload-artifact@v4
         with:
-          name: benchmark-results
-          path: |
-            bench_output.txt
-            target/criterion/
-          if-no-files-found: ignore
-
-  # Latency validation against targets
-  latency-check:
-    name: Latency Validation
-    runs-on: ubuntu-latest
-    steps:
-      - uses: actions/checkout@v4
-      - uses: dtolnay/rust-toolchain@stable
-      - uses: Swatinem/rust-cache@v2
-        with:
-          key: bench-latency
-
-      - name: Install system dependencies
-        run: sudo apt-get update && sudo apt-get install -y libhwloc-dev libelf-dev zlib1g-dev libcurl4-openssl-dev cmake pkg-config libsasl2-dev libudev-dev
-
-      - name: Run latency benchmarks
-        run: |
-          # Run specific latency-critical benchmarks
-          cargo bench -p laminar-core --bench state_bench -- --noplot 2>&1 | tee latency.txt || true
-          cargo bench -p laminar-core --bench dag_bench -- --noplot 2>&1 | tee -a latency.txt || true
-
-      - name: Check latency targets
-        run: |
-          echo "## Latency Targets" >> $GITHUB_STEP_SUMMARY
-          echo "" >> $GITHUB_STEP_SUMMARY
-          echo "| Target | Requirement | Status |" >> $GITHUB_STEP_SUMMARY
-          echo "|--------|-------------|--------|" >> $GITHUB_STEP_SUMMARY
-          echo "| State lookup | < 500ns | TBD |" >> $GITHUB_STEP_SUMMARY
-          echo "| Event processing | < 1μs | TBD |" >> $GITHUB_STEP_SUMMARY
-          echo "| Routing lookup | < 50ns | TBD |" >> $GITHUB_STEP_SUMMARY
+          name: benchmark-results-combined
+          path: bench_output.txt
