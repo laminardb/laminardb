@@ -240,7 +240,7 @@ Remaining work for Phase 3:
 
 | Gap | Feature | Priority | Notes |
 |-----|---------|----------|-------|
-| Delta Lake I/O | F031A-D | P0/P1 | Blocked by deltalake crate version |
+| Delta Lake I/O | F031A-D | P0/P1 | ✅ **UNBLOCKED** - deltalake git main has DF 52.x |
 | MySQL CDC I/O | F028A | P1 | Ready - mysql_async now using rustls (no OpenSSL) |
 | Iceberg I/O | F032A | P1 | Blocked by iceberg-datafusion 0.9.0 (needs DF 52.0 compat) |
 

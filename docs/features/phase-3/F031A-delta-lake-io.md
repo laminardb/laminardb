@@ -5,14 +5,15 @@
 | Field | Value |
 |-------|-------|
 | **ID** | F031A |
-| **Status** | 📝 Draft |
+| **Status** | 📝 Draft (Ready for Implementation) |
 | **Phase** | 3 |
 | **Priority** | P0 |
 | **Effort** | L (1-2 weeks) |
 | **Dependencies** | F031 (Delta Lake Sink), F-CLOUD-001, F-CLOUD-002, F-CLOUD-003 |
 | **Blocks** | F031B (Recovery), F031C (Compaction), F061 (Historical Backfill) |
-| **Blocked By** | `deltalake` crate compatibility with workspace DataFusion version |
+| **Blocked By** | ~~`deltalake` crate compatibility~~ ✅ **UNBLOCKED** (2026-02-05) |
 | **Created** | 2026-02-02 |
+| **Updated** | 2026-02-05 |
 
 ## Summary
 
@@ -20,7 +21,16 @@ Replace the stubbed I/O methods in `DeltaLakeSink` with actual `deltalake` crate
 
 F031 implemented all business logic (buffering, epoch management, changelog splitting, metrics). F031A wires that logic to the `deltalake` crate for actual storage I/O.
 
-**Blocked by**: The `deltalake` crate version must be compatible with the workspace DataFusion version. Track [delta-rs releases](https://github.com/delta-io/delta-rs/releases) for DataFusion version alignment.
+### Dependency Status
+
+✅ **UNBLOCKED** (2026-02-05): The `deltalake` crate is now available via git dependency from the main branch, which uses DataFusion 52.1.0 (compatible with LaminarDB's DataFusion 52.0).
+
+```toml
+# Current dependency in laminar-connectors/Cargo.toml
+deltalake = { git = "https://github.com/delta-io/delta-rs", branch = "main", ... }
+```
+
+When `deltalake` 0.31.0 is released with DataFusion 52.x, switch to a versioned dependency.
 
 ## Requirements
 
@@ -47,13 +57,17 @@ F031 implemented all business logic (buffering, epoch management, changelog spli
 
 ### Feature Flags
 
+✅ **Implemented** in `laminar-connectors/Cargo.toml`:
+
 ```toml
 [features]
-default = []
-delta-lake = ["dep:deltalake"]
+# Delta Lake - using git main branch with DataFusion 52.x
+delta-lake = ["dep:deltalake", "deltalake/datafusion"]
 delta-lake-s3 = ["delta-lake", "deltalake/s3"]
 delta-lake-azure = ["delta-lake", "deltalake/azure"]
 delta-lake-gcs = ["delta-lake", "deltalake/gcs"]
+delta-lake-unity = ["delta-lake", "deltalake/unity-experimental"]
+delta-lake-glue = ["delta-lake", "deltalake/glue"]
 ```
 
 ### Stubbed Methods to Replace
@@ -201,7 +215,7 @@ crates/laminar-connectors/src/lakehouse/
 
 ## Completion Checklist
 
-- [ ] `delta-lake` feature gate in Cargo.toml
+- [x] `delta-lake` feature gate in Cargo.toml ✅ (2026-02-05)
 - [ ] `open_table()` via `deltalake::open_table_with_storage_options()`
 - [ ] `flush_buffer_delta()` via `WriteBuilder`
 - [ ] `commit_delta()` with `txn` action metadata
