@@ -20,7 +20,7 @@ tracing = { workspace = true }
 tracing-opentelemetry = "0.22"
 
 # Health checks
-axum = "0.7"
+axum = "0.8"
 
 # Common
 tokio = { workspace = true }
