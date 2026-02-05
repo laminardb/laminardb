@@ -61,7 +61,7 @@ pub mod schema_registry;
 pub use avro::AvroDeserializer;
 pub use config::{
     AssignmentStrategy, CompatibilityLevel, IsolationLevel, KafkaSourceConfig, OffsetReset,
-    SaslMechanism, SecurityProtocol, SrAuth, TopicSubscription,
+    SaslMechanism, SecurityProtocol, SrAuth, StartupMode, TopicSubscription,
 };
 pub use metrics::KafkaSourceMetrics;
 pub use offsets::OffsetTracker;
@@ -184,8 +184,23 @@ fn kafka_source_config_keys() -> Vec<ConfigKeySpec> {
         ConfigKeySpec::optional("ssl.key.password", "Password for encrypted SSL key", ""),
         // Consumer tuning
         ConfigKeySpec::optional(
+            "startup.mode",
+            "Startup mode (group-offsets/earliest/latest)",
+            "group-offsets",
+        ),
+        ConfigKeySpec::optional(
+            "startup.specific.offsets",
+            "Start from specific offsets (format: 'partition:offset,...')",
+            "",
+        ),
+        ConfigKeySpec::optional(
+            "startup.timestamp.ms",
+            "Start from timestamp (milliseconds since epoch)",
+            "",
+        ),
+        ConfigKeySpec::optional(
             "auto.offset.reset",
-            "Where to start (earliest/latest/none)",
+            "Fallback when no committed offset (earliest/latest/none)",
             "earliest",
         ),
         ConfigKeySpec::optional(
@@ -259,6 +274,16 @@ fn kafka_source_config_keys() -> Vec<ConfigKeySpec> {
         ConfigKeySpec::optional(
             "schema.registry.ssl.ca.location",
             "Schema Registry SSL CA cert path",
+            "",
+        ),
+        ConfigKeySpec::optional(
+            "schema.registry.ssl.certificate.location",
+            "Schema Registry SSL client cert path",
+            "",
+        ),
+        ConfigKeySpec::optional(
+            "schema.registry.ssl.key.location",
+            "Schema Registry SSL client key path",
             "",
         ),
         ConfigKeySpec::optional(

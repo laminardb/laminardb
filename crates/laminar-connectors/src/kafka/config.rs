@@ -184,6 +184,76 @@ impl std::fmt::Display for IsolationLevel {
     }
 }
 
+/// Consumer startup mode controlling where to begin consuming.
+///
+/// This is a higher-level abstraction than `auto.offset.reset` that provides
+/// more control over initial positioning, including timestamp-based and
+/// partition-specific offset assignment.
+#[derive(Debug, Clone, PartialEq, Eq, Default)]
+pub enum StartupMode {
+    /// Use committed group offsets, fall back to `auto.offset.reset` if none exist.
+    #[default]
+    GroupOffsets,
+    /// Start from the earliest available offset in each partition.
+    Earliest,
+    /// Start from the latest offset in each partition (only new messages).
+    Latest,
+    /// Start from specific offsets per partition (`partition_id` -> offset).
+    SpecificOffsets(HashMap<i32, i64>),
+    /// Start from a specific timestamp (milliseconds since epoch).
+    /// The consumer seeks to the first message with timestamp >= this value.
+    Timestamp(i64),
+}
+
+impl StartupMode {
+    /// Returns true if this mode overrides auto.offset.reset behavior.
+    #[must_use]
+    pub fn overrides_offset_reset(&self) -> bool {
+        !matches!(self, StartupMode::GroupOffsets)
+    }
+
+    /// Returns the equivalent auto.offset.reset value, if applicable.
+    #[must_use]
+    pub fn as_offset_reset(&self) -> Option<&'static str> {
+        match self {
+            StartupMode::Earliest => Some("earliest"),
+            StartupMode::Latest => Some("latest"),
+            StartupMode::GroupOffsets
+            | StartupMode::SpecificOffsets(_)
+            | StartupMode::Timestamp(_) => None,
+        }
+    }
+}
+
+impl std::str::FromStr for StartupMode {
+    type Err = ConnectorError;
+
+    fn from_str(s: &str) -> Result<Self, Self::Err> {
+        match s.to_lowercase().replace('-', "_").as_str() {
+            "group_offsets" | "group" => Ok(StartupMode::GroupOffsets),
+            "earliest" => Ok(StartupMode::Earliest),
+            "latest" => Ok(StartupMode::Latest),
+            other => Err(ConnectorError::ConfigurationError(format!(
+                "invalid startup.mode: '{other}' (expected group-offsets/earliest/latest)"
+            ))),
+        }
+    }
+}
+
+impl std::fmt::Display for StartupMode {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            StartupMode::GroupOffsets => write!(f, "group-offsets"),
+            StartupMode::Earliest => write!(f, "earliest"),
+            StartupMode::Latest => write!(f, "latest"),
+            StartupMode::SpecificOffsets(offsets) => {
+                write!(f, "specific-offsets({} partitions)", offsets.len())
+            }
+            StartupMode::Timestamp(ts) => write!(f, "timestamp({ts})"),
+        }
+    }
+}
+
 /// Topic subscription mode: explicit list or regex pattern.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum TopicSubscription {
@@ -415,6 +485,10 @@ pub struct KafkaSourceConfig {
     pub schema_compatibility: Option<CompatibilityLevel>,
     /// Schema Registry SSL CA certificate path.
     pub schema_registry_ssl_ca_location: Option<String>,
+    /// Schema Registry SSL client certificate path.
+    pub schema_registry_ssl_certificate_location: Option<String>,
+    /// Schema Registry SSL client key path.
+    pub schema_registry_ssl_key_location: Option<String>,
     /// Column name containing the event timestamp.
     pub event_time_column: Option<String>,
     /// Whether to include Kafka metadata columns (_partition, _offset, _timestamp).
@@ -423,6 +497,8 @@ pub struct KafkaSourceConfig {
     pub include_headers: bool,
 
     // -- Consumer tuning --
+    /// Consumer startup mode (controls initial offset positioning).
+    pub startup_mode: StartupMode,
     /// Where to start reading when no committed offset exists.
     pub auto_offset_reset: OffsetReset,
     /// Consumer transaction isolation level.
@@ -482,9 +558,12 @@ impl Default for KafkaSourceConfig {
             schema_registry_auth: None,
             schema_compatibility: None,
             schema_registry_ssl_ca_location: None,
+            schema_registry_ssl_certificate_location: None,
+            schema_registry_ssl_key_location: None,
             event_time_column: None,
             include_metadata: false,
             include_headers: false,
+            startup_mode: StartupMode::default(),
             auto_offset_reset: OffsetReset::Earliest,
             isolation_level: IsolationLevel::default(),
             max_poll_records: 1000,
@@ -582,6 +661,12 @@ impl KafkaSourceConfig {
         let schema_registry_ssl_ca_location = config
             .get("schema.registry.ssl.ca.location")
             .map(String::from);
+        let schema_registry_ssl_certificate_location = config
+            .get("schema.registry.ssl.certificate.location")
+            .map(String::from);
+        let schema_registry_ssl_key_location = config
+            .get("schema.registry.ssl.key.location")
+            .map(String::from);
 
         let event_time_column = config.get("event.time.column").map(String::from);
 
@@ -592,6 +677,23 @@ impl KafkaSourceConfig {
         let include_headers = config
             .get_parsed::<bool>("include.headers")?
             .unwrap_or(false);
+
+        let startup_mode = if let Some(offsets_str) = config.get("startup.specific.offsets") {
+            let offsets = parse_specific_offsets(offsets_str)?;
+            StartupMode::SpecificOffsets(offsets)
+        } else if let Some(ts_str) = config.get("startup.timestamp.ms") {
+            let ts: i64 = ts_str.parse().map_err(|_| {
+                ConnectorError::ConfigurationError(format!(
+                    "invalid startup.timestamp.ms: '{ts_str}'"
+                ))
+            })?;
+            StartupMode::Timestamp(ts)
+        } else {
+            match config.get("startup.mode") {
+                Some(s) => s.parse::<StartupMode>()?,
+                None => StartupMode::default(),
+            }
+        };
 
         let auto_offset_reset = match config.get("auto.offset.reset") {
             Some(s) => s.parse::<OffsetReset>()?,
@@ -659,9 +761,12 @@ impl KafkaSourceConfig {
             schema_registry_auth,
             schema_compatibility,
             schema_registry_ssl_ca_location,
+            schema_registry_ssl_certificate_location,
+            schema_registry_ssl_key_location,
             event_time_column,
             include_metadata,
             include_headers,
+            startup_mode,
             auto_offset_reset,
             isolation_level,
             max_poll_records,
@@ -835,6 +940,48 @@ impl KafkaSourceConfig {
 
         config
     }
+}
+
+/// Parses a specific offsets string in the format "partition:offset,partition:offset,...".
+///
+/// Example: "0:100,1:200,2:300" maps partition 0 to offset 100, partition 1 to offset 200, etc.
+fn parse_specific_offsets(s: &str) -> Result<HashMap<i32, i64>, ConnectorError> {
+    let mut offsets = HashMap::new();
+
+    for pair in s.split(',') {
+        let pair = pair.trim();
+        if pair.is_empty() {
+            continue;
+        }
+
+        let parts: Vec<&str> = pair.split(':').collect();
+        if parts.len() != 2 {
+            return Err(ConnectorError::ConfigurationError(format!(
+                "invalid offset format '{pair}' (expected 'partition:offset')"
+            )));
+        }
+
+        let partition: i32 = parts[0].trim().parse().map_err(|_| {
+            ConnectorError::ConfigurationError(format!(
+                "invalid partition number '{}' in '{pair}'",
+                parts[0]
+            ))
+        })?;
+
+        let offset: i64 = parts[1].trim().parse().map_err(|_| {
+            ConnectorError::ConfigurationError(format!("invalid offset '{}' in '{pair}'", parts[1]))
+        })?;
+
+        offsets.insert(partition, offset);
+    }
+
+    if offsets.is_empty() {
+        return Err(ConnectorError::ConfigurationError(
+            "startup.specific.offsets cannot be empty".into(),
+        ));
+    }
+
+    Ok(offsets)
 }
 
 #[cfg(test)]
@@ -1316,5 +1463,146 @@ mod tests {
         assert_eq!(SecurityProtocol::SaslSsl.to_string(), "sasl_ssl");
         assert_eq!(SaslMechanism::ScramSha256.to_string(), "SCRAM-SHA-256");
         assert_eq!(IsolationLevel::ReadCommitted.to_string(), "read_committed");
+    }
+
+    #[test]
+    fn test_startup_mode_parsing() {
+        assert_eq!(
+            "group-offsets".parse::<StartupMode>().unwrap(),
+            StartupMode::GroupOffsets
+        );
+        assert_eq!(
+            "group_offsets".parse::<StartupMode>().unwrap(),
+            StartupMode::GroupOffsets
+        );
+        assert_eq!(
+            "earliest".parse::<StartupMode>().unwrap(),
+            StartupMode::Earliest
+        );
+        assert_eq!(
+            "latest".parse::<StartupMode>().unwrap(),
+            StartupMode::Latest
+        );
+        assert!("invalid".parse::<StartupMode>().is_err());
+    }
+
+    #[test]
+    fn test_startup_mode_display() {
+        assert_eq!(StartupMode::GroupOffsets.to_string(), "group-offsets");
+        assert_eq!(StartupMode::Earliest.to_string(), "earliest");
+        assert_eq!(StartupMode::Latest.to_string(), "latest");
+
+        let specific = StartupMode::SpecificOffsets(HashMap::from([(0, 100), (1, 200)]));
+        assert!(specific.to_string().contains("2 partitions"));
+
+        let ts = StartupMode::Timestamp(1234567890000);
+        assert!(ts.to_string().contains("1234567890000"));
+    }
+
+    #[test]
+    fn test_startup_mode_helpers() {
+        assert!(!StartupMode::GroupOffsets.overrides_offset_reset());
+        assert!(StartupMode::Earliest.overrides_offset_reset());
+        assert!(StartupMode::Latest.overrides_offset_reset());
+        assert!(StartupMode::SpecificOffsets(HashMap::new()).overrides_offset_reset());
+        assert!(StartupMode::Timestamp(0).overrides_offset_reset());
+
+        assert!(StartupMode::GroupOffsets.as_offset_reset().is_none());
+        assert_eq!(StartupMode::Earliest.as_offset_reset(), Some("earliest"));
+        assert_eq!(StartupMode::Latest.as_offset_reset(), Some("latest"));
+        assert!(StartupMode::SpecificOffsets(HashMap::new())
+            .as_offset_reset()
+            .is_none());
+        assert!(StartupMode::Timestamp(0).as_offset_reset().is_none());
+    }
+
+    #[test]
+    fn test_parse_specific_offsets() {
+        let offsets = parse_specific_offsets("0:100,1:200,2:300").unwrap();
+        assert_eq!(offsets.get(&0), Some(&100));
+        assert_eq!(offsets.get(&1), Some(&200));
+        assert_eq!(offsets.get(&2), Some(&300));
+    }
+
+    #[test]
+    fn test_parse_specific_offsets_with_spaces() {
+        let offsets = parse_specific_offsets(" 0:100 , 1:200 ").unwrap();
+        assert_eq!(offsets.get(&0), Some(&100));
+        assert_eq!(offsets.get(&1), Some(&200));
+    }
+
+    #[test]
+    fn test_parse_specific_offsets_errors() {
+        assert!(parse_specific_offsets("").is_err());
+        assert!(parse_specific_offsets("0").is_err());
+        assert!(parse_specific_offsets("0:abc").is_err());
+        assert!(parse_specific_offsets("abc:100").is_err());
+        assert!(parse_specific_offsets("0:100:extra").is_err());
+    }
+
+    #[test]
+    fn test_parse_startup_mode_from_config() {
+        let cfg =
+            KafkaSourceConfig::from_config(&make_config(&[("startup.mode", "earliest")])).unwrap();
+        assert_eq!(cfg.startup_mode, StartupMode::Earliest);
+
+        let cfg =
+            KafkaSourceConfig::from_config(&make_config(&[("startup.mode", "latest")])).unwrap();
+        assert_eq!(cfg.startup_mode, StartupMode::Latest);
+
+        let cfg =
+            KafkaSourceConfig::from_config(&make_config(&[("startup.mode", "group-offsets")]))
+                .unwrap();
+        assert_eq!(cfg.startup_mode, StartupMode::GroupOffsets);
+    }
+
+    #[test]
+    fn test_parse_startup_specific_offsets_from_config() {
+        let cfg = KafkaSourceConfig::from_config(&make_config(&[(
+            "startup.specific.offsets",
+            "0:100,1:200",
+        )]))
+        .unwrap();
+
+        match cfg.startup_mode {
+            StartupMode::SpecificOffsets(offsets) => {
+                assert_eq!(offsets.get(&0), Some(&100));
+                assert_eq!(offsets.get(&1), Some(&200));
+            }
+            _ => panic!("expected SpecificOffsets"),
+        }
+    }
+
+    #[test]
+    fn test_parse_startup_timestamp_from_config() {
+        let cfg =
+            KafkaSourceConfig::from_config(&make_config(&[("startup.timestamp.ms", "1234567890")]))
+                .unwrap();
+
+        assert_eq!(cfg.startup_mode, StartupMode::Timestamp(1234567890));
+    }
+
+    #[test]
+    fn test_parse_schema_registry_ssl_fields() {
+        let cfg = KafkaSourceConfig::from_config(&make_config(&[
+            ("schema.registry.url", "https://sr:8081"),
+            ("schema.registry.ssl.ca.location", "/ca.pem"),
+            ("schema.registry.ssl.certificate.location", "/cert.pem"),
+            ("schema.registry.ssl.key.location", "/key.pem"),
+        ]))
+        .unwrap();
+
+        assert_eq!(
+            cfg.schema_registry_ssl_ca_location,
+            Some("/ca.pem".to_string())
+        );
+        assert_eq!(
+            cfg.schema_registry_ssl_certificate_location,
+            Some("/cert.pem".to_string())
+        );
+        assert_eq!(
+            cfg.schema_registry_ssl_key_location,
+            Some("/key.pem".to_string())
+        );
     }
 }
