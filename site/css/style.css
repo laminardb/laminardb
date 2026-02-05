@@ -735,6 +735,58 @@ ul, ol { list-style: none; }
   font-family: var(--font-mono);
 }
 
+/* Architecture detail cards */
+.arch-details-grid {
+  display: grid;
+  grid-template-columns: repeat(auto-fit, minmax(320px, 1fr));
+  gap: 1.5rem;
+  margin-top: 2rem;
+}
+.arch-detail-card {
+  background: var(--glass-bg);
+  border: 1px solid var(--glass-border);
+  border-radius: var(--radius);
+  padding: 1.5rem;
+}
+.arch-detail-card h3 {
+  font-size: 1rem;
+  font-weight: 700;
+  color: var(--accent-primary);
+  margin-bottom: 1rem;
+  text-transform: uppercase;
+  letter-spacing: 0.05em;
+}
+.arch-ascii {
+  background: var(--bg-primary);
+  border: 1px solid var(--glass-border);
+  border-radius: var(--radius-sm);
+  padding: 1rem;
+  font-family: var(--font-mono);
+  font-size: 0.75rem;
+  line-height: 1.4;
+  color: var(--accent-secondary);
+  overflow-x: auto;
+  margin-bottom: 1rem;
+  white-space: pre;
+}
+.arch-detail-list {
+  display: flex;
+  flex-direction: column;
+  gap: 0.5rem;
+}
+.arch-detail-list li {
+  font-size: 0.85rem;
+  color: var(--text-secondary);
+  line-height: 1.5;
+}
+.arch-detail-list li strong {
+  color: var(--text-primary);
+}
+@media (max-width: 768px) {
+  .arch-details-grid { grid-template-columns: 1fr; }
+  .arch-ascii { font-size: 0.65rem; padding: 0.75rem; }
+}
+
 /* --- Use Cases --- */
 .use-cases { padding: var(--section-padding); }
 .use-cases-grid {
