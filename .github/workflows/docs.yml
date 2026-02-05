@@ -7,6 +7,7 @@ on:
       - 'docs/**'
       - 'crates/**/*.rs'
       - 'Cargo.toml'
+      - 'site/**'
       - '.github/workflows/docs.yml'
   release:
     types: [published]
@@ -51,112 +52,14 @@ jobs:
 
       - name: Prepare site structure
         run: |
-          mkdir -p site
+          # Start with the existing landing page from the repo
+          cp -r site/ _site/
 
-          # Landing page
-          cat > site/index.html << 'EOF'
-          <!DOCTYPE html>
-          <html lang="en">
-          <head>
-            <meta charset="utf-8">
-            <meta name="viewport" content="width=device-width, initial-scale=1">
-            <title>LaminarDB Documentation</title>
-            <style>
-              :root {
-                --bg: #0d1117;
-                --fg: #c9d1d9;
-                --accent: #58a6ff;
-                --border: #30363d;
-              }
-              body {
-                font-family: -apple-system, BlinkMacSystemFont, 'Segoe UI', Helvetica, Arial, sans-serif;
-                background: var(--bg);
-                color: var(--fg);
-                max-width: 900px;
-                margin: 0 auto;
-                padding: 2rem;
-                line-height: 1.6;
-              }
-              h1 { color: var(--accent); border-bottom: 1px solid var(--border); padding-bottom: 0.5rem; }
-              h2 { color: var(--fg); margin-top: 2rem; }
-              a { color: var(--accent); text-decoration: none; }
-              a:hover { text-decoration: underline; }
-              .cards { display: grid; grid-template-columns: repeat(auto-fit, minmax(280px, 1fr)); gap: 1rem; margin: 1.5rem 0; }
-              .card {
-                background: #161b22;
-                border: 1px solid var(--border);
-                border-radius: 6px;
-                padding: 1.5rem;
-                transition: border-color 0.2s;
-              }
-              .card:hover { border-color: var(--accent); }
-              .card h3 { margin: 0 0 0.5rem 0; }
-              .card p { margin: 0; color: #8b949e; font-size: 0.95em; }
-              code { background: #21262d; padding: 0.2rem 0.4rem; border-radius: 3px; font-size: 0.9em; }
-              pre { background: #161b22; padding: 1rem; border-radius: 6px; overflow-x: auto; }
-              .badge { display: inline-block; padding: 0.2rem 0.5rem; border-radius: 3px; font-size: 0.75em; margin-right: 0.5rem; }
-              .badge-perf { background: #238636; color: white; }
-              .badge-sql { background: #1f6feb; color: white; }
-              footer { margin-top: 3rem; padding-top: 1rem; border-top: 1px solid var(--border); font-size: 0.9em; color: #8b949e; }
-            </style>
-          </head>
-          <body>
-            <h1>LaminarDB</h1>
-            <p>
-              <span class="badge badge-perf">&lt;500ns latency</span>
-              <span class="badge badge-sql">SQL native</span>
-            </p>
-            <p>
-              High-performance embedded streaming SQL database. Thread-per-core architecture,
-              exactly-once semantics, sub-microsecond latency.
-            </p>
+          # Add API docs to the site
+          cp -r target/doc _site/api
 
-            <h2>Quick Start</h2>
-            <pre><code>cargo add laminar-db</code></pre>
-
-            <h2>Crates</h2>
-            <div class="cards">
-              <a href="api/laminar_db/" class="card">
-                <h3>laminar-db</h3>
-                <p>Main facade crate - start here</p>
-              </a>
-              <a href="api/laminar_core/" class="card">
-                <h3>laminar-core</h3>
-                <p>Reactor, state stores, operators, thread-per-core</p>
-              </a>
-              <a href="api/laminar_sql/" class="card">
-                <h3>laminar-sql</h3>
-                <p>SQL parser, DataFusion, streaming extensions</p>
-              </a>
-              <a href="api/laminar_storage/" class="card">
-                <h3>laminar-storage</h3>
-                <p>WAL, checkpointing, recovery</p>
-              </a>
-              <a href="api/laminar_connectors/" class="card">
-                <h3>laminar-connectors</h3>
-                <p>Kafka, PostgreSQL, MySQL, Delta Lake, Iceberg</p>
-              </a>
-            </div>
-
-            <h2>Resources</h2>
-            <ul>
-              <li><a href="https://github.com/laminardb/laminardb">GitHub Repository</a></li>
-              <li><a href="https://github.com/laminardb/laminardb/blob/main/docs/ARCHITECTURE.md">Architecture Guide</a></li>
-              <li><a href="https://github.com/laminardb/laminardb/blob/main/CHANGELOG.md">Changelog</a></li>
-            </ul>
-
-            <footer>
-              Built with Rust. Licensed under Apache 2.0.
-            </footer>
-          </body>
-          </html>
-          EOF
-
-          # Copy API docs
-          cp -r target/doc site/api
-
-          # Redirect for api root
-          cat > site/api/index.html << 'EOF'
+          # Create redirect for api root
+          cat > _site/api/index.html << 'EOF'
           <!DOCTYPE html>
           <html>
           <head><meta http-equiv="refresh" content="0; url=laminar_db/"></head>
@@ -167,7 +70,7 @@ jobs:
       - name: Upload Pages artifact
         uses: actions/upload-pages-artifact@v4
         with:
-          path: site
+          path: _site
 
   deploy:
     name: Deploy to GitHub Pages
