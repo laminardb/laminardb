@@ -228,10 +228,10 @@ jobs:
           components: miri
       - uses: Swatinem/rust-cache@v2
       - name: Setup Miri
-        run: cargo miri setup
+        run: cargo +nightly miri setup
       - name: Run Miri on core
         run: |
-          cargo miri test -p laminar-core --lib -- \
+          cargo +nightly miri test -p laminar-core --lib -- \
             --skip test_tpc \
             --skip test_numa \
             --skip test_io_uring \
