@@ -17,7 +17,7 @@ opentelemetry-prometheus = "0.14"
 
 # Tracing
 tracing = { workspace = true }
-tracing-opentelemetry = "0.22"
+tracing-opentelemetry = "0.32"
 
 # Health checks
 axum = "0.8"
