@@ -27,7 +27,7 @@ use crate::serde::{self, Format, RecordDeserializer};
 
 use super::avro::AvroDeserializer;
 use super::backpressure::BackpressureController;
-use super::config::KafkaSourceConfig;
+use super::config::{KafkaSourceConfig, TopicSubscription};
 use super::metrics::KafkaSourceMetrics;
 use super::offsets::OffsetTracker;
 use super::rebalance::RebalanceState;
@@ -224,7 +224,7 @@ impl SourceConnector for KafkaSource {
 
         info!(
             brokers = %kafka_config.bootstrap_servers,
-            topics = ?kafka_config.topics,
+            subscription = ?kafka_config.subscription,
             group_id = %kafka_config.group_id,
             format = %kafka_config.format,
             schema_fields = self.schema.fields().len(),
@@ -237,11 +237,26 @@ impl SourceConnector for KafkaSource {
             ConnectorError::ConnectionFailed(format!("failed to create consumer: {e}"))
         })?;
 
-        // Subscribe to topics.
-        let topics: Vec<&str> = kafka_config.topics.iter().map(String::as_str).collect();
-        consumer
-            .subscribe(&topics)
-            .map_err(|e| ConnectorError::ConnectionFailed(format!("failed to subscribe: {e}")))?;
+        // Subscribe to topics (list or regex pattern).
+        match &kafka_config.subscription {
+            TopicSubscription::Topics(topics) => {
+                let topic_refs: Vec<&str> = topics.iter().map(String::as_str).collect();
+                consumer.subscribe(&topic_refs).map_err(|e| {
+                    ConnectorError::ConnectionFailed(format!("failed to subscribe: {e}"))
+                })?;
+            }
+            TopicSubscription::Pattern(pattern) => {
+                // rdkafka requires a ^ prefix for regex patterns
+                let regex_pattern = if pattern.starts_with('^') {
+                    pattern.clone()
+                } else {
+                    format!("^{pattern}")
+                };
+                consumer.subscribe(&[&regex_pattern]).map_err(|e| {
+                    ConnectorError::ConnectionFailed(format!("failed to subscribe to pattern: {e}"))
+                })?;
+            }
+        }
 
         self.consumer = Some(consumer);
         self.state = ConnectorState::Running;
@@ -432,7 +447,7 @@ impl std::fmt::Debug for KafkaSource {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         f.debug_struct("KafkaSource")
             .field("state", &self.state)
-            .field("topics", &self.config.topics)
+            .field("subscription", &self.config.subscription)
             .field("group_id", &self.config.group_id)
             .field("format", &self.config.format)
             .field("partitions", &self.offsets.partition_count())
@@ -502,7 +517,7 @@ mod tests {
         let mut cfg = KafkaSourceConfig::default();
         cfg.bootstrap_servers = "localhost:9092".into();
         cfg.group_id = "test-group".into();
-        cfg.topics = vec!["events".into()];
+        cfg.subscription = TopicSubscription::Topics(vec!["events".into()]);
         cfg
     }
 
