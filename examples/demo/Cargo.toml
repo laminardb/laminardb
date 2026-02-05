@@ -47,6 +47,6 @@ crossterm = "0.28"
 sysinfo = "0.33"
 
 # Kafka (optional)
-rdkafka = { version = "0.36", features = ["cmake-build"], optional = true }
+rdkafka = { version = "0.39", features = ["cmake-build"], optional = true }
 serde = { version = "1.0", features = ["derive"], optional = true }
 serde_json = { version = "1.0", optional = true }

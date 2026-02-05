@@ -15,7 +15,7 @@ laminar-core = { path = "../laminar-core" }
 laminar-storage = { path = "../laminar-storage" }
 
 # Kafka
-rdkafka = { version = "0.36", features = ["cmake-build"], optional = true }
+rdkafka = { version = "0.39", features = ["cmake-build"], optional = true }
 arrow-avro = { version = "57.2", optional = true }
 reqwest = { version = "0.12", default-features = false, features = ["json", "rustls-tls"], optional = true }
 
