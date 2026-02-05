@@ -5,9 +5,43 @@
 
 ## Last Session
 
-**Date**: 2026-02-03
+**Date**: 2026-02-05
 
 ### What Was Accomplished
+- **F031A: Delta Lake I/O Integration** - IMPLEMENTATION COMPLETE (13 new integration tests)
+  - `lakehouse/delta_io.rs` (NEW): All deltalake crate integration functions
+    - `path_to_url()`: Convert local/S3/Azure/GCS paths to URL
+    - `open_or_create_table()`: Open existing or create new Delta table via `deltalake` crate
+    - `write_batches()`: Write RecordBatches with exactly-once txn metadata
+    - `get_last_committed_epoch()`: Recovery support via txn action in Delta log
+    - `get_table_schema()`: Schema discovery from existing table
+  - `lakehouse/delta.rs`: Added `Option<DeltaTable>` field, cfg-gated real I/O methods
+    - `open()` now calls `delta_io::open_or_create_table()` and recovers last committed epoch
+    - `flush_buffer_to_delta()`: NEW async method for real Parquet writes
+    - `commit_epoch()`: Flushes buffer to Delta Lake when feature enabled
+  - `lakehouse/mod.rs`: Added `#[cfg(feature = "delta-lake")] pub mod delta_io`
+  - `Cargo.toml`: Added `url` dependency for delta-lake feature
+  - 8 business-logic-only tests gated with `#[cfg(not(feature = "delta-lake"))]`
+  - All clippy clean with `-D warnings`
+  - Tests: 86 pass with feature, 81 pass without feature
+
+Previous session (2026-02-05):
+- **F025/F026 Kafka Connector Enhancement** - CRITICAL GAPS COMPLETE (140 tests passing)
+  - `config.rs`: Added SecurityProtocol enum (plaintext/ssl/sasl_plaintext/sasl_ssl) with uses_ssl(), uses_sasl() helpers
+  - `config.rs`: Added SaslMechanism enum (PLAIN/SCRAM-SHA-256/SCRAM-SHA-512/GSSAPI/OAUTHBEARER) with requires_credentials()
+  - `config.rs`: Added IsolationLevel enum (read_uncommitted/read_committed) for transactional pipelines
+  - `config.rs`: Added TopicSubscription enum (Topics/Pattern) for regex-based topic subscription
+  - `config.rs`: Added explicit security fields (sasl_username, sasl_password, ssl_ca_location, ssl_certificate_location, ssl_key_location, ssl_key_password)
+  - `config.rs`: Added fetch tuning fields (fetch_min_bytes, fetch_max_bytes, fetch_max_wait_ms, max_partition_fetch_bytes)
+  - `config.rs`: Added include_headers and schema_registry_ssl_ca_location
+  - `sink_config.rs`: Added security fields and batch_num_messages
+  - `source.rs`: Updated to use TopicSubscription with regex pattern support
+  - `mod.rs`: Added 45+ ConfigKeySpec entries for documentation/discovery
+  - Validation: SASL requires mechanism, credential-based mechanisms require username/password
+  - All clippy clean with `-D warnings`, 140 Kafka tests pass
+  - Gap analysis document: `docs/features/phase-3/F025-F026-kafka-connector-gaps.md`
+
+Previous session (2026-02-03):
 - **F-STREAM-010: Broadcast Channel** - IMPLEMENTATION COMPLETE (42 new tests)
   - `streaming/broadcast.rs`: BroadcastChannel<T> (shared ring buffer SPMC), BroadcastConfig, BroadcastConfigBuilder, SlowSubscriberPolicy (Block/DropSlow/SkipForSlow), SubscriberInfo, BroadcastError (31 tests)
   - `planner/channel_derivation.rs`: DerivedChannelType (Spsc/Broadcast), derive_channel_types(), SourceDefinition, MvDefinition, analyze_mv_sources(), derive_channel_types_detailed() (11 tests)
@@ -164,10 +198,10 @@ Previous session (2026-01-28):
 - Performance Audit: ALL 10 issues fixed
 - F074-F077: Aggregation Semantics Enhancement - COMPLETE (219 tests)
 
-**Total tests**: 1272 core + 412 sql + 115 storage + 120 laminar-db + 427 connectors + 4 demo = 2350 (base), +84 postgres-sink-only + 107 postgres-cdc-only + 118 kafka-only = 2659 (with feature flags)
+**Total tests**: 1272 core + 412 sql + 115 storage + 120 laminar-db + 440 connectors + 4 demo = 2363 (base), +84 postgres-sink-only + 107 postgres-cdc-only + 118 kafka-only + 13 delta-lake-only = 2685 (with feature flags)
 
 ### Where We Left Off
-**Phase 3 Connectors & Integration: 36/48 features COMPLETE (75%)**
+**Phase 3 Connectors & Integration: 37/49 features COMPLETE (76%)**
 - Streaming API core complete (F-STREAM-001 to F-STREAM-007, F-STREAM-013)
 - Developer API overhaul complete (laminar-derive, laminar-db crates)
 - DAG pipeline complete (F-DAG-001 to F-DAG-007)
@@ -177,6 +211,7 @@ Previous session (2026-01-28):
 - PostgreSQL Sink complete (F027B) — 84 tests, COPY BINARY + upsert + exactly-once
 - MySQL CDC Source complete (F028) — 119 tests, binlog decoder + GTID + Z-set changelog
 - Delta Lake Sink business logic complete (F031) — 73 tests, buffering + epoch management + changelog splitting
+- **Delta Lake I/O Integration complete (F031A)** — 13 new integration tests, real deltalake crate writes with exactly-once txn metadata
 - Apache Iceberg Sink business logic complete (F032) — 103 tests, REST/Glue/Hive catalogs + partition transforms + equality deletes
 - **Connector SDK complete (F034)** — 68 tests, retry/circuit breaker + rate limiting + test harness + builders + defaults + schema discovery
 - **Broadcast Channel complete (F-STREAM-010)** — 42 tests, shared ring buffer SPMC + query plan derivation + slow subscriber policies
@@ -185,18 +220,17 @@ Previous session (2026-01-28):
 - Performance Validation complete (F-DAG-007) — 16 benchmarks, performance audit + optimizations
 - Reactive Subscription System complete (F-SUB-001 to F-SUB-008) — 8 features, 10 new modules
 - Cloud Storage Infrastructure complete (F-CLOUD-001/002/003) — 82 tests, integrated with Delta Lake Sink
-- Delta Lake I/O extension specs created (F031A/B/C/D) — blocked by deltalake crate
-- Next: F029 MongoDB CDC Source or F033 Parquet File Source
+- Next: F028A MySQL CDC I/O, F029 MongoDB CDC Source, or F033 Parquet File Source
 
 ### Immediate Next Steps
 1. F028A: MySQL CDC binlog I/O (mysql_async now ready with rustls)
-2. F029: MongoDB CDC Source
-3. F033: Parquet File Source
-4. F031A/B/C/D: Delta Lake I/O (when deltalake crate version aligns)
+2. F031B/C/D: Delta Lake Recovery, Compaction, Schema Evolution
+3. F029: MongoDB CDC Source
+4. F033: Parquet File Source
 5. F032A: Iceberg I/O (when iceberg-rust crate can be added)
 
 ### Open Issues
-- **deltalake crate version**: Incompatible with workspace DataFusion version. F031A/B/C/D blocked until resolved. Track [delta-rs releases](https://github.com/delta-io/delta-rs/releases).
+- **deltalake crate version**: ✅ RESOLVED - Using git main branch with DataFusion 52.x. F031A complete.
 - **mysql_async crate**: ✅ RESOLVED - Now using rustls TLS backend (no OpenSSL required). F028A ready for implementation.
 - **iceberg-rust crate**: Deferred until version compatible with workspace. Business logic complete in F032.
 - None currently blocking.

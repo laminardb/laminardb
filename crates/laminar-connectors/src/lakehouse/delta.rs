@@ -27,6 +27,12 @@ use arrow_schema::SchemaRef;
 use async_trait::async_trait;
 use tracing::{debug, info, warn};
 
+#[cfg(feature = "delta-lake")]
+use deltalake::DeltaTable;
+
+#[cfg(feature = "delta-lake")]
+use deltalake::protocol::SaveMode;
+
 use crate::config::{ConnectorConfig, ConnectorState};
 use crate::connector::{SinkConnector, SinkConnectorCapabilities, WriteResult};
 use crate::error::ConnectorError;
@@ -80,6 +86,9 @@ pub struct DeltaLakeSink {
     buffer_start_time: Option<Instant>,
     /// Sink metrics.
     metrics: DeltaLakeSinkMetrics,
+    /// Delta Lake table handle (present when `delta-lake` feature is enabled).
+    #[cfg(feature = "delta-lake")]
+    table: Option<DeltaTable>,
 }
 
 impl DeltaLakeSink {
@@ -99,6 +108,8 @@ impl DeltaLakeSink {
             delta_version: 0,
             buffer_start_time: None,
             metrics: DeltaLakeSinkMetrics::new(),
+            #[cfg(feature = "delta-lake")]
+            table: None,
         }
     }
 
@@ -216,7 +227,87 @@ impl DeltaLakeSink {
         WriteResult::new(total_rows, estimated_bytes)
     }
 
+    /// Flushes buffered data to Delta Lake when the `delta-lake` feature is enabled.
+    ///
+    /// This writes the buffered `RecordBatch`es to Parquet files and commits them
+    /// as a Delta Lake transaction with the current epoch in txn metadata.
+    #[cfg(feature = "delta-lake")]
+    async fn flush_buffer_to_delta(&mut self) -> Result<WriteResult, ConnectorError> {
+        if self.buffer.is_empty() {
+            return Ok(WriteResult::new(0, 0));
+        }
+
+        let total_rows = self.buffered_rows;
+        let estimated_bytes: u64 = self
+            .buffer
+            .iter()
+            .map(|b| b.get_array_memory_size() as u64)
+            .sum();
+
+        // Take the table and buffer for the write operation.
+        let table = self.table.take().ok_or_else(|| {
+            ConnectorError::InvalidState {
+                expected: "table initialized".into(),
+                actual: "table not initialized".into(),
+            }
+        })?;
+
+        let batches = std::mem::take(&mut self.buffer);
+
+        // Determine save mode.
+        let save_mode = match self.config.write_mode {
+            DeltaWriteMode::Append | DeltaWriteMode::Upsert => SaveMode::Append,
+            DeltaWriteMode::Overwrite => SaveMode::Overwrite,
+        };
+
+        // Get partition columns if configured.
+        let partition_cols = if self.config.partition_columns.is_empty() {
+            None
+        } else {
+            Some(self.config.partition_columns.clone())
+        };
+
+        // Write to Delta Lake.
+        let (new_table, version) = super::delta_io::write_batches(
+            table,
+            batches,
+            &self.config.writer_id,
+            self.current_epoch,
+            save_mode,
+            partition_cols,
+        )
+        .await?;
+
+        // Restore table and update state.
+        // Note: Delta Lake uses i64 for version, but our version is u64.
+        // Versions are always non-negative, so this is safe.
+        self.table = Some(new_table);
+        #[allow(clippy::cast_sign_loss)]
+        {
+            self.delta_version = version as u64;
+        }
+        self.pending_files = 0;
+        self.buffered_rows = 0;
+        self.buffered_bytes = 0;
+        self.buffer_start_time = None;
+
+        self.metrics
+            .record_flush(total_rows as u64, estimated_bytes);
+        self.metrics.record_commit(self.delta_version);
+
+        debug!(
+            rows = total_rows,
+            bytes = estimated_bytes,
+            delta_version = self.delta_version,
+            "Delta Lake: flushed and committed buffer"
+        );
+
+        Ok(WriteResult::new(total_rows, estimated_bytes))
+    }
+
     /// Commits pending files as a Delta Lake transaction (updates metrics).
+    /// Only used when the delta-lake feature is NOT enabled (local simulation).
+    #[cfg(not(feature = "delta-lake"))]
     fn commit_local(&mut self, epoch: u64) {
         self.delta_version += 1;
         self.pending_files = 0;
@@ -300,11 +391,48 @@ impl SinkConnector for DeltaLakeSink {
             "opening Delta Lake sink connector"
         );
 
-        // NOTE: In production with the `delta-lake` feature, this is where we would:
-        // 1. Open or create the Delta Lake table via deltalake::open_table_with_storage_options
-        // 2. Resolve last committed epoch from txn metadata for exactly-once recovery
-        // 3. Read existing table schema
-        // 4. Start background compaction manager if enabled
+        // When delta-lake feature is enabled, open/create the actual table.
+        #[cfg(feature = "delta-lake")]
+        {
+            use super::delta_io;
+
+            // Open or create the Delta Lake table.
+            let table = delta_io::open_or_create_table(
+                &self.config.table_path,
+                self.config.storage_options.clone(),
+                self.schema.as_ref(),
+            )
+            .await?;
+
+            // Read schema from existing table if we don't have one.
+            if self.schema.is_none() {
+                if let Ok(schema) = delta_io::get_table_schema(&table) {
+                    self.schema = Some(schema);
+                }
+            }
+
+            // Resolve last committed epoch for exactly-once recovery.
+            if self.config.delivery_guarantee == DeliveryGuarantee::ExactlyOnce {
+                self.last_committed_epoch =
+                    delta_io::get_last_committed_epoch(&table, &self.config.writer_id).await;
+                if self.last_committed_epoch > 0 {
+                    info!(
+                        writer_id = %self.config.writer_id,
+                        last_committed_epoch = self.last_committed_epoch,
+                        "recovered last committed epoch from Delta Lake txn metadata"
+                    );
+                }
+            }
+
+            // Store the Delta version.
+            // Note: Delta Lake uses i64 for version, but our version is u64.
+            // Versions are always non-negative, so this is safe.
+            #[allow(clippy::cast_sign_loss)]
+            {
+                self.delta_version = table.version().unwrap_or(0) as u64;
+            }
+            self.table = Some(table);
+        }
 
         self.state = ConnectorState::Running;
 
@@ -387,14 +515,27 @@ impl SinkConnector for DeltaLakeSink {
             return Ok(());
         }
 
-        // Flush any remaining buffered data.
-        if !self.buffer.is_empty() {
-            let _ = self.flush_buffer_local();
+        // When delta-lake feature is enabled, use real I/O.
+        #[cfg(feature = "delta-lake")]
+        {
+            // Flush any remaining buffered data to Delta Lake.
+            if !self.buffer.is_empty() {
+                self.flush_buffer_to_delta().await?;
+            }
         }
 
-        // Commit all pending files as a single Delta Lake transaction.
-        if self.pending_files > 0 {
-            self.commit_local(epoch);
+        // When delta-lake feature is NOT enabled, use local simulation.
+        #[cfg(not(feature = "delta-lake"))]
+        {
+            // Flush any remaining buffered data.
+            if !self.buffer.is_empty() {
+                let _ = self.flush_buffer_local();
+            }
+
+            // Commit all pending files as a single Delta Lake transaction.
+            if self.pending_files > 0 {
+                self.commit_local(epoch);
+            }
         }
 
         self.last_committed_epoch = epoch;
@@ -457,7 +598,14 @@ impl SinkConnector for DeltaLakeSink {
 
     async fn flush(&mut self) -> Result<(), ConnectorError> {
         if !self.buffer.is_empty() {
-            let _ = self.flush_buffer_local();
+            #[cfg(feature = "delta-lake")]
+            {
+                self.flush_buffer_to_delta().await?;
+            }
+            #[cfg(not(feature = "delta-lake"))]
+            {
+                let _ = self.flush_buffer_local();
+            }
         }
         Ok(())
     }
@@ -467,11 +615,24 @@ impl SinkConnector for DeltaLakeSink {
 
         // Flush remaining data.
         if !self.buffer.is_empty() {
-            let _ = self.flush_buffer_local();
-            if self.pending_files > 0 {
-                self.commit_local(self.current_epoch);
-                self.last_committed_epoch = self.current_epoch;
+            #[cfg(feature = "delta-lake")]
+            {
+                self.flush_buffer_to_delta().await?;
             }
+            #[cfg(not(feature = "delta-lake"))]
+            {
+                let _ = self.flush_buffer_local();
+                if self.pending_files > 0 {
+                    self.commit_local(self.current_epoch);
+                    self.last_committed_epoch = self.current_epoch;
+                }
+            }
+        }
+
+        // Drop the table handle when closing.
+        #[cfg(feature = "delta-lake")]
+        {
+            self.table = None;
         }
 
         self.state = ConnectorState::Closed;
@@ -745,7 +906,11 @@ mod tests {
     }
 
     // ── Epoch lifecycle tests ──
+    // Note: These tests bypass open() and test business logic only.
+    // With the delta-lake feature, commit_epoch() does real I/O which fails without a table.
+    // See delta_io.rs for integration tests with real I/O.
 
+    #[cfg(not(feature = "delta-lake"))]
     #[tokio::test]
     async fn test_epoch_lifecycle() {
         let mut sink = DeltaLakeSink::new(test_config());
@@ -771,6 +936,7 @@ mod tests {
         assert_eq!(commits.unwrap().1, 1.0);
     }
 
+    #[cfg(not(feature = "delta-lake"))]
     #[tokio::test]
     async fn test_epoch_skip_already_committed() {
         let mut config = test_config();
@@ -796,6 +962,7 @@ mod tests {
         assert_eq!(sink.delta_version(), 1); // No new version
     }
 
+    #[cfg(not(feature = "delta-lake"))]
     #[tokio::test]
     async fn test_epoch_at_least_once_no_skip() {
         let mut config = test_config();
@@ -843,6 +1010,7 @@ mod tests {
         assert_eq!(sink.delta_version(), 0); // No version bump (no files)
     }
 
+    #[cfg(not(feature = "delta-lake"))]
     #[tokio::test]
     async fn test_sequential_epochs() {
         let mut sink = DeltaLakeSink::new(test_config());
@@ -860,7 +1028,9 @@ mod tests {
     }
 
     // ── Flush tests ──
+    // Note: These tests bypass open() and test business logic only.
 
+    #[cfg(not(feature = "delta-lake"))]
     #[tokio::test]
     async fn test_explicit_flush() {
         let mut config = test_config();
@@ -881,7 +1051,11 @@ mod tests {
     }
 
     // ── Open and close tests ──
+    // Note: These tests use fake paths that don't exist.
+    // With the delta-lake feature, open() tries to actually access the path.
+    // See delta_io.rs for integration tests with real I/O.
 
+    #[cfg(not(feature = "delta-lake"))]
     #[tokio::test]
     async fn test_open() {
         let mut sink = DeltaLakeSink::new(test_config());
@@ -892,6 +1066,7 @@ mod tests {
         assert_eq!(sink.state(), ConnectorState::Running);
     }
 
+    #[cfg(not(feature = "delta-lake"))]
     #[tokio::test]
     async fn test_open_with_properties() {
         let mut sink = DeltaLakeSink::new(DeltaLakeSinkConfig::default());
@@ -914,6 +1089,7 @@ mod tests {
         assert_eq!(sink.state(), ConnectorState::Closed);
     }
 
+    #[cfg(not(feature = "delta-lake"))]
     #[tokio::test]
     async fn test_close_flushes_remaining() {
         let mut config = test_config();

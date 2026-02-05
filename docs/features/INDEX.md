@@ -7,10 +7,10 @@
 | Phase 1 | 12 | 0 | 0 | 0 | 12 |
 | Phase 1.5 | 1 | 0 | 0 | 0 | 1 |
 | Phase 2 | 34 | 0 | 0 | 0 | 34 |
-| Phase 3 | 49 | 13 | 0 | 0 | 36 |
+| Phase 3 | 49 | 12 | 0 | 0 | 37 |
 | Phase 4 | 11 | 11 | 0 | 0 | 0 |
 | Phase 5 | 10 | 10 | 0 | 0 | 0 |
-| **Total** | **117** | **34** | **0** | **0** | **83** |
+| **Total** | **117** | **33** | **0** | **0** | **84** |
 
 ## Status Legend
 
@@ -170,7 +170,7 @@ See [Cloud Storage Index](phase-3/cloud/INDEX.md).
 | F029 | MongoDB CDC Source | 📝 | [Link](phase-3/F029-mongodb-cdc.md) |
 | F030 | Redis Lookup Table | 📝 | [Link](phase-3/F030-redis-lookup.md) |
 | F031 | Delta Lake Sink | ✅ | [Link](phase-3/F031-delta-lake-sink.md) |
-| F031A | Delta Lake I/O Integration | 📝 | [Link](phase-3/F031A-delta-lake-io.md) |
+| F031A | Delta Lake I/O Integration | ✅ | [Link](phase-3/F031A-delta-lake-io.md) |
 | F031B | Delta Lake Recovery | 📝 | [Link](phase-3/F031B-delta-lake-recovery.md) |
 | F031C | Delta Lake Compaction | 📝 | [Link](phase-3/F031C-delta-lake-compaction.md) |
 | F031D | Delta Lake Schema Evolution | 📝 | [Link](phase-3/F031D-delta-lake-schema-evolution.md) |
@@ -240,7 +240,8 @@ Remaining work for Phase 3:
 
 | Gap | Feature | Priority | Notes |
 |-----|---------|----------|-------|
-| Delta Lake I/O | F031A-D | P0/P1 | ✅ **UNBLOCKED** - deltalake git main has DF 52.x |
+| Delta Lake I/O | F031A | P0 | ✅ **COMPLETE** (2026-02-05) - 13 integration tests |
+| Delta Lake Advanced | F031B-D | P1 | Recovery, Compaction, Schema Evolution |
 | MySQL CDC I/O | F028A | P1 | Ready - mysql_async now using rustls (no OpenSSL) |
 | Iceberg I/O | F032A | P1 | Blocked by iceberg-datafusion 0.9.0 (needs DF 52.0 compat) |
 

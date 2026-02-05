@@ -59,6 +59,8 @@
 // Delta Lake modules
 pub mod delta;
 pub mod delta_config;
+#[cfg(feature = "delta-lake")]
+pub mod delta_io;
 pub mod delta_metrics;
 
 // Apache Iceberg modules
