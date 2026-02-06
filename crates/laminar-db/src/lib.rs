@@ -34,6 +34,30 @@ mod handle;
 mod sql_utils;
 mod stream_executor;
 
+/// FFI-friendly API for language bindings.
+///
+/// Enable with the `api` feature flag:
+/// ```toml
+/// laminar-db = { version = "0.1", features = ["api"] }
+/// ```
+///
+/// This module provides thread-safe types with numeric error codes,
+/// explicit resource management, and Arrow RecordBatch at all boundaries.
+#[cfg(feature = "api")]
+pub mod api;
+
+/// C FFI layer for LaminarDB.
+///
+/// Enable with the `ffi` feature flag:
+/// ```toml
+/// laminar-db = { version = "0.1", features = ["ffi"] }
+/// ```
+///
+/// This module provides `extern "C"` functions for calling LaminarDB from C
+/// and any language with C FFI support (Python, Java, Node.js, .NET, etc.).
+#[cfg(feature = "ffi")]
+pub mod ffi;
+
 pub use builder::LaminarDbBuilder;
 pub use catalog::{SourceCatalog, SourceEntry};
 pub use config::LaminarConfig;

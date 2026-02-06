@@ -5,9 +5,72 @@
 
 ## Last Session
 
-**Date**: 2026-02-05
+**Date**: 2026-02-06
 
 ### What Was Accomplished
+- **F-FFI-004: Async FFI Callbacks** - IMPLEMENTATION COMPLETE (9 new tests, 164 total)
+  - New `ffi/callback.rs` module for push-based subscription notifications:
+    - `LaminarSubscriptionCallback`: Function pointer type for data callbacks
+    - `LaminarErrorCallback`: Function pointer type for error callbacks
+    - `LaminarCompletionCallback`: Function pointer type for async completion (reserved for future use)
+    - `LaminarSubscriptionHandle`: Opaque handle for callback-based subscriptions
+    - `laminar_subscribe_callback()`: Create subscription with callbacks invoked from background thread
+    - `laminar_subscription_cancel()`: Stop receiving callbacks (thread-safe)
+    - `laminar_subscription_is_active()`: Check if subscription is still active
+    - `laminar_subscription_user_data()`: Retrieve user data pointer
+    - `laminar_subscription_free()`: Free subscription handle
+    - Event type constants: LAMINAR_EVENT_INSERT/DELETE/UPDATE/WATERMARK/SNAPSHOT
+  - Callbacks are serialized per-subscription (never concurrent for same handle)
+  - After cancel returns, no more callbacks will fire (safe to free user_data)
+  - Created feature spec `docs/features/phase-3/F-FFI-004-async-callbacks.md`
+  - All clippy clean with `-D warnings`, 164 laminar-db tests pass with `--features ffi`
+
+Previous session (2026-02-06):
+- **F-FFI-003: Arrow C Data Interface** - IMPLEMENTATION COMPLETE (5 new tests, 155 total)
+  - New `ffi/arrow_ffi.rs` module for zero-copy data exchange:
+    - `laminar_batch_export()`: Export RecordBatch to FFI_ArrowArray + FFI_ArrowSchema
+    - `laminar_schema_export()`: Export schema only to FFI_ArrowSchema
+    - `laminar_batch_export_column()`: Export single column to Arrow C Data Interface
+    - `laminar_batch_import()`: Import RecordBatch from Arrow C Data Interface
+    - `laminar_batch_create()`: Alias for import (for writing use case)
+  - Updated `Cargo.toml` to enable `arrow/ffi` feature when `ffi` feature is enabled
+  - Full round-trip test: export → import → verify data matches
+  - Zero-copy export enables PyArrow, Java Arrow, Node.js direct consumption
+  - All clippy clean with `-D warnings`, 155 laminar-db tests pass with `--features ffi`
+
+Previous session (2026-02-06):
+- **F-FFI-002: C Header Generation** - IMPLEMENTATION COMPLETE (21 new tests, 150 total)
+  - New `ffi` module in `laminar-db` crate (feature-gated, requires `api` feature):
+    - `ffi/error.rs`: Thread-local error storage, error codes (LAMINAR_OK, LAMINAR_ERR_*), laminar_last_error(), laminar_last_error_code(), laminar_clear_error()
+    - `ffi/connection.rs`: LaminarConnection opaque handle, laminar_open(), laminar_close(), laminar_execute(), laminar_query(), laminar_query_stream(), laminar_start(), laminar_is_closed()
+    - `ffi/schema.rs`: LaminarSchema opaque handle, laminar_get_schema(), laminar_list_sources(), laminar_schema_num_fields(), laminar_schema_field_name(), laminar_schema_field_type(), laminar_schema_free()
+    - `ffi/writer.rs`: LaminarWriter opaque handle, laminar_writer_create(), laminar_writer_write(), laminar_writer_flush(), laminar_writer_close(), laminar_writer_free()
+    - `ffi/query.rs`: LaminarQueryResult, LaminarQueryStream, LaminarRecordBatch opaque handles, result/stream/batch access functions
+    - `ffi/memory.rs`: laminar_string_free(), laminar_version()
+    - `ffi/mod.rs`: Public re-exports of all FFI functions
+  - Updated `lib.rs` to conditionally export ffi module with `#[cfg(feature = "ffi")]`
+  - Updated `Cargo.toml` with `ffi` feature (depends on `api` feature)
+  - All clippy clean with `-D warnings`, 150 laminar-db tests pass with `--features ffi`
+
+Previous session (2026-02-06):
+- **F-FFI-001: FFI API Module** - SPECIFICATION & IMPLEMENTATION COMPLETE (14 new tests)
+  - Created comprehensive FFI discovery and gap analysis documents
+  - **docs/ffi-discovery.md**: Codebase analysis for FFI support
+  - **docs/ffi-gap-analysis.md**: Required vs existing API comparison
+  - **docs/features/phase-3/F-FFI-001-api-module.md**: Full feature specification
+  - New `api` module in `laminar-db` crate (feature-gated):
+    - `api/error.rs`: ApiError with numeric codes (100-999 ranges), From<DbError> conversion
+    - `api/connection.rs`: Thread-safe Connection wrapper with Send + Sync, blocking execute()
+    - `api/query.rs`: QueryResult (materialized), QueryStream (streaming)
+    - `api/ingestion.rs`: Writer with explicit lifecycle management
+    - `api/subscription.rs`: ArrowSubscription for untyped RecordBatch consumption
+    - `api/mod.rs`: Public re-exports
+  - Updated `lib.rs` to conditionally export api module
+  - Updated `Cargo.toml` with `api` feature flag
+  - Updated `docs/features/INDEX.md` with FFI & Language Bindings section (4 features)
+  - All clippy clean with `-D warnings`, 129 laminar-db tests pass
+
+Previous session (2026-02-05):
 - **F031A: Delta Lake I/O Integration** - IMPLEMENTATION COMPLETE (13 new integration tests)
   - `lakehouse/delta_io.rs` (NEW): All deltalake crate integration functions
     - `path_to_url()`: Convert local/S3/Azure/GCS paths to URL
@@ -198,10 +261,10 @@ Previous session (2026-01-28):
 - Performance Audit: ALL 10 issues fixed
 - F074-F077: Aggregation Semantics Enhancement - COMPLETE (219 tests)
 
-**Total tests**: 1272 core + 412 sql + 115 storage + 120 laminar-db + 440 connectors + 4 demo = 2363 (base), +84 postgres-sink-only + 107 postgres-cdc-only + 118 kafka-only + 13 delta-lake-only = 2685 (with feature flags)
+**Total tests**: 1272 core + 412 sql + 115 storage + 164 laminar-db (with ffi) + 440 connectors + 4 demo = 2407 (base), +84 postgres-sink-only + 107 postgres-cdc-only + 118 kafka-only + 13 delta-lake-only = 2729 (with feature flags)
 
 ### Where We Left Off
-**Phase 3 Connectors & Integration: 37/49 features COMPLETE (76%)**
+**Phase 3 Connectors & Integration: 41/53 features COMPLETE (77%)**
 - Streaming API core complete (F-STREAM-001 to F-STREAM-007, F-STREAM-013)
 - Developer API overhaul complete (laminar-derive, laminar-db crates)
 - DAG pipeline complete (F-DAG-001 to F-DAG-007)
@@ -211,23 +274,27 @@ Previous session (2026-01-28):
 - PostgreSQL Sink complete (F027B) — 84 tests, COPY BINARY + upsert + exactly-once
 - MySQL CDC Source complete (F028) — 119 tests, binlog decoder + GTID + Z-set changelog
 - Delta Lake Sink business logic complete (F031) — 73 tests, buffering + epoch management + changelog splitting
-- **Delta Lake I/O Integration complete (F031A)** — 13 new integration tests, real deltalake crate writes with exactly-once txn metadata
+- Delta Lake I/O Integration complete (F031A) — 13 new integration tests, real deltalake crate writes with exactly-once txn metadata
 - Apache Iceberg Sink business logic complete (F032) — 103 tests, REST/Glue/Hive catalogs + partition transforms + equality deletes
-- **Connector SDK complete (F034)** — 68 tests, retry/circuit breaker + rate limiting + test harness + builders + defaults + schema discovery
-- **Broadcast Channel complete (F-STREAM-010)** — 42 tests, shared ring buffer SPMC + query plan derivation + slow subscriber policies
+- Connector SDK complete (F034) — 68 tests, retry/circuit breaker + rate limiting + test harness + builders + defaults + schema discovery
+- Broadcast Channel complete (F-STREAM-010) — 42 tests, shared ring buffer SPMC + query plan derivation + slow subscriber policies
 - SQL & MV Integration complete (F-DAG-005) — 18 new tests, DAG from MvRegistry, watermarks, changelog
 - Connector Bridge complete (F-DAG-006) — 25 new tests, source/sink bridge + runtime orchestration
 - Performance Validation complete (F-DAG-007) — 16 benchmarks, performance audit + optimizations
 - Reactive Subscription System complete (F-SUB-001 to F-SUB-008) — 8 features, 10 new modules
 - Cloud Storage Infrastructure complete (F-CLOUD-001/002/003) — 82 tests, integrated with Delta Lake Sink
-- Next: F028A MySQL CDC I/O, F029 MongoDB CDC Source, or F033 Parquet File Source
+- **FFI API Module complete (F-FFI-001)** — 14 new tests, Connection/Writer/QueryStream/ArrowSubscription with numeric error codes and Send+Sync
+- **C Header Generation complete (F-FFI-002)** — 21 new tests, extern "C" functions with opaque handles, thread-local error storage
+- **Arrow C Data Interface complete (F-FFI-003)** — 5 new tests, zero-copy export/import via FFI_ArrowArray/FFI_ArrowSchema
+- **Async FFI Callbacks complete (F-FFI-004)** — 9 new tests (164 total), callback-based subscription notifications from background thread
+- Next: F028A MySQL CDC I/O, F031B/C/D Delta Lake advanced, or F032A Iceberg I/O
 
 ### Immediate Next Steps
 1. F028A: MySQL CDC binlog I/O (mysql_async now ready with rustls)
 2. F031B/C/D: Delta Lake Recovery, Compaction, Schema Evolution
-3. F029: MongoDB CDC Source
-4. F033: Parquet File Source
-5. F032A: Iceberg I/O (when iceberg-rust crate can be added)
+3. F032A: Iceberg I/O (when iceberg-rust crate can be added)
+4. F029: MongoDB CDC Source
+5. F033: Parquet File Source
 
 ### Open Issues
 - **deltalake crate version**: ✅ RESOLVED - Using git main branch with DataFusion 52.x. F031A complete.

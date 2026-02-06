@@ -7,10 +7,10 @@
 | Phase 1 | 12 | 0 | 0 | 0 | 12 |
 | Phase 1.5 | 1 | 0 | 0 | 0 | 1 |
 | Phase 2 | 34 | 0 | 0 | 0 | 34 |
-| Phase 3 | 49 | 12 | 0 | 0 | 37 |
+| Phase 3 | 53 | 12 | 0 | 0 | 41 |
 | Phase 4 | 11 | 11 | 0 | 0 | 0 |
 | Phase 5 | 10 | 10 | 0 | 0 | 0 |
-| **Total** | **117** | **33** | **0** | **0** | **84** |
+| **Total** | **121** | **33** | **0** | **0** | **88** |
 
 ## Status Legend
 
@@ -196,6 +196,15 @@ See [Demo Index](phase-3/demo/INDEX.md).
 | F-DEMO-001 | Market Data Pipeline | 📝 | [Link](phase-3/demo/F-DEMO-001-market-data-pipeline.md) |
 | F-DEMO-002 | Ratatui TUI Dashboard | 📝 | [Link](phase-3/demo/F-DEMO-002-ratatui-tui.md) |
 | F-DEMO-003 | Kafka Integration & Docker | 📝 | [Link](phase-3/demo/F-DEMO-003-kafka-docker.md) |
+
+### FFI & Language Bindings
+
+| ID | Feature | Status | Spec |
+|----|---------|--------|------|
+| F-FFI-001 | API Module (Core FFI Surface) | ✅ | [Link](phase-3/F-FFI-001-api-module.md) |
+| F-FFI-002 | C Header Generation | ✅ | [Link](phase-3/F-FFI-002-c-headers.md) |
+| F-FFI-003 | Arrow C Data Interface | ✅ | [Link](phase-3/F-FFI-003-arrow-c-data-interface.md) |
+| F-FFI-004 | Async FFI Callbacks | ✅ | [Link](phase-3/F-FFI-004-async-callbacks.md) |
 
 ---
 

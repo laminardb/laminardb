@@ -11,6 +11,8 @@ description = "Unified database facade for LaminarDB"
 
 [features]
 default = []
+api = []  # FFI-friendly API module for language bindings
+ffi = ["api", "arrow/ffi"]  # C FFI layer (extern "C" functions, cbindgen headers, Arrow C Data Interface)
 kafka = ["laminar-connectors/kafka"]
 postgres-cdc = ["laminar-connectors/postgres-cdc"]
 postgres-sink = ["laminar-connectors/postgres-sink"]

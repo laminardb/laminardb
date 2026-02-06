@@ -50,7 +50,7 @@ bumpalo = "3.19"  # Arena allocator
 uuid = { version = "1.19", features = ["v4"] }  # Unique IDs
 
 # DataFusion and Arrow - using latest versions
-arrow = "57.2"
+arrow = { version = "57.2", default-features = true }
 arrow-array = "57.2"
 arrow-schema = "57.2"
 arrow-buffer = "57.2"
