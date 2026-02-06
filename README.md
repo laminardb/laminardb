@@ -41,7 +41,7 @@ See [docs/ARCHITECTURE.md](docs/ARCHITECTURE.md) for details.
 - [Architecture](docs/ARCHITECTURE.md)
 - [Development Roadmap](docs/ROADMAP.md)
 - [Contributing Guide](CONTRIBUTING.md)
-- [API Documentation](https://docs.laminardb.io)
+- [API Documentation](https://laminardb.io/api/)
 
 ## Performance
 

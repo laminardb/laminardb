@@ -6,7 +6,7 @@ edition.workspace = true
 license.workspace = true
 repository.workspace = true
 homepage.workspace = true
-documentation = "https://docs.laminardb.io/laminar-derive"
+documentation = "https://laminardb.io/api/laminar_derive"
 description = "Derive macros for LaminarDB Record and FromRecordBatch traits"
 
 [lib]
@@ -21,5 +21,5 @@ proc-macro2 = "1.0"
 arrow = { workspace = true }
 arrow-array = { workspace = true }
 arrow-schema = { workspace = true }
-laminar-core = { path = "../laminar-core" }
-laminar-connectors = { path = "../laminar-connectors" }
+laminar-core = { path = "../laminar-core", version = "0.1.0" }
+laminar-connectors = { path = "../laminar-connectors", version = "0.1.0" }

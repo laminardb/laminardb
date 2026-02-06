@@ -6,12 +6,12 @@ edition.workspace = true
 license.workspace = true
 repository.workspace = true
 homepage.workspace = true
-documentation = "https://docs.laminardb.io/laminar-sql"
+documentation = "https://laminardb.io/api/laminar_sql"
 description = "SQL layer for LaminarDB with streaming extensions"
 
 [dependencies]
 # Core dependency
-laminar-core = { path = "../laminar-core" }
+laminar-core = { path = "../laminar-core", version = "0.1.0" }
 
 # DataFusion for SQL processing
 datafusion = { workspace = true }

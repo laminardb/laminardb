@@ -6,7 +6,7 @@ edition.workspace = true
 license.workspace = true
 repository.workspace = true
 homepage.workspace = true
-documentation = "https://docs.laminardb.io/laminar-core"
+documentation = "https://laminardb.io/api/laminar_core"
 description = "Core streaming engine for LaminarDB - reactor, operators, and state management"
 
 [features]

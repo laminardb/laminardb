@@ -7,10 +7,10 @@
 | Phase 1 | 12 | 0 | 0 | 0 | 12 |
 | Phase 1.5 | 1 | 0 | 0 | 0 | 1 |
 | Phase 2 | 34 | 0 | 0 | 0 | 34 |
-| Phase 3 | 55 | 12 | 0 | 0 | 43 |
+| Phase 3 | 56 | 12 | 0 | 0 | 44 |
 | Phase 4 | 11 | 11 | 0 | 0 | 0 |
 | Phase 5 | 10 | 10 | 0 | 0 | 0 |
-| **Total** | **123** | **33** | **0** | **0** | **90** |
+| **Total** | **124** | **33** | **0** | **0** | **91** |
 
 ## Status Legend
 
@@ -101,7 +101,7 @@
 
 ## Phase 3: Connectors & Integration
 
-> **Status**: 43/55 features complete (78%)
+> **Status**: 44/56 features complete (79%)
 
 ### Streaming API ✅
 
@@ -167,6 +167,7 @@ See [Cloud Storage Index](phase-3/cloud/INDEX.md).
 | F027 | PostgreSQL CDC Source | ✅ | [Link](phase-3/F027-postgres-cdc.md) |
 | F027B | PostgreSQL Sink | ✅ | [Link](phase-3/F027B-postgres-sink.md) |
 | F028 | MySQL CDC Source | ✅ | [Link](phase-3/F028-mysql-cdc.md) |
+| F028A | MySQL CDC I/O Integration | ✅ | [Link](phase-3/F028A-mysql-cdc-io.md) |
 | F029 | MongoDB CDC Source | 📝 | [Link](phase-3/F029-mongodb-cdc.md) |
 | F030 | Redis Lookup Table | 📝 | [Link](phase-3/F030-redis-lookup.md) |
 | F031 | Delta Lake Sink | ✅ | [Link](phase-3/F031-delta-lake-sink.md) |
@@ -253,7 +254,7 @@ Remaining work for Phase 3:
 |-----|---------|----------|-------|
 | Delta Lake I/O | F031A | P0 | ✅ **COMPLETE** (2026-02-05) - 13 integration tests |
 | Delta Lake Advanced | F031B-D | P1 | Recovery, Compaction, Schema Evolution |
-| MySQL CDC I/O | F028A | P1 | Ready - mysql_async now using rustls (no OpenSSL) |
+| MySQL CDC I/O | F028A | P1 | ✅ **COMPLETE** (2026-02-06) - 21 new tests, mysql_async binlog I/O |
 | Iceberg I/O | F032A | P1 | Blocked by iceberg-datafusion 0.9.0 (needs DF 52.0 compat) |
 
 For historical gap analysis, see the [research documents](../research/).

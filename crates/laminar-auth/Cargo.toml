@@ -6,7 +6,7 @@ edition.workspace = true
 license.workspace = true
 repository.workspace = true
 homepage.workspace = true
-documentation = "https://docs.laminardb.io/laminar-auth"
+documentation = "https://laminardb.io/api/laminar_auth"
 description = "Authentication and authorization for LaminarDB"
 
 [dependencies]

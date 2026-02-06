@@ -28,16 +28,22 @@ jobs:
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@v6
+      - name: Free disk space
+        run: |
+          sudo rm -rf /usr/share/dotnet /usr/local/lib/android /opt/ghc /opt/hostedtoolcache/CodeQL
+          sudo docker image prune --all --force
+          df -h /
       - uses: dtolnay/rust-toolchain@nightly
       - uses: Swatinem/rust-cache@v2
 
       - name: Install system dependencies
-        run: sudo apt-get update && sudo apt-get install -y libhwloc-dev libelf-dev zlib1g-dev libcurl4-openssl-dev cmake pkg-config libsasl2-dev
+        run: sudo apt-get update && sudo apt-get install -y libhwloc-dev libelf-dev zlib1g-dev libcurl4-openssl-dev cmake pkg-config libsasl2-dev libudev-dev mold
 
       - name: Build API documentation
         run: cargo +nightly doc --workspace --no-deps --all-features
         env:
           RUSTDOCFLAGS: "--cfg docsrs -D warnings"
+          RUSTFLAGS: "-C link-arg=-fuse-ld=mold"
 
       # Build user guide if mdBook exists
       - name: Setup mdBook
@@ -55,10 +61,10 @@ jobs:
           # Start with the existing landing page from the repo
           cp -r site/ _site/
 
-          # Add API docs to the site
+          # Add API docs under /api/
           cp -r target/doc _site/api
 
-          # Create redirect for api root
+          # Create redirect for api root → main crate docs
           cat > _site/api/index.html << 'EOF'
           <!DOCTYPE html>
           <html>

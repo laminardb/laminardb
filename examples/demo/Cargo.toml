@@ -23,9 +23,9 @@ default = []
 kafka = ["laminar-db/kafka", "dep:rdkafka", "dep:serde", "dep:serde_json"]
 
 [dependencies]
-laminar-db = { path = "../../crates/laminar-db" }
-laminar-derive = { path = "../../crates/laminar-derive" }
-laminar-core = { path = "../../crates/laminar-core" }
+laminar-db = { path = "../../crates/laminar-db", version = "0.1.0" }
+laminar-derive = { path = "../../crates/laminar-derive", version = "0.1.0" }
+laminar-core = { path = "../../crates/laminar-core", version = "0.1.0" }
 
 # Arrow
 arrow = { workspace = true }

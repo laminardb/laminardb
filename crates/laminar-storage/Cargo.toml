@@ -6,12 +6,12 @@ edition.workspace = true
 license.workspace = true
 repository.workspace = true
 homepage.workspace = true
-documentation = "https://docs.laminardb.io/laminar-storage"
+documentation = "https://laminardb.io/api/laminar_storage"
 description = "Storage layer for LaminarDB - WAL, checkpointing, and lakehouse integration"
 
 [dependencies]
 # Core dependency
-laminar-core = { path = "../laminar-core" }
+laminar-core = { path = "../laminar-core", version = "0.1.0" }
 
 # Storage
 rocksdb = { version = "0.24", optional = true }

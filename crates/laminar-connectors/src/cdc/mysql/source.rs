@@ -19,7 +19,7 @@ use crate::metrics::ConnectorMetrics;
 
 use super::changelog::ChangeEvent;
 use super::config::MySqlCdcConfig;
-use super::decoder::BinlogPosition;
+use super::decoder::{BinlogMessage, BinlogPosition};
 use super::gtid::GtidSet;
 use super::metrics::MySqlCdcMetrics;
 use super::schema::{cdc_envelope_schema, TableCache, TableInfo};
@@ -50,7 +50,6 @@ use super::schema::{cdc_envelope_schema, TableCache, TableInfo};
 ///     println!("Received {} rows", batch.num_rows());
 /// }
 /// ```
-#[derive(Debug)]
 pub struct MySqlCdcSource {
     /// Configuration for the MySQL CDC connection.
     config: MySqlCdcConfig,
@@ -67,6 +66,12 @@ pub struct MySqlCdcSource {
     /// Current GTID set (for GTID-based replication).
     gtid_set: Option<GtidSet>,
 
+    /// Current binlog filename (updated by ROTATE events).
+    current_binlog_file: String,
+
+    /// Current GTID string (updated by GTID events within a transaction).
+    current_gtid: Option<String>,
+
     /// Buffered change events waiting to be emitted.
     event_buffer: Vec<ChangeEvent>,
 
@@ -78,6 +83,29 @@ pub struct MySqlCdcSource {
 
     /// Last time we received data (for health checks).
     last_activity: Option<Instant>,
+
+    /// Active binlog stream (mysql_async feature only).
+    #[cfg(feature = "mysql-cdc")]
+    binlog_stream: Option<mysql_async::BinlogStream>,
+}
+
+// Manual Debug impl because BinlogStream doesn't implement Debug.
+impl std::fmt::Debug for MySqlCdcSource {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("MySqlCdcSource")
+            .field("config", &self.config)
+            .field("connected", &self.connected)
+            .field("table_cache", &self.table_cache)
+            .field("position", &self.position)
+            .field("gtid_set", &self.gtid_set)
+            .field("current_binlog_file", &self.current_binlog_file)
+            .field("current_gtid", &self.current_gtid)
+            .field("event_buffer_len", &self.event_buffer.len())
+            .field("metrics", &self.metrics)
+            .field("schema", &self.schema)
+            .field("last_activity", &self.last_activity)
+            .finish_non_exhaustive()
+    }
 }
 
 impl MySqlCdcSource {
@@ -90,10 +118,14 @@ impl MySqlCdcSource {
             table_cache: TableCache::new(),
             position: None,
             gtid_set: None,
+            current_binlog_file: String::new(),
+            current_gtid: None,
             event_buffer: Vec::new(),
             metrics: MySqlCdcMetrics::new(),
             schema: None,
             last_activity: None,
+            #[cfg(feature = "mysql-cdc")]
+            binlog_stream: None,
         }
     }
 
@@ -224,6 +256,7 @@ impl MySqlCdcSource {
 }
 
 #[async_trait]
+#[allow(clippy::too_many_lines)]
 impl SourceConnector for MySqlCdcSource {
     async fn open(&mut self, config: &ConnectorConfig) -> Result<(), ConnectorError> {
         // Parse and update config if provided
@@ -235,19 +268,30 @@ impl SourceConnector for MySqlCdcSource {
         self.config.validate()?;
 
         // Initialize GTID set from config
-        self.gtid_set = self.config.gtid_set.clone();
+        self.gtid_set.clone_from(&self.config.gtid_set);
 
         // Initialize binlog position from config
         if let Some(ref filename) = self.config.binlog_filename {
+            self.current_binlog_file.clone_from(filename);
             if let Some(pos) = self.config.binlog_position {
                 self.position = Some(BinlogPosition::new(filename.clone(), pos));
             }
         }
 
-        // NOTE: Actual connection to MySQL server would happen here.
-        // This requires mysql_async crate which has OpenSSL dependency.
-        // For now, we set connected to true to allow business logic testing.
-        // Actual I/O will be implemented in F028A.
+        // When mysql-cdc feature is enabled, establish a real connection.
+        #[cfg(feature = "mysql-cdc")]
+        {
+            let conn = super::mysql_io::connect(&self.config).await?;
+            let stream = super::mysql_io::start_binlog_stream(
+                conn,
+                &self.config,
+                self.gtid_set.as_ref(),
+                self.position.as_ref(),
+            )
+            .await?;
+            self.binlog_stream = Some(stream);
+        }
+
         self.connected = true;
         self.last_activity = Some(Instant::now());
 
@@ -256,7 +300,7 @@ impl SourceConnector for MySqlCdcSource {
 
     async fn poll_batch(
         &mut self,
-        _max_records: usize,
+        max_records: usize,
     ) -> Result<Option<SourceBatch>, ConnectorError> {
         if !self.connected {
             return Err(ConnectorError::ConfigurationError(
@@ -264,15 +308,149 @@ impl SourceConnector for MySqlCdcSource {
             ));
         }
 
-        // NOTE: Actual binlog reading would happen here.
-        // This requires mysql_async crate for the connection.
-        // For now, return None (no data available).
-        // Actual I/O will be implemented in F028A.
+        // When mysql-cdc feature is enabled, read from the real binlog stream.
+        #[cfg(feature = "mysql-cdc")]
+        {
+            let stream = self.binlog_stream.as_mut().ok_or_else(|| {
+                ConnectorError::Internal("binlog stream not initialized".to_string())
+            })?;
 
-        // Update last activity timestamp
-        self.last_activity = Some(Instant::now());
+            let events =
+                super::mysql_io::read_events(stream, max_records, self.config.poll_timeout).await?;
 
-        Ok(None)
+            if events.is_empty() {
+                self.last_activity = Some(Instant::now());
+                return Ok(None);
+            }
+
+            // Track the last table_id that had a TABLE_MAP so we can flush per-table.
+            let mut last_table_info: Option<TableInfo> = None;
+            let stream_ref = self.binlog_stream.as_ref().unwrap();
+
+            for event in &events {
+                self.metrics.inc_events_received();
+
+                let msg = super::mysql_io::decode_binlog_event(event, stream_ref)?;
+                let Some(msg) = msg else {
+                    continue;
+                };
+
+                match msg {
+                    BinlogMessage::TableMap(tme) => {
+                        self.metrics.inc_table_maps();
+                        self.table_cache.update(&tme);
+                    }
+                    BinlogMessage::Insert(insert_msg) => {
+                        if !self
+                            .config
+                            .should_include_table(&insert_msg.database, &insert_msg.table)
+                        {
+                            continue;
+                        }
+                        let row_count = insert_msg.rows.len() as u64;
+                        let events = super::changelog::insert_to_events(
+                            &insert_msg,
+                            &self.current_binlog_file,
+                            self.current_gtid.as_deref(),
+                        );
+                        self.event_buffer.extend(events);
+                        self.metrics.inc_inserts(row_count);
+                        last_table_info = self.table_cache.get(insert_msg.table_id).cloned();
+                    }
+                    BinlogMessage::Update(update_msg) => {
+                        if !self
+                            .config
+                            .should_include_table(&update_msg.database, &update_msg.table)
+                        {
+                            continue;
+                        }
+                        let row_count = update_msg.rows.len() as u64;
+                        let events = super::changelog::update_to_events(
+                            &update_msg,
+                            &self.current_binlog_file,
+                            self.current_gtid.as_deref(),
+                        );
+                        self.event_buffer.extend(events);
+                        self.metrics.inc_updates(row_count);
+                        last_table_info = self.table_cache.get(update_msg.table_id).cloned();
+                    }
+                    BinlogMessage::Delete(delete_msg) => {
+                        if !self
+                            .config
+                            .should_include_table(&delete_msg.database, &delete_msg.table)
+                        {
+                            continue;
+                        }
+                        let row_count = delete_msg.rows.len() as u64;
+                        let events = super::changelog::delete_to_events(
+                            &delete_msg,
+                            &self.current_binlog_file,
+                            self.current_gtid.as_deref(),
+                        );
+                        self.event_buffer.extend(events);
+                        self.metrics.inc_deletes(row_count);
+                        last_table_info = self.table_cache.get(delete_msg.table_id).cloned();
+                    }
+                    BinlogMessage::Begin(begin_msg) => {
+                        if let Some(ref gtid) = begin_msg.gtid {
+                            self.current_gtid = Some(gtid.to_string());
+                            if let Some(ref mut gtid_set) = self.gtid_set {
+                                gtid_set.add(gtid);
+                            }
+                        } else {
+                            self.current_gtid = None;
+                        }
+                    }
+                    BinlogMessage::Commit(commit_msg) => {
+                        self.metrics.inc_transactions();
+                        self.metrics.set_binlog_position(commit_msg.binlog_position);
+                        if let Some(ref mut pos) = self.position {
+                            pos.position = commit_msg.binlog_position;
+                        }
+                    }
+                    BinlogMessage::Rotate(rotate_msg) => {
+                        self.current_binlog_file.clone_from(&rotate_msg.next_binlog);
+                        if let Some(ref mut pos) = self.position {
+                            pos.filename = rotate_msg.next_binlog;
+                            pos.position = rotate_msg.position;
+                        } else {
+                            self.position = Some(BinlogPosition::new(
+                                self.current_binlog_file.clone(),
+                                rotate_msg.position,
+                            ));
+                        }
+                    }
+                    BinlogMessage::Query(query_msg) => {
+                        self.metrics.inc_ddl_events();
+                        let _ = query_msg; // DDL events are logged but not emitted.
+                    }
+                    BinlogMessage::Heartbeat => {
+                        self.metrics.inc_heartbeats();
+                    }
+                }
+            }
+
+            self.last_activity = Some(Instant::now());
+
+            // Flush buffered events to a RecordBatch.
+            if let Some(table_info) = last_table_info {
+                if let Some(batch) = self.flush_events(&table_info)? {
+                    let schema = self.build_envelope_schema(&table_info.arrow_schema);
+                    self.schema = Some(schema);
+                    return Ok(Some(SourceBatch::new(batch)));
+                }
+            }
+
+            return Ok(None);
+        }
+
+        // Without mysql-cdc feature: stub returns None.
+        #[cfg(not(feature = "mysql-cdc"))]
+        {
+            let _ = max_records;
+            self.last_activity = Some(Instant::now());
+            Ok(None)
+        }
     }
 
     fn schema(&self) -> SchemaRef {
@@ -325,7 +503,14 @@ impl SourceConnector for MySqlCdcSource {
     }
 
     async fn close(&mut self) -> Result<(), ConnectorError> {
-        // NOTE: Actual disconnection would happen here.
+        // Close the binlog stream if active.
+        #[cfg(feature = "mysql-cdc")]
+        if let Some(stream) = self.binlog_stream.take() {
+            if let Err(e) = stream.close().await {
+                tracing::warn!("error closing binlog stream: {}", e);
+            }
+        }
+
         self.connected = false;
         self.table_cache.clear();
         self.event_buffer.clear();
@@ -529,6 +714,9 @@ mod tests {
         assert!(!source.should_include_table("testdb", "other"));
     }
 
+    // With mysql-cdc feature, open() attempts a real connection, so this test
+    // only works without the feature (stub mode).
+    #[cfg(not(feature = "mysql-cdc"))]
     #[tokio::test]
     async fn test_open_close() {
         let mut source = MySqlCdcSource::new(test_config());
@@ -549,6 +737,9 @@ mod tests {
         assert!(result.is_err());
     }
 
+    // With mysql-cdc feature, open() attempts a real connection, so this test
+    // only works without the feature (stub mode).
+    #[cfg(not(feature = "mysql-cdc"))]
     #[tokio::test]
     async fn test_poll_connected() {
         let mut source = MySqlCdcSource::new(test_config());

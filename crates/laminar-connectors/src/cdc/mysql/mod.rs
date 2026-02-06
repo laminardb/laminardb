@@ -74,6 +74,8 @@ mod config;
 mod decoder;
 mod gtid;
 mod metrics;
+#[cfg(feature = "mysql-cdc")]
+pub mod mysql_io;
 mod schema;
 mod source;
 mod types;

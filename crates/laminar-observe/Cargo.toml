@@ -6,7 +6,7 @@ edition.workspace = true
 license.workspace = true
 repository.workspace = true
 homepage.workspace = true
-documentation = "https://docs.laminardb.io/laminar-observe"
+documentation = "https://laminardb.io/api/laminar_observe"
 description = "Observability for LaminarDB - metrics, tracing, health checks"
 
 [dependencies]

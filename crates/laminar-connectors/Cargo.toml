@@ -6,13 +6,13 @@ edition.workspace = true
 license.workspace = true
 repository.workspace = true
 homepage.workspace = true
-documentation = "https://docs.laminardb.io/laminar-connectors"
+documentation = "https://laminardb.io/api/laminar_connectors"
 description = "External system connectors for LaminarDB - Kafka, CDC, lookup tables"
 
 [dependencies]
 # Core dependencies
-laminar-core = { path = "../laminar-core" }
-laminar-storage = { path = "../laminar-storage" }
+laminar-core = { path = "../laminar-core", version = "0.1.0" }
+laminar-storage = { path = "../laminar-storage", version = "0.1.0" }
 
 # Kafka
 rdkafka = { version = "0.39", features = ["cmake-build"], optional = true }
@@ -24,6 +24,7 @@ tokio-postgres = { version = "0.7", optional = true }
 postgres-types = { version = "0.2", optional = true }
 # MySQL async driver with rustls (no OpenSSL required)
 mysql_async = { version = "0.34", optional = true, default-features = false, features = ["rustls-tls", "binlog", "minimal-rust"] }
+tokio-stream = { workspace = true, optional = true }
 
 # Delta Lake - using git main branch (has DataFusion 52.1.0)
 # Published 0.30.2 requires DF 51.0, but main branch has DF 52.x
@@ -52,7 +53,7 @@ kafka = ["dep:rdkafka", "dep:arrow-avro", "dep:reqwest"]
 postgres-cdc = ["dep:tokio-postgres"]
 postgres-sink = ["dep:tokio-postgres", "dep:postgres-types"]
 # mysql-cdc: Business logic + mysql_async driver with rustls (no OpenSSL required)
-mysql-cdc = ["dep:mysql_async"]
+mysql-cdc = ["dep:mysql_async", "dep:tokio-stream"]
 # Delta Lake - using git main branch with DataFusion 52.x
 delta-lake = ["dep:deltalake", "dep:url", "deltalake/datafusion"]
 delta-lake-s3 = ["delta-lake", "deltalake/s3"]

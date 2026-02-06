@@ -182,6 +182,11 @@ impl GtidSet {
     pub fn source_count(&self) -> usize {
         self.sets.len()
     }
+
+    /// Iterates over source UUIDs and their transaction ranges.
+    pub fn iter_sets(&self) -> impl Iterator<Item = (&uuid::Uuid, &Vec<GtidRange>)> {
+        self.sets.iter()
+    }
 }
 
 impl fmt::Display for GtidSet {

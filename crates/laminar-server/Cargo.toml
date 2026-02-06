@@ -6,8 +6,9 @@ edition.workspace = true
 license.workspace = true
 repository.workspace = true
 homepage.workspace = true
-documentation = "https://docs.laminardb.io/laminar-server"
+documentation = "https://laminardb.io/api/laminar_server"
 description = "Standalone server binary for LaminarDB"
+publish = false
 
 [[bin]]
 name = "laminardb"
@@ -15,13 +16,13 @@ path = "src/main.rs"
 
 [dependencies]
 # All LaminarDB crates
-laminar-core = { path = "../laminar-core" }
-laminar-sql = { path = "../laminar-sql" }
-laminar-storage = { path = "../laminar-storage" }
-laminar-connectors = { path = "../laminar-connectors" }
-laminar-auth = { path = "../laminar-auth" }
-laminar-admin = { path = "../laminar-admin" }
-laminar-observe = { path = "../laminar-observe" }
+laminar-core = { path = "../laminar-core", version = "0.1.0" }
+laminar-sql = { path = "../laminar-sql", version = "0.1.0" }
+laminar-storage = { path = "../laminar-storage", version = "0.1.0" }
+laminar-connectors = { path = "../laminar-connectors", version = "0.1.0" }
+laminar-auth = { path = "../laminar-auth", version = "0.1.0" }
+laminar-admin = { path = "../laminar-admin", version = "0.1.0" }
+laminar-observe = { path = "../laminar-observe", version = "0.1.0" }
 
 # CLI and configuration
 clap = { version = "4.5", features = ["derive", "env"] }
