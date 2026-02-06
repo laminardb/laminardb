@@ -67,8 +67,9 @@ fn path_to_url(path: &str) -> Result<Url, ConnectorError> {
         // First canonicalize if it exists, otherwise use as-is.
         let path_buf = std::path::Path::new(path);
         let normalized = if path_buf.exists() {
-            std::fs::canonicalize(path_buf)
-                .map_err(|e| ConnectorError::ConfigurationError(format!("invalid path '{path}': {e}")))?
+            std::fs::canonicalize(path_buf).map_err(|e| {
+                ConnectorError::ConfigurationError(format!("invalid path '{path}': {e}"))
+            })?
         } else {
             // For new tables, the path might not exist yet.
             // Use absolute path if possible.
@@ -76,13 +77,19 @@ fn path_to_url(path: &str) -> Result<Url, ConnectorError> {
                 path_buf.to_path_buf()
             } else {
                 std::env::current_dir()
-                    .map_err(|e| ConnectorError::ConfigurationError(format!("cannot get current dir: {e}")))?
+                    .map_err(|e| {
+                        ConnectorError::ConfigurationError(format!("cannot get current dir: {e}"))
+                    })?
                     .join(path_buf)
             }
         };
 
-        Url::from_directory_path(&normalized)
-            .map_err(|()| ConnectorError::ConfigurationError(format!("cannot convert path to URL: {}", normalized.display())))
+        Url::from_directory_path(&normalized).map_err(|()| {
+            ConnectorError::ConfigurationError(format!(
+                "cannot convert path to URL: {}",
+                normalized.display()
+            ))
+        })
     }
 }
 
@@ -233,10 +240,7 @@ pub async fn write_batches(
 
     info!(
         writer_id,
-        epoch,
-        version,
-        total_rows,
-        "committed Delta Lake transaction"
+        epoch, version, total_rows, "committed Delta Lake transaction"
     );
 
     Ok((table, version))
@@ -263,17 +267,26 @@ pub async fn get_last_committed_epoch(table: &DeltaTable, writer_id: &str) -> u6
         return 0;
     };
 
-    match snapshot.transaction_version(&table.log_store(), writer_id).await {
+    match snapshot
+        .transaction_version(&table.log_store(), writer_id)
+        .await
+    {
         Ok(Some(version)) => {
             // Note: Delta Lake uses i64 for version, but our epoch is u64.
             // Versions are always non-negative, so this is safe.
             #[allow(clippy::cast_sign_loss)]
             let epoch = version as u64;
-            debug!(writer_id, epoch, "found last committed epoch from txn metadata");
+            debug!(
+                writer_id,
+                epoch, "found last committed epoch from txn metadata"
+            );
             epoch
         }
         Ok(None) => {
-            debug!(writer_id, "no txn metadata found for writer, assuming epoch 0");
+            debug!(
+                writer_id,
+                "no txn metadata found for writer, assuming epoch 0"
+            );
             0
         }
         Err(e) => {
@@ -407,16 +420,10 @@ mod tests {
 
         // Write a batch.
         let batch = test_batch(100);
-        let (table, version) = write_batches(
-            table,
-            vec![batch],
-            "test-writer",
-            1,
-            SaveMode::Append,
-            None,
-        )
-        .await
-        .unwrap();
+        let (table, version) =
+            write_batches(table, vec![batch], "test-writer", 1, SaveMode::Append, None)
+                .await
+                .unwrap();
 
         assert_eq!(version, 1);
         assert_eq!(table.version(), Some(1));
@@ -424,11 +431,14 @@ mod tests {
         // Verify Parquet files were created (in the table directory).
         let parquet_files: Vec<_> = std::fs::read_dir(temp_dir.path())
             .unwrap()
-            .filter_map(|e| e.ok())
+            .filter_map(Result::ok)
             .filter(|e| e.path().extension().is_some_and(|ext| ext == "parquet"))
             .collect();
 
-        assert!(!parquet_files.is_empty(), "should have created Parquet files");
+        assert!(
+            !parquet_files.is_empty(),
+            "should have created Parquet files"
+        );
     }
 
     #[tokio::test]
@@ -483,16 +493,10 @@ mod tests {
         // Write epochs 1, 2, 3.
         for epoch in 1..=3 {
             let batch = test_batch(10);
-            let result = write_batches(
-                table,
-                vec![batch],
-                writer_id,
-                epoch,
-                SaveMode::Append,
-                None,
-            )
-            .await
-            .unwrap();
+            let result =
+                write_batches(table, vec![batch], writer_id, epoch, SaveMode::Append, None)
+                    .await
+                    .unwrap();
             table = result.0;
             assert_eq!(result.1, epoch as i64);
         }
@@ -535,16 +539,10 @@ mod tests {
             .unwrap();
 
         // Write empty batch list - should be no-op.
-        let (table, version) = write_batches(
-            table,
-            vec![],
-            "test-writer",
-            1,
-            SaveMode::Append,
-            None,
-        )
-        .await
-        .unwrap();
+        let (table, version) =
+            write_batches(table, vec![], "test-writer", 1, SaveMode::Append, None)
+                .await
+                .unwrap();
 
         // Version should still be 0 (no write happened).
         assert_eq!(version, 0);

@@ -245,12 +245,13 @@ impl DeltaLakeSink {
             .sum();
 
         // Take the table and buffer for the write operation.
-        let table = self.table.take().ok_or_else(|| {
-            ConnectorError::InvalidState {
+        let table = self
+            .table
+            .take()
+            .ok_or_else(|| ConnectorError::InvalidState {
                 expected: "table initialized".into(),
                 actual: "table not initialized".into(),
-            }
-        })?;
+            })?;
 
         let batches = std::mem::take(&mut self.buffer);
 
