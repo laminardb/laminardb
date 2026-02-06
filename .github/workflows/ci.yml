@@ -6,6 +6,7 @@ on:
   pull_request:
     branches: [main, develop]
   workflow_dispatch:
+  workflow_call:
 
 # Cancel redundant runs: when pushing multiple commits quickly or when
 # both push and PR events fire for the same commit

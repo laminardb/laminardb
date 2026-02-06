@@ -11,9 +11,9 @@ description = "Observability for LaminarDB - metrics, tracing, health checks"
 
 [dependencies]
 # Metrics
-prometheus = "0.13"
-opentelemetry = "0.21"
-opentelemetry-prometheus = "0.14"
+prometheus = { version = "0.14", default-features = false }
+opentelemetry = "0.31"
+opentelemetry-prometheus = "0.31"
 
 # Tracing
 tracing = { workspace = true }
