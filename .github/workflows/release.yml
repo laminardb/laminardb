@@ -206,6 +206,8 @@ jobs:
     needs: [verify, release]
     runs-on: ubuntu-latest
     if: needs.verify.outputs.prerelease == 'false'
+    env:
+      CARGO_REGISTRY_TOKEN: ${{ secrets.CARGO_REGISTRY_TOKEN }}
     steps:
       - uses: actions/checkout@v6
       - uses: dtolnay/rust-toolchain@stable
@@ -213,42 +215,42 @@ jobs:
 
       # Publish in dependency order
       - name: Publish laminar-derive
-        run: cargo publish -p laminar-derive --token ${{ secrets.CARGO_REGISTRY_TOKEN }}
+        run: cargo publish -p laminar-derive --registry crates-io
         continue-on-error: true
 
       - name: Wait for index
         run: sleep 30
 
       - name: Publish laminar-core
-        run: cargo publish -p laminar-core --token ${{ secrets.CARGO_REGISTRY_TOKEN }}
+        run: cargo publish -p laminar-core --registry crates-io
         continue-on-error: true
 
       - name: Wait for index
         run: sleep 30
 
       - name: Publish laminar-sql
-        run: cargo publish -p laminar-sql --token ${{ secrets.CARGO_REGISTRY_TOKEN }}
+        run: cargo publish -p laminar-sql --registry crates-io
         continue-on-error: true
 
       - name: Wait for index
         run: sleep 30
 
       - name: Publish laminar-storage
-        run: cargo publish -p laminar-storage --token ${{ secrets.CARGO_REGISTRY_TOKEN }}
+        run: cargo publish -p laminar-storage --registry crates-io
         continue-on-error: true
 
       - name: Wait for index
         run: sleep 30
 
       - name: Publish laminar-connectors
-        run: cargo publish -p laminar-connectors --token ${{ secrets.CARGO_REGISTRY_TOKEN }}
+        run: cargo publish -p laminar-connectors --registry crates-io
         continue-on-error: true
 
       - name: Wait for index
         run: sleep 30
 
       - name: Publish laminar-db
-        run: cargo publish -p laminar-db --token ${{ secrets.CARGO_REGISTRY_TOKEN }}
+        run: cargo publish -p laminar-db --registry crates-io
         continue-on-error: true
 
   # ============================================
