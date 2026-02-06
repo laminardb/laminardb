@@ -1,0 +1,11 @@
+# Cargo audit configuration
+# https://github.com/rustsec/rustsec/tree/main/cargo-audit
+
+[advisories]
+# Advisories to ignore (unmaintained crates from transitive deps)
+ignore = [
+    # `instant` is unmaintained but not a security issue
+    # Pulled in via: deltalake -> deltalake-catalog-unity -> reqwest-retry -> wasm-timer -> parking_lot 0.11
+    # Waiting for upstream fix in deltalake
+    "RUSTSEC-2024-0384",
+]
