@@ -315,12 +315,8 @@ impl SourceConnector for MySqlCdcSource {
                 ConnectorError::Internal("binlog stream not initialized".to_string())
             })?;
 
-            let events = super::mysql_io::read_events(
-                stream,
-                max_records,
-                self.config.poll_timeout,
-            )
-            .await?;
+            let events =
+                super::mysql_io::read_events(stream, max_records, self.config.poll_timeout).await?;
 
             if events.is_empty() {
                 self.last_activity = Some(Instant::now());
@@ -345,10 +341,10 @@ impl SourceConnector for MySqlCdcSource {
                         self.table_cache.update(&tme);
                     }
                     BinlogMessage::Insert(insert_msg) => {
-                        if !self.config.should_include_table(
-                            &insert_msg.database,
-                            &insert_msg.table,
-                        ) {
+                        if !self
+                            .config
+                            .should_include_table(&insert_msg.database, &insert_msg.table)
+                        {
                             continue;
                         }
                         let row_count = insert_msg.rows.len() as u64;
@@ -359,14 +355,13 @@ impl SourceConnector for MySqlCdcSource {
                         );
                         self.event_buffer.extend(events);
                         self.metrics.inc_inserts(row_count);
-                        last_table_info =
-                            self.table_cache.get(insert_msg.table_id).cloned();
+                        last_table_info = self.table_cache.get(insert_msg.table_id).cloned();
                     }
                     BinlogMessage::Update(update_msg) => {
-                        if !self.config.should_include_table(
-                            &update_msg.database,
-                            &update_msg.table,
-                        ) {
+                        if !self
+                            .config
+                            .should_include_table(&update_msg.database, &update_msg.table)
+                        {
                             continue;
                         }
                         let row_count = update_msg.rows.len() as u64;
@@ -377,14 +372,13 @@ impl SourceConnector for MySqlCdcSource {
                         );
                         self.event_buffer.extend(events);
                         self.metrics.inc_updates(row_count);
-                        last_table_info =
-                            self.table_cache.get(update_msg.table_id).cloned();
+                        last_table_info = self.table_cache.get(update_msg.table_id).cloned();
                     }
                     BinlogMessage::Delete(delete_msg) => {
-                        if !self.config.should_include_table(
-                            &delete_msg.database,
-                            &delete_msg.table,
-                        ) {
+                        if !self
+                            .config
+                            .should_include_table(&delete_msg.database, &delete_msg.table)
+                        {
                             continue;
                         }
                         let row_count = delete_msg.rows.len() as u64;
@@ -395,8 +389,7 @@ impl SourceConnector for MySqlCdcSource {
                         );
                         self.event_buffer.extend(events);
                         self.metrics.inc_deletes(row_count);
-                        last_table_info =
-                            self.table_cache.get(delete_msg.table_id).cloned();
+                        last_table_info = self.table_cache.get(delete_msg.table_id).cloned();
                     }
                     BinlogMessage::Begin(begin_msg) => {
                         if let Some(ref gtid) = begin_msg.gtid {
@@ -410,8 +403,7 @@ impl SourceConnector for MySqlCdcSource {
                     }
                     BinlogMessage::Commit(commit_msg) => {
                         self.metrics.inc_transactions();
-                        self.metrics
-                            .set_binlog_position(commit_msg.binlog_position);
+                        self.metrics.set_binlog_position(commit_msg.binlog_position);
                         if let Some(ref mut pos) = self.position {
                             pos.position = commit_msg.binlog_position;
                         }

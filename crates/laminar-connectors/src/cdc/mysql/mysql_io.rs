@@ -285,8 +285,7 @@ pub fn decode_binlog_event(
             let table = tme.table_name().into_owned();
 
             match &rows_event {
-                RowsEventData::WriteRowsEvent(_)
-                | RowsEventData::WriteRowsEventV1(_) => {
+                RowsEventData::WriteRowsEvent(_) | RowsEventData::WriteRowsEventV1(_) => {
                     let rows = decode_rows_after(&rows_event, tme)?;
                     Ok(Some(BinlogMessage::Insert(InsertMessage {
                         table_id,
@@ -312,8 +311,7 @@ pub fn decode_binlog_event(
                     })))
                 }
 
-                RowsEventData::DeleteRowsEvent(_)
-                | RowsEventData::DeleteRowsEventV1(_) => {
+                RowsEventData::DeleteRowsEvent(_) | RowsEventData::DeleteRowsEventV1(_) => {
                     let rows = decode_rows_before(&rows_event, tme)?;
                     Ok(Some(BinlogMessage::Delete(DeleteMessage {
                         table_id,
@@ -374,9 +372,7 @@ pub fn decode_binlog_event(
 fn binlog_value_to_column_value(val: &BinlogValue<'_>) -> ColumnValue {
     match val {
         BinlogValue::Value(v) => mysql_value_to_column_value(v),
-        BinlogValue::Jsonb(jsonb_val) => {
-            ColumnValue::Json(format!("{jsonb_val:?}"))
-        }
+        BinlogValue::Jsonb(jsonb_val) => ColumnValue::Json(format!("{jsonb_val:?}")),
         BinlogValue::JsonDiff(_diffs) => {
             // Partial JSON updates (MySQL 8.0.20+) — represent as JSON string.
             ColumnValue::Json("{}".to_string())
@@ -420,7 +416,11 @@ fn mysql_value_to_column_value(val: &mysql_async::Value) -> ColumnValue {
             // days is u32 and hours is u8, product fits in i32.
             #[allow(clippy::cast_possible_wrap)]
             let total_hours = (*days as i32) * 24 + i32::from(*hours);
-            let h = if *is_negative { -total_hours } else { total_hours };
+            let h = if *is_negative {
+                -total_hours
+            } else {
+                total_hours
+            };
             ColumnValue::Time(h, u32::from(*minutes), u32::from(*seconds), *micros)
         }
     }
@@ -460,9 +460,7 @@ fn extract_columns_from_tme(
 
 /// Extracts column names from TABLE_MAP optional metadata.
 #[cfg(feature = "mysql-cdc")]
-fn extract_column_names(
-    tme: &mysql_async::binlog::events::TableMapEvent<'_>,
-) -> Vec<String> {
+fn extract_column_names(tme: &mysql_async::binlog::events::TableMapEvent<'_>) -> Vec<String> {
     let mut names = Vec::new();
     for meta in tme.iter_optional_meta().flatten() {
         use mysql_async::binlog::events::OptionalMetadataField;
@@ -521,12 +519,16 @@ fn decode_rows_update(
             .map_err(|e| ConnectorError::Internal(format!("failed to decode row: {e}")))?;
 
         let before_data = before.map_or_else(
-            || RowData { columns: Vec::new() },
+            || RowData {
+                columns: Vec::new(),
+            },
             |r| binlog_row_to_row_data(&r),
         );
 
         let after_data = after.map_or_else(
-            || RowData { columns: Vec::new() },
+            || RowData {
+                columns: Vec::new(),
+            },
             |r| binlog_row_to_row_data(&r),
         );
 
@@ -586,9 +588,9 @@ fn gtid_set_to_sids(gtid_set: &GtidSet) -> Vec<Sid<'static>> {
 pub fn build_ssl_opts(ssl_mode: &SslMode) -> Option<mysql_async::SslOpts> {
     match ssl_mode {
         SslMode::Disabled => None,
-        SslMode::Preferred => Some(
-            mysql_async::SslOpts::default().with_danger_accept_invalid_certs(true),
-        ),
+        SslMode::Preferred => {
+            Some(mysql_async::SslOpts::default().with_danger_accept_invalid_certs(true))
+        }
         SslMode::Required | SslMode::VerifyCa | SslMode::VerifyIdentity => {
             Some(mysql_async::SslOpts::default())
         }
@@ -754,9 +756,7 @@ mod tests {
         let _request = build_binlog_request(&config, None, None);
 
         // With GTID set.
-        let gtid_set: GtidSet = "3E11FA47-71CA-11E1-9E33-C80AA9429562:1-5"
-            .parse()
-            .unwrap();
+        let gtid_set: GtidSet = "3E11FA47-71CA-11E1-9E33-C80AA9429562:1-5".parse().unwrap();
         let _request = build_binlog_request(&config, Some(&gtid_set), None);
     }
 
@@ -811,16 +811,14 @@ mod tests {
 
     #[test]
     fn test_mysql_value_to_column_value_string() {
-        let val =
-            mysql_value_to_column_value(&mysql_async::Value::Bytes(b"hello world".to_vec()));
+        let val = mysql_value_to_column_value(&mysql_async::Value::Bytes(b"hello world".to_vec()));
         assert_eq!(val, ColumnValue::String("hello world".to_string()));
     }
 
     #[test]
     fn test_mysql_value_to_column_value_bytes() {
         // Non-UTF8 bytes should map to Bytes.
-        let val =
-            mysql_value_to_column_value(&mysql_async::Value::Bytes(vec![0xFF, 0xFE, 0xFD]));
+        let val = mysql_value_to_column_value(&mysql_async::Value::Bytes(vec![0xFF, 0xFE, 0xFD]));
         assert_eq!(val, ColumnValue::Bytes(vec![0xFF, 0xFE, 0xFD]));
     }
 
@@ -867,9 +865,7 @@ mod tests {
 
     #[test]
     fn test_gtid_set_to_sids_single() {
-        let gtid_set: GtidSet = "3E11FA47-71CA-11E1-9E33-C80AA9429562:1-10"
-            .parse()
-            .unwrap();
+        let gtid_set: GtidSet = "3E11FA47-71CA-11E1-9E33-C80AA9429562:1-10".parse().unwrap();
         let sids = gtid_set_to_sids(&gtid_set);
         assert_eq!(sids.len(), 1);
     }
