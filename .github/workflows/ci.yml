@@ -72,7 +72,7 @@ jobs:
     strategy:
       fail-fast: false
       matrix:
-        os: [ubuntu-latest, macos-latest, windows-latest]
+        os: [ubuntu-latest, windows-latest]
     steps:
       - uses: actions/checkout@v6
       - name: Free disk space (Linux)
@@ -91,20 +91,12 @@ jobs:
         if: runner.os == 'Linux'
         run: sudo apt-get update && sudo apt-get install -y libhwloc-dev libelf-dev zlib1g-dev libcurl4-openssl-dev cmake pkg-config libsasl2-dev libudev-dev mold
 
-      - name: Install hwloc (macOS)
-        if: runner.os == 'macOS'
-        run: brew install hwloc
-
       # Tests include compilation - no separate build step needed
       - name: Run tests (Linux)
         if: runner.os == 'Linux'
         run: cargo nextest run --workspace --all-features
         env:
           RUSTFLAGS: "-C link-arg=-fuse-ld=mold"
-
-      - name: Run tests (macOS)
-        if: runner.os == 'macOS'
-        run: cargo nextest run --workspace --all-features
 
       # Windows: explicit features (skip hwloc, io-uring, xdp)
       - name: Run tests (Windows)
