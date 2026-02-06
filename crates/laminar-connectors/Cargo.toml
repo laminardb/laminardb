@@ -11,8 +11,8 @@ description = "External system connectors for LaminarDB - Kafka, CDC, lookup tab
 
 [dependencies]
 # Core dependencies
-laminar-core = { path = "../laminar-core" }
-laminar-storage = { path = "../laminar-storage" }
+laminar-core = { path = "../laminar-core", version = "0.1.0" }
+laminar-storage = { path = "../laminar-storage", version = "0.1.0" }
 
 # Kafka
 rdkafka = { version = "0.39", features = ["cmake-build"], optional = true }

@@ -18,9 +18,9 @@ postgres-cdc = ["laminar-connectors/postgres-cdc"]
 postgres-sink = ["laminar-connectors/postgres-sink"]
 
 [dependencies]
-laminar-core = { path = "../laminar-core" }
-laminar-sql = { path = "../laminar-sql" }
-laminar-connectors = { path = "../laminar-connectors" }
+laminar-core = { path = "../laminar-core", version = "0.1.0" }
+laminar-sql = { path = "../laminar-sql", version = "0.1.0" }
+laminar-connectors = { path = "../laminar-connectors", version = "0.1.0" }
 
 # Arrow
 arrow = { workspace = true }
@@ -54,4 +54,4 @@ tracing = { workspace = true }
 
 [dev-dependencies]
 tokio = { workspace = true, features = ["test-util", "macros"] }
-laminar-derive = { path = "../laminar-derive" }
+laminar-derive = { path = "../laminar-derive", version = "0.1.0" }
