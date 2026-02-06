@@ -13,24 +13,23 @@ env:
 
 jobs:
   # ============================================
-  # Verify Tag Matches Cargo.toml
+  # Extract Version from Git Tag
   # ============================================
   verify:
-    name: Verify Release
+    name: Extract Version
     runs-on: ubuntu-latest
     outputs:
       version: ${{ steps.version.outputs.version }}
       prerelease: ${{ steps.version.outputs.prerelease }}
     steps:
-      - uses: actions/checkout@v6
-      - name: Extract and verify version
+      - name: Extract version from tag
         id: version
         run: |
           TAG_VERSION="${GITHUB_REF_NAME#v}"
-          CARGO_VERSION=$(grep -m1 '^version' Cargo.toml | cut -d'"' -f2)
 
-          if [ "$TAG_VERSION" != "$CARGO_VERSION" ]; then
-            echo "::error::Tag version ($TAG_VERSION) doesn't match Cargo.toml ($CARGO_VERSION)"
+          # Validate semver format
+          if ! [[ "$TAG_VERSION" =~ ^[0-9]+\.[0-9]+\.[0-9]+(-[a-zA-Z0-9.]+)?$ ]]; then
+            echo "::error::Tag '$GITHUB_REF_NAME' is not valid semver"
             exit 1
           fi
 
@@ -42,6 +41,8 @@ jobs:
           else
             echo "prerelease=false" >> $GITHUB_OUTPUT
           fi
+
+          echo "Release version: $TAG_VERSION"
 
   # ============================================
   # Run CI First
@@ -85,6 +86,25 @@ jobs:
       - uses: Swatinem/rust-cache@v2
         with:
           key: release-${{ matrix.target }}
+
+      - name: Set version from tag
+        shell: bash
+        run: |
+          VERSION="${{ needs.verify.outputs.version }}"
+          echo "Setting workspace version to $VERSION"
+
+          # Use perl for cross-platform in-place editing (macOS sed differs from GNU sed)
+          # Update workspace version in root Cargo.toml
+          perl -i -pe 's/^version = ".*"/version = "'"$VERSION"'"/' Cargo.toml
+
+          # Update inter-crate path dependency versions
+          find crates examples -name Cargo.toml -exec \
+            perl -i -pe 's/(path = "\.\.\/[^"]*", )version = "[^"]*"/${1}version = "'"$VERSION"'"/g' {} +
+          find crates examples -name Cargo.toml -exec \
+            perl -i -pe 's/(path = "\.\.\/\.\.\/[^"]*", )version = "[^"]*"/${1}version = "'"$VERSION"'"/g' {} +
+
+          echo "Workspace version:"
+          grep '^version' Cargo.toml
 
       - name: Install cross
         if: matrix.cross
@@ -212,6 +232,23 @@ jobs:
       - uses: actions/checkout@v6
       - uses: dtolnay/rust-toolchain@stable
       - uses: Swatinem/rust-cache@v2
+
+      - name: Set version from tag
+        run: |
+          VERSION="${{ needs.verify.outputs.version }}"
+          echo "Setting workspace version to $VERSION"
+
+          # Update workspace version in root Cargo.toml
+          perl -i -pe 's/^version = ".*"/version = "'"$VERSION"'"/' Cargo.toml
+
+          # Update inter-crate path dependency versions
+          find crates examples -name Cargo.toml -exec \
+            perl -i -pe 's/(path = "\.\.\/[^"]*", )version = "[^"]*"/${1}version = "'"$VERSION"'"/g' {} +
+          find crates examples -name Cargo.toml -exec \
+            perl -i -pe 's/(path = "\.\.\/\.\.\/[^"]*", )version = "[^"]*"/${1}version = "'"$VERSION"'"/g' {} +
+
+          echo "Workspace version:"
+          grep '^version' Cargo.toml
 
       # Publish in dependency order
       - name: Publish laminar-derive
