@@ -102,25 +102,37 @@ jobs:
         shell: bash
         run: |
           VERSION="${{ needs.verify.outputs.version }}"
+          TARGET="${{ matrix.target }}"
+          RELEASE_DIR="target/${TARGET}/release"
           mkdir -p artifacts
 
-          # Copy release binaries
+          # Copy the laminardb server binary
           if [[ "${{ matrix.os }}" == "windows-latest" ]]; then
-            cp target/${{ matrix.target }}/release/*.exe artifacts/ 2>/dev/null || true
-            cp target/${{ matrix.target }}/release/*.dll artifacts/ 2>/dev/null || true
+            cp "${RELEASE_DIR}/laminardb.exe" artifacts/ 2>/dev/null || true
+            cp ${RELEASE_DIR}/*.dll artifacts/ 2>/dev/null || true
           else
-            # Copy library files
-            cp target/${{ matrix.target }}/release/*.so artifacts/ 2>/dev/null || true
-            cp target/${{ matrix.target }}/release/*.dylib artifacts/ 2>/dev/null || true
-            cp target/${{ matrix.target }}/release/*.a artifacts/ 2>/dev/null || true
+            cp "${RELEASE_DIR}/laminardb" artifacts/ 2>/dev/null || true
+            cp ${RELEASE_DIR}/*.so artifacts/ 2>/dev/null || true
+            cp ${RELEASE_DIR}/*.dylib artifacts/ 2>/dev/null || true
+            cp ${RELEASE_DIR}/*.a artifacts/ 2>/dev/null || true
           fi
+
+          # Verify artifacts directory is not empty
+          if [ -z "$(ls -A artifacts)" ]; then
+            echo "::error::No artifacts found in ${RELEASE_DIR}"
+            ls -la "${RELEASE_DIR}/" | head -30
+            exit 1
+          fi
+
+          echo "Packaging artifacts:"
+          ls -la artifacts/
 
           # Create archive
           cd artifacts
           if [[ "${{ matrix.os }}" == "windows-latest" ]]; then
-            7z a ../laminardb-${{ matrix.target }}-v${VERSION}.zip *
+            7z a ../laminardb-${TARGET}-v${VERSION}.zip *
           else
-            tar -czvf ../laminardb-${{ matrix.target }}-v${VERSION}.tar.gz *
+            tar -czvf ../laminardb-${TARGET}-v${VERSION}.tar.gz *
           fi
 
       - name: Upload artifact

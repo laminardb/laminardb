@@ -7,10 +7,10 @@
 | Phase 1 | 12 | 0 | 0 | 0 | 12 |
 | Phase 1.5 | 1 | 0 | 0 | 0 | 1 |
 | Phase 2 | 34 | 0 | 0 | 0 | 34 |
-| Phase 3 | 53 | 12 | 0 | 0 | 41 |
+| Phase 3 | 55 | 12 | 0 | 0 | 43 |
 | Phase 4 | 11 | 11 | 0 | 0 | 0 |
 | Phase 5 | 10 | 10 | 0 | 0 | 0 |
-| **Total** | **121** | **33** | **0** | **0** | **88** |
+| **Total** | **123** | **33** | **0** | **0** | **90** |
 
 ## Status Legend
 
@@ -101,7 +101,7 @@
 
 ## Phase 3: Connectors & Integration
 
-> **Status**: 36/48 features complete (75%)
+> **Status**: 43/55 features complete (78%)
 
 ### Streaming API ✅
 
@@ -186,6 +186,8 @@ See [Cloud Storage Index](phase-3/cloud/INDEX.md).
 | ID | Feature | Status | Spec |
 |----|---------|--------|------|
 | F-SQL-001 | ASOF JOIN SQL Support | ✅ | [Link](phase-3/F-SQL-001-asof-join-sql.md) |
+| F-SQL-002 | LAG/LEAD Window Functions | ✅ | [Link](phase-3/F-SQL-002-lag-lead-functions.md) |
+| F-SQL-003 | ROW_NUMBER/RANK/DENSE_RANK | ✅ | [Link](phase-3/F-SQL-003-ranking-functions.md) |
 
 ### Production Demo
 

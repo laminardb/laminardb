@@ -25,6 +25,25 @@
   - Created feature spec `docs/features/phase-3/F-FFI-004-async-callbacks.md`
   - All clippy clean with `-D warnings`, 164 laminar-db tests pass with `--features ffi`
 
+- **F-SQL-002: LAG/LEAD Window Functions** - IMPLEMENTATION COMPLETE (31 new tests)
+  - `parser/analytic_parser.rs` (NEW): AnalyticFunctionType enum (Lag/Lead/FirstValue/LastValue/NthValue), AnalyticFunctionInfo, AnalyticWindowAnalysis, analyze_analytic_functions() — walks SELECT items for Expr::Function with OVER clause (11 tests)
+  - `translator/analytic_translator.rs` (NEW): AnalyticWindowConfig, AnalyticFunctionConfig, from_analysis() conversion (5 tests)
+  - `operator/lag_lead.rs` (NEW): LagLeadConfig, LagLeadFunctionSpec, LagLeadOperator implementing Operator trait — per-partition LAG history (VecDeque) and LEAD pending queues, watermark flush, checkpoint/restore (13 tests)
+  - `planner/mod.rs`: Added analytic_config to QueryPlan and QueryAnalysis, wired into plan_standard_statement() and analyze_query() (2 tests)
+  - `parser/mod.rs`: Added pub mod analytic_parser
+  - `translator/mod.rs`: Added pub mod analytic_translator + re-exports
+  - `operator/mod.rs`: Already had pub mod lag_lead
+  - Streaming semantics: LAG emits immediately (history buffer), LEAD buffers and waits for offset future events
+  - All clippy clean with `-D warnings`
+
+- **F-SQL-003: ROW_NUMBER/RANK/DENSE_RANK Enhancement** - IMPLEMENTATION COMPLETE (10 new tests)
+  - `parser/order_analyzer.rs`: Added RankType enum (RowNumber/Rank/DenseRank), fixed bug where detect_row_number_pattern() was called AFTER order_columns.is_empty() early return, extended extract_row_number_info() for RANK/DENSE_RANK (8 new + 2 fixed tests)
+  - `translator/order_translator.rs`: Added rank_type field to PerGroupTopKConfig, updated from_analysis() (2 new + 1 fixed test)
+  - `translator/mod.rs`: Re-exported RankType
+  - Bug fix: Subquery pattern `SELECT * FROM (...ROW_NUMBER()...) WHERE rn <= 5` now correctly detected
+
+- Feature spec docs created: F-SQL-002-lag-lead-functions.md, F-SQL-003-ranking-functions.md
+
 Previous session (2026-02-06):
 - **F-FFI-003: Arrow C Data Interface** - IMPLEMENTATION COMPLETE (5 new tests, 155 total)
   - New `ffi/arrow_ffi.rs` module for zero-copy data exchange:
@@ -261,10 +280,10 @@ Previous session (2026-01-28):
 - Performance Audit: ALL 10 issues fixed
 - F074-F077: Aggregation Semantics Enhancement - COMPLETE (219 tests)
 
-**Total tests**: 1272 core + 412 sql + 115 storage + 164 laminar-db (with ffi) + 440 connectors + 4 demo = 2407 (base), +84 postgres-sink-only + 107 postgres-cdc-only + 118 kafka-only + 13 delta-lake-only = 2729 (with feature flags)
+**Total tests**: 1347 core + 440 sql + 115 storage + 164 laminar-db (with ffi) + 427 connectors + 4 demo = 2497 (base with ffi), +84 postgres-sink-only + 107 postgres-cdc-only + 118 kafka-only + 13 delta-lake-only = 2819 (all feature flags)
 
 ### Where We Left Off
-**Phase 3 Connectors & Integration: 41/53 features COMPLETE (77%)**
+**Phase 3 Connectors & Integration: 43/55 features COMPLETE (78%)**
 - Streaming API core complete (F-STREAM-001 to F-STREAM-007, F-STREAM-013)
 - Developer API overhaul complete (laminar-derive, laminar-db crates)
 - DAG pipeline complete (F-DAG-001 to F-DAG-007)
@@ -287,6 +306,7 @@ Previous session (2026-01-28):
 - **C Header Generation complete (F-FFI-002)** — 21 new tests, extern "C" functions with opaque handles, thread-local error storage
 - **Arrow C Data Interface complete (F-FFI-003)** — 5 new tests, zero-copy export/import via FFI_ArrowArray/FFI_ArrowSchema
 - **Async FFI Callbacks complete (F-FFI-004)** — 9 new tests (164 total), callback-based subscription notifications from background thread
+- **SQL Extensions: F-SQL-002 (LAG/LEAD) + F-SQL-003 (ROW_NUMBER/RANK/DENSE_RANK)** — 41 new tests, analytic window functions + ranking bug fix
 - Next: F028A MySQL CDC I/O, F031B/C/D Delta Lake advanced, or F032A Iceberg I/O
 
 ### Immediate Next Steps
@@ -401,6 +421,7 @@ laminar-core/src/
     changelog   # F076: RetractableFirst/LastValueAccumulator
     asof_join   # F056: ASOF joins
     temporal_join # F021: Temporal joins
+    lag_lead    # F-SQL-002: LAG/LEAD analytic window operator (per-partition history + pending queues)
 
 laminar-sql/src/       # F006B: Production SQL Parser
   parser/              # SQL parsing with streaming extensions
@@ -410,10 +431,14 @@ laminar-sql/src/       # F006B: Production SQL Parser
     late_data_parser   # Late data handling
     join_parser        # Stream-stream/lookup join analysis
     aggregation_parser # F077: 30+ aggregates, FILTER, WITHIN GROUP, datafusion_name()
-  planner/             # StreamingPlanner, QueryPlan
+    analytic_parser    # F-SQL-002: LAG/LEAD/FIRST_VALUE/LAST_VALUE/NTH_VALUE analytic window functions
+    order_analyzer     # F-SQL-003: ROW_NUMBER/RANK/DENSE_RANK detection, RankType enum
+  planner/             # StreamingPlanner, QueryPlan (+ analytic_config for LAG/LEAD)
   translator/          # Operator configuration builders
     window_translator  # WindowOperatorConfig
     join_translator    # JoinOperatorConfig (stream/lookup)
+    analytic_translator # F-SQL-002: AnalyticWindowConfig, AnalyticFunctionConfig
+    order_translator   # F-SQL-003: PerGroupTopKConfig with RankType
     streaming_ddl      # F-STREAM-007: CREATE SOURCE/SINK → SourceDefinition/SinkDefinition
   datafusion/          # F005/F005B: DataFusion integration
     window_udf         # F005B: TUMBLE/HOP/SESSION scalar UDFs

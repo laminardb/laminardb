@@ -64,7 +64,18 @@
       "WebFetch(domain:crates.io)",
       "Bash(bc:*)",
       "WebFetch(domain:raw.githubusercontent.com)",
-      "Bash(cargo fix:*)"
+      "Bash(cargo fix:*)",
+      "WebFetch(domain:lib.rs)",
+      "Bash(del \"C:\\\\Users\\\\sujit\\\\source\\\\laminardb\\\\crates\\\\laminar-storage\\\\src\\\\lakehouse.rs\")",
+      "Bash(cargo update:*)",
+      "WebFetch(domain:www.laminardb.io)",
+      "WebFetch(domain:laminardb.io)",
+      "Bash(gh api:*)",
+      "Bash(git remote:*)",
+      "Bash(curl:*)",
+      "WebFetch(domain:laminardb.github.io)",
+      "Bash(git push:*)",
+      "Bash(cargo audit:*)"
     ]
   }
 }
