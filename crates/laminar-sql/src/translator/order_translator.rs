@@ -3,7 +3,7 @@
 //! Translates parsed ORDER BY analysis into Ring 0 operator configurations
 //! that can be instantiated for streaming ORDER BY execution.
 
-use crate::parser::order_analyzer::{OrderAnalysis, OrderColumn, OrderPattern};
+use crate::parser::order_analyzer::{OrderAnalysis, OrderColumn, OrderPattern, RankType};
 
 /// Configuration for a streaming ORDER BY operator.
 ///
@@ -72,6 +72,8 @@ pub struct PerGroupTopKConfig {
     pub sort_columns: Vec<OrderColumn>,
     /// Maximum number of partitions (memory safety)
     pub max_partitions: usize,
+    /// Which ranking function was used (ROW_NUMBER, RANK, or DENSE_RANK)
+    pub rank_type: RankType,
 }
 
 /// Default maximum buffer size for watermark-bounded sort.
@@ -104,11 +106,13 @@ impl OrderOperatorConfig {
             OrderPattern::PerGroupTopK {
                 k,
                 partition_columns,
+                rank_type,
             } => Ok(Some(Self::PerGroupTopK(PerGroupTopKConfig {
                 k: *k,
                 partition_columns: partition_columns.clone(),
                 sort_columns: analysis.order_columns.clone(),
                 max_partitions: DEFAULT_MAX_PARTITIONS,
+                rank_type: *rank_type,
             }))),
             OrderPattern::Unbounded => Err(
                 "ORDER BY without LIMIT is not supported on unbounded streams. \
@@ -196,6 +200,7 @@ mod tests {
             pattern: OrderPattern::PerGroupTopK {
                 k: 5,
                 partition_columns: vec!["category".to_string()],
+                rank_type: RankType::RowNumber,
             },
         };
         let config = OrderOperatorConfig::from_analysis(&analysis)
@@ -206,6 +211,7 @@ mod tests {
                 assert_eq!(cfg.k, 5);
                 assert_eq!(cfg.partition_columns, vec!["category".to_string()]);
                 assert_eq!(cfg.max_partitions, DEFAULT_MAX_PARTITIONS);
+                assert_eq!(cfg.rank_type, RankType::RowNumber);
             }
             _ => panic!("Expected PerGroupTopK config"),
         }
@@ -289,6 +295,7 @@ mod tests {
             partition_columns: vec!["cat".to_string()],
             sort_columns: make_sort_columns(),
             max_partitions: DEFAULT_MAX_PARTITIONS,
+            rank_type: RankType::RowNumber,
         }
         .with_max_partitions(500);
         assert_eq!(cfg.max_partitions, 500);
@@ -302,5 +309,52 @@ mod tests {
         }
         .with_max_buffer_size(50_000);
         assert_eq!(cfg.max_buffer_size, 50_000);
+    }
+
+    #[test]
+    fn test_per_group_topk_rank_type() {
+        let analysis = OrderAnalysis {
+            order_columns: make_sort_columns(),
+            limit: Some(3),
+            is_windowed: false,
+            pattern: OrderPattern::PerGroupTopK {
+                k: 3,
+                partition_columns: vec!["region".to_string()],
+                rank_type: RankType::Rank,
+            },
+        };
+        let config = OrderOperatorConfig::from_analysis(&analysis)
+            .unwrap()
+            .unwrap();
+        match config {
+            OrderOperatorConfig::PerGroupTopK(cfg) => {
+                assert_eq!(cfg.rank_type, RankType::Rank);
+            }
+            _ => panic!("Expected PerGroupTopK config"),
+        }
+    }
+
+    #[test]
+    fn test_per_group_topk_dense_rank() {
+        let analysis = OrderAnalysis {
+            order_columns: make_sort_columns(),
+            limit: Some(10),
+            is_windowed: false,
+            pattern: OrderPattern::PerGroupTopK {
+                k: 10,
+                partition_columns: vec!["cat".to_string()],
+                rank_type: RankType::DenseRank,
+            },
+        };
+        let config = OrderOperatorConfig::from_analysis(&analysis)
+            .unwrap()
+            .unwrap();
+        match config {
+            OrderOperatorConfig::PerGroupTopK(cfg) => {
+                assert_eq!(cfg.rank_type, RankType::DenseRank);
+                assert_eq!(cfg.k, 10);
+            }
+            _ => panic!("Expected PerGroupTopK config"),
+        }
     }
 }

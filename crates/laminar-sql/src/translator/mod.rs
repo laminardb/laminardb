@@ -3,6 +3,8 @@
 //! This module translates parsed SQL AST into Ring 0 operator configurations
 //! that can be instantiated and executed.
 
+/// Analytic window function operator configuration builder
+pub mod analytic_translator;
 /// DAG EXPLAIN formatter
 pub mod dag_planner;
 mod join_translator;
@@ -12,6 +14,8 @@ pub mod order_translator;
 pub mod streaming_ddl;
 mod window_translator;
 
+pub use crate::parser::order_analyzer::RankType;
+pub use analytic_translator::{AnalyticFunctionConfig, AnalyticWindowConfig};
 pub use dag_planner::{format_dag_explain, DagExplainOutput};
 pub use join_translator::{
     AsofJoinTranslatorConfig, AsofSqlJoinType, JoinOperatorConfig, LookupJoinConfig,

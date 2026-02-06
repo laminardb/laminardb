@@ -43,15 +43,28 @@ pub enum OrderPattern {
     },
     /// ORDER BY inside a windowed aggregation — bounded by window.
     WindowLocal,
-    /// ROW_NUMBER() OVER (PARTITION BY ... ORDER BY ...) WHERE rn <= N.
+    /// ROW_NUMBER() / RANK() / DENSE_RANK() OVER (PARTITION BY ... ORDER BY ...) WHERE rn <= N.
     PerGroupTopK {
         /// Per-partition limit
         k: usize,
         /// Partition key columns
         partition_columns: Vec<String>,
+        /// Which ranking function was used
+        rank_type: RankType,
     },
     /// Unbounded ORDER BY on an unbounded stream — rejected.
     Unbounded,
+}
+
+/// Type of ranking function used in a per-group top-K pattern.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum RankType {
+    /// ROW_NUMBER() — unique sequential ranking, no ties.
+    RowNumber,
+    /// RANK() — ties get the same rank, with gaps after ties.
+    Rank,
+    /// DENSE_RANK() — ties get the same rank, no gaps.
+    DenseRank,
 }
 
 impl OrderAnalysis {
@@ -85,21 +98,14 @@ pub fn analyze_order_by(stmt: &Statement) -> OrderAnalysis {
         };
     };
 
-    let order_columns = extract_order_columns(query);
-    if order_columns.is_empty() {
-        return OrderAnalysis {
-            order_columns: vec![],
-            limit: None,
-            is_windowed: false,
-            pattern: OrderPattern::None,
-        };
-    }
-
     let limit = extract_limit(query);
     let is_windowed = check_is_windowed(query);
 
-    // Check for ROW_NUMBER() OVER (PARTITION BY ... ORDER BY ...) WHERE rn <= N
-    if let Some((k, partition_columns)) = detect_row_number_pattern(query) {
+    // Check for ROW_NUMBER()/RANK()/DENSE_RANK() OVER (...) WHERE rn <= N
+    // Must run BEFORE the order_columns check: subquery patterns like
+    // `SELECT * FROM (...ROW_NUMBER()...) WHERE rn <= 5` have no outer ORDER BY.
+    if let Some((k, partition_columns, rank_type)) = detect_row_number_pattern(query) {
+        let order_columns = extract_order_columns(query);
         return OrderAnalysis {
             order_columns,
             limit,
@@ -107,7 +113,18 @@ pub fn analyze_order_by(stmt: &Statement) -> OrderAnalysis {
             pattern: OrderPattern::PerGroupTopK {
                 k,
                 partition_columns,
+                rank_type,
             },
+        };
+    }
+
+    let order_columns = extract_order_columns(query);
+    if order_columns.is_empty() {
+        return OrderAnalysis {
+            order_columns: vec![],
+            limit: None,
+            is_windowed: false,
+            pattern: OrderPattern::None,
         };
     }
 
@@ -203,20 +220,22 @@ fn check_is_windowed(query: &Query) -> bool {
     }
 }
 
-/// Detects ROW_NUMBER() OVER (PARTITION BY ... ORDER BY ...) WHERE rn <= N pattern.
+/// Detects ROW_NUMBER()/RANK()/DENSE_RANK() OVER (PARTITION BY ... ORDER BY ...) WHERE rn <= N.
 ///
 /// This is a simplified heuristic: it looks for a subquery in FROM with
-/// ROW_NUMBER() and a filter on the outer query. For Phase 1, we detect
+/// a ranking function and a filter on the outer query. For Phase 1, we detect
 /// common SQL patterns rather than doing full semantic analysis.
-fn detect_row_number_pattern(query: &Query) -> Option<(usize, Vec<String>)> {
-    // Look for ROW_NUMBER in the SELECT items of the query body
+fn detect_row_number_pattern(query: &Query) -> Option<(usize, Vec<String>, RankType)> {
+    // Look for ranking function in the SELECT items of the query body
     if let SetExpr::Select(select) = query.body.as_ref() {
         for item in &select.projection {
             if let SelectItem::UnnamedExpr(expr) | SelectItem::ExprWithAlias { expr, .. } = item {
-                if let Some((partition_cols, _order_cols)) = extract_row_number_info(expr) {
+                if let Some((partition_cols, _order_cols, rank_type)) =
+                    extract_row_number_info(expr)
+                {
                     // Look for a LIMIT to determine K
                     if let Some(k) = extract_limit(query) {
-                        return Some((k, partition_cols));
+                        return Some((k, partition_cols, rank_type));
                     }
                 }
             }
@@ -228,16 +247,15 @@ fn detect_row_number_pattern(query: &Query) -> Option<(usize, Vec<String>)> {
                 if let SetExpr::Select(inner_select) = subquery.body.as_ref() {
                     for item in &inner_select.projection {
                         if let SelectItem::ExprWithAlias { expr, alias } = item {
-                            if extract_row_number_info(expr).is_some() {
-                                // Found ROW_NUMBER() AS alias in subquery
+                            if let Some((partition_cols, _order_cols, rank_type)) =
+                                extract_row_number_info(expr)
+                            {
+                                // Found ranking function AS alias in subquery
                                 // Check outer WHERE for alias <= N
                                 if let Some(k) =
                                     extract_rn_filter_limit(select.selection.as_ref(), &alias.value)
                                 {
-                                    let partition_cols = extract_row_number_info(expr)
-                                        .map(|(p, _)| p)
-                                        .unwrap_or_default();
-                                    return Some((k, partition_cols));
+                                    return Some((k, partition_cols, rank_type));
                                 }
                             }
                         }
@@ -249,28 +267,34 @@ fn detect_row_number_pattern(query: &Query) -> Option<(usize, Vec<String>)> {
     None
 }
 
-/// Extracts ROW_NUMBER partition and order columns from an expression.
-fn extract_row_number_info(expr: &Expr) -> Option<(Vec<String>, Vec<String>)> {
+/// Extracts ranking function info (partition cols, order cols, rank type) from an expression.
+///
+/// Recognizes ROW_NUMBER(), RANK(), and DENSE_RANK().
+fn extract_row_number_info(expr: &Expr) -> Option<(Vec<String>, Vec<String>, RankType)> {
     if let Expr::Function(func) = expr {
         let name = func.name.to_string().to_uppercase();
-        if name == "ROW_NUMBER" {
-            if let Some(ref window_spec) = func.over {
-                match window_spec {
-                    sqlparser::ast::WindowType::WindowSpec(spec) => {
-                        let partition_cols: Vec<String> = spec
-                            .partition_by
-                            .iter()
-                            .filter_map(extract_column_name)
-                            .collect();
-                        let order_cols: Vec<String> = spec
-                            .order_by
-                            .iter()
-                            .filter_map(|ob| extract_column_name(&ob.expr))
-                            .collect();
-                        return Some((partition_cols, order_cols));
-                    }
-                    sqlparser::ast::WindowType::NamedWindow(_) => {}
+        let rank_type = match name.as_str() {
+            "ROW_NUMBER" => RankType::RowNumber,
+            "RANK" => RankType::Rank,
+            "DENSE_RANK" => RankType::DenseRank,
+            _ => return None,
+        };
+        if let Some(ref window_spec) = func.over {
+            match window_spec {
+                sqlparser::ast::WindowType::WindowSpec(spec) => {
+                    let partition_cols: Vec<String> = spec
+                        .partition_by
+                        .iter()
+                        .filter_map(extract_column_name)
+                        .collect();
+                    let order_cols: Vec<String> = spec
+                        .order_by
+                        .iter()
+                        .filter_map(|ob| extract_column_name(&ob.expr))
+                        .collect();
+                    return Some((partition_cols, order_cols, rank_type));
                 }
+                sqlparser::ast::WindowType::NamedWindow(_) => {}
             }
         }
     }
@@ -426,11 +450,16 @@ mod tests {
         let stmt = parse_stmt(sql);
         let analysis = analyze_order_by(&stmt);
 
-        // Should detect per-group topk (rn <= 5 but no outer ORDER BY)
-        // Note: The pattern detection looks at ORDER BY of the outer query
-        // For this specific SQL, the outer has no ORDER BY, so pattern is None
-        // The ROW_NUMBER detection triggers only when combined with outer ORDER BY or LIMIT
-        assert_eq!(analysis.pattern, OrderPattern::None);
+        // Should detect per-group topk (rn <= 5, subquery pattern)
+        assert_eq!(
+            analysis.pattern,
+            OrderPattern::PerGroupTopK {
+                k: 5,
+                partition_columns: vec!["category".to_string()],
+                rank_type: RankType::RowNumber,
+            }
+        );
+        assert!(analysis.is_streaming_safe());
     }
 
     #[test]
@@ -442,9 +471,15 @@ mod tests {
         let stmt = parse_stmt(sql);
         let analysis = analyze_order_by(&stmt);
 
-        // Outer has ORDER BY + LIMIT -> TopK, but the inner ROW_NUMBER pattern
-        // should be detected
-        // Note: current implementation detects TopK from outer LIMIT
+        // Should detect PerGroupTopK from the subquery pattern (k=3)
+        assert_eq!(
+            analysis.pattern,
+            OrderPattern::PerGroupTopK {
+                k: 3,
+                partition_columns: vec!["category".to_string()],
+                rank_type: RankType::RowNumber,
+            }
+        );
         assert!(analysis.is_streaming_safe());
     }
 
@@ -454,6 +489,139 @@ mod tests {
         let stmt = parse_stmt(sql);
         let analysis = analyze_order_by(&stmt);
         // No ORDER BY on the outer query, no filter -> None pattern
+        assert_eq!(analysis.pattern, OrderPattern::None);
+    }
+
+    // ── F-SQL-003: Ranking function tests ──────────────────────────────
+
+    #[test]
+    fn test_row_number_subquery_no_outer_order() {
+        let sql = "SELECT * FROM (
+            SELECT *, ROW_NUMBER() OVER (PARTITION BY symbol ORDER BY ts DESC) AS rn
+            FROM trades
+        ) sub WHERE rn <= 10";
+        let stmt = parse_stmt(sql);
+        let analysis = analyze_order_by(&stmt);
+        assert_eq!(
+            analysis.pattern,
+            OrderPattern::PerGroupTopK {
+                k: 10,
+                partition_columns: vec!["symbol".to_string()],
+                rank_type: RankType::RowNumber,
+            }
+        );
+        assert!(analysis.is_streaming_safe());
+    }
+
+    #[test]
+    fn test_row_number_direct_with_limit() {
+        let sql = "SELECT *, ROW_NUMBER() OVER (PARTITION BY cat ORDER BY val DESC) AS rn
+            FROM events LIMIT 5";
+        let stmt = parse_stmt(sql);
+        let analysis = analyze_order_by(&stmt);
+        assert_eq!(
+            analysis.pattern,
+            OrderPattern::PerGroupTopK {
+                k: 5,
+                partition_columns: vec!["cat".to_string()],
+                rank_type: RankType::RowNumber,
+            }
+        );
+    }
+
+    #[test]
+    fn test_detect_rank_pattern() {
+        let sql = "SELECT * FROM (
+            SELECT *, RANK() OVER (PARTITION BY category ORDER BY price DESC) AS rn
+            FROM trades
+        ) sub WHERE rn <= 3";
+        let stmt = parse_stmt(sql);
+        let analysis = analyze_order_by(&stmt);
+        assert_eq!(
+            analysis.pattern,
+            OrderPattern::PerGroupTopK {
+                k: 3,
+                partition_columns: vec!["category".to_string()],
+                rank_type: RankType::Rank,
+            }
+        );
+        assert!(analysis.is_streaming_safe());
+    }
+
+    #[test]
+    fn test_detect_dense_rank_pattern() {
+        let sql = "SELECT * FROM (
+            SELECT *, DENSE_RANK() OVER (PARTITION BY region ORDER BY revenue DESC) AS rn
+            FROM sales
+        ) sub WHERE rn <= 5";
+        let stmt = parse_stmt(sql);
+        let analysis = analyze_order_by(&stmt);
+        assert_eq!(
+            analysis.pattern,
+            OrderPattern::PerGroupTopK {
+                k: 5,
+                partition_columns: vec!["region".to_string()],
+                rank_type: RankType::DenseRank,
+            }
+        );
+    }
+
+    #[test]
+    fn test_rank_multiple_partition_columns() {
+        let sql = "SELECT * FROM (
+            SELECT *, RANK() OVER (PARTITION BY region, category ORDER BY sales DESC) AS rn
+            FROM revenue
+        ) sub WHERE rn <= 3";
+        let stmt = parse_stmt(sql);
+        let analysis = analyze_order_by(&stmt);
+        match &analysis.pattern {
+            OrderPattern::PerGroupTopK {
+                k,
+                partition_columns,
+                rank_type,
+            } => {
+                assert_eq!(*k, 3);
+                assert_eq!(
+                    partition_columns,
+                    &["region".to_string(), "category".to_string()]
+                );
+                assert_eq!(*rank_type, RankType::Rank);
+            }
+            _ => panic!("Expected PerGroupTopK, got {:?}", analysis.pattern),
+        }
+    }
+
+    #[test]
+    fn test_rank_extracts_order_columns() {
+        let sql = "SELECT *, RANK() OVER (PARTITION BY cat ORDER BY price DESC, ts ASC) AS rn
+            FROM trades LIMIT 10";
+        let stmt = parse_stmt(sql);
+        let analysis = analyze_order_by(&stmt);
+        assert!(matches!(
+            analysis.pattern,
+            OrderPattern::PerGroupTopK {
+                rank_type: RankType::Rank,
+                ..
+            }
+        ));
+    }
+
+    #[test]
+    fn test_rank_pattern_is_streaming_safe() {
+        let sql = "SELECT * FROM (
+            SELECT *, DENSE_RANK() OVER (PARTITION BY cat ORDER BY val) AS rn
+            FROM events
+        ) sub WHERE rn <= 5";
+        let stmt = parse_stmt(sql);
+        let analysis = analyze_order_by(&stmt);
+        assert!(analysis.is_streaming_safe());
+    }
+
+    #[test]
+    fn test_no_ranking_function_none() {
+        let sql = "SELECT id, name FROM events WHERE id > 5";
+        let stmt = parse_stmt(sql);
+        let analysis = analyze_order_by(&stmt);
         assert_eq!(analysis.pattern, OrderPattern::None);
     }
 

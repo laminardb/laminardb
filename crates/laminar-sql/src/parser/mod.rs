@@ -5,6 +5,7 @@
 //! with `GenericDialect`.
 
 pub mod aggregation_parser;
+pub mod analytic_parser;
 mod continuous_query_parser;
 pub(crate) mod dialect;
 mod emit_parser;

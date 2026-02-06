@@ -12,6 +12,7 @@ use datafusion::logical_expr::LogicalPlan;
 use datafusion::prelude::SessionContext;
 use sqlparser::ast::{ObjectName, SetExpr, Statement};
 
+use crate::parser::analytic_parser::analyze_analytic_functions;
 use crate::parser::join_parser::analyze_join;
 use crate::parser::order_analyzer::analyze_order_by;
 use crate::parser::{
@@ -19,7 +20,8 @@ use crate::parser::{
     WindowFunction, WindowRewriter,
 };
 use crate::translator::{
-    DagExplainOutput, JoinOperatorConfig, OrderOperatorConfig, WindowOperatorConfig,
+    AnalyticWindowConfig, DagExplainOutput, JoinOperatorConfig, OrderOperatorConfig,
+    WindowOperatorConfig,
 };
 
 /// Streaming query planner
@@ -83,6 +85,8 @@ pub struct QueryPlan {
     pub join_config: Option<JoinOperatorConfig>,
     /// ORDER BY configuration if the query has ordering
     pub order_config: Option<OrderOperatorConfig>,
+    /// Analytic window function configuration (LAG/LEAD/etc.)
+    pub analytic_config: Option<AnalyticWindowConfig>,
     /// Emit strategy
     pub emit_clause: Option<EmitClause>,
     /// The underlying SQL statement
@@ -228,6 +232,7 @@ impl StreamingPlanner {
             window_config: query_plan.window_config,
             join_config: query_plan.join_config,
             order_config: query_plan.order_config,
+            analytic_config: query_plan.analytic_config,
             emit_clause: emit_clause.cloned(),
             statement: Box::new(stmt),
         }))
@@ -252,8 +257,15 @@ impl StreamingPlanner {
                 let order_config = OrderOperatorConfig::from_analysis(&order_analysis)
                     .map_err(PlanningError::InvalidQuery)?;
 
-                let has_streaming_features =
-                    window_function.is_some() || join_analysis.is_some() || order_config.is_some();
+                // Check for analytic functions (LAG/LEAD/etc.)
+                let analytic_analysis = analyze_analytic_functions(stmt);
+                let analytic_config =
+                    analytic_analysis.map(|a| AnalyticWindowConfig::from_analysis(&a));
+
+                let has_streaming_features = window_function.is_some()
+                    || join_analysis.is_some()
+                    || order_config.is_some()
+                    || analytic_config.is_some();
 
                 if has_streaming_features {
                     let window_config = match window_function {
@@ -271,6 +283,7 @@ impl StreamingPlanner {
                         window_config,
                         join_config,
                         order_config,
+                        analytic_config,
                         emit_clause: None,
                         statement: Box::new(stmt.clone()),
                     }));
@@ -319,6 +332,11 @@ impl StreamingPlanner {
         let order_analysis = analyze_order_by(stmt);
         analysis.order_config = OrderOperatorConfig::from_analysis(&order_analysis)
             .map_err(PlanningError::InvalidQuery)?;
+
+        // Extract analytic function info (LAG/LEAD/etc.)
+        if let Some(analytic) = analyze_analytic_functions(stmt) {
+            analysis.analytic_config = Some(AnalyticWindowConfig::from_analysis(&analytic));
+        }
 
         Ok(analysis)
     }
@@ -411,6 +429,7 @@ struct QueryAnalysis {
     window_config: Option<WindowOperatorConfig>,
     join_config: Option<JoinOperatorConfig>,
     order_config: Option<OrderOperatorConfig>,
+    analytic_config: Option<AnalyticWindowConfig>,
 }
 
 /// Helper to convert `ObjectName` to String
@@ -616,6 +635,46 @@ mod tests {
                 assert_eq!(config.right_key(), "order_id");
             }
             _ => panic!("Expected Query plan"),
+        }
+    }
+
+    #[test]
+    fn test_plan_query_with_lag() {
+        let mut planner = StreamingPlanner::new();
+        let statements = StreamingParser::parse_sql(
+            "SELECT price, LAG(price) OVER (PARTITION BY symbol ORDER BY ts) AS prev FROM trades",
+        )
+        .unwrap();
+
+        let plan = planner.plan(&statements[0]).unwrap();
+        match plan {
+            StreamingPlan::Query(query_plan) => {
+                assert!(query_plan.analytic_config.is_some());
+                let config = query_plan.analytic_config.unwrap();
+                assert_eq!(config.functions.len(), 1);
+                assert_eq!(config.partition_columns, vec!["symbol".to_string()]);
+            }
+            _ => panic!("Expected Query plan with analytic config"),
+        }
+    }
+
+    #[test]
+    fn test_plan_query_with_lead() {
+        let mut planner = StreamingPlanner::new();
+        let statements = StreamingParser::parse_sql(
+            "SELECT LEAD(price, 2) OVER (ORDER BY ts) AS next2 FROM trades",
+        )
+        .unwrap();
+
+        let plan = planner.plan(&statements[0]).unwrap();
+        match plan {
+            StreamingPlan::Query(query_plan) => {
+                assert!(query_plan.analytic_config.is_some());
+                let config = query_plan.analytic_config.unwrap();
+                assert!(config.has_lookahead());
+                assert_eq!(config.functions[0].offset, 2);
+            }
+            _ => panic!("Expected Query plan with analytic config"),
         }
     }
 }
