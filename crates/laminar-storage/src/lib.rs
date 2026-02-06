@@ -1,6 +1,6 @@
 //! # `LaminarDB` Storage
 //!
-//! Durability layer for `LaminarDB` - WAL, checkpointing, and lakehouse integration.
+//! Durability layer for `LaminarDB` - WAL, checkpointing, and recovery.
 //!
 //! ## Module Overview
 //!
@@ -8,8 +8,10 @@
 //! - [`checkpoint`]: Basic checkpointing for fast recovery
 //! - [`incremental`]: F022 Incremental checkpointing with `RocksDB` backend
 //! - [`per_core_wal`]: F062 Per-core WAL segments for thread-per-core architecture
-//! - [`lakehouse`]: Delta Lake and Iceberg sink support
 //! - [`wal_state_store`]: Combines `MmapStateStore` with WAL for durability
+//!
+//! **Note:** Lakehouse sinks (Delta Lake, Iceberg) are in `laminar-connectors` crate,
+//! not here. This crate handles `LaminarDB`'s internal durability, not external storage formats.
 
 #![deny(missing_docs)]
 #![warn(clippy::all, clippy::pedantic)]
@@ -28,9 +30,6 @@ pub mod incremental;
 
 /// Per-core WAL segments (F062) - Thread-per-core WAL for lock-free writes
 pub mod per_core_wal;
-
-/// Lakehouse format integration - Delta Lake and Iceberg sink support
-pub mod lakehouse;
 
 /// `io_uring`-backed Write-Ahead Log for high-performance durability (Linux only).
 #[cfg(all(target_os = "linux", feature = "io-uring"))]

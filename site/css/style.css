@@ -735,6 +735,204 @@ ul, ol { list-style: none; }
   font-family: var(--font-mono);
 }
 
+/* --- Data Flow Section --- */
+.dataflow { padding: var(--section-padding); }
+
+.flow-diagram {
+  display: flex;
+  align-items: center;
+  justify-content: center;
+  gap: 0;
+  margin: 2rem 0 3rem;
+  flex-wrap: wrap;
+}
+
+.flow-stage {
+  background: var(--glass-bg);
+  border: 2px solid var(--glass-border);
+  border-radius: var(--radius);
+  padding: 1.5rem;
+  min-width: 180px;
+  text-align: center;
+}
+
+.flow-stage-label {
+  font-size: 0.7rem;
+  font-weight: 700;
+  text-transform: uppercase;
+  letter-spacing: 0.1em;
+  color: var(--text-muted);
+  margin-bottom: 1rem;
+}
+
+.flow-source { border-color: rgba(74, 222, 128, 0.4); }
+.flow-source .flow-stage-label { color: #4ade80; }
+
+.flow-processing {
+  border-color: var(--accent-primary);
+  background: rgba(56, 189, 248, 0.05);
+  min-width: 280px;
+}
+.flow-processing .flow-stage-label { color: var(--accent-primary); }
+
+.flow-sink { border-color: rgba(251, 146, 60, 0.4); }
+.flow-sink .flow-stage-label { color: #fb923c; }
+
+.flow-nodes {
+  display: flex;
+  flex-direction: column;
+  gap: 0.5rem;
+}
+
+.flow-node {
+  display: flex;
+  align-items: center;
+  gap: 0.5rem;
+  padding: 0.5rem 0.75rem;
+  background: var(--bg-primary);
+  border: 1px solid var(--glass-border);
+  border-radius: var(--radius-sm);
+  font-size: 0.85rem;
+  font-weight: 500;
+  color: var(--text-primary);
+}
+
+.flow-icon {
+  width: 20px;
+  height: 20px;
+  display: flex;
+  align-items: center;
+  justify-content: center;
+  background: var(--accent-primary);
+  color: var(--bg-primary);
+  border-radius: 4px;
+  font-size: 0.7rem;
+  font-weight: 700;
+}
+
+.flow-pipeline {
+  display: flex;
+  align-items: center;
+  justify-content: center;
+  gap: 0.25rem;
+  margin-bottom: 1rem;
+}
+
+.flow-connector {
+  width: 20px;
+  height: 2px;
+  background: var(--accent-primary);
+  position: relative;
+}
+.flow-connector::after {
+  content: '';
+  position: absolute;
+  right: 0;
+  top: -3px;
+  border: 4px solid transparent;
+  border-left-color: var(--accent-primary);
+}
+
+.flow-substage {
+  display: flex;
+  flex-wrap: wrap;
+  gap: 0.4rem;
+  justify-content: center;
+}
+.flow-substage span {
+  font-size: 0.7rem;
+  padding: 0.2rem 0.5rem;
+  background: rgba(56, 189, 248, 0.1);
+  border-radius: 100px;
+  color: var(--accent-secondary);
+  font-weight: 500;
+}
+
+.flow-arrow {
+  display: flex;
+  flex-direction: column;
+  align-items: center;
+  padding: 0 1rem;
+  color: var(--text-muted);
+}
+.flow-arrow svg {
+  width: 32px;
+  height: 32px;
+  stroke: var(--glass-border-hover);
+}
+.flow-arrow span {
+  font-size: 0.7rem;
+  margin-top: 0.25rem;
+  font-weight: 500;
+}
+
+/* Architecture highlights */
+.arch-highlights {
+  display: grid;
+  grid-template-columns: repeat(auto-fit, minmax(280px, 1fr));
+  gap: 1.5rem;
+  margin-top: 2rem;
+}
+
+.arch-highlight {
+  display: flex;
+  gap: 1rem;
+  padding: 1.25rem;
+  background: var(--glass-bg);
+  border: 1px solid var(--glass-border);
+  border-radius: var(--radius);
+  transition: all var(--transition);
+}
+.arch-highlight:hover {
+  border-color: var(--glass-border-hover);
+}
+
+.arch-highlight-icon {
+  flex-shrink: 0;
+  width: 40px;
+  height: 40px;
+  display: flex;
+  align-items: center;
+  justify-content: center;
+  background: rgba(56, 189, 248, 0.1);
+  border-radius: 8px;
+  color: var(--accent-primary);
+}
+.arch-highlight-icon svg {
+  width: 20px;
+  height: 20px;
+}
+
+.arch-highlight-content h4 {
+  font-size: 0.95rem;
+  font-weight: 600;
+  color: var(--text-primary);
+  margin-bottom: 0.25rem;
+}
+.arch-highlight-content p {
+  font-size: 0.85rem;
+  color: var(--text-secondary);
+  line-height: 1.5;
+}
+
+@media (max-width: 900px) {
+  .flow-diagram {
+    flex-direction: column;
+    gap: 1rem;
+  }
+  .flow-arrow {
+    transform: rotate(90deg);
+    padding: 0.5rem 0;
+  }
+  .flow-stage { width: 100%; max-width: 300px; }
+  .flow-pipeline { flex-wrap: wrap; }
+}
+
+@media (max-width: 480px) {
+  .arch-highlight { flex-direction: column; text-align: center; }
+  .arch-highlight-icon { margin: 0 auto; }
+}
+
 /* --- Use Cases --- */
 .use-cases { padding: var(--section-padding); }
 .use-cases-grid {

@@ -10,7 +10,7 @@
 
   <!-- Open Graph -->
   <meta property="og:title" content="LaminarDB - The Embedded Streaming Database">
-  <meta property="og:description" content="Sub-microsecond SQL stream processing. No cluster required. MIT.">
+  <meta property="og:description" content="Sub-microsecond SQL stream processing. No cluster required. Apache 2.0.">
   <meta property="og:image" content="https://laminardb.io/img/logo.jpg">
   <meta property="og:url" content="https://laminardb.io">
   <meta property="og:type" content="website">
@@ -44,7 +44,7 @@
     "description": "High-performance embedded streaming database in Rust with sub-microsecond latency",
     "applicationCategory": "Database",
     "operatingSystem": "Linux, macOS, Windows",
-    "license": "https://opensource.org/licenses/MIT",
+    "license": "https://opensource.org/licenses/Apache-2.0",
     "url": "https://laminardb.io",
     "codeRepository": "https://github.com/laminardb/laminardb",
     "programmingLanguage": "Rust"
@@ -66,7 +66,7 @@
         <a href="#performance">Performance</a>
         <a href="#code">Code</a>
         <a href="#architecture">Architecture</a>
-        <a href="#use-cases">Use Cases</a>
+        <a href="#dataflow">Data Flow</a>
         <a href="#features">Features</a>
       </nav>
 
@@ -88,7 +88,7 @@
         <a href="#performance">Performance</a>
         <a href="#code">Code Examples</a>
         <a href="#architecture">Architecture</a>
-        <a href="#use-cases">Use Cases</a>
+        <a href="#dataflow">Data Flow</a>
         <a href="#features">Features</a>
         <a href="#comparison">Comparison</a>
         <a href="https://github.com/laminardb/laminardb" class="btn btn-secondary" target="_blank" rel="noopener">GitHub</a>
@@ -132,10 +132,10 @@
         </div>
 
         <div class="hero-badges">
-          <span class="badge">MIT</span>
+          <span class="badge">Apache 2.0</span>
           <span class="badge">Rust</span>
-          <span class="badge">2000+ Tests</span>
-          <span class="badge">65 Features</span>
+          <span class="badge">2600+ Tests</span>
+          <span class="badge">84 Features</span>
         </div>
       </div>
     </section>
@@ -292,29 +292,126 @@
       <div class="container">
         <div class="code-tabs reveal">
           <div class="tab-buttons">
-            <button class="tab-btn active" data-tab="tab-sql">Streaming SQL</button>
+            <button class="tab-btn active" data-tab="tab-rust">Rust API</button>
+            <button class="tab-btn" data-tab="tab-sql">Streaming SQL</button>
+            <button class="tab-btn" data-tab="tab-kafka">Kafka Pipeline</button>
             <button class="tab-btn" data-tab="tab-joins">Stream Joins</button>
-            <button class="tab-btn" data-tab="tab-rust">Rust API</button>
             <button class="tab-btn" data-tab="tab-cdc">CDC Pipeline</button>
           </div>
 
-          <div class="tab-panel active" id="tab-sql">
+          <div class="tab-panel active" id="tab-rust">
+            <button class="copy-btn" aria-label="Copy code">Copy</button>
+            <pre><code class="language-rust">use laminar_db::LaminarDB;
+use laminar_derive::{Record, FromRecordBatch};
+
+#[derive(Record, FromRecordBatch, Clone)]
+struct Trade { symbol: String, price: f64, volume: i64, ts: i64 }
+
+#[derive(FromRecordBatch, Clone)]
+struct OhlcBar { symbol: String, open: f64, high: f64, low: f64, close: f64 }
+
+#[tokio::main]
+async fn main() -> Result&lt;(), Box&lt;dyn std::error::Error&gt;&gt; {
+    // Build with config variables for ${VAR} substitution in SQL
+    let db = LaminarDB::builder()
+        .config_var("KAFKA_BROKERS", "localhost:9092")
+        .buffer_size(65536)
+        .build().await?;
+
+    // Define source schema
+    db.execute("CREATE SOURCE trades (
+        symbol VARCHAR, price DOUBLE, volume BIGINT, ts BIGINT
+    )").await?;
+
+    // Create streaming materialized view
+    db.execute("CREATE MATERIALIZED VIEW ohlc_1m AS
+        SELECT symbol, FIRST(price) as open, MAX(price) as high,
+               MIN(price) as low, LAST(price) as close
+        FROM trades
+        GROUP BY symbol, TUMBLE(ts, INTERVAL '1' MINUTE)
+    ").await?;
+
+    db.start().await?;
+
+    // Get typed handles
+    let source = db.source::&lt;Trade&gt;("trades")?;
+    let sub = db.subscribe::&lt;OhlcBar&gt;("ohlc_1m")?;
+
+    // Push events (batch for efficiency)
+    source.push_batch(vec![
+        Trade { symbol: "AAPL".into(), price: 150.0, volume: 100, ts: now() },
+    ]);
+    source.watermark(now());  // Advance event time
+
+    // Consume results (non-blocking poll or blocking recv)
+    while let Some(bars) = sub.poll() {
+        for bar in bars { println!("{}: {:.2}", bar.symbol, bar.close); }
+    }
+    Ok(())
+}</code></pre>
+          </div>
+
+          <div class="tab-panel" id="tab-sql">
             <button class="copy-btn" aria-label="Copy code">Copy</button>
             <pre><code class="language-sql">-- Real-time OHLC bars from a trade stream
 CREATE MATERIALIZED VIEW ohlc_1m AS
 SELECT
   symbol,
-  TUMBLE_START(event_time, INTERVAL '1' MINUTE) AS bar_start,
-  FIRST_VALUE(price) AS open,
+  TUMBLE_START(ts, INTERVAL '1' MINUTE) AS bar_start,
+  FIRST(price) AS open,
   MAX(price) AS high,
   MIN(price) AS low,
-  LAST_VALUE(price) AS close,
+  LAST(price) AS close,
   SUM(volume) AS volume
 FROM trades
-GROUP BY
+GROUP BY symbol, TUMBLE(ts, INTERVAL '1' MINUTE)
+EMIT ON WINDOW CLOSE;
+
+-- Cascading MV: 1-hour bars from 1-minute bars
+CREATE MATERIALIZED VIEW ohlc_1h AS
+SELECT
   symbol,
-  TUMBLE(event_time, INTERVAL '1' MINUTE)
-EMIT ON WINDOW CLOSE;</code></pre>
+  TUMBLE_START(bar_start, INTERVAL '1' HOUR) AS hour_start,
+  FIRST(open) AS open,
+  MAX(high) AS high,
+  MIN(low) AS low,
+  LAST(close) AS close
+FROM ohlc_1m
+GROUP BY symbol, TUMBLE(bar_start, INTERVAL '1' HOUR);</code></pre>
+          </div>
+
+          <div class="tab-panel" id="tab-kafka">
+            <button class="copy-btn" aria-label="Copy code">Copy</button>
+            <pre><code class="language-sql">-- Kafka source with Schema Registry (Avro)
+CREATE SOURCE trades (
+  symbol VARCHAR, price DOUBLE, ts BIGINT
+) FROM KAFKA (
+  brokers = '${KAFKA_BROKERS}',
+  topic = 'market-trades',
+  group_id = 'laminar-analytics',
+  format = 'avro',
+  schema.registry.url = 'http://schema-registry:8081',
+  offset_reset = 'earliest',
+  security.protocol = 'sasl_ssl',
+  sasl.mechanism = 'SCRAM-SHA-256',
+  sasl.username = '${KAFKA_USER}',
+  sasl.password = '${KAFKA_PASS}'
+);
+
+-- Process and aggregate
+CREATE MATERIALIZED VIEW trade_summary AS
+SELECT symbol, COUNT(*) as trades, SUM(price * volume) as notional
+FROM trades
+GROUP BY symbol, TUMBLE(ts, INTERVAL '1' MINUTE);
+
+-- Kafka sink with exactly-once delivery
+CREATE SINK output TO KAFKA (
+  brokers = '${KAFKA_BROKERS}',
+  topic = 'trade-summaries',
+  format = 'json',
+  delivery.guarantee = 'exactly-once',
+  compression.type = 'snappy'
+) SELECT * FROM trade_summary;</code></pre>
           </div>
 
           <div class="tab-panel" id="tab-joins">
@@ -324,74 +421,55 @@ SELECT
   t.symbol,
   t.price AS trade_price,
   t.quantity,
-  q.bid,
-  q.ask,
+  q.bid, q.ask,
   t.price - q.bid AS spread
 FROM trades t
 ASOF JOIN quotes q
   ON t.symbol = q.symbol
-  AND t.event_time >= q.event_time
-  TOLERANCE INTERVAL '5' SECOND;</code></pre>
-          </div>
+  AND t.ts >= q.ts
+  TOLERANCE INTERVAL '5' SECOND;
 
-          <div class="tab-panel" id="tab-rust">
-            <button class="copy-btn" aria-label="Copy code">Copy</button>
-            <pre><code class="language-rust">use laminar_db::LaminarDB;
-
-#[tokio::main]
-async fn main() -> Result<(), Box<dyn std::error::Error>> {
-    let db = LaminarDB::open("./my_stream_db").await?;
-
-    // Create a streaming query
-    db.execute("
-        CREATE MATERIALIZED VIEW alerts AS
-        SELECT sensor_id, AVG(temperature) AS avg_temp
-        FROM sensors
-        GROUP BY sensor_id, TUMBLE(event_time, INTERVAL '10' SECOND)
-        HAVING AVG(temperature) > 100.0
-        EMIT ON WINDOW CLOSE
-    ").await?;
-
-    // Ingest events
-    let source = db.source("sensors").await?;
-    source.push(sensor_event).await?;
-
-    // Query results
-    let results = db.query("SELECT * FROM alerts").await?;
-    println!("{:?}", results);
-
-    Ok(())
-}</code></pre>
+-- Stream-stream join with time bounds
+SELECT t.*, o.order_id, o.client_id
+FROM trades t
+INNER JOIN orders o
+  ON t.symbol = o.symbol
+  AND t.ts BETWEEN o.ts AND o.ts + INTERVAL '1' MINUTE
+WHERE t.price >= o.limit_price;</code></pre>
           </div>
 
           <div class="tab-panel" id="tab-cdc">
             <button class="copy-btn" aria-label="Copy code">Copy</button>
-            <pre><code class="language-sql">-- Stream changes from PostgreSQL to Kafka
-CREATE SOURCE orders_cdc
-WITH (
-  connector = 'postgres-cdc',
+            <pre><code class="language-sql">-- PostgreSQL CDC source (logical replication)
+CREATE SOURCE orders_cdc (
+  id INT, customer_id INT, amount DECIMAL, status VARCHAR, ts BIGINT
+) FROM POSTGRES_CDC (
   hostname = 'db.example.com',
   port = '5432',
   database = 'shop',
+  schema = 'public',
   table = 'orders',
-  slot.name = 'laminar_orders'
+  slot.name = 'laminar_orders',
+  publication = 'laminar_pub'
 );
 
-CREATE SINK order_totals_kafka
-WITH (
-  connector = 'kafka',
-  brokers = 'kafka:9092',
-  topic = 'order-totals',
-  format = 'json'
-) AS
+-- Aggregate CDC changes (Z-set changelog)
+CREATE MATERIALIZED VIEW customer_totals AS
 SELECT
   customer_id,
   COUNT(*) AS total_orders,
   SUM(amount) AS total_spent
 FROM orders_cdc
-WHERE _op IN ('I', 'U')
+WHERE _op IN ('I', 'U')  -- Insert, Update operations
 GROUP BY customer_id
-EMIT CHANGES;</code></pre>
+EMIT CHANGES;
+
+-- Sink to Delta Lake
+CREATE SINK lake TO DELTA_LAKE (
+  path = 's3://bucket/customer_totals',
+  write_mode = 'merge',
+  partition_by = 'customer_id'
+) SELECT * FROM customer_totals;</code></pre>
           </div>
         </div>
       </div>
@@ -408,17 +486,18 @@ EMIT CHANGES;</code></pre>
           <div class="ring ring-0">
             <div class="ring-header">
               <span class="ring-title">Ring 0: Hot Path</span>
-              <span class="ring-constraint">&lt; 1&micro;s &bull; zero allocations &bull; no locks</span>
+              <span class="ring-constraint">&lt; 500ns &bull; zero allocations &bull; no locks</span>
             </div>
             <div class="ring-components">
               <div class="ring-component">Reactor</div>
-              <div class="ring-component">Operators</div>
-              <div class="ring-component">State Store</div>
-              <div class="ring-component">Emit</div>
+              <div class="ring-component">DagExecutor</div>
+              <div class="ring-component">RoutingTable</div>
+              <div class="ring-component">StateStore</div>
+              <div class="ring-component">MulticastBuffer</div>
             </div>
           </div>
 
-          <div class="ring-arrow"><span>SPSC Queues (lock-free)</span></div>
+          <div class="ring-arrow"><span>SPSC Queues (~4.8ns)</span></div>
 
           <div class="ring ring-1">
             <div class="ring-header">
@@ -426,9 +505,9 @@ EMIT CHANGES;</code></pre>
               <span class="ring-constraint">async I/O &bull; bounded latency impact</span>
             </div>
             <div class="ring-components">
+              <div class="ring-component">Per-Core WAL</div>
               <div class="ring-component">Checkpoint</div>
-              <div class="ring-component">WAL</div>
-              <div class="ring-component">Compaction</div>
+              <div class="ring-component">Connectors</div>
               <div class="ring-component">io_uring</div>
             </div>
           </div>
@@ -445,6 +524,90 @@ EMIT CHANGES;</code></pre>
               <div class="ring-component">Metrics</div>
               <div class="ring-component">Auth</div>
               <div class="ring-component">Config</div>
+            </div>
+          </div>
+        </div>
+      </div>
+
+    </section>
+
+    <!-- ======== Data Flow Section ======== -->
+    <section class="dataflow" id="dataflow">
+      <div class="container text-center">
+        <h2 class="section-heading reveal">End-to-End <span class="gradient-text">Data Flow</span></h2>
+        <p class="section-subheading reveal">From Kafka to lakehouse with exactly-once guarantees.</p>
+      </div>
+      <div class="container">
+        <div class="flow-diagram reveal">
+          <div class="flow-stage flow-source">
+            <div class="flow-stage-label">Sources</div>
+            <div class="flow-nodes">
+              <div class="flow-node"><span class="flow-icon">K</span>Kafka</div>
+              <div class="flow-node"><span class="flow-icon">P</span>PostgreSQL CDC</div>
+              <div class="flow-node"><span class="flow-icon">M</span>MySQL CDC</div>
+            </div>
+          </div>
+          <div class="flow-arrow">
+            <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><path d="M5 12h14M12 5l7 7-7 7"/></svg>
+            <span>Deserialize</span>
+          </div>
+          <div class="flow-stage flow-processing">
+            <div class="flow-stage-label">Ring 0 Processing</div>
+            <div class="flow-pipeline">
+              <div class="flow-node">DagExecutor</div>
+              <div class="flow-connector"></div>
+              <div class="flow-node">Operators</div>
+              <div class="flow-connector"></div>
+              <div class="flow-node">State Store</div>
+            </div>
+            <div class="flow-substage">
+              <span>Windows</span>
+              <span>Joins</span>
+              <span>Aggregations</span>
+              <span>Watermarks</span>
+            </div>
+          </div>
+          <div class="flow-arrow">
+            <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><path d="M5 12h14M12 5l7 7-7 7"/></svg>
+            <span>Checkpoint</span>
+          </div>
+          <div class="flow-stage flow-sink">
+            <div class="flow-stage-label">Sinks</div>
+            <div class="flow-nodes">
+              <div class="flow-node"><span class="flow-icon">K</span>Kafka</div>
+              <div class="flow-node"><span class="flow-icon">D</span>Delta Lake</div>
+              <div class="flow-node"><span class="flow-icon">I</span>Iceberg</div>
+            </div>
+          </div>
+        </div>
+
+        <!-- Architecture highlights -->
+        <div class="arch-highlights reveal">
+          <div class="arch-highlight">
+            <div class="arch-highlight-icon">
+              <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><circle cx="12" cy="12" r="10"/><path d="M12 6v6l4 2"/></svg>
+            </div>
+            <div class="arch-highlight-content">
+              <h4>Per-Core WAL</h4>
+              <p>Lock-free writes with epoch ordering. Each CPU core owns its own WAL segment for zero contention.</p>
+            </div>
+          </div>
+          <div class="arch-highlight">
+            <div class="arch-highlight-icon">
+              <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><path d="M22 11.08V12a10 10 0 1 1-5.93-9.14"/><polyline points="22 4 12 14.01 9 11.01"/></svg>
+            </div>
+            <div class="arch-highlight-content">
+              <h4>Exactly-Once Delivery</h4>
+              <p>Kafka transactions + epoch tracking. Checkpoint coordinator ensures no duplicates across failures.</p>
+            </div>
+          </div>
+          <div class="arch-highlight">
+            <div class="arch-highlight-icon">
+              <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><polyline points="22 12 18 12 15 21 9 3 6 12 2 12"/></svg>
+            </div>
+            <div class="arch-highlight-content">
+              <h4>Zero-Copy Multicast</h4>
+              <p>Arc&lt;RecordBatch&gt; fan-out to multiple consumers. O(1) routing via cache-line aligned dispatch table.</p>
             </div>
           </div>
         </div>
@@ -502,7 +665,7 @@ EMIT CHANGES;</code></pre>
     <!-- ======== Features Grid ======== -->
     <section class="features" id="features">
       <div class="container text-center">
-        <h2 class="section-heading reveal">65 Features <span class="gradient-text">And Counting</span></h2>
+        <h2 class="section-heading reveal">84 Features <span class="gradient-text">And Counting</span></h2>
         <p class="section-subheading reveal">Production-grade streaming across engine, SQL, durability, and connectors.</p>
       </div>
       <div class="container">
@@ -756,17 +919,17 @@ EMIT CHANGES;</code></pre>
           <div class="feature-category">
             <button class="feature-category-header">
               <h3>Connectors</h3>
-              <div><span class="count">5 features</span> <span class="chevron">&#9660;</span></div>
+              <div><span class="count">11 features</span> <span class="chevron">&#9660;</span></div>
             </button>
             <div class="feature-list">
               <div class="feature-item">
                 <span class="feature-name">Kafka Source</span>
-                <span class="feature-desc">Consumer groups, backpressure, Schema Registry</span>
+                <span class="feature-desc">Consumer groups, backpressure, Schema Registry, SASL/SSL</span>
                 <span class="feature-badge done">Done</span>
               </div>
               <div class="feature-item">
                 <span class="feature-name">Kafka Sink</span>
-                <span class="feature-desc">Transactional, idempotent, partitioning strategies</span>
+                <span class="feature-desc">Exactly-once transactions, partitioning, compression</span>
                 <span class="feature-badge done">Done</span>
               </div>
               <div class="feature-item">
@@ -780,8 +943,38 @@ EMIT CHANGES;</code></pre>
                 <span class="feature-badge done">Done</span>
               </div>
               <div class="feature-item">
+                <span class="feature-name">MySQL CDC Source</span>
+                <span class="feature-desc">Binlog decoder, GTID support, Z-set changelog</span>
+                <span class="feature-badge done">Done</span>
+              </div>
+              <div class="feature-item">
+                <span class="feature-name">Delta Lake Sink</span>
+                <span class="feature-desc">Parquet writes, exactly-once epochs, S3/Azure/GCS</span>
+                <span class="feature-badge done">Done</span>
+              </div>
+              <div class="feature-item">
+                <span class="feature-name">Iceberg Sink</span>
+                <span class="feature-desc">REST/Glue/Hive catalogs, partition transforms, equality deletes</span>
+                <span class="feature-badge done">Done</span>
+              </div>
+              <div class="feature-item">
+                <span class="feature-name">Connector SDK</span>
+                <span class="feature-desc">Retry policies, circuit breakers, rate limiting, test harness</span>
+                <span class="feature-badge done">Done</span>
+              </div>
+              <div class="feature-item">
+                <span class="feature-name">Cloud Storage</span>
+                <span class="feature-desc">S3, Azure ADLS, GCS credential resolution &amp; validation</span>
+                <span class="feature-badge done">Done</span>
+              </div>
+              <div class="feature-item">
                 <span class="feature-name">Connector Bridge</span>
                 <span class="feature-desc">DAG &harr; external connectors with runtime orchestration</span>
+                <span class="feature-badge done">Done</span>
+              </div>
+              <div class="feature-item">
+                <span class="feature-name">Broadcast Channel</span>
+                <span class="feature-desc">Shared ring buffer SPMC, query-plan derived mode</span>
                 <span class="feature-badge done">Done</span>
               </div>
             </div>
@@ -790,27 +983,17 @@ EMIT CHANGES;</code></pre>
           <div class="feature-category">
             <button class="feature-category-header">
               <h3>Coming Soon</h3>
-              <div><span class="count">10+ features</span> <span class="chevron">&#9660;</span></div>
+              <div><span class="count">6+ features</span> <span class="chevron">&#9660;</span></div>
             </button>
             <div class="feature-list">
               <div class="feature-item">
-                <span class="feature-name">Delta Lake Sink</span>
-                <span class="feature-desc">Stream to Delta Lake tables</span>
+                <span class="feature-name">MongoDB CDC Source</span>
+                <span class="feature-desc">Change streams, resume tokens</span>
                 <span class="feature-badge soon">Coming Soon</span>
               </div>
               <div class="feature-item">
-                <span class="feature-name">Iceberg Sink</span>
-                <span class="feature-desc">Stream to Apache Iceberg tables</span>
-                <span class="feature-badge soon">Coming Soon</span>
-              </div>
-              <div class="feature-item">
-                <span class="feature-name">MySQL CDC Source</span>
-                <span class="feature-desc">Binlog-based change data capture</span>
-                <span class="feature-badge soon">Coming Soon</span>
-              </div>
-              <div class="feature-item">
-                <span class="feature-name">Connector SDK</span>
-                <span class="feature-desc">Build custom source/sink connectors</span>
+                <span class="feature-name">Redis Lookup Table</span>
+                <span class="feature-desc">Cached dimension tables with TTL</span>
                 <span class="feature-badge soon">Coming Soon</span>
               </div>
               <div class="feature-item">
@@ -926,7 +1109,7 @@ EMIT CHANGES;</code></pre>
               </tr>
               <tr>
                 <td>License</td>
-                <td class="highlight">MIT</td>
+                <td class="highlight">Apache 2.0</td>
                 <td>Apache 2.0</td>
                 <td>Apache 2.0</td>
                 <td>Apache 2.0</td>
@@ -999,7 +1182,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     <section class="community" id="community">
       <div class="container">
         <div class="community-content reveal">
-          <h2 class="section-heading">Open Source.<br><span class="gradient-text">MIT.</span></h2>
+          <h2 class="section-heading">Open Source.<br><span class="gradient-text">Apache 2.0.</span></h2>
           <p class="section-subheading" style="margin: 1rem auto 0">LaminarDB is open source and free to use. Contributions welcome.</p>
 
           <div class="community-actions">
@@ -1059,7 +1242,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
       </div>
     </div>
     <div class="footer-bottom">
-      <p>&copy; 2026 LaminarDB. Built with Rust + Apache Arrow + DataFusion. <a href="https://github.com/laminardb/laminardb/blob/main/LICENSE" target="_blank" rel="noopener">MIT License</a>.</p>
+      <p>&copy; 2026 LaminarDB. Built with Rust + Apache Arrow + DataFusion. <a href="https://github.com/laminardb/laminardb/blob/main/LICENSE" target="_blank" rel="noopener">Apache 2.0 License</a>.</p>
     </div>
   </footer>
 

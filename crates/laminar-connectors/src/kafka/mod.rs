@@ -46,6 +46,7 @@ pub mod metrics;
 pub mod offsets;
 pub mod rebalance;
 pub mod source;
+pub mod watermarks;
 
 // Sink modules
 pub mod avro_serializer;
@@ -59,10 +60,17 @@ pub mod schema_registry;
 
 // Source re-exports
 pub use avro::AvroDeserializer;
-pub use config::{AssignmentStrategy, CompatibilityLevel, KafkaSourceConfig, OffsetReset, SrAuth};
+pub use config::{
+    AssignmentStrategy, CompatibilityLevel, IsolationLevel, KafkaSourceConfig, OffsetReset,
+    SaslMechanism, SecurityProtocol, SrAuth, StartupMode, TopicSubscription,
+};
 pub use metrics::KafkaSourceMetrics;
 pub use offsets::OffsetTracker;
 pub use source::KafkaSource;
+pub use watermarks::{
+    AlignmentCheckResult, KafkaAlignmentConfig, KafkaAlignmentMode, KafkaWatermarkTracker,
+    WatermarkMetrics, WatermarkMetricsSnapshot,
+};
 
 // Sink re-exports
 pub use avro_serializer::AvroSerializer;
@@ -147,28 +155,165 @@ pub fn register_kafka_sink(registry: &ConnectorRegistry) {
 }
 
 /// Returns the configuration key specifications for the Kafka source.
+#[allow(clippy::too_many_lines)]
 fn kafka_source_config_keys() -> Vec<ConfigKeySpec> {
     vec![
+        // Required
         ConfigKeySpec::required("bootstrap.servers", "Kafka broker addresses"),
         ConfigKeySpec::required("group.id", "Consumer group identifier"),
         ConfigKeySpec::required("topic", "Comma-separated list of topics"),
+        // Topic subscription (alternative to 'topic')
+        ConfigKeySpec::optional("topic.pattern", "Regex pattern for topic subscription", ""),
+        // Format
         ConfigKeySpec::optional("format", "Data format (json/csv/avro/raw/debezium)", "json"),
+        // Security
+        ConfigKeySpec::optional(
+            "security.protocol",
+            "Security protocol (plaintext/ssl/sasl_plaintext/sasl_ssl)",
+            "plaintext",
+        ),
+        ConfigKeySpec::optional(
+            "sasl.mechanism",
+            "SASL mechanism (PLAIN/SCRAM-SHA-256/SCRAM-SHA-512/GSSAPI/OAUTHBEARER)",
+            "",
+        ),
+        ConfigKeySpec::optional("sasl.username", "SASL username for PLAIN/SCRAM", ""),
+        ConfigKeySpec::optional("sasl.password", "SASL password for PLAIN/SCRAM", ""),
+        ConfigKeySpec::optional("ssl.ca.location", "SSL CA certificate file path", ""),
+        ConfigKeySpec::optional(
+            "ssl.certificate.location",
+            "Client SSL certificate file path",
+            "",
+        ),
+        ConfigKeySpec::optional("ssl.key.location", "Client SSL private key file path", ""),
+        ConfigKeySpec::optional("ssl.key.password", "Password for encrypted SSL key", ""),
+        // Consumer tuning
+        ConfigKeySpec::optional(
+            "startup.mode",
+            "Startup mode (group-offsets/earliest/latest)",
+            "group-offsets",
+        ),
+        ConfigKeySpec::optional(
+            "startup.specific.offsets",
+            "Start from specific offsets (format: 'partition:offset,...')",
+            "",
+        ),
+        ConfigKeySpec::optional(
+            "startup.timestamp.ms",
+            "Start from timestamp (milliseconds since epoch)",
+            "",
+        ),
         ConfigKeySpec::optional(
             "auto.offset.reset",
-            "Where to start (earliest/latest)",
+            "Fallback when no committed offset (earliest/latest/none)",
             "earliest",
+        ),
+        ConfigKeySpec::optional(
+            "isolation.level",
+            "Transaction isolation (read_uncommitted/read_committed)",
+            "read_committed",
         ),
         ConfigKeySpec::optional("max.poll.records", "Max records per poll", "1000"),
         ConfigKeySpec::optional("poll.timeout.ms", "Poll timeout in milliseconds", "100"),
         ConfigKeySpec::optional("commit.interval.ms", "Offset commit interval", "5000"),
         ConfigKeySpec::optional(
+            "partition.assignment.strategy",
+            "Partition assignment (range/roundrobin/cooperative-sticky)",
+            "range",
+        ),
+        // Fetch tuning
+        ConfigKeySpec::optional("fetch.min.bytes", "Minimum bytes per fetch request", "1"),
+        ConfigKeySpec::optional(
+            "fetch.max.bytes",
+            "Maximum bytes per fetch request",
+            "52428800",
+        ),
+        ConfigKeySpec::optional(
+            "fetch.max.wait.ms",
+            "Max wait time for fetch.min.bytes",
+            "500",
+        ),
+        ConfigKeySpec::optional(
+            "max.partition.fetch.bytes",
+            "Max bytes per partition per fetch",
+            "1048576",
+        ),
+        // Metadata
+        ConfigKeySpec::optional(
             "include.metadata",
-            "Include _partition/_offset columns",
+            "Include _partition/_offset/_timestamp columns",
+            "false",
+        ),
+        ConfigKeySpec::optional("include.headers", "Include _headers column", "false"),
+        ConfigKeySpec::optional(
+            "event.time.column",
+            "Column name for event time extraction",
+            "",
+        ),
+        // Watermark
+        ConfigKeySpec::optional(
+            "max.out.of.orderness.ms",
+            "Max out-of-orderness for watermarks",
+            "5000",
+        ),
+        ConfigKeySpec::optional("idle.timeout.ms", "Idle partition timeout", "30000"),
+        ConfigKeySpec::optional(
+            "enable.watermark.tracking",
+            "Enable per-partition watermark tracking (F064)",
             "false",
         ),
         ConfigKeySpec::optional(
+            "alignment.group.id",
+            "Alignment group ID for multi-source coordination (F066)",
+            "",
+        ),
+        ConfigKeySpec::optional(
+            "alignment.max.drift.ms",
+            "Maximum allowed drift between sources in alignment group",
+            "",
+        ),
+        ConfigKeySpec::optional(
+            "alignment.mode",
+            "Alignment enforcement mode (pause/warn-only/drop-excess)",
+            "pause",
+        ),
+        // Backpressure
+        ConfigKeySpec::optional(
+            "backpressure.high.watermark",
+            "Channel fill ratio to pause",
+            "0.8",
+        ),
+        ConfigKeySpec::optional(
+            "backpressure.low.watermark",
+            "Channel fill ratio to resume",
+            "0.5",
+        ),
+        // Schema Registry
+        ConfigKeySpec::optional(
             "schema.registry.url",
             "Confluent Schema Registry URL (required for Avro)",
+            "",
+        ),
+        ConfigKeySpec::optional("schema.registry.username", "Schema Registry username", ""),
+        ConfigKeySpec::optional("schema.registry.password", "Schema Registry password", ""),
+        ConfigKeySpec::optional(
+            "schema.registry.ssl.ca.location",
+            "Schema Registry SSL CA cert path",
+            "",
+        ),
+        ConfigKeySpec::optional(
+            "schema.registry.ssl.certificate.location",
+            "Schema Registry SSL client cert path",
+            "",
+        ),
+        ConfigKeySpec::optional(
+            "schema.registry.ssl.key.location",
+            "Schema Registry SSL client key path",
+            "",
+        ),
+        ConfigKeySpec::optional(
+            "schema.compatibility",
+            "Schema compatibility level override",
             "",
         ),
     ]
@@ -177,36 +322,102 @@ fn kafka_source_config_keys() -> Vec<ConfigKeySpec> {
 /// Returns the configuration key specifications for the Kafka sink.
 fn kafka_sink_config_keys() -> Vec<ConfigKeySpec> {
     vec![
+        // Required
         ConfigKeySpec::required("bootstrap.servers", "Kafka broker addresses"),
         ConfigKeySpec::required("topic", "Target Kafka topic"),
+        // Format
         ConfigKeySpec::optional("format", "Serialization format (json/csv/avro/raw)", "json"),
+        // Security
+        ConfigKeySpec::optional(
+            "security.protocol",
+            "Security protocol (plaintext/ssl/sasl_plaintext/sasl_ssl)",
+            "plaintext",
+        ),
+        ConfigKeySpec::optional(
+            "sasl.mechanism",
+            "SASL mechanism (PLAIN/SCRAM-SHA-256/SCRAM-SHA-512/GSSAPI/OAUTHBEARER)",
+            "",
+        ),
+        ConfigKeySpec::optional("sasl.username", "SASL username for PLAIN/SCRAM", ""),
+        ConfigKeySpec::optional("sasl.password", "SASL password for PLAIN/SCRAM", ""),
+        ConfigKeySpec::optional("ssl.ca.location", "SSL CA certificate file path", ""),
+        ConfigKeySpec::optional(
+            "ssl.certificate.location",
+            "Client SSL certificate file path",
+            "",
+        ),
+        ConfigKeySpec::optional("ssl.key.location", "Client SSL private key file path", ""),
+        ConfigKeySpec::optional("ssl.key.password", "Password for encrypted SSL key", ""),
+        // Delivery & Transactions
         ConfigKeySpec::optional(
             "delivery.guarantee",
             "Delivery guarantee (at-least-once/exactly-once)",
             "at-least-once",
         ),
+        ConfigKeySpec::optional(
+            "transactional.id",
+            "Transactional ID prefix (auto-generated if not set)",
+            "",
+        ),
+        ConfigKeySpec::optional(
+            "transaction.timeout.ms",
+            "Transaction timeout in milliseconds",
+            "60000",
+        ),
+        ConfigKeySpec::optional("acks", "Acknowledgment level (0/1/all)", "all"),
+        ConfigKeySpec::optional(
+            "max.in.flight.requests",
+            "Max in-flight requests (<=5 for exactly-once)",
+            "5",
+        ),
+        ConfigKeySpec::optional(
+            "delivery.timeout.ms",
+            "Delivery timeout in milliseconds",
+            "120000",
+        ),
+        // Partitioning
         ConfigKeySpec::optional("key.column", "Column name to use as Kafka message key", ""),
         ConfigKeySpec::optional(
             "partitioner",
             "Partitioning strategy (key-hash/round-robin/sticky)",
             "key-hash",
         ),
+        // Batching & Compression
+        ConfigKeySpec::optional("linger.ms", "Producer linger time in milliseconds", "5"),
+        ConfigKeySpec::optional("batch.size", "Producer batch size in bytes", "16384"),
+        ConfigKeySpec::optional("batch.num.messages", "Max messages per batch", "10000"),
         ConfigKeySpec::optional(
             "compression.type",
             "Compression (none/gzip/snappy/lz4/zstd)",
             "none",
         ),
-        ConfigKeySpec::optional("acks", "Acknowledgment level (none/leader/all)", "all"),
-        ConfigKeySpec::optional("linger.ms", "Producer linger time in milliseconds", "5"),
-        ConfigKeySpec::optional("batch.size", "Producer batch size in bytes", "65536"),
+        // Error Handling
+        ConfigKeySpec::optional(
+            "dlq.topic",
+            "Dead letter queue topic for failed records",
+            "",
+        ),
+        ConfigKeySpec::optional(
+            "flush.batch.size",
+            "Max records to buffer before flushing",
+            "1000",
+        ),
+        // Schema Registry
         ConfigKeySpec::optional(
             "schema.registry.url",
             "Confluent Schema Registry URL (required for Avro)",
             "",
         ),
+        ConfigKeySpec::optional("schema.registry.username", "Schema Registry username", ""),
+        ConfigKeySpec::optional("schema.registry.password", "Schema Registry password", ""),
         ConfigKeySpec::optional(
-            "dlq.topic",
-            "Dead letter queue topic for failed records",
+            "schema.registry.ssl.ca.location",
+            "Schema Registry SSL CA cert path",
+            "",
+        ),
+        ConfigKeySpec::optional(
+            "schema.compatibility",
+            "Schema compatibility level override",
             "",
         ),
     ]

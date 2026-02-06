@@ -16,10 +16,13 @@ concurrency:
 env:
   CARGO_TERM_COLOR: always
   RUST_BACKTRACE: 1
+  # Reduce debug info to speed up builds and linking
+  CARGO_PROFILE_DEV_DEBUG: 0
+  CARGO_PROFILE_TEST_DEBUG: 0
 
 jobs:
   # ============================================
-  # Formatting Check
+  # Formatting Check (fast, no deps)
   # ============================================
   fmt:
     name: Format
@@ -44,9 +47,11 @@ jobs:
           components: clippy
       - uses: Swatinem/rust-cache@v2
       - name: Install system dependencies
-        run: sudo apt-get update && sudo apt-get install -y libhwloc-dev libelf-dev zlib1g-dev libcurl4-openssl-dev cmake pkg-config libsasl2-dev libudev-dev
+        run: sudo apt-get update && sudo apt-get install -y libhwloc-dev libelf-dev zlib1g-dev libcurl4-openssl-dev cmake pkg-config libsasl2-dev libudev-dev mold
       - name: Clippy (all features)
         run: cargo clippy --workspace --all-features --all-targets -- -D warnings
+        env:
+          RUSTFLAGS: "-C link-arg=-fuse-ld=mold"
       - name: Clippy (no default features)
         run: cargo clippy --workspace --no-default-features -- -D warnings
 
@@ -54,7 +59,7 @@ jobs:
   # Build & Test (Multi-Platform)
   # ============================================
   build-and-test:
-    name: Build & Test (${{ matrix.os }})
+    name: Test (${{ matrix.os }})
     runs-on: ${{ matrix.os }}
     strategy:
       fail-fast: false
@@ -70,48 +75,53 @@ jobs:
 
       - name: Install system dependencies (Linux)
         if: runner.os == 'Linux'
-        run: sudo apt-get update && sudo apt-get install -y libhwloc-dev libelf-dev zlib1g-dev libcurl4-openssl-dev cmake pkg-config libsasl2-dev libudev-dev
+        run: sudo apt-get update && sudo apt-get install -y libhwloc-dev libelf-dev zlib1g-dev libcurl4-openssl-dev cmake pkg-config libsasl2-dev libudev-dev mold
 
       - name: Install hwloc (macOS)
         if: runner.os == 'macOS'
         run: brew install hwloc
 
-      # Build and test (debug mode for faster compilation and lower memory usage)
-      - name: Build (Linux/macOS)
-        if: runner.os != 'Windows'
-        run: cargo build --workspace --all-features
+      # Tests include compilation - no separate build step needed
+      - name: Run tests (Linux)
+        if: runner.os == 'Linux'
+        run: cargo nextest run --workspace --all-features
         env:
-          CARGO_BUILD_JOBS: 2  # Limit parallelism to reduce memory usage
+          RUSTFLAGS: "-C link-arg=-fuse-ld=mold"
 
-      - name: Build (Windows)
-        if: runner.os == 'Windows'
-        run: cargo build --workspace
-        env:
-          CARGO_BUILD_JOBS: 2
-
-      - name: Run tests (Linux/macOS)
-        if: runner.os != 'Windows'
+      - name: Run tests (macOS)
+        if: runner.os == 'macOS'
         run: cargo nextest run --workspace --all-features
 
+      # Windows: explicit features (skip hwloc, io-uring, xdp)
       - name: Run tests (Windows)
         if: runner.os == 'Windows'
-        run: cargo nextest run --workspace
+        run: cargo nextest run --workspace --features "allocation-tracking,kafka,postgres-cdc,postgres-sink,mysql-cdc,delta-lake"
 
+      # Doc tests only on Linux (redundant across platforms)
       - name: Run doc tests
+        if: runner.os == 'Linux'
         run: cargo test --doc --workspace
 
-      # Verify release build compiles (but don't run tests again)
-      - name: Check release build (Linux/macOS)
-        if: runner.os != 'Windows'
+  # ============================================
+  # Release Build (main/develop only)
+  # ============================================
+  release-build:
+    name: Release Build
+    runs-on: ubuntu-latest
+    # Only run on main/develop to save CI time on PRs
+    if: github.ref == 'refs/heads/main' || github.ref == 'refs/heads/develop'
+    steps:
+      - uses: actions/checkout@v6
+      - uses: dtolnay/rust-toolchain@stable
+      - uses: Swatinem/rust-cache@v2
+        with:
+          key: release
+      - name: Install system dependencies
+        run: sudo apt-get update && sudo apt-get install -y libhwloc-dev libelf-dev zlib1g-dev libcurl4-openssl-dev cmake pkg-config libsasl2-dev libudev-dev mold
+      - name: Build release
         run: cargo build --workspace --release --all-features
         env:
-          CARGO_BUILD_JOBS: 2
-
-      - name: Check release build (Windows)
-        if: runner.os == 'Windows'
-        run: cargo build --workspace --release
-        env:
-          CARGO_BUILD_JOBS: 2
+          RUSTFLAGS: "-C link-arg=-fuse-ld=mold"
 
   # ============================================
   # Feature Combinations
@@ -125,13 +135,15 @@ jobs:
       - uses: Swatinem/rust-cache@v2
 
       - name: Install system dependencies
-        run: sudo apt-get update && sudo apt-get install -y libhwloc-dev libelf-dev zlib1g-dev libcurl4-openssl-dev cmake pkg-config libsasl2-dev libudev-dev
+        run: sudo apt-get update && sudo apt-get install -y libhwloc-dev libelf-dev zlib1g-dev libcurl4-openssl-dev cmake pkg-config libsasl2-dev libudev-dev mold
 
       - name: Check no default features
         run: cargo check --workspace --no-default-features
 
       - name: Check all features
         run: cargo check --workspace --all-features
+        env:
+          RUSTFLAGS: "-C link-arg=-fuse-ld=mold"
 
       - name: Check individual features
         run: |
@@ -182,11 +194,12 @@ jobs:
       - uses: dtolnay/rust-toolchain@stable
       - uses: Swatinem/rust-cache@v2
       - name: Install system dependencies
-        run: sudo apt-get update && sudo apt-get install -y libhwloc-dev libelf-dev zlib1g-dev libcurl4-openssl-dev cmake pkg-config libsasl2-dev libudev-dev
+        run: sudo apt-get update && sudo apt-get install -y libhwloc-dev libelf-dev zlib1g-dev libcurl4-openssl-dev cmake pkg-config libsasl2-dev libudev-dev mold
       - name: Build docs
         run: cargo doc --workspace --no-deps --all-features
         env:
           RUSTDOCFLAGS: "-D warnings --cfg docsrs"
+          RUSTFLAGS: "-C link-arg=-fuse-ld=mold"
 
   # ============================================
   # Security Audit
