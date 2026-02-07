@@ -6,10 +6,10 @@
 #   docker run --rm -it -e DEMO_MODE=kafka laminardb-demo # Kafka mode
 
 # -- Build stage --
-FROM rust:1.83-slim AS builder
+FROM rust:1.93-slim AS builder
 
 RUN apt-get update && apt-get install -y --no-install-recommends \
-    cmake g++ libssl-dev pkg-config \
+    cmake make g++ libssl-dev libcurl4-openssl-dev pkg-config clang libclang-dev \
     && rm -rf /var/lib/apt/lists/*
 
 WORKDIR /build

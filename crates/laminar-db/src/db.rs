@@ -4969,7 +4969,8 @@ mod tests {
             schema.clone(),
             vec![
                 Arc::new(arrow::array::Int64Array::from(
-                    (1..=timestamps_ms.len() as i64).collect::<Vec<_>>(),
+                    (1..=i64::try_from(timestamps_ms.len()).expect("len fits i64"))
+                        .collect::<Vec<_>>(),
                 )),
                 Arc::new(arrow::array::TimestampMicrosecondArray::from(us_values)),
             ],
