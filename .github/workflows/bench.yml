@@ -65,7 +65,7 @@ jobs:
           cargo bench -p laminar-core --bench reactor_bench -- --noplot 2>&1 | tee -a results.txt
 
       - name: Upload results
-        uses: actions/upload-artifact@v4
+        uses: actions/upload-artifact@v6
         with:
           name: bench-latency
           path: results.txt
@@ -96,7 +96,7 @@ jobs:
           cargo bench -p laminar-core --bench dag_stress -- --noplot 2>&1 | tee -a results.txt
 
       - name: Upload results
-        uses: actions/upload-artifact@v4
+        uses: actions/upload-artifact@v6
         with:
           name: bench-dag
           path: results.txt
@@ -129,7 +129,7 @@ jobs:
           cargo bench -p laminar-core --bench subscription_bench -- --noplot 2>&1 | tee -a results.txt
 
       - name: Upload results
-        uses: actions/upload-artifact@v4
+        uses: actions/upload-artifact@v6
         with:
           name: bench-operators
           path: results.txt
@@ -161,7 +161,7 @@ jobs:
           cargo bench -p laminar-core --bench io_uring_bench -- --noplot 2>&1 | tee -a results.txt
 
       - name: Upload results
-        uses: actions/upload-artifact@v4
+        uses: actions/upload-artifact@v6
         with:
           name: bench-throughput
           path: results.txt
@@ -192,7 +192,7 @@ jobs:
           cargo bench -p laminar-storage --bench checkpoint_bench -- --noplot 2>&1 | tee -a results.txt
 
       - name: Upload results
-        uses: actions/upload-artifact@v4
+        uses: actions/upload-artifact@v6
         with:
           name: bench-storage
           path: results.txt
@@ -248,7 +248,7 @@ jobs:
         continue-on-error: true
 
       - name: Upload combined results
-        uses: actions/upload-artifact@v4
+        uses: actions/upload-artifact@v6
         with:
           name: benchmark-results-combined
           path: bench_output.txt
