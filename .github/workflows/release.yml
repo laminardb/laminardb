@@ -281,6 +281,15 @@ jobs:
       - name: Wait for index
         run: sleep 30
 
+      - name: Strip delta-lake feature from laminar-connectors
+        run: |
+          # deltalake 0.30.x on crates.io requires DataFusion 51, which conflicts
+          # with our DF 52 dependency tree. Remove it from the published crate.
+          # The delta-lake feature will be restored once deltalake publishes a DF 52-compatible release.
+          TOML="crates/laminar-connectors/Cargo.toml"
+          perl -i -ne 'print unless /^deltalake\s*=/' "$TOML"
+          perl -i -ne 'print unless /^delta-lake/' "$TOML"
+
       - name: Publish laminar-connectors
         run: cargo publish -p laminar-connectors --registry crates-io --allow-dirty --no-verify
         continue-on-error: true
