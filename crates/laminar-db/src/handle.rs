@@ -314,6 +314,12 @@ impl<T: Record> SourceHandle<T> {
     pub fn schema(&self) -> &SchemaRef {
         &self.entry.schema
     }
+
+    /// Get the maximum out-of-orderness duration, if configured.
+    #[must_use]
+    pub fn max_out_of_orderness(&self) -> Option<Duration> {
+        self.entry.max_out_of_orderness
+    }
 }
 
 impl<T: Record> std::fmt::Debug for SourceHandle<T> {
@@ -387,6 +393,12 @@ impl UntypedSourceHandle {
     #[must_use]
     pub fn schema(&self) -> &SchemaRef {
         &self.entry.schema
+    }
+
+    /// Get the maximum out-of-orderness duration, if configured.
+    #[must_use]
+    pub fn max_out_of_orderness(&self) -> Option<Duration> {
+        self.entry.max_out_of_orderness
     }
 }
 

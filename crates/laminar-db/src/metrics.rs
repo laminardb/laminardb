@@ -128,6 +128,8 @@ pub struct PipelineMetrics {
     pub stream_count: usize,
     /// Number of registered sinks.
     pub sink_count: usize,
+    /// Global pipeline watermark (minimum across all source watermarks).
+    pub pipeline_watermark: i64,
 }
 
 /// Metrics for a single registered source.
@@ -298,6 +300,7 @@ mod tests {
             source_count: 2,
             stream_count: 1,
             sink_count: 1,
+            pipeline_watermark: i64::MIN,
         };
         let m2 = m.clone();
         assert_eq!(m2.total_events_ingested, 100);

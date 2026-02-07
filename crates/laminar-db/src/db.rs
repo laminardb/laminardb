@@ -85,6 +85,32 @@ pub struct LaminarDB {
     counters: Arc<crate::metrics::PipelineCounters>,
     /// Instant when the database was created, for uptime calculation.
     start_time: std::time::Instant,
+    /// Global pipeline watermark (min of all source watermarks).
+    pipeline_watermark: Arc<std::sync::atomic::AtomicI64>,
+}
+
+/// Per-source watermark tracking state for the pipeline loop.
+///
+/// Combines an `EventTimeExtractor` (to find the max timestamp in each batch)
+/// with a `BoundedOutOfOrdernessGenerator` (to compute the watermark with delay).
+struct SourceWatermarkState {
+    extractor: laminar_core::time::EventTimeExtractor,
+    generator: laminar_core::time::BoundedOutOfOrdernessGenerator,
+}
+
+/// Infer the `TimestampFormat` from a schema column's `DataType`.
+fn infer_timestamp_format(
+    schema: &arrow::datatypes::SchemaRef,
+    column: &str,
+) -> laminar_core::time::TimestampFormat {
+    if let Ok(idx) = schema.index_of(column) {
+        match schema.field(idx).data_type() {
+            DataType::Timestamp(_, _) => laminar_core::time::TimestampFormat::ArrowNative,
+            _ => laminar_core::time::TimestampFormat::UnixMillis,
+        }
+    } else {
+        laminar_core::time::TimestampFormat::UnixMillis
+    }
 }
 
 impl LaminarDB {
@@ -153,6 +179,7 @@ impl LaminarDB {
             shutdown_signal: Arc::new(tokio::sync::Notify::new()),
             counters: Arc::new(crate::metrics::PipelineCounters::new()),
             start_time: std::time::Instant::now(),
+            pipeline_watermark: Arc::new(std::sync::atomic::AtomicI64::new(i64::MIN)),
         })
     }
 
@@ -326,6 +353,7 @@ impl LaminarDB {
         let name = &source_def.name;
         let schema = source_def.schema.clone();
         let watermark_col = source_def.watermark.as_ref().map(|w| w.column.clone());
+        let max_ooo = source_def.watermark.as_ref().map(|w| w.max_out_of_orderness);
 
         // Extract config from source definition
         let buffer_size = if source_def.config.buffer_size > 0 {
@@ -339,6 +367,7 @@ impl LaminarDB {
                 name,
                 schema,
                 watermark_col,
+                max_ooo,
                 buffer_size,
                 None,
             ))
@@ -348,6 +377,7 @@ impl LaminarDB {
                     name,
                     schema,
                     watermark_col,
+                    max_ooo,
                     buffer_size,
                     None,
                 )?)
@@ -357,7 +387,7 @@ impl LaminarDB {
         } else {
             Some(
                 self.catalog
-                    .register_source(name, schema, watermark_col, buffer_size, None)?,
+                    .register_source(name, schema, watermark_col, max_ooo, buffer_size, None)?,
             )
         };
 
@@ -1482,6 +1512,7 @@ impl LaminarDB {
     /// 2. Executes registered stream queries via `DataFusion`.
     /// 3. Pushes query results into the corresponding stream sources so
     ///    that callers of [`subscribe`](Self::subscribe) receive data.
+    #[allow(clippy::too_many_lines)]
     fn start_embedded_pipeline(
         &self,
         stream_regs: &HashMap<String, crate::connector_manager::StreamRegistration>,
@@ -1516,14 +1547,50 @@ impl LaminarDB {
             }
         }
 
+        // Build per-source watermark tracking state
+        let mut watermark_states: HashMap<String, SourceWatermarkState> = HashMap::new();
+        let mut source_entries: HashMap<String, Arc<crate::catalog::SourceEntry>> = HashMap::new();
+        let mut source_ids: HashMap<String, usize> = HashMap::new();
+        for name in self.catalog.list_sources() {
+            if let Some(entry) = self.catalog.get_source(&name) {
+                if let (Some(col), Some(dur)) =
+                    (&entry.watermark_column, entry.max_out_of_orderness)
+                {
+                    let format = infer_timestamp_format(&entry.schema, col);
+                    let extractor = laminar_core::time::EventTimeExtractor::from_column(col, format)
+                        .with_mode(laminar_core::time::ExtractionMode::Max);
+                    let generator =
+                        laminar_core::time::BoundedOutOfOrdernessGenerator::from_duration(dur);
+                    let id = source_ids.len();
+                    source_ids.insert(name.clone(), id);
+                    watermark_states.insert(
+                        name.clone(),
+                        SourceWatermarkState {
+                            extractor,
+                            generator,
+                        },
+                    );
+                }
+                source_entries.insert(name, entry);
+            }
+        }
+
+        let mut tracker = if source_ids.is_empty() {
+            None
+        } else {
+            Some(laminar_core::time::WatermarkTracker::new(source_ids.len()))
+        };
+
         tracing::info!(
             sources = source_subs.len(),
             streams = stream_sources.len(),
+            watermark_sources = source_ids.len(),
             "Starting embedded pipeline"
         );
 
         let shutdown = self.shutdown_signal.clone();
         let counters = Arc::clone(&self.counters);
+        let pipeline_watermark = Arc::clone(&self.pipeline_watermark);
 
         let handle = tokio::spawn(async move {
             let mut cycle_count: u64 = 0;
@@ -1553,6 +1620,31 @@ impl LaminarDB {
                                 counters
                                     .total_batches
                                     .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+
+                                // Extract watermark from batch
+                                if let Some(wm_state) = watermark_states.get_mut(name.as_str()) {
+                                    if let Ok(max_ts) = wm_state.extractor.extract(&batch) {
+                                        use laminar_core::time::WatermarkGenerator;
+                                        if let Some(wm) = wm_state.generator.on_event(max_ts) {
+                                            if let Some(entry) = source_entries.get(name.as_str()) {
+                                                entry.source.watermark(wm.timestamp());
+                                            }
+                                            if let Some(ref mut trk) = tracker {
+                                                if let Some(sid) = source_ids.get(name.as_str()) {
+                                                    if let Some(global_wm) =
+                                                        trk.update_source(*sid, wm.timestamp())
+                                                    {
+                                                        pipeline_watermark.store(
+                                                            global_wm.timestamp(),
+                                                            std::sync::atomic::Ordering::Relaxed,
+                                                        );
+                                                    }
+                                                }
+                                            }
+                                        }
+                                    }
+                                }
+
                                 source_batches.entry(name.clone()).or_default().push(batch);
                             }
                             _ => break,
@@ -1799,6 +1891,41 @@ impl LaminarDB {
             }
         }
 
+        // Build per-source watermark tracking state (connector pipeline)
+        let mut watermark_states: HashMap<String, SourceWatermarkState> = HashMap::new();
+        let mut source_entries_for_wm: HashMap<String, Arc<crate::catalog::SourceEntry>> =
+            HashMap::new();
+        let mut source_ids: HashMap<String, usize> = HashMap::new();
+        for name in self.catalog.list_sources() {
+            if let Some(entry) = self.catalog.get_source(&name) {
+                if let (Some(col), Some(dur)) =
+                    (&entry.watermark_column, entry.max_out_of_orderness)
+                {
+                    let format = infer_timestamp_format(&entry.schema, col);
+                    let extractor = laminar_core::time::EventTimeExtractor::from_column(col, format)
+                        .with_mode(laminar_core::time::ExtractionMode::Max);
+                    let generator =
+                        laminar_core::time::BoundedOutOfOrdernessGenerator::from_duration(dur);
+                    let id = source_ids.len();
+                    source_ids.insert(name.clone(), id);
+                    watermark_states.insert(
+                        name.clone(),
+                        SourceWatermarkState {
+                            extractor,
+                            generator,
+                        },
+                    );
+                }
+                source_entries_for_wm.insert(name, entry);
+            }
+        }
+
+        let mut tracker = if source_ids.is_empty() {
+            None
+        } else {
+            Some(laminar_core::time::WatermarkTracker::new(source_ids.len()))
+        };
+
         eprintln!(
             "[laminar-db] Starting connector pipeline: {} sources, {} sinks, \
              {} streams, {} subscriptions",
@@ -1812,6 +1939,7 @@ impl LaminarDB {
             sinks = sinks.len(),
             streams = stream_regs.len(),
             subscriptions = stream_sources.len(),
+            watermark_sources = source_ids.len(),
             "Starting connector pipeline"
         );
 
@@ -1825,6 +1953,7 @@ impl LaminarDB {
         let table_store_for_loop = self.table_store.clone();
         let ctx_for_sync = self.ctx.clone();
         let counters = Arc::clone(&self.counters);
+        let pipeline_watermark = Arc::clone(&self.pipeline_watermark);
 
         let handle = tokio::spawn(async move {
             eprintln!("[laminar-db] Connector pipeline task started");
@@ -1859,6 +1988,33 @@ impl LaminarDB {
                             counters
                                 .total_batches
                                 .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+
+                            // Extract watermark from batch
+                            if let Some(wm_state) = watermark_states.get_mut(name.as_str()) {
+                                if let Ok(max_ts) = wm_state.extractor.extract(&batch.records) {
+                                    use laminar_core::time::WatermarkGenerator;
+                                    if let Some(wm) = wm_state.generator.on_event(max_ts) {
+                                        if let Some(entry) =
+                                            source_entries_for_wm.get(name.as_str())
+                                        {
+                                            entry.source.watermark(wm.timestamp());
+                                        }
+                                        if let Some(ref mut trk) = tracker {
+                                            if let Some(sid) = source_ids.get(name.as_str()) {
+                                                if let Some(global_wm) =
+                                                    trk.update_source(*sid, wm.timestamp())
+                                                {
+                                                    pipeline_watermark.store(
+                                                        global_wm.timestamp(),
+                                                        std::sync::atomic::Ordering::Relaxed,
+                                                    );
+                                                }
+                                            }
+                                        }
+                                    }
+                                }
+                            }
+
                             source_batches
                                 .entry(name.clone())
                                 .or_insert_with(Vec::new)
@@ -2205,6 +2361,7 @@ impl LaminarDB {
             source_count: self.catalog.list_sources().len(),
             stream_count: self.catalog.list_streams().len(),
             sink_count: self.catalog.list_sinks().len(),
+            pipeline_watermark: self.pipeline_watermark(),
         }
     }
 
@@ -2282,6 +2439,16 @@ impl LaminarDB {
     #[must_use]
     pub fn counters(&self) -> &Arc<crate::metrics::PipelineCounters> {
         &self.counters
+    }
+
+    /// Returns the global pipeline watermark (minimum across all source watermarks).
+    ///
+    /// Returns `i64::MIN` if no watermark-enabled sources exist or no events
+    /// have been processed.
+    #[must_use]
+    pub fn pipeline_watermark(&self) -> i64 {
+        self.pipeline_watermark
+            .load(std::sync::atomic::Ordering::Relaxed)
     }
 
     /// Convert the internal `AtomicU8` state to a `PipelineState` enum.
@@ -4781,5 +4948,257 @@ mod tests {
     async fn test_stream_metrics_not_found() {
         let db = LaminarDB::open().unwrap();
         assert!(db.stream_metrics("nonexistent").is_none());
+    }
+
+    // ── Watermark Source Tracker tests ──────────────────────────────────
+
+    /// Helper: push a batch with `Timestamp(µs)` column to a source.
+    ///
+    /// `timestamps_ms` are in **milliseconds**; the helper converts to microseconds
+    /// internally to match the `TIMESTAMP` SQL type (`Timestamp(Microsecond, None)`).
+    fn make_ts_batch(schema: &arrow::datatypes::SchemaRef, timestamps_ms: &[i64]) -> RecordBatch {
+        let us_values: Vec<i64> = timestamps_ms.iter().map(|ms| ms * 1000).collect();
+        RecordBatch::try_new(
+            schema.clone(),
+            vec![
+                Arc::new(arrow::array::Int64Array::from(
+                    (1..=timestamps_ms.len() as i64).collect::<Vec<_>>(),
+                )),
+                Arc::new(arrow::array::TimestampMicrosecondArray::from(us_values)),
+            ],
+        )
+        .unwrap()
+    }
+
+    #[tokio::test]
+    async fn test_watermark_advances_on_push() {
+        let db = LaminarDB::open().unwrap();
+        db.execute(
+            "CREATE SOURCE events (id BIGINT, ts TIMESTAMP, \
+             WATERMARK FOR ts AS ts - INTERVAL '0' SECOND)",
+        )
+        .await
+        .unwrap();
+        db.execute("CREATE STREAM out AS SELECT id, ts FROM events")
+            .await
+            .unwrap();
+        db.start().await.unwrap();
+
+        let handle = db.source_untyped("events").unwrap();
+        let schema = handle.schema().clone();
+        let batch = make_ts_batch(&schema, &[1000, 2000, 3000]);
+        handle.push_arrow(batch).unwrap();
+
+        // Wait for pipeline loop to process
+        tokio::time::sleep(std::time::Duration::from_millis(500)).await;
+
+        // With 0s delay, watermark should be max timestamp = 3000
+        let wm = handle.current_watermark();
+        assert_eq!(wm, 3000, "watermark should equal max timestamp with 0s delay");
+    }
+
+    #[tokio::test]
+    async fn test_watermark_bounded_delay() {
+        let db = LaminarDB::open().unwrap();
+        db.execute(
+            "CREATE SOURCE events (id BIGINT, ts TIMESTAMP, \
+             WATERMARK FOR ts AS ts - INTERVAL '100' MILLISECOND)",
+        )
+        .await
+        .unwrap();
+        db.execute("CREATE STREAM out AS SELECT id, ts FROM events")
+            .await
+            .unwrap();
+        db.start().await.unwrap();
+
+        let handle = db.source_untyped("events").unwrap();
+        let schema = handle.schema().clone();
+
+        // Push timestamps [1000, 800, 1200] — max = 1200
+        let batch = make_ts_batch(&schema, &[1000, 800, 1200]);
+        handle.push_arrow(batch).unwrap();
+
+        tokio::time::sleep(std::time::Duration::from_millis(500)).await;
+
+        // Watermark = max(1200) - 100ms delay = 1100
+        let wm = handle.current_watermark();
+        assert_eq!(wm, 1100, "watermark should be max_ts - delay");
+    }
+
+    #[tokio::test]
+    async fn test_watermark_no_regression() {
+        let db = LaminarDB::open().unwrap();
+        db.execute(
+            "CREATE SOURCE events (id BIGINT, ts TIMESTAMP, \
+             WATERMARK FOR ts AS ts - INTERVAL '0' SECOND)",
+        )
+        .await
+        .unwrap();
+        db.execute("CREATE STREAM out AS SELECT id, ts FROM events")
+            .await
+            .unwrap();
+        db.start().await.unwrap();
+
+        let handle = db.source_untyped("events").unwrap();
+        let schema = handle.schema().clone();
+
+        // Push high timestamps first
+        let batch1 = make_ts_batch(&schema, &[5000]);
+        handle.push_arrow(batch1).unwrap();
+        tokio::time::sleep(std::time::Duration::from_millis(300)).await;
+        let wm1 = handle.current_watermark();
+
+        // Push lower timestamps
+        let batch2 = make_ts_batch(&schema, &[1000]);
+        handle.push_arrow(batch2).unwrap();
+        tokio::time::sleep(std::time::Duration::from_millis(300)).await;
+        let wm2 = handle.current_watermark();
+
+        // Watermark should never decrease
+        assert!(wm2 >= wm1, "watermark must not regress: {wm2} < {wm1}");
+        assert_eq!(wm1, 5000);
+        assert_eq!(wm2, 5000);
+    }
+
+    #[tokio::test]
+    async fn test_source_without_watermark() {
+        let db = LaminarDB::open().unwrap();
+        db.execute("CREATE SOURCE events (id BIGINT, ts BIGINT)")
+            .await
+            .unwrap();
+
+        // Source without WATERMARK clause should have default watermark
+        let handle = db.source_untyped("events").unwrap();
+        assert_eq!(handle.current_watermark(), i64::MIN);
+        assert!(handle.max_out_of_orderness().is_none());
+    }
+
+    #[tokio::test]
+    async fn test_watermark_with_arrow_timestamp_column() {
+        let db = LaminarDB::open().unwrap();
+        db.execute(
+            "CREATE SOURCE events (id BIGINT, ts TIMESTAMP, \
+             WATERMARK FOR ts AS ts - INTERVAL '0' SECOND)",
+        )
+        .await
+        .unwrap();
+        db.execute("CREATE STREAM out AS SELECT id, ts FROM events")
+            .await
+            .unwrap();
+        db.start().await.unwrap();
+
+        let handle = db.source_untyped("events").unwrap();
+        let schema = handle.schema().clone();
+
+        // Build a batch with Arrow Timestamp(us) column matching the schema
+        let batch = RecordBatch::try_new(
+            schema,
+            vec![
+                Arc::new(arrow::array::Int64Array::from(vec![1])),
+                Arc::new(
+                    arrow::array::TimestampMicrosecondArray::from(vec![5_000_000i64]),
+                ),
+            ],
+        )
+        .unwrap();
+        handle.push_arrow(batch).unwrap();
+
+        tokio::time::sleep(std::time::Duration::from_millis(500)).await;
+        let wm = handle.current_watermark();
+        // ArrowNative format: timestamp is in microseconds, extractor converts to millis
+        assert_eq!(wm, 5000, "watermark should work with Arrow Timestamp type");
+    }
+
+    #[tokio::test]
+    async fn test_pipeline_watermark_global_min() {
+        let db = LaminarDB::open().unwrap();
+        db.execute(
+            "CREATE SOURCE trades (id BIGINT, ts TIMESTAMP, \
+             WATERMARK FOR ts AS ts - INTERVAL '0' SECOND)",
+        )
+        .await
+        .unwrap();
+        db.execute(
+            "CREATE SOURCE orders (id BIGINT, ts TIMESTAMP, \
+             WATERMARK FOR ts AS ts - INTERVAL '0' SECOND)",
+        )
+        .await
+        .unwrap();
+        db.execute("CREATE STREAM out AS SELECT id, ts FROM trades")
+            .await
+            .unwrap();
+        db.start().await.unwrap();
+
+        let trades = db.source_untyped("trades").unwrap();
+        let orders = db.source_untyped("orders").unwrap();
+
+        // Push high watermark to trades
+        let batch1 = make_ts_batch(trades.schema(), &[5000]);
+        trades.push_arrow(batch1).unwrap();
+
+        // Push lower watermark to orders
+        let batch2 = make_ts_batch(orders.schema(), &[2000]);
+        orders.push_arrow(batch2).unwrap();
+
+        tokio::time::sleep(std::time::Duration::from_millis(500)).await;
+
+        // Global watermark should be min(5000, 2000) = 2000
+        let global = db.pipeline_watermark();
+        assert_eq!(global, 2000, "global watermark should be min of all sources");
+    }
+
+    #[tokio::test]
+    async fn test_pipeline_watermark_in_metrics() {
+        let db = LaminarDB::open().unwrap();
+        db.execute(
+            "CREATE SOURCE events (id BIGINT, ts TIMESTAMP, \
+             WATERMARK FOR ts AS ts - INTERVAL '0' SECOND)",
+        )
+        .await
+        .unwrap();
+        db.execute("CREATE STREAM out AS SELECT id, ts FROM events")
+            .await
+            .unwrap();
+        db.start().await.unwrap();
+
+        let handle = db.source_untyped("events").unwrap();
+        let batch = make_ts_batch(handle.schema(), &[4000]);
+        handle.push_arrow(batch).unwrap();
+
+        tokio::time::sleep(std::time::Duration::from_millis(500)).await;
+
+        let m = db.metrics();
+        assert_eq!(
+            m.pipeline_watermark,
+            db.pipeline_watermark(),
+            "metrics().pipeline_watermark should match pipeline_watermark()"
+        );
+        assert_eq!(m.pipeline_watermark, 4000);
+    }
+
+    #[tokio::test]
+    async fn test_source_handle_max_out_of_orderness() {
+        let db = LaminarDB::open().unwrap();
+        db.execute(
+            "CREATE SOURCE events (id BIGINT, ts TIMESTAMP, \
+             WATERMARK FOR ts AS ts - INTERVAL '5' SECOND)",
+        )
+        .await
+        .unwrap();
+
+        let handle = db.source_untyped("events").unwrap();
+        let dur = handle.max_out_of_orderness();
+        assert_eq!(dur, Some(std::time::Duration::from_secs(5)));
+    }
+
+    #[tokio::test]
+    async fn test_source_handle_no_watermark() {
+        let db = LaminarDB::open().unwrap();
+        db.execute("CREATE SOURCE events (id BIGINT, ts BIGINT)")
+            .await
+            .unwrap();
+
+        let handle = db.source_untyped("events").unwrap();
+        assert!(handle.max_out_of_orderness().is_none());
     }
 }

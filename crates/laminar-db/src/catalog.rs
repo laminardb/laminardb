@@ -3,6 +3,7 @@
 use std::collections::HashMap;
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::Arc;
+use std::time::Duration;
 
 use arrow::array::RecordBatch;
 use arrow::datatypes::SchemaRef;
@@ -37,6 +38,8 @@ pub struct SourceEntry {
     pub schema: SchemaRef,
     /// Watermark column name, if configured.
     pub watermark_column: Option<String>,
+    /// Maximum out-of-orderness for watermark generation.
+    pub max_out_of_orderness: Option<Duration>,
     /// The underlying streaming source (type-erased via `ArrowRecord`).
     pub(crate) source: streaming::Source<ArrowRecord>,
     /// The underlying streaming sink (type-erased via `ArrowRecord`).
@@ -106,6 +109,7 @@ impl SourceCatalog {
         name: &str,
         schema: SchemaRef,
         watermark_column: Option<String>,
+        max_out_of_orderness: Option<Duration>,
         buffer_size: Option<usize>,
         backpressure: Option<BackpressureStrategy>,
     ) -> Result<Arc<SourceEntry>, crate::DbError> {
@@ -133,6 +137,7 @@ impl SourceCatalog {
             name: name.to_string(),
             schema,
             watermark_column,
+            max_out_of_orderness,
             source,
             sink,
         });
@@ -147,14 +152,22 @@ impl SourceCatalog {
         name: &str,
         schema: SchemaRef,
         watermark_column: Option<String>,
+        max_out_of_orderness: Option<Duration>,
         buffer_size: Option<usize>,
         backpressure: Option<BackpressureStrategy>,
     ) -> Arc<SourceEntry> {
         // Remove existing if present
         self.sources.write().remove(name);
         // Safe to unwrap since we just removed any conflict
-        self.register_source(name, schema, watermark_column, buffer_size, backpressure)
-            .unwrap()
+        self.register_source(
+            name,
+            schema,
+            watermark_column,
+            max_out_of_orderness,
+            buffer_size,
+            backpressure,
+        )
+        .unwrap()
     }
 
     /// Get a registered source by name.
@@ -320,7 +333,7 @@ mod tests {
     #[test]
     fn test_register_source() {
         let catalog = SourceCatalog::new(1024, BackpressureStrategy::Block);
-        let result = catalog.register_source("test", test_schema(), None, None, None);
+        let result = catalog.register_source("test", test_schema(), None, None, None, None);
         assert!(result.is_ok());
         assert!(catalog.get_source("test").is_some());
     }
@@ -329,9 +342,9 @@ mod tests {
     fn test_register_duplicate_source() {
         let catalog = SourceCatalog::new(1024, BackpressureStrategy::Block);
         catalog
-            .register_source("test", test_schema(), None, None, None)
+            .register_source("test", test_schema(), None, None, None, None)
             .unwrap();
-        let result = catalog.register_source("test", test_schema(), None, None, None);
+        let result = catalog.register_source("test", test_schema(), None, None, None, None);
         assert!(matches!(
             result,
             Err(crate::DbError::SourceAlreadyExists(_))
@@ -342,7 +355,7 @@ mod tests {
     fn test_drop_source() {
         let catalog = SourceCatalog::new(1024, BackpressureStrategy::Block);
         catalog
-            .register_source("test", test_schema(), None, None, None)
+            .register_source("test", test_schema(), None, None, None, None)
             .unwrap();
         assert!(catalog.drop_source("test"));
         assert!(catalog.get_source("test").is_none());
@@ -352,10 +365,10 @@ mod tests {
     fn test_list_sources() {
         let catalog = SourceCatalog::new(1024, BackpressureStrategy::Block);
         catalog
-            .register_source("a", test_schema(), None, None, None)
+            .register_source("a", test_schema(), None, None, None, None)
             .unwrap();
         catalog
-            .register_source("b", test_schema(), None, None, None)
+            .register_source("b", test_schema(), None, None, None, None)
             .unwrap();
         let mut names = catalog.list_sources();
         names.sort();
@@ -393,7 +406,7 @@ mod tests {
         let catalog = SourceCatalog::new(1024, BackpressureStrategy::Block);
         let schema = test_schema();
         catalog
-            .register_source("test", schema.clone(), None, None, None)
+            .register_source("test", schema.clone(), None, None, None, None)
             .unwrap();
         let result = catalog.describe_source("test");
         assert!(result.is_some());
@@ -404,12 +417,13 @@ mod tests {
     fn test_or_replace() {
         let catalog = SourceCatalog::new(1024, BackpressureStrategy::Block);
         catalog
-            .register_source("test", test_schema(), None, None, None)
+            .register_source("test", test_schema(), None, None, None, None)
             .unwrap();
         let entry = catalog.register_source_or_replace(
             "test",
             test_schema(),
             Some("ts".into()),
+            None,
             None,
             None,
         );
