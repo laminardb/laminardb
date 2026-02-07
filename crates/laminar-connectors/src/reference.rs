@@ -113,10 +113,7 @@ pub struct MockReferenceTableSource {
 impl MockReferenceTableSource {
     /// Creates a new mock with the given snapshot and change batches.
     #[must_use]
-    pub fn new(
-        snapshot_batches: Vec<RecordBatch>,
-        change_batches: Vec<RecordBatch>,
-    ) -> Self {
+    pub fn new(snapshot_batches: Vec<RecordBatch>, change_batches: Vec<RecordBatch>) -> Self {
         Self {
             snapshot_batches: VecDeque::from(snapshot_batches),
             change_batches: VecDeque::from(change_batches),
@@ -177,16 +174,13 @@ mod tests {
 
     fn test_batch(values: &[i32]) -> RecordBatch {
         let schema = Arc::new(Schema::new(vec![Field::new("id", DataType::Int32, false)]));
-        RecordBatch::try_new(schema, vec![Arc::new(Int32Array::from(values.to_vec()))])
-            .unwrap()
+        RecordBatch::try_new(schema, vec![Arc::new(Int32Array::from(values.to_vec()))]).unwrap()
     }
 
     #[tokio::test]
     async fn test_mock_snapshot_exhaustion() {
-        let mut src = MockReferenceTableSource::new(
-            vec![test_batch(&[1, 2]), test_batch(&[3])],
-            vec![],
-        );
+        let mut src =
+            MockReferenceTableSource::new(vec![test_batch(&[1, 2]), test_batch(&[3])], vec![]);
 
         assert!(!src.is_snapshot_complete());
 
@@ -208,10 +202,8 @@ mod tests {
 
     #[tokio::test]
     async fn test_mock_change_polling() {
-        let mut src = MockReferenceTableSource::new(
-            vec![],
-            vec![test_batch(&[10]), test_batch(&[20, 30])],
-        );
+        let mut src =
+            MockReferenceTableSource::new(vec![], vec![test_batch(&[10]), test_batch(&[20, 30])]);
 
         // Exhaust snapshot first
         assert!(src.poll_snapshot().await.unwrap().is_none());
@@ -264,9 +256,10 @@ mod tests {
     #[tokio::test]
     async fn test_trait_compliance_with_mock() {
         // Exercise the full lifecycle through trait object
-        let mut src: Box<dyn ReferenceTableSource> = Box::new(
-            MockReferenceTableSource::new(vec![test_batch(&[1])], vec![test_batch(&[2])]),
-        );
+        let mut src: Box<dyn ReferenceTableSource> = Box::new(MockReferenceTableSource::new(
+            vec![test_batch(&[1])],
+            vec![test_batch(&[2])],
+        ));
 
         // Snapshot
         let batch = src.poll_snapshot().await.unwrap().unwrap();

@@ -233,16 +233,12 @@ impl StreamExecutor {
                         if !batches.is_empty() {
                             // Register results as a temp MemTable for downstream queries
                             let schema = batches[0].schema();
-                            if let Ok(mem_table) =
-                                datafusion::datasource::MemTable::try_new(
-                                    schema,
-                                    vec![batches.clone()],
-                                )
-                            {
+                            if let Ok(mem_table) = datafusion::datasource::MemTable::try_new(
+                                schema,
+                                vec![batches.clone()],
+                            ) {
                                 let _ = self.ctx.deregister_table(&query_name);
-                                let _ = self
-                                    .ctx
-                                    .register_table(&query_name, Arc::new(mem_table));
+                                let _ = self.ctx.register_table(&query_name, Arc::new(mem_table));
                                 intermediate_tables.push(query_name.clone());
                             }
                             results.insert(query_name, batches);
@@ -500,15 +496,12 @@ mod tests {
         assert!(refs.contains("customers"));
 
         // Subquery
-        let refs = extract_table_references(
-            "SELECT * FROM (SELECT * FROM raw_events) AS sub",
-        );
+        let refs = extract_table_references("SELECT * FROM (SELECT * FROM raw_events) AS sub");
         assert!(refs.contains("raw_events"));
 
         // UNION
-        let refs = extract_table_references(
-            "SELECT id FROM table_a UNION ALL SELECT id FROM table_b",
-        );
+        let refs =
+            extract_table_references("SELECT id FROM table_a UNION ALL SELECT id FROM table_b");
         assert!(refs.contains("table_a"));
         assert!(refs.contains("table_b"));
 
@@ -628,8 +621,7 @@ mod tests {
         assert!(results.contains_key("combined"));
 
         // combined: should have rows for names b and c (those in filtered)
-        let combined_rows: usize =
-            results["combined"].iter().map(|b| b.num_rows()).sum();
+        let combined_rows: usize = results["combined"].iter().map(|b| b.num_rows()).sum();
         assert_eq!(combined_rows, 2);
     }
 
@@ -664,8 +656,7 @@ mod tests {
             "downstream should have results"
         );
 
-        let downstream_rows: usize =
-            results["downstream"].iter().map(|b| b.num_rows()).sum();
+        let downstream_rows: usize = results["downstream"].iter().map(|b| b.num_rows()).sum();
         assert_eq!(downstream_rows, 2); // b=2.0, c=3.0
     }
 
@@ -679,10 +670,7 @@ mod tests {
             "level1".to_string(),
             "SELECT name, value FROM events".to_string(),
         );
-        executor.add_query(
-            "level2".to_string(),
-            "SELECT name FROM level1".to_string(),
-        );
+        executor.add_query("level2".to_string(), "SELECT name FROM level1".to_string());
 
         // No source data
         let source_batches = HashMap::new();

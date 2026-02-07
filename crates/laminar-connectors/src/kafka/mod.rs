@@ -429,8 +429,7 @@ mod avro_roundtrip_tests {
     use std::sync::Arc;
 
     use arrow_array::{
-        BooleanArray, Float32Array, Float64Array, Int32Array, Int64Array, RecordBatch,
-        StringArray,
+        BooleanArray, Float32Array, Float64Array, Int32Array, Int64Array, RecordBatch, StringArray,
     };
     use arrow_schema::{DataType, Field, Schema, SchemaRef};
 
@@ -453,7 +452,9 @@ mod avro_roundtrip_tests {
             .expect("register schema");
 
         let record_refs: Vec<&[u8]> = records.iter().map(|r| r.as_slice()).collect();
-        deser.deserialize_batch(&record_refs, schema).expect("deserialize")
+        deser
+            .deserialize_batch(&record_refs, schema)
+            .expect("deserialize")
     }
 
     #[test]
@@ -611,9 +612,7 @@ mod avro_roundtrip_tests {
 
     #[test]
     fn test_roundtrip_empty_batch() {
-        let schema = Arc::new(Schema::new(vec![
-            Field::new("id", DataType::Int64, false),
-        ]));
+        let schema = Arc::new(Schema::new(vec![Field::new("id", DataType::Int64, false)]));
         let batch = RecordBatch::new_empty(schema.clone());
 
         let ser = AvroSerializer::new(schema.clone(), 1);

@@ -161,13 +161,13 @@ pub enum OperatorError {
 
 pub mod asof_join;
 pub mod changelog;
-pub mod table_cache;
 pub mod lag_lead;
 pub mod lookup_join;
 pub mod partitioned_topk;
 pub mod session_window;
 pub mod sliding_window;
 pub mod stream_join;
+pub mod table_cache;
 pub mod temporal_join;
 pub mod topk;
 pub mod watermark_sort;

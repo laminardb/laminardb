@@ -99,9 +99,10 @@ impl AvroDeserializer {
             return Ok(());
         }
 
-        let registry = self.schema_registry.as_ref().ok_or(SerdeError::SchemaNotFound {
-            schema_id,
-        })?;
+        let registry = self
+            .schema_registry
+            .as_ref()
+            .ok_or(SerdeError::SchemaNotFound { schema_id })?;
 
         let cached = registry
             .lock()

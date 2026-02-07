@@ -72,11 +72,7 @@ impl TableLruCache {
     }
 
     /// Insert a key-value pair. Returns the evicted entry if the cache was full.
-    pub fn insert(
-        &mut self,
-        key: String,
-        value: RecordBatch,
-    ) -> Option<(String, RecordBatch)> {
+    pub fn insert(&mut self, key: String, value: RecordBatch) -> Option<(String, RecordBatch)> {
         // If key already present, update in place and promote.
         if let Some(&slot) = self.index.get(&key) {
             self.slab[slot].value = value;
@@ -375,10 +371,7 @@ pub enum LookupDecision {
 
 /// Collect metrics from an LRU cache and xor filter pair.
 #[must_use]
-pub fn collect_cache_metrics(
-    lru: &TableLruCache,
-    xor: &TableXorFilter,
-) -> TableCacheMetrics {
+pub fn collect_cache_metrics(lru: &TableLruCache, xor: &TableXorFilter) -> TableCacheMetrics {
     TableCacheMetrics {
         cache_gets: lru.total_gets(),
         cache_hits: lru.total_hits(),
@@ -559,7 +552,11 @@ mod tests {
 
     #[test]
     fn test_xor_build_and_contains() {
-        let keys = vec!["apple".to_string(), "banana".to_string(), "cherry".to_string()];
+        let keys = vec![
+            "apple".to_string(),
+            "banana".to_string(),
+            "cherry".to_string(),
+        ];
         let mut filter = TableXorFilter::build(&keys);
 
         // These should be found (no false negatives)
@@ -582,7 +579,10 @@ mod tests {
             }
         }
         // With 0.4% FPR, most of the 1000 missing keys should short-circuit
-        assert!(short_circuited > 900, "Expected >900 short-circuits, got {short_circuited}");
+        assert!(
+            short_circuited > 900,
+            "Expected >900 short-circuits, got {short_circuited}"
+        );
         assert!(filter.short_circuits() > 900);
     }
 
@@ -673,6 +673,9 @@ mod tests {
         let found = LookupDecision::Found(row);
         assert!(matches!(found, LookupDecision::Found(_)));
         assert!(matches!(LookupDecision::NotFound, LookupDecision::NotFound));
-        assert!(matches!(LookupDecision::CacheMiss, LookupDecision::CacheMiss));
+        assert!(matches!(
+            LookupDecision::CacheMiss,
+            LookupDecision::CacheMiss
+        ));
     }
 }

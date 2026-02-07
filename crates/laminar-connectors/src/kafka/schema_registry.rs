@@ -728,9 +728,7 @@ fn parse_avro_type(avro_type: &serde_json::Value) -> Result<(DataType, bool), Co
             match type_str {
                 "array" => {
                     let items = obj.get("items").ok_or_else(|| {
-                        ConnectorError::SchemaMismatch(
-                            "Avro array type missing 'items'".into(),
-                        )
+                        ConnectorError::SchemaMismatch("Avro array type missing 'items'".into())
                     })?;
                     let (item_type, _) = parse_avro_type(items)?;
                     Ok((
@@ -740,9 +738,7 @@ fn parse_avro_type(avro_type: &serde_json::Value) -> Result<(DataType, bool), Co
                 }
                 "map" => {
                     let values = obj.get("values").ok_or_else(|| {
-                        ConnectorError::SchemaMismatch(
-                            "Avro map type missing 'values'".into(),
-                        )
+                        ConnectorError::SchemaMismatch("Avro map type missing 'values'".into())
                     })?;
                     let (value_type, _) = parse_avro_type(values)?;
                     Ok((
@@ -762,9 +758,7 @@ fn parse_avro_type(avro_type: &serde_json::Value) -> Result<(DataType, bool), Co
                 }
                 "record" => {
                     let fields_val = obj.get("fields").ok_or_else(|| {
-                        ConnectorError::SchemaMismatch(
-                            "Avro nested record missing 'fields'".into(),
-                        )
+                        ConnectorError::SchemaMismatch("Avro nested record missing 'fields'".into())
                     })?;
                     let fields_arr = fields_val.as_array().ok_or_else(|| {
                         ConnectorError::SchemaMismatch(
@@ -773,14 +767,11 @@ fn parse_avro_type(avro_type: &serde_json::Value) -> Result<(DataType, bool), Co
                     })?;
                     let mut arrow_fields = Vec::with_capacity(fields_arr.len());
                     for f in fields_arr {
-                        let name = f
-                            .get("name")
-                            .and_then(|v| v.as_str())
-                            .ok_or_else(|| {
-                                ConnectorError::SchemaMismatch(
-                                    "Avro nested record field missing 'name'".into(),
-                                )
-                            })?;
+                        let name = f.get("name").and_then(|v| v.as_str()).ok_or_else(|| {
+                            ConnectorError::SchemaMismatch(
+                                "Avro nested record field missing 'name'".into(),
+                            )
+                        })?;
                         let f_type = f.get("type").ok_or_else(|| {
                             ConnectorError::SchemaMismatch(format!(
                                 "Avro nested field '{name}' missing 'type'"
@@ -792,10 +783,7 @@ fn parse_avro_type(avro_type: &serde_json::Value) -> Result<(DataType, bool), Co
                     Ok((DataType::Struct(Fields::from(arrow_fields)), false))
                 }
                 "enum" => Ok((
-                    DataType::Dictionary(
-                        Box::new(DataType::Int32),
-                        Box::new(DataType::Utf8),
-                    ),
+                    DataType::Dictionary(Box::new(DataType::Int32), Box::new(DataType::Utf8)),
                     false,
                 )),
                 "fixed" => {
@@ -803,9 +791,7 @@ fn parse_avro_type(avro_type: &serde_json::Value) -> Result<(DataType, bool), Co
                         .get("size")
                         .and_then(serde_json::Value::as_u64)
                         .ok_or_else(|| {
-                            ConnectorError::SchemaMismatch(
-                                "Avro fixed type missing 'size'".into(),
-                            )
+                            ConnectorError::SchemaMismatch("Avro fixed type missing 'size'".into())
                         })?;
                     #[allow(clippy::cast_possible_truncation)]
                     Ok((DataType::FixedSizeBinary(size as i32), false))
@@ -1288,10 +1274,7 @@ mod tests {
 
         let schema = avro_to_arrow_schema(avro).unwrap();
         assert_eq!(schema.fields().len(), 1);
-        assert_eq!(
-            schema.field(0).data_type(),
-            &DataType::FixedSizeBinary(16)
-        );
+        assert_eq!(schema.field(0).data_type(), &DataType::FixedSizeBinary(16));
     }
 
     #[test]
@@ -1421,7 +1404,9 @@ mod tests {
             id,
             version: 1,
             schema_type: SchemaType::Avro,
-            schema_str: format!(r#"{{"type":"record","name":"t{id}","fields":[{{"name":"x","type":"int"}}]}}"#),
+            schema_str: format!(
+                r#"{{"type":"record","name":"t{id}","fields":[{{"name":"x","type":"int"}}]}}"#
+            ),
             arrow_schema: Arc::new(Schema::new(vec![Field::new("x", DataType::Int32, false)])),
             inserted_at: Instant::now(),
         }
@@ -1557,7 +1542,10 @@ mod tests {
             message: "READER_FIELD_MISSING_DEFAULT_VALUE: field 'new_field'".into(),
         };
         let conn_err: ConnectorError = err.into();
-        assert!(matches!(conn_err, ConnectorError::Serde(SerdeError::SchemaIncompatible { .. })));
+        assert!(matches!(
+            conn_err,
+            ConnectorError::Serde(SerdeError::SchemaIncompatible { .. })
+        ));
         assert!(conn_err.to_string().contains("orders-value"));
     }
 
@@ -1594,10 +1582,7 @@ mod tests {
         let avro_str = arrow_to_avro_schema(&arrow_schema, "test").unwrap();
         let recovered = avro_to_arrow_schema(&avro_str).unwrap();
 
-        assert!(matches!(
-            recovered.field(0).data_type(),
-            DataType::List(_)
-        ));
+        assert!(matches!(recovered.field(0).data_type(), DataType::List(_)));
         assert!(matches!(
             recovered.field(1).data_type(),
             DataType::Map(_, _)

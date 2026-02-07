@@ -103,10 +103,7 @@ mod tests {
         assert_eq!(TableCacheMode::Full.max_entries(), None);
         assert_eq!(TableCacheMode::None.max_entries(), None);
         assert_eq!(
-            TableCacheMode::Partial {
-                max_entries: 1000
-            }
-            .max_entries(),
+            TableCacheMode::Partial { max_entries: 1000 }.max_entries(),
             Some(1000)
         );
     }

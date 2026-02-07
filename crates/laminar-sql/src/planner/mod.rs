@@ -12,14 +12,16 @@ use datafusion::logical_expr::LogicalPlan;
 use datafusion::prelude::SessionContext;
 use sqlparser::ast::{ObjectName, SetExpr, Statement};
 
-use crate::parser::analytic_parser::{analyze_analytic_functions, analyze_window_frames, FrameBound};
+use crate::parser::aggregation_parser::analyze_aggregates;
+use crate::parser::analytic_parser::{
+    analyze_analytic_functions, analyze_window_frames, FrameBound,
+};
 use crate::parser::join_parser::analyze_joins;
 use crate::parser::order_analyzer::analyze_order_by;
 use crate::parser::{
     CreateSinkStatement, CreateSourceStatement, EmitClause, SinkFrom, StreamingStatement,
     WindowFunction, WindowRewriter,
 };
-use crate::parser::aggregation_parser::analyze_aggregates;
 use crate::translator::{
     AnalyticWindowConfig, DagExplainOutput, HavingFilterConfig, JoinOperatorConfig,
     OrderOperatorConfig, WindowFrameConfig, WindowOperatorConfig,
@@ -271,9 +273,7 @@ impl StreamingPlanner {
 
                 // Check for HAVING clause
                 let agg_analysis = analyze_aggregates(stmt);
-                let having_config = agg_analysis
-                    .having_expr
-                    .map(HavingFilterConfig::new);
+                let having_config = agg_analysis.having_expr.map(HavingFilterConfig::new);
 
                 // Check for window frame functions (ROWS BETWEEN / RANGE BETWEEN)
                 let frame_analysis = analyze_window_frames(stmt);
@@ -359,8 +359,7 @@ impl StreamingPlanner {
                 if let Some(multi) = analyze_joins(select).map_err(|e| {
                     PlanningError::InvalidQuery(format!("Join analysis failed: {e}"))
                 })? {
-                    analysis.join_config =
-                        Some(JoinOperatorConfig::from_multi_analysis(&multi));
+                    analysis.join_config = Some(JoinOperatorConfig::from_multi_analysis(&multi));
                 }
             }
         }
@@ -377,9 +376,7 @@ impl StreamingPlanner {
 
         // Extract HAVING clause
         let agg_analysis = analyze_aggregates(stmt);
-        analysis.having_config = agg_analysis
-            .having_expr
-            .map(HavingFilterConfig::new);
+        analysis.having_config = agg_analysis.having_expr.map(HavingFilterConfig::new);
 
         // Extract window frame functions (ROWS BETWEEN / RANGE BETWEEN)
         if let Some(frame_analysis) = analyze_window_frames(stmt) {
@@ -826,10 +823,8 @@ mod tests {
     #[test]
     fn test_plan_single_join_produces_vec_of_one() {
         let mut planner = StreamingPlanner::new();
-        let statements = StreamingParser::parse_sql(
-            "SELECT * FROM a JOIN b ON a.id = b.a_id",
-        )
-        .unwrap();
+        let statements =
+            StreamingParser::parse_sql("SELECT * FROM a JOIN b ON a.id = b.a_id").unwrap();
 
         let plan = planner.plan(&statements[0]).unwrap();
         match plan {
@@ -889,10 +884,7 @@ mod tests {
     #[test]
     fn test_plan_backward_compat_no_join() {
         let mut planner = StreamingPlanner::new();
-        let statements = StreamingParser::parse_sql(
-            "SELECT * FROM orders",
-        )
-        .unwrap();
+        let statements = StreamingParser::parse_sql("SELECT * FROM orders").unwrap();
 
         let plan = planner.plan(&statements[0]).unwrap();
         match plan {
@@ -947,10 +939,7 @@ mod tests {
     #[test]
     fn test_plan_no_frame_is_standard() {
         let mut planner = StreamingPlanner::new();
-        let statements = StreamingParser::parse_sql(
-            "SELECT * FROM trades",
-        )
-        .unwrap();
+        let statements = StreamingParser::parse_sql("SELECT * FROM trades").unwrap();
 
         let plan = planner.plan(&statements[0]).unwrap();
         match plan {
@@ -972,9 +961,6 @@ mod tests {
         let result = planner.plan(&statements[0]);
         assert!(result.is_err());
         let err = result.unwrap_err().to_string();
-        assert!(
-            err.contains("UNBOUNDED FOLLOWING"),
-            "error was: {err}"
-        );
+        assert!(err.contains("UNBOUNDED FOLLOWING"), "error was: {err}");
     }
 }

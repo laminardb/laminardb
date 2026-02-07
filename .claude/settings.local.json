@@ -75,7 +75,19 @@
       "Bash(curl:*)",
       "WebFetch(domain:laminardb.github.io)",
       "Bash(git push:*)",
-      "Bash(cargo audit:*)"
+      "Bash(cargo audit:*)",
+      "Bash(git -C C:Userssujitsourcelaminardb log --oneline -20)",
+      "WebFetch(domain:www.alibabacloud.com)",
+      "WebFetch(domain:jack-vanlightly.com)",
+      "WebFetch(domain:risingwave.com)",
+      "WebFetch(domain:medium.com)",
+      "WebFetch(domain:duckdb.org)",
+      "WebFetch(domain:www.epsio.io)",
+      "WebFetch(domain:materialize.com)",
+      "Bash(gh issue view:*)",
+      "Bash(Select-String \"test result:\")",
+      "Bash(ForEach-Object { $_Line })",
+      "Bash(where:*)"
     ]
   }
 }

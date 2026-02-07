@@ -671,7 +671,10 @@ mod tests {
         let stmt = parse_stmt(sql);
         let analysis = analyze_window_frames(&stmt).unwrap();
         assert_eq!(analysis.functions.len(), 1);
-        assert_eq!(analysis.functions[0].function_type, WindowFrameFunction::Avg);
+        assert_eq!(
+            analysis.functions[0].function_type,
+            WindowFrameFunction::Avg
+        );
         assert_eq!(analysis.functions[0].column, "price");
         assert_eq!(analysis.functions[0].units, FrameUnits::Rows);
         assert_eq!(analysis.functions[0].start_bound, FrameBound::Preceding(9));
@@ -686,7 +689,10 @@ mod tests {
                     FROM orders";
         let stmt = parse_stmt(sql);
         let analysis = analyze_window_frames(&stmt).unwrap();
-        assert_eq!(analysis.functions[0].function_type, WindowFrameFunction::Sum);
+        assert_eq!(
+            analysis.functions[0].function_type,
+            WindowFrameFunction::Sum
+        );
         assert_eq!(analysis.functions[0].start_bound, FrameBound::Preceding(5));
         assert_eq!(analysis.functions[0].end_bound, FrameBound::Following(3));
     }
@@ -736,9 +742,15 @@ mod tests {
         let stmt = parse_stmt(sql);
         let analysis = analyze_window_frames(&stmt).unwrap();
         assert_eq!(analysis.functions.len(), 2);
-        assert_eq!(analysis.functions[0].function_type, WindowFrameFunction::Avg);
+        assert_eq!(
+            analysis.functions[0].function_type,
+            WindowFrameFunction::Avg
+        );
         assert_eq!(analysis.functions[0].column, "price");
-        assert_eq!(analysis.functions[1].function_type, WindowFrameFunction::Sum);
+        assert_eq!(
+            analysis.functions[1].function_type,
+            WindowFrameFunction::Sum
+        );
         assert_eq!(analysis.functions[1].column, "volume");
     }
 
@@ -777,10 +789,22 @@ mod tests {
         let stmt = parse_stmt(sql);
         let analysis = analyze_window_frames(&stmt).unwrap();
         assert_eq!(analysis.functions.len(), 5);
-        assert_eq!(analysis.functions[0].function_type, WindowFrameFunction::Avg);
-        assert_eq!(analysis.functions[1].function_type, WindowFrameFunction::Sum);
-        assert_eq!(analysis.functions[2].function_type, WindowFrameFunction::Min);
-        assert_eq!(analysis.functions[3].function_type, WindowFrameFunction::Max);
+        assert_eq!(
+            analysis.functions[0].function_type,
+            WindowFrameFunction::Avg
+        );
+        assert_eq!(
+            analysis.functions[1].function_type,
+            WindowFrameFunction::Sum
+        );
+        assert_eq!(
+            analysis.functions[2].function_type,
+            WindowFrameFunction::Min
+        );
+        assert_eq!(
+            analysis.functions[3].function_type,
+            WindowFrameFunction::Max
+        );
         assert_eq!(
             analysis.functions[4].function_type,
             WindowFrameFunction::Count

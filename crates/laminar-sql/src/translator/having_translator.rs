@@ -162,8 +162,7 @@ mod tests {
 
     #[tokio::test]
     async fn test_filter_compound_predicate() {
-        let config =
-            HavingFilterConfig::new("count_star >= 50 AND sum_volume > 30000".to_string());
+        let config = HavingFilterConfig::new("count_star >= 50 AND sum_volume > 30000".to_string());
         let batch = test_batch();
         let result = config.filter_batch(&batch).await.unwrap();
 
@@ -176,8 +175,7 @@ mod tests {
 
     #[tokio::test]
     async fn test_filter_or_predicate() {
-        let config =
-            HavingFilterConfig::new("count_star > 150 OR sum_volume < 2000".to_string());
+        let config = HavingFilterConfig::new("count_star > 150 OR sum_volume < 2000".to_string());
         let batch = test_batch();
         let result = config.filter_batch(&batch).await.unwrap();
 
@@ -219,11 +217,7 @@ mod tests {
 
     #[test]
     fn test_output_schema_unchanged() {
-        let schema = Arc::new(Schema::new(vec![Field::new(
-            "a",
-            DataType::Int64,
-            false,
-        )]));
+        let schema = Arc::new(Schema::new(vec![Field::new("a", DataType::Int64, false)]));
         let config = HavingFilterConfig::new("a > 0".to_string());
         let output = config.output_schema(&schema);
         assert_eq!(*output, *schema);

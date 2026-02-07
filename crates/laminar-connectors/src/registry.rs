@@ -22,9 +22,7 @@ pub type SinkFactory = Arc<dyn Fn() -> Box<dyn SinkConnector> + Send + Sync>;
 
 /// Factory function type for creating reference table sources.
 pub type TableSourceFactory = Arc<
-    dyn Fn(&ConnectorConfig) -> Result<Box<dyn ReferenceTableSource>, ConnectorError>
-        + Send
-        + Sync,
+    dyn Fn(&ConnectorConfig) -> Result<Box<dyn ReferenceTableSource>, ConnectorError> + Send + Sync,
 >;
 
 /// Registry of available connector implementations.
@@ -132,7 +130,9 @@ impl ConnectorRegistry {
         info: ConnectorInfo,
         factory: TableSourceFactory,
     ) {
-        self.table_sources.write().insert(name.into(), (info, factory));
+        self.table_sources
+            .write()
+            .insert(name.into(), (info, factory));
     }
 
     /// Creates a new reference table source instance.

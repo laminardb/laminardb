@@ -279,10 +279,7 @@ mod tests {
         let analysis = make_frame_analysis();
         let config = WindowFrameConfig::from_analysis(&analysis);
         assert_eq!(config.functions.len(), 1);
-        assert_eq!(
-            config.functions[0].function_type,
-            WindowFrameFunction::Avg
-        );
+        assert_eq!(config.functions[0].function_type, WindowFrameFunction::Avg);
         assert_eq!(config.functions[0].source_column, "price");
         assert_eq!(config.functions[0].units, FrameUnits::Rows);
         assert_eq!(config.functions[0].start_bound, FrameBound::Preceding(9));
@@ -344,13 +341,7 @@ mod tests {
         };
         let config = WindowFrameConfig::from_analysis(&analysis);
         assert_eq!(config.functions.len(), 2);
-        assert_eq!(
-            config.functions[0].function_type,
-            WindowFrameFunction::Avg
-        );
-        assert_eq!(
-            config.functions[1].function_type,
-            WindowFrameFunction::Max
-        );
+        assert_eq!(config.functions[0].function_type, WindowFrameFunction::Avg);
+        assert_eq!(config.functions[1].function_type, WindowFrameFunction::Max);
     }
 }

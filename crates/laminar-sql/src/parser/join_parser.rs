@@ -722,8 +722,7 @@ pub fn analyze_joins(select: &Select) -> Result<Option<MultiJoinAnalysis>, Parse
             join_steps.push(analysis);
         } else {
             // Regular join (inner, left, right, full)
-            let (left_key, right_key, time_bound) =
-                analyze_join_constraint(&join.join_operator)?;
+            let (left_key, right_key, time_bound) = analyze_join_constraint(&join.join_operator)?;
 
             let mut analysis = if let Some(tb) = time_bound {
                 JoinAnalysis::stream_stream(
