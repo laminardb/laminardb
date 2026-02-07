@@ -76,6 +76,89 @@ impl AnalyticWindowConfig {
     }
 }
 
+// --- Window Frame operator configuration (F-SQL-006) ---
+
+use crate::parser::analytic_parser::{
+    FrameBound, FrameUnits, WindowFrameAnalysis, WindowFrameFunction,
+};
+
+/// Configuration for a single window frame aggregate function.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct WindowFrameFunctionConfig {
+    /// Type of aggregate function
+    pub function_type: WindowFrameFunction,
+    /// Source column name
+    pub source_column: String,
+    /// Frame unit type (ROWS or RANGE)
+    pub units: FrameUnits,
+    /// Start bound of the frame
+    pub start_bound: FrameBound,
+    /// End bound of the frame
+    pub end_bound: FrameBound,
+    /// Output column alias
+    pub output_alias: Option<String>,
+}
+
+/// Configuration for a streaming window frame operator.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct WindowFrameConfig {
+    /// Individual function configurations
+    pub functions: Vec<WindowFrameFunctionConfig>,
+    /// PARTITION BY columns
+    pub partition_columns: Vec<String>,
+    /// ORDER BY columns
+    pub order_columns: Vec<String>,
+    /// Maximum number of partitions (memory safety)
+    pub max_partitions: usize,
+}
+
+impl WindowFrameConfig {
+    /// Creates an operator configuration from a window frame analysis.
+    #[must_use]
+    pub fn from_analysis(analysis: &WindowFrameAnalysis) -> Self {
+        let functions = analysis
+            .functions
+            .iter()
+            .map(|f| WindowFrameFunctionConfig {
+                function_type: f.function_type,
+                source_column: f.column.clone(),
+                units: f.units,
+                start_bound: f.start_bound.clone(),
+                end_bound: f.end_bound.clone(),
+                output_alias: f.alias.clone(),
+            })
+            .collect();
+
+        Self {
+            functions,
+            partition_columns: analysis.partition_columns.clone(),
+            order_columns: analysis.order_columns.clone(),
+            max_partitions: DEFAULT_MAX_PARTITIONS,
+        }
+    }
+
+    /// Sets the maximum number of partitions.
+    #[must_use]
+    pub fn with_max_partitions(mut self, max_partitions: usize) -> Self {
+        self.max_partitions = max_partitions;
+        self
+    }
+
+    /// Returns true if any frame uses FOLLOWING bounds.
+    #[must_use]
+    pub fn has_following(&self) -> bool {
+        self.functions.iter().any(|f| {
+            matches!(
+                f.end_bound,
+                FrameBound::Following(_) | FrameBound::UnboundedFollowing
+            ) || matches!(
+                f.start_bound,
+                FrameBound::Following(_) | FrameBound::UnboundedFollowing
+            )
+        })
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -170,5 +253,104 @@ mod tests {
         let analysis = make_lag_analysis();
         let config = AnalyticWindowConfig::from_analysis(&analysis);
         assert_eq!(config.max_partitions, DEFAULT_MAX_PARTITIONS);
+    }
+
+    // --- Window Frame translator tests (F-SQL-006) ---
+
+    use crate::parser::analytic_parser::WindowFrameInfo;
+
+    fn make_frame_analysis() -> WindowFrameAnalysis {
+        WindowFrameAnalysis {
+            functions: vec![WindowFrameInfo {
+                function_type: WindowFrameFunction::Avg,
+                column: "price".to_string(),
+                units: FrameUnits::Rows,
+                start_bound: FrameBound::Preceding(9),
+                end_bound: FrameBound::CurrentRow,
+                alias: Some("ma".to_string()),
+            }],
+            partition_columns: vec!["symbol".to_string()],
+            order_columns: vec!["ts".to_string()],
+        }
+    }
+
+    #[test]
+    fn test_frame_from_analysis_basic() {
+        let analysis = make_frame_analysis();
+        let config = WindowFrameConfig::from_analysis(&analysis);
+        assert_eq!(config.functions.len(), 1);
+        assert_eq!(
+            config.functions[0].function_type,
+            WindowFrameFunction::Avg
+        );
+        assert_eq!(config.functions[0].source_column, "price");
+        assert_eq!(config.functions[0].units, FrameUnits::Rows);
+        assert_eq!(config.functions[0].start_bound, FrameBound::Preceding(9));
+        assert_eq!(config.functions[0].end_bound, FrameBound::CurrentRow);
+        assert_eq!(config.functions[0].output_alias.as_deref(), Some("ma"));
+        assert_eq!(config.partition_columns, vec!["symbol".to_string()]);
+        assert_eq!(config.order_columns, vec!["ts".to_string()]);
+        assert!(!config.has_following());
+    }
+
+    #[test]
+    fn test_frame_max_partitions_builder() {
+        let analysis = make_frame_analysis();
+        let config = WindowFrameConfig::from_analysis(&analysis).with_max_partitions(500);
+        assert_eq!(config.max_partitions, 500);
+    }
+
+    #[test]
+    fn test_frame_has_following() {
+        let analysis = WindowFrameAnalysis {
+            functions: vec![WindowFrameInfo {
+                function_type: WindowFrameFunction::Sum,
+                column: "amount".to_string(),
+                units: FrameUnits::Rows,
+                start_bound: FrameBound::Preceding(5),
+                end_bound: FrameBound::Following(3),
+                alias: None,
+            }],
+            partition_columns: vec![],
+            order_columns: vec!["id".to_string()],
+        };
+        let config = WindowFrameConfig::from_analysis(&analysis);
+        assert!(config.has_following());
+    }
+
+    #[test]
+    fn test_frame_multiple_functions_config() {
+        let analysis = WindowFrameAnalysis {
+            functions: vec![
+                WindowFrameInfo {
+                    function_type: WindowFrameFunction::Avg,
+                    column: "price".to_string(),
+                    units: FrameUnits::Rows,
+                    start_bound: FrameBound::Preceding(9),
+                    end_bound: FrameBound::CurrentRow,
+                    alias: Some("ma".to_string()),
+                },
+                WindowFrameInfo {
+                    function_type: WindowFrameFunction::Max,
+                    column: "price".to_string(),
+                    units: FrameUnits::Rows,
+                    start_bound: FrameBound::Preceding(4),
+                    end_bound: FrameBound::CurrentRow,
+                    alias: Some("hi".to_string()),
+                },
+            ],
+            partition_columns: vec!["symbol".to_string()],
+            order_columns: vec!["ts".to_string()],
+        };
+        let config = WindowFrameConfig::from_analysis(&analysis);
+        assert_eq!(config.functions.len(), 2);
+        assert_eq!(
+            config.functions[0].function_type,
+            WindowFrameFunction::Avg
+        );
+        assert_eq!(
+            config.functions[1].function_type,
+            WindowFrameFunction::Max
+        );
     }
 }

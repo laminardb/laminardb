@@ -7,10 +7,10 @@
 | Phase 1 | 12 | 0 | 0 | 0 | 12 |
 | Phase 1.5 | 1 | 0 | 0 | 0 | 1 |
 | Phase 2 | 34 | 0 | 0 | 0 | 34 |
-| Phase 3 | 67 | 18 | 0 | 0 | 49 |
+| Phase 3 | 67 | 17 | 0 | 0 | 50 |
 | Phase 4 | 11 | 11 | 0 | 0 | 0 |
 | Phase 5 | 10 | 10 | 0 | 0 | 0 |
-| **Total** | **135** | **39** | **0** | **0** | **96** |
+| **Total** | **135** | **38** | **0** | **0** | **97** |
 
 ## Status Legend
 
@@ -191,7 +191,7 @@ See [Cloud Storage Index](phase-3/cloud/INDEX.md).
 | F-SQL-003 | ROW_NUMBER/RANK/DENSE_RANK | ✅ | [Link](phase-3/F-SQL-003-ranking-functions.md) |
 | F-SQL-004 | HAVING Clause Execution | ✅ | [Link](phase-3/F-SQL-004-having-clause.md) |
 | F-SQL-005 | Multi-Way JOIN Support | ✅ | [Link](phase-3/F-SQL-005-multi-way-joins.md) |
-| F-SQL-006 | Window Frame (ROWS BETWEEN) | 📝 | [Link](phase-3/F-SQL-006-window-frames.md) |
+| F-SQL-006 | Window Frame (ROWS BETWEEN) | ✅ | [Link](phase-3/F-SQL-006-window-frames.md) |
 
 ### Connector Infrastructure
 

@@ -17,7 +17,9 @@ pub mod streaming_ddl;
 mod window_translator;
 
 pub use crate::parser::order_analyzer::RankType;
-pub use analytic_translator::{AnalyticFunctionConfig, AnalyticWindowConfig};
+pub use analytic_translator::{
+    AnalyticFunctionConfig, AnalyticWindowConfig, WindowFrameConfig, WindowFrameFunctionConfig,
+};
 pub use dag_planner::{format_dag_explain, DagExplainOutput};
 pub use having_translator::HavingFilterConfig;
 pub use join_translator::{

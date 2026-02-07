@@ -833,6 +833,12 @@ impl LaminarDB {
                         if let Some(oc) = &qp.order_config {
                             rows.push(("order_by".into(), format!("{oc:?}")));
                         }
+                        if let Some(fc) = &qp.frame_config {
+                            rows.push((
+                                "frame_functions".into(),
+                                format!("{}", fc.functions.len()),
+                            ));
+                        }
                         if let Some(ec) = &qp.emit_clause {
                             rows.push(("emit".into(), format!("{ec:?}")));
                         }
@@ -3703,5 +3709,151 @@ mod tests {
         let batches = df.collect().await.unwrap();
         let total_rows: usize = batches.iter().map(|b| b.num_rows()).sum();
         assert_eq!(total_rows, 2);
+    }
+
+    // ── Window Frame tests (F-SQL-006) ────────────────────────────────
+
+    #[tokio::test]
+    async fn test_frame_moving_average() {
+        let db = LaminarDB::open().unwrap();
+
+        db.ctx
+            .sql(
+                "CREATE TABLE frame_prices AS SELECT * FROM (VALUES \
+                 (1, 10.0), (2, 20.0), (3, 30.0), (4, 40.0), (5, 50.0)) \
+                 AS t(id, price)",
+            )
+            .await
+            .unwrap();
+
+        let df = db
+            .ctx
+            .sql(
+                "SELECT id, AVG(price) OVER (ORDER BY id \
+                 ROWS BETWEEN 2 PRECEDING AND CURRENT ROW) AS ma \
+                 FROM frame_prices ORDER BY id",
+            )
+            .await
+            .unwrap();
+
+        let batches = df.collect().await.unwrap();
+        let total_rows: usize = batches.iter().map(|b| b.num_rows()).sum();
+        assert_eq!(total_rows, 5);
+
+        // Verify moving average values: row 3 → avg(10,20,30) = 20
+        let ma_col = batches[0]
+            .column(1)
+            .as_any()
+            .downcast_ref::<arrow::array::Float64Array>()
+            .unwrap();
+        assert!((ma_col.value(2) - 20.0).abs() < 0.01);
+    }
+
+    #[tokio::test]
+    async fn test_frame_running_sum() {
+        let db = LaminarDB::open().unwrap();
+
+        db.ctx
+            .sql(
+                "CREATE TABLE frame_amounts AS SELECT * FROM (VALUES \
+                 (1, 100.0), (2, 200.0), (3, 300.0)) AS t(id, amount)",
+            )
+            .await
+            .unwrap();
+
+        let df = db
+            .ctx
+            .sql(
+                "SELECT id, SUM(amount) OVER (ORDER BY id \
+                 ROWS BETWEEN UNBOUNDED PRECEDING AND CURRENT ROW) AS running \
+                 FROM frame_amounts ORDER BY id",
+            )
+            .await
+            .unwrap();
+
+        let batches = df.collect().await.unwrap();
+        let total_rows: usize = batches.iter().map(|b| b.num_rows()).sum();
+        assert_eq!(total_rows, 3);
+
+        let sum_col = batches[0]
+            .column(1)
+            .as_any()
+            .downcast_ref::<arrow::array::Float64Array>()
+            .unwrap();
+        // Row 3: cumulative sum = 100 + 200 + 300 = 600
+        assert!((sum_col.value(2) - 600.0).abs() < 0.01);
+    }
+
+    #[tokio::test]
+    async fn test_frame_rolling_max() {
+        let db = LaminarDB::open().unwrap();
+
+        db.ctx
+            .sql(
+                "CREATE TABLE frame_vals AS SELECT * FROM (VALUES \
+                 (1, 5.0), (2, 15.0), (3, 10.0), (4, 20.0)) AS t(id, price)",
+            )
+            .await
+            .unwrap();
+
+        let df = db
+            .ctx
+            .sql(
+                "SELECT id, MAX(price) OVER (ORDER BY id \
+                 ROWS BETWEEN 2 PRECEDING AND CURRENT ROW) AS rmax \
+                 FROM frame_vals ORDER BY id",
+            )
+            .await
+            .unwrap();
+
+        let batches = df.collect().await.unwrap();
+        let total_rows: usize = batches.iter().map(|b| b.num_rows()).sum();
+        assert_eq!(total_rows, 4);
+
+        let max_col = batches[0]
+            .column(1)
+            .as_any()
+            .downcast_ref::<arrow::array::Float64Array>()
+            .unwrap();
+        // Row 3: max(5, 15, 10) = 15
+        assert!((max_col.value(2) - 15.0).abs() < 0.01);
+    }
+
+    #[tokio::test]
+    async fn test_frame_rolling_count() {
+        let db = LaminarDB::open().unwrap();
+
+        db.ctx
+            .sql(
+                "CREATE TABLE frame_events AS SELECT * FROM (VALUES \
+                 (1, 'a'), (2, 'b'), (3, 'c'), (4, 'd')) AS t(id, code)",
+            )
+            .await
+            .unwrap();
+
+        let df = db
+            .ctx
+            .sql(
+                "SELECT id, COUNT(*) OVER (ORDER BY id \
+                 ROWS BETWEEN 1 PRECEDING AND CURRENT ROW) AS cnt \
+                 FROM frame_events ORDER BY id",
+            )
+            .await
+            .unwrap();
+
+        let batches = df.collect().await.unwrap();
+        let total_rows: usize = batches.iter().map(|b| b.num_rows()).sum();
+        assert_eq!(total_rows, 4);
+
+        let cnt_col = batches[0]
+            .column(1)
+            .as_any()
+            .downcast_ref::<arrow::array::Int64Array>()
+            .unwrap();
+        // Row 1: count of just row 1 = 1
+        assert_eq!(cnt_col.value(0), 1);
+        // Row 2+: count of current + 1 preceding = 2
+        assert_eq!(cnt_col.value(1), 2);
+        assert_eq!(cnt_col.value(2), 2);
     }
 }

@@ -12,7 +12,7 @@ use datafusion::logical_expr::LogicalPlan;
 use datafusion::prelude::SessionContext;
 use sqlparser::ast::{ObjectName, SetExpr, Statement};
 
-use crate::parser::analytic_parser::analyze_analytic_functions;
+use crate::parser::analytic_parser::{analyze_analytic_functions, analyze_window_frames, FrameBound};
 use crate::parser::join_parser::analyze_joins;
 use crate::parser::order_analyzer::analyze_order_by;
 use crate::parser::{
@@ -22,7 +22,7 @@ use crate::parser::{
 use crate::parser::aggregation_parser::analyze_aggregates;
 use crate::translator::{
     AnalyticWindowConfig, DagExplainOutput, HavingFilterConfig, JoinOperatorConfig,
-    OrderOperatorConfig, WindowOperatorConfig,
+    OrderOperatorConfig, WindowFrameConfig, WindowOperatorConfig,
 };
 
 /// Streaming query planner
@@ -90,6 +90,8 @@ pub struct QueryPlan {
     pub analytic_config: Option<AnalyticWindowConfig>,
     /// HAVING clause filter configuration
     pub having_config: Option<HavingFilterConfig>,
+    /// Window frame configuration (ROWS BETWEEN / RANGE BETWEEN)
+    pub frame_config: Option<WindowFrameConfig>,
     /// Emit strategy
     pub emit_clause: Option<EmitClause>,
     /// The underlying SQL statement
@@ -237,6 +239,7 @@ impl StreamingPlanner {
             order_config: query_plan.order_config,
             analytic_config: query_plan.analytic_config,
             having_config: query_plan.having_config,
+            frame_config: query_plan.frame_config,
             emit_clause: emit_clause.cloned(),
             statement: Box::new(stmt),
         }))
@@ -272,11 +275,30 @@ impl StreamingPlanner {
                     .having_expr
                     .map(HavingFilterConfig::new);
 
+                // Check for window frame functions (ROWS BETWEEN / RANGE BETWEEN)
+                let frame_analysis = analyze_window_frames(stmt);
+                let frame_config = frame_analysis
+                    .as_ref()
+                    .map(WindowFrameConfig::from_analysis);
+
+                // Validate: reject UNBOUNDED FOLLOWING (streaming can't buffer infinite future)
+                if let Some(fa) = &frame_analysis {
+                    for f in &fa.functions {
+                        if matches!(f.end_bound, FrameBound::UnboundedFollowing) {
+                            return Err(PlanningError::InvalidQuery(
+                                "UNBOUNDED FOLLOWING is not supported in streaming window frames"
+                                    .to_string(),
+                            ));
+                        }
+                    }
+                }
+
                 let has_streaming_features = window_function.is_some()
                     || join_analysis.is_some()
                     || order_config.is_some()
                     || analytic_config.is_some()
-                    || having_config.is_some();
+                    || having_config.is_some()
+                    || frame_config.is_some();
 
                 if has_streaming_features {
                     let window_config = match window_function {
@@ -297,6 +319,7 @@ impl StreamingPlanner {
                         order_config,
                         analytic_config,
                         having_config,
+                        frame_config,
                         emit_clause: None,
                         statement: Box::new(stmt.clone()),
                     }));
@@ -357,6 +380,20 @@ impl StreamingPlanner {
         analysis.having_config = agg_analysis
             .having_expr
             .map(HavingFilterConfig::new);
+
+        // Extract window frame functions (ROWS BETWEEN / RANGE BETWEEN)
+        if let Some(frame_analysis) = analyze_window_frames(stmt) {
+            // Validate: reject UNBOUNDED FOLLOWING
+            for f in &frame_analysis.functions {
+                if matches!(f.end_bound, FrameBound::UnboundedFollowing) {
+                    return Err(PlanningError::InvalidQuery(
+                        "UNBOUNDED FOLLOWING is not supported in streaming window frames"
+                            .to_string(),
+                    ));
+                }
+            }
+            analysis.frame_config = Some(WindowFrameConfig::from_analysis(&frame_analysis));
+        }
 
         Ok(analysis)
     }
@@ -451,6 +488,7 @@ struct QueryAnalysis {
     order_config: Option<OrderOperatorConfig>,
     analytic_config: Option<AnalyticWindowConfig>,
     having_config: Option<HavingFilterConfig>,
+    frame_config: Option<WindowFrameConfig>,
 }
 
 /// Helper to convert `ObjectName` to String
@@ -861,5 +899,82 @@ mod tests {
             StreamingPlan::Standard(_) => {} // No join → pass-through
             _ => panic!("Expected Standard plan for simple SELECT"),
         }
+    }
+
+    // -- Window Frame planner tests (F-SQL-006) --
+
+    #[test]
+    fn test_plan_query_with_rows_frame() {
+        let mut planner = StreamingPlanner::new();
+        let statements = StreamingParser::parse_sql(
+            "SELECT AVG(price) OVER (ORDER BY ts \
+             ROWS BETWEEN 9 PRECEDING AND CURRENT ROW) AS ma FROM trades",
+        )
+        .unwrap();
+
+        let plan = planner.plan(&statements[0]).unwrap();
+        match plan {
+            StreamingPlan::Query(qp) => {
+                assert!(qp.frame_config.is_some());
+                let fc = qp.frame_config.unwrap();
+                assert_eq!(fc.functions.len(), 1);
+                assert_eq!(fc.functions[0].source_column, "price");
+            }
+            _ => panic!("Expected Query plan with frame_config"),
+        }
+    }
+
+    #[test]
+    fn test_plan_frame_with_partition() {
+        let mut planner = StreamingPlanner::new();
+        let statements = StreamingParser::parse_sql(
+            "SELECT AVG(price) OVER (PARTITION BY symbol ORDER BY ts \
+             ROWS BETWEEN 4 PRECEDING AND CURRENT ROW) AS ma FROM trades",
+        )
+        .unwrap();
+
+        let plan = planner.plan(&statements[0]).unwrap();
+        match plan {
+            StreamingPlan::Query(qp) => {
+                let fc = qp.frame_config.unwrap();
+                assert_eq!(fc.partition_columns, vec!["symbol".to_string()]);
+                assert_eq!(fc.order_columns, vec!["ts".to_string()]);
+            }
+            _ => panic!("Expected Query plan with frame_config"),
+        }
+    }
+
+    #[test]
+    fn test_plan_no_frame_is_standard() {
+        let mut planner = StreamingPlanner::new();
+        let statements = StreamingParser::parse_sql(
+            "SELECT * FROM trades",
+        )
+        .unwrap();
+
+        let plan = planner.plan(&statements[0]).unwrap();
+        match plan {
+            StreamingPlan::Standard(_) => {} // No frame → pass-through
+            _ => panic!("Expected Standard plan for simple SELECT"),
+        }
+    }
+
+    #[test]
+    fn test_plan_unbounded_following_rejected() {
+        let mut planner = StreamingPlanner::new();
+        let statements = StreamingParser::parse_sql(
+            "SELECT SUM(amount) OVER (ORDER BY id \
+             ROWS BETWEEN CURRENT ROW AND UNBOUNDED FOLLOWING) AS rest \
+             FROM orders",
+        )
+        .unwrap();
+
+        let result = planner.plan(&statements[0]);
+        assert!(result.is_err());
+        let err = result.unwrap_err().to_string();
+        assert!(
+            err.contains("UNBOUNDED FOLLOWING"),
+            "error was: {err}"
+        );
     }
 }
