@@ -806,7 +806,9 @@ impl AsofJoinOperator {
     /// Updates the output schema when both input schemas are known.
     fn update_output_schema(&mut self) {
         if let (Some(left), Some(right)) = (&self.left_schema, &self.right_schema) {
-            let mut fields: Vec<Field> = left.fields().iter().map(|f| f.as_ref().clone()).collect();
+            let mut fields: Vec<Field> =
+                Vec::with_capacity(left.fields().len() + right.fields().len());
+            fields.extend(left.fields().iter().map(|f| f.as_ref().clone()));
 
             // Add right fields, prefixing duplicates
             for field in right.fields() {
@@ -830,8 +832,11 @@ impl AsofJoinOperator {
     fn create_joined_event(&self, left_event: &Event, right_row: &AsofRow) -> Option<Event> {
         let schema = self.output_schema.as_ref()?;
 
-        let mut columns: Vec<ArrayRef> = left_event.data.columns().to_vec();
-        for column in right_row.batch().columns() {
+        let left_cols = left_event.data.columns();
+        let right_cols = right_row.batch().columns();
+        let mut columns: Vec<ArrayRef> = Vec::with_capacity(left_cols.len() + right_cols.len());
+        columns.extend_from_slice(left_cols);
+        for column in right_cols {
             columns.push(Arc::clone(column));
         }
 
@@ -846,7 +851,10 @@ impl AsofJoinOperator {
         let right_schema = self.right_schema.as_ref()?;
 
         let num_rows = left_event.data.num_rows();
-        let mut columns: Vec<ArrayRef> = left_event.data.columns().to_vec();
+        let left_cols = left_event.data.columns();
+        let mut columns: Vec<ArrayRef> =
+            Vec::with_capacity(left_cols.len() + right_schema.fields().len());
+        columns.extend_from_slice(left_cols);
 
         // Add null columns for right side
         for field in right_schema.fields() {

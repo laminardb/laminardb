@@ -408,9 +408,10 @@ impl VersionedKeyState {
         }
 
         let to_remove = self.versions.len() - max_versions;
-        let keys_to_remove: Vec<_> = self.versions.keys().take(to_remove).copied().collect();
-        for key in keys_to_remove {
-            self.versions.remove(&key);
+        // Use split_off to avoid intermediate Vec allocation.
+        // BTreeMap is sorted ascending, so nth(to_remove) gives the first key to keep.
+        if let Some(&split_key) = self.versions.keys().nth(to_remove) {
+            self.versions = self.versions.split_off(&split_key);
         }
         self.min_version = self.versions.keys().next().copied().unwrap_or(i64::MAX);
     }
@@ -917,7 +918,8 @@ impl TemporalJoinOperator {
     fn update_output_schema(&mut self) {
         if let (Some(stream), Some(table)) = (&self.stream_schema, &self.table_schema) {
             let mut fields: Vec<Field> =
-                stream.fields().iter().map(|f| f.as_ref().clone()).collect();
+                Vec::with_capacity(stream.fields().len() + table.fields().len());
+            fields.extend(stream.fields().iter().map(|f| f.as_ref().clone()));
 
             // Add table fields, prefixing duplicates
             for field in table.fields() {
@@ -942,8 +944,11 @@ impl TemporalJoinOperator {
         let schema = self.output_schema.as_ref()?;
         let table_batch = table_row.to_batch().ok()?;
 
-        let mut columns: Vec<ArrayRef> = stream_event.data.columns().to_vec();
-        for column in table_batch.columns() {
+        let stream_cols = stream_event.data.columns();
+        let table_cols = table_batch.columns();
+        let mut columns: Vec<ArrayRef> = Vec::with_capacity(stream_cols.len() + table_cols.len());
+        columns.extend_from_slice(stream_cols);
+        for column in table_cols {
             columns.push(Arc::clone(column));
         }
 
@@ -958,7 +963,10 @@ impl TemporalJoinOperator {
         let table_schema = self.table_schema.as_ref()?;
 
         let num_rows = stream_event.data.num_rows();
-        let mut columns: Vec<ArrayRef> = stream_event.data.columns().to_vec();
+        let stream_cols = stream_event.data.columns();
+        let mut columns: Vec<ArrayRef> =
+            Vec::with_capacity(stream_cols.len() + table_schema.fields().len());
+        columns.extend_from_slice(stream_cols);
 
         // Add null columns for table side
         for field in table_schema.fields() {

@@ -243,15 +243,18 @@ impl LagLeadOperator {
         lead_values: &[f64],
     ) -> Event {
         let original_batch = &event.data;
-        let mut fields: Vec<Field> = original_batch
-            .schema()
-            .fields()
-            .iter()
-            .map(|f| f.as_ref().clone())
-            .collect();
-        let mut columns: Vec<Arc<dyn Array>> = (0..original_batch.num_columns())
-            .map(|i| original_batch.column(i).clone())
-            .collect();
+        let num_original = original_batch.num_columns();
+        let num_functions = functions.len();
+        let mut fields: Vec<Field> = Vec::with_capacity(num_original + num_functions);
+        fields.extend(
+            original_batch
+                .schema()
+                .fields()
+                .iter()
+                .map(|f| f.as_ref().clone()),
+        );
+        let mut columns: Vec<Arc<dyn Array>> = Vec::with_capacity(num_original + num_functions);
+        columns.extend((0..num_original).map(|i| original_batch.column(i).clone()));
 
         let mut lag_idx = 0;
         let mut lead_idx = 0;
@@ -437,15 +440,18 @@ impl LagLeadOperator {
         for state in self.partitions.values_mut() {
             while let Some(pending) = state.lead_pending.pop_front() {
                 let original_batch = &pending.event.data;
-                let mut fields: Vec<Field> = original_batch
-                    .schema()
-                    .fields()
-                    .iter()
-                    .map(|f| f.as_ref().clone())
-                    .collect();
-                let mut columns: Vec<Arc<dyn Array>> = (0..original_batch.num_columns())
-                    .map(|i| original_batch.column(i).clone())
-                    .collect();
+                let num_original = original_batch.num_columns();
+                let num_lead = lead_output_columns.len();
+                let mut fields: Vec<Field> = Vec::with_capacity(num_original + num_lead);
+                fields.extend(
+                    original_batch
+                        .schema()
+                        .fields()
+                        .iter()
+                        .map(|f| f.as_ref().clone()),
+                );
+                let mut columns: Vec<Arc<dyn Array>> = Vec::with_capacity(num_original + num_lead);
+                columns.extend((0..num_original).map(|i| original_batch.column(i).clone()));
 
                 for (col_name, &default) in lead_output_columns.iter().zip(lead_defaults.iter()) {
                     fields.push(Field::new(col_name, DataType::Float64, true));
