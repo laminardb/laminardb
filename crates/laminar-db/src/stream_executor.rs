@@ -35,6 +35,9 @@ pub(crate) struct StreamExecutor {
     queries: Vec<StreamQuery>,
     /// Tracks which temporary source tables are registered (for cleanup).
     registered_sources: Vec<String>,
+    /// Tracks queries that have failed, keyed by stream name → error message.
+    /// Only the first failure per query is recorded.
+    failed_queries: HashMap<String, String>,
 }
 
 impl StreamExecutor {
@@ -44,6 +47,7 @@ impl StreamExecutor {
             ctx,
             queries: Vec::new(),
             registered_sources: Vec::new(),
+            failed_queries: HashMap::new(),
         }
     }
 
@@ -89,19 +93,39 @@ impl StreamExecutor {
                         }
                     }
                     Err(e) => {
-                        tracing::warn!(
-                            stream = %query.name,
-                            error = %e,
-                            "Stream query execution failed"
-                        );
+                        if self.failed_queries.contains_key(&query.name) {
+                            tracing::debug!(
+                                stream = %query.name,
+                                error = %e,
+                                "Stream query execution failed (repeated)"
+                            );
+                        } else {
+                            tracing::error!(
+                                stream = %query.name,
+                                error = %e,
+                                "Stream query execution failed"
+                            );
+                            self.failed_queries
+                                .insert(query.name.clone(), e.to_string());
+                        }
                     }
                 },
                 Err(e) => {
-                    tracing::warn!(
-                        stream = %query.name,
-                        error = %e,
-                        "Stream query planning failed"
-                    );
+                    if self.failed_queries.contains_key(&query.name) {
+                        tracing::debug!(
+                            stream = %query.name,
+                            error = %e,
+                            "Stream query planning failed (repeated)"
+                        );
+                    } else {
+                        tracing::error!(
+                            stream = %query.name,
+                            error = %e,
+                            "Stream query planning failed"
+                        );
+                        self.failed_queries
+                            .insert(query.name.clone(), e.to_string());
+                    }
                 }
             }
         }
@@ -153,6 +177,11 @@ impl StreamExecutor {
     #[allow(dead_code)] // Public API for admin/observability queries
     pub fn query_count(&self) -> usize {
         self.queries.len()
+    }
+
+    /// Returns queries that have failed during execution, keyed by stream name.
+    pub fn failed_queries(&self) -> &HashMap<String, String> {
+        &self.failed_queries
     }
 }
 

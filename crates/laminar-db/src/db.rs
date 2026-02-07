@@ -614,6 +614,29 @@ impl LaminarDB {
     ) -> Result<ExecuteResult, DbError> {
         let name_str = name.to_string();
 
+        // Reject ASOF JOINs early — DataFusion does not support ASOF JOIN syntax,
+        // so the embedded pipeline would silently produce no output (see issue #37).
+        if let StreamingStatement::Standard(stmt) = query {
+            if let sqlparser::ast::Statement::Query(q) = stmt.as_ref() {
+                if let sqlparser::ast::SetExpr::Select(select) = q.body.as_ref() {
+                    if let Ok(Some(analysis)) =
+                        laminar_sql::parser::join_parser::analyze_join(select)
+                    {
+                        if analysis.is_asof_join {
+                            return Err(DbError::InvalidOperation(
+                                "ASOF JOIN is not yet supported in embedded pipeline mode. \
+                                 The ASOF JOIN operator exists in laminar-core but is not \
+                                 wired into the embedded executor. Use a stream-stream \
+                                 INNER JOIN with time bounds as an alternative, e.g.: \
+                                 ON t.symbol = q.symbol AND q.ts BETWEEN t.ts - 5000 AND t.ts"
+                                    .to_string(),
+                            ));
+                        }
+                    }
+                }
+            }
+        }
+
         // Register in catalog as a stream
         self.catalog.register_stream(&name_str)?;
 
@@ -1253,9 +1276,19 @@ impl LaminarDB {
                                 }
                             }
                         }
+
+                        // Surface any query failures on the first cycle that detects them
+                        let failed = executor.failed_queries();
+                        if !failed.is_empty() && cycle_count < 5 {
+                            for (name, err) in failed {
+                                eprintln!(
+                                    "[laminar-db] Stream query '{name}' failed: {err}"
+                                );
+                            }
+                        }
                     }
                     Err(e) => {
-                        tracing::warn!(error = %e, "Embedded stream execution error");
+                        tracing::error!(error = %e, "Embedded stream execution error");
                     }
                 }
 
@@ -2897,5 +2930,40 @@ mod tests {
         assert_eq!(find("src").node_type, PipelineNodeType::Source);
         assert_eq!(find("st").node_type, PipelineNodeType::Stream);
         assert_eq!(find("sk").node_type, PipelineNodeType::Sink);
+    }
+
+    #[tokio::test]
+    async fn test_asof_join_rejected_in_embedded_mode() {
+        let db = LaminarDB::open().unwrap();
+
+        db.execute(
+            "CREATE SOURCE trades (symbol VARCHAR NOT NULL, price DOUBLE NOT NULL, ts BIGINT NOT NULL)",
+        )
+        .await
+        .unwrap();
+
+        db.execute(
+            "CREATE SOURCE quotes (symbol VARCHAR NOT NULL, bid DOUBLE NOT NULL, ask DOUBLE NOT NULL, ts BIGINT NOT NULL)",
+        )
+        .await
+        .unwrap();
+
+        let result = db
+            .execute(
+                "CREATE STREAM asof_enriched AS \
+                 SELECT t.symbol, t.price, q.bid, q.ask \
+                 FROM trades t \
+                 ASOF JOIN quotes q \
+                 MATCH_CONDITION(t.ts >= q.ts AND t.ts - q.ts <= INTERVAL '5' SECOND) \
+                 ON t.symbol = q.symbol",
+            )
+            .await;
+
+        assert!(result.is_err(), "ASOF JOIN should be rejected in embedded mode");
+        let err_msg = result.unwrap_err().to_string();
+        assert!(
+            err_msg.contains("ASOF JOIN"),
+            "Error should mention ASOF JOIN, got: {err_msg}"
+        );
     }
 }
