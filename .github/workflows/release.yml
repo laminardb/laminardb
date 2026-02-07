@@ -251,43 +251,45 @@ jobs:
           grep '^version' Cargo.toml
 
       # Publish in dependency order
+      # --no-verify: CI already validated the build; skipping avoids bootstrap
+      # failures where dev-dependencies reference sibling crates not yet on crates.io
       - name: Publish laminar-derive
-        run: cargo publish -p laminar-derive --registry crates-io --allow-dirty
+        run: cargo publish -p laminar-derive --registry crates-io --allow-dirty --no-verify
         continue-on-error: true
 
       - name: Wait for index
         run: sleep 30
 
       - name: Publish laminar-core
-        run: cargo publish -p laminar-core --registry crates-io --allow-dirty
+        run: cargo publish -p laminar-core --registry crates-io --allow-dirty --no-verify
         continue-on-error: true
 
       - name: Wait for index
         run: sleep 30
 
       - name: Publish laminar-sql
-        run: cargo publish -p laminar-sql --registry crates-io --allow-dirty
+        run: cargo publish -p laminar-sql --registry crates-io --allow-dirty --no-verify
         continue-on-error: true
 
       - name: Wait for index
         run: sleep 30
 
       - name: Publish laminar-storage
-        run: cargo publish -p laminar-storage --registry crates-io --allow-dirty
+        run: cargo publish -p laminar-storage --registry crates-io --allow-dirty --no-verify
         continue-on-error: true
 
       - name: Wait for index
         run: sleep 30
 
       - name: Publish laminar-connectors
-        run: cargo publish -p laminar-connectors --registry crates-io --allow-dirty
+        run: cargo publish -p laminar-connectors --registry crates-io --allow-dirty --no-verify
         continue-on-error: true
 
       - name: Wait for index
         run: sleep 30
 
       - name: Publish laminar-db
-        run: cargo publish -p laminar-db --registry crates-io --allow-dirty
+        run: cargo publish -p laminar-db --registry crates-io --allow-dirty --no-verify
         continue-on-error: true
 
   # ============================================

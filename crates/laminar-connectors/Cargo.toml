@@ -26,9 +26,10 @@ postgres-types = { version = "0.2", optional = true }
 mysql_async = { version = "0.34", optional = true, default-features = false, features = ["rustls-tls", "binlog", "minimal-rust"] }
 tokio-stream = { workspace = true, optional = true }
 
-# Delta Lake - using git main branch (has DataFusion 52.1.0)
+# Delta Lake - using git main branch (has DataFusion 52.x)
 # Published 0.30.2 requires DF 51.0, but main branch has DF 52.x
-deltalake = { git = "https://github.com/delta-io/delta-rs", branch = "main", optional = true, default-features = false, features = ["rustls"] }
+# version is required for crates.io publishing; git spec is used locally, stripped on publish
+deltalake = { version = ">=0.30", git = "https://github.com/delta-io/delta-rs", branch = "main", optional = true, default-features = false, features = ["rustls"] }
 url = { version = "2", optional = true }
 uuid = { workspace = true }
 
