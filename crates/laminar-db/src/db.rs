@@ -140,7 +140,9 @@ impl LaminarDB {
             ),
             connector_registry,
             mv_registry: parking_lot::Mutex::new(laminar_core::mv::MvRegistry::new()),
-            table_store: Arc::new(parking_lot::Mutex::new(crate::table_store::TableStore::new())),
+            table_store: Arc::new(parking_lot::Mutex::new(
+                crate::table_store::TableStore::new(),
+            )),
             state: std::sync::atomic::AtomicU8::new(STATE_CREATED),
             runtime_handle: parking_lot::Mutex::new(None),
             shutdown_signal: Arc::new(tokio::sync::Notify::new()),
@@ -625,6 +627,7 @@ impl LaminarDB {
         let mut refresh_mode: Option<laminar_connectors::reference::RefreshMode> = None;
         let mut cache_mode: Option<crate::table_cache_mode::TableCacheMode> = None;
         let mut cache_max_entries: Option<usize> = None;
+        let mut storage: Option<String> = None;
 
         let with_options = match &create.table_options {
             sqlparser::ast::CreateTableOptions::With(opts) => opts.as_slice(),
@@ -639,12 +642,10 @@ impl LaminarDB {
                     "connector" => connector_type = Some(val),
                     "format" => format = Some(val),
                     "refresh" => {
-                        refresh_mode =
-                            Some(crate::connector_manager::parse_refresh_mode(&val)?);
+                        refresh_mode = Some(crate::connector_manager::parse_refresh_mode(&val)?);
                     }
                     "cache_mode" => {
-                        cache_mode =
-                            Some(crate::table_cache_mode::parse_cache_mode(&val)?);
+                        cache_mode = Some(crate::table_cache_mode::parse_cache_mode(&val)?);
                     }
                     "cache_max_entries" => {
                         cache_max_entries = Some(val.parse::<usize>().map_err(|_| {
@@ -653,9 +654,9 @@ impl LaminarDB {
                             ))
                         })?);
                     }
+                    "storage" => storage = Some(val),
                     kk if kk.starts_with("format.") => {
-                        format_options
-                            .insert(kk.strip_prefix("format.").unwrap().to_string(), val);
+                        format_options.insert(kk.strip_prefix("format.").unwrap().to_string(), val);
                     }
                     _ => {
                         connector_options.insert(k, val);
@@ -672,12 +673,32 @@ impl LaminarDB {
             _ => cache_mode.clone(),
         };
 
+        // Determine whether this is a persistent table
+        let is_persistent = storage.as_deref() == Some("persistent");
+
         // Register in TableStore if PK found
         if let Some(ref pk) = primary_key {
-            let mut ts = self.table_store.lock();
-            if let Some(ref mode) = resolved_cache_mode {
-                ts.create_table_with_cache(&name, schema.clone(), pk, mode.clone())?;
+            let cache = resolved_cache_mode
+                .clone()
+                .unwrap_or(crate::table_cache_mode::TableCacheMode::Full);
+
+            if is_persistent {
+                #[cfg(feature = "rocksdb")]
+                {
+                    let mut ts = self.table_store.lock();
+                    ts.create_table_persistent(&name, schema.clone(), pk, cache)?;
+                }
+                #[cfg(not(feature = "rocksdb"))]
+                {
+                    return Err(DbError::InvalidOperation(
+                        "storage = 'persistent' requires the 'rocksdb' feature".to_string(),
+                    ));
+                }
+            } else if resolved_cache_mode.is_some() {
+                let mut ts = self.table_store.lock();
+                ts.create_table_with_cache(&name, schema.clone(), pk, cache)?;
             } else {
+                let mut ts = self.table_store.lock();
                 ts.create_table(&name, schema.clone(), pk)?;
             }
         }
@@ -701,17 +722,30 @@ impl LaminarDB {
                     refresh: refresh_mode,
                     cache_mode: cache_mode.clone(),
                     cache_max_entries,
+                    storage: storage.clone(),
                 });
             }
         }
 
-        // Register as a DataFusion MemTable with empty data
-        let mem_table = datafusion::datasource::MemTable::try_new(schema.clone(), vec![vec![]])
-            .map_err(|e| DbError::InvalidOperation(format!("Failed to create table: {e}")))?;
+        // Register with DataFusion.
+        // Persistent tables use a live ReferenceTableProvider; others use MemTable.
+        if is_persistent && primary_key.is_some() {
+            let provider = crate::table_provider::ReferenceTableProvider::new(
+                name.clone(),
+                schema.clone(),
+                self.table_store.clone(),
+            );
+            self.ctx
+                .register_table(&name, Arc::new(provider))
+                .map_err(|e| DbError::InvalidOperation(format!("Failed to register table: {e}")))?;
+        } else {
+            let mem_table = datafusion::datasource::MemTable::try_new(schema.clone(), vec![vec![]])
+                .map_err(|e| DbError::InvalidOperation(format!("Failed to create table: {e}")))?;
 
-        self.ctx
-            .register_table(&name, Arc::new(mem_table))
-            .map_err(|e| DbError::InvalidOperation(format!("Failed to register table: {e}")))?;
+            self.ctx
+                .register_table(&name, Arc::new(mem_table))
+                .map_err(|e| DbError::InvalidOperation(format!("Failed to register table: {e}")))?;
+        }
 
         Ok(ExecuteResult::Ddl(DdlInfo {
             statement_type: "CREATE TABLE".to_string(),
@@ -857,10 +891,7 @@ impl LaminarDB {
                                 rows.push(("join_type".into(), format!("{:?}", jcs[0])));
                             } else {
                                 for (i, jc) in jcs.iter().enumerate() {
-                                    rows.push((
-                                        format!("join_step_{}", i + 1),
-                                        format!("{jc:?}"),
-                                    ));
+                                    rows.push((format!("join_step_{}", i + 1), format!("{jc:?}")));
                                 }
                             }
                         }
@@ -1449,10 +1480,10 @@ impl LaminarDB {
         stream_regs: HashMap<String, crate::connector_manager::StreamRegistration>,
         table_regs: HashMap<String, crate::connector_manager::TableRegistration>,
     ) -> Result<(), DbError> {
-        use crate::connector_manager::{build_sink_config, build_source_config, build_table_config};
-        use crate::pipeline_checkpoint::{
-            PipelineCheckpointManager, SerializableSourceCheckpoint,
+        use crate::connector_manager::{
+            build_sink_config, build_source_config, build_table_config,
         };
+        use crate::pipeline_checkpoint::{PipelineCheckpointManager, SerializableSourceCheckpoint};
         use crate::stream_executor::StreamExecutor;
         use laminar_connectors::config::ConnectorConfig;
         use laminar_connectors::connector::{SinkConnector, SourceConnector};
@@ -1592,7 +1623,10 @@ impl LaminarDB {
                     "[laminar-db] Recovered from checkpoint epoch {}",
                     checkpoint.epoch
                 );
-                tracing::info!(epoch = checkpoint.epoch, "Recovered from pipeline checkpoint");
+                tracing::info!(
+                    epoch = checkpoint.epoch,
+                    "Recovered from pipeline checkpoint"
+                );
             }
         }
 
@@ -1601,15 +1635,15 @@ impl LaminarDB {
             if matches!(mode, RefreshMode::Manual) {
                 continue;
             }
-            while let Some(batch) = source.poll_snapshot().await.map_err(|e| {
-                DbError::Connector(format!("Table '{name}' snapshot error: {e}"))
-            })? {
+            while let Some(batch) = source
+                .poll_snapshot()
+                .await
+                .map_err(|e| DbError::Connector(format!("Table '{name}' snapshot error: {e}")))?
+            {
                 self.table_store
                     .lock()
                     .upsert(name, &batch)
-                    .map_err(|e| {
-                        DbError::Connector(format!("Table '{name}' upsert error: {e}"))
-                    })?;
+                    .map_err(|e| DbError::Connector(format!("Table '{name}' upsert error: {e}")))?;
             }
             self.sync_table_to_datafusion(name)?;
             self.table_store.lock().rebuild_xor_filter(name);
@@ -1843,6 +1877,7 @@ impl LaminarDB {
                             source_offsets,
                             sink_epochs: HashMap::new(),
                             table_offsets,
+                            table_store_checkpoint_path: None,
                         };
 
                         if let Err(e) = mgr.save(&checkpoint) {
@@ -1894,6 +1929,7 @@ impl LaminarDB {
                     source_offsets,
                     sink_epochs: HashMap::new(),
                     table_offsets,
+                    table_store_checkpoint_path: None,
                 };
                 if let Err(e) = mgr.save(&checkpoint) {
                     tracing::warn!(error = %e, "Final checkpoint save failed");
@@ -2311,6 +2347,12 @@ impl LaminarDB {
     /// Deregisters the existing table (if any) and re-registers with the
     /// current contents of the `TableStore`.
     fn sync_table_to_datafusion(&self, name: &str) -> Result<(), DbError> {
+        // Persistent tables use ReferenceTableProvider which reads live data —
+        // no need to deregister/re-register.
+        if self.table_store.lock().is_persistent(name) {
+            return Ok(());
+        }
+
         let batch = self
             .table_store
             .lock()
@@ -2393,6 +2435,11 @@ fn sync_table_to_df(
     table_store: &Arc<parking_lot::Mutex<crate::table_store::TableStore>>,
     name: &str,
 ) {
+    // Persistent tables use ReferenceTableProvider — skip re-registration.
+    if table_store.lock().is_persistent(name) {
+        return;
+    }
+
     let Some(batch) = table_store.lock().to_record_batch(name) else {
         return;
     };
@@ -3660,9 +3707,7 @@ mod tests {
 
         let df = db
             .ctx
-            .sql(
-                "SELECT name, SUM(qty) as total FROM items GROUP BY name HAVING SUM(qty) > 1000",
-            )
+            .sql("SELECT name, SUM(qty) as total FROM items GROUP BY name HAVING SUM(qty) > 1000")
             .await
             .unwrap();
 
@@ -4156,11 +4201,9 @@ mod tests {
             }),
         );
 
-        db.execute(
-            "CREATE SOURCE events (x INT) WITH (connector = 'mock', format = 'json')",
-        )
-        .await
-        .unwrap();
+        db.execute("CREATE SOURCE events (x INT) WITH (connector = 'mock', format = 'json')")
+            .await
+            .unwrap();
 
         db.execute(
             "CREATE TABLE t1 (id INT PRIMARY KEY, symbol VARCHAR NOT NULL) \
@@ -4300,6 +4343,9 @@ mod tests {
             )
             .await;
         assert!(result.is_err());
-        assert!(result.unwrap_err().to_string().contains("cache_max_entries"));
+        assert!(result
+            .unwrap_err()
+            .to_string()
+            .contains("cache_max_entries"));
     }
 }

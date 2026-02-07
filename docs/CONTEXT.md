@@ -9,35 +9,40 @@
 **Date**: 2026-02-07
 
 ### What Was Accomplished
-- **F-CONN-002B: Connector-Backed Table Population** - COMPLETE (19 new tests, 441 connector / 181 laminar-db tests)
-  - `reference.rs` (NEW): `ReferenceTableSource` trait, `RefreshMode` enum, `MockReferenceTableSource` (6 tests)
-  - `registry.rs`: Added `TableSourceFactory`, `register_table_source()`, `create_table_source()`, `list_table_sources()` (3 tests)
-  - `connector_manager.rs`: Added `refresh` field to `TableRegistration`, `build_table_config()`, `parse_refresh_mode()` (5 tests)
-  - `pipeline_checkpoint.rs`: Added `table_offsets` field with `#[serde(default)]` backward compat (2 tests)
-  - `db.rs`: `table_store` → `Arc<Mutex<>>`, snapshot phase before spawn, incremental CDC polling in loop, checkpoint wiring, `sync_table_to_df()` free fn, refresh mode DDL parsing (5 tests)
-  - Tables are now snapshot-populated on startup and incrementally refreshed during processing
+- **F-CONN-002D: RocksDB-Backed Persistent Table Store** - COMPLETE (10 new tests, 223 laminar-db tests with rocksdb)
+  - `table_backend.rs` (NEW): `TableBackend` enum (InMemory/Persistent), Arrow IPC serde, `RocksDB` config (bloom filter, LZ4, block-based table), `open_rocksdb_for_tables()` (8 tests)
+  - `table_provider.rs` (NEW): `ReferenceTableProvider` implementing DataFusion `TableProvider` — live scan from `TableStore`, no re-registration needed (5 tests)
+  - `table_store.rs`: Refactored to use `TableBackend`, `row_count` tracking, `new_with_rocksdb()`, `create_table_persistent()`, `maybe_spill_to_rocksdb()`, `checkpoint_rocksdb()`, `is_persistent()`, `drop_table()` drops CF (7 new rocksdb tests)
+  - `db.rs`: DDL `WITH (storage = 'persistent')` parsing, `ReferenceTableProvider` registration, persistent table skip in `sync_table_to_datafusion()`
+  - `connector_manager.rs`: Added `storage` field to `TableRegistration`
+  - `error.rs`: Added `Storage(String)` variant
+  - `pipeline_checkpoint.rs`: Added `table_store_checkpoint_path` field
+  - `config.rs`: Added `table_spill_threshold` (default 1,000,000)
+  - `Cargo.toml`: `rocksdb` feature flag, `arrow-ipc` dep
+  - Platform: Block-based table (not PlainTable — Windows compat), `set_use_direct_reads` Linux-only, `Arc<parking_lot::Mutex<rocksdb::DB>>` for CF management
 
 Previous session (2026-02-07):
-- **F-SQL-006: Window Frame (ROWS BETWEEN)** - COMPLETE (22 new tests, 494 laminar-sql / 170 laminar-db tests)
+- **F-CONN-002C: PARTIAL Cache Mode & Xor Filter** - COMPLETE (40 new tests)
+- **F-CONN-002B: Connector-Backed Table Population** - COMPLETE (19 new tests)
+- **F-SQL-006: Window Frame (ROWS BETWEEN)** - COMPLETE (22 new tests)
 - **F-SQL-005: Multi-Way JOIN Support** - COMPLETE (21 new tests)
 - **F-SQL-004: HAVING Clause Execution** - COMPLETE (22 new tests)
 - **F-CONN-003: Avro Serialization Hardening** - COMPLETE (~40 new tests)
 
 ### Where We Left Off
 
-**Phase 3: 51/67 features COMPLETE (76%)**
+**Phase 3: 53/67 features COMPLETE (79%)**
 
 All Phase 1 (12), Phase 1.5 (1), and Phase 2 (34) features are complete.
 See [INDEX.md](./features/INDEX.md) for the full feature-by-feature breakdown.
 
-**Test counts**: ~2,560 base, ~2,910 with all feature flags (`kafka`, `postgres-cdc`, `postgres-sink`, `delta-lake`, `mysql-cdc`, `ffi`)
+**Test counts**: ~2,641 base, ~2,651+ with `rocksdb`, ~2,980+ with all feature flags (`kafka`, `postgres-cdc`, `postgres-sink`, `delta-lake`, `mysql-cdc`, `ffi`, `rocksdb`)
 
 ### Immediate Next Steps
-1. F-CONN-002C: PARTIAL Cache Mode & Xor Filter
-2. F-CONN-002D: RocksDB-Backed Persistent Table Store
-3. F-OBS-001: Pipeline Observability API
-4. F031B/C/D: Delta Lake advanced (recovery, compaction, schema evolution)
-5. F032A: Iceberg I/O (blocked by iceberg-rust DF 52.0 compat)
+1. F-OBS-001: Pipeline Observability API
+2. F031B/C/D: Delta Lake advanced (recovery, compaction, schema evolution)
+3. F032A: Iceberg I/O (blocked by iceberg-rust DF 52.0 compat)
+4. F-DEMO-001/002/003: Production demo pipeline + TUI
 
 ### Open Issues
 - **iceberg-rust crate**: Deferred until compatible with workspace DataFusion. Business logic complete in F032.
@@ -54,7 +59,7 @@ laminar-core/src/
   streaming/      # In-memory streaming: ring buffer, SPSC/MPSC channels, source, sink
   subscription/   # Reactive push-based: events, notifications, registry, dispatcher, backpressure, filtering
   time/           # Watermarks: partitioned, keyed, alignment groups
-  operator/       # Windows, joins (stream/asof/temporal), changelog, lag_lead
+  operator/       # Windows, joins (stream/asof/temporal), changelog, lag_lead, table_cache (LRU + xor)
   mv/             # Cascading materialized views
   tpc/            # Thread-per-core: SPSC, key router, core handle, backpressure, runtime
   sink/           # Exactly-once: transactional sink, epoch adapter

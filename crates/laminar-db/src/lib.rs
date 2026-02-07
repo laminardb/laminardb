@@ -34,7 +34,9 @@ mod handle;
 mod pipeline_checkpoint;
 mod sql_utils;
 mod stream_executor;
+mod table_backend;
 mod table_cache_mode;
+mod table_provider;
 mod table_store;
 
 /// FFI-friendly API for language bindings.
@@ -66,12 +68,12 @@ pub use catalog::{SourceCatalog, SourceEntry};
 pub use config::LaminarConfig;
 pub use db::LaminarDB;
 pub use error::DbError;
-pub use pipeline_checkpoint::PipelineCheckpoint;
 pub use handle::{
     DdlInfo, ExecuteResult, FromBatch, PipelineEdge, PipelineNode, PipelineNodeType,
     PipelineTopology, QueryHandle, QueryInfo, SinkInfo, SourceHandle, SourceInfo, StreamInfo,
     TypedSubscription, UntypedSourceHandle,
 };
+pub use pipeline_checkpoint::PipelineCheckpoint;
 
 /// Re-export the connector registry for custom connector registration.
 pub use laminar_connectors::registry::ConnectorRegistry;

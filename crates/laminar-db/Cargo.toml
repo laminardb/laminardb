@@ -16,6 +16,7 @@ ffi = ["api", "arrow/ffi"]  # C FFI layer (extern "C" functions, cbindgen header
 kafka = ["laminar-connectors/kafka"]
 postgres-cdc = ["laminar-connectors/postgres-cdc"]
 postgres-sink = ["laminar-connectors/postgres-sink"]
+rocksdb = ["dep:rocksdb"]
 
 [dependencies]
 laminar-core = { path = "../laminar-core", version = "0.1.0" }
@@ -25,7 +26,11 @@ laminar-connectors = { path = "../laminar-connectors", version = "0.1.0" }
 # Arrow
 arrow = { workspace = true }
 arrow-array = { workspace = true }
+arrow-ipc = { workspace = true }
 arrow-schema = { workspace = true }
+
+# Storage
+rocksdb = { version = "0.24", optional = true }
 
 # DataFusion
 datafusion = { workspace = true }

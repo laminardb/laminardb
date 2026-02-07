@@ -70,6 +70,9 @@ pub struct PipelineCheckpoint {
     /// Per-table source offsets (key: table name). Absent in older checkpoints.
     #[serde(default)]
     pub table_offsets: HashMap<String, SerializableSourceCheckpoint>,
+    /// Path to the `RocksDB` table store checkpoint, if any.
+    #[serde(default)]
+    pub table_store_checkpoint_path: Option<String>,
 }
 
 /// Manages pipeline checkpoint persistence on disk.
@@ -130,9 +133,8 @@ impl PipelineCheckpointManager {
         let filename = format!("checkpoint_{:06}.json", checkpoint.epoch);
         let filepath = self.checkpoint_dir.join(&filename);
 
-        let json = serde_json::to_string_pretty(checkpoint).map_err(|e| {
-            DbError::Checkpoint(format!("checkpoint serialization failed: {e}"))
-        })?;
+        let json = serde_json::to_string_pretty(checkpoint)
+            .map_err(|e| DbError::Checkpoint(format!("checkpoint serialization failed: {e}")))?;
 
         std::fs::write(&filepath, json).map_err(|e| {
             DbError::Checkpoint(format!("cannot write {}: {e}", filepath.display()))
@@ -140,9 +142,8 @@ impl PipelineCheckpointManager {
 
         // Update latest.txt pointer
         let latest_path = self.checkpoint_dir.join("latest.txt");
-        std::fs::write(&latest_path, &filename).map_err(|e| {
-            DbError::Checkpoint(format!("cannot write latest.txt: {e}"))
-        })?;
+        std::fs::write(&latest_path, &filename)
+            .map_err(|e| DbError::Checkpoint(format!("cannot write latest.txt: {e}")))?;
 
         self.prune()?;
 
@@ -162,9 +163,8 @@ impl PipelineCheckpointManager {
             return Ok(None);
         }
 
-        let filename = std::fs::read_to_string(&latest_path).map_err(|e| {
-            DbError::Checkpoint(format!("cannot read latest.txt: {e}"))
-        })?;
+        let filename = std::fs::read_to_string(&latest_path)
+            .map_err(|e| DbError::Checkpoint(format!("cannot read latest.txt: {e}")))?;
         let filename = filename.trim();
         if filename.is_empty() {
             return Ok(None);
@@ -175,13 +175,11 @@ impl PipelineCheckpointManager {
             return Ok(None);
         }
 
-        let json = std::fs::read_to_string(&filepath).map_err(|e| {
-            DbError::Checkpoint(format!("cannot read {}: {e}", filepath.display()))
-        })?;
+        let json = std::fs::read_to_string(&filepath)
+            .map_err(|e| DbError::Checkpoint(format!("cannot read {}: {e}", filepath.display())))?;
 
-        let checkpoint: PipelineCheckpoint = serde_json::from_str(&json).map_err(|e| {
-            DbError::Checkpoint(format!("checkpoint deserialization failed: {e}"))
-        })?;
+        let checkpoint: PipelineCheckpoint = serde_json::from_str(&json)
+            .map_err(|e| DbError::Checkpoint(format!("checkpoint deserialization failed: {e}")))?;
 
         Ok(Some(checkpoint))
     }
@@ -193,22 +191,16 @@ impl PipelineCheckpointManager {
         }
 
         let mut files: Vec<PathBuf> = std::fs::read_dir(&self.checkpoint_dir)
-            .map_err(|e| {
-                DbError::Checkpoint(format!(
-                    "cannot read checkpoint dir: {e}"
-                ))
-            })?
+            .map_err(|e| DbError::Checkpoint(format!("cannot read checkpoint dir: {e}")))?
             .filter_map(std::result::Result::ok)
             .map(|entry| entry.path())
             .filter(|path| {
-                path.file_name()
-                    .and_then(|n| n.to_str())
-                    .is_some_and(|n| {
-                        n.starts_with("checkpoint_")
-                            && Path::new(n)
-                                .extension()
-                                .is_some_and(|ext| ext.eq_ignore_ascii_case("json"))
-                    })
+                path.file_name().and_then(|n| n.to_str()).is_some_and(|n| {
+                    n.starts_with("checkpoint_")
+                        && Path::new(n)
+                            .extension()
+                            .is_some_and(|ext| ext.eq_ignore_ascii_case("json"))
+                })
             })
             .collect();
 
@@ -288,6 +280,7 @@ mod tests {
             )]),
             sink_epochs: HashMap::from([("pg-sink".to_string(), 41)]),
             table_offsets: HashMap::new(),
+            table_store_checkpoint_path: None,
         };
 
         let json = serde_json::to_string(&cp).unwrap();
@@ -309,6 +302,7 @@ mod tests {
             source_offsets: HashMap::new(),
             sink_epochs: HashMap::new(),
             table_offsets: HashMap::new(),
+            table_store_checkpoint_path: None,
         };
 
         let json = serde_json::to_string(&cp).unwrap();
@@ -339,6 +333,7 @@ mod tests {
             )]),
             sink_epochs: HashMap::new(),
             table_offsets: HashMap::new(),
+            table_store_checkpoint_path: None,
         };
 
         let saved_epoch = mgr.save(&cp).unwrap();
@@ -347,12 +342,7 @@ mod tests {
         let loaded = mgr.load_latest().unwrap().unwrap();
         assert_eq!(loaded.epoch, 1);
         assert_eq!(
-            loaded
-                .source_offsets
-                .get("src")
-                .unwrap()
-                .offsets
-                .get("p0"),
+            loaded.source_offsets.get("src").unwrap().offsets.get("p0"),
             Some(&"42".to_string())
         );
     }
@@ -377,6 +367,7 @@ mod tests {
                 source_offsets: HashMap::new(),
                 sink_epochs: HashMap::new(),
                 table_offsets: HashMap::new(),
+                table_store_checkpoint_path: None,
             };
             mgr.save(&cp).unwrap();
         }
@@ -398,6 +389,7 @@ mod tests {
                 source_offsets: HashMap::new(),
                 sink_epochs: HashMap::new(),
                 table_offsets: HashMap::new(),
+                table_store_checkpoint_path: None,
             };
             mgr.save(&cp).unwrap();
         }
@@ -466,6 +458,7 @@ mod tests {
             )]),
             sink_epochs: HashMap::new(),
             table_offsets: HashMap::new(),
+            table_store_checkpoint_path: None,
         })
         .unwrap();
 
@@ -483,18 +476,14 @@ mod tests {
             )]),
             sink_epochs: HashMap::new(),
             table_offsets: HashMap::new(),
+            table_store_checkpoint_path: None,
         })
         .unwrap();
 
         let latest = mgr.load_latest().unwrap().unwrap();
         assert_eq!(latest.epoch, 2);
         assert_eq!(
-            latest
-                .source_offsets
-                .get("src")
-                .unwrap()
-                .offsets
-                .get("p0"),
+            latest.source_offsets.get("src").unwrap().offsets.get("p0"),
             Some(&"99".to_string())
         );
     }
@@ -558,6 +547,7 @@ mod tests {
                     metadata: HashMap::new(),
                 },
             )]),
+            table_store_checkpoint_path: None,
         };
 
         let json = serde_json::to_string(&cp).unwrap();

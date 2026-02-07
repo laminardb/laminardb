@@ -77,6 +77,8 @@ pub(crate) struct TableRegistration {
     pub cache_mode: Option<TableCacheMode>,
     /// Override for maximum LRU cache entries (used with Partial mode).
     pub cache_max_entries: Option<usize>,
+    /// Storage backend: `None` or `"persistent"` for RocksDB-backed tables.
+    pub storage: Option<String>,
 }
 
 /// Build a [`ConnectorConfig`] from a [`SourceRegistration`].
@@ -156,9 +158,10 @@ pub(crate) fn build_sink_config(reg: &SinkRegistration) -> Result<ConnectorConfi
 ///
 /// Same normalization and validation as [`build_source_config`].
 pub(crate) fn build_table_config(reg: &TableRegistration) -> Result<ConnectorConfig, DbError> {
-    let connector_type = reg.connector_type.as_deref().ok_or_else(|| {
-        DbError::Connector(format!("Table '{}' has no connector type", reg.name))
-    })?;
+    let connector_type = reg
+        .connector_type
+        .as_deref()
+        .ok_or_else(|| DbError::Connector(format!("Table '{}' has no connector type", reg.name)))?;
 
     let mut config = ConnectorConfig::new(connector_type.to_lowercase());
     for (k, v) in &reg.connector_options {
@@ -586,6 +589,7 @@ mod tests {
             refresh: None,
             cache_mode: None,
             cache_max_entries: None,
+            storage: None,
         });
         assert_eq!(mgr.table_names().len(), 1);
         assert!(mgr.has_external_connectors());
@@ -604,6 +608,7 @@ mod tests {
             refresh: None,
             cache_mode: None,
             cache_max_entries: None,
+            storage: None,
         });
         assert!(mgr.unregister_table("t"));
         assert!(!mgr.unregister_table("t"));
@@ -623,6 +628,7 @@ mod tests {
             refresh: None,
             cache_mode: None,
             cache_max_entries: None,
+            storage: None,
         });
         assert_eq!(mgr.registration_count(), 1);
         mgr.clear();
@@ -772,6 +778,7 @@ mod tests {
             refresh: None,
             cache_mode: None,
             cache_max_entries: None,
+            storage: None,
         };
         let config = build_table_config(&reg).unwrap();
         assert_eq!(config.connector_type(), "kafka");
@@ -791,6 +798,7 @@ mod tests {
             refresh: None,
             cache_mode: None,
             cache_max_entries: None,
+            storage: None,
         };
         let err = build_table_config(&reg).unwrap_err();
         assert!(err.to_string().contains("no connector type"));
@@ -802,18 +810,34 @@ mod tests {
     fn test_parse_refresh_mode_variants() {
         use std::time::Duration;
 
-        assert_eq!(parse_refresh_mode("snapshot_only").unwrap(), RefreshMode::SnapshotOnly);
-        assert_eq!(parse_refresh_mode("snapshot").unwrap(), RefreshMode::SnapshotOnly);
-        assert_eq!(parse_refresh_mode("cdc").unwrap(), RefreshMode::SnapshotPlusCdc);
-        assert_eq!(parse_refresh_mode("snapshot_plus_cdc").unwrap(), RefreshMode::SnapshotPlusCdc);
+        assert_eq!(
+            parse_refresh_mode("snapshot_only").unwrap(),
+            RefreshMode::SnapshotOnly
+        );
+        assert_eq!(
+            parse_refresh_mode("snapshot").unwrap(),
+            RefreshMode::SnapshotOnly
+        );
+        assert_eq!(
+            parse_refresh_mode("cdc").unwrap(),
+            RefreshMode::SnapshotPlusCdc
+        );
+        assert_eq!(
+            parse_refresh_mode("snapshot_plus_cdc").unwrap(),
+            RefreshMode::SnapshotPlusCdc
+        );
         assert_eq!(parse_refresh_mode("manual").unwrap(), RefreshMode::Manual);
         assert_eq!(
             parse_refresh_mode("periodic:60").unwrap(),
-            RefreshMode::Periodic { interval: Duration::from_secs(60) }
+            RefreshMode::Periodic {
+                interval: Duration::from_secs(60)
+            }
         );
         assert_eq!(
             parse_refresh_mode("PERIODIC:30").unwrap(),
-            RefreshMode::Periodic { interval: Duration::from_secs(30) }
+            RefreshMode::Periodic {
+                interval: Duration::from_secs(30)
+            }
         );
     }
 

@@ -6,7 +6,11 @@
 //! Tables can operate in different cache modes:
 //! - **Full**: all rows in memory (default, unchanged behavior)
 //! - **Partial**: LRU cache of hot keys with xor filter for negative lookups
-//! - **None**: no caching, direct `HashMap` access (same as Full internally)
+//! - **None**: no caching, direct backend access (same as Full for in-memory)
+//!
+//! Backend storage can be:
+//! - **`InMemory`**: rows stored in a `HashMap` (default)
+//! - **Persistent**: rows stored in `RocksDB` (feature-gated, `#[cfg(feature = "rocksdb")]`)
 
 use std::collections::HashMap;
 
@@ -14,10 +18,11 @@ use arrow::array::{Array, RecordBatch, StringArray};
 use arrow::datatypes::SchemaRef;
 
 use laminar_core::operator::table_cache::{
-    TableCacheMetrics, TableLruCache, TableXorFilter, collect_cache_metrics,
+    collect_cache_metrics, TableCacheMetrics, TableLruCache, TableXorFilter,
 };
 
 use crate::error::DbError;
+use crate::table_backend::TableBackend;
 use crate::table_cache_mode::TableCacheMode;
 
 /// Internal state for a single reference table.
@@ -29,8 +34,10 @@ struct TableState {
     primary_key: String,
     /// Index of the primary key column in the schema.
     pk_index: usize,
-    /// Rows keyed by primary key value (stringified).
-    rows: HashMap<String, RecordBatch>,
+    /// Backend storage for row data.
+    backend: TableBackend,
+    /// Tracked row count (avoids expensive iteration for persistent backends).
+    row_count: usize,
     /// Whether the table has been fully populated (e.g., initial snapshot done).
     ready: bool,
     /// Connector type backing this table, if any.
@@ -49,6 +56,16 @@ struct TableState {
 /// Each table has a designated primary key column used to key individual rows.
 pub(crate) struct TableStore {
     tables: HashMap<String, TableState>,
+    /// Shared `RocksDB` instance for persistent tables.
+    #[cfg(feature = "rocksdb")]
+    db: Option<std::sync::Arc<parking_lot::Mutex<rocksdb::DB>>>,
+    /// Path to the `RocksDB` directory.
+    #[cfg(feature = "rocksdb")]
+    #[allow(dead_code)]
+    db_path: Option<std::path::PathBuf>,
+    /// Row count threshold for auto-spill from in-memory to `RocksDB`.
+    #[cfg(feature = "rocksdb")]
+    spill_threshold: usize,
 }
 
 impl TableStore {
@@ -56,7 +73,41 @@ impl TableStore {
     pub fn new() -> Self {
         Self {
             tables: HashMap::new(),
+            #[cfg(feature = "rocksdb")]
+            db: None,
+            #[cfg(feature = "rocksdb")]
+            db_path: None,
+            #[cfg(feature = "rocksdb")]
+            spill_threshold: 1_000_000,
         }
+    }
+
+    /// Create a table store with `RocksDB` backing.
+    #[cfg(feature = "rocksdb")]
+    #[allow(dead_code)]
+    pub fn new_with_rocksdb(
+        path: impl Into<std::path::PathBuf>,
+        spill_threshold: usize,
+    ) -> Result<Self, DbError> {
+        let path = path.into();
+
+        // List existing CFs from the path if the DB already exists
+        let cf_names = if path.exists() {
+            rocksdb::DB::list_cf(&crate::table_backend::table_store_rocksdb_options(), &path)
+                .unwrap_or_default()
+        } else {
+            vec![]
+        };
+        let cf_refs: Vec<&str> = cf_names.iter().map(String::as_str).collect();
+
+        let db = crate::table_backend::open_rocksdb_for_tables(&path, &cf_refs)?;
+
+        Ok(Self {
+            tables: HashMap::new(),
+            db: Some(std::sync::Arc::new(parking_lot::Mutex::new(db))),
+            db_path: Some(path),
+            spill_threshold,
+        })
     }
 
     /// Register a new table with the given schema and primary key column.
@@ -92,11 +143,11 @@ impl TableStore {
         if self.tables.contains_key(name) {
             return Err(DbError::TableAlreadyExists(name.to_string()));
         }
-        let pk_index = schema
-            .index_of(primary_key)
-            .map_err(|_| DbError::InvalidOperation(format!(
+        let pk_index = schema.index_of(primary_key).map_err(|_| {
+            DbError::InvalidOperation(format!(
                 "Primary key column '{primary_key}' not found in table '{name}'"
-            )))?;
+            ))
+        })?;
 
         let lru_cache = match &cache_mode {
             TableCacheMode::Partial { max_entries } => Some(TableLruCache::new(*max_entries)),
@@ -109,7 +160,74 @@ impl TableStore {
                 schema,
                 primary_key: primary_key.to_string(),
                 pk_index,
-                rows: HashMap::new(),
+                backend: TableBackend::in_memory(),
+                row_count: 0,
+                ready: false,
+                connector: None,
+                cache_mode,
+                lru_cache,
+                xor_filter: TableXorFilter::new(),
+            },
+        );
+        Ok(())
+    }
+
+    /// Register a new persistent table backed by `RocksDB`.
+    ///
+    /// Creates a column family for the table and uses the persistent backend.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error if the `rocksdb` feature is not enabled, the primary
+    /// key column is missing, or the table name is duplicated.
+    #[cfg(feature = "rocksdb")]
+    pub fn create_table_persistent(
+        &mut self,
+        name: &str,
+        schema: SchemaRef,
+        primary_key: &str,
+        cache_mode: TableCacheMode,
+    ) -> Result<(), DbError> {
+        if self.tables.contains_key(name) {
+            return Err(DbError::TableAlreadyExists(name.to_string()));
+        }
+        let pk_index = schema.index_of(primary_key).map_err(|_| {
+            DbError::InvalidOperation(format!(
+                "Primary key column '{primary_key}' not found in table '{name}'"
+            ))
+        })?;
+
+        let db_mtx = self.db.as_ref().ok_or_else(|| {
+            DbError::Storage("RocksDB not initialized — call new_with_rocksdb()".to_string())
+        })?;
+
+        // Create a column family for this table (if not already existing)
+        let cf_name = format!("table_{name}");
+        {
+            let mut db = db_mtx.lock();
+            if db.cf_handle(&cf_name).is_none() {
+                let opts = rocksdb::Options::default();
+                db.create_cf(&cf_name, &opts)
+                    .map_err(|e| DbError::Storage(format!("create CF '{cf_name}': {e}")))?;
+            }
+        }
+
+        let lru_cache = match &cache_mode {
+            TableCacheMode::Partial { max_entries } => Some(TableLruCache::new(*max_entries)),
+            _ => None,
+        };
+
+        let backend = TableBackend::persistent(db_mtx.clone(), cf_name, schema.clone());
+        let row_count = backend.len()?;
+
+        self.tables.insert(
+            name.to_string(),
+            TableState {
+                schema,
+                primary_key: primary_key.to_string(),
+                pk_index,
+                backend,
+                row_count,
                 ready: false,
                 connector: None,
                 cache_mode,
@@ -122,7 +240,20 @@ impl TableStore {
 
     /// Remove a table. Returns `true` if it existed.
     pub fn drop_table(&mut self, name: &str) -> bool {
-        self.tables.remove(name).is_some()
+        if let Some(state) = self.tables.remove(name) {
+            // If persistent, drop the column family
+            #[cfg(feature = "rocksdb")]
+            if state.backend.is_persistent() {
+                if let Some(ref db_mtx) = self.db {
+                    let cf_name = format!("table_{name}");
+                    let _ = db_mtx.lock().drop_cf(&cf_name);
+                }
+            }
+            let _ = state; // consumed
+            true
+        } else {
+            false
+        }
     }
 
     /// Check if a table exists.
@@ -147,7 +278,7 @@ impl TableStore {
 
     /// Get the row count for a table.
     pub fn table_row_count(&self, name: &str) -> usize {
-        self.tables.get(name).map_or(0, |t| t.rows.len())
+        self.tables.get(name).map_or(0, |t| t.row_count)
     }
 
     /// Check if a table is ready (fully populated).
@@ -173,9 +304,15 @@ impl TableStore {
 
     /// Get the connector type for a table.
     pub fn connector(&self, name: &str) -> Option<&str> {
+        self.tables.get(name).and_then(|t| t.connector.as_deref())
+    }
+
+    /// Whether a table uses persistent storage.
+    #[allow(dead_code)]
+    pub fn is_persistent(&self, name: &str) -> bool {
         self.tables
             .get(name)
-            .and_then(|t| t.connector.as_deref())
+            .is_some_and(|t| t.backend.is_persistent())
     }
 
     /// Upsert rows from a `RecordBatch` into a table.
@@ -205,7 +342,10 @@ impl TableStore {
                 lru.invalidate(&key);
             }
             let row = batch.slice(i, 1);
-            state.rows.insert(key, row);
+            let existed = state.backend.put(&key, row)?;
+            if !existed {
+                state.row_count += 1;
+            }
         }
 
         Ok(count)
@@ -219,7 +359,13 @@ impl TableStore {
             if let Some(ref mut lru) = state.lru_cache {
                 lru.invalidate(key);
             }
-            state.rows.remove(key).is_some()
+            match state.backend.remove(key) {
+                Ok(true) => {
+                    state.row_count = state.row_count.saturating_sub(1);
+                    true
+                }
+                _ => false,
+            }
         } else {
             false
         }
@@ -227,16 +373,14 @@ impl TableStore {
 
     /// Look up a single row by primary key.
     ///
-    /// In **Full** / **None** mode: direct `HashMap` lookup (unchanged behavior).
-    /// In **Partial** mode: xor filter → LRU cache → backing `HashMap` → populate LRU.
+    /// In **Full** / **None** mode: direct backend lookup (unchanged behavior).
+    /// In **Partial** mode: xor filter -> LRU cache -> backend -> populate LRU.
     #[allow(dead_code)]
     pub fn lookup(&mut self, name: &str, key: &str) -> Option<RecordBatch> {
         let state = self.tables.get_mut(name)?;
 
         match state.cache_mode {
-            TableCacheMode::Full | TableCacheMode::None => {
-                state.rows.get(key).cloned()
-            }
+            TableCacheMode::Full | TableCacheMode::None => state.backend.get(key).ok().flatten(),
             TableCacheMode::Partial { .. } => {
                 // Step 1: Xor filter check — if definitely absent, short-circuit
                 if !state.xor_filter.contains(key) {
@@ -250,8 +394,8 @@ impl TableStore {
                     }
                 }
 
-                // Step 3: Backing store lookup → populate LRU on hit
-                let batch = state.rows.get(key).cloned()?;
+                // Step 3: Backing store lookup -> populate LRU on hit
+                let batch = state.backend.get(key).ok().flatten()?;
                 if let Some(lru) = &mut state.lru_cache {
                     lru.insert(key.to_string(), batch.clone());
                 }
@@ -264,7 +408,7 @@ impl TableStore {
     #[allow(dead_code)]
     pub fn rebuild_xor_filter(&mut self, name: &str) {
         if let Some(state) = self.tables.get_mut(name) {
-            let keys: Vec<String> = state.rows.keys().cloned().collect();
+            let keys = state.backend.keys().unwrap_or_default();
             state.xor_filter.rebuild(&keys);
         }
     }
@@ -285,11 +429,73 @@ impl TableStore {
     /// (with correct schema) if the table has no rows.
     pub fn to_record_batch(&self, name: &str) -> Option<RecordBatch> {
         let state = self.tables.get(name)?;
-        if state.rows.is_empty() {
-            return Some(RecordBatch::new_empty(state.schema.clone()));
+        state.backend.to_record_batch(&state.schema).ok().flatten()
+    }
+
+    /// Migrate an in-memory table to `RocksDB` if row count exceeds threshold.
+    ///
+    /// No-op if the table is already persistent, the `rocksdb` feature is
+    /// disabled, or the database is not initialized.
+    #[cfg(feature = "rocksdb")]
+    #[allow(dead_code)]
+    pub fn maybe_spill_to_rocksdb(&mut self, name: &str) -> Result<bool, DbError> {
+        let db_mtx = match self.db.as_ref() {
+            Some(db) => db.clone(),
+            None => return Ok(false),
+        };
+
+        let Some(state) = self.tables.get_mut(name) else {
+            return Err(DbError::TableNotFound(name.to_string()));
+        };
+
+        if state.backend.is_persistent() {
+            return Ok(false);
         }
-        let batches: Vec<&RecordBatch> = state.rows.values().collect();
-        arrow::compute::concat_batches(&state.schema, batches.iter().copied()).ok()
+
+        if state.row_count <= self.spill_threshold {
+            return Ok(false);
+        }
+
+        // Create CF
+        let cf_name = format!("table_{name}");
+        {
+            let mut db = db_mtx.lock();
+            if db.cf_handle(&cf_name).is_none() {
+                let opts = rocksdb::Options::default();
+                db.create_cf(&cf_name, &opts)
+                    .map_err(|e| DbError::Storage(format!("create CF '{cf_name}': {e}")))?;
+            }
+        }
+
+        // Drain in-memory rows and write to RocksDB
+        let rows = state.backend.drain()?;
+        let mut new_backend = TableBackend::persistent(db_mtx, cf_name, state.schema.clone());
+        for (key, batch) in rows {
+            new_backend.put(&key, batch)?;
+        }
+        state.backend = new_backend;
+
+        Ok(true)
+    }
+
+    /// Create a `RocksDB` checkpoint of the persistent table data.
+    ///
+    /// Wraps `rocksdb::checkpoint::Checkpoint::create_checkpoint()`.
+    #[cfg(feature = "rocksdb")]
+    #[allow(dead_code)]
+    pub fn checkpoint_rocksdb(&self, dir: &std::path::Path) -> Result<(), DbError> {
+        let db_mtx = self
+            .db
+            .as_ref()
+            .ok_or_else(|| DbError::Storage("RocksDB not initialized".to_string()))?;
+        let db = db_mtx.lock();
+
+        let checkpoint = rocksdb::checkpoint::Checkpoint::new(&db)
+            .map_err(|e| DbError::Storage(format!("RocksDB checkpoint init: {e}")))?;
+        checkpoint
+            .create_checkpoint(dir)
+            .map_err(|e| DbError::Storage(format!("RocksDB checkpoint: {e}")))?;
+        Ok(())
     }
 }
 
@@ -377,7 +583,11 @@ mod tests {
 
         let row = store.lookup("t", "1").unwrap();
         assert_eq!(row.num_rows(), 1);
-        let names = row.column(1).as_any().downcast_ref::<StringArray>().unwrap();
+        let names = row
+            .column(1)
+            .as_any()
+            .downcast_ref::<StringArray>()
+            .unwrap();
         assert_eq!(names.value(0), "Widget");
     }
 
@@ -405,7 +615,11 @@ mod tests {
 
         assert_eq!(store.table_row_count("t"), 1);
         let row = store.lookup("t", "1").unwrap();
-        let names = row.column(1).as_any().downcast_ref::<StringArray>().unwrap();
+        let names = row
+            .column(1)
+            .as_any()
+            .downcast_ref::<StringArray>()
+            .unwrap();
         assert_eq!(names.value(0), "New");
     }
 
@@ -505,6 +719,13 @@ mod tests {
         assert_eq!(store.connector("t"), Some("kafka"));
     }
 
+    #[test]
+    fn test_is_persistent_default_false() {
+        let mut store = TableStore::new();
+        store.create_table("t", test_schema(), "id").unwrap();
+        assert!(!store.is_persistent("t"));
+    }
+
     // ── Partial cache mode tests ──
 
     #[test]
@@ -523,7 +744,7 @@ mod tests {
         store.upsert("t", &batch).unwrap();
         store.rebuild_xor_filter("t");
 
-        // First lookup: cache miss → backing store hit → populates LRU
+        // First lookup: cache miss -> backing store hit -> populates LRU
         let row = store.lookup("t", "1").unwrap();
         assert_eq!(row.num_rows(), 1);
 
@@ -614,7 +835,11 @@ mod tests {
 
         // Lookup should return the new value
         let row = store.lookup("t", "1").unwrap();
-        let names = row.column(1).as_any().downcast_ref::<StringArray>().unwrap();
+        let names = row
+            .column(1)
+            .as_any()
+            .downcast_ref::<StringArray>()
+            .unwrap();
         assert_eq!(names.value(0), "New");
     }
 
@@ -717,5 +942,194 @@ mod tests {
         // (filter is permissive when not built)
         let row = store.lookup("t", "1").unwrap();
         assert_eq!(row.num_rows(), 1);
+    }
+
+    // ── Row count tracking tests ──
+
+    #[test]
+    fn test_row_count_tracks_upserts_and_deletes() {
+        let mut store = TableStore::new();
+        store.create_table("t", test_schema(), "id").unwrap();
+        assert_eq!(store.table_row_count("t"), 0);
+
+        store
+            .upsert("t", &make_batch(&[1, 2], &["A", "B"], &[1.0, 2.0]))
+            .unwrap();
+        assert_eq!(store.table_row_count("t"), 2);
+
+        // Upsert existing key — count should not increase
+        store
+            .upsert("t", &make_batch(&[1], &["X"], &[9.0]))
+            .unwrap();
+        assert_eq!(store.table_row_count("t"), 2);
+
+        // Delete
+        assert!(store.delete("t", "1"));
+        assert_eq!(store.table_row_count("t"), 1);
+
+        // Delete non-existent — count unchanged
+        assert!(!store.delete("t", "999"));
+        assert_eq!(store.table_row_count("t"), 1);
+    }
+
+    // ── RocksDB-backed persistent table tests ──
+
+    #[cfg(feature = "rocksdb")]
+    mod rocksdb_tests {
+        use super::*;
+
+        #[test]
+        fn test_persistent_table_create_and_crud() {
+            let dir = tempfile::tempdir().unwrap();
+            let mut store = TableStore::new_with_rocksdb(dir.path(), 1_000_000).unwrap();
+
+            store
+                .create_table_persistent("t", test_schema(), "id", TableCacheMode::Full)
+                .unwrap();
+
+            assert!(store.is_persistent("t"));
+            assert_eq!(store.table_row_count("t"), 0);
+
+            // Upsert
+            store
+                .upsert("t", &make_batch(&[1, 2], &["A", "B"], &[1.0, 2.0]))
+                .unwrap();
+            assert_eq!(store.table_row_count("t"), 2);
+
+            // Lookup
+            let row = store.lookup("t", "1").unwrap();
+            let names = row
+                .column(1)
+                .as_any()
+                .downcast_ref::<StringArray>()
+                .unwrap();
+            assert_eq!(names.value(0), "A");
+
+            // Delete
+            assert!(store.delete("t", "1"));
+            assert_eq!(store.table_row_count("t"), 1);
+            assert!(store.lookup("t", "1").is_none());
+        }
+
+        #[test]
+        fn test_auto_spill_to_rocksdb() {
+            let dir = tempfile::tempdir().unwrap();
+            // Very low threshold to trigger spill
+            let mut store = TableStore::new_with_rocksdb(dir.path(), 2).unwrap();
+
+            store.create_table("t", test_schema(), "id").unwrap();
+            assert!(!store.is_persistent("t"));
+
+            // Insert rows below threshold
+            store
+                .upsert("t", &make_batch(&[1, 2], &["A", "B"], &[1.0, 2.0]))
+                .unwrap();
+            let spilled = store.maybe_spill_to_rocksdb("t").unwrap();
+            assert!(!spilled);
+            assert!(!store.is_persistent("t"));
+
+            // Insert one more to exceed threshold
+            store
+                .upsert("t", &make_batch(&[3], &["C"], &[3.0]))
+                .unwrap();
+            let spilled = store.maybe_spill_to_rocksdb("t").unwrap();
+            assert!(spilled);
+            assert!(store.is_persistent("t"));
+
+            // Data should survive the spill
+            assert_eq!(store.table_row_count("t"), 3);
+            let row = store.lookup("t", "2").unwrap();
+            let names = row
+                .column(1)
+                .as_any()
+                .downcast_ref::<StringArray>()
+                .unwrap();
+            assert_eq!(names.value(0), "B");
+        }
+
+        #[test]
+        fn test_drop_persistent_table_cleans_cf() {
+            let dir = tempfile::tempdir().unwrap();
+            let mut store = TableStore::new_with_rocksdb(dir.path(), 1_000_000).unwrap();
+
+            store
+                .create_table_persistent("t", test_schema(), "id", TableCacheMode::Full)
+                .unwrap();
+            store
+                .upsert("t", &make_batch(&[1], &["A"], &[1.0]))
+                .unwrap();
+
+            assert!(store.drop_table("t"));
+            assert!(!store.has_table("t"));
+        }
+
+        #[test]
+        fn test_checkpoint_rocksdb() {
+            let dir = tempfile::tempdir().unwrap();
+            let mut store = TableStore::new_with_rocksdb(dir.path().join("db"), 1_000_000).unwrap();
+
+            store
+                .create_table_persistent("t", test_schema(), "id", TableCacheMode::Full)
+                .unwrap();
+            store
+                .upsert("t", &make_batch(&[1], &["A"], &[1.0]))
+                .unwrap();
+
+            let cp_dir = dir.path().join("checkpoint");
+            store.checkpoint_rocksdb(&cp_dir).unwrap();
+            assert!(cp_dir.exists());
+        }
+
+        #[test]
+        fn test_mixed_backends() {
+            let dir = tempfile::tempdir().unwrap();
+            let mut store = TableStore::new_with_rocksdb(dir.path(), 1_000_000).unwrap();
+
+            // One in-memory, one persistent
+            store.create_table("mem_t", test_schema(), "id").unwrap();
+            store
+                .create_table_persistent("disk_t", test_schema(), "id", TableCacheMode::Full)
+                .unwrap();
+
+            assert!(!store.is_persistent("mem_t"));
+            assert!(store.is_persistent("disk_t"));
+
+            // Both work independently
+            store
+                .upsert("mem_t", &make_batch(&[1], &["A"], &[1.0]))
+                .unwrap();
+            store
+                .upsert("disk_t", &make_batch(&[2], &["B"], &[2.0]))
+                .unwrap();
+
+            assert_eq!(store.table_row_count("mem_t"), 1);
+            assert_eq!(store.table_row_count("disk_t"), 1);
+
+            let row = store.lookup("mem_t", "1").unwrap();
+            assert_eq!(row.num_rows(), 1);
+            let row = store.lookup("disk_t", "2").unwrap();
+            assert_eq!(row.num_rows(), 1);
+        }
+
+        #[test]
+        fn test_persistent_to_record_batch() {
+            let dir = tempfile::tempdir().unwrap();
+            let mut store = TableStore::new_with_rocksdb(dir.path(), 1_000_000).unwrap();
+
+            store
+                .create_table_persistent("t", test_schema(), "id", TableCacheMode::Full)
+                .unwrap();
+
+            // Empty
+            let batch = store.to_record_batch("t").unwrap();
+            assert_eq!(batch.num_rows(), 0);
+
+            // With data
+            store
+                .upsert("t", &make_batch(&[1, 2], &["A", "B"], &[1.0, 2.0]))
+                .unwrap();
+            let batch = store.to_record_batch("t").unwrap();
+            assert_eq!(batch.num_rows(), 2);
+        }
     }
 }
