@@ -108,6 +108,51 @@ pub enum SerdeError {
     /// The input data is malformed.
     #[error("malformed input: {0}")]
     MalformedInput(String),
+
+    /// Schema ID not found in registry.
+    #[error("schema not found: schema ID {schema_id}")]
+    SchemaNotFound {
+        /// The schema ID that was not found.
+        schema_id: i32,
+    },
+
+    /// Confluent wire format magic byte mismatch.
+    #[error("invalid Confluent header: expected 0x{expected:02x}, got 0x{got:02x}")]
+    InvalidConfluentHeader {
+        /// Expected magic byte (0x00).
+        expected: u8,
+        /// Actual byte found.
+        got: u8,
+    },
+
+    /// Schema incompatible with existing version in the registry.
+    #[error("schema incompatible: subject '{subject}': {message}")]
+    SchemaIncompatible {
+        /// The Schema Registry subject name.
+        subject: String,
+        /// Incompatibility details.
+        message: String,
+    },
+
+    /// Avro decode failure for a specific column.
+    #[error("Avro decode error: column '{column}' (avro type '{avro_type}'): {message}")]
+    AvroDecodeError {
+        /// The column that failed to decode.
+        column: String,
+        /// The Avro type being decoded.
+        avro_type: String,
+        /// The decode failure details.
+        message: String,
+    },
+
+    /// Record count mismatch after serialization.
+    #[error("record count mismatch: expected {expected}, got {got}")]
+    RecordCountMismatch {
+        /// Expected number of records.
+        expected: usize,
+        /// Actual number of records produced.
+        got: usize,
+    },
 }
 
 impl From<serde_json::Error> for SerdeError {
@@ -149,5 +194,58 @@ mod tests {
         };
         assert!(err.to_string().contains("Running"));
         assert!(err.to_string().contains("Closed"));
+    }
+
+    #[test]
+    fn test_schema_not_found_error() {
+        let err = SerdeError::SchemaNotFound { schema_id: 42 };
+        assert!(err.to_string().contains("42"));
+        assert!(err.to_string().contains("schema not found"));
+    }
+
+    #[test]
+    fn test_invalid_confluent_header_error() {
+        let err = SerdeError::InvalidConfluentHeader {
+            expected: 0x00,
+            got: 0xFF,
+        };
+        let msg = err.to_string();
+        assert!(msg.contains("0x00"));
+        assert!(msg.contains("0xff"));
+    }
+
+    #[test]
+    fn test_schema_incompatible_error() {
+        let err = SerdeError::SchemaIncompatible {
+            subject: "orders-value".into(),
+            message: "READER_FIELD_MISSING_DEFAULT_VALUE".into(),
+        };
+        let msg = err.to_string();
+        assert!(msg.contains("orders-value"));
+        assert!(msg.contains("READER_FIELD_MISSING_DEFAULT_VALUE"));
+    }
+
+    #[test]
+    fn test_avro_decode_error() {
+        let err = SerdeError::AvroDecodeError {
+            column: "price".into(),
+            avro_type: "double".into(),
+            message: "unexpected null".into(),
+        };
+        let msg = err.to_string();
+        assert!(msg.contains("price"));
+        assert!(msg.contains("double"));
+        assert!(msg.contains("unexpected null"));
+    }
+
+    #[test]
+    fn test_record_count_mismatch_error() {
+        let err = SerdeError::RecordCountMismatch {
+            expected: 5,
+            got: 3,
+        };
+        let msg = err.to_string();
+        assert!(msg.contains('5'));
+        assert!(msg.contains('3'));
     }
 }

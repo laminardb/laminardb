@@ -167,6 +167,7 @@ pub mod partitioned_topk;
 pub mod session_window;
 pub mod sliding_window;
 pub mod stream_join;
+pub mod table_cache;
 pub mod temporal_join;
 pub mod topk;
 pub mod watermark_sort;

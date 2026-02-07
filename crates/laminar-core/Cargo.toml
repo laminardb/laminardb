@@ -23,6 +23,7 @@ xdp = ["dep:libbpf-rs"]
 [dependencies]
 # Performance critical - no allocations on hot path
 fxhash = { workspace = true }
+xorf = { workspace = true }
 crossbeam = { workspace = true }
 parking_lot = { workspace = true }
 bytes = { workspace = true }

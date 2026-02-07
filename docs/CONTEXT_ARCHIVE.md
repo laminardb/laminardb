@@ -343,7 +343,104 @@ handle.credit_metrics();
 
 ---
 
-## Session History
+## Phase 3 Session History
+
+### Session - 2026-02-07 (F-CONN-003 Avro Hardening)
+
+- **F-CONN-003: Avro Serialization Hardening** - COMPLETE (~40 new tests)
+  - Bug fix: `Fingerprint::load_fingerprint_id()` byte-swaps via `u32::from_be()` — replaced with `Fingerprint::Id(n)`
+  - 5 new `SerdeError` variants: `SchemaNotFound`, `InvalidConfluentHeader`, `SchemaIncompatible`, `AvroDecodeError`, `RecordCountMismatch`
+  - Complex Avro types in `parse_avro_type()` / `arrow_to_avro_type()`: arrays, maps, nested records, enums, fixed
+  - LRU cache with TTL: `SchemaRegistryCacheConfig`, `cache_insert()`/`cache_get()`/`cache_evict_expired()`
+  - `validate_and_register_schema()` compatibility enforcement
+  - 7 round-trip integration tests in `kafka/mod.rs`
+  - Files: `error.rs`, `kafka/avro.rs`, `kafka/avro_serializer.rs`, `kafka/schema_registry.rs`, `kafka/mod.rs`
+
+### Session - 2026-02-06 (F-CONN-002 Reference Tables)
+
+- **F-CONN-002: Reference Table Support** - COMPLETE (21 new tests, 152 total laminar-db)
+  - `table_store.rs`: TableState/TableStore with PK upsert/delete/lookup
+  - `ConnectorManager`: TableRegistration, register_table/unregister_table
+  - `SHOW TABLES` DDL, `handle_create_table()` PK extraction, `handle_drop_table()` IF EXISTS
+  - `handle_insert_into()` upserts via TableStore + DataFusion MemTable sync
+
+### Session - 2026-02-06 (F-CONN-001 Checkpoint Recovery)
+
+- **F-CONN-001: Checkpoint Recovery Wiring** - COMPLETE (12 new tests)
+  - `pipeline_checkpoint.rs`: PipelineCheckpoint/PipelineCheckpointManager with JSON persistence
+  - Wired into `start_connector_pipeline()`: recovery, periodic checkpoint, final checkpoint
+
+### Session - 2026-02-06 (FFI, SQL Extensions, MySQL I/O)
+
+- **F028A: MySQL CDC Binlog I/O** - COMPLETE (21 new tests)
+  - `cdc/mysql/mysql_io.rs`: connect(), start_binlog_stream(), read_events(), decode_binlog_event()
+- **F-FFI-004: Async FFI Callbacks** - COMPLETE (9 new tests)
+  - `ffi/callback.rs`: LaminarSubscriptionCallback/Handle, laminar_subscribe_callback()
+- **F-SQL-002: LAG/LEAD Window Functions** - COMPLETE (31 new tests)
+  - `parser/analytic_parser.rs`, `translator/analytic_translator.rs`, `operator/lag_lead.rs`
+- **F-SQL-003: ROW_NUMBER/RANK/DENSE_RANK** - COMPLETE (10 new tests)
+  - `parser/order_analyzer.rs`: RankType enum, fixed subquery detection bug
+
+### Session - 2026-02-06 (FFI Stack)
+
+- **F-FFI-003: Arrow C Data Interface** - COMPLETE (5 new tests)
+  - `ffi/arrow_ffi.rs`: laminar_batch_export/import, zero-copy via FFI_ArrowArray/FFI_ArrowSchema
+- **F-FFI-002: C Header Generation** - COMPLETE (21 new tests)
+  - `ffi/` module: error.rs, connection.rs, schema.rs, writer.rs, query.rs, memory.rs
+- **F-FFI-001: FFI API Module** - COMPLETE (14 new tests)
+  - `api/` module: error.rs, connection.rs, query.rs, ingestion.rs, subscription.rs
+
+### Session - 2026-02-05 (Delta Lake I/O, Kafka Gaps)
+
+- **F031A: Delta Lake I/O Integration** - COMPLETE (13 integration tests)
+  - `lakehouse/delta_io.rs`: open_or_create_table(), write_batches(), get_last_committed_epoch()
+- **F025/F026 Kafka Enhancement** - COMPLETE (140 tests)
+  - SecurityProtocol, SaslMechanism, IsolationLevel, TopicSubscription, fetch tuning
+
+### Session - 2026-02-03 (Broadcast, SDK, Iceberg, MySQL CDC)
+
+- **F-STREAM-010: Broadcast Channel** - COMPLETE (42 tests)
+- **F034: Connector SDK** - COMPLETE (68 tests): retry, rate limiting, circuit breaker, test harness, builders, schema discovery
+- **F032: Iceberg Sink** - COMPLETE (103 tests): REST/Glue/Hive catalogs, partition transforms, equality deletes
+- **F028: MySQL CDC Source** - COMPLETE (119 tests): binlog decoder, GTID, Z-set changelog
+
+### Session - 2026-02-02 (Cloud Storage, Delta Lake)
+
+- **F-CLOUD-001/002/003: Cloud Storage Infrastructure** - ALL COMPLETE (82 tests)
+  - StorageProvider, StorageCredentialResolver, CloudConfigValidator, SecretMasker
+- **F031: Delta Lake Sink** - COMPLETE (73 tests): buffering, epoch management, changelog splitting
+- Delta Lake deferred work specs: F031A/B/C/D
+
+### Session - 2026-02-01 (Reactive Subscriptions)
+
+- **F-SUB-001 to F-SUB-008** - ALL COMPLETE (8 features)
+  - 10 new modules: event, notification, registry, dispatcher, handle, callback, stream, backpressure, batcher, filter
+
+### Session - 2026-01-31 (DAG, PostgreSQL, Performance)
+
+- **Event.data → Arc<RecordBatch>** for zero-copy multicast
+- **F-DAG-007: Performance Validation** - COMPLETE (16 benchmarks, 325ns 3-node latency, 2.24M events/sec)
+- **F-DAG-006: Connector Bridge** - COMPLETE (25 tests)
+- **F-DAG-005: SQL & MV Integration** - COMPLETE (18 tests)
+- **F027B: PostgreSQL Sink** - COMPLETE (84 tests): COPY BINARY + upsert + exactly-once
+- **F027: PostgreSQL CDC Source** - COMPLETE (107 tests): pgoutput decoder, Z-set changelog
+
+### Session - 2026-01-30 (DAG Pipeline, Kafka)
+
+- **F-DAG-001 to F-DAG-004** - ALL COMPLETE: topology, multicast/routing, executor, checkpointing
+- **F025: Kafka Source** - COMPLETE (67 tests)
+- **F026: Kafka Sink** - COMPLETE (51 tests)
+
+### Session - 2026-01-28 (Streaming API, Aggregation)
+
+- Developer API Overhaul: 3 new crates, SQL parser extensions, 5 examples
+- **F-STREAM-001 to F-STREAM-007** - ALL COMPLETE (99 tests)
+- Performance Audit: ALL 10 issues fixed
+- **F074-F077: Aggregation Semantics** - COMPLETE (219 tests)
+
+---
+
+## Phase 2 Session History
 
 ### Session - 2026-01-24 (F013 Thread-Per-Core)
 

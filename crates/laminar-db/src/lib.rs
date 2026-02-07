@@ -24,6 +24,7 @@
 #![warn(clippy::all, clippy::pedantic)]
 #![allow(clippy::module_name_repetitions)]
 
+mod asof_batch;
 mod builder;
 mod catalog;
 mod config;
@@ -31,8 +32,13 @@ mod connector_manager;
 mod db;
 mod error;
 mod handle;
+mod pipeline_checkpoint;
 mod sql_utils;
 mod stream_executor;
+mod table_backend;
+mod table_cache_mode;
+mod table_provider;
+mod table_store;
 
 /// FFI-friendly API for language bindings.
 ///
@@ -68,6 +74,7 @@ pub use handle::{
     PipelineTopology, QueryHandle, QueryInfo, SinkInfo, SourceHandle, SourceInfo, StreamInfo,
     TypedSubscription, UntypedSourceHandle,
 };
+pub use pipeline_checkpoint::PipelineCheckpoint;
 
 /// Re-export the connector registry for custom connector registration.
 pub use laminar_connectors::registry::ConnectorRegistry;

@@ -20,7 +20,7 @@ LaminarDB's DAG pipeline enables complex streaming topologies with fan-out, fan-
 | Tier | Total | Draft | In Progress | Done |
 |------|-------|-------|-------------|------|
 | Core (P0) | 3 | 0 | 0 | 3 |
-| Integration (P1) | 4 | 1 | 0 | 3 |
+| Integration (P1) | 4 | 0 | 0 | 4 |
 | Validation (P2) | 1 | 0 | 0 | 1 |
 
 ---
@@ -42,7 +42,7 @@ LaminarDB's DAG pipeline enables complex streaming topologies with fan-out, fan-
 | F-DAG-004 | DAG Checkpointing | P1 | ✅ | [Link](F-DAG-004-dag-checkpointing.md) |
 | F-DAG-005 | SQL & MV Integration | P1 | ✅ | [Link](F-DAG-005-sql-mv-integration.md) |
 | F-DAG-006 | Connector Bridge | P1 | ✅ | [Link](F-DAG-006-connector-bridge.md) |
-| F-DAG-008 | Pipeline Introspection | P1 | 📝 | [Link](F-DAG-008-pipeline-introspection.md) |
+| F-DAG-008 | Pipeline Introspection | P1 | ✅ | [Link](F-DAG-008-pipeline-introspection.md) |
 
 ---
 

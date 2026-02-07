@@ -165,6 +165,7 @@ impl StreamingParser {
             StreamingDdlKind::ShowStreams => {
                 Ok(vec![StreamingStatement::Show(ShowCommand::Streams)])
             }
+            StreamingDdlKind::ShowTables => Ok(vec![StreamingStatement::Show(ShowCommand::Tables)]),
             StreamingDdlKind::None => {
                 // Standard SQL - check for INSERT INTO and convert
                 let statements = sqlparser::parser::Parser::parse_sql(&dialect, sql_trimmed)?;

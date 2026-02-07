@@ -1,0 +1,557 @@
+//! Batch-level ASOF join execution on `RecordBatch`es.
+//!
+//! Implements the ASOF join algorithm for batch data, matching each left row
+//! to the closest right row by timestamp within the same key partition.
+
+use std::collections::BTreeMap;
+use std::collections::HashMap;
+use std::sync::Arc;
+
+use arrow::array::{
+    Array, ArrayRef, Float64Array, Int64Array, NullArray, RecordBatch, StringArray,
+    TimestampMillisecondArray,
+};
+use arrow::compute::concat_batches;
+use arrow::datatypes::{DataType, Field, Schema, SchemaRef, TimeUnit};
+
+use laminar_sql::parser::join_parser::AsofSqlDirection;
+use laminar_sql::translator::{AsofJoinTranslatorConfig, AsofSqlJoinType};
+
+use crate::error::DbError;
+
+/// Execute an ASOF join on two sets of `RecordBatch`es.
+///
+/// Matches each left row to the closest right row by timestamp, partitioned
+/// by key column, according to the direction and tolerance in `config`.
+///
+/// # Errors
+///
+/// Returns `DbError::Pipeline` if schemas are invalid or column extraction fails.
+pub(crate) fn execute_asof_join_batch(
+    left_batches: &[RecordBatch],
+    right_batches: &[RecordBatch],
+    config: &AsofJoinTranslatorConfig,
+) -> Result<RecordBatch, DbError> {
+    if left_batches.is_empty() {
+        let schema = if right_batches.is_empty() {
+            Arc::new(Schema::empty())
+        } else {
+            build_output_schema(
+                &Arc::new(Schema::empty()),
+                &right_batches[0].schema(),
+                config,
+            )
+        };
+        return Ok(RecordBatch::new_empty(schema));
+    }
+
+    let left_schema = left_batches[0].schema();
+    let left = concat_batches(&left_schema, left_batches)
+        .map_err(|e| DbError::Pipeline(format!("Failed to concat left batches: {e}")))?;
+
+    let right_schema = if right_batches.is_empty() {
+        // Build a schema with the same structure but no rows
+        Arc::new(Schema::empty())
+    } else {
+        right_batches[0].schema()
+    };
+
+    let right = if right_batches.is_empty() {
+        RecordBatch::new_empty(right_schema.clone())
+    } else {
+        concat_batches(&right_schema, right_batches)
+            .map_err(|e| DbError::Pipeline(format!("Failed to concat right batches: {e}")))?
+    };
+
+    let output_schema = build_output_schema(&left_schema, &right_schema, config);
+
+    // Build right-side index: key -> BTreeMap<timestamp, row_index>
+    let mut right_index: HashMap<String, BTreeMap<i64, usize>> = HashMap::new();
+    if right.num_rows() > 0 {
+        let right_keys = extract_column_as_strings(&right, &config.key_column)?;
+        let right_timestamps = extract_column_as_timestamps(&right, &config.right_time_column)?;
+
+        for (i, (key, ts)) in right_keys.iter().zip(right_timestamps.iter()).enumerate() {
+            right_index.entry(key.clone()).or_default().insert(*ts, i);
+        }
+    }
+
+    // Extract left key and timestamp columns
+    let left_keys = extract_column_as_strings(&left, &config.key_column)?;
+    let left_timestamps = extract_column_as_timestamps(&left, &config.left_time_column)?;
+
+    let tolerance_ms = config
+        .tolerance
+        .map(|d| i64::try_from(d.as_millis()).unwrap_or(i64::MAX));
+
+    // For each left row, find matching right row
+    let mut left_indices: Vec<usize> = Vec::new();
+    let mut right_indices: Vec<Option<usize>> = Vec::new();
+
+    for (left_idx, (key, left_ts)) in left_keys.iter().zip(left_timestamps.iter()).enumerate() {
+        let matched_right = right_index
+            .get(key)
+            .and_then(|btree| find_match(btree, *left_ts, config.direction, tolerance_ms));
+
+        match (&config.join_type, matched_right) {
+            (_, Some(right_idx)) => {
+                left_indices.push(left_idx);
+                right_indices.push(Some(right_idx));
+            }
+            (AsofSqlJoinType::Left, None) => {
+                left_indices.push(left_idx);
+                right_indices.push(None);
+            }
+            (AsofSqlJoinType::Inner, None) => {
+                // Skip unmatched rows for inner join
+            }
+        }
+    }
+
+    // Build output columns
+    build_output_batch(
+        &left,
+        &right,
+        &left_indices,
+        &right_indices,
+        &output_schema,
+        config,
+    )
+}
+
+/// Find the best matching right row given direction and tolerance.
+fn find_match(
+    btree: &BTreeMap<i64, usize>,
+    left_ts: i64,
+    direction: AsofSqlDirection,
+    tolerance_ms: Option<i64>,
+) -> Option<usize> {
+    let candidate = match direction {
+        AsofSqlDirection::Backward => {
+            // Find most recent right row <= left_ts
+            btree
+                .range(..=left_ts)
+                .next_back()
+                .map(|(&ts, &idx)| (ts, idx))
+        }
+        AsofSqlDirection::Forward => {
+            // Find earliest right row >= left_ts
+            btree.range(left_ts..).next().map(|(&ts, &idx)| (ts, idx))
+        }
+    };
+
+    candidate.and_then(|(right_ts, right_idx)| {
+        if let Some(tol) = tolerance_ms {
+            if (left_ts - right_ts).abs() <= tol {
+                Some(right_idx)
+            } else {
+                None
+            }
+        } else {
+            Some(right_idx)
+        }
+    })
+}
+
+/// Extract a column's values as `String`s.
+fn extract_column_as_strings(batch: &RecordBatch, col_name: &str) -> Result<Vec<String>, DbError> {
+    let col_idx = batch
+        .schema()
+        .index_of(col_name)
+        .map_err(|_| DbError::Pipeline(format!("Column '{col_name}' not found")))?;
+    let array = batch.column(col_idx);
+
+    match array.data_type() {
+        DataType::Utf8 => {
+            let string_array = array
+                .as_any()
+                .downcast_ref::<StringArray>()
+                .ok_or_else(|| DbError::Pipeline(format!("Column '{col_name}' is not Utf8")))?;
+            Ok((0..string_array.len())
+                .map(|i| string_array.value(i).to_string())
+                .collect())
+        }
+        DataType::Int64 => {
+            let int_array = array
+                .as_any()
+                .downcast_ref::<Int64Array>()
+                .ok_or_else(|| DbError::Pipeline(format!("Column '{col_name}' is not Int64")))?;
+            Ok((0..int_array.len())
+                .map(|i| int_array.value(i).to_string())
+                .collect())
+        }
+        other => Err(DbError::Pipeline(format!(
+            "Unsupported key column type: {other}"
+        ))),
+    }
+}
+
+/// Extract a column's values as `i64` timestamps (epoch millis).
+fn extract_column_as_timestamps(batch: &RecordBatch, col_name: &str) -> Result<Vec<i64>, DbError> {
+    let col_idx = batch
+        .schema()
+        .index_of(col_name)
+        .map_err(|_| DbError::Pipeline(format!("Timestamp column '{col_name}' not found")))?;
+    let array = batch.column(col_idx);
+
+    match array.data_type() {
+        DataType::Int64 => {
+            let int_array = array
+                .as_any()
+                .downcast_ref::<Int64Array>()
+                .ok_or_else(|| DbError::Pipeline(format!("Column '{col_name}' is not Int64")))?;
+            Ok(int_array.values().to_vec())
+        }
+        DataType::Timestamp(TimeUnit::Millisecond, _) => {
+            let ts_array = array
+                .as_any()
+                .downcast_ref::<TimestampMillisecondArray>()
+                .ok_or_else(|| {
+                    DbError::Pipeline(format!("Column '{col_name}' is not TimestampMillisecond"))
+                })?;
+            Ok(ts_array.values().to_vec())
+        }
+        DataType::Float64 => {
+            // Support float timestamps (cast to i64 millis)
+            let f_array = array
+                .as_any()
+                .downcast_ref::<Float64Array>()
+                .ok_or_else(|| DbError::Pipeline(format!("Column '{col_name}' is not Float64")))?;
+            #[allow(clippy::cast_possible_truncation)]
+            Ok(f_array.values().iter().map(|v| *v as i64).collect())
+        }
+        other => Err(DbError::Pipeline(format!(
+            "Unsupported timestamp column type for '{col_name}': {other}"
+        ))),
+    }
+}
+
+/// Build the merged output schema from left and right schemas.
+///
+/// Right-side columns are made nullable for Left joins.
+fn build_output_schema(
+    left_schema: &SchemaRef,
+    right_schema: &SchemaRef,
+    config: &AsofJoinTranslatorConfig,
+) -> SchemaRef {
+    let mut fields: Vec<Field> = left_schema
+        .fields()
+        .iter()
+        .map(|f| f.as_ref().clone())
+        .collect();
+
+    let make_nullable = config.join_type == AsofSqlJoinType::Left;
+    for field in right_schema.fields() {
+        // Skip duplicate key column (already in left side)
+        if field.name() == &config.key_column {
+            continue;
+        }
+        let mut f = field.as_ref().clone();
+        if make_nullable {
+            f = f.with_nullable(true);
+        }
+        fields.push(f);
+    }
+
+    Arc::new(Schema::new(fields))
+}
+
+/// Build the output `RecordBatch` from matched indices.
+fn build_output_batch(
+    left: &RecordBatch,
+    right: &RecordBatch,
+    left_indices: &[usize],
+    right_indices: &[Option<usize>],
+    output_schema: &SchemaRef,
+    config: &AsofJoinTranslatorConfig,
+) -> Result<RecordBatch, DbError> {
+    let num_rows = left_indices.len();
+    let mut columns: Vec<ArrayRef> = Vec::new();
+
+    // Left-side columns: take selected rows
+    #[allow(clippy::cast_possible_truncation)]
+    let left_idx_array =
+        arrow::array::UInt32Array::from(left_indices.iter().map(|&i| i as u32).collect::<Vec<_>>());
+    for col_idx in 0..left.num_columns() {
+        let array = left.column(col_idx);
+        let taken = arrow::compute::take(array, &left_idx_array, None)
+            .map_err(|e| DbError::Pipeline(format!("Failed to take left rows: {e}")))?;
+        columns.push(taken);
+    }
+
+    // Right-side columns: take selected rows (with nulls for unmatched)
+    let right_schema = right.schema();
+    for col_idx in 0..right.num_columns() {
+        let field_name = right_schema.field(col_idx).name();
+        // Skip duplicate key column
+        if field_name == &config.key_column {
+            continue;
+        }
+
+        let array = right.column(col_idx);
+        let taken = take_with_nulls(array, right_indices, num_rows)?;
+        columns.push(taken);
+    }
+
+    RecordBatch::try_new(output_schema.clone(), columns)
+        .map_err(|e| DbError::Pipeline(format!("Failed to build ASOF result batch: {e}")))
+}
+
+/// Take rows from an array using optional indices (None = null).
+fn take_with_nulls(
+    array: &dyn Array,
+    indices: &[Option<usize>],
+    num_rows: usize,
+) -> Result<ArrayRef, DbError> {
+    if array.is_empty() {
+        // Right side is empty — produce all nulls
+        return Ok(Arc::new(NullArray::new(num_rows)) as ArrayRef);
+    }
+
+    // Build a UInt32Array with null entries for unmatched rows
+    #[allow(clippy::cast_possible_truncation)]
+    let index_array = arrow::array::UInt32Array::from(
+        indices
+            .iter()
+            .map(|opt| opt.map(|i| i as u32))
+            .collect::<Vec<Option<u32>>>(),
+    );
+
+    arrow::compute::take(array, &index_array, None)
+        .map_err(|e| DbError::Pipeline(format!("Failed to take right rows: {e}")))
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use std::time::Duration;
+
+    fn trades_batch() -> RecordBatch {
+        let schema = Arc::new(Schema::new(vec![
+            Field::new("symbol", DataType::Utf8, false),
+            Field::new("trade_ts", DataType::Int64, false),
+            Field::new("price", DataType::Float64, false),
+        ]));
+        RecordBatch::try_new(
+            schema,
+            vec![
+                Arc::new(StringArray::from(vec!["AAPL", "AAPL", "GOOG", "AAPL"])),
+                Arc::new(Int64Array::from(vec![100, 200, 150, 300])),
+                Arc::new(Float64Array::from(vec![150.0, 152.0, 2800.0, 155.0])),
+            ],
+        )
+        .unwrap()
+    }
+
+    fn quotes_batch() -> RecordBatch {
+        let schema = Arc::new(Schema::new(vec![
+            Field::new("symbol", DataType::Utf8, false),
+            Field::new("quote_ts", DataType::Int64, false),
+            Field::new("bid", DataType::Float64, false),
+            Field::new("ask", DataType::Float64, false),
+        ]));
+        RecordBatch::try_new(
+            schema,
+            vec![
+                Arc::new(StringArray::from(vec![
+                    "AAPL", "AAPL", "GOOG", "AAPL", "GOOG",
+                ])),
+                Arc::new(Int64Array::from(vec![90, 180, 140, 250, 160])),
+                Arc::new(Float64Array::from(vec![
+                    149.0, 151.0, 2790.0, 153.0, 2795.0,
+                ])),
+                Arc::new(Float64Array::from(vec![
+                    150.0, 152.0, 2800.0, 154.0, 2805.0,
+                ])),
+            ],
+        )
+        .unwrap()
+    }
+
+    fn backward_config() -> AsofJoinTranslatorConfig {
+        AsofJoinTranslatorConfig {
+            left_table: "trades".to_string(),
+            right_table: "quotes".to_string(),
+            key_column: "symbol".to_string(),
+            left_time_column: "trade_ts".to_string(),
+            right_time_column: "quote_ts".to_string(),
+            direction: AsofSqlDirection::Backward,
+            tolerance: None,
+            join_type: AsofSqlJoinType::Left,
+        }
+    }
+
+    #[test]
+    fn test_backward_join_basic() {
+        let config = backward_config();
+        let result =
+            execute_asof_join_batch(&[trades_batch()], &[quotes_batch()], &config).unwrap();
+
+        // 4 left rows → 4 output rows (Left join)
+        assert_eq!(result.num_rows(), 4);
+        // Output should have: symbol, trade_ts, price, quote_ts, bid, ask
+        assert_eq!(result.num_columns(), 6);
+
+        // Verify AAPL trade at ts=100 matches quote at ts=90 (backward: 90 <= 100)
+        let quote_ts = result
+            .column(3)
+            .as_any()
+            .downcast_ref::<Int64Array>()
+            .unwrap();
+        assert_eq!(quote_ts.value(0), 90); // trade@100 → quote@90
+        assert_eq!(quote_ts.value(1), 180); // trade@200 → quote@180
+    }
+
+    #[test]
+    fn test_forward_join_basic() {
+        let mut config = backward_config();
+        config.direction = AsofSqlDirection::Forward;
+
+        let result =
+            execute_asof_join_batch(&[trades_batch()], &[quotes_batch()], &config).unwrap();
+
+        assert_eq!(result.num_rows(), 4);
+        // AAPL trade at ts=100 → forward match is quote@180 (earliest >= 100)
+        let quote_ts = result
+            .column(3)
+            .as_any()
+            .downcast_ref::<Int64Array>()
+            .unwrap();
+        assert_eq!(quote_ts.value(0), 180); // trade@100 → quote@180 (forward)
+        assert_eq!(quote_ts.value(1), 250); // trade@200 → quote@250 (earliest >= 200)
+    }
+
+    #[test]
+    fn test_left_join_emits_unmatched_with_nulls() {
+        // Create trades with a symbol that has no quotes
+        let trades_schema = Arc::new(Schema::new(vec![
+            Field::new("symbol", DataType::Utf8, false),
+            Field::new("trade_ts", DataType::Int64, false),
+            Field::new("price", DataType::Float64, false),
+        ]));
+        let trades = RecordBatch::try_new(
+            trades_schema,
+            vec![
+                Arc::new(StringArray::from(vec!["MSFT"])),
+                Arc::new(Int64Array::from(vec![100])),
+                Arc::new(Float64Array::from(vec![300.0])),
+            ],
+        )
+        .unwrap();
+
+        let config = backward_config();
+        let result = execute_asof_join_batch(&[trades], &[quotes_batch()], &config).unwrap();
+
+        // Left join: MSFT has no match, should still emit with nulls
+        assert_eq!(result.num_rows(), 1);
+        assert!(result.column(3).is_null(0)); // quote_ts is null
+    }
+
+    #[test]
+    fn test_inner_join_skips_unmatched() {
+        let trades_schema = Arc::new(Schema::new(vec![
+            Field::new("symbol", DataType::Utf8, false),
+            Field::new("trade_ts", DataType::Int64, false),
+            Field::new("price", DataType::Float64, false),
+        ]));
+        let trades = RecordBatch::try_new(
+            trades_schema,
+            vec![
+                Arc::new(StringArray::from(vec!["MSFT", "AAPL"])),
+                Arc::new(Int64Array::from(vec![100, 200])),
+                Arc::new(Float64Array::from(vec![300.0, 152.0])),
+            ],
+        )
+        .unwrap();
+
+        let mut config = backward_config();
+        config.join_type = AsofSqlJoinType::Inner;
+
+        let result = execute_asof_join_batch(&[trades], &[quotes_batch()], &config).unwrap();
+
+        // Inner join: MSFT skipped, only AAPL matches
+        assert_eq!(result.num_rows(), 1);
+    }
+
+    #[test]
+    fn test_tolerance_filtering() {
+        let mut config = backward_config();
+        config.tolerance = Some(Duration::from_millis(15));
+
+        let result =
+            execute_asof_join_batch(&[trades_batch()], &[quotes_batch()], &config).unwrap();
+
+        // AAPL trade@100 → quote@90 (diff=10, within 15ms tolerance) ✓
+        // AAPL trade@200 → quote@180 (diff=20, exceeds 15ms) → null (Left join)
+        // GOOG trade@150 → quote@140 (diff=10, within 15ms) ✓
+        // AAPL trade@300 → quote@250 (diff=50, exceeds 15ms) → null
+        assert_eq!(result.num_rows(), 4); // Left join, all left rows emitted
+        let quote_ts = result
+            .column(3)
+            .as_any()
+            .downcast_ref::<Int64Array>()
+            .unwrap();
+        assert_eq!(quote_ts.value(0), 90); // matched
+        assert!(result.column(3).is_null(1)); // no match within tolerance
+        assert_eq!(quote_ts.value(2), 140); // matched
+        assert!(result.column(3).is_null(3)); // no match within tolerance
+    }
+
+    #[test]
+    fn test_empty_left_input() {
+        let config = backward_config();
+        let result = execute_asof_join_batch(&[], &[quotes_batch()], &config).unwrap();
+        assert_eq!(result.num_rows(), 0);
+    }
+
+    #[test]
+    fn test_empty_right_input() {
+        let config = backward_config();
+        let result = execute_asof_join_batch(&[trades_batch()], &[], &config).unwrap();
+
+        // Left join with no right data: all rows emitted with nulls
+        assert_eq!(result.num_rows(), 4);
+    }
+
+    #[test]
+    fn test_multiple_keys() {
+        // Both AAPL and GOOG trades should match their respective quotes
+        let config = backward_config();
+        let result =
+            execute_asof_join_batch(&[trades_batch()], &[quotes_batch()], &config).unwrap();
+
+        assert_eq!(result.num_rows(), 4);
+
+        // Check GOOG trade@150 matches GOOG quote@140 (not an AAPL quote)
+        let symbols = result
+            .column(0)
+            .as_any()
+            .downcast_ref::<StringArray>()
+            .unwrap();
+        let quote_ts = result
+            .column(3)
+            .as_any()
+            .downcast_ref::<Int64Array>()
+            .unwrap();
+
+        // Row 2 is GOOG
+        assert_eq!(symbols.value(2), "GOOG");
+        assert_eq!(quote_ts.value(2), 140); // GOOG quote, not AAPL
+    }
+
+    #[test]
+    fn test_multiple_right_matches_picks_closest() {
+        // For backward: AAPL trade@200 should pick quote@180 (closest), not quote@90
+        let config = backward_config();
+        let result =
+            execute_asof_join_batch(&[trades_batch()], &[quotes_batch()], &config).unwrap();
+
+        let quote_ts = result
+            .column(3)
+            .as_any()
+            .downcast_ref::<Int64Array>()
+            .unwrap();
+        // AAPL trade@200: backward match picks 180 (closest <= 200), not 90
+        assert_eq!(quote_ts.value(1), 180);
+    }
+}

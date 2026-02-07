@@ -75,6 +75,9 @@ arrayvec = "0.7"
 libc = "0.2"
 io-uring = "0.7"  # Low-level io_uring bindings (Linux only)
 
+# Probabilistic data structures
+xorf = "0.12"
+
 # Randomness
 rand = "0.8"
 

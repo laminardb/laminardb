@@ -24,6 +24,8 @@ pub enum ShowCommand {
     MaterializedViews,
     /// SHOW STREAMS - list all named streams
     Streams,
+    /// SHOW TABLES - list all reference/dimension tables
+    Tables,
 }
 
 /// Streaming-specific SQL statements

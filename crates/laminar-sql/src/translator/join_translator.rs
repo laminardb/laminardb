@@ -5,7 +5,7 @@
 
 use std::time::Duration;
 
-use crate::parser::join_parser::{AsofSqlDirection, JoinAnalysis, JoinType};
+use crate::parser::join_parser::{AsofSqlDirection, JoinAnalysis, JoinType, MultiJoinAnalysis};
 
 /// Configuration for stream-stream join operator
 #[derive(Debug, Clone)]
@@ -58,6 +58,10 @@ pub enum LookupJoinType {
 /// Configuration for ASOF join operator
 #[derive(Debug, Clone)]
 pub struct AsofJoinTranslatorConfig {
+    /// Left side table name
+    pub left_table: String,
+    /// Right side table name
+    pub right_table: String,
     /// Key column for partitioning (e.g., symbol)
     pub key_column: String,
     /// Left side time column
@@ -98,6 +102,8 @@ impl JoinOperatorConfig {
     pub fn from_analysis(analysis: &JoinAnalysis) -> Self {
         if analysis.is_asof_join {
             return JoinOperatorConfig::Asof(AsofJoinTranslatorConfig {
+                left_table: analysis.left_table.clone(),
+                right_table: analysis.right_table.clone(),
                 key_column: analysis.left_key_column.clone(),
                 left_time_column: analysis.left_time_column.clone().unwrap_or_default(),
                 right_time_column: analysis.right_time_column.clone().unwrap_or_default(),
@@ -132,6 +138,12 @@ impl JoinOperatorConfig {
                 },
             })
         }
+    }
+
+    /// Create from a multi-join analysis, producing one config per join step.
+    #[must_use]
+    pub fn from_multi_analysis(multi: &MultiJoinAnalysis) -> Vec<Self> {
+        multi.joins.iter().map(Self::from_analysis).collect()
     }
 
     /// Check if this is a stream-stream join.
@@ -397,6 +409,166 @@ mod tests {
         let config = JoinOperatorConfig::from_analysis(&analysis);
         assert_eq!(config.left_key(), "sym");
         assert_eq!(config.right_key(), "sym");
+    }
+
+    // -- Multi-way join translator tests (F-SQL-005) --
+
+    #[test]
+    fn test_from_multi_analysis_single() {
+        let analysis = JoinAnalysis::lookup(
+            "a".to_string(),
+            "b".to_string(),
+            "id".to_string(),
+            "id".to_string(),
+            JoinType::Inner,
+        );
+        let multi = MultiJoinAnalysis {
+            joins: vec![analysis],
+            tables: vec!["a".to_string(), "b".to_string()],
+        };
+
+        let configs = JoinOperatorConfig::from_multi_analysis(&multi);
+        assert_eq!(configs.len(), 1);
+        assert!(configs[0].is_lookup());
+    }
+
+    #[test]
+    fn test_from_multi_analysis_two_lookups() {
+        let j1 = JoinAnalysis::lookup(
+            "a".to_string(),
+            "b".to_string(),
+            "id".to_string(),
+            "a_id".to_string(),
+            JoinType::Inner,
+        );
+        let j2 = JoinAnalysis::lookup(
+            "b".to_string(),
+            "c".to_string(),
+            "id".to_string(),
+            "b_id".to_string(),
+            JoinType::Left,
+        );
+        let multi = MultiJoinAnalysis {
+            joins: vec![j1, j2],
+            tables: vec!["a".to_string(), "b".to_string(), "c".to_string()],
+        };
+
+        let configs = JoinOperatorConfig::from_multi_analysis(&multi);
+        assert_eq!(configs.len(), 2);
+        assert!(configs[0].is_lookup());
+        assert!(configs[1].is_lookup());
+        assert_eq!(configs[0].left_key(), "id");
+        assert_eq!(configs[1].left_key(), "id");
+    }
+
+    #[test]
+    fn test_from_multi_analysis_mixed_asof_lookup() {
+        let j1 = JoinAnalysis::asof(
+            "trades".to_string(),
+            "quotes".to_string(),
+            "symbol".to_string(),
+            "symbol".to_string(),
+            AsofSqlDirection::Backward,
+            "ts".to_string(),
+            "ts".to_string(),
+            None,
+        );
+        let j2 = JoinAnalysis::lookup(
+            "quotes".to_string(),
+            "products".to_string(),
+            "product_id".to_string(),
+            "id".to_string(),
+            JoinType::Inner,
+        );
+        let multi = MultiJoinAnalysis {
+            joins: vec![j1, j2],
+            tables: vec![
+                "trades".to_string(),
+                "quotes".to_string(),
+                "products".to_string(),
+            ],
+        };
+
+        let configs = JoinOperatorConfig::from_multi_analysis(&multi);
+        assert_eq!(configs.len(), 2);
+        assert!(configs[0].is_asof());
+        assert!(configs[1].is_lookup());
+    }
+
+    #[test]
+    fn test_from_multi_analysis_stream_stream_and_lookup() {
+        let j1 = JoinAnalysis::stream_stream(
+            "orders".to_string(),
+            "payments".to_string(),
+            "id".to_string(),
+            "order_id".to_string(),
+            Duration::from_secs(3600),
+            JoinType::Inner,
+        );
+        let j2 = JoinAnalysis::lookup(
+            "payments".to_string(),
+            "customers".to_string(),
+            "cust_id".to_string(),
+            "id".to_string(),
+            JoinType::Left,
+        );
+        let multi = MultiJoinAnalysis {
+            joins: vec![j1, j2],
+            tables: vec![
+                "orders".to_string(),
+                "payments".to_string(),
+                "customers".to_string(),
+            ],
+        };
+
+        let configs = JoinOperatorConfig::from_multi_analysis(&multi);
+        assert_eq!(configs.len(), 2);
+        assert!(configs[0].is_stream_stream());
+        assert!(configs[1].is_lookup());
+    }
+
+    #[test]
+    fn test_from_multi_analysis_order_preserved() {
+        let j1 = JoinAnalysis::lookup(
+            "a".to_string(),
+            "b".to_string(),
+            "k1".to_string(),
+            "k1".to_string(),
+            JoinType::Inner,
+        );
+        let j2 = JoinAnalysis::stream_stream(
+            "b".to_string(),
+            "c".to_string(),
+            "k2".to_string(),
+            "k2".to_string(),
+            Duration::from_secs(60),
+            JoinType::Left,
+        );
+        let j3 = JoinAnalysis::lookup(
+            "c".to_string(),
+            "d".to_string(),
+            "k3".to_string(),
+            "k3".to_string(),
+            JoinType::Inner,
+        );
+        let multi = MultiJoinAnalysis {
+            joins: vec![j1, j2, j3],
+            tables: vec![
+                "a".to_string(),
+                "b".to_string(),
+                "c".to_string(),
+                "d".to_string(),
+            ],
+        };
+
+        let configs = JoinOperatorConfig::from_multi_analysis(&multi);
+        assert_eq!(configs.len(), 3);
+        assert!(configs[0].is_lookup());
+        assert!(configs[1].is_stream_stream());
+        assert!(configs[2].is_lookup());
+        assert_eq!(configs[0].left_key(), "k1");
+        assert_eq!(configs[1].left_key(), "k2");
+        assert_eq!(configs[2].left_key(), "k3");
     }
 
     #[test]

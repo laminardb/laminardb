@@ -7,10 +7,10 @@
 | Phase 1 | 12 | 0 | 0 | 0 | 12 |
 | Phase 1.5 | 1 | 0 | 0 | 0 | 1 |
 | Phase 2 | 34 | 0 | 0 | 0 | 34 |
-| Phase 3 | 56 | 12 | 0 | 0 | 44 |
+| Phase 3 | 67 | 14 | 0 | 0 | 53 |
 | Phase 4 | 11 | 11 | 0 | 0 | 0 |
 | Phase 5 | 10 | 10 | 0 | 0 | 0 |
-| **Total** | **124** | **33** | **0** | **0** | **91** |
+| **Total** | **135** | **35** | **0** | **0** | **100** |
 
 ## Status Legend
 
@@ -101,7 +101,7 @@
 
 ## Phase 3: Connectors & Integration
 
-> **Status**: 44/56 features complete (79%)
+> **Status**: 51/67 features complete (76%)
 
 ### Streaming API ✅
 
@@ -189,6 +189,26 @@ See [Cloud Storage Index](phase-3/cloud/INDEX.md).
 | F-SQL-001 | ASOF JOIN SQL Support | ✅ | [Link](phase-3/F-SQL-001-asof-join-sql.md) |
 | F-SQL-002 | LAG/LEAD Window Functions | ✅ | [Link](phase-3/F-SQL-002-lag-lead-functions.md) |
 | F-SQL-003 | ROW_NUMBER/RANK/DENSE_RANK | ✅ | [Link](phase-3/F-SQL-003-ranking-functions.md) |
+| F-SQL-004 | HAVING Clause Execution | ✅ | [Link](phase-3/F-SQL-004-having-clause.md) |
+| F-SQL-005 | Multi-Way JOIN Support | ✅ | [Link](phase-3/F-SQL-005-multi-way-joins.md) |
+| F-SQL-006 | Window Frame (ROWS BETWEEN) | ✅ | [Link](phase-3/F-SQL-006-window-frames.md) |
+
+### Connector Infrastructure
+
+| ID | Feature | Status | Spec |
+|----|---------|--------|------|
+| F-CONN-001 | Checkpoint Recovery Wiring | ✅ | [Link](phase-3/F-CONN-001-checkpoint-recovery-wiring.md) |
+| F-CONN-002 | Reference Table Support | ✅ | [Link](phase-3/F-CONN-002-reference-tables.md) |
+| F-CONN-002B | Connector-Backed Table Population | ✅ | [Link](phase-3/F-CONN-002B-table-source-population.md) |
+| F-CONN-002C | PARTIAL Cache Mode & Xor Filter | ✅ | [Link](phase-3/F-CONN-002C-partial-cache-xor-filter.md) |
+| F-CONN-002D | RocksDB-Backed Persistent Table Store | ✅ | [Link](phase-3/F-CONN-002D-rocksdb-table-store.md) |
+| F-CONN-003 | Avro Serialization Hardening | ✅ | [Link](phase-3/F-CONN-003-avro-hardening.md) |
+
+### Pipeline Observability
+
+| ID | Feature | Status | Spec |
+|----|---------|--------|------|
+| F-OBS-001 | Pipeline Observability API | 📝 | [Link](phase-3/F-OBS-001-pipeline-observability.md) |
 
 ### Production Demo
 
@@ -199,6 +219,7 @@ See [Demo Index](phase-3/demo/INDEX.md).
 | F-DEMO-001 | Market Data Pipeline | 📝 | [Link](phase-3/demo/F-DEMO-001-market-data-pipeline.md) |
 | F-DEMO-002 | Ratatui TUI Dashboard | 📝 | [Link](phase-3/demo/F-DEMO-002-ratatui-tui.md) |
 | F-DEMO-003 | Kafka Integration & Docker | 📝 | [Link](phase-3/demo/F-DEMO-003-kafka-docker.md) |
+| F-DEMO-006 | Kafka Mode TUI Dashboard | 📝 | [Link](phase-3/F-DEMO-006-kafka-tui.md) |
 
 ### FFI & Language Bindings
 

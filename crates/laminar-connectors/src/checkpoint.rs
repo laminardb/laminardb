@@ -79,6 +79,12 @@ impl SourceCheckpoint {
         self.metadata.get(key).map(String::as_str)
     }
 
+    /// Returns all metadata.
+    #[must_use]
+    pub fn metadata(&self) -> &HashMap<String, String> {
+        &self.metadata
+    }
+
     /// Returns `true` if the checkpoint has any offsets.
     #[must_use]
     pub fn is_empty(&self) -> bool {

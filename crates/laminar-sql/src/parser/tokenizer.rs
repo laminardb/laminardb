@@ -73,6 +73,8 @@ pub enum StreamingDdlKind {
     },
     /// SHOW STREAMS
     ShowStreams,
+    /// SHOW TABLES
+    ShowTables,
     /// Not a streaming DDL statement
     None,
 }
@@ -232,6 +234,7 @@ fn detect_show_ddl(significant: &[&TokenWithSpan]) -> StreamingDdlKind {
         Token::Word(w) if is_word_ci(w, "SINKS") => StreamingDdlKind::ShowSinks,
         Token::Word(w) if is_word_ci(w, "QUERIES") => StreamingDdlKind::ShowQueries,
         Token::Word(w) if is_word_ci(w, "STREAMS") => StreamingDdlKind::ShowStreams,
+        Token::Word(w) if is_word_ci(w, "TABLES") => StreamingDdlKind::ShowTables,
         Token::Word(Word {
             keyword: Keyword::MATERIALIZED,
             ..
@@ -629,6 +632,14 @@ mod tests {
         assert_eq!(
             detect_streaming_ddl(&tokenize("SHOW MATERIALIZED VIEWS")),
             StreamingDdlKind::ShowMaterializedViews
+        );
+    }
+
+    #[test]
+    fn test_detect_show_tables() {
+        assert_eq!(
+            detect_streaming_ddl(&tokenize("SHOW TABLES")),
+            StreamingDdlKind::ShowTables
         );
     }
 

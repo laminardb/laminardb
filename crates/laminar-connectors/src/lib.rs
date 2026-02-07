@@ -107,3 +107,6 @@ pub mod storage;
 
 /// Connector SDK - developer tooling and operational resilience.
 pub mod sdk;
+
+/// Reference table source trait and refresh modes.
+pub mod reference;

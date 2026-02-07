@@ -11,6 +11,7 @@ use parking_lot::RwLock;
 use crate::config::{ConnectorConfig, ConnectorInfo};
 use crate::connector::{SinkConnector, SourceConnector};
 use crate::error::ConnectorError;
+use crate::reference::ReferenceTableSource;
 use crate::serde::{self, Format, RecordDeserializer, RecordSerializer};
 
 /// Factory function type for creating source connectors.
@@ -18,6 +19,11 @@ pub type SourceFactory = Arc<dyn Fn() -> Box<dyn SourceConnector> + Send + Sync>
 
 /// Factory function type for creating sink connectors.
 pub type SinkFactory = Arc<dyn Fn() -> Box<dyn SinkConnector> + Send + Sync>;
+
+/// Factory function type for creating reference table sources.
+pub type TableSourceFactory = Arc<
+    dyn Fn(&ConnectorConfig) -> Result<Box<dyn ReferenceTableSource>, ConnectorError> + Send + Sync,
+>;
 
 /// Registry of available connector implementations.
 ///
@@ -39,6 +45,7 @@ pub type SinkFactory = Arc<dyn Fn() -> Box<dyn SinkConnector> + Send + Sync>;
 pub struct ConnectorRegistry {
     sources: Arc<RwLock<HashMap<String, (ConnectorInfo, SourceFactory)>>>,
     sinks: Arc<RwLock<HashMap<String, (ConnectorInfo, SinkFactory)>>>,
+    table_sources: Arc<RwLock<HashMap<String, (ConnectorInfo, TableSourceFactory)>>>,
 }
 
 impl ConnectorRegistry {
@@ -48,6 +55,7 @@ impl ConnectorRegistry {
         Self {
             sources: Arc::new(RwLock::new(HashMap::new())),
             sinks: Arc::new(RwLock::new(HashMap::new())),
+            table_sources: Arc::new(RwLock::new(HashMap::new())),
         }
     }
 
@@ -115,6 +123,46 @@ impl ConnectorRegistry {
         Ok(factory())
     }
 
+    /// Registers a reference table source factory.
+    pub fn register_table_source(
+        &self,
+        name: impl Into<String>,
+        info: ConnectorInfo,
+        factory: TableSourceFactory,
+    ) {
+        self.table_sources
+            .write()
+            .insert(name.into(), (info, factory));
+    }
+
+    /// Creates a new reference table source instance.
+    ///
+    /// The connector type is determined by `config.connector_type()`.
+    ///
+    /// # Errors
+    ///
+    /// Returns `ConnectorError::ConfigurationError` if the connector type
+    /// is not registered as a table source.
+    pub fn create_table_source(
+        &self,
+        config: &ConnectorConfig,
+    ) -> Result<Box<dyn ReferenceTableSource>, ConnectorError> {
+        let table_sources = self.table_sources.read();
+        let (_, factory) = table_sources.get(config.connector_type()).ok_or_else(|| {
+            ConnectorError::ConfigurationError(format!(
+                "unknown table source connector type: '{}'",
+                config.connector_type()
+            ))
+        })?;
+        factory(config)
+    }
+
+    /// Lists all registered table source connector names.
+    #[must_use]
+    pub fn list_table_sources(&self) -> Vec<String> {
+        self.table_sources.read().keys().cloned().collect()
+    }
+
     /// Returns information about a registered source connector.
     #[must_use]
     pub fn source_info(&self, name: &str) -> Option<ConnectorInfo> {
@@ -177,6 +225,7 @@ impl std::fmt::Debug for ConnectorRegistry {
         f.debug_struct("ConnectorRegistry")
             .field("sources", &self.list_sources())
             .field("sinks", &self.list_sinks())
+            .field("table_sources", &self.list_table_sources())
             .finish()
     }
 }
@@ -280,5 +329,52 @@ mod tests {
         assert!(registry.create_deserializer("json").is_ok());
         assert!(registry.create_serializer("csv").is_ok());
         assert!(registry.create_deserializer("unknown").is_err());
+    }
+
+    // ── Table source factory tests ──
+
+    #[test]
+    fn test_register_and_create_table_source() {
+        use crate::reference::MockReferenceTableSource;
+
+        let registry = ConnectorRegistry::new();
+        registry.register_table_source(
+            "mock",
+            mock_info("mock", true, false),
+            Arc::new(|_config| Ok(Box::new(MockReferenceTableSource::empty()))),
+        );
+
+        let config = ConnectorConfig::new("mock");
+        let source = registry.create_table_source(&config);
+        assert!(source.is_ok());
+    }
+
+    #[test]
+    fn test_create_unknown_table_source() {
+        let registry = ConnectorRegistry::new();
+        let config = ConnectorConfig::new("nonexistent");
+        let result = registry.create_table_source(&config);
+        match result {
+            Err(e) => assert!(e.to_string().contains("unknown table source"), "got: {e}"),
+            Ok(_) => panic!("Expected error for unknown table source"),
+        }
+    }
+
+    #[test]
+    fn test_list_table_sources() {
+        use crate::reference::MockReferenceTableSource;
+
+        let registry = ConnectorRegistry::new();
+        assert!(registry.list_table_sources().is_empty());
+
+        registry.register_table_source(
+            "mock-table",
+            mock_info("mock-table", true, false),
+            Arc::new(|_config| Ok(Box::new(MockReferenceTableSource::empty()))),
+        );
+
+        let names = registry.list_table_sources();
+        assert_eq!(names.len(), 1);
+        assert!(names.contains(&"mock-table".to_string()));
     }
 }

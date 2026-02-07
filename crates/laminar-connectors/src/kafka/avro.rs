@@ -76,7 +76,9 @@ impl AvroDeserializer {
         avro_schema_json: &str,
     ) -> Result<(), SerdeError> {
         let avro_schema = AvroSchema::new(avro_schema_json.to_string());
-        let fp = Fingerprint::load_fingerprint_id(schema_id as u32);
+        // Use Fingerprint::Id directly — NOT load_fingerprint_id which
+        // applies from_be byte-swap meant for raw wire bytes.
+        let fp = Fingerprint::Id(schema_id as u32);
         self.schema_store
             .set(fp, avro_schema)
             .map_err(|e| SerdeError::MalformedInput(format!("failed to register schema: {e}")))?;
@@ -97,20 +99,17 @@ impl AvroDeserializer {
             return Ok(());
         }
 
-        let registry = self.schema_registry.as_ref().ok_or_else(|| {
-            SerdeError::MalformedInput(format!(
-                "unknown schema ID {schema_id} and no Schema Registry configured"
-            ))
-        })?;
+        let registry = self
+            .schema_registry
+            .as_ref()
+            .ok_or(SerdeError::SchemaNotFound { schema_id })?;
 
         let cached = registry
             .lock()
             .await
             .resolve_confluent_id(schema_id)
             .await
-            .map_err(|e| {
-                SerdeError::MalformedInput(format!("failed to fetch schema ID {schema_id}: {e}"))
-            })?;
+            .map_err(|_| SerdeError::SchemaNotFound { schema_id })?;
 
         self.register_schema(schema_id, &cached.schema_str)?;
         Ok(())

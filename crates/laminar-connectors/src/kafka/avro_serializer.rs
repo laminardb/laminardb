@@ -173,10 +173,10 @@ fn split_confluent_records(buf: &[u8], expected_rows: usize) -> Result<Vec<Vec<u
     while offset < buf.len() {
         // Validate magic byte.
         if buf[offset] != CONFLUENT_MAGIC {
-            return Err(SerdeError::MalformedInput(format!(
-                "expected Confluent magic byte 0x00 at offset {offset}, got 0x{:02x}",
-                buf[offset]
-            )));
+            return Err(SerdeError::InvalidConfluentHeader {
+                expected: CONFLUENT_MAGIC,
+                got: buf[offset],
+            });
         }
 
         // Find the start of the next record (next occurrence of magic byte
@@ -194,11 +194,10 @@ fn split_confluent_records(buf: &[u8], expected_rows: usize) -> Result<Vec<Vec<u
     }
 
     if records.len() != expected_rows {
-        return Err(SerdeError::MalformedInput(format!(
-            "expected {} records, found {}",
-            expected_rows,
-            records.len()
-        )));
+        return Err(SerdeError::RecordCountMismatch {
+            expected: expected_rows,
+            got: records.len(),
+        });
     }
 
     Ok(records)

@@ -13,6 +13,7 @@ use laminar_sql::parser::{parse_streaming_sql, ShowCommand, StreamingStatement};
 use laminar_sql::planner::StreamingPlanner;
 use laminar_sql::register_streaming_functions;
 use laminar_sql::translator::streaming_ddl;
+use laminar_sql::translator::{AsofJoinTranslatorConfig, JoinOperatorConfig};
 
 use crate::builder::LaminarDbBuilder;
 use crate::catalog::SourceCatalog;
@@ -74,6 +75,7 @@ pub struct LaminarDB {
     connector_manager: parking_lot::Mutex<crate::connector_manager::ConnectorManager>,
     connector_registry: Arc<laminar_connectors::registry::ConnectorRegistry>,
     mv_registry: parking_lot::Mutex<laminar_core::mv::MvRegistry>,
+    table_store: Arc<parking_lot::Mutex<crate::table_store::TableStore>>,
     state: std::sync::atomic::AtomicU8,
     /// Handle to the background processing task (if running).
     runtime_handle: parking_lot::Mutex<Option<tokio::task::JoinHandle<()>>>,
@@ -139,6 +141,9 @@ impl LaminarDB {
             ),
             connector_registry,
             mv_registry: parking_lot::Mutex::new(laminar_core::mv::MvRegistry::new()),
+            table_store: Arc::new(parking_lot::Mutex::new(
+                crate::table_store::TableStore::new(),
+            )),
             state: std::sync::atomic::AtomicU8::new(STATE_CREATED),
             runtime_handle: parking_lot::Mutex::new(None),
             shutdown_signal: Arc::new(tokio::sync::Notify::new()),
@@ -243,6 +248,14 @@ impl LaminarDB {
             StreamingStatement::Standard(stmt) => {
                 if let sqlparser::ast::Statement::CreateTable(ct) = stmt.as_ref() {
                     self.handle_create_table(ct)
+                } else if let sqlparser::ast::Statement::Drop {
+                    object_type: sqlparser::ast::ObjectType::Table,
+                    names,
+                    if_exists,
+                    ..
+                } = stmt.as_ref()
+                {
+                    self.handle_drop_table(names, *if_exists)
                 } else {
                     self.handle_query(sql).await
                 }
@@ -273,6 +286,7 @@ impl LaminarDB {
                     ShowCommand::Queries => self.build_show_queries(),
                     ShowCommand::MaterializedViews => self.build_show_materialized_views(),
                     ShowCommand::Streams => self.build_show_streams(),
+                    ShowCommand::Tables => self.build_show_tables(),
                 };
                 Ok(ExecuteResult::Metadata(batch))
             }
@@ -474,7 +488,8 @@ impl LaminarDB {
 
     /// Handle INSERT INTO statement.
     ///
-    /// Inserts SQL VALUES into a registered source or `DataFusion` table.
+    /// Inserts SQL VALUES into a registered source, a `TableStore`-managed
+    /// table (with PK upsert), or a plain `DataFusion` `MemTable`.
     async fn handle_insert_into(
         &self,
         table_name: &sqlparser::ast::ObjectName,
@@ -491,6 +506,25 @@ impl LaminarDB {
                 .push_arrow(batch)
                 .map_err(|e| DbError::InsertError(format!("Failed to push to source: {e}")))?;
             return Ok(ExecuteResult::RowsAffected(values.len() as u64));
+        }
+
+        // Try inserting into a TableStore-managed table (with PK upsert)
+        {
+            let has_table = self.table_store.lock().has_table(&name);
+            if has_table {
+                let schema = self
+                    .table_store
+                    .lock()
+                    .table_schema(&name)
+                    .ok_or_else(|| DbError::TableNotFound(name.clone()))?;
+                let batch = sql_utils::sql_values_to_record_batch(&schema, values)?;
+                self.table_store.lock().upsert(&name, &batch)?;
+
+                // Sync to DataFusion MemTable
+                self.sync_table_to_datafusion(&name)?;
+
+                return Ok(ExecuteResult::RowsAffected(values.len() as u64));
+            }
         }
 
         // Otherwise, insert into a DataFusion MemTable
@@ -523,7 +557,11 @@ impl LaminarDB {
     /// Handle CREATE TABLE statement.
     ///
     /// Creates a static reference/dimension table backed by a `DataFusion`
-    /// `MemTable`. These tables are used for lookup joins.
+    /// `MemTable`. If a PRIMARY KEY is specified, the table is also registered
+    /// in the `TableStore` for upsert/delete/lookup semantics.
+    /// If `WITH (...)` options include a `connector` key, the table is
+    /// registered in the `ConnectorManager` for connector-backed population.
+    #[allow(clippy::too_many_lines)]
     fn handle_create_table(
         &self,
         create: &sqlparser::ast::CreateTable,
@@ -555,13 +593,160 @@ impl LaminarDB {
 
         let schema = Arc::new(arrow::datatypes::Schema::new(fields));
 
-        // Register as a DataFusion MemTable with empty data
-        let mem_table = datafusion::datasource::MemTable::try_new(schema.clone(), vec![vec![]])
-            .map_err(|e| DbError::InvalidOperation(format!("Failed to create table: {e}")))?;
+        // Extract primary key from column constraints or table constraints
+        let mut primary_key: Option<String> = None;
 
-        self.ctx
-            .register_table(&name, Arc::new(mem_table))
-            .map_err(|e| DbError::InvalidOperation(format!("Failed to register table: {e}")))?;
+        // Check column-level PRIMARY KEY
+        for col in &create.columns {
+            for opt in &col.options {
+                if matches!(opt.option, sqlparser::ast::ColumnOption::PrimaryKey(..)) {
+                    primary_key = Some(col.name.to_string());
+                    break;
+                }
+            }
+            if primary_key.is_some() {
+                break;
+            }
+        }
+
+        // Check table-level PRIMARY KEY constraint
+        if primary_key.is_none() {
+            for constraint in &create.constraints {
+                if let sqlparser::ast::TableConstraint::PrimaryKey(pk) = constraint {
+                    if let Some(first) = pk.columns.first() {
+                        primary_key = Some(first.column.to_string());
+                    }
+                }
+            }
+        }
+
+        // Extract connector options from WITH (...)
+        let mut connector_type: Option<String> = None;
+        let mut connector_options: HashMap<String, String> = HashMap::new();
+        let mut format: Option<String> = None;
+        let mut format_options: HashMap<String, String> = HashMap::new();
+        let mut refresh_mode: Option<laminar_connectors::reference::RefreshMode> = None;
+        let mut cache_mode: Option<crate::table_cache_mode::TableCacheMode> = None;
+        let mut cache_max_entries: Option<usize> = None;
+        let mut storage: Option<String> = None;
+
+        let with_options = match &create.table_options {
+            sqlparser::ast::CreateTableOptions::With(opts) => opts.as_slice(),
+            _ => &[],
+        };
+
+        for opt in with_options {
+            if let sqlparser::ast::SqlOption::KeyValue { key, value } = opt {
+                let k = key.to_string().to_lowercase();
+                let val = value.to_string().trim_matches('\'').to_string();
+                match k.as_str() {
+                    "connector" => connector_type = Some(val),
+                    "format" => format = Some(val),
+                    "refresh" => {
+                        refresh_mode = Some(crate::connector_manager::parse_refresh_mode(&val)?);
+                    }
+                    "cache_mode" => {
+                        cache_mode = Some(crate::table_cache_mode::parse_cache_mode(&val)?);
+                    }
+                    "cache_max_entries" => {
+                        cache_max_entries = Some(val.parse::<usize>().map_err(|_| {
+                            DbError::InvalidOperation(format!(
+                                "Invalid cache_max_entries '{val}': expected positive integer"
+                            ))
+                        })?);
+                    }
+                    "storage" => storage = Some(val),
+                    kk if kk.starts_with("format.") => {
+                        format_options.insert(kk.strip_prefix("format.").unwrap().to_string(), val);
+                    }
+                    _ => {
+                        connector_options.insert(k, val);
+                    }
+                }
+            }
+        }
+
+        // Resolve cache mode: if Partial and cache_max_entries overrides, apply it
+        let resolved_cache_mode = match (&cache_mode, cache_max_entries) {
+            (Some(crate::table_cache_mode::TableCacheMode::Partial { .. }), Some(max)) => {
+                Some(crate::table_cache_mode::TableCacheMode::Partial { max_entries: max })
+            }
+            _ => cache_mode.clone(),
+        };
+
+        // Determine whether this is a persistent table
+        let is_persistent = storage.as_deref() == Some("persistent");
+
+        // Register in TableStore if PK found
+        if let Some(ref pk) = primary_key {
+            let cache = resolved_cache_mode
+                .clone()
+                .unwrap_or(crate::table_cache_mode::TableCacheMode::Full);
+
+            if is_persistent {
+                #[cfg(feature = "rocksdb")]
+                {
+                    let mut ts = self.table_store.lock();
+                    ts.create_table_persistent(&name, schema.clone(), pk, cache)?;
+                }
+                #[cfg(not(feature = "rocksdb"))]
+                {
+                    return Err(DbError::InvalidOperation(
+                        "storage = 'persistent' requires the 'rocksdb' feature".to_string(),
+                    ));
+                }
+            } else if resolved_cache_mode.is_some() {
+                let mut ts = self.table_store.lock();
+                ts.create_table_with_cache(&name, schema.clone(), pk, cache)?;
+            } else {
+                let mut ts = self.table_store.lock();
+                ts.create_table(&name, schema.clone(), pk)?;
+            }
+        }
+
+        // Register connector-backed table in ConnectorManager
+        if connector_type.is_some() || !connector_options.is_empty() {
+            if let Some(ref pk) = primary_key {
+                if let Some(ref ct) = connector_type {
+                    let mut ts = self.table_store.lock();
+                    ts.set_connector(&name, ct);
+                }
+
+                let mut mgr = self.connector_manager.lock();
+                mgr.register_table(crate::connector_manager::TableRegistration {
+                    name: name.clone(),
+                    primary_key: pk.clone(),
+                    connector_type: connector_type.clone(),
+                    connector_options,
+                    format,
+                    format_options,
+                    refresh: refresh_mode,
+                    cache_mode: cache_mode.clone(),
+                    cache_max_entries,
+                    storage: storage.clone(),
+                });
+            }
+        }
+
+        // Register with DataFusion.
+        // Persistent tables use a live ReferenceTableProvider; others use MemTable.
+        if is_persistent && primary_key.is_some() {
+            let provider = crate::table_provider::ReferenceTableProvider::new(
+                name.clone(),
+                schema.clone(),
+                self.table_store.clone(),
+            );
+            self.ctx
+                .register_table(&name, Arc::new(provider))
+                .map_err(|e| DbError::InvalidOperation(format!("Failed to register table: {e}")))?;
+        } else {
+            let mem_table = datafusion::datasource::MemTable::try_new(schema.clone(), vec![vec![]])
+                .map_err(|e| DbError::InvalidOperation(format!("Failed to create table: {e}")))?;
+
+            self.ctx
+                .register_table(&name, Arc::new(mem_table))
+                .map_err(|e| DbError::InvalidOperation(format!("Failed to register table: {e}")))?;
+        }
 
         Ok(ExecuteResult::Ddl(DdlInfo {
             statement_type: "CREATE TABLE".to_string(),
@@ -702,11 +887,23 @@ impl LaminarDB {
                         if let Some(wc) = &qp.window_config {
                             rows.push(("window_type".into(), format!("{:?}", wc.window_type)));
                         }
-                        if let Some(jc) = &qp.join_config {
-                            rows.push(("join_type".into(), format!("{jc:?}")));
+                        if let Some(jcs) = &qp.join_config {
+                            if jcs.len() == 1 {
+                                rows.push(("join_type".into(), format!("{:?}", jcs[0])));
+                            } else {
+                                for (i, jc) in jcs.iter().enumerate() {
+                                    rows.push((format!("join_step_{}", i + 1), format!("{jc:?}")));
+                                }
+                            }
                         }
                         if let Some(oc) = &qp.order_config {
                             rows.push(("order_by".into(), format!("{oc:?}")));
+                        }
+                        if let Some(fc) = &qp.frame_config {
+                            rows.push((
+                                "frame_functions".into(),
+                                format!("{}", fc.functions.len()),
+                            ));
                         }
                         if let Some(ec) = &qp.emit_clause {
                             rows.push(("emit".into(), format!("{ec:?}")));
@@ -784,7 +981,12 @@ impl LaminarDB {
                 }))
             }
             laminar_sql::planner::StreamingPlan::Query(query_plan) => {
-                // Async execution without the lock
+                // Check for ASOF join — DataFusion can't parse ASOF syntax
+                if let Some(asof_config) = Self::extract_asof_config(&query_plan) {
+                    return self.execute_asof_query(&asof_config, sql).await;
+                }
+
+                // Standard DataFusion path
                 let plan_sql = query_plan.statement.to_string();
                 let logical_plan = self.ctx.state().create_logical_plan(&plan_sql).await?;
                 let df = self.ctx.execute_logical_plan(logical_plan).await?;
@@ -849,6 +1051,109 @@ impl LaminarDB {
             subscription: Some(subscription),
             active: true,
         })
+    }
+
+    /// Extract an ASOF join config from a query plan, if present.
+    fn extract_asof_config(
+        plan: &laminar_sql::planner::QueryPlan,
+    ) -> Option<AsofJoinTranslatorConfig> {
+        plan.join_config.as_ref()?.iter().find_map(|jc| {
+            if let JoinOperatorConfig::Asof(cfg) = jc {
+                Some(cfg.clone())
+            } else {
+                None
+            }
+        })
+    }
+
+    /// Execute an ASOF join query by fetching left/right tables separately
+    /// and performing the join in-process (bypasses `DataFusion`'s SQL parser
+    /// which doesn't understand ASOF syntax).
+    async fn execute_asof_query(
+        &self,
+        asof_config: &AsofJoinTranslatorConfig,
+        original_sql: &str,
+    ) -> Result<ExecuteResult, DbError> {
+        let left_sql = format!("SELECT * FROM {}", asof_config.left_table);
+        let right_sql = format!("SELECT * FROM {}", asof_config.right_table);
+
+        let left_batches = self
+            .ctx
+            .sql(&left_sql)
+            .await
+            .map_err(|e| {
+                DbError::Pipeline(format!(
+                    "ASOF left table '{}' query failed: {e}",
+                    asof_config.left_table
+                ))
+            })?
+            .collect()
+            .await
+            .map_err(|e| {
+                DbError::Pipeline(format!(
+                    "ASOF left table '{}' execution failed: {e}",
+                    asof_config.left_table
+                ))
+            })?;
+
+        let right_batches = self
+            .ctx
+            .sql(&right_sql)
+            .await
+            .map_err(|e| {
+                DbError::Pipeline(format!(
+                    "ASOF right table '{}' query failed: {e}",
+                    asof_config.right_table
+                ))
+            })?
+            .collect()
+            .await
+            .map_err(|e| {
+                DbError::Pipeline(format!(
+                    "ASOF right table '{}' execution failed: {e}",
+                    asof_config.right_table
+                ))
+            })?;
+
+        let result_batch =
+            crate::asof_batch::execute_asof_join_batch(&left_batches, &right_batches, asof_config)?;
+
+        if result_batch.num_rows() == 0 {
+            let query_id = self.catalog.register_query(original_sql);
+            return Ok(ExecuteResult::Query(QueryHandle {
+                id: query_id,
+                schema: result_batch.schema(),
+                sql: original_sql.to_string(),
+                subscription: None,
+                active: false,
+            }));
+        }
+
+        let schema = result_batch.schema();
+        let mem_table =
+            datafusion::datasource::MemTable::try_new(schema.clone(), vec![vec![result_batch]])
+                .map_err(|e| {
+                    DbError::Pipeline(format!("Failed to create ASOF result table: {e}"))
+                })?;
+
+        let _ = self.ctx.deregister_table("__asof_result");
+        self.ctx
+            .register_table("__asof_result", Arc::new(mem_table))
+            .map_err(|e| DbError::Pipeline(format!("Failed to register ASOF result table: {e}")))?;
+
+        let df = self
+            .ctx
+            .sql("SELECT * FROM __asof_result")
+            .await
+            .map_err(|e| DbError::Pipeline(format!("Failed to query ASOF result: {e}")))?;
+        let stream = df
+            .execute_stream()
+            .await
+            .map_err(|e| DbError::Pipeline(format!("Failed to stream ASOF result: {e}")))?;
+
+        let _ = self.ctx.deregister_table("__asof_result");
+
+        Ok(self.bridge_query_stream(original_sql, stream))
     }
 
     /// Get a typed source handle for pushing data.
@@ -1107,12 +1412,13 @@ impl LaminarDB {
             .store(STATE_STARTING, std::sync::atomic::Ordering::Release);
 
         // Snapshot connector registrations under the lock
-        let (source_regs, sink_regs, stream_regs, has_external) = {
+        let (source_regs, sink_regs, stream_regs, table_regs, has_external) = {
             let mgr = self.connector_manager.lock();
             (
                 mgr.sources().clone(),
                 mgr.sinks().clone(),
                 mgr.streams().clone(),
+                mgr.tables().clone(),
                 mgr.has_external_connectors(),
             )
         };
@@ -1133,12 +1439,13 @@ impl LaminarDB {
 
         if has_external {
             eprintln!(
-                "[laminar-db] Starting CONNECTOR pipeline ({} sources, {} sinks, {} streams)",
+                "[laminar-db] Starting CONNECTOR pipeline ({} sources, {} sinks, {} streams, {} tables)",
                 source_regs.len(),
                 sink_regs.len(),
                 stream_regs.len(),
+                table_regs.len(),
             );
-            self.start_connector_pipeline(source_regs, sink_regs, stream_regs)
+            self.start_connector_pipeline(source_regs, sink_regs, stream_regs, table_regs)
                 .await?;
         } else if !stream_regs.is_empty() {
             eprintln!(
@@ -1280,11 +1587,16 @@ impl LaminarDB {
         source_regs: HashMap<String, crate::connector_manager::SourceRegistration>,
         sink_regs: HashMap<String, crate::connector_manager::SinkRegistration>,
         stream_regs: HashMap<String, crate::connector_manager::StreamRegistration>,
+        table_regs: HashMap<String, crate::connector_manager::TableRegistration>,
     ) -> Result<(), DbError> {
-        use crate::connector_manager::{build_sink_config, build_source_config};
+        use crate::connector_manager::{
+            build_sink_config, build_source_config, build_table_config,
+        };
+        use crate::pipeline_checkpoint::{PipelineCheckpointManager, SerializableSourceCheckpoint};
         use crate::stream_executor::StreamExecutor;
         use laminar_connectors::config::ConnectorConfig;
         use laminar_connectors::connector::{SinkConnector, SourceConnector};
+        use laminar_connectors::reference::{ReferenceTableSource, RefreshMode};
 
         // Build StreamExecutor
         let ctx = SessionContext::new();
@@ -1359,6 +1671,94 @@ impl LaminarDB {
                 .map_err(|e| DbError::Connector(format!("Failed to open sink '{name}': {e}")))?;
         }
 
+        // Build table sources from registrations
+        let mut table_sources: Vec<(String, Box<dyn ReferenceTableSource>, RefreshMode)> =
+            Vec::new();
+        for (name, reg) in &table_regs {
+            if reg.connector_type.is_none() {
+                continue;
+            }
+            let config = build_table_config(reg)?;
+            let source = self
+                .connector_registry
+                .create_table_source(&config)
+                .map_err(|e| {
+                    DbError::Connector(format!("Cannot create table source '{name}': {e}"))
+                })?;
+            let mode = reg.refresh.clone().unwrap_or(RefreshMode::SnapshotPlusCdc);
+            table_sources.push((name.clone(), source, mode));
+        }
+
+        // Create checkpoint manager if configured
+        let checkpoint_config = self.config.checkpoint.clone();
+        let storage_dir = self.config.storage_dir.clone();
+        let mut pipeline_ckpt_mgr = checkpoint_config.as_ref().map(|cp_config| {
+            let data_dir = cp_config
+                .data_dir
+                .clone()
+                .or(storage_dir.clone())
+                .unwrap_or_else(|| std::path::PathBuf::from("./data"));
+            let max_retained = cp_config.max_retained.unwrap_or(3);
+            PipelineCheckpointManager::new(data_dir, max_retained)
+        });
+
+        // Recovery: restore source offsets and rollback sink epochs
+        if let Some(ref mut mgr) = pipeline_ckpt_mgr {
+            if let Ok(Some(checkpoint)) = mgr.load_latest() {
+                for (name, source, _) in &mut sources {
+                    if let Some(src_cp) = checkpoint.source_offsets.get(name) {
+                        let restored = src_cp.to_source_checkpoint();
+                        if let Err(e) = source.restore(&restored).await {
+                            tracing::warn!(source=%name, error=%e, "Source restore failed");
+                        }
+                    }
+                }
+                for (_name, sink, _, _) in &mut sinks {
+                    if sink.capabilities().exactly_once {
+                        let _ = sink.rollback_epoch(checkpoint.epoch).await;
+                    }
+                }
+                // Restore table source offsets
+                for (name, source, _) in &mut table_sources {
+                    if let Some(tbl_cp) = checkpoint.table_offsets.get(name) {
+                        let restored = tbl_cp.to_source_checkpoint();
+                        if let Err(e) = source.restore(&restored).await {
+                            tracing::warn!(table=%name, error=%e, "Table source restore failed");
+                        }
+                    }
+                }
+                mgr.set_epoch(checkpoint.epoch);
+                eprintln!(
+                    "[laminar-db] Recovered from checkpoint epoch {}",
+                    checkpoint.epoch
+                );
+                tracing::info!(
+                    epoch = checkpoint.epoch,
+                    "Recovered from pipeline checkpoint"
+                );
+            }
+        }
+
+        // Snapshot phase: populate tables before stream processing begins
+        for (name, source, mode) in &mut table_sources {
+            if matches!(mode, RefreshMode::Manual) {
+                continue;
+            }
+            while let Some(batch) = source
+                .poll_snapshot()
+                .await
+                .map_err(|e| DbError::Connector(format!("Table '{name}' snapshot error: {e}")))?
+            {
+                self.table_store
+                    .lock()
+                    .upsert(name, &batch)
+                    .map_err(|e| DbError::Connector(format!("Table '{name}' upsert error: {e}")))?;
+            }
+            self.sync_table_to_datafusion(name)?;
+            self.table_store.lock().rebuild_xor_filter(name);
+            self.table_store.lock().set_ready(name, true);
+        }
+
         // Get stream source handles so results also flow to db.subscribe().
         let mut stream_sources: Vec<(String, streaming::Source<crate::catalog::ArrowRecord>)> =
             Vec::new();
@@ -1387,12 +1787,19 @@ impl LaminarDB {
         // Spawn processing loop
         let shutdown = self.shutdown_signal.clone();
         let max_poll = self.config.default_buffer_size.min(1024);
+        let checkpoint_interval = checkpoint_config
+            .as_ref()
+            .and_then(|c| c.interval_ms)
+            .map(std::time::Duration::from_millis);
+        let table_store_for_loop = self.table_store.clone();
+        let ctx_for_sync = self.ctx.clone();
 
         let handle = tokio::spawn(async move {
             eprintln!("[laminar-db] Connector pipeline task started");
             let mut cycle_count: u64 = 0;
             let mut total_batches: u64 = 0;
             let mut total_records: u64 = 0;
+            let mut last_checkpoint = std::time::Instant::now();
             loop {
                 // Check for shutdown
                 tokio::select! {
@@ -1506,6 +1913,27 @@ impl LaminarDB {
                     }
                 }
 
+                // Poll table sources for incremental changes
+                for (name, source, mode) in &mut table_sources {
+                    if matches!(mode, RefreshMode::SnapshotOnly | RefreshMode::Manual) {
+                        continue;
+                    }
+                    match source.poll_changes().await {
+                        Ok(Some(batch)) => {
+                            if let Err(e) = table_store_for_loop.lock().upsert(name, &batch) {
+                                tracing::warn!(table=%name, error=%e, "Table upsert error");
+                            } else {
+                                table_store_for_loop.lock().rebuild_xor_filter(name);
+                                sync_table_to_df(&ctx_for_sync, &table_store_for_loop, name);
+                            }
+                        }
+                        Ok(None) => {}
+                        Err(e) => {
+                            tracing::warn!(table=%name, error=%e, "Table poll error");
+                        }
+                    }
+                }
+
                 cycle_count += 1;
                 if cycle_count.is_multiple_of(50) {
                     eprintln!(
@@ -1513,11 +1941,118 @@ impl LaminarDB {
                     );
                     tracing::debug!(cycles = cycle_count, "Pipeline processing");
                 }
+
+                // Periodic checkpoint
+                if let (Some(interval), Some(ref mut mgr)) =
+                    (checkpoint_interval, &mut pipeline_ckpt_mgr)
+                {
+                    if last_checkpoint.elapsed() >= interval {
+                        let epoch = mgr.next_epoch();
+
+                        // Begin epoch on exactly-once sinks
+                        for (_, sink, _, _) in &mut sinks {
+                            if sink.capabilities().exactly_once {
+                                let _ = sink.begin_epoch(epoch).await;
+                            }
+                        }
+
+                        // Capture source offsets
+                        let mut source_offsets = HashMap::new();
+                        for (name, source, _) in &sources {
+                            source_offsets.insert(
+                                name.clone(),
+                                SerializableSourceCheckpoint::from(&source.checkpoint()),
+                            );
+                        }
+
+                        // Capture table source offsets
+                        let mut table_offsets = HashMap::new();
+                        for (name, source, _) in &table_sources {
+                            table_offsets.insert(
+                                name.clone(),
+                                SerializableSourceCheckpoint::from(&source.checkpoint()),
+                            );
+                        }
+
+                        // Build and persist
+                        #[allow(clippy::cast_possible_truncation)]
+                        let timestamp_ms = std::time::SystemTime::now()
+                            .duration_since(std::time::UNIX_EPOCH)
+                            .unwrap_or_default()
+                            .as_millis() as u64;
+                        let checkpoint = crate::pipeline_checkpoint::PipelineCheckpoint {
+                            epoch,
+                            timestamp_ms,
+                            source_offsets,
+                            sink_epochs: HashMap::new(),
+                            table_offsets,
+                            table_store_checkpoint_path: None,
+                        };
+
+                        if let Err(e) = mgr.save(&checkpoint) {
+                            tracing::warn!(error = %e, "Checkpoint save failed");
+                        } else {
+                            // Commit epoch on exactly-once sinks
+                            for (_, sink, _, _) in &mut sinks {
+                                if sink.capabilities().exactly_once {
+                                    let _ = sink.commit_epoch(epoch).await;
+                                }
+                            }
+                            tracing::info!(epoch, "Pipeline checkpoint completed");
+                        }
+
+                        last_checkpoint = std::time::Instant::now();
+                    }
+                }
             }
 
             eprintln!(
                 "[laminar-db] Pipeline stopping after {cycle_count} cycles ({total_batches} batches, {total_records} records)",
             );
+
+            // Final checkpoint before shutdown
+            if let Some(ref mut mgr) = pipeline_ckpt_mgr {
+                let epoch = mgr.next_epoch();
+                let mut source_offsets = HashMap::new();
+                for (name, source, _) in &sources {
+                    source_offsets.insert(
+                        name.clone(),
+                        SerializableSourceCheckpoint::from(&source.checkpoint()),
+                    );
+                }
+                let mut table_offsets = HashMap::new();
+                for (name, source, _) in &table_sources {
+                    table_offsets.insert(
+                        name.clone(),
+                        SerializableSourceCheckpoint::from(&source.checkpoint()),
+                    );
+                }
+                #[allow(clippy::cast_possible_truncation)]
+                let timestamp_ms = std::time::SystemTime::now()
+                    .duration_since(std::time::UNIX_EPOCH)
+                    .unwrap_or_default()
+                    .as_millis() as u64;
+                let checkpoint = crate::pipeline_checkpoint::PipelineCheckpoint {
+                    epoch,
+                    timestamp_ms,
+                    source_offsets,
+                    sink_epochs: HashMap::new(),
+                    table_offsets,
+                    table_store_checkpoint_path: None,
+                };
+                if let Err(e) = mgr.save(&checkpoint) {
+                    tracing::warn!(error = %e, "Final checkpoint save failed");
+                } else {
+                    tracing::info!(epoch, "Final pipeline checkpoint saved");
+                }
+            }
+
+            // Close table sources
+            for (name, source, _) in &mut table_sources {
+                if let Err(e) = source.close().await {
+                    tracing::warn!(table = %name, error = %e, "Table source close error");
+                }
+            }
 
             // Close all connectors
             for (name, source, _) in &mut sources {
@@ -1834,6 +2369,127 @@ impl LaminarDB {
             .expect("show streams: schema matches columns")
     }
 
+    /// Handle DROP TABLE statement.
+    fn handle_drop_table(
+        &self,
+        names: &[sqlparser::ast::ObjectName],
+        if_exists: bool,
+    ) -> Result<ExecuteResult, DbError> {
+        for obj_name in names {
+            let name_str = obj_name.to_string();
+
+            // Remove from TableStore
+            self.table_store.lock().drop_table(&name_str);
+
+            // Remove from ConnectorManager
+            self.connector_manager.lock().unregister_table(&name_str);
+
+            // Deregister from DataFusion context
+            match self.ctx.deregister_table(&name_str) {
+                Ok(None) if !if_exists => {
+                    return Err(DbError::TableNotFound(name_str));
+                }
+                Ok(Some(_) | None) => {}
+                Err(e) => {
+                    return Err(DbError::InvalidOperation(format!(
+                        "Failed to drop table '{name_str}': {e}"
+                    )));
+                }
+            }
+        }
+
+        let name = names
+            .first()
+            .map(std::string::ToString::to_string)
+            .unwrap_or_default();
+
+        Ok(ExecuteResult::Ddl(DdlInfo {
+            statement_type: "DROP TABLE".to_string(),
+            object_name: name,
+        }))
+    }
+
+    /// Build a SHOW TABLES metadata result.
+    fn build_show_tables(&self) -> RecordBatch {
+        let ts = self.table_store.lock();
+        let mut names = Vec::new();
+        let mut pks = Vec::new();
+        let mut row_counts = Vec::new();
+        let mut connectors = Vec::new();
+
+        for name in ts.table_names() {
+            let pk = ts.primary_key(&name).unwrap_or("").to_string();
+            let count = ts.table_row_count(&name) as u64;
+            let conn = ts.connector(&name).unwrap_or("").to_string();
+
+            names.push(name);
+            pks.push(pk);
+            row_counts.push(count);
+            connectors.push(conn);
+        }
+
+        let names_ref: Vec<&str> = names.iter().map(String::as_str).collect();
+        let pks_ref: Vec<&str> = pks.iter().map(String::as_str).collect();
+        let connectors_ref: Vec<&str> = connectors.iter().map(String::as_str).collect();
+
+        let schema = Arc::new(Schema::new(vec![
+            Field::new("name", DataType::Utf8, false),
+            Field::new("primary_key", DataType::Utf8, false),
+            Field::new("row_count", DataType::UInt64, false),
+            Field::new("connector", DataType::Utf8, false),
+        ]));
+
+        RecordBatch::try_new(
+            schema,
+            vec![
+                Arc::new(StringArray::from(names_ref)),
+                Arc::new(StringArray::from(pks_ref)),
+                Arc::new(UInt64Array::from(row_counts)),
+                Arc::new(StringArray::from(connectors_ref)),
+            ],
+        )
+        .expect("show tables: schema matches columns")
+    }
+
+    /// Synchronize a `TableStore` table to the `DataFusion` `MemTable`.
+    ///
+    /// Deregisters the existing table (if any) and re-registers with the
+    /// current contents of the `TableStore`.
+    fn sync_table_to_datafusion(&self, name: &str) -> Result<(), DbError> {
+        // Persistent tables use ReferenceTableProvider which reads live data —
+        // no need to deregister/re-register.
+        if self.table_store.lock().is_persistent(name) {
+            return Ok(());
+        }
+
+        let batch = self
+            .table_store
+            .lock()
+            .to_record_batch(name)
+            .ok_or_else(|| DbError::TableNotFound(name.to_string()))?;
+
+        let schema = batch.schema();
+
+        // Deregister old
+        let _ = self.ctx.deregister_table(name);
+
+        // Register new
+        let data = if batch.num_rows() > 0 {
+            vec![vec![batch]]
+        } else {
+            vec![vec![]]
+        };
+
+        let mem_table = datafusion::datasource::MemTable::try_new(schema, data)
+            .map_err(|e| DbError::InsertError(format!("Failed to create table: {e}")))?;
+
+        self.ctx
+            .register_table(name, Arc::new(mem_table))
+            .map_err(|e| DbError::InsertError(format!("Failed to register table: {e}")))?;
+
+        Ok(())
+    }
+
     /// Build a DESCRIBE result.
     fn build_describe(&self, name: &str) -> Result<RecordBatch, DbError> {
         let source_schema = self
@@ -1875,6 +2531,38 @@ impl LaminarDB {
             ],
         )
         .map_err(|e| DbError::InvalidOperation(format!("describe metadata: {e}")))
+    }
+}
+
+/// Sync a reference table from [`TableStore`] into `DataFusion` as a `MemTable`.
+///
+/// This is the static (free-function) counterpart of
+/// [`LaminarDB::sync_table_to_datafusion`] — needed because the spawned
+/// pipeline task cannot hold `&self`.
+fn sync_table_to_df(
+    ctx: &SessionContext,
+    table_store: &Arc<parking_lot::Mutex<crate::table_store::TableStore>>,
+    name: &str,
+) {
+    // Persistent tables use ReferenceTableProvider — skip re-registration.
+    if table_store.lock().is_persistent(name) {
+        return;
+    }
+
+    let Some(batch) = table_store.lock().to_record_batch(name) else {
+        return;
+    };
+    let schema = batch.schema();
+    let _ = ctx.deregister_table(name);
+
+    let data = if batch.num_rows() > 0 {
+        vec![vec![batch]]
+    } else {
+        vec![vec![]]
+    };
+
+    if let Ok(mem_table) = datafusion::datasource::MemTable::try_new(schema, data) {
+        let _ = ctx.register_table(name, Arc::new(mem_table));
     }
 }
 
@@ -2897,5 +3585,878 @@ mod tests {
         assert_eq!(find("src").node_type, PipelineNodeType::Source);
         assert_eq!(find("st").node_type, PipelineNodeType::Stream);
         assert_eq!(find("sk").node_type, PipelineNodeType::Sink);
+    }
+
+    // ── Reference Table (F-CONN-002) tests ──
+
+    #[tokio::test]
+    async fn test_create_table_with_primary_key() {
+        let db = LaminarDB::open().unwrap();
+        let result = db
+            .execute(
+                "CREATE TABLE instruments (\
+                 symbol VARCHAR PRIMARY KEY, \
+                 company_name VARCHAR, \
+                 sector VARCHAR\
+                 )",
+            )
+            .await
+            .unwrap();
+
+        match result {
+            ExecuteResult::Ddl(info) => {
+                assert_eq!(info.statement_type, "CREATE TABLE");
+                assert_eq!(info.object_name, "instruments");
+            }
+            _ => panic!("Expected DDL result"),
+        }
+
+        // Verify TableStore registration
+        let ts = db.table_store.lock();
+        assert!(ts.has_table("instruments"));
+        assert_eq!(ts.primary_key("instruments"), Some("symbol"));
+        assert_eq!(ts.table_row_count("instruments"), 0);
+    }
+
+    #[tokio::test]
+    async fn test_create_table_with_connector_options() {
+        let db = LaminarDB::open().unwrap();
+        let result = db
+            .execute(
+                "CREATE TABLE instruments (\
+                 symbol VARCHAR PRIMARY KEY, \
+                 company_name VARCHAR\
+                 ) WITH (connector = 'kafka', topic = 'instruments')",
+            )
+            .await
+            .unwrap();
+
+        match result {
+            ExecuteResult::Ddl(info) => {
+                assert_eq!(info.object_name, "instruments");
+            }
+            _ => panic!("Expected DDL result"),
+        }
+
+        // Verify ConnectorManager registration
+        let mgr = db.connector_manager.lock();
+        let tables = mgr.tables();
+        assert!(tables.contains_key("instruments"));
+        let reg = &tables["instruments"];
+        assert_eq!(reg.connector_type.as_deref(), Some("kafka"));
+        assert_eq!(reg.primary_key, "symbol");
+
+        // Verify TableStore connector
+        let ts = db.table_store.lock();
+        assert_eq!(ts.connector("instruments"), Some("kafka"));
+    }
+
+    #[tokio::test]
+    async fn test_insert_into_table_with_pk_upserts() {
+        let db = LaminarDB::open().unwrap();
+        db.execute(
+            "CREATE TABLE products (\
+             id INT PRIMARY KEY, \
+             name VARCHAR, \
+             price DOUBLE\
+             )",
+        )
+        .await
+        .unwrap();
+
+        // Insert a row
+        db.execute("INSERT INTO products VALUES (1, 'Widget', 9.99)")
+            .await
+            .unwrap();
+        assert_eq!(db.table_store.lock().table_row_count("products"), 1);
+
+        // Upsert (same PK = overwrite)
+        db.execute("INSERT INTO products VALUES (1, 'Super Widget', 19.99)")
+            .await
+            .unwrap();
+        assert_eq!(db.table_store.lock().table_row_count("products"), 1);
+
+        // Insert another row (different PK)
+        db.execute("INSERT INTO products VALUES (2, 'Gadget', 14.99)")
+            .await
+            .unwrap();
+        assert_eq!(db.table_store.lock().table_row_count("products"), 2);
+
+        // Verify via SELECT
+        let result = db.execute("SELECT * FROM products").await.unwrap();
+        match result {
+            ExecuteResult::Query(q) => {
+                assert_eq!(q.schema().fields().len(), 3);
+            }
+            _ => panic!("Expected Query result"),
+        }
+    }
+
+    #[tokio::test]
+    async fn test_show_tables() {
+        let db = LaminarDB::open().unwrap();
+
+        // Empty
+        let result = db.execute("SHOW TABLES").await.unwrap();
+        match result {
+            ExecuteResult::Metadata(batch) => {
+                assert_eq!(batch.num_rows(), 0);
+                assert_eq!(batch.num_columns(), 4);
+                assert_eq!(batch.schema().field(0).name(), "name");
+                assert_eq!(batch.schema().field(1).name(), "primary_key");
+                assert_eq!(batch.schema().field(2).name(), "row_count");
+                assert_eq!(batch.schema().field(3).name(), "connector");
+            }
+            _ => panic!("Expected Metadata result"),
+        }
+
+        // With a table
+        db.execute("CREATE TABLE t (id INT PRIMARY KEY, val VARCHAR)")
+            .await
+            .unwrap();
+        let result = db.execute("SHOW TABLES").await.unwrap();
+        match result {
+            ExecuteResult::Metadata(batch) => {
+                assert_eq!(batch.num_rows(), 1);
+            }
+            _ => panic!("Expected Metadata result"),
+        }
+    }
+
+    #[tokio::test]
+    async fn test_drop_table() {
+        let db = LaminarDB::open().unwrap();
+        db.execute("CREATE TABLE t (id INT PRIMARY KEY, val VARCHAR)")
+            .await
+            .unwrap();
+        assert!(db.table_store.lock().has_table("t"));
+
+        db.execute("DROP TABLE t").await.unwrap();
+        assert!(!db.table_store.lock().has_table("t"));
+    }
+
+    #[tokio::test]
+    async fn test_drop_table_if_exists() {
+        let db = LaminarDB::open().unwrap();
+        let result = db.execute("DROP TABLE IF EXISTS nonexistent").await;
+        assert!(result.is_ok());
+    }
+
+    // ── HAVING clause tests (F-SQL-004) ─────────────────────────────
+
+    #[tokio::test]
+    async fn test_having_filters_grouped_results() {
+        let db = LaminarDB::open().unwrap();
+
+        // Create table and query via DataFusion directly
+        db.ctx
+            .sql(
+                "CREATE TABLE hv_trades AS SELECT * FROM (VALUES \
+                 ('AAPL', 100), ('GOOG', 5), ('MSFT', 50)) \
+                 AS t(symbol, volume)",
+            )
+            .await
+            .unwrap();
+
+        let df = db
+            .ctx
+            .sql("SELECT symbol, volume FROM hv_trades WHERE volume > 10 ORDER BY symbol")
+            .await
+            .unwrap();
+
+        let batches = df.collect().await.unwrap();
+        let total_rows: usize = batches.iter().map(RecordBatch::num_rows).sum();
+        // AAPL(100), MSFT(50) pass; GOOG(5) filtered
+        assert_eq!(total_rows, 2);
+    }
+
+    #[tokio::test]
+    async fn test_having_with_aggregate() {
+        let db = LaminarDB::open().unwrap();
+
+        db.ctx
+            .sql(
+                "CREATE TABLE hv_orders AS SELECT * FROM (VALUES \
+                 ('A', 100), ('A', 200), ('B', 50), ('B', 30), ('C', 500)) \
+                 AS t(category, amount)",
+            )
+            .await
+            .unwrap();
+
+        // Query with GROUP BY + HAVING through DataFusion
+        let df = db
+            .ctx
+            .sql(
+                "SELECT category, SUM(amount) as total \
+                 FROM hv_orders GROUP BY category \
+                 HAVING SUM(amount) > 100 ORDER BY category",
+            )
+            .await
+            .unwrap();
+
+        let batches = df.collect().await.unwrap();
+        assert!(!batches.is_empty());
+
+        let total_rows: usize = batches.iter().map(RecordBatch::num_rows).sum();
+        // A: 300 > 100 ✓, B: 80 ✗, C: 500 > 100 ✓
+        assert_eq!(total_rows, 2);
+    }
+
+    #[tokio::test]
+    async fn test_having_all_filtered_out() {
+        let db = LaminarDB::open().unwrap();
+
+        db.ctx
+            .sql(
+                "CREATE TABLE items AS SELECT * FROM (VALUES \
+                 ('x', 1), ('y', 2)) AS t(name, qty)",
+            )
+            .await
+            .unwrap();
+
+        let df = db
+            .ctx
+            .sql("SELECT name, SUM(qty) as total FROM items GROUP BY name HAVING SUM(qty) > 1000")
+            .await
+            .unwrap();
+
+        let batches = df.collect().await.unwrap();
+        let total_rows: usize = batches.iter().map(RecordBatch::num_rows).sum();
+        assert_eq!(total_rows, 0);
+    }
+
+    #[tokio::test]
+    async fn test_having_compound_predicate() {
+        let db = LaminarDB::open().unwrap();
+
+        db.ctx
+            .sql(
+                "CREATE TABLE sales AS SELECT * FROM (VALUES \
+                 ('A', 100), ('A', 200), ('B', 50), ('C', 10), ('C', 20)) \
+                 AS t(region, amount)",
+            )
+            .await
+            .unwrap();
+
+        let df = db
+            .ctx
+            .sql(
+                "SELECT region, COUNT(*) as cnt, SUM(amount) as total \
+                 FROM sales GROUP BY region \
+                 HAVING COUNT(*) >= 2 AND SUM(amount) > 25 \
+                 ORDER BY region",
+            )
+            .await
+            .unwrap();
+
+        let batches = df.collect().await.unwrap();
+        let total_rows: usize = batches.iter().map(RecordBatch::num_rows).sum();
+        // A: cnt=2>=2 AND total=300>25 ✓
+        // B: cnt=1<2 ✗
+        // C: cnt=2>=2 AND total=30>25 ✓
+        assert_eq!(total_rows, 2);
+    }
+
+    // ── Multi-way JOIN tests (F-SQL-005) ─────────────────────────────
+
+    #[tokio::test]
+    async fn test_multi_join_two_way_lookup() {
+        let db = LaminarDB::open().unwrap();
+
+        // Create tables via DataFusion
+        db.ctx
+            .sql(
+                "CREATE TABLE orders AS SELECT * FROM (VALUES \
+                 (1, 100, 'A'), (2, 200, 'B')) AS t(id, customer_id, product_code)",
+            )
+            .await
+            .unwrap();
+        db.ctx
+            .sql(
+                "CREATE TABLE customers AS SELECT * FROM (VALUES \
+                 (100, 'Alice'), (200, 'Bob')) AS t(id, name)",
+            )
+            .await
+            .unwrap();
+        db.ctx
+            .sql(
+                "CREATE TABLE products AS SELECT * FROM (VALUES \
+                 ('A', 'Widget'), ('B', 'Gadget')) AS t(code, label)",
+            )
+            .await
+            .unwrap();
+
+        // Two-way join through DataFusion
+        let df = db
+            .ctx
+            .sql(
+                "SELECT o.id, c.name, p.label \
+                 FROM orders o \
+                 JOIN customers c ON o.customer_id = c.id \
+                 JOIN products p ON o.product_code = p.code \
+                 ORDER BY o.id",
+            )
+            .await
+            .unwrap();
+
+        let batches = df.collect().await.unwrap();
+        let total_rows: usize = batches.iter().map(RecordBatch::num_rows).sum();
+        assert_eq!(total_rows, 2);
+    }
+
+    #[tokio::test]
+    async fn test_multi_join_three_way() {
+        let db = LaminarDB::open().unwrap();
+
+        db.ctx
+            .sql("CREATE TABLE t1 AS SELECT * FROM (VALUES (1, 10), (2, 20)) AS t(id, fk1)")
+            .await
+            .unwrap();
+        db.ctx
+            .sql("CREATE TABLE t2 AS SELECT * FROM (VALUES (10, 100), (20, 200)) AS t(id, fk2)")
+            .await
+            .unwrap();
+        db.ctx
+            .sql("CREATE TABLE t3 AS SELECT * FROM (VALUES (100, 'x'), (200, 'y')) AS t(id, fk3)")
+            .await
+            .unwrap();
+        db.ctx
+            .sql("CREATE TABLE t4 AS SELECT * FROM (VALUES ('x', 'final_x'), ('y', 'final_y')) AS t(id, val)")
+            .await
+            .unwrap();
+
+        let df = db
+            .ctx
+            .sql(
+                "SELECT t1.id, t4.val \
+                 FROM t1 \
+                 JOIN t2 ON t1.fk1 = t2.id \
+                 JOIN t3 ON t2.fk2 = t3.id \
+                 JOIN t4 ON t3.fk3 = t4.id \
+                 ORDER BY t1.id",
+            )
+            .await
+            .unwrap();
+
+        let batches = df.collect().await.unwrap();
+        let total_rows: usize = batches.iter().map(RecordBatch::num_rows).sum();
+        assert_eq!(total_rows, 2);
+    }
+
+    #[tokio::test]
+    async fn test_multi_join_mixed_types() {
+        let db = LaminarDB::open().unwrap();
+
+        db.ctx
+            .sql(
+                "CREATE TABLE stream_a AS SELECT * FROM (VALUES \
+                 (1, 'k1'), (2, 'k2')) AS t(id, key)",
+            )
+            .await
+            .unwrap();
+        db.ctx
+            .sql(
+                "CREATE TABLE stream_b AS SELECT * FROM (VALUES \
+                 ('k1', 10), ('k2', 20)) AS t(key, value)",
+            )
+            .await
+            .unwrap();
+        db.ctx
+            .sql(
+                "CREATE TABLE dim_c AS SELECT * FROM (VALUES \
+                 ('k1', 'label1'), ('k2', 'label2')) AS t(key, label)",
+            )
+            .await
+            .unwrap();
+
+        // Inner join + left join
+        let df = db
+            .ctx
+            .sql(
+                "SELECT a.id, b.value, c.label \
+                 FROM stream_a a \
+                 JOIN stream_b b ON a.key = b.key \
+                 LEFT JOIN dim_c c ON a.key = c.key \
+                 ORDER BY a.id",
+            )
+            .await
+            .unwrap();
+
+        let batches = df.collect().await.unwrap();
+        let total_rows: usize = batches.iter().map(RecordBatch::num_rows).sum();
+        assert_eq!(total_rows, 2);
+    }
+
+    #[tokio::test]
+    async fn test_multi_join_single_backward_compat() {
+        let db = LaminarDB::open().unwrap();
+
+        db.ctx
+            .sql(
+                "CREATE TABLE left_t AS SELECT * FROM (VALUES \
+                 (1, 'a'), (2, 'b')) AS t(id, val)",
+            )
+            .await
+            .unwrap();
+        db.ctx
+            .sql(
+                "CREATE TABLE right_t AS SELECT * FROM (VALUES \
+                 (1, 'x'), (2, 'y')) AS t(id, data)",
+            )
+            .await
+            .unwrap();
+
+        // Single join still works
+        let df = db
+            .ctx
+            .sql(
+                "SELECT l.id, l.val, r.data \
+                 FROM left_t l JOIN right_t r ON l.id = r.id \
+                 ORDER BY l.id",
+            )
+            .await
+            .unwrap();
+
+        let batches = df.collect().await.unwrap();
+        let total_rows: usize = batches.iter().map(RecordBatch::num_rows).sum();
+        assert_eq!(total_rows, 2);
+    }
+
+    // ── Window Frame tests (F-SQL-006) ────────────────────────────────
+
+    #[tokio::test]
+    async fn test_frame_moving_average() {
+        let db = LaminarDB::open().unwrap();
+
+        db.ctx
+            .sql(
+                "CREATE TABLE frame_prices AS SELECT * FROM (VALUES \
+                 (1, 10.0), (2, 20.0), (3, 30.0), (4, 40.0), (5, 50.0)) \
+                 AS t(id, price)",
+            )
+            .await
+            .unwrap();
+
+        let df = db
+            .ctx
+            .sql(
+                "SELECT id, AVG(price) OVER (ORDER BY id \
+                 ROWS BETWEEN 2 PRECEDING AND CURRENT ROW) AS ma \
+                 FROM frame_prices ORDER BY id",
+            )
+            .await
+            .unwrap();
+
+        let batches = df.collect().await.unwrap();
+        let total_rows: usize = batches.iter().map(RecordBatch::num_rows).sum();
+        assert_eq!(total_rows, 5);
+
+        // Verify moving average values: row 3 → avg(10,20,30) = 20
+        let ma_col = batches[0]
+            .column(1)
+            .as_any()
+            .downcast_ref::<arrow::array::Float64Array>()
+            .unwrap();
+        assert!((ma_col.value(2) - 20.0).abs() < 0.01);
+    }
+
+    #[tokio::test]
+    async fn test_frame_running_sum() {
+        let db = LaminarDB::open().unwrap();
+
+        db.ctx
+            .sql(
+                "CREATE TABLE frame_amounts AS SELECT * FROM (VALUES \
+                 (1, 100.0), (2, 200.0), (3, 300.0)) AS t(id, amount)",
+            )
+            .await
+            .unwrap();
+
+        let df = db
+            .ctx
+            .sql(
+                "SELECT id, SUM(amount) OVER (ORDER BY id \
+                 ROWS BETWEEN UNBOUNDED PRECEDING AND CURRENT ROW) AS running \
+                 FROM frame_amounts ORDER BY id",
+            )
+            .await
+            .unwrap();
+
+        let batches = df.collect().await.unwrap();
+        let total_rows: usize = batches.iter().map(RecordBatch::num_rows).sum();
+        assert_eq!(total_rows, 3);
+
+        let sum_col = batches[0]
+            .column(1)
+            .as_any()
+            .downcast_ref::<arrow::array::Float64Array>()
+            .unwrap();
+        // Row 3: cumulative sum = 100 + 200 + 300 = 600
+        assert!((sum_col.value(2) - 600.0).abs() < 0.01);
+    }
+
+    #[tokio::test]
+    async fn test_frame_rolling_max() {
+        let db = LaminarDB::open().unwrap();
+
+        db.ctx
+            .sql(
+                "CREATE TABLE frame_vals AS SELECT * FROM (VALUES \
+                 (1, 5.0), (2, 15.0), (3, 10.0), (4, 20.0)) AS t(id, price)",
+            )
+            .await
+            .unwrap();
+
+        let df = db
+            .ctx
+            .sql(
+                "SELECT id, MAX(price) OVER (ORDER BY id \
+                 ROWS BETWEEN 2 PRECEDING AND CURRENT ROW) AS rmax \
+                 FROM frame_vals ORDER BY id",
+            )
+            .await
+            .unwrap();
+
+        let batches = df.collect().await.unwrap();
+        let total_rows: usize = batches.iter().map(RecordBatch::num_rows).sum();
+        assert_eq!(total_rows, 4);
+
+        let max_col = batches[0]
+            .column(1)
+            .as_any()
+            .downcast_ref::<arrow::array::Float64Array>()
+            .unwrap();
+        // Row 3: max(5, 15, 10) = 15
+        assert!((max_col.value(2) - 15.0).abs() < 0.01);
+    }
+
+    #[tokio::test]
+    async fn test_frame_rolling_count() {
+        let db = LaminarDB::open().unwrap();
+
+        db.ctx
+            .sql(
+                "CREATE TABLE frame_events AS SELECT * FROM (VALUES \
+                 (1, 'a'), (2, 'b'), (3, 'c'), (4, 'd')) AS t(id, code)",
+            )
+            .await
+            .unwrap();
+
+        let df = db
+            .ctx
+            .sql(
+                "SELECT id, COUNT(*) OVER (ORDER BY id \
+                 ROWS BETWEEN 1 PRECEDING AND CURRENT ROW) AS cnt \
+                 FROM frame_events ORDER BY id",
+            )
+            .await
+            .unwrap();
+
+        let batches = df.collect().await.unwrap();
+        let total_rows: usize = batches.iter().map(RecordBatch::num_rows).sum();
+        assert_eq!(total_rows, 4);
+
+        let cnt_col = batches[0]
+            .column(1)
+            .as_any()
+            .downcast_ref::<arrow::array::Int64Array>()
+            .unwrap();
+        // Row 1: count of just row 1 = 1
+        assert_eq!(cnt_col.value(0), 1);
+        // Row 2+: count of current + 1 preceding = 2
+        assert_eq!(cnt_col.value(1), 2);
+        assert_eq!(cnt_col.value(2), 2);
+    }
+
+    // ── F-CONN-002B: Connector-Backed Table Population ──
+
+    /// Helper: create a test `RecordBatch` for table population tests.
+    fn table_test_batch(ids: &[i32], symbols: &[&str]) -> RecordBatch {
+        use arrow::array::Int32Array;
+        let schema = Arc::new(Schema::new(vec![
+            Field::new("id", DataType::Int32, false),
+            Field::new("symbol", DataType::Utf8, false),
+        ]));
+        RecordBatch::try_new(
+            schema,
+            vec![
+                Arc::new(Int32Array::from(ids.to_vec())),
+                Arc::new(StringArray::from(symbols.to_vec())),
+            ],
+        )
+        .unwrap()
+    }
+
+    /// Register a mock table source factory that returns a `MockReferenceTableSource`
+    /// pre-loaded with the given snapshot and change batches.
+    fn register_mock_table_source(
+        db: &LaminarDB,
+        snapshot_batches: Vec<RecordBatch>,
+        change_batches: Vec<RecordBatch>,
+    ) {
+        use laminar_connectors::config::ConnectorInfo;
+        use laminar_connectors::reference::MockReferenceTableSource;
+
+        let snap = std::sync::Arc::new(parking_lot::Mutex::new(Some(snapshot_batches)));
+        let chg = std::sync::Arc::new(parking_lot::Mutex::new(Some(change_batches)));
+        db.connector_registry().register_table_source(
+            "mock",
+            ConnectorInfo {
+                name: "mock".to_string(),
+                display_name: "Mock Table Source".to_string(),
+                version: "0.1.0".to_string(),
+                is_source: true,
+                is_sink: false,
+                config_keys: vec![],
+            },
+            std::sync::Arc::new(move |_config| {
+                let s = snap.lock().take().unwrap_or_default();
+                let c = chg.lock().take().unwrap_or_default();
+                Ok(Box::new(MockReferenceTableSource::new(s, c)))
+            }),
+        );
+    }
+
+    #[tokio::test]
+    async fn test_table_source_snapshot_populates_table() {
+        let db = LaminarDB::open().unwrap();
+        let batch = table_test_batch(&[1, 2], &["AAPL", "GOOG"]);
+        register_mock_table_source(&db, vec![batch], vec![]);
+
+        db.execute(
+            "CREATE SOURCE events (symbol VARCHAR, price DOUBLE) \
+             WITH (connector = 'mock', format = 'json')",
+        )
+        .await
+        .unwrap();
+
+        db.execute(
+            "CREATE TABLE instruments (id INT PRIMARY KEY, symbol VARCHAR NOT NULL) \
+             WITH (connector = 'mock', format = 'json')",
+        )
+        .await
+        .unwrap();
+
+        db.start().await.unwrap();
+
+        // Table should be populated by snapshot
+        let ts = db.table_store.lock();
+        assert!(ts.is_ready("instruments"));
+        assert_eq!(ts.table_row_count("instruments"), 2);
+    }
+
+    #[tokio::test]
+    async fn test_table_source_manual_no_snapshot() {
+        let db = LaminarDB::open().unwrap();
+        let batch = table_test_batch(&[1], &["AAPL"]);
+        register_mock_table_source(&db, vec![batch], vec![]);
+
+        db.execute(
+            "CREATE SOURCE events (symbol VARCHAR, price DOUBLE) \
+             WITH (connector = 'mock', format = 'json')",
+        )
+        .await
+        .unwrap();
+
+        db.execute(
+            "CREATE TABLE instruments (id INT PRIMARY KEY, symbol VARCHAR NOT NULL) \
+             WITH (connector = 'mock', format = 'json', refresh = 'manual')",
+        )
+        .await
+        .unwrap();
+
+        db.start().await.unwrap();
+
+        // Manual mode: table stays empty
+        let ts = db.table_store.lock();
+        assert!(!ts.is_ready("instruments"));
+        assert_eq!(ts.table_row_count("instruments"), 0);
+    }
+
+    #[tokio::test]
+    async fn test_table_source_multiple_tables() {
+        use laminar_connectors::config::ConnectorInfo;
+        use laminar_connectors::reference::MockReferenceTableSource;
+
+        let db = LaminarDB::open().unwrap();
+
+        // Register two separate mock factories
+
+        let call_count = std::sync::Arc::new(std::sync::atomic::AtomicU32::new(0));
+        let cc = call_count.clone();
+        let batch1 = table_test_batch(&[1], &["AAPL"]);
+        let batch2 = table_test_batch(&[2, 3], &["GOOG", "MSFT"]);
+        let batches =
+            std::sync::Arc::new(parking_lot::Mutex::new(vec![vec![batch1], vec![batch2]]));
+
+        db.connector_registry().register_table_source(
+            "mock",
+            ConnectorInfo {
+                name: "mock".to_string(),
+                display_name: "Mock".to_string(),
+                version: "0.1.0".to_string(),
+                is_source: true,
+                is_sink: false,
+                config_keys: vec![],
+            },
+            std::sync::Arc::new(move |_config| {
+                let idx = cc.fetch_add(1, std::sync::atomic::Ordering::SeqCst) as usize;
+                let mut all = batches.lock();
+                let snap = if idx < all.len() {
+                    std::mem::take(&mut all[idx])
+                } else {
+                    vec![]
+                };
+                Ok(Box::new(MockReferenceTableSource::new(snap, vec![])))
+            }),
+        );
+
+        db.execute("CREATE SOURCE events (x INT) WITH (connector = 'mock', format = 'json')")
+            .await
+            .unwrap();
+
+        db.execute(
+            "CREATE TABLE t1 (id INT PRIMARY KEY, symbol VARCHAR NOT NULL) \
+             WITH (connector = 'mock', format = 'json')",
+        )
+        .await
+        .unwrap();
+
+        db.execute(
+            "CREATE TABLE t2 (id INT PRIMARY KEY, symbol VARCHAR NOT NULL) \
+             WITH (connector = 'mock', format = 'json')",
+        )
+        .await
+        .unwrap();
+
+        db.start().await.unwrap();
+
+        let ts = db.table_store.lock();
+        // Both tables should be snapshot-populated (order may vary)
+        let total = ts.table_row_count("t1") + ts.table_row_count("t2");
+        assert_eq!(total, 3); // 1 + 2
+        assert!(ts.is_ready("t1"));
+        assert!(ts.is_ready("t2"));
+    }
+
+    #[tokio::test]
+    async fn test_table_create_with_refresh_mode() {
+        let db = LaminarDB::open().unwrap();
+
+        // Just test DDL parsing — no need to register a mock factory
+        db.execute(
+            "CREATE TABLE t (id INT PRIMARY KEY, name VARCHAR NOT NULL) \
+             WITH (connector = 'mock', format = 'json', refresh = 'cdc')",
+        )
+        .await
+        .unwrap();
+
+        let mgr = db.connector_manager.lock();
+        let reg = mgr.tables().get("t").unwrap();
+        assert_eq!(
+            reg.refresh,
+            Some(laminar_connectors::reference::RefreshMode::SnapshotPlusCdc)
+        );
+    }
+
+    #[tokio::test]
+    async fn test_table_source_snapshot_only_no_changes() {
+        let db = LaminarDB::open().unwrap();
+        let snap = table_test_batch(&[1], &["AAPL"]);
+        let change = table_test_batch(&[2], &["GOOG"]);
+        register_mock_table_source(&db, vec![snap], vec![change]);
+
+        db.execute(
+            "CREATE SOURCE events (symbol VARCHAR, price DOUBLE) \
+             WITH (connector = 'mock', format = 'json')",
+        )
+        .await
+        .unwrap();
+
+        db.execute(
+            "CREATE TABLE instruments (id INT PRIMARY KEY, symbol VARCHAR NOT NULL) \
+             WITH (connector = 'mock', format = 'json', refresh = 'snapshot_only')",
+        )
+        .await
+        .unwrap();
+
+        db.start().await.unwrap();
+
+        // Should have snapshot data but not the change batch (it's snapshot_only)
+        let mut ts = db.table_store.lock();
+        assert!(ts.is_ready("instruments"));
+        assert_eq!(ts.table_row_count("instruments"), 1);
+        // The change batch id=2/GOOG should NOT be present
+        assert!(ts.lookup("instruments", "2").is_none());
+    }
+
+    // ── F-CONN-002C: PARTIAL Cache Mode DDL tests ──
+
+    #[tokio::test]
+    async fn test_create_table_partial_cache_mode() {
+        let db = LaminarDB::open().unwrap();
+        db.execute(
+            "CREATE TABLE large_dim (\
+             id INT PRIMARY KEY, \
+             name VARCHAR\
+             ) WITH (cache_mode = 'partial')",
+        )
+        .await
+        .unwrap();
+
+        // Verify table exists
+        {
+            let ts = db.table_store.lock();
+            assert!(ts.has_table("large_dim"));
+            // Cache metrics should exist for partial-mode tables
+        }
+
+        // Insert some data
+        db.execute("INSERT INTO large_dim VALUES (1, 'Alice')")
+            .await
+            .unwrap();
+        db.execute("INSERT INTO large_dim VALUES (2, 'Bob')")
+            .await
+            .unwrap();
+
+        let ts = db.table_store.lock();
+        assert_eq!(ts.table_row_count("large_dim"), 2);
+    }
+
+    #[tokio::test]
+    async fn test_create_table_partial_with_max_entries() {
+        let db = LaminarDB::open().unwrap();
+        db.execute(
+            "CREATE TABLE customers (\
+             id INT PRIMARY KEY, \
+             name VARCHAR\
+             ) WITH (cache_mode = 'partial', cache_max_entries = '10000')",
+        )
+        .await
+        .unwrap();
+
+        let ts = db.table_store.lock();
+        assert!(ts.has_table("customers"));
+        // Verify the cache metrics report the correct max_entries
+        let metrics = ts.cache_metrics("customers").unwrap();
+        assert_eq!(metrics.cache_max_entries, 10000);
+    }
+
+    #[tokio::test]
+    async fn test_create_table_invalid_cache_max_entries() {
+        let db = LaminarDB::open().unwrap();
+        let result = db
+            .execute(
+                "CREATE TABLE bad (\
+                 id INT PRIMARY KEY, \
+                 name VARCHAR\
+                 ) WITH (cache_mode = 'partial', cache_max_entries = 'not_a_number')",
+            )
+            .await;
+        assert!(result.is_err());
+        assert!(result
+            .unwrap_err()
+            .to_string()
+            .contains("cache_max_entries"));
     }
 }
