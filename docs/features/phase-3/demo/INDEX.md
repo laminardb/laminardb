@@ -8,9 +8,10 @@ Production-style market data demo showcasing LaminarDB's streaming SQL capabilit
 |----|---------|----------|--------|------|
 | F-DEMO-001 | Market Data Pipeline | P0 | ✅ Done | [Link](F-DEMO-001-market-data-pipeline.md) |
 | F-DEMO-002 | Ratatui TUI Dashboard | P0 | ✅ Done | [Link](F-DEMO-002-ratatui-tui.md) |
-| F-DEMO-003 | Kafka Integration & Docker | P1 | 📝 Draft | [Link](F-DEMO-003-kafka-docker.md) |
-| F-DEMO-004 | DAG Pipeline Visualization | P1 | 📝 Draft | [Link](F-DEMO-004-dag-visualization.md) |
-| F-DEMO-005 | Tumbling Windows & ASOF JOIN Demo | P1 | 🚧 In Progress | - |
+| F-DEMO-003 | Kafka Integration & Docker | P1 | ✅ Done | [Link](F-DEMO-003-kafka-docker.md) |
+| F-DEMO-004 | DAG Pipeline Visualization | P1 | ✅ Done | [Link](F-DEMO-004-dag-visualization.md) |
+| F-DEMO-005 | Tumbling Windows & ASOF JOIN Demo | P1 | ✅ Done | - |
+| F-DEMO-006 | Kafka Mode TUI Dashboard | P0 | ✅ Done | [Link](../F-DEMO-006-kafka-tui.md) |
 
 ## Architecture
 

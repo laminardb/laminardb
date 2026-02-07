@@ -291,6 +291,18 @@ impl<T: Record> SourceHandle<T> {
         self.entry.source.pending()
     }
 
+    /// Buffer capacity.
+    #[must_use]
+    pub fn capacity(&self) -> usize {
+        self.entry.source.capacity()
+    }
+
+    /// Whether the source buffer is experiencing backpressure (>80% full).
+    #[must_use]
+    pub fn is_backpressured(&self) -> bool {
+        crate::metrics::is_backpressured(self.pending(), self.capacity())
+    }
+
     /// Get the source name.
     #[must_use]
     pub fn name(&self) -> &str {
@@ -301,6 +313,12 @@ impl<T: Record> SourceHandle<T> {
     #[must_use]
     pub fn schema(&self) -> &SchemaRef {
         &self.entry.schema
+    }
+
+    /// Get the maximum out-of-orderness duration, if configured.
+    #[must_use]
+    pub fn max_out_of_orderness(&self) -> Option<Duration> {
+        self.entry.max_out_of_orderness
     }
 }
 
@@ -347,6 +365,24 @@ impl UntypedSourceHandle {
         self.entry.source.current_watermark()
     }
 
+    /// Number of buffered records.
+    #[must_use]
+    pub fn pending(&self) -> usize {
+        self.entry.source.pending()
+    }
+
+    /// Buffer capacity.
+    #[must_use]
+    pub fn capacity(&self) -> usize {
+        self.entry.source.capacity()
+    }
+
+    /// Whether the source buffer is experiencing backpressure (>80% full).
+    #[must_use]
+    pub fn is_backpressured(&self) -> bool {
+        crate::metrics::is_backpressured(self.pending(), self.capacity())
+    }
+
     /// Get the source name.
     #[must_use]
     pub fn name(&self) -> &str {
@@ -357,6 +393,12 @@ impl UntypedSourceHandle {
     #[must_use]
     pub fn schema(&self) -> &SchemaRef {
         &self.entry.schema
+    }
+
+    /// Get the maximum out-of-orderness duration, if configured.
+    #[must_use]
+    pub fn max_out_of_orderness(&self) -> Option<Duration> {
+        self.entry.max_out_of_orderness
     }
 }
 

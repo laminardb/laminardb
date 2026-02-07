@@ -29,6 +29,13 @@ INTO KAFKA (
     format = 'json'
 );
 
+CREATE SINK spread_output FROM spread_metrics
+INTO KAFKA (
+    brokers = '${KAFKA_BROKERS}',
+    topic = 'spread-metrics',
+    format = 'json'
+);
+
 CREATE SINK depth_output FROM depth_metrics
 INTO KAFKA (
     brokers = '${KAFKA_BROKERS}',

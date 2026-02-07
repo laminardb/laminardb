@@ -9,6 +9,14 @@
 **Date**: 2026-02-07
 
 ### What Was Accomplished
+- **F-OBS-001: Pipeline Observability API** - COMPLETE (23 new tests, 253 laminar-db tests total)
+  - `metrics.rs` (NEW): `PipelineState`, `PipelineCounters` (atomic), `PipelineMetrics`, `SourceMetrics`, `StreamMetrics`, `CounterSnapshot`, `is_backpressured()`, `utilization()` (10 unit tests)
+  - `db.rs`: Added `counters: Arc<PipelineCounters>`, `start_time: Instant` fields; 7 public API methods: `metrics()`, `source_metrics()`, `all_source_metrics()`, `stream_metrics()`, `all_stream_metrics()`, `total_events_processed()`, `counters()`; instrumented both `start_embedded_pipeline` and `start_connector_pipeline` with counter increments for events_ingested/emitted/cycles/batches + cycle timing (13 integration tests)
+  - `handle.rs`: Added `capacity()`, `is_backpressured()` to `SourceHandle<T>` and `pending()`, `capacity()`, `is_backpressured()` to `UntypedSourceHandle`
+  - `catalog.rs`: Added `get_stream_entry()` for stream metrics access
+  - `lib.rs`: Added `mod metrics;` and re-exports for all public metric types
+
+Previous session (2026-02-07):
 - **F-CONN-002D: RocksDB-Backed Persistent Table Store** - COMPLETE (10 new tests, 223 laminar-db tests with rocksdb)
   - `table_backend.rs` (NEW): `TableBackend` enum (InMemory/Persistent), Arrow IPC serde, `RocksDB` config (bloom filter, LZ4, block-based table), `open_rocksdb_for_tables()` (8 tests)
   - `table_provider.rs` (NEW): `ReferenceTableProvider` implementing DataFusion `TableProvider` — live scan from `TableStore`, no re-registration needed (5 tests)
@@ -31,12 +39,12 @@ Previous session (2026-02-07):
 
 ### Where We Left Off
 
-**Phase 3: 53/67 features COMPLETE (79%)**
+**Phase 3: 54/67 features COMPLETE (81%)**
 
 All Phase 1 (12), Phase 1.5 (1), and Phase 2 (34) features are complete.
 See [INDEX.md](./features/INDEX.md) for the full feature-by-feature breakdown.
 
-**Test counts**: ~2,641 base, ~2,651+ with `rocksdb`, ~2,980+ with all feature flags (`kafka`, `postgres-cdc`, `postgres-sink`, `delta-lake`, `mysql-cdc`, `ffi`, `rocksdb`)
+**Test counts**: ~2,664 base, ~2,674+ with `rocksdb`, ~3,000+ with all feature flags (`kafka`, `postgres-cdc`, `postgres-sink`, `delta-lake`, `mysql-cdc`, `ffi`, `rocksdb`)
 
 ### Immediate Next Steps
 1. F-OBS-001: Pipeline Observability API

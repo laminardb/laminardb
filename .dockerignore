@@ -1,0 +1,24 @@
+# Build artifacts (20-30GB+)
+target/
+
+# Version control
+.git/
+
+# IDE / editor
+.vscode/
+.idea/
+*.swp
+*.swo
+
+# Documentation not needed in build
+docs/
+*.md
+
+# CI / config
+.github/
+.claude/
+
+# OS files
+nul
+Thumbs.db
+.DS_Store

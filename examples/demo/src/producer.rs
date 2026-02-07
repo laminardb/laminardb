@@ -10,13 +10,13 @@
 use std::time::Duration;
 
 use rdkafka::config::ClientConfig;
-use rdkafka::producer::FutureProducer;
+use rdkafka::producer::{FutureProducer, Producer};
 
 use laminardb_demo::generator::{self, MarketGenerator};
 
 #[tokio::main]
 async fn main() -> Result<(), Box<dyn std::error::Error>> {
-    let brokers = std::env::var("KAFKA_BROKERS").unwrap_or_else(|_| "localhost:9092".into());
+    let brokers = std::env::var("KAFKA_BROKERS").unwrap_or_else(|_| "localhost:19092".into());
     let rate: usize = std::env::var("PRODUCER_RATE")
         .unwrap_or_else(|_| "10".into())
         .parse()
@@ -25,6 +25,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     eprintln!("=== LaminarDB Market Data Producer ===");
     eprintln!("  Brokers: {brokers}");
     eprintln!("  Rate: {rate} ticks/symbol per batch");
+    eprintln!("  Press Ctrl+C to stop");
     eprintln!();
 
     let producer: FutureProducer = ClientConfig::new()
@@ -43,16 +44,40 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         let orders = gen.generate_kafka_orders(rate / 2, ts);
         let book_updates = gen.generate_kafka_book_updates(ts);
 
-        let tick_count = generator::produce_to_kafka(&producer, "market-ticks", &ticks).await?;
-        let order_count = generator::produce_to_kafka(&producer, "order-events", &orders).await?;
+        let tick_count =
+            generator::produce_to_kafka_keyed(&producer, "market-ticks", &ticks, |t| {
+                Some(&t.symbol)
+            })
+            .await?;
+        let order_count =
+            generator::produce_to_kafka_keyed(&producer, "order-events", &orders, |o| {
+                Some(&o.symbol)
+            })
+            .await?;
         let book_count =
-            generator::produce_to_kafka(&producer, "book-updates", &book_updates).await?;
+            generator::produce_to_kafka_keyed(&producer, "book-updates", &book_updates, |b| {
+                Some(&b.symbol)
+            })
+            .await?;
 
         eprintln!(
             "[cycle {}] Produced {} ticks, {} orders, {} book updates",
             cycle, tick_count, order_count, book_count
         );
 
-        tokio::time::sleep(Duration::from_secs(1)).await;
+        // Wait for next cycle or shutdown signal
+        tokio::select! {
+            _ = tokio::signal::ctrl_c() => {
+                eprintln!("\nShutting down producer...");
+                break;
+            }
+            _ = tokio::time::sleep(Duration::from_secs(1)) => {}
+        }
     }
+
+    // Flush in-flight messages before exit
+    producer.flush(Duration::from_secs(5))?;
+    eprintln!("Producer stopped. All in-flight messages flushed.");
+
+    Ok(())
 }

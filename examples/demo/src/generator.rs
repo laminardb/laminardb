@@ -310,12 +310,33 @@ pub async fn produce_to_kafka<T: serde::Serialize>(
     topic: &str,
     events: &[T],
 ) -> Result<usize, Box<dyn std::error::Error>> {
+    produce_to_kafka_keyed(producer, topic, events, |_| None).await
+}
+
+/// Produce events to a Kafka topic with an optional message key for partitioning.
+///
+/// When `key_fn` returns `Some(key)`, messages with the same key are routed to
+/// the same partition, ensuring co-partitioned processing (e.g., by symbol).
+#[cfg(feature = "kafka")]
+pub async fn produce_to_kafka_keyed<T, F>(
+    producer: &rdkafka::producer::FutureProducer,
+    topic: &str,
+    events: &[T],
+    key_fn: F,
+) -> Result<usize, Box<dyn std::error::Error>>
+where
+    T: serde::Serialize,
+    F: Fn(&T) -> Option<&str>,
+{
     use rdkafka::producer::FutureRecord;
 
     let mut count = 0;
     for event in events {
         let json = serde_json::to_string(event)?;
-        let record = FutureRecord::<(), _>::to(topic).payload(&json);
+        let mut record = FutureRecord::<str, _>::to(topic).payload(&json);
+        if let Some(key) = key_fn(event) {
+            record = record.key(key);
+        }
         producer
             .send(record, std::time::Duration::from_secs(5))
             .await

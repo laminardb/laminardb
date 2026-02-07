@@ -30,6 +30,10 @@ docker exec "$CONTAINER" rpk topic create book-updates \
     --partitions 5 \
     --config retention.ms=3600000
 
+docker exec "$CONTAINER" rpk topic create spread-metrics \
+    --partitions 5 \
+    --config retention.ms=3600000
+
 docker exec "$CONTAINER" rpk topic create book-imbalance \
     --partitions 5 \
     --config retention.ms=3600000

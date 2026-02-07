@@ -1,5 +1,3 @@
-version: "3.8"
-
 services:
   redpanda:
     image: docker.redpanda.com/redpandadata/redpanda:v24.2.5
@@ -46,3 +44,57 @@ services:
           adminApi:
             enabled: true
             urls: ["http://redpanda:9644"]
+
+  init-topics:
+    image: docker.redpanda.com/redpandadata/redpanda:v24.2.5
+    container_name: laminardb-demo-init-topics
+    depends_on:
+      redpanda:
+        condition: service_healthy
+    restart: "no"
+    entrypoint: /bin/bash
+    command:
+      - -c
+      - |
+        set -e
+        echo "Creating topics..."
+        rpk topic create market-ticks    --brokers redpanda:9092 --partitions 5 --config retention.ms=3600000
+        rpk topic create order-events    --brokers redpanda:9092 --partitions 5 --config retention.ms=3600000
+        rpk topic create ohlc-bars       --brokers redpanda:9092 --partitions 5 --config retention.ms=3600000
+        rpk topic create volume-metrics  --brokers redpanda:9092 --partitions 5 --config retention.ms=3600000
+        rpk topic create anomaly-alerts  --brokers redpanda:9092 --partitions 1 --config retention.ms=3600000
+        rpk topic create book-updates    --brokers redpanda:9092 --partitions 5 --config retention.ms=3600000
+        rpk topic create spread-metrics  --brokers redpanda:9092 --partitions 5 --config retention.ms=3600000
+        rpk topic create book-imbalance  --brokers redpanda:9092 --partitions 5 --config retention.ms=3600000
+        rpk topic create depth-metrics   --brokers redpanda:9092 --partitions 5 --config retention.ms=3600000
+        echo "All topics created:"
+        rpk topic list --brokers redpanda:9092
+
+  producer:
+    build:
+      context: ../..
+      dockerfile: examples/demo/Dockerfile
+    container_name: laminardb-demo-producer
+    depends_on:
+      init-topics:
+        condition: service_completed_successfully
+    entrypoint: ["producer"]
+    environment:
+      KAFKA_BROKERS: redpanda:9092
+      PRODUCER_RATE: "10"
+
+  demo:
+    build:
+      context: ../..
+      dockerfile: examples/demo/Dockerfile
+    container_name: laminardb-demo-consumer
+    depends_on:
+      init-topics:
+        condition: service_completed_successfully
+    entrypoint: ["demo"]
+    environment:
+      DEMO_MODE: kafka
+      KAFKA_BROKERS: redpanda:9092
+      GROUP_ID: laminardb-demo
+    stdin_open: true
+    tty: true

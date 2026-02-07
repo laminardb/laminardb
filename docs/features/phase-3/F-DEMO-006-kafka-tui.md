@@ -5,7 +5,7 @@
 | Field | Value |
 |-------|-------|
 | **ID** | F-DEMO-006 |
-| **Status** | 📝 Draft |
+| **Status** | ✅ Done |
 | **Priority** | P0 |
 | **Phase** | 3 |
 | **Effort** | M (2-3 days) |

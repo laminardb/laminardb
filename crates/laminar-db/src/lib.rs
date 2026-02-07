@@ -32,6 +32,7 @@ mod connector_manager;
 mod db;
 mod error;
 mod handle;
+mod metrics;
 mod pipeline_checkpoint;
 mod sql_utils;
 mod stream_executor;
@@ -74,6 +75,7 @@ pub use handle::{
     PipelineTopology, QueryHandle, QueryInfo, SinkInfo, SourceHandle, SourceInfo, StreamInfo,
     TypedSubscription, UntypedSourceHandle,
 };
+pub use metrics::{PipelineCounters, PipelineMetrics, PipelineState, SourceMetrics, StreamMetrics};
 pub use pipeline_checkpoint::PipelineCheckpoint;
 
 /// Re-export the connector registry for custom connector registration.
