@@ -1389,7 +1389,8 @@ impl StreamJoinOperator {
     /// Updates the output schema when both input schemas are known.
     fn update_output_schema(&mut self) {
         if let (Some(left), Some(right)) = (&self.left_schema, &self.right_schema) {
-            let mut fields: Vec<Field> = Vec::with_capacity(left.fields().len() + right.fields().len());
+            let mut fields: Vec<Field> =
+                Vec::with_capacity(left.fields().len() + right.fields().len());
             fields.extend(left.fields().iter().map(|f| f.as_ref().clone()));
 
             // Add right fields, prefixing duplicates
@@ -1807,7 +1808,8 @@ impl StreamJoinOperator {
     fn concat_batches(&self, left: &RecordBatch, right: &RecordBatch) -> Option<RecordBatch> {
         let schema = self.output_schema.as_ref()?;
 
-        let mut columns: Vec<ArrayRef> = Vec::with_capacity(left.num_columns() + right.num_columns());
+        let mut columns: Vec<ArrayRef> =
+            Vec::with_capacity(left.num_columns() + right.num_columns());
         columns.extend(left.columns().iter().cloned());
         columns.extend(right.columns().iter().cloned());
 

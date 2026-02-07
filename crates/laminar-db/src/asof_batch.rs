@@ -128,7 +128,8 @@ pub(crate) fn execute_asof_join_batch(
 
     // Build right-side index: key_hash -> BTreeMap<timestamp, row_index>
     // Keyed by hash to avoid per-row String allocations.
-    let mut right_index: HashMap<u64, BTreeMap<i64, usize>> = HashMap::with_capacity(right.num_rows());
+    let mut right_index: HashMap<u64, BTreeMap<i64, usize>> =
+        HashMap::with_capacity(right.num_rows());
     let right_keys_col;
     if right.num_rows() > 0 {
         right_keys_col = Some(extract_key_column(&right, &config.key_column)?);
@@ -229,7 +230,6 @@ fn find_match(
         }
     })
 }
-
 
 /// Extract a column's values as `i64` timestamps (epoch millis).
 fn extract_column_as_timestamps(batch: &RecordBatch, col_name: &str) -> Result<Vec<i64>, DbError> {

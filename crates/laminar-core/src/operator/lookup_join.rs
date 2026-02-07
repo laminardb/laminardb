@@ -586,8 +586,10 @@ impl LookupJoinOperator {
 
         if ctx.state.put_typed(&cache_key, &entry).is_ok() {
             // Populate in-memory batch cache (Arc wrap for cheap cache-hit cloning)
-            self.batch_cache
-                .insert(cache_key.clone(), result.as_ref().map(|b| Arc::new(b.clone())));
+            self.batch_cache.insert(
+                cache_key.clone(),
+                result.as_ref().map(|b| Arc::new(b.clone())),
+            );
 
             // Register TTL timer
             let expiry_time = ctx.processing_time + self.cache_ttl_us;
@@ -630,7 +632,8 @@ impl LookupJoinOperator {
         // Deserialize and cache the batch (one-time Arc wrap)
         let result = entry.to_batch().ok()?;
         let arc_result = result.map(Arc::new);
-        self.batch_cache.insert(cache_key.to_vec(), arc_result.clone());
+        self.batch_cache
+            .insert(cache_key.to_vec(), arc_result.clone());
         Some(arc_result)
     }
 
