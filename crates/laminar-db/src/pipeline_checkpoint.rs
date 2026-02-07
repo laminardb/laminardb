@@ -398,12 +398,17 @@ mod tests {
         let cp_dir = dir.path().join("pipeline_checkpoints");
         let json_files: Vec<_> = std::fs::read_dir(&cp_dir)
             .unwrap()
-            .filter_map(|e| e.ok())
+            .filter_map(std::result::Result::ok)
             .filter(|e| {
                 e.path()
                     .file_name()
                     .and_then(|n| n.to_str())
-                    .is_some_and(|n| n.starts_with("checkpoint_") && n.ends_with(".json"))
+                    .is_some_and(|n| {
+                        n.starts_with("checkpoint_")
+                            && std::path::Path::new(n)
+                                .extension()
+                                .is_some_and(|ext| ext.eq_ignore_ascii_case("json"))
+                    })
             })
             .collect();
 

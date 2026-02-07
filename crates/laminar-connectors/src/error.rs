@@ -245,7 +245,7 @@ mod tests {
             got: 3,
         };
         let msg = err.to_string();
-        assert!(msg.contains("5"));
-        assert!(msg.contains("3"));
+        assert!(msg.contains('5'));
+        assert!(msg.contains('3'));
     }
 }

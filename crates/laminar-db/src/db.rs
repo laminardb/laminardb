@@ -3765,7 +3765,7 @@ mod tests {
             .unwrap();
 
         let batches = df.collect().await.unwrap();
-        let total_rows: usize = batches.iter().map(|b| b.num_rows()).sum();
+        let total_rows: usize = batches.iter().map(RecordBatch::num_rows).sum();
         // AAPL(100), MSFT(50) pass; GOOG(5) filtered
         assert_eq!(total_rows, 2);
     }
@@ -3797,7 +3797,7 @@ mod tests {
         let batches = df.collect().await.unwrap();
         assert!(!batches.is_empty());
 
-        let total_rows: usize = batches.iter().map(|b| b.num_rows()).sum();
+        let total_rows: usize = batches.iter().map(RecordBatch::num_rows).sum();
         // A: 300 > 100 ✓, B: 80 ✗, C: 500 > 100 ✓
         assert_eq!(total_rows, 2);
     }
@@ -3821,7 +3821,7 @@ mod tests {
             .unwrap();
 
         let batches = df.collect().await.unwrap();
-        let total_rows: usize = batches.iter().map(|b| b.num_rows()).sum();
+        let total_rows: usize = batches.iter().map(RecordBatch::num_rows).sum();
         assert_eq!(total_rows, 0);
     }
 
@@ -3850,7 +3850,7 @@ mod tests {
             .unwrap();
 
         let batches = df.collect().await.unwrap();
-        let total_rows: usize = batches.iter().map(|b| b.num_rows()).sum();
+        let total_rows: usize = batches.iter().map(RecordBatch::num_rows).sum();
         // A: cnt=2>=2 AND total=300>25 ✓
         // B: cnt=1<2 ✗
         // C: cnt=2>=2 AND total=30>25 ✓
@@ -3900,7 +3900,7 @@ mod tests {
             .unwrap();
 
         let batches = df.collect().await.unwrap();
-        let total_rows: usize = batches.iter().map(|b| b.num_rows()).sum();
+        let total_rows: usize = batches.iter().map(RecordBatch::num_rows).sum();
         assert_eq!(total_rows, 2);
     }
 
@@ -3939,7 +3939,7 @@ mod tests {
             .unwrap();
 
         let batches = df.collect().await.unwrap();
-        let total_rows: usize = batches.iter().map(|b| b.num_rows()).sum();
+        let total_rows: usize = batches.iter().map(RecordBatch::num_rows).sum();
         assert_eq!(total_rows, 2);
     }
 
@@ -3983,7 +3983,7 @@ mod tests {
             .unwrap();
 
         let batches = df.collect().await.unwrap();
-        let total_rows: usize = batches.iter().map(|b| b.num_rows()).sum();
+        let total_rows: usize = batches.iter().map(RecordBatch::num_rows).sum();
         assert_eq!(total_rows, 2);
     }
 
@@ -4018,7 +4018,7 @@ mod tests {
             .unwrap();
 
         let batches = df.collect().await.unwrap();
-        let total_rows: usize = batches.iter().map(|b| b.num_rows()).sum();
+        let total_rows: usize = batches.iter().map(RecordBatch::num_rows).sum();
         assert_eq!(total_rows, 2);
     }
 
@@ -4048,7 +4048,7 @@ mod tests {
             .unwrap();
 
         let batches = df.collect().await.unwrap();
-        let total_rows: usize = batches.iter().map(|b| b.num_rows()).sum();
+        let total_rows: usize = batches.iter().map(RecordBatch::num_rows).sum();
         assert_eq!(total_rows, 5);
 
         // Verify moving average values: row 3 → avg(10,20,30) = 20
@@ -4083,7 +4083,7 @@ mod tests {
             .unwrap();
 
         let batches = df.collect().await.unwrap();
-        let total_rows: usize = batches.iter().map(|b| b.num_rows()).sum();
+        let total_rows: usize = batches.iter().map(RecordBatch::num_rows).sum();
         assert_eq!(total_rows, 3);
 
         let sum_col = batches[0]
@@ -4118,7 +4118,7 @@ mod tests {
             .unwrap();
 
         let batches = df.collect().await.unwrap();
-        let total_rows: usize = batches.iter().map(|b| b.num_rows()).sum();
+        let total_rows: usize = batches.iter().map(RecordBatch::num_rows).sum();
         assert_eq!(total_rows, 4);
 
         let max_col = batches[0]
@@ -4153,7 +4153,7 @@ mod tests {
             .unwrap();
 
         let batches = df.collect().await.unwrap();
-        let total_rows: usize = batches.iter().map(|b| b.num_rows()).sum();
+        let total_rows: usize = batches.iter().map(RecordBatch::num_rows).sum();
         assert_eq!(total_rows, 4);
 
         let cnt_col = batches[0]
@@ -4170,7 +4170,7 @@ mod tests {
 
     // ── F-CONN-002B: Connector-Backed Table Population ──
 
-    /// Helper: create a test RecordBatch for table population tests.
+    /// Helper: create a test `RecordBatch` for table population tests.
     fn table_test_batch(ids: &[i32], symbols: &[&str]) -> RecordBatch {
         use arrow::array::Int32Array;
         let schema = Arc::new(Schema::new(vec![
@@ -4275,11 +4275,12 @@ mod tests {
 
     #[tokio::test]
     async fn test_table_source_multiple_tables() {
+        use laminar_connectors::config::ConnectorInfo;
+        use laminar_connectors::reference::MockReferenceTableSource;
+
         let db = LaminarDB::open().unwrap();
 
         // Register two separate mock factories
-        use laminar_connectors::config::ConnectorInfo;
-        use laminar_connectors::reference::MockReferenceTableSource;
 
         let call_count = std::sync::Arc::new(std::sync::atomic::AtomicU32::new(0));
         let cc = call_count.clone();
@@ -4404,10 +4405,11 @@ mod tests {
         .unwrap();
 
         // Verify table exists
-        let ts = db.table_store.lock();
-        assert!(ts.has_table("large_dim"));
-        // Cache metrics should exist for partial-mode tables
-        drop(ts);
+        {
+            let ts = db.table_store.lock();
+            assert!(ts.has_table("large_dim"));
+            // Cache metrics should exist for partial-mode tables
+        }
 
         // Insert some data
         db.execute("INSERT INTO large_dim VALUES (1, 'Alice')")

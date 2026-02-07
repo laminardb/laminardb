@@ -95,7 +95,7 @@ mod tests {
     use std::sync::Arc;
 
     use super::*;
-    use arrow::array::{Float64Array, Int32Array, StringArray};
+    use arrow::array::{Float64Array, Int32Array, RecordBatch, StringArray};
     use arrow::datatypes::{DataType, Field, Schema};
     use datafusion::prelude::SessionContext;
 
@@ -147,7 +147,7 @@ mod tests {
 
         let df = ctx.sql("SELECT * FROM test").await.unwrap();
         let batches = df.collect().await.unwrap();
-        let total_rows: usize = batches.iter().map(|b| b.num_rows()).sum();
+        let total_rows: usize = batches.iter().map(RecordBatch::num_rows).sum();
         assert_eq!(total_rows, 0);
     }
 
@@ -168,7 +168,7 @@ mod tests {
 
         let df = ctx.sql("SELECT * FROM test").await.unwrap();
         let batches = df.collect().await.unwrap();
-        let total_rows: usize = batches.iter().map(|b| b.num_rows()).sum();
+        let total_rows: usize = batches.iter().map(RecordBatch::num_rows).sum();
         assert_eq!(total_rows, 2);
     }
 

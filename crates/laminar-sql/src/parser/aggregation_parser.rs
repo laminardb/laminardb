@@ -1165,7 +1165,7 @@ mod tests {
         assert!(analysis.has_having);
         let expr = analysis.having_expr.unwrap();
         assert!(expr.contains("COUNT(*)"), "expr was: {expr}");
-        assert!(expr.contains("5"), "expr was: {expr}");
+        assert!(expr.contains('5'), "expr was: {expr}");
     }
 
     #[test]

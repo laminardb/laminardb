@@ -519,7 +519,7 @@ mod tests {
     #[test]
     fn test_lru_hit_rate_zero_gets() {
         let cache = TableLruCache::new(10);
-        assert_eq!(cache.hit_rate(), 0.0);
+        assert!((cache.hit_rate() - 0.0).abs() < f64::EPSILON);
     }
 
     #[test]
