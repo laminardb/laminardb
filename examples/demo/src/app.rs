@@ -3,7 +3,7 @@
 use std::collections::{HashMap, VecDeque};
 use std::time::{Duration, Instant};
 
-use laminar_db::PipelineTopology;
+use laminar_db::{PipelineMetrics, PipelineTopology};
 
 use crate::asof_merge::TickIndex;
 use crate::generator::SYMBOLS;
@@ -75,6 +75,14 @@ pub struct App {
     // -- System stats --
     pub system_stats: SystemStats,
 
+    // -- Checkpoint state --
+    pub last_checkpoint_epoch: Option<u64>,
+    pub last_checkpoint_time: Option<Instant>,
+    pub recovered_from_epoch: Option<u64>,
+
+    // -- Pipeline metrics from F-OBS-001 --
+    pub pipeline_metrics: Option<PipelineMetrics>,
+
     // -- Previous anomaly state for threshold detection --
     prev_anomaly: HashMap<String, i64>,
 }
@@ -122,6 +130,10 @@ impl App {
             microprices: HashMap::new(),
             imbalance_history: HashMap::new(),
             system_stats: SystemStats::default(),
+            last_checkpoint_epoch: None,
+            last_checkpoint_time: None,
+            recovered_from_epoch: None,
+            pipeline_metrics: None,
             prev_anomaly: HashMap::new(),
         }
     }
@@ -338,6 +350,22 @@ impl App {
         }
         stats.cpu_history.push_back(stats.cpu_usage as u64);
         self.system_stats = stats;
+    }
+
+    /// Record a successful checkpoint.
+    pub fn record_checkpoint(&mut self, epoch: u64) {
+        self.last_checkpoint_epoch = Some(epoch);
+        self.last_checkpoint_time = Some(Instant::now());
+    }
+
+    /// Time elapsed since the last checkpoint, if any.
+    pub fn time_since_checkpoint(&self) -> Option<Duration> {
+        self.last_checkpoint_time.map(|t| t.elapsed())
+    }
+
+    /// Update pipeline metrics snapshot from `db.metrics()`.
+    pub fn update_pipeline_metrics(&mut self, metrics: PipelineMetrics) {
+        self.pipeline_metrics = Some(metrics);
     }
 
     /// Add a timestamped alert.

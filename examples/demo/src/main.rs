@@ -19,22 +19,14 @@
 //! DEMO_MODE=kafka cargo run -p laminardb-demo --features kafka
 //! ```
 //!
-//! # Core API Gaps
+//! # Observability
 //!
-//! The following observability APIs are not yet available in LaminarDB:
-//! - **No system metrics API**: `LaminarDB` has no `db.metrics()` for CPU/memory/latency.
-//!   Workaround: use `sysinfo` crate directly.
-//! - **No pipeline latency tracking**: No way to measure push-to-poll end-to-end latency.
-//!   Workaround: manual timestamp comparison.
-//! - **No event counters**: No `db.total_events_processed()`.
-//!   Workaround: track `total_ticks` manually in app.
-//! - **No per-stream metrics**: Can't query `db.stream_stats("ohlc_bars")` for
-//!   throughput/backpressure. Workaround: not available.
-//! - **No backpressure feedback**: `push_batch()` silently drops when channel full;
-//!   no `is_backpressured()`. Workaround: accept silent drops.
-//! - **No watermark visibility**: Can't observe internal watermark state of streams.
-//! - **No queue depth introspection**: Only `source.pending()` exists; no sink/stream
-//!   queue depth.
+//! Pipeline metrics are provided by `db.metrics()` (F-OBS-001):
+//! - Event counters: `total_events_ingested`, `total_events_emitted`
+//! - Cycle metrics: `total_cycles`, `last_cycle_duration_ns`
+//! - Pipeline watermark: `pipeline_watermark`
+//! - Source/stream backpressure: `db.source_metrics()`, `db.stream_metrics()`
+//! - System stats (CPU/memory) use `sysinfo` directly.
 
 use std::io;
 use std::time::Duration;
@@ -47,6 +39,7 @@ use crossterm::terminal::{
 use ratatui::backend::CrosstermBackend;
 use ratatui::Terminal;
 
+use laminar_core::streaming::StreamCheckpointConfig;
 use laminar_db::LaminarDB;
 
 use laminardb_demo::app::App;
@@ -256,11 +249,18 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
 /// Embedded mode: in-memory sources, continuous data generation, Ratatui dashboard.
 async fn run_embedded_mode() -> Result<(), Box<dyn std::error::Error>> {
     // -- Build LaminarDB --
+    let ckpt_dir = std::env::temp_dir().join("laminardb-demo-ckpt");
     let db = LaminarDB::builder()
         .config_var("KAFKA_BROKERS", "localhost:19092")
         .config_var("GROUP_ID", "demo")
         .config_var("ENVIRONMENT", "development")
         .buffer_size(65536)
+        .checkpoint(StreamCheckpointConfig {
+            data_dir: Some(ckpt_dir),
+            interval_ms: None, // manual only via [c]
+            max_retained: Some(5),
+            ..StreamCheckpointConfig::default()
+        })
         .build()
         .await?;
 
@@ -301,7 +301,7 @@ async fn run_embedded_mode() -> Result<(), Box<dyn std::error::Error>> {
         book_source,
     };
 
-    let result = run_with_tui(&mut app, &mut data_source, &subs).await;
+    let result = run_with_tui(&mut app, &mut data_source, &subs, &db).await;
 
     // -- Shutdown --
     db.shutdown().await?;
@@ -320,11 +320,18 @@ async fn run_kafka_mode() -> Result<(), Box<dyn std::error::Error>> {
     let group_id = std::env::var("GROUP_ID").unwrap_or_else(|_| "laminardb-demo".into());
 
     // -- Build LaminarDB with Kafka config --
+    let ckpt_dir = std::env::temp_dir().join("laminardb-demo-kafka-ckpt");
     let db = LaminarDB::builder()
         .config_var("KAFKA_BROKERS", &brokers)
         .config_var("GROUP_ID", &group_id)
         .config_var("ENVIRONMENT", "kafka-demo")
         .buffer_size(65536)
+        .checkpoint(StreamCheckpointConfig {
+            data_dir: Some(ckpt_dir),
+            interval_ms: None,
+            max_retained: Some(5),
+            ..StreamCheckpointConfig::default()
+        })
         .build()
         .await?;
 
@@ -389,7 +396,7 @@ async fn run_kafka_mode() -> Result<(), Box<dyn std::error::Error>> {
         producer,
     };
 
-    let result = run_with_tui(&mut app, &mut data_source, &subs).await;
+    let result = run_with_tui(&mut app, &mut data_source, &subs, &db).await;
 
     // -- Shutdown --
     db.shutdown().await?;
@@ -403,6 +410,7 @@ async fn run_with_tui<D: PipelineDataSource>(
     app: &mut App,
     data_source: &mut D,
     subs: &Subscriptions,
+    db: &LaminarDB,
 ) -> Result<(), Box<dyn std::error::Error>> {
     enable_raw_mode()?;
     let mut stdout = io::stdout();
@@ -420,7 +428,7 @@ async fn run_with_tui<D: PipelineDataSource>(
 
     let mut stats_collector = StatsCollector::new();
     let result =
-        run_tui_loop(&mut terminal, app, &mut stats_collector, data_source, subs).await;
+        run_tui_loop(&mut terminal, app, &mut stats_collector, data_source, subs, db).await;
 
     // Restore terminal
     disable_raw_mode()?;
@@ -437,6 +445,7 @@ async fn run_tui_loop<D: PipelineDataSource>(
     stats_collector: &mut StatsCollector,
     data_source: &mut D,
     subs: &Subscriptions,
+    db: &LaminarDB,
 ) -> Result<(), Box<dyn std::error::Error>> {
     loop {
         // Render
@@ -462,6 +471,11 @@ async fn run_tui_loop<D: PipelineDataSource>(
                         KeyCode::Char('d') => {
                             app.set_or_toggle_view(ViewMode::Dag);
                         }
+                        KeyCode::Char('c') => {
+                            if let Ok(Some(epoch)) = db.checkpoint() {
+                                app.record_checkpoint(epoch);
+                            }
+                        }
                         _ => {}
                     }
                 }
@@ -472,8 +486,9 @@ async fn run_tui_loop<D: PipelineDataSource>(
             break;
         }
 
-        // Update system stats every cycle (even when paused)
+        // Update system stats and pipeline metrics every cycle (even when paused)
         app.update_system_stats(stats_collector.refresh());
+        app.update_pipeline_metrics(db.metrics());
 
         if !app.paused {
             data_source.push_cycle(app).await?;

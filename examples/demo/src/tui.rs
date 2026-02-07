@@ -35,7 +35,7 @@ pub fn draw(f: &mut Frame, app: &App) {
     draw_footer(f, app, chunks[3]);
 }
 
-/// Header: title, status, uptime, throughput.
+/// Header: title, status, uptime, throughput, watermark, checkpoint.
 fn draw_header(f: &mut Frame, app: &App, area: Rect) {
     let uptime = app.uptime();
     let mins = uptime.as_secs() / 60;
@@ -47,7 +47,7 @@ fn draw_header(f: &mut Frame, app: &App, area: Rect) {
         Color::Green
     };
 
-    let header = Paragraph::new(Line::from(vec![
+    let mut spans = vec![
         Span::styled(
             " LAMINARDB MARKET DATA DEMO ",
             Style::default()
@@ -68,8 +68,40 @@ fn draw_header(f: &mut Frame, app: &App, area: Rect) {
             format!(" | Book: {}", format_count(app.total_book_updates)),
             Style::default().fg(Color::DarkGray),
         ),
-    ]))
-    .block(
+    ];
+
+    // Pipeline watermark from F-OBS-001 metrics
+    if let Some(ref m) = app.pipeline_metrics {
+        if m.pipeline_watermark != i64::MIN {
+            spans.push(Span::styled(
+                format!(" | WM: {}", m.pipeline_watermark),
+                Style::default().fg(Color::Blue),
+            ));
+        }
+    }
+
+    // Checkpoint status
+    if let Some(epoch) = app.last_checkpoint_epoch {
+        let ago = app
+            .time_since_checkpoint()
+            .map_or("?".to_string(), |d| format!("{}s", d.as_secs()));
+        spans.push(Span::styled(
+            format!(" | Ckpt: E{epoch} ({ago} ago)"),
+            Style::default().fg(Color::Magenta),
+        ));
+    }
+
+    // Recovery notice (show for first 10 seconds)
+    if let Some(epoch) = app.recovered_from_epoch {
+        if app.uptime().as_secs() < 10 {
+            spans.push(Span::styled(
+                format!(" | Recovered from E{epoch}"),
+                Style::default().fg(Color::Yellow),
+            ));
+        }
+    }
+
+    let header = Paragraph::new(Line::from(spans)).block(
         Block::default()
             .borders(Borders::ALL)
             .border_style(Style::default().fg(Color::Cyan)),
@@ -873,7 +905,9 @@ fn draw_footer(f: &mut Frame, app: &App, area: Rect) {
         Span::styled("[b] ", Style::default().fg(Color::Yellow)),
         Span::raw("Book  "),
         Span::styled("[d] ", Style::default().fg(Color::Yellow)),
-        Span::raw("Pipeline"),
+        Span::raw("Pipeline  "),
+        Span::styled("[c] ", Style::default().fg(Color::Yellow)),
+        Span::raw("Checkpoint"),
         Span::styled(view_hint, Style::default().fg(Color::DarkGray)),
     ]))
     .block(Block::default().borders(Borders::ALL));

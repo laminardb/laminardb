@@ -7,10 +7,10 @@
 | Phase 1 | 12 | 0 | 0 | 0 | 12 |
 | Phase 1.5 | 1 | 0 | 0 | 0 | 1 |
 | Phase 2 | 34 | 0 | 0 | 0 | 34 |
-| Phase 3 | 67 | 13 | 0 | 0 | 54 |
+| Phase 3 | 67 | 9 | 0 | 0 | 58 |
 | Phase 4 | 11 | 11 | 0 | 0 | 0 |
 | Phase 5 | 10 | 10 | 0 | 0 | 0 |
-| **Total** | **135** | **34** | **0** | **0** | **101** |
+| **Total** | **135** | **30** | **0** | **0** | **105** |
 
 ## Status Legend
 
@@ -216,10 +216,12 @@ See [Demo Index](phase-3/demo/INDEX.md).
 
 | ID | Feature | Status | Spec |
 |----|---------|--------|------|
-| F-DEMO-001 | Market Data Pipeline | 📝 | [Link](phase-3/demo/F-DEMO-001-market-data-pipeline.md) |
-| F-DEMO-002 | Ratatui TUI Dashboard | 📝 | [Link](phase-3/demo/F-DEMO-002-ratatui-tui.md) |
-| F-DEMO-003 | Kafka Integration & Docker | 📝 | [Link](phase-3/demo/F-DEMO-003-kafka-docker.md) |
-| F-DEMO-006 | Kafka Mode TUI Dashboard | 📝 | [Link](phase-3/F-DEMO-006-kafka-tui.md) |
+| F-DEMO-001 | Market Data Pipeline | ✅ | [Link](phase-3/demo/F-DEMO-001-market-data-pipeline.md) |
+| F-DEMO-002 | Ratatui TUI Dashboard | ✅ | [Link](phase-3/demo/F-DEMO-002-ratatui-tui.md) |
+| F-DEMO-003 | Kafka Integration & Docker | ✅ | [Link](phase-3/demo/F-DEMO-003-kafka-docker.md) |
+| F-DEMO-004 | DAG Pipeline Visualization | ✅ | [Link](phase-3/demo/F-DEMO-004-dag-visualization.md) |
+| F-DEMO-005 | Tumbling Windows & ASOF JOIN Demo | ✅ | - |
+| F-DEMO-006 | Kafka Mode TUI Dashboard | ✅ | [Link](phase-3/F-DEMO-006-kafka-tui.md) |
 
 ### FFI & Language Bindings
 
