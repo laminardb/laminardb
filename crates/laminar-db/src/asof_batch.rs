@@ -3,8 +3,10 @@
 //! Implements the ASOF join algorithm for batch data, matching each left row
 //! to the closest right row by timestamp within the same key partition.
 
+use std::collections::hash_map::DefaultHasher;
 use std::collections::BTreeMap;
 use std::collections::HashMap;
+use std::hash::{Hash, Hasher};
 use std::sync::Arc;
 
 use arrow::array::{
@@ -18,6 +20,65 @@ use laminar_sql::parser::join_parser::AsofSqlDirection;
 use laminar_sql::translator::{AsofJoinTranslatorConfig, AsofSqlJoinType};
 
 use crate::error::DbError;
+
+/// A borrowed reference to a key column, avoiding per-row String allocations.
+enum KeyColumn<'a> {
+    Utf8(&'a StringArray),
+    Int64(&'a Int64Array),
+}
+
+impl KeyColumn<'_> {
+    /// Computes a hash for the key at row `i`.
+    fn hash_at(&self, i: usize) -> u64 {
+        let mut hasher = DefaultHasher::new();
+        match self {
+            KeyColumn::Utf8(a) => a.value(i).hash(&mut hasher),
+            KeyColumn::Int64(a) => a.value(i).hash(&mut hasher),
+        }
+        hasher.finish()
+    }
+
+    /// Returns true if the keys at the given indices in two `KeyColumn`s are equal.
+    fn keys_equal(&self, i: usize, other: &KeyColumn<'_>, j: usize) -> bool {
+        match (self, other) {
+            (KeyColumn::Utf8(a), KeyColumn::Utf8(b)) => a.value(i) == b.value(j),
+            (KeyColumn::Int64(a), KeyColumn::Int64(b)) => a.value(i) == b.value(j),
+            _ => false,
+        }
+    }
+}
+
+/// Extracts a key column from a `RecordBatch` without per-row allocation.
+fn extract_key_column<'a>(
+    batch: &'a RecordBatch,
+    col_name: &str,
+) -> Result<KeyColumn<'a>, DbError> {
+    let col_idx = batch
+        .schema()
+        .index_of(col_name)
+        .map_err(|_| DbError::Pipeline(format!("Column '{col_name}' not found")))?;
+    let array = batch.column(col_idx);
+
+    match array.data_type() {
+        DataType::Utf8 => {
+            let string_array = array
+                .as_any()
+                .downcast_ref::<StringArray>()
+                .ok_or_else(|| DbError::Pipeline(format!("Column '{col_name}' is not Utf8")))?;
+            Ok(KeyColumn::Utf8(string_array))
+        }
+        DataType::Int64 => {
+            let int_array = array
+                .as_any()
+                .downcast_ref::<Int64Array>()
+                .ok_or_else(|| DbError::Pipeline(format!("Column '{col_name}' is not Int64")))?;
+            Ok(KeyColumn::Int64(int_array))
+        }
+        other => Err(DbError::Pipeline(format!(
+            "Unsupported key column type: {other}"
+        ))),
+    }
+}
 
 /// Execute an ASOF join on two sets of `RecordBatch`es.
 ///
@@ -65,19 +126,25 @@ pub(crate) fn execute_asof_join_batch(
 
     let output_schema = build_output_schema(&left_schema, &right_schema, config);
 
-    // Build right-side index: key -> BTreeMap<timestamp, row_index>
-    let mut right_index: HashMap<String, BTreeMap<i64, usize>> = HashMap::new();
+    // Build right-side index: key_hash -> BTreeMap<timestamp, row_index>
+    // Keyed by hash to avoid per-row String allocations.
+    let mut right_index: HashMap<u64, BTreeMap<i64, usize>> = HashMap::with_capacity(right.num_rows());
+    let right_keys_col;
     if right.num_rows() > 0 {
-        let right_keys = extract_column_as_strings(&right, &config.key_column)?;
+        right_keys_col = Some(extract_key_column(&right, &config.key_column)?);
         let right_timestamps = extract_column_as_timestamps(&right, &config.right_time_column)?;
+        let rk = right_keys_col.as_ref().unwrap();
 
-        for (i, (key, ts)) in right_keys.iter().zip(right_timestamps.iter()).enumerate() {
-            right_index.entry(key.clone()).or_default().insert(*ts, i);
+        for (i, &ts) in right_timestamps.iter().enumerate() {
+            let key_hash = rk.hash_at(i);
+            right_index.entry(key_hash).or_default().insert(ts, i);
         }
+    } else {
+        right_keys_col = None;
     }
 
-    // Extract left key and timestamp columns
-    let left_keys = extract_column_as_strings(&left, &config.key_column)?;
+    // Extract left key and timestamp columns (zero-alloc borrow)
+    let left_keys_col = extract_key_column(&left, &config.key_column)?;
     let left_timestamps = extract_column_as_timestamps(&left, &config.left_time_column)?;
 
     let tolerance_ms = config
@@ -85,13 +152,23 @@ pub(crate) fn execute_asof_join_batch(
         .map(|d| i64::try_from(d.as_millis()).unwrap_or(i64::MAX));
 
     // For each left row, find matching right row
-    let mut left_indices: Vec<usize> = Vec::new();
-    let mut right_indices: Vec<Option<usize>> = Vec::new();
+    let mut left_indices: Vec<usize> = Vec::with_capacity(left.num_rows());
+    let mut right_indices: Vec<Option<usize>> = Vec::with_capacity(left.num_rows());
 
-    for (left_idx, (key, left_ts)) in left_keys.iter().zip(left_timestamps.iter()).enumerate() {
-        let matched_right = right_index
-            .get(key)
-            .and_then(|btree| find_match(btree, *left_ts, config.direction, tolerance_ms));
+    for (left_idx, &left_ts) in left_timestamps.iter().enumerate() {
+        let left_hash = left_keys_col.hash_at(left_idx);
+
+        // Look up by hash, then verify key equality on candidates to handle collisions
+        let matched_right = right_index.get(&left_hash).and_then(|btree| {
+            let candidate = find_match(btree, left_ts, config.direction, tolerance_ms)?;
+            // Verify key equality (collision check)
+            if let Some(ref rk) = right_keys_col {
+                if left_keys_col.keys_equal(left_idx, rk, candidate) {
+                    return Some(candidate);
+                }
+            }
+            None
+        });
 
         match (&config.join_type, matched_right) {
             (_, Some(right_idx)) => {
@@ -153,38 +230,6 @@ fn find_match(
     })
 }
 
-/// Extract a column's values as `String`s.
-fn extract_column_as_strings(batch: &RecordBatch, col_name: &str) -> Result<Vec<String>, DbError> {
-    let col_idx = batch
-        .schema()
-        .index_of(col_name)
-        .map_err(|_| DbError::Pipeline(format!("Column '{col_name}' not found")))?;
-    let array = batch.column(col_idx);
-
-    match array.data_type() {
-        DataType::Utf8 => {
-            let string_array = array
-                .as_any()
-                .downcast_ref::<StringArray>()
-                .ok_or_else(|| DbError::Pipeline(format!("Column '{col_name}' is not Utf8")))?;
-            Ok((0..string_array.len())
-                .map(|i| string_array.value(i).to_string())
-                .collect())
-        }
-        DataType::Int64 => {
-            let int_array = array
-                .as_any()
-                .downcast_ref::<Int64Array>()
-                .ok_or_else(|| DbError::Pipeline(format!("Column '{col_name}' is not Int64")))?;
-            Ok((0..int_array.len())
-                .map(|i| int_array.value(i).to_string())
-                .collect())
-        }
-        other => Err(DbError::Pipeline(format!(
-            "Unsupported key column type: {other}"
-        ))),
-    }
-}
 
 /// Extract a column's values as `i64` timestamps (epoch millis).
 fn extract_column_as_timestamps(batch: &RecordBatch, col_name: &str) -> Result<Vec<i64>, DbError> {
@@ -266,7 +311,7 @@ fn build_output_batch(
     config: &AsofJoinTranslatorConfig,
 ) -> Result<RecordBatch, DbError> {
     let num_rows = left_indices.len();
-    let mut columns: Vec<ArrayRef> = Vec::new();
+    let mut columns: Vec<ArrayRef> = Vec::with_capacity(left.num_columns() + right.num_columns());
 
     // Left-side columns: take selected rows
     #[allow(clippy::cast_possible_truncation)]

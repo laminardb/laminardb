@@ -389,8 +389,8 @@ pub struct LookupJoinOperator {
     /// Events waiting for pending lookups.
     pending_events: Vec<(Event, Vec<u8>)>,
     /// In-memory cache of deserialized batches to avoid repeated Arrow IPC deserialization.
-    /// Maps cache key bytes to the deserialized `RecordBatch`.
-    batch_cache: FxHashMap<Vec<u8>, Option<RecordBatch>>,
+    /// Maps cache key bytes to the deserialized `RecordBatch` wrapped in `Arc` for cheap cloning.
+    batch_cache: FxHashMap<Vec<u8>, Option<Arc<RecordBatch>>>,
 }
 
 impl LookupJoinOperator {
@@ -493,7 +493,8 @@ impl LookupJoinOperator {
         }
 
         // Populate in-memory batch cache
-        self.batch_cache.insert(cache_key.clone(), result.cloned());
+        self.batch_cache
+            .insert(cache_key.clone(), result.map(|b| Arc::new(b.clone())));
 
         // Register TTL timer
         let expiry_time = ctx.processing_time + self.cache_ttl_us;
@@ -559,7 +560,7 @@ impl LookupJoinOperator {
         let cache_key = Self::make_cache_key(&key);
         if let Some(cached) = self.lookup_cache(&cache_key, ctx) {
             self.metrics.cache_hits += 1;
-            return self.emit_result(event, cached.as_ref(), ctx);
+            return self.emit_result(event, cached.as_ref().map(AsRef::as_ref), ctx);
         }
 
         // Cache miss - perform lookup
@@ -584,8 +585,9 @@ impl LookupJoinOperator {
         };
 
         if ctx.state.put_typed(&cache_key, &entry).is_ok() {
-            // Populate in-memory batch cache
-            self.batch_cache.insert(cache_key.clone(), result.clone());
+            // Populate in-memory batch cache (Arc wrap for cheap cache-hit cloning)
+            self.batch_cache
+                .insert(cache_key.clone(), result.as_ref().map(|b| Arc::new(b.clone())));
 
             // Register TTL timer
             let expiry_time = ctx.processing_time + self.cache_ttl_us;
@@ -611,7 +613,7 @@ impl LookupJoinOperator {
         &mut self,
         cache_key: &[u8],
         ctx: &OperatorContext,
-    ) -> Option<Option<RecordBatch>> {
+    ) -> Option<Option<Arc<RecordBatch>>> {
         let entry: CacheEntry = ctx.state.get_typed(cache_key).ok()??;
 
         // Check if expired
@@ -620,15 +622,16 @@ impl LookupJoinOperator {
             return None;
         }
 
-        // Check in-memory batch cache first
+        // Check in-memory batch cache first — Arc::clone is a cheap ref count bump
         if let Some(cached) = self.batch_cache.get(cache_key) {
             return Some(cached.clone());
         }
 
-        // Deserialize and cache the batch
+        // Deserialize and cache the batch (one-time Arc wrap)
         let result = entry.to_batch().ok()?;
-        self.batch_cache.insert(cache_key.to_vec(), result.clone());
-        Some(result)
+        let arc_result = result.map(Arc::new);
+        self.batch_cache.insert(cache_key.to_vec(), arc_result.clone());
+        Some(arc_result)
     }
 
     /// Emits the join result for an event.
@@ -712,7 +715,8 @@ impl LookupJoinOperator {
     fn update_output_schema(&mut self) {
         if let (Some(stream), Some(lookup)) = (&self.stream_schema, &self.lookup_schema) {
             let mut fields: Vec<Field> =
-                stream.fields().iter().map(|f| f.as_ref().clone()).collect();
+                Vec::with_capacity(stream.fields().len() + lookup.fields().len());
+            fields.extend(stream.fields().iter().map(|f| f.as_ref().clone()));
 
             // Add lookup fields, prefixing duplicates
             for field in lookup.fields() {
@@ -737,7 +741,9 @@ impl LookupJoinOperator {
         let lookup_batch = lookup?;
         let schema = self.output_schema.as_ref()?;
 
-        let mut columns: Vec<ArrayRef> = event.data.columns().to_vec();
+        let mut columns: Vec<ArrayRef> =
+            Vec::with_capacity(event.data.num_columns() + lookup_batch.num_columns());
+        columns.extend(event.data.columns().iter().cloned());
         for column in lookup_batch.columns() {
             columns.push(Arc::clone(column));
         }
@@ -753,7 +759,9 @@ impl LookupJoinOperator {
         let lookup_schema = self.lookup_schema.as_ref()?;
 
         let num_rows = event.data.num_rows();
-        let mut columns: Vec<ArrayRef> = event.data.columns().to_vec();
+        let mut columns: Vec<ArrayRef> =
+            Vec::with_capacity(event.data.num_columns() + lookup_schema.fields().len());
+        columns.extend(event.data.columns().iter().cloned());
 
         // Add null columns for lookup side
         for field in lookup_schema.fields() {
@@ -802,7 +810,7 @@ impl Operator for LookupJoinOperator {
         let cache_key = Self::make_cache_key(&key);
         if let Some(cached) = self.lookup_cache(&cache_key, ctx) {
             self.metrics.cache_hits += 1;
-            return self.emit_result(event, cached.as_ref(), ctx);
+            return self.emit_result(event, cached.as_ref().map(AsRef::as_ref), ctx);
         }
 
         // Cache miss - add to pending
