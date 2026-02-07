@@ -23,7 +23,7 @@ reqwest = { version = "0.12", default-features = false, features = ["json", "rus
 tokio-postgres = { version = "0.7", optional = true }
 postgres-types = { version = "0.2", optional = true }
 # MySQL async driver with rustls (no OpenSSL required)
-mysql_async = { version = "0.34", optional = true, default-features = false, features = ["rustls-tls", "binlog", "minimal-rust"] }
+mysql_async = { version = "0.36", optional = true, default-features = false, features = ["rustls-tls", "binlog", "minimal-rust"] }
 tokio-stream = { workspace = true, optional = true }
 
 # Delta Lake - using git main branch (has DataFusion 52.x)
