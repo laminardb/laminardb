@@ -253,6 +253,13 @@ jobs:
       # Publish in dependency order
       # --no-verify: CI already validated the build; skipping avoids bootstrap
       # failures where dev-dependencies reference sibling crates not yet on crates.io
+      - name: Strip sibling dev-dependencies from laminar-derive
+        run: |
+          # laminar-derive has dev-deps on laminar-core and laminar-connectors
+          # which aren't on crates.io yet. Safe to remove: CI already tested.
+          perl -i -ne 'print unless /^laminar-(?:core|connectors)\s*=/' \
+            crates/laminar-derive/Cargo.toml
+
       - name: Publish laminar-derive
         run: cargo publish -p laminar-derive --registry crates-io --allow-dirty --no-verify
         continue-on-error: true
