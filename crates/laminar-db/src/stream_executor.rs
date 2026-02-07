@@ -78,13 +78,34 @@ impl StreamExecutor {
         // 1. Register source data as temporary MemTables
         self.register_source_tables(source_batches)?;
 
-        // 2. Execute each stream query
+        // 2. Execute each stream query (in dependency order).
+        //    After each query, register its results as a temp table so
+        //    downstream queries can reference it (cascading MVs, issue #35).
         let mut results = HashMap::new();
         for query in &self.queries {
             match self.ctx.sql(&query.sql).await {
                 Ok(df) => match df.collect().await {
                     Ok(batches) => {
                         if !batches.is_empty() {
+                            // Register intermediate results so downstream queries
+                            // can reference this stream's output within the same cycle.
+                            let schema = batches[0].schema();
+                            if let Ok(mem_table) =
+                                datafusion::datasource::MemTable::try_new(
+                                    schema,
+                                    vec![batches.clone()],
+                                )
+                            {
+                                let _ = self.ctx.deregister_table(&query.name);
+                                if self
+                                    .ctx
+                                    .register_table(&query.name, Arc::new(mem_table))
+                                    .is_ok()
+                                {
+                                    self.registered_sources.push(query.name.clone());
+                                }
+                            }
+
                             results.insert(query.name.clone(), batches);
                         }
                     }
@@ -321,5 +342,76 @@ mod tests {
         assert!(results.contains_key("joined"));
         let total_rows: usize = results["joined"].iter().map(|b| b.num_rows()).sum();
         assert_eq!(total_rows, 2); // ids 1 and 2 match
+    }
+
+    #[tokio::test]
+    async fn test_executor_cascading_queries() {
+        let ctx = SessionContext::new();
+        register_streaming_functions(&ctx);
+        let mut executor = StreamExecutor::new(ctx);
+
+        // Level 1: aggregate from source
+        executor.add_query(
+            "level1".to_string(),
+            "SELECT name, SUM(value) as total FROM events GROUP BY name".to_string(),
+        );
+        // Level 2: read from level1 output (cascading)
+        executor.add_query(
+            "level2".to_string(),
+            "SELECT name, total * 2 as doubled FROM level1".to_string(),
+        );
+
+        let mut source_batches = HashMap::new();
+        source_batches.insert("events".to_string(), vec![test_batch()]);
+
+        let results = executor.execute_cycle(&source_batches).await.unwrap();
+
+        // Level 1 should produce results
+        assert!(results.contains_key("level1"), "level1 should have results");
+        let l1_rows: usize = results["level1"].iter().map(|b| b.num_rows()).sum();
+        assert_eq!(l1_rows, 3); // 3 distinct names
+
+        // Level 2 should also produce results (reading from level1)
+        assert!(
+            results.contains_key("level2"),
+            "level2 should have results (cascading from level1)"
+        );
+        let l2_rows: usize = results["level2"].iter().map(|b| b.num_rows()).sum();
+        assert_eq!(l2_rows, 3); // same 3 names, doubled values
+    }
+
+    #[tokio::test]
+    async fn test_executor_cascading_three_levels() {
+        let ctx = SessionContext::new();
+        register_streaming_functions(&ctx);
+        let mut executor = StreamExecutor::new(ctx);
+
+        // Level 1: passthrough
+        executor.add_query(
+            "l1".to_string(),
+            "SELECT id, name, value FROM events".to_string(),
+        );
+        // Level 2: filter from l1
+        executor.add_query(
+            "l2".to_string(),
+            "SELECT id, name, value FROM l1 WHERE value > 1.5".to_string(),
+        );
+        // Level 3: aggregate from l2
+        executor.add_query(
+            "l3".to_string(),
+            "SELECT COUNT(*) as cnt FROM l2".to_string(),
+        );
+
+        let mut source_batches = HashMap::new();
+        source_batches.insert("events".to_string(), vec![test_batch()]);
+
+        let results = executor.execute_cycle(&source_batches).await.unwrap();
+
+        assert!(results.contains_key("l1"));
+        assert!(results.contains_key("l2"));
+        assert!(results.contains_key("l3"), "l3 should cascade through l1 → l2 → l3");
+
+        let l2_rows: usize = results["l2"].iter().map(|b| b.num_rows()).sum();
+        assert_eq!(l2_rows, 2); // value 2.0 and 3.0
     }
 }

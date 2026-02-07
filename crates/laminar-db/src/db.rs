@@ -41,6 +41,66 @@ fn streaming_statement_to_sql(stmt: &StreamingStatement) -> String {
     }
 }
 
+/// Topological sort of stream registrations by dependency order.
+///
+/// A stream that references another stream in its SQL (e.g., `FROM ohlc_5s`)
+/// must execute after that stream. Uses Kahn's algorithm (BFS from roots).
+/// Falls back to original order if a cycle is detected.
+fn topological_sort_streams(
+    stream_regs: &HashMap<String, crate::connector_manager::StreamRegistration>,
+) -> Vec<String> {
+    use std::collections::VecDeque;
+
+    let names: Vec<String> = stream_regs.keys().cloned().collect();
+    if names.len() <= 1 {
+        return names;
+    }
+
+    // Build in-degree map and adjacency list.
+    // Edge: dependency → dependent (if B's SQL contains A, then A → B).
+    let mut in_degree: HashMap<String, usize> = names.iter().map(|n| (n.clone(), 0)).collect();
+    let mut adj: HashMap<String, Vec<String>> = names.iter().map(|n| (n.clone(), Vec::new())).collect();
+
+    for (name, reg) in stream_regs {
+        let sql_upper = reg.query_sql.to_uppercase();
+        for other in &names {
+            if other != name && sql_upper.contains(&other.to_uppercase()) {
+                adj.get_mut(other).unwrap().push(name.clone());
+                *in_degree.get_mut(name).unwrap() += 1;
+            }
+        }
+    }
+
+    // Kahn's algorithm: start with nodes that have no dependencies.
+    let mut queue: VecDeque<String> = names
+        .iter()
+        .filter(|n| in_degree[n.as_str()] == 0)
+        .cloned()
+        .collect();
+    let mut sorted = Vec::with_capacity(names.len());
+
+    while let Some(node) = queue.pop_front() {
+        sorted.push(node.clone());
+        for dependent in &adj[&node] {
+            let deg = in_degree.get_mut(dependent).unwrap();
+            *deg -= 1;
+            if *deg == 0 {
+                queue.push_back(dependent.clone());
+            }
+        }
+    }
+
+    // If cycle detected, fall back to original order.
+    if sorted.len() != names.len() {
+        tracing::warn!(
+            "Cycle detected in stream dependencies, using registration order"
+        );
+        return names;
+    }
+
+    sorted
+}
+
 /// The main `LaminarDB` database handle.
 ///
 /// Provides a unified interface for SQL execution, data ingestion,
@@ -1175,13 +1235,18 @@ impl LaminarDB {
     ) {
         use crate::stream_executor::StreamExecutor;
 
-        // Build StreamExecutor with the registered stream queries
+        // Build StreamExecutor with the registered stream queries.
+        // Sort by dependency order so cascading MVs execute correctly
+        // (e.g., ohlc_5s before ohlc_10s that reads FROM ohlc_5s).
         let ctx = SessionContext::new();
         register_streaming_functions(&ctx);
         let mut executor = StreamExecutor::new(ctx);
 
-        for reg in stream_regs.values() {
-            executor.add_query(reg.name.clone(), reg.query_sql.clone());
+        let sorted_names = topological_sort_streams(stream_regs);
+        for name in &sorted_names {
+            if let Some(reg) = stream_regs.get(name) {
+                executor.add_query(reg.name.clone(), reg.query_sql.clone());
+            }
         }
 
         // Subscribe to every source's sink so we can read pushed data.
@@ -2897,5 +2962,95 @@ mod tests {
         assert_eq!(find("src").node_type, PipelineNodeType::Source);
         assert_eq!(find("st").node_type, PipelineNodeType::Stream);
         assert_eq!(find("sk").node_type, PipelineNodeType::Sink);
+    }
+
+    #[test]
+    fn test_topological_sort_streams_basic() {
+        use crate::connector_manager::StreamRegistration;
+
+        let mut regs = HashMap::new();
+        // ohlc_10s depends on ohlc_5s (SQL references ohlc_5s)
+        regs.insert(
+            "ohlc_10s".to_string(),
+            StreamRegistration {
+                name: "ohlc_10s".to_string(),
+                query_sql: "SELECT * FROM ohlc_5s GROUP BY symbol".to_string(),
+            },
+        );
+        regs.insert(
+            "ohlc_5s".to_string(),
+            StreamRegistration {
+                name: "ohlc_5s".to_string(),
+                query_sql: "SELECT * FROM trades GROUP BY symbol".to_string(),
+            },
+        );
+
+        let sorted = topological_sort_streams(&regs);
+        let pos_5s = sorted.iter().position(|n| n == "ohlc_5s").unwrap();
+        let pos_10s = sorted.iter().position(|n| n == "ohlc_10s").unwrap();
+        assert!(
+            pos_5s < pos_10s,
+            "ohlc_5s should execute before ohlc_10s, got order: {sorted:?}"
+        );
+    }
+
+    #[test]
+    fn test_topological_sort_streams_three_levels() {
+        use crate::connector_manager::StreamRegistration;
+
+        let mut regs = HashMap::new();
+        // Insert in reverse dependency order to test sorting
+        regs.insert(
+            "l3".to_string(),
+            StreamRegistration {
+                name: "l3".to_string(),
+                query_sql: "SELECT * FROM l2".to_string(),
+            },
+        );
+        regs.insert(
+            "l1".to_string(),
+            StreamRegistration {
+                name: "l1".to_string(),
+                query_sql: "SELECT * FROM source1".to_string(),
+            },
+        );
+        regs.insert(
+            "l2".to_string(),
+            StreamRegistration {
+                name: "l2".to_string(),
+                query_sql: "SELECT * FROM l1".to_string(),
+            },
+        );
+
+        let sorted = topological_sort_streams(&regs);
+        let pos_l1 = sorted.iter().position(|n| n == "l1").unwrap();
+        let pos_l2 = sorted.iter().position(|n| n == "l2").unwrap();
+        let pos_l3 = sorted.iter().position(|n| n == "l3").unwrap();
+        assert!(pos_l1 < pos_l2, "l1 before l2: {sorted:?}");
+        assert!(pos_l2 < pos_l3, "l2 before l3: {sorted:?}");
+    }
+
+    #[test]
+    fn test_topological_sort_streams_no_deps() {
+        use crate::connector_manager::StreamRegistration;
+
+        let mut regs = HashMap::new();
+        regs.insert(
+            "a".to_string(),
+            StreamRegistration {
+                name: "a".to_string(),
+                query_sql: "SELECT * FROM src1".to_string(),
+            },
+        );
+        regs.insert(
+            "b".to_string(),
+            StreamRegistration {
+                name: "b".to_string(),
+                query_sql: "SELECT * FROM src2".to_string(),
+            },
+        );
+
+        let sorted = topological_sort_streams(&regs);
+        assert_eq!(sorted.len(), 2);
     }
 }
