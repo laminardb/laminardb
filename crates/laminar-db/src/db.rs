@@ -1734,6 +1734,15 @@ impl LaminarDB {
         laminar_sql::register_streaming_functions(&ctx);
         let mut executor = StreamExecutor::new(ctx);
 
+        // Register source schemas so the executor can create empty placeholder
+        // tables for sources that have no data in a given cycle (prevents
+        // DataFusion "table not found" errors when only some sources have data).
+        for name in self.catalog.list_sources() {
+            if let Some(entry) = self.catalog.get_source(&name) {
+                executor.register_source_schema(name, entry.schema.clone());
+            }
+        }
+
         for reg in stream_regs.values() {
             executor.add_query(reg.name.clone(), reg.query_sql.clone());
         }

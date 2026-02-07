@@ -12,6 +12,7 @@ use std::collections::{HashMap, HashSet, VecDeque};
 use std::sync::Arc;
 
 use arrow::array::RecordBatch;
+use arrow::datatypes::SchemaRef;
 use datafusion::prelude::SessionContext;
 use sqlparser::ast::{
     Expr, SelectItem, SetExpr, Statement, TableFactor, WildcardAdditionalOptions,
@@ -114,6 +115,9 @@ pub(crate) struct StreamExecutor {
     topo_order: Vec<usize>,
     /// When true, `topo_order` must be recomputed before next cycle.
     topo_dirty: bool,
+    /// Known source schemas — used to register empty tables when a source
+    /// has no data in a given cycle, preventing `DataFusion` planning errors.
+    source_schemas: HashMap<String, SchemaRef>,
 }
 
 impl StreamExecutor {
@@ -125,7 +129,14 @@ impl StreamExecutor {
             registered_sources: Vec::new(),
             topo_order: Vec::new(),
             topo_dirty: true,
+            source_schemas: HashMap::new(),
         }
+    }
+
+    /// Register a source schema so that empty placeholder tables can be
+    /// created for sources that have no data in a given cycle.
+    pub fn register_source_schema(&mut self, name: String, schema: SchemaRef) {
+        self.source_schemas.insert(name, schema);
     }
 
     /// Register a stream query for execution.
@@ -291,6 +302,10 @@ impl StreamExecutor {
     }
 
     /// Register source batches as temporary `MemTable` providers.
+    ///
+    /// Sources with data get their batches registered. Sources with known
+    /// schemas but no data this cycle get an empty `MemTable` so that
+    /// `DataFusion` can still plan queries that reference them.
     fn register_source_tables(
         &mut self,
         source_batches: &HashMap<String, Vec<RecordBatch>>,
@@ -317,6 +332,25 @@ impl StreamExecutor {
 
             self.registered_sources.push(name.clone());
         }
+
+        // Register empty tables for known sources that had no data this cycle
+        for (name, schema) in &self.source_schemas {
+            if source_batches.contains_key(name) {
+                continue;
+            }
+            let empty =
+                datafusion::datasource::MemTable::try_new(schema.clone(), vec![]).map_err(|e| {
+                    DbError::Pipeline(format!("Failed to create empty table '{name}': {e}"))
+                })?;
+            let _ = self.ctx.deregister_table(name);
+            self.ctx
+                .register_table(name, Arc::new(empty))
+                .map_err(|e| {
+                    DbError::Pipeline(format!("Failed to register empty table '{name}': {e}"))
+                })?;
+            self.registered_sources.push(name.clone());
+        }
+
         Ok(())
     }
 
