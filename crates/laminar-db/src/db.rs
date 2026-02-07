@@ -818,8 +818,17 @@ impl LaminarDB {
                         if let Some(wc) = &qp.window_config {
                             rows.push(("window_type".into(), format!("{:?}", wc.window_type)));
                         }
-                        if let Some(jc) = &qp.join_config {
-                            rows.push(("join_type".into(), format!("{jc:?}")));
+                        if let Some(jcs) = &qp.join_config {
+                            if jcs.len() == 1 {
+                                rows.push(("join_type".into(), format!("{:?}", jcs[0])));
+                            } else {
+                                for (i, jc) in jcs.iter().enumerate() {
+                                    rows.push((
+                                        format!("join_step_{}", i + 1),
+                                        format!("{jc:?}"),
+                                    ));
+                                }
+                            }
                         }
                         if let Some(oc) = &qp.order_config {
                             rows.push(("order_by".into(), format!("{oc:?}")));
@@ -3412,5 +3421,287 @@ mod tests {
         let db = LaminarDB::open().unwrap();
         let result = db.execute("DROP TABLE IF EXISTS nonexistent").await;
         assert!(result.is_ok());
+    }
+
+    // ── HAVING clause tests (F-SQL-004) ─────────────────────────────
+
+    #[tokio::test]
+    async fn test_having_filters_grouped_results() {
+        let db = LaminarDB::open().unwrap();
+
+        // Create table and query via DataFusion directly
+        db.ctx
+            .sql(
+                "CREATE TABLE hv_trades AS SELECT * FROM (VALUES \
+                 ('AAPL', 100), ('GOOG', 5), ('MSFT', 50)) \
+                 AS t(symbol, volume)",
+            )
+            .await
+            .unwrap();
+
+        let df = db
+            .ctx
+            .sql("SELECT symbol, volume FROM hv_trades WHERE volume > 10 ORDER BY symbol")
+            .await
+            .unwrap();
+
+        let batches = df.collect().await.unwrap();
+        let total_rows: usize = batches.iter().map(|b| b.num_rows()).sum();
+        // AAPL(100), MSFT(50) pass; GOOG(5) filtered
+        assert_eq!(total_rows, 2);
+    }
+
+    #[tokio::test]
+    async fn test_having_with_aggregate() {
+        let db = LaminarDB::open().unwrap();
+
+        db.ctx
+            .sql(
+                "CREATE TABLE hv_orders AS SELECT * FROM (VALUES \
+                 ('A', 100), ('A', 200), ('B', 50), ('B', 30), ('C', 500)) \
+                 AS t(category, amount)",
+            )
+            .await
+            .unwrap();
+
+        // Query with GROUP BY + HAVING through DataFusion
+        let df = db
+            .ctx
+            .sql(
+                "SELECT category, SUM(amount) as total \
+                 FROM hv_orders GROUP BY category \
+                 HAVING SUM(amount) > 100 ORDER BY category",
+            )
+            .await
+            .unwrap();
+
+        let batches = df.collect().await.unwrap();
+        assert!(!batches.is_empty());
+
+        let total_rows: usize = batches.iter().map(|b| b.num_rows()).sum();
+        // A: 300 > 100 ✓, B: 80 ✗, C: 500 > 100 ✓
+        assert_eq!(total_rows, 2);
+    }
+
+    #[tokio::test]
+    async fn test_having_all_filtered_out() {
+        let db = LaminarDB::open().unwrap();
+
+        db.ctx
+            .sql(
+                "CREATE TABLE items AS SELECT * FROM (VALUES \
+                 ('x', 1), ('y', 2)) AS t(name, qty)",
+            )
+            .await
+            .unwrap();
+
+        let df = db
+            .ctx
+            .sql(
+                "SELECT name, SUM(qty) as total FROM items GROUP BY name HAVING SUM(qty) > 1000",
+            )
+            .await
+            .unwrap();
+
+        let batches = df.collect().await.unwrap();
+        let total_rows: usize = batches.iter().map(|b| b.num_rows()).sum();
+        assert_eq!(total_rows, 0);
+    }
+
+    #[tokio::test]
+    async fn test_having_compound_predicate() {
+        let db = LaminarDB::open().unwrap();
+
+        db.ctx
+            .sql(
+                "CREATE TABLE sales AS SELECT * FROM (VALUES \
+                 ('A', 100), ('A', 200), ('B', 50), ('C', 10), ('C', 20)) \
+                 AS t(region, amount)",
+            )
+            .await
+            .unwrap();
+
+        let df = db
+            .ctx
+            .sql(
+                "SELECT region, COUNT(*) as cnt, SUM(amount) as total \
+                 FROM sales GROUP BY region \
+                 HAVING COUNT(*) >= 2 AND SUM(amount) > 25 \
+                 ORDER BY region",
+            )
+            .await
+            .unwrap();
+
+        let batches = df.collect().await.unwrap();
+        let total_rows: usize = batches.iter().map(|b| b.num_rows()).sum();
+        // A: cnt=2>=2 AND total=300>25 ✓
+        // B: cnt=1<2 ✗
+        // C: cnt=2>=2 AND total=30>25 ✓
+        assert_eq!(total_rows, 2);
+    }
+
+    // ── Multi-way JOIN tests (F-SQL-005) ─────────────────────────────
+
+    #[tokio::test]
+    async fn test_multi_join_two_way_lookup() {
+        let db = LaminarDB::open().unwrap();
+
+        // Create tables via DataFusion
+        db.ctx
+            .sql(
+                "CREATE TABLE orders AS SELECT * FROM (VALUES \
+                 (1, 100, 'A'), (2, 200, 'B')) AS t(id, customer_id, product_code)",
+            )
+            .await
+            .unwrap();
+        db.ctx
+            .sql(
+                "CREATE TABLE customers AS SELECT * FROM (VALUES \
+                 (100, 'Alice'), (200, 'Bob')) AS t(id, name)",
+            )
+            .await
+            .unwrap();
+        db.ctx
+            .sql(
+                "CREATE TABLE products AS SELECT * FROM (VALUES \
+                 ('A', 'Widget'), ('B', 'Gadget')) AS t(code, label)",
+            )
+            .await
+            .unwrap();
+
+        // Two-way join through DataFusion
+        let df = db
+            .ctx
+            .sql(
+                "SELECT o.id, c.name, p.label \
+                 FROM orders o \
+                 JOIN customers c ON o.customer_id = c.id \
+                 JOIN products p ON o.product_code = p.code \
+                 ORDER BY o.id",
+            )
+            .await
+            .unwrap();
+
+        let batches = df.collect().await.unwrap();
+        let total_rows: usize = batches.iter().map(|b| b.num_rows()).sum();
+        assert_eq!(total_rows, 2);
+    }
+
+    #[tokio::test]
+    async fn test_multi_join_three_way() {
+        let db = LaminarDB::open().unwrap();
+
+        db.ctx
+            .sql("CREATE TABLE t1 AS SELECT * FROM (VALUES (1, 10), (2, 20)) AS t(id, fk1)")
+            .await
+            .unwrap();
+        db.ctx
+            .sql("CREATE TABLE t2 AS SELECT * FROM (VALUES (10, 100), (20, 200)) AS t(id, fk2)")
+            .await
+            .unwrap();
+        db.ctx
+            .sql("CREATE TABLE t3 AS SELECT * FROM (VALUES (100, 'x'), (200, 'y')) AS t(id, fk3)")
+            .await
+            .unwrap();
+        db.ctx
+            .sql("CREATE TABLE t4 AS SELECT * FROM (VALUES ('x', 'final_x'), ('y', 'final_y')) AS t(id, val)")
+            .await
+            .unwrap();
+
+        let df = db
+            .ctx
+            .sql(
+                "SELECT t1.id, t4.val \
+                 FROM t1 \
+                 JOIN t2 ON t1.fk1 = t2.id \
+                 JOIN t3 ON t2.fk2 = t3.id \
+                 JOIN t4 ON t3.fk3 = t4.id \
+                 ORDER BY t1.id",
+            )
+            .await
+            .unwrap();
+
+        let batches = df.collect().await.unwrap();
+        let total_rows: usize = batches.iter().map(|b| b.num_rows()).sum();
+        assert_eq!(total_rows, 2);
+    }
+
+    #[tokio::test]
+    async fn test_multi_join_mixed_types() {
+        let db = LaminarDB::open().unwrap();
+
+        db.ctx
+            .sql(
+                "CREATE TABLE stream_a AS SELECT * FROM (VALUES \
+                 (1, 'k1'), (2, 'k2')) AS t(id, key)",
+            )
+            .await
+            .unwrap();
+        db.ctx
+            .sql(
+                "CREATE TABLE stream_b AS SELECT * FROM (VALUES \
+                 ('k1', 10), ('k2', 20)) AS t(key, value)",
+            )
+            .await
+            .unwrap();
+        db.ctx
+            .sql(
+                "CREATE TABLE dim_c AS SELECT * FROM (VALUES \
+                 ('k1', 'label1'), ('k2', 'label2')) AS t(key, label)",
+            )
+            .await
+            .unwrap();
+
+        // Inner join + left join
+        let df = db
+            .ctx
+            .sql(
+                "SELECT a.id, b.value, c.label \
+                 FROM stream_a a \
+                 JOIN stream_b b ON a.key = b.key \
+                 LEFT JOIN dim_c c ON a.key = c.key \
+                 ORDER BY a.id",
+            )
+            .await
+            .unwrap();
+
+        let batches = df.collect().await.unwrap();
+        let total_rows: usize = batches.iter().map(|b| b.num_rows()).sum();
+        assert_eq!(total_rows, 2);
+    }
+
+    #[tokio::test]
+    async fn test_multi_join_single_backward_compat() {
+        let db = LaminarDB::open().unwrap();
+
+        db.ctx
+            .sql(
+                "CREATE TABLE left_t AS SELECT * FROM (VALUES \
+                 (1, 'a'), (2, 'b')) AS t(id, val)",
+            )
+            .await
+            .unwrap();
+        db.ctx
+            .sql(
+                "CREATE TABLE right_t AS SELECT * FROM (VALUES \
+                 (1, 'x'), (2, 'y')) AS t(id, data)",
+            )
+            .await
+            .unwrap();
+
+        // Single join still works
+        let df = db
+            .ctx
+            .sql(
+                "SELECT l.id, l.val, r.data \
+                 FROM left_t l JOIN right_t r ON l.id = r.id \
+                 ORDER BY l.id",
+            )
+            .await
+            .unwrap();
+
+        let batches = df.collect().await.unwrap();
+        let total_rows: usize = batches.iter().map(|b| b.num_rows()).sum();
+        assert_eq!(total_rows, 2);
     }
 }

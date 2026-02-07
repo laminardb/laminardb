@@ -247,6 +247,8 @@ pub struct AggregationAnalysis {
     pub group_by_columns: Vec<String>,
     /// Whether the query has a HAVING clause
     pub has_having: bool,
+    /// The HAVING expression as SQL text (for downstream evaluation)
+    pub having_expr: Option<String>,
 }
 
 impl AggregationAnalysis {
@@ -339,8 +341,9 @@ fn analyze_select(analysis: &mut AggregationAnalysis, select: &Select) {
         GroupByExpr::All(_) => {}
     }
 
-    // Check for HAVING clause
+    // Check for HAVING clause and extract expression
     analysis.has_having = select.having.is_some();
+    analysis.having_expr = select.having.as_ref().map(std::string::ToString::to_string);
 }
 
 /// Resolve a SQL function name (upper-cased) to an [`AggregateType`], handling
@@ -1102,6 +1105,68 @@ mod tests {
     }
 
     // ── Case insensitivity ─────────────────────────────────────────
+
+    // ── HAVING expression extraction tests ──────────────────────────
+
+    #[test]
+    fn test_having_expr_simple() {
+        let stmt = parse_statement(
+            "SELECT symbol, COUNT(*) FROM trades GROUP BY symbol HAVING COUNT(*) > 10",
+        );
+        let analysis = analyze_aggregates(&stmt);
+        assert!(analysis.has_having);
+        assert!(analysis.having_expr.is_some());
+        let expr = analysis.having_expr.unwrap();
+        assert!(expr.contains("COUNT(*)"), "expr was: {expr}");
+        assert!(expr.contains("10"), "expr was: {expr}");
+    }
+
+    #[test]
+    fn test_having_expr_multiple_predicates() {
+        let stmt = parse_statement(
+            "SELECT symbol, SUM(volume) AS vol, AVG(price) AS avg_p \
+             FROM trades GROUP BY symbol \
+             HAVING SUM(volume) > 1000 AND AVG(price) < 50",
+        );
+        let analysis = analyze_aggregates(&stmt);
+        assert!(analysis.has_having);
+        let expr = analysis.having_expr.unwrap();
+        assert!(expr.contains("SUM(volume)"), "expr was: {expr}");
+        assert!(expr.contains("AVG(price)"), "expr was: {expr}");
+        assert!(expr.contains("AND"), "expr was: {expr}");
+    }
+
+    #[test]
+    fn test_having_expr_with_or() {
+        let stmt = parse_statement(
+            "SELECT category, COUNT(*) FROM products GROUP BY category \
+             HAVING COUNT(*) > 100 OR SUM(price) > 5000",
+        );
+        let analysis = analyze_aggregates(&stmt);
+        assert!(analysis.has_having);
+        let expr = analysis.having_expr.unwrap();
+        assert!(expr.contains("OR"), "expr was: {expr}");
+    }
+
+    #[test]
+    fn test_having_expr_none_without_having() {
+        let stmt = parse_statement("SELECT symbol, COUNT(*) FROM trades GROUP BY symbol");
+        let analysis = analyze_aggregates(&stmt);
+        assert!(!analysis.has_having);
+        assert!(analysis.having_expr.is_none());
+    }
+
+    #[test]
+    fn test_having_expr_with_alias_reference() {
+        let stmt = parse_statement(
+            "SELECT symbol, COUNT(*) AS cnt FROM trades GROUP BY symbol HAVING COUNT(*) >= 5",
+        );
+        let analysis = analyze_aggregates(&stmt);
+        assert!(analysis.has_having);
+        let expr = analysis.having_expr.unwrap();
+        assert!(expr.contains("COUNT(*)"), "expr was: {expr}");
+        assert!(expr.contains("5"), "expr was: {expr}");
+    }
 
     #[test]
     fn test_case_insensitive_detection() {

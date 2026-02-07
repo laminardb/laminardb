@@ -13,15 +13,16 @@ use datafusion::prelude::SessionContext;
 use sqlparser::ast::{ObjectName, SetExpr, Statement};
 
 use crate::parser::analytic_parser::analyze_analytic_functions;
-use crate::parser::join_parser::analyze_join;
+use crate::parser::join_parser::analyze_joins;
 use crate::parser::order_analyzer::analyze_order_by;
 use crate::parser::{
     CreateSinkStatement, CreateSourceStatement, EmitClause, SinkFrom, StreamingStatement,
     WindowFunction, WindowRewriter,
 };
+use crate::parser::aggregation_parser::analyze_aggregates;
 use crate::translator::{
-    AnalyticWindowConfig, DagExplainOutput, JoinOperatorConfig, OrderOperatorConfig,
-    WindowOperatorConfig,
+    AnalyticWindowConfig, DagExplainOutput, HavingFilterConfig, JoinOperatorConfig,
+    OrderOperatorConfig, WindowOperatorConfig,
 };
 
 /// Streaming query planner
@@ -81,12 +82,14 @@ pub struct QueryPlan {
     pub name: Option<String>,
     /// Window configuration if the query has windowed aggregation
     pub window_config: Option<WindowOperatorConfig>,
-    /// Join configuration if the query has joins
-    pub join_config: Option<JoinOperatorConfig>,
+    /// Join configuration(s) if the query has joins (one per join step)
+    pub join_config: Option<Vec<JoinOperatorConfig>>,
     /// ORDER BY configuration if the query has ordering
     pub order_config: Option<OrderOperatorConfig>,
     /// Analytic window function configuration (LAG/LEAD/etc.)
     pub analytic_config: Option<AnalyticWindowConfig>,
+    /// HAVING clause filter configuration
+    pub having_config: Option<HavingFilterConfig>,
     /// Emit strategy
     pub emit_clause: Option<EmitClause>,
     /// The underlying SQL statement
@@ -233,6 +236,7 @@ impl StreamingPlanner {
             join_config: query_plan.join_config,
             order_config: query_plan.order_config,
             analytic_config: query_plan.analytic_config,
+            having_config: query_plan.having_config,
             emit_clause: emit_clause.cloned(),
             statement: Box::new(stmt),
         }))
@@ -247,8 +251,8 @@ impl StreamingPlanner {
                 // Check for window functions in GROUP BY
                 let window_function = Self::extract_window_from_select(select);
 
-                // Check for joins
-                let join_analysis = analyze_join(select).map_err(|e| {
+                // Check for joins (multi-way)
+                let join_analysis = analyze_joins(select).map_err(|e| {
                     PlanningError::InvalidQuery(format!("Join analysis failed: {e}"))
                 })?;
 
@@ -262,10 +266,17 @@ impl StreamingPlanner {
                 let analytic_config =
                     analytic_analysis.map(|a| AnalyticWindowConfig::from_analysis(&a));
 
+                // Check for HAVING clause
+                let agg_analysis = analyze_aggregates(stmt);
+                let having_config = agg_analysis
+                    .having_expr
+                    .map(HavingFilterConfig::new);
+
                 let has_streaming_features = window_function.is_some()
                     || join_analysis.is_some()
                     || order_config.is_some()
-                    || analytic_config.is_some();
+                    || analytic_config.is_some()
+                    || having_config.is_some();
 
                 if has_streaming_features {
                     let window_config = match window_function {
@@ -276,7 +287,8 @@ impl StreamingPlanner {
                         None => None,
                     };
 
-                    let join_config = join_analysis.map(|j| JoinOperatorConfig::from_analysis(&j));
+                    let join_config =
+                        join_analysis.map(|m| JoinOperatorConfig::from_multi_analysis(&m));
 
                     return Ok(StreamingPlan::Query(QueryPlan {
                         name: None,
@@ -284,6 +296,7 @@ impl StreamingPlanner {
                         join_config,
                         order_config,
                         analytic_config,
+                        having_config,
                         emit_clause: None,
                         statement: Box::new(stmt.clone()),
                     }));
@@ -319,11 +332,12 @@ impl StreamingPlanner {
                     analysis.window_config = Some(config);
                 }
 
-                // Extract join info
-                if let Some(join) = analyze_join(select).map_err(|e| {
+                // Extract join info (multi-way)
+                if let Some(multi) = analyze_joins(select).map_err(|e| {
                     PlanningError::InvalidQuery(format!("Join analysis failed: {e}"))
                 })? {
-                    analysis.join_config = Some(JoinOperatorConfig::from_analysis(&join));
+                    analysis.join_config =
+                        Some(JoinOperatorConfig::from_multi_analysis(&multi));
                 }
             }
         }
@@ -337,6 +351,12 @@ impl StreamingPlanner {
         if let Some(analytic) = analyze_analytic_functions(stmt) {
             analysis.analytic_config = Some(AnalyticWindowConfig::from_analysis(&analytic));
         }
+
+        // Extract HAVING clause
+        let agg_analysis = analyze_aggregates(stmt);
+        analysis.having_config = agg_analysis
+            .having_expr
+            .map(HavingFilterConfig::new);
 
         Ok(analysis)
     }
@@ -427,9 +447,10 @@ impl Default for StreamingPlanner {
 #[allow(clippy::struct_field_names)]
 struct QueryAnalysis {
     window_config: Option<WindowOperatorConfig>,
-    join_config: Option<JoinOperatorConfig>,
+    join_config: Option<Vec<JoinOperatorConfig>>,
     order_config: Option<OrderOperatorConfig>,
     analytic_config: Option<AnalyticWindowConfig>,
+    having_config: Option<HavingFilterConfig>,
 }
 
 /// Helper to convert `ObjectName` to String
@@ -630,9 +651,10 @@ mod tests {
         match plan {
             StreamingPlan::Query(query_plan) => {
                 assert!(query_plan.join_config.is_some());
-                let config = query_plan.join_config.unwrap();
-                assert_eq!(config.left_key(), "order_id");
-                assert_eq!(config.right_key(), "order_id");
+                let configs = query_plan.join_config.unwrap();
+                assert_eq!(configs.len(), 1);
+                assert_eq!(configs[0].left_key(), "order_id");
+                assert_eq!(configs[0].right_key(), "order_id");
             }
             _ => panic!("Expected Query plan"),
         }
@@ -659,6 +681,89 @@ mod tests {
     }
 
     #[test]
+    fn test_plan_query_with_having() {
+        let mut planner = StreamingPlanner::new();
+        let statements = StreamingParser::parse_sql(
+            "SELECT symbol, COUNT(*) AS cnt FROM trades \
+             GROUP BY symbol, TUMBLE(ts, INTERVAL '5' MINUTE) \
+             HAVING COUNT(*) > 10",
+        )
+        .unwrap();
+
+        let plan = planner.plan(&statements[0]).unwrap();
+        match plan {
+            StreamingPlan::Query(query_plan) => {
+                assert!(query_plan.window_config.is_some());
+                assert!(query_plan.having_config.is_some());
+                let config = query_plan.having_config.unwrap();
+                assert!(
+                    config.predicate().contains("COUNT(*)"),
+                    "predicate was: {}",
+                    config.predicate()
+                );
+            }
+            _ => panic!("Expected Query plan with having config"),
+        }
+    }
+
+    #[test]
+    fn test_plan_query_without_having() {
+        let mut planner = StreamingPlanner::new();
+        let statements = StreamingParser::parse_sql(
+            "SELECT COUNT(*) FROM events GROUP BY TUMBLE(event_time, INTERVAL '5' MINUTE)",
+        )
+        .unwrap();
+
+        let plan = planner.plan(&statements[0]).unwrap();
+        match plan {
+            StreamingPlan::Query(query_plan) => {
+                assert!(query_plan.having_config.is_none());
+            }
+            _ => panic!("Expected Query plan"),
+        }
+    }
+
+    #[test]
+    fn test_plan_having_only_produces_query_plan() {
+        // HAVING without window function still produces a Query plan
+        let mut planner = StreamingPlanner::new();
+        let statements = StreamingParser::parse_sql(
+            "SELECT category, SUM(amount) FROM orders GROUP BY category HAVING SUM(amount) > 1000",
+        )
+        .unwrap();
+
+        let plan = planner.plan(&statements[0]).unwrap();
+        match plan {
+            StreamingPlan::Query(query_plan) => {
+                assert!(query_plan.having_config.is_some());
+                assert!(query_plan.window_config.is_none());
+            }
+            _ => panic!("Expected Query plan for HAVING-only query"),
+        }
+    }
+
+    #[test]
+    fn test_plan_having_compound_predicate() {
+        let mut planner = StreamingPlanner::new();
+        let statements = StreamingParser::parse_sql(
+            "SELECT symbol, COUNT(*) AS cnt, SUM(vol) AS total \
+             FROM trades GROUP BY symbol \
+             HAVING COUNT(*) >= 5 AND SUM(vol) > 10000",
+        )
+        .unwrap();
+
+        let plan = planner.plan(&statements[0]).unwrap();
+        match plan {
+            StreamingPlan::Query(query_plan) => {
+                let config = query_plan.having_config.unwrap();
+                let pred = config.predicate();
+                assert!(pred.contains("AND"), "predicate was: {pred}");
+            }
+            _ => panic!("Expected Query plan"),
+        }
+    }
+
+    #[test]
     fn test_plan_query_with_lead() {
         let mut planner = StreamingPlanner::new();
         let statements = StreamingParser::parse_sql(
@@ -675,6 +780,86 @@ mod tests {
                 assert_eq!(config.functions[0].offset, 2);
             }
             _ => panic!("Expected Query plan with analytic config"),
+        }
+    }
+
+    // -- Multi-way join planner tests (F-SQL-005) --
+
+    #[test]
+    fn test_plan_single_join_produces_vec_of_one() {
+        let mut planner = StreamingPlanner::new();
+        let statements = StreamingParser::parse_sql(
+            "SELECT * FROM a JOIN b ON a.id = b.a_id",
+        )
+        .unwrap();
+
+        let plan = planner.plan(&statements[0]).unwrap();
+        match plan {
+            StreamingPlan::Query(qp) => {
+                let configs = qp.join_config.unwrap();
+                assert_eq!(configs.len(), 1);
+            }
+            _ => panic!("Expected Query plan"),
+        }
+    }
+
+    #[test]
+    fn test_plan_two_way_join() {
+        let mut planner = StreamingPlanner::new();
+        let statements = StreamingParser::parse_sql(
+            "SELECT * FROM a JOIN b ON a.id = b.a_id JOIN c ON b.id = c.b_id",
+        )
+        .unwrap();
+
+        let plan = planner.plan(&statements[0]).unwrap();
+        match plan {
+            StreamingPlan::Query(qp) => {
+                let configs = qp.join_config.unwrap();
+                assert_eq!(configs.len(), 2);
+                assert_eq!(configs[0].left_key(), "id");
+                assert_eq!(configs[0].right_key(), "a_id");
+                assert_eq!(configs[1].left_key(), "id");
+                assert_eq!(configs[1].right_key(), "b_id");
+            }
+            _ => panic!("Expected Query plan"),
+        }
+    }
+
+    #[test]
+    fn test_plan_mixed_join_types() {
+        let mut planner = StreamingPlanner::new();
+        let statements = StreamingParser::parse_sql(
+            "SELECT * FROM orders o \
+             JOIN payments p ON o.id = p.order_id \
+                 AND p.ts BETWEEN o.ts AND o.ts + INTERVAL '1' HOUR \
+             JOIN customers c ON p.cust_id = c.id",
+        )
+        .unwrap();
+
+        let plan = planner.plan(&statements[0]).unwrap();
+        match plan {
+            StreamingPlan::Query(qp) => {
+                let configs = qp.join_config.unwrap();
+                assert_eq!(configs.len(), 2);
+                assert!(configs[0].is_stream_stream());
+                assert!(configs[1].is_lookup());
+            }
+            _ => panic!("Expected Query plan"),
+        }
+    }
+
+    #[test]
+    fn test_plan_backward_compat_no_join() {
+        let mut planner = StreamingPlanner::new();
+        let statements = StreamingParser::parse_sql(
+            "SELECT * FROM orders",
+        )
+        .unwrap();
+
+        let plan = planner.plan(&statements[0]).unwrap();
+        match plan {
+            StreamingPlan::Standard(_) => {} // No join → pass-through
+            _ => panic!("Expected Standard plan for simple SELECT"),
         }
     }
 }

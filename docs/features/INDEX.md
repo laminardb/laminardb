@@ -7,10 +7,10 @@
 | Phase 1 | 12 | 0 | 0 | 0 | 12 |
 | Phase 1.5 | 1 | 0 | 0 | 0 | 1 |
 | Phase 2 | 34 | 0 | 0 | 0 | 34 |
-| Phase 3 | 67 | 20 | 0 | 0 | 47 |
+| Phase 3 | 67 | 18 | 0 | 0 | 49 |
 | Phase 4 | 11 | 11 | 0 | 0 | 0 |
 | Phase 5 | 10 | 10 | 0 | 0 | 0 |
-| **Total** | **135** | **41** | **0** | **0** | **94** |
+| **Total** | **135** | **39** | **0** | **0** | **96** |
 
 ## Status Legend
 
@@ -101,7 +101,7 @@
 
 ## Phase 3: Connectors & Integration
 
-> **Status**: 47/67 features complete (70%)
+> **Status**: 49/67 features complete (73%)
 
 ### Streaming API ✅
 
@@ -189,8 +189,8 @@ See [Cloud Storage Index](phase-3/cloud/INDEX.md).
 | F-SQL-001 | ASOF JOIN SQL Support | ✅ | [Link](phase-3/F-SQL-001-asof-join-sql.md) |
 | F-SQL-002 | LAG/LEAD Window Functions | ✅ | [Link](phase-3/F-SQL-002-lag-lead-functions.md) |
 | F-SQL-003 | ROW_NUMBER/RANK/DENSE_RANK | ✅ | [Link](phase-3/F-SQL-003-ranking-functions.md) |
-| F-SQL-004 | HAVING Clause Execution | 📝 | [Link](phase-3/F-SQL-004-having-clause.md) |
-| F-SQL-005 | Multi-Way JOIN Support | 📝 | [Link](phase-3/F-SQL-005-multi-way-joins.md) |
+| F-SQL-004 | HAVING Clause Execution | ✅ | [Link](phase-3/F-SQL-004-having-clause.md) |
+| F-SQL-005 | Multi-Way JOIN Support | ✅ | [Link](phase-3/F-SQL-005-multi-way-joins.md) |
 | F-SQL-006 | Window Frame (ROWS BETWEEN) | 📝 | [Link](phase-3/F-SQL-006-window-frames.md) |
 
 ### Connector Infrastructure

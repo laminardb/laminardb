@@ -2,453 +2,42 @@
 
 > This file tracks session continuity. Update at the end of each session.
 > For historical details, see [CONTEXT_ARCHIVE.md](./CONTEXT_ARCHIVE.md)
+> For feature tracking, see [INDEX.md](./features/INDEX.md)
 
 ## Last Session
 
 **Date**: 2026-02-07
 
 ### What Was Accomplished
-- **F-CONN-003: Avro Serialization Hardening** - IMPLEMENTATION COMPLETE (~40 new tests, 627 total connector tests with kafka feature)
-  - **Bug fix**: `Fingerprint::load_fingerprint_id()` was byte-swapping schema IDs via `u32::from_be()` — replaced with `Fingerprint::Id(n)` directly, fixing SOE/Confluent wire format deserialization
-  - **5 new SerdeError variants**: `SchemaNotFound`, `InvalidConfluentHeader`, `SchemaIncompatible`, `AvroDecodeError`, `RecordCountMismatch` — replaced generic `MalformedInput` in avro.rs and avro_serializer.rs (5 error tests)
-  - **Complex Avro type support** in `schema_registry.rs`:
-    - `parse_avro_type()`: arrays→List, maps→Map, nested records→Struct, enums→Dictionary(Int32,Utf8), fixed→FixedSizeBinary
-    - `arrow_to_avro_type()`: changed return from `&'static str` to `serde_json::Value` for complex types (List→array, Map→map, Struct→record, Dictionary→enum, FixedSizeBinary→fixed)
-    - Nullable complex types in unions (`["null", {"type":"array",...}]`)
-    - 14 new tests (array, map, nested record, enum, fixed, nullable complex in union, missing items/values, arrow↔avro bidirectional, roundtrip)
-  - **LRU cache eviction with TTL** in `SchemaRegistryClient`:
-    - `SchemaRegistryCacheConfig`: max_entries (default 1000), ttl (default 1 hour)
-    - `cache_insert()`/`cache_get()`: LRU via VecDeque, lazy TTL expiration on access
-    - `cache_evict_expired()`: bulk eviction of expired entries
-    - `with_cache_config()` constructor
-    - 7 new tests (config defaults, LRU eviction, access refresh, TTL expiration, no-TTL, bulk evict, replace existing)
-  - **Schema compatibility enforcement**: `validate_and_register_schema()` method checks compatibility before registration, returns `SchemaIncompatible` error (2 tests)
-  - **Round-trip integration tests**: 7 tests covering serialize→deserialize→verify identity
-    - Primitives (Int64/Utf8/Float64), all primitive types (Bool/Int32/Int64/Float32/Float64/Utf8), single row, Confluent wire format header verification, empty batch, 100-row batch
-  - All clippy clean with `-D warnings` (base + kafka feature), 2,502 base tests pass, 627 connector tests with kafka
+- **F-SQL-005: Multi-Way JOIN Support** - COMPLETE (21 new tests, 476 laminar-sql / 166 laminar-db tests)
+  - `join_parser.rs`: Added `MultiJoinAnalysis` struct + `analyze_joins()` that iterates all joins in `first_table.joins` with left-deep chaining (8 tests)
+  - `join_translator.rs`: Added `JoinOperatorConfig::from_multi_analysis()` mapping `MultiJoinAnalysis` to `Vec<JoinOperatorConfig>` (5 tests)
+  - `planner/mod.rs`: Changed `join_config` from `Option<JoinOperatorConfig>` to `Option<Vec<JoinOperatorConfig>>` in `QueryPlan` and `QueryAnalysis`, wired `analyze_joins` + `from_multi_analysis` (4 tests)
+  - `db.rs`: Updated EXPLAIN display (single → `"join_type"`, multi → `"join_step_1"`, `"join_step_2"`, etc.) + 4 integration tests (two-way lookup, three-way, mixed types, single backward compat)
+  - Existing `analyze_join()` and `JoinAnalysis` unchanged — fully backward compatible
 
-Previous session (2026-02-06):
-- **F-CONN-002: Reference Table Support** - IMPLEMENTATION COMPLETE (21 new tests, 152 total laminar-db tests)
-  - New `table_store.rs` module in `laminar-db` crate:
-    - `TableState`: Per-table state with schema, primary key, PK index, row HashMap, ready flag, connector
-    - `TableStore`: PK-keyed upsert/delete/lookup + `to_record_batch()` concatenation for DataFusion sync
-    - 13 unit tests (create, PK validation, upsert, overwrite, delete, lookup, to_record_batch, drop, ready flag, connector tracking)
-  - Added `TableRegistration` to `ConnectorManager`:
-    - Struct with name, primary_key, connector_type, connector_options, format, format_options
-    - Methods: `register_table()`, `unregister_table()`, `tables()`, `table_names()`
-    - Updated `registration_count()`, `has_external_connectors()`, `clear()`, `Debug`
-    - 3 new tests
-  - Added `SHOW TABLES` DDL support in `laminar-sql`:
-    - `ShowTables` variant in `StreamingDdlKind` tokenizer enum
-    - `Tables` variant in `ShowCommand` enum
-    - Routing in parser `mod.rs`
-    - 1 new test
-  - Wired into `db.rs`:
-    - `table_store` field on `LaminarDB` (parking_lot::Mutex)
-    - Enhanced `handle_create_table()`: extracts PK from column/table constraints, WITH options for connector config
-    - `handle_drop_table()`: removes from TableStore, ConnectorManager, DataFusion context (with IF EXISTS)
-    - `build_show_tables()`: returns RecordBatch with name/primary_key/row_count/connector columns
-    - `handle_insert_into()`: upserts via TableStore for PK tables + DataFusion MemTable sync
-    - `sync_table_to_datafusion()`: deregisters old MemTable, registers new from TableStore data
-    - 5 new tests (CREATE TABLE PK, connector WITH options, INSERT upsert, SHOW TABLES, DROP TABLE)
-  - All clippy clean with `-D warnings`, 152 laminar-db tests pass, 441 laminar-sql tests pass
-
-Previous session (2026-02-06):
-- **F-CONN-001: Checkpoint Recovery Wiring** - IMPLEMENTATION COMPLETE (12 new tests, 141 total laminar-db tests)
-  - New `pipeline_checkpoint.rs` module in `laminar-db` crate:
-    - `SerializableSourceCheckpoint`: Serde-friendly mirror of `SourceCheckpoint` with bidirectional conversion
-    - `PipelineCheckpoint`: Point-in-time snapshot with source offsets and sink epochs (JSON serialized)
-    - `PipelineCheckpointManager`: Save/load/prune checkpoint files with `latest.txt` pointer (Windows-compatible)
-  - Added `metadata()` accessor to `SourceCheckpoint` in `laminar-connectors`
-  - Wired into `start_connector_pipeline()` in `db.rs`:
-    - **Recovery**: On startup, loads latest checkpoint, restores source offsets, rolls back sink epochs
-    - **Periodic checkpoint**: Timer-based checkpoint with begin_epoch/commit_epoch on exactly-once sinks
-    - **Final checkpoint**: Saves checkpoint before closing connectors on shutdown
-  - Uses `StreamCheckpointConfig` for interval/data_dir/max_retained settings
-  - All clippy clean with `-D warnings`, 141 laminar-db tests pass
-
-Previous session (2026-02-06):
-- **F028A: MySQL CDC Binlog I/O Integration** - IMPLEMENTATION COMPLETE (21 new tests, 122 MySQL tests with feature)
-  - New `cdc/mysql/mysql_io.rs` module for real MySQL binlog replication I/O:
-    - `connect()`: Establish MySQL connection via `mysql_async::Conn::new()` with SSL config
-    - `start_binlog_stream()`: Create binlog replication stream (GTID or file/position mode)
-    - `read_events()`: Poll binlog stream with timeout for up to N events
-    - `decode_binlog_event()`: Convert mysql_async event types to BinlogMessage enum
-    - Helper functions: `build_opts()`, `build_ssl_opts()`, `build_binlog_request()`, `binlog_value_to_column_value()`, `mysql_value_to_column_value()`, `gtid_set_to_sids()`, `sid_bytes_to_gtid()`
-  - Updated `source.rs`: Added `binlog_stream` field, real I/O in `open()`/`poll_batch()`/`close()`
-  - Updated `gtid.rs`: Added `iter_sets()` method to `GtidSet`
-  - Updated `Cargo.toml`: Added `tokio-stream` to `mysql-cdc` feature
-  - Feature-gated behind `mysql-cdc` Cargo feature (uses rustls, no OpenSSL)
-  - All 119 existing business-logic tests continue to work without the feature
-  - Created feature spec `docs/features/phase-3/F028A-mysql-cdc-io.md`
-  - All clippy clean with `-D warnings`, full workspace passes
-
-Previous session (2026-02-06):
-- **F-FFI-004: Async FFI Callbacks** - IMPLEMENTATION COMPLETE (9 new tests, 164 total)
-  - New `ffi/callback.rs` module for push-based subscription notifications:
-    - `LaminarSubscriptionCallback`: Function pointer type for data callbacks
-    - `LaminarErrorCallback`: Function pointer type for error callbacks
-    - `LaminarCompletionCallback`: Function pointer type for async completion (reserved for future use)
-    - `LaminarSubscriptionHandle`: Opaque handle for callback-based subscriptions
-    - `laminar_subscribe_callback()`: Create subscription with callbacks invoked from background thread
-    - `laminar_subscription_cancel()`: Stop receiving callbacks (thread-safe)
-    - `laminar_subscription_is_active()`: Check if subscription is still active
-    - `laminar_subscription_user_data()`: Retrieve user data pointer
-    - `laminar_subscription_free()`: Free subscription handle
-    - Event type constants: LAMINAR_EVENT_INSERT/DELETE/UPDATE/WATERMARK/SNAPSHOT
-  - Callbacks are serialized per-subscription (never concurrent for same handle)
-  - After cancel returns, no more callbacks will fire (safe to free user_data)
-  - Created feature spec `docs/features/phase-3/F-FFI-004-async-callbacks.md`
-  - All clippy clean with `-D warnings`, 164 laminar-db tests pass with `--features ffi`
-
-- **F-SQL-002: LAG/LEAD Window Functions** - IMPLEMENTATION COMPLETE (31 new tests)
-  - `parser/analytic_parser.rs` (NEW): AnalyticFunctionType enum (Lag/Lead/FirstValue/LastValue/NthValue), AnalyticFunctionInfo, AnalyticWindowAnalysis, analyze_analytic_functions() — walks SELECT items for Expr::Function with OVER clause (11 tests)
-  - `translator/analytic_translator.rs` (NEW): AnalyticWindowConfig, AnalyticFunctionConfig, from_analysis() conversion (5 tests)
-  - `operator/lag_lead.rs` (NEW): LagLeadConfig, LagLeadFunctionSpec, LagLeadOperator implementing Operator trait — per-partition LAG history (VecDeque) and LEAD pending queues, watermark flush, checkpoint/restore (13 tests)
-  - `planner/mod.rs`: Added analytic_config to QueryPlan and QueryAnalysis, wired into plan_standard_statement() and analyze_query() (2 tests)
-  - `parser/mod.rs`: Added pub mod analytic_parser
-  - `translator/mod.rs`: Added pub mod analytic_translator + re-exports
-  - `operator/mod.rs`: Already had pub mod lag_lead
-  - Streaming semantics: LAG emits immediately (history buffer), LEAD buffers and waits for offset future events
-  - All clippy clean with `-D warnings`
-
-- **F-SQL-003: ROW_NUMBER/RANK/DENSE_RANK Enhancement** - IMPLEMENTATION COMPLETE (10 new tests)
-  - `parser/order_analyzer.rs`: Added RankType enum (RowNumber/Rank/DenseRank), fixed bug where detect_row_number_pattern() was called AFTER order_columns.is_empty() early return, extended extract_row_number_info() for RANK/DENSE_RANK (8 new + 2 fixed tests)
-  - `translator/order_translator.rs`: Added rank_type field to PerGroupTopKConfig, updated from_analysis() (2 new + 1 fixed test)
-  - `translator/mod.rs`: Re-exported RankType
-  - Bug fix: Subquery pattern `SELECT * FROM (...ROW_NUMBER()...) WHERE rn <= 5` now correctly detected
-
-- Feature spec docs created: F-SQL-002-lag-lead-functions.md, F-SQL-003-ranking-functions.md
-
-Previous session (2026-02-06):
-- **F-FFI-003: Arrow C Data Interface** - IMPLEMENTATION COMPLETE (5 new tests, 155 total)
-  - New `ffi/arrow_ffi.rs` module for zero-copy data exchange:
-    - `laminar_batch_export()`: Export RecordBatch to FFI_ArrowArray + FFI_ArrowSchema
-    - `laminar_schema_export()`: Export schema only to FFI_ArrowSchema
-    - `laminar_batch_export_column()`: Export single column to Arrow C Data Interface
-    - `laminar_batch_import()`: Import RecordBatch from Arrow C Data Interface
-    - `laminar_batch_create()`: Alias for import (for writing use case)
-  - Updated `Cargo.toml` to enable `arrow/ffi` feature when `ffi` feature is enabled
-  - Full round-trip test: export → import → verify data matches
-  - Zero-copy export enables PyArrow, Java Arrow, Node.js direct consumption
-  - All clippy clean with `-D warnings`, 155 laminar-db tests pass with `--features ffi`
-
-Previous session (2026-02-06):
-- **F-FFI-002: C Header Generation** - IMPLEMENTATION COMPLETE (21 new tests, 150 total)
-  - New `ffi` module in `laminar-db` crate (feature-gated, requires `api` feature):
-    - `ffi/error.rs`: Thread-local error storage, error codes (LAMINAR_OK, LAMINAR_ERR_*), laminar_last_error(), laminar_last_error_code(), laminar_clear_error()
-    - `ffi/connection.rs`: LaminarConnection opaque handle, laminar_open(), laminar_close(), laminar_execute(), laminar_query(), laminar_query_stream(), laminar_start(), laminar_is_closed()
-    - `ffi/schema.rs`: LaminarSchema opaque handle, laminar_get_schema(), laminar_list_sources(), laminar_schema_num_fields(), laminar_schema_field_name(), laminar_schema_field_type(), laminar_schema_free()
-    - `ffi/writer.rs`: LaminarWriter opaque handle, laminar_writer_create(), laminar_writer_write(), laminar_writer_flush(), laminar_writer_close(), laminar_writer_free()
-    - `ffi/query.rs`: LaminarQueryResult, LaminarQueryStream, LaminarRecordBatch opaque handles, result/stream/batch access functions
-    - `ffi/memory.rs`: laminar_string_free(), laminar_version()
-    - `ffi/mod.rs`: Public re-exports of all FFI functions
-  - Updated `lib.rs` to conditionally export ffi module with `#[cfg(feature = "ffi")]`
-  - Updated `Cargo.toml` with `ffi` feature (depends on `api` feature)
-  - All clippy clean with `-D warnings`, 150 laminar-db tests pass with `--features ffi`
-
-Previous session (2026-02-06):
-- **F-FFI-001: FFI API Module** - SPECIFICATION & IMPLEMENTATION COMPLETE (14 new tests)
-  - Created comprehensive FFI discovery and gap analysis documents
-  - **docs/ffi-discovery.md**: Codebase analysis for FFI support
-  - **docs/ffi-gap-analysis.md**: Required vs existing API comparison
-  - **docs/features/phase-3/F-FFI-001-api-module.md**: Full feature specification
-  - New `api` module in `laminar-db` crate (feature-gated):
-    - `api/error.rs`: ApiError with numeric codes (100-999 ranges), From<DbError> conversion
-    - `api/connection.rs`: Thread-safe Connection wrapper with Send + Sync, blocking execute()
-    - `api/query.rs`: QueryResult (materialized), QueryStream (streaming)
-    - `api/ingestion.rs`: Writer with explicit lifecycle management
-    - `api/subscription.rs`: ArrowSubscription for untyped RecordBatch consumption
-    - `api/mod.rs`: Public re-exports
-  - Updated `lib.rs` to conditionally export api module
-  - Updated `Cargo.toml` with `api` feature flag
-  - Updated `docs/features/INDEX.md` with FFI & Language Bindings section (4 features)
-  - All clippy clean with `-D warnings`, 129 laminar-db tests pass
-
-Previous session (2026-02-05):
-- **F031A: Delta Lake I/O Integration** - IMPLEMENTATION COMPLETE (13 new integration tests)
-  - `lakehouse/delta_io.rs` (NEW): All deltalake crate integration functions
-    - `path_to_url()`: Convert local/S3/Azure/GCS paths to URL
-    - `open_or_create_table()`: Open existing or create new Delta table via `deltalake` crate
-    - `write_batches()`: Write RecordBatches with exactly-once txn metadata
-    - `get_last_committed_epoch()`: Recovery support via txn action in Delta log
-    - `get_table_schema()`: Schema discovery from existing table
-  - `lakehouse/delta.rs`: Added `Option<DeltaTable>` field, cfg-gated real I/O methods
-    - `open()` now calls `delta_io::open_or_create_table()` and recovers last committed epoch
-    - `flush_buffer_to_delta()`: NEW async method for real Parquet writes
-    - `commit_epoch()`: Flushes buffer to Delta Lake when feature enabled
-  - `lakehouse/mod.rs`: Added `#[cfg(feature = "delta-lake")] pub mod delta_io`
-  - `Cargo.toml`: Added `url` dependency for delta-lake feature
-  - 8 business-logic-only tests gated with `#[cfg(not(feature = "delta-lake"))]`
-  - All clippy clean with `-D warnings`
-  - Tests: 86 pass with feature, 81 pass without feature
-
-Previous session (2026-02-05):
-- **F025/F026 Kafka Connector Enhancement** - CRITICAL GAPS COMPLETE (140 tests passing)
-  - `config.rs`: Added SecurityProtocol enum (plaintext/ssl/sasl_plaintext/sasl_ssl) with uses_ssl(), uses_sasl() helpers
-  - `config.rs`: Added SaslMechanism enum (PLAIN/SCRAM-SHA-256/SCRAM-SHA-512/GSSAPI/OAUTHBEARER) with requires_credentials()
-  - `config.rs`: Added IsolationLevel enum (read_uncommitted/read_committed) for transactional pipelines
-  - `config.rs`: Added TopicSubscription enum (Topics/Pattern) for regex-based topic subscription
-  - `config.rs`: Added explicit security fields (sasl_username, sasl_password, ssl_ca_location, ssl_certificate_location, ssl_key_location, ssl_key_password)
-  - `config.rs`: Added fetch tuning fields (fetch_min_bytes, fetch_max_bytes, fetch_max_wait_ms, max_partition_fetch_bytes)
-  - `config.rs`: Added include_headers and schema_registry_ssl_ca_location
-  - `sink_config.rs`: Added security fields and batch_num_messages
-  - `source.rs`: Updated to use TopicSubscription with regex pattern support
-  - `mod.rs`: Added 45+ ConfigKeySpec entries for documentation/discovery
-  - Validation: SASL requires mechanism, credential-based mechanisms require username/password
-  - All clippy clean with `-D warnings`, 140 Kafka tests pass
-  - Gap analysis document: `docs/features/phase-3/F025-F026-kafka-connector-gaps.md`
-
-Previous session (2026-02-03):
-- **F-STREAM-010: Broadcast Channel** - IMPLEMENTATION COMPLETE (42 new tests)
-  - `streaming/broadcast.rs`: BroadcastChannel<T> (shared ring buffer SPMC), BroadcastConfig, BroadcastConfigBuilder, SlowSubscriberPolicy (Block/DropSlow/SkipForSlow), SubscriberInfo, BroadcastError (31 tests)
-  - `planner/channel_derivation.rs`: DerivedChannelType (Spsc/Broadcast), derive_channel_types(), SourceDefinition, MvDefinition, analyze_mv_sources(), derive_channel_types_detailed() (11 tests)
-  - Key design: Users never specify broadcast mode - derived from query plan analysis when multiple MVs read from same source
-  - Features: per-subscriber cursors, lag tracking, configurable slow subscriber policies, dynamic subscribe/unsubscribe
-  - All clippy clean with `-D warnings`, 2350 total tests pass
-
-Previous session (2026-02-03):
-- **F034: Connector SDK** - IMPLEMENTATION COMPLETE (68 new tests, 427 total connector-base tests)
-  - `sdk/retry.rs`: RetryPolicy (exponential backoff, jitter), with_retry async helper, with_retry_and_handler, CircuitBreaker (Closed/Open/HalfOpen state machine), with_circuit_breaker helper (18 tests)
-  - `sdk/rate_limit.rs`: RateLimiter trait, TokenBucket (tokens/sec + burst), LeakyBucket (requests/sec + queue), NoopRateLimiter (13 tests)
-  - `sdk/harness.rs`: ConnectorTestHarness with test_source, test_sink, test_checkpoint_recovery, test_exactly_once methods; TestSourceConnector and TestSinkConnector with configurable batches/errors/delays (12 tests)
-  - `sdk/builder.rs`: SourceConnectorBuilder and SinkConnectorBuilder for fluent connector configuration with retry policies, rate limiters, and circuit breakers; ConfiguredSource and ConfiguredSink wrappers (8 tests)
-  - `sdk/defaults.rs`: register_all_connectors(), register_mock_connectors(), default_registry() with auto-registration of mock/delta-lake/iceberg/kafka/postgres/mysql connectors based on features (7 tests)
-  - `sdk/schema.rs`: SchemaDiscoveryHints (type_hints, nullable_fields, field_names, prefer_larger_types, empty_as_null), infer_schema_from_samples() for JSON/CSV formats (10 tests)
-  - `sdk/mod.rs`: Re-exports all SDK types
-  - `laminar-derive/connector_config.rs`: #[derive(ConnectorConfig)] macro generates from_config(), validate(), config_keys() from struct fields with #[config(key, required, default, env, description, duration_ms)] attributes
-  - All clippy clean with `-D warnings`, 2308 total tests pass
-
-Previous session (2026-02-03):
-- **F032: Apache Iceberg Sink** - IMPLEMENTATION COMPLETE (103 new tests, 359 total connector-base tests)
-  - `lakehouse/iceberg_config.rs`: IcebergSinkConfig with IcebergCatalogType (REST/Glue/Hive/Memory), IcebergWriteMode, IcebergPartitionField, IcebergTransform (Identity/Bucket/Truncate/Year/Month/Day/Hour), MaintenanceConfig, SortField, IcebergFileFormat enums, from_config() parsing with parentheses-aware partition spec splitting, validation (49 tests)
-  - `lakehouse/iceberg_metrics.rs`: IcebergSinkMetrics with 11 atomic counters (rows, bytes, flushes, commits, errors, rollbacks, data_files, delete_files, changelog_deletes, snapshot_id, table_version), MetricsSnapshot (9 tests)
-  - `lakehouse/iceberg.rs`: IcebergSink implementing SinkConnector — buffering with size/time/rows flush triggers, epoch management with exactly-once skip, Z-set changelog splitting with Iceberg v2 equality delete file support, upsert mode, health checks, capabilities (45 tests)
-  - `lakehouse/mod.rs`: Re-exports, register_iceberg_sink() and register_lakehouse_sinks() factories, 33 config key specs including catalog, partition, maintenance, and cloud storage options (6 tests)
-  - Follows Delta Lake Sink pattern: all business logic without actual iceberg-rust crate dependency
-  - Supports REST, Glue, Hive, and Memory catalogs
-  - Iceberg-native partition transforms: IDENTITY, BUCKET(n), TRUNCATE(w), YEAR, MONTH, DAY, HOUR
-  - All clippy clean with `-D warnings`, 2240 total tests pass
-
-Previous session (2026-02-03):
-- **F028: MySQL CDC Source** - IMPLEMENTATION COMPLETE (119 new tests, 359 total connector-base tests)
-  - `cdc/mysql/config.rs`: MySqlCdcConfig with SslMode, SnapshotMode enums, from_config() parsing, validation (15 tests)
-  - `cdc/mysql/gtid.rs`: Gtid, GtidRange, GtidSet types with parsing and ordering (21 tests)
-  - `cdc/mysql/types.rs`: MySqlColumn, mysql_type_to_arrow mapping for 20+ MySQL types (14 tests)
-  - `cdc/mysql/decoder.rs`: BinlogMessage enum, BinlogPosition, TableMapMessage, row event types (14 tests)
-  - `cdc/mysql/schema.rs`: TableInfo, TableCache for binlog TABLE_MAP events (12 tests)
-  - `cdc/mysql/changelog.rs`: CdcOperation, ChangeEvent, Z-set changelog format, events_to_record_batch (17 tests)
-  - `cdc/mysql/metrics.rs`: MySqlCdcMetrics with 11 AtomicU64 counters, MetricsSnapshot (12 tests)
-  - `cdc/mysql/source.rs`: MySqlCdcSource implementing SourceConnector — open/poll_batch/checkpoint/restore/health_check/close (14 tests)
-  - `cdc/mysql/mod.rs`: Re-exports, register_mysql_cdc_source factory, 19 config key specs (4 tests)
-  - Feature-gated behind `mysql-cdc` Cargo feature (business logic only, no mysql_async dependency)
-  - Follows Delta Lake pattern: all business logic without actual I/O (F028A will add binlog I/O)
-  - All clippy clean with `-D warnings`
-
-Previous session (2026-02-02):
-- **F-CLOUD-001, F-CLOUD-002, F-CLOUD-003: Cloud Storage Infrastructure** - ALL 3 COMPLETE (82 new tests, 256 total connector base tests)
-  - `storage/provider.rs`: StorageProvider enum (AwsS3, AzureAdls, Gcs, Local), detect() from URI scheme, 18 tests
-  - `storage/resolver.rs`: StorageCredentialResolver with resolve() and resolve_with_env(), env var fallback for AWS (7 vars), Azure (6), GCS (2), 22 tests
-  - `storage/validation.rs`: CloudConfigValidator with per-provider rules — S3 requires region, Azure requires account_name, GCS warning-only, 20 tests
-  - `storage/masking.rs`: SecretMasker with is_secret_key(), redact_map(), display_map(), 8 secret patterns, 22 tests
-  - `storage/mod.rs`: Re-exports all primary types
-  - **Integration with Delta Lake Sink**: DeltaLakeSinkConfig.from_config() now auto-resolves env vars via StorageCredentialResolver, validate() checks cloud credentials via CloudConfigValidator, display_storage_options() redacts secrets
-  - `config.rs`: Added display_redacted() to ConnectorConfig
-  - `lakehouse/mod.rs`: Added 12 cloud-specific ConfigKeySpec entries for discoverability
-  - `lakehouse/delta_config.rs`: 10 new integration tests (S3/Azure/GCS path validation, secret redaction)
-  - All clippy clean with `-D warnings`, 2137 total tests pass across workspace
-
-Previous session (2026-02-02):
-- **Delta Lake Deferred Work Breakdown** - Created 7 new feature specs for cloud storage infrastructure and Delta Lake I/O completion
-  - `docs/features/phase-3/cloud/INDEX.md`: Cloud Storage Infrastructure sub-group
-  - `F031A`: Delta Lake I/O Integration (blocked by deltalake crate)
-  - `F031B`: Delta Lake Recovery & Exactly-Once I/O (blocked by F031A)
-  - `F031C`: Delta Lake Compaction & Maintenance (blocked by F031A)
-  - `F031D`: Delta Lake Schema Evolution (blocked by F031A)
-
-Previous session (2026-02-02):
-- **F031: Delta Lake Sink** - IMPLEMENTATION COMPLETE (73 new tests, 169 total connector base tests)
-  - `lakehouse/delta_config.rs`: DeltaLakeSinkConfig with DeltaWriteMode, DeliveryGuarantee, CompactionConfig enums, from_config() parsing, validation (20 tests)
-  - `lakehouse/delta_metrics.rs`: DeltaLakeSinkMetrics with 9 AtomicU64 counters, to_connector_metrics() (7 tests)
-  - `lakehouse/delta.rs`: DeltaLakeSink implementing SinkConnector — buffering with size/time/rows flush triggers, epoch management with exactly-once skip, Z-set changelog splitting, health checks, capabilities (42 tests)
-  - `lakehouse/mod.rs`: Re-exports, register_delta_lake_sink factory, 15 config key specs (4 tests)
-  - Not feature-gated (compiles without deltalake crate dependency); deltalake crate deferred until version compatible with workspace datafusion
-  - Follows PostgresSink pattern: all business logic without actual I/O
-  - All clippy clean with `-D warnings`, 2050 total tests pass
-
-Previous session (2026-02-01):
-- **F-SUB-001 to F-SUB-008: Reactive Subscription System** - ALL COMPLETE (8/8 features)
-  - F-SUB-001: ChangeEvent types (EventType, ChangeEvent, ChangeEventBatch, NotificationRef)
-  - F-SUB-002: Notification Slot (NotificationSlot 64-byte cache-aligned, NotificationRing SPSC, NotificationHub)
-  - F-SUB-003: Subscription Registry (SubscriptionRegistry, SubscriptionEntry, SubscriptionConfig, SubscriptionMetrics)
-  - F-SUB-004: Subscription Dispatcher (SubscriptionDispatcher, Ring 1 broadcast, NotificationDataSource trait)
-  - F-SUB-005: Push Subscription API (PushSubscription channel-based handle)
-  - F-SUB-006: Callback Subscriptions (subscribe_callback, subscribe_fn, CallbackSubscriptionHandle)
-  - F-SUB-007: Stream Subscriptions (subscribe_stream, ChangeEventStream, ChangeEventResultStream)
-  - F-SUB-008: Backpressure & Filtering (BackpressureController, DemandBackpressure, NotificationBatcher, Ring0Predicate, compile_filter via sqlparser)
-  - New files: event.rs, notification.rs, registry.rs, dispatcher.rs, handle.rs, callback.rs, stream.rs, backpressure.rs, batcher.rs, filter.rs
-  - Added sqlparser dependency to laminar-core for filter compilation (SQL → Ring 0/Ring 1 predicate classification)
-  - 42 new tests from F-SUB-008 alone (10 backpressure + 6 batcher + 26 filter)
-  - All clippy clean with `-D warnings`, 1240 total laminar-core tests pass
-
-Previous session (2026-01-31):
-- **Performance Optimization: Event.data → Arc<RecordBatch>** - COMPLETE
-  - Changed `Event.data` from owned `RecordBatch` to `Arc<RecordBatch>` for zero-copy multicast
-  - Multicast fan-out clone cost: O(columns) → O(1) (~2ns atomic increment)
-  - All clippy clean with `-D warnings`, all 1709 tests pass
-
-Previous session (2026-01-31):
-- **F-DAG-007: Performance Validation** - IMPLEMENTATION COMPLETE
-  - `benches/dag_bench.rs`: 11 Criterion benchmarks in 5 groups (routing, multicast, executor latency, throughput, checkpoint/recovery)
-  - `benches/dag_stress.rs`: 5 stress test scenarios (20-node mixed, 8-way fan-out, deep linear 10, diamond stateful, checkpoint under load with p99 latency)
-  - Cargo.toml: Added `[[bench]]` entries for `dag_bench` and `dag_stress`
-  - Performance audit: lock-free hot path confirmed, zero-lock architecture, proper cache-line alignment
-  - Optimizations applied:
-    - R1: Pre-allocated event pools in benchmarks (eliminates RecordBatch allocation from timed region)
-    - R2: Pre-sized VecDeque input queues with `with_capacity(16)` in DagExecutor (avoids Ring 0 allocation on first push)
-  - Benchmark results (post-optimization):
-    - Routing lookup: ~4ns (target <50ns) — 12x headroom
-    - Linear 3-node latency: **325ns** (target <500ns) — 35% headroom (was 542ns before pre-alloc fix)
-    - Linear throughput: **2.24M events/sec** (target 500K) — 4.5x headroom
-    - Deep 10-op throughput: **660K events/sec** (target 500K) — 32% headroom (with event alloc overhead)
-  - All clippy clean with `-D warnings`
-
-Previous session (2026-01-31):
-- **F-DAG-006: Connector Bridge** - IMPLEMENTATION COMPLETE (25 new tests, 96 total connector base tests)
-
-Previous session (2026-01-31):
-- **F-DAG-005: SQL & MV Integration** - IMPLEMENTATION COMPLETE (18 new tests, 100 total DAG tests + 2 SQL tests)
-
-Previous session (2026-01-31):
-- **F027B: PostgreSQL Sink** - IMPLEMENTATION COMPLETE (84 new tests, 155 total connector tests with postgres-sink)
-  - `postgres/types.rs`: Arrow→PG type mapping — DDL types, UNNEST array casts, SQL types (12 tests)
-  - `postgres/sink_config.rs`: PostgresSinkConfig with WriteMode, DeliveryGuarantee, SslMode enums, validation, ConnectorConfig parsing (20 tests)
-  - `postgres/sink_metrics.rs`: 9 AtomicU64 counters — records, bytes, errors, batches, copy/upsert ops, epochs, changelog deletes (7 tests)
-  - `postgres/sink.rs`: PostgresSink implementing SinkConnector — COPY BINARY SQL, UNNEST upsert SQL, DELETE SQL, DDL generation, co-transactional epoch commit/recover SQL, Z-set changelog splitting, batch buffering with size/time flush triggers (41 tests)
-  - `postgres/mod.rs`: Re-exports, register_postgres_sink factory, 18 config key specs (4 tests)
-  - Feature-gated behind `postgres-sink` Cargo feature
-  - Two write strategies: Append (COPY BINARY >500K rows/sec) and Upsert (INSERT...ON CONFLICT DO UPDATE with UNNEST)
-  - Exactly-once via co-transactional offset storage (_laminardb_sink_offsets table)
-  - Z-set changelog support: splits batches by _op column into inserts (I/U/r) and deletes (D)
-  - All clippy clean with `-D warnings`
-
-Previous session (2026-01-31):
-- **F027: PostgreSQL CDC Source** - IMPLEMENTATION COMPLETE (107 new tests, 178 total connector tests)
-  - Full pgoutput binary protocol parser (9 message types)
-  - CDC envelope schema: _table, _op, _lsn, _ts_ms, _before, _after columns
-  - Feature-gated behind `postgres-cdc` Cargo feature
-
-Previous session (2026-01-31):
-- **F027: PostgreSQL CDC Source** - SPEC UPDATED to v2.0
-- **F027B: PostgreSQL Sink Connector** - NEW SPEC CREATED (v1.0)
-
-Previous session (2026-01-30):
-- F-DAG-004: DAG Checkpointing - COMPLETE (18 new tests, 84 total DAG tests)
-- F026: Kafka Sink Connector - COMPLETE (51 new sink tests)
-- F025: Kafka Source Connector - COMPLETE (67 tests)
-- F-DAG-003: DAG Executor - COMPLETE (21 tests)
-- F-DAG-002: Multicast & Routing - COMPLETE (16 tests)
-- F-DAG-001: Core DAG Topology - COMPLETE (29 tests)
-
-Previous session (2026-01-28):
-- Developer API Overhaul - 3 new crates, SQL parser extensions, 5 examples
-- F-STREAM-001 to F-STREAM-007: Streaming API - ALL COMPLETE (99 tests)
-- Performance Audit: ALL 10 issues fixed
-- F074-F077: Aggregation Semantics Enhancement - COMPLETE (219 tests)
-
-**Total tests**: 1347 core + 440 sql + 115 storage + 178 laminar-db (with ffi) + 427 connectors + 4 demo = 2511 (base with ffi), +84 postgres-sink-only + 107 postgres-cdc-only + 118 kafka-only + 13 delta-lake-only = 2833 (all feature flags)
+Previous session (2026-02-07):
+- **F-SQL-004: HAVING Clause Execution** - COMPLETE (22 new tests, 459 laminar-sql / 162 laminar-db tests)
+- **F-CONN-003: Avro Serialization Hardening** - COMPLETE (~40 new tests, 627 total connector tests with kafka)
 
 ### Where We Left Off
-**Phase 3 Connectors & Integration: 47/67 features COMPLETE (70%)**
-- Streaming API core complete (F-STREAM-001 to F-STREAM-007, F-STREAM-013)
-- Developer API overhaul complete (laminar-derive, laminar-db crates)
-- DAG pipeline complete (F-DAG-001 to F-DAG-007)
-- Kafka Source Connector complete (F025)
-- Kafka Sink Connector complete (F026)
-- PostgreSQL CDC Source complete (F027) — 107 tests, full pgoutput decoder
-- PostgreSQL Sink complete (F027B) — 84 tests, COPY BINARY + upsert + exactly-once
-- MySQL CDC Source complete (F028) — 119 tests, binlog decoder + GTID + Z-set changelog
-- **MySQL CDC I/O Integration complete (F028A)** — 21 new tests, mysql_async binlog replication with SSL/GTID/file-position
-- Delta Lake Sink business logic complete (F031) — 73 tests, buffering + epoch management + changelog splitting
-- Delta Lake I/O Integration complete (F031A) — 13 new integration tests, real deltalake crate writes with exactly-once txn metadata
-- Apache Iceberg Sink business logic complete (F032) — 103 tests, REST/Glue/Hive catalogs + partition transforms + equality deletes
-- Connector SDK complete (F034) — 68 tests, retry/circuit breaker + rate limiting + test harness + builders + defaults + schema discovery
-- Broadcast Channel complete (F-STREAM-010) — 42 tests, shared ring buffer SPMC + query plan derivation + slow subscriber policies
-- SQL & MV Integration complete (F-DAG-005) — 18 new tests, DAG from MvRegistry, watermarks, changelog
-- Connector Bridge complete (F-DAG-006) — 25 new tests, source/sink bridge + runtime orchestration
-- Performance Validation complete (F-DAG-007) — 16 benchmarks, performance audit + optimizations
-- Reactive Subscription System complete (F-SUB-001 to F-SUB-008) — 8 features, 10 new modules
-- Cloud Storage Infrastructure complete (F-CLOUD-001/002/003) — 82 tests, integrated with Delta Lake Sink
-- FFI API Module complete (F-FFI-001) — 14 new tests, Connection/Writer/QueryStream/ArrowSubscription with numeric error codes and Send+Sync
-- C Header Generation complete (F-FFI-002) — 21 new tests, extern "C" functions with opaque handles, thread-local error storage
-- Arrow C Data Interface complete (F-FFI-003) — 5 new tests, zero-copy export/import via FFI_ArrowArray/FFI_ArrowSchema
-- Async FFI Callbacks complete (F-FFI-004) — 9 new tests (164 total), callback-based subscription notifications from background thread
-- SQL Extensions: F-SQL-002 (LAG/LEAD) + F-SQL-003 (ROW_NUMBER/RANK/DENSE_RANK) — 41 new tests, analytic window functions + ranking bug fix
-- **Checkpoint Recovery Wiring complete (F-CONN-001)** — 12 new tests, pipeline checkpoint persistence + recovery + periodic + final checkpoint
-- **Reference Table Support complete (F-CONN-002)** — 21 new tests (152 total), TableStore with PK upsert/delete/lookup, SHOW TABLES/DROP TABLE DDL, connector-backed table registration
-- **Avro Serialization Hardening complete (F-CONN-003)** — ~40 new tests (627 total with kafka), fingerprint bug fix, complex types, LRU cache, compatibility enforcement, round-trip tests
-- Next: F-SQL-004, F-SQL-005, F-SQL-006, F-OBS-001, F031B/C/D Delta Lake advanced, F032A Iceberg I/O, F029 MongoDB CDC
+
+**Phase 3: 49/67 features COMPLETE (73%)**
+
+All Phase 1 (12), Phase 1.5 (1), and Phase 2 (34) features are complete.
+See [INDEX.md](./features/INDEX.md) for the full feature-by-feature breakdown.
+
+**Test counts**: ~2,520 base, ~2,870 with all feature flags (`kafka`, `postgres-cdc`, `postgres-sink`, `delta-lake`, `mysql-cdc`, `ffi`)
 
 ### Immediate Next Steps
-1. F-SQL-004: HAVING Clause Execution
-2. F-SQL-005: Multi-Way JOIN Support
-3. F-SQL-006: Window Frame (ROWS BETWEEN)
-4. F-OBS-001: Pipeline Observability API
+1. F-SQL-006: Window Frame (ROWS BETWEEN)
+2. F-OBS-001: Pipeline Observability API
+3. F031B/C/D: Delta Lake advanced (recovery, compaction, schema evolution)
+4. F032A: Iceberg I/O (blocked by iceberg-rust DF 52.0 compat)
 
 ### Open Issues
-- **deltalake crate version**: ✅ RESOLVED - Using git main branch with DataFusion 52.x. F031A complete.
-- **mysql_async crate**: ✅ RESOLVED - F028A complete with rustls TLS backend (no OpenSSL required).
-- **iceberg-rust crate**: Deferred until version compatible with workspace. Business logic complete in F032.
-- None currently blocking.
-
----
-
-## Phase 2 Progress
-
-| Feature | Status | Notes |
-|---------|--------|-------|
-| F013: Thread-Per-Core | Done | SPSC queues, key routing, CPU pinning |
-| F014: SPSC Queues | Done | Part of F013 |
-| F015: CPU Pinning | Done | Part of F013 |
-| F016: Sliding Windows | Done | Multi-window assignment |
-| F017: Session Windows | Done | Gap-based sessions |
-| F018: Hopping Windows | Done | Alias for sliding |
-| F019: Stream-Stream Joins | Done | Inner/Left/Right/Full |
-| F020: Lookup Joins | Done | Cached with TTL |
-| F011B: EMIT Extension | Done | OnWindowClose, Changelog, Final |
-| F023: Exactly-Once Sinks | Done | TransactionalSink, ExactlyOnceSinkAdapter, 28 tests |
-| F059: FIRST/LAST | Done | Essential for OHLC |
-| F063: Changelog/Retraction | Done | Z-set foundation |
-| F067: io_uring Advanced | Done | SQPOLL, IOPOLL |
-| F068: NUMA-Aware Memory | Done | NumaAllocator |
-| F071: Zero-Alloc Enforcement | Done | HotPathGuard |
-| F022: Incremental Checkpoint | Done | RocksDB backend |
-| F062: Per-Core WAL | Done | Lock-free per-core |
-| F069: Three-Ring I/O | Done | Latency/Main/Poll |
-| F070: Task Budget | Done | BudgetMonitor |
-| F073: Zero-Alloc Polling | Done | Callback APIs |
-| F060: Cascading MVs | Done | MvRegistry |
-| F056: ASOF Joins | Done | Backward/Forward/Nearest, tolerance |
-| F064: Per-Partition Watermarks | Done | PartitionedWatermarkTracker, CoreWatermarkState |
-| F065: Keyed Watermarks | Done | KeyedWatermarkTracker, per-key 99%+ accuracy |
-| F057: Stream Join Optimizations | Done | CPU-friendly encoding, asymmetric compaction, per-key tracking |
-| F024: Two-Phase Commit | Done | Presumed abort, crash recovery, 20 tests |
-| F021: Temporal Joins | Done | Event-time/process-time, append-only/non-append-only, 22 tests |
-| F066: Watermark Alignment Groups | Done | Pause/WarnOnly/DropExcess, coordinator, 25 tests |
-| F072: XDP/eBPF | Done | Packet header, CPU steering, Linux loader, 34 tests |
-| F005B: Advanced DataFusion | Done | Window/Watermark UDFs, async LogicalPlan, execute_streaming_sql, 31 tests |
-| F074: Composite Aggregator | Done | ScalarResult, DynAccumulator, CompositeAggregator, f64 aggregators, 122 tests |
-| F075: DataFusion Aggregate Bridge | Done | DataFusionAccumulatorAdapter, DataFusionAggregateFactory, 40 tests |
-| F076: Retractable FIRST/LAST | Done | RetractableFirst/LastValue, f64 variants, 26 tests |
-| F077: Extended Aggregation Parser | Done | 20+ new AggregateType variants, FILTER, WITHIN GROUP, 57 tests |
-
----
-
-## Phase 1.5 Progress (SQL Parser)
-
-| Feature | Status | Notes |
-|---------|--------|-------|
-| F006B: Production SQL Parser | Done | 129 tests, all 6 phases complete |
+- **iceberg-rust crate**: Deferred until compatible with workspace DataFusion. Business logic complete in F032.
+- No other blockers.
 
 ---
 
@@ -457,145 +46,50 @@ Previous session (2026-01-28):
 ### Key Modules
 ```
 laminar-core/src/
-  dag/          # F-DAG-001/002/003/004/007: DAG pipeline topology + multicast/routing + executor + checkpointing + benchmarks
-    topology      # StreamingDag, DagNode, DagEdge, DagChannelType
-    builder       # DagBuilder, FanOutBuilder
-    error         # DagError (+ checkpoint error variants)
-    multicast     # F-DAG-002: MulticastBuffer<T> (SPMC, refcounted slots)
-    routing       # F-DAG-002: RoutingTable, RoutingEntry (64-byte aligned)
-    executor      # F-DAG-003: DagExecutor, DagExecutorMetrics (Ring 0 processing)
-    checkpoint    # F-DAG-004: CheckpointBarrier, BarrierAligner, DagCheckpointCoordinator
-    recovery      # F-DAG-004: DagCheckpointSnapshot, DagRecoveryManager, RecoveredDagState
-  streaming/    # F-STREAM-001 to F-STREAM-006: In-memory streaming API
-    ring_buffer   # Lock-free SPSC ring buffer
-    channel       # SPSC/MPSC channel with auto-upgrade
-    source        # Source<T> with push/watermark
-    sink          # Sink<T> with broadcast mode
-    subscription  # poll/recv/Iterator APIs
-  time/         # F010, F064, F065, F066: Watermarks, partitioned + keyed + alignment
-    alignment_group # F066: Watermark alignment groups
-  mv/           # F060: Cascading MVs
-  budget/       # F070: Task budgets
-  sink/         # F023: Exactly-once sinks
-    transactional  # F023: TransactionalSink<S> with buffer+commit
-    adapter        # F023: ExactlyOnceSinkAdapter epoch-based bridge
-  io_uring/     # F067, F069: io_uring + three-ring
-  xdp/          # F072: XDP/eBPF network optimization
-  alloc/        # F071: Zero-allocation
-  numa/         # F068: NUMA awareness
-  tpc/          # F013/F014: Thread-per-core
-  subscription/ # F-SUB-001 to F-SUB-008: Reactive push-based subscription system
-    event         # F-SUB-001: ChangeEvent, ChangeEventBatch, EventType, NotificationRef
-    notification  # F-SUB-002: NotificationSlot (64-byte), NotificationRing (SPSC), NotificationHub
-    registry      # F-SUB-003: SubscriptionRegistry, SubscriptionEntry, SubscriptionConfig, SubscriptionMetrics
-    dispatcher    # F-SUB-004: SubscriptionDispatcher (Ring 1 broadcast), NotificationDataSource
-    handle        # F-SUB-005: PushSubscription (channel-based)
-    callback      # F-SUB-006: subscribe_callback, subscribe_fn, CallbackSubscriptionHandle
-    stream        # F-SUB-007: subscribe_stream, ChangeEventStream, ChangeEventResultStream
-    backpressure  # F-SUB-008: BackpressureController, DemandBackpressure, DemandHandle
-    batcher       # F-SUB-008: BatchConfig, NotificationBatcher (size/time triggers)
-    filter        # F-SUB-008: Ring0Predicate, ScalarValue, StringInternTable, compile_filter
-  operator/     # Windows, joins, changelog
-    window      # F074: CompositeAggregator, DynAccumulator, f64 aggregators
-    changelog   # F076: RetractableFirst/LastValueAccumulator
-    asof_join   # F056: ASOF joins
-    temporal_join # F021: Temporal joins
-    lag_lead    # F-SQL-002: LAG/LEAD analytic window operator (per-partition history + pending queues)
+  dag/            # DAG pipeline: topology, multicast, routing, executor, checkpointing
+  streaming/      # In-memory streaming: ring buffer, SPSC/MPSC channels, source, sink
+  subscription/   # Reactive push-based: events, notifications, registry, dispatcher, backpressure, filtering
+  time/           # Watermarks: partitioned, keyed, alignment groups
+  operator/       # Windows, joins (stream/asof/temporal), changelog, lag_lead
+  mv/             # Cascading materialized views
+  tpc/            # Thread-per-core: SPSC, key router, core handle, backpressure, runtime
+  sink/           # Exactly-once: transactional sink, epoch adapter
+  alloc/          # Zero-allocation enforcement
+  numa/           # NUMA-aware memory
+  io_uring/       # io_uring + three-ring I/O
+  xdp/            # XDP/eBPF network optimization
+  budget/         # Task budget enforcement
 
-laminar-sql/src/       # F006B: Production SQL Parser
-  parser/              # SQL parsing with streaming extensions
-    streaming_parser   # CREATE SOURCE/SINK
-    window_rewriter    # TUMBLE/HOP/SESSION extraction
-    emit_parser        # EMIT clause parsing
-    late_data_parser   # Late data handling
-    join_parser        # Stream-stream/lookup join analysis
-    aggregation_parser # F077: 30+ aggregates, FILTER, WITHIN GROUP, datafusion_name()
-    analytic_parser    # F-SQL-002: LAG/LEAD/FIRST_VALUE/LAST_VALUE/NTH_VALUE analytic window functions
-    order_analyzer     # F-SQL-003: ROW_NUMBER/RANK/DENSE_RANK detection, RankType enum
-  planner/             # StreamingPlanner, QueryPlan (+ analytic_config for LAG/LEAD)
-  translator/          # Operator configuration builders
-    window_translator  # WindowOperatorConfig
-    join_translator    # JoinOperatorConfig (stream/lookup)
-    analytic_translator # F-SQL-002: AnalyticWindowConfig, AnalyticFunctionConfig
-    order_translator   # F-SQL-003: PerGroupTopKConfig with RankType
-    streaming_ddl      # F-STREAM-007: CREATE SOURCE/SINK → SourceDefinition/SinkDefinition
-  datafusion/          # F005/F005B: DataFusion integration
-    window_udf         # F005B: TUMBLE/HOP/SESSION scalar UDFs
-    watermark_udf      # F005B: watermark() UDF via Arc<AtomicI64>
-    execute            # F005B: execute_streaming_sql end-to-end
-    aggregate_bridge   # F075: DataFusion Accumulator ↔ DynAccumulator bridge
+laminar-sql/src/
+  parser/         # Streaming SQL: windows, emit, late data, joins, aggregation, analytics, ranking
+  planner/        # StreamingPlanner, QueryPlan
+  translator/     # Operator config builders: window, join, analytic, order, having, DDL
+  datafusion/     # DataFusion integration: UDFs, aggregate bridge, execute_streaming_sql
 
 laminar-connectors/src/
-  kafka/              # F025/F026: Kafka Source & Sink Connectors
-    config            # KafkaSourceConfig, OffsetReset, AssignmentStrategy, CompatibilityLevel
-    source            # KafkaSource (SourceConnector impl)
-    offsets           # OffsetTracker (per-partition offset tracking)
-    backpressure      # BackpressureController (high/low watermark)
-    metrics           # KafkaSourceMetrics (AtomicU64 counters)
-    rebalance         # RebalanceState (partition assignment)
-    schema_registry   # SchemaRegistryClient (Confluent SR REST API, caching, registration)
-    avro              # AvroDeserializer (arrow-avro Decoder, Confluent wire format)
-    sink_config       # KafkaSinkConfig, DeliveryGuarantee, PartitionStrategy, CompressionType
-    sink              # KafkaSink (SinkConnector impl, transactional/idempotent)
-    avro_serializer   # AvroSerializer (arrow-avro Writer, Confluent wire format)
-    partitioner       # KafkaPartitioner trait, KeyHash/RoundRobin/Sticky
-    sink_metrics      # KafkaSinkMetrics (AtomicU64 counters)
-  postgres/           # F027B: PostgreSQL Sink Connector
-    types             # Arrow→PG type mapping (DDL, UNNEST casts, SQL types)
-    sink_config       # PostgresSinkConfig, WriteMode, DeliveryGuarantee, SslMode
-    sink_metrics      # PostgresSinkMetrics (9 AtomicU64 counters)
-    sink              # PostgresSink (SinkConnector impl, COPY BINARY + upsert + changelog)
-  cdc/postgres/       # F027: PostgreSQL CDC Source Connector
-    lsn               # LSN type (X/Y hex format, ordering, arithmetic)
-    types             # 28 PG OID constants, PgColumn, pg_type_to_arrow mapping
-    config            # PostgresCdcConfig, SslMode, SnapshotMode
-    decoder           # pgoutput binary protocol parser (9 message types)
-    schema            # RelationInfo, RelationCache, cdc_envelope_schema
-    changelog         # Z-set ChangeEvent, tuple_to_json, events_to_record_batch
-    metrics           # CdcMetrics (11 atomic counters)
-    source            # PostgresCdcSource (SourceConnector impl, transaction buffering)
-  cdc/mysql/          # F028: MySQL CDC Source Connector
-    config            # MySqlCdcConfig, SslMode, SnapshotMode
-    gtid              # Gtid, GtidRange, GtidSet (GTID-based replication)
-    types             # MySqlColumn, mysql_type_to_arrow mapping (20+ types)
-    decoder           # BinlogMessage enum, BinlogPosition, row event types
-    schema            # TableInfo, TableCache (TABLE_MAP event handling)
-    changelog         # CdcOperation, ChangeEvent, Z-set format, events_to_record_batch
-    metrics           # MySqlCdcMetrics (11 atomic counters)
-    source            # MySqlCdcSource (SourceConnector impl)
-  lakehouse/          # F031, F032: Lakehouse connectors (Delta Lake, Iceberg)
-    delta             # DeltaLakeSink (SinkConnector impl, buffering + epoch + changelog)
-    delta_config      # DeltaLakeSinkConfig, DeltaWriteMode, DeliveryGuarantee, CompactionConfig
-    delta_metrics     # DeltaLakeSinkMetrics (9 AtomicU64 counters)
-    iceberg           # F032: IcebergSink (SinkConnector impl, buffering + epoch + equality deletes)
-    iceberg_config    # IcebergSinkConfig, IcebergCatalogType, IcebergWriteMode, IcebergTransform, IcebergPartitionField
-    iceberg_metrics   # IcebergSinkMetrics (11 AtomicU64 counters)
-  storage/            # F-CLOUD-001/002/003: Cloud Storage Infrastructure
-    provider          # StorageProvider enum (AwsS3, AzureAdls, Gcs, Local), detect() from URI
-    resolver          # StorageCredentialResolver, resolve() + resolve_with_env(), env var fallback
-    validation        # CloudConfigValidator, per-provider required fields, warnings vs errors
-    masking           # SecretMasker, is_secret_key(), redact_map(), display_map()
-  bridge/             # F-DAG-006: Connector Bridge (DAG ↔ external connectors)
-    source_bridge     # DagSourceBridge (SourceConnector → DagExecutor)
-    sink_bridge       # DagSinkBridge (DagExecutor → SinkConnector)
-    runtime           # ConnectorBridgeRuntime (orchestration + checkpoint/recovery)
-    metrics           # SourceBridgeMetrics, SinkBridgeMetrics, BridgeRuntimeMetrics
-    config            # BridgeRuntimeConfig
-  serde/              # RecordDeserializer/RecordSerializer traits
-    json, csv, raw, debezium  # Format implementations
-  connector           # SourceConnector/SinkConnector traits
-  registry            # ConnectorRegistry factory pattern
+  kafka/          # Source, sink, Avro serde, schema registry, partitioner, backpressure
+  postgres/       # Sink (COPY BINARY + upsert + exactly-once)
+  cdc/postgres/   # CDC source (pgoutput decoder, Z-set changelog)
+  cdc/mysql/      # CDC source (binlog decoder, GTID, Z-set changelog)
+  lakehouse/      # Delta Lake + Iceberg sinks (buffering, epoch, changelog)
+  storage/        # Cloud storage: provider detection, credential resolver, config validation, secret masking
+  bridge/         # DAG ↔ connector bridge (source/sink bridges, runtime orchestration)
+  sdk/            # Connector SDK: retry, rate limiting, circuit breaker, test harness, schema discovery
+  serde/          # Format implementations: JSON, CSV, raw, Debezium, Avro
 
 laminar-storage/src/
-  incremental/  # F022: Checkpointing
-  per_core_wal/ # F062: Per-core WAL
+  incremental/    # Incremental checkpointing (RocksDB backend)
+  per_core_wal/   # Per-core WAL segments
+
+laminar-db/src/
+  api/            # FFI-ready API: Connection, Writer, QueryStream, ArrowSubscription
+  ffi/            # C FFI: opaque handles, Arrow C Data Interface, async callbacks
 ```
 
 ### Useful Commands
 ```bash
-cargo test --all --lib          # Run all tests
-cargo bench --bench tpc_bench   # TPC benchmarks
-cargo bench --bench dag_bench   # DAG pipeline benchmarks (F-DAG-007)
-cargo bench --bench dag_stress  # DAG stress tests with p99 latency
-cargo clippy --all -- -D warnings
+cargo test --all --lib                    # Run all tests (base features)
+cargo test --all --lib --features kafka   # Include Kafka/Avro tests
+cargo bench --bench dag_bench             # DAG pipeline benchmarks
+cargo clippy --all -- -D warnings         # Lint
 ```

@@ -620,6 +620,145 @@ pub fn count_joins(select: &Select) -> usize {
         .sum()
 }
 
+/// Analysis result for multi-way JOINs (e.g., `A JOIN B ... JOIN C ...`).
+///
+/// Each step represents one left-deep join: step 0 joins the base table with
+/// the first right table, step 1 joins the result with the next right table, etc.
+#[derive(Debug, Clone)]
+pub struct MultiJoinAnalysis {
+    /// Ordered join steps (left-to-right)
+    pub joins: Vec<JoinAnalysis>,
+    /// All referenced tables in order (base table first, then each right table)
+    pub tables: Vec<String>,
+}
+
+impl MultiJoinAnalysis {
+    /// Number of join steps.
+    #[must_use]
+    pub fn len(&self) -> usize {
+        self.joins.len()
+    }
+
+    /// Whether there are no join steps.
+    #[must_use]
+    pub fn is_empty(&self) -> bool {
+        self.joins.is_empty()
+    }
+
+    /// Whether this is a single join (backward-compatible case).
+    #[must_use]
+    pub fn is_single(&self) -> bool {
+        self.joins.len() == 1
+    }
+
+    /// The first join step (convenience for single-join queries).
+    #[must_use]
+    pub fn first(&self) -> Option<&JoinAnalysis> {
+        self.joins.first()
+    }
+}
+
+/// Analyze a SELECT statement for all join steps (multi-way).
+///
+/// Returns `None` if the query has no joins. For a single join this
+/// returns a `MultiJoinAnalysis` with one step, making it backward
+/// compatible with `analyze_join()`.
+///
+/// # Errors
+///
+/// Returns `ParseError::StreamingError` if any join constraint is
+/// not supported or key columns cannot be extracted.
+pub fn analyze_joins(select: &Select) -> Result<Option<MultiJoinAnalysis>, ParseError> {
+    let from = &select.from;
+    if from.is_empty() {
+        return Ok(None);
+    }
+
+    let first_table = &from[0];
+    if first_table.joins.is_empty() {
+        return Ok(None);
+    }
+
+    // Extract base table
+    let base_table = extract_table_name(&first_table.relation)?;
+    let base_alias = extract_table_alias(&first_table.relation);
+
+    let mut join_steps = Vec::with_capacity(first_table.joins.len());
+    let mut tables = vec![base_table.clone()];
+
+    // Track the left table name for left-deep chaining
+    let mut prev_left_table = base_table;
+    let mut prev_left_alias = base_alias;
+
+    for join in &first_table.joins {
+        let right_table = extract_table_name(&join.relation)?;
+        let right_alias = extract_table_alias(&join.relation);
+        tables.push(right_table.clone());
+
+        let join_type = map_join_operator(&join.join_operator);
+
+        // Handle ASOF JOIN
+        if let JoinOperator::AsOf {
+            match_condition,
+            constraint,
+        } = &join.join_operator
+        {
+            let (direction, left_time, right_time, tolerance) =
+                analyze_asof_match_condition(match_condition)?;
+            let (left_key, right_key) = analyze_asof_constraint(constraint)?;
+
+            let mut analysis = JoinAnalysis::asof(
+                prev_left_table.clone(),
+                right_table.clone(),
+                left_key,
+                right_key,
+                direction,
+                left_time,
+                right_time,
+                tolerance,
+            );
+            analysis.left_alias.clone_from(&prev_left_alias);
+            analysis.right_alias = right_alias;
+            join_steps.push(analysis);
+        } else {
+            // Regular join (inner, left, right, full)
+            let (left_key, right_key, time_bound) =
+                analyze_join_constraint(&join.join_operator)?;
+
+            let mut analysis = if let Some(tb) = time_bound {
+                JoinAnalysis::stream_stream(
+                    prev_left_table.clone(),
+                    right_table.clone(),
+                    left_key,
+                    right_key,
+                    tb,
+                    join_type,
+                )
+            } else {
+                JoinAnalysis::lookup(
+                    prev_left_table.clone(),
+                    right_table.clone(),
+                    left_key,
+                    right_key,
+                    join_type,
+                )
+            };
+            analysis.left_alias.clone_from(&prev_left_alias);
+            analysis.right_alias = right_alias;
+            join_steps.push(analysis);
+        }
+
+        // Next step's left table is this step's right table (left-deep)
+        prev_left_table = right_table;
+        prev_left_alias = extract_table_alias(&join.relation);
+    }
+
+    Ok(Some(MultiJoinAnalysis {
+        joins: join_steps,
+        tables,
+    }))
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -854,5 +993,117 @@ mod tests {
         assert_eq!(analysis.right_alias, Some("q".to_string()));
         assert_eq!(analysis.left_table, "trades");
         assert_eq!(analysis.right_table, "quotes");
+    }
+
+    // -- Multi-way JOIN tests (F-SQL-005) --
+
+    #[test]
+    fn test_multi_join_single_backward_compat() {
+        let sql = "SELECT * FROM orders o JOIN payments p ON o.id = p.order_id";
+        let select = parse_select(sql);
+        let multi = analyze_joins(&select).unwrap().unwrap();
+
+        assert!(multi.is_single());
+        assert_eq!(multi.len(), 1);
+        assert!(!multi.is_empty());
+        let first = multi.first().unwrap();
+        assert_eq!(first.left_table, "orders");
+        assert_eq!(first.right_table, "payments");
+    }
+
+    #[test]
+    fn test_multi_join_two_way() {
+        let sql = "SELECT * FROM a JOIN b ON a.id = b.a_id JOIN c ON b.id = c.b_id";
+        let select = parse_select(sql);
+        let multi = analyze_joins(&select).unwrap().unwrap();
+
+        assert_eq!(multi.len(), 2);
+        assert!(!multi.is_single());
+
+        assert_eq!(multi.joins[0].left_table, "a");
+        assert_eq!(multi.joins[0].right_table, "b");
+        assert_eq!(multi.joins[0].left_key_column, "id");
+        assert_eq!(multi.joins[0].right_key_column, "a_id");
+
+        assert_eq!(multi.joins[1].left_table, "b");
+        assert_eq!(multi.joins[1].right_table, "c");
+        assert_eq!(multi.joins[1].left_key_column, "id");
+        assert_eq!(multi.joins[1].right_key_column, "b_id");
+    }
+
+    #[test]
+    fn test_multi_join_three_way() {
+        let sql = "SELECT * FROM a \
+                    JOIN b ON a.id = b.a_id \
+                    JOIN c ON b.id = c.b_id \
+                    JOIN d ON c.id = d.c_id";
+        let select = parse_select(sql);
+        let multi = analyze_joins(&select).unwrap().unwrap();
+
+        assert_eq!(multi.len(), 3);
+        assert_eq!(multi.tables.len(), 4);
+        assert_eq!(multi.tables, vec!["a", "b", "c", "d"]);
+    }
+
+    #[test]
+    fn test_multi_join_mixed_asof_and_lookup() {
+        // ASOF first, then lookup (use Snowflake dialect for ASOF)
+        let sql = "SELECT * FROM trades t \
+                    ASOF JOIN quotes q \
+                    MATCH_CONDITION(t.ts >= q.ts) \
+                    ON t.symbol = q.symbol \
+                    JOIN products p ON q.product_id = p.id";
+        let select = parse_select_snowflake(sql);
+        let multi = analyze_joins(&select).unwrap().unwrap();
+
+        assert_eq!(multi.len(), 2);
+        assert!(multi.joins[0].is_asof_join);
+        assert!(multi.joins[1].is_lookup_join);
+    }
+
+    #[test]
+    fn test_multi_join_stream_stream_and_lookup() {
+        let sql = "SELECT * FROM orders o \
+                    JOIN payments p ON o.id = p.order_id \
+                        AND p.ts BETWEEN o.ts AND o.ts + INTERVAL '1' HOUR \
+                    JOIN customers c ON o.customer_id = c.id";
+        let select = parse_select(sql);
+        let multi = analyze_joins(&select).unwrap().unwrap();
+
+        assert_eq!(multi.len(), 2);
+        assert!(!multi.joins[0].is_lookup_join); // stream-stream
+        assert!(multi.joins[0].time_bound.is_some());
+        assert!(multi.joins[1].is_lookup_join); // lookup
+    }
+
+    #[test]
+    fn test_multi_join_tables_list() {
+        let sql = "SELECT * FROM a JOIN b ON a.id = b.a_id JOIN c ON b.id = c.b_id";
+        let select = parse_select(sql);
+        let multi = analyze_joins(&select).unwrap().unwrap();
+
+        assert_eq!(multi.tables, vec!["a", "b", "c"]);
+    }
+
+    #[test]
+    fn test_multi_join_aliases() {
+        let sql = "SELECT * FROM orders AS o \
+                    JOIN payments AS p ON o.id = p.order_id \
+                    JOIN refunds AS r ON p.id = r.payment_id";
+        let select = parse_select(sql);
+        let multi = analyze_joins(&select).unwrap().unwrap();
+
+        assert_eq!(multi.joins[0].left_alias, Some("o".to_string()));
+        assert_eq!(multi.joins[0].right_alias, Some("p".to_string()));
+        assert_eq!(multi.joins[1].left_alias, Some("p".to_string()));
+        assert_eq!(multi.joins[1].right_alias, Some("r".to_string()));
+    }
+
+    #[test]
+    fn test_multi_join_no_join_returns_none() {
+        let sql = "SELECT * FROM orders";
+        let select = parse_select(sql);
+        let multi = analyze_joins(&select).unwrap();
+        assert!(multi.is_none());
     }
 }

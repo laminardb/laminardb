@@ -7,6 +7,8 @@
 pub mod analytic_translator;
 /// DAG EXPLAIN formatter
 pub mod dag_planner;
+/// HAVING clause filter configuration
+pub mod having_translator;
 mod join_translator;
 /// ORDER BY operator configuration builder
 pub mod order_translator;
@@ -17,6 +19,7 @@ mod window_translator;
 pub use crate::parser::order_analyzer::RankType;
 pub use analytic_translator::{AnalyticFunctionConfig, AnalyticWindowConfig};
 pub use dag_planner::{format_dag_explain, DagExplainOutput};
+pub use having_translator::HavingFilterConfig;
 pub use join_translator::{
     AsofJoinTranslatorConfig, AsofSqlJoinType, JoinOperatorConfig, LookupJoinConfig,
     LookupJoinType, StreamJoinConfig, StreamJoinType,
