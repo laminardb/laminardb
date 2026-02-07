@@ -1562,7 +1562,7 @@ impl LaminarDB {
                         }
                     }
                     Err(e) => {
-                        tracing::warn!(error = %e, "Embedded stream execution error");
+                        tracing::error!(error = %e, "Embedded stream execution error");
                     }
                 }
 

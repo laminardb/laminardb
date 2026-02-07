@@ -6,11 +6,12 @@
 use std::collections::hash_map::DefaultHasher;
 use std::collections::BTreeMap;
 use std::collections::HashMap;
+use std::collections::HashSet;
 use std::hash::{Hash, Hasher};
 use std::sync::Arc;
 
 use arrow::array::{
-    Array, ArrayRef, Float64Array, Int64Array, NullArray, RecordBatch, StringArray,
+    Array, ArrayRef, Float64Array, Int64Array, RecordBatch, StringArray,
     TimestampMillisecondArray,
 };
 use arrow::compute::concat_batches;
@@ -273,7 +274,9 @@ fn extract_column_as_timestamps(batch: &RecordBatch, col_name: &str) -> Result<V
 
 /// Build the merged output schema from left and right schemas.
 ///
-/// Right-side columns are made nullable for Left joins.
+/// Right-side columns are made nullable for Left joins. Duplicate column
+/// names (collisions between left and right) are disambiguated by appending
+/// `_{right_table}` to the right-side field.
 fn build_output_schema(
     left_schema: &SchemaRef,
     right_schema: &SchemaRef,
@@ -285,6 +288,7 @@ fn build_output_schema(
         .map(|f| f.as_ref().clone())
         .collect();
 
+    let left_names: HashSet<&str> = left_schema.fields().iter().map(|f| f.name().as_str()).collect();
     let make_nullable = config.join_type == AsofSqlJoinType::Left;
     for field in right_schema.fields() {
         // Skip duplicate key column (already in left side)
@@ -294,6 +298,11 @@ fn build_output_schema(
         let mut f = field.as_ref().clone();
         if make_nullable {
             f = f.with_nullable(true);
+        }
+        // Disambiguate duplicate names by appending _{right_table}
+        if left_names.contains(f.name().as_str()) {
+            let suffixed_name = format!("{}_{}", f.name(), config.right_table);
+            f = f.with_name(suffixed_name);
         }
         fields.push(f);
     }
@@ -349,8 +358,8 @@ fn take_with_nulls(
     num_rows: usize,
 ) -> Result<ArrayRef, DbError> {
     if array.is_empty() {
-        // Right side is empty — produce all nulls
-        return Ok(Arc::new(NullArray::new(num_rows)) as ArrayRef);
+        // Right side is empty — produce typed all-null array matching the source dtype
+        return Ok(arrow::array::new_null_array(array.data_type(), num_rows));
     }
 
     // Build a UInt32Array with null entries for unmatched rows

@@ -13,9 +13,14 @@ use std::sync::Arc;
 
 use arrow::array::RecordBatch;
 use datafusion::prelude::SessionContext;
-use sqlparser::ast::{SetExpr, Statement, TableFactor};
+use sqlparser::ast::{
+    Expr, SelectItem, SetExpr, Statement, TableFactor, WildcardAdditionalOptions,
+};
 use sqlparser::dialect::GenericDialect;
 use sqlparser::parser::Parser;
+
+use laminar_sql::parser::join_parser::analyze_joins;
+use laminar_sql::translator::{AsofJoinTranslatorConfig, JoinOperatorConfig};
 
 use crate::error::DbError;
 
@@ -88,6 +93,11 @@ pub(crate) struct StreamQuery {
     pub name: String,
     /// SQL query text.
     pub sql: String,
+    /// ASOF join config (set when the query contains an ASOF JOIN).
+    pub asof_config: Option<AsofJoinTranslatorConfig>,
+    /// Rewritten projection SQL to apply aliases/expressions after the ASOF
+    /// join result is registered as `__asof_tmp`.
+    pub projection_sql: Option<String>,
 }
 
 /// DataFusion-based micro-batch stream executor.
@@ -119,8 +129,18 @@ impl StreamExecutor {
     }
 
     /// Register a stream query for execution.
+    ///
+    /// If the query contains an ASOF JOIN, it is detected at registration time
+    /// and routed to a custom execution path in `execute_cycle()` (since
+    /// `DataFusion` cannot parse ASOF syntax).
     pub fn add_query(&mut self, name: String, sql: String) {
-        self.queries.push(StreamQuery { name, sql });
+        let (asof_config, projection_sql) = detect_asof_query(&sql);
+        self.queries.push(StreamQuery {
+            name,
+            sql,
+            asof_config,
+            projection_sql,
+        });
         self.topo_dirty = true;
     }
 
@@ -226,13 +246,26 @@ impl StreamExecutor {
             let query = &self.queries[idx];
             let query_name = query.name.clone();
             let query_sql = query.sql.clone();
+            let asof_config = query.asof_config.clone();
+            let projection_sql = query.projection_sql.clone();
 
-            let df = self.ctx.sql(&query_sql).await.map_err(|e| {
-                DbError::Pipeline(format!("Stream '{query_name}' planning failed: {e}"))
-            })?;
-            let batches = df.collect().await.map_err(|e| {
-                DbError::Pipeline(format!("Stream '{query_name}' execution failed: {e}"))
-            })?;
+            let batches = if let Some(ref cfg) = asof_config {
+                self.execute_asof_query(
+                    &query_name,
+                    cfg,
+                    projection_sql.as_deref(),
+                    source_batches,
+                    &results,
+                )
+                .await?
+            } else {
+                let df = self.ctx.sql(&query_sql).await.map_err(|e| {
+                    DbError::Pipeline(format!("Stream '{query_name}' planning failed: {e}"))
+                })?;
+                df.collect().await.map_err(|e| {
+                    DbError::Pipeline(format!("Stream '{query_name}' execution failed: {e}"))
+                })?
+            };
 
             if !batches.is_empty() {
                 // Register results as a temp MemTable for downstream queries
@@ -298,6 +331,300 @@ impl StreamExecutor {
     #[allow(dead_code)] // Public API for admin/observability queries
     pub fn query_count(&self) -> usize {
         self.queries.len()
+    }
+
+    /// Execute an ASOF join query by fetching left/right batches and performing
+    /// the join in-process. Optionally applies a projection SQL for aliases and
+    /// computed columns.
+    async fn execute_asof_query(
+        &self,
+        query_name: &str,
+        config: &AsofJoinTranslatorConfig,
+        projection_sql: Option<&str>,
+        source_batches: &HashMap<String, Vec<RecordBatch>>,
+        intermediate_results: &HashMap<String, Vec<RecordBatch>>,
+    ) -> Result<Vec<RecordBatch>, DbError> {
+        // Resolve left batches: source_batches → intermediate → DataFusion
+        let left_batches =
+            self.resolve_table_batches(&config.left_table, source_batches, intermediate_results)
+                .await?;
+        let right_batches =
+            self.resolve_table_batches(&config.right_table, source_batches, intermediate_results)
+                .await?;
+
+        let joined =
+            crate::asof_batch::execute_asof_join_batch(&left_batches, &right_batches, config)?;
+
+        if joined.num_rows() == 0 {
+            return Ok(Vec::new());
+        }
+
+        // Apply projection if present (handles aliases and computed columns)
+        if let Some(proj_sql) = projection_sql {
+            let schema = joined.schema();
+            let mem_table =
+                datafusion::datasource::MemTable::try_new(schema, vec![vec![joined]]).map_err(
+                    |e| {
+                        DbError::Pipeline(format!(
+                            "Stream '{query_name}' ASOF temp table failed: {e}"
+                        ))
+                    },
+                )?;
+
+            let _ = self.ctx.deregister_table("__asof_tmp");
+            self.ctx
+                .register_table("__asof_tmp", Arc::new(mem_table))
+                .map_err(|e| {
+                    DbError::Pipeline(format!(
+                        "Stream '{query_name}' ASOF temp registration failed: {e}"
+                    ))
+                })?;
+
+            let df = self.ctx.sql(proj_sql).await.map_err(|e| {
+                DbError::Pipeline(format!(
+                    "Stream '{query_name}' ASOF projection failed: {e}"
+                ))
+            })?;
+            let result = df.collect().await.map_err(|e| {
+                DbError::Pipeline(format!(
+                    "Stream '{query_name}' ASOF projection execution failed: {e}"
+                ))
+            })?;
+
+            let _ = self.ctx.deregister_table("__asof_tmp");
+            Ok(result)
+        } else {
+            Ok(vec![joined])
+        }
+    }
+
+    /// Resolve batches for a table name by checking source batches first,
+    /// then intermediate results, then falling back to the `DataFusion` context.
+    async fn resolve_table_batches(
+        &self,
+        table_name: &str,
+        source_batches: &HashMap<String, Vec<RecordBatch>>,
+        intermediate_results: &HashMap<String, Vec<RecordBatch>>,
+    ) -> Result<Vec<RecordBatch>, DbError> {
+        if let Some(batches) = source_batches.get(table_name) {
+            return Ok(batches.clone());
+        }
+        if let Some(batches) = intermediate_results.get(table_name) {
+            return Ok(batches.clone());
+        }
+        // Fall back to DataFusion context (e.g., static reference tables)
+        let sql = format!("SELECT * FROM {table_name}");
+        let df = self.ctx.sql(&sql).await.map_err(|e| {
+            DbError::Pipeline(format!("ASOF table '{table_name}' not found: {e}"))
+        })?;
+        df.collect().await.map_err(|e| {
+            DbError::Pipeline(format!("ASOF table '{table_name}' query failed: {e}"))
+        })
+    }
+}
+
+/// Detect whether a SQL query contains an ASOF JOIN and, if so, extract the
+/// `AsofJoinTranslatorConfig` and build a projection SQL string.
+///
+/// Returns `(None, None)` for non-ASOF queries.
+fn detect_asof_query(sql: &str) -> (Option<AsofJoinTranslatorConfig>, Option<String>) {
+    // Parse using the streaming parser which understands ASOF syntax
+    let Ok(statements) = laminar_sql::parse_streaming_sql(sql) else {
+        return (None, None);
+    };
+
+    // We need a raw sqlparser Statement::Query to inspect the SELECT AST
+    let Some(laminar_sql::parser::StreamingStatement::Standard(stmt)) = statements.first() else {
+        return (None, None);
+    };
+
+    let Statement::Query(query) = stmt.as_ref() else {
+        return (None, None);
+    };
+
+    let SetExpr::Select(select) = query.body.as_ref() else {
+        return (None, None);
+    };
+
+    let Ok(Some(multi)) = analyze_joins(select) else {
+        return (None, None);
+    };
+
+    // Find the first ASOF join step
+    let Some(asof_analysis) = multi.joins.iter().find(|j| j.is_asof_join) else {
+        return (None, None);
+    };
+
+    let JoinOperatorConfig::Asof(config) = JoinOperatorConfig::from_analysis(asof_analysis) else {
+        return (None, None);
+    };
+
+    // Build a projection SQL that rewrites the original SELECT list to reference
+    // the flattened __asof_tmp table (no table qualifiers, disambiguated names).
+    let projection_sql = build_projection_sql(select, asof_analysis, &config);
+
+    (Some(config), Some(projection_sql))
+}
+
+/// Build a `SELECT ... FROM __asof_tmp` projection query from the original
+/// SELECT items, rewriting table-qualified references to plain column names.
+fn build_projection_sql(
+    select: &sqlparser::ast::Select,
+    analysis: &laminar_sql::parser::join_parser::JoinAnalysis,
+    config: &AsofJoinTranslatorConfig,
+) -> String {
+    let left_alias = analysis.left_alias.as_deref();
+    let right_alias = analysis.right_alias.as_deref();
+
+    // Collect disambiguation mapping: right-side columns that collide with left
+    // get suffixed with _{right_table} in the output schema.
+    // We don't know the exact schemas here, but we know the key column is shared.
+    // For the right time column, it often collides (e.g., both sides have "ts").
+    // The actual renaming is done in build_output_schema; here we just need to
+    // handle the common case of right-qualified columns referencing their
+    // potentially-renamed counterparts.
+
+    let items: Vec<String> = select
+        .projection
+        .iter()
+        .map(|item| rewrite_select_item(item, left_alias, right_alias, config))
+        .collect();
+
+    let select_clause = items.join(", ");
+
+    // Rewrite WHERE clause if present
+    let where_clause = select.selection.as_ref().map(|expr| {
+        let rewritten = rewrite_expr(expr, left_alias, right_alias, config);
+        format!(" WHERE {rewritten}")
+    });
+
+    format!(
+        "SELECT {select_clause} FROM __asof_tmp{}",
+        where_clause.unwrap_or_default()
+    )
+}
+
+/// Rewrite a single `SelectItem` to remove table qualifiers.
+fn rewrite_select_item(
+    item: &SelectItem,
+    left_alias: Option<&str>,
+    right_alias: Option<&str>,
+    config: &AsofJoinTranslatorConfig,
+) -> String {
+    match item {
+        SelectItem::UnnamedExpr(expr) => rewrite_expr(expr, left_alias, right_alias, config),
+        SelectItem::ExprWithAlias { expr, alias } => {
+            let rewritten = rewrite_expr(expr, left_alias, right_alias, config);
+            format!("{rewritten} AS {alias}")
+        }
+        SelectItem::Wildcard(WildcardAdditionalOptions { .. }) => "*".to_string(),
+        SelectItem::QualifiedWildcard(name, _) => {
+            let table = name.to_string();
+            // t.* or q.* — just use * since all columns are flattened
+            if Some(table.as_str()) == left_alias || Some(table.as_str()) == right_alias {
+                "*".to_string()
+            } else {
+                format!("{table}.*")
+            }
+        }
+    }
+}
+
+/// Recursively rewrite an expression tree to remove table qualifiers
+/// and map right-side columns to their disambiguated names.
+fn rewrite_expr(
+    expr: &Expr,
+    left_alias: Option<&str>,
+    right_alias: Option<&str>,
+    config: &AsofJoinTranslatorConfig,
+) -> String {
+    match expr {
+        Expr::CompoundIdentifier(parts) if parts.len() == 2 => {
+            let table = parts[0].value.as_str();
+            let column = parts[1].value.as_str();
+
+            let is_left = Some(table) == left_alias
+                || table == config.left_table;
+            let is_right = Some(table) == right_alias
+                || table == config.right_table;
+
+            if is_left {
+                column.to_string()
+            } else if is_right {
+                // Check if this right column might be disambiguated.
+                // The key column is excluded from the right side entirely,
+                // and other duplicate columns get suffixed.
+                // We suffix if the column name matches a "well-known" left-side
+                // column that could collide — specifically the key column
+                // (already excluded) or columns sharing the same name.
+                // We use a heuristic: if the right column name equals the
+                // left time column, suffix it.
+                if column == config.left_time_column && column != config.right_time_column {
+                    // Left and right time columns have different names — no collision
+                    column.to_string()
+                } else if column == config.key_column {
+                    // Key column: just use the bare name (from left side)
+                    column.to_string()
+                } else {
+                    // For other right-side columns, check if the column name
+                    // matches any "standard" left-side column name.
+                    // Since we don't have the full schema here, use a
+                    // conservative approach: only suffix the right time column
+                    // when it matches the left time column name.
+                    if column == config.left_time_column
+                        && column == config.right_time_column
+                    {
+                        // Same name for time columns — right side is suffixed
+                        format!("{}_{}", column, config.right_table)
+                    } else {
+                        column.to_string()
+                    }
+                }
+            } else {
+                expr.to_string()
+            }
+        }
+        Expr::BinaryOp { left, op, right } => {
+            let l = rewrite_expr(left, left_alias, right_alias, config);
+            let r = rewrite_expr(right, left_alias, right_alias, config);
+            format!("{l} {op} {r}")
+        }
+        Expr::UnaryOp { op, expr: inner } => {
+            let e = rewrite_expr(inner, left_alias, right_alias, config);
+            format!("{op} {e}")
+        }
+        Expr::Nested(inner) => {
+            let e = rewrite_expr(inner, left_alias, right_alias, config);
+            format!("({e})")
+        }
+        Expr::Function(func) => {
+            // Rewrite function arguments
+            let name = &func.name;
+            let args: Vec<String> = match &func.args {
+                sqlparser::ast::FunctionArguments::List(arg_list) => arg_list
+                    .args
+                    .iter()
+                    .map(|arg| match arg {
+                        sqlparser::ast::FunctionArg::Unnamed(
+                            sqlparser::ast::FunctionArgExpr::Expr(e),
+                        ) => rewrite_expr(e, left_alias, right_alias, config),
+                        other => other.to_string(),
+                    })
+                    .collect(),
+                other => vec![other.to_string()],
+            };
+            format!("{name}({})", args.join(", "))
+        }
+        Expr::Cast {
+            expr: inner,
+            data_type,
+            ..
+        } => {
+            let e = rewrite_expr(inner, left_alias, right_alias, config);
+            format!("CAST({e} AS {data_type})")
+        }
+        // For any other expression variant, fall back to sqlparser's Display
+        _ => expr.to_string(),
     }
 }
 
@@ -719,5 +1046,238 @@ mod tests {
             err_msg.contains("missing_col"),
             "error should name the stream: {err_msg}"
         );
+    }
+
+    // --- ASOF JOIN streaming tests ---
+
+    fn trades_schema() -> Arc<Schema> {
+        Arc::new(Schema::new(vec![
+            Field::new("symbol", DataType::Utf8, false),
+            Field::new("ts", DataType::Int64, false),
+            Field::new("price", DataType::Float64, false),
+            Field::new("volume", DataType::Int64, false),
+        ]))
+    }
+
+    fn quotes_schema() -> Arc<Schema> {
+        Arc::new(Schema::new(vec![
+            Field::new("symbol", DataType::Utf8, false),
+            Field::new("ts", DataType::Int64, false),
+            Field::new("bid", DataType::Float64, false),
+            Field::new("ask", DataType::Float64, false),
+        ]))
+    }
+
+    fn trades_batch_for_asof() -> RecordBatch {
+        RecordBatch::try_new(
+            trades_schema(),
+            vec![
+                Arc::new(StringArray::from(vec!["AAPL", "AAPL", "GOOG"])),
+                Arc::new(Int64Array::from(vec![100, 200, 150])),
+                Arc::new(Float64Array::from(vec![150.0, 152.0, 2800.0])),
+                Arc::new(Int64Array::from(vec![100, 200, 50])),
+            ],
+        )
+        .unwrap()
+    }
+
+    fn quotes_batch_for_asof() -> RecordBatch {
+        RecordBatch::try_new(
+            quotes_schema(),
+            vec![
+                Arc::new(StringArray::from(vec!["AAPL", "AAPL", "GOOG"])),
+                Arc::new(Int64Array::from(vec![90, 180, 140])),
+                Arc::new(Float64Array::from(vec![149.0, 151.0, 2790.0])),
+                Arc::new(Float64Array::from(vec![150.0, 152.0, 2800.0])),
+            ],
+        )
+        .unwrap()
+    }
+
+    #[test]
+    fn test_detect_asof_query_positive() {
+        let sql = "SELECT t.symbol, t.price AS trade_price, q.bid \
+                   FROM trades t ASOF JOIN quotes q \
+                   MATCH_CONDITION(t.ts >= q.ts) ON t.symbol = q.symbol";
+        let (cfg, proj) = detect_asof_query(sql);
+        assert!(cfg.is_some(), "should detect ASOF config");
+        assert!(proj.is_some(), "should produce projection SQL");
+
+        let config = cfg.unwrap();
+        assert_eq!(config.left_table, "trades");
+        assert_eq!(config.right_table, "quotes");
+        assert_eq!(config.key_column, "symbol");
+
+        let proj_sql = proj.unwrap();
+        assert!(
+            proj_sql.contains("__asof_tmp"),
+            "projection should reference __asof_tmp: {proj_sql}"
+        );
+        assert!(
+            proj_sql.contains("trade_price"),
+            "projection should preserve alias: {proj_sql}"
+        );
+    }
+
+    #[test]
+    fn test_detect_asof_query_negative() {
+        let sql = "SELECT name, SUM(value) FROM events GROUP BY name";
+        let (cfg, proj) = detect_asof_query(sql);
+        assert!(cfg.is_none());
+        assert!(proj.is_none());
+    }
+
+    #[tokio::test]
+    async fn test_asof_streaming_basic() {
+        let ctx = SessionContext::new();
+        register_streaming_functions(&ctx);
+        let mut executor = StreamExecutor::new(ctx);
+
+        executor.add_query(
+            "enriched".to_string(),
+            "SELECT t.symbol, t.price, q.bid, q.ask \
+             FROM trades t ASOF JOIN quotes q \
+             MATCH_CONDITION(t.ts >= q.ts) ON t.symbol = q.symbol"
+                .to_string(),
+        );
+
+        let mut source_batches = HashMap::new();
+        source_batches.insert("trades".to_string(), vec![trades_batch_for_asof()]);
+        source_batches.insert("quotes".to_string(), vec![quotes_batch_for_asof()]);
+
+        let results = executor.execute_cycle(&source_batches).await.unwrap();
+        assert!(
+            results.contains_key("enriched"),
+            "ASOF query should produce results"
+        );
+        let batches = &results["enriched"];
+        let total_rows: usize = batches.iter().map(|b| b.num_rows()).sum();
+        assert_eq!(total_rows, 3, "should have one row per trade");
+
+        // Verify column names in the projected output
+        let schema = batches[0].schema();
+        let names: Vec<&str> = schema.fields().iter().map(|f| f.name().as_str()).collect();
+        assert_eq!(names, vec!["symbol", "price", "bid", "ask"]);
+    }
+
+    #[tokio::test]
+    async fn test_asof_streaming_with_aliases_and_computed_columns() {
+        let ctx = SessionContext::new();
+        register_streaming_functions(&ctx);
+        let mut executor = StreamExecutor::new(ctx);
+
+        executor.add_query(
+            "spread_stream".to_string(),
+            "SELECT t.symbol, t.price AS trade_price, q.bid, t.price - q.bid AS spread \
+             FROM trades t ASOF JOIN quotes q \
+             MATCH_CONDITION(t.ts >= q.ts) ON t.symbol = q.symbol"
+                .to_string(),
+        );
+
+        let mut source_batches = HashMap::new();
+        source_batches.insert("trades".to_string(), vec![trades_batch_for_asof()]);
+        source_batches.insert("quotes".to_string(), vec![quotes_batch_for_asof()]);
+
+        let results = executor.execute_cycle(&source_batches).await.unwrap();
+        assert!(results.contains_key("spread_stream"));
+        let batches = &results["spread_stream"];
+        let total_rows: usize = batches.iter().map(|b| b.num_rows()).sum();
+        assert_eq!(total_rows, 3);
+
+        // Verify column names include aliases and computed column
+        let schema = batches[0].schema();
+        let names: Vec<&str> = schema.fields().iter().map(|f| f.name().as_str()).collect();
+        assert_eq!(names, vec!["symbol", "trade_price", "bid", "spread"]);
+
+        // Verify computed spread value: AAPL trade@100 price=150.0, quote@90 bid=149.0 → spread=1.0
+        let spread = batches[0]
+            .column_by_name("spread")
+            .unwrap()
+            .as_any()
+            .downcast_ref::<Float64Array>()
+            .unwrap();
+        assert!((spread.value(0) - 1.0).abs() < f64::EPSILON);
+    }
+
+    #[tokio::test]
+    async fn test_asof_streaming_empty_sources() {
+        let ctx = SessionContext::new();
+        register_streaming_functions(&ctx);
+        let mut executor = StreamExecutor::new(ctx);
+
+        executor.add_query(
+            "enriched".to_string(),
+            "SELECT t.symbol, q.bid \
+             FROM trades t ASOF JOIN quotes q \
+             MATCH_CONDITION(t.ts >= q.ts) ON t.symbol = q.symbol"
+                .to_string(),
+        );
+
+        // Only trades, no quotes → should still work (left join with nulls)
+        let mut source_batches = HashMap::new();
+        source_batches.insert("trades".to_string(), vec![trades_batch_for_asof()]);
+        source_batches.insert(
+            "quotes".to_string(),
+            vec![RecordBatch::new_empty(quotes_schema())],
+        );
+
+        let results = executor.execute_cycle(&source_batches).await.unwrap();
+        // ASOF join with empty right produces 3 rows with null bids
+        assert!(results.contains_key("enriched"));
+    }
+
+    #[tokio::test]
+    async fn test_asof_in_cascade() {
+        let ctx = SessionContext::new();
+        register_streaming_functions(&ctx);
+        let mut executor = StreamExecutor::new(ctx);
+
+        // ASOF join produces enriched results
+        executor.add_query(
+            "enriched".to_string(),
+            "SELECT t.symbol, t.price, q.bid \
+             FROM trades t ASOF JOIN quotes q \
+             MATCH_CONDITION(t.ts >= q.ts) ON t.symbol = q.symbol"
+                .to_string(),
+        );
+
+        // Downstream query filters ASOF results
+        executor.add_query(
+            "filtered".to_string(),
+            "SELECT symbol, price, bid FROM enriched WHERE price > 151.0".to_string(),
+        );
+
+        let mut source_batches = HashMap::new();
+        source_batches.insert("trades".to_string(), vec![trades_batch_for_asof()]);
+        source_batches.insert("quotes".to_string(), vec![quotes_batch_for_asof()]);
+
+        let results = executor.execute_cycle(&source_batches).await.unwrap();
+        assert!(results.contains_key("enriched"));
+        assert!(results.contains_key("filtered"));
+
+        // filtered: only trades with price > 151.0 → AAPL@152.0 and GOOG@2800.0
+        let filtered_rows: usize = results["filtered"].iter().map(|b| b.num_rows()).sum();
+        assert_eq!(filtered_rows, 2);
+    }
+
+    #[tokio::test]
+    async fn test_non_asof_queries_unaffected() {
+        // Verify that non-ASOF queries still work exactly as before
+        let ctx = SessionContext::new();
+        register_streaming_functions(&ctx);
+        let mut executor = StreamExecutor::new(ctx);
+
+        executor.add_query(
+            "simple".to_string(),
+            "SELECT name, SUM(value) as total FROM events GROUP BY name".to_string(),
+        );
+
+        let mut source_batches = HashMap::new();
+        source_batches.insert("events".to_string(), vec![test_batch()]);
+
+        let results = executor.execute_cycle(&source_batches).await.unwrap();
+        assert!(results.contains_key("simple"));
+        let total_rows: usize = results["simple"].iter().map(|b| b.num_rows()).sum();
+        assert_eq!(total_rows, 3);
     }
 }
