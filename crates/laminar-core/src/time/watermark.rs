@@ -63,6 +63,13 @@ pub trait WatermarkGenerator: Send {
 
     /// Returns the current watermark value without advancing it.
     fn current_watermark(&self) -> i64;
+
+    /// Advances the watermark to at least the given timestamp from an external source.
+    ///
+    /// Called when the source provides an explicit watermark (e.g., `Source::watermark()`).
+    /// Returns `Some(Watermark)` if the watermark advanced, `None` if the timestamp
+    /// was not higher than the current watermark.
+    fn advance_watermark(&mut self, timestamp: i64) -> Option<Watermark>;
 }
 
 /// Watermark generator with bounded out-of-orderness.
@@ -145,6 +152,21 @@ impl WatermarkGenerator for BoundedOutOfOrdernessGenerator {
     fn current_watermark(&self) -> i64 {
         self.current_watermark
     }
+
+    #[inline]
+    fn advance_watermark(&mut self, timestamp: i64) -> Option<Watermark> {
+        if timestamp > self.current_watermark {
+            self.current_watermark = timestamp;
+            // Maintain invariant: current_max_timestamp >= current_watermark + max_out_of_orderness
+            let min_max = timestamp.saturating_add(self.max_out_of_orderness);
+            if min_max > self.current_max_timestamp {
+                self.current_max_timestamp = min_max;
+            }
+            Some(Watermark::new(timestamp))
+        } else {
+            None
+        }
+    }
 }
 
 /// Watermark generator for strictly ascending timestamps.
@@ -195,6 +217,16 @@ impl WatermarkGenerator for AscendingTimestampsGenerator {
     #[inline]
     fn current_watermark(&self) -> i64 {
         self.current_watermark
+    }
+
+    #[inline]
+    fn advance_watermark(&mut self, timestamp: i64) -> Option<Watermark> {
+        if timestamp > self.current_watermark {
+            self.current_watermark = timestamp;
+            Some(Watermark::new(timestamp))
+        } else {
+            None
+        }
     }
 }
 
@@ -285,6 +317,15 @@ impl<G: WatermarkGenerator> WatermarkGenerator for PeriodicGenerator<G> {
     fn current_watermark(&self) -> i64 {
         self.inner.current_watermark()
     }
+
+    fn advance_watermark(&mut self, timestamp: i64) -> Option<Watermark> {
+        let wm = self.inner.advance_watermark(timestamp);
+        if let Some(ref w) = wm {
+            self.last_emitted_watermark = w.timestamp();
+            self.last_emit_time = Instant::now();
+        }
+        wm
+    }
 }
 
 /// Punctuated watermark generator that emits based on special events.
@@ -355,6 +396,15 @@ where
 
     fn current_watermark(&self) -> i64 {
         self.current_watermark
+    }
+
+    fn advance_watermark(&mut self, timestamp: i64) -> Option<Watermark> {
+        if timestamp > self.current_watermark {
+            self.current_watermark = timestamp;
+            Some(Watermark::new(timestamp))
+        } else {
+            None
+        }
     }
 }
 
@@ -606,6 +656,10 @@ impl WatermarkGenerator for SourceProvidedGenerator {
             self.fallback.current_watermark().max(self.source_watermark)
         }
     }
+
+    fn advance_watermark(&mut self, timestamp: i64) -> Option<Watermark> {
+        self.on_source_watermark(timestamp)
+    }
 }
 
 /// Metrics for watermark tracking.
@@ -695,6 +749,15 @@ impl<G: WatermarkGenerator> WatermarkGenerator for MeteredGenerator<G> {
 
     fn current_watermark(&self) -> i64 {
         self.inner.current_watermark()
+    }
+
+    fn advance_watermark(&mut self, timestamp: i64) -> Option<Watermark> {
+        let wm = self.inner.advance_watermark(timestamp);
+        if let Some(ref w) = wm {
+            self.metrics.current_watermark = w.timestamp();
+            self.metrics.watermarks_emitted += 1;
+        }
+        wm
     }
 }
 
@@ -975,5 +1038,134 @@ mod tests {
         assert_eq!(metrics.max_event_timestamp, 0);
         assert_eq!(metrics.watermarks_emitted, 0);
         assert_eq!(metrics.late_events, 0);
+    }
+
+    // --- advance_watermark() tests ---
+
+    #[test]
+    fn test_advance_watermark_bounded_generator() {
+        let mut gen = BoundedOutOfOrdernessGenerator::new(100);
+
+        // Advance from initial state
+        let wm = gen.advance_watermark(500);
+        assert_eq!(wm, Some(Watermark::new(500)));
+        assert_eq!(gen.current_watermark(), 500);
+
+        // Advance further
+        let wm = gen.advance_watermark(800);
+        assert_eq!(wm, Some(Watermark::new(800)));
+        assert_eq!(gen.current_watermark(), 800);
+
+        // No regression
+        let wm = gen.advance_watermark(600);
+        assert_eq!(wm, None);
+        assert_eq!(gen.current_watermark(), 800);
+    }
+
+    #[test]
+    fn test_advance_watermark_maintains_invariant() {
+        let mut gen = BoundedOutOfOrdernessGenerator::new(100);
+
+        // Process an event to set initial state
+        gen.on_event(1000); // wm=900, max_ts=1000
+
+        // Advance watermark beyond current
+        gen.advance_watermark(1200);
+        assert_eq!(gen.current_watermark(), 1200);
+
+        // Now on_event at 1250 should work correctly: max_ts should be >= 1300
+        // wm = 1250 - 100 = 1150 which is < 1200, so no new watermark from on_event
+        let wm = gen.on_event(1250);
+        assert_eq!(wm, None);
+        assert_eq!(gen.current_watermark(), 1200);
+
+        // But event at 1400: max_ts = 1400, wm = 1300 > 1200
+        let wm = gen.on_event(1400);
+        assert_eq!(wm, Some(Watermark::new(1300)));
+    }
+
+    #[test]
+    fn test_advance_watermark_ascending_generator() {
+        let mut gen = AscendingTimestampsGenerator::new();
+
+        let wm = gen.advance_watermark(500);
+        assert_eq!(wm, Some(Watermark::new(500)));
+        assert_eq!(gen.current_watermark(), 500);
+
+        // No regression
+        let wm = gen.advance_watermark(300);
+        assert_eq!(wm, None);
+        assert_eq!(gen.current_watermark(), 500);
+
+        // Further advance
+        let wm = gen.advance_watermark(1000);
+        assert_eq!(wm, Some(Watermark::new(1000)));
+    }
+
+    #[test]
+    fn test_advance_watermark_periodic_generator() {
+        let inner = BoundedOutOfOrdernessGenerator::new(100);
+        let mut gen = PeriodicGenerator::new(inner, Duration::from_millis(100));
+
+        let wm = gen.advance_watermark(500);
+        assert_eq!(wm, Some(Watermark::new(500)));
+        assert_eq!(gen.current_watermark(), 500);
+
+        // No regression
+        let wm = gen.advance_watermark(300);
+        assert_eq!(wm, None);
+    }
+
+    #[test]
+    fn test_advance_watermark_punctuated_generator() {
+        let mut gen = PunctuatedGenerator::new(|ts| {
+            if ts % 1000 == 0 {
+                Some(Watermark::new(ts))
+            } else {
+                None
+            }
+        });
+
+        // External advance (does not invoke predicate)
+        let wm = gen.advance_watermark(500);
+        assert_eq!(wm, Some(Watermark::new(500)));
+        assert_eq!(gen.current_watermark(), 500);
+
+        // No regression
+        let wm = gen.advance_watermark(200);
+        assert_eq!(wm, None);
+    }
+
+    #[test]
+    fn test_advance_watermark_source_provided_generator() {
+        let mut gen = SourceProvidedGenerator::new(100, true);
+
+        let wm = gen.advance_watermark(500);
+        assert_eq!(wm, Some(Watermark::new(500)));
+        assert_eq!(gen.current_watermark(), 500);
+
+        // No regression
+        let wm = gen.advance_watermark(300);
+        assert_eq!(wm, None);
+    }
+
+    #[test]
+    fn test_advance_watermark_metered_generator() {
+        let inner = BoundedOutOfOrdernessGenerator::new(100);
+        let mut gen = MeteredGenerator::new(inner);
+
+        let wm = gen.advance_watermark(500);
+        assert_eq!(wm, Some(Watermark::new(500)));
+        assert_eq!(gen.metrics().current_watermark, 500);
+        assert_eq!(gen.metrics().watermarks_emitted, 1);
+
+        // Advance further
+        gen.advance_watermark(800);
+        assert_eq!(gen.metrics().current_watermark, 800);
+        assert_eq!(gen.metrics().watermarks_emitted, 2);
+
+        // No regression doesn't bump metrics
+        gen.advance_watermark(600);
+        assert_eq!(gen.metrics().watermarks_emitted, 2);
     }
 }

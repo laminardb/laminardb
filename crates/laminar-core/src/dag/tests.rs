@@ -2914,3 +2914,44 @@ fn test_watermark_out_of_bounds_node() {
     assert_eq!(tracker.get_watermark(NodeId(999)), None);
     assert_eq!(tracker.effective_watermark(NodeId(999)), None);
 }
+
+// --- process_watermark() tests ---
+
+#[test]
+fn test_process_watermark_advances_generators() {
+    let schema = int_schema();
+    let dag = DagBuilder::new()
+        .source("src", schema.clone())
+        .operator("op", schema.clone())
+        .connect("src", "op")
+        .sink_for("op", "snk", schema)
+        .build()
+        .unwrap();
+
+    let mut executor = DagExecutor::from_dag(&dag);
+
+    // Find the source node
+    let src_id = executor.source_nodes()[0];
+
+    // Process watermark
+    executor.process_watermark(src_id, 5000).unwrap();
+    assert_eq!(executor.metrics().watermarks_processed, 1);
+
+    // Process another watermark
+    executor.process_watermark(src_id, 8000).unwrap();
+    assert_eq!(executor.metrics().watermarks_processed, 2);
+}
+
+#[test]
+fn test_process_watermark_invalid_node() {
+    let schema = int_schema();
+    let dag = DagBuilder::new()
+        .source("src", schema.clone())
+        .sink_for("src", "snk", schema)
+        .build()
+        .unwrap();
+
+    let mut executor = DagExecutor::from_dag(&dag);
+    let result = executor.process_watermark(NodeId(999), 5000);
+    assert!(result.is_err());
+}

@@ -92,6 +92,8 @@ pub struct DagExecutorMetrics {
     pub backpressure_stalls: u64,
     /// Total nodes skipped (empty input queue).
     pub nodes_skipped: u64,
+    /// Total watermark advances processed via `process_watermark()`.
+    pub watermarks_processed: u64,
 }
 
 /// Ring 0 DAG executor for event processing.
@@ -239,6 +241,45 @@ impl DagExecutor {
 
         self.input_queues[idx].push_back(event);
         self.process_dag();
+        Ok(())
+    }
+
+    /// Advances watermark generators for all nodes in topological order.
+    ///
+    /// Called when an external source provides a watermark (e.g., via
+    /// `Source::watermark()`). Propagates the watermark through the DAG
+    /// so downstream operators can use it for late-data filtering and
+    /// window triggering.
+    ///
+    /// # Arguments
+    ///
+    /// * `source_node` - The source node that originated the watermark
+    /// * `watermark` - The watermark timestamp in milliseconds
+    ///
+    /// # Errors
+    ///
+    /// Returns [`DagError::NodeNotFound`] if `source_node` is out of bounds.
+    pub fn process_watermark(
+        &mut self,
+        source_node: NodeId,
+        watermark: i64,
+    ) -> Result<(), DagError> {
+        let idx = source_node.0 as usize;
+        if idx >= self.slot_count {
+            return Err(DagError::NodeNotFound(format!("{source_node}")));
+        }
+
+        // Advance watermark generators in topological order
+        for &node_id in &self.execution_order {
+            let nidx = node_id.0 as usize;
+            if nidx < self.slot_count {
+                if let Some(ref mut rt) = self.runtimes[nidx] {
+                    rt.watermark_generator.advance_watermark(watermark);
+                }
+            }
+        }
+
+        self.metrics.watermarks_processed += 1;
         Ok(())
     }
 

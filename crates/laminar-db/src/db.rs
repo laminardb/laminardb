@@ -9,6 +9,7 @@ use datafusion::prelude::SessionContext;
 
 use laminar_core::streaming;
 use laminar_core::streaming::StreamCheckpointManager;
+use laminar_core::time::WatermarkGenerator;
 use laminar_sql::parser::{parse_streaming_sql, ShowCommand, StreamingStatement};
 use laminar_sql::planner::StreamingPlanner;
 use laminar_sql::register_streaming_functions;
@@ -96,6 +97,10 @@ pub struct LaminarDB {
 struct SourceWatermarkState {
     extractor: laminar_core::time::EventTimeExtractor,
     generator: laminar_core::time::BoundedOutOfOrdernessGenerator,
+    /// Watermark column name for late-row filtering.
+    column: String,
+    /// Timestamp format for late-row filtering.
+    format: laminar_core::time::TimestampFormat,
 }
 
 /// Infer the `TimestampFormat` from a schema column's `DataType`.
@@ -110,6 +115,148 @@ fn infer_timestamp_format(
         }
     } else {
         laminar_core::time::TimestampFormat::UnixMillis
+    }
+}
+
+/// Filters rows from a `RecordBatch` whose timestamp is behind the watermark.
+///
+/// Returns `None` if all rows are late (i.e., filtered result is empty).
+/// For sources without a watermark column, callers should skip this function
+/// and pass the batch through unfiltered.
+#[allow(clippy::too_many_lines)]
+fn filter_late_rows(
+    batch: &RecordBatch,
+    column: &str,
+    watermark: i64,
+    format: laminar_core::time::TimestampFormat,
+) -> Option<RecordBatch> {
+    use arrow::array::{Array, BooleanArray, Int64Array};
+    use arrow::compute::filter_record_batch;
+    use arrow::datatypes::TimeUnit;
+
+    let Ok(idx) = batch.schema().index_of(column) else {
+        return Some(batch.clone());
+    };
+
+    let col = batch.column(idx);
+    let num_rows = batch.num_rows();
+
+    // Helper closure to build the boolean mask for an Int64 column
+    let i64_mask = |arr: &Int64Array, threshold: i64| -> BooleanArray {
+        (0..num_rows)
+            .map(|i| {
+                if arr.is_null(i) {
+                    Some(false)
+                } else {
+                    Some(arr.value(i) >= threshold)
+                }
+            })
+            .collect()
+    };
+
+    // Build boolean mask: true = on-time (timestamp >= watermark)
+    let mask: BooleanArray = match format {
+        laminar_core::time::TimestampFormat::UnixMillis => {
+            if let Some(arr) = col.as_any().downcast_ref::<Int64Array>() {
+                i64_mask(arr, watermark)
+            } else {
+                return Some(batch.clone());
+            }
+        }
+        laminar_core::time::TimestampFormat::ArrowNative => match col.data_type() {
+            DataType::Timestamp(TimeUnit::Millisecond, _) => {
+                let arr = col
+                    .as_any()
+                    .downcast_ref::<arrow::array::TimestampMillisecondArray>()?;
+                (0..num_rows)
+                    .map(|i| {
+                        if arr.is_null(i) {
+                            Some(false)
+                        } else {
+                            Some(arr.value(i) >= watermark)
+                        }
+                    })
+                    .collect()
+            }
+            DataType::Timestamp(TimeUnit::Second, _) => {
+                let arr = col
+                    .as_any()
+                    .downcast_ref::<arrow::array::TimestampSecondArray>()?;
+                let wm_secs = watermark / 1000;
+                (0..num_rows)
+                    .map(|i| {
+                        if arr.is_null(i) {
+                            Some(false)
+                        } else {
+                            Some(arr.value(i) >= wm_secs)
+                        }
+                    })
+                    .collect()
+            }
+            DataType::Timestamp(TimeUnit::Microsecond, _) => {
+                let arr = col
+                    .as_any()
+                    .downcast_ref::<arrow::array::TimestampMicrosecondArray>()?;
+                let wm_micros = watermark.saturating_mul(1000);
+                (0..num_rows)
+                    .map(|i| {
+                        if arr.is_null(i) {
+                            Some(false)
+                        } else {
+                            Some(arr.value(i) >= wm_micros)
+                        }
+                    })
+                    .collect()
+            }
+            DataType::Timestamp(TimeUnit::Nanosecond, _) => {
+                let arr = col
+                    .as_any()
+                    .downcast_ref::<arrow::array::TimestampNanosecondArray>()?;
+                let wm_nanos = watermark.saturating_mul(1_000_000);
+                (0..num_rows)
+                    .map(|i| {
+                        if arr.is_null(i) {
+                            Some(false)
+                        } else {
+                            Some(arr.value(i) >= wm_nanos)
+                        }
+                    })
+                    .collect()
+            }
+            _ => return Some(batch.clone()),
+        },
+        laminar_core::time::TimestampFormat::UnixSeconds => {
+            if let Some(arr) = col.as_any().downcast_ref::<Int64Array>() {
+                i64_mask(arr, watermark / 1000)
+            } else {
+                return Some(batch.clone());
+            }
+        }
+        laminar_core::time::TimestampFormat::UnixMicros => {
+            if let Some(arr) = col.as_any().downcast_ref::<Int64Array>() {
+                i64_mask(arr, watermark.saturating_mul(1000))
+            } else {
+                return Some(batch.clone());
+            }
+        }
+        laminar_core::time::TimestampFormat::UnixNanos => {
+            if let Some(arr) = col.as_any().downcast_ref::<Int64Array>() {
+                i64_mask(arr, watermark.saturating_mul(1_000_000))
+            } else {
+                return Some(batch.clone());
+            }
+        }
+        // Iso8601 would require parsing each row; skip filtering for string timestamps
+        laminar_core::time::TimestampFormat::Iso8601 => {
+            return Some(batch.clone());
+        }
+    };
+
+    let filtered = filter_record_batch(batch, &mask).ok()?;
+    if filtered.num_rows() == 0 {
+        None
+    } else {
+        Some(filtered)
     }
 }
 
@@ -1590,6 +1737,8 @@ impl LaminarDB {
                         SourceWatermarkState {
                             extractor,
                             generator,
+                            column: col.clone(),
+                            format,
                         },
                     );
                 }
@@ -1628,6 +1777,29 @@ impl LaminarDB {
 
                 let cycle_start = std::time::Instant::now();
 
+                // Check external watermarks from Source::watermark() calls
+                for (name, _sub) in &source_subs {
+                    if let Some(entry) = source_entries.get(name.as_str()) {
+                        let external_wm = entry.source.current_watermark();
+                        if let Some(wm_state) = watermark_states.get_mut(name.as_str()) {
+                            if let Some(wm) = wm_state.generator.advance_watermark(external_wm) {
+                                if let Some(ref mut trk) = tracker {
+                                    if let Some(sid) = source_ids.get(name.as_str()) {
+                                        if let Some(global_wm) =
+                                            trk.update_source(*sid, wm.timestamp())
+                                        {
+                                            pipeline_watermark.store(
+                                                global_wm.timestamp(),
+                                                std::sync::atomic::Ordering::Relaxed,
+                                            );
+                                        }
+                                    }
+                                }
+                            }
+                        }
+                    }
+                }
+
                 // Drain source subscriptions into batches
                 let mut source_batches: HashMap<String, Vec<RecordBatch>> = HashMap::new();
                 for (name, sub) in &source_subs {
@@ -1646,7 +1818,6 @@ impl LaminarDB {
                                 // Extract watermark from batch
                                 if let Some(wm_state) = watermark_states.get_mut(name.as_str()) {
                                     if let Ok(max_ts) = wm_state.extractor.extract(&batch) {
-                                        use laminar_core::time::WatermarkGenerator;
                                         if let Some(wm) = wm_state.generator.on_event(max_ts) {
                                             if let Some(entry) = source_entries.get(name.as_str()) {
                                                 entry.source.watermark(wm.timestamp());
@@ -1665,9 +1836,28 @@ impl LaminarDB {
                                             }
                                         }
                                     }
-                                }
 
-                                source_batches.entry(name.clone()).or_default().push(batch);
+                                    // Filter late rows
+                                    let current_wm = wm_state.generator.current_watermark();
+                                    if current_wm > i64::MIN {
+                                        if let Some(filtered) = filter_late_rows(
+                                            &batch,
+                                            &wm_state.column,
+                                            current_wm,
+                                            wm_state.format,
+                                        ) {
+                                            source_batches
+                                                .entry(name.clone())
+                                                .or_default()
+                                                .push(filtered);
+                                        }
+                                        // else: all rows were late, skip batch
+                                    } else {
+                                        source_batches.entry(name.clone()).or_default().push(batch);
+                                    }
+                                } else {
+                                    source_batches.entry(name.clone()).or_default().push(batch);
+                                }
                             }
                             _ => break,
                         }
@@ -1997,6 +2187,8 @@ impl LaminarDB {
                         SourceWatermarkState {
                             extractor,
                             generator,
+                            column: col.clone(),
+                            format,
                         },
                     );
                 }
@@ -2058,6 +2250,29 @@ impl LaminarDB {
 
                 let cycle_start = std::time::Instant::now();
 
+                // Check external watermarks from Source::watermark() calls
+                for (name, _, _) in &sources {
+                    if let Some(entry) = source_entries_for_wm.get(name.as_str()) {
+                        let external_wm = entry.source.current_watermark();
+                        if let Some(wm_state) = watermark_states.get_mut(name.as_str()) {
+                            if let Some(wm) = wm_state.generator.advance_watermark(external_wm) {
+                                if let Some(ref mut trk) = tracker {
+                                    if let Some(sid) = source_ids.get(name.as_str()) {
+                                        if let Some(global_wm) =
+                                            trk.update_source(*sid, wm.timestamp())
+                                        {
+                                            pipeline_watermark.store(
+                                                global_wm.timestamp(),
+                                                std::sync::atomic::Ordering::Relaxed,
+                                            );
+                                        }
+                                    }
+                                }
+                            }
+                        }
+                    }
+                }
+
                 // Poll sources
                 let mut source_batches = HashMap::new();
                 for (name, source_arc, _) in &sources {
@@ -2077,7 +2292,6 @@ impl LaminarDB {
                             // Extract watermark from batch
                             if let Some(wm_state) = watermark_states.get_mut(name.as_str()) {
                                 if let Ok(max_ts) = wm_state.extractor.extract(&batch.records) {
-                                    use laminar_core::time::WatermarkGenerator;
                                     if let Some(wm) = wm_state.generator.on_event(max_ts) {
                                         if let Some(entry) =
                                             source_entries_for_wm.get(name.as_str())
@@ -2098,12 +2312,34 @@ impl LaminarDB {
                                         }
                                     }
                                 }
-                            }
 
-                            source_batches
-                                .entry(name.clone())
-                                .or_insert_with(Vec::new)
-                                .push(batch.records);
+                                // Filter late rows
+                                let current_wm = wm_state.generator.current_watermark();
+                                if current_wm > i64::MIN {
+                                    if let Some(filtered) = filter_late_rows(
+                                        &batch.records,
+                                        &wm_state.column,
+                                        current_wm,
+                                        wm_state.format,
+                                    ) {
+                                        source_batches
+                                            .entry(name.clone())
+                                            .or_insert_with(Vec::new)
+                                            .push(filtered);
+                                    }
+                                    // else: all rows were late, skip batch
+                                } else {
+                                    source_batches
+                                        .entry(name.clone())
+                                        .or_insert_with(Vec::new)
+                                        .push(batch.records);
+                                }
+                            } else {
+                                source_batches
+                                    .entry(name.clone())
+                                    .or_insert_with(Vec::new)
+                                    .push(batch.records);
+                            }
                         }
                         Ok(None) => {}
                         Err(e) => {
@@ -5284,5 +5520,149 @@ mod tests {
 
         let handle = db.source_untyped("events").unwrap();
         assert!(handle.max_out_of_orderness().is_none());
+    }
+
+    #[tokio::test]
+    async fn test_late_data_dropped_after_external_watermark() {
+        // Scenario:
+        //  1. Push on-time batch (ts = [1000, 2000, 3000])
+        //  2. Advance watermark to 200_000 externally via source.watermark()
+        //  3. Push late batch (ts = [100, 200, 300]) — all timestamps < watermark
+        //  4. Verify late batch does NOT appear in stream output
+        let db = LaminarDB::open().unwrap();
+        db.execute(
+            "CREATE SOURCE events (id BIGINT, ts TIMESTAMP, \
+             WATERMARK FOR ts AS ts - INTERVAL '0' SECOND)",
+        )
+        .await
+        .unwrap();
+        db.execute("CREATE STREAM out AS SELECT id, ts FROM events")
+            .await
+            .unwrap();
+
+        let sub = db.catalog.get_stream_subscription("out").unwrap();
+        db.start().await.unwrap();
+
+        let handle = db.source_untyped("events").unwrap();
+        let schema = handle.schema().clone();
+
+        // Step 1: Push on-time data
+        let batch1 = make_ts_batch(&schema, &[1000, 2000, 3000]);
+        handle.push_arrow(batch1).unwrap();
+        tokio::time::sleep(std::time::Duration::from_millis(500)).await;
+
+        // Drain on-time results
+        let mut on_time_rows = 0;
+        for _ in 0..256 {
+            match sub.poll() {
+                Some(b) => on_time_rows += b.num_rows(),
+                None => break,
+            }
+        }
+        assert!(on_time_rows > 0, "should have on-time rows");
+
+        // Step 2: Advance watermark to 200_000 (external signal)
+        handle.watermark(200_000);
+        // Give the pipeline loop a cycle to pick up the external watermark
+        tokio::time::sleep(std::time::Duration::from_millis(300)).await;
+
+        // Step 3: Push late data (all timestamps < 200_000)
+        let late_batch = make_ts_batch(&schema, &[100, 200, 300]);
+        handle.push_arrow(late_batch).unwrap();
+        tokio::time::sleep(std::time::Duration::from_millis(500)).await;
+
+        // Step 4: Check that late data was filtered out
+        let mut late_rows = 0;
+        for _ in 0..256 {
+            match sub.poll() {
+                Some(b) => late_rows += b.num_rows(),
+                None => break,
+            }
+        }
+        assert_eq!(late_rows, 0, "late data behind watermark should be dropped");
+    }
+
+    #[test]
+    fn test_filter_late_rows_filters_correctly() {
+        use arrow::array::Int64Array;
+
+        // Int64 / UnixMillis format
+        let schema = Arc::new(Schema::new(vec![
+            Field::new("id", DataType::Int64, false),
+            Field::new("ts", DataType::Int64, false),
+        ]));
+        let batch = RecordBatch::try_new(
+            schema,
+            vec![
+                Arc::new(Int64Array::from(vec![1, 2, 3, 4])),
+                Arc::new(Int64Array::from(vec![100, 500, 200, 800])),
+            ],
+        )
+        .unwrap();
+
+        // Watermark at 300: rows with ts >= 300 survive (ts=500, ts=800)
+        let filtered = filter_late_rows(
+            &batch,
+            "ts",
+            300,
+            laminar_core::time::TimestampFormat::UnixMillis,
+        );
+        let filtered = filtered.expect("should have some on-time rows");
+        assert_eq!(filtered.num_rows(), 2);
+
+        // Check values
+        let ids = filtered
+            .column(0)
+            .as_any()
+            .downcast_ref::<Int64Array>()
+            .unwrap();
+        assert_eq!(ids.value(0), 2); // ts=500
+        assert_eq!(ids.value(1), 4); // ts=800
+    }
+
+    #[test]
+    fn test_filter_late_rows_all_late() {
+        use arrow::array::Int64Array;
+
+        let schema = Arc::new(Schema::new(vec![
+            Field::new("id", DataType::Int64, false),
+            Field::new("ts", DataType::Int64, false),
+        ]));
+        let batch = RecordBatch::try_new(
+            schema,
+            vec![
+                Arc::new(Int64Array::from(vec![1, 2])),
+                Arc::new(Int64Array::from(vec![100, 200])),
+            ],
+        )
+        .unwrap();
+
+        // Watermark at 1000: all rows are late
+        let result = filter_late_rows(
+            &batch,
+            "ts",
+            1000,
+            laminar_core::time::TimestampFormat::UnixMillis,
+        );
+        assert!(result.is_none(), "all-late batch should return None");
+    }
+
+    #[test]
+    fn test_filter_late_rows_no_column() {
+        use arrow::array::Int64Array;
+
+        let schema = Arc::new(Schema::new(vec![Field::new("id", DataType::Int64, false)]));
+        let batch =
+            RecordBatch::try_new(schema, vec![Arc::new(Int64Array::from(vec![1, 2]))]).unwrap();
+
+        // Column not found — batch passes through unfiltered
+        let result = filter_late_rows(
+            &batch,
+            "ts",
+            1000,
+            laminar_core::time::TimestampFormat::UnixMillis,
+        );
+        let result = result.expect("should pass through when column not found");
+        assert_eq!(result.num_rows(), 2);
     }
 }
