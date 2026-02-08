@@ -220,3 +220,6 @@ impl Default for DagRecoveryManager {
         Self::new()
     }
 }
+
+#[cfg(test)]
+mod tests;
