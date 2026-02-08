@@ -9,6 +9,8 @@ pub mod analytic_parser;
 mod continuous_query_parser;
 pub(crate) mod dialect;
 mod emit_parser;
+/// INTERVAL arithmetic rewriter for BIGINT timestamp columns
+pub mod interval_rewriter;
 pub mod join_parser;
 mod late_data_parser;
 pub mod order_analyzer;

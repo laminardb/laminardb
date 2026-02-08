@@ -25,6 +25,7 @@
 use datafusion::execution::SendableRecordBatchStream;
 use datafusion::prelude::SessionContext;
 
+use crate::parser::interval_rewriter::rewrite_interval_arithmetic;
 use crate::parser::parse_streaming_sql;
 use crate::planner::{QueryPlan, StreamingPlan, StreamingPlanner};
 use crate::Error;
@@ -110,7 +111,9 @@ pub async fn execute_streaming_sql(
         StreamingPlan::RegisterSource(_) | StreamingPlan::RegisterSink(_) => {
             Ok(StreamingSqlResult::Ddl(DdlResult { plan }))
         }
-        StreamingPlan::Query(query_plan) => {
+        StreamingPlan::Query(mut query_plan) => {
+            // Rewrite INTERVAL arithmetic for BIGINT timestamp columns
+            rewrite_interval_arithmetic(&mut query_plan.statement);
             let logical_plan = planner.to_logical_plan(&query_plan, ctx).await?;
             let df = ctx.execute_logical_plan(logical_plan).await?;
             let stream = df.execute_stream().await?;
@@ -120,7 +123,9 @@ pub async fn execute_streaming_sql(
                 query_plan: Some(query_plan),
             }))
         }
-        StreamingPlan::Standard(stmt) => {
+        StreamingPlan::Standard(mut stmt) => {
+            // Rewrite INTERVAL arithmetic for BIGINT timestamp columns
+            rewrite_interval_arithmetic(&mut stmt);
             let sql_str = stmt.to_string();
             let df = ctx.sql(&sql_str).await?;
             let stream = df.execute_stream().await?;
