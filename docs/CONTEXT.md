@@ -9,31 +9,25 @@
 **Date**: 2026-02-08
 
 ### What Was Accomplished
+- **pgwire-replication integration for PostgreSQL CDC WAL streaming** (PR #74, closes #58)
+  - Integrated `pgwire-replication` v0.2 — native CopyBoth transport for logical replication, unblocking real-time CDC
+  - `Cargo.toml`: Added `pgwire-replication` as optional dep, gated under `postgres-cdc` feature
+  - `postgres_io.rs`: `connect()` is now a regular control-plane connection (removed `replication=database`); `ensure_replication_slot()` uses `pg_create_logical_replication_slot()` SQL function; new `build_replication_config()` maps `PostgresCdcConfig` → `pgwire_replication::ReplicationConfig`
+  - `decoder.rs`: Made `pg_timestamp_to_unix_ms()` public for PG-epoch timestamp conversion
+  - `source.rs`: Added `repl_client` field; `open()` connects pgwire-replication after slot management; `poll_batch()` calls `receive_replication_events()` for production path; `process_replication_event()` maps Begin/XLogData/Commit/KeepAlive to existing `process_wal_message()`; `close()` gracefully shuts down replication client
+  - All 558 connector tests pass, clippy clean, docs clean
+
+Previous session (2026-02-08):
 - **FFI API Surface Update** — Exposed full LaminarDB API through `api::Connection` for Python bindings (PR #49)
-  - `connection.rs`: 18 new passthrough methods — `source_info()`, `sink_info()`, `stream_info()`, `query_info()`, `pipeline_topology()`, `pipeline_state()`, `pipeline_watermark()`, `total_events_processed()`, `source_count()`, `sink_count()`, `active_query_count()`, `metrics()`, `source_metrics()`, `all_source_metrics()`, `stream_metrics()`, `all_stream_metrics()`, `cancel_query()`, `shutdown()`, `subscribe()`
-  - `mod.rs`: Re-exported `SourceInfo`, `SinkInfo`, `StreamInfo`, `QueryInfo`, `PipelineTopology`, `PipelineNode`, `PipelineEdge`, `PipelineNodeType`, `PipelineMetrics`, `PipelineState`, `SourceMetrics`, `StreamMetrics`
-  - `db.rs`: Added `pub(crate) subscribe_raw()` helper to support `Connection::subscribe()` without `FromBatch` trait bounds
-  - 6 new tests, 307 total laminar-db tests passing, clippy clean
 - **F027 PostgreSQL CDC Replication I/O** (#44, PR #48) - MERGED
-  - `postgres_io.rs` (NEW, 455 lines): Replication wire format parsing (`XLogData`, `PrimaryKeepalive`), `encode_standby_status` (34-byte 'r' tag), `build_start_replication_query`, `connect` with `replication=database`, `ensure_replication_slot` via `simple_query` (10 unit tests)
-  - `source.rs`: Feature-gated `open()` connects to PostgreSQL, resolves slot's `confirmed_flush_lsn`; `close()` aborts connection handle; `connection_handle` field
-  - `mod.rs`: Registered `postgres_io` module, added `password` config key
-  - **Note**: WAL streaming (`START_REPLICATION` via `CopyBoth`) deferred — `tokio-postgres` 0.7 does not support `CopyBothDuplex`. Wire format + slot management are ready for future integration.
+  - Wire format parsing, slot management, `connect` with `replication=database`
+  - WAL streaming was deferred due to `tokio-postgres` CopyBoth limitation (now resolved via pgwire-replication)
 
 Previous session (2026-02-08):
 - **Unified Checkpoint System (F-CKP-001 through F-CKP-009)** - ALL 9 FEATURES COMPLETE
-  - F-CKP-001 through F-CKP-009: Manifest, two-phase sink, coordinator, operator state, changelog wiring, WAL coordination, recovery manager, end-to-end tests, observability
-  - Phase C gate: clippy clean, fmt clean, doc clean, 2,767+ lib tests + 12 integration tests
 
 Previous session (2026-02-07):
-- **F-OBS-001: Pipeline Observability API** - COMPLETE (23 new tests)
-- **F-CONN-002D: RocksDB-Backed Persistent Table Store** - COMPLETE (10 new tests)
-- **F-CONN-002C: PARTIAL Cache Mode & Xor Filter** - COMPLETE (40 new tests)
-- **F-CONN-002B: Connector-Backed Table Population** - COMPLETE (19 new tests)
-- **F-SQL-006: Window Frame (ROWS BETWEEN)** - COMPLETE (22 new tests)
-- **F-SQL-005: Multi-Way JOIN Support** - COMPLETE (21 new tests)
-- **F-SQL-004: HAVING Clause Execution** - COMPLETE (22 new tests)
-- **F-CONN-003: Avro Serialization Hardening** - COMPLETE (~40 new tests)
+- **F-OBS-001, F-CONN-002B/C/D, F-SQL-004/005/006, F-CONN-003** — all complete
 
 ### Where We Left Off
 
@@ -45,18 +39,14 @@ See [INDEX.md](./features/INDEX.md) for the full feature-by-feature breakdown.
 **Test counts**: ~2,767 base, ~2,777+ with `rocksdb`, ~3,100+ with all feature flags (`kafka`, `postgres-cdc`, `postgres-sink`, `delta-lake`, `mysql-cdc`, `ffi`, `rocksdb`)
 
 ### Immediate Next Steps
-1. F027 follow-ups: TLS support, initial snapshot, auto-reconnect (see plan in `postgres_io.rs` future work)
-2. F031B/C/D: Delta Lake advanced (recovery, compaction, schema evolution)
-3. F032A: Iceberg I/O (blocked by iceberg-rust DF 52.0 compat)
-4. Remaining Phase 3 gaps (F029, F030, F033, F058, F061)
-1. Python bindings (`laminardb-python` repo): Update to use the new `api::Connection` methods
-2. F027 follow-ups: TLS support, initial snapshot, auto-reconnect (see plan in `postgres_io.rs` future work)
+1. F027 follow-ups: TLS cert path support for pgwire-replication, initial snapshot, auto-reconnect
+2. Python bindings (`laminardb-python` repo): Update to use the new `api::Connection` methods
 3. F031B/C/D: Delta Lake advanced (recovery, compaction, schema evolution)
 4. F032A: Iceberg I/O (blocked by iceberg-rust DF 52.0 compat)
 5. Remaining Phase 3 gaps (F029, F030, F033, F058, F061)
 
 ### Open Issues
-- **tokio-postgres CopyBoth**: v0.7 lacks `CopyBothDuplex` for WAL streaming. Wire format parsing is ready; actual streaming awaits upstream support or a raw TCP approach.
+- **pgwire-replication TLS**: `SslMode::Require`/`VerifyCa`/`VerifyFull` currently fall back to disabled — need cert path configuration plumbing.
 - **iceberg-rust crate**: Deferred until compatible with workspace DataFusion. Business logic complete in F032.
 - No other blockers.
 
