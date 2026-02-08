@@ -45,6 +45,10 @@ See [INDEX.md](./features/INDEX.md) for the full feature-by-feature breakdown.
 **Test counts**: ~2,767 base, ~2,777+ with `rocksdb`, ~3,100+ with all feature flags (`kafka`, `postgres-cdc`, `postgres-sink`, `delta-lake`, `mysql-cdc`, `ffi`, `rocksdb`)
 
 ### Immediate Next Steps
+1. F027 follow-ups: TLS support, initial snapshot, auto-reconnect (see plan in `postgres_io.rs` future work)
+2. F031B/C/D: Delta Lake advanced (recovery, compaction, schema evolution)
+3. F032A: Iceberg I/O (blocked by iceberg-rust DF 52.0 compat)
+4. Remaining Phase 3 gaps (F029, F030, F033, F058, F061)
 1. Python bindings (`laminardb-python` repo): Update to use the new `api::Connection` methods
 2. F027 follow-ups: TLS support, initial snapshot, auto-reconnect (see plan in `postgres_io.rs` future work)
 3. F031B/C/D: Delta Lake advanced (recovery, compaction, schema evolution)
