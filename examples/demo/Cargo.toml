@@ -40,7 +40,7 @@ chrono = { workspace = true }
 rand = { workspace = true }
 
 # TUI
-ratatui = { version = "0.29", features = ["all-widgets"] }
+ratatui = { version = "0.30", features = ["all-widgets"] }
 crossterm = "0.28"
 
 # System metrics
