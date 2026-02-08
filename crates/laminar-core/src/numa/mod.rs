@@ -40,7 +40,7 @@
 //! let ptr = allocator.alloc_on_node(0, 4096, 64)?;
 //!
 //! // Free when done
-//! unsafe { allocator.dealloc(ptr, 4096); }
+//! unsafe { allocator.dealloc(ptr, 4096, 64); }
 //! ```
 //!
 //! ## Platform Support
@@ -83,7 +83,7 @@ mod tests {
         assert!(!ptr.is_null());
 
         // Free
-        unsafe { allocator.dealloc(ptr, 4096) };
+        unsafe { allocator.dealloc(ptr, 4096, 64) };
     }
 
     #[test]
@@ -96,7 +96,7 @@ mod tests {
         assert!(!ptr.is_null());
 
         // Free
-        unsafe { allocator.dealloc(ptr, 4096) };
+        unsafe { allocator.dealloc(ptr, 4096, 64) };
     }
 
     #[test]
@@ -109,7 +109,7 @@ mod tests {
         assert!(!ptr.is_null());
 
         // Free
-        unsafe { allocator.dealloc(ptr, 64 * 1024) };
+        unsafe { allocator.dealloc(ptr, 64 * 1024, 64) };
     }
 
     #[test]
