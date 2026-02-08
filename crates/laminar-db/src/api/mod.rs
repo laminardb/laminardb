@@ -90,9 +90,7 @@ pub use crate::LaminarConfig;
 
 // Re-export catalog, pipeline, and metrics types for language bindings
 pub use crate::{
-    PipelineMetrics, PipelineState, SourceMetrics, StreamMetrics,
+    PipelineEdge, PipelineNode, PipelineNodeType, PipelineTopology, QueryInfo, SinkInfo,
+    SourceInfo, StreamInfo,
 };
-pub use crate::{
-    PipelineEdge, PipelineNode, PipelineNodeType, PipelineTopology,
-    QueryInfo, SinkInfo, SourceInfo, StreamInfo,
-};
+pub use crate::{PipelineMetrics, PipelineState, SourceMetrics, StreamMetrics};

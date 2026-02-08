@@ -9,6 +9,13 @@
 **Date**: 2026-02-08
 
 ### What Was Accomplished
+- **FFI API Surface Update** — Exposed full LaminarDB API through `api::Connection` for Python bindings (PR #49)
+  - `connection.rs`: 18 new passthrough methods — `source_info()`, `sink_info()`, `stream_info()`, `query_info()`, `pipeline_topology()`, `pipeline_state()`, `pipeline_watermark()`, `total_events_processed()`, `source_count()`, `sink_count()`, `active_query_count()`, `metrics()`, `source_metrics()`, `all_source_metrics()`, `stream_metrics()`, `all_stream_metrics()`, `cancel_query()`, `shutdown()`, `subscribe()`
+  - `mod.rs`: Re-exported `SourceInfo`, `SinkInfo`, `StreamInfo`, `QueryInfo`, `PipelineTopology`, `PipelineNode`, `PipelineEdge`, `PipelineNodeType`, `PipelineMetrics`, `PipelineState`, `SourceMetrics`, `StreamMetrics`
+  - `db.rs`: Added `pub(crate) subscribe_raw()` helper to support `Connection::subscribe()` without `FromBatch` trait bounds
+  - 6 new tests, 307 total laminar-db tests passing, clippy clean
+
+Previous session (2026-02-08):
 - **Unified Checkpoint System (F-CKP-001 through F-CKP-009)** - ALL 9 FEATURES COMPLETE
   - **F-CKP-001**: Checkpoint Manifest & Store — `CheckpointManifest`, `ConnectorCheckpoint`, `OperatorCheckpoint`, `FileSystemCheckpointStore` with atomic writes (laminar-storage)
   - **F-CKP-002**: Two-Phase Sink Protocol — `pre_commit()` added to `SinkConnector` trait, implemented for Kafka/PG/Delta/Iceberg sinks, `SinkConnectorCapabilities::with_two_phase_commit()`
@@ -61,9 +68,10 @@ See [INDEX.md](./features/INDEX.md) for the full feature-by-feature breakdown.
 **Test counts**: ~2,767 base, ~2,777+ with `rocksdb`, ~3,100+ with all feature flags (`kafka`, `postgres-cdc`, `postgres-sink`, `delta-lake`, `mysql-cdc`, `ffi`, `rocksdb`)
 
 ### Immediate Next Steps
-1. F031B/C/D: Delta Lake advanced (recovery, compaction, schema evolution)
-2. F032A: Iceberg I/O (blocked by iceberg-rust DF 52.0 compat)
-3. Remaining Phase 3 gaps (F029, F030, F033, F058, F061)
+1. Python bindings (`laminardb-python` repo): Update to use the new `api::Connection` methods
+2. F031B/C/D: Delta Lake advanced (recovery, compaction, schema evolution)
+3. F032A: Iceberg I/O (blocked by iceberg-rust DF 52.0 compat)
+4. Remaining Phase 3 gaps (F029, F030, F033, F058, F061)
 
 ### Open Issues
 - **iceberg-rust crate**: Deferred until compatible with workspace DataFusion. Business logic complete in F032.

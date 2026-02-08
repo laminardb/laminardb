@@ -442,7 +442,10 @@ impl Connection {
         &self,
         stream_name: &str,
     ) -> Result<super::subscription::ArrowSubscription, ApiError> {
-        let sub = self.inner.subscribe_raw(stream_name).map_err(ApiError::from)?;
+        let sub = self
+            .inner
+            .subscribe_raw(stream_name)
+            .map_err(ApiError::from)?;
         Ok(super::subscription::ArrowSubscription::new(
             sub,
             std::sync::Arc::new(arrow::datatypes::Schema::empty()),
