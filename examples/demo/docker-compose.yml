@@ -96,5 +96,11 @@ services:
       DEMO_MODE: kafka
       KAFKA_BROKERS: redpanda:9092
       GROUP_ID: laminardb-demo
+      CHECKPOINT_DIR: /data/checkpoints
+    volumes:
+      - demo-checkpoints:/data/checkpoints
     stdin_open: true
     tty: true
+
+volumes:
+  demo-checkpoints:

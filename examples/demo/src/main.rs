@@ -255,7 +255,7 @@ async fn run_embedded_mode() -> Result<(), Box<dyn std::error::Error>> {
         .buffer_size(65536)
         .checkpoint(StreamCheckpointConfig {
             data_dir: Some(ckpt_dir),
-            interval_ms: None, // manual only via [c]
+            interval_ms: Some(30_000),
             max_retained: Some(5),
             ..StreamCheckpointConfig::default()
         })
@@ -318,7 +318,9 @@ async fn run_kafka_mode() -> Result<(), Box<dyn std::error::Error>> {
     let group_id = std::env::var("GROUP_ID").unwrap_or_else(|_| "laminardb-demo".into());
 
     // -- Build LaminarDB with Kafka config --
-    let ckpt_dir = std::env::temp_dir().join("laminardb-demo-kafka-ckpt");
+    let ckpt_dir = std::env::var("CHECKPOINT_DIR")
+        .map(std::path::PathBuf::from)
+        .unwrap_or_else(|_| std::env::temp_dir().join("laminardb-demo-kafka-ckpt"));
     let db = LaminarDB::builder()
         .config_var("KAFKA_BROKERS", &brokers)
         .config_var("GROUP_ID", &group_id)
@@ -326,7 +328,7 @@ async fn run_kafka_mode() -> Result<(), Box<dyn std::error::Error>> {
         .buffer_size(65536)
         .checkpoint(StreamCheckpointConfig {
             data_dir: Some(ckpt_dir),
-            interval_ms: None,
+            interval_ms: Some(30_000),
             max_retained: Some(5),
             ..StreamCheckpointConfig::default()
         })
