@@ -85,6 +85,22 @@ pub fn expand_record(input: DeriveInput) -> Result<TokenStream, Error> {
         build_array_expr(ident, &f.ty, f.is_option)
     });
 
+    // Code generation for to_record_batch_from_iter
+    let vec_inits = field_infos.iter().map(|f| {
+        let ident = &f.ident;
+        quote! { let mut #ident = Vec::new(); }
+    });
+
+    let vec_pushes = field_infos.iter().map(|f| {
+        let ident = &f.ident;
+        quote! { #ident.push(record.#ident); }
+    });
+
+    let array_builders_from_vec = field_infos.iter().map(|f| {
+        let ident = &f.ident;
+        build_array_from_vec(ident, &f.ty, f.is_option)
+    });
+
     // Find the event_time field
     let event_time_impl = field_infos
         .iter()
@@ -126,6 +142,25 @@ pub fn expand_record(input: DeriveInput) -> Result<TokenStream, Error> {
                     <Self as laminar_core::streaming::Record>::schema(),
                     vec![
                         #(#array_builders),*
+                    ],
+                )
+                .expect("Record derive: schema and arrays must match")
+            }
+
+            fn to_record_batch_from_iter<I>(records: I) -> arrow::array::RecordBatch
+            where
+                I: IntoIterator<Item = Self>,
+            {
+                #(#vec_inits)*
+
+                for record in records {
+                    #(#vec_pushes)*
+                }
+
+                arrow::array::RecordBatch::try_new(
+                    <Self as laminar_core::streaming::Record>::schema(),
+                    vec![
+                        #(#array_builders_from_vec),*
                     ],
                 )
                 .expect("Record derive: schema and arrays must match")
@@ -332,6 +367,129 @@ fn build_option_array_expr(ident: &Ident, inner_ty: &Type) -> TokenStream {
             },
             "String" => quote! {
                 std::sync::Arc::new(arrow::array::StringArray::from(vec![self.#ident.as_deref()]))
+            },
+            _ => quote! { compile_error!("Unsupported Option<T> type for Record derive") },
+        }
+    } else {
+        quote! { compile_error!("Unsupported Option type for Record derive") }
+    }
+}
+
+/// Build array expression from a Vec of values.
+fn build_array_from_vec(ident: &Ident, ty: &Type, is_option: bool) -> TokenStream {
+    if is_option {
+        if let Some(inner) = extract_option_inner(ty) {
+            return build_option_array_from_vec(ident, inner);
+        }
+    }
+
+    if let Type::Path(type_path) = ty {
+        let type_str = type_path
+            .path
+            .segments
+            .iter()
+            .map(|s| s.ident.to_string())
+            .collect::<Vec<_>>()
+            .join("::");
+
+        match type_str.as_str() {
+            "bool" => quote! {
+                std::sync::Arc::new(arrow::array::BooleanArray::from(#ident))
+            },
+            "i8" => quote! {
+                std::sync::Arc::new(arrow::array::Int8Array::from(#ident))
+            },
+            "i16" => quote! {
+                std::sync::Arc::new(arrow::array::Int16Array::from(#ident))
+            },
+            "i32" => quote! {
+                std::sync::Arc::new(arrow::array::Int32Array::from(#ident))
+            },
+            "i64" => quote! {
+                std::sync::Arc::new(arrow::array::Int64Array::from(#ident))
+            },
+            "u8" => quote! {
+                std::sync::Arc::new(arrow::array::UInt8Array::from(#ident))
+            },
+            "u16" => quote! {
+                std::sync::Arc::new(arrow::array::UInt16Array::from(#ident))
+            },
+            "u32" => quote! {
+                std::sync::Arc::new(arrow::array::UInt32Array::from(#ident))
+            },
+            "u64" => quote! {
+                std::sync::Arc::new(arrow::array::UInt64Array::from(#ident))
+            },
+            "f32" => quote! {
+                std::sync::Arc::new(arrow::array::Float32Array::from(#ident))
+            },
+            "f64" => quote! {
+                std::sync::Arc::new(arrow::array::Float64Array::from(#ident))
+            },
+            "String" => quote! {
+                std::sync::Arc::new(arrow::array::StringArray::from(#ident))
+            },
+            "Vec" => {
+                // Vec<u8> → BinaryArray
+                // Vec<Vec<u8>> needs conversion or iteration
+                quote! {
+                    std::sync::Arc::new(arrow::array::BinaryArray::from_iter_values(#ident.iter()))
+                }
+            }
+            _ => quote! { compile_error!("Unsupported type for Record derive array builder") },
+        }
+    } else {
+        quote! { compile_error!("Unsupported type for Record derive array builder") }
+    }
+}
+
+/// Build array expression for Vec<Option<T>>.
+fn build_option_array_from_vec(ident: &Ident, inner_ty: &Type) -> TokenStream {
+    if let Type::Path(type_path) = inner_ty {
+        let type_str = type_path
+            .path
+            .segments
+            .iter()
+            .map(|s| s.ident.to_string())
+            .collect::<Vec<_>>()
+            .join("::");
+
+        match type_str.as_str() {
+            "bool" => quote! {
+                std::sync::Arc::new(arrow::array::BooleanArray::from(#ident))
+            },
+            "i8" => quote! {
+                std::sync::Arc::new(arrow::array::Int8Array::from(#ident))
+            },
+            "i16" => quote! {
+                std::sync::Arc::new(arrow::array::Int16Array::from(#ident))
+            },
+            "i32" => quote! {
+                std::sync::Arc::new(arrow::array::Int32Array::from(#ident))
+            },
+            "i64" => quote! {
+                std::sync::Arc::new(arrow::array::Int64Array::from(#ident))
+            },
+            "u8" => quote! {
+                std::sync::Arc::new(arrow::array::UInt8Array::from(#ident))
+            },
+            "u16" => quote! {
+                std::sync::Arc::new(arrow::array::UInt16Array::from(#ident))
+            },
+            "u32" => quote! {
+                std::sync::Arc::new(arrow::array::UInt32Array::from(#ident))
+            },
+            "u64" => quote! {
+                std::sync::Arc::new(arrow::array::UInt64Array::from(#ident))
+            },
+            "f32" => quote! {
+                std::sync::Arc::new(arrow::array::Float32Array::from(#ident))
+            },
+            "f64" => quote! {
+                std::sync::Arc::new(arrow::array::Float64Array::from(#ident))
+            },
+            "String" => quote! {
+                std::sync::Arc::new(arrow::array::StringArray::from(#ident))
             },
             _ => quote! { compile_error!("Unsupported Option<T> type for Record derive") },
         }

@@ -252,12 +252,27 @@ impl<T: Record> SourceHandle<T> {
 
     /// Push a batch of records.
     pub fn push_batch(&self, records: impl IntoIterator<Item = T>) -> usize {
+        const BATCH_SIZE: usize = 1024;
         let mut count = 0;
+        let mut buffer = Vec::with_capacity(BATCH_SIZE);
+
         for record in records {
-            if self.push(record).is_err() {
-                break;
+            buffer.push(record);
+            if buffer.len() >= BATCH_SIZE {
+                let batch = T::to_record_batch_from_iter(buffer.drain(..));
+                if self.push_arrow(batch).is_err() {
+                    return count;
+                }
+                count += BATCH_SIZE;
             }
-            count += 1;
+        }
+
+        if !buffer.is_empty() {
+            let len = buffer.len();
+            let batch = T::to_record_batch_from_iter(buffer);
+            if self.push_arrow(batch).is_ok() {
+                count += len;
+            }
         }
         count
     }
