@@ -78,6 +78,9 @@ io-uring = "0.7"  # Low-level io_uring bindings (Linux only)
 # Probabilistic data structures
 xorf = "0.12"
 
+# Encoding
+base64 = "0.22"
+
 # Randomness
 rand = "0.8"
 

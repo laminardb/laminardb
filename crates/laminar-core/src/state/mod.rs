@@ -629,8 +629,12 @@ pub enum StateError {
 
 mod mmap;
 
+/// Changelog-aware state store wrapper (F-CKP-005).
+pub mod changelog_aware;
+
 // Re-export main types
 pub use self::StateError as Error;
+pub use changelog_aware::{ChangelogAwareStore, ChangelogSink};
 pub use mmap::MmapStateStore;
 
 #[cfg(test)]

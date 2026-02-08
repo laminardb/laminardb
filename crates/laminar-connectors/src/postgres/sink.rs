@@ -482,17 +482,29 @@ impl SinkConnector for PostgresSink {
         Ok(())
     }
 
+    async fn pre_commit(&mut self, epoch: u64) -> Result<(), ConnectorError> {
+        if epoch != self.current_epoch {
+            return Err(ConnectorError::TransactionError(format!(
+                "epoch mismatch in pre_commit: expected {}, got {epoch}",
+                self.current_epoch
+            )));
+        }
+
+        // Flush any remaining buffered COPY data (phase 1).
+        if !self.buffer.is_empty() {
+            let _ = self.flush_buffer_local();
+        }
+
+        debug!(epoch, "PostgreSQL sink pre-committed (flushed)");
+        Ok(())
+    }
+
     async fn commit_epoch(&mut self, epoch: u64) -> Result<(), ConnectorError> {
         if epoch != self.current_epoch {
             return Err(ConnectorError::TransactionError(format!(
                 "epoch mismatch: expected {}, got {epoch}",
                 self.current_epoch
             )));
-        }
-
-        // Flush any remaining buffered data.
-        if !self.buffer.is_empty() {
-            let _ = self.flush_buffer_local();
         }
 
         self.last_committed_epoch = epoch;
@@ -537,7 +549,7 @@ impl SinkConnector for PostgresSink {
             caps = caps.with_changelog();
         }
         if self.config.delivery_guarantee == DeliveryGuarantee::ExactlyOnce {
-            caps = caps.with_exactly_once();
+            caps = caps.with_exactly_once().with_two_phase_commit();
         }
 
         caps

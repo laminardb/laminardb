@@ -7,10 +7,10 @@
 | Phase 1 | 12 | 0 | 0 | 0 | 12 |
 | Phase 1.5 | 1 | 0 | 0 | 0 | 1 |
 | Phase 2 | 34 | 0 | 0 | 0 | 34 |
-| Phase 3 | 67 | 9 | 0 | 0 | 58 |
+| Phase 3 | 76 | 9 | 0 | 0 | 67 |
 | Phase 4 | 11 | 11 | 0 | 0 | 0 |
 | Phase 5 | 10 | 10 | 0 | 0 | 0 |
-| **Total** | **135** | **30** | **0** | **0** | **105** |
+| **Total** | **144** | **30** | **0** | **0** | **114** |
 
 ## Status Legend
 
@@ -101,7 +101,7 @@
 
 ## Phase 3: Connectors & Integration
 
-> **Status**: 54/67 features complete (81%)
+> **Status**: 67/76 features complete (88%)
 
 ### Streaming API ✅
 
@@ -222,6 +222,20 @@ See [Demo Index](phase-3/demo/INDEX.md).
 | F-DEMO-004 | DAG Pipeline Visualization | ✅ | [Link](phase-3/demo/F-DEMO-004-dag-visualization.md) |
 | F-DEMO-005 | Tumbling Windows & ASOF JOIN Demo | ✅ | - |
 | F-DEMO-006 | Kafka Mode TUI Dashboard | ✅ | [Link](phase-3/F-DEMO-006-kafka-tui.md) |
+
+### Unified Checkpoint System
+
+| ID | Feature | Status | Spec |
+|----|---------|--------|------|
+| F-CKP-001 | Checkpoint Manifest & Store | ✅ | - |
+| F-CKP-002 | Two-Phase Sink Protocol | ✅ | - |
+| F-CKP-003 | Checkpoint Coordinator | ✅ | - |
+| F-CKP-004 | Operator State Persistence | ✅ | - |
+| F-CKP-005 | Changelog Buffer Wiring | ✅ | - |
+| F-CKP-006 | WAL Checkpoint Coordination | ✅ | - |
+| F-CKP-007 | Unified Recovery Manager | ✅ | - |
+| F-CKP-008 | End-to-End Recovery Tests | ✅ | - |
+| F-CKP-009 | Checkpoint Observability | ✅ | - |
 
 ### FFI & Language Bindings
 

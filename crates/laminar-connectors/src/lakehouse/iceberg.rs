@@ -450,6 +450,23 @@ impl SinkConnector for IcebergSink {
         Ok(())
     }
 
+    async fn pre_commit(&mut self, epoch: u64) -> Result<(), ConnectorError> {
+        // Skip if already committed (exactly-once idempotency).
+        if self.config.delivery_guarantee == DeliveryGuarantee::ExactlyOnce
+            && epoch <= self.last_committed_epoch
+        {
+            return Ok(());
+        }
+
+        // Write any remaining buffered data to data files (phase 1).
+        if !self.buffer.is_empty() {
+            let _ = self.flush_buffer_local();
+        }
+
+        debug!(epoch, "Iceberg: pre-committed (data files written)");
+        Ok(())
+    }
+
     async fn commit_epoch(&mut self, epoch: u64) -> Result<(), ConnectorError> {
         // Skip if already committed (exactly-once idempotency).
         if self.config.delivery_guarantee == DeliveryGuarantee::ExactlyOnce
@@ -458,12 +475,7 @@ impl SinkConnector for IcebergSink {
             return Ok(());
         }
 
-        // Flush any remaining buffered data.
-        if !self.buffer.is_empty() {
-            let _ = self.flush_buffer_local();
-        }
-
-        // Commit all pending files as a single Iceberg snapshot.
+        // Commit all pending files as a single Iceberg snapshot (phase 2).
         if self.pending_data_files > 0 || self.pending_delete_files > 0 {
             self.commit_local(epoch);
         }
@@ -515,7 +527,7 @@ impl SinkConnector for IcebergSink {
         let mut caps = SinkConnectorCapabilities::default().with_idempotent();
 
         if self.config.delivery_guarantee == DeliveryGuarantee::ExactlyOnce {
-            caps = caps.with_exactly_once();
+            caps = caps.with_exactly_once().with_two_phase_commit();
         }
         if self.config.write_mode == IcebergWriteMode::Upsert {
             caps = caps.with_upsert().with_changelog();
@@ -841,10 +853,11 @@ mod tests {
         let batch = test_batch(10);
         sink.write_batch(&batch).await.unwrap();
 
-        // Commit epoch
+        // Two-phase commit: pre_commit flushes buffer, commit_epoch commits
+        sink.pre_commit(1).await.unwrap();
+        assert_eq!(sink.buffered_rows(), 0);
         sink.commit_epoch(1).await.unwrap();
         assert_eq!(sink.last_committed_epoch(), 1);
-        assert_eq!(sink.buffered_rows(), 0);
         assert_eq!(sink.table_version(), 1);
         assert!(sink.snapshot_id() > 0);
 
@@ -865,6 +878,7 @@ mod tests {
         sink.begin_epoch(1).await.unwrap();
         let batch = test_batch(5);
         sink.write_batch(&batch).await.unwrap();
+        sink.pre_commit(1).await.unwrap();
         sink.commit_epoch(1).await.unwrap();
         assert_eq!(sink.last_committed_epoch(), 1);
         let version_after_first = sink.table_version();
@@ -872,7 +886,8 @@ mod tests {
         // Try to begin epoch 1 again (should skip)
         sink.begin_epoch(1).await.unwrap();
 
-        // Commit epoch 1 again (should be no-op)
+        // Commit epoch 1 again (should be no-op due to idempotency)
+        sink.pre_commit(1).await.unwrap();
         sink.commit_epoch(1).await.unwrap();
         assert_eq!(sink.last_committed_epoch(), 1);
         assert_eq!(sink.table_version(), version_after_first); // No new version
@@ -888,6 +903,7 @@ mod tests {
         sink.begin_epoch(1).await.unwrap();
         let batch = test_batch(5);
         sink.write_batch(&batch).await.unwrap();
+        sink.pre_commit(1).await.unwrap();
         sink.commit_epoch(1).await.unwrap();
 
         // Begin epoch 1 again (at-least-once doesn't skip)
@@ -935,6 +951,7 @@ mod tests {
             sink.begin_epoch(epoch).await.unwrap();
             let batch = test_batch(10);
             sink.write_batch(&batch).await.unwrap();
+            sink.pre_commit(epoch).await.unwrap();
             sink.commit_epoch(epoch).await.unwrap();
         }
 

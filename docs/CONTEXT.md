@@ -6,9 +6,23 @@
 
 ## Last Session
 
-**Date**: 2026-02-07
+**Date**: 2026-02-08
 
 ### What Was Accomplished
+- **Unified Checkpoint System (F-CKP-001 through F-CKP-009)** - ALL 9 FEATURES COMPLETE
+  - **F-CKP-001**: Checkpoint Manifest & Store — `CheckpointManifest`, `ConnectorCheckpoint`, `OperatorCheckpoint`, `FileSystemCheckpointStore` with atomic writes (laminar-storage)
+  - **F-CKP-002**: Two-Phase Sink Protocol — `pre_commit()` added to `SinkConnector` trait, implemented for Kafka/PG/Delta/Iceberg sinks, `SinkConnectorCapabilities::with_two_phase_commit()`
+  - **F-CKP-003**: Checkpoint Coordinator — `CheckpointCoordinator` with full checkpoint cycle: source snapshot → sink pre-commit → manifest persist → sink commit/rollback
+  - **F-CKP-004**: Operator State Persistence — `manifest_operators_to_dag_states()` and `dag_snapshot_to_manifest_operators()` conversion functions
+  - **F-CKP-005**: Changelog Buffer Wiring — `ChangelogAwareStore<S>` wrapper (Ring 0, ~2-5ns), `ChangelogSink` trait, `ChangelogDrainer` (Ring 1)
+  - **F-CKP-006**: WAL Checkpoint Coordination — `WalPrepareResult`, `prepare_wal_for_checkpoint()`, `truncate_wal_after_checkpoint()`
+  - **F-CKP-007**: Unified Recovery Manager — `RecoveryManager` loads manifest, restores sources/sinks/tables, `RecoveredState` with error tracking
+  - **F-CKP-008**: End-to-End Recovery Tests — 12 integration tests covering happy path, fresh start, multiple checkpoints, offsets, operator state, WAL, epoch resume, incremental, prune, JSON round-trip
+  - **F-CKP-009**: Checkpoint Observability — `checkpoints_completed/failed`, `last_checkpoint_duration_ms`, `checkpoint_epoch` in `PipelineCounters`
+  - Fixed lakehouse delta/iceberg tests broken by F-CKP-002 two-phase commit refactor
+  - Phase C gate: clippy clean, fmt clean, doc clean (0 warnings), 2,767+ lib tests + 12 integration tests all passing
+
+Previous session (2026-02-07):
 - **F-OBS-001: Pipeline Observability API** - COMPLETE (23 new tests, 253 laminar-db tests total)
   - `metrics.rs` (NEW): `PipelineState`, `PipelineCounters` (atomic), `PipelineMetrics`, `SourceMetrics`, `StreamMetrics`, `CounterSnapshot`, `is_backpressured()`, `utilization()` (10 unit tests)
   - `db.rs`: Added `counters: Arc<PipelineCounters>`, `start_time: Instant` fields; 7 public API methods: `metrics()`, `source_metrics()`, `all_source_metrics()`, `stream_metrics()`, `all_stream_metrics()`, `total_events_processed()`, `counters()`; instrumented both `start_embedded_pipeline` and `start_connector_pipeline` with counter increments for events_ingested/emitted/cycles/batches + cycle timing (13 integration tests)
@@ -39,18 +53,17 @@ Previous session (2026-02-07):
 
 ### Where We Left Off
 
-**Phase 3: 54/67 features COMPLETE (81%)**
+**Phase 3: 63/67 features COMPLETE (94%)**
 
-All Phase 1 (12), Phase 1.5 (1), and Phase 2 (34) features are complete.
+All Phase 1 (12), Phase 1.5 (1), Phase 2 (34), and Unified Checkpoint (9) features are complete.
 See [INDEX.md](./features/INDEX.md) for the full feature-by-feature breakdown.
 
-**Test counts**: ~2,664 base, ~2,674+ with `rocksdb`, ~3,000+ with all feature flags (`kafka`, `postgres-cdc`, `postgres-sink`, `delta-lake`, `mysql-cdc`, `ffi`, `rocksdb`)
+**Test counts**: ~2,767 base, ~2,777+ with `rocksdb`, ~3,100+ with all feature flags (`kafka`, `postgres-cdc`, `postgres-sink`, `delta-lake`, `mysql-cdc`, `ffi`, `rocksdb`)
 
 ### Immediate Next Steps
-1. F-OBS-001: Pipeline Observability API
-2. F031B/C/D: Delta Lake advanced (recovery, compaction, schema evolution)
-3. F032A: Iceberg I/O (blocked by iceberg-rust DF 52.0 compat)
-4. F-DEMO-001/002/003: Production demo pipeline + TUI
+1. F031B/C/D: Delta Lake advanced (recovery, compaction, schema evolution)
+2. F032A: Iceberg I/O (blocked by iceberg-rust DF 52.0 compat)
+3. Remaining Phase 3 gaps (F029, F030, F033, F058, F061)
 
 ### Open Issues
 - **iceberg-rust crate**: Deferred until compatible with workspace DataFusion. Business logic complete in F032.
@@ -68,6 +81,7 @@ laminar-core/src/
   subscription/   # Reactive push-based: events, notifications, registry, dispatcher, backpressure, filtering
   time/           # Watermarks: partitioned, keyed, alignment groups
   operator/       # Windows, joins (stream/asof/temporal), changelog, lag_lead, table_cache (LRU + xor)
+  state/          # State stores: InMemoryStore, ChangelogAwareStore (Ring 0 wrapper), ChangelogSink trait
   mv/             # Cascading materialized views
   tpc/            # Thread-per-core: SPSC, key router, core handle, backpressure, runtime
   sink/           # Exactly-once: transactional sink, epoch adapter
@@ -97,8 +111,13 @@ laminar-connectors/src/
 laminar-storage/src/
   incremental/    # Incremental checkpointing (RocksDB backend)
   per_core_wal/   # Per-core WAL segments
+  checkpoint_manifest.rs  # Unified CheckpointManifest, ConnectorCheckpoint, OperatorCheckpoint
+  checkpoint_store.rs     # CheckpointStore trait, FileSystemCheckpointStore (atomic writes)
+  changelog_drainer.rs    # Ring 1 SPSC changelog consumer
 
 laminar-db/src/
+  checkpoint_coordinator.rs  # Unified checkpoint orchestrator (F-CKP-003)
+  recovery_manager.rs       # Unified recovery: load manifest, restore all state (F-CKP-007)
   api/            # FFI-ready API: Connection, Writer, QueryStream, ArrowSubscription
   ffi/            # C FFI: opaque handles, Arrow C Data Interface, async callbacks
 ```

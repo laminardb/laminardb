@@ -508,6 +508,32 @@ impl SinkConnector for DeltaLakeSink {
         Ok(())
     }
 
+    async fn pre_commit(&mut self, epoch: u64) -> Result<(), ConnectorError> {
+        // Skip if already committed (exactly-once idempotency).
+        if self.config.delivery_guarantee == DeliveryGuarantee::ExactlyOnce
+            && epoch <= self.last_committed_epoch
+        {
+            return Ok(());
+        }
+
+        // Write any remaining buffered data to Parquet files (phase 1).
+        #[cfg(feature = "delta-lake")]
+        {
+            if !self.buffer.is_empty() {
+                self.flush_buffer_to_delta().await?;
+            }
+        }
+        #[cfg(not(feature = "delta-lake"))]
+        {
+            if !self.buffer.is_empty() {
+                let _ = self.flush_buffer_local();
+            }
+        }
+
+        debug!(epoch, "Delta Lake: pre-committed (files written)");
+        Ok(())
+    }
+
     async fn commit_epoch(&mut self, epoch: u64) -> Result<(), ConnectorError> {
         // Skip if already committed (exactly-once idempotency).
         if self.config.delivery_guarantee == DeliveryGuarantee::ExactlyOnce
@@ -516,24 +542,9 @@ impl SinkConnector for DeltaLakeSink {
             return Ok(());
         }
 
-        // When delta-lake feature is enabled, use real I/O.
-        #[cfg(feature = "delta-lake")]
-        {
-            // Flush any remaining buffered data to Delta Lake.
-            if !self.buffer.is_empty() {
-                self.flush_buffer_to_delta().await?;
-            }
-        }
-
-        // When delta-lake feature is NOT enabled, use local simulation.
+        // Commit all pending files as a single Delta Lake transaction (phase 2).
         #[cfg(not(feature = "delta-lake"))]
         {
-            // Flush any remaining buffered data.
-            if !self.buffer.is_empty() {
-                let _ = self.flush_buffer_local();
-            }
-
-            // Commit all pending files as a single Delta Lake transaction.
             if self.pending_files > 0 {
                 self.commit_local(epoch);
             }
@@ -582,7 +593,7 @@ impl SinkConnector for DeltaLakeSink {
         let mut caps = SinkConnectorCapabilities::default().with_idempotent();
 
         if self.config.delivery_guarantee == DeliveryGuarantee::ExactlyOnce {
-            caps = caps.with_exactly_once();
+            caps = caps.with_exactly_once().with_two_phase_commit();
         }
         if self.config.write_mode == DeltaWriteMode::Upsert {
             caps = caps.with_upsert().with_changelog();
@@ -925,10 +936,11 @@ mod tests {
         let batch = test_batch(10);
         sink.write_batch(&batch).await.unwrap();
 
-        // Commit epoch
+        // Two-phase commit: pre_commit flushes buffer, commit_epoch commits
+        sink.pre_commit(1).await.unwrap();
+        assert_eq!(sink.buffered_rows(), 0);
         sink.commit_epoch(1).await.unwrap();
         assert_eq!(sink.last_committed_epoch(), 1);
-        assert_eq!(sink.buffered_rows(), 0);
         assert_eq!(sink.delta_version(), 1);
 
         // Metrics should show 1 commit
@@ -949,6 +961,7 @@ mod tests {
         sink.begin_epoch(1).await.unwrap();
         let batch = test_batch(5);
         sink.write_batch(&batch).await.unwrap();
+        sink.pre_commit(1).await.unwrap();
         sink.commit_epoch(1).await.unwrap();
         assert_eq!(sink.last_committed_epoch(), 1);
 
@@ -957,7 +970,8 @@ mod tests {
         // Should not have cleared the state for a new epoch
         // (skipped because already committed)
 
-        // Commit epoch 1 again (should be no-op)
+        // Commit epoch 1 again (should be no-op due to idempotency)
+        sink.pre_commit(1).await.unwrap();
         sink.commit_epoch(1).await.unwrap();
         assert_eq!(sink.last_committed_epoch(), 1);
         assert_eq!(sink.delta_version(), 1); // No new version
@@ -974,6 +988,7 @@ mod tests {
         sink.begin_epoch(1).await.unwrap();
         let batch = test_batch(5);
         sink.write_batch(&batch).await.unwrap();
+        sink.pre_commit(1).await.unwrap();
         sink.commit_epoch(1).await.unwrap();
 
         // Begin epoch 1 again (at-least-once doesn't skip)
@@ -1021,6 +1036,7 @@ mod tests {
             sink.begin_epoch(epoch).await.unwrap();
             let batch = test_batch(10);
             sink.write_batch(&batch).await.unwrap();
+            sink.pre_commit(epoch).await.unwrap();
             sink.commit_epoch(epoch).await.unwrap();
         }
 

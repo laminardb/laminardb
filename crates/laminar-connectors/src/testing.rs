@@ -269,6 +269,7 @@ impl SinkConnector for MockSinkConnector {
         SinkConnectorCapabilities::default()
             .with_exactly_once()
             .with_idempotent()
+            .with_two_phase_commit()
     }
 
     async fn close(&mut self) -> Result<(), ConnectorError> {

@@ -21,6 +21,7 @@ rocksdb = ["dep:rocksdb"]
 [dependencies]
 laminar-core = { path = "../laminar-core", version = "0.1.0" }
 laminar-sql = { path = "../laminar-sql", version = "0.1.0" }
+laminar-storage = { path = "../laminar-storage", version = "0.1.0" }
 laminar-connectors = { path = "../laminar-connectors", version = "0.1.0" }
 
 # Arrow
@@ -54,6 +55,9 @@ async-trait = { workspace = true }
 
 # Concurrency
 parking_lot = { workspace = true }
+
+# Fast hash maps (for DAG operator state maps)
+fxhash = { workspace = true }
 
 # Observability
 tracing = { workspace = true }

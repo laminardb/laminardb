@@ -448,6 +448,27 @@ impl SinkConnector for KafkaSink {
         Ok(())
     }
 
+    async fn pre_commit(&mut self, epoch: u64) -> Result<(), ConnectorError> {
+        if epoch != self.current_epoch {
+            return Err(ConnectorError::TransactionError(format!(
+                "epoch mismatch in pre_commit: expected {}, got {epoch}",
+                self.current_epoch
+            )));
+        }
+
+        // Flush all pending messages to Kafka brokers (phase 1).
+        if let Some(ref producer) = self.producer {
+            producer.flush(self.config.delivery_timeout).map_err(|e| {
+                ConnectorError::TransactionError(format!(
+                    "failed to flush before pre-commit for epoch {epoch}: {e}"
+                ))
+            })?;
+        }
+
+        debug!(epoch, "pre-committed epoch (flushed)");
+        Ok(())
+    }
+
     async fn commit_epoch(&mut self, epoch: u64) -> Result<(), ConnectorError> {
         if epoch != self.current_epoch {
             return Err(ConnectorError::TransactionError(format!(
@@ -546,7 +567,7 @@ impl SinkConnector for KafkaSink {
             .with_partitioned();
 
         if self.config.delivery_guarantee == DeliveryGuarantee::ExactlyOnce {
-            caps = caps.with_exactly_once();
+            caps = caps.with_exactly_once().with_two_phase_commit();
         }
 
         if self.schema_registry.is_some() {

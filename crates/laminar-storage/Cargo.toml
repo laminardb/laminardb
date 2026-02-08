@@ -28,6 +28,9 @@ bytes = { workspace = true }
 # CRC32 for WAL integrity
 crc32c = "0.6"
 
+# Base64 encoding for operator state in checkpoint manifests
+base64 = { workspace = true }
+
 # Fast hash for changelog entries
 fxhash = "0.2"
 

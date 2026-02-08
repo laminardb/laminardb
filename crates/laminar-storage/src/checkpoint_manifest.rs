@@ -1,0 +1,369 @@
+//! Unified checkpoint manifest types.
+//!
+//! The [`CheckpointManifest`] is the single source of truth for checkpoint state,
+//! replacing the previously separate `PipelineCheckpoint`, `DagCheckpointSnapshot`,
+//! and `CheckpointMetadata` types. One manifest captures ALL state at a point in
+//! time: source offsets, sink epochs, operator state, WAL positions, and watermarks.
+//!
+//! ## Manifest Format
+//!
+//! Manifests are serialized as JSON for human readability and debuggability.
+//! Large operator state (binary blobs) is stored in a separate `state.bin` file
+//! referenced by the manifest.
+//!
+//! ## Connector Checkpoint
+//!
+//! The [`ConnectorCheckpoint`] type provides a connector-agnostic offset container
+//! that supports all connector types (Kafka partitions, PostgreSQL LSNs, MySQL GTIDs)
+//! through string key-value pairs.
+
+use std::collections::HashMap;
+
+/// A point-in-time snapshot of all pipeline state.
+///
+/// This is the single source of truth for checkpoint persistence, replacing
+/// the three previously disconnected checkpoint systems:
+/// - `PipelineCheckpoint` (source offsets + sink epochs)
+/// - `DagCheckpointSnapshot` (operator state — in-memory only)
+/// - `CheckpointMetadata` (WAL position + watermark)
+#[derive(Debug, Clone, serde::Serialize, serde::Deserialize, PartialEq)]
+pub struct CheckpointManifest {
+    /// Manifest format version (for future evolution).
+    pub version: u32,
+    /// Unique, monotonically increasing checkpoint ID.
+    pub checkpoint_id: u64,
+    /// Epoch number for exactly-once coordination.
+    pub epoch: u64,
+    /// Timestamp when checkpoint was created (millis since Unix epoch).
+    pub timestamp_ms: u64,
+
+    // ── Connector State ──
+    /// Per-source connector offsets (key: source name).
+    #[serde(default)]
+    pub source_offsets: HashMap<String, ConnectorCheckpoint>,
+    /// Per-sink last committed epoch (key: sink name).
+    #[serde(default)]
+    pub sink_epochs: HashMap<String, u64>,
+    /// Per-table source offsets for reference tables (key: table name).
+    #[serde(default)]
+    pub table_offsets: HashMap<String, ConnectorCheckpoint>,
+
+    // ── Operator State ──
+    /// Per-operator checkpoint data (key: operator/node name).
+    ///
+    /// Small state is inlined as base64. Large state is stored in a separate
+    /// `state.bin` file and this map holds only a reference marker.
+    #[serde(default)]
+    pub operator_states: HashMap<String, OperatorCheckpoint>,
+
+    // ── Storage State ──
+    /// Path to the `RocksDB` table store checkpoint, if any.
+    #[serde(default)]
+    pub table_store_checkpoint_path: Option<String>,
+    /// WAL position for single-writer mode.
+    #[serde(default)]
+    pub wal_position: u64,
+    /// Per-core WAL positions for thread-per-core mode.
+    #[serde(default)]
+    pub per_core_wal_positions: Vec<u64>,
+
+    // ── Time State ──
+    /// Global watermark at checkpoint time.
+    #[serde(default)]
+    pub watermark: Option<i64>,
+    /// Per-source watermarks (key: source name).
+    #[serde(default)]
+    pub source_watermarks: HashMap<String, i64>,
+
+    // ── Metadata ──
+    /// Total size of all checkpoint data in bytes (manifest + state.bin).
+    #[serde(default)]
+    pub size_bytes: u64,
+    /// Whether this is an incremental checkpoint (only deltas since parent).
+    #[serde(default)]
+    pub is_incremental: bool,
+    /// Parent checkpoint ID for incremental checkpoints.
+    #[serde(default)]
+    pub parent_id: Option<u64>,
+}
+
+impl CheckpointManifest {
+    /// Creates a new manifest with the given ID and epoch.
+    #[must_use]
+    pub fn new(checkpoint_id: u64, epoch: u64) -> Self {
+        #[allow(clippy::cast_possible_truncation)] // u64 millis won't overflow until year 584M
+        let timestamp_ms = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .unwrap_or_default()
+            .as_millis() as u64;
+
+        Self {
+            version: 1,
+            checkpoint_id,
+            epoch,
+            timestamp_ms,
+            source_offsets: HashMap::new(),
+            sink_epochs: HashMap::new(),
+            table_offsets: HashMap::new(),
+            operator_states: HashMap::new(),
+            table_store_checkpoint_path: None,
+            wal_position: 0,
+            per_core_wal_positions: Vec::new(),
+            watermark: None,
+            source_watermarks: HashMap::new(),
+            size_bytes: 0,
+            is_incremental: false,
+            parent_id: None,
+        }
+    }
+}
+
+/// Connector-agnostic offset container.
+///
+/// Uses string key-value pairs to support all connector types:
+/// - **Kafka**: `{"partition-0": "1234", "partition-1": "5678"}`
+/// - **`PostgreSQL` CDC**: `{"lsn": "0/1234ABCD"}`
+/// - **`MySQL` CDC**: `{"gtid_set": "uuid:1-5", "binlog_file": "mysql-bin.000003"}`
+/// - **Delta Lake**: `{"version": "42"}`
+#[derive(Debug, Clone, serde::Serialize, serde::Deserialize, PartialEq, Eq)]
+pub struct ConnectorCheckpoint {
+    /// Connector-specific offset data.
+    pub offsets: HashMap<String, String>,
+    /// Epoch this checkpoint belongs to.
+    pub epoch: u64,
+    /// Optional metadata (connector type, topic name, etc.).
+    #[serde(default)]
+    pub metadata: HashMap<String, String>,
+}
+
+impl ConnectorCheckpoint {
+    /// Creates a new connector checkpoint with the given epoch.
+    #[must_use]
+    pub fn new(epoch: u64) -> Self {
+        Self {
+            offsets: HashMap::new(),
+            epoch,
+            metadata: HashMap::new(),
+        }
+    }
+
+    /// Creates a connector checkpoint with pre-populated offsets.
+    #[must_use]
+    pub fn with_offsets(epoch: u64, offsets: HashMap<String, String>) -> Self {
+        Self {
+            offsets,
+            epoch,
+            metadata: HashMap::new(),
+        }
+    }
+}
+
+/// Serialized operator state stored in the manifest.
+#[derive(Debug, Clone, serde::Serialize, serde::Deserialize, PartialEq, Eq)]
+pub struct OperatorCheckpoint {
+    /// Base64-encoded binary state (for small payloads inlined in JSON).
+    #[serde(default)]
+    pub state_b64: Option<String>,
+    /// If true, state is stored externally in the state.bin sidecar file.
+    #[serde(default)]
+    pub external: bool,
+    /// Byte offset into the state.bin file (if external).
+    #[serde(default)]
+    pub external_offset: u64,
+    /// Byte length of the state in the state.bin file (if external).
+    #[serde(default)]
+    pub external_length: u64,
+}
+
+impl OperatorCheckpoint {
+    /// Creates an inline operator checkpoint from raw bytes.
+    ///
+    /// The bytes are base64-encoded for JSON storage.
+    #[must_use]
+    pub fn inline(data: &[u8]) -> Self {
+        use base64::Engine;
+        Self {
+            state_b64: Some(base64::engine::general_purpose::STANDARD.encode(data)),
+            external: false,
+            external_offset: 0,
+            external_length: 0,
+        }
+    }
+
+    /// Creates an external reference to state in the sidecar file.
+    #[must_use]
+    pub fn external(offset: u64, length: u64) -> Self {
+        Self {
+            state_b64: None,
+            external: true,
+            external_offset: offset,
+            external_length: length,
+        }
+    }
+
+    /// Decodes the inline state, returning the raw bytes.
+    ///
+    /// Returns `None` if the state is external or no inline data is present.
+    #[must_use]
+    pub fn decode_inline(&self) -> Option<Vec<u8>> {
+        use base64::Engine;
+        self.state_b64
+            .as_ref()
+            .and_then(|b64| base64::engine::general_purpose::STANDARD.decode(b64).ok())
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn test_manifest_new() {
+        let m = CheckpointManifest::new(1, 5);
+        assert_eq!(m.version, 1);
+        assert_eq!(m.checkpoint_id, 1);
+        assert_eq!(m.epoch, 5);
+        assert!(m.timestamp_ms > 0);
+        assert!(m.source_offsets.is_empty());
+        assert!(m.sink_epochs.is_empty());
+        assert!(m.operator_states.is_empty());
+        assert!(!m.is_incremental);
+        assert!(m.parent_id.is_none());
+    }
+
+    #[test]
+    fn test_manifest_json_round_trip() {
+        let mut m = CheckpointManifest::new(42, 10);
+        m.source_offsets.insert(
+            "kafka-src".into(),
+            ConnectorCheckpoint::with_offsets(
+                10,
+                HashMap::from([
+                    ("partition-0".into(), "1234".into()),
+                    ("partition-1".into(), "5678".into()),
+                ]),
+            ),
+        );
+        m.sink_epochs.insert("pg-sink".into(), 9);
+        m.watermark = Some(999_000);
+        m.wal_position = 4096;
+        m.operator_states
+            .insert("window-agg".into(), OperatorCheckpoint::inline(b"hello"));
+
+        let json = serde_json::to_string_pretty(&m).unwrap();
+        let restored: CheckpointManifest = serde_json::from_str(&json).unwrap();
+
+        assert_eq!(restored.checkpoint_id, 42);
+        assert_eq!(restored.epoch, 10);
+        assert_eq!(restored.watermark, Some(999_000));
+        assert_eq!(restored.wal_position, 4096);
+
+        let src = restored.source_offsets.get("kafka-src").unwrap();
+        assert_eq!(src.offsets.get("partition-0"), Some(&"1234".into()));
+        assert_eq!(restored.sink_epochs.get("pg-sink"), Some(&9));
+
+        let op = restored.operator_states.get("window-agg").unwrap();
+        assert_eq!(op.decode_inline().unwrap(), b"hello");
+    }
+
+    #[test]
+    fn test_manifest_backward_compat_missing_fields() {
+        // Simulate an older manifest with only mandatory fields
+        let json = r#"{
+            "version": 1,
+            "checkpoint_id": 1,
+            "epoch": 1,
+            "timestamp_ms": 1000
+        }"#;
+
+        let m: CheckpointManifest = serde_json::from_str(json).unwrap();
+        assert_eq!(m.version, 1);
+        assert!(m.source_offsets.is_empty());
+        assert!(m.sink_epochs.is_empty());
+        assert!(m.operator_states.is_empty());
+        assert!(m.per_core_wal_positions.is_empty());
+        assert!(m.watermark.is_none());
+        assert!(!m.is_incremental);
+    }
+
+    #[test]
+    fn test_connector_checkpoint_new() {
+        let cp = ConnectorCheckpoint::new(5);
+        assert_eq!(cp.epoch, 5);
+        assert!(cp.offsets.is_empty());
+        assert!(cp.metadata.is_empty());
+    }
+
+    #[test]
+    fn test_connector_checkpoint_with_offsets() {
+        let offsets = HashMap::from([("lsn".into(), "0/ABCD".into())]);
+        let cp = ConnectorCheckpoint::with_offsets(3, offsets);
+        assert_eq!(cp.epoch, 3);
+        assert_eq!(cp.offsets.get("lsn"), Some(&"0/ABCD".into()));
+    }
+
+    #[test]
+    fn test_operator_checkpoint_inline() {
+        let op = OperatorCheckpoint::inline(b"state-data");
+        assert!(!op.external);
+        assert!(op.state_b64.is_some());
+        assert_eq!(op.decode_inline().unwrap(), b"state-data");
+    }
+
+    #[test]
+    fn test_operator_checkpoint_external() {
+        let op = OperatorCheckpoint::external(1024, 256);
+        assert!(op.external);
+        assert_eq!(op.external_offset, 1024);
+        assert_eq!(op.external_length, 256);
+        assert!(op.decode_inline().is_none());
+    }
+
+    #[test]
+    fn test_operator_checkpoint_empty_inline() {
+        let op = OperatorCheckpoint::inline(b"");
+        assert_eq!(op.decode_inline().unwrap(), b"");
+    }
+
+    #[test]
+    fn test_manifest_with_incremental() {
+        let mut m = CheckpointManifest::new(5, 5);
+        m.is_incremental = true;
+        m.parent_id = Some(4);
+
+        let json = serde_json::to_string(&m).unwrap();
+        let restored: CheckpointManifest = serde_json::from_str(&json).unwrap();
+
+        assert!(restored.is_incremental);
+        assert_eq!(restored.parent_id, Some(4));
+    }
+
+    #[test]
+    fn test_manifest_per_core_wal_positions() {
+        let mut m = CheckpointManifest::new(1, 1);
+        m.per_core_wal_positions = vec![100, 200, 300, 400];
+
+        let json = serde_json::to_string(&m).unwrap();
+        let restored: CheckpointManifest = serde_json::from_str(&json).unwrap();
+        assert_eq!(restored.per_core_wal_positions, vec![100, 200, 300, 400]);
+    }
+
+    #[test]
+    fn test_manifest_table_offsets() {
+        let mut m = CheckpointManifest::new(1, 1);
+        m.table_offsets.insert(
+            "instruments".into(),
+            ConnectorCheckpoint::with_offsets(1, HashMap::from([("lsn".into(), "0/ABCD".into())])),
+        );
+        m.table_store_checkpoint_path = Some("/tmp/rocksdb_cp".into());
+
+        let json = serde_json::to_string(&m).unwrap();
+        let restored: CheckpointManifest = serde_json::from_str(&json).unwrap();
+
+        assert_eq!(restored.table_offsets.len(), 1);
+        assert_eq!(
+            restored.table_store_checkpoint_path.as_deref(),
+            Some("/tmp/rocksdb_cp")
+        );
+    }
+}

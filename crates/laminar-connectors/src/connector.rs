@@ -123,6 +123,9 @@ pub struct SinkConnectorCapabilities {
     /// Whether the sink can handle changelog/retraction records.
     pub changelog: bool,
 
+    /// Whether the sink supports two-phase commit (pre-commit + commit).
+    pub two_phase_commit: bool,
+
     /// Whether the sink supports schema evolution.
     pub schema_evolution: bool,
 
@@ -156,6 +159,13 @@ impl SinkConnectorCapabilities {
     #[must_use]
     pub fn with_changelog(mut self) -> Self {
         self.changelog = true;
+        self
+    }
+
+    /// Creates capabilities with two-phase commit support (pre-commit + commit).
+    #[must_use]
+    pub fn with_two_phase_commit(mut self) -> Self {
+        self.two_phase_commit = true;
         self
     }
 
@@ -320,9 +330,31 @@ pub trait SinkConnector: Send {
         Ok(())
     }
 
-    /// Commits the current epoch.
+    /// Pre-commits the current epoch (phase 1 of two-phase commit).
     ///
-    /// Called by the runtime when a checkpoint completes successfully.
+    /// Called after all writes for this epoch are complete but before the
+    /// checkpoint manifest is persisted. The sink should flush any buffered
+    /// data and prepare for commit, but must NOT finalize the transaction.
+    ///
+    /// The protocol is:
+    /// 1. `pre_commit(epoch)` — flush/prepare (this method)
+    /// 2. Manifest persisted to disk
+    /// 3. `commit_epoch(epoch)` — finalize transaction
+    /// 4. On failure: `rollback_epoch(epoch)`
+    ///
+    /// Default implementation delegates to `flush()`.
+    ///
+    /// # Errors
+    ///
+    /// Returns `ConnectorError` if the pre-commit fails.
+    async fn pre_commit(&mut self, _epoch: u64) -> Result<(), ConnectorError> {
+        self.flush().await
+    }
+
+    /// Commits the current epoch (phase 2 of two-phase commit).
+    ///
+    /// Called by the runtime after the checkpoint manifest is successfully
+    /// persisted. The sink should finalize any pending transactions.
     /// Default implementation does nothing (at-least-once semantics).
     ///
     /// # Errors

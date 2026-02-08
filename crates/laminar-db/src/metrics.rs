@@ -50,6 +50,15 @@ pub struct PipelineCounters {
     pub last_cycle_duration_ns: AtomicU64,
     /// Total batches processed.
     pub total_batches: AtomicU64,
+    // ── F-CKP-009: Checkpoint counters ──
+    /// Total checkpoints completed successfully.
+    pub checkpoints_completed: AtomicU64,
+    /// Total checkpoints that failed.
+    pub checkpoints_failed: AtomicU64,
+    /// Duration of the last checkpoint in milliseconds.
+    pub last_checkpoint_duration_ms: AtomicU64,
+    /// Current checkpoint epoch.
+    pub checkpoint_epoch: AtomicU64,
 }
 
 impl PipelineCounters {
@@ -63,6 +72,10 @@ impl PipelineCounters {
             cycles: AtomicU64::new(0),
             last_cycle_duration_ns: AtomicU64::new(0),
             total_batches: AtomicU64::new(0),
+            checkpoints_completed: AtomicU64::new(0),
+            checkpoints_failed: AtomicU64::new(0),
+            last_checkpoint_duration_ms: AtomicU64::new(0),
+            checkpoint_epoch: AtomicU64::new(0),
         }
     }
 
@@ -76,6 +89,10 @@ impl PipelineCounters {
             cycles: self.cycles.load(Ordering::Relaxed),
             last_cycle_duration_ns: self.last_cycle_duration_ns.load(Ordering::Relaxed),
             total_batches: self.total_batches.load(Ordering::Relaxed),
+            checkpoints_completed: self.checkpoints_completed.load(Ordering::Relaxed),
+            checkpoints_failed: self.checkpoints_failed.load(Ordering::Relaxed),
+            last_checkpoint_duration_ms: self.last_checkpoint_duration_ms.load(Ordering::Relaxed),
+            checkpoint_epoch: self.checkpoint_epoch.load(Ordering::Relaxed),
         }
     }
 }
@@ -101,6 +118,14 @@ pub struct CounterSnapshot {
     pub last_cycle_duration_ns: u64,
     /// Total batches processed.
     pub total_batches: u64,
+    /// Total checkpoints completed.
+    pub checkpoints_completed: u64,
+    /// Total checkpoints failed.
+    pub checkpoints_failed: u64,
+    /// Last checkpoint duration in milliseconds.
+    pub last_checkpoint_duration_ms: u64,
+    /// Current checkpoint epoch.
+    pub checkpoint_epoch: u64,
 }
 
 /// Pipeline-wide metrics snapshot.
@@ -321,6 +346,21 @@ mod tests {
         let dbg = format!("{m:?}");
         assert!(dbg.contains("trades"));
         assert!(dbg.contains("1000"));
+    }
+
+    #[test]
+    fn test_checkpoint_counters() {
+        let c = PipelineCounters::new();
+        c.checkpoints_completed.fetch_add(5, Ordering::Relaxed);
+        c.checkpoints_failed.fetch_add(1, Ordering::Relaxed);
+        c.last_checkpoint_duration_ms.store(250, Ordering::Relaxed);
+        c.checkpoint_epoch.store(10, Ordering::Relaxed);
+
+        let s = c.snapshot();
+        assert_eq!(s.checkpoints_completed, 5);
+        assert_eq!(s.checkpoints_failed, 1);
+        assert_eq!(s.last_checkpoint_duration_ms, 250);
+        assert_eq!(s.checkpoint_epoch, 10);
     }
 
     #[test]

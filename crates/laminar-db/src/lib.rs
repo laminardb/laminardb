@@ -27,6 +27,8 @@
 mod asof_batch;
 mod builder;
 mod catalog;
+/// Unified checkpoint coordination (F-CKP-003).
+pub mod checkpoint_coordinator;
 mod config;
 mod connector_manager;
 mod db;
@@ -34,6 +36,8 @@ mod error;
 mod handle;
 mod metrics;
 mod pipeline_checkpoint;
+/// Unified recovery manager (F-CKP-007).
+pub mod recovery_manager;
 mod sql_utils;
 mod stream_executor;
 mod table_backend;
@@ -67,6 +71,10 @@ pub mod ffi;
 
 pub use builder::LaminarDbBuilder;
 pub use catalog::{SourceCatalog, SourceEntry};
+pub use checkpoint_coordinator::{
+    CheckpointConfig, CheckpointCoordinator, CheckpointPhase, CheckpointResult, CheckpointStats,
+    WalPrepareResult,
+};
 pub use config::LaminarConfig;
 pub use db::LaminarDB;
 pub use error::DbError;
@@ -77,6 +85,7 @@ pub use handle::{
 };
 pub use metrics::{PipelineCounters, PipelineMetrics, PipelineState, SourceMetrics, StreamMetrics};
 pub use pipeline_checkpoint::PipelineCheckpoint;
+pub use recovery_manager::{RecoveredState, RecoveryManager};
 
 /// Re-export the connector registry for custom connector registration.
 pub use laminar_connectors::registry::ConnectorRegistry;
