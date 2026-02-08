@@ -98,7 +98,6 @@ pub struct RecoveryManager<'a> {
     store: &'a dyn CheckpointStore,
 }
 
-#[allow(dead_code)] // Methods used in tests; wired into db.rs in future
 impl<'a> RecoveryManager<'a> {
     /// Creates a new recovery manager using the given checkpoint store.
     #[must_use]

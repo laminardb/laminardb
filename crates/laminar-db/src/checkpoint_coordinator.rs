@@ -609,6 +609,166 @@ impl CheckpointCoordinator {
         &*self.store
     }
 
+    /// Performs a full checkpoint cycle with additional table offsets.
+    ///
+    /// Identical to [`checkpoint()`](Self::checkpoint) but merges
+    /// `extra_table_offsets` into the manifest's `table_offsets` field.
+    /// This is useful for `ReferenceTableSource` instances that are not
+    /// registered as `SourceConnector` but still need their offsets persisted.
+    ///
+    /// # Errors
+    ///
+    /// Returns `DbError::Checkpoint` if any phase fails.
+    #[allow(clippy::too_many_arguments)]
+    pub async fn checkpoint_with_extra_tables(
+        &mut self,
+        operator_states: HashMap<String, Vec<u8>>,
+        watermark: Option<i64>,
+        wal_position: u64,
+        per_core_wal_positions: Vec<u64>,
+        table_store_checkpoint_path: Option<String>,
+        extra_table_offsets: HashMap<String, ConnectorCheckpoint>,
+    ) -> Result<CheckpointResult, DbError> {
+        let start = Instant::now();
+        let checkpoint_id = self.next_checkpoint_id;
+        let epoch = self.epoch;
+
+        info!(
+            checkpoint_id,
+            epoch, "starting checkpoint (with extra tables)"
+        );
+
+        // ── Step 3: Source snapshot ──
+        self.phase = CheckpointPhase::Snapshotting;
+        let source_offsets = self.snapshot_sources(&self.sources).await?;
+        let mut table_offsets = self.snapshot_sources(&self.table_sources).await?;
+
+        // Merge extra table offsets (from ReferenceTableSource instances)
+        for (name, cp) in extra_table_offsets {
+            table_offsets.insert(name, cp);
+        }
+
+        // ── Step 4: Sink pre-commit ──
+        self.phase = CheckpointPhase::PreCommitting;
+        if let Err(e) = self.pre_commit_sinks(epoch).await {
+            self.phase = CheckpointPhase::Idle;
+            self.checkpoints_failed += 1;
+            let duration = start.elapsed();
+            self.emit_checkpoint_metrics(false, epoch, duration);
+            error!(checkpoint_id, epoch, error = %e, "pre-commit failed");
+            return Ok(CheckpointResult {
+                success: false,
+                checkpoint_id,
+                epoch,
+                duration,
+                error: Some(format!("pre-commit failed: {e}")),
+            });
+        }
+
+        // ── Build manifest ──
+        let mut manifest = CheckpointManifest::new(checkpoint_id, epoch);
+        manifest.source_offsets = source_offsets;
+        manifest.table_offsets = table_offsets;
+        manifest.sink_epochs = self.collect_sink_epochs();
+        manifest.watermark = watermark;
+        manifest.wal_position = wal_position;
+        manifest.per_core_wal_positions = per_core_wal_positions;
+        manifest.table_store_checkpoint_path = table_store_checkpoint_path;
+        manifest.is_incremental = self.config.incremental;
+
+        for (name, data) in &operator_states {
+            manifest.operator_states.insert(
+                name.clone(),
+                laminar_storage::checkpoint_manifest::OperatorCheckpoint::inline(data),
+            );
+        }
+
+        // ── Step 5: Persist manifest ──
+        self.phase = CheckpointPhase::Persisting;
+        if let Err(e) = self.store.save(&manifest) {
+            self.phase = CheckpointPhase::Idle;
+            self.checkpoints_failed += 1;
+            let duration = start.elapsed();
+            self.emit_checkpoint_metrics(false, epoch, duration);
+            let _ = self.rollback_sinks(epoch).await;
+            error!(checkpoint_id, epoch, error = %e, "manifest persist failed");
+            return Ok(CheckpointResult {
+                success: false,
+                checkpoint_id,
+                epoch,
+                duration,
+                error: Some(format!("manifest persist failed: {e}")),
+            });
+        }
+
+        // ── Step 6: Sink commit ──
+        self.phase = CheckpointPhase::Committing;
+        if let Err(e) = self.commit_sinks(epoch).await {
+            self.checkpoints_failed += 1;
+            warn!(checkpoint_id, epoch, error = %e, "sink commit partially failed");
+        }
+
+        // ── Success ──
+        self.phase = CheckpointPhase::Idle;
+        self.next_checkpoint_id += 1;
+        self.epoch += 1;
+        self.checkpoints_completed += 1;
+        let duration = start.elapsed();
+        self.last_checkpoint_duration = Some(duration);
+        self.emit_checkpoint_metrics(true, epoch, duration);
+
+        info!(
+            checkpoint_id,
+            epoch,
+            duration_ms = duration.as_millis(),
+            "checkpoint completed"
+        );
+
+        Ok(CheckpointResult {
+            success: true,
+            checkpoint_id,
+            epoch,
+            duration,
+            error: None,
+        })
+    }
+
+    /// Attempts recovery from the latest checkpoint.
+    ///
+    /// Creates a [`RecoveryManager`](crate::recovery_manager::RecoveryManager)
+    /// using the coordinator's store and delegates recovery to it.
+    /// On success, advances `self.epoch` past the recovered epoch so the
+    /// next checkpoint gets a fresh epoch number.
+    ///
+    /// Returns `Ok(None)` for a fresh start (no checkpoint found).
+    ///
+    /// # Errors
+    ///
+    /// Returns `DbError::Checkpoint` if the store itself fails.
+    pub async fn recover(
+        &mut self,
+    ) -> Result<Option<crate::recovery_manager::RecoveredState>, DbError> {
+        use crate::recovery_manager::RecoveryManager;
+
+        let mgr = RecoveryManager::new(&*self.store);
+        let result = mgr
+            .recover(&self.sources, &self.sinks, &self.table_sources)
+            .await?;
+
+        if let Some(ref recovered) = result {
+            // Advance epoch past the recovered one
+            self.epoch = recovered.epoch() + 1;
+            self.next_checkpoint_id = recovered.manifest.checkpoint_id + 1;
+            info!(
+                epoch = self.epoch,
+                checkpoint_id = self.next_checkpoint_id,
+                "coordinator epoch set after recovery"
+            );
+        }
+
+        Ok(result)
+    }
+
     /// Loads the latest manifest from the store.
     ///
     /// # Errors
