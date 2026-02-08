@@ -174,11 +174,7 @@ pub fn encode_standby_status(write_lsn: Lsn, flush_lsn: Lsn, apply_lsn: Lsn) -> 
 /// Currently used for documentation; will be used directly once
 /// `CopyBoth` support is available in `tokio-postgres`.
 #[must_use]
-pub fn build_start_replication_query(
-    slot_name: &str,
-    start_lsn: Lsn,
-    publication: &str,
-) -> String {
+pub fn build_start_replication_query(slot_name: &str, start_lsn: Lsn, publication: &str) -> String {
     format!(
         "START_REPLICATION SLOT {slot_name} LOGICAL {start_lsn} \
          (proto_version '1', publication_names '{publication}')"
@@ -284,7 +280,11 @@ pub async fn ensure_replication_slot(
         .await
         .map_err(|e| ConnectorError::ConnectionFailed(format!("create replication slot: {e}")))?;
 
-    tracing::info!(slot = slot_name, plugin = plugin, "created replication slot");
+    tracing::info!(
+        slot = slot_name,
+        plugin = plugin,
+        "created replication slot"
+    );
     Ok(None)
 }
 
@@ -443,11 +443,8 @@ mod tests {
 
     #[test]
     fn test_build_start_replication_query() {
-        let query = build_start_replication_query(
-            "my_slot",
-            "0/1234ABCD".parse().unwrap(),
-            "my_pub",
-        );
+        let query =
+            build_start_replication_query("my_slot", "0/1234ABCD".parse().unwrap(), "my_pub");
         assert!(query.contains("START_REPLICATION SLOT my_slot LOGICAL 0/1234ABCD"));
         assert!(query.contains("proto_version '1'"));
         assert!(query.contains("publication_names 'my_pub'"));
