@@ -93,6 +93,21 @@ pub trait Record: Send + Sized + 'static {
     fn event_time(&self) -> Option<i64> {
         None
     }
+
+    /// Converts a batch of records to an Arrow `RecordBatch`.
+    ///
+    /// The default implementation converts each record individually and concatenates them.
+    /// Derived implementations can override this to optimize allocation and copying.
+    fn to_record_batch_from_iter<I>(records: I) -> RecordBatch
+    where
+        I: IntoIterator<Item = Self>,
+    {
+        let batches: Vec<RecordBatch> = records.into_iter().map(|r| r.to_record_batch()).collect();
+        if batches.is_empty() {
+            return RecordBatch::new_empty(Self::schema());
+        }
+        arrow::compute::concat_batches(&Self::schema(), &batches).expect("concat failed")
+    }
 }
 
 /// Internal message type that wraps records and control signals.
