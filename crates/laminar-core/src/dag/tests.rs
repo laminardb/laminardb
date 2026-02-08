@@ -2756,3 +2756,161 @@ fn test_watermark_effective_watermark() {
     // Source node effective watermark = own watermark
     assert_eq!(tracker.effective_watermark(src_a), Some(1000));
 }
+
+#[test]
+fn test_watermark_propagation_updated_buffer() {
+    // src -> a -> b
+    let schema = int_schema();
+    let dag = DagBuilder::new()
+        .source("src", schema.clone())
+        .operator("a", schema.clone())
+        .sink_for("a", "b", schema.clone())
+        .connect("src", "a")
+        .build()
+        .unwrap();
+
+    let src_id = dag.node_id_by_name("src").unwrap();
+    let a_id = dag.node_id_by_name("a").unwrap();
+    let b_id = dag.node_id_by_name("b").unwrap();
+
+    let mut tracker = DagWatermarkTracker::from_dag(&dag);
+
+    // Initial update
+    let updated = tracker.update_watermark(src_id, 100).to_vec();
+    assert_eq!(updated.len(), 3);
+    assert!(updated.contains(&(src_id, 100)));
+    assert!(updated.contains(&(a_id, 100)));
+    assert!(updated.contains(&(b_id, 100)));
+
+    // Update with same value - should return empty
+    let updated = tracker.update_watermark(src_id, 100);
+    assert!(updated.is_empty());
+
+    // Update with smaller value - should return empty
+    let updated = tracker.update_watermark(src_id, 50);
+    assert!(updated.is_empty());
+
+    // Advancement
+    let updated = tracker.update_watermark(src_id, 200).to_vec();
+    assert_eq!(updated.len(), 3);
+    assert!(updated.contains(&(src_id, 200)));
+    assert!(updated.contains(&(a_id, 200)));
+    assert!(updated.contains(&(b_id, 200)));
+}
+
+#[test]
+fn test_watermark_diamond_propagation() {
+    //      src
+    //     /   \
+    //    a     b
+    //     \   /
+    //     merge
+    let schema = int_schema();
+    let dag = DagBuilder::new()
+        .source("src", schema.clone())
+        .operator("a", schema.clone())
+        .operator("b", schema.clone())
+        .operator("merge", schema.clone())
+        .connect("src", "a")
+        .connect("src", "b")
+        .connect("a", "merge")
+        .connect("b", "merge")
+        .sink_for("merge", "snk", schema.clone())
+        .build()
+        .unwrap();
+
+    let src_id = dag.node_id_by_name("src").unwrap();
+    let a_id = dag.node_id_by_name("a").unwrap();
+    let b_id = dag.node_id_by_name("b").unwrap();
+    let merge_id = dag.node_id_by_name("merge").unwrap();
+    let snk_id = dag.node_id_by_name("snk").unwrap();
+
+    let mut tracker = DagWatermarkTracker::from_dag(&dag);
+
+    // src advances -> a and b advance, and since they are the only inputs to merge,
+    // merge and snk also advance.
+    let updated = tracker.update_watermark(src_id, 1000).to_vec();
+    assert_eq!(updated.len(), 5);
+    assert!(updated.contains(&(src_id, 1000)));
+    assert!(updated.contains(&(a_id, 1000)));
+    assert!(updated.contains(&(b_id, 1000)));
+    assert!(updated.contains(&(merge_id, 1000)));
+    assert!(updated.contains(&(snk_id, 1000)));
+}
+
+#[test]
+fn test_watermark_complex_fan_in_partial_advancement() {
+    // src1 -> a \
+    //             merge -> snk
+    // src2 -> b /
+    let schema = int_schema();
+    let dag = DagBuilder::new()
+        .source("src1", schema.clone())
+        .source("src2", schema.clone())
+        .operator("a", schema.clone())
+        .operator("b", schema.clone())
+        .operator("merge", schema.clone())
+        .connect("src1", "a")
+        .connect("src2", "b")
+        .connect("a", "merge")
+        .connect("b", "merge")
+        .sink_for("merge", "snk", schema.clone())
+        .build()
+        .unwrap();
+
+    let src1 = dag.node_id_by_name("src1").unwrap();
+    let src2 = dag.node_id_by_name("src2").unwrap();
+    let a = dag.node_id_by_name("a").unwrap();
+    let b = dag.node_id_by_name("b").unwrap();
+    let merge = dag.node_id_by_name("merge").unwrap();
+    let snk = dag.node_id_by_name("snk").unwrap();
+
+    let mut tracker = DagWatermarkTracker::from_dag(&dag);
+
+    // 1. Initialize src1
+    tracker.update_watermark(src1, 1000);
+    assert_eq!(tracker.get_watermark(a), Some(1000));
+    assert_eq!(tracker.get_watermark(merge), None);
+
+    // 2. Initialize src2 with a lower value
+    let updated = tracker.update_watermark(src2, 500).to_vec();
+    assert!(updated.contains(&(src2, 500)));
+    assert!(updated.contains(&(b, 500)));
+    assert!(updated.contains(&(merge, 500)));
+    assert!(updated.contains(&(snk, 500)));
+
+    // 3. Advance src2 but still below src1
+    let updated = tracker.update_watermark(src2, 800).to_vec();
+    assert_eq!(updated.len(), 4);
+    assert!(updated.contains(&(src2, 800)));
+    assert!(updated.contains(&(b, 800)));
+    assert!(updated.contains(&(merge, 800)));
+    assert!(updated.contains(&(snk, 800)));
+
+    // 4. Advance src2 past src1
+    let updated = tracker.update_watermark(src2, 1200).to_vec();
+    assert_eq!(updated.len(), 4);
+    assert!(updated.contains(&(src2, 1200)));
+    assert!(updated.contains(&(b, 1200)));
+    assert!(updated.contains(&(merge, 1000))); // limited by a=1000
+    assert!(updated.contains(&(snk, 1000)));
+
+    assert_eq!(tracker.get_watermark(merge), Some(1000));
+}
+
+#[test]
+fn test_watermark_out_of_bounds_node() {
+    let schema = int_schema();
+    let dag = DagBuilder::new()
+        .source("src", schema.clone())
+        .sink_for("src", "snk", schema)
+        .build()
+        .unwrap();
+
+    let mut tracker = DagWatermarkTracker::from_dag(&dag);
+    let updated = tracker.update_watermark(NodeId(999), 1000);
+    assert!(updated.is_empty());
+
+    assert_eq!(tracker.get_watermark(NodeId(999)), None);
+    assert_eq!(tracker.effective_watermark(NodeId(999)), None);
+}
