@@ -9,41 +9,20 @@
 **Date**: 2026-02-08
 
 ### What Was Accomplished
+- **F027 PostgreSQL CDC Replication I/O** (#44, PR #48) - MERGED
+  - `postgres_io.rs` (NEW, 455 lines): Replication wire format parsing (`XLogData`, `PrimaryKeepalive`), `encode_standby_status` (34-byte 'r' tag), `build_start_replication_query`, `connect` with `replication=database`, `ensure_replication_slot` via `simple_query` (10 unit tests)
+  - `source.rs`: Feature-gated `open()` connects to PostgreSQL, resolves slot's `confirmed_flush_lsn`; `close()` aborts connection handle; `connection_handle` field
+  - `mod.rs`: Registered `postgres_io` module, added `password` config key
+  - **Note**: WAL streaming (`START_REPLICATION` via `CopyBoth`) deferred — `tokio-postgres` 0.7 does not support `CopyBothDuplex`. Wire format + slot management are ready for future integration.
+
+Previous session (2026-02-08):
 - **Unified Checkpoint System (F-CKP-001 through F-CKP-009)** - ALL 9 FEATURES COMPLETE
-  - **F-CKP-001**: Checkpoint Manifest & Store — `CheckpointManifest`, `ConnectorCheckpoint`, `OperatorCheckpoint`, `FileSystemCheckpointStore` with atomic writes (laminar-storage)
-  - **F-CKP-002**: Two-Phase Sink Protocol — `pre_commit()` added to `SinkConnector` trait, implemented for Kafka/PG/Delta/Iceberg sinks, `SinkConnectorCapabilities::with_two_phase_commit()`
-  - **F-CKP-003**: Checkpoint Coordinator — `CheckpointCoordinator` with full checkpoint cycle: source snapshot → sink pre-commit → manifest persist → sink commit/rollback
-  - **F-CKP-004**: Operator State Persistence — `manifest_operators_to_dag_states()` and `dag_snapshot_to_manifest_operators()` conversion functions
-  - **F-CKP-005**: Changelog Buffer Wiring — `ChangelogAwareStore<S>` wrapper (Ring 0, ~2-5ns), `ChangelogSink` trait, `ChangelogDrainer` (Ring 1)
-  - **F-CKP-006**: WAL Checkpoint Coordination — `WalPrepareResult`, `prepare_wal_for_checkpoint()`, `truncate_wal_after_checkpoint()`
-  - **F-CKP-007**: Unified Recovery Manager — `RecoveryManager` loads manifest, restores sources/sinks/tables, `RecoveredState` with error tracking
-  - **F-CKP-008**: End-to-End Recovery Tests — 12 integration tests covering happy path, fresh start, multiple checkpoints, offsets, operator state, WAL, epoch resume, incremental, prune, JSON round-trip
-  - **F-CKP-009**: Checkpoint Observability — `checkpoints_completed/failed`, `last_checkpoint_duration_ms`, `checkpoint_epoch` in `PipelineCounters`
-  - Fixed lakehouse delta/iceberg tests broken by F-CKP-002 two-phase commit refactor
-  - Phase C gate: clippy clean, fmt clean, doc clean (0 warnings), 2,767+ lib tests + 12 integration tests all passing
+  - F-CKP-001 through F-CKP-009: Manifest, two-phase sink, coordinator, operator state, changelog wiring, WAL coordination, recovery manager, end-to-end tests, observability
+  - Phase C gate: clippy clean, fmt clean, doc clean, 2,767+ lib tests + 12 integration tests
 
 Previous session (2026-02-07):
-- **F-OBS-001: Pipeline Observability API** - COMPLETE (23 new tests, 253 laminar-db tests total)
-  - `metrics.rs` (NEW): `PipelineState`, `PipelineCounters` (atomic), `PipelineMetrics`, `SourceMetrics`, `StreamMetrics`, `CounterSnapshot`, `is_backpressured()`, `utilization()` (10 unit tests)
-  - `db.rs`: Added `counters: Arc<PipelineCounters>`, `start_time: Instant` fields; 7 public API methods: `metrics()`, `source_metrics()`, `all_source_metrics()`, `stream_metrics()`, `all_stream_metrics()`, `total_events_processed()`, `counters()`; instrumented both `start_embedded_pipeline` and `start_connector_pipeline` with counter increments for events_ingested/emitted/cycles/batches + cycle timing (13 integration tests)
-  - `handle.rs`: Added `capacity()`, `is_backpressured()` to `SourceHandle<T>` and `pending()`, `capacity()`, `is_backpressured()` to `UntypedSourceHandle`
-  - `catalog.rs`: Added `get_stream_entry()` for stream metrics access
-  - `lib.rs`: Added `mod metrics;` and re-exports for all public metric types
-
-Previous session (2026-02-07):
-- **F-CONN-002D: RocksDB-Backed Persistent Table Store** - COMPLETE (10 new tests, 223 laminar-db tests with rocksdb)
-  - `table_backend.rs` (NEW): `TableBackend` enum (InMemory/Persistent), Arrow IPC serde, `RocksDB` config (bloom filter, LZ4, block-based table), `open_rocksdb_for_tables()` (8 tests)
-  - `table_provider.rs` (NEW): `ReferenceTableProvider` implementing DataFusion `TableProvider` — live scan from `TableStore`, no re-registration needed (5 tests)
-  - `table_store.rs`: Refactored to use `TableBackend`, `row_count` tracking, `new_with_rocksdb()`, `create_table_persistent()`, `maybe_spill_to_rocksdb()`, `checkpoint_rocksdb()`, `is_persistent()`, `drop_table()` drops CF (7 new rocksdb tests)
-  - `db.rs`: DDL `WITH (storage = 'persistent')` parsing, `ReferenceTableProvider` registration, persistent table skip in `sync_table_to_datafusion()`
-  - `connector_manager.rs`: Added `storage` field to `TableRegistration`
-  - `error.rs`: Added `Storage(String)` variant
-  - `pipeline_checkpoint.rs`: Added `table_store_checkpoint_path` field
-  - `config.rs`: Added `table_spill_threshold` (default 1,000,000)
-  - `Cargo.toml`: `rocksdb` feature flag, `arrow-ipc` dep
-  - Platform: Block-based table (not PlainTable — Windows compat), `set_use_direct_reads` Linux-only, `Arc<parking_lot::Mutex<rocksdb::DB>>` for CF management
-
-Previous session (2026-02-07):
+- **F-OBS-001: Pipeline Observability API** - COMPLETE (23 new tests)
+- **F-CONN-002D: RocksDB-Backed Persistent Table Store** - COMPLETE (10 new tests)
 - **F-CONN-002C: PARTIAL Cache Mode & Xor Filter** - COMPLETE (40 new tests)
 - **F-CONN-002B: Connector-Backed Table Population** - COMPLETE (19 new tests)
 - **F-SQL-006: Window Frame (ROWS BETWEEN)** - COMPLETE (22 new tests)
@@ -53,7 +32,7 @@ Previous session (2026-02-07):
 
 ### Where We Left Off
 
-**Phase 3: 63/67 features COMPLETE (94%)**
+**Phase 3: 67/76 features COMPLETE (88%)**
 
 All Phase 1 (12), Phase 1.5 (1), Phase 2 (34), and Unified Checkpoint (9) features are complete.
 See [INDEX.md](./features/INDEX.md) for the full feature-by-feature breakdown.
@@ -61,11 +40,13 @@ See [INDEX.md](./features/INDEX.md) for the full feature-by-feature breakdown.
 **Test counts**: ~2,767 base, ~2,777+ with `rocksdb`, ~3,100+ with all feature flags (`kafka`, `postgres-cdc`, `postgres-sink`, `delta-lake`, `mysql-cdc`, `ffi`, `rocksdb`)
 
 ### Immediate Next Steps
-1. F031B/C/D: Delta Lake advanced (recovery, compaction, schema evolution)
-2. F032A: Iceberg I/O (blocked by iceberg-rust DF 52.0 compat)
-3. Remaining Phase 3 gaps (F029, F030, F033, F058, F061)
+1. F027 follow-ups: TLS support, initial snapshot, auto-reconnect (see plan in `postgres_io.rs` future work)
+2. F031B/C/D: Delta Lake advanced (recovery, compaction, schema evolution)
+3. F032A: Iceberg I/O (blocked by iceberg-rust DF 52.0 compat)
+4. Remaining Phase 3 gaps (F029, F030, F033, F058, F061)
 
 ### Open Issues
+- **tokio-postgres CopyBoth**: v0.7 lacks `CopyBothDuplex` for WAL streaming. Wire format parsing is ready; actual streaming awaits upstream support or a raw TCP approach.
 - **iceberg-rust crate**: Deferred until compatible with workspace DataFusion. Business logic complete in F032.
 - No other blockers.
 
@@ -100,7 +81,7 @@ laminar-sql/src/
 laminar-connectors/src/
   kafka/          # Source, sink, Avro serde, schema registry, partitioner, backpressure
   postgres/       # Sink (COPY BINARY + upsert + exactly-once)
-  cdc/postgres/   # CDC source (pgoutput decoder, Z-set changelog)
+  cdc/postgres/   # CDC source (pgoutput decoder, Z-set changelog, replication I/O)
   cdc/mysql/      # CDC source (binlog decoder, GTID, Z-set changelog)
   lakehouse/      # Delta Lake + Iceberg sinks (buffering, epoch, changelog)
   storage/        # Cloud storage: provider detection, credential resolver, config validation, secret masking
