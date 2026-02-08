@@ -74,11 +74,16 @@ pub struct PostgresCdcSource {
     /// Write LSN (latest position received from server).
     write_lsn: Lsn,
 
-    /// Last time a keepalive was sent.
-    _last_keepalive: Instant,
+    /// Last time a keepalive was sent (used by production I/O path).
+    #[allow(dead_code)]
+    last_keepalive: Instant,
 
     /// Pending WAL messages to process (for testing and batch processing).
     pending_messages: VecDeque<Vec<u8>>,
+
+    /// Background connection task handle (feature-gated).
+    #[cfg(feature = "postgres-cdc")]
+    connection_handle: Option<tokio::task::JoinHandle<()>>,
 }
 
 /// In-progress transaction state.
@@ -108,8 +113,10 @@ impl PostgresCdcSource {
             current_txn: None,
             confirmed_flush_lsn: Lsn::ZERO,
             write_lsn: Lsn::ZERO,
-            _last_keepalive: Instant::now(),
+            last_keepalive: Instant::now(),
             pending_messages: VecDeque::new(),
+            #[cfg(feature = "postgres-cdc")]
+            connection_handle: None,
         }
     }
 
@@ -375,14 +382,37 @@ impl SourceConnector for PostgresCdcSource {
             self.write_lsn = lsn;
         }
 
-        // In production, this would:
-        // 1. Connect to PostgreSQL using tokio-postgres
-        // 2. Create or verify the replication slot
-        // 3. Start the replication stream
-        // 4. Begin receiving WAL data
-        //
-        // For now, the source operates on enqueued WAL data
-        // (see enqueue_wal_data / process_pending_messages).
+        #[cfg(all(feature = "postgres-cdc", not(test)))]
+        {
+            use super::postgres_io;
+
+            // 1. Connect to PostgreSQL with replication=database
+            let (client, handle) = postgres_io::connect(&self.config).await?;
+            self.connection_handle = Some(handle);
+
+            // 2. Ensure replication slot exists
+            let slot_lsn = postgres_io::ensure_replication_slot(
+                &client,
+                &self.config.slot_name,
+                &self.config.output_plugin,
+            )
+            .await?;
+
+            // Use slot's confirmed_flush_lsn if no explicit start LSN
+            if self.config.start_lsn.is_none() {
+                if let Some(lsn) = slot_lsn {
+                    self.confirmed_flush_lsn = lsn;
+                    self.write_lsn = lsn;
+                }
+            }
+
+            // NOTE: WAL streaming (START_REPLICATION) requires the CopyBoth
+            // sub-protocol, which tokio-postgres 0.7 does not yet support.
+            // The query is ready via postgres_io::build_start_replication_query().
+            // Until CopyBoth support is available, WAL data is fed via
+            // enqueue_wal_data() + process_pending_messages().
+            self.last_keepalive = Instant::now();
+        }
 
         self.state = ConnectorState::Running;
         Ok(())
@@ -463,6 +493,12 @@ impl SourceConnector for PostgresCdcSource {
     }
 
     async fn close(&mut self) -> Result<(), ConnectorError> {
+        // Abort the background connection task
+        #[cfg(feature = "postgres-cdc")]
+        if let Some(handle) = self.connection_handle.take() {
+            handle.abort();
+        }
+
         self.state = ConnectorState::Closed;
         self.event_buffer.clear();
         self.pending_messages.clear();
