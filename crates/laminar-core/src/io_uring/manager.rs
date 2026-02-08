@@ -767,7 +767,7 @@ mod tests {
                 assert_eq!(m.mode(), RingMode::Standard);
             }
             Err(e) => {
-                eprintln!("io_uring not available: {e}");
+                tracing::error!("io_uring not available: {e}");
             }
         }
     }
@@ -788,7 +788,7 @@ mod tests {
                 manager.release_buffer(idx);
             }
             Err(e) => {
-                eprintln!("Buffer acquire failed: {e}");
+                tracing::error!("Buffer acquire failed: {e}");
             }
         }
     }
@@ -900,13 +900,13 @@ mod tests {
                 // In some CI environments, io_uring operations may fail
                 // (e.g., containers without proper io_uring support)
                 if !completion.is_success() {
-                    eprintln!("Write completion failed (possibly unsupported environment)");
+                    tracing::error!("Write completion failed (possibly unsupported environment)");
                     return;
                 }
                 assert_eq!(completion.kind(), CompletionKind::Write);
             }
             Err(e) => {
-                eprintln!("Wait failed: {e}");
+                tracing::error!("Wait failed: {e}");
                 return;
             }
         }

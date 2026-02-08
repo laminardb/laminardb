@@ -441,7 +441,7 @@ impl Reactor {
 
             #[cfg(not(any(target_os = "linux", target_os = "windows")))]
             {
-                eprintln!("Warning: CPU affinity is not implemented for this platform");
+                tracing::warn!("CPU affinity is not implemented for this platform");
             }
         }
         Ok(())
@@ -463,7 +463,7 @@ impl Reactor {
             if !outputs.is_empty() {
                 if let Some(sink) = &mut self.sink {
                     if let Err(e) = sink.write(outputs) {
-                        eprintln!("Failed to write to sink: {e}");
+                        tracing::error!("Failed to write to sink: {e}");
                         // Continue processing even if sink fails
                     }
                 }
@@ -483,7 +483,7 @@ impl Reactor {
         // Flush sink before shutdown
         if let Some(sink) = &mut self.sink {
             if let Err(e) = sink.flush() {
-                eprintln!("Failed to flush sink during shutdown: {e}");
+                tracing::error!("Failed to flush sink during shutdown: {e}");
             }
         }
 
@@ -507,7 +507,7 @@ impl Reactor {
             if !outputs.is_empty() {
                 if let Some(sink) = &mut self.sink {
                     if let Err(e) = sink.write(outputs) {
-                        eprintln!("Failed to write final outputs during shutdown: {e}");
+                        tracing::error!("Failed to write final outputs during shutdown: {e}");
                     }
                 }
             }
@@ -516,7 +516,7 @@ impl Reactor {
         // Final flush
         if let Some(sink) = &mut self.sink {
             if let Err(e) = sink.flush() {
-                eprintln!("Failed to flush sink during shutdown: {e}");
+                tracing::error!("Failed to flush sink during shutdown: {e}");
             }
         }
 

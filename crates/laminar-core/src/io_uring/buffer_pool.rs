@@ -381,7 +381,7 @@ mod tests {
         let mut ring = match create_test_ring() {
             Some(r) => r,
             None => {
-                eprintln!("io_uring not available, skipping test");
+                tracing::warn!("io_uring not available, skipping test");
                 return;
             }
         };
@@ -395,7 +395,7 @@ mod tests {
                 assert_eq!(p.acquired_count(), 0);
             }
             Err(e) => {
-                eprintln!("Buffer registration failed: {e}");
+                tracing::warn!("Buffer registration failed: {e}");
             }
         }
     }

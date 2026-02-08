@@ -800,7 +800,7 @@ mod tests {
                 assert_eq!(r.router().pending_count(), 0);
             }
             Err(e) => {
-                eprintln!("io_uring not available: {e}");
+                tracing::error!("io_uring not available: {e}");
             }
         }
     }
@@ -818,7 +818,7 @@ mod tests {
             }
             Err(e) => {
                 // May fail if IOPOLL not available
-                eprintln!("Poll ring not available: {e}");
+                tracing::error!("Poll ring not available: {e}");
             }
         }
     }

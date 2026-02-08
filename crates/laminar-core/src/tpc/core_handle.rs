@@ -548,7 +548,7 @@ fn init_core_thread(
         match CoreRingManager::new(ctx.core_id, io_uring_config) {
             Ok(manager) => Some(manager),
             Err(e) => {
-                eprintln!(
+                tracing::error!(
                     "Core {}: Failed to initialize io_uring ring: {e}. Falling back to standard I/O.",
                     ctx.core_id
                 );
@@ -607,7 +607,7 @@ fn core_thread_main(
             match message {
                 CoreMessage::Event(event) => {
                     if let Err(e) = reactor.submit(event) {
-                        eprintln!("Core {}: Failed to submit event: {e}", ctx.core_id);
+                        tracing::error!("Core {}: Failed to submit event: {e}", ctx.core_id);
                     }
                     messages_processed += 1;
                     had_work = true;
