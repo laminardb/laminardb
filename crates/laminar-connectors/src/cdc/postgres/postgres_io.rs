@@ -315,7 +315,7 @@ mod tests {
                 assert_eq!(server_time_us, 1_234_567_890);
                 assert_eq!(data, b"hello pgoutput");
             }
-            _ => panic!("expected XLogData"),
+            ReplicationMessage::PrimaryKeepalive { .. } => panic!("expected XLogData"),
         }
     }
 
@@ -331,7 +331,7 @@ mod tests {
             ReplicationMessage::XLogData { data, .. } => {
                 assert!(data.is_empty());
             }
-            _ => panic!("expected XLogData"),
+            ReplicationMessage::PrimaryKeepalive { .. } => panic!("expected XLogData"),
         }
     }
 
@@ -355,7 +355,7 @@ mod tests {
                 assert_eq!(server_time_us, 9_876_543_210);
                 assert!(reply_requested);
             }
-            _ => panic!("expected PrimaryKeepalive"),
+            ReplicationMessage::XLogData { .. } => panic!("expected PrimaryKeepalive"),
         }
     }
 
@@ -373,7 +373,7 @@ mod tests {
             } => {
                 assert!(!reply_requested);
             }
-            _ => panic!("expected PrimaryKeepalive"),
+            ReplicationMessage::XLogData { .. } => panic!("expected PrimaryKeepalive"),
         }
     }
 
