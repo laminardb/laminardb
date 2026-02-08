@@ -317,7 +317,8 @@ impl<'a> Cursor<'a> {
 
 /// Converts a `PostgreSQL` timestamp (microseconds since 2000-01-01) to
 /// milliseconds since Unix epoch (1970-01-01).
-fn pg_timestamp_to_unix_ms(pg_us: i64) -> i64 {
+#[must_use]
+pub fn pg_timestamp_to_unix_ms(pg_us: i64) -> i64 {
     (pg_us + PG_EPOCH_OFFSET_US) / 1000
 }
 

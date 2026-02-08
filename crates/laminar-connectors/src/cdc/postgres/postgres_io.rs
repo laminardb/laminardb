@@ -5,20 +5,15 @@
 //!
 //! # Architecture
 //!
-//! - **Connection & slot management** (`connect`, `ensure_replication_slot`):
-//!   Feature-gated behind `postgres-cdc`, uses `tokio-postgres` `simple_query`.
+//! - **Control-plane connection** (`connect`, `ensure_replication_slot`):
+//!   Feature-gated behind `postgres-cdc`, uses `tokio-postgres` for slot
+//!   management and metadata queries.
+//! - **Replication streaming**: WAL streaming uses `pgwire-replication` which
+//!   implements the `CopyBoth` sub-protocol natively. See
+//!   `build_replication_config()` for config conversion.
 //! - **Wire format** (`parse_replication_message`, `encode_standby_status`,
-//!   `build_start_replication_query`): Always available, fully unit-tested
-//!   without a `PostgreSQL` server.
-//!
-//! # `CopyBoth` Streaming
-//!
-//! `PostgreSQL` logical replication uses the `CopyBoth` sub-protocol for
-//! bidirectional WAL streaming. `tokio-postgres` 0.7 does not yet
-//! support `CopyBoth`. The wire format parsing in this module is ready
-//! for integration once `CopyBoth` support is available (via a future
-//! `tokio-postgres` release or `pgwire-replication` crate). Until then,
-//! WAL data is fed via `PostgresCdcSource::enqueue_wal_data()`.
+//!   `build_start_replication_query`): Always available, retained as test
+//!   utilities and protocol documentation.
 //!
 //! # Wire Format
 //!
@@ -183,7 +178,11 @@ pub fn build_start_replication_query(slot_name: &str, start_lsn: Lsn, publicatio
 
 // ── Feature-gated I/O functions ──
 
-/// Connects to `PostgreSQL` with `replication=database` enabled.
+/// Connects to `PostgreSQL` as a regular (control-plane) connection.
+///
+/// This connection is used for slot management and metadata queries.
+/// WAL streaming uses a separate `pgwire-replication` client (see
+/// `build_replication_config()`).
 ///
 /// Spawns a background task to drive the connection. The caller must
 /// keep the returned `JoinHandle` alive; dropping it will close the
@@ -204,14 +203,12 @@ pub async fn connect(
 ) -> Result<(tokio_postgres::Client, tokio::task::JoinHandle<()>), ConnectorError> {
     use super::config::SslMode;
 
-    // Build connection string with replication=database
-    let mut conn_str = config.connection_string();
-    conn_str.push_str(" replication=database");
+    let conn_str = config.connection_string();
 
     if config.ssl_mode != SslMode::Disable {
         tracing::warn!(
             ssl_mode = %config.ssl_mode,
-            "TLS not yet supported for replication connections; falling back to NoTls"
+            "TLS not yet supported for control-plane connections; falling back to NoTls"
         );
     }
 
@@ -221,7 +218,7 @@ pub async fn connect(
 
     let handle = tokio::spawn(async move {
         if let Err(e) = connection.await {
-            tracing::error!(error = %e, "PostgreSQL replication connection error");
+            tracing::error!(error = %e, "PostgreSQL control-plane connection error");
         }
     });
 
@@ -233,8 +230,9 @@ pub async fn connect(
 /// Returns the slot's `confirmed_flush_lsn` if the slot already exists
 /// (useful for resuming replication from the last acknowledged position).
 ///
-/// Uses `simple_query` for the `CREATE_REPLICATION_SLOT` command since
-/// it is a replication-mode command (not a regular SQL statement).
+/// Uses a regular (non-replication) connection. Slot creation uses the
+/// `pg_create_logical_replication_slot()` SQL function which works on
+/// standard connections.
 ///
 /// # Errors
 ///
@@ -245,8 +243,7 @@ pub async fn ensure_replication_slot(
     slot_name: &str,
     plugin: &str,
 ) -> Result<Option<Lsn>, ConnectorError> {
-    // Check if slot already exists via simple_query (replication connections
-    // don't support extended query protocol for system catalog queries)
+    // Check if slot already exists
     let query = format!(
         "SELECT confirmed_flush_lsn FROM pg_replication_slots \
          WHERE slot_name = '{slot_name}'"
@@ -272,9 +269,9 @@ pub async fn ensure_replication_slot(
         }
     }
 
-    // Slot doesn't exist — create it
+    // Slot doesn't exist — create it via SQL function (works on regular connections)
     let create_sql =
-        format!("CREATE_REPLICATION_SLOT {slot_name} LOGICAL {plugin} NOEXPORT_SNAPSHOT");
+        format!("SELECT pg_create_logical_replication_slot('{slot_name}', '{plugin}')");
     client
         .simple_query(&create_sql)
         .await
@@ -286,6 +283,60 @@ pub async fn ensure_replication_slot(
         "created replication slot"
     );
     Ok(None)
+}
+
+/// Builds a [`pgwire_replication::ReplicationConfig`] from a
+/// [`PostgresCdcConfig`](super::config::PostgresCdcConfig).
+///
+/// Maps connection parameters, replication slot, publication, start LSN,
+/// and keepalive interval. TLS mapping uses `TlsConfig::disabled()` for
+/// `Disable`, and `TlsConfig::require()` for `Require`/`VerifyCa`/`VerifyFull`
+/// (CA cert path support is a follow-up).
+///
+/// # Note
+///
+/// `pgwire-replication` manages slot creation externally — use
+/// `ensure_replication_slot()` before calling this.
+#[cfg(feature = "postgres-cdc")]
+pub fn build_replication_config(
+    config: &super::config::PostgresCdcConfig,
+) -> pgwire_replication::ReplicationConfig {
+    use super::config::SslMode;
+
+    let tls = match config.ssl_mode {
+        // For Disable/Prefer we leave TLS disabled since we don't have cert
+        // paths yet. This matches the current `connect()` behavior.
+        SslMode::Disable | SslMode::Prefer => pgwire_replication::TlsConfig::disabled(),
+        SslMode::Require | SslMode::VerifyCa | SslMode::VerifyFull => {
+            tracing::warn!(
+                ssl_mode = %config.ssl_mode,
+                "TLS cert paths not yet configured for pgwire-replication; using disabled"
+            );
+            pgwire_replication::TlsConfig::disabled()
+        }
+    };
+
+    let start_lsn = config
+        .start_lsn
+        .map_or(pgwire_replication::Lsn::ZERO, |lsn| {
+            pgwire_replication::Lsn::from_u64(lsn.as_u64())
+        });
+
+    pgwire_replication::ReplicationConfig {
+        host: config.host.clone(),
+        port: config.port,
+        user: config.username.clone(),
+        password: config.password.clone().unwrap_or_default(),
+        database: config.database.clone(),
+        tls,
+        slot: config.slot_name.clone(),
+        publication: config.publication.clone(),
+        start_lsn,
+        stop_at_lsn: None,
+        status_interval: config.keepalive_interval,
+        idle_wakeup_interval: config.poll_timeout,
+        buffer_events: 8192,
+    }
 }
 
 #[cfg(test)]

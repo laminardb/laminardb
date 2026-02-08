@@ -84,6 +84,10 @@ pub struct PostgresCdcSource {
     /// Background connection task handle (feature-gated).
     #[cfg(feature = "postgres-cdc")]
     connection_handle: Option<tokio::task::JoinHandle<()>>,
+
+    /// `pgwire-replication` client for WAL streaming (feature-gated).
+    #[cfg(feature = "postgres-cdc")]
+    repl_client: Option<pgwire_replication::ReplicationClient>,
 }
 
 /// In-progress transaction state.
@@ -117,6 +121,8 @@ impl PostgresCdcSource {
             pending_messages: VecDeque::new(),
             #[cfg(feature = "postgres-cdc")]
             connection_handle: None,
+            #[cfg(feature = "postgres-cdc")]
+            repl_client: None,
         }
     }
 
@@ -354,6 +360,131 @@ impl PostgresCdcSource {
         }
     }
 
+    /// Receives WAL events from the `pgwire-replication` client and processes
+    /// them into the event buffer.
+    ///
+    /// Loops until `event_buffer.len() >= max_records` or the poll timeout
+    /// expires. After processing, reports the last committed LSN back to
+    /// the server.
+    #[cfg(all(feature = "postgres-cdc", not(test)))]
+    async fn receive_replication_events(
+        &mut self,
+        max_records: usize,
+    ) -> Result<(), ConnectorError> {
+        let Some(mut client) = self.repl_client.take() else {
+            return Ok(());
+        };
+
+        let timeout = self.config.poll_timeout;
+        let mut last_commit_lsn: Option<pgwire_replication::Lsn> = None;
+
+        loop {
+            if self.event_buffer.len() >= max_records {
+                break;
+            }
+
+            let event = match tokio::time::timeout(timeout, client.recv()).await {
+                Ok(Ok(Some(event))) => event,
+                // Stream ended normally or poll timeout — return what we have
+                Ok(Ok(None)) | Err(_) => break,
+                Ok(Err(e)) => {
+                    self.repl_client = Some(client);
+                    return Err(ConnectorError::ReadError(format!(
+                        "replication recv error: {e}"
+                    )));
+                }
+            };
+
+            match self.process_replication_event(&event) {
+                Ok(Some(commit_lsn)) => {
+                    last_commit_lsn = Some(commit_lsn);
+                }
+                Ok(None) => {}
+                Err(e) => {
+                    self.repl_client = Some(client);
+                    return Err(e);
+                }
+            }
+        }
+
+        // Report last committed LSN to the server
+        if let Some(lsn) = last_commit_lsn {
+            client.update_applied_lsn(lsn);
+        }
+
+        self.repl_client = Some(client);
+        Ok(())
+    }
+
+    /// Processes a single `pgwire-replication` event into WAL messages.
+    ///
+    /// Returns `Ok(Some(lsn))` on Commit events (the LSN to report),
+    /// `Ok(None)` for other events.
+    #[cfg(all(feature = "postgres-cdc", not(test)))]
+    fn process_replication_event(
+        &mut self,
+        event: &pgwire_replication::ReplicationEvent,
+    ) -> Result<Option<pgwire_replication::Lsn>, ConnectorError> {
+        use super::decoder::pg_timestamp_to_unix_ms;
+
+        match event {
+            pgwire_replication::ReplicationEvent::Begin {
+                final_lsn,
+                xid,
+                commit_time_micros,
+            } => {
+                let begin = super::decoder::BeginMessage {
+                    final_lsn: Lsn::new(final_lsn.as_u64()),
+                    commit_ts_ms: pg_timestamp_to_unix_ms(*commit_time_micros),
+                    xid: *xid,
+                };
+                self.process_wal_message(WalMessage::Begin(begin))?;
+                Ok(None)
+            }
+
+            pgwire_replication::ReplicationEvent::XLogData { wal_end, data, .. } => {
+                // pgwire-replication delivers Begin/Commit as separate events,
+                // but XLogData may still carry pgoutput Begin(b'B') or
+                // Commit(b'C') bytes — skip those to avoid double-processing.
+                if !data.is_empty() && (data[0] == b'B' || data[0] == b'C') {
+                    self.write_lsn = Lsn::new(wal_end.as_u64());
+                    return Ok(None);
+                }
+
+                let msg = decode_message(data)
+                    .map_err(|e| ConnectorError::ReadError(format!("pgoutput decode: {e}")))?;
+                self.process_wal_message(msg)?;
+                self.write_lsn = Lsn::new(wal_end.as_u64());
+                Ok(None)
+            }
+
+            pgwire_replication::ReplicationEvent::Commit {
+                end_lsn,
+                commit_time_micros,
+                lsn,
+            } => {
+                let commit = super::decoder::CommitMessage {
+                    flags: 0,
+                    commit_lsn: Lsn::new(lsn.as_u64()),
+                    end_lsn: Lsn::new(end_lsn.as_u64()),
+                    commit_ts_ms: pg_timestamp_to_unix_ms(*commit_time_micros),
+                };
+                self.process_wal_message(WalMessage::Commit(commit))?;
+                Ok(Some(*end_lsn))
+            }
+
+            pgwire_replication::ReplicationEvent::KeepAlive { wal_end, .. } => {
+                self.write_lsn = Lsn::new(wal_end.as_u64());
+                self.last_keepalive = Instant::now();
+                Ok(None)
+            }
+
+            // Message and StoppedAt are no-ops for CDC processing
+            pgwire_replication::ReplicationEvent::Message { .. }
+            | pgwire_replication::ReplicationEvent::StoppedAt { .. } => Ok(None),
+        }
+    }
+
     /// Drains up to `max` events from the buffer and converts to a `RecordBatch`.
     fn drain_events(&mut self, max: usize) -> Result<Option<RecordBatch>, ConnectorError> {
         if self.event_buffer.is_empty() {
@@ -386,7 +517,7 @@ impl SourceConnector for PostgresCdcSource {
         {
             use super::postgres_io;
 
-            // 1. Connect to PostgreSQL with replication=database
+            // 1. Connect control-plane for slot management
             let (client, handle) = postgres_io::connect(&self.config).await?;
             self.connection_handle = Some(handle);
 
@@ -406,11 +537,20 @@ impl SourceConnector for PostgresCdcSource {
                 }
             }
 
-            // NOTE: WAL streaming (START_REPLICATION) requires the CopyBoth
-            // sub-protocol, which tokio-postgres 0.7 does not yet support.
-            // The query is ready via postgres_io::build_start_replication_query().
-            // Until CopyBoth support is available, WAL data is fed via
-            // enqueue_wal_data() + process_pending_messages().
+            // 3. Build pgwire-replication config and start WAL streaming
+            let mut repl_config = postgres_io::build_replication_config(&self.config);
+            // If we resolved a slot LSN, override start_lsn so we resume correctly
+            if self.confirmed_flush_lsn != Lsn::ZERO {
+                repl_config.start_lsn =
+                    pgwire_replication::Lsn::from_u64(self.confirmed_flush_lsn.as_u64());
+            }
+
+            let repl_client = pgwire_replication::ReplicationClient::connect(repl_config)
+                .await
+                .map_err(|e| {
+                    ConnectorError::ConnectionFailed(format!("pgwire-replication connect: {e}"))
+                })?;
+            self.repl_client = Some(repl_client);
             self.last_keepalive = Instant::now();
         }
 
@@ -429,7 +569,11 @@ impl SourceConnector for PostgresCdcSource {
             });
         }
 
-        // Process any pending WAL messages
+        // Receive events from pgwire-replication WAL stream (production path)
+        #[cfg(all(feature = "postgres-cdc", not(test)))]
+        self.receive_replication_events(max_records).await?;
+
+        // Process any pending WAL messages (test injection path)
         self.process_pending_messages()?;
 
         // Drain buffered events into a RecordBatch
@@ -493,7 +637,13 @@ impl SourceConnector for PostgresCdcSource {
     }
 
     async fn close(&mut self) -> Result<(), ConnectorError> {
-        // Abort the background connection task
+        // Shut down the pgwire-replication WAL streaming client
+        #[cfg(feature = "postgres-cdc")]
+        if let Some(mut client) = self.repl_client.take() {
+            let _ = client.shutdown().await;
+        }
+
+        // Abort the background control-plane connection task
         #[cfg(feature = "postgres-cdc")]
         if let Some(handle) = self.connection_handle.take() {
             handle.abort();
