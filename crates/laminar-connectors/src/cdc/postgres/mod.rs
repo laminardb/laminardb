@@ -37,6 +37,7 @@ pub mod config;
 pub mod decoder;
 pub mod lsn;
 pub mod metrics;
+pub mod postgres_io;
 pub mod schema;
 pub mod source;
 pub mod types;
@@ -77,6 +78,7 @@ fn postgres_cdc_config_keys() -> Vec<ConfigKeySpec> {
         ConfigKeySpec::required("publication", "Publication name"),
         ConfigKeySpec::optional("port", "PostgreSQL port", "5432"),
         ConfigKeySpec::optional("username", "Connection username", "postgres"),
+        ConfigKeySpec::optional("password", "Connection password", ""),
         ConfigKeySpec::optional("ssl.mode", "SSL mode (disable/prefer/require)", "prefer"),
         ConfigKeySpec::optional(
             "snapshot.mode",
