@@ -198,20 +198,13 @@ impl NumaAllocator {
     ///
     /// # Note
     ///
-    /// On non-Linux platforms, you must pass the same alignment used during
-    /// allocation. Use the overload with alignment parameter for non-Linux,
-    /// or ensure you only use this on Linux.
-    pub unsafe fn dealloc(&self, ptr: *mut u8, size: usize) {
-        self.dealloc_with_align(ptr, size, 64);
-    }
-
-    /// Deallocate NUMA-allocated memory with explicit alignment.
+    /// Deallocate NUMA-allocated memory.
     ///
     /// # Safety
     ///
     /// The pointer must have been allocated by this allocator with the same
     /// size and alignment.
-    pub unsafe fn dealloc_with_align(&self, ptr: *mut u8, size: usize, align: usize) {
+    pub unsafe fn dealloc(&self, ptr: *mut u8, size: usize, align: usize) {
         if ptr.is_null() || size == 0 {
             return;
         }
@@ -232,6 +225,17 @@ impl NumaAllocator {
                 std::alloc::dealloc(ptr, layout);
             }
         }
+    }
+
+    /// Deallocate NUMA-allocated memory with explicit alignment.
+    ///
+    /// # Safety
+    ///
+    /// The pointer must have been allocated by this allocator with the same
+    /// size and alignment.
+    #[deprecated(since = "0.2.0", note = "Use `dealloc` which now accepts alignment")]
+    pub unsafe fn dealloc_with_align(&self, ptr: *mut u8, size: usize, align: usize) {
+        self.dealloc(ptr, size, align);
     }
 
     /// Allocate memory using mmap.
@@ -740,7 +744,7 @@ mod tests {
         let ptr = allocator.alloc_local(4096, 64).unwrap();
         assert!(!ptr.is_null());
 
-        unsafe { allocator.dealloc(ptr, 4096) };
+        unsafe { allocator.dealloc(ptr, 4096, 64) };
     }
 
     #[test]
@@ -751,7 +755,7 @@ mod tests {
         let ptr = allocator.alloc_on_node(0, 4096, 64).unwrap();
         assert!(!ptr.is_null());
 
-        unsafe { allocator.dealloc(ptr, 4096) };
+        unsafe { allocator.dealloc(ptr, 4096, 64) };
     }
 
     #[test]
@@ -771,7 +775,7 @@ mod tests {
         let ptr = allocator.alloc_interleaved(64 * 1024, 64).unwrap();
         assert!(!ptr.is_null());
 
-        unsafe { allocator.dealloc(ptr, 64 * 1024) };
+        unsafe { allocator.dealloc(ptr, 64 * 1024, 64) };
     }
 
     #[test]
@@ -784,21 +788,21 @@ mod tests {
             .alloc_with_placement(NumaPlacement::Local(0), 4096, 64)
             .unwrap();
         assert!(!ptr.is_null());
-        unsafe { allocator.dealloc(ptr, 4096) };
+        unsafe { allocator.dealloc(ptr, 4096, 64) };
 
         // Interleaved
         let ptr = allocator
             .alloc_with_placement(NumaPlacement::Interleaved, 4096, 64)
             .unwrap();
         assert!(!ptr.is_null());
-        unsafe { allocator.dealloc(ptr, 4096) };
+        unsafe { allocator.dealloc(ptr, 4096, 64) };
 
         // Any
         let ptr = allocator
             .alloc_with_placement(NumaPlacement::Any, 4096, 64)
             .unwrap();
         assert!(!ptr.is_null());
-        unsafe { allocator.dealloc(ptr, 4096) };
+        unsafe { allocator.dealloc(ptr, 4096, 64) };
     }
 
     #[test]
@@ -922,6 +926,26 @@ mod tests {
             assert!(node.is_some());
         }
 
-        unsafe { allocator.dealloc(ptr, 4096) };
+        unsafe { allocator.dealloc(ptr, 4096, 64) };
+    }
+}
+
+#[cfg(test)]
+mod custom_alignment_test {
+    use super::*;
+
+    #[test]
+    fn test_alloc_custom_alignment() {
+        let topo = NumaTopology::detect();
+        let allocator = NumaAllocator::new(&topo);
+        let align = 128;
+        let size = 4096;
+
+        // Allocate with 128 byte alignment
+        let ptr = allocator.alloc_local(size, align).unwrap();
+        assert!(!ptr.is_null());
+
+        // This call now explicitly uses the correct alignment, which is safe on all platforms.
+        unsafe { allocator.dealloc(ptr, size, align) };
     }
 }
