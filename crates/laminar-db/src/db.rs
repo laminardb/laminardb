@@ -911,6 +911,7 @@ impl LaminarDB {
     ///
     /// Used by `api::Connection::subscribe` to create an `ArrowSubscription`
     /// without requiring the `FromBatch` trait bound.
+    #[cfg(feature = "api")]
     pub(crate) fn subscribe_raw(
         &self,
         name: &str,
