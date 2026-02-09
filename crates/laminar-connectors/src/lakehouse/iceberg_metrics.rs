@@ -6,8 +6,8 @@
 
 use std::sync::atomic::{AtomicI64, AtomicU64, Ordering};
 
-use crate::metrics::ConnectorMetrics;
 use super::metrics::LakehouseSinkMetrics;
+use crate::metrics::ConnectorMetrics;
 
 /// Atomic counters for Iceberg sink connector statistics.
 #[derive(Debug)]

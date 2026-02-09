@@ -6,8 +6,8 @@
 
 use std::sync::atomic::{AtomicU64, Ordering};
 
-use crate::metrics::ConnectorMetrics;
 use super::metrics::LakehouseSinkMetrics;
+use crate::metrics::ConnectorMetrics;
 
 /// Atomic counters for Delta Lake sink connector statistics.
 #[derive(Debug)]
