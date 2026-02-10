@@ -19,6 +19,12 @@ io-uring = ["dep:io-uring"]
 hwloc = ["dep:hwlocality"]
 # Enable XDP/eBPF network optimization (Linux 4.15+ only)
 xdp = ["dep:libbpf-rs"]
+# Enable Cranelift JIT compilation for Ring 0 expressions
+jit = [
+    "dep:cranelift-codegen", "dep:cranelift-frontend", "dep:cranelift-jit",
+    "dep:cranelift-module", "dep:cranelift-native",
+    "dep:datafusion-expr", "dep:datafusion-common",
+]
 
 [dependencies]
 # Performance critical - no allocations on hot path
@@ -57,6 +63,15 @@ async-trait = { workspace = true }
 
 # SQL parsing (for filter compilation)
 sqlparser = { workspace = true }
+
+# JIT compilation (optional, Cranelift)
+cranelift-codegen = { workspace = true, optional = true }
+cranelift-frontend = { workspace = true, optional = true }
+cranelift-jit = { workspace = true, optional = true }
+cranelift-module = { workspace = true, optional = true }
+cranelift-native = { workspace = true, optional = true }
+datafusion-expr = { workspace = true, optional = true }
+datafusion-common = { workspace = true, optional = true }
 
 # Observability
 tracing = { workspace = true }

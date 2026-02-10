@@ -9,17 +9,20 @@
 **Date**: 2026-02-10
 
 ### What Was Accomplished
-- **F017D+E: Session Emit Strategies + Timer Persistence** — Completes Issue #55
-  - Added `needs_timer_reregistration` flag for lazy timer re-registration after restore
-  - `restore()` sets flag when pending timers are recovered; `process()` re-registers them with `TimerService`
-  - Verified all 5 emit strategies work correctly with session windows (OnWatermark, OnWindowClose, OnUpdate, Changelog, Final)
-  - 5 new tests: OnWatermark no intermediate emits, OnWindowClose no intermediate emits, Changelog timer output, OnUpdate progressive counts, timer re-registration after restore
-  - `on_watermark_advance()` deemed unnecessary — session windows use the same timer-based closure pattern as tumbling/sliding windows
-  - 42 total session window tests, 1,423 laminar-core tests, all passing
+- **F079: Compiled Expression Evaluator** — Cranelift JIT for DataFusion Expr trees
+  - New `jit` feature in laminar-core gating Cranelift 0.128 + datafusion-expr/common
+  - `ExprCompiler` compiles filter (`FilterFn`) and scalar (`ScalarFn`) expressions to native x86-64
+  - Supports: column refs, literals (i8–u64, f32/f64, bool), arithmetic (+−×÷%), all 6 comparisons, AND/OR with short-circuit, NOT, IS NULL/IS NOT NULL, CAST, CASE/WHEN
+  - Full SQL null propagation (NULL in arithmetic → NULL)
+  - Constant folding pre-pass (`fold_constants`) eliminates literal sub-expressions before codegen
+  - 48 new tests, all passing; clippy clean with `-D warnings`
+  - 4 new files: `error.rs`, `jit.rs`, `fold.rs`, `expr.rs` in `compiler/` module
+  - Phase 2.5 Plan Compiler: 2/5 features complete (40%)
 
 Previous session (2026-02-10):
-- **F017B: Session State Refactoring** — Multi-session per key support (commit `5e8dc79`)
-- **F017C: Session Merging & Overlap Detection** — Core fix for Issue #55 (commit `3734954`)
+- **F017D+E: Session Emit Strategies + Timer Persistence** — Completes Issue #55
+- **F017B: Session State Refactoring** — Multi-session per key support
+- **F017C: Session Merging & Overlap Detection** — Core fix for Issue #55
 
 Previous session (2026-02-08):
 - **pgwire-replication integration for PostgreSQL CDC WAL streaming** (PR #74, closes #58)
@@ -29,13 +32,17 @@ Previous session (2026-02-08):
 ### Where We Left Off
 
 **Phase 2: 38/38 features COMPLETE (100%)** ✅
+**Phase 2.5: 2/5 features COMPLETE (40%)** — F078 ✅, F079 ✅
 **Phase 3: 67/76 features COMPLETE (88%)**
 
-Session window hardening (Issue #55): F017B ✅, F017C ✅, F017D ✅, F017E ✅
-
-**Test counts**: ~1,423 laminar-core (base), ~3,100+ with all feature flags
+**Test counts**: ~1,530 laminar-core (with jit), ~3,100+ with all feature flags
 
 ### Immediate Next Steps
+
+**Phase 2.5 Plan Compiler** (next priority):
+1. F080: Plan Compiler Core — compile full DataFusion LogicalPlan to native pipeline
+2. F081: Ring 0/Ring 1 Pipeline Bridge
+3. F082: Streaming Query Lifecycle
 
 **Phase 3 remaining work**:
 1. F027 follow-ups: TLS cert path support for pgwire-replication, initial snapshot, auto-reconnect
@@ -69,6 +76,7 @@ laminar-core/src/
   io_uring/       # io_uring + three-ring I/O
   xdp/            # XDP/eBPF network optimization
   budget/         # Task budget enforcement
+  compiler/       # Plan compiler: EventRow, JIT expr compiler (Cranelift), constant folding
 
 laminar-sql/src/
   parser/         # Streaming SQL: windows, emit, late data, joins, aggregation, analytics, ranking
