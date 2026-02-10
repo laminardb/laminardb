@@ -35,6 +35,7 @@
 
 pub mod alloc;
 pub mod budget;
+pub mod compiler;
 pub mod dag;
 pub mod detect;
 pub mod io_uring;

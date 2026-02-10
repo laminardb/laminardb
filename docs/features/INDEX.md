@@ -7,10 +7,11 @@
 | Phase 1 | 12 | 0 | 0 | 0 | 12 |
 | Phase 1.5 | 1 | 0 | 0 | 0 | 1 |
 | Phase 2 | 38 | 0 | 0 | 0 | 38 |
+| Phase 2.5 | 5 | 4 | 0 | 0 | 1 |
 | Phase 3 | 76 | 9 | 0 | 0 | 67 |
 | Phase 4 | 11 | 11 | 0 | 0 | 0 |
 | Phase 5 | 10 | 10 | 0 | 0 | 0 |
-| **Total** | **148** | **30** | **0** | **0** | **118** |
+| **Total** | **153** | **34** | **0** | **0** | **119** |
 
 ## Status Legend
 
@@ -100,6 +101,22 @@
 | F075 | DataFusion Aggregate Bridge | ✅ | [Link](phase-2/F075-datafusion-aggregate-bridge.md) |
 | F076 | Retractable FIRST/LAST Accumulators | ✅ | [Link](phase-2/F076-retractable-first-last.md) |
 | F077 | Extended Aggregation Parser | ✅ | [Link](phase-2/F077-extended-aggregation-parser.md) |
+
+---
+
+## Phase 2.5: Plan Compiler
+
+> **Status**: 1/5 features complete (20%). Compiles DataFusion logical plans into zero-allocation JIT functions for Ring 0.
+
+See [Plan Compiler Index](plan-compiler/INDEX.md) for architecture details and [research](../research/plan-compiler-research-2026.md) for background.
+
+| ID | Feature | Status | Spec |
+|----|---------|--------|------|
+| F078 | Event Row Format | ✅ | [Link](plan-compiler/F078-event-row-format.md) |
+| F079 | Compiled Expression Evaluator | 📝 | [Link](plan-compiler/F079-compiled-expression-evaluator.md) |
+| F080 | Plan Compiler Core | 📝 | [Link](plan-compiler/F080-plan-compiler-core.md) |
+| F081 | Ring 0/Ring 1 Pipeline Bridge | 📝 | [Link](plan-compiler/F081-ring0-ring1-pipeline-bridge.md) |
+| F082 | Streaming Query Lifecycle | 📝 | [Link](plan-compiler/F082-streaming-query-lifecycle.md) |
 
 ---
 
