@@ -410,6 +410,218 @@ fn bench_checkpoint(c: &mut Criterion) {
     group.finish();
 }
 
+/// Benchmark EOWC (Emit On Window Close) vs other emit strategies
+///
+/// Compares process() throughput and on_timer() latency across
+/// OnWindowClose, OnWatermark, and OnUpdate strategies.
+fn bench_eowc_process(c: &mut Criterion) {
+    use laminar_core::operator::window::{EmitStrategy, TumblingWindowOperator};
+
+    let mut group = c.benchmark_group("eowc_process");
+    group.throughput(Throughput::Elements(100));
+
+    let assigner = TumblingWindowAssigner::from_millis(1000);
+    let aggregator = CountAggregator::new();
+
+    let strategies: Vec<(&str, EmitStrategy)> = vec![
+        ("on_watermark", EmitStrategy::OnWatermark),
+        ("on_window_close", EmitStrategy::OnWindowClose),
+        ("on_update", EmitStrategy::OnUpdate),
+    ];
+
+    for (name, strategy) in &strategies {
+        group.bench_with_input(
+            BenchmarkId::new("100_events", *name),
+            strategy,
+            |b, strategy| {
+                b.iter_batched(
+                    || {
+                        let mut operator = TumblingWindowOperator::with_id(
+                            assigner.clone(),
+                            aggregator.clone(),
+                            Duration::from_millis(0),
+                            "bench_eowc".to_string(),
+                        );
+                        operator.set_emit_strategy(strategy.clone());
+                        let timers = TimerService::new();
+                        let state = InMemoryStore::new();
+                        let watermark_gen = BoundedOutOfOrdernessGenerator::new(100);
+                        (operator, timers, state, watermark_gen)
+                    },
+                    |(mut operator, mut timers, mut state, mut watermark_gen)| {
+                        for ts in (0..100).map(|i| i * 10) {
+                            let event = create_event(ts, 1);
+                            let mut ctx = OperatorContext {
+                                event_time: ts,
+                                processing_time: 0,
+                                timers: &mut timers,
+                                state: &mut state,
+                                watermark_generator: &mut watermark_gen,
+                                operator_index: 0,
+                            };
+                            black_box(operator.process(&event, &mut ctx));
+                        }
+                    },
+                    criterion::BatchSize::SmallInput,
+                )
+            },
+        );
+    }
+
+    group.finish();
+}
+
+/// Benchmark on_timer latency across emit strategies
+///
+/// Measures time to fire a timer and emit results for a window
+/// containing 100 events, comparing all emit strategies.
+fn bench_eowc_timer(c: &mut Criterion) {
+    use laminar_core::operator::window::{EmitStrategy, TumblingWindowOperator};
+
+    let mut group = c.benchmark_group("eowc_timer");
+    group.throughput(Throughput::Elements(1));
+
+    let assigner = TumblingWindowAssigner::from_millis(1000);
+    let aggregator = CountAggregator::new();
+
+    let strategies: Vec<(&str, EmitStrategy)> = vec![
+        ("on_watermark", EmitStrategy::OnWatermark),
+        ("on_window_close", EmitStrategy::OnWindowClose),
+        ("on_update", EmitStrategy::OnUpdate),
+    ];
+
+    for (name, strategy) in &strategies {
+        group.bench_with_input(
+            BenchmarkId::new("fire_100_events", *name),
+            strategy,
+            |b, strategy| {
+                b.iter_batched(
+                    || {
+                        // Setup: populate a window with 100 events
+                        let mut operator = TumblingWindowOperator::with_id(
+                            assigner.clone(),
+                            aggregator.clone(),
+                            Duration::from_millis(0),
+                            "bench_eowc".to_string(),
+                        );
+                        operator.set_emit_strategy(strategy.clone());
+                        let mut timers = TimerService::new();
+                        let mut state = InMemoryStore::new();
+                        let mut watermark_gen = BoundedOutOfOrdernessGenerator::new(100);
+
+                        for ts in (0..100).map(|i| i * 10) {
+                            let event = create_event(ts, 1);
+                            let mut ctx = OperatorContext {
+                                event_time: ts,
+                                processing_time: 0,
+                                timers: &mut timers,
+                                state: &mut state,
+                                watermark_generator: &mut watermark_gen,
+                                operator_index: 0,
+                            };
+                            operator.process(&event, &mut ctx);
+                        }
+
+                        (operator, timers, state, watermark_gen)
+                    },
+                    |(mut operator, mut timers, mut state, mut watermark_gen)| {
+                        let timer = Timer {
+                            key: WindowId::new(0, 1000).to_key(),
+                            timestamp: 1000,
+                        };
+                        let mut ctx = OperatorContext {
+                            event_time: 1000,
+                            processing_time: 1000,
+                            timers: &mut timers,
+                            state: &mut state,
+                            watermark_generator: &mut watermark_gen,
+                            operator_index: 0,
+                        };
+                        let output = operator.on_timer(timer, &mut ctx);
+                        black_box(output)
+                    },
+                    criterion::BatchSize::SmallInput,
+                )
+            },
+        );
+    }
+
+    group.finish();
+}
+
+/// Benchmark full EOWC pipeline: process events + close window
+///
+/// End-to-end benchmark of feeding events into a window and then
+/// closing it, measuring the complete EOWC cycle.
+fn bench_eowc_pipeline(c: &mut Criterion) {
+    use laminar_core::operator::window::{EmitStrategy, TumblingWindowOperator};
+
+    let mut group = c.benchmark_group("eowc_pipeline");
+
+    let assigner = TumblingWindowAssigner::from_millis(1000);
+    let aggregator = CountAggregator::new();
+
+    for event_count in [10u64, 100, 1000] {
+        group.throughput(Throughput::Elements(event_count));
+        group.bench_with_input(
+            BenchmarkId::new("eowc_full_cycle", event_count),
+            &event_count,
+            |b, &count| {
+                b.iter_batched(
+                    || {
+                        let mut operator = TumblingWindowOperator::with_id(
+                            assigner.clone(),
+                            aggregator.clone(),
+                            Duration::from_millis(0),
+                            "bench_eowc".to_string(),
+                        );
+                        operator.set_emit_strategy(EmitStrategy::OnWindowClose);
+                        let timers = TimerService::new();
+                        let state = InMemoryStore::new();
+                        let watermark_gen = BoundedOutOfOrdernessGenerator::new(100);
+                        (operator, timers, state, watermark_gen)
+                    },
+                    |(mut operator, mut timers, mut state, mut watermark_gen)| {
+                        // Process events into the window
+                        let step = 1000 / count as i64;
+                        for i in 0..count as i64 {
+                            let ts = i * step;
+                            let event = create_event(ts, 1);
+                            let mut ctx = OperatorContext {
+                                event_time: ts,
+                                processing_time: 0,
+                                timers: &mut timers,
+                                state: &mut state,
+                                watermark_generator: &mut watermark_gen,
+                                operator_index: 0,
+                            };
+                            operator.process(&event, &mut ctx);
+                        }
+                        // Close the window via timer fire
+                        let timer = Timer {
+                            key: WindowId::new(0, 1000).to_key(),
+                            timestamp: 1000,
+                        };
+                        let mut ctx = OperatorContext {
+                            event_time: 1000,
+                            processing_time: 1000,
+                            timers: &mut timers,
+                            state: &mut state,
+                            watermark_generator: &mut watermark_gen,
+                            operator_index: 0,
+                        };
+                        let output = operator.on_timer(timer, &mut ctx);
+                        black_box(output)
+                    },
+                    criterion::BatchSize::SmallInput,
+                )
+            },
+        );
+    }
+
+    group.finish();
+}
+
 criterion_group!(
     benches,
     bench_window_assign,
@@ -419,5 +631,8 @@ criterion_group!(
     bench_window_emit,
     bench_aggregator_extract,
     bench_checkpoint,
+    bench_eowc_process,
+    bench_eowc_timer,
+    bench_eowc_pipeline,
 );
 criterion_main!(benches);

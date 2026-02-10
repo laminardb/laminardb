@@ -24,6 +24,13 @@ pub enum WindowType {
 ///
 /// This structure holds all the information needed to create and configure
 /// a window operator in Ring 0.
+///
+/// # EMIT ON WINDOW CLOSE
+///
+/// When `emit_strategy` is `OnWindowClose` or `FinalOnly`, use [`validate()`](Self::validate)
+/// to ensure the configuration is valid. These strategies require:
+/// - A watermark definition on the source (timers are driven by watermark)
+/// - A windowed aggregation context (non-windowed queries cannot use EOWC)
 #[derive(Debug, Clone)]
 pub struct WindowOperatorConfig {
     /// The type of window (tumbling, sliding, session)
@@ -169,6 +176,45 @@ impl WindowOperatorConfig {
         self
     }
 
+    /// Validates that the window operator configuration is used in a valid context.
+    ///
+    /// Checks:
+    /// - `EMIT ON WINDOW CLOSE` and `EMIT FINAL` require a watermark on the source
+    /// - `EMIT ON WINDOW CLOSE` and `EMIT FINAL` require a windowed aggregation
+    ///
+    /// # Arguments
+    ///
+    /// * `has_watermark` - Whether the source has a watermark definition
+    /// * `has_window` - Whether the query contains a windowed aggregation
+    ///
+    /// # Errors
+    ///
+    /// Returns `ParseError::WindowError` if validation fails.
+    pub fn validate(&self, has_watermark: bool, has_window: bool) -> Result<(), ParseError> {
+        if matches!(
+            self.emit_strategy,
+            EmitStrategy::OnWindowClose | EmitStrategy::FinalOnly
+        ) {
+            if !has_watermark {
+                return Err(ParseError::WindowError(
+                    "EMIT ON WINDOW CLOSE requires a watermark definition \
+                     on the source. Add WATERMARK FOR <column> AS <expr> \
+                     to the CREATE SOURCE statement."
+                        .to_string(),
+                ));
+            }
+            if !has_window {
+                return Err(ParseError::WindowError(
+                    "EMIT ON WINDOW CLOSE is only valid with windowed \
+                     aggregation queries. Use EMIT ON UPDATE for \
+                     non-windowed queries."
+                        .to_string(),
+                ));
+            }
+        }
+        Ok(())
+    }
+
     /// Check if this configuration supports append-only output.
     ///
     /// Append-only sinks (Kafka, S3, Delta Lake) require emit strategies
@@ -303,5 +349,68 @@ mod tests {
         // With side output
         let config3 = config.with_late_data_side_output("late".to_string());
         assert!(config3.has_late_data_handling());
+    }
+
+    #[test]
+    fn test_eowc_without_watermark_errors() {
+        let config = WindowOperatorConfig::tumbling("ts".to_string(), Duration::from_secs(300))
+            .with_emit_strategy(EmitStrategy::OnWindowClose);
+
+        let result = config.validate(false, true);
+        assert!(result.is_err());
+        let err = result.unwrap_err().to_string();
+        assert!(
+            err.contains("watermark"),
+            "Expected watermark error, got: {err}"
+        );
+    }
+
+    #[test]
+    fn test_eowc_without_window_errors() {
+        let config = WindowOperatorConfig::tumbling("ts".to_string(), Duration::from_secs(300))
+            .with_emit_strategy(EmitStrategy::OnWindowClose);
+
+        let result = config.validate(true, false);
+        assert!(result.is_err());
+        let err = result.unwrap_err().to_string();
+        assert!(
+            err.contains("windowed"),
+            "Expected windowed query error, got: {err}"
+        );
+    }
+
+    #[test]
+    fn test_eowc_with_watermark_and_window_passes() {
+        let config = WindowOperatorConfig::tumbling("ts".to_string(), Duration::from_secs(300))
+            .with_emit_strategy(EmitStrategy::OnWindowClose);
+
+        assert!(config.validate(true, true).is_ok());
+    }
+
+    #[test]
+    fn test_final_without_watermark_errors() {
+        let config = WindowOperatorConfig::tumbling("ts".to_string(), Duration::from_secs(300))
+            .with_emit_strategy(EmitStrategy::FinalOnly);
+
+        let result = config.validate(false, true);
+        assert!(result.is_err());
+    }
+
+    #[test]
+    fn test_non_eowc_without_watermark_ok() {
+        // OnUpdate does not require watermark
+        let config = WindowOperatorConfig::tumbling("ts".to_string(), Duration::from_secs(300))
+            .with_emit_strategy(EmitStrategy::OnUpdate);
+        assert!(config.validate(false, false).is_ok());
+
+        // Periodic does not require watermark
+        let config2 = WindowOperatorConfig::tumbling("ts".to_string(), Duration::from_secs(300))
+            .with_emit_strategy(EmitStrategy::Periodic(Duration::from_secs(5)));
+        assert!(config2.validate(false, false).is_ok());
+
+        // Changelog does not require watermark
+        let config3 = WindowOperatorConfig::tumbling("ts".to_string(), Duration::from_secs(300))
+            .with_emit_strategy(EmitStrategy::Changelog);
+        assert!(config3.validate(false, false).is_ok());
     }
 }

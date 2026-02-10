@@ -48,7 +48,7 @@
 
 use super::window::{
     Accumulator, Aggregator, ChangelogRecord, EmitStrategy, LateDataConfig, LateDataMetrics,
-    ResultToI64, WindowAssigner, WindowId, WindowIdVec,
+    ResultToI64, WindowAssigner, WindowCloseMetrics, WindowId, WindowIdVec,
 };
 use super::{
     Event, Operator, OperatorContext, OperatorError, OperatorState, Output, OutputVec, Timer,
@@ -304,6 +304,8 @@ pub struct SlidingWindowOperator<A: Aggregator> {
     late_data_config: LateDataConfig,
     /// Metrics for late data tracking
     late_data_metrics: LateDataMetrics,
+    /// Metrics for window close tracking
+    window_close_metrics: WindowCloseMetrics,
     /// Operator ID for checkpointing
     operator_id: String,
     /// Cached output schema (avoids allocation on every emit)
@@ -340,6 +342,7 @@ where
             emit_strategy: EmitStrategy::default(),
             late_data_config: LateDataConfig::default(),
             late_data_metrics: LateDataMetrics::new(),
+            window_close_metrics: WindowCloseMetrics::new(),
             operator_id: format!("sliding_window_{operator_num}"),
             output_schema: create_window_output_schema(),
             _phantom: PhantomData,
@@ -366,6 +369,7 @@ where
             emit_strategy: EmitStrategy::default(),
             late_data_config: LateDataConfig::default(),
             late_data_metrics: LateDataMetrics::new(),
+            window_close_metrics: WindowCloseMetrics::new(),
             operator_id,
             output_schema: create_window_output_schema(),
             _phantom: PhantomData,
@@ -403,6 +407,23 @@ where
     /// Resets the late data metrics counters.
     pub fn reset_late_data_metrics(&mut self) {
         self.late_data_metrics.reset();
+    }
+
+    /// Returns the window close metrics.
+    #[must_use]
+    pub fn window_close_metrics(&self) -> &WindowCloseMetrics {
+        &self.window_close_metrics
+    }
+
+    /// Resets the window close metrics counters.
+    pub fn reset_window_close_metrics(&mut self) {
+        self.window_close_metrics.reset();
+    }
+
+    /// Returns the number of windows currently accumulating events.
+    #[must_use]
+    pub fn active_windows_count(&self) -> usize {
+        self.registered_windows.len()
     }
 
     /// Returns the window assigner.
@@ -760,6 +781,10 @@ where
         match batch {
             Ok(data) => {
                 let event = Event::new(window_id.end, data);
+
+                // Record window close metrics
+                self.window_close_metrics
+                    .record_close(window_id.end, ctx.processing_time);
 
                 // F011B: Emit based on strategy
                 match &self.emit_strategy {
@@ -1481,5 +1506,186 @@ mod tests {
             .any(|o| matches!(o, Output::LateEvent(_) | Output::SideOutput { .. }));
         assert!(!is_late);
         assert_eq!(operator.late_data_metrics().late_events_total(), 0);
+    }
+
+    // ========================================================================
+    // EMIT ON WINDOW CLOSE (EOWC) — Sliding Window Tests (Issue #52)
+    // ========================================================================
+
+    #[test]
+    fn test_eowc_sliding_multiple_windows_per_event() {
+        // An event at t=50000 with size=60s, slide=20s belongs to 3 windows.
+        // Each window should emit independently when its timer fires.
+        let assigner = SlidingWindowAssigner::from_millis(60_000, 20_000);
+        let aggregator = CountAggregator::new();
+        let mut operator = SlidingWindowOperator::with_id(
+            assigner,
+            aggregator,
+            Duration::from_millis(0),
+            "eowc_slide".to_string(),
+        );
+        operator.set_emit_strategy(EmitStrategy::OnWindowClose);
+
+        let mut timers = TimerService::new();
+        let mut state = InMemoryStore::new();
+        let mut watermark_gen = BoundedOutOfOrdernessGenerator::new(0);
+
+        // Single event at t=50000
+        // Belongs to windows: [0, 60000), [20000, 80000), [40000, 100000)
+        let event = create_test_event(50_000, 1);
+        let outputs = {
+            let mut ctx = create_test_context(&mut timers, &mut state, &mut watermark_gen);
+            operator.process(&event, &mut ctx)
+        };
+
+        // No intermediate emissions
+        let event_outputs: Vec<_> = outputs
+            .iter()
+            .filter(|o| matches!(o, Output::Event(_)))
+            .collect();
+        assert!(
+            event_outputs.is_empty(),
+            "EOWC sliding should not emit intermediate results"
+        );
+
+        // Fire each window's timer and collect emissions
+        let windows = [
+            WindowId::new(0, 60_000),
+            WindowId::new(20_000, 80_000),
+            WindowId::new(40_000, 100_000),
+        ];
+
+        let mut emission_count = 0;
+        for wid in &windows {
+            let timer = Timer {
+                key: wid.to_key(),
+                timestamp: wid.end,
+            };
+            let out = {
+                let mut ctx = create_test_context(&mut timers, &mut state, &mut watermark_gen);
+                operator.on_timer(timer, &mut ctx)
+            };
+            assert_eq!(
+                out.len(),
+                1,
+                "Each window should emit exactly once (window [{}, {}))",
+                wid.start,
+                wid.end
+            );
+            if let Output::Event(e) = &out[0] {
+                let result = e
+                    .data
+                    .column(2)
+                    .as_any()
+                    .downcast_ref::<Int64Array>()
+                    .unwrap();
+                assert_eq!(result.value(0), 1, "Each window should have count=1");
+            }
+            emission_count += 1;
+        }
+        assert_eq!(
+            emission_count, 3,
+            "Should have 3 separate emissions for 3 overlapping windows"
+        );
+    }
+
+    #[test]
+    fn test_eowc_sliding_no_intermediate_emissions() {
+        // Verify process() never returns Output::Event for OnWindowClose.
+        let assigner = SlidingWindowAssigner::from_millis(1000, 500);
+        let aggregator = CountAggregator::new();
+        let mut operator = SlidingWindowOperator::with_id(
+            assigner,
+            aggregator,
+            Duration::from_millis(0),
+            "eowc_slide".to_string(),
+        );
+        operator.set_emit_strategy(EmitStrategy::OnWindowClose);
+
+        let mut timers = TimerService::new();
+        let mut state = InMemoryStore::new();
+        let mut watermark_gen = BoundedOutOfOrdernessGenerator::new(100);
+
+        // Process events across multiple windows
+        for ts in (0..10).map(|i| i * 200) {
+            let event = create_test_event(ts, 1);
+            let outputs = {
+                let mut ctx = create_test_context(&mut timers, &mut state, &mut watermark_gen);
+                operator.process(&event, &mut ctx)
+            };
+            for output in &outputs {
+                assert!(
+                    !matches!(output, Output::Event(_)),
+                    "process() must not emit Output::Event with OnWindowClose (ts={ts})"
+                );
+            }
+        }
+    }
+
+    #[test]
+    fn test_eowc_sliding_overlapping_window_close_order() {
+        // Verify windows close in chronological order (earliest window_end first).
+        let assigner = SlidingWindowAssigner::from_millis(1000, 500);
+        let aggregator = SumAggregator::new(0);
+        let mut operator = SlidingWindowOperator::with_id(
+            assigner,
+            aggregator,
+            Duration::from_millis(0),
+            "eowc_slide".to_string(),
+        );
+        operator.set_emit_strategy(EmitStrategy::OnWindowClose);
+
+        let mut timers = TimerService::new();
+        let mut state = InMemoryStore::new();
+        let mut watermark_gen = BoundedOutOfOrdernessGenerator::new(0);
+
+        // Event at t=600 belongs to [0, 1000) and [500, 1500)
+        let event = create_test_event(600, 10);
+        {
+            let mut ctx = create_test_context(&mut timers, &mut state, &mut watermark_gen);
+            operator.process(&event, &mut ctx);
+        }
+
+        // Fire window [0, 1000) first (earlier end)
+        let win_timer_1 = Timer {
+            key: WindowId::new(0, 1000).to_key(),
+            timestamp: 1000,
+        };
+        let out1 = {
+            let mut ctx = create_test_context(&mut timers, &mut state, &mut watermark_gen);
+            operator.on_timer(win_timer_1, &mut ctx)
+        };
+        assert_eq!(out1.len(), 1);
+        if let Output::Event(e) = &out1[0] {
+            assert_eq!(e.timestamp, 1000, "First emission at window_end=1000");
+        }
+
+        // Fire window [500, 1500) second (later end)
+        let win_timer_2 = Timer {
+            key: WindowId::new(500, 1500).to_key(),
+            timestamp: 1500,
+        };
+        let out2 = {
+            let mut ctx = create_test_context(&mut timers, &mut state, &mut watermark_gen);
+            operator.on_timer(win_timer_2, &mut ctx)
+        };
+        assert_eq!(out2.len(), 1);
+        if let Output::Event(e) = &out2[0] {
+            assert_eq!(e.timestamp, 1500, "Second emission at window_end=1500");
+            let result = e
+                .data
+                .column(2)
+                .as_any()
+                .downcast_ref::<Int64Array>()
+                .unwrap();
+            assert_eq!(
+                result.value(0),
+                10,
+                "Both windows should contain the event sum=10"
+            );
+        }
+
+        // All windows should be cleaned up
+        assert!(operator.registered_windows.is_empty());
     }
 }

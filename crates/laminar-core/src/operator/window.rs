@@ -59,7 +59,15 @@ use std::time::Duration;
 /// Configuration for late data handling.
 ///
 /// Controls what happens to events that arrive after their window has closed
-/// (i.e., after `window_end + allowed_lateness`).
+/// (i.e., after `watermark >= window_end + allowed_lateness`).
+///
+/// This is particularly important for [`EmitStrategy::OnWindowClose`], where
+/// late events are **never** re-incorporated into a closed window. The choice
+/// is between dropping them silently or routing them to a side output for
+/// separate processing (e.g., a `late_events` topic or table).
+///
+/// For [`EmitStrategy::Final`], late events are always silently dropped
+/// regardless of this configuration.
 ///
 /// # Example
 ///
@@ -167,6 +175,81 @@ impl LateDataMetrics {
     }
 }
 
+/// Metrics for tracking window close behavior.
+///
+/// These counters track window lifecycle events and can be used for
+/// monitoring watermark lag and window throughput. Particularly useful
+/// for [`EmitStrategy::OnWindowClose`] where each window emits exactly
+/// once.
+#[derive(Debug, Clone, Default)]
+pub struct WindowCloseMetrics {
+    /// Total number of windows that have emitted and closed
+    windows_closed_total: u64,
+    /// Sum of close latencies in milliseconds (for computing averages)
+    close_latency_sum_ms: i64,
+    /// Maximum close latency observed (milliseconds)
+    close_latency_max_ms: i64,
+}
+
+impl WindowCloseMetrics {
+    /// Creates a new metrics tracker.
+    #[must_use]
+    pub fn new() -> Self {
+        Self::default()
+    }
+
+    /// Returns the total number of windows that have emitted and closed.
+    #[must_use]
+    pub fn windows_closed_total(&self) -> u64 {
+        self.windows_closed_total
+    }
+
+    /// Returns the average window close latency in milliseconds.
+    ///
+    /// Close latency measures the delay between `window_end` and the
+    /// actual emission time (`processing_time`). This reflects watermark
+    /// lag — how long after the window boundary the watermark advances
+    /// enough to trigger emission.
+    ///
+    /// Returns 0 if no windows have been closed.
+    #[must_use]
+    pub fn avg_close_latency_ms(&self) -> i64 {
+        if self.windows_closed_total == 0 {
+            0
+        } else {
+            self.close_latency_sum_ms / i64::try_from(self.windows_closed_total).unwrap_or(i64::MAX)
+        }
+    }
+
+    /// Returns the maximum close latency observed (milliseconds).
+    #[must_use]
+    pub fn max_close_latency_ms(&self) -> i64 {
+        self.close_latency_max_ms
+    }
+
+    /// Records a window close event.
+    ///
+    /// # Arguments
+    ///
+    /// * `window_end` - The exclusive upper bound of the closed window
+    /// * `processing_time` - The wall-clock time at which the window emitted
+    pub fn record_close(&mut self, window_end: i64, processing_time: i64) {
+        self.windows_closed_total += 1;
+        let latency = processing_time.saturating_sub(window_end).max(0);
+        self.close_latency_sum_ms += latency;
+        if latency > self.close_latency_max_ms {
+            self.close_latency_max_ms = latency;
+        }
+    }
+
+    /// Resets all counters to zero.
+    pub fn reset(&mut self) {
+        self.windows_closed_total = 0;
+        self.close_latency_sum_ms = 0;
+        self.close_latency_max_ms = 0;
+    }
+}
+
 /// Strategy for when window results should be emitted.
 ///
 /// This controls the trade-off between result freshness and efficiency:
@@ -207,12 +290,31 @@ pub enum EmitStrategy {
     /// Emit ONLY when watermark passes window end. No intermediate emissions.
     ///
     /// **Critical for append-only sinks** (Kafka, S3, Delta Lake, Iceberg).
-    /// Unlike `OnWatermark`, this NEVER emits before window close, even with
-    /// late data retractions. Late data is buffered until next window close.
+    /// Guarantees exactly one emission per window and strictly append-only
+    /// output — no retractions, no updates.
     ///
-    /// Key difference from `OnWatermark`:
-    /// - `OnWatermark`: May emit retractions for late data
-    /// - `OnWindowClose`: Buffers late data, only emits final result
+    /// # Window Close Condition
+    ///
+    /// A window closes when `watermark >= window_end + allowed_lateness`.
+    /// At that point, the timer fires, the final result is emitted, and
+    /// window state is purged immediately.
+    ///
+    /// # Late Data Policy
+    ///
+    /// Events arriving after window close are classified as **late** and
+    /// handled by [`LateDataConfig`]:
+    /// - **Default**: dropped (increment `late_events_dropped` metric)
+    /// - **With side output**: routed to named side output for separate
+    ///   processing (increment `late_events_side_output` metric)
+    ///
+    /// Late data **never** re-opens a closed window. The single emission
+    /// is final and immutable. This is the key contract that makes EOWC
+    /// safe for append-only sinks.
+    ///
+    /// # Requires
+    ///
+    /// - A watermark definition on the source (otherwise timers never fire)
+    /// - A windowed aggregation query
     ///
     /// SQL: `EMIT ON WINDOW CLOSE`
     OnWindowClose,
@@ -312,8 +414,8 @@ impl EmitStrategy {
     /// - `Changelog`: emits -old/+new pair
     ///
     /// Strategies that do NOT generate retractions:
-    /// - `OnWindowClose`: buffers late data
-    /// - `Final`: drops late data
+    /// - `OnWindowClose`: drops late data (or routes to side output)
+    /// - `Final`: drops late data silently
     /// - `Periodic`: depends on whether window is still open
     #[must_use]
     pub fn generates_retractions(&self) -> bool {
@@ -3061,6 +3163,8 @@ pub struct TumblingWindowOperator<A: Aggregator> {
     late_data_config: LateDataConfig,
     /// Metrics for late data tracking
     late_data_metrics: LateDataMetrics,
+    /// Metrics for window close tracking
+    window_close_metrics: WindowCloseMetrics,
     /// Operator ID for checkpointing
     operator_id: String,
     /// Cached output schema (avoids allocation on every emit)
@@ -3117,6 +3221,7 @@ where
             emit_strategy: EmitStrategy::default(),
             late_data_config: LateDataConfig::default(),
             late_data_metrics: LateDataMetrics::new(),
+            window_close_metrics: WindowCloseMetrics::new(),
             operator_id: format!("tumbling_window_{operator_num}"),
             output_schema: create_window_output_schema(),
             _phantom: PhantomData,
@@ -3145,6 +3250,7 @@ where
             emit_strategy: EmitStrategy::default(),
             late_data_config: LateDataConfig::default(),
             late_data_metrics: LateDataMetrics::new(),
+            window_close_metrics: WindowCloseMetrics::new(),
             operator_id,
             output_schema: create_window_output_schema(),
             _phantom: PhantomData,
@@ -3230,6 +3336,25 @@ where
     /// Resets the late data metrics counters.
     pub fn reset_late_data_metrics(&mut self) {
         self.late_data_metrics.reset();
+    }
+
+    /// Returns the window close metrics.
+    ///
+    /// Use this to monitor window close throughput and watermark lag.
+    #[must_use]
+    pub fn window_close_metrics(&self) -> &WindowCloseMetrics {
+        &self.window_close_metrics
+    }
+
+    /// Resets the window close metrics counters.
+    pub fn reset_window_close_metrics(&mut self) {
+        self.window_close_metrics.reset();
+    }
+
+    /// Returns the number of windows currently accumulating events.
+    #[must_use]
+    pub fn active_windows_count(&self) -> usize {
+        self.registered_windows.len()
     }
 
     /// Returns the window assigner.
@@ -3600,6 +3725,10 @@ where
         match batch {
             Ok(data) => {
                 let event = Event::new(window_id.end, data);
+
+                // Record window close metrics
+                self.window_close_metrics
+                    .record_close(window_id.end, ctx.processing_time);
 
                 // F011B: Emit based on strategy
                 match &self.emit_strategy {

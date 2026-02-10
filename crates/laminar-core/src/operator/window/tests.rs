@@ -1973,3 +1973,647 @@ fn test_f64_factory_types() {
     let avg_factory = AvgF64Factory::new(0, "average");
     assert_eq!(avg_factory.type_tag(), "avg_f64");
 }
+
+// ============================================================================
+// Window Close Metrics Tests
+// ============================================================================
+
+#[test]
+fn test_window_close_metrics_basic() {
+    let mut metrics = WindowCloseMetrics::new();
+    assert_eq!(metrics.windows_closed_total(), 0);
+    assert_eq!(metrics.avg_close_latency_ms(), 0);
+    assert_eq!(metrics.max_close_latency_ms(), 0);
+
+    // Record a close with 500ms latency (window_end=1000, processing_time=1500)
+    metrics.record_close(1000, 1500);
+    assert_eq!(metrics.windows_closed_total(), 1);
+    assert_eq!(metrics.avg_close_latency_ms(), 500);
+    assert_eq!(metrics.max_close_latency_ms(), 500);
+
+    // Record another with 200ms latency
+    metrics.record_close(2000, 2200);
+    assert_eq!(metrics.windows_closed_total(), 2);
+    assert_eq!(metrics.avg_close_latency_ms(), 350); // (500+200)/2
+    assert_eq!(metrics.max_close_latency_ms(), 500);
+
+    // Record another with 1000ms latency (new max)
+    metrics.record_close(3000, 4000);
+    assert_eq!(metrics.windows_closed_total(), 3);
+    assert_eq!(metrics.max_close_latency_ms(), 1000);
+}
+
+#[test]
+fn test_window_close_metrics_reset() {
+    let mut metrics = WindowCloseMetrics::new();
+    metrics.record_close(1000, 1500);
+    metrics.record_close(2000, 2200);
+    assert_eq!(metrics.windows_closed_total(), 2);
+
+    metrics.reset();
+    assert_eq!(metrics.windows_closed_total(), 0);
+    assert_eq!(metrics.avg_close_latency_ms(), 0);
+    assert_eq!(metrics.max_close_latency_ms(), 0);
+}
+
+#[test]
+fn test_tumbling_window_close_metrics_on_timer() {
+    let assigner = TumblingWindowAssigner::from_millis(1000);
+    let aggregator = CountAggregator::new();
+    let mut operator = TumblingWindowOperator::with_id(
+        assigner,
+        aggregator,
+        Duration::from_millis(0),
+        "metrics_test".to_string(),
+    );
+
+    let mut timers = TimerService::new();
+    let mut state = InMemoryStore::new();
+    let mut watermark_gen = BoundedOutOfOrdernessGenerator::new(0);
+
+    // Process events into 2 windows
+    for ts in [100, 400, 700] {
+        let event = create_test_event(ts, 1);
+        let mut ctx = create_test_context(&mut timers, &mut state, &mut watermark_gen);
+        operator.process(&event, &mut ctx);
+    }
+    for ts in [1100, 1500] {
+        let event = create_test_event(ts, 1);
+        let mut ctx = create_test_context(&mut timers, &mut state, &mut watermark_gen);
+        operator.process(&event, &mut ctx);
+    }
+
+    // Verify active windows count
+    assert_eq!(operator.active_windows_count(), 2);
+
+    // Fire window 1
+    let win_timer_1 = Timer {
+        key: WindowId::new(0, 1000).to_key(),
+        timestamp: 1000,
+    };
+    {
+        let mut ctx = create_test_context(&mut timers, &mut state, &mut watermark_gen);
+        operator.on_timer(win_timer_1, &mut ctx);
+    }
+
+    assert_eq!(operator.window_close_metrics().windows_closed_total(), 1);
+    assert_eq!(operator.active_windows_count(), 1);
+
+    // Fire window 2
+    let win_timer_2 = Timer {
+        key: WindowId::new(1000, 2000).to_key(),
+        timestamp: 2000,
+    };
+    {
+        let mut ctx = create_test_context(&mut timers, &mut state, &mut watermark_gen);
+        operator.on_timer(win_timer_2, &mut ctx);
+    }
+
+    assert_eq!(operator.window_close_metrics().windows_closed_total(), 2);
+    assert_eq!(operator.active_windows_count(), 0);
+}
+
+#[test]
+fn test_window_close_metrics_empty_window_not_counted() {
+    let assigner = TumblingWindowAssigner::from_millis(1000);
+    let aggregator = CountAggregator::new();
+    let mut operator = TumblingWindowOperator::with_id(
+        assigner,
+        aggregator,
+        Duration::from_millis(0),
+        "metrics_test".to_string(),
+    );
+
+    let mut timers = TimerService::new();
+    let mut state = InMemoryStore::new();
+    let mut watermark_gen = BoundedOutOfOrdernessGenerator::new(0);
+
+    // Fire timer for empty window — should not count as closed
+    let timer = Timer {
+        key: WindowId::new(0, 1000).to_key(),
+        timestamp: 1000,
+    };
+    {
+        let mut ctx = create_test_context(&mut timers, &mut state, &mut watermark_gen);
+        operator.on_timer(timer, &mut ctx);
+    }
+
+    assert_eq!(
+        operator.window_close_metrics().windows_closed_total(),
+        0,
+        "Empty window should not increment closed counter"
+    );
+}
+
+// ============================================================================
+// EMIT ON WINDOW CLOSE (EOWC) — End-to-End Tests (Issue #52)
+// ============================================================================
+
+#[test]
+fn test_eowc_tumbling_single_window_single_emit() {
+    // Verify: exactly 1 Output::Event with final count after watermark
+    // advances past window_end. No intermediate emissions.
+    let assigner = TumblingWindowAssigner::from_millis(60_000); // 1 minute
+    let aggregator = CountAggregator::new();
+    let mut operator = TumblingWindowOperator::with_id(
+        assigner,
+        aggregator,
+        Duration::from_millis(0),
+        "eowc_test".to_string(),
+    );
+    operator.set_emit_strategy(EmitStrategy::OnWindowClose);
+
+    let mut timers = TimerService::new();
+    let mut state = InMemoryStore::new();
+    let mut watermark_gen = BoundedOutOfOrdernessGenerator::new(0);
+
+    // Send 10 events in window [0, 60000)
+    for i in 0..10 {
+        let event = create_test_event(i * 5000, 1); // 0, 5k, 10k, ..., 45k
+        let outputs = {
+            let mut ctx = create_test_context(&mut timers, &mut state, &mut watermark_gen);
+            operator.process(&event, &mut ctx)
+        };
+        // No Event outputs during accumulation
+        let event_outputs: Vec<_> = outputs
+            .iter()
+            .filter(|o| matches!(o, Output::Event(_)))
+            .collect();
+        assert!(
+            event_outputs.is_empty(),
+            "EOWC should not emit intermediate results (event #{i})"
+        );
+    }
+
+    // Now fire the timer at window_end (60000)
+    let timer = Timer {
+        key: WindowId::new(0, 60_000).to_key(),
+        timestamp: 60_000,
+    };
+    let outputs = {
+        let mut ctx = create_test_context(&mut timers, &mut state, &mut watermark_gen);
+        operator.on_timer(timer, &mut ctx)
+    };
+
+    // Exactly 1 emission
+    assert_eq!(outputs.len(), 1, "EOWC should emit exactly once per window");
+    match &outputs[0] {
+        Output::Event(event) => {
+            assert_eq!(event.timestamp, 60_000);
+            let result_col = event.data.column(2);
+            let result_array = result_col.as_any().downcast_ref::<Int64Array>().unwrap();
+            assert_eq!(result_array.value(0), 10, "Count should be 10");
+        }
+        other => panic!("Expected Output::Event, got: {other:?}"),
+    }
+
+    // Window state should be purged
+    assert!(
+        operator.registered_windows.is_empty(),
+        "Window state should be purged after EOWC emit"
+    );
+}
+
+#[test]
+fn test_eowc_tumbling_no_intermediate_emissions() {
+    // Verify that process() NEVER returns Output::Event for OnWindowClose.
+    // Only Output::Watermark (and possibly nothing) should come from process().
+    let assigner = TumblingWindowAssigner::from_millis(1000);
+    let aggregator = CountAggregator::new();
+    let mut operator = TumblingWindowOperator::with_id(
+        assigner,
+        aggregator,
+        Duration::from_millis(0),
+        "eowc_test".to_string(),
+    );
+    operator.set_emit_strategy(EmitStrategy::OnWindowClose);
+
+    let mut timers = TimerService::new();
+    let mut state = InMemoryStore::new();
+    let mut watermark_gen = BoundedOutOfOrdernessGenerator::new(100);
+
+    // Process 20 events across 2 windows
+    for ts in (0..20).map(|i| i * 100) {
+        let event = create_test_event(ts, 1);
+        let outputs = {
+            let mut ctx = create_test_context(&mut timers, &mut state, &mut watermark_gen);
+            operator.process(&event, &mut ctx)
+        };
+        for output in &outputs {
+            assert!(
+                !matches!(output, Output::Event(_)),
+                "process() must not emit Output::Event with OnWindowClose (ts={ts})"
+            );
+            assert!(
+                !matches!(output, Output::Changelog(_)),
+                "process() must not emit Output::Changelog with OnWindowClose (ts={ts})"
+            );
+        }
+    }
+}
+
+#[test]
+fn test_eowc_tumbling_multiple_windows() {
+    // Send events spanning 3 windows, advance watermark past each,
+    // verify 3 separate emissions with correct counts.
+    let assigner = TumblingWindowAssigner::from_millis(1000);
+    let aggregator = CountAggregator::new();
+    let mut operator = TumblingWindowOperator::with_id(
+        assigner,
+        aggregator,
+        Duration::from_millis(0),
+        "eowc_test".to_string(),
+    );
+    operator.set_emit_strategy(EmitStrategy::OnWindowClose);
+
+    let mut timers = TimerService::new();
+    let mut state = InMemoryStore::new();
+    let mut watermark_gen = BoundedOutOfOrdernessGenerator::new(0);
+
+    // Window [0, 1000): 3 events
+    for ts in [100, 400, 700] {
+        let event = create_test_event(ts, 1);
+        let mut ctx = create_test_context(&mut timers, &mut state, &mut watermark_gen);
+        operator.process(&event, &mut ctx);
+    }
+
+    // Window [1000, 2000): 2 events
+    for ts in [1100, 1500] {
+        let event = create_test_event(ts, 1);
+        let mut ctx = create_test_context(&mut timers, &mut state, &mut watermark_gen);
+        operator.process(&event, &mut ctx);
+    }
+
+    // Window [2000, 3000): 1 event
+    {
+        let event = create_test_event(2200, 1);
+        let mut ctx = create_test_context(&mut timers, &mut state, &mut watermark_gen);
+        operator.process(&event, &mut ctx);
+    }
+
+    // Fire window 1: [0, 1000)
+    let win_timer_1 = Timer {
+        key: WindowId::new(0, 1000).to_key(),
+        timestamp: 1000,
+    };
+    let out1 = {
+        let mut ctx = create_test_context(&mut timers, &mut state, &mut watermark_gen);
+        operator.on_timer(win_timer_1, &mut ctx)
+    };
+    assert_eq!(out1.len(), 1);
+    if let Output::Event(e) = &out1[0] {
+        let result = e
+            .data
+            .column(2)
+            .as_any()
+            .downcast_ref::<Int64Array>()
+            .unwrap();
+        assert_eq!(result.value(0), 3, "Window [0,1000) should have count=3");
+    } else {
+        panic!("Expected Event output for window 1");
+    }
+
+    // Fire window 2: [1000, 2000)
+    let win_timer_2 = Timer {
+        key: WindowId::new(1000, 2000).to_key(),
+        timestamp: 2000,
+    };
+    let out2 = {
+        let mut ctx = create_test_context(&mut timers, &mut state, &mut watermark_gen);
+        operator.on_timer(win_timer_2, &mut ctx)
+    };
+    assert_eq!(out2.len(), 1);
+    if let Output::Event(e) = &out2[0] {
+        let result = e
+            .data
+            .column(2)
+            .as_any()
+            .downcast_ref::<Int64Array>()
+            .unwrap();
+        assert_eq!(result.value(0), 2, "Window [1000,2000) should have count=2");
+    } else {
+        panic!("Expected Event output for window 2");
+    }
+
+    // Fire window 3: [2000, 3000)
+    let win_timer_3 = Timer {
+        key: WindowId::new(2000, 3000).to_key(),
+        timestamp: 3000,
+    };
+    let out3 = {
+        let mut ctx = create_test_context(&mut timers, &mut state, &mut watermark_gen);
+        operator.on_timer(win_timer_3, &mut ctx)
+    };
+    assert_eq!(out3.len(), 1);
+    if let Output::Event(e) = &out3[0] {
+        let result = e
+            .data
+            .column(2)
+            .as_any()
+            .downcast_ref::<Int64Array>()
+            .unwrap();
+        assert_eq!(result.value(0), 1, "Window [2000,3000) should have count=1");
+    } else {
+        panic!("Expected Event output for window 3");
+    }
+
+    // All windows purged
+    assert!(operator.registered_windows.is_empty());
+}
+
+#[test]
+fn test_eowc_tumbling_late_data_dropped_after_close() {
+    // After window closes and emits, late data should be dropped.
+    let assigner = TumblingWindowAssigner::from_millis(1000);
+    let aggregator = CountAggregator::new();
+    let mut operator = TumblingWindowOperator::with_id(
+        assigner,
+        aggregator,
+        Duration::from_millis(5000), // 5s allowed lateness
+        "eowc_test".to_string(),
+    );
+    operator.set_emit_strategy(EmitStrategy::OnWindowClose);
+
+    let mut timers = TimerService::new();
+    let mut state = InMemoryStore::new();
+    let mut watermark_gen = BoundedOutOfOrdernessGenerator::new(0);
+
+    // Fill window [0, 1000) with 3 events
+    for ts in [100, 400, 700] {
+        let event = create_test_event(ts, 1);
+        let mut ctx = create_test_context(&mut timers, &mut state, &mut watermark_gen);
+        operator.process(&event, &mut ctx);
+    }
+
+    // Fire timer at window_end + allowed_lateness = 1000 + 5000 = 6000
+    let timer = Timer {
+        key: WindowId::new(0, 1000).to_key(),
+        timestamp: 6000,
+    };
+    let emit_out = {
+        let mut ctx = create_test_context(&mut timers, &mut state, &mut watermark_gen);
+        operator.on_timer(timer, &mut ctx)
+    };
+    assert_eq!(emit_out.len(), 1, "Should emit exactly once");
+    assert!(matches!(&emit_out[0], Output::Event(_)));
+
+    // Now advance watermark well past the window close point
+    let advance_event = create_test_event(7000, 1);
+    {
+        let mut ctx = create_test_context(&mut timers, &mut state, &mut watermark_gen);
+        operator.process(&advance_event, &mut ctx);
+    }
+
+    // Send late event for the closed window [0, 1000)
+    let late_event = create_test_event(500, 99);
+    let late_outputs = {
+        let mut ctx = create_test_context(&mut timers, &mut state, &mut watermark_gen);
+        operator.process(&late_event, &mut ctx)
+    };
+
+    // Should be classified as late (LateEvent output)
+    let is_late = late_outputs
+        .iter()
+        .any(|o| matches!(o, Output::LateEvent(_)));
+    assert!(
+        is_late,
+        "Late event after EOWC close should produce LateEvent output"
+    );
+
+    // Should NOT produce a new Event (window already closed)
+    let is_event = late_outputs.iter().any(|o| matches!(o, Output::Event(_)));
+    assert!(
+        !is_event,
+        "Late event after EOWC close must not produce a new Event"
+    );
+
+    assert_eq!(operator.late_data_metrics().late_events_dropped(), 1);
+}
+
+#[test]
+fn test_eowc_tumbling_late_data_side_output() {
+    // Same as above but with side output configured.
+    let assigner = TumblingWindowAssigner::from_millis(1000);
+    let aggregator = CountAggregator::new();
+    let mut operator = TumblingWindowOperator::with_id(
+        assigner,
+        aggregator,
+        Duration::from_millis(0),
+        "eowc_test".to_string(),
+    );
+    operator.set_emit_strategy(EmitStrategy::OnWindowClose);
+    operator.set_late_data_config(LateDataConfig::with_side_output("late_trades".to_string()));
+
+    let mut timers = TimerService::new();
+    let mut state = InMemoryStore::new();
+    let mut watermark_gen = BoundedOutOfOrdernessGenerator::new(0);
+
+    // Fill window [0, 1000)
+    let event = create_test_event(500, 1);
+    {
+        let mut ctx = create_test_context(&mut timers, &mut state, &mut watermark_gen);
+        operator.process(&event, &mut ctx);
+    }
+
+    // Fire timer
+    let timer = Timer {
+        key: WindowId::new(0, 1000).to_key(),
+        timestamp: 1000,
+    };
+    {
+        let mut ctx = create_test_context(&mut timers, &mut state, &mut watermark_gen);
+        operator.on_timer(timer, &mut ctx);
+    }
+
+    // Advance watermark
+    let advance = create_test_event(2000, 1);
+    {
+        let mut ctx = create_test_context(&mut timers, &mut state, &mut watermark_gen);
+        operator.process(&advance, &mut ctx);
+    }
+
+    // Send late event
+    let late_event = create_test_event(300, 99);
+    let outputs = {
+        let mut ctx = create_test_context(&mut timers, &mut state, &mut watermark_gen);
+        operator.process(&late_event, &mut ctx)
+    };
+
+    // Should be routed to side output
+    let side_output = outputs.iter().find_map(|o| {
+        if let Output::SideOutput { name, .. } = o {
+            Some(name.clone())
+        } else {
+            None
+        }
+    });
+    assert_eq!(
+        side_output,
+        Some("late_trades".to_string()),
+        "Late event should be routed to side output"
+    );
+    assert_eq!(operator.late_data_metrics().late_events_side_output(), 1);
+}
+
+#[test]
+fn test_eowc_tumbling_empty_window_no_emission() {
+    // Windows that receive no events produce no output when timer fires.
+    let assigner = TumblingWindowAssigner::from_millis(1000);
+    let aggregator = CountAggregator::new();
+    let mut operator = TumblingWindowOperator::with_id(
+        assigner,
+        aggregator,
+        Duration::from_millis(0),
+        "eowc_test".to_string(),
+    );
+    operator.set_emit_strategy(EmitStrategy::OnWindowClose);
+
+    let mut timers = TimerService::new();
+    let mut state = InMemoryStore::new();
+    let mut watermark_gen = BoundedOutOfOrdernessGenerator::new(0);
+
+    // Fire timer for a window that was never populated
+    let timer = Timer {
+        key: WindowId::new(0, 1000).to_key(),
+        timestamp: 1000,
+    };
+    let outputs = {
+        let mut ctx = create_test_context(&mut timers, &mut state, &mut watermark_gen);
+        operator.on_timer(timer, &mut ctx)
+    };
+
+    assert!(
+        outputs.is_empty(),
+        "Empty window should produce no output on timer fire"
+    );
+}
+
+#[test]
+fn test_eowc_tumbling_checkpoint_restore_then_emit() {
+    // Accumulate events, checkpoint, restore, then verify correct emission.
+    let assigner = TumblingWindowAssigner::from_millis(1000);
+    let aggregator = CountAggregator::new();
+    let mut operator = TumblingWindowOperator::with_id(
+        assigner.clone(),
+        aggregator.clone(),
+        Duration::from_millis(0),
+        "eowc_test".to_string(),
+    );
+    operator.set_emit_strategy(EmitStrategy::OnWindowClose);
+
+    let mut timers = TimerService::new();
+    let mut state = InMemoryStore::new();
+    let mut watermark_gen = BoundedOutOfOrdernessGenerator::new(0);
+
+    // Process events into window [0, 1000)
+    for ts in [100, 300, 600] {
+        let event = create_test_event(ts, 1);
+        let mut ctx = create_test_context(&mut timers, &mut state, &mut watermark_gen);
+        operator.process(&event, &mut ctx);
+    }
+
+    // Checkpoint
+    let checkpoint = operator.checkpoint();
+
+    // Create a new operator and restore
+    let mut restored = TumblingWindowOperator::with_id(
+        assigner,
+        aggregator,
+        Duration::from_millis(0),
+        "eowc_test".to_string(),
+    );
+    restored.set_emit_strategy(EmitStrategy::OnWindowClose);
+    restored.restore(checkpoint).unwrap();
+
+    assert_eq!(
+        restored.registered_windows.len(),
+        1,
+        "Should have 1 registered window after restore"
+    );
+
+    // Fire the timer on the restored operator
+    let timer = Timer {
+        key: WindowId::new(0, 1000).to_key(),
+        timestamp: 1000,
+    };
+    let outputs = {
+        let mut ctx = create_test_context(&mut timers, &mut state, &mut watermark_gen);
+        restored.on_timer(timer, &mut ctx)
+    };
+
+    assert_eq!(outputs.len(), 1, "Restored operator should emit once");
+    if let Output::Event(e) = &outputs[0] {
+        let result = e
+            .data
+            .column(2)
+            .as_any()
+            .downcast_ref::<Int64Array>()
+            .unwrap();
+        assert_eq!(result.value(0), 3, "Restored window should have count=3");
+    } else {
+        panic!("Expected Event output after restore");
+    }
+
+    assert!(restored.registered_windows.is_empty());
+}
+
+#[test]
+fn test_eowc_vs_on_watermark_same_result() {
+    // Property: given the same events, OnWindowClose and OnWatermark
+    // should produce the same final result for single-emission cases.
+    let events: Vec<(i64, i64)> = vec![(100, 5), (300, 10), (500, 15), (800, 20)];
+
+    let mut results = Vec::new();
+    for strategy in [EmitStrategy::OnWindowClose, EmitStrategy::OnWatermark] {
+        let assigner = TumblingWindowAssigner::from_millis(1000);
+        let aggregator = SumAggregator::new(0);
+        let mut operator = TumblingWindowOperator::with_id(
+            assigner,
+            aggregator,
+            Duration::from_millis(0),
+            "compare_test".to_string(),
+        );
+        operator.set_emit_strategy(strategy.clone());
+
+        let mut timers = TimerService::new();
+        let mut state = InMemoryStore::new();
+        let mut watermark_gen = BoundedOutOfOrdernessGenerator::new(0);
+
+        for &(ts, val) in &events {
+            let event = create_test_event(ts, val);
+            let mut ctx = create_test_context(&mut timers, &mut state, &mut watermark_gen);
+            operator.process(&event, &mut ctx);
+        }
+
+        // Fire the timer
+        let timer = Timer {
+            key: WindowId::new(0, 1000).to_key(),
+            timestamp: 1000,
+        };
+        let outputs = {
+            let mut ctx = create_test_context(&mut timers, &mut state, &mut watermark_gen);
+            operator.on_timer(timer, &mut ctx)
+        };
+
+        assert_eq!(outputs.len(), 1, "Both strategies should emit once");
+        if let Output::Event(e) = &outputs[0] {
+            let result = e
+                .data
+                .column(2)
+                .as_any()
+                .downcast_ref::<Int64Array>()
+                .unwrap();
+            results.push(result.value(0));
+        } else {
+            panic!("Expected Event output for {strategy:?}");
+        }
+    }
+
+    assert_eq!(
+        results[0], results[1],
+        "OnWindowClose and OnWatermark should produce same final result: \
+         got {}, {}",
+        results[0], results[1]
+    );
+    assert_eq!(results[0], 50, "Sum should be 5+10+15+20=50");
+}

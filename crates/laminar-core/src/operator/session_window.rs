@@ -41,7 +41,7 @@
 
 use super::window::{
     Accumulator, Aggregator, ChangelogRecord, EmitStrategy, LateDataConfig, LateDataMetrics,
-    ResultToI64, WindowId,
+    ResultToI64, WindowCloseMetrics, WindowId,
 };
 use super::{
     Event, Operator, OperatorContext, OperatorError, OperatorState, Output, OutputVec, Timer,
@@ -295,6 +295,8 @@ pub struct SessionWindowOperator<A: Aggregator> {
     late_data_config: LateDataConfig,
     /// Late data metrics
     late_data_metrics: LateDataMetrics,
+    /// Window close metrics
+    window_close_metrics: WindowCloseMetrics,
     /// Operator ID for checkpointing
     operator_id: String,
     /// Cached output schema
@@ -337,6 +339,7 @@ where
             emit_strategy: EmitStrategy::default(),
             late_data_config: LateDataConfig::default(),
             late_data_metrics: LateDataMetrics::new(),
+            window_close_metrics: WindowCloseMetrics::new(),
             operator_id: format!("session_window_{operator_num}"),
             output_schema: create_session_output_schema(),
             key_column: None,
@@ -367,6 +370,7 @@ where
             emit_strategy: EmitStrategy::default(),
             late_data_config: LateDataConfig::default(),
             late_data_metrics: LateDataMetrics::new(),
+            window_close_metrics: WindowCloseMetrics::new(),
             operator_id,
             output_schema: create_session_output_schema(),
             key_column: None,
@@ -419,6 +423,17 @@ where
     /// Resets the late data metrics counters.
     pub fn reset_late_data_metrics(&mut self) {
         self.late_data_metrics.reset();
+    }
+
+    /// Returns the window close metrics.
+    #[must_use]
+    pub fn window_close_metrics(&self) -> &WindowCloseMetrics {
+        &self.window_close_metrics
+    }
+
+    /// Resets the window close metrics counters.
+    pub fn reset_window_close_metrics(&mut self) {
+        self.window_close_metrics.reset();
     }
 
     /// Returns the gap timeout in milliseconds.
@@ -869,6 +884,10 @@ where
         // Load accumulator and create output
         let acc = self.load_accumulator(session_id, ctx.state);
         if let Some(event) = self.create_output(&session, &acc) {
+            // Record window close metrics
+            self.window_close_metrics
+                .record_close(session.end, ctx.processing_time);
+
             match &self.emit_strategy {
                 EmitStrategy::Changelog => {
                     let record = ChangelogRecord::insert(event, ctx.processing_time);
@@ -2516,5 +2535,266 @@ mod tests {
             }
             _ => panic!("Expected Event output from restored timer"),
         }
+    }
+
+    // ========================================================================
+    // EMIT ON WINDOW CLOSE (EOWC) — Session Window Tests (Issue #52)
+    // ========================================================================
+
+    #[test]
+    fn test_eowc_session_basic_close() {
+        // Create session with 30s gap, send events at t=0, 10000, 20000.
+        // Session = [0, 50000). Fire timer. Verify single emission.
+        let aggregator = CountAggregator::new();
+        let mut operator = SessionWindowOperator::with_id(
+            Duration::from_millis(30_000), // 30s gap
+            aggregator,
+            Duration::from_millis(0),
+            "eowc_session".to_string(),
+        );
+        operator.set_emit_strategy(EmitStrategy::OnWindowClose);
+
+        let mut timers = TimerService::new();
+        let mut state = InMemoryStore::new();
+        let mut watermark_gen = BoundedOutOfOrdernessGenerator::new(0);
+
+        // Send 3 events within the same session
+        for ts in [0, 10_000, 20_000] {
+            let event = create_test_event(ts, 1);
+            let outputs = {
+                let mut ctx = create_test_context(&mut timers, &mut state, &mut watermark_gen);
+                operator.process(&event, &mut ctx)
+            };
+            // No intermediate Event emissions
+            let event_count = outputs
+                .iter()
+                .filter(|o| matches!(o, Output::Event(_)))
+                .count();
+            assert_eq!(
+                event_count, 0,
+                "EOWC session should not emit intermediate results"
+            );
+        }
+
+        // Session should be [0, 50000) (last event at 20000 + gap 30000)
+        assert_eq!(operator.active_session_count(), 1);
+
+        // Get the pending timer and fire it
+        let (sid, timer_time, _kh) = first_pending_timer(&operator);
+        let timer = Timer {
+            key: SessionWindowOperator::<CountAggregator>::timer_key(sid),
+            timestamp: timer_time,
+        };
+        let outputs = {
+            let mut ctx = create_test_context(&mut timers, &mut state, &mut watermark_gen);
+            operator.on_timer(timer, &mut ctx)
+        };
+
+        assert_eq!(outputs.len(), 1, "Should emit exactly once");
+        match &outputs[0] {
+            Output::Event(e) => {
+                let result = e
+                    .data
+                    .column(2)
+                    .as_any()
+                    .downcast_ref::<Int64Array>()
+                    .unwrap();
+                assert_eq!(result.value(0), 3, "Session count should be 3");
+            }
+            other => panic!("Expected Output::Event, got: {other:?}"),
+        }
+
+        // Session should be cleaned up
+        assert_eq!(operator.active_session_count(), 0);
+    }
+
+    #[test]
+    fn test_eowc_session_no_intermediate_on_extend() {
+        // Extending a session with new events should not produce
+        // intermediate emissions with OnWindowClose.
+        let aggregator = CountAggregator::new();
+        let mut operator = SessionWindowOperator::with_id(
+            Duration::from_millis(1000),
+            aggregator,
+            Duration::from_millis(0),
+            "eowc_extend".to_string(),
+        );
+        operator.set_emit_strategy(EmitStrategy::OnWindowClose);
+
+        let mut timers = TimerService::new();
+        let mut state = InMemoryStore::new();
+        let mut watermark_gen = BoundedOutOfOrdernessGenerator::new(100);
+
+        // Repeatedly extend the session
+        for ts in (0..5).map(|i| i * 500) {
+            let event = create_test_event(ts, 1);
+            let outputs = {
+                let mut ctx = create_test_context(&mut timers, &mut state, &mut watermark_gen);
+                operator.process(&event, &mut ctx)
+            };
+            for output in &outputs {
+                assert!(
+                    !matches!(output, Output::Event(_)),
+                    "No intermediate Event on session extend (ts={ts})"
+                );
+                assert!(
+                    !matches!(output, Output::Changelog(_)),
+                    "No intermediate Changelog on session extend (ts={ts})"
+                );
+            }
+        }
+
+        // Still 1 session, not yet emitted
+        assert_eq!(operator.active_session_count(), 1);
+    }
+
+    #[test]
+    fn test_eowc_session_merge_before_close() {
+        // Create two separate sessions, then bridge them.
+        // Merged session should emit once with combined count.
+        let aggregator = CountAggregator::new();
+        let mut operator = SessionWindowOperator::with_id(
+            Duration::from_millis(1000), // 1s gap
+            aggregator,
+            Duration::from_millis(0),
+            "eowc_merge".to_string(),
+        );
+        operator.set_emit_strategy(EmitStrategy::OnWindowClose);
+
+        let mut timers = TimerService::new();
+        let mut state = InMemoryStore::new();
+        let mut watermark_gen = BoundedOutOfOrdernessGenerator::new(100);
+
+        // Session 1: event at t=100 → session [100, 1100)
+        let e1 = create_test_event(100, 1);
+        {
+            let mut ctx = create_test_context(&mut timers, &mut state, &mut watermark_gen);
+            operator.process(&e1, &mut ctx);
+        }
+
+        // Session 2: event at t=1200 → session [1200, 2200)
+        let e2 = create_test_event(1200, 1);
+        {
+            let mut ctx = create_test_context(&mut timers, &mut state, &mut watermark_gen);
+            operator.process(&e2, &mut ctx);
+        }
+        assert_eq!(
+            operator.active_session_count(),
+            2,
+            "Should have 2 sessions before merge"
+        );
+
+        // Bridge: event at t=1050 → session [1050, 2050) overlaps both
+        let bridge = create_test_event(1050, 1);
+        let bridge_outputs = {
+            let mut ctx = create_test_context(&mut timers, &mut state, &mut watermark_gen);
+            operator.process(&bridge, &mut ctx)
+        };
+
+        // No intermediate Event from merge with OnWindowClose
+        let event_count = bridge_outputs
+            .iter()
+            .filter(|o| matches!(o, Output::Event(_)))
+            .count();
+        assert_eq!(
+            event_count, 0,
+            "Merge should not emit intermediate results with EOWC"
+        );
+        assert_eq!(
+            operator.active_session_count(),
+            1,
+            "Should have 1 merged session"
+        );
+
+        // Fire the merged session's timer
+        let (sid, timer_time, _kh) = first_pending_timer(&operator);
+        let timer = Timer {
+            key: SessionWindowOperator::<CountAggregator>::timer_key(sid),
+            timestamp: timer_time,
+        };
+        let outputs = {
+            let mut ctx = create_test_context(&mut timers, &mut state, &mut watermark_gen);
+            operator.on_timer(timer, &mut ctx)
+        };
+
+        assert_eq!(outputs.len(), 1, "Merged session should emit once");
+        if let Output::Event(e) = &outputs[0] {
+            let result = e
+                .data
+                .column(2)
+                .as_any()
+                .downcast_ref::<Int64Array>()
+                .unwrap();
+            assert_eq!(
+                result.value(0),
+                3,
+                "Merged session count should be 3 (1+1+1)"
+            );
+        } else {
+            panic!("Expected Event output for merged session");
+        }
+    }
+
+    #[test]
+    fn test_eowc_session_late_data_after_close() {
+        // Close a session, then send late event for the same time range.
+        // Late event should be dropped (or routed to side output).
+        let aggregator = CountAggregator::new();
+        let mut operator = SessionWindowOperator::with_id(
+            Duration::from_millis(1000),
+            aggregator,
+            Duration::from_millis(0),
+            "eowc_late".to_string(),
+        );
+        operator.set_emit_strategy(EmitStrategy::OnWindowClose);
+
+        let mut timers = TimerService::new();
+        let mut state = InMemoryStore::new();
+        let mut watermark_gen = BoundedOutOfOrdernessGenerator::new(0);
+
+        // Create session at t=500 → session [500, 1500)
+        let e1 = create_test_event(500, 1);
+        {
+            let mut ctx = create_test_context(&mut timers, &mut state, &mut watermark_gen);
+            operator.process(&e1, &mut ctx);
+        }
+
+        // Fire timer to close the session
+        let (sid, timer_time, _kh) = first_pending_timer(&operator);
+        let timer = Timer {
+            key: SessionWindowOperator::<CountAggregator>::timer_key(sid),
+            timestamp: timer_time,
+        };
+        {
+            let mut ctx = create_test_context(&mut timers, &mut state, &mut watermark_gen);
+            operator.on_timer(timer, &mut ctx);
+        }
+        assert_eq!(operator.active_session_count(), 0);
+
+        // Advance watermark past the session close
+        let advance = create_test_event(5000, 1);
+        {
+            let mut ctx = create_test_context(&mut timers, &mut state, &mut watermark_gen);
+            operator.process(&advance, &mut ctx);
+        }
+
+        // Send late event for the closed session's time range
+        let late = create_test_event(600, 99);
+        let late_outputs = {
+            let mut ctx = create_test_context(&mut timers, &mut state, &mut watermark_gen);
+            operator.process(&late, &mut ctx)
+        };
+
+        // Should be classified as late
+        let is_late = late_outputs
+            .iter()
+            .any(|o| matches!(o, Output::LateEvent(_)));
+        assert!(is_late, "Late event after session close should be detected");
+
+        // Should NOT produce a new Event
+        let is_event = late_outputs.iter().any(|o| matches!(o, Output::Event(_)));
+        assert!(!is_event, "Late event should not re-open closed session");
+
+        assert_eq!(operator.late_data_metrics().late_events_dropped(), 1);
     }
 }

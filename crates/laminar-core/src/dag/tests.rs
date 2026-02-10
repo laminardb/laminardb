@@ -2955,3 +2955,356 @@ fn test_process_watermark_invalid_node() {
     let result = executor.process_watermark(NodeId(999), 5000);
     assert!(result.is_err());
 }
+
+// ---- EOWC (Emit On Window Close) DAG-level integration tests ----
+
+/// Build a tumbling window operator with the given emit strategy.
+fn make_eowc_window_operator(
+    emit_strategy: crate::operator::window::EmitStrategy,
+) -> Box<dyn crate::operator::Operator> {
+    use crate::operator::window::{
+        CountAggregator, TumblingWindowAssigner, TumblingWindowOperator,
+    };
+    use std::time::Duration;
+
+    let assigner = TumblingWindowAssigner::from_millis(1000);
+    let aggregator = CountAggregator::new();
+    let mut op = TumblingWindowOperator::with_id(
+        assigner,
+        aggregator,
+        Duration::from_millis(0),
+        "dag_eowc_window".to_string(),
+    );
+    op.set_emit_strategy(emit_strategy);
+    Box::new(op)
+}
+
+/// EOWC: Source → TumblingWindow(OnWindowClose) → Sink
+///
+/// Verifies that events processed through the DAG produce no intermediate
+/// output, and that firing timers after watermark advancement produces
+/// exactly one emission per window.
+#[test]
+fn test_eowc_dag_no_intermediate_single_emission() {
+    use crate::operator::window::EmitStrategy;
+
+    let schema = int_schema();
+    let dag = DagBuilder::new()
+        .source("src", schema.clone())
+        .operator("window", schema.clone())
+        .sink_for("window", "snk", schema)
+        .connect("src", "window")
+        .build()
+        .unwrap();
+
+    let src_id = dag.node_id_by_name("src").unwrap();
+    let window_id = dag.node_id_by_name("window").unwrap();
+    let snk_id = dag.node_id_by_name("snk").unwrap();
+
+    let mut executor = DagExecutor::from_dag(&dag);
+    executor.register_operator(
+        window_id,
+        make_eowc_window_operator(EmitStrategy::OnWindowClose),
+    );
+
+    // Process 5 events into window [0, 1000)
+    for i in 0..5 {
+        executor
+            .process_event(src_id, test_event(i * 200, 1))
+            .unwrap();
+    }
+
+    // No intermediate emissions for OnWindowClose
+    let outputs = executor.take_sink_outputs(snk_id);
+    assert!(
+        outputs.is_empty(),
+        "OnWindowClose should not emit intermediate results, got {} events",
+        outputs.len()
+    );
+
+    // Advance watermark past window end to trigger timer
+    executor.process_watermark(src_id, 1100).unwrap();
+    executor.fire_timers(1100);
+
+    // Now should have exactly one emission
+    let outputs = executor.take_sink_outputs(snk_id);
+    assert_eq!(
+        outputs.len(),
+        1,
+        "Expected exactly 1 window emission, got {}",
+        outputs.len()
+    );
+}
+
+/// EOWC: Multiple windows through DAG
+///
+/// Feeds events into 3 tumbling windows [0,1000), [1000,2000), [2000,3000)
+/// and verifies that firing timers produces exactly 3 emissions.
+#[test]
+fn test_eowc_dag_multiple_windows() {
+    use crate::operator::window::EmitStrategy;
+
+    let schema = int_schema();
+    let dag = DagBuilder::new()
+        .source("src", schema.clone())
+        .operator("window", schema.clone())
+        .sink_for("window", "snk", schema)
+        .connect("src", "window")
+        .build()
+        .unwrap();
+
+    let src_id = dag.node_id_by_name("src").unwrap();
+    let window_id = dag.node_id_by_name("window").unwrap();
+    let snk_id = dag.node_id_by_name("snk").unwrap();
+
+    let mut executor = DagExecutor::from_dag(&dag);
+    executor.register_operator(
+        window_id,
+        make_eowc_window_operator(EmitStrategy::OnWindowClose),
+    );
+
+    // Window [0, 1000): 3 events
+    for i in 0..3 {
+        executor
+            .process_event(src_id, test_event(i * 300, 1))
+            .unwrap();
+    }
+    // Window [1000, 2000): 2 events
+    for i in 0..2 {
+        executor
+            .process_event(src_id, test_event(1000 + i * 400, 1))
+            .unwrap();
+    }
+    // Window [2000, 3000): 1 event
+    executor.process_event(src_id, test_event(2500, 1)).unwrap();
+
+    // No outputs yet (OnWindowClose)
+    assert!(executor.take_sink_outputs(snk_id).is_empty());
+
+    // Advance watermark past all windows
+    executor.process_watermark(src_id, 3100).unwrap();
+    executor.fire_timers(3100);
+
+    let outputs = executor.take_sink_outputs(snk_id);
+    assert_eq!(
+        outputs.len(),
+        3,
+        "Expected 3 window emissions, got {}",
+        outputs.len()
+    );
+}
+
+/// EOWC: Checkpoint and restore in DAG
+///
+/// Processes events, checkpoints, restores to a fresh executor,
+/// processes a new event into a new window, and verifies that the
+/// new window emits correctly after restore.
+///
+/// Note: Timer re-registration after restore for existing windows is
+/// a known gap in tumbling windows (session windows handle this via
+/// `needs_timer_reregistration`). This test verifies that checkpoint/
+/// restore preserves the `registered_windows` set and that new windows
+/// created after restore work correctly end-to-end.
+#[test]
+fn test_eowc_dag_checkpoint_restore() {
+    use crate::operator::window::EmitStrategy;
+
+    let schema = int_schema();
+    let dag = DagBuilder::new()
+        .source("src", schema.clone())
+        .operator("window", schema.clone())
+        .sink_for("window", "snk", schema)
+        .connect("src", "window")
+        .build()
+        .unwrap();
+
+    let src_id = dag.node_id_by_name("src").unwrap();
+    let window_id = dag.node_id_by_name("window").unwrap();
+    let snk_id = dag.node_id_by_name("snk").unwrap();
+
+    // Phase 1: Process events and checkpoint
+    let mut executor = DagExecutor::from_dag(&dag);
+    executor.register_operator(
+        window_id,
+        make_eowc_window_operator(EmitStrategy::OnWindowClose),
+    );
+
+    for i in 0..4 {
+        executor
+            .process_event(src_id, test_event(i * 200, 1))
+            .unwrap();
+    }
+
+    let states = executor.checkpoint();
+    assert!(
+        states.contains_key(&window_id),
+        "Checkpoint should contain window operator state"
+    );
+
+    // Phase 2: Restore into a fresh executor
+    let mut executor2 = DagExecutor::from_dag(&dag);
+    executor2.register_operator(
+        window_id,
+        make_eowc_window_operator(EmitStrategy::OnWindowClose),
+    );
+    executor2.restore(&states).unwrap();
+
+    // After restore, process events into a NEW window [1000, 2000).
+    // This creates a fresh timer registration and verifies the operator
+    // is functional post-restore.
+    for i in 0..3 {
+        executor2
+            .process_event(src_id, test_event(1000 + i * 300, 1))
+            .unwrap();
+    }
+
+    // No intermediate output yet (OnWindowClose)
+    assert!(executor2.take_sink_outputs(snk_id).is_empty());
+
+    // Fire timers for the new window
+    executor2.process_watermark(src_id, 2100).unwrap();
+    executor2.fire_timers(2100);
+
+    let outputs = executor2.take_sink_outputs(snk_id);
+    assert!(
+        !outputs.is_empty(),
+        "Expected at least 1 emission for new window after checkpoint-restore"
+    );
+}
+
+/// EOWC vs `OnWatermark` comparison at DAG level
+///
+/// Both strategies should produce the same final result for a single window,
+/// but `OnWatermark` may emit intermediate results while `OnWindowClose` does not.
+#[test]
+fn test_eowc_dag_vs_on_watermark() {
+    use crate::operator::window::EmitStrategy;
+
+    let schema = int_schema();
+
+    // --- OnWindowClose pipeline ---
+    let dag_eowc = DagBuilder::new()
+        .source("src", schema.clone())
+        .operator("window", schema.clone())
+        .sink_for("window", "snk", schema.clone())
+        .connect("src", "window")
+        .build()
+        .unwrap();
+
+    let src_eowc = dag_eowc.node_id_by_name("src").unwrap();
+    let win_eowc = dag_eowc.node_id_by_name("window").unwrap();
+    let snk_eowc = dag_eowc.node_id_by_name("snk").unwrap();
+
+    let mut exec_eowc = DagExecutor::from_dag(&dag_eowc);
+    exec_eowc.register_operator(
+        win_eowc,
+        make_eowc_window_operator(EmitStrategy::OnWindowClose),
+    );
+
+    // --- OnWatermark pipeline ---
+    let dag_wm = DagBuilder::new()
+        .source("src", schema.clone())
+        .operator("window", schema.clone())
+        .sink_for("window", "snk", schema)
+        .connect("src", "window")
+        .build()
+        .unwrap();
+
+    let src_wm = dag_wm.node_id_by_name("src").unwrap();
+    let win_wm = dag_wm.node_id_by_name("window").unwrap();
+    let snk_wm = dag_wm.node_id_by_name("snk").unwrap();
+
+    let mut exec_wm = DagExecutor::from_dag(&dag_wm);
+    exec_wm.register_operator(win_wm, make_eowc_window_operator(EmitStrategy::OnWatermark));
+
+    // Process same events into both
+    for i in 0..5 {
+        let ts = i * 150;
+        exec_eowc
+            .process_event(src_eowc, test_event(ts, 1))
+            .unwrap();
+        exec_wm.process_event(src_wm, test_event(ts, 1)).unwrap();
+    }
+
+    // Fire timers for both
+    exec_eowc.process_watermark(src_eowc, 1100).unwrap();
+    exec_eowc.fire_timers(1100);
+
+    exec_wm.process_watermark(src_wm, 1100).unwrap();
+    exec_wm.fire_timers(1100);
+
+    let eowc_outputs = exec_eowc.take_sink_outputs(snk_eowc);
+    let wm_outputs = exec_wm.take_sink_outputs(snk_wm);
+
+    // Both should produce at least one output per window
+    assert!(
+        !eowc_outputs.is_empty(),
+        "OnWindowClose should emit after timer fire"
+    );
+    assert!(
+        !wm_outputs.is_empty(),
+        "OnWatermark should emit after timer fire"
+    );
+
+    // EOWC: exactly 1 emission (no intermediate + 1 final)
+    assert_eq!(
+        eowc_outputs.len(),
+        1,
+        "OnWindowClose should produce exactly 1 emission"
+    );
+}
+
+/// `fire_timers`: basic test that it fires timers and routes outputs.
+#[test]
+fn test_fire_timers_routes_outputs() {
+    use crate::operator::window::{
+        CountAggregator, EmitStrategy, TumblingWindowAssigner, TumblingWindowOperator,
+    };
+    use std::time::Duration;
+
+    let schema = int_schema();
+    let dag = DagBuilder::new()
+        .source("src", schema.clone())
+        .operator("window", schema.clone())
+        .sink_for("window", "snk", schema)
+        .connect("src", "window")
+        .build()
+        .unwrap();
+
+    let src_id = dag.node_id_by_name("src").unwrap();
+    let window_id = dag.node_id_by_name("window").unwrap();
+    let snk_id = dag.node_id_by_name("snk").unwrap();
+
+    let mut executor = DagExecutor::from_dag(&dag);
+
+    let assigner = TumblingWindowAssigner::from_millis(1000);
+    let aggregator = CountAggregator::new();
+    let mut op = TumblingWindowOperator::with_id(
+        assigner,
+        aggregator,
+        Duration::from_millis(0),
+        "fire_timer_test".to_string(),
+    );
+    op.set_emit_strategy(EmitStrategy::OnWatermark);
+    executor.register_operator(window_id, Box::new(op));
+
+    // Inject events
+    for i in 0..10 {
+        executor
+            .process_event(src_id, test_event(i * 100, 1))
+            .unwrap();
+    }
+
+    // No fire yet — timers not due
+    executor.fire_timers(500);
+    assert!(executor.take_sink_outputs(snk_id).is_empty());
+
+    // Fire at window end time
+    executor.fire_timers(1000);
+    let outputs = executor.take_sink_outputs(snk_id);
+    assert_eq!(
+        outputs.len(),
+        1,
+        "Expected 1 window emission from timer fire"
+    );
+}

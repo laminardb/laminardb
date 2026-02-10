@@ -392,6 +392,19 @@ impl EmitClause {
             EmitClause::OnWindowClose | EmitClause::Final | EmitClause::AfterWatermark
         )
     }
+
+    /// Returns true if this emit strategy requires a watermark on the source.
+    ///
+    /// `OnWindowClose`, `Final`, and `AfterWatermark` all depend on watermark
+    /// advancement to trigger window closure. Without a watermark, timers will
+    /// never fire and windows will never close.
+    #[must_use]
+    pub fn requires_watermark(&self) -> bool {
+        matches!(
+            self,
+            EmitClause::OnWindowClose | EmitClause::Final | EmitClause::AfterWatermark
+        )
+    }
 }
 
 /// Window function types
@@ -719,5 +732,21 @@ mod tests {
             }
             _ => panic!("Expected InsertInto"),
         }
+    }
+
+    #[test]
+    fn test_eowc_requires_watermark_helper() {
+        // Watermark-dependent strategies
+        assert!(EmitClause::OnWindowClose.requires_watermark());
+        assert!(EmitClause::Final.requires_watermark());
+        assert!(EmitClause::AfterWatermark.requires_watermark());
+
+        // Non-watermark strategies
+        assert!(!EmitClause::OnUpdate.requires_watermark());
+        assert!(!EmitClause::Changes.requires_watermark());
+        let periodic = EmitClause::Periodically {
+            interval: Box::new(Expr::Identifier(Ident::new("5_SECONDS"))),
+        };
+        assert!(!periodic.requires_watermark());
     }
 }
