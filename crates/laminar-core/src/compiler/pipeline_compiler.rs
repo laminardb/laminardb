@@ -76,10 +76,11 @@ impl<'a> PipelineCompiler<'a> {
         sig.params.push(AbiParam::new(PTR_TYPE)); // output_row
         sig.returns.push(AbiParam::new(cl_types::I8)); // action
 
-        let func_id = self
-            .jit
-            .module()
-            .declare_function(&func_name, cranelift_module::Linkage::Local, &sig)?;
+        let func_id = self.jit.module().declare_function(
+            &func_name,
+            cranelift_module::Linkage::Local,
+            &sig,
+        )?;
 
         let mut func = Function::with_name_signature(UserFuncName::testcase(&func_name), sig);
 
@@ -173,9 +174,11 @@ fn emit_filter_stage(
     let result = if compiled.is_nullable {
         if let Some(null_flag) = compiled.null_flag {
             let zero = builder.ins().iconst(cl_types::I8, 0);
-            let is_null = builder
-                .ins()
-                .icmp_imm(cranelift_codegen::ir::condcodes::IntCC::NotEqual, null_flag, 0);
+            let is_null = builder.ins().icmp_imm(
+                cranelift_codegen::ir::condcodes::IntCC::NotEqual,
+                null_flag,
+                0,
+            );
             builder.ins().select(is_null, zero, compiled.value)
         } else {
             compiled.value
@@ -291,7 +294,9 @@ fn write_null_bit(
             let set_byte = builder.ins().bor(current_byte, mask);
             let clear_byte = builder.ins().band(current_byte, inv_mask);
             let new_byte = builder.ins().select(is_null, set_byte, clear_byte);
-            builder.ins().store(mem_flags, new_byte, row_ptr, byte_offset);
+            builder
+                .ins()
+                .store(mem_flags, new_byte, row_ptr, byte_offset);
         }
     } else {
         // Non-nullable: ensure the bit is clear (valid).
@@ -300,7 +305,9 @@ fn write_null_bit(
             .load(cl_types::I8, mem_flags, row_ptr, byte_offset);
         let inv_mask = builder.ins().iconst(cl_types::I8, !(1_i64 << bit_idx));
         let new_byte = builder.ins().band(current_byte, inv_mask);
-        builder.ins().store(mem_flags, new_byte, row_ptr, byte_offset);
+        builder
+            .ins()
+            .store(mem_flags, new_byte, row_ptr, byte_offset);
     }
 }
 

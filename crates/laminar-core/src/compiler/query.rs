@@ -23,7 +23,9 @@ use std::time::Instant;
 use smallvec::SmallVec;
 
 use super::fallback::ExecutablePipeline;
-use super::metrics::{QueryConfig, QueryError, QueryId, QueryMetadata, QueryMetrics, QueryState, SubmitResult};
+use super::metrics::{
+    QueryConfig, QueryError, QueryId, QueryMetadata, QueryMetrics, QueryState, SubmitResult,
+};
 use super::pipeline::PipelineAction;
 use super::pipeline_bridge::{BridgeConsumer, PipelineBridge, Ring1Action};
 use super::row::{EventRow, RowSchema};
@@ -253,9 +255,7 @@ impl StreamingQuery {
                         let output_buf = &mut self.output_buffers[i];
                         // SAFETY: input row data matches the compiled pipeline's input schema.
                         // Output buffer is pre-allocated to output_buffer_size bytes.
-                        unsafe {
-                            compiled.execute(row.data().as_ptr(), output_buf.as_mut_ptr())
-                        }
+                        unsafe { compiled.execute(row.data().as_ptr(), output_buf.as_mut_ptr()) }
                     };
                     #[allow(clippy::cast_possible_truncation)]
                     let elapsed_ns = start.elapsed().as_nanos() as u64;
@@ -450,14 +450,10 @@ impl StreamingQuery {
             match pipeline {
                 ExecutablePipeline::Compiled(compiled) => {
                     m.pipelines_compiled += 1;
-                    m.ring0_events_in +=
-                        compiled.stats.events_processed.load(Ordering::Relaxed);
-                    m.ring0_events_out +=
-                        compiled.stats.events_emitted.load(Ordering::Relaxed);
-                    m.ring0_events_dropped +=
-                        compiled.stats.events_dropped.load(Ordering::Relaxed);
-                    m.ring0_total_ns +=
-                        compiled.stats.total_ns.load(Ordering::Relaxed);
+                    m.ring0_events_in += compiled.stats.events_processed.load(Ordering::Relaxed);
+                    m.ring0_events_out += compiled.stats.events_emitted.load(Ordering::Relaxed);
+                    m.ring0_events_dropped += compiled.stats.events_dropped.load(Ordering::Relaxed);
+                    m.ring0_total_ns += compiled.stats.total_ns.load(Ordering::Relaxed);
                 }
                 ExecutablePipeline::Fallback { .. } => {
                     m.pipelines_fallback += 1;
@@ -518,7 +514,12 @@ mod tests {
     fn make_fallback(
         id: u32,
         row_schema: &Arc<RowSchema>,
-    ) -> (ExecutablePipeline, PipelineBridge, BridgeConsumer, Arc<RowSchema>) {
+    ) -> (
+        ExecutablePipeline,
+        PipelineBridge,
+        BridgeConsumer,
+        Arc<RowSchema>,
+    ) {
         let exec = ExecutablePipeline::Fallback {
             pipeline_id: PipelineId(id),
             reason: crate::compiler::error::CompileError::UnsupportedExpr(
@@ -540,7 +541,12 @@ mod tests {
     fn make_compiled_emit(
         id: u32,
         row_schema: &Arc<RowSchema>,
-    ) -> (ExecutablePipeline, PipelineBridge, BridgeConsumer, Arc<RowSchema>) {
+    ) -> (
+        ExecutablePipeline,
+        PipelineBridge,
+        BridgeConsumer,
+        Arc<RowSchema>,
+    ) {
         unsafe extern "C" fn always_emit(input: *const u8, output: *mut u8) -> u8 {
             // Copy 64 bytes from input to output as a simple passthrough.
             std::ptr::copy_nonoverlapping(input, output, 64);
@@ -569,7 +575,12 @@ mod tests {
     fn make_compiled_drop(
         id: u32,
         row_schema: &Arc<RowSchema>,
-    ) -> (ExecutablePipeline, PipelineBridge, BridgeConsumer, Arc<RowSchema>) {
+    ) -> (
+        ExecutablePipeline,
+        PipelineBridge,
+        BridgeConsumer,
+        Arc<RowSchema>,
+    ) {
         unsafe extern "C" fn always_drop(_: *const u8, _: *mut u8) -> u8 {
             0 // Drop
         }

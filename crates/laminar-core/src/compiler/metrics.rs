@@ -23,7 +23,7 @@ impl fmt::Display for QueryId {
 
 // ────────────────────────────── QueryState ───────────────────────────
 
-/// Lifecycle state of a [`StreamingQuery`](super::query::StreamingQuery).
+/// Lifecycle state of a `StreamingQuery` (requires `jit` feature).
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum QueryState {
     /// Query is built but not yet started.

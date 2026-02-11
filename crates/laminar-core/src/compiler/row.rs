@@ -732,10 +732,8 @@ impl<'a> MutableEventRow<'a> {
         self.var_offset += len;
 
         let field_offset = self.schema.fields[field_idx].offset;
-        self.data[field_offset..field_offset + 4]
-            .copy_from_slice(&(start as u32).to_le_bytes());
-        self.data[field_offset + 4..field_offset + 8]
-            .copy_from_slice(&(len as u32).to_le_bytes());
+        self.data[field_offset..field_offset + 4].copy_from_slice(&(start as u32).to_le_bytes());
+        self.data[field_offset + 4..field_offset + 8].copy_from_slice(&(len as u32).to_le_bytes());
     }
 }
 
@@ -784,7 +782,11 @@ mod tests {
             ("f8", DataType::UInt64, false),
             ("f9", DataType::Float32, false),
             ("f10", DataType::Float64, false),
-            ("f11", DataType::Timestamp(TimeUnit::Microsecond, None), false),
+            (
+                "f11",
+                DataType::Timestamp(TimeUnit::Microsecond, None),
+                false,
+            ),
             ("f12", DataType::Utf8, true),
             ("f13", DataType::Binary, true),
         ]);
@@ -806,7 +808,11 @@ mod tests {
 
     #[test]
     fn schema_from_arrow_unsupported() {
-        let schema = make_schema(vec![("bad", DataType::List(Arc::new(Field::new("item", DataType::Int32, true))), false)]);
+        let schema = make_schema(vec![(
+            "bad",
+            DataType::List(Arc::new(Field::new("item", DataType::Int32, true))),
+            false,
+        )]);
         let err = RowSchema::from_arrow(&schema).unwrap_err();
         assert!(err.to_string().contains("unsupported"));
     }
@@ -818,15 +824,45 @@ mod tests {
         assert_eq!(RowSchema::from_arrow(&s1).unwrap().null_bitmap_size(), 8);
 
         // 8 fields: bitmap = 1 byte, padded to 8
-        let s8 = make_schema((0..8).map(|i| (Box::leak(format!("f{i}").into_boxed_str()) as &str, DataType::Int32, false)).collect());
+        let s8 = make_schema(
+            (0..8)
+                .map(|i| {
+                    (
+                        Box::leak(format!("f{i}").into_boxed_str()) as &str,
+                        DataType::Int32,
+                        false,
+                    )
+                })
+                .collect(),
+        );
         assert_eq!(RowSchema::from_arrow(&s8).unwrap().null_bitmap_size(), 8);
 
         // 9 fields: bitmap = 2 bytes, padded to 8
-        let s9 = make_schema((0..9).map(|i| (Box::leak(format!("f{i}").into_boxed_str()) as &str, DataType::Int32, false)).collect());
+        let s9 = make_schema(
+            (0..9)
+                .map(|i| {
+                    (
+                        Box::leak(format!("f{i}").into_boxed_str()) as &str,
+                        DataType::Int32,
+                        false,
+                    )
+                })
+                .collect(),
+        );
         assert_eq!(RowSchema::from_arrow(&s9).unwrap().null_bitmap_size(), 8);
 
         // 65 fields: bitmap = 9 bytes, padded to 16
-        let s65 = make_schema((0..65).map(|i| (Box::leak(format!("f{i}").into_boxed_str()) as &str, DataType::Int32, false)).collect());
+        let s65 = make_schema(
+            (0..65)
+                .map(|i| {
+                    (
+                        Box::leak(format!("f{i}").into_boxed_str()) as &str,
+                        DataType::Int32,
+                        false,
+                    )
+                })
+                .collect(),
+        );
         assert_eq!(RowSchema::from_arrow(&s65).unwrap().null_bitmap_size(), 16);
     }
 
@@ -843,7 +879,7 @@ mod tests {
         let bool_off = rs.field(0).offset;
         let i64_off = rs.field(1).offset;
         assert_eq!(bool_off % 1, 0); // trivially aligned
-        assert_eq!(i64_off % 8, 0);  // 8-byte aligned
+        assert_eq!(i64_off % 8, 0); // 8-byte aligned
         assert!(i64_off > bool_off);
     }
 
@@ -950,9 +986,11 @@ mod tests {
 
     #[test]
     fn roundtrip_timestamp() {
-        let schema = make_schema(vec![
-            ("ts", DataType::Timestamp(TimeUnit::Microsecond, None), false),
-        ]);
+        let schema = make_schema(vec![(
+            "ts",
+            DataType::Timestamp(TimeUnit::Microsecond, None),
+            false,
+        )]);
         let rs = RowSchema::from_arrow(&schema).unwrap();
         let arena = Bump::new();
         let mut row = MutableEventRow::new_in(&arena, &rs, 0);
@@ -988,7 +1026,11 @@ mod tests {
     #[test]
     fn roundtrip_all_types() {
         let schema = make_schema(vec![
-            ("ts", DataType::Timestamp(TimeUnit::Microsecond, None), false),
+            (
+                "ts",
+                DataType::Timestamp(TimeUnit::Microsecond, None),
+                false,
+            ),
             ("flag", DataType::Boolean, false),
             ("i8", DataType::Int8, false),
             ("i16", DataType::Int16, false),
@@ -1211,27 +1253,69 @@ mod tests {
 
     #[test]
     fn field_type_from_arrow_all() {
-        assert_eq!(FieldType::from_arrow(&DataType::Boolean), Some(FieldType::Bool));
-        assert_eq!(FieldType::from_arrow(&DataType::Int8), Some(FieldType::Int8));
-        assert_eq!(FieldType::from_arrow(&DataType::Int16), Some(FieldType::Int16));
-        assert_eq!(FieldType::from_arrow(&DataType::Int32), Some(FieldType::Int32));
-        assert_eq!(FieldType::from_arrow(&DataType::Int64), Some(FieldType::Int64));
-        assert_eq!(FieldType::from_arrow(&DataType::UInt8), Some(FieldType::UInt8));
-        assert_eq!(FieldType::from_arrow(&DataType::UInt16), Some(FieldType::UInt16));
-        assert_eq!(FieldType::from_arrow(&DataType::UInt32), Some(FieldType::UInt32));
-        assert_eq!(FieldType::from_arrow(&DataType::UInt64), Some(FieldType::UInt64));
-        assert_eq!(FieldType::from_arrow(&DataType::Float32), Some(FieldType::Float32));
-        assert_eq!(FieldType::from_arrow(&DataType::Float64), Some(FieldType::Float64));
+        assert_eq!(
+            FieldType::from_arrow(&DataType::Boolean),
+            Some(FieldType::Bool)
+        );
+        assert_eq!(
+            FieldType::from_arrow(&DataType::Int8),
+            Some(FieldType::Int8)
+        );
+        assert_eq!(
+            FieldType::from_arrow(&DataType::Int16),
+            Some(FieldType::Int16)
+        );
+        assert_eq!(
+            FieldType::from_arrow(&DataType::Int32),
+            Some(FieldType::Int32)
+        );
+        assert_eq!(
+            FieldType::from_arrow(&DataType::Int64),
+            Some(FieldType::Int64)
+        );
+        assert_eq!(
+            FieldType::from_arrow(&DataType::UInt8),
+            Some(FieldType::UInt8)
+        );
+        assert_eq!(
+            FieldType::from_arrow(&DataType::UInt16),
+            Some(FieldType::UInt16)
+        );
+        assert_eq!(
+            FieldType::from_arrow(&DataType::UInt32),
+            Some(FieldType::UInt32)
+        );
+        assert_eq!(
+            FieldType::from_arrow(&DataType::UInt64),
+            Some(FieldType::UInt64)
+        );
+        assert_eq!(
+            FieldType::from_arrow(&DataType::Float32),
+            Some(FieldType::Float32)
+        );
+        assert_eq!(
+            FieldType::from_arrow(&DataType::Float64),
+            Some(FieldType::Float64)
+        );
         assert_eq!(
             FieldType::from_arrow(&DataType::Timestamp(TimeUnit::Microsecond, None)),
             Some(FieldType::TimestampMicros)
         );
         assert_eq!(
-            FieldType::from_arrow(&DataType::Timestamp(TimeUnit::Microsecond, Some("UTC".into()))),
+            FieldType::from_arrow(&DataType::Timestamp(
+                TimeUnit::Microsecond,
+                Some("UTC".into())
+            )),
             Some(FieldType::TimestampMicros)
         );
-        assert_eq!(FieldType::from_arrow(&DataType::Utf8), Some(FieldType::Utf8));
-        assert_eq!(FieldType::from_arrow(&DataType::Binary), Some(FieldType::Binary));
+        assert_eq!(
+            FieldType::from_arrow(&DataType::Utf8),
+            Some(FieldType::Utf8)
+        );
+        assert_eq!(
+            FieldType::from_arrow(&DataType::Binary),
+            Some(FieldType::Binary)
+        );
         // Unsupported types
         assert_eq!(FieldType::from_arrow(&DataType::Float16), None);
         assert_eq!(FieldType::from_arrow(&DataType::LargeUtf8), None);

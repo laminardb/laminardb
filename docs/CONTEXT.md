@@ -9,45 +9,46 @@
 **Date**: 2026-02-11
 
 ### What Was Accomplished
-- **F082: Streaming Query Lifecycle** — Unified runtime object wiring compiled/fallback pipelines to bridges with lifecycle management
-  - 2 new files: `metrics.rs` (NOT jit-gated), `query.rs` (jit-gated)
-  - `QueryId`, `QueryState`, `QueryConfig`, `QueryError`, `SubmitResult`, `QueryMetadata`, `QueryMetrics` — always-available types
-  - `StreamingQueryBuilder`: add_pipeline triplets (ExecutablePipeline + PipelineBridge + BridgeConsumer), build() validates equal lengths
-  - `StreamingQuery`: lifecycle (start/pause/resume/stop), submit_row (compiled JIT + fallback passthrough), advance_watermark, checkpoint, send_eof
-  - `poll_ring1()` / `check_latency_flush()` drain all consumers for Ring 1 actions
-  - `swap()` hot-swap: validates same pipeline count, swaps internals, old query goes Stopped
-  - `metrics()` aggregates PipelineStats + BridgeStatsSnapshot across all pipelines/consumers
-  - 1 file modified: `mod.rs` (wiring + re-exports)
-  - 35 tests (8 metrics + 27 query), clippy clean with `-D warnings`
-  - Phase 2.5 Plan Compiler: **5/5 features COMPLETE (100%)** ✅
+- **F083–F089: SQL Compiler Integration** — 7 features wiring the JIT compiler stack (F078–F082) into end-to-end SQL query execution
+  - **F083: Batch Row Reader** — Arrow `RecordBatch` → `EventRow` conversion in bump arena
+    - `BatchRowReader` with pre-downcast `ColumnAccessor` enum, 14 type variants
+    - Round-trip correctness: `RecordBatch → EventRow → RowBatchBridge → RecordBatch`
+    - 17 tests in `batch_reader.rs`
+  - **F084: SQL Compiler Orchestrator** — Single `compile_streaming_query()` entry point
+    - LogicalPlan → extract pipelines → compile → wire bridges → `CompiledStreamingQuery`
+    - Breaker detection returns `None` for stateful operators (aggregate/sort/join)
+    - `extract_table_scan()` pulls source scan for DataFusion execution
+    - 12 tests in `orchestrate.rs`
+  - **F085: LaminarDB JIT Query Execution** — Wire compiled path into `handle_query()`
+    - `jit` feature on `laminar-db` forwarding to `laminar-core/jit`
+    - `CompilerCache` field on `LaminarDB` (jit-gated)
+    - `try_compile_query()` → `bridge_compiled_query()` with transparent fallback
+    - `handle_query()` tries JIT first, falls through to DataFusion on `None`
+    - 291 laminar-db tests pass
+  - **F086: Adaptive Compilation Warmup** — Background JIT with seamless swap
+    - `AdaptiveQueryRunner` using `tokio::sync::oneshot` for non-blocking compile results
+    - `ExecutionMode` enum: Interpreted → Compiling → Compiled / FallbackPermanent
+    - 6 tests in `adaptive.rs`
+  - **F087: Compiled Stateful Pipeline Bridge** — Multi-segment compiled/interpreted execution
+    - `Ring1Operator` trait for stateful operators at pipeline boundaries
+    - `BreakerExecutor` wraps Ring1Operator with stats tracking
+    - `CompiledQueryGraph` for linear chain of executors
+    - 13 tests in `breaker_executor.rs` (jit-gated)
+  - **F088: Schema-Aware Event Time Extraction** — Extract timestamps from data schema
+    - `RowEventTimeExtractor` with auto-detection (first TimestampMicros, then well-known names)
+    - `EventTimeConfig` with configurable column and watermark delay
+    - Integrated into `bridge_compiled_query()` for correct event-time processing
+    - 18 tests in `event_time.rs`
+  - **F089: Compilation Metrics & Observability** — Track compilation stats
+    - `CompilationMetrics` with atomic counters (compiled/fallback/error/compile_time)
+    - `MetricsSnapshot` with `compilation_rate()`, `CacheSnapshot` with `hit_rate()`/`fill_ratio()`
+    - 14 tests in `compilation_metrics.rs`
+  - Phase 2.5 SQL Compiler Integration: **7/7 features COMPLETE (100%)** ✅
 
 Previous session (2026-02-11):
-- **F081: Ring 0/Ring 1 Pipeline Bridge** — Lock-free SPSC bridge from compiled Ring 0 to Ring 1 stateful operators
-  - 2 new files: `policy.rs`, `pipeline_bridge.rs`
-  - `BatchPolicy` (max_rows, max_latency, flush_on_watermark) + `BackpressureStrategy` (DropNewest, PauseSource, SpillToDisk)
-  - `PipelineBridge` (producer): sends Event/Watermark/CheckpointBarrier/Eof via `SmallVec<[u8; 128]>`
-  - `BridgeConsumer` (consumer): drains SPSC queue, accumulates rows via `RowBatchBridge`, emits `Ring1Action`s
-  - Watermark-aware flushing prevents partial-batch emissions (Issue #55)
-  - `BridgeStats` with `AtomicU64` counters shared between producer/consumer
-  - `create_pipeline_bridge()` factory for paired construction
-  - 1 file modified: `mod.rs` (wiring + re-exports, NOT gated behind `jit` feature)
-  - 36 tests (6 policy + 30 bridge), clippy clean with `-D warnings`
-  - Phase 2.5 Plan Compiler: 4/5 features complete (80%)
-
-Previous session (2026-02-11):
-- **F080: Plan Compiler Core** — Compile entire DataFusion LogicalPlan pipeline segments into single native Cranelift JIT functions
-  - 5 new files: `pipeline.rs`, `extractor.rs`, `pipeline_compiler.rs`, `cache.rs`, `fallback.rs`
-  - `PipelineExtractor` walks LogicalPlan top-down, splitting at stateful operators (Aggregate/Sort/Join) into compilable pipeline chains
-  - `PipelineCompiler` generates Cranelift codegen fusing Filter→Project→KeyExtract stages into a single `fn(input_row, output_row) -> u8` native function
-  - `CompilerCache` with FxHashMap + FIFO eviction avoids redundant compilation
-  - `ExecutablePipeline` Compiled/Fallback for graceful degradation to DataFusion interpreted execution
-  - 3 files modified: `expr.rs` (7 items pub(crate)), `error.rs` (+ExtractError), `mod.rs` (wiring)
-  - 75 new tests (123 total compiler tests), clippy clean with `-D warnings`
-  - Phase 2.5 Plan Compiler: 3/5 features complete (60%)
-
-Previous session (2026-02-10):
-- **F079: Compiled Expression Evaluator** — Cranelift JIT for DataFusion Expr trees
-- **F017D+E: Session Emit Strategies + Timer Persistence** — Completes Issue #55
+- **F078–F082: Plan Compiler Core** — 5 features building the JIT compiler stack
+  - F078: EventRow format, F079: Cranelift expression compiler, F080: Pipeline extraction/compilation/cache
+  - F081: Ring 0/Ring 1 SPSC bridge, F082: StreamingQuery lifecycle management
 
 Previous session (2026-02-08):
 - **pgwire-replication integration for PostgreSQL CDC WAL streaming** (PR #74, closes #58)
@@ -56,10 +57,10 @@ Previous session (2026-02-08):
 ### Where We Left Off
 
 **Phase 2: 38/38 features COMPLETE (100%)** ✅
-**Phase 2.5: 5/5 features COMPLETE (100%)** ✅ — F078 ✅, F079 ✅, F080 ✅, F081 ✅, F082 ✅
+**Phase 2.5: 12/12 features COMPLETE (100%)** ✅ — F078–F082 (Plan Compiler) ✅, F083–F089 (SQL Compiler Integration) ✅
 **Phase 3: 67/76 features COMPLETE (88%)**
 
-**Test counts**: ~1,635 laminar-core (with jit), ~3,100+ with all feature flags
+**Test counts**: ~1,700+ laminar-core (with jit), ~3,100+ with all feature flags
 
 ### Immediate Next Steps
 
@@ -97,7 +98,10 @@ laminar-core/src/
   budget/         # Task budget enforcement
   compiler/       # Plan compiler: EventRow, JIT expr compiler (Cranelift), constant folding,
                   #   pipeline extraction, pipeline compilation, cache, fallback,
-                  #   metrics (always-available types), query (StreamingQuery lifecycle)
+                  #   metrics (always-available types), query (StreamingQuery lifecycle),
+                  #   batch_reader (Arrow→EventRow), orchestrate (compile_streaming_query),
+                  #   event_time (schema-aware extraction), compilation_metrics (observability),
+                  #   breaker_executor (stateful pipeline bridge)
 
 laminar-sql/src/
   parser/         # Streaming SQL: windows, emit, late data, joins, aggregation, analytics, ranking

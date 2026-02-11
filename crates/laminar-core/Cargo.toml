@@ -147,3 +147,8 @@ harness = false
 [[bench]]
 name = "subscription_bench"
 harness = false
+
+[[bench]]
+name = "compiler_bench"
+harness = false
+required-features = ["jit"]

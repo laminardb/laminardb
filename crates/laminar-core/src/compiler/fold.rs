@@ -219,8 +219,14 @@ mod tests {
 
     #[test]
     fn fold_not_literal() {
-        assert_eq!(fold_constants(&Expr::Not(Box::new(lit_bool(true)))), lit_bool(false));
-        assert_eq!(fold_constants(&Expr::Not(Box::new(lit_bool(false)))), lit_bool(true));
+        assert_eq!(
+            fold_constants(&Expr::Not(Box::new(lit_bool(true)))),
+            lit_bool(false)
+        );
+        assert_eq!(
+            fold_constants(&Expr::Not(Box::new(lit_bool(false)))),
+            lit_bool(true)
+        );
     }
 
     #[test]

@@ -1,7 +1,7 @@
 //! Compiled expression evaluator using Cranelift JIT.
 //!
 //! [`ExprCompiler`] translates `DataFusion` [`Expr`] trees into native machine code
-//! via Cranelift. The generated functions operate directly on [`EventRow`] byte
+//! via Cranelift. The generated functions operate directly on [`super::EventRow`] byte
 //! buffers using pointer arithmetic — zero allocations, zero virtual dispatch.
 //!
 //! # Supported Expressions
@@ -24,8 +24,7 @@
 use cranelift_codegen::ir::condcodes::{FloatCC, IntCC};
 use cranelift_codegen::ir::types::{self as cl_types};
 use cranelift_codegen::ir::{
-    AbiParam, BlockArg, Function, InstBuilder, MemFlags, Type as CraneliftType, UserFuncName,
-    Value,
+    AbiParam, BlockArg, Function, InstBuilder, MemFlags, Type as CraneliftType, UserFuncName, Value,
 };
 use cranelift_codegen::Context;
 use cranelift_frontend::FunctionBuilder;
@@ -91,13 +90,13 @@ impl<'a> ExprCompiler<'a> {
         sig.params.push(AbiParam::new(PTR_TYPE));
         sig.returns.push(AbiParam::new(cl_types::I8));
 
-        let func_id = self
-            .jit
-            .module()
-            .declare_function(&func_name, cranelift_module::Linkage::Local, &sig)?;
+        let func_id = self.jit.module().declare_function(
+            &func_name,
+            cranelift_module::Linkage::Local,
+            &sig,
+        )?;
 
-        let mut func =
-            Function::with_name_signature(UserFuncName::testcase(&func_name), sig);
+        let mut func = Function::with_name_signature(UserFuncName::testcase(&func_name), sig);
 
         {
             let builder_ctx = self.jit.builder_ctx();
@@ -166,13 +165,13 @@ impl<'a> ExprCompiler<'a> {
         sig.params.push(AbiParam::new(PTR_TYPE));
         sig.returns.push(AbiParam::new(cl_types::I8));
 
-        let func_id = self
-            .jit
-            .module()
-            .declare_function(&func_name, cranelift_module::Linkage::Local, &sig)?;
+        let func_id = self.jit.module().declare_function(
+            &func_name,
+            cranelift_module::Linkage::Local,
+            &sig,
+        )?;
 
-        let mut func =
-            Function::with_name_signature(UserFuncName::testcase(&func_name), sig);
+        let mut func = Function::with_name_signature(UserFuncName::testcase(&func_name), sig);
 
         {
             let builder_ctx = self.jit.builder_ctx();
@@ -674,10 +673,7 @@ fn compile_case(
             .unwrap_or_else(|| builder.ins().iconst(cl_types::I8, 0));
         builder.ins().jump(
             merge_block,
-            &[
-                BlockArg::Value(then_val.value),
-                BlockArg::Value(then_null),
-            ],
+            &[BlockArg::Value(then_val.value), BlockArg::Value(then_null)],
         );
 
         builder.switch_to_block(else_block);
@@ -694,10 +690,7 @@ fn compile_case(
         .unwrap_or_else(|| builder.ins().iconst(cl_types::I8, 0));
     builder.ins().jump(
         merge_block,
-        &[
-            BlockArg::Value(else_val.value),
-            BlockArg::Value(else_null),
-        ],
+        &[BlockArg::Value(else_val.value), BlockArg::Value(else_null)],
     );
 
     builder.switch_to_block(merge_block);
@@ -1045,21 +1038,27 @@ mod tests {
         let arena = Bump::new();
 
         // lt_eq
-        let f = compiler.compile_filter(&col("x").lt_eq(lit(10_i64))).unwrap();
+        let f = compiler
+            .compile_filter(&col("x").lt_eq(lit(10_i64)))
+            .unwrap();
         let b = make_row_bytes(&arena, &rs, &[(0, 10)], &[]);
         assert_eq!(unsafe { f(b.as_ptr()) }, 1);
         let b = make_row_bytes(&arena, &rs, &[(0, 11)], &[]);
         assert_eq!(unsafe { f(b.as_ptr()) }, 0);
 
         // gt_eq
-        let f = compiler.compile_filter(&col("x").gt_eq(lit(10_i64))).unwrap();
+        let f = compiler
+            .compile_filter(&col("x").gt_eq(lit(10_i64)))
+            .unwrap();
         let b = make_row_bytes(&arena, &rs, &[(0, 10)], &[]);
         assert_eq!(unsafe { f(b.as_ptr()) }, 1);
         let b = make_row_bytes(&arena, &rs, &[(0, 9)], &[]);
         assert_eq!(unsafe { f(b.as_ptr()) }, 0);
 
         // not_eq
-        let f = compiler.compile_filter(&col("x").not_eq(lit(42_i64))).unwrap();
+        let f = compiler
+            .compile_filter(&col("x").not_eq(lit(42_i64)))
+            .unwrap();
         let b = make_row_bytes(&arena, &rs, &[(0, 43)], &[]);
         assert_eq!(unsafe { f(b.as_ptr()) }, 1);
         let b = make_row_bytes(&arena, &rs, &[(0, 42)], &[]);
@@ -1210,19 +1209,25 @@ mod tests {
         let mut output = [0u8; 8];
 
         // sub
-        let s = compiler.compile_scalar(&(col("val") - lit(8_i64)), &FieldType::Int64).unwrap();
+        let s = compiler
+            .compile_scalar(&(col("val") - lit(8_i64)), &FieldType::Int64)
+            .unwrap();
         let b = make_row_bytes(&arena, &rs, &[(0, 50)], &[]);
         assert_eq!(unsafe { s(b.as_ptr(), output.as_mut_ptr()) }, 0);
         assert_eq!(i64::from_le_bytes(output), 42);
 
         // div
-        let s = compiler.compile_scalar(&(col("val") / lit(2_i64)), &FieldType::Int64).unwrap();
+        let s = compiler
+            .compile_scalar(&(col("val") / lit(2_i64)), &FieldType::Int64)
+            .unwrap();
         let b = make_row_bytes(&arena, &rs, &[(0, 84)], &[]);
         assert_eq!(unsafe { s(b.as_ptr(), output.as_mut_ptr()) }, 0);
         assert_eq!(i64::from_le_bytes(output), 42);
 
         // mod
-        let s = compiler.compile_scalar(&(col("val") % lit(10_i64)), &FieldType::Int64).unwrap();
+        let s = compiler
+            .compile_scalar(&(col("val") % lit(10_i64)), &FieldType::Int64)
+            .unwrap();
         let b = make_row_bytes(&arena, &rs, &[(0, 42)], &[]);
         assert_eq!(unsafe { s(b.as_ptr(), output.as_mut_ptr()) }, 0);
         assert_eq!(i64::from_le_bytes(output), 2);
@@ -1255,7 +1260,9 @@ mod tests {
         let mut jit = JitContext::new().unwrap();
         let mut compiler = ExprCompiler::new(&mut jit, &rs);
 
-        let scalar = compiler.compile_scalar(&col("val"), &FieldType::Int64).unwrap();
+        let scalar = compiler
+            .compile_scalar(&col("val"), &FieldType::Int64)
+            .unwrap();
 
         let arena = Bump::new();
         let bytes = make_row_bytes(&arena, &rs, &[(0, 999)], &[]);
@@ -1273,7 +1280,9 @@ mod tests {
         let mut jit = JitContext::new().unwrap();
         let mut compiler = ExprCompiler::new(&mut jit, &rs);
 
-        let filter = compiler.compile_filter(&col("val").gt(lit(10_i64))).unwrap();
+        let filter = compiler
+            .compile_filter(&col("val").gt(lit(10_i64)))
+            .unwrap();
 
         let arena = Bump::new();
         let bytes = make_row_bytes(&arena, &rs, &[(0, 999)], &[0]);
@@ -1287,7 +1296,9 @@ mod tests {
         let mut jit = JitContext::new().unwrap();
         let mut compiler = ExprCompiler::new(&mut jit, &rs);
 
-        let scalar = compiler.compile_scalar(&(col("val") + lit(10_i64)), &FieldType::Int64).unwrap();
+        let scalar = compiler
+            .compile_scalar(&(col("val") + lit(10_i64)), &FieldType::Int64)
+            .unwrap();
 
         let arena = Bump::new();
         let bytes = make_row_bytes(&arena, &rs, &[(0, 0)], &[0]);
@@ -1388,7 +1399,10 @@ mod tests {
         row.set_i32(0, -42);
         let frozen = row.freeze();
         let mut output = [0u8; 8];
-        assert_eq!(unsafe { scalar(frozen.data().as_ptr(), output.as_mut_ptr()) }, 0);
+        assert_eq!(
+            unsafe { scalar(frozen.data().as_ptr(), output.as_mut_ptr()) },
+            0
+        );
         assert_eq!(i64::from_le_bytes(output), -42);
     }
 
@@ -1430,7 +1444,10 @@ mod tests {
         row.set_f64(0, 42.9);
         let frozen = row.freeze();
         let mut output = [0u8; 8];
-        assert_eq!(unsafe { scalar(frozen.data().as_ptr(), output.as_mut_ptr()) }, 0);
+        assert_eq!(
+            unsafe { scalar(frozen.data().as_ptr(), output.as_mut_ptr()) },
+            0
+        );
         assert_eq!(i64::from_le_bytes(output), 42);
     }
 
@@ -1452,7 +1469,10 @@ mod tests {
         row.set_bool(0, true);
         let frozen = row.freeze();
         let mut output = [0u8; 8];
-        assert_eq!(unsafe { scalar(frozen.data().as_ptr(), output.as_mut_ptr()) }, 0);
+        assert_eq!(
+            unsafe { scalar(frozen.data().as_ptr(), output.as_mut_ptr()) },
+            0
+        );
         assert_eq!(i64::from_le_bytes(output), 1);
     }
 
@@ -1467,10 +1487,7 @@ mod tests {
 
         let expr = Expr::Case(datafusion_expr::Case {
             expr: None,
-            when_then_expr: vec![(
-                Box::new(col("val").gt(lit(10_i64))),
-                Box::new(lit(1_i64)),
-            )],
+            when_then_expr: vec![(Box::new(col("val").gt(lit(10_i64))), Box::new(lit(1_i64)))],
             else_expr: Some(Box::new(lit(0_i64))),
         });
         let scalar = compiler.compile_scalar(&expr, &FieldType::Int64).unwrap();
@@ -1529,10 +1546,7 @@ mod tests {
 
         let expr = Expr::Case(datafusion_expr::Case {
             expr: None,
-            when_then_expr: vec![(
-                Box::new(col("val").gt(lit(100_i64))),
-                Box::new(lit(1_i64)),
-            )],
+            when_then_expr: vec![(Box::new(col("val").gt(lit(100_i64))), Box::new(lit(1_i64)))],
             else_expr: None,
         });
         let scalar = compiler.compile_scalar(&expr, &FieldType::Int64).unwrap();
@@ -1577,7 +1591,9 @@ mod tests {
         let mut jit = JitContext::new().unwrap();
         let mut compiler = ExprCompiler::new(&mut jit, &rs);
 
-        let filter = compiler.compile_filter(&col("price").gt(lit(100.0_f64))).unwrap();
+        let filter = compiler
+            .compile_filter(&col("price").gt(lit(100.0_f64)))
+            .unwrap();
 
         let arena = Bump::new();
         let mut row = MutableEventRow::new_in(&arena, &rs, 0);
@@ -1601,7 +1617,9 @@ mod tests {
         let mut jit = JitContext::new().unwrap();
         let mut compiler = ExprCompiler::new(&mut jit, &rs);
 
-        let scalar = compiler.compile_scalar(&(col("a") + col("b")), &FieldType::Int64).unwrap();
+        let scalar = compiler
+            .compile_scalar(&(col("a") + col("b")), &FieldType::Int64)
+            .unwrap();
 
         let arena = Bump::new();
         let bytes = make_row_bytes(&arena, &rs, &[(0, 30), (1, 12)], &[]);
@@ -1619,8 +1637,12 @@ mod tests {
         let mut jit = JitContext::new().unwrap();
         let mut compiler = ExprCompiler::new(&mut jit, &rs);
 
-        let f1 = compiler.compile_filter(&col("val").gt(lit(10_i64))).unwrap();
-        let f2 = compiler.compile_filter(&col("val").lt(lit(100_i64))).unwrap();
+        let f1 = compiler
+            .compile_filter(&col("val").gt(lit(10_i64)))
+            .unwrap();
+        let f2 = compiler
+            .compile_filter(&col("val").lt(lit(100_i64)))
+            .unwrap();
 
         let arena = Bump::new();
         let bytes = make_row_bytes(&arena, &rs, &[(0, 50)], &[]);

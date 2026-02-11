@@ -200,8 +200,7 @@ fn extract_impl(
 
             // Create downstream pipeline with the aggregate's output schema.
             let output_schema = Arc::new(agg.schema.as_arrow().clone());
-            let downstream_id =
-                ctx.new_pipeline(Arc::clone(&output_schema), output_schema);
+            let downstream_id = ctx.new_pipeline(Arc::clone(&output_schema), output_schema);
 
             ctx.breakers.push((
                 upstream_id,
@@ -219,8 +218,7 @@ fn extract_impl(
             let upstream_id = extract_impl(&sort.input, ctx)?;
 
             let output_schema = arrow_schema(plan);
-            let downstream_id =
-                ctx.new_pipeline(Arc::clone(&output_schema), output_schema);
+            let downstream_id = ctx.new_pipeline(Arc::clone(&output_schema), output_schema);
 
             let order_exprs = sort.expr.iter().map(|se| se.expr.clone()).collect();
             ctx.breakers.push((
@@ -237,8 +235,7 @@ fn extract_impl(
             let _right_id = extract_impl(&join.right, ctx)?;
 
             let output_schema = Arc::new(join.schema.as_arrow().clone());
-            let downstream_id =
-                ctx.new_pipeline(Arc::clone(&output_schema), output_schema);
+            let downstream_id = ctx.new_pipeline(Arc::clone(&output_schema), output_schema);
 
             let left_keys = join.on.iter().map(|(l, _)| l.clone()).collect();
             let right_keys = join.on.iter().map(|(_, r)| r.clone()).collect();
@@ -262,8 +259,7 @@ fn extract_impl(
             // Limit requires materialization — treat as a breaker.
             let upstream_id = extract_impl(&limit.input, ctx)?;
             let output_schema = arrow_schema(plan);
-            let downstream_id =
-                ctx.new_pipeline(Arc::clone(&output_schema), output_schema);
+            let downstream_id = ctx.new_pipeline(Arc::clone(&output_schema), output_schema);
 
             ctx.breakers.push((
                 upstream_id,
@@ -283,8 +279,7 @@ fn extract_impl(
             };
             let upstream_id = extract_impl(input, ctx)?;
             let output_schema = arrow_schema(plan);
-            let downstream_id =
-                ctx.new_pipeline(Arc::clone(&output_schema), output_schema);
+            let downstream_id = ctx.new_pipeline(Arc::clone(&output_schema), output_schema);
 
             ctx.breakers.push((
                 upstream_id,
@@ -355,10 +350,9 @@ mod tests {
     #[test]
     fn extract_filter_only() {
         let scan = table_scan_plan(vec![("x", DataType::Int64)]);
-        let plan = LogicalPlan::Filter(datafusion_expr::Filter::try_new(
-            col("x").gt(lit(10_i64)),
-            Arc::new(scan),
-        ).unwrap());
+        let plan = LogicalPlan::Filter(
+            datafusion_expr::Filter::try_new(col("x").gt(lit(10_i64)), Arc::new(scan)).unwrap(),
+        );
 
         let extracted = PipelineExtractor::extract(&plan).unwrap();
 
@@ -422,9 +416,7 @@ mod tests {
         let scan = table_scan_plan(vec![("key", DataType::Int64), ("val", DataType::Int64)]);
 
         // Build aggregate manually. Schema must match group_expr.len() + aggr_expr.len().
-        let agg_schema = Arc::new(Schema::new(vec![
-            Field::new("key", DataType::Int64, true),
-        ]));
+        let agg_schema = Arc::new(Schema::new(vec![Field::new("key", DataType::Int64, true)]));
         let df_schema = DFSchema::try_from(agg_schema.as_ref().clone()).unwrap();
         let agg = datafusion_expr::Aggregate::try_new_with_schema(
             Arc::new(scan),
@@ -511,8 +503,7 @@ mod tests {
 
         assert_eq!(extracted.pipelines.len(), 1);
         assert_eq!(extracted.pipelines[0].stages.len(), 2);
-        assert!(extracted
-            .pipelines[0]
+        assert!(extracted.pipelines[0]
             .stages
             .iter()
             .all(|s| matches!(s, PipelineStage::Filter { .. })));
@@ -529,9 +520,7 @@ mod tests {
             .build()
             .unwrap();
 
-        let agg_schema = Arc::new(Schema::new(vec![
-            Field::new("key", DataType::Int64, true),
-        ]));
+        let agg_schema = Arc::new(Schema::new(vec![Field::new("key", DataType::Int64, true)]));
         let df_schema = DFSchema::try_from(agg_schema.as_ref().clone()).unwrap();
         let agg = datafusion_expr::Aggregate::try_new_with_schema(
             Arc::new(filtered),
@@ -641,5 +630,4 @@ mod tests {
         assert_eq!(extracted.pipelines.len(), 2);
         assert_eq!(extracted.breakers.len(), 1);
     }
-
 }

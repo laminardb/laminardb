@@ -174,10 +174,7 @@ fn append_field(
             }
         }
         FieldType::Int16 => {
-            let b = builder
-                .as_any_mut()
-                .downcast_mut::<Int16Builder>()
-                .unwrap();
+            let b = builder.as_any_mut().downcast_mut::<Int16Builder>().unwrap();
             if is_null {
                 b.append_null();
             } else {
@@ -185,10 +182,7 @@ fn append_field(
             }
         }
         FieldType::Int32 => {
-            let b = builder
-                .as_any_mut()
-                .downcast_mut::<Int32Builder>()
-                .unwrap();
+            let b = builder.as_any_mut().downcast_mut::<Int32Builder>().unwrap();
             if is_null {
                 b.append_null();
             } else {
@@ -196,10 +190,7 @@ fn append_field(
             }
         }
         FieldType::Int64 => {
-            let b = builder
-                .as_any_mut()
-                .downcast_mut::<Int64Builder>()
-                .unwrap();
+            let b = builder.as_any_mut().downcast_mut::<Int64Builder>().unwrap();
             if is_null {
                 b.append_null();
             } else {
@@ -207,10 +198,7 @@ fn append_field(
             }
         }
         FieldType::UInt8 => {
-            let b = builder
-                .as_any_mut()
-                .downcast_mut::<UInt8Builder>()
-                .unwrap();
+            let b = builder.as_any_mut().downcast_mut::<UInt8Builder>().unwrap();
             if is_null {
                 b.append_null();
             } else {
@@ -312,9 +300,7 @@ fn append_field(
 mod tests {
     use super::*;
     use crate::compiler::row::MutableEventRow;
-    use arrow_array::{
-        Array, BooleanArray, Float64Array, Int64Array, StringArray, UInt32Array,
-    };
+    use arrow_array::{Array, BooleanArray, Float64Array, Int64Array, StringArray, UInt32Array};
     use arrow_schema::{DataType, Field, Schema, TimeUnit};
     use bumpalo::Bump;
     use std::sync::Arc;
@@ -350,10 +336,18 @@ mod tests {
         assert_eq!(batch.num_rows(), 1);
         assert_eq!(batch.num_columns(), 2);
 
-        let col0 = batch.column(0).as_any().downcast_ref::<Int64Array>().unwrap();
+        let col0 = batch
+            .column(0)
+            .as_any()
+            .downcast_ref::<Int64Array>()
+            .unwrap();
         assert_eq!(col0.value(0), 100);
 
-        let col1 = batch.column(0 + 1).as_any().downcast_ref::<Float64Array>().unwrap();
+        let col1 = batch
+            .column(0 + 1)
+            .as_any()
+            .downcast_ref::<Float64Array>()
+            .unwrap();
         assert!((col1.value(0) - 3.14).abs() < f64::EPSILON);
     }
 
@@ -376,7 +370,11 @@ mod tests {
         let batch = bridge.flush();
         assert_eq!(batch.num_rows(), 10);
 
-        let col = batch.column(0).as_any().downcast_ref::<Int64Array>().unwrap();
+        let col = batch
+            .column(0)
+            .as_any()
+            .downcast_ref::<Int64Array>()
+            .unwrap();
         for i in 0..10 {
             assert_eq!(col.value(i), i as i64);
         }
@@ -412,7 +410,11 @@ mod tests {
             ("flag", DataType::Boolean, false),
             ("count", DataType::UInt32, false),
             ("name", DataType::Utf8, true),
-            ("ts", DataType::Timestamp(TimeUnit::Microsecond, None), false),
+            (
+                "ts",
+                DataType::Timestamp(TimeUnit::Microsecond, None),
+                false,
+            ),
         ]);
         let row_schema = RowSchema::from_arrow(&schema).unwrap();
         let mut bridge = RowBatchBridge::new(schema, 16).unwrap();
@@ -428,13 +430,25 @@ mod tests {
         let batch = bridge.flush();
         assert_eq!(batch.num_rows(), 1);
 
-        let bools = batch.column(0).as_any().downcast_ref::<BooleanArray>().unwrap();
+        let bools = batch
+            .column(0)
+            .as_any()
+            .downcast_ref::<BooleanArray>()
+            .unwrap();
         assert!(bools.value(0));
 
-        let uints = batch.column(1).as_any().downcast_ref::<UInt32Array>().unwrap();
+        let uints = batch
+            .column(1)
+            .as_any()
+            .downcast_ref::<UInt32Array>()
+            .unwrap();
         assert_eq!(uints.value(0), 42);
 
-        let strs = batch.column(2).as_any().downcast_ref::<StringArray>().unwrap();
+        let strs = batch
+            .column(2)
+            .as_any()
+            .downcast_ref::<StringArray>()
+            .unwrap();
         assert_eq!(strs.value(0), "test");
     }
 
@@ -461,11 +475,19 @@ mod tests {
         let batch = bridge.flush();
         assert_eq!(batch.num_rows(), 2);
 
-        let ints = batch.column(0).as_any().downcast_ref::<Int64Array>().unwrap();
+        let ints = batch
+            .column(0)
+            .as_any()
+            .downcast_ref::<Int64Array>()
+            .unwrap();
         assert!(ints.is_null(0));
         assert_eq!(ints.value(1), 99);
 
-        let strs = batch.column(1).as_any().downcast_ref::<StringArray>().unwrap();
+        let strs = batch
+            .column(1)
+            .as_any()
+            .downcast_ref::<StringArray>()
+            .unwrap();
         assert_eq!(strs.value(0), "hello");
         assert!(strs.is_null(1));
     }
@@ -493,7 +515,11 @@ mod tests {
 
         let batch2 = bridge.flush();
         assert_eq!(batch2.num_rows(), 1);
-        let col = batch2.column(0).as_any().downcast_ref::<Int64Array>().unwrap();
+        let col = batch2
+            .column(0)
+            .as_any()
+            .downcast_ref::<Int64Array>()
+            .unwrap();
         assert_eq!(col.value(0), 2);
     }
 

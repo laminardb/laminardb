@@ -7,11 +7,11 @@
 | Phase 1 | 12 | 0 | 0 | 0 | 12 |
 | Phase 1.5 | 1 | 0 | 0 | 0 | 1 |
 | Phase 2 | 38 | 0 | 0 | 0 | 38 |
-| Phase 2.5 | 5 | 0 | 0 | 0 | 5 |
+| Phase 2.5 | 12 | 0 | 0 | 0 | 12 |
 | Phase 3 | 76 | 9 | 0 | 0 | 67 |
 | Phase 4 | 11 | 11 | 0 | 0 | 0 |
 | Phase 5 | 10 | 10 | 0 | 0 | 0 |
-| **Total** | **153** | **30** | **0** | **0** | **123** |
+| **Total** | **160** | **23** | **0** | **0** | **130** |
 
 ## Status Legend
 
@@ -104,11 +104,13 @@
 
 ---
 
-## Phase 2.5: Plan Compiler
+## Phase 2.5: Plan Compiler & SQL Compiler Integration
 
-> **Status**: 5/5 features complete (100%) ✅. Compiles DataFusion logical plans into zero-allocation JIT functions for Ring 0.
+> **Status**: 12/12 features complete (100%) ✅. Compiles DataFusion logical plans into zero-allocation JIT functions for Ring 0, with end-to-end SQL query execution integration.
 
 See [Plan Compiler Index](plan-compiler/INDEX.md) for architecture details and [research](../research/plan-compiler-research-2026.md) for background.
+
+### Plan Compiler Core (F078–F082) ✅
 
 | ID | Feature | Status | Spec |
 |----|---------|--------|------|
@@ -117,6 +119,18 @@ See [Plan Compiler Index](plan-compiler/INDEX.md) for architecture details and [
 | F080 | Plan Compiler Core | ✅ | [Link](plan-compiler/F080-plan-compiler-core.md) |
 | F081 | Ring 0/Ring 1 Pipeline Bridge | ✅ | [Link](plan-compiler/F081-ring0-ring1-pipeline-bridge.md) |
 | F082 | Streaming Query Lifecycle | ✅ | [Link](plan-compiler/F082-streaming-query-lifecycle.md) |
+
+### SQL Compiler Integration (F083–F089) ✅
+
+| ID | Feature | Status | Spec |
+|----|---------|--------|------|
+| F083 | Batch Row Reader | ✅ | - |
+| F084 | SQL Compiler Orchestrator | ✅ | - |
+| F085 | LaminarDB JIT Query Execution | ✅ | - |
+| F086 | Adaptive Compilation Warmup | ✅ | - |
+| F087 | Compiled Stateful Pipeline Bridge | ✅ | - |
+| F088 | Schema-Aware Event Time Extraction | ✅ | - |
+| F089 | Compilation Metrics & Observability | ✅ | - |
 
 ---
 
