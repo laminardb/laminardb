@@ -55,6 +55,26 @@ impl From<cranelift_module::ModuleError> for CompileError {
     }
 }
 
+/// Errors that can occur during pipeline extraction from a logical plan.
+#[derive(Debug)]
+pub enum ExtractError {
+    /// The logical plan contains a node that cannot be decomposed into pipelines.
+    UnsupportedPlan(String),
+    /// A schema-related error during extraction (e.g., unsupported column type).
+    SchemaError(String),
+}
+
+impl fmt::Display for ExtractError {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        match self {
+            Self::UnsupportedPlan(desc) => write!(f, "unsupported plan node: {desc}"),
+            Self::SchemaError(desc) => write!(f, "schema error during extraction: {desc}"),
+        }
+    }
+}
+
+impl std::error::Error for ExtractError {}
+
 /// A compiled filter function: `fn(row_ptr: *const u8) -> u8`.
 ///
 /// Returns 1 if the row passes the filter, 0 otherwise.

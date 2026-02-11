@@ -42,15 +42,15 @@ use super::row::{FieldType, RowSchema};
 const PTR_TYPE: CraneliftType = cl_types::I64;
 
 /// Tracks a compiled SSA value plus its null state.
-struct CompiledValue {
+pub(crate) struct CompiledValue {
     /// The SSA value in Cranelift IR.
-    value: Value,
+    pub(crate) value: Value,
     /// Whether this value can be null.
-    is_nullable: bool,
+    pub(crate) is_nullable: bool,
     /// SSA value holding the null flag (i8: 0 = valid, nonzero = null).
-    null_flag: Option<Value>,
+    pub(crate) null_flag: Option<Value>,
     /// The [`FieldType`] of this value.
-    value_type: FieldType,
+    pub(crate) value_type: FieldType,
 }
 
 /// Compiles `DataFusion` expressions into native functions via Cranelift.
@@ -229,7 +229,7 @@ impl<'a> ExprCompiler<'a> {
 // ---------------------------------------------------------------------------
 
 /// Recursively compiles an expression node into Cranelift IR.
-fn compile_expr_inner(
+pub(crate) fn compile_expr_inner(
     builder: &mut FunctionBuilder,
     schema: &RowSchema,
     expr: &Expr,
@@ -368,7 +368,7 @@ fn compile_literal(
 }
 
 /// Creates a null value of the given type.
-fn null_value(builder: &mut FunctionBuilder, field_type: FieldType) -> CompiledValue {
+pub(crate) fn null_value(builder: &mut FunctionBuilder, field_type: FieldType) -> CompiledValue {
     let cl_type = field_type_to_cranelift(field_type);
     let value = if cl_type.is_float() {
         if cl_type == cl_types::F32 {
@@ -797,7 +797,7 @@ fn compile_short_circuit_or(
 }
 
 /// Loads the null bitmap bit for the given field index.
-fn emit_null_check(
+pub(crate) fn emit_null_check(
     builder: &mut FunctionBuilder,
     schema: &RowSchema,
     field_idx: usize,
@@ -819,7 +819,7 @@ fn emit_null_check(
 }
 
 /// Merges null flags from two operands (SQL null propagation).
-fn merge_null_flags(
+pub(crate) fn merge_null_flags(
     builder: &mut FunctionBuilder,
     lhs: &CompiledValue,
     rhs: &CompiledValue,
@@ -835,7 +835,7 @@ fn merge_null_flags(
 }
 
 /// Infers the output [`FieldType`] of an expression without compiling it.
-fn infer_expr_type(schema: &RowSchema, expr: &Expr) -> Result<FieldType, CompileError> {
+pub(crate) fn infer_expr_type(schema: &RowSchema, expr: &Expr) -> Result<FieldType, CompileError> {
     match expr {
         Expr::Column(col) => {
             let idx = schema
@@ -888,7 +888,7 @@ fn infer_expr_type(schema: &RowSchema, expr: &Expr) -> Result<FieldType, Compile
 // ---------------------------------------------------------------------------
 
 /// Maps a [`FieldType`] to the corresponding Cranelift IR type.
-fn field_type_to_cranelift(ft: FieldType) -> CraneliftType {
+pub(crate) fn field_type_to_cranelift(ft: FieldType) -> CraneliftType {
     match ft {
         FieldType::Bool | FieldType::Int8 | FieldType::UInt8 => cl_types::I8,
         FieldType::Int16 | FieldType::UInt16 => cl_types::I16,
