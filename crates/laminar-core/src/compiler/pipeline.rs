@@ -232,6 +232,7 @@ impl std::fmt::Debug for CompiledPipeline {
 }
 
 #[cfg(test)]
+#[allow(clippy::items_after_statements, clippy::useless_vec)]
 mod tests {
     use super::*;
 

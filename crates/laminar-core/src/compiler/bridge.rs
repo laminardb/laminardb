@@ -297,6 +297,7 @@ fn append_field(
 }
 
 #[cfg(test)]
+#[allow(clippy::approx_constant, clippy::identity_op, clippy::cast_possible_wrap)]
 mod tests {
     use super::*;
     use crate::compiler::row::MutableEventRow;

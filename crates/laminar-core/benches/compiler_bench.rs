@@ -160,7 +160,7 @@ fn bench_event_row(c: &mut Criterion) {
             let fresh = Bump::with_capacity(64);
             let mut row = MutableEventRow::new_in(&fresh, &schema, 0);
             row.set_i64(0, 1_000_000);
-            row.set_f64(1, 3.14);
+            row.set_f64(1, std::f64::consts::PI);
             black_box(&row);
         });
         black_box(&arena);
@@ -170,7 +170,7 @@ fn bench_event_row(c: &mut Criterion) {
         let arena = Bump::new();
         let mut row = MutableEventRow::new_in(&arena, &schema, 0);
         row.set_i64(0, 42_000);
-        row.set_f64(1, 2.718);
+        row.set_f64(1, std::f64::consts::E);
         let frozen = row.freeze();
         b.iter(|| {
             let ts = black_box(frozen.get_i64(0));
@@ -208,7 +208,7 @@ fn bench_bridge(c: &mut Criterion) {
             let _ = bridge.send_event(&frozen, i as i64, i);
             i += 1;
             // Drain periodically to prevent backpressure.
-            if i % 1024 == 0 {
+            if i.is_multiple_of(1024) {
                 black_box(consumer.drain());
             }
         })
@@ -252,7 +252,7 @@ fn bench_submit_row(c: &mut Criterion) {
         let arena = Bump::new();
         let mut row = MutableEventRow::new_in(&arena, &schema, 0);
         row.set_i64(0, 1000);
-        row.set_f64(1, 3.14);
+        row.set_f64(1, std::f64::consts::PI);
         let frozen = row.freeze();
         let mut ts = 0i64;
         b.iter(|| {
@@ -271,7 +271,7 @@ fn bench_submit_row(c: &mut Criterion) {
         let arena = Bump::new();
         let mut row = MutableEventRow::new_in(&arena, &schema, 0);
         row.set_i64(0, 1000);
-        row.set_f64(1, 3.14);
+        row.set_f64(1, std::f64::consts::PI);
         let frozen = row.freeze();
         let mut ts = 0i64;
         b.iter(|| {
@@ -287,7 +287,7 @@ fn bench_submit_row(c: &mut Criterion) {
         let arena = Bump::new();
         let mut row = MutableEventRow::new_in(&arena, &schema, 0);
         row.set_i64(0, 1000);
-        row.set_f64(1, 3.14);
+        row.set_f64(1, std::f64::consts::PI);
         let frozen = row.freeze();
         let mut ts = 0i64;
         b.iter(|| {
@@ -317,7 +317,7 @@ fn bench_full_cycle(c: &mut Criterion) {
         let arena = Bump::new();
         let mut row = MutableEventRow::new_in(&arena, &schema, 0);
         row.set_i64(0, 1000);
-        row.set_f64(1, 3.14);
+        row.set_f64(1, std::f64::consts::PI);
         let frozen = row.freeze();
         let mut epoch = 0i64;
         b.iter(|| {
@@ -340,7 +340,7 @@ fn bench_full_cycle(c: &mut Criterion) {
         let arena = Bump::new();
         let mut row = MutableEventRow::new_in(&arena, &schema, 0);
         row.set_i64(0, 1000);
-        row.set_f64(1, 3.14);
+        row.set_f64(1, std::f64::consts::PI);
         let frozen = row.freeze();
         let mut epoch = 0u64;
         b.iter(|| {
@@ -368,7 +368,7 @@ fn bench_metrics(c: &mut Criterion) {
         let arena = Bump::new();
         let mut row = MutableEventRow::new_in(&arena, &schema, 0);
         row.set_i64(0, 1000);
-        row.set_f64(1, 3.14);
+        row.set_f64(1, std::f64::consts::PI);
         let frozen = row.freeze();
         for i in 0..100i64 {
             let _ = query.submit_row(&frozen, i, i as u64);

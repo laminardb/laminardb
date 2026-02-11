@@ -485,6 +485,7 @@ impl std::fmt::Debug for StreamingQuery {
 // ────────────────────────────── Tests ────────────────────────────────
 
 #[cfg(test)]
+#[allow(clippy::cast_precision_loss)]
 mod tests {
     use super::*;
     use crate::compiler::pipeline::{CompiledPipeline, PipelineId};

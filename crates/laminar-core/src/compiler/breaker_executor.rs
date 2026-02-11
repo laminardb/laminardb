@@ -348,7 +348,9 @@ mod tests {
 
         fn checkpoint(&self) -> Vec<u8> {
             // Simple: just store the count.
-            (self.buffer.len() as u32).to_le_bytes().to_vec()
+            #[allow(clippy::cast_possible_truncation)]
+            let len = self.buffer.len() as u32;
+            len.to_le_bytes().to_vec()
         }
 
         fn restore(&mut self, state: &[u8]) {

@@ -738,6 +738,13 @@ impl<'a> MutableEventRow<'a> {
 }
 
 #[cfg(test)]
+#[allow(
+    clippy::float_cmp,
+    clippy::approx_constant,
+    clippy::modulo_one,
+    clippy::cast_possible_truncation,
+    clippy::cast_sign_loss
+)]
 mod tests {
     use super::*;
     use arrow_schema::{DataType, Field, Schema, TimeUnit};

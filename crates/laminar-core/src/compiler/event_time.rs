@@ -181,6 +181,7 @@ impl std::fmt::Debug for RowEventTimeExtractor {
 }
 
 #[cfg(test)]
+#[allow(clippy::approx_constant)]
 mod tests {
     use super::*;
     use crate::compiler::row::{MutableEventRow, RowSchema};

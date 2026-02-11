@@ -198,6 +198,7 @@ pub struct QueryMetrics {
 // ────────────────────────────── Tests ────────────────────────────────
 
 #[cfg(test)]
+#[allow(clippy::single_char_pattern)]
 mod tests {
     use super::*;
 

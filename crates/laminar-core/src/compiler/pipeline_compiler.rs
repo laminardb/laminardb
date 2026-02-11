@@ -312,6 +312,7 @@ fn write_null_bit(
 }
 
 #[cfg(test)]
+#[allow(clippy::similar_names, clippy::approx_constant)]
 mod tests {
     use super::*;
     use crate::compiler::pipeline::PipelineId;

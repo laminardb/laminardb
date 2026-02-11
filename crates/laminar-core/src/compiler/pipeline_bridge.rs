@@ -515,6 +515,11 @@ pub fn create_pipeline_bridge(
 }
 
 #[cfg(test)]
+#[allow(
+    clippy::approx_constant,
+    clippy::cast_precision_loss,
+    clippy::cast_possible_wrap
+)]
 mod tests {
     use super::*;
     use crate::compiler::row::MutableEventRow;
