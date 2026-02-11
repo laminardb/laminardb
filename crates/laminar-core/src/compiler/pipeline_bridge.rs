@@ -41,12 +41,16 @@ pub enum PipelineBridgeError {
 // ────────────────────────────── Messages ─────────────────────────────
 
 /// A message sent from Ring 0 through the SPSC queue to Ring 1.
-#[derive(Debug, Clone)]
+// The size disparity between `Event` (280 bytes) and other variants is
+// intentional: `SmallVec<[u8; 256]>` keeps row data inline to avoid heap
+// allocations on the Ring 0 hot path. Boxing would negate the benefit.
+#[derive(Debug)]
+#[allow(clippy::large_enum_variant)]
 pub enum BridgeMessage {
     /// A processed event row with metadata.
     Event {
-        /// Serialized row bytes (inline for rows <= 128 bytes).
-        row_data: SmallVec<[u8; 128]>,
+        /// Serialized row bytes (inline for rows <= 256 bytes).
+        row_data: SmallVec<[u8; 256]>,
         /// Event timestamp (microseconds since epoch).
         event_time: i64,
         /// Pre-computed key hash for partitioned operators.
@@ -177,7 +181,7 @@ pub struct PipelineBridge {
 impl PipelineBridge {
     /// Sends a processed event row through the bridge.
     ///
-    /// Copies `row.data()` into a `SmallVec` (inline for <=128 bytes) so the
+    /// Copies `row.data()` into a `SmallVec` (inline for <=256 bytes) so the
     /// caller's arena can be reset after this call returns.
     ///
     /// # Errors
@@ -190,8 +194,14 @@ impl PipelineBridge {
         event_time: i64,
         key_hash: u64,
     ) -> Result<(), PipelineBridgeError> {
+        let data = row.data();
+        debug_assert!(
+            data.len() <= 256,
+            "BridgeMessage::Event row_data spilled to heap ({} bytes > 256 inline capacity)",
+            data.len()
+        );
         let msg = BridgeMessage::Event {
-            row_data: SmallVec::from_slice(row.data()),
+            row_data: SmallVec::from_slice(data),
             event_time,
             key_hash,
         };

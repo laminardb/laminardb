@@ -1294,7 +1294,10 @@ impl LaminarDB {
         sql: &str,
         logical_plan: &datafusion::logical_expr::LogicalPlan,
     ) -> Option<laminar_core::compiler::CompiledStreamingQuery> {
-        let mut cache = self.compiler_cache.lock();
+        let Some(mut cache) = self.compiler_cache.try_lock() else {
+            tracing::debug!(sql = %sql, "Compiler cache contended, falling back to DataFusion");
+            return None;
+        };
         let config = laminar_core::compiler::QueryConfig::default();
         match laminar_core::compiler::compile_streaming_query(
             sql,
@@ -1354,11 +1357,11 @@ impl LaminarDB {
             use tokio_stream::StreamExt;
             let mut stream = input_stream;
             let mut extractor = time_extractor;
+            let mut arena = bumpalo::Bump::with_capacity(1024 * 128);
 
             while let Some(result) = stream.next().await {
                 match result {
                     Ok(batch) => {
-                        let arena = bumpalo::Bump::with_capacity(batch.num_rows() * 128);
                         let reader = BatchRowReader::new(&batch, &input_schema);
                         for row_idx in 0..reader.row_count() {
                             let row = reader.read_row(row_idx, &arena);
@@ -1382,6 +1385,8 @@ impl LaminarDB {
                                 }
                             }
                         }
+                        // Reset arena for next batch — keeps underlying allocation.
+                        arena.reset();
                     }
                     Err(_) => break,
                 }

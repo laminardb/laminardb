@@ -79,6 +79,8 @@ pub struct BatchRowReader<'a> {
     batch: &'a RecordBatch,
     schema: &'a RowSchema,
     columns: Vec<ColumnAccessor<'a>>,
+    /// Pre-computed variable-length capacity estimate (64 bytes per var-len field).
+    var_capacity: usize,
 }
 
 impl<'a> BatchRowReader<'a> {
@@ -102,10 +104,13 @@ impl<'a> BatchRowReader<'a> {
             .map(|i| downcast_column(batch, schema, i))
             .collect();
 
+        let var_capacity = schema.fields().iter().filter(|f| f.is_variable).count() * 64;
+
         Self {
             batch,
             schema,
             columns,
+            var_capacity,
         }
     }
 
@@ -131,16 +136,7 @@ impl<'a> BatchRowReader<'a> {
             self.batch.num_rows()
         );
 
-        // Estimate variable-length capacity: 64 bytes per variable field is reasonable.
-        let var_capacity = self
-            .schema
-            .fields()
-            .iter()
-            .filter(|f| f.is_variable)
-            .count()
-            * 64;
-
-        let mut row = MutableEventRow::new_in(arena, self.schema, var_capacity);
+        let mut row = MutableEventRow::new_in(arena, self.schema, self.var_capacity);
 
         for (field_idx, col) in self.columns.iter().enumerate() {
             read_field(&mut row, col, field_idx, row_idx);
