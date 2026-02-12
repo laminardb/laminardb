@@ -112,11 +112,11 @@ jobs:
 
       - name: Build (cross)
         if: matrix.cross
-        run: cross build --workspace --release --target ${{ matrix.target }}
+        run: cross build --workspace --release --all-features --target ${{ matrix.target }}
 
       - name: Build (native)
         if: "!matrix.cross"
-        run: cargo build --workspace --release --target ${{ matrix.target }}
+        run: cargo build --workspace --release --all-features --target ${{ matrix.target }}
 
       - name: Package artifacts
         shell: bash

@@ -101,7 +101,7 @@ jobs:
       # Windows: explicit features (skip hwloc, io-uring, xdp)
       - name: Run tests (Windows)
         if: runner.os == 'Windows'
-        run: cargo nextest run --workspace --features "allocation-tracking,kafka,postgres-cdc,postgres-sink,mysql-cdc,delta-lake"
+        run: cargo nextest run --workspace --features "allocation-tracking,jit,kafka,postgres-cdc,postgres-sink,mysql-cdc,delta-lake"
 
       # Doc tests only on Linux (redundant across platforms)
       - name: Run doc tests
@@ -168,6 +168,10 @@ jobs:
           cargo check -p laminar-core --features io-uring
           cargo check -p laminar-core --features hwloc
           cargo check -p laminar-core --features xdp
+          cargo check -p laminar-core --features jit
+
+          # DB features
+          cargo check -p laminar-db --features jit
 
           # Connector features
           cargo check -p laminar-connectors --no-default-features

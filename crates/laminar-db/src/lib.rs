@@ -24,6 +24,8 @@
 #![warn(clippy::all, clippy::pedantic)]
 #![allow(clippy::module_name_repetitions)]
 
+#[allow(dead_code)]
+mod adaptive;
 mod asof_batch;
 mod builder;
 mod catalog;

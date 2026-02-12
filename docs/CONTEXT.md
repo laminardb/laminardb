@@ -6,34 +6,61 @@
 
 ## Last Session
 
-**Date**: 2026-02-10
+**Date**: 2026-02-11
 
 ### What Was Accomplished
-- **F017D+E: Session Emit Strategies + Timer Persistence** — Completes Issue #55
-  - Added `needs_timer_reregistration` flag for lazy timer re-registration after restore
-  - `restore()` sets flag when pending timers are recovered; `process()` re-registers them with `TimerService`
-  - Verified all 5 emit strategies work correctly with session windows (OnWatermark, OnWindowClose, OnUpdate, Changelog, Final)
-  - 5 new tests: OnWatermark no intermediate emits, OnWindowClose no intermediate emits, Changelog timer output, OnUpdate progressive counts, timer re-registration after restore
-  - `on_watermark_advance()` deemed unnecessary — session windows use the same timer-based closure pattern as tumbling/sliding windows
-  - 42 total session window tests, 1,423 laminar-core tests, all passing
+- **F083–F089: SQL Compiler Integration** — 7 features wiring the JIT compiler stack (F078–F082) into end-to-end SQL query execution
+  - **F083: Batch Row Reader** — Arrow `RecordBatch` → `EventRow` conversion in bump arena
+    - `BatchRowReader` with pre-downcast `ColumnAccessor` enum, 14 type variants
+    - Round-trip correctness: `RecordBatch → EventRow → RowBatchBridge → RecordBatch`
+    - 17 tests in `batch_reader.rs`
+  - **F084: SQL Compiler Orchestrator** — Single `compile_streaming_query()` entry point
+    - LogicalPlan → extract pipelines → compile → wire bridges → `CompiledStreamingQuery`
+    - Breaker detection returns `None` for stateful operators (aggregate/sort/join)
+    - `extract_table_scan()` pulls source scan for DataFusion execution
+    - 12 tests in `orchestrate.rs`
+  - **F085: LaminarDB JIT Query Execution** — Wire compiled path into `handle_query()`
+    - `jit` feature on `laminar-db` forwarding to `laminar-core/jit`
+    - `CompilerCache` field on `LaminarDB` (jit-gated)
+    - `try_compile_query()` → `bridge_compiled_query()` with transparent fallback
+    - `handle_query()` tries JIT first, falls through to DataFusion on `None`
+    - 291 laminar-db tests pass
+  - **F086: Adaptive Compilation Warmup** — Background JIT with seamless swap
+    - `AdaptiveQueryRunner` using `tokio::sync::oneshot` for non-blocking compile results
+    - `ExecutionMode` enum: Interpreted → Compiling → Compiled / FallbackPermanent
+    - 6 tests in `adaptive.rs`
+  - **F087: Compiled Stateful Pipeline Bridge** — Multi-segment compiled/interpreted execution
+    - `Ring1Operator` trait for stateful operators at pipeline boundaries
+    - `BreakerExecutor` wraps Ring1Operator with stats tracking
+    - `CompiledQueryGraph` for linear chain of executors
+    - 13 tests in `breaker_executor.rs` (jit-gated)
+  - **F088: Schema-Aware Event Time Extraction** — Extract timestamps from data schema
+    - `RowEventTimeExtractor` with auto-detection (first TimestampMicros, then well-known names)
+    - `EventTimeConfig` with configurable column and watermark delay
+    - Integrated into `bridge_compiled_query()` for correct event-time processing
+    - 18 tests in `event_time.rs`
+  - **F089: Compilation Metrics & Observability** — Track compilation stats
+    - `CompilationMetrics` with atomic counters (compiled/fallback/error/compile_time)
+    - `MetricsSnapshot` with `compilation_rate()`, `CacheSnapshot` with `hit_rate()`/`fill_ratio()`
+    - 14 tests in `compilation_metrics.rs`
+  - Phase 2.5 SQL Compiler Integration: **7/7 features COMPLETE (100%)** ✅
 
-Previous session (2026-02-10):
-- **F017B: Session State Refactoring** — Multi-session per key support (commit `5e8dc79`)
-- **F017C: Session Merging & Overlap Detection** — Core fix for Issue #55 (commit `3734954`)
+Previous session (2026-02-11):
+- **F078–F082: Plan Compiler Core** — 5 features building the JIT compiler stack
+  - F078: EventRow format, F079: Cranelift expression compiler, F080: Pipeline extraction/compilation/cache
+  - F081: Ring 0/Ring 1 SPSC bridge, F082: StreamingQuery lifecycle management
 
 Previous session (2026-02-08):
 - **pgwire-replication integration for PostgreSQL CDC WAL streaming** (PR #74, closes #58)
-- **FFI API Surface Update** — Exposed full LaminarDB API through `api::Connection` (PR #49)
 - **Unified Checkpoint System (F-CKP-001 through F-CKP-009)** — ALL 9 FEATURES COMPLETE
 
 ### Where We Left Off
 
 **Phase 2: 38/38 features COMPLETE (100%)** ✅
+**Phase 2.5: 12/12 features COMPLETE (100%)** ✅ — F078–F082 (Plan Compiler) ✅, F083–F089 (SQL Compiler Integration) ✅
 **Phase 3: 67/76 features COMPLETE (88%)**
 
-Session window hardening (Issue #55): F017B ✅, F017C ✅, F017D ✅, F017E ✅
-
-**Test counts**: ~1,423 laminar-core (base), ~3,100+ with all feature flags
+**Test counts**: ~1,700+ laminar-core (with jit), ~3,100+ with all feature flags
 
 ### Immediate Next Steps
 
@@ -69,6 +96,12 @@ laminar-core/src/
   io_uring/       # io_uring + three-ring I/O
   xdp/            # XDP/eBPF network optimization
   budget/         # Task budget enforcement
+  compiler/       # Plan compiler: EventRow, JIT expr compiler (Cranelift), constant folding,
+                  #   pipeline extraction, pipeline compilation, cache, fallback,
+                  #   metrics (always-available types), query (StreamingQuery lifecycle),
+                  #   batch_reader (Arrow→EventRow), orchestrate (compile_streaming_query),
+                  #   event_time (schema-aware extraction), compilation_metrics (observability),
+                  #   breaker_executor (stateful pipeline bridge)
 
 laminar-sql/src/
   parser/         # Streaming SQL: windows, emit, late data, joins, aggregation, analytics, ranking

@@ -88,6 +88,10 @@ pub struct LaminarDB {
     start_time: std::time::Instant,
     /// Global pipeline watermark (min of all source watermarks).
     pipeline_watermark: Arc<std::sync::atomic::AtomicI64>,
+    /// Shared compiler cache for JIT-compiled pipelines.
+    /// Protected by `Mutex` — only locked during compilation, not execution.
+    #[cfg(feature = "jit")]
+    compiler_cache: parking_lot::Mutex<laminar_core::compiler::CompilerCache>,
 }
 
 /// Per-source watermark tracking state for the pipeline loop.
@@ -327,6 +331,11 @@ impl LaminarDB {
             counters: Arc::new(crate::metrics::PipelineCounters::new()),
             start_time: std::time::Instant::now(),
             pipeline_watermark: Arc::new(std::sync::atomic::AtomicI64::new(i64::MIN)),
+            #[cfg(feature = "jit")]
+            compiler_cache: parking_lot::Mutex::new(
+                laminar_core::compiler::CompilerCache::new(64)
+                    .expect("JIT compiler cache initialization"),
+            ),
         })
     }
 
@@ -1190,9 +1199,24 @@ impl LaminarDB {
                     return self.execute_asof_query(&asof_config, sql).await;
                 }
 
-                // Standard DataFusion path
                 let plan_sql = query_plan.statement.to_string();
                 let logical_plan = self.ctx.state().create_logical_plan(&plan_sql).await?;
+
+                // Try JIT compilation first (when feature enabled).
+                #[cfg(feature = "jit")]
+                {
+                    if let Some(compiled) = self.try_compile_query(sql, &logical_plan) {
+                        tracing::info!(
+                            sql = %sql,
+                            compiled = compiled.metadata.compiled_pipeline_count,
+                            fallback = compiled.metadata.fallback_pipeline_count,
+                            "Query compiled via JIT"
+                        );
+                        return self.bridge_compiled_query(sql, compiled).await;
+                    }
+                }
+
+                // Fall through to DataFusion interpreted execution.
                 let df = self.ctx.execute_logical_plan(logical_plan).await?;
                 let stream = df.execute_stream().await?;
 
@@ -1255,6 +1279,134 @@ impl LaminarDB {
             subscription: Some(subscription),
             active: true,
         })
+    }
+
+    // ── JIT compilation integration ─────────────────────────────────
+
+    /// Attempts to compile a query via the JIT compiler stack.
+    ///
+    /// Returns `Some(compiled)` if compilation succeeds.
+    /// Returns `None` if the plan has stateful operators or compilation fails.
+    /// Compilation errors are logged at `DEBUG` level and swallowed — transparent fallback.
+    #[cfg(feature = "jit")]
+    fn try_compile_query(
+        &self,
+        sql: &str,
+        logical_plan: &datafusion::logical_expr::LogicalPlan,
+    ) -> Option<laminar_core::compiler::CompiledStreamingQuery> {
+        let Some(mut cache) = self.compiler_cache.try_lock() else {
+            tracing::debug!(sql = %sql, "Compiler cache contended, falling back to DataFusion");
+            return None;
+        };
+        let config = laminar_core::compiler::QueryConfig::default();
+        match laminar_core::compiler::compile_streaming_query(
+            sql,
+            logical_plan,
+            &mut cache,
+            &config,
+        ) {
+            Ok(result) => result,
+            Err(e) => {
+                tracing::debug!(
+                    sql = %sql,
+                    error = %e,
+                    "JIT compilation failed, falling back to DataFusion"
+                );
+                None
+            }
+        }
+    }
+
+    /// Executes a compiled query: runs the source scan via `DataFusion`, feeds
+    /// rows through the compiled pipeline, and bridges output to the subscription.
+    #[cfg(feature = "jit")]
+    async fn bridge_compiled_query(
+        &self,
+        sql: &str,
+        compiled: laminar_core::compiler::CompiledStreamingQuery,
+    ) -> Result<ExecuteResult, DbError> {
+        use laminar_core::compiler::batch_reader::BatchRowReader;
+        use laminar_core::compiler::event_time::{EventTimeConfig, RowEventTimeExtractor};
+        use laminar_core::compiler::pipeline_bridge::Ring1Action;
+
+        // 1. Execute source scan via DataFusion to get input stream.
+        let df = self.ctx.execute_logical_plan(compiled.source_plan).await?;
+        let input_stream = df.execute_stream().await?;
+        let output_schema = compiled.output_schema.arrow_schema().clone();
+
+        // 2. Set up subscription infrastructure.
+        let query_id = self.catalog.register_query(sql);
+        let source_cfg = streaming::SourceConfig::with_buffer_size(self.config.default_buffer_size);
+        let (source, sink) =
+            streaming::create_with_config::<crate::catalog::ArrowRecord>(source_cfg);
+        let subscription = sink.subscribe();
+
+        // 3. Build event time extractor (auto-detect from schema).
+        let input_schema = compiled.input_schema;
+        let time_config = EventTimeConfig::default();
+        let time_extractor = RowEventTimeExtractor::from_schema(&input_schema, &time_config);
+
+        // 4. Spawn bridge task: input stream → EventRow → compiled pipeline → output batches.
+        let source_clone = source.clone();
+        let mut query = compiled.query;
+        query
+            .start()
+            .map_err(|e| DbError::InvalidOperation(e.to_string()))?;
+
+        tokio::spawn(async move {
+            use tokio_stream::StreamExt;
+            let mut stream = input_stream;
+            let mut extractor = time_extractor;
+            let mut arena = bumpalo::Bump::with_capacity(1024 * 128);
+
+            while let Some(result) = stream.next().await {
+                match result {
+                    Ok(batch) => {
+                        let reader = BatchRowReader::new(&batch, &input_schema);
+                        for row_idx in 0..reader.row_count() {
+                            let row = reader.read_row(row_idx, &arena);
+                            let event_time = match extractor {
+                                Some(ref mut ext) => ext.extract(&row),
+                                #[allow(clippy::cast_possible_wrap)]
+                                None => row_idx as i64,
+                            };
+                            let _ = query.submit_row(&row, event_time, row_idx as u64);
+                        }
+                        // Advance watermark after each batch.
+                        if let Some(ref ext) = extractor {
+                            let _ = query.advance_watermark(ext.watermark());
+                        }
+                        // Drain compiled output.
+                        let actions = query.poll_ring1();
+                        for action in actions {
+                            if let Ring1Action::ProcessBatch(out_batch) = action {
+                                if source_clone.push_arrow(out_batch).is_err() {
+                                    return;
+                                }
+                            }
+                        }
+                        // Reset arena for next batch — keeps underlying allocation.
+                        arena.reset();
+                    }
+                    Err(_) => break,
+                }
+            }
+            // Flush remaining output.
+            let _ = query.send_eof();
+            for action in query.poll_ring1() {
+                if let Ring1Action::ProcessBatch(batch) = action {
+                    let _ = source_clone.push_arrow(batch);
+                }
+            }
+        });
+
+        Ok(ExecuteResult::Query(QueryHandle {
+            id: query_id,
+            schema: output_schema,
+            sql: sql.to_string(),
+            subscription: Some(subscription),
+            active: true,
+        }))
     }
 
     /// Extract an ASOF join config from a query plan, if present.
