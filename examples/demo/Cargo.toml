@@ -41,7 +41,7 @@ rand = { workspace = true }
 
 # TUI
 ratatui = { version = "0.30", features = ["all-widgets"] }
-crossterm = "0.28"
+crossterm = "0.29"
 
 # System metrics
 sysinfo = "0.33"
