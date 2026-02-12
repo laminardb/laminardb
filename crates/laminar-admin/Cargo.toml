@@ -16,7 +16,7 @@ tower = "0.4"
 tower-http = { version = "0.5", features = ["fs", "cors"] }
 
 # API documentation
-utoipa = { version = "4.1", features = ["axum_extras"] }
+utoipa = { version = "5.4", features = ["axum_extras"] }
 utoipa-swagger-ui = { version = "9.0", features = ["axum"] }
 
 # Common
