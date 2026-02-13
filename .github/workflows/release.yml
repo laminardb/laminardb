@@ -66,18 +66,27 @@ jobs:
           - os: ubuntu-latest
             target: x86_64-unknown-linux-gnu
             cross: false
+            features: --all-features
           - os: ubuntu-latest
             target: aarch64-unknown-linux-gnu
             cross: true
+            # Cross builds: skip hwloc (needs target-arch libhwloc) and xdp (needs libelf);
+            # io-uring is pure syscalls so cross-compiles fine
+            features: --features "allocation-tracking,io-uring,jit,kafka,postgres-cdc,postgres-sink,mysql-cdc,delta-lake"
           - os: ubuntu-latest
             target: x86_64-unknown-linux-musl
             cross: true
+            features: --features "allocation-tracking,io-uring,jit,kafka,postgres-cdc,postgres-sink,mysql-cdc,delta-lake"
           - os: macos-15  # ARM64
             target: aarch64-apple-darwin
             cross: false
+            # macOS: skip Linux-only features (hwloc, io-uring, xdp)
+            features: --features "allocation-tracking,jit,kafka,postgres-cdc,postgres-sink,mysql-cdc,delta-lake"
           - os: windows-latest
             target: x86_64-pc-windows-msvc
             cross: false
+            # Windows: skip Linux-only features (hwloc, io-uring, xdp)
+            features: --features "allocation-tracking,jit,kafka,postgres-cdc,postgres-sink,mysql-cdc,delta-lake"
     steps:
       - uses: actions/checkout@v6
       - uses: dtolnay/rust-toolchain@stable
@@ -106,17 +115,21 @@ jobs:
           echo "Workspace version:"
           grep '^version' Cargo.toml
 
+      - name: Install system dependencies (Linux native)
+        if: runner.os == 'Linux' && !matrix.cross
+        run: sudo apt-get update && sudo apt-get install -y libhwloc-dev libelf-dev zlib1g-dev libcurl4-openssl-dev cmake pkg-config libsasl2-dev libudev-dev
+
       - name: Install cross
         if: matrix.cross
         run: cargo install cross --git https://github.com/cross-rs/cross
 
       - name: Build (cross)
         if: matrix.cross
-        run: cross build --workspace --release --all-features --target ${{ matrix.target }}
+        run: cross build --workspace --release ${{ matrix.features }} --target ${{ matrix.target }}
 
       - name: Build (native)
         if: "!matrix.cross"
-        run: cargo build --workspace --release --all-features --target ${{ matrix.target }}
+        run: cargo build --workspace --release ${{ matrix.features }} --target ${{ matrix.target }}
 
       - name: Package artifacts
         shell: bash
