@@ -1,0 +1,64 @@
+# laminar-db
+
+Unified database facade for LaminarDB.
+
+## Overview
+
+This crate provides `LaminarDB`, the primary user-facing type that ties together the SQL parser, query planner, DataFusion context, streaming infrastructure, and connector registry into a single interface.
+
+## Key Types
+
+- **`LaminarDB`** -- Main database handle. Manages sources, streams, sinks, and the streaming pipeline lifecycle.
+- **`LaminarDbBuilder`** -- Fluent builder for constructing `LaminarDB` with custom configuration.
+- **`ExecuteResult`** -- Result of executing a SQL statement (DDL, query, rows affected, metadata).
+- **`QueryHandle`** -- Handle to a running streaming query with schema and subscription access.
+- **`SourceHandle<T>`** / **`UntypedSourceHandle`** -- Typed and untyped handles for pushing data into sources.
+- **`TypedSubscription<T>`** -- Subscription to a named stream with automatic RecordBatch-to-struct conversion.
+
+## Usage
+
+```rust
+use laminar_db::LaminarDB;
+
+let db = LaminarDB::open()?;
+
+// Create a source
+db.execute("CREATE SOURCE trades (
+    symbol VARCHAR, price DOUBLE, ts BIGINT
+)").await?;
+
+// Create a continuous query
+db.execute("CREATE STREAM avg_price AS
+    SELECT symbol, AVG(price) AS avg
+    FROM trades
+    GROUP BY symbol, tumble(ts, INTERVAL '1' MINUTE)
+").await?;
+
+// Push data
+let source = db.source_untyped("trades")?;
+
+// Start the pipeline
+db.start().await?;
+
+// Shutdown
+db.shutdown().await?;
+```
+
+## Feature Flags
+
+| Flag | Purpose |
+|------|---------|
+| `api` | FFI-friendly API module with `Connection`, `Writer`, `QueryStream` |
+| `ffi` | C FFI layer with `extern "C"` functions and Arrow C Data Interface |
+| `jit` | Cranelift JIT compilation (forwards to laminar-core) |
+| `kafka` | Kafka source/sink connector |
+| `postgres-cdc` | PostgreSQL CDC source |
+| `postgres-sink` | PostgreSQL sink |
+| `rocksdb` | RocksDB-backed persistent state |
+
+## Related Crates
+
+- [`laminar-core`](../laminar-core) -- Ring 0 engine (operators, state, streaming)
+- [`laminar-sql`](../laminar-sql) -- SQL parser and DataFusion integration
+- [`laminar-storage`](../laminar-storage) -- WAL and checkpointing
+- [`laminar-connectors`](../laminar-connectors) -- External system connectors
