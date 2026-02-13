@@ -20,10 +20,10 @@ postgres-sink = ["laminar-connectors/postgres-sink"]
 rocksdb = ["dep:rocksdb"]
 
 [dependencies]
-laminar-core = { path = "../laminar-core", version = "0.1.0" }
-laminar-sql = { path = "../laminar-sql", version = "0.1.0" }
-laminar-storage = { path = "../laminar-storage", version = "0.1.0" }
-laminar-connectors = { path = "../laminar-connectors", version = "0.1.0" }
+laminar-core = { path = "../laminar-core", version = "0.12.0" }
+laminar-sql = { path = "../laminar-sql", version = "0.12.0" }
+laminar-storage = { path = "../laminar-storage", version = "0.12.0" }
+laminar-connectors = { path = "../laminar-connectors", version = "0.12.0" }
 
 # Arrow
 arrow = { workspace = true }
@@ -69,4 +69,4 @@ tracing = { workspace = true }
 [dev-dependencies]
 tokio = { workspace = true, features = ["test-util", "macros"] }
 tempfile = { workspace = true }
-laminar-derive = { path = "../laminar-derive", version = "0.1.0" }
+laminar-derive = { path = "../laminar-derive", version = "0.12.0" }
