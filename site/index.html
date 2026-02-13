@@ -4,8 +4,8 @@
   <meta charset="UTF-8">
   <meta name="viewport" content="width=device-width, initial-scale=1.0">
   <title>LaminarDB - Embedded Streaming Database | Sub-Microsecond SQL Stream Processing</title>
-  <meta name="description" content="LaminarDB is an embedded streaming database in Rust. Sub-microsecond latency, full SQL support, exactly-once semantics. DuckDB for stream processing.">
-  <meta name="keywords" content="streaming database, embedded database, real-time analytics, stream processing, Rust, Apache Arrow, DataFusion, SQL streaming, sub-microsecond latency">
+  <meta name="description" content="LaminarDB is an embedded streaming database in Rust with Python bindings. Sub-microsecond latency, full SQL support, exactly-once semantics, Kafka &amp; CDC connectors. DuckDB for stream processing.">
+  <meta name="keywords" content="streaming database, embedded database, real-time analytics, stream processing, Rust, Python, Apache Arrow, DataFusion, SQL streaming, sub-microsecond latency, Kafka, CDC, Delta Lake">
   <link rel="canonical" href="https://laminardb.io">
 
   <!-- Open Graph -->
@@ -47,7 +47,7 @@
     "license": "https://opensource.org/licenses/Apache-2.0",
     "url": "https://laminardb.io",
     "codeRepository": "https://github.com/laminardb/laminardb",
-    "programmingLanguage": "Rust"
+    "programmingLanguage": ["Rust", "Python"]
   }
   </script>
 </head>
@@ -68,6 +68,7 @@
         <a href="#architecture">Architecture</a>
         <a href="#dataflow">Data Flow</a>
         <a href="#features">Features</a>
+        <a href="https://crates.io/crates/laminar-db" target="_blank" rel="noopener">Crates.io</a>
       </nav>
 
       <div class="nav-actions">
@@ -114,7 +115,7 @@
 
       <div class="hero-content">
         <h1 class="gradient-text">The Embedded<br>Streaming Database</h1>
-        <p class="hero-subtitle">Sub-microsecond SQL stream processing. No cluster required.</p>
+        <p class="hero-subtitle">Sub-microsecond SQL stream processing in Rust &amp; Python. No cluster required.</p>
 
         <div class="hero-latency reveal">
           <span class="latency-number" id="latency-counter">0</span>
@@ -134,8 +135,8 @@
         <div class="hero-badges">
           <span class="badge">Apache 2.0</span>
           <span class="badge">Rust</span>
-          <span class="badge">2600+ Tests</span>
-          <span class="badge">84 Features</span>
+          <span class="badge">3100+ Tests</span>
+          <span class="badge">130+ Features</span>
         </div>
       </div>
     </section>
@@ -293,6 +294,7 @@
         <div class="code-tabs reveal">
           <div class="tab-buttons">
             <button class="tab-btn active" data-tab="tab-rust">Rust API</button>
+            <button class="tab-btn" data-tab="tab-python">Python</button>
             <button class="tab-btn" data-tab="tab-sql">Streaming SQL</button>
             <button class="tab-btn" data-tab="tab-kafka">Kafka Pipeline</button>
             <button class="tab-btn" data-tab="tab-joins">Stream Joins</button>
@@ -349,6 +351,44 @@ async fn main() -> Result&lt;(), Box&lt;dyn std::error::Error&gt;&gt; {
     }
     Ok(())
 }</code></pre>
+          </div>
+
+          <div class="tab-panel" id="tab-python">
+            <button class="copy-btn" aria-label="Copy code">Copy</button>
+            <pre><code class="language-python">import laminardb
+import pyarrow as pa
+
+# Open an in-memory database (or pass a path for persistence)
+db = laminardb.open(":memory:")
+
+# Define source and streaming query
+db.execute("""CREATE SOURCE trades (
+    symbol VARCHAR, price DOUBLE, volume BIGINT, ts BIGINT
+)""")
+db.execute("""CREATE STREAM vwap AS
+    SELECT symbol, SUM(price * volume) / SUM(volume) AS vwap,
+           COUNT(*) AS trade_count
+    FROM trades
+    GROUP BY symbol, TUMBLE(ts, INTERVAL '1' MINUTE)
+    EMIT ON WINDOW CLOSE
+""")
+
+db.start()
+
+# Insert data (dict or PyArrow RecordBatch)
+db.insert("trades", {"symbol": "AAPL", "price": 150.25, "volume": 100, "ts": 1700000000000})
+
+# Query results as PyArrow Table (zero-copy)
+result = db.query("SELECT * FROM vwap")
+print(result.to_pandas())
+
+# Subscribe for streaming updates
+sub = db.subscribe("vwap")
+for batch in sub:
+    print(batch.to_pandas())
+
+# pip install laminardb
+# Requires: Python 3.8+, PyArrow 14+</code></pre>
           </div>
 
           <div class="tab-panel" id="tab-sql">
@@ -665,8 +705,8 @@ CREATE SINK lake TO DELTA_LAKE (
     <!-- ======== Features Grid ======== -->
     <section class="features" id="features">
       <div class="container text-center">
-        <h2 class="section-heading reveal">84 Features <span class="gradient-text">And Counting</span></h2>
-        <p class="section-subheading reveal">Production-grade streaming across engine, SQL, durability, and connectors.</p>
+        <h2 class="section-heading reveal">130+ Features <span class="gradient-text">And Counting</span></h2>
+        <p class="section-subheading reveal">Production-grade streaming across engine, SQL, durability, connectors, and language bindings.</p>
       </div>
       <div class="container">
         <div class="features-categories reveal">
@@ -982,6 +1022,133 @@ CREATE SINK lake TO DELTA_LAKE (
 
           <div class="feature-category">
             <button class="feature-category-header">
+              <h3>Checkpointing &amp; Recovery</h3>
+              <div><span class="count">9 features</span> <span class="chevron">&#9660;</span></div>
+            </button>
+            <div class="feature-list">
+              <div class="feature-item">
+                <span class="feature-name">Checkpoint Manifest &amp; Store</span>
+                <span class="feature-desc">Unified manifest with operator, connector, and sink state</span>
+                <span class="feature-badge done">Done</span>
+              </div>
+              <div class="feature-item">
+                <span class="feature-name">Two-Phase Sink Protocol</span>
+                <span class="feature-desc">pre_commit() / commit_epoch() for exactly-once sinks</span>
+                <span class="feature-badge done">Done</span>
+              </div>
+              <div class="feature-item">
+                <span class="feature-name">Checkpoint Coordinator</span>
+                <span class="feature-desc">Chandy-Lamport barriers across all operators and sinks</span>
+                <span class="feature-badge done">Done</span>
+              </div>
+              <div class="feature-item">
+                <span class="feature-name">Operator State Persistence</span>
+                <span class="feature-desc">Window, join, and aggregation state snapshot/restore</span>
+                <span class="feature-badge done">Done</span>
+              </div>
+              <div class="feature-item">
+                <span class="feature-name">Changelog Buffer Wiring</span>
+                <span class="feature-desc">Zero-alloc Ring 0 changelog via ChangelogAwareStore</span>
+                <span class="feature-badge done">Done</span>
+              </div>
+              <div class="feature-item">
+                <span class="feature-name">WAL Checkpoint Coordination</span>
+                <span class="feature-desc">Per-core WAL epoch alignment with checkpoint barriers</span>
+                <span class="feature-badge done">Done</span>
+              </div>
+              <div class="feature-item">
+                <span class="feature-name">Unified Recovery Manager</span>
+                <span class="feature-desc">Full state restore from manifest + WAL replay</span>
+                <span class="feature-badge done">Done</span>
+              </div>
+              <div class="feature-item">
+                <span class="feature-name">End-to-End Recovery Tests</span>
+                <span class="feature-desc">Crash recovery with connector offset resumption</span>
+                <span class="feature-badge done">Done</span>
+              </div>
+              <div class="feature-item">
+                <span class="feature-name">Checkpoint Observability</span>
+                <span class="feature-desc">Metrics for checkpoint duration, size, and recovery time</span>
+                <span class="feature-badge done">Done</span>
+              </div>
+            </div>
+          </div>
+
+          <div class="feature-category">
+            <button class="feature-category-header">
+              <h3>JIT Compilation</h3>
+              <div><span class="count">12 features</span> <span class="chevron">&#9660;</span></div>
+            </button>
+            <div class="feature-list">
+              <div class="feature-item">
+                <span class="feature-name">Event Row Format</span>
+                <span class="feature-desc">Bump-arena row format for zero-allocation Ring 0 processing</span>
+                <span class="feature-badge done">Done</span>
+              </div>
+              <div class="feature-item">
+                <span class="feature-name">Cranelift Expression Compiler</span>
+                <span class="feature-desc">JIT-compile SQL expressions to native machine code</span>
+                <span class="feature-badge done">Done</span>
+              </div>
+              <div class="feature-item">
+                <span class="feature-name">Plan Compiler Core</span>
+                <span class="feature-desc">Pipeline extraction, compilation, caching, and fallback</span>
+                <span class="feature-badge done">Done</span>
+              </div>
+              <div class="feature-item">
+                <span class="feature-name">Ring 0/Ring 1 Bridge</span>
+                <span class="feature-desc">SPSC pipeline bridge between compiled and interpreted code</span>
+                <span class="feature-badge done">Done</span>
+              </div>
+              <div class="feature-item">
+                <span class="feature-name">Adaptive Compilation</span>
+                <span class="feature-desc">Background JIT with seamless interpreted-to-compiled swap</span>
+                <span class="feature-badge done">Done</span>
+              </div>
+              <div class="feature-item">
+                <span class="feature-name">Compilation Metrics</span>
+                <span class="feature-desc">Hit rate, compile time, fallback rate observability</span>
+                <span class="feature-badge done">Done</span>
+              </div>
+            </div>
+          </div>
+
+          <div class="feature-category">
+            <button class="feature-category-header">
+              <h3>Language Bindings</h3>
+              <div><span class="count">5 features</span> <span class="chevron">&#9660;</span></div>
+            </button>
+            <div class="feature-list">
+              <div class="feature-item">
+                <span class="feature-name">Python Bindings (PyO3)</span>
+                <span class="feature-desc">Full API: open, execute, insert, query, subscribe, start</span>
+                <span class="feature-badge done">Done</span>
+              </div>
+              <div class="feature-item">
+                <span class="feature-name">PyArrow Zero-Copy</span>
+                <span class="feature-desc">pyo3-arrow for RecordBatch interchange without copying</span>
+                <span class="feature-badge done">Done</span>
+              </div>
+              <div class="feature-item">
+                <span class="feature-name">C FFI API</span>
+                <span class="feature-desc">Opaque handles, cbindgen headers, Arrow C Data Interface</span>
+                <span class="feature-badge done">Done</span>
+              </div>
+              <div class="feature-item">
+                <span class="feature-name">Async FFI Callbacks</span>
+                <span class="feature-desc">Non-blocking subscription callbacks across FFI boundary</span>
+                <span class="feature-badge done">Done</span>
+              </div>
+              <div class="feature-item">
+                <span class="feature-name">Derive Macros</span>
+                <span class="feature-desc">#[derive(Record, FromRecordBatch)] for typed data flow</span>
+                <span class="feature-badge done">Done</span>
+              </div>
+            </div>
+          </div>
+
+          <div class="feature-category">
+            <button class="feature-category-header">
               <h3>Coming Soon</h3>
               <div><span class="count">6+ features</span> <span class="chevron">&#9660;</span></div>
             </button>
@@ -1093,7 +1260,7 @@ CREATE SINK lake TO DELTA_LAKE (
               </tr>
               <tr>
                 <td>Lakehouse</td>
-                <td class="highlight">Planned</td>
+                <td class="highlight"><span class="check">&#10003;</span> Delta + Iceberg</td>
                 <td>Limited</td>
                 <td><span class="cross">&#10007;</span></td>
                 <td><span class="check">&#10003;</span></td>
@@ -1134,7 +1301,11 @@ CREATE SINK lake TO DELTA_LAKE (
             <div class="step-number">1</div>
             <div class="step-content">
               <h3>Add the dependency</h3>
-              <pre><code class="language-bash">cargo add laminar-db</code></pre>
+              <pre><code class="language-bash"># Rust
+cargo add laminar-db
+
+# Python
+pip install laminardb</code></pre>
             </div>
           </div>
           <div class="step reveal">
@@ -1172,8 +1343,9 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
 
         <div class="get-started-links reveal">
           <a href="https://laminardb.io/api/" class="btn btn-primary" target="_blank" rel="noopener">Documentation</a>
+          <a href="https://crates.io/crates/laminar-db" class="btn btn-secondary" target="_blank" rel="noopener">Crates.io</a>
+          <a href="https://github.com/laminardb/laminardb-python" class="btn btn-secondary" target="_blank" rel="noopener">Python Bindings</a>
           <a href="https://github.com/laminardb/laminardb/tree/main/examples" class="btn btn-secondary" target="_blank" rel="noopener">Examples</a>
-          <a href="https://laminardb.io/api/" class="btn btn-secondary" target="_blank" rel="noopener">API Reference</a>
         </div>
       </div>
     </section>
@@ -1197,6 +1369,10 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
             <div class="built-with-item">
               <svg width="16" height="16" viewBox="0 0 24 24" fill="#fb923c"><path d="M23.837 8.237a1.006 1.006 0 0 0-.795-.465l-7.003-.575L13.14.532a1.004 1.004 0 0 0-1.88 0L8.36 7.197l-7.003.575A1 1 0 0 0 .781 9.39l5.296 4.635-1.577 6.89a1.001 1.001 0 0 0 1.483 1.078L12 18.63l5.017 3.363a1.001 1.001 0 0 0 1.483-1.078l-1.577-6.89 5.296-4.635a1 1 0 0 0 .618-1.153z"/></svg>
               Rust
+            </div>
+            <div class="built-with-item">
+              <svg width="16" height="16" viewBox="0 0 24 24" fill="#3776ab"><path d="M12 2C6.48 2 2 6.48 2 12s4.48 10 10 10 10-4.48 10-10S17.52 2 12 2zm0 18c-4.41 0-8-3.59-8-8s3.59-8 8-8 8 3.59 8 8-3.59 8-8 8z"/></svg>
+              Python
             </div>
             <div class="built-with-item">
               <svg width="16" height="16" viewBox="0 0 24 24" fill="var(--accent-primary)"><path d="M12 2L2 7l10 5 10-5-10-5zM2 17l10 5 10-5M2 12l10 5 10-5"/></svg>
@@ -1227,8 +1403,9 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         <div class="footer-links">
           <a href="https://laminardb.io/api/" target="_blank" rel="noopener">Documentation</a>
           <a href="https://github.com/laminardb/laminardb" target="_blank" rel="noopener">GitHub</a>
+          <a href="https://crates.io/crates/laminar-db" target="_blank" rel="noopener">Crates.io</a>
+          <a href="https://github.com/laminardb/laminardb-python" target="_blank" rel="noopener">Python Bindings</a>
           <a href="https://github.com/laminardb/laminardb/blob/main/CONTRIBUTING.md" target="_blank" rel="noopener">Contributing</a>
-          <a href="https://github.com/laminardb/laminardb/blob/main/LICENSE" target="_blank" rel="noopener">License</a>
         </div>
       </div>
       <div>
@@ -1251,6 +1428,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
   <script src="https://cdnjs.cloudflare.com/ajax/libs/prism/1.29.0/components/prism-sql.min.js"></script>
   <script src="https://cdnjs.cloudflare.com/ajax/libs/prism/1.29.0/components/prism-rust.min.js"></script>
   <script src="https://cdnjs.cloudflare.com/ajax/libs/prism/1.29.0/components/prism-bash.min.js"></script>
+  <script src="https://cdnjs.cloudflare.com/ajax/libs/prism/1.29.0/components/prism-python.min.js"></script>
 
   <!-- Main JS -->
   <script src="js/main.js"></script>
