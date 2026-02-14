@@ -18,6 +18,6 @@ pre-build = [
 # substitution which breaks when cross-rs changes the toolchain file format.
 [target.x86_64-unknown-linux-musl]
 pre-build = [
-    "apt-get update && apt-get --assume-yes install zlib1g-dev libcurl4-openssl-dev",
+    "apt-get update && apt-get --assume-yes install zlib1g-dev",
     "printf '\\nset(CMAKE_FIND_ROOT_PATH_MODE_LIBRARY BOTH)\\nset(CMAKE_FIND_ROOT_PATH_MODE_INCLUDE BOTH)\\nset(CMAKE_FIND_ROOT_PATH_MODE_PACKAGE BOTH)\\n' >> /opt/toolchain.cmake || true"
 ]
