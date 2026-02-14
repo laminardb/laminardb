@@ -180,7 +180,9 @@ mod tests {
             schema,
             vec![
                 Arc::new(Int64Array::from(timestamps)),
-                Arc::new(Int64Array::from((0..len as i64).collect::<Vec<_>>())),
+                Arc::new(Int64Array::from(
+                    (0..i64::try_from(len).expect("len fits i64")).collect::<Vec<_>>(),
+                )),
             ],
         )
         .unwrap()
