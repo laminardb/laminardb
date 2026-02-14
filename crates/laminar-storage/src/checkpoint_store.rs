@@ -20,6 +20,31 @@ use std::path::{Path, PathBuf};
 
 use crate::checkpoint_manifest::CheckpointManifest;
 
+/// Fsync a file to ensure its contents are durable on disk.
+fn sync_file(path: &Path) -> Result<(), std::io::Error> {
+    // Must open with write access — Windows requires it for FlushFileBuffers.
+    let f = std::fs::OpenOptions::new().write(true).open(path)?;
+    f.sync_all()
+}
+
+/// Fsync a directory to make rename operations durable.
+///
+/// On Unix, this flushes directory metadata (new/renamed entries).
+/// On Windows, directory sync is not supported; the OS handles durability.
+#[allow(clippy::unnecessary_wraps)] // Returns Result on Unix, no-op on Windows
+fn sync_dir(path: &Path) -> Result<(), std::io::Error> {
+    #[cfg(unix)]
+    {
+        let f = std::fs::File::open(path)?;
+        f.sync_all()?;
+    }
+    #[cfg(not(unix))]
+    {
+        let _ = path;
+    }
+    Ok(())
+}
+
 /// Errors from checkpoint store operations.
 #[derive(Debug, thiserror::Error)]
 pub enum CheckpointStoreError {
@@ -183,18 +208,23 @@ impl CheckpointStore for FileSystemCheckpointStore {
         let manifest_path = self.manifest_path(manifest.checkpoint_id);
         let json = serde_json::to_string_pretty(manifest)?;
 
-        // Write to a temp file, then rename for atomicity
+        // Write to a temp file, fsync, then rename for atomic durability
         let tmp_path = manifest_path.with_extension("json.tmp");
         std::fs::write(&tmp_path, &json)?;
+        sync_file(&tmp_path)?;
         std::fs::rename(&tmp_path, &manifest_path)?;
+        sync_dir(&cp_dir)?;
 
-        // Update latest.txt pointer
+        // Update latest.txt pointer — only after manifest is durable
         let latest = self.latest_path();
-        std::fs::create_dir_all(latest.parent().unwrap_or(Path::new(".")))?;
+        let latest_dir = latest.parent().unwrap_or(Path::new("."));
+        std::fs::create_dir_all(latest_dir)?;
         let latest_content = format!("checkpoint_{:06}", manifest.checkpoint_id);
         let tmp_latest = latest.with_extension("txt.tmp");
         std::fs::write(&tmp_latest, &latest_content)?;
+        sync_file(&tmp_latest)?;
         std::fs::rename(&tmp_latest, &latest)?;
+        sync_dir(latest_dir)?;
 
         // Auto-prune if configured
         if self.max_retained > 0 {

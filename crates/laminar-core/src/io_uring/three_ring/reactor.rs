@@ -34,6 +34,9 @@ use crate::io_uring::IoUringError;
 /// When the main ring blocks waiting for I/O, it also waits on the latency
 /// ring's eventfd. Any completion on the latency ring immediately wakes
 /// the main ring, ensuring sub-microsecond response for latency-critical ops.
+/// Default pre-allocation capacity for completion scratch buffers.
+const CQE_SCRATCH_CAPACITY: usize = 64;
+
 pub struct ThreeRingReactor {
     /// Latency-critical operations (network, urgent).
     /// Always checked first, never blocks.
@@ -69,6 +72,12 @@ pub struct ThreeRingReactor {
 
     /// Whether the reactor is closed.
     closed: bool,
+
+    /// Pre-allocated scratch buffer for CQE data (avoids per-poll Vec allocs).
+    cqe_scratch: Vec<(u64, i32, u32)>,
+
+    /// Pre-allocated scratch buffers for completions in `run()`.
+    completion_scratch: Vec<RoutedCompletion>,
 }
 
 impl ThreeRingReactor {
@@ -125,6 +134,8 @@ impl ThreeRingReactor {
             stats: ThreeRingStats::new(),
             config,
             closed: false,
+            cqe_scratch: Vec::with_capacity(CQE_SCRATCH_CAPACITY),
+            completion_scratch: Vec::with_capacity(CQE_SCRATCH_CAPACITY),
         })
     }
 
@@ -382,6 +393,7 @@ impl ThreeRingReactor {
     /// Poll all rings for completions without blocking.
     ///
     /// Always drains latency ring first for priority.
+    /// Internal CQE collection reuses a pre-allocated scratch buffer.
     #[must_use]
     pub fn poll_all(&mut self) -> Vec<RoutedCompletion> {
         if self.closed {
@@ -404,17 +416,17 @@ impl ThreeRingReactor {
 
     /// Poll only the latency ring.
     fn poll_latency_ring(&mut self, completions: &mut Vec<RoutedCompletion>) {
-        // Collect CQE data first to avoid borrow conflict
-        let cqe_data: Vec<(u64, i32, u32)> = {
+        // Collect CQE data into pre-allocated scratch to avoid borrow conflict
+        self.cqe_scratch.clear();
+        {
             let cq = self.latency_ring.completion();
-            let mut data = Vec::new();
             for cqe in cq {
-                data.push((cqe.user_data(), cqe.result(), cqe.flags()));
+                self.cqe_scratch
+                    .push((cqe.user_data(), cqe.result(), cqe.flags()));
             }
-            data
-        };
+        }
 
-        for (user_data, result, flags) in cqe_data {
+        for &(user_data, result, flags) in &self.cqe_scratch {
             let completion = self.process_cqe_data(user_data, result, flags, RingAffinity::Latency);
             self.stats
                 .record_latency_completion(completion.latency(), completion.is_success());
@@ -424,17 +436,17 @@ impl ThreeRingReactor {
 
     /// Poll only the main ring.
     fn poll_main_ring(&mut self, completions: &mut Vec<RoutedCompletion>) {
-        // Collect CQE data first to avoid borrow conflict
-        let cqe_data: Vec<(u64, i32, u32)> = {
+        // Collect CQE data into pre-allocated scratch to avoid borrow conflict
+        self.cqe_scratch.clear();
+        {
             let cq = self.main_ring.completion();
-            let mut data = Vec::new();
             for cqe in cq {
-                data.push((cqe.user_data(), cqe.result(), cqe.flags()));
+                self.cqe_scratch
+                    .push((cqe.user_data(), cqe.result(), cqe.flags()));
             }
-            data
-        };
+        }
 
-        for (user_data, result, flags) in cqe_data {
+        for &(user_data, result, flags) in &self.cqe_scratch {
             let completion = self.process_cqe_data(user_data, result, flags, RingAffinity::Main);
             self.stats
                 .record_main_completion(completion.latency(), completion.is_success());
@@ -444,20 +456,20 @@ impl ThreeRingReactor {
 
     /// Poll only the poll ring.
     fn poll_poll_ring(&mut self, completions: &mut Vec<RoutedCompletion>) {
-        // Collect CQE data first to avoid borrow conflict
-        let cqe_data: Vec<(u64, i32, u32)> = {
+        // Collect CQE data into pre-allocated scratch to avoid borrow conflict
+        self.cqe_scratch.clear();
+        {
             let Some(ref mut ring) = self.poll_ring else {
                 return;
             };
             let cq = ring.completion();
-            let mut data = Vec::new();
             for cqe in cq {
-                data.push((cqe.user_data(), cqe.result(), cqe.flags()));
+                self.cqe_scratch
+                    .push((cqe.user_data(), cqe.result(), cqe.flags()));
             }
-            data
-        };
+        }
 
-        for (user_data, result, flags) in cqe_data {
+        for &(user_data, result, flags) in &self.cqe_scratch {
             let completion = self.process_cqe_data(user_data, result, flags, RingAffinity::Poll);
             self.stats
                 .record_poll_completion(completion.latency(), completion.is_success());
@@ -492,26 +504,27 @@ impl ThreeRingReactor {
     /// Run the event loop with a handler.
     ///
     /// This is the main event loop that integrates with Ring 0/1/2 architecture.
+    /// Reuses pre-allocated scratch buffers to avoid per-iteration allocations.
     pub fn run(&mut self, handler: &mut dyn RingHandler) {
         while !self.closed {
             // 1. Always drain latency ring first (non-blocking)
-            let mut latency_completions = Vec::new();
-            self.poll_latency_ring(&mut latency_completions);
-            for completion in latency_completions {
+            self.completion_scratch.clear();
+            self.poll_latency_ring(&mut self.completion_scratch);
+            for completion in self.completion_scratch.drain(..) {
                 handler.handle_latency_completion(completion);
             }
 
             // 2. Drain main ring completions (non-blocking)
-            let mut main_completions = Vec::new();
-            self.poll_main_ring(&mut main_completions);
-            for completion in main_completions {
+            self.completion_scratch.clear();
+            self.poll_main_ring(&mut self.completion_scratch);
+            for completion in self.completion_scratch.drain(..) {
                 handler.handle_main_completion(completion);
             }
 
             // 3. Drain poll ring if present (non-blocking)
-            let mut poll_completions = Vec::new();
-            self.poll_poll_ring(&mut poll_completions);
-            for completion in poll_completions {
+            self.completion_scratch.clear();
+            self.poll_poll_ring(&mut self.completion_scratch);
+            for completion in self.completion_scratch.drain(..) {
                 handler.handle_poll_completion(completion);
             }
 

@@ -471,6 +471,14 @@ impl CheckpointCoordinator {
             warn!(checkpoint_id, epoch, error = %e, "sink commit partially failed");
         }
 
+        // ── Step 7: Clear changelog drainer pending buffers ──
+        // Entries are metadata-only (key_hash + mmap_offset) used for SPSC
+        // backpressure relief. The checkpoint captured full state, so the
+        // metadata is no longer needed. Clearing prevents unbounded growth.
+        for drainer in &mut self.changelog_drainers {
+            drainer.clear_pending();
+        }
+
         // ── Success ──
         self.phase = CheckpointPhase::Idle;
         self.next_checkpoint_id += 1;
@@ -1347,6 +1355,13 @@ mod tests {
             .unwrap();
 
         assert!(result.success);
+
+        // Changelog drainer pending should be cleared after successful checkpoint
+        assert_eq!(
+            coord.changelog_drainers()[0].pending_count(),
+            0,
+            "pending entries should be cleared after checkpoint"
+        );
 
         // Manifest should have per-core WAL positions
         let loaded = coord.store().load_latest().unwrap().unwrap();

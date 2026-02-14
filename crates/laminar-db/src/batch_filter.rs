@@ -21,7 +21,9 @@ pub(crate) enum ThresholdOp {
 ///
 /// Handles Int64 (millis/seconds/micros/nanos), Arrow Timestamp (all `TimeUnit`s),
 /// and Iso8601 (pass-through). Returns `None` if the filtered result is empty.
-#[allow(clippy::too_many_lines)]
+///
+/// Uses Arrow's SIMD-accelerated comparison kernels (`arrow::compute::kernels::cmp`)
+/// instead of row-by-row iteration.
 pub(crate) fn filter_batch_by_timestamp(
     batch: &RecordBatch,
     column: &str,
@@ -31,6 +33,7 @@ pub(crate) fn filter_batch_by_timestamp(
 ) -> Option<RecordBatch> {
     use arrow::array::{Array, BooleanArray, Int64Array};
     use arrow::compute::filter_record_batch;
+    use arrow::compute::kernels::cmp;
     use arrow::datatypes::TimeUnit;
 
     let Ok(idx) = batch.schema().index_of(column) else {
@@ -38,116 +41,91 @@ pub(crate) fn filter_batch_by_timestamp(
     };
 
     let col = batch.column(idx);
-    let num_rows = batch.num_rows();
 
-    let cmp: fn(i64, i64) -> bool = match op {
-        ThresholdOp::GreaterEq => |val, thr| val >= thr,
-        ThresholdOp::Less => |val, thr| val < thr,
-    };
-
-    // Helper closure to build the boolean mask for an Int64 column
-    let i64_mask = |arr: &Int64Array, threshold: i64| -> BooleanArray {
-        (0..num_rows)
-            .map(|i| {
-                if arr.is_null(i) {
-                    Some(false)
-                } else {
-                    Some(cmp(arr.value(i), threshold))
-                }
-            })
-            .collect()
-    };
+    // Arrow SIMD-accelerated comparison via `cmp::gt_eq` / `cmp::lt`.
+    // Null values propagate as null in the boolean mask, and
+    // `filter_record_batch` treats null mask entries as false (row excluded).
+    macro_rules! cmp_scalar {
+        ($arr:expr, $scalar:expr) => {
+            match op {
+                ThresholdOp::GreaterEq => cmp::gt_eq($arr, &$scalar).ok()?,
+                ThresholdOp::Less => cmp::lt($arr, &$scalar).ok()?,
+            }
+        };
+    }
 
     let mask: BooleanArray = match format {
         TimestampFormat::UnixMillis => {
-            if let Some(arr) = col.as_any().downcast_ref::<Int64Array>() {
-                i64_mask(arr, threshold_ms)
-            } else {
+            let Some(arr) = col.as_any().downcast_ref::<Int64Array>() else {
                 return Some(batch.clone());
-            }
+            };
+            cmp_scalar!(arr, Int64Array::new_scalar(threshold_ms))
         }
         TimestampFormat::ArrowNative => match col.data_type() {
             DataType::Timestamp(TimeUnit::Millisecond, _) => {
                 let arr = col
                     .as_any()
                     .downcast_ref::<arrow::array::TimestampMillisecondArray>()?;
-                (0..num_rows)
-                    .map(|i| {
-                        if arr.is_null(i) {
-                            Some(false)
-                        } else {
-                            Some(cmp(arr.value(i), threshold_ms))
-                        }
-                    })
-                    .collect()
+                cmp_scalar!(
+                    arr,
+                    arrow::array::TimestampMillisecondArray::new_scalar(threshold_ms)
+                )
             }
             DataType::Timestamp(TimeUnit::Second, _) => {
                 let arr = col
                     .as_any()
                     .downcast_ref::<arrow::array::TimestampSecondArray>()?;
                 let thr_secs = threshold_ms / 1000;
-                (0..num_rows)
-                    .map(|i| {
-                        if arr.is_null(i) {
-                            Some(false)
-                        } else {
-                            Some(cmp(arr.value(i), thr_secs))
-                        }
-                    })
-                    .collect()
+                cmp_scalar!(
+                    arr,
+                    arrow::array::TimestampSecondArray::new_scalar(thr_secs)
+                )
             }
             DataType::Timestamp(TimeUnit::Microsecond, _) => {
                 let arr = col
                     .as_any()
                     .downcast_ref::<arrow::array::TimestampMicrosecondArray>()?;
                 let thr_micros = threshold_ms.saturating_mul(1000);
-                (0..num_rows)
-                    .map(|i| {
-                        if arr.is_null(i) {
-                            Some(false)
-                        } else {
-                            Some(cmp(arr.value(i), thr_micros))
-                        }
-                    })
-                    .collect()
+                cmp_scalar!(
+                    arr,
+                    arrow::array::TimestampMicrosecondArray::new_scalar(thr_micros)
+                )
             }
             DataType::Timestamp(TimeUnit::Nanosecond, _) => {
                 let arr = col
                     .as_any()
                     .downcast_ref::<arrow::array::TimestampNanosecondArray>()?;
                 let thr_nanos = threshold_ms.saturating_mul(1_000_000);
-                (0..num_rows)
-                    .map(|i| {
-                        if arr.is_null(i) {
-                            Some(false)
-                        } else {
-                            Some(cmp(arr.value(i), thr_nanos))
-                        }
-                    })
-                    .collect()
+                cmp_scalar!(
+                    arr,
+                    arrow::array::TimestampNanosecondArray::new_scalar(thr_nanos)
+                )
             }
             _ => return Some(batch.clone()),
         },
         TimestampFormat::UnixSeconds => {
-            if let Some(arr) = col.as_any().downcast_ref::<Int64Array>() {
-                i64_mask(arr, threshold_ms / 1000)
-            } else {
+            let Some(arr) = col.as_any().downcast_ref::<Int64Array>() else {
                 return Some(batch.clone());
-            }
+            };
+            cmp_scalar!(arr, Int64Array::new_scalar(threshold_ms / 1000))
         }
         TimestampFormat::UnixMicros => {
-            if let Some(arr) = col.as_any().downcast_ref::<Int64Array>() {
-                i64_mask(arr, threshold_ms.saturating_mul(1000))
-            } else {
+            let Some(arr) = col.as_any().downcast_ref::<Int64Array>() else {
                 return Some(batch.clone());
-            }
+            };
+            cmp_scalar!(
+                arr,
+                Int64Array::new_scalar(threshold_ms.saturating_mul(1000))
+            )
         }
         TimestampFormat::UnixNanos => {
-            if let Some(arr) = col.as_any().downcast_ref::<Int64Array>() {
-                i64_mask(arr, threshold_ms.saturating_mul(1_000_000))
-            } else {
+            let Some(arr) = col.as_any().downcast_ref::<Int64Array>() else {
                 return Some(batch.clone());
-            }
+            };
+            cmp_scalar!(
+                arr,
+                Int64Array::new_scalar(threshold_ms.saturating_mul(1_000_000))
+            )
         }
         // Iso8601 would require parsing each row; skip filtering for string timestamps
         TimestampFormat::Iso8601 => {
