@@ -6,49 +6,22 @@
 
 ## Last Session
 
-**Date**: 2026-02-11
+**Date**: 2026-02-14
 
 ### What Was Accomplished
-- **F083–F089: SQL Compiler Integration** — 7 features wiring the JIT compiler stack (F078–F082) into end-to-end SQL query execution
-  - **F083: Batch Row Reader** — Arrow `RecordBatch` → `EventRow` conversion in bump arena
-    - `BatchRowReader` with pre-downcast `ColumnAccessor` enum, 14 type variants
-    - Round-trip correctness: `RecordBatch → EventRow → RowBatchBridge → RecordBatch`
-    - 17 tests in `batch_reader.rs`
-  - **F084: SQL Compiler Orchestrator** — Single `compile_streaming_query()` entry point
-    - LogicalPlan → extract pipelines → compile → wire bridges → `CompiledStreamingQuery`
-    - Breaker detection returns `None` for stateful operators (aggregate/sort/join)
-    - `extract_table_scan()` pulls source scan for DataFusion execution
-    - 12 tests in `orchestrate.rs`
-  - **F085: LaminarDB JIT Query Execution** — Wire compiled path into `handle_query()`
-    - `jit` feature on `laminar-db` forwarding to `laminar-core/jit`
-    - `CompilerCache` field on `LaminarDB` (jit-gated)
-    - `try_compile_query()` → `bridge_compiled_query()` with transparent fallback
-    - `handle_query()` tries JIT first, falls through to DataFusion on `None`
-    - 291 laminar-db tests pass
-  - **F086: Adaptive Compilation Warmup** — Background JIT with seamless swap
-    - `AdaptiveQueryRunner` using `tokio::sync::oneshot` for non-blocking compile results
-    - `ExecutionMode` enum: Interpreted → Compiling → Compiled / FallbackPermanent
-    - 6 tests in `adaptive.rs`
-  - **F087: Compiled Stateful Pipeline Bridge** — Multi-segment compiled/interpreted execution
-    - `Ring1Operator` trait for stateful operators at pipeline boundaries
-    - `BreakerExecutor` wraps Ring1Operator with stats tracking
-    - `CompiledQueryGraph` for linear chain of executors
-    - 13 tests in `breaker_executor.rs` (jit-gated)
-  - **F088: Schema-Aware Event Time Extraction** — Extract timestamps from data schema
-    - `RowEventTimeExtractor` with auto-detection (first TimestampMicros, then well-known names)
-    - `EventTimeConfig` with configurable column and watermark delay
-    - Integrated into `bridge_compiled_query()` for correct event-time processing
-    - 18 tests in `event_time.rs`
-  - **F089: Compilation Metrics & Observability** — Track compilation stats
-    - `CompilationMetrics` with atomic counters (compiled/fallback/error/compile_time)
-    - `MetricsSnapshot` with `compilation_rate()`, `CacheSnapshot` with `hit_rate()`/`fill_ratio()`
-    - 14 tests in `compilation_metrics.rs`
-  - Phase 2.5 SQL Compiler Integration: **7/7 features COMPLETE (100%)** ✅
+- **Fix: EMIT ON WINDOW CLOSE in Embedded SQL Executor** (PR #90, closes #85)
+  - `EMIT ON WINDOW CLOSE` was parsed and planned correctly but lost at the `StreamRegistration` boundary — `handle_create_stream()` discarded the planner result (`let _ = planner.plan()`)
+  - Implemented watermark-gated source accumulation for EOWC/Final streams:
+    - **`batch_filter.rs`** (NEW): Shared `filter_batch_by_timestamp()` with `ThresholdOp::GreaterEq/Less`, replacing 130-line `filter_late_rows` body
+    - **`connector_manager.rs`**: Extended `StreamRegistration` with `emit_clause` + `window_config`
+    - **`db.rs`**: Capture planner result; pass emit/window to registration; pass watermark to `execute_cycle()`
+    - **`stream_executor.rs`**: `EowcState` per-query accumulator, EOWC branch in `execute_cycle()`, `compute_closed_boundary()` for tumbling/session/sliding
+  - Non-EOWC streams: zero change, zero overhead
+  - 304 laminar-db tests pass (8 new EOWC tests + 296 existing)
 
 Previous session (2026-02-11):
+- **F083–F089: SQL Compiler Integration** — 7 features wiring JIT into end-to-end SQL execution
 - **F078–F082: Plan Compiler Core** — 5 features building the JIT compiler stack
-  - F078: EventRow format, F079: Cranelift expression compiler, F080: Pipeline extraction/compilation/cache
-  - F081: Ring 0/Ring 1 SPSC bridge, F082: StreamingQuery lifecycle management
 
 Previous session (2026-02-08):
 - **pgwire-replication integration for PostgreSQL CDC WAL streaming** (PR #74, closes #58)
@@ -128,6 +101,8 @@ laminar-storage/src/
   changelog_drainer.rs    # Ring 1 SPSC changelog consumer
 
 laminar-db/src/
+  batch_filter.rs # Shared timestamp-based batch filtering (late-row + EOWC closed-window)
+  stream_executor.rs # DataFusion micro-batch executor with EOWC accumulation
   checkpoint_coordinator.rs  # Unified checkpoint orchestrator (F-CKP-003)
   recovery_manager.rs       # Unified recovery: load manifest, restore all state (F-CKP-007)
   api/            # FFI-ready API: Connection, Writer, QueryStream, ArrowSubscription
