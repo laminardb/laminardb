@@ -310,6 +310,10 @@ pub struct SlidingWindowOperator<A: Aggregator> {
     operator_id: String,
     /// Cached output schema (avoids allocation on every emit)
     output_schema: SchemaRef,
+    /// Last emitted intermediate result per window (for Changelog retraction).
+    /// Only populated when `emit_strategy` is `Changelog`.
+    /// Enables Z-set balance: retract (-1) old value before inserting (+1) new.
+    last_emitted: std::collections::HashMap<WindowId, Event>,
     /// Phantom data for accumulator type
     _phantom: PhantomData<A::Acc>,
 }
@@ -345,6 +349,7 @@ where
             window_close_metrics: WindowCloseMetrics::new(),
             operator_id: format!("sliding_window_{operator_num}"),
             output_schema: create_window_output_schema(),
+            last_emitted: std::collections::HashMap::new(),
             _phantom: PhantomData,
         }
     }
@@ -372,6 +377,7 @@ where
             window_close_metrics: WindowCloseMetrics::new(),
             operator_id,
             output_schema: create_window_output_schema(),
+            last_emitted: std::collections::HashMap::new(),
             _phantom: PhantomData,
         }
     }
@@ -702,12 +708,22 @@ where
                         }
                     }
                 }
-                // Changelog: emit changelog record on every update
+                // Changelog: emit retraction of previous value, then insert new.
+                // This maintains Z-set balance: net weight per window = +1 (final).
                 EmitStrategy::Changelog => {
                     for window_id in &updated_windows {
                         if let Some(event) = self.create_intermediate_result(window_id, ctx.state) {
-                            let record = ChangelogRecord::insert(event, ctx.processing_time);
+                            // Retract previous intermediate if one was emitted
+                            if let Some(old_event) = self.last_emitted.get(window_id) {
+                                let retract =
+                                    ChangelogRecord::delete(old_event.clone(), ctx.processing_time);
+                                output.push(Output::Changelog(retract));
+                            }
+                            // Emit new intermediate
+                            let record =
+                                ChangelogRecord::insert(event.clone(), ctx.processing_time);
                             output.push(Output::Changelog(record));
+                            self.last_emitted.insert(*window_id, event);
                         }
                     }
                 }
@@ -753,16 +769,18 @@ where
             let _ = Self::delete_accumulator(&window_id, ctx.state);
             self.registered_windows.remove(&window_id);
             self.periodic_timer_windows.remove(&window_id);
+            self.last_emitted.remove(&window_id);
             return OutputVec::new();
         }
 
         // Get the result
         let result = acc.result();
 
-        // Clean up window state
+        // Clean up window state (last_emitted retraction handled above in Changelog branch)
         let _ = Self::delete_accumulator(&window_id, ctx.state);
         self.registered_windows.remove(&window_id);
         self.periodic_timer_windows.remove(&window_id);
+        // Note: last_emitted for this window_id already removed in Changelog branch above
 
         // Convert result to i64 for the batch
         let result_i64 = result.to_i64();
@@ -788,8 +806,12 @@ where
 
                 // F011B: Emit based on strategy
                 match &self.emit_strategy {
-                    // Changelog: wrap in changelog record for CDC
+                    // Changelog: retract last intermediate, then emit final insert
                     EmitStrategy::Changelog => {
+                        if let Some(old_event) = self.last_emitted.remove(&window_id) {
+                            let retract = ChangelogRecord::delete(old_event, ctx.processing_time);
+                            output.push(Output::Changelog(retract));
+                        }
                         let record = ChangelogRecord::insert(event, ctx.processing_time);
                         output.push(Output::Changelog(record));
                     }
@@ -1687,5 +1709,212 @@ mod tests {
 
         // All windows should be cleaned up
         assert!(operator.registered_windows.is_empty());
+    }
+
+    // ========================================================================
+    // Changelog Retraction Tests
+    // ========================================================================
+
+    #[test]
+    fn test_sliding_changelog_retraction_on_update() {
+        // Two events to the same window → second should emit delete(-1) then insert(+1)
+        let assigner = SlidingWindowAssigner::from_millis(1000, 1000); // tumbling-like
+        let aggregator = CountAggregator::new();
+        let mut operator = SlidingWindowOperator::with_id(
+            assigner,
+            aggregator,
+            Duration::from_millis(0),
+            "changelog_op".to_string(),
+        );
+        operator.set_emit_strategy(EmitStrategy::Changelog);
+
+        let mut timers = TimerService::new();
+        let mut state = InMemoryStore::new();
+        let mut watermark_gen = BoundedOutOfOrdernessGenerator::new(100);
+
+        // First event at t=100 → insert only (no previous to retract)
+        let event1 = create_test_event(100, 1);
+        let out1 = {
+            let mut ctx = create_test_context(&mut timers, &mut state, &mut watermark_gen);
+            operator.process(&event1, &mut ctx)
+        };
+        let changelog1: Vec<_> = out1
+            .iter()
+            .filter(|o| matches!(o, Output::Changelog(_)))
+            .collect();
+        assert_eq!(
+            changelog1.len(),
+            1,
+            "first event: only insert, no retraction"
+        );
+        if let Output::Changelog(rec) = &changelog1[0] {
+            assert_eq!(rec.weight, 1, "first event should be insert (+1)");
+        }
+
+        // Second event at t=200 in same window → retract previous, then insert new
+        let event2 = create_test_event(200, 1);
+        let out2 = {
+            let mut ctx = create_test_context(&mut timers, &mut state, &mut watermark_gen);
+            operator.process(&event2, &mut ctx)
+        };
+        let changelog2: Vec<_> = out2
+            .iter()
+            .filter(|o| matches!(o, Output::Changelog(_)))
+            .collect();
+        assert_eq!(
+            changelog2.len(),
+            2,
+            "second event: retraction + insert = 2 changelog records"
+        );
+        if let Output::Changelog(retract) = &changelog2[0] {
+            assert_eq!(retract.weight, -1, "first record should be retraction (-1)");
+        }
+        if let Output::Changelog(insert) = &changelog2[1] {
+            assert_eq!(insert.weight, 1, "second record should be insert (+1)");
+        }
+    }
+
+    #[test]
+    fn test_sliding_changelog_retraction_on_close() {
+        // Window close should retract last intermediate before emitting final
+        let assigner = SlidingWindowAssigner::from_millis(1000, 1000);
+        let aggregator = CountAggregator::new();
+        let mut operator = SlidingWindowOperator::with_id(
+            assigner,
+            aggregator,
+            Duration::from_millis(0),
+            "changelog_op".to_string(),
+        );
+        operator.set_emit_strategy(EmitStrategy::Changelog);
+
+        let mut timers = TimerService::new();
+        let mut state = InMemoryStore::new();
+        let mut watermark_gen = BoundedOutOfOrdernessGenerator::new(100);
+
+        // Process an event to populate last_emitted
+        let event = create_test_event(100, 1);
+        {
+            let mut ctx = create_test_context(&mut timers, &mut state, &mut watermark_gen);
+            operator.process(&event, &mut ctx);
+        }
+
+        // Fire the window timer → should emit retraction + final insert
+        let timer = Timer {
+            key: WindowId::new(0, 1000).to_key(),
+            timestamp: 1000,
+        };
+        let out = {
+            let mut ctx = create_test_context(&mut timers, &mut state, &mut watermark_gen);
+            operator.on_timer(timer, &mut ctx)
+        };
+
+        let changelog: Vec<_> = out
+            .iter()
+            .filter(|o| matches!(o, Output::Changelog(_)))
+            .collect();
+        assert_eq!(
+            changelog.len(),
+            2,
+            "window close: retraction + final insert"
+        );
+        if let Output::Changelog(retract) = &changelog[0] {
+            assert_eq!(retract.weight, -1, "first should be retraction");
+        }
+        if let Output::Changelog(insert) = &changelog[1] {
+            assert_eq!(insert.weight, 1, "second should be final insert");
+        }
+
+        // last_emitted should be cleaned up
+        assert!(operator.last_emitted.is_empty());
+    }
+
+    #[test]
+    fn test_sliding_changelog_z_set_balance() {
+        // Full lifecycle: 3 updates + close → net weight = +1 (final result)
+        let assigner = SlidingWindowAssigner::from_millis(1000, 1000);
+        let aggregator = CountAggregator::new();
+        let mut operator = SlidingWindowOperator::with_id(
+            assigner,
+            aggregator,
+            Duration::from_millis(0),
+            "changelog_op".to_string(),
+        );
+        operator.set_emit_strategy(EmitStrategy::Changelog);
+
+        let mut timers = TimerService::new();
+        let mut state = InMemoryStore::new();
+        let mut watermark_gen = BoundedOutOfOrdernessGenerator::new(100);
+
+        let mut total_weight: i32 = 0;
+
+        // 3 events in same window
+        for ts in [100, 200, 300] {
+            let event = create_test_event(ts, 1);
+            let out = {
+                let mut ctx = create_test_context(&mut timers, &mut state, &mut watermark_gen);
+                operator.process(&event, &mut ctx)
+            };
+            for output in &out {
+                if let Output::Changelog(rec) = output {
+                    total_weight += rec.weight;
+                }
+            }
+        }
+
+        // Close the window
+        let timer = Timer {
+            key: WindowId::new(0, 1000).to_key(),
+            timestamp: 1000,
+        };
+        let out = {
+            let mut ctx = create_test_context(&mut timers, &mut state, &mut watermark_gen);
+            operator.on_timer(timer, &mut ctx)
+        };
+        for output in &out {
+            if let Output::Changelog(rec) = output {
+                total_weight += rec.weight;
+            }
+        }
+
+        assert_eq!(
+            total_weight, 1,
+            "Z-set balance: net weight should be +1 (final result only)"
+        );
+    }
+
+    #[test]
+    fn test_sliding_non_changelog_unaffected() {
+        // OnUpdate strategy should NOT emit retractions
+        let assigner = SlidingWindowAssigner::from_millis(1000, 500);
+        let aggregator = CountAggregator::new();
+        let mut operator = SlidingWindowOperator::with_id(
+            assigner,
+            aggregator,
+            Duration::from_millis(0),
+            "on_update_op".to_string(),
+        );
+        operator.set_emit_strategy(EmitStrategy::OnUpdate);
+
+        let mut timers = TimerService::new();
+        let mut state = InMemoryStore::new();
+        let mut watermark_gen = BoundedOutOfOrdernessGenerator::new(100);
+
+        // Two events in same window
+        for ts in [100, 200] {
+            let event = create_test_event(ts, 1);
+            let out = {
+                let mut ctx = create_test_context(&mut timers, &mut state, &mut watermark_gen);
+                operator.process(&event, &mut ctx)
+            };
+            // OnUpdate should only emit Event outputs, never Changelog
+            for output in &out {
+                assert!(
+                    !matches!(output, Output::Changelog(_)),
+                    "OnUpdate should not produce Changelog outputs"
+                );
+            }
+        }
+        // last_emitted should be empty (only used for Changelog)
+        assert!(operator.last_emitted.is_empty());
     }
 }

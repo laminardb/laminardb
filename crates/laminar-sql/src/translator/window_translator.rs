@@ -51,6 +51,65 @@ pub struct WindowOperatorConfig {
     pub late_data_side_output: Option<String>,
 }
 
+/// Format a Duration as a human-readable string (e.g., "60s", "5m", "1h").
+fn format_duration(d: Duration) -> String {
+    let secs = d.as_secs();
+    if secs == 0 {
+        return format!("{}ms", d.as_millis());
+    }
+    if secs.is_multiple_of(3600) {
+        format!("{}h", secs / 3600)
+    } else if secs.is_multiple_of(60) {
+        format!("{}m", secs / 60)
+    } else {
+        format!("{secs}s")
+    }
+}
+
+impl std::fmt::Display for WindowType {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            WindowType::Tumbling => write!(f, "TUMBLE"),
+            WindowType::Sliding => write!(f, "HOP"),
+            WindowType::Session => write!(f, "SESSION"),
+        }
+    }
+}
+
+impl std::fmt::Display for WindowOperatorConfig {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self.window_type {
+            WindowType::Tumbling => {
+                write!(
+                    f,
+                    "TUMBLE({}, {})",
+                    self.time_column,
+                    format_duration(self.size)
+                )
+            }
+            WindowType::Sliding => {
+                let slide = self.slide.unwrap_or(self.size);
+                write!(
+                    f,
+                    "HOP({}, {} SLIDE {})",
+                    self.time_column,
+                    format_duration(self.size),
+                    format_duration(slide)
+                )
+            }
+            WindowType::Session => {
+                let gap = self.gap.unwrap_or(Duration::ZERO);
+                write!(
+                    f,
+                    "SESSION({}, GAP {})",
+                    self.time_column,
+                    format_duration(gap)
+                )
+            }
+        }
+    }
+}
+
 impl WindowOperatorConfig {
     /// Create a new tumbling window configuration.
     #[must_use]
@@ -412,5 +471,51 @@ mod tests {
         let config3 = WindowOperatorConfig::tumbling("ts".to_string(), Duration::from_secs(300))
             .with_emit_strategy(EmitStrategy::Changelog);
         assert!(config3.validate(false, false).is_ok());
+    }
+
+    #[test]
+    fn test_display_tumbling_window() {
+        let config =
+            WindowOperatorConfig::tumbling("event_time".to_string(), Duration::from_secs(60));
+        assert_eq!(format!("{config}"), "TUMBLE(event_time, 1m)");
+    }
+
+    #[test]
+    fn test_display_sliding_window() {
+        let config = WindowOperatorConfig::sliding(
+            "ts".to_string(),
+            Duration::from_secs(300),
+            Duration::from_secs(60),
+        );
+        assert_eq!(format!("{config}"), "HOP(ts, 5m SLIDE 1m)");
+    }
+
+    #[test]
+    fn test_display_session_window() {
+        let config =
+            WindowOperatorConfig::session("click_time".to_string(), Duration::from_secs(1800));
+        assert_eq!(format!("{config}"), "SESSION(click_time, GAP 30m)");
+    }
+
+    #[test]
+    fn test_display_window_type() {
+        assert_eq!(format!("{}", WindowType::Tumbling), "TUMBLE");
+        assert_eq!(format!("{}", WindowType::Sliding), "HOP");
+        assert_eq!(format!("{}", WindowType::Session), "SESSION");
+    }
+
+    #[test]
+    fn test_display_duration_formatting() {
+        // Hours
+        let config = WindowOperatorConfig::tumbling("ts".to_string(), Duration::from_secs(3600));
+        assert_eq!(format!("{config}"), "TUMBLE(ts, 1h)");
+
+        // Seconds (non-round minutes)
+        let config2 = WindowOperatorConfig::tumbling("ts".to_string(), Duration::from_secs(45));
+        assert_eq!(format!("{config2}"), "TUMBLE(ts, 45s)");
+
+        // Milliseconds (sub-second)
+        let config3 = WindowOperatorConfig::tumbling("ts".to_string(), Duration::from_millis(500));
+        assert_eq!(format!("{config3}"), "TUMBLE(ts, 500ms)");
     }
 }

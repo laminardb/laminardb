@@ -96,6 +96,94 @@ pub enum JoinOperatorConfig {
     Asof(AsofJoinTranslatorConfig),
 }
 
+impl std::fmt::Display for StreamJoinType {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            StreamJoinType::Inner => write!(f, "INNER"),
+            StreamJoinType::Left => write!(f, "LEFT"),
+            StreamJoinType::Right => write!(f, "RIGHT"),
+            StreamJoinType::Full => write!(f, "FULL"),
+        }
+    }
+}
+
+impl std::fmt::Display for LookupJoinType {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            LookupJoinType::Inner => write!(f, "INNER"),
+            LookupJoinType::Left => write!(f, "LEFT"),
+        }
+    }
+}
+
+impl std::fmt::Display for AsofSqlJoinType {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            AsofSqlJoinType::Inner => write!(f, "INNER"),
+            AsofSqlJoinType::Left => write!(f, "LEFT"),
+        }
+    }
+}
+
+impl std::fmt::Display for StreamJoinConfig {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        write!(
+            f,
+            "{} JOIN ON left.{} = right.{} (bound: {}s)",
+            self.join_type,
+            self.left_key,
+            self.right_key,
+            self.time_bound.as_secs()
+        )
+    }
+}
+
+impl std::fmt::Display for LookupJoinConfig {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        write!(
+            f,
+            "{} LOOKUP JOIN ON stream.{} = lookup.{} (cache_ttl: {}s)",
+            self.join_type,
+            self.stream_key,
+            self.lookup_key,
+            self.cache_ttl.as_secs()
+        )
+    }
+}
+
+impl std::fmt::Display for AsofJoinTranslatorConfig {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        write!(
+            f,
+            "{} ASOF JOIN {}.{} = {}.{} ({}, {}.{} ~ {}.{}",
+            self.join_type,
+            self.left_table,
+            self.key_column,
+            self.right_table,
+            self.key_column,
+            self.direction,
+            self.left_table,
+            self.left_time_column,
+            self.right_table,
+            self.right_time_column,
+        )?;
+        if let Some(tol) = self.tolerance {
+            write!(f, ", tolerance: {}s", tol.as_secs())?;
+        }
+        write!(f, ")")
+    }
+}
+
+impl std::fmt::Display for JoinOperatorConfig {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            JoinOperatorConfig::StreamStream(c) => write!(f, "{c}"),
+            JoinOperatorConfig::Lookup(c) => write!(f, "{c}"),
+            JoinOperatorConfig::Asof(c) => write!(f, "{c}"),
+        }
+    }
+}
+
 impl JoinOperatorConfig {
     /// Create from join analysis.
     #[must_use]
@@ -618,5 +706,58 @@ mod tests {
         {
             assert_eq!(config.join_type, StreamJoinType::Full);
         }
+    }
+
+    #[test]
+    fn test_display_stream_join() {
+        let config = StreamJoinConfig::inner(
+            "order_id".to_string(),
+            "order_id".to_string(),
+            Duration::from_secs(3600),
+        );
+        assert_eq!(
+            format!("{config}"),
+            "INNER JOIN ON left.order_id = right.order_id (bound: 3600s)"
+        );
+    }
+
+    #[test]
+    fn test_display_lookup_join() {
+        let config = LookupJoinConfig::left("cust_id".to_string(), "id".to_string());
+        assert_eq!(
+            format!("{config}"),
+            "LEFT LOOKUP JOIN ON stream.cust_id = lookup.id (cache_ttl: 300s)"
+        );
+    }
+
+    #[test]
+    fn test_display_asof_join() {
+        let analysis = JoinAnalysis::asof(
+            "trades".to_string(),
+            "quotes".to_string(),
+            "symbol".to_string(),
+            "symbol".to_string(),
+            AsofSqlDirection::Backward,
+            "ts".to_string(),
+            "ts".to_string(),
+            Some(Duration::from_secs(5)),
+        );
+        let config = JoinOperatorConfig::from_analysis(&analysis);
+        let s = format!("{config}");
+        assert!(s.contains("ASOF JOIN"), "got: {s}");
+        assert!(s.contains("BACKWARD"), "got: {s}");
+        assert!(s.contains("tolerance: 5s"), "got: {s}");
+    }
+
+    #[test]
+    fn test_display_join_types() {
+        assert_eq!(format!("{}", StreamJoinType::Inner), "INNER");
+        assert_eq!(format!("{}", StreamJoinType::Left), "LEFT");
+        assert_eq!(format!("{}", StreamJoinType::Right), "RIGHT");
+        assert_eq!(format!("{}", StreamJoinType::Full), "FULL");
+        assert_eq!(format!("{}", LookupJoinType::Inner), "INNER");
+        assert_eq!(format!("{}", LookupJoinType::Left), "LEFT");
+        assert_eq!(format!("{}", AsofSqlJoinType::Inner), "INNER");
+        assert_eq!(format!("{}", AsofSqlJoinType::Left), "LEFT");
     }
 }

@@ -975,7 +975,14 @@ impl LaminarDB {
             Ok(plan) => {
                 rows.push((
                     "plan_type".into(),
-                    format!("{:?}", std::mem::discriminant(&plan)),
+                    match &plan {
+                        laminar_sql::planner::StreamingPlan::Query(_) => "Query",
+                        laminar_sql::planner::StreamingPlan::RegisterSource(_) => "RegisterSource",
+                        laminar_sql::planner::StreamingPlan::RegisterSink(_) => "RegisterSink",
+                        laminar_sql::planner::StreamingPlan::Standard(_) => "Standard",
+                        laminar_sql::planner::StreamingPlan::DagExplain(_) => "DagExplain",
+                    }
+                    .into(),
                 ));
                 match &plan {
                     laminar_sql::planner::StreamingPlan::Query(qp) => {
@@ -983,14 +990,14 @@ impl LaminarDB {
                             rows.push(("query_name".into(), name.clone()));
                         }
                         if let Some(wc) = &qp.window_config {
-                            rows.push(("window_type".into(), format!("{:?}", wc.window_type)));
+                            rows.push(("window".into(), format!("{wc}")));
                         }
                         if let Some(jcs) = &qp.join_config {
                             if jcs.len() == 1 {
-                                rows.push(("join_type".into(), format!("{:?}", jcs[0])));
+                                rows.push(("join".into(), format!("{}", jcs[0])));
                             } else {
                                 for (i, jc) in jcs.iter().enumerate() {
-                                    rows.push((format!("join_step_{}", i + 1), format!("{jc:?}")));
+                                    rows.push((format!("join_step_{}", i + 1), format!("{jc}")));
                                 }
                             }
                         }
@@ -1004,7 +1011,7 @@ impl LaminarDB {
                             ));
                         }
                         if let Some(ec) = &qp.emit_clause {
-                            rows.push(("emit".into(), format!("{ec:?}")));
+                            rows.push(("emit".into(), format!("{ec}")));
                         }
                     }
                     laminar_sql::planner::StreamingPlan::RegisterSource(info) => {

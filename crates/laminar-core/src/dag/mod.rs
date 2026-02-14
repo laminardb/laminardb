@@ -83,6 +83,8 @@ pub use checkpoint::{
     DagCheckpointConfig, DagCheckpointCoordinator,
 };
 pub use error::DagError;
+#[cfg(feature = "dag-metrics")]
+pub use executor::OperatorNodeMetrics;
 pub use executor::{DagExecutor, DagExecutorMetrics};
 pub use multicast::MulticastBuffer;
 pub use recovery::{

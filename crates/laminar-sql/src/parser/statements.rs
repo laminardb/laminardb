@@ -360,6 +360,19 @@ pub enum EmitClause {
     Final,
 }
 
+impl std::fmt::Display for EmitClause {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            EmitClause::AfterWatermark => write!(f, "EMIT AFTER WATERMARK"),
+            EmitClause::OnWindowClose => write!(f, "EMIT ON WINDOW CLOSE"),
+            EmitClause::Periodically { interval } => write!(f, "EMIT EVERY {interval}"),
+            EmitClause::OnUpdate => write!(f, "EMIT ON UPDATE"),
+            EmitClause::Changes => write!(f, "EMIT CHANGES"),
+            EmitClause::Final => write!(f, "EMIT FINAL"),
+        }
+    }
+}
+
 impl EmitClause {
     /// Convert to runtime EmitStrategy.
     ///

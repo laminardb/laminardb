@@ -417,64 +417,68 @@ impl ThreeRingReactor {
     /// Poll only the latency ring.
     fn poll_latency_ring(&mut self, completions: &mut Vec<RoutedCompletion>) {
         // Collect CQE data into pre-allocated scratch to avoid borrow conflict
-        self.cqe_scratch.clear();
+        let mut scratch = std::mem::take(&mut self.cqe_scratch);
+        scratch.clear();
         {
             let cq = self.latency_ring.completion();
             for cqe in cq {
-                self.cqe_scratch
-                    .push((cqe.user_data(), cqe.result(), cqe.flags()));
+                scratch.push((cqe.user_data(), cqe.result(), cqe.flags()));
             }
         }
 
-        for &(user_data, result, flags) in &self.cqe_scratch {
+        for &(user_data, result, flags) in &scratch {
             let completion = self.process_cqe_data(user_data, result, flags, RingAffinity::Latency);
             self.stats
                 .record_latency_completion(completion.latency(), completion.is_success());
             completions.push(completion);
         }
+        self.cqe_scratch = scratch;
     }
 
     /// Poll only the main ring.
     fn poll_main_ring(&mut self, completions: &mut Vec<RoutedCompletion>) {
         // Collect CQE data into pre-allocated scratch to avoid borrow conflict
-        self.cqe_scratch.clear();
+        let mut scratch = std::mem::take(&mut self.cqe_scratch);
+        scratch.clear();
         {
             let cq = self.main_ring.completion();
             for cqe in cq {
-                self.cqe_scratch
-                    .push((cqe.user_data(), cqe.result(), cqe.flags()));
+                scratch.push((cqe.user_data(), cqe.result(), cqe.flags()));
             }
         }
 
-        for &(user_data, result, flags) in &self.cqe_scratch {
+        for &(user_data, result, flags) in &scratch {
             let completion = self.process_cqe_data(user_data, result, flags, RingAffinity::Main);
             self.stats
                 .record_main_completion(completion.latency(), completion.is_success());
             completions.push(completion);
         }
+        self.cqe_scratch = scratch;
     }
 
     /// Poll only the poll ring.
     fn poll_poll_ring(&mut self, completions: &mut Vec<RoutedCompletion>) {
         // Collect CQE data into pre-allocated scratch to avoid borrow conflict
-        self.cqe_scratch.clear();
+        let mut scratch = std::mem::take(&mut self.cqe_scratch);
+        scratch.clear();
         {
             let Some(ref mut ring) = self.poll_ring else {
+                self.cqe_scratch = scratch;
                 return;
             };
             let cq = ring.completion();
             for cqe in cq {
-                self.cqe_scratch
-                    .push((cqe.user_data(), cqe.result(), cqe.flags()));
+                scratch.push((cqe.user_data(), cqe.result(), cqe.flags()));
             }
         }
 
-        for &(user_data, result, flags) in &self.cqe_scratch {
+        for &(user_data, result, flags) in &scratch {
             let completion = self.process_cqe_data(user_data, result, flags, RingAffinity::Poll);
             self.stats
                 .record_poll_completion(completion.latency(), completion.is_success());
             completions.push(completion);
         }
+        self.cqe_scratch = scratch;
     }
 
     /// Process completion data from a CQE.
@@ -507,26 +511,30 @@ impl ThreeRingReactor {
     /// Reuses pre-allocated scratch buffers to avoid per-iteration allocations.
     pub fn run(&mut self, handler: &mut dyn RingHandler) {
         while !self.closed {
+            let mut comp_scratch = std::mem::take(&mut self.completion_scratch);
+
             // 1. Always drain latency ring first (non-blocking)
-            self.completion_scratch.clear();
-            self.poll_latency_ring(&mut self.completion_scratch);
-            for completion in self.completion_scratch.drain(..) {
+            comp_scratch.clear();
+            self.poll_latency_ring(&mut comp_scratch);
+            for completion in comp_scratch.drain(..) {
                 handler.handle_latency_completion(completion);
             }
 
             // 2. Drain main ring completions (non-blocking)
-            self.completion_scratch.clear();
-            self.poll_main_ring(&mut self.completion_scratch);
-            for completion in self.completion_scratch.drain(..) {
+            comp_scratch.clear();
+            self.poll_main_ring(&mut comp_scratch);
+            for completion in comp_scratch.drain(..) {
                 handler.handle_main_completion(completion);
             }
 
             // 3. Drain poll ring if present (non-blocking)
-            self.completion_scratch.clear();
-            self.poll_poll_ring(&mut self.completion_scratch);
-            for completion in self.completion_scratch.drain(..) {
+            comp_scratch.clear();
+            self.poll_poll_ring(&mut comp_scratch);
+            for completion in comp_scratch.drain(..) {
                 handler.handle_poll_completion(completion);
             }
+
+            self.completion_scratch = comp_scratch;
 
             // 4. Ring 0: Process application events
             handler.process_ring0_events();

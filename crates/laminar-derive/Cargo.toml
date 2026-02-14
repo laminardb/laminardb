@@ -21,5 +21,5 @@ proc-macro2 = "1.0"
 arrow = { workspace = true }
 arrow-array = { workspace = true }
 arrow-schema = { workspace = true }
-laminar-core = { path = "../laminar-core", version = "0.12.0" }
-laminar-connectors = { path = "../laminar-connectors", version = "0.12.0" }
+laminar-core = { path = "../laminar-core", version = "0.13.0" }
+laminar-connectors = { path = "../laminar-connectors", version = "0.13.0" }

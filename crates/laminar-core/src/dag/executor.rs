@@ -96,6 +96,23 @@ pub struct DagExecutorMetrics {
     pub watermarks_processed: u64,
 }
 
+/// Per-operator metrics tracked by the DAG executor.
+///
+/// Only populated when the `dag-metrics` feature is enabled.
+/// Tracks event counts and cumulative processing time per operator node.
+#[cfg(feature = "dag-metrics")]
+#[derive(Debug, Clone, Default)]
+pub struct OperatorNodeMetrics {
+    /// Total events received by this operator.
+    pub events_in: u64,
+    /// Total events emitted by this operator.
+    pub events_out: u64,
+    /// Total processing time in nanoseconds.
+    pub total_time_ns: u64,
+    /// Number of `process()` invocations.
+    pub invocations: u64,
+}
+
 /// Ring 0 DAG executor for event processing.
 ///
 /// Processes events through a finalized [`StreamingDag`] in topological order
@@ -143,6 +160,9 @@ pub struct DagExecutor {
     temp_events: Vec<Event>,
     /// Executor metrics.
     metrics: DagExecutorMetrics,
+    /// Per-operator node metrics (feature-gated).
+    #[cfg(feature = "dag-metrics")]
+    node_metrics: Vec<OperatorNodeMetrics>,
 }
 
 impl DagExecutor {
@@ -198,6 +218,10 @@ impl DagExecutor {
             input_counts,
             temp_events: Vec::with_capacity(64),
             metrics: DagExecutorMetrics::default(),
+            #[cfg(feature = "dag-metrics")]
+            node_metrics: (0..slot_count)
+                .map(|_| OperatorNodeMetrics::default())
+                .collect(),
         }
     }
 
@@ -374,9 +398,22 @@ impl DagExecutor {
         &self.metrics
     }
 
+    /// Returns per-operator node metrics (only available with `dag-metrics` feature).
+    #[cfg(feature = "dag-metrics")]
+    #[must_use]
+    pub fn node_metrics(&self) -> &[OperatorNodeMetrics] {
+        &self.node_metrics
+    }
+
     /// Resets all executor metrics to zero.
     pub fn reset_metrics(&mut self) {
         self.metrics = DagExecutorMetrics::default();
+        #[cfg(feature = "dag-metrics")]
+        {
+            for m in &mut self.node_metrics {
+                *m = OperatorNodeMetrics::default();
+            }
+        }
     }
 
     /// Returns the source node IDs.
@@ -531,7 +568,11 @@ impl DagExecutor {
             #[cfg(feature = "dag-metrics")]
             {
                 self.metrics.events_processed += 1;
+                self.node_metrics[idx].events_in += 1;
             }
+
+            #[cfg(feature = "dag-metrics")]
+            let start = std::time::Instant::now();
 
             let outputs = if let Some(op) = &mut operator {
                 if let Some(rt) = &mut runtime {
@@ -551,9 +592,21 @@ impl DagExecutor {
                 passthrough_output(event)
             };
 
+            #[cfg(feature = "dag-metrics")]
+            {
+                #[allow(clippy::cast_possible_truncation)]
+                let elapsed = start.elapsed().as_nanos() as u64;
+                self.node_metrics[idx].total_time_ns += elapsed;
+                self.node_metrics[idx].invocations += 1;
+            }
+
             // Route outputs to downstream nodes.
             for output in outputs {
                 if let Output::Event(out_event) = output {
+                    #[cfg(feature = "dag-metrics")]
+                    {
+                        self.node_metrics[idx].events_out += 1;
+                    }
                     self.route_output(node_id, out_event);
                 }
             }

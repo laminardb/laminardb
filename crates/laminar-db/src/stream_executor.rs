@@ -106,6 +106,9 @@ pub(crate) struct StreamQuery {
     pub emit_clause: Option<EmitClause>,
     /// Window configuration from the planner (window type, size, gap, etc.).
     pub window_config: Option<WindowOperatorConfig>,
+    /// Pre-computed table references (extracted once at registration).
+    /// Avoids re-parsing SQL for dependency analysis every cycle.
+    table_refs: HashSet<String>,
 }
 
 impl StreamQuery {
@@ -191,6 +194,7 @@ impl StreamExecutor {
         window_config: Option<WindowOperatorConfig>,
     ) {
         let (asof_config, projection_sql) = detect_asof_query(&sql);
+        let table_refs = extract_table_references(&sql);
         let idx = self.queries.len();
         let query = StreamQuery {
             name,
@@ -199,6 +203,7 @@ impl StreamExecutor {
             projection_sql,
             emit_clause,
             window_config,
+            table_refs,
         };
         // Initialize EOWC state for queries that suppress intermediate results
         if query.suppresses_intermediate() {
@@ -250,8 +255,7 @@ impl StreamExecutor {
         let mut dependents: Vec<Vec<usize>> = vec![Vec::new(); self.queries.len()];
 
         for (i, query) in self.queries.iter().enumerate() {
-            let refs = extract_table_references(&query.sql);
-            for table_ref in &refs {
+            for table_ref in &query.table_refs {
                 if let Some(&dep_idx) = name_to_idx.get(table_ref.as_str()) {
                     if dep_idx != i {
                         in_degree[i] += 1;
@@ -329,14 +333,12 @@ impl StreamExecutor {
             // Clone query fields only in branches needing &mut self.
             let batches = if is_eowc {
                 let query_name = self.queries[idx].name.clone();
-                let query_sql = self.queries[idx].sql.clone();
                 let window_config = self.queries[idx].window_config.clone();
                 let asof_config = self.queries[idx].asof_config.clone();
                 let projection_sql = self.queries[idx].projection_sql.clone();
                 self.execute_eowc_query(
                     idx,
                     &query_name,
-                    &query_sql,
                     window_config.as_ref(),
                     asof_config.as_ref(),
                     projection_sql.as_deref(),
@@ -484,7 +486,6 @@ impl StreamExecutor {
         &mut self,
         idx: usize,
         query_name: &str,
-        query_sql: &str,
         window_config: Option<&WindowOperatorConfig>,
         asof_config: Option<&AsofJoinTranslatorConfig>,
         projection_sql: Option<&str>,
@@ -492,8 +493,8 @@ impl StreamExecutor {
         intermediate_results: &HashMap<String, Vec<RecordBatch>>,
         current_watermark: i64,
     ) -> Result<Vec<RecordBatch>, DbError> {
-        // Determine which source tables feed this query
-        let table_refs = extract_table_references(query_sql);
+        // Use pre-computed table references (extracted once at registration)
+        let table_refs = self.queries[idx].table_refs.clone();
 
         // Accumulate current source batches into EOWC state
         if let Some(eowc) = self.eowc_states.get_mut(&idx) {
@@ -649,6 +650,7 @@ impl StreamExecutor {
         }
 
         // Execute the query
+        let query_sql = &self.queries[idx].sql;
         let batches = if let Some(cfg) = asof_config {
             self.execute_asof_query(
                 query_name,
@@ -2100,5 +2102,86 @@ mod tests {
         // At watermark=3000: closed=…[1000,3000), open=[1500,3500)…
         // Earliest open window starts at 1500 → boundary=1500
         assert_eq!(compute_closed_boundary(3000, &config), 1500);
+    }
+
+    // ── Pre-computed table refs tests ──
+
+    #[test]
+    fn test_precomputed_table_refs() {
+        let ctx = SessionContext::new();
+        let mut executor = StreamExecutor::new(ctx);
+
+        executor.add_query(
+            "level1".to_string(),
+            "SELECT name, value FROM events".to_string(),
+            None,
+            None,
+        );
+        executor.add_query(
+            "level2".to_string(),
+            "SELECT name FROM level1 WHERE name = 'a'".to_string(),
+            None,
+            None,
+        );
+        executor.add_query(
+            "joined".to_string(),
+            "SELECT a.name, b.name FROM level1 a JOIN level2 b ON a.name = b.name".to_string(),
+            None,
+            None,
+        );
+
+        // Table refs should be pre-computed at registration time
+        assert!(
+            executor.queries[0].table_refs.contains("events"),
+            "level1 should reference 'events'"
+        );
+        assert!(
+            executor.queries[1].table_refs.contains("level1"),
+            "level2 should reference 'level1'"
+        );
+        assert!(
+            executor.queries[2].table_refs.contains("level1"),
+            "joined should reference 'level1'"
+        );
+        assert!(
+            executor.queries[2].table_refs.contains("level2"),
+            "joined should reference 'level2'"
+        );
+    }
+
+    #[tokio::test]
+    async fn test_precomputed_table_refs_used_in_topo_order() {
+        let ctx = SessionContext::new();
+        register_streaming_functions(&ctx);
+        let mut executor = StreamExecutor::new(ctx);
+
+        // Register downstream BEFORE upstream (reversed order)
+        executor.add_query(
+            "downstream".to_string(),
+            "SELECT name, total FROM upstream WHERE total > 1.0".to_string(),
+            None,
+            None,
+        );
+        executor.add_query(
+            "upstream".to_string(),
+            "SELECT name, SUM(value) as total FROM events GROUP BY name".to_string(),
+            None,
+            None,
+        );
+
+        // Pre-computed refs should enable correct topo ordering
+        assert!(executor.queries[0].table_refs.contains("upstream"));
+        assert!(executor.queries[1].table_refs.contains("events"));
+
+        let mut source_batches = HashMap::new();
+        source_batches.insert("events".to_string(), vec![test_batch()]);
+
+        let results = executor
+            .execute_cycle(&source_batches, i64::MAX)
+            .await
+            .unwrap();
+
+        assert!(results.contains_key("upstream"));
+        assert!(results.contains_key("downstream"));
     }
 }
