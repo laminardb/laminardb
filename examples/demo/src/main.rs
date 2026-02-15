@@ -475,8 +475,8 @@ async fn run_tui_loop<D: PipelineDataSource>(
                             app.set_or_toggle_view(ViewMode::Dag);
                         }
                         KeyCode::Char('c') => {
-                            if let Ok(Some(epoch)) = db.checkpoint() {
-                                app.record_checkpoint(epoch);
+                            if let Ok(result) = db.checkpoint().await {
+                                app.record_checkpoint(result.epoch);
                             }
                         }
                         _ => {}

@@ -8,7 +8,6 @@ use arrow::datatypes::{DataType, Field, Schema};
 use datafusion::prelude::SessionContext;
 
 use laminar_core::streaming;
-use laminar_core::streaming::StreamCheckpointManager;
 use laminar_core::time::WatermarkGenerator;
 use laminar_sql::parser::{parse_streaming_sql, ShowCommand, StreamingStatement};
 use laminar_sql::planner::StreamingPlanner;
@@ -72,7 +71,9 @@ pub struct LaminarDB {
     config: LaminarConfig,
     config_vars: Arc<HashMap<String, String>>,
     shutdown: std::sync::atomic::AtomicBool,
-    checkpoint_manager: parking_lot::Mutex<StreamCheckpointManager>,
+    /// Unified checkpoint coordinator (populated by `start()`).
+    coordinator:
+        Arc<tokio::sync::Mutex<Option<crate::checkpoint_coordinator::CheckpointCoordinator>>>,
     connector_manager: parking_lot::Mutex<crate::connector_manager::ConnectorManager>,
     connector_registry: Arc<laminar_connectors::registry::ConnectorRegistry>,
     mv_registry: parking_lot::Mutex<laminar_core::mv::MvRegistry>,
@@ -179,11 +180,6 @@ impl LaminarDB {
             config.default_backpressure,
         ));
 
-        let checkpoint_manager = match &config.checkpoint {
-            Some(cp_config) => StreamCheckpointManager::new(cp_config.clone()),
-            None => StreamCheckpointManager::disabled(),
-        };
-
         let connector_registry = Arc::new(laminar_connectors::registry::ConnectorRegistry::new());
         Self::register_builtin_connectors(&connector_registry);
 
@@ -194,7 +190,7 @@ impl LaminarDB {
             config,
             config_vars: Arc::new(config_vars),
             shutdown: std::sync::atomic::AtomicBool::new(false),
-            checkpoint_manager: parking_lot::Mutex::new(checkpoint_manager),
+            coordinator: Arc::new(tokio::sync::Mutex::new(None)),
             connector_manager: parking_lot::Mutex::new(
                 crate::connector_manager::ConnectorManager::new(),
             ),
@@ -441,18 +437,6 @@ impl LaminarDB {
             }
             let provider = crate::table_provider::SourceSnapshotProvider::new(Arc::clone(entry));
             let _ = self.ctx.register_table(name, Arc::new(provider));
-        }
-
-        // Auto-register source with checkpoint manager if enabled
-        if let Some(ref entry) = entry {
-            let mut mgr = self.checkpoint_manager.lock();
-            if mgr.is_enabled() {
-                mgr.register_source(
-                    &entry.name,
-                    entry.source.sequence_counter(),
-                    entry.source.watermark_atomic(),
-                );
-            }
         }
 
         // Register as a base table in the MV registry for dependency tracking
@@ -1599,36 +1583,38 @@ impl LaminarDB {
     }
 
     /// Returns whether streaming checkpointing is enabled.
+    #[must_use]
     pub fn is_checkpoint_enabled(&self) -> bool {
-        self.checkpoint_manager.lock().is_enabled()
+        self.config.checkpoint.is_some()
     }
 
-    /// Triggers a streaming checkpoint, capturing source sequences and
-    /// watermarks.
+    /// Triggers a streaming checkpoint that persists source offsets, sink
+    /// positions, and operator state to disk via the
+    /// [`CheckpointCoordinator`](crate::checkpoint_coordinator::CheckpointCoordinator).
     ///
-    /// Returns the checkpoint ID on success.
+    /// Returns the checkpoint result on success, including the checkpoint ID,
+    /// epoch, and duration.
     ///
     /// # Errors
     ///
-    /// Returns `DbError::Checkpoint` if the checkpoint operation fails.
-    pub fn checkpoint(&self) -> Result<Option<u64>, DbError> {
-        self.checkpoint_manager
-            .lock()
-            .checkpoint()
-            .map_err(|e| DbError::Checkpoint(e.to_string()))
-    }
-
-    /// Returns the most recent streaming checkpoint for restore.
-    ///
-    /// # Errors
-    ///
-    /// Returns `DbError::Checkpoint` if no checkpoint is available.
-    pub fn restore_checkpoint(&self) -> Result<streaming::StreamCheckpoint, DbError> {
-        self.checkpoint_manager
-            .lock()
-            .restore()
-            .cloned()
-            .map_err(|e| DbError::Checkpoint(e.to_string()))
+    /// Returns `DbError::Checkpoint` if checkpointing is not enabled, the
+    /// coordinator has not been initialized (call `start()` first), or the
+    /// checkpoint operation fails.
+    pub async fn checkpoint(
+        &self,
+    ) -> Result<crate::checkpoint_coordinator::CheckpointResult, DbError> {
+        if self.config.checkpoint.is_none() {
+            return Err(DbError::Checkpoint(
+                "checkpointing is not enabled".to_string(),
+            ));
+        }
+        let mut guard = self.coordinator.lock().await;
+        let coord = guard.as_mut().ok_or_else(|| {
+            DbError::Checkpoint("coordinator not initialized — call start() first".to_string())
+        })?;
+        coord
+            .checkpoint(HashMap::new(), None, 0, Vec::new(), None)
+            .await
     }
 
     /// Shut down the database gracefully.
@@ -1695,6 +1681,30 @@ impl LaminarDB {
                 "[laminar-db] Sink '{}': connector_type={:?}",
                 name, reg.connector_type
             );
+        }
+
+        // Initialize checkpoint coordinator (shared across all pipeline modes)
+        if let Some(ref cp_config) = self.config.checkpoint {
+            use crate::checkpoint_coordinator::{
+                CheckpointConfig as CkpConfig, CheckpointCoordinator,
+            };
+            use laminar_storage::checkpoint_store::FileSystemCheckpointStore;
+
+            let data_dir = cp_config
+                .data_dir
+                .clone()
+                .or_else(|| self.config.storage_dir.clone())
+                .unwrap_or_else(|| std::path::PathBuf::from("./data"));
+            let max_retained = cp_config.max_retained.unwrap_or(3);
+            let store = FileSystemCheckpointStore::new(&data_dir, max_retained);
+            let config = CkpConfig {
+                interval: cp_config.interval_ms.map(std::time::Duration::from_millis),
+                max_retained,
+                ..CkpConfig::default()
+            };
+            let mut coord = CheckpointCoordinator::new(config, Box::new(store));
+            coord.set_counters(Arc::clone(&self.counters));
+            *self.coordinator.lock().await = Some(coord);
         }
 
         if has_external {
@@ -2017,9 +2027,7 @@ impl LaminarDB {
         stream_regs: HashMap<String, crate::connector_manager::StreamRegistration>,
         table_regs: HashMap<String, crate::connector_manager::TableRegistration>,
     ) -> Result<(), DbError> {
-        use crate::checkpoint_coordinator::{
-            source_to_connector_checkpoint, CheckpointConfig as CkpConfig,
-        };
+        use crate::checkpoint_coordinator::source_to_connector_checkpoint;
         use crate::connector_manager::{
             build_sink_config, build_source_config, build_table_config,
         };
@@ -2027,7 +2035,6 @@ impl LaminarDB {
         use laminar_connectors::config::ConnectorConfig;
         use laminar_connectors::connector::{SinkConnector, SourceConnector};
         use laminar_connectors::reference::{ReferenceTableSource, RefreshMode};
-        use laminar_storage::checkpoint_store::FileSystemCheckpointStore;
 
         // Build StreamExecutor
         let ctx = SessionContext::new();
@@ -2157,75 +2164,57 @@ impl LaminarDB {
             table_sources.push((name.clone(), source, mode));
         }
 
-        // Create unified checkpoint coordinator (replaces PipelineCheckpointManager)
-        let checkpoint_config = self.config.checkpoint.clone();
-        let storage_dir = self.config.storage_dir.clone();
-        let coordinator: Option<
-            Arc<tokio::sync::Mutex<crate::checkpoint_coordinator::CheckpointCoordinator>>,
-        > = if let Some(ref cp_config) = checkpoint_config {
-            let data_dir = cp_config
-                .data_dir
-                .clone()
-                .or(storage_dir.clone())
-                .unwrap_or_else(|| std::path::PathBuf::from("./data"));
-            let max_retained = cp_config.max_retained.unwrap_or(3);
-            let store = FileSystemCheckpointStore::new(&data_dir, max_retained);
-            let config = CkpConfig {
-                interval: cp_config.interval_ms.map(std::time::Duration::from_millis),
-                max_retained,
-                ..CkpConfig::default()
-            };
-            let mut coord =
-                crate::checkpoint_coordinator::CheckpointCoordinator::new(config, Box::new(store));
-            coord.set_counters(Arc::clone(&self.counters));
-
-            // Register sources with coordinator
-            for (name, source_arc, _) in &sources {
-                coord.register_source(name.clone(), Arc::clone(source_arc));
+        // Register connector sources/sinks with the checkpoint coordinator
+        {
+            let mut guard = self.coordinator.lock().await;
+            if let Some(ref mut coord) = *guard {
+                for (name, source_arc, _) in &sources {
+                    coord.register_source(name.clone(), Arc::clone(source_arc));
+                }
+                for (name, sink_arc, _, _) in &sinks {
+                    let exactly_once = sink_arc.lock().await.capabilities().exactly_once;
+                    coord.register_sink(name.clone(), Arc::clone(sink_arc), exactly_once);
+                }
             }
-            // Register sinks with coordinator
-            for (name, sink_arc, _, _) in &sinks {
-                let exactly_once = sink_arc.lock().await.capabilities().exactly_once;
-                coord.register_sink(name.clone(), Arc::clone(sink_arc), exactly_once);
-            }
-
-            Some(Arc::new(tokio::sync::Mutex::new(coord)))
-        } else {
-            None
-        };
+        }
 
         // Recovery: restore source/sink/table state via unified coordinator
-        if let Some(ref coord_arc) = coordinator {
-            let mut coord = coord_arc.lock().await;
-            match coord.recover().await {
-                Ok(Some(recovered)) => {
-                    // Manually restore table source offsets (ReferenceTableSource
-                    // is not a SourceConnector, so the coordinator can't do this)
-                    for (name, source, _) in &mut table_sources {
-                        if let Some(cp) = recovered.manifest.table_offsets.get(name) {
-                            let restored =
-                                crate::checkpoint_coordinator::connector_to_source_checkpoint(cp);
-                            if let Err(e) = source.restore(&restored).await {
-                                tracing::warn!(table=%name, error=%e, "Table source restore failed");
+        {
+            let mut guard = self.coordinator.lock().await;
+            if let Some(ref mut coord) = *guard {
+                match coord.recover().await {
+                    Ok(Some(recovered)) => {
+                        for (name, source, _) in &mut table_sources {
+                            if let Some(cp) = recovered.manifest.table_offsets.get(name) {
+                                let restored =
+                                    crate::checkpoint_coordinator::connector_to_source_checkpoint(
+                                        cp,
+                                    );
+                                if let Err(e) = source.restore(&restored).await {
+                                    tracing::warn!(
+                                        table=%name, error=%e,
+                                        "Table source restore failed"
+                                    );
+                                }
                             }
                         }
+                        eprintln!(
+                            "[laminar-db] Recovered from checkpoint epoch {}",
+                            recovered.epoch()
+                        );
+                        tracing::info!(
+                            epoch = recovered.epoch(),
+                            sources_restored = recovered.sources_restored,
+                            sinks_rolled_back = recovered.sinks_rolled_back,
+                            "Recovered from unified checkpoint"
+                        );
                     }
-                    eprintln!(
-                        "[laminar-db] Recovered from checkpoint epoch {}",
-                        recovered.epoch()
-                    );
-                    tracing::info!(
-                        epoch = recovered.epoch(),
-                        sources_restored = recovered.sources_restored,
-                        sinks_rolled_back = recovered.sinks_rolled_back,
-                        "Recovered from unified checkpoint"
-                    );
-                }
-                Ok(None) => {
-                    tracing::info!("No checkpoint found, starting fresh");
-                }
-                Err(e) => {
-                    tracing::warn!(error = %e, "Checkpoint recovery failed, starting fresh");
+                    Ok(None) => {
+                        tracing::info!("No checkpoint found, starting fresh");
+                    }
+                    Err(e) => {
+                        tracing::warn!(error = %e, "Checkpoint recovery failed, starting fresh");
+                    }
                 }
             }
         }
@@ -2351,7 +2340,9 @@ impl LaminarDB {
         // Spawn processing loop
         let shutdown = self.shutdown_signal.clone();
         let max_poll = self.config.default_buffer_size.min(1024);
-        let checkpoint_interval = checkpoint_config
+        let checkpoint_interval = self
+            .config
+            .checkpoint
             .as_ref()
             .and_then(|c| c.interval_ms)
             .map(std::time::Duration::from_millis);
@@ -2360,6 +2351,7 @@ impl LaminarDB {
         let counters = Arc::clone(&self.counters);
         let pipeline_watermark = Arc::clone(&self.pipeline_watermark);
         let checkpoint_in_progress = Arc::new(std::sync::atomic::AtomicBool::new(false));
+        let coordinator = Arc::clone(&self.coordinator);
 
         let handle = tokio::spawn(async move {
             eprintln!("[laminar-db] Connector pipeline task started");
@@ -2629,7 +2621,7 @@ impl LaminarDB {
                 }
 
                 // Periodic checkpoint (non-blocking — spawned as a separate task)
-                if let (Some(interval), Some(ref coord_arc)) = (checkpoint_interval, &coordinator) {
+                if let Some(interval) = checkpoint_interval {
                     if last_checkpoint.elapsed() >= interval
                         && !checkpoint_in_progress.load(std::sync::atomic::Ordering::Relaxed)
                     {
@@ -2642,42 +2634,44 @@ impl LaminarDB {
                             );
                         }
 
-                        let coord_clone = Arc::clone(coord_arc);
+                        let coord_clone = Arc::clone(&coordinator);
                         let in_progress = Arc::clone(&checkpoint_in_progress);
                         in_progress.store(true, std::sync::atomic::Ordering::Relaxed);
 
                         tokio::spawn(async move {
-                            let mut coord = coord_clone.lock().await;
-                            match coord
-                                .checkpoint_with_extra_tables(
-                                    HashMap::new(),
-                                    None,
-                                    0,
-                                    Vec::new(),
-                                    None,
-                                    extra_tables,
-                                )
-                                .await
-                            {
-                                Ok(result) if result.success => {
-                                    tracing::info!(
-                                        epoch = result.epoch,
-                                        duration_ms = result.duration.as_millis(),
-                                        "Pipeline checkpoint completed"
-                                    );
-                                }
-                                Ok(result) => {
-                                    tracing::warn!(
-                                        epoch = result.epoch,
-                                        error = ?result.error,
-                                        "Pipeline checkpoint failed"
-                                    );
-                                }
-                                Err(e) => {
-                                    tracing::warn!(
-                                        error = %e,
-                                        "Checkpoint error"
-                                    );
+                            let mut guard = coord_clone.lock().await;
+                            if let Some(ref mut coord) = *guard {
+                                match coord
+                                    .checkpoint_with_extra_tables(
+                                        HashMap::new(),
+                                        None,
+                                        0,
+                                        Vec::new(),
+                                        None,
+                                        extra_tables,
+                                    )
+                                    .await
+                                {
+                                    Ok(result) if result.success => {
+                                        tracing::info!(
+                                            epoch = result.epoch,
+                                            duration_ms = result.duration.as_millis(),
+                                            "Pipeline checkpoint completed"
+                                        );
+                                    }
+                                    Ok(result) => {
+                                        tracing::warn!(
+                                            epoch = result.epoch,
+                                            error = ?result.error,
+                                            "Pipeline checkpoint failed"
+                                        );
+                                    }
+                                    Err(e) => {
+                                        tracing::warn!(
+                                            error = %e,
+                                            "Checkpoint error"
+                                        );
+                                    }
                                 }
                             }
                             in_progress.store(false, std::sync::atomic::Ordering::Relaxed);
@@ -2698,39 +2692,41 @@ impl LaminarDB {
             }
 
             // Final checkpoint before shutdown (blocking is OK at shutdown)
-            if let Some(ref coord_arc) = coordinator {
-                let mut coord = coord_arc.lock().await;
-                let mut extra_tables = HashMap::new();
-                for (name, source, _) in &table_sources {
-                    extra_tables.insert(
-                        name.clone(),
-                        source_to_connector_checkpoint(&source.checkpoint()),
-                    );
-                }
-
-                match coord
-                    .checkpoint_with_extra_tables(
-                        HashMap::new(),
-                        None,
-                        0,
-                        Vec::new(),
-                        None,
-                        extra_tables,
-                    )
-                    .await
-                {
-                    Ok(result) if result.success => {
-                        tracing::info!(epoch = result.epoch, "Final pipeline checkpoint saved");
-                    }
-                    Ok(result) => {
-                        tracing::warn!(
-                            epoch = result.epoch,
-                            error = ?result.error,
-                            "Final checkpoint failed"
+            {
+                let mut guard = coordinator.lock().await;
+                if let Some(ref mut coord) = *guard {
+                    let mut extra_tables = HashMap::new();
+                    for (name, source, _) in &table_sources {
+                        extra_tables.insert(
+                            name.clone(),
+                            source_to_connector_checkpoint(&source.checkpoint()),
                         );
                     }
-                    Err(e) => {
-                        tracing::warn!(error = %e, "Final checkpoint error");
+
+                    match coord
+                        .checkpoint_with_extra_tables(
+                            HashMap::new(),
+                            None,
+                            0,
+                            Vec::new(),
+                            None,
+                            extra_tables,
+                        )
+                        .await
+                    {
+                        Ok(result) if result.success => {
+                            tracing::info!(epoch = result.epoch, "Final pipeline checkpoint saved");
+                        }
+                        Ok(result) => {
+                            tracing::warn!(
+                                epoch = result.epoch,
+                                error = ?result.error,
+                                "Final checkpoint failed"
+                            );
+                        }
+                        Err(e) => {
+                            tracing::warn!(error = %e, "Final checkpoint error");
+                        }
                     }
                 }
             }
