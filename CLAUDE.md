@@ -28,11 +28,10 @@ crates/
 
 ## Key Documents
 
-- @docs/STEERING.md - Current priorities and decisions
-- @docs/ARCHITECTURE.md - System design and ring model
-- @docs/ROADMAP.md - Phase timeline and milestones
-- @docs/features/INDEX.md - Feature tracking
-- @docs/COMPETITIVE.md - Competitive landscape analysis
+- [ARCHITECTURE.md](docs/ARCHITECTURE.md) - System design and ring model
+- [ROADMAP.md](docs/ROADMAP.md) - Phase timeline and milestones
+- [STEERING.md](docs/STEERING.md) - Current priorities and decisions
+- [features/INDEX.md](docs/features/INDEX.md) - Feature tracking
 
 ## Performance Targets
 
@@ -49,53 +48,3 @@ crates/
 - **No locks on hot path** - SPSC queues, lock-free structures
 - **Unsafe requires justification** - Comment with `// SAFETY:` explanation
 - **All public APIs documented** - `#![deny(missing_docs)]`
-
-## Development Workflow
-
-### Starting a Session
-1. Run `/status` to see current state
-2. Pick up the next priority item
-
-### Ending a Session
-1. Note any blockers or decisions needed
-2. List immediate next steps
-
-## Ring Architecture
-
-```
-┌─────────────────────────────────────────────────────────────────┐
-│                        RING 0: HOT PATH                         │
-│  Zero allocations, no locks, < 1μs latency                      │
-│  ┌─────────┐  ┌─────────┐  ┌─────────┐  ┌─────────┐            │
-│  │ Reactor │─▶│Operators│─▶│  State  │─▶│  Emit   │            │
-│  └─────────┘  └─────────┘  └─────────┘  └─────────┘            │
-├─────────────────────────────────────────────────────────────────┤
-│                     RING 1: BACKGROUND                          │
-│  Async I/O, checkpoints, can allocate                           │
-│  ┌─────────┐  ┌─────────┐  ┌─────────┐                         │
-│  │Checkpoint│  │  WAL   │  │Compaction│                         │
-│  └─────────┘  └─────────┘  └─────────┘                         │
-├─────────────────────────────────────────────────────────────────┤
-│                     RING 2: CONTROL PLANE                       │
-│  Configuration, metrics, admin                                  │
-│  ┌─────────┐  ┌─────────┐  ┌─────────┐                         │
-│  │  Admin  │  │ Metrics │  │  Auth   │                         │
-│  └─────────┘  └─────────┘  └─────────┘                         │
-└─────────────────────────────────────────────────────────────────┘
-```
-
-## Agents
-
-- **architect** - Design review, ring model validation
-- **security-reviewer** - Auth code audits
-- **performance-auditor** - Hot path violation checks
-- **stage-gate** - Phase completion validation
-- **feature-spec-writer** - Generate feature specifications
-
-## Commands
-
-- `/status` - Current project state
-- `/new-feature` - Create feature specification
-- `/complete-feature` - Run completion checklist
-- `/gate-check` - Validate phase completion
-- `/adr` - Create architecture decision record
