@@ -435,7 +435,11 @@ impl LaminarDB {
             if create.or_replace {
                 let _ = self.ctx.deregister_table(name);
             }
-            let provider = crate::table_provider::SourceSnapshotProvider::new(Arc::clone(entry));
+            let num_partitions = self.ctx.state().config().target_partitions();
+            let provider = crate::table_provider::SourceSnapshotProvider::new(
+                Arc::clone(entry),
+                num_partitions,
+            );
             let _ = self.ctx.register_table(name, Arc::new(provider));
         }
 

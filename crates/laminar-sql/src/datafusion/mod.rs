@@ -118,9 +118,27 @@ use datafusion_expr::ScalarUDF;
 /// ```
 #[must_use]
 pub fn create_streaming_context() -> SessionContext {
+    create_partitioned_streaming_context(1)
+}
+
+/// Creates a `DataFusion` session context configured for multi-partition
+/// streaming queries.
+///
+/// The context is configured with:
+/// - Batch size of 8192 (balanced for streaming throughput)
+/// - `target_partitions` set to `num_partitions` so `DataFusion` can
+///   utilise multiple cores for parallel scan execution
+/// - All streaming UDFs registered (TUMBLE, HOP, SESSION, WATERMARK)
+///
+/// # Arguments
+///
+/// * `num_partitions` - Number of target partitions for query execution.
+///   Must be >= 1; values < 1 are clamped to 1.
+#[must_use]
+pub fn create_partitioned_streaming_context(num_partitions: usize) -> SessionContext {
     let config = SessionConfig::new()
         .with_batch_size(8192)
-        .with_target_partitions(1); // Single partition for streaming
+        .with_target_partitions(num_partitions.max(1));
 
     let ctx = SessionContext::new_with_config(config);
     register_streaming_functions(&ctx);
@@ -180,9 +198,9 @@ mod tests {
         ]))
     }
 
-    /// Take the sender from a `ChannelStreamSource`, panicking if already taken.
+    /// Take the sender for partition 0 from a `ChannelStreamSource`, panicking if already taken.
     fn take_test_sender(source: &ChannelStreamSource) -> super::bridge::BridgeSender {
-        source.take_sender().expect("sender already taken")
+        source.take_sender(0).expect("sender already taken")
     }
 
     fn test_batch(schema: &Arc<Schema>, ids: Vec<i64>, values: Vec<f64>) -> RecordBatch {
@@ -204,6 +222,16 @@ mod tests {
 
         assert_eq!(config.batch_size(), 8192);
         assert_eq!(config.target_partitions(), 1);
+    }
+
+    #[test]
+    fn test_create_partitioned_streaming_context() {
+        let ctx = create_partitioned_streaming_context(4);
+        let state = ctx.state();
+        let config = state.config();
+
+        assert_eq!(config.batch_size(), 8192);
+        assert_eq!(config.target_partitions(), 4);
     }
 
     #[tokio::test]
@@ -485,7 +513,7 @@ mod tests {
         ]));
 
         let source = Arc::new(ChannelStreamSource::new(schema));
-        let _sender = source.take_sender();
+        let _sender = source.take_sender(0);
         let provider = StreamingTableProvider::new("events", source);
         ctx.register_table("events", Arc::new(provider)).unwrap();
 

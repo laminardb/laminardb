@@ -151,6 +151,7 @@ mod tests {
 
         fn stream(
             &self,
+            _partition: usize,
             _projection: Option<Vec<usize>>,
             _filters: Vec<Expr>,
         ) -> Result<SendableRecordBatchStream, DataFusionError> {

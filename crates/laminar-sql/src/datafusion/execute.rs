@@ -234,7 +234,7 @@ mod tests {
         let source = Arc::new(crate::datafusion::ChannelStreamSource::new(Arc::clone(
             &schema,
         )));
-        let sender = source.take_sender().expect("sender available");
+        let sender = source.take_sender(0).expect("sender available");
         let provider = crate::datafusion::StreamingTableProvider::new("users", source);
         ctx.register_table("users", Arc::new(provider)).unwrap();
 
