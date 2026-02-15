@@ -44,7 +44,7 @@ ratatui = { version = "0.30", features = ["all-widgets"] }
 crossterm = "0.29"
 
 # System metrics
-sysinfo = "0.33"
+sysinfo = "0.38"
 
 # Kafka (optional)
 rdkafka = { version = "0.39", features = ["cmake-build"], optional = true }
