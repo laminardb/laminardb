@@ -28,7 +28,7 @@ use super::source::{SortColumn, StreamSourceRef};
 ///
 /// # Properties
 ///
-/// - Supports multi-partition scanning for parallel query execution
+/// - Single partition (streaming sources are typically not partitioned)
 /// - Unbounded execution mode (streaming)
 /// - No inherent ordering (unless specified by source)
 pub struct StreamingScanExec {
@@ -68,7 +68,6 @@ impl StreamingScanExec {
     ) -> Self {
         let source_schema = source.schema();
         let source_ordering = source.output_ordering();
-        let num_partitions = source.num_partitions();
 
         let schema = match &projection {
             Some(indices) => {
@@ -87,11 +86,11 @@ impl StreamingScanExec {
         // Build plan properties for an unbounded streaming source
         let properties = PlanProperties::new(
             eq_properties,
-            Partitioning::UnknownPartitioning(num_partitions),
-            EmissionType::Incremental,
+            Partitioning::UnknownPartitioning(1), // Single partition for streaming
+            EmissionType::Incremental,            // Streaming emits incrementally
             Boundedness::Unbounded {
                 requires_infinite_memory: false,
-            },
+            }, // Streaming is unbounded
         );
 
         Self {
@@ -231,16 +230,14 @@ impl ExecutionPlan for StreamingScanExec {
         partition: usize,
         _context: Arc<TaskContext>,
     ) -> Result<SendableRecordBatchStream, DataFusionError> {
-        let num_partitions = self.source.num_partitions();
-        if partition >= num_partitions {
+        if partition != 0 {
             return Err(DataFusionError::Plan(format!(
-                "StreamingScanExec partition {partition} out of range \
-                 (source has {num_partitions} partition(s))"
+                "StreamingScanExec only supports partition 0, got {partition}"
             )));
         }
 
         self.source
-            .stream(partition, self.projection.clone(), self.filters.clone())
+            .stream(self.projection.clone(), self.filters.clone())
     }
 }
 
@@ -304,7 +301,6 @@ mod tests {
 
         fn stream(
             &self,
-            _partition: usize,
             _projection: Option<Vec<usize>>,
             _filters: Vec<Expr>,
         ) -> Result<SendableRecordBatchStream, DataFusionError> {
@@ -356,7 +352,7 @@ mod tests {
         // Should be unbounded (streaming)
         assert!(matches!(exec.boundedness(), Boundedness::Unbounded { .. }));
 
-        // Should match source's num_partitions (default 1)
+        // Should be single partition
         let partitioning = exec.properties().output_partitioning();
         assert!(matches!(partitioning, Partitioning::UnknownPartitioning(1)));
 

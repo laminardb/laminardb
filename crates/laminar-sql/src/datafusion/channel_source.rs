@@ -23,22 +23,12 @@ use super::source::{SortColumn, StreamSource};
 /// Default channel capacity for the stream source.
 const DEFAULT_CHANNEL_CAPACITY: usize = 1024;
 
-/// Maximum number of partitions allowed, to prevent accidental
-/// misconfiguration from allocating thousands of channels.
-const MAX_PARTITIONS: usize = 256;
-
 /// A streaming source that receives data through a channel.
 ///
 /// This is the primary integration point between `LaminarDB`'s push-based
 /// Reactor and `DataFusion`'s pull-based query execution. Data is pushed
 /// into the source via `BridgeSender`, and `DataFusion` pulls it through
 /// the stream.
-///
-/// # Multi-Partition Support
-///
-/// A source can be created with multiple partitions via
-/// [`with_partitions`](Self::with_partitions) to enable parallel query
-/// execution. Each partition has its own bridge and sender.
 ///
 /// # Important Usage Pattern
 ///
@@ -47,7 +37,7 @@ const MAX_PARTITIONS: usize = 256;
 /// ```rust,ignore
 /// // Create the source and take the sender
 /// let source = ChannelStreamSource::new(schema);
-/// let sender = source.take_sender(0).expect("sender available");
+/// let sender = source.take_sender().expect("sender available");
 ///
 /// // Register with `DataFusion`
 /// let provider = StreamingTableProvider::new("events", Arc::new(source));
@@ -71,77 +61,41 @@ const MAX_PARTITIONS: usize = 256;
 pub struct ChannelStreamSource {
     /// Schema of the data
     schema: SchemaRef,
-    /// Per-partition bridges connecting senders and receivers
-    bridges: Mutex<Vec<Option<StreamBridge>>>,
-    /// Per-partition senders for pushing data
-    senders: Mutex<Vec<Option<BridgeSender>>>,
-    /// Number of partitions
-    num_partitions: usize,
-    /// Channel capacity per partition
+    /// The bridge connecting sender and receivers
+    bridge: Mutex<Option<StreamBridge>>,
+    /// Sender for pushing data - must be taken, not cloned
+    sender: Mutex<Option<BridgeSender>>,
+    /// Channel capacity
     capacity: usize,
     /// Declared output ordering (for ORDER BY elision)
     ordering: Option<Vec<SortColumn>>,
 }
 
 impl ChannelStreamSource {
-    /// Creates a new single-partition channel stream source with default capacity.
+    /// Creates a new channel stream source with default capacity.
     ///
     /// # Arguments
     ///
     /// * `schema` - Schema of the `RecordBatch` instances that will be pushed
     #[must_use]
     pub fn new(schema: SchemaRef) -> Self {
-        Self::with_partitions_and_capacity(schema, 1, DEFAULT_CHANNEL_CAPACITY)
+        Self::with_capacity(schema, DEFAULT_CHANNEL_CAPACITY)
     }
 
-    /// Creates a new single-partition channel stream source with specified capacity.
+    /// Creates a new channel stream source with specified capacity.
     ///
     /// # Arguments
     ///
     /// * `schema` - Schema of the `RecordBatch` instances that will be pushed
-    /// * `capacity` - Maximum number of batches that can be buffered per partition
+    /// * `capacity` - Maximum number of batches that can be buffered
     #[must_use]
     pub fn with_capacity(schema: SchemaRef, capacity: usize) -> Self {
-        Self::with_partitions_and_capacity(schema, 1, capacity)
-    }
-
-    /// Creates a new multi-partition channel stream source with default capacity.
-    ///
-    /// # Arguments
-    ///
-    /// * `schema` - Schema of the `RecordBatch` instances that will be pushed
-    /// * `num_partitions` - Number of partitions (must be >= 1)
-    #[must_use]
-    pub fn with_partitions(schema: SchemaRef, num_partitions: usize) -> Self {
-        Self::with_partitions_and_capacity(schema, num_partitions, DEFAULT_CHANNEL_CAPACITY)
-    }
-
-    /// Creates a new multi-partition channel stream source with specified capacity.
-    ///
-    /// # Arguments
-    ///
-    /// * `schema` - Schema of the `RecordBatch` instances that will be pushed
-    /// * `num_partitions` - Number of partitions (must be >= 1)
-    /// * `capacity` - Maximum number of batches that can be buffered per partition
-    #[must_use]
-    pub fn with_partitions_and_capacity(
-        schema: SchemaRef,
-        num_partitions: usize,
-        capacity: usize,
-    ) -> Self {
-        let num_partitions = num_partitions.clamp(1, MAX_PARTITIONS);
-        let mut bridges = Vec::with_capacity(num_partitions);
-        let mut senders = Vec::with_capacity(num_partitions);
-        for _ in 0..num_partitions {
-            let bridge = StreamBridge::new(Arc::clone(&schema), capacity);
-            senders.push(Some(bridge.sender()));
-            bridges.push(Some(bridge));
-        }
+        let bridge = StreamBridge::new(Arc::clone(&schema), capacity);
+        let sender = bridge.sender();
         Self {
             schema,
-            bridges: Mutex::new(bridges),
-            senders: Mutex::new(senders),
-            num_partitions,
+            bridge: Mutex::new(Some(bridge)),
+            sender: Mutex::new(Some(sender)),
             capacity,
             ordering: None,
         }
@@ -161,50 +115,43 @@ impl ChannelStreamSource {
         self
     }
 
-    /// Takes the sender for pushing batches into the given partition.
+    /// Takes the sender for pushing batches into this source.
     ///
-    /// This method can only be called once per partition. The sender is
-    /// moved out of the source to ensure the caller has full ownership
-    /// and can close the channel by dropping the sender.
+    /// This method can only be called once. The sender is moved out of
+    /// the source to ensure the caller has full ownership and can close
+    /// the channel by dropping the sender.
     ///
-    /// Returns `None` if the sender was already taken or `partition` is
-    /// out of range.
+    /// The returned sender can be cloned to allow multiple producers.
+    ///
+    /// Returns `None` if the sender was already taken.
     #[must_use]
-    pub fn take_sender(&self, partition: usize) -> Option<BridgeSender> {
-        let mut guard = self.senders.lock();
-        guard.get_mut(partition)?.take()
+    pub fn take_sender(&self) -> Option<BridgeSender> {
+        self.sender.lock().take()
     }
 
-    /// Takes all senders at once, one per partition.
+    /// Returns a clone of the sender if it hasn't been taken yet.
     ///
-    /// Each element is `Some` if the sender hasn't been taken yet for
-    /// that partition, or `None` if it was already taken.
+    /// **Warning**: Using this method can lead to channel leak issues if
+    /// the original sender is never dropped. Prefer `take_sender()` for
+    /// proper channel lifecycle management.
     #[must_use]
-    pub fn take_senders(&self) -> Vec<Option<BridgeSender>> {
-        let mut guard = self.senders.lock();
-        guard.iter_mut().map(Option::take).collect()
+    pub fn sender(&self) -> Option<BridgeSender> {
+        self.sender.lock().as_ref().map(BridgeSender::clone)
     }
 
-    /// Resets the source, recreating all bridges and senders.
+    /// Resets the source with a new bridge and sender.
     ///
     /// This is useful when you need to reuse the source after the previous
-    /// streams have been consumed. Any data sent before the reset but not
+    /// stream has been consumed. Any data sent before the reset but not
     /// yet consumed will be lost.
     ///
-    /// Returns the new senders, one per partition.
-    pub fn reset(&self) -> Vec<BridgeSender> {
-        let mut bridges_guard = self.bridges.lock();
-        let mut senders_guard = self.senders.lock();
-        bridges_guard.clear();
-        senders_guard.clear();
-        let mut result = Vec::with_capacity(self.num_partitions);
-        for _ in 0..self.num_partitions {
-            let bridge = StreamBridge::new(Arc::clone(&self.schema), self.capacity);
-            result.push(bridge.sender());
-            senders_guard.push(Some(bridge.sender()));
-            bridges_guard.push(Some(bridge));
-        }
-        result
+    /// Returns the new sender.
+    pub fn reset(&self) -> BridgeSender {
+        let bridge = StreamBridge::new(Arc::clone(&self.schema), self.capacity);
+        let sender = bridge.sender();
+        *self.bridge.lock() = Some(bridge);
+        *self.sender.lock() = Some(sender.clone());
+        sender
     }
 }
 
@@ -212,7 +159,6 @@ impl Debug for ChannelStreamSource {
     fn fmt(&self, f: &mut Formatter<'_>) -> std::fmt::Result {
         f.debug_struct("ChannelStreamSource")
             .field("schema", &self.schema)
-            .field("num_partitions", &self.num_partitions)
             .field("capacity", &self.capacity)
             .finish_non_exhaustive()
     }
@@ -224,36 +170,21 @@ impl StreamSource for ChannelStreamSource {
         Arc::clone(&self.schema)
     }
 
-    fn num_partitions(&self) -> usize {
-        self.num_partitions
-    }
-
     fn output_ordering(&self) -> Option<Vec<SortColumn>> {
         self.ordering.clone()
     }
 
     fn stream(
         &self,
-        partition: usize,
         projection: Option<Vec<usize>>,
         _filters: Vec<Expr>,
     ) -> Result<datafusion::physical_plan::SendableRecordBatchStream, DataFusionError> {
-        if partition >= self.num_partitions {
-            return Err(DataFusionError::Plan(format!(
-                "Partition {partition} out of range (num_partitions={})",
-                self.num_partitions,
-            )));
-        }
-
-        let mut bridges_guard = self.bridges.lock();
-        let bridge = bridges_guard
-            .get_mut(partition)
-            .and_then(Option::take)
-            .ok_or_else(|| {
-                DataFusionError::Execution(format!(
-                    "Stream for partition {partition} already taken; call reset() to recreate",
-                ))
-            })?;
+        let mut bridge_guard = self.bridge.lock();
+        let bridge = bridge_guard.take().ok_or_else(|| {
+            DataFusionError::Execution(
+                "Stream already taken; call reset() to create a new bridge".to_string(),
+            )
+        })?;
 
         let inner_stream = bridge.into_stream();
 
@@ -379,21 +310,13 @@ mod tests {
         assert_eq!(source.schema(), schema);
     }
 
-    #[test]
-    fn test_channel_source_default_single_partition() {
-        let schema = test_schema();
-        let source = ChannelStreamSource::new(Arc::clone(&schema));
-
-        assert_eq!(source.num_partitions(), 1);
-    }
-
     #[tokio::test]
     async fn test_channel_source_stream() {
         let schema = test_schema();
         let source = ChannelStreamSource::new(Arc::clone(&schema));
-        let sender = source.take_sender(0).unwrap();
+        let sender = source.take_sender().unwrap();
 
-        let mut stream = source.stream(0, None, vec![]).unwrap();
+        let mut stream = source.stream(None, vec![]).unwrap();
 
         // Send data
         sender
@@ -412,10 +335,10 @@ mod tests {
     async fn test_channel_source_projection() {
         let schema = test_schema();
         let source = ChannelStreamSource::new(Arc::clone(&schema));
-        let sender = source.take_sender(0).unwrap();
+        let sender = source.take_sender().unwrap();
 
         // Project only the "value" column (index 1)
-        let mut stream = source.stream(0, Some(vec![1]), vec![]).unwrap();
+        let mut stream = source.stream(Some(vec![1]), vec![]).unwrap();
 
         sender
             .send(test_batch(&schema, vec![1, 2], vec![100, 200]))
@@ -442,10 +365,10 @@ mod tests {
         let source = ChannelStreamSource::new(Arc::clone(&schema));
 
         // First stream takes ownership
-        let _stream = source.stream(0, None, vec![]).unwrap();
+        let _stream = source.stream(None, vec![]).unwrap();
 
         // Second stream should fail
-        let result = source.stream(0, None, vec![]);
+        let result = source.stream(None, vec![]);
         assert!(result.is_err());
     }
 
@@ -453,8 +376,8 @@ mod tests {
     async fn test_channel_source_multiple_batches() {
         let schema = test_schema();
         let source = ChannelStreamSource::new(Arc::clone(&schema));
-        let sender = source.take_sender(0).unwrap();
-        let mut stream = source.stream(0, None, vec![]).unwrap();
+        let sender = source.take_sender().unwrap();
+        let mut stream = source.stream(None, vec![]).unwrap();
 
         // Send multiple batches
         for i in 0..5i64 {
@@ -480,11 +403,11 @@ mod tests {
         let source = ChannelStreamSource::new(Arc::clone(&schema));
 
         // First take succeeds
-        let sender = source.take_sender(0);
+        let sender = source.take_sender();
         assert!(sender.is_some());
 
         // Second take returns None
-        let sender2 = source.take_sender(0);
+        let sender2 = source.take_sender();
         assert!(sender2.is_none());
     }
 
@@ -494,20 +417,19 @@ mod tests {
         let source = ChannelStreamSource::new(Arc::clone(&schema));
 
         // Take sender and stream
-        let _sender = source.take_sender(0).unwrap();
-        let _stream = source.stream(0, None, vec![]).unwrap();
+        let _sender = source.take_sender().unwrap();
+        let _stream = source.stream(None, vec![]).unwrap();
 
-        // Reset creates new bridges and senders
-        let new_senders = source.reset();
-        assert_eq!(new_senders.len(), 1);
-        let mut new_stream = source.stream(0, None, vec![]).unwrap();
+        // Reset creates new bridge and sender
+        let new_sender = source.reset();
+        let mut new_stream = source.stream(None, vec![]).unwrap();
 
         // Can use the new sender and stream
-        new_senders[0]
+        new_sender
             .send(test_batch(&schema, vec![1], vec![10]))
             .await
             .unwrap();
-        drop(new_senders);
+        drop(new_sender);
 
         let batch = new_stream.next().await.unwrap().unwrap();
         assert_eq!(batch.num_rows(), 1);
@@ -543,71 +465,5 @@ mod tests {
         assert_eq!(cols.len(), 1);
         assert_eq!(cols[0].name, "id");
         assert!(!cols[0].descending);
-    }
-
-    // --- Multi-partition tests ---
-
-    #[test]
-    fn test_channel_source_multi_partition_count() {
-        let schema = test_schema();
-        let source = ChannelStreamSource::with_partitions(Arc::clone(&schema), 4);
-
-        assert_eq!(source.num_partitions(), 4);
-    }
-
-    #[tokio::test]
-    async fn test_channel_source_multi_partition_senders_and_streams() {
-        let schema = test_schema();
-        let num_partitions = 3;
-        let source = ChannelStreamSource::with_partitions(Arc::clone(&schema), num_partitions);
-
-        // Take all senders
-        let senders = source.take_senders();
-        assert_eq!(senders.len(), num_partitions);
-
-        // Open all streams
-        let mut streams: Vec<_> = (0..num_partitions)
-            .map(|p| source.stream(p, None, vec![]).unwrap())
-            .collect();
-
-        // Send distinct data to each partition
-        for (i, sender) in senders.into_iter().enumerate() {
-            let sender = sender.unwrap();
-            let id = i as i64;
-            sender
-                .send(test_batch(&schema, vec![id], vec![id * 100]))
-                .await
-                .unwrap();
-            drop(sender);
-        }
-
-        // Each partition should yield its own data
-        let mut total_rows = 0;
-        for stream in &mut streams {
-            while let Some(batch) = stream.next().await {
-                total_rows += batch.unwrap().num_rows();
-            }
-        }
-        assert_eq!(total_rows, num_partitions);
-    }
-
-    #[test]
-    fn test_channel_source_partition_out_of_range() {
-        let schema = test_schema();
-        let source = ChannelStreamSource::with_partitions(Arc::clone(&schema), 2);
-
-        let result = source.stream(2, None, vec![]);
-        match result {
-            Err(e) => assert!(e.to_string().contains("out of range")),
-            Ok(_) => panic!("expected error for out-of-range partition"),
-        }
-    }
-
-    #[test]
-    fn test_channel_source_take_sender_out_of_range() {
-        let schema = test_schema();
-        let source = ChannelStreamSource::new(Arc::clone(&schema));
-
-        assert!(source.take_sender(1).is_none());
     }
 }

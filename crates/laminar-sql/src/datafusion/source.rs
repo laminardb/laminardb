@@ -93,22 +93,10 @@ pub trait StreamSource: Send + Sync + Debug {
     /// the schema of `RecordBatch` instances yielded by `stream()`.
     fn schema(&self) -> SchemaRef;
 
-    /// Returns the number of partitions this source can produce.
-    ///
-    /// `DataFusion` will call `stream()` once per partition (0..n), enabling
-    /// parallel query execution across multiple cores.
-    ///
-    /// The default implementation returns 1 (single partition).
-    fn num_partitions(&self) -> usize {
-        1
-    }
-
-    /// Creates a stream of `RecordBatch` instances for the given partition.
+    /// Creates a stream of `RecordBatch` instances.
     ///
     /// # Arguments
     ///
-    /// * `partition` - The partition index (0-based). Must be less than
-    ///   `num_partitions()`.
     /// * `projection` - Optional column indices to project. If `None`,
     ///   all columns are returned. Indices refer to the source schema.
     /// * `filters` - Filter expressions that can be applied at the source.
@@ -120,11 +108,9 @@ pub trait StreamSource: Send + Sync + Debug {
     ///
     /// # Errors
     ///
-    /// Returns `DataFusionError` if the stream cannot be created or
-    /// if `partition` is out of range.
+    /// Returns `DataFusionError` if the stream cannot be created.
     fn stream(
         &self,
-        partition: usize,
         projection: Option<Vec<usize>>,
         filters: Vec<Expr>,
     ) -> Result<SendableRecordBatchStream, DataFusionError>;
@@ -184,7 +170,6 @@ mod tests {
 
         fn stream(
             &self,
-            _partition: usize,
             _projection: Option<Vec<usize>>,
             _filters: Vec<Expr>,
         ) -> Result<SendableRecordBatchStream, DataFusionError> {
@@ -240,15 +225,6 @@ mod tests {
     }
 
     #[test]
-    fn test_stream_source_default_num_partitions() {
-        let schema = Arc::new(Schema::new(vec![Field::new("id", DataType::Int64, false)]));
-        let source = MockSource { schema };
-
-        // Default implementation returns 1
-        assert_eq!(source.num_partitions(), 1);
-    }
-
-    #[test]
     fn test_stream_source_default_ordering() {
         let schema = Arc::new(Schema::new(vec![Field::new("id", DataType::Int64, false)]));
         let source = MockSource { schema };
@@ -272,7 +248,6 @@ mod tests {
 
             fn stream(
                 &self,
-                _partition: usize,
                 _projection: Option<Vec<usize>>,
                 _filters: Vec<Expr>,
             ) -> Result<SendableRecordBatchStream, DataFusionError> {
