@@ -377,6 +377,7 @@ impl LaminarDB {
     }
 
     /// Handle CREATE SOURCE statement.
+    #[allow(clippy::too_many_lines)]
     fn handle_create_source(
         &self,
         create: &laminar_sql::parser::CreateSourceStatement,
@@ -431,6 +432,16 @@ impl LaminarDB {
                 None,
             )?)
         };
+
+        // Register source as a DataFusion table for ad-hoc SELECT queries.
+        // For OR REPLACE, deregister the old table first.
+        if let Some(ref entry) = entry {
+            if create.or_replace {
+                let _ = self.ctx.deregister_table(name);
+            }
+            let provider = crate::table_provider::SourceSnapshotProvider::new(Arc::clone(entry));
+            let _ = self.ctx.register_table(name, Arc::new(provider));
+        }
 
         // Auto-register source with checkpoint manager if enabled
         if let Some(ref entry) = entry {
@@ -579,8 +590,7 @@ impl LaminarDB {
         if let Some(entry) = self.catalog.get_source(&name) {
             let batch = sql_utils::sql_values_to_record_batch(&entry.schema, values)?;
             entry
-                .source
-                .push_arrow(batch)
+                .push_and_buffer(batch)
                 .map_err(|e| DbError::InsertError(format!("Failed to push to source: {e}")))?;
             return Ok(ExecuteResult::RowsAffected(values.len() as u64));
         }
@@ -842,6 +852,8 @@ impl LaminarDB {
         if !dropped && !if_exists {
             return Err(DbError::SourceNotFound(name_str));
         }
+        // Deregister from DataFusion so SELECT no longer resolves.
+        let _ = self.ctx.deregister_table(&name_str);
         self.connector_manager.lock().unregister_source(&name_str);
         Ok(ExecuteResult::Ddl(DdlInfo {
             statement_type: "DROP SOURCE".to_string(),
@@ -5947,5 +5959,85 @@ mod tests {
             total_rows, 6,
             "all data should pass through without watermark config"
         );
+    }
+
+    #[tokio::test]
+    async fn test_select_from_source() {
+        let db = LaminarDB::open().unwrap();
+        db.execute("CREATE SOURCE sensors (id BIGINT, temp DOUBLE)")
+            .await
+            .unwrap();
+        db.execute("INSERT INTO sensors VALUES (1, 22.5), (2, 23.1)")
+            .await
+            .unwrap();
+
+        let result = db.execute("SELECT * FROM sensors").await.unwrap();
+        match result {
+            ExecuteResult::Query(mut q) => {
+                // The bridge_query_stream spawns a tokio task; yield to let it run.
+                tokio::task::yield_now().await;
+                let sub = q.subscribe_raw().unwrap();
+                let mut total_rows = 0;
+                for _ in 0..256 {
+                    match sub.poll() {
+                        Some(b) => total_rows += b.num_rows(),
+                        None => break,
+                    }
+                }
+                assert_eq!(total_rows, 2);
+            }
+            _ => panic!("Expected Query result from SELECT on source"),
+        }
+    }
+
+    #[tokio::test]
+    async fn test_select_from_dropped_source_fails() {
+        let db = LaminarDB::open().unwrap();
+        db.execute("CREATE SOURCE sensors (id BIGINT, temp DOUBLE)")
+            .await
+            .unwrap();
+        db.execute("DROP SOURCE sensors").await.unwrap();
+
+        let result = db.execute("SELECT * FROM sensors").await;
+        assert!(result.is_err(), "SELECT after DROP SOURCE should fail");
+    }
+
+    #[tokio::test]
+    async fn test_select_from_replaced_source() {
+        let db = LaminarDB::open().unwrap();
+        db.execute("CREATE SOURCE sensors (id BIGINT, temp DOUBLE)")
+            .await
+            .unwrap();
+        db.execute("INSERT INTO sensors VALUES (1, 20.0)")
+            .await
+            .unwrap();
+
+        // Replace the source — old buffer is gone
+        db.execute("CREATE OR REPLACE SOURCE sensors (id BIGINT, temp DOUBLE)")
+            .await
+            .unwrap();
+        db.execute("INSERT INTO sensors VALUES (2, 30.0)")
+            .await
+            .unwrap();
+
+        let result = db.execute("SELECT * FROM sensors").await.unwrap();
+        match result {
+            ExecuteResult::Query(mut q) => {
+                tokio::task::yield_now().await;
+                let sub = q.subscribe_raw().unwrap();
+                let mut total_rows = 0;
+                for _ in 0..256 {
+                    match sub.poll() {
+                        Some(b) => total_rows += b.num_rows(),
+                        None => break,
+                    }
+                }
+                assert_eq!(
+                    total_rows, 1,
+                    "only the post-replace insert should be visible"
+                );
+            }
+            _ => panic!("Expected Query result"),
+        }
     }
 }

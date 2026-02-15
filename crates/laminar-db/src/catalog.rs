@@ -1,13 +1,13 @@
 //! Source and sink catalog for tracking registered streaming objects.
 
-use std::collections::HashMap;
+use std::collections::{HashMap, VecDeque};
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::Arc;
 use std::time::Duration;
 
 use arrow::array::RecordBatch;
 use arrow::datatypes::SchemaRef;
-use parking_lot::RwLock;
+use parking_lot::{Mutex, RwLock};
 
 use laminar_core::streaming::{self, BackpressureStrategy, SourceConfig, WaitStrategy};
 
@@ -45,6 +45,34 @@ pub struct SourceEntry {
     /// The underlying streaming sink (type-erased via `ArrowRecord`).
     #[allow(dead_code)] // Reserved for Phase 3 connector manager sink routing
     pub(crate) sink: streaming::Sink<ArrowRecord>,
+    /// Bounded buffer of recent batches for ad-hoc snapshot queries.
+    buffer: Mutex<VecDeque<RecordBatch>>,
+    /// Max batches retained (defaults to channel `buffer_size`).
+    buffer_capacity: usize,
+}
+
+impl SourceEntry {
+    /// Push a batch to both the SPSC channel and the snapshot buffer.
+    ///
+    /// The snapshot buffer is bounded — oldest batches are dropped when
+    /// `buffer_capacity` is exceeded.
+    pub(crate) fn push_and_buffer(
+        &self,
+        batch: RecordBatch,
+    ) -> Result<(), laminar_core::streaming::StreamingError> {
+        self.source.push_arrow(batch.clone())?;
+        let mut buf = self.buffer.lock();
+        if buf.len() >= self.buffer_capacity {
+            buf.pop_front();
+        }
+        buf.push_back(batch);
+        Ok(())
+    }
+
+    /// Return a snapshot of all buffered batches for ad-hoc queries.
+    pub(crate) fn snapshot(&self) -> Vec<RecordBatch> {
+        self.buffer.lock().iter().cloned().collect()
+    }
 }
 
 /// A registered sink in the catalog.
@@ -140,6 +168,8 @@ impl SourceCatalog {
             max_out_of_orderness,
             source,
             sink,
+            buffer: Mutex::new(VecDeque::with_capacity(buf_size)),
+            buffer_capacity: buf_size,
         });
 
         sources.insert(name.to_string(), Arc::clone(&entry));
@@ -428,5 +458,61 @@ mod tests {
             None,
         );
         assert_eq!(entry.watermark_column, Some("ts".to_string()));
+    }
+
+    #[test]
+    fn test_push_and_buffer_snapshot() {
+        let catalog = SourceCatalog::new(1024, BackpressureStrategy::Block);
+        let schema = test_schema();
+        let entry = catalog
+            .register_source("test", schema.clone(), None, None, None, None)
+            .unwrap();
+
+        let batch = RecordBatch::try_new(
+            schema,
+            vec![
+                Arc::new(arrow::array::Int64Array::from(vec![1])),
+                Arc::new(arrow::array::Float64Array::from(vec![1.5])),
+            ],
+        )
+        .unwrap();
+
+        entry.push_and_buffer(batch).unwrap();
+        let snap = entry.snapshot();
+        assert_eq!(snap.len(), 1);
+        assert_eq!(snap[0].num_rows(), 1);
+    }
+
+    #[test]
+    fn test_buffer_capacity_drops_oldest() {
+        // Use a small buffer size so we can test overflow
+        let catalog = SourceCatalog::new(2, BackpressureStrategy::DropOldest);
+        let schema = test_schema();
+        let entry = catalog
+            .register_source("test", schema.clone(), None, None, None, None)
+            .unwrap();
+
+        let values: [(i64, f64); 3] = [(0, 1.0), (1, 2.0), (2, 3.0)];
+        for (id, val) in values {
+            let batch = RecordBatch::try_new(
+                schema.clone(),
+                vec![
+                    Arc::new(arrow::array::Int64Array::from(vec![id])),
+                    Arc::new(arrow::array::Float64Array::from(vec![val])),
+                ],
+            )
+            .unwrap();
+            entry.push_and_buffer(batch).unwrap();
+        }
+
+        let snap = entry.snapshot();
+        // buffer_capacity=2, so only the last 2 batches should remain
+        assert_eq!(snap.len(), 2);
+        let col = snap[0]
+            .column(0)
+            .as_any()
+            .downcast_ref::<arrow::array::Int64Array>()
+            .unwrap();
+        assert_eq!(col.value(0), 1); // batch 0 was dropped
     }
 }
