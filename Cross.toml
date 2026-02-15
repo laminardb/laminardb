@@ -13,11 +13,16 @@ pre-build = [
 ]
 
 # x86_64 Linux (musl) -- install system libs for rdkafka-sys cmake build.
-# The cross-rs toolchain file restricts CMake find_* to the sysroot (ONLY mode),
-# so we append BOTH overrides at the end of the toolchain file — more robust than sed
-# substitution which breaks when cross-rs changes the toolchain file format.
+# Two issues:
+#   1) The cross-rs toolchain file restricts CMake find_* to the sysroot (ONLY mode),
+#      so libz-sys's output in CMAKE_PREFIX_PATH is ignored. Fix: append BOTH overrides.
+#   2) librdkafka 2.12.1 uses #cmakedefine01 WITH_CURL → `#define WITH_CURL 0` which
+#      still satisfies `#ifdef WITH_CURL`, so curl/curl.h is included even with -DWITH_CURL=0.
+#      Fix: copy curl headers into the musl sysroot so the compiler can find them.
+#      (Only headers needed — actual curl calls are gated by `#if WITH_CURL` which is 0.)
 [target.x86_64-unknown-linux-musl]
 pre-build = [
-    "apt-get update && apt-get --assume-yes install zlib1g-dev",
+    "apt-get update && apt-get --assume-yes install zlib1g-dev libcurl4-openssl-dev",
+    "mkdir -p /usr/local/x86_64-linux-musl/include && cp -r /usr/include/curl /usr/local/x86_64-linux-musl/include/ 2>/dev/null || cp -r /usr/include/x86_64-linux-gnu/curl /usr/local/x86_64-linux-musl/include/ 2>/dev/null || true",
     "printf '\\nset(CMAKE_FIND_ROOT_PATH_MODE_LIBRARY BOTH)\\nset(CMAKE_FIND_ROOT_PATH_MODE_INCLUDE BOTH)\\nset(CMAKE_FIND_ROOT_PATH_MODE_PACKAGE BOTH)\\n' >> /opt/toolchain.cmake || true"
 ]
