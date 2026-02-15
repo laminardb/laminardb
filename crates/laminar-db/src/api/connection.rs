@@ -264,15 +264,37 @@ impl Connection {
         self.inner.is_closed()
     }
 
-    /// Trigger a checkpoint.
+    /// Trigger a checkpoint that persists to disk.
     ///
-    /// Returns the checkpoint ID on success.
+    /// Returns the checkpoint ID on success. The pipeline must be started
+    /// first via [`start()`](Self::start).
     ///
     /// # Errors
     ///
-    /// Returns `ApiError` if checkpointing fails.
-    pub fn checkpoint(&self) -> Result<Option<u64>, ApiError> {
-        self.inner.checkpoint().map_err(ApiError::from)
+    /// Returns `ApiError` if checkpointing fails or is not enabled.
+    ///
+    /// # Panics
+    ///
+    /// Panics if the internal thread used for async execution panics.
+    pub fn checkpoint(&self) -> Result<u64, ApiError> {
+        let result = if let Ok(handle) = tokio::runtime::Handle::try_current() {
+            std::thread::scope(|s| {
+                s.spawn(|| {
+                    let inner = Arc::clone(&self.inner);
+                    handle.block_on(async move { inner.checkpoint().await })
+                })
+                .join()
+                .unwrap()
+            })
+        } else {
+            let rt = tokio::runtime::Builder::new_current_thread()
+                .enable_all()
+                .build()
+                .map_err(|e| ApiError::internal(format!("Runtime error: {e}")))?;
+            rt.block_on(self.inner.checkpoint())
+        };
+
+        result.map(|r| r.checkpoint_id).map_err(ApiError::from)
     }
 
     /// Check if checkpointing is enabled.

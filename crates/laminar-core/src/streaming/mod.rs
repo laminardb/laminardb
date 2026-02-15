@@ -123,9 +123,7 @@ pub mod subscription;
 
 // Re-export key types
 pub use channel::{channel, channel_with_config, ChannelMode, Consumer, Producer};
-pub use checkpoint::{
-    CheckpointError, StreamCheckpoint, StreamCheckpointConfig, StreamCheckpointManager, WalMode,
-};
+pub use checkpoint::{CheckpointError, StreamCheckpoint, StreamCheckpointConfig, WalMode};
 pub use config::{
     BackpressureStrategy, ChannelConfig, ChannelStats, SinkConfig, SourceConfig, WaitStrategy,
 };
