@@ -28,7 +28,7 @@
 
 ## Phase 1: Core Engine ✅
 
-> **Status**: Complete. See [PHASE1_AUDIT.md](../PHASE1_AUDIT.md) for details.
+> **Status**: Complete.
 
 | ID | Feature | Status | Spec |
 |----|---------|--------|------|

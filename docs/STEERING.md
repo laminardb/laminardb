@@ -14,14 +14,14 @@ Phase 2 Production Hardening is complete with all 29 features implemented.
 
 **Next Priority** (updated based on research reviews):
 
-**Thread-Per-Core Optimizations** (from [TPC 2026 Research](research/laminardb-thread-per-core-2026-research.md)):
+**Thread-Per-Core Optimizations**:
 1. ~~**F071 (Zero-Allocation Enforcement)**~~ - ✅ COMPLETE
 2. ~~**F067 (io_uring Advanced)**~~ - ✅ COMPLETE
 3. ~~**F068 (NUMA-Aware Memory)**~~ - ✅ COMPLETE
 4. ~~**F070 (Task Budget Enforcement)**~~ - ✅ COMPLETE - latency SLA guarantees
 5. ~~**F069 (Three-Ring I/O)**~~ - ✅ COMPLETE - latency/main/poll ring separation
 
-**Emit & Checkpoint** (from [Emit Patterns Research](research/emit-patterns-research-2026.md)):
+**Emit & Checkpoint**:
 6. ~~**F011B (EMIT Clause Extension)**~~ - ✅ COMPLETE - OnWindowClose/Changelog/Final
 7. ~~**F063 (Changelog/Retraction)**~~ - ✅ COMPLETE - Z-set foundation, unblocks F023, F060
 8. ~~**F059 (FIRST/LAST Value Aggregates)**~~ - ✅ COMPLETE - Essential for OHLC, unblocks F060
@@ -63,7 +63,7 @@ Phase 1 features are functionally complete. A comprehensive audit against 2025-2
 | Partial (gaps found) | 6 |
 | Needs Work | 1 |
 
-**Full audit report**: See `docs/PHASE1_AUDIT.md`
+**Full audit report**: All P0 items resolved.
 
 ---
 
@@ -89,7 +89,7 @@ Phase 1 features are functionally complete. A comprehensive audit against 2025-2
 | ~~Retraction model~~ | ~~Z-set vs Flink changelog~~ | ~~Phase 2 Week 2~~ | ✅ **Decided: Z-set** (F063) |
 
 **Notes**:
-- Retraction model decided based on [emit patterns research](research/emit-patterns-research-2026.md) - DBSP/Feldera Z-sets chosen for mathematical foundation. See [F063: Changelog/Retraction](features/phase-2/F063-changelog-retraction.md).
+- Retraction model decided: DBSP/Feldera Z-sets chosen for mathematical foundation. See [F063: Changelog/Retraction](features/phase-2/F063-changelog-retraction.md).
 - io_uring and NUMA implementation details specified in [F067](features/phase-2/F067-io-uring-optimization.md) and [F068](features/phase-2/F068-numa-aware-memory.md) respectively.
 
 ---
@@ -181,6 +181,5 @@ Phase 1 features are functionally complete. A comprehensive audit against 2025-2
 
 ## Communication
 
-- **Daily**: Quick status in CONTEXT.md
 - **Weekly**: Update STEERING.md priorities
 - **Phase End**: Full retrospective and planning

@@ -31,7 +31,6 @@ crates/
 - @docs/STEERING.md - Current priorities and decisions
 - @docs/ARCHITECTURE.md - System design and ring model
 - @docs/ROADMAP.md - Phase timeline and milestones
-- @docs/CONTEXT.md - Session continuity (where we left off)
 - @docs/features/INDEX.md - Feature tracking
 - @docs/COMPETITIVE.md - Competitive landscape analysis
 
@@ -54,14 +53,12 @@ crates/
 ## Development Workflow
 
 ### Starting a Session
-1. Read CONTEXT.md for where we left off
-2. Run `/status` to see current state
-3. Pick up the next priority item
+1. Run `/status` to see current state
+2. Pick up the next priority item
 
 ### Ending a Session
-1. Update CONTEXT.md with progress
-2. Note any blockers or decisions needed
-3. List immediate next steps
+1. Note any blockers or decisions needed
+2. List immediate next steps
 
 ## Ring Architecture
 

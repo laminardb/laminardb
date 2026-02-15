@@ -58,7 +58,6 @@ Progress: 3/12 features complete (25%)
 
 - `docs/features/INDEX.md` - Feature status
 - `docs/STEERING.md` - Current priorities
-- `docs/CONTEXT.md` - Session context
 - `cargo test` - Test status
 - `cargo clippy` - Lint status
 
