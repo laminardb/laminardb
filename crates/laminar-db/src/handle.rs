@@ -247,7 +247,7 @@ impl<T: Record> SourceHandle<T> {
     #[allow(clippy::needless_pass_by_value)]
     pub fn push(&self, record: T) -> Result<(), laminar_core::streaming::StreamingError> {
         let batch = record.to_record_batch();
-        self.entry.source.push_arrow(batch)
+        self.entry.push_and_buffer(batch)
     }
 
     /// Push a batch of records.
@@ -279,6 +279,9 @@ impl<T: Record> SourceHandle<T> {
 
     /// Push a raw `RecordBatch`.
     ///
+    /// The batch is sent to the SPSC channel for pipeline processing and
+    /// also buffered for ad-hoc `SELECT` snapshot queries.
+    ///
     /// # Errors
     ///
     /// Returns `StreamingError` if the channel is full or closed.
@@ -286,7 +289,7 @@ impl<T: Record> SourceHandle<T> {
         &self,
         batch: RecordBatch,
     ) -> Result<(), laminar_core::streaming::StreamingError> {
-        self.entry.source.push_arrow(batch)
+        self.entry.push_and_buffer(batch)
     }
 
     /// Emit a watermark.
@@ -367,6 +370,9 @@ impl UntypedSourceHandle {
 
     /// Push a `RecordBatch`.
     ///
+    /// The batch is sent to the SPSC channel for pipeline processing and
+    /// also buffered for ad-hoc `SELECT` snapshot queries.
+    ///
     /// # Errors
     ///
     /// Returns `StreamingError` if the channel is full or closed.
@@ -374,7 +380,7 @@ impl UntypedSourceHandle {
         &self,
         batch: RecordBatch,
     ) -> Result<(), laminar_core::streaming::StreamingError> {
-        self.entry.source.push_arrow(batch)
+        self.entry.push_and_buffer(batch)
     }
 
     /// Emit a watermark.

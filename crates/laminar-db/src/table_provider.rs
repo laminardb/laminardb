@@ -1,8 +1,10 @@
-//! Live `DataFusion` table provider backed by the `TableStore`.
+//! Live `DataFusion` table providers for `TableStore` and streaming sources.
 //!
-//! Unlike `MemTable` (which is a static snapshot), [`ReferenceTableProvider`]
-//! reads directly from the `TableStore` on each `scan()` call, so queries
-//! always see the latest data without needing to deregister/re-register.
+//! [`ReferenceTableProvider`] reads directly from the `TableStore` on each
+//! `scan()` call, so queries always see the latest data without re-registration.
+//!
+//! [`SourceSnapshotProvider`] serves point-in-time snapshots of buffered
+//! source data, enabling `SELECT * FROM source` on streaming sources.
 
 use std::any::Any;
 use std::sync::Arc;
@@ -15,6 +17,7 @@ use datafusion::error::DataFusionError;
 use datafusion::logical_expr::Expr;
 use datafusion::physical_plan::ExecutionPlan;
 
+use crate::catalog::SourceEntry;
 use crate::table_store::TableStore;
 
 /// A `DataFusion` table provider that reads live data from `TableStore`.
@@ -86,6 +89,63 @@ impl std::fmt::Debug for ReferenceTableProvider {
         f.debug_struct("ReferenceTableProvider")
             .field("table_name", &self.table_name)
             .field("schema", &self.schema)
+            .finish_non_exhaustive()
+    }
+}
+
+/// A `DataFusion` table provider that serves point-in-time snapshots of a
+/// streaming source's buffered data.
+///
+/// Registered at `CREATE SOURCE` time. Each `scan()` reads the current
+/// snapshot from `SourceEntry::snapshot()` and delegates to `MemTable`.
+pub(crate) struct SourceSnapshotProvider {
+    source_entry: Arc<SourceEntry>,
+}
+
+impl SourceSnapshotProvider {
+    /// Create a new provider backed by the given source entry.
+    pub fn new(source_entry: Arc<SourceEntry>) -> Self {
+        Self { source_entry }
+    }
+}
+
+#[async_trait]
+impl TableProvider for SourceSnapshotProvider {
+    fn as_any(&self) -> &dyn Any {
+        self
+    }
+
+    fn schema(&self) -> SchemaRef {
+        self.source_entry.schema.clone()
+    }
+
+    fn table_type(&self) -> TableType {
+        TableType::Base
+    }
+
+    async fn scan(
+        &self,
+        state: &dyn Session,
+        projection: Option<&Vec<usize>>,
+        filters: &[Expr],
+        limit: Option<usize>,
+    ) -> Result<Arc<dyn ExecutionPlan>, DataFusionError> {
+        let batches = self.source_entry.snapshot();
+        let schema = self.source_entry.schema.clone();
+        let data = if batches.is_empty() {
+            vec![vec![]]
+        } else {
+            vec![batches]
+        };
+        let mem_table = datafusion::datasource::MemTable::try_new(schema, data)?;
+        mem_table.scan(state, projection, filters, limit).await
+    }
+}
+
+impl std::fmt::Debug for SourceSnapshotProvider {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("SourceSnapshotProvider")
+            .field("source", &self.source_entry.name)
             .finish_non_exhaustive()
     }
 }
