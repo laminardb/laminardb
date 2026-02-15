@@ -23,6 +23,10 @@ use super::source::{SortColumn, StreamSource};
 /// Default channel capacity for the stream source.
 const DEFAULT_CHANNEL_CAPACITY: usize = 1024;
 
+/// Maximum number of partitions allowed, to prevent accidental
+/// misconfiguration from allocating thousands of channels.
+const MAX_PARTITIONS: usize = 256;
+
 /// A streaming source that receives data through a channel.
 ///
 /// This is the primary integration point between `LaminarDB`'s push-based
@@ -125,7 +129,7 @@ impl ChannelStreamSource {
         num_partitions: usize,
         capacity: usize,
     ) -> Self {
-        let num_partitions = num_partitions.max(1);
+        let num_partitions = num_partitions.clamp(1, MAX_PARTITIONS);
         let mut bridges = Vec::with_capacity(num_partitions);
         let mut senders = Vec::with_capacity(num_partitions);
         for _ in 0..num_partitions {
@@ -196,10 +200,9 @@ impl ChannelStreamSource {
         let mut result = Vec::with_capacity(self.num_partitions);
         for _ in 0..self.num_partitions {
             let bridge = StreamBridge::new(Arc::clone(&self.schema), self.capacity);
-            let sender = bridge.sender();
-            senders_guard.push(Some(sender.clone()));
+            result.push(bridge.sender());
+            senders_guard.push(Some(bridge.sender()));
             bridges_guard.push(Some(bridge));
-            result.push(sender);
         }
         result
     }

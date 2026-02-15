@@ -111,11 +111,11 @@ impl SourceSnapshotProvider {
     /// # Arguments
     ///
     /// * `source_entry` - The source entry to snapshot
-    /// * `num_partitions` - Number of partitions for parallel scans
+    /// * `num_partitions` - Number of partitions for parallel scans (clamped to 1..=256)
     pub fn new(source_entry: Arc<SourceEntry>, num_partitions: usize) -> Self {
         Self {
             source_entry,
-            num_partitions: num_partitions.max(1),
+            num_partitions: num_partitions.clamp(1, 256),
         }
     }
 }
@@ -147,7 +147,9 @@ impl TableProvider for SourceSnapshotProvider {
             // Produce the right number of (empty) partitions
             (0..self.num_partitions).map(|_| Vec::new()).collect()
         } else {
-            // Distribute batches round-robin across partitions
+            // Distribute batches round-robin across partitions.
+            // Assumes roughly uniform batch sizes; skew is acceptable
+            // for ad-hoc snapshot queries (not on the streaming hot path).
             let mut partitions: Vec<Vec<_>> =
                 (0..self.num_partitions).map(|_| Vec::new()).collect();
             for (i, batch) in batches.into_iter().enumerate() {
