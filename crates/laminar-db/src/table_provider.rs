@@ -97,15 +97,26 @@ impl std::fmt::Debug for ReferenceTableProvider {
 /// streaming source's buffered data.
 ///
 /// Registered at `CREATE SOURCE` time. Each `scan()` reads the current
-/// snapshot from `SourceEntry::snapshot()` and delegates to `MemTable`.
+/// snapshot from `SourceEntry::snapshot()` and distributes batches
+/// round-robin across `num_partitions` partitions to enable parallel
+/// query execution.
 pub(crate) struct SourceSnapshotProvider {
     source_entry: Arc<SourceEntry>,
+    num_partitions: usize,
 }
 
 impl SourceSnapshotProvider {
     /// Create a new provider backed by the given source entry.
-    pub fn new(source_entry: Arc<SourceEntry>) -> Self {
-        Self { source_entry }
+    ///
+    /// # Arguments
+    ///
+    /// * `source_entry` - The source entry to snapshot
+    /// * `num_partitions` - Number of partitions for parallel scans (clamped to 1..=256)
+    pub fn new(source_entry: Arc<SourceEntry>, num_partitions: usize) -> Self {
+        Self {
+            source_entry,
+            num_partitions: num_partitions.clamp(1, 256),
+        }
     }
 }
 
@@ -133,9 +144,18 @@ impl TableProvider for SourceSnapshotProvider {
         let batches = self.source_entry.snapshot();
         let schema = self.source_entry.schema.clone();
         let data = if batches.is_empty() {
-            vec![vec![]]
+            // Produce the right number of (empty) partitions
+            (0..self.num_partitions).map(|_| Vec::new()).collect()
         } else {
-            vec![batches]
+            // Distribute batches round-robin across partitions.
+            // Assumes roughly uniform batch sizes; skew is acceptable
+            // for ad-hoc snapshot queries (not on the streaming hot path).
+            let mut partitions: Vec<Vec<_>> =
+                (0..self.num_partitions).map(|_| Vec::new()).collect();
+            for (i, batch) in batches.into_iter().enumerate() {
+                partitions[i % self.num_partitions].push(batch);
+            }
+            partitions
         };
         let mem_table = datafusion::datasource::MemTable::try_new(schema, data)?;
         mem_table.scan(state, projection, filters, limit).await
@@ -146,6 +166,7 @@ impl std::fmt::Debug for SourceSnapshotProvider {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         f.debug_struct("SourceSnapshotProvider")
             .field("source", &self.source_entry.name)
+            .field("num_partitions", &self.num_partitions)
             .finish_non_exhaustive()
     }
 }

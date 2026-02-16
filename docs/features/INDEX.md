@@ -8,10 +8,10 @@
 | Phase 1.5 | 1 | 0 | 0 | 0 | 1 |
 | Phase 2 | 38 | 0 | 0 | 0 | 38 |
 | Phase 2.5 | 12 | 0 | 0 | 0 | 12 |
-| Phase 3 | 76 | 9 | 0 | 0 | 67 |
+| Phase 3 | 77 | 9 | 0 | 0 | 68 |
 | Phase 4 | 11 | 11 | 0 | 0 | 0 |
 | Phase 5 | 10 | 10 | 0 | 0 | 0 |
-| **Total** | **160** | **23** | **0** | **0** | **130** |
+| **Total** | **161** | **23** | **0** | **0** | **131** |
 
 ## Status Legend
 
@@ -136,7 +136,7 @@ See [Plan Compiler Index](plan-compiler/INDEX.md) for architecture details and [
 
 ## Phase 3: Connectors & Integration
 
-> **Status**: 67/76 features complete (88%)
+> **Status**: 68/77 features complete (88%)
 
 ### Streaming API ✅
 
@@ -227,6 +227,7 @@ See [Cloud Storage Index](phase-3/cloud/INDEX.md).
 | F-SQL-004 | HAVING Clause Execution | ✅ | [Link](phase-3/F-SQL-004-having-clause.md) |
 | F-SQL-005 | Multi-Way JOIN Support | ✅ | [Link](phase-3/F-SQL-005-multi-way-joins.md) |
 | F-SQL-006 | Window Frame (ROWS BETWEEN) | ✅ | [Link](phase-3/F-SQL-006-window-frames.md) |
+| F-SQL-007 | Multi-Partition Streaming Scans | ✅ | [Link](phase-3/F-SQL-007-multi-partition-scans.md) |
 
 ### Connector Infrastructure
 
