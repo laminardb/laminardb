@@ -32,7 +32,7 @@ crc32c = "0.6"
 base64 = { workspace = true }
 
 # Fast hash for changelog entries
-fxhash = "0.2"
+rustc-hash = { workspace = true }
 
 # Async
 tokio = { workspace = true }

@@ -30,7 +30,7 @@ jit = [
 
 [dependencies]
 # Performance critical - no allocations on hot path
-fxhash = { workspace = true }
+rustc-hash = { workspace = true }
 xorf = { workspace = true }
 crossbeam = { workspace = true }
 parking_lot = { workspace = true }
@@ -94,7 +94,7 @@ libbpf-rs = { version = "0.26", optional = true }
 libc = { workspace = true }
 
 [target.'cfg(target_os = "windows")'.dependencies]
-winapi = { version = "0.3", features = ["processthreadsapi", "winbase", "basetsd"] }
+windows-sys = { version = "0.59", features = ["Win32_System_Threading"] }
 
 [dev-dependencies]
 criterion = { workspace = true }

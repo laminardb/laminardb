@@ -24,7 +24,7 @@
 use std::hash::{BuildHasher, Hasher};
 use std::sync::atomic::{AtomicUsize, Ordering};
 
-use fxhash::FxBuildHasher;
+use rustc_hash::FxBuildHasher;
 
 /// State mutation operation type.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -156,7 +156,7 @@ impl StateChangelogEntry {
     #[inline]
     #[must_use]
     pub fn hash_key(key: &[u8]) -> u64 {
-        let hasher_builder = FxBuildHasher::default();
+        let hasher_builder = FxBuildHasher;
         let mut hasher = hasher_builder.build_hasher();
         hasher.write(key);
         hasher.finish()
@@ -484,7 +484,7 @@ impl ChangelogEntryBuilder {
     pub fn new(epoch: u64) -> Self {
         Self {
             epoch,
-            hasher_builder: FxBuildHasher::default(),
+            hasher_builder: FxBuildHasher,
         }
     }
 

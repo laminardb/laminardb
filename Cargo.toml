@@ -42,7 +42,7 @@ tracing-subscriber = { version = "0.3", features = ["env-filter"] }
 chrono = "0.4"
 
 # Performance-critical
-fxhash = "0.2"  # Faster than std HashMap
+rustc-hash = "2.1"  # Faster than std HashMap (replaces unmaintained fxhash)
 crossbeam = "0.8"  # Lock-free data structures
 parking_lot = "0.12"  # Faster Mutex/RwLock
 memmap2 = "0.9"  # Memory-mapped files
@@ -62,7 +62,7 @@ datafusion = "52.0"
 datafusion-common = "52.0"
 datafusion-expr = "52.0"
 datafusion-sql = "52.0"
-sqlparser = "0.60"
+sqlparser = "0.59"
 
 # Async
 tokio-stream = "0.1"
@@ -82,7 +82,7 @@ xorf = "0.12"
 base64 = "0.22"
 
 # Randomness
-rand = "0.8"
+rand = "0.9"
 
 # JIT compilation (Cranelift)
 cranelift-codegen = "0.128"

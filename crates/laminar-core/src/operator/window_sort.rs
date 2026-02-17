@@ -19,7 +19,7 @@ use super::{
 };
 use arrow_array::{Array, Float64Array, Int64Array, StringArray, TimestampMicrosecondArray};
 use arrow_schema::DataType;
-use fxhash::FxHashMap;
+use rustc_hash::FxHashMap;
 
 /// Window-local sort operator.
 ///

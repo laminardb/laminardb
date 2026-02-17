@@ -48,7 +48,7 @@
 
 use arrow_array::RecordBatch;
 use async_trait::async_trait;
-use std::collections::HashMap;
+use rustc_hash::FxHashMap;
 use std::sync::Arc;
 use thiserror::Error;
 
@@ -219,7 +219,7 @@ pub trait TableLoader: Send + Sync {
 #[derive(Debug, Clone)]
 pub struct InMemoryTableLoader {
     /// The underlying data store.
-    data: Arc<parking_lot::RwLock<HashMap<Vec<u8>, RecordBatch>>>,
+    data: Arc<parking_lot::RwLock<FxHashMap<Vec<u8>, RecordBatch>>>,
     /// Name for logging.
     name: String,
 }
@@ -235,14 +235,14 @@ impl InMemoryTableLoader {
     #[must_use]
     pub fn with_name(name: impl Into<String>) -> Self {
         Self {
-            data: Arc::new(parking_lot::RwLock::new(HashMap::new())),
+            data: Arc::new(parking_lot::RwLock::new(FxHashMap::default())),
             name: name.into(),
         }
     }
 
     /// Creates a new in-memory table loader from existing data.
     #[must_use]
-    pub fn from_map(data: HashMap<Vec<u8>, RecordBatch>) -> Self {
+    pub fn from_map(data: FxHashMap<Vec<u8>, RecordBatch>) -> Self {
         Self {
             data: Arc::new(parking_lot::RwLock::new(data)),
             name: "in_memory".to_string(),

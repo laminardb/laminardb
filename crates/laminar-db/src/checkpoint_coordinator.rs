@@ -1020,8 +1020,9 @@ pub fn dag_snapshot_to_manifest_operators<S: std::hash::BuildHasher>(
 #[must_use]
 pub fn manifest_operators_to_dag_states<S: std::hash::BuildHasher>(
     operators: &HashMap<String, laminar_storage::checkpoint_manifest::OperatorCheckpoint, S>,
-) -> fxhash::FxHashMap<laminar_core::dag::topology::NodeId, laminar_core::operator::OperatorState> {
-    let mut states = fxhash::FxHashMap::default();
+) -> rustc_hash::FxHashMap<laminar_core::dag::topology::NodeId, laminar_core::operator::OperatorState>
+{
+    let mut states = rustc_hash::FxHashMap::default();
     for (key, op_ckpt) in operators {
         if let Ok(node_id) = key.parse::<u32>() {
             if let Some(data) = op_ckpt.decode_inline() {

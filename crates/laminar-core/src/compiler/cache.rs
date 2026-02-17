@@ -6,7 +6,7 @@
 
 use std::sync::Arc;
 
-use fxhash::FxHashMap;
+use rustc_hash::FxHashMap;
 
 use super::error::CompileError;
 use super::jit::JitContext;
@@ -102,7 +102,7 @@ impl std::fmt::Debug for CompilerCache {
 fn hash_pipeline(pipeline: &Pipeline) -> u64 {
     use std::hash::{Hash, Hasher};
 
-    let mut hasher = fxhash::FxHasher::default();
+    let mut hasher = rustc_hash::FxHasher::default();
 
     for stage in &pipeline.stages {
         let stage_repr = format!("{stage:?}");

@@ -23,7 +23,7 @@ use super::{
 };
 use arrow_array::{Array, Float64Array, Int64Array, StringArray, TimestampMicrosecondArray};
 use arrow_schema::DataType;
-use fxhash::FxHashMap;
+use rustc_hash::FxHashMap;
 
 /// Configuration for a partition key column.
 #[derive(Debug, Clone, PartialEq, Eq)]

@@ -93,10 +93,11 @@ use super::{
 use crate::state::StateStoreExt;
 use arrow_array::{Array, ArrayRef, Int64Array, RecordBatch, StringArray};
 use arrow_schema::{DataType, Field, Schema, SchemaRef};
-use fxhash::FxHashMap;
 use rkyv::{
     rancor::Error as RkyvError, Archive, Deserialize as RkyvDeserialize, Serialize as RkyvSerialize,
 };
+use rustc_hash::FxHashMap;
+use std::hash::{Hash, Hasher};
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::Arc;
 use std::time::Duration;
@@ -691,7 +692,11 @@ impl LookupJoinOperator {
 
     /// Creates a cache key from a lookup key.
     fn make_cache_key(key: &[u8]) -> Vec<u8> {
-        let key_hash = fxhash::hash64(key);
+        let key_hash = {
+            let mut hasher = rustc_hash::FxHasher::default();
+            key.hash(&mut hasher);
+            hasher.finish()
+        };
         let mut cache_key = Vec::with_capacity(12);
         cache_key.extend_from_slice(CACHE_STATE_PREFIX);
         cache_key.extend_from_slice(&key_hash.to_be_bytes());

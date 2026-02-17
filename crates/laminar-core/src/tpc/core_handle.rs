@@ -718,16 +718,14 @@ fn set_cpu_affinity(core_id: usize, cpu_id: usize) -> Result<(), TpcError> {
 
     #[cfg(target_os = "windows")]
     {
-        use winapi::shared::basetsd::DWORD_PTR;
-        use winapi::um::processthreadsapi::GetCurrentThread;
-        use winapi::um::winbase::SetThreadAffinityMask;
+        use windows_sys::Win32::System::Threading::{GetCurrentThread, SetThreadAffinityMask};
 
         // SAFETY: We're calling Windows API functions with valid parameters.
         // GetCurrentThread returns a pseudo-handle that doesn't need to be closed.
         // The mask is a valid CPU mask for the specified core.
         #[allow(unsafe_code)]
         unsafe {
-            let mask: DWORD_PTR = 1 << cpu_id;
+            let mask: usize = 1 << cpu_id;
             let result = SetThreadAffinityMask(GetCurrentThread(), mask);
             if result == 0 {
                 return Err(TpcError::AffinityFailed {

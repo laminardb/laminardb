@@ -49,7 +49,6 @@ use super::{
 use crate::state::{StateStore, StateStoreExt};
 use arrow_array::{Array, Int64Array, RecordBatch};
 use arrow_schema::{DataType, Field, Schema, SchemaRef};
-use fxhash::FxHashMap;
 use rkyv::{
     api::high::{HighDeserializer, HighSerializer, HighValidator},
     bytecheck::CheckBytes,
@@ -58,6 +57,7 @@ use rkyv::{
     util::AlignedVec,
     Archive, Deserialize as RkyvDeserialize, Serialize as RkyvSerialize,
 };
+use rustc_hash::FxHashMap;
 use std::marker::PhantomData;
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::Arc;
@@ -92,7 +92,12 @@ impl SessionId {
     /// Combines a hash of the operator ID with a monotonic counter to produce
     /// IDs that are unique across operators and invocations.
     pub fn generate(operator_id: &str, counter: &AtomicU64) -> Self {
-        let op_hash = fxhash::hash64(operator_id.as_bytes());
+        let op_hash = {
+            use std::hash::{Hash, Hasher};
+            let mut hasher = rustc_hash::FxHasher::default();
+            operator_id.as_bytes().hash(&mut hasher);
+            hasher.finish()
+        };
         let seq = counter.fetch_add(1, Ordering::Relaxed);
         Self(op_hash ^ seq)
     }
@@ -502,7 +507,7 @@ where
     /// Computes a hash for the key.
     fn key_hash(key: &[u8]) -> u64 {
         use std::hash::{Hash, Hasher};
-        let mut hasher = fxhash::FxHasher::default();
+        let mut hasher = rustc_hash::FxHasher::default();
         key.hash(&mut hasher);
         hasher.finish()
     }

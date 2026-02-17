@@ -44,7 +44,7 @@
 //! ```
 
 use super::window::{CdcOperation, WindowId};
-use fxhash::FxHashMap;
+use rustc_hash::FxHashMap;
 use serde::{Deserialize, Serialize};
 
 // Ring 0: Zero-Allocation Types
@@ -521,19 +521,15 @@ impl RetractableAccumulator for RetractableAvgAccumulator {
     }
 }
 
-/// Retractable min accumulator with value tracking.
+/// Retractable min accumulator with counted value tracking.
 ///
-/// This accumulator tracks all values to support efficient retraction.
-/// When the current minimum is retracted, it recomputes from remaining values.
-///
-/// Note: This uses more memory than the basic `MinAccumulator` because it
-/// stores all values. Use only when retraction support is required.
+/// Uses a `BTreeMap<i64, usize>` (value → count) for O(log n) insert/remove
+/// and O(1) min via `first_key_value()`. Bounded memory proportional to
+/// distinct values, not total event count.
 #[derive(Debug, Clone, Default)]
 pub struct RetractableMinAccumulator {
-    /// All values (for recomputation on retraction)
-    values: Vec<i64>,
-    /// Cached minimum
-    cached_min: Option<i64>,
+    /// Value → occurrence count (sorted for O(1) min access)
+    counts: std::collections::BTreeMap<i64, usize>,
 }
 
 impl RetractableMinAccumulator {
@@ -542,10 +538,6 @@ impl RetractableMinAccumulator {
     pub fn new() -> Self {
         Self::default()
     }
-
-    fn recompute_min(&mut self) {
-        self.cached_min = self.values.iter().copied().min();
-    }
 }
 
 impl RetractableAccumulator for RetractableMinAccumulator {
@@ -553,53 +545,50 @@ impl RetractableAccumulator for RetractableMinAccumulator {
     type Output = Option<i64>;
 
     fn add(&mut self, value: i64) {
-        self.values.push(value);
-        self.cached_min = Some(self.cached_min.map_or(value, |m| m.min(value)));
+        *self.counts.entry(value).or_insert(0) += 1;
     }
 
     fn retract(&mut self, value: &i64) {
-        if let Some(pos) = self.values.iter().position(|v| v == value) {
-            self.values.swap_remove(pos);
-            // Recompute if we removed the minimum
-            if self.cached_min == Some(*value) {
-                self.recompute_min();
+        if let Some(count) = self.counts.get_mut(value) {
+            *count -= 1;
+            if *count == 0 {
+                self.counts.remove(value);
             }
         }
     }
 
     fn merge(&mut self, other: &Self) {
-        self.values.extend(&other.values);
-        self.recompute_min();
+        for (&val, &cnt) in &other.counts {
+            *self.counts.entry(val).or_insert(0) += cnt;
+        }
     }
 
     fn result(&self) -> Option<i64> {
-        self.cached_min
+        self.counts.keys().next().copied()
     }
 
     fn is_empty(&self) -> bool {
-        self.values.is_empty()
+        self.counts.is_empty()
     }
 
     fn supports_efficient_retraction(&self) -> bool {
-        // Retraction may require O(n) recomputation
-        false
+        true
     }
 
     fn reset(&mut self) {
-        self.values.clear();
-        self.cached_min = None;
+        self.counts.clear();
     }
 }
 
-/// Retractable max accumulator with value tracking.
+/// Retractable max accumulator with counted value tracking.
 ///
-/// Similar to `RetractableMinAccumulator`, tracks all values for retraction support.
+/// Uses a `BTreeMap<i64, usize>` (value → count) for O(log n) insert/remove
+/// and O(1) max via `last_key_value()`. Bounded memory proportional to
+/// distinct values, not total event count.
 #[derive(Debug, Clone, Default)]
 pub struct RetractableMaxAccumulator {
-    /// All values (for recomputation on retraction)
-    values: Vec<i64>,
-    /// Cached maximum
-    cached_max: Option<i64>,
+    /// Value → occurrence count (sorted for O(1) max access)
+    counts: std::collections::BTreeMap<i64, usize>,
 }
 
 impl RetractableMaxAccumulator {
@@ -608,10 +597,6 @@ impl RetractableMaxAccumulator {
     pub fn new() -> Self {
         Self::default()
     }
-
-    fn recompute_max(&mut self) {
-        self.cached_max = self.values.iter().copied().max();
-    }
 }
 
 impl RetractableAccumulator for RetractableMaxAccumulator {
@@ -619,41 +604,38 @@ impl RetractableAccumulator for RetractableMaxAccumulator {
     type Output = Option<i64>;
 
     fn add(&mut self, value: i64) {
-        self.values.push(value);
-        self.cached_max = Some(self.cached_max.map_or(value, |m| m.max(value)));
+        *self.counts.entry(value).or_insert(0) += 1;
     }
 
     fn retract(&mut self, value: &i64) {
-        if let Some(pos) = self.values.iter().position(|v| v == value) {
-            self.values.swap_remove(pos);
-            // Recompute if we removed the maximum
-            if self.cached_max == Some(*value) {
-                self.recompute_max();
+        if let Some(count) = self.counts.get_mut(value) {
+            *count -= 1;
+            if *count == 0 {
+                self.counts.remove(value);
             }
         }
     }
 
     fn merge(&mut self, other: &Self) {
-        self.values.extend(&other.values);
-        self.recompute_max();
+        for (&val, &cnt) in &other.counts {
+            *self.counts.entry(val).or_insert(0) += cnt;
+        }
     }
 
     fn result(&self) -> Option<i64> {
-        self.cached_max
+        self.counts.keys().next_back().copied()
     }
 
     fn is_empty(&self) -> bool {
-        self.values.is_empty()
+        self.counts.is_empty()
     }
 
     fn supports_efficient_retraction(&self) -> bool {
-        // Retraction may require O(n) recomputation
-        false
+        true
     }
 
     fn reset(&mut self) {
-        self.values.clear();
-        self.cached_max = None;
+        self.counts.clear();
     }
 }
 
@@ -1094,10 +1076,15 @@ impl<T: Serialize> CdcEnvelope<T> {
 ///
 /// This is a Ring 1 structure (allocates). Ring 0 uses the non-retractable
 /// [`super::window::FirstValueAccumulator`] via the static dispatch path.
+///
+/// Uses `BTreeMap<i64, Vec<i64>>` (timestamp → values) for O(log n) insert/remove
+/// and O(1) first-value access via `first_key_value()`.
 #[derive(Debug, Clone, Default)]
 pub struct RetractableFirstValueAccumulator {
-    /// Sorted entries: `(timestamp, value)`, ascending by timestamp
-    entries: Vec<(i64, i64)>,
+    /// Timestamp to values at that timestamp (`BTreeMap` for O(log n) ops)
+    entries: std::collections::BTreeMap<i64, Vec<i64>>,
+    /// Total entry count across all timestamps
+    total_count: usize,
 }
 
 impl RetractableFirstValueAccumulator {
@@ -1110,13 +1097,13 @@ impl RetractableFirstValueAccumulator {
     /// Returns the number of stored entries.
     #[must_use]
     pub fn len(&self) -> usize {
-        self.entries.len()
+        self.total_count
     }
 
     /// Returns true if no entries are stored.
     #[must_use]
     pub fn is_empty(&self) -> bool {
-        self.entries.is_empty()
+        self.total_count == 0
     }
 }
 
@@ -1125,58 +1112,38 @@ impl RetractableAccumulator for RetractableFirstValueAccumulator {
     type Output = Option<i64>;
 
     fn add(&mut self, (timestamp, value): (i64, i64)) {
-        // Insert in sorted order by timestamp, preserving insertion order
-        // for duplicate timestamps (append after existing same-timestamp entries)
-        let pos = match self.entries.binary_search_by_key(&timestamp, |(ts, _)| *ts) {
-            Ok(mut p) => {
-                // Skip past all entries with the same timestamp
-                while p < self.entries.len() && self.entries[p].0 == timestamp {
-                    p += 1;
-                }
-                p
-            }
-            Err(p) => p,
-        };
-        self.entries.insert(pos, (timestamp, value));
+        self.entries.entry(timestamp).or_default().push(value);
+        self.total_count += 1;
     }
 
     fn retract(&mut self, (timestamp, value): &(i64, i64)) {
-        // Find and remove the exact entry
-        if let Some(pos) = self
-            .entries
-            .iter()
-            .position(|(ts, val)| ts == timestamp && val == value)
-        {
-            self.entries.remove(pos);
+        if let Some(values) = self.entries.get_mut(timestamp) {
+            if let Some(pos) = values.iter().position(|v| v == value) {
+                values.swap_remove(pos);
+                self.total_count -= 1;
+                if values.is_empty() {
+                    self.entries.remove(timestamp);
+                }
+            }
         }
     }
 
     fn merge(&mut self, other: &Self) {
-        // Merge sorted lists
-        let mut merged = Vec::with_capacity(self.entries.len() + other.entries.len());
-        let mut i = 0;
-        let mut j = 0;
-        while i < self.entries.len() && j < other.entries.len() {
-            if self.entries[i].0 <= other.entries[j].0 {
-                merged.push(self.entries[i]);
-                i += 1;
-            } else {
-                merged.push(other.entries[j]);
-                j += 1;
-            }
+        for (&ts, vals) in &other.entries {
+            self.entries.entry(ts).or_default().extend(vals);
         }
-        merged.extend_from_slice(&self.entries[i..]);
-        merged.extend_from_slice(&other.entries[j..]);
-        self.entries = merged;
+        self.total_count += other.total_count;
     }
 
     fn result(&self) -> Option<i64> {
-        // First entry has the earliest timestamp
-        self.entries.first().map(|(_, val)| *val)
+        self.entries
+            .values()
+            .next()
+            .and_then(|vals| vals.first().copied())
     }
 
     fn is_empty(&self) -> bool {
-        self.entries.is_empty()
+        self.total_count == 0
     }
 
     fn supports_efficient_retraction(&self) -> bool {
@@ -1185,19 +1152,20 @@ impl RetractableAccumulator for RetractableFirstValueAccumulator {
 
     fn reset(&mut self) {
         self.entries.clear();
+        self.total_count = 0;
     }
 }
 
 /// Retractable `LAST_VALUE` accumulator for changelog/retraction mode.
 ///
-/// Stores all `(timestamp, value)` entries sorted by timestamp ascending.
-/// On retraction, removes the entry and recomputes the last value.
-/// This is necessary for `EMIT CHANGES` with OHLC queries where the
-/// close price may need to be retracted.
+/// Uses `BTreeMap<i64, Vec<i64>>` (timestamp → values) for O(log n) insert/remove
+/// and O(1) last-value access via `last_key_value()`.
 #[derive(Debug, Clone, Default)]
 pub struct RetractableLastValueAccumulator {
-    /// Sorted entries: `(timestamp, value)`, ascending by timestamp
-    entries: Vec<(i64, i64)>,
+    /// Timestamp to values at that timestamp (`BTreeMap` for O(log n) ops)
+    entries: std::collections::BTreeMap<i64, Vec<i64>>,
+    /// Total entry count across all timestamps
+    total_count: usize,
 }
 
 impl RetractableLastValueAccumulator {
@@ -1210,13 +1178,13 @@ impl RetractableLastValueAccumulator {
     /// Returns the number of stored entries.
     #[must_use]
     pub fn len(&self) -> usize {
-        self.entries.len()
+        self.total_count
     }
 
     /// Returns true if no entries are stored.
     #[must_use]
     pub fn is_empty(&self) -> bool {
-        self.entries.is_empty()
+        self.total_count == 0
     }
 }
 
@@ -1225,54 +1193,38 @@ impl RetractableAccumulator for RetractableLastValueAccumulator {
     type Output = Option<i64>;
 
     fn add(&mut self, (timestamp, value): (i64, i64)) {
-        // Insert in sorted order by timestamp, preserving insertion order
-        let pos = match self.entries.binary_search_by_key(&timestamp, |(ts, _)| *ts) {
-            Ok(mut p) => {
-                while p < self.entries.len() && self.entries[p].0 == timestamp {
-                    p += 1;
-                }
-                p
-            }
-            Err(p) => p,
-        };
-        self.entries.insert(pos, (timestamp, value));
+        self.entries.entry(timestamp).or_default().push(value);
+        self.total_count += 1;
     }
 
     fn retract(&mut self, (timestamp, value): &(i64, i64)) {
-        if let Some(pos) = self
-            .entries
-            .iter()
-            .position(|(ts, val)| ts == timestamp && val == value)
-        {
-            self.entries.remove(pos);
+        if let Some(values) = self.entries.get_mut(timestamp) {
+            if let Some(pos) = values.iter().position(|v| v == value) {
+                values.swap_remove(pos);
+                self.total_count -= 1;
+                if values.is_empty() {
+                    self.entries.remove(timestamp);
+                }
+            }
         }
     }
 
     fn merge(&mut self, other: &Self) {
-        let mut merged = Vec::with_capacity(self.entries.len() + other.entries.len());
-        let mut i = 0;
-        let mut j = 0;
-        while i < self.entries.len() && j < other.entries.len() {
-            if self.entries[i].0 <= other.entries[j].0 {
-                merged.push(self.entries[i]);
-                i += 1;
-            } else {
-                merged.push(other.entries[j]);
-                j += 1;
-            }
+        for (&ts, vals) in &other.entries {
+            self.entries.entry(ts).or_default().extend(vals);
         }
-        merged.extend_from_slice(&self.entries[i..]);
-        merged.extend_from_slice(&other.entries[j..]);
-        self.entries = merged;
+        self.total_count += other.total_count;
     }
 
     fn result(&self) -> Option<i64> {
-        // Last entry has the latest timestamp
-        self.entries.last().map(|(_, val)| *val)
+        self.entries
+            .values()
+            .next_back()
+            .and_then(|vals| vals.last().copied())
     }
 
     fn is_empty(&self) -> bool {
-        self.entries.is_empty()
+        self.total_count == 0
     }
 
     fn supports_efficient_retraction(&self) -> bool {
@@ -1281,17 +1233,20 @@ impl RetractableAccumulator for RetractableLastValueAccumulator {
 
     fn reset(&mut self) {
         self.entries.clear();
+        self.total_count = 0;
     }
 }
 
 /// Retractable `FIRST_VALUE` accumulator for f64 values.
 ///
-/// Uses `f64::to_bits()` / `f64::from_bits()` for lossless i64 storage
-/// within the sorted entry list.
+/// Uses `f64::to_bits()` / `f64::from_bits()` for lossless i64 storage.
+/// Uses `BTreeMap<i64, Vec<i64>>` (timestamp to `value_bits`) for O(log n) ops.
 #[derive(Debug, Clone, Default)]
 pub struct RetractableFirstValueF64Accumulator {
-    /// Sorted entries: `(timestamp, value_bits)`, ascending by timestamp
-    entries: Vec<(i64, i64)>,
+    /// Timestamp to `value_bits` at that timestamp
+    entries: std::collections::BTreeMap<i64, Vec<i64>>,
+    /// Total entry count across all timestamps
+    total_count: usize,
 }
 
 impl RetractableFirstValueF64Accumulator {
@@ -1304,13 +1259,13 @@ impl RetractableFirstValueF64Accumulator {
     /// Returns the number of stored entries.
     #[must_use]
     pub fn len(&self) -> usize {
-        self.entries.len()
+        self.total_count
     }
 
     /// Returns true if no entries are stored.
     #[must_use]
     pub fn is_empty(&self) -> bool {
-        self.entries.is_empty()
+        self.total_count == 0
     }
 
     /// Returns the result as f64.
@@ -1318,8 +1273,10 @@ impl RetractableFirstValueF64Accumulator {
     #[allow(clippy::cast_sign_loss)]
     pub fn result_f64(&self) -> Option<f64> {
         self.entries
-            .first()
-            .map(|(_, bits)| f64::from_bits(*bits as u64))
+            .values()
+            .next()
+            .and_then(|vals| vals.first())
+            .map(|bits| f64::from_bits(*bits as u64))
     }
 }
 
@@ -1330,54 +1287,40 @@ impl RetractableAccumulator for RetractableFirstValueF64Accumulator {
     #[allow(clippy::cast_possible_wrap)]
     fn add(&mut self, (timestamp, value): (i64, f64)) {
         let value_bits = value.to_bits() as i64;
-        let pos = match self.entries.binary_search_by_key(&timestamp, |(ts, _)| *ts) {
-            Ok(mut p) => {
-                while p < self.entries.len() && self.entries[p].0 == timestamp {
-                    p += 1;
-                }
-                p
-            }
-            Err(p) => p,
-        };
-        self.entries.insert(pos, (timestamp, value_bits));
+        self.entries.entry(timestamp).or_default().push(value_bits);
+        self.total_count += 1;
     }
 
     fn retract(&mut self, (timestamp, value): &(i64, f64)) {
         #[allow(clippy::cast_possible_wrap)]
         let value_bits = value.to_bits() as i64;
-        if let Some(pos) = self
-            .entries
-            .iter()
-            .position(|(ts, val)| *ts == *timestamp && *val == value_bits)
-        {
-            self.entries.remove(pos);
+        if let Some(values) = self.entries.get_mut(timestamp) {
+            if let Some(pos) = values.iter().position(|v| *v == value_bits) {
+                values.swap_remove(pos);
+                self.total_count -= 1;
+                if values.is_empty() {
+                    self.entries.remove(timestamp);
+                }
+            }
         }
     }
 
     fn merge(&mut self, other: &Self) {
-        let mut merged = Vec::with_capacity(self.entries.len() + other.entries.len());
-        let mut i = 0;
-        let mut j = 0;
-        while i < self.entries.len() && j < other.entries.len() {
-            if self.entries[i].0 <= other.entries[j].0 {
-                merged.push(self.entries[i]);
-                i += 1;
-            } else {
-                merged.push(other.entries[j]);
-                j += 1;
-            }
+        for (&ts, vals) in &other.entries {
+            self.entries.entry(ts).or_default().extend(vals);
         }
-        merged.extend_from_slice(&self.entries[i..]);
-        merged.extend_from_slice(&other.entries[j..]);
-        self.entries = merged;
+        self.total_count += other.total_count;
     }
 
     fn result(&self) -> Option<i64> {
-        self.entries.first().map(|(_, val)| *val)
+        self.entries
+            .values()
+            .next()
+            .and_then(|vals| vals.first().copied())
     }
 
     fn is_empty(&self) -> bool {
-        self.entries.is_empty()
+        self.total_count == 0
     }
 
     fn supports_efficient_retraction(&self) -> bool {
@@ -1386,16 +1329,20 @@ impl RetractableAccumulator for RetractableFirstValueF64Accumulator {
 
     fn reset(&mut self) {
         self.entries.clear();
+        self.total_count = 0;
     }
 }
 
 /// Retractable `LAST_VALUE` accumulator for f64 values.
 ///
 /// Uses `f64::to_bits()` / `f64::from_bits()` for lossless i64 storage.
+/// Uses `BTreeMap<i64, Vec<i64>>` (timestamp to `value_bits`) for O(log n) ops.
 #[derive(Debug, Clone, Default)]
 pub struct RetractableLastValueF64Accumulator {
-    /// Sorted entries: `(timestamp, value_bits)`, ascending by timestamp
-    entries: Vec<(i64, i64)>,
+    /// Timestamp to `value_bits` at that timestamp
+    entries: std::collections::BTreeMap<i64, Vec<i64>>,
+    /// Total entry count across all timestamps
+    total_count: usize,
 }
 
 impl RetractableLastValueF64Accumulator {
@@ -1408,13 +1355,13 @@ impl RetractableLastValueF64Accumulator {
     /// Returns the number of stored entries.
     #[must_use]
     pub fn len(&self) -> usize {
-        self.entries.len()
+        self.total_count
     }
 
     /// Returns true if no entries are stored.
     #[must_use]
     pub fn is_empty(&self) -> bool {
-        self.entries.is_empty()
+        self.total_count == 0
     }
 
     /// Returns the result as f64.
@@ -1422,8 +1369,10 @@ impl RetractableLastValueF64Accumulator {
     #[allow(clippy::cast_sign_loss)]
     pub fn result_f64(&self) -> Option<f64> {
         self.entries
-            .last()
-            .map(|(_, bits)| f64::from_bits(*bits as u64))
+            .values()
+            .next_back()
+            .and_then(|vals| vals.last())
+            .map(|bits| f64::from_bits(*bits as u64))
     }
 }
 
@@ -1434,54 +1383,40 @@ impl RetractableAccumulator for RetractableLastValueF64Accumulator {
     #[allow(clippy::cast_possible_wrap)]
     fn add(&mut self, (timestamp, value): (i64, f64)) {
         let value_bits = value.to_bits() as i64;
-        let pos = match self.entries.binary_search_by_key(&timestamp, |(ts, _)| *ts) {
-            Ok(mut p) => {
-                while p < self.entries.len() && self.entries[p].0 == timestamp {
-                    p += 1;
-                }
-                p
-            }
-            Err(p) => p,
-        };
-        self.entries.insert(pos, (timestamp, value_bits));
+        self.entries.entry(timestamp).or_default().push(value_bits);
+        self.total_count += 1;
     }
 
     fn retract(&mut self, (timestamp, value): &(i64, f64)) {
         #[allow(clippy::cast_possible_wrap)]
         let value_bits = value.to_bits() as i64;
-        if let Some(pos) = self
-            .entries
-            .iter()
-            .position(|(ts, val)| *ts == *timestamp && *val == value_bits)
-        {
-            self.entries.remove(pos);
+        if let Some(values) = self.entries.get_mut(timestamp) {
+            if let Some(pos) = values.iter().position(|v| *v == value_bits) {
+                values.swap_remove(pos);
+                self.total_count -= 1;
+                if values.is_empty() {
+                    self.entries.remove(timestamp);
+                }
+            }
         }
     }
 
     fn merge(&mut self, other: &Self) {
-        let mut merged = Vec::with_capacity(self.entries.len() + other.entries.len());
-        let mut i = 0;
-        let mut j = 0;
-        while i < self.entries.len() && j < other.entries.len() {
-            if self.entries[i].0 <= other.entries[j].0 {
-                merged.push(self.entries[i]);
-                i += 1;
-            } else {
-                merged.push(other.entries[j]);
-                j += 1;
-            }
+        for (&ts, vals) in &other.entries {
+            self.entries.entry(ts).or_default().extend(vals);
         }
-        merged.extend_from_slice(&self.entries[i..]);
-        merged.extend_from_slice(&other.entries[j..]);
-        self.entries = merged;
+        self.total_count += other.total_count;
     }
 
     fn result(&self) -> Option<i64> {
-        self.entries.last().map(|(_, val)| *val)
+        self.entries
+            .values()
+            .next_back()
+            .and_then(|vals| vals.last().copied())
     }
 
     fn is_empty(&self) -> bool {
-        self.entries.is_empty()
+        self.total_count == 0
     }
 
     fn supports_efficient_retraction(&self) -> bool {
@@ -1490,6 +1425,7 @@ impl RetractableAccumulator for RetractableLastValueF64Accumulator {
 
     fn reset(&mut self) {
         self.entries.clear();
+        self.total_count = 0;
     }
 }
 
@@ -1757,9 +1693,9 @@ mod tests {
         assert!(sum.supports_efficient_retraction());
         assert!(avg.supports_efficient_retraction());
 
-        // Min/max may need recomputation
-        assert!(!min.supports_efficient_retraction());
-        assert!(!max.supports_efficient_retraction());
+        // Min/max use BTreeMap — O(log n) retraction, no recomputation
+        assert!(min.supports_efficient_retraction());
+        assert!(max.supports_efficient_retraction());
     }
 
     // LateDataRetractionGenerator Tests

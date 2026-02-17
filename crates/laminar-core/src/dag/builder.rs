@@ -4,7 +4,7 @@
 //! `FanOutBuilder` for creating fan-out branches from shared stages.
 
 use arrow_schema::SchemaRef;
-use fxhash::FxHashMap;
+use rustc_hash::FxHashMap;
 
 use super::error::DagError;
 use super::topology::{DagNodeType, StreamingDag};

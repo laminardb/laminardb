@@ -25,7 +25,7 @@ arrow-array = { workspace = true }
 arrow-schema = { workspace = true }
 
 # SQL parsing
-sqlparser = "0.60"
+sqlparser = { workspace = true }
 
 # Error handling
 thiserror = { workspace = true }

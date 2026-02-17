@@ -3,8 +3,10 @@
 //! `TableLruCache` provides O(1) slab-based LRU eviction for hot keys.
 //! `TableXorFilter` wraps `xorf::Xor8` for negative-lookup short-circuiting.
 
+use std::hash::{Hash, Hasher};
+
 use arrow::array::RecordBatch;
-use fxhash::FxHashMap;
+use rustc_hash::FxHashMap;
 
 // ── LRU Cache ───────────────────────────────────────────────────────────
 
@@ -326,9 +328,11 @@ impl Default for TableXorFilter {
     }
 }
 
-/// Hash a string key to u64 using fxhash.
+/// Hash a string key to u64 using `FxHasher`.
 fn hash_key(key: &str) -> u64 {
-    fxhash::hash64(key)
+    let mut hasher = rustc_hash::FxHasher::default();
+    key.hash(&mut hasher);
+    hasher.finish()
 }
 
 // ── Metrics ─────────────────────────────────────────────────────────────

@@ -61,7 +61,7 @@ async-trait = { workspace = true }
 parking_lot = { workspace = true }
 
 # Fast hash maps (for DAG operator state maps)
-fxhash = { workspace = true }
+rustc-hash = { workspace = true }
 
 # Observability
 tracing = { workspace = true }

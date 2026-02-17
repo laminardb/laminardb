@@ -21,7 +21,7 @@
 //! via modulo: `core_id = hash(key) % num_cores`.
 
 use arrow_array::{Array, RecordBatch};
-use fxhash::FxHasher;
+use rustc_hash::FxHasher;
 use std::hash::{Hash, Hasher};
 
 use crate::operator::Event;

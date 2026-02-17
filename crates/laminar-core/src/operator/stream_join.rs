@@ -83,7 +83,8 @@ use bytes::Bytes;
 use rkyv::{
     rancor::Error as RkyvError, Archive, Deserialize as RkyvDeserialize, Serialize as RkyvSerialize,
 };
-use std::collections::HashMap;
+use rustc_hash::FxHashMap;
+use std::hash::{Hash, Hasher};
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::Arc;
 use std::time::Duration;
@@ -1103,7 +1104,7 @@ pub struct StreamJoinOperator {
     /// Right-side statistics.
     right_stats: SideStats,
     /// Per-key metadata (`key_hash` -> metadata).
-    key_metadata: HashMap<u64, KeyMetadata>,
+    key_metadata: FxHashMap<u64, KeyMetadata>,
     /// Left-side watermark.
     left_watermark: i64,
     /// Right-side watermark.
@@ -1150,7 +1151,7 @@ impl StreamJoinOperator {
             build_side: None,
             left_stats: SideStats::new(),
             right_stats: SideStats::new(),
-            key_metadata: HashMap::new(),
+            key_metadata: FxHashMap::default(),
             left_watermark: i64::MIN,
             right_watermark: i64::MIN,
             prune_buffer: Vec::with_capacity(100),
@@ -1187,7 +1188,7 @@ impl StreamJoinOperator {
             build_side: None,
             left_stats: SideStats::new(),
             right_stats: SideStats::new(),
-            key_metadata: HashMap::new(),
+            key_metadata: FxHashMap::default(),
             left_watermark: i64::MIN,
             right_watermark: i64::MIN,
             prune_buffer: Vec::with_capacity(100),
@@ -1243,7 +1244,7 @@ impl StreamJoinOperator {
             build_side: config.build_side,
             left_stats: SideStats::new(),
             right_stats: SideStats::new(),
-            key_metadata: HashMap::new(),
+            key_metadata: FxHashMap::default(),
             left_watermark: i64::MIN,
             right_watermark: i64::MIN,
             prune_buffer: Vec::with_capacity(100),
@@ -1449,7 +1450,11 @@ impl StreamJoinOperator {
         };
 
         // F057: Compute key hash for per-key tracking
-        let key_hash = fxhash::hash64(&key_value);
+        let key_hash = {
+            let mut hasher = rustc_hash::FxHasher::default();
+            key_value.hash(&mut hasher);
+            hasher.finish()
+        };
 
         // F057: Track per-key metadata
         if self.per_key_tracking {
@@ -1705,7 +1710,11 @@ impl StreamJoinOperator {
         key.extend_from_slice(prefix);
 
         // Use FxHash for the key value
-        let key_hash = fxhash::hash64(key_value);
+        let key_hash = {
+            let mut hasher = rustc_hash::FxHasher::default();
+            key_value.hash(&mut hasher);
+            hasher.finish()
+        };
         key.extend_from_slice(&key_hash.to_be_bytes());
         key.extend_from_slice(&timestamp.to_be_bytes());
         key.extend_from_slice(&event_id.to_be_bytes());
@@ -1756,7 +1765,11 @@ impl StreamJoinOperator {
         };
 
         // Build prefix for scanning: prefix + key_hash
-        let key_hash = fxhash::hash64(key_value);
+        let key_hash = {
+            let mut hasher = rustc_hash::FxHasher::default();
+            key_value.hash(&mut hasher);
+            hasher.finish()
+        };
         let mut scan_prefix = Vec::with_capacity(12);
         scan_prefix.extend_from_slice(prefix);
         scan_prefix.extend_from_slice(&key_hash.to_be_bytes());

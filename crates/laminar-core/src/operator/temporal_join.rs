@@ -64,10 +64,10 @@ use super::{
 };
 use arrow_array::{Array, ArrayRef, Int64Array, RecordBatch, StringArray};
 use arrow_schema::{DataType, Field, Schema, SchemaRef};
-use fxhash::FxHashMap;
 use rkyv::{
     rancor::Error as RkyvError, Archive, Deserialize as RkyvDeserialize, Serialize as RkyvSerialize,
 };
+use rustc_hash::FxHashMap;
 use smallvec::SmallVec;
 use std::collections::BTreeMap;
 use std::sync::atomic::{AtomicU64, Ordering};

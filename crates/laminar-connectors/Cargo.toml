@@ -42,6 +42,7 @@ serde_json = { workspace = true }
 thiserror = { workspace = true }
 tracing = { workspace = true }
 parking_lot = { workspace = true }
+rustc-hash = { workspace = true }
 
 # Arrow for RecordBatch
 arrow-array = { workspace = true }

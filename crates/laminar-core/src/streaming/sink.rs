@@ -103,7 +103,7 @@ pub struct Sink<T: Record> {
     inner: Arc<SinkInner<T>>,
     /// Subscribers (only used in broadcast mode).
     /// Uses `RwLock` for fast read access on hot path.
-    subscribers: Arc<std::sync::RwLock<Vec<SubscriberInner<T>>>>,
+    subscribers: Arc<parking_lot::RwLock<Vec<SubscriberInner<T>>>>,
 }
 
 impl<T: Record> Sink<T> {
@@ -121,7 +121,7 @@ impl<T: Record> Sink<T> {
                 subscriber_count: AtomicUsize::new(0),
                 disconnected: std::sync::atomic::AtomicBool::new(false),
             }),
-            subscribers: Arc::new(std::sync::RwLock::new(Vec::new())),
+            subscribers: Arc::new(parking_lot::RwLock::new(Vec::new())),
         }
     }
 
@@ -156,7 +156,7 @@ impl<T: Record> Sink<T> {
 
             // Store producer for broadcasting (write lock, not hot path)
             {
-                let mut subs = self.subscribers.write().unwrap();
+                let mut subs = self.subscribers.write();
                 subs.push(SubscriberInner { producer });
             }
 
@@ -224,7 +224,7 @@ impl<T: Record> Sink<T> {
         }
 
         // Take read lock (fast, doesn't block other readers)
-        let subscribers = self.subscribers.read().unwrap();
+        let subscribers = self.subscribers.read();
         if subscribers.is_empty() {
             return 0;
         }

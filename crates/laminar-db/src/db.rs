@@ -674,7 +674,13 @@ impl LaminarDB {
         // Check column-level PRIMARY KEY
         for col in &create.columns {
             for opt in &col.options {
-                if matches!(opt.option, sqlparser::ast::ColumnOption::PrimaryKey(..)) {
+                if matches!(
+                    opt.option,
+                    sqlparser::ast::ColumnOption::Unique {
+                        is_primary: true,
+                        ..
+                    }
+                ) {
                     primary_key = Some(col.name.to_string());
                     break;
                 }
@@ -687,8 +693,8 @@ impl LaminarDB {
         // Check table-level PRIMARY KEY constraint
         if primary_key.is_none() {
             for constraint in &create.constraints {
-                if let sqlparser::ast::TableConstraint::PrimaryKey(pk) = constraint {
-                    if let Some(first) = pk.columns.first() {
+                if let sqlparser::ast::TableConstraint::PrimaryKey { columns, .. } = constraint {
+                    if let Some(first) = columns.first() {
                         primary_key = Some(first.column.to_string());
                     }
                 }

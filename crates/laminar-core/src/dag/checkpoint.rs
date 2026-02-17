@@ -16,7 +16,7 @@
 use std::collections::VecDeque;
 use std::time::Duration;
 
-use fxhash::FxHashMap;
+use rustc_hash::FxHashMap;
 
 use crate::operator::{Event, OperatorState};
 

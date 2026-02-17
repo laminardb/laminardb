@@ -8,7 +8,7 @@ use std::fmt;
 use std::sync::Arc;
 
 use arrow_schema::SchemaRef;
-use fxhash::{FxHashMap, FxHashSet};
+use rustc_hash::{FxHashMap, FxHashSet};
 use smallvec::SmallVec;
 
 use super::error::DagError;
