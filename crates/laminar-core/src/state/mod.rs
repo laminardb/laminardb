@@ -73,11 +73,41 @@ use std::collections::BTreeMap;
 use std::ops::Bound;
 use std::ops::Range;
 
+/// A single mutation entry within an incremental snapshot.
+///
+/// Captures the exact key/value bytes for each state change, enabling
+/// delta-based checkpointing to object stores without full state copies.
+///
+/// - `Put(key, value)` — a key was inserted or updated
+/// - `Delete(key)` — a key was removed
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum ChangeEntry {
+    /// A key was inserted or updated: `(key, value)`.
+    Put(Vec<u8>, Vec<u8>),
+    /// A key was deleted.
+    Delete(Vec<u8>),
+}
+
+/// An incremental snapshot capturing only mutations since the last checkpoint.
+///
+/// State stores that support incremental snapshots return this from
+/// [`StateStore::incremental_snapshot`]. The recovery system applies
+/// these deltas on top of a base snapshot to reconstruct full state.
+#[derive(Debug, Clone)]
+pub struct IncrementalSnapshot {
+    /// The ordered list of mutations since `base_epoch`.
+    pub changes: Vec<ChangeEntry>,
+    /// The epoch of the base (full) snapshot these changes apply to.
+    pub base_epoch: u64,
+    /// The epoch this incremental snapshot represents.
+    pub epoch: u64,
+}
+
 /// Compute the lexicographic successor of a byte prefix.
 ///
 /// Returns `None` if no successor exists (empty prefix or all bytes are 0xFF).
 /// Used by `BTreeMap::range()` to efficiently bound prefix scans.
-fn prefix_successor(prefix: &[u8]) -> Option<Vec<u8>> {
+pub(crate) fn prefix_successor(prefix: &[u8]) -> Option<Vec<u8>> {
     if prefix.is_empty() {
         return None;
     }
@@ -222,6 +252,31 @@ pub trait StateStore: Send {
     /// Returns `StateError` if the flush operation fails.
     fn flush(&mut self) -> Result<(), StateError> {
         Ok(()) // Default no-op for in-memory stores
+    }
+
+    /// Get a zero-copy reference to a value by key.
+    ///
+    /// Returns a direct `&[u8]` slice into the store's internal buffer,
+    /// avoiding the `Bytes` ref-count overhead. Only backends that own
+    /// their storage contiguously (e.g., `AHashMapStore`) can implement
+    /// this; others return `None` and callers fall back to [`get`](Self::get).
+    ///
+    /// # Lifetime
+    ///
+    /// The returned slice borrows `self`, so no mutations are allowed
+    /// while the reference is live.
+    fn get_ref(&self, _key: &[u8]) -> Option<&[u8]> {
+        None
+    }
+
+    /// Return an incremental snapshot of mutations since the last checkpoint.
+    ///
+    /// Backends that track per-mutation changelogs return
+    /// `Some(IncrementalSnapshot)` containing only the puts and deletes
+    /// since `base_epoch`. Backends without changelog support return `None`,
+    /// and the checkpointer falls back to a full [`snapshot`](Self::snapshot).
+    fn incremental_snapshot(&self) -> Option<IncrementalSnapshot> {
+        None
     }
 
     /// Get a value or insert a default.
@@ -629,11 +684,15 @@ pub enum StateError {
 
 mod mmap;
 
+/// AHashMap-backed state store with O(1) lookups and zero-copy reads (F-STATE-002).
+pub mod ahash_store;
+
 /// Changelog-aware state store wrapper (F-CKP-005).
 pub mod changelog_aware;
 
 // Re-export main types
 pub use self::StateError as Error;
+pub use ahash_store::AHashMapStore;
 pub use changelog_aware::{ChangelogAwareStore, ChangelogSink};
 pub use mmap::MmapStateStore;
 

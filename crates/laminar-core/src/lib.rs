@@ -35,10 +35,14 @@
 
 pub mod alloc;
 pub mod budget;
+/// Distributed checkpoint barrier protocol (F-DCKP-001).
+pub mod checkpoint;
 pub mod compiler;
 pub mod dag;
 pub mod detect;
 pub mod io_uring;
+/// Lookup table types and predicate pushdown (F-LOOKUP-003).
+pub mod lookup;
 pub mod mv;
 pub mod numa;
 pub mod operator;

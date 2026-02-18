@@ -47,7 +47,8 @@ crossbeam = "0.8"  # Lock-free data structures
 parking_lot = "0.12"  # Faster Mutex/RwLock
 memmap2 = "0.9"  # Memory-mapped files
 bumpalo = "3.19"  # Arena allocator
-uuid = { version = "1.19", features = ["v4"] }  # Unique IDs
+uuid = { version = "1.19", features = ["v4", "v7", "serde"] }  # Unique IDs
+ahash = "0.8"  # Fast hashing for state stores
 
 # DataFusion and Arrow - using latest versions
 arrow = { version = "57.2", default-features = true }

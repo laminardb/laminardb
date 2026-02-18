@@ -1,4 +1,10 @@
-//! Checkpoint management for state persistence and recovery
+//! Checkpoint management for state persistence and recovery.
+//!
+//! - [`CheckpointManager`]: Phase 1-3 file-system checkpoint manager
+//! - [`layout`]: Phase 6a object-store checkpoint layout (F-DCKP-003)
+
+/// Object-store checkpoint layout with UUID v7 identifiers (F-DCKP-003).
+pub mod layout;
 
 use std::collections::HashMap;
 use std::fs;

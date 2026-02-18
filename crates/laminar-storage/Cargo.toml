@@ -34,6 +34,9 @@ base64 = { workspace = true }
 # Fast hash for changelog entries
 rustc-hash = { workspace = true }
 
+# Identifiers
+uuid = { workspace = true }
+
 # Async
 tokio = { workspace = true }
 async-trait = { workspace = true }
