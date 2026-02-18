@@ -5,7 +5,7 @@
 //! Run with: cargo bench --bench state_bench
 
 use criterion::{criterion_group, criterion_main, BenchmarkId, Criterion, Throughput};
-use laminar_core::state::{InMemoryStore, MmapStateStore, StateStore, StateStoreExt};
+use laminar_core::state::{AHashMapStore, InMemoryStore, MmapStateStore, StateStore, StateStoreExt};
 use std::hint::black_box;
 
 /// Pre-populate a store with N entries
@@ -513,6 +513,133 @@ fn bench_store_comparison(c: &mut Criterion) {
     group.finish();
 }
 
+// ── AHashMapStore benchmarks (F-PERF-001) ──
+
+/// Pre-populate an AHashMapStore with N entries
+fn populate_ahash_store(n: usize) -> AHashMapStore {
+    let mut store = AHashMapStore::with_capacity(n);
+    for i in 0..n {
+        let key = format!("key:{i:08}");
+        let value = format!("value:{i:08}");
+        store.put(key.as_bytes(), value.as_bytes()).unwrap();
+    }
+    store
+}
+
+/// Benchmark AHashMapStore point lookups
+fn bench_ahash_lookup(c: &mut Criterion) {
+    let mut group = c.benchmark_group("ahash_lookup");
+
+    for size in [100, 1_000, 10_000, 100_000] {
+        let store = populate_ahash_store(size);
+        let key = format!("key:{:08}", size / 2);
+
+        group.throughput(Throughput::Elements(1));
+        group.bench_with_input(BenchmarkId::new("get_existing", size), &key, |b, key| {
+            b.iter(|| {
+                let result = store.get(black_box(key.as_bytes()));
+                black_box(result)
+            })
+        });
+
+        group.bench_with_input(BenchmarkId::new("get_missing", size), &(), |b, _| {
+            b.iter(|| {
+                let result = store.get(black_box(b"nonexistent:key"));
+                black_box(result)
+            })
+        });
+    }
+
+    group.finish();
+}
+
+/// Benchmark AHashMapStore zero-copy get_ref
+fn bench_ahash_get_ref(c: &mut Criterion) {
+    let mut group = c.benchmark_group("ahash_get_ref");
+
+    for size in [100, 1_000, 10_000, 100_000] {
+        let store = populate_ahash_store(size);
+        let key = format!("key:{:08}", size / 2);
+
+        group.throughput(Throughput::Elements(1));
+        group.bench_with_input(BenchmarkId::new("get_ref", size), &key, |b, key| {
+            b.iter(|| {
+                let result = store.get_ref(black_box(key.as_bytes()));
+                black_box(result)
+            })
+        });
+    }
+
+    group.finish();
+}
+
+/// Benchmark AHashMapStore put
+fn bench_ahash_put(c: &mut Criterion) {
+    let mut group = c.benchmark_group("ahash_put");
+
+    for size in [100, 1_000, 10_000] {
+        group.throughput(Throughput::Elements(1));
+
+        group.bench_with_input(BenchmarkId::new("insert", size), &size, |b, &size| {
+            let mut store = populate_ahash_store(size);
+            let mut counter = size;
+            b.iter(|| {
+                let key = format!("newkey:{counter:08}");
+                store
+                    .put(black_box(key.as_bytes()), black_box(b"newvalue"))
+                    .unwrap();
+                counter += 1;
+            })
+        });
+
+        group.bench_with_input(BenchmarkId::new("update", size), &size, |b, &size| {
+            let mut store = populate_ahash_store(size);
+            let key = format!("key:{:08}", size / 2);
+            let mut counter = 0u64;
+            b.iter(|| {
+                let value = counter.to_le_bytes();
+                store
+                    .put(black_box(key.as_bytes()), black_box(&value))
+                    .unwrap();
+                counter += 1;
+            })
+        });
+    }
+
+    group.finish();
+}
+
+/// Compare all three store backends
+fn bench_three_way_comparison(c: &mut Criterion) {
+    let mut group = c.benchmark_group("three_way_comparison");
+    let size = 10_000;
+
+    let inmem = populate_store(size);
+    let ahash = populate_ahash_store(size);
+    let mmap = populate_mmap_store(size);
+    let key = format!("key:{:08}", size / 2);
+
+    group.throughput(Throughput::Elements(1));
+
+    group.bench_function("inmemory_get", |b| {
+        b.iter(|| black_box(inmem.get(black_box(key.as_bytes()))))
+    });
+
+    group.bench_function("ahash_get", |b| {
+        b.iter(|| black_box(ahash.get(black_box(key.as_bytes()))))
+    });
+
+    group.bench_function("ahash_get_ref", |b| {
+        b.iter(|| black_box(ahash.get_ref(black_box(key.as_bytes()))))
+    });
+
+    group.bench_function("mmap_get", |b| {
+        b.iter(|| black_box(mmap.get(black_box(key.as_bytes()))))
+    });
+
+    group.finish();
+}
+
 criterion_group!(
     benches,
     bench_state_lookup,
@@ -529,5 +656,9 @@ criterion_group!(
     bench_mmap_snapshot,
     bench_mmap_compact,
     bench_store_comparison,
+    bench_ahash_lookup,
+    bench_ahash_get_ref,
+    bench_ahash_put,
+    bench_three_way_comparison,
 );
 criterion_main!(benches);

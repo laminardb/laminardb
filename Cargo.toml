@@ -49,6 +49,9 @@ memmap2 = "0.9"  # Memory-mapped files
 bumpalo = "3.19"  # Arena allocator
 uuid = { version = "1.19", features = ["v4", "v7", "serde"] }  # Unique IDs
 ahash = "0.8"  # Fast hashing for state stores
+papaya = "0.2"  # Lock-free concurrent HashMap
+sha2 = "0.10"  # SHA-256 for checkpoint integrity
+backoff = { version = "0.4", features = ["tokio"] }  # Exponential backoff retry
 
 # DataFusion and Arrow - using latest versions
 arrow = { version = "57.2", default-features = true }
@@ -67,6 +70,7 @@ sqlparser = "0.59"
 
 # Async
 tokio-stream = "0.1"
+futures = "0.3"
 
 # Collections
 smallvec = { version = "1.15", features = ["const_new", "union"] }

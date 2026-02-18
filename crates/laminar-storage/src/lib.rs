@@ -47,6 +47,9 @@ pub mod io_uring_wal;
 // Re-export key types
 pub use changelog_drainer::ChangelogDrainer;
 pub use checkpoint::{Checkpoint, CheckpointManager, CheckpointMetadata};
+pub use checkpoint::checkpointer::{
+    Checkpointer, CheckpointerError, ObjectStoreCheckpointer, verify_integrity,
+};
 pub use checkpoint::layout::{
     CheckpointId, CheckpointManifestV2, CheckpointPaths, OperatorSnapshotEntry,
     PartitionSnapshotEntry, SourceOffsetEntry,

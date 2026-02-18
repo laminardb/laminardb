@@ -33,6 +33,8 @@
 // Allow unsafe in alloc module for zero-copy optimizations
 #![allow(unsafe_code)]
 
+/// Cross-partition aggregation (F-XAGG-001).
+pub mod aggregation;
 pub mod alloc;
 pub mod budget;
 /// Distributed checkpoint barrier protocol (F-DCKP-001).

@@ -37,9 +37,14 @@ rustc-hash = { workspace = true }
 # Identifiers
 uuid = { workspace = true }
 
+# Checkpoint integrity
+sha2 = { workspace = true }
+backoff = { workspace = true }
+
 # Async
 tokio = { workspace = true }
 async-trait = { workspace = true }
+futures = { workspace = true }
 
 # Error handling
 thiserror = { workspace = true }

@@ -32,6 +32,7 @@ jit = [
 # Performance critical - no allocations on hot path
 rustc-hash = { workspace = true }
 ahash = { workspace = true }
+papaya = { workspace = true }
 xorf = { workspace = true }
 crossbeam = { workspace = true }
 parking_lot = { workspace = true }
