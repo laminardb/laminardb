@@ -11,10 +11,10 @@
 | Phase 3 | 77 | 9 | 0 | 0 | 68 | 0 |
 | Phase 4 | 11 | 11 | 0 | 0 | 0 | 0 |
 | Phase 5 | 10 | 10 | 0 | 0 | 0 | 0 |
-| Phase 6a | 27 | 10 | 0 | 0 | 15 | 2 |
+| Phase 6a | 29 | 4 | 0 | 0 | 23 | 2 |
 | Phase 6b | 14 | 14 | 0 | 0 | 0 | 0 |
 | Phase 6c | 10 | 9 | 0 | 0 | 0 | 1 |
-| **Total** | **212** | **63** | **0** | **0** | **146** | **3** |
+| **Total** | **214** | **57** | **0** | **0** | **154** | **3** |
 
 ## Status Legend
 
@@ -349,33 +349,33 @@ See [Constellation Index](constellation/INDEX.md) for full details, dependency g
 | F-DCKP-002 | Barrier Alignment | ✅ | [Link](constellation/checkpoint/F-DCKP-002-barrier-alignment.md) |
 | F-DCKP-003 | Object Store Checkpoint Layout | ✅ | [Link](constellation/checkpoint/F-DCKP-003-object-store-layout.md) |
 | F-DCKP-004 | ObjectStoreCheckpointer | ✅ | [Link](constellation/checkpoint/F-DCKP-004-object-store-checkpointer.md) |
-| F-DCKP-005 | Recovery Manager | 📝 | [Link](constellation/checkpoint/F-DCKP-005-recovery-manager.md) |
+| F-DCKP-005 | Recovery Manager | ✅ | [Link](constellation/checkpoint/F-DCKP-005-recovery-manager.md) |
 
 #### Lookup Tables
 
 | ID | Feature | Status | Spec |
 |----|---------|--------|------|
 | F-LOOKUP-001 | LookupTable Trait & Strategy | ✅ | [Link](constellation/lookup/F-LOOKUP-001-lookup-table-trait.md) |
-| F-LOOKUP-002 | LookupSource Trait | 📝 | [Link](constellation/lookup/F-LOOKUP-002-lookup-source-trait.md) |
+| F-LOOKUP-002 | LookupSource Trait | ✅ | [Link](constellation/lookup/F-LOOKUP-002-lookup-source-trait.md) |
 | F-LOOKUP-003 | Predicate Types | ✅ | [Link](constellation/lookup/F-LOOKUP-003-predicate-types.md) |
-| F-LOOKUP-004 | foyer In-Memory Cache (Ring 0) | 📝 | [Link](constellation/lookup/F-LOOKUP-004-foyer-memory-cache.md) |
+| F-LOOKUP-004 | foyer In-Memory Cache (Ring 0) | ✅ | [Link](constellation/lookup/F-LOOKUP-004-foyer-memory-cache.md) |
 | F-LOOKUP-005 | foyer Hybrid Cache (Ring 1) | ✅ | [Link](constellation/lookup/F-LOOKUP-005-foyer-hybrid-cache.md) |
-| F-LOOKUP-006 | CDC-to-Cache Adapter | 📝 | [Link](constellation/lookup/F-LOOKUP-006-cdc-cache-adapter.md) |
+| F-LOOKUP-006 | CDC-to-Cache Adapter | ✅ | [Link](constellation/lookup/F-LOOKUP-006-cdc-cache-adapter.md) |
 | F-LOOKUP-007 | PostgresLookupSource | ✅ | [Link](constellation/lookup/F-LOOKUP-007-postgres-lookup-source.md) |
 | F-LOOKUP-008 | ParquetLookupSource | 📝 | [Link](constellation/lookup/F-LOOKUP-008-parquet-lookup-source.md) |
-| F-LOOKUP-010 | Remove RocksDB Dependency | 📝 | [Link](constellation/lookup/F-LOOKUP-010-rocksdb-removal.md) |
+| F-LOOKUP-010 | Remove RocksDB Dependency | ✅ | [Link](constellation/lookup/F-LOOKUP-010-rocksdb-removal.md) |
 
 #### Secondary Indexes
 
 | ID | Feature | Status | Spec |
 |----|---------|--------|------|
-| F-IDX-001 | redb Secondary Indexes | 📝 | [Link](constellation/indexes/F-IDX-001-redb-secondary-indexes.md) |
+| F-IDX-001 | redb Secondary Indexes | ✅ | [Link](constellation/indexes/F-IDX-001-redb-secondary-indexes.md) |
 
 #### Deployment Profiles
 
 | ID | Feature | Status | Spec |
 |----|---------|--------|------|
-| F-PROFILE-001 | Deployment Profiles | 📝 | [Link](constellation/profiles/F-PROFILE-001-deployment-profiles.md) |
+| F-PROFILE-001 | Deployment Profiles | ✅ | [Link](constellation/profiles/F-PROFILE-001-deployment-profiles.md) |
 
 #### Cross-Partition Aggregation
 
@@ -387,7 +387,7 @@ See [Constellation Index](constellation/INDEX.md) for full details, dependency g
 
 | ID | Feature | Status | Spec |
 |----|---------|--------|------|
-| F-E2E-001 | Source Offset Checkpoint | 📝 | [Link](constellation/exactly-once/F-E2E-001-source-offset-checkpoint.md) |
+| F-E2E-001 | Source Offset Checkpoint | ✅ | [Link](constellation/exactly-once/F-E2E-001-source-offset-checkpoint.md) |
 
 #### SQL Integration
 

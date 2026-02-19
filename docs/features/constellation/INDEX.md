@@ -30,10 +30,10 @@ The Constellation Architecture extends LaminarDB from an embedded single-process
 
 | Phase | Total | Draft | Superseded | In Progress | Done |
 |-------|-------|-------|------------|-------------|------|
-| Phase 6a — Partition-Parallel Embedded | 27 | 3 | 2 | 0 | 20 |
+| Phase 6a — Partition-Parallel Embedded | 29 | 4 | 2 | 0 | 23 |
 | Phase 6b — Constellation Foundation | 14 | 14 | 0 | 0 | 0 |
 | Phase 6c — Production Hardening | 10 | 9 | 1 | 0 | 0 |
-| **Total** | **51** | **26** | **3** | **0** | **20** |
+| **Total** | **53** | **25** | **3** | **0** | **23** |
 
 ## Key Dependencies
 
@@ -85,13 +85,13 @@ See [DEPENDENCIES.md](DEPENDENCIES.md) for the full project dependency graph.
 | F-LOOKUP-006 | CDC-to-Cache Adapter | ✅ | P0 | S | [Link](lookup/F-LOOKUP-006-cdc-cache-adapter.md) |
 | F-LOOKUP-007 | PostgresLookupSource | ✅ | P1 | M | [Link](lookup/F-LOOKUP-007-postgres-lookup-source.md) |
 | F-LOOKUP-008 | ParquetLookupSource | 📝 | P2 | M | [Link](lookup/F-LOOKUP-008-parquet-lookup-source.md) |
-| F-LOOKUP-010 | Remove RocksDB Dependency | 📝 | P0 | S | [Link](lookup/F-LOOKUP-010-rocksdb-removal.md) |
+| F-LOOKUP-010 | Remove RocksDB Dependency | ✅ | P0 | S | [Link](lookup/F-LOOKUP-010-rocksdb-removal.md) |
 
 ### Secondary Indexes
 
 | ID | Feature | Status | Priority | Effort | Spec |
 |----|---------|--------|----------|--------|------|
-| F-IDX-001 | redb Secondary Indexes | 📝 | P1 | M | [Link](indexes/F-IDX-001-redb-secondary-indexes.md) |
+| F-IDX-001 | redb Secondary Indexes | ✅ | P1 | M | [Link](indexes/F-IDX-001-redb-secondary-indexes.md) |
 
 ### Deployment Profiles
 
@@ -109,7 +109,7 @@ See [DEPENDENCIES.md](DEPENDENCIES.md) for the full project dependency graph.
 
 | ID | Feature | Status | Priority | Effort | Spec |
 |----|---------|--------|----------|--------|------|
-| F-E2E-001 | Source Offset Checkpoint | 📝 | P0 | M | [Link](exactly-once/F-E2E-001-source-offset-checkpoint.md) |
+| F-E2E-001 | Source Offset Checkpoint | ✅ | P0 | M | [Link](exactly-once/F-E2E-001-source-offset-checkpoint.md) |
 
 ### SQL Integration
 
