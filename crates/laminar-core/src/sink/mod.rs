@@ -83,8 +83,8 @@ mod tests {
         }
 
         impl Sink for MockSink {
-            fn write(&mut self, outputs: Vec<Output>) -> Result<(), crate::reactor::SinkError> {
-                self.writes.extend(outputs);
+            fn write(&mut self, outputs: &mut Vec<Output>) -> Result<(), crate::reactor::SinkError> {
+                self.writes.append(outputs);
                 Ok(())
             }
             fn flush(&mut self) -> Result<(), crate::reactor::SinkError> {
@@ -98,8 +98,8 @@ mod tests {
 
         // First write should succeed
         let event1 = make_test_event(1000, 42);
-        let outputs1 = vec![Output::Event(event1.clone())];
-        Sink::write(&mut sink, outputs1).unwrap();
+        let mut outputs1 = vec![Output::Event(event1.clone())];
+        Sink::write(&mut sink, &mut outputs1).unwrap();
 
         // Write count depends on implementation
         // The important thing is deduplication works
@@ -244,7 +244,7 @@ mod tests {
 
         // Write event and checkpoint
         let event = make_test_event(1000, 42);
-        Sink::write(&mut sink, vec![Output::Event(event.clone())]).unwrap();
+        Sink::write(&mut sink, &mut vec![Output::Event(event.clone())]).unwrap();
         let checkpoint = ExactlyOnceSink::checkpoint(&sink);
 
         // Simulate crash: create new sink and restore
@@ -254,7 +254,7 @@ mod tests {
         restored.restore(&checkpoint).unwrap();
 
         // Replay the same event — should be deduplicated
-        Sink::write(&mut restored, vec![Output::Event(event)]).unwrap();
+        Sink::write(&mut restored, &mut vec![Output::Event(event)]).unwrap();
         assert_eq!(restored.stats().total_deduplicated, 1);
     }
 
@@ -267,7 +267,7 @@ mod tests {
 
         // Epoch 1: write and checkpoint
         let event1 = make_test_event(1000, 1);
-        Sink::write(&mut adapter, vec![Output::Event(event1)]).unwrap();
+        Sink::write(&mut adapter, &mut vec![Output::Event(event1)]).unwrap();
         let checkpoint = adapter.notify_checkpoint(1).unwrap();
 
         assert_eq!(adapter.epoch(), 1);
@@ -275,7 +275,7 @@ mod tests {
 
         // Epoch 2: write but crash before checkpoint
         let event2 = make_test_event(2000, 2);
-        Sink::write(&mut adapter, vec![Output::Event(event2)]).unwrap();
+        Sink::write(&mut adapter, &mut vec![Output::Event(event2)]).unwrap();
         assert!(adapter.has_active_transaction());
 
         // Recover from epoch 1 checkpoint
@@ -288,7 +288,7 @@ mod tests {
 
         // Can continue writing after recovery
         let event3 = make_test_event(3000, 3);
-        Sink::write(&mut adapter, vec![Output::Event(event3)]).unwrap();
+        Sink::write(&mut adapter, &mut vec![Output::Event(event3)]).unwrap();
         let _cp2 = adapter.notify_checkpoint(2).unwrap();
         assert_eq!(adapter.stats().committed_epochs, 2);
     }
@@ -300,7 +300,7 @@ mod tests {
         let inner1 = BufferingSink::new();
         let mut tx_sink = TransactionalSink::new(inner1, "tx-type");
         assert!(tx_sink.capabilities().supports_transactions());
-        Sink::write(&mut tx_sink, vec![Output::Event(make_test_event(1000, 1))]).unwrap();
+        Sink::write(&mut tx_sink, &mut vec![Output::Event(make_test_event(1000, 1))]).unwrap();
         Sink::flush(&mut tx_sink).unwrap();
         assert_eq!(tx_sink.stats().committed, 1);
 
@@ -311,7 +311,7 @@ mod tests {
         assert!(idem_sink.capabilities().supports_idempotent_writes());
         Sink::write(
             &mut idem_sink,
-            vec![Output::Event(make_test_event(1000, 1))],
+            &mut vec![Output::Event(make_test_event(1000, 1))],
         )
         .unwrap();
         Sink::flush(&mut idem_sink).unwrap();
@@ -334,8 +334,8 @@ mod tests {
         let mut adapter2 = ExactlyOnceSinkAdapter::new(tx_sink2);
 
         // Write to both and checkpoint
-        Sink::write(&mut adapter1, vec![Output::Event(make_test_event(1000, 1))]).unwrap();
-        Sink::write(&mut adapter2, vec![Output::Event(make_test_event(2000, 2))]).unwrap();
+        Sink::write(&mut adapter1, &mut vec![Output::Event(make_test_event(1000, 1))]).unwrap();
+        Sink::write(&mut adapter2, &mut vec![Output::Event(make_test_event(2000, 2))]).unwrap();
 
         let cp1 = adapter1.notify_checkpoint(1).unwrap();
         let cp2 = adapter2.notify_checkpoint(1).unwrap();

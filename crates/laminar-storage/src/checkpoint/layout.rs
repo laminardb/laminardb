@@ -79,7 +79,7 @@ impl fmt::Display for CheckpointId {
 #[derive(Debug, Clone)]
 pub struct CheckpointPaths {
     /// Base prefix in the object store (e.g., `"checkpoints/"`)
-    base_prefix: String,
+    pub(crate) base_prefix: String,
 }
 
 impl CheckpointPaths {

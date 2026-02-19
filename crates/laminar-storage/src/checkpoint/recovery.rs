@@ -334,8 +334,10 @@ impl RecoveryManager {
             Ok(mut ids) => {
                 ids.sort();
                 ids.reverse(); // Newest first
+                let mut seen: std::collections::HashSet<CheckpointId> =
+                    candidates.iter().copied().collect();
                 for id in ids {
-                    if !candidates.contains(&id) {
+                    if seen.insert(id) {
                         candidates.push(id);
                     }
                 }
@@ -386,7 +388,11 @@ impl RecoveryManager {
         for restorable in restorables.iter_mut() {
             let op_id = restorable.operator_id().to_string();
             if let Some(op_entry) = manifest.operators.get(&op_id) {
-                for partition in &op_entry.partitions {
+                // Sort: full snapshots first, then deltas, to prevent applying
+                // deltas to empty state when partition order is non-deterministic.
+                let mut partitions = op_entry.partitions.clone();
+                partitions.sort_by_key(|p| p.is_delta);
+                for partition in &partitions {
                     // Load artifact
                     let data = self
                         .checkpointer
@@ -479,7 +485,10 @@ impl RecoveryManager {
         for restorable in restorables.iter_mut() {
             let op_id = restorable.operator_id().to_string();
             if let Some(op_entry) = manifest.operators.get(&op_id) {
-                for partition in &op_entry.partitions {
+                // Sort: full snapshots first, then deltas.
+                let mut partitions = op_entry.partitions.clone();
+                partitions.sort_by_key(|p| p.is_delta);
+                for partition in &partitions {
                     let data = self
                         .checkpointer
                         .load_artifact(&partition.path)
@@ -532,10 +541,21 @@ impl RecoveryManager {
                     })?;
                     sources_seeked += 1;
                 } else {
+                    // Fall back to raw string-based seek via Seekable if
+                    // typed parsing fails. If that's not available either,
+                    // fail recovery to prevent exactly-once violations.
                     warn!(
                         source_id = %src_id,
-                        "could not parse typed position, skipping seek"
+                        source_type = %offset_entry.source_type,
+                        "could not parse typed position from offset entry"
                     );
+                    return Err(RecoveryError::SeekFailed {
+                        source_id: src_id,
+                        reason: format!(
+                            "could not parse typed position for source_type '{}'",
+                            offset_entry.source_type
+                        ),
+                    });
                 }
             }
         }

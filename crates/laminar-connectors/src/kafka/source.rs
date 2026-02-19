@@ -62,6 +62,13 @@ pub struct KafkaSource {
     schema: SchemaRef,
     /// Backpressure controller.
     backpressure: BackpressureController,
+    /// Shared backpressure channel fill counter.
+    ///
+    /// Clone this Arc and update it from the downstream consumer to wire
+    /// backpressure. Increment when batches are buffered, decrement when
+    /// consumed. Without wiring, the counter stays at 0 and backpressure
+    /// is effectively disabled (correct for sequential polling pipelines).
+    channel_len: Arc<AtomicUsize>,
     /// Consumer group rebalance tracking.
     rebalance_state: RebalanceState,
     /// Optional Schema Registry client (shared with Avro deserializer).
@@ -85,7 +92,7 @@ impl KafkaSource {
             config.backpressure_high_watermark,
             config.backpressure_low_watermark,
             config.max_poll_records * 10, // rough channel capacity estimate
-            channel_len,
+            Arc::clone(&channel_len),
         );
 
         Self {
@@ -97,6 +104,7 @@ impl KafkaSource {
             metrics: KafkaSourceMetrics::new(),
             schema,
             backpressure,
+            channel_len,
             rebalance_state: RebalanceState::new(),
             schema_registry: None,
             last_commit_time: Instant::now(),
@@ -128,7 +136,7 @@ impl KafkaSource {
             config.backpressure_high_watermark,
             config.backpressure_low_watermark,
             config.max_poll_records * 10,
-            channel_len,
+            Arc::clone(&channel_len),
         );
 
         Self {
@@ -140,6 +148,7 @@ impl KafkaSource {
             metrics: KafkaSourceMetrics::new(),
             schema,
             backpressure,
+            channel_len,
             rebalance_state: RebalanceState::new(),
             schema_registry: Some(sr),
             last_commit_time: Instant::now(),
@@ -156,6 +165,22 @@ impl KafkaSource {
     #[must_use]
     pub fn offsets(&self) -> &OffsetTracker {
         &self.offsets
+    }
+
+    /// Returns the shared backpressure channel fill counter.
+    ///
+    /// The downstream consumer should clone this `Arc` and update the
+    /// counter as batches are buffered and consumed:
+    /// - Increment (`fetch_add`) when a batch is placed into a buffer
+    /// - Decrement (`fetch_sub`) when a batch is processed
+    ///
+    /// The [`BackpressureController`] reads this counter to decide when
+    /// to pause/resume the Kafka consumer. Without wiring, the counter
+    /// stays at 0 and backpressure is disabled (correct for sequential
+    /// polling pipelines that inherently throttle by processing rate).
+    #[must_use]
+    pub fn channel_len(&self) -> Arc<AtomicUsize> {
+        Arc::clone(&self.channel_len)
     }
 
     /// Returns a reference to the rebalance state.

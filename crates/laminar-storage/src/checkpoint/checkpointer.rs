@@ -333,9 +333,13 @@ impl Checkpointer for ObjectStoreCheckpointer {
     }
 
     async fn list_checkpoints(&self) -> Result<Vec<CheckpointId>, CheckpointerError> {
-        // List objects at the base prefix — each checkpoint is a directory
-        // We look for manifest.json files to identify checkpoints
+        // List objects at the base prefix — each checkpoint is a directory.
+        // We look for manifest.json files to identify checkpoints.
+        //
+        // Manifest path format: {base_prefix}{UUID}manifest.json
+        // (no slash between UUID and "manifest.json", see layout.rs:114)
         let prefix = Path::from(self.paths.latest_pointer().trim_end_matches("_latest"));
+        let base_prefix = &self.paths.base_prefix;
         let mut ids = Vec::new();
 
         let mut stream = self.store.list(Some(&prefix));
@@ -343,14 +347,19 @@ impl Checkpointer for ObjectStoreCheckpointer {
             let meta = meta?;
             let path_str = meta.location.to_string();
             if path_str.ends_with("manifest.json") {
-                // Extract checkpoint ID from path: {prefix}{UUID}manifest.json
-                if let Some(id_str) = path_str
-                    .strip_suffix("manifest.json")
-                    .and_then(|s: &str| s.rsplit('/').next())
-                    .filter(|s| !s.is_empty())
-                {
-                    if let Ok(uuid) = uuid::Uuid::parse_str(id_str) {
-                        ids.push(CheckpointId::from_uuid(uuid));
+                // Extract checkpoint ID: strip suffix then strip base prefix.
+                // Path is "{base_prefix}{UUID}manifest.json".
+                // After stripping suffix: "{base_prefix}{UUID}".
+                // After stripping prefix: "{UUID}".
+                if let Some(remainder) = path_str.strip_suffix("manifest.json") {
+                    let id_str = remainder
+                        .strip_prefix(base_prefix.as_str())
+                        .unwrap_or(remainder);
+                    let id_str = id_str.trim_end_matches('/');
+                    if !id_str.is_empty() {
+                        if let Ok(uuid) = uuid::Uuid::parse_str(id_str) {
+                            ids.push(CheckpointId::from_uuid(uuid));
+                        }
                     }
                 }
             }

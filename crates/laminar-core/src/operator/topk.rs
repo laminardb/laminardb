@@ -108,6 +108,8 @@ pub struct StreamingTopKOperator {
     sequence_counter: u64,
     /// Current watermark value.
     current_watermark: i64,
+    /// Cached column indices for sort columns — resolved on first event.
+    cached_sort_indices: Vec<Option<usize>>,
 }
 
 impl StreamingTopKOperator {
@@ -119,6 +121,7 @@ impl StreamingTopKOperator {
         sort_columns: Vec<TopKSortColumn>,
         emit_strategy: TopKEmitStrategy,
     ) -> Self {
+        let num_sort_cols = sort_columns.len();
         Self {
             operator_id,
             k,
@@ -128,6 +131,7 @@ impl StreamingTopKOperator {
             pending_changes: Vec::new(),
             sequence_counter: 0,
             current_watermark: i64::MIN,
+            cached_sort_indices: vec![None; num_sort_cols],
         }
     }
 
@@ -162,16 +166,22 @@ impl StreamingTopKOperator {
     }
 
     /// Extracts a memcomparable sort key from an event.
-    fn extract_sort_key(&self, event: &Event) -> Vec<u8> {
+    ///
+    /// Caches column indices on first call to avoid per-event schema lookups.
+    fn extract_sort_key(&mut self, event: &Event) -> Vec<u8> {
         let batch = &event.data;
-        let schema = batch.schema();
         let mut key = Vec::new();
 
-        for col_spec in &self.sort_columns {
-            let Ok(col_idx) = schema.index_of(&col_spec.column_name) else {
-                // Column not found — encode as null
-                encode_null(col_spec.nulls_first, col_spec.descending, &mut key);
-                continue;
+        for (i, col_spec) in self.sort_columns.iter().enumerate() {
+            let col_idx = if let Some(idx) = self.cached_sort_indices[i] {
+                idx
+            } else {
+                let Ok(idx) = batch.schema().index_of(&col_spec.column_name) else {
+                    encode_null(col_spec.nulls_first, col_spec.descending, &mut key);
+                    continue;
+                };
+                self.cached_sort_indices[i] = Some(idx);
+                idx
             };
 
             let array = batch.column(col_idx);
@@ -589,7 +599,7 @@ mod tests {
 
     #[test]
     fn test_topk_sort_key_extraction_int64() {
-        let op = create_topk(
+        let mut op = create_topk(
             3,
             vec![TopKSortColumn::ascending("value")],
             TopKEmitStrategy::OnUpdate,
@@ -609,7 +619,7 @@ mod tests {
 
     #[test]
     fn test_topk_sort_key_extraction_float64() {
-        let op = create_topk(
+        let mut op = create_topk(
             3,
             vec![TopKSortColumn::descending("price")],
             TopKEmitStrategy::OnUpdate,
@@ -629,7 +639,7 @@ mod tests {
 
     #[test]
     fn test_topk_sort_key_extraction_utf8() {
-        let op = create_topk(
+        let mut op = create_topk(
             3,
             vec![TopKSortColumn::ascending("name")],
             TopKEmitStrategy::OnUpdate,
@@ -663,7 +673,7 @@ mod tests {
         .unwrap();
         let event = Event::new(1, batch);
 
-        let op = create_topk(
+        let mut op = create_topk(
             3,
             vec![TopKSortColumn::ascending("ts")],
             TopKEmitStrategy::OnUpdate,

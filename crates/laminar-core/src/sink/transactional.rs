@@ -152,13 +152,13 @@ impl<S: Sink> TransactionalSink<S> {
 
     /// Flush the buffer to the inner sink
     fn flush_buffer(&mut self) -> Result<(), SinkError> {
-        let outputs = self.buffer.take();
+        let mut outputs = self.buffer.take();
         if outputs.is_empty() {
             return Ok(());
         }
         let count = outputs.len() as u64;
         self.inner
-            .write(outputs)
+            .write(&mut outputs)
             .map_err(|e| SinkError::WriteFailed(e.to_string()))?;
         self.inner
             .flush()
@@ -291,7 +291,7 @@ impl<S: Sink> ExactlyOnceSink for TransactionalSink<S> {
 ///
 /// Auto-begins a transaction on the first write. Flush commits the active transaction.
 impl<S: Sink> Sink for TransactionalSink<S> {
-    fn write(&mut self, outputs: Vec<Output>) -> Result<(), crate::reactor::SinkError> {
+    fn write(&mut self, outputs: &mut Vec<Output>) -> Result<(), crate::reactor::SinkError> {
         // Auto-begin transaction if idle
         if self.tx_state.is_idle() {
             self.begin_transaction()
@@ -306,7 +306,8 @@ impl<S: Sink> Sink for TransactionalSink<S> {
                 crate::reactor::SinkError::WriteFailed("No active transaction".to_string())
             })?;
 
-        ExactlyOnceSink::write(self, &tx_id, outputs).map_err(crate::reactor::SinkError::from)
+        let owned = std::mem::take(outputs);
+        ExactlyOnceSink::write(self, &tx_id, owned).map_err(crate::reactor::SinkError::from)
     }
 
     fn flush(&mut self) -> Result<(), crate::reactor::SinkError> {
@@ -472,7 +473,7 @@ mod tests {
 
         // Using reactor::Sink interface auto-begins a transaction
         let event = make_event(1000, 42);
-        ReactorSink::write(&mut sink, vec![Output::Event(event)]).unwrap();
+        ReactorSink::write(&mut sink, &mut vec![Output::Event(event)]).unwrap();
 
         assert_eq!(sink.state(), SinkState::InTransaction);
         assert_eq!(sink.buffer.len(), 1);

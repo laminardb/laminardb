@@ -392,6 +392,8 @@ pub struct LookupJoinOperator {
     /// In-memory cache of deserialized batches to avoid repeated Arrow IPC deserialization.
     /// Maps cache key bytes to the deserialized `RecordBatch` wrapped in `Arc` for cheap cloning.
     batch_cache: FxHashMap<Vec<u8>, Option<Arc<RecordBatch>>>,
+    /// Cached column index for the join key — resolved on first event.
+    key_column_index: Option<usize>,
 }
 
 impl LookupJoinOperator {
@@ -417,6 +419,7 @@ impl LookupJoinOperator {
             pending_keys: Vec::new(),
             pending_events: Vec::new(),
             batch_cache: FxHashMap::default(),
+            key_column_index: None,
         }
     }
 
@@ -553,7 +556,9 @@ impl LookupJoinOperator {
         }
 
         // Extract join key
-        let Some(key) = Self::extract_key(&event.data, &self.config.stream_key_column) else {
+        let Some(key) =
+            Self::extract_key(&event.data, &self.config.stream_key_column, &mut self.key_column_index)
+        else {
             return OutputVec::new();
         };
 
@@ -668,8 +673,21 @@ impl LookupJoinOperator {
     }
 
     /// Extracts the join key value from a record batch.
-    fn extract_key(batch: &RecordBatch, column_name: &str) -> Option<Vec<u8>> {
-        let column_index = batch.schema().index_of(column_name).ok()?;
+    ///
+    /// Resolves the column index on the first call and caches it in
+    /// `cached_index` to avoid per-event schema lookups.
+    fn extract_key(
+        batch: &RecordBatch,
+        column_name: &str,
+        cached_index: &mut Option<usize>,
+    ) -> Option<Vec<u8>> {
+        let column_index = if let Some(idx) = *cached_index {
+            idx
+        } else {
+            let idx = batch.schema().index_of(column_name).ok()?;
+            *cached_index = Some(idx);
+            idx
+        };
         let column = batch.column(column_index);
 
         // Handle different column types
@@ -810,7 +828,9 @@ impl Operator for LookupJoinOperator {
         }
 
         // Extract join key
-        let Some(key) = Self::extract_key(&event.data, &self.config.stream_key_column) else {
+        let Some(key) =
+            Self::extract_key(&event.data, &self.config.stream_key_column, &mut self.key_column_index)
+        else {
             return OutputVec::new();
         };
 

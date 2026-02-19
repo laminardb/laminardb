@@ -412,10 +412,12 @@ impl CheckpointCoordinator {
             }
         }
 
-        // ── Step 3: Source snapshot ──
+        // ── Step 3: Source snapshot (parallel) ──
         self.phase = CheckpointPhase::Snapshotting;
-        let source_offsets = self.snapshot_sources(&self.sources).await?;
-        let table_offsets = self.snapshot_sources(&self.table_sources).await?;
+        let (source_offsets, table_offsets) = tokio::try_join!(
+            self.snapshot_sources(&self.sources),
+            self.snapshot_sources(&self.table_sources),
+        )?;
 
         // ── Step 4: Sink pre-commit ──
         self.phase = CheckpointPhase::PreCommitting;
@@ -536,21 +538,30 @@ impl CheckpointCoordinator {
         })
     }
 
-    /// Snapshots all registered source connectors.
+    /// Snapshots all registered source connectors concurrently.
+    ///
+    /// Uses `join_all` to lock and checkpoint each source in parallel rather
+    /// than sequentially, reducing snapshot latency proportional to source count.
     async fn snapshot_sources(
         &self,
         sources: &[RegisteredSource],
     ) -> Result<HashMap<String, ConnectorCheckpoint>, DbError> {
-        let mut offsets = HashMap::new();
+        use futures::future::join_all;
 
-        for source in sources {
-            let connector = source.connector.lock().await;
-            let cp = connector.checkpoint();
-            offsets.insert(source.name.clone(), source_to_connector_checkpoint(&cp));
-            debug!(source = %source.name, epoch = cp.epoch(), "source snapshotted");
-        }
+        let futs = sources.iter().map(|source| {
+            let connector = Arc::clone(&source.connector);
+            let name = source.name.clone();
+            async move {
+                let guard = connector.lock().await;
+                let cp = guard.checkpoint();
+                let result = source_to_connector_checkpoint(&cp);
+                debug!(source = %name, epoch = cp.epoch(), "source snapshotted");
+                (name, result)
+            }
+        });
 
-        Ok(offsets)
+        let results = join_all(futs).await;
+        Ok(results.into_iter().collect())
     }
 
     /// Pre-commits all exactly-once sinks (phase 1) with a timeout.
@@ -752,10 +763,12 @@ impl CheckpointCoordinator {
             }
         }
 
-        // ── Step 3: Source snapshot ──
+        // ── Step 3: Source snapshot (parallel) ──
         self.phase = CheckpointPhase::Snapshotting;
-        let source_offsets = self.snapshot_sources(&self.sources).await?;
-        let mut table_offsets = self.snapshot_sources(&self.table_sources).await?;
+        let (source_offsets, mut table_offsets) = tokio::try_join!(
+            self.snapshot_sources(&self.sources),
+            self.snapshot_sources(&self.table_sources),
+        )?;
 
         // Merge extra table offsets (from ReferenceTableSource instances)
         for (name, cp) in extra_table_offsets {

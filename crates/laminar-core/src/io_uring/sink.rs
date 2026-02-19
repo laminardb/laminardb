@@ -214,10 +214,11 @@ mod linux_impl {
     }
 
     impl Sink for IoUringSink {
-        fn write(&mut self, outputs: Vec<Output>) -> Result<(), SinkError> {
-            for output in &outputs {
+        fn write(&mut self, outputs: &mut Vec<Output>) -> Result<(), SinkError> {
+            for output in outputs.iter() {
                 self.write_output(output)?;
             }
+            outputs.clear();
             Ok(())
         }
 

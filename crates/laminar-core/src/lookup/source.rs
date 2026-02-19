@@ -39,6 +39,10 @@ pub enum LookupError {
     /// The source is not available (e.g., not initialized).
     #[error("not available: {0}")]
     NotAvailable(String),
+
+    /// Internal error (cache I/O, codec failure, etc.).
+    #[error("internal: {0}")]
+    Internal(String),
 }
 
 /// Capabilities that a lookup source advertises.

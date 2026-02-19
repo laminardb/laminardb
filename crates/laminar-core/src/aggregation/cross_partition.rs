@@ -130,6 +130,80 @@ impl CrossPartitionAggregateStore {
     pub fn is_empty(&self) -> bool {
         self.len() == 0
     }
+
+    /// Snapshot all partial aggregates for checkpointing.
+    ///
+    /// Each entry is serialized as:
+    /// - Key: `group_key_len(4 bytes LE) + group_key + partition_id(4 bytes LE)`
+    /// - Value: raw partial aggregate bytes
+    ///
+    /// The `num_partitions` is stored as a sentinel entry with an empty key
+    /// and value containing the partition count as 4 bytes LE.
+    #[must_use]
+    pub fn snapshot(&self) -> Vec<(Vec<u8>, Vec<u8>)> {
+        let guard = self.map.guard();
+        let mut entries = Vec::new();
+
+        // Sentinel entry for num_partitions
+        entries.push((Vec::new(), self.num_partitions.to_le_bytes().to_vec()));
+
+        for (key, value) in self.map.iter(&guard) {
+            #[allow(clippy::cast_possible_truncation)] // group keys are always < 4 GiB
+            let group_len = key.group_key.len() as u32;
+            let mut serialized_key =
+                Vec::with_capacity(4 + key.group_key.len() + 4);
+            serialized_key.extend_from_slice(&group_len.to_le_bytes());
+            serialized_key.extend_from_slice(&key.group_key);
+            serialized_key.extend_from_slice(&key.partition_id.to_le_bytes());
+            entries.push((serialized_key, value.to_vec()));
+        }
+
+        entries
+    }
+
+    /// Restore partial aggregates from a checkpoint snapshot.
+    ///
+    /// Clears the current state and inserts all entries from the snapshot.
+    ///
+    /// # Panics
+    ///
+    /// Panics if a non-sentinel entry has a key shorter than the encoded
+    /// length prefix (corrupted snapshot). Malformed entries with incorrect
+    /// total length are silently skipped.
+    pub fn restore(&self, snapshot: &[(Vec<u8>, Vec<u8>)]) {
+        let guard = self.map.guard();
+        self.map.clear(&guard);
+
+        for (key_bytes, value_bytes) in snapshot {
+            // Skip sentinel entry (empty key = num_partitions metadata)
+            if key_bytes.is_empty() {
+                continue;
+            }
+            if key_bytes.len() < 8 {
+                continue; // malformed entry
+            }
+
+            let group_len =
+                u32::from_le_bytes(key_bytes[..4].try_into().unwrap()) as usize;
+            if key_bytes.len() < 4 + group_len + 4 {
+                continue; // malformed entry
+            }
+
+            let group_key = Bytes::copy_from_slice(&key_bytes[4..4 + group_len]);
+            let partition_id = u32::from_le_bytes(
+                key_bytes[4 + group_len..4 + group_len + 4]
+                    .try_into()
+                    .unwrap(),
+            );
+
+            let composite = CompositeKey {
+                group_key,
+                partition_id,
+            };
+            self.map
+                .insert(composite, Bytes::copy_from_slice(value_bytes), &guard);
+        }
+    }
 }
 
 // papaya::HashMap<K, V> is Send + Sync when K and V are Send + Sync.
@@ -224,6 +298,51 @@ mod tests {
         assert!(store.is_empty());
         assert_eq!(store.len(), 0);
         assert_eq!(store.num_partitions(), 4);
+    }
+
+    #[test]
+    fn test_snapshot_and_restore() {
+        let store = CrossPartitionAggregateStore::new(3);
+
+        store.publish(Bytes::from_static(b"g1"), 0, Bytes::from_static(b"p0"));
+        store.publish(Bytes::from_static(b"g1"), 1, Bytes::from_static(b"p1"));
+        store.publish(Bytes::from_static(b"g2"), 2, Bytes::from_static(b"p2"));
+
+        let snapshot = store.snapshot();
+        assert_eq!(snapshot.len(), 4); // 3 entries + 1 sentinel
+
+        // Restore into a fresh store
+        let store2 = CrossPartitionAggregateStore::new(3);
+        store2.restore(&snapshot);
+
+        assert_eq!(store2.len(), 3);
+        assert_eq!(
+            store2.get_partial(b"g1", 0),
+            Some(Bytes::from_static(b"p0"))
+        );
+        assert_eq!(
+            store2.get_partial(b"g1", 1),
+            Some(Bytes::from_static(b"p1"))
+        );
+        assert_eq!(
+            store2.get_partial(b"g2", 2),
+            Some(Bytes::from_static(b"p2"))
+        );
+    }
+
+    #[test]
+    fn test_restore_clears_existing() {
+        let store = CrossPartitionAggregateStore::new(2);
+
+        store.publish(Bytes::from_static(b"old"), 0, Bytes::from_static(b"v"));
+        assert_eq!(store.len(), 1);
+
+        // Restore empty snapshot (just sentinel)
+        let empty_snapshot = vec![(Vec::new(), 2u32.to_le_bytes().to_vec())];
+        store.restore(&empty_snapshot);
+
+        assert!(store.is_empty());
+        assert!(store.get_partial(b"old", 0).is_none());
     }
 
     #[test]

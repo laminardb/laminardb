@@ -23,6 +23,9 @@ pub use predicate::{
     Predicate, ScalarValue, SourceCapabilities, SplitPredicates, predicate_to_sql,
     split_predicates,
 };
-pub use foyer_cache::{FoyerMemoryCache, FoyerMemoryCacheConfig, LookupCacheKey};
+pub use foyer_cache::{
+    CachedValue, FoyerMemoryCache, FoyerMemoryCacheConfig, HierarchyMetrics,
+    HybridCacheConfig, LookupCacheHierarchy, LookupCacheKey,
+};
 pub use source::{ColumnId, LookupError, LookupSource, LookupSourceCapabilities, PushdownAdapter};
 pub use table::{LookupResult, LookupStrategy, LookupTable, LookupTableConfig};

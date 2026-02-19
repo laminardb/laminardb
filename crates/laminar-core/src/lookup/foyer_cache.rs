@@ -1,28 +1,44 @@
-//! foyer-backed in-memory cache for lookup tables.
+//! foyer-backed caches for lookup tables.
 //!
-//! [`FoyerMemoryCache`] implements [`LookupTable`] using foyer's
-//! high-performance in-memory cache with S3-FIFO eviction. Only the
-//! synchronous [`foyer::Cache`] is used (not `HybridCache`) to stay
-//! within Ring 0 latency requirements.
+//! ## Ring 0 — [`FoyerMemoryCache`]
 //!
-//! ## Performance targets
+//! Synchronous [`foyer::Cache`] with S3-FIFO eviction. Checked per-event
+//! on the operator hot path — sub-microsecond latency.
 //!
-//! - Cache hit `get()`: < 500ns
-//! - Cache miss: < 200ns
-//! - `insert()`: < 1us
+//! ## Ring 1 — [`LookupCacheHierarchy`]
+//!
+//! Async two-tier cache (`HybridCache` memory + disk) with source fallback.
+//! Used only on Ring 0 miss (cold path). foyer's built-in request
+//! deduplication eliminates the need for external concurrency control.
+//!
+//! ```text
+//! Ring 0 (sync, <500ns)              Ring 1 (async, 10us-100ms)
+//! ┌──────────────────┐    miss    ┌──────────────────────────────┐
+//! │ FoyerMemoryCache │ ────────→ │ LookupCacheHierarchy         │
+//! │ (foyer::Cache)   │ ←──────── │   HybridCache mem → disk     │
+//! └──────────────────┘  promote  │   └→ LookupSource (external)  │
+//!                                └──────────────────────────────┘
+//! ```
 
+use std::path::PathBuf;
 use std::sync::atomic::{AtomicU64, Ordering};
+use std::sync::Arc;
+use std::time::{Duration, SystemTime, UNIX_EPOCH};
 
 use bytes::Bytes;
-use foyer::{Cache, CacheBuilder};
+use foyer::{
+    BlockEngineBuilder, Cache, CacheBuilder, DeviceBuilder, FsDeviceBuilder,
+    HybridCache, NoopDeviceBuilder,
+};
 
+use crate::lookup::source::{LookupError, LookupSource};
 use crate::lookup::table::{LookupResult, LookupTable};
 
 /// Composite cache key: table ID + raw key bytes.
 ///
 /// The `table_id` ensures that caches for different lookup tables
 /// never collide, even if they share a `foyer::Cache` instance.
-#[derive(Debug, Clone, PartialEq, Eq, Hash)]
+#[derive(Debug, Clone, PartialEq, Eq, Hash, serde::Serialize, serde::Deserialize)]
 pub struct LookupCacheKey {
     /// Lookup table identifier.
     pub table_id: u32,
@@ -174,6 +190,277 @@ impl std::fmt::Debug for FoyerMemoryCache {
     }
 }
 
+// ---------------------------------------------------------------------------
+// Ring 1: HybridCache hierarchy
+// ---------------------------------------------------------------------------
+
+/// Configuration for [`LookupCacheHierarchy`].
+#[derive(Debug, Clone)]
+pub struct HybridCacheConfig {
+    /// Memory capacity for the hybrid cache's internal memory tier (bytes).
+    pub memory_capacity: usize,
+    /// Disk capacity for the hybrid cache's disk tier (bytes).
+    pub disk_capacity: usize,
+    /// Directory for disk-backed cache files.
+    pub disk_dir: PathBuf,
+    /// Optional TTL for cached entries. `None` means no expiry.
+    pub ttl: Option<Duration>,
+}
+
+impl Default for HybridCacheConfig {
+    fn default() -> Self {
+        Self {
+            memory_capacity: 32 * 1024 * 1024, // 32 MiB
+            disk_capacity: 1024 * 1024 * 1024,  // 1 GiB
+            disk_dir: std::env::temp_dir().join("laminar").join("lookup_cache"),
+            ttl: None,
+        }
+    }
+}
+
+/// Value stored in the [`HybridCache`] tier.
+///
+/// Wraps raw data bytes with an insertion timestamp for TTL checks.
+#[derive(Clone, Debug, serde::Serialize, serde::Deserialize)]
+pub struct CachedValue {
+    /// Raw value bytes.
+    pub data: Vec<u8>,
+    /// Milliseconds since UNIX epoch when this entry was cached.
+    pub cached_at_ms: u64,
+}
+
+impl CachedValue {
+    /// Create a new cached value stamped with the current time.
+    #[allow(clippy::cast_possible_truncation)]
+    fn new(data: Vec<u8>) -> Self {
+        let cached_at_ms = SystemTime::now()
+            .duration_since(UNIX_EPOCH)
+            .unwrap_or_default()
+            .as_millis() as u64;
+        Self { data, cached_at_ms }
+    }
+
+    /// Check whether this entry has expired given an optional TTL.
+    #[must_use]
+    #[allow(clippy::cast_possible_truncation)]
+    pub fn is_expired(&self, ttl: Option<Duration>) -> bool {
+        match ttl {
+            None => false,
+            Some(ttl) => {
+                let now_ms = SystemTime::now()
+                    .duration_since(UNIX_EPOCH)
+                    .unwrap_or_default()
+                    .as_millis() as u64;
+                now_ms.saturating_sub(self.cached_at_ms) > ttl.as_millis() as u64
+            }
+        }
+    }
+}
+
+/// Metrics snapshot from [`LookupCacheHierarchy`].
+#[derive(Debug, Clone)]
+pub struct HierarchyMetrics {
+    /// Bytes used by the hybrid cache's in-memory tier.
+    pub hybrid_memory_usage: usize,
+    /// Number of successful source queries.
+    pub source_hits: u64,
+    /// Number of source queries that returned no data.
+    pub source_misses: u64,
+}
+
+/// Two-tier async cache hierarchy for lookup tables.
+///
+/// Sits between the hot [`FoyerMemoryCache`] (Ring 0) and the external
+/// [`LookupSource`]. Uses foyer's [`HybridCache`] for a memory + disk
+/// tier with built-in request deduplication on disk reads.
+///
+/// Generic over the source type `S` because [`LookupSource`] uses RPITIT
+/// and is not dyn-compatible.
+pub struct LookupCacheHierarchy<S> {
+    hot_cache: Arc<FoyerMemoryCache>,
+    hybrid: HybridCache<LookupCacheKey, CachedValue>,
+    source: S,
+    config: HybridCacheConfig,
+    source_hits: AtomicU64,
+    source_misses: AtomicU64,
+}
+
+impl<S: LookupSource> LookupCacheHierarchy<S> {
+    /// Build a hierarchy backed by a real filesystem disk tier.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`LookupError::Internal`] if directory creation, device
+    /// initialization, or hybrid cache construction fails.
+    pub async fn new(
+        hot_cache: Arc<FoyerMemoryCache>,
+        source: S,
+        config: HybridCacheConfig,
+    ) -> Result<Self, LookupError> {
+        std::fs::create_dir_all(&config.disk_dir).map_err(|e| {
+            LookupError::Internal(format!("failed to create cache dir: {e}"))
+        })?;
+
+        let device = FsDeviceBuilder::new(&config.disk_dir)
+            .with_capacity(config.disk_capacity)
+            .build()
+            .map_err(|e| LookupError::Internal(format!("device build: {e}")))?;
+
+        let hybrid = HybridCache::builder()
+            .memory(config.memory_capacity)
+            .storage()
+            .with_engine_config(BlockEngineBuilder::new(device))
+            .build()
+            .await
+            .map_err(|e| LookupError::Internal(format!("hybrid build: {e}")))?;
+
+        Ok(Self {
+            hot_cache,
+            hybrid,
+            source,
+            config,
+            source_hits: AtomicU64::new(0),
+            source_misses: AtomicU64::new(0),
+        })
+    }
+
+    /// Build a hierarchy with a noop storage backend (no disk I/O).
+    ///
+    /// Useful for tests or environments without a writable filesystem.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`LookupError::Internal`] if hybrid cache construction fails.
+    pub async fn with_noop_storage(
+        hot_cache: Arc<FoyerMemoryCache>,
+        source: S,
+        config: HybridCacheConfig,
+    ) -> Result<Self, LookupError> {
+        let device = NoopDeviceBuilder::default()
+            .build()
+            .map_err(|e| LookupError::Internal(format!("noop device: {e}")))?;
+
+        let hybrid = HybridCache::builder()
+            .memory(config.memory_capacity)
+            .storage()
+            .with_engine_config(BlockEngineBuilder::new(device))
+            .build()
+            .await
+            .map_err(|e| LookupError::Internal(format!("hybrid build: {e}")))?;
+
+        Ok(Self {
+            hot_cache,
+            hybrid,
+            source,
+            config,
+            source_hits: AtomicU64::new(0),
+            source_misses: AtomicU64::new(0),
+        })
+    }
+
+    /// Fetch a value through the cache hierarchy.
+    ///
+    /// 1. Check hybrid cache (memory + disk) via `obtain()` (deduplicates
+    ///    concurrent disk reads for the same key).
+    /// 2. On hit + not expired → promote to hot cache, return value.
+    /// 3. On miss or expired → query source, insert into hybrid + hot cache.
+    /// 4. Source miss → return `Ok(None)` without caching.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`LookupError::Internal`] on hybrid cache I/O failure, or
+    /// propagates errors from the underlying [`LookupSource::query`].
+    pub async fn fetch(
+        &self,
+        table_id: u32,
+        key: &[u8],
+    ) -> Result<Option<Bytes>, LookupError> {
+        let cache_key = LookupCacheKey {
+            table_id,
+            key: key.to_vec(),
+        };
+
+        // Check hybrid cache (memory + disk tiers)
+        if let Some(entry) = self
+            .hybrid
+            .obtain(cache_key.clone())
+            .await
+            .map_err(|e| LookupError::Internal(format!("hybrid obtain: {e}")))?
+        {
+            let cached = entry.value();
+            if !cached.is_expired(self.config.ttl) {
+                // Promote to hot cache and return
+                let data = Bytes::from(cached.data.clone());
+                self.hot_cache.insert(key, data.clone());
+                return Ok(Some(data));
+            }
+            // Expired — remove stale entry and fall through to source
+            self.hybrid.remove(&cache_key);
+        }
+
+        // Cache miss or expired — query source
+        let keys: Vec<&[u8]> = vec![key];
+        let results: Vec<Option<Vec<u8>>> =
+            self.source.query(&keys, &[], &[]).await?;
+
+        if let Some(value) = results.into_iter().next().flatten() {
+            self.source_hits.fetch_add(1, Ordering::Relaxed);
+            let cached_value = CachedValue::new(value.clone());
+            self.hybrid.insert(cache_key, cached_value);
+            let data = Bytes::from(value);
+            self.hot_cache.insert(key, data.clone());
+            Ok(Some(data))
+        } else {
+            self.source_misses.fetch_add(1, Ordering::Relaxed);
+            Ok(None)
+        }
+    }
+
+    /// Bulk-insert entries into the hybrid cache for warming.
+    ///
+    /// Returns the number of entries inserted.
+    pub fn warm(
+        &self,
+        table_id: u32,
+        entries: &[(&[u8], &[u8])],
+    ) -> usize {
+        for (key, value) in entries {
+            let cache_key = LookupCacheKey {
+                table_id,
+                key: key.to_vec(),
+            };
+            let cached_value = CachedValue::new(value.to_vec());
+            self.hybrid.insert(cache_key, cached_value);
+        }
+        entries.len()
+    }
+
+    /// Snapshot of cache hierarchy metrics.
+    pub fn metrics(&self) -> HierarchyMetrics {
+        HierarchyMetrics {
+            hybrid_memory_usage: self.hybrid.memory().usage(),
+            source_hits: self.source_hits.load(Ordering::Relaxed),
+            source_misses: self.source_misses.load(Ordering::Relaxed),
+        }
+    }
+
+    /// Reference to the underlying source.
+    pub fn source(&self) -> &S {
+        &self.source
+    }
+}
+
+impl<S: LookupSource> std::fmt::Debug for LookupCacheHierarchy<S> {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("LookupCacheHierarchy")
+            .field("source", &self.source.source_name())
+            .field("hybrid_memory_usage", &self.hybrid.memory().usage())
+            .field("source_hits", &self.source_hits.load(Ordering::Relaxed))
+            .field("source_misses", &self.source_misses.load(Ordering::Relaxed))
+            .finish_non_exhaustive()
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -291,5 +578,181 @@ mod tests {
         let config = FoyerMemoryCacheConfig::default();
         assert_eq!(config.capacity, 256 * 1024);
         assert_eq!(config.shards, 16);
+    }
+
+    // -----------------------------------------------------------------------
+    // Ring 1 hierarchy tests
+    // -----------------------------------------------------------------------
+
+    use std::collections::HashMap;
+    use std::future::Future;
+
+    use crate::lookup::source::{
+        ColumnId, LookupError, LookupSource, LookupSourceCapabilities,
+    };
+    use crate::lookup::predicate::Predicate;
+
+    /// In-memory lookup source for hierarchy tests.
+    struct TestSource {
+        data: HashMap<Vec<u8>, Vec<u8>>,
+    }
+
+    impl TestSource {
+        fn new(entries: &[(&[u8], &[u8])]) -> Self {
+            let mut data = HashMap::new();
+            for (k, v) in entries {
+                data.insert(k.to_vec(), v.to_vec());
+            }
+            Self { data }
+        }
+
+        fn empty() -> Self {
+            Self {
+                data: HashMap::new(),
+            }
+        }
+    }
+
+    impl LookupSource for TestSource {
+        fn query(
+            &self,
+            keys: &[&[u8]],
+            _predicates: &[Predicate],
+            _projection: &[ColumnId],
+        ) -> impl Future<Output = Result<Vec<Option<Vec<u8>>>, LookupError>> + Send
+        {
+            let results: Vec<Option<Vec<u8>>> = keys
+                .iter()
+                .map(|k| self.data.get(k.as_ref()).cloned())
+                .collect();
+            async move { Ok(results) }
+        }
+
+        fn capabilities(&self) -> LookupSourceCapabilities {
+            LookupSourceCapabilities::default()
+        }
+
+        fn source_name(&self) -> &str {
+            "test_source"
+        }
+    }
+
+    /// Helper to build a hierarchy with noop storage for testing.
+    async fn test_hierarchy(
+        source: TestSource,
+    ) -> LookupCacheHierarchy<TestSource> {
+        let hot = Arc::new(small_cache(1));
+        let config = HybridCacheConfig {
+            memory_capacity: 4 * 1024 * 1024,
+            ..Default::default()
+        };
+        LookupCacheHierarchy::with_noop_storage(hot, source, config)
+            .await
+            .expect("noop hierarchy should build")
+    }
+
+    #[test]
+    fn test_hybrid_cache_config_defaults() {
+        let config = HybridCacheConfig::default();
+        assert_eq!(config.memory_capacity, 32 * 1024 * 1024);
+        assert_eq!(config.disk_capacity, 1024 * 1024 * 1024);
+        assert!(config.ttl.is_none());
+        assert!(config.disk_dir.ends_with("lookup_cache"));
+    }
+
+    #[test]
+    fn test_cached_value_no_ttl() {
+        let cv = CachedValue::new(b"hello".to_vec());
+        assert!(!cv.is_expired(None));
+    }
+
+    #[test]
+    fn test_cached_value_not_expired() {
+        let cv = CachedValue::new(b"hello".to_vec());
+        // 1 hour TTL — should not be expired yet
+        assert!(!cv.is_expired(Some(Duration::from_secs(3600))));
+    }
+
+    #[test]
+    fn test_cached_value_expired() {
+        let mut cv = CachedValue::new(b"hello".to_vec());
+        // Set cached_at to 2 seconds ago
+        cv.cached_at_ms = SystemTime::now()
+            .duration_since(UNIX_EPOCH)
+            .unwrap()
+            .as_millis() as u64
+            - 2000;
+        // 1-second TTL — should be expired
+        assert!(cv.is_expired(Some(Duration::from_secs(1))));
+    }
+
+    #[tokio::test]
+    async fn test_hierarchy_fetch_populates_hybrid() {
+        let source = TestSource::new(&[(b"k1", b"v1"), (b"k2", b"v2")]);
+        let h = test_hierarchy(source).await;
+
+        // First fetch — goes to source
+        let result = h.fetch(1, b"k1").await.unwrap();
+        assert_eq!(result, Some(Bytes::from_static(b"v1")));
+
+        // Verify it was promoted to hot cache
+        let hot_result = h.hot_cache.get_cached(b"k1");
+        assert!(hot_result.is_hit());
+
+        // Verify source_hits counter
+        assert_eq!(h.metrics().source_hits, 1);
+    }
+
+    #[tokio::test]
+    async fn test_hierarchy_fetch_source_miss() {
+        let source = TestSource::empty();
+        let h = test_hierarchy(source).await;
+
+        let result = h.fetch(1, b"missing").await.unwrap();
+        assert_eq!(result, None);
+
+        // Should NOT be in hot cache
+        let hot_result = h.hot_cache.get_cached(b"missing");
+        assert!(hot_result.is_not_found());
+
+        // Source miss counter should increment
+        assert_eq!(h.metrics().source_misses, 1);
+    }
+
+    #[tokio::test]
+    async fn test_hierarchy_warm() {
+        let source = TestSource::empty();
+        let h = test_hierarchy(source).await;
+
+        let entries: Vec<(&[u8], &[u8])> =
+            vec![(b"w1", b"val1"), (b"w2", b"val2"), (b"w3", b"val3")];
+        let count = h.warm(1, &entries);
+        assert_eq!(count, 3);
+
+        // Warmed entries should be retrievable via obtain (hybrid hit)
+        let result = h.fetch(1, b"w1").await.unwrap();
+        assert_eq!(result, Some(Bytes::from(b"val1".to_vec())));
+
+        // Source should not have been queried (source_hits stays 0)
+        assert_eq!(h.metrics().source_hits, 0);
+    }
+
+    #[tokio::test]
+    async fn test_hierarchy_metrics() {
+        let source = TestSource::new(&[(b"k1", b"v1")]);
+        let h = test_hierarchy(source).await;
+
+        // Initial state
+        let m = h.metrics();
+        assert_eq!(m.source_hits, 0);
+        assert_eq!(m.source_misses, 0);
+
+        // One hit, one miss
+        h.fetch(1, b"k1").await.unwrap();
+        h.fetch(1, b"nope").await.unwrap();
+
+        let m = h.metrics();
+        assert_eq!(m.source_hits, 1);
+        assert_eq!(m.source_misses, 1);
     }
 }

@@ -35,10 +35,13 @@ use crate::time::{BoundedOutOfOrdernessGenerator, TimerService, WatermarkGenerat
 pub trait Sink: Send {
     /// Write outputs to the sink.
     ///
+    /// The sink should drain items from the provided vector, leaving it empty
+    /// but preserving capacity so the caller can reuse the allocation.
+    ///
     /// # Errors
     ///
     /// Returns an error if the sink cannot accept the outputs.
-    fn write(&mut self, outputs: Vec<Output>) -> Result<(), SinkError>;
+    fn write(&mut self, outputs: &mut Vec<Output>) -> Result<(), SinkError>;
 
     /// Flush any buffered data.
     ///
@@ -192,9 +195,11 @@ impl Reactor {
         Ok(())
     }
 
-    /// Run one iteration of the event loop
-    /// Returns outputs ready for downstream
-    pub fn poll(&mut self) -> Vec<Output> {
+    /// Processes one iteration of the event loop, filling `self.output_buffer`.
+    ///
+    /// Separated from [`poll`] so that [`run`] and [`shutdown`] can access
+    /// `self.output_buffer` directly without allocating.
+    fn process_events(&mut self) {
         // Hot path guard - will panic on allocation when allocation-tracking is enabled
         let _guard = HotPathGuard::enter("Reactor::poll");
 
@@ -327,9 +332,25 @@ impl Reactor {
                 break;
             }
         }
+    }
 
-        // 3. Return outputs
+    /// Run one iteration of the event loop.
+    ///
+    /// Returns outputs ready for downstream. Allocates a new `Vec` per call.
+    /// Prefer [`poll_into`] or the internal [`run`] loop for zero-allocation
+    /// processing.
+    pub fn poll(&mut self) -> Vec<Output> {
+        self.process_events();
         self.output_buffer.drain(..).collect()
+    }
+
+    /// Run one iteration, appending outputs to a caller-provided buffer.
+    ///
+    /// This avoids the per-poll allocation of [`poll`] — the caller can
+    /// reuse the same `Vec` across iterations, retaining its capacity.
+    pub fn poll_into(&mut self, output: &mut Vec<Output>) {
+        self.process_events();
+        output.append(&mut self.output_buffer);
     }
 
     /// Advances the watermark to the given timestamp.
@@ -456,17 +477,19 @@ impl Reactor {
         self.set_cpu_affinity()?;
 
         while !self.shutdown.load(Ordering::Relaxed) {
-            // Process events
-            let outputs = self.poll();
+            // Process events into self.output_buffer (zero-alloc)
+            self.process_events();
 
-            // Send outputs to sink if configured
-            if !outputs.is_empty() {
+            // Send outputs to sink if configured.
+            // Sink drains output_buffer, preserving capacity for reuse.
+            if !self.output_buffer.is_empty() {
                 if let Some(sink) = &mut self.sink {
-                    if let Err(e) = sink.write(outputs) {
+                    if let Err(e) = sink.write(&mut self.output_buffer) {
                         tracing::error!("Failed to write to sink: {e}");
                         // Continue processing even if sink fails
                     }
                 }
+                self.output_buffer.clear();
             }
 
             // If no events to process, emit a CPU spin hint (PAUSE on x86,
@@ -502,17 +525,17 @@ impl Reactor {
         // Signal shutdown
         self.shutdown.store(true, Ordering::Relaxed);
 
-        // Process remaining events
+        // Process remaining events (zero-alloc drain)
         while !self.event_queue.is_empty() {
-            let outputs = self.poll();
+            self.process_events();
 
-            // Send final outputs to sink
-            if !outputs.is_empty() {
+            if !self.output_buffer.is_empty() {
                 if let Some(sink) = &mut self.sink {
-                    if let Err(e) = sink.write(outputs) {
+                    if let Err(e) = sink.write(&mut self.output_buffer) {
                         tracing::error!("Failed to write final outputs during shutdown: {e}");
                     }
                 }
+                self.output_buffer.clear();
             }
         }
 
@@ -554,8 +577,8 @@ pub enum ReactorError {
 pub struct StdoutSink;
 
 impl Sink for StdoutSink {
-    fn write(&mut self, outputs: Vec<Output>) -> Result<(), SinkError> {
-        for output in outputs {
+    fn write(&mut self, outputs: &mut Vec<Output>) -> Result<(), SinkError> {
+        for output in outputs.drain(..) {
             match output {
                 Output::Event(event) => {
                     println!(
@@ -628,8 +651,8 @@ impl BufferingSink {
 }
 
 impl Sink for BufferingSink {
-    fn write(&mut self, mut outputs: Vec<Output>) -> Result<(), SinkError> {
-        self.buffer.append(&mut outputs);
+    fn write(&mut self, outputs: &mut Vec<Output>) -> Result<(), SinkError> {
+        self.buffer.append(outputs);
         Ok(())
     }
 

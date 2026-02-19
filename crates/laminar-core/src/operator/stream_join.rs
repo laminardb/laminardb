@@ -1111,6 +1111,10 @@ pub struct StreamJoinOperator {
     right_watermark: i64,
     /// Reusable buffer for `prune_build_side` to avoid per-call allocation.
     prune_buffer: Vec<Bytes>,
+    /// Cached column index for left key — resolved on first left event.
+    left_key_index: Option<usize>,
+    /// Cached column index for right key — resolved on first right event.
+    right_key_index: Option<usize>,
 }
 
 impl StreamJoinOperator {
@@ -1155,6 +1159,8 @@ impl StreamJoinOperator {
             left_watermark: i64::MIN,
             right_watermark: i64::MIN,
             prune_buffer: Vec::with_capacity(100),
+            left_key_index: None,
+            right_key_index: None,
         }
     }
 
@@ -1192,6 +1198,8 @@ impl StreamJoinOperator {
             left_watermark: i64::MIN,
             right_watermark: i64::MIN,
             prune_buffer: Vec::with_capacity(100),
+            left_key_index: None,
+            right_key_index: None,
         }
     }
 
@@ -1248,6 +1256,8 @@ impl StreamJoinOperator {
             left_watermark: i64::MIN,
             right_watermark: i64::MIN,
             prune_buffer: Vec::with_capacity(100),
+            left_key_index: None,
+            right_key_index: None,
         }
     }
 
@@ -1440,11 +1450,11 @@ impl StreamJoinOperator {
         }
 
         // Extract join key
-        let key_column = match side {
-            JoinSide::Left => &self.left_key_column,
-            JoinSide::Right => &self.right_key_column,
+        let (key_column, cached_index) = match side {
+            JoinSide::Left => (&self.left_key_column, &mut self.left_key_index),
+            JoinSide::Right => (&self.right_key_column, &mut self.right_key_index),
         };
-        let Some(key_value) = Self::extract_key(&event.data, key_column) else {
+        let Some(key_value) = Self::extract_key(&event.data, key_column, cached_index) else {
             // Can't extract key, skip this event
             return output;
         };
@@ -1671,8 +1681,20 @@ impl StreamJoinOperator {
     }
 
     /// Extracts the join key value from a record batch.
-    fn extract_key(batch: &RecordBatch, column_name: &str) -> Option<Vec<u8>> {
-        let column_index = batch.schema().index_of(column_name).ok()?;
+    ///
+    /// Caches the column index on first call to avoid per-event schema lookups.
+    fn extract_key(
+        batch: &RecordBatch,
+        column_name: &str,
+        cached_index: &mut Option<usize>,
+    ) -> Option<Vec<u8>> {
+        let column_index = if let Some(idx) = *cached_index {
+            idx
+        } else {
+            let idx = batch.schema().index_of(column_name).ok()?;
+            *cached_index = Some(idx);
+            idx
+        };
         let column = batch.column(column_index);
 
         // Handle different column types

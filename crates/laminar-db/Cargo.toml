@@ -58,6 +58,7 @@ sqlparser = { workspace = true }
 tokio = { workspace = true }
 tokio-stream = { workspace = true }
 async-trait = { workspace = true }
+futures = { workspace = true }
 
 # Concurrency
 parking_lot = { workspace = true }

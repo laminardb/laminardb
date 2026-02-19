@@ -248,9 +248,14 @@ impl IncrementalCheckpointManager {
     }
 
     /// Scans the checkpoint directory to find existing checkpoints.
+    ///
+    /// `next_id` is based on the highest directory ID (including partial
+    /// dirs) to avoid ID collisions. `latest_id` only considers dirs with
+    /// a valid `metadata.json` to prevent partial checkpoint directories
+    /// from poisoning the incremental `parent_id` chain.
     fn scan_checkpoints(dir: &Path) -> Result<(u64, Option<u64>), IncrementalCheckpointError> {
-        let mut max_id = 0u64;
-        let mut latest_id = None;
+        let mut max_dir_id = 0u64;
+        let mut latest_valid_id = None;
 
         if dir.exists() {
             for entry in fs::read_dir(dir)? {
@@ -260,16 +265,32 @@ impl IncrementalCheckpointManager {
 
                 if let Some(id_str) = name_str.strip_prefix("checkpoint_") {
                     if let Ok(id) = u64::from_str_radix(id_str, 16) {
-                        if id >= max_id {
-                            max_id = id;
-                            latest_id = Some(id);
+                        // Track highest dir ID for next_id (avoids collisions).
+                        if id >= max_dir_id {
+                            max_dir_id = id;
+                        }
+                        // Only set latest_id if metadata.json exists.
+                        // Partial dirs (crash before metadata write) must not
+                        // set latest_id or they poison parent_id chains.
+                        let metadata_path = dir
+                            .join(name_str.as_ref())
+                            .join("metadata.json");
+                        if !metadata_path.exists() {
+                            debug!(
+                                checkpoint_id = id,
+                                "skipping partial checkpoint dir (no metadata.json)"
+                            );
+                            continue;
+                        }
+                        if latest_valid_id.is_none_or(|prev| id >= prev) {
+                            latest_valid_id = Some(id);
                         }
                     }
                 }
             }
         }
 
-        Ok((max_id + 1, latest_id))
+        Ok((max_dir_id + 1, latest_valid_id))
     }
 
     /// Opens or creates the `RocksDB` backend.
@@ -961,10 +982,13 @@ mod tests {
     fn test_scan_existing_checkpoints() {
         let temp_dir = TempDir::new().unwrap();
 
-        // Create some checkpoint directories manually
-        fs::create_dir_all(temp_dir.path().join("checkpoint_0000000000000001")).unwrap();
-        fs::create_dir_all(temp_dir.path().join("checkpoint_0000000000000003")).unwrap();
-        fs::create_dir_all(temp_dir.path().join("checkpoint_0000000000000002")).unwrap();
+        // Create checkpoint directories with metadata.json so they're recognized
+        for id in [1u64, 2, 3] {
+            let dir = temp_dir.path().join(format!("checkpoint_{id:016x}"));
+            fs::create_dir_all(&dir).unwrap();
+            let metadata = IncrementalCheckpointMetadata::new(id, id * 10);
+            fs::write(dir.join("metadata.json"), metadata.to_json().unwrap()).unwrap();
+        }
 
         let config = CheckpointConfig::new(temp_dir.path());
         let manager = IncrementalCheckpointManager::new(config).unwrap();
@@ -973,5 +997,28 @@ mod tests {
         assert_eq!(manager.next_id.load(Ordering::Relaxed), 4);
         // Latest should be 3
         assert_eq!(manager.latest_checkpoint_id, Some(3));
+    }
+
+    #[test]
+    fn test_scan_skips_partial_checkpoint_dirs() {
+        let temp_dir = TempDir::new().unwrap();
+
+        // Valid checkpoint with metadata.json
+        let dir1 = temp_dir.path().join("checkpoint_0000000000000001");
+        fs::create_dir_all(&dir1).unwrap();
+        let metadata = IncrementalCheckpointMetadata::new(1, 10);
+        fs::write(dir1.join("metadata.json"), metadata.to_json().unwrap()).unwrap();
+
+        // Partial checkpoint dir (no metadata.json) — should be skipped for latest_id
+        let dir3 = temp_dir.path().join("checkpoint_0000000000000003");
+        fs::create_dir_all(&dir3).unwrap();
+
+        let config = CheckpointConfig::new(temp_dir.path());
+        let manager = IncrementalCheckpointManager::new(config).unwrap();
+
+        // Latest should be 1 (dir 3 was skipped due to missing metadata)
+        assert_eq!(manager.latest_checkpoint_id, Some(1));
+        // next_id should still be 4 (max dir id 3 + 1) to avoid ID collision
+        assert_eq!(manager.next_id.load(Ordering::Relaxed), 4);
     }
 }

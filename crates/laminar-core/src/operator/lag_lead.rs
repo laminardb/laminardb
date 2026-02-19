@@ -116,6 +116,12 @@ pub struct LagLeadOperator {
     lead_defaults_cache: Vec<f64>,
     /// Cached LEAD output column names — computed once, reused.
     lead_columns_cache: Vec<String>,
+    /// Cached column indices for partition columns — resolved on first event.
+    cached_partition_indices: Vec<Option<usize>>,
+    /// Cached column index for the LAG source column — resolved on first event.
+    cached_lag_col_index: Option<usize>,
+    /// Cached column index for the LEAD source column — resolved on first event.
+    cached_lead_col_index: Option<usize>,
 }
 
 impl LagLeadOperator {
@@ -142,6 +148,7 @@ impl LagLeadOperator {
             .map(|f| f.output_column.clone())
             .collect();
 
+        let num_partition_cols = config.partition_columns.len();
         Self {
             operator_id: config.operator_id,
             functions: config.functions,
@@ -153,6 +160,9 @@ impl LagLeadOperator {
             lead_specs_cache,
             lead_defaults_cache,
             lead_columns_cache,
+            cached_partition_indices: vec![None; num_partition_cols],
+            cached_lag_col_index: None,
+            cached_lead_col_index: None,
         }
     }
 
@@ -174,12 +184,17 @@ impl LagLeadOperator {
     fn fill_partition_key(&mut self, event: &Event) {
         self.key_buf.clear();
         let batch = &event.data;
-        let schema = batch.schema();
 
-        for col_name in &self.partition_columns {
-            let Ok(col_idx) = schema.index_of(col_name) else {
-                self.key_buf.push(0x00); // missing column marker
-                continue;
+        for (i, col_name) in self.partition_columns.iter().enumerate() {
+            let col_idx = if let Some(idx) = self.cached_partition_indices[i] {
+                idx
+            } else {
+                let Ok(idx) = batch.schema().index_of(col_name) else {
+                    self.key_buf.push(0x00);
+                    continue;
+                };
+                self.cached_partition_indices[i] = Some(idx);
+                idx
             };
 
             let array = batch.column(col_idx);
@@ -214,11 +229,22 @@ impl LagLeadOperator {
     }
 
     /// Extracts a f64 value from a column in the event.
-    fn extract_column_value(event: &Event, column: &str) -> f64 {
+    ///
+    /// Caches the column index on first call to avoid per-event schema lookups.
+    fn extract_column_value(
+        event: &Event,
+        column: &str,
+        cached_index: &mut Option<usize>,
+    ) -> f64 {
         let batch = &event.data;
-        let schema = batch.schema();
-        let Ok(col_idx) = schema.index_of(column) else {
-            return f64::NAN;
+        let col_idx = if let Some(idx) = *cached_index {
+            idx
+        } else {
+            let Ok(idx) = batch.schema().index_of(column) else {
+                return f64::NAN;
+            };
+            *cached_index = Some(idx);
+            idx
         };
 
         let array = batch.column(col_idx);
@@ -378,7 +404,7 @@ impl LagLeadOperator {
         // Update LAG history
         if has_lag {
             if let Some(col) = &lag_source_col {
-                let value = Self::extract_column_value(event, col);
+                let value = Self::extract_column_value(event, col, &mut self.cached_lag_col_index);
                 state.lag_history.push_back(value);
                 while state.lag_history.len() > max_lag_offset {
                     state.lag_history.pop_front();
@@ -389,7 +415,7 @@ impl LagLeadOperator {
         if has_lead {
             // Buffer this event for LEAD resolution
             let value = if let Some(col) = &lead_source_col {
-                Self::extract_column_value(event, col)
+                Self::extract_column_value(event, col, &mut self.cached_lead_col_index)
             } else {
                 f64::NAN
             };
