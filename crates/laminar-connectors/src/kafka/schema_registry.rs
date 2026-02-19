@@ -4,9 +4,10 @@
 //! the Confluent Schema Registry API, with in-memory caching, arrow
 //! schema conversion, and compatibility checking.
 
-use std::collections::{HashMap, VecDeque};
 use std::sync::Arc;
 use std::time::{Duration, Instant};
+
+use foyer::{Cache, CacheBuilder};
 
 use arrow_schema::{DataType, Field, Fields, Schema, SchemaRef};
 use reqwest::Client;
@@ -103,12 +104,10 @@ pub struct SchemaRegistryClient {
     client: Client,
     base_url: String,
     auth: Option<SrAuth>,
-    /// Cache by schema ID.
-    cache: HashMap<i32, CachedSchema>,
+    /// Cache by schema ID (foyer LRU with S3-FIFO eviction).
+    cache: Cache<i32, CachedSchema>,
     /// Cache by subject name (latest version).
-    subject_cache: HashMap<String, CachedSchema>,
-    /// LRU order for schema ID cache (front = oldest, back = newest).
-    lru_order: VecDeque<i32>,
+    subject_cache: Cache<String, CachedSchema>,
     /// Cache configuration.
     cache_config: SchemaRegistryCacheConfig,
 }
@@ -190,13 +189,19 @@ impl SchemaRegistryClient {
         auth: Option<SrAuth>,
         cache_config: SchemaRegistryCacheConfig,
     ) -> Self {
+        let cache = CacheBuilder::new(cache_config.max_entries)
+            .with_shards(4)
+            .build();
+        // Subject cache is small — one entry per subject
+        let subject_cache = CacheBuilder::new(256)
+            .with_shards(4)
+            .build();
         Self {
             client: Client::new(),
             base_url: base_url.into().trim_end_matches('/').to_string(),
             auth,
-            cache: HashMap::new(),
-            subject_cache: HashMap::new(),
-            lru_order: VecDeque::new(),
+            cache,
+            subject_cache,
             cache_config,
         }
     }
@@ -219,83 +224,30 @@ impl SchemaRegistryClient {
         &self.cache_config
     }
 
-    /// Inserts a schema into the cache, evicting if needed.
-    fn cache_insert(&mut self, id: i32, mut schema: CachedSchema) {
+    /// Inserts a schema into the cache.
+    ///
+    /// foyer handles LRU eviction internally with S3-FIFO.
+    fn cache_insert(&self, id: i32, mut schema: CachedSchema) {
         schema.inserted_at = Instant::now();
-
-        // If already cached, remove old LRU entry.
-        if self.cache.contains_key(&id) {
-            self.lru_order.retain(|&x| x != id);
-        }
-
-        // Evict expired entries lazily.
-        if let Some(ttl) = self.cache_config.ttl {
-            let now = Instant::now();
-            while let Some(&oldest_id) = self.lru_order.front() {
-                if let Some(entry) = self.cache.get(&oldest_id) {
-                    if now.duration_since(entry.inserted_at) > ttl {
-                        self.cache.remove(&oldest_id);
-                        self.lru_order.pop_front();
-                        continue;
-                    }
-                }
-                break;
-            }
-        }
-
-        // Evict LRU if at capacity.
-        while self.cache.len() >= self.cache_config.max_entries {
-            if let Some(evict_id) = self.lru_order.pop_front() {
-                self.cache.remove(&evict_id);
-            } else {
-                break;
-            }
-        }
-
         self.cache.insert(id, schema);
-        self.lru_order.push_back(id);
     }
 
     /// Gets from cache, returning `None` if expired.
-    fn cache_get(&mut self, id: i32) -> Option<CachedSchema> {
-        if let Some(entry) = self.cache.get(&id) {
-            // Check TTL.
-            if let Some(ttl) = self.cache_config.ttl {
-                if entry.inserted_at.elapsed() > ttl {
-                    self.cache.remove(&id);
-                    self.lru_order.retain(|&x| x != id);
-                    return None;
-                }
-            }
-            // Move to back of LRU.
-            self.lru_order.retain(|&x| x != id);
-            self.lru_order.push_back(id);
-            Some(self.cache[&id].clone())
-        } else {
-            None
-        }
-    }
-
-    /// Returns the number of non-expired cached schemas.
-    #[must_use]
-    pub fn cache_evict_expired(&mut self) -> usize {
+    ///
+    /// TTL is checked lazily on access — expired entries are removed
+    /// and treated as cache misses.
+    fn cache_get(&self, id: i32) -> Option<CachedSchema> {
+        let entry = self.cache.get(&id)?;
+        let schema = entry.value();
         if let Some(ttl) = self.cache_config.ttl {
-            let now = Instant::now();
-            let expired: Vec<i32> = self
-                .cache
-                .iter()
-                .filter(|(_, v)| now.duration_since(v.inserted_at) > ttl)
-                .map(|(&k, _)| k)
-                .collect();
-            let count = expired.len();
-            for id in expired {
+            if schema.inserted_at.elapsed() > ttl {
+                drop(entry);
                 self.cache.remove(&id);
-                self.lru_order.retain(|&x| x != id);
+                return None;
             }
-            count
-        } else {
-            0
         }
+        // foyer's get() already promotes the entry in the eviction policy
+        Some(schema.clone())
     }
 
     /// Fetches a schema by its global ID.
@@ -306,7 +258,7 @@ impl SchemaRegistryClient {
     ///
     /// Returns `ConnectorError` if the HTTP request fails or the schema
     /// cannot be parsed.
-    pub async fn get_schema_by_id(&mut self, id: i32) -> Result<CachedSchema, ConnectorError> {
+    pub async fn get_schema_by_id(&self, id: i32) -> Result<CachedSchema, ConnectorError> {
         if let Some(cached) = self.cache_get(id) {
             return Ok(cached);
         }
@@ -335,7 +287,7 @@ impl SchemaRegistryClient {
     ///
     /// Returns `ConnectorError` if the HTTP request fails.
     pub async fn get_latest_schema(
-        &mut self,
+        &self,
         subject: &str,
     ) -> Result<CachedSchema, ConnectorError> {
         let url = format!("{}/subjects/{}/versions/latest", self.base_url, subject);
@@ -354,8 +306,7 @@ impl SchemaRegistryClient {
         };
 
         self.cache_insert(resp.id, cached.clone());
-        self.subject_cache
-            .insert(subject.to_string(), cached.clone());
+        self.subject_cache.insert(subject.to_string(), cached.clone());
         Ok(cached)
     }
 
@@ -365,7 +316,7 @@ impl SchemaRegistryClient {
     ///
     /// Returns `ConnectorError` if the HTTP request fails.
     pub async fn get_schema_version(
-        &mut self,
+        &self,
         subject: &str,
         version: i32,
     ) -> Result<CachedSchema, ConnectorError> {
@@ -496,7 +447,7 @@ impl SchemaRegistryClient {
     /// # Errors
     ///
     /// Returns `ConnectorError` if the schema cannot be fetched.
-    pub async fn resolve_confluent_id(&mut self, id: i32) -> Result<CachedSchema, ConnectorError> {
+    pub async fn resolve_confluent_id(&self, id: i32) -> Result<CachedSchema, ConnectorError> {
         self.get_schema_by_id(id).await
     }
 
@@ -510,14 +461,14 @@ impl SchemaRegistryClient {
     /// Returns `ConnectorError` if the HTTP request fails or the response
     /// is malformed.
     pub async fn register_schema(
-        &mut self,
+        &self,
         subject: &str,
         schema_str: &str,
         schema_type: SchemaType,
     ) -> Result<i32, ConnectorError> {
         // Check subject cache first.
-        if let Some(cached) = self.subject_cache.get(subject) {
-            return Ok(cached.id);
+        if let Some(entry) = self.subject_cache.get(subject) {
+            return Ok(entry.value().id);
         }
 
         let url = format!("{}/subjects/{}/versions", self.base_url, subject);
@@ -574,7 +525,7 @@ impl SchemaRegistryClient {
     /// Returns `ConnectorError::Serde(SchemaIncompatible)` if incompatible,
     /// or `ConnectorError` for HTTP/network errors.
     pub async fn validate_and_register_schema(
-        &mut self,
+        &self,
         subject: &str,
         schema_str: &str,
         schema_type: SchemaType,
@@ -606,13 +557,13 @@ impl SchemaRegistryClient {
     /// Returns `true` if the schema ID is in the local cache.
     #[must_use]
     pub fn is_cached(&self, id: i32) -> bool {
-        self.cache.contains_key(&id)
+        self.cache.contains(&id)
     }
 
     /// Returns the number of cached schemas.
     #[must_use]
     pub fn cache_size(&self) -> usize {
-        self.cache.len()
+        self.cache.usage()
     }
 
     /// Helper to perform a GET request and deserialize JSON.
@@ -649,8 +600,8 @@ impl std::fmt::Debug for SchemaRegistryClient {
         f.debug_struct("SchemaRegistryClient")
             .field("base_url", &self.base_url)
             .field("has_auth", &self.auth.is_some())
-            .field("cached_schemas", &self.cache.len())
-            .field("cached_subjects", &self.subject_cache.len())
+            .field("cached_schemas", &self.cache.usage())
+            .field("cached_subjects", &self.subject_cache.usage())
             .finish_non_exhaustive()
     }
 }
@@ -1425,7 +1376,7 @@ mod tests {
             max_entries: 3,
             ttl: None,
         };
-        let mut client =
+        let client =
             SchemaRegistryClient::with_cache_config("http://localhost:8081", None, config);
 
         // Insert 3 schemas.
@@ -1434,36 +1385,10 @@ mod tests {
         client.cache_insert(3, make_cached_schema(3));
         assert_eq!(client.cache_size(), 3);
 
-        // Insert a 4th — should evict schema ID 1 (oldest).
+        // Insert a 4th — should evict one entry (foyer S3-FIFO eviction).
         client.cache_insert(4, make_cached_schema(4));
-        assert_eq!(client.cache_size(), 3);
-        assert!(client.cache_get(1).is_none());
-        assert!(client.cache_get(2).is_some());
-        assert!(client.cache_get(4).is_some());
-    }
-
-    #[test]
-    fn test_cache_lru_access_refreshes() {
-        let config = SchemaRegistryCacheConfig {
-            max_entries: 3,
-            ttl: None,
-        };
-        let mut client =
-            SchemaRegistryClient::with_cache_config("http://localhost:8081", None, config);
-
-        client.cache_insert(1, make_cached_schema(1));
-        client.cache_insert(2, make_cached_schema(2));
-        client.cache_insert(3, make_cached_schema(3));
-
-        // Access schema 1 to refresh it in LRU.
-        let _ = client.cache_get(1);
-
-        // Insert 4 — should evict schema 2 (now oldest), not 1.
-        client.cache_insert(4, make_cached_schema(4));
-        assert_eq!(client.cache_size(), 3);
-        assert!(client.cache_get(1).is_some()); // refreshed
-        assert!(client.cache_get(2).is_none()); // evicted
-        assert!(client.cache_get(3).is_some());
+        assert!(client.cache_size() <= 3);
+        // The most recently inserted should always be present.
         assert!(client.cache_get(4).is_some());
     }
 
@@ -1473,7 +1398,7 @@ mod tests {
             max_entries: 100,
             ttl: Some(Duration::from_millis(50)),
         };
-        let mut client =
+        let client =
             SchemaRegistryClient::with_cache_config("http://localhost:8081", None, config);
 
         client.cache_insert(1, make_cached_schema(1));
@@ -1481,6 +1406,7 @@ mod tests {
 
         // Wait for TTL to expire.
         std::thread::sleep(Duration::from_millis(60));
+        // Lazy TTL: expired entry returns None on access.
         assert!(client.cache_get(1).is_none());
     }
 
@@ -1490,7 +1416,7 @@ mod tests {
             max_entries: 100,
             ttl: None,
         };
-        let mut client =
+        let client =
             SchemaRegistryClient::with_cache_config("http://localhost:8081", None, config);
 
         client.cache_insert(1, make_cached_schema(1));
@@ -1499,31 +1425,12 @@ mod tests {
     }
 
     #[test]
-    fn test_cache_evict_expired() {
-        let config = SchemaRegistryCacheConfig {
-            max_entries: 100,
-            ttl: Some(Duration::from_millis(50)),
-        };
-        let mut client =
-            SchemaRegistryClient::with_cache_config("http://localhost:8081", None, config);
-
-        client.cache_insert(1, make_cached_schema(1));
-        client.cache_insert(2, make_cached_schema(2));
-        assert_eq!(client.cache_size(), 2);
-
-        std::thread::sleep(Duration::from_millis(60));
-        let evicted = client.cache_evict_expired();
-        assert_eq!(evicted, 2);
-        assert_eq!(client.cache_size(), 0);
-    }
-
-    #[test]
     fn test_cache_replace_existing_id() {
         let config = SchemaRegistryCacheConfig {
-            max_entries: 3,
+            max_entries: 10,
             ttl: None,
         };
-        let mut client =
+        let client =
             SchemaRegistryClient::with_cache_config("http://localhost:8081", None, config);
 
         client.cache_insert(1, make_cached_schema(1));

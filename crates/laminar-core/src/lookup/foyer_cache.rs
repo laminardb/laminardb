@@ -20,12 +20,14 @@
 //!                                └──────────────────────────────┘
 //! ```
 
+use std::hash::{Hash, Hasher};
 use std::path::PathBuf;
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::Arc;
 use std::time::{Duration, SystemTime, UNIX_EPOCH};
 
 use bytes::Bytes;
+use equivalent::Equivalent;
 use foyer::{
     BlockEngineBuilder, Cache, CacheBuilder, DeviceBuilder, FsDeviceBuilder,
     HybridCache, NoopDeviceBuilder,
@@ -44,6 +46,32 @@ pub struct LookupCacheKey {
     pub table_id: u32,
     /// Raw key bytes.
     pub key: Vec<u8>,
+}
+
+/// Borrowed view of [`LookupCacheKey`] that avoids heap allocation.
+///
+/// Used with foyer's `Cache::get<Q>()` where `Q: Hash + Equivalent<K>`.
+/// Hashes identically to `LookupCacheKey` because `Vec<u8>` and `[u8]`
+/// produce the same hash output.
+struct LookupCacheKeyRef<'a> {
+    table_id: u32,
+    key: &'a [u8],
+}
+
+impl Hash for LookupCacheKeyRef<'_> {
+    fn hash<H: Hasher>(&self, state: &mut H) {
+        // Must match the derived Hash for LookupCacheKey:
+        // Hash::hash(&self.table_id, state) then Hash::hash(&self.key, state).
+        // Vec<u8>::hash delegates to [u8]::hash, so this is identical.
+        self.table_id.hash(state);
+        self.key.hash(state);
+    }
+}
+
+impl Equivalent<LookupCacheKey> for LookupCacheKeyRef<'_> {
+    fn equivalent(&self, other: &LookupCacheKey) -> bool {
+        self.table_id == other.table_id && self.key == other.key.as_slice()
+    }
 }
 
 /// Configuration for [`FoyerMemoryCache`].
@@ -145,8 +173,11 @@ impl FoyerMemoryCache {
 
 impl LookupTable for FoyerMemoryCache {
     fn get_cached(&self, key: &[u8]) -> LookupResult {
-        let cache_key = self.make_key(key);
-        if let Some(entry) = self.cache.get(&cache_key) {
+        let ref_key = LookupCacheKeyRef {
+            table_id: self.table_id,
+            key,
+        };
+        if let Some(entry) = self.cache.get(&ref_key) {
             // Clone the Bytes value (Arc bump only), then drop the
             // CacheEntry handle immediately — do NOT hold it across
             // operator boundaries (audit fix C3).
@@ -165,13 +196,18 @@ impl LookupTable for FoyerMemoryCache {
     }
 
     fn insert(&self, key: &[u8], value: Bytes) {
+        // insert() requires an owned key — allocation is acceptable here
+        // because inserts are on the cold path (cache miss → source query).
         let cache_key = self.make_key(key);
         self.cache.insert(cache_key, value);
     }
 
     fn invalidate(&self, key: &[u8]) {
-        let cache_key = self.make_key(key);
-        self.cache.remove(&cache_key);
+        let ref_key = LookupCacheKeyRef {
+            table_id: self.table_id,
+            key,
+        };
+        self.cache.remove(&ref_key);
     }
 
     fn len(&self) -> usize {

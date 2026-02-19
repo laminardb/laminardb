@@ -14,7 +14,6 @@ use async_trait::async_trait;
 use rdkafka::consumer::{Consumer, StreamConsumer};
 use rdkafka::message::Message;
 use rdkafka::ClientConfig;
-use tokio::sync::Mutex;
 use tracing::{debug, info, warn};
 
 use crate::checkpoint::SourceCheckpoint;
@@ -72,7 +71,7 @@ pub struct KafkaSource {
     /// Consumer group rebalance tracking.
     rebalance_state: RebalanceState,
     /// Optional Schema Registry client (shared with Avro deserializer).
-    schema_registry: Option<Arc<Mutex<SchemaRegistryClient>>>,
+    schema_registry: Option<Arc<SchemaRegistryClient>>,
     /// Last time offsets were committed to Kafka.
     last_commit_time: Instant,
 }
@@ -124,9 +123,9 @@ impl KafkaSource {
         config: KafkaSourceConfig,
         sr_client: SchemaRegistryClient,
     ) -> Self {
-        let sr = Arc::new(Mutex::new(sr_client));
+        let sr = Arc::new(sr_client);
         let deserializer: Box<dyn RecordDeserializer> = if config.format == Format::Avro {
-            Box::new(AvroDeserializer::with_schema_registry(sr.clone()))
+            Box::new(AvroDeserializer::with_schema_registry(Arc::clone(&sr)))
         } else {
             select_deserializer(config.format)
         };

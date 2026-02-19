@@ -12,7 +12,6 @@ use arrow_avro::schema::FingerprintStrategy;
 use arrow_avro::writer::format::AvroSoeFormat;
 use arrow_avro::writer::WriterBuilder;
 use arrow_schema::SchemaRef;
-use tokio::sync::Mutex;
 
 use crate::error::SerdeError;
 use crate::kafka::schema_registry::SchemaRegistryClient;
@@ -34,7 +33,7 @@ pub struct AvroSerializer {
     /// Arrow schema for the records being serialized.
     schema: SchemaRef,
     /// Optional Schema Registry client for schema registration.
-    schema_registry: Option<Arc<Mutex<SchemaRegistryClient>>>,
+    schema_registry: Option<Arc<SchemaRegistryClient>>,
 }
 
 impl AvroSerializer {
@@ -58,7 +57,7 @@ impl AvroSerializer {
     pub fn with_schema_registry(
         schema: SchemaRef,
         schema_id: u32,
-        registry: Arc<Mutex<SchemaRegistryClient>>,
+        registry: Arc<SchemaRegistryClient>,
     ) -> Self {
         Self {
             schema_id,

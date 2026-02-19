@@ -14,7 +14,6 @@ use async_trait::async_trait;
 use rdkafka::message::OwnedHeaders;
 use rdkafka::producer::{FutureProducer, FutureRecord, Producer};
 use rdkafka::ClientConfig;
-use tokio::sync::Mutex;
 use tracing::{debug, info, warn};
 
 use crate::config::{ConnectorConfig, ConnectorState};
@@ -70,7 +69,7 @@ pub struct KafkaSink {
     /// Arrow schema for input batches.
     schema: SchemaRef,
     /// Optional Schema Registry client.
-    schema_registry: Option<Arc<Mutex<SchemaRegistryClient>>>,
+    schema_registry: Option<Arc<SchemaRegistryClient>>,
 }
 
 impl KafkaSink {
@@ -103,14 +102,14 @@ impl KafkaSink {
         config: KafkaSinkConfig,
         sr_client: SchemaRegistryClient,
     ) -> Self {
-        let sr = Arc::new(Mutex::new(sr_client));
+        let sr = Arc::new(sr_client);
         let serializer: Box<dyn RecordSerializer> = if config.format == Format::Avro {
             // Schema ID 0 as placeholder — will be updated during open()
             // after schema registration with the registry.
             Box::new(AvroSerializer::with_schema_registry(
                 schema.clone(),
                 0,
-                sr.clone(),
+                Arc::clone(&sr),
             ))
         } else {
             select_serializer(config.format, &schema)
@@ -320,10 +319,10 @@ impl SinkConnector for KafkaSink {
         // Initialize Schema Registry client if configured.
         if let Some(ref url) = self.config.schema_registry_url {
             if self.schema_registry.is_none() {
-                self.schema_registry = Some(Arc::new(Mutex::new(SchemaRegistryClient::new(
+                self.schema_registry = Some(Arc::new(SchemaRegistryClient::new(
                     url,
                     self.config.schema_registry_auth.clone(),
-                ))));
+                )));
             }
         }
 

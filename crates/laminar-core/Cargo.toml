@@ -38,6 +38,7 @@ crossbeam = { workspace = true }
 parking_lot = { workspace = true }
 bytes = { workspace = true }
 foyer = { workspace = true }
+equivalent = "1"
 memmap2 = { workspace = true }
 bumpalo = { workspace = true }
 uuid = { workspace = true }

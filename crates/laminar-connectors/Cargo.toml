@@ -36,6 +36,7 @@ uuid = { workspace = true }
 
 # Bytes (for cache value types)
 bytes = { workspace = true }
+foyer = { workspace = true }
 
 # Common
 tokio = { workspace = true }
