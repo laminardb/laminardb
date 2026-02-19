@@ -7,7 +7,7 @@
 //!
 //! - [`cross_partition`]: Concurrent partial aggregate store backed by `papaya::HashMap`
 
-/// Lock-free cross-partition aggregate store (F-XAGG-001).
+/// Lock-free cross-partition aggregate store.
 pub mod cross_partition;
 
 pub use cross_partition::CrossPartitionAggregateStore;

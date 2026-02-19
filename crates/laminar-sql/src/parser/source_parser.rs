@@ -428,7 +428,7 @@ mod tests {
         assert!(matches!(source.columns[1].data_type, DataType::Real));
     }
 
-    // ── FROM connector tests (F-SQL-001) ────────────────────────────
+    // ── FROM connector tests ────────────────────────────
 
     #[test]
     fn test_from_kafka_connector() {

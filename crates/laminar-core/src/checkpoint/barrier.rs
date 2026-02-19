@@ -214,14 +214,29 @@ impl CheckpointBarrierInjector {
     /// Trigger a new checkpoint barrier.
     ///
     /// The next [`BarrierPollHandle::poll`] call on any source will
-    /// observe this barrier and return it.
+    /// observe this barrier and return it. If a previous barrier has
+    /// not been consumed, it is superseded — this is intentional for
+    /// the Chandy-Lamport protocol where only the latest checkpoint
+    /// matters.
     ///
     /// # Arguments
     ///
-    /// * `checkpoint_id` - Unique checkpoint ID (truncated to 32 bits)
-    /// * `flags` - Barrier flags (truncated to 32 bits)
+    /// * `checkpoint_id` - Unique checkpoint ID (must fit in 32 bits)
+    /// * `barrier_flags` - Barrier flags (must fit in 32 bits)
+    ///
+    /// # Panics
+    ///
+    /// Debug-asserts that `checkpoint_id` and `barrier_flags` fit in u32.
     #[allow(clippy::cast_possible_truncation)]
     pub fn trigger(&self, checkpoint_id: u64, barrier_flags: u64) {
+        debug_assert!(
+            u32::try_from(checkpoint_id).is_ok(),
+            "checkpoint_id {checkpoint_id} exceeds u32::MAX"
+        );
+        debug_assert!(
+            u32::try_from(barrier_flags).is_ok(),
+            "barrier_flags {barrier_flags:#x} exceeds u32::MAX"
+        );
         let packed = pack_barrier_cmd(checkpoint_id as u32, barrier_flags as u32);
         self.cmd.store(packed, Ordering::Release);
         self.epoch.fetch_add(1, Ordering::Relaxed);
@@ -254,8 +269,14 @@ impl BarrierPollHandle {
     /// Poll for a pending barrier.
     ///
     /// Returns `Some(CheckpointBarrier)` if a barrier is pending and
-    /// this call successfully claimed it (exactly-once delivery).
-    /// Returns `None` if no barrier is pending.
+    /// this call successfully claimed it (exactly-once delivery across
+    /// handles sharing the same injector). Returns `None` if no barrier
+    /// is pending or another handle already claimed it.
+    ///
+    /// The `epoch` parameter is supplied by the caller (typically the
+    /// source operator's current epoch) and is embedded in the returned
+    /// barrier. The injector does not encode the epoch in the atomic
+    /// command word — only checkpoint ID and flags are packed.
     ///
     /// ## Performance
     ///

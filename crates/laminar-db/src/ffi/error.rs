@@ -9,7 +9,7 @@ use std::ptr;
 
 use crate::api::ApiError;
 
-// Error code constants matching F-FFI-002 spec
+// Error code constants
 
 /// Success return code.
 pub const LAMINAR_OK: i32 = 0;

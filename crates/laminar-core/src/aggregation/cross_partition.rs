@@ -1,4 +1,4 @@
-//! Cross-partition aggregate store backed by `papaya::HashMap` (F-XAGG-001).
+//! Cross-partition aggregate store backed by `papaya::HashMap`.
 //!
 //! In a partition-parallel system, each partition computes partial aggregates
 //! independently. The [`CrossPartitionAggregateStore`] provides a lock-free
@@ -86,9 +86,11 @@ impl CrossPartitionAggregateStore {
     pub fn collect_partials(&self, group_key: &[u8]) -> Vec<(u32, Bytes)> {
         let guard = self.map.guard();
         let mut result = Vec::new();
+        // Single allocation; clone() inside the loop is a ref-count bump (~2ns)
+        let group_bytes = Bytes::copy_from_slice(group_key);
         for partition_id in 0..self.num_partitions {
             let key = CompositeKey {
-                group_key: Bytes::copy_from_slice(group_key),
+                group_key: group_bytes.clone(),
                 partition_id,
             };
             if let Some(partial) = self.map.get(&key, &guard) {
@@ -101,9 +103,10 @@ impl CrossPartitionAggregateStore {
     /// Remove all partials for a group key.
     pub fn remove_group(&self, group_key: &[u8]) {
         let guard = self.map.guard();
+        let group_bytes = Bytes::copy_from_slice(group_key);
         for partition_id in 0..self.num_partitions {
             let key = CompositeKey {
-                group_key: Bytes::copy_from_slice(group_key),
+                group_key: group_bytes.clone(),
                 partition_id,
             };
             self.map.remove(&key, &guard);
@@ -129,11 +132,9 @@ impl CrossPartitionAggregateStore {
     }
 }
 
-// SAFETY: papaya::HashMap is Send + Sync, Bytes is Send + Sync.
-// The CompositeKey contains only Bytes (Send+Sync) and u32 (Send+Sync).
-unsafe impl Send for CrossPartitionAggregateStore {}
-// SAFETY: same reasoning — all fields are Sync.
-unsafe impl Sync for CrossPartitionAggregateStore {}
+// papaya::HashMap<K, V> is Send + Sync when K and V are Send + Sync.
+// CompositeKey contains Bytes (Send+Sync) and u32 (Send+Sync),
+// so the auto-derived impls apply. No manual unsafe needed.
 
 #[cfg(test)]
 mod tests {

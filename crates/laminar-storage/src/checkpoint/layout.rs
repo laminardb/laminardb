@@ -1,4 +1,4 @@
-//! Object-store checkpoint layout for distributed checkpoints (F-DCKP-003).
+//! Object-store checkpoint layout for distributed checkpoints.
 //!
 //! Defines the directory structure, manifest format, and path conventions
 //! for checkpoints stored in object stores (S3, GCS, Azure Blob, local FS).

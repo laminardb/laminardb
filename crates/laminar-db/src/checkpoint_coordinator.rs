@@ -1,4 +1,4 @@
-//! Unified checkpoint coordinator (F-CKP-003).
+//! Unified checkpoint coordinator.
 //!
 //! Single orchestrator that replaces `StreamCheckpointManager`,
 //! `PipelineCheckpointManager`, and the persistence side of `DagRecoveryManager`.
@@ -156,11 +156,11 @@ pub struct CheckpointCoordinator {
     checkpoints_completed: u64,
     checkpoints_failed: u64,
     last_checkpoint_duration: Option<Duration>,
-    /// Per-core WAL manager for epoch barriers and truncation (F-CKP-006).
+    /// Per-core WAL manager for epoch barriers and truncation.
     wal_manager: Option<PerCoreWalManager>,
-    /// Changelog drainers to flush before checkpointing (F-CKP-006).
+    /// Changelog drainers to flush before checkpointing.
     changelog_drainers: Vec<ChangelogDrainer>,
-    /// Shared counters for observability (F-CKP-009).
+    /// Shared counters for observability.
     counters: Option<Arc<PipelineCounters>>,
 }
 
@@ -231,7 +231,7 @@ impl CheckpointCoordinator {
         });
     }
 
-    // ── F-CKP-009: Observability ──
+    // ── Observability ──
 
     /// Sets the shared pipeline counters for checkpoint metrics emission.
     ///
@@ -259,7 +259,7 @@ impl CheckpointCoordinator {
         }
     }
 
-    // ── F-CKP-006: WAL coordination ──
+    // ── WAL coordination ──
 
     /// Registers a per-core WAL manager for checkpoint coordination.
     ///
@@ -1226,7 +1226,7 @@ mod tests {
         assert!(debug.contains("epoch: 1"));
     }
 
-    // ── F-CKP-004: operator state persistence tests ──
+    // ── Operator state persistence tests ──
 
     #[test]
     fn test_dag_snapshot_to_manifest_operators() {
@@ -1323,7 +1323,7 @@ mod tests {
         assert!(dag_states.contains_key(&laminar_core::dag::topology::NodeId(42)));
     }
 
-    // ── F-CKP-006: WAL checkpoint coordination tests ──
+    // ── WAL checkpoint coordination tests ──
 
     #[test]
     fn test_prepare_wal_no_wal_manager() {
@@ -1518,7 +1518,7 @@ mod tests {
         assert!(debug.contains("changelog_drainers: 0"));
     }
 
-    // ── F-CKP-009: Checkpoint observability tests ──
+    // ── Checkpoint observability tests ──
 
     #[tokio::test]
     async fn test_checkpoint_emits_metrics_on_success() {

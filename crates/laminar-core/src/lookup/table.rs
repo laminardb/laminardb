@@ -1,4 +1,4 @@
-//! Lookup table trait and configuration types (F-LOOKUP-001).
+//! Lookup table trait and configuration types.
 //!
 //! A [`LookupTable`] provides synchronous key-value access for enriching
 //! stream events via lookup joins. The trait is `Send + Sync` so tables

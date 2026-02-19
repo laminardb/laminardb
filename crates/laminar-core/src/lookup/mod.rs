@@ -10,8 +10,12 @@
 //! - [`predicate`]: Filter predicates for source pushdown
 //! - [`table`]: `LookupTable` trait, `LookupResult`, strategy/config types
 
+/// foyer-backed in-memory cache for lookup tables.
+pub mod foyer_cache;
 pub mod predicate;
-/// Lookup table trait and configuration (F-LOOKUP-001).
+/// Async lookup source trait for Phase 6.
+pub mod source;
+/// Lookup table trait and configuration.
 pub mod table;
 
 // Re-export commonly used types
@@ -19,4 +23,6 @@ pub use predicate::{
     Predicate, ScalarValue, SourceCapabilities, SplitPredicates, predicate_to_sql,
     split_predicates,
 };
+pub use foyer_cache::{FoyerMemoryCache, FoyerMemoryCacheConfig, LookupCacheKey};
+pub use source::{ColumnId, LookupError, LookupSource, LookupSourceCapabilities, PushdownAdapter};
 pub use table::{LookupResult, LookupStrategy, LookupTable, LookupTableConfig};

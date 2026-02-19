@@ -1,4 +1,4 @@
-//! Async checkpoint persistence via object stores (F-DCKP-004).
+//! Async checkpoint persistence via object stores.
 //!
 //! The [`Checkpointer`] trait abstracts checkpoint I/O so that the
 //! checkpoint coordinator doesn't need to know whether state is persisted
@@ -343,10 +343,11 @@ impl Checkpointer for ObjectStoreCheckpointer {
             let meta = meta?;
             let path_str = meta.location.to_string();
             if path_str.ends_with("manifest.json") {
-                // Extract checkpoint ID from path: .../UUID/manifest.json
+                // Extract checkpoint ID from path: {prefix}{UUID}manifest.json
                 if let Some(id_str) = path_str
-                    .strip_suffix("/manifest.json")
+                    .strip_suffix("manifest.json")
                     .and_then(|s: &str| s.rsplit('/').next())
+                    .filter(|s| !s.is_empty())
                 {
                     if let Ok(uuid) = uuid::Uuid::parse_str(id_str) {
                         ids.push(CheckpointId::from_uuid(uuid));

@@ -44,7 +44,10 @@ impl fmt::Display for ScalarValue {
             Self::Bool(v) => write!(f, "{v}"),
             Self::Int64(v) => write!(f, "{v}"),
             Self::Float64(v) => write!(f, "{v}"),
-            Self::Utf8(v) => write!(f, "'{v}'"),
+            Self::Utf8(v) => {
+                // Escape single quotes to prevent SQL injection
+                write!(f, "'{}'", v.replace('\'', "''"))
+            }
             Self::Binary(v) => write!(f, "X'{}'", hex_encode(v)),
             Self::Timestamp(us) => write!(f, "TIMESTAMP '{us}'"),
         }
@@ -193,9 +196,12 @@ pub fn split_predicates(
 
     for pred in predicates {
         let can_push = match &pred {
-            Predicate::Eq { column, .. } | Predicate::NotEq { column, .. } => {
+            Predicate::Eq { column, .. } => {
                 capabilities.eq_columns.iter().any(|c| c == column)
             }
+            // NotEq cannot use equality indexes — a != b requires a full
+            // scan in most databases. Always evaluate locally.
+            Predicate::NotEq { .. } => false,
             Predicate::Lt { column, .. }
             | Predicate::LtEq { column, .. }
             | Predicate::Gt { column, .. }
@@ -341,6 +347,55 @@ mod tests {
         let split = split_predicates(predicates, &capabilities);
         assert_eq!(split.pushable.len(), 3); // id=, created_at>, status IN
         assert_eq!(split.local.len(), 2); // IS NULL (no null support), region=
+    }
+
+    #[test]
+    fn test_scalar_value_display_escapes_single_quotes() {
+        // SQL injection vector: O'Brien must become O''Brien
+        assert_eq!(
+            ScalarValue::Utf8("O'Brien".into()).to_string(),
+            "'O''Brien'"
+        );
+        // Double quotes are not special in SQL string literals
+        assert_eq!(
+            ScalarValue::Utf8(r#"say "hello""#.into()).to_string(),
+            r#"'say "hello"'"#
+        );
+        // Multiple consecutive single quotes
+        assert_eq!(
+            ScalarValue::Utf8("it''s".into()).to_string(),
+            "'it''''s'"
+        );
+        // Empty string
+        assert_eq!(ScalarValue::Utf8(String::new()).to_string(), "''");
+    }
+
+    #[test]
+    fn test_not_eq_never_pushed_down() {
+        let capabilities = SourceCapabilities {
+            eq_columns: vec!["id".into()],
+            range_columns: vec![],
+            in_columns: vec![],
+            supports_null_check: false,
+        };
+
+        let predicates = vec![
+            Predicate::Eq {
+                column: "id".into(),
+                value: ScalarValue::Int64(1),
+            },
+            Predicate::NotEq {
+                column: "id".into(),
+                value: ScalarValue::Int64(2),
+            },
+        ];
+
+        let split = split_predicates(predicates, &capabilities);
+        // Eq should be pushed, NotEq should stay local
+        assert_eq!(split.pushable.len(), 1);
+        assert!(matches!(&split.pushable[0], Predicate::Eq { .. }));
+        assert_eq!(split.local.len(), 1);
+        assert!(matches!(&split.local[0], Predicate::NotEq { .. }));
     }
 
     #[test]

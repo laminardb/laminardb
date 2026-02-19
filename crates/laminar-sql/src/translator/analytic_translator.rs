@@ -76,7 +76,7 @@ impl AnalyticWindowConfig {
     }
 }
 
-// --- Window Frame operator configuration (F-SQL-006) ---
+// --- Window Frame operator configuration ---
 
 use crate::parser::analytic_parser::{
     FrameBound, FrameUnits, WindowFrameAnalysis, WindowFrameFunction,
@@ -255,7 +255,7 @@ mod tests {
         assert_eq!(config.max_partitions, DEFAULT_MAX_PARTITIONS);
     }
 
-    // --- Window Frame translator tests (F-SQL-006) ---
+    // --- Window Frame translator tests ---
 
     use crate::parser::analytic_parser::WindowFrameInfo;
 

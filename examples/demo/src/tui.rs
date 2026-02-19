@@ -70,7 +70,7 @@ fn draw_header(f: &mut Frame, app: &App, area: Rect) {
         ),
     ];
 
-    // Pipeline watermark from F-OBS-001 metrics
+    // Pipeline watermark from metrics
     if let Some(ref m) = app.pipeline_metrics {
         if m.pipeline_watermark != i64::MIN {
             spans.push(Span::styled(

@@ -8,9 +8,9 @@
 //!   cross-thread barrier injection
 //! - [`alignment`]: Multi-input barrier alignment with buffering
 
-/// Barrier alignment for multi-input operators (F-DCKP-002).
+/// Barrier alignment for multi-input operators.
 pub mod alignment;
-/// Checkpoint barrier types and cross-thread injection (F-DCKP-001).
+/// Checkpoint barrier types and cross-thread injection.
 pub mod barrier;
 
 // Re-export key types

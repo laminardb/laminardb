@@ -1,4 +1,4 @@
-//! End-to-end checkpoint recovery tests (F-CKP-008).
+//! End-to-end checkpoint recovery tests.
 //!
 //! Tests the full checkpoint → shutdown → restart → recovery cycle
 //! using the unified checkpoint system.

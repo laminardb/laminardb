@@ -81,18 +81,20 @@ fn bench_state_put(c: &mut Criterion) {
     for size in [100, 1_000, 10_000] {
         group.throughput(Throughput::Elements(1));
 
-        // Insert into existing store
+        // Insert into existing store (pre-allocate keys to avoid measuring format!)
         group.bench_with_input(BenchmarkId::new("insert", size), &size, |b, &size| {
-            let mut store = populate_store(size);
-            let mut counter = size;
-            b.iter(|| {
-                let key = format!("newkey:{counter:08}");
-                let value = b"newvalue";
-                store
-                    .put(black_box(key.as_bytes()), black_box(value))
-                    .unwrap();
-                counter += 1;
-            })
+            b.iter_batched(
+                || {
+                    let store = populate_store(size);
+                    let key = format!("newkey:{size:08}");
+                    (store, key)
+                },
+                |(mut store, key)| {
+                    store.put(black_box(key.as_bytes()), black_box(b"newvalue")).unwrap();
+                    black_box(store)
+                },
+                criterion::BatchSize::SmallInput,
+            )
         });
 
         // Update existing key
@@ -193,10 +195,15 @@ fn bench_snapshot(c: &mut Criterion) {
             BenchmarkId::new("restore", size),
             &snapshot,
             |b, snapshot| {
-                let mut store = InMemoryStore::new();
-                b.iter(|| {
-                    store.restore(black_box(snapshot.clone()));
-                })
+                b.iter_batched(
+                    || snapshot.clone(),
+                    |snap| {
+                        let mut store = InMemoryStore::new();
+                        store.restore(black_box(snap));
+                        black_box(store)
+                    },
+                    criterion::BatchSize::SmallInput,
+                )
             },
         );
 
@@ -513,7 +520,7 @@ fn bench_store_comparison(c: &mut Criterion) {
     group.finish();
 }
 
-// ── AHashMapStore benchmarks (F-PERF-001) ──
+// ── AHashMapStore benchmarks ──
 
 /// Pre-populate an AHashMapStore with N entries
 fn populate_ahash_store(n: usize) -> AHashMapStore {

@@ -1003,7 +1003,7 @@ mod tests {
         assert_eq!(analysis.right_table, "quotes");
     }
 
-    // -- Multi-way JOIN tests (F-SQL-005) --
+    // -- Multi-way JOIN tests --
 
     #[test]
     fn test_multi_join_single_backward_compat() {

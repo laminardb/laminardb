@@ -30,10 +30,10 @@ The Constellation Architecture extends LaminarDB from an embedded single-process
 
 | Phase | Total | Draft | Superseded | In Progress | Done |
 |-------|-------|-------|------------|-------------|------|
-| Phase 6a — Partition-Parallel Embedded | 27 | 23 | 2 | 0 | 0 |
+| Phase 6a — Partition-Parallel Embedded | 27 | 8 | 2 | 0 | 15 |
 | Phase 6b — Constellation Foundation | 14 | 14 | 0 | 0 | 0 |
 | Phase 6c — Production Hardening | 10 | 9 | 1 | 0 | 0 |
-| **Total** | **51** | **46** | **3** | **0** | **0** |
+| **Total** | **51** | **31** | **3** | **0** | **15** |
 
 ## Key Dependencies
 
@@ -58,8 +58,8 @@ See [DEPENDENCIES.md](DEPENDENCIES.md) for the full project dependency graph.
 
 | ID | Feature | Status | Priority | Effort | Spec |
 |----|---------|--------|----------|--------|------|
-| F-STATE-001 | Revised StateStore Trait | 📝 | P0 | M | [Link](state/F-STATE-001-state-store-trait.md) |
-| F-STATE-002 | InMemoryStateStore (FxHashMap/BTreeMap) | 📝 | P0 | S | [Link](state/F-STATE-002-inmemory-state-store.md) |
+| F-STATE-001 | Revised StateStore Trait | ✅ | P0 | M | [Link](state/F-STATE-001-state-store-trait.md) |
+| F-STATE-002 | InMemoryStateStore (AHashMap/BTreeSet) | ✅ | P0 | S | [Link](state/F-STATE-002-inmemory-state-store.md) |
 | F-STATE-003 | ~~MmapStateStore~~ | ❌ | — | — | [Link](state/F-STATE-003-mmap-state-store.md) |
 | F-STATE-004 | ~~Pluggable Snapshot Strategies~~ | ❌ | — | — | [Link](state/F-STATE-004-pluggable-snapshots.md) |
 
@@ -67,22 +67,22 @@ See [DEPENDENCIES.md](DEPENDENCIES.md) for the full project dependency graph.
 
 | ID | Feature | Status | Priority | Effort | Spec |
 |----|---------|--------|----------|--------|------|
-| F-DCKP-001 | Checkpoint Barrier Protocol | 📝 | P0 | M | [Link](checkpoint/F-DCKP-001-barrier-protocol.md) |
-| F-DCKP-002 | Barrier Alignment | 📝 | P0 | M | [Link](checkpoint/F-DCKP-002-barrier-alignment.md) |
-| F-DCKP-003 | Object Store Checkpoint Layout | 📝 | P0 | S | [Link](checkpoint/F-DCKP-003-object-store-layout.md) |
-| F-DCKP-004 | ObjectStoreCheckpointer | 📝 | P0 | M | [Link](checkpoint/F-DCKP-004-object-store-checkpointer.md) |
-| F-DCKP-005 | Recovery Manager | 📝 | P0 | L | [Link](checkpoint/F-DCKP-005-recovery-manager.md) |
+| F-DCKP-001 | Checkpoint Barrier Protocol | ✅ | P0 | M | [Link](checkpoint/F-DCKP-001-barrier-protocol.md) |
+| F-DCKP-002 | Barrier Alignment | ✅ | P0 | M | [Link](checkpoint/F-DCKP-002-barrier-alignment.md) |
+| F-DCKP-003 | Object Store Checkpoint Layout | ✅ | P0 | S | [Link](checkpoint/F-DCKP-003-object-store-layout.md) |
+| F-DCKP-004 | ObjectStoreCheckpointer | ✅ | P0 | M | [Link](checkpoint/F-DCKP-004-object-store-checkpointer.md) |
+| F-DCKP-005 | Recovery Manager | ✅ | P0 | L | [Link](checkpoint/F-DCKP-005-recovery-manager.md) |
 
 ### Lookup Tables
 
 | ID | Feature | Status | Priority | Effort | Spec |
 |----|---------|--------|----------|--------|------|
-| F-LOOKUP-001 | LookupTable Trait & Strategy | 📝 | P0 | M | [Link](lookup/F-LOOKUP-001-lookup-table-trait.md) |
-| F-LOOKUP-002 | LookupSource Trait | 📝 | P0 | M | [Link](lookup/F-LOOKUP-002-lookup-source-trait.md) |
-| F-LOOKUP-003 | Predicate Types | 📝 | P0 | S | [Link](lookup/F-LOOKUP-003-predicate-types.md) |
-| F-LOOKUP-004 | foyer In-Memory Cache (Ring 0) | 📝 | P0 | M | [Link](lookup/F-LOOKUP-004-foyer-memory-cache.md) |
+| F-LOOKUP-001 | LookupTable Trait & Strategy | ✅ | P0 | M | [Link](lookup/F-LOOKUP-001-lookup-table-trait.md) |
+| F-LOOKUP-002 | LookupSource Trait | ✅ | P0 | M | [Link](lookup/F-LOOKUP-002-lookup-source-trait.md) |
+| F-LOOKUP-003 | Predicate Types | ✅ | P0 | S | [Link](lookup/F-LOOKUP-003-predicate-types.md) |
+| F-LOOKUP-004 | foyer In-Memory Cache (Ring 0) | ✅ | P0 | M | [Link](lookup/F-LOOKUP-004-foyer-memory-cache.md) |
 | F-LOOKUP-005 | foyer Hybrid Cache (Ring 1) | 📝 | P1 | M | [Link](lookup/F-LOOKUP-005-foyer-hybrid-cache.md) |
-| F-LOOKUP-006 | CDC-to-Cache Adapter | 📝 | P0 | S | [Link](lookup/F-LOOKUP-006-cdc-cache-adapter.md) |
+| F-LOOKUP-006 | CDC-to-Cache Adapter | ✅ | P0 | S | [Link](lookup/F-LOOKUP-006-cdc-cache-adapter.md) |
 | F-LOOKUP-007 | PostgresLookupSource | 📝 | P1 | M | [Link](lookup/F-LOOKUP-007-postgres-lookup-source.md) |
 | F-LOOKUP-008 | ParquetLookupSource | 📝 | P2 | M | [Link](lookup/F-LOOKUP-008-parquet-lookup-source.md) |
 | F-LOOKUP-010 | Remove RocksDB Dependency | 📝 | P0 | S | [Link](lookup/F-LOOKUP-010-rocksdb-removal.md) |
@@ -97,13 +97,13 @@ See [DEPENDENCIES.md](DEPENDENCIES.md) for the full project dependency graph.
 
 | ID | Feature | Status | Priority | Effort | Spec |
 |----|---------|--------|----------|--------|------|
-| F-PROFILE-001 | Deployment Profiles | 📝 | P0 | M | [Link](profiles/F-PROFILE-001-deployment-profiles.md) |
+| F-PROFILE-001 | Deployment Profiles | ✅ | P0 | M | [Link](profiles/F-PROFILE-001-deployment-profiles.md) |
 
 ### Cross-Partition Aggregation
 
 | ID | Feature | Status | Priority | Effort | Spec |
 |----|---------|--------|----------|--------|------|
-| F-XAGG-001 | Cross-Partition Lock-Free HashMap | 📝 | P1 | M | [Link](aggregation/F-XAGG-001-cross-partition-hashmap.md) |
+| F-XAGG-001 | Cross-Partition Lock-Free HashMap | ✅ | P1 | M | [Link](aggregation/F-XAGG-001-cross-partition-hashmap.md) |
 
 ### Exactly-Once (Source Layer)
 
@@ -123,7 +123,7 @@ See [DEPENDENCIES.md](DEPENDENCIES.md) for the full project dependency graph.
 
 | ID | Feature | Status | Priority | Effort | Spec |
 |----|---------|--------|----------|--------|------|
-| F-PERF-001 | StateStore Microbenchmarks | 📝 | P0 | S | [Link](benchmarks/F-PERF-001-state-store-benchmarks.md) |
+| F-PERF-001 | StateStore Microbenchmarks | ✅ | P0 | S | [Link](benchmarks/F-PERF-001-state-store-benchmarks.md) |
 | F-PERF-002 | Cache Hit/Miss Ratio Benchmarks | 📝 | P1 | S | [Link](benchmarks/F-PERF-002-cache-benchmarks.md) |
 | F-PERF-003 | Checkpoint Cycle Benchmark | 📝 | P1 | S | [Link](benchmarks/F-PERF-003-checkpoint-cycle-benchmark.md) |
 | F-PERF-005 | Lookup Join Throughput | 📝 | P1 | S | [Link](benchmarks/F-PERF-005-lookup-join-throughput.md) |

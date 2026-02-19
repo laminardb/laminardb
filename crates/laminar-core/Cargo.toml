@@ -37,6 +37,7 @@ xorf = { workspace = true }
 crossbeam = { workspace = true }
 parking_lot = { workspace = true }
 bytes = { workspace = true }
+foyer = { workspace = true }
 memmap2 = { workspace = true }
 bumpalo = { workspace = true }
 uuid = { workspace = true }

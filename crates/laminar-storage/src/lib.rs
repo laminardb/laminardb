@@ -25,13 +25,13 @@ pub mod wal_state_store;
 /// Checkpointing for fast recovery
 pub mod checkpoint;
 
-/// Unified checkpoint manifest types (F-CKP-001)
+/// Unified checkpoint manifest types
 pub mod checkpoint_manifest;
 
-/// Checkpoint persistence trait and filesystem store (F-CKP-001)
+/// Checkpoint persistence trait and filesystem store
 pub mod checkpoint_store;
 
-/// Ring 1 changelog drainer (F-CKP-005)
+/// Ring 1 changelog drainer
 pub mod changelog_drainer;
 
 /// Incremental checkpointing (F022) - Three-tier architecture with RocksDB backend

@@ -257,7 +257,7 @@ fn extract_column_name(expr: &Expr) -> Option<String> {
     }
 }
 
-// --- Window Frame types (F-SQL-006) ---
+// --- Window Frame types ---
 
 /// Types of aggregate functions used with window frames.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
@@ -661,7 +661,7 @@ mod tests {
         assert_eq!(analysis.max_offset(), 5);
     }
 
-    // --- Window Frame tests (F-SQL-006) ---
+    // --- Window Frame tests ---
 
     #[test]
     fn test_frame_rows_preceding_current() {

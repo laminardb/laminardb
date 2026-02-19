@@ -9,7 +9,7 @@
 //!
 //! - **Ring 0**: `NotificationRef` — zero-allocation, cache-line-aligned notification
 //! - **Ring 1**: `ChangeEvent` — data delivery with `Arc<RecordBatch>` payloads
-//! - **Ring 2**: Subscription lifecycle management (future F-SUB-003+)
+//! - **Ring 2**: Subscription lifecycle management
 //!
 //! ## Types
 //!

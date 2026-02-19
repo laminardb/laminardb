@@ -34,6 +34,9 @@ deltalake = { version = ">=0.30", git = "https://github.com/delta-io/delta-rs", 
 url = { version = "2", optional = true }
 uuid = { workspace = true }
 
+# Bytes (for cache value types)
+bytes = { workspace = true }
+
 # Common
 tokio = { workspace = true }
 async-trait = { workspace = true }

@@ -50,6 +50,7 @@ bumpalo = "3.19"  # Arena allocator
 uuid = { version = "1.19", features = ["v4", "v7", "serde"] }  # Unique IDs
 ahash = "0.8"  # Fast hashing for state stores
 papaya = "0.2"  # Lock-free concurrent HashMap
+foyer = "0.20"  # High-performance in-memory cache (S3-FIFO eviction)
 sha2 = "0.10"  # SHA-256 for checkpoint integrity
 backoff = { version = "0.4", features = ["tokio"] }  # Exponential backoff retry
 

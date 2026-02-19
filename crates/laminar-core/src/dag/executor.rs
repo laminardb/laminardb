@@ -1,9 +1,8 @@
 //! Ring 0 DAG executor for event processing.
 //!
 //! [`DagExecutor`] processes events through a finalized [`StreamingDag`] in
-//! topological order. It uses the pre-computed [`RoutingTable`] (F-DAG-002)
-//! for O(1) dispatch and integrates with the [`Operator`] trait for operator
-//! invocation.
+//! topological order. It uses the pre-computed [`RoutingTable`] for O(1)
+//! dispatch and integrates with the [`Operator`] trait for operator invocation.
 //!
 //! # Architecture
 //!

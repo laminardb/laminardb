@@ -684,10 +684,10 @@ pub enum StateError {
 
 mod mmap;
 
-/// AHashMap-backed state store with O(1) lookups and zero-copy reads (F-STATE-002).
+/// AHashMap-backed state store with O(1) lookups and zero-copy reads.
 pub mod ahash_store;
 
-/// Changelog-aware state store wrapper (F-CKP-005).
+/// Changelog-aware state store wrapper.
 pub mod changelog_aware;
 
 // Re-export main types

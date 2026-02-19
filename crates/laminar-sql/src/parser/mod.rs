@@ -934,7 +934,7 @@ mod tests {
         }
     }
 
-    // ── CREATE STREAM tests (F-SQL-003) ─────────────────────────────
+    // ── CREATE STREAM tests ─────────────────────────────
 
     #[test]
     fn test_parse_create_stream() {

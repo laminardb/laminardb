@@ -11,10 +11,10 @@
 | Phase 3 | 77 | 9 | 0 | 0 | 68 | 0 |
 | Phase 4 | 11 | 11 | 0 | 0 | 0 | 0 |
 | Phase 5 | 10 | 10 | 0 | 0 | 0 | 0 |
-| Phase 6a | 27 | 25 | 0 | 0 | 0 | 2 |
+| Phase 6a | 27 | 15 | 0 | 0 | 10 | 2 |
 | Phase 6b | 14 | 14 | 0 | 0 | 0 | 0 |
 | Phase 6c | 10 | 9 | 0 | 0 | 0 | 1 |
-| **Total** | **212** | **78** | **0** | **0** | **131** | **3** |
+| **Total** | **212** | **68** | **0** | **0** | **141** | **3** |
 
 ## Status Legend
 
@@ -336,8 +336,8 @@ See [Constellation Index](constellation/INDEX.md) for full details, dependency g
 
 | ID | Feature | Status | Spec |
 |----|---------|--------|------|
-| F-STATE-001 | Revised StateStore Trait | 📝 | [Link](constellation/state/F-STATE-001-state-store-trait.md) |
-| F-STATE-002 | InMemoryStateStore (FxHashMap/BTreeMap) | 📝 | [Link](constellation/state/F-STATE-002-inmemory-state-store.md) |
+| F-STATE-001 | Revised StateStore Trait | ✅ | [Link](constellation/state/F-STATE-001-state-store-trait.md) |
+| F-STATE-002 | InMemoryStateStore (AHashMap/BTreeSet) | ✅ | [Link](constellation/state/F-STATE-002-inmemory-state-store.md) |
 | F-STATE-003 | ~~MmapStateStore~~ | ❌ | [Link](constellation/state/F-STATE-003-mmap-state-store.md) |
 | F-STATE-004 | ~~Pluggable Snapshot Strategies~~ | ❌ | [Link](constellation/state/F-STATE-004-pluggable-snapshots.md) |
 
@@ -345,19 +345,19 @@ See [Constellation Index](constellation/INDEX.md) for full details, dependency g
 
 | ID | Feature | Status | Spec |
 |----|---------|--------|------|
-| F-DCKP-001 | Checkpoint Barrier Protocol | 📝 | [Link](constellation/checkpoint/F-DCKP-001-barrier-protocol.md) |
-| F-DCKP-002 | Barrier Alignment | 📝 | [Link](constellation/checkpoint/F-DCKP-002-barrier-alignment.md) |
-| F-DCKP-003 | Object Store Checkpoint Layout | 📝 | [Link](constellation/checkpoint/F-DCKP-003-object-store-layout.md) |
-| F-DCKP-004 | ObjectStoreCheckpointer | 📝 | [Link](constellation/checkpoint/F-DCKP-004-object-store-checkpointer.md) |
+| F-DCKP-001 | Checkpoint Barrier Protocol | ✅ | [Link](constellation/checkpoint/F-DCKP-001-barrier-protocol.md) |
+| F-DCKP-002 | Barrier Alignment | ✅ | [Link](constellation/checkpoint/F-DCKP-002-barrier-alignment.md) |
+| F-DCKP-003 | Object Store Checkpoint Layout | ✅ | [Link](constellation/checkpoint/F-DCKP-003-object-store-layout.md) |
+| F-DCKP-004 | ObjectStoreCheckpointer | ✅ | [Link](constellation/checkpoint/F-DCKP-004-object-store-checkpointer.md) |
 | F-DCKP-005 | Recovery Manager | 📝 | [Link](constellation/checkpoint/F-DCKP-005-recovery-manager.md) |
 
 #### Lookup Tables
 
 | ID | Feature | Status | Spec |
 |----|---------|--------|------|
-| F-LOOKUP-001 | LookupTable Trait & Strategy | 📝 | [Link](constellation/lookup/F-LOOKUP-001-lookup-table-trait.md) |
+| F-LOOKUP-001 | LookupTable Trait & Strategy | ✅ | [Link](constellation/lookup/F-LOOKUP-001-lookup-table-trait.md) |
 | F-LOOKUP-002 | LookupSource Trait | 📝 | [Link](constellation/lookup/F-LOOKUP-002-lookup-source-trait.md) |
-| F-LOOKUP-003 | Predicate Types | 📝 | [Link](constellation/lookup/F-LOOKUP-003-predicate-types.md) |
+| F-LOOKUP-003 | Predicate Types | ✅ | [Link](constellation/lookup/F-LOOKUP-003-predicate-types.md) |
 | F-LOOKUP-004 | foyer In-Memory Cache (Ring 0) | 📝 | [Link](constellation/lookup/F-LOOKUP-004-foyer-memory-cache.md) |
 | F-LOOKUP-005 | foyer Hybrid Cache (Ring 1) | 📝 | [Link](constellation/lookup/F-LOOKUP-005-foyer-hybrid-cache.md) |
 | F-LOOKUP-006 | CDC-to-Cache Adapter | 📝 | [Link](constellation/lookup/F-LOOKUP-006-cdc-cache-adapter.md) |
@@ -381,7 +381,7 @@ See [Constellation Index](constellation/INDEX.md) for full details, dependency g
 
 | ID | Feature | Status | Spec |
 |----|---------|--------|------|
-| F-XAGG-001 | Cross-Partition Lock-Free HashMap | 📝 | [Link](constellation/aggregation/F-XAGG-001-cross-partition-hashmap.md) |
+| F-XAGG-001 | Cross-Partition Lock-Free HashMap | ✅ | [Link](constellation/aggregation/F-XAGG-001-cross-partition-hashmap.md) |
 
 #### Exactly-Once (Source Layer)
 
@@ -401,7 +401,7 @@ See [Constellation Index](constellation/INDEX.md) for full details, dependency g
 
 | ID | Feature | Status | Spec |
 |----|---------|--------|------|
-| F-PERF-001 | StateStore Microbenchmarks | 📝 | [Link](constellation/benchmarks/F-PERF-001-state-store-benchmarks.md) |
+| F-PERF-001 | StateStore Microbenchmarks | ✅ | [Link](constellation/benchmarks/F-PERF-001-state-store-benchmarks.md) |
 | F-PERF-002 | Cache Hit/Miss Ratio Benchmarks | 📝 | [Link](constellation/benchmarks/F-PERF-002-cache-benchmarks.md) |
 | F-PERF-003 | Checkpoint Cycle Benchmark | 📝 | [Link](constellation/benchmarks/F-PERF-003-checkpoint-cycle-benchmark.md) |
 | F-PERF-005 | Lookup Join Throughput | 📝 | [Link](constellation/benchmarks/F-PERF-005-lookup-join-throughput.md) |

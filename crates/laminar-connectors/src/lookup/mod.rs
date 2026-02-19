@@ -46,6 +46,9 @@
 //! // Use with LookupJoinOperator in laminar-core
 //! ```
 
+/// CDC-to-cache adapter for lookup table refresh.
+pub mod cdc_adapter;
+
 use arrow_array::RecordBatch;
 use async_trait::async_trait;
 use rustc_hash::FxHashMap;

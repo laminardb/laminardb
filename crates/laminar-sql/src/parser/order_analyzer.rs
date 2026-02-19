@@ -492,7 +492,7 @@ mod tests {
         assert_eq!(analysis.pattern, OrderPattern::None);
     }
 
-    // ── F-SQL-003: Ranking function tests ──────────────────────────────
+    // ── Ranking function tests ──────────────────────────────
 
     #[test]
     fn test_row_number_subquery_no_outer_order() {

@@ -818,7 +818,7 @@ mod tests {
         }
     }
 
-    // -- Multi-way join planner tests (F-SQL-005) --
+    // -- Multi-way join planner tests --
 
     #[test]
     fn test_plan_single_join_produces_vec_of_one() {
@@ -893,7 +893,7 @@ mod tests {
         }
     }
 
-    // -- Window Frame planner tests (F-SQL-006) --
+    // -- Window Frame planner tests --
 
     #[test]
     fn test_plan_query_with_rows_frame() {

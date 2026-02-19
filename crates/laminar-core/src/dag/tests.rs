@@ -2227,7 +2227,7 @@ fn test_full_checkpoint_recovery_cycle() {
 }
 
 // ===========================================================================
-// F-DAG-005: SQL & MV Integration tests
+// SQL & MV Integration tests
 // ===========================================================================
 
 /// Helper: create a simple MV registry with base tables and schemas map.

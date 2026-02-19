@@ -14,7 +14,7 @@
 //!
 //! # Safety
 //!
-//! The single-writer invariant is upheld by the DAG executor (F-DAG-003),
+//! The single-writer invariant is upheld by the DAG executor,
 //! which ensures exactly one thread calls `publish()` on any given buffer.
 //! Multiple threads may call `consume()` with distinct `consumer_idx` values.
 

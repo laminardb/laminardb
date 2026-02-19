@@ -3654,7 +3654,7 @@ mod tests {
         assert_eq!(db.source_count(), 1);
     }
 
-    // ── Multi-statement execution tests (F-SQL-005) ─────────────────
+    // ── Multi-statement execution tests ─────────────────
 
     #[tokio::test]
     async fn test_multi_statement_execution() {
@@ -3685,7 +3685,7 @@ mod tests {
         assert_eq!(db.source_count(), 1);
     }
 
-    // ── Config variable substitution tests (F-SQL-006) ──────────────
+    // ── Config variable substitution tests ──────────────
 
     #[tokio::test]
     async fn test_config_var_substitution() {
@@ -3700,7 +3700,7 @@ mod tests {
         assert_eq!(db.source_count(), 1);
     }
 
-    // ── CREATE STREAM tests (F-SQL-003) ─────────────────────────────
+    // ── CREATE STREAM tests ─────────────────────────────
 
     #[tokio::test]
     async fn test_create_stream() {
@@ -4370,7 +4370,7 @@ mod tests {
         assert_eq!(find("sk").node_type, PipelineNodeType::Sink);
     }
 
-    // ── Reference Table (F-CONN-002) tests ──
+    // ── Reference Table tests ──
 
     #[tokio::test]
     async fn test_create_table_with_primary_key() {
@@ -4525,7 +4525,7 @@ mod tests {
         assert!(result.is_ok());
     }
 
-    // ── HAVING clause tests (F-SQL-004) ─────────────────────────────
+    // ── HAVING clause tests ─────────────────────────────
 
     #[tokio::test]
     async fn test_having_filters_grouped_results() {
@@ -4640,7 +4640,7 @@ mod tests {
         assert_eq!(total_rows, 2);
     }
 
-    // ── Multi-way JOIN tests (F-SQL-005) ─────────────────────────────
+    // ── Multi-way JOIN tests ─────────────────────────────
 
     #[tokio::test]
     async fn test_multi_join_two_way_lookup() {
@@ -4805,7 +4805,7 @@ mod tests {
         assert_eq!(total_rows, 2);
     }
 
-    // ── Window Frame tests (F-SQL-006) ────────────────────────────────
+    // ── Window Frame tests ────────────────────────────────
 
     #[tokio::test]
     async fn test_frame_moving_average() {
@@ -4951,7 +4951,7 @@ mod tests {
         assert_eq!(cnt_col.value(2), 2);
     }
 
-    // ── F-CONN-002B: Connector-Backed Table Population ──
+    // ── Connector-Backed Table Population ──
 
     /// Helper: create a test `RecordBatch` for table population tests.
     fn table_test_batch(ids: &[i32], symbols: &[&str]) -> RecordBatch {
@@ -5173,7 +5173,7 @@ mod tests {
         assert!(ts.lookup("instruments", "2").is_none());
     }
 
-    // ── F-CONN-002C: PARTIAL Cache Mode DDL tests ──
+    // ── PARTIAL Cache Mode DDL tests ──
 
     #[tokio::test]
     async fn test_create_table_partial_cache_mode() {
@@ -5243,7 +5243,7 @@ mod tests {
             .contains("cache_max_entries"));
     }
 
-    // --- F-OBS-001: Pipeline Observability API tests ---
+    // --- Pipeline Observability API tests ---
 
     #[tokio::test]
     async fn test_metrics_initial_state() {

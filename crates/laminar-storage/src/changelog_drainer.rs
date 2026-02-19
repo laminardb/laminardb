@@ -1,4 +1,4 @@
-//! Ring 1 changelog drainer (F-CKP-005).
+//! Ring 1 changelog drainer.
 //!
 //! Consumes entries from the Ring 0 [`StateChangelogBuffer`] to relieve
 //! SPSC backpressure. Runs in the background (Ring 1) on a periodic

@@ -1,4 +1,4 @@
-//! Unified recovery manager (F-CKP-007).
+//! Unified recovery manager.
 //!
 //! Single recovery path that loads a
 //! [`CheckpointManifest`](laminar_storage::checkpoint_manifest::CheckpointManifest) and restores

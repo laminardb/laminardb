@@ -499,7 +499,7 @@ mod tests {
         assert_eq!(config.right_key(), "sym");
     }
 
-    // -- Multi-way join translator tests (F-SQL-005) --
+    // -- Multi-way join translator tests --
 
     #[test]
     fn test_from_multi_analysis_single() {

@@ -98,4 +98,8 @@ pub enum DbError {
     /// Storage backend error (e.g., `RocksDB`)
     #[error("Storage error: {0}")]
     Storage(String),
+
+    /// Configuration / profile validation error
+    #[error("Config error: {0}")]
+    Config(String),
 }

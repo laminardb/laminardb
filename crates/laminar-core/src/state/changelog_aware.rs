@@ -1,4 +1,4 @@
-//! Changelog-aware state store wrapper (F-CKP-005).
+//! Changelog-aware state store wrapper.
 //!
 //! Wraps any [`StateStore`] to record mutations to a [`ChangelogSink`],
 //! enabling Ring 1 WAL writes to track Ring 0 state changes.
