@@ -27,6 +27,12 @@ jit = [
     "dep:cranelift-module", "dep:cranelift-native",
     "dep:datafusion-expr", "dep:datafusion-common",
 ]
+# Enable distributed constellation mode (multi-node)
+constellation = [
+    "dep:tonic", "dep:prost", "dep:openraft", "dep:chitchat",
+    "dep:bincode", "dep:tokio-util", "dep:xxhash-rust",
+    "dep:tonic-build", "dep:prost-build",
+]
 
 [dependencies]
 # Performance critical - no allocations on hot path
@@ -82,6 +88,15 @@ datafusion-common = { workspace = true, optional = true }
 # Secondary indexes
 redb = { workspace = true }
 
+# Constellation (optional, multi-node distributed mode)
+tonic = { workspace = true, optional = true }
+prost = { workspace = true, optional = true }
+openraft = { workspace = true, optional = true }
+chitchat = { workspace = true, optional = true }
+bincode = { workspace = true, optional = true }
+tokio-util = { workspace = true, optional = true }
+xxhash-rust = { workspace = true, optional = true }
+
 # Observability
 tracing = { workspace = true }
 
@@ -102,6 +117,10 @@ libc = { workspace = true }
 
 [target.'cfg(target_os = "windows")'.dependencies]
 windows-sys = { version = "0.59", features = ["Win32_System_Threading"] }
+
+[build-dependencies]
+tonic-build = { workspace = true, optional = true }
+prost-build = { workspace = true, optional = true }
 
 [dev-dependencies]
 criterion = { workspace = true }
@@ -174,3 +193,8 @@ harness = false
 [[bench]]
 name = "lookup_join_bench"
 harness = false
+
+[[bench]]
+name = "constellation_checkpoint_bench"
+harness = false
+required-features = ["constellation"]

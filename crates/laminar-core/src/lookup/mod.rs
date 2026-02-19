@@ -12,6 +12,9 @@
 
 /// foyer-backed in-memory cache for lookup tables.
 pub mod foyer_cache;
+/// Partitioned lookup strategy for distributed lookup tables.
+#[cfg(feature = "constellation")]
+pub mod partitioned;
 pub mod predicate;
 /// Async lookup source trait for Phase 6.
 pub mod source;

@@ -58,6 +58,10 @@ pub mod sink_metrics;
 // Shared modules
 pub mod schema_registry;
 
+// Discovery module (requires constellation feature from laminar-core)
+#[cfg(feature = "kafka-discovery")]
+pub mod discovery;
+
 // Source re-exports
 pub use avro::AvroDeserializer;
 pub use config::{

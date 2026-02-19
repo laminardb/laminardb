@@ -12,9 +12,9 @@
 | Phase 4 | 11 | 11 | 0 | 0 | 0 | 0 |
 | Phase 5 | 10 | 10 | 0 | 0 | 0 | 0 |
 | Phase 6a | 29 | 0 | 0 | 0 | 27 | 2 |
-| Phase 6b | 14 | 14 | 0 | 0 | 0 | 0 |
+| Phase 6b | 14 | 0 | 0 | 0 | 14 | 0 |
 | Phase 6c | 10 | 9 | 0 | 0 | 0 | 1 |
-| **Total** | **214** | **53** | **0** | **0** | **158** | **3** |
+| **Total** | **214** | **39** | **0** | **0** | **172** | **3** |
 
 ## Status Legend
 
@@ -414,57 +414,57 @@ See [Constellation Index](constellation/INDEX.md) for full details, dependency g
 
 | ID | Feature | Status | Spec |
 |----|---------|--------|------|
-| F-DISC-001 | Discovery Trait & Static Discovery | 📝 | [Link](constellation/discovery/F-DISC-001-static-discovery.md) |
-| F-DISC-002 | Gossip Discovery (chitchat) | 📝 | [Link](constellation/discovery/F-DISC-002-gossip-discovery.md) |
-| F-DISC-003 | Kafka Group Discovery | 📝 | [Link](constellation/discovery/F-DISC-003-kafka-discovery.md) |
+| F-DISC-001 | Discovery Trait & Static Discovery | ✅ | [Link](constellation/discovery/F-DISC-001-static-discovery.md) |
+| F-DISC-002 | Gossip Discovery (chitchat) | ✅ | [Link](constellation/discovery/F-DISC-002-gossip-discovery.md) |
+| F-DISC-003 | Kafka Group Discovery | ✅ | [Link](constellation/discovery/F-DISC-003-kafka-discovery.md) |
 
 #### Coordination
 
 | ID | Feature | Status | Spec |
 |----|---------|--------|------|
-| F-COORD-001 | Raft Metadata Consensus | 📝 | [Link](constellation/coordination/F-COORD-001-raft-metadata.md) |
-| F-COORD-002 | Constellation Orchestration | 📝 | [Link](constellation/coordination/F-COORD-002-constellation-orchestration.md) |
+| F-COORD-001 | Raft Metadata Consensus | ✅ | [Link](constellation/coordination/F-COORD-001-raft-metadata.md) |
+| F-COORD-002 | Constellation Orchestration | ✅ | [Link](constellation/coordination/F-COORD-002-constellation-orchestration.md) |
 
 #### Partition Ownership
 
 | ID | Feature | Status | Spec |
 |----|---------|--------|------|
-| F-EPOCH-001 | PartitionGuard & Epoch Fencing | 📝 | [Link](constellation/partition/F-EPOCH-001-partition-guard.md) |
-| F-EPOCH-002 | Partition Assignment Algorithm | 📝 | [Link](constellation/partition/F-EPOCH-002-assignment-algorithm.md) |
-| F-EPOCH-003 | Partition Reassignment Protocol | 📝 | [Link](constellation/partition/F-EPOCH-003-reassignment-protocol.md) |
+| F-EPOCH-001 | PartitionGuard & Epoch Fencing | ✅ | [Link](constellation/partition/F-EPOCH-001-partition-guard.md) |
+| F-EPOCH-002 | Partition Assignment Algorithm | ✅ | [Link](constellation/partition/F-EPOCH-002-assignment-algorithm.md) |
+| F-EPOCH-003 | Partition Reassignment Protocol | ✅ | [Link](constellation/partition/F-EPOCH-003-reassignment-protocol.md) |
 
 #### Distributed Checkpoint (Constellation)
 
 | ID | Feature | Status | Spec |
 |----|---------|--------|------|
-| F-DCKP-008 | Distributed Checkpoint Coordination | 📝 | [Link](constellation/checkpoint/F-DCKP-008-distributed-coordination.md) |
+| F-DCKP-008 | Distributed Checkpoint Coordination | ✅ | [Link](constellation/checkpoint/F-DCKP-008-distributed-coordination.md) |
 
 #### Constellation Lookup
 
 | ID | Feature | Status | Spec |
 |----|---------|--------|------|
-| F-LOOKUP-009 | Partitioned Lookup Strategy | 📝 | [Link](constellation/lookup/F-LOOKUP-009-partitioned-lookup.md) |
+| F-LOOKUP-009 | Partitioned Lookup Strategy | ✅ | [Link](constellation/lookup/F-LOOKUP-009-partitioned-lookup.md) |
 
 #### Cross-Node Aggregation
 
 | ID | Feature | Status | Spec |
 |----|---------|--------|------|
-| F-XAGG-002 | Gossip Partial Aggregates | 📝 | [Link](constellation/aggregation/F-XAGG-002-gossip-aggregates.md) |
-| F-XAGG-003 | gRPC Aggregate Fan-Out | 📝 | [Link](constellation/aggregation/F-XAGG-003-grpc-aggregate-fanout.md) |
+| F-XAGG-002 | Gossip Partial Aggregates | ✅ | [Link](constellation/aggregation/F-XAGG-002-gossip-aggregates.md) |
+| F-XAGG-003 | gRPC Aggregate Fan-Out | ✅ | [Link](constellation/aggregation/F-XAGG-003-grpc-aggregate-fanout.md) |
 
 #### Inter-Node RPC
 
 | ID | Feature | Status | Spec |
 |----|---------|--------|------|
-| F-RPC-001 | gRPC Service Definitions | 📝 | [Link](constellation/rpc/F-RPC-001-grpc-service-definitions.md) |
-| F-RPC-002 | Remote Lookup Service | 📝 | [Link](constellation/rpc/F-RPC-002-remote-lookup-service.md) |
-| F-RPC-003 | Barrier Forwarding Service | 📝 | [Link](constellation/rpc/F-RPC-003-barrier-forwarding.md) |
+| F-RPC-001 | gRPC Service Definitions | ✅ | [Link](constellation/rpc/F-RPC-001-grpc-service-definitions.md) |
+| F-RPC-002 | Remote Lookup Service | ✅ | [Link](constellation/rpc/F-RPC-002-remote-lookup-service.md) |
+| F-RPC-003 | Barrier Forwarding Service | ✅ | [Link](constellation/rpc/F-RPC-003-barrier-forwarding.md) |
 
 #### Performance Benchmarks (Constellation)
 
 | ID | Feature | Status | Spec |
 |----|---------|--------|------|
-| F-PERF-004 | Constellation Checkpoint Benchmark | 📝 | [Link](constellation/benchmarks/F-PERF-004-constellation-checkpoint-benchmark.md) |
+| F-PERF-004 | Constellation Checkpoint Benchmark | ✅ | [Link](constellation/benchmarks/F-PERF-004-constellation-checkpoint-benchmark.md) |
 
 ### Phase 6c: Production Hardening
 

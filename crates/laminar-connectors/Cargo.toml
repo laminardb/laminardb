@@ -59,6 +59,10 @@ arrow-select = { workspace = true }
 parquet = { version = "57.2", optional = true, default-features = false, features = ["arrow"] }
 object_store = { version = "0.13", optional = true }
 
+# Kafka discovery (optional)
+tokio-util = { workspace = true, optional = true }
+chrono = { workspace = true, optional = true }
+
 [features]
 default = []
 kafka = ["dep:rdkafka", "dep:arrow-avro", "dep:reqwest"]
@@ -75,6 +79,8 @@ delta-lake-unity = ["delta-lake", "deltalake/unity-experimental"]
 delta-lake-glue = ["delta-lake", "deltalake/glue"]
 # Parquet file lookup source
 parquet-lookup = ["dep:parquet", "dep:object_store"]
+# Kafka-based discovery for constellation
+kafka-discovery = ["kafka", "laminar-core/constellation", "dep:tokio-util", "dep:chrono"]
 
 [dev-dependencies]
 tempfile = { workspace = true }

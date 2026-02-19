@@ -59,6 +59,10 @@ pub mod time;
 pub mod tpc;
 pub mod xdp;
 
+/// Distributed constellation mode (multi-node coordination).
+#[cfg(feature = "constellation")]
+pub mod constellation;
+
 // Re-export key types
 pub use reactor::{Reactor, ReactorConfig};
 

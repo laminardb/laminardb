@@ -101,6 +101,17 @@ cranelift-native = "0.128"
 # Embedded key-value (secondary indexes)
 redb = "2"
 
+# Constellation (distributed mode)
+tonic = "0.13"
+prost = "0.13"
+tonic-build = "0.13"
+prost-build = "0.13"
+openraft = { version = "0.9", features = ["serde"] }
+chitchat = "0.10"
+bincode = { version = "2", features = ["serde"] }
+tokio-util = { version = "0.7", features = ["rt"] }
+xxhash-rust = { version = "0.8", features = ["xxh3"] }
+
 # Testing
 criterion = { version = "0.8", features = ["html_reports"] }
 proptest = "1.9"
