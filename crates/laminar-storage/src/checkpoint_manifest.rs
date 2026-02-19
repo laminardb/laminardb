@@ -80,7 +80,7 @@ pub struct CheckpointManifest {
     pub operator_states: HashMap<String, OperatorCheckpoint>,
 
     // ── Storage State ──
-    /// Path to the `RocksDB` table store checkpoint, if any.
+    /// Path to the table store checkpoint, if any.
     #[serde(default)]
     pub table_store_checkpoint_path: Option<String>,
     /// WAL position for single-writer mode.

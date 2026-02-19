@@ -49,6 +49,13 @@
 /// CDC-to-cache adapter for lookup table refresh.
 pub mod cdc_adapter;
 
+/// PostgreSQL lookup source with connection pooling and predicate pushdown.
+#[cfg(feature = "postgres-cdc")]
+pub mod postgres_source;
+
+#[cfg(feature = "postgres-cdc")]
+pub use postgres_source::{PostgresLookupSource, PostgresLookupSourceConfig};
+
 use arrow_array::RecordBatch;
 use async_trait::async_trait;
 use rustc_hash::FxHashMap;

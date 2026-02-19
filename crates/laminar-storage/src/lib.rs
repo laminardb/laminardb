@@ -6,7 +6,7 @@
 //!
 //! - [`wal`]: Write-ahead log for durability and exactly-once semantics
 //! - [`checkpoint`]: Basic checkpointing for fast recovery
-//! - [`incremental`]: F022 Incremental checkpointing with `RocksDB` backend
+//! - [`incremental`]: F022 Incremental checkpointing
 //! - [`per_core_wal`]: F062 Per-core WAL segments for thread-per-core architecture
 //! - [`wal_state_store`]: Combines `MmapStateStore` with WAL for durability
 //!
@@ -34,7 +34,7 @@ pub mod checkpoint_store;
 /// Ring 1 changelog drainer
 pub mod changelog_drainer;
 
-/// Incremental checkpointing (F022) - Three-tier architecture with RocksDB backend
+/// Incremental checkpointing (F022) - Directory-based checkpoint architecture
 pub mod incremental;
 
 /// Per-core WAL segments (F062) - Thread-per-core WAL for lock-free writes

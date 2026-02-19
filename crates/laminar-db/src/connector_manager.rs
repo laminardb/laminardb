@@ -81,7 +81,7 @@ pub(crate) struct TableRegistration {
     pub cache_mode: Option<TableCacheMode>,
     /// Override for maximum LRU cache entries (used with Partial mode).
     pub cache_max_entries: Option<usize>,
-    /// Storage backend: `None` or `"persistent"` for RocksDB-backed tables.
+    /// Storage backend: `None` for in-memory tables.
     pub storage: Option<String>,
 }
 

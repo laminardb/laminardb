@@ -95,7 +95,7 @@ pub enum DbError {
     #[error("Materialized view error: {0}")]
     MaterializedView(String),
 
-    /// Storage backend error (e.g., `RocksDB`)
+    /// Storage backend error.
     #[error("Storage error: {0}")]
     Storage(String),
 

@@ -78,6 +78,8 @@ mod table_provider;
 pub mod watermark_udf;
 /// Window function UDFs (TUMBLE, HOP, SESSION)
 pub mod window_udf;
+/// Lookup join plan node for DataFusion.
+pub mod lookup_join;
 
 pub use aggregate_bridge::{
     create_aggregate_factory, lookup_aggregate_udf, result_to_scalar_value, scalar_value_to_result,

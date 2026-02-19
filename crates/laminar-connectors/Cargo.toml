@@ -22,6 +22,7 @@ reqwest = { version = "0.12", default-features = false, features = ["json", "rus
 # Database drivers for CDC and sinks
 tokio-postgres = { version = "0.7", optional = true }
 postgres-types = { version = "0.2", optional = true }
+deadpool-postgres = { version = "0.14", optional = true }
 pgwire-replication = { version = "0.2", optional = true }
 # MySQL async driver with rustls (no OpenSSL required)
 mysql_async = { version = "0.36", optional = true, default-features = false, features = ["rustls-tls", "binlog", "minimal-rust"] }
@@ -57,7 +58,7 @@ arrow-select = { workspace = true }
 [features]
 default = []
 kafka = ["dep:rdkafka", "dep:arrow-avro", "dep:reqwest"]
-postgres-cdc = ["dep:tokio-postgres", "dep:pgwire-replication"]
+postgres-cdc = ["dep:tokio-postgres", "dep:pgwire-replication", "dep:deadpool-postgres"]
 postgres-sink = ["dep:tokio-postgres", "dep:postgres-types"]
 # mysql-cdc: Business logic + mysql_async driver with rustls (no OpenSSL required)
 mysql-cdc = ["dep:mysql_async", "dep:tokio-stream"]

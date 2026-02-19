@@ -1,8 +1,7 @@
-//! Incremental checkpoint manager with `RocksDB` backend.
+//! Incremental checkpoint manager.
 //!
-//! This module provides incremental checkpointing using `RocksDB`'s native
-//! checkpoint functionality, which hard-links `SSTable` files for efficient
-//! space utilization.
+//! This module provides incremental checkpointing using directory-based
+//! snapshots with metadata tracking.
 
 use std::collections::HashMap;
 use std::fs;
@@ -30,7 +29,7 @@ pub struct CheckpointConfig {
     pub truncate_wal: bool,
     /// Minimum WAL size before checkpoint (bytes).
     pub min_wal_size_for_checkpoint: u64,
-    /// Enable incremental checkpoints (hard-link `SSTable`s).
+    /// Enable incremental checkpoints.
     pub incremental: bool,
 }
 
@@ -191,9 +190,8 @@ impl IncrementalCheckpointMetadata {
 
 /// Incremental checkpoint manager.
 ///
-/// This manager creates and manages incremental checkpoints using `RocksDB`'s
-/// native checkpoint functionality when available, falling back to full
-/// snapshots when `RocksDB` is not enabled.
+/// This manager creates and manages incremental checkpoints using
+/// directory-based snapshots with metadata tracking.
 pub struct IncrementalCheckpointManager {
     /// Configuration.
     config: CheckpointConfig,
@@ -205,12 +203,8 @@ pub struct IncrementalCheckpointManager {
     last_checkpoint_time: AtomicU64,
     /// Latest checkpoint ID.
     latest_checkpoint_id: Option<u64>,
-    /// `RocksDB` instance (when feature enabled).
-    #[cfg(feature = "rocksdb")]
-    db: Option<rocksdb::DB>,
-    /// In-memory state store (used when RocksDB not enabled).
-    #[cfg(not(feature = "rocksdb"))]
-    state: std::collections::HashMap<Vec<u8>, Vec<u8>>,
+    /// In-memory state store.
+    state: HashMap<Vec<u8>, Vec<u8>>,
     /// Source offsets for exactly-once semantics.
     source_offsets: HashMap<String, u64>,
     /// Current watermark.
@@ -238,10 +232,7 @@ impl IncrementalCheckpointManager {
             current_epoch: AtomicU64::new(0),
             last_checkpoint_time: AtomicU64::new(0),
             latest_checkpoint_id: latest_id,
-            #[cfg(feature = "rocksdb")]
-            db: None,
-            #[cfg(not(feature = "rocksdb"))]
-            state: std::collections::HashMap::new(),
+            state: HashMap::new(),
             source_offsets: HashMap::new(),
             watermark: None,
         })
@@ -293,23 +284,6 @@ impl IncrementalCheckpointManager {
         Ok((max_dir_id + 1, latest_valid_id))
     }
 
-    /// Opens or creates the `RocksDB` backend.
-    ///
-    /// # Errors
-    ///
-    /// Returns an error if `RocksDB` fails to open.
-    #[cfg(feature = "rocksdb")]
-    pub fn open_rocksdb(&mut self, path: &Path) -> Result<(), IncrementalCheckpointError> {
-        let mut opts = rocksdb::Options::default();
-        opts.create_if_missing(true);
-        opts.set_max_background_jobs(2);
-        opts.set_bytes_per_sync(1024 * 1024); // 1MB
-
-        let db = rocksdb::DB::open(&opts, path)?;
-        self.db = Some(db);
-        Ok(())
-    }
-
     /// Returns the configuration.
     #[must_use]
     pub fn config(&self) -> &CheckpointConfig {
@@ -331,16 +305,10 @@ impl IncrementalCheckpointManager {
     ///
     /// # Errors
     ///
-    /// Returns an error if the `RocksDB` write fails.
+    /// Returns an error if the write fails.
+    #[allow(clippy::unnecessary_wraps)]
     pub fn put(&mut self, key: &[u8], value: &[u8]) -> Result<(), IncrementalCheckpointError> {
-        #[cfg(feature = "rocksdb")]
-        if let Some(ref db) = self.db {
-            db.put(key, value)?;
-        }
-        #[cfg(not(feature = "rocksdb"))]
-        {
-            self.state.insert(key.to_vec(), value.to_vec());
-        }
+        self.state.insert(key.to_vec(), value.to_vec());
         Ok(())
     }
 
@@ -348,16 +316,10 @@ impl IncrementalCheckpointManager {
     ///
     /// # Errors
     ///
-    /// Returns an error if the `RocksDB` delete fails.
+    /// Returns an error if the delete fails.
+    #[allow(clippy::unnecessary_wraps)]
     pub fn delete(&mut self, key: &[u8]) -> Result<(), IncrementalCheckpointError> {
-        #[cfg(feature = "rocksdb")]
-        if let Some(ref db) = self.db {
-            db.delete(key)?;
-        }
-        #[cfg(not(feature = "rocksdb"))]
-        {
-            self.state.remove(key);
-        }
+        self.state.remove(key);
         Ok(())
     }
 
@@ -403,8 +365,8 @@ impl IncrementalCheckpointManager {
 
     /// Creates a new incremental checkpoint.
     ///
-    /// This creates a checkpoint of the current state using `RocksDB`'s
-    /// checkpoint functionality when available.
+    /// This creates a checkpoint of the current state using directory-based
+    /// snapshots.
     ///
     /// # Errors
     ///
@@ -425,27 +387,6 @@ impl IncrementalCheckpointManager {
 
         // Create checkpoint directory
         fs::create_dir_all(&checkpoint_path)?;
-
-        // Create RocksDB checkpoint if available
-        #[cfg(feature = "rocksdb")]
-        if let Some(ref db) = self.db {
-            let checkpoint = rocksdb::checkpoint::Checkpoint::new(db)?;
-            let ckpt_db_path = checkpoint_path.join("db");
-            checkpoint.create_checkpoint(&ckpt_db_path)?;
-
-            // Collect `SSTable` files
-            metadata.sst_files = Self::list_sst_files(&ckpt_db_path)?;
-            metadata.size_bytes = Self::calculate_dir_size(&ckpt_db_path)?;
-
-            info!(
-                checkpoint_id = id,
-                epoch = epoch,
-                wal_position = wal_position,
-                size_bytes = metadata.size_bytes,
-                sst_count = metadata.sst_files.len(),
-                "Created RocksDB checkpoint"
-            );
-        }
 
         // Write metadata
         let metadata_path = checkpoint_path.join("metadata.json");
@@ -501,17 +442,6 @@ impl IncrementalCheckpointManager {
         // usize → u64: lossless on 64-bit, acceptable on 32-bit
         {
             metadata.size_bytes = state_data.len() as u64;
-        }
-
-        // Create RocksDB checkpoint if available
-        #[cfg(feature = "rocksdb")]
-        if let Some(ref db) = self.db {
-            let checkpoint = rocksdb::checkpoint::Checkpoint::new(db)?;
-            let ckpt_db_path = checkpoint_path.join("db");
-            checkpoint.create_checkpoint(&ckpt_db_path)?;
-
-            metadata.sst_files = Self::list_sst_files(&ckpt_db_path)?;
-            metadata.size_bytes += Self::calculate_dir_size(&ckpt_db_path)?;
         }
 
         // Write metadata
@@ -699,85 +629,6 @@ impl IncrementalCheckpointManager {
 
         info!(checkpoint_id = id, "Deleted checkpoint");
         Ok(())
-    }
-
-    /// Applies entries from the changelog to `RocksDB`.
-    ///
-    /// # Errors
-    ///
-    /// Returns an error if the `RocksDB` write fails.
-    #[cfg(feature = "rocksdb")]
-    pub fn apply_changelog(
-        &self,
-        entries: &[(Vec<u8>, Option<Vec<u8>>)],
-    ) -> Result<(), IncrementalCheckpointError> {
-        let Some(ref db) = self.db else {
-            return Ok(());
-        };
-
-        let mut batch = rocksdb::WriteBatch::default();
-
-        for (key, value) in entries {
-            if let Some(v) = value {
-                batch.put(key, v);
-            } else {
-                batch.delete(key);
-            }
-        }
-
-        db.write(batch)?;
-        Ok(())
-    }
-
-    /// Gets a value from `RocksDB`.
-    ///
-    /// # Errors
-    ///
-    /// Returns an error if the `RocksDB` read fails.
-    #[cfg(feature = "rocksdb")]
-    pub fn get(&self, key: &[u8]) -> Result<Option<Vec<u8>>, IncrementalCheckpointError> {
-        let Some(ref db) = self.db else {
-            return Ok(None);
-        };
-
-        Ok(db.get(key)?)
-    }
-
-    /// Lists `SSTable` files in a directory.
-    #[cfg(feature = "rocksdb")]
-    fn list_sst_files(dir: &Path) -> Result<Vec<String>, IncrementalCheckpointError> {
-        let mut files = Vec::new();
-
-        if dir.exists() {
-            for entry in fs::read_dir(dir)? {
-                let entry = entry?;
-                let name = entry.file_name();
-                let name_str = name.to_string_lossy();
-
-                if name_str.ends_with(".sst") {
-                    files.push(name_str.to_string());
-                }
-            }
-        }
-
-        Ok(files)
-    }
-
-    /// Calculates the total size of a directory.
-    #[cfg(feature = "rocksdb")]
-    fn calculate_dir_size(dir: &Path) -> Result<u64, IncrementalCheckpointError> {
-        let mut size = 0u64;
-
-        if dir.exists() {
-            for entry in fs::read_dir(dir)? {
-                let entry = entry?;
-                if let Ok(metadata) = entry.metadata() {
-                    size += metadata.len();
-                }
-            }
-        }
-
-        Ok(size)
     }
 }
 

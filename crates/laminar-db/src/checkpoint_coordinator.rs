@@ -48,7 +48,7 @@ pub struct CheckpointConfig {
     /// A stuck sink will not block checkpointing indefinitely.
     /// Defaults to 30 seconds.
     pub pre_commit_timeout: Duration,
-    /// Whether to use incremental checkpoints (future use with `RocksDB`).
+    /// Whether to use incremental checkpoints.
     pub incremental: bool,
 }
 
@@ -381,7 +381,7 @@ impl CheckpointCoordinator {
     /// * `watermark` — current global watermark
     /// * `wal_position` — single-writer WAL position
     /// * `per_core_wal_positions` — thread-per-core WAL positions
-    /// * `table_store_checkpoint_path` — `RocksDB` table store checkpoint path
+    /// * `table_store_checkpoint_path` — table store checkpoint path
     ///
     /// # Errors
     ///

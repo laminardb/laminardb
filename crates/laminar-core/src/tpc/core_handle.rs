@@ -621,7 +621,7 @@ fn core_thread_main(
                 }
                 CoreMessage::CheckpointRequest(checkpoint_id) => {
                     // Snapshot all operator states and push to outbox
-                    // for Ring 1 to persist via WAL + RocksDB.
+                    // for Ring 1 to persist via WAL.
                     let operator_states = reactor.trigger_checkpoint();
                     let checkpoint_output = Output::CheckpointComplete {
                         checkpoint_id,

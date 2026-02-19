@@ -359,6 +359,10 @@ impl LaminarDB {
                 Ok(ExecuteResult::Metadata(batch))
             }
             StreamingStatement::Explain { statement } => self.handle_explain(statement),
+            StreamingStatement::CreateLookupTable(_)
+            | StreamingStatement::DropLookupTable { .. } => {
+                self.handle_query(sql).await
+            }
             StreamingStatement::CreateMaterializedView {
                 name,
                 query,
@@ -765,17 +769,9 @@ impl LaminarDB {
                 .unwrap_or(crate::table_cache_mode::TableCacheMode::Full);
 
             if is_persistent {
-                #[cfg(feature = "rocksdb")]
-                {
-                    let mut ts = self.table_store.lock();
-                    ts.create_table_persistent(&name, schema.clone(), pk, cache)?;
-                }
-                #[cfg(not(feature = "rocksdb"))]
-                {
-                    return Err(DbError::InvalidOperation(
-                        "storage = 'persistent' requires the 'rocksdb' feature".to_string(),
-                    ));
-                }
+                return Err(DbError::InvalidOperation(
+                    "storage = 'persistent' is no longer supported; use in-memory tables with foyer caching instead".to_string(),
+                ));
             } else if resolved_cache_mode.is_some() {
                 let mut ts = self.table_store.lock();
                 ts.create_table_with_cache(&name, schema.clone(), pk, cache)?;
@@ -987,6 +983,12 @@ impl LaminarDB {
                         laminar_sql::planner::StreamingPlan::RegisterSink(_) => "RegisterSink",
                         laminar_sql::planner::StreamingPlan::Standard(_) => "Standard",
                         laminar_sql::planner::StreamingPlan::DagExplain(_) => "DagExplain",
+                        laminar_sql::planner::StreamingPlan::RegisterLookupTable(_) => {
+                            "RegisterLookupTable"
+                        }
+                        laminar_sql::planner::StreamingPlan::DropLookupTable { .. } => {
+                            "DropLookupTable"
+                        }
                     }
                     .into(),
                 ));
@@ -1031,6 +1033,12 @@ impl LaminarDB {
                     }
                     laminar_sql::planner::StreamingPlan::DagExplain(output) => {
                         rows.push(("dag_topology".into(), output.topology_text.clone()));
+                    }
+                    laminar_sql::planner::StreamingPlan::RegisterLookupTable(info) => {
+                        rows.push(("lookup_table".into(), info.name.clone()));
+                    }
+                    laminar_sql::planner::StreamingPlan::DropLookupTable { name } => {
+                        rows.push(("drop_lookup_table".into(), name.clone()));
                     }
                 }
             }
@@ -1132,6 +1140,18 @@ impl LaminarDB {
                 Ok(ExecuteResult::Ddl(DdlInfo {
                     statement_type: "EXPLAIN DAG".to_string(),
                     object_name: output.topology_text,
+                }))
+            }
+            laminar_sql::planner::StreamingPlan::RegisterLookupTable(info) => {
+                Ok(ExecuteResult::Ddl(DdlInfo {
+                    statement_type: "CREATE LOOKUP TABLE".to_string(),
+                    object_name: info.name,
+                }))
+            }
+            laminar_sql::planner::StreamingPlan::DropLookupTable { name } => {
+                Ok(ExecuteResult::Ddl(DdlInfo {
+                    statement_type: "DROP LOOKUP TABLE".to_string(),
+                    object_name: name,
                 }))
             }
         }

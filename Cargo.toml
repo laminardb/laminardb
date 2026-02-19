@@ -67,6 +67,7 @@ datafusion = "52.0"
 datafusion-common = "52.0"
 datafusion-expr = "52.0"
 datafusion-sql = "52.0"
+datafusion-optimizer = "52.0"
 sqlparser = "0.59"
 
 # Async
@@ -96,6 +97,9 @@ cranelift-frontend = "0.128"
 cranelift-jit = "0.128"
 cranelift-module = "0.128"
 cranelift-native = "0.128"
+
+# Embedded key-value (secondary indexes)
+redb = "2"
 
 # Testing
 criterion = { version = "0.8", features = ["html_reports"] }

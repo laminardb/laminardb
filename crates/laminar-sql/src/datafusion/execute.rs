@@ -135,7 +135,9 @@ pub async fn execute_streaming_sql(
                 query_plan: None,
             }))
         }
-        StreamingPlan::DagExplain(_) => Ok(StreamingSqlResult::Ddl(DdlResult { plan })),
+        StreamingPlan::DagExplain(_)
+        | StreamingPlan::RegisterLookupTable(_)
+        | StreamingPlan::DropLookupTable { .. } => Ok(StreamingSqlResult::Ddl(DdlResult { plan })),
     }
 }
 

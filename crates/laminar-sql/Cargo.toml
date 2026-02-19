@@ -18,6 +18,7 @@ datafusion = { workspace = true }
 datafusion-common = { workspace = true }
 datafusion-expr = { workspace = true }
 datafusion-sql = { workspace = true }
+datafusion-optimizer = { workspace = true }
 
 # Arrow for columnar data
 arrow = { workspace = true }

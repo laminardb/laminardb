@@ -79,6 +79,9 @@ cranelift-native = { workspace = true, optional = true }
 datafusion-expr = { workspace = true, optional = true }
 datafusion-common = { workspace = true, optional = true }
 
+# Secondary indexes
+redb = { workspace = true }
+
 # Observability
 tracing = { workspace = true }
 

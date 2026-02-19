@@ -39,6 +39,8 @@ pub mod alloc;
 pub mod budget;
 /// Distributed checkpoint barrier protocol.
 pub mod checkpoint;
+/// Secondary index support using redb.
+pub mod index;
 pub mod compiler;
 pub mod dag;
 pub mod detect;

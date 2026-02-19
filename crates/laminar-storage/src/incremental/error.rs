@@ -9,11 +9,6 @@ pub enum IncrementalCheckpointError {
     #[error("I/O error: {0}")]
     Io(#[from] std::io::Error),
 
-    /// `RocksDB` error.
-    #[cfg(feature = "rocksdb")]
-    #[error("RocksDB error: {0}")]
-    RocksDb(#[from] rocksdb::Error),
-
     /// Serialization error.
     #[error("Serialization error: {0}")]
     Serialization(String),

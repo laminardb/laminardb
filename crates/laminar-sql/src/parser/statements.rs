@@ -138,6 +138,17 @@ pub enum StreamingStatement {
         /// Row values
         values: Vec<Vec<Expr>>,
     },
+
+    /// CREATE LOOKUP TABLE statement
+    CreateLookupTable(Box<super::lookup_table::CreateLookupTableStatement>),
+
+    /// DROP LOOKUP TABLE statement
+    DropLookupTable {
+        /// Lookup table name to drop
+        name: ObjectName,
+        /// Whether IF EXISTS was specified
+        if_exists: bool,
+    },
 }
 
 /// Format specification for serialization (e.g., FORMAT JSON, FORMAT AVRO).
