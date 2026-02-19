@@ -30,10 +30,10 @@ The Constellation Architecture extends LaminarDB from an embedded single-process
 
 | Phase | Total | Draft | Superseded | In Progress | Done |
 |-------|-------|-------|------------|-------------|------|
-| Phase 6a — Partition-Parallel Embedded | 29 | 4 | 2 | 0 | 23 |
+| Phase 6a — Partition-Parallel Embedded | 29 | 0 | 2 | 0 | 27 |
 | Phase 6b — Constellation Foundation | 14 | 14 | 0 | 0 | 0 |
 | Phase 6c — Production Hardening | 10 | 9 | 1 | 0 | 0 |
-| **Total** | **53** | **25** | **3** | **0** | **23** |
+| **Total** | **53** | **21** | **3** | **0** | **27** |
 
 ## Key Dependencies
 
@@ -84,7 +84,7 @@ See [DEPENDENCIES.md](DEPENDENCIES.md) for the full project dependency graph.
 | F-LOOKUP-005 | foyer Hybrid Cache (Ring 1) | ✅ | P1 | M | [Link](lookup/F-LOOKUP-005-foyer-hybrid-cache.md) |
 | F-LOOKUP-006 | CDC-to-Cache Adapter | ✅ | P0 | S | [Link](lookup/F-LOOKUP-006-cdc-cache-adapter.md) |
 | F-LOOKUP-007 | PostgresLookupSource | ✅ | P1 | M | [Link](lookup/F-LOOKUP-007-postgres-lookup-source.md) |
-| F-LOOKUP-008 | ParquetLookupSource | 📝 | P2 | M | [Link](lookup/F-LOOKUP-008-parquet-lookup-source.md) |
+| F-LOOKUP-008 | ParquetLookupSource | ✅ | P2 | M | [Link](lookup/F-LOOKUP-008-parquet-lookup-source.md) |
 | F-LOOKUP-010 | Remove RocksDB Dependency | ✅ | P0 | S | [Link](lookup/F-LOOKUP-010-rocksdb-removal.md) |
 
 ### Secondary Indexes
@@ -124,9 +124,9 @@ See [DEPENDENCIES.md](DEPENDENCIES.md) for the full project dependency graph.
 | ID | Feature | Status | Priority | Effort | Spec |
 |----|---------|--------|----------|--------|------|
 | F-PERF-001 | StateStore Microbenchmarks | ✅ | P0 | S | [Link](benchmarks/F-PERF-001-state-store-benchmarks.md) |
-| F-PERF-002 | Cache Hit/Miss Ratio Benchmarks | 📝 | P1 | S | [Link](benchmarks/F-PERF-002-cache-benchmarks.md) |
-| F-PERF-003 | Checkpoint Cycle Benchmark | 📝 | P1 | S | [Link](benchmarks/F-PERF-003-checkpoint-cycle-benchmark.md) |
-| F-PERF-005 | Lookup Join Throughput | 📝 | P1 | S | [Link](benchmarks/F-PERF-005-lookup-join-throughput.md) |
+| F-PERF-002 | Cache Hit/Miss Ratio Benchmarks | ✅ | P1 | S | [Link](benchmarks/F-PERF-002-cache-benchmarks.md) |
+| F-PERF-003 | Checkpoint Cycle Benchmark | ✅ | P1 | S | [Link](benchmarks/F-PERF-003-checkpoint-cycle-benchmark.md) |
+| F-PERF-005 | Lookup Join Throughput | ✅ | P1 | S | [Link](benchmarks/F-PERF-005-lookup-join-throughput.md) |
 
 ---
 

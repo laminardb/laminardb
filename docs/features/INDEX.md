@@ -11,10 +11,10 @@
 | Phase 3 | 77 | 9 | 0 | 0 | 68 | 0 |
 | Phase 4 | 11 | 11 | 0 | 0 | 0 | 0 |
 | Phase 5 | 10 | 10 | 0 | 0 | 0 | 0 |
-| Phase 6a | 29 | 4 | 0 | 0 | 23 | 2 |
+| Phase 6a | 29 | 0 | 0 | 0 | 27 | 2 |
 | Phase 6b | 14 | 14 | 0 | 0 | 0 | 0 |
 | Phase 6c | 10 | 9 | 0 | 0 | 0 | 1 |
-| **Total** | **214** | **57** | **0** | **0** | **154** | **3** |
+| **Total** | **214** | **53** | **0** | **0** | **158** | **3** |
 
 ## Status Legend
 
@@ -362,7 +362,7 @@ See [Constellation Index](constellation/INDEX.md) for full details, dependency g
 | F-LOOKUP-005 | foyer Hybrid Cache (Ring 1) | ✅ | [Link](constellation/lookup/F-LOOKUP-005-foyer-hybrid-cache.md) |
 | F-LOOKUP-006 | CDC-to-Cache Adapter | ✅ | [Link](constellation/lookup/F-LOOKUP-006-cdc-cache-adapter.md) |
 | F-LOOKUP-007 | PostgresLookupSource | ✅ | [Link](constellation/lookup/F-LOOKUP-007-postgres-lookup-source.md) |
-| F-LOOKUP-008 | ParquetLookupSource | 📝 | [Link](constellation/lookup/F-LOOKUP-008-parquet-lookup-source.md) |
+| F-LOOKUP-008 | ParquetLookupSource | ✅ | [Link](constellation/lookup/F-LOOKUP-008-parquet-lookup-source.md) |
 | F-LOOKUP-010 | Remove RocksDB Dependency | ✅ | [Link](constellation/lookup/F-LOOKUP-010-rocksdb-removal.md) |
 
 #### Secondary Indexes
@@ -402,9 +402,9 @@ See [Constellation Index](constellation/INDEX.md) for full details, dependency g
 | ID | Feature | Status | Spec |
 |----|---------|--------|------|
 | F-PERF-001 | StateStore Microbenchmarks | ✅ | [Link](constellation/benchmarks/F-PERF-001-state-store-benchmarks.md) |
-| F-PERF-002 | Cache Hit/Miss Ratio Benchmarks | 📝 | [Link](constellation/benchmarks/F-PERF-002-cache-benchmarks.md) |
-| F-PERF-003 | Checkpoint Cycle Benchmark | 📝 | [Link](constellation/benchmarks/F-PERF-003-checkpoint-cycle-benchmark.md) |
-| F-PERF-005 | Lookup Join Throughput | 📝 | [Link](constellation/benchmarks/F-PERF-005-lookup-join-throughput.md) |
+| F-PERF-002 | Cache Hit/Miss Ratio Benchmarks | ✅ | [Link](constellation/benchmarks/F-PERF-002-cache-benchmarks.md) |
+| F-PERF-003 | Checkpoint Cycle Benchmark | ✅ | [Link](constellation/benchmarks/F-PERF-003-checkpoint-cycle-benchmark.md) |
+| F-PERF-005 | Lookup Join Throughput | ✅ | [Link](constellation/benchmarks/F-PERF-005-lookup-join-throughput.md) |
 
 ### Phase 6b: Constellation Foundation
 

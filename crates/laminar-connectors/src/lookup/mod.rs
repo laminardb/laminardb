@@ -56,6 +56,13 @@ pub mod postgres_source;
 #[cfg(feature = "postgres-cdc")]
 pub use postgres_source::{PostgresLookupSource, PostgresLookupSourceConfig};
 
+/// Parquet file lookup source for static/slowly-changing dimension tables.
+#[cfg(feature = "parquet-lookup")]
+pub mod parquet_source;
+
+#[cfg(feature = "parquet-lookup")]
+pub use parquet_source::{ParquetLookupSource, ParquetLookupSourceConfig};
+
 use arrow_array::RecordBatch;
 use async_trait::async_trait;
 use rustc_hash::FxHashMap;

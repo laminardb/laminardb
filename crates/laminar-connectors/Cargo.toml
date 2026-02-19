@@ -55,6 +55,10 @@ arrow-cast = { workspace = true }
 arrow-schema = { workspace = true }
 arrow-select = { workspace = true }
 
+# Parquet lookup source (optional)
+parquet = { version = "57.2", optional = true, default-features = false, features = ["arrow"] }
+object_store = { version = "0.13", optional = true }
+
 [features]
 default = []
 kafka = ["dep:rdkafka", "dep:arrow-avro", "dep:reqwest"]
@@ -69,6 +73,9 @@ delta-lake-azure = ["delta-lake", "deltalake/azure"]
 delta-lake-gcs = ["delta-lake", "deltalake/gcs"]
 delta-lake-unity = ["delta-lake", "deltalake/unity-experimental"]
 delta-lake-glue = ["delta-lake", "deltalake/glue"]
+# Parquet file lookup source
+parquet-lookup = ["dep:parquet", "dep:object_store"]
 
 [dev-dependencies]
 tempfile = { workspace = true }
+tokio = { workspace = true, features = ["macros", "rt-multi-thread"] }

@@ -106,6 +106,7 @@ windows-sys = { version = "0.59", features = ["Win32_System_Threading"] }
 [dev-dependencies]
 criterion = { workspace = true }
 proptest = { workspace = true }
+rand = { workspace = true }
 tokio = { workspace = true, features = ["test-util", "macros"] }
 tempfile = { workspace = true }
 
@@ -161,3 +162,15 @@ harness = false
 name = "compiler_bench"
 harness = false
 required-features = ["jit"]
+
+[[bench]]
+name = "cache_bench"
+harness = false
+
+[[bench]]
+name = "checkpoint_bench"
+harness = false
+
+[[bench]]
+name = "lookup_join_bench"
+harness = false
