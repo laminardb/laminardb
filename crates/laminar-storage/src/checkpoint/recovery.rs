@@ -60,6 +60,38 @@ pub trait Seekable: Send + Sync {
     fn source_id(&self) -> &str;
 }
 
+/// Trait for source connectors that can seek using a typed [`SourcePosition`].
+///
+/// This extends the raw string-based [`Seekable`] trait with type-safe
+/// position tracking for exactly-once semantics (F-E2E-001).
+pub trait TypedSeekable: Send + Sync {
+    /// Seek the source to a typed checkpoint position.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`RecoveryError::SeekFailed`] if the source cannot seek
+    /// to the given position.
+    fn seek_typed(
+        &mut self,
+        position: &crate::checkpoint::source_offsets::SourcePosition,
+    ) -> Result<(), RecoveryError>;
+
+    /// Validate that the source can seek to the given position.
+    ///
+    /// Returns `false` if the position is unreachable (e.g., Kafka
+    /// retention expired, replication slot dropped).
+    fn can_seek_to(
+        &self,
+        position: &crate::checkpoint::source_offsets::SourcePosition,
+    ) -> bool {
+        let _ = position;
+        true
+    }
+
+    /// Source identifier (must match the key in the manifest).
+    fn source_id(&self) -> &str;
+}
+
 /// Configuration for the distributed recovery manager.
 #[derive(Debug, Clone)]
 pub struct RecoveryConfig {
@@ -221,6 +253,60 @@ impl RecoveryManager {
         }
     }
 
+    /// Run the full recovery sequence with typed source seeking (F-E2E-001).
+    ///
+    /// This is the same as [`recover()`](Self::recover) but uses
+    /// [`TypedSeekable`] for type-safe source position restoration.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`RecoveryError`] if recovery fails.
+    pub async fn recover_typed(
+        &self,
+        restorables: &mut [&mut dyn Restorable],
+        typed_seekables: &mut [&mut dyn TypedSeekable],
+    ) -> Result<RecoveryResult, RecoveryError> {
+        let candidates = self.discover_candidates().await?;
+
+        let max_attempts = self.config.max_fallback_attempts.min(candidates.len());
+        let mut last_error = None;
+
+        for (attempt, id) in candidates.iter().take(max_attempts).enumerate() {
+            info!(
+                checkpoint_id = %id,
+                attempt = attempt + 1,
+                "attempting typed recovery from checkpoint"
+            );
+
+            match self
+                .try_recover_typed_from(id, restorables, typed_seekables)
+                .await
+            {
+                Ok(result) => return Ok(result),
+                Err(e) => {
+                    warn!(
+                        checkpoint_id = %id,
+                        error = %e,
+                        "typed checkpoint recovery failed, trying fallback"
+                    );
+                    last_error = Some(e);
+                }
+            }
+        }
+
+        match last_error {
+            Some(e) => {
+                warn!(
+                    attempts = max_attempts,
+                    last_error = %e,
+                    "all typed checkpoint recovery attempts failed"
+                );
+                Err(RecoveryError::AllCheckpointsCorrupt(max_attempts))
+            }
+            None => Err(RecoveryError::NoCheckpointAvailable),
+        }
+    }
+
     /// Discover checkpoint candidates in priority order (latest first).
     ///
     /// C9: dual-source discovery — tries `read_latest()` first, then
@@ -347,6 +433,110 @@ impl RecoveryManager {
                     }
                 })?;
                 sources_seeked += 1;
+            }
+        }
+
+        Ok(RecoveryResult {
+            checkpoint_id: manifest.checkpoint_id,
+            epoch: manifest.epoch,
+            watermark: manifest.watermark,
+            operators_restored,
+            sources_seeked,
+        })
+    }
+
+    /// Attempt typed recovery from a single checkpoint (F-E2E-001).
+    ///
+    /// Same as [`try_recover_from`] but converts manifest offset entries
+    /// to [`SourcePosition`] and calls [`TypedSeekable::seek_typed`].
+    async fn try_recover_typed_from(
+        &self,
+        id: &CheckpointId,
+        restorables: &mut [&mut dyn Restorable],
+        typed_seekables: &mut [&mut dyn TypedSeekable],
+    ) -> Result<RecoveryResult, RecoveryError> {
+        use crate::checkpoint::source_offsets::SourcePosition;
+
+        let manifest = self.checkpointer.load_manifest(id).await?;
+
+        // Validate operator set
+        let expected: Vec<String> = restorables
+            .iter()
+            .map(|r| r.operator_id().to_string())
+            .collect();
+        let found: Vec<String> = manifest.operators.keys().cloned().collect();
+        for op_id in &expected {
+            if !manifest.operators.contains_key(op_id) {
+                return Err(RecoveryError::OperatorMismatch {
+                    expected: expected.clone(),
+                    found,
+                });
+            }
+        }
+
+        // Restore operator state (same as untyped path)
+        let mut operators_restored = 0;
+        for restorable in restorables.iter_mut() {
+            let op_id = restorable.operator_id().to_string();
+            if let Some(op_entry) = manifest.operators.get(&op_id) {
+                for partition in &op_entry.partitions {
+                    let data = self
+                        .checkpointer
+                        .load_artifact(&partition.path)
+                        .await?;
+
+                    if self.config.verify_integrity {
+                        if let Some(expected_sha) = &partition.sha256 {
+                            verify_integrity(&partition.path, &data, expected_sha)?;
+                        }
+                    }
+
+                    if partition.is_delta {
+                        restorable.apply_delta(&data).map_err(|e| {
+                            RecoveryError::RestoreFailed {
+                                operator: op_id.clone(),
+                                reason: e.to_string(),
+                            }
+                        })?;
+                    } else {
+                        restorable.restore(&data).map_err(|e| {
+                            RecoveryError::RestoreFailed {
+                                operator: op_id.clone(),
+                                reason: e.to_string(),
+                            }
+                        })?;
+                    }
+                }
+                operators_restored += 1;
+            }
+        }
+
+        // Typed source seeking
+        let mut sources_seeked = 0;
+        for seekable in typed_seekables.iter_mut() {
+            let src_id = seekable.source_id().to_string();
+            if let Some(offset_entry) = manifest.source_offsets.get(&src_id) {
+                if let Some(position) = SourcePosition::from_offset_entry(offset_entry) {
+                    // Validate seekability
+                    if !seekable.can_seek_to(&position) {
+                        return Err(RecoveryError::SeekFailed {
+                            source_id: src_id,
+                            reason: "source reports position is unreachable".into(),
+                        });
+                    }
+                    seekable.seek_typed(&position).map_err(|e| {
+                        RecoveryError::SeekFailed {
+                            source_id: src_id,
+                            reason: e.to_string(),
+                        }
+                    })?;
+                    sources_seeked += 1;
+                } else {
+                    warn!(
+                        source_id = %src_id,
+                        "could not parse typed position, skipping seek"
+                    );
+                }
             }
         }
 
@@ -789,5 +979,133 @@ mod tests {
             result.unwrap_err(),
             RecoveryError::AllCheckpointsCorrupt(1)
         ));
+    }
+
+    // ---- TypedSeekable tests ----
+
+    struct TestTypedSeekable {
+        id: String,
+        position: Option<crate::checkpoint::source_offsets::SourcePosition>,
+        reachable: bool,
+    }
+
+    impl TestTypedSeekable {
+        fn new(id: &str) -> Self {
+            Self {
+                id: id.to_string(),
+                position: None,
+                reachable: true,
+            }
+        }
+
+        fn unreachable(id: &str) -> Self {
+            Self {
+                id: id.to_string(),
+                position: None,
+                reachable: false,
+            }
+        }
+    }
+
+    impl TypedSeekable for TestTypedSeekable {
+        fn seek_typed(
+            &mut self,
+            position: &crate::checkpoint::source_offsets::SourcePosition,
+        ) -> Result<(), RecoveryError> {
+            self.position = Some(position.clone());
+            Ok(())
+        }
+
+        fn can_seek_to(
+            &self,
+            _position: &crate::checkpoint::source_offsets::SourcePosition,
+        ) -> bool {
+            self.reachable
+        }
+
+        fn source_id(&self) -> &str {
+            &self.id
+        }
+    }
+
+    #[tokio::test]
+    async fn test_typed_recovery() {
+        let ckpt = setup_checkpointer().await;
+        let id = CheckpointId::now();
+
+        save_checkpoint(
+            &ckpt,
+            &id,
+            5,
+            vec![("op1", b"state", false)],
+            vec![("kafka-src", HashMap::from([
+                ("group_id".into(), "g1".into()),
+                ("events-0".into(), "100".into()),
+            ]))],
+            Some(8000),
+        )
+        .await;
+
+        // Update the source_type to "kafka" so typed parsing works
+        {
+            let mut manifest = ckpt.load_manifest(&id).await.unwrap();
+            manifest.source_offsets.get_mut("kafka-src").unwrap().source_type = "kafka".into();
+            ckpt.save_manifest(&manifest).await.unwrap();
+        }
+
+        let rm = RecoveryManager::new(ckpt, RecoveryConfig::default());
+        let mut op = TestRestorable::new("op1");
+        let mut src = TestTypedSeekable::new("kafka-src");
+
+        let result = rm
+            .recover_typed(&mut [&mut op], &mut [&mut src])
+            .await
+            .unwrap();
+
+        assert_eq!(result.epoch, 5);
+        assert_eq!(result.operators_restored, 1);
+        assert_eq!(result.sources_seeked, 1);
+        assert!(src.position.is_some());
+    }
+
+    #[tokio::test]
+    async fn test_typed_recovery_unreachable_position() {
+        let ckpt = setup_checkpointer().await;
+        let id = CheckpointId::now();
+
+        save_checkpoint(
+            &ckpt,
+            &id,
+            5,
+            vec![("op1", b"state", false)],
+            vec![("kafka-src", HashMap::from([
+                ("group_id".into(), "g1".into()),
+                ("events-0".into(), "100".into()),
+            ]))],
+            None,
+        )
+        .await;
+
+        // Set source_type to kafka
+        {
+            let mut manifest = ckpt.load_manifest(&id).await.unwrap();
+            manifest.source_offsets.get_mut("kafka-src").unwrap().source_type = "kafka".into();
+            ckpt.save_manifest(&manifest).await.unwrap();
+        }
+
+        let rm = RecoveryManager::new(
+            ckpt,
+            RecoveryConfig {
+                max_fallback_attempts: 1,
+                ..Default::default()
+            },
+        );
+        let mut op = TestRestorable::new("op1");
+        let mut src = TestTypedSeekable::unreachable("kafka-src");
+
+        let result = rm
+            .recover_typed(&mut [&mut op], &mut [&mut src])
+            .await;
+        assert!(result.is_err());
     }
 }

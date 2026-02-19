@@ -54,6 +54,12 @@ pub use checkpoint::layout::{
     CheckpointId, CheckpointManifestV2, CheckpointPaths, OperatorSnapshotEntry,
     PartitionSnapshotEntry, SourceOffsetEntry,
 };
+pub use checkpoint::source_offsets::{
+    DeterminismValidator, DeterminismWarning, FilePosition, GenericPosition,
+    KafkaPartitionOffset, KafkaPosition, MysqlCdcPosition, OperatorDescriptor,
+    OperatorDeterminismWarning, PostgresCdcPosition, RecoveryPlan, SourceId, SourceOffset,
+    SourcePosition, WarningSeverity,
+};
 pub use checkpoint_manifest::{CheckpointManifest, ConnectorCheckpoint, OperatorCheckpoint};
 pub use checkpoint_store::{CheckpointStore, CheckpointStoreError, FileSystemCheckpointStore};
 pub use wal::{WalEntry, WalError, WalPosition, WriteAheadLog};

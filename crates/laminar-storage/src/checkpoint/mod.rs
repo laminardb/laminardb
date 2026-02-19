@@ -10,6 +10,8 @@ pub mod checkpointer;
 pub mod layout;
 /// Distributed recovery manager for Phase 6a.
 pub mod recovery;
+/// Typed source position tracking for checkpoint recovery.
+pub mod source_offsets;
 
 use std::collections::HashMap;
 use std::fs;
