@@ -73,12 +73,18 @@ pub struct LookupJoinNode {
     join_type: LookupJoinType,
     /// Predicates to push down to the lookup source.
     pushdown_predicates: Vec<Expr>,
+    /// Predicates evaluated locally after the join.
+    local_predicates: Vec<Expr>,
     /// Required columns from the lookup table.
     required_lookup_columns: HashSet<String>,
     /// Combined output schema (stream + lookup columns).
     output_schema: DFSchemaRef,
     /// Metadata about the lookup table.
     metadata: LookupTableMetadata,
+    /// Alias for the lookup table (for qualified column resolution).
+    lookup_alias: Option<String>,
+    /// Alias for the stream input (for qualified column resolution).
+    stream_alias: Option<String>,
 }
 
 impl PartialEq for LookupJoinNode {
@@ -87,6 +93,7 @@ impl PartialEq for LookupJoinNode {
             && self.join_keys == other.join_keys
             && self.join_type == other.join_type
             && self.pushdown_predicates == other.pushdown_predicates
+            && self.local_predicates == other.local_predicates
             && self.required_lookup_columns == other.required_lookup_columns
             && self.metadata == other.metadata
     }
@@ -100,6 +107,7 @@ impl Hash for LookupJoinNode {
         self.join_keys.hash(state);
         self.join_type.hash(state);
         self.pushdown_predicates.hash(state);
+        self.local_predicates.hash(state);
         self.metadata.hash(state);
         // HashSet doesn't implement Hash; hash sorted elements instead
         let mut cols: Vec<&String> = self.required_lookup_columns.iter().collect();
@@ -136,10 +144,32 @@ impl LookupJoinNode {
             join_keys,
             join_type,
             pushdown_predicates,
+            local_predicates: vec![],
             required_lookup_columns,
             output_schema,
             metadata,
+            lookup_alias: None,
+            stream_alias: None,
         }
+    }
+
+    /// Sets predicates to be evaluated locally after the join.
+    #[must_use]
+    pub fn with_local_predicates(mut self, predicates: Vec<Expr>) -> Self {
+        self.local_predicates = predicates;
+        self
+    }
+
+    /// Sets table aliases for qualified column resolution.
+    #[must_use]
+    pub fn with_aliases(
+        mut self,
+        lookup_alias: Option<String>,
+        stream_alias: Option<String>,
+    ) -> Self {
+        self.lookup_alias = lookup_alias;
+        self.stream_alias = stream_alias;
+        self
     }
 
     /// Returns the lookup table name.
@@ -183,6 +213,24 @@ impl LookupJoinNode {
     pub fn lookup_schema(&self) -> &DFSchemaRef {
         &self.lookup_schema
     }
+
+    /// Returns the local predicates (evaluated after the join).
+    #[must_use]
+    pub fn local_predicates(&self) -> &[Expr] {
+        &self.local_predicates
+    }
+
+    /// Returns the lookup table alias.
+    #[must_use]
+    pub fn lookup_alias(&self) -> Option<&str> {
+        self.lookup_alias.as_deref()
+    }
+
+    /// Returns the stream input alias.
+    #[must_use]
+    pub fn stream_alias(&self) -> Option<&str> {
+        self.stream_alias.as_deref()
+    }
 }
 
 impl UserDefinedLogicalNodeCore for LookupJoinNode {
@@ -203,6 +251,7 @@ impl UserDefinedLogicalNodeCore for LookupJoinNode {
             .iter()
             .map(|k| k.stream_expr.clone())
             .chain(self.pushdown_predicates.clone())
+            .chain(self.local_predicates.clone())
             .collect()
     }
 
@@ -214,10 +263,12 @@ impl UserDefinedLogicalNodeCore for LookupJoinNode {
             .collect();
         write!(
             f,
-            "LookupJoin: table={}, keys=[{}], type={}",
+            "LookupJoin: table={}, keys=[{}], type={}, pushdown={}, local={}",
             self.lookup_table,
             keys.join(", "),
             self.join_type,
+            self.pushdown_predicates.len(),
+            self.local_predicates.len(),
         )
     }
 
@@ -228,9 +279,12 @@ impl UserDefinedLogicalNodeCore for LookupJoinNode {
     ) -> Result<Self> {
         let input = inputs.swap_remove(0);
 
-        // Split expressions: first N are join keys, rest are pushdown predicates
+        // Split expressions: keys | pushdown predicates | local predicates
         let num_keys = self.join_keys.len();
-        let (key_exprs, pred_exprs) = exprs.split_at(num_keys.min(exprs.len()));
+        let num_pushdown = self.pushdown_predicates.len();
+        let (key_exprs, rest) = exprs.split_at(num_keys.min(exprs.len()));
+        let (pushdown_exprs, local_exprs) =
+            rest.split_at(num_pushdown.min(rest.len()));
 
         let join_keys: Vec<JoinKeyPair> = key_exprs
             .iter()
@@ -247,10 +301,13 @@ impl UserDefinedLogicalNodeCore for LookupJoinNode {
             lookup_schema: Arc::clone(&self.lookup_schema),
             join_keys,
             join_type: self.join_type,
-            pushdown_predicates: pred_exprs.to_vec(),
+            pushdown_predicates: pushdown_exprs.to_vec(),
+            local_predicates: local_exprs.to_vec(),
             required_lookup_columns: self.required_lookup_columns.clone(),
             output_schema: Arc::clone(&self.output_schema),
             metadata: self.metadata.clone(),
+            lookup_alias: self.lookup_alias.clone(),
+            stream_alias: self.stream_alias.clone(),
         })
     }
 }

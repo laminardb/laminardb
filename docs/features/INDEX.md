@@ -11,10 +11,10 @@
 | Phase 3 | 77 | 9 | 0 | 0 | 68 | 0 |
 | Phase 4 | 11 | 11 | 0 | 0 | 0 | 0 |
 | Phase 5 | 10 | 10 | 0 | 0 | 0 | 0 |
-| Phase 6a | 27 | 15 | 0 | 0 | 10 | 2 |
+| Phase 6a | 27 | 10 | 0 | 0 | 15 | 2 |
 | Phase 6b | 14 | 14 | 0 | 0 | 0 | 0 |
 | Phase 6c | 10 | 9 | 0 | 0 | 0 | 1 |
-| **Total** | **212** | **68** | **0** | **0** | **141** | **3** |
+| **Total** | **212** | **63** | **0** | **0** | **146** | **3** |
 
 ## Status Legend
 
@@ -359,9 +359,9 @@ See [Constellation Index](constellation/INDEX.md) for full details, dependency g
 | F-LOOKUP-002 | LookupSource Trait | 📝 | [Link](constellation/lookup/F-LOOKUP-002-lookup-source-trait.md) |
 | F-LOOKUP-003 | Predicate Types | ✅ | [Link](constellation/lookup/F-LOOKUP-003-predicate-types.md) |
 | F-LOOKUP-004 | foyer In-Memory Cache (Ring 0) | 📝 | [Link](constellation/lookup/F-LOOKUP-004-foyer-memory-cache.md) |
-| F-LOOKUP-005 | foyer Hybrid Cache (Ring 1) | 📝 | [Link](constellation/lookup/F-LOOKUP-005-foyer-hybrid-cache.md) |
+| F-LOOKUP-005 | foyer Hybrid Cache (Ring 1) | ✅ | [Link](constellation/lookup/F-LOOKUP-005-foyer-hybrid-cache.md) |
 | F-LOOKUP-006 | CDC-to-Cache Adapter | 📝 | [Link](constellation/lookup/F-LOOKUP-006-cdc-cache-adapter.md) |
-| F-LOOKUP-007 | PostgresLookupSource | 📝 | [Link](constellation/lookup/F-LOOKUP-007-postgres-lookup-source.md) |
+| F-LOOKUP-007 | PostgresLookupSource | ✅ | [Link](constellation/lookup/F-LOOKUP-007-postgres-lookup-source.md) |
 | F-LOOKUP-008 | ParquetLookupSource | 📝 | [Link](constellation/lookup/F-LOOKUP-008-parquet-lookup-source.md) |
 | F-LOOKUP-010 | Remove RocksDB Dependency | 📝 | [Link](constellation/lookup/F-LOOKUP-010-rocksdb-removal.md) |
 
@@ -393,9 +393,9 @@ See [Constellation Index](constellation/INDEX.md) for full details, dependency g
 
 | ID | Feature | Status | Spec |
 |----|---------|--------|------|
-| F-LSQL-001 | CREATE LOOKUP TABLE DDL | 📝 | [Link](constellation/sql/F-LSQL-001-create-lookup-table.md) |
-| F-LSQL-002 | Lookup Join Plan Node | 📝 | [Link](constellation/sql/F-LSQL-002-lookup-join-plan-node.md) |
-| F-LSQL-003 | Predicate Splitting & Pushdown | 📝 | [Link](constellation/sql/F-LSQL-003-predicate-splitting.md) |
+| F-LSQL-001 | CREATE LOOKUP TABLE DDL | ✅ | [Link](constellation/sql/F-LSQL-001-create-lookup-table.md) |
+| F-LSQL-002 | Lookup Join Plan Node | ✅ | [Link](constellation/sql/F-LSQL-002-lookup-join-plan-node.md) |
+| F-LSQL-003 | Predicate Splitting & Pushdown | ✅ | [Link](constellation/sql/F-LSQL-003-predicate-splitting.md) |
 
 #### Performance Benchmarks (Baseline)
 

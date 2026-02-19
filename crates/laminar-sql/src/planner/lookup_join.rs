@@ -84,6 +84,12 @@ impl OptimizerRule for LookupJoinRewriteRule {
             (join.right.as_ref(), join.left.as_ref())
         };
 
+        // Extract aliases for qualified column resolution (C7)
+        let stream_alias =
+            scan_table_name_and_alias(stream_plan).and_then(|(_, a)| a);
+        let lookup_alias =
+            scan_table_name_and_alias(lookup_plan).and_then(|(_, a)| a);
+
         let lookup_schema = lookup_plan.schema().clone();
 
         // Build join key pairs from the equijoin conditions
@@ -154,7 +160,8 @@ impl OptimizerRule for LookupJoinRewriteRule {
             required_columns,
             output_schema,
             metadata,
-        );
+        )
+        .with_aliases(lookup_alias, stream_alias);
 
         Ok(Transformed::yes(LogicalPlan::Extension(Extension {
             node: Arc::new(node),
@@ -219,6 +226,11 @@ impl OptimizerRule for LookupColumnPruningRule {
             used,
             schema.clone(),
             node.metadata().clone(),
+        )
+        .with_local_predicates(node.local_predicates().to_vec())
+        .with_aliases(
+            node.lookup_alias().map(String::from),
+            node.stream_alias().map(String::from),
         );
 
         Ok(Transformed::yes(LogicalPlan::Extension(Extension {
@@ -227,15 +239,27 @@ impl OptimizerRule for LookupColumnPruningRule {
     }
 }
 
-/// Extracts the table name from a `TableScan` node, unwrapping aliases.
-fn scan_table_name(plan: &LogicalPlan) -> Option<String> {
+/// Extracts the table name and optional alias from a plan node.
+///
+/// Returns `(base_table_name, alias)` — alias is the `SubqueryAlias` name
+/// if the scan is wrapped in one, `None` otherwise.
+fn scan_table_name_and_alias(plan: &LogicalPlan) -> Option<(String, Option<String>)> {
     match plan {
         LogicalPlan::TableScan(TableScan { table_name, .. }) => {
-            Some(table_name.table().to_string())
+            Some((table_name.table().to_string(), None))
         }
-        LogicalPlan::SubqueryAlias(alias) => scan_table_name(&alias.input),
+        LogicalPlan::SubqueryAlias(alias) => {
+            let alias_name = alias.alias.table().to_string();
+            scan_table_name_and_alias(&alias.input)
+                .map(|(base, _)| (base, Some(alias_name)))
+        }
         _ => None,
     }
+}
+
+/// Extracts the table name from a `TableScan` node, unwrapping aliases.
+fn scan_table_name(plan: &LogicalPlan) -> Option<String> {
+    scan_table_name_and_alias(plan).map(|(name, _)| name)
 }
 
 /// Display helpers for connector/strategy/pushdown types.

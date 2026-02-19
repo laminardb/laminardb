@@ -7,6 +7,8 @@
 pub mod channel_derivation;
 /// Optimizer rules for lookup join rewriting.
 pub mod lookup_join;
+/// Predicate splitting and pushdown for lookup joins.
+pub mod predicate_split;
 
 use std::collections::HashMap;
 
