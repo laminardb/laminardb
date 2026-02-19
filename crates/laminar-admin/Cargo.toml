@@ -12,7 +12,7 @@ description = "Administration interface for LaminarDB"
 [dependencies]
 # Web framework
 axum = "0.8"
-tower = "0.4"
+tower = "0.5"
 tower-http = { version = "0.5", features = ["fs", "cors"] }
 
 # API documentation
@@ -28,4 +28,4 @@ thiserror = { workspace = true }
 tracing = { workspace = true }
 
 [dev-dependencies]
-tower = { version = "0.4", features = ["util"] }
+tower = { version = "0.5", features = ["util"] }
