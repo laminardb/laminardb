@@ -13,7 +13,7 @@ description = "Administration interface for LaminarDB"
 # Web framework
 axum = "0.8"
 tower = "0.4"
-tower-http = { version = "0.5", features = ["fs", "cors"] }
+tower-http = { version = "0.6", features = ["fs", "cors"] }
 
 # API documentation
 utoipa = { version = "5.4", features = ["axum_extras"] }
