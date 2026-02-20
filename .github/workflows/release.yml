@@ -177,7 +177,7 @@ jobs:
           fi
 
       - name: Upload artifact
-        uses: actions/upload-artifact@v4
+        uses: actions/upload-artifact@v6
         with:
           name: build-${{ matrix.target }}
           path: laminardb-${{ matrix.target }}-v*.tar.gz
@@ -185,7 +185,7 @@ jobs:
 
       - name: Upload artifact (Windows)
         if: matrix.os == 'windows-latest'
-        uses: actions/upload-artifact@v4
+        uses: actions/upload-artifact@v6
         with:
           name: build-${{ matrix.target }}
           path: laminardb-${{ matrix.target }}-v*.zip
