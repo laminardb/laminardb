@@ -89,7 +89,7 @@ xorf = "0.12"
 base64 = "0.22"
 
 # Randomness
-rand = "0.9"
+rand = "0.10"
 
 # JIT compilation (Cranelift)
 cranelift-codegen = "0.128"
