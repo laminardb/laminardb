@@ -76,9 +76,11 @@ pub mod execute;
 pub mod lookup_join;
 mod source;
 mod table_provider;
+/// Processing-time UDF for `PROCTIME()` support
+pub mod proctime_udf;
 /// Watermark UDF for current watermark access
 pub mod watermark_udf;
-/// Window function UDFs (TUMBLE, HOP, SESSION)
+/// Window function UDFs (TUMBLE, HOP, SESSION, CUMULATE)
 pub mod window_udf;
 
 pub use aggregate_bridge::{
@@ -91,8 +93,9 @@ pub use exec::StreamingScanExec;
 pub use execute::{execute_streaming_sql, DdlResult, QueryResult, StreamingSqlResult};
 pub use source::{SortColumn, StreamSource, StreamSourceRef};
 pub use table_provider::StreamingTableProvider;
+pub use proctime_udf::ProcTimeUdf;
 pub use watermark_udf::WatermarkUdf;
-pub use window_udf::{HopWindowStart, SessionWindowStart, TumbleWindowStart};
+pub use window_udf::{CumulateWindowStart, HopWindowStart, SessionWindowStart, TumbleWindowStart};
 
 use std::sync::atomic::AtomicI64;
 use std::sync::Arc;
@@ -143,7 +146,9 @@ pub fn register_streaming_functions(ctx: &SessionContext) {
     ctx.register_udf(ScalarUDF::new_from_impl(TumbleWindowStart::new()));
     ctx.register_udf(ScalarUDF::new_from_impl(HopWindowStart::new()));
     ctx.register_udf(ScalarUDF::new_from_impl(SessionWindowStart::new()));
+    ctx.register_udf(ScalarUDF::new_from_impl(CumulateWindowStart::new()));
     ctx.register_udf(ScalarUDF::new_from_impl(WatermarkUdf::unset()));
+    ctx.register_udf(ScalarUDF::new_from_impl(ProcTimeUdf::new()));
 }
 
 /// Registers streaming UDFs with a live watermark source.
@@ -163,7 +168,9 @@ pub fn register_streaming_functions_with_watermark(
     ctx.register_udf(ScalarUDF::new_from_impl(TumbleWindowStart::new()));
     ctx.register_udf(ScalarUDF::new_from_impl(HopWindowStart::new()));
     ctx.register_udf(ScalarUDF::new_from_impl(SessionWindowStart::new()));
+    ctx.register_udf(ScalarUDF::new_from_impl(CumulateWindowStart::new()));
     ctx.register_udf(ScalarUDF::new_from_impl(WatermarkUdf::new(watermark_ms)));
+    ctx.register_udf(ScalarUDF::new_from_impl(ProcTimeUdf::new()));
 }
 
 #[cfg(test)]

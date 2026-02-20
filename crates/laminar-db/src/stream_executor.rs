@@ -849,6 +849,16 @@ fn compute_closed_boundary(watermark_ms: i64, config: &WindowOperatorConfig) -> 
             let base = watermark_ms.saturating_sub(size);
             (base / slide + 1) * slide
         }
+        WindowType::Cumulate => {
+            // Cumulate windows share the same epoch alignment as tumbling.
+            // A full epoch is closed when watermark >= epoch_end.
+            #[allow(clippy::cast_possible_truncation)]
+            let size = config.size.as_millis() as i64;
+            if size <= 0 {
+                return watermark_ms;
+            }
+            (watermark_ms / size) * size
+        }
     }
 }
 

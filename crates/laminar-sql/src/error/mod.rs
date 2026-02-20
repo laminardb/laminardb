@@ -268,6 +268,17 @@ pub fn translate_datafusion_error_with_context(
 fn check_window_errors(clean: &str) -> Option<TranslatedError> {
     let lower = clean.to_ascii_lowercase();
 
+    // "Window error:" prefix from parser — classify as WINDOW_INVALID
+    if lower.starts_with("window error:") {
+        return Some(TranslatedError {
+            code: codes::WINDOW_INVALID,
+            message: format!("Invalid window specification: {clean}"),
+            hint: Some(
+                "Supported window types: TUMBLE, HOP, SESSION, CUMULATE".to_string(),
+            ),
+        });
+    }
+
     if lower.contains("watermark") && (lower.contains("required") || lower.contains("missing")) {
         return Some(TranslatedError {
             code: codes::WATERMARK_REQUIRED,
@@ -287,7 +298,7 @@ fn check_window_errors(clean: &str) -> Option<TranslatedError> {
             code: codes::WINDOW_INVALID,
             message: format!("Invalid window specification: {clean}"),
             hint: Some(
-                "Supported window types: TUMBLE, HOP, SESSION".to_string(),
+                "Supported window types: TUMBLE, HOP, SESSION, CUMULATE".to_string(),
             ),
         });
     }
@@ -303,12 +314,54 @@ fn check_window_errors(clean: &str) -> Option<TranslatedError> {
         });
     }
 
+    // Late data rejected/dropped
+    if lower.contains("late")
+        && (lower.contains("data") || lower.contains("event"))
+        && (lower.contains("rejected") || lower.contains("dropped"))
+    {
+        return Some(TranslatedError {
+            code: codes::LATE_DATA_REJECTED,
+            message: format!("Late data rejected: {clean}"),
+            hint: Some(
+                "Increase the allowed lateness with ALLOWED LATENESS INTERVAL, \
+                 or route late data to a side output"
+                    .to_string(),
+            ),
+        });
+    }
+
     None
 }
 
 /// Check for join-related error patterns.
 fn check_join_errors(clean: &str) -> Option<TranslatedError> {
     let lower = clean.to_ascii_lowercase();
+
+    // "Streaming SQL error:" prefix — classify sub-patterns
+    if lower.starts_with("streaming sql error:") {
+        if lower.contains("using clause requires") {
+            return Some(TranslatedError {
+                code: codes::JOIN_KEY_MISSING,
+                message: format!("Join key error: {clean}"),
+                hint: Some(
+                    "Ensure the USING clause references columns that exist \
+                     in both sides of the join"
+                        .to_string(),
+                ),
+            });
+        }
+        if lower.contains("cannot extract time bound") || lower.contains("tolerance") {
+            return Some(TranslatedError {
+                code: codes::JOIN_TIME_BOUND_MISSING,
+                message: format!("Join time bound required: {clean}"),
+                hint: Some(
+                    "Stream-stream joins require a time bound in the ON clause, e.g.: \
+                     AND b.ts BETWEEN a.ts AND a.ts + INTERVAL '1' HOUR"
+                        .to_string(),
+                ),
+            });
+        }
+    }
 
     if lower.contains("join") && lower.contains("key") && lower.contains("not found") {
         return Some(TranslatedError {
@@ -343,6 +396,24 @@ fn check_join_errors(clean: &str) -> Option<TranslatedError> {
             message: format!("Temporal join error: {clean}"),
             hint: Some(
                 "The right-side table of a temporal join requires a PRIMARY KEY"
+                    .to_string(),
+            ),
+        });
+    }
+
+    // Unsupported join types for streaming
+    if (lower.contains("not supported for streaming")
+        || lower.contains("natural join not supported")
+        || lower.contains("cross join not supported")
+        || lower.contains("unsupported join"))
+        && lower.contains("join")
+    {
+        return Some(TranslatedError {
+            code: codes::JOIN_TYPE_UNSUPPORTED,
+            message: format!("Unsupported join type: {clean}"),
+            hint: Some(
+                "Streaming queries support INNER, LEFT, RIGHT, and FULL OUTER joins \
+                 with time bounds. CROSS and NATURAL joins are not supported."
                     .to_string(),
             ),
         });
@@ -566,5 +637,62 @@ mod tests {
         );
         assert_eq!(t.code, codes::TEMPORAL_JOIN_NO_PK);
         assert!(t.hint.unwrap().contains("PRIMARY KEY"));
+    }
+
+    // -- LDB-2004 LATE_DATA_REJECTED tests --
+
+    #[test]
+    fn test_late_data_rejected() {
+        let t = translate_datafusion_error("late data rejected by window policy");
+        assert_eq!(t.code, codes::LATE_DATA_REJECTED);
+        assert!(t.hint.unwrap().contains("lateness"));
+    }
+
+    #[test]
+    fn test_late_event_dropped() {
+        let t = translate_datafusion_error("late event dropped after window close");
+        assert_eq!(t.code, codes::LATE_DATA_REJECTED);
+    }
+
+    // -- "Window error:" prefix test --
+
+    #[test]
+    fn test_window_error_prefix() {
+        let t = translate_datafusion_error("Window error: CUMULATE requires step <= size");
+        assert_eq!(t.code, codes::WINDOW_INVALID);
+        assert!(t.hint.unwrap().contains("CUMULATE"));
+    }
+
+    // -- LDB-3004 JOIN_TYPE_UNSUPPORTED tests --
+
+    #[test]
+    fn test_join_type_unsupported_cross() {
+        let t = translate_datafusion_error("cross join not supported for streaming queries");
+        assert_eq!(t.code, codes::JOIN_TYPE_UNSUPPORTED);
+        assert!(t.hint.unwrap().contains("CROSS"));
+    }
+
+    #[test]
+    fn test_join_type_unsupported_natural() {
+        let t = translate_datafusion_error("natural join not supported in streaming context");
+        assert_eq!(t.code, codes::JOIN_TYPE_UNSUPPORTED);
+    }
+
+    // -- "Streaming SQL error:" prefix tests --
+
+    #[test]
+    fn test_streaming_sql_error_using_clause() {
+        let t = translate_datafusion_error(
+            "Streaming SQL error: using clause requires matching columns",
+        );
+        assert_eq!(t.code, codes::JOIN_KEY_MISSING);
+    }
+
+    #[test]
+    fn test_streaming_sql_error_time_bound() {
+        let t = translate_datafusion_error(
+            "Streaming SQL error: cannot extract time bound from ON clause",
+        );
+        assert_eq!(t.code, codes::JOIN_TIME_BOUND_MISSING);
     }
 }

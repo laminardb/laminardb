@@ -170,8 +170,8 @@ pub use partitioned_watermark::{
 
 pub use watermark::{
     AscendingTimestampsGenerator, BoundedOutOfOrdernessGenerator, MeteredGenerator,
-    PeriodicGenerator, PunctuatedGenerator, SourceProvidedGenerator, WatermarkGenerator,
-    WatermarkMetrics, WatermarkTracker,
+    PeriodicGenerator, ProcessingTimeGenerator, PunctuatedGenerator, SourceProvidedGenerator,
+    WatermarkGenerator, WatermarkMetrics, WatermarkTracker,
 };
 
 use smallvec::SmallVec;

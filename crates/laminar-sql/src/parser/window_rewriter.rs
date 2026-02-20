@@ -126,7 +126,7 @@ impl WindowRewriter {
             Expr::Function(func) => {
                 if let Some(name) = func.name.0.last() {
                     let func_name = name.to_string().to_uppercase();
-                    matches!(func_name.as_str(), "TUMBLE" | "HOP" | "SLIDE" | "SESSION")
+                    matches!(func_name.as_str(), "TUMBLE" | "HOP" | "SLIDE" | "SESSION" | "CUMULATE")
                 } else {
                     false
                 }
@@ -169,6 +169,7 @@ impl WindowRewriter {
                     "TUMBLE" => Self::parse_tumble_args(&args),
                     "HOP" | "SLIDE" => Self::parse_hop_args(&args),
                     "SESSION" => Self::parse_session_args(&args),
+                    "CUMULATE" => Self::parse_cumulate_args(&args),
                     _ => Ok(None),
                 }
             }
@@ -255,6 +256,22 @@ impl WindowRewriter {
         }))
     }
 
+    /// Parse CUMULATE(time_column, step_interval, max_size_interval) arguments.
+    fn parse_cumulate_args(args: &[Expr]) -> Result<Option<WindowFunction>, ParseError> {
+        if args.len() != 3 {
+            return Err(ParseError::WindowError(format!(
+                "CUMULATE requires 3 arguments (time_column, step_interval, max_size_interval), got {}",
+                args.len()
+            )));
+        }
+
+        Ok(Some(WindowFunction::Cumulate {
+            time_column: Box::new(args[0].clone()),
+            step_interval: Box::new(args[1].clone()),
+            max_size_interval: Box::new(args[2].clone()),
+        }))
+    }
+
     /// Extract the time column name from a window function.
     ///
     /// Returns the column name as a string if extractable.
@@ -263,7 +280,8 @@ impl WindowRewriter {
         let expr = match window {
             WindowFunction::Tumble { time_column, .. }
             | WindowFunction::Hop { time_column, .. }
-            | WindowFunction::Session { time_column, .. } => time_column.as_ref(),
+            | WindowFunction::Session { time_column, .. }
+            | WindowFunction::Cumulate { time_column, .. } => time_column.as_ref(),
         };
 
         match expr {
@@ -650,6 +668,91 @@ mod tests {
 
                 if let WindowFunction::Tumble { time_column, .. } = window {
                     assert_eq!(time_column.to_string(), "event_time");
+                }
+            }
+        }
+    }
+
+    #[test]
+    fn test_contains_cumulate_window_function() {
+        let sql = "SELECT CUMULATE(ts, INTERVAL '1' MINUTE, INTERVAL '5' MINUTE) FROM events";
+        let dialect = GenericDialect {};
+        let statements = Parser::parse_sql(&dialect, sql).unwrap();
+
+        if let Statement::Query(query) = &statements[0] {
+            if let SetExpr::Select(select) = &*query.body {
+                if let SelectItem::UnnamedExpr(expr) = &select.projection[0] {
+                    assert!(WindowRewriter::contains_window_function(expr));
+                }
+            }
+        }
+    }
+
+    #[test]
+    fn test_extract_cumulate_with_actual_args() {
+        let sql =
+            "SELECT CUMULATE(order_time, INTERVAL '1' MINUTE, INTERVAL '5' MINUTE) FROM orders";
+        let dialect = GenericDialect {};
+        let statements = Parser::parse_sql(&dialect, sql).unwrap();
+
+        if let Statement::Query(query) = &statements[0] {
+            if let SetExpr::Select(select) = &*query.body {
+                if let SelectItem::UnnamedExpr(expr) = &select.projection[0] {
+                    let window = WindowRewriter::extract_window_function(expr)
+                        .unwrap()
+                        .unwrap();
+
+                    match window {
+                        WindowFunction::Cumulate {
+                            time_column,
+                            step_interval,
+                            max_size_interval,
+                        } => {
+                            assert_eq!(time_column.to_string(), "order_time");
+                            assert!(step_interval.to_string().contains('1'));
+                            assert!(max_size_interval.to_string().contains('5'));
+                        }
+                        _ => panic!("Expected Cumulate window"),
+                    }
+                }
+            }
+        }
+    }
+
+    #[test]
+    fn test_cumulate_wrong_args_count() {
+        let sql = "SELECT CUMULATE(ts, INTERVAL '1' MINUTE) FROM events";
+        let dialect = GenericDialect {};
+        let statements = Parser::parse_sql(&dialect, sql).unwrap();
+
+        if let Statement::Query(query) = &statements[0] {
+            if let SetExpr::Select(select) = &*query.body {
+                if let SelectItem::UnnamedExpr(expr) = &select.projection[0] {
+                    let result = WindowRewriter::extract_window_function(expr);
+                    assert!(result.is_err());
+                    let err = result.unwrap_err();
+                    assert!(err.to_string().contains("3 arguments"));
+                }
+            }
+        }
+    }
+
+    #[test]
+    fn test_cumulate_time_column_name() {
+        let sql =
+            "SELECT CUMULATE(my_ts, INTERVAL '1' MINUTE, INTERVAL '5' MINUTE) FROM events";
+        let dialect = GenericDialect {};
+        let statements = Parser::parse_sql(&dialect, sql).unwrap();
+
+        if let Statement::Query(query) = &statements[0] {
+            if let SetExpr::Select(select) = &*query.body {
+                if let SelectItem::UnnamedExpr(expr) = &select.projection[0] {
+                    let window = WindowRewriter::extract_window_function(expr)
+                        .unwrap()
+                        .unwrap();
+
+                    let col_name = WindowRewriter::get_time_column_name(&window);
+                    assert_eq!(col_name, Some("my_ts".to_string()));
                 }
             }
         }

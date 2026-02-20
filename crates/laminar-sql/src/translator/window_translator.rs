@@ -18,6 +18,8 @@ pub enum WindowType {
     Sliding,
     /// Dynamic windows based on activity gaps
     Session,
+    /// Incrementally growing windows within fixed-size epochs
+    Cumulate,
 }
 
 /// Complete configuration for instantiating a window operator.
@@ -72,6 +74,7 @@ impl std::fmt::Display for WindowType {
             WindowType::Tumbling => write!(f, "TUMBLE"),
             WindowType::Sliding => write!(f, "HOP"),
             WindowType::Session => write!(f, "SESSION"),
+            WindowType::Cumulate => write!(f, "CUMULATE"),
         }
     }
 }
@@ -104,6 +107,16 @@ impl std::fmt::Display for WindowOperatorConfig {
                     "SESSION({}, GAP {})",
                     self.time_column,
                     format_duration(gap)
+                )
+            }
+            WindowType::Cumulate => {
+                let step = self.slide.unwrap_or(self.size);
+                write!(
+                    f,
+                    "CUMULATE({}, STEP {} SIZE {})",
+                    self.time_column,
+                    format_duration(step),
+                    format_duration(self.size)
                 )
             }
         }
@@ -156,6 +169,24 @@ impl WindowOperatorConfig {
         }
     }
 
+    /// Create a new cumulate window configuration.
+    ///
+    /// `step` is the window growth increment and `max_size` is the epoch
+    /// size. The `slide` field is reused to store the step interval.
+    #[must_use]
+    pub fn cumulate(time_column: String, step: Duration, max_size: Duration) -> Self {
+        Self {
+            window_type: WindowType::Cumulate,
+            time_column,
+            size: max_size,
+            slide: Some(step),
+            gap: None,
+            allowed_lateness: Duration::ZERO,
+            emit_strategy: EmitStrategy::OnWatermark,
+            late_data_side_output: None,
+        }
+    }
+
     /// Build configuration from a parsed `WindowFunction`.
     ///
     /// # Errors
@@ -185,6 +216,15 @@ impl WindowOperatorConfig {
             WindowFunction::Session { gap_interval, .. } => {
                 let gap = WindowRewriter::parse_interval_to_duration(gap_interval)?;
                 Ok(Self::session(time_column, gap))
+            }
+            WindowFunction::Cumulate {
+                step_interval,
+                max_size_interval,
+                ..
+            } => {
+                let step = WindowRewriter::parse_interval_to_duration(step_interval)?;
+                let max_size = WindowRewriter::parse_interval_to_duration(max_size_interval)?;
+                Ok(Self::cumulate(time_column, step, max_size))
             }
         }
     }
@@ -498,10 +538,51 @@ mod tests {
     }
 
     #[test]
+    fn test_cumulate_config() {
+        let config = WindowOperatorConfig::cumulate(
+            "ts".to_string(),
+            Duration::from_secs(60),
+            Duration::from_secs(300),
+        );
+
+        assert_eq!(config.window_type, WindowType::Cumulate);
+        assert_eq!(config.time_column, "ts");
+        assert_eq!(config.size, Duration::from_secs(300));
+        assert_eq!(config.slide, Some(Duration::from_secs(60)));
+        assert!(config.gap.is_none());
+    }
+
+    #[test]
+    fn test_cumulate_from_window_function() {
+        let window = WindowFunction::Cumulate {
+            time_column: Box::new(Expr::Identifier(Ident::new("event_time"))),
+            step_interval: Box::new(Expr::Identifier(Ident::new("1 MINUTE"))),
+            max_size_interval: Box::new(Expr::Identifier(Ident::new("5 MINUTE"))),
+        };
+        let config = WindowOperatorConfig::from_window_function(&window).unwrap();
+
+        assert_eq!(config.window_type, WindowType::Cumulate);
+        assert_eq!(config.time_column, "event_time");
+        assert_eq!(config.size, Duration::from_secs(300));
+        assert_eq!(config.slide, Some(Duration::from_secs(60)));
+    }
+
+    #[test]
+    fn test_display_cumulate_window() {
+        let config = WindowOperatorConfig::cumulate(
+            "ts".to_string(),
+            Duration::from_secs(60),
+            Duration::from_secs(300),
+        );
+        assert_eq!(format!("{config}"), "CUMULATE(ts, STEP 1m SIZE 5m)");
+    }
+
+    #[test]
     fn test_display_window_type() {
         assert_eq!(format!("{}", WindowType::Tumbling), "TUMBLE");
         assert_eq!(format!("{}", WindowType::Sliding), "HOP");
         assert_eq!(format!("{}", WindowType::Session), "SESSION");
+        assert_eq!(format!("{}", WindowType::Cumulate), "CUMULATE");
     }
 
     #[test]

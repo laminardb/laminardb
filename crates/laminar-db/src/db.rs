@@ -8,7 +8,6 @@ use arrow::datatypes::{DataType, Field, Schema};
 use datafusion::prelude::SessionContext;
 
 use laminar_core::streaming;
-use laminar_core::time::WatermarkGenerator;
 use laminar_sql::parser::{parse_streaming_sql, ShowCommand, StreamingStatement};
 use laminar_sql::planner::StreamingPlanner;
 use laminar_sql::register_streaming_functions;
@@ -100,10 +99,10 @@ pub struct LaminarDB {
 /// Per-source watermark tracking state for the pipeline loop.
 ///
 /// Combines an `EventTimeExtractor` (to find the max timestamp in each batch)
-/// with a `BoundedOutOfOrdernessGenerator` (to compute the watermark with delay).
+/// with a watermark generator (to compute the watermark with delay).
 struct SourceWatermarkState {
     extractor: laminar_core::time::EventTimeExtractor,
-    generator: laminar_core::time::BoundedOutOfOrdernessGenerator,
+    generator: Box<dyn laminar_core::time::WatermarkGenerator>,
     /// Watermark column name for late-row filtering.
     column: String,
     /// Timestamp format for late-row filtering.
@@ -247,6 +246,20 @@ impl LaminarDB {
     #[must_use]
     pub fn connector_registry(&self) -> &laminar_connectors::registry::ConnectorRegistry {
         &self.connector_registry
+    }
+
+    /// Register a custom scalar UDF on the `SessionContext`.
+    ///
+    /// Called by `LaminarDbBuilder::build()` after construction.
+    pub(crate) fn register_custom_udf(&self, udf: datafusion_expr::ScalarUDF) {
+        self.ctx.register_udf(udf);
+    }
+
+    /// Register a custom aggregate UDF (UDAF) on the `SessionContext`.
+    ///
+    /// Called by `LaminarDbBuilder::build()` after construction.
+    pub(crate) fn register_custom_udaf(&self, udaf: datafusion_expr::AggregateUDF) {
+        self.ctx.register_udaf(udaf);
     }
 
     /// Execute a SQL statement.
@@ -444,6 +457,17 @@ impl LaminarDB {
                 None,
             )?)
         };
+
+        // Mark processing-time sources
+        if let Some(ref wm) = source_def.watermark {
+            if wm.is_processing_time {
+                if let Some(ref entry) = entry {
+                    entry
+                        .is_processing_time
+                        .store(true, std::sync::atomic::Ordering::Relaxed);
+                }
+            }
+        }
 
         // Register source as a DataFusion table for ad-hoc SELECT queries.
         // For OR REPLACE, deregister the old table first.
@@ -2015,8 +2039,16 @@ impl LaminarDB {
                     let extractor =
                         laminar_core::time::EventTimeExtractor::from_column(col, format)
                             .with_mode(laminar_core::time::ExtractionMode::Max);
-                    let generator =
-                        laminar_core::time::BoundedOutOfOrdernessGenerator::from_duration(dur);
+                    let generator: Box<dyn laminar_core::time::WatermarkGenerator> =
+                        if entry.is_processing_time.load(std::sync::atomic::Ordering::Relaxed) {
+                            Box::new(laminar_core::time::ProcessingTimeGenerator::new())
+                        } else {
+                            Box::new(
+                                laminar_core::time::BoundedOutOfOrdernessGenerator::from_duration(
+                                    dur,
+                                ),
+                            )
+                        };
                     let id = source_ids.len();
                     source_ids.insert(name.clone(), id);
                     watermark_states.insert(
@@ -2045,10 +2077,16 @@ impl LaminarDB {
                     let extractor =
                         laminar_core::time::EventTimeExtractor::from_column(&col, format)
                             .with_mode(laminar_core::time::ExtractionMode::Max);
-                    let generator =
-                        laminar_core::time::BoundedOutOfOrdernessGenerator::from_duration(
-                            std::time::Duration::ZERO,
-                        );
+                    let generator: Box<dyn laminar_core::time::WatermarkGenerator> =
+                        if entry.is_processing_time.load(std::sync::atomic::Ordering::Relaxed) {
+                            Box::new(laminar_core::time::ProcessingTimeGenerator::new())
+                        } else {
+                            Box::new(
+                                laminar_core::time::BoundedOutOfOrdernessGenerator::from_duration(
+                                    std::time::Duration::ZERO,
+                                ),
+                            )
+                        };
                     let id = source_ids.len();
                     source_ids.insert(name.clone(), id);
                     watermark_states.insert(
@@ -2478,8 +2516,16 @@ impl LaminarDB {
                     let extractor =
                         laminar_core::time::EventTimeExtractor::from_column(col, format)
                             .with_mode(laminar_core::time::ExtractionMode::Max);
-                    let generator =
-                        laminar_core::time::BoundedOutOfOrdernessGenerator::from_duration(dur);
+                    let generator: Box<dyn laminar_core::time::WatermarkGenerator> =
+                        if entry.is_processing_time.load(std::sync::atomic::Ordering::Relaxed) {
+                            Box::new(laminar_core::time::ProcessingTimeGenerator::new())
+                        } else {
+                            Box::new(
+                                laminar_core::time::BoundedOutOfOrdernessGenerator::from_duration(
+                                    dur,
+                                ),
+                            )
+                        };
                     let id = source_ids.len();
                     source_ids.insert(name.clone(), id);
                     watermark_states.insert(
@@ -2508,10 +2554,16 @@ impl LaminarDB {
                     let extractor =
                         laminar_core::time::EventTimeExtractor::from_column(&col, format)
                             .with_mode(laminar_core::time::ExtractionMode::Max);
-                    let generator =
-                        laminar_core::time::BoundedOutOfOrdernessGenerator::from_duration(
-                            std::time::Duration::ZERO,
-                        );
+                    let generator: Box<dyn laminar_core::time::WatermarkGenerator> =
+                        if entry.is_processing_time.load(std::sync::atomic::Ordering::Relaxed) {
+                            Box::new(laminar_core::time::ProcessingTimeGenerator::new())
+                        } else {
+                            Box::new(
+                                laminar_core::time::BoundedOutOfOrdernessGenerator::from_duration(
+                                    std::time::Duration::ZERO,
+                                ),
+                            )
+                        };
                     let id = source_ids.len();
                     source_ids.insert(name.clone(), id);
                     watermark_states.insert(

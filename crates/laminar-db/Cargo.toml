@@ -35,6 +35,7 @@ arrow-schema = { workspace = true }
 # DataFusion
 datafusion = { workspace = true }
 datafusion-common = { workspace = true }
+datafusion-expr = { workspace = true }
 
 # Arena allocator (for JIT batch→row conversion)
 bumpalo = { workspace = true }

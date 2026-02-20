@@ -488,6 +488,15 @@ pub enum WindowFunction {
         /// The gap interval (max gap between events in same session)
         gap_interval: Box<Expr>,
     },
+    /// CUMULATE(column, step, size)
+    Cumulate {
+        /// The time column to window on
+        time_column: Box<Expr>,
+        /// The step interval (window growth increment)
+        step_interval: Box<Expr>,
+        /// The max window size interval (epoch size)
+        max_size_interval: Box<Expr>,
+    },
 }
 
 #[cfg(test)]

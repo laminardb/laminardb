@@ -40,6 +40,8 @@ pub struct SourceEntry {
     pub watermark_column: Option<String>,
     /// Maximum out-of-orderness for watermark generation.
     pub max_out_of_orderness: Option<Duration>,
+    /// Whether this source uses processing-time watermarks (`PROCTIME()`).
+    pub is_processing_time: std::sync::atomic::AtomicBool,
     /// The underlying streaming source (type-erased via `ArrowRecord`).
     pub(crate) source: streaming::Source<ArrowRecord>,
     /// The underlying streaming sink (type-erased via `ArrowRecord`).
@@ -132,6 +134,7 @@ impl SourceCatalog {
     }
 
     /// Register a source from a SQL CREATE SOURCE definition.
+    #[allow(clippy::too_many_arguments)]
     pub(crate) fn register_source(
         &self,
         name: &str,
@@ -166,6 +169,7 @@ impl SourceCatalog {
             schema,
             watermark_column,
             max_out_of_orderness,
+            is_processing_time: std::sync::atomic::AtomicBool::new(false),
             source,
             sink,
             buffer: Mutex::new(VecDeque::with_capacity(buf_size)),
