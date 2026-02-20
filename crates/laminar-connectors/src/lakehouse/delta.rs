@@ -107,7 +107,7 @@ impl DeltaLakeSink {
             state: ConnectorState::Created,
             current_epoch: 0,
             last_committed_epoch: 0,
-            buffer: Vec::new(),
+            buffer: Vec::with_capacity(16),
             buffered_rows: 0,
             buffered_bytes: 0,
             pending_files: 0,
@@ -212,11 +212,7 @@ impl DeltaLakeSink {
     #[cfg(not(feature = "delta-lake"))]
     fn flush_buffer_local(&mut self) -> WriteResult {
         let total_rows = self.buffered_rows;
-        let estimated_bytes: u64 = self
-            .buffer
-            .iter()
-            .map(|b| b.get_array_memory_size() as u64)
-            .sum();
+        let estimated_bytes = self.buffered_bytes;
 
         self.pending_files += 1;
 
@@ -249,11 +245,7 @@ impl DeltaLakeSink {
         }
 
         let total_rows = self.buffered_rows;
-        let estimated_bytes: u64 = self
-            .buffer
-            .iter()
-            .map(|b| b.get_array_memory_size() as u64)
-            .sum();
+        let estimated_bytes = self.buffered_bytes;
 
         // Take the table and buffer for the write operation.
         let mut table = self
@@ -268,46 +260,48 @@ impl DeltaLakeSink {
 
         if self.config.write_mode == DeltaWriteMode::Upsert {
             // ── Upsert/Merge path ──
-            // Concatenate all buffered batches, split by changelog op, then merge.
-            for batch in &batches {
-                let (inserts, deletes) = Self::split_changelog_batch(batch)?;
+            // Coalesce all buffered batches into one, split by changelog op,
+            // then issue a single MERGE + single DELETE transaction.
+            let combined = arrow_select::concat::concat_batches(&batches[0].schema(), &batches)
+                .map_err(|e| ConnectorError::Internal(format!("failed to concat batches: {e}")))?;
 
-                // Merge inserts/updates into the target table.
-                if inserts.num_rows() > 0 {
-                    let (t, result) = super::delta_io::merge_batches(
-                        table,
-                        inserts,
-                        &self.config.merge_key_columns,
-                        &self.config.writer_id,
-                        self.current_epoch,
-                        self.config.schema_evolution,
-                    )
-                    .await?;
-                    table = t;
-                    self.metrics.record_merge();
-                    debug!(
-                        inserted = result.rows_inserted,
-                        updated = result.rows_updated,
-                        "Delta Lake: merged inserts/updates"
-                    );
-                }
+            let (inserts, deletes) = Self::split_changelog_batch(&combined)?;
 
-                // Delete matching rows from the target table.
-                if deletes.num_rows() > 0 {
-                    let delete_count = deletes.num_rows();
-                    let (t, rows_deleted) = super::delta_io::delete_by_merge(
-                        table,
-                        deletes,
-                        &self.config.merge_key_columns,
-                        &self.config.writer_id,
-                        self.current_epoch,
-                    )
-                    .await?;
-                    table = t;
-                    #[allow(clippy::cast_possible_truncation)]
-                    self.metrics.record_deletes(delete_count as u64);
-                    debug!(rows_deleted, "Delta Lake: merged deletes");
-                }
+            // Merge inserts/updates into the target table.
+            if inserts.num_rows() > 0 {
+                let (t, result) = super::delta_io::merge_batches(
+                    table,
+                    inserts,
+                    &self.config.merge_key_columns,
+                    &self.config.writer_id,
+                    self.current_epoch,
+                    self.config.schema_evolution,
+                )
+                .await?;
+                table = t;
+                self.metrics.record_merge();
+                debug!(
+                    inserted = result.rows_inserted,
+                    updated = result.rows_updated,
+                    "Delta Lake: merged inserts/updates"
+                );
+            }
+
+            // Delete matching rows from the target table.
+            if deletes.num_rows() > 0 {
+                let delete_count = deletes.num_rows();
+                let (t, rows_deleted) = super::delta_io::delete_by_merge(
+                    table,
+                    deletes,
+                    &self.config.merge_key_columns,
+                    &self.config.writer_id,
+                    self.current_epoch,
+                )
+                .await?;
+                table = t;
+                #[allow(clippy::cast_possible_truncation)]
+                self.metrics.record_deletes(delete_count as u64);
+                debug!(rows_deleted, "Delta Lake: merged deletes");
             }
         } else {
             // ── Append/Overwrite path ──
@@ -320,7 +314,7 @@ impl DeltaLakeSink {
             let partition_cols = if self.config.partition_columns.is_empty() {
                 None
             } else {
-                Some(self.config.partition_columns.clone())
+                Some(self.config.partition_columns.as_slice())
             };
 
             let (t, _version) = super::delta_io::write_batches(
@@ -407,26 +401,45 @@ impl DeltaLakeSink {
                 ConnectorError::ConfigurationError("'_op' column must be String (Utf8) type".into())
             })?;
 
-        let mut insert_indices = Vec::new();
-        let mut delete_indices = Vec::new();
+        // Build boolean masks (compact bit-buffers, no per-element heap allocation).
+        let len = op_array.len();
+        let mut insert_mask = Vec::with_capacity(len);
+        let mut delete_mask = Vec::with_capacity(len);
 
-        for i in 0..op_array.len() {
+        for i in 0..len {
             if op_array.is_null(i) {
+                insert_mask.push(false);
+                delete_mask.push(false);
                 continue;
             }
             match op_array.value(i) {
                 "I" | "U" | "r" => {
-                    insert_indices.push(u32::try_from(i).unwrap_or(u32::MAX));
+                    insert_mask.push(true);
+                    delete_mask.push(false);
                 }
                 "D" => {
-                    delete_indices.push(u32::try_from(i).unwrap_or(u32::MAX));
+                    insert_mask.push(false);
+                    delete_mask.push(true);
                 }
-                _ => {} // Skip unknown ops
+                _ => {
+                    insert_mask.push(false);
+                    delete_mask.push(false);
+                }
             }
         }
 
-        let insert_batch = filter_batch_by_indices(batch, &insert_indices)?;
-        let delete_batch = filter_batch_by_indices(batch, &delete_indices)?;
+        // Compute user-column projection indices once (strip metadata columns).
+        let user_col_indices: Vec<usize> = batch
+            .schema()
+            .fields()
+            .iter()
+            .enumerate()
+            .filter(|(_, f)| !f.name().starts_with('_'))
+            .map(|(i, _)| i)
+            .collect();
+
+        let insert_batch = filter_and_project(batch, &insert_mask, &user_col_indices)?;
+        let delete_batch = filter_and_project(batch, &delete_mask, &user_col_indices)?;
 
         Ok((insert_batch, delete_batch))
     }
@@ -438,7 +451,7 @@ impl DeltaLakeSink {
 #[cfg(feature = "delta-lake")]
 async fn compaction_loop(
     table_path: String,
-    storage_options: std::collections::HashMap<String, String>,
+    storage_options: Arc<std::collections::HashMap<String, String>>,
     config: super::delta_config::CompactionConfig,
     vacuum_retention: std::time::Duration,
     cancel: tokio_util::sync::CancellationToken,
@@ -463,9 +476,11 @@ async fn compaction_loop(
             }
             _ = interval.tick() => {
                 // Open a fresh table handle for compaction (no shared state).
+                // Clone the HashMap only here (once per tick, not avoidable
+                // since open_or_create_table takes owned HashMap).
                 let table = match delta_io::open_or_create_table(
                     &table_path,
-                    storage_options.clone(),
+                    (*storage_options).clone(),
                     None,
                 )
                 .await
@@ -570,7 +585,7 @@ impl SinkConnector for DeltaLakeSink {
                 let cancel = tokio_util::sync::CancellationToken::new();
                 let handle = tokio::spawn(compaction_loop(
                     self.config.table_path.clone(),
-                    self.config.storage_options.clone(),
+                    Arc::new(self.config.storage_options.clone()),
                     self.config.compaction.clone(),
                     self.config.vacuum_retention,
                     cancel.clone(),
@@ -841,43 +856,26 @@ impl std::fmt::Debug for DeltaLakeSink {
 
 // ── Helper functions ────────────────────────────────────────────────
 
-/// Filters a `RecordBatch` to include only rows at the given indices.
+/// Filters a `RecordBatch` using a boolean mask and projects to the given column indices.
 ///
-/// Also strips metadata columns (those starting with `_`) from the output.
-fn filter_batch_by_indices(
+/// Uses Arrow's SIMD-optimized `filter` kernel instead of index-gather (`take`).
+fn filter_and_project(
     batch: &RecordBatch,
-    indices: &[u32],
+    mask: &[bool],
+    col_indices: &[usize],
 ) -> Result<RecordBatch, ConnectorError> {
-    let user_schema = Arc::new(arrow_schema::Schema::new(
-        batch
-            .schema()
-            .fields()
-            .iter()
-            .filter(|f| !f.name().starts_with('_'))
-            .cloned()
-            .collect::<Vec<_>>(),
-    ));
+    use arrow_array::BooleanArray;
+    use arrow_select::filter::filter_record_batch;
 
-    if indices.is_empty() {
-        return Ok(RecordBatch::new_empty(user_schema));
-    }
+    let bool_array = BooleanArray::from(mask.to_vec());
 
-    let indices_array = arrow_array::UInt32Array::from(indices.to_vec());
+    // Filter the full batch first (SIMD-optimized), then project columns.
+    let filtered = filter_record_batch(batch, &bool_array)
+        .map_err(|e| ConnectorError::Internal(format!("arrow filter failed: {e}")))?;
 
-    let filtered_columns: Vec<Arc<dyn arrow_array::Array>> = batch
-        .schema()
-        .fields()
-        .iter()
-        .enumerate()
-        .filter(|(_, f)| !f.name().starts_with('_'))
-        .map(|(i, _)| {
-            arrow_select::take::take(batch.column(i), &indices_array, None)
-                .map_err(|e| ConnectorError::Internal(format!("arrow take failed: {e}")))
-        })
-        .collect::<Result<Vec<_>, _>>()?;
-
-    RecordBatch::try_new(user_schema, filtered_columns)
-        .map_err(|e| ConnectorError::Internal(format!("batch construction failed: {e}")))
+    filtered
+        .project(col_indices)
+        .map_err(|e| ConnectorError::Internal(format!("batch projection failed: {e}")))
 }
 
 #[cfg(test)]

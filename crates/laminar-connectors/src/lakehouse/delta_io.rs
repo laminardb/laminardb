@@ -182,7 +182,7 @@ pub async fn open_or_create_table(
 /// * `writer_id` - Unique writer identifier for exactly-once deduplication
 /// * `epoch` - The epoch number for this write (stored in txn metadata)
 /// * `save_mode` - Delta Lake save mode (Append, Overwrite, etc.)
-/// * `partition_columns` - Optional partition column names
+/// * `partition_columns` - Optional partition column name slice
 /// * `schema_evolution` - If true, auto-merge new columns into the table schema
 ///
 /// # Returns
@@ -199,7 +199,7 @@ pub async fn write_batches(
     writer_id: &str,
     epoch: u64,
     save_mode: SaveMode,
-    partition_columns: Option<Vec<String>>,
+    partition_columns: Option<&[String]>,
     schema_evolution: bool,
 ) -> Result<(DeltaTable, i64), ConnectorError> {
     if batches.is_empty() {
@@ -240,7 +240,7 @@ pub async fn write_batches(
     // Add partition columns if specified.
     if let Some(cols) = partition_columns {
         if !cols.is_empty() {
-            write_builder = write_builder.with_partition_columns(cols);
+            write_builder = write_builder.with_partition_columns(cols.to_vec());
         }
     }
 
@@ -491,6 +491,10 @@ pub async fn merge_batches(
     let epoch_i64 = epoch as i64;
 
     let source_schema = source_df.schema().clone();
+
+    // Use a HashSet for O(1) key lookups instead of O(k) linear scan.
+    let key_set: std::collections::HashSet<&str> = key_columns.iter().map(String::as_str).collect();
+
     let all_columns: Vec<String> = source_schema
         .fields()
         .iter()
@@ -499,13 +503,13 @@ pub async fn merge_batches(
 
     let non_key_columns: Vec<String> = all_columns
         .iter()
-        .filter(|c| !key_columns.contains(c))
+        .filter(|c| !key_set.contains(c.as_str()))
         .cloned()
         .collect();
 
-    // Clone for use in closures.
-    let non_key_for_update = non_key_columns.clone();
-    let all_for_insert = all_columns.clone();
+    // Move into closures (no clone needed — originals are not used after).
+    let non_key_for_update = non_key_columns;
+    let all_for_insert = all_columns;
 
     let mut merge_builder = table
         .merge(source_df, predicate)

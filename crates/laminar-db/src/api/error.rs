@@ -333,9 +333,9 @@ mod tests {
 
     #[test]
     fn test_datafusion_error_becomes_query_not_internal() {
-        let df_err = datafusion_common::DataFusionError::Plan("No field named 'foo'".to_string());
-        let db_err = crate::DbError::DataFusion(df_err);
-        let api_err: ApiError = db_err.into();
+        let datafusion_err = datafusion_common::DataFusionError::Plan("No field named 'foo'".to_string());
+        let db_error = crate::DbError::DataFusion(datafusion_err);
+        let api_err: ApiError = db_error.into();
         // Should be a Query error, not Internal
         assert_eq!(api_err.code(), codes::QUERY_FAILED);
         assert!(
