@@ -66,7 +66,7 @@ pub(crate) fn emit_clause_to_core(
 ///
 /// Parses the SQL and walks the AST to find `TableFactor::Table` references,
 /// recursing into subqueries, nested joins, and set operations (UNION, etc.).
-fn extract_table_references(sql: &str) -> HashSet<String> {
+pub(crate) fn extract_table_references(sql: &str) -> HashSet<String> {
     let mut tables = HashSet::new();
     let dialect = GenericDialect {};
     let Ok(statements) = Parser::parse_sql(&dialect, sql) else {

@@ -173,7 +173,8 @@ impl StreamingPlanner {
             | StreamingStatement::Describe { .. }
             | StreamingStatement::Explain { .. }
             | StreamingStatement::CreateMaterializedView { .. }
-            | StreamingStatement::InsertInto { .. } => {
+            | StreamingStatement::InsertInto { .. }
+            | StreamingStatement::AlterSource { .. } => {
                 // These statements are handled directly by the database facade
                 // and don't need query planning. Return as Standard pass-through.
                 Err(PlanningError::UnsupportedSql(format!(

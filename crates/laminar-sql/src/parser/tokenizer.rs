@@ -85,6 +85,8 @@ pub enum StreamingDdlKind {
         /// Whether IF EXISTS was specified
         if_exists: bool,
     },
+    /// ALTER SOURCE
+    AlterSource,
     /// Not a streaming DDL statement
     None,
 }
@@ -131,6 +133,10 @@ pub fn detect_streaming_ddl(tokens: &[TokenWithSpan]) -> StreamingDdlKind {
             keyword: Keyword::EXPLAIN,
             ..
         }) => detect_explain_ddl(&significant),
+        Token::Word(Word {
+            keyword: Keyword::ALTER,
+            ..
+        }) => detect_alter_ddl(&significant),
         _ => StreamingDdlKind::None,
     }
 }
@@ -256,6 +262,17 @@ fn detect_drop_ddl(significant: &[&TokenWithSpan]) -> StreamingDdlKind {
             }
             StreamingDdlKind::None
         }
+        _ => StreamingDdlKind::None,
+    }
+}
+
+/// Detect ALTER-based DDL statements.
+fn detect_alter_ddl(significant: &[&TokenWithSpan]) -> StreamingDdlKind {
+    if significant.len() < 2 {
+        return StreamingDdlKind::None;
+    }
+    match &significant[1].token {
+        Token::Word(w) if is_word_ci(w, "SOURCE") => StreamingDdlKind::AlterSource,
         _ => StreamingDdlKind::None,
     }
 }

@@ -24,8 +24,9 @@ mod window_rewriter;
 
 pub use lookup_table::CreateLookupTableStatement;
 pub use statements::{
-    CreateSinkStatement, CreateSourceStatement, EmitClause, EmitStrategy, FormatSpec,
-    LateDataClause, ShowCommand, SinkFrom, StreamingStatement, WatermarkDef, WindowFunction,
+    AlterSourceOperation, CreateSinkStatement, CreateSourceStatement, EmitClause, EmitStrategy,
+    FormatSpec, LateDataClause, ShowCommand, SinkFrom, StreamingStatement, WatermarkDef,
+    WindowFunction,
 };
 pub use window_rewriter::WindowRewriter;
 
@@ -188,6 +189,13 @@ impl StreamingParser {
                     if_exists,
                 }])
             }
+            StreamingDdlKind::AlterSource => {
+                let mut parser =
+                    sqlparser::parser::Parser::new(&dialect).with_tokens_with_locations(tokens);
+                let stmt =
+                    parse_alter_source(&mut parser).map_err(parse_error_to_parser_error)?;
+                Ok(vec![stmt])
+            }
             StreamingDdlKind::None => {
                 // Standard SQL - check for INSERT INTO and convert
                 let statements = sqlparser::parser::Parser::parse_sql(&dialect, sql_trimmed)?;
@@ -277,7 +285,7 @@ fn convert_standard_statement(stmt: sqlparser::ast::Statement) -> StreamingState
 
 /// Parse a DROP SOURCE statement.
 ///
-/// Syntax: `DROP SOURCE [IF EXISTS] name`
+/// Syntax: `DROP SOURCE [IF EXISTS] name [CASCADE]`
 ///
 /// # Errors
 ///
@@ -296,12 +304,17 @@ fn parse_drop_source(
     let name = parser
         .parse_object_name(false)
         .map_err(ParseError::SqlParseError)?;
-    Ok(StreamingStatement::DropSource { name, if_exists })
+    let cascade = parser.parse_keyword(sqlparser::keywords::Keyword::CASCADE);
+    Ok(StreamingStatement::DropSource {
+        name,
+        if_exists,
+        cascade,
+    })
 }
 
 /// Parse a DROP SINK statement.
 ///
-/// Syntax: `DROP SINK [IF EXISTS] name`
+/// Syntax: `DROP SINK [IF EXISTS] name [CASCADE]`
 ///
 /// # Errors
 ///
@@ -320,7 +333,12 @@ fn parse_drop_sink(
     let name = parser
         .parse_object_name(false)
         .map_err(ParseError::SqlParseError)?;
-    Ok(StreamingStatement::DropSink { name, if_exists })
+    let cascade = parser.parse_keyword(sqlparser::keywords::Keyword::CASCADE);
+    Ok(StreamingStatement::DropSink {
+        name,
+        if_exists,
+        cascade,
+    })
 }
 
 /// Parse a DROP MATERIALIZED VIEW statement.
@@ -433,7 +451,7 @@ fn parse_create_stream(
 
 /// Parse a DROP STREAM statement.
 ///
-/// Syntax: `DROP STREAM [IF EXISTS] name`
+/// Syntax: `DROP STREAM [IF EXISTS] name [CASCADE]`
 ///
 /// # Errors
 ///
@@ -452,12 +470,92 @@ fn parse_drop_stream(
     let name = parser
         .parse_object_name(false)
         .map_err(ParseError::SqlParseError)?;
-    Ok(StreamingStatement::DropStream { name, if_exists })
+    let cascade = parser.parse_keyword(sqlparser::keywords::Keyword::CASCADE);
+    Ok(StreamingStatement::DropStream {
+        name,
+        if_exists,
+        cascade,
+    })
 }
 
 /// Parse a DESCRIBE statement.
 ///
 /// Syntax: `DESCRIBE [EXTENDED] name`
+/// Parse an ALTER SOURCE statement.
+///
+/// Syntax:
+/// - `ALTER SOURCE name ADD COLUMN col_name data_type`
+/// - `ALTER SOURCE name SET ('key' = 'value', ...)`
+///
+/// # Errors
+///
+/// Returns `ParseError` if the statement syntax is invalid.
+fn parse_alter_source(
+    parser: &mut sqlparser::parser::Parser,
+) -> Result<StreamingStatement, ParseError> {
+    parser
+        .expect_keyword(sqlparser::keywords::Keyword::ALTER)
+        .map_err(ParseError::SqlParseError)?;
+    tokenizer::expect_custom_keyword(parser, "SOURCE")?;
+    let name = parser
+        .parse_object_name(false)
+        .map_err(ParseError::SqlParseError)?;
+
+    // Determine operation: ADD COLUMN or SET
+    if parser.parse_keywords(&[
+        sqlparser::keywords::Keyword::ADD,
+        sqlparser::keywords::Keyword::COLUMN,
+    ]) {
+        // ALTER SOURCE name ADD COLUMN col_name data_type
+        let col_name = parser
+            .parse_identifier()
+            .map_err(ParseError::SqlParseError)?;
+        let data_type = parser.parse_data_type().map_err(ParseError::SqlParseError)?;
+        let column_def = sqlparser::ast::ColumnDef {
+            name: col_name,
+            data_type,
+            options: vec![],
+        };
+        Ok(StreamingStatement::AlterSource {
+            name,
+            operation: statements::AlterSourceOperation::AddColumn { column_def },
+        })
+    } else if parser.parse_keyword(sqlparser::keywords::Keyword::SET) {
+        // ALTER SOURCE name SET ('key' = 'value', ...)
+        parser
+            .expect_token(&sqlparser::tokenizer::Token::LParen)
+            .map_err(ParseError::SqlParseError)?;
+        let mut properties = std::collections::HashMap::new();
+        loop {
+            let key = parser
+                .parse_literal_string()
+                .map_err(ParseError::SqlParseError)?;
+            parser
+                .expect_token(&sqlparser::tokenizer::Token::Eq)
+                .map_err(ParseError::SqlParseError)?;
+            let value = parser
+                .parse_literal_string()
+                .map_err(ParseError::SqlParseError)?;
+            properties.insert(key, value);
+            if !parser.consume_token(&sqlparser::tokenizer::Token::Comma) {
+                break;
+            }
+        }
+        parser
+            .expect_token(&sqlparser::tokenizer::Token::RParen)
+            .map_err(ParseError::SqlParseError)?;
+        Ok(StreamingStatement::AlterSource {
+            name,
+            operation: statements::AlterSourceOperation::SetProperties { properties },
+        })
+    } else {
+        Err(ParseError::StreamingError(
+            "Expected ADD COLUMN or SET after ALTER SOURCE <name>".to_string(),
+        ))
+    }
+}
+
+/// Parse a DESCRIBE statement.
 ///
 /// # Errors
 ///
@@ -684,9 +782,14 @@ mod tests {
     fn test_parse_drop_source() {
         let stmt = parse_one("DROP SOURCE events");
         match stmt {
-            StreamingStatement::DropSource { name, if_exists } => {
+            StreamingStatement::DropSource {
+                name,
+                if_exists,
+                cascade,
+            } => {
                 assert_eq!(name.to_string(), "events");
                 assert!(!if_exists);
+                assert!(!cascade);
             }
             _ => panic!("Expected DropSource, got {stmt:?}"),
         }
@@ -696,9 +799,31 @@ mod tests {
     fn test_parse_drop_source_if_exists() {
         let stmt = parse_one("DROP SOURCE IF EXISTS events");
         match stmt {
-            StreamingStatement::DropSource { name, if_exists } => {
+            StreamingStatement::DropSource {
+                name,
+                if_exists,
+                cascade,
+            } => {
                 assert_eq!(name.to_string(), "events");
                 assert!(if_exists);
+                assert!(!cascade);
+            }
+            _ => panic!("Expected DropSource, got {stmt:?}"),
+        }
+    }
+
+    #[test]
+    fn test_parse_drop_source_cascade() {
+        let stmt = parse_one("DROP SOURCE IF EXISTS events CASCADE");
+        match stmt {
+            StreamingStatement::DropSource {
+                name,
+                if_exists,
+                cascade,
+            } => {
+                assert_eq!(name.to_string(), "events");
+                assert!(if_exists);
+                assert!(cascade);
             }
             _ => panic!("Expected DropSource, got {stmt:?}"),
         }
@@ -708,9 +833,14 @@ mod tests {
     fn test_parse_drop_sink() {
         let stmt = parse_one("DROP SINK output");
         match stmt {
-            StreamingStatement::DropSink { name, if_exists } => {
+            StreamingStatement::DropSink {
+                name,
+                if_exists,
+                cascade,
+            } => {
                 assert_eq!(name.to_string(), "output");
                 assert!(!if_exists);
+                assert!(!cascade);
             }
             _ => panic!("Expected DropSink, got {stmt:?}"),
         }
@@ -720,9 +850,31 @@ mod tests {
     fn test_parse_drop_sink_if_exists() {
         let stmt = parse_one("DROP SINK IF EXISTS output");
         match stmt {
-            StreamingStatement::DropSink { name, if_exists } => {
+            StreamingStatement::DropSink {
+                name,
+                if_exists,
+                cascade,
+            } => {
                 assert_eq!(name.to_string(), "output");
                 assert!(if_exists);
+                assert!(!cascade);
+            }
+            _ => panic!("Expected DropSink, got {stmt:?}"),
+        }
+    }
+
+    #[test]
+    fn test_parse_drop_sink_cascade() {
+        let stmt = parse_one("DROP SINK output CASCADE");
+        match stmt {
+            StreamingStatement::DropSink {
+                name,
+                if_exists,
+                cascade,
+            } => {
+                assert_eq!(name.to_string(), "output");
+                assert!(!if_exists);
+                assert!(cascade);
             }
             _ => panic!("Expected DropSink, got {stmt:?}"),
         }
@@ -1016,9 +1168,14 @@ mod tests {
     fn test_parse_drop_stream() {
         let stmt = parse_one("DROP STREAM my_stream");
         match stmt {
-            StreamingStatement::DropStream { name, if_exists } => {
+            StreamingStatement::DropStream {
+                name,
+                if_exists,
+                cascade,
+            } => {
                 assert_eq!(name.to_string(), "my_stream");
                 assert!(!if_exists);
+                assert!(!cascade);
             }
             _ => panic!("Expected DropStream, got {stmt:?}"),
         }
@@ -1028,9 +1185,31 @@ mod tests {
     fn test_parse_drop_stream_if_exists() {
         let stmt = parse_one("DROP STREAM IF EXISTS my_stream");
         match stmt {
-            StreamingStatement::DropStream { name, if_exists } => {
+            StreamingStatement::DropStream {
+                name,
+                if_exists,
+                cascade,
+            } => {
                 assert_eq!(name.to_string(), "my_stream");
                 assert!(if_exists);
+                assert!(!cascade);
+            }
+            _ => panic!("Expected DropStream, got {stmt:?}"),
+        }
+    }
+
+    #[test]
+    fn test_parse_drop_stream_cascade() {
+        let stmt = parse_one("DROP STREAM my_stream CASCADE");
+        match stmt {
+            StreamingStatement::DropStream {
+                name,
+                if_exists,
+                cascade,
+            } => {
+                assert_eq!(name.to_string(), "my_stream");
+                assert!(!if_exists);
+                assert!(cascade);
             }
             _ => panic!("Expected DropStream, got {stmt:?}"),
         }
@@ -1043,5 +1222,44 @@ mod tests {
             stmt,
             StreamingStatement::Show(ShowCommand::Streams)
         ));
+    }
+
+    #[test]
+    fn test_parse_alter_source_add_column() {
+        let stmt = parse_one("ALTER SOURCE events ADD COLUMN new_col INT");
+        match stmt {
+            StreamingStatement::AlterSource { name, operation } => {
+                assert_eq!(name.to_string(), "events");
+                match operation {
+                    statements::AlterSourceOperation::AddColumn { column_def } => {
+                        assert_eq!(column_def.name.value, "new_col");
+                        assert_eq!(
+                            column_def.data_type,
+                            sqlparser::ast::DataType::Int(None)
+                        );
+                    }
+                    _ => panic!("Expected AddColumn"),
+                }
+            }
+            _ => panic!("Expected AlterSource, got {stmt:?}"),
+        }
+    }
+
+    #[test]
+    fn test_parse_alter_source_set_properties() {
+        let stmt = parse_one("ALTER SOURCE events SET ('batch.size' = '1000', 'timeout' = '5s')");
+        match stmt {
+            StreamingStatement::AlterSource { name, operation } => {
+                assert_eq!(name.to_string(), "events");
+                match operation {
+                    statements::AlterSourceOperation::SetProperties { properties } => {
+                        assert_eq!(properties.get("batch.size"), Some(&"1000".to_string()));
+                        assert_eq!(properties.get("timeout"), Some(&"5s".to_string()));
+                    }
+                    _ => panic!("Expected SetProperties"),
+                }
+            }
+            _ => panic!("Expected AlterSource, got {stmt:?}"),
+        }
     }
 }
