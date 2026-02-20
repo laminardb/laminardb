@@ -12,7 +12,7 @@ use std::sync::Arc;
 
 use bytes::Bytes;
 use criterion::{criterion_group, criterion_main, BenchmarkId, Criterion, Throughput};
-use rand::Rng;
+use rand::RngExt;
 // Zipfian approximation: use rejection sampling with inverse CDF.
 // rand 0.9 doesn't include Zipf in its core distr module.
 
