@@ -337,7 +337,7 @@ impl Reactor {
     /// Run one iteration of the event loop.
     ///
     /// Returns outputs ready for downstream. Allocates a new `Vec` per call.
-    /// Prefer [`poll_into`] or the internal [`run`] loop for zero-allocation
+    /// Prefer [`poll_into`](Self::poll_into) or the internal `run` loop for zero-allocation
     /// processing.
     pub fn poll(&mut self) -> Vec<Output> {
         self.process_events();
@@ -346,7 +346,7 @@ impl Reactor {
 
     /// Run one iteration, appending outputs to a caller-provided buffer.
     ///
-    /// This avoids the per-poll allocation of [`poll`] — the caller can
+    /// This avoids the per-poll allocation of [`poll`](Self::poll) — the caller can
     /// reuse the same `Vec` across iterations, retaining its capacity.
     pub fn poll_into(&mut self, output: &mut Vec<Output>) {
         self.process_events();

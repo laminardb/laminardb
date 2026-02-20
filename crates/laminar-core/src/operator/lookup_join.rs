@@ -3,7 +3,7 @@
 //! Join streaming events with external reference tables (dimension tables).
 //!
 //! Lookup joins enrich streaming data with information from slowly-changing
-//! external tables. Unlike stream-stream joins (F019), lookup joins:
+//! external tables. Unlike stream-stream joins, lookup joins:
 //! - Have one streaming side (events) and one static/slowly-changing side (table)
 //! - Use caching to avoid repeated lookups for the same key
 //! - Support TTL-based cache expiration for slowly-changing data
@@ -556,9 +556,11 @@ impl LookupJoinOperator {
         }
 
         // Extract join key
-        let Some(key) =
-            Self::extract_key(&event.data, &self.config.stream_key_column, &mut self.key_column_index)
-        else {
+        let Some(key) = Self::extract_key(
+            &event.data,
+            &self.config.stream_key_column,
+            &mut self.key_column_index,
+        ) else {
             return OutputVec::new();
         };
 
@@ -828,9 +830,11 @@ impl Operator for LookupJoinOperator {
         }
 
         // Extract join key
-        let Some(key) =
-            Self::extract_key(&event.data, &self.config.stream_key_column, &mut self.key_column_index)
-        else {
+        let Some(key) = Self::extract_key(
+            &event.data,
+            &self.config.stream_key_column,
+            &mut self.key_column_index,
+        ) else {
             return OutputVec::new();
         };
 

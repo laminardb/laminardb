@@ -1,12 +1,12 @@
 //! `PostgreSQL` lookup source implementation.
 //!
-//! Provides a [`LookupSource`] backed by `PostgreSQL` with connection pooling
+//! Provides a `LookupSource` backed by `PostgreSQL` with connection pooling
 //! via `deadpool-postgres` and predicate pushdown support.
 //!
 //! ## Features
 //!
 //! - **Connection pooling**: Efficient connection reuse via `deadpool-postgres`
-//! - **Predicate pushdown**: Translates [`Predicate`] variants to SQL WHERE
+//! - **Predicate pushdown**: Translates `Predicate` variants to SQL WHERE
 //!   clauses (except `NotEq`, which is always evaluated locally)
 //! - **Projection pushdown**: SELECT only requested columns
 //! - **Batch lookups**: `WHERE pk = ANY($1)` for single-column primary keys,
@@ -33,10 +33,8 @@
 
 use std::sync::atomic::{AtomicU64, Ordering};
 
-use laminar_core::lookup::predicate::{Predicate, predicate_to_sql};
-use laminar_core::lookup::source::{
-    ColumnId, LookupError, LookupSource, LookupSourceCapabilities,
-};
+use laminar_core::lookup::predicate::{predicate_to_sql, Predicate};
+use laminar_core::lookup::source::{ColumnId, LookupError, LookupSource, LookupSourceCapabilities};
 
 /// Configuration for the `PostgreSQL` lookup source.
 ///
@@ -88,7 +86,7 @@ impl Default for PostgresLookupSourceConfig {
     }
 }
 
-/// `PostgreSQL` implementation of the [`LookupSource`] trait.
+/// `PostgreSQL` implementation of the `LookupSource` trait.
 ///
 /// Provides full predicate and projection pushdown via parameterized
 /// SQL queries. Uses `deadpool-postgres` for connection pooling.
@@ -130,11 +128,8 @@ impl PostgresLookupSource {
         let mgr_config = deadpool_postgres::ManagerConfig {
             recycling_method: deadpool_postgres::RecyclingMethod::Fast,
         };
-        let mgr = deadpool_postgres::Manager::from_config(
-            pg_config,
-            tokio_postgres::NoTls,
-            mgr_config,
-        );
+        let mgr =
+            deadpool_postgres::Manager::from_config(pg_config, tokio_postgres::NoTls, mgr_config);
 
         let pool = deadpool_postgres::Pool::builder(mgr)
             .max_size(config.max_pool_size)
@@ -207,8 +202,10 @@ impl LookupSource for PostgresLookupSource {
 
         let rows = tokio::time::timeout(timeout, async {
             // Build params array for tokio-postgres
-            let param_refs: Vec<&(dyn tokio_postgres::types::ToSql + Sync)> =
-                params.iter().map(|s| s as &(dyn tokio_postgres::types::ToSql + Sync)).collect();
+            let param_refs: Vec<&(dyn tokio_postgres::types::ToSql + Sync)> = params
+                .iter()
+                .map(|s| s as &(dyn tokio_postgres::types::ToSql + Sync))
+                .collect();
             client.query(&sql, &param_refs).await
         })
         .await
@@ -269,9 +266,10 @@ impl LookupSource for PostgresLookupSource {
     }
 
     async fn health_check(&self) -> Result<(), LookupError> {
-        let client = self.pool.get().await.map_err(|e| {
-            LookupError::Connection(format!("health check pool get failed: {e}"))
-        })?;
+        let client =
+            self.pool.get().await.map_err(|e| {
+                LookupError::Connection(format!("health check pool get failed: {e}"))
+            })?;
         client
             .query_one("SELECT 1", &[])
             .await
@@ -343,10 +341,7 @@ pub fn build_query(
                     format!("({})", vals.join(", "))
                 })
                 .collect();
-            where_parts.push(format!(
-                "({pk_list}) IN ({})",
-                value_tuples.join(", ")
-            ));
+            where_parts.push(format!("({pk_list}) IN ({})", value_tuples.join(", ")));
         }
     }
 
@@ -423,20 +418,9 @@ mod tests {
 
     #[test]
     fn test_build_query_batch_keys() {
-        let keys: Vec<Vec<String>> = (1..=5)
-            .map(|i| vec![i.to_string()])
-            .collect();
-        let (sql, params) = build_query(
-            "orders",
-            &["order_id".into()],
-            &keys,
-            None,
-            None,
-        );
-        assert_eq!(
-            sql,
-            "SELECT * FROM orders WHERE order_id = ANY($1)"
-        );
+        let keys: Vec<Vec<String>> = (1..=5).map(|i| vec![i.to_string()]).collect();
+        let (sql, params) = build_query("orders", &["order_id".into()], &keys, None, None);
+        assert_eq!(sql, "SELECT * FROM orders WHERE order_id = ANY($1)");
         assert_eq!(params[0], "{1,2,3,4,5}");
     }
 
@@ -550,26 +534,13 @@ mod tests {
             },
             Predicate::In {
                 column: "f".into(),
-                values: vec![
-                    ScalarValue::Utf8("x".into()),
-                    ScalarValue::Utf8("y".into()),
-                ],
+                values: vec![ScalarValue::Utf8("x".into()), ScalarValue::Utf8("y".into())],
             },
-            Predicate::IsNull {
-                column: "g".into(),
-            },
-            Predicate::IsNotNull {
-                column: "h".into(),
-            },
+            Predicate::IsNull { column: "g".into() },
+            Predicate::IsNotNull { column: "h".into() },
         ];
 
-        let (sql, _) = build_query(
-            "t",
-            &[],
-            &[],
-            Some(&predicates),
-            None,
-        );
+        let (sql, _) = build_query("t", &[], &[], Some(&predicates), None);
 
         assert!(sql.contains("a = 1"));
         assert!(sql.contains("b < 10"));

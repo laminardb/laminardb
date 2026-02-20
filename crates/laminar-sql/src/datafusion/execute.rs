@@ -1,4 +1,4 @@
-//! End-to-end streaming SQL execution (F005B)
+//! End-to-end streaming SQL execution
 //!
 //! Provides [`execute_streaming_sql`] for parsing, planning, and executing
 //! streaming SQL statements through the `DataFusion` engine.

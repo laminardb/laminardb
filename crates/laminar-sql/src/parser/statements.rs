@@ -319,7 +319,7 @@ pub enum EmitStrategy {
 /// See `laminar_core::operator::window::EmitStrategy` for the runtime representation.
 #[derive(Debug, Clone, PartialEq)]
 pub enum EmitClause {
-    // === Existing (F011) ===
+    // === Existing ===
     /// EMIT AFTER WATERMARK (or EMIT ON WATERMARK)
     ///
     /// Emit results when the watermark passes the window end.
@@ -348,7 +348,7 @@ pub enum EmitClause {
     /// This provides lowest latency but highest overhead.
     OnUpdate,
 
-    // === New (F011B) ===
+    // === New ===
     /// EMIT CHANGES
     ///
     /// Emit changelog records with Z-set weights for CDC pipelines.

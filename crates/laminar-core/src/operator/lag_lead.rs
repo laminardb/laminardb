@@ -231,11 +231,7 @@ impl LagLeadOperator {
     /// Extracts a f64 value from a column in the event.
     ///
     /// Caches the column index on first call to avoid per-event schema lookups.
-    fn extract_column_value(
-        event: &Event,
-        column: &str,
-        cached_index: &mut Option<usize>,
-    ) -> f64 {
+    fn extract_column_value(event: &Event, column: &str, cached_index: &mut Option<usize>) -> f64 {
         let batch = &event.data;
         let col_idx = if let Some(idx) = *cached_index {
             idx

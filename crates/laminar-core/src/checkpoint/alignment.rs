@@ -80,11 +80,7 @@ impl<T> BarrierAligner<T> {
     /// # Panics
     ///
     /// Panics if `input` is >= the configured number of inputs.
-    pub fn process(
-        &mut self,
-        input: u8,
-        message: StreamMessage<T>,
-    ) -> AlignmentAction<T> {
+    pub fn process(&mut self, input: u8, message: StreamMessage<T>) -> AlignmentAction<T> {
         assert!(
             input < self.num_inputs,
             "input index {input} >= num_inputs {}",
@@ -229,7 +225,10 @@ mod tests {
 
         // Watermark passes through even during alignment
         let action = aligner.process(1, StreamMessage::Watermark(5000));
-        assert!(matches!(action, AlignmentAction::WatermarkPassThrough(5000)));
+        assert!(matches!(
+            action,
+            AlignmentAction::WatermarkPassThrough(5000)
+        ));
     }
 
     #[test]
@@ -239,8 +238,7 @@ mod tests {
         // First checkpoint
         aligner.process(0, StreamMessage::Barrier(CheckpointBarrier::new(1, 1)));
         aligner.process(0, StreamMessage::Event(10));
-        let action =
-            aligner.process(1, StreamMessage::Barrier(CheckpointBarrier::new(1, 1)));
+        let action = aligner.process(1, StreamMessage::Barrier(CheckpointBarrier::new(1, 1)));
         assert!(matches!(action, AlignmentAction::Aligned(b) if b.checkpoint_id == 1));
 
         // Drain
@@ -251,8 +249,7 @@ mod tests {
         aligner.process(0, StreamMessage::Event(20));
         aligner.process(1, StreamMessage::Barrier(CheckpointBarrier::new(2, 2)));
         aligner.process(1, StreamMessage::Event(30));
-        let action =
-            aligner.process(0, StreamMessage::Barrier(CheckpointBarrier::new(2, 2)));
+        let action = aligner.process(0, StreamMessage::Barrier(CheckpointBarrier::new(2, 2)));
         assert!(matches!(action, AlignmentAction::Aligned(b) if b.checkpoint_id == 2));
 
         // Drain second checkpoint's buffered events

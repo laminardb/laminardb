@@ -1,7 +1,7 @@
 //! Kafka watermark integration.
 //!
-//! Integrates `laminar-core` per-partition watermarks (F064) and watermark
-//! alignment groups (F066) with the Kafka source connector.
+//! Integrates `laminar-core` per-partition watermarks and watermark
+//! alignment groups with the Kafka source connector.
 //!
 //! # Per-Partition Watermarks
 //!

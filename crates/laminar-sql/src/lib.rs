@@ -43,7 +43,7 @@ pub use parser::{parse_streaming_sql, StreamingStatement};
 pub use planner::StreamingPlanner;
 pub use translator::{OrderOperatorConfig, WindowOperatorConfig, WindowType};
 
-// Re-export F005B types
+// Re-export types
 pub use datafusion::execute::execute_streaming_sql;
 pub use datafusion::{
     register_streaming_functions, register_streaming_functions_with_watermark, DdlResult,

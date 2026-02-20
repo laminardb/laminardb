@@ -27,8 +27,8 @@ jit = [
     "dep:cranelift-module", "dep:cranelift-native",
     "dep:datafusion-expr", "dep:datafusion-common",
 ]
-# Enable distributed constellation mode (multi-node)
-constellation = [
+# Enable distributed delta mode (multi-node)
+delta = [
     "dep:tonic", "dep:prost", "dep:openraft", "dep:chitchat",
     "dep:bincode", "dep:tokio-util", "dep:xxhash-rust",
     "dep:tonic-build", "dep:prost-build",
@@ -88,7 +88,7 @@ datafusion-common = { workspace = true, optional = true }
 # Secondary indexes
 redb = { workspace = true }
 
-# Constellation (optional, multi-node distributed mode)
+# Delta (optional, multi-node distributed mode)
 tonic = { workspace = true, optional = true }
 prost = { workspace = true, optional = true }
 openraft = { workspace = true, optional = true }
@@ -195,6 +195,6 @@ name = "lookup_join_bench"
 harness = false
 
 [[bench]]
-name = "constellation_checkpoint_bench"
+name = "delta_checkpoint_bench"
 harness = false
-required-features = ["constellation"]
+required-features = ["delta"]

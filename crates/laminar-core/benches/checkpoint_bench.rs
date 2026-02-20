@@ -1,4 +1,4 @@
-//! Checkpoint cycle benchmarks (F-PERF-003)
+//! Checkpoint cycle benchmarks
 //!
 //! Benchmarks the full checkpoint cycle: state snapshot, serialize,
 //! and barrier injection overhead.
@@ -31,16 +31,12 @@ fn bench_checkpoint_snapshot(c: &mut Criterion) {
         let store = populated_store(size);
 
         group.throughput(Throughput::Elements(size as u64));
-        group.bench_with_input(
-            BenchmarkId::new("snapshot", size),
-            &store,
-            |b, store| {
-                b.iter(|| {
-                    let snapshot = store.snapshot();
-                    black_box(snapshot)
-                })
-            },
-        );
+        group.bench_with_input(BenchmarkId::new("snapshot", size), &store, |b, store| {
+            b.iter(|| {
+                let snapshot = store.snapshot();
+                black_box(snapshot)
+            })
+        });
     }
 
     group.finish();

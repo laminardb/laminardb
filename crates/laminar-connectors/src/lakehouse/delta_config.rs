@@ -259,7 +259,7 @@ pub enum DeltaWriteMode {
     /// Overwrite: replace partition contents. Used for batch-style recomputation.
     Overwrite,
     /// Upsert/Merge: CDC-style insert/update/delete via MERGE statement.
-    /// Requires `merge_key_columns` to be set. Integrates with F063 Z-sets.
+    /// Requires `merge_key_columns` to be set. Integrates with Z-sets.
     Upsert,
 }
 

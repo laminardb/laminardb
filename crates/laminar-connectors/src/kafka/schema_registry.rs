@@ -193,9 +193,7 @@ impl SchemaRegistryClient {
             .with_shards(4)
             .build();
         // Subject cache is small — one entry per subject
-        let subject_cache = CacheBuilder::new(256)
-            .with_shards(4)
-            .build();
+        let subject_cache = CacheBuilder::new(256).with_shards(4).build();
         Self {
             client: Client::new(),
             base_url: base_url.into().trim_end_matches('/').to_string(),
@@ -286,10 +284,7 @@ impl SchemaRegistryClient {
     /// # Errors
     ///
     /// Returns `ConnectorError` if the HTTP request fails.
-    pub async fn get_latest_schema(
-        &self,
-        subject: &str,
-    ) -> Result<CachedSchema, ConnectorError> {
+    pub async fn get_latest_schema(&self, subject: &str) -> Result<CachedSchema, ConnectorError> {
         let url = format!("{}/subjects/{}/versions/latest", self.base_url, subject);
         let resp: SchemaVersionResponse = self.get_json(&url).await?;
 
@@ -306,7 +301,8 @@ impl SchemaRegistryClient {
         };
 
         self.cache_insert(resp.id, cached.clone());
-        self.subject_cache.insert(subject.to_string(), cached.clone());
+        self.subject_cache
+            .insert(subject.to_string(), cached.clone());
         Ok(cached)
     }
 
@@ -1376,8 +1372,7 @@ mod tests {
             max_entries: 3,
             ttl: None,
         };
-        let client =
-            SchemaRegistryClient::with_cache_config("http://localhost:8081", None, config);
+        let client = SchemaRegistryClient::with_cache_config("http://localhost:8081", None, config);
 
         // Insert 3 schemas.
         client.cache_insert(1, make_cached_schema(1));
@@ -1398,8 +1393,7 @@ mod tests {
             max_entries: 100,
             ttl: Some(Duration::from_millis(50)),
         };
-        let client =
-            SchemaRegistryClient::with_cache_config("http://localhost:8081", None, config);
+        let client = SchemaRegistryClient::with_cache_config("http://localhost:8081", None, config);
 
         client.cache_insert(1, make_cached_schema(1));
         assert!(client.cache_get(1).is_some());
@@ -1416,8 +1410,7 @@ mod tests {
             max_entries: 100,
             ttl: None,
         };
-        let client =
-            SchemaRegistryClient::with_cache_config("http://localhost:8081", None, config);
+        let client = SchemaRegistryClient::with_cache_config("http://localhost:8081", None, config);
 
         client.cache_insert(1, make_cached_schema(1));
         // No TTL — entry should stay.
@@ -1430,8 +1423,7 @@ mod tests {
             max_entries: 10,
             ttl: None,
         };
-        let client =
-            SchemaRegistryClient::with_cache_config("http://localhost:8081", None, config);
+        let client = SchemaRegistryClient::with_cache_config("http://localhost:8081", None, config);
 
         client.cache_insert(1, make_cached_schema(1));
         client.cache_insert(2, make_cached_schema(2));

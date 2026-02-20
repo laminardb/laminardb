@@ -72,21 +72,21 @@ jobs:
             cross: true
             # Cross builds: skip hwloc (needs target-arch libhwloc) and xdp (needs libelf);
             # io-uring is pure syscalls so cross-compiles fine
-            features: --features "allocation-tracking,io-uring,jit,kafka,postgres-cdc,postgres-sink,mysql-cdc,delta-lake"
+            features: --features "allocation-tracking,io-uring,jit,kafka,postgres-cdc,postgres-sink,mysql-cdc,delta-lake,delta"
           - os: ubuntu-latest
             target: x86_64-unknown-linux-musl
             cross: true
-            features: --features "allocation-tracking,io-uring,jit,kafka,postgres-cdc,postgres-sink,mysql-cdc,delta-lake"
+            features: --features "allocation-tracking,io-uring,jit,kafka,postgres-cdc,postgres-sink,mysql-cdc,delta-lake,delta"
           - os: macos-15  # ARM64
             target: aarch64-apple-darwin
             cross: false
             # macOS: skip Linux-only features (hwloc, io-uring, xdp)
-            features: --features "allocation-tracking,jit,kafka,postgres-cdc,postgres-sink,mysql-cdc,delta-lake"
+            features: --features "allocation-tracking,jit,kafka,postgres-cdc,postgres-sink,mysql-cdc,delta-lake,delta"
           - os: windows-latest
             target: x86_64-pc-windows-msvc
             cross: false
             # Windows: skip Linux-only features (hwloc, io-uring, xdp)
-            features: --features "allocation-tracking,jit,kafka,postgres-cdc,postgres-sink,mysql-cdc,delta-lake"
+            features: --features "allocation-tracking,jit,kafka,postgres-cdc,postgres-sink,mysql-cdc,delta-lake,delta"
     steps:
       - uses: actions/checkout@v6
       - uses: dtolnay/rust-toolchain@stable
@@ -117,7 +117,15 @@ jobs:
 
       - name: Install system dependencies (Linux native)
         if: runner.os == 'Linux' && !matrix.cross
-        run: sudo apt-get update && sudo apt-get install -y libhwloc-dev libelf-dev zlib1g-dev libcurl4-openssl-dev cmake pkg-config libsasl2-dev libudev-dev
+        run: sudo apt-get update && sudo apt-get install -y libhwloc-dev libelf-dev zlib1g-dev libcurl4-openssl-dev cmake pkg-config libsasl2-dev libudev-dev protobuf-compiler
+
+      - name: Install protoc (macOS)
+        if: runner.os == 'macOS'
+        run: brew install protobuf
+
+      - name: Install protoc (Windows)
+        if: runner.os == 'Windows'
+        run: choco install protoc -y
 
       - name: Install cross
         if: matrix.cross

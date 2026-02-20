@@ -1,4 +1,4 @@
-//! Watermark UDF for `DataFusion` integration (F005B)
+//! Watermark UDF for `DataFusion` integration
 //!
 //! Provides a `watermark()` scalar function that returns the current
 //! watermark timestamp from Ring 0 via a shared `Arc<AtomicI64>`.

@@ -525,9 +525,9 @@ pub struct KafkaSourceConfig {
     pub max_out_of_orderness: Duration,
     /// Timeout before marking a partition as idle.
     pub idle_timeout: Duration,
-    /// Enable per-partition watermark tracking (integrates with F064).
+    /// Enable per-partition watermark tracking (integrates with watermark tracking).
     pub enable_watermark_tracking: bool,
-    /// Alignment group ID for multi-source coordination (integrates with F066).
+    /// Alignment group ID for multi-source coordination (integrates with watermark tracking).
     pub alignment_group_id: Option<String>,
     /// Maximum allowed drift between sources in alignment group.
     pub alignment_max_drift: Option<Duration>,

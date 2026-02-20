@@ -1,7 +1,7 @@
-//! MySQL binlog replication CDC source connector (F028).
+//! MySQL binlog replication CDC source connector.
 //!
-// Note: Many functions are not yet used because actual I/O (F028A) is not implemented.
-// These allows will be removed when F028A adds the binlog reader.
+// Note: Many functions are not yet used because actual I/O is not implemented.
+// These allows will be removed when we add the binlog reader.
 #![allow(dead_code)]
 // MySQL CDC docs reference many MySQL-specific terms that clippy wants backticks for.
 // This is a domain-specific module where MySQL terminology is ubiquitous.
@@ -16,7 +16,7 @@
 //! - Table filtering with include/exclude patterns
 //! - SSL/TLS connections
 //! - Automatic schema discovery via TABLE_MAP events
-//! - Z-set changelog format (F063 compatible)
+//! - Z-set changelog format
 //!
 //! # Architecture
 //!

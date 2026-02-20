@@ -1,4 +1,4 @@
-//! # Exactly-Once Sinks (F023)
+//! # Exactly-Once Sinks
 //!
 //! This module provides exactly-once delivery semantics for sinks through two mechanisms:
 //!
@@ -83,7 +83,10 @@ mod tests {
         }
 
         impl Sink for MockSink {
-            fn write(&mut self, outputs: &mut Vec<Output>) -> Result<(), crate::reactor::SinkError> {
+            fn write(
+                &mut self,
+                outputs: &mut Vec<Output>,
+            ) -> Result<(), crate::reactor::SinkError> {
                 self.writes.append(outputs);
                 Ok(())
             }
@@ -194,7 +197,7 @@ mod tests {
         assert!(!caps.supports_upsert());
     }
 
-    // F023 Recovery Integration Tests
+    // Recovery Integration Tests
 
     use crate::reactor::BufferingSink;
 
@@ -300,7 +303,11 @@ mod tests {
         let inner1 = BufferingSink::new();
         let mut tx_sink = TransactionalSink::new(inner1, "tx-type");
         assert!(tx_sink.capabilities().supports_transactions());
-        Sink::write(&mut tx_sink, &mut vec![Output::Event(make_test_event(1000, 1))]).unwrap();
+        Sink::write(
+            &mut tx_sink,
+            &mut vec![Output::Event(make_test_event(1000, 1))],
+        )
+        .unwrap();
         Sink::flush(&mut tx_sink).unwrap();
         assert_eq!(tx_sink.stats().committed, 1);
 
@@ -334,8 +341,16 @@ mod tests {
         let mut adapter2 = ExactlyOnceSinkAdapter::new(tx_sink2);
 
         // Write to both and checkpoint
-        Sink::write(&mut adapter1, &mut vec![Output::Event(make_test_event(1000, 1))]).unwrap();
-        Sink::write(&mut adapter2, &mut vec![Output::Event(make_test_event(2000, 2))]).unwrap();
+        Sink::write(
+            &mut adapter1,
+            &mut vec![Output::Event(make_test_event(1000, 1))],
+        )
+        .unwrap();
+        Sink::write(
+            &mut adapter2,
+            &mut vec![Output::Event(make_test_event(2000, 2))],
+        )
+        .unwrap();
 
         let cp1 = adapter1.notify_checkpoint(1).unwrap();
         let cp2 = adapter2.notify_checkpoint(1).unwrap();

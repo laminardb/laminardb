@@ -1,7 +1,7 @@
 //! `LookupJoinNode` — custom DataFusion logical plan node for lookup joins.
 //!
 //! This node represents a join between a streaming input and a registered
-//! lookup table. It is produced by the [`LookupJoinRewriteRule`] optimizer
+//! lookup table. It is produced by the `LookupJoinRewriteRule` optimizer
 //! rule when a standard JOIN references a registered lookup table.
 
 use std::collections::HashSet;
@@ -283,8 +283,7 @@ impl UserDefinedLogicalNodeCore for LookupJoinNode {
         let num_keys = self.join_keys.len();
         let num_pushdown = self.pushdown_predicates.len();
         let (key_exprs, rest) = exprs.split_at(num_keys.min(exprs.len()));
-        let (pushdown_exprs, local_exprs) =
-            rest.split_at(num_pushdown.min(rest.len()));
+        let (pushdown_exprs, local_exprs) = rest.split_at(num_pushdown.min(rest.len()));
 
         let join_keys: Vec<JoinKeyPair> = key_exprs
             .iter()
@@ -315,6 +314,8 @@ impl UserDefinedLogicalNodeCore for LookupJoinNode {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use std::fmt::Write;
+
     use arrow::datatypes::{DataType, Field, Schema};
     use datafusion::common::DFSchema;
     use datafusion::logical_expr::col;
@@ -366,12 +367,10 @@ mod tests {
 
     fn test_node() -> LookupJoinNode {
         let stream_schema = test_stream_schema();
-        let input = LogicalPlan::EmptyRelation(
-            datafusion::logical_expr::EmptyRelation {
-                produce_one_row: false,
-                schema: stream_schema,
-            },
-        );
+        let input = LogicalPlan::EmptyRelation(datafusion::logical_expr::EmptyRelation {
+            produce_one_row: false,
+            schema: stream_schema,
+        });
 
         LookupJoinNode::new(
             input,
@@ -422,7 +421,6 @@ mod tests {
 
         // Test the Display-like explain output
         let mut buf = String::new();
-        use std::fmt::Write;
         write!(buf, "{}", DisplayExplain(&node)).unwrap();
         assert!(buf.contains("LookupJoin: table=customers"));
         assert!(buf.contains("type=Inner"));
@@ -443,12 +441,10 @@ mod tests {
     #[test]
     fn test_left_outer_join() {
         let stream_schema = test_stream_schema();
-        let input = LogicalPlan::EmptyRelation(
-            datafusion::logical_expr::EmptyRelation {
-                produce_one_row: false,
-                schema: stream_schema,
-            },
-        );
+        let input = LogicalPlan::EmptyRelation(datafusion::logical_expr::EmptyRelation {
+            produce_one_row: false,
+            schema: stream_schema,
+        });
 
         let node = LookupJoinNode::new(
             input,

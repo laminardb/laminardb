@@ -226,7 +226,8 @@ impl WriteAheadLog {
         // Coalesce header + data into self.write_buffer (reused across calls).
         self.write_buffer.clear();
         #[allow(clippy::cast_possible_truncation)] // RECORD_HEADER_SIZE is 8, always fits usize
-        self.write_buffer.reserve(RECORD_HEADER_SIZE as usize + bytes.len());
+        self.write_buffer
+            .reserve(RECORD_HEADER_SIZE as usize + bytes.len());
         self.write_buffer.extend_from_slice(&len.to_le_bytes());
         self.write_buffer.extend_from_slice(&crc.to_le_bytes());
         self.write_buffer.extend_from_slice(&bytes);

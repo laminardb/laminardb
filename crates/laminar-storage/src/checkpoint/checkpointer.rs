@@ -1,10 +1,10 @@
 //! Async checkpoint persistence via object stores.
 //!
-//! The [`Checkpointer`] trait abstracts checkpoint I/O so that the
+//! The `Checkpointer` trait abstracts checkpoint I/O so that the
 //! checkpoint coordinator doesn't need to know whether state is persisted
 //! to local disk, S3, GCS, or Azure Blob.
 //!
-//! [`ObjectStoreCheckpointer`] is the production implementation that
+//! `ObjectStoreCheckpointer` is the production implementation that
 //! writes to any `object_store::ObjectStore` backend with:
 //! - Concurrent partition uploads via `JoinSet`
 //! - SHA-256 integrity digests
@@ -20,9 +20,7 @@ use object_store::{GetOptions, ObjectStore, PutOptions, PutPayload};
 use sha2::{Digest, Sha256};
 use tokio::task::JoinSet;
 
-use super::layout::{
-    CheckpointId, CheckpointManifestV2, CheckpointPaths, PartitionSnapshotEntry,
-};
+use super::layout::{CheckpointId, CheckpointManifestV2, CheckpointPaths, PartitionSnapshotEntry};
 
 /// Errors from checkpoint persistence operations.
 #[derive(Debug, thiserror::Error)]
@@ -59,10 +57,8 @@ pub enum CheckpointerError {
 #[async_trait]
 pub trait Checkpointer: Send + Sync {
     /// Write a manifest to the checkpoint store.
-    async fn save_manifest(
-        &self,
-        manifest: &CheckpointManifestV2,
-    ) -> Result<(), CheckpointerError>;
+    async fn save_manifest(&self, manifest: &CheckpointManifestV2)
+        -> Result<(), CheckpointerError>;
 
     /// Load a manifest by checkpoint ID.
     async fn load_manifest(
@@ -313,18 +309,16 @@ impl Checkpointer for ObjectStoreCheckpointer {
         match self.store.get_opts(&path, GetOptions::default()).await {
             Ok(result) => {
                 let data = result.bytes().await?;
-                let id_str = std::str::from_utf8(&data).map_err(|e| {
-                    object_store::Error::Generic {
+                let id_str =
+                    std::str::from_utf8(&data).map_err(|e| object_store::Error::Generic {
                         store: "checkpointer",
                         source: Box::new(e),
-                    }
-                })?;
-                let uuid = uuid::Uuid::parse_str(id_str).map_err(|e| {
-                    object_store::Error::Generic {
+                    })?;
+                let uuid =
+                    uuid::Uuid::parse_str(id_str).map_err(|e| object_store::Error::Generic {
                         store: "checkpointer",
                         source: Box::new(e),
-                    }
-                })?;
+                    })?;
                 Ok(Some(CheckpointId::from_uuid(uuid)))
             }
             Err(object_store::Error::NotFound { .. }) => Ok(None),
@@ -382,8 +376,7 @@ impl Checkpointer for ObjectStoreCheckpointer {
         }
 
         // Delete using delete_stream (object-safe, no ObjectStoreExt needed)
-        let locations_stream =
-            futures::stream::iter(paths_to_delete.into_iter().map(Ok)).boxed();
+        let locations_stream = futures::stream::iter(paths_to_delete.into_iter().map(Ok)).boxed();
         let mut results = self.store.delete_stream(locations_stream);
         while let Some(result) = results.next().await {
             result?;
@@ -416,11 +409,11 @@ pub fn verify_integrity(
 
 #[cfg(test)]
 mod tests {
-    use super::*;
     use super::super::layout::OperatorSnapshotEntry;
+    use super::*;
     use object_store::memory::InMemory;
 
-    async fn make_checkpointer() -> ObjectStoreCheckpointer {
+    fn make_checkpointer() -> ObjectStoreCheckpointer {
         let store = Arc::new(InMemory::new());
         let paths = CheckpointPaths::default();
         ObjectStoreCheckpointer::new(store, paths, 4)
@@ -428,7 +421,7 @@ mod tests {
 
     #[tokio::test]
     async fn test_save_and_load_manifest() {
-        let ckpt = make_checkpointer().await;
+        let ckpt = make_checkpointer();
         let id = CheckpointId::now();
         let manifest = CheckpointManifestV2::new(id, 1);
 
@@ -441,7 +434,7 @@ mod tests {
 
     #[tokio::test]
     async fn test_save_snapshot_with_digest() {
-        let ckpt = make_checkpointer().await;
+        let ckpt = make_checkpointer();
         let id = CheckpointId::now();
         let data = Bytes::from_static(b"hello world");
 
@@ -457,7 +450,7 @@ mod tests {
 
     #[tokio::test]
     async fn test_load_artifact() {
-        let ckpt = make_checkpointer().await;
+        let ckpt = make_checkpointer();
         let id = CheckpointId::now();
         let data = Bytes::from_static(b"partition state");
 
@@ -472,7 +465,7 @@ mod tests {
 
     #[tokio::test]
     async fn test_latest_pointer() {
-        let ckpt = make_checkpointer().await;
+        let ckpt = make_checkpointer();
 
         // No latest yet
         assert!(ckpt.read_latest().await.unwrap().is_none());
@@ -486,7 +479,7 @@ mod tests {
 
     #[tokio::test]
     async fn test_concurrent_partition_uploads() {
-        let ckpt = make_checkpointer().await;
+        let ckpt = make_checkpointer();
         let id = CheckpointId::now();
 
         let snapshots = vec![
@@ -518,7 +511,7 @@ mod tests {
 
     #[tokio::test]
     async fn test_save_and_build_manifest() {
-        let ckpt = make_checkpointer().await;
+        let ckpt = make_checkpointer();
         let id = CheckpointId::now();
 
         // Save partitions

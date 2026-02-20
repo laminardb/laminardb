@@ -58,7 +58,7 @@ pub mod sink_metrics;
 // Shared modules
 pub mod schema_registry;
 
-// Discovery module (requires constellation feature from laminar-core)
+// Discovery module (requires delta feature from laminar-core)
 #[cfg(feature = "kafka-discovery")]
 pub mod discovery;
 
@@ -263,12 +263,12 @@ fn kafka_source_config_keys() -> Vec<ConfigKeySpec> {
         ConfigKeySpec::optional("idle.timeout.ms", "Idle partition timeout", "30000"),
         ConfigKeySpec::optional(
             "enable.watermark.tracking",
-            "Enable per-partition watermark tracking (F064)",
+            "Enable per-partition watermark tracking",
             "false",
         ),
         ConfigKeySpec::optional(
             "alignment.group.id",
-            "Alignment group ID for multi-source coordination (F066)",
+            "Alignment group ID for multi-source coordination",
             "",
         ),
         ConfigKeySpec::optional(

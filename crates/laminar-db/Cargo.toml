@@ -18,7 +18,7 @@ kafka = ["laminar-connectors/kafka"]
 postgres-cdc = ["laminar-connectors/postgres-cdc"]
 postgres-sink = ["laminar-connectors/postgres-sink"]
 durable = []             # Object-store checkpoint profiles
-constellation = ["durable"]  # Full distributed mode (Durable + gRPC + gossip + Raft)
+delta = ["durable"]  # Full distributed mode (Durable + gRPC + gossip + Raft)
 
 [dependencies]
 laminar-core = { path = "../laminar-core", version = "0.13.0" }

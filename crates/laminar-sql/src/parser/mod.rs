@@ -183,7 +183,10 @@ impl StreamingParser {
                     sqlparser::parser::Parser::new(&dialect).with_tokens_with_locations(tokens);
                 let (name, if_exists) = lookup_table::parse_drop_lookup_table(&mut parser)
                     .map_err(parse_error_to_parser_error)?;
-                Ok(vec![StreamingStatement::DropLookupTable { name, if_exists }])
+                Ok(vec![StreamingStatement::DropLookupTable {
+                    name,
+                    if_exists,
+                }])
             }
             StreamingDdlKind::None => {
                 // Standard SQL - check for INSERT INTO and convert

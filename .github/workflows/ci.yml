@@ -55,7 +55,7 @@ jobs:
           components: clippy
       - uses: Swatinem/rust-cache@v2
       - name: Install system dependencies
-        run: sudo apt-get update && sudo apt-get install -y libhwloc-dev libelf-dev zlib1g-dev libcurl4-openssl-dev cmake pkg-config libsasl2-dev libudev-dev mold
+        run: sudo apt-get update && sudo apt-get install -y libhwloc-dev libelf-dev zlib1g-dev libcurl4-openssl-dev cmake pkg-config libsasl2-dev libudev-dev mold protobuf-compiler protobuf-compiler
       - name: Clippy (all features)
         run: cargo clippy --workspace --all-features --all-targets -- -D warnings
         env:
@@ -89,7 +89,11 @@ jobs:
 
       - name: Install system dependencies (Linux)
         if: runner.os == 'Linux'
-        run: sudo apt-get update && sudo apt-get install -y libhwloc-dev libelf-dev zlib1g-dev libcurl4-openssl-dev cmake pkg-config libsasl2-dev libudev-dev mold
+        run: sudo apt-get update && sudo apt-get install -y libhwloc-dev libelf-dev zlib1g-dev libcurl4-openssl-dev cmake pkg-config libsasl2-dev libudev-dev mold protobuf-compiler
+
+      - name: Install protoc (Windows)
+        if: runner.os == 'Windows'
+        run: choco install protoc -y
 
       # Tests include compilation - no separate build step needed
       - name: Run tests (Linux)
@@ -101,7 +105,7 @@ jobs:
       # Windows: explicit features (skip hwloc, io-uring, xdp)
       - name: Run tests (Windows)
         if: runner.os == 'Windows'
-        run: cargo nextest run --workspace --features "allocation-tracking,jit,kafka,postgres-cdc,postgres-sink,mysql-cdc,delta-lake"
+        run: cargo nextest run --workspace --features "allocation-tracking,jit,kafka,postgres-cdc,postgres-sink,mysql-cdc,delta-lake,delta"
 
       # Doc tests only on Linux (redundant across platforms)
       - name: Run doc tests
@@ -128,7 +132,7 @@ jobs:
         with:
           key: release
       - name: Install system dependencies
-        run: sudo apt-get update && sudo apt-get install -y libhwloc-dev libelf-dev zlib1g-dev libcurl4-openssl-dev cmake pkg-config libsasl2-dev libudev-dev mold
+        run: sudo apt-get update && sudo apt-get install -y libhwloc-dev libelf-dev zlib1g-dev libcurl4-openssl-dev cmake pkg-config libsasl2-dev libudev-dev mold protobuf-compiler
       - name: Build release
         run: cargo build --workspace --release --all-features
         env:
@@ -151,7 +155,7 @@ jobs:
       - uses: Swatinem/rust-cache@v2
 
       - name: Install system dependencies
-        run: sudo apt-get update && sudo apt-get install -y libhwloc-dev libelf-dev zlib1g-dev libcurl4-openssl-dev cmake pkg-config libsasl2-dev libudev-dev mold
+        run: sudo apt-get update && sudo apt-get install -y libhwloc-dev libelf-dev zlib1g-dev libcurl4-openssl-dev cmake pkg-config libsasl2-dev libudev-dev mold protobuf-compiler
 
       - name: Check no default features
         run: cargo check --workspace --no-default-features
@@ -169,9 +173,11 @@ jobs:
           cargo check -p laminar-core --features hwloc
           cargo check -p laminar-core --features xdp
           cargo check -p laminar-core --features jit
+          cargo check -p laminar-core --features delta
 
           # DB features
           cargo check -p laminar-db --features jit
+          cargo check -p laminar-db --features delta
 
           # Connector features
           cargo check -p laminar-connectors --no-default-features
@@ -179,6 +185,7 @@ jobs:
           cargo check -p laminar-connectors --features postgres-cdc
           cargo check -p laminar-connectors --features postgres-sink
           cargo check -p laminar-connectors --features mysql-cdc
+          cargo check -p laminar-connectors --features kafka-discovery
 
   # ============================================
   # MSRV Check
@@ -219,7 +226,7 @@ jobs:
       - uses: dtolnay/rust-toolchain@stable
       - uses: Swatinem/rust-cache@v2
       - name: Install system dependencies
-        run: sudo apt-get update && sudo apt-get install -y libhwloc-dev libelf-dev zlib1g-dev libcurl4-openssl-dev cmake pkg-config libsasl2-dev libudev-dev mold
+        run: sudo apt-get update && sudo apt-get install -y libhwloc-dev libelf-dev zlib1g-dev libcurl4-openssl-dev cmake pkg-config libsasl2-dev libudev-dev mold protobuf-compiler
       - name: Build docs
         run: cargo doc --workspace --no-deps --all-features
         env:

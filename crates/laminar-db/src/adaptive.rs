@@ -2,7 +2,7 @@
 //!
 //! [`AdaptiveQueryRunner`] starts executing a query immediately via `DataFusion`
 //! interpreted mode while Cranelift compiles the pipeline in the background.
-//! When compilation completes, the runner seamlessly swaps to the compiled path.
+//! When compilation completes, the runner swaps to the compiled path.
 //!
 //! This eliminates the "cold start" latency of JIT compilation (typically 0.5–5ms)
 //! for interactive or ad-hoc queries, while still providing the throughput benefits

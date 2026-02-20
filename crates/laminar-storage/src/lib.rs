@@ -6,8 +6,8 @@
 //!
 //! - [`wal`]: Write-ahead log for durability and exactly-once semantics
 //! - [`checkpoint`]: Basic checkpointing for fast recovery
-//! - [`incremental`]: F022 Incremental checkpointing
-//! - [`per_core_wal`]: F062 Per-core WAL segments for thread-per-core architecture
+//! - [`incremental`]: Incremental checkpointing
+//! - [`per_core_wal`]: Per-core WAL segments for thread-per-core architecture
 //! - [`wal_state_store`]: Combines `MmapStateStore` with WAL for durability
 //!
 //! **Note:** Lakehouse sinks (Delta Lake, Iceberg) are in `laminar-connectors` crate,
@@ -34,10 +34,10 @@ pub mod checkpoint_store;
 /// Ring 1 changelog drainer
 pub mod changelog_drainer;
 
-/// Incremental checkpointing (F022) - Directory-based checkpoint architecture
+/// Incremental checkpointing - Directory-based checkpoint architecture
 pub mod incremental;
 
-/// Per-core WAL segments (F062) - Thread-per-core WAL for lock-free writes
+/// Per-core WAL segments - Thread-per-core WAL for lock-free writes
 pub mod per_core_wal;
 
 /// `io_uring`-backed Write-Ahead Log for high-performance durability (Linux only).
@@ -46,20 +46,19 @@ pub mod io_uring_wal;
 
 // Re-export key types
 pub use changelog_drainer::ChangelogDrainer;
-pub use checkpoint::{Checkpoint, CheckpointManager, CheckpointMetadata};
 pub use checkpoint::checkpointer::{
-    Checkpointer, CheckpointerError, ObjectStoreCheckpointer, verify_integrity,
+    verify_integrity, Checkpointer, CheckpointerError, ObjectStoreCheckpointer,
 };
 pub use checkpoint::layout::{
     CheckpointId, CheckpointManifestV2, CheckpointPaths, OperatorSnapshotEntry,
     PartitionSnapshotEntry, SourceOffsetEntry,
 };
 pub use checkpoint::source_offsets::{
-    DeterminismValidator, DeterminismWarning, FilePosition, GenericPosition,
-    KafkaPartitionOffset, KafkaPosition, MysqlCdcPosition, OperatorDescriptor,
-    OperatorDeterminismWarning, PostgresCdcPosition, RecoveryPlan, SourceId, SourceOffset,
-    SourcePosition, WarningSeverity,
+    DeterminismValidator, DeterminismWarning, FilePosition, GenericPosition, KafkaPartitionOffset,
+    KafkaPosition, MysqlCdcPosition, OperatorDescriptor, OperatorDeterminismWarning,
+    PostgresCdcPosition, RecoveryPlan, SourceId, SourceOffset, SourcePosition, WarningSeverity,
 };
+pub use checkpoint::{Checkpoint, CheckpointManager, CheckpointMetadata};
 pub use checkpoint_manifest::{CheckpointManifest, ConnectorCheckpoint, OperatorCheckpoint};
 pub use checkpoint_store::{CheckpointStore, CheckpointStoreError, FileSystemCheckpointStore};
 pub use wal::{WalEntry, WalError, WalPosition, WriteAheadLog};

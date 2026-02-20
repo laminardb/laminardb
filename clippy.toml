@@ -1,0 +1,4 @@
+# ScratchBuffer uses a 64KB inline array for zero-allocation thread-local
+# storage. The default array-size-threshold (16384) triggers a false positive
+# since the buffer lives in thread-local storage, not on the call stack.
+array-size-threshold = 131072

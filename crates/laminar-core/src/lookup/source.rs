@@ -14,9 +14,7 @@
 use std::future::Future;
 use std::time::Duration;
 
-use crate::lookup::predicate::{
-    Predicate, SourceCapabilities, split_predicates,
-};
+use crate::lookup::predicate::{split_predicates, Predicate, SourceCapabilities};
 
 /// Column identifier for projection pushdown.
 pub type ColumnId = u32;
@@ -217,7 +215,7 @@ mod tests {
         ) -> impl Future<Output = Result<Vec<Option<Vec<u8>>>, LookupError>> + Send {
             let results: Vec<Option<Vec<u8>>> = keys
                 .iter()
-                .map(|k| self.data.get(k.as_ref()).cloned())
+                .map(|k| self.data.get::<[u8]>(k.as_ref()).cloned())
                 .collect();
             async move { Ok(results) }
         }
@@ -226,7 +224,7 @@ mod tests {
             self.capabilities.clone()
         }
 
-        fn source_name(&self) -> &str {
+        fn source_name(&self) -> &'static str {
             "in_memory_test"
         }
 
@@ -309,7 +307,7 @@ mod tests {
 
         // Build keys exceeding max_batch_size
         let keys: Vec<Vec<u8>> = (0..10u8).map(|i| vec![i]).collect();
-        let key_refs: Vec<&[u8]> = keys.iter().map(|k| k.as_slice()).collect();
+        let key_refs: Vec<&[u8]> = keys.iter().map(Vec::as_slice).collect();
 
         // Chunk keys according to max_batch_size and query each chunk
         let max = source.capabilities().max_batch_size;
@@ -321,7 +319,9 @@ mod tests {
 
         assert_eq!(all_results.len(), 10);
         for (i, result) in all_results.iter().enumerate() {
-            assert_eq!(*result, Some(vec![i as u8 + 100]));
+            #[allow(clippy::cast_possible_truncation)]
+            let expected = i as u8 + 100;
+            assert_eq!(*result, Some(vec![expected]));
         }
     }
 

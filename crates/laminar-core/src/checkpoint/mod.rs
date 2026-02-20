@@ -4,9 +4,9 @@
 //!
 //! ## Module Overview
 //!
-//! - [`barrier`]: Checkpoint barrier types, `StreamMessage<T>` enum, and
+//! - `barrier`: Checkpoint barrier types, `StreamMessage<T>` enum, and
 //!   cross-thread barrier injection
-//! - [`alignment`]: Multi-input barrier alignment with buffering
+//! - `alignment`: Multi-input barrier alignment with buffering
 
 /// Barrier alignment for multi-input operators.
 pub mod alignment;
@@ -15,6 +15,4 @@ pub mod barrier;
 
 // Re-export key types
 pub use alignment::{AlignmentAction, BarrierAligner};
-pub use barrier::{
-    BarrierPollHandle, CheckpointBarrier, CheckpointBarrierInjector, StreamMessage,
-};
+pub use barrier::{BarrierPollHandle, CheckpointBarrier, CheckpointBarrierInjector, StreamMessage};

@@ -61,7 +61,7 @@
 //! let df = ctx.sql("SELECT * FROM events WHERE value > 100").await?;
 //! ```
 
-/// F075: DataFusion aggregate bridge for streaming aggregation.
+/// DataFusion aggregate bridge for streaming aggregation.
 ///
 /// Bridges DataFusion's `Accumulator` trait with `laminar-core`'s
 /// `DynAccumulator` / `DynAggregatorFactory` traits. This avoids
@@ -72,14 +72,14 @@ mod channel_source;
 mod exec;
 /// End-to-end streaming SQL execution
 pub mod execute;
+/// Lookup join plan node for DataFusion.
+pub mod lookup_join;
 mod source;
 mod table_provider;
 /// Watermark UDF for current watermark access
 pub mod watermark_udf;
 /// Window function UDFs (TUMBLE, HOP, SESSION)
 pub mod window_udf;
-/// Lookup join plan node for DataFusion.
-pub mod lookup_join;
 
 pub use aggregate_bridge::{
     create_aggregate_factory, lookup_aggregate_udf, result_to_scalar_value, scalar_value_to_result,
@@ -298,7 +298,7 @@ mod tests {
     #[tokio::test]
     async fn test_unbounded_aggregation_rejected() {
         // Aggregations on unbounded streams should be rejected by `DataFusion`.
-        // Streaming aggregations require windows, which are implemented in F006.
+        // Streaming aggregations require windows, which are implemented.
         let ctx = create_streaming_context();
         let schema = test_schema();
 
@@ -381,7 +381,7 @@ mod tests {
         assert_eq!(received, batch_count);
     }
 
-    // ── F005B Integration Tests ──────────────────────────────────────────
+    // ── Integration Tests ──────────────────────────────────────────
 
     #[test]
     fn test_streaming_functions_registered() {

@@ -39,11 +39,11 @@ pub mod alloc;
 pub mod budget;
 /// Distributed checkpoint barrier protocol.
 pub mod checkpoint;
-/// Secondary index support using redb.
-pub mod index;
 pub mod compiler;
 pub mod dag;
 pub mod detect;
+/// Secondary index support using redb.
+pub mod index;
 pub mod io_uring;
 /// Lookup table types and predicate pushdown.
 pub mod lookup;
@@ -59,9 +59,9 @@ pub mod time;
 pub mod tpc;
 pub mod xdp;
 
-/// Distributed constellation mode (multi-node coordination).
-#[cfg(feature = "constellation")]
-pub mod constellation;
+/// Distributed delta mode (multi-node coordination).
+#[cfg(feature = "delta")]
+pub mod delta;
 
 // Re-export key types
 pub use reactor::{Reactor, ReactorConfig};

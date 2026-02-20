@@ -263,7 +263,7 @@ impl IcebergSink {
 
     /// Splits a changelog `RecordBatch` into insert and delete batches.
     ///
-    /// Uses the `_op` metadata column (F063 Z-set changelog format):
+    /// Uses the `_op` metadata column:
     /// - `"I"` (insert), `"+I"`, `"c"` (create), `"r"` (read/snapshot),
     ///   `"+U"` (update-after) -> insert batch (data files)
     /// - `"D"` (delete), `"-D"`, `"-U"` (update-before) -> delete batch

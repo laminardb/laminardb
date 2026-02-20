@@ -1,4 +1,4 @@
-//! # Temporal Join Operators (F021)
+//! # Temporal Join Operators
 //!
 //! Join streaming events with versioned tables using point-in-time lookups.
 //! Temporal joins return the table value that was valid at the event's timestamp,

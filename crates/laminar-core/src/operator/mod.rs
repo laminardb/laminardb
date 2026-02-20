@@ -58,7 +58,7 @@ pub enum Output {
         /// The late event
         event: Event,
     },
-    /// Changelog record with Z-set weight (F011B).
+    /// Changelog record with Z-set weight.
     ///
     /// Used by `EmitStrategy::Changelog` to emit structured change records
     /// for CDC pipelines and cascading materialized views.

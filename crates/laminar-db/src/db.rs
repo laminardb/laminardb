@@ -307,7 +307,9 @@ impl LaminarDB {
                 emit_clause,
                 ..
             } => self.handle_create_stream(name, query, emit_clause.as_ref()),
-            StreamingStatement::CreateContinuousQuery { .. } => self.handle_query(sql).await,
+            StreamingStatement::CreateContinuousQuery { .. }
+            | StreamingStatement::CreateLookupTable(_)
+            | StreamingStatement::DropLookupTable { .. } => self.handle_query(sql).await,
             StreamingStatement::Standard(stmt) => {
                 if let sqlparser::ast::Statement::CreateTable(ct) = stmt.as_ref() {
                     self.handle_create_table(ct)
@@ -359,10 +361,6 @@ impl LaminarDB {
                 Ok(ExecuteResult::Metadata(batch))
             }
             StreamingStatement::Explain { statement } => self.handle_explain(statement),
-            StreamingStatement::CreateLookupTable(_)
-            | StreamingStatement::DropLookupTable { .. } => {
-                self.handle_query(sql).await
-            }
             StreamingStatement::CreateMaterializedView {
                 name,
                 query,
@@ -1701,16 +1699,10 @@ impl LaminarDB {
 
         // Log which sources have external connectors for debugging.
         for (name, reg) in &source_regs {
-            eprintln!(
-                "[laminar-db] Source '{}': connector_type={:?}",
-                name, reg.connector_type
-            );
+            tracing::debug!(source = %name, connector_type = ?reg.connector_type, "Registered source");
         }
         for (name, reg) in &sink_regs {
-            eprintln!(
-                "[laminar-db] Sink '{}': connector_type={:?}",
-                name, reg.connector_type
-            );
+            tracing::debug!(sink = %name, connector_type = ?reg.connector_type, "Registered sink");
         }
 
         // Initialize checkpoint coordinator (shared across all pipeline modes)
@@ -1738,23 +1730,19 @@ impl LaminarDB {
         }
 
         if has_external {
-            eprintln!(
-                "[laminar-db] Starting CONNECTOR pipeline ({} sources, {} sinks, {} streams, {} tables)",
-                source_regs.len(),
-                sink_regs.len(),
-                stream_regs.len(),
-                table_regs.len(),
+            tracing::info!(
+                sources = source_regs.len(),
+                sinks = sink_regs.len(),
+                streams = stream_regs.len(),
+                tables = table_regs.len(),
+                "Starting connector pipeline"
             );
             self.start_connector_pipeline(source_regs, sink_regs, stream_regs, table_regs)
                 .await?;
         } else if !stream_regs.is_empty() {
-            eprintln!(
-                "[laminar-db] Starting EMBEDDED pipeline ({} streams)",
-                stream_regs.len(),
-            );
+            tracing::info!(streams = stream_regs.len(), "Starting embedded pipeline");
             self.start_embedded_pipeline(&stream_regs);
         } else {
-            eprintln!("[laminar-db] Starting in embedded mode (no streams)");
             tracing::info!(
                 sources = source_regs.len(),
                 sinks = sink_regs.len(),
@@ -2228,10 +2216,6 @@ impl LaminarDB {
                                 }
                             }
                         }
-                        eprintln!(
-                            "[laminar-db] Recovered from checkpoint epoch {}",
-                            recovered.epoch()
-                        );
                         tracing::info!(
                             epoch = recovered.epoch(),
                             sources_restored = recovered.sources_restored,
@@ -2350,14 +2334,6 @@ impl LaminarDB {
             Some(laminar_core::time::WatermarkTracker::new(source_ids.len()))
         };
 
-        eprintln!(
-            "[laminar-db] Starting connector pipeline: {} sources, {} sinks, \
-             {} streams, {} subscriptions",
-            sources.len(),
-            sinks.len(),
-            stream_regs.len(),
-            stream_sources.len(),
-        );
         tracing::info!(
             sources = sources.len(),
             sinks = sinks.len(),
@@ -2384,7 +2360,7 @@ impl LaminarDB {
         let coordinator = Arc::clone(&self.coordinator);
 
         let handle = tokio::spawn(async move {
-            eprintln!("[laminar-db] Connector pipeline task started");
+            tracing::debug!("Connector pipeline task started");
             let mut cycle_count: u64 = 0;
             let mut total_batches: u64 = 0;
             let mut total_records: u64 = 0;
@@ -2494,9 +2470,6 @@ impl LaminarDB {
                         }
                         Ok(None) => {}
                         Err(e) => {
-                            if cycle_count < 5 || cycle_count.is_multiple_of(100) {
-                                eprintln!("[laminar-db] Source '{name}' poll error: {e}");
-                            }
                             tracing::warn!(
                                 source = %name,
                                 error = %e,
@@ -2517,10 +2490,7 @@ impl LaminarDB {
                                 format!("{k}({rows} rows)")
                             })
                             .collect();
-                        eprintln!(
-                            "[laminar-db] Executing queries with: [{}]",
-                            src_summary.join(", "),
-                        );
+                        tracing::debug!(sources = %src_summary.join(", "), "Executing queries");
                     }
                     let current_wm = pipeline_watermark.load(std::sync::atomic::Ordering::Relaxed);
                     match executor.execute_cycle(&source_batches, current_wm).await {
@@ -2584,9 +2554,6 @@ impl LaminarDB {
                             }
                         }
                         Err(e) => {
-                            if cycle_count < 5 || cycle_count.is_multiple_of(100) {
-                                eprintln!("[laminar-db] Stream execution error: {e}");
-                            }
                             tracing::warn!(error = %e, "Stream execution cycle error");
                         }
                     }
@@ -2644,10 +2611,12 @@ impl LaminarDB {
                     .last_cycle_duration_ns
                     .store(elapsed_ns, std::sync::atomic::Ordering::Relaxed);
                 if cycle_count.is_multiple_of(50) {
-                    eprintln!(
-                        "[laminar-db] Pipeline cycle {cycle_count}: {total_batches} batches, {total_records} records total",
+                    tracing::debug!(
+                        cycles = cycle_count,
+                        batches = total_batches,
+                        records = total_records,
+                        "Pipeline processing"
                     );
-                    tracing::debug!(cycles = cycle_count, "Pipeline processing");
                 }
 
                 // Periodic checkpoint (non-blocking — spawned as a separate task)
@@ -2712,8 +2681,11 @@ impl LaminarDB {
                 }
             }
 
-            eprintln!(
-                "[laminar-db] Pipeline stopping after {cycle_count} cycles ({total_batches} batches, {total_records} records)",
+            tracing::info!(
+                cycles = cycle_count,
+                batches = total_batches,
+                records = total_records,
+                "Pipeline stopping"
             );
 
             // Wait for any in-flight checkpoint to complete before final checkpoint

@@ -159,7 +159,7 @@ impl<S: StateStore> StateStore for ChangelogAwareStore<S> {
         Some(IncrementalSnapshot {
             changes,
             base_epoch: 0, // Caller sets the correct base epoch
-            epoch: 0,       // Caller sets the correct epoch
+            epoch: 0,      // Caller sets the correct epoch
         })
     }
 
@@ -203,9 +203,7 @@ mod tests {
 
         fn record_delete(&self, key: &[u8]) -> bool {
             self.deletes.fetch_add(1, Ordering::Relaxed);
-            self.entries
-                .lock()
-                .push(ChangeEntry::Delete(key.to_vec()));
+            self.entries.lock().push(ChangeEntry::Delete(key.to_vec()));
             true
         }
 

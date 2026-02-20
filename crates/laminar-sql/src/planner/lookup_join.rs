@@ -1,8 +1,8 @@
 //! Optimizer rules that rewrite standard JOINs to `LookupJoinNode`.
 //!
 //! When a query joins a streaming source with a registered lookup table,
-//! the [`LookupJoinRewriteRule`] replaces the standard hash/merge join
-//! with a [`LookupJoinNode`] that uses the lookup source connector.
+//! the `LookupJoinRewriteRule` replaces the standard hash/merge join
+//! with a `LookupJoinNode` that uses the lookup source connector.
 
 use std::collections::{HashMap, HashSet};
 use std::fmt;
@@ -85,10 +85,8 @@ impl OptimizerRule for LookupJoinRewriteRule {
         };
 
         // Extract aliases for qualified column resolution (C7)
-        let stream_alias =
-            scan_table_name_and_alias(stream_plan).and_then(|(_, a)| a);
-        let lookup_alias =
-            scan_table_name_and_alias(lookup_plan).and_then(|(_, a)| a);
+        let stream_alias = scan_table_name_and_alias(stream_plan).and_then(|(_, a)| a);
+        let lookup_alias = scan_table_name_and_alias(lookup_plan).and_then(|(_, a)| a);
 
         let lookup_schema = lookup_plan.schema().clone();
 
@@ -250,8 +248,7 @@ fn scan_table_name_and_alias(plan: &LogicalPlan) -> Option<(String, Option<Strin
         }
         LogicalPlan::SubqueryAlias(alias) => {
             let alias_name = alias.alias.table().to_string();
-            scan_table_name_and_alias(&alias.input)
-                .map(|(base, _)| (base, Some(alias_name)))
+            scan_table_name_and_alias(&alias.input).map(|(base, _)| (base, Some(alias_name)))
         }
         _ => None,
     }
@@ -337,8 +334,11 @@ mod tests {
             Field::new("id", DataType::Int64, false),
             Field::new("name", DataType::Utf8, true),
         ]));
-        ctx.register_batch("orders", arrow::array::RecordBatch::new_empty(orders_schema))
-            .unwrap();
+        ctx.register_batch(
+            "orders",
+            arrow::array::RecordBatch::new_empty(orders_schema),
+        )
+        .unwrap();
         ctx.register_batch(
             "customers",
             arrow::array::RecordBatch::new_empty(customers_schema),
@@ -375,12 +375,12 @@ mod tests {
     async fn test_non_lookup_join_not_rewritten() {
         let ctx = SessionContext::new();
         // Register both as regular tables (neither is a lookup table)
-        let schema_a = Arc::new(Schema::new(vec![
-            Field::new("id", DataType::Int64, false),
-        ]));
-        let schema_b = Arc::new(Schema::new(vec![
-            Field::new("a_id", DataType::Int64, false),
-        ]));
+        let schema_a = Arc::new(Schema::new(vec![Field::new("id", DataType::Int64, false)]));
+        let schema_b = Arc::new(Schema::new(vec![Field::new(
+            "a_id",
+            DataType::Int64,
+            false,
+        )]));
         ctx.register_batch("a", arrow::array::RecordBatch::new_empty(schema_a))
             .unwrap();
         ctx.register_batch("b", arrow::array::RecordBatch::new_empty(schema_b))
@@ -423,7 +423,10 @@ mod tests {
 
         assert!(transformed.transformed);
         let debug_str = format!("{:?}", transformed.data);
-        assert!(debug_str.contains("LeftOuter"), "Expected LeftOuter join type, got: {debug_str}");
+        assert!(
+            debug_str.contains("LeftOuter"),
+            "Expected LeftOuter join type, got: {debug_str}"
+        );
     }
 
     #[test]

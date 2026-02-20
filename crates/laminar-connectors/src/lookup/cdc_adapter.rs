@@ -1,7 +1,7 @@
 //! CDC-to-cache adapter for lookup table refresh.
 //!
-//! [`CdcCacheAdapter`] translates Change Data Capture events into
-//! cache mutations on a [`LookupTable`]. It bridges the gap between
+//! `CdcCacheAdapter` translates Change Data Capture events into
+//! cache mutations on a `LookupTable`. It bridges the gap between
 //! CDC connectors (Postgres, MySQL, Kafka) and the in-memory lookup
 //! cache used by Ring 0 lookup join operators.
 //!
@@ -204,10 +204,7 @@ mod tests {
 
     fn make_adapter() -> (Arc<TestCache>, CdcCacheAdapter<TestCache>) {
         let cache = Arc::new(TestCache::new());
-        let adapter = CdcCacheAdapter::new(
-            Arc::clone(&cache),
-            CdcCacheAdapterConfig::default(),
-        );
+        let adapter = CdcCacheAdapter::new(Arc::clone(&cache), CdcCacheAdapterConfig::default());
         (cache, adapter)
     }
 
@@ -228,10 +225,7 @@ mod tests {
             value: b"v1_updated".to_vec(),
         });
         let hit = cache.get_cached(b"k1");
-        assert_eq!(
-            hit.into_bytes().unwrap(),
-            Bytes::from_static(b"v1_updated")
-        );
+        assert_eq!(hit.into_bytes().unwrap(), Bytes::from_static(b"v1_updated"));
 
         // Delete
         adapter.process_event(CdcOperation::Delete {
@@ -253,9 +247,7 @@ mod tests {
                 key: b"b".to_vec(),
                 value: b"2".to_vec(),
             },
-            CdcOperation::Delete {
-                key: b"a".to_vec(),
-            },
+            CdcOperation::Delete { key: b"a".to_vec() },
             CdcOperation::Update {
                 key: b"b".to_vec(),
                 value: b"3".to_vec(),

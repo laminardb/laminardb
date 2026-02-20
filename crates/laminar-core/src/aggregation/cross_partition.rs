@@ -150,8 +150,7 @@ impl CrossPartitionAggregateStore {
         for (key, value) in self.map.iter(&guard) {
             #[allow(clippy::cast_possible_truncation)] // group keys are always < 4 GiB
             let group_len = key.group_key.len() as u32;
-            let mut serialized_key =
-                Vec::with_capacity(4 + key.group_key.len() + 4);
+            let mut serialized_key = Vec::with_capacity(4 + key.group_key.len() + 4);
             serialized_key.extend_from_slice(&group_len.to_le_bytes());
             serialized_key.extend_from_slice(&key.group_key);
             serialized_key.extend_from_slice(&key.partition_id.to_le_bytes());
@@ -183,8 +182,7 @@ impl CrossPartitionAggregateStore {
                 continue; // malformed entry
             }
 
-            let group_len =
-                u32::from_le_bytes(key_bytes[..4].try_into().unwrap()) as usize;
+            let group_len = u32::from_le_bytes(key_bytes[..4].try_into().unwrap()) as usize;
             if key_bytes.len() < 4 + group_len + 4 {
                 continue; // malformed entry
             }
@@ -238,16 +236,8 @@ mod tests {
     fn test_overwrite_partial() {
         let store = CrossPartitionAggregateStore::new(2);
 
-        store.publish(
-            Bytes::from_static(b"key"),
-            0,
-            Bytes::from_static(b"v1"),
-        );
-        store.publish(
-            Bytes::from_static(b"key"),
-            0,
-            Bytes::from_static(b"v2"),
-        );
+        store.publish(Bytes::from_static(b"key"), 0, Bytes::from_static(b"v1"));
+        store.publish(Bytes::from_static(b"key"), 0, Bytes::from_static(b"v2"));
 
         assert_eq!(
             store.get_partial(b"key", 0),
@@ -286,10 +276,7 @@ mod tests {
         assert!(store.get_partial(b"g1", 0).is_none());
         assert!(store.get_partial(b"g1", 1).is_none());
         // g2 still present
-        assert_eq!(
-            store.get_partial(b"g2", 0),
-            Some(Bytes::from_static(b"c"))
-        );
+        assert_eq!(store.get_partial(b"g2", 0), Some(Bytes::from_static(b"c")));
     }
 
     #[test]
@@ -360,11 +347,7 @@ mod tests {
                 for i in 0..100u32 {
                     let group = format!("group_{i}");
                     let value = format!("p{partition}_v{i}");
-                    store.publish(
-                        Bytes::from(group),
-                        partition,
-                        Bytes::from(value),
-                    );
+                    store.publish(Bytes::from(group), partition, Bytes::from(value));
                 }
             }));
         }

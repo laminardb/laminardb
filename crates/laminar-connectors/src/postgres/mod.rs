@@ -1,4 +1,4 @@
-//! `PostgreSQL` sink connector (F027B).
+//! `PostgreSQL` sink connector.
 //!
 //! Writes Arrow `RecordBatch` to `PostgreSQL` tables using two strategies:
 //! - **Append mode**: COPY BINARY for maximum throughput (>500K rows/sec)
@@ -116,7 +116,7 @@ fn postgres_sink_config_keys() -> Vec<ConfigKeySpec> {
         ),
         ConfigKeySpec::optional(
             "changelog.mode",
-            "Handle F063 Z-set records (split INSERT/DELETE by _op)",
+            "Handle Z-set records (split INSERT/DELETE by _op)",
             "false",
         ),
         ConfigKeySpec::optional(

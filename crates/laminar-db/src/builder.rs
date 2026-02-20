@@ -92,7 +92,7 @@ impl LaminarDbBuilder {
     /// Set the object-store URL for durable checkpoints.
     ///
     /// Required when using [`Profile::Durable`] or
-    /// [`Profile::Constellation`].
+    /// [`Profile::Delta`].
     #[must_use]
     pub fn object_store_url(mut self, url: impl Into<String>) -> Self {
         self.object_store_url = Some(url.into());

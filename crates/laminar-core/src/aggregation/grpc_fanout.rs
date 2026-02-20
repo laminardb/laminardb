@@ -1,13 +1,13 @@
-//! gRPC Aggregate Fan-Out (F-XAGG-003).
+//! gRPC Aggregate Fan-Out.
 //!
-//! Sends aggregate queries to all (or a subset of) constellation nodes,
+//! Sends aggregate queries to all (or a subset of) delta nodes,
 //! collects partial results, merges them, and returns a unified response.
 //!
 //! ## Routing Strategies
 //!
 //! - **Full fan-out**: Query is broadcast to every node. The coordinator
-//!   waits for a quorum (configurable via [`QuorumPolicy`]) before returning.
-//! - **Partition affinity**: If the [`FanOutRequest`] includes a `key_filter`,
+//!   waits for a quorum (configurable via `QuorumPolicy`) before returning.
+//! - **Partition affinity**: If the `FanOutRequest` includes a `key_filter`,
 //!   the coordinator hashes the key to a single owning node and routes the
 //!   query directly — bypassing the fan-out entirely (<1ms).
 //!
@@ -24,8 +24,8 @@ use std::time::Duration;
 
 use serde::{Deserialize, Serialize};
 
-use crate::constellation::discovery::NodeId;
 use super::gossip_aggregates::AggregateState;
+use crate::delta::discovery::NodeId;
 
 // ── QuorumPolicy ────────────────────────────────────────────────────
 
@@ -73,7 +73,7 @@ impl fmt::Display for QuorumPolicy {
 
 // ── FanOutRequest ───────────────────────────────────────────────────
 
-/// A fan-out aggregate query to send to the constellation.
+/// A fan-out aggregate query to send to the delta.
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct FanOutRequest {
     /// Unique identifier for this query.
@@ -138,7 +138,7 @@ impl FanOutRequest {
 
 // ── NodeAggregateResult ─────────────────────────────────────────────
 
-/// Result from a single node in the constellation.
+/// Result from a single node in the delta.
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct NodeAggregateResult {
     /// The node that produced this result.
@@ -336,7 +336,7 @@ pub enum FanOutError {
     },
 
     /// No nodes are available to query.
-    #[error("no nodes available in the constellation")]
+    #[error("no nodes available in the delta")]
     NoNodes,
 
     /// A specific node failed to respond.
@@ -351,7 +351,7 @@ pub enum FanOutError {
 
 // ── FanOutCoordinator ───────────────────────────────────────────────
 
-/// Coordinates fan-out aggregate queries across constellation nodes.
+/// Coordinates fan-out aggregate queries across delta nodes.
 ///
 /// The coordinator maintains a configuration and metrics. The actual
 /// gRPC transport is injected when `execute` is wired up (Phase 6b).
@@ -480,7 +480,7 @@ impl fmt::Debug for FanOutCoordinator {
 /// Hash a key to a partition index using FNV-1a.
 ///
 /// This must be consistent with the partition assignment used by the
-/// constellation's partition manager.
+/// delta's partition manager.
 #[must_use]
 #[allow(clippy::cast_possible_truncation)]
 fn key_to_partition(key: &[u8], num_partitions: u32) -> u32 {
@@ -690,8 +690,7 @@ mod tests {
         let mut partition_map = HashMap::new();
         partition_map.insert(partition, NodeId(2));
 
-        let req = FanOutRequest::new("q1".into(), "agg".into())
-            .with_key_filter(key.to_vec());
+        let req = FanOutRequest::new("q1".into(), "agg".into()).with_key_filter(key.to_vec());
 
         let targets = coord.resolve_targets(&req, &all_nodes, &partition_map, 4);
         assert_eq!(targets.len(), 1);
@@ -714,8 +713,7 @@ mod tests {
 
     #[test]
     fn test_epoch_pin_all_up_to_date() {
-        let req = FanOutRequest::new("q1".into(), "agg".into())
-            .with_epoch(10);
+        let req = FanOutRequest::new("q1".into(), "agg".into()).with_epoch(10);
         let results = vec![
             NodeAggregateResult {
                 node_id: NodeId(1),
@@ -737,8 +735,7 @@ mod tests {
 
     #[test]
     fn test_epoch_pin_some_behind() {
-        let req = FanOutRequest::new("q1".into(), "agg".into())
-            .with_epoch(10);
+        let req = FanOutRequest::new("q1".into(), "agg".into()).with_epoch(10);
         let results = vec![
             NodeAggregateResult {
                 node_id: NodeId(1),
@@ -796,10 +793,7 @@ mod tests {
     #[test]
     fn test_error_display_no_nodes() {
         let err = FanOutError::NoNodes;
-        assert_eq!(
-            err.to_string(),
-            "no nodes available in the constellation"
-        );
+        assert_eq!(err.to_string(), "no nodes available in the delta");
     }
 
     #[test]
@@ -808,10 +802,7 @@ mod tests {
             node_id: NodeId(7),
             reason: "connection refused".into(),
         };
-        assert_eq!(
-            err.to_string(),
-            "node node-7 failed: connection refused"
-        );
+        assert_eq!(err.to_string(), "node node-7 failed: connection refused");
     }
 
     // ── Evaluate results tests ──────────────────────────────────────
@@ -819,8 +810,7 @@ mod tests {
     #[test]
     fn test_evaluate_results_quorum_met() {
         let coord = FanOutCoordinator::with_defaults();
-        let req = FanOutRequest::new("q1".into(), "agg".into())
-            .with_quorum(QuorumPolicy::Majority);
+        let req = FanOutRequest::new("q1".into(), "agg".into()).with_quorum(QuorumPolicy::Majority);
 
         let results = vec![
             NodeAggregateResult {
@@ -850,8 +840,7 @@ mod tests {
     #[test]
     fn test_evaluate_results_quorum_not_met() {
         let coord = FanOutCoordinator::with_defaults();
-        let req = FanOutRequest::new("q1".into(), "agg".into())
-            .with_quorum(QuorumPolicy::All);
+        let req = FanOutRequest::new("q1".into(), "agg".into()).with_quorum(QuorumPolicy::All);
 
         let results = vec![NodeAggregateResult {
             node_id: NodeId(1),

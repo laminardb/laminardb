@@ -2,7 +2,7 @@
 //!
 //! [`AHashMapStore`] uses `AHashMap<Vec<u8>, Vec<u8>>` for O(1) point lookups
 //! and a `BTreeMap<Vec<u8>, ()>` index for efficient prefix/range scans.
-//! This is the first backend that supports zero-copy [`get_ref`](super::StateStore::get_ref).
+//! This is the first backend that supports zero-copy `get_ref`.
 //!
 //! ## Performance Characteristics
 //!

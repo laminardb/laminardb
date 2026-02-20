@@ -1,4 +1,4 @@
-//! # Incremental Checkpointing (F022)
+//! # Incremental Checkpointing
 //!
 //! Three-tier incremental checkpoint architecture that maintains Ring 0 latency (<500ns)
 //! while providing durable, incremental state snapshots.

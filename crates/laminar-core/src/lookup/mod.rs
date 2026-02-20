@@ -7,13 +7,13 @@
 //!
 //! ## Module Overview
 //!
-//! - [`predicate`]: Filter predicates for source pushdown
-//! - [`table`]: `LookupTable` trait, `LookupResult`, strategy/config types
+//! - `predicate`: Filter predicates for source pushdown
+//! - `table`: `LookupTable` trait, `LookupResult`, strategy/config types
 
 /// foyer-backed in-memory cache for lookup tables.
 pub mod foyer_cache;
 /// Partitioned lookup strategy for distributed lookup tables.
-#[cfg(feature = "constellation")]
+#[cfg(feature = "delta")]
 pub mod partitioned;
 pub mod predicate;
 /// Async lookup source trait for Phase 6.
@@ -22,13 +22,12 @@ pub mod source;
 pub mod table;
 
 // Re-export commonly used types
-pub use predicate::{
-    Predicate, ScalarValue, SourceCapabilities, SplitPredicates, predicate_to_sql,
-    split_predicates,
-};
 pub use foyer_cache::{
-    CachedValue, FoyerMemoryCache, FoyerMemoryCacheConfig, HierarchyMetrics,
-    HybridCacheConfig, LookupCacheHierarchy, LookupCacheKey,
+    CachedValue, FoyerMemoryCache, FoyerMemoryCacheConfig, HierarchyMetrics, HybridCacheConfig,
+    LookupCacheHierarchy, LookupCacheKey,
+};
+pub use predicate::{
+    predicate_to_sql, split_predicates, Predicate, ScalarValue, SourceCapabilities, SplitPredicates,
 };
 pub use source::{ColumnId, LookupError, LookupSource, LookupSourceCapabilities, PushdownAdapter};
 pub use table::{LookupResult, LookupStrategy, LookupTable, LookupTableConfig};

@@ -5,7 +5,7 @@
 //! the tiers below it.
 //!
 //! ```text
-//! BareMetal ⊂ Embedded ⊂ Durable ⊂ Constellation
+//! BareMetal ⊂ Embedded ⊂ Durable ⊂ Delta
 //! ```
 //!
 //! ## Usage
@@ -39,7 +39,7 @@ pub enum Profile {
     /// Object-store checkpoints + rkyv snapshots.
     Durable,
     /// Full distributed: Durable + gRPC + gossip + Raft.
-    Constellation,
+    Delta,
 }
 
 impl Profile {
@@ -61,11 +61,11 @@ impl Profile {
                     Err(ProfileError::FeatureNotCompiled("durable".into()))
                 }
             }
-            Self::Constellation => {
-                if cfg!(feature = "constellation") {
+            Self::Delta => {
+                if cfg!(feature = "delta") {
                     Ok(())
                 } else {
-                    Err(ProfileError::FeatureNotCompiled("constellation".into()))
+                    Err(ProfileError::FeatureNotCompiled("delta".into()))
                 }
             }
         }
@@ -94,10 +94,10 @@ impl Profile {
                 }
                 Ok(())
             }
-            Self::Durable | Self::Constellation => {
+            Self::Durable | Self::Delta => {
                 if object_store_url.is_none() {
                     return Err(ProfileError::RequirementNotMet(
-                        "Durable/Constellation profile requires an \
+                        "Durable/Delta profile requires an \
                          object_store_url"
                             .into(),
                     ));
@@ -127,7 +127,7 @@ impl Profile {
                     config.default_buffer_size = 131_072;
                 }
             }
-            Self::Constellation => {
+            Self::Delta => {
                 // Largest buffers for distributed workloads.
                 if config.default_buffer_size == LaminarConfig::default().default_buffer_size {
                     config.default_buffer_size = 262_144;
@@ -145,7 +145,7 @@ impl FromStr for Profile {
             "bare_metal" | "baremetal" | "bare-metal" => Ok(Self::BareMetal),
             "embedded" => Ok(Self::Embedded),
             "durable" => Ok(Self::Durable),
-            "constellation" => Ok(Self::Constellation),
+            "delta" => Ok(Self::Delta),
             _ => Err(ProfileError::UnknownProfileName(s.into())),
         }
     }
@@ -157,7 +157,7 @@ impl fmt::Display for Profile {
             Self::BareMetal => write!(f, "bare_metal"),
             Self::Embedded => write!(f, "embedded"),
             Self::Durable => write!(f, "durable"),
-            Self::Constellation => write!(f, "constellation"),
+            Self::Delta => write!(f, "delta"),
         }
     }
 }
@@ -221,10 +221,7 @@ mod tests {
         assert_eq!(Profile::from_str("bare-metal").unwrap(), Profile::BareMetal);
         assert_eq!(Profile::from_str("embedded").unwrap(), Profile::Embedded);
         assert_eq!(Profile::from_str("durable").unwrap(), Profile::Durable);
-        assert_eq!(
-            Profile::from_str("constellation").unwrap(),
-            Profile::Constellation
-        );
+        assert_eq!(Profile::from_str("delta").unwrap(), Profile::Delta);
         // Case insensitive
         assert_eq!(Profile::from_str("DURABLE").unwrap(), Profile::Durable);
         // Unknown name
@@ -236,12 +233,12 @@ mod tests {
     }
 
     #[test]
-    fn test_constellation_requires_durable_feature() {
-        // When compiled without the `constellation` feature, this should fail.
-        // In normal test builds (no `constellation` feature), this checks the
+    fn test_delta_requires_durable_feature() {
+        // When compiled without the `delta` feature, this should fail.
+        // In normal test builds (no `delta` feature), this checks the
         // FeatureNotCompiled path.
-        let result = Profile::Constellation.validate_features();
-        if cfg!(feature = "constellation") {
+        let result = Profile::Delta.validate_features();
+        if cfg!(feature = "delta") {
             assert!(result.is_ok());
         } else {
             assert!(matches!(
@@ -256,7 +253,7 @@ mod tests {
         assert_eq!(Profile::BareMetal.to_string(), "bare_metal");
         assert_eq!(Profile::Embedded.to_string(), "embedded");
         assert_eq!(Profile::Durable.to_string(), "durable");
-        assert_eq!(Profile::Constellation.to_string(), "constellation");
+        assert_eq!(Profile::Delta.to_string(), "delta");
     }
 
     #[test]
@@ -274,8 +271,10 @@ mod tests {
 
     #[test]
     fn test_apply_defaults_does_not_override_user_values() {
-        let mut config = LaminarConfig::default();
-        config.default_buffer_size = 999;
+        let mut config = LaminarConfig {
+            default_buffer_size: 999,
+            ..LaminarConfig::default()
+        };
         Profile::Durable.apply_defaults(&mut config);
         // User explicitly set 999 — should not be overridden
         assert_eq!(config.default_buffer_size, 999);

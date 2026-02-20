@@ -230,7 +230,7 @@ impl MySqlCdcSource {
     }
 
     /// Builds the CDC envelope schema based on a table schema.
-    #[allow(clippy::unused_self)] // Will use self for config options in F028A
+    #[allow(clippy::unused_self)] // Will use self for config options
     fn build_envelope_schema(&self, table_schema: &Schema) -> SchemaRef {
         Arc::new(cdc_envelope_schema(table_schema))
     }

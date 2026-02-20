@@ -1,4 +1,4 @@
-//! # Per-Core WAL (F062)
+//! # Per-Core WAL
 //!
 //! Per-core WAL segments for thread-per-core architecture. Each core writes to its own
 //! WAL file without contention, and segments are merged during checkpoint for global recovery.

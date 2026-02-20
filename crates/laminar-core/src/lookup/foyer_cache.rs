@@ -29,8 +29,8 @@ use std::time::{Duration, SystemTime, UNIX_EPOCH};
 use bytes::Bytes;
 use equivalent::Equivalent;
 use foyer::{
-    BlockEngineBuilder, Cache, CacheBuilder, DeviceBuilder, FsDeviceBuilder,
-    HybridCache, NoopDeviceBuilder,
+    BlockEngineBuilder, Cache, CacheBuilder, DeviceBuilder, FsDeviceBuilder, HybridCache,
+    NoopDeviceBuilder,
 };
 use tokio::sync::Semaphore;
 
@@ -252,7 +252,7 @@ impl Default for HybridCacheConfig {
     fn default() -> Self {
         Self {
             memory_capacity: 32 * 1024 * 1024, // 32 MiB
-            disk_capacity: 1024 * 1024 * 1024,  // 1 GiB
+            disk_capacity: 1024 * 1024 * 1024, // 1 GiB
             disk_dir: std::env::temp_dir().join("laminar").join("lookup_cache"),
             ttl: None,
             disk_shards: 4,
@@ -343,9 +343,8 @@ impl<S: LookupSource> LookupCacheHierarchy<S> {
         source: S,
         config: HybridCacheConfig,
     ) -> Result<Self, LookupError> {
-        std::fs::create_dir_all(&config.disk_dir).map_err(|e| {
-            LookupError::Internal(format!("failed to create cache dir: {e}"))
-        })?;
+        std::fs::create_dir_all(&config.disk_dir)
+            .map_err(|e| LookupError::Internal(format!("failed to create cache dir: {e}")))?;
 
         let device = FsDeviceBuilder::new(&config.disk_dir)
             .with_capacity(config.disk_capacity)
@@ -420,11 +419,7 @@ impl<S: LookupSource> LookupCacheHierarchy<S> {
     ///
     /// Returns [`LookupError::Internal`] on hybrid cache I/O failure, or
     /// propagates errors from the underlying [`LookupSource::query`].
-    pub async fn fetch(
-        &self,
-        table_id: u32,
-        key: &[u8],
-    ) -> Result<Option<Bytes>, LookupError> {
+    pub async fn fetch(&self, table_id: u32, key: &[u8]) -> Result<Option<Bytes>, LookupError> {
         let cache_key = LookupCacheKey {
             table_id,
             key: key.to_vec(),
@@ -451,9 +446,11 @@ impl<S: LookupSource> LookupCacheHierarchy<S> {
         }
 
         // Cache miss or expired — acquire semaphore permit, then query source
-        let _permit = self.fetch_semaphore.acquire().await.map_err(|_| {
-            LookupError::Internal("fetch semaphore closed".to_string())
-        })?;
+        let _permit = self
+            .fetch_semaphore
+            .acquire()
+            .await
+            .map_err(|_| LookupError::Internal("fetch semaphore closed".to_string()))?;
 
         let keys: Vec<&[u8]> = vec![key];
         let source_result = self.source.query(&keys, &[], &[]).await;
@@ -489,11 +486,7 @@ impl<S: LookupSource> LookupCacheHierarchy<S> {
     /// Bulk-insert entries into the hybrid cache for warming.
     ///
     /// Returns the number of entries inserted.
-    pub fn warm(
-        &self,
-        table_id: u32,
-        entries: &[(&[u8], &[u8])],
-    ) -> usize {
+    pub fn warm(&self, table_id: u32, entries: &[(&[u8], &[u8])]) -> usize {
         for (key, value) in entries {
             let cache_key = LookupCacheKey {
                 table_id,
@@ -563,10 +556,7 @@ mod tests {
         cache.insert(b"key1", Bytes::from_static(b"value1"));
         let result = cache.get_cached(b"key1");
         assert!(result.is_hit());
-        assert_eq!(
-            result.into_bytes().unwrap(),
-            Bytes::from_static(b"value1")
-        );
+        assert_eq!(result.into_bytes().unwrap(), Bytes::from_static(b"value1"));
         assert_eq!(cache.hit_count(), 1);
     }
 
@@ -662,10 +652,8 @@ mod tests {
     use std::collections::HashMap;
     use std::future::Future;
 
-    use crate::lookup::source::{
-        ColumnId, LookupError, LookupSource, LookupSourceCapabilities,
-    };
     use crate::lookup::predicate::Predicate;
+    use crate::lookup::source::{ColumnId, LookupError, LookupSource, LookupSourceCapabilities};
 
     /// In-memory lookup source for hierarchy tests.
     struct TestSource {
@@ -694,11 +682,10 @@ mod tests {
             keys: &[&[u8]],
             _predicates: &[Predicate],
             _projection: &[ColumnId],
-        ) -> impl Future<Output = Result<Vec<Option<Vec<u8>>>, LookupError>> + Send
-        {
+        ) -> impl Future<Output = Result<Vec<Option<Vec<u8>>>, LookupError>> + Send {
             let results: Vec<Option<Vec<u8>>> = keys
                 .iter()
-                .map(|k| self.data.get(k.as_ref()).cloned())
+                .map(|k| self.data.get::<[u8]>(k.as_ref()).cloned())
                 .collect();
             async move { Ok(results) }
         }
@@ -707,15 +694,13 @@ mod tests {
             LookupSourceCapabilities::default()
         }
 
-        fn source_name(&self) -> &str {
+        fn source_name(&self) -> &'static str {
             "test_source"
         }
     }
 
     /// Helper to build a hierarchy with noop storage for testing.
-    async fn test_hierarchy(
-        source: TestSource,
-    ) -> LookupCacheHierarchy<TestSource> {
+    async fn test_hierarchy(source: TestSource) -> LookupCacheHierarchy<TestSource> {
         let hot = Arc::new(small_cache(1));
         let config = HybridCacheConfig {
             memory_capacity: 4 * 1024 * 1024,
@@ -730,21 +715,20 @@ mod tests {
     struct FailingSource;
 
     impl LookupSource for FailingSource {
-        fn query(
+        async fn query(
             &self,
             _keys: &[&[u8]],
             _predicates: &[Predicate],
             _projection: &[ColumnId],
-        ) -> impl Future<Output = Result<Vec<Option<Vec<u8>>>, LookupError>> + Send
-        {
-            async { Err(LookupError::Internal("source unavailable".to_string())) }
+        ) -> Result<Vec<Option<Vec<u8>>>, LookupError> {
+            Err(LookupError::Internal("source unavailable".to_string()))
         }
 
         fn capabilities(&self) -> LookupSourceCapabilities {
             LookupSourceCapabilities::default()
         }
 
-        fn source_name(&self) -> &str {
+        fn source_name(&self) -> &'static str {
             "failing_source"
         }
     }
@@ -777,11 +761,14 @@ mod tests {
     fn test_cached_value_expired() {
         let mut cv = CachedValue::new(b"hello".to_vec());
         // Set cached_at to 2 seconds ago
-        cv.cached_at_ms = SystemTime::now()
-            .duration_since(UNIX_EPOCH)
-            .unwrap()
-            .as_millis() as u64
-            - 2000;
+        #[allow(clippy::cast_possible_truncation)]
+        {
+            cv.cached_at_ms = SystemTime::now()
+                .duration_since(UNIX_EPOCH)
+                .unwrap()
+                .as_millis() as u64
+                - 2000;
+        }
         // 1-second TTL — should be expired
         assert!(cv.is_expired(Some(Duration::from_secs(1))));
     }
@@ -886,10 +873,9 @@ mod tests {
             ttl: Some(Duration::from_millis(1)),
             ..Default::default()
         };
-        let h2 =
-            LookupCacheHierarchy::with_noop_storage(hot2, FailingSource, config2)
-                .await
-                .unwrap();
+        let h2 = LookupCacheHierarchy::with_noop_storage(hot2, FailingSource, config2)
+            .await
+            .unwrap();
 
         // Warm with an entry, then wait for it to expire
         h2.warm(1, &[(b"stale_key", b"stale_val")]);
@@ -908,10 +894,9 @@ mod tests {
             memory_capacity: 4 * 1024 * 1024,
             ..Default::default()
         };
-        let h =
-            LookupCacheHierarchy::with_noop_storage(hot, FailingSource, config)
-                .await
-                .unwrap();
+        let h = LookupCacheHierarchy::with_noop_storage(hot, FailingSource, config)
+            .await
+            .unwrap();
 
         let result = h.fetch(1, b"missing").await;
         assert!(result.is_err());

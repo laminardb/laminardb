@@ -21,8 +21,8 @@ use crate::parser::analytic_parser::{
     analyze_analytic_functions, analyze_window_frames, FrameBound,
 };
 use crate::parser::join_parser::analyze_joins;
-use crate::parser::order_analyzer::analyze_order_by;
 use crate::parser::lookup_table::{validate_properties, LookupTableProperties};
+use crate::parser::order_analyzer::analyze_order_by;
 use crate::parser::{
     CreateLookupTableStatement, CreateSinkStatement, CreateSourceStatement, EmitClause, SinkFrom,
     StreamingStatement, WindowFunction, WindowRewriter,

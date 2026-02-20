@@ -181,7 +181,7 @@ impl SessionMetadata {
 
     /// Merges another session into this one.
     ///
-    /// Takes the union of the two sessions' bounds. Used by F017C for
+    /// Takes the union of the two sessions' bounds. Used for
     /// session merging when late data bridges two previously separate sessions.
     fn merge(&mut self, other: &SessionMetadata) {
         self.start = self.start.min(other.start);
@@ -270,7 +270,7 @@ fn create_session_output_schema() -> SchemaRef {
 /// 1. **Start**: First event for a key creates a new session
 /// 2. **Extend**: Events within gap period extend the session
 /// 3. **Close**: Timer fires when gap expires, emitting results
-/// 4. **Merge**: Late data may merge previously separate sessions (F017C)
+/// 4. **Merge**: Late data may merge previously separate sessions
 ///
 /// # State Management
 ///
@@ -682,7 +682,7 @@ where
         Some(Event::new(session.end, batch))
     }
 
-    /// Merges multiple overlapping sessions into one (F017C).
+    /// Merges multiple overlapping sessions into one.
     ///
     /// The first session in `overlapping` becomes the "winner" that absorbs all
     /// others. Each "loser" session has its accumulator merged into the winner,
@@ -788,7 +788,7 @@ where
         // Check if event is late
         let current_wm = ctx.watermark_generator.current_watermark();
         if current_wm > i64::MIN && self.is_late(event_time, current_wm) {
-            // F011B: EMIT FINAL drops late data entirely
+            // EMIT FINAL drops late data entirely
             if self.emit_strategy.drops_late_data() {
                 self.late_data_metrics.record_dropped();
                 return output;
@@ -832,7 +832,7 @@ where
                 }
             }
             _ => {
-                // Multiple overlaps — merge all into one session (F017C)
+                // Multiple overlaps — merge all into one session
                 session_id = self.merge_sessions(&mut index, &overlapping, ctx, &mut output);
                 // Extend the merged winner to include this event
                 if let Some(session) = index.get_mut(session_id) {
@@ -1926,7 +1926,7 @@ mod tests {
     }
 
     // ---------------------------------------------------------------
-    //  F017C: Session merging tests
+    //  Session merging tests
     // ---------------------------------------------------------------
 
     #[test]
@@ -2253,7 +2253,7 @@ mod tests {
     }
 
     // ---------------------------------------------------------------
-    //  F017D: Emit strategy verification tests
+    //  Emit strategy verification tests
     // ---------------------------------------------------------------
 
     #[test]
@@ -2471,7 +2471,7 @@ mod tests {
     }
 
     // ---------------------------------------------------------------
-    //  F017E: Timer persistence after checkpoint/restore
+    //  Timer persistence after checkpoint/restore
     // ---------------------------------------------------------------
 
     #[test]

@@ -1,8 +1,8 @@
 //! Checkpoint management for state persistence and recovery.
 //!
 //! - [`CheckpointManager`]: Phase 1-3 file-system checkpoint manager
-//! - [`layout`]: Phase 6a object-store checkpoint layout
-//! - [`checkpointer`]: Async checkpoint persistence via object stores
+//! - `layout`: Phase 6a object-store checkpoint layout
+//! - `checkpointer`: Async checkpoint persistence via object stores
 
 /// Async checkpoint persistence via object stores.
 pub mod checkpointer;

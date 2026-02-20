@@ -638,7 +638,7 @@ where
         if current_wm > i64::MIN && self.is_late(event_time, current_wm) {
             let mut output = OutputVec::new();
 
-            // F011B: EMIT FINAL drops late data entirely
+            // EMIT FINAL drops late data entirely
             if self.emit_strategy.drops_late_data() {
                 self.late_data_metrics.record_dropped();
                 return output; // Silently drop - no LateEvent output
@@ -683,7 +683,7 @@ where
             // Register timers for this window
             self.maybe_register_timer(*window_id, ctx);
 
-            // F011B: OnWindowClose and Final suppress intermediate emissions
+            // OnWindowClose and Final suppress intermediate emissions
             if !self.emit_strategy.suppresses_intermediate() {
                 self.maybe_register_periodic_timer(*window_id, ctx);
             }
@@ -697,7 +697,7 @@ where
             output.push(Output::Watermark(wm.timestamp()));
         }
 
-        // F011B: Handle different emit strategies for intermediate emissions
+        // Handle different emit strategies for intermediate emissions
         if !updated_windows.is_empty() {
             match &self.emit_strategy {
                 // OnUpdate: emit intermediate result as regular event
@@ -741,7 +741,7 @@ where
     fn on_timer(&mut self, timer: Timer, ctx: &mut OperatorContext) -> OutputVec {
         // Check if this is a periodic timer
         if Self::is_periodic_timer_key(&timer.key) {
-            // F011B: OnWindowClose and Final suppress periodic emissions
+            // OnWindowClose and Final suppress periodic emissions
             if self.emit_strategy.suppresses_intermediate() {
                 // Don't emit, just clean up the periodic timer tracking
                 if let Some(window_id) = Self::window_id_from_periodic_key(&timer.key) {
@@ -804,7 +804,7 @@ where
                 self.window_close_metrics
                     .record_close(window_id.end, ctx.processing_time);
 
-                // F011B: Emit based on strategy
+                // Emit based on strategy
                 match &self.emit_strategy {
                     // Changelog: retract last intermediate, then emit final insert
                     EmitStrategy::Changelog => {

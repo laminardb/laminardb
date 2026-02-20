@@ -79,8 +79,8 @@ delta-lake-unity = ["delta-lake", "deltalake/unity-experimental"]
 delta-lake-glue = ["delta-lake", "deltalake/glue"]
 # Parquet file lookup source
 parquet-lookup = ["dep:parquet", "dep:object_store"]
-# Kafka-based discovery for constellation
-kafka-discovery = ["kafka", "laminar-core/constellation", "dep:tokio-util", "dep:chrono"]
+# Kafka-based discovery for delta
+kafka-discovery = ["kafka", "laminar-core/delta", "dep:tokio-util", "dep:chrono"]
 
 [dev-dependencies]
 tempfile = { workspace = true }

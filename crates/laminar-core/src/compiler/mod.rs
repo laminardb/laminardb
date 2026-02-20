@@ -82,7 +82,7 @@ pub use expr::ExprCompiler;
 #[cfg(feature = "jit")]
 pub use jit::JitContext;
 
-// F080: Plan Compiler Core types
+// Plan Compiler Core types
 #[cfg(feature = "jit")]
 pub use cache::CompilerCache;
 #[cfg(feature = "jit")]
@@ -97,14 +97,14 @@ pub use pipeline::{
 #[cfg(feature = "jit")]
 pub use pipeline_compiler::PipelineCompiler;
 
-// F082: Streaming Query Lifecycle
+// Streaming Query Lifecycle
 #[cfg(feature = "jit")]
 pub use query::{StreamingQuery, StreamingQueryBuilder};
 
-// F084: SQL Compiler Orchestrator
+// SQL Compiler Orchestrator
 #[cfg(feature = "jit")]
 pub use orchestrate::{compile_streaming_query, CompiledStreamingQuery};
 
-// F087: Compiled Stateful Pipeline Bridge
+// Compiled Stateful Pipeline Bridge
 #[cfg(feature = "jit")]
 pub use breaker_executor::{BreakerExecutor, CompiledQueryGraph, Ring1Operator};

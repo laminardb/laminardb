@@ -1,4 +1,4 @@
-//! Two-Phase Commit (2PC) Protocol Implementation (F024)
+//! Two-Phase Commit (2PC) Protocol Implementation
 //!
 //! Provides distributed transaction coordination across multiple sinks with:
 //! - Coordinator/participant protocol

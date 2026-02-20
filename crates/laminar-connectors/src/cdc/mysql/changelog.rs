@@ -1,7 +1,7 @@
 //! MySQL CDC changelog conversion to Z-set format.
 //!
 //! Converts MySQL binlog row events into CDC change events compatible
-//! with LaminarDB's Z-set changelog format (F063).
+//! with LaminarDB's Z-set changelog format.
 
 use std::sync::Arc;
 

@@ -178,7 +178,7 @@ const fn unpack_barrier_cmd(packed: u64) -> (u32, u32) {
 ///
 /// The coordinator thread stores a packed barrier command via
 /// [`trigger`](Self::trigger). Source operators poll via
-/// [`poll`](Self::poll) on each iteration of their event loop.
+/// [`BarrierPollHandle::poll`] on each iteration of their event loop.
 ///
 /// ## Fast Path
 ///
@@ -360,8 +360,7 @@ mod tests {
         let watermark: StreamMessage<String> = StreamMessage::Watermark(1000);
         assert!(watermark.is_watermark());
 
-        let barrier: StreamMessage<String> =
-            StreamMessage::Barrier(CheckpointBarrier::new(1, 1));
+        let barrier: StreamMessage<String> = StreamMessage::Barrier(CheckpointBarrier::new(1, 1));
         assert!(barrier.is_barrier());
         assert_eq!(barrier.as_barrier().unwrap().checkpoint_id, 1);
     }

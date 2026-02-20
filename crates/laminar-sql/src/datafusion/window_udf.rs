@@ -1,4 +1,4 @@
-//! Window function UDFs for `DataFusion` integration (F005B)
+//! Window function UDFs for `DataFusion` integration
 //!
 //! Provides scalar UDFs that compute window start timestamps for
 //! streaming window operations:

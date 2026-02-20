@@ -1,4 +1,4 @@
-//! Cache hit/miss ratio benchmarks (F-PERF-002)
+//! Cache hit/miss ratio benchmarks
 //!
 //! Measures foyer cache performance under realistic workloads with
 //! Zipfian access patterns.
@@ -49,7 +49,7 @@ impl LookupSource for BenchLookupSource {
     ) -> impl Future<Output = Result<Vec<Option<Vec<u8>>>, LookupError>> + Send {
         let results: Vec<Option<Vec<u8>>> = keys
             .iter()
-            .map(|k| self.data.get(k.as_ref()).cloned())
+            .map(|k| self.data.get::<[u8]>(k.as_ref()).cloned())
             .collect();
         async move { Ok(results) }
     }
@@ -89,7 +89,11 @@ fn populated_cache(n: usize) -> FoyerMemoryCache {
 /// Uses inverse-CDF approximation: index = floor(n * u^(1/skew)) where
 /// u is uniform in (0, 1). Higher skew concentrates more accesses on
 /// lower-numbered keys (hotter items).
-#[allow(clippy::cast_possible_truncation, clippy::cast_sign_loss, clippy::cast_precision_loss)]
+#[allow(
+    clippy::cast_possible_truncation,
+    clippy::cast_sign_loss,
+    clippy::cast_precision_loss
+)]
 fn zipfian_keys(n: usize, count: usize, skew: f64) -> Vec<String> {
     let mut rng = rand::rng();
     (0..count)
@@ -114,17 +118,13 @@ fn bench_cache_hit_rate(c: &mut Criterion) {
             let label = format!("n={size}/skew={skew}");
 
             group.throughput(Throughput::Elements(keys.len() as u64));
-            group.bench_with_input(
-                BenchmarkId::new("get", &label),
-                &keys,
-                |b, keys| {
-                    b.iter(|| {
-                        for key in keys {
-                            black_box(cache.get_cached(key.as_bytes()));
-                        }
-                    })
-                },
-            );
+            group.bench_with_input(BenchmarkId::new("get", &label), &keys, |b, keys| {
+                b.iter(|| {
+                    for key in keys {
+                        black_box(cache.get_cached(key.as_bytes()));
+                    }
+                })
+            });
         }
     }
 
@@ -153,13 +153,9 @@ fn bench_cache_miss_penalty(c: &mut Criterion) {
         ..Default::default()
     };
     let hierarchy = rt.block_on(async {
-        LookupCacheHierarchy::with_noop_storage(
-            Arc::clone(&hot_cache),
-            source,
-            config,
-        )
-        .await
-        .expect("hierarchy")
+        LookupCacheHierarchy::with_noop_storage(Arc::clone(&hot_cache), source, config)
+            .await
+            .expect("hierarchy")
     });
 
     // Pre-warm half the entries into hot cache
@@ -222,38 +218,34 @@ fn bench_cache_warm(c: &mut Criterion) {
             .collect();
 
         group.throughput(Throughput::Elements(size as u64));
-        group.bench_with_input(
-            BenchmarkId::new("warm", size),
-            &entry_refs,
-            |b, refs| {
-                b.iter_batched(
-                    || {
-                        let source = BenchLookupSource::new(0);
-                        let hot = Arc::new(FoyerMemoryCache::new(
-                            1,
-                            FoyerMemoryCacheConfig {
-                                capacity: size * 2,
-                                shards: 16,
-                            },
-                        ));
-                        let config = HybridCacheConfig {
-                            memory_capacity: 4 * 1024 * 1024,
-                            ..Default::default()
-                        };
-                        rt.block_on(async {
-                            LookupCacheHierarchy::with_noop_storage(hot, source, config)
-                                .await
-                                .expect("hierarchy")
-                        })
-                    },
-                    |hierarchy| {
-                        let count = hierarchy.warm(1, refs);
-                        black_box(count)
-                    },
-                    criterion::BatchSize::SmallInput,
-                )
-            },
-        );
+        group.bench_with_input(BenchmarkId::new("warm", size), &entry_refs, |b, refs| {
+            b.iter_batched(
+                || {
+                    let source = BenchLookupSource::new(0);
+                    let hot = Arc::new(FoyerMemoryCache::new(
+                        1,
+                        FoyerMemoryCacheConfig {
+                            capacity: size * 2,
+                            shards: 16,
+                        },
+                    ));
+                    let config = HybridCacheConfig {
+                        memory_capacity: 4 * 1024 * 1024,
+                        ..Default::default()
+                    };
+                    rt.block_on(async {
+                        LookupCacheHierarchy::with_noop_storage(hot, source, config)
+                            .await
+                            .expect("hierarchy")
+                    })
+                },
+                |hierarchy| {
+                    let count = hierarchy.warm(1, refs);
+                    black_box(count)
+                },
+                criterion::BatchSize::SmallInput,
+            )
+        });
     }
 
     group.finish();

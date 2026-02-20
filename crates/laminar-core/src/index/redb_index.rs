@@ -61,8 +61,7 @@ impl SecondaryIndex {
     pub fn new(db: Arc<Database>, table_name: String) -> Result<Self, IndexError> {
         // Eagerly create the table so that lookup/range work even before any inserts.
         {
-            let table_def: TableDefinition<'_, &[u8], &[u8]> =
-                TableDefinition::new(&table_name);
+            let table_def: TableDefinition<'_, &[u8], &[u8]> = TableDefinition::new(&table_name);
             let txn = db.begin_write().map_err(box_txn_error)?;
             let _ = txn.open_table(table_def)?;
             txn.commit()?;
@@ -132,11 +131,7 @@ impl SecondaryIndex {
     /// # Errors
     ///
     /// Returns `IndexError` on storage failure.
-    pub fn range(
-        &self,
-        start: &[u8],
-        end: &[u8],
-    ) -> Result<RangeResult, IndexError> {
+    pub fn range(&self, start: &[u8], end: &[u8]) -> Result<RangeResult, IndexError> {
         let table_name = self.table_name.clone();
         let table_def: TableDefinition<'_, &[u8], &[u8]> = TableDefinition::new(&table_name);
         let txn = self.db.begin_read().map_err(box_txn_error)?;
@@ -199,20 +194,58 @@ impl SecondaryIndex {
 fn extract_scalar(array: &dyn Array, data_type: &DataType, row: usize) -> ScalarValue {
     match data_type {
         DataType::Boolean => ScalarValue::Bool(array.as_boolean().value(row)),
-        DataType::Int8 => ScalarValue::Int64(i64::from(array.as_primitive::<arrow::datatypes::Int8Type>().value(row))),
-        DataType::Int16 => ScalarValue::Int64(i64::from(array.as_primitive::<arrow::datatypes::Int16Type>().value(row))),
-        DataType::Int32 => ScalarValue::Int64(i64::from(array.as_primitive::<arrow::datatypes::Int32Type>().value(row))),
-        DataType::Int64 => ScalarValue::Int64(array.as_primitive::<arrow::datatypes::Int64Type>().value(row)),
-        DataType::UInt8 => ScalarValue::Int64(i64::from(array.as_primitive::<arrow::datatypes::UInt8Type>().value(row))),
-        DataType::UInt16 => ScalarValue::Int64(i64::from(array.as_primitive::<arrow::datatypes::UInt16Type>().value(row))),
-        DataType::UInt32 => ScalarValue::Int64(i64::from(array.as_primitive::<arrow::datatypes::UInt32Type>().value(row))),
+        DataType::Int8 => ScalarValue::Int64(i64::from(
+            array
+                .as_primitive::<arrow::datatypes::Int8Type>()
+                .value(row),
+        )),
+        DataType::Int16 => ScalarValue::Int64(i64::from(
+            array
+                .as_primitive::<arrow::datatypes::Int16Type>()
+                .value(row),
+        )),
+        DataType::Int32 => ScalarValue::Int64(i64::from(
+            array
+                .as_primitive::<arrow::datatypes::Int32Type>()
+                .value(row),
+        )),
+        DataType::Int64 => ScalarValue::Int64(
+            array
+                .as_primitive::<arrow::datatypes::Int64Type>()
+                .value(row),
+        ),
+        DataType::UInt8 => ScalarValue::Int64(i64::from(
+            array
+                .as_primitive::<arrow::datatypes::UInt8Type>()
+                .value(row),
+        )),
+        DataType::UInt16 => ScalarValue::Int64(i64::from(
+            array
+                .as_primitive::<arrow::datatypes::UInt16Type>()
+                .value(row),
+        )),
+        DataType::UInt32 => ScalarValue::Int64(i64::from(
+            array
+                .as_primitive::<arrow::datatypes::UInt32Type>()
+                .value(row),
+        )),
         DataType::UInt64 => {
             // May truncate for very large u64, but lookup ScalarValue uses i64
-            let v = array.as_primitive::<arrow::datatypes::UInt64Type>().value(row);
+            let v = array
+                .as_primitive::<arrow::datatypes::UInt64Type>()
+                .value(row);
             ScalarValue::Int64(v.cast_signed())
         }
-        DataType::Float32 => ScalarValue::Float64(f64::from(array.as_primitive::<arrow::datatypes::Float32Type>().value(row))),
-        DataType::Float64 => ScalarValue::Float64(array.as_primitive::<arrow::datatypes::Float64Type>().value(row)),
+        DataType::Float32 => ScalarValue::Float64(f64::from(
+            array
+                .as_primitive::<arrow::datatypes::Float32Type>()
+                .value(row),
+        )),
+        DataType::Float64 => ScalarValue::Float64(
+            array
+                .as_primitive::<arrow::datatypes::Float64Type>()
+                .value(row),
+        ),
         DataType::Utf8 => ScalarValue::Utf8(array.as_string::<i32>().value(row).to_string()),
         DataType::LargeUtf8 => ScalarValue::Utf8(array.as_string::<i64>().value(row).to_string()),
         DataType::Binary => ScalarValue::Binary(array.as_binary::<i32>().value(row).to_vec()),

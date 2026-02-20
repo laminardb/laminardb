@@ -263,9 +263,7 @@ impl IncrementalCheckpointManager {
                         // Only set latest_id if metadata.json exists.
                         // Partial dirs (crash before metadata write) must not
                         // set latest_id or they poison parent_id chains.
-                        let metadata_path = dir
-                            .join(name_str.as_ref())
-                            .join("metadata.json");
+                        let metadata_path = dir.join(name_str.as_ref()).join("metadata.json");
                         if !metadata_path.exists() {
                             debug!(
                                 checkpoint_id = id,

@@ -527,7 +527,7 @@ impl DagExecutor {
     /// Processes all nodes in topological order.
     ///
     /// Drains input queues, dispatches to operators, and routes outputs
-    /// to downstream nodes. Uses [`HotPathGuard`] (F071) for zero-allocation
+    /// to downstream nodes. Uses [`HotPathGuard`] for zero-allocation
     /// enforcement in debug builds.
     fn process_dag(&mut self) {
         let _guard = HotPathGuard::enter("dag_executor");

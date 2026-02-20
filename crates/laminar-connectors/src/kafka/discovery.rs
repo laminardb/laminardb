@@ -1,4 +1,4 @@
-//! Kafka-based discovery for constellation nodes (F-DISC-003).
+//! Kafka-based discovery for delta nodes.
 //!
 //! Uses Kafka consumer group protocol for node discovery and membership.
 //! Each node joins a shared consumer group; the group coordinator handles
@@ -25,7 +25,7 @@ use parking_lot::RwLock;
 use tokio::sync::watch;
 use tokio_util::sync::CancellationToken;
 
-use laminar_core::constellation::discovery::{
+use laminar_core::delta::discovery::{
     Discovery, DiscoveryError, NodeId, NodeInfo, NodeMetadata, NodeState,
 };
 
@@ -275,7 +275,7 @@ impl Discovery for KafkaDiscovery {
     }
 }
 
-/// Custom partition assignor for `LaminarDB` constellation.
+/// Custom partition assignor for `LaminarDB` delta.
 ///
 /// Assigns Kafka partitions weighted by node core count, ensuring
 /// that nodes with more cores get proportionally more partitions.
@@ -319,7 +319,8 @@ impl LaminarPartitionAssignor {
                 // Last node gets the remainder
                 num_partitions - assigned
             } else {
-                let share_f = f64::from(num_partitions) * f64::from(*weight) / f64::from(total_weight);
+                let share_f =
+                    f64::from(num_partitions) * f64::from(*weight) / f64::from(total_weight);
                 share_f.round() as u32
             };
 

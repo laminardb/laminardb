@@ -49,3 +49,4 @@ laminardb.toml
 data/
 checkpoints/
 wal/
+/tools

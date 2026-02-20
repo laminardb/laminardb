@@ -1,4 +1,4 @@
-//! Lookup join throughput benchmarks (F-PERF-005)
+//! Lookup join throughput benchmarks
 //!
 //! End-to-end lookup join throughput: stream event → key extraction →
 //! cache lookup → enrichment.
@@ -48,7 +48,7 @@ impl LookupSource for BenchLookupSource {
     ) -> impl Future<Output = Result<Vec<Option<Vec<u8>>>, LookupError>> + Send {
         let results: Vec<Option<Vec<u8>>> = keys
             .iter()
-            .map(|k| self.data.get(k.as_ref()).cloned())
+            .map(|k| self.data.get::<[u8]>(k.as_ref()).cloned())
             .collect();
         async move { Ok(results) }
     }
@@ -69,7 +69,11 @@ impl LookupSource for BenchLookupSource {
 /// Generate Zipfian-distributed key strings in \[0, key_range).
 ///
 /// Uses inverse-CDF approximation: index = floor(n * u^(1/skew)).
-#[allow(clippy::cast_possible_truncation, clippy::cast_sign_loss, clippy::cast_precision_loss)]
+#[allow(
+    clippy::cast_possible_truncation,
+    clippy::cast_sign_loss,
+    clippy::cast_precision_loss
+)]
 fn zipfian_keys(key_range: usize, count: usize, skew: f64) -> Vec<String> {
     let mut rng = rand::rng();
     (0..count)
@@ -190,9 +194,7 @@ fn bench_lookup_source_query(c: &mut Criterion) {
     let source = BenchLookupSource::new(10_000);
 
     for &batch_size in &[1, 10, 100, 1_000] {
-        let keys: Vec<String> = (0..batch_size)
-            .map(|i| format!("key:{i:08}"))
-            .collect();
+        let keys: Vec<String> = (0..batch_size).map(|i| format!("key:{i:08}")).collect();
         let key_refs: Vec<&[u8]> = keys.iter().map(|k| k.as_bytes()).collect();
 
         group.throughput(Throughput::Elements(batch_size as u64));
@@ -235,13 +237,9 @@ fn bench_lookup_hierarchy_fetch(c: &mut Criterion) {
         ..Default::default()
     };
     let hierarchy = rt.block_on(async {
-        LookupCacheHierarchy::with_noop_storage(
-            Arc::clone(&hot_cache),
-            source,
-            config,
-        )
-        .await
-        .expect("hierarchy")
+        LookupCacheHierarchy::with_noop_storage(Arc::clone(&hot_cache), source, config)
+            .await
+            .expect("hierarchy")
     });
 
     // Warm half the entries

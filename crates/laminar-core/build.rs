@@ -1,5 +1,5 @@
 fn main() {
-    #[cfg(feature = "constellation")]
+    #[cfg(feature = "delta")]
     {
         // Use local protoc if system protoc is not available
         if std::env::var("PROTOC").is_err() {
@@ -23,10 +23,7 @@ fn main() {
         tonic_build::configure()
             .build_server(true)
             .build_client(true)
-            .compile_protos(
-                &["proto/constellation.proto"],
-                &["proto/"],
-            )
-            .expect("Failed to compile constellation proto files");
+            .compile_protos(&["proto/delta.proto"], &["proto/"])
+            .expect("Failed to compile delta proto files");
     }
 }

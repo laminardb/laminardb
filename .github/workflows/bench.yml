@@ -33,7 +33,7 @@ jobs:
           save-if: ${{ github.ref == 'refs/heads/main' }}
 
       - name: Install system dependencies
-        run: sudo apt-get update && sudo apt-get install -y libhwloc-dev libelf-dev zlib1g-dev libcurl4-openssl-dev cmake pkg-config libsasl2-dev libudev-dev
+        run: sudo apt-get update && sudo apt-get install -y libhwloc-dev libelf-dev zlib1g-dev libcurl4-openssl-dev cmake pkg-config libsasl2-dev libudev-dev protobuf-compiler
 
       - name: Build all benchmarks
         run: cargo build --release -p laminar-core -p laminar-storage --benches
@@ -56,7 +56,7 @@ jobs:
           key: bench-build
 
       - name: Install system dependencies
-        run: sudo apt-get update && sudo apt-get install -y libhwloc-dev libelf-dev zlib1g-dev libcurl4-openssl-dev cmake pkg-config libsasl2-dev libudev-dev
+        run: sudo apt-get update && sudo apt-get install -y libhwloc-dev libelf-dev zlib1g-dev libcurl4-openssl-dev cmake pkg-config libsasl2-dev libudev-dev protobuf-compiler
 
       - name: Run latency benchmarks
         run: |
@@ -88,7 +88,7 @@ jobs:
           key: bench-build
 
       - name: Install system dependencies
-        run: sudo apt-get update && sudo apt-get install -y libhwloc-dev libelf-dev zlib1g-dev libcurl4-openssl-dev cmake pkg-config libsasl2-dev libudev-dev
+        run: sudo apt-get update && sudo apt-get install -y libhwloc-dev libelf-dev zlib1g-dev libcurl4-openssl-dev cmake pkg-config libsasl2-dev libudev-dev protobuf-compiler
 
       - name: Run DAG benchmarks
         run: |
@@ -119,7 +119,7 @@ jobs:
           key: bench-build
 
       - name: Install system dependencies
-        run: sudo apt-get update && sudo apt-get install -y libhwloc-dev libelf-dev zlib1g-dev libcurl4-openssl-dev cmake pkg-config libsasl2-dev libudev-dev
+        run: sudo apt-get update && sudo apt-get install -y libhwloc-dev libelf-dev zlib1g-dev libcurl4-openssl-dev cmake pkg-config libsasl2-dev libudev-dev protobuf-compiler
 
       - name: Run operator benchmarks
         run: |
@@ -152,7 +152,7 @@ jobs:
           key: bench-build
 
       - name: Install system dependencies
-        run: sudo apt-get update && sudo apt-get install -y libhwloc-dev libelf-dev zlib1g-dev libcurl4-openssl-dev cmake pkg-config libsasl2-dev libudev-dev
+        run: sudo apt-get update && sudo apt-get install -y libhwloc-dev libelf-dev zlib1g-dev libcurl4-openssl-dev cmake pkg-config libsasl2-dev libudev-dev protobuf-compiler
 
       - name: Run throughput benchmarks
         run: |
@@ -184,7 +184,7 @@ jobs:
           key: bench-build
 
       - name: Install system dependencies
-        run: sudo apt-get update && sudo apt-get install -y libhwloc-dev libelf-dev zlib1g-dev libcurl4-openssl-dev cmake pkg-config libsasl2-dev libudev-dev
+        run: sudo apt-get update && sudo apt-get install -y libhwloc-dev libelf-dev zlib1g-dev libcurl4-openssl-dev cmake pkg-config libsasl2-dev libudev-dev protobuf-compiler
 
       - name: Run storage benchmarks
         run: |

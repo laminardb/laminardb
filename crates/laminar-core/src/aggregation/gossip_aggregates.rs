@@ -1,7 +1,7 @@
 //! Gossip-based partial aggregate replication across nodes.
 //!
-//! Reuses the chitchat gossip protocol from F-DISC-002 to disseminate
-//! partial aggregates across the constellation. Each node publishes
+//! Reuses the chitchat gossip protocol from the gossip discovery module to disseminate
+//! partial aggregates across the delta. Each node publishes
 //! its local partials to chitchat, and a merger reads both local and
 //! remote partials to produce cluster-wide aggregates.
 //!
@@ -18,7 +18,7 @@ use std::hash::BuildHasher;
 
 use serde::{Deserialize, Serialize};
 
-use crate::constellation::discovery::NodeId;
+use crate::delta::discovery::NodeId;
 
 /// Aggregate state for a single partial.
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
@@ -58,16 +58,7 @@ impl AggregateState {
                     *a = *b;
                 }
             }
-            (
-                Self::Avg {
-                    sum: s1,
-                    count: c1,
-                },
-                Self::Avg {
-                    sum: s2,
-                    count: c2,
-                },
-            ) => {
+            (Self::Avg { sum: s1, count: c1 }, Self::Avg { sum: s2, count: c2 }) => {
                 *s1 += s2;
                 *c1 += c2;
             }
@@ -320,7 +311,10 @@ mod tests {
     #[test]
     fn test_aggregate_state_finalize() {
         assert!((AggregateState::Count(42).finalize() - 42.0).abs() < f64::EPSILON);
-        assert!((AggregateState::Sum(3.14).finalize() - 3.14).abs() < f64::EPSILON);
+        assert!(
+            (AggregateState::Sum(std::f64::consts::PI).finalize() - std::f64::consts::PI).abs()
+                < f64::EPSILON
+        );
         let avg = AggregateState::Avg {
             sum: 10.0,
             count: 4,
@@ -351,8 +345,7 @@ mod tests {
 
     #[test]
     fn test_parse_scope_window() {
-        let scope =
-            AggregateKeyspace::parse_scope("agg/pipe1/hourly/window/1000_2000").unwrap();
+        let scope = AggregateKeyspace::parse_scope("agg/pipe1/hourly/window/1000_2000").unwrap();
         assert_eq!(
             scope,
             AggregateScope::Window {
@@ -374,7 +367,10 @@ mod tests {
         let mut wms = HashMap::new();
         wms.insert(NodeId(1), 2000);
         wms.insert(NodeId(2), 1500);
-        assert_eq!(check_watermark_gate(1000, &wms), WatermarkGateStatus::Complete);
+        assert_eq!(
+            check_watermark_gate(1000, &wms),
+            WatermarkGateStatus::Complete
+        );
     }
 
     #[test]
@@ -469,10 +465,7 @@ mod tests {
 
     #[test]
     fn test_avg_zero_count_finalize() {
-        let avg = AggregateState::Avg {
-            sum: 0.0,
-            count: 0,
-        };
+        let avg = AggregateState::Avg { sum: 0.0, count: 0 };
         assert!((avg.finalize()).abs() < f64::EPSILON);
     }
 }

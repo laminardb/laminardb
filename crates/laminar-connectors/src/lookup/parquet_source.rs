@@ -1,7 +1,7 @@
-//! Parquet file lookup source (F-LOOKUP-008).
+//! Parquet file lookup source.
 //!
 //! Loads a Parquet file into an in-memory `HashMap` at construction time,
-//! providing a [`LookupSource`] implementation suitable for static or
+//! providing a `LookupSource` implementation suitable for static or
 //! slowly-changing dimension tables stored as Parquet.
 //!
 //! ## Usage
@@ -52,7 +52,7 @@ impl Default for ParquetLookupSourceConfig {
     }
 }
 
-/// A [`LookupSource`] that loads a Parquet file into memory.
+/// A `LookupSource` that loads a Parquet file into memory.
 ///
 /// All data is loaded eagerly at construction time. Lookups are served
 /// from an in-memory `HashMap` keyed by the serialized primary key
@@ -96,8 +96,9 @@ fn serialize_pk(
             key.push(0); // separator
         }
         let col = batch.column(col_idx);
-        let formatter = ArrayFormatter::try_new(col.as_ref(), &arrow_cast::display::FormatOptions::default())
-            .map_err(|e| LookupError::Internal(format!("format pk: {e}")))?;
+        let formatter =
+            ArrayFormatter::try_new(col.as_ref(), &arrow_cast::display::FormatOptions::default())
+                .map_err(|e| LookupError::Internal(format!("format pk: {e}")))?;
         let display = formatter.value(row);
         key.extend_from_slice(format!("{display}").as_bytes());
     }
@@ -107,17 +108,15 @@ fn serialize_pk(
 /// Serialize all columns of a single row into bytes.
 ///
 /// Uses a simple format: column values separated by `\x01`.
-fn serialize_row(
-    batch: &RecordBatch,
-    row: usize,
-) -> Result<Vec<u8>, LookupError> {
+fn serialize_row(batch: &RecordBatch, row: usize) -> Result<Vec<u8>, LookupError> {
     let mut buf = Vec::new();
     for (i, col) in batch.columns().iter().enumerate() {
         if i > 0 {
             buf.push(1); // separator
         }
-        let formatter = ArrayFormatter::try_new(col.as_ref(), &arrow_cast::display::FormatOptions::default())
-            .map_err(|e| LookupError::Internal(format!("format row: {e}")))?;
+        let formatter =
+            ArrayFormatter::try_new(col.as_ref(), &arrow_cast::display::FormatOptions::default())
+                .map_err(|e| LookupError::Internal(format!("format row: {e}")))?;
         let display = formatter.value(row);
         buf.extend_from_slice(format!("{display}").as_bytes());
     }
@@ -163,8 +162,8 @@ impl ParquetLookupSource {
         let mut row_count = 0u64;
 
         for batch_result in reader {
-            let batch = batch_result
-                .map_err(|e| LookupError::Internal(format!("read batch: {e}")))?;
+            let batch =
+                batch_result.map_err(|e| LookupError::Internal(format!("read batch: {e}")))?;
 
             for row in 0..batch.num_rows() {
                 let key = serialize_pk(&batch, &pk_indices, row)?;
@@ -234,10 +233,7 @@ mod tests {
     use parquet::arrow::ArrowWriter;
 
     /// Create a temp Parquet file with customer data and return the path.
-    fn write_temp_parquet(
-        schema: &SchemaRef,
-        batches: &[RecordBatch],
-    ) -> tempfile::NamedTempFile {
+    fn write_temp_parquet(schema: &SchemaRef, batches: &[RecordBatch]) -> tempfile::NamedTempFile {
         let file = tempfile::NamedTempFile::new().expect("temp file");
         let writer_file = file.reopen().expect("reopen");
         let mut writer =
@@ -272,7 +268,11 @@ mod tests {
 
     #[tokio::test]
     async fn test_single_pk_hit_miss() {
-        let batch = customer_batch(&[1, 2, 3], &["Alice", "Bob", "Carol"], &["gold", "silver", "bronze"]);
+        let batch = customer_batch(
+            &[1, 2, 3],
+            &["Alice", "Bob", "Carol"],
+            &["gold", "silver", "bronze"],
+        );
         let schema = customer_schema();
         let file = write_temp_parquet(&schema, &[batch]);
 
@@ -360,7 +360,11 @@ mod tests {
 
     #[tokio::test]
     async fn test_batch_query() {
-        let batch = customer_batch(&[1, 2, 3], &["Alice", "Bob", "Carol"], &["gold", "silver", "bronze"]);
+        let batch = customer_batch(
+            &[1, 2, 3],
+            &["Alice", "Bob", "Carol"],
+            &["gold", "silver", "bronze"],
+        );
         let schema = customer_schema();
         let file = write_temp_parquet(&schema, &[batch]);
 
@@ -381,7 +385,11 @@ mod tests {
 
     #[test]
     fn test_row_count_estimate() {
-        let batch = customer_batch(&[1, 2, 3], &["Alice", "Bob", "Carol"], &["gold", "silver", "bronze"]);
+        let batch = customer_batch(
+            &[1, 2, 3],
+            &["Alice", "Bob", "Carol"],
+            &["gold", "silver", "bronze"],
+        );
         let schema = customer_schema();
         let file = write_temp_parquet(&schema, &[batch]);
 

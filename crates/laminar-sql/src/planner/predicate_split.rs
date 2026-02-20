@@ -22,8 +22,7 @@ use std::sync::Arc;
 
 use datafusion::logical_expr::logical_plan::LogicalPlan;
 use datafusion::logical_expr::{
-    BinaryExpr, Expr, Extension, Filter, Operator as DfOperator,
-    UserDefinedLogicalNodeCore,
+    BinaryExpr, Expr, Extension, Filter, Operator as DfOperator, UserDefinedLogicalNodeCore,
 };
 use datafusion_common::tree_node::Transformed;
 use datafusion_common::Result;
@@ -336,8 +335,7 @@ impl PredicateSplitterRule {
         );
 
         let caps = self.capabilities.get(node.lookup_table_name());
-        let pushdown_disabled = caps
-            .is_none_or(|c| c.pushdown_mode == PlanPushdownMode::None);
+        let pushdown_disabled = caps.is_none_or(|c| c.pushdown_mode == PlanPushdownMode::None);
 
         let is_left_outer = node.join_type() == LookupJoinType::LeftOuter;
 
@@ -383,9 +381,7 @@ impl PredicateSplitterRule {
 fn contains_not_eq(expr: &Expr) -> bool {
     match expr {
         Expr::BinaryExpr(BinaryExpr { left, op, right }) => {
-            *op == DfOperator::NotEq
-                || contains_not_eq(left)
-                || contains_not_eq(right)
+            *op == DfOperator::NotEq || contains_not_eq(left) || contains_not_eq(right)
         }
         Expr::Not(inner) => contains_not_eq(inner),
         _ => false,
@@ -408,18 +404,13 @@ impl OptimizerRule for PredicateSplitterRule {
     ) -> Result<Transformed<LogicalPlan>> {
         // Case 1: Filter above a LookupJoinNode
         if let LogicalPlan::Filter(Filter {
-            predicate,
-            input,
-            ..
+            predicate, input, ..
         }) = &plan
         {
             if let LogicalPlan::Extension(ext) = input.as_ref() {
-                if let Some(node) =
-                    ext.node.as_any().downcast_ref::<LookupJoinNode>()
-                {
+                if let Some(node) = ext.node.as_any().downcast_ref::<LookupJoinNode>() {
                     let filter_preds = split_conjunction(predicate);
-                    let (pushdown, local) =
-                        self.split_for_node(node, &filter_preds);
+                    let (pushdown, local) = self.split_for_node(node, &filter_preds);
 
                     let inputs = node.inputs();
                     let rebuilt = LookupJoinNode::new(
@@ -439,26 +430,19 @@ impl OptimizerRule for PredicateSplitterRule {
                         node.stream_alias().map(String::from),
                     );
 
-                    return Ok(Transformed::yes(LogicalPlan::Extension(
-                        Extension {
-                            node: Arc::new(rebuilt),
-                        },
-                    )));
+                    return Ok(Transformed::yes(LogicalPlan::Extension(Extension {
+                        node: Arc::new(rebuilt),
+                    })));
                 }
             }
         }
 
         // Case 2: Direct LookupJoinNode (re-classify existing predicates)
         if let LogicalPlan::Extension(ext) = &plan {
-            if let Some(node) =
-                ext.node.as_any().downcast_ref::<LookupJoinNode>()
-            {
+            if let Some(node) = ext.node.as_any().downcast_ref::<LookupJoinNode>() {
                 // Only re-classify if there are predicates to work with
-                if !node.pushdown_predicates().is_empty()
-                    || !node.local_predicates().is_empty()
-                {
-                    let (pushdown, local) =
-                        self.split_for_node(node, &[]);
+                if !node.pushdown_predicates().is_empty() || !node.local_predicates().is_empty() {
+                    let (pushdown, local) = self.split_for_node(node, &[]);
                     let inputs = node.inputs();
                     let rebuilt = LookupJoinNode::new(
                         inputs[0].clone(),
@@ -477,11 +461,9 @@ impl OptimizerRule for PredicateSplitterRule {
                         node.stream_alias().map(String::from),
                     );
 
-                    return Ok(Transformed::yes(LogicalPlan::Extension(
-                        Extension {
-                            node: Arc::new(rebuilt),
-                        },
-                    )));
+                    return Ok(Transformed::yes(LogicalPlan::Extension(Extension {
+                        node: Arc::new(rebuilt),
+                    })));
                 }
             }
         }
@@ -506,11 +488,7 @@ mod tests {
     };
 
     fn lookup_cols() -> HashSet<String> {
-        HashSet::from([
-            "id".to_string(),
-            "name".to_string(),
-            "region".to_string(),
-        ])
+        HashSet::from(["id".to_string(), "name".to_string(), "region".to_string()])
     }
 
     fn stream_cols() -> HashSet<String> {
@@ -526,12 +504,7 @@ mod tests {
     }
 
     fn classifier_with_aliases() -> PredicateClassifier {
-        PredicateClassifier::new(
-            lookup_cols(),
-            stream_cols(),
-            Some("c"),
-            Some("o"),
-        )
+        PredicateClassifier::new(lookup_cols(), stream_cols(), Some("c"), Some("o"))
     }
 
     // -----------------------------------------------------------------------
@@ -571,22 +544,16 @@ mod tests {
     fn test_classify_qualified_lookup_c7() {
         let c = classifier_with_aliases();
         // c.name should resolve to lookup via qualified match
-        let expr = Expr::Column(datafusion::common::Column::new(
-            Some::<&str>("c"),
-            "name",
-        ))
-        .eq(lit("Alice"));
+        let expr = Expr::Column(datafusion::common::Column::new(Some::<&str>("c"), "name"))
+            .eq(lit("Alice"));
         assert_eq!(c.classify(&expr), PredicateClass::LookupOnly);
     }
 
     #[test]
     fn test_classify_qualified_stream_c7() {
         let c = classifier_with_aliases();
-        let expr = Expr::Column(datafusion::common::Column::new(
-            Some::<&str>("o"),
-            "amount",
-        ))
-        .gt(lit(50));
+        let expr =
+            Expr::Column(datafusion::common::Column::new(Some::<&str>("o"), "amount")).gt(lit(50));
         assert_eq!(c.classify(&expr), PredicateClass::StreamOnly);
     }
 
@@ -726,16 +693,12 @@ mod tests {
         )
     }
 
-    fn make_lookup_node(
-        join_type: LookupJoinType,
-    ) -> LookupJoinNode {
+    fn make_lookup_node(join_type: LookupJoinType) -> LookupJoinNode {
         let stream_schema = test_stream_schema();
-        let input = LogicalPlan::EmptyRelation(
-            datafusion::logical_expr::EmptyRelation {
-                produce_one_row: false,
-                schema: stream_schema,
-            },
-        );
+        let input = LogicalPlan::EmptyRelation(datafusion::logical_expr::EmptyRelation {
+            produce_one_row: false,
+            schema: stream_schema,
+        });
 
         LookupJoinNode::new(
             input,
@@ -747,26 +710,17 @@ mod tests {
             }],
             join_type,
             vec![],
-            HashSet::from([
-                "id".to_string(),
-                "name".to_string(),
-                "region".to_string(),
-            ]),
+            HashSet::from(["id".to_string(), "name".to_string(), "region".to_string()]),
             test_output_schema(),
             test_metadata(),
         )
     }
 
-    fn make_filter_over_node(
-        node: LookupJoinNode,
-        predicate: Expr,
-    ) -> LogicalPlan {
+    fn make_filter_over_node(node: LookupJoinNode, predicate: Expr) -> LogicalPlan {
         let ext = LogicalPlan::Extension(Extension {
             node: Arc::new(node),
         });
-        LogicalPlan::Filter(
-            Filter::try_new(predicate, Arc::new(ext)).unwrap(),
-        )
+        LogicalPlan::Filter(Filter::try_new(predicate, Arc::new(ext)).unwrap())
     }
 
     fn full_capabilities() -> SourceCapabilitiesRegistry {
@@ -800,16 +754,15 @@ mod tests {
 
         let rule = PredicateSplitterRule::new(full_capabilities());
         let result = rule
-            .rewrite(plan, &datafusion_optimizer::optimizer::OptimizerContext::new())
+            .rewrite(
+                plan,
+                &datafusion_optimizer::optimizer::OptimizerContext::new(),
+            )
             .unwrap();
 
         assert!(result.transformed);
         if let LogicalPlan::Extension(ext) = &result.data {
-            let rebuilt = ext
-                .node
-                .as_any()
-                .downcast_ref::<LookupJoinNode>()
-                .unwrap();
+            let rebuilt = ext.node.as_any().downcast_ref::<LookupJoinNode>().unwrap();
             assert_eq!(rebuilt.pushdown_predicates().len(), 1);
             assert_eq!(rebuilt.local_predicates().len(), 0);
         } else {
@@ -825,16 +778,15 @@ mod tests {
 
         let rule = PredicateSplitterRule::new(full_capabilities());
         let result = rule
-            .rewrite(plan, &datafusion_optimizer::optimizer::OptimizerContext::new())
+            .rewrite(
+                plan,
+                &datafusion_optimizer::optimizer::OptimizerContext::new(),
+            )
             .unwrap();
 
         assert!(result.transformed);
         if let LogicalPlan::Extension(ext) = &result.data {
-            let rebuilt = ext
-                .node
-                .as_any()
-                .downcast_ref::<LookupJoinNode>()
-                .unwrap();
+            let rebuilt = ext.node.as_any().downcast_ref::<LookupJoinNode>().unwrap();
             assert_eq!(rebuilt.pushdown_predicates().len(), 0);
             assert_eq!(rebuilt.local_predicates().len(), 1);
         } else {
@@ -851,16 +803,15 @@ mod tests {
 
         let rule = PredicateSplitterRule::new(full_capabilities());
         let result = rule
-            .rewrite(plan, &datafusion_optimizer::optimizer::OptimizerContext::new())
+            .rewrite(
+                plan,
+                &datafusion_optimizer::optimizer::OptimizerContext::new(),
+            )
             .unwrap();
 
         assert!(result.transformed);
         if let LogicalPlan::Extension(ext) = &result.data {
-            let rebuilt = ext
-                .node
-                .as_any()
-                .downcast_ref::<LookupJoinNode>()
-                .unwrap();
+            let rebuilt = ext.node.as_any().downcast_ref::<LookupJoinNode>().unwrap();
             assert_eq!(rebuilt.pushdown_predicates().len(), 0);
             assert_eq!(rebuilt.local_predicates().len(), 1);
         } else {
@@ -877,16 +828,15 @@ mod tests {
         // No capabilities registered → pushdown disabled
         let rule = PredicateSplitterRule::new(no_capabilities());
         let result = rule
-            .rewrite(plan, &datafusion_optimizer::optimizer::OptimizerContext::new())
+            .rewrite(
+                plan,
+                &datafusion_optimizer::optimizer::OptimizerContext::new(),
+            )
             .unwrap();
 
         assert!(result.transformed);
         if let LogicalPlan::Extension(ext) = &result.data {
-            let rebuilt = ext
-                .node
-                .as_any()
-                .downcast_ref::<LookupJoinNode>()
-                .unwrap();
+            let rebuilt = ext.node.as_any().downcast_ref::<LookupJoinNode>().unwrap();
             assert_eq!(rebuilt.pushdown_predicates().len(), 0);
             assert_eq!(rebuilt.local_predicates().len(), 1);
         } else {
@@ -903,16 +853,15 @@ mod tests {
 
         let rule = PredicateSplitterRule::new(full_capabilities());
         let result = rule
-            .rewrite(plan, &datafusion_optimizer::optimizer::OptimizerContext::new())
+            .rewrite(
+                plan,
+                &datafusion_optimizer::optimizer::OptimizerContext::new(),
+            )
             .unwrap();
 
         assert!(result.transformed);
         if let LogicalPlan::Extension(ext) = &result.data {
-            let rebuilt = ext
-                .node
-                .as_any()
-                .downcast_ref::<LookupJoinNode>()
-                .unwrap();
+            let rebuilt = ext.node.as_any().downcast_ref::<LookupJoinNode>().unwrap();
             // Should stay local due to H10
             assert_eq!(rebuilt.pushdown_predicates().len(), 0);
             assert_eq!(rebuilt.local_predicates().len(), 1);
@@ -930,7 +879,10 @@ mod tests {
 
         let rule = PredicateSplitterRule::new(full_capabilities());
         let result = rule
-            .rewrite(plan, &datafusion_optimizer::optimizer::OptimizerContext::new())
+            .rewrite(
+                plan,
+                &datafusion_optimizer::optimizer::OptimizerContext::new(),
+            )
             .unwrap();
 
         // No predicates to split → no transformation
@@ -941,23 +893,20 @@ mod tests {
     fn test_mixed_conjunction_split() {
         let node = make_lookup_node(LookupJoinType::Inner);
         // region = 'US' AND amount > 100
-        let filter_pred = col("region")
-            .eq(lit("US"))
-            .and(col("amount").gt(lit(100)));
+        let filter_pred = col("region").eq(lit("US")).and(col("amount").gt(lit(100)));
         let plan = make_filter_over_node(node, filter_pred);
 
         let rule = PredicateSplitterRule::new(full_capabilities());
         let result = rule
-            .rewrite(plan, &datafusion_optimizer::optimizer::OptimizerContext::new())
+            .rewrite(
+                plan,
+                &datafusion_optimizer::optimizer::OptimizerContext::new(),
+            )
             .unwrap();
 
         assert!(result.transformed);
         if let LogicalPlan::Extension(ext) = &result.data {
-            let rebuilt = ext
-                .node
-                .as_any()
-                .downcast_ref::<LookupJoinNode>()
-                .unwrap();
+            let rebuilt = ext.node.as_any().downcast_ref::<LookupJoinNode>().unwrap();
             // region = 'US' → pushdown, amount > 100 → local
             assert_eq!(rebuilt.pushdown_predicates().len(), 1);
             assert_eq!(rebuilt.local_predicates().len(), 1);
@@ -974,16 +923,15 @@ mod tests {
 
         let rule = PredicateSplitterRule::new(full_capabilities());
         let result = rule
-            .rewrite(plan, &datafusion_optimizer::optimizer::OptimizerContext::new())
+            .rewrite(
+                plan,
+                &datafusion_optimizer::optimizer::OptimizerContext::new(),
+            )
             .unwrap();
 
         assert!(result.transformed);
         if let LogicalPlan::Extension(ext) = &result.data {
-            let rebuilt = ext
-                .node
-                .as_any()
-                .downcast_ref::<LookupJoinNode>()
-                .unwrap();
+            let rebuilt = ext.node.as_any().downcast_ref::<LookupJoinNode>().unwrap();
             // NotEq never pushed down
             assert_eq!(rebuilt.pushdown_predicates().len(), 0);
             assert_eq!(rebuilt.local_predicates().len(), 1);

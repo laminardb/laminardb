@@ -9,7 +9,7 @@ use sqlparser::dialect::{Dialect, GenericDialect};
 ///
 /// Delegates to [`GenericDialect`] for most behavior but enables
 /// streaming-specific features:
-/// - `FILTER` clauses during aggregation (F077)
+/// - `FILTER` clauses during aggregation
 /// - Backtick-delimited identifiers
 #[derive(Debug, Default)]
 pub struct LaminarDialect {

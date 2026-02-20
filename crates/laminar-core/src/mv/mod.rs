@@ -1,4 +1,4 @@
-//! # Cascading Materialized Views (F060)
+//! # Cascading Materialized Views
 //!
 //! Materialized views that can read from other materialized views, forming a DAG.
 //! Essential for multi-resolution time-series aggregation (e.g., 1s → 1m → 1h OHLC bars).

@@ -1,4 +1,4 @@
-//! # Changelog and Retraction Support (F063)
+//! # Changelog and Retraction Support
 //!
 //! Z-set style changelog records with integer weights for incremental computation.
 //! This is the foundation for exactly-once sinks, cascading materialized views,
@@ -1063,7 +1063,7 @@ impl<T: Serialize> CdcEnvelope<T> {
     }
 }
 
-// F076: Retractable FIRST/LAST Accumulators
+// Retractable FIRST/LAST Accumulators
 
 /// Retractable `FIRST_VALUE` accumulator for changelog/retraction mode.
 ///
@@ -1889,7 +1889,7 @@ mod tests {
     }
 
     // ════════════════════════════════════════════════════════════════════════
-    // F076: Retractable FIRST/LAST Accumulator Tests
+    // Retractable FIRST/LAST Accumulator Tests
     // ════════════════════════════════════════════════════════════════════════
 
     // ── RetractableFirstValueAccumulator ─────────────────────────────────────

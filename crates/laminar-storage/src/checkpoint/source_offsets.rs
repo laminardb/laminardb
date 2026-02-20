@@ -1,14 +1,14 @@
 //! Typed source position tracking for checkpoint recovery.
 //!
-//! Provides [`SourcePosition`] — a strongly typed enum representing
+//! Provides `SourcePosition` — a strongly typed enum representing
 //! connector-specific offsets — alongside conversion methods to/from
-//! the existing [`ConnectorCheckpoint`] format.
+//! the existing `ConnectorCheckpoint` format.
 //!
 //! Also provides:
-//! - [`SourceId`] — newtype for source identifiers within a pipeline.
-//! - [`SourceOffset`] — combines a [`SourceId`] with a [`SourcePosition`].
-//! - [`RecoveryPlan`] — recovery plan built from checkpoint manifests.
-//! - [`DeterminismWarning`] — warnings about non-determinism during recovery.
+//! - `SourceId` — newtype for source identifiers within a pipeline.
+//! - `SourceOffset` — combines a `SourceId` with a `SourcePosition`.
+//! - `RecoveryPlan` — recovery plan built from checkpoint manifests.
+//! - `DeterminismWarning` — warnings about non-determinism during recovery.
 
 use std::collections::HashMap;
 use std::fmt;
@@ -152,15 +152,11 @@ impl SourcePosition {
         let mut cp = ConnectorCheckpoint::new(epoch);
         match self {
             Self::Kafka(pos) => {
-                cp.metadata
-                    .insert("connector_type".into(), "kafka".into());
-                cp.metadata
-                    .insert("group_id".into(), pos.group_id.clone());
+                cp.metadata.insert("connector_type".into(), "kafka".into());
+                cp.metadata.insert("group_id".into(), pos.group_id.clone());
                 for p in &pos.partitions {
-                    cp.offsets.insert(
-                        format!("{}-{}", p.topic, p.partition),
-                        p.offset.to_string(),
-                    );
+                    cp.offsets
+                        .insert(format!("{}-{}", p.topic, p.partition), p.offset.to_string());
                 }
             }
             Self::PostgresCdc(pos) => {
@@ -191,8 +187,7 @@ impl SourcePosition {
                 }
             }
             Self::File(pos) => {
-                cp.metadata
-                    .insert("connector_type".into(), "file".into());
+                cp.metadata.insert("connector_type".into(), "file".into());
                 cp.offsets.insert("path".into(), pos.path.clone());
                 cp.offsets
                     .insert("byte_offset".into(), pos.byte_offset.to_string());
@@ -216,16 +211,12 @@ impl SourcePosition {
         cp: &ConnectorCheckpoint,
         type_hint: Option<&str>,
     ) -> Option<Self> {
-        let connector_type = type_hint
-            .or_else(|| cp.metadata.get("connector_type").map(String::as_str))?;
+        let connector_type =
+            type_hint.or_else(|| cp.metadata.get("connector_type").map(String::as_str))?;
 
         match connector_type {
             "kafka" => {
-                let group_id = cp
-                    .metadata
-                    .get("group_id")
-                    .cloned()
-                    .unwrap_or_default();
+                let group_id = cp.metadata.get("group_id").cloned().unwrap_or_default();
                 let mut partitions = Vec::new();
                 for (key, value) in &cp.offsets {
                     // Keys are "topic-partition"
@@ -248,14 +239,9 @@ impl SourcePosition {
                 }))
             }
             "postgres_cdc" => {
-                let confirmed_flush_lsn =
-                    cp.offsets.get("confirmed_flush_lsn")?.clone();
+                let confirmed_flush_lsn = cp.offsets.get("confirmed_flush_lsn")?.clone();
                 let write_lsn = cp.offsets.get("write_lsn").cloned();
-                let slot_name = cp
-                    .metadata
-                    .get("slot_name")
-                    .cloned()
-                    .unwrap_or_default();
+                let slot_name = cp.metadata.get("slot_name").cloned().unwrap_or_default();
                 Some(Self::PostgresCdc(PostgresCdcPosition {
                     confirmed_flush_lsn,
                     write_lsn,
@@ -294,10 +280,7 @@ impl SourcePosition {
                 let mut offsets = HashMap::new();
                 offsets.insert("group_id".into(), pos.group_id.clone());
                 for p in &pos.partitions {
-                    offsets.insert(
-                        format!("{}-{}", p.topic, p.partition),
-                        p.offset.to_string(),
-                    );
+                    offsets.insert(format!("{}-{}", p.topic, p.partition), p.offset.to_string());
                 }
                 ("kafka".to_string(), offsets)
             }
@@ -349,11 +332,7 @@ impl SourcePosition {
     pub fn from_offset_entry(entry: &SourceOffsetEntry) -> Option<Self> {
         match entry.source_type.as_str() {
             "kafka" => {
-                let group_id = entry
-                    .offsets
-                    .get("group_id")
-                    .cloned()
-                    .unwrap_or_default();
+                let group_id = entry.offsets.get("group_id").cloned().unwrap_or_default();
                 let mut partitions = Vec::new();
                 for (key, value) in &entry.offsets {
                     if key == "group_id" {
@@ -378,14 +357,9 @@ impl SourcePosition {
                 }))
             }
             "postgres_cdc" => {
-                let confirmed_flush_lsn =
-                    entry.offsets.get("confirmed_flush_lsn")?.clone();
+                let confirmed_flush_lsn = entry.offsets.get("confirmed_flush_lsn")?.clone();
                 let write_lsn = entry.offsets.get("write_lsn").cloned();
-                let slot_name = entry
-                    .offsets
-                    .get("slot_name")
-                    .cloned()
-                    .unwrap_or_default();
+                let slot_name = entry.offsets.get("slot_name").cloned().unwrap_or_default();
                 Some(Self::PostgresCdc(PostgresCdcPosition {
                     confirmed_flush_lsn,
                     write_lsn,
@@ -464,9 +438,7 @@ impl RecoveryPlan {
         let mut warnings = Vec::new();
 
         for (name, cp) in source_offsets {
-            if let Some(pos) =
-                SourcePosition::from_connector_checkpoint(cp, None)
-            {
+            if let Some(pos) = SourcePosition::from_connector_checkpoint(cp, None) {
                 source_positions.insert(name.clone(), pos);
             } else {
                 warnings.push(DeterminismWarning {
@@ -607,10 +579,11 @@ impl DeterminismValidator {
     ///
     /// Returns warnings for all non-deterministic operators.
     #[must_use]
-    pub fn validate_all(
-        operators: &[&dyn OperatorDescriptor],
-    ) -> Vec<OperatorDeterminismWarning> {
-        operators.iter().flat_map(|op| Self::validate(*op)).collect()
+    pub fn validate_all(operators: &[&dyn OperatorDescriptor]) -> Vec<OperatorDeterminismWarning> {
+        operators
+            .iter()
+            .flat_map(|op| Self::validate(*op))
+            .collect()
     }
 }
 
@@ -655,9 +628,7 @@ mod tests {
     #[test]
     fn test_mysql_cdc_position_serde_roundtrip() {
         let pos = SourcePosition::MysqlCdc(MysqlCdcPosition {
-            gtid_set: Some(
-                "3E11FA47-71CA-11E1-9E33-C80AA9429562:1-5".into(),
-            ),
+            gtid_set: Some("3E11FA47-71CA-11E1-9E33-C80AA9429562:1-5".into()),
             binlog_file: Some("mysql-bin.000003".into()),
             binlog_position: Some(154),
         });
@@ -700,18 +671,12 @@ mod tests {
         });
         let cp = pos.to_connector_checkpoint(5);
         assert_eq!(cp.epoch, 5);
-        assert_eq!(
-            cp.offsets.get("events-0"),
-            Some(&"1234".to_string())
-        );
+        assert_eq!(cp.offsets.get("events-0"), Some(&"1234".to_string()));
         assert_eq!(
             cp.metadata.get("connector_type"),
             Some(&"kafka".to_string())
         );
-        assert_eq!(
-            cp.metadata.get("group_id"),
-            Some(&"my-group".to_string())
-        );
+        assert_eq!(cp.metadata.get("group_id"), Some(&"my-group".to_string()));
     }
 
     #[test]
@@ -722,8 +687,7 @@ mod tests {
             slot_name: "test_slot".into(),
         });
         let cp = original.to_connector_checkpoint(10);
-        let restored =
-            SourcePosition::from_connector_checkpoint(&cp, None).unwrap();
+        let restored = SourcePosition::from_connector_checkpoint(&cp, None).unwrap();
         assert_eq!(original, restored);
     }
 
@@ -735,8 +699,7 @@ mod tests {
             binlog_position: Some(154),
         });
         let cp = original.to_connector_checkpoint(3);
-        let restored =
-            SourcePosition::from_connector_checkpoint(&cp, None).unwrap();
+        let restored = SourcePosition::from_connector_checkpoint(&cp, None).unwrap();
         assert_eq!(original, restored);
     }
 
@@ -747,8 +710,7 @@ mod tests {
             byte_offset: 4096,
         });
         let cp = original.to_connector_checkpoint(1);
-        let restored =
-            SourcePosition::from_connector_checkpoint(&cp, None).unwrap();
+        let restored = SourcePosition::from_connector_checkpoint(&cp, None).unwrap();
         assert_eq!(original, restored);
     }
 
@@ -757,11 +719,7 @@ mod tests {
         let mut cp = ConnectorCheckpoint::new(1);
         cp.offsets.insert("events-0".into(), "100".into());
         // No metadata — use type hint instead
-        let pos = SourcePosition::from_connector_checkpoint(
-            &cp,
-            Some("kafka"),
-        )
-        .unwrap();
+        let pos = SourcePosition::from_connector_checkpoint(&cp, Some("kafka")).unwrap();
         match pos {
             SourcePosition::Kafka(k) => {
                 assert_eq!(k.partitions.len(), 1);
@@ -774,9 +732,7 @@ mod tests {
     #[test]
     fn test_from_checkpoint_no_type_returns_none() {
         let cp = ConnectorCheckpoint::new(1);
-        assert!(
-            SourcePosition::from_connector_checkpoint(&cp, None).is_none()
-        );
+        assert!(SourcePosition::from_connector_checkpoint(&cp, None).is_none());
     }
 
     #[test]
@@ -787,12 +743,8 @@ mod tests {
         kafka_cp
             .metadata
             .insert("connector_type".into(), "kafka".into());
-        kafka_cp
-            .metadata
-            .insert("group_id".into(), "g1".into());
-        kafka_cp
-            .offsets
-            .insert("topic-0".into(), "100".into());
+        kafka_cp.metadata.insert("group_id".into(), "g1".into());
+        kafka_cp.offsets.insert("topic-0".into(), "100".into());
         source_offsets.insert("kafka-src".into(), kafka_cp);
 
         // CP with no type info — should generate warning
@@ -852,10 +804,7 @@ mod tests {
         assert_eq!(entry.source_type, "kafka");
         assert_eq!(entry.epoch, 5);
         assert_eq!(entry.offsets.get("group_id"), Some(&"g1".to_string()));
-        assert_eq!(
-            entry.offsets.get("events-0"),
-            Some(&"1234".to_string())
-        );
+        assert_eq!(entry.offsets.get("events-0"), Some(&"1234".to_string()));
     }
 
     #[test]
@@ -966,8 +915,7 @@ mod tests {
             severity: WarningSeverity::Warning,
         };
         let json = serde_json::to_string(&warning).unwrap();
-        let restored: DeterminismWarning =
-            serde_json::from_str(&json).unwrap();
+        let restored: DeterminismWarning = serde_json::from_str(&json).unwrap();
         assert_eq!(warning, restored);
     }
 

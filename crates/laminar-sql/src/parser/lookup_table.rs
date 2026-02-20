@@ -180,9 +180,10 @@ impl ByteSize {
             (s.as_str(), 1)
         };
 
-        let num: u64 = num_str.trim().parse().map_err(|_| {
-            ParseError::ValidationError(format!("invalid byte size: '{s}'"))
-        })?;
+        let num: u64 = num_str
+            .trim()
+            .parse()
+            .map_err(|_| ParseError::ValidationError(format!("invalid byte size: '{s}'")))?;
 
         Ok(Self(num * multiplier))
     }
@@ -317,9 +318,7 @@ pub fn parse_create_lookup_table(
 /// # Errors
 ///
 /// Returns `ParseError` if the statement syntax is invalid.
-pub fn parse_drop_lookup_table(
-    parser: &mut Parser,
-) -> Result<(ObjectName, bool), ParseError> {
+pub fn parse_drop_lookup_table(parser: &mut Parser) -> Result<(ObjectName, bool), ParseError> {
     parser
         .expect_keyword(Keyword::DROP)
         .map_err(ParseError::SqlParseError)?;
@@ -372,9 +371,8 @@ pub fn validate_properties<S: ::std::hash::BuildHasher>(
     let cache_ttl = options
         .get("cache.ttl")
         .map(|s| {
-            s.parse::<u64>().map_err(|_| {
-                ParseError::ValidationError(format!("invalid cache.ttl: '{s}'"))
-            })
+            s.parse::<u64>()
+                .map_err(|_| ParseError::ValidationError(format!("invalid cache.ttl: '{s}'")))
         })
         .transpose()?;
 
@@ -496,10 +494,7 @@ mod tests {
                     Some("postgresql://localhost/db")
                 );
                 assert_eq!(props.strategy, LookupStrategy::Replicated);
-                assert_eq!(
-                    props.cache_memory,
-                    Some(ByteSize(512 * 1024 * 1024))
-                );
+                assert_eq!(props.cache_memory, Some(ByteSize(512 * 1024 * 1024)));
                 assert_eq!(props.pushdown_mode, PushdownMode::Auto);
             }
             _ => panic!("Expected CreateLookupTable, got {stmt:?}"),
@@ -532,12 +527,21 @@ mod tests {
 
     #[test]
     fn test_byte_size_parsing() {
-        assert_eq!(ByteSize::parse("512mb").unwrap(), ByteSize(512 * 1024 * 1024));
-        assert_eq!(ByteSize::parse("1gb").unwrap(), ByteSize(1024 * 1024 * 1024));
+        assert_eq!(
+            ByteSize::parse("512mb").unwrap(),
+            ByteSize(512 * 1024 * 1024)
+        );
+        assert_eq!(
+            ByteSize::parse("1gb").unwrap(),
+            ByteSize(1024 * 1024 * 1024)
+        );
         assert_eq!(ByteSize::parse("10kb").unwrap(), ByteSize(10 * 1024));
         assert_eq!(ByteSize::parse("100b").unwrap(), ByteSize(100));
         assert_eq!(ByteSize::parse("1024").unwrap(), ByteSize(1024));
-        assert_eq!(ByteSize::parse("2tb").unwrap(), ByteSize(2 * 1024 * 1024 * 1024 * 1024));
+        assert_eq!(
+            ByteSize::parse("2tb").unwrap(),
+            ByteSize(2 * 1024 * 1024 * 1024 * 1024)
+        );
     }
 
     #[test]
@@ -550,10 +554,7 @@ mod tests {
             ConnectorType::parse("mysql-cdc").unwrap(),
             ConnectorType::MysqlCdc
         );
-        assert_eq!(
-            ConnectorType::parse("redis").unwrap(),
-            ConnectorType::Redis
-        );
+        assert_eq!(ConnectorType::parse("redis").unwrap(), ConnectorType::Redis);
         assert_eq!(
             ConnectorType::parse("s3-parquet").unwrap(),
             ConnectorType::S3Parquet
@@ -570,17 +571,14 @@ mod tests {
 
     #[test]
     fn test_error_missing_columns() {
-        let result = StreamingParser::parse_sql(
-            "CREATE LOOKUP TABLE t () WITH ('connector' = 'static')",
-        );
+        let result =
+            StreamingParser::parse_sql("CREATE LOOKUP TABLE t () WITH ('connector' = 'static')");
         assert!(result.is_err());
     }
 
     #[test]
     fn test_error_missing_with_clause() {
-        let result = StreamingParser::parse_sql(
-            "CREATE LOOKUP TABLE t (id INT, PRIMARY KEY (id))",
-        );
+        let result = StreamingParser::parse_sql("CREATE LOOKUP TABLE t (id INT, PRIMARY KEY (id))");
         assert!(result.is_err());
     }
 

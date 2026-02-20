@@ -22,7 +22,7 @@
 //!
 //! ## Checkpoint IDs
 //!
-//! [`CheckpointId`] wraps a UUID v7, which is time-sortable. This means
+//! `CheckpointId` wraps a UUID v7, which is time-sortable. This means
 //! lexicographic sorting of checkpoint directories equals chronological
 //! ordering — no need to parse timestamps or sequence numbers.
 
@@ -135,10 +135,7 @@ impl CheckpointPaths {
     /// Path to a source offset file.
     #[must_use]
     pub fn source_offset(&self, id: &CheckpointId, source_name: &str) -> String {
-        format!(
-            "{}{}offsets/{source_name}.json",
-            self.base_prefix, id
-        )
+        format!("{}{}offsets/{source_name}.json", self.base_prefix, id)
     }
 }
 

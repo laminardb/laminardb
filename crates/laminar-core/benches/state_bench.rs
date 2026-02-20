@@ -5,7 +5,9 @@
 //! Run with: cargo bench --bench state_bench
 
 use criterion::{criterion_group, criterion_main, BenchmarkId, Criterion, Throughput};
-use laminar_core::state::{AHashMapStore, InMemoryStore, MmapStateStore, StateStore, StateStoreExt};
+use laminar_core::state::{
+    AHashMapStore, InMemoryStore, MmapStateStore, StateStore, StateStoreExt,
+};
 use std::hint::black_box;
 
 /// Pre-populate a store with N entries
@@ -90,7 +92,9 @@ fn bench_state_put(c: &mut Criterion) {
                     (store, key)
                 },
                 |(mut store, key)| {
-                    store.put(black_box(key.as_bytes()), black_box(b"newvalue")).unwrap();
+                    store
+                        .put(black_box(key.as_bytes()), black_box(b"newvalue"))
+                        .unwrap();
                     black_box(store)
                 },
                 criterion::BatchSize::SmallInput,

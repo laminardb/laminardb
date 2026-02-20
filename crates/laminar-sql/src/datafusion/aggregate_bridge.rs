@@ -1,4 +1,4 @@
-//! F075: DataFusion Aggregate Bridge
+//! DataFusion Aggregate Bridge
 //!
 //! Bridges DataFusion's 50+ built-in aggregate functions into LaminarDB's
 //! `DynAccumulator` / `DynAggregatorFactory` traits. This avoids

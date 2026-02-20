@@ -58,7 +58,7 @@ impl DagBuilder {
     /// Adds a source node to the DAG.
     ///
     /// Source nodes are entry points that receive data from external
-    /// systems via the Connector SDK (F034).
+    /// systems via the Connector SDK.
     #[must_use]
     pub fn source(mut self, name: &str, schema: SchemaRef) -> Self {
         let idx = self.nodes.len();

@@ -13,7 +13,7 @@
 //! 4. **Restore state**: For each operator partition — full snapshot or
 //!    incremental delta (C1: incremental support)
 //! 5. **Seek sources**: Reset source offsets to checkpoint positions
-//! 6. **Return** [`RecoveryResult`]
+//! 6. **Return** `RecoveryResult`
 
 use std::collections::HashMap;
 use std::sync::Arc;
@@ -21,7 +21,7 @@ use std::time::Duration;
 
 use tracing::{info, warn};
 
-use super::checkpointer::{Checkpointer, CheckpointerError, verify_integrity};
+use super::checkpointer::{verify_integrity, Checkpointer, CheckpointerError};
 use super::layout::CheckpointId;
 
 /// Trait for operator state that can be restored from a checkpoint.
@@ -60,7 +60,7 @@ pub trait Seekable: Send + Sync {
     fn source_id(&self) -> &str;
 }
 
-/// Trait for source connectors that can seek using a typed [`SourcePosition`].
+/// Trait for source connectors that can seek using a typed `SourcePosition`.
 ///
 /// This extends the raw string-based [`Seekable`] trait with type-safe
 /// position tracking for exactly-once semantics (F-E2E-001).
@@ -80,10 +80,7 @@ pub trait TypedSeekable: Send + Sync {
     ///
     /// Returns `false` if the position is unreachable (e.g., Kafka
     /// retention expired, replication slot dropped).
-    fn can_seek_to(
-        &self,
-        position: &crate::checkpoint::source_offsets::SourcePosition,
-    ) -> bool {
+    fn can_seek_to(&self, position: &crate::checkpoint::source_offsets::SourcePosition) -> bool {
         let _ = position;
         true
     }
@@ -223,10 +220,7 @@ impl RecoveryManager {
                 "attempting recovery from checkpoint"
             );
 
-            match self
-                .try_recover_from(id, restorables, seekables)
-                .await
-            {
+            match self.try_recover_from(id, restorables, seekables).await {
                 Ok(result) => return Ok(result),
                 Err(e) => {
                     warn!(
@@ -394,10 +388,7 @@ impl RecoveryManager {
                 partitions.sort_by_key(|p| p.is_delta);
                 for partition in &partitions {
                     // Load artifact
-                    let data = self
-                        .checkpointer
-                        .load_artifact(&partition.path)
-                        .await?;
+                    let data = self.checkpointer.load_artifact(&partition.path).await?;
 
                     // Optional integrity check
                     if self.config.verify_integrity {
@@ -415,12 +406,12 @@ impl RecoveryManager {
                             }
                         })?;
                     } else {
-                        restorable.restore(&data).map_err(|e| {
-                            RecoveryError::RestoreFailed {
+                        restorable
+                            .restore(&data)
+                            .map_err(|e| RecoveryError::RestoreFailed {
                                 operator: op_id.clone(),
                                 reason: e.to_string(),
-                            }
-                        })?;
+                            })?;
                     }
                 }
                 operators_restored += 1;
@@ -432,12 +423,12 @@ impl RecoveryManager {
         for seekable in seekables.iter_mut() {
             let src_id = seekable.source_id().to_string();
             if let Some(offset_entry) = manifest.source_offsets.get(&src_id) {
-                seekable.seek(&offset_entry.offsets).map_err(|e| {
-                    RecoveryError::SeekFailed {
+                seekable
+                    .seek(&offset_entry.offsets)
+                    .map_err(|e| RecoveryError::SeekFailed {
                         source_id: src_id,
                         reason: e.to_string(),
-                    }
-                })?;
+                    })?;
                 sources_seeked += 1;
             }
         }
@@ -489,10 +480,7 @@ impl RecoveryManager {
                 let mut partitions = op_entry.partitions.clone();
                 partitions.sort_by_key(|p| p.is_delta);
                 for partition in &partitions {
-                    let data = self
-                        .checkpointer
-                        .load_artifact(&partition.path)
-                        .await?;
+                    let data = self.checkpointer.load_artifact(&partition.path).await?;
 
                     if self.config.verify_integrity {
                         if let Some(expected_sha) = &partition.sha256 {
@@ -508,12 +496,12 @@ impl RecoveryManager {
                             }
                         })?;
                     } else {
-                        restorable.restore(&data).map_err(|e| {
-                            RecoveryError::RestoreFailed {
+                        restorable
+                            .restore(&data)
+                            .map_err(|e| RecoveryError::RestoreFailed {
                                 operator: op_id.clone(),
                                 reason: e.to_string(),
-                            }
-                        })?;
+                            })?;
                     }
                 }
                 operators_restored += 1;
@@ -533,12 +521,12 @@ impl RecoveryManager {
                             reason: "source reports position is unreachable".into(),
                         });
                     }
-                    seekable.seek_typed(&position).map_err(|e| {
-                        RecoveryError::SeekFailed {
+                    seekable
+                        .seek_typed(&position)
+                        .map_err(|e| RecoveryError::SeekFailed {
                             source_id: src_id,
                             reason: e.to_string(),
-                        }
-                    })?;
+                        })?;
                     sources_seeked += 1;
                 } else {
                     // Fall back to raw string-based seek via Seekable if
@@ -575,8 +563,8 @@ mod tests {
     use super::*;
     use crate::checkpoint::checkpointer::ObjectStoreCheckpointer;
     use crate::checkpoint::layout::{
-        CheckpointManifestV2, CheckpointPaths, OperatorSnapshotEntry,
-        PartitionSnapshotEntry, SourceOffsetEntry,
+        CheckpointManifestV2, CheckpointPaths, OperatorSnapshotEntry, PartitionSnapshotEntry,
+        SourceOffsetEntry,
     };
     use bytes::Bytes;
     use object_store::memory::InMemory;
@@ -648,7 +636,7 @@ mod tests {
         format!("{:x}", hasher.finalize())
     }
 
-    async fn setup_checkpointer() -> Arc<ObjectStoreCheckpointer> {
+    fn setup_checkpointer() -> Arc<ObjectStoreCheckpointer> {
         let store = Arc::new(InMemory::new());
         let paths = CheckpointPaths::default();
         Arc::new(ObjectStoreCheckpointer::new(store, paths, 4))
@@ -721,13 +709,11 @@ mod tests {
 
     #[tokio::test]
     async fn test_recovery_fresh_start() {
-        let ckpt = setup_checkpointer().await;
+        let ckpt = setup_checkpointer();
         let rm = RecoveryManager::new(ckpt, RecoveryConfig::default());
 
         let mut op = TestRestorable::new("op1");
-        let result = rm
-            .recover(&mut [&mut op], &mut [])
-            .await;
+        let result = rm.recover(&mut [&mut op], &mut []).await;
 
         assert!(matches!(
             result.unwrap_err(),
@@ -737,7 +723,7 @@ mod tests {
 
     #[tokio::test]
     async fn test_recovery_full_snapshot() {
-        let ckpt = setup_checkpointer().await;
+        let ckpt = setup_checkpointer();
         let id = CheckpointId::now();
 
         save_checkpoint(
@@ -754,10 +740,7 @@ mod tests {
         let mut op = TestRestorable::new("op1");
         let mut src = TestSeekable::new("kafka");
 
-        let result = rm
-            .recover(&mut [&mut op], &mut [&mut src])
-            .await
-            .unwrap();
+        let result = rm.recover(&mut [&mut op], &mut [&mut src]).await.unwrap();
 
         assert_eq!(result.checkpoint_id, id);
         assert_eq!(result.epoch, 5);
@@ -773,7 +756,7 @@ mod tests {
 
     #[tokio::test]
     async fn test_recovery_incremental() {
-        let ckpt = setup_checkpointer().await;
+        let ckpt = setup_checkpointer();
         let id = CheckpointId::now();
         let paths = make_paths();
 
@@ -829,7 +812,7 @@ mod tests {
 
     #[tokio::test]
     async fn test_recovery_integrity_check() {
-        let ckpt = setup_checkpointer().await;
+        let ckpt = setup_checkpointer();
         let id = CheckpointId::now();
 
         // Save with wrong digest
@@ -878,7 +861,7 @@ mod tests {
 
     #[tokio::test]
     async fn test_recovery_fallback() {
-        let ckpt = setup_checkpointer().await;
+        let ckpt = setup_checkpointer();
 
         // First checkpoint: bad digest (will fail)
         let id1 = CheckpointId::now();
@@ -912,7 +895,15 @@ mod tests {
 
         // Second checkpoint: correct (will succeed)
         let id2 = CheckpointId::now();
-        save_checkpoint(&ckpt, &id2, 2, vec![("op1", b"good_state", false)], vec![], None).await;
+        save_checkpoint(
+            &ckpt,
+            &id2,
+            2,
+            vec![("op1", b"good_state", false)],
+            vec![],
+            None,
+        )
+        .await;
 
         // Set latest to the bad one to test fallback
         ckpt.update_latest(&id1).await.unwrap();
@@ -929,7 +920,7 @@ mod tests {
     #[tokio::test]
     async fn test_recovery_dual_source_discovery() {
         // _latest is missing, but list_checkpoints() finds the checkpoint
-        let ckpt = setup_checkpointer().await;
+        let ckpt = setup_checkpointer();
         let id = CheckpointId::now();
 
         // Save checkpoint but do NOT update_latest
@@ -970,19 +961,11 @@ mod tests {
 
     #[tokio::test]
     async fn test_recovery_operator_mismatch() {
-        let ckpt = setup_checkpointer().await;
+        let ckpt = setup_checkpointer();
         let id = CheckpointId::now();
 
         // Checkpoint has "op1", but we try to restore "op2"
-        save_checkpoint(
-            &ckpt,
-            &id,
-            1,
-            vec![("op1", b"state", false)],
-            vec![],
-            None,
-        )
-        .await;
+        save_checkpoint(&ckpt, &id, 1, vec![("op1", b"state", false)], vec![], None).await;
 
         let rm = RecoveryManager::new(
             ckpt,
@@ -1050,7 +1033,7 @@ mod tests {
 
     #[tokio::test]
     async fn test_typed_recovery() {
-        let ckpt = setup_checkpointer().await;
+        let ckpt = setup_checkpointer();
         let id = CheckpointId::now();
 
         save_checkpoint(
@@ -1058,10 +1041,13 @@ mod tests {
             &id,
             5,
             vec![("op1", b"state", false)],
-            vec![("kafka-src", HashMap::from([
-                ("group_id".into(), "g1".into()),
-                ("events-0".into(), "100".into()),
-            ]))],
+            vec![(
+                "kafka-src",
+                HashMap::from([
+                    ("group_id".into(), "g1".into()),
+                    ("events-0".into(), "100".into()),
+                ]),
+            )],
             Some(8000),
         )
         .await;
@@ -1069,7 +1055,11 @@ mod tests {
         // Update the source_type to "kafka" so typed parsing works
         {
             let mut manifest = ckpt.load_manifest(&id).await.unwrap();
-            manifest.source_offsets.get_mut("kafka-src").unwrap().source_type = "kafka".into();
+            manifest
+                .source_offsets
+                .get_mut("kafka-src")
+                .unwrap()
+                .source_type = "kafka".into();
             ckpt.save_manifest(&manifest).await.unwrap();
         }
 
@@ -1090,7 +1080,7 @@ mod tests {
 
     #[tokio::test]
     async fn test_typed_recovery_unreachable_position() {
-        let ckpt = setup_checkpointer().await;
+        let ckpt = setup_checkpointer();
         let id = CheckpointId::now();
 
         save_checkpoint(
@@ -1098,10 +1088,13 @@ mod tests {
             &id,
             5,
             vec![("op1", b"state", false)],
-            vec![("kafka-src", HashMap::from([
-                ("group_id".into(), "g1".into()),
-                ("events-0".into(), "100".into()),
-            ]))],
+            vec![(
+                "kafka-src",
+                HashMap::from([
+                    ("group_id".into(), "g1".into()),
+                    ("events-0".into(), "100".into()),
+                ]),
+            )],
             None,
         )
         .await;
@@ -1109,7 +1102,11 @@ mod tests {
         // Set source_type to kafka
         {
             let mut manifest = ckpt.load_manifest(&id).await.unwrap();
-            manifest.source_offsets.get_mut("kafka-src").unwrap().source_type = "kafka".into();
+            manifest
+                .source_offsets
+                .get_mut("kafka-src")
+                .unwrap()
+                .source_type = "kafka".into();
             ckpt.save_manifest(&manifest).await.unwrap();
         }
 
@@ -1123,9 +1120,7 @@ mod tests {
         let mut op = TestRestorable::new("op1");
         let mut src = TestTypedSeekable::unreachable("kafka-src");
 
-        let result = rm
-            .recover_typed(&mut [&mut op], &mut [&mut src])
-            .await;
+        let result = rm.recover_typed(&mut [&mut op], &mut [&mut src]).await;
         assert!(result.is_err());
     }
 }

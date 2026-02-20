@@ -196,9 +196,7 @@ pub fn split_predicates(
 
     for pred in predicates {
         let can_push = match &pred {
-            Predicate::Eq { column, .. } => {
-                capabilities.eq_columns.iter().any(|c| c == column)
-            }
+            Predicate::Eq { column, .. } => capabilities.eq_columns.iter().any(|c| c == column),
             // NotEq cannot use equality indexes — a != b requires a full
             // scan in most databases. Always evaluate locally.
             Predicate::NotEq { .. } => false,
@@ -208,9 +206,7 @@ pub fn split_predicates(
             | Predicate::GtEq { column, .. } => {
                 capabilities.range_columns.iter().any(|c| c == column)
             }
-            Predicate::In { column, .. } => {
-                capabilities.in_columns.iter().any(|c| c == column)
-            }
+            Predicate::In { column, .. } => capabilities.in_columns.iter().any(|c| c == column),
             Predicate::IsNull { .. } | Predicate::IsNotNull { .. } => {
                 capabilities.supports_null_check
             }
@@ -261,12 +257,9 @@ mod tests {
         assert_eq!(ScalarValue::Null.to_string(), "NULL");
         assert_eq!(ScalarValue::Bool(true).to_string(), "true");
         assert_eq!(ScalarValue::Int64(42).to_string(), "42");
-        assert_eq!(ScalarValue::Float64(3.14).to_string(), "3.14");
+        assert_eq!(ScalarValue::Float64(1.23).to_string(), "1.23");
         assert_eq!(ScalarValue::Utf8("hello".into()).to_string(), "'hello'");
-        assert_eq!(
-            ScalarValue::Binary(vec![0xDE, 0xAD]).to_string(),
-            "X'dead'"
-        );
+        assert_eq!(ScalarValue::Binary(vec![0xDE, 0xAD]).to_string(), "X'dead'");
     }
 
     #[test]
@@ -362,10 +355,7 @@ mod tests {
             r#"'say "hello"'"#
         );
         // Multiple consecutive single quotes
-        assert_eq!(
-            ScalarValue::Utf8("it''s".into()).to_string(),
-            "'it''''s'"
-        );
+        assert_eq!(ScalarValue::Utf8("it''s".into()).to_string(), "'it''''s'");
         // Empty string
         assert_eq!(ScalarValue::Utf8(String::new()).to_string(), "''");
     }

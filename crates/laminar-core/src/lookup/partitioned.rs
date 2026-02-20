@@ -13,9 +13,9 @@ use std::sync::Arc;
 
 use bytes::Bytes;
 
-use crate::constellation::discovery::NodeId;
-use crate::lookup::table::{LookupResult, LookupTable};
+use crate::delta::discovery::NodeId;
 use crate::lookup::foyer_cache::FoyerMemoryCache;
+use crate::lookup::table::{LookupResult, LookupTable};
 
 /// Maps partition IDs to owning nodes.
 #[derive(Debug, Clone)]
@@ -306,11 +306,13 @@ mod tests {
     use crate::lookup::foyer_cache::FoyerMemoryCacheConfig;
 
     fn make_cache() -> Arc<FoyerMemoryCache> {
-        Arc::new(FoyerMemoryCache::new(0, FoyerMemoryCacheConfig {
-            capacity: 1000,
-            shards: 1,
-            ..FoyerMemoryCacheConfig::default()
-        }))
+        Arc::new(FoyerMemoryCache::new(
+            0,
+            FoyerMemoryCacheConfig {
+                capacity: 1000,
+                shards: 1,
+            },
+        ))
     }
 
     #[test]
@@ -411,11 +413,7 @@ mod tests {
     fn test_partitioned_lookup_local() {
         let map = PartitionMap::new(256, NodeId(1));
         let cache = make_cache();
-        let table = PartitionedLookupTable::new(
-            map,
-            cache,
-            PartitionedLookupConfig::default(),
-        );
+        let table = PartitionedLookupTable::new(map, cache, PartitionedLookupConfig::default());
 
         // Insert a value
         table.insert(b"key1", Bytes::from_static(b"value1"));
@@ -432,11 +430,7 @@ mod tests {
     fn test_partitioned_lookup_miss() {
         let map = PartitionMap::new(256, NodeId(1));
         let cache = make_cache();
-        let table = PartitionedLookupTable::new(
-            map,
-            cache,
-            PartitionedLookupConfig::default(),
-        );
+        let table = PartitionedLookupTable::new(map, cache, PartitionedLookupConfig::default());
 
         let result = table.get_cached(b"nonexistent");
         assert!(!result.is_hit());
@@ -454,11 +448,7 @@ mod tests {
         }
         let map = PartitionMap::from_assignments(256, &assignments, NodeId(1));
         let cache = make_cache();
-        let table = PartitionedLookupTable::new(
-            map,
-            cache,
-            PartitionedLookupConfig::default(),
-        );
+        let table = PartitionedLookupTable::new(map, cache, PartitionedLookupConfig::default());
 
         let result = table.get_cached(b"key1");
         assert_eq!(result, LookupResult::Pending);
@@ -475,11 +465,7 @@ mod tests {
         }
         let map = PartitionMap::from_assignments(256, &assignments, NodeId(1));
         let cache = make_cache();
-        let table = PartitionedLookupTable::new(
-            map,
-            cache,
-            PartitionedLookupConfig::default(),
-        );
+        let table = PartitionedLookupTable::new(map, cache, PartitionedLookupConfig::default());
 
         // Insert to a remote partition should be no-op
         table.insert(b"key1", Bytes::from_static(b"value1"));
@@ -490,11 +476,7 @@ mod tests {
     fn test_partitioned_invalidate() {
         let map = PartitionMap::new(256, NodeId(1));
         let cache = make_cache();
-        let table = PartitionedLookupTable::new(
-            map,
-            cache,
-            PartitionedLookupConfig::default(),
-        );
+        let table = PartitionedLookupTable::new(map, cache, PartitionedLookupConfig::default());
 
         table.insert(b"key1", Bytes::from_static(b"value1"));
         assert!(table.get_cached(b"key1").is_hit());

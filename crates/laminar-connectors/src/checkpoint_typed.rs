@@ -1,6 +1,6 @@
 //! Typed checkpoint extension for source connectors.
 //!
-//! The [`CheckpointableSource`] trait extends source connectors with
+//! The `CheckpointableSource` trait extends source connectors with
 //! type-safe position tracking, enabling strongly typed checkpoint
 //! storage and recovery planning.
 

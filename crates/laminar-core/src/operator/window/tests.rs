@@ -835,7 +835,7 @@ fn test_emit_strategy_helper_methods() {
     assert!(!periodic.generates_retractions());
     assert!(!periodic.suppresses_intermediate());
 
-    // OnWindowClose (F011B)
+    // OnWindowClose
     assert!(!EmitStrategy::OnWindowClose.emits_intermediate());
     assert!(!EmitStrategy::OnWindowClose.requires_changelog());
     assert!(EmitStrategy::OnWindowClose.is_append_only_compatible());
@@ -843,14 +843,14 @@ fn test_emit_strategy_helper_methods() {
     assert!(EmitStrategy::OnWindowClose.suppresses_intermediate());
     assert!(!EmitStrategy::OnWindowClose.drops_late_data());
 
-    // Changelog (F011B)
+    // Changelog
     assert!(!EmitStrategy::Changelog.emits_intermediate());
     assert!(EmitStrategy::Changelog.requires_changelog());
     assert!(!EmitStrategy::Changelog.is_append_only_compatible());
     assert!(EmitStrategy::Changelog.generates_retractions());
     assert!(!EmitStrategy::Changelog.suppresses_intermediate());
 
-    // Final (F011B)
+    // Final
     assert!(!EmitStrategy::Final.emits_intermediate());
     assert!(!EmitStrategy::Final.requires_changelog());
     assert!(EmitStrategy::Final.is_append_only_compatible());
@@ -1117,7 +1117,7 @@ fn test_emit_strategy_changelog_on_timer() {
     }
 }
 
-// FIRST_VALUE / LAST_VALUE Tests (F059)
+// FIRST_VALUE / LAST_VALUE Tests
 
 #[test]
 fn test_first_value_single_event() {
@@ -1406,7 +1406,7 @@ fn test_last_value_checkpoint_restore() {
 }
 
 // ════════════════════════════════════════════════════════════════════════
-// F074: Composite Aggregator & f64 Type Support Tests
+// Composite Aggregator & f64 Type Support Tests
 // ════════════════════════════════════════════════════════════════════════
 
 // ── ScalarResult tests ──────────────────────────────────────────────────

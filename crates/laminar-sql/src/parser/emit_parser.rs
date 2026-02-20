@@ -7,8 +7,8 @@
 //! - `EMIT ON WINDOW CLOSE`
 //! - `EMIT ON UPDATE`
 //! - `EMIT EVERY INTERVAL 'N' UNIT` / `EMIT PERIODICALLY INTERVAL 'N' UNIT`
-//! - `EMIT CHANGES` (F011B)
-//! - `EMIT FINAL` (F011B)
+//! - `EMIT CHANGES`
+//! - `EMIT FINAL`
 
 use sqlparser::keywords::Keyword;
 use sqlparser::parser::Parser;
@@ -21,7 +21,7 @@ use super::ParseError;
 /// Parse an EMIT clause from the parser's current position.
 ///
 /// Returns `Ok(None)` if no EMIT keyword is found at the current position.
-/// Uses token matching rather than string containment for robust detection.
+/// Uses token matching rather than string containment for detection.
 ///
 /// # Errors
 ///
@@ -49,13 +49,13 @@ pub fn parse_emit_clause(parser: &mut Parser) -> Result<Option<EmitClause>, Pars
             parse_emit_on(parser)
         }
 
-        // EMIT CHANGES (F011B)
+        // EMIT CHANGES
         Token::Word(w) if w.value.eq_ignore_ascii_case("CHANGES") => {
             parser.next_token(); // consume CHANGES
             Ok(Some(EmitClause::Changes))
         }
 
-        // EMIT FINAL (F011B)
+        // EMIT FINAL
         Token::Word(w) if w.value.eq_ignore_ascii_case("FINAL") => {
             parser.next_token(); // consume FINAL
             Ok(Some(EmitClause::Final))
