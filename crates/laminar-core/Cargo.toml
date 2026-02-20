@@ -29,9 +29,9 @@ jit = [
 ]
 # Enable distributed delta mode (multi-node)
 delta = [
-    "dep:tonic", "dep:prost", "dep:openraft", "dep:chitchat",
-    "dep:bincode", "dep:tokio-util", "dep:xxhash-rust",
-    "dep:tonic-build", "dep:prost-build",
+    "dep:tonic", "dep:tonic-prost", "dep:prost", "dep:openraft", "dep:chitchat",
+    "dep:tokio-util", "dep:xxhash-rust",
+    "dep:tonic-build", "dep:tonic-prost-build", "dep:prost-build",
 ]
 
 [dependencies]
@@ -90,10 +90,10 @@ redb = { workspace = true }
 
 # Delta (optional, multi-node distributed mode)
 tonic = { workspace = true, optional = true }
+tonic-prost = { workspace = true, optional = true }
 prost = { workspace = true, optional = true }
 openraft = { workspace = true, optional = true }
 chitchat = { workspace = true, optional = true }
-bincode = { workspace = true, optional = true }
 tokio-util = { workspace = true, optional = true }
 xxhash-rust = { workspace = true, optional = true }
 
@@ -120,6 +120,7 @@ windows-sys = { version = "0.59", features = ["Win32_System_Threading"] }
 
 [build-dependencies]
 tonic-build = { workspace = true, optional = true }
+tonic-prost-build = { workspace = true, optional = true }
 prost-build = { workspace = true, optional = true }
 
 [dev-dependencies]
