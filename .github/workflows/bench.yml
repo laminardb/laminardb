@@ -12,6 +12,10 @@ permissions:
 env:
   CARGO_TERM_COLOR: always
   CARGO_INCREMENTAL: 0
+  # Reduce criterion sample count for CI (default 100 samples + 5s measurement
+  # per benchmark causes timeouts on GitHub runners). 10 samples with shorter
+  # warmup/measurement is sufficient for regression detection.
+  BENCH_ARGS: "--noplot --sample-size 10 --warm-up-time 1 --measurement-time 3"
 
 jobs:
   # Build once, cache for all benchmark jobs
@@ -60,9 +64,9 @@ jobs:
 
       - name: Run latency benchmarks
         run: |
-          cargo bench -p laminar-core --bench state_bench -- --noplot 2>&1 | tee results.txt
-          cargo bench -p laminar-core --bench latency_bench -- --noplot 2>&1 | tee -a results.txt
-          cargo bench -p laminar-core --bench reactor_bench -- --noplot 2>&1 | tee -a results.txt
+          cargo bench -p laminar-core --bench state_bench -- $BENCH_ARGS 2>&1 | tee results.txt
+          cargo bench -p laminar-core --bench latency_bench -- $BENCH_ARGS 2>&1 | tee -a results.txt
+          cargo bench -p laminar-core --bench reactor_bench -- $BENCH_ARGS 2>&1 | tee -a results.txt
 
       - name: Upload results
         uses: actions/upload-artifact@v4
@@ -92,8 +96,8 @@ jobs:
 
       - name: Run DAG benchmarks
         run: |
-          cargo bench -p laminar-core --bench dag_bench -- --noplot 2>&1 | tee results.txt
-          cargo bench -p laminar-core --bench dag_stress -- --noplot 2>&1 | tee -a results.txt
+          cargo bench -p laminar-core --bench dag_bench -- $BENCH_ARGS 2>&1 | tee results.txt
+          cargo bench -p laminar-core --bench dag_stress -- $BENCH_ARGS 2>&1 | tee -a results.txt
 
       - name: Upload results
         uses: actions/upload-artifact@v4
@@ -123,10 +127,10 @@ jobs:
 
       - name: Run operator benchmarks
         run: |
-          cargo bench -p laminar-core --bench window_bench -- --noplot 2>&1 | tee results.txt
-          cargo bench -p laminar-core --bench join_bench -- --noplot 2>&1 | tee -a results.txt
-          cargo bench -p laminar-core --bench streaming_bench -- --noplot 2>&1 | tee -a results.txt
-          cargo bench -p laminar-core --bench subscription_bench -- --noplot 2>&1 | tee -a results.txt
+          cargo bench -p laminar-core --bench window_bench -- $BENCH_ARGS 2>&1 | tee results.txt
+          cargo bench -p laminar-core --bench join_bench -- $BENCH_ARGS 2>&1 | tee -a results.txt
+          cargo bench -p laminar-core --bench streaming_bench -- $BENCH_ARGS 2>&1 | tee -a results.txt
+          cargo bench -p laminar-core --bench subscription_bench -- $BENCH_ARGS 2>&1 | tee -a results.txt
 
       - name: Upload results
         uses: actions/upload-artifact@v4
@@ -156,9 +160,9 @@ jobs:
 
       - name: Run throughput benchmarks
         run: |
-          cargo bench -p laminar-core --bench throughput_bench -- --noplot 2>&1 | tee results.txt
-          cargo bench -p laminar-core --bench tpc_bench -- --noplot 2>&1 | tee -a results.txt
-          cargo bench -p laminar-core --bench io_uring_bench -- --noplot 2>&1 | tee -a results.txt
+          cargo bench -p laminar-core --bench throughput_bench -- $BENCH_ARGS 2>&1 | tee results.txt
+          cargo bench -p laminar-core --bench tpc_bench -- $BENCH_ARGS 2>&1 | tee -a results.txt
+          cargo bench -p laminar-core --bench io_uring_bench -- $BENCH_ARGS 2>&1 | tee -a results.txt
 
       - name: Upload results
         uses: actions/upload-artifact@v4
@@ -188,8 +192,8 @@ jobs:
 
       - name: Run storage benchmarks
         run: |
-          cargo bench -p laminar-storage --bench wal_bench -- --noplot 2>&1 | tee results.txt
-          cargo bench -p laminar-storage --bench checkpoint_bench -- --noplot 2>&1 | tee -a results.txt
+          cargo bench -p laminar-storage --bench wal_bench -- $BENCH_ARGS 2>&1 | tee results.txt
+          cargo bench -p laminar-storage --bench checkpoint_bench -- $BENCH_ARGS 2>&1 | tee -a results.txt
 
       - name: Upload results
         uses: actions/upload-artifact@v4
