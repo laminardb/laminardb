@@ -17,7 +17,7 @@ laminar-storage = { path = "../laminar-storage", version = "0.13.0" }
 # Kafka
 rdkafka = { version = "0.39", features = ["cmake-build"], optional = true }
 arrow-avro = { version = "57.2", optional = true }
-reqwest = { version = "0.12", default-features = false, features = ["json", "rustls-tls"], optional = true }
+reqwest = { version = "0.13", default-features = false, features = ["json", "rustls-tls"], optional = true }
 
 # Database drivers for CDC and sinks
 tokio-postgres = { version = "0.7", optional = true }
