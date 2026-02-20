@@ -98,8 +98,7 @@ impl DbError {
         context: impl Into<String>,
         df_error: &datafusion_common::DataFusionError,
     ) -> Self {
-        let translated =
-            laminar_sql::error::translate_datafusion_error(&df_error.to_string());
+        let translated = laminar_sql::error::translate_datafusion_error(&df_error.to_string());
         Self::QueryPipeline {
             context: context.into(),
             translated: translated.to_string(),
@@ -113,11 +112,10 @@ impl DbError {
         df_error: &datafusion_common::DataFusionError,
         available_columns: &[&str],
     ) -> Self {
-        let translated =
-            laminar_sql::error::translate_datafusion_error_with_context(
-                &df_error.to_string(),
-                Some(available_columns),
-            );
+        let translated = laminar_sql::error::translate_datafusion_error_with_context(
+            &df_error.to_string(),
+            Some(available_columns),
+        );
         Self::QueryPipeline {
             context: context.into(),
             translated: translated.to_string(),
@@ -129,8 +127,7 @@ impl DbError {
         context: impl Into<String>,
         arrow_error: &arrow::error::ArrowError,
     ) -> Self {
-        let translated =
-            laminar_sql::error::translate_datafusion_error(&arrow_error.to_string());
+        let translated = laminar_sql::error::translate_datafusion_error(&arrow_error.to_string());
         Self::QueryPipeline {
             context: context.into(),
             translated: translated.to_string(),
@@ -145,10 +142,7 @@ impl std::fmt::Display for DbError {
             Self::Engine(e) => write!(f, "Engine error: {e}"),
             Self::Streaming(e) => write!(f, "Streaming error: {e}"),
             Self::DataFusion(e) => {
-                let translated =
-                    laminar_sql::error::translate_datafusion_error(
-                        &e.to_string(),
-                    );
+                let translated = laminar_sql::error::translate_datafusion_error(&e.to_string());
                 write!(f, "{translated}")
             }
             Self::SourceNotFound(name) => {

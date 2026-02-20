@@ -192,12 +192,13 @@ impl SourceConnector for DeltaSource {
         {
             use super::delta_io;
 
-            let table = self.table.as_mut().ok_or_else(|| {
-                ConnectorError::InvalidState {
+            let table = self
+                .table
+                .as_mut()
+                .ok_or_else(|| ConnectorError::InvalidState {
                     expected: "table initialized".into(),
                     actual: "table not initialized".into(),
-                }
-            })?;
+                })?;
 
             let latest_version = delta_io::get_latest_version(table).await?;
 
@@ -207,8 +208,7 @@ impl SourceConnector for DeltaSource {
 
             debug!(
                 current_version = self.current_version,
-                latest_version,
-                "Delta Lake source: new version(s) available"
+                latest_version, "Delta Lake source: new version(s) available"
             );
 
             // Load the next version and scan batches.

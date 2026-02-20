@@ -89,6 +89,12 @@ pub struct DeltaLakeSink {
     /// Delta Lake table handle (present when `delta-lake` feature is enabled).
     #[cfg(feature = "delta-lake")]
     table: Option<DeltaTable>,
+    /// Cancellation token for the background compaction task.
+    #[cfg(feature = "delta-lake")]
+    compaction_cancel: Option<tokio_util::sync::CancellationToken>,
+    /// Handle for the background compaction task.
+    #[cfg(feature = "delta-lake")]
+    compaction_handle: Option<tokio::task::JoinHandle<()>>,
 }
 
 impl DeltaLakeSink {
@@ -110,6 +116,10 @@ impl DeltaLakeSink {
             metrics: DeltaLakeSinkMetrics::new(),
             #[cfg(feature = "delta-lake")]
             table: None,
+            #[cfg(feature = "delta-lake")]
+            compaction_cancel: None,
+            #[cfg(feature = "delta-lake")]
+            compaction_handle: None,
         }
     }
 
@@ -246,7 +256,7 @@ impl DeltaLakeSink {
             .sum();
 
         // Take the table and buffer for the write operation.
-        let table = self
+        let mut table = self
             .table
             .take()
             .ok_or_else(|| ConnectorError::InvalidState {
@@ -256,38 +266,84 @@ impl DeltaLakeSink {
 
         let batches = std::mem::take(&mut self.buffer);
 
-        // Determine save mode.
-        let save_mode = match self.config.write_mode {
-            DeltaWriteMode::Append | DeltaWriteMode::Upsert => SaveMode::Append,
-            DeltaWriteMode::Overwrite => SaveMode::Overwrite,
-        };
+        if self.config.write_mode == DeltaWriteMode::Upsert {
+            // ── Upsert/Merge path ──
+            // Concatenate all buffered batches, split by changelog op, then merge.
+            for batch in &batches {
+                let (inserts, deletes) = Self::split_changelog_batch(batch)?;
 
-        // Get partition columns if configured.
-        let partition_cols = if self.config.partition_columns.is_empty() {
-            None
+                // Merge inserts/updates into the target table.
+                if inserts.num_rows() > 0 {
+                    let (t, result) = super::delta_io::merge_batches(
+                        table,
+                        inserts,
+                        &self.config.merge_key_columns,
+                        &self.config.writer_id,
+                        self.current_epoch,
+                        self.config.schema_evolution,
+                    )
+                    .await?;
+                    table = t;
+                    self.metrics.record_merge();
+                    debug!(
+                        inserted = result.rows_inserted,
+                        updated = result.rows_updated,
+                        "Delta Lake: merged inserts/updates"
+                    );
+                }
+
+                // Delete matching rows from the target table.
+                if deletes.num_rows() > 0 {
+                    let delete_count = deletes.num_rows();
+                    let (t, rows_deleted) = super::delta_io::delete_by_merge(
+                        table,
+                        deletes,
+                        &self.config.merge_key_columns,
+                        &self.config.writer_id,
+                        self.current_epoch,
+                    )
+                    .await?;
+                    table = t;
+                    #[allow(clippy::cast_possible_truncation)]
+                    self.metrics.record_deletes(delete_count as u64);
+                    debug!(rows_deleted, "Delta Lake: merged deletes");
+                }
+            }
         } else {
-            Some(self.config.partition_columns.clone())
-        };
+            // ── Append/Overwrite path ──
+            let save_mode = match self.config.write_mode {
+                DeltaWriteMode::Append => SaveMode::Append,
+                DeltaWriteMode::Overwrite => SaveMode::Overwrite,
+                DeltaWriteMode::Upsert => unreachable!(),
+            };
 
-        // Write to Delta Lake.
-        let (new_table, version) = super::delta_io::write_batches(
-            table,
-            batches,
-            &self.config.writer_id,
-            self.current_epoch,
-            save_mode,
-            partition_cols,
-        )
-        .await?;
+            let partition_cols = if self.config.partition_columns.is_empty() {
+                None
+            } else {
+                Some(self.config.partition_columns.clone())
+            };
+
+            let (t, _version) = super::delta_io::write_batches(
+                table,
+                batches,
+                &self.config.writer_id,
+                self.current_epoch,
+                save_mode,
+                partition_cols,
+                self.config.schema_evolution,
+            )
+            .await?;
+            table = t;
+        }
 
         // Restore table and update state.
         // Note: Delta Lake uses i64 for version, but our version is u64.
         // Versions are always non-negative, so this is safe.
-        self.table = Some(new_table);
         #[allow(clippy::cast_sign_loss)]
         {
-            self.delta_version = version as u64;
+            self.delta_version = table.version().unwrap_or(0) as u64;
         }
+        self.table = Some(table);
         self.pending_files = 0;
         self.buffered_rows = 0;
         self.buffered_bytes = 0;
@@ -376,6 +432,80 @@ impl DeltaLakeSink {
     }
 }
 
+/// Background compaction loop that periodically runs OPTIMIZE and VACUUM.
+///
+/// Opens its own `DeltaTable` handle (no shared state with the sink).
+#[cfg(feature = "delta-lake")]
+async fn compaction_loop(
+    table_path: String,
+    storage_options: std::collections::HashMap<String, String>,
+    config: super::delta_config::CompactionConfig,
+    vacuum_retention: std::time::Duration,
+    cancel: tokio_util::sync::CancellationToken,
+) {
+    use super::delta_io;
+
+    info!(
+        table_path = %table_path,
+        check_interval_secs = config.check_interval.as_secs(),
+        "compaction background task started"
+    );
+
+    let mut interval = tokio::time::interval(config.check_interval);
+    // Skip the first immediate tick.
+    interval.tick().await;
+
+    loop {
+        tokio::select! {
+            () = cancel.cancelled() => {
+                info!("compaction background task cancelled");
+                return;
+            }
+            _ = interval.tick() => {
+                // Open a fresh table handle for compaction (no shared state).
+                let table = match delta_io::open_or_create_table(
+                    &table_path,
+                    storage_options.clone(),
+                    None,
+                )
+                .await
+                {
+                    Ok(t) => t,
+                    Err(e) => {
+                        warn!(error = %e, "compaction: failed to open table, will retry");
+                        continue;
+                    }
+                };
+
+                // Run OPTIMIZE.
+                let target_size = config.target_file_size as u64;
+                match delta_io::run_compaction(table, target_size, &config.z_order_columns).await {
+                    Ok((table, result)) => {
+                        debug!(
+                            files_added = result.files_added,
+                            files_removed = result.files_removed,
+                            "compaction: OPTIMIZE complete"
+                        );
+
+                        // Run VACUUM after compaction.
+                        match delta_io::run_vacuum(table, vacuum_retention).await {
+                            Ok((_table, files_deleted)) => {
+                                debug!(files_deleted, "compaction: VACUUM complete");
+                            }
+                            Err(e) => {
+                                warn!(error = %e, "compaction: VACUUM failed");
+                            }
+                        }
+                    }
+                    Err(e) => {
+                        warn!(error = %e, "compaction: OPTIMIZE failed");
+                    }
+                }
+            }
+        }
+    }
+}
+
 #[async_trait]
 impl SinkConnector for DeltaLakeSink {
     async fn open(&mut self, config: &ConnectorConfig) -> Result<(), ConnectorError> {
@@ -434,6 +564,20 @@ impl SinkConnector for DeltaLakeSink {
                 self.delta_version = table.version().unwrap_or(0) as u64;
             }
             self.table = Some(table);
+
+            // Spawn background compaction task if enabled.
+            if self.config.compaction.enabled {
+                let cancel = tokio_util::sync::CancellationToken::new();
+                let handle = tokio::spawn(compaction_loop(
+                    self.config.table_path.clone(),
+                    self.config.storage_options.clone(),
+                    self.config.compaction.clone(),
+                    self.config.vacuum_retention,
+                    cancel.clone(),
+                ));
+                self.compaction_cancel = Some(cancel);
+                self.compaction_handle = Some(handle);
+            }
         }
 
         self.state = ConnectorState::Running;
@@ -647,6 +791,18 @@ impl SinkConnector for DeltaLakeSink {
                     self.commit_local(self.current_epoch);
                     self.last_committed_epoch = self.current_epoch;
                 }
+            }
+        }
+
+        // Cancel and join the background compaction task.
+        #[cfg(feature = "delta-lake")]
+        {
+            if let Some(cancel) = self.compaction_cancel.take() {
+                cancel.cancel();
+            }
+            if let Some(handle) = self.compaction_handle.take() {
+                // Wait up to 5 seconds for the compaction task to finish.
+                let _ = tokio::time::timeout(std::time::Duration::from_secs(5), handle).await;
             }
         }
 

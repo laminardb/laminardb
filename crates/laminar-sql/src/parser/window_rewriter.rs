@@ -126,7 +126,10 @@ impl WindowRewriter {
             Expr::Function(func) => {
                 if let Some(name) = func.name.0.last() {
                     let func_name = name.to_string().to_uppercase();
-                    matches!(func_name.as_str(), "TUMBLE" | "HOP" | "SLIDE" | "SESSION" | "CUMULATE")
+                    matches!(
+                        func_name.as_str(),
+                        "TUMBLE" | "HOP" | "SLIDE" | "SESSION" | "CUMULATE"
+                    )
                 } else {
                     false
                 }
@@ -739,8 +742,7 @@ mod tests {
 
     #[test]
     fn test_cumulate_time_column_name() {
-        let sql =
-            "SELECT CUMULATE(my_ts, INTERVAL '1' MINUTE, INTERVAL '5' MINUTE) FROM events";
+        let sql = "SELECT CUMULATE(my_ts, INTERVAL '1' MINUTE, INTERVAL '5' MINUTE) FROM events";
         let dialect = GenericDialect {};
         let statements = Parser::parse_sql(&dialect, sql).unwrap();
 

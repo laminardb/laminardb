@@ -353,14 +353,11 @@ impl LagLeadOperator {
                 }
                 AnalyticFunctionKind::NthValue => {
                     // N is stored in offset (1-indexed)
-                    if state.nth_values[nth_idx].is_none()
-                        && state.event_count == func.offset
-                    {
+                    if state.nth_values[nth_idx].is_none() && state.event_count == func.offset {
                         state.nth_values[nth_idx] = Some(current_value);
                     }
                     results.push(
-                        state.nth_values[nth_idx]
-                            .unwrap_or(func.default_value.unwrap_or(f64::NAN)),
+                        state.nth_values[nth_idx].unwrap_or(func.default_value.unwrap_or(f64::NAN)),
                     );
                     nth_idx += 1;
                 }
@@ -599,13 +596,8 @@ impl LagLeadOperator {
             }
         } else {
             // No LEAD functions: emit immediately with LAG values
-            let output = Self::build_output(
-                &self.functions,
-                event,
-                &lag_values,
-                &[],
-                &positional_values,
-            );
+            let output =
+                Self::build_output(&self.functions, event, &lag_values, &[], &positional_values);
             outputs.push(Output::Event(output));
         }
 

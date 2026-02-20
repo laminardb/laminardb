@@ -1572,7 +1572,14 @@ impl StreamJoinOperator {
         let matches = self.probe_opposite_side(side, &key_value, event_time, ctx.state);
 
         self.process_matches(
-            matches, side, event, event_time, &join_row, &state_key, ctx, &mut output,
+            matches,
+            side,
+            event,
+            event_time,
+            &join_row,
+            &state_key,
+            ctx,
+            &mut output,
         );
 
         // Emit watermark if generated

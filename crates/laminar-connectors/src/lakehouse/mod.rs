@@ -77,7 +77,9 @@ pub mod metrics;
 
 // Re-export Delta Lake types at module level.
 pub use delta::DeltaLakeSink;
-pub use delta_config::{CompactionConfig, DeliveryGuarantee, DeltaLakeSinkConfig, DeltaWriteMode};
+pub use delta_config::{
+    CompactionConfig, DeliveryGuarantee, DeltaCatalogType, DeltaLakeSinkConfig, DeltaWriteMode,
+};
 pub use delta_metrics::DeltaLakeSinkMetrics;
 pub use delta_source::DeltaSource;
 pub use delta_source_config::DeltaSourceConfig;
@@ -233,6 +235,34 @@ fn delta_lake_config_keys() -> Vec<ConfigKeySpec> {
             "Writer ID for exactly-once deduplication (auto UUID if not set)",
             "",
         ),
+        // ── Catalog configuration ──
+        ConfigKeySpec::optional("catalog.type", "Catalog type: none, glue, unity", "none"),
+        ConfigKeySpec::optional(
+            "catalog.database",
+            "Catalog database name (required for Glue)",
+            "",
+        ),
+        ConfigKeySpec::optional("catalog.name", "Catalog name (required for Unity)", ""),
+        ConfigKeySpec::optional(
+            "catalog.schema",
+            "Catalog schema name (required for Unity)",
+            "",
+        ),
+        ConfigKeySpec::optional(
+            "catalog.workspace_url",
+            "Databricks workspace URL (required for Unity)",
+            "",
+        ),
+        ConfigKeySpec::optional(
+            "catalog.access_token",
+            "Databricks access token (required for Unity)",
+            "",
+        ),
+        ConfigKeySpec::optional(
+            "catalog.prop.*",
+            "Catalog-specific properties (pass-through)",
+            "",
+        ),
         // ── Cloud storage credentials (resolved via StorageCredentialResolver) ──
         ConfigKeySpec::optional(
             "storage.aws_access_key_id",
@@ -313,22 +343,38 @@ fn delta_lake_source_config_keys() -> Vec<ConfigKeySpec> {
             "How often to poll for new versions (ms)",
             "1000",
         ),
+        // ── Catalog configuration ──
+        ConfigKeySpec::optional("catalog.type", "Catalog type: none, glue, unity", "none"),
+        ConfigKeySpec::optional(
+            "catalog.database",
+            "Catalog database name (required for Glue)",
+            "",
+        ),
+        ConfigKeySpec::optional("catalog.name", "Catalog name (required for Unity)", ""),
+        ConfigKeySpec::optional(
+            "catalog.schema",
+            "Catalog schema name (required for Unity)",
+            "",
+        ),
+        ConfigKeySpec::optional(
+            "catalog.workspace_url",
+            "Databricks workspace URL (required for Unity)",
+            "",
+        ),
+        ConfigKeySpec::optional(
+            "catalog.access_token",
+            "Databricks access token (required for Unity)",
+            "",
+        ),
+        ConfigKeySpec::optional(
+            "catalog.prop.*",
+            "Catalog-specific properties (pass-through)",
+            "",
+        ),
         // ── Cloud storage credentials ──
-        ConfigKeySpec::optional(
-            "storage.aws_access_key_id",
-            "AWS access key ID",
-            "",
-        ),
-        ConfigKeySpec::optional(
-            "storage.aws_secret_access_key",
-            "AWS secret access key",
-            "",
-        ),
-        ConfigKeySpec::optional(
-            "storage.aws_region",
-            "AWS region for S3 paths",
-            "",
-        ),
+        ConfigKeySpec::optional("storage.aws_access_key_id", "AWS access key ID", ""),
+        ConfigKeySpec::optional("storage.aws_secret_access_key", "AWS secret access key", ""),
+        ConfigKeySpec::optional("storage.aws_region", "AWS region for S3 paths", ""),
         ConfigKeySpec::optional(
             "storage.azure_storage_account_name",
             "Azure storage account name",
@@ -577,6 +623,14 @@ mod tests {
         assert!(optional.contains(&"compaction.z-order.columns"));
         assert!(optional.contains(&"vacuum.retention.hours"));
         assert!(optional.contains(&"writer.id"));
+        // Catalog keys
+        assert!(optional.contains(&"catalog.type"));
+        assert!(optional.contains(&"catalog.database"));
+        assert!(optional.contains(&"catalog.name"));
+        assert!(optional.contains(&"catalog.schema"));
+        assert!(optional.contains(&"catalog.workspace_url"));
+        assert!(optional.contains(&"catalog.access_token"));
+        assert!(optional.contains(&"catalog.prop.*"));
     }
 
     #[test]
@@ -623,6 +677,9 @@ mod tests {
             .collect();
         assert!(optional.contains(&"starting.version"));
         assert!(optional.contains(&"poll.interval.ms"));
+        // Catalog keys
+        assert!(optional.contains(&"catalog.type"));
+        assert!(optional.contains(&"catalog.database"));
     }
 
     #[test]

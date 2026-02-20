@@ -281,20 +281,13 @@ impl From<crate::DbError> for ApiError {
 
             // DataFusion errors are query errors, not internal errors
             DbError::DataFusion(e) => {
-                let translated =
-                    laminar_sql::error::translate_datafusion_error(
-                        &e.to_string(),
-                    );
+                let translated = laminar_sql::error::translate_datafusion_error(&e.to_string());
                 Self::query(translated.to_string())
             }
 
             DbError::Engine(e) => Self::internal(format!("Engine error: {e}")),
-            DbError::Connector(msg) => {
-                Self::internal(format!("Connector error: {msg}"))
-            }
-            DbError::Pipeline(msg) => {
-                Self::internal(format!("Pipeline error: {msg}"))
-            }
+            DbError::Connector(msg) => Self::internal(format!("Connector error: {msg}")),
+            DbError::Pipeline(msg) => Self::internal(format!("Pipeline error: {msg}")),
             DbError::QueryPipeline {
                 context,
                 translated,
@@ -340,9 +333,7 @@ mod tests {
 
     #[test]
     fn test_datafusion_error_becomes_query_not_internal() {
-        let df_err = datafusion_common::DataFusionError::Plan(
-            "No field named 'foo'".to_string(),
-        );
+        let df_err = datafusion_common::DataFusionError::Plan("No field named 'foo'".to_string());
         let db_err = crate::DbError::DataFusion(df_err);
         let api_err: ApiError = db_err.into();
         // Should be a Query error, not Internal
@@ -383,8 +374,7 @@ mod tests {
 
     #[test]
     fn test_materialized_view_error_becomes_query() {
-        let db_err =
-            crate::DbError::MaterializedView("view failed".into());
+        let db_err = crate::DbError::MaterializedView("view failed".into());
         let api_err: ApiError = db_err.into();
         assert_eq!(api_err.code(), codes::QUERY_FAILED);
         assert!(api_err.message().contains("view failed"));

@@ -345,9 +345,9 @@ fn extract_temporal_version(factor: &TableFactor) -> Option<String> {
 fn extract_column_name_from_expr(expr: &Expr) -> String {
     match expr {
         Expr::Identifier(ident) => ident.value.clone(),
-        Expr::CompoundIdentifier(parts) => {
-            parts.last().map_or_else(|| expr.to_string(), |p| p.value.clone())
-        }
+        Expr::CompoundIdentifier(parts) => parts
+            .last()
+            .map_or_else(|| expr.to_string(), |p| p.value.clone()),
         _ => expr.to_string(),
     }
 }

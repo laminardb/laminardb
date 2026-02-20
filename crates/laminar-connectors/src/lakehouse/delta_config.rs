@@ -62,6 +62,21 @@ pub struct DeltaLakeSinkConfig {
 
     /// Writer ID for exactly-once deduplication.
     pub writer_id: String,
+
+    /// Catalog type for table discovery.
+    pub catalog_type: DeltaCatalogType,
+
+    /// Catalog database name (required for Glue).
+    pub catalog_database: Option<String>,
+
+    /// Catalog name (required for Unity).
+    pub catalog_name: Option<String>,
+
+    /// Catalog schema name (required for Unity).
+    pub catalog_schema: Option<String>,
+
+    /// Additional catalog-specific properties.
+    pub catalog_properties: HashMap<String, String>,
 }
 
 impl Default for DeltaLakeSinkConfig {
@@ -81,6 +96,11 @@ impl Default for DeltaLakeSinkConfig {
             vacuum_retention: Duration::from_secs(7 * 24 * 3600), // 7 days
             delivery_guarantee: DeliveryGuarantee::ExactlyOnce,
             writer_id: uuid::Uuid::new_v4().to_string(),
+            catalog_type: DeltaCatalogType::None,
+            catalog_database: None,
+            catalog_name: None,
+            catalog_schema: None,
+            catalog_properties: HashMap::new(),
         }
     }
 }
@@ -105,6 +125,7 @@ impl DeltaLakeSinkConfig {
     ///
     /// Returns `ConnectorError::MissingConfig` if required keys are absent,
     /// or `ConnectorError::ConfigurationError` on invalid values.
+    #[allow(clippy::too_many_lines)]
     pub fn from_config(config: &ConnectorConfig) -> Result<Self, ConnectorError> {
         let mut cfg = Self {
             table_path: config.require("table.path")?.to_string(),
@@ -189,6 +210,38 @@ impl DeltaLakeSinkConfig {
             cfg.writer_id = v.to_string();
         }
 
+        // ── Catalog configuration ──
+        if let Some(v) = config.get("catalog.type") {
+            cfg.catalog_type = v.parse().map_err(|_| {
+                ConnectorError::ConfigurationError(format!(
+                    "invalid catalog.type: '{v}' (expected 'none', 'glue', or 'unity')"
+                ))
+            })?;
+        }
+        if let Some(v) = config.get("catalog.database") {
+            cfg.catalog_database = Some(v.to_string());
+        }
+        if let Some(v) = config.get("catalog.name") {
+            cfg.catalog_name = Some(v.to_string());
+        }
+        if let Some(v) = config.get("catalog.schema") {
+            cfg.catalog_schema = Some(v.to_string());
+        }
+        // Unity-specific: populate workspace_url and access_token into the enum variant.
+        if let DeltaCatalogType::Unity {
+            ref mut workspace_url,
+            ref mut access_token,
+        } = cfg.catalog_type
+        {
+            if let Some(v) = config.get("catalog.workspace_url") {
+                *workspace_url = v.to_string();
+            }
+            if let Some(v) = config.get("catalog.access_token") {
+                *access_token = v.to_string();
+            }
+        }
+        cfg.catalog_properties = config.properties_with_prefix("catalog.prop.");
+
         // Resolve storage credentials: explicit options + environment variable fallbacks.
         let explicit_storage = config.properties_with_prefix("storage.");
         let resolved = StorageCredentialResolver::resolve(&cfg.table_path, &explicit_storage);
@@ -232,6 +285,43 @@ impl DeltaLakeSinkConfig {
             return Err(ConnectorError::ConfigurationError(
                 "checkpoint.interval must be > 0".into(),
             ));
+        }
+
+        // Validate catalog-specific requirements.
+        match &self.catalog_type {
+            DeltaCatalogType::None => {}
+            DeltaCatalogType::Glue => {
+                if self.catalog_database.is_none() {
+                    return Err(ConnectorError::ConfigurationError(
+                        "Glue catalog requires 'catalog.database' to be set".into(),
+                    ));
+                }
+            }
+            DeltaCatalogType::Unity {
+                workspace_url,
+                access_token,
+            } => {
+                if workspace_url.is_empty() {
+                    return Err(ConnectorError::ConfigurationError(
+                        "Unity catalog requires 'catalog.workspace_url' to be set".into(),
+                    ));
+                }
+                if access_token.is_empty() {
+                    return Err(ConnectorError::ConfigurationError(
+                        "Unity catalog requires 'catalog.access_token' to be set".into(),
+                    ));
+                }
+                if self.catalog_name.is_none() {
+                    return Err(ConnectorError::ConfigurationError(
+                        "Unity catalog requires 'catalog.name' to be set".into(),
+                    ));
+                }
+                if self.catalog_schema.is_none() {
+                    return Err(ConnectorError::ConfigurationError(
+                        "Unity catalog requires 'catalog.schema' to be set".into(),
+                    ));
+                }
+            }
         }
 
         // Validate cloud storage credentials for the detected provider.
@@ -312,6 +402,51 @@ impl fmt::Display for DeliveryGuarantee {
         match self {
             Self::AtLeastOnce => write!(f, "at-least-once"),
             Self::ExactlyOnce => write!(f, "exactly-once"),
+        }
+    }
+}
+
+/// Delta Lake catalog type for table discovery.
+///
+/// Catalogs enable referencing tables by logical names instead of raw paths.
+#[derive(Debug, Clone, PartialEq, Eq, Default)]
+pub enum DeltaCatalogType {
+    /// No catalog — table path is a direct file or cloud URI.
+    #[default]
+    None,
+    /// AWS Glue Data Catalog.
+    Glue,
+    /// Databricks Unity Catalog.
+    Unity {
+        /// Databricks workspace URL (e.g., `https://xxx.cloud.databricks.com`).
+        workspace_url: String,
+        /// Databricks access token.
+        access_token: String,
+    },
+}
+
+impl FromStr for DeltaCatalogType {
+    type Err = String;
+
+    fn from_str(s: &str) -> Result<Self, Self::Err> {
+        match s.to_lowercase().as_str() {
+            "none" | "" => Ok(Self::None),
+            "glue" => Ok(Self::Glue),
+            "unity" => Ok(Self::Unity {
+                workspace_url: String::new(),
+                access_token: String::new(),
+            }),
+            other => Err(format!("unknown catalog type: '{other}'")),
+        }
+    }
+}
+
+impl fmt::Display for DeltaCatalogType {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        match self {
+            Self::None => write!(f, "none"),
+            Self::Glue => write!(f, "glue"),
+            Self::Unity { .. } => write!(f, "unity"),
         }
     }
 }
@@ -710,5 +845,149 @@ mod tests {
     fn test_display_storage_options_empty() {
         let cfg = DeltaLakeSinkConfig::new("/local/path");
         assert!(cfg.display_storage_options().is_empty());
+    }
+
+    // ── Catalog tests ──
+
+    #[test]
+    fn test_catalog_type_parse() {
+        assert_eq!(
+            "none".parse::<DeltaCatalogType>().unwrap(),
+            DeltaCatalogType::None
+        );
+        assert_eq!(
+            "glue".parse::<DeltaCatalogType>().unwrap(),
+            DeltaCatalogType::Glue
+        );
+        assert!(matches!(
+            "unity".parse::<DeltaCatalogType>().unwrap(),
+            DeltaCatalogType::Unity { .. }
+        ));
+        assert!("unknown".parse::<DeltaCatalogType>().is_err());
+    }
+
+    #[test]
+    fn test_catalog_type_display() {
+        assert_eq!(DeltaCatalogType::None.to_string(), "none");
+        assert_eq!(DeltaCatalogType::Glue.to_string(), "glue");
+        assert_eq!(
+            DeltaCatalogType::Unity {
+                workspace_url: "url".into(),
+                access_token: "tok".into()
+            }
+            .to_string(),
+            "unity"
+        );
+    }
+
+    #[test]
+    fn test_catalog_none_default() {
+        let config = make_config(&required_pairs());
+        let cfg = DeltaLakeSinkConfig::from_config(&config).unwrap();
+        assert_eq!(cfg.catalog_type, DeltaCatalogType::None);
+        assert!(cfg.catalog_database.is_none());
+        assert!(cfg.catalog_name.is_none());
+        assert!(cfg.catalog_schema.is_none());
+        assert!(cfg.catalog_properties.is_empty());
+    }
+
+    #[test]
+    fn test_catalog_glue_valid() {
+        let mut pairs = required_pairs();
+        pairs.extend_from_slice(&[
+            ("catalog.type", "glue"),
+            ("catalog.database", "my_database"),
+        ]);
+        let config = make_config(&pairs);
+        let cfg = DeltaLakeSinkConfig::from_config(&config).unwrap();
+        assert_eq!(cfg.catalog_type, DeltaCatalogType::Glue);
+        assert_eq!(cfg.catalog_database.as_deref(), Some("my_database"));
+    }
+
+    #[test]
+    fn test_catalog_glue_missing_database() {
+        let mut pairs = required_pairs();
+        pairs.push(("catalog.type", "glue"));
+        let config = make_config(&pairs);
+        let result = DeltaLakeSinkConfig::from_config(&config);
+        assert!(result.is_err());
+        let err = result.unwrap_err().to_string();
+        assert!(err.contains("catalog.database"), "error: {err}");
+    }
+
+    #[test]
+    fn test_catalog_unity_valid() {
+        let mut pairs = required_pairs();
+        pairs.extend_from_slice(&[
+            ("catalog.type", "unity"),
+            ("catalog.workspace_url", "https://my.databricks.com"),
+            ("catalog.access_token", "dapi123"),
+            ("catalog.name", "main"),
+            ("catalog.schema", "default"),
+        ]);
+        let config = make_config(&pairs);
+        let cfg = DeltaLakeSinkConfig::from_config(&config).unwrap();
+        assert!(matches!(
+            cfg.catalog_type,
+            DeltaCatalogType::Unity {
+                ref workspace_url,
+                ref access_token
+            }
+            if workspace_url == "https://my.databricks.com"
+                && access_token == "dapi123"
+        ));
+        assert_eq!(cfg.catalog_name.as_deref(), Some("main"));
+        assert_eq!(cfg.catalog_schema.as_deref(), Some("default"));
+    }
+
+    #[test]
+    fn test_catalog_unity_missing_workspace_url() {
+        let mut pairs = required_pairs();
+        pairs.extend_from_slice(&[
+            ("catalog.type", "unity"),
+            ("catalog.access_token", "dapi123"),
+            ("catalog.name", "main"),
+            ("catalog.schema", "default"),
+        ]);
+        let config = make_config(&pairs);
+        let result = DeltaLakeSinkConfig::from_config(&config);
+        assert!(result.is_err());
+        let err = result.unwrap_err().to_string();
+        assert!(err.contains("workspace_url"), "error: {err}");
+    }
+
+    #[test]
+    fn test_catalog_unity_missing_access_token() {
+        let mut pairs = required_pairs();
+        pairs.extend_from_slice(&[
+            ("catalog.type", "unity"),
+            ("catalog.workspace_url", "https://my.databricks.com"),
+            ("catalog.name", "main"),
+            ("catalog.schema", "default"),
+        ]);
+        let config = make_config(&pairs);
+        let result = DeltaLakeSinkConfig::from_config(&config);
+        assert!(result.is_err());
+        let err = result.unwrap_err().to_string();
+        assert!(err.contains("access_token"), "error: {err}");
+    }
+
+    #[test]
+    fn test_catalog_properties_prefix() {
+        let mut pairs = required_pairs();
+        pairs.extend_from_slice(&[
+            ("catalog.prop.token", "my_token"),
+            ("catalog.prop.warehouse", "my_wh"),
+        ]);
+        let config = make_config(&pairs);
+        let cfg = DeltaLakeSinkConfig::from_config(&config).unwrap();
+        assert_eq!(
+            cfg.catalog_properties.get("token"),
+            Some(&"my_token".to_string())
+        );
+        assert_eq!(
+            cfg.catalog_properties.get("warehouse"),
+            Some(&"my_wh".to_string())
+        );
     }
 }

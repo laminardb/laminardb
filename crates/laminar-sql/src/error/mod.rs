@@ -171,8 +171,7 @@ pub fn translate_datafusion_error_with_context(
 
     // Column not found
     if let Some(col) = extract_missing_column(clean) {
-        let hint = available_columns
-            .and_then(|cols| suggest_column(col, cols));
+        let hint = available_columns.and_then(|cols| suggest_column(col, cols));
         return TranslatedError {
             code: codes::COLUMN_NOT_FOUND,
             message: format!("Column '{col}' not found in query"),
@@ -185,9 +184,7 @@ pub fn translate_datafusion_error_with_context(
         return TranslatedError {
             code: codes::TABLE_NOT_FOUND,
             message: format!("Table or source '{table}' not found"),
-            hint: Some(
-                "Use SHOW TABLES to see available sources and tables".to_string(),
-            ),
+            hint: Some("Use SHOW TABLES to see available sources and tables".to_string()),
         };
     }
 
@@ -273,9 +270,7 @@ fn check_window_errors(clean: &str) -> Option<TranslatedError> {
         return Some(TranslatedError {
             code: codes::WINDOW_INVALID,
             message: format!("Invalid window specification: {clean}"),
-            hint: Some(
-                "Supported window types: TUMBLE, HOP, SESSION, CUMULATE".to_string(),
-            ),
+            hint: Some("Supported window types: TUMBLE, HOP, SESSION, CUMULATE".to_string()),
         });
     }
 
@@ -291,15 +286,11 @@ fn check_window_errors(clean: &str) -> Option<TranslatedError> {
         });
     }
 
-    if lower.contains("window")
-        && (lower.contains("invalid") || lower.contains("not supported"))
-    {
+    if lower.contains("window") && (lower.contains("invalid") || lower.contains("not supported")) {
         return Some(TranslatedError {
             code: codes::WINDOW_INVALID,
             message: format!("Invalid window specification: {clean}"),
-            hint: Some(
-                "Supported window types: TUMBLE, HOP, SESSION, CUMULATE".to_string(),
-            ),
+            hint: Some("Supported window types: TUMBLE, HOP, SESSION, CUMULATE".to_string()),
         });
     }
 
@@ -395,8 +386,7 @@ fn check_join_errors(clean: &str) -> Option<TranslatedError> {
             code: codes::TEMPORAL_JOIN_NO_PK,
             message: format!("Temporal join error: {clean}"),
             hint: Some(
-                "The right-side table of a temporal join requires a PRIMARY KEY"
-                    .to_string(),
+                "The right-side table of a temporal join requires a PRIMARY KEY".to_string(),
             ),
         });
     }
@@ -485,24 +475,21 @@ mod tests {
     fn test_plan_error_with_column_extracts_column() {
         // When a Plan error wraps a "No field named" message, the more
         // specific column-not-found code is preferred over generic planning.
-        let t =
-            translate_datafusion_error("Plan(\"No field named 'x' in schema\")");
+        let t = translate_datafusion_error("Plan(\"No field named 'x' in schema\")");
         assert_eq!(t.code, codes::COLUMN_NOT_FOUND);
         assert!(t.message.contains("'x'"));
     }
 
     #[test]
     fn test_plan_error_generic() {
-        let t =
-            translate_datafusion_error("Plan(\"aggregate function not found\")");
+        let t = translate_datafusion_error("Plan(\"aggregate function not found\")");
         assert_eq!(t.code, codes::PLANNING_FAILED);
         assert!(t.message.contains("aggregate function not found"));
     }
 
     #[test]
     fn test_error_during_planning() {
-        let t =
-            translate_datafusion_error("Error during planning: ambiguous reference 'id'");
+        let t = translate_datafusion_error("Error during planning: ambiguous reference 'id'");
         assert_eq!(t.code, codes::PLANNING_FAILED);
     }
 
@@ -522,9 +509,7 @@ mod tests {
 
     #[test]
     fn test_prefix_stripping() {
-        let t = translate_datafusion_error(
-            "DataFusion error: Arrow error: No field named 'x'",
-        );
+        let t = translate_datafusion_error("DataFusion error: Arrow error: No field named 'x'");
         assert_eq!(t.code, codes::COLUMN_NOT_FOUND);
         assert!(t.message.contains("'x'"));
         assert!(!t.message.contains("DataFusion"));
@@ -566,10 +551,7 @@ mod tests {
     #[test]
     fn test_column_not_found_with_suggestion() {
         let cols = &["user_id", "email", "price"];
-        let t = translate_datafusion_error_with_context(
-            "No field named 'user_ie'",
-            Some(cols),
-        );
+        let t = translate_datafusion_error_with_context("No field named 'user_ie'", Some(cols));
         assert_eq!(t.code, codes::COLUMN_NOT_FOUND);
         assert!(t.message.contains("user_ie"));
         assert!(t.hint.is_some());
@@ -583,10 +565,7 @@ mod tests {
     #[test]
     fn test_column_not_found_no_close_match() {
         let cols = &["user_id", "email"];
-        let t = translate_datafusion_error_with_context(
-            "No field named 'zzzzz'",
-            Some(cols),
-        );
+        let t = translate_datafusion_error_with_context("No field named 'zzzzz'", Some(cols));
         assert_eq!(t.code, codes::COLUMN_NOT_FOUND);
         assert!(t.hint.is_none());
     }
@@ -602,9 +581,7 @@ mod tests {
 
     #[test]
     fn test_watermark_required_error() {
-        let t = translate_datafusion_error(
-            "Watermark required for EMIT ON WINDOW CLOSE",
-        );
+        let t = translate_datafusion_error("Watermark required for EMIT ON WINDOW CLOSE");
         assert_eq!(t.code, codes::WATERMARK_REQUIRED);
         assert!(t.hint.is_some());
         assert!(t.hint.unwrap().contains("WATERMARK FOR"));
@@ -612,9 +589,7 @@ mod tests {
 
     #[test]
     fn test_window_invalid_error() {
-        let t = translate_datafusion_error(
-            "Window type not supported for this operation",
-        );
+        let t = translate_datafusion_error("Window type not supported for this operation");
         assert_eq!(t.code, codes::WINDOW_INVALID);
         assert!(t.hint.unwrap().contains("TUMBLE"));
     }
@@ -623,18 +598,14 @@ mod tests {
 
     #[test]
     fn test_join_key_not_found_error() {
-        let t = translate_datafusion_error(
-            "Join key 'user_id' not found in right table",
-        );
+        let t = translate_datafusion_error("Join key 'user_id' not found in right table");
         assert_eq!(t.code, codes::JOIN_KEY_MISSING);
         assert!(t.hint.unwrap().contains("ON clause"));
     }
 
     #[test]
     fn test_temporal_join_pk_error() {
-        let t = translate_datafusion_error(
-            "Temporal join requires a primary key on right table",
-        );
+        let t = translate_datafusion_error("Temporal join requires a primary key on right table");
         assert_eq!(t.code, codes::TEMPORAL_JOIN_NO_PK);
         assert!(t.hint.unwrap().contains("PRIMARY KEY"));
     }

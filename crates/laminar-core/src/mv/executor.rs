@@ -689,10 +689,7 @@ mod tests {
             }
         }
 
-        fn restore(
-            &mut self,
-            _state: OperatorState,
-        ) -> Result<(), crate::operator::OperatorError> {
+        fn restore(&mut self, _state: OperatorState) -> Result<(), crate::operator::OperatorError> {
             Ok(())
         }
     }
@@ -727,9 +724,7 @@ mod tests {
         executor
             .register_operator(
                 "mv1",
-                Box::new(ChangelogEmittingOperator {
-                    id: "mv1".into(),
-                }),
+                Box::new(ChangelogEmittingOperator { id: "mv1".into() }),
             )
             .unwrap();
         executor

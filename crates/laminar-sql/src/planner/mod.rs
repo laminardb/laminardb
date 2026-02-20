@@ -623,8 +623,7 @@ impl std::fmt::Display for PlanningError {
             Self::SourceNotFound(name) => write!(f, "Source not found: {name}"),
             Self::SinkNotFound(name) => write!(f, "Sink not found: {name}"),
             Self::DataFusion(e) => {
-                let translated =
-                    crate::error::translate_datafusion_error(&e.to_string());
+                let translated = crate::error::translate_datafusion_error(&e.to_string());
                 write!(f, "{translated}")
             }
         }

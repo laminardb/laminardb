@@ -74,10 +74,10 @@ mod exec;
 pub mod execute;
 /// Lookup join plan node for DataFusion.
 pub mod lookup_join;
-mod source;
-mod table_provider;
 /// Processing-time UDF for `PROCTIME()` support
 pub mod proctime_udf;
+mod source;
+mod table_provider;
 /// Watermark UDF for current watermark access
 pub mod watermark_udf;
 /// Window function UDFs (TUMBLE, HOP, SESSION, CUMULATE)
@@ -91,9 +91,9 @@ pub use bridge::{BridgeSendError, BridgeSender, BridgeStream, BridgeTrySendError
 pub use channel_source::ChannelStreamSource;
 pub use exec::StreamingScanExec;
 pub use execute::{execute_streaming_sql, DdlResult, QueryResult, StreamingSqlResult};
+pub use proctime_udf::ProcTimeUdf;
 pub use source::{SortColumn, StreamSource, StreamSourceRef};
 pub use table_provider::StreamingTableProvider;
-pub use proctime_udf::ProcTimeUdf;
 pub use watermark_udf::WatermarkUdf;
 pub use window_udf::{CumulateWindowStart, HopWindowStart, SessionWindowStart, TumbleWindowStart};
 

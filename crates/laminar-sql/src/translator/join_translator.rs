@@ -240,10 +240,7 @@ impl JoinOperatorConfig {
             return JoinOperatorConfig::Temporal(TemporalJoinTranslatorConfig {
                 stream_key_column: analysis.left_key_column.clone(),
                 table_key_column: analysis.right_key_column.clone(),
-                table_version_column: analysis
-                    .temporal_version_column
-                    .clone()
-                    .unwrap_or_default(),
+                table_version_column: analysis.temporal_version_column.clone().unwrap_or_default(),
                 semantics: "event_time".to_string(),
                 join_type: join_type_str.to_string(),
             });
@@ -848,9 +845,7 @@ mod tests {
             Duration::from_secs(60),
             JoinType::LeftSemi,
         );
-        if let JoinOperatorConfig::StreamStream(config) =
-            JoinOperatorConfig::from_analysis(&semi)
-        {
+        if let JoinOperatorConfig::StreamStream(config) = JoinOperatorConfig::from_analysis(&semi) {
             assert_eq!(config.join_type, StreamJoinType::LeftSemi);
         } else {
             panic!("Expected StreamStream config");
@@ -864,9 +859,7 @@ mod tests {
             Duration::from_secs(60),
             JoinType::RightAnti,
         );
-        if let JoinOperatorConfig::StreamStream(config) =
-            JoinOperatorConfig::from_analysis(&anti)
-        {
+        if let JoinOperatorConfig::StreamStream(config) = JoinOperatorConfig::from_analysis(&anti) {
             assert_eq!(config.join_type, StreamJoinType::RightAnti);
         } else {
             panic!("Expected StreamStream config");

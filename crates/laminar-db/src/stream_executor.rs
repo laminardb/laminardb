@@ -400,19 +400,19 @@ impl StreamExecutor {
             } else {
                 let query_name = &self.queries[idx].name;
                 let query_sql = &self.queries[idx].sql;
-                let df = self.ctx.sql(query_sql).await.map_err(|e| {
-                    DbError::query_pipeline(query_name, &e)
-                })?;
-                df.collect().await.map_err(|e| {
-                    DbError::query_pipeline(query_name, &e)
-                })?
+                let df = self
+                    .ctx
+                    .sql(query_sql)
+                    .await
+                    .map_err(|e| DbError::query_pipeline(query_name, &e))?;
+                df.collect()
+                    .await
+                    .map_err(|e| DbError::query_pipeline(query_name, &e))?
             };
 
             // Apply Top-K post-filter if configured
             let batches = match &self.queries[idx].order_config {
-                Some(OrderOperatorConfig::TopK(config)) => {
-                    apply_topk_filter(&batches, config.k)
-                }
+                Some(OrderOperatorConfig::TopK(config)) => apply_topk_filter(&batches, config.k),
                 Some(OrderOperatorConfig::PerGroupTopK(config)) => {
                     apply_topk_filter(&batches, config.k)
                 }
@@ -477,9 +477,8 @@ impl StreamExecutor {
             if source_batches.contains_key(name) {
                 continue;
             }
-            let empty =
-                datafusion::datasource::MemTable::try_new(schema.clone(), vec![])
-                    .map_err(|e| DbError::query_pipeline(name, &e))?;
+            let empty = datafusion::datasource::MemTable::try_new(schema.clone(), vec![])
+                .map_err(|e| DbError::query_pipeline(name, &e))?;
             let _ = self.ctx.deregister_table(name);
             self.ctx
                 .register_table(name, Arc::new(empty))
@@ -676,11 +675,9 @@ impl StreamExecutor {
                 continue;
             }
             let schema = batches[0].schema();
-            let mem_table = datafusion::datasource::MemTable::try_new(
-                schema,
-                vec![batches.clone()],
-            )
-            .map_err(|e| DbError::query_pipeline(name, &e))?;
+            let mem_table =
+                datafusion::datasource::MemTable::try_new(schema, vec![batches.clone()])
+                    .map_err(|e| DbError::query_pipeline(name, &e))?;
             let _ = self.ctx.deregister_table(name);
             self.ctx
                 .register_table(name, Arc::new(mem_table))
@@ -700,12 +697,14 @@ impl StreamExecutor {
             )
             .await?
         } else {
-            let df = self.ctx.sql(query_sql).await.map_err(|e| {
-                DbError::query_pipeline(query_name, &e)
-            })?;
-            df.collect().await.map_err(|e| {
-                DbError::query_pipeline(query_name, &e)
-            })?
+            let df = self
+                .ctx
+                .sql(query_sql)
+                .await
+                .map_err(|e| DbError::query_pipeline(query_name, &e))?;
+            df.collect()
+                .await
+                .map_err(|e| DbError::query_pipeline(query_name, &e))?
         };
 
         // Cleanup EOWC temp tables
@@ -765,12 +764,15 @@ impl StreamExecutor {
                 .register_table("__asof_tmp", Arc::new(mem_table))
                 .map_err(|e| DbError::query_pipeline(query_name, &e))?;
 
-            let df = self.ctx.sql(proj_sql).await.map_err(|e| {
-                DbError::query_pipeline(query_name, &e)
-            })?;
-            let result = df.collect().await.map_err(|e| {
-                DbError::query_pipeline(query_name, &e)
-            })?;
+            let df = self
+                .ctx
+                .sql(proj_sql)
+                .await
+                .map_err(|e| DbError::query_pipeline(query_name, &e))?;
+            let result = df
+                .collect()
+                .await
+                .map_err(|e| DbError::query_pipeline(query_name, &e))?;
 
             let _ = self.ctx.deregister_table("__asof_tmp");
             Ok(result)
@@ -2301,7 +2303,10 @@ mod tests {
         use laminar_core::operator::window::EmitStrategy as CoreEmit;
         use laminar_sql::parser::EmitStrategy as SqlEmit;
 
-        assert_eq!(sql_emit_to_core(&SqlEmit::OnWatermark), CoreEmit::OnWatermark);
+        assert_eq!(
+            sql_emit_to_core(&SqlEmit::OnWatermark),
+            CoreEmit::OnWatermark
+        );
         assert_eq!(
             sql_emit_to_core(&SqlEmit::OnWindowClose),
             CoreEmit::OnWindowClose
@@ -2355,7 +2360,7 @@ mod tests {
     #[test]
     fn test_apply_topk_filter_no_op_when_under_limit() {
         let batch = test_batch(); // 3 rows
-        let result = apply_topk_filter(&[batch.clone()], 10);
+        let result = apply_topk_filter(std::slice::from_ref(&batch), 10);
         let total: usize = result.iter().map(|b| b.num_rows()).sum();
         assert_eq!(total, 3);
     }
@@ -2408,10 +2413,7 @@ mod tests {
             .await
             .unwrap();
         assert!(results.contains_key("topk_stream"));
-        let total_rows: usize = results["topk_stream"]
-            .iter()
-            .map(|b| b.num_rows())
-            .sum();
+        let total_rows: usize = results["topk_stream"].iter().map(|b| b.num_rows()).sum();
         assert_eq!(total_rows, 2);
     }
 }

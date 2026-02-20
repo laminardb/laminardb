@@ -328,7 +328,11 @@ mod tests {
         }
 
         let udf = ScalarUDF::new_from_impl(FortyTwo::new());
-        let db = LaminarDB::builder().register_udf(udf).build().await.unwrap();
+        let db = LaminarDB::builder()
+            .register_udf(udf)
+            .build()
+            .await
+            .unwrap();
 
         // Verify the UDF is queryable
         let result = db.execute("SELECT forty_two()").await;

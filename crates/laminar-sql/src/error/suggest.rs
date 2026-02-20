@@ -14,9 +14,7 @@ fn levenshtein(a: &[u8], b: &[u8]) -> usize {
         curr[0] = i;
         for j in 1..=n {
             let cost = usize::from(a[i - 1] != b[j - 1]);
-            curr[j] = (prev[j] + 1)
-                .min(curr[j - 1] + 1)
-                .min(prev[j - 1] + cost);
+            curr[j] = (prev[j] + 1).min(curr[j - 1] + 1).min(prev[j - 1] + cost);
         }
         std::mem::swap(&mut prev, &mut curr);
     }
@@ -42,10 +40,7 @@ pub fn closest_match<'a>(
     for &candidate in candidates {
         let cand_lower = candidate.to_ascii_lowercase();
         let dist = levenshtein(input_lower.as_bytes(), cand_lower.as_bytes());
-        if dist > 0
-            && dist <= max_distance
-            && best.is_none_or(|(_, d)| dist < d)
-        {
+        if dist > 0 && dist <= max_distance && best.is_none_or(|(_, d)| dist < d) {
             best = Some((candidate, dist));
         }
     }

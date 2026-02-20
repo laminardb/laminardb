@@ -959,9 +959,10 @@ impl LaminarDB {
         match operation {
             AlterSourceOperation::AddColumn { column_def } => {
                 let col_name = column_def.name.value.clone();
-                let arrow_type =
-                    laminar_sql::translator::streaming_ddl::sql_type_to_arrow(&column_def.data_type)
-                        .map_err(|e| DbError::Sql(laminar_sql::Error::ParseError(e)))?;
+                let arrow_type = laminar_sql::translator::streaming_ddl::sql_type_to_arrow(
+                    &column_def.data_type,
+                )
+                .map_err(|e| DbError::Sql(laminar_sql::Error::ParseError(e)))?;
 
                 // Build new schema with the added column
                 let mut fields: Vec<arrow::datatypes::FieldRef> =
@@ -971,11 +972,9 @@ impl LaminarDB {
 
                 // Re-register the source with the new schema
                 let entry = self.catalog.get_source(&name_str);
-                let (wm_col, max_ooo) = entry
-                    .as_ref()
-                    .map_or((None, None), |e| {
-                        (e.watermark_column.clone(), e.max_out_of_orderness)
-                    });
+                let (wm_col, max_ooo) = entry.as_ref().map_or((None, None), |e| {
+                    (e.watermark_column.clone(), e.max_out_of_orderness)
+                });
 
                 self.catalog.register_source_or_replace(
                     &name_str,
@@ -988,10 +987,10 @@ impl LaminarDB {
 
                 // Update DataFusion registration
                 let _ = self.ctx.deregister_table(&name_str);
-                let provider =
-                    datafusion::datasource::MemTable::try_new(new_schema, vec![vec![]]).map_err(
-                        |e| DbError::InvalidOperation(format!("Failed to re-register table: {e}")),
-                    )?;
+                let provider = datafusion::datasource::MemTable::try_new(new_schema, vec![vec![]])
+                    .map_err(|e| {
+                        DbError::InvalidOperation(format!("Failed to re-register table: {e}"))
+                    })?;
                 self.ctx
                     .register_table(&name_str, Arc::new(provider))
                     .map_err(|e| {
@@ -1059,9 +1058,11 @@ impl LaminarDB {
                 if_not_exists: false,
             };
             match planner.plan(&stmt) {
-                Ok(laminar_sql::planner::StreamingPlan::Query(ref qp)) => {
-                    (qp.emit_clause.clone(), qp.window_config.clone(), qp.order_config.clone())
-                }
+                Ok(laminar_sql::planner::StreamingPlan::Query(ref qp)) => (
+                    qp.emit_clause.clone(),
+                    qp.window_config.clone(),
+                    qp.order_config.clone(),
+                ),
                 _ => (emit_clause.cloned(), None, None),
             }
         };
@@ -1119,10 +1120,7 @@ impl LaminarDB {
     }
 
     /// Handle SET statement — stores session properties.
-    fn handle_set(
-        &self,
-        set_stmt: &sqlparser::ast::Set,
-    ) -> Result<ExecuteResult, DbError> {
+    fn handle_set(&self, set_stmt: &sqlparser::ast::Set) -> Result<ExecuteResult, DbError> {
         use sqlparser::ast::Set;
         match set_stmt {
             Set::SingleAssignment {
@@ -2077,16 +2075,16 @@ impl LaminarDB {
                     let extractor =
                         laminar_core::time::EventTimeExtractor::from_column(col, format)
                             .with_mode(laminar_core::time::ExtractionMode::Max);
-                    let generator: Box<dyn laminar_core::time::WatermarkGenerator> =
-                        if entry.is_processing_time.load(std::sync::atomic::Ordering::Relaxed) {
-                            Box::new(laminar_core::time::ProcessingTimeGenerator::new())
-                        } else {
-                            Box::new(
-                                laminar_core::time::BoundedOutOfOrdernessGenerator::from_duration(
-                                    dur,
-                                ),
-                            )
-                        };
+                    let generator: Box<dyn laminar_core::time::WatermarkGenerator> = if entry
+                        .is_processing_time
+                        .load(std::sync::atomic::Ordering::Relaxed)
+                    {
+                        Box::new(laminar_core::time::ProcessingTimeGenerator::new())
+                    } else {
+                        Box::new(
+                            laminar_core::time::BoundedOutOfOrdernessGenerator::from_duration(dur),
+                        )
+                    };
                     let id = source_ids.len();
                     source_ids.insert(name.clone(), id);
                     watermark_states.insert(
@@ -2115,16 +2113,18 @@ impl LaminarDB {
                     let extractor =
                         laminar_core::time::EventTimeExtractor::from_column(&col, format)
                             .with_mode(laminar_core::time::ExtractionMode::Max);
-                    let generator: Box<dyn laminar_core::time::WatermarkGenerator> =
-                        if entry.is_processing_time.load(std::sync::atomic::Ordering::Relaxed) {
-                            Box::new(laminar_core::time::ProcessingTimeGenerator::new())
-                        } else {
-                            Box::new(
-                                laminar_core::time::BoundedOutOfOrdernessGenerator::from_duration(
-                                    std::time::Duration::ZERO,
-                                ),
-                            )
-                        };
+                    let generator: Box<dyn laminar_core::time::WatermarkGenerator> = if entry
+                        .is_processing_time
+                        .load(std::sync::atomic::Ordering::Relaxed)
+                    {
+                        Box::new(laminar_core::time::ProcessingTimeGenerator::new())
+                    } else {
+                        Box::new(
+                            laminar_core::time::BoundedOutOfOrdernessGenerator::from_duration(
+                                std::time::Duration::ZERO,
+                            ),
+                        )
+                    };
                     let id = source_ids.len();
                     source_ids.insert(name.clone(), id);
                     watermark_states.insert(
@@ -2554,16 +2554,16 @@ impl LaminarDB {
                     let extractor =
                         laminar_core::time::EventTimeExtractor::from_column(col, format)
                             .with_mode(laminar_core::time::ExtractionMode::Max);
-                    let generator: Box<dyn laminar_core::time::WatermarkGenerator> =
-                        if entry.is_processing_time.load(std::sync::atomic::Ordering::Relaxed) {
-                            Box::new(laminar_core::time::ProcessingTimeGenerator::new())
-                        } else {
-                            Box::new(
-                                laminar_core::time::BoundedOutOfOrdernessGenerator::from_duration(
-                                    dur,
-                                ),
-                            )
-                        };
+                    let generator: Box<dyn laminar_core::time::WatermarkGenerator> = if entry
+                        .is_processing_time
+                        .load(std::sync::atomic::Ordering::Relaxed)
+                    {
+                        Box::new(laminar_core::time::ProcessingTimeGenerator::new())
+                    } else {
+                        Box::new(
+                            laminar_core::time::BoundedOutOfOrdernessGenerator::from_duration(dur),
+                        )
+                    };
                     let id = source_ids.len();
                     source_ids.insert(name.clone(), id);
                     watermark_states.insert(
@@ -2592,16 +2592,18 @@ impl LaminarDB {
                     let extractor =
                         laminar_core::time::EventTimeExtractor::from_column(&col, format)
                             .with_mode(laminar_core::time::ExtractionMode::Max);
-                    let generator: Box<dyn laminar_core::time::WatermarkGenerator> =
-                        if entry.is_processing_time.load(std::sync::atomic::Ordering::Relaxed) {
-                            Box::new(laminar_core::time::ProcessingTimeGenerator::new())
-                        } else {
-                            Box::new(
-                                laminar_core::time::BoundedOutOfOrdernessGenerator::from_duration(
-                                    std::time::Duration::ZERO,
-                                ),
-                            )
-                        };
+                    let generator: Box<dyn laminar_core::time::WatermarkGenerator> = if entry
+                        .is_processing_time
+                        .load(std::sync::atomic::Ordering::Relaxed)
+                    {
+                        Box::new(laminar_core::time::ProcessingTimeGenerator::new())
+                    } else {
+                        Box::new(
+                            laminar_core::time::BoundedOutOfOrdernessGenerator::from_duration(
+                                std::time::Duration::ZERO,
+                            ),
+                        )
+                    };
                     let id = source_ids.len();
                     source_ids.insert(name.clone(), id);
                     watermark_states.insert(
@@ -3351,9 +3353,11 @@ impl LaminarDB {
                 if_not_exists: false,
             };
             match planner.plan(&stmt) {
-                Ok(laminar_sql::planner::StreamingPlan::Query(ref qp)) => {
-                    (qp.emit_clause.clone(), qp.window_config.clone(), qp.order_config.clone())
-                }
+                Ok(laminar_sql::planner::StreamingPlan::Query(ref qp)) => (
+                    qp.emit_clause.clone(),
+                    qp.window_config.clone(),
+                    qp.order_config.clone(),
+                ),
                 _ => (None, None, None),
             }
         };
@@ -3398,7 +3402,10 @@ impl LaminarDB {
 
             match result {
                 Ok(views) => {
-                    dropped_names = views.into_iter().map(|v| v.name.clone()).collect::<Vec<_>>();
+                    dropped_names = views
+                        .into_iter()
+                        .map(|v| v.name.clone())
+                        .collect::<Vec<_>>();
                 }
                 Err(_) if if_exists => {
                     dropped_names = vec![];

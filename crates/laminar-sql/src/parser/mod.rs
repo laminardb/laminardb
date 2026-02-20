@@ -192,8 +192,7 @@ impl StreamingParser {
             StreamingDdlKind::AlterSource => {
                 let mut parser =
                     sqlparser::parser::Parser::new(&dialect).with_tokens_with_locations(tokens);
-                let stmt =
-                    parse_alter_source(&mut parser).map_err(parse_error_to_parser_error)?;
+                let stmt = parse_alter_source(&mut parser).map_err(parse_error_to_parser_error)?;
                 Ok(vec![stmt])
             }
             StreamingDdlKind::None => {
@@ -510,7 +509,9 @@ fn parse_alter_source(
         let col_name = parser
             .parse_identifier()
             .map_err(ParseError::SqlParseError)?;
-        let data_type = parser.parse_data_type().map_err(ParseError::SqlParseError)?;
+        let data_type = parser
+            .parse_data_type()
+            .map_err(ParseError::SqlParseError)?;
         let column_def = sqlparser::ast::ColumnDef {
             name: col_name,
             data_type,
@@ -1233,12 +1234,11 @@ mod tests {
                 match operation {
                     statements::AlterSourceOperation::AddColumn { column_def } => {
                         assert_eq!(column_def.name.value, "new_col");
-                        assert_eq!(
-                            column_def.data_type,
-                            sqlparser::ast::DataType::Int(None)
-                        );
+                        assert_eq!(column_def.data_type, sqlparser::ast::DataType::Int(None));
                     }
-                    _ => panic!("Expected AddColumn"),
+                    statements::AlterSourceOperation::SetProperties { .. } => {
+                        panic!("Expected AddColumn")
+                    }
                 }
             }
             _ => panic!("Expected AlterSource, got {stmt:?}"),
@@ -1256,7 +1256,9 @@ mod tests {
                         assert_eq!(properties.get("batch.size"), Some(&"1000".to_string()));
                         assert_eq!(properties.get("timeout"), Some(&"5s".to_string()));
                     }
-                    _ => panic!("Expected SetProperties"),
+                    statements::AlterSourceOperation::AddColumn { .. } => {
+                        panic!("Expected SetProperties")
+                    }
                 }
             }
             _ => panic!("Expected AlterSource, got {stmt:?}"),

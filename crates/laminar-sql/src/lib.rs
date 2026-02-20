@@ -76,8 +76,7 @@ impl std::fmt::Display for Error {
             Self::ParseError(e) => write!(f, "SQL parse error: {e}"),
             Self::PlanningError(e) => write!(f, "Planning error: {e}"),
             Self::DataFusionError(e) => {
-                let translated =
-                    error::translate_datafusion_error(&e.to_string());
+                let translated = error::translate_datafusion_error(&e.to_string());
                 write!(f, "{translated}")
             }
             Self::UnsupportedFeature(msg) => {

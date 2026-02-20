@@ -133,10 +133,8 @@ mod tests {
     #[test]
     fn test_cumulate_first_step() {
         // step=1min, size=5min
-        let assigner = CumulateWindowAssigner::new(
-            Duration::from_secs(60),
-            Duration::from_secs(300),
-        );
+        let assigner =
+            CumulateWindowAssigner::new(Duration::from_secs(60), Duration::from_secs(300));
 
         // Event at 30s → in first step, should get 5 windows
         let windows = assigner.assign_windows(30_000);
@@ -150,10 +148,8 @@ mod tests {
 
     #[test]
     fn test_cumulate_middle_step() {
-        let assigner = CumulateWindowAssigner::new(
-            Duration::from_secs(60),
-            Duration::from_secs(300),
-        );
+        let assigner =
+            CumulateWindowAssigner::new(Duration::from_secs(60), Duration::from_secs(300));
 
         // Event at 90s → in second step (index 1), should get 4 windows
         let windows = assigner.assign_windows(90_000);
@@ -166,10 +162,8 @@ mod tests {
 
     #[test]
     fn test_cumulate_last_step() {
-        let assigner = CumulateWindowAssigner::new(
-            Duration::from_secs(60),
-            Duration::from_secs(300),
-        );
+        let assigner =
+            CumulateWindowAssigner::new(Duration::from_secs(60), Duration::from_secs(300));
 
         // Event at 270s → in last step (index 4), should get 1 window
         let windows = assigner.assign_windows(270_000);
@@ -179,10 +173,8 @@ mod tests {
 
     #[test]
     fn test_cumulate_epoch_boundary() {
-        let assigner = CumulateWindowAssigner::new(
-            Duration::from_secs(60),
-            Duration::from_secs(300),
-        );
+        let assigner =
+            CumulateWindowAssigner::new(Duration::from_secs(60), Duration::from_secs(300));
 
         // Event at exactly 300s → starts a new epoch
         let windows = assigner.assign_windows(300_000);
@@ -193,10 +185,8 @@ mod tests {
 
     #[test]
     fn test_cumulate_multiple_epochs() {
-        let assigner = CumulateWindowAssigner::new(
-            Duration::from_secs(60),
-            Duration::from_secs(300),
-        );
+        let assigner =
+            CumulateWindowAssigner::new(Duration::from_secs(60), Duration::from_secs(300));
 
         // Event at 620s (epoch 2, offset 20s → step 0)
         let windows = assigner.assign_windows(620_000);
@@ -223,10 +213,8 @@ mod tests {
     #[test]
     fn test_cumulate_step_equals_size() {
         // Degenerate case: step == size → same as tumbling
-        let assigner = CumulateWindowAssigner::new(
-            Duration::from_secs(300),
-            Duration::from_secs(300),
-        );
+        let assigner =
+            CumulateWindowAssigner::new(Duration::from_secs(300), Duration::from_secs(300));
 
         let windows = assigner.assign_windows(30_000);
         assert_eq!(windows.len(), 1);
@@ -236,24 +224,24 @@ mod tests {
     #[test]
     #[should_panic(expected = "Step must be positive")]
     fn test_cumulate_zero_step_panics() {
-        CumulateWindowAssigner::from_millis(0, 300_000);
+        let _ = CumulateWindowAssigner::from_millis(0, 300_000);
     }
 
     #[test]
     #[should_panic(expected = "Size must be positive")]
     fn test_cumulate_zero_size_panics() {
-        CumulateWindowAssigner::from_millis(60_000, 0);
+        let _ = CumulateWindowAssigner::from_millis(60_000, 0);
     }
 
     #[test]
     #[should_panic(expected = "Step must not exceed size")]
     fn test_cumulate_step_exceeds_size_panics() {
-        CumulateWindowAssigner::from_millis(600_000, 300_000);
+        let _ = CumulateWindowAssigner::from_millis(600_000, 300_000);
     }
 
     #[test]
     #[should_panic(expected = "evenly divisible")]
     fn test_cumulate_not_divisible_panics() {
-        CumulateWindowAssigner::from_millis(70_000, 300_000);
+        let _ = CumulateWindowAssigner::from_millis(70_000, 300_000);
     }
 }

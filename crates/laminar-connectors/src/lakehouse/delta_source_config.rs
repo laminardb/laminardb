@@ -14,6 +14,8 @@ use crate::storage::{
     StorageProvider,
 };
 
+use super::delta_config::DeltaCatalogType;
+
 /// Configuration for the Delta Lake source connector.
 ///
 /// Parsed from SQL `WITH (...)` clause options or constructed programmatically.
@@ -30,6 +32,21 @@ pub struct DeltaSourceConfig {
 
     /// Storage options (S3 credentials, Azure keys, etc.).
     pub storage_options: HashMap<String, String>,
+
+    /// Catalog type for table discovery.
+    pub catalog_type: DeltaCatalogType,
+
+    /// Catalog database name (required for Glue).
+    pub catalog_database: Option<String>,
+
+    /// Catalog name (required for Unity).
+    pub catalog_name: Option<String>,
+
+    /// Catalog schema name (required for Unity).
+    pub catalog_schema: Option<String>,
+
+    /// Additional catalog-specific properties.
+    pub catalog_properties: HashMap<String, String>,
 }
 
 impl Default for DeltaSourceConfig {
@@ -39,6 +56,11 @@ impl Default for DeltaSourceConfig {
             starting_version: None,
             poll_interval: Duration::from_millis(1000),
             storage_options: HashMap::new(),
+            catalog_type: DeltaCatalogType::None,
+            catalog_database: None,
+            catalog_name: None,
+            catalog_schema: None,
+            catalog_properties: HashMap::new(),
         }
     }
 }
@@ -81,6 +103,37 @@ impl DeltaSourceConfig {
             cfg.poll_interval = Duration::from_millis(ms);
         }
 
+        // ── Catalog configuration ──
+        if let Some(v) = config.get("catalog.type") {
+            cfg.catalog_type = v.parse().map_err(|_| {
+                ConnectorError::ConfigurationError(format!(
+                    "invalid catalog.type: '{v}' (expected 'none', 'glue', or 'unity')"
+                ))
+            })?;
+        }
+        if let Some(v) = config.get("catalog.database") {
+            cfg.catalog_database = Some(v.to_string());
+        }
+        if let Some(v) = config.get("catalog.name") {
+            cfg.catalog_name = Some(v.to_string());
+        }
+        if let Some(v) = config.get("catalog.schema") {
+            cfg.catalog_schema = Some(v.to_string());
+        }
+        if let DeltaCatalogType::Unity {
+            ref mut workspace_url,
+            ref mut access_token,
+        } = cfg.catalog_type
+        {
+            if let Some(v) = config.get("catalog.workspace_url") {
+                *workspace_url = v.to_string();
+            }
+            if let Some(v) = config.get("catalog.access_token") {
+                *access_token = v.to_string();
+            }
+        }
+        cfg.catalog_properties = config.properties_with_prefix("catalog.prop.");
+
         // Resolve storage credentials.
         let explicit_storage = config.properties_with_prefix("storage.");
         let resolved = StorageCredentialResolver::resolve(&cfg.table_path, &explicit_storage);
@@ -104,6 +157,43 @@ impl DeltaSourceConfig {
     pub fn validate(&self) -> Result<(), ConnectorError> {
         if self.table_path.is_empty() {
             return Err(ConnectorError::MissingConfig("table.path".into()));
+        }
+
+        // Validate catalog-specific requirements.
+        match &self.catalog_type {
+            DeltaCatalogType::None => {}
+            DeltaCatalogType::Glue => {
+                if self.catalog_database.is_none() {
+                    return Err(ConnectorError::ConfigurationError(
+                        "Glue catalog requires 'catalog.database' to be set".into(),
+                    ));
+                }
+            }
+            DeltaCatalogType::Unity {
+                workspace_url,
+                access_token,
+            } => {
+                if workspace_url.is_empty() {
+                    return Err(ConnectorError::ConfigurationError(
+                        "Unity catalog requires 'catalog.workspace_url' to be set".into(),
+                    ));
+                }
+                if access_token.is_empty() {
+                    return Err(ConnectorError::ConfigurationError(
+                        "Unity catalog requires 'catalog.access_token' to be set".into(),
+                    ));
+                }
+                if self.catalog_name.is_none() {
+                    return Err(ConnectorError::ConfigurationError(
+                        "Unity catalog requires 'catalog.name' to be set".into(),
+                    ));
+                }
+                if self.catalog_schema.is_none() {
+                    return Err(ConnectorError::ConfigurationError(
+                        "Unity catalog requires 'catalog.schema' to be set".into(),
+                    ));
+                }
+            }
         }
 
         // Validate cloud storage credentials for the detected provider.

@@ -56,17 +56,19 @@ pub async fn register_delta_table(
 ) -> Result<(), ConnectorError> {
     use super::delta_io;
 
-    info!(name, table_uri, "registering Delta Lake table as TableProvider");
+    info!(
+        name,
+        table_uri, "registering Delta Lake table as TableProvider"
+    );
 
     // Open the existing table.
     let table = delta_io::open_or_create_table(table_uri, storage_options, None).await?;
 
     // Build a DeltaTableProvider (which implements TableProvider) from the table.
-    let provider = table
-        .table_provider()
-        .build()
-        .await
-        .map_err(|e| ConnectorError::Internal(format!("failed to build table provider: {e}")))?;
+    let provider =
+        table.table_provider().build().await.map_err(|e| {
+            ConnectorError::Internal(format!("failed to build table provider: {e}"))
+        })?;
 
     ctx.register_table(name, Arc::new(provider)).map_err(|e| {
         ConnectorError::Internal(format!("failed to register Delta table '{name}': {e}"))
@@ -131,6 +133,7 @@ mod tests {
             1,
             SaveMode::Append,
             None,
+            false,
         )
         .await
         .unwrap();
@@ -142,7 +145,10 @@ mod tests {
             .await
             .unwrap();
 
-        let df = ctx.sql("SELECT COUNT(*) AS cnt FROM test_delta").await.unwrap();
+        let df = ctx
+            .sql("SELECT COUNT(*) AS cnt FROM test_delta")
+            .await
+            .unwrap();
         let results = df.collect().await.unwrap();
 
         assert_eq!(results.len(), 1);
