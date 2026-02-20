@@ -25,6 +25,9 @@
 use std::collections::HashMap;
 
 #[cfg(feature = "delta-lake")]
+use std::sync::Arc;
+
+#[cfg(feature = "delta-lake")]
 use arrow_array::RecordBatch;
 
 #[cfg(feature = "delta-lake")]
@@ -319,6 +322,87 @@ pub fn get_table_schema(table: &DeltaTable) -> Result<SchemaRef, ConnectorError>
     Ok(state.snapshot().arrow_schema())
 }
 
+/// Returns the latest committed version of a Delta Lake table.
+///
+/// This refreshes the table state from storage before checking.
+///
+/// # Errors
+///
+/// Returns `ConnectorError::ReadError` if the table state cannot be refreshed.
+#[cfg(feature = "delta-lake")]
+pub async fn get_latest_version(table: &mut DeltaTable) -> Result<i64, ConnectorError> {
+    // DeltaTable::update() takes ownership, so clone and replace.
+    let (updated, _metrics) = table
+        .clone()
+        .update()
+        .await
+        .map_err(|e| ConnectorError::ReadError(format!("failed to refresh Delta table: {e}")))?;
+
+    *table = updated;
+    Ok(table.version().unwrap_or(0))
+}
+
+/// Reads record batches from a specific Delta Lake table version.
+///
+/// Loads the requested version, then executes a full scan to collect
+/// all record batches using a table provider registered with `DataFusion`.
+///
+/// # Arguments
+///
+/// * `table` - Mutable reference to the Delta Lake table handle
+/// * `version` - The table version to read
+/// * `max_records` - Hint for maximum records to return (best-effort)
+///
+/// # Errors
+///
+/// Returns `ConnectorError::ReadError` if the version cannot be loaded or scanned.
+#[cfg(feature = "delta-lake")]
+pub async fn read_batches_at_version(
+    table: &mut DeltaTable,
+    version: i64,
+    _max_records: usize,
+) -> Result<Vec<RecordBatch>, ConnectorError> {
+    use datafusion::prelude::SessionContext;
+
+    // Load the specific version.
+    table
+        .load_version(version)
+        .await
+        .map_err(|e| ConnectorError::ReadError(format!("failed to load version {version}: {e}")))?;
+
+    debug!(version, "Delta Lake: loaded version for reading");
+
+    // Build a DeltaTableProvider via the builder and register it with DataFusion.
+    let provider = table
+        .table_provider()
+        .build()
+        .await
+        .map_err(|e| ConnectorError::ReadError(format!("failed to build table provider: {e}")))?;
+
+    let ctx = SessionContext::new();
+    ctx.register_table("delta_source_scan", Arc::new(provider))
+        .map_err(|e| ConnectorError::ReadError(format!("failed to register scan table: {e}")))?;
+
+    let df = ctx
+        .sql("SELECT * FROM delta_source_scan")
+        .await
+        .map_err(|e| ConnectorError::ReadError(format!("scan query failed: {e}")))?;
+
+    let batches = df
+        .collect()
+        .await
+        .map_err(|e| ConnectorError::ReadError(format!("scan execution failed: {e}")))?;
+
+    debug!(
+        version,
+        num_batches = batches.len(),
+        total_rows = batches.iter().map(RecordBatch::num_rows).sum::<usize>(),
+        "Delta Lake: scanned version"
+    );
+
+    Ok(batches)
+}
+
 // ============================================================================
 // Integration tests (require delta-lake feature)
 // ============================================================================
@@ -610,5 +694,290 @@ mod tests {
     fn test_path_to_url_gcs() {
         let url = path_to_url("gs://my-bucket/path/to/table").unwrap();
         assert_eq!(url.scheme(), "gs");
+    }
+
+    // ── End-to-end tests for new functionality ──
+
+    #[tokio::test]
+    async fn test_get_latest_version() {
+        let temp_dir = TempDir::new().unwrap();
+        let table_path = temp_dir.path().to_str().unwrap();
+
+        let schema = test_schema();
+        let mut table = open_or_create_table(table_path, HashMap::new(), Some(&schema))
+            .await
+            .unwrap();
+
+        // Initial version is 0.
+        let v = get_latest_version(&mut table).await.unwrap();
+        assert_eq!(v, 0);
+
+        // Write a batch -> version 1.
+        let batch = test_batch(10);
+        let (returned_table, version) =
+            write_batches(table, vec![batch], "writer", 1, SaveMode::Append, None)
+                .await
+                .unwrap();
+        assert_eq!(version, 1);
+        table = returned_table;
+
+        let v = get_latest_version(&mut table).await.unwrap();
+        assert_eq!(v, 1);
+    }
+
+    #[tokio::test]
+    async fn test_read_batches_at_version() {
+        let temp_dir = TempDir::new().unwrap();
+        let table_path = temp_dir.path().to_str().unwrap();
+
+        let schema = test_schema();
+        let table = open_or_create_table(table_path, HashMap::new(), Some(&schema))
+            .await
+            .unwrap();
+
+        // Write 50 rows at version 1.
+        let batch = test_batch(50);
+        let (table, _) =
+            write_batches(table, vec![batch], "writer", 1, SaveMode::Append, None)
+                .await
+                .unwrap();
+
+        // Write 30 more rows at version 2.
+        let batch = test_batch(30);
+        let (_table, _) =
+            write_batches(table, vec![batch], "writer", 2, SaveMode::Append, None)
+                .await
+                .unwrap();
+
+        // Read version 1 — should get 50 rows.
+        let mut read_table = open_or_create_table(table_path, HashMap::new(), None)
+            .await
+            .unwrap();
+        let batches = read_batches_at_version(&mut read_table, 1, 10000).await.unwrap();
+        let total_rows: usize = batches.iter().map(|b| b.num_rows()).sum();
+        assert_eq!(total_rows, 50);
+
+        // Read version 2 — should get 80 rows (cumulative).
+        let batches = read_batches_at_version(&mut read_table, 2, 10000).await.unwrap();
+        let total_rows: usize = batches.iter().map(|b| b.num_rows()).sum();
+        assert_eq!(total_rows, 80);
+    }
+
+    #[tokio::test]
+    async fn test_sink_source_roundtrip() {
+        use super::super::delta::DeltaLakeSink;
+        use super::super::delta_config::DeltaLakeSinkConfig;
+        use super::super::delta_source::DeltaSource;
+        use super::super::delta_source_config::DeltaSourceConfig;
+        use crate::config::ConnectorConfig;
+        use crate::connector::{SinkConnector, SourceConnector};
+
+        let temp_dir = TempDir::new().unwrap();
+        let table_path = temp_dir.path().to_str().unwrap();
+
+        // Write data via sink.
+        let sink_config = DeltaLakeSinkConfig::new(table_path);
+        let mut sink = DeltaLakeSink::with_schema(sink_config, test_schema());
+        let connector_config = ConnectorConfig::new("delta-lake");
+        sink.open(&connector_config).await.unwrap();
+
+        sink.begin_epoch(1).await.unwrap();
+        let batch = test_batch(25);
+        sink.write_batch(&batch).await.unwrap();
+        sink.pre_commit(1).await.unwrap();
+        sink.commit_epoch(1).await.unwrap();
+        sink.close().await.unwrap();
+
+        // Read data via source.
+        let mut source_config = DeltaSourceConfig::new(table_path);
+        source_config.starting_version = Some(0);
+        let mut source = DeltaSource::new(source_config);
+        let source_connector_config = ConnectorConfig::new("delta-lake");
+        source.open(&source_connector_config).await.unwrap();
+
+        // Poll — should get version 1 data (25 rows).
+        let result = source.poll_batch(10000).await.unwrap();
+        assert!(result.is_some(), "should have received a batch");
+        let total_rows: usize = {
+            let mut rows = result.unwrap().records.num_rows();
+            // Drain any remaining buffered batches.
+            while let Ok(Some(batch)) = source.poll_batch(10000).await {
+                rows += batch.records.num_rows();
+            }
+            rows
+        };
+        assert_eq!(total_rows, 25);
+
+        source.close().await.unwrap();
+    }
+
+    #[tokio::test]
+    async fn test_source_checkpoint_restore() {
+        use super::super::delta_source::DeltaSource;
+        use super::super::delta_source_config::DeltaSourceConfig;
+        use crate::checkpoint::SourceCheckpoint;
+        use crate::config::ConnectorConfig;
+        use crate::connector::SourceConnector;
+
+        let temp_dir = TempDir::new().unwrap();
+        let table_path = temp_dir.path().to_str().unwrap();
+
+        // Create table and write 2 versions.
+        let schema = test_schema();
+        let table = open_or_create_table(table_path, HashMap::new(), Some(&schema))
+            .await
+            .unwrap();
+
+        let (table, _) = write_batches(
+            table,
+            vec![test_batch(10)],
+            "writer",
+            1,
+            SaveMode::Append,
+            None,
+        )
+        .await
+        .unwrap();
+        let (_table, _) = write_batches(
+            table,
+            vec![test_batch(20)],
+            "writer",
+            2,
+            SaveMode::Append,
+            None,
+        )
+        .await
+        .unwrap();
+
+        // Open source starting from version 0, read version 1.
+        let mut source_config = DeltaSourceConfig::new(table_path);
+        source_config.starting_version = Some(0);
+        let mut source = DeltaSource::new(source_config.clone());
+        let connector_config = ConnectorConfig::new("delta-lake");
+        source.open(&connector_config).await.unwrap();
+
+        // Poll to consume version 1.
+        let _ = source.poll_batch(10000).await.unwrap();
+        // Drain buffered.
+        while let Ok(Some(_)) = source.poll_batch(10000).await {}
+
+        // Checkpoint.
+        let cp = source.checkpoint();
+        assert_eq!(cp.get_offset("delta_version"), Some("1"));
+        source.close().await.unwrap();
+
+        // Restore from checkpoint — should resume at version 1.
+        let mut source2 = DeltaSource::new(source_config);
+        source2.open(&connector_config).await.unwrap();
+        source2.restore(&cp).await.unwrap();
+
+        assert_eq!(source2.current_version(), 1);
+
+        // Next poll should get version 2.
+        let result = source2.poll_batch(10000).await.unwrap();
+        assert!(result.is_some());
+        let mut total = result.unwrap().records.num_rows();
+        while let Ok(Some(batch)) = source2.poll_batch(10000).await {
+            total += batch.records.num_rows();
+        }
+        // Version 2 has cumulative 30 rows (10 + 20).
+        assert_eq!(total, 30);
+
+        source2.close().await.unwrap();
+    }
+
+    #[tokio::test]
+    async fn test_auto_flush_writes_data() {
+        use super::super::delta::DeltaLakeSink;
+        use super::super::delta_config::DeltaLakeSinkConfig;
+        use crate::config::ConnectorConfig;
+        use crate::connector::SinkConnector;
+
+        let temp_dir = TempDir::new().unwrap();
+        let table_path = temp_dir.path().to_str().unwrap();
+
+        // Configure a small buffer to trigger auto-flush.
+        let mut sink_config = DeltaLakeSinkConfig::new(table_path);
+        sink_config.max_buffer_records = 10;
+        let mut sink = DeltaLakeSink::with_schema(sink_config, test_schema());
+
+        let connector_config = ConnectorConfig::new("delta-lake");
+        sink.open(&connector_config).await.unwrap();
+
+        sink.begin_epoch(1).await.unwrap();
+
+        // Write 25 rows — should trigger auto-flush after 10.
+        let batch = test_batch(25);
+        sink.write_batch(&batch).await.unwrap();
+
+        // Commit the rest.
+        sink.pre_commit(1).await.unwrap();
+        sink.commit_epoch(1).await.unwrap();
+        sink.close().await.unwrap();
+
+        // Verify all 25 rows are in the Delta table.
+        let mut table = open_or_create_table(table_path, HashMap::new(), None)
+            .await
+            .unwrap();
+        let latest = get_latest_version(&mut table).await.unwrap();
+        assert!(latest >= 1, "should have at least 1 version");
+
+        let batches = read_batches_at_version(&mut table, latest, 10000)
+            .await
+            .unwrap();
+        let total_rows: usize = batches.iter().map(|b| b.num_rows()).sum();
+        assert_eq!(total_rows, 25, "all 25 rows should be written, not dropped by auto-flush");
+    }
+
+    #[tokio::test]
+    async fn test_sink_exactly_once_epoch() {
+        let temp_dir = TempDir::new().unwrap();
+        let table_path = temp_dir.path().to_str().unwrap();
+        let writer_id = "exactly-once-test";
+
+        let schema = test_schema();
+        let table = open_or_create_table(table_path, HashMap::new(), Some(&schema))
+            .await
+            .unwrap();
+
+        // Write epoch 1 with 10 rows.
+        let (table, v1) = write_batches(
+            table,
+            vec![test_batch(10)],
+            writer_id,
+            1,
+            SaveMode::Append,
+            None,
+        )
+        .await
+        .unwrap();
+        assert_eq!(v1, 1);
+
+        // Write epoch 2 with 15 rows using the same writer.
+        let (table, v2) = write_batches(
+            table,
+            vec![test_batch(15)],
+            writer_id,
+            2,
+            SaveMode::Append,
+            None,
+        )
+        .await
+        .unwrap();
+        assert_eq!(v2, 2);
+
+        // Verify the last committed epoch is 2.
+        let last_epoch = get_last_committed_epoch(&table, writer_id).await;
+        assert_eq!(last_epoch, 2);
+
+        // Verify total rows = 25 (10 + 15).
+        let mut read_table = open_or_create_table(table_path, HashMap::new(), None)
+            .await
+            .unwrap();
+        let batches = read_batches_at_version(&mut read_table, 2, 10000)
+            .await
+            .unwrap();
+        let total_rows: usize = batches.iter().map(|b| b.num_rows()).sum();
+        assert_eq!(total_rows, 25);
     }
 }

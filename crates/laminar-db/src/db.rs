@@ -237,6 +237,11 @@ impl LaminarDB {
         {
             laminar_connectors::postgres::register_postgres_sink(registry);
         }
+        #[cfg(feature = "delta-lake")]
+        {
+            laminar_connectors::lakehouse::register_delta_lake_sink(registry);
+            laminar_connectors::lakehouse::register_delta_lake_source(registry);
+        }
     }
 
     /// Returns the connector registry for registering custom connectors.
@@ -260,6 +265,39 @@ impl LaminarDB {
     /// Called by `LaminarDbBuilder::build()` after construction.
     pub(crate) fn register_custom_udaf(&self, udaf: datafusion_expr::AggregateUDF) {
         self.ctx.register_udaf(udaf);
+    }
+
+    /// Registers a Delta Lake table as a `DataFusion` `TableProvider`.
+    ///
+    /// After registration, the table can be queried via SQL:
+    /// ```sql
+    /// SELECT * FROM my_delta_table WHERE id > 100
+    /// ```
+    ///
+    /// # Arguments
+    ///
+    /// * `name` - SQL table name (e.g., `"trades"`)
+    /// * `table_uri` - Path to the Delta Lake table (local, `s3://`, `az://`, `gs://`)
+    /// * `storage_options` - Storage credentials and configuration
+    ///
+    /// # Errors
+    ///
+    /// Returns `DbError` if the table cannot be opened or registered.
+    #[cfg(feature = "delta-lake")]
+    pub async fn register_delta_table(
+        &self,
+        name: &str,
+        table_uri: &str,
+        storage_options: std::collections::HashMap<String, String>,
+    ) -> Result<(), DbError> {
+        laminar_connectors::lakehouse::delta_table_provider::register_delta_table(
+            &self.ctx,
+            name,
+            table_uri,
+            storage_options,
+        )
+        .await
+        .map_err(|e| DbError::Connector(e.to_string()))
     }
 
     /// Execute a SQL statement.
@@ -4330,6 +4368,11 @@ mod tests {
         #[cfg(feature = "postgres-sink")]
         {
             expected_sinks += 1; // postgres sink
+        }
+        #[cfg(feature = "delta-lake")]
+        {
+            expected_sources += 1; // delta-lake source
+            expected_sinks += 1; // delta-lake sink
         }
 
         assert_eq!(registry.list_sources().len(), expected_sources);

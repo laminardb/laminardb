@@ -199,6 +199,7 @@ impl DeltaLakeSink {
     /// Flushes the internal buffer (updates metrics; actual Parquet write
     /// happens via the `deltalake` crate when the `delta-lake` feature is
     /// enabled).
+    #[cfg(not(feature = "delta-lake"))]
     fn flush_buffer_local(&mut self) -> WriteResult {
         let total_rows = self.buffered_rows;
         let estimated_bytes: u64 = self
@@ -471,8 +472,16 @@ impl SinkConnector for DeltaLakeSink {
 
         // Flush if buffer threshold reached.
         if self.should_flush() {
-            let result = self.flush_buffer_local();
-            return Ok(result);
+            #[cfg(feature = "delta-lake")]
+            {
+                self.flush_buffer_to_delta().await?;
+                return Ok(WriteResult::new(0, 0));
+            }
+            #[cfg(not(feature = "delta-lake"))]
+            {
+                let result = self.flush_buffer_local();
+                return Ok(result);
+            }
         }
 
         Ok(WriteResult::new(0, 0))
@@ -853,6 +862,10 @@ mod tests {
         assert!(sink.buffered_bytes() > 0);
     }
 
+    // When delta-lake feature is enabled, auto-flush calls flush_buffer_to_delta()
+    // which requires an actual table. See delta_io::tests::test_auto_flush_writes_data
+    // for the real I/O integration test.
+    #[cfg(not(feature = "delta-lake"))]
     #[tokio::test]
     async fn test_write_batch_auto_flush() {
         let mut config = test_config();
@@ -1225,6 +1238,9 @@ mod tests {
         assert_eq!(m.errors_total, 0);
     }
 
+    // When delta-lake feature is enabled, this triggers auto-flush which
+    // needs a real table. See delta_io::tests for integration coverage.
+    #[cfg(not(feature = "delta-lake"))]
     #[tokio::test]
     async fn test_metrics_after_writes() {
         let mut config = test_config();
