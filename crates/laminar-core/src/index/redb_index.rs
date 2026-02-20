@@ -7,7 +7,7 @@ use std::sync::Arc;
 
 use arrow::array::{Array, AsArray};
 use arrow::datatypes::DataType;
-use redb::{Database, ReadableTable, TableDefinition};
+use redb::{Database, ReadableDatabase, ReadableTable, TableDefinition};
 
 use super::encoding::encode_comparable;
 use crate::lookup::ScalarValue;

@@ -15,7 +15,7 @@ members = [
 resolver = "2"
 
 [workspace.package]
-version = "0.13.1"
+version = "0.15.0"
 authors = ["LaminarDB Contributors"]
 edition = "2021"
 rust-version = "1.85"
@@ -50,7 +50,7 @@ bumpalo = "3.19"  # Arena allocator
 uuid = { version = "1.19", features = ["v4", "v7", "serde"] }  # Unique IDs
 ahash = "0.8"  # Fast hashing for state stores
 papaya = "0.2"  # Lock-free concurrent HashMap
-foyer = { version = "0.20", features = ["serde"] }  # High-performance cache (S3-FIFO eviction, serde for HybridCache)
+foyer = { version = "0.22", features = ["serde"] }  # High-performance cache (S3-FIFO eviction, serde for HybridCache)
 sha2 = "0.10"  # SHA-256 for checkpoint integrity
 backoff = { version = "0.4", features = ["tokio"] }  # Exponential backoff retry
 
@@ -89,7 +89,7 @@ xorf = "0.12"
 base64 = "0.22"
 
 # Randomness
-rand = "0.9"
+rand = "0.10"
 
 # JIT compilation (Cranelift)
 cranelift-codegen = "0.128"
@@ -99,16 +99,17 @@ cranelift-module = "0.128"
 cranelift-native = "0.128"
 
 # Embedded key-value (secondary indexes)
-redb = "2"
+redb = "3"
 
 # Constellation (distributed mode)
-tonic = "0.13"
-prost = "0.13"
-tonic-build = "0.13"
-prost-build = "0.13"
+tonic = "0.14"
+tonic-prost = "0.14"
+prost = "0.14"
+tonic-build = "0.14"
+tonic-prost-build = "0.14"
+prost-build = "0.14"
 openraft = { version = "0.9", features = ["serde"] }
 chitchat = "0.10"
-bincode = { version = "2", features = ["serde"] }
 tokio-util = { version = "0.7", features = ["rt"] }
 xxhash-rust = { version = "0.8", features = ["xxh3"] }
 

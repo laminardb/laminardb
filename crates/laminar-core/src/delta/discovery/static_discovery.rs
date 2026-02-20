@@ -91,15 +91,15 @@ impl StaticDiscovery {
 
     /// Serialize a `NodeInfo` for transmission.
     fn serialize_node_info(info: &NodeInfo) -> Result<Vec<u8>, DiscoveryError> {
-        bincode::serde::encode_to_vec(info, bincode::config::standard())
+        rkyv::to_bytes::<rkyv::rancor::Error>(info)
+            .map(|v| v.to_vec())
             .map_err(|e| DiscoveryError::Serialization(e.to_string()))
     }
 
     /// Deserialize a `NodeInfo` from received bytes.
     fn deserialize_node_info(data: &[u8]) -> Result<NodeInfo, DiscoveryError> {
-        let (info, _) = bincode::serde::decode_from_slice(data, bincode::config::standard())
-            .map_err(|e| DiscoveryError::Serialization(e.to_string()))?;
-        Ok(info)
+        rkyv::from_bytes::<NodeInfo, rkyv::rancor::Error>(data)
+            .map_err(|e| DiscoveryError::Serialization(e.to_string()))
     }
 
     /// Update the membership watch channel from current peer state.

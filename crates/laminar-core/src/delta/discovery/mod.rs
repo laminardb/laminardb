@@ -21,7 +21,19 @@ use serde::{Deserialize, Serialize};
 use tokio::sync::watch;
 
 /// Unique identifier for a node in the delta.
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Serialize, Deserialize)]
+#[derive(
+    Debug,
+    Clone,
+    Copy,
+    PartialEq,
+    Eq,
+    Hash,
+    Serialize,
+    Deserialize,
+    rkyv::Archive,
+    rkyv::Serialize,
+    rkyv::Deserialize,
+)]
 pub struct NodeId(pub u64);
 
 impl NodeId {
@@ -42,7 +54,18 @@ impl fmt::Display for NodeId {
 }
 
 /// Current lifecycle state of a node.
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[derive(
+    Debug,
+    Clone,
+    Copy,
+    PartialEq,
+    Eq,
+    Serialize,
+    Deserialize,
+    rkyv::Archive,
+    rkyv::Serialize,
+    rkyv::Deserialize,
+)]
 pub enum NodeState {
     /// Node is joining the cluster but not yet fully active.
     Joining,
@@ -69,7 +92,9 @@ impl fmt::Display for NodeState {
 }
 
 /// Hardware and deployment metadata for a node.
-#[derive(Debug, Clone, Serialize, Deserialize)]
+#[derive(
+    Debug, Clone, Serialize, Deserialize, rkyv::Archive, rkyv::Serialize, rkyv::Deserialize,
+)]
 pub struct NodeMetadata {
     /// Number of CPU cores available.
     pub cores: u32,
@@ -99,7 +124,9 @@ impl Default for NodeMetadata {
 }
 
 /// Full information about a discovered node.
-#[derive(Debug, Clone, Serialize, Deserialize)]
+#[derive(
+    Debug, Clone, Serialize, Deserialize, rkyv::Archive, rkyv::Serialize, rkyv::Deserialize,
+)]
 pub struct NodeInfo {
     /// The node's unique identifier.
     pub id: NodeId,

@@ -1,7 +1,7 @@
 //! Synthetic market data generator with correlated random-walk prices,
 //! mean-reverting spreads, intraday volume patterns, and L2 order book updates.
 
-use rand::Rng;
+use rand::{Rng, RngExt};
 
 use crate::types::{MarketTick, OrderBookUpdate, OrderEvent};
 

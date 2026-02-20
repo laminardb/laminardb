@@ -29,7 +29,7 @@ use std::time::{Duration, SystemTime, UNIX_EPOCH};
 use bytes::Bytes;
 use equivalent::Equivalent;
 use foyer::{
-    BlockEngineBuilder, Cache, CacheBuilder, DeviceBuilder, FsDeviceBuilder, HybridCache,
+    BlockEngineConfig, Cache, CacheBuilder, DeviceBuilder, FsDeviceBuilder, HybridCache,
     NoopDeviceBuilder,
 };
 use tokio::sync::Semaphore;
@@ -354,7 +354,7 @@ impl<S: LookupSource> LookupCacheHierarchy<S> {
         let hybrid = HybridCache::builder()
             .memory(config.memory_capacity)
             .storage()
-            .with_engine_config(BlockEngineBuilder::new(device))
+            .with_engine_config(BlockEngineConfig::new(device))
             .build()
             .await
             .map_err(|e| LookupError::Internal(format!("hybrid build: {e}")))?;
@@ -390,7 +390,7 @@ impl<S: LookupSource> LookupCacheHierarchy<S> {
         let hybrid = HybridCache::builder()
             .memory(config.memory_capacity)
             .storage()
-            .with_engine_config(BlockEngineBuilder::new(device))
+            .with_engine_config(BlockEngineConfig::new(device))
             .build()
             .await
             .map_err(|e| LookupError::Internal(format!("hybrid build: {e}")))?;
@@ -429,9 +429,9 @@ impl<S: LookupSource> LookupCacheHierarchy<S> {
         let mut stale_data: Option<Vec<u8>> = None;
         if let Some(entry) = self
             .hybrid
-            .obtain(cache_key.clone())
+            .get(&cache_key)
             .await
-            .map_err(|e| LookupError::Internal(format!("hybrid obtain: {e}")))?
+            .map_err(|e| LookupError::Internal(format!("hybrid get: {e}")))?
         {
             let cached = entry.value();
             if !cached.is_expired(self.config.ttl) {
