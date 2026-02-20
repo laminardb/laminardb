@@ -44,6 +44,14 @@ pub enum StreamJoinType {
     Right,
     /// Both sides always emitted
     Full,
+    /// Left rows with at least one match (left columns only)
+    LeftSemi,
+    /// Left rows with no match (left columns only)
+    LeftAnti,
+    /// Right rows with at least one match (right columns only)
+    RightSemi,
+    /// Right rows with no match (right columns only)
+    RightAnti,
 }
 
 /// Lookup join types
@@ -53,6 +61,21 @@ pub enum LookupJoinType {
     Inner,
     /// Stream event always emitted, lookup optional
     Left,
+}
+
+/// Configuration for temporal join operator (FOR SYSTEM_TIME AS OF).
+#[derive(Debug, Clone)]
+pub struct TemporalJoinTranslatorConfig {
+    /// Stream side key column
+    pub stream_key_column: String,
+    /// Table side key column
+    pub table_key_column: String,
+    /// Version column from FOR SYSTEM_TIME AS OF
+    pub table_version_column: String,
+    /// Temporal semantics: "event_time" or "process_time"
+    pub semantics: String,
+    /// Join type: "inner" or "left"
+    pub join_type: String,
 }
 
 /// Configuration for ASOF join operator
@@ -94,6 +117,8 @@ pub enum JoinOperatorConfig {
     Lookup(LookupJoinConfig),
     /// ASOF join
     Asof(AsofJoinTranslatorConfig),
+    /// Temporal join (FOR SYSTEM_TIME AS OF)
+    Temporal(TemporalJoinTranslatorConfig),
 }
 
 impl std::fmt::Display for StreamJoinType {
@@ -103,6 +128,10 @@ impl std::fmt::Display for StreamJoinType {
             StreamJoinType::Left => write!(f, "LEFT"),
             StreamJoinType::Right => write!(f, "RIGHT"),
             StreamJoinType::Full => write!(f, "FULL"),
+            StreamJoinType::LeftSemi => write!(f, "LEFT SEMI"),
+            StreamJoinType::LeftAnti => write!(f, "LEFT ANTI"),
+            StreamJoinType::RightSemi => write!(f, "RIGHT SEMI"),
+            StreamJoinType::RightAnti => write!(f, "RIGHT ANTI"),
         }
     }
 }
@@ -174,12 +203,27 @@ impl std::fmt::Display for AsofJoinTranslatorConfig {
     }
 }
 
+impl std::fmt::Display for TemporalJoinTranslatorConfig {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        write!(
+            f,
+            "{} TEMPORAL JOIN ON stream.{} = table.{} (version: {}, {})",
+            self.join_type.to_uppercase(),
+            self.stream_key_column,
+            self.table_key_column,
+            self.table_version_column,
+            self.semantics,
+        )
+    }
+}
+
 impl std::fmt::Display for JoinOperatorConfig {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         match self {
             JoinOperatorConfig::StreamStream(c) => write!(f, "{c}"),
             JoinOperatorConfig::Lookup(c) => write!(f, "{c}"),
             JoinOperatorConfig::Asof(c) => write!(f, "{c}"),
+            JoinOperatorConfig::Temporal(c) => write!(f, "{c}"),
         }
     }
 }
@@ -188,6 +232,20 @@ impl JoinOperatorConfig {
     /// Create from join analysis.
     #[must_use]
     pub fn from_analysis(analysis: &JoinAnalysis) -> Self {
+        if analysis.is_temporal_join {
+            let join_type_str = match analysis.join_type {
+                JoinType::Left => "left",
+                _ => "inner",
+            };
+            return JoinOperatorConfig::Temporal(TemporalJoinTranslatorConfig {
+                stream_key_column: analysis.left_key_column.clone(),
+                table_key_column: analysis.right_key_column.clone(),
+                table_version_column: analysis.temporal_version_column.clone().unwrap_or_default(),
+                semantics: "event_time".to_string(),
+                join_type: join_type_str.to_string(),
+            });
+        }
+
         if analysis.is_asof_join {
             return JoinOperatorConfig::Asof(AsofJoinTranslatorConfig {
                 left_table: analysis.left_table.clone(),
@@ -223,6 +281,10 @@ impl JoinOperatorConfig {
                     JoinType::Left | JoinType::AsOf => StreamJoinType::Left,
                     JoinType::Right => StreamJoinType::Right,
                     JoinType::Full => StreamJoinType::Full,
+                    JoinType::LeftSemi => StreamJoinType::LeftSemi,
+                    JoinType::LeftAnti => StreamJoinType::LeftAnti,
+                    JoinType::RightSemi => StreamJoinType::RightSemi,
+                    JoinType::RightAnti => StreamJoinType::RightAnti,
                 },
             })
         }
@@ -252,6 +314,12 @@ impl JoinOperatorConfig {
         matches!(self, JoinOperatorConfig::Asof(_))
     }
 
+    /// Check if this is a temporal join.
+    #[must_use]
+    pub fn is_temporal(&self) -> bool {
+        matches!(self, JoinOperatorConfig::Temporal(_))
+    }
+
     /// Get the left key column name.
     #[must_use]
     pub fn left_key(&self) -> &str {
@@ -259,6 +327,7 @@ impl JoinOperatorConfig {
             JoinOperatorConfig::StreamStream(config) => &config.left_key,
             JoinOperatorConfig::Lookup(config) => &config.stream_key,
             JoinOperatorConfig::Asof(config) => &config.key_column,
+            JoinOperatorConfig::Temporal(config) => &config.stream_key_column,
         }
     }
 
@@ -269,6 +338,7 @@ impl JoinOperatorConfig {
             JoinOperatorConfig::StreamStream(config) => &config.right_key,
             JoinOperatorConfig::Lookup(config) => &config.lookup_key,
             JoinOperatorConfig::Asof(config) => &config.key_column,
+            JoinOperatorConfig::Temporal(config) => &config.table_key_column,
         }
     }
 }
@@ -755,9 +825,107 @@ mod tests {
         assert_eq!(format!("{}", StreamJoinType::Left), "LEFT");
         assert_eq!(format!("{}", StreamJoinType::Right), "RIGHT");
         assert_eq!(format!("{}", StreamJoinType::Full), "FULL");
+        assert_eq!(format!("{}", StreamJoinType::LeftSemi), "LEFT SEMI");
+        assert_eq!(format!("{}", StreamJoinType::LeftAnti), "LEFT ANTI");
+        assert_eq!(format!("{}", StreamJoinType::RightSemi), "RIGHT SEMI");
+        assert_eq!(format!("{}", StreamJoinType::RightAnti), "RIGHT ANTI");
         assert_eq!(format!("{}", LookupJoinType::Inner), "INNER");
         assert_eq!(format!("{}", LookupJoinType::Left), "LEFT");
         assert_eq!(format!("{}", AsofSqlJoinType::Inner), "INNER");
         assert_eq!(format!("{}", AsofSqlJoinType::Left), "LEFT");
+    }
+
+    #[test]
+    fn test_from_analysis_semi_anti() {
+        let semi = JoinAnalysis::stream_stream(
+            "a".to_string(),
+            "b".to_string(),
+            "id".to_string(),
+            "id".to_string(),
+            Duration::from_secs(60),
+            JoinType::LeftSemi,
+        );
+        if let JoinOperatorConfig::StreamStream(config) = JoinOperatorConfig::from_analysis(&semi) {
+            assert_eq!(config.join_type, StreamJoinType::LeftSemi);
+        } else {
+            panic!("Expected StreamStream config");
+        }
+
+        let anti = JoinAnalysis::stream_stream(
+            "a".to_string(),
+            "b".to_string(),
+            "id".to_string(),
+            "id".to_string(),
+            Duration::from_secs(60),
+            JoinType::RightAnti,
+        );
+        if let JoinOperatorConfig::StreamStream(config) = JoinOperatorConfig::from_analysis(&anti) {
+            assert_eq!(config.join_type, StreamJoinType::RightAnti);
+        } else {
+            panic!("Expected StreamStream config");
+        }
+    }
+
+    #[test]
+    fn test_from_analysis_temporal() {
+        let analysis = JoinAnalysis::temporal(
+            "orders".to_string(),
+            "products".to_string(),
+            "product_id".to_string(),
+            "id".to_string(),
+            "order_time".to_string(),
+            JoinType::Inner,
+        );
+
+        let config = JoinOperatorConfig::from_analysis(&analysis);
+        assert!(config.is_temporal());
+        assert!(!config.is_asof());
+        assert!(!config.is_lookup());
+        assert!(!config.is_stream_stream());
+        assert_eq!(config.left_key(), "product_id");
+        assert_eq!(config.right_key(), "id");
+
+        if let JoinOperatorConfig::Temporal(tc) = config {
+            assert_eq!(tc.table_version_column, "order_time");
+            assert_eq!(tc.semantics, "event_time");
+            assert_eq!(tc.join_type, "inner");
+        } else {
+            panic!("Expected Temporal config");
+        }
+    }
+
+    #[test]
+    fn test_temporal_left_join() {
+        let analysis = JoinAnalysis::temporal(
+            "orders".to_string(),
+            "products".to_string(),
+            "product_id".to_string(),
+            "id".to_string(),
+            "order_time".to_string(),
+            JoinType::Left,
+        );
+
+        let config = JoinOperatorConfig::from_analysis(&analysis);
+        if let JoinOperatorConfig::Temporal(tc) = config {
+            assert_eq!(tc.join_type, "left");
+        } else {
+            panic!("Expected Temporal config");
+        }
+    }
+
+    #[test]
+    fn test_display_temporal_join() {
+        let analysis = JoinAnalysis::temporal(
+            "orders".to_string(),
+            "products".to_string(),
+            "product_id".to_string(),
+            "id".to_string(),
+            "order_time".to_string(),
+            JoinType::Inner,
+        );
+        let config = JoinOperatorConfig::from_analysis(&analysis);
+        let s = format!("{config}");
+        assert!(s.contains("TEMPORAL JOIN"), "got: {s}");
+        assert!(s.contains("order_time"), "got: {s}");
     }
 }

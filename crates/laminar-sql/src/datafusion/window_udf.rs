@@ -280,6 +280,101 @@ impl ScalarUDFImpl for SessionWindowStart {
     }
 }
 
+// ─── CumulateWindowStart ────────────────────────────────────────────────────
+
+/// Computes the cumulate window epoch start for a given timestamp.
+///
+/// `cumulate(timestamp, step, size)` returns `floor(ts / size) * size`,
+/// which is the epoch start for the cumulating window that contains `ts`.
+/// The actual multi-window assignment (one row per cumulating window) is
+/// handled by Ring 0 operators.
+///
+/// # Arguments
+///
+/// * Arg 0: Timestamp column or scalar (`TimestampMillisecond` or `Int64` ms)
+/// * Arg 1: Step interval scalar (window growth increment)
+/// * Arg 2: Max size interval scalar (epoch size)
+#[derive(Debug)]
+pub struct CumulateWindowStart {
+    signature: Signature,
+}
+
+impl CumulateWindowStart {
+    /// Creates a new cumulate window start UDF.
+    #[must_use]
+    pub fn new() -> Self {
+        Self {
+            signature: Signature::new(TypeSignature::Any(3), Volatility::Immutable),
+        }
+    }
+}
+
+impl Default for CumulateWindowStart {
+    fn default() -> Self {
+        Self::new()
+    }
+}
+
+impl PartialEq for CumulateWindowStart {
+    fn eq(&self, _other: &Self) -> bool {
+        true
+    }
+}
+
+impl Eq for CumulateWindowStart {}
+
+impl Hash for CumulateWindowStart {
+    fn hash<H: Hasher>(&self, state: &mut H) {
+        "cumulate".hash(state);
+    }
+}
+
+impl ScalarUDFImpl for CumulateWindowStart {
+    fn as_any(&self) -> &dyn Any {
+        self
+    }
+
+    fn name(&self) -> &'static str {
+        "cumulate"
+    }
+
+    fn signature(&self) -> &Signature {
+        &self.signature
+    }
+
+    fn return_type(&self, _arg_types: &[DataType]) -> Result<DataType> {
+        Ok(DataType::Timestamp(TimeUnit::Millisecond, None))
+    }
+
+    fn invoke_with_args(&self, args: ScalarFunctionArgs) -> Result<ColumnarValue> {
+        let ScalarFunctionArgs { args, .. } = args;
+        if args.len() != 3 {
+            return Err(DataFusionError::Plan(
+                "cumulate() requires exactly 3 arguments: (timestamp, step, size)".to_string(),
+            ));
+        }
+        let step_ms = extract_interval_ms(&args[1])?;
+        let size_ms = extract_interval_ms(&args[2])?;
+        if step_ms <= 0 || size_ms <= 0 {
+            return Err(DataFusionError::Plan(
+                "cumulate() step and size must be positive".to_string(),
+            ));
+        }
+        if step_ms > size_ms {
+            return Err(DataFusionError::Plan(
+                "cumulate() step must not exceed size".to_string(),
+            ));
+        }
+        if size_ms % step_ms != 0 {
+            return Err(DataFusionError::Plan(
+                "cumulate() size must be evenly divisible by step".to_string(),
+            ));
+        }
+        // Return epoch start = floor(ts / size) * size (same as tumble with size)
+        compute_tumble(&args[0], size_ms)
+    }
+}
+
 // ─── Helper Functions ────────────────────────────────────────────────────────
 
 /// Extracts an interval value in milliseconds from a `ColumnarValue`.
@@ -666,6 +761,82 @@ mod tests {
 
     // ── Registration & signature tests ───────────────────────────────────
 
+    // ── Cumulate tests ──────────────────────────────────────────────────
+
+    #[test]
+    fn test_cumulate_basic() {
+        let udf = CumulateWindowStart::new();
+        // step=1min, size=5min, ts=30s → epoch start = 0
+        let result = udf
+            .invoke_with_args(make_args(
+                vec![
+                    ts_ms(Some(30_000)),
+                    interval_dt(0, 60_000),
+                    interval_dt(0, 300_000),
+                ],
+                1,
+            ))
+            .unwrap();
+        assert_eq!(expect_ts_ms(result), Some(0));
+    }
+
+    #[test]
+    fn test_cumulate_second_epoch() {
+        let udf = CumulateWindowStart::new();
+        // step=1min, size=5min, ts=350s → epoch start = 300_000
+        let result = udf
+            .invoke_with_args(make_args(
+                vec![
+                    ts_ms(Some(350_000)),
+                    interval_dt(0, 60_000),
+                    interval_dt(0, 300_000),
+                ],
+                1,
+            ))
+            .unwrap();
+        assert_eq!(expect_ts_ms(result), Some(300_000));
+    }
+
+    #[test]
+    fn test_cumulate_rejects_step_exceeds_size() {
+        let udf = CumulateWindowStart::new();
+        let result = udf.invoke_with_args(make_args(
+            vec![
+                ts_ms(Some(1000)),
+                interval_dt(0, 600_000),
+                interval_dt(0, 300_000),
+            ],
+            1,
+        ));
+        assert!(result.is_err());
+    }
+
+    #[test]
+    fn test_cumulate_rejects_not_divisible() {
+        let udf = CumulateWindowStart::new();
+        let result = udf.invoke_with_args(make_args(
+            vec![
+                ts_ms(Some(1000)),
+                interval_dt(0, 70_000),
+                interval_dt(0, 300_000),
+            ],
+            1,
+        ));
+        assert!(result.is_err());
+    }
+
+    #[test]
+    fn test_cumulate_rejects_wrong_arg_count() {
+        let udf = CumulateWindowStart::new();
+        let result = udf.invoke_with_args(make_args(
+            vec![ts_ms(Some(1000)), interval_dt(0, 60_000)],
+            1,
+        ));
+        assert!(result.is_err());
+    }
+
+    // ── Registration & signature tests ───────────────────────────────────
+
     #[test]
     fn test_udf_registration() {
         let tumble = ScalarUDF::new_from_impl(TumbleWindowStart::new());
@@ -676,6 +847,9 @@ mod tests {
 
         let session = ScalarUDF::new_from_impl(SessionWindowStart::new());
         assert_eq!(session.name(), "session");
+
+        let cumulate = ScalarUDF::new_from_impl(CumulateWindowStart::new());
+        assert_eq!(cumulate.name(), "cumulate");
     }
 
     #[test]
@@ -692,11 +866,22 @@ mod tests {
             SessionWindowStart::new().signature().volatility,
             Volatility::Immutable
         );
+        assert_eq!(
+            CumulateWindowStart::new().signature().volatility,
+            Volatility::Immutable
+        );
     }
 
     #[test]
     fn test_tumble_return_type() {
         let udf = TumbleWindowStart::new();
+        let rt = udf.return_type(&[]).unwrap();
+        assert_eq!(rt, DataType::Timestamp(TimeUnit::Millisecond, None));
+    }
+
+    #[test]
+    fn test_cumulate_return_type() {
+        let udf = CumulateWindowStart::new();
         let rt = udf.return_type(&[]).unwrap();
         assert_eq!(rt, DataType::Timestamp(TimeUnit::Millisecond, None));
     }

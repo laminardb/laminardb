@@ -89,6 +89,12 @@ pub struct DeltaLakeSink {
     /// Delta Lake table handle (present when `delta-lake` feature is enabled).
     #[cfg(feature = "delta-lake")]
     table: Option<DeltaTable>,
+    /// Cancellation token for the background compaction task.
+    #[cfg(feature = "delta-lake")]
+    compaction_cancel: Option<tokio_util::sync::CancellationToken>,
+    /// Handle for the background compaction task.
+    #[cfg(feature = "delta-lake")]
+    compaction_handle: Option<tokio::task::JoinHandle<()>>,
 }
 
 impl DeltaLakeSink {
@@ -101,7 +107,7 @@ impl DeltaLakeSink {
             state: ConnectorState::Created,
             current_epoch: 0,
             last_committed_epoch: 0,
-            buffer: Vec::new(),
+            buffer: Vec::with_capacity(16),
             buffered_rows: 0,
             buffered_bytes: 0,
             pending_files: 0,
@@ -110,6 +116,10 @@ impl DeltaLakeSink {
             metrics: DeltaLakeSinkMetrics::new(),
             #[cfg(feature = "delta-lake")]
             table: None,
+            #[cfg(feature = "delta-lake")]
+            compaction_cancel: None,
+            #[cfg(feature = "delta-lake")]
+            compaction_handle: None,
         }
     }
 
@@ -199,13 +209,10 @@ impl DeltaLakeSink {
     /// Flushes the internal buffer (updates metrics; actual Parquet write
     /// happens via the `deltalake` crate when the `delta-lake` feature is
     /// enabled).
+    #[cfg(not(feature = "delta-lake"))]
     fn flush_buffer_local(&mut self) -> WriteResult {
         let total_rows = self.buffered_rows;
-        let estimated_bytes: u64 = self
-            .buffer
-            .iter()
-            .map(|b| b.get_array_memory_size() as u64)
-            .sum();
+        let estimated_bytes = self.buffered_bytes;
 
         self.pending_files += 1;
 
@@ -238,14 +245,10 @@ impl DeltaLakeSink {
         }
 
         let total_rows = self.buffered_rows;
-        let estimated_bytes: u64 = self
-            .buffer
-            .iter()
-            .map(|b| b.get_array_memory_size() as u64)
-            .sum();
+        let estimated_bytes = self.buffered_bytes;
 
         // Take the table and buffer for the write operation.
-        let table = self
+        let mut table = self
             .table
             .take()
             .ok_or_else(|| ConnectorError::InvalidState {
@@ -255,38 +258,86 @@ impl DeltaLakeSink {
 
         let batches = std::mem::take(&mut self.buffer);
 
-        // Determine save mode.
-        let save_mode = match self.config.write_mode {
-            DeltaWriteMode::Append | DeltaWriteMode::Upsert => SaveMode::Append,
-            DeltaWriteMode::Overwrite => SaveMode::Overwrite,
-        };
+        if self.config.write_mode == DeltaWriteMode::Upsert {
+            // ── Upsert/Merge path ──
+            // Coalesce all buffered batches into one, split by changelog op,
+            // then issue a single MERGE + single DELETE transaction.
+            let combined = arrow_select::concat::concat_batches(&batches[0].schema(), &batches)
+                .map_err(|e| ConnectorError::Internal(format!("failed to concat batches: {e}")))?;
 
-        // Get partition columns if configured.
-        let partition_cols = if self.config.partition_columns.is_empty() {
-            None
+            let (inserts, deletes) = Self::split_changelog_batch(&combined)?;
+
+            // Merge inserts/updates into the target table.
+            if inserts.num_rows() > 0 {
+                let (t, result) = super::delta_io::merge_batches(
+                    table,
+                    inserts,
+                    &self.config.merge_key_columns,
+                    &self.config.writer_id,
+                    self.current_epoch,
+                    self.config.schema_evolution,
+                )
+                .await?;
+                table = t;
+                self.metrics.record_merge();
+                debug!(
+                    inserted = result.rows_inserted,
+                    updated = result.rows_updated,
+                    "Delta Lake: merged inserts/updates"
+                );
+            }
+
+            // Delete matching rows from the target table.
+            if deletes.num_rows() > 0 {
+                let delete_count = deletes.num_rows();
+                let (t, rows_deleted) = super::delta_io::delete_by_merge(
+                    table,
+                    deletes,
+                    &self.config.merge_key_columns,
+                    &self.config.writer_id,
+                    self.current_epoch,
+                )
+                .await?;
+                table = t;
+                #[allow(clippy::cast_possible_truncation)]
+                self.metrics.record_deletes(delete_count as u64);
+                debug!(rows_deleted, "Delta Lake: merged deletes");
+            }
         } else {
-            Some(self.config.partition_columns.clone())
-        };
+            // ── Append/Overwrite path ──
+            let save_mode = match self.config.write_mode {
+                DeltaWriteMode::Append => SaveMode::Append,
+                DeltaWriteMode::Overwrite => SaveMode::Overwrite,
+                DeltaWriteMode::Upsert => unreachable!(),
+            };
 
-        // Write to Delta Lake.
-        let (new_table, version) = super::delta_io::write_batches(
-            table,
-            batches,
-            &self.config.writer_id,
-            self.current_epoch,
-            save_mode,
-            partition_cols,
-        )
-        .await?;
+            let partition_cols = if self.config.partition_columns.is_empty() {
+                None
+            } else {
+                Some(self.config.partition_columns.as_slice())
+            };
+
+            let (t, _version) = super::delta_io::write_batches(
+                table,
+                batches,
+                &self.config.writer_id,
+                self.current_epoch,
+                save_mode,
+                partition_cols,
+                self.config.schema_evolution,
+            )
+            .await?;
+            table = t;
+        }
 
         // Restore table and update state.
         // Note: Delta Lake uses i64 for version, but our version is u64.
         // Versions are always non-negative, so this is safe.
-        self.table = Some(new_table);
         #[allow(clippy::cast_sign_loss)]
         {
-            self.delta_version = version as u64;
+            self.delta_version = table.version().unwrap_or(0) as u64;
         }
+        self.table = Some(table);
         self.pending_files = 0;
         self.buffered_rows = 0;
         self.buffered_bytes = 0;
@@ -350,28 +401,123 @@ impl DeltaLakeSink {
                 ConnectorError::ConfigurationError("'_op' column must be String (Utf8) type".into())
             })?;
 
-        let mut insert_indices = Vec::new();
-        let mut delete_indices = Vec::new();
+        // Build boolean masks (compact bit-buffers, no per-element heap allocation).
+        let len = op_array.len();
+        let mut insert_mask = Vec::with_capacity(len);
+        let mut delete_mask = Vec::with_capacity(len);
 
-        for i in 0..op_array.len() {
+        for i in 0..len {
             if op_array.is_null(i) {
+                insert_mask.push(false);
+                delete_mask.push(false);
                 continue;
             }
             match op_array.value(i) {
                 "I" | "U" | "r" => {
-                    insert_indices.push(u32::try_from(i).unwrap_or(u32::MAX));
+                    insert_mask.push(true);
+                    delete_mask.push(false);
                 }
                 "D" => {
-                    delete_indices.push(u32::try_from(i).unwrap_or(u32::MAX));
+                    insert_mask.push(false);
+                    delete_mask.push(true);
                 }
-                _ => {} // Skip unknown ops
+                _ => {
+                    insert_mask.push(false);
+                    delete_mask.push(false);
+                }
             }
         }
 
-        let insert_batch = filter_batch_by_indices(batch, &insert_indices)?;
-        let delete_batch = filter_batch_by_indices(batch, &delete_indices)?;
+        // Compute user-column projection indices once (strip metadata columns).
+        let user_col_indices: Vec<usize> = batch
+            .schema()
+            .fields()
+            .iter()
+            .enumerate()
+            .filter(|(_, f)| !f.name().starts_with('_'))
+            .map(|(i, _)| i)
+            .collect();
+
+        let insert_batch = filter_and_project(batch, &insert_mask, &user_col_indices)?;
+        let delete_batch = filter_and_project(batch, &delete_mask, &user_col_indices)?;
 
         Ok((insert_batch, delete_batch))
+    }
+}
+
+/// Background compaction loop that periodically runs OPTIMIZE and VACUUM.
+///
+/// Opens its own `DeltaTable` handle (no shared state with the sink).
+#[cfg(feature = "delta-lake")]
+async fn compaction_loop(
+    table_path: String,
+    storage_options: Arc<std::collections::HashMap<String, String>>,
+    config: super::delta_config::CompactionConfig,
+    vacuum_retention: std::time::Duration,
+    cancel: tokio_util::sync::CancellationToken,
+) {
+    use super::delta_io;
+
+    info!(
+        table_path = %table_path,
+        check_interval_secs = config.check_interval.as_secs(),
+        "compaction background task started"
+    );
+
+    let mut interval = tokio::time::interval(config.check_interval);
+    // Skip the first immediate tick.
+    interval.tick().await;
+
+    loop {
+        tokio::select! {
+            () = cancel.cancelled() => {
+                info!("compaction background task cancelled");
+                return;
+            }
+            _ = interval.tick() => {
+                // Open a fresh table handle for compaction (no shared state).
+                // Clone the HashMap only here (once per tick, not avoidable
+                // since open_or_create_table takes owned HashMap).
+                let table = match delta_io::open_or_create_table(
+                    &table_path,
+                    (*storage_options).clone(),
+                    None,
+                )
+                .await
+                {
+                    Ok(t) => t,
+                    Err(e) => {
+                        warn!(error = %e, "compaction: failed to open table, will retry");
+                        continue;
+                    }
+                };
+
+                // Run OPTIMIZE.
+                let target_size = config.target_file_size as u64;
+                match delta_io::run_compaction(table, target_size, &config.z_order_columns).await {
+                    Ok((table, result)) => {
+                        debug!(
+                            files_added = result.files_added,
+                            files_removed = result.files_removed,
+                            "compaction: OPTIMIZE complete"
+                        );
+
+                        // Run VACUUM after compaction.
+                        match delta_io::run_vacuum(table, vacuum_retention).await {
+                            Ok((_table, files_deleted)) => {
+                                debug!(files_deleted, "compaction: VACUUM complete");
+                            }
+                            Err(e) => {
+                                warn!(error = %e, "compaction: VACUUM failed");
+                            }
+                        }
+                    }
+                    Err(e) => {
+                        warn!(error = %e, "compaction: OPTIMIZE failed");
+                    }
+                }
+            }
+        }
     }
 }
 
@@ -433,6 +579,20 @@ impl SinkConnector for DeltaLakeSink {
                 self.delta_version = table.version().unwrap_or(0) as u64;
             }
             self.table = Some(table);
+
+            // Spawn background compaction task if enabled.
+            if self.config.compaction.enabled {
+                let cancel = tokio_util::sync::CancellationToken::new();
+                let handle = tokio::spawn(compaction_loop(
+                    self.config.table_path.clone(),
+                    Arc::new(self.config.storage_options.clone()),
+                    self.config.compaction.clone(),
+                    self.config.vacuum_retention,
+                    cancel.clone(),
+                ));
+                self.compaction_cancel = Some(cancel);
+                self.compaction_handle = Some(handle);
+            }
         }
 
         self.state = ConnectorState::Running;
@@ -471,8 +631,16 @@ impl SinkConnector for DeltaLakeSink {
 
         // Flush if buffer threshold reached.
         if self.should_flush() {
-            let result = self.flush_buffer_local();
-            return Ok(result);
+            #[cfg(feature = "delta-lake")]
+            {
+                self.flush_buffer_to_delta().await?;
+                return Ok(WriteResult::new(0, 0));
+            }
+            #[cfg(not(feature = "delta-lake"))]
+            {
+                let result = self.flush_buffer_local();
+                return Ok(result);
+            }
         }
 
         Ok(WriteResult::new(0, 0))
@@ -641,6 +809,18 @@ impl SinkConnector for DeltaLakeSink {
             }
         }
 
+        // Cancel and join the background compaction task.
+        #[cfg(feature = "delta-lake")]
+        {
+            if let Some(cancel) = self.compaction_cancel.take() {
+                cancel.cancel();
+            }
+            if let Some(handle) = self.compaction_handle.take() {
+                // Wait up to 5 seconds for the compaction task to finish.
+                let _ = tokio::time::timeout(std::time::Duration::from_secs(5), handle).await;
+            }
+        }
+
         // Drop the table handle when closing.
         #[cfg(feature = "delta-lake")]
         {
@@ -676,43 +856,26 @@ impl std::fmt::Debug for DeltaLakeSink {
 
 // ── Helper functions ────────────────────────────────────────────────
 
-/// Filters a `RecordBatch` to include only rows at the given indices.
+/// Filters a `RecordBatch` using a boolean mask and projects to the given column indices.
 ///
-/// Also strips metadata columns (those starting with `_`) from the output.
-fn filter_batch_by_indices(
+/// Uses Arrow's SIMD-optimized `filter` kernel instead of index-gather (`take`).
+fn filter_and_project(
     batch: &RecordBatch,
-    indices: &[u32],
+    mask: &[bool],
+    col_indices: &[usize],
 ) -> Result<RecordBatch, ConnectorError> {
-    let user_schema = Arc::new(arrow_schema::Schema::new(
-        batch
-            .schema()
-            .fields()
-            .iter()
-            .filter(|f| !f.name().starts_with('_'))
-            .cloned()
-            .collect::<Vec<_>>(),
-    ));
+    use arrow_array::BooleanArray;
+    use arrow_select::filter::filter_record_batch;
 
-    if indices.is_empty() {
-        return Ok(RecordBatch::new_empty(user_schema));
-    }
+    let bool_array = BooleanArray::from(mask.to_vec());
 
-    let indices_array = arrow_array::UInt32Array::from(indices.to_vec());
+    // Filter the full batch first (SIMD-optimized), then project columns.
+    let filtered = filter_record_batch(batch, &bool_array)
+        .map_err(|e| ConnectorError::Internal(format!("arrow filter failed: {e}")))?;
 
-    let filtered_columns: Vec<Arc<dyn arrow_array::Array>> = batch
-        .schema()
-        .fields()
-        .iter()
-        .enumerate()
-        .filter(|(_, f)| !f.name().starts_with('_'))
-        .map(|(i, _)| {
-            arrow_select::take::take(batch.column(i), &indices_array, None)
-                .map_err(|e| ConnectorError::Internal(format!("arrow take failed: {e}")))
-        })
-        .collect::<Result<Vec<_>, _>>()?;
-
-    RecordBatch::try_new(user_schema, filtered_columns)
-        .map_err(|e| ConnectorError::Internal(format!("batch construction failed: {e}")))
+    filtered
+        .project(col_indices)
+        .map_err(|e| ConnectorError::Internal(format!("batch projection failed: {e}")))
 }
 
 #[cfg(test)]
@@ -853,6 +1016,10 @@ mod tests {
         assert!(sink.buffered_bytes() > 0);
     }
 
+    // When delta-lake feature is enabled, auto-flush calls flush_buffer_to_delta()
+    // which requires an actual table. See delta_io::tests::test_auto_flush_writes_data
+    // for the real I/O integration test.
+    #[cfg(not(feature = "delta-lake"))]
     #[tokio::test]
     async fn test_write_batch_auto_flush() {
         let mut config = test_config();
@@ -1225,6 +1392,9 @@ mod tests {
         assert_eq!(m.errors_total, 0);
     }
 
+    // When delta-lake feature is enabled, this triggers auto-flush which
+    // needs a real table. See delta_io::tests for integration coverage.
+    #[cfg(not(feature = "delta-lake"))]
     #[tokio::test]
     async fn test_metrics_after_writes() {
         let mut config = test_config();

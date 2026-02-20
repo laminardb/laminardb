@@ -253,8 +253,8 @@ impl SessionIndex {
 /// Creates the standard session output schema.
 fn create_session_output_schema() -> SchemaRef {
     Arc::new(Schema::new(vec![
-        Field::new("session_start", DataType::Int64, false),
-        Field::new("session_end", DataType::Int64, false),
+        Field::new("window_start", DataType::Int64, false),
+        Field::new("window_end", DataType::Int64, false),
         Field::new("result", DataType::Int64, false),
     ]))
 }
@@ -1825,8 +1825,8 @@ mod tests {
         let schema = create_session_output_schema();
 
         assert_eq!(schema.fields().len(), 3);
-        assert_eq!(schema.field(0).name(), "session_start");
-        assert_eq!(schema.field(1).name(), "session_end");
+        assert_eq!(schema.field(0).name(), "window_start");
+        assert_eq!(schema.field(1).name(), "window_end");
         assert_eq!(schema.field(2).name(), "result");
     }
 

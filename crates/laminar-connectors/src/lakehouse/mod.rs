@@ -62,6 +62,10 @@ pub mod delta_config;
 #[cfg(feature = "delta-lake")]
 pub mod delta_io;
 pub mod delta_metrics;
+pub mod delta_source;
+pub mod delta_source_config;
+#[cfg(feature = "delta-lake")]
+pub mod delta_table_provider;
 
 // Apache Iceberg modules
 pub mod iceberg;
@@ -73,8 +77,12 @@ pub mod metrics;
 
 // Re-export Delta Lake types at module level.
 pub use delta::DeltaLakeSink;
-pub use delta_config::{CompactionConfig, DeliveryGuarantee, DeltaLakeSinkConfig, DeltaWriteMode};
+pub use delta_config::{
+    CompactionConfig, DeliveryGuarantee, DeltaCatalogType, DeltaLakeSinkConfig, DeltaWriteMode,
+};
 pub use delta_metrics::DeltaLakeSinkMetrics;
+pub use delta_source::DeltaSource;
+pub use delta_source_config::DeltaSourceConfig;
 
 // Re-export Iceberg types at module level.
 pub use iceberg::IcebergSink;
@@ -105,6 +113,24 @@ pub fn register_delta_lake_sink(registry: &ConnectorRegistry) {
         "delta-lake",
         info,
         Arc::new(|| Box::new(DeltaLakeSink::new(DeltaLakeSinkConfig::default()))),
+    );
+}
+
+/// Registers the Delta Lake source connector with the given registry.
+pub fn register_delta_lake_source(registry: &ConnectorRegistry) {
+    let info = ConnectorInfo {
+        name: "delta-lake".to_string(),
+        display_name: "Delta Lake Source".to_string(),
+        version: env!("CARGO_PKG_VERSION").to_string(),
+        is_source: true,
+        is_sink: false,
+        config_keys: delta_lake_source_config_keys(),
+    };
+
+    registry.register_source(
+        "delta-lake",
+        info,
+        Arc::new(|| Box::new(DeltaSource::new(DeltaSourceConfig::default()))),
     );
 }
 
@@ -209,6 +235,34 @@ fn delta_lake_config_keys() -> Vec<ConfigKeySpec> {
             "Writer ID for exactly-once deduplication (auto UUID if not set)",
             "",
         ),
+        // ── Catalog configuration ──
+        ConfigKeySpec::optional("catalog.type", "Catalog type: none, glue, unity", "none"),
+        ConfigKeySpec::optional(
+            "catalog.database",
+            "Catalog database name (required for Glue)",
+            "",
+        ),
+        ConfigKeySpec::optional("catalog.name", "Catalog name (required for Unity)", ""),
+        ConfigKeySpec::optional(
+            "catalog.schema",
+            "Catalog schema name (required for Unity)",
+            "",
+        ),
+        ConfigKeySpec::optional(
+            "catalog.workspace_url",
+            "Databricks workspace URL (required for Unity)",
+            "",
+        ),
+        ConfigKeySpec::optional(
+            "catalog.access_token",
+            "Databricks access token (required for Unity)",
+            "",
+        ),
+        ConfigKeySpec::optional(
+            "catalog.prop.*",
+            "Catalog-specific properties (pass-through)",
+            "",
+        ),
         // ── Cloud storage credentials (resolved via StorageCredentialResolver) ──
         ConfigKeySpec::optional(
             "storage.aws_access_key_id",
@@ -268,6 +322,72 @@ fn delta_lake_config_keys() -> Vec<ConfigKeySpec> {
         ConfigKeySpec::optional(
             "storage.google_service_account_key",
             "Inline GCS service account JSON (falls back to GOOGLE_SERVICE_ACCOUNT_KEY)",
+            "",
+        ),
+    ]
+}
+
+fn delta_lake_source_config_keys() -> Vec<ConfigKeySpec> {
+    vec![
+        ConfigKeySpec::required(
+            "table.path",
+            "Path to Delta Lake table (local, s3://, az://, gs://)",
+        ),
+        ConfigKeySpec::optional(
+            "starting.version",
+            "Starting version to read from (default: latest)",
+            "",
+        ),
+        ConfigKeySpec::optional(
+            "poll.interval.ms",
+            "How often to poll for new versions (ms)",
+            "1000",
+        ),
+        // ── Catalog configuration ──
+        ConfigKeySpec::optional("catalog.type", "Catalog type: none, glue, unity", "none"),
+        ConfigKeySpec::optional(
+            "catalog.database",
+            "Catalog database name (required for Glue)",
+            "",
+        ),
+        ConfigKeySpec::optional("catalog.name", "Catalog name (required for Unity)", ""),
+        ConfigKeySpec::optional(
+            "catalog.schema",
+            "Catalog schema name (required for Unity)",
+            "",
+        ),
+        ConfigKeySpec::optional(
+            "catalog.workspace_url",
+            "Databricks workspace URL (required for Unity)",
+            "",
+        ),
+        ConfigKeySpec::optional(
+            "catalog.access_token",
+            "Databricks access token (required for Unity)",
+            "",
+        ),
+        ConfigKeySpec::optional(
+            "catalog.prop.*",
+            "Catalog-specific properties (pass-through)",
+            "",
+        ),
+        // ── Cloud storage credentials ──
+        ConfigKeySpec::optional("storage.aws_access_key_id", "AWS access key ID", ""),
+        ConfigKeySpec::optional("storage.aws_secret_access_key", "AWS secret access key", ""),
+        ConfigKeySpec::optional("storage.aws_region", "AWS region for S3 paths", ""),
+        ConfigKeySpec::optional(
+            "storage.azure_storage_account_name",
+            "Azure storage account name",
+            "",
+        ),
+        ConfigKeySpec::optional(
+            "storage.azure_storage_account_key",
+            "Azure storage account key",
+            "",
+        ),
+        ConfigKeySpec::optional(
+            "storage.google_service_account_path",
+            "Path to GCS service account JSON",
             "",
         ),
     ]
@@ -503,6 +623,14 @@ mod tests {
         assert!(optional.contains(&"compaction.z-order.columns"));
         assert!(optional.contains(&"vacuum.retention.hours"));
         assert!(optional.contains(&"writer.id"));
+        // Catalog keys
+        assert!(optional.contains(&"catalog.type"));
+        assert!(optional.contains(&"catalog.database"));
+        assert!(optional.contains(&"catalog.name"));
+        assert!(optional.contains(&"catalog.schema"));
+        assert!(optional.contains(&"catalog.workspace_url"));
+        assert!(optional.contains(&"catalog.access_token"));
+        assert!(optional.contains(&"catalog.prop.*"));
     }
 
     #[test]
@@ -513,6 +641,55 @@ mod tests {
         let config = crate::config::ConnectorConfig::new("delta-lake");
         let sink = registry.create_sink(&config);
         assert!(sink.is_ok());
+    }
+
+    // ── Delta Lake source registration tests ──
+
+    #[test]
+    fn test_register_delta_lake_source() {
+        let registry = ConnectorRegistry::new();
+        register_delta_lake_source(&registry);
+
+        let info = registry.source_info("delta-lake");
+        assert!(info.is_some());
+        let info = info.unwrap();
+        assert_eq!(info.name, "delta-lake");
+        assert!(info.is_source);
+        assert!(!info.is_sink);
+        assert!(!info.config_keys.is_empty());
+    }
+
+    #[test]
+    fn test_source_config_keys() {
+        let keys = delta_lake_source_config_keys();
+        let required: Vec<&str> = keys
+            .iter()
+            .filter(|k| k.required)
+            .map(|k| k.key.as_str())
+            .collect();
+        assert!(required.contains(&"table.path"));
+        assert_eq!(required.len(), 1);
+
+        let optional: Vec<&str> = keys
+            .iter()
+            .filter(|k| !k.required)
+            .map(|k| k.key.as_str())
+            .collect();
+        assert!(optional.contains(&"starting.version"));
+        assert!(optional.contains(&"poll.interval.ms"));
+        // Catalog keys
+        assert!(optional.contains(&"catalog.type"));
+        assert!(optional.contains(&"catalog.database"));
+    }
+
+    #[test]
+    fn test_factory_creates_source() {
+        let registry = ConnectorRegistry::new();
+        register_delta_lake_source(&registry);
+
+        let config = crate::config::ConnectorConfig::new("delta-lake");
+        let source = registry.create_source(&config);
+        assert!(source.is_ok());
     }
 
     // ── Iceberg registration tests ──

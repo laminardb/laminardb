@@ -21,18 +21,52 @@ use sqlparser::dialect::GenericDialect;
 use sqlparser::parser::Parser;
 
 use laminar_sql::parser::join_parser::analyze_joins;
-use laminar_sql::parser::EmitClause;
+use laminar_sql::parser::{EmitClause, EmitStrategy as SqlEmitStrategy};
 use laminar_sql::translator::{
-    AsofJoinTranslatorConfig, JoinOperatorConfig, WindowOperatorConfig, WindowType,
+    AsofJoinTranslatorConfig, JoinOperatorConfig, OrderOperatorConfig, WindowOperatorConfig,
+    WindowType,
 };
 
 use crate::error::DbError;
+
+/// Convert a SQL-layer `EmitStrategy` to a core-layer `EmitStrategy`.
+///
+/// The SQL parser produces `EmitStrategy::FinalOnly`, while core operators
+/// expect `EmitStrategy::Final`. This function maps all variants correctly.
+///
+/// Cannot use a `From` impl due to the orphan rule (neither type is local).
+#[allow(dead_code)] // Bridge function for Phase 4 MV pipeline integration
+pub(crate) fn sql_emit_to_core(
+    s: &SqlEmitStrategy,
+) -> laminar_core::operator::window::EmitStrategy {
+    use laminar_core::operator::window::EmitStrategy as CoreEmit;
+    match s {
+        SqlEmitStrategy::OnWatermark => CoreEmit::OnWatermark,
+        SqlEmitStrategy::OnWindowClose => CoreEmit::OnWindowClose,
+        SqlEmitStrategy::Periodic(d) => CoreEmit::Periodic(*d),
+        SqlEmitStrategy::OnUpdate => CoreEmit::OnUpdate,
+        SqlEmitStrategy::Changelog => CoreEmit::Changelog,
+        SqlEmitStrategy::FinalOnly => CoreEmit::Final,
+    }
+}
+
+/// Convert an `EmitClause` (SQL AST) to a core `EmitStrategy`.
+///
+/// Calls `EmitClause::to_emit_strategy()` to resolve the clause to a
+/// runtime strategy, then converts via [`sql_emit_to_core`].
+#[allow(dead_code)] // Bridge function for Phase 4 MV pipeline integration
+pub(crate) fn emit_clause_to_core(
+    clause: &EmitClause,
+) -> Result<laminar_core::operator::window::EmitStrategy, laminar_sql::parser::ParseError> {
+    let sql_strategy = clause.to_emit_strategy()?;
+    Ok(sql_emit_to_core(&sql_strategy))
+}
 
 /// Extract all table names referenced in FROM/JOIN clauses of a SQL query.
 ///
 /// Parses the SQL and walks the AST to find `TableFactor::Table` references,
 /// recursing into subqueries, nested joins, and set operations (UNION, etc.).
-fn extract_table_references(sql: &str) -> HashSet<String> {
+pub(crate) fn extract_table_references(sql: &str) -> HashSet<String> {
     let mut tables = HashSet::new();
     let dialect = GenericDialect {};
     let Ok(statements) = Parser::parse_sql(&dialect, sql) else {
@@ -106,6 +140,8 @@ pub(crate) struct StreamQuery {
     pub emit_clause: Option<EmitClause>,
     /// Window configuration from the planner (window type, size, gap, etc.).
     pub window_config: Option<WindowOperatorConfig>,
+    /// ORDER BY configuration (Top-K, `PerGroupTopK`, etc.).
+    pub order_config: Option<OrderOperatorConfig>,
     /// Pre-computed table references (extracted once at registration).
     /// Avoids re-parsing SQL for dependency analysis every cycle.
     table_refs: HashSet<String>,
@@ -192,6 +228,7 @@ impl StreamExecutor {
         sql: String,
         emit_clause: Option<EmitClause>,
         window_config: Option<WindowOperatorConfig>,
+        order_config: Option<OrderOperatorConfig>,
     ) {
         let (asof_config, projection_sql) = detect_asof_query(&sql);
         let table_refs = extract_table_references(&sql);
@@ -203,6 +240,7 @@ impl StreamExecutor {
             projection_sql,
             emit_clause,
             window_config,
+            order_config,
             table_refs,
         };
         // Initialize EOWC state for queries that suppress intermediate results
@@ -227,11 +265,11 @@ impl StreamExecutor {
     pub fn register_table(&self, name: &str, batch: RecordBatch) -> Result<(), DbError> {
         let schema = batch.schema();
         let mem_table = datafusion::datasource::MemTable::try_new(schema, vec![vec![batch]])
-            .map_err(|e| DbError::Pipeline(format!("Failed to create table '{name}': {e}")))?;
+            .map_err(|e| DbError::query_pipeline(name, &e))?;
 
         self.ctx
             .register_table(name, Arc::new(mem_table))
-            .map_err(|e| DbError::Pipeline(format!("Failed to register table '{name}': {e}")))?;
+            .map_err(|e| DbError::query_pipeline(name, &e))?;
         Ok(())
     }
 
@@ -362,12 +400,23 @@ impl StreamExecutor {
             } else {
                 let query_name = &self.queries[idx].name;
                 let query_sql = &self.queries[idx].sql;
-                let df = self.ctx.sql(query_sql).await.map_err(|e| {
-                    DbError::Pipeline(format!("Stream '{query_name}' planning failed: {e}"))
-                })?;
-                df.collect().await.map_err(|e| {
-                    DbError::Pipeline(format!("Stream '{query_name}' execution failed: {e}"))
-                })?
+                let df = self
+                    .ctx
+                    .sql(query_sql)
+                    .await
+                    .map_err(|e| DbError::query_pipeline(query_name, &e))?;
+                df.collect()
+                    .await
+                    .map_err(|e| DbError::query_pipeline(query_name, &e))?
+            };
+
+            // Apply Top-K post-filter if configured
+            let batches = match &self.queries[idx].order_config {
+                Some(OrderOperatorConfig::TopK(config)) => apply_topk_filter(&batches, config.k),
+                Some(OrderOperatorConfig::PerGroupTopK(config)) => {
+                    apply_topk_filter(&batches, config.k)
+                }
+                _ => batches,
             };
 
             if !batches.is_empty() {
@@ -410,18 +459,15 @@ impl StreamExecutor {
 
             let schema = batches[0].schema();
             let mem_table =
-                datafusion::datasource::MemTable::try_new(schema, vec![batches.clone()]).map_err(
-                    |e| DbError::Pipeline(format!("Failed to create temp table '{name}': {e}")),
-                )?;
+                datafusion::datasource::MemTable::try_new(schema, vec![batches.clone()])
+                    .map_err(|e| DbError::query_pipeline(name, &e))?;
 
             // Deregister first if it exists (from previous cycle)
             let _ = self.ctx.deregister_table(name);
 
             self.ctx
                 .register_table(name, Arc::new(mem_table))
-                .map_err(|e| {
-                    DbError::Pipeline(format!("Failed to register temp table '{name}': {e}"))
-                })?;
+                .map_err(|e| DbError::query_pipeline(name, &e))?;
 
             self.registered_sources.push(name.clone());
         }
@@ -431,16 +477,12 @@ impl StreamExecutor {
             if source_batches.contains_key(name) {
                 continue;
             }
-            let empty =
-                datafusion::datasource::MemTable::try_new(schema.clone(), vec![]).map_err(|e| {
-                    DbError::Pipeline(format!("Failed to create empty table '{name}': {e}"))
-                })?;
+            let empty = datafusion::datasource::MemTable::try_new(schema.clone(), vec![])
+                .map_err(|e| DbError::query_pipeline(name, &e))?;
             let _ = self.ctx.deregister_table(name);
             self.ctx
                 .register_table(name, Arc::new(empty))
-                .map_err(|e| {
-                    DbError::Pipeline(format!("Failed to register empty table '{name}': {e}"))
-                })?;
+                .map_err(|e| DbError::query_pipeline(name, &e))?;
             self.registered_sources.push(name.clone());
         }
 
@@ -633,19 +675,13 @@ impl StreamExecutor {
                 continue;
             }
             let schema = batches[0].schema();
-            let mem_table = datafusion::datasource::MemTable::try_new(
-                schema,
-                vec![batches.clone()],
-            )
-            .map_err(|e| {
-                DbError::Pipeline(format!("EOWC: Failed to create temp table '{name}': {e}"))
-            })?;
+            let mem_table =
+                datafusion::datasource::MemTable::try_new(schema, vec![batches.clone()])
+                    .map_err(|e| DbError::query_pipeline(name, &e))?;
             let _ = self.ctx.deregister_table(name);
             self.ctx
                 .register_table(name, Arc::new(mem_table))
-                .map_err(|e| {
-                    DbError::Pipeline(format!("EOWC: Failed to register temp table '{name}': {e}"))
-                })?;
+                .map_err(|e| DbError::query_pipeline(name, &e))?;
             eowc_temp_tables.push(name.clone());
         }
 
@@ -661,12 +697,14 @@ impl StreamExecutor {
             )
             .await?
         } else {
-            let df = self.ctx.sql(query_sql).await.map_err(|e| {
-                DbError::Pipeline(format!("EOWC stream '{query_name}' planning failed: {e}"))
-            })?;
-            df.collect().await.map_err(|e| {
-                DbError::Pipeline(format!("EOWC stream '{query_name}' execution failed: {e}"))
-            })?
+            let df = self
+                .ctx
+                .sql(query_sql)
+                .await
+                .map_err(|e| DbError::query_pipeline(query_name, &e))?;
+            df.collect()
+                .await
+                .map_err(|e| DbError::query_pipeline(query_name, &e))?
         };
 
         // Cleanup EOWC temp tables
@@ -719,27 +757,22 @@ impl StreamExecutor {
         if let Some(proj_sql) = projection_sql {
             let schema = joined.schema();
             let mem_table = datafusion::datasource::MemTable::try_new(schema, vec![vec![joined]])
-                .map_err(|e| {
-                DbError::Pipeline(format!("Stream '{query_name}' ASOF temp table failed: {e}"))
-            })?;
+                .map_err(|e| DbError::query_pipeline(query_name, &e))?;
 
             let _ = self.ctx.deregister_table("__asof_tmp");
             self.ctx
                 .register_table("__asof_tmp", Arc::new(mem_table))
-                .map_err(|e| {
-                    DbError::Pipeline(format!(
-                        "Stream '{query_name}' ASOF temp registration failed: {e}"
-                    ))
-                })?;
+                .map_err(|e| DbError::query_pipeline(query_name, &e))?;
 
-            let df = self.ctx.sql(proj_sql).await.map_err(|e| {
-                DbError::Pipeline(format!("Stream '{query_name}' ASOF projection failed: {e}"))
-            })?;
-            let result = df.collect().await.map_err(|e| {
-                DbError::Pipeline(format!(
-                    "Stream '{query_name}' ASOF projection execution failed: {e}"
-                ))
-            })?;
+            let df = self
+                .ctx
+                .sql(proj_sql)
+                .await
+                .map_err(|e| DbError::query_pipeline(query_name, &e))?;
+            let result = df
+                .collect()
+                .await
+                .map_err(|e| DbError::query_pipeline(query_name, &e))?;
 
             let _ = self.ctx.deregister_table("__asof_tmp");
             Ok(result)
@@ -764,13 +797,14 @@ impl StreamExecutor {
         }
         // Fall back to DataFusion context (e.g., static reference tables)
         let sql = format!("SELECT * FROM {table_name}");
-        let df =
-            self.ctx.sql(&sql).await.map_err(|e| {
-                DbError::Pipeline(format!("ASOF table '{table_name}' not found: {e}"))
-            })?;
+        let df = self
+            .ctx
+            .sql(&sql)
+            .await
+            .map_err(|e| DbError::query_pipeline(table_name, &e))?;
         df.collect()
             .await
-            .map_err(|e| DbError::Pipeline(format!("ASOF table '{table_name}' query failed: {e}")))
+            .map_err(|e| DbError::query_pipeline(table_name, &e))
     }
 }
 
@@ -816,6 +850,16 @@ fn compute_closed_boundary(watermark_ms: i64, config: &WindowOperatorConfig) -> 
             // belongs only to fully closed windows.
             let base = watermark_ms.saturating_sub(size);
             (base / slide + 1) * slide
+        }
+        WindowType::Cumulate => {
+            // Cumulate windows share the same epoch alignment as tumbling.
+            // A full epoch is closed when watermark >= epoch_end.
+            #[allow(clippy::cast_possible_truncation)]
+            let size = config.size.as_millis() as i64;
+            if size <= 0 {
+                return watermark_ms;
+            }
+            (watermark_ms / size) * size
         }
     }
 }
@@ -1032,6 +1076,35 @@ fn rewrite_expr(
     }
 }
 
+/// Apply a Top-K filter to batches, keeping at most `k` rows total.
+///
+/// `DataFusion` applies `LIMIT N` per micro-batch, but streaming Top-K
+/// needs a global limit across the combined result. This function
+/// concatenates all batches and slices to the first `k` rows.
+fn apply_topk_filter(batches: &[RecordBatch], k: usize) -> Vec<RecordBatch> {
+    if batches.is_empty() || k == 0 {
+        return Vec::new();
+    }
+
+    let total_rows: usize = batches.iter().map(RecordBatch::num_rows).sum();
+    if total_rows <= k {
+        return batches.to_vec();
+    }
+
+    // Slice across batches to keep exactly k rows
+    let mut remaining = k;
+    let mut result = Vec::new();
+    for batch in batches {
+        if remaining == 0 {
+            break;
+        }
+        let take = remaining.min(batch.num_rows());
+        result.push(batch.slice(0, take));
+        remaining -= take;
+    }
+    result
+}
+
 #[cfg(test)]
 #[allow(clippy::redundant_closure_for_method_calls)]
 mod tests {
@@ -1072,6 +1145,7 @@ mod tests {
             "SELECT name, SUM(value) as total FROM events GROUP BY name".to_string(),
             None,
             None,
+            None,
         );
 
         let mut source_batches = HashMap::new();
@@ -1100,6 +1174,7 @@ mod tests {
             "SELECT * FROM events".to_string(),
             None,
             None,
+            None,
         );
 
         let source_batches = HashMap::new();
@@ -1125,10 +1200,12 @@ mod tests {
             "SELECT COUNT(*) as cnt FROM events".to_string(),
             None,
             None,
+            None,
         );
         executor.add_query(
             "sum_stream".to_string(),
             "SELECT SUM(value) as total FROM events".to_string(),
+            None,
             None,
             None,
         );
@@ -1155,6 +1232,7 @@ mod tests {
             "SELECT * FROM events WHERE value > 1.5".to_string(),
             None,
             None,
+            None,
         );
 
         let mut source_batches = HashMap::new();
@@ -1178,6 +1256,7 @@ mod tests {
         executor.add_query(
             "pass".to_string(),
             "SELECT * FROM events".to_string(),
+            None,
             None,
             None,
         );
@@ -1224,6 +1303,7 @@ mod tests {
         executor.add_query(
             "joined".to_string(),
             "SELECT e.name, d.label FROM events e JOIN dim d ON e.id = d.id".to_string(),
+            None,
             None,
             None,
         );
@@ -1280,11 +1360,13 @@ mod tests {
             "SELECT name, SUM(value) as total FROM events GROUP BY name".to_string(),
             None,
             None,
+            None,
         );
         // level2: filter level1 results
         executor.add_query(
             "level2".to_string(),
             "SELECT name, total FROM level1 WHERE total > 1.0".to_string(),
+            None,
             None,
             None,
         );
@@ -1322,6 +1404,7 @@ mod tests {
             "SELECT name, value FROM events".to_string(),
             None,
             None,
+            None,
         );
         // level2: filter
         executor.add_query(
@@ -1329,11 +1412,13 @@ mod tests {
             "SELECT name, value FROM level1 WHERE value >= 2.0".to_string(),
             None,
             None,
+            None,
         );
         // level3: aggregate
         executor.add_query(
             "level3".to_string(),
             "SELECT COUNT(*) as cnt FROM level2".to_string(),
+            None,
             None,
             None,
         );
@@ -1375,10 +1460,12 @@ mod tests {
             "SELECT name, SUM(value) as total FROM events GROUP BY name".to_string(),
             None,
             None,
+            None,
         );
         executor.add_query(
             "filtered".to_string(),
             "SELECT name, value FROM events WHERE value > 1.5".to_string(),
+            None,
             None,
             None,
         );
@@ -1387,6 +1474,7 @@ mod tests {
             "combined".to_string(),
             "SELECT a.name, a.total, f.value FROM agg a JOIN filtered f ON a.name = f.name"
                 .to_string(),
+            None,
             None,
             None,
         );
@@ -1420,10 +1508,12 @@ mod tests {
             "SELECT name, total FROM upstream WHERE total > 1.0".to_string(),
             None,
             None,
+            None,
         );
         executor.add_query(
             "upstream".to_string(),
             "SELECT name, SUM(value) as total FROM events GROUP BY name".to_string(),
+            None,
             None,
             None,
         );
@@ -1461,10 +1551,12 @@ mod tests {
             "SELECT name, value FROM events".to_string(),
             None,
             None,
+            None,
         );
         executor.add_query(
             "level2".to_string(),
             "SELECT name FROM level1".to_string(),
+            None,
             None,
             None,
         );
@@ -1485,6 +1577,7 @@ mod tests {
         executor.add_query(
             "bad_query".to_string(),
             "SELECTTTT * FROMM nowhere".to_string(),
+            None,
             None,
             None,
         );
@@ -1511,6 +1604,7 @@ mod tests {
         executor.add_query(
             "missing_col".to_string(),
             "SELECT nonexistent_column FROM events".to_string(),
+            None,
             None,
             None,
         );
@@ -1620,6 +1714,7 @@ mod tests {
                 .to_string(),
             None,
             None,
+            None,
         );
 
         let mut source_batches = HashMap::new();
@@ -1656,6 +1751,7 @@ mod tests {
              FROM trades t ASOF JOIN quotes q \
              MATCH_CONDITION(t.ts >= q.ts) ON t.symbol = q.symbol"
                 .to_string(),
+            None,
             None,
             None,
         );
@@ -1702,6 +1798,7 @@ mod tests {
                 .to_string(),
             None,
             None,
+            None,
         );
 
         // Only trades, no quotes → should still work (left join with nulls)
@@ -1735,12 +1832,14 @@ mod tests {
                 .to_string(),
             None,
             None,
+            None,
         );
 
         // Downstream query filters ASOF results
         executor.add_query(
             "filtered".to_string(),
             "SELECT symbol, price, bid FROM enriched WHERE price > 151.0".to_string(),
+            None,
             None,
             None,
         );
@@ -1771,6 +1870,7 @@ mod tests {
         executor.add_query(
             "simple".to_string(),
             "SELECT name, SUM(value) as total FROM events GROUP BY name".to_string(),
+            None,
             None,
             None,
         );
@@ -1835,6 +1935,7 @@ mod tests {
             "SELECT symbol, AVG(price) as avg_price FROM trades GROUP BY symbol".to_string(),
             Some(EmitClause::OnWindowClose),
             Some(tumbling_window_config(1000)),
+            None,
         );
 
         let mut source_batches = HashMap::new();
@@ -1872,6 +1973,7 @@ mod tests {
             "SELECT symbol, SUM(price) as total FROM trades GROUP BY symbol".to_string(),
             Some(EmitClause::OnWindowClose),
             Some(tumbling_window_config(1000)),
+            None,
         );
 
         // Cycle 1: push data at ts=100
@@ -1921,6 +2023,7 @@ mod tests {
             "SELECT COUNT(*) as cnt FROM trades".to_string(),
             Some(EmitClause::OnWindowClose),
             Some(tumbling_window_config(1000)),
+            None,
         );
 
         // Push data spanning two windows: [0,1000) and [1000,2000)
@@ -1972,6 +2075,7 @@ mod tests {
             "SELECT symbol, price FROM trades".to_string(),
             None, // no emit clause → non-EOWC
             None,
+            None,
         );
 
         let mut source_batches = HashMap::new();
@@ -2005,6 +2109,7 @@ mod tests {
             "SELECT symbol, price FROM trades".to_string(),
             None,
             None,
+            None,
         );
 
         // EOWC query
@@ -2013,6 +2118,7 @@ mod tests {
             "SELECT symbol, AVG(price) as avg_price FROM trades GROUP BY symbol".to_string(),
             Some(EmitClause::Final),
             Some(tumbling_window_config(1000)),
+            None,
         );
 
         let mut source_batches = HashMap::new();
@@ -2116,16 +2222,19 @@ mod tests {
             "SELECT name, value FROM events".to_string(),
             None,
             None,
+            None,
         );
         executor.add_query(
             "level2".to_string(),
             "SELECT name FROM level1 WHERE name = 'a'".to_string(),
             None,
             None,
+            None,
         );
         executor.add_query(
             "joined".to_string(),
             "SELECT a.name, b.name FROM level1 a JOIN level2 b ON a.name = b.name".to_string(),
+            None,
             None,
             None,
         );
@@ -2161,10 +2270,12 @@ mod tests {
             "SELECT name, total FROM upstream WHERE total > 1.0".to_string(),
             None,
             None,
+            None,
         );
         executor.add_query(
             "upstream".to_string(),
             "SELECT name, SUM(value) as total FROM events GROUP BY name".to_string(),
+            None,
             None,
             None,
         );
@@ -2183,5 +2294,126 @@ mod tests {
 
         assert!(results.contains_key("upstream"));
         assert!(results.contains_key("downstream"));
+    }
+
+    // ── EmitStrategy conversion tests ──
+
+    #[test]
+    fn test_sql_emit_to_core_all_variants() {
+        use laminar_core::operator::window::EmitStrategy as CoreEmit;
+        use laminar_sql::parser::EmitStrategy as SqlEmit;
+
+        assert_eq!(
+            sql_emit_to_core(&SqlEmit::OnWatermark),
+            CoreEmit::OnWatermark
+        );
+        assert_eq!(
+            sql_emit_to_core(&SqlEmit::OnWindowClose),
+            CoreEmit::OnWindowClose
+        );
+        assert_eq!(
+            sql_emit_to_core(&SqlEmit::Periodic(std::time::Duration::from_secs(5))),
+            CoreEmit::Periodic(std::time::Duration::from_secs(5))
+        );
+        assert_eq!(sql_emit_to_core(&SqlEmit::OnUpdate), CoreEmit::OnUpdate);
+        assert_eq!(sql_emit_to_core(&SqlEmit::Changelog), CoreEmit::Changelog);
+        // This is the key mapping: SQL FinalOnly → Core Final
+        assert_eq!(sql_emit_to_core(&SqlEmit::FinalOnly), CoreEmit::Final);
+    }
+
+    #[test]
+    fn test_emit_clause_to_core() {
+        use laminar_core::operator::window::EmitStrategy as CoreEmit;
+
+        assert_eq!(
+            emit_clause_to_core(&EmitClause::AfterWatermark).unwrap(),
+            CoreEmit::OnWatermark
+        );
+        assert_eq!(
+            emit_clause_to_core(&EmitClause::Final).unwrap(),
+            CoreEmit::Final
+        );
+        assert_eq!(
+            emit_clause_to_core(&EmitClause::Changes).unwrap(),
+            CoreEmit::Changelog
+        );
+        assert_eq!(
+            emit_clause_to_core(&EmitClause::OnWindowClose).unwrap(),
+            CoreEmit::OnWindowClose
+        );
+        assert_eq!(
+            emit_clause_to_core(&EmitClause::OnUpdate).unwrap(),
+            CoreEmit::OnUpdate
+        );
+    }
+
+    // ── Top-K post-filter tests ──
+
+    #[test]
+    fn test_apply_topk_filter_limits_rows() {
+        let batch = test_batch(); // 3 rows
+        let result = apply_topk_filter(&[batch], 2);
+        let total: usize = result.iter().map(|b| b.num_rows()).sum();
+        assert_eq!(total, 2);
+    }
+
+    #[test]
+    fn test_apply_topk_filter_no_op_when_under_limit() {
+        let batch = test_batch(); // 3 rows
+        let result = apply_topk_filter(std::slice::from_ref(&batch), 10);
+        let total: usize = result.iter().map(|b| b.num_rows()).sum();
+        assert_eq!(total, 3);
+    }
+
+    #[test]
+    fn test_apply_topk_filter_across_batches() {
+        let batch = test_batch(); // 3 rows each
+        let result = apply_topk_filter(&[batch.clone(), batch], 4);
+        let total: usize = result.iter().map(|b| b.num_rows()).sum();
+        assert_eq!(total, 4);
+    }
+
+    #[test]
+    fn test_apply_topk_filter_empty() {
+        let result = apply_topk_filter(&[], 5);
+        assert!(result.is_empty());
+    }
+
+    #[tokio::test]
+    async fn test_executor_topk_query() {
+        use laminar_sql::parser::order_analyzer::OrderColumn;
+
+        let ctx = SessionContext::new();
+        register_streaming_functions(&ctx);
+        let mut executor = StreamExecutor::new(ctx);
+
+        // Register with a Top-K config that limits to 2 rows
+        executor.add_query(
+            "topk_stream".to_string(),
+            "SELECT * FROM events ORDER BY value DESC".to_string(),
+            None,
+            None,
+            Some(OrderOperatorConfig::TopK(
+                laminar_sql::translator::TopKConfig {
+                    k: 2,
+                    sort_columns: vec![OrderColumn {
+                        column: "value".to_string(),
+                        descending: true,
+                        nulls_first: false,
+                    }],
+                },
+            )),
+        );
+
+        let mut source_batches = HashMap::new();
+        source_batches.insert("events".to_string(), vec![test_batch()]); // 3 rows
+
+        let results = executor
+            .execute_cycle(&source_batches, i64::MAX)
+            .await
+            .unwrap();
+        assert!(results.contains_key("topk_stream"));
+        let total_rows: usize = results["topk_stream"].iter().map(|b| b.num_rows()).sum();
+        assert_eq!(total_rows, 2);
     }
 }

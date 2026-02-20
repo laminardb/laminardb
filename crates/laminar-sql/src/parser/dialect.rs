@@ -32,4 +32,8 @@ impl Dialect for LaminarDialect {
     fn supports_filter_during_aggregation(&self) -> bool {
         true
     }
+
+    fn supports_timestamp_versioning(&self) -> bool {
+        true
+    }
 }

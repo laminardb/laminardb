@@ -28,10 +28,9 @@ pgwire-replication = { version = "0.2", optional = true }
 mysql_async = { version = "0.36", optional = true, default-features = false, features = ["rustls-tls", "binlog", "minimal-rust"] }
 tokio-stream = { workspace = true, optional = true }
 
-# Delta Lake - using git main branch (has DataFusion 52.x)
-# Published 0.30.2 requires DF 51.0, but main branch has DF 52.x
-# version is required for crates.io publishing; git spec is used locally, stripped on publish
-deltalake = { version = ">=0.30", git = "https://github.com/delta-io/delta-rs", branch = "main", optional = true, default-features = false, features = ["rustls"] }
+# Delta Lake
+deltalake = { version = "0.31.0", optional = true, default-features = false, features = ["rustls"] }
+datafusion = { workspace = true, optional = true }
 url = { version = "2", optional = true }
 uuid = { workspace = true }
 
@@ -71,7 +70,7 @@ postgres-sink = ["dep:tokio-postgres", "dep:postgres-types"]
 # mysql-cdc: Business logic + mysql_async driver with rustls (no OpenSSL required)
 mysql-cdc = ["dep:mysql_async", "dep:tokio-stream"]
 # Delta Lake - using git main branch with DataFusion 52.x
-delta-lake = ["dep:deltalake", "dep:url", "deltalake/datafusion"]
+delta-lake = ["dep:deltalake", "dep:url", "dep:datafusion", "deltalake/datafusion", "dep:tokio-util", "dep:chrono"]
 delta-lake-s3 = ["delta-lake", "deltalake/s3"]
 delta-lake-azure = ["delta-lake", "deltalake/azure"]
 delta-lake-gcs = ["delta-lake", "deltalake/gcs"]

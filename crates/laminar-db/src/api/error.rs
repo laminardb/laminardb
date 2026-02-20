@@ -278,6 +278,24 @@ impl From<crate::DbError> for ApiError {
                 code: codes::QUERY_FAILED,
                 message: msg,
             },
+
+            // DataFusion errors are query errors, not internal errors
+            DbError::DataFusion(e) => {
+                let translated = laminar_sql::error::translate_datafusion_error(&e.to_string());
+                Self::query(translated.to_string())
+            }
+
+            DbError::Engine(e) => Self::internal(format!("Engine error: {e}")),
+            DbError::Connector(msg) => Self::internal(format!("Connector error: {msg}")),
+            DbError::Pipeline(msg) => Self::internal(format!("Pipeline error: {msg}")),
+            DbError::QueryPipeline {
+                context,
+                translated,
+            } => Self::query(format!("Stream '{context}': {translated}")),
+            DbError::MaterializedView(msg) => {
+                Self::query(format!("Materialized view error: {msg}"))
+            }
+
             other => Self::internal(other.to_string()),
         }
     }
@@ -311,5 +329,55 @@ mod tests {
         let api_err: ApiError = db_err.into();
         assert_eq!(api_err.code(), codes::TABLE_NOT_FOUND);
         assert!(api_err.message().contains("foo"));
+    }
+
+    #[test]
+    fn test_datafusion_error_becomes_query_not_internal() {
+        let datafusion_err =
+            datafusion_common::DataFusionError::Plan("No field named 'foo'".to_string());
+        let db_error = crate::DbError::DataFusion(datafusion_err);
+        let api_err: ApiError = db_error.into();
+        // Should be a Query error, not Internal
+        assert_eq!(api_err.code(), codes::QUERY_FAILED);
+        assert!(
+            api_err.message().contains("foo"),
+            "message was: {}",
+            api_err.message()
+        );
+        // Should not contain raw "DataFusion" prefix
+        assert!(
+            !api_err.message().contains("DataFusion"),
+            "message was: {}",
+            api_err.message()
+        );
+    }
+
+    #[test]
+    fn test_query_pipeline_error_becomes_query_not_internal() {
+        let db_err = crate::DbError::QueryPipeline {
+            context: "my_stream".to_string(),
+            translated: "[LDB-1100] Column 'foo' not found in query".to_string(),
+        };
+        let api_err: ApiError = db_err.into();
+        // Should be a Query error (400), not Internal (900)
+        assert_eq!(api_err.code(), codes::QUERY_FAILED);
+        assert!(
+            api_err.message().contains("my_stream"),
+            "message should include stream name: {}",
+            api_err.message()
+        );
+        assert!(
+            api_err.message().contains("LDB-1100"),
+            "message should include error code: {}",
+            api_err.message()
+        );
+    }
+
+    #[test]
+    fn test_materialized_view_error_becomes_query() {
+        let db_err = crate::DbError::MaterializedView("view failed".into());
+        let api_err: ApiError = db_err.into();
+        assert_eq!(api_err.code(), codes::QUERY_FAILED);
+        assert!(api_err.message().contains("view failed"));
     }
 }

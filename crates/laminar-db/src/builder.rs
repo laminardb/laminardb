@@ -3,6 +3,7 @@
 use std::collections::HashMap;
 use std::path::PathBuf;
 
+use datafusion_expr::{AggregateUDF, ScalarUDF};
 use laminar_core::streaming::{BackpressureStrategy, StreamCheckpointConfig};
 
 use crate::config::LaminarConfig;
@@ -30,6 +31,8 @@ pub struct LaminarDbBuilder {
     connector_callbacks: Vec<ConnectorCallback>,
     profile: Profile,
     object_store_url: Option<String>,
+    custom_udfs: Vec<ScalarUDF>,
+    custom_udafs: Vec<AggregateUDF>,
 }
 
 impl LaminarDbBuilder {
@@ -42,6 +45,8 @@ impl LaminarDbBuilder {
             connector_callbacks: Vec::new(),
             profile: Profile::default(),
             object_store_url: None,
+            custom_udfs: Vec::new(),
+            custom_udafs: Vec::new(),
         }
     }
 
@@ -99,6 +104,46 @@ impl LaminarDbBuilder {
         self
     }
 
+    /// Register a custom scalar UDF with the database.
+    ///
+    /// The UDF will be available in SQL queries after `build()`.
+    ///
+    /// # Example
+    ///
+    /// ```rust,ignore
+    /// use datafusion_expr::ScalarUDF;
+    ///
+    /// let db = LaminarDB::builder()
+    ///     .register_udf(my_scalar_udf)
+    ///     .build()
+    ///     .await?;
+    /// ```
+    #[must_use]
+    pub fn register_udf(mut self, udf: ScalarUDF) -> Self {
+        self.custom_udfs.push(udf);
+        self
+    }
+
+    /// Register a custom aggregate UDF (UDAF) with the database.
+    ///
+    /// The UDAF will be available in SQL queries after `build()`.
+    ///
+    /// # Example
+    ///
+    /// ```rust,ignore
+    /// use datafusion_expr::AggregateUDF;
+    ///
+    /// let db = LaminarDB::builder()
+    ///     .register_udaf(my_aggregate_udf)
+    ///     .build()
+    ///     .await?;
+    /// ```
+    #[must_use]
+    pub fn register_udaf(mut self, udaf: AggregateUDF) -> Self {
+        self.custom_udafs.push(udaf);
+        self
+    }
+
     /// Register custom connectors with the `ConnectorRegistry`.
     ///
     /// The callback is invoked after the database is created and built-in
@@ -146,6 +191,12 @@ impl LaminarDbBuilder {
         for callback in self.connector_callbacks {
             callback(db.connector_registry());
         }
+        for udf in self.custom_udfs {
+            db.register_custom_udf(udf);
+        }
+        for udaf in self.custom_udafs {
+            db.register_custom_udaf(udaf);
+        }
         Ok(db)
     }
 }
@@ -164,6 +215,8 @@ impl std::fmt::Debug for LaminarDbBuilder {
             .field("object_store_url", &self.object_store_url)
             .field("config_vars_count", &self.config_vars.len())
             .field("connector_callbacks", &self.connector_callbacks.len())
+            .field("custom_udfs", &self.custom_udfs.len())
+            .field("custom_udafs", &self.custom_udafs.len())
             .finish()
     }
 }
@@ -211,5 +264,78 @@ mod tests {
         let debug = format!("{builder:?}");
         assert!(debug.contains("LaminarDbBuilder"));
         assert!(debug.contains("config_vars_count: 1"));
+    }
+
+    #[tokio::test]
+    async fn test_builder_register_udf() {
+        use std::any::Any;
+        use std::hash::{Hash, Hasher};
+
+        use arrow::datatypes::DataType;
+        use datafusion_expr::{
+            ColumnarValue, ScalarFunctionArgs, ScalarUDFImpl, Signature, TypeSignature, Volatility,
+        };
+
+        /// Trivial UDF that returns 42.
+        #[derive(Debug)]
+        struct FortyTwo {
+            signature: Signature,
+        }
+
+        impl FortyTwo {
+            fn new() -> Self {
+                Self {
+                    signature: Signature::new(TypeSignature::Nullary, Volatility::Immutable),
+                }
+            }
+        }
+
+        impl PartialEq for FortyTwo {
+            fn eq(&self, _: &Self) -> bool {
+                true
+            }
+        }
+
+        impl Eq for FortyTwo {}
+
+        impl Hash for FortyTwo {
+            fn hash<H: Hasher>(&self, state: &mut H) {
+                "forty_two".hash(state);
+            }
+        }
+
+        impl ScalarUDFImpl for FortyTwo {
+            fn as_any(&self) -> &dyn Any {
+                self
+            }
+            fn name(&self) -> &'static str {
+                "forty_two"
+            }
+            fn signature(&self) -> &Signature {
+                &self.signature
+            }
+            fn return_type(&self, _: &[DataType]) -> datafusion_common::Result<DataType> {
+                Ok(DataType::Int64)
+            }
+            fn invoke_with_args(
+                &self,
+                _args: ScalarFunctionArgs,
+            ) -> datafusion_common::Result<ColumnarValue> {
+                Ok(ColumnarValue::Scalar(
+                    datafusion_common::ScalarValue::Int64(Some(42)),
+                ))
+            }
+        }
+
+        let udf = ScalarUDF::new_from_impl(FortyTwo::new());
+        let db = LaminarDB::builder()
+            .register_udf(udf)
+            .build()
+            .await
+            .unwrap();
+
+        // Verify the UDF is queryable
+        let result = db.execute("SELECT forty_two()").await;
+        assert!(result.is_ok(), "UDF should be callable: {result:?}");
     }
 }

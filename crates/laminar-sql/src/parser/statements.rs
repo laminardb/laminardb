@@ -56,6 +56,8 @@ pub enum StreamingStatement {
         name: ObjectName,
         /// Whether IF EXISTS was specified
         if_exists: bool,
+        /// Whether CASCADE was specified (drops dependent streams/MVs)
+        cascade: bool,
     },
 
     /// DROP SINK statement
@@ -64,6 +66,8 @@ pub enum StreamingStatement {
         name: ObjectName,
         /// Whether IF EXISTS was specified
         if_exists: bool,
+        /// Whether CASCADE was specified
+        cascade: bool,
     },
 
     /// DROP MATERIALIZED VIEW statement
@@ -127,6 +131,16 @@ pub enum StreamingStatement {
         name: ObjectName,
         /// Whether IF EXISTS was specified
         if_exists: bool,
+        /// Whether CASCADE was specified
+        cascade: bool,
+    },
+
+    /// ALTER SOURCE — modify a source definition
+    AlterSource {
+        /// Source name to alter
+        name: ObjectName,
+        /// The alteration to apply
+        operation: AlterSourceOperation,
     },
 
     /// INSERT INTO a streaming source or table
@@ -148,6 +162,21 @@ pub enum StreamingStatement {
         name: ObjectName,
         /// Whether IF EXISTS was specified
         if_exists: bool,
+    },
+}
+
+/// Operations for ALTER SOURCE statements.
+#[derive(Debug, Clone, PartialEq)]
+pub enum AlterSourceOperation {
+    /// Add a new column: `ALTER SOURCE name ADD COLUMN col_name data_type`
+    AddColumn {
+        /// Column definition
+        column_def: ColumnDef,
+    },
+    /// Set source properties: `ALTER SOURCE name SET ('key' = 'value', ...)`
+    SetProperties {
+        /// Key-value pairs
+        properties: HashMap<String, String>,
     },
 }
 
@@ -459,6 +488,15 @@ pub enum WindowFunction {
         /// The gap interval (max gap between events in same session)
         gap_interval: Box<Expr>,
     },
+    /// CUMULATE(column, step, size)
+    Cumulate {
+        /// The time column to window on
+        time_column: Box<Expr>,
+        /// The step interval (window growth increment)
+        step_interval: Box<Expr>,
+        /// The max window size interval (epoch size)
+        max_size_interval: Box<Expr>,
+    },
 }
 
 #[cfg(test)]
@@ -615,11 +653,17 @@ mod tests {
         let stmt = StreamingStatement::DropSource {
             name: ObjectName(vec![ObjectNamePart::Identifier(Ident::new("events"))]),
             if_exists: true,
+            cascade: false,
         };
         match stmt {
-            StreamingStatement::DropSource { name, if_exists } => {
+            StreamingStatement::DropSource {
+                name,
+                if_exists,
+                cascade,
+            } => {
                 assert_eq!(name.to_string(), "events");
                 assert!(if_exists);
+                assert!(!cascade);
             }
             _ => panic!("Expected DropSource"),
         }
@@ -630,11 +674,17 @@ mod tests {
         let stmt = StreamingStatement::DropSink {
             name: ObjectName(vec![ObjectNamePart::Identifier(Ident::new("output"))]),
             if_exists: false,
+            cascade: false,
         };
         match stmt {
-            StreamingStatement::DropSink { name, if_exists } => {
+            StreamingStatement::DropSink {
+                name,
+                if_exists,
+                cascade,
+            } => {
                 assert_eq!(name.to_string(), "output");
                 assert!(!if_exists);
+                assert!(!cascade);
             }
             _ => panic!("Expected DropSink"),
         }

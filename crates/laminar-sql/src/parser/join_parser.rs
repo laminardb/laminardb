@@ -8,7 +8,9 @@
 
 use std::time::Duration;
 
-use sqlparser::ast::{BinaryOperator, Expr, JoinConstraint, JoinOperator, Select, TableFactor};
+use sqlparser::ast::{
+    BinaryOperator, Expr, JoinConstraint, JoinOperator, Select, TableFactor, TableVersion,
+};
 
 use super::window_rewriter::WindowRewriter;
 use super::ParseError;
@@ -24,6 +26,14 @@ pub enum JoinType {
     Right,
     /// FULL \[OUTER\] JOIN
     Full,
+    /// LEFT SEMI JOIN — emit left rows with at least one match
+    LeftSemi,
+    /// LEFT ANTI JOIN — emit left rows with no match
+    LeftAnti,
+    /// RIGHT SEMI JOIN — emit right rows with at least one match
+    RightSemi,
+    /// RIGHT ANTI JOIN — emit right rows with no match
+    RightAnti,
     /// ASOF JOIN
     AsOf,
 }
@@ -77,6 +87,10 @@ pub struct JoinAnalysis {
     pub right_time_column: Option<String>,
     /// ASOF join tolerance (max time difference)
     pub asof_tolerance: Option<Duration>,
+    /// Whether this is a temporal join (FOR SYSTEM_TIME AS OF)
+    pub is_temporal_join: bool,
+    /// The version column from FOR SYSTEM_TIME AS OF (e.g., `order_time`)
+    pub temporal_version_column: Option<String>,
 }
 
 impl JoinAnalysis {
@@ -105,6 +119,8 @@ impl JoinAnalysis {
             left_time_column: None,
             right_time_column: None,
             asof_tolerance: None,
+            is_temporal_join: false,
+            temporal_version_column: None,
         }
     }
 
@@ -132,6 +148,8 @@ impl JoinAnalysis {
             left_time_column: None,
             right_time_column: None,
             asof_tolerance: None,
+            is_temporal_join: false,
+            temporal_version_column: None,
         }
     }
 
@@ -163,6 +181,38 @@ impl JoinAnalysis {
             left_time_column: Some(left_time_col),
             right_time_column: Some(right_time_col),
             asof_tolerance: tolerance,
+            is_temporal_join: false,
+            temporal_version_column: None,
+        }
+    }
+
+    /// Create a temporal join analysis (FOR SYSTEM_TIME AS OF).
+    #[must_use]
+    pub fn temporal(
+        left_table: String,
+        right_table: String,
+        left_key: String,
+        right_key: String,
+        version_column: String,
+        join_type: JoinType,
+    ) -> Self {
+        Self {
+            join_type,
+            left_table,
+            right_table,
+            left_key_column: left_key,
+            right_key_column: right_key,
+            time_bound: None,
+            is_lookup_join: false,
+            left_alias: None,
+            right_alias: None,
+            is_asof_join: false,
+            asof_direction: None,
+            left_time_column: None,
+            right_time_column: None,
+            asof_tolerance: None,
+            is_temporal_join: true,
+            temporal_version_column: Some(version_column),
         }
     }
 }
@@ -223,6 +273,22 @@ pub fn analyze_join(select: &Select) -> Result<Option<JoinAnalysis>, ParseError>
         return Ok(Some(analysis));
     }
 
+    // Check for temporal join (FOR SYSTEM_TIME AS OF)
+    if let Some(version_col) = extract_temporal_version(&join.relation) {
+        let (left_key, right_key, _) = analyze_join_constraint(&join.join_operator)?;
+        let mut analysis = JoinAnalysis::temporal(
+            left_table,
+            right_table,
+            left_key,
+            right_key,
+            version_col,
+            join_type,
+        );
+        analysis.left_alias = left_alias;
+        analysis.right_alias = right_alias;
+        return Ok(Some(analysis));
+    }
+
     // Analyze the join constraint
     let (left_key, right_key, time_bound) = analyze_join_constraint(&join.join_operator)?;
 
@@ -257,6 +323,35 @@ fn extract_table_name(factor: &TableFactor) -> Result<String, ParseError> {
     }
 }
 
+/// Extract the version column from a temporal join's `FOR SYSTEM_TIME AS OF` clause.
+///
+/// Returns `Some(column_name)` if the table factor has a temporal version qualifier,
+/// `None` otherwise.
+fn extract_temporal_version(factor: &TableFactor) -> Option<String> {
+    if let TableFactor::Table {
+        version: Some(TableVersion::ForSystemTimeAsOf(expr)),
+        ..
+    } = factor
+    {
+        Some(extract_column_name_from_expr(expr))
+    } else {
+        None
+    }
+}
+
+/// Extract a column name from an expression (e.g., `o.order_time` → `order_time`).
+///
+/// Falls back to the full expression string for complex expressions.
+fn extract_column_name_from_expr(expr: &Expr) -> String {
+    match expr {
+        Expr::Identifier(ident) => ident.value.clone(),
+        Expr::CompoundIdentifier(parts) => parts
+            .last()
+            .map_or_else(|| expr.to_string(), |p| p.value.clone()),
+        _ => expr.to_string(),
+    }
+}
+
 /// Extract table alias from a TableFactor.
 fn extract_table_alias(factor: &TableFactor) -> Option<String> {
     match factor {
@@ -266,7 +361,7 @@ fn extract_table_alias(factor: &TableFactor) -> Option<String> {
     }
 }
 
-/// Map sqlparser JoinOperator to our JoinType.
+/// Map sqlparser `JoinOperator` to our `JoinType`.
 fn map_join_operator(op: &JoinOperator) -> JoinType {
     match op {
         JoinOperator::Inner(_)
@@ -275,17 +370,13 @@ fn map_join_operator(op: &JoinOperator) -> JoinType {
         | JoinOperator::CrossApply
         | JoinOperator::OuterApply
         | JoinOperator::StraightJoin(_) => JoinType::Inner,
-        JoinOperator::Left(_)
-        | JoinOperator::LeftOuter(_)
-        | JoinOperator::LeftSemi(_)
-        | JoinOperator::LeftAnti(_)
-        | JoinOperator::Semi(_) => JoinType::Left,
+        JoinOperator::Left(_) | JoinOperator::LeftOuter(_) => JoinType::Left,
+        JoinOperator::LeftSemi(_) | JoinOperator::Semi(_) => JoinType::LeftSemi,
+        JoinOperator::LeftAnti(_) => JoinType::LeftAnti,
         JoinOperator::AsOf { .. } => JoinType::AsOf,
-        JoinOperator::Right(_)
-        | JoinOperator::RightOuter(_)
-        | JoinOperator::RightSemi(_)
-        | JoinOperator::RightAnti(_)
-        | JoinOperator::Anti(_) => JoinType::Right,
+        JoinOperator::Right(_) | JoinOperator::RightOuter(_) => JoinType::Right,
+        JoinOperator::RightSemi(_) => JoinType::RightSemi,
+        JoinOperator::RightAnti(_) | JoinOperator::Anti(_) => JoinType::RightAnti,
         JoinOperator::FullOuter(_) => JoinType::Full,
     }
 }
@@ -729,6 +820,21 @@ pub fn analyze_joins(select: &Select) -> Result<Option<MultiJoinAnalysis>, Parse
             analysis.left_alias.clone_from(&prev_left_alias);
             analysis.right_alias = right_alias;
             join_steps.push(analysis);
+        } else if let Some(version_col) = extract_temporal_version(&join.relation) {
+            // Temporal join: right side has FOR SYSTEM_TIME AS OF
+            let (left_key, right_key, _) = analyze_join_constraint(&join.join_operator)?;
+
+            let mut analysis = JoinAnalysis::temporal(
+                prev_left_table.clone(),
+                right_table.clone(),
+                left_key,
+                right_key,
+                version_col,
+                join_type,
+            );
+            analysis.left_alias.clone_from(&prev_left_alias);
+            analysis.right_alias = right_alias;
+            join_steps.push(analysis);
         } else {
             // Regular join (inner, left, right, full)
             let (left_key, right_key, time_bound) = analyze_join_constraint(&join.join_operator)?;
@@ -884,6 +990,17 @@ mod tests {
 
     fn parse_select_snowflake(sql: &str) -> Select {
         let dialect = sqlparser::dialect::SnowflakeDialect {};
+        let statements = Parser::parse_sql(&dialect, sql).unwrap();
+        if let Statement::Query(query) = &statements[0] {
+            if let SetExpr::Select(select) = query.body.as_ref() {
+                return *select.clone();
+            }
+        }
+        panic!("Expected SELECT query");
+    }
+
+    fn parse_select_laminar(sql: &str) -> Select {
+        let dialect = crate::parser::dialect::LaminarDialect::default();
         let statements = Parser::parse_sql(&dialect, sql).unwrap();
         if let Statement::Query(query) = &statements[0] {
             if let SetExpr::Select(select) = query.body.as_ref() {
@@ -1113,5 +1230,57 @@ mod tests {
         let select = parse_select(sql);
         let multi = analyze_joins(&select).unwrap();
         assert!(multi.is_none());
+    }
+
+    // -- Temporal JOIN tests (FOR SYSTEM_TIME AS OF) --
+
+    #[test]
+    fn test_temporal_join_detected() {
+        let sql = "SELECT o.*, p.price \
+                    FROM orders o \
+                    JOIN products FOR SYSTEM_TIME AS OF o.order_time AS p \
+                    ON o.product_id = p.id";
+        let select = parse_select_laminar(sql);
+        let analysis = analyze_join(&select).unwrap().unwrap();
+
+        assert!(analysis.is_temporal_join);
+        assert_eq!(
+            analysis.temporal_version_column,
+            Some("order_time".to_string())
+        );
+        assert_eq!(analysis.left_table, "orders");
+        assert_eq!(analysis.right_table, "products");
+        assert_eq!(analysis.left_key_column, "product_id");
+        assert_eq!(analysis.right_key_column, "id");
+        assert!(!analysis.is_lookup_join);
+        assert!(!analysis.is_asof_join);
+    }
+
+    #[test]
+    fn test_temporal_join_via_analyze_joins() {
+        let sql = "SELECT o.*, p.price \
+                    FROM orders o \
+                    JOIN products FOR SYSTEM_TIME AS OF o.order_time AS p \
+                    ON o.product_id = p.id";
+        let select = parse_select_laminar(sql);
+        let multi = analyze_joins(&select).unwrap().unwrap();
+
+        assert_eq!(multi.len(), 1);
+        let first = multi.first().unwrap();
+        assert!(first.is_temporal_join);
+        assert_eq!(
+            first.temporal_version_column,
+            Some("order_time".to_string())
+        );
+    }
+
+    #[test]
+    fn test_non_temporal_join_not_flagged() {
+        let sql = "SELECT * FROM orders o JOIN payments p ON o.id = p.order_id";
+        let select = parse_select(sql);
+        let analysis = analyze_join(&select).unwrap().unwrap();
+
+        assert!(!analysis.is_temporal_join);
+        assert!(analysis.temporal_version_column.is_none());
     }
 }

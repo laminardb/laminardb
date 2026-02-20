@@ -116,6 +116,11 @@ pub struct WatermarkSpec {
     pub column: String,
     /// Bounded out-of-orderness duration.
     pub max_out_of_orderness: Duration,
+    /// Whether this is a processing-time watermark (`PROCTIME()`).
+    ///
+    /// When `true`, the runtime should use `ProcessingTimeGenerator`
+    /// instead of `BoundedOutOfOrdernessGenerator`.
+    pub is_processing_time: bool,
 }
 
 /// Configuration options for a streaming source.
@@ -452,6 +457,16 @@ pub fn sql_type_to_arrow(sql_type: &SqlDataType) -> Result<DataType, ParseError>
     }
 }
 
+/// Checks if an expression is a `PROCTIME()` function call.
+fn is_proctime_call(expr: &sqlparser::ast::Expr) -> bool {
+    if let sqlparser::ast::Expr::Function(func) = expr {
+        if let Some(name) = func.name.0.last() {
+            return name.to_string().eq_ignore_ascii_case("proctime");
+        }
+    }
+    false
+}
+
 /// Parses watermark definition.
 fn parse_watermark(
     wm: &WatermarkDef,
@@ -485,6 +500,17 @@ fn parse_watermark(
         )));
     }
 
+    // Check for PROCTIME() watermark expression
+    if let Some(expr) = &wm.expression {
+        if is_proctime_call(expr) {
+            return Ok(WatermarkSpec {
+                column: column_name,
+                max_out_of_orderness: Duration::ZERO,
+                is_processing_time: true,
+            });
+        }
+    }
+
     // Parse the watermark expression to extract out-of-orderness.
     // When expression is None (WATERMARK FOR col without AS), use zero delay.
     let max_out_of_orderness = match &wm.expression {
@@ -495,6 +521,7 @@ fn parse_watermark(
     Ok(WatermarkSpec {
         column: column_name,
         max_out_of_orderness,
+        is_processing_time: false,
     })
 }
 
@@ -875,5 +902,36 @@ mod tests {
         let wm = def.watermark.unwrap();
         assert_eq!(wm.column, "ts");
         assert_eq!(wm.max_out_of_orderness, Duration::ZERO);
+    }
+
+    #[test]
+    fn test_watermark_proctime() {
+        let def = parse_and_translate(
+            "CREATE SOURCE events (
+                ts TIMESTAMP,
+                WATERMARK FOR ts AS PROCTIME()
+            )",
+        )
+        .unwrap();
+
+        assert!(def.watermark.is_some());
+        let wm = def.watermark.unwrap();
+        assert_eq!(wm.column, "ts");
+        assert!(wm.is_processing_time);
+        assert_eq!(wm.max_out_of_orderness, Duration::ZERO);
+    }
+
+    #[test]
+    fn test_watermark_event_time_not_proctime() {
+        let def = parse_and_translate(
+            "CREATE SOURCE events (
+                ts TIMESTAMP,
+                WATERMARK FOR ts AS ts - INTERVAL '5' SECOND
+            )",
+        )
+        .unwrap();
+
+        let wm = def.watermark.unwrap();
+        assert!(!wm.is_processing_time);
     }
 }

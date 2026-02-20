@@ -40,7 +40,7 @@
 //! assert_eq!(tracker.current_watermark(), Some(Watermark::new(3000)));
 //! ```
 
-use std::time::{Duration, Instant};
+use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 
 use super::Watermark;
 
@@ -662,6 +662,90 @@ impl WatermarkGenerator for SourceProvidedGenerator {
     }
 }
 
+/// Processing-time watermark generator.
+///
+/// Ignores event timestamps entirely and advances the watermark based on
+/// wall-clock time. Use with `PROCTIME()` sources where events are processed
+/// in arrival order without event-time semantics.
+///
+/// - [`on_event`](WatermarkGenerator::on_event) returns `None` (event timestamps are ignored)
+/// - [`on_periodic`](WatermarkGenerator::on_periodic) returns `Some(Watermark::new(now_millis()))`
+///
+/// # Example
+///
+/// ```rust
+/// use laminar_core::time::{ProcessingTimeGenerator, WatermarkGenerator};
+///
+/// let mut gen = ProcessingTimeGenerator::new();
+/// // on_event ignores the timestamp
+/// assert_eq!(gen.on_event(1000), None);
+/// // on_periodic returns wall-clock time
+/// let wm = gen.on_periodic();
+/// assert!(wm.is_some());
+/// ```
+pub struct ProcessingTimeGenerator {
+    current_watermark: i64,
+}
+
+impl ProcessingTimeGenerator {
+    /// Creates a new processing-time watermark generator.
+    #[must_use]
+    pub fn new() -> Self {
+        Self {
+            current_watermark: i64::MIN,
+        }
+    }
+
+    /// Returns the current wall-clock time in milliseconds since Unix epoch.
+    #[allow(clippy::cast_possible_truncation)]
+    fn now_millis() -> i64 {
+        SystemTime::now()
+            .duration_since(UNIX_EPOCH)
+            .unwrap_or(Duration::ZERO)
+            .as_millis() as i64
+    }
+}
+
+impl Default for ProcessingTimeGenerator {
+    fn default() -> Self {
+        Self::new()
+    }
+}
+
+impl WatermarkGenerator for ProcessingTimeGenerator {
+    #[inline]
+    fn on_event(&mut self, _timestamp: i64) -> Option<Watermark> {
+        // Processing-time mode ignores event timestamps
+        None
+    }
+
+    #[inline]
+    fn on_periodic(&mut self) -> Option<Watermark> {
+        let now = Self::now_millis();
+        if now > self.current_watermark {
+            self.current_watermark = now;
+            Some(Watermark::new(now))
+        } else {
+            None
+        }
+    }
+
+    #[inline]
+    fn current_watermark(&self) -> i64 {
+        self.current_watermark
+    }
+
+    #[inline]
+    fn advance_watermark(&mut self, timestamp: i64) -> Option<Watermark> {
+        if timestamp > self.current_watermark {
+            self.current_watermark = timestamp;
+            Some(Watermark::new(timestamp))
+        } else {
+            None
+        }
+    }
+}
+
 /// Metrics for watermark tracking.
 #[derive(Debug, Clone, Default)]
 pub struct WatermarkMetrics {
@@ -1167,5 +1251,49 @@ mod tests {
         // No regression doesn't bump metrics
         gen.advance_watermark(600);
         assert_eq!(gen.metrics().watermarks_emitted, 2);
+    }
+
+    // --- ProcessingTimeGenerator tests ---
+
+    #[test]
+    fn test_processing_time_generator_ignores_events() {
+        let mut gen = ProcessingTimeGenerator::new();
+        assert_eq!(gen.on_event(1000), None);
+        assert_eq!(gen.on_event(2000), None);
+        assert_eq!(gen.current_watermark(), i64::MIN);
+    }
+
+    #[test]
+    fn test_processing_time_generator_periodic() {
+        let mut gen = ProcessingTimeGenerator::new();
+        let wm = gen.on_periodic();
+        assert!(wm.is_some());
+        let ts = wm.unwrap().timestamp();
+        // Should be a reasonable timestamp (after 2020-01-01)
+        assert!(ts > 1_577_836_800_000, "timestamp too old: {ts}");
+    }
+
+    #[test]
+    fn test_processing_time_generator_advance_watermark() {
+        let mut gen = ProcessingTimeGenerator::new();
+
+        let wm = gen.advance_watermark(500);
+        assert_eq!(wm, Some(Watermark::new(500)));
+        assert_eq!(gen.current_watermark(), 500);
+
+        // No regression
+        let wm = gen.advance_watermark(300);
+        assert_eq!(wm, None);
+        assert_eq!(gen.current_watermark(), 500);
+
+        // Further advance
+        let wm = gen.advance_watermark(1000);
+        assert_eq!(wm, Some(Watermark::new(1000)));
+    }
+
+    #[test]
+    fn test_processing_time_generator_default() {
+        let gen = ProcessingTimeGenerator::default();
+        assert_eq!(gen.current_watermark(), i64::MIN);
     }
 }

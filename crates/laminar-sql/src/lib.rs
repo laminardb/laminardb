@@ -34,6 +34,7 @@
 #![allow(clippy::uninlined_format_args)]
 
 pub mod datafusion;
+pub mod error;
 pub mod parser;
 pub mod planner;
 pub mod translator;
@@ -57,18 +58,30 @@ pub type Result<T> = std::result::Result<T, Error>;
 #[derive(Debug, thiserror::Error)]
 pub enum Error {
     /// SQL parsing error
-    #[error("SQL parse error: {0}")]
     ParseError(#[from] parser::ParseError),
 
     /// Planning error
-    #[error("Planning error: {0}")]
     PlanningError(#[from] planner::PlanningError),
 
-    /// `DataFusion` error
-    #[error("DataFusion error: {0}")]
+    /// `DataFusion` error (translated to user-friendly messages on display)
     DataFusionError(#[from] datafusion_common::DataFusionError),
 
     /// Unsupported SQL feature
-    #[error("Unsupported feature: {0}")]
     UnsupportedFeature(String),
+}
+
+impl std::fmt::Display for Error {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            Self::ParseError(e) => write!(f, "SQL parse error: {e}"),
+            Self::PlanningError(e) => write!(f, "Planning error: {e}"),
+            Self::DataFusionError(e) => {
+                let translated = error::translate_datafusion_error(&e.to_string());
+                write!(f, "{translated}")
+            }
+            Self::UnsupportedFeature(msg) => {
+                write!(f, "Unsupported feature: {msg}")
+            }
+        }
+    }
 }

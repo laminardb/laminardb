@@ -20,6 +20,18 @@ pub struct DeltaLakeSinkMetrics {
 
     /// Last Delta Lake table version committed.
     pub last_delta_version: AtomicU64,
+
+    /// Total compaction runs completed.
+    pub compaction_runs: AtomicU64,
+
+    /// Total files added by compaction.
+    pub compaction_files_added: AtomicU64,
+
+    /// Total files removed by compaction.
+    pub compaction_files_removed: AtomicU64,
+
+    /// Total files deleted by vacuum.
+    pub vacuum_files_deleted: AtomicU64,
 }
 
 impl DeltaLakeSinkMetrics {
@@ -30,6 +42,10 @@ impl DeltaLakeSinkMetrics {
             common: LakehouseSinkMetrics::new(),
             merge_operations: AtomicU64::new(0),
             last_delta_version: AtomicU64::new(0),
+            compaction_runs: AtomicU64::new(0),
+            compaction_files_added: AtomicU64::new(0),
+            compaction_files_removed: AtomicU64::new(0),
+            vacuum_files_deleted: AtomicU64::new(0),
         }
     }
 
@@ -65,6 +81,21 @@ impl DeltaLakeSinkMetrics {
         self.common.record_deletes(count);
     }
 
+    /// Records a completed compaction run.
+    pub fn record_compaction(&self, files_added: u64, files_removed: u64) {
+        self.compaction_runs.fetch_add(1, Ordering::Relaxed);
+        self.compaction_files_added
+            .fetch_add(files_added, Ordering::Relaxed);
+        self.compaction_files_removed
+            .fetch_add(files_removed, Ordering::Relaxed);
+    }
+
+    /// Records files deleted by vacuum.
+    pub fn record_vacuum(&self, files_deleted: u64) {
+        self.vacuum_files_deleted
+            .fetch_add(files_deleted, Ordering::Relaxed);
+    }
+
     /// Converts to the SDK's [`ConnectorMetrics`].
     #[must_use]
     #[allow(clippy::cast_precision_loss)]
@@ -79,6 +110,22 @@ impl DeltaLakeSinkMetrics {
         m.add_custom(
             "delta.last_version",
             self.last_delta_version.load(Ordering::Relaxed) as f64,
+        );
+        m.add_custom(
+            "delta.compaction_runs",
+            self.compaction_runs.load(Ordering::Relaxed) as f64,
+        );
+        m.add_custom(
+            "delta.compaction_files_added",
+            self.compaction_files_added.load(Ordering::Relaxed) as f64,
+        );
+        m.add_custom(
+            "delta.compaction_files_removed",
+            self.compaction_files_removed.load(Ordering::Relaxed) as f64,
+        );
+        m.add_custom(
+            "delta.vacuum_files_deleted",
+            self.vacuum_files_deleted.load(Ordering::Relaxed) as f64,
         );
         m
     }

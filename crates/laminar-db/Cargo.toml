@@ -17,6 +17,7 @@ jit = ["laminar-core/jit"]  # Cranelift JIT compilation for compiled Ring 0 pipe
 kafka = ["laminar-connectors/kafka"]
 postgres-cdc = ["laminar-connectors/postgres-cdc"]
 postgres-sink = ["laminar-connectors/postgres-sink"]
+delta-lake = ["laminar-connectors/delta-lake"]
 durable = []             # Object-store checkpoint profiles
 delta = ["durable"]  # Full distributed mode (Durable + gRPC + gossip + Raft)
 
@@ -35,6 +36,7 @@ arrow-schema = { workspace = true }
 # DataFusion
 datafusion = { workspace = true }
 datafusion-common = { workspace = true }
+datafusion-expr = { workspace = true }
 
 # Arena allocator (for JIT batch→row conversion)
 bumpalo = { workspace = true }

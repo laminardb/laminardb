@@ -8,7 +8,6 @@ use arrow::datatypes::{DataType, Field, Schema};
 use datafusion::prelude::SessionContext;
 
 use laminar_core::streaming;
-use laminar_core::time::WatermarkGenerator;
 use laminar_sql::parser::{parse_streaming_sql, ShowCommand, StreamingStatement};
 use laminar_sql::planner::StreamingPlanner;
 use laminar_sql::register_streaming_functions;
@@ -87,6 +86,8 @@ pub struct LaminarDB {
     counters: Arc<crate::metrics::PipelineCounters>,
     /// Instant when the database was created, for uptime calculation.
     start_time: std::time::Instant,
+    /// Session properties set via `SET key = value`.
+    session_properties: parking_lot::Mutex<HashMap<String, String>>,
     /// Global pipeline watermark (min of all source watermarks).
     pipeline_watermark: Arc<std::sync::atomic::AtomicI64>,
     /// Shared compiler cache for JIT-compiled pipelines.
@@ -98,10 +99,10 @@ pub struct LaminarDB {
 /// Per-source watermark tracking state for the pipeline loop.
 ///
 /// Combines an `EventTimeExtractor` (to find the max timestamp in each batch)
-/// with a `BoundedOutOfOrdernessGenerator` (to compute the watermark with delay).
+/// with a watermark generator (to compute the watermark with delay).
 struct SourceWatermarkState {
     extractor: laminar_core::time::EventTimeExtractor,
-    generator: laminar_core::time::BoundedOutOfOrdernessGenerator,
+    generator: Box<dyn laminar_core::time::WatermarkGenerator>,
     /// Watermark column name for late-row filtering.
     column: String,
     /// Timestamp format for late-row filtering.
@@ -204,6 +205,7 @@ impl LaminarDB {
             shutdown_signal: Arc::new(tokio::sync::Notify::new()),
             counters: Arc::new(crate::metrics::PipelineCounters::new()),
             start_time: std::time::Instant::now(),
+            session_properties: parking_lot::Mutex::new(HashMap::new()),
             pipeline_watermark: Arc::new(std::sync::atomic::AtomicI64::new(i64::MIN)),
             #[cfg(feature = "jit")]
             compiler_cache: parking_lot::Mutex::new(
@@ -235,6 +237,11 @@ impl LaminarDB {
         {
             laminar_connectors::postgres::register_postgres_sink(registry);
         }
+        #[cfg(feature = "delta-lake")]
+        {
+            laminar_connectors::lakehouse::register_delta_lake_sink(registry);
+            laminar_connectors::lakehouse::register_delta_lake_source(registry);
+        }
     }
 
     /// Returns the connector registry for registering custom connectors.
@@ -244,6 +251,53 @@ impl LaminarDB {
     #[must_use]
     pub fn connector_registry(&self) -> &laminar_connectors::registry::ConnectorRegistry {
         &self.connector_registry
+    }
+
+    /// Register a custom scalar UDF on the `SessionContext`.
+    ///
+    /// Called by `LaminarDbBuilder::build()` after construction.
+    pub(crate) fn register_custom_udf(&self, udf: datafusion_expr::ScalarUDF) {
+        self.ctx.register_udf(udf);
+    }
+
+    /// Register a custom aggregate UDF (UDAF) on the `SessionContext`.
+    ///
+    /// Called by `LaminarDbBuilder::build()` after construction.
+    pub(crate) fn register_custom_udaf(&self, udaf: datafusion_expr::AggregateUDF) {
+        self.ctx.register_udaf(udaf);
+    }
+
+    /// Registers a Delta Lake table as a `DataFusion` `TableProvider`.
+    ///
+    /// After registration, the table can be queried via SQL:
+    /// ```sql
+    /// SELECT * FROM my_delta_table WHERE id > 100
+    /// ```
+    ///
+    /// # Arguments
+    ///
+    /// * `name` - SQL table name (e.g., `"trades"`)
+    /// * `table_uri` - Path to the Delta Lake table (local, `s3://`, `az://`, `gs://`)
+    /// * `storage_options` - Storage credentials and configuration
+    ///
+    /// # Errors
+    ///
+    /// Returns `DbError` if the table cannot be opened or registered.
+    #[cfg(feature = "delta-lake")]
+    pub async fn register_delta_table(
+        &self,
+        name: &str,
+        table_uri: &str,
+        storage_options: std::collections::HashMap<String, String>,
+    ) -> Result<(), DbError> {
+        laminar_connectors::lakehouse::delta_table_provider::register_delta_table(
+            &self.ctx,
+            name,
+            table_uri,
+            storage_options,
+        )
+        .await
+        .map_err(|e| DbError::Connector(e.to_string()))
     }
 
     /// Execute a SQL statement.
@@ -321,6 +375,8 @@ impl LaminarDB {
                 } = stmt.as_ref()
                 {
                     self.handle_drop_table(names, *if_exists)
+                } else if let sqlparser::ast::Statement::Set(set_stmt) = stmt.as_ref() {
+                    self.handle_set(set_stmt)
                 } else {
                     self.handle_query(sql).await
                 }
@@ -330,15 +386,21 @@ impl LaminarDB {
                 columns,
                 values,
             } => self.handle_insert_into(table_name, columns, values).await,
-            StreamingStatement::DropSource { name, if_exists } => {
-                self.handle_drop_source(name, *if_exists)
-            }
-            StreamingStatement::DropSink { name, if_exists } => {
-                self.handle_drop_sink(name, *if_exists)
-            }
-            StreamingStatement::DropStream { name, if_exists } => {
-                self.handle_drop_stream(name, *if_exists)
-            }
+            StreamingStatement::DropSource {
+                name,
+                if_exists,
+                cascade,
+            } => self.handle_drop_source(name, *if_exists, *cascade),
+            StreamingStatement::DropSink {
+                name,
+                if_exists,
+                cascade,
+            } => self.handle_drop_sink(name, *if_exists, *cascade),
+            StreamingStatement::DropStream {
+                name,
+                if_exists,
+                cascade,
+            } => self.handle_drop_stream(name, *if_exists, *cascade),
             StreamingStatement::DropMaterializedView {
                 name,
                 if_exists,
@@ -370,6 +432,9 @@ impl LaminarDB {
             } => {
                 self.handle_create_materialized_view(sql, name, query, *or_replace, *if_not_exists)
                     .await
+            }
+            StreamingStatement::AlterSource { name, operation } => {
+                self.handle_alter_source(name, operation)
             }
         }
     }
@@ -430,6 +495,17 @@ impl LaminarDB {
                 None,
             )?)
         };
+
+        // Mark processing-time sources
+        if let Some(ref wm) = source_def.watermark {
+            if wm.is_processing_time {
+                if let Some(ref entry) = entry {
+                    entry
+                        .is_processing_time
+                        .store(true, std::sync::atomic::Ordering::Relaxed);
+                }
+            }
+        }
 
         // Register source as a DataFusion table for ad-hoc SELECT queries.
         // For OR REPLACE, deregister the old table first.
@@ -834,8 +910,24 @@ impl LaminarDB {
         &self,
         name: &sqlparser::ast::ObjectName,
         if_exists: bool,
+        cascade: bool,
     ) -> Result<ExecuteResult, DbError> {
         let name_str = name.to_string();
+
+        // Check for dependents: streams and MVs that reference this source
+        if cascade {
+            self.cascade_drop_dependents(&name_str);
+        } else {
+            let dependents = self.find_dependents(&name_str);
+            if !dependents.is_empty() {
+                return Err(DbError::InvalidOperation(format!(
+                    "Cannot drop source '{name_str}': depended on by {}. \
+                     Use CASCADE to drop dependents.",
+                    dependents.join(", ")
+                )));
+            }
+        }
+
         let dropped = self.catalog.drop_source(&name_str);
         if !dropped && !if_exists {
             return Err(DbError::SourceNotFound(name_str));
@@ -849,11 +941,87 @@ impl LaminarDB {
         }))
     }
 
+    /// Handle ALTER SOURCE statement.
+    fn handle_alter_source(
+        &self,
+        name: &sqlparser::ast::ObjectName,
+        operation: &laminar_sql::parser::AlterSourceOperation,
+    ) -> Result<ExecuteResult, DbError> {
+        use laminar_sql::parser::AlterSourceOperation;
+        let name_str = name.to_string();
+
+        // Verify source exists
+        let existing_schema = self
+            .catalog
+            .describe_source(&name_str)
+            .ok_or_else(|| DbError::SourceNotFound(name_str.clone()))?;
+
+        match operation {
+            AlterSourceOperation::AddColumn { column_def } => {
+                let col_name = column_def.name.value.clone();
+                let arrow_type = laminar_sql::translator::streaming_ddl::sql_type_to_arrow(
+                    &column_def.data_type,
+                )
+                .map_err(|e| DbError::Sql(laminar_sql::Error::ParseError(e)))?;
+
+                // Build new schema with the added column
+                let mut fields: Vec<arrow::datatypes::FieldRef> =
+                    existing_schema.fields().iter().cloned().collect();
+                fields.push(Arc::new(Field::new(&col_name, arrow_type, true)));
+                let new_schema = Arc::new(arrow::datatypes::Schema::new(fields));
+
+                // Re-register the source with the new schema
+                let entry = self.catalog.get_source(&name_str);
+                let (wm_col, max_ooo) = entry.as_ref().map_or((None, None), |e| {
+                    (e.watermark_column.clone(), e.max_out_of_orderness)
+                });
+
+                self.catalog.register_source_or_replace(
+                    &name_str,
+                    new_schema.clone(),
+                    wm_col,
+                    max_ooo,
+                    None,
+                    None,
+                );
+
+                // Update DataFusion registration
+                let _ = self.ctx.deregister_table(&name_str);
+                let provider = datafusion::datasource::MemTable::try_new(new_schema, vec![vec![]])
+                    .map_err(|e| {
+                        DbError::InvalidOperation(format!("Failed to re-register table: {e}"))
+                    })?;
+                self.ctx
+                    .register_table(&name_str, Arc::new(provider))
+                    .map_err(|e| {
+                        DbError::InvalidOperation(format!("Failed to re-register table: {e}"))
+                    })?;
+
+                Ok(ExecuteResult::Ddl(DdlInfo {
+                    statement_type: "ALTER SOURCE".to_string(),
+                    object_name: name_str,
+                }))
+            }
+            AlterSourceOperation::SetProperties { properties } => {
+                // Store properties in session config for this source
+                let mut props = self.session_properties.lock();
+                for (key, value) in properties {
+                    props.insert(format!("{name_str}.{key}"), value.clone());
+                }
+                Ok(ExecuteResult::Ddl(DdlInfo {
+                    statement_type: "ALTER SOURCE".to_string(),
+                    object_name: name_str,
+                }))
+            }
+        }
+    }
+
     /// Handle DROP SINK statement.
     fn handle_drop_sink(
         &self,
         name: &sqlparser::ast::ObjectName,
         if_exists: bool,
+        _cascade: bool,
     ) -> Result<ExecuteResult, DbError> {
         let name_str = name.to_string();
         let dropped = self.catalog.drop_sink(&name_str);
@@ -879,8 +1047,8 @@ impl LaminarDB {
         // Register in catalog as a stream
         self.catalog.register_stream(&name_str)?;
 
-        // Plan the statement to extract emit_clause and window_config
-        let (plan_emit, plan_window) = {
+        // Plan the statement to extract emit_clause, window_config, and order_config
+        let (plan_emit, plan_window, plan_order) = {
             let mut planner = self.planner.lock();
             let stmt = StreamingStatement::CreateStream {
                 name: name.clone(),
@@ -890,10 +1058,12 @@ impl LaminarDB {
                 if_not_exists: false,
             };
             match planner.plan(&stmt) {
-                Ok(laminar_sql::planner::StreamingPlan::Query(ref qp)) => {
-                    (qp.emit_clause.clone(), qp.window_config.clone())
-                }
-                _ => (emit_clause.cloned(), None),
+                Ok(laminar_sql::planner::StreamingPlan::Query(ref qp)) => (
+                    qp.emit_clause.clone(),
+                    qp.window_config.clone(),
+                    qp.order_config.clone(),
+                ),
+                _ => (emit_clause.cloned(), None, None),
             }
         };
 
@@ -905,6 +1075,7 @@ impl LaminarDB {
                 query_sql: streaming_statement_to_sql(query),
                 emit_clause: plan_emit,
                 window_config: plan_window,
+                order_config: plan_order,
             });
         }
 
@@ -919,8 +1090,24 @@ impl LaminarDB {
         &self,
         name: &sqlparser::ast::ObjectName,
         if_exists: bool,
+        cascade: bool,
     ) -> Result<ExecuteResult, DbError> {
         let name_str = name.to_string();
+
+        // Check for dependents: MVs that reference this stream
+        if cascade {
+            self.cascade_drop_dependents(&name_str);
+        } else {
+            let dependents = self.find_dependents(&name_str);
+            if !dependents.is_empty() {
+                return Err(DbError::InvalidOperation(format!(
+                    "Cannot drop stream '{name_str}': depended on by {}. \
+                     Use CASCADE to drop dependents.",
+                    dependents.join(", ")
+                )));
+            }
+        }
+
         let dropped = self.catalog.drop_stream(&name_str);
         if !dropped && !if_exists {
             return Err(DbError::StreamNotFound(name_str));
@@ -930,6 +1117,98 @@ impl LaminarDB {
             statement_type: "DROP STREAM".to_string(),
             object_name: name_str,
         }))
+    }
+
+    /// Handle SET statement — stores session properties.
+    fn handle_set(&self, set_stmt: &sqlparser::ast::Set) -> Result<ExecuteResult, DbError> {
+        use sqlparser::ast::Set;
+        match set_stmt {
+            Set::SingleAssignment {
+                variable, values, ..
+            } => {
+                let key = variable.to_string().to_lowercase();
+                let value = if values.len() == 1 {
+                    values[0].to_string().trim_matches('\'').to_string()
+                } else {
+                    values
+                        .iter()
+                        .map(std::string::ToString::to_string)
+                        .collect::<Vec<_>>()
+                        .join(", ")
+                };
+                self.session_properties.lock().insert(key.clone(), value);
+                Ok(ExecuteResult::Ddl(DdlInfo {
+                    statement_type: "SET".to_string(),
+                    object_name: key,
+                }))
+            }
+            _ => Err(DbError::InvalidOperation(
+                "Only SET key = value syntax is supported".to_string(),
+            )),
+        }
+    }
+
+    /// Get a session property value.
+    #[must_use]
+    pub fn get_session_property(&self, key: &str) -> Option<String> {
+        self.session_properties
+            .lock()
+            .get(&key.to_lowercase())
+            .cloned()
+    }
+
+    /// Get all session properties.
+    #[must_use]
+    pub fn session_properties(&self) -> HashMap<String, String> {
+        self.session_properties.lock().clone()
+    }
+
+    /// Find streams and MVs that depend on the given object name.
+    fn find_dependents(&self, name: &str) -> Vec<String> {
+        let mut dependents = Vec::new();
+
+        // Check streams: scan registered streams for SQL references to `name`
+        {
+            let mgr = self.connector_manager.lock();
+            for (stream_name, reg) in mgr.streams() {
+                let refs = crate::stream_executor::extract_table_references(&reg.query_sql);
+                if refs.contains(name) {
+                    dependents.push(stream_name.clone());
+                }
+            }
+        }
+
+        // Check MVs via the dependency graph
+        {
+            let registry = self.mv_registry.lock();
+            for dep in registry.get_dependents(name) {
+                dependents.push(dep.to_string());
+            }
+        }
+
+        dependents
+    }
+
+    /// Drop all streams and MVs that depend on the given object, recursively.
+    fn cascade_drop_dependents(&self, name: &str) {
+        let dependents = self.find_dependents(name);
+        for dep in &dependents {
+            // Try dropping as stream first
+            if self.catalog.drop_stream(dep) {
+                self.connector_manager.lock().unregister_stream(dep);
+            }
+            // Try dropping as MV (cascade further)
+            {
+                let mut registry = self.mv_registry.lock();
+                if let Ok(views) = registry.unregister_cascade(dep) {
+                    drop(registry);
+                    let mut mgr = self.connector_manager.lock();
+                    for v in &views {
+                        mgr.unregister_stream(&v.name);
+                    }
+                }
+            }
+        }
     }
 
     /// Subscribe to a named stream or materialized view.
@@ -1353,39 +1632,19 @@ impl LaminarDB {
             .ctx
             .sql(&left_sql)
             .await
-            .map_err(|e| {
-                DbError::Pipeline(format!(
-                    "ASOF left table '{}' query failed: {e}",
-                    asof_config.left_table
-                ))
-            })?
+            .map_err(|e| DbError::query_pipeline(&asof_config.left_table, &e))?
             .collect()
             .await
-            .map_err(|e| {
-                DbError::Pipeline(format!(
-                    "ASOF left table '{}' execution failed: {e}",
-                    asof_config.left_table
-                ))
-            })?;
+            .map_err(|e| DbError::query_pipeline(&asof_config.left_table, &e))?;
 
         let right_batches = self
             .ctx
             .sql(&right_sql)
             .await
-            .map_err(|e| {
-                DbError::Pipeline(format!(
-                    "ASOF right table '{}' query failed: {e}",
-                    asof_config.right_table
-                ))
-            })?
+            .map_err(|e| DbError::query_pipeline(&asof_config.right_table, &e))?
             .collect()
             .await
-            .map_err(|e| {
-                DbError::Pipeline(format!(
-                    "ASOF right table '{}' execution failed: {e}",
-                    asof_config.right_table
-                ))
-            })?;
+            .map_err(|e| DbError::query_pipeline(&asof_config.right_table, &e))?;
 
         let result_batch =
             crate::asof_batch::execute_asof_join_batch(&left_batches, &right_batches, asof_config)?;
@@ -1404,24 +1663,22 @@ impl LaminarDB {
         let schema = result_batch.schema();
         let mem_table =
             datafusion::datasource::MemTable::try_new(schema.clone(), vec![vec![result_batch]])
-                .map_err(|e| {
-                    DbError::Pipeline(format!("Failed to create ASOF result table: {e}"))
-                })?;
+                .map_err(|e| DbError::query_pipeline("ASOF join", &e))?;
 
         let _ = self.ctx.deregister_table("__asof_result");
         self.ctx
             .register_table("__asof_result", Arc::new(mem_table))
-            .map_err(|e| DbError::Pipeline(format!("Failed to register ASOF result table: {e}")))?;
+            .map_err(|e| DbError::query_pipeline("ASOF join", &e))?;
 
         let df = self
             .ctx
             .sql("SELECT * FROM __asof_result")
             .await
-            .map_err(|e| DbError::Pipeline(format!("Failed to query ASOF result: {e}")))?;
+            .map_err(|e| DbError::query_pipeline("ASOF join", &e))?;
         let stream = df
             .execute_stream()
             .await
-            .map_err(|e| DbError::Pipeline(format!("Failed to stream ASOF result: {e}")))?;
+            .map_err(|e| DbError::query_pipeline("ASOF join", &e))?;
 
         let _ = self.ctx.deregister_table("__asof_result");
 
@@ -1782,6 +2039,7 @@ impl LaminarDB {
                 reg.query_sql.clone(),
                 reg.emit_clause.clone(),
                 reg.window_config.clone(),
+                reg.order_config.clone(),
             );
         }
 
@@ -1817,8 +2075,16 @@ impl LaminarDB {
                     let extractor =
                         laminar_core::time::EventTimeExtractor::from_column(col, format)
                             .with_mode(laminar_core::time::ExtractionMode::Max);
-                    let generator =
-                        laminar_core::time::BoundedOutOfOrdernessGenerator::from_duration(dur);
+                    let generator: Box<dyn laminar_core::time::WatermarkGenerator> = if entry
+                        .is_processing_time
+                        .load(std::sync::atomic::Ordering::Relaxed)
+                    {
+                        Box::new(laminar_core::time::ProcessingTimeGenerator::new())
+                    } else {
+                        Box::new(
+                            laminar_core::time::BoundedOutOfOrdernessGenerator::from_duration(dur),
+                        )
+                    };
                     let id = source_ids.len();
                     source_ids.insert(name.clone(), id);
                     watermark_states.insert(
@@ -1847,10 +2113,18 @@ impl LaminarDB {
                     let extractor =
                         laminar_core::time::EventTimeExtractor::from_column(&col, format)
                             .with_mode(laminar_core::time::ExtractionMode::Max);
-                    let generator =
-                        laminar_core::time::BoundedOutOfOrdernessGenerator::from_duration(
-                            std::time::Duration::ZERO,
-                        );
+                    let generator: Box<dyn laminar_core::time::WatermarkGenerator> = if entry
+                        .is_processing_time
+                        .load(std::sync::atomic::Ordering::Relaxed)
+                    {
+                        Box::new(laminar_core::time::ProcessingTimeGenerator::new())
+                    } else {
+                        Box::new(
+                            laminar_core::time::BoundedOutOfOrdernessGenerator::from_duration(
+                                std::time::Duration::ZERO,
+                            ),
+                        )
+                    };
                     let id = source_ids.len();
                     source_ids.insert(name.clone(), id);
                     watermark_states.insert(
@@ -2074,6 +2348,7 @@ impl LaminarDB {
                 reg.query_sql.clone(),
                 reg.emit_clause.clone(),
                 reg.window_config.clone(),
+                reg.order_config.clone(),
             );
         }
 
@@ -2279,8 +2554,16 @@ impl LaminarDB {
                     let extractor =
                         laminar_core::time::EventTimeExtractor::from_column(col, format)
                             .with_mode(laminar_core::time::ExtractionMode::Max);
-                    let generator =
-                        laminar_core::time::BoundedOutOfOrdernessGenerator::from_duration(dur);
+                    let generator: Box<dyn laminar_core::time::WatermarkGenerator> = if entry
+                        .is_processing_time
+                        .load(std::sync::atomic::Ordering::Relaxed)
+                    {
+                        Box::new(laminar_core::time::ProcessingTimeGenerator::new())
+                    } else {
+                        Box::new(
+                            laminar_core::time::BoundedOutOfOrdernessGenerator::from_duration(dur),
+                        )
+                    };
                     let id = source_ids.len();
                     source_ids.insert(name.clone(), id);
                     watermark_states.insert(
@@ -2309,10 +2592,18 @@ impl LaminarDB {
                     let extractor =
                         laminar_core::time::EventTimeExtractor::from_column(&col, format)
                             .with_mode(laminar_core::time::ExtractionMode::Max);
-                    let generator =
-                        laminar_core::time::BoundedOutOfOrdernessGenerator::from_duration(
-                            std::time::Duration::ZERO,
-                        );
+                    let generator: Box<dyn laminar_core::time::WatermarkGenerator> = if entry
+                        .is_processing_time
+                        .load(std::sync::atomic::Ordering::Relaxed)
+                    {
+                        Box::new(laminar_core::time::ProcessingTimeGenerator::new())
+                    } else {
+                        Box::new(
+                            laminar_core::time::BoundedOutOfOrdernessGenerator::from_duration(
+                                std::time::Duration::ZERO,
+                            ),
+                        )
+                    };
                     let id = source_ids.len();
                     source_ids.insert(name.clone(), id);
                     watermark_states.insert(
@@ -3016,19 +3307,19 @@ impl LaminarDB {
             )])),
         };
 
-        // Discover source references: check which catalog sources and
-        // existing MVs appear in the query SQL
+        // Discover source references via AST-based extraction (not substring matching)
+        let table_refs = crate::stream_executor::extract_table_references(&query_sql);
         let catalog_sources = self.catalog.list_sources();
         let mut sources: Vec<String> = catalog_sources
             .into_iter()
-            .filter(|s| query_sql.contains(s.as_str()))
+            .filter(|s| table_refs.contains(s.as_str()))
             .collect();
 
         // Also check existing MVs as potential sources (cascading MVs)
         {
             let registry = self.mv_registry.lock();
             for view in registry.views() {
-                if view.name != name_str && query_sql.contains(view.name.as_str()) {
+                if view.name != name_str && table_refs.contains(view.name.as_str()) {
                     sources.push(view.name.clone());
                 }
             }
@@ -3050,6 +3341,39 @@ impl LaminarDB {
                 .map_err(|e| DbError::MaterializedView(e.to_string()))?;
         }
 
+        // Plan the MV's backing query to extract emit_clause, window_config, and order_config
+        let (plan_emit, plan_window, plan_order) = {
+            let mut planner = self.planner.lock();
+            // Wrap the inner query as a CreateStream to reuse the planner
+            let stmt = StreamingStatement::CreateStream {
+                name: name.clone(),
+                query: Box::new(query.clone()),
+                emit_clause: None,
+                or_replace: false,
+                if_not_exists: false,
+            };
+            match planner.plan(&stmt) {
+                Ok(laminar_sql::planner::StreamingPlan::Query(ref qp)) => (
+                    qp.emit_clause.clone(),
+                    qp.window_config.clone(),
+                    qp.order_config.clone(),
+                ),
+                _ => (None, None, None),
+            }
+        };
+
+        // Register the MV as a stream so start() picks it up for execution
+        {
+            let mut mgr = self.connector_manager.lock();
+            mgr.register_stream(crate::connector_manager::StreamRegistration {
+                name: name_str.clone(),
+                query_sql: query_sql.clone(),
+                emit_clause: plan_emit,
+                window_config: plan_window,
+                order_config: plan_order,
+            });
+        }
+
         Ok(ExecuteResult::Ddl(DdlInfo {
             statement_type: "CREATE MATERIALIZED VIEW".to_string(),
             object_name: name_str,
@@ -3064,25 +3388,44 @@ impl LaminarDB {
         cascade: bool,
     ) -> Result<ExecuteResult, DbError> {
         let name_str = name.to_string();
-        let mut registry = self.mv_registry.lock();
 
-        let result = if cascade {
-            registry.unregister_cascade(&name_str)
-        } else {
-            registry.unregister(&name_str).map(|v| vec![v])
-        };
+        // Collect names to unregister from connector manager
+        let dropped_names;
+        {
+            let mut registry = self.mv_registry.lock();
 
-        match result {
-            Ok(_) => Ok(ExecuteResult::Ddl(DdlInfo {
-                statement_type: "DROP MATERIALIZED VIEW".to_string(),
-                object_name: name_str,
-            })),
-            Err(_) if if_exists => Ok(ExecuteResult::Ddl(DdlInfo {
-                statement_type: "DROP MATERIALIZED VIEW".to_string(),
-                object_name: name_str,
-            })),
-            Err(e) => Err(DbError::MaterializedView(e.to_string())),
+            let result = if cascade {
+                registry.unregister_cascade(&name_str)
+            } else {
+                registry.unregister(&name_str).map(|v| vec![v])
+            };
+
+            match result {
+                Ok(views) => {
+                    dropped_names = views
+                        .into_iter()
+                        .map(|v| v.name.clone())
+                        .collect::<Vec<_>>();
+                }
+                Err(_) if if_exists => {
+                    dropped_names = vec![];
+                }
+                Err(e) => return Err(DbError::MaterializedView(e.to_string())),
+            }
         }
+
+        // Remove stream registrations for dropped MVs
+        {
+            let mut mgr = self.connector_manager.lock();
+            for dropped in &dropped_names {
+                mgr.unregister_stream(dropped);
+            }
+        }
+
+        Ok(ExecuteResult::Ddl(DdlInfo {
+            statement_type: "DROP MATERIALIZED VIEW".to_string(),
+            object_name: name_str,
+        }))
     }
 
     /// Build a SHOW MATERIALIZED VIEWS metadata result.
@@ -3299,46 +3642,66 @@ impl LaminarDB {
 
     /// Build a DESCRIBE result.
     fn build_describe(&self, name: &str) -> Result<RecordBatch, DbError> {
-        let source_schema = self
-            .catalog
-            .describe_source(name)
-            .ok_or_else(|| DbError::SourceNotFound(name.to_string()))?;
+        // Try sources first
+        let schema = if let Some(s) = self.catalog.describe_source(name) {
+            s
+        // Then reference/dimension tables
+        } else if let Some(s) = self.table_store.lock().table_schema(name) {
+            s
+        // Then materialized views
+        } else if let Some(s) = self
+            .mv_registry
+            .lock()
+            .get(name)
+            .map(|mv| mv.schema.clone())
+        {
+            s
+        // Then check sinks (no schema, but confirm existence)
+        } else if self.catalog.list_sinks().contains(&name.to_string()) {
+            return Err(DbError::InvalidOperation(
+                "DESCRIBE is not supported for sinks. Use SHOW SINKS for details.".to_string(),
+            ));
+        // Then streams (no stored schema yet)
+        } else if self.catalog.list_streams().contains(&name.to_string()) {
+            return Err(DbError::InvalidOperation(format!(
+                "Stream '{name}' exists but schema is only available after pipeline start"
+            )));
+        } else {
+            return Err(DbError::TableNotFound(name.to_string()));
+        };
 
-        let col_names: Vec<String> = source_schema
-            .fields()
-            .iter()
-            .map(|f| f.name().clone())
-            .collect();
-        let col_types: Vec<String> = source_schema
-            .fields()
-            .iter()
-            .map(|f| format!("{}", f.data_type()))
-            .collect();
-        let col_nullable: Vec<bool> = source_schema
-            .fields()
-            .iter()
-            .map(|f| f.is_nullable())
-            .collect();
-
-        let names_ref: Vec<&str> = col_names.iter().map(String::as_str).collect();
-        let types_ref: Vec<&str> = col_types.iter().map(String::as_str).collect();
-
-        let result_schema = Arc::new(Schema::new(vec![
-            Field::new("column_name", DataType::Utf8, false),
-            Field::new("data_type", DataType::Utf8, false),
-            Field::new("nullable", DataType::Boolean, false),
-        ]));
-
-        RecordBatch::try_new(
-            result_schema,
-            vec![
-                Arc::new(StringArray::from(names_ref)),
-                Arc::new(StringArray::from(types_ref)),
-                Arc::new(BooleanArray::from(col_nullable)),
-            ],
-        )
-        .map_err(|e| DbError::InvalidOperation(format!("describe metadata: {e}")))
+        schema_to_describe_batch(&schema)
     }
+}
+
+/// Convert an Arrow schema to a DESCRIBE result `RecordBatch`.
+fn schema_to_describe_batch(schema: &Schema) -> Result<RecordBatch, DbError> {
+    let col_names: Vec<String> = schema.fields().iter().map(|f| f.name().clone()).collect();
+    let col_types: Vec<String> = schema
+        .fields()
+        .iter()
+        .map(|f| format!("{}", f.data_type()))
+        .collect();
+    let col_nullable: Vec<bool> = schema.fields().iter().map(|f| f.is_nullable()).collect();
+
+    let names_ref: Vec<&str> = col_names.iter().map(String::as_str).collect();
+    let types_ref: Vec<&str> = col_types.iter().map(String::as_str).collect();
+
+    let result_schema = Arc::new(Schema::new(vec![
+        Field::new("column_name", DataType::Utf8, false),
+        Field::new("data_type", DataType::Utf8, false),
+        Field::new("nullable", DataType::Boolean, false),
+    ]));
+
+    RecordBatch::try_new(
+        result_schema,
+        vec![
+            Arc::new(StringArray::from(names_ref)),
+            Arc::new(StringArray::from(types_ref)),
+            Arc::new(BooleanArray::from(col_nullable)),
+        ],
+    )
+    .map_err(|e| DbError::InvalidOperation(format!("describe metadata: {e}")))
 }
 
 /// Internal table name used by the sink WHERE filter.
@@ -3372,22 +3735,22 @@ async fn apply_filter(
 
     // Register the batch as a temporary table
     let mem_table = datafusion::datasource::MemTable::try_new(schema, vec![vec![batch.clone()]])
-        .map_err(|e| DbError::Pipeline(format!("Filter table creation: {e}")))?;
+        .map_err(|e| DbError::query_pipeline("sink filter", &e))?;
 
     ctx.register_table(FILTER_INPUT_TABLE, Arc::new(mem_table))
-        .map_err(|e| DbError::Pipeline(format!("Filter table registration: {e}")))?;
+        .map_err(|e| DbError::query_pipeline("sink filter", &e))?;
 
     // Execute the filter query
     let sql = format!("SELECT * FROM {FILTER_INPUT_TABLE} WHERE {filter_sql}");
     let df = ctx
         .sql(&sql)
         .await
-        .map_err(|e| DbError::Pipeline(format!("Filter query: {e}")))?;
+        .map_err(|e| DbError::query_pipeline("sink filter", &e))?;
 
     let batches = df
         .collect()
         .await
-        .map_err(|e| DbError::Pipeline(format!("Filter execution: {e}")))?;
+        .map_err(|e| DbError::query_pipeline("sink filter", &e))?;
 
     if batches.is_empty() {
         return Ok(None);
@@ -3546,6 +3909,54 @@ mod tests {
             }
             _ => panic!("Expected Metadata result"),
         }
+    }
+
+    #[tokio::test]
+    async fn test_describe_table() {
+        let db = LaminarDB::open().unwrap();
+        db.execute("CREATE TABLE products (id BIGINT PRIMARY KEY, name VARCHAR, price DOUBLE)")
+            .await
+            .unwrap();
+        db.execute("INSERT INTO products VALUES (1, 'Widget', 9.99)")
+            .await
+            .unwrap();
+
+        let result = db.execute("DESCRIBE products").await.unwrap();
+        match result {
+            ExecuteResult::Metadata(batch) => {
+                assert_eq!(batch.num_rows(), 3);
+            }
+            _ => panic!("Expected Metadata result"),
+        }
+    }
+
+    #[tokio::test]
+    async fn test_describe_materialized_view() {
+        let db = LaminarDB::open().unwrap();
+        db.execute("CREATE SOURCE events (id BIGINT, name VARCHAR, value DOUBLE)")
+            .await
+            .unwrap();
+        db.execute(
+            "CREATE MATERIALIZED VIEW event_counts AS \
+             SELECT name, COUNT(*) as cnt FROM events GROUP BY name",
+        )
+        .await
+        .unwrap();
+
+        let result = db.execute("DESCRIBE event_counts").await.unwrap();
+        match result {
+            ExecuteResult::Metadata(batch) => {
+                assert!(batch.num_rows() >= 2, "Should have at least name and cnt");
+            }
+            _ => panic!("Expected Metadata result"),
+        }
+    }
+
+    #[tokio::test]
+    async fn test_describe_not_found() {
+        let db = LaminarDB::open().unwrap();
+        let result = db.execute("DESCRIBE nonexistent").await;
+        assert!(result.is_err());
     }
 
     #[tokio::test]
@@ -3964,6 +4375,11 @@ mod tests {
         #[cfg(feature = "postgres-sink")]
         {
             expected_sinks += 1; // postgres sink
+        }
+        #[cfg(feature = "delta-lake")]
+        {
+            expected_sources += 1; // delta-lake source
+            expected_sinks += 1; // delta-lake sink
         }
 
         assert_eq!(registry.list_sources().len(), expected_sources);
@@ -6037,5 +6453,165 @@ mod tests {
             }
             _ => panic!("Expected Query result"),
         }
+    }
+
+    #[tokio::test]
+    async fn test_mv_registers_stream_in_connector_manager() {
+        let db = LaminarDB::open().unwrap();
+        db.execute("CREATE SOURCE events (id INT, value DOUBLE)")
+            .await
+            .unwrap();
+
+        // Before MV creation, no stream registered
+        {
+            let mgr = db.connector_manager.lock();
+            assert!(
+                !mgr.streams().contains_key("event_totals"),
+                "stream should not exist before MV creation"
+            );
+        }
+
+        let result = db
+            .execute("CREATE MATERIALIZED VIEW event_totals AS SELECT * FROM events")
+            .await;
+
+        // The MV may fail at query execution (no data), but if DDL succeeds
+        // the connector manager should have the stream registered
+        if result.is_ok() {
+            let mgr = db.connector_manager.lock();
+            assert!(
+                mgr.streams().contains_key("event_totals"),
+                "MV should be registered as a stream in connector manager"
+            );
+            let reg = &mgr.streams()["event_totals"];
+            assert!(
+                reg.query_sql.contains("events"),
+                "stream query should reference the source"
+            );
+        }
+    }
+
+    #[tokio::test]
+    async fn test_drop_mv_unregisters_stream() {
+        let db = LaminarDB::open().unwrap();
+        db.execute("CREATE SOURCE events (id INT, value DOUBLE)")
+            .await
+            .unwrap();
+
+        let result = db
+            .execute("CREATE MATERIALIZED VIEW mv1 AS SELECT * FROM events")
+            .await;
+
+        if result.is_ok() {
+            // Verify registered
+            {
+                let mgr = db.connector_manager.lock();
+                assert!(mgr.streams().contains_key("mv1"));
+            }
+
+            // Drop the MV
+            db.execute("DROP MATERIALIZED VIEW mv1").await.unwrap();
+
+            // Verify unregistered
+            {
+                let mgr = db.connector_manager.lock();
+                assert!(
+                    !mgr.streams().contains_key("mv1"),
+                    "stream should be unregistered after DROP MV"
+                );
+            }
+        }
+    }
+
+    #[tokio::test]
+    async fn test_set_session_property() {
+        let db = LaminarDB::open().unwrap();
+        db.execute("SET parallelism = 4").await.unwrap();
+        assert_eq!(
+            db.get_session_property("parallelism"),
+            Some("4".to_string())
+        );
+    }
+
+    #[tokio::test]
+    async fn test_set_session_property_string_value() {
+        let db = LaminarDB::open().unwrap();
+        db.execute("SET state_ttl = '1 hour'").await.unwrap();
+        assert_eq!(
+            db.get_session_property("state_ttl"),
+            Some("1 hour".to_string())
+        );
+    }
+
+    #[tokio::test]
+    async fn test_set_session_property_overwrite() {
+        let db = LaminarDB::open().unwrap();
+        db.execute("SET batch_size = 100").await.unwrap();
+        db.execute("SET batch_size = 200").await.unwrap();
+        assert_eq!(
+            db.get_session_property("batch_size"),
+            Some("200".to_string())
+        );
+    }
+
+    #[tokio::test]
+    async fn test_get_session_property_not_set() {
+        let db = LaminarDB::open().unwrap();
+        assert_eq!(db.get_session_property("nonexistent"), None);
+    }
+
+    #[tokio::test]
+    async fn test_session_properties_all() {
+        let db = LaminarDB::open().unwrap();
+        db.execute("SET parallelism = 4").await.unwrap();
+        db.execute("SET state_ttl = '1 hour'").await.unwrap();
+        let props = db.session_properties();
+        assert_eq!(props.len(), 2);
+        assert_eq!(props.get("parallelism"), Some(&"4".to_string()));
+        assert_eq!(props.get("state_ttl"), Some(&"1 hour".to_string()));
+    }
+
+    #[tokio::test]
+    async fn test_alter_source_add_column() {
+        let db = LaminarDB::open().unwrap();
+        db.execute("CREATE SOURCE events (id INT, value DOUBLE)")
+            .await
+            .unwrap();
+
+        // Verify initial schema has 2 columns
+        let schema = db.catalog.describe_source("events").unwrap();
+        assert_eq!(schema.fields().len(), 2);
+
+        // Add a column
+        db.execute("ALTER SOURCE events ADD COLUMN new_col VARCHAR")
+            .await
+            .unwrap();
+
+        // Verify updated schema has 3 columns
+        let schema = db.catalog.describe_source("events").unwrap();
+        assert_eq!(schema.fields().len(), 3);
+        assert_eq!(schema.field(2).name(), "new_col");
+    }
+
+    #[tokio::test]
+    async fn test_alter_source_not_found() {
+        let db = LaminarDB::open().unwrap();
+        let result = db
+            .execute("ALTER SOURCE nonexistent ADD COLUMN col INT")
+            .await;
+        assert!(result.is_err());
+    }
+
+    #[tokio::test]
+    async fn test_alter_source_set_properties() {
+        let db = LaminarDB::open().unwrap();
+        db.execute("CREATE SOURCE events (id INT)").await.unwrap();
+        db.execute("ALTER SOURCE events SET ('batch.size' = '1000')")
+            .await
+            .unwrap();
+        assert_eq!(
+            db.get_session_property("events.batch.size"),
+            Some("1000".to_string())
+        );
     }
 }
