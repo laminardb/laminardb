@@ -57,6 +57,8 @@ pub(crate) struct StreamRegistration {
     pub emit_clause: Option<laminar_sql::parser::EmitClause>,
     /// Window configuration from the planner (window type, size, gap, etc.).
     pub window_config: Option<laminar_sql::translator::WindowOperatorConfig>,
+    /// ORDER BY configuration from the planner (Top-K, `PerGroupTopK`, etc.).
+    pub order_config: Option<laminar_sql::translator::OrderOperatorConfig>,
 }
 
 /// Registration of a reference/dimension table from DDL.
@@ -418,6 +420,7 @@ mod tests {
             query_sql: "SELECT count(*) FROM events".to_string(),
             emit_clause: None,
             window_config: None,
+            order_config: None,
         });
         assert_eq!(mgr.stream_names(), vec!["agg_stream"]);
     }
@@ -574,6 +577,7 @@ mod tests {
             query_sql: "SELECT 1".to_string(),
             emit_clause: None,
             window_config: None,
+            order_config: None,
         });
         assert!(mgr.unregister_sink("s1"));
         assert!(!mgr.unregister_sink("s1"));

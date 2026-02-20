@@ -24,7 +24,7 @@ pub use dag_planner::{format_dag_explain, DagExplainOutput};
 pub use having_translator::HavingFilterConfig;
 pub use join_translator::{
     AsofJoinTranslatorConfig, AsofSqlJoinType, JoinOperatorConfig, LookupJoinConfig,
-    LookupJoinType, StreamJoinConfig, StreamJoinType,
+    LookupJoinType, StreamJoinConfig, StreamJoinType, TemporalJoinTranslatorConfig,
 };
 pub use order_translator::{
     OrderOperatorConfig, PerGroupTopKConfig, TopKConfig, WatermarkSortConfig, WindowLocalSortConfig,

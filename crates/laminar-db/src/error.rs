@@ -69,6 +69,16 @@ pub enum DbError {
     /// Pipeline error (start/shutdown lifecycle)
     Pipeline(String),
 
+    /// Query pipeline error — wraps a `DataFusion` error with stream context.
+    /// Unlike `Pipeline`, this variant is translated to user-friendly messages.
+    QueryPipeline {
+        /// The stream or query name where the error occurred.
+        context: String,
+        /// The translated error message (already processed through
+        /// `translate_datafusion_error`).
+        translated: String,
+    },
+
     /// Materialized view error
     MaterializedView(String),
 
@@ -77,6 +87,55 @@ pub enum DbError {
 
     /// Configuration / profile validation error
     Config(String),
+}
+
+impl DbError {
+    /// Create a `QueryPipeline` error from a `DataFusion` error with stream context.
+    ///
+    /// The `DataFusion` error is translated to a user-friendly message with
+    /// structured error codes. The raw `DataFusion` internals are never exposed.
+    pub fn query_pipeline(
+        context: impl Into<String>,
+        df_error: &datafusion_common::DataFusionError,
+    ) -> Self {
+        let translated =
+            laminar_sql::error::translate_datafusion_error(&df_error.to_string());
+        Self::QueryPipeline {
+            context: context.into(),
+            translated: translated.to_string(),
+        }
+    }
+
+    /// Create a `QueryPipeline` error from a `DataFusion` error with stream
+    /// context and available column names for typo suggestions.
+    pub fn query_pipeline_with_columns(
+        context: impl Into<String>,
+        df_error: &datafusion_common::DataFusionError,
+        available_columns: &[&str],
+    ) -> Self {
+        let translated =
+            laminar_sql::error::translate_datafusion_error_with_context(
+                &df_error.to_string(),
+                Some(available_columns),
+            );
+        Self::QueryPipeline {
+            context: context.into(),
+            translated: translated.to_string(),
+        }
+    }
+
+    /// Create a `QueryPipeline` error from an Arrow error with stream context.
+    pub fn query_pipeline_arrow(
+        context: impl Into<String>,
+        arrow_error: &arrow::error::ArrowError,
+    ) -> Self {
+        let translated =
+            laminar_sql::error::translate_datafusion_error(&arrow_error.to_string());
+        Self::QueryPipeline {
+            context: context.into(),
+            translated: translated.to_string(),
+        }
+    }
 }
 
 impl std::fmt::Display for DbError {
@@ -132,6 +191,10 @@ impl std::fmt::Display for DbError {
             }
             Self::Connector(msg) => write!(f, "Connector error: {msg}"),
             Self::Pipeline(msg) => write!(f, "Pipeline error: {msg}"),
+            Self::QueryPipeline {
+                context,
+                translated,
+            } => write!(f, "Stream '{context}': {translated}"),
             Self::MaterializedView(msg) => {
                 write!(f, "Materialized view error: {msg}")
             }

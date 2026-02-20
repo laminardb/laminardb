@@ -108,7 +108,7 @@ pub(crate) fn execute_asof_join_batch(
 
     let left_schema = left_batches[0].schema();
     let left = concat_batches(&left_schema, left_batches)
-        .map_err(|e| DbError::Pipeline(format!("Failed to concat left batches: {e}")))?;
+        .map_err(|e| DbError::query_pipeline_arrow("ASOF join (left)", &e))?;
 
     let right_schema = if right_batches.is_empty() {
         // Build a schema with the same structure but no rows
@@ -121,7 +121,7 @@ pub(crate) fn execute_asof_join_batch(
         RecordBatch::new_empty(right_schema.clone())
     } else {
         concat_batches(&right_schema, right_batches)
-            .map_err(|e| DbError::Pipeline(format!("Failed to concat right batches: {e}")))?
+            .map_err(|e| DbError::query_pipeline_arrow("ASOF join (right)", &e))?
     };
 
     let output_schema = build_output_schema(&left_schema, &right_schema, config);
@@ -332,7 +332,7 @@ fn build_output_batch(
     for col_idx in 0..left.num_columns() {
         let array = left.column(col_idx);
         let taken = arrow::compute::take(array, &left_idx_array, None)
-            .map_err(|e| DbError::Pipeline(format!("Failed to take left rows: {e}")))?;
+            .map_err(|e| DbError::query_pipeline_arrow("ASOF join (left take)", &e))?;
         columns.push(taken);
     }
 
@@ -351,7 +351,7 @@ fn build_output_batch(
     }
 
     RecordBatch::try_new(output_schema.clone(), columns)
-        .map_err(|e| DbError::Pipeline(format!("Failed to build ASOF result batch: {e}")))
+        .map_err(|e| DbError::query_pipeline_arrow("ASOF join (result)", &e))
 }
 
 /// Take rows from an array using optional indices (None = null).
@@ -375,7 +375,7 @@ fn take_with_nulls(
     );
 
     arrow::compute::take(array, &index_array, None)
-        .map_err(|e| DbError::Pipeline(format!("Failed to take right rows: {e}")))
+        .map_err(|e| DbError::query_pipeline_arrow("ASOF join (right take)", &e))
 }
 
 #[cfg(test)]

@@ -30,6 +30,27 @@ pub mod codes {
     pub const TABLE_NOT_FOUND: &str = "LDB-1101";
     /// Type mismatch.
     pub const TYPE_MISMATCH: &str = "LDB-1200";
+
+    // Window / watermark errors (2000-2099)
+    /// Watermark required for this operation.
+    pub const WATERMARK_REQUIRED: &str = "LDB-2001";
+    /// Invalid window specification.
+    pub const WINDOW_INVALID: &str = "LDB-2002";
+    /// Window size must be positive.
+    pub const WINDOW_SIZE_INVALID: &str = "LDB-2003";
+    /// Late data rejected by window policy.
+    pub const LATE_DATA_REJECTED: &str = "LDB-2004";
+
+    // Join errors (3000-3099)
+    /// Join key column not found or invalid.
+    pub const JOIN_KEY_MISSING: &str = "LDB-3001";
+    /// Time bound required for stream-stream join.
+    pub const JOIN_TIME_BOUND_MISSING: &str = "LDB-3002";
+    /// Temporal join requires a primary key on the right-side table.
+    pub const TEMPORAL_JOIN_NO_PK: &str = "LDB-3003";
+    /// Unsupported join type for streaming queries.
+    pub const JOIN_TYPE_UNSUPPORTED: &str = "LDB-3004";
+
     /// Internal query error (unrecognized pattern).
     pub const INTERNAL: &str = "LDB-9000";
     /// Query execution failed.
@@ -131,16 +152,31 @@ fn extract_quoted(s: &str) -> Option<&str> {
 /// Pattern-matches known DataFusion error formats and rewrites them with
 /// structured error codes and helpful messages. Unrecognized patterns fall
 /// back to `LDB-9000` with the message sanitized (internal prefixes stripped).
+///
+/// When `available_columns` is provided, column-not-found errors include a
+/// "Did you mean '...'?" hint based on edit distance.
 #[must_use]
 pub fn translate_datafusion_error(msg: &str) -> TranslatedError {
+    translate_datafusion_error_with_context(msg, None)
+}
+
+/// Like [`translate_datafusion_error`] but accepts an optional list of
+/// available column names for typo suggestions.
+#[must_use]
+pub fn translate_datafusion_error_with_context(
+    msg: &str,
+    available_columns: Option<&[&str]>,
+) -> TranslatedError {
     let clean = sanitize(msg);
 
     // Column not found
     if let Some(col) = extract_missing_column(clean) {
+        let hint = available_columns
+            .and_then(|cols| suggest_column(col, cols));
         return TranslatedError {
             code: codes::COLUMN_NOT_FOUND,
             message: format!("Column '{col}' not found in query"),
-            hint: None,
+            hint,
         };
     }
 
@@ -165,6 +201,16 @@ pub fn translate_datafusion_error(msg: &str) -> TranslatedError {
             message: format!("Type mismatch: {clean}"),
             hint: Some("Check column types with DESCRIBE <table>".to_string()),
         };
+    }
+
+    // Window / watermark errors
+    if let Some(translated) = check_window_errors(clean) {
+        return translated;
+    }
+
+    // Join errors
+    if let Some(translated) = check_join_errors(clean) {
+        return translated;
     }
 
     // Unsupported / not implemented
@@ -216,6 +262,93 @@ pub fn translate_datafusion_error(msg: &str) -> TranslatedError {
         message: format!("Internal query error: {clean}"),
         hint: Some("If this persists, file a bug report".to_string()),
     }
+}
+
+/// Check for window/watermark-related error patterns.
+fn check_window_errors(clean: &str) -> Option<TranslatedError> {
+    let lower = clean.to_ascii_lowercase();
+
+    if lower.contains("watermark") && (lower.contains("required") || lower.contains("missing")) {
+        return Some(TranslatedError {
+            code: codes::WATERMARK_REQUIRED,
+            message: format!("Watermark required: {clean}"),
+            hint: Some(
+                "Add WATERMARK FOR <column> AS <column> - INTERVAL '<n>' SECOND \
+                 to the CREATE SOURCE statement"
+                    .to_string(),
+            ),
+        });
+    }
+
+    if lower.contains("window")
+        && (lower.contains("invalid") || lower.contains("not supported"))
+    {
+        return Some(TranslatedError {
+            code: codes::WINDOW_INVALID,
+            message: format!("Invalid window specification: {clean}"),
+            hint: Some(
+                "Supported window types: TUMBLE, HOP, SESSION".to_string(),
+            ),
+        });
+    }
+
+    if lower.contains("window")
+        && lower.contains("size")
+        && (lower.contains("zero") || lower.contains("negative") || lower.contains("positive"))
+    {
+        return Some(TranslatedError {
+            code: codes::WINDOW_SIZE_INVALID,
+            message: format!("Invalid window size: {clean}"),
+            hint: Some("Window size must be a positive interval".to_string()),
+        });
+    }
+
+    None
+}
+
+/// Check for join-related error patterns.
+fn check_join_errors(clean: &str) -> Option<TranslatedError> {
+    let lower = clean.to_ascii_lowercase();
+
+    if lower.contains("join") && lower.contains("key") && lower.contains("not found") {
+        return Some(TranslatedError {
+            code: codes::JOIN_KEY_MISSING,
+            message: format!("Join key error: {clean}"),
+            hint: Some(
+                "Ensure the ON clause references columns that exist \
+                 in both sides of the join"
+                    .to_string(),
+            ),
+        });
+    }
+
+    if lower.contains("join")
+        && (lower.contains("time bound") || lower.contains("interval"))
+        && lower.contains("required")
+    {
+        return Some(TranslatedError {
+            code: codes::JOIN_TIME_BOUND_MISSING,
+            message: format!("Join time bound required: {clean}"),
+            hint: Some(
+                "Stream-stream joins require a time bound in the ON clause, e.g.: \
+                 AND b.ts BETWEEN a.ts AND a.ts + INTERVAL '1' HOUR"
+                    .to_string(),
+            ),
+        });
+    }
+
+    if lower.contains("temporal") && lower.contains("primary key") {
+        return Some(TranslatedError {
+            code: codes::TEMPORAL_JOIN_NO_PK,
+            message: format!("Temporal join error: {clean}"),
+            hint: Some(
+                "The right-side table of a temporal join requires a PRIMARY KEY"
+                    .to_string(),
+            ),
+        });
+    }
+
+    None
 }
 
 #[cfg(test)]
@@ -355,5 +488,83 @@ mod tests {
     fn test_suggest_column_none() {
         let result = suggest_column("xyz", &["user_id", "email"]);
         assert_eq!(result, None);
+    }
+
+    // -- translate_datafusion_error_with_context tests --
+
+    #[test]
+    fn test_column_not_found_with_suggestion() {
+        let cols = &["user_id", "email", "price"];
+        let t = translate_datafusion_error_with_context(
+            "No field named 'user_ie'",
+            Some(cols),
+        );
+        assert_eq!(t.code, codes::COLUMN_NOT_FOUND);
+        assert!(t.message.contains("user_ie"));
+        assert!(t.hint.is_some());
+        assert!(
+            t.hint.as_ref().unwrap().contains("user_id"),
+            "hint should suggest 'user_id': {:?}",
+            t.hint
+        );
+    }
+
+    #[test]
+    fn test_column_not_found_no_close_match() {
+        let cols = &["user_id", "email"];
+        let t = translate_datafusion_error_with_context(
+            "No field named 'zzzzz'",
+            Some(cols),
+        );
+        assert_eq!(t.code, codes::COLUMN_NOT_FOUND);
+        assert!(t.hint.is_none());
+    }
+
+    #[test]
+    fn test_column_not_found_without_context() {
+        let t = translate_datafusion_error("No field named 'foo'");
+        assert_eq!(t.code, codes::COLUMN_NOT_FOUND);
+        assert!(t.hint.is_none()); // no columns provided
+    }
+
+    // -- window error code tests --
+
+    #[test]
+    fn test_watermark_required_error() {
+        let t = translate_datafusion_error(
+            "Watermark required for EMIT ON WINDOW CLOSE",
+        );
+        assert_eq!(t.code, codes::WATERMARK_REQUIRED);
+        assert!(t.hint.is_some());
+        assert!(t.hint.unwrap().contains("WATERMARK FOR"));
+    }
+
+    #[test]
+    fn test_window_invalid_error() {
+        let t = translate_datafusion_error(
+            "Window type not supported for this operation",
+        );
+        assert_eq!(t.code, codes::WINDOW_INVALID);
+        assert!(t.hint.unwrap().contains("TUMBLE"));
+    }
+
+    // -- join error code tests --
+
+    #[test]
+    fn test_join_key_not_found_error() {
+        let t = translate_datafusion_error(
+            "Join key 'user_id' not found in right table",
+        );
+        assert_eq!(t.code, codes::JOIN_KEY_MISSING);
+        assert!(t.hint.unwrap().contains("ON clause"));
+    }
+
+    #[test]
+    fn test_temporal_join_pk_error() {
+        let t = translate_datafusion_error(
+            "Temporal join requires a primary key on right table",
+        );
+        assert_eq!(t.code, codes::TEMPORAL_JOIN_NO_PK);
+        assert!(t.hint.unwrap().contains("PRIMARY KEY"));
     }
 }

@@ -208,6 +208,15 @@ impl MvPipelineExecutor {
                                 .or_default()
                                 .push_back(event);
                         }
+                        Output::Changelog(ref changelog) => {
+                            // Propagate event from changelog to downstream MVs
+                            let event = changelog.event.clone();
+                            self.output_queues
+                                .entry(mv_name.clone())
+                                .or_default()
+                                .push_back(event);
+                            all_outputs.push(output);
+                        }
                         other => all_outputs.push(other),
                     }
                 }
@@ -292,6 +301,16 @@ impl MvPipelineExecutor {
                             .entry(mv_name.to_string())
                             .or_default()
                             .push_back(event);
+                    }
+                    Output::Changelog(ref changelog) => {
+                        // Propagate the event from changelog to downstream MVs
+                        let event = changelog.event.clone();
+                        self.output_queues
+                            .entry(mv_name.to_string())
+                            .or_default()
+                            .push_back(event);
+                        // Also pass through to final output for sinks
+                        outputs.push(output);
                     }
                     other => outputs.push(other),
                 }
@@ -414,6 +433,7 @@ impl Operator for PassThroughOperator {
 mod tests {
     use super::*;
     use crate::mv::registry::MaterializedView;
+    use crate::operator::window::{CdcOperation, ChangelogRecord};
     use crate::state::InMemoryStore;
     use crate::time::{BoundedOutOfOrdernessGenerator, TimerService};
     use arrow_array::{Int64Array, RecordBatch};
@@ -634,6 +654,125 @@ mod tests {
 
         // Watermarks should be restored
         assert_eq!(executor2.get_watermark("trades"), Some(5000));
+    }
+
+    /// Operator that emits Changelog records (for testing changelog propagation).
+    #[derive(Debug, Clone)]
+    struct ChangelogEmittingOperator {
+        id: String,
+    }
+
+    impl Operator for ChangelogEmittingOperator {
+        fn process(&mut self, event: &Event, _ctx: &mut OperatorContext) -> OutputVec {
+            let mut outputs = OutputVec::new();
+            outputs.push(Output::Changelog(ChangelogRecord {
+                operation: CdcOperation::Insert,
+                weight: 1,
+                emit_timestamp: event.timestamp,
+                event: event.clone(),
+            }));
+            outputs
+        }
+
+        fn on_timer(
+            &mut self,
+            _timer: crate::operator::Timer,
+            _ctx: &mut OperatorContext,
+        ) -> OutputVec {
+            OutputVec::new()
+        }
+
+        fn checkpoint(&self) -> OperatorState {
+            OperatorState {
+                operator_id: self.id.clone(),
+                data: Vec::new(),
+            }
+        }
+
+        fn restore(
+            &mut self,
+            _state: OperatorState,
+        ) -> Result<(), crate::operator::OperatorError> {
+            Ok(())
+        }
+    }
+
+    #[test]
+    fn test_changelog_propagation_three_level_mv_chain() {
+        // Setup: source → MV1 (emits Changelog) → MV2 (pass-through)
+        let mut registry = MvRegistry::new();
+        registry.register_base_table("trades");
+
+        let schema = Arc::new(Schema::new(vec![Field::new(
+            "value",
+            DataType::Int64,
+            false,
+        )]));
+        let mv = |n: &str, s: Vec<&str>| {
+            MaterializedView::new(
+                n,
+                "",
+                s.into_iter().map(String::from).collect(),
+                schema.clone(),
+            )
+        };
+
+        registry.register(mv("mv1", vec!["trades"])).unwrap();
+        registry.register(mv("mv2", vec!["mv1"])).unwrap();
+        let registry = Arc::new(registry);
+
+        let mut executor = MvPipelineExecutor::new(registry);
+
+        // MV1 emits Changelog, MV2 is a pass-through
+        executor
+            .register_operator(
+                "mv1",
+                Box::new(ChangelogEmittingOperator {
+                    id: "mv1".into(),
+                }),
+            )
+            .unwrap();
+        executor
+            .register_operator("mv2", Box::new(PassThroughOperator::new("mv2")))
+            .unwrap();
+
+        let (mut state, mut timers, mut wm_gen) = create_context();
+        let mut ctx = OperatorContext {
+            event_time: 1000,
+            processing_time: 1000,
+            timers: &mut timers,
+            state: &mut state,
+            watermark_generator: &mut wm_gen,
+            operator_index: 0,
+        };
+
+        let event = create_test_event(42, 1000);
+        let outputs = executor
+            .process_source_event("trades", event, &mut ctx)
+            .unwrap();
+
+        // MV2 should have received the event from MV1's changelog
+        assert_eq!(
+            executor.metrics().events_per_mv.get("mv2"),
+            Some(&1),
+            "MV2 should have processed 1 event from MV1's changelog"
+        );
+
+        // Final outputs should contain the Changelog from MV1
+        // (MV2's output is an Event queued to its output_queue, plus MV1's Changelog)
+        let changelog_count = outputs
+            .iter()
+            .filter(|o| matches!(o, Output::Changelog(_)))
+            .count();
+        assert_eq!(
+            changelog_count, 1,
+            "should have 1 changelog in final output from MV1"
+        );
+
+        // MV2's output should be queued (pass-through emits Event)
+        let pending_mv2 = executor.pending_events("mv2");
+        assert!(pending_mv2.is_some());
+        assert_eq!(pending_mv2.unwrap().len(), 1);
     }
 
     #[test]

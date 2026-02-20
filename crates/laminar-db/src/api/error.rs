@@ -295,6 +295,10 @@ impl From<crate::DbError> for ApiError {
             DbError::Pipeline(msg) => {
                 Self::internal(format!("Pipeline error: {msg}"))
             }
+            DbError::QueryPipeline {
+                context,
+                translated,
+            } => Self::query(format!("Stream '{context}': {translated}")),
             DbError::MaterializedView(msg) => {
                 Self::query(format!("Materialized view error: {msg}"))
             }
@@ -352,6 +356,27 @@ mod tests {
         assert!(
             !api_err.message().contains("DataFusion"),
             "message was: {}",
+            api_err.message()
+        );
+    }
+
+    #[test]
+    fn test_query_pipeline_error_becomes_query_not_internal() {
+        let db_err = crate::DbError::QueryPipeline {
+            context: "my_stream".to_string(),
+            translated: "[LDB-1100] Column 'foo' not found in query".to_string(),
+        };
+        let api_err: ApiError = db_err.into();
+        // Should be a Query error (400), not Internal (900)
+        assert_eq!(api_err.code(), codes::QUERY_FAILED);
+        assert!(
+            api_err.message().contains("my_stream"),
+            "message should include stream name: {}",
+            api_err.message()
+        );
+        assert!(
+            api_err.message().contains("LDB-1100"),
+            "message should include error code: {}",
             api_err.message()
         );
     }

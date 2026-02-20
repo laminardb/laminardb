@@ -12,6 +12,9 @@
 //! - **Left**: Emit all left events, with right match if exists
 //! - **Right**: Emit all right events, with left match if exists
 //! - **Full**: Emit all events, with matches where they exist
+//! - **Left Semi**: Emit left rows that have at least one match (left columns only)
+//! - **Left Anti**: Emit left rows with no match within the time bound (left columns only)
+//! - **Right Semi/Anti**: Mirror of left variants
 //!
 //! ## Example
 //!
@@ -101,19 +104,49 @@ pub enum JoinType {
     Right,
     /// Full outer join - emit all events, with matches where they exist.
     Full,
+    /// Left semi join - emit left rows that have at least one match (left columns only).
+    LeftSemi,
+    /// Left anti join - emit left rows that have no match (left columns only).
+    LeftAnti,
+    /// Right semi join - emit right rows that have at least one match (right columns only).
+    RightSemi,
+    /// Right anti join - emit right rows that have no match (right columns only).
+    RightAnti,
 }
 
 impl JoinType {
     /// Returns true if unmatched left events should be emitted.
     #[must_use]
     pub fn emits_unmatched_left(&self) -> bool {
-        matches!(self, JoinType::Left | JoinType::Full)
+        matches!(self, JoinType::Left | JoinType::Full | JoinType::LeftAnti)
     }
 
     /// Returns true if unmatched right events should be emitted.
     #[must_use]
     pub fn emits_unmatched_right(&self) -> bool {
-        matches!(self, JoinType::Right | JoinType::Full)
+        matches!(self, JoinType::Right | JoinType::Full | JoinType::RightAnti)
+    }
+
+    /// Returns true if this is a semi join.
+    #[must_use]
+    pub fn is_semi(&self) -> bool {
+        matches!(self, JoinType::LeftSemi | JoinType::RightSemi)
+    }
+
+    /// Returns true if this is an anti join.
+    #[must_use]
+    pub fn is_anti(&self) -> bool {
+        matches!(self, JoinType::LeftAnti | JoinType::RightAnti)
+    }
+
+    /// For semi/anti joins, returns the side whose rows are kept in the output.
+    #[must_use]
+    pub fn kept_side(&self) -> Option<JoinSide> {
+        match self {
+            JoinType::LeftSemi | JoinType::LeftAnti => Some(JoinSide::Left),
+            JoinType::RightSemi | JoinType::RightAnti => Some(JoinSide::Right),
+            _ => None,
+        }
     }
 }
 
@@ -1400,6 +1433,19 @@ impl StreamJoinOperator {
     /// Updates the output schema when both input schemas are known.
     fn update_output_schema(&mut self) {
         if let (Some(left), Some(right)) = (&self.left_schema, &self.right_schema) {
+            // Semi/anti joins output only the kept side's columns
+            match self.join_type.kept_side() {
+                Some(JoinSide::Left) => {
+                    self.output_schema = Some(Arc::clone(left));
+                    return;
+                }
+                Some(JoinSide::Right) => {
+                    self.output_schema = Some(Arc::clone(right));
+                    return;
+                }
+                None => {}
+            }
+
             let mut fields: Vec<Field> =
                 Vec::with_capacity(left.fields().len() + right.fields().len());
             fields.extend(left.fields().iter().map(|f| f.as_ref().clone()));
@@ -1525,30 +1571,9 @@ impl StreamJoinOperator {
         // Probe the opposite side for matches
         let matches = self.probe_opposite_side(side, &key_value, event_time, ctx.state);
 
-        // Emit join results
-        for (other_row_key, mut other_row) in matches {
-            self.metrics.matches += 1;
-
-            // Mark this row as matched in state
-            other_row.matched = true;
-            let _ = ctx.state.put_typed(&other_row_key, &other_row);
-
-            // Also mark our row as matched
-            if let Ok(Some(mut our_row)) = ctx.state.get_typed::<JoinRow>(&state_key) {
-                our_row.matched = true;
-                let _ = ctx.state.put_typed(&state_key, &our_row);
-            }
-
-            // Create joined output
-            if let Some(joined_event) = self.create_joined_event(
-                side,
-                &join_row,
-                &other_row,
-                std::cmp::max(event_time, other_row.timestamp),
-            ) {
-                output.push(Output::Event(joined_event));
-            }
-        }
+        self.process_matches(
+            matches, side, event, event_time, &join_row, &state_key, ctx, &mut output,
+        );
 
         // Emit watermark if generated
         if let Some(wm) = emitted_watermark {
@@ -1556,6 +1581,88 @@ impl StreamJoinOperator {
         }
 
         output
+    }
+
+    /// Processes matched rows according to the join type (semi, anti, or standard).
+    #[allow(clippy::too_many_arguments)]
+    fn process_matches(
+        &mut self,
+        matches: Vec<(Vec<u8>, JoinRow)>,
+        side: JoinSide,
+        event: &Event,
+        event_time: i64,
+        join_row: &JoinRow,
+        state_key: &[u8],
+        ctx: &mut OperatorContext,
+        output: &mut OutputVec,
+    ) {
+        if self.join_type.is_semi() {
+            // Semi join: emit the kept side's row on first match only
+            let kept_side = self.join_type.kept_side().unwrap();
+            for (other_row_key, mut other_row) in matches {
+                self.metrics.matches += 1;
+                let was_other_matched = other_row.matched;
+                other_row.matched = true;
+                let _ = ctx.state.put_typed(&other_row_key, &other_row);
+
+                if let Ok(Some(mut our_row)) = ctx.state.get_typed::<JoinRow>(state_key) {
+                    let was_our_matched = our_row.matched;
+                    our_row.matched = true;
+                    let _ = ctx.state.put_typed(state_key, &our_row);
+
+                    if side == kept_side && !was_our_matched {
+                        // Incoming event is the kept side — emit it
+                        output.push(Output::Event(Event::new(
+                            event_time,
+                            RecordBatch::clone(&event.data),
+                        )));
+                        break; // One match is enough for semi
+                    } else if side != kept_side && !was_other_matched {
+                        // Other side is the kept side — emit the other row
+                        if let Ok(batch) = other_row.to_batch() {
+                            output.push(Output::Event(Event::new(other_row.timestamp, batch)));
+                        }
+                    }
+                }
+            }
+        } else if self.join_type.is_anti() {
+            // Anti join: mark rows as matched (suppresses unmatched timer emission)
+            for (other_row_key, mut other_row) in matches {
+                self.metrics.matches += 1;
+                other_row.matched = true;
+                let _ = ctx.state.put_typed(&other_row_key, &other_row);
+
+                if let Ok(Some(mut our_row)) = ctx.state.get_typed::<JoinRow>(state_key) {
+                    our_row.matched = true;
+                    let _ = ctx.state.put_typed(state_key, &our_row);
+                }
+            }
+        } else {
+            // Standard join: emit concatenated left+right rows
+            for (other_row_key, mut other_row) in matches {
+                self.metrics.matches += 1;
+
+                // Mark this row as matched in state
+                other_row.matched = true;
+                let _ = ctx.state.put_typed(&other_row_key, &other_row);
+
+                // Also mark our row as matched
+                if let Ok(Some(mut our_row)) = ctx.state.get_typed::<JoinRow>(state_key) {
+                    our_row.matched = true;
+                    let _ = ctx.state.put_typed(state_key, &our_row);
+                }
+
+                // Create joined output
+                if let Some(joined_event) = self.create_joined_event(
+                    side,
+                    join_row,
+                    &other_row,
+                    std::cmp::max(event_time, other_row.timestamp),
+                ) {
+                    output.push(Output::Event(joined_event));
+                }
+            }
+        }
     }
 
     /// Prunes build-side entries that cannot produce future matches.
@@ -1923,15 +2030,20 @@ impl StreamJoinOperator {
             }
         }
 
-        // Delete the state entry
-        if ctx.state.delete(state_key).is_ok() {
+        // For outer/anti joins, defer state deletion to the unmatched timer handler
+        // so the row is still readable when the unmatched timer fires.
+        let defer_cleanup = match side {
+            JoinSide::Left => self.join_type.emits_unmatched_left(),
+            JoinSide::Right => self.join_type.emits_unmatched_right(),
+        };
+        if !defer_cleanup && ctx.state.delete(state_key).is_ok() {
             self.metrics.state_cleanups += 1;
         }
 
         output
     }
 
-    /// Handles unmatched timer expiration for outer joins.
+    /// Handles unmatched timer expiration for outer/anti joins.
     fn handle_unmatched_timer(
         &mut self,
         side: JoinSide,
@@ -1950,18 +2062,33 @@ impl StreamJoinOperator {
             match side {
                 JoinSide::Left if self.join_type.emits_unmatched_left() => {
                     self.metrics.unmatched_left += 1;
-                    if let Some(event) = self.create_unmatched_event(side, &row) {
+                    if self.join_type.is_anti() {
+                        // Anti join: emit just the kept side's data
+                        if let Ok(batch) = row.to_batch() {
+                            output.push(Output::Event(Event::new(row.timestamp, batch)));
+                        }
+                    } else if let Some(event) = self.create_unmatched_event(side, &row) {
                         output.push(Output::Event(event));
                     }
                 }
                 JoinSide::Right if self.join_type.emits_unmatched_right() => {
                     self.metrics.unmatched_right += 1;
-                    if let Some(event) = self.create_unmatched_event(side, &row) {
+                    if self.join_type.is_anti() {
+                        // Anti join: emit just the kept side's data
+                        if let Ok(batch) = row.to_batch() {
+                            output.push(Output::Event(Event::new(row.timestamp, batch)));
+                        }
+                    } else if let Some(event) = self.create_unmatched_event(side, &row) {
                         output.push(Output::Event(event));
                     }
                 }
                 _ => {}
             }
+        }
+
+        // Clean up state (deferred from cleanup timer for outer/anti joins)
+        if ctx.state.delete(state_key).is_ok() {
+            self.metrics.state_cleanups += 1;
         }
 
         output
@@ -2205,6 +2332,167 @@ mod tests {
 
         assert!(JoinType::Full.emits_unmatched_left());
         assert!(JoinType::Full.emits_unmatched_right());
+
+        // Semi joins: never emit unmatched
+        assert!(!JoinType::LeftSemi.emits_unmatched_left());
+        assert!(!JoinType::LeftSemi.emits_unmatched_right());
+        assert!(!JoinType::RightSemi.emits_unmatched_left());
+        assert!(!JoinType::RightSemi.emits_unmatched_right());
+
+        // Anti joins: emit unmatched for the kept side only
+        assert!(JoinType::LeftAnti.emits_unmatched_left());
+        assert!(!JoinType::LeftAnti.emits_unmatched_right());
+        assert!(!JoinType::RightAnti.emits_unmatched_left());
+        assert!(JoinType::RightAnti.emits_unmatched_right());
+
+        // Semi/Anti helpers
+        assert!(JoinType::LeftSemi.is_semi());
+        assert!(JoinType::RightSemi.is_semi());
+        assert!(!JoinType::LeftAnti.is_semi());
+        assert!(JoinType::LeftAnti.is_anti());
+        assert!(JoinType::RightAnti.is_anti());
+        assert!(!JoinType::Inner.is_semi());
+        assert!(!JoinType::Inner.is_anti());
+
+        // Kept side
+        assert_eq!(JoinType::LeftSemi.kept_side(), Some(JoinSide::Left));
+        assert_eq!(JoinType::LeftAnti.kept_side(), Some(JoinSide::Left));
+        assert_eq!(JoinType::RightSemi.kept_side(), Some(JoinSide::Right));
+        assert_eq!(JoinType::RightAnti.kept_side(), Some(JoinSide::Right));
+        assert_eq!(JoinType::Inner.kept_side(), None);
+    }
+
+    #[test]
+    fn test_left_semi_join_only_emits_matched() {
+        let mut operator = StreamJoinOperator::with_id(
+            "order_id".to_string(),
+            "order_id".to_string(),
+            Duration::from_secs(3600),
+            JoinType::LeftSemi,
+            "test_semi".to_string(),
+        );
+
+        let mut timers = TimerService::new();
+        let mut state = InMemoryStore::new();
+        let mut watermark_gen = BoundedOutOfOrdernessGenerator::new(100);
+
+        // Left event (order) — no match yet
+        let order = create_order_event(1000, "order_1", 100);
+        {
+            let mut ctx = create_test_context(&mut timers, &mut state, &mut watermark_gen);
+            let outputs = operator.process_side(&order, JoinSide::Left, &mut ctx);
+            let events: Vec<_> = outputs
+                .iter()
+                .filter(|o| matches!(o, Output::Event(_)))
+                .collect();
+            assert_eq!(events.len(), 0, "semi join should not emit without match");
+        }
+
+        // Right event (payment) — match found, should emit left row
+        let payment = create_payment_event(2000, "order_1", "paid");
+        let outputs = {
+            let mut ctx = create_test_context(&mut timers, &mut state, &mut watermark_gen);
+            operator.process_side(&payment, JoinSide::Right, &mut ctx)
+        };
+        let events: Vec<_> = outputs
+            .iter()
+            .filter_map(|o| match o {
+                Output::Event(e) => Some(e),
+                _ => None,
+            })
+            .collect();
+        assert_eq!(events.len(), 1, "semi join should emit left row on match");
+        // Output should only have left columns (order_id, amount) — NOT concatenated
+        assert_eq!(events[0].data.num_columns(), 2);
+        assert_eq!(events[0].data.schema().field(0).name(), "order_id");
+        assert_eq!(events[0].data.schema().field(1).name(), "amount");
+
+        // Second right match for same left — should NOT emit again
+        let payment2 = create_payment_event(2500, "order_1", "refunded");
+        {
+            let mut ctx = create_test_context(&mut timers, &mut state, &mut watermark_gen);
+            let outputs = operator.process_side(&payment2, JoinSide::Right, &mut ctx);
+            let events: Vec<_> = outputs
+                .iter()
+                .filter(|o| matches!(o, Output::Event(_)))
+                .collect();
+            assert_eq!(events.len(), 0, "semi join should not emit duplicate");
+        }
+    }
+
+    #[test]
+    fn test_left_anti_join_only_emits_unmatched() {
+        let mut operator = StreamJoinOperator::with_id(
+            "order_id".to_string(),
+            "order_id".to_string(),
+            Duration::from_secs(3600),
+            JoinType::LeftAnti,
+            "test_anti".to_string(),
+        );
+
+        let mut timers = TimerService::new();
+        let mut state = InMemoryStore::new();
+        let mut watermark_gen = BoundedOutOfOrdernessGenerator::new(100);
+
+        // Left event for a key that WILL have a match (should NOT be emitted)
+        let matched_order = create_order_event(1000, "order_1", 100);
+        {
+            let mut ctx = create_test_context(&mut timers, &mut state, &mut watermark_gen);
+            let outputs = operator.process_side(&matched_order, JoinSide::Left, &mut ctx);
+            let events: Vec<_> = outputs
+                .iter()
+                .filter(|o| matches!(o, Output::Event(_)))
+                .collect();
+            assert_eq!(events.len(), 0, "anti join should not emit on insert");
+        }
+
+        // Left event for a key that will NOT have a match (should be emitted at timer)
+        let unmatched_order = create_order_event(1100, "order_2", 200);
+        {
+            let mut ctx = create_test_context(&mut timers, &mut state, &mut watermark_gen);
+            let outputs = operator.process_side(&unmatched_order, JoinSide::Left, &mut ctx);
+            let events: Vec<_> = outputs
+                .iter()
+                .filter(|o| matches!(o, Output::Event(_)))
+                .collect();
+            assert_eq!(events.len(), 0, "anti join should not emit on insert");
+        }
+
+        // Right event matches order_1 — suppresses anti emission
+        let payment = create_payment_event(2000, "order_1", "paid");
+        {
+            let mut ctx = create_test_context(&mut timers, &mut state, &mut watermark_gen);
+            let outputs = operator.process_side(&payment, JoinSide::Right, &mut ctx);
+            let events: Vec<_> = outputs
+                .iter()
+                .filter(|o| matches!(o, Output::Event(_)))
+                .collect();
+            assert_eq!(events.len(), 0, "anti join should never emit on match");
+        }
+
+        // Fire timers — order_2 should be emitted (unmatched), order_1 should NOT
+        let pending_timers = timers.poll_timers(i64::MAX);
+        let mut anti_outputs = 0;
+        for timer_reg in pending_timers {
+            let timer = Timer {
+                key: timer_reg.key.unwrap_or_default(),
+                timestamp: timer_reg.timestamp,
+            };
+            let mut ctx = create_test_context(&mut timers, &mut state, &mut watermark_gen);
+            let outputs = operator.on_timer(timer, &mut ctx);
+            for out in &outputs {
+                if let Output::Event(e) = out {
+                    anti_outputs += 1;
+                    // Should only have left columns
+                    assert_eq!(e.data.num_columns(), 2);
+                    assert_eq!(e.data.schema().field(0).name(), "order_id");
+                }
+            }
+        }
+        assert!(
+            anti_outputs >= 1,
+            "anti join should emit unmatched left rows on timer"
+        );
     }
 
     #[test]

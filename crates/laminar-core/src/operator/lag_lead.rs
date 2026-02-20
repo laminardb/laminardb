@@ -27,6 +27,35 @@ use super::{
     Event, Operator, OperatorContext, OperatorError, OperatorState, Output, OutputVec, Timer,
 };
 
+/// The kind of analytic window function.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum AnalyticFunctionKind {
+    /// LAG — look back `offset` rows in the partition.
+    Lag,
+    /// LEAD — look ahead `offset` rows in the partition.
+    Lead,
+    /// `FIRST_VALUE` — always emit the first row's value in the partition.
+    FirstValue,
+    /// `LAST_VALUE` — always emit the current (most recent) row's value.
+    LastValue,
+    /// `NTH_VALUE` — emit the Nth row's value (`offset` = N).
+    NthValue,
+}
+
+impl AnalyticFunctionKind {
+    /// Returns true if this is a LAG function.
+    #[must_use]
+    pub fn is_lag(self) -> bool {
+        self == Self::Lag
+    }
+
+    /// Returns true if this is a LEAD function.
+    #[must_use]
+    pub fn is_lead(self) -> bool {
+        self == Self::Lead
+    }
+}
+
 /// Configuration for a LAG/LEAD operator.
 #[derive(Debug, Clone)]
 pub struct LagLeadConfig {
@@ -40,14 +69,14 @@ pub struct LagLeadConfig {
     pub max_partitions: usize,
 }
 
-/// Specification for a single LAG or LEAD function.
+/// Specification for a single analytic function (LAG, LEAD, `FIRST_VALUE`, etc.).
 #[derive(Debug, Clone)]
 pub struct LagLeadFunctionSpec {
-    /// True for LAG, false for LEAD.
-    pub is_lag: bool,
+    /// The kind of analytic function.
+    pub function_type: AnalyticFunctionKind,
     /// Source column to read values from.
     pub source_column: String,
-    /// Offset (number of rows to look back/ahead).
+    /// Offset: for LAG/LEAD = rows to look back/ahead; for `NTH_VALUE` = N.
     pub offset: usize,
     /// Default value when no row is available (as f64 for simplicity).
     pub default_value: Option<f64>,
@@ -55,13 +84,19 @@ pub struct LagLeadFunctionSpec {
     pub output_column: String,
 }
 
-/// Per-partition state for LAG/LEAD processing.
+/// Per-partition state for analytic function processing.
 #[derive(Debug, Clone)]
 struct PartitionState {
     /// History buffer for LAG lookback (most recent at back).
     lag_history: VecDeque<f64>,
     /// Pending events for LEAD (waiting for future events).
     lead_pending: VecDeque<PendingLeadEvent>,
+    /// Stored first values per `FIRST_VALUE` function (set once on first event).
+    first_values: Vec<Option<f64>>,
+    /// Stored Nth values per `NTH_VALUE` function (set once when Nth event arrives).
+    nth_values: Vec<Option<f64>>,
+    /// Number of events seen in this partition.
+    event_count: usize,
 }
 
 /// A pending event waiting for LEAD resolution.
@@ -132,19 +167,19 @@ impl LagLeadOperator {
         let lead_specs_cache: Vec<(usize, Option<f64>)> = config
             .functions
             .iter()
-            .filter(|f| !f.is_lag)
+            .filter(|f| f.function_type.is_lead())
             .map(|f| (f.offset, f.default_value))
             .collect();
         let lead_defaults_cache: Vec<f64> = config
             .functions
             .iter()
-            .filter(|f| !f.is_lag)
+            .filter(|f| f.function_type.is_lead())
             .map(|f| f.default_value.unwrap_or(f64::NAN))
             .collect();
         let lead_columns_cache: Vec<String> = config
             .functions
             .iter()
-            .filter(|f| !f.is_lag)
+            .filter(|f| f.function_type.is_lead())
             .map(|f| f.output_column.clone())
             .collect();
 
@@ -278,7 +313,7 @@ impl LagLeadOperator {
     fn compute_lag_values(functions: &[LagLeadFunctionSpec], state: &PartitionState) -> Vec<f64> {
         functions
             .iter()
-            .filter(|f| f.is_lag)
+            .filter(|f| f.function_type.is_lag())
             .map(|func| {
                 let history = &state.lag_history;
                 if history.len() >= func.offset {
@@ -291,12 +326,58 @@ impl LagLeadOperator {
             .collect()
     }
 
+    /// Computes `FIRST_VALUE` / `LAST_VALUE` / `NTH_VALUE` results.
+    ///
+    /// Updates partition state for `FIRST_VALUE` and `NTH_VALUE` on first occurrence.
+    fn compute_positional_values(
+        functions: &[LagLeadFunctionSpec],
+        state: &mut PartitionState,
+        current_value: f64,
+    ) -> Vec<f64> {
+        let mut first_idx = 0usize;
+        let mut nth_idx = 0usize;
+        let mut results = Vec::new();
+
+        for func in functions {
+            match func.function_type {
+                AnalyticFunctionKind::FirstValue => {
+                    if state.first_values[first_idx].is_none() {
+                        state.first_values[first_idx] = Some(current_value);
+                    }
+                    results.push(state.first_values[first_idx].unwrap());
+                    first_idx += 1;
+                }
+                AnalyticFunctionKind::LastValue => {
+                    // LAST_VALUE in a streaming context = current event's value
+                    results.push(current_value);
+                }
+                AnalyticFunctionKind::NthValue => {
+                    // N is stored in offset (1-indexed)
+                    if state.nth_values[nth_idx].is_none()
+                        && state.event_count == func.offset
+                    {
+                        state.nth_values[nth_idx] = Some(current_value);
+                    }
+                    results.push(
+                        state.nth_values[nth_idx]
+                            .unwrap_or(func.default_value.unwrap_or(f64::NAN)),
+                    );
+                    nth_idx += 1;
+                }
+                _ => {} // LAG/LEAD handled separately
+            }
+        }
+
+        results
+    }
+
     /// Builds an output event with computed values (static to avoid borrow issues).
     fn build_output(
         functions: &[LagLeadFunctionSpec],
         event: &Event,
         lag_values: &[f64],
         lead_values: &[f64],
+        positional_values: &[f64],
     ) -> Event {
         let original_batch = &event.data;
         let num_original = original_batch.num_columns();
@@ -314,16 +395,27 @@ impl LagLeadOperator {
 
         let mut lag_idx = 0;
         let mut lead_idx = 0;
+        let mut pos_idx = 0;
 
         for func in functions {
-            let value = if func.is_lag {
-                let v = lag_values.get(lag_idx).copied().unwrap_or(f64::NAN);
-                lag_idx += 1;
-                v
-            } else {
-                let v = lead_values.get(lead_idx).copied().unwrap_or(f64::NAN);
-                lead_idx += 1;
-                v
+            let value = match func.function_type {
+                AnalyticFunctionKind::Lag => {
+                    let v = lag_values.get(lag_idx).copied().unwrap_or(f64::NAN);
+                    lag_idx += 1;
+                    v
+                }
+                AnalyticFunctionKind::Lead => {
+                    let v = lead_values.get(lead_idx).copied().unwrap_or(f64::NAN);
+                    lead_idx += 1;
+                    v
+                }
+                AnalyticFunctionKind::FirstValue
+                | AnalyticFunctionKind::LastValue
+                | AnalyticFunctionKind::NthValue => {
+                    let v = positional_values.get(pos_idx).copied().unwrap_or(f64::NAN);
+                    pos_idx += 1;
+                    v
+                }
             };
 
             fields.push(Field::new(&func.output_column, DataType::Float64, true));
@@ -350,33 +442,45 @@ impl LagLeadOperator {
             return OutputVec::new();
         }
 
-        let has_lag = self.functions.iter().any(|f| f.is_lag);
+        let has_lag = self.functions.iter().any(|f| f.function_type.is_lag());
         let has_lead = !self.lead_specs_cache.is_empty();
+
+        // Count FIRST_VALUE and NTH_VALUE functions for partition state init
+        let first_value_count = self
+            .functions
+            .iter()
+            .filter(|f| f.function_type == AnalyticFunctionKind::FirstValue)
+            .count();
+        let nth_value_count = self
+            .functions
+            .iter()
+            .filter(|f| f.function_type == AnalyticFunctionKind::NthValue)
+            .count();
 
         // Pre-compute constants from functions to avoid borrowing self later
         let max_lag_offset = self
             .functions
             .iter()
-            .filter(|f| f.is_lag)
+            .filter(|f| f.function_type.is_lag())
             .map(|f| f.offset)
             .max()
             .unwrap_or(1);
         let max_lead_offset = self
             .functions
             .iter()
-            .filter(|f| !f.is_lag)
+            .filter(|f| f.function_type.is_lead())
             .map(|f| f.offset)
             .max()
             .unwrap_or(1);
         let lag_source_col = self
             .functions
             .iter()
-            .find(|f| f.is_lag)
+            .find(|f| f.function_type.is_lag())
             .map(|f| f.source_column.clone());
         let lead_source_col = self
             .functions
             .iter()
-            .find(|f| !f.is_lag)
+            .find(|f| f.function_type.is_lead())
             .map(|f| f.source_column.clone());
 
         // Get or create partition state
@@ -386,7 +490,11 @@ impl LagLeadOperator {
             .or_insert_with(|| PartitionState {
                 lag_history: VecDeque::new(),
                 lead_pending: VecDeque::new(),
+                first_values: vec![None; first_value_count],
+                nth_values: vec![None; nth_value_count],
+                event_count: 0,
             });
+        state.event_count += 1;
 
         let mut outputs = OutputVec::new();
 
@@ -407,6 +515,37 @@ impl LagLeadOperator {
                 }
             }
         }
+
+        // Compute FIRST_VALUE / LAST_VALUE / NTH_VALUE
+        // Use the first positional function's source column (all typically share one)
+        let has_positional = self.functions.iter().any(|f| {
+            matches!(
+                f.function_type,
+                AnalyticFunctionKind::FirstValue
+                    | AnalyticFunctionKind::LastValue
+                    | AnalyticFunctionKind::NthValue
+            )
+        });
+        let positional_values = if has_positional {
+            let pos_source_col = self
+                .functions
+                .iter()
+                .find(|f| {
+                    matches!(
+                        f.function_type,
+                        AnalyticFunctionKind::FirstValue
+                            | AnalyticFunctionKind::LastValue
+                            | AnalyticFunctionKind::NthValue
+                    )
+                })
+                .map(|f| f.source_column.clone());
+            let current_value = pos_source_col.as_ref().map_or(f64::NAN, |col| {
+                Self::extract_column_value(event, col, &mut self.cached_lag_col_index)
+            });
+            Self::compute_positional_values(&self.functions, state, current_value)
+        } else {
+            vec![]
+        };
 
         if has_lead {
             // Buffer this event for LEAD resolution
@@ -448,14 +587,25 @@ impl LagLeadOperator {
             }
 
             for (resolved, lead_values) in resolved_events {
-                let output =
-                    Self::build_output(&self.functions, &resolved.event, &lag_values, &lead_values);
+                let output = Self::build_output(
+                    &self.functions,
+                    &resolved.event,
+                    &lag_values,
+                    &lead_values,
+                    &positional_values,
+                );
                 outputs.push(Output::Event(output));
                 self.metrics.lead_flushed += 1;
             }
         } else {
             // No LEAD functions: emit immediately with LAG values
-            let output = Self::build_output(&self.functions, event, &lag_values, &[]);
+            let output = Self::build_output(
+                &self.functions,
+                event,
+                &lag_values,
+                &[],
+                &positional_values,
+            );
             outputs.push(Output::Event(output));
         }
 
@@ -656,11 +806,24 @@ impl Operator for LagLeadOperator {
                 });
             }
 
+            let first_value_count = self
+                .functions
+                .iter()
+                .filter(|f| f.function_type == AnalyticFunctionKind::FirstValue)
+                .count();
+            let nth_value_count = self
+                .functions
+                .iter()
+                .filter(|f| f.function_type == AnalyticFunctionKind::NthValue)
+                .count();
             self.partitions.insert(
                 partition_key,
                 PartitionState {
                     lag_history,
                     lead_pending,
+                    first_values: vec![None; first_value_count],
+                    nth_values: vec![None; nth_value_count],
+                    event_count: 0,
                 },
             );
         }
@@ -712,7 +875,7 @@ mod tests {
         LagLeadConfig {
             operator_id: "test_lag".to_string(),
             functions: vec![LagLeadFunctionSpec {
-                is_lag: true,
+                function_type: AnalyticFunctionKind::Lag,
                 source_column: "price".to_string(),
                 offset,
                 default_value: None,
@@ -727,7 +890,7 @@ mod tests {
         LagLeadConfig {
             operator_id: "test_lead".to_string(),
             functions: vec![LagLeadFunctionSpec {
-                is_lag: false,
+                function_type: AnalyticFunctionKind::Lead,
                 source_column: "price".to_string(),
                 offset,
                 default_value: Some(0.0),
@@ -795,7 +958,7 @@ mod tests {
         let mut op = LagLeadOperator::new(LagLeadConfig {
             operator_id: "test".to_string(),
             functions: vec![LagLeadFunctionSpec {
-                is_lag: true,
+                function_type: AnalyticFunctionKind::Lag,
                 source_column: "price".to_string(),
                 offset: 1,
                 default_value: Some(-1.0),
@@ -973,7 +1136,7 @@ mod tests {
         let mut op = LagLeadOperator::new(LagLeadConfig {
             operator_id: "test".to_string(),
             functions: vec![LagLeadFunctionSpec {
-                is_lag: true,
+                function_type: AnalyticFunctionKind::Lag,
                 source_column: "price".to_string(),
                 offset: 1,
                 default_value: None,
@@ -1081,5 +1244,169 @@ mod tests {
         let op = LagLeadOperator::new(lag_config(1));
         assert_eq!(op.partition_count(), 0);
         assert_eq!(op.metrics().events_processed, 0);
+    }
+
+    #[test]
+    fn test_first_value() {
+        let config = LagLeadConfig {
+            operator_id: "first_val".to_string(),
+            functions: vec![LagLeadFunctionSpec {
+                function_type: AnalyticFunctionKind::FirstValue,
+                source_column: "price".to_string(),
+                offset: 0,
+                default_value: None,
+                output_column: "first_price".to_string(),
+            }],
+            partition_columns: vec!["symbol".to_string()],
+            max_partitions: 100,
+        };
+
+        let mut op = LagLeadOperator::new(config);
+        let mut timers = TimerService::new();
+        let mut state = InMemoryStore::new();
+        let mut wm = BoundedOutOfOrdernessGenerator::new(100);
+
+        let events = [
+            make_trade(1, "AAPL", 100.0),
+            make_trade(2, "AAPL", 110.0),
+            make_trade(3, "AAPL", 120.0),
+        ];
+
+        for e in &events {
+            let mut ctx = create_test_context(&mut timers, &mut state, &mut wm);
+            let outputs = op.process(e, &mut ctx);
+            assert_eq!(outputs.len(), 1);
+            if let Output::Event(out) = &outputs[0] {
+                let arr = out
+                    .data
+                    .column_by_name("first_price")
+                    .unwrap()
+                    .as_any()
+                    .downcast_ref::<Float64Array>()
+                    .unwrap();
+                // FIRST_VALUE should always return the first event's value
+                assert_eq!(arr.value(0), 100.0);
+            }
+        }
+    }
+
+    #[test]
+    fn test_last_value() {
+        let config = LagLeadConfig {
+            operator_id: "last_val".to_string(),
+            functions: vec![LagLeadFunctionSpec {
+                function_type: AnalyticFunctionKind::LastValue,
+                source_column: "price".to_string(),
+                offset: 0,
+                default_value: None,
+                output_column: "last_price".to_string(),
+            }],
+            partition_columns: vec!["symbol".to_string()],
+            max_partitions: 100,
+        };
+
+        let mut op = LagLeadOperator::new(config);
+        let mut timers = TimerService::new();
+        let mut state = InMemoryStore::new();
+        let mut wm = BoundedOutOfOrdernessGenerator::new(100);
+
+        let events = [
+            make_trade(1, "AAPL", 100.0),
+            make_trade(2, "AAPL", 110.0),
+            make_trade(3, "AAPL", 120.0),
+        ];
+
+        let expected = [100.0, 110.0, 120.0];
+        for (e, &exp) in events.iter().zip(expected.iter()) {
+            let mut ctx = create_test_context(&mut timers, &mut state, &mut wm);
+            let outputs = op.process(e, &mut ctx);
+            assert_eq!(outputs.len(), 1);
+            if let Output::Event(out) = &outputs[0] {
+                let arr = out
+                    .data
+                    .column_by_name("last_price")
+                    .unwrap()
+                    .as_any()
+                    .downcast_ref::<Float64Array>()
+                    .unwrap();
+                // LAST_VALUE should return the current event's value
+                assert_eq!(arr.value(0), exp);
+            }
+        }
+    }
+
+    #[test]
+    fn test_nth_value() {
+        let config = LagLeadConfig {
+            operator_id: "nth_val".to_string(),
+            functions: vec![LagLeadFunctionSpec {
+                function_type: AnalyticFunctionKind::NthValue,
+                source_column: "price".to_string(),
+                offset: 2, // NTH_VALUE(price, 2) — return the 2nd event's value
+                default_value: Some(-1.0),
+                output_column: "second_price".to_string(),
+            }],
+            partition_columns: vec!["symbol".to_string()],
+            max_partitions: 100,
+        };
+
+        let mut op = LagLeadOperator::new(config);
+        let mut timers = TimerService::new();
+        let mut state = InMemoryStore::new();
+        let mut wm = BoundedOutOfOrdernessGenerator::new(100);
+
+        let events = [
+            make_trade(1, "AAPL", 100.0),
+            make_trade(2, "AAPL", 110.0),
+            make_trade(3, "AAPL", 120.0),
+        ];
+
+        // Event 1: N=2 not yet reached, should return default (-1.0)
+        {
+            let mut ctx = create_test_context(&mut timers, &mut state, &mut wm);
+            let outputs = op.process(&events[0], &mut ctx);
+            if let Output::Event(out) = &outputs[0] {
+                let arr = out
+                    .data
+                    .column_by_name("second_price")
+                    .unwrap()
+                    .as_any()
+                    .downcast_ref::<Float64Array>()
+                    .unwrap();
+                assert_eq!(arr.value(0), -1.0);
+            }
+        }
+
+        // Event 2: N=2 reached, should return 110.0 (the 2nd event's price)
+        {
+            let mut ctx = create_test_context(&mut timers, &mut state, &mut wm);
+            let outputs = op.process(&events[1], &mut ctx);
+            if let Output::Event(out) = &outputs[0] {
+                let arr = out
+                    .data
+                    .column_by_name("second_price")
+                    .unwrap()
+                    .as_any()
+                    .downcast_ref::<Float64Array>()
+                    .unwrap();
+                assert_eq!(arr.value(0), 110.0);
+            }
+        }
+
+        // Event 3: N=2 already stored, should still return 110.0
+        {
+            let mut ctx = create_test_context(&mut timers, &mut state, &mut wm);
+            let outputs = op.process(&events[2], &mut ctx);
+            if let Output::Event(out) = &outputs[0] {
+                let arr = out
+                    .data
+                    .column_by_name("second_price")
+                    .unwrap()
+                    .as_any()
+                    .downcast_ref::<Float64Array>()
+                    .unwrap();
+                assert_eq!(arr.value(0), 110.0);
+            }
+        }
     }
 }

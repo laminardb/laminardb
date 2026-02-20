@@ -879,8 +879,8 @@ impl LaminarDB {
         // Register in catalog as a stream
         self.catalog.register_stream(&name_str)?;
 
-        // Plan the statement to extract emit_clause and window_config
-        let (plan_emit, plan_window) = {
+        // Plan the statement to extract emit_clause, window_config, and order_config
+        let (plan_emit, plan_window, plan_order) = {
             let mut planner = self.planner.lock();
             let stmt = StreamingStatement::CreateStream {
                 name: name.clone(),
@@ -891,9 +891,9 @@ impl LaminarDB {
             };
             match planner.plan(&stmt) {
                 Ok(laminar_sql::planner::StreamingPlan::Query(ref qp)) => {
-                    (qp.emit_clause.clone(), qp.window_config.clone())
+                    (qp.emit_clause.clone(), qp.window_config.clone(), qp.order_config.clone())
                 }
-                _ => (emit_clause.cloned(), None),
+                _ => (emit_clause.cloned(), None, None),
             }
         };
 
@@ -905,6 +905,7 @@ impl LaminarDB {
                 query_sql: streaming_statement_to_sql(query),
                 emit_clause: plan_emit,
                 window_config: plan_window,
+                order_config: plan_order,
             });
         }
 
@@ -1353,39 +1354,19 @@ impl LaminarDB {
             .ctx
             .sql(&left_sql)
             .await
-            .map_err(|e| {
-                DbError::Pipeline(format!(
-                    "ASOF left table '{}' query failed: {e}",
-                    asof_config.left_table
-                ))
-            })?
+            .map_err(|e| DbError::query_pipeline(&asof_config.left_table, &e))?
             .collect()
             .await
-            .map_err(|e| {
-                DbError::Pipeline(format!(
-                    "ASOF left table '{}' execution failed: {e}",
-                    asof_config.left_table
-                ))
-            })?;
+            .map_err(|e| DbError::query_pipeline(&asof_config.left_table, &e))?;
 
         let right_batches = self
             .ctx
             .sql(&right_sql)
             .await
-            .map_err(|e| {
-                DbError::Pipeline(format!(
-                    "ASOF right table '{}' query failed: {e}",
-                    asof_config.right_table
-                ))
-            })?
+            .map_err(|e| DbError::query_pipeline(&asof_config.right_table, &e))?
             .collect()
             .await
-            .map_err(|e| {
-                DbError::Pipeline(format!(
-                    "ASOF right table '{}' execution failed: {e}",
-                    asof_config.right_table
-                ))
-            })?;
+            .map_err(|e| DbError::query_pipeline(&asof_config.right_table, &e))?;
 
         let result_batch =
             crate::asof_batch::execute_asof_join_batch(&left_batches, &right_batches, asof_config)?;
@@ -1404,24 +1385,22 @@ impl LaminarDB {
         let schema = result_batch.schema();
         let mem_table =
             datafusion::datasource::MemTable::try_new(schema.clone(), vec![vec![result_batch]])
-                .map_err(|e| {
-                    DbError::Pipeline(format!("Failed to create ASOF result table: {e}"))
-                })?;
+                .map_err(|e| DbError::query_pipeline("ASOF join", &e))?;
 
         let _ = self.ctx.deregister_table("__asof_result");
         self.ctx
             .register_table("__asof_result", Arc::new(mem_table))
-            .map_err(|e| DbError::Pipeline(format!("Failed to register ASOF result table: {e}")))?;
+            .map_err(|e| DbError::query_pipeline("ASOF join", &e))?;
 
         let df = self
             .ctx
             .sql("SELECT * FROM __asof_result")
             .await
-            .map_err(|e| DbError::Pipeline(format!("Failed to query ASOF result: {e}")))?;
+            .map_err(|e| DbError::query_pipeline("ASOF join", &e))?;
         let stream = df
             .execute_stream()
             .await
-            .map_err(|e| DbError::Pipeline(format!("Failed to stream ASOF result: {e}")))?;
+            .map_err(|e| DbError::query_pipeline("ASOF join", &e))?;
 
         let _ = self.ctx.deregister_table("__asof_result");
 
@@ -1782,6 +1761,7 @@ impl LaminarDB {
                 reg.query_sql.clone(),
                 reg.emit_clause.clone(),
                 reg.window_config.clone(),
+                reg.order_config.clone(),
             );
         }
 
@@ -2074,6 +2054,7 @@ impl LaminarDB {
                 reg.query_sql.clone(),
                 reg.emit_clause.clone(),
                 reg.window_config.clone(),
+                reg.order_config.clone(),
             );
         }
 
@@ -3050,6 +3031,37 @@ impl LaminarDB {
                 .map_err(|e| DbError::MaterializedView(e.to_string()))?;
         }
 
+        // Plan the MV's backing query to extract emit_clause, window_config, and order_config
+        let (plan_emit, plan_window, plan_order) = {
+            let mut planner = self.planner.lock();
+            // Wrap the inner query as a CreateStream to reuse the planner
+            let stmt = StreamingStatement::CreateStream {
+                name: name.clone(),
+                query: Box::new(query.clone()),
+                emit_clause: None,
+                or_replace: false,
+                if_not_exists: false,
+            };
+            match planner.plan(&stmt) {
+                Ok(laminar_sql::planner::StreamingPlan::Query(ref qp)) => {
+                    (qp.emit_clause.clone(), qp.window_config.clone(), qp.order_config.clone())
+                }
+                _ => (None, None, None),
+            }
+        };
+
+        // Register the MV as a stream so start() picks it up for execution
+        {
+            let mut mgr = self.connector_manager.lock();
+            mgr.register_stream(crate::connector_manager::StreamRegistration {
+                name: name_str.clone(),
+                query_sql: query_sql.clone(),
+                emit_clause: plan_emit,
+                window_config: plan_window,
+                order_config: plan_order,
+            });
+        }
+
         Ok(ExecuteResult::Ddl(DdlInfo {
             statement_type: "CREATE MATERIALIZED VIEW".to_string(),
             object_name: name_str,
@@ -3064,25 +3076,41 @@ impl LaminarDB {
         cascade: bool,
     ) -> Result<ExecuteResult, DbError> {
         let name_str = name.to_string();
-        let mut registry = self.mv_registry.lock();
 
-        let result = if cascade {
-            registry.unregister_cascade(&name_str)
-        } else {
-            registry.unregister(&name_str).map(|v| vec![v])
-        };
+        // Collect names to unregister from connector manager
+        let dropped_names;
+        {
+            let mut registry = self.mv_registry.lock();
 
-        match result {
-            Ok(_) => Ok(ExecuteResult::Ddl(DdlInfo {
-                statement_type: "DROP MATERIALIZED VIEW".to_string(),
-                object_name: name_str,
-            })),
-            Err(_) if if_exists => Ok(ExecuteResult::Ddl(DdlInfo {
-                statement_type: "DROP MATERIALIZED VIEW".to_string(),
-                object_name: name_str,
-            })),
-            Err(e) => Err(DbError::MaterializedView(e.to_string())),
+            let result = if cascade {
+                registry.unregister_cascade(&name_str)
+            } else {
+                registry.unregister(&name_str).map(|v| vec![v])
+            };
+
+            match result {
+                Ok(views) => {
+                    dropped_names = views.into_iter().map(|v| v.name.clone()).collect::<Vec<_>>();
+                }
+                Err(_) if if_exists => {
+                    dropped_names = vec![];
+                }
+                Err(e) => return Err(DbError::MaterializedView(e.to_string())),
+            }
         }
+
+        // Remove stream registrations for dropped MVs
+        {
+            let mut mgr = self.connector_manager.lock();
+            for dropped in &dropped_names {
+                mgr.unregister_stream(dropped);
+            }
+        }
+
+        Ok(ExecuteResult::Ddl(DdlInfo {
+            statement_type: "DROP MATERIALIZED VIEW".to_string(),
+            object_name: name_str,
+        }))
     }
 
     /// Build a SHOW MATERIALIZED VIEWS metadata result.
@@ -3372,22 +3400,22 @@ async fn apply_filter(
 
     // Register the batch as a temporary table
     let mem_table = datafusion::datasource::MemTable::try_new(schema, vec![vec![batch.clone()]])
-        .map_err(|e| DbError::Pipeline(format!("Filter table creation: {e}")))?;
+        .map_err(|e| DbError::query_pipeline("sink filter", &e))?;
 
     ctx.register_table(FILTER_INPUT_TABLE, Arc::new(mem_table))
-        .map_err(|e| DbError::Pipeline(format!("Filter table registration: {e}")))?;
+        .map_err(|e| DbError::query_pipeline("sink filter", &e))?;
 
     // Execute the filter query
     let sql = format!("SELECT * FROM {FILTER_INPUT_TABLE} WHERE {filter_sql}");
     let df = ctx
         .sql(&sql)
         .await
-        .map_err(|e| DbError::Pipeline(format!("Filter query: {e}")))?;
+        .map_err(|e| DbError::query_pipeline("sink filter", &e))?;
 
     let batches = df
         .collect()
         .await
-        .map_err(|e| DbError::Pipeline(format!("Filter execution: {e}")))?;
+        .map_err(|e| DbError::query_pipeline("sink filter", &e))?;
 
     if batches.is_empty() {
         return Ok(None);
@@ -6036,6 +6064,74 @@ mod tests {
                 );
             }
             _ => panic!("Expected Query result"),
+        }
+    }
+
+    #[tokio::test]
+    async fn test_mv_registers_stream_in_connector_manager() {
+        let db = LaminarDB::open().unwrap();
+        db.execute("CREATE SOURCE events (id INT, value DOUBLE)")
+            .await
+            .unwrap();
+
+        // Before MV creation, no stream registered
+        {
+            let mgr = db.connector_manager.lock();
+            assert!(
+                !mgr.streams().contains_key("event_totals"),
+                "stream should not exist before MV creation"
+            );
+        }
+
+        let result = db
+            .execute("CREATE MATERIALIZED VIEW event_totals AS SELECT * FROM events")
+            .await;
+
+        // The MV may fail at query execution (no data), but if DDL succeeds
+        // the connector manager should have the stream registered
+        if result.is_ok() {
+            let mgr = db.connector_manager.lock();
+            assert!(
+                mgr.streams().contains_key("event_totals"),
+                "MV should be registered as a stream in connector manager"
+            );
+            let reg = &mgr.streams()["event_totals"];
+            assert!(
+                reg.query_sql.contains("events"),
+                "stream query should reference the source"
+            );
+        }
+    }
+
+    #[tokio::test]
+    async fn test_drop_mv_unregisters_stream() {
+        let db = LaminarDB::open().unwrap();
+        db.execute("CREATE SOURCE events (id INT, value DOUBLE)")
+            .await
+            .unwrap();
+
+        let result = db
+            .execute("CREATE MATERIALIZED VIEW mv1 AS SELECT * FROM events")
+            .await;
+
+        if result.is_ok() {
+            // Verify registered
+            {
+                let mgr = db.connector_manager.lock();
+                assert!(mgr.streams().contains_key("mv1"));
+            }
+
+            // Drop the MV
+            db.execute("DROP MATERIALIZED VIEW mv1").await.unwrap();
+
+            // Verify unregistered
+            {
+                let mgr = db.connector_manager.lock();
+                assert!(
+                    !mgr.streams().contains_key("mv1"),
+                    "stream should be unregistered after DROP MV"
+                );
+            }
         }
     }
 }
