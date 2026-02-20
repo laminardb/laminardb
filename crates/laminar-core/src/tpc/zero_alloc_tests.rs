@@ -1,4 +1,4 @@
-//! Zero-allocation verification tests for F073.
+//! Zero-allocation verification tests.
 //!
 //! These tests verify that the new zero-allocation APIs work correctly
 //! and don't allocate when used properly.

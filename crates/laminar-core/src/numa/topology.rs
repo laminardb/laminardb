@@ -199,8 +199,8 @@ impl NumaTopology {
             }
         }
 
-        // Fallback to num_cpus crate
-        num_cpus::get()
+        // Fallback to std
+        std::thread::available_parallelism().map_or(1, std::num::NonZero::get)
     }
 
     /// Parse a CPU list string like "0-7,16-23".
@@ -250,7 +250,7 @@ impl NumaTopology {
 
     /// Create a single-node fallback topology.
     fn single_node_fallback() -> Self {
-        let num_cpus = num_cpus::get();
+        let num_cpus = std::thread::available_parallelism().map_or(1, std::num::NonZero::get);
         let cpus: Vec<usize> = (0..num_cpus).collect();
 
         Self {

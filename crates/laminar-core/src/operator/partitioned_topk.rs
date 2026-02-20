@@ -23,7 +23,7 @@ use super::{
 };
 use arrow_array::{Array, Float64Array, Int64Array, StringArray, TimestampMicrosecondArray};
 use arrow_schema::DataType;
-use fxhash::FxHashMap;
+use rustc_hash::FxHashMap;
 
 /// Configuration for a partition key column.
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -74,6 +74,10 @@ pub struct PartitionedTopKOperator {
     sequence_counter: u64,
     /// Maximum number of partitions (memory safety).
     max_partitions: usize,
+    /// Cached column indices for partition columns — resolved on first event.
+    cached_partition_indices: Vec<Option<usize>>,
+    /// Cached column indices for sort columns — resolved on first event.
+    cached_sort_indices: Vec<Option<usize>>,
 }
 
 impl PartitionedTopKOperator {
@@ -87,6 +91,8 @@ impl PartitionedTopKOperator {
         emit_strategy: TopKEmitStrategy,
         max_partitions: usize,
     ) -> Self {
+        let num_partition_cols = partition_columns.len();
+        let num_sort_cols = sort_columns.len();
         Self {
             operator_id,
             k,
@@ -97,6 +103,8 @@ impl PartitionedTopKOperator {
             pending_changes: Vec::new(),
             sequence_counter: 0,
             max_partitions,
+            cached_partition_indices: vec![None; num_partition_cols],
+            cached_sort_indices: vec![None; num_sort_cols],
         }
     }
 
@@ -125,16 +133,22 @@ impl PartitionedTopKOperator {
     }
 
     /// Extracts the partition key from an event.
-    fn extract_partition_key(&self, event: &Event) -> Vec<u8> {
+    ///
+    /// Caches column indices on first call to avoid per-event schema lookups.
+    fn extract_partition_key(&mut self, event: &Event) -> Vec<u8> {
         let batch = &event.data;
-        let schema = batch.schema();
         let mut key = Vec::new();
 
-        for col in &self.partition_columns {
-            let Ok(col_idx) = schema.index_of(&col.column_name) else {
-                // Missing column: use null marker
-                key.push(0x00);
-                continue;
+        for (i, col) in self.partition_columns.iter().enumerate() {
+            let col_idx = if let Some(idx) = self.cached_partition_indices[i] {
+                idx
+            } else {
+                let Ok(idx) = batch.schema().index_of(&col.column_name) else {
+                    key.push(0x00);
+                    continue;
+                };
+                self.cached_partition_indices[i] = Some(idx);
+                idx
             };
 
             let array = batch.column(col_idx);
@@ -171,15 +185,22 @@ impl PartitionedTopKOperator {
     }
 
     /// Extracts a memcomparable sort key from an event.
-    fn extract_sort_key(&self, event: &Event) -> Vec<u8> {
+    ///
+    /// Caches column indices on first call to avoid per-event schema lookups.
+    fn extract_sort_key(&mut self, event: &Event) -> Vec<u8> {
         let batch = &event.data;
-        let schema = batch.schema();
         let mut key = Vec::new();
 
-        for col_spec in &self.sort_columns {
-            let Ok(col_idx) = schema.index_of(&col_spec.column_name) else {
-                encode_null(col_spec.nulls_first, col_spec.descending, &mut key);
-                continue;
+        for (i, col_spec) in self.sort_columns.iter().enumerate() {
+            let col_idx = if let Some(idx) = self.cached_sort_indices[i] {
+                idx
+            } else {
+                let Ok(idx) = batch.schema().index_of(&col_spec.column_name) else {
+                    encode_null(col_spec.nulls_first, col_spec.descending, &mut key);
+                    continue;
+                };
+                self.cached_sort_indices[i] = Some(idx);
+                idx
             };
 
             let array = batch.column(col_idx);

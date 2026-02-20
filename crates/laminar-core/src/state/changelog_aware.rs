@@ -1,4 +1,4 @@
-//! Changelog-aware state store wrapper (F-CKP-005).
+//! Changelog-aware state store wrapper.
 //!
 //! Wraps any [`StateStore`] to record mutations to a [`ChangelogSink`],
 //! enabling Ring 1 WAL writes to track Ring 0 state changes.
@@ -13,7 +13,7 @@ use bytes::Bytes;
 use std::ops::Range;
 use std::sync::Arc;
 
-use super::{StateError, StateSnapshot, StateStore};
+use super::{ChangeEntry, IncrementalSnapshot, StateError, StateSnapshot, StateStore};
 
 /// Trait for recording state mutations from Ring 0.
 ///
@@ -32,6 +32,18 @@ pub trait ChangelogSink: Send + Sync {
     ///
     /// Returns `true` if recorded, `false` if the sink is full.
     fn record_delete(&self, key: &[u8]) -> bool;
+
+    /// Drain all accumulated entries since the last drain/reset.
+    ///
+    /// Returns the ordered list of mutations. After this call, the sink
+    /// is empty and ready for the next checkpoint interval.
+    fn drain(&self) -> Vec<ChangeEntry>;
+
+    /// Reset the sink, discarding all accumulated entries.
+    ///
+    /// Called during `restore()` and `clear()` to ensure the changelog
+    /// does not contain stale deltas from before the state reset.
+    fn reset(&self);
 }
 
 /// A state store wrapper that records all mutations to a changelog sink.
@@ -129,10 +141,26 @@ impl<S: StateStore> StateStore for ChangelogAwareStore<S> {
 
     fn restore(&mut self, snapshot: StateSnapshot) {
         self.inner.restore(snapshot);
+        // Reset changelog so incremental deltas start from the restored baseline.
+        self.changelog.reset();
     }
 
     fn clear(&mut self) {
         self.inner.clear();
+        // Reset changelog so incremental deltas start from the cleared state.
+        self.changelog.reset();
+    }
+
+    fn incremental_snapshot(&self) -> Option<IncrementalSnapshot> {
+        let changes = self.changelog.drain();
+        if changes.is_empty() {
+            return None;
+        }
+        Some(IncrementalSnapshot {
+            changes,
+            base_epoch: 0, // Caller sets the correct base epoch
+            epoch: 0,      // Caller sets the correct epoch
+        })
     }
 
     fn flush(&mut self) -> Result<(), StateError> {
@@ -144,12 +172,14 @@ impl<S: StateStore> StateStore for ChangelogAwareStore<S> {
 mod tests {
     use super::*;
     use crate::state::InMemoryStore;
+    use parking_lot::Mutex;
     use std::sync::atomic::{AtomicUsize, Ordering};
 
-    /// Test changelog sink that counts operations.
+    /// Test changelog sink that counts operations and accumulates entries.
     struct CountingSink {
         puts: AtomicUsize,
         deletes: AtomicUsize,
+        entries: Mutex<Vec<ChangeEntry>>,
     }
 
     impl CountingSink {
@@ -157,19 +187,34 @@ mod tests {
             Self {
                 puts: AtomicUsize::new(0),
                 deletes: AtomicUsize::new(0),
+                entries: Mutex::new(Vec::new()),
             }
         }
     }
 
     impl ChangelogSink for CountingSink {
-        fn record_put(&self, _key: &[u8], _value_len: u32) -> bool {
+        fn record_put(&self, key: &[u8], _value_len: u32) -> bool {
             self.puts.fetch_add(1, Ordering::Relaxed);
+            self.entries
+                .lock()
+                .push(ChangeEntry::Put(key.to_vec(), Vec::new()));
             true
         }
 
-        fn record_delete(&self, _key: &[u8]) -> bool {
+        fn record_delete(&self, key: &[u8]) -> bool {
             self.deletes.fetch_add(1, Ordering::Relaxed);
+            self.entries.lock().push(ChangeEntry::Delete(key.to_vec()));
             true
+        }
+
+        fn drain(&self) -> Vec<ChangeEntry> {
+            std::mem::take(&mut *self.entries.lock())
+        }
+
+        fn reset(&self) {
+            self.entries.lock().clear();
+            self.puts.store(0, Ordering::Relaxed);
+            self.deletes.store(0, Ordering::Relaxed);
         }
     }
 
@@ -276,6 +321,10 @@ mod tests {
             fn record_delete(&self, _key: &[u8]) -> bool {
                 false // Always full
             }
+            fn drain(&self) -> Vec<ChangeEntry> {
+                Vec::new()
+            }
+            fn reset(&self) {}
         }
 
         let sink = Arc::new(FullSink);
@@ -308,10 +357,10 @@ mod tests {
         assert_eq!(store.get(b"key1").unwrap().as_ref(), b"value1");
         assert!(store.get(b"key3").is_none());
 
-        // Restore doesn't record to changelog (it's a control operation, not data)
-        // puts: 3 (key1, key2, key3), deletes: 1 (key1)
-        assert_eq!(sink.puts.load(Ordering::Relaxed), 3);
-        assert_eq!(sink.deletes.load(Ordering::Relaxed), 1);
+        // Restore resets the changelog so incremental deltas start fresh.
+        // Counters are reset to 0 by restore().
+        assert_eq!(sink.puts.load(Ordering::Relaxed), 0);
+        assert_eq!(sink.deletes.load(Ordering::Relaxed), 0);
     }
 
     #[test]
@@ -351,5 +400,86 @@ mod tests {
 
         let results: Vec<_> = store.range_scan(b"b".as_slice()..b"d".as_slice()).collect();
         assert_eq!(results.len(), 2);
+    }
+
+    #[test]
+    fn test_incremental_snapshot_returns_changes() {
+        let sink = Arc::new(CountingSink::new());
+        let mut store = ChangelogAwareStore::new(InMemoryStore::new(), sink);
+
+        store.put(b"k1", b"v1").unwrap();
+        store.put(b"k2", b"v2").unwrap();
+        store.delete(b"k1").unwrap();
+
+        let snap = store.incremental_snapshot().unwrap();
+        assert_eq!(snap.changes.len(), 3);
+        assert!(matches!(&snap.changes[0], ChangeEntry::Put(k, _) if k == b"k1"));
+        assert!(matches!(&snap.changes[1], ChangeEntry::Put(k, _) if k == b"k2"));
+        assert!(matches!(&snap.changes[2], ChangeEntry::Delete(k) if k == b"k1"));
+    }
+
+    #[test]
+    fn test_incremental_snapshot_empty_returns_none() {
+        let sink = Arc::new(CountingSink::new());
+        let store = ChangelogAwareStore::new(InMemoryStore::new(), sink);
+
+        assert!(store.incremental_snapshot().is_none());
+    }
+
+    #[test]
+    fn test_incremental_snapshot_drains_on_call() {
+        let sink = Arc::new(CountingSink::new());
+        let mut store = ChangelogAwareStore::new(InMemoryStore::new(), sink);
+
+        store.put(b"k1", b"v1").unwrap();
+        let snap = store.incremental_snapshot().unwrap();
+        assert_eq!(snap.changes.len(), 1);
+
+        // Second call should return None (drained)
+        assert!(store.incremental_snapshot().is_none());
+
+        // New mutations produce a new snapshot
+        store.put(b"k2", b"v2").unwrap();
+        let snap2 = store.incremental_snapshot().unwrap();
+        assert_eq!(snap2.changes.len(), 1);
+    }
+
+    #[test]
+    fn test_restore_resets_changelog() {
+        let sink = Arc::new(CountingSink::new());
+        let mut store = ChangelogAwareStore::new(InMemoryStore::new(), sink.clone());
+
+        store.put(b"k1", b"v1").unwrap();
+        store.put(b"k2", b"v2").unwrap();
+        let snapshot = store.snapshot();
+
+        store.put(b"k3", b"v3").unwrap();
+        // 3 puts recorded before restore
+        assert_eq!(sink.puts.load(Ordering::Relaxed), 3);
+
+        store.restore(snapshot);
+        // Counters reset by restore
+        assert_eq!(sink.puts.load(Ordering::Relaxed), 0);
+        // Changelog drained
+        assert!(store.incremental_snapshot().is_none());
+
+        // Post-restore mutations are tracked fresh
+        store.put(b"k4", b"v4").unwrap();
+        let snap = store.incremental_snapshot().unwrap();
+        assert_eq!(snap.changes.len(), 1);
+    }
+
+    #[test]
+    fn test_clear_resets_changelog() {
+        let sink = Arc::new(CountingSink::new());
+        let mut store = ChangelogAwareStore::new(InMemoryStore::new(), sink.clone());
+
+        store.put(b"k1", b"v1").unwrap();
+        store.put(b"k2", b"v2").unwrap();
+        assert_eq!(sink.puts.load(Ordering::Relaxed), 2);
+
+        store.clear();
+        assert_eq!(sink.puts.load(Ordering::Relaxed), 0);
+        assert!(store.incremental_snapshot().is_none());
     }
 }

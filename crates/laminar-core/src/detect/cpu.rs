@@ -267,10 +267,12 @@ fn detect_cache_line_cpuid() -> Option<usize> {
 /// Get the number of logical CPUs.
 #[must_use]
 pub fn logical_cpu_count() -> usize {
-    num_cpus::get()
+    std::thread::available_parallelism().map_or(1, std::num::NonZero::get)
 }
 
 /// Get the number of physical CPU cores.
+///
+/// Uses `num_cpus::get_physical()` as there is no std equivalent.
 #[must_use]
 pub fn physical_cpu_count() -> usize {
     num_cpus::get_physical()

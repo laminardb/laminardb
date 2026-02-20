@@ -14,7 +14,6 @@ description = "Storage layer for LaminarDB - WAL, checkpointing, and lakehouse i
 laminar-core = { path = "../laminar-core", version = "0.13.0" }
 
 # Storage
-rocksdb = { version = "0.24", optional = true }
 object_store = "0.13"  # For cloud storage
 parquet = "57.2"  # For lakehouse formats
 delta_kernel = { version = "0.19", optional = true }  # Delta Lake
@@ -32,11 +31,19 @@ crc32c = "0.6"
 base64 = { workspace = true }
 
 # Fast hash for changelog entries
-fxhash = "0.2"
+rustc-hash = { workspace = true }
+
+# Identifiers
+uuid = { workspace = true }
+
+# Checkpoint integrity
+sha2 = { workspace = true }
+backoff = { workspace = true }
 
 # Async
 tokio = { workspace = true }
 async-trait = { workspace = true }
+futures = { workspace = true }
 
 # Error handling
 thiserror = { workspace = true }
@@ -46,8 +53,7 @@ anyhow = { workspace = true }
 tracing = { workspace = true }
 
 [features]
-default = ["rocksdb"]
-rocksdb = ["dep:rocksdb"]
+default = []
 delta = ["dep:delta_kernel"]
 io-uring = ["laminar-core/io-uring"]
 

@@ -59,7 +59,7 @@ pub struct PipelineCheckpoint {
     /// Per-table source offsets (key: table name). Absent in older checkpoints.
     #[serde(default)]
     pub table_offsets: HashMap<String, SerializableSourceCheckpoint>,
-    /// Path to the `RocksDB` table store checkpoint, if any.
+    /// Path to the table store checkpoint, if any.
     #[serde(default)]
     pub table_store_checkpoint_path: Option<String>,
 }

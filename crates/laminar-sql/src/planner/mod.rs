@@ -5,6 +5,10 @@
 //! operator configurations for Ring 0 execution.
 
 pub mod channel_derivation;
+/// Optimizer rules for lookup join rewriting.
+pub mod lookup_join;
+/// Predicate splitting and pushdown for lookup joins.
+pub mod predicate_split;
 
 use std::collections::HashMap;
 
@@ -17,15 +21,29 @@ use crate::parser::analytic_parser::{
     analyze_analytic_functions, analyze_window_frames, FrameBound,
 };
 use crate::parser::join_parser::analyze_joins;
+use crate::parser::lookup_table::{validate_properties, LookupTableProperties};
 use crate::parser::order_analyzer::analyze_order_by;
 use crate::parser::{
-    CreateSinkStatement, CreateSourceStatement, EmitClause, SinkFrom, StreamingStatement,
-    WindowFunction, WindowRewriter,
+    CreateLookupTableStatement, CreateSinkStatement, CreateSourceStatement, EmitClause, SinkFrom,
+    StreamingStatement, WindowFunction, WindowRewriter,
 };
 use crate::translator::{
     AnalyticWindowConfig, DagExplainOutput, HavingFilterConfig, JoinOperatorConfig,
     OrderOperatorConfig, WindowFrameConfig, WindowOperatorConfig,
 };
+
+/// Information about a registered lookup table.
+#[derive(Debug, Clone)]
+pub struct LookupTableInfo {
+    /// Table name.
+    pub name: String,
+    /// Column names and types.
+    pub columns: Vec<(String, String)>,
+    /// Primary key columns.
+    pub primary_key: Vec<String>,
+    /// Validated properties.
+    pub properties: LookupTableProperties,
+}
 
 /// Streaming query planner
 pub struct StreamingPlanner {
@@ -33,6 +51,8 @@ pub struct StreamingPlanner {
     sources: HashMap<String, SourceInfo>,
     /// Registered sinks
     sinks: HashMap<String, SinkInfo>,
+    /// Registered lookup tables
+    lookup_tables: HashMap<String, LookupTableInfo>,
 }
 
 /// Information about a registered source
@@ -75,6 +95,15 @@ pub enum StreamingPlan {
 
     /// DAG topology explanation (from EXPLAIN DAG)
     DagExplain(DagExplainOutput),
+
+    /// Lookup table registration (DDL)
+    RegisterLookupTable(LookupTableInfo),
+
+    /// Drop a lookup table
+    DropLookupTable {
+        /// Name of the lookup table to drop.
+        name: String,
+    },
 }
 
 /// A query plan with streaming operator configurations
@@ -107,6 +136,7 @@ impl StreamingPlanner {
         Self {
             sources: HashMap::new(),
             sinks: HashMap::new(),
+            lookup_tables: HashMap::new(),
         }
     }
 
@@ -131,6 +161,10 @@ impl StreamingPlanner {
                 ..
             } => self.plan_continuous_query(name, query, emit_clause.as_ref()),
             StreamingStatement::Standard(stmt) => self.plan_standard_statement(stmt),
+            StreamingStatement::CreateLookupTable(lt) => self.plan_create_lookup_table(lt),
+            StreamingStatement::DropLookupTable { name, if_exists } => {
+                self.plan_drop_lookup_table(name, *if_exists)
+            }
             StreamingStatement::DropSource { .. }
             | StreamingStatement::DropSink { .. }
             | StreamingStatement::DropStream { .. }
@@ -413,6 +447,62 @@ impl StreamingPlanner {
         None
     }
 
+    /// Plans a CREATE LOOKUP TABLE statement.
+    fn plan_create_lookup_table(
+        &mut self,
+        lt: &CreateLookupTableStatement,
+    ) -> Result<StreamingPlan, PlanningError> {
+        let name = object_name_to_string(&lt.name);
+
+        if !lt.or_replace && !lt.if_not_exists && self.lookup_tables.contains_key(&name) {
+            return Err(PlanningError::InvalidQuery(format!(
+                "Lookup table '{}' already exists",
+                name
+            )));
+        }
+
+        let columns: Vec<(String, String)> = lt
+            .columns
+            .iter()
+            .map(|c| (c.name.value.clone(), c.data_type.to_string()))
+            .collect();
+
+        let properties = validate_properties(&lt.with_options).map_err(|e| {
+            PlanningError::InvalidQuery(format!("Invalid lookup table properties: {e}"))
+        })?;
+
+        let info = LookupTableInfo {
+            name: name.clone(),
+            columns,
+            primary_key: lt.primary_key.clone(),
+            properties,
+        };
+
+        self.lookup_tables.insert(name, info.clone());
+
+        Ok(StreamingPlan::RegisterLookupTable(info))
+    }
+
+    /// Plans a DROP LOOKUP TABLE statement.
+    fn plan_drop_lookup_table(
+        &mut self,
+        name: &ObjectName,
+        if_exists: bool,
+    ) -> Result<StreamingPlan, PlanningError> {
+        let name_str = object_name_to_string(name);
+
+        if !if_exists && !self.lookup_tables.contains_key(&name_str) {
+            return Err(PlanningError::InvalidQuery(format!(
+                "Lookup table '{}' does not exist",
+                name_str
+            )));
+        }
+
+        self.lookup_tables.remove(&name_str);
+
+        Ok(StreamingPlan::DropLookupTable { name: name_str })
+    }
+
     /// Gets a registered source by name.
     #[must_use]
     pub fn get_source(&self, name: &str) -> Option<&SourceInfo> {
@@ -435,6 +525,18 @@ impl StreamingPlanner {
     #[must_use]
     pub fn list_sinks(&self) -> Vec<&SinkInfo> {
         self.sinks.values().collect()
+    }
+
+    /// Gets a registered lookup table by name.
+    #[must_use]
+    pub fn get_lookup_table(&self, name: &str) -> Option<&LookupTableInfo> {
+        self.lookup_tables.get(name)
+    }
+
+    /// Lists all registered lookup tables.
+    #[must_use]
+    pub fn list_lookup_tables(&self) -> Vec<&LookupTableInfo> {
+        self.lookup_tables.values().collect()
     }
 
     /// Creates a `DataFusion` logical plan from a query plan.
@@ -818,7 +920,7 @@ mod tests {
         }
     }
 
-    // -- Multi-way join planner tests (F-SQL-005) --
+    // -- Multi-way join planner tests --
 
     #[test]
     fn test_plan_single_join_produces_vec_of_one() {
@@ -893,7 +995,7 @@ mod tests {
         }
     }
 
-    // -- Window Frame planner tests (F-SQL-006) --
+    // -- Window Frame planner tests --
 
     #[test]
     fn test_plan_query_with_rows_frame() {

@@ -1,6 +1,6 @@
 //! Window operator benchmarks
 //!
-//! Targets from F004 spec:
+//! Targets spec:
 //! - bench_window_assign: < 10ns
 //! - bench_window_aggregate: < 100ns per event
 //! - bench_window_emit: < 1μs

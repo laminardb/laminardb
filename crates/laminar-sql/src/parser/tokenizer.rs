@@ -75,6 +75,16 @@ pub enum StreamingDdlKind {
     ShowStreams,
     /// SHOW TABLES
     ShowTables,
+    /// CREATE [OR REPLACE] LOOKUP TABLE
+    CreateLookupTable {
+        /// Whether OR REPLACE was specified
+        or_replace: bool,
+    },
+    /// DROP LOOKUP TABLE [IF EXISTS]
+    DropLookupTable {
+        /// Whether IF EXISTS was specified
+        if_exists: bool,
+    },
     /// Not a streaming DDL statement
     None,
 }
@@ -144,6 +154,19 @@ fn detect_create_ddl(significant: &[&TokenWithSpan]) -> StreamingDdlKind {
         Token::Word(w) if is_word_ci(w, "STREAM") => {
             StreamingDdlKind::CreateStream { or_replace: false }
         }
+        Token::Word(w) if is_word_ci(w, "LOOKUP") => {
+            // CREATE LOOKUP TABLE
+            if significant.len() >= 3 {
+                if let Token::Word(Word {
+                    keyword: Keyword::TABLE,
+                    ..
+                }) = &significant[2].token
+                {
+                    return StreamingDdlKind::CreateLookupTable { or_replace: false };
+                }
+            }
+            StreamingDdlKind::None
+        }
         Token::Word(Word {
             keyword: Keyword::MATERIALIZED,
             ..
@@ -201,6 +224,20 @@ fn detect_drop_ddl(significant: &[&TokenWithSpan]) -> StreamingDdlKind {
         Token::Word(w) if is_word_ci(w, "STREAM") => {
             let if_exists = has_if_exists(significant, 2);
             StreamingDdlKind::DropStream { if_exists }
+        }
+        Token::Word(w) if is_word_ci(w, "LOOKUP") => {
+            // DROP LOOKUP TABLE
+            if significant.len() >= 3 {
+                if let Token::Word(Word {
+                    keyword: Keyword::TABLE,
+                    ..
+                }) = &significant[2].token
+                {
+                    let if_exists = has_if_exists(significant, 3);
+                    return StreamingDdlKind::DropLookupTable { if_exists };
+                }
+            }
+            StreamingDdlKind::None
         }
         Token::Word(Word {
             keyword: Keyword::MATERIALIZED,
@@ -315,6 +352,20 @@ fn classify_after_or_replace(token: &Token, significant: &[&TokenWithSpan]) -> S
         }
         Token::Word(w) if is_word_ci(w, "STREAM") => {
             StreamingDdlKind::CreateStream { or_replace: true }
+        }
+        Token::Word(w) if is_word_ci(w, "LOOKUP") => {
+            // CREATE OR REPLACE LOOKUP TABLE
+            // significant[0]=CREATE [1]=OR [2]=REPLACE [3]=LOOKUP [4]=TABLE
+            if significant.len() >= 5 {
+                if let Token::Word(Word {
+                    keyword: Keyword::TABLE,
+                    ..
+                }) = &significant[4].token
+                {
+                    return StreamingDdlKind::CreateLookupTable { or_replace: true };
+                }
+            }
+            StreamingDdlKind::None
         }
         Token::Word(Word {
             keyword: Keyword::MATERIALIZED,

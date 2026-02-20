@@ -12,7 +12,6 @@ use arrow_array::RecordBatch;
 use arrow_avro::reader::ReaderBuilder;
 use arrow_avro::schema::{AvroSchema, Fingerprint, FingerprintAlgorithm, SchemaStore};
 use arrow_schema::SchemaRef;
-use tokio::sync::Mutex;
 
 use crate::error::SerdeError;
 use crate::kafka::schema_registry::SchemaRegistryClient;
@@ -33,7 +32,7 @@ pub struct AvroDeserializer {
     /// Schema store shared with the Decoder.
     schema_store: SchemaStore,
     /// Optional Schema Registry client for resolving unknown IDs.
-    schema_registry: Option<Arc<Mutex<SchemaRegistryClient>>>,
+    schema_registry: Option<Arc<SchemaRegistryClient>>,
     /// Set of schema IDs already registered in the store.
     known_ids: HashSet<i32>,
 }
@@ -56,7 +55,7 @@ impl AvroDeserializer {
     /// Unknown schema IDs encountered in the Confluent wire format will
     /// be fetched from the registry automatically.
     #[must_use]
-    pub fn with_schema_registry(registry: Arc<Mutex<SchemaRegistryClient>>) -> Self {
+    pub fn with_schema_registry(registry: Arc<SchemaRegistryClient>) -> Self {
         Self {
             schema_store: SchemaStore::new_with_type(FingerprintAlgorithm::Id),
             schema_registry: Some(registry),
@@ -105,8 +104,6 @@ impl AvroDeserializer {
             .ok_or(SerdeError::SchemaNotFound { schema_id })?;
 
         let cached = registry
-            .lock()
-            .await
             .resolve_confluent_id(schema_id)
             .await
             .map_err(|_| SerdeError::SchemaNotFound { schema_id })?;

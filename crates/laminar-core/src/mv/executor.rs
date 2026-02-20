@@ -7,7 +7,7 @@ use super::error::MvError;
 use super::registry::MvRegistry;
 use super::watermark::CascadingWatermarkTracker;
 use crate::operator::{Event, Operator, OperatorContext, OperatorState, Output, OutputVec};
-use fxhash::FxHashMap;
+use rustc_hash::FxHashMap;
 use std::collections::VecDeque;
 use std::sync::Arc;
 

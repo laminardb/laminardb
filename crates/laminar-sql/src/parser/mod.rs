@@ -13,6 +13,8 @@ mod emit_parser;
 pub mod interval_rewriter;
 pub mod join_parser;
 mod late_data_parser;
+/// Parser for CREATE/DROP LOOKUP TABLE DDL statements
+pub mod lookup_table;
 pub mod order_analyzer;
 mod sink_parser;
 mod source_parser;
@@ -20,6 +22,7 @@ mod statements;
 mod tokenizer;
 mod window_rewriter;
 
+pub use lookup_table::CreateLookupTableStatement;
 pub use statements::{
     CreateSinkStatement, CreateSourceStatement, EmitClause, EmitStrategy, FormatSpec,
     LateDataClause, ShowCommand, SinkFrom, StreamingStatement, WatermarkDef, WindowFunction,
@@ -168,6 +171,23 @@ impl StreamingParser {
                 Ok(vec![StreamingStatement::Show(ShowCommand::Streams)])
             }
             StreamingDdlKind::ShowTables => Ok(vec![StreamingStatement::Show(ShowCommand::Tables)]),
+            StreamingDdlKind::CreateLookupTable { .. } => {
+                let mut parser =
+                    sqlparser::parser::Parser::new(&dialect).with_tokens_with_locations(tokens);
+                let lt = lookup_table::parse_create_lookup_table(&mut parser)
+                    .map_err(parse_error_to_parser_error)?;
+                Ok(vec![StreamingStatement::CreateLookupTable(Box::new(lt))])
+            }
+            StreamingDdlKind::DropLookupTable { .. } => {
+                let mut parser =
+                    sqlparser::parser::Parser::new(&dialect).with_tokens_with_locations(tokens);
+                let (name, if_exists) = lookup_table::parse_drop_lookup_table(&mut parser)
+                    .map_err(parse_error_to_parser_error)?;
+                Ok(vec![StreamingStatement::DropLookupTable {
+                    name,
+                    if_exists,
+                }])
+            }
             StreamingDdlKind::None => {
                 // Standard SQL - check for INSERT INTO and convert
                 let statements = sqlparser::parser::Parser::parse_sql(&dialect, sql_trimmed)?;
@@ -934,7 +954,7 @@ mod tests {
         }
     }
 
-    // ── CREATE STREAM tests (F-SQL-003) ─────────────────────────────
+    // ── CREATE STREAM tests ─────────────────────────────
 
     #[test]
     fn test_parse_create_stream() {

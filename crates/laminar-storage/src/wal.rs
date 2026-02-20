@@ -107,6 +107,9 @@ pub struct WriteAheadLog {
     position: u64,
     /// Whether to sync on every write (for testing).
     sync_on_write: bool,
+    /// Pre-allocated write buffer reused across `append()` calls.
+    /// Grows to high-water mark and stays, eliminating per-append allocation.
+    write_buffer: Vec<u8>,
 }
 
 /// Error type for WAL operations.
@@ -178,6 +181,7 @@ impl WriteAheadLog {
             last_sync: Instant::now(),
             position,
             sync_on_write: false,
+            write_buffer: Vec::with_capacity(4096),
         })
     }
 
@@ -219,14 +223,16 @@ impl WriteAheadLog {
         #[allow(clippy::cast_possible_truncation)] // Validated < u32::MAX on line 215
         let len = bytes.len() as u32;
 
-        // Optimize: Coalesce writes into a single buffer to reduce syscalls/locking overhead
-        #[allow(clippy::cast_possible_truncation)] // RECORD_HEADER_SIZE is 8, always fits in usize
-        let mut buffer = Vec::with_capacity(RECORD_HEADER_SIZE as usize + bytes.len());
-        buffer.extend_from_slice(&len.to_le_bytes());
-        buffer.extend_from_slice(&crc.to_le_bytes());
-        buffer.extend_from_slice(&bytes);
+        // Coalesce header + data into self.write_buffer (reused across calls).
+        self.write_buffer.clear();
+        #[allow(clippy::cast_possible_truncation)] // RECORD_HEADER_SIZE is 8, always fits usize
+        self.write_buffer
+            .reserve(RECORD_HEADER_SIZE as usize + bytes.len());
+        self.write_buffer.extend_from_slice(&len.to_le_bytes());
+        self.write_buffer.extend_from_slice(&crc.to_le_bytes());
+        self.write_buffer.extend_from_slice(&bytes);
 
-        self.writer.write_all(&buffer)?;
+        self.writer.write_all(&self.write_buffer)?;
 
         let bytes_len = bytes.len() as u64;
         self.position += RECORD_HEADER_SIZE + bytes_len;

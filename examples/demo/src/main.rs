@@ -21,7 +21,7 @@
 //!
 //! # Observability
 //!
-//! Pipeline metrics are provided by `db.metrics()` (F-OBS-001):
+//! Pipeline metrics are provided by `db.metrics()`:
 //! - Event counters: `total_events_ingested`, `total_events_emitted`
 //! - Cycle metrics: `total_cycles`, `last_cycle_duration_ns`
 //! - Pipeline watermark: `pipeline_watermark`

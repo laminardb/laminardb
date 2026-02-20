@@ -307,7 +307,9 @@ impl LaminarDB {
                 emit_clause,
                 ..
             } => self.handle_create_stream(name, query, emit_clause.as_ref()),
-            StreamingStatement::CreateContinuousQuery { .. } => self.handle_query(sql).await,
+            StreamingStatement::CreateContinuousQuery { .. }
+            | StreamingStatement::CreateLookupTable(_)
+            | StreamingStatement::DropLookupTable { .. } => self.handle_query(sql).await,
             StreamingStatement::Standard(stmt) => {
                 if let sqlparser::ast::Statement::CreateTable(ct) = stmt.as_ref() {
                     self.handle_create_table(ct)
@@ -674,7 +676,13 @@ impl LaminarDB {
         // Check column-level PRIMARY KEY
         for col in &create.columns {
             for opt in &col.options {
-                if matches!(opt.option, sqlparser::ast::ColumnOption::PrimaryKey(..)) {
+                if matches!(
+                    opt.option,
+                    sqlparser::ast::ColumnOption::Unique {
+                        is_primary: true,
+                        ..
+                    }
+                ) {
                     primary_key = Some(col.name.to_string());
                     break;
                 }
@@ -687,8 +695,8 @@ impl LaminarDB {
         // Check table-level PRIMARY KEY constraint
         if primary_key.is_none() {
             for constraint in &create.constraints {
-                if let sqlparser::ast::TableConstraint::PrimaryKey(pk) = constraint {
-                    if let Some(first) = pk.columns.first() {
+                if let sqlparser::ast::TableConstraint::PrimaryKey { columns, .. } = constraint {
+                    if let Some(first) = columns.first() {
                         primary_key = Some(first.column.to_string());
                     }
                 }
@@ -759,17 +767,9 @@ impl LaminarDB {
                 .unwrap_or(crate::table_cache_mode::TableCacheMode::Full);
 
             if is_persistent {
-                #[cfg(feature = "rocksdb")]
-                {
-                    let mut ts = self.table_store.lock();
-                    ts.create_table_persistent(&name, schema.clone(), pk, cache)?;
-                }
-                #[cfg(not(feature = "rocksdb"))]
-                {
-                    return Err(DbError::InvalidOperation(
-                        "storage = 'persistent' requires the 'rocksdb' feature".to_string(),
-                    ));
-                }
+                return Err(DbError::InvalidOperation(
+                    "storage = 'persistent' is no longer supported; use in-memory tables with foyer caching instead".to_string(),
+                ));
             } else if resolved_cache_mode.is_some() {
                 let mut ts = self.table_store.lock();
                 ts.create_table_with_cache(&name, schema.clone(), pk, cache)?;
@@ -981,6 +981,12 @@ impl LaminarDB {
                         laminar_sql::planner::StreamingPlan::RegisterSink(_) => "RegisterSink",
                         laminar_sql::planner::StreamingPlan::Standard(_) => "Standard",
                         laminar_sql::planner::StreamingPlan::DagExplain(_) => "DagExplain",
+                        laminar_sql::planner::StreamingPlan::RegisterLookupTable(_) => {
+                            "RegisterLookupTable"
+                        }
+                        laminar_sql::planner::StreamingPlan::DropLookupTable { .. } => {
+                            "DropLookupTable"
+                        }
                     }
                     .into(),
                 ));
@@ -1025,6 +1031,12 @@ impl LaminarDB {
                     }
                     laminar_sql::planner::StreamingPlan::DagExplain(output) => {
                         rows.push(("dag_topology".into(), output.topology_text.clone()));
+                    }
+                    laminar_sql::planner::StreamingPlan::RegisterLookupTable(info) => {
+                        rows.push(("lookup_table".into(), info.name.clone()));
+                    }
+                    laminar_sql::planner::StreamingPlan::DropLookupTable { name } => {
+                        rows.push(("drop_lookup_table".into(), name.clone()));
                     }
                 }
             }
@@ -1126,6 +1138,18 @@ impl LaminarDB {
                 Ok(ExecuteResult::Ddl(DdlInfo {
                     statement_type: "EXPLAIN DAG".to_string(),
                     object_name: output.topology_text,
+                }))
+            }
+            laminar_sql::planner::StreamingPlan::RegisterLookupTable(info) => {
+                Ok(ExecuteResult::Ddl(DdlInfo {
+                    statement_type: "CREATE LOOKUP TABLE".to_string(),
+                    object_name: info.name,
+                }))
+            }
+            laminar_sql::planner::StreamingPlan::DropLookupTable { name } => {
+                Ok(ExecuteResult::Ddl(DdlInfo {
+                    statement_type: "DROP LOOKUP TABLE".to_string(),
+                    object_name: name,
                 }))
             }
         }
@@ -1675,16 +1699,10 @@ impl LaminarDB {
 
         // Log which sources have external connectors for debugging.
         for (name, reg) in &source_regs {
-            eprintln!(
-                "[laminar-db] Source '{}': connector_type={:?}",
-                name, reg.connector_type
-            );
+            tracing::debug!(source = %name, connector_type = ?reg.connector_type, "Registered source");
         }
         for (name, reg) in &sink_regs {
-            eprintln!(
-                "[laminar-db] Sink '{}': connector_type={:?}",
-                name, reg.connector_type
-            );
+            tracing::debug!(sink = %name, connector_type = ?reg.connector_type, "Registered sink");
         }
 
         // Initialize checkpoint coordinator (shared across all pipeline modes)
@@ -1712,23 +1730,19 @@ impl LaminarDB {
         }
 
         if has_external {
-            eprintln!(
-                "[laminar-db] Starting CONNECTOR pipeline ({} sources, {} sinks, {} streams, {} tables)",
-                source_regs.len(),
-                sink_regs.len(),
-                stream_regs.len(),
-                table_regs.len(),
+            tracing::info!(
+                sources = source_regs.len(),
+                sinks = sink_regs.len(),
+                streams = stream_regs.len(),
+                tables = table_regs.len(),
+                "Starting connector pipeline"
             );
             self.start_connector_pipeline(source_regs, sink_regs, stream_regs, table_regs)
                 .await?;
         } else if !stream_regs.is_empty() {
-            eprintln!(
-                "[laminar-db] Starting EMBEDDED pipeline ({} streams)",
-                stream_regs.len(),
-            );
+            tracing::info!(streams = stream_regs.len(), "Starting embedded pipeline");
             self.start_embedded_pipeline(&stream_regs);
         } else {
-            eprintln!("[laminar-db] Starting in embedded mode (no streams)");
             tracing::info!(
                 sources = source_regs.len(),
                 sinks = sink_regs.len(),
@@ -2202,10 +2216,6 @@ impl LaminarDB {
                                 }
                             }
                         }
-                        eprintln!(
-                            "[laminar-db] Recovered from checkpoint epoch {}",
-                            recovered.epoch()
-                        );
                         tracing::info!(
                             epoch = recovered.epoch(),
                             sources_restored = recovered.sources_restored,
@@ -2324,14 +2334,6 @@ impl LaminarDB {
             Some(laminar_core::time::WatermarkTracker::new(source_ids.len()))
         };
 
-        eprintln!(
-            "[laminar-db] Starting connector pipeline: {} sources, {} sinks, \
-             {} streams, {} subscriptions",
-            sources.len(),
-            sinks.len(),
-            stream_regs.len(),
-            stream_sources.len(),
-        );
         tracing::info!(
             sources = sources.len(),
             sinks = sinks.len(),
@@ -2358,7 +2360,7 @@ impl LaminarDB {
         let coordinator = Arc::clone(&self.coordinator);
 
         let handle = tokio::spawn(async move {
-            eprintln!("[laminar-db] Connector pipeline task started");
+            tracing::debug!("Connector pipeline task started");
             let mut cycle_count: u64 = 0;
             let mut total_batches: u64 = 0;
             let mut total_records: u64 = 0;
@@ -2468,9 +2470,6 @@ impl LaminarDB {
                         }
                         Ok(None) => {}
                         Err(e) => {
-                            if cycle_count < 5 || cycle_count.is_multiple_of(100) {
-                                eprintln!("[laminar-db] Source '{name}' poll error: {e}");
-                            }
                             tracing::warn!(
                                 source = %name,
                                 error = %e,
@@ -2491,10 +2490,7 @@ impl LaminarDB {
                                 format!("{k}({rows} rows)")
                             })
                             .collect();
-                        eprintln!(
-                            "[laminar-db] Executing queries with: [{}]",
-                            src_summary.join(", "),
-                        );
+                        tracing::debug!(sources = %src_summary.join(", "), "Executing queries");
                     }
                     let current_wm = pipeline_watermark.load(std::sync::atomic::Ordering::Relaxed);
                     match executor.execute_cycle(&source_batches, current_wm).await {
@@ -2558,9 +2554,6 @@ impl LaminarDB {
                             }
                         }
                         Err(e) => {
-                            if cycle_count < 5 || cycle_count.is_multiple_of(100) {
-                                eprintln!("[laminar-db] Stream execution error: {e}");
-                            }
                             tracing::warn!(error = %e, "Stream execution cycle error");
                         }
                     }
@@ -2618,10 +2611,12 @@ impl LaminarDB {
                     .last_cycle_duration_ns
                     .store(elapsed_ns, std::sync::atomic::Ordering::Relaxed);
                 if cycle_count.is_multiple_of(50) {
-                    eprintln!(
-                        "[laminar-db] Pipeline cycle {cycle_count}: {total_batches} batches, {total_records} records total",
+                    tracing::debug!(
+                        cycles = cycle_count,
+                        batches = total_batches,
+                        records = total_records,
+                        "Pipeline processing"
                     );
-                    tracing::debug!(cycles = cycle_count, "Pipeline processing");
                 }
 
                 // Periodic checkpoint (non-blocking — spawned as a separate task)
@@ -2686,8 +2681,11 @@ impl LaminarDB {
                 }
             }
 
-            eprintln!(
-                "[laminar-db] Pipeline stopping after {cycle_count} cycles ({total_batches} batches, {total_records} records)",
+            tracing::info!(
+                cycles = cycle_count,
+                batches = total_batches,
+                records = total_records,
+                "Pipeline stopping"
             );
 
             // Wait for any in-flight checkpoint to complete before final checkpoint
@@ -3648,7 +3646,7 @@ mod tests {
         assert_eq!(db.source_count(), 1);
     }
 
-    // ── Multi-statement execution tests (F-SQL-005) ─────────────────
+    // ── Multi-statement execution tests ─────────────────
 
     #[tokio::test]
     async fn test_multi_statement_execution() {
@@ -3679,7 +3677,7 @@ mod tests {
         assert_eq!(db.source_count(), 1);
     }
 
-    // ── Config variable substitution tests (F-SQL-006) ──────────────
+    // ── Config variable substitution tests ──────────────
 
     #[tokio::test]
     async fn test_config_var_substitution() {
@@ -3694,7 +3692,7 @@ mod tests {
         assert_eq!(db.source_count(), 1);
     }
 
-    // ── CREATE STREAM tests (F-SQL-003) ─────────────────────────────
+    // ── CREATE STREAM tests ─────────────────────────────
 
     #[tokio::test]
     async fn test_create_stream() {
@@ -4364,7 +4362,7 @@ mod tests {
         assert_eq!(find("sk").node_type, PipelineNodeType::Sink);
     }
 
-    // ── Reference Table (F-CONN-002) tests ──
+    // ── Reference Table tests ──
 
     #[tokio::test]
     async fn test_create_table_with_primary_key() {
@@ -4519,7 +4517,7 @@ mod tests {
         assert!(result.is_ok());
     }
 
-    // ── HAVING clause tests (F-SQL-004) ─────────────────────────────
+    // ── HAVING clause tests ─────────────────────────────
 
     #[tokio::test]
     async fn test_having_filters_grouped_results() {
@@ -4634,7 +4632,7 @@ mod tests {
         assert_eq!(total_rows, 2);
     }
 
-    // ── Multi-way JOIN tests (F-SQL-005) ─────────────────────────────
+    // ── Multi-way JOIN tests ─────────────────────────────
 
     #[tokio::test]
     async fn test_multi_join_two_way_lookup() {
@@ -4799,7 +4797,7 @@ mod tests {
         assert_eq!(total_rows, 2);
     }
 
-    // ── Window Frame tests (F-SQL-006) ────────────────────────────────
+    // ── Window Frame tests ────────────────────────────────
 
     #[tokio::test]
     async fn test_frame_moving_average() {
@@ -4945,7 +4943,7 @@ mod tests {
         assert_eq!(cnt_col.value(2), 2);
     }
 
-    // ── F-CONN-002B: Connector-Backed Table Population ──
+    // ── Connector-Backed Table Population ──
 
     /// Helper: create a test `RecordBatch` for table population tests.
     fn table_test_batch(ids: &[i32], symbols: &[&str]) -> RecordBatch {
@@ -5167,7 +5165,7 @@ mod tests {
         assert!(ts.lookup("instruments", "2").is_none());
     }
 
-    // ── F-CONN-002C: PARTIAL Cache Mode DDL tests ──
+    // ── PARTIAL Cache Mode DDL tests ──
 
     #[tokio::test]
     async fn test_create_table_partial_cache_mode() {
@@ -5237,7 +5235,7 @@ mod tests {
             .contains("cache_max_entries"));
     }
 
-    // --- F-OBS-001: Pipeline Observability API tests ---
+    // --- Pipeline Observability API tests ---
 
     #[tokio::test]
     async fn test_metrics_initial_state() {

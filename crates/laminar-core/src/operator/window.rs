@@ -256,12 +256,12 @@ impl WindowCloseMetrics {
 /// - `OnWatermark` is most efficient but has highest latency
 /// - `Periodic` balances freshness and efficiency
 /// - `OnUpdate` provides lowest latency but highest overhead
-/// - `OnWindowClose` (F011B) is for append-only sinks
-/// - `Changelog` (F011B) emits Z-set weighted records for CDC
-/// - `Final` (F011B) suppresses all intermediate results
+/// - `OnWindowClose` is for append-only sinks
+/// - `Changelog` emits Z-set weighted records for CDC
+/// - `Final` suppresses all intermediate results
 #[derive(Debug, Clone, PartialEq, Eq, Default)]
 pub enum EmitStrategy {
-    // === Existing (F011) ===
+    // === Existing ===
     /// Emit final results when watermark passes window end (default).
     ///
     /// This is the most efficient strategy as it only emits once per window.
@@ -286,7 +286,7 @@ pub enum EmitStrategy {
     /// Use with caution for high-volume streams.
     OnUpdate,
 
-    // === New (F011B) ===
+    // === New ===
     /// Emit ONLY when watermark passes window end. No intermediate emissions.
     ///
     /// **Critical for append-only sinks** (Kafka, S3, Delta Lake, Iceberg).
@@ -328,7 +328,7 @@ pub enum EmitStrategy {
     ///
     /// Required for:
     /// - CDC pipelines
-    /// - Cascading materialized views (F060)
+    /// - Cascading materialized views
     /// - Downstream consumers that need to track changes
     ///
     /// SQL: `EMIT CHANGES`
@@ -368,7 +368,7 @@ impl EmitStrategy {
         matches!(self, Self::OnUpdate)
     }
 
-    // === F011B Helper Methods ===
+    // === Helper Methods ===
 
     /// Returns true if this strategy emits intermediate results.
     ///
@@ -511,7 +511,7 @@ impl WindowId {
 /// - 2-4 windows: sliding windows with small overlap
 pub type WindowIdVec = SmallVec<[WindowId; 4]>;
 
-// === F011B: Changelog/Z-Set Support ===
+// === Changelog/Z-Set Support ===
 
 /// CDC operation type for changelog records.
 ///
@@ -1206,7 +1206,7 @@ impl Aggregator for AvgAggregator {
     }
 }
 
-// FIRST_VALUE / LAST_VALUE Aggregators (F059)
+// FIRST_VALUE / LAST_VALUE Aggregators
 
 /// `FIRST_VALUE` aggregator - returns the first value seen in a window.
 ///
@@ -1473,7 +1473,7 @@ impl Aggregator for LastValueAggregator {
     }
 }
 
-// FIRST_VALUE / LAST_VALUE for Float64 (F059)
+// FIRST_VALUE / LAST_VALUE for Float64
 
 /// Accumulator for `FIRST_VALUE` aggregation on f64 values.
 #[derive(Debug, Clone, Default, Archive, RkyvSerialize, RkyvDeserialize)]
@@ -1713,7 +1713,7 @@ impl Aggregator for LastValueF64Aggregator {
     }
 }
 
-// F074: Composite Aggregator & f64 Type Support
+// Composite Aggregator & f64 Type Support
 
 /// Scalar result type supporting multiple numeric types.
 ///
@@ -1796,7 +1796,7 @@ impl ScalarResult {
     }
 }
 
-/// Dynamic accumulator trait for composite aggregation (F074).
+/// Dynamic accumulator trait for composite aggregation.
 ///
 /// Unlike the static [`Accumulator`] trait, this works with events directly
 /// and returns [`ScalarResult`] for type-flexible output. Used by
@@ -3108,8 +3108,6 @@ impl Clone for CompositeAccumulator {
     }
 }
 
-// End F074
-
 /// State key prefix for window accumulators (4 bytes)
 const WINDOW_STATE_PREFIX: &[u8; 4] = b"win:";
 
@@ -3581,7 +3579,7 @@ where
         if current_wm > i64::MIN && self.is_late(event_time, current_wm) {
             let mut output = OutputVec::new();
 
-            // F011B: EMIT FINAL drops late data entirely
+            // EMIT FINAL drops late data entirely
             if self.emit_strategy.drops_late_data() {
                 self.late_data_metrics.record_dropped();
                 return output; // Silently drop - no LateEvent output
@@ -3624,7 +3622,7 @@ where
         // Register timer for this window (watermark-based final emission)
         self.maybe_register_timer(window_id, ctx);
 
-        // F011B: OnWindowClose and Final suppress intermediate emissions
+        // OnWindowClose and Final suppress intermediate emissions
         // Don't register periodic timers for these strategies
         if !self.emit_strategy.suppresses_intermediate() {
             self.maybe_register_periodic_timer(window_id, ctx);
@@ -3636,7 +3634,7 @@ where
             output.push(Output::Watermark(wm.timestamp()));
         }
 
-        // F011B: Handle different emit strategies
+        // Handle different emit strategies
         if state_updated {
             match &self.emit_strategy {
                 // OnUpdate: emit intermediate result as regular event
@@ -3649,7 +3647,7 @@ where
                 EmitStrategy::Changelog => {
                     if let Some(event) = self.create_intermediate_result(&window_id, ctx.state) {
                         // For intermediate updates in changelog mode, we emit as insert
-                        // Full CDC support (with retractions) requires F063
+                        // Full CDC support (with retractions) requires changelog support
                         let record = ChangelogRecord::insert(event, ctx.processing_time);
                         output.push(Output::Changelog(record));
                     }
@@ -3668,7 +3666,7 @@ where
     fn on_timer(&mut self, timer: Timer, ctx: &mut OperatorContext) -> OutputVec {
         // Check if this is a periodic timer (high bit set)
         if Self::is_periodic_timer_key(&timer.key) {
-            // F011B: OnWindowClose and Final suppress periodic emissions
+            // OnWindowClose and Final suppress periodic emissions
             if self.emit_strategy.suppresses_intermediate() {
                 // Don't emit, just clean up the periodic timer tracking
                 if let Some(window_id) = Self::window_id_from_periodic_key(&timer.key) {
@@ -3730,7 +3728,7 @@ where
                 self.window_close_metrics
                     .record_close(window_id.end, ctx.processing_time);
 
-                // F011B: Emit based on strategy
+                // Emit based on strategy
                 match &self.emit_strategy {
                     // Changelog: wrap in changelog record for CDC
                     EmitStrategy::Changelog => {

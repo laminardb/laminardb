@@ -47,16 +47,16 @@ impl SymbolState {
     fn step(&mut self, rng: &mut impl Rng, market_factor: f64) {
         // Correlated price drift: beta * market_factor + idiosyncratic noise
         let systematic = self.beta * market_factor * self.volatility;
-        let idiosyncratic: f64 = rng.gen_range(-1.0..=1.0) * self.volatility * 0.5;
+        let idiosyncratic: f64 = rng.random_range(-1.0..=1.0) * self.volatility * 0.5;
         self.price = (self.price + systematic + idiosyncratic).max(1.0);
 
         // Ornstein-Uhlenbeck mean-reverting spread
-        let spread_noise: f64 = rng.gen_range(-0.3..=0.3) * self.spread_mean;
+        let spread_noise: f64 = rng.random_range(-0.3..=0.3) * self.spread_mean;
         self.spread_current += 0.3 * (self.spread_mean - self.spread_current) + spread_noise;
         self.spread_current = self.spread_current.max(self.price * 0.0001); // min 1 bps
 
         // Spread widens occasionally
-        let spread_factor = if rng.gen_bool(0.05) { 3.0 } else { 1.0 };
+        let spread_factor = if rng.random_bool(0.05) { 3.0 } else { 1.0 };
         let half_spread = self.spread_current * spread_factor / 2.0;
         self.bid = self.price - half_spread;
         self.ask = self.price + half_spread;
@@ -97,19 +97,19 @@ impl MarketGenerator {
 
     /// Generate a batch of market ticks across all symbols.
     pub fn generate_ticks(&mut self, count_per_symbol: usize, base_ts: i64) -> Vec<MarketTick> {
-        let mut rng = rand::thread_rng();
+        let mut rng = rand::rng();
         let mut ticks = Vec::with_capacity(count_per_symbol * self.states.len());
         self.cycle += 1;
         let vol_mult = intraday_volume_multiplier(self.cycle);
 
         for tick_idx in 0..count_per_symbol {
-            let market_factor: f64 = rng.gen_range(-1.0..=1.0);
+            let market_factor: f64 = rng.random_range(-1.0..=1.0);
             for state in &mut self.states {
                 state.step(&mut rng, market_factor);
-                let base_volume = if rng.gen_bool(0.05) {
-                    rng.gen_range(500..5000) // occasional spike
+                let base_volume = if rng.random_bool(0.05) {
+                    rng.random_range(500..5000) // occasional spike
                 } else {
-                    rng.gen_range(10..200)
+                    rng.random_range(10..200)
                 };
                 let volume = (base_volume as f64 * vol_mult) as i64;
                 ticks.push(MarketTick {
@@ -118,7 +118,7 @@ impl MarketGenerator {
                     bid: round2(state.bid),
                     ask: round2(state.ask),
                     volume: volume.max(1),
-                    side: SIDES[rng.gen_range(0..2)].to_string(),
+                    side: SIDES[rng.random_range(0..2)].to_string(),
                     ts: base_ts + tick_idx as i64 * 50, // 50ms apart
                 });
             }
@@ -128,16 +128,16 @@ impl MarketGenerator {
 
     /// Generate a batch of order events across all symbols.
     pub fn generate_orders(&mut self, count: usize, base_ts: i64) -> Vec<OrderEvent> {
-        let mut rng = rand::thread_rng();
+        let mut rng = rand::rng();
         (0..count)
             .map(|i| {
-                let state = &self.states[rng.gen_range(0..self.states.len())];
+                let state = &self.states[rng.random_range(0..self.states.len())];
                 self.order_seq += 1;
                 OrderEvent {
                     order_id: format!("ORD-{:08}", self.order_seq),
                     symbol: state.symbol.to_string(),
-                    side: SIDES[rng.gen_range(0..2)].to_string(),
-                    quantity: rng.gen_range(1..=100),
+                    side: SIDES[rng.random_range(0..2)].to_string(),
+                    quantity: rng.random_range(1..=100),
                     price: round2(state.price),
                     ts: base_ts + i as i64 * 100,
                 }
@@ -148,16 +148,16 @@ impl MarketGenerator {
     /// Generate L2 order book updates for all symbols.
     /// Produces 3–8 updates per symbol per call.
     pub fn generate_book_updates(&self, base_ts: i64) -> Vec<OrderBookUpdate> {
-        let mut rng = rand::thread_rng();
+        let mut rng = rand::rng();
         let mut updates = Vec::new();
 
         for (sym_idx, state) in self.states.iter().enumerate() {
-            let n_updates = rng.gen_range(3..=8);
+            let n_updates = rng.random_range(3..=8);
             let tick_size = (state.price * 0.0001).max(0.01); // min $0.01
 
             for j in 0..n_updates {
-                let side = if rng.gen_bool(0.5) { "bid" } else { "ask" };
-                let level_offset = rng.gen_range(0..10) as f64;
+                let side = if rng.random_bool(0.5) { "bid" } else { "ask" };
+                let level_offset = rng.random_range(0..10) as f64;
                 let price_level = if side == "bid" {
                     round2(state.bid - level_offset * tick_size)
                 } else {
@@ -165,15 +165,19 @@ impl MarketGenerator {
                 };
 
                 // Action distribution: 30% add, 50% modify, 15% delete, 5% trade
-                let r: f64 = rng.gen();
+                let r: f64 = rng.random();
                 let (action, quantity, order_count) = if r < 0.30 {
-                    ("add", rng.gen_range(10..=500), rng.gen_range(1..=10))
+                    ("add", rng.random_range(10..=500), rng.random_range(1..=10))
                 } else if r < 0.80 {
-                    ("modify", rng.gen_range(10..=500), rng.gen_range(1..=10))
+                    (
+                        "modify",
+                        rng.random_range(10..=500),
+                        rng.random_range(1..=10),
+                    )
                 } else if r < 0.95 {
                     ("delete", 0_i64, 0_i64)
                 } else {
-                    ("trade", rng.gen_range(1..=100), 1_i64)
+                    ("trade", rng.random_range(1..=100), 1_i64)
                 };
 
                 let ts = base_ts + (sym_idx * 10 + j) as i64 * 25; // 25ms spacing
@@ -203,19 +207,19 @@ impl MarketGenerator {
         base_ts: i64,
     ) -> Vec<crate::types::KafkaMarketTick> {
         use crate::types::KafkaMarketTick;
-        let mut rng = rand::thread_rng();
+        let mut rng = rand::rng();
         let mut ticks = Vec::with_capacity(count_per_symbol * self.states.len());
         self.cycle += 1;
         let vol_mult = intraday_volume_multiplier(self.cycle);
 
         for tick_idx in 0..count_per_symbol {
-            let market_factor: f64 = rng.gen_range(-1.0..=1.0);
+            let market_factor: f64 = rng.random_range(-1.0..=1.0);
             for state in &mut self.states {
                 state.step(&mut rng, market_factor);
-                let base_volume = if rng.gen_bool(0.05) {
-                    rng.gen_range(500..5000)
+                let base_volume = if rng.random_bool(0.05) {
+                    rng.random_range(500..5000)
                 } else {
-                    rng.gen_range(10..200)
+                    rng.random_range(10..200)
                 };
                 let volume = (base_volume as f64 * vol_mult) as i64;
                 ticks.push(KafkaMarketTick {
@@ -224,7 +228,7 @@ impl MarketGenerator {
                     bid: round2(state.bid),
                     ask: round2(state.ask),
                     volume: volume.max(1),
-                    side: SIDES[rng.gen_range(0..2)].to_string(),
+                    side: SIDES[rng.random_range(0..2)].to_string(),
                     ts: base_ts + tick_idx as i64 * 50,
                 });
             }
@@ -238,16 +242,16 @@ impl MarketGenerator {
         base_ts: i64,
     ) -> Vec<crate::types::KafkaOrderEvent> {
         use crate::types::KafkaOrderEvent;
-        let mut rng = rand::thread_rng();
+        let mut rng = rand::rng();
         (0..count)
             .map(|i| {
-                let state = &self.states[rng.gen_range(0..self.states.len())];
+                let state = &self.states[rng.random_range(0..self.states.len())];
                 self.order_seq += 1;
                 KafkaOrderEvent {
                     order_id: format!("ORD-{:08}", self.order_seq),
                     symbol: state.symbol.to_string(),
-                    side: SIDES[rng.gen_range(0..2)].to_string(),
-                    quantity: rng.gen_range(1..=100),
+                    side: SIDES[rng.random_range(0..2)].to_string(),
+                    quantity: rng.random_range(1..=100),
                     price: round2(state.price),
                     ts: base_ts + i as i64 * 100,
                 }
@@ -260,31 +264,35 @@ impl MarketGenerator {
         base_ts: i64,
     ) -> Vec<crate::types::KafkaOrderBookUpdate> {
         use crate::types::KafkaOrderBookUpdate;
-        let mut rng = rand::thread_rng();
+        let mut rng = rand::rng();
         let mut updates = Vec::new();
 
         for (sym_idx, state) in self.states.iter().enumerate() {
-            let n_updates = rng.gen_range(3..=8);
+            let n_updates = rng.random_range(3..=8);
             let tick_size = (state.price * 0.0001).max(0.01);
 
             for j in 0..n_updates {
-                let side = if rng.gen_bool(0.5) { "bid" } else { "ask" };
-                let level_offset = rng.gen_range(0..10) as f64;
+                let side = if rng.random_bool(0.5) { "bid" } else { "ask" };
+                let level_offset = rng.random_range(0..10) as f64;
                 let price_level = if side == "bid" {
                     round2(state.bid - level_offset * tick_size)
                 } else {
                     round2(state.ask + level_offset * tick_size)
                 };
 
-                let r: f64 = rng.gen();
+                let r: f64 = rng.random();
                 let (action, quantity, order_count) = if r < 0.30 {
-                    ("add", rng.gen_range(10..=500), rng.gen_range(1..=10))
+                    ("add", rng.random_range(10..=500), rng.random_range(1..=10))
                 } else if r < 0.80 {
-                    ("modify", rng.gen_range(10..=500), rng.gen_range(1..=10))
+                    (
+                        "modify",
+                        rng.random_range(10..=500),
+                        rng.random_range(1..=10),
+                    )
                 } else if r < 0.95 {
                     ("delete", 0_i64, 0_i64)
                 } else {
-                    ("trade", rng.gen_range(1..=100), 1_i64)
+                    ("trade", rng.random_range(1..=100), 1_i64)
                 };
 
                 let ts = base_ts + (sym_idx * 10 + j) as i64 * 25;

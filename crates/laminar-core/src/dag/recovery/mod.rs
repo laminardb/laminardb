@@ -8,7 +8,7 @@
 
 use std::collections::HashMap;
 
-use fxhash::FxHashMap;
+use rustc_hash::FxHashMap;
 use serde::{Deserialize, Serialize};
 
 use crate::operator::OperatorState;

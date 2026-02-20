@@ -19,7 +19,7 @@ use super::{
 };
 use arrow_array::{Array, Float64Array, Int64Array, StringArray, TimestampMicrosecondArray};
 use arrow_schema::DataType;
-use fxhash::FxHashMap;
+use rustc_hash::FxHashMap;
 
 /// Window-local sort operator.
 ///
@@ -36,6 +36,8 @@ pub struct WindowLocalSortOperator {
     current_watermark: i64,
     /// Optional LIMIT for top-N within each window.
     limit: Option<usize>,
+    /// Cached column indices for sort columns — resolved on first event.
+    cached_sort_indices: Vec<Option<usize>>,
 }
 
 /// A buffered event with its pre-computed sort key.
@@ -54,12 +56,14 @@ impl WindowLocalSortOperator {
         sort_columns: Vec<TopKSortColumn>,
         limit: Option<usize>,
     ) -> Self {
+        let num_sort_cols = sort_columns.len();
         Self {
             operator_id,
             sort_columns,
             window_buffers: FxHashMap::default(),
             current_watermark: i64::MIN,
             limit,
+            cached_sort_indices: vec![None; num_sort_cols],
         }
     }
 
@@ -82,15 +86,22 @@ impl WindowLocalSortOperator {
     }
 
     /// Extracts a memcomparable sort key from an event.
-    fn extract_sort_key(&self, event: &Event) -> Vec<u8> {
+    ///
+    /// Caches column indices on first call to avoid per-event schema lookups.
+    fn extract_sort_key(&mut self, event: &Event) -> Vec<u8> {
         let batch = &event.data;
-        let schema = batch.schema();
         let mut key = Vec::new();
 
-        for col_spec in &self.sort_columns {
-            let Ok(col_idx) = schema.index_of(&col_spec.column_name) else {
-                encode_null(col_spec.nulls_first, col_spec.descending, &mut key);
-                continue;
+        for (i, col_spec) in self.sort_columns.iter().enumerate() {
+            let col_idx = if let Some(idx) = self.cached_sort_indices[i] {
+                idx
+            } else {
+                let Ok(idx) = batch.schema().index_of(&col_spec.column_name) else {
+                    encode_null(col_spec.nulls_first, col_spec.descending, &mut key);
+                    continue;
+                };
+                self.cached_sort_indices[i] = Some(idx);
+                idx
             };
 
             let array = batch.column(col_idx);

@@ -1,6 +1,6 @@
 // SPDX-License-Identifier: GPL-2.0 OR Apache-2.0
 //
-// LaminarDB XDP Program for Network Optimization (F072)
+// LaminarDB XDP Program for Network Optimization
 //
 // This XDP program provides:
 // - Invalid packet filtering at NIC driver level

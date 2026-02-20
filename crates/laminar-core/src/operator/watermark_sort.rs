@@ -51,6 +51,8 @@ pub struct WatermarkBoundedSortOperator {
     last_watermark: i64,
     /// Number of late events dropped.
     late_events_dropped: u64,
+    /// Cached column indices for sort columns — resolved on first event.
+    cached_sort_indices: Vec<Option<usize>>,
 }
 
 impl WatermarkBoundedSortOperator {
@@ -61,6 +63,7 @@ impl WatermarkBoundedSortOperator {
         sort_columns: Vec<TopKSortColumn>,
         max_buffer_size: usize,
     ) -> Self {
+        let num_sort_cols = sort_columns.len();
         Self {
             operator_id,
             sort_columns,
@@ -68,6 +71,7 @@ impl WatermarkBoundedSortOperator {
             max_buffer_size,
             last_watermark: i64::MIN,
             late_events_dropped: 0,
+            cached_sort_indices: vec![None; num_sort_cols],
         }
     }
 
@@ -96,15 +100,22 @@ impl WatermarkBoundedSortOperator {
     }
 
     /// Extracts a memcomparable sort key from an event.
-    fn extract_sort_key(&self, event: &Event) -> Vec<u8> {
+    ///
+    /// Caches column indices on first call to avoid per-event schema lookups.
+    fn extract_sort_key(&mut self, event: &Event) -> Vec<u8> {
         let batch = &event.data;
-        let schema = batch.schema();
         let mut key = Vec::new();
 
-        for col_spec in &self.sort_columns {
-            let Ok(col_idx) = schema.index_of(&col_spec.column_name) else {
-                encode_null(col_spec.nulls_first, col_spec.descending, &mut key);
-                continue;
+        for (i, col_spec) in self.sort_columns.iter().enumerate() {
+            let col_idx = if let Some(idx) = self.cached_sort_indices[i] {
+                idx
+            } else {
+                let Ok(idx) = batch.schema().index_of(&col_spec.column_name) else {
+                    encode_null(col_spec.nulls_first, col_spec.descending, &mut key);
+                    continue;
+                };
+                self.cached_sort_indices[i] = Some(idx);
+                idx
             };
 
             let array = batch.column(col_idx);

@@ -1,4 +1,4 @@
-//! End-to-end streaming SQL execution (F005B)
+//! End-to-end streaming SQL execution
 //!
 //! Provides [`execute_streaming_sql`] for parsing, planning, and executing
 //! streaming SQL statements through the `DataFusion` engine.
@@ -135,7 +135,9 @@ pub async fn execute_streaming_sql(
                 query_plan: None,
             }))
         }
-        StreamingPlan::DagExplain(_) => Ok(StreamingSqlResult::Ddl(DdlResult { plan })),
+        StreamingPlan::DagExplain(_)
+        | StreamingPlan::RegisterLookupTable(_)
+        | StreamingPlan::DropLookupTable { .. } => Ok(StreamingSqlResult::Ddl(DdlResult { plan })),
     }
 }
 

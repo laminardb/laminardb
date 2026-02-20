@@ -1,4 +1,4 @@
-//! Unified checkpoint coordinator (F-CKP-003).
+//! Unified checkpoint coordinator.
 //!
 //! Single orchestrator that replaces `StreamCheckpointManager`,
 //! `PipelineCheckpointManager`, and the persistence side of `DagRecoveryManager`.
@@ -48,7 +48,7 @@ pub struct CheckpointConfig {
     /// A stuck sink will not block checkpointing indefinitely.
     /// Defaults to 30 seconds.
     pub pre_commit_timeout: Duration,
-    /// Whether to use incremental checkpoints (future use with `RocksDB`).
+    /// Whether to use incremental checkpoints.
     pub incremental: bool,
 }
 
@@ -156,11 +156,11 @@ pub struct CheckpointCoordinator {
     checkpoints_completed: u64,
     checkpoints_failed: u64,
     last_checkpoint_duration: Option<Duration>,
-    /// Per-core WAL manager for epoch barriers and truncation (F-CKP-006).
+    /// Per-core WAL manager for epoch barriers and truncation.
     wal_manager: Option<PerCoreWalManager>,
-    /// Changelog drainers to flush before checkpointing (F-CKP-006).
+    /// Changelog drainers to flush before checkpointing.
     changelog_drainers: Vec<ChangelogDrainer>,
-    /// Shared counters for observability (F-CKP-009).
+    /// Shared counters for observability.
     counters: Option<Arc<PipelineCounters>>,
 }
 
@@ -231,7 +231,7 @@ impl CheckpointCoordinator {
         });
     }
 
-    // ── F-CKP-009: Observability ──
+    // ── Observability ──
 
     /// Sets the shared pipeline counters for checkpoint metrics emission.
     ///
@@ -259,7 +259,7 @@ impl CheckpointCoordinator {
         }
     }
 
-    // ── F-CKP-006: WAL coordination ──
+    // ── WAL coordination ──
 
     /// Registers a per-core WAL manager for checkpoint coordination.
     ///
@@ -381,7 +381,7 @@ impl CheckpointCoordinator {
     /// * `watermark` — current global watermark
     /// * `wal_position` — single-writer WAL position
     /// * `per_core_wal_positions` — thread-per-core WAL positions
-    /// * `table_store_checkpoint_path` — `RocksDB` table store checkpoint path
+    /// * `table_store_checkpoint_path` — table store checkpoint path
     ///
     /// # Errors
     ///
@@ -412,10 +412,12 @@ impl CheckpointCoordinator {
             }
         }
 
-        // ── Step 3: Source snapshot ──
+        // ── Step 3: Source snapshot (parallel) ──
         self.phase = CheckpointPhase::Snapshotting;
-        let source_offsets = self.snapshot_sources(&self.sources).await?;
-        let table_offsets = self.snapshot_sources(&self.table_sources).await?;
+        let (source_offsets, table_offsets) = tokio::try_join!(
+            self.snapshot_sources(&self.sources),
+            self.snapshot_sources(&self.table_sources),
+        )?;
 
         // ── Step 4: Sink pre-commit ──
         self.phase = CheckpointPhase::PreCommitting;
@@ -536,21 +538,30 @@ impl CheckpointCoordinator {
         })
     }
 
-    /// Snapshots all registered source connectors.
+    /// Snapshots all registered source connectors concurrently.
+    ///
+    /// Uses `join_all` to lock and checkpoint each source in parallel rather
+    /// than sequentially, reducing snapshot latency proportional to source count.
     async fn snapshot_sources(
         &self,
         sources: &[RegisteredSource],
     ) -> Result<HashMap<String, ConnectorCheckpoint>, DbError> {
-        let mut offsets = HashMap::new();
+        use futures::future::join_all;
 
-        for source in sources {
-            let connector = source.connector.lock().await;
-            let cp = connector.checkpoint();
-            offsets.insert(source.name.clone(), source_to_connector_checkpoint(&cp));
-            debug!(source = %source.name, epoch = cp.epoch(), "source snapshotted");
-        }
+        let futs = sources.iter().map(|source| {
+            let connector = Arc::clone(&source.connector);
+            let name = source.name.clone();
+            async move {
+                let guard = connector.lock().await;
+                let cp = guard.checkpoint();
+                let result = source_to_connector_checkpoint(&cp);
+                debug!(source = %name, epoch = cp.epoch(), "source snapshotted");
+                (name, result)
+            }
+        });
 
-        Ok(offsets)
+        let results = join_all(futs).await;
+        Ok(results.into_iter().collect())
     }
 
     /// Pre-commits all exactly-once sinks (phase 1) with a timeout.
@@ -752,10 +763,12 @@ impl CheckpointCoordinator {
             }
         }
 
-        // ── Step 3: Source snapshot ──
+        // ── Step 3: Source snapshot (parallel) ──
         self.phase = CheckpointPhase::Snapshotting;
-        let source_offsets = self.snapshot_sources(&self.sources).await?;
-        let mut table_offsets = self.snapshot_sources(&self.table_sources).await?;
+        let (source_offsets, mut table_offsets) = tokio::try_join!(
+            self.snapshot_sources(&self.sources),
+            self.snapshot_sources(&self.table_sources),
+        )?;
 
         // Merge extra table offsets (from ReferenceTableSource instances)
         for (name, cp) in extra_table_offsets {
@@ -1020,8 +1033,9 @@ pub fn dag_snapshot_to_manifest_operators<S: std::hash::BuildHasher>(
 #[must_use]
 pub fn manifest_operators_to_dag_states<S: std::hash::BuildHasher>(
     operators: &HashMap<String, laminar_storage::checkpoint_manifest::OperatorCheckpoint, S>,
-) -> fxhash::FxHashMap<laminar_core::dag::topology::NodeId, laminar_core::operator::OperatorState> {
-    let mut states = fxhash::FxHashMap::default();
+) -> rustc_hash::FxHashMap<laminar_core::dag::topology::NodeId, laminar_core::operator::OperatorState>
+{
+    let mut states = rustc_hash::FxHashMap::default();
     for (key, op_ckpt) in operators {
         if let Ok(node_id) = key.parse::<u32>() {
             if let Some(data) = op_ckpt.decode_inline() {
@@ -1225,7 +1239,7 @@ mod tests {
         assert!(debug.contains("epoch: 1"));
     }
 
-    // ── F-CKP-004: operator state persistence tests ──
+    // ── Operator state persistence tests ──
 
     #[test]
     fn test_dag_snapshot_to_manifest_operators() {
@@ -1322,7 +1336,7 @@ mod tests {
         assert!(dag_states.contains_key(&laminar_core::dag::topology::NodeId(42)));
     }
 
-    // ── F-CKP-006: WAL checkpoint coordination tests ──
+    // ── WAL checkpoint coordination tests ──
 
     #[test]
     fn test_prepare_wal_no_wal_manager() {
@@ -1517,7 +1531,7 @@ mod tests {
         assert!(debug.contains("changelog_drainers: 0"));
     }
 
-    // ── F-CKP-009: Checkpoint observability tests ──
+    // ── Checkpoint observability tests ──
 
     #[tokio::test]
     async fn test_checkpoint_emits_metrics_on_success() {

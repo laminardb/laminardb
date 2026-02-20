@@ -17,7 +17,7 @@ const RECORD_HEADER_SIZE: u64 = 8;
 /// Per-core WAL writer.
 ///
 /// Each core owns its own writer, eliminating cross-core synchronization on the write path.
-/// Record format is compatible with F007: `[length: 4][crc32: 4][data: length]`
+/// Record format is compatible with `[length: 4][crc32: 4][data: length]`
 pub struct CoreWalWriter {
     /// Core ID this writer belongs to.
     core_id: usize,

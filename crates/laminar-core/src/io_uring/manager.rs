@@ -163,7 +163,7 @@ impl Completion {
 /// Per-core `io_uring` manager.
 ///
 /// Manages a single core's `io_uring` instance, buffer pool, and pending operations.
-/// Designed for integration with the thread-per-core architecture (F013).
+/// Designed for integration with the thread-per-core architecture.
 pub struct CoreRingManager {
     /// Core ID.
     core_id: usize,

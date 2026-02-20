@@ -13,7 +13,7 @@
 //! ## Recovery Process
 //!
 //! 1. Find the latest valid checkpoint
-//! 2. Load checkpoint state (mmap state snapshot + `RocksDB`)
+//! 2. Load checkpoint state (mmap state snapshot)
 //! 3. Replay WAL entries from checkpoint's WAL position
 //! 4. Restore watermark and source offsets
 

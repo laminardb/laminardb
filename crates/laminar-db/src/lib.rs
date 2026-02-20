@@ -30,7 +30,7 @@ mod asof_batch;
 mod batch_filter;
 mod builder;
 mod catalog;
-/// Unified checkpoint coordination (F-CKP-003).
+/// Unified checkpoint coordination.
 pub mod checkpoint_coordinator;
 mod config;
 mod connector_manager;
@@ -39,7 +39,9 @@ mod error;
 mod handle;
 mod metrics;
 mod pipeline_checkpoint;
-/// Unified recovery manager (F-CKP-007).
+/// Deployment profiles.
+pub mod profile;
+/// Unified recovery manager.
 pub mod recovery_manager;
 mod sql_utils;
 mod stream_executor;
@@ -88,6 +90,7 @@ pub use handle::{
 };
 pub use metrics::{PipelineCounters, PipelineMetrics, PipelineState, SourceMetrics, StreamMetrics};
 pub use pipeline_checkpoint::PipelineCheckpoint;
+pub use profile::{Profile, ProfileError};
 pub use recovery_manager::{RecoveredState, RecoveryManager};
 
 /// Re-export the connector registry for custom connector registration.

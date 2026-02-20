@@ -42,12 +42,17 @@ tracing-subscriber = { version = "0.3", features = ["env-filter"] }
 chrono = "0.4"
 
 # Performance-critical
-fxhash = "0.2"  # Faster than std HashMap
+rustc-hash = "2.1"  # Faster than std HashMap (replaces unmaintained fxhash)
 crossbeam = "0.8"  # Lock-free data structures
 parking_lot = "0.12"  # Faster Mutex/RwLock
 memmap2 = "0.9"  # Memory-mapped files
 bumpalo = "3.19"  # Arena allocator
-uuid = { version = "1.19", features = ["v4"] }  # Unique IDs
+uuid = { version = "1.19", features = ["v4", "v7", "serde"] }  # Unique IDs
+ahash = "0.8"  # Fast hashing for state stores
+papaya = "0.2"  # Lock-free concurrent HashMap
+foyer = { version = "0.20", features = ["serde"] }  # High-performance cache (S3-FIFO eviction, serde for HybridCache)
+sha2 = "0.10"  # SHA-256 for checkpoint integrity
+backoff = { version = "0.4", features = ["tokio"] }  # Exponential backoff retry
 
 # DataFusion and Arrow - using latest versions
 arrow = { version = "57.2", default-features = true }
@@ -62,10 +67,12 @@ datafusion = "52.0"
 datafusion-common = "52.0"
 datafusion-expr = "52.0"
 datafusion-sql = "52.0"
-sqlparser = "0.60"
+datafusion-optimizer = "52.0"
+sqlparser = "0.59"
 
 # Async
 tokio-stream = "0.1"
+futures = "0.3"
 
 # Collections
 smallvec = { version = "1.15", features = ["const_new", "union"] }
@@ -82,7 +89,7 @@ xorf = "0.12"
 base64 = "0.22"
 
 # Randomness
-rand = "0.8"
+rand = "0.9"
 
 # JIT compilation (Cranelift)
 cranelift-codegen = "0.128"
@@ -90,6 +97,20 @@ cranelift-frontend = "0.128"
 cranelift-jit = "0.128"
 cranelift-module = "0.128"
 cranelift-native = "0.128"
+
+# Embedded key-value (secondary indexes)
+redb = "2"
+
+# Constellation (distributed mode)
+tonic = "0.13"
+prost = "0.13"
+tonic-build = "0.13"
+prost-build = "0.13"
+openraft = { version = "0.9", features = ["serde"] }
+chitchat = "0.10"
+bincode = { version = "2", features = ["serde"] }
+tokio-util = { version = "0.7", features = ["rt"] }
+xxhash-rust = { version = "0.8", features = ["xxh3"] }
 
 # Testing
 criterion = { version = "0.8", features = ["html_reports"] }

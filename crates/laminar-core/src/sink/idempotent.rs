@@ -252,7 +252,7 @@ where
 
         // Write to inner sink
         self.inner
-            .write(new_outputs)
+            .write(&mut new_outputs)
             .map_err(|e| SinkError::WriteFailed(e.to_string()))?;
 
         // Mark IDs as seen after successful write
@@ -269,8 +269,9 @@ where
     D: DeduplicationStore,
     E: RecordIdExtractor,
 {
-    fn write(&mut self, outputs: Vec<Output>) -> Result<(), crate::reactor::SinkError> {
-        self.write_deduplicated(outputs)
+    fn write(&mut self, outputs: &mut Vec<Output>) -> Result<(), crate::reactor::SinkError> {
+        let owned = std::mem::take(outputs);
+        self.write_deduplicated(owned)
             .map_err(crate::reactor::SinkError::from)
     }
 
@@ -409,7 +410,7 @@ mod tests {
         let mut sink = IdempotentSink::new(inner, dedup);
 
         let event = make_event(1000, 42);
-        ReactorSink::write(&mut sink, vec![Output::Event(event)]).unwrap();
+        ReactorSink::write(&mut sink, &mut vec![Output::Event(event)]).unwrap();
 
         let stats = sink.stats();
         assert_eq!(stats.total_received, 1);
@@ -424,10 +425,10 @@ mod tests {
 
         // First write
         let event = make_event(1000, 42);
-        ReactorSink::write(&mut sink, vec![Output::Event(event.clone())]).unwrap();
+        ReactorSink::write(&mut sink, &mut vec![Output::Event(event.clone())]).unwrap();
 
         // Same event again (will be deduplicated)
-        ReactorSink::write(&mut sink, vec![Output::Event(event)]).unwrap();
+        ReactorSink::write(&mut sink, &mut vec![Output::Event(event)]).unwrap();
 
         let stats = sink.stats();
         assert_eq!(stats.total_received, 2);
@@ -442,7 +443,7 @@ mod tests {
 
         // Write some data
         let event = make_event(1000, 42);
-        ReactorSink::write(&mut sink, vec![Output::Event(event)]).unwrap();
+        ReactorSink::write(&mut sink, &mut vec![Output::Event(event)]).unwrap();
 
         // Checkpoint
         let checkpoint = ExactlyOnceSink::checkpoint(&sink);
@@ -455,7 +456,7 @@ mod tests {
 
         // The same event should be deduplicated
         let event = make_event(1000, 42);
-        ReactorSink::write(&mut sink2, vec![Output::Event(event)]).unwrap();
+        ReactorSink::write(&mut sink2, &mut vec![Output::Event(event)]).unwrap();
 
         let stats = sink2.stats();
         assert_eq!(stats.total_deduplicated, 1);

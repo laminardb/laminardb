@@ -16,6 +16,7 @@
 //! query.stop()?;
 //! ```
 
+use std::hash::{Hash, Hasher};
 use std::sync::atomic::Ordering;
 use std::sync::Arc;
 use std::time::Instant;
@@ -113,7 +114,11 @@ impl StreamingQueryBuilder {
             )));
         }
 
-        let id = QueryId(fxhash::hash64(self.sql.as_bytes()));
+        let id = QueryId({
+            let mut hasher = rustc_hash::FxHasher::default();
+            self.sql.as_bytes().hash(&mut hasher);
+            hasher.finish()
+        });
 
         let output_buffers = (0..n)
             .map(|_| vec![0u8; self.config.output_buffer_size])
@@ -403,7 +408,11 @@ impl StreamingQuery {
         std::mem::swap(&mut self.output_buffers, &mut new.output_buffers);
         std::mem::swap(&mut self.metadata, &mut new.metadata);
         std::mem::swap(&mut self.sql, &mut new.sql);
-        self.id = QueryId(fxhash::hash64(self.sql.as_bytes()));
+        self.id = QueryId({
+            let mut hasher = rustc_hash::FxHasher::default();
+            self.sql.as_bytes().hash(&mut hasher);
+            hasher.finish()
+        });
         new.state = QueryState::Stopped;
 
         Ok(new)

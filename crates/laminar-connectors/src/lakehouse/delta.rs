@@ -7,7 +7,7 @@
 //!
 //! - **Append mode**: Arrow-to-Parquet zero-copy writes for immutable streams
 //! - **Overwrite mode**: Replace partition contents for recomputation
-//! - **Upsert mode**: CDC MERGE via F063 Z-set changelog integration
+//! - **Upsert mode**: CDC MERGE via Z-set changelog integration
 //!
 //! Exactly-once semantics use epoch-to-Delta-version mapping: each `LaminarDB`
 //! epoch maps to exactly one Delta Lake transaction via `txn` application

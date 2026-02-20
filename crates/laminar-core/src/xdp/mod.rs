@@ -1,4 +1,4 @@
-//! # XDP/eBPF Network Optimization (F072)
+//! # XDP/eBPF Network Optimization
 //!
 //! Implements XDP (eXpress Data Path) integration for wire-speed packet filtering
 //! and CPU steering. XDP processes packets at the NIC driver level before kernel

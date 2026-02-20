@@ -22,6 +22,7 @@ reqwest = { version = "0.12", default-features = false, features = ["json", "rus
 # Database drivers for CDC and sinks
 tokio-postgres = { version = "0.7", optional = true }
 postgres-types = { version = "0.2", optional = true }
+deadpool-postgres = { version = "0.14", optional = true }
 pgwire-replication = { version = "0.2", optional = true }
 # MySQL async driver with rustls (no OpenSSL required)
 mysql_async = { version = "0.36", optional = true, default-features = false, features = ["rustls-tls", "binlog", "minimal-rust"] }
@@ -34,6 +35,10 @@ deltalake = { version = ">=0.30", git = "https://github.com/delta-io/delta-rs", 
 url = { version = "2", optional = true }
 uuid = { workspace = true }
 
+# Bytes (for cache value types)
+bytes = { workspace = true }
+foyer = { workspace = true }
+
 # Common
 tokio = { workspace = true }
 async-trait = { workspace = true }
@@ -42,6 +47,7 @@ serde_json = { workspace = true }
 thiserror = { workspace = true }
 tracing = { workspace = true }
 parking_lot = { workspace = true }
+rustc-hash = { workspace = true }
 
 # Arrow for RecordBatch
 arrow-array = { workspace = true }
@@ -49,10 +55,18 @@ arrow-cast = { workspace = true }
 arrow-schema = { workspace = true }
 arrow-select = { workspace = true }
 
+# Parquet lookup source (optional)
+parquet = { version = "57.2", optional = true, default-features = false, features = ["arrow"] }
+object_store = { version = "0.13", optional = true }
+
+# Kafka discovery (optional)
+tokio-util = { workspace = true, optional = true }
+chrono = { workspace = true, optional = true }
+
 [features]
 default = []
 kafka = ["dep:rdkafka", "dep:arrow-avro", "dep:reqwest"]
-postgres-cdc = ["dep:tokio-postgres", "dep:pgwire-replication"]
+postgres-cdc = ["dep:tokio-postgres", "dep:pgwire-replication", "dep:deadpool-postgres"]
 postgres-sink = ["dep:tokio-postgres", "dep:postgres-types"]
 # mysql-cdc: Business logic + mysql_async driver with rustls (no OpenSSL required)
 mysql-cdc = ["dep:mysql_async", "dep:tokio-stream"]
@@ -63,6 +77,11 @@ delta-lake-azure = ["delta-lake", "deltalake/azure"]
 delta-lake-gcs = ["delta-lake", "deltalake/gcs"]
 delta-lake-unity = ["delta-lake", "deltalake/unity-experimental"]
 delta-lake-glue = ["delta-lake", "deltalake/glue"]
+# Parquet file lookup source
+parquet-lookup = ["dep:parquet", "dep:object_store"]
+# Kafka-based discovery for delta
+kafka-discovery = ["kafka", "laminar-core/delta", "dep:tokio-util", "dep:chrono"]
 
 [dev-dependencies]
 tempfile = { workspace = true }
+tokio = { workspace = true, features = ["macros", "rt-multi-thread"] }

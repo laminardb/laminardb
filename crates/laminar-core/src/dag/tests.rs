@@ -10,7 +10,7 @@ use std::sync::Arc;
 
 use arrow_array::{Int64Array, RecordBatch};
 use arrow_schema::{DataType, Field, Schema, SchemaRef};
-use fxhash::FxHashMap;
+use rustc_hash::FxHashMap;
 
 use super::builder::DagBuilder;
 use super::changelog::DagChangelogPropagator;
@@ -2227,7 +2227,7 @@ fn test_full_checkpoint_recovery_cycle() {
 }
 
 // ===========================================================================
-// F-DAG-005: SQL & MV Integration tests
+// SQL & MV Integration tests
 // ===========================================================================
 
 /// Helper: create a simple MV registry with base tables and schemas map.

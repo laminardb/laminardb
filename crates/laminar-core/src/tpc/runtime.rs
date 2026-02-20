@@ -217,7 +217,7 @@ pub struct TpcConfig {
 impl Default for TpcConfig {
     fn default() -> Self {
         Self {
-            num_cores: num_cpus::get(),
+            num_cores: std::thread::available_parallelism().map_or(1, std::num::NonZero::get),
             key_spec: KeySpec::RoundRobin,
             cpu_pinning: false,
             cpu_start: 0,
@@ -377,7 +377,9 @@ impl TpcConfigBuilder {
     /// Returns an error if the configuration is invalid.
     pub fn build(self) -> Result<TpcConfig, TpcError> {
         let config = TpcConfig {
-            num_cores: self.num_cores.unwrap_or_else(num_cpus::get),
+            num_cores: self.num_cores.unwrap_or_else(|| {
+                std::thread::available_parallelism().map_or(1, std::num::NonZero::get)
+            }),
             key_spec: self.key_spec.unwrap_or_default(),
             cpu_pinning: self.cpu_pinning.unwrap_or(false),
             cpu_start: self.cpu_start.unwrap_or(0),

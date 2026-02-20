@@ -80,7 +80,7 @@ pub struct App {
     pub last_checkpoint_time: Option<Instant>,
     pub recovered_from_epoch: Option<u64>,
 
-    // -- Pipeline metrics from F-OBS-001 --
+    // -- Pipeline metrics --
     pub pipeline_metrics: Option<PipelineMetrics>,
 
     // -- Previous anomaly state for threshold detection --

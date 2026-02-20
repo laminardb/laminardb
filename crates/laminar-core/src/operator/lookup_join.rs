@@ -3,7 +3,7 @@
 //! Join streaming events with external reference tables (dimension tables).
 //!
 //! Lookup joins enrich streaming data with information from slowly-changing
-//! external tables. Unlike stream-stream joins (F019), lookup joins:
+//! external tables. Unlike stream-stream joins, lookup joins:
 //! - Have one streaming side (events) and one static/slowly-changing side (table)
 //! - Use caching to avoid repeated lookups for the same key
 //! - Support TTL-based cache expiration for slowly-changing data
@@ -93,10 +93,11 @@ use super::{
 use crate::state::StateStoreExt;
 use arrow_array::{Array, ArrayRef, Int64Array, RecordBatch, StringArray};
 use arrow_schema::{DataType, Field, Schema, SchemaRef};
-use fxhash::FxHashMap;
 use rkyv::{
     rancor::Error as RkyvError, Archive, Deserialize as RkyvDeserialize, Serialize as RkyvSerialize,
 };
+use rustc_hash::FxHashMap;
+use std::hash::{Hash, Hasher};
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::Arc;
 use std::time::Duration;
@@ -391,6 +392,8 @@ pub struct LookupJoinOperator {
     /// In-memory cache of deserialized batches to avoid repeated Arrow IPC deserialization.
     /// Maps cache key bytes to the deserialized `RecordBatch` wrapped in `Arc` for cheap cloning.
     batch_cache: FxHashMap<Vec<u8>, Option<Arc<RecordBatch>>>,
+    /// Cached column index for the join key — resolved on first event.
+    key_column_index: Option<usize>,
 }
 
 impl LookupJoinOperator {
@@ -416,6 +419,7 @@ impl LookupJoinOperator {
             pending_keys: Vec::new(),
             pending_events: Vec::new(),
             batch_cache: FxHashMap::default(),
+            key_column_index: None,
         }
     }
 
@@ -552,7 +556,11 @@ impl LookupJoinOperator {
         }
 
         // Extract join key
-        let Some(key) = Self::extract_key(&event.data, &self.config.stream_key_column) else {
+        let Some(key) = Self::extract_key(
+            &event.data,
+            &self.config.stream_key_column,
+            &mut self.key_column_index,
+        ) else {
             return OutputVec::new();
         };
 
@@ -667,8 +675,21 @@ impl LookupJoinOperator {
     }
 
     /// Extracts the join key value from a record batch.
-    fn extract_key(batch: &RecordBatch, column_name: &str) -> Option<Vec<u8>> {
-        let column_index = batch.schema().index_of(column_name).ok()?;
+    ///
+    /// Resolves the column index on the first call and caches it in
+    /// `cached_index` to avoid per-event schema lookups.
+    fn extract_key(
+        batch: &RecordBatch,
+        column_name: &str,
+        cached_index: &mut Option<usize>,
+    ) -> Option<Vec<u8>> {
+        let column_index = if let Some(idx) = *cached_index {
+            idx
+        } else {
+            let idx = batch.schema().index_of(column_name).ok()?;
+            *cached_index = Some(idx);
+            idx
+        };
         let column = batch.column(column_index);
 
         // Handle different column types
@@ -691,7 +712,11 @@ impl LookupJoinOperator {
 
     /// Creates a cache key from a lookup key.
     fn make_cache_key(key: &[u8]) -> Vec<u8> {
-        let key_hash = fxhash::hash64(key);
+        let key_hash = {
+            let mut hasher = rustc_hash::FxHasher::default();
+            key.hash(&mut hasher);
+            hasher.finish()
+        };
         let mut cache_key = Vec::with_capacity(12);
         cache_key.extend_from_slice(CACHE_STATE_PREFIX);
         cache_key.extend_from_slice(&key_hash.to_be_bytes());
@@ -805,7 +830,11 @@ impl Operator for LookupJoinOperator {
         }
 
         // Extract join key
-        let Some(key) = Self::extract_key(&event.data, &self.config.stream_key_column) else {
+        let Some(key) = Self::extract_key(
+            &event.data,
+            &self.config.stream_key_column,
+            &mut self.key_column_index,
+        ) else {
             return OutputVec::new();
         };
 

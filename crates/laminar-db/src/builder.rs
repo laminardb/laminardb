@@ -8,6 +8,7 @@ use laminar_core::streaming::{BackpressureStrategy, StreamCheckpointConfig};
 use crate::config::LaminarConfig;
 use crate::db::LaminarDB;
 use crate::error::DbError;
+use crate::profile::Profile;
 
 /// Callback for registering custom connectors.
 type ConnectorCallback = Box<dyn FnOnce(&laminar_connectors::registry::ConnectorRegistry) + Send>;
@@ -27,6 +28,8 @@ pub struct LaminarDbBuilder {
     config: LaminarConfig,
     config_vars: HashMap<String, String>,
     connector_callbacks: Vec<ConnectorCallback>,
+    profile: Profile,
+    object_store_url: Option<String>,
 }
 
 impl LaminarDbBuilder {
@@ -37,6 +40,8 @@ impl LaminarDbBuilder {
             config: LaminarConfig::default(),
             config_vars: HashMap::new(),
             connector_callbacks: Vec::new(),
+            profile: Profile::default(),
+            object_store_url: None,
         }
     }
 
@@ -75,6 +80,25 @@ impl LaminarDbBuilder {
         self
     }
 
+    /// Set the deployment profile.
+    ///
+    /// See [`Profile`] for the available tiers.
+    #[must_use]
+    pub fn profile(mut self, profile: Profile) -> Self {
+        self.profile = profile;
+        self
+    }
+
+    /// Set the object-store URL for durable checkpoints.
+    ///
+    /// Required when using [`Profile::Durable`] or
+    /// [`Profile::Delta`].
+    #[must_use]
+    pub fn object_store_url(mut self, url: impl Into<String>) -> Self {
+        self.object_store_url = Some(url.into());
+        self
+    }
+
     /// Register custom connectors with the `ConnectorRegistry`.
     ///
     /// The callback is invoked after the database is created and built-in
@@ -106,7 +130,18 @@ impl LaminarDbBuilder {
     ///
     /// Returns `DbError` if database creation fails.
     #[allow(clippy::unused_async)]
-    pub async fn build(self) -> Result<LaminarDB, DbError> {
+    pub async fn build(mut self) -> Result<LaminarDB, DbError> {
+        // Validate profile feature gates and config requirements.
+        self.profile
+            .validate_features()
+            .map_err(|e| DbError::Config(e.to_string()))?;
+        self.profile
+            .validate_config(&self.config, self.object_store_url.as_deref())
+            .map_err(|e| DbError::Config(e.to_string()))?;
+
+        // Apply profile defaults for fields the user hasn't set.
+        self.profile.apply_defaults(&mut self.config);
+
         let db = LaminarDB::open_with_config_and_vars(self.config, self.config_vars)?;
         for callback in self.connector_callbacks {
             callback(db.connector_registry());
@@ -125,6 +160,8 @@ impl std::fmt::Debug for LaminarDbBuilder {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         f.debug_struct("LaminarDbBuilder")
             .field("config", &self.config)
+            .field("profile", &self.profile)
+            .field("object_store_url", &self.object_store_url)
             .field("config_vars_count", &self.config_vars.len())
             .field("connector_callbacks", &self.connector_callbacks.len())
             .finish()

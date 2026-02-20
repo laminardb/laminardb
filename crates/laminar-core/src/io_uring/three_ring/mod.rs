@@ -1,4 +1,4 @@
-//! # Three-Ring I/O Architecture (F069)
+//! # Three-Ring I/O Architecture
 //!
 //! Implements the three-ring I/O pattern from Seastar/Glommio where each core uses
 //! multiple `io_uring` instances serving different latency requirements:

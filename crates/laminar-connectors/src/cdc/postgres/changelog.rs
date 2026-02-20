@@ -1,7 +1,7 @@
 //! Z-set changelog integration for `PostgreSQL` CDC events.
 //!
 //! Converts decoded `pgoutput` DML messages into change events compatible
-//! with `LaminarDB`'s F063 changelog/retraction model (Z-sets).
+//! with `LaminarDB`'s changelog/retraction model (Z-sets).
 //!
 //! # Z-Set Semantics
 //!

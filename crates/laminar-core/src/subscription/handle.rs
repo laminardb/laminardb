@@ -23,8 +23,8 @@
 //!
 //! This is the **channel-based** style (Option B from the research). Other styles
 //! build on top of it:
-//! - F-SUB-006: Callback subscriptions (`on_event` closure)
-//! - F-SUB-007: Async `Stream` subscriptions (`StreamExt` compatible)
+//! - Callback subscriptions (`on_event` closure)
+//! - Async `Stream` subscriptions (`StreamExt` compatible)
 
 use std::sync::Arc;
 

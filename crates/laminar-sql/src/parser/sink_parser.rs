@@ -259,7 +259,7 @@ mod tests {
         assert!(!sink.if_not_exists);
     }
 
-    // ── INTO connector tests (F-SQL-002) ────────────────────────────
+    // ── INTO connector tests ────────────────────────────
 
     #[test]
     fn test_sink_into_kafka() {

@@ -1,6 +1,6 @@
 use std::collections::HashMap;
 
-use fxhash::FxHashMap;
+use rustc_hash::FxHashMap;
 
 use crate::dag::error::DagError;
 use crate::dag::topology::NodeId;

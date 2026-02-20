@@ -16,7 +16,7 @@
 use std::collections::VecDeque;
 use std::time::Duration;
 
-use fxhash::FxHashMap;
+use rustc_hash::FxHashMap;
 
 use crate::operator::{Event, OperatorState};
 
@@ -129,7 +129,14 @@ impl BarrierAligner {
     ///
     /// Returns [`AlignmentResult::Pending`] until all inputs have reported,
     /// then returns [`AlignmentResult::Aligned`] with the barrier and any
-    /// buffered events.
+    /// buffered events sorted by event timestamp.
+    ///
+    /// ## Cross-input ordering
+    ///
+    /// Buffered events from different upstream inputs are merged and sorted
+    /// by `event.timestamp` to ensure deterministic event-time ordering at
+    /// fan-in nodes. Operators that require event-time ordering can rely on
+    /// this guarantee for the post-alignment batch.
     ///
     /// # Panics
     ///
@@ -145,10 +152,13 @@ impl BarrierAligner {
 
         if self.barriers_received.len() >= self.expected_inputs {
             // All inputs aligned — drain buffered events.
+            // Sort by event timestamp to ensure deterministic ordering
+            // regardless of FxHashMap iteration order.
             let mut all_buffered = Vec::new();
             for (_node, mut events) in self.buffered_events.drain() {
                 all_buffered.extend(events.drain(..));
             }
+            all_buffered.sort_by_key(|e| e.timestamp);
 
             // Take the last barrier received as the canonical one.
             let barrier = self

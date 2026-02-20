@@ -1,4 +1,4 @@
-//! # Incremental Checkpointing (F022)
+//! # Incremental Checkpointing
 //!
 //! Three-tier incremental checkpoint architecture that maintains Ring 0 latency (<500ns)
 //! while providing durable, incremental state snapshots.
@@ -16,8 +16,8 @@
 //!                         (group commit, fdatasync)
 //!                                        │
 //!                                        ▼ periodic checkpoint
-//!   wal.replay(last_ckpt..now) ──▶ rocksdb.write_batch()
-//!   rocksdb.create_checkpoint() ──▶ hard-link SSTables
+//!   wal.replay(last_ckpt..now) ──▶ state.apply_batch()
+//!   state.create_checkpoint() ──▶ snapshot to directory
 //!   wal.truncate(checkpoint_epoch)
 //! ```
 //!
@@ -31,7 +31,7 @@
 //!
 //! - [`StateChangelogEntry`]: Zero-alloc changelog entry (32 bytes)
 //! - [`StateChangelogBuffer`]: Ring 0 SPSC changelog buffer
-//! - [`IncrementalCheckpointManager`]: RocksDB-based incremental checkpoints
+//! - [`IncrementalCheckpointManager`]: Directory-based incremental checkpoints
 //! - [`RecoveryManager`]: Checkpoint + WAL recovery
 //!
 //! ## Example
@@ -43,7 +43,7 @@
 //! use std::path::Path;
 //! use std::time::Duration;
 //!
-//! // Create checkpoint manager with RocksDB backend
+//! // Create checkpoint manager
 //! let config = CheckpointConfig::new(Path::new("/data/checkpoints"))
 //!     .with_wal_path(Path::new("/data/wal"))
 //!     .with_interval(Duration::from_secs(60))

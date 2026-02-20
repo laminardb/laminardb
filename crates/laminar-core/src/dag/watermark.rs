@@ -3,7 +3,7 @@
 //! Provides Vec-indexed O(1) watermark propagation through a DAG topology.
 //! Watermarks flow from source nodes downstream using min-semantics at
 //! fan-in (merge) nodes, matching the global watermark tracking pattern
-//! from F010 but scoped to DAG nodes.
+//! but scoped to DAG nodes.
 //!
 //! # Ring 0 Compatibility
 //!

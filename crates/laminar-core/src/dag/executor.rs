@@ -1,9 +1,8 @@
 //! Ring 0 DAG executor for event processing.
 //!
 //! [`DagExecutor`] processes events through a finalized [`StreamingDag`] in
-//! topological order. It uses the pre-computed [`RoutingTable`] (F-DAG-002)
-//! for O(1) dispatch and integrates with the [`Operator`] trait for operator
-//! invocation.
+//! topological order. It uses the pre-computed [`RoutingTable`] for O(1)
+//! dispatch and integrates with the [`Operator`] trait for operator invocation.
 //!
 //! # Architecture
 //!
@@ -39,7 +38,7 @@
 
 use std::collections::VecDeque;
 
-use fxhash::FxHashMap;
+use rustc_hash::FxHashMap;
 use smallvec::SmallVec;
 
 use crate::alloc::HotPathGuard;
@@ -528,7 +527,7 @@ impl DagExecutor {
     /// Processes all nodes in topological order.
     ///
     /// Drains input queues, dispatches to operators, and routes outputs
-    /// to downstream nodes. Uses [`HotPathGuard`] (F071) for zero-allocation
+    /// to downstream nodes. Uses [`HotPathGuard`] for zero-allocation
     /// enforcement in debug builds.
     fn process_dag(&mut self) {
         let _guard = HotPathGuard::enter("dag_executor");

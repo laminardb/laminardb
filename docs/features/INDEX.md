@@ -2,16 +2,19 @@
 
 ## Overview
 
-| Phase | Total | Draft | In Progress | Hardening | Done |
-|-------|-------|-------|-------------|-----------|------|
-| Phase 1 | 12 | 0 | 0 | 0 | 12 |
-| Phase 1.5 | 1 | 0 | 0 | 0 | 1 |
-| Phase 2 | 38 | 0 | 0 | 0 | 38 |
-| Phase 2.5 | 12 | 0 | 0 | 0 | 12 |
-| Phase 3 | 77 | 9 | 0 | 0 | 68 |
-| Phase 4 | 11 | 11 | 0 | 0 | 0 |
-| Phase 5 | 10 | 10 | 0 | 0 | 0 |
-| **Total** | **161** | **23** | **0** | **0** | **131** |
+| Phase | Total | Draft | In Progress | Hardening | Done | Superseded |
+|-------|-------|-------|-------------|-----------|------|------------|
+| Phase 1 | 12 | 0 | 0 | 0 | 12 | 0 |
+| Phase 1.5 | 1 | 0 | 0 | 0 | 1 | 0 |
+| Phase 2 | 38 | 0 | 0 | 0 | 38 | 0 |
+| Phase 2.5 | 12 | 0 | 0 | 0 | 12 | 0 |
+| Phase 3 | 77 | 9 | 0 | 0 | 68 | 0 |
+| Phase 4 | 11 | 11 | 0 | 0 | 0 | 0 |
+| Phase 5 | 10 | 10 | 0 | 0 | 0 | 0 |
+| Phase 6a | 29 | 0 | 0 | 0 | 27 | 2 |
+| Phase 6b | 14 | 0 | 0 | 0 | 14 | 0 |
+| Phase 6c | 10 | 9 | 0 | 0 | 0 | 1 |
+| **Total** | **214** | **39** | **0** | **0** | **172** | **3** |
 
 ## Status Legend
 
@@ -20,7 +23,7 @@
 - 🔧 Hardening - Functional but has gaps to fix
 - ✅ Done - Complete and merged
 - ⏸️ Paused - On hold
-- ❌ Cancelled - Will not implement
+- ❌ Cancelled / Superseded - Will not implement or replaced by alternative approach
 
 **See also:** [DEPENDENCIES.md](DEPENDENCIES.md) for feature dependency graph.
 
@@ -316,6 +319,181 @@ See [Demo Index](phase-3/demo/INDEX.md).
 | F053 | Alerting Integration | 📝 | [Link](phase-5/F053-alerting.md) |
 | F054 | Configuration Management | 📝 | [Link](phase-5/F054-config-management.md) |
 | F055 | CLI Tools | 📝 | [Link](phase-5/F055-cli-tools.md) |
+
+---
+
+## Phase 6: Delta Architecture
+
+> Embedded-to-distributed streaming SQL with sub-500ns hot path guarantees. Extends LaminarDB from single-process to multi-node delta without changing operator code.
+
+See [Delta Index](delta/INDEX.md) for full details, dependency graph, performance budget, and decision log.
+
+### Phase 6a: Partition-Parallel Embedded
+
+> State store infrastructure, checkpoint barriers, lookup tables with foyer caching, source pushdown, SQL integration, baseline benchmarks.
+
+#### State Store Architecture
+
+| ID | Feature | Status | Spec |
+|----|---------|--------|------|
+| F-STATE-001 | Revised StateStore Trait | ✅ | [Link](delta/state/F-STATE-001-state-store-trait.md) |
+| F-STATE-002 | InMemoryStateStore (AHashMap/BTreeSet) | ✅ | [Link](delta/state/F-STATE-002-inmemory-state-store.md) |
+| F-STATE-003 | ~~MmapStateStore~~ | ❌ | [Link](delta/state/F-STATE-003-mmap-state-store.md) |
+| F-STATE-004 | ~~Pluggable Snapshot Strategies~~ | ❌ | [Link](delta/state/F-STATE-004-pluggable-snapshots.md) |
+
+#### Distributed Checkpoint (Embedded)
+
+| ID | Feature | Status | Spec |
+|----|---------|--------|------|
+| F-DCKP-001 | Checkpoint Barrier Protocol | ✅ | [Link](delta/checkpoint/F-DCKP-001-barrier-protocol.md) |
+| F-DCKP-002 | Barrier Alignment | ✅ | [Link](delta/checkpoint/F-DCKP-002-barrier-alignment.md) |
+| F-DCKP-003 | Object Store Checkpoint Layout | ✅ | [Link](delta/checkpoint/F-DCKP-003-object-store-layout.md) |
+| F-DCKP-004 | ObjectStoreCheckpointer | ✅ | [Link](delta/checkpoint/F-DCKP-004-object-store-checkpointer.md) |
+| F-DCKP-005 | Recovery Manager | ✅ | [Link](delta/checkpoint/F-DCKP-005-recovery-manager.md) |
+
+#### Lookup Tables
+
+| ID | Feature | Status | Spec |
+|----|---------|--------|------|
+| F-LOOKUP-001 | LookupTable Trait & Strategy | ✅ | [Link](delta/lookup/F-LOOKUP-001-lookup-table-trait.md) |
+| F-LOOKUP-002 | LookupSource Trait | ✅ | [Link](delta/lookup/F-LOOKUP-002-lookup-source-trait.md) |
+| F-LOOKUP-003 | Predicate Types | ✅ | [Link](delta/lookup/F-LOOKUP-003-predicate-types.md) |
+| F-LOOKUP-004 | foyer In-Memory Cache (Ring 0) | ✅ | [Link](delta/lookup/F-LOOKUP-004-foyer-memory-cache.md) |
+| F-LOOKUP-005 | foyer Hybrid Cache (Ring 1) | ✅ | [Link](delta/lookup/F-LOOKUP-005-foyer-hybrid-cache.md) |
+| F-LOOKUP-006 | CDC-to-Cache Adapter | ✅ | [Link](delta/lookup/F-LOOKUP-006-cdc-cache-adapter.md) |
+| F-LOOKUP-007 | PostgresLookupSource | ✅ | [Link](delta/lookup/F-LOOKUP-007-postgres-lookup-source.md) |
+| F-LOOKUP-008 | ParquetLookupSource | ✅ | [Link](delta/lookup/F-LOOKUP-008-parquet-lookup-source.md) |
+| F-LOOKUP-010 | Remove RocksDB Dependency | ✅ | [Link](delta/lookup/F-LOOKUP-010-rocksdb-removal.md) |
+
+#### Secondary Indexes
+
+| ID | Feature | Status | Spec |
+|----|---------|--------|------|
+| F-IDX-001 | redb Secondary Indexes | ✅ | [Link](delta/indexes/F-IDX-001-redb-secondary-indexes.md) |
+
+#### Deployment Profiles
+
+| ID | Feature | Status | Spec |
+|----|---------|--------|------|
+| F-PROFILE-001 | Deployment Profiles | ✅ | [Link](delta/profiles/F-PROFILE-001-deployment-profiles.md) |
+
+#### Cross-Partition Aggregation
+
+| ID | Feature | Status | Spec |
+|----|---------|--------|------|
+| F-XAGG-001 | Cross-Partition Lock-Free HashMap | ✅ | [Link](delta/aggregation/F-XAGG-001-cross-partition-hashmap.md) |
+
+#### Exactly-Once (Source Layer)
+
+| ID | Feature | Status | Spec |
+|----|---------|--------|------|
+| F-E2E-001 | Source Offset Checkpoint | ✅ | [Link](delta/exactly-once/F-E2E-001-source-offset-checkpoint.md) |
+
+#### SQL Integration
+
+| ID | Feature | Status | Spec |
+|----|---------|--------|------|
+| F-LSQL-001 | CREATE LOOKUP TABLE DDL | ✅ | [Link](delta/sql/F-LSQL-001-create-lookup-table.md) |
+| F-LSQL-002 | Lookup Join Plan Node | ✅ | [Link](delta/sql/F-LSQL-002-lookup-join-plan-node.md) |
+| F-LSQL-003 | Predicate Splitting & Pushdown | ✅ | [Link](delta/sql/F-LSQL-003-predicate-splitting.md) |
+
+#### Performance Benchmarks (Baseline)
+
+| ID | Feature | Status | Spec |
+|----|---------|--------|------|
+| F-PERF-001 | StateStore Microbenchmarks | ✅ | [Link](delta/benchmarks/F-PERF-001-state-store-benchmarks.md) |
+| F-PERF-002 | Cache Hit/Miss Ratio Benchmarks | ✅ | [Link](delta/benchmarks/F-PERF-002-cache-benchmarks.md) |
+| F-PERF-003 | Checkpoint Cycle Benchmark | ✅ | [Link](delta/benchmarks/F-PERF-003-checkpoint-cycle-benchmark.md) |
+| F-PERF-005 | Lookup Join Throughput | ✅ | [Link](delta/benchmarks/F-PERF-005-lookup-join-throughput.md) |
+
+### Phase 6b: Delta Foundation
+
+> Multi-node discovery (gossip), Raft-based metadata consensus, partition ownership with epoch fencing, distributed checkpointing, partitioned lookups, cross-node aggregation, inter-node RPC.
+
+#### Discovery
+
+| ID | Feature | Status | Spec |
+|----|---------|--------|------|
+| F-DISC-001 | Discovery Trait & Static Discovery | ✅ | [Link](delta/discovery/F-DISC-001-static-discovery.md) |
+| F-DISC-002 | Gossip Discovery (chitchat) | ✅ | [Link](delta/discovery/F-DISC-002-gossip-discovery.md) |
+| F-DISC-003 | Kafka Group Discovery | ✅ | [Link](delta/discovery/F-DISC-003-kafka-discovery.md) |
+
+#### Coordination
+
+| ID | Feature | Status | Spec |
+|----|---------|--------|------|
+| F-COORD-001 | Raft Metadata Consensus | ✅ | [Link](delta/coordination/F-COORD-001-raft-metadata.md) |
+| F-COORD-002 | Delta Orchestration | ✅ | [Link](delta/coordination/F-COORD-002-delta-orchestration.md) |
+
+#### Partition Ownership
+
+| ID | Feature | Status | Spec |
+|----|---------|--------|------|
+| F-EPOCH-001 | PartitionGuard & Epoch Fencing | ✅ | [Link](delta/partition/F-EPOCH-001-partition-guard.md) |
+| F-EPOCH-002 | Partition Assignment Algorithm | ✅ | [Link](delta/partition/F-EPOCH-002-assignment-algorithm.md) |
+| F-EPOCH-003 | Partition Reassignment Protocol | ✅ | [Link](delta/partition/F-EPOCH-003-reassignment-protocol.md) |
+
+#### Distributed Checkpoint (Delta)
+
+| ID | Feature | Status | Spec |
+|----|---------|--------|------|
+| F-DCKP-008 | Distributed Checkpoint Coordination | ✅ | [Link](delta/checkpoint/F-DCKP-008-distributed-coordination.md) |
+
+#### Delta Lookup
+
+| ID | Feature | Status | Spec |
+|----|---------|--------|------|
+| F-LOOKUP-009 | Partitioned Lookup Strategy | ✅ | [Link](delta/lookup/F-LOOKUP-009-partitioned-lookup.md) |
+
+#### Cross-Node Aggregation
+
+| ID | Feature | Status | Spec |
+|----|---------|--------|------|
+| F-XAGG-002 | Gossip Partial Aggregates | ✅ | [Link](delta/aggregation/F-XAGG-002-gossip-aggregates.md) |
+| F-XAGG-003 | gRPC Aggregate Fan-Out | ✅ | [Link](delta/aggregation/F-XAGG-003-grpc-aggregate-fanout.md) |
+
+#### Inter-Node RPC
+
+| ID | Feature | Status | Spec |
+|----|---------|--------|------|
+| F-RPC-001 | gRPC Service Definitions | ✅ | [Link](delta/rpc/F-RPC-001-grpc-service-definitions.md) |
+| F-RPC-002 | Remote Lookup Service | ✅ | [Link](delta/rpc/F-RPC-002-remote-lookup-service.md) |
+| F-RPC-003 | Barrier Forwarding Service | ✅ | [Link](delta/rpc/F-RPC-003-barrier-forwarding.md) |
+
+#### Performance Benchmarks (Delta)
+
+| ID | Feature | Status | Spec |
+|----|---------|--------|------|
+| F-PERF-004 | Delta Checkpoint Benchmark | ✅ | [Link](delta/benchmarks/F-PERF-004-delta-checkpoint-benchmark.md) |
+
+### Phase 6c: Production Hardening
+
+> Unaligned checkpoints, exactly-once sinks, laminardb-server binary with TOML config, HTTP API, hot reload, rolling restarts.
+
+#### Advanced Checkpointing
+
+| ID | Feature | Status | Spec |
+|----|---------|--------|------|
+| F-DCKP-006 | Unaligned Checkpoints | 📝 | [Link](delta/checkpoint/F-DCKP-006-unaligned-checkpoints.md) |
+| F-DCKP-007 | ~~Incremental Mmap Checkpoints~~ | ❌ | [Link](delta/checkpoint/F-DCKP-007-incremental-mmap-checkpoints.md) |
+
+#### Exactly-Once Sinks
+
+| ID | Feature | Status | Spec |
+|----|---------|--------|------|
+| F-E2E-002 | Transactional Sink (2PC) | 📝 | [Link](delta/exactly-once/F-E2E-002-transactional-sink.md) |
+| F-E2E-003 | Idempotent Sink | 📝 | [Link](delta/exactly-once/F-E2E-003-idempotent-sink.md) |
+
+#### laminardb-server
+
+| ID | Feature | Status | Spec |
+|----|---------|--------|------|
+| F-SERVER-001 | TOML Configuration | 📝 | [Link](delta/server/F-SERVER-001-toml-config.md) |
+| F-SERVER-002 | Engine Construction | 📝 | [Link](delta/server/F-SERVER-002-engine-construction.md) |
+| F-SERVER-003 | HTTP API | 📝 | [Link](delta/server/F-SERVER-003-http-api.md) |
+| F-SERVER-004 | Hot Reload | 📝 | [Link](delta/server/F-SERVER-004-hot-reload.md) |
+| F-SERVER-005 | Delta Server Mode | 📝 | [Link](delta/server/F-SERVER-005-delta-mode.md) |
+| F-SERVER-006 | Graceful Rolling Restart | 📝 | [Link](delta/server/F-SERVER-006-rolling-restart.md) |
 
 ---
 

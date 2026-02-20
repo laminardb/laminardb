@@ -1,8 +1,8 @@
-//! PostgreSQL CDC source connector (F027).
+//! PostgreSQL CDC source connector.
 //!
 //! Streams row-level changes from PostgreSQL using logical replication
 //! (pgoutput plugin). Supports INSERT, UPDATE, DELETE operations with
-//! Z-set changelog integration (F063).
+//! Z-set changelog integration.
 //!
 //! # Architecture
 //!

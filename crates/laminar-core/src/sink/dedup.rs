@@ -5,7 +5,7 @@
 use std::collections::VecDeque;
 use std::hash::{Hash, Hasher};
 
-use fxhash::FxHashSet;
+use rustc_hash::FxHashSet;
 
 /// Unique identifier for a record
 ///
@@ -46,7 +46,7 @@ impl RecordId {
     /// Uses `FxHash` for fast, deterministic hashing.
     #[must_use]
     pub fn from_hash(data: &[u8]) -> Self {
-        use fxhash::FxHasher;
+        use rustc_hash::FxHasher;
         let mut hasher = FxHasher::default();
         data.hash(&mut hasher);
         let hash = hasher.finish();
@@ -315,7 +315,7 @@ impl BloomFilterDedup {
 
     /// Get indices for a record ID
     fn get_indices(&self, id: &RecordId) -> Vec<usize> {
-        use fxhash::FxHasher;
+        use rustc_hash::FxHasher;
 
         let mut indices = Vec::with_capacity(self.num_hashes);
 

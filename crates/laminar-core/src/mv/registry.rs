@@ -5,7 +5,7 @@
 
 use super::error::{MvError, MvState};
 use arrow_schema::SchemaRef;
-use fxhash::{FxHashMap, FxHashSet};
+use rustc_hash::{FxHashMap, FxHashSet};
 use std::collections::VecDeque;
 
 /// Materialized view definition.

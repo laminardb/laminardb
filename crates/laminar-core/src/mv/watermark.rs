@@ -4,7 +4,7 @@
 //! a view's watermark is the minimum of all its source watermarks.
 
 use super::registry::MvRegistry;
-use fxhash::FxHashMap;
+use rustc_hash::FxHashMap;
 use std::sync::Arc;
 
 /// Tracks watermarks for cascading materialized views.

@@ -8,14 +8,14 @@ use std::fmt;
 use std::sync::Arc;
 
 use arrow_schema::SchemaRef;
-use fxhash::{FxHashMap, FxHashSet};
+use rustc_hash::{FxHashMap, FxHashSet};
 use smallvec::SmallVec;
 
 use super::error::DagError;
 
 /// Maximum fan-out targets per node output port.
 ///
-/// Matches the routing table entry size in F-DAG-002.
+/// Matches the routing table entry size.
 pub const MAX_FAN_OUT: usize = 8;
 
 /// Unique identifier for a node in the DAG.

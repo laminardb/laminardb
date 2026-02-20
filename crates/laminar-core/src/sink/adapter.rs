@@ -236,15 +236,16 @@ impl<E: ExactlyOnceSink> ExactlyOnceSinkAdapter<E> {
 }
 
 impl<E: ExactlyOnceSink> Sink for ExactlyOnceSinkAdapter<E> {
-    fn write(&mut self, outputs: Vec<Output>) -> Result<(), crate::reactor::SinkError> {
+    fn write(&mut self, outputs: &mut Vec<Output>) -> Result<(), crate::reactor::SinkError> {
         let tx_id = self
             .ensure_transaction()
             .map_err(|e| crate::reactor::SinkError::WriteFailed(e.to_string()))?;
 
-        let count = outputs.len() as u64;
+        let owned = std::mem::take(outputs);
+        let count = owned.len() as u64;
 
         self.inner
-            .write(&tx_id, outputs)
+            .write(&tx_id, owned)
             .map_err(crate::reactor::SinkError::from)?;
 
         self.stats.epoch_output_count += count;
@@ -301,7 +302,7 @@ mod tests {
         let mut adapter = ExactlyOnceSinkAdapter::new(tx_sink);
 
         let event = make_event(1000, 42);
-        ReactorSink::write(&mut adapter, vec![Output::Event(event)]).unwrap();
+        ReactorSink::write(&mut adapter, &mut vec![Output::Event(event)]).unwrap();
 
         assert!(adapter.has_active_transaction());
         assert_eq!(adapter.stats().epoch_output_count, 1);
@@ -316,7 +317,7 @@ mod tests {
 
         // Write some data
         let event = make_event(1000, 42);
-        ReactorSink::write(&mut adapter, vec![Output::Event(event)]).unwrap();
+        ReactorSink::write(&mut adapter, &mut vec![Output::Event(event)]).unwrap();
         assert!(adapter.has_active_transaction());
 
         // Checkpoint should commit
@@ -335,7 +336,7 @@ mod tests {
 
         for epoch in 1..=3 {
             let event = make_event(epoch * 1000, epoch);
-            ReactorSink::write(&mut adapter, vec![Output::Event(event)]).unwrap();
+            ReactorSink::write(&mut adapter, &mut vec![Output::Event(event)]).unwrap();
             adapter.notify_checkpoint(epoch as u64).unwrap();
         }
 
@@ -352,12 +353,12 @@ mod tests {
 
         // Commit epoch 1
         let event = make_event(1000, 1);
-        ReactorSink::write(&mut adapter, vec![Output::Event(event)]).unwrap();
+        ReactorSink::write(&mut adapter, &mut vec![Output::Event(event)]).unwrap();
         let checkpoint = adapter.notify_checkpoint(1).unwrap();
 
         // Start epoch 2 but don't commit (simulates crash)
         let event2 = make_event(2000, 2);
-        ReactorSink::write(&mut adapter, vec![Output::Event(event2)]).unwrap();
+        ReactorSink::write(&mut adapter, &mut vec![Output::Event(event2)]).unwrap();
         assert!(adapter.has_active_transaction());
 
         // Restore from epoch 1 checkpoint
@@ -374,7 +375,7 @@ mod tests {
         let mut adapter = ExactlyOnceSinkAdapter::new(tx_sink);
 
         let event = make_event(1000, 42);
-        ReactorSink::write(&mut adapter, vec![Output::Event(event)]).unwrap();
+        ReactorSink::write(&mut adapter, &mut vec![Output::Event(event)]).unwrap();
 
         ReactorSink::flush(&mut adapter).unwrap();
         assert!(!adapter.has_active_transaction());
@@ -390,7 +391,7 @@ mod tests {
         // Write 3 outputs, checkpoint
         for i in 0..3 {
             let event = make_event(i * 1000, i);
-            ReactorSink::write(&mut adapter, vec![Output::Event(event)]).unwrap();
+            ReactorSink::write(&mut adapter, &mut vec![Output::Event(event)]).unwrap();
         }
 
         let stats = adapter.stats();
@@ -412,7 +413,7 @@ mod tests {
         let mut adapter = ExactlyOnceSinkAdapter::new(tx_sink);
 
         let event = make_event(1000, 42);
-        ReactorSink::write(&mut adapter, vec![Output::Event(event)]).unwrap();
+        ReactorSink::write(&mut adapter, &mut vec![Output::Event(event)]).unwrap();
         let checkpoint = adapter.notify_checkpoint(1).unwrap();
 
         assert_eq!(checkpoint.epoch(), 1);
@@ -427,7 +428,7 @@ mod tests {
         let mut adapter = ExactlyOnceSinkAdapter::new(idem_sink);
 
         let event = make_event(1000, 42);
-        ReactorSink::write(&mut adapter, vec![Output::Event(event)]).unwrap();
+        ReactorSink::write(&mut adapter, &mut vec![Output::Event(event)]).unwrap();
         let checkpoint = adapter.notify_checkpoint(1).unwrap();
 
         assert_eq!(checkpoint.epoch(), 1);
@@ -443,7 +444,7 @@ mod tests {
         // Multiple writes within one epoch
         for i in 0..5 {
             let event = make_event(i * 100, i);
-            ReactorSink::write(&mut adapter, vec![Output::Event(event)]).unwrap();
+            ReactorSink::write(&mut adapter, &mut vec![Output::Event(event)]).unwrap();
         }
 
         assert_eq!(adapter.stats().epoch_output_count, 5);
@@ -476,7 +477,7 @@ mod tests {
         let mut adapter = ExactlyOnceSinkAdapter::with_config(tx_sink, config);
 
         let event = make_event(1000, 42);
-        let result = ReactorSink::write(&mut adapter, vec![Output::Event(event)]);
+        let result = ReactorSink::write(&mut adapter, &mut vec![Output::Event(event)]);
         assert!(result.is_err()); // Should fail because auto-begin is off
     }
 
@@ -488,7 +489,7 @@ mod tests {
 
         // Write without committing
         let event = make_event(1000, 42);
-        ReactorSink::write(&mut adapter, vec![Output::Event(event)]).unwrap();
+        ReactorSink::write(&mut adapter, &mut vec![Output::Event(event)]).unwrap();
 
         // checkpoint() should return state without committing
         let cp = adapter.checkpoint();

@@ -29,7 +29,7 @@
 //!     JoinType::Inner,
 //! );
 //!
-//! // Optimized join with CPU-friendly encoding (F057)
+//! // Optimized join with CPU-friendly encoding
 //! let config = StreamJoinConfig::builder()
 //!     .left_key_column("order_id")
 //!     .right_key_column("order_id")
@@ -51,7 +51,7 @@
 //!     ON o.order_id = p.order_id
 //!     AND p.ts BETWEEN o.ts AND o.ts + INTERVAL '1' HOUR;
 //!
-//! -- Session variables for optimization (F057)
+//! -- Session variables for optimization
 //! SET streaming_join_row_encoding = 'cpu_friendly';
 //! SET streaming_join_asymmetric_compaction = true;
 //! ```
@@ -65,7 +65,7 @@
 //! State is automatically cleaned up when watermark passes
 //! `event_timestamp + time_bound`.
 //!
-//! ## Optimizations (F057)
+//! ## Optimizations
 //!
 //! - **CPU-Friendly Encoding**: Inlines primitive values for faster access (30-50% improvement)
 //! - **Asymmetric Compaction**: Skips compaction on finished/idle sides
@@ -83,7 +83,8 @@ use bytes::Bytes;
 use rkyv::{
     rancor::Error as RkyvError, Archive, Deserialize as RkyvDeserialize, Serialize as RkyvSerialize,
 };
-use std::collections::HashMap;
+use rustc_hash::FxHashMap;
+use std::hash::{Hash, Hasher};
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::Arc;
 use std::time::Duration;
@@ -125,9 +126,9 @@ pub enum JoinSide {
     Right,
 }
 
-// F057: Stream Join Optimizations
+// Stream Join Optimizations
 
-/// Row encoding strategy for join state (F057).
+/// Row encoding strategy for join state.
 ///
 /// Controls how join rows are serialized for storage. The encoding choice
 /// affects the tradeoff between memory usage and CPU access speed.
@@ -172,7 +173,7 @@ impl std::str::FromStr for JoinRowEncoding {
     }
 }
 
-/// Configuration for stream-stream joins (F057).
+/// Configuration for stream-stream joins.
 ///
 /// Provides fine-grained control over join behavior and optimizations.
 /// Use the builder pattern for convenient construction.
@@ -204,7 +205,7 @@ pub struct StreamJoinConfig {
     /// Operator ID for checkpointing.
     pub operator_id: Option<String>,
 
-    // F057 Optimizations
+    // Optimizations
     /// Row encoding strategy.
     pub row_encoding: JoinRowEncoding,
     /// Enable asymmetric compaction optimization.
@@ -298,21 +299,21 @@ impl StreamJoinConfigBuilder {
         self
     }
 
-    /// Sets the row encoding strategy (F057).
+    /// Sets the row encoding strategy.
     #[must_use]
     pub fn row_encoding(mut self, encoding: JoinRowEncoding) -> Self {
         self.config.row_encoding = encoding;
         self
     }
 
-    /// Enables or disables asymmetric compaction (F057).
+    /// Enables or disables asymmetric compaction.
     #[must_use]
     pub fn asymmetric_compaction(mut self, enabled: bool) -> Self {
         self.config.asymmetric_compaction = enabled;
         self
     }
 
-    /// Sets the idle threshold for asymmetric compaction (F057).
+    /// Sets the idle threshold for asymmetric compaction.
     #[must_use]
     #[allow(clippy::cast_possible_truncation)] // Duration.as_millis() fits i64 for practical values
     pub fn idle_threshold(mut self, duration: Duration) -> Self {
@@ -320,14 +321,14 @@ impl StreamJoinConfigBuilder {
         self
     }
 
-    /// Enables or disables per-key tracking (F057).
+    /// Enables or disables per-key tracking.
     #[must_use]
     pub fn per_key_tracking(mut self, enabled: bool) -> Self {
         self.config.per_key_tracking = enabled;
         self
     }
 
-    /// Sets the key idle threshold for cleanup (F057).
+    /// Sets the key idle threshold for cleanup.
     #[must_use]
     #[allow(clippy::cast_possible_truncation)] // Duration.as_millis() fits i64 for practical values
     pub fn key_idle_threshold(mut self, duration: Duration) -> Self {
@@ -335,14 +336,14 @@ impl StreamJoinConfigBuilder {
         self
     }
 
-    /// Enables or disables build-side pruning (F057).
+    /// Enables or disables build-side pruning.
     #[must_use]
     pub fn build_side_pruning(mut self, enabled: bool) -> Self {
         self.config.build_side_pruning = enabled;
         self
     }
 
-    /// Sets which side to use as the build side (F057).
+    /// Sets which side to use as the build side.
     #[must_use]
     pub fn build_side(mut self, side: JoinSide) -> Self {
         self.config.build_side = Some(side);
@@ -356,7 +357,7 @@ impl StreamJoinConfigBuilder {
     }
 }
 
-/// Per-side statistics for asymmetric optimization (F057).
+/// Per-side statistics for asymmetric optimization.
 #[derive(Debug, Clone, Default)]
 pub struct SideStats {
     /// Total events received on this side.
@@ -410,7 +411,7 @@ impl SideStats {
     }
 }
 
-/// Per-key metadata for cleanup tracking (F057).
+/// Per-key metadata for cleanup tracking.
 #[derive(Debug, Clone)]
 pub struct KeyMetadata {
     /// Last event timestamp for this key (processing time).
@@ -479,7 +480,7 @@ pub struct JoinRow {
     pub data: Vec<u8>,
     /// Whether this row has been matched (for outer joins).
     pub matched: bool,
-    /// Encoding used for serialization (F057).
+    /// Encoding used for serialization.
     /// 0 = Compact (Arrow IPC), 1 = `CpuFriendly`
     encoding: u8,
 }
@@ -505,7 +506,7 @@ impl JoinRow {
         Self::with_encoding(timestamp, key_value, batch, JoinRowEncoding::Compact)
     }
 
-    /// Creates a new join row with specified encoding (F057).
+    /// Creates a new join row with specified encoding.
     fn with_encoding(
         timestamp: i64,
         key_value: Vec<u8>,
@@ -541,7 +542,7 @@ impl JoinRow {
         Ok(buf)
     }
 
-    /// Serializes using CPU-friendly format (F057).
+    /// Serializes using CPU-friendly format.
     ///
     /// Format:
     /// - Magic (4 bytes): "CPUF"
@@ -737,7 +738,7 @@ impl JoinRow {
             .map_err(|e| OperatorError::SerializationFailed(e.to_string()))
     }
 
-    /// Deserializes from CPU-friendly format (F057).
+    /// Deserializes from CPU-friendly format.
     fn deserialize_cpu_friendly(data: &[u8]) -> Result<RecordBatch, OperatorError> {
         if data.len() < 10 {
             return Err(OperatorError::SerializationFailed(
@@ -1011,7 +1012,7 @@ pub struct JoinMetrics {
     /// Number of state entries cleaned up.
     pub state_cleanups: u64,
 
-    // F057 Optimization Metrics
+    // Optimization Metrics
     /// Rows encoded with CPU-friendly format.
     pub cpu_friendly_encodes: u64,
     /// Rows encoded with compact format.
@@ -1057,7 +1058,7 @@ impl JoinMetrics {
 /// - For high-cardinality joins, consider using shorter time bounds
 /// - Inner joins use less state than outer joins (no unmatched tracking)
 ///
-/// # Optimizations (F057)
+/// # Optimizations
 ///
 /// - **CPU-Friendly Encoding**: Use `JoinRowEncoding::CpuFriendly` for 30-50% faster access
 /// - **Asymmetric Compaction**: Automatically skips compaction on finished/idle sides
@@ -1083,7 +1084,7 @@ pub struct StreamJoinOperator {
     /// Right schema (captured from first right event).
     right_schema: Option<SchemaRef>,
 
-    // F057 Optimization Fields
+    // Optimization Fields
     /// Row encoding strategy.
     row_encoding: JoinRowEncoding,
     /// Enable asymmetric compaction.
@@ -1103,13 +1104,17 @@ pub struct StreamJoinOperator {
     /// Right-side statistics.
     right_stats: SideStats,
     /// Per-key metadata (`key_hash` -> metadata).
-    key_metadata: HashMap<u64, KeyMetadata>,
+    key_metadata: FxHashMap<u64, KeyMetadata>,
     /// Left-side watermark.
     left_watermark: i64,
     /// Right-side watermark.
     right_watermark: i64,
     /// Reusable buffer for `prune_build_side` to avoid per-call allocation.
     prune_buffer: Vec<Bytes>,
+    /// Cached column index for left key — resolved on first left event.
+    left_key_index: Option<usize>,
+    /// Cached column index for right key — resolved on first right event.
+    right_key_index: Option<usize>,
 }
 
 impl StreamJoinOperator {
@@ -1140,7 +1145,7 @@ impl StreamJoinOperator {
             output_schema: None,
             left_schema: None,
             right_schema: None,
-            // F057: Default optimizations
+            // Default optimizations
             row_encoding: JoinRowEncoding::Compact,
             asymmetric_compaction: true,
             idle_threshold_ms: 60_000,
@@ -1150,10 +1155,12 @@ impl StreamJoinOperator {
             build_side: None,
             left_stats: SideStats::new(),
             right_stats: SideStats::new(),
-            key_metadata: HashMap::new(),
+            key_metadata: FxHashMap::default(),
             left_watermark: i64::MIN,
             right_watermark: i64::MIN,
             prune_buffer: Vec::with_capacity(100),
+            left_key_index: None,
+            right_key_index: None,
         }
     }
 
@@ -1177,7 +1184,7 @@ impl StreamJoinOperator {
             output_schema: None,
             left_schema: None,
             right_schema: None,
-            // F057: Default optimizations
+            // Default optimizations
             row_encoding: JoinRowEncoding::Compact,
             asymmetric_compaction: true,
             idle_threshold_ms: 60_000,
@@ -1187,14 +1194,16 @@ impl StreamJoinOperator {
             build_side: None,
             left_stats: SideStats::new(),
             right_stats: SideStats::new(),
-            key_metadata: HashMap::new(),
+            key_metadata: FxHashMap::default(),
             left_watermark: i64::MIN,
             right_watermark: i64::MIN,
             prune_buffer: Vec::with_capacity(100),
+            left_key_index: None,
+            right_key_index: None,
         }
     }
 
-    /// Creates a new stream join operator from configuration (F057).
+    /// Creates a new stream join operator from configuration.
     ///
     /// This is the recommended constructor for production use, allowing
     /// fine-grained control over optimization settings.
@@ -1243,10 +1252,12 @@ impl StreamJoinOperator {
             build_side: config.build_side,
             left_stats: SideStats::new(),
             right_stats: SideStats::new(),
-            key_metadata: HashMap::new(),
+            key_metadata: FxHashMap::default(),
             left_watermark: i64::MIN,
             right_watermark: i64::MIN,
             prune_buffer: Vec::with_capacity(100),
+            left_key_index: None,
+            right_key_index: None,
         }
     }
 
@@ -1273,43 +1284,43 @@ impl StreamJoinOperator {
         self.metrics.reset();
     }
 
-    /// Returns the row encoding strategy (F057).
+    /// Returns the row encoding strategy.
     #[must_use]
     pub fn row_encoding(&self) -> JoinRowEncoding {
         self.row_encoding
     }
 
-    /// Returns whether asymmetric compaction is enabled (F057).
+    /// Returns whether asymmetric compaction is enabled.
     #[must_use]
     pub fn asymmetric_compaction_enabled(&self) -> bool {
         self.asymmetric_compaction
     }
 
-    /// Returns whether per-key tracking is enabled (F057).
+    /// Returns whether per-key tracking is enabled.
     #[must_use]
     pub fn per_key_tracking_enabled(&self) -> bool {
         self.per_key_tracking
     }
 
-    /// Returns the left-side statistics (F057).
+    /// Returns the left-side statistics.
     #[must_use]
     pub fn left_stats(&self) -> &SideStats {
         &self.left_stats
     }
 
-    /// Returns the right-side statistics (F057).
+    /// Returns the right-side statistics.
     #[must_use]
     pub fn right_stats(&self) -> &SideStats {
         &self.right_stats
     }
 
-    /// Returns the number of tracked keys (F057).
+    /// Returns the number of tracked keys.
     #[must_use]
     pub fn tracked_key_count(&self) -> usize {
         self.key_metadata.len()
     }
 
-    /// Checks if a side is considered "finished" (idle) (F057).
+    /// Checks if a side is considered "finished" (idle).
     #[must_use]
     pub fn is_side_idle(&self, side: JoinSide, current_time: i64) -> bool {
         match side {
@@ -1322,7 +1333,7 @@ impl StreamJoinOperator {
         }
     }
 
-    /// Determines the effective build side based on configuration or heuristics (F057).
+    /// Determines the effective build side based on configuration or heuristics.
     #[must_use]
     pub fn effective_build_side(&self) -> JoinSide {
         // Use configured build side if set
@@ -1358,7 +1369,7 @@ impl StreamJoinOperator {
     fn process_left(&mut self, event: &Event, ctx: &mut OperatorContext) -> OutputVec {
         self.metrics.left_events += 1;
 
-        // F057: Track side statistics for asymmetric compaction
+        // Track side statistics for asymmetric compaction
         self.left_stats.record_event(ctx.processing_time);
 
         // Capture left schema on first event
@@ -1374,7 +1385,7 @@ impl StreamJoinOperator {
     fn process_right(&mut self, event: &Event, ctx: &mut OperatorContext) -> OutputVec {
         self.metrics.right_events += 1;
 
-        // F057: Track side statistics for asymmetric compaction
+        // Track side statistics for asymmetric compaction
         self.right_stats.record_event(ctx.processing_time);
 
         // Capture right schema on first event
@@ -1424,7 +1435,7 @@ impl StreamJoinOperator {
         // Update watermark
         let emitted_watermark = ctx.watermark_generator.on_event(event_time);
 
-        // F057: Track per-side watermarks for build-side pruning
+        // Track per-side watermarks for build-side pruning
         match side {
             JoinSide::Left => self.left_watermark = self.left_watermark.max(event_time),
             JoinSide::Right => self.right_watermark = self.right_watermark.max(event_time),
@@ -1439,19 +1450,23 @@ impl StreamJoinOperator {
         }
 
         // Extract join key
-        let key_column = match side {
-            JoinSide::Left => &self.left_key_column,
-            JoinSide::Right => &self.right_key_column,
+        let (key_column, cached_index) = match side {
+            JoinSide::Left => (&self.left_key_column, &mut self.left_key_index),
+            JoinSide::Right => (&self.right_key_column, &mut self.right_key_index),
         };
-        let Some(key_value) = Self::extract_key(&event.data, key_column) else {
+        let Some(key_value) = Self::extract_key(&event.data, key_column, cached_index) else {
             // Can't extract key, skip this event
             return output;
         };
 
-        // F057: Compute key hash for per-key tracking
-        let key_hash = fxhash::hash64(&key_value);
+        // Compute key hash for per-key tracking
+        let key_hash = {
+            let mut hasher = rustc_hash::FxHasher::default();
+            key_value.hash(&mut hasher);
+            hasher.finish()
+        };
 
-        // F057: Track per-key metadata
+        // Track per-key metadata
         if self.per_key_tracking {
             self.key_metadata
                 .entry(key_hash)
@@ -1460,7 +1475,7 @@ impl StreamJoinOperator {
             self.metrics.tracked_keys = self.key_metadata.len() as u64;
         }
 
-        // Create join row with configured encoding (F057)
+        // Create join row with configured encoding
         let join_row = match JoinRow::with_encoding(
             event_time,
             key_value.clone(),
@@ -1502,7 +1517,7 @@ impl StreamJoinOperator {
             );
         }
 
-        // F057: Build-side pruning - prune entries that can no longer produce matches
+        // Build-side pruning - prune entries that can no longer produce matches
         if self.build_side_pruning {
             self.prune_build_side(side, ctx);
         }
@@ -1543,7 +1558,7 @@ impl StreamJoinOperator {
         output
     }
 
-    /// F057: Prunes build-side entries that cannot produce future matches.
+    /// Prunes build-side entries that cannot produce future matches.
     ///
     /// An entry can be pruned if its `timestamp + time_bound < probe_side_watermark`,
     /// meaning the probe side has advanced beyond any possible match window.
@@ -1612,7 +1627,7 @@ impl StreamJoinOperator {
         }
     }
 
-    /// F057: Scans for idle keys and cleans them up aggressively.
+    /// Scans for idle keys and cleans them up aggressively.
     ///
     /// Called periodically (e.g., on timer) to identify keys with no recent
     /// activity and remove their state entries.
@@ -1640,7 +1655,7 @@ impl StreamJoinOperator {
         self.metrics.tracked_keys = self.key_metadata.len() as u64;
     }
 
-    /// F057: Checks if compaction should be skipped for a side due to asymmetric optimization.
+    /// Checks if compaction should be skipped for a side due to asymmetric optimization.
     #[must_use]
     pub fn should_skip_compaction(&self, side: JoinSide, current_time: i64) -> bool {
         if !self.asymmetric_compaction {
@@ -1666,8 +1681,20 @@ impl StreamJoinOperator {
     }
 
     /// Extracts the join key value from a record batch.
-    fn extract_key(batch: &RecordBatch, column_name: &str) -> Option<Vec<u8>> {
-        let column_index = batch.schema().index_of(column_name).ok()?;
+    ///
+    /// Caches the column index on first call to avoid per-event schema lookups.
+    fn extract_key(
+        batch: &RecordBatch,
+        column_name: &str,
+        cached_index: &mut Option<usize>,
+    ) -> Option<Vec<u8>> {
+        let column_index = if let Some(idx) = *cached_index {
+            idx
+        } else {
+            let idx = batch.schema().index_of(column_name).ok()?;
+            *cached_index = Some(idx);
+            idx
+        };
         let column = batch.column(column_index);
 
         // Handle different column types
@@ -1705,7 +1732,11 @@ impl StreamJoinOperator {
         key.extend_from_slice(prefix);
 
         // Use FxHash for the key value
-        let key_hash = fxhash::hash64(key_value);
+        let key_hash = {
+            let mut hasher = rustc_hash::FxHasher::default();
+            key_value.hash(&mut hasher);
+            hasher.finish()
+        };
         key.extend_from_slice(&key_hash.to_be_bytes());
         key.extend_from_slice(&timestamp.to_be_bytes());
         key.extend_from_slice(&event_id.to_be_bytes());
@@ -1756,7 +1787,11 @@ impl StreamJoinOperator {
         };
 
         // Build prefix for scanning: prefix + key_hash
-        let key_hash = fxhash::hash64(key_value);
+        let key_hash = {
+            let mut hasher = rustc_hash::FxHasher::default();
+            key_value.hash(&mut hasher);
+            hasher.finish()
+        };
         let mut scan_prefix = Vec::with_capacity(12);
         scan_prefix.extend_from_slice(prefix);
         scan_prefix.extend_from_slice(&key_hash.to_be_bytes());
@@ -1871,13 +1906,13 @@ impl StreamJoinOperator {
     ) -> OutputVec {
         let output = OutputVec::new();
 
-        // F057: Check asymmetric compaction - skip if side is idle
+        // Check asymmetric compaction - skip if side is idle
         if self.should_skip_compaction(side, ctx.processing_time) {
             self.metrics.asymmetric_skips += 1;
             // Don't skip the actual cleanup, but could be used for compaction
         }
 
-        // F057: Update per-key metadata before deleting
+        // Update per-key metadata before deleting
         if self.per_key_tracking && state_key.len() >= 12 {
             // Extract key hash from state key (bytes 4-12)
             if let Ok(hash_bytes) = state_key[4..12].try_into() {
@@ -1991,7 +2026,7 @@ impl Operator for StreamJoinOperator {
     }
 
     fn checkpoint(&self) -> OperatorState {
-        // Checkpoint the metrics, configuration, and F057 state
+        // Checkpoint the metrics, configuration, and optimization state
         // Use nested tuples to stay within rkyv's tuple size limit (max 12)
         // Format: ((config), (core_metrics), (f057_metrics, side_stats))
         let checkpoint_data = (
@@ -2007,7 +2042,7 @@ impl Operator for StreamJoinOperator {
                 self.metrics.right_events,
                 self.metrics.matches,
             ),
-            // Part 3: F057 metrics (5 elements)
+            // Part 3: optimization metrics (5 elements)
             (
                 self.metrics.cpu_friendly_encodes,
                 self.metrics.compact_encodes,
@@ -2015,7 +2050,7 @@ impl Operator for StreamJoinOperator {
                 self.metrics.idle_key_cleanups,
                 self.metrics.build_side_prunes,
             ),
-            // Part 4: F057 side stats (4 elements)
+            // Part 4: side stats (4 elements)
             (
                 self.left_stats.events_received,
                 self.right_stats.events_received,
@@ -2035,12 +2070,12 @@ impl Operator for StreamJoinOperator {
     }
 
     fn restore(&mut self, state: OperatorState) -> Result<(), OperatorError> {
-        // Extended checkpoint data type with F057 fields using nested tuples
+        // Extended checkpoint data type with optimization fields using nested tuples
         type CheckpointData = (
             (String, String, i64),     // config
             (u64, u64, u64),           // core metrics
-            (u64, u64, u64, u64, u64), // F057 metrics
-            (u64, u64, i64, i64),      // F057 side stats
+            (u64, u64, u64, u64, u64), // optimization metrics
+            (u64, u64, i64, i64),      // side stats
         );
         // Legacy checkpoint type for backward compatibility
         type LegacyCheckpointData = (String, String, i64, u64, u64, u64);
@@ -2052,7 +2087,7 @@ impl Operator for StreamJoinOperator {
             )));
         }
 
-        // Try to restore full F057 checkpoint first
+        // Try to restore full optimization checkpoint first
         if let Ok(archived) = rkyv::access::<rkyv::Archived<CheckpointData>, RkyvError>(&state.data)
         {
             if let Ok(data) = rkyv::deserialize::<CheckpointData, RkyvError>(archived) {
@@ -2615,7 +2650,7 @@ mod tests {
         assert_eq!(operator.metrics().matches, 1);
     }
 
-    // F057: Stream Join Optimization Tests
+    // Stream Join Optimization Tests
 
     #[test]
     fn test_f057_join_row_encoding_enum() {
@@ -3021,7 +3056,7 @@ mod tests {
         let mut restored = StreamJoinOperator::from_config(config2);
         restored.restore(checkpoint).unwrap();
 
-        // Verify F057 state was restored
+        // Verify optimization state was restored
         assert_eq!(restored.metrics().left_events, 100);
         assert_eq!(restored.metrics().right_events, 50);
         assert_eq!(restored.metrics().matches, 25);

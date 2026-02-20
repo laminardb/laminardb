@@ -1,4 +1,4 @@
-//! # `io_uring` Advanced Optimization (F067)
+//! # `io_uring` Advanced Optimization
 //!
 //! Implements advanced `io_uring` optimizations including SQPOLL mode, registered buffers,
 //! IOPOLL mode, and per-core ring management for sub-microsecond I/O latency.
@@ -9,7 +9,7 @@
 //! - **Registered Buffers**: Avoids per-operation buffer mapping overhead
 //! - **IOPOLL Mode**: Polls completions directly from `NVMe` queue (no interrupts)
 //! - **Per-Core Rings**: Each core has its own `io_uring` instance for thread-per-core
-//! - **Three-Ring I/O (F069)**: Separate latency/main/poll rings for optimal scheduling
+//! - **Three-Ring I/O**: Separate latency/main/poll rings for optimal scheduling
 //!
 //! ## Research Background
 //!
@@ -41,7 +41,7 @@
 //! let completions = manager.poll_completions();
 //! ```
 //!
-//! ## Three-Ring I/O (F069)
+//! ## Three-Ring I/O
 //!
 //! For optimal latency/throughput balance, use the three-ring reactor:
 //!

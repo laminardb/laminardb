@@ -49,7 +49,6 @@ use super::{
 use crate::state::{StateStore, StateStoreExt};
 use arrow_array::{Array, Int64Array, RecordBatch};
 use arrow_schema::{DataType, Field, Schema, SchemaRef};
-use fxhash::FxHashMap;
 use rkyv::{
     api::high::{HighDeserializer, HighSerializer, HighValidator},
     bytecheck::CheckBytes,
@@ -58,6 +57,7 @@ use rkyv::{
     util::AlignedVec,
     Archive, Deserialize as RkyvDeserialize, Serialize as RkyvSerialize,
 };
+use rustc_hash::FxHashMap;
 use std::marker::PhantomData;
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::Arc;
@@ -92,7 +92,12 @@ impl SessionId {
     /// Combines a hash of the operator ID with a monotonic counter to produce
     /// IDs that are unique across operators and invocations.
     pub fn generate(operator_id: &str, counter: &AtomicU64) -> Self {
-        let op_hash = fxhash::hash64(operator_id.as_bytes());
+        let op_hash = {
+            use std::hash::{Hash, Hasher};
+            let mut hasher = rustc_hash::FxHasher::default();
+            operator_id.as_bytes().hash(&mut hasher);
+            hasher.finish()
+        };
         let seq = counter.fetch_add(1, Ordering::Relaxed);
         Self(op_hash ^ seq)
     }
@@ -176,7 +181,7 @@ impl SessionMetadata {
 
     /// Merges another session into this one.
     ///
-    /// Takes the union of the two sessions' bounds. Used by F017C for
+    /// Takes the union of the two sessions' bounds. Used for
     /// session merging when late data bridges two previously separate sessions.
     fn merge(&mut self, other: &SessionMetadata) {
         self.start = self.start.min(other.start);
@@ -265,7 +270,7 @@ fn create_session_output_schema() -> SchemaRef {
 /// 1. **Start**: First event for a key creates a new session
 /// 2. **Extend**: Events within gap period extend the session
 /// 3. **Close**: Timer fires when gap expires, emitting results
-/// 4. **Merge**: Late data may merge previously separate sessions (F017C)
+/// 4. **Merge**: Late data may merge previously separate sessions
 ///
 /// # State Management
 ///
@@ -502,7 +507,7 @@ where
     /// Computes a hash for the key.
     fn key_hash(key: &[u8]) -> u64 {
         use std::hash::{Hash, Hasher};
-        let mut hasher = fxhash::FxHasher::default();
+        let mut hasher = rustc_hash::FxHasher::default();
         key.hash(&mut hasher);
         hasher.finish()
     }
@@ -677,7 +682,7 @@ where
         Some(Event::new(session.end, batch))
     }
 
-    /// Merges multiple overlapping sessions into one (F017C).
+    /// Merges multiple overlapping sessions into one.
     ///
     /// The first session in `overlapping` becomes the "winner" that absorbs all
     /// others. Each "loser" session has its accumulator merged into the winner,
@@ -783,7 +788,7 @@ where
         // Check if event is late
         let current_wm = ctx.watermark_generator.current_watermark();
         if current_wm > i64::MIN && self.is_late(event_time, current_wm) {
-            // F011B: EMIT FINAL drops late data entirely
+            // EMIT FINAL drops late data entirely
             if self.emit_strategy.drops_late_data() {
                 self.late_data_metrics.record_dropped();
                 return output;
@@ -827,7 +832,7 @@ where
                 }
             }
             _ => {
-                // Multiple overlaps — merge all into one session (F017C)
+                // Multiple overlaps — merge all into one session
                 session_id = self.merge_sessions(&mut index, &overlapping, ctx, &mut output);
                 // Extend the merged winner to include this event
                 if let Some(session) = index.get_mut(session_id) {
@@ -1921,7 +1926,7 @@ mod tests {
     }
 
     // ---------------------------------------------------------------
-    //  F017C: Session merging tests
+    //  Session merging tests
     // ---------------------------------------------------------------
 
     #[test]
@@ -2248,7 +2253,7 @@ mod tests {
     }
 
     // ---------------------------------------------------------------
-    //  F017D: Emit strategy verification tests
+    //  Emit strategy verification tests
     // ---------------------------------------------------------------
 
     #[test]
@@ -2466,7 +2471,7 @@ mod tests {
     }
 
     // ---------------------------------------------------------------
-    //  F017E: Timer persistence after checkpoint/restore
+    //  Timer persistence after checkpoint/restore
     // ---------------------------------------------------------------
 
     #[test]

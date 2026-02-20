@@ -81,7 +81,7 @@
 //! assert_eq!(tracker.current_watermark(), Some(Watermark::new(4000)));
 //! ```
 //!
-//! ## Per-Key Watermark Tracking (F065)
+//! ## Per-Key Watermark Tracking
 //!
 //! For multi-tenant workloads or scenarios with significant event-time skew between
 //! keys, use [`KeyedWatermarkTracker`] to achieve 99%+ accuracy vs 63-67% with global:
@@ -110,7 +110,7 @@
 //! assert!(tracker.is_late(&"tenant_a".to_string(), 3000));
 //! ```
 //!
-//! ## Watermark Alignment Groups (F066)
+//! ## Watermark Alignment Groups
 //!
 //! For stream-stream joins and multi-source operators, use [`WatermarkAlignmentGroup`]
 //! to prevent unbounded state growth when sources have different processing speeds:

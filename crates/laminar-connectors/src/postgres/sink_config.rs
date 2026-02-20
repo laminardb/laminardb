@@ -60,7 +60,7 @@ pub struct PostgresSinkConfig {
     /// Whether to create the target table if it doesn't exist.
     pub auto_create_table: bool,
 
-    /// Whether to handle changelog/retraction records (F063 Z-sets).
+    /// Whether to handle changelog/retraction records.
     pub changelog_mode: bool,
 
     /// Delivery guarantee level.

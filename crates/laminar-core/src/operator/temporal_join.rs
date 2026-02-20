@@ -1,4 +1,4 @@
-//! # Temporal Join Operators (F021)
+//! # Temporal Join Operators
 //!
 //! Join streaming events with versioned tables using point-in-time lookups.
 //! Temporal joins return the table value that was valid at the event's timestamp,
@@ -64,10 +64,10 @@ use super::{
 };
 use arrow_array::{Array, ArrayRef, Int64Array, RecordBatch, StringArray};
 use arrow_schema::{DataType, Field, Schema, SchemaRef};
-use fxhash::FxHashMap;
 use rkyv::{
     rancor::Error as RkyvError, Archive, Deserialize as RkyvDeserialize, Serialize as RkyvSerialize,
 };
+use rustc_hash::FxHashMap;
 use smallvec::SmallVec;
 use std::collections::BTreeMap;
 use std::sync::atomic::{AtomicU64, Ordering};
@@ -528,6 +528,12 @@ pub struct TemporalJoinOperator {
     stream_schema: Option<SchemaRef>,
     /// Table schema.
     table_schema: Option<SchemaRef>,
+    /// Cached column index for stream key — resolved on first stream event.
+    stream_key_index: Option<usize>,
+    /// Cached column index for table key — resolved on first table event.
+    table_key_index: Option<usize>,
+    /// Cached column index for table timestamp — resolved on first table event.
+    table_ts_index: Option<usize>,
 }
 
 impl TemporalJoinOperator {
@@ -549,6 +555,9 @@ impl TemporalJoinOperator {
             output_schema: None,
             stream_schema: None,
             table_schema: None,
+            stream_key_index: None,
+            table_key_index: None,
+            table_ts_index: None,
         }
     }
 
@@ -607,7 +616,11 @@ impl TemporalJoinOperator {
         let mut output = OutputVec::new();
 
         // Extract join key
-        let Some(key_value) = Self::extract_key(&event.data, &self.config.stream_key_column) else {
+        let Some(key_value) = Self::extract_key(
+            &event.data,
+            &self.config.stream_key_column,
+            &mut self.stream_key_index,
+        ) else {
             return output;
         };
 
@@ -661,12 +674,20 @@ impl TemporalJoinOperator {
         }
 
         // Extract key and version
-        let Some(key_value) = Self::extract_key(&event.data, &self.config.table_key_column) else {
+        let Some(key_value) = Self::extract_key(
+            &event.data,
+            &self.config.table_key_column,
+            &mut self.table_key_index,
+        ) else {
             return OutputVec::new();
         };
 
-        let version_ts = Self::extract_timestamp(&event.data, &self.config.table_version_column)
-            .unwrap_or(event.timestamp);
+        let version_ts = Self::extract_timestamp(
+            &event.data,
+            &self.config.table_version_column,
+            &mut self.table_ts_index,
+        )
+        .unwrap_or(event.timestamp);
 
         // Create and store table row
         let Ok(row) = TableRow::new(version_ts, key_value.clone(), &event.data) else {
@@ -868,8 +889,20 @@ impl TemporalJoinOperator {
     }
 
     /// Extracts the key value from a record batch.
-    fn extract_key(batch: &RecordBatch, column_name: &str) -> Option<Vec<u8>> {
-        let column_index = batch.schema().index_of(column_name).ok()?;
+    ///
+    /// Caches the column index on first call to avoid per-event schema lookups.
+    fn extract_key(
+        batch: &RecordBatch,
+        column_name: &str,
+        cached_index: &mut Option<usize>,
+    ) -> Option<Vec<u8>> {
+        let column_index = if let Some(idx) = *cached_index {
+            idx
+        } else {
+            let idx = batch.schema().index_of(column_name).ok()?;
+            *cached_index = Some(idx);
+            idx
+        };
         let column = batch.column(column_index);
 
         if let Some(string_array) = column.as_any().downcast_ref::<StringArray>() {
@@ -890,8 +923,20 @@ impl TemporalJoinOperator {
     }
 
     /// Extracts a timestamp value from a record batch.
-    fn extract_timestamp(batch: &RecordBatch, column_name: &str) -> Option<i64> {
-        let column_index = batch.schema().index_of(column_name).ok()?;
+    ///
+    /// Caches the column index on first call to avoid per-event schema lookups.
+    fn extract_timestamp(
+        batch: &RecordBatch,
+        column_name: &str,
+        cached_index: &mut Option<usize>,
+    ) -> Option<i64> {
+        let column_index = if let Some(idx) = *cached_index {
+            idx
+        } else {
+            let idx = batch.schema().index_of(column_name).ok()?;
+            *cached_index = Some(idx);
+            idx
+        };
         let column = batch.column(column_index);
 
         if let Some(int_array) = column.as_any().downcast_ref::<Int64Array>() {

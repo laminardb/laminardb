@@ -5,13 +5,13 @@
 //!
 //! # Supported Databases
 //!
-//! - **PostgreSQL** (F027): Logical replication via `pgoutput` plugin
-//! - **MySQL** (F028): Binary log replication with GTID support
+//! - **PostgreSQL**: Logical replication via `pgoutput` plugin
+//! - **MySQL**: Binary log replication with GTID support
 
-/// PostgreSQL logical replication CDC source connector (F027).
+/// PostgreSQL logical replication CDC source connector.
 #[cfg(feature = "postgres-cdc")]
 pub mod postgres;
 
-/// MySQL binlog replication CDC source connector (F028).
+/// MySQL binlog replication CDC source connector.
 #[cfg(feature = "mysql-cdc")]
 pub mod mysql;
