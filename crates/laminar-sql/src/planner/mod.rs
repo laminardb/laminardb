@@ -599,24 +599,35 @@ fn object_name_to_string(name: &ObjectName) -> String {
 #[derive(Debug, thiserror::Error)]
 pub enum PlanningError {
     /// Unsupported SQL feature
-    #[error("Unsupported SQL: {0}")]
     UnsupportedSql(String),
 
     /// Invalid query
-    #[error("Invalid query: {0}")]
     InvalidQuery(String),
 
     /// Source not found
-    #[error("Source not found: {0}")]
     SourceNotFound(String),
 
     /// Sink not found
-    #[error("Sink not found: {0}")]
     SinkNotFound(String),
 
-    /// `DataFusion` error during logical plan creation
-    #[error("DataFusion error: {0}")]
+    /// `DataFusion` error during logical plan creation (translated on display)
     DataFusion(#[from] datafusion_common::DataFusionError),
+}
+
+impl std::fmt::Display for PlanningError {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            Self::UnsupportedSql(msg) => write!(f, "Unsupported SQL: {msg}"),
+            Self::InvalidQuery(msg) => write!(f, "Invalid query: {msg}"),
+            Self::SourceNotFound(name) => write!(f, "Source not found: {name}"),
+            Self::SinkNotFound(name) => write!(f, "Sink not found: {name}"),
+            Self::DataFusion(e) => {
+                let translated =
+                    crate::error::translate_datafusion_error(&e.to_string());
+                write!(f, "{translated}")
+            }
+        }
+    }
 }
 
 #[cfg(test)]
