@@ -21,10 +21,7 @@ use std::hash::{Hash, Hasher};
 use std::sync::Arc;
 
 use arrow::datatypes::DataType;
-use arrow_array::{
-    Array, ArrayRef, MapArray, StructArray,
-    builder::BooleanBuilder,
-};
+use arrow_array::{builder::BooleanBuilder, Array, ArrayRef, MapArray, StructArray};
 use arrow_schema::{Field, Fields};
 use datafusion_common::Result;
 use datafusion_expr::{
@@ -54,17 +51,21 @@ fn scalar_string_value(cv: &ColumnarValue) -> Result<String> {
     match cv {
         ColumnarValue::Scalar(s) => {
             let arr = s.to_array_of_size(1)?;
-            let str_arr = arr.as_any().downcast_ref::<arrow_array::StringArray>()
-                .ok_or_else(|| datafusion_common::DataFusionError::Internal(
-                    "expected Utf8 argument".into(),
-                ))?;
+            let str_arr = arr
+                .as_any()
+                .downcast_ref::<arrow_array::StringArray>()
+                .ok_or_else(|| {
+                    datafusion_common::DataFusionError::Internal("expected Utf8 argument".into())
+                })?;
             Ok(str_arr.value(0).to_string())
         }
         ColumnarValue::Array(arr) => {
-            let str_arr = arr.as_any().downcast_ref::<arrow_array::StringArray>()
-                .ok_or_else(|| datafusion_common::DataFusionError::Internal(
-                    "expected Utf8 argument".into(),
-                ))?;
+            let str_arr = arr
+                .as_any()
+                .downcast_ref::<arrow_array::StringArray>()
+                .ok_or_else(|| {
+                    datafusion_common::DataFusionError::Internal("expected Utf8 argument".into())
+                })?;
             Ok(str_arr.value(0).to_string())
         }
     }
@@ -85,30 +86,39 @@ impl StructExtract {
     #[must_use]
     pub fn new() -> Self {
         Self {
-            signature: Signature::new(
-                TypeSignature::Any(2),
-                Volatility::Immutable,
-            ),
+            signature: Signature::new(TypeSignature::Any(2), Volatility::Immutable),
         }
     }
 }
 
 impl Default for StructExtract {
-    fn default() -> Self { Self::new() }
+    fn default() -> Self {
+        Self::new()
+    }
 }
 
 impl PartialEq for StructExtract {
-    fn eq(&self, _other: &Self) -> bool { true }
+    fn eq(&self, _other: &Self) -> bool {
+        true
+    }
 }
 impl Eq for StructExtract {}
 impl Hash for StructExtract {
-    fn hash<H: Hasher>(&self, state: &mut H) { "struct_extract".hash(state); }
+    fn hash<H: Hasher>(&self, state: &mut H) {
+        "struct_extract".hash(state);
+    }
 }
 
 impl ScalarUDFImpl for StructExtract {
-    fn as_any(&self) -> &dyn Any { self }
-    fn name(&self) -> &'static str { "struct_extract" }
-    fn signature(&self) -> &Signature { &self.signature }
+    fn as_any(&self) -> &dyn Any {
+        self
+    }
+    fn name(&self) -> &'static str {
+        "struct_extract"
+    }
+    fn signature(&self) -> &Signature {
+        &self.signature
+    }
 
     fn return_type(&self, _arg_types: &[DataType]) -> Result<DataType> {
         // Dynamic return type based on the struct field.
@@ -121,16 +131,19 @@ impl ScalarUDFImpl for StructExtract {
         let struct_arr = expanded[0]
             .as_any()
             .downcast_ref::<StructArray>()
-            .ok_or_else(|| datafusion_common::DataFusionError::Internal(
-                "struct_extract: first arg must be Struct".into(),
-            ))?;
+            .ok_or_else(|| {
+                datafusion_common::DataFusionError::Internal(
+                    "struct_extract: first arg must be Struct".into(),
+                )
+            })?;
 
         let field_name = scalar_string_value(&args.args[1])?;
 
-        let (idx, _) = struct_arr.fields().find(&field_name)
-            .ok_or_else(|| datafusion_common::DataFusionError::Internal(
-                format!("struct_extract: field '{field_name}' not found in struct"),
-            ))?;
+        let (idx, _) = struct_arr.fields().find(&field_name).ok_or_else(|| {
+            datafusion_common::DataFusionError::Internal(format!(
+                "struct_extract: field '{field_name}' not found in struct"
+            ))
+        })?;
 
         Ok(ColumnarValue::Array(struct_arr.column(idx).clone()))
     }
@@ -151,29 +164,38 @@ impl StructSet {
     #[must_use]
     pub fn new() -> Self {
         Self {
-            signature: Signature::new(
-                TypeSignature::Any(3),
-                Volatility::Immutable,
-            ),
+            signature: Signature::new(TypeSignature::Any(3), Volatility::Immutable),
         }
     }
 }
 
 impl Default for StructSet {
-    fn default() -> Self { Self::new() }
+    fn default() -> Self {
+        Self::new()
+    }
 }
 impl PartialEq for StructSet {
-    fn eq(&self, _other: &Self) -> bool { true }
+    fn eq(&self, _other: &Self) -> bool {
+        true
+    }
 }
 impl Eq for StructSet {}
 impl Hash for StructSet {
-    fn hash<H: Hasher>(&self, state: &mut H) { "struct_set".hash(state); }
+    fn hash<H: Hasher>(&self, state: &mut H) {
+        "struct_set".hash(state);
+    }
 }
 
 impl ScalarUDFImpl for StructSet {
-    fn as_any(&self) -> &dyn Any { self }
-    fn name(&self) -> &'static str { "struct_set" }
-    fn signature(&self) -> &Signature { &self.signature }
+    fn as_any(&self) -> &dyn Any {
+        self
+    }
+    fn name(&self) -> &'static str {
+        "struct_set"
+    }
+    fn signature(&self) -> &Signature {
+        &self.signature
+    }
 
     fn return_type(&self, _arg_types: &[DataType]) -> Result<DataType> {
         // Return type is a struct; exact fields depend on input.
@@ -185,9 +207,11 @@ impl ScalarUDFImpl for StructSet {
         let struct_arr = expanded[0]
             .as_any()
             .downcast_ref::<StructArray>()
-            .ok_or_else(|| datafusion_common::DataFusionError::Internal(
-                "struct_set: first arg must be Struct".into(),
-            ))?;
+            .ok_or_else(|| {
+                datafusion_common::DataFusionError::Internal(
+                    "struct_set: first arg must be Struct".into(),
+                )
+            })?;
 
         let field_name = scalar_string_value(&args.args[1])?;
         let new_value = Arc::clone(&expanded[2]);
@@ -244,29 +268,38 @@ impl StructDrop {
     #[must_use]
     pub fn new() -> Self {
         Self {
-            signature: Signature::new(
-                TypeSignature::Any(2),
-                Volatility::Immutable,
-            ),
+            signature: Signature::new(TypeSignature::Any(2), Volatility::Immutable),
         }
     }
 }
 
 impl Default for StructDrop {
-    fn default() -> Self { Self::new() }
+    fn default() -> Self {
+        Self::new()
+    }
 }
 impl PartialEq for StructDrop {
-    fn eq(&self, _other: &Self) -> bool { true }
+    fn eq(&self, _other: &Self) -> bool {
+        true
+    }
 }
 impl Eq for StructDrop {}
 impl Hash for StructDrop {
-    fn hash<H: Hasher>(&self, state: &mut H) { "struct_drop".hash(state); }
+    fn hash<H: Hasher>(&self, state: &mut H) {
+        "struct_drop".hash(state);
+    }
 }
 
 impl ScalarUDFImpl for StructDrop {
-    fn as_any(&self) -> &dyn Any { self }
-    fn name(&self) -> &'static str { "struct_drop" }
-    fn signature(&self) -> &Signature { &self.signature }
+    fn as_any(&self) -> &dyn Any {
+        self
+    }
+    fn name(&self) -> &'static str {
+        "struct_drop"
+    }
+    fn signature(&self) -> &Signature {
+        &self.signature
+    }
 
     fn return_type(&self, _arg_types: &[DataType]) -> Result<DataType> {
         Ok(DataType::Utf8)
@@ -277,9 +310,11 @@ impl ScalarUDFImpl for StructDrop {
         let struct_arr = expanded[0]
             .as_any()
             .downcast_ref::<StructArray>()
-            .ok_or_else(|| datafusion_common::DataFusionError::Internal(
-                "struct_drop: first arg must be Struct".into(),
-            ))?;
+            .ok_or_else(|| {
+                datafusion_common::DataFusionError::Internal(
+                    "struct_drop: first arg must be Struct".into(),
+                )
+            })?;
 
         let field_name = scalar_string_value(&args.args[1])?;
 
@@ -323,29 +358,38 @@ impl StructRename {
     #[must_use]
     pub fn new() -> Self {
         Self {
-            signature: Signature::new(
-                TypeSignature::Any(3),
-                Volatility::Immutable,
-            ),
+            signature: Signature::new(TypeSignature::Any(3), Volatility::Immutable),
         }
     }
 }
 
 impl Default for StructRename {
-    fn default() -> Self { Self::new() }
+    fn default() -> Self {
+        Self::new()
+    }
 }
 impl PartialEq for StructRename {
-    fn eq(&self, _other: &Self) -> bool { true }
+    fn eq(&self, _other: &Self) -> bool {
+        true
+    }
 }
 impl Eq for StructRename {}
 impl Hash for StructRename {
-    fn hash<H: Hasher>(&self, state: &mut H) { "struct_rename".hash(state); }
+    fn hash<H: Hasher>(&self, state: &mut H) {
+        "struct_rename".hash(state);
+    }
 }
 
 impl ScalarUDFImpl for StructRename {
-    fn as_any(&self) -> &dyn Any { self }
-    fn name(&self) -> &'static str { "struct_rename" }
-    fn signature(&self) -> &Signature { &self.signature }
+    fn as_any(&self) -> &dyn Any {
+        self
+    }
+    fn name(&self) -> &'static str {
+        "struct_rename"
+    }
+    fn signature(&self) -> &Signature {
+        &self.signature
+    }
 
     fn return_type(&self, _arg_types: &[DataType]) -> Result<DataType> {
         Ok(DataType::Utf8)
@@ -356,9 +400,11 @@ impl ScalarUDFImpl for StructRename {
         let struct_arr = expanded[0]
             .as_any()
             .downcast_ref::<StructArray>()
-            .ok_or_else(|| datafusion_common::DataFusionError::Internal(
-                "struct_rename: first arg must be Struct".into(),
-            ))?;
+            .ok_or_else(|| {
+                datafusion_common::DataFusionError::Internal(
+                    "struct_rename: first arg must be Struct".into(),
+                )
+            })?;
 
         let old_name = scalar_string_value(&args.args[1])?;
         let new_name = scalar_string_value(&args.args[2])?;
@@ -403,29 +449,38 @@ impl StructMerge {
     #[must_use]
     pub fn new() -> Self {
         Self {
-            signature: Signature::new(
-                TypeSignature::Any(2),
-                Volatility::Immutable,
-            ),
+            signature: Signature::new(TypeSignature::Any(2), Volatility::Immutable),
         }
     }
 }
 
 impl Default for StructMerge {
-    fn default() -> Self { Self::new() }
+    fn default() -> Self {
+        Self::new()
+    }
 }
 impl PartialEq for StructMerge {
-    fn eq(&self, _other: &Self) -> bool { true }
+    fn eq(&self, _other: &Self) -> bool {
+        true
+    }
 }
 impl Eq for StructMerge {}
 impl Hash for StructMerge {
-    fn hash<H: Hasher>(&self, state: &mut H) { "struct_merge".hash(state); }
+    fn hash<H: Hasher>(&self, state: &mut H) {
+        "struct_merge".hash(state);
+    }
 }
 
 impl ScalarUDFImpl for StructMerge {
-    fn as_any(&self) -> &dyn Any { self }
-    fn name(&self) -> &'static str { "struct_merge" }
-    fn signature(&self) -> &Signature { &self.signature }
+    fn as_any(&self) -> &dyn Any {
+        self
+    }
+    fn name(&self) -> &'static str {
+        "struct_merge"
+    }
+    fn signature(&self) -> &Signature {
+        &self.signature
+    }
 
     fn return_type(&self, _arg_types: &[DataType]) -> Result<DataType> {
         Ok(DataType::Utf8)
@@ -436,15 +491,19 @@ impl ScalarUDFImpl for StructMerge {
         let s1 = expanded[0]
             .as_any()
             .downcast_ref::<StructArray>()
-            .ok_or_else(|| datafusion_common::DataFusionError::Internal(
-                "struct_merge: first arg must be Struct".into(),
-            ))?;
+            .ok_or_else(|| {
+                datafusion_common::DataFusionError::Internal(
+                    "struct_merge: first arg must be Struct".into(),
+                )
+            })?;
         let s2 = expanded[1]
             .as_any()
             .downcast_ref::<StructArray>()
-            .ok_or_else(|| datafusion_common::DataFusionError::Internal(
-                "struct_merge: second arg must be Struct".into(),
-            ))?;
+            .ok_or_else(|| {
+                datafusion_common::DataFusionError::Internal(
+                    "struct_merge: second arg must be Struct".into(),
+                )
+            })?;
 
         let mut new_fields: Vec<Arc<Field>> = Vec::new();
         let mut new_columns: Vec<ArrayRef> = Vec::new();
@@ -466,11 +525,7 @@ impl ScalarUDFImpl for StructMerge {
             new_columns.push(s2.column(i).clone());
         }
 
-        let result = StructArray::try_new(
-            Fields::from(new_fields),
-            new_columns,
-            None,
-        )?;
+        let result = StructArray::try_new(Fields::from(new_fields), new_columns, None)?;
         Ok(ColumnarValue::Array(Arc::new(result)))
     }
 }
@@ -490,29 +545,38 @@ impl MapKeys {
     #[must_use]
     pub fn new() -> Self {
         Self {
-            signature: Signature::new(
-                TypeSignature::Any(1),
-                Volatility::Immutable,
-            ),
+            signature: Signature::new(TypeSignature::Any(1), Volatility::Immutable),
         }
     }
 }
 
 impl Default for MapKeys {
-    fn default() -> Self { Self::new() }
+    fn default() -> Self {
+        Self::new()
+    }
 }
 impl PartialEq for MapKeys {
-    fn eq(&self, _other: &Self) -> bool { true }
+    fn eq(&self, _other: &Self) -> bool {
+        true
+    }
 }
 impl Eq for MapKeys {}
 impl Hash for MapKeys {
-    fn hash<H: Hasher>(&self, state: &mut H) { "map_keys".hash(state); }
+    fn hash<H: Hasher>(&self, state: &mut H) {
+        "map_keys".hash(state);
+    }
 }
 
 impl ScalarUDFImpl for MapKeys {
-    fn as_any(&self) -> &dyn Any { self }
-    fn name(&self) -> &'static str { "map_keys" }
-    fn signature(&self) -> &Signature { &self.signature }
+    fn as_any(&self) -> &dyn Any {
+        self
+    }
+    fn name(&self) -> &'static str {
+        "map_keys"
+    }
+    fn signature(&self) -> &Signature {
+        &self.signature
+    }
 
     fn return_type(&self, arg_types: &[DataType]) -> Result<DataType> {
         match &arg_types[0] {
@@ -526,9 +590,17 @@ impl ScalarUDFImpl for MapKeys {
                         ))));
                     }
                 }
-                Ok(DataType::List(Arc::new(Field::new("item", DataType::Utf8, true))))
+                Ok(DataType::List(Arc::new(Field::new(
+                    "item",
+                    DataType::Utf8,
+                    true,
+                ))))
             }
-            _ => Ok(DataType::List(Arc::new(Field::new("item", DataType::Utf8, true)))),
+            _ => Ok(DataType::List(Arc::new(Field::new(
+                "item",
+                DataType::Utf8,
+                true,
+            )))),
         }
     }
 
@@ -537,9 +609,9 @@ impl ScalarUDFImpl for MapKeys {
         let map_arr = expanded[0]
             .as_any()
             .downcast_ref::<MapArray>()
-            .ok_or_else(|| datafusion_common::DataFusionError::Internal(
-                "map_keys: arg must be Map".into(),
-            ))?;
+            .ok_or_else(|| {
+                datafusion_common::DataFusionError::Internal("map_keys: arg must be Map".into())
+            })?;
 
         Ok(ColumnarValue::Array(Arc::new(map_arr.keys().clone())))
     }
@@ -560,29 +632,38 @@ impl MapValues {
     #[must_use]
     pub fn new() -> Self {
         Self {
-            signature: Signature::new(
-                TypeSignature::Any(1),
-                Volatility::Immutable,
-            ),
+            signature: Signature::new(TypeSignature::Any(1), Volatility::Immutable),
         }
     }
 }
 
 impl Default for MapValues {
-    fn default() -> Self { Self::new() }
+    fn default() -> Self {
+        Self::new()
+    }
 }
 impl PartialEq for MapValues {
-    fn eq(&self, _other: &Self) -> bool { true }
+    fn eq(&self, _other: &Self) -> bool {
+        true
+    }
 }
 impl Eq for MapValues {}
 impl Hash for MapValues {
-    fn hash<H: Hasher>(&self, state: &mut H) { "map_values".hash(state); }
+    fn hash<H: Hasher>(&self, state: &mut H) {
+        "map_values".hash(state);
+    }
 }
 
 impl ScalarUDFImpl for MapValues {
-    fn as_any(&self) -> &dyn Any { self }
-    fn name(&self) -> &'static str { "map_values" }
-    fn signature(&self) -> &Signature { &self.signature }
+    fn as_any(&self) -> &dyn Any {
+        self
+    }
+    fn name(&self) -> &'static str {
+        "map_values"
+    }
+    fn signature(&self) -> &Signature {
+        &self.signature
+    }
 
     fn return_type(&self, arg_types: &[DataType]) -> Result<DataType> {
         match &arg_types[0] {
@@ -597,9 +678,17 @@ impl ScalarUDFImpl for MapValues {
                         ))));
                     }
                 }
-                Ok(DataType::List(Arc::new(Field::new("item", DataType::Utf8, true))))
+                Ok(DataType::List(Arc::new(Field::new(
+                    "item",
+                    DataType::Utf8,
+                    true,
+                ))))
             }
-            _ => Ok(DataType::List(Arc::new(Field::new("item", DataType::Utf8, true)))),
+            _ => Ok(DataType::List(Arc::new(Field::new(
+                "item",
+                DataType::Utf8,
+                true,
+            )))),
         }
     }
 
@@ -608,9 +697,9 @@ impl ScalarUDFImpl for MapValues {
         let map_arr = expanded[0]
             .as_any()
             .downcast_ref::<MapArray>()
-            .ok_or_else(|| datafusion_common::DataFusionError::Internal(
-                "map_values: arg must be Map".into(),
-            ))?;
+            .ok_or_else(|| {
+                datafusion_common::DataFusionError::Internal("map_values: arg must be Map".into())
+            })?;
 
         Ok(ColumnarValue::Array(Arc::new(map_arr.values().clone())))
     }
@@ -631,29 +720,38 @@ impl MapContainsKey {
     #[must_use]
     pub fn new() -> Self {
         Self {
-            signature: Signature::new(
-                TypeSignature::Any(2),
-                Volatility::Immutable,
-            ),
+            signature: Signature::new(TypeSignature::Any(2), Volatility::Immutable),
         }
     }
 }
 
 impl Default for MapContainsKey {
-    fn default() -> Self { Self::new() }
+    fn default() -> Self {
+        Self::new()
+    }
 }
 impl PartialEq for MapContainsKey {
-    fn eq(&self, _other: &Self) -> bool { true }
+    fn eq(&self, _other: &Self) -> bool {
+        true
+    }
 }
 impl Eq for MapContainsKey {}
 impl Hash for MapContainsKey {
-    fn hash<H: Hasher>(&self, state: &mut H) { "map_contains_key".hash(state); }
+    fn hash<H: Hasher>(&self, state: &mut H) {
+        "map_contains_key".hash(state);
+    }
 }
 
 impl ScalarUDFImpl for MapContainsKey {
-    fn as_any(&self) -> &dyn Any { self }
-    fn name(&self) -> &'static str { "map_contains_key" }
-    fn signature(&self) -> &Signature { &self.signature }
+    fn as_any(&self) -> &dyn Any {
+        self
+    }
+    fn name(&self) -> &'static str {
+        "map_contains_key"
+    }
+    fn signature(&self) -> &Signature {
+        &self.signature
+    }
 
     fn return_type(&self, _arg_types: &[DataType]) -> Result<DataType> {
         Ok(DataType::Boolean)
@@ -665,21 +763,23 @@ impl ScalarUDFImpl for MapContainsKey {
         let map_arr = expanded[0]
             .as_any()
             .downcast_ref::<MapArray>()
-            .ok_or_else(|| datafusion_common::DataFusionError::Internal(
-                "map_contains_key: first arg must be Map".into(),
-            ))?;
+            .ok_or_else(|| {
+                datafusion_common::DataFusionError::Internal(
+                    "map_contains_key: first arg must be Map".into(),
+                )
+            })?;
 
         let search_key = expanded[1]
             .as_any()
             .downcast_ref::<arrow_array::StringArray>()
-            .ok_or_else(|| datafusion_common::DataFusionError::Internal(
-                "map_contains_key: second arg must be Utf8".into(),
-            ))?;
+            .ok_or_else(|| {
+                datafusion_common::DataFusionError::Internal(
+                    "map_contains_key: second arg must be Utf8".into(),
+                )
+            })?;
 
         let keys_col = map_arr.keys();
-        let keys_str = keys_col
-            .as_any()
-            .downcast_ref::<arrow_array::StringArray>();
+        let keys_str = keys_col.as_any().downcast_ref::<arrow_array::StringArray>();
 
         let mut builder = BooleanBuilder::with_capacity(map_arr.len());
 
@@ -721,29 +821,38 @@ impl MapFromArrays {
     #[must_use]
     pub fn new() -> Self {
         Self {
-            signature: Signature::new(
-                TypeSignature::Any(2),
-                Volatility::Immutable,
-            ),
+            signature: Signature::new(TypeSignature::Any(2), Volatility::Immutable),
         }
     }
 }
 
 impl Default for MapFromArrays {
-    fn default() -> Self { Self::new() }
+    fn default() -> Self {
+        Self::new()
+    }
 }
 impl PartialEq for MapFromArrays {
-    fn eq(&self, _other: &Self) -> bool { true }
+    fn eq(&self, _other: &Self) -> bool {
+        true
+    }
 }
 impl Eq for MapFromArrays {}
 impl Hash for MapFromArrays {
-    fn hash<H: Hasher>(&self, state: &mut H) { "map_from_arrays".hash(state); }
+    fn hash<H: Hasher>(&self, state: &mut H) {
+        "map_from_arrays".hash(state);
+    }
 }
 
 impl ScalarUDFImpl for MapFromArrays {
-    fn as_any(&self) -> &dyn Any { self }
-    fn name(&self) -> &'static str { "map_from_arrays" }
-    fn signature(&self) -> &Signature { &self.signature }
+    fn as_any(&self) -> &dyn Any {
+        self
+    }
+    fn name(&self) -> &'static str {
+        "map_from_arrays"
+    }
+    fn signature(&self) -> &Signature {
+        &self.signature
+    }
 
     fn return_type(&self, arg_types: &[DataType]) -> Result<DataType> {
         let key_type = match &arg_types[0] {
@@ -771,15 +880,19 @@ impl ScalarUDFImpl for MapFromArrays {
         let keys_list = expanded[0]
             .as_any()
             .downcast_ref::<arrow_array::ListArray>()
-            .ok_or_else(|| datafusion_common::DataFusionError::Internal(
-                "map_from_arrays: first arg must be List".into(),
-            ))?;
+            .ok_or_else(|| {
+                datafusion_common::DataFusionError::Internal(
+                    "map_from_arrays: first arg must be List".into(),
+                )
+            })?;
         let values_list = expanded[1]
             .as_any()
             .downcast_ref::<arrow_array::ListArray>()
-            .ok_or_else(|| datafusion_common::DataFusionError::Internal(
-                "map_from_arrays: second arg must be List".into(),
-            ))?;
+            .ok_or_else(|| {
+                datafusion_common::DataFusionError::Internal(
+                    "map_from_arrays: second arg must be List".into(),
+                )
+            })?;
 
         // Build the MapArray from key/value ListArrays.
         let offsets = keys_list.offsets().clone();
@@ -789,24 +902,10 @@ impl ScalarUDFImpl for MapFromArrays {
         let key_field = Field::new("key", key_values.data_type().clone(), false);
         let val_field = Field::new("value", val_values.data_type().clone(), true);
         let struct_fields = Fields::from(vec![key_field.clone(), val_field.clone()]);
-        let entries = StructArray::try_new(
-            struct_fields,
-            vec![key_values, val_values],
-            None,
-        )?;
+        let entries = StructArray::try_new(struct_fields, vec![key_values, val_values], None)?;
 
-        let entries_field = Field::new(
-            "entries",
-            entries.data_type().clone(),
-            false,
-        );
-        let map = MapArray::try_new(
-            Arc::new(entries_field),
-            offsets,
-            entries,
-            None,
-            false,
-        )?;
+        let entries_field = Field::new("entries", entries.data_type().clone(), false);
+        let map = MapArray::try_new(Arc::new(entries_field), offsets, entries, None, false)?;
         Ok(ColumnarValue::Array(Arc::new(map)))
     }
 }
@@ -814,8 +913,8 @@ impl ScalarUDFImpl for MapFromArrays {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use arrow_array::*;
     use arrow_array::builder::*;
+    use arrow_array::*;
     use arrow_schema::{DataType, Field, Fields};
     use datafusion::prelude::*;
     use datafusion_common::config::ConfigOptions;
@@ -878,9 +977,7 @@ mod tests {
             .invoke_with_args(ScalarFunctionArgs {
                 args: vec![
                     ColumnarValue::Array(Arc::new(struct_arr)),
-                    ColumnarValue::Scalar(
-                        datafusion_common::ScalarValue::Utf8(Some("b".into())),
-                    ),
+                    ColumnarValue::Scalar(datafusion_common::ScalarValue::Utf8(Some("b".into()))),
                 ],
                 number_rows: 0,
                 arg_fields: vec![],
@@ -922,9 +1019,7 @@ mod tests {
             .invoke_with_args(ScalarFunctionArgs {
                 args: vec![
                     ColumnarValue::Array(Arc::new(struct_arr)),
-                    ColumnarValue::Scalar(
-                        datafusion_common::ScalarValue::Utf8(Some("b".into())),
-                    ),
+                    ColumnarValue::Scalar(datafusion_common::ScalarValue::Utf8(Some("b".into()))),
                 ],
                 number_rows: 0,
                 arg_fields: vec![],
@@ -946,27 +1041,21 @@ mod tests {
 
     #[test]
     fn test_struct_rename() {
-        let fields = Fields::from(vec![
-            Field::new("old_name", DataType::Int64, false),
-        ]);
-        let struct_arr = StructArray::try_new(
-            fields,
-            vec![Arc::new(Int64Array::from(vec![42]))],
-            None,
-        )
-        .unwrap();
+        let fields = Fields::from(vec![Field::new("old_name", DataType::Int64, false)]);
+        let struct_arr =
+            StructArray::try_new(fields, vec![Arc::new(Int64Array::from(vec![42]))], None).unwrap();
 
         let udf = StructRename::new();
         let result = udf
             .invoke_with_args(ScalarFunctionArgs {
                 args: vec![
                     ColumnarValue::Array(Arc::new(struct_arr)),
-                    ColumnarValue::Scalar(
-                        datafusion_common::ScalarValue::Utf8(Some("old_name".into())),
-                    ),
-                    ColumnarValue::Scalar(
-                        datafusion_common::ScalarValue::Utf8(Some("new_name".into())),
-                    ),
+                    ColumnarValue::Scalar(datafusion_common::ScalarValue::Utf8(Some(
+                        "old_name".into(),
+                    ))),
+                    ColumnarValue::Scalar(datafusion_common::ScalarValue::Utf8(Some(
+                        "new_name".into(),
+                    ))),
                 ],
                 number_rows: 0,
                 arg_fields: vec![],
@@ -1062,9 +1151,7 @@ mod tests {
             .invoke_with_args(ScalarFunctionArgs {
                 args: vec![
                     ColumnarValue::Array(Arc::new(map_arr.clone())),
-                    ColumnarValue::Scalar(
-                        datafusion_common::ScalarValue::Utf8(Some("x".into())),
-                    ),
+                    ColumnarValue::Scalar(datafusion_common::ScalarValue::Utf8(Some("x".into()))),
                 ],
                 number_rows: 0,
                 arg_fields: vec![],
@@ -1083,9 +1170,7 @@ mod tests {
             .invoke_with_args(ScalarFunctionArgs {
                 args: vec![
                     ColumnarValue::Array(Arc::new(map_arr)),
-                    ColumnarValue::Scalar(
-                        datafusion_common::ScalarValue::Utf8(Some("z".into())),
-                    ),
+                    ColumnarValue::Scalar(datafusion_common::ScalarValue::Utf8(Some("z".into()))),
                 ],
                 number_rows: 0,
                 arg_fields: vec![],

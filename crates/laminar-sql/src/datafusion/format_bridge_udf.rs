@@ -13,8 +13,8 @@ use std::sync::Arc;
 
 use arrow::datatypes::{DataType, TimeUnit};
 use arrow_array::{
-    Array, ArrayRef, LargeBinaryArray, StringArray, TimestampMicrosecondArray,
     builder::{LargeBinaryBuilder, StringBuilder, TimestampMicrosecondBuilder},
+    Array, ArrayRef, LargeBinaryArray, StringArray, TimestampMicrosecondArray,
 };
 use datafusion_common::Result;
 use datafusion_expr::{
@@ -285,8 +285,7 @@ fn parse_ts_string(ts_str: &str, fmt: &str) -> std::result::Result<i64, String> 
                     .map(|ndt| ndt.and_utc())
             })
             .or_else(|_| {
-                NaiveDateTime::parse_from_str(ts_str, "%Y-%m-%dT%H:%M:%S")
-                    .map(|ndt| ndt.and_utc())
+                NaiveDateTime::parse_from_str(ts_str, "%Y-%m-%dT%H:%M:%S").map(|ndt| ndt.and_utc())
             })
             .map_err(|e| e.to_string())?;
         return Ok(dt.timestamp_micros());
@@ -510,9 +509,7 @@ impl ScalarUDFImpl for FromJsonUdf {
             .as_any()
             .downcast_ref::<StringArray>()
             .ok_or_else(|| {
-                datafusion_common::DataFusionError::Internal(
-                    "from_json: arg must be Utf8".into(),
-                )
+                datafusion_common::DataFusionError::Internal("from_json: arg must be Utf8".into())
             })?;
 
         let mut builder = LargeBinaryBuilder::with_capacity(str_arr.len(), 256);
@@ -624,8 +621,9 @@ mod tests {
     #[test]
     fn test_parse_epoch_nanoseconds() {
         let udf = ParseEpochUdf::new();
-        let vals =
-            Arc::new(arrow_array::Int64Array::from(vec![1_708_528_800_000_000_000])) as ArrayRef;
+        let vals = Arc::new(arrow_array::Int64Array::from(vec![
+            1_708_528_800_000_000_000,
+        ])) as ArrayRef;
         let units = Arc::new(StringArray::from(vec!["nanoseconds"])) as ArrayRef;
         let result = udf.invoke_with_args(make_args_2(vals, units)).unwrap();
         let arr = match result {

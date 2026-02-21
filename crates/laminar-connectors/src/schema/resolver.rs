@@ -269,8 +269,11 @@ impl SchemaResolver {
                     .infer_from_samples(&samples, inference_config)
                     .await?;
 
-                let inf_warnings: Vec<String> =
-                    inferred.warnings.iter().map(|w| w.message.clone()).collect();
+                let inf_warnings: Vec<String> = inferred
+                    .warnings
+                    .iter()
+                    .map(|w| w.message.clone())
+                    .collect();
 
                 let kind = ResolutionKind::Inferred {
                     sample_count: inferred.sample_count,
@@ -278,8 +281,7 @@ impl SchemaResolver {
                 };
 
                 if declared.has_wildcard {
-                    let mut resolved =
-                        Self::merge_with_declared(declared, &inferred.schema, kind)?;
+                    let mut resolved = Self::merge_with_declared(declared, &inferred.schema, kind)?;
                     resolved.warnings.extend(inf_warnings);
                     return Ok(resolved);
                 }
@@ -489,11 +491,8 @@ mod tests {
 
     #[test]
     fn test_declared_schema_with_wildcard() {
-        let declared = DeclaredSchema::with_wildcard(vec![DeclaredColumn::new(
-            "id",
-            DataType::Int64,
-            false,
-        )]);
+        let declared =
+            DeclaredSchema::with_wildcard(vec![DeclaredColumn::new("id", DataType::Int64, false)]);
         assert!(declared.has_wildcard);
     }
 
@@ -544,9 +543,12 @@ mod tests {
         )]);
 
         let resolved = sample_resolved_schema();
-        let result =
-            SchemaResolver::merge_with_declared(&declared, &resolved, ResolutionKind::SourceProvided)
-                .unwrap();
+        let result = SchemaResolver::merge_with_declared(
+            &declared,
+            &resolved,
+            ResolutionKind::SourceProvided,
+        )
+        .unwrap();
 
         // "extra" first, then id, name, age
         assert_eq!(result.schema.fields().len(), 4);
@@ -568,9 +570,12 @@ mod tests {
         )]);
 
         let resolved = sample_resolved_schema();
-        let result =
-            SchemaResolver::merge_with_declared(&declared, &resolved, ResolutionKind::SourceProvided)
-                .unwrap();
+        let result = SchemaResolver::merge_with_declared(
+            &declared,
+            &resolved,
+            ResolutionKind::SourceProvided,
+        )
+        .unwrap();
 
         // "id" from declared (Int32), then name, age from resolved.
         assert_eq!(result.schema.fields().len(), 3);
@@ -586,17 +591,17 @@ mod tests {
 
     #[test]
     fn test_merge_with_prefix() {
-        let declared = DeclaredSchema::with_wildcard(vec![DeclaredColumn::new(
-            "pk",
-            DataType::Int64,
-            false,
-        )])
-        .with_prefix("src_");
+        let declared =
+            DeclaredSchema::with_wildcard(vec![DeclaredColumn::new("pk", DataType::Int64, false)])
+                .with_prefix("src_");
 
         let resolved = sample_resolved_schema();
-        let result =
-            SchemaResolver::merge_with_declared(&declared, &resolved, ResolutionKind::SourceProvided)
-                .unwrap();
+        let result = SchemaResolver::merge_with_declared(
+            &declared,
+            &resolved,
+            ResolutionKind::SourceProvided,
+        )
+        .unwrap();
 
         // "pk" first, then src_id, src_name, src_age
         assert_eq!(result.schema.fields().len(), 4);
@@ -658,11 +663,8 @@ mod tests {
 
     #[test]
     fn test_prefix_collision_none() {
-        let declared = DeclaredSchema::with_wildcard(vec![DeclaredColumn::new(
-            "pk",
-            DataType::Int64,
-            false,
-        )]);
+        let declared =
+            DeclaredSchema::with_wildcard(vec![DeclaredColumn::new("pk", DataType::Int64, false)]);
         let resolved = sample_resolved_schema();
         assert!(SchemaResolver::check_prefix_collision(&declared, &resolved).is_ok());
     }
@@ -685,11 +687,8 @@ mod tests {
 
     #[test]
     fn test_prefix_collision_no_prefix_ok() {
-        let declared = DeclaredSchema::with_wildcard(vec![DeclaredColumn::new(
-            "name",
-            DataType::Utf8,
-            true,
-        )]);
+        let declared =
+            DeclaredSchema::with_wildcard(vec![DeclaredColumn::new("name", DataType::Utf8, true)]);
         let resolved = sample_resolved_schema();
         // No prefix set, so no collision check needed.
         assert!(SchemaResolver::check_prefix_collision(&declared, &resolved).is_ok());

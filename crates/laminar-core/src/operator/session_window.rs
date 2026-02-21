@@ -338,7 +338,11 @@ where
         let output_schema = Arc::new(Schema::new(vec![
             Field::new("window_start", DataType::Int64, false),
             Field::new("window_end", DataType::Int64, false),
-            Field::new("result", aggregator.output_data_type(), aggregator.output_nullable()),
+            Field::new(
+                "result",
+                aggregator.output_data_type(),
+                aggregator.output_nullable(),
+            ),
         ]));
         Self {
             gap_ms: i64::try_from(gap.as_millis()).expect("Gap must fit in i64"),
@@ -375,7 +379,11 @@ where
         let output_schema = Arc::new(Schema::new(vec![
             Field::new("window_start", DataType::Int64, false),
             Field::new("window_end", DataType::Int64, false),
-            Field::new("result", aggregator.output_data_type(), aggregator.output_nullable()),
+            Field::new(
+                "result",
+                aggregator.output_data_type(),
+                aggregator.output_nullable(),
+            ),
         ]));
         Self {
             gap_ms: i64::try_from(gap.as_millis()).expect("Gap must fit in i64"),

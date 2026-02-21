@@ -335,7 +335,11 @@ where
         let output_schema = Arc::new(Schema::new(vec![
             Field::new("window_start", DataType::Int64, false),
             Field::new("window_end", DataType::Int64, false),
-            Field::new("result", aggregator.output_data_type(), aggregator.output_nullable()),
+            Field::new(
+                "result",
+                aggregator.output_data_type(),
+                aggregator.output_nullable(),
+            ),
         ]));
         Self {
             assigner,
@@ -368,7 +372,11 @@ where
         let output_schema = Arc::new(Schema::new(vec![
             Field::new("window_start", DataType::Int64, false),
             Field::new("window_end", DataType::Int64, false),
-            Field::new("result", aggregator.output_data_type(), aggregator.output_nullable()),
+            Field::new(
+                "result",
+                aggregator.output_data_type(),
+                aggregator.output_nullable(),
+            ),
         ]));
         Self {
             assigner,

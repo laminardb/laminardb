@@ -69,23 +69,17 @@ fn column_value_to_json(
     data_type: &DataType,
 ) -> SchemaResult<serde_json::Value> {
     Ok(match data_type {
-        DataType::Boolean => {
-            serde_json::Value::Bool(col.as_boolean().value(row))
-        }
-        DataType::Int32 => {
-            serde_json::Value::Number(
-                col.as_primitive::<arrow_array::types::Int32Type>()
-                    .value(row)
-                    .into(),
-            )
-        }
-        DataType::Int64 => {
-            serde_json::Value::Number(
-                col.as_primitive::<arrow_array::types::Int64Type>()
-                    .value(row)
-                    .into(),
-            )
-        }
+        DataType::Boolean => serde_json::Value::Bool(col.as_boolean().value(row)),
+        DataType::Int32 => serde_json::Value::Number(
+            col.as_primitive::<arrow_array::types::Int32Type>()
+                .value(row)
+                .into(),
+        ),
+        DataType::Int64 => serde_json::Value::Number(
+            col.as_primitive::<arrow_array::types::Int64Type>()
+                .value(row)
+                .into(),
+        ),
         DataType::Float32 => {
             let f = f64::from(
                 col.as_primitive::<arrow_array::types::Float32Type>()
@@ -101,9 +95,7 @@ fn column_value_to_json(
             serde_json::Number::from_f64(f)
                 .map_or(serde_json::Value::Null, serde_json::Value::Number)
         }
-        DataType::Utf8 => {
-            serde_json::Value::String(col.as_string::<i32>().value(row).to_string())
-        }
+        DataType::Utf8 => serde_json::Value::String(col.as_string::<i32>().value(row).to_string()),
         DataType::LargeUtf8 => {
             serde_json::Value::String(col.as_string::<i64>().value(row).to_string())
         }

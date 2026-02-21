@@ -861,7 +861,9 @@ impl ResultToArrow for i64 {
 
 impl ResultToArrow for u64 {
     fn to_arrow_array(&self) -> Arc<dyn ArrowArray> {
-        Arc::new(Int64Array::from(vec![i64::try_from(*self).unwrap_or(i64::MAX)]))
+        Arc::new(Int64Array::from(vec![
+            i64::try_from(*self).unwrap_or(i64::MAX)
+        ]))
     }
 
     fn arrow_data_type(&self) -> DataType {
@@ -952,10 +954,7 @@ pub trait Aggregator: Send + Clone {
     /// The default implementation calls [`extract()`](Self::extract) and wraps
     /// the single result. Override this in aggregators that need to process
     /// all rows in a batch (e.g., `AvgAggregator`).
-    fn extract_batch(
-        &self,
-        event: &Event,
-    ) -> SmallVec<[<Self::Acc as Accumulator>::Input; 4]> {
+    fn extract_batch(&self, event: &Event) -> SmallVec<[<Self::Acc as Accumulator>::Input; 4]> {
         let mut values = SmallVec::new();
         if let Some(v) = self.extract(event) {
             values.push(v);
@@ -3320,7 +3319,11 @@ where
         let output_schema = Arc::new(Schema::new(vec![
             Field::new("window_start", DataType::Int64, false),
             Field::new("window_end", DataType::Int64, false),
-            Field::new("result", aggregator.output_data_type(), aggregator.output_nullable()),
+            Field::new(
+                "result",
+                aggregator.output_data_type(),
+                aggregator.output_nullable(),
+            ),
         ]));
         Self {
             assigner,
@@ -3355,7 +3358,11 @@ where
         let output_schema = Arc::new(Schema::new(vec![
             Field::new("window_start", DataType::Int64, false),
             Field::new("window_end", DataType::Int64, false),
-            Field::new("result", aggregator.output_data_type(), aggregator.output_nullable()),
+            Field::new(
+                "result",
+                aggregator.output_data_type(),
+                aggregator.output_nullable(),
+            ),
         ]));
         Self {
             assigner,
@@ -3773,8 +3780,7 @@ where
                 }
                 // Changelog: emit retraction for old value, then insert new value
                 EmitStrategy::Changelog => {
-                    if let Some(new_event) =
-                        self.create_intermediate_result(&window_id, ctx.state)
+                    if let Some(new_event) = self.create_intermediate_result(&window_id, ctx.state)
                     {
                         // Emit delete for previous value (retraction)
                         if let Some(old_event) = self.last_emitted.get(&window_id) {

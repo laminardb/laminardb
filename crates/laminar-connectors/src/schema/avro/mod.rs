@@ -55,9 +55,7 @@ pub fn avro_to_arrow_schema(avro_schema_json: &str) -> SchemaResult<SchemaRef> {
 
         let avro_type = field
             .get("type")
-            .ok_or_else(|| {
-                SchemaError::Incompatible(format!("field '{name}' missing 'type'"))
-            })?;
+            .ok_or_else(|| SchemaError::Incompatible(format!("field '{name}' missing 'type'")))?;
 
         let (data_type, nullable) = avro_to_arrow_type(avro_type)?;
         arrow_fields.push(Field::new(name, data_type, nullable));
@@ -97,9 +95,7 @@ pub fn avro_to_arrow_schema(avro_schema_json: &str) -> SchemaResult<SchemaRef> {
 /// # Errors
 ///
 /// Returns [`SchemaError::Incompatible`] for unrecognized types.
-pub fn avro_to_arrow_type(
-    avro_type: &serde_json::Value,
-) -> SchemaResult<(DataType, bool)> {
+pub fn avro_to_arrow_type(avro_type: &serde_json::Value) -> SchemaResult<(DataType, bool)> {
     match avro_type {
         serde_json::Value::String(s) => Ok((avro_primitive(s)?, false)),
         serde_json::Value::Array(union) => parse_union(union),
@@ -130,9 +126,7 @@ fn avro_primitive(type_name: &str) -> SchemaResult<DataType> {
 /// Parses Avro union types.
 ///
 /// `["null", T]` → nullable T. Multi-type unions fall back to Utf8.
-fn parse_union(
-    variants: &[serde_json::Value],
-) -> SchemaResult<(DataType, bool)> {
+fn parse_union(variants: &[serde_json::Value]) -> SchemaResult<(DataType, bool)> {
     let non_null: Vec<_> = variants
         .iter()
         .filter(|v| v.as_str() != Some("null"))
@@ -159,26 +153,14 @@ fn parse_complex(
     if let Some(logical) = obj.get("logicalType").and_then(|v| v.as_str()) {
         return match logical {
             "date" => Ok((DataType::Date32, false)),
-            "time-millis" => Ok((
-                DataType::Time32(arrow_schema::TimeUnit::Millisecond),
-                false,
-            )),
-            "time-micros" => Ok((
-                DataType::Time64(arrow_schema::TimeUnit::Microsecond),
-                false,
-            )),
+            "time-millis" => Ok((DataType::Time32(arrow_schema::TimeUnit::Millisecond), false)),
+            "time-micros" => Ok((DataType::Time64(arrow_schema::TimeUnit::Microsecond), false)),
             "timestamp-millis" => Ok((
-                DataType::Timestamp(
-                    arrow_schema::TimeUnit::Millisecond,
-                    Some("UTC".into()),
-                ),
+                DataType::Timestamp(arrow_schema::TimeUnit::Millisecond, Some("UTC".into())),
                 false,
             )),
             "timestamp-micros" => Ok((
-                DataType::Timestamp(
-                    arrow_schema::TimeUnit::Microsecond,
-                    Some("UTC".into()),
-                ),
+                DataType::Timestamp(arrow_schema::TimeUnit::Microsecond, Some("UTC".into())),
                 false,
             )),
             "decimal" => {
@@ -204,9 +186,7 @@ fn parse_complex(
         "array" => {
             let items = obj
                 .get("items")
-                .ok_or_else(|| {
-                    SchemaError::Incompatible("Avro array missing 'items'".into())
-                })?;
+                .ok_or_else(|| SchemaError::Incompatible("Avro array missing 'items'".into()))?;
             let (item_type, _) = avro_to_arrow_type(items)?;
             Ok((
                 DataType::List(Arc::new(Field::new("item", item_type, true))),
@@ -216,9 +196,7 @@ fn parse_complex(
         "map" => {
             let values = obj
                 .get("values")
-                .ok_or_else(|| {
-                    SchemaError::Incompatible("Avro map missing 'values'".into())
-                })?;
+                .ok_or_else(|| SchemaError::Incompatible("Avro map missing 'values'".into()))?;
             let (value_type, _) = avro_to_arrow_type(values)?;
             Ok((
                 DataType::Map(
@@ -240,40 +218,25 @@ fn parse_complex(
                 SchemaError::Incompatible("nested record missing 'fields'".into())
             })?;
             let fields_arr = fields_val.as_array().ok_or_else(|| {
-                SchemaError::Incompatible(
-                    "nested record 'fields' is not an array".into(),
-                )
+                SchemaError::Incompatible("nested record 'fields' is not an array".into())
             })?;
             let mut arrow_fields = Vec::with_capacity(fields_arr.len());
             for f in fields_arr {
-                let name = f
-                    .get("name")
-                    .and_then(|v| v.as_str())
-                    .ok_or_else(|| {
-                        SchemaError::Incompatible(
-                            "nested record field missing 'name'".into(),
-                        )
-                    })?;
+                let name = f.get("name").and_then(|v| v.as_str()).ok_or_else(|| {
+                    SchemaError::Incompatible("nested record field missing 'name'".into())
+                })?;
                 let ft = f.get("type").ok_or_else(|| {
-                    SchemaError::Incompatible(format!(
-                        "nested field '{name}' missing 'type'"
-                    ))
+                    SchemaError::Incompatible(format!("nested field '{name}' missing 'type'"))
                 })?;
                 let (dt, nullable) = avro_to_arrow_type(ft)?;
                 arrow_fields.push(Field::new(name, dt, nullable));
             }
-            Ok((
-                DataType::Struct(Fields::from(arrow_fields)),
-                false,
-            ))
+            Ok((DataType::Struct(Fields::from(arrow_fields)), false))
         }
         "enum" => {
             // Avro enum → Dictionary(Int32, Utf8)
             Ok((
-                DataType::Dictionary(
-                    Box::new(DataType::Int32),
-                    Box::new(DataType::Utf8),
-                ),
+                DataType::Dictionary(Box::new(DataType::Int32), Box::new(DataType::Utf8)),
                 false,
             ))
         }
@@ -281,9 +244,7 @@ fn parse_complex(
             let size = obj
                 .get("size")
                 .and_then(serde_json::Value::as_i64)
-                .ok_or_else(|| {
-                    SchemaError::Incompatible("Avro fixed missing 'size'".into())
-                })?;
+                .ok_or_else(|| SchemaError::Incompatible("Avro fixed missing 'size'".into()))?;
             #[allow(clippy::cast_possible_truncation)]
             Ok((DataType::FixedSizeBinary(size as i32), false))
         }

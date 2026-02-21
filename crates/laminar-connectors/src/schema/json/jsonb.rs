@@ -79,8 +79,7 @@ impl JsonbEncoder {
             }
             serde_json::Value::String(s) => {
                 self.buf.push(tags::STRING);
-                self.buf
-                    .extend_from_slice(&(s.len() as u32).to_le_bytes());
+                self.buf.extend_from_slice(&(s.len() as u32).to_le_bytes());
                 self.buf.extend_from_slice(s.as_bytes());
             }
             serde_json::Value::Array(arr) => {
@@ -94,8 +93,7 @@ impl JsonbEncoder {
                 for (i, elem) in arr.iter().enumerate() {
                     let elem_offset = (self.buf.len() - data_start) as u32;
                     let entry_pos = offset_table_pos + i * 4;
-                    self.buf[entry_pos..entry_pos + 4]
-                        .copy_from_slice(&elem_offset.to_le_bytes());
+                    self.buf[entry_pos..entry_pos + 4].copy_from_slice(&elem_offset.to_le_bytes());
                     self.encode_value(elem);
                 }
             }
@@ -115,8 +113,7 @@ impl JsonbEncoder {
                     // Write key offset.
                     let key_offset = (self.buf.len() - data_start) as u32;
                     let entry_pos = offset_table_pos + i * 8;
-                    self.buf[entry_pos..entry_pos + 4]
-                        .copy_from_slice(&key_offset.to_le_bytes());
+                    self.buf[entry_pos..entry_pos + 4].copy_from_slice(&key_offset.to_le_bytes());
                     // Write key (u16 length + UTF-8 bytes).
                     self.buf
                         .extend_from_slice(&(key.len() as u16).to_le_bytes());
@@ -187,7 +184,10 @@ impl JsonbAccessor {
             match key_str.cmp(field_name) {
                 std::cmp::Ordering::Equal => {
                     let val_off = u32::from_le_bytes(
-                        jsonb.get(entry_offset + 4..entry_offset + 8)?.try_into().ok()?,
+                        jsonb
+                            .get(entry_offset + 4..entry_offset + 8)?
+                            .try_into()
+                            .ok()?,
                     ) as usize;
                     let val_abs = data_start + val_off;
                     return jsonb.get(val_abs..);
@@ -224,9 +224,7 @@ impl JsonbAccessor {
         if jsonb_value.first()? != &tags::INT64 {
             return None;
         }
-        Some(i64::from_le_bytes(
-            jsonb_value.get(1..9)?.try_into().ok()?,
-        ))
+        Some(i64::from_le_bytes(jsonb_value.get(1..9)?.try_into().ok()?))
     }
 
     /// Extract an f64 from a JSONB value slice.
@@ -236,9 +234,7 @@ impl JsonbAccessor {
         if jsonb_value.first()? != &tags::FLOAT64 {
             return None;
         }
-        Some(f64::from_le_bytes(
-            jsonb_value.get(1..9)?.try_into().ok()?,
-        ))
+        Some(f64::from_le_bytes(jsonb_value.get(1..9)?.try_into().ok()?))
     }
 
     /// Extract a string from a JSONB value slice.
@@ -248,8 +244,7 @@ impl JsonbAccessor {
         if jsonb_value.first()? != &tags::STRING {
             return None;
         }
-        let len =
-            u32::from_le_bytes(jsonb_value.get(1..5)?.try_into().ok()?) as usize;
+        let len = u32::from_le_bytes(jsonb_value.get(1..5)?.try_into().ok()?) as usize;
         std::str::from_utf8(jsonb_value.get(5..5 + len)?).ok()
     }
 
@@ -270,8 +265,7 @@ impl JsonbAccessor {
         if jsonb_value.first()? != &tags::ARRAY {
             return None;
         }
-        let count =
-            u32::from_le_bytes(jsonb_value.get(1..5)?.try_into().ok()?) as usize;
+        let count = u32::from_le_bytes(jsonb_value.get(1..5)?.try_into().ok()?) as usize;
         if index >= count {
             return None;
         }

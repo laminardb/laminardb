@@ -336,11 +336,7 @@ pub trait SchemaRegistryAware: Send + Sync {
     /// # Errors
     ///
     /// Returns a schema error if the compatibility check itself fails.
-    async fn check_compatibility(
-        &self,
-        subject: &str,
-        proposed: &SchemaRef,
-    ) -> SchemaResult<bool>;
+    async fn check_compatibility(&self, subject: &str, proposed: &SchemaRef) -> SchemaResult<bool>;
 
     /// Registers a new schema version for a subject.
     ///
@@ -362,7 +358,10 @@ pub trait SchemaRegistryAware: Send + Sync {
     ///
     /// Returns a schema error if the decoder cannot be constructed
     /// (e.g., unsupported schema type).
-    fn build_registry_decoder(&self, schema: &RegisteredSchema) -> SchemaResult<Box<dyn FormatDecoder>>;
+    fn build_registry_decoder(
+        &self,
+        schema: &RegisteredSchema,
+    ) -> SchemaResult<Box<dyn FormatDecoder>>;
 }
 
 /// Configuration for connecting to a schema registry.

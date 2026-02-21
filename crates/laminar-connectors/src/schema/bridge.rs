@@ -160,22 +160,16 @@ mod tests {
     #[test]
     fn test_decoder_output_schema() {
         let schema = test_schema();
-        let decoder = DeserializerDecoder::new(
-            Box::new(JsonDeserializer::new()),
-            schema.clone(),
-            "json",
-        );
+        let decoder =
+            DeserializerDecoder::new(Box::new(JsonDeserializer::new()), schema.clone(), "json");
         assert_eq!(decoder.output_schema(), schema);
         assert_eq!(decoder.format_name(), "json");
     }
 
     #[test]
     fn test_decoder_debug() {
-        let decoder = DeserializerDecoder::new(
-            Box::new(JsonDeserializer::new()),
-            test_schema(),
-            "json",
-        );
+        let decoder =
+            DeserializerDecoder::new(Box::new(JsonDeserializer::new()), test_schema(), "json");
         let dbg = format!("{decoder:?}");
         assert!(dbg.contains("DeserializerDecoder"));
         assert!(dbg.contains("json"));
@@ -184,11 +178,7 @@ mod tests {
     #[test]
     fn test_decoder_decode_one() {
         let schema = test_schema();
-        let decoder = DeserializerDecoder::new(
-            Box::new(JsonDeserializer::new()),
-            schema,
-            "json",
-        );
+        let decoder = DeserializerDecoder::new(Box::new(JsonDeserializer::new()), schema, "json");
 
         let record = RawRecord::new(br#"{"id": 42, "name": "Alice"}"#.to_vec());
         let batch = decoder.decode_one(&record).unwrap();
@@ -200,11 +190,7 @@ mod tests {
     #[test]
     fn test_decoder_decode_batch() {
         let schema = test_schema();
-        let decoder = DeserializerDecoder::new(
-            Box::new(JsonDeserializer::new()),
-            schema,
-            "json",
-        );
+        let decoder = DeserializerDecoder::new(Box::new(JsonDeserializer::new()), schema, "json");
 
         let records = vec![
             RawRecord::new(br#"{"id": 1, "name": "A"}"#.to_vec()),
@@ -218,11 +204,8 @@ mod tests {
     #[test]
     fn test_decoder_decode_empty() {
         let schema = test_schema();
-        let decoder = DeserializerDecoder::new(
-            Box::new(JsonDeserializer::new()),
-            schema.clone(),
-            "json",
-        );
+        let decoder =
+            DeserializerDecoder::new(Box::new(JsonDeserializer::new()), schema.clone(), "json");
 
         let batch = decoder.decode_batch(&[]).unwrap();
         assert_eq!(batch.num_rows(), 0);
@@ -232,11 +215,7 @@ mod tests {
     #[test]
     fn test_decoder_decode_error() {
         let schema = test_schema();
-        let decoder = DeserializerDecoder::new(
-            Box::new(JsonDeserializer::new()),
-            schema,
-            "json",
-        );
+        let decoder = DeserializerDecoder::new(Box::new(JsonDeserializer::new()), schema, "json");
 
         let record = RawRecord::new(b"not json".to_vec());
         let result = decoder.decode_one(&record);
@@ -248,33 +227,23 @@ mod tests {
     #[test]
     fn test_encoder_input_schema() {
         let schema = test_schema();
-        let encoder = SerializerEncoder::new(
-            Box::new(JsonSerializer::new()),
-            schema.clone(),
-            "json",
-        );
+        let encoder =
+            SerializerEncoder::new(Box::new(JsonSerializer::new()), schema.clone(), "json");
         assert_eq!(encoder.input_schema(), schema);
         assert_eq!(encoder.format_name(), "json");
     }
 
     #[test]
     fn test_encoder_debug() {
-        let encoder = SerializerEncoder::new(
-            Box::new(JsonSerializer::new()),
-            test_schema(),
-            "json",
-        );
+        let encoder =
+            SerializerEncoder::new(Box::new(JsonSerializer::new()), test_schema(), "json");
         let dbg = format!("{encoder:?}");
         assert!(dbg.contains("SerializerEncoder"));
     }
 
     #[test]
     fn test_encoder_encode_batch() {
-        let schema = Arc::new(Schema::new(vec![Field::new(
-            "id",
-            DataType::Int64,
-            false,
-        )]));
+        let schema = Arc::new(Schema::new(vec![Field::new("id", DataType::Int64, false)]));
 
         let batch = RecordBatch::try_new(
             schema.clone(),
@@ -282,8 +251,7 @@ mod tests {
         )
         .unwrap();
 
-        let encoder =
-            SerializerEncoder::new(Box::new(JsonSerializer::new()), schema, "json");
+        let encoder = SerializerEncoder::new(Box::new(JsonSerializer::new()), schema, "json");
 
         let encoded = encoder.encode_batch(&batch).unwrap();
         assert_eq!(encoded.len(), 3);
@@ -316,15 +284,8 @@ mod tests {
         let encoded = encoder.encode_batch(&batch).unwrap();
 
         // Decode.
-        let decoder = DeserializerDecoder::new(
-            Box::new(JsonDeserializer::new()),
-            schema,
-            "json",
-        );
-        let records: Vec<RawRecord> = encoded
-            .into_iter()
-            .map(RawRecord::new)
-            .collect();
+        let decoder = DeserializerDecoder::new(Box::new(JsonDeserializer::new()), schema, "json");
+        let records: Vec<RawRecord> = encoded.into_iter().map(RawRecord::new).collect();
         let decoded = decoder.decode_batch(&records).unwrap();
 
         assert_eq!(decoded.num_rows(), 2);

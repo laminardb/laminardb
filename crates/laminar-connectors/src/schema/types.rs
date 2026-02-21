@@ -368,8 +368,7 @@ mod tests {
 
     #[test]
     fn test_sink_config() {
-        let cfg = SinkConfig::new("postgres", Format::Json)
-            .with_option("table", "output");
+        let cfg = SinkConfig::new("postgres", Format::Json).with_option("table", "output");
 
         assert_eq!(cfg.connector_type, "postgres");
         assert_eq!(cfg.get_option("table"), Some("output"));

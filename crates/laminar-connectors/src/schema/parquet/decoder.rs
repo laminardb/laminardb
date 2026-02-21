@@ -163,9 +163,8 @@ impl FormatDecoder for ParquetDecoder {
 
         for record in records {
             let bytes = Bytes::copy_from_slice(&record.value);
-            let mut builder = ParquetRecordBatchReaderBuilder::try_new(bytes).map_err(|e| {
-                SchemaError::DecodeError(format!("Parquet reader init error: {e}"))
-            })?;
+            let mut builder = ParquetRecordBatchReaderBuilder::try_new(bytes)
+                .map_err(|e| SchemaError::DecodeError(format!("Parquet reader init error: {e}")))?;
 
             // Apply batch size.
             builder = builder.with_batch_size(self.config.batch_size);
@@ -182,8 +181,7 @@ impl FormatDecoder for ParquetDecoder {
 
             // Apply row-group selection if specified.
             if !self.config.row_group_indices.is_empty() {
-                builder =
-                    builder.with_row_groups(self.config.row_group_indices.clone());
+                builder = builder.with_row_groups(self.config.row_group_indices.clone());
             }
 
             let reader = builder.build().map_err(|e| {
@@ -191,9 +189,8 @@ impl FormatDecoder for ParquetDecoder {
             })?;
 
             for batch_result in reader {
-                let batch = batch_result.map_err(|e| {
-                    SchemaError::DecodeError(format!("Parquet read error: {e}"))
-                })?;
+                let batch = batch_result
+                    .map_err(|e| SchemaError::DecodeError(format!("Parquet read error: {e}")))?;
                 all_batches.push(batch);
             }
         }
@@ -272,7 +269,9 @@ mod tests {
         let output = decoder.decode_batch(&[record]).unwrap();
 
         assert_eq!(output.num_rows(), 3);
-        let ids = output.column(0).as_primitive::<arrow_array::types::Int64Type>();
+        let ids = output
+            .column(0)
+            .as_primitive::<arrow_array::types::Int64Type>();
         assert_eq!(ids.value(0), 1);
         assert_eq!(ids.value(1), 2);
         assert_eq!(ids.value(2), 3);

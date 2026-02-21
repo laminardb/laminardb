@@ -19,9 +19,7 @@ use std::hash::{Hash, Hasher};
 use std::sync::Arc;
 
 use arrow::datatypes::DataType;
-use arrow_array::{
-    Array, ArrayRef, BooleanArray, ListArray, MapArray, StructArray,
-};
+use arrow_array::{Array, ArrayRef, BooleanArray, ListArray, MapArray, StructArray};
 use arrow_schema::{Field, Fields, Schema};
 use datafusion_common::Result;
 use datafusion_expr::{
@@ -44,40 +42,35 @@ pub fn register_lambda_functions(ctx: &datafusion::prelude::SessionContext) {
 /// Evaluate a SQL expression against a `RecordBatch`, returning the result column.
 ///
 /// The expression can reference columns by name from the batch schema.
-fn eval_expr_on_batch(
-    sql_expr: &str,
-    batch: &arrow_array::RecordBatch,
-) -> Result<ArrayRef> {
+fn eval_expr_on_batch(sql_expr: &str, batch: &arrow_array::RecordBatch) -> Result<ArrayRef> {
     // Build a SELECT <expr> FROM <data> query using DataFusion.
     let ctx = datafusion::prelude::SessionContext::new();
-    let provider = datafusion::datasource::MemTable::try_new(
-        batch.schema(),
-        vec![vec![batch.clone()]],
-    )?;
-    let rt = tokio::runtime::Handle::try_current()
-        .map_err(|e| datafusion_common::DataFusionError::Internal(
-            format!("lambda eval requires tokio runtime: {e}"),
-        ))?;
+    let provider =
+        datafusion::datasource::MemTable::try_new(batch.schema(), vec![vec![batch.clone()]])?;
+    let rt = tokio::runtime::Handle::try_current().map_err(|e| {
+        datafusion_common::DataFusionError::Internal(format!(
+            "lambda eval requires tokio runtime: {e}"
+        ))
+    })?;
     // Use block_in_place to allow blocking inside an already-running tokio runtime.
-    tokio::task::block_in_place(|| rt.block_on(async {
-        ctx.register_table("__lambda_data", Arc::new(provider))?;
-        let df = ctx
-            .sql(&format!("SELECT {sql_expr} FROM __lambda_data"))
-            .await?;
-        let batches = df.collect().await?;
-        if batches.is_empty() {
-            Err(datafusion_common::DataFusionError::Internal(
-                "lambda expression returned no data".into(),
-            ))
-        } else {
-            // Concatenate all result batches and return the first column.
-            let result = arrow::compute::concat_batches(
-                &batches[0].schema(),
-                &batches,
-            )?;
-            Ok(result.column(0).clone())
-        }
-    }))
+    tokio::task::block_in_place(|| {
+        rt.block_on(async {
+            ctx.register_table("__lambda_data", Arc::new(provider))?;
+            let df = ctx
+                .sql(&format!("SELECT {sql_expr} FROM __lambda_data"))
+                .await?;
+            let batches = df.collect().await?;
+            if batches.is_empty() {
+                Err(datafusion_common::DataFusionError::Internal(
+                    "lambda expression returned no data".into(),
+                ))
+            } else {
+                // Concatenate all result batches and return the first column.
+                let result = arrow::compute::concat_batches(&batches[0].schema(), &batches)?;
+                Ok(result.column(0).clone())
+            }
+        })
+    })
 }
 
 fn scalar_string_value(cv: &ColumnarValue) -> Result<String> {
@@ -88,9 +81,7 @@ fn scalar_string_value(cv: &ColumnarValue) -> Result<String> {
                 .as_any()
                 .downcast_ref::<arrow_array::StringArray>()
                 .ok_or_else(|| {
-                    datafusion_common::DataFusionError::Internal(
-                        "expected Utf8 argument".into(),
-                    )
+                    datafusion_common::DataFusionError::Internal("expected Utf8 argument".into())
                 })?;
             Ok(str_arr.value(0).to_string())
         }
@@ -99,9 +90,7 @@ fn scalar_string_value(cv: &ColumnarValue) -> Result<String> {
                 .as_any()
                 .downcast_ref::<arrow_array::StringArray>()
                 .ok_or_else(|| {
-                    datafusion_common::DataFusionError::Internal(
-                        "expected Utf8 argument".into(),
-                    )
+                    datafusion_common::DataFusionError::Internal("expected Utf8 argument".into())
                 })?;
             Ok(str_arr.value(0).to_string())
         }
@@ -186,16 +175,11 @@ impl ScalarUDFImpl for ArrayTransform {
             flat_values.data_type().clone(),
             true,
         )]));
-        let batch =
-            arrow_array::RecordBatch::try_new(schema, vec![Arc::clone(flat_values)])?;
+        let batch = arrow_array::RecordBatch::try_new(schema, vec![Arc::clone(flat_values)])?;
 
         let result_arr = eval_expr_on_batch(&lambda_str, &batch)?;
 
-        let new_field = Arc::new(Field::new(
-            "item",
-            result_arr.data_type().clone(),
-            true,
-        ));
+        let new_field = Arc::new(Field::new("item", result_arr.data_type().clone(), true));
         let new_list = ListArray::try_new(
             new_field,
             list_arr.offsets().clone(),
@@ -265,7 +249,11 @@ impl ScalarUDFImpl for ArrayFilter {
         }
     }
 
-    #[allow(clippy::cast_sign_loss, clippy::cast_possible_wrap, clippy::cast_possible_truncation)]
+    #[allow(
+        clippy::cast_sign_loss,
+        clippy::cast_possible_wrap,
+        clippy::cast_possible_truncation
+    )]
     fn invoke_with_args(&self, args: ScalarFunctionArgs) -> Result<ColumnarValue> {
         let expanded = expand_args(&args.args)?;
         let list_arr = expanded[0]
@@ -282,15 +270,17 @@ impl ScalarUDFImpl for ArrayFilter {
         let elem_type = flat_values.data_type().clone();
 
         let schema = Arc::new(Schema::new(vec![Field::new("x", elem_type.clone(), true)]));
-        let batch =
-            arrow_array::RecordBatch::try_new(schema, vec![Arc::clone(flat_values)])?;
+        let batch = arrow_array::RecordBatch::try_new(schema, vec![Arc::clone(flat_values)])?;
 
         let mask_arr = eval_expr_on_batch(&lambda_str, &batch)?;
-        let mask = mask_arr.as_any().downcast_ref::<BooleanArray>().ok_or_else(|| {
-            datafusion_common::DataFusionError::Internal(
-                "array_filter: lambda must return Boolean".into(),
-            )
-        })?;
+        let mask = mask_arr
+            .as_any()
+            .downcast_ref::<BooleanArray>()
+            .ok_or_else(|| {
+                datafusion_common::DataFusionError::Internal(
+                    "array_filter: lambda must return Boolean".into(),
+                )
+            })?;
 
         let mut offsets = vec![0i32];
         let mut filtered_indices: Vec<usize> = Vec::new();
@@ -313,13 +303,11 @@ impl ScalarUDFImpl for ArrayFilter {
                 .map(|&i| i as u32)
                 .collect::<Vec<_>>(),
         );
-        let filtered_values =
-            arrow::compute::take(flat_values.as_ref(), &indices, None)?;
+        let filtered_values = arrow::compute::take(flat_values.as_ref(), &indices, None)?;
 
         let new_field = Arc::new(Field::new("item", elem_type, true));
-        let new_offsets = arrow::buffer::OffsetBuffer::new(
-            arrow::buffer::ScalarBuffer::from(offsets),
-        );
+        let new_offsets =
+            arrow::buffer::OffsetBuffer::new(arrow::buffer::ScalarBuffer::from(offsets));
         let new_list = ListArray::try_new(
             new_field,
             new_offsets,
@@ -430,7 +418,10 @@ impl ScalarUDFImpl for ArrayReduce {
             return Ok(ColumnarValue::Array(Arc::clone(init_arr)));
         }
 
-        let refs: Vec<&dyn Array> = result_builder.iter().map(std::convert::AsRef::as_ref).collect();
+        let refs: Vec<&dyn Array> = result_builder
+            .iter()
+            .map(std::convert::AsRef::as_ref)
+            .collect();
         let result = arrow::compute::concat(&refs)?;
         Ok(ColumnarValue::Array(result))
     }
@@ -488,7 +479,11 @@ impl ScalarUDFImpl for MapFilter {
         Ok(arg_types[0].clone())
     }
 
-    #[allow(clippy::cast_sign_loss, clippy::cast_possible_wrap, clippy::cast_possible_truncation)]
+    #[allow(
+        clippy::cast_sign_loss,
+        clippy::cast_possible_wrap,
+        clippy::cast_possible_truncation
+    )]
     fn invoke_with_args(&self, args: ScalarFunctionArgs) -> Result<ColumnarValue> {
         let expanded = expand_args(&args.args)?;
         let map_arr = expanded[0]
@@ -544,10 +539,7 @@ impl ScalarUDFImpl for MapFilter {
         }
 
         let indices = arrow_array::UInt32Array::from(
-            keep_indices
-                .iter()
-                .map(|&i| i as u32)
-                .collect::<Vec<_>>(),
+            keep_indices.iter().map(|&i| i as u32).collect::<Vec<_>>(),
         );
         let new_keys = arrow::compute::take(key_col.as_ref(), &indices, None)?;
         let new_vals = arrow::compute::take(val_col.as_ref(), &indices, None)?;
@@ -556,14 +548,11 @@ impl ScalarUDFImpl for MapFilter {
             Field::new("key", key_type, false),
             Field::new("value", val_type, true),
         ]);
-        let new_entries =
-            StructArray::try_new(struct_fields, vec![new_keys, new_vals], None)?;
+        let new_entries = StructArray::try_new(struct_fields, vec![new_keys, new_vals], None)?;
 
-        let entries_field =
-            Field::new("entries", new_entries.data_type().clone(), false);
-        let new_offsets = arrow::buffer::OffsetBuffer::new(
-            arrow::buffer::ScalarBuffer::from(offsets),
-        );
+        let entries_field = Field::new("entries", new_entries.data_type().clone(), false);
+        let new_offsets =
+            arrow::buffer::OffsetBuffer::new(arrow::buffer::ScalarBuffer::from(offsets));
         let new_map = MapArray::try_new(
             Arc::new(entries_field),
             new_offsets,
@@ -664,8 +653,7 @@ impl ScalarUDFImpl for MapTransformValues {
         let new_entries =
             StructArray::try_new(struct_fields, vec![Arc::clone(key_col), new_vals], None)?;
 
-        let entries_field =
-            Field::new("entries", new_entries.data_type().clone(), false);
+        let entries_field = Field::new("entries", new_entries.data_type().clone(), false);
         let new_map = MapArray::try_new(
             Arc::new(entries_field),
             map_arr.offsets().clone(),
@@ -689,9 +677,8 @@ mod tests {
     #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
     async fn test_array_transform_add_one() {
         let values = Int64Array::from(vec![1, 2, 3, 4, 5, 6]);
-        let offsets = arrow::buffer::OffsetBuffer::new(
-            arrow::buffer::ScalarBuffer::from(vec![0i32, 3, 6]),
-        );
+        let offsets =
+            arrow::buffer::OffsetBuffer::new(arrow::buffer::ScalarBuffer::from(vec![0i32, 3, 6]));
         let list = ListArray::try_new(
             Arc::new(Field::new("item", DataType::Int64, true)),
             offsets,
@@ -738,9 +725,8 @@ mod tests {
     #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
     async fn test_array_filter_positive() {
         let values = Int64Array::from(vec![-1, 2, -3, 4]);
-        let offsets = arrow::buffer::OffsetBuffer::new(
-            arrow::buffer::ScalarBuffer::from(vec![0i32, 4]),
-        );
+        let offsets =
+            arrow::buffer::OffsetBuffer::new(arrow::buffer::ScalarBuffer::from(vec![0i32, 4]));
         let list = ListArray::try_new(
             Arc::new(Field::new("item", DataType::Int64, true)),
             offsets,

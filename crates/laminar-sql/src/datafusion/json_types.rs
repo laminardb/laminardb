@@ -132,11 +132,7 @@ pub fn jsonb_to_text(jsonb: &[u8]) -> Option<String> {
         }
         tags::STRING => {
             let len = read_u32(jsonb, 1)? as usize;
-            Some(
-                std::str::from_utf8(jsonb.get(5..5 + len)?)
-                    .ok()?
-                    .to_owned(),
-            )
+            Some(std::str::from_utf8(jsonb.get(5..5 + len)?).ok()?.to_owned())
         }
         tags::ARRAY | tags::OBJECT => jsonb_to_json_string(jsonb),
         // NULL and unknown tags return None (PostgreSQL returns NULL for null)
@@ -183,8 +179,8 @@ fn jsonb_to_json_string(jsonb: &[u8]) -> Option<String> {
                 let key_off = read_u32(jsonb, entry)? as usize;
                 let key_abs = data_start + key_off;
                 let key_len = read_u16(jsonb, key_abs)? as usize;
-                let key = std::str::from_utf8(jsonb.get(key_abs + 2..key_abs + 2 + key_len)?)
-                    .ok()?;
+                let key =
+                    std::str::from_utf8(jsonb.get(key_abs + 2..key_abs + 2 + key_len)?).ok()?;
                 let val_off = read_u32(jsonb, entry + 4)? as usize;
                 let val_slice = jsonb.get(data_start + val_off..)?;
                 parts.push(format!("\"{}\":{}", key, jsonb_to_json_string(val_slice)?));
@@ -285,8 +281,8 @@ pub fn jsonb_contains(left: &[u8], right: &[u8]) -> Option<bool> {
                 let key_off = read_u32(right, entry)? as usize;
                 let key_abs = r_data_start + key_off;
                 let key_len = read_u16(right, key_abs)? as usize;
-                let key = std::str::from_utf8(right.get(key_abs + 2..key_abs + 2 + key_len)?)
-                    .ok()?;
+                let key =
+                    std::str::from_utf8(right.get(key_abs + 2..key_abs + 2 + key_len)?).ok()?;
 
                 let val_off = read_u32(right, entry + 4)? as usize;
                 let r_val = right.get(r_data_start + val_off..)?;
@@ -549,10 +545,7 @@ mod tests {
         assert_eq!(jsonb_to_value(&enc(json!(false))), Some(json!(false)));
         assert_eq!(jsonb_to_value(&enc(json!(42))), Some(json!(42)));
         assert_eq!(jsonb_to_value(&enc(json!(3.14))), Some(json!(3.14)));
-        assert_eq!(
-            jsonb_to_value(&enc(json!("hello"))),
-            Some(json!("hello"))
-        );
+        assert_eq!(jsonb_to_value(&enc(json!("hello"))), Some(json!("hello")));
     }
 
     #[test]

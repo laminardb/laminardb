@@ -19,8 +19,7 @@ use arrow::datatypes::DataType;
 use arrow_array::{Array, BooleanArray, LargeBinaryArray};
 use datafusion_common::Result;
 use datafusion_expr::{
-    ColumnarValue, ScalarFunctionArgs, ScalarUDFImpl, Signature, TypeSignature,
-    Volatility,
+    ColumnarValue, ScalarFunctionArgs, ScalarUDFImpl, Signature, TypeSignature, Volatility,
 };
 
 use super::json_types;
@@ -141,14 +140,12 @@ impl CompiledJsonPath {
                             pos += 1;
                         }
                         if pos == start || (negative && pos == start + 1) {
-                            return Err(format!(
-                                "expected array index or '*' at position {start}"
-                            ));
+                            return Err(format!("expected array index or '*' at position {start}"));
                         }
                         let idx_str: String = chars[start..pos].iter().collect();
-                        let idx: i64 = idx_str.parse().map_err(|_| {
-                            format!("invalid array index: '{idx_str}'")
-                        })?;
+                        let idx: i64 = idx_str
+                            .parse()
+                            .map_err(|_| format!("invalid array index: '{idx_str}'"))?;
                         steps.push(JsonPathStep::ArrayIndex(idx));
                     }
                     // Skip whitespace and expect ']'
@@ -156,9 +153,7 @@ impl CompiledJsonPath {
                         pos += 1;
                     }
                     if pos >= chars.len() || chars[pos] != ']' {
-                        return Err(format!(
-                            "expected ']' at position {pos}"
-                        ));
+                        return Err(format!("expected ']' at position {pos}"));
                     }
                     pos += 1;
                 }
@@ -166,9 +161,7 @@ impl CompiledJsonPath {
                     pos += 1;
                 }
                 c => {
-                    return Err(format!(
-                        "unexpected character '{c}' at position {pos}"
-                    ));
+                    return Err(format!("unexpected character '{c}' at position {pos}"));
                 }
             }
         }
@@ -219,9 +212,8 @@ impl CompiledJsonPath {
                         if !data.is_empty() && data[0] == 0x06 {
                             // ARRAY tag
                             if data.len() >= 5 {
-                                let count = u32::from_le_bytes([
-                                    data[1], data[2], data[3], data[4],
-                                ]) as usize;
+                                let count = u32::from_le_bytes([data[1], data[2], data[3], data[4]])
+                                    as usize;
                                 for i in 0..count {
                                     if let Some(val) = json_types::jsonb_array_get(data, i) {
                                         next.push(val);
@@ -503,10 +495,7 @@ mod tests {
         let path = CompiledJsonPath::compile("$.name").unwrap();
         assert_eq!(
             path.steps,
-            vec![
-                JsonPathStep::Root,
-                JsonPathStep::Member("name".into()),
-            ]
+            vec![JsonPathStep::Root, JsonPathStep::Member("name".into()),]
         );
     }
 
@@ -592,7 +581,10 @@ mod tests {
         let results = path.evaluate(&jsonb);
         assert_eq!(results.len(), 1);
         // Should be the string "Alice" in JSONB format
-        assert_eq!(json_types::jsonb_to_text(results[0]), Some("Alice".to_string()));
+        assert_eq!(
+            json_types::jsonb_to_text(results[0]),
+            Some("Alice".to_string())
+        );
     }
 
     #[test]
@@ -606,13 +598,15 @@ mod tests {
 
     #[test]
     fn test_evaluate_array_index() {
-        let json: serde_json::Value =
-            serde_json::from_str(r#"{"items": [10, 20, 30]}"#).unwrap();
+        let json: serde_json::Value = serde_json::from_str(r#"{"items": [10, 20, 30]}"#).unwrap();
         let jsonb = json_types::encode_jsonb(&json);
         let path = CompiledJsonPath::compile("$.items[1]").unwrap();
         let results = path.evaluate(&jsonb);
         assert_eq!(results.len(), 1);
-        assert_eq!(json_types::jsonb_to_text(results[0]), Some("20".to_string()));
+        assert_eq!(
+            json_types::jsonb_to_text(results[0]),
+            Some("20".to_string())
+        );
     }
 
     #[test]
@@ -627,8 +621,7 @@ mod tests {
 
     #[test]
     fn test_exists_true() {
-        let json: serde_json::Value =
-            serde_json::from_str(r#"{"users": [{"age": 30}]}"#).unwrap();
+        let json: serde_json::Value = serde_json::from_str(r#"{"users": [{"age": 30}]}"#).unwrap();
         let jsonb = json_types::encode_jsonb(&json);
         let path = CompiledJsonPath::compile("$.users[0].age").unwrap();
         assert!(path.exists(&jsonb));
@@ -636,8 +629,7 @@ mod tests {
 
     #[test]
     fn test_exists_false() {
-        let json: serde_json::Value =
-            serde_json::from_str(r#"{"users": [{"age": 30}]}"#).unwrap();
+        let json: serde_json::Value = serde_json::from_str(r#"{"users": [{"age": 30}]}"#).unwrap();
         let jsonb = json_types::encode_jsonb(&json);
         let path = CompiledJsonPath::compile("$.users[0].email").unwrap();
         assert!(!path.exists(&jsonb));

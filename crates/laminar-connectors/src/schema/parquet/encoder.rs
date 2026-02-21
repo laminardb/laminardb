@@ -109,8 +109,8 @@ impl FormatEncoder for ParquetEncoder {
             .set_max_row_group_size(self.config.max_row_group_size);
 
         if !self.config.write_statistics {
-            props_builder =
-                props_builder.set_statistics_enabled(parquet::file::properties::EnabledStatistics::None);
+            props_builder = props_builder
+                .set_statistics_enabled(parquet::file::properties::EnabledStatistics::None);
         }
 
         let props = props_builder.build();
@@ -200,8 +200,8 @@ mod tests {
         )
         .unwrap();
 
-        let config = ParquetEncoderConfig::default()
-            .with_compression(Compression::GZIP(Default::default()));
+        let config =
+            ParquetEncoderConfig::default().with_compression(Compression::GZIP(Default::default()));
         let encoder = ParquetEncoder::with_config(schema, config);
         let encoded = encoder.encode_batch(&batch).unwrap();
         assert_eq!(encoded.len(), 1);

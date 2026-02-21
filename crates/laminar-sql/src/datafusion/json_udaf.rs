@@ -13,9 +13,7 @@ use arrow_array::{Array, ArrayRef, LargeBinaryArray, StringArray};
 use arrow_schema::Field;
 use datafusion_common::{Result, ScalarValue};
 use datafusion_expr::function::AccumulatorArgs;
-use datafusion_expr::{
-    Accumulator, AggregateUDFImpl, Signature, TypeSignature, Volatility,
-};
+use datafusion_expr::{Accumulator, AggregateUDFImpl, Signature, TypeSignature, Volatility};
 
 use super::json_types;
 
@@ -79,9 +77,16 @@ impl AggregateUDFImpl for JsonAgg {
         Ok(DataType::LargeBinary)
     }
 
-    fn state_fields(&self, _args: datafusion_expr::function::StateFieldsArgs) -> Result<Vec<Arc<Field>>> {
+    fn state_fields(
+        &self,
+        _args: datafusion_expr::function::StateFieldsArgs,
+    ) -> Result<Vec<Arc<Field>>> {
         // State is a single LargeBinary holding concatenated JSONB values
-        Ok(vec![Arc::new(Field::new("json_agg_state", DataType::LargeBinary, true))])
+        Ok(vec![Arc::new(Field::new(
+            "json_agg_state",
+            DataType::LargeBinary,
+            true,
+        ))])
     }
 
     fn accumulator(&self, _args: AccumulatorArgs<'_>) -> Result<Box<dyn Accumulator>> {
@@ -99,9 +104,7 @@ struct JsonAggAccumulator {
 
 impl JsonAggAccumulator {
     fn new() -> Self {
-        Self {
-            values: Vec::new(),
-        }
+        Self { values: Vec::new() }
     }
 }
 
@@ -222,7 +225,10 @@ impl AggregateUDFImpl for JsonObjectAgg {
         Ok(DataType::LargeBinary)
     }
 
-    fn state_fields(&self, _args: datafusion_expr::function::StateFieldsArgs) -> Result<Vec<Arc<Field>>> {
+    fn state_fields(
+        &self,
+        _args: datafusion_expr::function::StateFieldsArgs,
+    ) -> Result<Vec<Arc<Field>>> {
         Ok(vec![Arc::new(Field::new(
             "json_object_agg_state",
             DataType::LargeBinary,
@@ -278,8 +284,7 @@ impl Accumulator for JsonObjectAggAccumulator {
     }
 
     fn size(&self) -> usize {
-        std::mem::size_of::<Self>()
-            + self.entries.len() * 64 // rough estimate
+        std::mem::size_of::<Self>() + self.entries.len() * 64 // rough estimate
     }
 
     fn state(&mut self) -> Result<Vec<ScalarValue>> {

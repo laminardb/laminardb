@@ -50,10 +50,7 @@ impl ErrorHandlingDecoder {
     ///
     /// Returns `SchemaError` if the error strategy is `Fail` and any
     /// record fails to decode.
-    pub fn decode_batch_with_errors(
-        &self,
-        records: &[RawRecord],
-    ) -> SchemaResult<RecordBatch> {
+    pub fn decode_batch_with_errors(&self, records: &[RawRecord]) -> SchemaResult<RecordBatch> {
         if records.is_empty() {
             return Ok(RecordBatch::new_empty(self.inner.output_schema()));
         }
@@ -80,11 +77,8 @@ impl ErrorHandlingDecoder {
         if good_batches.is_empty() {
             Ok(RecordBatch::new_empty(self.inner.output_schema()))
         } else {
-            arrow_select::concat::concat_batches(
-                &self.inner.output_schema(),
-                good_batches.iter(),
-            )
-            .map_err(|e| SchemaError::DecodeError(format!("failed to concat batches: {e}")))
+            arrow_select::concat::concat_batches(&self.inner.output_schema(), good_batches.iter())
+                .map_err(|e| SchemaError::DecodeError(format!("failed to concat batches: {e}")))
         }
     }
 
@@ -150,7 +144,11 @@ mod tests {
     impl TestDecoder {
         fn new() -> Self {
             Self {
-                schema: Arc::new(Schema::new(vec![Field::new("val", arrow_schema::DataType::Utf8, true)])),
+                schema: Arc::new(Schema::new(vec![Field::new(
+                    "val",
+                    arrow_schema::DataType::Utf8,
+                    true,
+                )])),
             }
         }
     }
@@ -191,7 +189,8 @@ mod tests {
     #[test]
     fn test_fast_path_no_errors() {
         let metrics = Arc::new(ErrorMetrics::new());
-        let (router, _rx) = ErrorRouter::new("test".into(), ErrorStrategy::Skip, Arc::clone(&metrics));
+        let (router, _rx) =
+            ErrorRouter::new("test".into(), ErrorStrategy::Skip, Arc::clone(&metrics));
         let decoder = ErrorHandlingDecoder::new(Box::new(TestDecoder::new()), router);
 
         let records = vec![
@@ -200,13 +199,19 @@ mod tests {
         ];
         let batch = decoder.decode_batch_with_errors(&records).unwrap();
         assert_eq!(batch.num_rows(), 2);
-        assert_eq!(metrics.errors_total.load(std::sync::atomic::Ordering::Relaxed), 0);
+        assert_eq!(
+            metrics
+                .errors_total
+                .load(std::sync::atomic::Ordering::Relaxed),
+            0
+        );
     }
 
     #[test]
     fn test_slow_path_skip_strategy() {
         let metrics = Arc::new(ErrorMetrics::new());
-        let (router, _rx) = ErrorRouter::new("test".into(), ErrorStrategy::Skip, Arc::clone(&metrics));
+        let (router, _rx) =
+            ErrorRouter::new("test".into(), ErrorStrategy::Skip, Arc::clone(&metrics));
         let decoder = ErrorHandlingDecoder::new(Box::new(TestDecoder::new()), router);
 
         let records = vec![
@@ -216,14 +221,25 @@ mod tests {
         ];
         let batch = decoder.decode_batch_with_errors(&records).unwrap();
         assert_eq!(batch.num_rows(), 2); // only good records
-        assert_eq!(metrics.errors_total.load(std::sync::atomic::Ordering::Relaxed), 1);
-        assert_eq!(metrics.skipped_total.load(std::sync::atomic::Ordering::Relaxed), 1);
+        assert_eq!(
+            metrics
+                .errors_total
+                .load(std::sync::atomic::Ordering::Relaxed),
+            1
+        );
+        assert_eq!(
+            metrics
+                .skipped_total
+                .load(std::sync::atomic::Ordering::Relaxed),
+            1
+        );
     }
 
     #[test]
     fn test_fail_strategy_halts() {
         let metrics = Arc::new(ErrorMetrics::new());
-        let (router, _rx) = ErrorRouter::new("test".into(), ErrorStrategy::Fail, Arc::clone(&metrics));
+        let (router, _rx) =
+            ErrorRouter::new("test".into(), ErrorStrategy::Fail, Arc::clone(&metrics));
         let decoder = ErrorHandlingDecoder::new(Box::new(TestDecoder::new()), router);
 
         let records = vec![
@@ -266,7 +282,8 @@ mod tests {
     #[test]
     fn test_all_errors_returns_empty_batch() {
         let metrics = Arc::new(ErrorMetrics::new());
-        let (router, _rx) = ErrorRouter::new("test".into(), ErrorStrategy::Skip, Arc::clone(&metrics));
+        let (router, _rx) =
+            ErrorRouter::new("test".into(), ErrorStrategy::Skip, Arc::clone(&metrics));
         let decoder = ErrorHandlingDecoder::new(Box::new(TestDecoder::new()), router);
 
         let records = vec![
@@ -275,13 +292,19 @@ mod tests {
         ];
         let batch = decoder.decode_batch_with_errors(&records).unwrap();
         assert_eq!(batch.num_rows(), 0);
-        assert_eq!(metrics.errors_total.load(std::sync::atomic::Ordering::Relaxed), 2);
+        assert_eq!(
+            metrics
+                .errors_total
+                .load(std::sync::atomic::Ordering::Relaxed),
+            2
+        );
     }
 
     #[test]
     fn test_empty_batch() {
         let metrics = Arc::new(ErrorMetrics::new());
-        let (router, _rx) = ErrorRouter::new("test".into(), ErrorStrategy::Skip, Arc::clone(&metrics));
+        let (router, _rx) =
+            ErrorRouter::new("test".into(), ErrorStrategy::Skip, Arc::clone(&metrics));
         let decoder = ErrorHandlingDecoder::new(Box::new(TestDecoder::new()), router);
 
         let records: Vec<RawRecord> = vec![];

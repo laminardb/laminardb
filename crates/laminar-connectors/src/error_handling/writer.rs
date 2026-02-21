@@ -247,7 +247,14 @@ mod tests {
             }
         }
 
-        let writer = DeadLetterWriter::new(rx, 0, Box::new(SharedDest { inner: shared_clone }), Arc::clone(&metrics));
+        let writer = DeadLetterWriter::new(
+            rx,
+            0,
+            Box::new(SharedDest {
+                inner: shared_clone,
+            }),
+            Arc::clone(&metrics),
+        );
         let handle = tokio::spawn(writer.run());
 
         tx.send(sample_record()).await.unwrap();
@@ -288,7 +295,9 @@ mod tests {
         let writer = DeadLetterWriter::new(
             rx,
             2,
-            Box::new(SharedDest { inner: shared_clone }),
+            Box::new(SharedDest {
+                inner: shared_clone,
+            }),
             Arc::clone(&metrics),
         );
         let handle = tokio::spawn(writer.run());

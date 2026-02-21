@@ -99,14 +99,8 @@ impl std::fmt::Debug for ErrorMetrics {
                 "window_start_ms",
                 &self.window_start_ms.load(Ordering::Relaxed),
             )
-            .field(
-                "last_error_ms",
-                &self.last_error_ms.load(Ordering::Relaxed),
-            )
-            .field(
-                "skipped_total",
-                &self.skipped_total.load(Ordering::Relaxed),
-            )
+            .field("last_error_ms", &self.last_error_ms.load(Ordering::Relaxed))
+            .field("skipped_total", &self.skipped_total.load(Ordering::Relaxed))
             .field("dlq_total", &self.dlq_total.load(Ordering::Relaxed))
             .field(
                 "rate_limited_total",

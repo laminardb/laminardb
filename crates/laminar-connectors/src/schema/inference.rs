@@ -129,12 +129,14 @@ pub fn default_infer_from_samples(
     samples: &[RawRecord],
     config: &InferenceConfig,
 ) -> SchemaResult<InferredSchema> {
-    let inferencer = FORMAT_INFERENCE_REGISTRY.get(&config.format).ok_or_else(|| {
-        SchemaError::InferenceFailed(format!(
-            "no inferencer registered for format '{}'",
-            config.format
-        ))
-    })?;
+    let inferencer = FORMAT_INFERENCE_REGISTRY
+        .get(&config.format)
+        .ok_or_else(|| {
+            SchemaError::InferenceFailed(format!(
+                "no inferencer registered for format '{}'",
+                config.format
+            ))
+        })?;
     inferencer.infer(samples, config)
 }
 
@@ -172,10 +174,9 @@ impl FormatInference for JsonFormatInference {
         let mut warnings: Vec<InferenceWarning> = Vec::new();
 
         for (i, record) in samples.iter().enumerate() {
-            let value: serde_json::Value =
-                serde_json::from_slice(&record.value).map_err(|e| {
-                    SchemaError::InferenceFailed(format!("JSON parse error in sample {i}: {e}"))
-                })?;
+            let value: serde_json::Value = serde_json::from_slice(&record.value).map_err(|e| {
+                SchemaError::InferenceFailed(format!("JSON parse error in sample {i}: {e}"))
+            })?;
 
             let obj = value.as_object().ok_or_else(|| {
                 SchemaError::InferenceFailed(format!(
@@ -212,8 +213,8 @@ impl FormatInference for JsonFormatInference {
                 .iter()
                 .filter(|t| !matches!(t, InferredType::Null))
                 .count();
-            let nullable = types.iter().any(|t| matches!(t, InferredType::Null))
-                || types.len() < total;
+            let nullable =
+                types.iter().any(|t| matches!(t, InferredType::Null)) || types.len() < total;
 
             let field_confidence = if types.is_empty() {
                 0.0
@@ -664,7 +665,11 @@ mod tests {
 
         let cfg = InferenceConfig::new("json");
         let result = JsonFormatInference.infer(&samples, &cfg).unwrap();
-        assert!(result.schema.field_with_name("value").unwrap().is_nullable());
+        assert!(result
+            .schema
+            .field_with_name("value")
+            .unwrap()
+            .is_nullable());
     }
 
     #[test]
@@ -709,7 +714,11 @@ mod tests {
         ];
         let cfg = InferenceConfig::new("json").with_empty_as_null();
         let result = JsonFormatInference.infer(&samples, &cfg).unwrap();
-        assert!(result.schema.field_with_name("value").unwrap().is_nullable());
+        assert!(result
+            .schema
+            .field_with_name("value")
+            .unwrap()
+            .is_nullable());
     }
 
     #[test]
@@ -785,7 +794,11 @@ mod tests {
         let result = CsvFormatInference.infer(&samples, &cfg).unwrap();
 
         assert_eq!(
-            result.schema.field_with_name("int_col").unwrap().data_type(),
+            result
+                .schema
+                .field_with_name("int_col")
+                .unwrap()
+                .data_type(),
             &DataType::Int64
         );
         assert_eq!(
@@ -805,7 +818,11 @@ mod tests {
             &DataType::Boolean
         );
         assert_eq!(
-            result.schema.field_with_name("str_col").unwrap().data_type(),
+            result
+                .schema
+                .field_with_name("str_col")
+                .unwrap()
+                .data_type(),
             &DataType::Utf8
         );
     }

@@ -209,13 +209,12 @@ impl ErrorRouter {
         strategy: ErrorStrategy,
         metrics: Arc<ErrorMetrics>,
     ) -> (Self, Option<mpsc::Receiver<DeadLetterRecord>>) {
-        let (dlq_sender, dlq_receiver) =
-            if matches!(strategy, ErrorStrategy::DeadLetter { .. }) {
-                let (tx, rx) = mpsc::channel(4096);
-                (Some(tx), Some(rx))
-            } else {
-                (None, None)
-            };
+        let (dlq_sender, dlq_receiver) = if matches!(strategy, ErrorStrategy::DeadLetter { .. }) {
+            let (tx, rx) = mpsc::channel(4096);
+            (Some(tx), Some(rx))
+        } else {
+            (None, None)
+        };
 
         (
             Self {
@@ -248,12 +247,7 @@ impl ErrorRouter {
                 Ok(())
             }
             ErrorStrategy::DeadLetter { config } => {
-                let record = build_dlq_record(
-                    error,
-                    raw_record,
-                    &self.source_name,
-                    config,
-                );
+                let record = build_dlq_record(error, raw_record, &self.source_name, config);
 
                 // Non-blocking send; if channel is full, count as rate-limited
                 if let Some(sender) = &self.dlq_sender {
@@ -443,11 +437,26 @@ mod tests {
 
     #[test]
     fn test_error_kind_display() {
-        assert_eq!(DeadLetterErrorKind::MalformedPayload.to_string(), "MalformedPayload");
-        assert_eq!(DeadLetterErrorKind::SchemaMismatch.to_string(), "SchemaMismatch");
-        assert_eq!(DeadLetterErrorKind::TypeConversion.to_string(), "TypeConversion");
-        assert_eq!(DeadLetterErrorKind::UnknownSchemaId.to_string(), "UnknownSchemaId");
-        assert_eq!(DeadLetterErrorKind::PayloadTooLarge.to_string(), "PayloadTooLarge");
+        assert_eq!(
+            DeadLetterErrorKind::MalformedPayload.to_string(),
+            "MalformedPayload"
+        );
+        assert_eq!(
+            DeadLetterErrorKind::SchemaMismatch.to_string(),
+            "SchemaMismatch"
+        );
+        assert_eq!(
+            DeadLetterErrorKind::TypeConversion.to_string(),
+            "TypeConversion"
+        );
+        assert_eq!(
+            DeadLetterErrorKind::UnknownSchemaId.to_string(),
+            "UnknownSchemaId"
+        );
+        assert_eq!(
+            DeadLetterErrorKind::PayloadTooLarge.to_string(),
+            "PayloadTooLarge"
+        );
         assert_eq!(DeadLetterErrorKind::Other.to_string(), "Other");
     }
 
@@ -504,7 +513,8 @@ mod tests {
     #[test]
     fn test_router_skip_drops_record() {
         let metrics = Arc::new(ErrorMetrics::new());
-        let (router, rx) = ErrorRouter::new("src".into(), ErrorStrategy::Skip, Arc::clone(&metrics));
+        let (router, rx) =
+            ErrorRouter::new("src".into(), ErrorStrategy::Skip, Arc::clone(&metrics));
         assert!(rx.is_none());
 
         let err = SerdeError::MalformedInput("bad".into());
@@ -518,7 +528,8 @@ mod tests {
     #[test]
     fn test_router_fail_returns_error() {
         let metrics = Arc::new(ErrorMetrics::new());
-        let (router, _rx) = ErrorRouter::new("src".into(), ErrorStrategy::Fail, Arc::clone(&metrics));
+        let (router, _rx) =
+            ErrorRouter::new("src".into(), ErrorStrategy::Fail, Arc::clone(&metrics));
 
         let err = SerdeError::MalformedInput("bad".into());
         let record = RawRecord::new(b"bad data".to_vec());

@@ -15,8 +15,8 @@ use std::sync::Arc;
 
 use arrow::datatypes::DataType;
 use arrow_array::{
-    Array, ArrayRef, BooleanArray, LargeBinaryArray, ListArray, StringArray,
     builder::{LargeBinaryBuilder, StringBuilder},
+    Array, ArrayRef, BooleanArray, LargeBinaryArray, ListArray, StringArray,
 };
 use datafusion_common::Result;
 use datafusion_expr::{
@@ -240,7 +240,10 @@ impl ScalarUDFImpl for JsonbGetIdx {
             } else {
                 let jsonb = jsonb_arr.value(i);
                 let idx = idx_arr.value(i);
-                match usize::try_from(idx).ok().and_then(|u| json_types::jsonb_array_get(jsonb, u)) {
+                match usize::try_from(idx)
+                    .ok()
+                    .and_then(|u| json_types::jsonb_array_get(jsonb, u))
+                {
                     Some(val) => builder.append_value(val),
                     None => builder.append_null(),
                 }
@@ -795,7 +798,10 @@ impl ScalarUDFImpl for JsonbExists {
                 if jsonb_arr.is_null(i) || key_arr.is_null(i) {
                     None
                 } else {
-                    Some(json_types::jsonb_has_key(jsonb_arr.value(i), key_arr.value(i)))
+                    Some(json_types::jsonb_has_key(
+                        jsonb_arr.value(i),
+                        key_arr.value(i),
+                    ))
                 }
             })
             .collect();
@@ -892,17 +898,20 @@ impl ScalarUDFImpl for JsonbExistsAny {
                 )
             })?;
 
-        let result: BooleanArray = (0..jsonb_arr.len())
-            .map(|i| {
-                if jsonb_arr.is_null(i) || keys_arr.is_null(i) {
-                    return None;
-                }
-                let jsonb = jsonb_arr.value(i);
-                let keys_list = keys_arr.value(i);
-                let keys = keys_list.as_any().downcast_ref::<StringArray>()?;
-                Some((0..keys.len()).any(|k| !keys.is_null(k) && json_types::jsonb_has_key(jsonb, keys.value(k))))
-            })
-            .collect();
+        let result: BooleanArray =
+            (0..jsonb_arr.len())
+                .map(|i| {
+                    if jsonb_arr.is_null(i) || keys_arr.is_null(i) {
+                        return None;
+                    }
+                    let jsonb = jsonb_arr.value(i);
+                    let keys_list = keys_arr.value(i);
+                    let keys = keys_list.as_any().downcast_ref::<StringArray>()?;
+                    Some((0..keys.len()).any(|k| {
+                        !keys.is_null(k) && json_types::jsonb_has_key(jsonb, keys.value(k))
+                    }))
+                })
+                .collect();
         Ok(ColumnarValue::Array(Arc::new(result)))
     }
 }
@@ -996,17 +1005,20 @@ impl ScalarUDFImpl for JsonbExistsAll {
                 )
             })?;
 
-        let result: BooleanArray = (0..jsonb_arr.len())
-            .map(|i| {
-                if jsonb_arr.is_null(i) || keys_arr.is_null(i) {
-                    return None;
-                }
-                let jsonb = jsonb_arr.value(i);
-                let keys_list = keys_arr.value(i);
-                let keys = keys_list.as_any().downcast_ref::<StringArray>()?;
-                Some((0..keys.len()).all(|k| !keys.is_null(k) && json_types::jsonb_has_key(jsonb, keys.value(k))))
-            })
-            .collect();
+        let result: BooleanArray =
+            (0..jsonb_arr.len())
+                .map(|i| {
+                    if jsonb_arr.is_null(i) || keys_arr.is_null(i) {
+                        return None;
+                    }
+                    let jsonb = jsonb_arr.value(i);
+                    let keys_list = keys_arr.value(i);
+                    let keys = keys_list.as_any().downcast_ref::<StringArray>()?;
+                    Some((0..keys.len()).all(|k| {
+                        !keys.is_null(k) && json_types::jsonb_has_key(jsonb, keys.value(k))
+                    }))
+                })
+                .collect();
         Ok(ColumnarValue::Array(Arc::new(result)))
     }
 }
@@ -1872,9 +1884,7 @@ mod tests {
             serde_json::json!(true),
             serde_json::json!(null),
         ]);
-        let result = udf
-            .invoke_with_args(make_args_1(Arc::new(jsonb)))
-            .unwrap();
+        let result = udf.invoke_with_args(make_args_1(Arc::new(jsonb))).unwrap();
         let arr = match result {
             ColumnarValue::Array(a) => a,
             _ => panic!("expected array"),
@@ -1896,10 +1906,7 @@ mod tests {
         let keys = Arc::new(make_string_array(&["name"])) as ArrayRef;
         let vals = Arc::new(make_string_array(&["Alice"])) as ArrayRef;
         let args = ScalarFunctionArgs {
-            args: vec![
-                ColumnarValue::Array(keys),
-                ColumnarValue::Array(vals),
-            ],
+            args: vec![ColumnarValue::Array(keys), ColumnarValue::Array(vals)],
             arg_fields: vec![],
             number_rows: 0,
             return_field: Arc::new(Field::new("output", DataType::LargeBinary, true)),
@@ -1939,10 +1946,7 @@ mod tests {
         let a = Arc::new(arrow_array::Int64Array::from(vec![1])) as ArrayRef;
         let b = Arc::new(make_string_array(&["two"])) as ArrayRef;
         let args = ScalarFunctionArgs {
-            args: vec![
-                ColumnarValue::Array(a),
-                ColumnarValue::Array(b),
-            ],
+            args: vec![ColumnarValue::Array(a), ColumnarValue::Array(b)],
             arg_fields: vec![],
             number_rows: 0,
             return_field: Arc::new(Field::new("output", DataType::LargeBinary, true)),
@@ -1998,15 +2002,33 @@ mod tests {
     fn test_all_udfs_register() {
         let names = [
             ScalarUDF::new_from_impl(JsonbGet::new()).name().to_owned(),
-            ScalarUDF::new_from_impl(JsonbGetIdx::new()).name().to_owned(),
-            ScalarUDF::new_from_impl(JsonbGetText::new()).name().to_owned(),
-            ScalarUDF::new_from_impl(JsonbGetTextIdx::new()).name().to_owned(),
-            ScalarUDF::new_from_impl(JsonbExists::new()).name().to_owned(),
-            ScalarUDF::new_from_impl(JsonbContains::new()).name().to_owned(),
-            ScalarUDF::new_from_impl(JsonbContainedBy::new()).name().to_owned(),
-            ScalarUDF::new_from_impl(JsonTypeof::new()).name().to_owned(),
-            ScalarUDF::new_from_impl(JsonBuildObject::new()).name().to_owned(),
-            ScalarUDF::new_from_impl(JsonBuildArray::new()).name().to_owned(),
+            ScalarUDF::new_from_impl(JsonbGetIdx::new())
+                .name()
+                .to_owned(),
+            ScalarUDF::new_from_impl(JsonbGetText::new())
+                .name()
+                .to_owned(),
+            ScalarUDF::new_from_impl(JsonbGetTextIdx::new())
+                .name()
+                .to_owned(),
+            ScalarUDF::new_from_impl(JsonbExists::new())
+                .name()
+                .to_owned(),
+            ScalarUDF::new_from_impl(JsonbContains::new())
+                .name()
+                .to_owned(),
+            ScalarUDF::new_from_impl(JsonbContainedBy::new())
+                .name()
+                .to_owned(),
+            ScalarUDF::new_from_impl(JsonTypeof::new())
+                .name()
+                .to_owned(),
+            ScalarUDF::new_from_impl(JsonBuildObject::new())
+                .name()
+                .to_owned(),
+            ScalarUDF::new_from_impl(JsonBuildArray::new())
+                .name()
+                .to_owned(),
             ScalarUDF::new_from_impl(ToJsonb::new()).name().to_owned(),
         ];
         for name in &names {
@@ -2030,9 +2052,7 @@ mod tests {
         // Then: get 'address'
         let addr = json_types::jsonb_get_field(user, "address").unwrap();
         // Then: get_text 'city'
-        let city = json_types::jsonb_to_text(
-            json_types::jsonb_get_field(addr, "city").unwrap(),
-        );
+        let city = json_types::jsonb_to_text(json_types::jsonb_get_field(addr, "city").unwrap());
         assert_eq!(city, Some("London".to_owned()));
     }
 

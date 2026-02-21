@@ -158,8 +158,10 @@ impl FormatDecoder for JsonDecoder {
         let mut builders = create_builders(&self.schema, capacity);
 
         // Optional _extra JSONB column for CollectExtra strategy.
-        let collect_extra =
-            matches!(self.config.unknown_fields, UnknownFieldStrategy::CollectExtra);
+        let collect_extra = matches!(
+            self.config.unknown_fields,
+            UnknownFieldStrategy::CollectExtra
+        );
         let mut extra_builder = if collect_extra {
             Some(LargeBinaryBuilder::with_capacity(capacity, capacity * 64))
         } else {
@@ -173,10 +175,8 @@ impl FormatDecoder for JsonDecoder {
         };
 
         for record in records {
-            let value: serde_json::Value =
-                serde_json::from_slice(&record.value).map_err(|e| {
-                    SchemaError::DecodeError(format!("JSON parse error: {e}"))
-                })?;
+            let value: serde_json::Value = serde_json::from_slice(&record.value)
+                .map_err(|e| SchemaError::DecodeError(format!("JSON parse error: {e}")))?;
 
             let obj = value.as_object().ok_or_else(|| {
                 SchemaError::DecodeError("top-level JSON value must be an object".into())
@@ -235,13 +235,11 @@ impl FormatDecoder for JsonDecoder {
                     if extra.is_empty() {
                         eb.append_null();
                     } else {
-                        let mut enc =
-                            jsonb_encoder.as_mut().map_or_else(JsonbEncoder::new, |_| {
-                                // Borrow-safe: take a fresh encoder for extra.
-                                JsonbEncoder::new()
-                            });
-                        let bytes =
-                            enc.encode(&serde_json::Value::Object(extra.clone()));
+                        let mut enc = jsonb_encoder.as_mut().map_or_else(JsonbEncoder::new, |_| {
+                            // Borrow-safe: take a fresh encoder for extra.
+                            JsonbEncoder::new()
+                        });
+                        let bytes = enc.encode(&serde_json::Value::Object(extra.clone()));
                         eb.append_value(&bytes);
                     }
                 } else {
@@ -251,8 +249,7 @@ impl FormatDecoder for JsonDecoder {
         }
 
         // Finish all builders into arrays.
-        let mut columns: Vec<ArrayRef> =
-            builders.into_iter().map(|mut b| b.finish()).collect();
+        let mut columns: Vec<ArrayRef> = builders.into_iter().map(|mut b| b.finish()).collect();
 
         // Append _extra column if present.
         let final_schema = if let Some(mut eb) = extra_builder {
@@ -342,15 +339,13 @@ fn create_builder(data_type: &DataType, capacity: usize) -> Box<dyn ColumnBuilde
         DataType::Int64 => Box::new(Int64Builder::with_capacity(capacity)),
         DataType::Float32 => Box::new(Float32Builder::with_capacity(capacity)),
         DataType::Float64 => Box::new(Float64Builder::with_capacity(capacity)),
-        DataType::LargeUtf8 => {
-            Box::new(LargeStringBuilder::with_capacity(capacity, capacity * 32))
-        }
+        DataType::LargeUtf8 => Box::new(LargeStringBuilder::with_capacity(capacity, capacity * 32)),
         DataType::LargeBinary => {
             Box::new(LargeBinaryBuilder::with_capacity(capacity, capacity * 64))
         }
         DataType::Timestamp(TimeUnit::Nanosecond, tz) => {
-            let builder = TimestampNanosecondBuilder::with_capacity(capacity)
-                .with_timezone_opt(tz.clone());
+            let builder =
+                TimestampNanosecondBuilder::with_capacity(capacity).with_timezone_opt(tz.clone());
             Box::new(builder)
         }
         // Fallback: serialize as JSON string.
@@ -379,7 +374,10 @@ fn append_value(
 
     match target_type {
         DataType::Boolean => {
-            let b = builder.as_any_mut().downcast_mut::<BooleanBuilder>().unwrap();
+            let b = builder
+                .as_any_mut()
+                .downcast_mut::<BooleanBuilder>()
+                .unwrap();
             match extract_bool(value, config) {
                 Ok(v) => b.append_value(v),
                 Err(e) => handle_mismatch(builder, config, mismatch_count, &e)?,
@@ -400,14 +398,20 @@ fn append_value(
             }
         }
         DataType::Float32 => {
-            let b = builder.as_any_mut().downcast_mut::<Float32Builder>().unwrap();
+            let b = builder
+                .as_any_mut()
+                .downcast_mut::<Float32Builder>()
+                .unwrap();
             match extract_f32(value, config) {
                 Ok(v) => b.append_value(v),
                 Err(e) => handle_mismatch(builder, config, mismatch_count, &e)?,
             }
         }
         DataType::Float64 => {
-            let b = builder.as_any_mut().downcast_mut::<Float64Builder>().unwrap();
+            let b = builder
+                .as_any_mut()
+                .downcast_mut::<Float64Builder>()
+                .unwrap();
             match extract_f64(value, config) {
                 Ok(v) => b.append_value(v),
                 Err(e) => handle_mismatch(builder, config, mismatch_count, &e)?,
@@ -447,7 +451,10 @@ fn append_value(
         }
         // Unsupported types: serialize as JSON string.
         _ => {
-            let b = builder.as_any_mut().downcast_mut::<StringBuilder>().unwrap();
+            let b = builder
+                .as_any_mut()
+                .downcast_mut::<StringBuilder>()
+                .unwrap();
             let s = value_to_string(value);
             b.append_value(&s);
         }
@@ -474,9 +481,9 @@ fn handle_mismatch(
             builder.append_null_value();
             Ok(())
         }
-        TypeMismatchStrategy::Reject => {
-            Err(SchemaError::DecodeError(format!("type mismatch: {error_msg}")))
-        }
+        TypeMismatchStrategy::Reject => Err(SchemaError::DecodeError(format!(
+            "type mismatch: {error_msg}"
+        ))),
     }
 }
 
@@ -615,10 +622,7 @@ fn extract_timestamp_nanos(
         return Err(format!("cannot parse timestamp from string: {s}"));
     }
 
-    Err(format!(
-        "expected timestamp, got {}",
-        json_type_name(value)
-    ))
+    Err(format!("expected timestamp, got {}", json_type_name(value)))
 }
 
 fn value_to_string(value: &serde_json::Value) -> String {
@@ -680,7 +684,13 @@ mod tests {
         let batch = decoder.decode_batch(&records).unwrap();
 
         assert_eq!(batch.num_rows(), 1);
-        assert_eq!(batch.column(0).as_primitive::<arrow_array::types::Int64Type>().value(0), 42);
+        assert_eq!(
+            batch
+                .column(0)
+                .as_primitive::<arrow_array::types::Int64Type>()
+                .value(0),
+            42
+        );
         assert_eq!(batch.column(1).as_string::<i32>().value(0), "Alice");
     }
 
@@ -699,7 +709,9 @@ mod tests {
         let batch = decoder.decode_batch(&records).unwrap();
 
         assert_eq!(batch.num_rows(), 3);
-        let x_col = batch.column(0).as_primitive::<arrow_array::types::Int64Type>();
+        let x_col = batch
+            .column(0)
+            .as_primitive::<arrow_array::types::Int64Type>();
         assert_eq!(x_col.value(0), 1);
         assert_eq!(x_col.value(1), 2);
         assert_eq!(x_col.value(2), 3);
@@ -721,8 +733,17 @@ mod tests {
 
         assert_eq!(batch.num_rows(), 1);
         assert!(batch.column(0).as_boolean().value(0));
-        assert_eq!(batch.column(1).as_primitive::<arrow_array::types::Int64Type>().value(0), 42);
-        let f = batch.column(2).as_primitive::<arrow_array::types::Float64Type>().value(0);
+        assert_eq!(
+            batch
+                .column(1)
+                .as_primitive::<arrow_array::types::Int64Type>()
+                .value(0),
+            42
+        );
+        let f = batch
+            .column(2)
+            .as_primitive::<arrow_array::types::Float64Type>()
+            .value(0);
         assert!((f - 3.14).abs() < f64::EPSILON);
         assert_eq!(batch.column(3).as_string::<i32>().value(0), "hello");
     }
@@ -753,7 +774,13 @@ mod tests {
         let records = vec![json_record(r#"{"a": 1}"#)]; // "b" missing
         let batch = decoder.decode_batch(&records).unwrap();
 
-        assert_eq!(batch.column(0).as_primitive::<arrow_array::types::Int64Type>().value(0), 1);
+        assert_eq!(
+            batch
+                .column(0)
+                .as_primitive::<arrow_array::types::Int64Type>()
+                .value(0),
+            1
+        );
         assert!(batch.column(1).is_null(0));
     }
 
@@ -781,7 +808,13 @@ mod tests {
         let records = vec![json_record(r#"{"x": "123"}"#)];
         let batch = decoder.decode_batch(&records).unwrap();
 
-        assert_eq!(batch.column(0).as_primitive::<arrow_array::types::Int64Type>().value(0), 123);
+        assert_eq!(
+            batch
+                .column(0)
+                .as_primitive::<arrow_array::types::Int64Type>()
+                .value(0),
+            123
+        );
     }
 
     #[test]
@@ -943,7 +976,13 @@ mod tests {
         let record = json_record(r#"{"x": 99}"#);
         let batch = decoder.decode_one(&record).unwrap();
         assert_eq!(batch.num_rows(), 1);
-        assert_eq!(batch.column(0).as_primitive::<arrow_array::types::Int64Type>().value(0), 99);
+        assert_eq!(
+            batch
+                .column(0)
+                .as_primitive::<arrow_array::types::Int64Type>()
+                .value(0),
+            99
+        );
     }
 
     // ── Int/Float numeric coercion ────────────────────────────
@@ -967,7 +1006,10 @@ mod tests {
         let decoder = JsonDecoder::new(schema);
         let records = vec![json_record(r#"{"x": 42}"#)];
         let batch = decoder.decode_batch(&records).unwrap();
-        let val = batch.column(0).as_primitive::<arrow_array::types::Float64Type>().value(0);
+        let val = batch
+            .column(0)
+            .as_primitive::<arrow_array::types::Float64Type>()
+            .value(0);
         assert!((val - 42.0).abs() < f64::EPSILON);
     }
 }

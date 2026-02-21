@@ -281,8 +281,7 @@ pub fn analyze_join(select: &Select) -> Result<Option<JoinAnalysis>, ParseError>
 
     // Check for temporal join (FOR SYSTEM_TIME AS OF)
     if let Some(version_col) = extract_temporal_version(&join.relation) {
-        let (left_key, right_key, additional, _) =
-            analyze_join_constraint(&join.join_operator)?;
+        let (left_key, right_key, additional, _) = analyze_join_constraint(&join.join_operator)?;
         let mut analysis = JoinAnalysis::temporal(
             left_table,
             right_table,

@@ -80,9 +80,7 @@ impl FormatEncoder for AvroFormatEncoder {
         let mut writer = WriterBuilder::new(arrow_schema)
             .with_fingerprint_strategy(FingerprintStrategy::Id(self.schema_id))
             .build::<_, AvroSoeFormat>(&mut buf)
-            .map_err(|e| {
-                SchemaError::DecodeError(format!("failed to build Avro writer: {e}"))
-            })?;
+            .map_err(|e| SchemaError::DecodeError(format!("failed to build Avro writer: {e}")))?;
 
         writer
             .write(batch)
@@ -118,15 +116,10 @@ fn split_confluent_records(buf: &[u8], expected: usize) -> SchemaResult<Vec<Vec<
         // Find next record boundary.
         let schema_id_bytes = buf
             .get(offset + 1..offset + CONFLUENT_HEADER_SIZE)
-            .ok_or_else(|| {
-                SchemaError::DecodeError("truncated Confluent header".into())
-            })?;
+            .ok_or_else(|| SchemaError::DecodeError("truncated Confluent header".into()))?;
 
-        let next_start = find_next_record(
-            &buf[offset + CONFLUENT_HEADER_SIZE..],
-            schema_id_bytes,
-        )
-        .map_or(buf.len(), |pos| offset + CONFLUENT_HEADER_SIZE + pos);
+        let next_start = find_next_record(&buf[offset + CONFLUENT_HEADER_SIZE..], schema_id_bytes)
+            .map_or(buf.len(), |pos| offset + CONFLUENT_HEADER_SIZE + pos);
 
         records.push(buf[offset..next_start].to_vec());
         offset = next_start;

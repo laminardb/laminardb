@@ -65,10 +65,7 @@ impl AvroFormatDecoder {
     /// # Errors
     ///
     /// Returns [`SchemaError::DecodeError`] if the schema cannot be parsed.
-    pub fn new_raw(
-        output_schema: SchemaRef,
-        avro_schema_json: &str,
-    ) -> SchemaResult<Self> {
+    pub fn new_raw(output_schema: SchemaRef, avro_schema_json: &str) -> SchemaResult<Self> {
         let mut store = SchemaStore::new_with_type(FingerprintAlgorithm::Id);
         let avro_schema = AvroSchema::new(avro_schema_json.to_string());
         // Register with ID 0 for raw mode.
@@ -109,11 +106,7 @@ impl AvroFormatDecoder {
     ///
     /// Returns [`SchemaError::DecodeError`] if the schema cannot be registered.
     #[allow(clippy::cast_sign_loss)]
-    pub fn register_schema(
-        &mut self,
-        schema_id: i32,
-        avro_schema_json: &str,
-    ) -> SchemaResult<()> {
+    pub fn register_schema(&mut self, schema_id: i32, avro_schema_json: &str) -> SchemaResult<()> {
         let avro_schema = AvroSchema::new(avro_schema_json.to_string());
         // Use Fingerprint::Id directly — NOT load_fingerprint_id which
         // applies from_be byte-swap meant for raw wire bytes.
@@ -198,8 +191,7 @@ impl FormatDecoder for AvroFormatDecoder {
         match self.mode {
             AvroDecoderMode::Raw => {
                 // Raw mode: pass record values directly.
-                let slices: Vec<&[u8]> =
-                    records.iter().map(|r| r.value.as_slice()).collect();
+                let slices: Vec<&[u8]> = records.iter().map(|r| r.value.as_slice()).collect();
                 self.decode_slices(&slices)
             }
             AvroDecoderMode::Confluent => {
@@ -207,8 +199,7 @@ impl FormatDecoder for AvroFormatDecoder {
                 // Records keep their Confluent header — arrow-avro handles it
                 // natively when the schema store is configured with
                 // FingerprintAlgorithm::Id.
-                let slices: Vec<&[u8]> =
-                    records.iter().map(|r| r.value.as_slice()).collect();
+                let slices: Vec<&[u8]> = records.iter().map(|r| r.value.as_slice()).collect();
 
                 // Validate that all records have the Confluent magic byte
                 // and that the schema IDs are registered.
@@ -227,9 +218,7 @@ impl FormatDecoder for AvroFormatDecoder {
                             slice[0]
                         )));
                     }
-                    let sid = i32::from_be_bytes([
-                        slice[1], slice[2], slice[3], slice[4],
-                    ]);
+                    let sid = i32::from_be_bytes([slice[1], slice[2], slice[3], slice[4]]);
                     if !self.known_ids.contains(&sid) {
                         return Err(SchemaError::DecodeError(format!(
                             "unknown schema ID {sid} in record {i} — \
@@ -276,10 +265,7 @@ mod tests {
 
     #[test]
     fn test_new_raw_decoder() {
-        let dec = AvroFormatDecoder::new_raw(
-            test_arrow_schema(),
-            TEST_SCHEMA_JSON,
-        );
+        let dec = AvroFormatDecoder::new_raw(test_arrow_schema(), TEST_SCHEMA_JSON);
         assert!(dec.is_ok());
         let dec = dec.unwrap();
         assert_eq!(dec.mode(), AvroDecoderMode::Raw);
@@ -385,9 +371,6 @@ mod tests {
         // i32::MAX
         let mut data = vec![0x00];
         data.extend_from_slice(&i32::MAX.to_be_bytes());
-        assert_eq!(
-            AvroFormatDecoder::extract_schema_id(&data),
-            Some(i32::MAX)
-        );
+        assert_eq!(AvroFormatDecoder::extract_schema_id(&data), Some(i32::MAX));
     }
 }

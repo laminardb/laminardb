@@ -55,38 +55,37 @@ pub mod parquet;
 
 // ── Re-exports for convenience ─────────────────────────────────────
 
+#[cfg(feature = "kafka")]
+pub use avro::{
+    avro_to_arrow_schema, avro_to_arrow_type, AvroDecoderMode, AvroFormatDecoder, AvroFormatEncoder,
+};
+pub use csv::{CsvDecoder, CsvDecoderConfig, FieldCountMismatchStrategy};
 pub use error::{SchemaError, SchemaResult};
+pub use evolution::{
+    diff_schemas_by_name, is_safe_widening, DefaultSchemaEvolver, EvolutionResult,
+    EvolutionTrigger, SchemaEvolutionEngine, SchemaHistory, SchemaHistoryEntry,
+};
 pub use inference::{
     CsvFormatInference, FormatInference, FormatInferenceRegistry, JsonFormatInference,
     RawFormatInference, FORMAT_INFERENCE_REGISTRY,
 };
-pub use resolver::{
-    DeclaredColumn, DeclaredSchema, FieldOrigin, ResolutionKind, ResolvedSchema, SchemaResolver,
-};
-pub use traits::{
-    ColumnProjection, CompatibilityMode, ConfigOption, ConfigValueType, ConnectorConfigSchema,
-    EvolutionVerdict, FieldInferenceDetail, FormatDecoder, FormatEncoder, InferenceConfig,
-    InferenceWarning, InferredSchema, NumberInference, ArrayInference, RegisteredSchema,
-    RegistryConfig, RegistryCredentials, RegistrySchemaType, SchemaChange, SchemaEvolvable,
-    SchemaInferable, SchemaProvider, SchemaRegistryAware, WarningSeverity,
-};
-pub use types::{FieldMeta, RawRecord, SinkConfig, SourceConfig, SourceMetadata};
-pub use csv::{CsvDecoder, CsvDecoderConfig, FieldCountMismatchStrategy};
-pub use evolution::{
-    DefaultSchemaEvolver, EvolutionResult, EvolutionTrigger, SchemaEvolutionEngine,
-    SchemaHistory, SchemaHistoryEntry, diff_schemas_by_name, is_safe_widening,
-};
 pub use json::{
-    JsonDecoder, JsonDecoderConfig, JsonEncoder, JsonbAccessor, JsonbEncoder,
-    TypeMismatchStrategy, UnknownFieldStrategy,
-};
-#[cfg(feature = "kafka")]
-pub use avro::{
-    AvroDecoderMode, AvroFormatDecoder, AvroFormatEncoder, avro_to_arrow_schema,
-    avro_to_arrow_type,
+    JsonDecoder, JsonDecoderConfig, JsonEncoder, JsonbAccessor, JsonbEncoder, TypeMismatchStrategy,
+    UnknownFieldStrategy,
 };
 #[cfg(feature = "parquet-lookup")]
 pub use parquet::{
     ParquetDecoder, ParquetDecoderConfig, ParquetEncoder, ParquetEncoderConfig,
     ParquetSchemaProvider, RowGroupPredicate,
 };
+pub use resolver::{
+    DeclaredColumn, DeclaredSchema, FieldOrigin, ResolutionKind, ResolvedSchema, SchemaResolver,
+};
+pub use traits::{
+    ArrayInference, ColumnProjection, CompatibilityMode, ConfigOption, ConfigValueType,
+    ConnectorConfigSchema, EvolutionVerdict, FieldInferenceDetail, FormatDecoder, FormatEncoder,
+    InferenceConfig, InferenceWarning, InferredSchema, NumberInference, RegisteredSchema,
+    RegistryConfig, RegistryCredentials, RegistrySchemaType, SchemaChange, SchemaEvolvable,
+    SchemaInferable, SchemaProvider, SchemaRegistryAware, WarningSeverity,
+};
+pub use types::{FieldMeta, RawRecord, SinkConfig, SourceConfig, SourceMetadata};

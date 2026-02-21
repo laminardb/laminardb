@@ -18,7 +18,7 @@ use arrow::record_batch::RecordBatch;
 use arrow_array::{Int64Array, LargeBinaryArray, StringArray};
 use datafusion::catalog::{TableFunctionImpl, TableProvider};
 use datafusion::datasource::MemTable;
-use datafusion_common::{Result, ScalarValue, plan_err};
+use datafusion_common::{plan_err, Result, ScalarValue};
 use datafusion_expr::Expr;
 
 use super::json_types;
@@ -45,10 +45,9 @@ fn extract_jsonb_literal(expr: &Expr) -> Result<Option<Vec<u8>>> {
         Expr::Literal(ScalarValue::Null | ScalarValue::Utf8(None), _) => Ok(None),
         // Also accept Utf8 string literals (parse as JSON then encode to JSONB)
         Expr::Literal(ScalarValue::Utf8(Some(s)), _) => {
-            let json_val: serde_json::Value = serde_json::from_str(s)
-                .map_err(|e| datafusion_common::DataFusionError::Plan(
-                    format!("invalid JSON literal: {e}")
-                ))?;
+            let json_val: serde_json::Value = serde_json::from_str(s).map_err(|e| {
+                datafusion_common::DataFusionError::Plan(format!("invalid JSON literal: {e}"))
+            })?;
             Ok(Some(json_types::encode_jsonb(&json_val)))
         }
         other => plan_err!(
@@ -128,11 +127,14 @@ fn jsonb_object_entries(data: &[u8]) -> Option<Vec<(String, Vec<u8>)>> {
     let mut entries = Vec::with_capacity(count);
     for i in 0..count {
         let base = offsets_start + i * 8;
-        let key_off = u32::from_le_bytes([
-            data[base], data[base + 1], data[base + 2], data[base + 3],
-        ]) as usize;
+        let key_off =
+            u32::from_le_bytes([data[base], data[base + 1], data[base + 2], data[base + 3]])
+                as usize;
         let val_off = u32::from_le_bytes([
-            data[base + 4], data[base + 5], data[base + 6], data[base + 7],
+            data[base + 4],
+            data[base + 5],
+            data[base + 6],
+            data[base + 7],
         ]) as usize;
 
         // Key at data_start + key_off: u16 LE length + UTF-8 bytes
@@ -140,8 +142,7 @@ fn jsonb_object_entries(data: &[u8]) -> Option<Vec<(String, Vec<u8>)>> {
         if key_abs + 2 > data.len() {
             continue;
         }
-        let key_len =
-            u16::from_le_bytes([data[key_abs], data[key_abs + 1]]) as usize;
+        let key_len = u16::from_le_bytes([data[key_abs], data[key_abs + 1]]) as usize;
         let key_start = key_abs + 2;
         let key_end = key_start + key_len;
         if key_end > data.len() {
@@ -194,8 +195,7 @@ impl TableFunctionImpl for JsonbArrayElementsTvf {
 
         match elements {
             Some(elems) if !elems.is_empty() => {
-                let values: Vec<Option<&[u8]>> =
-                    elems.iter().map(|e| Some(e.as_slice())).collect();
+                let values: Vec<Option<&[u8]>> = elems.iter().map(|e| Some(e.as_slice())).collect();
                 let ordinality = ordinality_vec(elems.len());
                 let batch = RecordBatch::try_new(
                     Arc::clone(&schema),
@@ -204,9 +204,7 @@ impl TableFunctionImpl for JsonbArrayElementsTvf {
                         Arc::new(Int64Array::from(ordinality)),
                     ],
                 )?;
-                Ok(Arc::new(
-                    MemTable::try_new(schema, vec![vec![batch]])?,
-                ))
+                Ok(Arc::new(MemTable::try_new(schema, vec![vec![batch]])?))
             }
             _ => Ok(Arc::new(MemTable::try_new(schema, vec![vec![]])?)),
         }
@@ -236,10 +234,8 @@ impl TableFunctionImpl for JsonbArrayElementsTextTvf {
 
         match elements {
             Some(elems) if !elems.is_empty() => {
-                let texts: Vec<Option<String>> = elems
-                    .iter()
-                    .map(|e| json_types::jsonb_to_text(e))
-                    .collect();
+                let texts: Vec<Option<String>> =
+                    elems.iter().map(|e| json_types::jsonb_to_text(e)).collect();
                 let ordinality = ordinality_vec(elems.len());
                 let batch = RecordBatch::try_new(
                     Arc::clone(&schema),
@@ -248,9 +244,7 @@ impl TableFunctionImpl for JsonbArrayElementsTextTvf {
                         Arc::new(Int64Array::from(ordinality)),
                     ],
                 )?;
-                Ok(Arc::new(
-                    MemTable::try_new(schema, vec![vec![batch]])?,
-                ))
+                Ok(Arc::new(MemTable::try_new(schema, vec![vec![batch]])?))
             }
             _ => Ok(Arc::new(MemTable::try_new(schema, vec![vec![]])?)),
         }
@@ -293,9 +287,7 @@ impl TableFunctionImpl for JsonbEachTvf {
                         Arc::new(Int64Array::from(ordinality)),
                     ],
                 )?;
-                Ok(Arc::new(
-                    MemTable::try_new(schema, vec![vec![batch]])?,
-                ))
+                Ok(Arc::new(MemTable::try_new(schema, vec![vec![batch]])?))
             }
             _ => Ok(Arc::new(MemTable::try_new(schema, vec![vec![]])?)),
         }
@@ -340,9 +332,7 @@ impl TableFunctionImpl for JsonbEachTextTvf {
                         Arc::new(Int64Array::from(ordinality)),
                     ],
                 )?;
-                Ok(Arc::new(
-                    MemTable::try_new(schema, vec![vec![batch]])?,
-                ))
+                Ok(Arc::new(MemTable::try_new(schema, vec![vec![batch]])?))
             }
             _ => Ok(Arc::new(MemTable::try_new(schema, vec![vec![]])?)),
         }
@@ -381,9 +371,7 @@ impl TableFunctionImpl for JsonbObjectKeysTvf {
                         Arc::new(Int64Array::from(ordinality)),
                     ],
                 )?;
-                Ok(Arc::new(
-                    MemTable::try_new(schema, vec![vec![batch]])?,
-                ))
+                Ok(Arc::new(MemTable::try_new(schema, vec![vec![batch]])?))
             }
             _ => Ok(Arc::new(MemTable::try_new(schema, vec![vec![]])?)),
         }
@@ -394,10 +382,7 @@ impl TableFunctionImpl for JsonbObjectKeysTvf {
 
 /// Registers all JSON table-valued functions with the `SessionContext`.
 pub fn register_json_table_functions(ctx: &datafusion::prelude::SessionContext) {
-    ctx.register_udtf(
-        "jsonb_array_elements",
-        Arc::new(JsonbArrayElementsTvf),
-    );
+    ctx.register_udtf("jsonb_array_elements", Arc::new(JsonbArrayElementsTvf));
     ctx.register_udtf(
         "jsonb_array_elements_text",
         Arc::new(JsonbArrayElementsTextTvf),
@@ -546,10 +531,7 @@ mod tests {
         let ctx = SessionContext::new();
         register_json_table_functions(&ctx);
 
-        let df = ctx
-            .sql("SELECT key FROM jsonb_each('{}')")
-            .await
-            .unwrap();
+        let df = ctx.sql("SELECT key FROM jsonb_each('{}')").await.unwrap();
         let batches = df.collect().await.unwrap();
         let total: usize = batches.iter().map(RecordBatch::num_rows).sum();
         assert_eq!(total, 0);

@@ -16,8 +16,8 @@ use std::sync::Arc;
 
 use arrow::datatypes::DataType;
 use arrow_array::{
-    Array, LargeBinaryArray, ListArray, MapArray, StringArray,
     builder::{LargeBinaryBuilder, StringBuilder},
+    Array, LargeBinaryArray, ListArray, MapArray, StringArray,
 };
 use datafusion_common::Result;
 use datafusion_expr::{
@@ -127,9 +127,8 @@ impl ScalarUDFImpl for JsonbMerge {
                         for (k, v) in r {
                             l.insert(k, v);
                         }
-                        builder.append_value(json_types::encode_jsonb(
-                            &serde_json::Value::Object(l),
-                        ));
+                        builder
+                            .append_value(json_types::encode_jsonb(&serde_json::Value::Object(l)));
                     }
                     (_, Some(r)) => {
                         builder.append_value(json_types::encode_jsonb(&r));
@@ -257,8 +256,8 @@ impl ScalarUDFImpl for JsonbDeepMerge {
                 let right_val = json_types::jsonb_to_value(right_arr.value(i));
                 match (left_val, right_val) {
                     (Some(l), Some(r)) => {
-                        let merged =
-                            deep_merge(l, r, 0).map_err(datafusion_common::DataFusionError::Execution)?;
+                        let merged = deep_merge(l, r, 0)
+                            .map_err(datafusion_common::DataFusionError::Execution)?;
                         builder.append_value(json_types::encode_jsonb(&merged));
                     }
                     _ => builder.append_null(),
@@ -486,14 +485,13 @@ impl ScalarUDFImpl for JsonbRenameKeys {
                         let renamed: serde_json::Map<String, serde_json::Value> = obj
                             .into_iter()
                             .map(|(k, v)| {
-                                let new_key =
-                                    rename_map.get(k.as_str()).cloned().unwrap_or(k);
+                                let new_key = rename_map.get(k.as_str()).cloned().unwrap_or(k);
                                 (new_key, v)
                             })
                             .collect();
-                        builder.append_value(json_types::encode_jsonb(
-                            &serde_json::Value::Object(renamed),
-                        ));
+                        builder.append_value(json_types::encode_jsonb(&serde_json::Value::Object(
+                            renamed,
+                        )));
                     }
                     Some(other) => {
                         builder.append_value(json_types::encode_jsonb(&other));
@@ -507,10 +505,7 @@ impl ScalarUDFImpl for JsonbRenameKeys {
 }
 
 /// Extract a `HashMap<String, String>` from a `MapArray` at row `i`.
-fn extract_string_map(
-    map_arr: &MapArray,
-    row: usize,
-) -> std::collections::HashMap<String, String> {
+fn extract_string_map(map_arr: &MapArray, row: usize) -> std::collections::HashMap<String, String> {
     let mut result = std::collections::HashMap::new();
     let entries = map_arr.value(row);
     let struct_arr = entries
@@ -635,9 +630,9 @@ impl ScalarUDFImpl for JsonbPick {
                             .into_iter()
                             .filter(|(k, _)| key_set.contains(k.as_str()))
                             .collect();
-                        builder.append_value(json_types::encode_jsonb(
-                            &serde_json::Value::Object(picked),
-                        ));
+                        builder.append_value(json_types::encode_jsonb(&serde_json::Value::Object(
+                            picked,
+                        )));
                     }
                     Some(other) => {
                         builder.append_value(json_types::encode_jsonb(&other));
@@ -765,9 +760,9 @@ impl ScalarUDFImpl for JsonbExcept {
                             .into_iter()
                             .filter(|(k, _)| !exclude_set.contains(k.as_str()))
                             .collect();
-                        builder.append_value(json_types::encode_jsonb(
-                            &serde_json::Value::Object(filtered),
-                        ));
+                        builder.append_value(json_types::encode_jsonb(&serde_json::Value::Object(
+                            filtered,
+                        )));
                     }
                     Some(other) => {
                         builder.append_value(json_types::encode_jsonb(&other));
@@ -911,9 +906,9 @@ impl ScalarUDFImpl for JsonbFlatten {
                         let mut flat = serde_json::Map::new();
                         flatten_value(&val, "", sep, &mut flat, 0)
                             .map_err(datafusion_common::DataFusionError::Execution)?;
-                        builder.append_value(json_types::encode_jsonb(
-                            &serde_json::Value::Object(flat),
-                        ));
+                        builder.append_value(json_types::encode_jsonb(&serde_json::Value::Object(
+                            flat,
+                        )));
                     }
                     None => builder.append_null(),
                 }
@@ -970,11 +965,7 @@ impl Hash for JsonbUnflatten {
     }
 }
 
-fn unflatten_insert(
-    root: &mut serde_json::Value,
-    parts: &[&str],
-    value: serde_json::Value,
-) {
+fn unflatten_insert(root: &mut serde_json::Value, parts: &[&str], value: serde_json::Value) {
     if parts.is_empty() {
         return;
     }
@@ -1036,8 +1027,7 @@ impl ScalarUDFImpl for JsonbUnflatten {
                 let sep = sep_arr.value(i);
                 match json_types::jsonb_to_value(jsonb_arr.value(i)) {
                     Some(serde_json::Value::Object(flat)) => {
-                        let mut root =
-                            serde_json::Value::Object(serde_json::Map::new());
+                        let mut root = serde_json::Value::Object(serde_json::Map::new());
                         for (key, val) in flat {
                             let parts: Vec<&str> = key.split(sep).collect();
                             unflatten_insert(&mut root, &parts, val);
@@ -1109,10 +1099,7 @@ fn parse_type_spec_fields(spec: &str) -> Vec<String> {
     spec.split(',')
         .filter_map(|part| {
             let trimmed = part.trim();
-            trimmed
-                .split_whitespace()
-                .next()
-                .map(ToOwned::to_owned)
+            trimmed.split_whitespace().next().map(ToOwned::to_owned)
         })
         .collect()
 }
@@ -1159,17 +1146,16 @@ impl ScalarUDFImpl for JsonToColumns {
                 builder.append_null();
             } else {
                 let fields = parse_type_spec_fields(spec_arr.value(i));
-                let field_set: HashSet<&str> =
-                    fields.iter().map(String::as_str).collect();
+                let field_set: HashSet<&str> = fields.iter().map(String::as_str).collect();
                 match json_types::jsonb_to_value(jsonb_arr.value(i)) {
                     Some(serde_json::Value::Object(obj)) => {
                         let picked: serde_json::Map<String, serde_json::Value> = obj
                             .into_iter()
                             .filter(|(k, _)| field_set.contains(k.as_str()))
                             .collect();
-                        builder.append_value(json_types::encode_jsonb(
-                            &serde_json::Value::Object(picked),
-                        ));
+                        builder.append_value(json_types::encode_jsonb(&serde_json::Value::Object(
+                            picked,
+                        )));
                     }
                     Some(other) => {
                         builder.append_value(json_types::encode_jsonb(&other));
@@ -1291,12 +1277,7 @@ impl ScalarUDFImpl for JsonInferSchema {
                     Some(serde_json::Value::Object(obj)) => {
                         let schema: serde_json::Map<String, serde_json::Value> = obj
                             .iter()
-                            .map(|(k, v)| {
-                                (
-                                    k.clone(),
-                                    serde_json::Value::String(infer_type(v)),
-                                )
-                            })
+                            .map(|(k, v)| (k.clone(), serde_json::Value::String(infer_type(v))))
                             .collect();
                         builder.append_value(
                             serde_json::to_string(&serde_json::Value::Object(schema))
@@ -1341,8 +1322,8 @@ pub fn register_json_extensions(ctx: &datafusion::prelude::SessionContext) {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use arrow_array::ArrayRef;
     use arrow_array::builder::{MapBuilder, StringBuilder as MapSB};
+    use arrow_array::ArrayRef;
     use arrow_schema::Field;
     use datafusion_common::config::ConfigOptions;
     use serde_json::json;
@@ -1456,9 +1437,7 @@ mod tests {
     fn test_json_ext_strip_nulls() {
         let udf = JsonbStripNulls::new();
         let input = make_jsonb_array(&[json!({"a": 1, "b": null, "c": {"d": null, "e": 2}})]);
-        let result = udf
-            .invoke_with_args(make_args_1(Arc::new(input)))
-            .unwrap();
+        let result = udf.invoke_with_args(make_args_1(Arc::new(input))).unwrap();
         assert_eq!(
             decode_jsonb_result(result, 0),
             json!({"a": 1, "c": {"e": 2}})
@@ -1469,13 +1448,8 @@ mod tests {
     fn test_json_ext_strip_nulls_array_preserved() {
         let udf = JsonbStripNulls::new();
         let input = make_jsonb_array(&[json!({"arr": [1, null, 3]})]);
-        let result = udf
-            .invoke_with_args(make_args_1(Arc::new(input)))
-            .unwrap();
-        assert_eq!(
-            decode_jsonb_result(result, 0),
-            json!({"arr": [1, null, 3]})
-        );
+        let result = udf.invoke_with_args(make_args_1(Arc::new(input))).unwrap();
+        assert_eq!(decode_jsonb_result(result, 0), json!({"arr": [1, null, 3]}));
     }
 
     // ── jsonb_rename_keys tests ───────────────────────────────
@@ -1649,7 +1623,9 @@ mod tests {
         use datafusion_expr::ScalarUDF;
 
         let names: Vec<String> = vec![
-            ScalarUDF::new_from_impl(JsonbMerge::new()).name().to_owned(),
+            ScalarUDF::new_from_impl(JsonbMerge::new())
+                .name()
+                .to_owned(),
             ScalarUDF::new_from_impl(JsonbDeepMerge::new())
                 .name()
                 .to_owned(),

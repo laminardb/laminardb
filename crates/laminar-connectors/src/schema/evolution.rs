@@ -28,10 +28,15 @@ use super::traits::{
 pub fn is_safe_widening(from: &DataType, to: &DataType) -> bool {
     matches!(
         (from, to),
-        (DataType::Int8, DataType::Int16 | DataType::Int32 | DataType::Int64)
-            | (DataType::Int16, DataType::Int32 | DataType::Int64)
+        (
+            DataType::Int8,
+            DataType::Int16 | DataType::Int32 | DataType::Int64
+        ) | (DataType::Int16, DataType::Int32 | DataType::Int64)
             | (DataType::Int32, DataType::Int64 | DataType::Float64)
-            | (DataType::UInt8, DataType::UInt16 | DataType::UInt32 | DataType::UInt64)
+            | (
+                DataType::UInt8,
+                DataType::UInt16 | DataType::UInt32 | DataType::UInt64
+            )
             | (DataType::UInt16, DataType::UInt32 | DataType::UInt64)
             | (DataType::UInt32, DataType::UInt64)
             | (
@@ -160,10 +165,7 @@ pub fn diff_schemas_by_name(old: &SchemaRef, new: &SchemaRef) -> Vec<SchemaChang
 
 /// Evaluates a set of schema changes against a compatibility mode.
 #[must_use]
-pub fn evaluate_changes(
-    changes: &[SchemaChange],
-    mode: CompatibilityMode,
-) -> EvolutionVerdict {
+pub fn evaluate_changes(changes: &[SchemaChange], mode: CompatibilityMode) -> EvolutionVerdict {
     if changes.is_empty() {
         return EvolutionVerdict::Compatible;
     }
@@ -301,10 +303,7 @@ fn change_name(change: &SchemaChange) -> &str {
 /// # Errors
 ///
 /// Returns [`SchemaError`] if the changes reference columns that don't exist.
-pub fn apply_changes(
-    old: &SchemaRef,
-    changes: &[SchemaChange],
-) -> SchemaResult<ColumnProjection> {
+pub fn apply_changes(old: &SchemaRef, changes: &[SchemaChange]) -> SchemaResult<ColumnProjection> {
     let mut fields: Vec<Field> = old.fields().iter().map(|f| f.as_ref().clone()).collect();
     let mut old_index_map: Vec<Option<usize>> = (0..fields.len()).map(Some).collect();
 
@@ -326,9 +325,7 @@ pub fn apply_changes(
                     remove_indices.push(idx);
                 }
             }
-            SchemaChange::TypeChanged {
-                name, new_type, ..
-            } => {
+            SchemaChange::TypeChanged { name, new_type, .. } => {
                 if let Some(field) = fields.iter_mut().find(|f| f.name() == name) {
                     *field = Field::new(field.name(), new_type.clone(), field.is_nullable());
                 }
@@ -337,16 +334,14 @@ pub fn apply_changes(
                 name, now_nullable, ..
             } => {
                 if let Some(field) = fields.iter_mut().find(|f| f.name() == name) {
-                    *field =
-                        Field::new(field.name(), field.data_type().clone(), *now_nullable);
+                    *field = Field::new(field.name(), field.data_type().clone(), *now_nullable);
                 }
             }
             SchemaChange::ColumnRenamed {
                 old_name, new_name, ..
             } => {
                 if let Some(field) = fields.iter_mut().find(|f| f.name() == old_name) {
-                    *field =
-                        Field::new(new_name, field.data_type().clone(), field.is_nullable());
+                    *field = Field::new(new_name, field.data_type().clone(), field.is_nullable());
                 }
             }
         }
@@ -438,9 +433,7 @@ impl SchemaHistory {
     /// Returns all versions for a source.
     #[must_use]
     pub fn versions(&self, source_name: &str) -> &[SchemaHistoryEntry] {
-        self.entries
-            .get(source_name)
-            .map_or(&[], |v| v.as_slice())
+        self.entries.get(source_name).map_or(&[], |v| v.as_slice())
     }
 
     /// Returns the latest version number for a source.
@@ -531,9 +524,7 @@ impl SchemaEvolutionEngine {
                     changes,
                 })
             }
-            EvolutionVerdict::Incompatible(reason) => {
-                Err(SchemaError::EvolutionRejected(reason))
-            }
+            EvolutionVerdict::Incompatible(reason) => Err(SchemaError::EvolutionRejected(reason)),
         }
     }
 }
@@ -615,10 +606,7 @@ mod tests {
     #[test]
     fn test_diff_column_added() {
         let old = schema(&[("a", DataType::Int64, false)]);
-        let new = schema(&[
-            ("a", DataType::Int64, false),
-            ("b", DataType::Utf8, true),
-        ]);
+        let new = schema(&[("a", DataType::Int64, false), ("b", DataType::Utf8, true)]);
         let changes = diff_schemas_by_name(&old, &new);
         assert_eq!(changes.len(), 1);
         assert!(matches!(&changes[0], SchemaChange::ColumnAdded { name, .. } if name == "b"));
@@ -626,16 +614,11 @@ mod tests {
 
     #[test]
     fn test_diff_column_removed() {
-        let old = schema(&[
-            ("a", DataType::Int64, false),
-            ("b", DataType::Utf8, true),
-        ]);
+        let old = schema(&[("a", DataType::Int64, false), ("b", DataType::Utf8, true)]);
         let new = schema(&[("a", DataType::Int64, false)]);
         let changes = diff_schemas_by_name(&old, &new);
         assert_eq!(changes.len(), 1);
-        assert!(
-            matches!(&changes[0], SchemaChange::ColumnRemoved { name } if name == "b")
-        );
+        assert!(matches!(&changes[0], SchemaChange::ColumnRemoved { name } if name == "b"));
     }
 
     #[test]
@@ -672,12 +655,9 @@ mod tests {
 
     #[test]
     fn test_diff_multiple_changes() {
-        let old = schema(&[
-            ("a", DataType::Int64, false),
-            ("b", DataType::Utf8, true),
-        ]);
+        let old = schema(&[("a", DataType::Int64, false), ("b", DataType::Utf8, true)]);
         let new = schema(&[
-            ("a", DataType::Int64, true), // nullability changed
+            ("a", DataType::Int64, true),    // nullability changed
             ("c", DataType::Float64, false), // b removed, c added
         ]);
         let changes = diff_schemas_by_name(&old, &new);
@@ -696,9 +676,7 @@ mod tests {
     #[test]
     fn test_evaluate_none_mode_allows_all() {
         let changes = vec![
-            SchemaChange::ColumnRemoved {
-                name: "x".into(),
-            },
+            SchemaChange::ColumnRemoved { name: "x".into() },
             SchemaChange::TypeChanged {
                 name: "y".into(),
                 old_type: DataType::Int64,
@@ -831,13 +809,8 @@ mod tests {
 
     #[test]
     fn test_apply_remove_column() {
-        let old = schema(&[
-            ("a", DataType::Int64, false),
-            ("b", DataType::Utf8, true),
-        ]);
-        let changes = vec![SchemaChange::ColumnRemoved {
-            name: "b".into(),
-        }];
+        let old = schema(&[("a", DataType::Int64, false), ("b", DataType::Utf8, true)]);
+        let changes = vec![SchemaChange::ColumnRemoved { name: "b".into() }];
         let proj = apply_changes(&old, &changes).unwrap();
         assert_eq!(proj.target_schema.fields().len(), 1);
         assert_eq!(proj.target_schema.field(0).name(), "a");
@@ -889,9 +862,7 @@ mod tests {
             ("c", DataType::Utf8, false),
         ]);
         let changes = vec![
-            SchemaChange::ColumnRemoved {
-                name: "c".into(),
-            },
+            SchemaChange::ColumnRemoved { name: "c".into() },
             SchemaChange::ColumnAdded {
                 name: "d".into(),
                 data_type: DataType::Float64,
@@ -919,10 +890,7 @@ mod tests {
     fn test_history_record_and_query() {
         let mut history = SchemaHistory::new();
         let s1 = schema(&[("a", DataType::Int64, false)]);
-        let s2 = schema(&[
-            ("a", DataType::Int64, false),
-            ("b", DataType::Utf8, true),
-        ]);
+        let s2 = schema(&[("a", DataType::Int64, false), ("b", DataType::Utf8, true)]);
 
         let v1 = history.record("test_source", s1, vec![], EvolutionTrigger::Ddl);
         assert_eq!(v1, 1);
@@ -964,10 +932,7 @@ mod tests {
         let mut engine = SchemaEvolutionEngine::new(CompatibilityMode::Backward);
         let evolver = DefaultSchemaEvolver::new(CompatibilityMode::Backward);
         let old = schema(&[("a", DataType::Int64, false)]);
-        let new = schema(&[
-            ("a", DataType::Int64, false),
-            ("b", DataType::Utf8, true),
-        ]);
+        let new = schema(&[("a", DataType::Int64, false), ("b", DataType::Utf8, true)]);
 
         let result = engine
             .evolve("src", &evolver, &old, &new, EvolutionTrigger::Ddl)

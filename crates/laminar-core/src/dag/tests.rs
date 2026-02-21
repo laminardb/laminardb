@@ -3462,10 +3462,7 @@ impl Operator for ChangelogEmittingOperator {
     fn process(&mut self, event: &Event, _ctx: &mut OperatorContext) -> OutputVec {
         use crate::operator::window::ChangelogRecord;
         let mut v = OutputVec::new();
-        v.push(Output::Changelog(ChangelogRecord::insert(
-            event.clone(),
-            0,
-        )));
+        v.push(Output::Changelog(ChangelogRecord::insert(event.clone(), 0)));
         v
     }
     fn on_timer(&mut self, _timer: Timer, _ctx: &mut OperatorContext) -> OutputVec {
@@ -3614,9 +3611,7 @@ fn test_watermark_output_feedback() {
     executor.register_operator(op_id, Box::new(WatermarkEmittingOperator));
 
     // Process an event — the operator will emit Output::Watermark(3000)
-    executor
-        .process_event(src_id, test_event(3000, 1))
-        .unwrap();
+    executor.process_event(src_id, test_event(3000, 1)).unwrap();
 
     // The watermark tracker should have the watermark for the op node (source of the
     // watermark output) and it should propagate to snk.

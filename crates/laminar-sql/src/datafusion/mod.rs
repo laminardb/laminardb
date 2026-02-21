@@ -69,23 +69,29 @@
 pub mod aggregate_bridge;
 mod bridge;
 mod channel_source;
+/// Lambda higher-order functions for arrays and maps (F-SCHEMA-015 Tier 3)
+pub mod complex_type_lambda;
+/// Array, Struct, and Map scalar UDFs (F-SCHEMA-015)
+pub mod complex_type_udf;
 mod exec;
 /// End-to-end streaming SQL execution
 pub mod execute;
-/// Lookup join plan node for DataFusion.
-pub mod lookup_join;
 /// Format bridge UDFs for inline format conversion
 pub mod format_bridge_udf;
-/// PostgreSQL-compatible JSON aggregate UDAFs
-pub mod json_udaf;
-/// JSONB binary format types for JSON UDF evaluation
-pub mod json_types;
+/// LaminarDB streaming JSON extension UDFs (F-SCHEMA-013)
+pub mod json_extensions;
 /// SQL/JSON path query compiler and scalar UDFs
 pub mod json_path;
 /// JSON table-valued functions (array/object expansion)
 pub mod json_tvf;
+/// JSONB binary format types for JSON UDF evaluation
+pub mod json_types;
+/// PostgreSQL-compatible JSON aggregate UDAFs
+pub mod json_udaf;
 /// PostgreSQL-compatible JSON scalar UDFs
 pub mod json_udf;
+/// Lookup join plan node for DataFusion.
+pub mod lookup_join;
 /// Processing-time UDF for `PROCTIME()` support
 pub mod proctime_udf;
 mod source;
@@ -94,12 +100,6 @@ mod table_provider;
 pub mod watermark_udf;
 /// Window function UDFs (TUMBLE, HOP, SESSION, CUMULATE)
 pub mod window_udf;
-/// Array, Struct, and Map scalar UDFs (F-SCHEMA-015)
-pub mod complex_type_udf;
-/// Lambda higher-order functions for arrays and maps (F-SCHEMA-015 Tier 3)
-pub mod complex_type_lambda;
-/// LaminarDB streaming JSON extension UDFs (F-SCHEMA-013)
-pub mod json_extensions;
 
 pub use aggregate_bridge::{
     create_aggregate_factory, lookup_aggregate_udf, result_to_scalar_value, scalar_value_to_result,
@@ -107,13 +107,25 @@ pub use aggregate_bridge::{
 };
 pub use bridge::{BridgeSendError, BridgeSender, BridgeStream, BridgeTrySendError, StreamBridge};
 pub use channel_source::ChannelStreamSource;
+pub use complex_type_lambda::{
+    register_lambda_functions, ArrayFilter, ArrayReduce, ArrayTransform, MapFilter,
+    MapTransformValues,
+};
+pub use complex_type_udf::{
+    register_complex_type_functions, MapContainsKey, MapFromArrays, MapKeys, MapValues, StructDrop,
+    StructExtract, StructMerge, StructRename, StructSet,
+};
 pub use exec::StreamingScanExec;
 pub use execute::{execute_streaming_sql, DdlResult, QueryResult, StreamingSqlResult};
 pub use format_bridge_udf::{FromJsonUdf, ParseEpochUdf, ParseTimestampUdf, ToJsonUdf};
+pub use json_extensions::{
+    register_json_extensions, JsonInferSchema, JsonToColumns, JsonbDeepMerge, JsonbExcept,
+    JsonbFlatten, JsonbMerge, JsonbPick, JsonbRenameKeys, JsonbStripNulls, JsonbUnflatten,
+};
 pub use json_path::{CompiledJsonPath, JsonPathStep, JsonbPathExistsUdf, JsonbPathMatchUdf};
 pub use json_tvf::{
-    JsonbArrayElementsTextTvf, JsonbArrayElementsTvf, JsonbEachTextTvf, JsonbEachTvf,
-    JsonbObjectKeysTvf, register_json_table_functions,
+    register_json_table_functions, JsonbArrayElementsTextTvf, JsonbArrayElementsTvf,
+    JsonbEachTextTvf, JsonbEachTvf, JsonbObjectKeysTvf,
 };
 pub use json_udaf::{JsonAgg, JsonObjectAgg};
 pub use json_udf::{
@@ -126,18 +138,6 @@ pub use source::{SortColumn, StreamSource, StreamSourceRef};
 pub use table_provider::StreamingTableProvider;
 pub use watermark_udf::WatermarkUdf;
 pub use window_udf::{CumulateWindowStart, HopWindowStart, SessionWindowStart, TumbleWindowStart};
-pub use complex_type_udf::{
-    MapContainsKey, MapFromArrays, MapKeys, MapValues, StructDrop, StructExtract, StructMerge,
-    StructRename, StructSet, register_complex_type_functions,
-};
-pub use complex_type_lambda::{
-    ArrayFilter, ArrayReduce, ArrayTransform, MapFilter, MapTransformValues,
-    register_lambda_functions,
-};
-pub use json_extensions::{
-    JsonInferSchema, JsonToColumns, JsonbDeepMerge, JsonbExcept, JsonbFlatten, JsonbMerge,
-    JsonbPick, JsonbRenameKeys, JsonbStripNulls, JsonbUnflatten, register_json_extensions,
-};
 
 use std::sync::atomic::AtomicI64;
 use std::sync::Arc;
@@ -250,9 +250,7 @@ pub fn register_json_functions(ctx: &SessionContext) {
     ctx.register_udf(ScalarUDF::new_from_impl(ToJsonb::new()));
 
     // Aggregates
-    ctx.register_udaf(datafusion_expr::AggregateUDF::new_from_impl(
-        JsonAgg::new(),
-    ));
+    ctx.register_udaf(datafusion_expr::AggregateUDF::new_from_impl(JsonAgg::new()));
     ctx.register_udaf(datafusion_expr::AggregateUDF::new_from_impl(
         JsonObjectAgg::new(),
     ));

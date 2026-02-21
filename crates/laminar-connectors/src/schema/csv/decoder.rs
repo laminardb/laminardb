@@ -190,12 +190,8 @@ impl CsvDecoder {
             | DataType::UInt32
             | DataType::UInt64 => CsvCoercion::Int64,
             DataType::Float16 | DataType::Float32 | DataType::Float64 => CsvCoercion::Float64,
-            DataType::Timestamp(_, _) => {
-                CsvCoercion::Timestamp(config.timestamp_format.clone())
-            }
-            DataType::Date32 | DataType::Date64 => {
-                CsvCoercion::Date(config.date_format.clone())
-            }
+            DataType::Timestamp(_, _) => CsvCoercion::Timestamp(config.timestamp_format.clone()),
+            DataType::Date32 | DataType::Date64 => CsvCoercion::Date(config.date_format.clone()),
             _ => CsvCoercion::Utf8,
         }
     }
@@ -325,11 +321,7 @@ impl FormatDecoder for CsvDecoder {
                 }
 
                 // Apply coercion.
-                let ok = append_coerced(
-                    &mut builders[col_idx],
-                    &self.coercions[col_idx],
-                    trimmed,
-                );
+                let ok = append_coerced(&mut builders[col_idx], &self.coercions[col_idx], trimmed);
 
                 if !ok {
                     self.parse_error_count.fetch_add(1, Ordering::Relaxed);
@@ -413,8 +405,8 @@ fn create_builder(data_type: &DataType, capacity: usize) -> Box<dyn ColumnBuilde
             Box::new(Float64Builder::with_capacity(capacity))
         }
         DataType::Timestamp(TimeUnit::Nanosecond, tz) => {
-            let builder = TimestampNanosecondBuilder::with_capacity(capacity)
-                .with_timezone_opt(tz.clone());
+            let builder =
+                TimestampNanosecondBuilder::with_capacity(capacity).with_timezone_opt(tz.clone());
             Box::new(builder)
         }
         DataType::Date32 | DataType::Date64 => Box::new(Date32Builder::with_capacity(capacity)),
@@ -453,10 +445,7 @@ fn append_coerced(
             }
         }
         CsvCoercion::Int64 => {
-            let b = builder
-                .as_any_mut()
-                .downcast_mut::<Int64Builder>()
-                .unwrap();
+            let b = builder.as_any_mut().downcast_mut::<Int64Builder>().unwrap();
             match value.parse::<i64>() {
                 Ok(v) => {
                     b.append_value(v);
