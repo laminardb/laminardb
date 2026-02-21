@@ -8,13 +8,13 @@
 | Phase 1.5 | 1 | 0 | 0 | 0 | 1 | 0 |
 | Phase 2 | 38 | 0 | 0 | 0 | 38 | 0 |
 | Phase 2.5 | 12 | 0 | 0 | 0 | 12 | 0 |
-| Phase 3 | 93 | 25 | 0 | 0 | 68 | 0 |
+| Phase 3 | 93 | 22 | 0 | 0 | 71 | 0 |
 | Phase 4 | 11 | 11 | 0 | 0 | 0 | 0 |
 | Phase 5 | 10 | 10 | 0 | 0 | 0 | 0 |
 | Phase 6a | 29 | 0 | 0 | 0 | 27 | 2 |
 | Phase 6b | 14 | 0 | 0 | 0 | 14 | 0 |
 | Phase 6c | 10 | 9 | 0 | 0 | 0 | 1 |
-| **Total** | **230** | **55** | **0** | **0** | **172** | **3** |
+| **Total** | **230** | **52** | **0** | **0** | **175** | **3** |
 
 ## Status Legend
 
@@ -139,7 +139,7 @@ See [Plan Compiler Index](plan-compiler/INDEX.md) for architecture details and [
 
 ## Phase 3: Connectors & Integration
 
-> **Status**: 68/77 features complete (88%)
+> **Status**: 71/93 features complete (76%)
 
 ### Streaming API ✅
 
@@ -293,9 +293,9 @@ See [Demo Index](phase-3/demo/INDEX.md).
 
 | ID | Feature | Priority | Status | Dependencies | Spec |
 |----|---------|----------|--------|--------------|------|
-| F-SCHEMA-001 | Extensible Connector Trait Framework | P0 | 📝 | F034 | [Link](phase-3/schema/F-SCHEMA-001-connector-trait-framework.md) |
-| F-SCHEMA-002 | Schema Resolver & Merge Engine | P0 | 📝 | F-SCHEMA-001 | [Link](phase-3/schema/F-SCHEMA-002-schema-resolver.md) |
-| F-SCHEMA-003 | Format Inference Registry | P0 | 📝 | F-SCHEMA-001 | [Link](phase-3/schema/F-SCHEMA-003-format-inference-registry.md) |
+| F-SCHEMA-001 | Extensible Connector Trait Framework | P0 | ✅ | F034 | [Link](phase-3/schema/F-SCHEMA-001-connector-trait-framework.md) |
+| F-SCHEMA-002 | Schema Resolver & Merge Engine | P0 | ✅ | F-SCHEMA-001 | [Link](phase-3/schema/F-SCHEMA-002-schema-resolver.md) |
+| F-SCHEMA-003 | Format Inference Registry | P0 | ✅ | F-SCHEMA-001 | [Link](phase-3/schema/F-SCHEMA-003-format-inference-registry.md) |
 
 #### Format Decoders (Group B — Ring 1 Hot Path)
 

@@ -73,6 +73,9 @@ pub mod metrics;
 /// Record serialization and deserialization framework.
 pub mod serde;
 
+/// Schema inference, resolution, and evolution framework.
+pub mod schema;
+
 /// Connector registry with factory pattern.
 pub mod registry;
 
