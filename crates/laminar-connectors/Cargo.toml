@@ -58,8 +58,11 @@ arrow-select = { workspace = true }
 parquet = { version = "57.2", optional = true, default-features = false, features = ["arrow"] }
 object_store = { version = "0.13", optional = true }
 
-# Timestamp parsing for JSON decoder
+# Timestamp parsing for JSON/CSV decoders
 chrono = { workspace = true }
+
+# CSV parsing
+csv = "1.3"
 
 # Kafka discovery (optional)
 tokio-util = { workspace = true, optional = true }

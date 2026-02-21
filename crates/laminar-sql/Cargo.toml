@@ -43,6 +43,12 @@ parking_lot = { workspace = true }
 # Observability
 tracing = { workspace = true }
 
+# JSON serialization (for json_build_object, to_jsonb, etc.)
+serde_json = { workspace = true }
+
+# Timestamp parsing for format bridge UDFs
+chrono = { workspace = true }
+
 [dev-dependencies]
 criterion = { workspace = true }
 proptest = { workspace = true }

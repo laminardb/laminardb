@@ -15,6 +15,10 @@
 //!   `FormatDecoder` / `FormatEncoder` traits
 //! - **JSON format** ([`json`]) — JSON decoder, encoder, and JSONB binary
 //!   format (F-SCHEMA-004)
+//! - **CSV format** ([`csv`]) — CSV decoder with DuckDB-style type coercion
+//!   (F-SCHEMA-005)
+//! - **Schema evolution** ([`evolution`]) — diff, evaluate, and apply schema
+//!   changes with configurable compatibility modes (F-SCHEMA-009)
 //!
 //! # Architecture
 //!
@@ -34,12 +38,17 @@
 //! ```
 
 pub mod bridge;
+pub mod csv;
 pub mod error;
+pub mod evolution;
 pub mod inference;
 pub mod json;
 pub mod resolver;
 pub mod traits;
 pub mod types;
+
+#[cfg(feature = "kafka")]
+pub mod avro;
 
 // ── Re-exports for convenience ─────────────────────────────────────
 
@@ -59,7 +68,17 @@ pub use traits::{
     SchemaInferable, SchemaProvider, SchemaRegistryAware, WarningSeverity,
 };
 pub use types::{FieldMeta, RawRecord, SinkConfig, SourceConfig, SourceMetadata};
+pub use csv::{CsvDecoder, CsvDecoderConfig, FieldCountMismatchStrategy};
+pub use evolution::{
+    DefaultSchemaEvolver, EvolutionResult, EvolutionTrigger, SchemaEvolutionEngine,
+    SchemaHistory, SchemaHistoryEntry, diff_schemas_by_name, is_safe_widening,
+};
 pub use json::{
     JsonDecoder, JsonDecoderConfig, JsonEncoder, JsonbAccessor, JsonbEncoder,
     TypeMismatchStrategy, UnknownFieldStrategy,
+};
+#[cfg(feature = "kafka")]
+pub use avro::{
+    AvroDecoderMode, AvroFormatDecoder, AvroFormatEncoder, avro_to_arrow_schema,
+    avro_to_arrow_type,
 };

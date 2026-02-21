@@ -8,13 +8,13 @@
 | Phase 1.5 | 1 | 0 | 0 | 0 | 1 | 0 |
 | Phase 2 | 38 | 0 | 0 | 0 | 38 | 0 |
 | Phase 2.5 | 12 | 0 | 0 | 0 | 12 | 0 |
-| Phase 3 | 93 | 22 | 0 | 0 | 71 | 0 |
+| Phase 3 | 93 | 16 | 0 | 0 | 77 | 0 |
 | Phase 4 | 11 | 11 | 0 | 0 | 0 | 0 |
 | Phase 5 | 10 | 10 | 0 | 0 | 0 | 0 |
 | Phase 6a | 29 | 0 | 0 | 0 | 27 | 2 |
 | Phase 6b | 14 | 0 | 0 | 0 | 14 | 0 |
 | Phase 6c | 10 | 9 | 0 | 0 | 0 | 1 |
-| **Total** | **230** | **52** | **0** | **0** | **175** | **3** |
+| **Total** | **230** | **46** | **0** | **0** | **181** | **3** |
 
 ## Status Legend
 
@@ -302,8 +302,8 @@ See [Demo Index](phase-3/demo/INDEX.md).
 | ID | Feature | Priority | Status | Dependencies | Spec |
 |----|---------|----------|--------|--------------|------|
 | F-SCHEMA-004 | JSON Format Decoder & Inference | P0 | ✅ | F-SCHEMA-001, F-SCHEMA-003 | [Link](phase-3/schema/F-SCHEMA-004-json-decoder.md) |
-| F-SCHEMA-005 | CSV Format Decoder & Inference | P1 | 📝 | F-SCHEMA-001, F-SCHEMA-003 | [Link](phase-3/schema/F-SCHEMA-005-csv-decoder.md) |
-| F-SCHEMA-006 | Avro Format Decoder + Schema Registry | P0 | 📝 | F-SCHEMA-001, F-SCHEMA-003 | [Link](phase-3/schema/F-SCHEMA-006-avro-decoder.md) |
+| F-SCHEMA-005 | CSV Format Decoder & Inference | P1 | ✅ | F-SCHEMA-001, F-SCHEMA-003 | [Link](phase-3/schema/F-SCHEMA-005-csv-decoder.md) |
+| F-SCHEMA-006 | Avro Format Decoder + Schema Registry | P0 | ✅ | F-SCHEMA-001, F-SCHEMA-003 | [Link](phase-3/schema/F-SCHEMA-006-avro-decoder.md) |
 | F-SCHEMA-007 | Parquet Format Decoder | P1 | 📝 | F-SCHEMA-001 | [Link](phase-3/schema/F-SCHEMA-007-parquet-decoder.md) |
 | F-SCHEMA-008 | Protobuf Format Decoder | P2 | 📝 | F-SCHEMA-001, F-SCHEMA-006 | [Link](phase-3/schema/F-SCHEMA-008-protobuf-decoder.md) |
 
@@ -311,17 +311,17 @@ See [Demo Index](phase-3/demo/INDEX.md).
 
 | ID | Feature | Priority | Status | Dependencies | Spec |
 |----|---------|----------|--------|--------------|------|
-| F-SCHEMA-009 | Schema Evolution Engine | P1 | 📝 | F-SCHEMA-001, F-SCHEMA-002 | [Link](phase-3/schema/F-SCHEMA-009-schema-evolution.md) |
-| F-SCHEMA-010 | Dead Letter Queue & Error Handling | P1 | 📝 | F-SCHEMA-001 | [Link](phase-3/schema/F-SCHEMA-010-dead-letter-queue.md) |
+| F-SCHEMA-009 | Schema Evolution Engine | P1 | ✅ | F-SCHEMA-001, F-SCHEMA-002 | [Link](phase-3/schema/F-SCHEMA-009-schema-evolution.md) |
+| F-SCHEMA-010 | Dead Letter Queue & Error Handling | P1 | ✅ | F-SCHEMA-001 | [Link](phase-3/schema/F-SCHEMA-010-dead-letter-queue.md) |
 
 #### Transformation Functions (Group D)
 
 | ID | Feature | Priority | Status | Dependencies | Spec |
 |----|---------|----------|--------|--------------|------|
-| F-SCHEMA-011 | PostgreSQL-Compatible JSON Functions | P0 | 📝 | F-SCHEMA-004 | [Link](phase-3/schema/F-SCHEMA-011-json-functions.md) |
-| F-SCHEMA-012 | JSON Table-Valued & Path Functions | P1 | 📝 | F-SCHEMA-011 | [Link](phase-3/schema/F-SCHEMA-012-json-tvf.md) |
+| F-SCHEMA-011 | PostgreSQL-Compatible JSON Functions | P0 | ✅ | F-SCHEMA-004 | [Link](phase-3/schema/F-SCHEMA-011-json-functions.md) |
+| F-SCHEMA-012 | JSON Table-Valued & Path Functions | P1 | ✅ | F-SCHEMA-011 | [Link](phase-3/schema/F-SCHEMA-012-json-tvf.md) |
 | F-SCHEMA-013 | LaminarDB JSON Extensions | P2 | 📝 | F-SCHEMA-011 | [Link](phase-3/schema/F-SCHEMA-013-json-extensions.md) |
-| F-SCHEMA-014 | Format Bridge Functions | P1 | 📝 | F-SCHEMA-001, F-SCHEMA-004, F-SCHEMA-006 | [Link](phase-3/schema/F-SCHEMA-014-format-bridges.md) |
+| F-SCHEMA-014 | Format Bridge Functions | P1 | ✅ | F-SCHEMA-001, F-SCHEMA-004, F-SCHEMA-006 | [Link](phase-3/schema/F-SCHEMA-014-format-bridges.md) |
 | F-SCHEMA-015 | Array, Struct & Map Functions | P1 | 📝 | F-SCHEMA-001 | [Link](phase-3/schema/F-SCHEMA-015-array-struct-map-functions.md) |
 
 #### Schema Hints (Group E — Unique to LaminarDB)
