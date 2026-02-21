@@ -210,6 +210,10 @@ pub struct CreateSourceStatement {
     pub connector_options: HashMap<String, String>,
     /// Format specification (e.g., `FORMAT JSON`)
     pub format: Option<FormatSpec>,
+    /// Whether the column list includes a `*` wildcard for schema inference.
+    pub has_wildcard: bool,
+    /// Optional prefix for wildcard-expanded columns (from `PREFIX 'str'`).
+    pub wildcard_prefix: Option<String>,
 }
 
 /// CREATE SINK statement
@@ -533,6 +537,8 @@ mod tests {
             connector_type: None,
             connector_options: HashMap::new(),
             format: None,
+            has_wildcard: false,
+            wildcard_prefix: None,
         };
 
         // Check the statement fields

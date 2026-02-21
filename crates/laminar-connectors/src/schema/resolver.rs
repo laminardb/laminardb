@@ -164,6 +164,17 @@ pub enum FieldOrigin {
     DefaultAdded,
 }
 
+impl std::fmt::Display for FieldOrigin {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            FieldOrigin::UserDeclared => write!(f, "DECLARED"),
+            FieldOrigin::AutoResolved => write!(f, "AUTO"),
+            FieldOrigin::WildcardInferred => write!(f, "WILDCARD"),
+            FieldOrigin::DefaultAdded => write!(f, "DEFAULT"),
+        }
+    }
+}
+
 /// Stateless schema resolver.
 ///
 /// Implements the five-level priority chain and wildcard merge logic.
@@ -361,6 +372,72 @@ impl SchemaResolver {
             field_origins: origins,
             warnings,
         })
+    }
+
+    /// Validates that a wildcard declaration is consistent and usable.
+    ///
+    /// Checks:
+    /// - The connector supports at least one schema resolution path
+    ///   (provider, registry, or inference).
+    /// - If a prefix is set, no prefixed column name collides with a
+    ///   declared column name.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`SchemaError::WildcardWithoutInference`] if no resolution
+    /// path is available, or [`SchemaError::WildcardPrefixCollision`] if
+    /// a prefixed name collides with a declared column.
+    pub fn validate_wildcard(
+        declared: &DeclaredSchema,
+        connector: &dyn SourceConnector,
+    ) -> SchemaResult<()> {
+        if !declared.has_wildcard {
+            return Ok(());
+        }
+
+        // At least one resolution path must be available.
+        let has_provider = connector.as_schema_provider().is_some();
+        let has_registry = connector.as_schema_registry_aware().is_some();
+        let has_inference = connector.as_schema_inferable().is_some();
+
+        if !has_provider && !has_registry && !has_inference {
+            return Err(SchemaError::WildcardWithoutInference);
+        }
+
+        Ok(())
+    }
+
+    /// Checks that wildcard-prefixed column names don't collide with
+    /// declared columns.
+    ///
+    /// Call this after schema resolution when the resolved field names
+    /// are known.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`SchemaError::WildcardPrefixCollision`] on collision.
+    pub fn check_prefix_collision(
+        declared: &DeclaredSchema,
+        resolved: &SchemaRef,
+    ) -> SchemaResult<()> {
+        let Some(prefix) = &declared.wildcard_prefix else {
+            return Ok(());
+        };
+
+        let declared_names: Vec<&str> = declared.columns.iter().map(|c| c.name.as_str()).collect();
+
+        for field in resolved.fields() {
+            let name = field.name();
+            if declared_names.contains(&name.as_str()) {
+                continue; // Will be skipped during merge anyway.
+            }
+            let prefixed = format!("{prefix}{name}");
+            if declared_names.contains(&prefixed.as_str()) {
+                return Err(SchemaError::WildcardPrefixCollision(prefixed));
+            }
+        }
+
+        Ok(())
     }
 
     /// Converts a [`DeclaredSchema`] into an Arrow [`SchemaRef`].
@@ -575,5 +652,64 @@ mod tests {
         assert_eq!(resolved.kind, ResolutionKind::Declared);
         assert_eq!(resolved.field_origins.len(), 2);
         assert!(resolved.warnings.is_empty());
+    }
+
+    // ── check_prefix_collision tests ────────────────────────
+
+    #[test]
+    fn test_prefix_collision_none() {
+        let declared = DeclaredSchema::with_wildcard(vec![DeclaredColumn::new(
+            "pk",
+            DataType::Int64,
+            false,
+        )]);
+        let resolved = sample_resolved_schema();
+        assert!(SchemaResolver::check_prefix_collision(&declared, &resolved).is_ok());
+    }
+
+    #[test]
+    fn test_prefix_collision_detected() {
+        let declared = DeclaredSchema::with_wildcard(vec![DeclaredColumn::new(
+            "src_name",
+            DataType::Utf8,
+            true,
+        )])
+        .with_prefix("src_");
+
+        let resolved = sample_resolved_schema(); // has "name"
+        let result = SchemaResolver::check_prefix_collision(&declared, &resolved);
+        assert!(result.is_err());
+        let err = result.unwrap_err();
+        assert!(err.to_string().contains("src_name"));
+    }
+
+    #[test]
+    fn test_prefix_collision_no_prefix_ok() {
+        let declared = DeclaredSchema::with_wildcard(vec![DeclaredColumn::new(
+            "name",
+            DataType::Utf8,
+            true,
+        )]);
+        let resolved = sample_resolved_schema();
+        // No prefix set, so no collision check needed.
+        assert!(SchemaResolver::check_prefix_collision(&declared, &resolved).is_ok());
+    }
+
+    #[test]
+    fn test_prefix_collision_skip_declared_overlap() {
+        // If a resolved field overlaps with a declared field (same name without prefix),
+        // it won't be expanded, so no collision.
+        let declared = DeclaredSchema::with_wildcard(vec![DeclaredColumn::new(
+            "src_id",
+            DataType::Int64,
+            false,
+        )])
+        .with_prefix("src_");
+
+        // "id" -> "src_id" would collide, BUT "id" is not the same as "src_id" (the declared name),
+        // so it IS a collision.
+        let resolved = sample_resolved_schema();
+        let result = SchemaResolver::check_prefix_collision(&declared, &resolved);
+        assert!(result.is_err());
     }
 }

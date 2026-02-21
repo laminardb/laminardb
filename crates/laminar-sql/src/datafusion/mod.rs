@@ -94,6 +94,10 @@ mod table_provider;
 pub mod watermark_udf;
 /// Window function UDFs (TUMBLE, HOP, SESSION, CUMULATE)
 pub mod window_udf;
+/// Array, Struct, and Map scalar UDFs (F-SCHEMA-015)
+pub mod complex_type_udf;
+/// Lambda higher-order functions for arrays and maps (F-SCHEMA-015 Tier 3)
+pub mod complex_type_lambda;
 
 pub use aggregate_bridge::{
     create_aggregate_factory, lookup_aggregate_udf, result_to_scalar_value, scalar_value_to_result,
@@ -120,6 +124,14 @@ pub use source::{SortColumn, StreamSource, StreamSourceRef};
 pub use table_provider::StreamingTableProvider;
 pub use watermark_udf::WatermarkUdf;
 pub use window_udf::{CumulateWindowStart, HopWindowStart, SessionWindowStart, TumbleWindowStart};
+pub use complex_type_udf::{
+    MapContainsKey, MapFromArrays, MapKeys, MapValues, StructDrop, StructExtract, StructMerge,
+    StructRename, StructSet, register_complex_type_functions,
+};
+pub use complex_type_lambda::{
+    ArrayFilter, ArrayReduce, ArrayTransform, MapFilter, MapTransformValues,
+    register_lambda_functions,
+};
 
 use std::sync::atomic::AtomicI64;
 use std::sync::Arc;
@@ -174,6 +186,8 @@ pub fn register_streaming_functions(ctx: &SessionContext) {
     ctx.register_udf(ScalarUDF::new_from_impl(WatermarkUdf::unset()));
     ctx.register_udf(ScalarUDF::new_from_impl(ProcTimeUdf::new()));
     register_json_functions(ctx);
+    register_complex_type_functions(ctx);
+    register_lambda_functions(ctx);
 }
 
 /// Registers streaming UDFs with a live watermark source.
@@ -197,6 +211,8 @@ pub fn register_streaming_functions_with_watermark(
     ctx.register_udf(ScalarUDF::new_from_impl(WatermarkUdf::new(watermark_ms)));
     ctx.register_udf(ScalarUDF::new_from_impl(ProcTimeUdf::new()));
     register_json_functions(ctx);
+    register_complex_type_functions(ctx);
+    register_lambda_functions(ctx);
 }
 
 /// Registers all PostgreSQL-compatible JSON UDFs and UDAFs

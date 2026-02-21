@@ -50,6 +50,9 @@ pub mod types;
 #[cfg(feature = "kafka")]
 pub mod avro;
 
+#[cfg(feature = "parquet-lookup")]
+pub mod parquet;
+
 // ── Re-exports for convenience ─────────────────────────────────────
 
 pub use error::{SchemaError, SchemaResult};
@@ -81,4 +84,9 @@ pub use json::{
 pub use avro::{
     AvroDecoderMode, AvroFormatDecoder, AvroFormatEncoder, avro_to_arrow_schema,
     avro_to_arrow_type,
+};
+#[cfg(feature = "parquet-lookup")]
+pub use parquet::{
+    ParquetDecoder, ParquetDecoderConfig, ParquetEncoder, ParquetEncoderConfig,
+    ParquetSchemaProvider, RowGroupPredicate,
 };

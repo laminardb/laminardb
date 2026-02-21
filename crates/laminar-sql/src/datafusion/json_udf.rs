@@ -38,7 +38,11 @@ fn output_len(args: &[ColumnarValue]) -> usize {
 }
 
 /// Expand all args to arrays of the same length.
-fn expand_args(args: &[ColumnarValue]) -> Result<Vec<ArrayRef>> {
+///
+/// # Errors
+///
+/// Returns a `DataFusionError` if a scalar value cannot be expanded to the target length.
+pub fn expand_args(args: &[ColumnarValue]) -> Result<Vec<ArrayRef>> {
     let len = output_len(args);
     args.iter()
         .map(|a| match a {

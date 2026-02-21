@@ -46,6 +46,23 @@ pub enum SchemaError {
         message: String,
     },
 
+    /// Duplicate wildcard `*` in the column list.
+    #[error("duplicate wildcard: only one `*` is allowed in the column list")]
+    DuplicateWildcard,
+
+    /// Wildcard `*` used without a connector that supports schema inference.
+    #[error("wildcard without inference: `*` requires a connector that supports schema inference or a schema registry")]
+    WildcardWithoutInference,
+
+    /// A wildcard-prefixed column name collides with a declared column.
+    #[error("wildcard prefix collision: prefixed column '{0}' collides with a declared column")]
+    WildcardPrefixCollision(String),
+
+    /// Wildcard expanded to zero new columns (all source columns were
+    /// already declared).
+    #[error("wildcard expanded to zero new columns: all source columns are already declared")]
+    WildcardNoNewFields,
+
     /// An Arrow error propagated from schema operations.
     #[error("arrow error: {0}")]
     Arrow(#[from] arrow_schema::ArrowError),
@@ -128,5 +145,20 @@ mod tests {
         let se: SchemaError = ce.into();
         assert!(matches!(se, SchemaError::Other(_)));
         assert!(se.to_string().contains("host down"));
+    }
+
+    #[test]
+    fn test_wildcard_errors_display() {
+        let e1 = SchemaError::DuplicateWildcard;
+        assert!(e1.to_string().contains("duplicate wildcard"));
+
+        let e2 = SchemaError::WildcardWithoutInference;
+        assert!(e2.to_string().contains("schema inference"));
+
+        let e3 = SchemaError::WildcardPrefixCollision("src_id".into());
+        assert!(e3.to_string().contains("src_id"));
+
+        let e4 = SchemaError::WildcardNoNewFields;
+        assert!(e4.to_string().contains("zero new columns"));
     }
 }
