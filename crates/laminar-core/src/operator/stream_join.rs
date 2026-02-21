@@ -1481,14 +1481,14 @@ impl StreamJoinOperator {
         // Update watermark
         let emitted_watermark = ctx.watermark_generator.on_event(event_time);
 
-        // Track per-side watermarks for build-side pruning
+        // Track per-side watermarks for build-side pruning using actual watermark
+        let current_wm = ctx.watermark_generator.current_watermark();
         match side {
-            JoinSide::Left => self.left_watermark = self.left_watermark.max(event_time),
-            JoinSide::Right => self.right_watermark = self.right_watermark.max(event_time),
+            JoinSide::Left => self.left_watermark = self.left_watermark.max(current_wm),
+            JoinSide::Right => self.right_watermark = self.right_watermark.max(current_wm),
         }
 
         // Check if event is too late
-        let current_wm = ctx.watermark_generator.current_watermark();
         if current_wm > i64::MIN && event_time + self.time_bound_ms < current_wm {
             self.metrics.late_events += 1;
             output.push(Output::LateEvent(event.clone()));

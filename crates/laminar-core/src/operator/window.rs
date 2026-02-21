@@ -837,6 +837,59 @@ impl ResultToI64 for Option<f64> {
     }
 }
 
+/// Trait for converting aggregation results to Arrow arrays.
+///
+/// This preserves the native type (e.g., `Float64` for AVG) and nullable
+/// semantics (empty windows produce null, not zero).
+pub trait ResultToArrow {
+    /// Converts the result to a single-element Arrow array.
+    fn to_arrow_array(&self) -> Arc<dyn ArrowArray>;
+
+    /// Returns the Arrow [`DataType`] for this result.
+    fn arrow_data_type(&self) -> DataType;
+}
+
+impl ResultToArrow for i64 {
+    fn to_arrow_array(&self) -> Arc<dyn ArrowArray> {
+        Arc::new(Int64Array::from(vec![*self]))
+    }
+
+    fn arrow_data_type(&self) -> DataType {
+        DataType::Int64
+    }
+}
+
+impl ResultToArrow for u64 {
+    fn to_arrow_array(&self) -> Arc<dyn ArrowArray> {
+        Arc::new(Int64Array::from(vec![i64::try_from(*self).unwrap_or(i64::MAX)]))
+    }
+
+    fn arrow_data_type(&self) -> DataType {
+        DataType::Int64
+    }
+}
+
+impl ResultToArrow for Option<i64> {
+    fn to_arrow_array(&self) -> Arc<dyn ArrowArray> {
+        Arc::new(Int64Array::from(vec![*self]))
+    }
+
+    fn arrow_data_type(&self) -> DataType {
+        DataType::Int64
+    }
+}
+
+impl ResultToArrow for Option<f64> {
+    fn to_arrow_array(&self) -> Arc<dyn ArrowArray> {
+        use arrow_array::Float64Array;
+        Arc::new(Float64Array::from(vec![*self]))
+    }
+
+    fn arrow_data_type(&self) -> DataType {
+        DataType::Float64
+    }
+}
+
 /// Accumulator state for aggregations.
 ///
 /// This is the state stored per window in the state store.
@@ -848,7 +901,7 @@ pub trait Accumulator: Default + Clone + Send {
     /// The input type for the aggregation.
     type Input;
     /// The output type produced by the aggregation.
-    type Output: ResultToI64;
+    type Output: ResultToI64 + ResultToArrow;
 
     /// Adds a value to the accumulator.
     fn add(&mut self, value: Self::Input);
@@ -878,6 +931,37 @@ pub trait Aggregator: Send + Clone {
     ///
     /// Returns `None` if the event should be skipped.
     fn extract(&self, event: &Event) -> Option<<Self::Acc as Accumulator>::Input>;
+
+    /// Returns the Arrow [`DataType`] for this aggregator's output.
+    ///
+    /// Defaults to `Int64`. Override for aggregators that produce different types
+    /// (e.g., `AvgAggregator` returns `Float64`).
+    fn output_data_type(&self) -> DataType {
+        DataType::Int64
+    }
+
+    /// Returns whether the output is nullable (e.g., empty windows produce null).
+    ///
+    /// Defaults to `false`. Override for aggregators like MIN/MAX/AVG.
+    fn output_nullable(&self) -> bool {
+        false
+    }
+
+    /// Extracts all values from a multi-row batch event.
+    ///
+    /// The default implementation calls [`extract()`](Self::extract) and wraps
+    /// the single result. Override this in aggregators that need to process
+    /// all rows in a batch (e.g., `AvgAggregator`).
+    fn extract_batch(
+        &self,
+        event: &Event,
+    ) -> SmallVec<[<Self::Acc as Accumulator>::Input; 4]> {
+        let mut values = SmallVec::new();
+        if let Some(v) = self.extract(event) {
+            values.push(v);
+        }
+        values
+    }
 }
 
 /// Count aggregator - counts the number of events in a window.
@@ -1050,6 +1134,10 @@ impl Aggregator for MinAggregator {
         MinAccumulator::default()
     }
 
+    fn output_nullable(&self) -> bool {
+        true
+    }
+
     fn extract(&self, event: &Event) -> Option<i64> {
         use arrow_array::cast::AsArray;
         use arrow_array::types::Int64Type;
@@ -1114,6 +1202,10 @@ impl Aggregator for MaxAggregator {
 
     fn create_accumulator(&self) -> MaxAccumulator {
         MaxAccumulator::default()
+    }
+
+    fn output_nullable(&self) -> bool {
+        true
     }
 
     fn extract(&self, event: &Event) -> Option<i64> {
@@ -1189,6 +1281,14 @@ impl Aggregator for AvgAggregator {
         AvgAccumulator::default()
     }
 
+    fn output_data_type(&self) -> DataType {
+        DataType::Float64
+    }
+
+    fn output_nullable(&self) -> bool {
+        true
+    }
+
     fn extract(&self, event: &Event) -> Option<i64> {
         use arrow_array::cast::AsArray;
         use arrow_array::types::Int64Type;
@@ -1201,8 +1301,26 @@ impl Aggregator for AvgAggregator {
         let column = batch.column(self.column_index);
         let array = column.as_primitive_opt::<Int64Type>()?;
 
-        // For average, we add each value individually
+        // Return the first value for single-row batches
         array.iter().flatten().next()
+    }
+
+    fn extract_batch(&self, event: &Event) -> SmallVec<[i64; 4]> {
+        use arrow_array::cast::AsArray;
+        use arrow_array::types::Int64Type;
+
+        let batch = &event.data;
+        if self.column_index >= batch.num_columns() {
+            return SmallVec::new();
+        }
+
+        let column = batch.column(self.column_index);
+        let Some(array) = column.as_primitive_opt::<Int64Type>() else {
+            return SmallVec::new();
+        };
+
+        // Return ALL values from the batch for correct multi-row averaging
+        array.iter().flatten().collect()
     }
 }
 
@@ -3167,23 +3285,14 @@ pub struct TumblingWindowOperator<A: Aggregator> {
     operator_id: String,
     /// Cached output schema (avoids allocation on every emit)
     output_schema: SchemaRef,
+    /// Last emitted events per window for changelog retraction
+    last_emitted: std::collections::HashMap<WindowId, Event>,
     /// Phantom data for accumulator type
     _phantom: PhantomData<A::Acc>,
 }
 
 /// Static counter for generating unique operator IDs without allocation.
 static OPERATOR_COUNTER: AtomicU64 = AtomicU64::new(0);
-
-/// Creates the standard window output schema.
-///
-/// This schema is used for all window aggregation results.
-fn create_window_output_schema() -> SchemaRef {
-    Arc::new(Schema::new(vec![
-        Field::new("window_start", DataType::Int64, false),
-        Field::new("window_end", DataType::Int64, false),
-        Field::new("result", DataType::Int64, false),
-    ]))
-}
 
 impl<A: Aggregator> TumblingWindowOperator<A>
 where
@@ -3208,6 +3317,11 @@ where
         allowed_lateness: Duration,
     ) -> Self {
         let operator_num = OPERATOR_COUNTER.fetch_add(1, Ordering::Relaxed);
+        let output_schema = Arc::new(Schema::new(vec![
+            Field::new("window_start", DataType::Int64, false),
+            Field::new("window_end", DataType::Int64, false),
+            Field::new("result", aggregator.output_data_type(), aggregator.output_nullable()),
+        ]));
         Self {
             assigner,
             aggregator,
@@ -3221,7 +3335,8 @@ where
             late_data_metrics: LateDataMetrics::new(),
             window_close_metrics: WindowCloseMetrics::new(),
             operator_id: format!("tumbling_window_{operator_num}"),
-            output_schema: create_window_output_schema(),
+            output_schema,
+            last_emitted: std::collections::HashMap::new(),
             _phantom: PhantomData,
         }
     }
@@ -3237,6 +3352,11 @@ where
         allowed_lateness: Duration,
         operator_id: String,
     ) -> Self {
+        let output_schema = Arc::new(Schema::new(vec![
+            Field::new("window_start", DataType::Int64, false),
+            Field::new("window_end", DataType::Int64, false),
+            Field::new("result", aggregator.output_data_type(), aggregator.output_nullable()),
+        ]));
         Self {
             assigner,
             aggregator,
@@ -3250,7 +3370,8 @@ where
             late_data_metrics: LateDataMetrics::new(),
             window_close_metrics: WindowCloseMetrics::new(),
             operator_id,
-            output_schema: create_window_output_schema(),
+            output_schema,
+            last_emitted: std::collections::HashMap::new(),
             _phantom: PhantomData,
         }
     }
@@ -3493,6 +3614,10 @@ where
     /// Creates an intermediate result for a window without cleaning up state.
     ///
     /// Returns `None` if the window is empty.
+    /// Creates an intermediate result for a window without cleaning up state.
+    ///
+    /// Returns `None` if the window is empty. Uses `ResultToArrow` for
+    /// type-preserving output.
     fn create_intermediate_result(
         &self,
         window_id: &WindowId,
@@ -3505,14 +3630,14 @@ where
         }
 
         let result = acc.result();
-        let result_i64 = result.to_i64();
+        let result_array = result.to_arrow_array();
 
         let batch = RecordBatch::try_new(
             Arc::clone(&self.output_schema),
             vec![
                 Arc::new(Int64Array::from(vec![window_id.start])),
                 Arc::new(Int64Array::from(vec![window_id.end])),
-                Arc::new(Int64Array::from(vec![result_i64])),
+                result_array,
             ],
         )
         .ok()?;
@@ -3607,10 +3732,13 @@ where
         // Track if state was updated (for OnUpdate and Changelog strategies)
         let mut state_updated = false;
 
-        // Extract value and update accumulator
-        if let Some(value) = self.aggregator.extract(event) {
+        // Extract values and update accumulator (handles multi-row batches)
+        let values = self.aggregator.extract_batch(event);
+        if !values.is_empty() {
             let mut acc = self.get_accumulator(&window_id, ctx.state);
-            acc.add(value);
+            for value in values {
+                acc.add(value);
+            }
             if let Err(e) = Self::put_accumulator(&window_id, &acc, ctx.state) {
                 // Log error but don't fail - we'll retry on next event
                 tracing::error!("Failed to store window state: {e}");
@@ -3643,13 +3771,22 @@ where
                         output.push(Output::Event(event));
                     }
                 }
-                // Changelog: emit changelog record on every update
+                // Changelog: emit retraction for old value, then insert new value
                 EmitStrategy::Changelog => {
-                    if let Some(event) = self.create_intermediate_result(&window_id, ctx.state) {
-                        // For intermediate updates in changelog mode, we emit as insert
-                        // Full CDC support (with retractions) requires changelog support
-                        let record = ChangelogRecord::insert(event, ctx.processing_time);
-                        output.push(Output::Changelog(record));
+                    if let Some(new_event) =
+                        self.create_intermediate_result(&window_id, ctx.state)
+                    {
+                        // Emit delete for previous value (retraction)
+                        if let Some(old_event) = self.last_emitted.get(&window_id) {
+                            let delete =
+                                ChangelogRecord::delete(old_event.clone(), ctx.processing_time);
+                            output.push(Output::Changelog(delete));
+                        }
+                        // Emit insert for new value
+                        let insert =
+                            ChangelogRecord::insert(new_event.clone(), ctx.processing_time);
+                        output.push(Output::Changelog(insert));
+                        self.last_emitted.insert(window_id, new_event);
                     }
                 }
                 // Other strategies: no intermediate emission
@@ -3695,6 +3832,7 @@ where
             let _ = Self::delete_accumulator(&window_id, ctx.state);
             self.registered_windows.remove(&window_id);
             self.periodic_timer_windows.remove(&window_id);
+            self.last_emitted.remove(&window_id);
             return OutputVec::new();
         }
 
@@ -3705,9 +3843,10 @@ where
         let _ = Self::delete_accumulator(&window_id, ctx.state);
         self.registered_windows.remove(&window_id);
         self.periodic_timer_windows.remove(&window_id);
+        self.last_emitted.remove(&window_id);
 
-        // Convert result to i64 for the batch
-        let result_i64 = result.to_i64();
+        // Convert result to Arrow array (preserves native type: Float64 for AVG, etc.)
+        let result_array = result.to_arrow_array();
 
         // Create output batch using cached schema (avoids ~200ns allocation per emit)
         let batch = RecordBatch::try_new(
@@ -3715,7 +3854,7 @@ where
             vec![
                 Arc::new(Int64Array::from(vec![window_id.start])),
                 Arc::new(Int64Array::from(vec![window_id.end])),
-                Arc::new(Int64Array::from(vec![result_i64])),
+                result_array,
             ],
         );
 

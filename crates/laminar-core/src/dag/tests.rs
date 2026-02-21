@@ -3417,3 +3417,258 @@ fn test_operator_node_metrics_reset() {
     assert_eq!(op_m.total_time_ns, 0);
     assert_eq!(op_m.invocations, 0);
 }
+
+// ---- Watermark topology propagation, output routing, and feedback tests ----
+
+#[test]
+fn test_watermark_topology_propagation() {
+    // Build a 3-node DAG: source -> op -> sink
+    // Call process_watermark(source, 1000) and verify propagation.
+    let schema = int_schema();
+    let dag = DagBuilder::new()
+        .source("src", schema.clone())
+        .operator("op", schema.clone())
+        .sink_for("op", "snk", schema.clone())
+        .connect("src", "op")
+        .build()
+        .unwrap();
+
+    let src_id = dag.node_id_by_name("src").unwrap();
+    let op_id = dag.node_id_by_name("op").unwrap();
+    let snk_id = dag.node_id_by_name("snk").unwrap();
+
+    let mut executor = DagExecutor::from_dag(&dag);
+
+    // Before watermark: checkpoint should show unset (i64::MIN) for all nodes
+    let cp_before = executor.checkpoint_watermarks();
+    assert_eq!(cp_before.watermarks[src_id.0 as usize], i64::MIN);
+    assert_eq!(cp_before.watermarks[op_id.0 as usize], i64::MIN);
+    assert_eq!(cp_before.watermarks[snk_id.0 as usize], i64::MIN);
+
+    // Process watermark at the source
+    executor.process_watermark(src_id, 1000).unwrap();
+
+    // After watermark: all nodes in the topology should have watermark 1000
+    let cp_after = executor.checkpoint_watermarks();
+    assert_eq!(cp_after.watermarks[src_id.0 as usize], 1000);
+    assert_eq!(cp_after.watermarks[op_id.0 as usize], 1000);
+    assert_eq!(cp_after.watermarks[snk_id.0 as usize], 1000);
+}
+
+/// An operator that emits a `Changelog(ChangelogRecord::insert(...))` for each input.
+struct ChangelogEmittingOperator;
+
+impl Operator for ChangelogEmittingOperator {
+    fn process(&mut self, event: &Event, _ctx: &mut OperatorContext) -> OutputVec {
+        use crate::operator::window::ChangelogRecord;
+        let mut v = OutputVec::new();
+        v.push(Output::Changelog(ChangelogRecord::insert(
+            event.clone(),
+            0,
+        )));
+        v
+    }
+    fn on_timer(&mut self, _timer: Timer, _ctx: &mut OperatorContext) -> OutputVec {
+        OutputVec::new()
+    }
+    fn checkpoint(&self) -> OperatorState {
+        OperatorState {
+            operator_id: "changelog_emitter".to_string(),
+            data: Vec::new(),
+        }
+    }
+    fn restore(&mut self, _state: OperatorState) -> Result<(), OperatorError> {
+        Ok(())
+    }
+}
+
+#[test]
+fn test_changelog_output_routing() {
+    // src -> op (emits Changelog) -> snk
+    // Changelog events should be collected in take_sink_outputs for the op node.
+    let schema = int_schema();
+    let dag = DagBuilder::new()
+        .source("src", schema.clone())
+        .operator("op", schema.clone())
+        .sink_for("op", "snk", schema.clone())
+        .connect("src", "op")
+        .build()
+        .unwrap();
+
+    let src_id = dag.node_id_by_name("src").unwrap();
+    let op_id = dag.node_id_by_name("op").unwrap();
+
+    let mut executor = DagExecutor::from_dag(&dag);
+    executor.register_operator(op_id, Box::new(ChangelogEmittingOperator));
+
+    executor
+        .process_event(src_id, test_event(1000, 42))
+        .unwrap();
+
+    // Changelog outputs are collected at the operator node's sink_outputs slot
+    let outputs = executor.take_sink_outputs(op_id);
+    assert_eq!(outputs.len(), 1);
+    assert_eq!(event_value(&outputs[0]), 42);
+    assert_eq!(outputs[0].timestamp, 1000);
+}
+
+/// An operator that emits a `SideOutput { name: "late", event }` for each input.
+struct SideOutputEmittingOperator;
+
+impl Operator for SideOutputEmittingOperator {
+    fn process(&mut self, event: &Event, _ctx: &mut OperatorContext) -> OutputVec {
+        let mut v = OutputVec::new();
+        v.push(Output::SideOutput {
+            name: "late".to_string(),
+            event: event.clone(),
+        });
+        v
+    }
+    fn on_timer(&mut self, _timer: Timer, _ctx: &mut OperatorContext) -> OutputVec {
+        OutputVec::new()
+    }
+    fn checkpoint(&self) -> OperatorState {
+        OperatorState {
+            operator_id: "side_output_emitter".to_string(),
+            data: Vec::new(),
+        }
+    }
+    fn restore(&mut self, _state: OperatorState) -> Result<(), OperatorError> {
+        Ok(())
+    }
+}
+
+#[test]
+fn test_side_output_routing() {
+    // src -> op (emits SideOutput) -> snk
+    // Side output events should be collected at the op node's sink_outputs.
+    let schema = int_schema();
+    let dag = DagBuilder::new()
+        .source("src", schema.clone())
+        .operator("op", schema.clone())
+        .sink_for("op", "snk", schema.clone())
+        .connect("src", "op")
+        .build()
+        .unwrap();
+
+    let src_id = dag.node_id_by_name("src").unwrap();
+    let op_id = dag.node_id_by_name("op").unwrap();
+
+    let mut executor = DagExecutor::from_dag(&dag);
+    executor.register_operator(op_id, Box::new(SideOutputEmittingOperator));
+
+    executor
+        .process_event(src_id, test_event(2000, 77))
+        .unwrap();
+
+    // Side output events are collected at the operator node
+    let outputs = executor.take_sink_outputs(op_id);
+    assert_eq!(outputs.len(), 1);
+    assert_eq!(event_value(&outputs[0]), 77);
+    assert_eq!(outputs[0].timestamp, 2000);
+}
+
+/// An operator that emits `Output::Watermark(event.timestamp)` from `process()`.
+struct WatermarkEmittingOperator;
+
+impl Operator for WatermarkEmittingOperator {
+    fn process(&mut self, event: &Event, _ctx: &mut OperatorContext) -> OutputVec {
+        let mut v = OutputVec::new();
+        // Emit the event's timestamp as a watermark
+        v.push(Output::Watermark(event.timestamp));
+        v
+    }
+    fn on_timer(&mut self, _timer: Timer, _ctx: &mut OperatorContext) -> OutputVec {
+        OutputVec::new()
+    }
+    fn checkpoint(&self) -> OperatorState {
+        OperatorState {
+            operator_id: "watermark_emitter".to_string(),
+            data: Vec::new(),
+        }
+    }
+    fn restore(&mut self, _state: OperatorState) -> Result<(), OperatorError> {
+        Ok(())
+    }
+}
+
+#[test]
+fn test_watermark_output_feedback() {
+    // src -> op (emits Watermark from process) -> snk
+    // The operator emits Output::Watermark(timestamp) when processing an event.
+    // This should feed back into the watermark tracker for the source node (op).
+    let schema = int_schema();
+    let dag = DagBuilder::new()
+        .source("src", schema.clone())
+        .operator("op", schema.clone())
+        .sink_for("op", "snk", schema.clone())
+        .connect("src", "op")
+        .build()
+        .unwrap();
+
+    let src_id = dag.node_id_by_name("src").unwrap();
+    let op_id = dag.node_id_by_name("op").unwrap();
+    let snk_id = dag.node_id_by_name("snk").unwrap();
+
+    let mut executor = DagExecutor::from_dag(&dag);
+    executor.register_operator(op_id, Box::new(WatermarkEmittingOperator));
+
+    // Process an event — the operator will emit Output::Watermark(3000)
+    executor
+        .process_event(src_id, test_event(3000, 1))
+        .unwrap();
+
+    // The watermark tracker should have the watermark for the op node (source of the
+    // watermark output) and it should propagate to snk.
+    let cp = executor.checkpoint_watermarks();
+    assert_eq!(cp.watermarks[op_id.0 as usize], 3000);
+    assert_eq!(cp.watermarks[snk_id.0 as usize], 3000);
+}
+
+#[test]
+fn test_multi_input_watermark_min() {
+    // Build a DAG with 2 sources merging into 1 join node (fan-in):
+    //   src_a \
+    //          -> join -> snk
+    //   src_b /
+    //
+    // Advance src_a watermark to 1000, src_b to 500.
+    // The effective watermark at the join node should be 500 (min semantics).
+    let schema = int_schema();
+    let dag = DagBuilder::new()
+        .source("src_a", schema.clone())
+        .source("src_b", schema.clone())
+        .operator("join", schema.clone())
+        .sink_for("join", "snk", schema.clone())
+        .connect("src_a", "join")
+        .connect("src_b", "join")
+        .build()
+        .unwrap();
+
+    let src_a = dag.node_id_by_name("src_a").unwrap();
+    let src_b = dag.node_id_by_name("src_b").unwrap();
+    let join_id = dag.node_id_by_name("join").unwrap();
+    let snk_id = dag.node_id_by_name("snk").unwrap();
+
+    let mut tracker = DagWatermarkTracker::from_dag(&dag);
+
+    // Only src_a advances first — join should NOT advance (src_b is still unset)
+    tracker.update_watermark(src_a, 1000);
+    assert_eq!(tracker.get_watermark(join_id), None);
+
+    // Now src_b advances to 500 — join should get min(1000, 500) = 500
+    tracker.update_watermark(src_b, 500);
+    assert_eq!(tracker.get_watermark(join_id), Some(500));
+
+    // Verify effective_watermark agrees
+    assert_eq!(tracker.effective_watermark(join_id), Some(500));
+
+    // The snk downstream of join should also get 500
+    assert_eq!(tracker.get_watermark(snk_id), Some(500));
+
+    // Now advance src_b to 2000 — join should advance to min(1000, 2000) = 1000
+    tracker.update_watermark(src_b, 2000);
+    assert_eq!(tracker.get_watermark(join_id), Some(1000));
+    assert_eq!(tracker.effective_watermark(join_id), Some(1000));
+    assert_eq!(tracker.get_watermark(snk_id), Some(1000));
+}

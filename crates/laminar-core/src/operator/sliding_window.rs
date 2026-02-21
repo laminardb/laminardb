@@ -48,7 +48,7 @@
 
 use super::window::{
     Accumulator, Aggregator, ChangelogRecord, EmitStrategy, LateDataConfig, LateDataMetrics,
-    ResultToI64, WindowAssigner, WindowCloseMetrics, WindowId, WindowIdVec,
+    ResultToArrow, WindowAssigner, WindowCloseMetrics, WindowId, WindowIdVec,
 };
 use super::{
     Event, Operator, OperatorContext, OperatorError, OperatorState, Output, OutputVec, Timer,
@@ -201,8 +201,9 @@ impl SlidingWindowAssigner {
         if timestamp >= 0 {
             (timestamp / self.slide_ms) * self.slide_ms
         } else {
-            // For negative timestamps, use floor division
-            ((timestamp - self.slide_ms + 1) / self.slide_ms) * self.slide_ms
+            // For negative timestamps, use floor division with saturating arithmetic
+            (timestamp.saturating_sub(self.slide_ms).saturating_add(1) / self.slide_ms)
+                * self.slide_ms
         }
     }
 }
@@ -223,7 +224,11 @@ impl WindowAssigner for SlidingWindowAssigner {
         while window_start + self.size_ms > timestamp {
             let window_end = window_start + self.size_ms;
             windows.push(WindowId::new(window_start, window_end));
-            window_start -= self.slide_ms;
+            let prev = window_start;
+            window_start = window_start.saturating_sub(self.slide_ms);
+            if window_start == prev {
+                break;
+            }
         }
 
         // Reverse to get windows in chronological order (earliest first)
@@ -246,15 +251,6 @@ const WINDOW_STATE_KEY_SIZE: usize = 4 + 16;
 
 /// Static counter for generating unique operator IDs without allocation.
 static SLIDING_OPERATOR_COUNTER: AtomicU64 = AtomicU64::new(0);
-
-/// Creates the standard window output schema.
-fn create_window_output_schema() -> SchemaRef {
-    Arc::new(Schema::new(vec![
-        Field::new("window_start", DataType::Int64, false),
-        Field::new("window_end", DataType::Int64, false),
-        Field::new("result", DataType::Int64, false),
-    ]))
-}
 
 /// Sliding window operator.
 ///
@@ -336,6 +332,11 @@ where
     /// Panics if allowed lateness does not fit in i64.
     pub fn new(assigner: SlidingWindowAssigner, aggregator: A, allowed_lateness: Duration) -> Self {
         let operator_num = SLIDING_OPERATOR_COUNTER.fetch_add(1, Ordering::Relaxed);
+        let output_schema = Arc::new(Schema::new(vec![
+            Field::new("window_start", DataType::Int64, false),
+            Field::new("window_end", DataType::Int64, false),
+            Field::new("result", aggregator.output_data_type(), aggregator.output_nullable()),
+        ]));
         Self {
             assigner,
             aggregator,
@@ -348,7 +349,7 @@ where
             late_data_metrics: LateDataMetrics::new(),
             window_close_metrics: WindowCloseMetrics::new(),
             operator_id: format!("sliding_window_{operator_num}"),
-            output_schema: create_window_output_schema(),
+            output_schema,
             last_emitted: std::collections::HashMap::new(),
             _phantom: PhantomData,
         }
@@ -364,6 +365,11 @@ where
         allowed_lateness: Duration,
         operator_id: String,
     ) -> Self {
+        let output_schema = Arc::new(Schema::new(vec![
+            Field::new("window_start", DataType::Int64, false),
+            Field::new("window_end", DataType::Int64, false),
+            Field::new("result", aggregator.output_data_type(), aggregator.output_nullable()),
+        ]));
         Self {
             assigner,
             aggregator,
@@ -376,7 +382,7 @@ where
             late_data_metrics: LateDataMetrics::new(),
             window_close_metrics: WindowCloseMetrics::new(),
             operator_id,
-            output_schema: create_window_output_schema(),
+            output_schema,
             last_emitted: std::collections::HashMap::new(),
             _phantom: PhantomData,
         }
@@ -571,14 +577,14 @@ where
         }
 
         let result = acc.result();
-        let result_i64 = result.to_i64();
+        let result_array = result.to_arrow_array();
 
         let batch = RecordBatch::try_new(
             Arc::clone(&self.output_schema),
             vec![
                 Arc::new(Int64Array::from(vec![window_id.start])),
                 Arc::new(Int64Array::from(vec![window_id.end])),
-                Arc::new(Int64Array::from(vec![result_i64])),
+                result_array,
             ],
         )
         .ok()?;
@@ -671,10 +677,13 @@ where
                 continue;
             }
 
-            // Extract value for each window (re-extract since Input may not be Clone)
-            if let Some(value) = self.aggregator.extract(event) {
+            // Extract values for each window (handles multi-row batches)
+            let values = self.aggregator.extract_batch(event);
+            if !values.is_empty() {
                 let mut acc = self.get_accumulator(window_id, ctx.state);
-                acc.add(value);
+                for value in values {
+                    acc.add(value);
+                }
                 if Self::put_accumulator(window_id, &acc, ctx.state).is_ok() {
                     updated_windows.push(*window_id);
                 }
@@ -782,8 +791,8 @@ where
         self.periodic_timer_windows.remove(&window_id);
         // Note: last_emitted for this window_id already removed in Changelog branch above
 
-        // Convert result to i64 for the batch
-        let result_i64 = result.to_i64();
+        // Convert result to Arrow array (preserves native type)
+        let result_array = result.to_arrow_array();
 
         // Create output batch
         let batch = RecordBatch::try_new(
@@ -791,7 +800,7 @@ where
             vec![
                 Arc::new(Int64Array::from(vec![window_id.start])),
                 Arc::new(Int64Array::from(vec![window_id.end])),
-                Arc::new(Int64Array::from(vec![result_i64])),
+                result_array,
             ],
         );
 
@@ -1916,5 +1925,39 @@ mod tests {
         }
         // last_emitted should be empty (only used for Changelog)
         assert!(operator.last_emitted.is_empty());
+    }
+
+    #[test]
+    fn test_negative_near_min_no_overflow() {
+        // The primary goal: saturating arithmetic prevents overflow panics near i64::MIN.
+        // Before the fix, this would panic with "attempt to subtract with overflow".
+        let assigner = SlidingWindowAssigner::from_millis(1000, 500);
+
+        // last_window_start must not panic
+        let _start = assigner.last_window_start(i64::MIN + 10);
+
+        // assign_windows must not panic
+        let _windows = assigner.assign_windows(i64::MIN + 10);
+
+        // Also verify with slide_ms == size_ms (tumbling-like sliding)
+        let assigner2 = SlidingWindowAssigner::from_millis(1000, 1000);
+        let _start2 = assigner2.last_window_start(i64::MIN + 10);
+        let _windows2 = assigner2.assign_windows(i64::MIN + 10);
+
+        // Verify slightly less extreme value still produces correct windows
+        let assigner3 = SlidingWindowAssigner::from_millis(1000, 500);
+        let windows3 = assigner3.assign_windows(-5000);
+        assert!(
+            !windows3.is_empty(),
+            "Negative timestamp should still produce windows"
+        );
+        for w in &windows3 {
+            assert!(
+                w.start <= -5000 && w.start + 1000 > -5000,
+                "Window [{}, {}) should contain timestamp -5000",
+                w.start,
+                w.end
+            );
+        }
     }
 }

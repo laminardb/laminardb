@@ -41,7 +41,7 @@
 
 use super::window::{
     Accumulator, Aggregator, ChangelogRecord, EmitStrategy, LateDataConfig, LateDataMetrics,
-    ResultToI64, WindowCloseMetrics, WindowId,
+    ResultToArrow, WindowCloseMetrics, WindowId,
 };
 use super::{
     Event, Operator, OperatorContext, OperatorError, OperatorState, Output, OutputVec, Timer,
@@ -251,14 +251,6 @@ impl SessionIndex {
 }
 
 /// Creates the standard session output schema.
-fn create_session_output_schema() -> SchemaRef {
-    Arc::new(Schema::new(vec![
-        Field::new("window_start", DataType::Int64, false),
-        Field::new("window_end", DataType::Int64, false),
-        Field::new("result", DataType::Int64, false),
-    ]))
-}
-
 /// Session window operator.
 ///
 /// Groups events by activity periods separated by gaps. Each unique key
@@ -343,6 +335,11 @@ where
     /// Panics if gap or allowed lateness does not fit in i64.
     pub fn new(gap: Duration, aggregator: A, allowed_lateness: Duration) -> Self {
         let operator_num = SESSION_OPERATOR_COUNTER.fetch_add(1, Ordering::Relaxed);
+        let output_schema = Arc::new(Schema::new(vec![
+            Field::new("window_start", DataType::Int64, false),
+            Field::new("window_end", DataType::Int64, false),
+            Field::new("result", aggregator.output_data_type(), aggregator.output_nullable()),
+        ]));
         Self {
             gap_ms: i64::try_from(gap.as_millis()).expect("Gap must fit in i64"),
             aggregator,
@@ -357,7 +354,7 @@ where
             late_data_metrics: LateDataMetrics::new(),
             window_close_metrics: WindowCloseMetrics::new(),
             operator_id: format!("session_window_{operator_num}"),
-            output_schema: create_session_output_schema(),
+            output_schema,
             key_column: None,
             needs_timer_reregistration: false,
             _phantom: PhantomData,
@@ -375,6 +372,11 @@ where
         allowed_lateness: Duration,
         operator_id: String,
     ) -> Self {
+        let output_schema = Arc::new(Schema::new(vec![
+            Field::new("window_start", DataType::Int64, false),
+            Field::new("window_end", DataType::Int64, false),
+            Field::new("result", aggregator.output_data_type(), aggregator.output_nullable()),
+        ]));
         Self {
             gap_ms: i64::try_from(gap.as_millis()).expect("Gap must fit in i64"),
             aggregator,
@@ -389,7 +391,7 @@ where
             late_data_metrics: LateDataMetrics::new(),
             window_close_metrics: WindowCloseMetrics::new(),
             operator_id,
-            output_schema: create_session_output_schema(),
+            output_schema,
             key_column: None,
             needs_timer_reregistration: false,
             _phantom: PhantomData,
@@ -667,14 +669,14 @@ where
         }
 
         let result = acc.result();
-        let result_i64 = result.to_i64();
+        let result_array = result.to_arrow_array();
 
         let batch = RecordBatch::try_new(
             Arc::clone(&self.output_schema),
             vec![
                 Arc::new(Int64Array::from(vec![session.start])),
                 Arc::new(Int64Array::from(vec![session.end])),
-                Arc::new(Int64Array::from(vec![result_i64])),
+                result_array,
             ],
         )
         .ok()?;
@@ -841,9 +843,10 @@ where
             }
         }
 
-        // Load and update accumulator
+        // Load and update accumulator (handles multi-row batches)
         let mut acc = self.load_accumulator(session_id, ctx.state);
-        if let Some(value) = self.aggregator.extract(event) {
+        let values = self.aggregator.extract_batch(event);
+        for value in values {
             acc.add(value);
         }
 
@@ -1822,7 +1825,12 @@ mod tests {
 
     #[test]
     fn test_session_output_schema() {
-        let schema = create_session_output_schema();
+        use arrow_schema::Schema;
+        let schema = Schema::new(vec![
+            arrow_schema::Field::new("window_start", arrow_schema::DataType::Int64, false),
+            arrow_schema::Field::new("window_end", arrow_schema::DataType::Int64, false),
+            arrow_schema::Field::new("result", arrow_schema::DataType::Int64, false),
+        ]);
 
         assert_eq!(schema.fields().len(), 3);
         assert_eq!(schema.field(0).name(), "window_start");
