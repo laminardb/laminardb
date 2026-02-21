@@ -98,6 +98,8 @@ pub mod window_udf;
 pub mod complex_type_udf;
 /// Lambda higher-order functions for arrays and maps (F-SCHEMA-015 Tier 3)
 pub mod complex_type_lambda;
+/// LaminarDB streaming JSON extension UDFs (F-SCHEMA-013)
+pub mod json_extensions;
 
 pub use aggregate_bridge::{
     create_aggregate_factory, lookup_aggregate_udf, result_to_scalar_value, scalar_value_to_result,
@@ -131,6 +133,10 @@ pub use complex_type_udf::{
 pub use complex_type_lambda::{
     ArrayFilter, ArrayReduce, ArrayTransform, MapFilter, MapTransformValues,
     register_lambda_functions,
+};
+pub use json_extensions::{
+    JsonInferSchema, JsonToColumns, JsonbDeepMerge, JsonbExcept, JsonbFlatten, JsonbMerge,
+    JsonbPick, JsonbRenameKeys, JsonbStripNulls, JsonbUnflatten, register_json_extensions,
 };
 
 use std::sync::atomic::AtomicI64;
@@ -186,6 +192,7 @@ pub fn register_streaming_functions(ctx: &SessionContext) {
     ctx.register_udf(ScalarUDF::new_from_impl(WatermarkUdf::unset()));
     ctx.register_udf(ScalarUDF::new_from_impl(ProcTimeUdf::new()));
     register_json_functions(ctx);
+    register_json_extensions(ctx);
     register_complex_type_functions(ctx);
     register_lambda_functions(ctx);
 }
@@ -211,6 +218,7 @@ pub fn register_streaming_functions_with_watermark(
     ctx.register_udf(ScalarUDF::new_from_impl(WatermarkUdf::new(watermark_ms)));
     ctx.register_udf(ScalarUDF::new_from_impl(ProcTimeUdf::new()));
     register_json_functions(ctx);
+    register_json_extensions(ctx);
     register_complex_type_functions(ctx);
     register_lambda_functions(ctx);
 }

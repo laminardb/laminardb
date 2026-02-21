@@ -195,6 +195,64 @@ fn jsonb_to_json_string(jsonb: &[u8]) -> Option<String> {
     })
 }
 
+/// Convert a JSONB binary value to a `serde_json::Value`.
+///
+/// Recursively decodes the JSONB binary format into the equivalent
+/// `serde_json::Value`, avoiding the text round-trip through JSON strings.
+///
+/// Returns `None` if the JSONB bytes are malformed.
+#[must_use]
+#[allow(clippy::cast_possible_truncation)]
+pub fn jsonb_to_value(jsonb: &[u8]) -> Option<serde_json::Value> {
+    let tag = *jsonb.first()?;
+    Some(match tag {
+        tags::NULL => serde_json::Value::Null,
+        tags::BOOL_FALSE => serde_json::Value::Bool(false),
+        tags::BOOL_TRUE => serde_json::Value::Bool(true),
+        tags::INT64 => {
+            let v = i64::from_le_bytes(jsonb.get(1..9)?.try_into().ok()?);
+            serde_json::Value::Number(v.into())
+        }
+        tags::FLOAT64 => {
+            let v = f64::from_le_bytes(jsonb.get(1..9)?.try_into().ok()?);
+            serde_json::Value::Number(serde_json::Number::from_f64(v)?)
+        }
+        tags::STRING => {
+            let len = read_u32(jsonb, 1)? as usize;
+            let s = std::str::from_utf8(jsonb.get(5..5 + len)?).ok()?;
+            serde_json::Value::String(s.to_owned())
+        }
+        tags::ARRAY => {
+            let count = read_u32(jsonb, 1)? as usize;
+            let mut arr = Vec::with_capacity(count);
+            for i in 0..count {
+                let elem = jsonb_array_get(jsonb, i)?;
+                arr.push(jsonb_to_value(elem)?);
+            }
+            serde_json::Value::Array(arr)
+        }
+        tags::OBJECT => {
+            let count = read_u32(jsonb, 1)? as usize;
+            let offset_table_start = 5;
+            let data_start = offset_table_start + count * 8;
+            let mut map = serde_json::Map::with_capacity(count);
+            for i in 0..count {
+                let entry = offset_table_start + i * 8;
+                let key_off = read_u32(jsonb, entry)? as usize;
+                let key_abs = data_start + key_off;
+                let key_len = read_u16(jsonb, key_abs)? as usize;
+                let key =
+                    std::str::from_utf8(jsonb.get(key_abs + 2..key_abs + 2 + key_len)?).ok()?;
+                let val_off = read_u32(jsonb, entry + 4)? as usize;
+                let val_slice = jsonb.get(data_start + val_off..)?;
+                map.insert(key.to_owned(), jsonb_to_value(val_slice)?);
+            }
+            serde_json::Value::Object(map)
+        }
+        _ => return None,
+    })
+}
+
 /// Check whether JSONB `left` contains `right` (PostgreSQL `@>` semantics).
 ///
 /// An object contains another if every key in `right` exists in `left`
@@ -482,5 +540,31 @@ mod tests {
             let text = jsonb_to_json_string(&b);
             assert!(text.is_some(), "Failed to round-trip: {v:?}");
         }
+    }
+
+    #[test]
+    fn test_jsonb_to_value_scalars() {
+        assert_eq!(jsonb_to_value(&enc(json!(null))), Some(json!(null)));
+        assert_eq!(jsonb_to_value(&enc(json!(true))), Some(json!(true)));
+        assert_eq!(jsonb_to_value(&enc(json!(false))), Some(json!(false)));
+        assert_eq!(jsonb_to_value(&enc(json!(42))), Some(json!(42)));
+        assert_eq!(jsonb_to_value(&enc(json!(3.14))), Some(json!(3.14)));
+        assert_eq!(
+            jsonb_to_value(&enc(json!("hello"))),
+            Some(json!("hello"))
+        );
+    }
+
+    #[test]
+    fn test_jsonb_to_value_complex() {
+        let obj = json!({"a": 1, "b": [2, 3], "c": {"d": true}});
+        let bytes = enc(obj.clone());
+        assert_eq!(jsonb_to_value(&bytes), Some(obj));
+    }
+
+    #[test]
+    fn test_jsonb_to_value_empty() {
+        assert_eq!(jsonb_to_value(&[]), None);
+        assert_eq!(jsonb_to_value(&[0xFF]), None);
     }
 }

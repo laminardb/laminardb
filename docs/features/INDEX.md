@@ -8,13 +8,13 @@
 | Phase 1.5 | 1 | 0 | 0 | 0 | 1 | 0 |
 | Phase 2 | 38 | 0 | 0 | 0 | 38 | 0 |
 | Phase 2.5 | 12 | 0 | 0 | 0 | 12 | 0 |
-| Phase 3 | 93 | 13 | 0 | 0 | 80 | 0 |
+| Phase 3 | 93 | 12 | 0 | 0 | 81 | 0 |
 | Phase 4 | 11 | 11 | 0 | 0 | 0 | 0 |
 | Phase 5 | 10 | 10 | 0 | 0 | 0 | 0 |
 | Phase 6a | 29 | 0 | 0 | 0 | 27 | 2 |
 | Phase 6b | 14 | 0 | 0 | 0 | 14 | 0 |
 | Phase 6c | 10 | 9 | 0 | 0 | 0 | 1 |
-| **Total** | **230** | **43** | **0** | **0** | **184** | **3** |
+| **Total** | **230** | **42** | **0** | **0** | **185** | **3** |
 
 ## Status Legend
 
@@ -139,7 +139,7 @@ See [Plan Compiler Index](plan-compiler/INDEX.md) for architecture details and [
 
 ## Phase 3: Connectors & Integration
 
-> **Status**: 80/93 features complete (86%)
+> **Status**: 81/93 features complete (87%)
 
 ### Streaming API ✅
 
@@ -320,7 +320,7 @@ See [Demo Index](phase-3/demo/INDEX.md).
 |----|---------|----------|--------|--------------|------|
 | F-SCHEMA-011 | PostgreSQL-Compatible JSON Functions | P0 | ✅ | F-SCHEMA-004 | [Link](phase-3/schema/F-SCHEMA-011-json-functions.md) |
 | F-SCHEMA-012 | JSON Table-Valued & Path Functions | P1 | ✅ | F-SCHEMA-011 | [Link](phase-3/schema/F-SCHEMA-012-json-tvf.md) |
-| F-SCHEMA-013 | LaminarDB JSON Extensions | P2 | 📝 | F-SCHEMA-011 | [Link](phase-3/schema/F-SCHEMA-013-json-extensions.md) |
+| F-SCHEMA-013 | LaminarDB JSON Extensions | P2 | ✅ | F-SCHEMA-011 | [Link](phase-3/schema/F-SCHEMA-013-json-extensions.md) |
 | F-SCHEMA-014 | Format Bridge Functions | P1 | ✅ | F-SCHEMA-001, F-SCHEMA-004, F-SCHEMA-006 | [Link](phase-3/schema/F-SCHEMA-014-format-bridges.md) |
 | F-SCHEMA-015 | Array, Struct & Map Functions | P1 | ✅ | F-SCHEMA-001 | [Link](phase-3/schema/F-SCHEMA-015-array-struct-map-functions.md) |
 
