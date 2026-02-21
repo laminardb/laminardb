@@ -614,11 +614,11 @@ mod tests {
 
             // Verify variant is preserved.
             match (&fmt, &deser) {
-                (EventTimeFormat::EpochMillis, EventTimeFormat::EpochMillis) => {}
-                (EventTimeFormat::EpochMicros, EventTimeFormat::EpochMicros) => {}
-                (EventTimeFormat::EpochNanos, EventTimeFormat::EpochNanos) => {}
-                (EventTimeFormat::EpochSeconds, EventTimeFormat::EpochSeconds) => {}
-                (EventTimeFormat::Iso8601, EventTimeFormat::Iso8601) => {}
+                (EventTimeFormat::EpochMillis, EventTimeFormat::EpochMillis)
+                | (EventTimeFormat::EpochMicros, EventTimeFormat::EpochMicros)
+                | (EventTimeFormat::EpochNanos, EventTimeFormat::EpochNanos)
+                | (EventTimeFormat::EpochSeconds, EventTimeFormat::EpochSeconds)
+                | (EventTimeFormat::Iso8601, EventTimeFormat::Iso8601) => {}
                 (EventTimeFormat::Custom(a), EventTimeFormat::Custom(b)) => {
                     assert_eq!(a, b);
                 }
@@ -652,7 +652,7 @@ mod tests {
             } => {
                 assert_eq!(max_connections, 1024);
             }
-            _ => panic!("expected Server"),
+            SourceMode::Client { .. } => panic!("expected Server"),
         }
     }
 
