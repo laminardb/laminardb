@@ -301,7 +301,7 @@ See [Demo Index](phase-3/demo/INDEX.md).
 
 | ID | Feature | Priority | Status | Dependencies | Spec |
 |----|---------|----------|--------|--------------|------|
-| F-SCHEMA-004 | JSON Format Decoder & Inference | P0 | 📝 | F-SCHEMA-001, F-SCHEMA-003 | [Link](phase-3/schema/F-SCHEMA-004-json-decoder.md) |
+| F-SCHEMA-004 | JSON Format Decoder & Inference | P0 | ✅ | F-SCHEMA-001, F-SCHEMA-003 | [Link](phase-3/schema/F-SCHEMA-004-json-decoder.md) |
 | F-SCHEMA-005 | CSV Format Decoder & Inference | P1 | 📝 | F-SCHEMA-001, F-SCHEMA-003 | [Link](phase-3/schema/F-SCHEMA-005-csv-decoder.md) |
 | F-SCHEMA-006 | Avro Format Decoder + Schema Registry | P0 | 📝 | F-SCHEMA-001, F-SCHEMA-003 | [Link](phase-3/schema/F-SCHEMA-006-avro-decoder.md) |
 | F-SCHEMA-007 | Parquet Format Decoder | P1 | 📝 | F-SCHEMA-001 | [Link](phase-3/schema/F-SCHEMA-007-parquet-decoder.md) |

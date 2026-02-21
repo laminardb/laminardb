@@ -13,6 +13,8 @@
 //!   [`RecordDeserializer`](crate::serde::RecordDeserializer) /
 //!   [`RecordSerializer`](crate::serde::RecordSerializer) and the new
 //!   `FormatDecoder` / `FormatEncoder` traits
+//! - **JSON format** ([`json`]) — JSON decoder, encoder, and JSONB binary
+//!   format (F-SCHEMA-004)
 //!
 //! # Architecture
 //!
@@ -34,6 +36,7 @@
 pub mod bridge;
 pub mod error;
 pub mod inference;
+pub mod json;
 pub mod resolver;
 pub mod traits;
 pub mod types;
@@ -56,3 +59,7 @@ pub use traits::{
     SchemaInferable, SchemaProvider, SchemaRegistryAware, WarningSeverity,
 };
 pub use types::{FieldMeta, RawRecord, SinkConfig, SourceConfig, SourceMetadata};
+pub use json::{
+    JsonDecoder, JsonDecoderConfig, JsonEncoder, JsonbAccessor, JsonbEncoder,
+    TypeMismatchStrategy, UnknownFieldStrategy,
+};
