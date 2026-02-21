@@ -62,6 +62,11 @@ object_store = { version = "0.13", optional = true }
 tokio-util = { workspace = true, optional = true }
 chrono = { workspace = true, optional = true }
 
+# WebSocket
+tokio-tungstenite = { version = "0.26", features = ["rustls-tls-webpki-roots"], optional = true }
+tungstenite = { version = "0.26", optional = true }
+futures-util = { version = "0.3", features = ["sink"], optional = true }
+
 [features]
 default = []
 kafka = ["dep:rdkafka", "dep:arrow-avro", "dep:reqwest"]
@@ -80,6 +85,8 @@ delta-lake-glue = ["delta-lake", "deltalake/glue"]
 parquet-lookup = ["dep:parquet", "dep:object_store"]
 # Kafka-based discovery for delta
 kafka-discovery = ["kafka", "laminar-core/delta", "dep:tokio-util", "dep:chrono"]
+# WebSocket source and sink
+websocket = ["dep:tokio-tungstenite", "dep:tungstenite", "dep:futures-util", "dep:url"]
 
 [dev-dependencies]
 tempfile = { workspace = true }

@@ -112,3 +112,7 @@ pub mod sdk;
 
 /// Reference table source trait and refresh modes.
 pub mod reference;
+
+/// WebSocket source and sink connectors.
+#[cfg(feature = "websocket")]
+pub mod websocket;
