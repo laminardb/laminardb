@@ -39,8 +39,8 @@ use std::path::{Path, PathBuf};
 use std::time::{Duration, Instant};
 
 use rkyv::{
-    rancor::Error as RkyvError, util::AlignedVec, Archive, Deserialize as RkyvDeserialize,
-    Serialize as RkyvSerialize,
+    api::high, rancor::Error as RkyvError, util::AlignedVec, Archive,
+    Deserialize as RkyvDeserialize, Serialize as RkyvSerialize,
 };
 
 // Module to contain types that use derive macros with generated code
@@ -110,6 +110,8 @@ pub struct WriteAheadLog {
     /// Pre-allocated write buffer reused across `append()` calls.
     /// Grows to high-water mark and stays, eliminating per-append allocation.
     write_buffer: Vec<u8>,
+    /// Reusable rkyv serialization buffer (avoids `AlignedVec` alloc per append).
+    serialize_buffer: AlignedVec,
 }
 
 /// Error type for WAL operations.
@@ -182,6 +184,7 @@ impl WriteAheadLog {
             position,
             sync_on_write: false,
             write_buffer: Vec::with_capacity(4096),
+            serialize_buffer: AlignedVec::with_capacity(256),
         })
     }
 
@@ -205,8 +208,10 @@ impl WriteAheadLog {
     pub fn append(&mut self, entry: &WalEntry) -> Result<u64, WalError> {
         let start_pos = self.position;
 
-        // Serialize the entry using rkyv
-        let bytes: AlignedVec = rkyv::to_bytes::<RkyvError>(entry)
+        // Serialize into reusable buffer (avoids AlignedVec alloc per append)
+        self.serialize_buffer.clear();
+        let taken = std::mem::take(&mut self.serialize_buffer);
+        let bytes = high::to_bytes_in::<_, RkyvError>(entry, taken)
             .map_err(|e| WalError::Serialization(e.to_string()))?;
 
         // Compute CRC32C checksum of the serialized data
@@ -236,6 +241,9 @@ impl WriteAheadLog {
 
         let bytes_len = bytes.len() as u64;
         self.position += RECORD_HEADER_SIZE + bytes_len;
+
+        // Restore serialize buffer for reuse
+        self.serialize_buffer = bytes;
 
         // Check if we need to sync (group commit)
         if self.sync_on_write || self.last_sync.elapsed() >= self.sync_interval {

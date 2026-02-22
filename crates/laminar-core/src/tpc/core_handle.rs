@@ -586,6 +586,9 @@ fn core_thread_main(
     // Signal that we're running
     ctx.is_running.store(true, Ordering::Release);
 
+    // Reusable buffer for reactor outputs (avoids per-poll Vec allocation)
+    let mut poll_buffer: Vec<Output> = Vec::with_capacity(256);
+
     // Main loop
     loop {
         // Check for shutdown
@@ -656,13 +659,14 @@ fn core_thread_main(
             ctx.credit_gate.release(messages_processed);
         }
 
-        // Process events in reactor
-        let outputs = reactor.poll();
+        // Process events in reactor (reuses poll_buffer capacity across iterations)
+        poll_buffer.clear();
+        reactor.poll_into(&mut poll_buffer);
         ctx.events_processed
-            .fetch_add(outputs.len() as u64, Ordering::Relaxed);
+            .fetch_add(poll_buffer.len() as u64, Ordering::Relaxed);
 
         // Push outputs to outbox
-        for output in outputs {
+        for output in poll_buffer.drain(..) {
             if ctx.outbox.push(output).is_err() {
                 ctx.outputs_dropped.fetch_add(1, Ordering::Relaxed);
             }
@@ -679,8 +683,9 @@ fn core_thread_main(
     }
 
     // Drain any remaining events before shutdown
-    let outputs = reactor.poll();
-    for output in outputs {
+    poll_buffer.clear();
+    reactor.poll_into(&mut poll_buffer);
+    for output in poll_buffer.drain(..) {
         let _ = ctx.outbox.push(output);
     }
 

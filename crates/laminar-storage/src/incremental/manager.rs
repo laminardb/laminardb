@@ -9,6 +9,7 @@ use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::time::{Duration, SystemTime, UNIX_EPOCH};
 
+use rustc_hash::FxHashMap;
 use serde::{Deserialize, Serialize};
 use tracing::{debug, info};
 
@@ -204,7 +205,7 @@ pub struct IncrementalCheckpointManager {
     /// Latest checkpoint ID.
     latest_checkpoint_id: Option<u64>,
     /// In-memory state store.
-    state: HashMap<Vec<u8>, Vec<u8>>,
+    state: FxHashMap<Vec<u8>, Vec<u8>>,
     /// Source offsets for exactly-once semantics.
     source_offsets: HashMap<String, u64>,
     /// Current watermark.
@@ -232,7 +233,7 @@ impl IncrementalCheckpointManager {
             current_epoch: AtomicU64::new(0),
             last_checkpoint_time: AtomicU64::new(0),
             latest_checkpoint_id: latest_id,
-            state: HashMap::new(),
+            state: FxHashMap::default(),
             source_offsets: HashMap::new(),
             watermark: None,
         })

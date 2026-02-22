@@ -246,19 +246,10 @@ where
     fn poll_next(mut self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<Option<Self::Item>> {
         match Pin::new(&mut self.inner).poll_next(cx) {
             Poll::Ready(Some(Ok(batch))) => {
-                // Project columns
-                let columns: Vec<_> = self
-                    .indices
-                    .iter()
-                    .map(|&i| Arc::clone(batch.column(i)))
-                    .collect();
-                let projected =
-                    RecordBatch::try_new(Arc::clone(&self.schema), columns).map_err(|e| {
-                        DataFusionError::ArrowError(
-                            Box::new(e),
-                            Some("projection failed".to_string()),
-                        )
-                    });
+                // Project columns using built-in projection (avoids intermediate Vec alloc)
+                let projected = batch.project(&self.indices).map_err(|e| {
+                    DataFusionError::ArrowError(Box::new(e), Some("projection failed".to_string()))
+                });
                 Poll::Ready(Some(projected))
             }
             Poll::Ready(Some(Err(e))) => Poll::Ready(Some(Err(e))),

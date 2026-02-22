@@ -5,6 +5,7 @@ use std::io::{BufWriter, Write};
 use std::path::{Path, PathBuf};
 use std::time::Instant;
 
+use rkyv::api::high;
 use rkyv::rancor::Error as RkyvError;
 use rkyv::util::AlignedVec;
 
@@ -40,6 +41,11 @@ pub struct CoreWalWriter {
     last_sync: Instant,
     /// Number of entries since last sync.
     entries_since_sync: u64,
+    /// Pre-allocated write buffer reused across `append()` calls.
+    /// Grows to high-water mark and stays, eliminating per-append allocation.
+    write_buffer: Vec<u8>,
+    /// Reusable rkyv serialization buffer (avoids `AlignedVec` alloc per append).
+    serialize_buffer: AlignedVec,
 }
 
 impl CoreWalWriter {
@@ -68,6 +74,8 @@ impl CoreWalWriter {
             sequence: 0,
             last_sync: Instant::now(),
             entries_since_sync: 0,
+            write_buffer: Vec::with_capacity(4096),
+            serialize_buffer: AlignedVec::with_capacity(256),
         })
     }
 
@@ -96,6 +104,8 @@ impl CoreWalWriter {
             sequence: 0,
             last_sync: Instant::now(),
             entries_since_sync: 0,
+            write_buffer: Vec::with_capacity(4096),
+            serialize_buffer: AlignedVec::with_capacity(256),
         })
     }
 
@@ -190,24 +200,34 @@ impl CoreWalWriter {
     pub fn append(&mut self, entry: &PerCoreWalEntry) -> Result<u64, PerCoreWalError> {
         let start_pos = self.position;
 
-        // Serialize the entry using rkyv
-        let bytes: AlignedVec = rkyv::to_bytes::<RkyvError>(entry)
+        // Serialize into reusable buffer (avoids AlignedVec alloc per append)
+        self.serialize_buffer.clear();
+        let taken = std::mem::take(&mut self.serialize_buffer);
+        let bytes = high::to_bytes_in::<_, RkyvError>(entry, taken)
             .map_err(|e| PerCoreWalError::Serialization(e.to_string()))?;
 
         // Compute CRC32C checksum
         let crc = crc32c::crc32c(&bytes);
 
-        // Write record: [length: 4 bytes][crc32: 4 bytes][data: length bytes]
+        // Coalesce header + data into single write_all() call
         #[allow(clippy::cast_possible_truncation)]
         // rkyv entry serialization is well below u32::MAX
         let len = bytes.len() as u32;
-        self.writer.write_all(&len.to_le_bytes())?;
-        self.writer.write_all(&crc.to_le_bytes())?;
-        self.writer.write_all(&bytes)?;
+        self.write_buffer.clear();
+        #[allow(clippy::cast_possible_truncation)] // RECORD_HEADER_SIZE is 8, always fits usize
+        self.write_buffer
+            .reserve(RECORD_HEADER_SIZE as usize + bytes.len());
+        self.write_buffer.extend_from_slice(&len.to_le_bytes());
+        self.write_buffer.extend_from_slice(&crc.to_le_bytes());
+        self.write_buffer.extend_from_slice(&bytes);
+        self.writer.write_all(&self.write_buffer)?;
+
+        // Restore serialize buffer for reuse
+        self.serialize_buffer = bytes;
 
         #[allow(clippy::cast_possible_truncation)] // usize → u64: lossless on 64-bit
-        let bytes_len = bytes.len() as u64;
-        self.position += RECORD_HEADER_SIZE + bytes_len;
+        let data_len = self.write_buffer.len() as u64 - RECORD_HEADER_SIZE;
+        self.position += RECORD_HEADER_SIZE + data_len;
         self.sequence += 1;
         self.entries_since_sync += 1;
 
