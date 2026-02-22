@@ -374,6 +374,7 @@ code {
   font-weight: 500;
   padding: 0.4rem 0.75rem;
   border-radius: var(--radius-xs);
+  white-space: nowrap;
   transition: all var(--duration) var(--ease-out);
 }
 .nav-links a:hover { color: var(--text-primary); background: rgba(148, 163, 184, 0.06); }
