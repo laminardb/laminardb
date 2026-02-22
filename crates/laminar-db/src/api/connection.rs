@@ -620,9 +620,8 @@ mod tests {
     #[test]
     fn test_cancel_query_invalid() {
         let conn = Connection::open().unwrap();
-        // Cancelling a non-existent query should succeed (no-op in current impl)
         let result = conn.cancel_query(999);
-        assert!(result.is_ok());
+        assert!(result.is_err());
     }
 
     #[test]

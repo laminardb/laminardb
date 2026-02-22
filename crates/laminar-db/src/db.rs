@@ -3237,8 +3237,11 @@ impl LaminarDB {
     ///
     /// Returns `DbError` if the query is not found.
     pub fn cancel_query(&self, query_id: u64) -> Result<(), DbError> {
-        self.catalog.deactivate_query(query_id);
-        Ok(())
+        if self.catalog.deactivate_query(query_id) {
+            Ok(())
+        } else {
+            Err(DbError::QueryNotFound(query_id.to_string()))
+        }
     }
 
     /// Get the number of registered sources.
