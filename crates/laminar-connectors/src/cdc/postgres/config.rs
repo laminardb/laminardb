@@ -3,8 +3,6 @@
 //! Provides [`PostgresCdcConfig`] with all settings needed to connect to
 //! a `PostgreSQL` database and stream logical replication changes.
 
-use std::fmt;
-use std::str::FromStr;
 use std::time::Duration;
 
 use crate::config::ConnectorConfig;
@@ -165,25 +163,19 @@ impl PostgresCdcConfig {
         }
         cfg.password = config.get("password").map(String::from);
 
-        if let Some(ssl) = config.get("ssl.mode") {
-            cfg.ssl_mode = ssl.parse().map_err(|_| {
-                ConnectorError::ConfigurationError(format!("invalid ssl.mode: {ssl}"))
-            })?;
+        if let Some(ssl) = config.get_parsed::<SslMode>("ssl.mode")? {
+            cfg.ssl_mode = ssl;
         }
         cfg.ca_cert_path = config.get("ssl.ca.cert.path").map(String::from);
         cfg.client_cert_path = config.get("ssl.client.cert.path").map(String::from);
         cfg.client_key_path = config.get("ssl.client.key.path").map(String::from);
         cfg.sni_hostname = config.get("ssl.sni.hostname").map(String::from);
 
-        if let Some(lsn) = config.get("start.lsn") {
-            cfg.start_lsn = Some(lsn.parse::<Lsn>().map_err(|e| {
-                ConnectorError::ConfigurationError(format!("invalid start.lsn: {e}"))
-            })?);
+        if let Some(lsn) = config.get_parsed::<Lsn>("start.lsn")? {
+            cfg.start_lsn = Some(lsn);
         }
-        if let Some(mode) = config.get("snapshot.mode") {
-            cfg.snapshot_mode = mode.parse().map_err(|_| {
-                ConnectorError::ConfigurationError(format!("invalid snapshot.mode: {mode}"))
-            })?;
+        if let Some(mode) = config.get_parsed::<SnapshotMode>("snapshot.mode")? {
+            cfg.snapshot_mode = mode;
         }
         if let Some(timeout) = config.get_parsed::<u64>("poll.timeout.ms")? {
             cfg.poll_timeout = Duration::from_millis(timeout);
@@ -211,26 +203,10 @@ impl PostgresCdcConfig {
     ///
     /// Returns `ConnectorError::ConfigurationError` for invalid settings.
     pub fn validate(&self) -> Result<(), ConnectorError> {
-        if self.host.is_empty() {
-            return Err(ConnectorError::ConfigurationError(
-                "host must not be empty".to_string(),
-            ));
-        }
-        if self.database.is_empty() {
-            return Err(ConnectorError::ConfigurationError(
-                "database must not be empty".to_string(),
-            ));
-        }
-        if self.slot_name.is_empty() {
-            return Err(ConnectorError::ConfigurationError(
-                "slot.name must not be empty".to_string(),
-            ));
-        }
-        if self.publication.is_empty() {
-            return Err(ConnectorError::ConfigurationError(
-                "publication must not be empty".to_string(),
-            ));
-        }
+        crate::config::require_non_empty(&self.host, "host")?;
+        crate::config::require_non_empty(&self.database, "database")?;
+        crate::config::require_non_empty(&self.slot_name, "slot.name")?;
+        crate::config::require_non_empty(&self.publication, "publication")?;
         if self.max_poll_records == 0 {
             return Err(ConnectorError::ConfigurationError(
                 "max.poll.records must be > 0".to_string(),
@@ -284,32 +260,13 @@ pub enum SslMode {
     VerifyFull,
 }
 
-impl fmt::Display for SslMode {
-    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
-        match self {
-            SslMode::Disable => write!(f, "disable"),
-            SslMode::Prefer => write!(f, "prefer"),
-            SslMode::Require => write!(f, "require"),
-            SslMode::VerifyCa => write!(f, "verify-ca"),
-            SslMode::VerifyFull => write!(f, "verify-full"),
-        }
-    }
-}
-
-impl FromStr for SslMode {
-    type Err = String;
-
-    fn from_str(s: &str) -> Result<Self, Self::Err> {
-        match s.to_lowercase().as_str() {
-            "disable" => Ok(SslMode::Disable),
-            "prefer" => Ok(SslMode::Prefer),
-            "require" => Ok(SslMode::Require),
-            "verify-ca" | "verify_ca" => Ok(SslMode::VerifyCa),
-            "verify-full" | "verify_full" => Ok(SslMode::VerifyFull),
-            _ => Err(format!("unknown SSL mode: {s}")),
-        }
-    }
-}
+str_enum!(SslMode, lowercase_nodash, String, "unknown SSL mode",
+    Disable => "disable";
+    Prefer => "prefer";
+    Require => "require";
+    VerifyCa => "verify-ca", "verify_ca";
+    VerifyFull => "verify-full", "verify_full"
+);
 
 /// How to handle the initial snapshot when no prior checkpoint exists.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
@@ -323,28 +280,11 @@ pub enum SnapshotMode {
     Always,
 }
 
-impl fmt::Display for SnapshotMode {
-    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
-        match self {
-            SnapshotMode::Initial => write!(f, "initial"),
-            SnapshotMode::Never => write!(f, "never"),
-            SnapshotMode::Always => write!(f, "always"),
-        }
-    }
-}
-
-impl FromStr for SnapshotMode {
-    type Err = String;
-
-    fn from_str(s: &str) -> Result<Self, Self::Err> {
-        match s.to_lowercase().as_str() {
-            "initial" => Ok(SnapshotMode::Initial),
-            "never" => Ok(SnapshotMode::Never),
-            "always" => Ok(SnapshotMode::Always),
-            _ => Err(format!("unknown snapshot mode: {s}")),
-        }
-    }
-}
+str_enum!(SnapshotMode, lowercase_nodash, String, "unknown snapshot mode",
+    Initial => "initial";
+    Never => "never";
+    Always => "always"
+);
 
 #[cfg(test)]
 mod tests {

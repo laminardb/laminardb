@@ -472,46 +472,6 @@ impl Iterator for DrainIter<'_> {
     }
 }
 
-/// Builder for creating changelog entries with validation.
-pub struct ChangelogEntryBuilder {
-    epoch: u64,
-    hasher_builder: FxBuildHasher,
-}
-
-impl ChangelogEntryBuilder {
-    /// Creates a new builder for the given epoch.
-    #[must_use]
-    pub fn new(epoch: u64) -> Self {
-        Self {
-            epoch,
-            hasher_builder: FxBuildHasher,
-        }
-    }
-
-    /// Sets the epoch.
-    #[must_use]
-    pub fn epoch(mut self, epoch: u64) -> Self {
-        self.epoch = epoch;
-        self
-    }
-
-    /// Builds a Put entry.
-    #[must_use]
-    pub fn put(&self, key: &[u8], mmap_offset: u64, value_len: u32) -> StateChangelogEntry {
-        let mut hasher = self.hasher_builder.build_hasher();
-        hasher.write(key);
-        StateChangelogEntry::put(self.epoch, hasher.finish(), mmap_offset, value_len)
-    }
-
-    /// Builds a Delete entry.
-    #[must_use]
-    pub fn delete(&self, key: &[u8]) -> StateChangelogEntry {
-        let mut hasher = self.hasher_builder.build_hasher();
-        hasher.write(key);
-        StateChangelogEntry::delete(self.epoch, hasher.finish())
-    }
-}
-
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -683,16 +643,16 @@ mod tests {
     }
 
     #[test]
-    fn test_entry_builder() {
-        let builder = ChangelogEntryBuilder::new(100);
+    fn test_entry_from_key() {
+        let key_hash = StateChangelogEntry::hash_key(b"mykey");
 
-        let put = builder.put(b"mykey", 500, 75);
+        let put = StateChangelogEntry::put(100, key_hash, 500, 75);
         assert_eq!(put.epoch, 100);
         assert_eq!(put.mmap_offset, 500);
         assert_eq!(put.value_len, 75);
         assert!(put.is_put());
 
-        let delete = builder.delete(b"mykey");
+        let delete = StateChangelogEntry::delete(100, key_hash);
         assert_eq!(delete.epoch, 100);
         assert!(delete.is_delete());
 

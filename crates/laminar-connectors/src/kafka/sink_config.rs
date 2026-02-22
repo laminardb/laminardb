@@ -415,26 +415,10 @@ pub enum DeliveryGuarantee {
     ExactlyOnce,
 }
 
-impl std::str::FromStr for DeliveryGuarantee {
-    type Err = String;
-
-    fn from_str(s: &str) -> Result<Self, Self::Err> {
-        match s.to_lowercase().replace('_', "-").as_str() {
-            "at-least-once" | "atleastonce" => Ok(Self::AtLeastOnce),
-            "exactly-once" | "exactlyonce" => Ok(Self::ExactlyOnce),
-            other => Err(format!("unknown delivery guarantee: '{other}'")),
-        }
-    }
-}
-
-impl std::fmt::Display for DeliveryGuarantee {
-    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-        match self {
-            Self::AtLeastOnce => write!(f, "at-least-once"),
-            Self::ExactlyOnce => write!(f, "exactly-once"),
-        }
-    }
-}
+str_enum!(DeliveryGuarantee, lowercase_udash, String, "unknown delivery guarantee",
+    AtLeastOnce => "at-least-once", "atleastonce";
+    ExactlyOnce => "exactly-once", "exactlyonce"
+);
 
 /// Partitioning strategy for distributing records across Kafka partitions.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -447,28 +431,11 @@ pub enum PartitionStrategy {
     Sticky,
 }
 
-impl std::str::FromStr for PartitionStrategy {
-    type Err = String;
-
-    fn from_str(s: &str) -> Result<Self, Self::Err> {
-        match s.to_lowercase().replace('_', "-").as_str() {
-            "key-hash" | "keyhash" | "hash" => Ok(Self::KeyHash),
-            "round-robin" | "roundrobin" => Ok(Self::RoundRobin),
-            "sticky" => Ok(Self::Sticky),
-            other => Err(format!("unknown partition strategy: '{other}'")),
-        }
-    }
-}
-
-impl std::fmt::Display for PartitionStrategy {
-    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-        match self {
-            Self::KeyHash => write!(f, "key-hash"),
-            Self::RoundRobin => write!(f, "round-robin"),
-            Self::Sticky => write!(f, "sticky"),
-        }
-    }
-}
+str_enum!(PartitionStrategy, lowercase_udash, String, "unknown partition strategy",
+    KeyHash => "key-hash", "keyhash", "hash";
+    RoundRobin => "round-robin", "roundrobin";
+    Sticky => "sticky"
+);
 
 /// Compression type for produced Kafka messages.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -499,20 +466,13 @@ impl CompressionType {
     }
 }
 
-impl std::str::FromStr for CompressionType {
-    type Err = String;
-
-    fn from_str(s: &str) -> Result<Self, Self::Err> {
-        match s.to_lowercase().as_str() {
-            "none" => Ok(Self::None),
-            "gzip" => Ok(Self::Gzip),
-            "snappy" => Ok(Self::Snappy),
-            "lz4" => Ok(Self::Lz4),
-            "zstd" | "zstandard" => Ok(Self::Zstd),
-            other => Err(format!("unknown compression type: '{other}'")),
-        }
-    }
-}
+str_enum!(fromstr CompressionType, lowercase_nodash, String, "unknown compression type",
+    None => "none";
+    Gzip => "gzip";
+    Snappy => "snappy";
+    Lz4 => "lz4";
+    Zstd => "zstd", "zstandard"
+);
 
 impl std::fmt::Display for CompressionType {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
@@ -543,18 +503,11 @@ impl Acks {
     }
 }
 
-impl std::str::FromStr for Acks {
-    type Err = String;
-
-    fn from_str(s: &str) -> Result<Self, Self::Err> {
-        match s.to_lowercase().as_str() {
-            "0" | "none" => Ok(Self::None),
-            "1" | "leader" => Ok(Self::Leader),
-            "-1" | "all" => Ok(Self::All),
-            other => Err(format!("unknown acks value: '{other}'")),
-        }
-    }
-}
+str_enum!(fromstr Acks, lowercase_nodash, String, "unknown acks value",
+    None => "0", "none";
+    Leader => "1", "leader";
+    All => "-1", "all"
+);
 
 impl std::fmt::Display for Acks {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {

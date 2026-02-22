@@ -57,21 +57,12 @@ impl SecurityProtocol {
     }
 }
 
-impl std::str::FromStr for SecurityProtocol {
-    type Err = ConnectorError;
-
-    fn from_str(s: &str) -> Result<Self, Self::Err> {
-        match s.to_lowercase().replace('-', "_").as_str() {
-            "plaintext" => Ok(SecurityProtocol::Plaintext),
-            "ssl" => Ok(SecurityProtocol::Ssl),
-            "sasl_plaintext" => Ok(SecurityProtocol::SaslPlaintext),
-            "sasl_ssl" => Ok(SecurityProtocol::SaslSsl),
-            other => Err(ConnectorError::ConfigurationError(format!(
-                "invalid security.protocol: '{other}' (expected plaintext/ssl/sasl_plaintext/sasl_ssl)"
-            ))),
-        }
-    }
-}
+str_enum!(fromstr SecurityProtocol, lowercase, ConnectorError, "invalid security.protocol",
+    Plaintext => "plaintext";
+    Ssl => "ssl";
+    SaslPlaintext => "sasl_plaintext";
+    SaslSsl => "sasl_ssl"
+);
 
 impl std::fmt::Display for SecurityProtocol {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
@@ -118,22 +109,13 @@ impl SaslMechanism {
     }
 }
 
-impl std::str::FromStr for SaslMechanism {
-    type Err = ConnectorError;
-
-    fn from_str(s: &str) -> Result<Self, Self::Err> {
-        match s.to_uppercase().replace('-', "_").as_str() {
-            "PLAIN" => Ok(SaslMechanism::Plain),
-            "SCRAM_SHA_256" | "SCRAM_SHA256" => Ok(SaslMechanism::ScramSha256),
-            "SCRAM_SHA_512" | "SCRAM_SHA512" => Ok(SaslMechanism::ScramSha512),
-            "GSSAPI" | "KERBEROS" => Ok(SaslMechanism::Gssapi),
-            "OAUTHBEARER" | "OAUTH" => Ok(SaslMechanism::Oauthbearer),
-            other => Err(ConnectorError::ConfigurationError(format!(
-                "invalid sasl.mechanism: '{other}' (expected PLAIN/SCRAM-SHA-256/SCRAM-SHA-512/GSSAPI/OAUTHBEARER)"
-            ))),
-        }
-    }
-}
+str_enum!(fromstr SaslMechanism, uppercase, ConnectorError, "invalid sasl.mechanism",
+    Plain => "PLAIN";
+    ScramSha256 => "SCRAM_SHA_256", "SCRAM_SHA256";
+    ScramSha512 => "SCRAM_SHA_512", "SCRAM_SHA512";
+    Gssapi => "GSSAPI", "KERBEROS";
+    Oauthbearer => "OAUTHBEARER", "OAUTH"
+);
 
 impl std::fmt::Display for SaslMechanism {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
@@ -164,19 +146,10 @@ impl IsolationLevel {
     }
 }
 
-impl std::str::FromStr for IsolationLevel {
-    type Err = ConnectorError;
-
-    fn from_str(s: &str) -> Result<Self, Self::Err> {
-        match s.to_lowercase().replace('-', "_").as_str() {
-            "read_uncommitted" => Ok(IsolationLevel::ReadUncommitted),
-            "read_committed" => Ok(IsolationLevel::ReadCommitted),
-            other => Err(ConnectorError::ConfigurationError(format!(
-                "invalid isolation.level: '{other}' (expected read_uncommitted/read_committed)"
-            ))),
-        }
-    }
-}
+str_enum!(fromstr IsolationLevel, lowercase, ConnectorError, "invalid isolation.level",
+    ReadUncommitted => "read_uncommitted";
+    ReadCommitted => "read_committed"
+);
 
 impl std::fmt::Display for IsolationLevel {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
@@ -318,20 +291,11 @@ impl OffsetReset {
     }
 }
 
-impl std::str::FromStr for OffsetReset {
-    type Err = ConnectorError;
-
-    fn from_str(s: &str) -> Result<Self, Self::Err> {
-        match s.to_lowercase().as_str() {
-            "earliest" | "beginning" => Ok(OffsetReset::Earliest),
-            "latest" | "end" => Ok(OffsetReset::Latest),
-            "none" | "error" => Ok(OffsetReset::None),
-            other => Err(ConnectorError::ConfigurationError(format!(
-                "invalid auto.offset.reset: '{other}' (expected earliest/latest/none)"
-            ))),
-        }
-    }
-}
+str_enum!(fromstr OffsetReset, lowercase_nodash, ConnectorError, "invalid auto.offset.reset",
+    Earliest => "earliest", "beginning";
+    Latest => "latest", "end";
+    None => "none", "error"
+);
 
 /// Kafka partition assignment strategy.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -356,22 +320,12 @@ impl AssignmentStrategy {
     }
 }
 
-impl std::str::FromStr for AssignmentStrategy {
-    type Err = ConnectorError;
-
-    fn from_str(s: &str) -> Result<Self, Self::Err> {
-        match s.to_lowercase().as_str() {
-            "range" => Ok(AssignmentStrategy::Range),
-            "roundrobin" | "round-robin" | "round_robin" => Ok(AssignmentStrategy::RoundRobin),
-            "cooperative-sticky" | "cooperative_sticky" => {
-                Ok(AssignmentStrategy::CooperativeSticky)
-            }
-            other => Err(ConnectorError::ConfigurationError(format!(
-                "invalid partition.assignment.strategy: '{other}'"
-            ))),
-        }
-    }
-}
+str_enum!(fromstr AssignmentStrategy, lowercase_nodash, ConnectorError,
+    "invalid partition.assignment.strategy",
+    Range => "range";
+    RoundRobin => "roundrobin", "round-robin", "round_robin";
+    CooperativeSticky => "cooperative-sticky", "cooperative_sticky"
+);
 
 /// Schema Registry compatibility level.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -408,24 +362,15 @@ impl CompatibilityLevel {
     }
 }
 
-impl std::str::FromStr for CompatibilityLevel {
-    type Err = ConnectorError;
-
-    fn from_str(s: &str) -> Result<Self, Self::Err> {
-        match s.to_uppercase().as_str() {
-            "BACKWARD" => Ok(CompatibilityLevel::Backward),
-            "BACKWARD_TRANSITIVE" => Ok(CompatibilityLevel::BackwardTransitive),
-            "FORWARD" => Ok(CompatibilityLevel::Forward),
-            "FORWARD_TRANSITIVE" => Ok(CompatibilityLevel::ForwardTransitive),
-            "FULL" => Ok(CompatibilityLevel::Full),
-            "FULL_TRANSITIVE" => Ok(CompatibilityLevel::FullTransitive),
-            "NONE" => Ok(CompatibilityLevel::None),
-            other => Err(ConnectorError::ConfigurationError(format!(
-                "invalid schema.compatibility: '{other}'"
-            ))),
-        }
-    }
-}
+str_enum!(fromstr CompatibilityLevel, uppercase, ConnectorError, "invalid schema.compatibility",
+    Backward => "BACKWARD";
+    BackwardTransitive => "BACKWARD_TRANSITIVE";
+    Forward => "FORWARD";
+    ForwardTransitive => "FORWARD_TRANSITIVE";
+    Full => "FULL";
+    FullTransitive => "FULL_TRANSITIVE";
+    None => "NONE"
+);
 
 impl std::fmt::Display for CompatibilityLevel {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {

@@ -390,28 +390,11 @@ pub enum KafkaAlignmentMode {
     DropExcess,
 }
 
-impl std::fmt::Display for KafkaAlignmentMode {
-    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-        match self {
-            Self::Pause => write!(f, "pause"),
-            Self::WarnOnly => write!(f, "warn-only"),
-            Self::DropExcess => write!(f, "drop-excess"),
-        }
-    }
-}
-
-impl std::str::FromStr for KafkaAlignmentMode {
-    type Err = String;
-
-    fn from_str(s: &str) -> Result<Self, Self::Err> {
-        match s.to_lowercase().replace('_', "-").as_str() {
-            "pause" => Ok(Self::Pause),
-            "warn-only" | "warnonly" | "warn" => Ok(Self::WarnOnly),
-            "drop-excess" | "dropexcess" | "drop" => Ok(Self::DropExcess),
-            other => Err(format!("invalid alignment mode: '{other}'")),
-        }
-    }
-}
+str_enum!(KafkaAlignmentMode, lowercase_udash, String, "invalid alignment mode",
+    Pause => "pause";
+    WarnOnly => "warn-only", "warnonly", "warn";
+    DropExcess => "drop-excess", "dropexcess", "drop"
+);
 
 /// Configuration for Kafka source watermark alignment.
 ///

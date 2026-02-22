@@ -66,10 +66,9 @@ pub use wal_state_store::WalStateStore;
 
 // Re-export incremental checkpoint types
 pub use incremental::{
-    validate_checkpoint, wal_size, ChangelogEntryBuilder, CheckpointConfig,
-    IncrementalCheckpointError, IncrementalCheckpointManager, IncrementalCheckpointMetadata,
-    RecoveredState, RecoveryConfig, RecoveryManager, StateChangelogBuffer, StateChangelogEntry,
-    StateOp,
+    validate_checkpoint, wal_size, CheckpointConfig, IncrementalCheckpointError,
+    IncrementalCheckpointManager, IncrementalCheckpointMetadata, RecoveredState, RecoveryConfig,
+    RecoveryManager, StateChangelogBuffer, StateChangelogEntry, StateOp,
 };
 
 // Re-export per-core WAL types

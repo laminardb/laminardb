@@ -52,6 +52,9 @@
 /// Connector error types.
 pub mod error;
 
+#[macro_use]
+mod macros;
+
 /// Connector configuration types.
 pub mod config;
 

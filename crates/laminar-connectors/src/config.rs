@@ -155,6 +155,20 @@ impl ConnectorConfig {
     }
 }
 
+/// Validates that a string field is non-empty.
+///
+/// # Errors
+///
+/// Returns `ConnectorError::ConfigurationError` if the value is empty.
+pub fn require_non_empty(value: &str, field_name: &str) -> Result<(), ConnectorError> {
+    if value.is_empty() {
+        return Err(ConnectorError::ConfigurationError(format!(
+            "{field_name} must not be empty",
+        )));
+    }
+    Ok(())
+}
+
 /// Specification for a configuration key.
 ///
 /// Used by connectors to declare their expected configuration.
