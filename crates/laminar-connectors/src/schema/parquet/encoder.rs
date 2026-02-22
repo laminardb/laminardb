@@ -174,11 +174,11 @@ mod tests {
         .unwrap();
 
         let encoder = ParquetEncoder::new(schema);
-        let encoded = encoder.encode_batch(&batch).unwrap();
-        assert_eq!(encoded.len(), 1);
+        let result = encoder.encode_batch(&batch).unwrap();
+        assert_eq!(result.len(), 1);
 
         // Decode back to verify roundtrip.
-        let bytes = bytes::Bytes::from(encoded.into_iter().next().unwrap());
+        let bytes = bytes::Bytes::from(result.into_iter().next().unwrap());
         let reader = ParquetRecordBatchReaderBuilder::try_new(bytes)
             .unwrap()
             .build()
@@ -204,9 +204,9 @@ mod tests {
         let config = ParquetEncoderConfig::default()
             .with_compression(Compression::GZIP(GzipLevel::default()));
         let encoder = ParquetEncoder::with_config(schema, config);
-        let encoded = encoder.encode_batch(&batch).unwrap();
-        assert_eq!(encoded.len(), 1);
-        assert!(!encoded[0].is_empty());
+        let result = encoder.encode_batch(&batch).unwrap();
+        assert_eq!(result.len(), 1);
+        assert!(!result[0].is_empty());
     }
 
     #[test]

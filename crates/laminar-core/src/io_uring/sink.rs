@@ -169,10 +169,11 @@ mod linux_impl {
                 Output::LateEvent(event) => {
                     format!("LATE_EVENT ts={}\n", event.timestamp).into_bytes()
                 }
-                Output::SideOutput(data) => {
-                    format!("SIDE_OUTPUT name={} ts={}\n", data.name, data.event.timestamp)
-                        .into_bytes()
-                }
+                Output::SideOutput(data) => format!(
+                    "SIDE_OUTPUT name={} ts={}\n",
+                    data.name, data.event.timestamp
+                )
+                .into_bytes(),
                 Output::Changelog(record) => {
                     format!("CHANGELOG op={:?}\n", record.operation).into_bytes()
                 }

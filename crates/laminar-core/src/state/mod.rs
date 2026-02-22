@@ -960,10 +960,7 @@ mod tests {
     #[test]
     fn test_prefix_successor() {
         // Normal case
-        assert_eq!(
-            prefix_successor(b"abc").as_deref(),
-            Some(b"abd".as_slice())
-        );
+        assert_eq!(prefix_successor(b"abc").as_deref(), Some(b"abd".as_slice()));
 
         // Empty prefix
         assert!(prefix_successor(b"").is_none());

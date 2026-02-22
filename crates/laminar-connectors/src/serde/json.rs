@@ -168,8 +168,8 @@ impl RecordSerializer for JsonSerializer {
                 obj.insert(field.name().clone(), value);
             }
 
-            let json_bytes = serde_json::to_vec(&obj)
-                .map_err(|e| SerdeError::Json(e.to_string()))?;
+            let json_bytes =
+                serde_json::to_vec(&obj).map_err(|e| SerdeError::Json(e.to_string()))?;
             records.push(json_bytes);
         }
 

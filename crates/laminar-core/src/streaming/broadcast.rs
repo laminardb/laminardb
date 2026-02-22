@@ -36,9 +36,9 @@
 //! | `read()` | < 50ns |
 //! | `subscribe()` | O(1), CAS on slot (Ring 2 only) |
 
+use parking_lot::RwLock;
 use std::cell::UnsafeCell;
 use std::sync::atomic::{AtomicBool, AtomicU64, AtomicUsize, Ordering};
-use parking_lot::RwLock;
 use std::time::Duration;
 
 use crate::tpc::CachePadded;

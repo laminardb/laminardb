@@ -286,10 +286,7 @@ impl DataFusionAggregateFactory {
 
     /// Returns a cached column name for the given index.
     fn col_name(i: usize) -> &'static str {
-        Self::COL_NAMES
-            .get(i)
-            .copied()
-            .unwrap_or("col_n")
+        Self::COL_NAMES.get(i).copied().unwrap_or("col_n")
     }
 
     /// Creates a DataFusion accumulator from the UDF.

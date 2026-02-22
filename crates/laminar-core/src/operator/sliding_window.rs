@@ -55,7 +55,6 @@ use super::{
     SideOutputData, Timer,
 };
 use crate::state::{StateStore, StateStoreExt};
-use rustc_hash::FxHashMap;
 use arrow_array::{Int64Array, RecordBatch};
 use arrow_schema::{DataType, Field, Schema, SchemaRef};
 use rkyv::{
@@ -66,6 +65,7 @@ use rkyv::{
     util::AlignedVec,
     Archive, Deserialize as RkyvDeserialize, Serialize as RkyvSerialize,
 };
+use rustc_hash::FxHashMap;
 use smallvec::SmallVec;
 use std::marker::PhantomData;
 use std::sync::atomic::{AtomicU64, Ordering};

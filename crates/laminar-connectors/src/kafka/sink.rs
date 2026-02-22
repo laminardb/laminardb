@@ -421,10 +421,7 @@ impl SinkConnector for KafkaSink {
         // instead of waiting for each acknowledgement sequentially.
         let mut delivery_futures = Vec::with_capacity(payloads.len());
         for (i, payload) in payloads.iter().enumerate() {
-            let key: Option<&[u8]> = keys
-                .as_ref()
-                .map(|kb| kb.key(i))
-                .filter(|k| !k.is_empty());
+            let key: Option<&[u8]> = keys.as_ref().map(|kb| kb.key(i)).filter(|k| !k.is_empty());
 
             // Determine partition.
             // Use a reasonable default for num_partitions when metadata isn't cached.
@@ -455,10 +452,8 @@ impl SinkConnector for KafkaSink {
                     let err_msg = err.to_string();
 
                     if self.dlq_producer.is_some() {
-                        let key: Option<&[u8]> = keys
-                            .as_ref()
-                            .map(|kb| kb.key(i))
-                            .filter(|k| !k.is_empty());
+                        let key: Option<&[u8]> =
+                            keys.as_ref().map(|kb| kb.key(i)).filter(|k| !k.is_empty());
                         self.route_to_dlq(&payloads[i], key, &err_msg).await?;
                     } else {
                         return Err(ConnectorError::WriteError(format!(

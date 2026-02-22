@@ -24,9 +24,9 @@
 //! └─────────────────────┘
 //! ```
 
+use parking_lot::RwLock;
 use std::collections::HashMap;
 use std::sync::atomic::{AtomicU64, Ordering};
-use parking_lot::RwLock;
 use std::time::{Duration, Instant};
 
 use tokio::sync::broadcast;

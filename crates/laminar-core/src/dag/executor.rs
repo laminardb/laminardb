@@ -40,7 +40,6 @@ use std::collections::VecDeque;
 
 use rustc_hash::FxHashMap;
 
-
 use crate::alloc::HotPathGuard;
 use crate::operator::{
     Event, Operator, OperatorContext, OperatorState, Output, OutputVec, SideOutputData, Timer,
@@ -302,7 +301,10 @@ impl DagExecutor {
 
         // Use topology-aware propagation: only advance downstream nodes.
         // Direct field access avoids collecting into a SmallVec.
-        for &(node_id, wm) in self.watermark_tracker.update_watermark(source_node, watermark) {
+        for &(node_id, wm) in self
+            .watermark_tracker
+            .update_watermark(source_node, watermark)
+        {
             let nidx = node_id.0 as usize;
             if nidx < self.slot_count {
                 if let Some(ref mut rt) = self.runtimes[nidx] {
@@ -657,9 +659,7 @@ impl DagExecutor {
                     self.route_output(source, out_event);
                 }
                 Output::Watermark(wm) => {
-                    for &(node_id, new_wm) in
-                        self.watermark_tracker.update_watermark(source, wm)
-                    {
+                    for &(node_id, new_wm) in self.watermark_tracker.update_watermark(source, wm) {
                         let nidx = node_id.0 as usize;
                         if nidx < self.slot_count {
                             if let Some(ref mut rt) = self.runtimes[nidx] {
