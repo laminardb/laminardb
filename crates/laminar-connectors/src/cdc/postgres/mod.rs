@@ -102,6 +102,17 @@ fn postgres_cdc_config_keys() -> Vec<ConfigKeySpec> {
             "Comma-separated list of tables to exclude",
             "",
         ),
+        // SSL certificate paths
+        ConfigKeySpec::optional("ssl.ca.cert.path", "Path to CA certificate file", ""),
+        ConfigKeySpec::optional(
+            "ssl.client.cert.path",
+            "Path to client certificate file",
+            "",
+        ),
+        ConfigKeySpec::optional("ssl.client.key.path", "Path to client private key file", ""),
+        ConfigKeySpec::optional("ssl.sni.hostname", "SNI hostname for SSL connections", ""),
+        // Replication start position
+        ConfigKeySpec::optional("start.lsn", "Starting LSN for replication", ""),
     ]
 }
 

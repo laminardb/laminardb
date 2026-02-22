@@ -123,18 +123,50 @@ fn websocket_source_config_keys() -> Vec<ConfigKeySpec> {
         ConfigKeySpec::required("url", "WebSocket URL to connect to (ws:// or wss://)"),
         ConfigKeySpec::optional("mode", "Operating mode (client/server)", "client"),
         ConfigKeySpec::optional("format", "Message format (json/csv/binary)", "json"),
-        ConfigKeySpec::optional("subscribe.message", "JSON subscription message to send after handshake", ""),
+        ConfigKeySpec::optional(
+            "subscribe.message",
+            "JSON subscription message to send after handshake",
+            "",
+        ),
         ConfigKeySpec::optional("reconnect.enabled", "Enable automatic reconnection", "true"),
-        ConfigKeySpec::optional("reconnect.initial.delay.ms", "Initial reconnect delay in ms", "100"),
-        ConfigKeySpec::optional("reconnect.max.delay.ms", "Maximum reconnect delay in ms", "30000"),
+        ConfigKeySpec::optional(
+            "reconnect.initial.delay.ms",
+            "Initial reconnect delay in ms",
+            "100",
+        ),
+        ConfigKeySpec::optional(
+            "reconnect.max.delay.ms",
+            "Maximum reconnect delay in ms",
+            "30000",
+        ),
         ConfigKeySpec::optional("ping.interval.ms", "WebSocket ping interval in ms", "30000"),
         ConfigKeySpec::optional("ping.timeout.ms", "Pong reply timeout in ms", "10000"),
         ConfigKeySpec::optional("bind.address", "Socket address for server mode", ""),
-        ConfigKeySpec::optional("max.connections", "Max concurrent connections (server mode)", "1024"),
-        ConfigKeySpec::optional("on.backpressure", "Backpressure strategy (block/drop)", "block"),
-        ConfigKeySpec::optional("max.message.size", "Max WebSocket message size in bytes", "67108864"),
-        ConfigKeySpec::optional("event.time.field", "JSON field path for event time extraction", ""),
-        ConfigKeySpec::optional("event.time.format", "Event time format (epoch_millis/iso8601)", ""),
+        ConfigKeySpec::optional(
+            "max.connections",
+            "Max concurrent connections (server mode)",
+            "1024",
+        ),
+        ConfigKeySpec::optional(
+            "on.backpressure",
+            "Backpressure strategy (block/drop)",
+            "block",
+        ),
+        ConfigKeySpec::optional(
+            "max.message.size",
+            "Max WebSocket message size in bytes",
+            "67108864",
+        ),
+        ConfigKeySpec::optional(
+            "event.time.field",
+            "JSON field path for event time extraction",
+            "",
+        ),
+        ConfigKeySpec::optional(
+            "event.time.format",
+            "Event time format (epoch_millis/iso8601)",
+            "",
+        ),
         ConfigKeySpec::optional("auth.type", "Authentication type (bearer/basic/hmac)", ""),
         ConfigKeySpec::optional("auth.token", "Bearer token for authentication", ""),
     ]
@@ -142,15 +174,38 @@ fn websocket_source_config_keys() -> Vec<ConfigKeySpec> {
 
 fn websocket_sink_config_keys() -> Vec<ConfigKeySpec> {
     vec![
-        ConfigKeySpec::required("bind.address", "Socket address to bind (e.g., 0.0.0.0:8080)"),
+        ConfigKeySpec::required(
+            "bind.address",
+            "Socket address to bind (e.g., 0.0.0.0:8080)",
+        ),
         ConfigKeySpec::optional("mode", "Operating mode (server/client)", "server"),
-        ConfigKeySpec::optional("format", "Serialization format (json/jsonlines/arrow_ipc)", "json"),
-        ConfigKeySpec::optional("max.connections", "Max concurrent client connections", "10000"),
-        ConfigKeySpec::optional("per.client.buffer", "Per-client send buffer in bytes", "262144"),
-        ConfigKeySpec::optional("slow.client.policy", "Slow client policy (drop_oldest/disconnect)", "drop_oldest"),
+        ConfigKeySpec::optional(
+            "format",
+            "Serialization format (json/jsonlines/arrow_ipc)",
+            "json",
+        ),
+        ConfigKeySpec::optional(
+            "max.connections",
+            "Max concurrent client connections",
+            "10000",
+        ),
+        ConfigKeySpec::optional(
+            "per.client.buffer",
+            "Per-client send buffer in bytes",
+            "262144",
+        ),
+        ConfigKeySpec::optional(
+            "slow.client.policy",
+            "Slow client policy (drop_oldest/disconnect)",
+            "drop_oldest",
+        ),
         ConfigKeySpec::optional("ping.interval.ms", "Ping interval in ms", "30000"),
         ConfigKeySpec::optional("ping.timeout.ms", "Pong timeout in ms", "10000"),
-        ConfigKeySpec::optional("replay.buffer.size", "Messages to buffer for late joiners", ""),
+        ConfigKeySpec::optional(
+            "replay.buffer.size",
+            "Messages to buffer for late joiners",
+            "",
+        ),
         ConfigKeySpec::optional("url", "WebSocket URL for client mode", ""),
         ConfigKeySpec::optional("auth.type", "Authentication type (bearer/basic/hmac)", ""),
         ConfigKeySpec::optional("auth.token", "Bearer token for authentication", ""),

@@ -136,133 +136,71 @@ pub fn register_mysql_cdc_source(registry: &ConnectorRegistry) {
 pub fn config_key_specs() -> Vec<ConfigKeySpec> {
     vec![
         // Connection settings
-        ConfigKeySpec {
-            key: "host".to_string(),
-            description: "MySQL server hostname".to_string(),
-            required: true,
-            default: Some("localhost".to_string()),
-        },
-        ConfigKeySpec {
-            key: "port".to_string(),
-            description: "MySQL server port".to_string(),
-            required: false,
-            default: Some("3306".to_string()),
-        },
-        ConfigKeySpec {
-            key: "database".to_string(),
-            description: "Database name to replicate".to_string(),
-            required: false,
-            default: None,
-        },
-        ConfigKeySpec {
-            key: "username".to_string(),
-            description: "MySQL replication user".to_string(),
-            required: true,
-            default: None,
-        },
-        ConfigKeySpec {
-            key: "password".to_string(),
-            description: "MySQL replication password".to_string(),
-            required: true,
-            default: None,
-        },
+        ConfigKeySpec::optional("host", "MySQL server hostname", "localhost"),
+        ConfigKeySpec::optional("port", "MySQL server port", "3306"),
+        ConfigKeySpec::optional("database", "Database name to replicate", ""),
+        ConfigKeySpec::required("username", "MySQL replication user"),
+        ConfigKeySpec::required("password", "MySQL replication password"),
         // SSL settings
-        ConfigKeySpec {
-            key: "ssl_mode".to_string(),
-            description:
-                "SSL connection mode (disabled/preferred/required/verify_ca/verify_identity)"
-                    .to_string(),
-            required: false,
-            default: Some("preferred".to_string()),
-        },
+        ConfigKeySpec::optional(
+            "ssl.mode",
+            "SSL connection mode (disabled/preferred/required/verify_ca/verify_identity)",
+            "preferred",
+        ),
         // Replication settings
-        ConfigKeySpec {
-            key: "server_id".to_string(),
-            description: "Unique server ID for this replication client".to_string(),
-            required: true,
-            default: None,
-        },
-        ConfigKeySpec {
-            key: "use_gtid".to_string(),
-            description: "Use GTID-based replication (recommended)".to_string(),
-            required: false,
-            default: Some("true".to_string()),
-        },
-        ConfigKeySpec {
-            key: "gtid_set".to_string(),
-            description: "Starting GTID set for replication".to_string(),
-            required: false,
-            default: None,
-        },
-        ConfigKeySpec {
-            key: "binlog_filename".to_string(),
-            description: "Starting binlog filename (if not using GTID)".to_string(),
-            required: false,
-            default: None,
-        },
-        ConfigKeySpec {
-            key: "binlog_position".to_string(),
-            description: "Starting binlog position (if not using GTID)".to_string(),
-            required: false,
-            default: Some("4".to_string()),
-        },
+        ConfigKeySpec::required("server.id", "Unique server ID for this replication client"),
+        ConfigKeySpec::optional(
+            "use.gtid",
+            "Use GTID-based replication (recommended)",
+            "true",
+        ),
+        ConfigKeySpec::optional("gtid.set", "Starting GTID set for replication", ""),
+        ConfigKeySpec::optional(
+            "binlog.filename",
+            "Starting binlog filename (if not using GTID)",
+            "",
+        ),
+        ConfigKeySpec::optional(
+            "binlog.position",
+            "Starting binlog position (if not using GTID)",
+            "4",
+        ),
         // Snapshot settings
-        ConfigKeySpec {
-            key: "snapshot_mode".to_string(),
-            description: "Snapshot mode (initial/never/always/schema_only)".to_string(),
-            required: false,
-            default: Some("initial".to_string()),
-        },
+        ConfigKeySpec::optional(
+            "snapshot.mode",
+            "Snapshot mode (initial/never/always/schema_only)",
+            "initial",
+        ),
         // Table filtering
-        ConfigKeySpec {
-            key: "table_include".to_string(),
-            description: "Comma-separated list of tables to include".to_string(),
-            required: false,
-            default: None,
-        },
-        ConfigKeySpec {
-            key: "table_exclude".to_string(),
-            description: "Comma-separated list of tables to exclude".to_string(),
-            required: false,
-            default: None,
-        },
-        ConfigKeySpec {
-            key: "database_filter".to_string(),
-            description: "Database name filter pattern".to_string(),
-            required: false,
-            default: None,
-        },
+        ConfigKeySpec::optional(
+            "table.include",
+            "Comma-separated list of tables to include",
+            "",
+        ),
+        ConfigKeySpec::optional(
+            "table.exclude",
+            "Comma-separated list of tables to exclude",
+            "",
+        ),
+        ConfigKeySpec::optional("database.filter", "Database name filter pattern", ""),
         // Tuning settings
-        ConfigKeySpec {
-            key: "poll_timeout_ms".to_string(),
-            description: "Timeout for polling binlog events (milliseconds)".to_string(),
-            required: false,
-            default: Some("1000".to_string()),
-        },
-        ConfigKeySpec {
-            key: "max_poll_records".to_string(),
-            description: "Maximum records per poll batch".to_string(),
-            required: false,
-            default: Some("1000".to_string()),
-        },
-        ConfigKeySpec {
-            key: "heartbeat_interval_ms".to_string(),
-            description: "Heartbeat interval (milliseconds)".to_string(),
-            required: false,
-            default: Some("30000".to_string()),
-        },
-        ConfigKeySpec {
-            key: "connect_timeout_ms".to_string(),
-            description: "Connection timeout (milliseconds)".to_string(),
-            required: false,
-            default: Some("10000".to_string()),
-        },
-        ConfigKeySpec {
-            key: "read_timeout_ms".to_string(),
-            description: "Read timeout (milliseconds)".to_string(),
-            required: false,
-            default: Some("60000".to_string()),
-        },
+        ConfigKeySpec::optional(
+            "poll.timeout.ms",
+            "Timeout for polling binlog events (milliseconds)",
+            "1000",
+        ),
+        ConfigKeySpec::optional("max.poll.records", "Maximum records per poll batch", "1000"),
+        ConfigKeySpec::optional(
+            "heartbeat.interval.ms",
+            "Heartbeat interval (milliseconds)",
+            "30000",
+        ),
+        ConfigKeySpec::optional(
+            "connect.timeout.ms",
+            "Connection timeout (milliseconds)",
+            "10000",
+        ),
+        ConfigKeySpec::optional("read.timeout.ms", "Read timeout (milliseconds)", "60000"),
     ]
 }
 
@@ -289,17 +227,20 @@ mod tests {
 
         // Required keys
         let required: Vec<_> = specs.iter().filter(|s| s.required).collect();
-        assert!(required.iter().any(|s| s.key == "host"));
         assert!(required.iter().any(|s| s.key == "username"));
         assert!(required.iter().any(|s| s.key == "password"));
-        assert!(required.iter().any(|s| s.key == "server_id"));
+        assert!(required.iter().any(|s| s.key == "server.id"));
 
         // Optional with defaults
+        let host_spec = specs.iter().find(|s| s.key == "host").unwrap();
+        assert!(!host_spec.required);
+        assert_eq!(host_spec.default, Some("localhost".to_string()));
+
         let port_spec = specs.iter().find(|s| s.key == "port").unwrap();
         assert!(!port_spec.required);
         assert_eq!(port_spec.default, Some("3306".to_string()));
 
-        let ssl_spec = specs.iter().find(|s| s.key == "ssl_mode").unwrap();
+        let ssl_spec = specs.iter().find(|s| s.key == "ssl.mode").unwrap();
         assert!(!ssl_spec.required);
         assert_eq!(ssl_spec.default, Some("preferred".to_string()));
     }
