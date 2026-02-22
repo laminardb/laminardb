@@ -21,8 +21,15 @@ use datafusion_common::Result;
 use datafusion_expr::{
     ColumnarValue, ScalarFunctionArgs, ScalarUDFImpl, Signature, TypeSignature, Volatility,
 };
+use parking_lot::Mutex;
 
 use super::json_types;
+
+/// One-slot cache for compiled JSON paths.
+///
+/// Since a given UDF instance almost always evaluates the same constant path
+/// string, a single-entry cache avoids recompilation on every batch.
+type PathCache = Mutex<Option<(String, CompiledJsonPath)>>;
 
 // ── JSON Path Compiler ──────────────────────────────────────────────
 
@@ -242,10 +249,27 @@ impl CompiledJsonPath {
 
 /// `jsonb_path_exists(jsonb, path_text) → boolean`
 ///
+/// Looks up or compiles a JSON path, caching the result.
+fn compile_cached(
+    cache: &PathCache,
+    path_str: &str,
+) -> std::result::Result<CompiledJsonPath, String> {
+    let mut guard = cache.lock();
+    if let Some((cached_str, cached_path)) = guard.as_ref() {
+        if cached_str == path_str {
+            return Ok(cached_path.clone());
+        }
+    }
+    let compiled = CompiledJsonPath::compile(path_str)?;
+    *guard = Some((path_str.to_owned(), compiled.clone()));
+    Ok(compiled)
+}
+
 /// Returns `true` if the JSON path matches any element in the JSONB value.
 #[derive(Debug)]
 pub struct JsonbPathExistsUdf {
     signature: Signature,
+    path_cache: PathCache,
 }
 
 impl Default for JsonbPathExistsUdf {
@@ -263,6 +287,7 @@ impl JsonbPathExistsUdf {
                 TypeSignature::Exact(vec![DataType::LargeBinary, DataType::Utf8]),
                 Volatility::Immutable,
             ),
+            path_cache: Mutex::new(None),
         }
     }
 }
@@ -307,7 +332,7 @@ impl ScalarUDFImpl for JsonbPathExistsUdf {
                 ColumnarValue::Array(bin_arr),
                 ColumnarValue::Scalar(datafusion_common::ScalarValue::Utf8(Some(path_str))),
             ) => {
-                let compiled = CompiledJsonPath::compile(path_str)
+                let compiled = compile_cached(&self.path_cache, path_str)
                     .map_err(datafusion_common::DataFusionError::Execution)?;
                 let binary = bin_arr
                     .as_any()
@@ -332,7 +357,7 @@ impl ScalarUDFImpl for JsonbPathExistsUdf {
                 ColumnarValue::Scalar(datafusion_common::ScalarValue::LargeBinary(Some(bytes))),
                 ColumnarValue::Scalar(datafusion_common::ScalarValue::Utf8(Some(path_str))),
             ) => {
-                let compiled = CompiledJsonPath::compile(path_str)
+                let compiled = compile_cached(&self.path_cache, path_str)
                     .map_err(datafusion_common::DataFusionError::Execution)?;
                 let result = compiled.exists(bytes);
                 Ok(ColumnarValue::Scalar(
@@ -356,6 +381,7 @@ impl ScalarUDFImpl for JsonbPathExistsUdf {
 #[derive(Debug)]
 pub struct JsonbPathMatchUdf {
     signature: Signature,
+    path_cache: PathCache,
 }
 
 impl Default for JsonbPathMatchUdf {
@@ -373,6 +399,7 @@ impl JsonbPathMatchUdf {
                 TypeSignature::Exact(vec![DataType::LargeBinary, DataType::Utf8]),
                 Volatility::Immutable,
             ),
+            path_cache: Mutex::new(None),
         }
     }
 }
@@ -429,7 +456,7 @@ impl ScalarUDFImpl for JsonbPathMatchUdf {
                 ColumnarValue::Array(bin_arr),
                 ColumnarValue::Scalar(datafusion_common::ScalarValue::Utf8(Some(path_str))),
             ) => {
-                let compiled = CompiledJsonPath::compile(path_str)
+                let compiled = compile_cached(&self.path_cache, path_str)
                     .map_err(datafusion_common::DataFusionError::Execution)?;
                 let binary = bin_arr
                     .as_any()
@@ -459,7 +486,7 @@ impl ScalarUDFImpl for JsonbPathMatchUdf {
                 ColumnarValue::Scalar(datafusion_common::ScalarValue::LargeBinary(Some(bytes))),
                 ColumnarValue::Scalar(datafusion_common::ScalarValue::Utf8(Some(path_str))),
             ) => {
-                let compiled = CompiledJsonPath::compile(path_str)
+                let compiled = compile_cached(&self.path_cache, path_str)
                     .map_err(datafusion_common::DataFusionError::Execution)?;
                 let matched = compiled.evaluate(bytes);
                 let result = if matched.len() == 1 {
