@@ -313,8 +313,8 @@ pub fn build_query(
     };
 
     // WHERE clause parts
-    let mut where_parts: Vec<String> = Vec::new();
-    let mut params: Vec<String> = Vec::new();
+    let mut where_parts = Vec::new();
+    let mut params = Vec::new();
 
     // Key lookup clause
     if !keys.is_empty() && !pk_columns.is_empty() {

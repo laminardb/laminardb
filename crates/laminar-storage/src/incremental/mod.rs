@@ -68,7 +68,7 @@ mod error;
 mod manager;
 mod recovery;
 
-pub use changelog::{ChangelogEntryBuilder, StateChangelogBuffer, StateChangelogEntry, StateOp};
+pub use changelog::{StateChangelogBuffer, StateChangelogEntry, StateOp};
 pub use error::IncrementalCheckpointError;
 pub use manager::{CheckpointConfig, IncrementalCheckpointManager, IncrementalCheckpointMetadata};
 pub use recovery::{

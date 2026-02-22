@@ -3,8 +3,6 @@
 //! [`PostgresSinkConfig`] encapsulates all settings for writing Arrow
 //! `RecordBatch` data to `PostgreSQL`, parsed from SQL `WITH (...)` clauses.
 
-use std::fmt;
-use std::str::FromStr;
 use std::time::Duration;
 
 use crate::config::ConnectorConfig;
@@ -256,26 +254,10 @@ pub enum WriteMode {
     Upsert,
 }
 
-impl FromStr for WriteMode {
-    type Err = String;
-
-    fn from_str(s: &str) -> Result<Self, Self::Err> {
-        match s.to_lowercase().as_str() {
-            "append" | "copy" => Ok(Self::Append),
-            "upsert" | "insert" => Ok(Self::Upsert),
-            other => Err(format!("unknown write mode: '{other}'")),
-        }
-    }
-}
-
-impl fmt::Display for WriteMode {
-    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
-        match self {
-            Self::Append => write!(f, "append"),
-            Self::Upsert => write!(f, "upsert"),
-        }
-    }
-}
+str_enum!(WriteMode, lowercase_nodash, String, "unknown write mode",
+    Append => "append", "copy";
+    Upsert => "upsert", "insert"
+);
 
 /// Delivery guarantee for the `PostgreSQL` sink.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -286,26 +268,10 @@ pub enum DeliveryGuarantee {
     ExactlyOnce,
 }
 
-impl FromStr for DeliveryGuarantee {
-    type Err = String;
-
-    fn from_str(s: &str) -> Result<Self, Self::Err> {
-        match s.to_lowercase().replace('-', "_").as_str() {
-            "at_least_once" | "atleastonce" => Ok(Self::AtLeastOnce),
-            "exactly_once" | "exactlyonce" => Ok(Self::ExactlyOnce),
-            other => Err(format!("unknown delivery guarantee: '{other}'")),
-        }
-    }
-}
-
-impl fmt::Display for DeliveryGuarantee {
-    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
-        match self {
-            Self::AtLeastOnce => write!(f, "at_least_once"),
-            Self::ExactlyOnce => write!(f, "exactly_once"),
-        }
-    }
-}
+str_enum!(DeliveryGuarantee, lowercase_nodash, String, "unknown delivery guarantee",
+    AtLeastOnce => "at_least_once", "at-least-once", "atleastonce";
+    ExactlyOnce => "exactly_once", "exactly-once", "exactlyonce"
+);
 
 /// SSL mode for `PostgreSQL` connections.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -322,32 +288,13 @@ pub enum SslMode {
     VerifyFull,
 }
 
-impl FromStr for SslMode {
-    type Err = String;
-
-    fn from_str(s: &str) -> Result<Self, Self::Err> {
-        match s.to_lowercase().replace('-', "_").as_str() {
-            "disable" | "off" => Ok(Self::Disable),
-            "prefer" => Ok(Self::Prefer),
-            "require" => Ok(Self::Require),
-            "verify_ca" | "verifyca" => Ok(Self::VerifyCa),
-            "verify_full" | "verifyfull" => Ok(Self::VerifyFull),
-            other => Err(format!("unknown SSL mode: '{other}'")),
-        }
-    }
-}
-
-impl fmt::Display for SslMode {
-    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
-        match self {
-            Self::Disable => write!(f, "disable"),
-            Self::Prefer => write!(f, "prefer"),
-            Self::Require => write!(f, "require"),
-            Self::VerifyCa => write!(f, "verify-ca"),
-            Self::VerifyFull => write!(f, "verify-full"),
-        }
-    }
-}
+str_enum!(SslMode, lowercase_nodash, String, "unknown SSL mode",
+    Disable => "disable", "off";
+    Prefer => "prefer";
+    Require => "require";
+    VerifyCa => "verify-ca", "verify_ca", "verifyca";
+    VerifyFull => "verify-full", "verify_full", "verifyfull"
+);
 
 #[cfg(test)]
 mod tests {

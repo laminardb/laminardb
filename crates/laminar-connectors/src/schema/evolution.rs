@@ -308,7 +308,7 @@ pub fn apply_changes(old: &SchemaRef, changes: &[SchemaChange]) -> SchemaResult<
     let mut old_index_map: Vec<Option<usize>> = (0..fields.len()).map(Some).collect();
 
     // Collect indices of columns to remove.
-    let mut remove_indices: Vec<usize> = Vec::new();
+    let mut remove_indices = Vec::new();
 
     for change in changes {
         match change {

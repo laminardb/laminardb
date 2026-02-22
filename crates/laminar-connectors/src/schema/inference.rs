@@ -170,8 +170,8 @@ impl FormatInference for JsonFormatInference {
         let samples = &samples[..limit];
 
         let mut field_types: HashMap<String, Vec<InferredType>> = HashMap::new();
-        let mut field_order: Vec<String> = Vec::new();
-        let mut warnings: Vec<InferenceWarning> = Vec::new();
+        let mut field_order = Vec::new();
+        let mut warnings = Vec::new();
 
         for (i, record) in samples.iter().enumerate() {
             let value: serde_json::Value = serde_json::from_slice(&record.value).map_err(|e| {
@@ -196,8 +196,8 @@ impl FormatInference for JsonFormatInference {
         }
 
         let total = samples.len();
-        let mut fields: Vec<Field> = Vec::new();
-        let mut details: Vec<FieldInferenceDetail> = Vec::new();
+        let mut fields = Vec::new();
+        let mut details = Vec::new();
 
         for name in &field_order {
             let types = &field_types[name];

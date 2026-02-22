@@ -3,8 +3,6 @@
 //! Provides [`MySqlCdcConfig`] with all settings needed to connect to
 //! a MySQL database and stream binlog changes.
 
-use std::fmt;
-use std::str::FromStr;
 use std::time::Duration;
 
 use crate::config::ConnectorConfig;
@@ -165,20 +163,16 @@ impl MySqlCdcConfig {
         cfg.database = config.get("database").map(String::from);
         cfg.password = config.get("password").map(String::from);
 
-        if let Some(ssl) = config.get("ssl.mode") {
-            cfg.ssl_mode = ssl.parse().map_err(|_| {
-                ConnectorError::ConfigurationError(format!("invalid ssl.mode: {ssl}"))
-            })?;
+        if let Some(ssl) = config.get_parsed::<SslMode>("ssl.mode")? {
+            cfg.ssl_mode = ssl;
         }
 
         if let Some(id) = config.get_parsed::<u32>("server.id")? {
             cfg.server_id = id;
         }
 
-        if let Some(gtid) = config.get("gtid.set") {
-            cfg.gtid_set = Some(gtid.parse().map_err(|e| {
-                ConnectorError::ConfigurationError(format!("invalid gtid.set: {e}"))
-            })?);
+        if let Some(gtid) = config.get_parsed::<GtidSet>("gtid.set")? {
+            cfg.gtid_set = Some(gtid);
         }
 
         cfg.binlog_filename = config.get("binlog.filename").map(String::from);
@@ -191,10 +185,8 @@ impl MySqlCdcConfig {
             cfg.use_gtid = use_gtid.parse().unwrap_or(true);
         }
 
-        if let Some(mode) = config.get("snapshot.mode") {
-            cfg.snapshot_mode = mode.parse().map_err(|_| {
-                ConnectorError::ConfigurationError(format!("invalid snapshot.mode: {mode}"))
-            })?;
+        if let Some(mode) = config.get_parsed::<SnapshotMode>("snapshot.mode")? {
+            cfg.snapshot_mode = mode;
         }
 
         if let Some(timeout) = config.get_parsed::<u64>("poll.timeout.ms")? {
@@ -231,16 +223,8 @@ impl MySqlCdcConfig {
     ///
     /// Returns `ConnectorError::ConfigurationError` for invalid settings.
     pub fn validate(&self) -> Result<(), ConnectorError> {
-        if self.host.is_empty() {
-            return Err(ConnectorError::ConfigurationError(
-                "host must not be empty".to_string(),
-            ));
-        }
-        if self.username.is_empty() {
-            return Err(ConnectorError::ConfigurationError(
-                "username must not be empty".to_string(),
-            ));
-        }
+        crate::config::require_non_empty(&self.host, "host")?;
+        crate::config::require_non_empty(&self.username, "username")?;
         if self.server_id == 0 {
             return Err(ConnectorError::ConfigurationError(
                 "server.id must be > 0".to_string(),
@@ -320,32 +304,13 @@ pub enum SslMode {
     VerifyIdentity,
 }
 
-impl fmt::Display for SslMode {
-    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
-        match self {
-            SslMode::Disabled => write!(f, "disabled"),
-            SslMode::Preferred => write!(f, "preferred"),
-            SslMode::Required => write!(f, "required"),
-            SslMode::VerifyCa => write!(f, "verify_ca"),
-            SslMode::VerifyIdentity => write!(f, "verify_identity"),
-        }
-    }
-}
-
-impl FromStr for SslMode {
-    type Err = String;
-
-    fn from_str(s: &str) -> Result<Self, Self::Err> {
-        match s.to_lowercase().as_str() {
-            "disabled" | "disable" | "false" => Ok(SslMode::Disabled),
-            "preferred" | "prefer" => Ok(SslMode::Preferred),
-            "required" | "require" | "true" => Ok(SslMode::Required),
-            "verify_ca" | "verify-ca" => Ok(SslMode::VerifyCa),
-            "verify_identity" | "verify-identity" => Ok(SslMode::VerifyIdentity),
-            _ => Err(format!("unknown SSL mode: {s}")),
-        }
-    }
-}
+str_enum!(SslMode, lowercase_nodash, String, "unknown SSL mode",
+    Disabled => "disabled", "disable", "false";
+    Preferred => "preferred", "prefer";
+    Required => "required", "require", "true";
+    VerifyCa => "verify_ca", "verify-ca";
+    VerifyIdentity => "verify_identity", "verify-identity"
+);
 
 /// How to handle the initial snapshot when no prior checkpoint exists.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
@@ -361,30 +326,12 @@ pub enum SnapshotMode {
     SchemaOnly,
 }
 
-impl fmt::Display for SnapshotMode {
-    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
-        match self {
-            SnapshotMode::Initial => write!(f, "initial"),
-            SnapshotMode::Never => write!(f, "never"),
-            SnapshotMode::Always => write!(f, "always"),
-            SnapshotMode::SchemaOnly => write!(f, "schema_only"),
-        }
-    }
-}
-
-impl FromStr for SnapshotMode {
-    type Err = String;
-
-    fn from_str(s: &str) -> Result<Self, Self::Err> {
-        match s.to_lowercase().as_str() {
-            "initial" => Ok(SnapshotMode::Initial),
-            "never" => Ok(SnapshotMode::Never),
-            "always" => Ok(SnapshotMode::Always),
-            "schema_only" | "schema-only" => Ok(SnapshotMode::SchemaOnly),
-            _ => Err(format!("unknown snapshot mode: {s}")),
-        }
-    }
-}
+str_enum!(SnapshotMode, lowercase_nodash, String, "unknown snapshot mode",
+    Initial => "initial";
+    Never => "never";
+    Always => "always";
+    SchemaOnly => "schema_only", "schema-only"
+);
 
 #[cfg(test)]
 mod tests {

@@ -185,72 +185,6 @@ impl LaminarHeader {
     }
 }
 
-/// Builder for creating packets with headers.
-#[derive(Debug, Default)]
-#[allow(dead_code)]
-pub struct PacketBuilder {
-    partition_key: u32,
-    sequence: u64,
-}
-
-#[allow(dead_code)]
-impl PacketBuilder {
-    /// Creates a new packet builder.
-    #[must_use]
-    pub const fn new() -> Self {
-        Self {
-            partition_key: 0,
-            sequence: 0,
-        }
-    }
-
-    /// Sets the partition key.
-    #[must_use]
-    pub const fn partition_key(mut self, key: u32) -> Self {
-        self.partition_key = key;
-        self
-    }
-
-    /// Sets the sequence number.
-    #[must_use]
-    pub const fn sequence(mut self, seq: u64) -> Self {
-        self.sequence = seq;
-        self
-    }
-
-    /// Builds a packet with the given payload.
-    #[must_use]
-    #[allow(clippy::cast_possible_truncation)] // Packet payloads bounded by MTU (< u32::MAX)
-    pub fn build(&self, payload: &[u8]) -> Vec<u8> {
-        let header =
-            LaminarHeader::with_sequence(self.partition_key, payload.len() as u32, self.sequence);
-
-        let mut packet = Vec::with_capacity(LaminarHeader::SIZE + payload.len());
-        packet.extend_from_slice(&header.to_bytes());
-        packet.extend_from_slice(payload);
-        packet
-    }
-
-    /// Writes a packet to the given buffer.
-    ///
-    /// Returns the total packet size, or `None` if the buffer is too small.
-    #[allow(clippy::cast_possible_truncation)] // Packet payloads bounded by MTU (< u32::MAX)
-    pub fn build_into(&self, payload: &[u8], buffer: &mut [u8]) -> Option<usize> {
-        let total_size = LaminarHeader::SIZE + payload.len();
-        if buffer.len() < total_size {
-            return None;
-        }
-
-        let header =
-            LaminarHeader::with_sequence(self.partition_key, payload.len() as u32, self.sequence);
-
-        buffer[..LaminarHeader::SIZE].copy_from_slice(&header.to_bytes());
-        buffer[LaminarHeader::SIZE..total_size].copy_from_slice(payload);
-
-        Some(total_size)
-    }
-}
-
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -316,47 +250,5 @@ mod tests {
         // "LAMI" in ASCII
         assert_eq!(LaminarHeader::MAGIC, 0x4C41_4D49);
         assert_eq!(&LaminarHeader::MAGIC.to_be_bytes(), b"LAMI");
-    }
-
-    #[test]
-    fn test_packet_builder() {
-        let payload = b"Hello, World!";
-        let packet = PacketBuilder::new()
-            .partition_key(42)
-            .sequence(100)
-            .build(payload);
-
-        assert_eq!(packet.len(), LaminarHeader::SIZE + payload.len());
-
-        let header = LaminarHeader::from_bytes(&packet).unwrap();
-        assert_eq!(header.partition_key(), 42);
-        assert_eq!(header.sequence(), 100);
-        assert_eq!(header.payload_len(), u32::try_from(payload.len()).unwrap());
-
-        assert_eq!(&packet[LaminarHeader::SIZE..], payload);
-    }
-
-    #[test]
-    fn test_packet_builder_into() {
-        let payload = b"Test";
-        let mut buffer = [0u8; 100];
-
-        let size = PacketBuilder::new()
-            .partition_key(1)
-            .build_into(payload, &mut buffer)
-            .unwrap();
-
-        assert_eq!(size, LaminarHeader::SIZE + payload.len());
-    }
-
-    #[test]
-    fn test_packet_builder_into_too_small() {
-        let payload = b"Test";
-        let mut buffer = [0u8; 5]; // Too small
-
-        assert!(PacketBuilder::new()
-            .partition_key(1)
-            .build_into(payload, &mut buffer)
-            .is_none());
     }
 }

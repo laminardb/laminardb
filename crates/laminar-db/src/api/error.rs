@@ -122,6 +122,31 @@ pub enum ApiError {
     },
 }
 
+macro_rules! api_error_msg {
+    ($name:ident, $variant:ident, $code:expr) => {
+        /// Create an error with the given message.
+        pub fn $name(message: impl Into<String>) -> Self {
+            Self::$variant {
+                code: $code,
+                message: message.into(),
+            }
+        }
+    };
+}
+
+macro_rules! api_error_fixed {
+    ($name:ident, $variant:ident, $code:expr, $msg:literal) => {
+        /// Create a fixed-message error.
+        #[must_use]
+        pub fn $name() -> Self {
+            Self::$variant {
+                code: $code,
+                message: $msg.into(),
+            }
+        }
+    };
+}
+
 impl ApiError {
     /// Get the numeric error code.
     #[must_use]
@@ -151,13 +176,27 @@ impl ApiError {
 
     // ---- Constructor helpers ----
 
-    /// Create a connection error with default code.
-    pub fn connection(message: impl Into<String>) -> Self {
-        Self::Connection {
-            code: codes::CONNECTION_FAILED,
-            message: message.into(),
-        }
-    }
+    api_error_msg!(connection, Connection, codes::CONNECTION_FAILED);
+    api_error_msg!(schema_mismatch, Schema, codes::SCHEMA_MISMATCH);
+    api_error_msg!(ingestion, Ingestion, codes::INGESTION_FAILED);
+    api_error_msg!(query, Query, codes::QUERY_FAILED);
+    api_error_msg!(sql_parse, Query, codes::SQL_PARSE_ERROR);
+    api_error_msg!(subscription, Subscription, codes::SUBSCRIPTION_FAILED);
+    api_error_msg!(internal, Internal, codes::INTERNAL_ERROR);
+
+    api_error_fixed!(
+        subscription_closed,
+        Subscription,
+        codes::SUBSCRIPTION_CLOSED,
+        "Subscription closed"
+    );
+    api_error_fixed!(
+        subscription_timeout,
+        Subscription,
+        codes::SUBSCRIPTION_TIMEOUT,
+        "Subscription timeout"
+    );
+    api_error_fixed!(shutdown, Internal, codes::SHUTDOWN, "Database is shut down");
 
     /// Create a "table not found" error.
     #[must_use]
@@ -174,81 +213,6 @@ impl ApiError {
         Self::Schema {
             code: codes::TABLE_EXISTS,
             message: format!("Table already exists: {table}"),
-        }
-    }
-
-    /// Create a schema mismatch error.
-    pub fn schema_mismatch(message: impl Into<String>) -> Self {
-        Self::Schema {
-            code: codes::SCHEMA_MISMATCH,
-            message: message.into(),
-        }
-    }
-
-    /// Create an ingestion error with default code.
-    pub fn ingestion(message: impl Into<String>) -> Self {
-        Self::Ingestion {
-            code: codes::INGESTION_FAILED,
-            message: message.into(),
-        }
-    }
-
-    /// Create a query error with default code.
-    pub fn query(message: impl Into<String>) -> Self {
-        Self::Query {
-            code: codes::QUERY_FAILED,
-            message: message.into(),
-        }
-    }
-
-    /// Create a SQL parse error.
-    pub fn sql_parse(message: impl Into<String>) -> Self {
-        Self::Query {
-            code: codes::SQL_PARSE_ERROR,
-            message: message.into(),
-        }
-    }
-
-    /// Create a subscription error with default code.
-    pub fn subscription(message: impl Into<String>) -> Self {
-        Self::Subscription {
-            code: codes::SUBSCRIPTION_FAILED,
-            message: message.into(),
-        }
-    }
-
-    /// Create a "subscription closed" error.
-    #[must_use]
-    pub fn subscription_closed() -> Self {
-        Self::Subscription {
-            code: codes::SUBSCRIPTION_CLOSED,
-            message: "Subscription closed".into(),
-        }
-    }
-
-    /// Create a "subscription timeout" error.
-    #[must_use]
-    pub fn subscription_timeout() -> Self {
-        Self::Subscription {
-            code: codes::SUBSCRIPTION_TIMEOUT,
-            message: "Subscription timeout".into(),
-        }
-    }
-
-    /// Create an internal error with default code.
-    pub fn internal(message: impl Into<String>) -> Self {
-        Self::Internal {
-            code: codes::INTERNAL_ERROR,
-            message: message.into(),
-        }
-    }
-
-    /// Create a "database shutdown" error.
-    #[must_use]
-    pub fn shutdown() -> Self {
-        Self::Internal {
-            code: codes::SHUTDOWN,
-            message: "Database is shut down".into(),
         }
     }
 }
