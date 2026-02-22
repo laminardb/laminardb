@@ -4392,7 +4392,16 @@ mod tests {
         #[cfg(feature = "delta-lake")]
         {
             expected_sources += 1; // delta-lake source
-            expected_sinks += 1; // delta-lake sink
+            expected_sinks += 2; // delta-lake sink + iceberg sink
+        }
+        #[cfg(feature = "websocket")]
+        {
+            expected_sources += 1; // websocket source
+            expected_sinks += 1; // websocket sink
+        }
+        #[cfg(feature = "mysql-cdc")]
+        {
+            expected_sources += 1; // mysql CDC source
         }
 
         assert_eq!(registry.list_sources().len(), expected_sources);
