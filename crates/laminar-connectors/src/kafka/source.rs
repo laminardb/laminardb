@@ -325,29 +325,41 @@ impl SourceConnector for KafkaSource {
         let limit = max_records.min(self.config.max_poll_records);
         let timeout = self.config.poll_timeout;
 
-        // Collect raw messages.
-        let mut payloads: Vec<Vec<u8>> = Vec::with_capacity(limit);
+        // Collect raw messages into a contiguous buffer (single allocation
+        // instead of per-message Vec<u8>).
+        let mut payload_buf: Vec<u8> = Vec::with_capacity(limit * 256);
+        let mut payload_offsets: Vec<(usize, usize)> = Vec::with_capacity(limit);
         let mut total_bytes: u64 = 0;
-        let mut last_partition: Option<PartitionInfo> = None;
+        // Defer PartitionInfo string formatting until after the loop to
+        // avoid allocating format strings for every message.
+        let mut last_topic = String::new();
+        let mut last_partition_id: i32 = 0;
+        let mut last_offset: i64 = -1;
 
         let poll_start = Instant::now();
-        while payloads.len() < limit && poll_start.elapsed() < timeout {
+        while payload_offsets.len() < limit && poll_start.elapsed() < timeout {
             let remaining = timeout.saturating_sub(poll_start.elapsed());
             match tokio::time::timeout(remaining, consumer.recv()).await {
                 Ok(Ok(msg)) => {
                     if let Some(payload) = msg.payload() {
                         total_bytes += payload.len() as u64;
-                        payloads.push(payload.to_vec());
+                        let start = payload_buf.len();
+                        payload_buf.extend_from_slice(payload);
+                        payload_offsets.push((start, payload.len()));
 
                         let topic = msg.topic();
                         let partition = msg.partition();
                         let offset = msg.offset();
 
                         self.offsets.update(topic, partition, offset);
-                        last_partition = Some(PartitionInfo::new(
-                            format!("{topic}-{partition}"),
-                            offset.to_string(),
-                        ));
+                        // Track raw values; only reallocate topic string
+                        // when the topic/partition actually changes.
+                        if last_topic.as_str() != topic || last_partition_id != partition {
+                            last_topic.clear();
+                            last_topic.push_str(topic);
+                            last_partition_id = partition;
+                        }
+                        last_offset = offset;
                     }
                 }
                 Ok(Err(e)) => {
@@ -366,12 +378,25 @@ impl SourceConnector for KafkaSource {
         // Periodically commit offsets.
         self.maybe_commit_offsets()?;
 
-        if payloads.is_empty() {
+        if payload_offsets.is_empty() {
             return Ok(None);
         }
 
+        // Build PartitionInfo once after the loop (not per-message).
+        let last_partition = if last_offset >= 0 {
+            Some(PartitionInfo::new(
+                format!("{last_topic}-{last_partition_id}"),
+                last_offset.to_string(),
+            ))
+        } else {
+            None
+        };
+
         // Deserialize messages into RecordBatch.
-        let refs: Vec<&[u8]> = payloads.iter().map(Vec::as_slice).collect();
+        let refs: Vec<&[u8]> = payload_offsets
+            .iter()
+            .map(|&(start, len)| &payload_buf[start..start + len])
+            .collect();
         let batch = self
             .deserializer
             .deserialize_batch(&refs, &self.schema)

@@ -31,6 +31,51 @@ use super::schema_registry::SchemaRegistryClient;
 use super::sink_config::{DeliveryGuarantee, KafkaSinkConfig, PartitionStrategy};
 use super::sink_metrics::KafkaSinkMetrics;
 
+/// Contiguous key buffer — stores all key bytes in a single allocation
+/// with per-row `(offset, length)` pairs. Avoids N separate heap
+/// allocations for N rows.
+struct KeyBuffer {
+    data: Vec<u8>,
+    offsets: Vec<(usize, usize)>,
+}
+
+impl KeyBuffer {
+    fn with_capacity(num_rows: usize, avg_key_len: usize) -> Self {
+        Self {
+            data: Vec::with_capacity(num_rows * avg_key_len),
+            offsets: Vec::with_capacity(num_rows),
+        }
+    }
+
+    fn push(&mut self, key: &[u8]) {
+        let start = self.data.len();
+        self.data.extend_from_slice(key);
+        self.offsets.push((start, key.len()));
+    }
+
+    fn push_empty(&mut self) {
+        self.offsets.push((0, 0));
+    }
+
+    fn key(&self, i: usize) -> &[u8] {
+        let (start, len) = self.offsets[i];
+        &self.data[start..start + len]
+    }
+
+    #[cfg(test)]
+    fn len(&self) -> usize {
+        self.offsets.len()
+    }
+}
+
+impl std::ops::Index<usize> for KeyBuffer {
+    type Output = [u8];
+
+    fn index(&self, i: usize) -> &[u8] {
+        self.key(i)
+    }
+}
+
 /// Kafka sink connector that writes Arrow `RecordBatch` data to Kafka topics.
 ///
 /// Operates in Ring 1 (background) receiving data from Ring 0 via the
@@ -157,13 +202,13 @@ impl KafkaSink {
         self.last_committed_epoch
     }
 
-    /// Extracts key bytes from the configured key column.
+    /// Contiguous key buffer: all key bytes in one allocation with per-row offsets.
     ///
     /// Returns `None` if no key column is configured.
     fn extract_keys(
         &self,
         batch: &arrow_array::RecordBatch,
-    ) -> Result<Option<Vec<Vec<u8>>>, ConnectorError> {
+    ) -> Result<Option<KeyBuffer>, ConnectorError> {
         let Some(key_col) = &self.config.key_column else {
             return Ok(None);
         };
@@ -175,19 +220,21 @@ impl KafkaSink {
         })?;
 
         let array = batch.column(col_idx);
-        let mut keys = Vec::with_capacity(batch.num_rows());
+        let num_rows = batch.num_rows();
+        let mut buf = KeyBuffer::with_capacity(num_rows, 32);
 
         // Try to get string values; fall back to display representation.
         if let Some(str_array) = array.as_any().downcast_ref::<StringArray>() {
-            for i in 0..batch.num_rows() {
+            for i in 0..num_rows {
                 if str_array.is_null(i) {
-                    keys.push(Vec::new());
+                    buf.push_empty();
                 } else {
-                    keys.push(str_array.value(i).as_bytes().to_vec());
+                    buf.push(str_array.value(i).as_bytes());
                 }
             }
         } else {
             // For non-string columns, use the Arrow array formatter.
+            use std::fmt::Write;
             let formatter = arrow_cast::display::ArrayFormatter::try_new(
                 array,
                 &arrow_cast::display::FormatOptions::default(),
@@ -197,16 +244,20 @@ impl KafkaSink {
                     "failed to create array formatter for key column: {e}"
                 ))
             })?;
-            for i in 0..batch.num_rows() {
+            // Reusable string buffer for formatted values.
+            let mut fmt_buf = String::with_capacity(64);
+            for i in 0..num_rows {
                 if array.is_null(i) {
-                    keys.push(Vec::new());
+                    buf.push_empty();
                 } else {
-                    keys.push(formatter.value(i).to_string().into_bytes());
+                    fmt_buf.clear();
+                    let _ = write!(fmt_buf, "{}", formatter.value(i));
+                    buf.push(fmt_buf.as_bytes());
                 }
             }
         }
 
-        Ok(Some(keys))
+        Ok(Some(buf))
     }
 
     /// Routes a failed record to the dead letter queue.
@@ -364,10 +415,15 @@ impl SinkConnector for KafkaSink {
         let mut records_written: usize = 0;
         let mut bytes_written: u64 = 0;
 
+        // Phase 1: Enqueue all records into librdkafka's internal queue.
+        // producer.send() copies data synchronously and returns a
+        // DeliveryFuture, allowing rdkafka to batch network writes
+        // instead of waiting for each acknowledgement sequentially.
+        let mut delivery_futures = Vec::with_capacity(payloads.len());
         for (i, payload) in payloads.iter().enumerate() {
             let key: Option<&[u8]> = keys
                 .as_ref()
-                .map(|k| k[i].as_slice())
+                .map(|kb| kb.key(i))
                 .filter(|k| !k.is_empty());
 
             // Determine partition.
@@ -384,18 +440,26 @@ impl SinkConnector for KafkaSink {
                 record = record.partition(p);
             }
 
-            // Send to Kafka (async).
-            match producer.send(record, Duration::from_secs(0)).await {
+            delivery_futures.push(producer.send(record, Duration::from_secs(0)));
+        }
+
+        // Phase 2: Collect delivery reports.
+        for (i, future) in delivery_futures.into_iter().enumerate() {
+            match future.await {
                 Ok(_delivery) => {
                     records_written += 1;
-                    bytes_written += payload.len() as u64;
+                    bytes_written += payloads[i].len() as u64;
                 }
                 Err((err, _msg)) => {
                     self.metrics.record_error();
                     let err_msg = err.to_string();
 
                     if self.dlq_producer.is_some() {
-                        self.route_to_dlq(payload, key, &err_msg).await?;
+                        let key: Option<&[u8]> = keys
+                            .as_ref()
+                            .map(|kb| kb.key(i))
+                            .filter(|k| !k.is_empty());
+                        self.route_to_dlq(&payloads[i], key, &err_msg).await?;
                     } else {
                         return Err(ConnectorError::WriteError(format!(
                             "Kafka produce failed: {err_msg}"
@@ -797,7 +861,7 @@ mod tests {
         .unwrap();
         let keys = sink.extract_keys(&batch).unwrap().unwrap();
         assert_eq!(keys.len(), 2);
-        assert_eq!(keys[0], b"key-a");
-        assert_eq!(keys[1], b"key-b");
+        assert_eq!(&keys[0], b"key-a");
+        assert_eq!(&keys[1], b"key-b");
     }
 }
