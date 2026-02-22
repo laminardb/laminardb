@@ -110,9 +110,12 @@ impl KeyWatermarkState {
     /// Updates state with a new event timestamp.
     ///
     /// Returns `true` if the watermark advanced.
+    ///
+    /// The `now` parameter should be the current processing time, cached once
+    /// per batch or poll iteration to avoid per-key `Instant::now()` syscalls.
     #[inline]
-    pub fn update(&mut self, event_time: i64, bounded_delay: i64) -> bool {
-        self.last_activity = Instant::now();
+    pub fn update(&mut self, event_time: i64, bounded_delay: i64, now: Instant) -> bool {
+        self.last_activity = now;
         self.is_idle = false;
 
         if event_time > self.max_event_time {
@@ -371,9 +374,10 @@ impl<K: Hash + Eq + Clone> KeyedWatermarkTracker<K> {
             self.metrics.total_keys = self.key_states.len();
         }
 
-        // Update the key's watermark
+        // Update the key's watermark (cache Instant::now() once per update call)
+        let now = Instant::now();
         let state = self.key_states.get_mut(&key).expect("key just inserted");
-        let watermark_advanced = state.update(event_time, self.bounded_delay_ms);
+        let watermark_advanced = state.update(event_time, self.bounded_delay_ms, now);
 
         if watermark_advanced {
             self.metrics.key_advances += 1;
@@ -399,6 +403,8 @@ impl<K: Hash + Eq + Clone> KeyedWatermarkTracker<K> {
         &mut self,
         events: &[(K, i64)],
     ) -> Result<Option<Watermark>, KeyedWatermarkError> {
+        // Cache Instant::now() once for the entire batch
+        let now = Instant::now();
         for (key, event_time) in events {
             // Check if we need to create a new key
             if !self.key_states.contains_key(key) {
@@ -422,7 +428,7 @@ impl<K: Hash + Eq + Clone> KeyedWatermarkTracker<K> {
             }
 
             let state = self.key_states.get_mut(key).expect("key just inserted");
-            if state.update(*event_time, self.bounded_delay_ms) {
+            if state.update(*event_time, self.bounded_delay_ms, now) {
                 self.metrics.key_advances += 1;
             }
         }
@@ -773,20 +779,21 @@ mod tests {
     #[test]
     fn test_key_watermark_state_update() {
         let mut state = KeyWatermarkState::new();
+        let now = Instant::now();
 
         // First update
-        let advanced = state.update(1000, 100);
+        let advanced = state.update(1000, 100, now);
         assert!(advanced);
         assert_eq!(state.max_event_time, 1000);
         assert_eq!(state.watermark, 900); // 1000 - 100
 
         // Out-of-order event
-        let advanced = state.update(800, 100);
+        let advanced = state.update(800, 100, now);
         assert!(!advanced);
         assert_eq!(state.max_event_time, 1000); // Unchanged
 
         // New max
-        let advanced = state.update(1500, 100);
+        let advanced = state.update(1500, 100, now);
         assert!(advanced);
         assert_eq!(state.watermark, 1400);
     }
@@ -794,7 +801,7 @@ mod tests {
     #[test]
     fn test_key_watermark_state_is_late() {
         let mut state = KeyWatermarkState::new();
-        state.update(1000, 100); // watermark = 900
+        state.update(1000, 100, Instant::now()); // watermark = 900
 
         assert!(state.is_late(800)); // Before watermark
         assert!(state.is_late(899)); // Just before watermark

@@ -28,7 +28,8 @@ use super::watermark::DagWatermarkTracker;
 use crate::mv::{MaterializedView, MvRegistry};
 use crate::operator::changelog::ChangelogRef;
 use crate::operator::{
-    Event, Operator, OperatorContext, OperatorError, OperatorState, Output, OutputVec, Timer,
+    Event, Operator, OperatorContext, OperatorError, OperatorState, Output, OutputVec,
+    SideOutputData, Timer,
 };
 
 /// Helper to create a simple int64 schema.
@@ -3515,10 +3516,10 @@ struct SideOutputEmittingOperator;
 impl Operator for SideOutputEmittingOperator {
     fn process(&mut self, event: &Event, _ctx: &mut OperatorContext) -> OutputVec {
         let mut v = OutputVec::new();
-        v.push(Output::SideOutput {
-            name: "late".to_string(),
+        v.push(Output::SideOutput(Box::new(SideOutputData {
+            name: Arc::from("late"),
             event: event.clone(),
-        });
+        })));
         v
     }
     fn on_timer(&mut self, _timer: Timer, _ctx: &mut OperatorContext) -> OutputVec {

@@ -37,7 +37,7 @@ use crate::io_uring::{CoreRingManager, IoUringConfig};
 use crate::alloc::HotPathGuard;
 use crate::budget::TaskBudget;
 use crate::numa::{NumaAllocator, NumaTopology};
-use crate::operator::{Event, Operator, Output};
+use crate::operator::{CheckpointCompleteData, Event, Operator, Output};
 use crate::reactor::{Reactor, ReactorConfig};
 
 use super::backpressure::{
@@ -623,10 +623,11 @@ fn core_thread_main(
                     // Snapshot all operator states and push to outbox
                     // for Ring 1 to persist via WAL.
                     let operator_states = reactor.trigger_checkpoint();
-                    let checkpoint_output = Output::CheckpointComplete {
-                        checkpoint_id,
-                        operator_states,
-                    };
+                    let checkpoint_output =
+                        Output::CheckpointComplete(Box::new(CheckpointCompleteData {
+                            checkpoint_id,
+                            operator_states,
+                        }));
                     if ctx.outbox.push(checkpoint_output).is_err() {
                         ctx.outputs_dropped.fetch_add(1, Ordering::Relaxed);
                     }
@@ -1130,18 +1131,14 @@ mod tests {
         let outputs = handle.poll_outputs(100);
         let checkpoint = outputs
             .iter()
-            .find(|o| matches!(o, Output::CheckpointComplete { .. }));
+            .find(|o| matches!(o, Output::CheckpointComplete(_)));
         assert!(checkpoint.is_some(), "Expected CheckpointComplete output");
 
-        if let Some(Output::CheckpointComplete {
-            checkpoint_id,
-            operator_states,
-        }) = checkpoint
-        {
-            assert_eq!(*checkpoint_id, 42);
+        if let Some(Output::CheckpointComplete(data)) = checkpoint {
+            assert_eq!(data.checkpoint_id, 42);
             // One operator (PassthroughOperator)
-            assert_eq!(operator_states.len(), 1);
-            assert_eq!(operator_states[0].operator_id, "passthrough");
+            assert_eq!(data.operator_states.len(), 1);
+            assert_eq!(data.operator_states[0].operator_id, "passthrough");
         }
 
         handle.shutdown_and_join().unwrap();

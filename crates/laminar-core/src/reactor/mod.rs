@@ -27,8 +27,10 @@ use std::time::{Duration, Instant};
 
 use crate::alloc::HotPathGuard;
 use crate::budget::TaskBudget;
-use crate::operator::{Event, Operator, OperatorContext, OperatorState, Output};
-use crate::state::{InMemoryStore, StateStore};
+use crate::operator::{
+    CheckpointCompleteData, Event, Operator, OperatorContext, OperatorState, Output, SideOutputData,
+};
+use crate::state::{AHashMapStore, StateStore};
 use crate::time::{BoundedOutOfOrdernessGenerator, TimerService, WatermarkGenerator};
 
 /// Trait for output sinks that consume reactor outputs.
@@ -134,7 +136,7 @@ impl Reactor {
             timer_service: TimerService::new(),
             event_queue,
             output_buffer: Vec::with_capacity(1024),
-            state_store: Box::new(InMemoryStore::new()),
+            state_store: Box::new(AHashMapStore::new()),
             watermark_generator,
             current_event_time: 0,
             start_time: Instant::now(),
@@ -595,7 +597,8 @@ impl Sink for StdoutSink {
                         event.timestamp, event.data
                     );
                 }
-                Output::SideOutput { name, event } => {
+                Output::SideOutput(side_output) => {
+                    let SideOutputData { name, event } = *side_output;
                     println!(
                         "Side Output [{}]: timestamp={}, data={:?}",
                         name, event.timestamp, event.data
@@ -611,10 +614,11 @@ impl Sink for StdoutSink {
                         record.event.data
                     );
                 }
-                Output::CheckpointComplete {
-                    checkpoint_id,
-                    operator_states,
-                } => {
+                Output::CheckpointComplete(data) => {
+                    let CheckpointCompleteData {
+                        checkpoint_id,
+                        operator_states,
+                    } = *data;
                     println!(
                         "Checkpoint: id={checkpoint_id}, operators={}",
                         operator_states.len()

@@ -43,6 +43,9 @@ impl Event {
 }
 
 /// Output from an operator
+///
+/// Infrequent variants (`SideOutput`, `CheckpointComplete`) are boxed to keep
+/// the enum size small for the common hot-path variants (`Event`, `Watermark`).
 #[derive(Debug)]
 pub enum Output {
     /// Regular event output
@@ -51,28 +54,43 @@ pub enum Output {
     Watermark(i64),
     /// Late event that arrived after watermark (no side output configured)
     LateEvent(Event),
-    /// Late event routed to a named side output
-    SideOutput {
-        /// The name of the side output to route to
-        name: String,
-        /// The late event
-        event: Event,
-    },
+    /// Late event routed to a named side output (boxed — infrequent path).
+    SideOutput(Box<SideOutputData>),
     /// Changelog record with Z-set weight.
     ///
     /// Used by `EmitStrategy::Changelog` to emit structured change records
     /// for CDC pipelines and cascading materialized views.
     Changelog(window::ChangelogRecord),
-    /// Checkpoint completion with snapshotted operator states.
+    /// Checkpoint completion with snapshotted operator states (boxed — infrequent path).
     ///
     /// Emitted when a `CheckpointRequest` is processed by a core thread.
     /// Carries the checkpoint ID and all operator states for persistence by Ring 1.
-    CheckpointComplete {
-        /// The checkpoint ID from the request
-        checkpoint_id: u64,
-        /// Snapshotted states from all operators on this core
-        operator_states: Vec<OperatorState>,
-    },
+    CheckpointComplete(Box<CheckpointCompleteData>),
+}
+
+/// Data for a late event routed to a named side output.
+///
+/// Boxed inside [`Output::SideOutput`] to reduce enum size on the hot path.
+#[derive(Debug)]
+pub struct SideOutputData {
+    /// The name of the side output to route to.
+    ///
+    /// Uses `Arc<str>` to avoid per-event String allocation — the name is
+    /// typically shared across all late events for a given operator.
+    pub name: Arc<str>,
+    /// The late event
+    pub event: Event,
+}
+
+/// Data for a checkpoint completion.
+///
+/// Boxed inside [`Output::CheckpointComplete`] to reduce enum size on the hot path.
+#[derive(Debug)]
+pub struct CheckpointCompleteData {
+    /// The checkpoint ID from the request
+    pub checkpoint_id: u64,
+    /// Snapshotted states from all operators on this core
+    pub operator_states: Vec<OperatorState>,
 }
 
 /// Collection type for operator outputs.

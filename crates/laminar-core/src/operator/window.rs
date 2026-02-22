@@ -37,7 +37,8 @@
 //! ```
 
 use super::{
-    Event, Operator, OperatorContext, OperatorError, OperatorState, Output, OutputVec, Timer,
+    Event, Operator, OperatorContext, OperatorError, OperatorState, Output, OutputVec,
+    SideOutputData, Timer,
 };
 use crate::state::{StateStore, StateStoreExt};
 use arrow_array::{Array as ArrowArray, Int64Array, RecordBatch};
@@ -3721,10 +3722,10 @@ where
             if let Some(side_output_name) = self.late_data_config.side_output() {
                 // Route to named side output
                 self.late_data_metrics.record_side_output();
-                output.push(Output::SideOutput {
-                    name: side_output_name.to_string(),
+                output.push(Output::SideOutput(Box::new(SideOutputData {
+                    name: Arc::from(side_output_name),
                     event: event.clone(),
-                });
+                })));
             } else {
                 // No side output configured - emit as LateEvent (may be dropped by downstream)
                 self.late_data_metrics.record_dropped();

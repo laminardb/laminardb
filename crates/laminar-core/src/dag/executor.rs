@@ -42,7 +42,9 @@ use rustc_hash::FxHashMap;
 use smallvec::SmallVec;
 
 use crate::alloc::HotPathGuard;
-use crate::operator::{Event, Operator, OperatorContext, OperatorState, Output, OutputVec, Timer};
+use crate::operator::{
+    Event, Operator, OperatorContext, OperatorState, Output, OutputVec, SideOutputData, Timer,
+};
 use crate::state::InMemoryStore;
 use crate::time::{BoundedOutOfOrdernessGenerator, TimerService};
 
@@ -675,11 +677,14 @@ impl DagExecutor {
                 Output::LateEvent(late_event) => {
                     self.sink_outputs[source.0 as usize].push(late_event);
                 }
-                Output::SideOutput { name: _, event }
-                | Output::Changelog(ChangelogRecord { event, .. }) => {
+                Output::SideOutput(data) => {
+                    let SideOutputData { event, .. } = *data;
                     self.sink_outputs[source.0 as usize].push(event);
                 }
-                Output::CheckpointComplete { .. } => {
+                Output::Changelog(ChangelogRecord { event, .. }) => {
+                    self.sink_outputs[source.0 as usize].push(event);
+                }
+                Output::CheckpointComplete(_) => {
                     // No-op: consumed by checkpoint coordinator
                 }
             }

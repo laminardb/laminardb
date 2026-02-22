@@ -44,7 +44,8 @@ use super::window::{
     ResultToArrow, WindowCloseMetrics, WindowId,
 };
 use super::{
-    Event, Operator, OperatorContext, OperatorError, OperatorState, Output, OutputVec, Timer,
+    Event, Operator, OperatorContext, OperatorError, OperatorState, Output, OutputVec,
+    SideOutputData, Timer,
 };
 use crate::state::{StateStore, StateStoreExt};
 use arrow_array::{Array, Int64Array, RecordBatch};
@@ -220,7 +221,7 @@ impl SessionIndex {
     }
 
     /// Finds all sessions that overlap with an event at `timestamp`.
-    fn find_overlapping(&self, timestamp: i64, gap_ms: i64) -> Vec<SessionId> {
+    fn find_overlapping(&self, timestamp: i64, gap_ms: i64) -> SmallVec<[SessionId; 4]> {
         self.sessions
             .iter()
             .filter(|s| s.overlaps(timestamp, gap_ms))
@@ -807,10 +808,10 @@ where
 
             if let Some(side_output_name) = self.late_data_config.side_output() {
                 self.late_data_metrics.record_side_output();
-                output.push(Output::SideOutput {
-                    name: side_output_name.to_string(),
+                output.push(Output::SideOutput(Box::new(SideOutputData {
+                    name: Arc::from(side_output_name),
                     event: event.clone(),
-                });
+                })));
             } else {
                 self.late_data_metrics.record_dropped();
                 output.push(Output::LateEvent(event.clone()));
@@ -1208,7 +1209,7 @@ mod tests {
 
         // Event at 300 with gap=500 → [300, 800) overlaps [100, 600)
         let hits = idx.find_overlapping(300, 500);
-        assert_eq!(hits, vec![SessionId(1)]);
+        assert_eq!(hits.as_slice(), &[SessionId(1)]);
 
         // Event at 1500 with gap=500 → [1500, 2000) doesn't overlap either
         let hits = idx.find_overlapping(1500, 500);
@@ -1216,7 +1217,7 @@ mod tests {
 
         // Event at 1800 with gap=500 → [1800, 2300) overlaps [2000, 2500)
         let hits = idx.find_overlapping(1800, 500);
-        assert_eq!(hits, vec![SessionId(2)]);
+        assert_eq!(hits.as_slice(), &[SessionId(2)]);
     }
 
     #[test]
@@ -1578,13 +1579,13 @@ mod tests {
         };
 
         let side_output = outputs.iter().find_map(|o| {
-            if let Output::SideOutput { name, .. } = o {
-                Some(name.clone())
+            if let Output::SideOutput(data) = o {
+                Some(data.name.clone())
             } else {
                 None
             }
         });
-        assert_eq!(side_output, Some("late".to_string()));
+        assert_eq!(side_output.as_deref(), Some("late"));
         assert_eq!(operator.late_data_metrics().late_events_side_output(), 1);
     }
 

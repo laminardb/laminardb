@@ -51,7 +51,8 @@ use super::window::{
     ResultToArrow, WindowAssigner, WindowCloseMetrics, WindowId, WindowIdVec,
 };
 use super::{
-    Event, Operator, OperatorContext, OperatorError, OperatorState, Output, OutputVec, Timer,
+    Event, Operator, OperatorContext, OperatorError, OperatorState, Output, OutputVec,
+    SideOutputData, Timer,
 };
 use crate::state::{StateStore, StateStoreExt};
 use arrow_array::{Int64Array, RecordBatch};
@@ -64,6 +65,7 @@ use rkyv::{
     util::AlignedVec,
     Archive, Deserialize as RkyvDeserialize, Serialize as RkyvSerialize,
 };
+use smallvec::SmallVec;
 use std::marker::PhantomData;
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::Arc;
@@ -660,10 +662,10 @@ where
 
             if let Some(side_output_name) = self.late_data_config.side_output() {
                 self.late_data_metrics.record_side_output();
-                output.push(Output::SideOutput {
-                    name: side_output_name.to_string(),
+                output.push(Output::SideOutput(Box::new(SideOutputData {
+                    name: Arc::from(side_output_name),
                     event: event.clone(),
-                });
+                })));
             } else {
                 self.late_data_metrics.record_dropped();
                 output.push(Output::LateEvent(event.clone()));
@@ -675,7 +677,7 @@ where
         let windows = self.assigner.assign_windows(event_time);
 
         // Track windows that were updated (for OnUpdate and Changelog strategies)
-        let mut updated_windows = Vec::new();
+        let mut updated_windows = SmallVec::<[WindowId; 4]>::new();
 
         // Update accumulator for each window
         for window_id in &windows {
@@ -1329,13 +1331,13 @@ mod tests {
 
         // Should emit SideOutput
         let side_output = outputs.iter().find_map(|o| {
-            if let Output::SideOutput { name, .. } = o {
-                Some(name.clone())
+            if let Output::SideOutput(data) = o {
+                Some(data.name.clone())
             } else {
                 None
             }
         });
-        assert_eq!(side_output, Some("late".to_string()));
+        assert_eq!(side_output.as_deref(), Some("late"));
         assert_eq!(operator.late_data_metrics().late_events_side_output(), 1);
     }
 
@@ -1542,7 +1544,7 @@ mod tests {
         // Should NOT be late
         let is_late = outputs
             .iter()
-            .any(|o| matches!(o, Output::LateEvent(_) | Output::SideOutput { .. }));
+            .any(|o| matches!(o, Output::LateEvent(_) | Output::SideOutput(_)));
         assert!(!is_late);
         assert_eq!(operator.late_data_metrics().late_events_total(), 0);
     }

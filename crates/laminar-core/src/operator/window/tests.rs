@@ -716,13 +716,13 @@ fn test_late_event_routed_to_side_output() {
     // Should emit a SideOutput
     assert!(!outputs.is_empty());
     let side_output = outputs.iter().find_map(|o| {
-        if let Output::SideOutput { name, .. } = o {
-            Some(name.clone())
+        if let Output::SideOutput(data) = o {
+            Some(data.name.clone())
         } else {
             None
         }
     });
-    assert_eq!(side_output, Some("late_events".to_string()));
+    assert_eq!(side_output.as_deref(), Some("late_events"));
 
     // Metrics should show side output
     assert_eq!(operator.late_data_metrics().late_events_dropped(), 0);
@@ -765,7 +765,7 @@ fn test_event_within_lateness_not_late() {
     // Should NOT be a late event - should be processed normally
     let is_late_event = outputs
         .iter()
-        .any(|o| matches!(o, Output::LateEvent(_) | Output::SideOutput { .. }));
+        .any(|o| matches!(o, Output::LateEvent(_) | Output::SideOutput(_)));
     assert!(
         !is_late_event,
         "Event within lateness period should not be marked as late"
@@ -2444,15 +2444,15 @@ fn test_eowc_tumbling_late_data_side_output() {
 
     // Should be routed to side output
     let side_output = outputs.iter().find_map(|o| {
-        if let Output::SideOutput { name, .. } = o {
-            Some(name.clone())
+        if let Output::SideOutput(data) = o {
+            Some(data.name.clone())
         } else {
             None
         }
     });
     assert_eq!(
-        side_output,
-        Some("late_trades".to_string()),
+        side_output.as_deref(),
+        Some("late_trades"),
         "Late event should be routed to side output"
     );
     assert_eq!(operator.late_data_metrics().late_events_side_output(), 1);
