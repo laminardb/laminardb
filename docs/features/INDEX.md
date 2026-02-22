@@ -14,7 +14,8 @@
 | Phase 6a | 29 | 0 | 0 | 0 | 27 | 2 |
 | Phase 6b | 14 | 0 | 0 | 0 | 14 | 0 |
 | Phase 6c | 10 | 9 | 0 | 0 | 0 | 1 |
-| **Total** | **230** | **42** | **0** | **0** | **185** | **3** |
+| Perf Optimization | 12 | 12 | 0 | 0 | 0 | 0 |
+| **Total** | **242** | **54** | **0** | **0** | **185** | **3** |
 
 ## Status Legend
 
@@ -572,6 +573,44 @@ See [Delta Index](delta/INDEX.md) for full details, dependency graph, performanc
 | F-SERVER-004 | Hot Reload | 📝 | [Link](delta/server/F-SERVER-004-hot-reload.md) |
 | F-SERVER-005 | Delta Server Mode | 📝 | [Link](delta/server/F-SERVER-005-delta-mode.md) |
 | F-SERVER-006 | Graceful Rolling Restart | 📝 | [Link](delta/server/F-SERVER-006-rolling-restart.md) |
+
+---
+
+## Performance Optimization
+
+> Architectural performance improvements identified by the 2026-02-22 audit. These require design changes beyond localized code fixes. All actionable local fixes (40+ findings) have been implemented.
+
+### State Store & Reactor
+
+| ID | Feature | Priority | Status | Spec |
+|----|---------|----------|--------|------|
+| F-POPT-001 | Zero-Copy Prefix Scan (GAT iterator) | P2 | 📝 | [Link](perf-optimization/F-POPT-001-zero-copy-prefix-scan.md) |
+| F-POPT-002 | Monomorphized Reactor Dispatch | P2 | 📝 | [Link](perf-optimization/F-POPT-002-monomorphized-reactor.md) |
+| F-POPT-003 | AHashMapStore Key Deduplication | P2 | 📝 | [Link](perf-optimization/F-POPT-003-ahash-key-dedup.md) |
+| F-POPT-004 | MmapStateStore Compaction | P3 | 📝 | [Link](perf-optimization/F-POPT-004-mmap-compaction.md) |
+
+### Join Operators
+
+| ID | Feature | Priority | Status | Spec |
+|----|---------|----------|--------|------|
+| F-POPT-005 | Zero-Copy Join Row Encoding | P1 | 📝 | [Link](perf-optimization/F-POPT-005-zero-copy-join-row.md) |
+| F-POPT-006 | Pooled Arrow Builders for Join Output | P1 | 📝 | [Link](perf-optimization/F-POPT-006-pooled-join-builders.md) |
+
+### SQL Execution
+
+| ID | Feature | Priority | Status | Spec |
+|----|---------|----------|--------|------|
+| F-POPT-007 | LogicalPlan Passthrough (eliminate AST round-trip) | P1 | 📝 | [Link](perf-optimization/F-POPT-007-logical-plan-passthrough.md) |
+| F-POPT-008 | Binary JSON Representation (JSONB) | P2 | 📝 | [Link](perf-optimization/F-POPT-008-binary-json.md) |
+| F-POPT-009 | SQL Plan Cache | P3 | 📝 | [Link](perf-optimization/F-POPT-009-sql-plan-cache.md) |
+| F-POPT-010 | MVCC TableStore (eliminate Mutex contention) | P2 | 📝 | [Link](perf-optimization/F-POPT-010-mvcc-table-store.md) |
+
+### Storage & Connectors
+
+| ID | Feature | Priority | Status | Spec |
+|----|---------|----------|--------|------|
+| F-POPT-011 | WAL Scatter-Gather Writes | P1 | 📝 | [Link](perf-optimization/F-POPT-011-wal-scatter-gather.md) |
+| F-POPT-012 | Avro Decoder Reuse | P3 | 📝 | [Link](perf-optimization/F-POPT-012-avro-decoder-reuse.md) |
 
 ---
 
