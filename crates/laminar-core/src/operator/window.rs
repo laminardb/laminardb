@@ -51,7 +51,7 @@ use rkyv::{
     util::AlignedVec,
     Archive, Deserialize as RkyvDeserialize, Serialize as RkyvSerialize,
 };
-use rustc_hash::FxHashSet;
+use rustc_hash::{FxHashMap, FxHashSet};
 use smallvec::SmallVec;
 use std::marker::PhantomData;
 use std::sync::atomic::{AtomicU64, Ordering};
@@ -3287,7 +3287,7 @@ pub struct TumblingWindowOperator<A: Aggregator> {
     /// Cached output schema (avoids allocation on every emit)
     output_schema: SchemaRef,
     /// Last emitted events per window for changelog retraction
-    last_emitted: std::collections::HashMap<WindowId, Event>,
+    last_emitted: FxHashMap<WindowId, Event>,
     /// Phantom data for accumulator type
     _phantom: PhantomData<A::Acc>,
 }
@@ -3341,7 +3341,7 @@ where
             window_close_metrics: WindowCloseMetrics::new(),
             operator_id: format!("tumbling_window_{operator_num}"),
             output_schema,
-            last_emitted: std::collections::HashMap::new(),
+            last_emitted: FxHashMap::default(),
             _phantom: PhantomData,
         }
     }
@@ -3380,7 +3380,7 @@ where
             window_close_metrics: WindowCloseMetrics::new(),
             operator_id,
             output_schema,
-            last_emitted: std::collections::HashMap::new(),
+            last_emitted: FxHashMap::default(),
             _phantom: PhantomData,
         }
     }

@@ -55,6 +55,7 @@ use super::{
     SideOutputData, Timer,
 };
 use crate::state::{StateStore, StateStoreExt};
+use rustc_hash::FxHashMap;
 use arrow_array::{Int64Array, RecordBatch};
 use arrow_schema::{DataType, Field, Schema, SchemaRef};
 use rkyv::{
@@ -311,7 +312,7 @@ pub struct SlidingWindowOperator<A: Aggregator> {
     /// Last emitted intermediate result per window (for Changelog retraction).
     /// Only populated when `emit_strategy` is `Changelog`.
     /// Enables Z-set balance: retract (-1) old value before inserting (+1) new.
-    last_emitted: std::collections::HashMap<WindowId, Event>,
+    last_emitted: FxHashMap<WindowId, Event>,
     /// Phantom data for accumulator type
     _phantom: PhantomData<A::Acc>,
 }
@@ -356,7 +357,7 @@ where
             window_close_metrics: WindowCloseMetrics::new(),
             operator_id: format!("sliding_window_{operator_num}"),
             output_schema,
-            last_emitted: std::collections::HashMap::new(),
+            last_emitted: FxHashMap::default(),
             _phantom: PhantomData,
         }
     }
@@ -393,7 +394,7 @@ where
             window_close_metrics: WindowCloseMetrics::new(),
             operator_id,
             output_schema,
-            last_emitted: std::collections::HashMap::new(),
+            last_emitted: FxHashMap::default(),
             _phantom: PhantomData,
         }
     }

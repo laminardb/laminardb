@@ -39,7 +39,7 @@
 use std::collections::VecDeque;
 
 use rustc_hash::FxHashMap;
-use smallvec::SmallVec;
+
 
 use crate::alloc::HotPathGuard;
 use crate::operator::{
@@ -300,19 +300,13 @@ impl DagExecutor {
             return Err(DagError::NodeNotFound(format!("{source_node}")));
         }
 
-        // Use topology-aware propagation: only advance downstream nodes
-        let updated: SmallVec<[(NodeId, i64); 8]> = self
-            .watermark_tracker
-            .update_watermark(source_node, watermark)
-            .iter()
-            .copied()
-            .collect();
-
-        for (node_id, wm) in &updated {
+        // Use topology-aware propagation: only advance downstream nodes.
+        // Direct field access avoids collecting into a SmallVec.
+        for &(node_id, wm) in self.watermark_tracker.update_watermark(source_node, watermark) {
             let nidx = node_id.0 as usize;
             if nidx < self.slot_count {
                 if let Some(ref mut rt) = self.runtimes[nidx] {
-                    rt.watermark_generator.advance_watermark(*wm);
+                    rt.watermark_generator.advance_watermark(wm);
                 }
             }
         }
@@ -395,11 +389,15 @@ impl DagExecutor {
     #[must_use]
     pub fn take_all_sink_outputs(&mut self) -> FxHashMap<NodeId, Vec<Event>> {
         let mut outputs = FxHashMap::default();
-        let sink_ids: SmallVec<[NodeId; 8]> = self.sink_nodes.iter().copied().collect();
-        for sink_id in sink_ids {
-            let events = self.take_sink_outputs(sink_id);
-            if !events.is_empty() {
-                outputs.insert(sink_id, events);
+        // Index-based iteration avoids collecting sink_nodes into a SmallVec.
+        for i in 0..self.sink_nodes.len() {
+            let sink_id = self.sink_nodes[i];
+            let idx = sink_id.0 as usize;
+            if idx < self.slot_count {
+                let events = std::mem::take(&mut self.sink_outputs[idx]);
+                if !events.is_empty() {
+                    outputs.insert(sink_id, events);
+                }
             }
         }
         outputs
@@ -659,17 +657,13 @@ impl DagExecutor {
                     self.route_output(source, out_event);
                 }
                 Output::Watermark(wm) => {
-                    let updated: SmallVec<[(NodeId, i64); 8]> = self
-                        .watermark_tracker
-                        .update_watermark(source, wm)
-                        .iter()
-                        .copied()
-                        .collect();
-                    for (node_id, new_wm) in &updated {
+                    for &(node_id, new_wm) in
+                        self.watermark_tracker.update_watermark(source, wm)
+                    {
                         let nidx = node_id.0 as usize;
                         if nidx < self.slot_count {
                             if let Some(ref mut rt) = self.runtimes[nidx] {
-                                rt.watermark_generator.advance_watermark(*new_wm);
+                                rt.watermark_generator.advance_watermark(new_wm);
                             }
                         }
                     }
