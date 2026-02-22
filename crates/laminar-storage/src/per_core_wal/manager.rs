@@ -183,7 +183,7 @@ impl PerCoreWalManager {
     /// Advances the global epoch and returns the new epoch.
     #[must_use]
     pub fn advance_epoch(&self) -> u64 {
-        self.global_epoch.fetch_add(1, Ordering::SeqCst) + 1
+        self.global_epoch.fetch_add(1, Ordering::AcqRel) + 1
     }
 
     /// Sets the epoch on all writers.
