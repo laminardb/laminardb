@@ -79,6 +79,7 @@ impl StateStore for AHashMapStore {
         self.data.get(key).map(Vec::as_slice)
     }
 
+    #[inline]
     fn put(&mut self, key: &[u8], value: &[u8]) -> Result<(), StateError> {
         if let Some(old_value) = self.data.get_mut(key) {
             // Update existing: only value size changes, no key allocation
@@ -96,6 +97,7 @@ impl StateStore for AHashMapStore {
         Ok(())
     }
 
+    #[inline]
     fn delete(&mut self, key: &[u8]) -> Result<(), StateError> {
         if let Some(old_value) = self.data.remove(key) {
             self.size_bytes -= key.len() + old_value.len();

@@ -38,7 +38,7 @@
 
 use std::cell::UnsafeCell;
 use std::sync::atomic::{AtomicBool, AtomicU64, AtomicUsize, Ordering};
-use std::sync::RwLock;
+use parking_lot::RwLock;
 use std::time::Duration;
 
 use crate::tpc::CachePadded;
@@ -539,7 +539,7 @@ impl<T> BroadcastChannel<T> {
             return None;
         }
         let slot = &self.cursor_slots[subscriber_id];
-        let names = self.cursor_names.read().unwrap();
+        let names = self.cursor_names.read();
         let write_pos = self.write_seq.load(Ordering::Acquire);
         let read_pos = slot.read_position();
         let active = slot.is_active();
@@ -565,7 +565,7 @@ impl<T> BroadcastChannel<T> {
     /// Panics if the internal lock is poisoned (should not happen in normal use).
     #[must_use]
     pub fn list_subscribers(&self) -> Vec<SubscriberInfo> {
-        let names = self.cursor_names.read().unwrap();
+        let names = self.cursor_names.read();
         let write_pos = self.write_seq.load(Ordering::Acquire);
 
         self.cursor_slots
@@ -695,7 +695,7 @@ impl<T: Clone> BroadcastChannel<T> {
             if slot.try_claim(start_seq) {
                 // Successfully claimed slot - now store the name
                 {
-                    let mut names = self.cursor_names.write().unwrap();
+                    let mut names = self.cursor_names.write();
                     names[slot_id] = name.into();
                 }
 

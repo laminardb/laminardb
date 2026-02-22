@@ -167,12 +167,14 @@ impl CoreWalWriter {
     #[inline]
     #[allow(clippy::cast_possible_truncation)] // core_id bounded by physical CPU count (< u16::MAX)
     pub fn append_put(&mut self, key: &[u8], value: &[u8]) -> Result<u64, PerCoreWalError> {
+        let ts = PerCoreWalEntry::now_ns();
         let entry = PerCoreWalEntry::put(
             self.core_id as u16,
             self.epoch,
             self.sequence,
             key.to_vec(),
             value.to_vec(),
+            ts,
         );
         self.append(&entry)
     }
@@ -185,8 +187,14 @@ impl CoreWalWriter {
     #[inline]
     #[allow(clippy::cast_possible_truncation)] // core_id bounded by physical CPU count (< u16::MAX)
     pub fn append_delete(&mut self, key: &[u8]) -> Result<u64, PerCoreWalError> {
-        let entry =
-            PerCoreWalEntry::delete(self.core_id as u16, self.epoch, self.sequence, key.to_vec());
+        let ts = PerCoreWalEntry::now_ns();
+        let entry = PerCoreWalEntry::delete(
+            self.core_id as u16,
+            self.epoch,
+            self.sequence,
+            key.to_vec(),
+            ts,
+        );
         self.append(&entry)
     }
 
@@ -241,11 +249,13 @@ impl CoreWalWriter {
     /// Returns an error if serialization or I/O fails.
     #[allow(clippy::cast_possible_truncation)] // core_id bounded by physical CPU count (< u16::MAX)
     pub fn append_checkpoint(&mut self, checkpoint_id: u64) -> Result<u64, PerCoreWalError> {
+        let ts = PerCoreWalEntry::now_ns();
         let entry = PerCoreWalEntry::checkpoint(
             self.core_id as u16,
             self.epoch,
             self.sequence,
             checkpoint_id,
+            ts,
         );
         self.append(&entry)
     }
@@ -257,7 +267,9 @@ impl CoreWalWriter {
     /// Returns an error if serialization or I/O fails.
     #[allow(clippy::cast_possible_truncation)] // core_id bounded by physical CPU count (< u16::MAX)
     pub fn append_epoch_barrier(&mut self) -> Result<u64, PerCoreWalError> {
-        let entry = PerCoreWalEntry::epoch_barrier(self.core_id as u16, self.epoch, self.sequence);
+        let ts = PerCoreWalEntry::now_ns();
+        let entry =
+            PerCoreWalEntry::epoch_barrier(self.core_id as u16, self.epoch, self.sequence, ts);
         self.append(&entry)
     }
 
@@ -272,12 +284,14 @@ impl CoreWalWriter {
         offsets: std::collections::HashMap<String, u64>,
         watermark: Option<i64>,
     ) -> Result<u64, PerCoreWalError> {
+        let ts = PerCoreWalEntry::now_ns();
         let entry = PerCoreWalEntry::commit(
             self.core_id as u16,
             self.epoch,
             self.sequence,
             offsets,
             watermark,
+            ts,
         );
         self.append(&entry)
     }

@@ -108,11 +108,11 @@ pub struct IncrementalSnapshot {
 ///
 /// Returns `None` if no successor exists (empty prefix or all bytes are 0xFF).
 /// Used by `BTreeMap::range()` to efficiently bound prefix scans.
-pub(crate) fn prefix_successor(prefix: &[u8]) -> Option<Vec<u8>> {
+pub(crate) fn prefix_successor(prefix: &[u8]) -> Option<smallvec::SmallVec<[u8; 64]>> {
     if prefix.is_empty() {
         return None;
     }
-    let mut successor = prefix.to_vec();
+    let mut successor = smallvec::SmallVec::<[u8; 64]>::from_slice(prefix);
     // Walk backwards, incrementing the last non-0xFF byte
     while let Some(last) = successor.last_mut() {
         if *last < 0xFF {
@@ -960,25 +960,37 @@ mod tests {
     #[test]
     fn test_prefix_successor() {
         // Normal case
-        assert_eq!(prefix_successor(b"abc"), Some(b"abd".to_vec()));
+        assert_eq!(
+            prefix_successor(b"abc").as_deref(),
+            Some(b"abd".as_slice())
+        );
 
         // Empty prefix
-        assert_eq!(prefix_successor(b""), None);
+        assert!(prefix_successor(b"").is_none());
 
         // All 0xFF bytes — no successor
-        assert_eq!(prefix_successor(&[0xFF, 0xFF, 0xFF]), None);
+        assert!(prefix_successor(&[0xFF, 0xFF, 0xFF]).is_none());
 
         // Trailing 0xFF bytes are truncated and previous byte incremented
-        assert_eq!(prefix_successor(&[0x01, 0xFF]), Some(vec![0x02]));
         assert_eq!(
-            prefix_successor(&[0x01, 0x02, 0xFF]),
-            Some(vec![0x01, 0x03])
+            prefix_successor(&[0x01, 0xFF]).as_deref(),
+            Some([0x02].as_slice())
+        );
+        assert_eq!(
+            prefix_successor(&[0x01, 0x02, 0xFF]).as_deref(),
+            Some([0x01, 0x03].as_slice())
         );
 
         // Single byte
-        assert_eq!(prefix_successor(&[0x00]), Some(vec![0x01]));
-        assert_eq!(prefix_successor(&[0xFE]), Some(vec![0xFF]));
-        assert_eq!(prefix_successor(&[0xFF]), None);
+        assert_eq!(
+            prefix_successor(&[0x00]).as_deref(),
+            Some([0x01].as_slice())
+        );
+        assert_eq!(
+            prefix_successor(&[0xFE]).as_deref(),
+            Some([0xFF].as_slice())
+        );
+        assert!(prefix_successor(&[0xFF]).is_none());
     }
 
     #[test]
