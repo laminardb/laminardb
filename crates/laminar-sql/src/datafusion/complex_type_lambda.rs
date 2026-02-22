@@ -39,12 +39,28 @@ pub fn register_lambda_functions(ctx: &datafusion::prelude::SessionContext) {
     ctx.register_udf(ScalarUDF::new_from_impl(MapTransformValues::new()));
 }
 
+thread_local! {
+    /// Cached `SessionContext` for lambda evaluation.
+    ///
+    /// Creating a `SessionContext` is expensive because it registers all
+    /// built-in functions and sets up catalogs. We cache it per-thread
+    /// and reuse it across lambda invocations.
+    static LAMBDA_CTX: std::cell::RefCell<Option<datafusion::prelude::SessionContext>> =
+        const { std::cell::RefCell::new(None) };
+}
+
 /// Evaluate a SQL expression against a `RecordBatch`, returning the result column.
 ///
 /// The expression can reference columns by name from the batch schema.
 fn eval_expr_on_batch(sql_expr: &str, batch: &arrow_array::RecordBatch) -> Result<ArrayRef> {
-    // Build a SELECT <expr> FROM <data> query using DataFusion.
-    let ctx = datafusion::prelude::SessionContext::new();
+    // Reuse a thread-local SessionContext to avoid the cost of
+    // registering built-in functions on every invocation.
+    let ctx = LAMBDA_CTX.with(|cell| {
+        let mut opt = cell.borrow_mut();
+        opt.get_or_insert_with(datafusion::prelude::SessionContext::new)
+            .clone()
+    });
+
     let provider =
         datafusion::datasource::MemTable::try_new(batch.schema(), vec![vec![batch.clone()]])?;
     let rt = tokio::runtime::Handle::try_current().map_err(|e| {
@@ -60,6 +76,8 @@ fn eval_expr_on_batch(sql_expr: &str, batch: &arrow_array::RecordBatch) -> Resul
                 .sql(&format!("SELECT {sql_expr} FROM __lambda_data"))
                 .await?;
             let batches = df.collect().await?;
+            // Deregister the ephemeral table so the batch data is freed.
+            let _ = ctx.deregister_table("__lambda_data");
             if batches.is_empty() {
                 Err(datafusion_common::DataFusionError::Internal(
                     "lambda expression returned no data".into(),

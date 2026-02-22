@@ -67,7 +67,7 @@ impl WatermarkBoundedSortOperator {
         Self {
             operator_id,
             sort_columns,
-            buffer: Vec::new(),
+            buffer: Vec::with_capacity(max_buffer_size),
             max_buffer_size,
             last_watermark: i64::MIN,
             late_events_dropped: 0,
