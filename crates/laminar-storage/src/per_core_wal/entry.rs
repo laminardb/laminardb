@@ -68,42 +68,77 @@ pub use entry_types::{PerCoreWalEntry, WalOperation};
 
 impl PerCoreWalEntry {
     /// Creates a new Put entry.
+    ///
+    /// # Arguments
+    ///
+    /// * `timestamp_ns` - Pre-cached timestamp from [`now_ns()`](Self::now_ns)
     #[must_use]
-    pub fn put(core_id: u16, epoch: u64, sequence: u64, key: Vec<u8>, value: Vec<u8>) -> Self {
+    pub fn put(
+        core_id: u16,
+        epoch: u64,
+        sequence: u64,
+        key: Vec<u8>,
+        value: Vec<u8>,
+        timestamp_ns: i64,
+    ) -> Self {
         Self {
             epoch,
             sequence,
             core_id,
-            timestamp_ns: Self::now_ns(),
+            timestamp_ns,
             operation: WalOperation::Put { key, value },
         }
     }
 
     /// Creates a new Delete entry.
+    ///
+    /// # Arguments
+    ///
+    /// * `timestamp_ns` - Pre-cached timestamp from [`now_ns()`](Self::now_ns)
     #[must_use]
-    pub fn delete(core_id: u16, epoch: u64, sequence: u64, key: Vec<u8>) -> Self {
+    pub fn delete(
+        core_id: u16,
+        epoch: u64,
+        sequence: u64,
+        key: Vec<u8>,
+        timestamp_ns: i64,
+    ) -> Self {
         Self {
             epoch,
             sequence,
             core_id,
-            timestamp_ns: Self::now_ns(),
+            timestamp_ns,
             operation: WalOperation::Delete { key },
         }
     }
 
     /// Creates a new Checkpoint entry.
+    ///
+    /// # Arguments
+    ///
+    /// * `timestamp_ns` - Pre-cached timestamp from [`now_ns()`](Self::now_ns)
     #[must_use]
-    pub fn checkpoint(core_id: u16, epoch: u64, sequence: u64, checkpoint_id: u64) -> Self {
+    pub fn checkpoint(
+        core_id: u16,
+        epoch: u64,
+        sequence: u64,
+        checkpoint_id: u64,
+        timestamp_ns: i64,
+    ) -> Self {
         Self {
             epoch,
             sequence,
             core_id,
-            timestamp_ns: Self::now_ns(),
+            timestamp_ns,
             operation: WalOperation::Checkpoint { id: checkpoint_id },
         }
     }
 
     /// Creates a new Commit entry.
+    ///
+    /// # Arguments
+    ///
+    /// * `timestamp_ns` - Pre-cached timestamp from [`now_ns()`](Self::now_ns)
     #[must_use]
     pub fn commit(
         core_id: u16,
@@ -111,24 +146,29 @@ impl PerCoreWalEntry {
         sequence: u64,
         offsets: HashMap<String, u64>,
         watermark: Option<i64>,
+        timestamp_ns: i64,
     ) -> Self {
         Self {
             epoch,
             sequence,
             core_id,
-            timestamp_ns: Self::now_ns(),
+            timestamp_ns,
             operation: WalOperation::Commit { offsets, watermark },
         }
     }
 
     /// Creates a new `EpochBarrier` entry.
+    ///
+    /// # Arguments
+    ///
+    /// * `timestamp_ns` - Pre-cached timestamp from [`now_ns()`](Self::now_ns)
     #[must_use]
-    pub fn epoch_barrier(core_id: u16, epoch: u64, sequence: u64) -> Self {
+    pub fn epoch_barrier(core_id: u16, epoch: u64, sequence: u64, timestamp_ns: i64) -> Self {
         Self {
             epoch,
             sequence,
             core_id,
-            timestamp_ns: Self::now_ns(),
+            timestamp_ns,
             operation: WalOperation::EpochBarrier { epoch },
         }
     }
@@ -176,7 +216,11 @@ impl PerCoreWalEntry {
     }
 
     /// Returns current timestamp in nanoseconds.
-    fn now_ns() -> i64 {
+    ///
+    /// Call once and pass the result to entry constructors to avoid
+    /// repeated `SystemTime::now()` syscalls in tight loops.
+    #[must_use]
+    pub fn now_ns() -> i64 {
         use std::time::{SystemTime, UNIX_EPOCH};
         SystemTime::now().duration_since(UNIX_EPOCH).map_or(0, |d| {
             #[allow(clippy::cast_possible_truncation)] // i64 ns won't overflow for ~292 years
@@ -298,19 +342,21 @@ mod tests {
 
     #[test]
     fn test_entry_constructors() {
-        let put = PerCoreWalEntry::put(0, 1, 1, b"key".to_vec(), b"value".to_vec());
+        let ts = PerCoreWalEntry::now_ns();
+
+        let put = PerCoreWalEntry::put(0, 1, 1, b"key".to_vec(), b"value".to_vec(), ts);
         assert!(put.is_put());
         assert!(!put.is_delete());
         assert_eq!(put.key(), Some(b"key".as_slice()));
         assert_eq!(put.value(), Some(b"value".as_slice()));
 
-        let delete = PerCoreWalEntry::delete(1, 1, 2, b"key2".to_vec());
+        let delete = PerCoreWalEntry::delete(1, 1, 2, b"key2".to_vec(), ts);
         assert!(delete.is_delete());
         assert!(!delete.is_put());
         assert_eq!(delete.key(), Some(b"key2".as_slice()));
         assert!(delete.value().is_none());
 
-        let checkpoint = PerCoreWalEntry::checkpoint(0, 1, 3, 100);
+        let checkpoint = PerCoreWalEntry::checkpoint(0, 1, 3, 100, ts);
         assert!(checkpoint.is_checkpoint());
         assert!(!checkpoint.is_state_operation());
     }
@@ -379,7 +425,8 @@ mod tests {
         offsets.insert("topic1".to_string(), 100);
         offsets.insert("topic2".to_string(), 200);
 
-        let commit = PerCoreWalEntry::commit(0, 1, 1, offsets, Some(12345));
+        let commit =
+            PerCoreWalEntry::commit(0, 1, 1, offsets, Some(12345), PerCoreWalEntry::now_ns());
 
         match &commit.operation {
             WalOperation::Commit { offsets, watermark } => {
@@ -393,7 +440,7 @@ mod tests {
 
     #[test]
     fn test_epoch_barrier_entry() {
-        let barrier = PerCoreWalEntry::epoch_barrier(0, 5, 100);
+        let barrier = PerCoreWalEntry::epoch_barrier(0, 5, 100, PerCoreWalEntry::now_ns());
 
         match &barrier.operation {
             WalOperation::EpochBarrier { epoch } => {

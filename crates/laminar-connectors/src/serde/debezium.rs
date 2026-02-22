@@ -131,10 +131,8 @@ impl RecordDeserializer for DebeziumDeserializer {
             )));
         }
 
-        // Deserialize the payload as a JSON record
-        let payload_bytes =
-            serde_json::to_vec(payload).map_err(|e| SerdeError::Json(e.to_string()))?;
-        let data_batch = self.json_deser.deserialize(&payload_bytes, schema)?;
+        // Deserialize the payload directly from the parsed Value (avoids double parse)
+        let data_batch = self.json_deser.deserialize_value(payload, schema)?;
 
         // Append __op and __ts_ms columns
         let mut columns: Vec<ArrayRef> = data_batch.columns().to_vec();

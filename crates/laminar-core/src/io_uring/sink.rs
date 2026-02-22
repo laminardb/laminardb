@@ -169,14 +169,16 @@ mod linux_impl {
                 Output::LateEvent(event) => {
                     format!("LATE_EVENT ts={}\n", event.timestamp).into_bytes()
                 }
-                Output::SideOutput { name, event } => {
-                    format!("SIDE_OUTPUT name={} ts={}\n", name, event.timestamp).into_bytes()
-                }
+                Output::SideOutput(data) => format!(
+                    "SIDE_OUTPUT name={} ts={}\n",
+                    data.name, data.event.timestamp
+                )
+                .into_bytes(),
                 Output::Changelog(record) => {
                     format!("CHANGELOG op={:?}\n", record.operation).into_bytes()
                 }
-                Output::CheckpointComplete { checkpoint_id, .. } => {
-                    format!("CHECKPOINT_COMPLETE id={checkpoint_id}\n").into_bytes()
+                Output::CheckpointComplete(data) => {
+                    format!("CHECKPOINT_COMPLETE id={}\n", data.checkpoint_id).into_bytes()
                 }
             };
 

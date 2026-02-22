@@ -91,6 +91,8 @@ pub struct JoinAnalysis {
     pub is_temporal_join: bool,
     /// The version column from FOR SYSTEM_TIME AS OF (e.g., `order_time`)
     pub temporal_version_column: Option<String>,
+    /// Additional key columns for composite join keys (beyond the primary key pair)
+    pub additional_key_columns: Vec<(String, String)>,
 }
 
 impl JoinAnalysis {
@@ -121,6 +123,7 @@ impl JoinAnalysis {
             asof_tolerance: None,
             is_temporal_join: false,
             temporal_version_column: None,
+            additional_key_columns: vec![],
         }
     }
 
@@ -150,6 +153,7 @@ impl JoinAnalysis {
             asof_tolerance: None,
             is_temporal_join: false,
             temporal_version_column: None,
+            additional_key_columns: vec![],
         }
     }
 
@@ -183,6 +187,7 @@ impl JoinAnalysis {
             asof_tolerance: tolerance,
             is_temporal_join: false,
             temporal_version_column: None,
+            additional_key_columns: vec![],
         }
     }
 
@@ -213,6 +218,7 @@ impl JoinAnalysis {
             asof_tolerance: None,
             is_temporal_join: true,
             temporal_version_column: Some(version_column),
+            additional_key_columns: vec![],
         }
     }
 }
@@ -275,7 +281,7 @@ pub fn analyze_join(select: &Select) -> Result<Option<JoinAnalysis>, ParseError>
 
     // Check for temporal join (FOR SYSTEM_TIME AS OF)
     if let Some(version_col) = extract_temporal_version(&join.relation) {
-        let (left_key, right_key, _) = analyze_join_constraint(&join.join_operator)?;
+        let (left_key, right_key, additional, _) = analyze_join_constraint(&join.join_operator)?;
         let mut analysis = JoinAnalysis::temporal(
             left_table,
             right_table,
@@ -286,11 +292,13 @@ pub fn analyze_join(select: &Select) -> Result<Option<JoinAnalysis>, ParseError>
         );
         analysis.left_alias = left_alias;
         analysis.right_alias = right_alias;
+        analysis.additional_key_columns = additional;
         return Ok(Some(analysis));
     }
 
     // Analyze the join constraint
-    let (left_key, right_key, time_bound) = analyze_join_constraint(&join.join_operator)?;
+    let (left_key, right_key, additional, time_bound) =
+        analyze_join_constraint(&join.join_operator)?;
 
     let mut analysis = if let Some(tb) = time_bound {
         JoinAnalysis::stream_stream(left_table, right_table, left_key, right_key, tb, join_type)
@@ -300,6 +308,7 @@ pub fn analyze_join(select: &Select) -> Result<Option<JoinAnalysis>, ParseError>
 
     analysis.left_alias = left_alias;
     analysis.right_alias = right_alias;
+    analysis.additional_key_columns = additional;
 
     Ok(Some(analysis))
 }
@@ -364,12 +373,9 @@ fn extract_table_alias(factor: &TableFactor) -> Option<String> {
 /// Map sqlparser `JoinOperator` to our `JoinType`.
 fn map_join_operator(op: &JoinOperator) -> JoinType {
     match op {
-        JoinOperator::Inner(_)
-        | JoinOperator::Join(_)
-        | JoinOperator::CrossJoin(_)
-        | JoinOperator::CrossApply
-        | JoinOperator::OuterApply
-        | JoinOperator::StraightJoin(_) => JoinType::Inner,
+        JoinOperator::Inner(_) | JoinOperator::Join(_) | JoinOperator::StraightJoin(_) => {
+            JoinType::Inner
+        }
         JoinOperator::Left(_) | JoinOperator::LeftOuter(_) => JoinType::Left,
         JoinOperator::LeftSemi(_) | JoinOperator::Semi(_) => JoinType::LeftSemi,
         JoinOperator::LeftAnti(_) => JoinType::LeftAnti,
@@ -378,27 +384,45 @@ fn map_join_operator(op: &JoinOperator) -> JoinType {
         JoinOperator::RightSemi(_) => JoinType::RightSemi,
         JoinOperator::RightAnti(_) | JoinOperator::Anti(_) => JoinType::RightAnti,
         JoinOperator::FullOuter(_) => JoinType::Full,
+        // CrossJoin, CrossApply, OuterApply are rejected by get_join_constraint()
+        _ => JoinType::Inner,
     }
 }
 
-/// Analyze join constraint to extract key columns and time bound.
+/// Analyze join constraint to extract key columns, additional key columns, and time bound.
+#[allow(clippy::type_complexity)]
 fn analyze_join_constraint(
     op: &JoinOperator,
-) -> Result<(String, String, Option<Duration>), ParseError> {
+) -> Result<(String, String, Vec<(String, String)>, Option<Duration>), ParseError> {
     let constraint = get_join_constraint(op)?;
 
     match constraint {
-        JoinConstraint::On(expr) => analyze_on_expression(expr),
+        JoinConstraint::On(expr) => {
+            let (key_pairs, time_bound) = analyze_on_expression(expr)?;
+            if key_pairs.is_empty() {
+                return Ok((String::new(), String::new(), vec![], time_bound));
+            }
+            let (first_left, first_right) = key_pairs[0].clone();
+            let additional = key_pairs[1..].to_vec();
+            Ok((first_left, first_right, additional, time_bound))
+        }
         JoinConstraint::Using(cols) => {
             if cols.is_empty() {
                 return Err(ParseError::StreamingError(
                     "USING clause requires at least one column".to_string(),
                 ));
             }
-            // For USING, both sides have the same column name
-            // Use to_string() on the Ident to get the column name
-            let col = cols[0].to_string();
-            Ok((col.clone(), col, None))
+            // First column is the primary key pair
+            let first_col = cols[0].to_string();
+            // Remaining columns are additional key pairs
+            let additional: Vec<(String, String)> = cols[1..]
+                .iter()
+                .map(|c| {
+                    let col = c.to_string();
+                    (col.clone(), col)
+                })
+                .collect();
+            Ok((first_col.clone(), first_col, additional, None))
         }
         JoinConstraint::Natural => Err(ParseError::StreamingError(
             "NATURAL JOIN not supported for streaming".to_string(),
@@ -433,8 +457,11 @@ fn get_join_constraint(op: &JoinOperator) -> Result<&JoinConstraint, ParseError>
     }
 }
 
-/// Analyze ON expression to extract key columns and time bound.
-fn analyze_on_expression(expr: &Expr) -> Result<(String, String, Option<Duration>), ParseError> {
+/// Analyze ON expression to extract all key column pairs and time bound.
+#[allow(clippy::type_complexity)]
+fn analyze_on_expression(
+    expr: &Expr,
+) -> Result<(Vec<(String, String)>, Option<Duration>), ParseError> {
     // Handle compound expressions (AND)
     match expr {
         Expr::BinaryOp {
@@ -446,15 +473,13 @@ fn analyze_on_expression(expr: &Expr) -> Result<(String, String, Option<Duration
             let left_result = analyze_on_expression(left);
             let right_result = analyze_on_expression(right);
 
-            // Combine results - one should have keys, the other might have time bound
+            // Combine results - collect all key pairs and time bounds
             match (left_result, right_result) {
-                (Ok((lk, rk, None)), Ok((_, _, time))) if !lk.is_empty() => Ok((lk, rk, time)),
-                (Ok((_, _, time)), Ok((lk, rk, None))) if !lk.is_empty() => Ok((lk, rk, time)),
-                (Ok(result), Err(_)) | (Err(_), Ok(result)) => Ok(result),
-                (Ok((lk, rk, t1)), Ok((_, _, t2))) => {
-                    // If both have keys, prefer the first
-                    Ok((lk, rk, t1.or(t2)))
+                (Ok((mut lk, lt)), Ok((rk, rt))) => {
+                    lk.extend(rk);
+                    Ok((lk, lt.or(rt)))
                 }
+                (Ok(result), Err(_)) | (Err(_), Ok(result)) => Ok(result),
                 (Err(e), Err(_)) => Err(e),
             }
         }
@@ -468,7 +493,7 @@ fn analyze_on_expression(expr: &Expr) -> Result<(String, String, Option<Duration
             let right_col = extract_column_ref(right);
 
             match (left_col, right_col) {
-                (Some(l), Some(r)) => Ok((l, r, None)),
+                (Some(l), Some(r)) => Ok((vec![(l, r)], None)),
                 _ => Err(ParseError::StreamingError(
                     "Cannot extract column references from equality condition".to_string(),
                 )),
@@ -483,7 +508,7 @@ fn analyze_on_expression(expr: &Expr) -> Result<(String, String, Option<Duration
         } => {
             // Try to extract time bound from high expression
             let time_bound = extract_time_bound_from_expr(high).ok();
-            Ok((String::new(), String::new(), time_bound))
+            Ok((vec![], time_bound))
         }
         // Comparison operators for time bounds
         Expr::BinaryOp {
@@ -494,7 +519,7 @@ fn analyze_on_expression(expr: &Expr) -> Result<(String, String, Option<Duration
         } => {
             // Try to extract time bound from right side
             let time_bound = extract_time_bound_from_expr(right).ok();
-            Ok((String::new(), String::new(), time_bound))
+            Ok((vec![], time_bound))
         }
         _ => Err(ParseError::StreamingError(format!(
             "Unsupported join condition expression: {expr:?}"
@@ -822,7 +847,8 @@ pub fn analyze_joins(select: &Select) -> Result<Option<MultiJoinAnalysis>, Parse
             join_steps.push(analysis);
         } else if let Some(version_col) = extract_temporal_version(&join.relation) {
             // Temporal join: right side has FOR SYSTEM_TIME AS OF
-            let (left_key, right_key, _) = analyze_join_constraint(&join.join_operator)?;
+            let (left_key, right_key, additional, _) =
+                analyze_join_constraint(&join.join_operator)?;
 
             let mut analysis = JoinAnalysis::temporal(
                 prev_left_table.clone(),
@@ -834,10 +860,12 @@ pub fn analyze_joins(select: &Select) -> Result<Option<MultiJoinAnalysis>, Parse
             );
             analysis.left_alias.clone_from(&prev_left_alias);
             analysis.right_alias = right_alias;
+            analysis.additional_key_columns = additional;
             join_steps.push(analysis);
         } else {
             // Regular join (inner, left, right, full)
-            let (left_key, right_key, time_bound) = analyze_join_constraint(&join.join_operator)?;
+            let (left_key, right_key, additional, time_bound) =
+                analyze_join_constraint(&join.join_operator)?;
 
             let mut analysis = if let Some(tb) = time_bound {
                 JoinAnalysis::stream_stream(
@@ -859,6 +887,7 @@ pub fn analyze_joins(select: &Select) -> Result<Option<MultiJoinAnalysis>, Parse
             };
             analysis.left_alias.clone_from(&prev_left_alias);
             analysis.right_alias = right_alias;
+            analysis.additional_key_columns = additional;
             join_steps.push(analysis);
         }
 
@@ -1282,5 +1311,47 @@ mod tests {
 
         assert!(!analysis.is_temporal_join);
         assert!(analysis.temporal_version_column.is_none());
+    }
+
+    #[test]
+    fn test_composite_join_keys() {
+        let sql = "SELECT * FROM orders o \
+                    JOIN shipments s \
+                    ON o.order_id = s.order_id AND o.region = s.region";
+        let select = parse_select(sql);
+        let analysis = analyze_join(&select).unwrap().unwrap();
+
+        // First key pair is the primary key
+        assert_eq!(analysis.left_key_column, "order_id");
+        assert_eq!(analysis.right_key_column, "order_id");
+
+        // Second key pair should be in additional_key_columns
+        assert_eq!(
+            analysis.additional_key_columns.len(),
+            1,
+            "Should have 1 additional key pair"
+        );
+        assert_eq!(analysis.additional_key_columns[0].0, "region");
+        assert_eq!(analysis.additional_key_columns[0].1, "region");
+    }
+
+    #[test]
+    fn test_composite_using_clause() {
+        let sql = "SELECT * FROM orders o JOIN shipments s USING (order_id, region)";
+        let select = parse_select(sql);
+        let analysis = analyze_join(&select).unwrap().unwrap();
+
+        // First column becomes primary key
+        assert_eq!(analysis.left_key_column, "order_id");
+        assert_eq!(analysis.right_key_column, "order_id");
+
+        // Additional columns
+        assert_eq!(
+            analysis.additional_key_columns.len(),
+            1,
+            "USING(order_id, region) should have 1 additional key"
+        );
+        assert_eq!(analysis.additional_key_columns[0].0, "region");
+        assert_eq!(analysis.additional_key_columns[0].1, "region");
     }
 }

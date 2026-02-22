@@ -62,13 +62,14 @@
 
 use bytes::Bytes;
 use rkyv::{
-    api::high::{HighDeserializer, HighSerializer, HighValidator},
+    api::high::{self, HighDeserializer, HighSerializer, HighValidator},
     bytecheck::CheckBytes,
     rancor::Error as RkyvError,
     ser::allocator::ArenaHandle,
     util::AlignedVec,
     Archive, Deserialize as RkyvDeserialize, Serialize as RkyvSerialize,
 };
+use std::cell::RefCell;
 use std::collections::BTreeMap;
 use std::ops::Bound;
 use std::ops::Range;
@@ -107,11 +108,11 @@ pub struct IncrementalSnapshot {
 ///
 /// Returns `None` if no successor exists (empty prefix or all bytes are 0xFF).
 /// Used by `BTreeMap::range()` to efficiently bound prefix scans.
-pub(crate) fn prefix_successor(prefix: &[u8]) -> Option<Vec<u8>> {
+pub(crate) fn prefix_successor(prefix: &[u8]) -> Option<smallvec::SmallVec<[u8; 64]>> {
     if prefix.is_empty() {
         return None;
     }
-    let mut successor = prefix.to_vec();
+    let mut successor = smallvec::SmallVec::<[u8; 64]>::from_slice(prefix);
     // Walk backwards, incrementing the last non-0xFF byte
     while let Some(last) = successor.last_mut() {
         if *last < 0xFF {
@@ -334,21 +335,29 @@ pub trait StateStoreExt: StateStore {
         T::Archived: for<'a> CheckBytes<HighValidator<'a, RkyvError>>
             + RkyvDeserialize<T, HighDeserializer<RkyvError>>,
     {
-        match self.get(key) {
-            Some(bytes) => {
-                let archived = rkyv::access::<T::Archived, RkyvError>(&bytes)
-                    .map_err(|e| StateError::Serialization(e.to_string()))?;
-                let value = rkyv::deserialize::<T, RkyvError>(archived)
-                    .map_err(|e| StateError::Serialization(e.to_string()))?;
-                Ok(Some(value))
-            }
-            None => Ok(None),
-        }
+        // Prefer zero-copy get_ref when available
+        let bytes_ref = self.get_ref(key);
+        let bytes_owned;
+        let data: &[u8] = if let Some(r) = bytes_ref {
+            r
+        } else if let Some(b) = self.get(key) {
+            bytes_owned = b;
+            &bytes_owned
+        } else {
+            return Ok(None);
+        };
+
+        let archived = rkyv::access::<T::Archived, RkyvError>(data)
+            .map_err(|e| StateError::Serialization(e.to_string()))?;
+        let value = rkyv::deserialize::<T, RkyvError>(archived)
+            .map_err(|e| StateError::Serialization(e.to_string()))?;
+        Ok(Some(value))
     }
 
     /// Serialize and store a value using rkyv.
     ///
-    /// Uses aligned buffers for optimal performance on the hot path.
+    /// Uses a thread-local reusable buffer to avoid per-call heap allocation
+    /// on the hot path. The buffer is cleared and reused between calls.
     ///
     /// # Errors
     ///
@@ -357,9 +366,29 @@ pub trait StateStoreExt: StateStore {
     where
         T: for<'a> RkyvSerialize<HighSerializer<AlignedVec, ArenaHandle<'a>, RkyvError>>,
     {
-        let bytes = rkyv::to_bytes::<RkyvError>(value)
-            .map_err(|e| StateError::Serialization(e.to_string()))?;
-        self.put(key, &bytes)
+        thread_local! {
+            static SERIALIZE_BUF: RefCell<AlignedVec> =
+                RefCell::new(AlignedVec::with_capacity(256));
+        }
+
+        SERIALIZE_BUF.with(|buf| {
+            let mut vec = buf.borrow_mut();
+            vec.clear();
+            // Take ownership to pass to to_bytes_in, then put it back
+            let taken = std::mem::take(&mut *vec);
+            match high::to_bytes_in::<_, RkyvError>(value, taken) {
+                Ok(filled) => {
+                    let result = self.put(key, &filled);
+                    *vec = filled;
+                    result
+                }
+                Err(e) => {
+                    // Restore an empty buffer on error
+                    *vec = AlignedVec::new();
+                    Err(StateError::Serialization(e.to_string()))
+                }
+            }
+        })
     }
 
     /// Update a value in place using a closure.
@@ -548,20 +577,23 @@ impl StateStore for InMemoryStore {
     }
 
     #[inline]
+    fn get_ref(&self, key: &[u8]) -> Option<&[u8]> {
+        self.data.get(key).map(Bytes::as_ref)
+    }
+
+    #[inline]
     fn put(&mut self, key: &[u8], value: &[u8]) -> Result<(), StateError> {
         let value_bytes = Bytes::copy_from_slice(value);
 
-        // Entry API: single tree traversal for both insert and update
-        match self.data.entry(key.to_vec()) {
-            std::collections::btree_map::Entry::Occupied(mut entry) => {
-                self.size_bytes -= entry.get().len();
-                self.size_bytes += value.len();
-                *entry.get_mut() = value_bytes;
-            }
-            std::collections::btree_map::Entry::Vacant(entry) => {
-                self.size_bytes += key.len() + value.len();
-                entry.insert(value_bytes);
-            }
+        // Check-then-insert: avoids key.to_vec() allocation on the
+        // update path, which is the common case for accumulator state.
+        if let Some(existing) = self.data.get_mut(key) {
+            self.size_bytes -= existing.len();
+            self.size_bytes += value.len();
+            *existing = value_bytes;
+        } else {
+            self.size_bytes += key.len() + value.len();
+            self.data.insert(key.to_vec(), value_bytes);
         }
         Ok(())
     }
@@ -928,25 +960,34 @@ mod tests {
     #[test]
     fn test_prefix_successor() {
         // Normal case
-        assert_eq!(prefix_successor(b"abc"), Some(b"abd".to_vec()));
+        assert_eq!(prefix_successor(b"abc").as_deref(), Some(b"abd".as_slice()));
 
         // Empty prefix
-        assert_eq!(prefix_successor(b""), None);
+        assert!(prefix_successor(b"").is_none());
 
         // All 0xFF bytes — no successor
-        assert_eq!(prefix_successor(&[0xFF, 0xFF, 0xFF]), None);
+        assert!(prefix_successor(&[0xFF, 0xFF, 0xFF]).is_none());
 
         // Trailing 0xFF bytes are truncated and previous byte incremented
-        assert_eq!(prefix_successor(&[0x01, 0xFF]), Some(vec![0x02]));
         assert_eq!(
-            prefix_successor(&[0x01, 0x02, 0xFF]),
-            Some(vec![0x01, 0x03])
+            prefix_successor(&[0x01, 0xFF]).as_deref(),
+            Some([0x02].as_slice())
+        );
+        assert_eq!(
+            prefix_successor(&[0x01, 0x02, 0xFF]).as_deref(),
+            Some([0x01, 0x03].as_slice())
         );
 
         // Single byte
-        assert_eq!(prefix_successor(&[0x00]), Some(vec![0x01]));
-        assert_eq!(prefix_successor(&[0xFE]), Some(vec![0xFF]));
-        assert_eq!(prefix_successor(&[0xFF]), None);
+        assert_eq!(
+            prefix_successor(&[0x00]).as_deref(),
+            Some([0x01].as_slice())
+        );
+        assert_eq!(
+            prefix_successor(&[0xFE]).as_deref(),
+            Some([0xFF].as_slice())
+        );
+        assert!(prefix_successor(&[0xFF]).is_none());
     }
 
     #[test]

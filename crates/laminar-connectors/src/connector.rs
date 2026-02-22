@@ -278,6 +278,26 @@ pub trait SourceConnector: Send {
     ///
     /// Returns `ConnectorError` if cleanup fails.
     async fn close(&mut self) -> Result<(), ConnectorError>;
+
+    /// Returns this connector as a [`SchemaProvider`](crate::schema::SchemaProvider), if supported.
+    fn as_schema_provider(&self) -> Option<&dyn crate::schema::SchemaProvider> {
+        None
+    }
+
+    /// Returns this connector as a [`SchemaInferable`](crate::schema::SchemaInferable), if supported.
+    fn as_schema_inferable(&self) -> Option<&dyn crate::schema::SchemaInferable> {
+        None
+    }
+
+    /// Returns this connector as a [`SchemaRegistryAware`](crate::schema::SchemaRegistryAware), if supported.
+    fn as_schema_registry_aware(&self) -> Option<&dyn crate::schema::SchemaRegistryAware> {
+        None
+    }
+
+    /// Returns this connector as a [`SchemaEvolvable`](crate::schema::SchemaEvolvable), if supported.
+    fn as_schema_evolvable(&self) -> Option<&dyn crate::schema::SchemaEvolvable> {
+        None
+    }
 }
 
 /// Trait for sink connectors that write data to external systems.
@@ -406,6 +426,16 @@ pub trait SinkConnector: Send {
     ///
     /// Returns `ConnectorError` if cleanup fails.
     async fn close(&mut self) -> Result<(), ConnectorError>;
+
+    /// Returns this connector as a [`SchemaRegistryAware`](crate::schema::SchemaRegistryAware), if supported.
+    fn as_schema_registry_aware(&self) -> Option<&dyn crate::schema::SchemaRegistryAware> {
+        None
+    }
+
+    /// Returns this connector as a [`SchemaEvolvable`](crate::schema::SchemaEvolvable), if supported.
+    fn as_schema_evolvable(&self) -> Option<&dyn crate::schema::SchemaEvolvable> {
+        None
+    }
 }
 
 #[cfg(test)]

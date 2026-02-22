@@ -41,10 +41,11 @@
 
 use super::window::{
     Accumulator, Aggregator, ChangelogRecord, EmitStrategy, LateDataConfig, LateDataMetrics,
-    ResultToI64, WindowCloseMetrics, WindowId,
+    ResultToArrow, WindowCloseMetrics, WindowId,
 };
 use super::{
-    Event, Operator, OperatorContext, OperatorError, OperatorState, Output, OutputVec, Timer,
+    Event, Operator, OperatorContext, OperatorError, OperatorState, Output, OutputVec,
+    SideOutputData, Timer,
 };
 use crate::state::{StateStore, StateStoreExt};
 use arrow_array::{Array, Int64Array, RecordBatch};
@@ -58,6 +59,7 @@ use rkyv::{
     Archive, Deserialize as RkyvDeserialize, Serialize as RkyvSerialize,
 };
 use rustc_hash::FxHashMap;
+use smallvec::SmallVec;
 use std::marker::PhantomData;
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::Arc;
@@ -219,7 +221,7 @@ impl SessionIndex {
     }
 
     /// Finds all sessions that overlap with an event at `timestamp`.
-    fn find_overlapping(&self, timestamp: i64, gap_ms: i64) -> Vec<SessionId> {
+    fn find_overlapping(&self, timestamp: i64, gap_ms: i64) -> SmallVec<[SessionId; 4]> {
         self.sessions
             .iter()
             .filter(|s| s.overlaps(timestamp, gap_ms))
@@ -251,14 +253,6 @@ impl SessionIndex {
 }
 
 /// Creates the standard session output schema.
-fn create_session_output_schema() -> SchemaRef {
-    Arc::new(Schema::new(vec![
-        Field::new("window_start", DataType::Int64, false),
-        Field::new("window_end", DataType::Int64, false),
-        Field::new("result", DataType::Int64, false),
-    ]))
-}
-
 /// Session window operator.
 ///
 /// Groups events by activity periods separated by gaps. Each unique key
@@ -343,6 +337,15 @@ where
     /// Panics if gap or allowed lateness does not fit in i64.
     pub fn new(gap: Duration, aggregator: A, allowed_lateness: Duration) -> Self {
         let operator_num = SESSION_OPERATOR_COUNTER.fetch_add(1, Ordering::Relaxed);
+        let output_schema = Arc::new(Schema::new(vec![
+            Field::new("window_start", DataType::Int64, false),
+            Field::new("window_end", DataType::Int64, false),
+            Field::new(
+                "result",
+                aggregator.output_data_type(),
+                aggregator.output_nullable(),
+            ),
+        ]));
         Self {
             gap_ms: i64::try_from(gap.as_millis()).expect("Gap must fit in i64"),
             aggregator,
@@ -357,7 +360,7 @@ where
             late_data_metrics: LateDataMetrics::new(),
             window_close_metrics: WindowCloseMetrics::new(),
             operator_id: format!("session_window_{operator_num}"),
-            output_schema: create_session_output_schema(),
+            output_schema,
             key_column: None,
             needs_timer_reregistration: false,
             _phantom: PhantomData,
@@ -375,6 +378,15 @@ where
         allowed_lateness: Duration,
         operator_id: String,
     ) -> Self {
+        let output_schema = Arc::new(Schema::new(vec![
+            Field::new("window_start", DataType::Int64, false),
+            Field::new("window_end", DataType::Int64, false),
+            Field::new(
+                "result",
+                aggregator.output_data_type(),
+                aggregator.output_nullable(),
+            ),
+        ]));
         Self {
             gap_ms: i64::try_from(gap.as_millis()).expect("Gap must fit in i64"),
             aggregator,
@@ -389,7 +401,7 @@ where
             late_data_metrics: LateDataMetrics::new(),
             window_close_metrics: WindowCloseMetrics::new(),
             operator_id,
-            output_schema: create_session_output_schema(),
+            output_schema,
             key_column: None,
             needs_timer_reregistration: false,
             _phantom: PhantomData,
@@ -480,7 +492,7 @@ where
     }
 
     /// Extracts the key from an event.
-    fn extract_key(&self, event: &Event) -> Vec<u8> {
+    fn extract_key(&self, event: &Event) -> SmallVec<[u8; 16]> {
         use arrow_array::cast::AsArray;
         use arrow_array::types::Int64Type;
 
@@ -489,19 +501,19 @@ where
                 let column = event.data.column(col_idx);
                 if let Some(array) = column.as_primitive_opt::<Int64Type>() {
                     if !array.is_empty() && !array.is_null(0) {
-                        return array.value(0).to_be_bytes().to_vec();
+                        return SmallVec::from_slice(&array.value(0).to_be_bytes());
                     }
                 }
                 // Try string column
                 if let Some(array) = column.as_string_opt::<i32>() {
                     if !array.is_empty() && !array.is_null(0) {
-                        return array.value(0).as_bytes().to_vec();
+                        return SmallVec::from_slice(array.value(0).as_bytes());
                     }
                 }
             }
         }
         // Default: global session (empty key)
-        Vec::new()
+        SmallVec::new()
     }
 
     /// Computes a hash for the key.
@@ -667,14 +679,14 @@ where
         }
 
         let result = acc.result();
-        let result_i64 = result.to_i64();
+        let result_array = result.to_arrow_array();
 
         let batch = RecordBatch::try_new(
             Arc::clone(&self.output_schema),
             vec![
                 Arc::new(Int64Array::from(vec![session.start])),
                 Arc::new(Int64Array::from(vec![session.end])),
-                Arc::new(Int64Array::from(vec![result_i64])),
+                result_array,
             ],
         )
         .ok()?;
@@ -796,10 +808,10 @@ where
 
             if let Some(side_output_name) = self.late_data_config.side_output() {
                 self.late_data_metrics.record_side_output();
-                output.push(Output::SideOutput {
-                    name: side_output_name.to_string(),
+                output.push(Output::SideOutput(Box::new(SideOutputData {
+                    name: Arc::from(side_output_name),
                     event: event.clone(),
-                });
+                })));
             } else {
                 self.late_data_metrics.record_dropped();
                 output.push(Output::LateEvent(event.clone()));
@@ -841,9 +853,10 @@ where
             }
         }
 
-        // Load and update accumulator
+        // Load and update accumulator (handles multi-row batches)
         let mut acc = self.load_accumulator(session_id, ctx.state);
-        if let Some(value) = self.aggregator.extract(event) {
+        let values = self.aggregator.extract_batch(event);
+        for value in values {
             acc.add(value);
         }
 
@@ -1196,7 +1209,7 @@ mod tests {
 
         // Event at 300 with gap=500 → [300, 800) overlaps [100, 600)
         let hits = idx.find_overlapping(300, 500);
-        assert_eq!(hits, vec![SessionId(1)]);
+        assert_eq!(hits.as_slice(), &[SessionId(1)]);
 
         // Event at 1500 with gap=500 → [1500, 2000) doesn't overlap either
         let hits = idx.find_overlapping(1500, 500);
@@ -1204,7 +1217,7 @@ mod tests {
 
         // Event at 1800 with gap=500 → [1800, 2300) overlaps [2000, 2500)
         let hits = idx.find_overlapping(1800, 500);
-        assert_eq!(hits, vec![SessionId(2)]);
+        assert_eq!(hits.as_slice(), &[SessionId(2)]);
     }
 
     #[test]
@@ -1566,13 +1579,13 @@ mod tests {
         };
 
         let side_output = outputs.iter().find_map(|o| {
-            if let Output::SideOutput { name, .. } = o {
-                Some(name.clone())
+            if let Output::SideOutput(data) = o {
+                Some(data.name.clone())
             } else {
                 None
             }
         });
-        assert_eq!(side_output, Some("late".to_string()));
+        assert_eq!(side_output.as_deref(), Some("late"));
         assert_eq!(operator.late_data_metrics().late_events_side_output(), 1);
     }
 
@@ -1822,7 +1835,12 @@ mod tests {
 
     #[test]
     fn test_session_output_schema() {
-        let schema = create_session_output_schema();
+        use arrow_schema::Schema;
+        let schema = Schema::new(vec![
+            arrow_schema::Field::new("window_start", arrow_schema::DataType::Int64, false),
+            arrow_schema::Field::new("window_end", arrow_schema::DataType::Int64, false),
+            arrow_schema::Field::new("result", arrow_schema::DataType::Int64, false),
+        ]);
 
         assert_eq!(schema.fields().len(), 3);
         assert_eq!(schema.field(0).name(), "window_start");

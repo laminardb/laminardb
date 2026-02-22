@@ -88,7 +88,9 @@
       "Bash(Select-String \"test result:\")",
       "Bash(ForEach-Object { $_Line })",
       "Bash(where:*)",
-      "Bash(git reset:*)"
+      "Bash(git reset:*)",
+      "Bash(python3:*)",
+      "WebFetch(domain:datafusion.apache.org)"
     ]
   }
 }

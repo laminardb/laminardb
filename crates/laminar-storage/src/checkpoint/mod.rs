@@ -184,7 +184,7 @@ impl CheckpointManager {
         watermark: Option<i64>,
     ) -> Result<Checkpoint> {
         // Generate checkpoint ID
-        let checkpoint_id = self.next_id.fetch_add(1, Ordering::SeqCst);
+        let checkpoint_id = self.next_id.fetch_add(1, Ordering::Relaxed);
 
         // Create checkpoint directory
         let checkpoint_path = self.checkpoint_path(checkpoint_id);

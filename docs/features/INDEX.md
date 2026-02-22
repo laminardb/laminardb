@@ -8,13 +8,14 @@
 | Phase 1.5 | 1 | 0 | 0 | 0 | 1 | 0 |
 | Phase 2 | 38 | 0 | 0 | 0 | 38 | 0 |
 | Phase 2.5 | 12 | 0 | 0 | 0 | 12 | 0 |
-| Phase 3 | 77 | 9 | 0 | 0 | 68 | 0 |
+| Phase 3 | 93 | 12 | 0 | 0 | 81 | 0 |
 | Phase 4 | 11 | 11 | 0 | 0 | 0 | 0 |
 | Phase 5 | 10 | 10 | 0 | 0 | 0 | 0 |
 | Phase 6a | 29 | 0 | 0 | 0 | 27 | 2 |
 | Phase 6b | 14 | 0 | 0 | 0 | 14 | 0 |
 | Phase 6c | 10 | 9 | 0 | 0 | 0 | 1 |
-| **Total** | **214** | **39** | **0** | **0** | **172** | **3** |
+| Perf Optimization | 12 | 12 | 0 | 0 | 0 | 0 |
+| **Total** | **242** | **54** | **0** | **0** | **185** | **3** |
 
 ## Status Legend
 
@@ -139,7 +140,7 @@ See [Plan Compiler Index](plan-compiler/INDEX.md) for architecture details and [
 
 ## Phase 3: Connectors & Integration
 
-> **Status**: 68/77 features complete (88%)
+> **Status**: 81/93 features complete (87%)
 
 ### Streaming API ✅
 
@@ -284,6 +285,84 @@ See [Demo Index](phase-3/demo/INDEX.md).
 | F-FFI-002 | C Header Generation | ✅ | [Link](phase-3/F-FFI-002-c-headers.md) |
 | F-FFI-003 | Arrow C Data Interface | ✅ | [Link](phase-3/F-FFI-003-arrow-c-data-interface.md) |
 | F-FFI-004 | Async FFI Callbacks | ✅ | [Link](phase-3/F-FFI-004-async-callbacks.md) |
+
+### Schema & Format Framework
+
+> Extensible trait-based connector architecture, format decoders, schema inference/evolution, JSON/Array/Struct functions, and schema hints. See [ADR-006](../adr/ADR-006-schema-trait-contract.md) for the binding trait contract.
+
+#### Core Schema Trait Architecture (Group A — Foundation)
+
+| ID | Feature | Priority | Status | Dependencies | Spec |
+|----|---------|----------|--------|--------------|------|
+| F-SCHEMA-001 | Extensible Connector Trait Framework | P0 | ✅ | F034 | [Link](phase-3/schema/F-SCHEMA-001-connector-trait-framework.md) |
+| F-SCHEMA-002 | Schema Resolver & Merge Engine | P0 | ✅ | F-SCHEMA-001 | [Link](phase-3/schema/F-SCHEMA-002-schema-resolver.md) |
+| F-SCHEMA-003 | Format Inference Registry | P0 | ✅ | F-SCHEMA-001 | [Link](phase-3/schema/F-SCHEMA-003-format-inference-registry.md) |
+
+#### Format Decoders (Group B — Ring 1 Hot Path)
+
+| ID | Feature | Priority | Status | Dependencies | Spec |
+|----|---------|----------|--------|--------------|------|
+| F-SCHEMA-004 | JSON Format Decoder & Inference | P0 | ✅ | F-SCHEMA-001, F-SCHEMA-003 | [Link](phase-3/schema/F-SCHEMA-004-json-decoder.md) |
+| F-SCHEMA-005 | CSV Format Decoder & Inference | P1 | ✅ | F-SCHEMA-001, F-SCHEMA-003 | [Link](phase-3/schema/F-SCHEMA-005-csv-decoder.md) |
+| F-SCHEMA-006 | Avro Format Decoder + Schema Registry | P0 | ✅ | F-SCHEMA-001, F-SCHEMA-003 | [Link](phase-3/schema/F-SCHEMA-006-avro-decoder.md) |
+| F-SCHEMA-007 | Parquet Format Decoder | P1 | ✅ | F-SCHEMA-001 | [Link](phase-3/schema/F-SCHEMA-007-parquet-decoder.md) |
+| F-SCHEMA-008 | Protobuf Format Decoder | P2 | 📝 | F-SCHEMA-001, F-SCHEMA-006 | [Link](phase-3/schema/F-SCHEMA-008-protobuf-decoder.md) |
+
+#### Schema Evolution & Error Handling (Group C)
+
+| ID | Feature | Priority | Status | Dependencies | Spec |
+|----|---------|----------|--------|--------------|------|
+| F-SCHEMA-009 | Schema Evolution Engine | P1 | ✅ | F-SCHEMA-001, F-SCHEMA-002 | [Link](phase-3/schema/F-SCHEMA-009-schema-evolution.md) |
+| F-SCHEMA-010 | Dead Letter Queue & Error Handling | P1 | ✅ | F-SCHEMA-001 | [Link](phase-3/schema/F-SCHEMA-010-dead-letter-queue.md) |
+
+#### Transformation Functions (Group D)
+
+| ID | Feature | Priority | Status | Dependencies | Spec |
+|----|---------|----------|--------|--------------|------|
+| F-SCHEMA-011 | PostgreSQL-Compatible JSON Functions | P0 | ✅ | F-SCHEMA-004 | [Link](phase-3/schema/F-SCHEMA-011-json-functions.md) |
+| F-SCHEMA-012 | JSON Table-Valued & Path Functions | P1 | ✅ | F-SCHEMA-011 | [Link](phase-3/schema/F-SCHEMA-012-json-tvf.md) |
+| F-SCHEMA-013 | LaminarDB JSON Extensions | P2 | ✅ | F-SCHEMA-011 | [Link](phase-3/schema/F-SCHEMA-013-json-extensions.md) |
+| F-SCHEMA-014 | Format Bridge Functions | P1 | ✅ | F-SCHEMA-001, F-SCHEMA-004, F-SCHEMA-006 | [Link](phase-3/schema/F-SCHEMA-014-format-bridges.md) |
+| F-SCHEMA-015 | Array, Struct & Map Functions | P1 | ✅ | F-SCHEMA-001 | [Link](phase-3/schema/F-SCHEMA-015-array-struct-map-functions.md) |
+
+#### Schema Hints (Group E — Unique to LaminarDB)
+
+| ID | Feature | Priority | Status | Dependencies | Spec |
+|----|---------|----------|--------|--------------|------|
+| F-SCHEMA-016 | Schema Hints with Wildcard Inference | P1 | ✅ | F-SCHEMA-002, F-SCHEMA-003 | [Link](phase-3/schema/F-SCHEMA-016-schema-hints.md) |
+
+#### Dependency Graph
+
+```
+F-SCHEMA-001 (Traits) ─┬─→ F-SCHEMA-002 (Resolver) ──┬─→ F-SCHEMA-009 (Evolution)
+                        │                              └─→ F-SCHEMA-016 (Schema Hints)
+                        │                                        ↑
+                        ├─→ F-SCHEMA-003 (Inference Reg) ──┬────┘
+                        │         │                        │
+                        │         ├─→ F-SCHEMA-004 (JSON) ─┬─→ F-SCHEMA-011 (JSON Fns)
+                        │         │                        │         │
+                        │         │                        │         ├─→ F-SCHEMA-012 (TVF)
+                        │         │                        │         └─→ F-SCHEMA-013 (Extensions)
+                        │         │                        │
+                        │         └─→ F-SCHEMA-005 (CSV)   └─→ F-SCHEMA-014 (Format Bridges)
+                        │                                            ↑
+                        ├─→ F-SCHEMA-006 (Avro+Registry) ──────────┘
+                        │         └─→ F-SCHEMA-008 (Protobuf)
+                        │
+                        ├─→ F-SCHEMA-007 (Parquet)
+                        ├─→ F-SCHEMA-010 (Dead Letter)
+                        └─→ F-SCHEMA-015 (Array/Struct/Map)
+```
+
+#### Build Order (Recommended)
+
+1. **F-SCHEMA-001** (Trait Framework) — everything depends on this
+2. **F-SCHEMA-002** + **F-SCHEMA-003** (Resolver + Inference Registry) — parallel
+3. **F-SCHEMA-004** + **F-SCHEMA-006** + **F-SCHEMA-007** (JSON + Avro + Parquet decoders) — parallel
+4. **F-SCHEMA-005** + **F-SCHEMA-010** + **F-SCHEMA-015** (CSV + DLQ + Array/Struct/Map) — parallel
+5. **F-SCHEMA-011** (JSON Functions) — needs JSON decoder
+6. **F-SCHEMA-009** + **F-SCHEMA-012** + **F-SCHEMA-014** (Evolution + TVF + Format Bridges) — parallel
+7. **F-SCHEMA-008** + **F-SCHEMA-013** + **F-SCHEMA-016** (Protobuf + JSON Extensions + Schema Hints) — parallel
 
 ---
 
@@ -494,6 +573,44 @@ See [Delta Index](delta/INDEX.md) for full details, dependency graph, performanc
 | F-SERVER-004 | Hot Reload | 📝 | [Link](delta/server/F-SERVER-004-hot-reload.md) |
 | F-SERVER-005 | Delta Server Mode | 📝 | [Link](delta/server/F-SERVER-005-delta-mode.md) |
 | F-SERVER-006 | Graceful Rolling Restart | 📝 | [Link](delta/server/F-SERVER-006-rolling-restart.md) |
+
+---
+
+## Performance Optimization
+
+> Architectural performance improvements identified by the 2026-02-22 audit. These require design changes beyond localized code fixes. All actionable local fixes (40+ findings) have been implemented.
+
+### State Store & Reactor
+
+| ID | Feature | Priority | Status | Spec |
+|----|---------|----------|--------|------|
+| F-POPT-001 | Zero-Copy Prefix Scan (GAT iterator) | P2 | 📝 | [Link](perf-optimization/F-POPT-001-zero-copy-prefix-scan.md) |
+| F-POPT-002 | Monomorphized Reactor Dispatch | P2 | 📝 | [Link](perf-optimization/F-POPT-002-monomorphized-reactor.md) |
+| F-POPT-003 | AHashMapStore Key Deduplication | P2 | 📝 | [Link](perf-optimization/F-POPT-003-ahash-key-dedup.md) |
+| F-POPT-004 | MmapStateStore Compaction | P3 | 📝 | [Link](perf-optimization/F-POPT-004-mmap-compaction.md) |
+
+### Join Operators
+
+| ID | Feature | Priority | Status | Spec |
+|----|---------|----------|--------|------|
+| F-POPT-005 | Zero-Copy Join Row Encoding | P1 | 📝 | [Link](perf-optimization/F-POPT-005-zero-copy-join-row.md) |
+| F-POPT-006 | Pooled Arrow Builders for Join Output | P1 | 📝 | [Link](perf-optimization/F-POPT-006-pooled-join-builders.md) |
+
+### SQL Execution
+
+| ID | Feature | Priority | Status | Spec |
+|----|---------|----------|--------|------|
+| F-POPT-007 | LogicalPlan Passthrough (eliminate AST round-trip) | P1 | 📝 | [Link](perf-optimization/F-POPT-007-logical-plan-passthrough.md) |
+| F-POPT-008 | Binary JSON Representation (JSONB) | P2 | 📝 | [Link](perf-optimization/F-POPT-008-binary-json.md) |
+| F-POPT-009 | SQL Plan Cache | P3 | 📝 | [Link](perf-optimization/F-POPT-009-sql-plan-cache.md) |
+| F-POPT-010 | MVCC TableStore (eliminate Mutex contention) | P2 | 📝 | [Link](perf-optimization/F-POPT-010-mvcc-table-store.md) |
+
+### Storage & Connectors
+
+| ID | Feature | Priority | Status | Spec |
+|----|---------|----------|--------|------|
+| F-POPT-011 | WAL Scatter-Gather Writes | P1 | 📝 | [Link](perf-optimization/F-POPT-011-wal-scatter-gather.md) |
+| F-POPT-012 | Avro Decoder Reuse | P3 | 📝 | [Link](perf-optimization/F-POPT-012-avro-decoder-reuse.md) |
 
 ---
 

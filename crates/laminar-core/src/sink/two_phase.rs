@@ -668,7 +668,7 @@ impl TwoPhaseCoordinator {
             ));
         }
 
-        let tx_id = TransactionId::new(self.next_tx_id.fetch_add(1, Ordering::SeqCst));
+        let tx_id = TransactionId::new(self.next_tx_id.fetch_add(1, Ordering::Relaxed));
         let record = TransactionRecord::new(tx_id.clone(), &self.participants);
 
         // Log the preparing state

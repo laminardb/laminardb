@@ -69,9 +69,27 @@
 pub mod aggregate_bridge;
 mod bridge;
 mod channel_source;
+/// Lambda higher-order functions for arrays and maps (F-SCHEMA-015 Tier 3)
+pub mod complex_type_lambda;
+/// Array, Struct, and Map scalar UDFs (F-SCHEMA-015)
+pub mod complex_type_udf;
 mod exec;
 /// End-to-end streaming SQL execution
 pub mod execute;
+/// Format bridge UDFs for inline format conversion
+pub mod format_bridge_udf;
+/// LaminarDB streaming JSON extension UDFs (F-SCHEMA-013)
+pub mod json_extensions;
+/// SQL/JSON path query compiler and scalar UDFs
+pub mod json_path;
+/// JSON table-valued functions (array/object expansion)
+pub mod json_tvf;
+/// JSONB binary format types for JSON UDF evaluation
+pub mod json_types;
+/// PostgreSQL-compatible JSON aggregate UDAFs
+pub mod json_udaf;
+/// PostgreSQL-compatible JSON scalar UDFs
+pub mod json_udf;
 /// Lookup join plan node for DataFusion.
 pub mod lookup_join;
 /// Processing-time UDF for `PROCTIME()` support
@@ -89,8 +107,32 @@ pub use aggregate_bridge::{
 };
 pub use bridge::{BridgeSendError, BridgeSender, BridgeStream, BridgeTrySendError, StreamBridge};
 pub use channel_source::ChannelStreamSource;
+pub use complex_type_lambda::{
+    register_lambda_functions, ArrayFilter, ArrayReduce, ArrayTransform, MapFilter,
+    MapTransformValues,
+};
+pub use complex_type_udf::{
+    register_complex_type_functions, MapContainsKey, MapFromArrays, MapKeys, MapValues, StructDrop,
+    StructExtract, StructMerge, StructRename, StructSet,
+};
 pub use exec::StreamingScanExec;
 pub use execute::{execute_streaming_sql, DdlResult, QueryResult, StreamingSqlResult};
+pub use format_bridge_udf::{FromJsonUdf, ParseEpochUdf, ParseTimestampUdf, ToJsonUdf};
+pub use json_extensions::{
+    register_json_extensions, JsonInferSchema, JsonToColumns, JsonbDeepMerge, JsonbExcept,
+    JsonbFlatten, JsonbMerge, JsonbPick, JsonbRenameKeys, JsonbStripNulls, JsonbUnflatten,
+};
+pub use json_path::{CompiledJsonPath, JsonPathStep, JsonbPathExistsUdf, JsonbPathMatchUdf};
+pub use json_tvf::{
+    register_json_table_functions, JsonbArrayElementsTextTvf, JsonbArrayElementsTvf,
+    JsonbEachTextTvf, JsonbEachTvf, JsonbObjectKeysTvf,
+};
+pub use json_udaf::{JsonAgg, JsonObjectAgg};
+pub use json_udf::{
+    JsonBuildArray, JsonBuildObject, JsonTypeof, JsonbContainedBy, JsonbContains, JsonbExists,
+    JsonbExistsAll, JsonbExistsAny, JsonbGet, JsonbGetIdx, JsonbGetPath, JsonbGetPathText,
+    JsonbGetText, JsonbGetTextIdx, ToJsonb,
+};
 pub use proctime_udf::ProcTimeUdf;
 pub use source::{SortColumn, StreamSource, StreamSourceRef};
 pub use table_provider::StreamingTableProvider;
@@ -149,6 +191,10 @@ pub fn register_streaming_functions(ctx: &SessionContext) {
     ctx.register_udf(ScalarUDF::new_from_impl(CumulateWindowStart::new()));
     ctx.register_udf(ScalarUDF::new_from_impl(WatermarkUdf::unset()));
     ctx.register_udf(ScalarUDF::new_from_impl(ProcTimeUdf::new()));
+    register_json_functions(ctx);
+    register_json_extensions(ctx);
+    register_complex_type_functions(ctx);
+    register_lambda_functions(ctx);
 }
 
 /// Registers streaming UDFs with a live watermark source.
@@ -171,6 +217,56 @@ pub fn register_streaming_functions_with_watermark(
     ctx.register_udf(ScalarUDF::new_from_impl(CumulateWindowStart::new()));
     ctx.register_udf(ScalarUDF::new_from_impl(WatermarkUdf::new(watermark_ms)));
     ctx.register_udf(ScalarUDF::new_from_impl(ProcTimeUdf::new()));
+    register_json_functions(ctx);
+    register_json_extensions(ctx);
+    register_complex_type_functions(ctx);
+    register_lambda_functions(ctx);
+}
+
+/// Registers all PostgreSQL-compatible JSON UDFs and UDAFs
+/// with the given `SessionContext`.
+pub fn register_json_functions(ctx: &SessionContext) {
+    // Extraction operators
+    ctx.register_udf(ScalarUDF::new_from_impl(JsonbGet::new()));
+    ctx.register_udf(ScalarUDF::new_from_impl(JsonbGetIdx::new()));
+    ctx.register_udf(ScalarUDF::new_from_impl(JsonbGetText::new()));
+    ctx.register_udf(ScalarUDF::new_from_impl(JsonbGetTextIdx::new()));
+    ctx.register_udf(ScalarUDF::new_from_impl(JsonbGetPath::new()));
+    ctx.register_udf(ScalarUDF::new_from_impl(JsonbGetPathText::new()));
+
+    // Existence operators
+    ctx.register_udf(ScalarUDF::new_from_impl(JsonbExists::new()));
+    ctx.register_udf(ScalarUDF::new_from_impl(JsonbExistsAny::new()));
+    ctx.register_udf(ScalarUDF::new_from_impl(JsonbExistsAll::new()));
+
+    // Containment operators
+    ctx.register_udf(ScalarUDF::new_from_impl(JsonbContains::new()));
+    ctx.register_udf(ScalarUDF::new_from_impl(JsonbContainedBy::new()));
+
+    // Interrogation / construction
+    ctx.register_udf(ScalarUDF::new_from_impl(JsonTypeof::new()));
+    ctx.register_udf(ScalarUDF::new_from_impl(JsonBuildObject::new()));
+    ctx.register_udf(ScalarUDF::new_from_impl(JsonBuildArray::new()));
+    ctx.register_udf(ScalarUDF::new_from_impl(ToJsonb::new()));
+
+    // Aggregates
+    ctx.register_udaf(datafusion_expr::AggregateUDF::new_from_impl(JsonAgg::new()));
+    ctx.register_udaf(datafusion_expr::AggregateUDF::new_from_impl(
+        JsonObjectAgg::new(),
+    ));
+
+    // Format bridge functions
+    ctx.register_udf(ScalarUDF::new_from_impl(ParseEpochUdf::new()));
+    ctx.register_udf(ScalarUDF::new_from_impl(ParseTimestampUdf::new()));
+    ctx.register_udf(ScalarUDF::new_from_impl(ToJsonUdf::new()));
+    ctx.register_udf(ScalarUDF::new_from_impl(FromJsonUdf::new()));
+
+    // JSON path query functions (scalar)
+    ctx.register_udf(ScalarUDF::new_from_impl(JsonbPathExistsUdf::new()));
+    ctx.register_udf(ScalarUDF::new_from_impl(JsonbPathMatchUdf::new()));
+
+    // JSON table-valued functions
+    register_json_table_functions(ctx);
 }
 
 #[cfg(test)]

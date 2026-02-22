@@ -43,9 +43,21 @@ impl Default for JsonDeserializer {
     }
 }
 
-impl RecordDeserializer for JsonDeserializer {
-    fn deserialize(&self, data: &[u8], schema: &SchemaRef) -> Result<RecordBatch, SerdeError> {
-        let value: Value = serde_json::from_slice(data)?;
+impl JsonDeserializer {
+    /// Deserializes a pre-parsed JSON [`Value`] into a [`RecordBatch`].
+    ///
+    /// Avoids the serialize-then-reparse overhead when the caller already
+    /// holds a parsed `Value` (e.g. Debezium envelope extraction).
+    ///
+    /// # Errors
+    ///
+    /// Returns `SerdeError` if the value is not a JSON object, a required
+    /// field is missing, or Arrow array construction fails.
+    pub fn deserialize_value(
+        &self,
+        value: &Value,
+        schema: &SchemaRef,
+    ) -> Result<RecordBatch, SerdeError> {
         let obj = value
             .as_object()
             .ok_or_else(|| SerdeError::MalformedInput("expected JSON object".into()))?;
@@ -67,6 +79,13 @@ impl RecordDeserializer for JsonDeserializer {
 
         RecordBatch::try_new(schema.clone(), columns)
             .map_err(|e| SerdeError::MalformedInput(format!("failed to create RecordBatch: {e}")))
+    }
+}
+
+impl RecordDeserializer for JsonDeserializer {
+    fn deserialize(&self, data: &[u8], schema: &SchemaRef) -> Result<RecordBatch, SerdeError> {
+        let value: Value = serde_json::from_slice(data)?;
+        self.deserialize_value(&value, schema)
     }
 
     fn deserialize_batch(
@@ -131,9 +150,11 @@ impl RecordSerializer for JsonSerializer {
     fn serialize(&self, batch: &RecordBatch) -> Result<Vec<Vec<u8>>, SerdeError> {
         let mut records = Vec::with_capacity(batch.num_rows());
         let schema = batch.schema();
+        // Reuse a single Map across all rows (clear instead of re-allocate)
+        let mut obj = serde_json::Map::with_capacity(schema.fields().len());
 
         for row in 0..batch.num_rows() {
-            let mut obj = serde_json::Map::new();
+            obj.clear();
 
             for (col_idx, field) in schema.fields().iter().enumerate() {
                 let column = batch.column(col_idx);
@@ -147,8 +168,8 @@ impl RecordSerializer for JsonSerializer {
                 obj.insert(field.name().clone(), value);
             }
 
-            let json_bytes = serde_json::to_vec(&Value::Object(obj))
-                .map_err(|e| SerdeError::Json(e.to_string()))?;
+            let json_bytes =
+                serde_json::to_vec(&obj).map_err(|e| SerdeError::Json(e.to_string()))?;
             records.push(json_bytes);
         }
 
@@ -156,14 +177,35 @@ impl RecordSerializer for JsonSerializer {
     }
 
     fn serialize_batch(&self, batch: &RecordBatch) -> Result<Vec<u8>, SerdeError> {
-        let records = self.serialize(batch)?;
-        // Newline-delimited JSON
-        let total_len: usize = records.iter().map(|r| r.len() + 1).sum();
-        let mut buf = Vec::with_capacity(total_len);
-        for record in &records {
-            buf.extend_from_slice(record);
+        let schema = batch.schema();
+        // Estimate ~256 bytes per row for capacity hint
+        let mut buf = Vec::with_capacity(batch.num_rows() * 256);
+        let mut obj = serde_json::Map::with_capacity(schema.fields().len());
+        // Reusable per-row write buffer
+        let mut row_buf: Vec<u8> = Vec::with_capacity(256);
+
+        for row in 0..batch.num_rows() {
+            obj.clear();
+
+            for (col_idx, field) in schema.fields().iter().enumerate() {
+                let column = batch.column(col_idx);
+
+                if column.is_null(row) {
+                    obj.insert(field.name().clone(), Value::Null);
+                    continue;
+                }
+
+                let value = arrow_column_to_json(column, row, field.data_type())?;
+                obj.insert(field.name().clone(), value);
+            }
+
+            row_buf.clear();
+            serde_json::to_writer(&mut row_buf, &obj)
+                .map_err(|e| SerdeError::Json(e.to_string()))?;
+            buf.extend_from_slice(&row_buf);
             buf.push(b'\n');
         }
+
         Ok(buf)
     }
 

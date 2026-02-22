@@ -9,6 +9,7 @@ use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::time::{Duration, SystemTime, UNIX_EPOCH};
 
+use rustc_hash::FxHashMap;
 use serde::{Deserialize, Serialize};
 use tracing::{debug, info};
 
@@ -204,7 +205,7 @@ pub struct IncrementalCheckpointManager {
     /// Latest checkpoint ID.
     latest_checkpoint_id: Option<u64>,
     /// In-memory state store.
-    state: HashMap<Vec<u8>, Vec<u8>>,
+    state: FxHashMap<Vec<u8>, Vec<u8>>,
     /// Source offsets for exactly-once semantics.
     source_offsets: HashMap<String, u64>,
     /// Current watermark.
@@ -232,7 +233,7 @@ impl IncrementalCheckpointManager {
             current_epoch: AtomicU64::new(0),
             last_checkpoint_time: AtomicU64::new(0),
             latest_checkpoint_id: latest_id,
-            state: HashMap::new(),
+            state: FxHashMap::default(),
             source_offsets: HashMap::new(),
             watermark: None,
         })
@@ -290,13 +291,13 @@ impl IncrementalCheckpointManager {
 
     /// Sets the current epoch.
     pub fn set_epoch(&self, epoch: u64) {
-        self.current_epoch.store(epoch, Ordering::SeqCst);
+        self.current_epoch.store(epoch, Ordering::Release);
     }
 
     /// Returns the current epoch.
     #[must_use]
     pub fn epoch(&self) -> u64 {
-        self.current_epoch.load(Ordering::SeqCst)
+        self.current_epoch.load(Ordering::Acquire)
     }
 
     /// Puts a key-value pair into the state.
@@ -373,8 +374,8 @@ impl IncrementalCheckpointManager {
         &mut self,
         wal_position: u64,
     ) -> Result<IncrementalCheckpointMetadata, IncrementalCheckpointError> {
-        let id = self.next_id.fetch_add(1, Ordering::SeqCst);
-        let epoch = self.current_epoch.load(Ordering::SeqCst);
+        let id = self.next_id.fetch_add(1, Ordering::Relaxed);
+        let epoch = self.current_epoch.load(Ordering::Acquire);
 
         let mut metadata = IncrementalCheckpointMetadata::new(id, epoch);
         metadata.wal_position = wal_position;
@@ -419,8 +420,8 @@ impl IncrementalCheckpointManager {
         watermark: Option<i64>,
         state_data: &[u8],
     ) -> Result<IncrementalCheckpointMetadata, IncrementalCheckpointError> {
-        let id = self.next_id.fetch_add(1, Ordering::SeqCst);
-        let epoch = self.current_epoch.load(Ordering::SeqCst);
+        let id = self.next_id.fetch_add(1, Ordering::Relaxed);
+        let epoch = self.current_epoch.load(Ordering::Acquire);
 
         let mut metadata = IncrementalCheckpointMetadata::new(id, epoch);
         metadata.wal_position = wal_position;

@@ -102,7 +102,7 @@ impl TransactionState {
     ///
     /// Returns an error if a transaction is already active.
     pub fn begin_new(&mut self) -> Result<TransactionId, SinkError> {
-        let tx_id = TransactionId::new(self.next_tx_id.fetch_add(1, Ordering::SeqCst));
+        let tx_id = TransactionId::new(self.next_tx_id.fetch_add(1, Ordering::Relaxed));
         self.begin(tx_id.clone())?;
         Ok(tx_id)
     }
@@ -242,7 +242,7 @@ impl TransactionCoordinator {
             return Err(SinkError::TransactionAlreadyActive(tx.to_string()));
         }
 
-        let tx_id = TransactionId::new(self.next_tx_id.fetch_add(1, Ordering::SeqCst));
+        let tx_id = TransactionId::new(self.next_tx_id.fetch_add(1, Ordering::Relaxed));
         self.current_tx = Some(tx_id.clone());
         self.prepared.clear();
         self.committed.clear();

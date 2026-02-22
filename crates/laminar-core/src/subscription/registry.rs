@@ -24,9 +24,9 @@
 //! └─────────────────────┘
 //! ```
 
+use parking_lot::RwLock;
 use std::collections::HashMap;
 use std::sync::atomic::{AtomicU64, Ordering};
-use std::sync::RwLock;
 use std::time::{Duration, Instant};
 
 use tokio::sync::broadcast;
@@ -244,12 +244,11 @@ impl SubscriptionRegistry {
         };
 
         // Insert into main map
-        self.subscriptions.write().unwrap().insert(id, entry);
+        self.subscriptions.write().insert(id, entry);
 
         // Insert into source index
         self.by_source
             .write()
-            .unwrap()
             .entry(source_id)
             .or_default()
             .push(id);
@@ -257,7 +256,6 @@ impl SubscriptionRegistry {
         // Insert into name index
         self.by_name
             .write()
-            .unwrap()
             .entry(source_name)
             .or_default()
             .push(id);
@@ -270,7 +268,7 @@ impl SubscriptionRegistry {
     /// Returns `true` if the subscription was `Active` and is now `Paused`.
     /// Returns `false` if the subscription does not exist or is not active.
     pub fn pause(&self, id: SubscriptionId) -> bool {
-        let mut subs = self.subscriptions.write().unwrap();
+        let mut subs = self.subscriptions.write();
         if let Some(entry) = subs.get_mut(&id) {
             if entry.state == SubscriptionState::Active {
                 entry.state = SubscriptionState::Paused;
@@ -285,7 +283,7 @@ impl SubscriptionRegistry {
     /// Returns `true` if the subscription was `Paused` and is now `Active`.
     /// Returns `false` if the subscription does not exist or is not paused.
     pub fn resume(&self, id: SubscriptionId) -> bool {
-        let mut subs = self.subscriptions.write().unwrap();
+        let mut subs = self.subscriptions.write();
         if let Some(entry) = subs.get_mut(&id) {
             if entry.state == SubscriptionState::Paused {
                 entry.state = SubscriptionState::Active;
@@ -299,16 +297,16 @@ impl SubscriptionRegistry {
     ///
     /// Returns `true` if the subscription existed and was removed.
     pub fn cancel(&self, id: SubscriptionId) -> bool {
-        let entry = self.subscriptions.write().unwrap().remove(&id);
+        let entry = self.subscriptions.write().remove(&id);
 
         if let Some(entry) = entry {
             // Remove from source index
-            if let Some(ids) = self.by_source.write().unwrap().get_mut(&entry.source_id) {
+            if let Some(ids) = self.by_source.write().get_mut(&entry.source_id) {
                 ids.retain(|&i| i != id);
             }
 
             // Remove from name index
-            if let Some(ids) = self.by_name.write().unwrap().get_mut(&entry.source_name) {
+            if let Some(ids) = self.by_name.write().get_mut(&entry.source_name) {
                 ids.retain(|&i| i != id);
             }
 
@@ -324,12 +322,12 @@ impl SubscriptionRegistry {
     /// for fast concurrent access.
     #[must_use]
     pub fn get_senders_for_source(&self, source_id: u32) -> Vec<broadcast::Sender<ChangeEvent>> {
-        let by_source = self.by_source.read().unwrap();
+        let by_source = self.by_source.read();
         let Some(ids) = by_source.get(&source_id) else {
             return Vec::new();
         };
 
-        let subs = self.subscriptions.read().unwrap();
+        let subs = self.subscriptions.read();
         ids.iter()
             .filter_map(|id| {
                 subs.get(id).and_then(|entry| {
@@ -346,14 +344,14 @@ impl SubscriptionRegistry {
     /// Returns subscription IDs for the given source name.
     #[must_use]
     pub fn get_subscriptions_by_name(&self, name: &str) -> Vec<SubscriptionId> {
-        let by_name = self.by_name.read().unwrap();
+        let by_name = self.by_name.read();
         by_name.get(name).cloned().unwrap_or_default()
     }
 
     /// Returns the total number of registered subscriptions.
     #[must_use]
     pub fn subscription_count(&self) -> usize {
-        self.subscriptions.read().unwrap().len()
+        self.subscriptions.read().len()
     }
 
     /// Returns the number of active subscriptions.
@@ -361,7 +359,6 @@ impl SubscriptionRegistry {
     pub fn active_count(&self) -> usize {
         self.subscriptions
             .read()
-            .unwrap()
             .values()
             .filter(|e| e.state == SubscriptionState::Active)
             .count()
@@ -370,7 +367,7 @@ impl SubscriptionRegistry {
     /// Returns a metrics snapshot for the given subscription.
     #[must_use]
     pub fn metrics(&self, id: SubscriptionId) -> Option<SubscriptionMetrics> {
-        let subs = self.subscriptions.read().unwrap();
+        let subs = self.subscriptions.read();
         subs.get(&id).map(|entry| SubscriptionMetrics {
             id: entry.id,
             source_name: entry.source_name.clone(),
@@ -385,14 +382,14 @@ impl SubscriptionRegistry {
     /// Returns the state of a subscription.
     #[must_use]
     pub fn state(&self, id: SubscriptionId) -> Option<SubscriptionState> {
-        self.subscriptions.read().unwrap().get(&id).map(|e| e.state)
+        self.subscriptions.read().get(&id).map(|e| e.state)
     }
 
     /// Increments the delivered event count for a subscription.
     ///
     /// Called by the Ring 1 dispatcher after successful delivery.
     pub fn record_delivery(&self, id: SubscriptionId, count: u64) {
-        if let Some(entry) = self.subscriptions.write().unwrap().get_mut(&id) {
+        if let Some(entry) = self.subscriptions.write().get_mut(&id) {
             entry.events_delivered += count;
         }
     }
@@ -401,7 +398,7 @@ impl SubscriptionRegistry {
     ///
     /// Called by the Ring 1 dispatcher on backpressure.
     pub fn record_drop(&self, id: SubscriptionId, count: u64) {
-        if let Some(entry) = self.subscriptions.write().unwrap().get_mut(&id) {
+        if let Some(entry) = self.subscriptions.write().get_mut(&id) {
             entry.events_dropped += count;
         }
     }

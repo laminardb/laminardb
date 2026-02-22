@@ -5,6 +5,7 @@ use std::io::{BufWriter, Write};
 use std::path::{Path, PathBuf};
 use std::time::Instant;
 
+use rkyv::api::high;
 use rkyv::rancor::Error as RkyvError;
 use rkyv::util::AlignedVec;
 
@@ -40,6 +41,11 @@ pub struct CoreWalWriter {
     last_sync: Instant,
     /// Number of entries since last sync.
     entries_since_sync: u64,
+    /// Pre-allocated write buffer reused across `append()` calls.
+    /// Grows to high-water mark and stays, eliminating per-append allocation.
+    write_buffer: Vec<u8>,
+    /// Reusable rkyv serialization buffer (avoids `AlignedVec` alloc per append).
+    serialize_buffer: AlignedVec,
 }
 
 impl CoreWalWriter {
@@ -68,6 +74,8 @@ impl CoreWalWriter {
             sequence: 0,
             last_sync: Instant::now(),
             entries_since_sync: 0,
+            write_buffer: Vec::with_capacity(4096),
+            serialize_buffer: AlignedVec::with_capacity(256),
         })
     }
 
@@ -96,6 +104,8 @@ impl CoreWalWriter {
             sequence: 0,
             last_sync: Instant::now(),
             entries_since_sync: 0,
+            write_buffer: Vec::with_capacity(4096),
+            serialize_buffer: AlignedVec::with_capacity(256),
         })
     }
 
@@ -157,12 +167,14 @@ impl CoreWalWriter {
     #[inline]
     #[allow(clippy::cast_possible_truncation)] // core_id bounded by physical CPU count (< u16::MAX)
     pub fn append_put(&mut self, key: &[u8], value: &[u8]) -> Result<u64, PerCoreWalError> {
+        let ts = PerCoreWalEntry::now_ns();
         let entry = PerCoreWalEntry::put(
             self.core_id as u16,
             self.epoch,
             self.sequence,
             key.to_vec(),
             value.to_vec(),
+            ts,
         );
         self.append(&entry)
     }
@@ -175,8 +187,14 @@ impl CoreWalWriter {
     #[inline]
     #[allow(clippy::cast_possible_truncation)] // core_id bounded by physical CPU count (< u16::MAX)
     pub fn append_delete(&mut self, key: &[u8]) -> Result<u64, PerCoreWalError> {
-        let entry =
-            PerCoreWalEntry::delete(self.core_id as u16, self.epoch, self.sequence, key.to_vec());
+        let ts = PerCoreWalEntry::now_ns();
+        let entry = PerCoreWalEntry::delete(
+            self.core_id as u16,
+            self.epoch,
+            self.sequence,
+            key.to_vec(),
+            ts,
+        );
         self.append(&entry)
     }
 
@@ -190,24 +208,34 @@ impl CoreWalWriter {
     pub fn append(&mut self, entry: &PerCoreWalEntry) -> Result<u64, PerCoreWalError> {
         let start_pos = self.position;
 
-        // Serialize the entry using rkyv
-        let bytes: AlignedVec = rkyv::to_bytes::<RkyvError>(entry)
+        // Serialize into reusable buffer (avoids AlignedVec alloc per append)
+        self.serialize_buffer.clear();
+        let taken = std::mem::take(&mut self.serialize_buffer);
+        let bytes = high::to_bytes_in::<_, RkyvError>(entry, taken)
             .map_err(|e| PerCoreWalError::Serialization(e.to_string()))?;
 
         // Compute CRC32C checksum
         let crc = crc32c::crc32c(&bytes);
 
-        // Write record: [length: 4 bytes][crc32: 4 bytes][data: length bytes]
+        // Coalesce header + data into single write_all() call
         #[allow(clippy::cast_possible_truncation)]
         // rkyv entry serialization is well below u32::MAX
         let len = bytes.len() as u32;
-        self.writer.write_all(&len.to_le_bytes())?;
-        self.writer.write_all(&crc.to_le_bytes())?;
-        self.writer.write_all(&bytes)?;
+        self.write_buffer.clear();
+        #[allow(clippy::cast_possible_truncation)] // RECORD_HEADER_SIZE is 8, always fits usize
+        self.write_buffer
+            .reserve(RECORD_HEADER_SIZE as usize + bytes.len());
+        self.write_buffer.extend_from_slice(&len.to_le_bytes());
+        self.write_buffer.extend_from_slice(&crc.to_le_bytes());
+        self.write_buffer.extend_from_slice(&bytes);
+        self.writer.write_all(&self.write_buffer)?;
+
+        // Restore serialize buffer for reuse
+        self.serialize_buffer = bytes;
 
         #[allow(clippy::cast_possible_truncation)] // usize → u64: lossless on 64-bit
-        let bytes_len = bytes.len() as u64;
-        self.position += RECORD_HEADER_SIZE + bytes_len;
+        let data_len = self.write_buffer.len() as u64 - RECORD_HEADER_SIZE;
+        self.position += RECORD_HEADER_SIZE + data_len;
         self.sequence += 1;
         self.entries_since_sync += 1;
 
@@ -221,11 +249,13 @@ impl CoreWalWriter {
     /// Returns an error if serialization or I/O fails.
     #[allow(clippy::cast_possible_truncation)] // core_id bounded by physical CPU count (< u16::MAX)
     pub fn append_checkpoint(&mut self, checkpoint_id: u64) -> Result<u64, PerCoreWalError> {
+        let ts = PerCoreWalEntry::now_ns();
         let entry = PerCoreWalEntry::checkpoint(
             self.core_id as u16,
             self.epoch,
             self.sequence,
             checkpoint_id,
+            ts,
         );
         self.append(&entry)
     }
@@ -237,7 +267,9 @@ impl CoreWalWriter {
     /// Returns an error if serialization or I/O fails.
     #[allow(clippy::cast_possible_truncation)] // core_id bounded by physical CPU count (< u16::MAX)
     pub fn append_epoch_barrier(&mut self) -> Result<u64, PerCoreWalError> {
-        let entry = PerCoreWalEntry::epoch_barrier(self.core_id as u16, self.epoch, self.sequence);
+        let ts = PerCoreWalEntry::now_ns();
+        let entry =
+            PerCoreWalEntry::epoch_barrier(self.core_id as u16, self.epoch, self.sequence, ts);
         self.append(&entry)
     }
 
@@ -252,12 +284,14 @@ impl CoreWalWriter {
         offsets: std::collections::HashMap<String, u64>,
         watermark: Option<i64>,
     ) -> Result<u64, PerCoreWalError> {
+        let ts = PerCoreWalEntry::now_ns();
         let entry = PerCoreWalEntry::commit(
             self.core_id as u16,
             self.epoch,
             self.sequence,
             offsets,
             watermark,
+            ts,
         );
         self.append(&entry)
     }

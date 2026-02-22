@@ -520,6 +520,13 @@ impl StateStore for MmapStateStore {
     }
 
     #[inline]
+    fn get_ref(&self, key: &[u8]) -> Option<&[u8]> {
+        self.index
+            .get(key)
+            .map(|entry| self.storage.get(entry.offset, entry.len))
+    }
+
+    #[inline]
     fn put(&mut self, key: &[u8], value: &[u8]) -> Result<(), StateError> {
         // Write value to storage
         let offset = self.storage.write(value)?;
@@ -531,16 +538,13 @@ impl StateStore for MmapStateStore {
         };
         self.next_version += 1;
 
-        // Entry API: single tree traversal for both insert and update
-        match self.index.entry(key.to_vec()) {
-            std::collections::btree_map::Entry::Occupied(mut occupied) => {
-                self.size_bytes = self.size_bytes - occupied.get().len + value.len();
-                *occupied.get_mut() = entry;
-            }
-            std::collections::btree_map::Entry::Vacant(vacant) => {
-                self.size_bytes += key.len() + value.len();
-                vacant.insert(entry);
-            }
+        // Fast path: update existing key without allocating key.to_vec()
+        if let Some(existing) = self.index.get_mut(key) {
+            self.size_bytes = self.size_bytes - existing.len + value.len();
+            *existing = entry;
+        } else {
+            self.size_bytes += key.len() + value.len();
+            self.index.insert(key.to_vec(), entry);
         }
         Ok(())
     }

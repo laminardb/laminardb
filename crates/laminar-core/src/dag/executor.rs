@@ -39,10 +39,11 @@
 use std::collections::VecDeque;
 
 use rustc_hash::FxHashMap;
-use smallvec::SmallVec;
 
 use crate::alloc::HotPathGuard;
-use crate::operator::{Event, Operator, OperatorContext, OperatorState, Output, OutputVec, Timer};
+use crate::operator::{
+    Event, Operator, OperatorContext, OperatorState, Output, OutputVec, SideOutputData, Timer,
+};
 use crate::state::InMemoryStore;
 use crate::time::{BoundedOutOfOrdernessGenerator, TimerService};
 
@@ -50,6 +51,7 @@ use super::checkpoint::CheckpointBarrier;
 use super::error::DagError;
 use super::routing::RoutingTable;
 use super::topology::{DagNodeType, NodeId, StreamingDag};
+use super::watermark::{DagWatermarkCheckpoint, DagWatermarkTracker};
 
 /// Per-node runtime state (timer service, state store, watermark generator).
 ///
@@ -159,6 +161,8 @@ pub struct DagExecutor {
     temp_events: Vec<Event>,
     /// Executor metrics.
     metrics: DagExecutorMetrics,
+    /// DAG-native watermark tracker for topology-aware propagation.
+    watermark_tracker: DagWatermarkTracker,
     /// Per-operator node metrics (feature-gated).
     #[cfg(feature = "dag-metrics")]
     node_metrics: Vec<OperatorNodeMetrics>,
@@ -203,6 +207,8 @@ impl DagExecutor {
             }
         }
 
+        let watermark_tracker = DagWatermarkTracker::from_dag(dag);
+
         Self {
             operators,
             runtimes,
@@ -217,6 +223,7 @@ impl DagExecutor {
             input_counts,
             temp_events: Vec::with_capacity(64),
             metrics: DagExecutorMetrics::default(),
+            watermark_tracker,
             #[cfg(feature = "dag-metrics")]
             node_metrics: (0..slot_count)
                 .map(|_| OperatorNodeMetrics::default())
@@ -292,15 +299,22 @@ impl DagExecutor {
             return Err(DagError::NodeNotFound(format!("{source_node}")));
         }
 
-        // Advance watermark generators in topological order
-        for &node_id in &self.execution_order {
+        // Use topology-aware propagation: only advance downstream nodes.
+        // Direct field access avoids collecting into a SmallVec.
+        for &(node_id, wm) in self
+            .watermark_tracker
+            .update_watermark(source_node, watermark)
+        {
             let nidx = node_id.0 as usize;
             if nidx < self.slot_count {
                 if let Some(ref mut rt) = self.runtimes[nidx] {
-                    rt.watermark_generator.advance_watermark(watermark);
+                    rt.watermark_generator.advance_watermark(wm);
                 }
             }
         }
+
+        // Fire timers for any nodes whose watermark advanced
+        self.fire_timers(watermark);
 
         #[cfg(feature = "dag-metrics")]
         {
@@ -347,11 +361,7 @@ impl DagExecutor {
                         operator_index: idx,
                     };
                     let outputs = op.on_timer(timer, &mut ctx);
-                    for output in outputs {
-                        if let Output::Event(out_event) = output {
-                            self.route_output(node_id, out_event);
-                        }
-                    }
+                    self.route_all_outputs(node_id, outputs);
                 }
             }
 
@@ -381,11 +391,15 @@ impl DagExecutor {
     #[must_use]
     pub fn take_all_sink_outputs(&mut self) -> FxHashMap<NodeId, Vec<Event>> {
         let mut outputs = FxHashMap::default();
-        let sink_ids: SmallVec<[NodeId; 8]> = self.sink_nodes.iter().copied().collect();
-        for sink_id in sink_ids {
-            let events = self.take_sink_outputs(sink_id);
-            if !events.is_empty() {
-                outputs.insert(sink_id, events);
+        // Index-based iteration avoids collecting sink_nodes into a SmallVec.
+        for i in 0..self.sink_nodes.len() {
+            let sink_id = self.sink_nodes[i];
+            let idx = sink_id.0 as usize;
+            if idx < self.slot_count {
+                let events = std::mem::take(&mut self.sink_outputs[idx]);
+                if !events.is_empty() {
+                    outputs.insert(sink_id, events);
+                }
             }
         }
         outputs
@@ -479,6 +493,17 @@ impl DagExecutor {
             }
         }
         Ok(())
+    }
+
+    /// Checkpoints the watermark tracker state.
+    #[must_use]
+    pub fn checkpoint_watermarks(&self) -> DagWatermarkCheckpoint {
+        self.watermark_tracker.checkpoint()
+    }
+
+    /// Restores watermark tracker state from a checkpoint.
+    pub fn restore_watermarks(&mut self, checkpoint: &DagWatermarkCheckpoint) {
+        self.watermark_tracker.restore(checkpoint);
     }
 
     /// Injects events into a node's input queue.
@@ -599,22 +624,65 @@ impl DagExecutor {
                 self.node_metrics[idx].invocations += 1;
             }
 
-            // Route outputs to downstream nodes.
-            for output in outputs {
-                if let Output::Event(out_event) = output {
-                    #[cfg(feature = "dag-metrics")]
-                    {
-                        self.node_metrics[idx].events_out += 1;
-                    }
-                    self.route_output(node_id, out_event);
-                }
-            }
+            // Route all output variants to downstream nodes.
+            self.route_all_outputs(node_id, outputs);
         }
 
         // Put operator and runtime back.
         self.operators[idx] = operator;
         self.runtimes[idx] = runtime;
         self.temp_events = events;
+    }
+
+    /// Routes all output variants from a source node.
+    ///
+    /// Handles each [`Output`] variant:
+    /// - `Event` → route to downstream nodes via [`route_output()`]
+    /// - `Watermark` → feed into watermark tracker, advance downstream runtimes
+    /// - `LateEvent` → collect in sink outputs for the source node
+    /// - `SideOutput` → collect in sink outputs for the source node
+    /// - `Changelog` → collect changelog event in sink outputs
+    /// - `CheckpointComplete` → no-op (consumed by coordinator)
+    fn route_all_outputs(&mut self, source: NodeId, outputs: OutputVec) {
+        use crate::operator::window::ChangelogRecord;
+
+        for output in outputs {
+            match output {
+                Output::Event(out_event) => {
+                    #[cfg(feature = "dag-metrics")]
+                    {
+                        let sidx = source.0 as usize;
+                        if sidx < self.slot_count {
+                            self.node_metrics[sidx].events_out += 1;
+                        }
+                    }
+                    self.route_output(source, out_event);
+                }
+                Output::Watermark(wm) => {
+                    for &(node_id, new_wm) in self.watermark_tracker.update_watermark(source, wm) {
+                        let nidx = node_id.0 as usize;
+                        if nidx < self.slot_count {
+                            if let Some(ref mut rt) = self.runtimes[nidx] {
+                                rt.watermark_generator.advance_watermark(new_wm);
+                            }
+                        }
+                    }
+                }
+                Output::LateEvent(late_event) => {
+                    self.sink_outputs[source.0 as usize].push(late_event);
+                }
+                Output::SideOutput(data) => {
+                    let SideOutputData { event, .. } = *data;
+                    self.sink_outputs[source.0 as usize].push(event);
+                }
+                Output::Changelog(ChangelogRecord { event, .. }) => {
+                    self.sink_outputs[source.0 as usize].push(event);
+                }
+                Output::CheckpointComplete(_) => {
+                    // No-op: consumed by checkpoint coordinator
+                }
+            }
+        }
     }
 
     /// Routes an output event from a source node to its downstream targets.

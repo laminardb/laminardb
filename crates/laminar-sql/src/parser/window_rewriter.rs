@@ -313,6 +313,14 @@ impl WindowRewriter {
                     .clone()
                     .unwrap_or(sqlparser::ast::DateTimeField::Second);
 
+                match unit {
+                    sqlparser::ast::DateTimeField::Millisecond
+                    | sqlparser::ast::DateTimeField::Milliseconds => {
+                        return Ok(std::time::Duration::from_millis(value));
+                    }
+                    _ => {}
+                }
+
                 let seconds =
                     match unit {
                         sqlparser::ast::DateTimeField::Second
@@ -394,6 +402,10 @@ impl WindowRewriter {
         } else {
             "SECOND".to_string()
         };
+
+        if matches!(unit.as_str(), "MILLISECOND" | "MILLISECONDS" | "MS") {
+            return Ok(std::time::Duration::from_millis(value));
+        }
 
         let seconds = match unit.as_str() {
             "SECOND" | "SECONDS" | "S" => value,
@@ -758,5 +770,52 @@ mod tests {
                 }
             }
         }
+    }
+
+    #[test]
+    fn test_millisecond_interval() {
+        // parse_interval_to_duration should handle MILLISECOND unit
+        let sql = "SELECT TUMBLE(ts, INTERVAL '500' MILLISECOND) FROM events";
+        let dialect = GenericDialect {};
+        let statements = Parser::parse_sql(&dialect, sql).unwrap();
+
+        if let Statement::Query(query) = &statements[0] {
+            if let SetExpr::Select(select) = &*query.body {
+                if let SelectItem::UnnamedExpr(expr) = &select.projection[0] {
+                    let window = WindowRewriter::extract_window_function(expr)
+                        .unwrap()
+                        .unwrap();
+
+                    match window {
+                        WindowFunction::Tumble {
+                            time_column: _,
+                            interval,
+                        } => {
+                            let duration =
+                                WindowRewriter::parse_interval_to_duration(&interval).unwrap();
+                            assert_eq!(
+                                duration,
+                                std::time::Duration::from_millis(500),
+                                "INTERVAL '500' MILLISECOND should parse to 500ms"
+                            );
+                        }
+                        _ => panic!("Expected Tumble window"),
+                    }
+                }
+            }
+        }
+    }
+
+    #[test]
+    fn test_millisecond_interval_string() {
+        // parse_interval_string should handle MS unit
+        let duration = WindowRewriter::parse_interval_string("250 MS").unwrap();
+        assert_eq!(duration, std::time::Duration::from_millis(250));
+
+        let duration2 = WindowRewriter::parse_interval_string("100 MILLISECONDS").unwrap();
+        assert_eq!(duration2, std::time::Duration::from_millis(100));
+
+        let duration3 = WindowRewriter::parse_interval_string("750 MILLISECOND").unwrap();
+        assert_eq!(duration3, std::time::Duration::from_millis(750));
     }
 }
