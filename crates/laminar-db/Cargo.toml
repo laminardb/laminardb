@@ -18,6 +18,15 @@ kafka = ["laminar-connectors/kafka"]
 postgres-cdc = ["laminar-connectors/postgres-cdc"]
 postgres-sink = ["laminar-connectors/postgres-sink"]
 delta-lake = ["laminar-connectors/delta-lake"]
+websocket = ["laminar-connectors/websocket"]
+mysql-cdc = ["laminar-connectors/mysql-cdc"]
+iceberg = ["laminar-connectors/delta-lake"]  # Iceberg shares the lakehouse module
+delta-lake-s3 = ["laminar-connectors/delta-lake-s3"]
+delta-lake-azure = ["laminar-connectors/delta-lake-azure"]
+delta-lake-gcs = ["laminar-connectors/delta-lake-gcs"]
+delta-lake-unity = ["laminar-connectors/delta-lake-unity"]
+delta-lake-glue = ["laminar-connectors/delta-lake-glue"]
+parquet-lookup = ["laminar-connectors/parquet-lookup"]
 durable = []             # Object-store checkpoint profiles
 delta = ["durable"]  # Full distributed mode (Durable + gRPC + gossip + Raft)
 
