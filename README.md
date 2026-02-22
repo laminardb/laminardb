@@ -78,6 +78,33 @@ cargo build --release
 cargo run
 ```
 
+### Python Quick Start
+
+LaminarDB also has Python bindings via [laminardb-python](https://github.com/laminardb/laminardb-python):
+
+```bash
+pip install laminardb
+```
+
+```python
+import laminardb
+
+conn = laminardb.open(":memory:")
+conn.execute("CREATE SOURCE sensors (ts BIGINT, device VARCHAR, value DOUBLE)")
+conn.insert("sensors", [
+    {"ts": 1, "device": "sensor_a", "value": 42.0},
+    {"ts": 2, "device": "sensor_b", "value": 43.5},
+])
+
+conn.sql("SELECT * FROM sensors WHERE value > 42.0").show()
+#    ts    device  value
+# 0   2  sensor_b   43.5
+
+conn.close()
+```
+
+See the [Python README](https://github.com/laminardb/laminardb-python) for the full API including streaming subscriptions, DataFrame integration, and async support.
+
 ---
 
 ## Feature Overview
