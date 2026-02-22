@@ -315,10 +315,17 @@
     var ops = config.operators;
     var totalWidth = canvasWidth / dpr;
     var totalHeight = canvasHeight / dpr;
-    var nodeW = 100;
-    var nodeH = 58;
-    var paddingX = 40;
-    var paddingY = 30;
+
+    // Responsive node dimensions based on canvas width
+    var nodeW, nodeH, paddingX, paddingY;
+    if (totalWidth > 768) {
+      nodeW = 100; nodeH = 58; paddingX = 40; paddingY = 30;
+    } else if (totalWidth > 480) {
+      nodeW = 80; nodeH = 48; paddingX = 24; paddingY = 20;
+    } else {
+      nodeW = 64; nodeH = 42; paddingX = 16; paddingY = 14;
+    }
+
     var availableWidth = totalWidth - paddingX * 2 - nodeW;
     var availableHeight = totalHeight - paddingY * 2 - nodeH;
 
@@ -340,6 +347,77 @@
         centerY: y + nodeH / 2,
         originalIndex: i
       });
+    }
+
+    // On narrow screens, zigzag nodes that share a horizontal band into two rows
+    // so they don't crowd each other. Groups nodes by similar yFrac from the preset,
+    // and for any band with 3+ nodes, alternates them between upper and lower rows.
+    if (totalWidth <= 600) {
+      var yBands = {};
+      for (var zi = 0; zi < ops.length; zi++) {
+        var bandKey = Math.round(ops[zi].pos[1] * 5);
+        if (!yBands[bandKey]) yBands[bandKey] = [];
+        yBands[bandKey].push(zi);
+      }
+      var yHigh = (totalHeight - nodeH) * 0.12;
+      var yLow = (totalHeight - nodeH) * 0.62;
+      for (var bk in yBands) {
+        if (yBands[bk].length >= 3) {
+          var band = yBands[bk];
+          band.sort(function (a, b) { return nodes[a].x - nodes[b].x; });
+          for (var bi = 0; bi < band.length; bi++) {
+            nodes[band[bi]].y = (bi % 2 === 0) ? yHigh : yLow;
+          }
+        }
+      }
+      // Recompute centers after zigzag
+      for (var zr = 0; zr < nodes.length; zr++) {
+        nodes[zr].centerX = nodes[zr].x + nodes[zr].w / 2;
+        nodes[zr].centerY = nodes[zr].y + nodes[zr].h / 2;
+      }
+    }
+
+    // Resolve overlapping nodes — push apart until no bounding boxes collide
+    var minGap = 4;
+    for (var pass = 0; pass < 10; pass++) {
+      var moved = false;
+      for (var a = 0; a < nodes.length; a++) {
+        for (var b = a + 1; b < nodes.length; b++) {
+          var na = nodes[a], nb = nodes[b];
+          var overlapX = (na.x + na.w + minGap) - nb.x;
+          var overlapY = (na.y + na.h + minGap) - nb.y;
+          var overlapXr = (nb.x + nb.w + minGap) - na.x;
+          var overlapYr = (nb.y + nb.h + minGap) - na.y;
+          // Check if rectangles (with gap) actually intersect
+          if (overlapX > 0 && overlapXr > 0 && overlapY > 0 && overlapYr > 0) {
+            // Find the axis of least penetration to push apart
+            var pushX = Math.min(overlapX, overlapXr);
+            var pushY = Math.min(overlapY, overlapYr);
+            if (pushX < pushY) {
+              // Push apart horizontally
+              var dx = (na.centerX < nb.centerX) ? -pushX / 2 : pushX / 2;
+              na.x += dx; nb.x -= dx;
+            } else {
+              // Push apart vertically
+              var dy = (na.centerY < nb.centerY) ? -pushY / 2 : pushY / 2;
+              na.y += dy; nb.y -= dy;
+            }
+            moved = true;
+          }
+        }
+      }
+      // Clamp all nodes within canvas bounds
+      for (var c = 0; c < nodes.length; c++) {
+        var nc = nodes[c];
+        nc.x = Math.max(2, Math.min(totalWidth - nc.w - 2, nc.x));
+        nc.y = Math.max(2, Math.min(totalHeight - nc.h - 2, nc.y));
+      }
+      if (!moved) break;
+    }
+    // Recompute centers after resolution
+    for (var r = 0; r < nodes.length; r++) {
+      nodes[r].centerX = nodes[r].x + nodes[r].w / 2;
+      nodes[r].centerY = nodes[r].y + nodes[r].h / 2;
     }
 
     // Build connections from preset
@@ -658,6 +736,20 @@
 
   // --- Draw operator nodes ---
   function drawNodes(time) {
+    // Responsive font and icon sizes based on canvas width
+    var cw = canvasWidth / dpr;
+    var labelSize, sublabelSize, iconSize, iconOffsetY, labelOffsetY, sublabelOffsetY, badgeFontSize;
+    if (cw > 768) {
+      labelSize = 11; sublabelSize = 9; iconSize = 28;
+      iconOffsetY = 17; labelOffsetY = 38; sublabelOffsetY = 50; badgeFontSize = 7;
+    } else if (cw > 480) {
+      labelSize = 10; sublabelSize = 8; iconSize = 22;
+      iconOffsetY = 14; labelOffsetY = 31; sublabelOffsetY = 41; badgeFontSize = 6;
+    } else {
+      labelSize = 9; sublabelSize = 7; iconSize = 18;
+      iconOffsetY = 12; labelOffsetY = 26; sublabelOffsetY = 35; badgeFontSize = 6;
+    }
+
     for (var i = 0; i < nodes.length; i++) {
       var node = nodes[i];
       var op = node.op;
@@ -704,20 +796,19 @@
       }
 
       // Icon
-      var iconY = node.y + 17;
       ctx.strokeStyle = enabled ? 'rgba(6, 182, 212, 0.8)' : 'rgba(148, 163, 184, 0.3)';
-      drawIcon(op.icon, node.x + node.w / 2, iconY, 28);
+      drawIcon(op.icon, node.x + node.w / 2, node.y + iconOffsetY, iconSize);
 
       // Label
       ctx.fillStyle = enabled ? '#f1f5f9' : 'rgba(148, 163, 184, 0.4)';
-      ctx.font = '600 11px Inter, sans-serif';
+      ctx.font = '600 ' + labelSize + 'px Inter, sans-serif';
       ctx.textAlign = 'center';
-      ctx.fillText(op.label, node.x + node.w / 2, node.y + 38);
+      ctx.fillText(op.label, node.x + node.w / 2, node.y + labelOffsetY);
 
       // Sublabel
       ctx.fillStyle = enabled ? 'rgba(148, 163, 184, 0.6)' : 'rgba(148, 163, 184, 0.25)';
-      ctx.font = '400 9px "JetBrains Mono", monospace';
-      ctx.fillText(op.sublabel, node.x + node.w / 2, node.y + 50);
+      ctx.font = '400 ' + sublabelSize + 'px "JetBrains Mono", monospace';
+      ctx.fillText(op.sublabel, node.x + node.w / 2, node.y + sublabelOffsetY);
 
       // Disabled badge
       if (!enabled) {
@@ -732,7 +823,7 @@
         ctx.fill();
         ctx.stroke();
         ctx.fillStyle = 'rgba(251, 191, 36, 0.8)';
-        ctx.font = '600 7px Inter, sans-serif';
+        ctx.font = '600 ' + badgeFontSize + 'px Inter, sans-serif';
         ctx.fillText('OFF', node.x + node.w / 2, by + 10);
       }
 
@@ -1331,7 +1422,14 @@
   function resize() {
     var container = canvas.parentElement;
     var w = container.clientWidth;
-    var h = Math.max(220, Math.min(320, w * 0.28));
+    var h;
+    if (w > 768) {
+      h = Math.max(220, Math.min(320, w * 0.28));
+    } else if (w > 480) {
+      h = Math.max(240, Math.min(300, w * 0.38));
+    } else {
+      h = Math.max(260, Math.min(300, w * 0.65));
+    }
     dpr = Math.min(window.devicePixelRatio || 1, 2);
 
     canvas.width = w * dpr;
