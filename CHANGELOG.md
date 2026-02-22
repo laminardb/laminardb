@@ -7,9 +7,50 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [0.15.0] - 2026-02-22
+
 ### Added
 - Comprehensive project documentation (README, ARCHITECTURE, CONTRIBUTING, crate READMEs)
 - PR template and SECURITY.md
+- Interactive data flow playground on docs website
+- WebSocket source and sink connectors registered in connector registry
+- MySQL CDC and Iceberg connectors registered in connector registry
+
+### Fixed
+- `cancel_query()` now returns an error for nonexistent query IDs
+- Mobile responsiveness for data flow playground
+- Windows CI protoc installation (switched to arduino/setup-protoc)
+- Cross-compilation protoc availability in containers
+
+### Changed
+- Removed ~460 lines of boilerplate via macros and dead code deletion
+
+## [0.14.0] - 2026-02-18
+
+### Added
+- Docs and website redesign with interactive playground
+- Schema inference for connectors
+- Multi-partition streaming scans
+
+### Fixed
+- SELECT on streaming sources now works correctly
+- Manual `checkpoint()` wired to disk persistence
+- Connector config specs aligned with `from_config()` implementations
+
+## [0.13.0] - 2026-02-14
+
+### Added
+- Deferred architectural fixes
+- EXPLAIN formatting improvements
+- Per-operator metrics
+- SQL fixes and improvements
+
+### Fixed
+- `EMIT ON WINDOW CLOSE` in embedded SQL executor
+- Cross-build failures for musl and aarch64 targets
+
+### Changed
+- Major dependency upgrades (sysinfo 0.33→0.38)
 
 ## [0.12.0] - 2026-02-11
 
