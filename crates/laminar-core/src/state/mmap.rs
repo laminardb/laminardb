@@ -520,6 +520,13 @@ impl StateStore for MmapStateStore {
     }
 
     #[inline]
+    fn get_ref(&self, key: &[u8]) -> Option<&[u8]> {
+        self.index
+            .get(key)
+            .map(|entry| self.storage.get(entry.offset, entry.len))
+    }
+
+    #[inline]
     fn put(&mut self, key: &[u8], value: &[u8]) -> Result<(), StateError> {
         // Write value to storage
         let offset = self.storage.write(value)?;

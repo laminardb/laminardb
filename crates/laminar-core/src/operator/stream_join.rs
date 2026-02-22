@@ -87,6 +87,7 @@ use rkyv::{
     rancor::Error as RkyvError, Archive, Deserialize as RkyvDeserialize, Serialize as RkyvSerialize,
 };
 use rustc_hash::FxHashMap;
+use smallvec::SmallVec;
 use std::hash::{Hash, Hasher};
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::Arc;
@@ -1524,7 +1525,7 @@ impl StreamJoinOperator {
         // Create join row with configured encoding
         let join_row = match JoinRow::with_encoding(
             event_time,
-            key_value.clone(),
+            key_value.to_vec(),
             &event.data,
             self.row_encoding,
         ) {
@@ -1801,7 +1802,7 @@ impl StreamJoinOperator {
         batch: &RecordBatch,
         column_name: &str,
         cached_index: &mut Option<usize>,
-    ) -> Option<Vec<u8>> {
+    ) -> Option<SmallVec<[u8; 16]>> {
         let column_index = if let Some(idx) = *cached_index {
             idx
         } else {
@@ -1816,14 +1817,14 @@ impl StreamJoinOperator {
             if string_array.is_empty() || string_array.is_null(0) {
                 return None;
             }
-            return Some(string_array.value(0).as_bytes().to_vec());
+            return Some(SmallVec::from_slice(string_array.value(0).as_bytes()));
         }
 
         if let Some(int_array) = column.as_any().downcast_ref::<Int64Array>() {
             if int_array.is_empty() || int_array.is_null(0) {
                 return None;
             }
-            return Some(int_array.value(0).to_le_bytes().to_vec());
+            return Some(SmallVec::from_slice(&int_array.value(0).to_le_bytes()));
         }
 
         // For other types, use the raw bytes if available
@@ -1833,7 +1834,7 @@ impl StreamJoinOperator {
 
     /// Creates a state key for storing a join row.
     #[allow(clippy::cast_sign_loss)]
-    fn make_state_key(side: JoinSide, key_value: &[u8], timestamp: i64) -> Vec<u8> {
+    fn make_state_key(side: JoinSide, key_value: &[u8], timestamp: i64) -> [u8; 28] {
         let prefix = match side {
             JoinSide::Left => LEFT_STATE_PREFIX,
             JoinSide::Right => RIGHT_STATE_PREFIX,
@@ -1842,8 +1843,8 @@ impl StreamJoinOperator {
         let event_id = EVENT_ID_COUNTER.fetch_add(1, Ordering::Relaxed);
 
         // Key format: prefix (4) + key_hash (8) + timestamp (8) + event_id (8) = 28 bytes
-        let mut key = Vec::with_capacity(28);
-        key.extend_from_slice(prefix);
+        let mut key = [0u8; 28];
+        key[..4].copy_from_slice(prefix);
 
         // Use FxHash for the key value
         let key_hash = {
@@ -1851,9 +1852,9 @@ impl StreamJoinOperator {
             key_value.hash(&mut hasher);
             hasher.finish()
         };
-        key.extend_from_slice(&key_hash.to_be_bytes());
-        key.extend_from_slice(&timestamp.to_be_bytes());
-        key.extend_from_slice(&event_id.to_be_bytes());
+        key[4..12].copy_from_slice(&key_hash.to_be_bytes());
+        key[12..20].copy_from_slice(&timestamp.to_be_bytes());
+        key[20..28].copy_from_slice(&event_id.to_be_bytes());
 
         key
     }
@@ -1906,9 +1907,9 @@ impl StreamJoinOperator {
             key_value.hash(&mut hasher);
             hasher.finish()
         };
-        let mut scan_prefix = Vec::with_capacity(12);
-        scan_prefix.extend_from_slice(prefix);
-        scan_prefix.extend_from_slice(&key_hash.to_be_bytes());
+        let mut scan_prefix = [0u8; 12];
+        scan_prefix[..4].copy_from_slice(prefix);
+        scan_prefix[4..12].copy_from_slice(&key_hash.to_be_bytes());
 
         // Scan for matching keys
         for (state_key, value) in state.prefix_scan(&scan_prefix) {

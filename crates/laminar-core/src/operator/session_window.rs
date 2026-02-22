@@ -58,6 +58,7 @@ use rkyv::{
     Archive, Deserialize as RkyvDeserialize, Serialize as RkyvSerialize,
 };
 use rustc_hash::FxHashMap;
+use smallvec::SmallVec;
 use std::marker::PhantomData;
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::Arc;
@@ -490,7 +491,7 @@ where
     }
 
     /// Extracts the key from an event.
-    fn extract_key(&self, event: &Event) -> Vec<u8> {
+    fn extract_key(&self, event: &Event) -> SmallVec<[u8; 16]> {
         use arrow_array::cast::AsArray;
         use arrow_array::types::Int64Type;
 
@@ -499,19 +500,19 @@ where
                 let column = event.data.column(col_idx);
                 if let Some(array) = column.as_primitive_opt::<Int64Type>() {
                     if !array.is_empty() && !array.is_null(0) {
-                        return array.value(0).to_be_bytes().to_vec();
+                        return SmallVec::from_slice(&array.value(0).to_be_bytes());
                     }
                 }
                 // Try string column
                 if let Some(array) = column.as_string_opt::<i32>() {
                     if !array.is_empty() && !array.is_null(0) {
-                        return array.value(0).as_bytes().to_vec();
+                        return SmallVec::from_slice(array.value(0).as_bytes());
                     }
                 }
             }
         }
         // Default: global session (empty key)
-        Vec::new()
+        SmallVec::new()
     }
 
     /// Computes a hash for the key.
