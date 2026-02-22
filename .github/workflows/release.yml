@@ -234,18 +234,29 @@ jobs:
             echo "See [CHANGELOG.md](CHANGELOG.md) for details." >> notes.md
           fi
 
-      - name: Create GitHub Release
-        uses: softprops/action-gh-release@v2
-        with:
-          draft: false
-          prerelease: ${{ needs.verify.outputs.prerelease == 'true' }}
-          body_path: notes.md
-          files: |
-            artifacts/laminardb-*.tar.gz
-            artifacts/laminardb-*.zip
-            artifacts/checksums.sha256
+      - name: Create or update GitHub Release
         env:
-          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        run: |
+          TAG="${{ github.ref_name }}"
+          PRERELEASE="${{ needs.verify.outputs.prerelease }}"
+
+          FLAGS=(--notes-file notes.md --verify-tag)
+          if [[ "$PRERELEASE" == "true" ]]; then
+            FLAGS+=(--prerelease)
+          else
+            FLAGS+=(--latest)
+          fi
+
+          # If the release already exists, upload assets to it; otherwise create it
+          if gh release view "$TAG" > /dev/null 2>&1; then
+            echo "Release $TAG already exists — updating assets"
+            gh release upload "$TAG" artifacts/laminardb-*.tar.gz artifacts/laminardb-*.zip artifacts/checksums.sha256 --clobber
+            gh release edit "$TAG" --notes-file notes.md
+          else
+            echo "Creating release $TAG"
+            gh release create "$TAG" "${FLAGS[@]}" artifacts/laminardb-*.tar.gz artifacts/laminardb-*.zip artifacts/checksums.sha256
+          fi
 
   # ============================================
   # Publish to crates.io
