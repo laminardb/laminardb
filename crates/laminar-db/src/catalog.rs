@@ -329,11 +329,13 @@ impl SourceCatalog {
         id
     }
 
-    /// Mark a query as inactive.
-    #[allow(dead_code)]
-    pub(crate) fn deactivate_query(&self, id: u64) {
+    /// Mark a query as inactive. Returns `true` if the query existed.
+    pub(crate) fn deactivate_query(&self, id: u64) -> bool {
         if let Some(entry) = self.queries.write().get_mut(&id) {
             entry.active = false;
+            true
+        } else {
+            false
         }
     }
 
