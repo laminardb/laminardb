@@ -133,7 +133,7 @@ jobs:
 
       - name: Install protoc (Windows)
         if: runner.os == 'Windows'
-        run: choco install protoc -y
+        uses: arduino/setup-protoc@v3
 
       - name: Install cross
         if: matrix.cross

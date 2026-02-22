@@ -19,8 +19,9 @@ use crate::testing::{MockSinkConnector, MockSourceConnector};
 /// - `PostgreSQL` CDC (with `postgres-cdc` feature)
 /// - `PostgreSQL` Sink (with `postgres-sink` feature)
 /// - `MySQL` CDC (with `mysql-cdc` feature)
-/// - Delta Lake (always available, business logic only)
+/// - Delta Lake source + sink (always available, business logic only)
 /// - Iceberg (always available, business logic only)
+/// - WebSocket source + sink (with `websocket` feature)
 pub fn register_all_connectors(registry: &ConnectorRegistry) {
     // Always register mock connectors
     register_mock_connectors(registry);
@@ -30,6 +31,10 @@ pub fn register_all_connectors(registry: &ConnectorRegistry) {
 
     // Register Iceberg sink (business logic only, no external dependency)
     register_iceberg(registry);
+
+    // Register WebSocket source + sink
+    #[cfg(feature = "websocket")]
+    register_websocket(registry);
 
     // Feature-gated connectors
     #[cfg(feature = "kafka")]
@@ -75,8 +80,9 @@ pub fn register_mock_connectors(registry: &ConnectorRegistry) {
 }
 
 fn register_delta_lake(registry: &ConnectorRegistry) {
-    use crate::lakehouse::register_delta_lake_sink;
+    use crate::lakehouse::{register_delta_lake_sink, register_delta_lake_source};
     register_delta_lake_sink(registry);
+    register_delta_lake_source(registry);
 }
 
 fn register_iceberg(registry: &ConnectorRegistry) {
@@ -108,6 +114,13 @@ fn register_mysql_cdc(registry: &ConnectorRegistry) {
     register_mysql_cdc_source(registry);
 }
 
+#[cfg(feature = "websocket")]
+fn register_websocket(registry: &ConnectorRegistry) {
+    use crate::websocket::{register_websocket_sink, register_websocket_source};
+    register_websocket_source(registry);
+    register_websocket_sink(registry);
+}
+
 /// Returns a registry with all default connectors pre-registered.
 #[must_use]
 pub fn default_registry() -> ConnectorRegistry {
@@ -129,7 +142,8 @@ mod tests {
         assert!(registry.source_info("mock").is_some());
         assert!(registry.sink_info("mock").is_some());
 
-        // Delta Lake and Iceberg sinks should be available
+        // Delta Lake source + sink and Iceberg sink should be available
+        assert!(registry.source_info("delta-lake").is_some());
         assert!(registry.sink_info("delta-lake").is_some());
         assert!(registry.sink_info("iceberg").is_some());
     }
