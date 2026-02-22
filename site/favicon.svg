@@ -1,25 +1,14 @@
 <svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 32 32">
   <defs>
-    <linearGradient id="a" x1="0" y1="1" x2="1" y2="0">
-      <stop offset="0%" stop-color="#0b2540"/>
-      <stop offset="100%" stop-color="#1a6fa0"/>
+    <linearGradient id="fg" x1="0" y1="0" x2="1" y2="1">
+      <stop offset="0%" stop-color="#06b6d4"/>
+      <stop offset="100%" stop-color="#8b5cf6"/>
     </linearGradient>
-    <linearGradient id="b" x1="0" y1="1" x2="1" y2="0">
-      <stop offset="0%" stop-color="#1a6fa0"/>
-      <stop offset="100%" stop-color="#38bdf8"/>
-    </linearGradient>
-    <linearGradient id="c" x1="0" y1="1" x2="1" y2="0">
-      <stop offset="0%" stop-color="#38bdf8"/>
-      <stop offset="100%" stop-color="#7dd3fc"/>
-    </linearGradient>
-    <clipPath id="L">
-      <path d="M4 2h10v18h12v8H4z"/>
-    </clipPath>
   </defs>
-  <rect width="32" height="32" rx="7" fill="#0a1628"/>
-  <g clip-path="url(#L)">
-    <rect x="4" y="2" width="22" height="26" fill="url(#a)"/>
-    <path d="M4 28 Q12 16 18 20 Q22 22 26 14 L26 28Z" fill="url(#b)"/>
-    <path d="M4 28 Q12 22 18 24 Q22 26 26 21 L26 28Z" fill="url(#c)"/>
-  </g>
+  <rect width="32" height="32" rx="7" fill="#080d1e"/>
+  <!-- Laminar flow streams -->
+  <path d="M5 9 C10 9, 12 7, 17 7 C22 7, 24 10, 27 10" stroke="url(#fg)" stroke-width="2" fill="none" stroke-linecap="round" opacity="0.5"/>
+  <path d="M4 14 C9 14, 12 12, 17 12 C22 12, 24 15, 28 15" stroke="url(#fg)" stroke-width="2" fill="none" stroke-linecap="round" opacity="0.7"/>
+  <path d="M3 19 C8 19, 12 17, 17 17 C22 17, 24 20, 29 20" stroke="url(#fg)" stroke-width="2.5" fill="none" stroke-linecap="round" opacity="1"/>
+  <path d="M4 24 C9 24, 12 22, 17 22 C22 22, 24 25, 28 25" stroke="url(#fg)" stroke-width="2" fill="none" stroke-linecap="round" opacity="0.5"/>
 </svg>
