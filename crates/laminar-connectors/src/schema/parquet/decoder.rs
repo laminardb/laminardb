@@ -208,7 +208,7 @@ impl FormatDecoder for ParquetDecoder {
             .map_err(|e| SchemaError::DecodeError(format!("batch concat error: {e}")))
     }
 
-    fn format_name(&self) -> &str {
+    fn format_name(&self) -> &'static str {
         "parquet"
     }
 }

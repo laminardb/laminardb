@@ -627,7 +627,7 @@ mod tests {
 
     #[test]
     fn test_field_origin_variants() {
-        let origins = vec![
+        let origins = [
             FieldOrigin::UserDeclared,
             FieldOrigin::AutoResolved,
             FieldOrigin::WildcardInferred,

@@ -66,7 +66,7 @@ impl SchemaProvider for ParquetSchemaProvider {
         let mut result = HashMap::new();
         for (idx, field) in schema.fields().iter().enumerate() {
             let mut meta = FieldMeta::new()
-                .with_field_id(idx as u32)
+                .with_field_id(u32::try_from(idx).expect("field index overflow"))
                 .with_source_type(format!("{}", field.data_type()));
 
             // Copy Arrow field metadata as properties.

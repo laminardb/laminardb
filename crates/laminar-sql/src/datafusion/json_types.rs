@@ -406,27 +406,27 @@ mod tests {
     use super::*;
     use serde_json::json;
 
-    fn enc(v: serde_json::Value) -> Vec<u8> {
-        encode_jsonb(&v)
+    fn enc(v: &serde_json::Value) -> Vec<u8> {
+        encode_jsonb(v)
     }
 
     #[test]
     fn test_type_name() {
-        assert_eq!(jsonb_type_name(&enc(json!(null))), Some("null"));
-        assert_eq!(jsonb_type_name(&enc(json!(true))), Some("boolean"));
-        assert_eq!(jsonb_type_name(&enc(json!(false))), Some("boolean"));
-        assert_eq!(jsonb_type_name(&enc(json!(42))), Some("number"));
-        assert_eq!(jsonb_type_name(&enc(json!(3.14))), Some("number"));
-        assert_eq!(jsonb_type_name(&enc(json!("hi"))), Some("string"));
-        assert_eq!(jsonb_type_name(&enc(json!([1]))), Some("array"));
-        assert_eq!(jsonb_type_name(&enc(json!({"a": 1}))), Some("object"));
+        assert_eq!(jsonb_type_name(&enc(&json!(null))), Some("null"));
+        assert_eq!(jsonb_type_name(&enc(&json!(true))), Some("boolean"));
+        assert_eq!(jsonb_type_name(&enc(&json!(false))), Some("boolean"));
+        assert_eq!(jsonb_type_name(&enc(&json!(42))), Some("number"));
+        assert_eq!(jsonb_type_name(&enc(&json!(3.125))), Some("number"));
+        assert_eq!(jsonb_type_name(&enc(&json!("hi"))), Some("string"));
+        assert_eq!(jsonb_type_name(&enc(&json!([1]))), Some("array"));
+        assert_eq!(jsonb_type_name(&enc(&json!({"a": 1}))), Some("object"));
         assert_eq!(jsonb_type_name(&[]), None);
         assert_eq!(jsonb_type_name(&[0xFF]), None);
     }
 
     #[test]
     fn test_get_field() {
-        let b = enc(json!({"name": "Alice", "age": 30}));
+        let b = enc(&json!({"name": "Alice", "age": 30}));
         let name = jsonb_get_field(&b, "name").unwrap();
         assert_eq!(jsonb_to_text(name), Some("Alice".to_owned()));
         let age = jsonb_get_field(&b, "age").unwrap();
@@ -436,7 +436,7 @@ mod tests {
 
     #[test]
     fn test_array_get() {
-        let b = enc(json!([10, 20, 30]));
+        let b = enc(&json!([10, 20, 30]));
         let e1 = jsonb_array_get(&b, 1).unwrap();
         assert_eq!(jsonb_to_text(e1), Some("20".to_owned()));
         assert!(jsonb_array_get(&b, 5).is_none());
@@ -444,75 +444,75 @@ mod tests {
 
     #[test]
     fn test_has_key() {
-        let b = enc(json!({"a": 1, "b": 2}));
+        let b = enc(&json!({"a": 1, "b": 2}));
         assert!(jsonb_has_key(&b, "a"));
         assert!(!jsonb_has_key(&b, "c"));
     }
 
     #[test]
     fn test_to_text_string() {
-        let b = enc(json!("hello"));
+        let b = enc(&json!("hello"));
         assert_eq!(jsonb_to_text(&b), Some("hello".to_owned()));
     }
 
     #[test]
     fn test_to_text_null() {
-        let b = enc(json!(null));
+        let b = enc(&json!(null));
         assert_eq!(jsonb_to_text(&b), None);
     }
 
     #[test]
     fn test_to_text_object() {
-        let b = enc(json!({"a": 1}));
+        let b = enc(&json!({"a": 1}));
         assert_eq!(jsonb_to_text(&b), Some("{\"a\":1}".to_owned()));
     }
 
     #[test]
     fn test_to_text_array() {
-        let b = enc(json!([1, "two"]));
+        let b = enc(&json!([1, "two"]));
         assert_eq!(jsonb_to_text(&b), Some("[1,\"two\"]".to_owned()));
     }
 
     #[test]
     fn test_contains_object() {
-        let left = enc(json!({"a": 1, "b": 2, "c": 3}));
-        let right = enc(json!({"a": 1, "c": 3}));
+        let left = enc(&json!({"a": 1, "b": 2, "c": 3}));
+        let right = enc(&json!({"a": 1, "c": 3}));
         assert_eq!(jsonb_contains(&left, &right), Some(true));
     }
 
     #[test]
     fn test_contains_object_false() {
-        let left = enc(json!({"a": 1}));
-        let right = enc(json!({"a": 1, "b": 2}));
+        let left = enc(&json!({"a": 1}));
+        let right = enc(&json!({"a": 1, "b": 2}));
         assert_eq!(jsonb_contains(&left, &right), Some(false));
     }
 
     #[test]
     fn test_contains_array() {
-        let left = enc(json!([1, 2, 3]));
-        let right = enc(json!([1, 3]));
+        let left = enc(&json!([1, 2, 3]));
+        let right = enc(&json!([1, 3]));
         assert_eq!(jsonb_contains(&left, &right), Some(true));
     }
 
     #[test]
     fn test_contains_scalar() {
-        let a = enc(json!(42));
-        let b = enc(json!(42));
-        let c = enc(json!(99));
+        let a = enc(&json!(42));
+        let b = enc(&json!(42));
+        let c = enc(&json!(99));
         assert_eq!(jsonb_contains(&a, &b), Some(true));
         assert_eq!(jsonb_contains(&a, &c), Some(false));
     }
 
     #[test]
     fn test_contains_type_mismatch() {
-        let a = enc(json!(42));
-        let b = enc(json!("42"));
+        let a = enc(&json!(42));
+        let b = enc(&json!("42"));
         assert_eq!(jsonb_contains(&a, &b), Some(false));
     }
 
     #[test]
     fn test_nested_get() {
-        let b = enc(json!({"user": {"address": {"city": "London"}}}));
+        let b = enc(&json!({"user": {"address": {"city": "London"}}}));
         let user = jsonb_get_field(&b, "user").unwrap();
         let addr = jsonb_get_field(user, "address").unwrap();
         let city = jsonb_get_field(addr, "city").unwrap();
@@ -526,13 +526,13 @@ mod tests {
             json!(true),
             json!(false),
             json!(42),
-            json!(3.14),
+            json!(3.125),
             json!("hello"),
             json!([1, "two", null]),
             json!({"key": "value", "num": 42}),
         ];
         for v in vals {
-            let b = enc(v.clone());
+            let b = enc(&v);
             let text = jsonb_to_json_string(&b);
             assert!(text.is_some(), "Failed to round-trip: {v:?}");
         }
@@ -540,18 +540,18 @@ mod tests {
 
     #[test]
     fn test_jsonb_to_value_scalars() {
-        assert_eq!(jsonb_to_value(&enc(json!(null))), Some(json!(null)));
-        assert_eq!(jsonb_to_value(&enc(json!(true))), Some(json!(true)));
-        assert_eq!(jsonb_to_value(&enc(json!(false))), Some(json!(false)));
-        assert_eq!(jsonb_to_value(&enc(json!(42))), Some(json!(42)));
-        assert_eq!(jsonb_to_value(&enc(json!(3.14))), Some(json!(3.14)));
-        assert_eq!(jsonb_to_value(&enc(json!("hello"))), Some(json!("hello")));
+        assert_eq!(jsonb_to_value(&enc(&json!(null))), Some(json!(null)));
+        assert_eq!(jsonb_to_value(&enc(&json!(true))), Some(json!(true)));
+        assert_eq!(jsonb_to_value(&enc(&json!(false))), Some(json!(false)));
+        assert_eq!(jsonb_to_value(&enc(&json!(42))), Some(json!(42)));
+        assert_eq!(jsonb_to_value(&enc(&json!(3.125))), Some(json!(3.125)));
+        assert_eq!(jsonb_to_value(&enc(&json!("hello"))), Some(json!("hello")));
     }
 
     #[test]
     fn test_jsonb_to_value_complex() {
         let obj = json!({"a": 1, "b": [2, 3], "c": {"d": true}});
-        let bytes = enc(obj.clone());
+        let bytes = enc(&obj);
         assert_eq!(jsonb_to_value(&bytes), Some(obj));
     }
 

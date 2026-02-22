@@ -21,7 +21,7 @@ pub struct ParquetEncoderConfig {
     /// Parquet writer version (1 or 2, default: 2).
     pub writer_version: i32,
 
-    /// Maximum rows per row group (default: 1_000_000).
+    /// Maximum rows per row group (default: `1_000_000`).
     pub max_row_group_size: usize,
 
     /// Whether to write column statistics (default: true).
@@ -131,7 +131,7 @@ impl FormatEncoder for ParquetEncoder {
         Ok(vec![buf])
     }
 
-    fn format_name(&self) -> &str {
+    fn format_name(&self) -> &'static str {
         "parquet"
     }
 }
@@ -142,6 +142,7 @@ mod tests {
     use arrow_array::{Int64Array, StringArray};
     use arrow_schema::{DataType, Field, Schema};
     use parquet::arrow::arrow_reader::ParquetRecordBatchReaderBuilder;
+    use parquet::basic::{GzipLevel, ZstdLevel};
     use std::sync::Arc;
 
     fn make_schema() -> SchemaRef {
@@ -184,7 +185,7 @@ mod tests {
             .unwrap();
 
         let batches: Vec<RecordBatch> = reader.map(Result::unwrap).collect();
-        let total_rows: usize = batches.iter().map(|b| b.num_rows()).sum();
+        let total_rows: usize = batches.iter().map(RecordBatch::num_rows).sum();
         assert_eq!(total_rows, 3);
     }
 
@@ -200,8 +201,8 @@ mod tests {
         )
         .unwrap();
 
-        let config =
-            ParquetEncoderConfig::default().with_compression(Compression::GZIP(Default::default()));
+        let config = ParquetEncoderConfig::default()
+            .with_compression(Compression::GZIP(GzipLevel::default()));
         let encoder = ParquetEncoder::with_config(schema, config);
         let encoded = encoder.encode_batch(&batch).unwrap();
         assert_eq!(encoded.len(), 1);
@@ -218,7 +219,7 @@ mod tests {
     #[test]
     fn test_config_builder() {
         let config = ParquetEncoderConfig::default()
-            .with_compression(Compression::ZSTD(Default::default()))
+            .with_compression(Compression::ZSTD(ZstdLevel::default()))
             .with_writer_version(1)
             .with_max_row_group_size(500)
             .with_statistics(false);

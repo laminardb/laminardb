@@ -221,14 +221,6 @@ mod tests {
 
     #[tokio::test]
     async fn test_writer_processes_records() {
-        let (tx, rx) = mpsc::channel(16);
-        let metrics = Arc::new(ErrorMetrics::new());
-
-        // We need to wrap dest to inspect it after the writer runs.
-        // Use a shared Arc<Mutex<>> for testing.
-        let shared_records = Arc::new(tokio::sync::Mutex::new(Vec::new()));
-        let shared_clone = Arc::clone(&shared_records);
-
         struct SharedDest {
             inner: Arc<tokio::sync::Mutex<Vec<DeadLetterRecord>>>,
         }
@@ -246,6 +238,14 @@ mod tests {
                 Ok(())
             }
         }
+
+        let (tx, rx) = mpsc::channel(16);
+        let metrics = Arc::new(ErrorMetrics::new());
+
+        // We need to wrap dest to inspect it after the writer runs.
+        // Use a shared Arc<Mutex<>> for testing.
+        let shared_records = Arc::new(tokio::sync::Mutex::new(Vec::new()));
+        let shared_clone = Arc::clone(&shared_records);
 
         let writer = DeadLetterWriter::new(
             rx,
@@ -268,11 +268,6 @@ mod tests {
 
     #[tokio::test]
     async fn test_writer_rate_limiting() {
-        let (tx, rx) = mpsc::channel(16);
-        let metrics = Arc::new(ErrorMetrics::new());
-        let shared_records = Arc::new(tokio::sync::Mutex::new(Vec::new()));
-        let shared_clone = Arc::clone(&shared_records);
-
         struct SharedDest {
             inner: Arc<tokio::sync::Mutex<Vec<DeadLetterRecord>>>,
         }
@@ -290,6 +285,11 @@ mod tests {
                 Ok(())
             }
         }
+
+        let (tx, rx) = mpsc::channel(16);
+        let metrics = Arc::new(ErrorMetrics::new());
+        let shared_records = Arc::new(tokio::sync::Mutex::new(Vec::new()));
+        let shared_clone = Arc::clone(&shared_records);
 
         // Rate limit to 2/sec
         let writer = DeadLetterWriter::new(

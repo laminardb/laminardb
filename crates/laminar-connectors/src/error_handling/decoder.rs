@@ -3,7 +3,7 @@
 //! [`ErrorHandlingDecoder`] wraps a [`FormatDecoder`] and intercepts
 //! per-record errors during batch decoding. Good records are collected
 //! into the output batch; bad records are routed to the
-//! [`ErrorRouter`](super::ErrorRouter).
+//! [`ErrorRouter`].
 
 use arrow_array::RecordBatch;
 use arrow_schema::SchemaRef;
@@ -181,7 +181,7 @@ mod tests {
             Ok(RecordBatch::try_new(Arc::clone(&self.schema), vec![Arc::new(arr)]).unwrap())
         }
 
-        fn format_name(&self) -> &str {
+        fn format_name(&self) -> &'static str {
             "test"
         }
     }

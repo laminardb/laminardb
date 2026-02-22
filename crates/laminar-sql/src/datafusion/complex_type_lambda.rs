@@ -769,10 +769,10 @@ mod tests {
 
     #[test]
     fn test_register_lambda_functions() {
+        use datafusion::execution::FunctionRegistry;
+
         let ctx = SessionContext::new();
         register_lambda_functions(&ctx);
-
-        use datafusion::execution::FunctionRegistry;
         assert!(ctx.udf("array_transform").is_ok());
         assert!(ctx.udf("array_filter").is_ok());
         assert!(ctx.udf("array_reduce").is_ok());

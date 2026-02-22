@@ -949,7 +949,7 @@ mod tests {
                 assert_eq!(version, 1);
                 assert_eq!(changes.len(), 1);
             }
-            _ => panic!("expected Applied"),
+            EvolutionResult::NoChange => panic!("expected Applied"),
         }
     }
 

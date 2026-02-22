@@ -676,7 +676,7 @@ mod tests {
 
     #[test]
     fn test_schema_change_variants() {
-        let changes = vec![
+        let changes = [
             SchemaChange::ColumnAdded {
                 name: "email".into(),
                 data_type: DataType::Utf8,

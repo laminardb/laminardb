@@ -403,10 +403,6 @@ mod tests {
         Expr::Literal(ScalarValue::LargeBinary(Some(bytes)), None)
     }
 
-    fn make_null_expr() -> Expr {
-        Expr::Literal(ScalarValue::Null, None)
-    }
-
     // ── jsonb_array_elements tests ──
 
     #[test]

@@ -573,9 +573,8 @@ mod tests {
         let vals = Arc::new(arrow_array::Int64Array::from(vec![1_708_528_800])) as ArrayRef;
         let units = Arc::new(StringArray::from(vec!["seconds"])) as ArrayRef;
         let result = udf.invoke_with_args(make_args_2(vals, units)).unwrap();
-        let arr = match result {
-            ColumnarValue::Array(a) => a,
-            _ => panic!("expected array"),
+        let ColumnarValue::Array(arr) = result else {
+            panic!("expected array")
         };
         let ts = arr
             .as_any()
@@ -590,9 +589,8 @@ mod tests {
         let vals = Arc::new(arrow_array::Int64Array::from(vec![1_708_528_800_000])) as ArrayRef;
         let units = Arc::new(StringArray::from(vec!["milliseconds"])) as ArrayRef;
         let result = udf.invoke_with_args(make_args_2(vals, units)).unwrap();
-        let arr = match result {
-            ColumnarValue::Array(a) => a,
-            _ => panic!("expected array"),
+        let ColumnarValue::Array(arr) = result else {
+            panic!("expected array")
         };
         let ts = arr
             .as_any()
@@ -607,9 +605,8 @@ mod tests {
         let vals = Arc::new(arrow_array::Int64Array::from(vec![1_708_528_800_000_000])) as ArrayRef;
         let units = Arc::new(StringArray::from(vec!["microseconds"])) as ArrayRef;
         let result = udf.invoke_with_args(make_args_2(vals, units)).unwrap();
-        let arr = match result {
-            ColumnarValue::Array(a) => a,
-            _ => panic!("expected array"),
+        let ColumnarValue::Array(arr) = result else {
+            panic!("expected array")
         };
         let ts = arr
             .as_any()
@@ -626,9 +623,8 @@ mod tests {
         ])) as ArrayRef;
         let units = Arc::new(StringArray::from(vec!["nanoseconds"])) as ArrayRef;
         let result = udf.invoke_with_args(make_args_2(vals, units)).unwrap();
-        let arr = match result {
-            ColumnarValue::Array(a) => a,
-            _ => panic!("expected array"),
+        let ColumnarValue::Array(arr) = result else {
+            panic!("expected array")
         };
         let ts = arr
             .as_any()
@@ -649,9 +645,8 @@ mod tests {
             let vals = Arc::new(arrow_array::Int64Array::from(vec![val])) as ArrayRef;
             let units = Arc::new(StringArray::from(vec![unit])) as ArrayRef;
             let result = udf.invoke_with_args(make_args_2(vals, units)).unwrap();
-            let arr = match result {
-                ColumnarValue::Array(a) => a,
-                _ => panic!("expected array"),
+            let ColumnarValue::Array(arr) = result else {
+                panic!("expected array")
             };
             let ts = arr
                 .as_any()
@@ -683,9 +678,8 @@ mod tests {
             Some("seconds"),
         ])) as ArrayRef;
         let result = udf.invoke_with_args(make_args_2(vals, units)).unwrap();
-        let arr = match result {
-            ColumnarValue::Array(a) => a,
-            _ => panic!("expected array"),
+        let ColumnarValue::Array(arr) = result else {
+            panic!("expected array")
         };
         let ts = arr
             .as_any()
@@ -704,9 +698,8 @@ mod tests {
         let strs = Arc::new(StringArray::from(vec!["2026-02-21 14:30:00"])) as ArrayRef;
         let fmts = Arc::new(StringArray::from(vec!["%Y-%m-%d %H:%M:%S"])) as ArrayRef;
         let result = udf.invoke_with_args(make_args_2(strs, fmts)).unwrap();
-        let arr = match result {
-            ColumnarValue::Array(a) => a,
-            _ => panic!("expected array"),
+        let ColumnarValue::Array(arr) = result else {
+            panic!("expected array")
         };
         let ts = arr
             .as_any()
@@ -724,9 +717,8 @@ mod tests {
         let strs = Arc::new(StringArray::from(vec!["2026-02-21T14:30:00Z"])) as ArrayRef;
         let fmts = Arc::new(StringArray::from(vec!["iso8601"])) as ArrayRef;
         let result = udf.invoke_with_args(make_args_2(strs, fmts)).unwrap();
-        let arr = match result {
-            ColumnarValue::Array(a) => a,
-            _ => panic!("expected array"),
+        let ColumnarValue::Array(arr) = result else {
+            panic!("expected array")
         };
         let ts = arr
             .as_any()
@@ -741,9 +733,8 @@ mod tests {
         let strs = Arc::new(StringArray::from(vec!["not-a-timestamp"])) as ArrayRef;
         let fmts = Arc::new(StringArray::from(vec!["%Y-%m-%d %H:%M:%S"])) as ArrayRef;
         let result = udf.invoke_with_args(make_args_2(strs, fmts)).unwrap();
-        let arr = match result {
-            ColumnarValue::Array(a) => a,
-            _ => panic!("expected array"),
+        let ColumnarValue::Array(arr) = result else {
+            panic!("expected array")
         };
         let ts = arr
             .as_any()
@@ -759,9 +750,8 @@ mod tests {
         let udf = ToJsonUdf::new();
         let vals = Arc::new(arrow_array::Int64Array::from(vec![42])) as ArrayRef;
         let result = udf.invoke_with_args(make_args_1(vals)).unwrap();
-        let arr = match result {
-            ColumnarValue::Array(a) => a,
-            _ => panic!("expected array"),
+        let ColumnarValue::Array(arr) = result else {
+            panic!("expected array")
         };
         let str_arr = arr.as_any().downcast_ref::<StringArray>().unwrap();
         assert_eq!(str_arr.value(0), "42");
@@ -772,9 +762,8 @@ mod tests {
         let udf = ToJsonUdf::new();
         let vals = Arc::new(StringArray::from(vec!["hello"])) as ArrayRef;
         let result = udf.invoke_with_args(make_args_1(vals)).unwrap();
-        let arr = match result {
-            ColumnarValue::Array(a) => a,
-            _ => panic!("expected array"),
+        let ColumnarValue::Array(arr) = result else {
+            panic!("expected array")
         };
         let str_arr = arr.as_any().downcast_ref::<StringArray>().unwrap();
         assert_eq!(str_arr.value(0), "\"hello\"");
@@ -785,9 +774,8 @@ mod tests {
         let udf = ToJsonUdf::new();
         let vals = Arc::new(arrow_array::BooleanArray::from(vec![true, false])) as ArrayRef;
         let result = udf.invoke_with_args(make_args_1(vals)).unwrap();
-        let arr = match result {
-            ColumnarValue::Array(a) => a,
-            _ => panic!("expected array"),
+        let ColumnarValue::Array(arr) = result else {
+            panic!("expected array")
         };
         let str_arr = arr.as_any().downcast_ref::<StringArray>().unwrap();
         assert_eq!(str_arr.value(0), "true");
@@ -799,9 +787,8 @@ mod tests {
         let udf = ToJsonUdf::new();
         let vals = Arc::new(arrow_array::Int64Array::from(vec![None::<i64>])) as ArrayRef;
         let result = udf.invoke_with_args(make_args_1(vals)).unwrap();
-        let arr = match result {
-            ColumnarValue::Array(a) => a,
-            _ => panic!("expected array"),
+        let ColumnarValue::Array(arr) = result else {
+            panic!("expected array")
         };
         let str_arr = arr.as_any().downcast_ref::<StringArray>().unwrap();
         assert_eq!(str_arr.value(0), "null");
@@ -814,9 +801,8 @@ mod tests {
         let udf = FromJsonUdf::new();
         let strs = Arc::new(StringArray::from(vec![r#"{"name":"Alice","age":30}"#])) as ArrayRef;
         let result = udf.invoke_with_args(make_args_1(strs)).unwrap();
-        let arr = match result {
-            ColumnarValue::Array(a) => a,
-            _ => panic!("expected array"),
+        let ColumnarValue::Array(arr) = result else {
+            panic!("expected array")
         };
         let bin = arr.as_any().downcast_ref::<LargeBinaryArray>().unwrap();
         assert!(!bin.is_null(0));
@@ -831,9 +817,8 @@ mod tests {
         let udf = FromJsonUdf::new();
         let strs = Arc::new(StringArray::from(vec!["42"])) as ArrayRef;
         let result = udf.invoke_with_args(make_args_1(strs)).unwrap();
-        let arr = match result {
-            ColumnarValue::Array(a) => a,
-            _ => panic!("expected array"),
+        let ColumnarValue::Array(arr) = result else {
+            panic!("expected array")
         };
         let bin = arr.as_any().downcast_ref::<LargeBinaryArray>().unwrap();
         assert_eq!(json_types::jsonb_type_name(bin.value(0)), Some("number"));
@@ -844,9 +829,8 @@ mod tests {
         let udf = FromJsonUdf::new();
         let strs = Arc::new(StringArray::from(vec!["not json {{{"])) as ArrayRef;
         let result = udf.invoke_with_args(make_args_1(strs)).unwrap();
-        let arr = match result {
-            ColumnarValue::Array(a) => a,
-            _ => panic!("expected array"),
+        let ColumnarValue::Array(arr) = result else {
+            panic!("expected array")
         };
         let bin = arr.as_any().downcast_ref::<LargeBinaryArray>().unwrap();
         assert!(bin.is_null(0));
@@ -857,9 +841,8 @@ mod tests {
         let udf = FromJsonUdf::new();
         let strs = Arc::new(StringArray::from(vec![None::<&str>])) as ArrayRef;
         let result = udf.invoke_with_args(make_args_1(strs)).unwrap();
-        let arr = match result {
-            ColumnarValue::Array(a) => a,
-            _ => panic!("expected array"),
+        let ColumnarValue::Array(arr) = result else {
+            panic!("expected array")
         };
         let bin = arr.as_any().downcast_ref::<LargeBinaryArray>().unwrap();
         assert!(bin.is_null(0));
@@ -877,7 +860,7 @@ mod tests {
             ScalarUDF::new_from_impl(ToJsonUdf::new()),
             ScalarUDF::new_from_impl(FromJsonUdf::new()),
         ];
-        let names: Vec<&str> = udfs.iter().map(|u| u.name()).collect();
+        let names: Vec<&str> = udfs.iter().map(datafusion_expr::ScalarUDF::name).collect();
         assert_eq!(
             names,
             &["parse_epoch", "parse_timestamp", "to_json", "from_json"]

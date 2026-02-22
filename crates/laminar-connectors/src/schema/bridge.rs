@@ -253,11 +253,11 @@ mod tests {
 
         let encoder = SerializerEncoder::new(Box::new(JsonSerializer::new()), schema, "json");
 
-        let encoded = encoder.encode_batch(&batch).unwrap();
-        assert_eq!(encoded.len(), 3);
+        let output = encoder.encode_batch(&batch).unwrap();
+        assert_eq!(output.len(), 3);
 
         // Each encoded record should be valid JSON.
-        for bytes in &encoded {
+        for bytes in &output {
             let _: serde_json::Value = serde_json::from_slice(bytes).unwrap();
         }
     }
@@ -281,15 +281,15 @@ mod tests {
 
         let encoder =
             SerializerEncoder::new(Box::new(JsonSerializer::new()), schema.clone(), "json");
-        let encoded = encoder.encode_batch(&batch).unwrap();
+        let output = encoder.encode_batch(&batch).unwrap();
 
         // Decode.
         let decoder = DeserializerDecoder::new(Box::new(JsonDeserializer::new()), schema, "json");
-        let records: Vec<RawRecord> = encoded.into_iter().map(RawRecord::new).collect();
-        let decoded = decoder.decode_batch(&records).unwrap();
+        let records: Vec<RawRecord> = output.into_iter().map(RawRecord::new).collect();
+        let result_batch = decoder.decode_batch(&records).unwrap();
 
-        assert_eq!(decoded.num_rows(), 2);
-        let col = decoded
+        assert_eq!(result_batch.num_rows(), 2);
+        let col = result_batch
             .column(0)
             .as_any()
             .downcast_ref::<Int64Array>()

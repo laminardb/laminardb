@@ -1096,7 +1096,7 @@ mod tests {
             ]),
             vec![
                 Arc::new(StringArray::from(vec!["new"])),
-                Arc::new(Float64Array::from(vec![3.14])),
+                Arc::new(Float64Array::from(vec![3.125])),
             ],
             None,
         )
@@ -1189,10 +1189,10 @@ mod tests {
 
     #[test]
     fn test_register_complex_type_functions() {
+        use datafusion::execution::FunctionRegistry;
+
         let ctx = SessionContext::new();
         register_complex_type_functions(&ctx);
-
-        use datafusion::execution::FunctionRegistry;
         assert!(ctx.udf("struct_extract").is_ok());
         assert!(ctx.udf("struct_set").is_ok());
         assert!(ctx.udf("struct_drop").is_ok());

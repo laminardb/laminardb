@@ -1627,12 +1627,12 @@ mod tests {
     use datafusion_common::config::ConfigOptions;
     use datafusion_expr::ScalarUDF;
 
-    fn enc(v: serde_json::Value) -> Vec<u8> {
-        json_types::encode_jsonb(&v)
+    fn enc(v: &serde_json::Value) -> Vec<u8> {
+        json_types::encode_jsonb(v)
     }
 
     fn make_jsonb_array(vals: &[serde_json::Value]) -> LargeBinaryArray {
-        let encoded: Vec<Vec<u8>> = vals.iter().map(|v| enc(v.clone())).collect();
+        let encoded: Vec<Vec<u8>> = vals.iter().map(enc).collect();
         let refs: Vec<&[u8]> = encoded.iter().map(Vec::as_slice).collect();
         LargeBinaryArray::from_iter_values(refs)
     }
@@ -1672,9 +1672,8 @@ mod tests {
             .invoke_with_args(make_args_2(Arc::new(jsonb), Arc::new(keys)))
             .unwrap();
 
-        let arr = match result {
-            ColumnarValue::Array(a) => a,
-            _ => panic!("expected array"),
+        let ColumnarValue::Array(arr) = result else {
+            panic!("expected array")
         };
         let bin = arr.as_any().downcast_ref::<LargeBinaryArray>().unwrap();
         assert!(!bin.is_null(0));
@@ -1690,9 +1689,8 @@ mod tests {
         let result = udf
             .invoke_with_args(make_args_2(Arc::new(jsonb), Arc::new(keys)))
             .unwrap();
-        let arr = match result {
-            ColumnarValue::Array(a) => a,
-            _ => panic!("expected array"),
+        let ColumnarValue::Array(arr) = result else {
+            panic!("expected array")
         };
         let bin = arr.as_any().downcast_ref::<LargeBinaryArray>().unwrap();
         assert!(bin.is_null(0));
@@ -1708,9 +1706,8 @@ mod tests {
         let result = udf
             .invoke_with_args(make_args_2(Arc::new(jsonb), Arc::new(idxs)))
             .unwrap();
-        let arr = match result {
-            ColumnarValue::Array(a) => a,
-            _ => panic!("expected array"),
+        let ColumnarValue::Array(arr) = result else {
+            panic!("expected array")
         };
         let bin = arr.as_any().downcast_ref::<LargeBinaryArray>().unwrap();
         let val = bin.value(0);
@@ -1725,9 +1722,8 @@ mod tests {
         let result = udf
             .invoke_with_args(make_args_2(Arc::new(jsonb), Arc::new(idxs)))
             .unwrap();
-        let arr = match result {
-            ColumnarValue::Array(a) => a,
-            _ => panic!("expected array"),
+        let ColumnarValue::Array(arr) = result else {
+            panic!("expected array")
         };
         let bin = arr.as_any().downcast_ref::<LargeBinaryArray>().unwrap();
         assert!(bin.is_null(0));
@@ -1743,9 +1739,8 @@ mod tests {
         let result = udf
             .invoke_with_args(make_args_2(Arc::new(jsonb), Arc::new(keys)))
             .unwrap();
-        let arr = match result {
-            ColumnarValue::Array(a) => a,
-            _ => panic!("expected array"),
+        let ColumnarValue::Array(arr) = result else {
+            panic!("expected array")
         };
         let str_arr = arr.as_any().downcast_ref::<StringArray>().unwrap();
         assert_eq!(str_arr.value(0), "Alice");
@@ -1759,9 +1754,8 @@ mod tests {
         let result = udf
             .invoke_with_args(make_args_2(Arc::new(jsonb), Arc::new(keys)))
             .unwrap();
-        let arr = match result {
-            ColumnarValue::Array(a) => a,
-            _ => panic!("expected array"),
+        let ColumnarValue::Array(arr) = result else {
+            panic!("expected array")
         };
         let str_arr = arr.as_any().downcast_ref::<StringArray>().unwrap();
         assert_eq!(str_arr.value(0), "30");
@@ -1777,9 +1771,8 @@ mod tests {
         let result = udf
             .invoke_with_args(make_args_2(Arc::new(jsonb), Arc::new(idxs)))
             .unwrap();
-        let arr = match result {
-            ColumnarValue::Array(a) => a,
-            _ => panic!("expected array"),
+        let ColumnarValue::Array(arr) = result else {
+            panic!("expected array")
         };
         let str_arr = arr.as_any().downcast_ref::<StringArray>().unwrap();
         assert_eq!(str_arr.value(0), "30");
@@ -1795,12 +1788,11 @@ mod tests {
         let result = udf
             .invoke_with_args(make_args_2(Arc::new(jsonb), Arc::new(keys)))
             .unwrap();
-        let arr = match result {
-            ColumnarValue::Array(a) => a,
-            _ => panic!("expected array"),
+        let ColumnarValue::Array(arr) = result else {
+            panic!("expected array")
         };
         let bool_arr = arr.as_any().downcast_ref::<BooleanArray>().unwrap();
-        assert_eq!(bool_arr.value(0), true);
+        assert!(bool_arr.value(0));
     }
 
     #[test]
@@ -1811,12 +1803,11 @@ mod tests {
         let result = udf
             .invoke_with_args(make_args_2(Arc::new(jsonb), Arc::new(keys)))
             .unwrap();
-        let arr = match result {
-            ColumnarValue::Array(a) => a,
-            _ => panic!("expected array"),
+        let ColumnarValue::Array(arr) = result else {
+            panic!("expected array")
         };
         let bool_arr = arr.as_any().downcast_ref::<BooleanArray>().unwrap();
-        assert_eq!(bool_arr.value(0), false);
+        assert!(!bool_arr.value(0));
     }
 
     // ── jsonb_contains tests ─────────────────────────────────
@@ -1829,12 +1820,11 @@ mod tests {
         let result = udf
             .invoke_with_args(make_args_2(Arc::new(left), Arc::new(right)))
             .unwrap();
-        let arr = match result {
-            ColumnarValue::Array(a) => a,
-            _ => panic!("expected array"),
+        let ColumnarValue::Array(arr) = result else {
+            panic!("expected array")
         };
         let bool_arr = arr.as_any().downcast_ref::<BooleanArray>().unwrap();
-        assert_eq!(bool_arr.value(0), true);
+        assert!(bool_arr.value(0));
     }
 
     #[test]
@@ -1845,12 +1835,11 @@ mod tests {
         let result = udf
             .invoke_with_args(make_args_2(Arc::new(left), Arc::new(right)))
             .unwrap();
-        let arr = match result {
-            ColumnarValue::Array(a) => a,
-            _ => panic!("expected array"),
+        let ColumnarValue::Array(arr) = result else {
+            panic!("expected array")
         };
         let bool_arr = arr.as_any().downcast_ref::<BooleanArray>().unwrap();
-        assert_eq!(bool_arr.value(0), false);
+        assert!(!bool_arr.value(0));
     }
 
     // ── jsonb_contained_by tests ─────────────────────────────
@@ -1863,12 +1852,11 @@ mod tests {
         let result = udf
             .invoke_with_args(make_args_2(Arc::new(left), Arc::new(right)))
             .unwrap();
-        let arr = match result {
-            ColumnarValue::Array(a) => a,
-            _ => panic!("expected array"),
+        let ColumnarValue::Array(arr) = result else {
+            panic!("expected array")
         };
         let bool_arr = arr.as_any().downcast_ref::<BooleanArray>().unwrap();
-        assert_eq!(bool_arr.value(0), true);
+        assert!(bool_arr.value(0));
     }
 
     // ── json_typeof tests ────────────────────────────────────
@@ -1885,9 +1873,8 @@ mod tests {
             serde_json::json!(null),
         ]);
         let result = udf.invoke_with_args(make_args_1(Arc::new(jsonb))).unwrap();
-        let arr = match result {
-            ColumnarValue::Array(a) => a,
-            _ => panic!("expected array"),
+        let ColumnarValue::Array(arr) = result else {
+            panic!("expected array")
         };
         let str_arr = arr.as_any().downcast_ref::<StringArray>().unwrap();
         assert_eq!(str_arr.value(0), "object");
@@ -1913,9 +1900,8 @@ mod tests {
             config_options: Arc::new(ConfigOptions::default()),
         };
         let result = udf.invoke_with_args(args).unwrap();
-        let arr = match result {
-            ColumnarValue::Array(a) => a,
-            _ => panic!("expected array"),
+        let ColumnarValue::Array(arr) = result else {
+            panic!("expected array")
         };
         let bin = arr.as_any().downcast_ref::<LargeBinaryArray>().unwrap();
         let val = bin.value(0);
@@ -1953,9 +1939,8 @@ mod tests {
             config_options: Arc::new(ConfigOptions::default()),
         };
         let result = udf.invoke_with_args(args).unwrap();
-        let arr = match result {
-            ColumnarValue::Array(a) => a,
-            _ => panic!("expected array"),
+        let ColumnarValue::Array(arr) = result else {
+            panic!("expected array")
         };
         let bin = arr.as_any().downcast_ref::<LargeBinaryArray>().unwrap();
         let val = bin.value(0);
@@ -1973,9 +1958,8 @@ mod tests {
         let udf = ToJsonb::new();
         let a = Arc::new(arrow_array::Int64Array::from(vec![42])) as ArrayRef;
         let result = udf.invoke_with_args(make_args_1(a)).unwrap();
-        let arr = match result {
-            ColumnarValue::Array(a) => a,
-            _ => panic!("expected array"),
+        let ColumnarValue::Array(arr) = result else {
+            panic!("expected array")
         };
         let bin = arr.as_any().downcast_ref::<LargeBinaryArray>().unwrap();
         let val = bin.value(0);
@@ -1987,9 +1971,8 @@ mod tests {
         let udf = ToJsonb::new();
         let a = Arc::new(make_string_array(&["hello"])) as ArrayRef;
         let result = udf.invoke_with_args(make_args_1(a)).unwrap();
-        let arr = match result {
-            ColumnarValue::Array(a) => a,
-            _ => panic!("expected array"),
+        let ColumnarValue::Array(arr) = result else {
+            panic!("expected array")
         };
         let bin = arr.as_any().downcast_ref::<LargeBinaryArray>().unwrap();
         let val = bin.value(0);
@@ -2045,7 +2028,7 @@ mod tests {
         let data = serde_json::json!({
             "user": {"address": {"city": "London"}}
         });
-        let jsonb_bytes = enc(data);
+        let jsonb_bytes = enc(&data);
 
         // First: get 'user'
         let user = json_types::jsonb_get_field(&jsonb_bytes, "user").unwrap();
@@ -2070,9 +2053,8 @@ mod tests {
         let result = udf
             .invoke_with_args(make_args_2(Arc::new(jsonb), Arc::new(keys)))
             .unwrap();
-        let arr = match result {
-            ColumnarValue::Array(a) => a,
-            _ => panic!("expected array"),
+        let ColumnarValue::Array(arr) = result else {
+            panic!("expected array")
         };
         let bin = arr.as_any().downcast_ref::<LargeBinaryArray>().unwrap();
         assert!(!bin.is_null(0)); // Alice

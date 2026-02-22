@@ -3,21 +3,21 @@
 //! This module implements the foundation of LaminarDB's extensible
 //! connector schema system (F-SCHEMA-001/002/003):
 //!
-//! - **Capability traits** ([`traits`]) — six opt-in traits that connectors
+//! - **Capability traits** (`traits`) — six opt-in traits that connectors
 //!   implement to declare schema capabilities
-//! - **Schema resolver** ([`resolver`]) — five-level priority chain for
+//! - **Schema resolver** (`resolver`) — five-level priority chain for
 //!   determining a source's Arrow schema
-//! - **Format inference** ([`inference`]) — registry of format-specific
+//! - **Format inference** (`inference`) — registry of format-specific
 //!   schema inferencers with built-in JSON, CSV, and raw support
 //! - **Bridge adapters** ([`bridge`]) — adapters between legacy
 //!   [`RecordDeserializer`](crate::serde::RecordDeserializer) /
 //!   [`RecordSerializer`](crate::serde::RecordSerializer) and the new
 //!   `FormatDecoder` / `FormatEncoder` traits
-//! - **JSON format** ([`json`]) — JSON decoder, encoder, and JSONB binary
+//! - **JSON format** (`json`) — JSON decoder, encoder, and JSONB binary
 //!   format (F-SCHEMA-004)
 //! - **CSV format** ([`csv`]) — CSV decoder with DuckDB-style type coercion
 //!   (F-SCHEMA-005)
-//! - **Schema evolution** ([`evolution`]) — diff, evaluate, and apply schema
+//! - **Schema evolution** (`evolution`) — diff, evaluate, and apply schema
 //!   changes with configurable compatibility modes (F-SCHEMA-009)
 //!
 //! # Architecture
