@@ -10,6 +10,8 @@ permissions:
 
 env:
   CARGO_TERM_COLOR: always
+  # Limit parallel compiler jobs to avoid OOM on GitHub Actions runners (7 GB RAM)
+  CARGO_BUILD_JOBS: 2
 
 jobs:
   # ============================================
@@ -114,6 +116,12 @@ jobs:
 
           echo "Workspace version:"
           grep '^version' Cargo.toml
+
+      - name: Set swap space (Linux)
+        if: runner.os == 'Linux'
+        uses: pierotofy/set-swap-space@v1.0
+        with:
+          swap-size-gb: 10
 
       - name: Install system dependencies (Linux native)
         if: runner.os == 'Linux' && !matrix.cross
