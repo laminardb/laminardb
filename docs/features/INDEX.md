@@ -1,21 +1,25 @@
 # Feature Index
 
+> Last updated: 2026-02-22
+
 ## Overview
 
 | Phase | Total | Draft | In Progress | Hardening | Done | Superseded |
 |-------|-------|-------|-------------|-----------|------|------------|
-| Phase 1 | 12 | 0 | 0 | 0 | 12 | 0 |
-| Phase 1.5 | 1 | 0 | 0 | 0 | 1 | 0 |
-| Phase 2 | 38 | 0 | 0 | 0 | 38 | 0 |
-| Phase 2.5 | 12 | 0 | 0 | 0 | 12 | 0 |
-| Phase 3 | 93 | 12 | 0 | 0 | 81 | 0 |
-| Phase 4 | 11 | 11 | 0 | 0 | 0 | 0 |
-| Phase 5 | 10 | 10 | 0 | 0 | 0 | 0 |
-| Phase 6a | 29 | 0 | 0 | 0 | 27 | 2 |
-| Phase 6b | 14 | 0 | 0 | 0 | 14 | 0 |
-| Phase 6c | 10 | 9 | 0 | 0 | 0 | 1 |
+| Phase 1: Core Engine | 12 | 0 | 0 | 0 | 12 | 0 |
+| Phase 1.5: SQL Parser | 1 | 0 | 0 | 0 | 1 | 0 |
+| Phase 2: Production Hardening | 38 | 0 | 0 | 0 | 38 | 0 |
+| Phase 2.5: JIT Compiler | 12 | 0 | 0 | 0 | 12 | 0 |
+| Phase 3: Connectors | 93 | 12 | 0 | 0 | 81 | 0 |
+| Phase 4: Enterprise Security | 11 | 11 | 0 | 0 | 0 | 0 |
+| Phase 5: Admin & Observability | 10 | 10 | 0 | 0 | 0 | 0 |
+| Phase 6a: Partition-Parallel | 29 | 0 | 0 | 0 | 27 | 2 |
+| Phase 6b: Delta Foundation | 14 | 0 | 0 | 0 | 14 | 0 |
+| Phase 6c: Delta Hardening | 10 | 9 | 0 | 0 | 0 | 1 |
 | Perf Optimization | 12 | 12 | 0 | 0 | 0 | 0 |
 | **Total** | **242** | **54** | **0** | **0** | **185** | **3** |
+
+**Completion: 185/242 features (76%).** Phases 1, 1.5, 2, 2.5, and 6b are fully complete. Phases 3 and 6a are nearly complete. Phases 4, 5, 6c, and Perf Optimization are planned with specifications written but no implementation started.
 
 ## Status Legend
 

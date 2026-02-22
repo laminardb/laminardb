@@ -355,4 +355,4 @@ The following patterns are confirmed working in LaminarDB embedded mode (tested 
 
 ---
 
-*This reference is based on LaminarDB v0.1.x with DataFusion 57.x. Contributions and corrections welcome — please open an issue or PR.*
+*This reference is based on LaminarDB v0.15.x with DataFusion 52.x and Arrow 57.x. Contributions and corrections welcome -- please open an issue or PR.*

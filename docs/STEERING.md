@@ -1,69 +1,65 @@
 # Steering Document
 
-> Last Updated: January 2026
+> Last Updated: February 2026
 
 ## Current Focus
 
-**Phase 2 Production Hardening** - ✅ **COMPLETE** (29/29 features)
+**Phase 3 Connectors & Integration** -- 87% complete (81/93 features)
 
-### Sprint Priority: Phase 3 - Connectors & Integration
+### Active Work
 
-Phase 2 Production Hardening is complete with all 29 features implemented.
+Phase 3 is nearly complete. The remaining 12 features are all in Draft status:
 
-**Phase 2 Completed**: F013 (Thread-Per-Core), F014 (SPSC), F015 (CPU Pinning), F016 (Sliding Windows), F017 (Session Windows), F018 (Hopping), F019 (Stream-Stream Joins), F020 (Lookup Joins), F021 (Temporal Joins), F067 (io_uring), F068 (NUMA), F071 (Zero-Alloc), F011B (EMIT Extension), F063 (Changelog/Retraction), F059 (FIRST/LAST), F023 (Exactly-Once Sinks), F022 (Incremental Checkpointing), F062 (Per-Core WAL), F069 (Three-Ring I/O), F070 (Task Budget), F073 (Zero-Alloc Polling), F060 (Cascading MVs), F056 (ASOF Joins), F064 (Per-Partition Watermarks), F065 (Keyed Watermarks), F024 (Two-Phase Commit), F066 (Watermark Alignment Groups), F072 (XDP/eBPF)
+| Feature | Priority | Notes |
+|---------|----------|-------|
+| MongoDB CDC Source (F029) | P2 | Not started |
+| Redis Lookup Table (F030) | P1 | Not started |
+| Delta Lake Recovery (F031B) | P1 | Spec written |
+| Delta Lake Compaction (F031C) | P1 | Spec written |
+| Delta Lake Schema Evolution (F031D) | P1 | Spec written |
+| Iceberg I/O Integration (F032A) | P1 | Blocked by iceberg-datafusion DF 52.0 compat |
+| Parquet File Source (F033) | P2 | Not started |
+| Async State Access (F058) | P2 | Not started |
+| Historical Backfill (F061) | P2 | Not started |
+| Protobuf Format Decoder (F-SCHEMA-008) | P2 | Spec written |
+| WebSocket connector improvements | -- | Recently merged (PR #103) |
+| Schema inference framework | -- | Recently merged (PR #104) |
 
-**Next Priority** (updated based on research reviews):
+### Phase 6 Status
 
-**Thread-Per-Core Optimizations**:
-1. ~~**F071 (Zero-Allocation Enforcement)**~~ - ✅ COMPLETE
-2. ~~**F067 (io_uring Advanced)**~~ - ✅ COMPLETE
-3. ~~**F068 (NUMA-Aware Memory)**~~ - ✅ COMPLETE
-4. ~~**F070 (Task Budget Enforcement)**~~ - ✅ COMPLETE - latency SLA guarantees
-5. ~~**F069 (Three-Ring I/O)**~~ - ✅ COMPLETE - latency/main/poll ring separation
+- **Phase 6a** (Partition-Parallel Embedded): 27/29 features complete (93%)
+- **Phase 6b** (Delta Foundation): 14/14 features complete (100%)
+- **Phase 6c** (Delta Production Hardening): 0/10 features (planned)
 
-**Emit & Checkpoint**:
-6. ~~**F011B (EMIT Clause Extension)**~~ - ✅ COMPLETE - OnWindowClose/Changelog/Final
-7. ~~**F063 (Changelog/Retraction)**~~ - ✅ COMPLETE - Z-set foundation, unblocks F023, F060
-8. ~~**F059 (FIRST/LAST Value Aggregates)**~~ - ✅ COMPLETE - Essential for OHLC, unblocks F060
-9. ~~**F023 (Exactly-Once Sinks)**~~ - ✅ COMPLETE - Transactional + idempotent sinks
-10. ~~**F022 (Incremental Checkpointing)**~~ - ✅ COMPLETE - RocksDB backend, SPSC changelog
-11. ~~**F062 (Per-Core WAL)**~~ - ✅ COMPLETE - lock-free per-core writers, epoch ordering
+### Next Priorities
 
-### Phase 1 Hardening (Complete)
+1. Complete remaining Phase 3 P1 features (Delta Lake advanced, Redis lookup)
+2. Begin Phase 6c server infrastructure (TOML config, engine construction, HTTP API)
+3. Phase 4/5 security and admin features can begin in parallel
 
-Phase 1 features are functionally complete. A comprehensive audit against 2025-2026 best practices identified critical gaps that have been fixed.
+---
 
-#### P0 - Must Fix Before Phase 2
+## Completed Phases
 
-| # | Issue | Feature | Effort | Impact |
-|---|-------|---------|--------|--------|
-| 1 | **WAL uses fsync not fdatasync** | F007 | 1 hour | 50-100μs/sync wasted on metadata |
-| 2 | **No CRC32 checksum in WAL** | F007 | 4 hours | Cannot detect corruption |
-| 3 | **No torn write detection** | F007 | 4 hours | Crash recovery may fail |
-| 4 | **Watermark not persisted in WAL** | F010 | 4 hours | Recovery loses watermark progress |
-| 5 | **No recovery integration test** | F007/F008 | 1 day | Untested critical path |
+### Phase 1: Core Engine -- COMPLETE (12/12)
 
-#### P1 - Early Phase 2
+Reactor, state stores, tumbling windows, DataFusion integration, WAL, checkpointing, event time processing, watermarks, EMIT clause, late data handling.
 
-| # | Issue | Feature | Effort | Status | Impact |
-|---|-------|---------|--------|--------|--------|
-| 6 | Per-core WAL segments | **F062** | 3-5 days | ✅ Done | Required for F013 (thread-per-core) |
-| 7 | Async checkpointing | **F022** | 1-2 weeks | ✅ Done | Blocks Ring 0 currently |
-| 8 | MAP_PRIVATE for checkpoints | F002 | 2-3 days | 📝 Draft | CoW isolation for snapshots |
-| 9 | io_uring integration | F001/F007 | 3-5 days | ✅ Done | Blocking I/O on hot path |
+### Phase 1.5: Production SQL Parser -- COMPLETE (1/1)
 
-**New ADR**: [ADR-004: Checkpoint Strategy](adr/ADR-004-checkpoint-strategy.md) documents the three-tier checkpoint architecture decision.
+129 parser tests covering all streaming SQL extensions.
 
-### Audit Summary
+### Phase 2: Production Hardening -- COMPLETE (38/38)
 
-| Category | Status |
-|----------|--------|
-| Features Audited | 12 |
-| Fully Implemented | 5 |
-| Partial (gaps found) | 6 |
-| Needs Work | 1 |
+Thread-per-core, all window types, all join types, exactly-once sinks, two-phase commit, per-core WAL, incremental checkpointing, NUMA, io_uring, Z-set changelog, cascading MVs, watermark variants, JIT groundwork.
 
-**Full audit report**: All P0 items resolved.
+### Phase 2.5: JIT Compiler -- COMPLETE (12/12)
+
+Cranelift JIT compilation, adaptive compilation warmup, compiled stateful pipeline bridge.
+
+### Phase 6b: Delta Foundation -- COMPLETE (14/14)
+
+Gossip discovery, Raft consensus, partition ownership, distributed checkpoints, gRPC services, cross-node aggregation.
 
 ---
 
@@ -73,79 +69,53 @@ Phase 1 features are functionally complete. A comprehensive audit against 2025-2
 
 | Decision | Choice | Rationale | ADR |
 |----------|--------|-----------|-----|
-| Hash map implementation | FxHashMap | Faster than std HashMap for small keys | ADR-001 |
+| Hash map implementation | AHashMap (Ring 0), FxHashMap (general) | Faster for small keys, DoS-resistant | ADR-001 |
 | Serialization format | rkyv | Zero-copy deserialization, ~1.2ns access | ADR-002 |
 | SQL parser strategy | Extend sqlparser-rs | DataFusion compatible, streaming extensions | ADR-003 |
-| Checkpoint strategy | Three-tier hybrid | Ring 0 changelog, Ring 1 WAL+RocksDB | ADR-004 |
-| Async runtime | tokio (Ring 1 only) | Industry standard, not on hot path | - |
-| WAL format | Custom (keep) | Simpler than RocksDB WAL, add checksums | - |
-
-### Pending
-
-| Decision | Options | Deadline | Owner |
-|----------|---------|----------|-------|
-| io_uring crate | tokio-uring vs io_uring | Phase 2 | TBD |
-| NUMA crate | libc vs numa crate | Phase 2 | TBD |
-| ~~Retraction model~~ | ~~Z-set vs Flink changelog~~ | ~~Phase 2 Week 2~~ | ✅ **Decided: Z-set** (F063) |
-
-**Notes**:
-- Retraction model decided: DBSP/Feldera Z-sets chosen for mathematical foundation. See [F063: Changelog/Retraction](features/phase-2/F063-changelog-retraction.md).
-- io_uring and NUMA implementation details specified in [F067](features/phase-2/F067-io-uring-optimization.md) and [F068](features/phase-2/F068-numa-aware-memory.md) respectively.
-
----
-
-## Blocked Items
-
-| Item | Blocker | Unblock Action |
-|------|---------|----------------|
-| ~~Phase 2 Start~~ | ~~P0 hardening fixes~~ | ✅ Complete - 5 critical items done |
-| Benchmarking | CI setup | Set up benchmark CI |
-| Performance validation | No benchmarks exist | Add criterion benchmarks |
-
----
-
-## Technical Debt
-
-### Critical (P0) - ✅ ALL COMPLETE
-
-- [x] ~~Phase 1 features complete~~
-- [x] ~~WAL durability fixes~~ - fdatasync, CRC32C, torn write detection
-- [x] ~~Watermark persistence~~ - In WAL commits and checkpoint metadata
-- [x] ~~Recovery integration test~~ - 6 comprehensive tests in wal_state_store.rs
-
-### High (P0/P1) - Thread-Per-Core Research Gaps
-
-- [ ] **Zero-allocation enforcement** - See [F071: Zero-Allocation Enforcement](features/phase-2/F071-zero-allocation-enforcement.md)
-- [ ] **io_uring advanced** - See [F067: io_uring Advanced Optimization](features/phase-2/F067-io-uring-optimization.md)
-- [ ] **NUMA awareness** - See [F068: NUMA-Aware Memory Allocation](features/phase-2/F068-numa-aware-memory.md)
-- [ ] **Task budgeting** - See [F070: Task Budget Enforcement](features/phase-2/F070-task-budget-enforcement.md)
-- [ ] **Three-ring I/O** - See [F069: Three-Ring I/O Architecture](features/phase-2/F069-three-ring-io.md)
-
-### High (P1)
-
-- [ ] **Production SQL Parser** - Current F006 is POC only (see ADR-003, F006B spec)
-- [ ] **Async checkpointing** - See [F022: Incremental Checkpointing](features/phase-2/F022-incremental-checkpointing.md)
-- [ ] **Per-core WAL** - See [F062: Per-Core WAL Segments](features/phase-2/F062-per-core-wal.md)
-
-### Medium (P2)
-
-- [ ] Add property-based tests for serialization
-- [ ] Document unsafe blocks in core crate
-- [ ] Add tracing spans for debugging
-- [ ] Prefix scan optimization (currently O(n))
-- [ ] madvise hints for mmap
-- [ ] Huge page support for large state
+| Checkpoint strategy | Three-tier hybrid | Ring 0 changelog, Ring 1 WAL + directory snapshots | ADR-004 |
+| Async runtime | tokio (Ring 1 only) | Industry standard, not on hot path | -- |
+| WAL format | Custom (keep) | Simpler than RocksDB WAL, CRC32C checksums | -- |
+| Retraction model | Z-sets (DBSP/Feldera) | Mathematical foundation for correctness | F063 |
+| Schema trait architecture | Extensible connector traits | Pluggable format decoders, schema inference | ADR-006 |
+| Distributed coordination | openraft + chitchat | Proven Raft for consensus, gossip for discovery | -- |
+| Cache implementation | foyer | S3-FIFO eviction, serde for HybridCache | -- |
+| Secondary indexes | redb | Embedded B-tree, no external dependencies | -- |
+| Concurrent HashMap | papaya | Lock-free, better than dashmap for cross-partition | -- |
 
 ---
 
 ## Performance Validation Status
 
-| Metric | Target | Verified | Action |
-|--------|--------|----------|--------|
-| State lookup | < 500ns | ⚠️ Claimed | Add benchmark |
-| Throughput/core | 500K/sec | ❌ Not tested | Add benchmark |
-| p99 latency | < 10μs | ❌ Not tested | Add histogram |
-| Checkpoint recovery | < 10s | ❌ Not tested | Add benchmark |
+| Metric | Target | Validated | Benchmark |
+|--------|--------|-----------|-----------|
+| State lookup | < 500ns | Benchmarks exist | `state_bench` |
+| Throughput/core | 500K/sec | Benchmarks exist | `throughput_bench` |
+| p99 latency | < 10us | Benchmarks exist | `latency_bench` |
+| Checkpoint recovery | < 10s | Integration tests | `checkpoint_bench` |
+| Window trigger | < 10us | Benchmarks exist | `window_bench` |
+| Join throughput | -- | Benchmarks exist | `join_bench`, `lookup_join_bench` |
+| Cache performance | -- | Benchmarks exist | `cache_bench` |
+| JIT compilation | -- | Benchmarks exist | `compiler_bench` |
+
+17 benchmark suites exist in `laminar-core`, 2 in `laminar-storage`.
+
+---
+
+## Technical Debt
+
+### Resolved (P0)
+
+All Phase 1 P0 issues resolved:
+- WAL durability fixes (fdatasync, CRC32C, torn write detection)
+- Watermark persistence in WAL commits and checkpoint metadata
+- Recovery integration tests (6 comprehensive tests)
+
+### Remaining
+
+- [ ] Phase 4/5 crate stubs are empty (auth, admin, observe) -- implementation planned
+- [ ] Server binary is skeleton only -- Phase 6c will implement
+- [ ] Iceberg I/O integration blocked by iceberg-datafusion compatibility
+- [ ] Performance optimization features (12 identified, all planned)
 
 ---
 
@@ -167,19 +137,17 @@ Phase 1 features are functionally complete. A comprehensive audit against 2025-2
 
 ---
 
-## Upcoming Milestones
+## Milestones
 
 | Milestone | Target Date | Status |
 |-----------|-------------|--------|
-| Phase 1 Features Complete | 2026-01-24 | ✅ Done |
-| Phase 1 P0 Hardening Complete | 2026-01-24 | ✅ Done |
-| Phase 2 Start | 2026-01-24 | ✅ Started (7/28 features complete) |
-| Phase 2 P0 Features | TBD | 🚧 In Progress |
-| First public demo | TBD | 📋 Planned |
-
----
-
-## Communication
-
-- **Weekly**: Update STEERING.md priorities
-- **Phase End**: Full retrospective and planning
+| Phase 1 Complete | 2026-01-24 | Done |
+| Phase 1 P0 Hardening | 2026-01-24 | Done |
+| Phase 2 Complete | 2026-01-31 | Done |
+| Phase 2.5 JIT Complete | 2026-02-03 | Done |
+| Phase 6a/6b Complete | 2026-02-15 | Done (6b), 93% (6a) |
+| Phase 3 Complete | TBD | 87% |
+| Phase 6c Server | TBD | Planned |
+| Phase 4 Security | TBD | Planned |
+| Phase 5 Admin | TBD | Planned |
+| First public release | TBD | Planned |

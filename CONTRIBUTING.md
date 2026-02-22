@@ -99,7 +99,7 @@ cargo test --all
 cargo test -p laminar-core
 
 # With feature flags
-cargo test --all --features kafka,postgres-cdc,mysql-cdc,rocksdb
+cargo test --all --features kafka,postgres-cdc,mysql-cdc,delta-lake
 
 # Run benchmarks
 cargo bench
@@ -115,15 +115,21 @@ Many features are optional to keep compile times manageable:
 | Flag | Crate | Purpose |
 |------|-------|---------|
 | `jit` | laminar-core, laminar-db | Cranelift JIT compilation |
-| `kafka` | laminar-connectors | Kafka source/sink, Avro serde |
-| `postgres-cdc` | laminar-connectors | PostgreSQL CDC source |
-| `postgres-sink` | laminar-connectors | PostgreSQL sink |
+| `kafka` | laminar-connectors, laminar-db | Kafka source/sink, Avro serde |
+| `postgres-cdc` | laminar-connectors, laminar-db | PostgreSQL CDC source |
+| `postgres-sink` | laminar-connectors, laminar-db | PostgreSQL sink |
 | `mysql-cdc` | laminar-connectors | MySQL CDC source |
-| `rocksdb` | laminar-storage, laminar-db | RocksDB-backed state store |
-| `delta-lake` | laminar-connectors | Delta Lake sink |
+| `delta-lake` | laminar-connectors, laminar-db | Delta Lake sink and source |
+| `delta-lake-s3` | laminar-connectors | S3 storage backend for Delta Lake |
+| `websocket` | laminar-connectors | WebSocket source and sink |
 | `ffi` | laminar-db | C FFI layer |
+| `api` | laminar-db | FFI-friendly API module |
+| `delta` | laminar-core, laminar-db | Distributed delta mode |
 | `allocation-tracking` | laminar-core | Panic on hot-path allocation |
 | `io-uring` | laminar-core | Linux io_uring integration |
+| `hwloc` | laminar-core | Enhanced NUMA topology |
+| `xdp` | laminar-core | Linux eBPF/XDP |
+| `parquet-lookup` | laminar-connectors | Parquet file lookup source |
 
 ## Pull Request Process
 

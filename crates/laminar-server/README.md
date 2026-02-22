@@ -2,38 +2,43 @@
 
 Standalone server binary for LaminarDB.
 
-## Overview
+## Status: Skeleton
 
-Provides the `laminardb` binary that runs LaminarDB as a standalone server process. Combines all crates (core, SQL, storage, connectors, auth, admin, observe) into a single deployable binary.
+The server binary exists with CLI argument parsing and logging initialization, but the core server logic (configuration loading, reactor initialization, admin API mounting) is not yet implemented. The `main.rs` contains TODO comments for Phase 5 features.
+
+## What Works
+
+- CLI argument parsing via clap (`--config`, `--log-level`, `--admin-bind`)
+- Tracing/logging initialization via tracing-subscriber
+- Prints version and config file path
+
+## What is Planned (Phase 6c)
+
+- **TOML Configuration** (F-SERVER-001) -- Load pipeline definitions from TOML
+- **Engine Construction** (F-SERVER-002) -- Initialize reactor from config
+- **HTTP API** (F-SERVER-003) -- Admin and query endpoints
+- **Hot Reload** (F-SERVER-004) -- Reload config without restart
+- **Delta Server Mode** (F-SERVER-005) -- Multi-node distributed operation
+- **Graceful Rolling Restart** (F-SERVER-006) -- Zero-downtime upgrades
 
 ## Running
 
 ```bash
-# Build and run
+# Build and run (currently just prints startup info)
 cargo run --release --bin laminardb
 
 # With configuration file
 cargo run --release --bin laminardb -- --config config.toml
+
+# Custom log level and bind address
+cargo run --release --bin laminardb -- --log-level debug --admin-bind 0.0.0.0:8080
 ```
-
-## Configuration
-
-Configuration is loaded from (in order of precedence):
-1. CLI arguments (via clap)
-2. Environment variables
-3. Configuration file (TOML)
-4. Default values
-
-## Binary
-
-- **Name**: `laminardb`
-- **Entry point**: `src/main.rs`
 
 ## Related Crates
 
-This crate depends on all other LaminarDB crates and serves as the integration point:
+This crate will depend on all other LaminarDB crates and serve as the integration point:
 
 - [`laminar-db`](../laminar-db) -- Database facade
-- [`laminar-admin`](../laminar-admin) -- REST API
-- [`laminar-observe`](../laminar-observe) -- Metrics and health endpoints
-- [`laminar-auth`](../laminar-auth) -- Authentication
+- [`laminar-admin`](../laminar-admin) -- REST API (planned)
+- [`laminar-observe`](../laminar-observe) -- Metrics and health endpoints (planned)
+- [`laminar-auth`](../laminar-auth) -- Authentication (planned)
