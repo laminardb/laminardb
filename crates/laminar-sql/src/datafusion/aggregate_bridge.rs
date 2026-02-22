@@ -279,6 +279,19 @@ impl DataFusionAggregateFactory {
         self.udf.name()
     }
 
+    /// Pre-defined column names to avoid `format!()` per accumulator creation.
+    const COL_NAMES: [&str; 8] = [
+        "col_0", "col_1", "col_2", "col_3", "col_4", "col_5", "col_6", "col_7",
+    ];
+
+    /// Returns a cached column name for the given index.
+    fn col_name(i: usize) -> &'static str {
+        Self::COL_NAMES
+            .get(i)
+            .copied()
+            .unwrap_or("col_n")
+    }
+
     /// Creates a DataFusion accumulator from the UDF.
     fn create_df_accumulator(&self) -> Box<dyn datafusion_expr::Accumulator> {
         let return_type = self
@@ -290,14 +303,14 @@ impl DataFusionAggregateFactory {
             self.input_types
                 .iter()
                 .enumerate()
-                .map(|(i, dt)| Field::new(format!("col_{i}"), dt.clone(), true))
+                .map(|(i, dt)| Field::new(Self::col_name(i), dt.clone(), true))
                 .collect::<Vec<_>>(),
         );
         let expr_fields: Vec<FieldRef> = self
             .input_types
             .iter()
             .enumerate()
-            .map(|(i, dt)| Arc::new(Field::new(format!("col_{i}"), dt.clone(), true)) as FieldRef)
+            .map(|(i, dt)| Arc::new(Field::new(Self::col_name(i), dt.clone(), true)) as FieldRef)
             .collect();
         let args = AccumulatorArgs {
             return_field,

@@ -9,7 +9,6 @@
 //! - DELETE → weight -1 (retracted row)
 //! - UPDATE → weight -1 (old row) + weight +1 (new row)
 
-use std::collections::HashMap;
 use std::sync::Arc;
 
 use arrow_array::builder::{Int64Builder, StringBuilder, UInt64Builder};
@@ -64,25 +63,61 @@ pub struct ChangeEvent {
 ///
 /// Produces a flat JSON object like `{"id": "42", "name": "Alice"}`.
 /// All values are serialized as strings (matching `pgoutput` text format).
+///
+/// Writes JSON directly to a `String` buffer instead of building an
+/// intermediate `HashMap`, avoiding per-row map + key/value cloning.
 #[must_use]
 pub fn tuple_to_json(tuple: &TupleData, relation: &RelationInfo) -> String {
-    let mut map = HashMap::new();
+    let mut buf = String::with_capacity(128);
+    buf.push('{');
+    let mut first = true;
     for (i, col_val) in tuple.columns.iter().enumerate() {
         if let Some(col_info) = relation.columns.get(i) {
-            match col_val {
-                ColumnValue::Text(s) => {
-                    map.insert(col_info.name.clone(), serde_json::Value::String(s.clone()));
+            let val = match col_val {
+                ColumnValue::Text(s) => Some(s.as_str()),
+                ColumnValue::Null => None,
+                ColumnValue::Unchanged => continue,
+            };
+            if !first {
+                buf.push(',');
+            }
+            first = false;
+            // Write key (escape quotes in column names)
+            buf.push('"');
+            escape_json_str(&col_info.name, &mut buf);
+            buf.push('"');
+            buf.push(':');
+            // Write value
+            match val {
+                Some(s) => {
+                    buf.push('"');
+                    escape_json_str(s, &mut buf);
+                    buf.push('"');
                 }
-                ColumnValue::Null => {
-                    map.insert(col_info.name.clone(), serde_json::Value::Null);
-                }
-                ColumnValue::Unchanged => {
-                    // Unchanged TOAST values are omitted from the JSON
-                }
+                None => buf.push_str("null"),
             }
         }
     }
-    serde_json::to_string(&map).unwrap_or_else(|_| "{}".to_string())
+    buf.push('}');
+    buf
+}
+
+/// Escapes a string for JSON output (quotes and control characters).
+fn escape_json_str(s: &str, buf: &mut String) {
+    for ch in s.chars() {
+        match ch {
+            '"' => buf.push_str("\\\""),
+            '\\' => buf.push_str("\\\\"),
+            '\n' => buf.push_str("\\n"),
+            '\r' => buf.push_str("\\r"),
+            '\t' => buf.push_str("\\t"),
+            c if c.is_control() => {
+                use std::fmt::Write;
+                let _ = write!(buf, "\\u{:04x}", c as u32);
+            }
+            c => buf.push(c),
+        }
+    }
 }
 
 /// Converts a batch of [`ChangeEvent`]s into an Arrow [`RecordBatch`]
