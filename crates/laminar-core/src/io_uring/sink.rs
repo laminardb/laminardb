@@ -24,7 +24,7 @@ mod linux_impl {
     use std::path::{Path, PathBuf};
 
     use crate::io_uring::{CoreRingManager, IoUringConfig, IoUringError};
-    use crate::operator::{CheckpointCompleteData, Output, SideOutputData};
+    use crate::operator::Output;
     use crate::reactor::{Sink, SinkError};
 
     /// `io_uring`-backed sink for file output.
@@ -170,8 +170,8 @@ mod linux_impl {
                     format!("LATE_EVENT ts={}\n", event.timestamp).into_bytes()
                 }
                 Output::SideOutput(data) => {
-                    let SideOutputData { name, event } = *data;
-                    format!("SIDE_OUTPUT name={} ts={}\n", name, event.timestamp).into_bytes()
+                    format!("SIDE_OUTPUT name={} ts={}\n", data.name, data.event.timestamp)
+                        .into_bytes()
                 }
                 Output::Changelog(record) => {
                     format!("CHANGELOG op={:?}\n", record.operation).into_bytes()
