@@ -2,18 +2,30 @@
 
 Authentication and authorization for LaminarDB.
 
-## Overview
+## Status: Planned (Phase 4)
 
-Ring 2 crate providing security infrastructure. Handles JWT-based authentication and policy-based authorization (RBAC and ABAC).
+This crate exists as a workspace member with module stubs, but **no implementation exists yet**. The source files (`authn.rs`, `authz.rs`, `rls.rs`) contain only module-level doc comments.
 
-## Key Components
+Implementation is planned for Phase 4 (Enterprise & Security). See the [Feature Index](../../docs/features/INDEX.md) for details on features F035-F045.
 
-- **JWT Authentication** -- Token validation and claims extraction via `jsonwebtoken`
-- **RBAC** -- Role-based access control with role hierarchies
-- **ABAC** -- Attribute-based access control with policy evaluation
-- **Row-Level Security** -- Per-user data filtering (planned)
+## Planned Components
+
+- **JWT Authentication** (F036) -- Token validation and claims extraction
+- **mTLS Authentication** (F037) -- Mutual TLS client certificate auth
+- **LDAP Integration** (F038) -- Directory-based authentication
+- **RBAC** (F039) -- Role-based access control with role hierarchies
+- **ABAC** (F040) -- Attribute-based access control with policy evaluation
+- **Row-Level Security** (F041) -- Per-user data filtering
+- **Column-Level Security** (F042) -- Per-user column masking
+- **Audit Logging** (F043) -- Tamper-evident audit trail
+- **Encryption at Rest** (F044) -- State store and WAL encryption
+- **Key Management** (F045) -- Key rotation and vault integration
+
+## Architecture
+
+This crate operates in **Ring 2 (Control Plane)** with no latency requirements.
 
 ## Related Crates
 
-- [`laminar-admin`](../laminar-admin) -- REST API that uses auth for endpoint protection
-- [`laminar-server`](../laminar-server) -- Server binary that configures auth
+- [`laminar-admin`](../laminar-admin) -- REST API that will use auth for endpoint protection
+- [`laminar-server`](../laminar-server) -- Server binary that will configure auth

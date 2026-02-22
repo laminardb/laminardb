@@ -2,17 +2,25 @@
 
 Administration interface for LaminarDB.
 
-## Overview
+## Status: Planned (Phase 5)
 
-Ring 2 crate providing a REST API for pipeline management, built on Axum with auto-generated OpenAPI documentation via utoipa/Swagger UI.
+This crate exists as a workspace member with module stubs, but **no implementation exists yet**. The source files (`api.rs`, `dashboard.rs`, `cli.rs`) contain only module-level doc comments.
 
-## Key Components
+Implementation is planned for Phase 5 (Admin & Observability). See the [Feature Index](../../docs/features/INDEX.md) for details on features F046-F055.
 
-- **REST API** -- Pipeline management endpoints (Axum 0.8)
-- **Swagger UI** -- Interactive API documentation (utoipa-swagger-ui)
+## Planned Components
+
+- **Admin REST API** (F046) -- Pipeline management endpoints via Axum
+- **Web Dashboard** (F047) -- Browser-based admin dashboard
+- **SQL Query Console** (F049) -- Interactive SQL console
+- **CLI Tools** (F055) -- Command-line administration
+
+## Architecture
+
+This crate operates in **Ring 2 (Control Plane)** with no latency requirements.
 
 ## Related Crates
 
 - [`laminar-auth`](../laminar-auth) -- Authentication and authorization
 - [`laminar-observe`](../laminar-observe) -- Metrics and health endpoints
-- [`laminar-server`](../laminar-server) -- Server binary that mounts the admin API
+- [`laminar-server`](../laminar-server) -- Server binary that will mount the admin API
