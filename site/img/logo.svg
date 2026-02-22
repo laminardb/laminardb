@@ -1,0 +1,28 @@
+<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 200 40">
+  <defs>
+    <linearGradient id="flow-grad" x1="0" y1="0" x2="1" y2="1">
+      <stop offset="0%" stop-color="#06b6d4"/>
+      <stop offset="100%" stop-color="#8b5cf6"/>
+    </linearGradient>
+    <linearGradient id="flow-grad-2" x1="0" y1="0" x2="1" y2="0">
+      <stop offset="0%" stop-color="#06b6d4"/>
+      <stop offset="50%" stop-color="#7c3aed"/>
+      <stop offset="100%" stop-color="#8b5cf6"/>
+    </linearGradient>
+  </defs>
+  <!-- Icon: parallel flowing streams -->
+  <g>
+    <!-- Stream 1 (top) -->
+    <path d="M4 8 C12 8, 14 6, 22 6 C30 6, 32 10, 36 10" stroke="url(#flow-grad)" stroke-width="2.5" fill="none" stroke-linecap="round" opacity="0.5"/>
+    <!-- Stream 2 -->
+    <path d="M2 14 C10 14, 14 11, 22 11 C30 11, 32 15, 38 15" stroke="url(#flow-grad)" stroke-width="2.5" fill="none" stroke-linecap="round" opacity="0.7"/>
+    <!-- Stream 3 (center, brightest) -->
+    <path d="M0 20 C8 20, 14 17, 22 17 C30 17, 32 21, 40 21" stroke="url(#flow-grad)" stroke-width="3" fill="none" stroke-linecap="round" opacity="1"/>
+    <!-- Stream 4 -->
+    <path d="M2 26 C10 26, 14 23, 22 23 C30 23, 32 27, 38 27" stroke="url(#flow-grad)" stroke-width="2.5" fill="none" stroke-linecap="round" opacity="0.7"/>
+    <!-- Stream 5 (bottom) -->
+    <path d="M4 32 C12 32, 14 30, 22 30 C30 30, 32 34, 36 34" stroke="url(#flow-grad)" stroke-width="2.5" fill="none" stroke-linecap="round" opacity="0.5"/>
+  </g>
+  <!-- Wordmark -->
+  <text x="48" y="27" font-family="Inter, -apple-system, BlinkMacSystemFont, sans-serif" font-size="22" font-weight="700" fill="#f1f5f9" letter-spacing="-0.5">Laminar<tspan fill="url(#flow-grad-2)">DB</tspan></text>
+</svg>
