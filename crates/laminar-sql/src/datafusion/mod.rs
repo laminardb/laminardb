@@ -145,11 +145,35 @@ use std::sync::Arc;
 use datafusion::prelude::*;
 use datafusion_expr::ScalarUDF;
 
+/// Returns a base `SessionConfig` with identifier normalization disabled.
+///
+/// DataFusion's default behaviour lowercases all unquoted SQL identifiers
+/// (per the SQL standard). LaminarDB disables this so that mixed-case
+/// column names from external sources (Kafka, CDC, WebSocket) can be
+/// referenced without double-quoting.
+#[must_use]
+pub fn base_session_config() -> SessionConfig {
+    let mut config = SessionConfig::new();
+    config.options_mut().sql_parser.enable_ident_normalization = false;
+    config
+}
+
+/// Creates a `DataFusion` session context with identifier normalization
+/// disabled.
+///
+/// Suitable for ad-hoc / non-streaming queries (filters, lookups).
+/// For streaming workloads prefer [`create_streaming_context`].
+#[must_use]
+pub fn create_session_context() -> SessionContext {
+    SessionContext::new_with_config(base_session_config())
+}
+
 /// Creates a `DataFusion` session context configured for streaming queries.
 ///
 /// The context is configured with:
 /// - Batch size of 8192 (balanced for streaming throughput)
 /// - Single partition (streaming sources are typically not partitioned)
+/// - Identifier normalization disabled (mixed-case columns work unquoted)
 /// - All streaming UDFs registered (TUMBLE, HOP, SESSION, WATERMARK)
 ///
 /// The watermark UDF is initialized with no watermark set (returns NULL).
@@ -165,7 +189,7 @@ use datafusion_expr::ScalarUDF;
 /// ```
 #[must_use]
 pub fn create_streaming_context() -> SessionContext {
-    let config = SessionConfig::new()
+    let config = base_session_config()
         .with_batch_size(8192)
         .with_target_partitions(1); // Single partition for streaming
 
@@ -500,7 +524,7 @@ mod tests {
     fn test_streaming_functions_with_watermark() {
         use std::sync::atomic::AtomicI64;
 
-        let ctx = SessionContext::new();
+        let ctx = create_session_context();
         let wm = Arc::new(AtomicI64::new(42_000));
         register_streaming_functions_with_watermark(&ctx, wm);
 
@@ -660,7 +684,7 @@ mod tests {
         use std::sync::atomic::AtomicI64;
 
         // Create context with a specific watermark value
-        let config = SessionConfig::new()
+        let config = base_session_config()
             .with_batch_size(8192)
             .with_target_partitions(1);
         let ctx = SessionContext::new_with_config(config);

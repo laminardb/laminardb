@@ -6,10 +6,10 @@
 
 use std::sync::Arc;
 
+use crate::datafusion::create_session_context;
 use arrow_array::RecordBatch;
 use arrow_schema::SchemaRef;
 use datafusion::datasource::MemTable;
-use datafusion::prelude::SessionContext;
 
 /// Configuration for a post-aggregation HAVING filter.
 #[derive(Debug, Clone)]
@@ -51,7 +51,7 @@ impl HavingFilterConfig {
         let schema = batch.schema();
 
         // Register the batch as a temporary MemTable so column names resolve
-        let ctx = SessionContext::new();
+        let ctx = create_session_context();
         let mem_table = MemTable::try_new(schema.clone(), vec![vec![batch.clone()]])
             .map_err(|e| HavingFilterError::SchemaError(e.to_string()))?;
         ctx.register_table("_having_input", Arc::new(mem_table))

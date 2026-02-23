@@ -296,6 +296,7 @@ impl fmt::Display for crate::parser::lookup_table::PushdownMode {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::datafusion::create_session_context;
     use crate::parser::lookup_table::{
         ByteSize, ConnectorType, LookupStrategy, LookupTableProperties, PushdownMode,
     };
@@ -348,7 +349,7 @@ mod tests {
 
     #[tokio::test]
     async fn test_rewrite_join_on_lookup_table() {
-        let ctx = SessionContext::new();
+        let ctx = create_session_context();
         register_test_tables(&ctx);
 
         let plan = ctx
@@ -373,7 +374,7 @@ mod tests {
 
     #[tokio::test]
     async fn test_non_lookup_join_not_rewritten() {
-        let ctx = SessionContext::new();
+        let ctx = create_session_context();
         // Register both as regular tables (neither is a lookup table)
         let schema_a = Arc::new(Schema::new(vec![Field::new("id", DataType::Int64, false)]));
         let schema_b = Arc::new(Schema::new(vec![Field::new(
@@ -404,7 +405,7 @@ mod tests {
 
     #[tokio::test]
     async fn test_left_outer_produces_left_outer_type() {
-        let ctx = SessionContext::new();
+        let ctx = create_session_context();
         register_test_tables(&ctx);
 
         let plan = ctx

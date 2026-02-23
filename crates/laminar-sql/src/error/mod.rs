@@ -16,7 +16,7 @@
 
 pub mod suggest;
 
-use suggest::closest_match;
+use suggest::{closest_match, resolve_column_name};
 
 /// Structured error code constants.
 pub mod codes {
@@ -171,7 +171,18 @@ pub fn translate_datafusion_error_with_context(
 
     // Column not found
     if let Some(col) = extract_missing_column(clean) {
-        let hint = available_columns.and_then(|cols| suggest_column(col, cols));
+        let hint = available_columns.and_then(|cols| match resolve_column_name(col, cols) {
+            Ok(actual) if actual != col => Some(format!(
+                "Column is named '{actual}' (case differs). \
+                         Use \"{actual}\" or match the exact casing."
+            )),
+            Err(suggest::ColumnResolveError::Ambiguous { matches, .. }) => Some(format!(
+                "Multiple columns match case-insensitively: {}. \
+                         Use double quotes for exact match.",
+                matches.join(", ")
+            )),
+            _ => suggest_column(col, cols),
+        });
         return TranslatedError {
             code: codes::COLUMN_NOT_FOUND,
             message: format!("Column '{col}' not found in query"),
@@ -575,6 +586,33 @@ mod tests {
         let t = translate_datafusion_error("No field named 'foo'");
         assert_eq!(t.code, codes::COLUMN_NOT_FOUND);
         assert!(t.hint.is_none()); // no columns provided
+    }
+
+    #[test]
+    fn test_column_not_found_case_insensitive_hint() {
+        let cols = &["tradeId", "symbol", "lastPrice"];
+        let t = translate_datafusion_error_with_context("No field named 'tradeid'", Some(cols));
+        assert_eq!(t.code, codes::COLUMN_NOT_FOUND);
+        assert!(t.hint.is_some());
+        let hint = t.hint.unwrap();
+        assert!(
+            hint.contains("tradeId"),
+            "hint should mention actual name: {hint}"
+        );
+        assert!(hint.contains("case"), "hint should mention case: {hint}");
+    }
+
+    #[test]
+    fn test_column_not_found_ambiguous_case_hint() {
+        let cols = &["price", "Price", "PRICE"];
+        let t = translate_datafusion_error_with_context("No field named 'pRiCe'", Some(cols));
+        assert_eq!(t.code, codes::COLUMN_NOT_FOUND);
+        assert!(t.hint.is_some());
+        let hint = t.hint.unwrap();
+        assert!(
+            hint.contains("Multiple"),
+            "hint should mention ambiguity: {hint}"
+        );
     }
 
     // -- window error code tests --

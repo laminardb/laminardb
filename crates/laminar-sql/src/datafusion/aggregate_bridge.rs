@@ -391,8 +391,8 @@ pub fn create_aggregate_factory(
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::datafusion::create_session_context;
     use arrow_array::{Float64Array, Int64Array, RecordBatch};
-    use datafusion::prelude::SessionContext;
 
     fn float_event(ts: i64, values: Vec<f64>) -> Event {
         let schema = Arc::new(Schema::new(vec![Field::new(
@@ -548,7 +548,7 @@ mod tests {
 
     #[test]
     fn test_factory_count() {
-        let ctx = SessionContext::new();
+        let ctx = create_session_context();
         let factory = create_aggregate_factory(&ctx, "count", vec![0], vec![DataType::Int64]);
         assert!(factory.is_some(), "count should be a recognized aggregate");
         assert_eq!(factory.unwrap().name(), "count");
@@ -556,7 +556,7 @@ mod tests {
 
     #[test]
     fn test_factory_sum() {
-        let ctx = SessionContext::new();
+        let ctx = create_session_context();
         let factory = create_aggregate_factory(&ctx, "sum", vec![0], vec![DataType::Float64]);
         assert!(factory.is_some());
         assert_eq!(factory.unwrap().name(), "sum");
@@ -564,14 +564,14 @@ mod tests {
 
     #[test]
     fn test_factory_avg() {
-        let ctx = SessionContext::new();
+        let ctx = create_session_context();
         let factory = create_aggregate_factory(&ctx, "avg", vec![0], vec![DataType::Float64]);
         assert!(factory.is_some());
     }
 
     #[test]
     fn test_factory_stddev() {
-        let ctx = SessionContext::new();
+        let ctx = create_session_context();
         let factory = create_aggregate_factory(&ctx, "stddev", vec![0], vec![DataType::Float64]);
         assert!(
             factory.is_some(),
@@ -581,7 +581,7 @@ mod tests {
 
     #[test]
     fn test_factory_unknown() {
-        let ctx = SessionContext::new();
+        let ctx = create_session_context();
         let factory = create_aggregate_factory(
             &ctx,
             "nonexistent_aggregate_xyz",
@@ -593,7 +593,7 @@ mod tests {
 
     #[test]
     fn test_factory_result_field() {
-        let ctx = SessionContext::new();
+        let ctx = create_session_context();
         let factory =
             create_aggregate_factory(&ctx, "sum", vec![0], vec![DataType::Float64]).unwrap();
         let field = factory.result_field();
@@ -603,7 +603,7 @@ mod tests {
 
     #[test]
     fn test_factory_clone_box() {
-        let ctx = SessionContext::new();
+        let ctx = create_session_context();
         let factory =
             create_aggregate_factory(&ctx, "count", vec![0], vec![DataType::Int64]).unwrap();
         let cloned = factory.clone_box();
@@ -614,7 +614,7 @@ mod tests {
 
     #[test]
     fn test_adapter_count_basic() {
-        let ctx = SessionContext::new();
+        let ctx = create_session_context();
         let factory =
             create_aggregate_factory(&ctx, "count", vec![0], vec![DataType::Int64]).unwrap();
         let mut acc = factory.create_accumulator();
@@ -642,7 +642,7 @@ mod tests {
 
     #[test]
     fn test_adapter_sum_float64() {
-        let ctx = SessionContext::new();
+        let ctx = create_session_context();
         let factory =
             create_aggregate_factory(&ctx, "sum", vec![0], vec![DataType::Float64]).unwrap();
         let mut acc = factory.create_accumulator();
@@ -653,7 +653,7 @@ mod tests {
 
     #[test]
     fn test_adapter_avg_float64() {
-        let ctx = SessionContext::new();
+        let ctx = create_session_context();
         let factory =
             create_aggregate_factory(&ctx, "avg", vec![0], vec![DataType::Float64]).unwrap();
         let mut acc = factory.create_accumulator();
@@ -664,7 +664,7 @@ mod tests {
 
     #[test]
     fn test_adapter_min_float64() {
-        let ctx = SessionContext::new();
+        let ctx = create_session_context();
         let factory =
             create_aggregate_factory(&ctx, "min", vec![0], vec![DataType::Float64]).unwrap();
         let mut acc = factory.create_accumulator();
@@ -675,7 +675,7 @@ mod tests {
 
     #[test]
     fn test_adapter_max_float64() {
-        let ctx = SessionContext::new();
+        let ctx = create_session_context();
         let factory =
             create_aggregate_factory(&ctx, "max", vec![0], vec![DataType::Float64]).unwrap();
         let mut acc = factory.create_accumulator();
@@ -686,7 +686,7 @@ mod tests {
 
     #[test]
     fn test_adapter_sum_int64() {
-        let ctx = SessionContext::new();
+        let ctx = create_session_context();
         let factory =
             create_aggregate_factory(&ctx, "sum", vec![0], vec![DataType::Int64]).unwrap();
         let mut acc = factory.create_accumulator();
@@ -697,7 +697,7 @@ mod tests {
 
     #[test]
     fn test_adapter_type_tag() {
-        let ctx = SessionContext::new();
+        let ctx = create_session_context();
         let factory =
             create_aggregate_factory(&ctx, "sum", vec![0], vec![DataType::Float64]).unwrap();
         let acc = factory.create_accumulator();
@@ -706,7 +706,7 @@ mod tests {
 
     #[test]
     fn test_adapter_result_field() {
-        let ctx = SessionContext::new();
+        let ctx = create_session_context();
         let factory =
             create_aggregate_factory(&ctx, "sum", vec![0], vec![DataType::Float64]).unwrap();
         let mut acc = factory.create_accumulator();
@@ -718,7 +718,7 @@ mod tests {
 
     #[test]
     fn test_adapter_merge_sum() {
-        let ctx = SessionContext::new();
+        let ctx = create_session_context();
         let factory =
             create_aggregate_factory(&ctx, "sum", vec![0], vec![DataType::Float64]).unwrap();
 
@@ -734,7 +734,7 @@ mod tests {
 
     #[test]
     fn test_adapter_merge_count() {
-        let ctx = SessionContext::new();
+        let ctx = create_session_context();
         let factory =
             create_aggregate_factory(&ctx, "count", vec![0], vec![DataType::Int64]).unwrap();
 
@@ -754,7 +754,7 @@ mod tests {
 
     #[test]
     fn test_adapter_merge_avg() {
-        let ctx = SessionContext::new();
+        let ctx = create_session_context();
         let factory =
             create_aggregate_factory(&ctx, "avg", vec![0], vec![DataType::Float64]).unwrap();
 
@@ -770,7 +770,7 @@ mod tests {
 
     #[test]
     fn test_adapter_merge_empty() {
-        let ctx = SessionContext::new();
+        let ctx = create_session_context();
         let factory =
             create_aggregate_factory(&ctx, "sum", vec![0], vec![DataType::Float64]).unwrap();
 
@@ -786,7 +786,7 @@ mod tests {
 
     #[test]
     fn test_adapter_stddev() {
-        let ctx = SessionContext::new();
+        let ctx = create_session_context();
         let factory =
             create_aggregate_factory(&ctx, "stddev", vec![0], vec![DataType::Float64]).unwrap();
         let mut acc = factory.create_accumulator();
@@ -805,7 +805,7 @@ mod tests {
 
     #[test]
     fn test_adapter_variance() {
-        let ctx = SessionContext::new();
+        let ctx = create_session_context();
         if let Some(factory) =
             create_aggregate_factory(&ctx, "var_samp", vec![0], vec![DataType::Float64])
         {
@@ -822,7 +822,7 @@ mod tests {
 
     #[test]
     fn test_adapter_median() {
-        let ctx = SessionContext::new();
+        let ctx = create_session_context();
         if let Some(factory) =
             create_aggregate_factory(&ctx, "median", vec![0], vec![DataType::Float64])
         {
@@ -836,7 +836,7 @@ mod tests {
 
     #[test]
     fn test_adapter_serialize() {
-        let ctx = SessionContext::new();
+        let ctx = create_session_context();
         let factory =
             create_aggregate_factory(&ctx, "sum", vec![0], vec![DataType::Float64]).unwrap();
         let mut acc = factory.create_accumulator();
@@ -846,7 +846,7 @@ mod tests {
 
     #[test]
     fn test_adapter_serialize_empty() {
-        let ctx = SessionContext::new();
+        let ctx = create_session_context();
         let factory =
             create_aggregate_factory(&ctx, "sum", vec![0], vec![DataType::Float64]).unwrap();
         let acc = factory.create_accumulator();
@@ -857,7 +857,7 @@ mod tests {
 
     #[test]
     fn test_lookup_common_aggregates() {
-        let ctx = SessionContext::new();
+        let ctx = create_session_context();
         for name in &["count", "sum", "min", "max", "avg"] {
             assert!(
                 lookup_aggregate_udf(&ctx, name).is_some(),
@@ -868,7 +868,7 @@ mod tests {
 
     #[test]
     fn test_lookup_statistical_aggregates() {
-        let ctx = SessionContext::new();
+        let ctx = create_session_context();
         for name in &["stddev", "stddev_pop", "median"] {
             // Just verify lookup doesn't panic
             let _ = lookup_aggregate_udf(&ctx, name);
@@ -877,7 +877,7 @@ mod tests {
 
     #[test]
     fn test_lookup_case_insensitive() {
-        let ctx = SessionContext::new();
+        let ctx = create_session_context();
         assert!(lookup_aggregate_udf(&ctx, "COUNT").is_some());
         assert!(lookup_aggregate_udf(&ctx, "Sum").is_some());
         assert!(lookup_aggregate_udf(&ctx, "AVG").is_some());
@@ -887,7 +887,7 @@ mod tests {
 
     #[test]
     fn test_adapter_multi_column_covar() {
-        let ctx = SessionContext::new();
+        let ctx = create_session_context();
         if let Some(factory) = create_aggregate_factory(
             &ctx,
             "covar_samp",
@@ -910,7 +910,7 @@ mod tests {
 
     #[test]
     fn test_create_aggregate_factory_api() {
-        let ctx = SessionContext::new();
+        let ctx = create_session_context();
         let factory =
             create_aggregate_factory(&ctx, "count", vec![0], vec![DataType::Int64]).unwrap();
         let acc = factory.create_accumulator();
@@ -919,7 +919,7 @@ mod tests {
 
     #[test]
     fn test_factory_creates_independent_accumulators() {
-        let ctx = SessionContext::new();
+        let ctx = create_session_context();
         let factory =
             create_aggregate_factory(&ctx, "sum", vec![0], vec![DataType::Float64]).unwrap();
 
@@ -935,7 +935,7 @@ mod tests {
 
     #[test]
     fn test_adapter_function_name() {
-        let ctx = SessionContext::new();
+        let ctx = create_session_context();
         let factory =
             create_aggregate_factory(&ctx, "sum", vec![0], vec![DataType::Float64]).unwrap();
         let acc = factory.create_accumulator();

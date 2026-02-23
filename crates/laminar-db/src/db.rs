@@ -6,7 +6,6 @@ use std::sync::Arc;
 use arrow::array::{BooleanArray, RecordBatch, StringArray, UInt64Array};
 use arrow::datatypes::{DataType, Field, Schema};
 use datafusion::prelude::SessionContext;
-
 use laminar_core::streaming;
 use laminar_sql::parser::{parse_streaming_sql, ShowCommand, StreamingStatement};
 use laminar_sql::planner::StreamingPlanner;
@@ -173,7 +172,7 @@ impl LaminarDB {
         config: LaminarConfig,
         config_vars: HashMap<String, String>,
     ) -> Result<Self, DbError> {
-        let ctx = SessionContext::new();
+        let ctx = laminar_sql::create_session_context();
         register_streaming_functions(&ctx);
 
         let catalog = Arc::new(SourceCatalog::new(
@@ -2039,7 +2038,7 @@ impl LaminarDB {
         use crate::stream_executor::StreamExecutor;
 
         // Build StreamExecutor with the registered stream queries
-        let ctx = SessionContext::new();
+        let ctx = laminar_sql::create_session_context();
         register_streaming_functions(&ctx);
         let mut executor = StreamExecutor::new(ctx);
 
@@ -2339,7 +2338,7 @@ impl LaminarDB {
         use laminar_connectors::reference::{ReferenceTableSource, RefreshMode};
 
         // Build StreamExecutor
-        let ctx = SessionContext::new();
+        let ctx = laminar_sql::create_session_context();
         laminar_sql::register_streaming_functions(&ctx);
         let mut executor = StreamExecutor::new(ctx);
 
@@ -3741,9 +3740,7 @@ async fn apply_filter(
     batch: &RecordBatch,
     filter_sql: &str,
 ) -> Result<Option<RecordBatch>, DbError> {
-    use datafusion::prelude::SessionContext;
-
-    let ctx = SessionContext::new();
+    let ctx = laminar_sql::create_session_context();
     let schema = batch.schema();
 
     // Register the batch as a temporary table

@@ -395,7 +395,7 @@ pub fn register_json_table_functions(ctx: &datafusion::prelude::SessionContext) 
 #[cfg(test)]
 mod tests {
     use super::*;
-    use datafusion::prelude::*;
+    use crate::datafusion::create_session_context;
 
     fn make_jsonb_expr(json_str: &str) -> Expr {
         let val: serde_json::Value = serde_json::from_str(json_str).unwrap();
@@ -417,7 +417,7 @@ mod tests {
 
     #[tokio::test]
     async fn test_array_elements_via_sql() {
-        let ctx = SessionContext::new();
+        let ctx = create_session_context();
         register_json_table_functions(&ctx);
 
         let df = ctx
@@ -441,7 +441,7 @@ mod tests {
 
     #[tokio::test]
     async fn test_array_elements_empty() {
-        let ctx = SessionContext::new();
+        let ctx = create_session_context();
         register_json_table_functions(&ctx);
 
         let df = ctx
@@ -455,7 +455,7 @@ mod tests {
 
     #[tokio::test]
     async fn test_array_elements_not_array() {
-        let ctx = SessionContext::new();
+        let ctx = create_session_context();
         register_json_table_functions(&ctx);
 
         let df = ctx
@@ -471,7 +471,7 @@ mod tests {
 
     #[tokio::test]
     async fn test_array_elements_text_strings() {
-        let ctx = SessionContext::new();
+        let ctx = create_session_context();
         register_json_table_functions(&ctx);
 
         let df = ctx
@@ -494,7 +494,7 @@ mod tests {
 
     #[tokio::test]
     async fn test_array_elements_text_mixed() {
-        let ctx = SessionContext::new();
+        let ctx = create_session_context();
         register_json_table_functions(&ctx);
 
         let df = ctx
@@ -510,7 +510,7 @@ mod tests {
 
     #[tokio::test]
     async fn test_each_basic() {
-        let ctx = SessionContext::new();
+        let ctx = create_session_context();
         register_json_table_functions(&ctx);
 
         let df = ctx
@@ -524,7 +524,7 @@ mod tests {
 
     #[tokio::test]
     async fn test_each_empty() {
-        let ctx = SessionContext::new();
+        let ctx = create_session_context();
         register_json_table_functions(&ctx);
 
         let df = ctx.sql("SELECT key FROM jsonb_each('{}')").await.unwrap();
@@ -537,7 +537,7 @@ mod tests {
 
     #[tokio::test]
     async fn test_each_text_basic() {
-        let ctx = SessionContext::new();
+        let ctx = create_session_context();
         register_json_table_functions(&ctx);
 
         let df = ctx
@@ -553,7 +553,7 @@ mod tests {
 
     #[tokio::test]
     async fn test_object_keys_basic() {
-        let ctx = SessionContext::new();
+        let ctx = create_session_context();
         register_json_table_functions(&ctx);
 
         let df = ctx
@@ -567,7 +567,7 @@ mod tests {
 
     #[tokio::test]
     async fn test_object_keys_empty() {
-        let ctx = SessionContext::new();
+        let ctx = create_session_context();
         register_json_table_functions(&ctx);
 
         let df = ctx
@@ -583,7 +583,7 @@ mod tests {
 
     #[test]
     fn test_registration() {
-        let ctx = SessionContext::new();
+        let ctx = create_session_context();
         register_json_table_functions(&ctx);
         assert!(ctx.table_function("jsonb_array_elements").is_ok());
         assert!(ctx.table_function("jsonb_array_elements_text").is_ok());

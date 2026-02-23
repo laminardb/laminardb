@@ -178,7 +178,7 @@ mod tests {
     use super::*;
     use arrow::array::{Float64Array, Int32Array, RecordBatch, StringArray};
     use arrow::datatypes::{DataType, Field, Schema};
-    use datafusion::prelude::SessionContext;
+    use laminar_sql::create_session_context;
 
     fn test_schema() -> SchemaRef {
         Arc::new(Schema::new(vec![
@@ -223,7 +223,7 @@ mod tests {
         }
 
         let provider = ReferenceTableProvider::new("test".to_string(), test_schema(), ts);
-        let ctx = SessionContext::new();
+        let ctx = create_session_context();
         ctx.register_table("test", Arc::new(provider)).unwrap();
 
         let df = ctx.sql("SELECT * FROM test").await.unwrap();
@@ -244,7 +244,7 @@ mod tests {
         }
 
         let provider = ReferenceTableProvider::new("test".to_string(), test_schema(), ts);
-        let ctx = SessionContext::new();
+        let ctx = create_session_context();
         ctx.register_table("test", Arc::new(provider)).unwrap();
 
         let df = ctx.sql("SELECT * FROM test").await.unwrap();
@@ -262,7 +262,7 @@ mod tests {
         }
 
         let provider = ReferenceTableProvider::new("test".to_string(), test_schema(), ts.clone());
-        let ctx = SessionContext::new();
+        let ctx = create_session_context();
         ctx.register_table("test", Arc::new(provider)).unwrap();
 
         // First query: empty
