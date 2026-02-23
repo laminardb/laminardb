@@ -1,3 +1,0 @@
-    Finished `dev` profile [unoptimized + debuginfo] target(s) in 0.31s
-     Running `target\debug\demo.exe`
-error: process didn't exit successfully: `target\debug\demo.exe` (exit code: 143)
