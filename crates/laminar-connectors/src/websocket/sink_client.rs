@@ -197,6 +197,7 @@ impl SinkConnector for WebSocketSinkClient {
         info!(url = %url, "opening WebSocket sink client");
 
         let (stream, _response) = tokio_tungstenite::connect_async(&url).await.map_err(|e| {
+            warn!(url = %url, error = %e, "WebSocket sink client failed to connect — if running in embedded mode, WebSocket connectors require a running server");
             ConnectorError::ConnectionFailed(format!("failed to connect to {url}: {e}"))
         })?;
 

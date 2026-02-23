@@ -470,6 +470,14 @@ pub fn parse_with_options(parser: &mut Parser) -> Result<HashMap<String, String>
         // Parse key
         let key = parse_option_string(parser)?;
 
+        // Check for unquoted dotted key (e.g. bind.address instead of 'bind.address')
+        if parser.peek_token().token == Token::Period {
+            return Err(ParseError::StreamingError(format!(
+                "Config keys containing dots must be quoted, e.g. '{key}.…' — \
+                 found unquoted dot after '{key}'"
+            )));
+        }
+
         // Expect '='
         parser
             .expect_token(&Token::Eq)

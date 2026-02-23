@@ -152,6 +152,7 @@ impl SinkConnector for WebSocketSinkServer {
         );
 
         let listener = TcpListener::bind(&bind_address).await.map_err(|e| {
+            warn!(bind = %bind_address, error = %e, "WebSocket sink server failed to bind — if running in embedded mode, the TCP listener may not be available");
             ConnectorError::ConnectionFailed(format!("failed to bind {bind_address}: {e}"))
         })?;
 

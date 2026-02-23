@@ -195,6 +195,9 @@ pub(crate) struct StreamExecutor {
     source_schemas: HashMap<String, SchemaRef>,
     /// Per-query EOWC accumulation state, keyed by query index.
     eowc_states: HashMap<usize, EowcState>,
+    /// Tracks which EOWC streams have already logged a suppression warning
+    /// (to avoid spamming on every cycle).
+    eowc_warned: HashSet<usize>,
 }
 
 impl StreamExecutor {
@@ -208,6 +211,7 @@ impl StreamExecutor {
             topo_dirty: true,
             source_schemas: HashMap::new(),
             eowc_states: HashMap::new(),
+            eowc_warned: HashSet::new(),
         }
     }
 
@@ -581,7 +585,18 @@ impl StreamExecutor {
             .map_or(i64::MIN, |s| s.last_closed_boundary);
 
         if closed_cut <= last_boundary && !force_emit {
-            // No new windows closed and not over memory limit — suppress output
+            // No new windows closed and not over memory limit — suppress output.
+            // Warn once per stream so users know EOWC is actively suppressing.
+            if !self.eowc_warned.contains(&idx) {
+                tracing::warn!(
+                    stream = query_name,
+                    "EMIT ON WINDOW CLOSE stream has no closed windows yet — \
+                     output is suppressed until the watermark advances past a window boundary. \
+                     In embedded micro-batch mode without an external watermark source, \
+                     EOWC streams may never emit."
+                );
+                self.eowc_warned.insert(idx);
+            }
             return Ok(Vec::new());
         }
 
