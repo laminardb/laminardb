@@ -10,6 +10,9 @@ use arrow_array::RecordBatch;
 use arrow_schema::{DataType, Field, Schema, SchemaRef};
 
 use crate::error::ConnectorError;
+use crate::schema::json::decoder::JsonDecoder;
+use crate::schema::traits::FormatDecoder;
+use crate::schema::types::RawRecord;
 
 use super::source_config::MessageFormat;
 
@@ -19,13 +22,25 @@ pub struct MessageParser {
     schema: SchemaRef,
     /// The message format.
     format: MessageFormat,
+    /// Type-aware JSON decoder (set for JSON/JsonLines formats).
+    json_decoder: Option<JsonDecoder>,
 }
 
 impl MessageParser {
     /// Creates a new parser for the given schema and format.
     #[must_use]
     pub fn new(schema: SchemaRef, format: MessageFormat) -> Self {
-        Self { schema, format }
+        let json_decoder = match &format {
+            MessageFormat::Json | MessageFormat::JsonLines => {
+                Some(JsonDecoder::new(schema.clone()))
+            }
+            _ => None,
+        };
+        Self {
+            schema,
+            format,
+            json_decoder,
+        }
     }
 
     /// Returns the output schema.
@@ -53,57 +68,18 @@ impl MessageParser {
 
     /// Parses JSON messages into a `RecordBatch`.
     ///
-    /// Each message is expected to be a JSON object whose keys map to the
-    /// schema field names. Missing fields become null.
+    /// Uses the type-aware [`JsonDecoder`] to coerce JSON values to the
+    /// Arrow types declared in the schema.
     fn parse_json_batch(&self, messages: &[&[u8]]) -> Result<RecordBatch, ConnectorError> {
-        let mut builders: Vec<StringBuilder> = self
-            .schema
-            .fields()
+        let decoder = self
+            .json_decoder
+            .as_ref()
+            .expect("json_decoder set for JSON format");
+        let records: Vec<RawRecord> = messages
             .iter()
-            .map(|_| StringBuilder::with_capacity(messages.len(), messages.len() * 64))
+            .map(|m| RawRecord::new(m.to_vec()))
             .collect();
-
-        for msg in messages {
-            let text = std::str::from_utf8(msg).map_err(|e| {
-                ConnectorError::Serde(crate::error::SerdeError::MalformedInput(format!(
-                    "invalid UTF-8 in JSON message: {e}"
-                )))
-            })?;
-
-            let value: serde_json::Value = serde_json::from_str(text).map_err(|e| {
-                ConnectorError::Serde(crate::error::SerdeError::Json(e.to_string()))
-            })?;
-
-            let obj = value.as_object().ok_or_else(|| {
-                ConnectorError::Serde(crate::error::SerdeError::MalformedInput(
-                    "expected JSON object".into(),
-                ))
-            })?;
-
-            for (i, field) in self.schema.fields().iter().enumerate() {
-                match obj.get(field.name()) {
-                    Some(serde_json::Value::Null) | None => builders[i].append_null(),
-                    Some(v) => {
-                        let s = match v {
-                            serde_json::Value::String(s) => s.clone(),
-                            other => other.to_string(),
-                        };
-                        builders[i].append_value(&s);
-                    }
-                }
-            }
-        }
-
-        let arrays: Vec<Arc<dyn arrow_array::Array>> = builders
-            .into_iter()
-            .map(|mut b| Arc::new(b.finish()) as _)
-            .collect();
-
-        RecordBatch::try_new(self.schema.clone(), arrays).map_err(|e| {
-            ConnectorError::Serde(crate::error::SerdeError::Json(format!(
-                "failed to build RecordBatch: {e}"
-            )))
-        })
+        decoder.decode_batch(&records).map_err(ConnectorError::from)
     }
 
     /// Parses binary messages — each message becomes a single row with a
@@ -315,6 +291,56 @@ mod tests {
         let messages: Vec<&[u8]> = vec![b"not json"];
 
         assert!(parser.parse_batch(&messages).is_err());
+    }
+
+    #[test]
+    fn test_parse_json_typed_columns() {
+        let schema = Arc::new(Schema::new(vec![
+            Field::new("id", DataType::Int64, false),
+            Field::new("price", DataType::Float64, false),
+            Field::new("name", DataType::Utf8, true),
+        ]));
+        let parser = MessageParser::new(schema, MessageFormat::Json);
+        let messages: Vec<&[u8]> = vec![
+            br#"{"id": 1, "price": 99.5, "name": "Widget"}"#,
+            br#"{"id": 2, "price": 10.0, "name": "Gadget"}"#,
+        ];
+
+        let batch = parser.parse_batch(&messages).unwrap();
+        assert_eq!(batch.num_rows(), 2);
+
+        // Columns should have the declared types, not Utf8.
+        assert_eq!(batch.column(0).data_type(), &DataType::Int64);
+        assert_eq!(batch.column(1).data_type(), &DataType::Float64);
+        assert_eq!(batch.column(2).data_type(), &DataType::Utf8);
+
+        let ids = batch
+            .column(0)
+            .as_any()
+            .downcast_ref::<arrow_array::Int64Array>()
+            .unwrap();
+        assert_eq!(ids.value(0), 1);
+        assert_eq!(ids.value(1), 2);
+    }
+
+    #[test]
+    fn test_parse_json_coerces_string_numbers() {
+        let schema = Arc::new(Schema::new(vec![Field::new(
+            "price",
+            DataType::Float64,
+            false,
+        )]));
+        let parser = MessageParser::new(schema, MessageFormat::Json);
+        let messages: Vec<&[u8]> = vec![br#"{"price": "187.52"}"#];
+
+        let batch = parser.parse_batch(&messages).unwrap();
+        assert_eq!(batch.column(0).data_type(), &DataType::Float64);
+        let prices = batch
+            .column(0)
+            .as_any()
+            .downcast_ref::<arrow_array::Float64Array>()
+            .unwrap();
+        assert!((prices.value(0) - 187.52).abs() < f64::EPSILON);
     }
 
     #[test]

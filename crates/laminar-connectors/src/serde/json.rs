@@ -14,6 +14,9 @@ use serde_json::Value;
 
 use super::{Format, RecordDeserializer, RecordSerializer};
 use crate::error::SerdeError;
+use crate::schema::json::decoder::JsonDecoder;
+use crate::schema::traits::FormatDecoder;
+use crate::schema::types::RawRecord;
 
 /// JSON record deserializer.
 ///
@@ -84,8 +87,11 @@ impl JsonDeserializer {
 
 impl RecordDeserializer for JsonDeserializer {
     fn deserialize(&self, data: &[u8], schema: &SchemaRef) -> Result<RecordBatch, SerdeError> {
-        let value: Value = serde_json::from_slice(data)?;
-        self.deserialize_value(&value, schema)
+        let decoder = JsonDecoder::new(schema.clone());
+        let record = RawRecord::new(data.to_vec());
+        decoder
+            .decode_one(&record)
+            .map_err(|e| SerdeError::Json(e.to_string()))
     }
 
     fn deserialize_batch(
@@ -96,27 +102,12 @@ impl RecordDeserializer for JsonDeserializer {
         if records.is_empty() {
             return Ok(RecordBatch::new_empty(schema.clone()));
         }
-
-        // Parse all JSON values first
-        let values: Vec<Value> = records
-            .iter()
-            .map(|data| serde_json::from_slice(data).map_err(SerdeError::from))
-            .collect::<Result<Vec<_>, _>>()?;
-
-        let mut columns: Vec<ArrayRef> = Vec::with_capacity(schema.fields().len());
-
-        for field in schema.fields() {
-            let array = build_column_from_json_values(
-                field.data_type(),
-                field.name(),
-                &values,
-                field.is_nullable(),
-            )?;
-            columns.push(array);
-        }
-
-        RecordBatch::try_new(schema.clone(), columns)
-            .map_err(|e| SerdeError::MalformedInput(format!("failed to create RecordBatch: {e}")))
+        let decoder = JsonDecoder::new(schema.clone());
+        let raw_records: Vec<RawRecord> =
+            records.iter().map(|r| RawRecord::new(r.to_vec())).collect();
+        decoder
+            .decode_batch(&raw_records)
+            .map_err(|e| SerdeError::Json(e.to_string()))
     }
 
     fn format(&self) -> Format {
@@ -435,131 +426,6 @@ where
     Ok(builder.finish_array())
 }
 
-/// Builds a multi-row column from a slice of JSON values.
-#[allow(clippy::too_many_lines)]
-fn build_column_from_json_values(
-    data_type: &DataType,
-    field_name: &str,
-    values: &[Value],
-    nullable: bool,
-) -> Result<ArrayRef, SerdeError> {
-    match data_type {
-        DataType::Int64 => {
-            let mut builder = Int64Builder::with_capacity(values.len());
-            for value in values {
-                let obj = value.as_object();
-                let field_val = obj.and_then(|o| o.get(field_name));
-                match field_val {
-                    Some(Value::Number(n)) => {
-                        let i = n.as_i64().ok_or_else(|| SerdeError::TypeConversion {
-                            field: field_name.into(),
-                            expected: "Int64".into(),
-                            message: format!("cannot convert {n}"),
-                        })?;
-                        builder.append_value(i);
-                    }
-                    Some(Value::Null) | None if nullable => builder.append_null(),
-                    Some(Value::Null) | None => {
-                        return Err(SerdeError::MissingField(field_name.into()))
-                    }
-                    other => {
-                        return Err(SerdeError::TypeConversion {
-                            field: field_name.into(),
-                            expected: "Int64".into(),
-                            message: format!("got {other:?}"),
-                        })
-                    }
-                }
-            }
-            Ok(Arc::new(builder.finish()))
-        }
-        DataType::Float64 => {
-            let mut builder = Float64Builder::with_capacity(values.len());
-            for value in values {
-                let obj = value.as_object();
-                let field_val = obj.and_then(|o| o.get(field_name));
-                match field_val {
-                    Some(Value::Number(n)) => {
-                        let f = n.as_f64().ok_or_else(|| SerdeError::TypeConversion {
-                            field: field_name.into(),
-                            expected: "Float64".into(),
-                            message: format!("cannot convert {n}"),
-                        })?;
-                        builder.append_value(f);
-                    }
-                    Some(Value::Null) | None if nullable => builder.append_null(),
-                    Some(Value::Null) | None => {
-                        return Err(SerdeError::MissingField(field_name.into()))
-                    }
-                    other => {
-                        return Err(SerdeError::TypeConversion {
-                            field: field_name.into(),
-                            expected: "Float64".into(),
-                            message: format!("got {other:?}"),
-                        })
-                    }
-                }
-            }
-            Ok(Arc::new(builder.finish()))
-        }
-        DataType::Utf8 => {
-            let mut builder = StringBuilder::with_capacity(values.len(), values.len() * 32);
-            for value in values {
-                let obj = value.as_object();
-                let field_val = obj.and_then(|o| o.get(field_name));
-                match field_val {
-                    Some(Value::String(s)) => builder.append_value(s),
-                    Some(Value::Null) | None if nullable => builder.append_null(),
-                    Some(Value::Null) | None => {
-                        return Err(SerdeError::MissingField(field_name.into()))
-                    }
-                    Some(other) => builder.append_value(other.to_string()),
-                }
-            }
-            Ok(Arc::new(builder.finish()))
-        }
-        DataType::Boolean => {
-            let mut builder = BooleanBuilder::with_capacity(values.len());
-            for value in values {
-                let obj = value.as_object();
-                let field_val = obj.and_then(|o| o.get(field_name));
-                match field_val {
-                    Some(Value::Bool(b)) => builder.append_value(*b),
-                    Some(Value::Null) | None if nullable => builder.append_null(),
-                    Some(Value::Null) | None => {
-                        return Err(SerdeError::MissingField(field_name.into()))
-                    }
-                    other => {
-                        return Err(SerdeError::TypeConversion {
-                            field: field_name.into(),
-                            expected: "Boolean".into(),
-                            message: format!("got {other:?}"),
-                        })
-                    }
-                }
-            }
-            Ok(Arc::new(builder.finish()))
-        }
-        // Fall back to per-row deserialization for other types
-        _ => {
-            let arrays: Result<Vec<ArrayRef>, _> = values
-                .iter()
-                .map(|v| {
-                    let field_val = v.as_object().and_then(|o| o.get(field_name));
-                    build_array_from_json(data_type, field_val, field_name)
-                })
-                .collect();
-            let arrays = arrays?;
-            if arrays.len() == 1 {
-                return Ok(arrays.into_iter().next().unwrap());
-            }
-            Err(SerdeError::UnsupportedFormat(format!(
-                "batch deserialization not supported for type {data_type}"
-            )))
-        }
-    }
-}
-
 /// Converts an Arrow column value at `row` to a JSON value.
 fn arrow_column_to_json(
     column: &ArrayRef,
@@ -670,11 +536,12 @@ mod tests {
     }
 
     #[test]
-    fn test_json_deserialize_missing_required() {
+    fn test_json_deserialize_missing_required_field() {
         let deser = JsonDeserializer::new();
-        let schema = test_schema();
+        let schema = test_schema(); // `name` is non-nullable
         let data = br#"{"id": 3, "score": 80.0}"#;
 
+        // Missing non-nullable field → error from RecordBatch construction.
         let result = deser.deserialize(data, &schema);
         assert!(result.is_err());
     }
@@ -727,6 +594,33 @@ mod tests {
             .filter(|l| !l.is_empty())
             .collect();
         assert_eq!(lines.len(), 2);
+    }
+
+    #[test]
+    fn test_json_deserialize_coercion() {
+        let deser = JsonDeserializer::new();
+        let schema = Arc::new(Schema::new(vec![
+            Field::new("qty", DataType::Int64, false),
+            Field::new("price", DataType::Float64, false),
+        ]));
+
+        // String numbers should coerce to the declared numeric types.
+        let data = br#"{"qty": "100", "price": "187.52"}"#;
+        let batch = deser.deserialize(data, &schema).unwrap();
+
+        let qty = batch
+            .column(0)
+            .as_any()
+            .downcast_ref::<arrow_array::Int64Array>()
+            .unwrap();
+        assert_eq!(qty.value(0), 100);
+
+        let price = batch
+            .column(1)
+            .as_any()
+            .downcast_ref::<arrow_array::Float64Array>()
+            .unwrap();
+        assert!((price.value(0) - 187.52).abs() < f64::EPSILON);
     }
 
     #[test]
