@@ -286,6 +286,17 @@ impl SourceConnector for WebSocketSource {
             self.config = WebSocketSourceConfig::from_config(config)?;
         }
 
+        // Override schema from SQL DDL if provided.
+        if let Some(schema) = config.arrow_schema() {
+            info!(
+                fields = schema.fields().len(),
+                "using SQL-defined schema for deserialization"
+            );
+            self.schema = schema;
+            self.parser =
+                MessageParser::new(self.schema.clone(), self.config.format.clone());
+        }
+
         let mode = &self.config.mode;
         let (urls, subscribe_message, reconnect, ping_interval, ping_timeout) = match mode {
             SourceMode::Client {

@@ -8,6 +8,9 @@
 
 use std::collections::HashMap;
 use std::fmt;
+use std::sync::Arc;
+
+use arrow_schema::{DataType, Field, Schema, SchemaRef};
 
 use crate::error::ConnectorError;
 
@@ -122,6 +125,49 @@ impl ConnectorConfig {
                     .map(|stripped| (stripped.to_string(), v.clone()))
             })
             .collect()
+    }
+
+    /// Returns the SQL-defined Arrow schema passed via `_arrow_schema`,
+    /// or `None` if absent or unparseable.
+    ///
+    /// The compact format is `"col1:Type1,col2:Type2,..."` as produced by
+    /// `encode_arrow_schema` in `laminar-db`.
+    ///
+    /// **Note:** This method re-parses the schema string on each call.
+    /// Cache the result if you need it in a hot loop.
+    #[must_use]
+    pub fn arrow_schema(&self) -> Option<SchemaRef> {
+        let s = self.get("_arrow_schema")?;
+        let fields: Vec<Field> = s
+            .split(',')
+            .filter(|part| !part.is_empty())
+            .filter_map(|part| {
+                let (name, type_str) = part.split_once(':')?;
+                let dt = match type_str {
+                    "Utf8" => DataType::Utf8,
+                    "LargeUtf8" => DataType::LargeUtf8,
+                    "Float64" => DataType::Float64,
+                    "Float32" => DataType::Float32,
+                    "Int64" => DataType::Int64,
+                    "Int32" => DataType::Int32,
+                    "Int16" => DataType::Int16,
+                    "Int8" => DataType::Int8,
+                    "UInt64" => DataType::UInt64,
+                    "UInt32" => DataType::UInt32,
+                    "Boolean" => DataType::Boolean,
+                    "Date32" => DataType::Date32,
+                    "Date64" => DataType::Date64,
+                    _ => return None,
+                };
+                Some(Field::new(name, dt, true))
+            })
+            .collect();
+
+        if fields.is_empty() {
+            None
+        } else {
+            Some(Arc::new(Schema::new(fields)))
+        }
     }
 
     /// Formats all properties for display with secrets redacted.
@@ -396,5 +442,34 @@ mod tests {
     fn test_display_redacted_empty() {
         let config = ConnectorConfig::new("test");
         assert!(config.display_redacted().is_empty());
+    }
+
+    #[test]
+    fn test_arrow_schema_parses_compact_encoding() {
+        let mut config = ConnectorConfig::new("websocket");
+        config.set("_arrow_schema", "s:Utf8,p:Float64,q:Float64,T:Int64");
+
+        let schema = config.arrow_schema().expect("should parse");
+        assert_eq!(schema.fields().len(), 4);
+        assert_eq!(schema.field(0).name(), "s");
+        assert_eq!(schema.field(0).data_type(), &DataType::Utf8);
+        assert_eq!(schema.field(1).name(), "p");
+        assert_eq!(schema.field(1).data_type(), &DataType::Float64);
+        assert_eq!(schema.field(3).name(), "T");
+        assert_eq!(schema.field(3).data_type(), &DataType::Int64);
+        assert!(schema.field(0).is_nullable());
+    }
+
+    #[test]
+    fn test_arrow_schema_returns_none_when_absent() {
+        let config = ConnectorConfig::new("kafka");
+        assert!(config.arrow_schema().is_none());
+    }
+
+    #[test]
+    fn test_arrow_schema_returns_none_for_empty_value() {
+        let mut config = ConnectorConfig::new("kafka");
+        config.set("_arrow_schema", "");
+        assert!(config.arrow_schema().is_none());
     }
 }

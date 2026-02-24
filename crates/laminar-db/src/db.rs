@@ -785,7 +785,7 @@ impl LaminarDB {
                     .iter()
                     .any(|opt| matches!(opt.option, sqlparser::ast::ColumnOption::NotNull));
                 Ok(arrow::datatypes::Field::new(
-                    col.name.to_string(),
+                    col.name.value.clone(),
                     data_type,
                     nullable,
                 ))
@@ -807,7 +807,7 @@ impl LaminarDB {
                         ..
                     }
                 ) {
-                    primary_key = Some(col.name.to_string());
+                    primary_key = Some(col.name.value.clone());
                     break;
                 }
             }
@@ -821,7 +821,12 @@ impl LaminarDB {
             for constraint in &create.constraints {
                 if let sqlparser::ast::TableConstraint::PrimaryKey { columns, .. } = constraint {
                     if let Some(first) = columns.first() {
-                        primary_key = Some(first.column.to_string());
+                        primary_key = match &first.column.expr {
+                            sqlparser::ast::Expr::Identifier(ident) => {
+                                Some(ident.value.clone())
+                            }
+                            other => Some(other.to_string()),
+                        };
                     }
                 }
             }
