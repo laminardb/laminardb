@@ -544,22 +544,30 @@ impl LaminarDB {
         // Supports two syntax forms:
         //   1. FROM KAFKA ('topic' = 'events', ...) — connector_type is set
         //   2. WITH ('connector' = 'kafka', 'topic' = 'events', ...) — extract from with_options
-        let (resolved_connector_type, resolved_connector_options, resolved_format, resolved_format_options) =
-            if create.connector_type.is_some() {
-                (
-                    create.connector_type.clone(),
-                    create.connector_options.clone(),
-                    create.format.as_ref().map(|f| f.format_type.clone()),
-                    create.format.as_ref().map(|f| f.options.clone()).unwrap_or_default(),
-                )
-            } else if let Some(ct) = create.with_options.get("connector") {
-                // WITH-syntax: extract connector type and options from with_options
-                let (conn_opts, fmt, fmt_opts) =
-                    extract_connector_from_with_options(&create.with_options);
-                (Some(ct.to_uppercase()), conn_opts, fmt, fmt_opts)
-            } else {
-                (None, HashMap::new(), None, HashMap::new())
-            };
+        let (
+            resolved_connector_type,
+            resolved_connector_options,
+            resolved_format,
+            resolved_format_options,
+        ) = if create.connector_type.is_some() {
+            (
+                create.connector_type.clone(),
+                create.connector_options.clone(),
+                create.format.as_ref().map(|f| f.format_type.clone()),
+                create
+                    .format
+                    .as_ref()
+                    .map(|f| f.options.clone())
+                    .unwrap_or_default(),
+            )
+        } else if let Some(ct) = create.with_options.get("connector") {
+            // WITH-syntax: extract connector type and options from with_options
+            let (conn_opts, fmt, fmt_opts) =
+                extract_connector_from_with_options(&create.with_options);
+            (Some(ct.to_uppercase()), conn_opts, fmt, fmt_opts)
+        } else {
+            (None, HashMap::new(), None, HashMap::new())
+        };
 
         if let Some(ref ct) = resolved_connector_type {
             let normalized = ct.to_lowercase();
@@ -572,9 +580,8 @@ impl LaminarDB {
 
             // Validate format
             if let Some(ref fmt_str) = resolved_format {
-                laminar_connectors::serde::Format::parse(&fmt_str.to_lowercase()).map_err(
-                    |e| DbError::Connector(format!("Unknown format '{fmt_str}': {e}")),
-                )?;
+                laminar_connectors::serde::Format::parse(&fmt_str.to_lowercase())
+                    .map_err(|e| DbError::Connector(format!("Unknown format '{fmt_str}': {e}")))?;
             }
 
             let mut mgr = self.connector_manager.lock();
@@ -624,21 +631,29 @@ impl LaminarDB {
         // Supports two syntax forms:
         //   1. INTO KAFKA ('topic' = 'events', ...) — connector_type is set
         //   2. WITH ('connector' = 'kafka', 'topic' = 'events', ...) — extract from with_options
-        let (resolved_connector_type, resolved_connector_options, resolved_format, resolved_format_options) =
-            if create.connector_type.is_some() {
-                (
-                    create.connector_type.clone(),
-                    create.connector_options.clone(),
-                    create.format.as_ref().map(|f| f.format_type.clone()),
-                    create.format.as_ref().map(|f| f.options.clone()).unwrap_or_default(),
-                )
-            } else if let Some(ct) = create.with_options.get("connector") {
-                let (conn_opts, fmt, fmt_opts) =
-                    extract_connector_from_with_options(&create.with_options);
-                (Some(ct.to_uppercase()), conn_opts, fmt, fmt_opts)
-            } else {
-                (None, HashMap::new(), None, HashMap::new())
-            };
+        let (
+            resolved_connector_type,
+            resolved_connector_options,
+            resolved_format,
+            resolved_format_options,
+        ) = if create.connector_type.is_some() {
+            (
+                create.connector_type.clone(),
+                create.connector_options.clone(),
+                create.format.as_ref().map(|f| f.format_type.clone()),
+                create
+                    .format
+                    .as_ref()
+                    .map(|f| f.options.clone())
+                    .unwrap_or_default(),
+            )
+        } else if let Some(ct) = create.with_options.get("connector") {
+            let (conn_opts, fmt, fmt_opts) =
+                extract_connector_from_with_options(&create.with_options);
+            (Some(ct.to_uppercase()), conn_opts, fmt, fmt_opts)
+        } else {
+            (None, HashMap::new(), None, HashMap::new())
+        };
 
         if let Some(ref ct) = resolved_connector_type {
             let normalized = ct.to_lowercase();
@@ -651,9 +666,8 @@ impl LaminarDB {
 
             // Validate format
             if let Some(ref fmt_str) = resolved_format {
-                laminar_connectors::serde::Format::parse(&fmt_str.to_lowercase()).map_err(
-                    |e| DbError::Connector(format!("Unknown format '{fmt_str}': {e}")),
-                )?;
+                laminar_connectors::serde::Format::parse(&fmt_str.to_lowercase())
+                    .map_err(|e| DbError::Connector(format!("Unknown format '{fmt_str}': {e}")))?;
             }
 
             let mut mgr = self.connector_manager.lock();
@@ -3775,7 +3789,11 @@ const STREAMING_OPTION_KEYS: &[&str] = &[
 /// Returns `(connector_options, format, format_options)`.
 fn extract_connector_from_with_options(
     with_options: &HashMap<String, String>,
-) -> (HashMap<String, String>, Option<String>, HashMap<String, String>) {
+) -> (
+    HashMap<String, String>,
+    Option<String>,
+    HashMap<String, String>,
+) {
     let mut connector_options = HashMap::new();
     let mut format: Option<String> = None;
     let mut format_options = HashMap::new();
@@ -5599,9 +5617,7 @@ mod tests {
             }),
         );
 
-        db.execute("CREATE SOURCE events (x INT)")
-            .await
-            .unwrap();
+        db.execute("CREATE SOURCE events (x INT)").await.unwrap();
 
         db.execute(
             "CREATE TABLE t1 (id INT PRIMARY KEY, symbol VARCHAR NOT NULL) \

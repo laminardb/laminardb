@@ -160,9 +160,7 @@ impl WebSocketSourceConfig {
 
         let on_backpressure = match config.get("on.backpressure").map(str::to_lowercase) {
             Some(ref s) if s == "block" => BackpressureStrategy::Block,
-            Some(ref s) if s == "drop" || s == "drop_newest" => {
-                BackpressureStrategy::DropNewest
-            }
+            Some(ref s) if s == "drop" || s == "drop_newest" => BackpressureStrategy::DropNewest,
             Some(ref other) => {
                 return Err(ConnectorError::ConfigurationError(format!(
                     "invalid backpressure strategy '{other}': expected 'block' or 'drop'"
@@ -205,27 +203,21 @@ impl WebSocketSourceConfig {
                     ));
                 };
 
-                let subscribe_message =
-                    config.get("subscribe.message").map(ToString::to_string);
+                let subscribe_message = config.get("subscribe.message").map(ToString::to_string);
 
-                let reconnect_enabled: bool = config
-                    .get_parsed("reconnect.enabled")?
-                    .unwrap_or(true);
+                let reconnect_enabled: bool =
+                    config.get_parsed("reconnect.enabled")?.unwrap_or(true);
                 let initial_delay_ms: u64 = config
                     .get_parsed("reconnect.initial.delay.ms")?
                     .unwrap_or(100);
                 let max_delay_ms: u64 = config
                     .get_parsed("reconnect.max.delay.ms")?
                     .unwrap_or(30_000);
-                let max_retries: Option<u32> =
-                    config.get_parsed("reconnect.max.retries")?;
+                let max_retries: Option<u32> = config.get_parsed("reconnect.max.retries")?;
 
-                let ping_interval_ms: u64 = config
-                    .get_parsed("ping.interval.ms")?
-                    .unwrap_or(30_000);
-                let ping_timeout_ms: u64 = config
-                    .get_parsed("ping.timeout.ms")?
-                    .unwrap_or(10_000);
+                let ping_interval_ms: u64 =
+                    config.get_parsed("ping.interval.ms")?.unwrap_or(30_000);
+                let ping_timeout_ms: u64 = config.get_parsed("ping.timeout.ms")?.unwrap_or(10_000);
 
                 Ok(SourceMode::Client {
                     urls,
@@ -243,9 +235,7 @@ impl WebSocketSourceConfig {
                 })
             }
             "server" => {
-                let bind_address = config
-                    .require("bind.address")
-                    .map(ToString::to_string)?;
+                let bind_address = config.require("bind.address").map(ToString::to_string)?;
                 let max_connections: usize = config
                     .get_parsed("max.connections")?
                     .unwrap_or(default_max_connections());
@@ -871,10 +861,7 @@ mod tests {
                 ping_timeout,
             } => {
                 assert_eq!(urls, &["wss://feed.example.com/v1"]);
-                assert_eq!(
-                    subscribe_message.as_deref(),
-                    Some(r#"{"op":"subscribe"}"#)
-                );
+                assert_eq!(subscribe_message.as_deref(), Some(r#"{"op":"subscribe"}"#));
                 assert!(reconnect.enabled);
                 assert_eq!(reconnect.initial_delay, Duration::from_millis(200));
                 assert_eq!(reconnect.max_delay, Duration::from_millis(60_000));
@@ -945,7 +932,7 @@ mod tests {
                 assert_eq!(urls[0], "wss://a.example.com");
                 assert_eq!(urls[1], "wss://b.example.com");
             }
-            _ => panic!("expected Client mode"),
+            SourceMode::Server { .. } => panic!("expected Client mode"),
         }
     }
 

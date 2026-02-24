@@ -68,23 +68,17 @@ impl WebSocketSinkConfig {
         let mode_str = config.get("mode").unwrap_or("server");
         let mode = match mode_str.to_lowercase().as_str() {
             "server" => {
-                let bind_address = config
-                    .require("bind.address")
-                    .map(ToString::to_string)?;
+                let bind_address = config.require("bind.address").map(ToString::to_string)?;
                 let max_connections: usize = config
                     .get_parsed("max.connections")?
                     .unwrap_or(default_max_connections());
                 let per_client_buffer: usize = config
                     .get_parsed("per.client.buffer")?
                     .unwrap_or(default_per_client_buffer());
-                let ping_interval_ms: u64 = config
-                    .get_parsed("ping.interval.ms")?
-                    .unwrap_or(30_000);
-                let ping_timeout_ms: u64 = config
-                    .get_parsed("ping.timeout.ms")?
-                    .unwrap_or(10_000);
-                let replay_buffer_size: Option<usize> =
-                    config.get_parsed("replay.buffer.size")?;
+                let ping_interval_ms: u64 =
+                    config.get_parsed("ping.interval.ms")?.unwrap_or(30_000);
+                let ping_timeout_ms: u64 = config.get_parsed("ping.timeout.ms")?.unwrap_or(10_000);
+                let replay_buffer_size: Option<usize> = config.get_parsed("replay.buffer.size")?;
                 let path = config.get("path").map(ToString::to_string);
 
                 let slow_client_policy =
@@ -116,8 +110,7 @@ impl WebSocketSinkConfig {
                 let buffer_on_disconnect: Option<usize> =
                     config.get_parsed("buffer.on.disconnect")?;
                 let batch_max_size: Option<usize> = config.get_parsed("batch.max.size")?;
-                let batch_interval_ms: Option<u64> =
-                    config.get_parsed("batch.interval.ms")?;
+                let batch_interval_ms: Option<u64> = config.get_parsed("batch.interval.ms")?;
 
                 SinkMode::Client {
                     url,
