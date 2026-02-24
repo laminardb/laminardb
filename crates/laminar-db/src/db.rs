@@ -6817,18 +6817,15 @@ mod tests {
         // Without the websocket feature, the connector type won't be registered,
         // so we expect an "Unknown source connector type" error — which proves
         // the WITH clause WAS routed to the connector registry.
-        match result {
-            Err(e) => {
-                let msg = e.to_string();
-                assert!(
-                    msg.contains("Unknown source connector type"),
-                    "Expected connector routing error, got: {msg}"
-                );
-            }
-            Ok(_) => {
-                // If websocket feature IS enabled, the connector type is registered
-                // and the DDL succeeds — also acceptable.
-            }
+        if let Err(e) = result {
+            let msg = e.to_string();
+            assert!(
+                msg.contains("Unknown source connector type"),
+                "Expected connector routing error, got: {msg}"
+            );
+        } else {
+            // If websocket feature IS enabled, the connector type is registered
+            // and the DDL succeeds — also acceptable.
         }
     }
 }
