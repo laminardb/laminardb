@@ -278,8 +278,23 @@ async fn send_with_backpressure(
 
 #[async_trait]
 impl SourceConnector for WebSocketSource {
-    async fn open(&mut self, _config: &ConnectorConfig) -> Result<(), ConnectorError> {
+    async fn open(&mut self, config: &ConnectorConfig) -> Result<(), ConnectorError> {
         self.state = ConnectorState::Initializing;
+
+        // If config has properties, re-parse (supports runtime config via SQL WITH).
+        if !config.properties().is_empty() {
+            self.config = WebSocketSourceConfig::from_config(config)?;
+        }
+
+        // Override schema from SQL DDL if provided.
+        if let Some(schema) = config.arrow_schema() {
+            info!(
+                fields = schema.fields().len(),
+                "using SQL-defined schema for deserialization"
+            );
+            self.schema = schema;
+            self.parser = MessageParser::new(self.schema.clone(), self.config.format.clone());
+        }
 
         let mode = &self.config.mode;
         let (urls, subscribe_message, reconnect, ping_interval, ping_timeout) = match mode {

@@ -913,17 +913,17 @@ impl ScalarUDFImpl for MapFromArrays {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::datafusion::create_session_context;
     use arrow_array::builder::*;
     use arrow_array::*;
     use arrow_schema::{DataType, Field, Fields};
-    use datafusion::prelude::*;
     use datafusion_common::config::ConfigOptions;
 
     // ── Tier 1: Verify DataFusion built-in array functions ──────
 
     #[tokio::test]
     async fn test_builtin_array_length() {
-        let ctx = SessionContext::new();
+        let ctx = create_session_context();
         let df = ctx
             .sql("SELECT array_length(make_array(1, 2, 3))")
             .await
@@ -934,7 +934,7 @@ mod tests {
 
     #[tokio::test]
     async fn test_builtin_array_sort() {
-        let ctx = SessionContext::new();
+        let ctx = create_session_context();
         let df = ctx
             .sql("SELECT array_sort(make_array(3, 1, 2))")
             .await
@@ -945,7 +945,7 @@ mod tests {
 
     #[tokio::test]
     async fn test_builtin_array_distinct() {
-        let ctx = SessionContext::new();
+        let ctx = create_session_context();
         let df = ctx
             .sql("SELECT array_distinct(make_array(1, 2, 2, 3))")
             .await
@@ -1191,7 +1191,7 @@ mod tests {
     fn test_register_complex_type_functions() {
         use datafusion::execution::FunctionRegistry;
 
-        let ctx = SessionContext::new();
+        let ctx = create_session_context();
         register_complex_type_functions(&ctx);
         assert!(ctx.udf("struct_extract").is_ok());
         assert!(ctx.udf("struct_set").is_ok());

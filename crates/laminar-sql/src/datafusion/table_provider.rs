@@ -251,7 +251,7 @@ mod tests {
 
     #[tokio::test]
     async fn test_scan_creates_exec() {
-        use datafusion::prelude::SessionContext;
+        use crate::datafusion::create_session_context;
 
         let schema = test_schema();
         let source: StreamSourceRef = Arc::new(MockSource {
@@ -260,7 +260,7 @@ mod tests {
         });
         let provider = StreamingTableProvider::new("test", source);
 
-        let ctx = SessionContext::new();
+        let ctx = create_session_context();
         let session_state = ctx.state();
 
         let exec = provider
@@ -275,7 +275,7 @@ mod tests {
 
     #[tokio::test]
     async fn test_scan_with_projection() {
-        use datafusion::prelude::SessionContext;
+        use crate::datafusion::create_session_context;
 
         let schema = test_schema();
         let source: StreamSourceRef = Arc::new(MockSource {
@@ -284,7 +284,7 @@ mod tests {
         });
         let provider = StreamingTableProvider::new("test", source);
 
-        let ctx = SessionContext::new();
+        let ctx = create_session_context();
         let session_state = ctx.state();
 
         let projection = vec![0]; // Only id column

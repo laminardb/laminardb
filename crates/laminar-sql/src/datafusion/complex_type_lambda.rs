@@ -686,8 +686,8 @@ impl ScalarUDFImpl for MapTransformValues {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::datafusion::create_session_context;
     use arrow_array::*;
-    use datafusion::prelude::*;
     use datafusion_common::config::ConfigOptions;
 
     // ── array_transform ─────────────────────────────────────────
@@ -789,7 +789,7 @@ mod tests {
     fn test_register_lambda_functions() {
         use datafusion::execution::FunctionRegistry;
 
-        let ctx = SessionContext::new();
+        let ctx = create_session_context();
         register_lambda_functions(&ctx);
         assert!(ctx.udf("array_transform").is_ok());
         assert!(ctx.udf("array_filter").is_ok());

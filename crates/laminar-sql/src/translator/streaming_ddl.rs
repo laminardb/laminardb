@@ -382,7 +382,7 @@ fn convert_column(col: &ColumnDef) -> Result<ColumnDefinition, ParseError> {
         .any(|opt| matches!(opt.option, sqlparser::ast::ColumnOption::NotNull));
 
     Ok(ColumnDefinition {
-        name: col.name.to_string(),
+        name: col.name.value.clone(),
         data_type,
         nullable,
     })
@@ -472,7 +472,7 @@ fn parse_watermark(
     wm: &WatermarkDef,
     columns: &[ColumnDefinition],
 ) -> Result<WatermarkSpec, ParseError> {
-    let column_name = wm.column.to_string();
+    let column_name = wm.column.value.clone();
 
     // Verify column exists and is a timestamp type
     let col = columns

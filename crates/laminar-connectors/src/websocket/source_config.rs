@@ -10,6 +10,8 @@ use std::time::Duration;
 use serde::{Deserialize, Serialize};
 
 use super::backpressure::BackpressureStrategy;
+use crate::config::ConnectorConfig;
+use crate::error::ConnectorError;
 
 // ---------------------------------------------------------------------------
 // Serde helper: Duration as milliseconds
@@ -138,6 +140,170 @@ impl Default for WebSocketSourceConfig {
             event_time_format: None,
             max_message_size: default_max_message_size(),
             auth: None,
+        }
+    }
+}
+
+impl WebSocketSourceConfig {
+    /// Builds a [`WebSocketSourceConfig`] from a flat [`ConnectorConfig`] property map.
+    ///
+    /// Maps well-known keys from `WITH (...)` clauses to the structured config.
+    /// Unknown keys are silently ignored (forward compatibility).
+    ///
+    /// # Errors
+    ///
+    /// Returns `ConnectorError::ConfigurationError` if a required key is missing
+    /// or a value cannot be parsed.
+    pub fn from_config(config: &ConnectorConfig) -> Result<Self, ConnectorError> {
+        let mode = Self::parse_mode(config)?;
+        let format = Self::parse_format(config)?;
+
+        let on_backpressure = match config.get("on.backpressure").map(str::to_lowercase) {
+            Some(ref s) if s == "block" => BackpressureStrategy::Block,
+            Some(ref s) if s == "drop" || s == "drop_newest" => BackpressureStrategy::DropNewest,
+            Some(ref other) => {
+                return Err(ConnectorError::ConfigurationError(format!(
+                    "invalid backpressure strategy '{other}': expected 'block' or 'drop'"
+                )));
+            }
+            None => default_backpressure(),
+        };
+
+        let max_message_size: usize = config
+            .get_parsed("max.message.size")?
+            .unwrap_or(default_max_message_size());
+
+        let event_time_field = config.get("event.time.field").map(ToString::to_string);
+        let event_time_format = Self::parse_event_time_format(config);
+        let auth = Self::parse_auth(config)?;
+
+        Ok(Self {
+            mode,
+            format,
+            on_backpressure,
+            event_time_field,
+            event_time_format,
+            max_message_size,
+            auth,
+        })
+    }
+
+    /// Parses the `mode` property into a [`SourceMode`].
+    fn parse_mode(config: &ConnectorConfig) -> Result<SourceMode, ConnectorError> {
+        let mode_str = config.get("mode").unwrap_or("client");
+        match mode_str.to_lowercase().as_str() {
+            "client" => {
+                let urls = if let Some(url) = config.get("url") {
+                    url.split(',').map(|s| s.trim().to_string()).collect()
+                } else {
+                    return Err(ConnectorError::ConfigurationError(
+                        "WebSocket client mode requires 'url'. \
+                         Set url='wss://...' in the WITH clause."
+                            .into(),
+                    ));
+                };
+
+                let subscribe_message = config.get("subscribe.message").map(ToString::to_string);
+
+                let reconnect_enabled: bool =
+                    config.get_parsed("reconnect.enabled")?.unwrap_or(true);
+                let initial_delay_ms: u64 = config
+                    .get_parsed("reconnect.initial.delay.ms")?
+                    .unwrap_or(100);
+                let max_delay_ms: u64 = config
+                    .get_parsed("reconnect.max.delay.ms")?
+                    .unwrap_or(30_000);
+                let max_retries: Option<u32> = config.get_parsed("reconnect.max.retries")?;
+
+                let ping_interval_ms: u64 =
+                    config.get_parsed("ping.interval.ms")?.unwrap_or(30_000);
+                let ping_timeout_ms: u64 = config.get_parsed("ping.timeout.ms")?.unwrap_or(10_000);
+
+                Ok(SourceMode::Client {
+                    urls,
+                    subscribe_message,
+                    reconnect: ReconnectConfig {
+                        enabled: reconnect_enabled,
+                        initial_delay: Duration::from_millis(initial_delay_ms),
+                        max_delay: Duration::from_millis(max_delay_ms),
+                        backoff_multiplier: default_backoff_multiplier(),
+                        max_retries,
+                        jitter: true,
+                    },
+                    ping_interval: Duration::from_millis(ping_interval_ms),
+                    ping_timeout: Duration::from_millis(ping_timeout_ms),
+                })
+            }
+            "server" => {
+                let bind_address = config.require("bind.address").map(ToString::to_string)?;
+                let max_connections: usize = config
+                    .get_parsed("max.connections")?
+                    .unwrap_or(default_max_connections());
+                let path = config.get("path").map(ToString::to_string);
+
+                Ok(SourceMode::Server {
+                    bind_address,
+                    max_connections,
+                    path,
+                })
+            }
+            other => Err(ConnectorError::ConfigurationError(format!(
+                "invalid WebSocket mode '{other}': expected 'client' or 'server'"
+            ))),
+        }
+    }
+
+    /// Parses the `format` property into a [`MessageFormat`].
+    fn parse_format(config: &ConnectorConfig) -> Result<MessageFormat, ConnectorError> {
+        match config.get("format").map(str::to_lowercase) {
+            Some(ref s) if s == "json" => Ok(MessageFormat::Json),
+            Some(ref s) if s == "jsonlines" || s == "json_lines" => Ok(MessageFormat::JsonLines),
+            Some(ref s) if s == "binary" => Ok(MessageFormat::Binary),
+            Some(ref s) if s == "csv" => Ok(MessageFormat::Csv {
+                delimiter: ',',
+                has_header: false,
+            }),
+            Some(ref other) => Err(ConnectorError::ConfigurationError(format!(
+                "invalid WebSocket format '{other}': expected json, jsonlines, binary, or csv"
+            ))),
+            None => Ok(MessageFormat::Json),
+        }
+    }
+
+    /// Parses the `event.time.format` property into an [`EventTimeFormat`].
+    fn parse_event_time_format(config: &ConnectorConfig) -> Option<EventTimeFormat> {
+        match config.get("event.time.format").map(str::to_lowercase) {
+            Some(ref s) if s == "epoch_millis" => Some(EventTimeFormat::EpochMillis),
+            Some(ref s) if s == "epoch_micros" => Some(EventTimeFormat::EpochMicros),
+            Some(ref s) if s == "epoch_nanos" => Some(EventTimeFormat::EpochNanos),
+            Some(ref s) if s == "epoch_seconds" => Some(EventTimeFormat::EpochSeconds),
+            Some(ref s) if s == "iso8601" => Some(EventTimeFormat::Iso8601),
+            Some(other) => Some(EventTimeFormat::Custom(other.clone())),
+            None => None,
+        }
+    }
+
+    /// Parses the `auth.*` properties into an optional [`WsAuthConfig`].
+    fn parse_auth(config: &ConnectorConfig) -> Result<Option<WsAuthConfig>, ConnectorError> {
+        match config.get("auth.type").map(str::to_lowercase) {
+            Some(ref s) if s == "bearer" => {
+                let token = config.require("auth.token").map(ToString::to_string)?;
+                Ok(Some(WsAuthConfig::Bearer { token }))
+            }
+            Some(ref s) if s == "basic" => {
+                let username = config.require("auth.username").map(ToString::to_string)?;
+                let password = config.require("auth.password").map(ToString::to_string)?;
+                Ok(Some(WsAuthConfig::Basic { username, password }))
+            }
+            Some(ref s) if s == "hmac" => {
+                let api_key = config.require("auth.api.key").map(ToString::to_string)?;
+                let secret = config.require("auth.secret").map(ToString::to_string)?;
+                Ok(Some(WsAuthConfig::Hmac { api_key, secret }))
+            }
+            Some(ref other) => Err(ConnectorError::ConfigurationError(format!(
+                "unsupported auth type '{other}': expected bearer, basic, or hmac"
+            ))),
+            None => Ok(None),
         }
     }
 }
@@ -668,5 +834,118 @@ mod tests {
         assert_eq!(default_max_delay(), Duration::from_secs(30));
         assert!((default_backoff_multiplier() - 2.0).abs() < f64::EPSILON);
         assert!(default_true());
+    }
+
+    // -- from_config tests ---------------------------------------------------
+
+    #[test]
+    fn test_from_config_client_mode() {
+        let mut config = ConnectorConfig::new("websocket");
+        config.set("url", "wss://feed.example.com/v1");
+        config.set("format", "json");
+        config.set("subscribe.message", r#"{"op":"subscribe"}"#);
+        config.set("reconnect.enabled", "true");
+        config.set("reconnect.initial.delay.ms", "200");
+        config.set("reconnect.max.delay.ms", "60000");
+        config.set("ping.interval.ms", "15000");
+        config.set("ping.timeout.ms", "5000");
+
+        let cfg = WebSocketSourceConfig::from_config(&config).unwrap();
+
+        match &cfg.mode {
+            SourceMode::Client {
+                urls,
+                subscribe_message,
+                reconnect,
+                ping_interval,
+                ping_timeout,
+            } => {
+                assert_eq!(urls, &["wss://feed.example.com/v1"]);
+                assert_eq!(subscribe_message.as_deref(), Some(r#"{"op":"subscribe"}"#));
+                assert!(reconnect.enabled);
+                assert_eq!(reconnect.initial_delay, Duration::from_millis(200));
+                assert_eq!(reconnect.max_delay, Duration::from_millis(60_000));
+                assert_eq!(*ping_interval, Duration::from_millis(15_000));
+                assert_eq!(*ping_timeout, Duration::from_millis(5_000));
+            }
+            SourceMode::Server { .. } => panic!("expected Client mode"),
+        }
+        assert!(matches!(cfg.format, MessageFormat::Json));
+    }
+
+    #[test]
+    fn test_from_config_server_mode() {
+        let mut config = ConnectorConfig::new("websocket");
+        config.set("mode", "server");
+        config.set("bind.address", "0.0.0.0:9443");
+        config.set("max.connections", "512");
+        config.set("path", "/ingest");
+
+        let cfg = WebSocketSourceConfig::from_config(&config).unwrap();
+
+        match &cfg.mode {
+            SourceMode::Server {
+                bind_address,
+                max_connections,
+                path,
+            } => {
+                assert_eq!(bind_address, "0.0.0.0:9443");
+                assert_eq!(*max_connections, 512);
+                assert_eq!(path.as_deref(), Some("/ingest"));
+            }
+            SourceMode::Client { .. } => panic!("expected Server mode"),
+        }
+    }
+
+    #[test]
+    fn test_from_config_missing_url_errors() {
+        let config = ConnectorConfig::new("websocket");
+        // Client mode is default — missing URL should error.
+        let result = WebSocketSourceConfig::from_config(&config);
+        assert!(result.is_err());
+        assert!(result.unwrap_err().to_string().contains("url"));
+    }
+
+    #[test]
+    fn test_from_config_bearer_auth() {
+        let mut config = ConnectorConfig::new("websocket");
+        config.set("url", "wss://api.example.com");
+        config.set("auth.type", "bearer");
+        config.set("auth.token", "tok_abc123");
+
+        let cfg = WebSocketSourceConfig::from_config(&config).unwrap();
+        assert!(matches!(
+            cfg.auth,
+            Some(WsAuthConfig::Bearer { ref token }) if token == "tok_abc123"
+        ));
+    }
+
+    #[test]
+    fn test_from_config_multiple_urls() {
+        let mut config = ConnectorConfig::new("websocket");
+        config.set("url", "wss://a.example.com, wss://b.example.com");
+
+        let cfg = WebSocketSourceConfig::from_config(&config).unwrap();
+        match &cfg.mode {
+            SourceMode::Client { urls, .. } => {
+                assert_eq!(urls.len(), 2);
+                assert_eq!(urls[0], "wss://a.example.com");
+                assert_eq!(urls[1], "wss://b.example.com");
+            }
+            SourceMode::Server { .. } => panic!("expected Client mode"),
+        }
+    }
+
+    #[test]
+    fn test_from_config_defaults() {
+        let mut config = ConnectorConfig::new("websocket");
+        config.set("url", "wss://feed.example.com");
+
+        let cfg = WebSocketSourceConfig::from_config(&config).unwrap();
+        assert!(matches!(cfg.format, MessageFormat::Json));
+        assert!(matches!(cfg.on_backpressure, BackpressureStrategy::Block));
+        assert_eq!(cfg.max_message_size, 64 * 1024 * 1024);
+        assert!(cfg.event_time_field.is_none());
+        assert!(cfg.auth.is_none());
     }
 }

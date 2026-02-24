@@ -97,8 +97,13 @@ impl WebSocketSourceServer {
 #[async_trait]
 #[allow(clippy::too_many_lines)]
 impl SourceConnector for WebSocketSourceServer {
-    async fn open(&mut self, _config: &ConnectorConfig) -> Result<(), ConnectorError> {
+    async fn open(&mut self, config: &ConnectorConfig) -> Result<(), ConnectorError> {
         self.state = ConnectorState::Initializing;
+
+        // If config has properties, re-parse (supports runtime config via SQL WITH).
+        if !config.properties().is_empty() {
+            self.config = WebSocketSourceConfig::from_config(config)?;
+        }
 
         let (bind_address, max_connections, _path) = match &self.config.mode {
             SourceMode::Server {

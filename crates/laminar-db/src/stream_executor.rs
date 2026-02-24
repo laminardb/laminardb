@@ -1111,6 +1111,7 @@ mod tests {
     use super::*;
     use arrow::array::{Float64Array, Int64Array, StringArray};
     use arrow::datatypes::{DataType, Field, Schema};
+    use laminar_sql::create_session_context;
     use laminar_sql::register_streaming_functions;
 
     fn test_schema() -> Arc<Schema> {
@@ -1136,7 +1137,7 @@ mod tests {
 
     #[tokio::test]
     async fn test_executor_basic_query() {
-        let ctx = SessionContext::new();
+        let ctx = create_session_context();
         register_streaming_functions(&ctx);
         let mut executor = StreamExecutor::new(ctx);
 
@@ -1165,7 +1166,7 @@ mod tests {
 
     #[tokio::test]
     async fn test_executor_empty_source() {
-        let ctx = SessionContext::new();
+        let ctx = create_session_context();
         register_streaming_functions(&ctx);
         let mut executor = StreamExecutor::new(ctx);
 
@@ -1191,7 +1192,7 @@ mod tests {
 
     #[tokio::test]
     async fn test_executor_multiple_queries() {
-        let ctx = SessionContext::new();
+        let ctx = create_session_context();
         register_streaming_functions(&ctx);
         let mut executor = StreamExecutor::new(ctx);
 
@@ -1223,7 +1224,7 @@ mod tests {
 
     #[tokio::test]
     async fn test_executor_with_filter() {
-        let ctx = SessionContext::new();
+        let ctx = create_session_context();
         register_streaming_functions(&ctx);
         let mut executor = StreamExecutor::new(ctx);
 
@@ -1249,7 +1250,7 @@ mod tests {
 
     #[tokio::test]
     async fn test_executor_cleanup_between_cycles() {
-        let ctx = SessionContext::new();
+        let ctx = create_session_context();
         register_streaming_functions(&ctx);
         let mut executor = StreamExecutor::new(ctx);
 
@@ -1281,7 +1282,7 @@ mod tests {
 
     #[tokio::test]
     async fn test_executor_register_table() {
-        let ctx = SessionContext::new();
+        let ctx = create_session_context();
         register_streaming_functions(&ctx);
         let mut executor = StreamExecutor::new(ctx);
 
@@ -1350,7 +1351,7 @@ mod tests {
 
     #[tokio::test]
     async fn test_cascading_queries() {
-        let ctx = SessionContext::new();
+        let ctx = create_session_context();
         register_streaming_functions(&ctx);
         let mut executor = StreamExecutor::new(ctx);
 
@@ -1394,7 +1395,7 @@ mod tests {
 
     #[tokio::test]
     async fn test_three_level_cascade() {
-        let ctx = SessionContext::new();
+        let ctx = create_session_context();
         register_streaming_functions(&ctx);
         let mut executor = StreamExecutor::new(ctx);
 
@@ -1450,7 +1451,7 @@ mod tests {
 
     #[tokio::test]
     async fn test_diamond_cascade() {
-        let ctx = SessionContext::new();
+        let ctx = create_session_context();
         register_streaming_functions(&ctx);
         let mut executor = StreamExecutor::new(ctx);
 
@@ -1498,7 +1499,7 @@ mod tests {
 
     #[tokio::test]
     async fn test_topo_order_ignores_insertion_order() {
-        let ctx = SessionContext::new();
+        let ctx = create_session_context();
         register_streaming_functions(&ctx);
         let mut executor = StreamExecutor::new(ctx);
 
@@ -1542,7 +1543,7 @@ mod tests {
 
     #[tokio::test]
     async fn test_cascade_empty_source() {
-        let ctx = SessionContext::new();
+        let ctx = create_session_context();
         register_streaming_functions(&ctx);
         let mut executor = StreamExecutor::new(ctx);
 
@@ -1569,7 +1570,7 @@ mod tests {
 
     #[tokio::test]
     async fn test_execute_cycle_propagates_planning_error() {
-        let ctx = SessionContext::new();
+        let ctx = create_session_context();
         register_streaming_functions(&ctx);
         let mut executor = StreamExecutor::new(ctx);
 
@@ -1596,7 +1597,7 @@ mod tests {
 
     #[tokio::test]
     async fn test_execute_cycle_propagates_execution_error() {
-        let ctx = SessionContext::new();
+        let ctx = create_session_context();
         register_streaming_functions(&ctx);
         let mut executor = StreamExecutor::new(ctx);
 
@@ -1702,7 +1703,7 @@ mod tests {
 
     #[tokio::test]
     async fn test_asof_streaming_basic() {
-        let ctx = SessionContext::new();
+        let ctx = create_session_context();
         register_streaming_functions(&ctx);
         let mut executor = StreamExecutor::new(ctx);
 
@@ -1741,7 +1742,7 @@ mod tests {
 
     #[tokio::test]
     async fn test_asof_streaming_with_aliases_and_computed_columns() {
-        let ctx = SessionContext::new();
+        let ctx = create_session_context();
         register_streaming_functions(&ctx);
         let mut executor = StreamExecutor::new(ctx);
 
@@ -1786,7 +1787,7 @@ mod tests {
 
     #[tokio::test]
     async fn test_asof_streaming_empty_sources() {
-        let ctx = SessionContext::new();
+        let ctx = create_session_context();
         register_streaming_functions(&ctx);
         let mut executor = StreamExecutor::new(ctx);
 
@@ -1819,7 +1820,7 @@ mod tests {
 
     #[tokio::test]
     async fn test_asof_in_cascade() {
-        let ctx = SessionContext::new();
+        let ctx = create_session_context();
         register_streaming_functions(&ctx);
         let mut executor = StreamExecutor::new(ctx);
 
@@ -1863,7 +1864,7 @@ mod tests {
     #[tokio::test]
     async fn test_non_asof_queries_unaffected() {
         // Verify that non-ASOF queries still work exactly as before
-        let ctx = SessionContext::new();
+        let ctx = create_session_context();
         register_streaming_functions(&ctx);
         let mut executor = StreamExecutor::new(ctx);
 
@@ -1925,7 +1926,7 @@ mod tests {
 
     #[tokio::test]
     async fn test_eowc_suppresses_until_watermark_advances() {
-        let ctx = SessionContext::new();
+        let ctx = create_session_context();
         register_streaming_functions(&ctx);
         let mut executor = StreamExecutor::new(ctx);
 
@@ -1964,7 +1965,7 @@ mod tests {
 
     #[tokio::test]
     async fn test_eowc_accumulates_across_cycles() {
-        let ctx = SessionContext::new();
+        let ctx = create_session_context();
         register_streaming_functions(&ctx);
         let mut executor = StreamExecutor::new(ctx);
 
@@ -2014,7 +2015,7 @@ mod tests {
 
     #[tokio::test]
     async fn test_eowc_purges_old_data() {
-        let ctx = SessionContext::new();
+        let ctx = create_session_context();
         register_streaming_functions(&ctx);
         let mut executor = StreamExecutor::new(ctx);
 
@@ -2066,7 +2067,7 @@ mod tests {
     #[tokio::test]
     async fn test_non_eowc_unaffected() {
         // Verify that non-EOWC queries still emit every cycle
-        let ctx = SessionContext::new();
+        let ctx = create_session_context();
         register_streaming_functions(&ctx);
         let mut executor = StreamExecutor::new(ctx);
 
@@ -2096,7 +2097,7 @@ mod tests {
 
     #[tokio::test]
     async fn test_mixed_eowc_and_non_eowc() {
-        let ctx = SessionContext::new();
+        let ctx = create_session_context();
         register_streaming_functions(&ctx);
         let mut executor = StreamExecutor::new(ctx);
 
@@ -2214,7 +2215,7 @@ mod tests {
 
     #[test]
     fn test_precomputed_table_refs() {
-        let ctx = SessionContext::new();
+        let ctx = create_session_context();
         let mut executor = StreamExecutor::new(ctx);
 
         executor.add_query(
@@ -2260,7 +2261,7 @@ mod tests {
 
     #[tokio::test]
     async fn test_precomputed_table_refs_used_in_topo_order() {
-        let ctx = SessionContext::new();
+        let ctx = create_session_context();
         register_streaming_functions(&ctx);
         let mut executor = StreamExecutor::new(ctx);
 
@@ -2383,7 +2384,7 @@ mod tests {
     async fn test_executor_topk_query() {
         use laminar_sql::parser::order_analyzer::OrderColumn;
 
-        let ctx = SessionContext::new();
+        let ctx = create_session_context();
         register_streaming_functions(&ctx);
         let mut executor = StreamExecutor::new(ctx);
 
@@ -2415,5 +2416,150 @@ mod tests {
         assert!(results.contains_key("topk_stream"));
         let total_rows: usize = results["topk_stream"].iter().map(|b| b.num_rows()).sum();
         assert_eq!(total_rows, 2);
+    }
+
+    // -- Mixed-case column tests (identifier normalization disabled) --
+
+    fn mixed_case_schema() -> Arc<Schema> {
+        Arc::new(Schema::new(vec![
+            Field::new("tradeId", DataType::Int64, false),
+            Field::new("symbol", DataType::Utf8, false),
+            Field::new("lastPrice", DataType::Float64, false),
+            Field::new("orderQty", DataType::Int64, false),
+        ]))
+    }
+
+    fn mixed_case_batch() -> RecordBatch {
+        RecordBatch::try_new(
+            mixed_case_schema(),
+            vec![
+                Arc::new(Int64Array::from(vec![101, 102, 103])),
+                Arc::new(StringArray::from(vec!["AAPL", "GOOG", "MSFT"])),
+                Arc::new(Float64Array::from(vec![150.5, 2800.0, 310.25])),
+                Arc::new(Int64Array::from(vec![10, 5, 20])),
+            ],
+        )
+        .unwrap()
+    }
+
+    #[tokio::test]
+    async fn test_mixed_case_select() {
+        let ctx = create_session_context();
+        register_streaming_functions(&ctx);
+        let mut executor = StreamExecutor::new(ctx);
+
+        executor.add_query(
+            "trades_stream".to_string(),
+            "SELECT tradeId, symbol, lastPrice FROM trades".to_string(),
+            None,
+            None,
+            None,
+        );
+
+        let mut source_batches = HashMap::new();
+        source_batches.insert("trades".to_string(), vec![mixed_case_batch()]);
+
+        let results = executor
+            .execute_cycle(&source_batches, i64::MAX)
+            .await
+            .unwrap();
+        assert!(results.contains_key("trades_stream"));
+        let batches = &results["trades_stream"];
+        let total_rows: usize = batches.iter().map(|b| b.num_rows()).sum();
+        assert_eq!(total_rows, 3);
+
+        // Verify column names are preserved
+        let schema = batches[0].schema();
+        assert_eq!(schema.field(0).name(), "tradeId");
+        assert_eq!(schema.field(1).name(), "symbol");
+        assert_eq!(schema.field(2).name(), "lastPrice");
+    }
+
+    #[tokio::test]
+    async fn test_mixed_case_aggregate() {
+        let ctx = create_session_context();
+        register_streaming_functions(&ctx);
+        let mut executor = StreamExecutor::new(ctx);
+
+        executor.add_query(
+            "agg_stream".to_string(),
+            "SELECT symbol, AVG(lastPrice) as avgPrice, MAX(orderQty) as maxQty \
+             FROM trades GROUP BY symbol"
+                .to_string(),
+            None,
+            None,
+            None,
+        );
+
+        let mut source_batches = HashMap::new();
+        source_batches.insert("trades".to_string(), vec![mixed_case_batch()]);
+
+        let results = executor
+            .execute_cycle(&source_batches, i64::MAX)
+            .await
+            .unwrap();
+        assert!(results.contains_key("agg_stream"));
+        let batches = &results["agg_stream"];
+        assert!(!batches.is_empty());
+        let total_rows: usize = batches.iter().map(|b| b.num_rows()).sum();
+        assert_eq!(total_rows, 3); // 3 distinct symbols
+    }
+
+    #[tokio::test]
+    async fn test_mixed_case_filter() {
+        let ctx = create_session_context();
+        register_streaming_functions(&ctx);
+        let mut executor = StreamExecutor::new(ctx);
+
+        executor.add_query(
+            "filtered_stream".to_string(),
+            "SELECT tradeId, lastPrice FROM trades WHERE lastPrice > 200.0".to_string(),
+            None,
+            None,
+            None,
+        );
+
+        let mut source_batches = HashMap::new();
+        source_batches.insert("trades".to_string(), vec![mixed_case_batch()]);
+
+        let results = executor
+            .execute_cycle(&source_batches, i64::MAX)
+            .await
+            .unwrap();
+        assert!(results.contains_key("filtered_stream"));
+        let batches = &results["filtered_stream"];
+        let total_rows: usize = batches.iter().map(|b| b.num_rows()).sum();
+        assert_eq!(total_rows, 2); // GOOG (2800) and MSFT (310.25) > 200
+    }
+
+    #[tokio::test]
+    async fn test_mixed_case_star_select() {
+        let ctx = create_session_context();
+        register_streaming_functions(&ctx);
+        let mut executor = StreamExecutor::new(ctx);
+
+        executor.add_query(
+            "star_stream".to_string(),
+            "SELECT * FROM trades".to_string(),
+            None,
+            None,
+            None,
+        );
+
+        let mut source_batches = HashMap::new();
+        source_batches.insert("trades".to_string(), vec![mixed_case_batch()]);
+
+        let results = executor
+            .execute_cycle(&source_batches, i64::MAX)
+            .await
+            .unwrap();
+        assert!(results.contains_key("star_stream"));
+        let batches = &results["star_stream"];
+        let schema = batches[0].schema();
+        // All original mixed-case names should be preserved
+        assert_eq!(schema.field(0).name(), "tradeId");
+        assert_eq!(schema.field(1).name(), "symbol");
+        assert_eq!(schema.field(2).name(), "lastPrice");
+        assert_eq!(schema.field(3).name(), "orderQty");
     }
 }

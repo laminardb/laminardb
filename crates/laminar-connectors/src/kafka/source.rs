@@ -236,14 +236,12 @@ impl SourceConnector for KafkaSource {
         };
 
         // Override schema from SQL DDL if provided.
-        if let Some(schema_str) = config.get("_arrow_schema") {
-            if let Some(schema) = parse_arrow_schema(schema_str) {
-                info!(
-                    fields = schema.fields().len(),
-                    "using SQL-defined schema for deserialization"
-                );
-                self.schema = Arc::new(schema);
-            }
+        if let Some(schema) = config.arrow_schema() {
+            info!(
+                fields = schema.fields().len(),
+                "using SQL-defined schema for deserialization"
+            );
+            self.schema = schema;
         }
 
         info!(
@@ -510,43 +508,6 @@ fn select_deserializer(format: Format) -> Box<dyn RecordDeserializer> {
         Format::Avro => Box::new(AvroDeserializer::new()),
         other => serde::create_deserializer(other)
             .expect("supported format should always create a deserializer"),
-    }
-}
-
-/// Parse an Arrow schema from the compact `name:type,name:type,...` encoding
-/// produced by `encode_arrow_schema` in laminar-db.
-fn parse_arrow_schema(s: &str) -> Option<arrow_schema::Schema> {
-    use arrow_schema::{DataType, Field};
-
-    let fields: Vec<Field> = s
-        .split(',')
-        .filter(|part| !part.is_empty())
-        .filter_map(|part| {
-            let (name, type_str) = part.split_once(':')?;
-            let dt = match type_str {
-                "Utf8" => DataType::Utf8,
-                "LargeUtf8" => DataType::LargeUtf8,
-                "Float64" => DataType::Float64,
-                "Float32" => DataType::Float32,
-                "Int64" => DataType::Int64,
-                "Int32" => DataType::Int32,
-                "Int16" => DataType::Int16,
-                "Int8" => DataType::Int8,
-                "UInt64" => DataType::UInt64,
-                "UInt32" => DataType::UInt32,
-                "Boolean" => DataType::Boolean,
-                "Date32" => DataType::Date32,
-                "Date64" => DataType::Date64,
-                _ => return None,
-            };
-            Some(Field::new(name, dt, true))
-        })
-        .collect();
-
-    if fields.is_empty() {
-        None
-    } else {
-        Some(arrow_schema::Schema::new(fields))
     }
 }
 
