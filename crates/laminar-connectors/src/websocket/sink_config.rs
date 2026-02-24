@@ -10,6 +10,8 @@ use std::time::Duration;
 use serde::{Deserialize, Serialize};
 
 use super::source_config::{ReconnectConfig, WsAuthConfig};
+use crate::config::ConnectorConfig;
+use crate::error::ConnectorError;
 
 // ---------------------------------------------------------------------------
 // Serde default helpers
@@ -53,6 +55,118 @@ pub struct WebSocketSinkConfig {
     pub format: SinkFormat,
     /// Optional authentication configuration shared with the source connector.
     pub auth: Option<WsAuthConfig>,
+}
+
+impl WebSocketSinkConfig {
+    /// Builds a [`WebSocketSinkConfig`] from a flat [`ConnectorConfig`] property map.
+    ///
+    /// # Errors
+    ///
+    /// Returns `ConnectorError::ConfigurationError` if a required key is missing
+    /// or a value cannot be parsed.
+    pub fn from_config(config: &ConnectorConfig) -> Result<Self, ConnectorError> {
+        let mode_str = config.get("mode").unwrap_or("server");
+        let mode = match mode_str.to_lowercase().as_str() {
+            "server" => {
+                let bind_address = config
+                    .require("bind.address")
+                    .map(ToString::to_string)?;
+                let max_connections: usize = config
+                    .get_parsed("max.connections")?
+                    .unwrap_or(default_max_connections());
+                let per_client_buffer: usize = config
+                    .get_parsed("per.client.buffer")?
+                    .unwrap_or(default_per_client_buffer());
+                let ping_interval_ms: u64 = config
+                    .get_parsed("ping.interval.ms")?
+                    .unwrap_or(30_000);
+                let ping_timeout_ms: u64 = config
+                    .get_parsed("ping.timeout.ms")?
+                    .unwrap_or(10_000);
+                let replay_buffer_size: Option<usize> =
+                    config.get_parsed("replay.buffer.size")?;
+                let path = config.get("path").map(ToString::to_string);
+
+                let slow_client_policy =
+                    match config.get("slow.client.policy").map(str::to_lowercase) {
+                        Some(ref s) if s == "drop_oldest" => SlowClientPolicy::DropOldest,
+                        Some(ref s) if s == "drop_newest" => SlowClientPolicy::DropNewest,
+                        Some(ref s) if s == "disconnect" => SlowClientPolicy::Disconnect {
+                            threshold_pct: config
+                                .get_parsed("slow.client.threshold.pct")?
+                                .unwrap_or(90),
+                        },
+                        _ => SlowClientPolicy::default(),
+                    };
+
+                SinkMode::Server {
+                    bind_address,
+                    path,
+                    max_connections,
+                    per_client_buffer,
+                    slow_client_policy,
+                    ping_interval: Duration::from_millis(ping_interval_ms),
+                    ping_timeout: Duration::from_millis(ping_timeout_ms),
+                    enable_subscription_filter: false,
+                    replay_buffer_size,
+                }
+            }
+            "client" => {
+                let url = config.require("url").map(ToString::to_string)?;
+                let buffer_on_disconnect: Option<usize> =
+                    config.get_parsed("buffer.on.disconnect")?;
+                let batch_max_size: Option<usize> = config.get_parsed("batch.max.size")?;
+                let batch_interval_ms: Option<u64> =
+                    config.get_parsed("batch.interval.ms")?;
+
+                SinkMode::Client {
+                    url,
+                    reconnect: ReconnectConfig::default(),
+                    buffer_on_disconnect,
+                    batch_interval: batch_interval_ms.map(Duration::from_millis),
+                    batch_max_size,
+                }
+            }
+            other => {
+                return Err(ConnectorError::ConfigurationError(format!(
+                    "invalid WebSocket sink mode '{other}': expected 'server' or 'client'"
+                )));
+            }
+        };
+
+        let format = match config.get("format").map(str::to_lowercase) {
+            Some(ref s) if s == "json" => SinkFormat::Json,
+            Some(ref s) if s == "jsonlines" || s == "json_lines" => SinkFormat::JsonLines,
+            Some(ref s) if s == "arrow_ipc" || s == "arowipc" => SinkFormat::ArrowIpc,
+            Some(ref s) if s == "binary" => SinkFormat::Binary,
+            Some(ref other) => {
+                return Err(ConnectorError::ConfigurationError(format!(
+                    "invalid sink format '{other}': expected json, jsonlines, arrow_ipc, or binary"
+                )));
+            }
+            None => SinkFormat::Json,
+        };
+
+        let auth = match config.get("auth.type").map(str::to_lowercase) {
+            Some(ref s) if s == "bearer" => {
+                let token = config.require("auth.token").map(ToString::to_string)?;
+                Some(WsAuthConfig::Bearer { token })
+            }
+            Some(ref s) if s == "basic" => {
+                let username = config.require("auth.username").map(ToString::to_string)?;
+                let password = config.require("auth.password").map(ToString::to_string)?;
+                Some(WsAuthConfig::Basic { username, password })
+            }
+            Some(ref s) if s == "hmac" => {
+                let api_key = config.require("auth.api.key").map(ToString::to_string)?;
+                let secret = config.require("auth.secret").map(ToString::to_string)?;
+                Some(WsAuthConfig::Hmac { api_key, secret })
+            }
+            _ => None,
+        };
+
+        Ok(Self { mode, format, auth })
+    }
 }
 
 // ---------------------------------------------------------------------------
@@ -428,5 +542,69 @@ mod tests {
             }
             SinkMode::Client { .. } => panic!("expected Server"),
         }
+    }
+
+    // -- from_config tests ---------------------------------------------------
+
+    #[test]
+    fn test_from_config_server_mode() {
+        let mut config = ConnectorConfig::new("websocket");
+        config.set("bind.address", "0.0.0.0:3000");
+        config.set("max.connections", "2000");
+        config.set("format", "jsonlines");
+
+        let cfg = WebSocketSinkConfig::from_config(&config).unwrap();
+        assert_eq!(cfg.format, SinkFormat::JsonLines);
+        match cfg.mode {
+            SinkMode::Server {
+                bind_address,
+                max_connections,
+                ..
+            } => {
+                assert_eq!(bind_address, "0.0.0.0:3000");
+                assert_eq!(max_connections, 2000);
+            }
+            SinkMode::Client { .. } => panic!("expected Server mode"),
+        }
+    }
+
+    #[test]
+    fn test_from_config_client_mode() {
+        let mut config = ConnectorConfig::new("websocket");
+        config.set("mode", "client");
+        config.set("url", "wss://upstream.example.com/feed");
+        config.set("format", "json");
+
+        let cfg = WebSocketSinkConfig::from_config(&config).unwrap();
+        assert_eq!(cfg.format, SinkFormat::Json);
+        match cfg.mode {
+            SinkMode::Client { url, .. } => {
+                assert_eq!(url, "wss://upstream.example.com/feed");
+            }
+            SinkMode::Server { .. } => panic!("expected Client mode"),
+        }
+    }
+
+    #[test]
+    fn test_from_config_missing_bind_address_errors() {
+        let config = ConnectorConfig::new("websocket");
+        // Server mode is default — missing bind.address should error.
+        let result = WebSocketSinkConfig::from_config(&config);
+        assert!(result.is_err());
+        assert!(result.unwrap_err().to_string().contains("bind.address"));
+    }
+
+    #[test]
+    fn test_from_config_bearer_auth() {
+        let mut config = ConnectorConfig::new("websocket");
+        config.set("bind.address", "0.0.0.0:8080");
+        config.set("auth.type", "bearer");
+        config.set("auth.token", "my-secret");
+
+        let cfg = WebSocketSinkConfig::from_config(&config).unwrap();
+        assert!(matches!(
+            cfg.auth,
+            Some(WsAuthConfig::Bearer { ref token }) if token == "my-secret"
+        ));
     }
 }

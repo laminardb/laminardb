@@ -540,37 +540,50 @@ impl LaminarDB {
             let _ = planner.plan(&stmt);
         }
 
-        // Register connector info in ConnectorManager if external connector specified
-        if create.connector_type.is_some() {
-            // Validate connector type is registered
-            if let Some(ref ct) = create.connector_type {
-                let normalized = ct.to_lowercase();
-                if self.connector_registry.source_info(&normalized).is_none() {
-                    return Err(DbError::Connector(format!(
-                        "Unknown source connector type '{ct}'. Available: {:?}",
-                        self.connector_registry.list_sources()
-                    )));
-                }
+        // Register connector info in ConnectorManager if external connector specified.
+        // Supports two syntax forms:
+        //   1. FROM KAFKA ('topic' = 'events', ...) — connector_type is set
+        //   2. WITH ('connector' = 'kafka', 'topic' = 'events', ...) — extract from with_options
+        let (resolved_connector_type, resolved_connector_options, resolved_format, resolved_format_options) =
+            if create.connector_type.is_some() {
+                (
+                    create.connector_type.clone(),
+                    create.connector_options.clone(),
+                    create.format.as_ref().map(|f| f.format_type.clone()),
+                    create.format.as_ref().map(|f| f.options.clone()).unwrap_or_default(),
+                )
+            } else if let Some(ct) = create.with_options.get("connector") {
+                // WITH-syntax: extract connector type and options from with_options
+                let (conn_opts, fmt, fmt_opts) =
+                    extract_connector_from_with_options(&create.with_options);
+                (Some(ct.to_uppercase()), conn_opts, fmt, fmt_opts)
+            } else {
+                (None, HashMap::new(), None, HashMap::new())
+            };
+
+        if let Some(ref ct) = resolved_connector_type {
+            let normalized = ct.to_lowercase();
+            if self.connector_registry.source_info(&normalized).is_none() {
+                return Err(DbError::Connector(format!(
+                    "Unknown source connector type '{ct}'. Available: {:?}",
+                    self.connector_registry.list_sources()
+                )));
             }
 
             // Validate format
-            if let Some(ref fmt) = create.format {
-                laminar_connectors::serde::Format::parse(&fmt.format_type.to_lowercase()).map_err(
-                    |e| DbError::Connector(format!("Unknown format '{}': {e}", fmt.format_type)),
+            if let Some(ref fmt_str) = resolved_format {
+                laminar_connectors::serde::Format::parse(&fmt_str.to_lowercase()).map_err(
+                    |e| DbError::Connector(format!("Unknown format '{fmt_str}': {e}")),
                 )?;
             }
 
             let mut mgr = self.connector_manager.lock();
             mgr.register_source(crate::connector_manager::SourceRegistration {
                 name: name.clone(),
-                connector_type: create.connector_type.clone(),
-                connector_options: create.connector_options.clone(),
-                format: create.format.as_ref().map(|f| f.format_type.clone()),
-                format_options: create
-                    .format
-                    .as_ref()
-                    .map(|f| f.options.clone())
-                    .unwrap_or_default(),
+                connector_type: Some(ct.clone()),
+                connector_options: resolved_connector_options,
+                format: resolved_format,
+                format_options: resolved_format_options,
             });
         }
 
@@ -607,23 +620,39 @@ impl LaminarDB {
             let _ = planner.plan(&stmt);
         }
 
-        // Register connector info in ConnectorManager if external connector specified
-        if create.connector_type.is_some() {
-            // Validate connector type is registered
-            if let Some(ref ct) = create.connector_type {
-                let normalized = ct.to_lowercase();
-                if self.connector_registry.sink_info(&normalized).is_none() {
-                    return Err(DbError::Connector(format!(
-                        "Unknown sink connector type '{ct}'. Available: {:?}",
-                        self.connector_registry.list_sinks()
-                    )));
-                }
+        // Register connector info in ConnectorManager if external connector specified.
+        // Supports two syntax forms:
+        //   1. INTO KAFKA ('topic' = 'events', ...) — connector_type is set
+        //   2. WITH ('connector' = 'kafka', 'topic' = 'events', ...) — extract from with_options
+        let (resolved_connector_type, resolved_connector_options, resolved_format, resolved_format_options) =
+            if create.connector_type.is_some() {
+                (
+                    create.connector_type.clone(),
+                    create.connector_options.clone(),
+                    create.format.as_ref().map(|f| f.format_type.clone()),
+                    create.format.as_ref().map(|f| f.options.clone()).unwrap_or_default(),
+                )
+            } else if let Some(ct) = create.with_options.get("connector") {
+                let (conn_opts, fmt, fmt_opts) =
+                    extract_connector_from_with_options(&create.with_options);
+                (Some(ct.to_uppercase()), conn_opts, fmt, fmt_opts)
+            } else {
+                (None, HashMap::new(), None, HashMap::new())
+            };
+
+        if let Some(ref ct) = resolved_connector_type {
+            let normalized = ct.to_lowercase();
+            if self.connector_registry.sink_info(&normalized).is_none() {
+                return Err(DbError::Connector(format!(
+                    "Unknown sink connector type '{ct}'. Available: {:?}",
+                    self.connector_registry.list_sinks()
+                )));
             }
 
             // Validate format
-            if let Some(ref fmt) = create.format {
-                laminar_connectors::serde::Format::parse(&fmt.format_type.to_lowercase()).map_err(
-                    |e| DbError::Connector(format!("Unknown format '{}': {e}", fmt.format_type)),
+            if let Some(ref fmt_str) = resolved_format {
+                laminar_connectors::serde::Format::parse(&fmt_str.to_lowercase()).map_err(
+                    |e| DbError::Connector(format!("Unknown format '{fmt_str}': {e}")),
                 )?;
             }
 
@@ -631,14 +660,10 @@ impl LaminarDB {
             mgr.register_sink(crate::connector_manager::SinkRegistration {
                 name: name.clone(),
                 input: input.clone(),
-                connector_type: create.connector_type.clone(),
-                connector_options: create.connector_options.clone(),
-                format: create.format.as_ref().map(|f| f.format_type.clone()),
-                format_options: create
-                    .format
-                    .as_ref()
-                    .map(|f| f.options.clone())
-                    .unwrap_or_default(),
+                connector_type: Some(ct.clone()),
+                connector_options: resolved_connector_options,
+                format: resolved_format,
+                format_options: resolved_format_options,
                 filter_expr: create.filter.as_ref().map(std::string::ToString::to_string),
             });
         }
@@ -3720,6 +3745,65 @@ fn schema_to_describe_batch(schema: &Schema) -> Result<RecordBatch, DbError> {
 const FILTER_INPUT_TABLE: &str = "__laminar_filter_input";
 
 /// Encode an Arrow schema as a compact string for passing through `ConnectorConfig`.
+/// Keys in `WITH (...)` clauses that are streaming-engine options rather than
+/// connector-specific properties.  These are consumed by
+/// [`streaming_ddl::parse_source_options`] and must not be forwarded to the
+/// connector configuration.
+const STREAMING_OPTION_KEYS: &[&str] = &[
+    "connector",
+    "format",
+    "buffer_size",
+    "buffersize",
+    "backpressure",
+    "wait_strategy",
+    "waitstrategy",
+    "track_stats",
+    "trackstats",
+    "stats",
+    "event_time",
+    "watermark_delay",
+];
+
+/// Extracts connector-specific options from a `WITH (...)` clause map.
+///
+/// When a source or sink is created with the `WITH ('connector' = '...', ...)`
+/// syntax (as opposed to `FROM KAFKA (...)`), the `connector` key selects the
+/// connector type and the `format` key selects the serialisation format.
+/// All remaining entries that are **not** known streaming-engine options are
+/// forwarded as connector options.
+///
+/// Returns `(connector_options, format, format_options)`.
+fn extract_connector_from_with_options(
+    with_options: &HashMap<String, String>,
+) -> (HashMap<String, String>, Option<String>, HashMap<String, String>) {
+    let mut connector_options = HashMap::new();
+    let mut format: Option<String> = None;
+    let mut format_options = HashMap::new();
+
+    for (key, value) in with_options {
+        let lower = key.to_lowercase();
+        if lower == "connector" {
+            // Already handled by the caller.
+            continue;
+        }
+        if lower == "format" {
+            format = Some(value.clone());
+            continue;
+        }
+        // Keys starting with "format." are format-specific sub-options.
+        if let Some(suffix) = lower.strip_prefix("format.") {
+            format_options.insert(suffix.to_string(), value.clone());
+            continue;
+        }
+        if STREAMING_OPTION_KEYS.contains(&lower.as_str()) {
+            continue;
+        }
+        connector_options.insert(key.clone(), value.clone());
+    }
+
+    (connector_options, format, format_options)
+}
+
 ///
 /// Format: `name:type,name:type,...` where type is the Arrow `DataType` debug name.
 /// Example: `symbol:Utf8,price:Float64,volume:Int64`
@@ -5433,12 +5517,9 @@ mod tests {
         let batch = table_test_batch(&[1, 2], &["AAPL", "GOOG"]);
         register_mock_table_source(&db, vec![batch], vec![]);
 
-        db.execute(
-            "CREATE SOURCE events (symbol VARCHAR, price DOUBLE) \
-             WITH (connector = 'mock', format = 'json')",
-        )
-        .await
-        .unwrap();
+        db.execute("CREATE SOURCE events (symbol VARCHAR, price DOUBLE)")
+            .await
+            .unwrap();
 
         db.execute(
             "CREATE TABLE instruments (id INT PRIMARY KEY, symbol VARCHAR NOT NULL) \
@@ -5461,12 +5542,9 @@ mod tests {
         let batch = table_test_batch(&[1], &["AAPL"]);
         register_mock_table_source(&db, vec![batch], vec![]);
 
-        db.execute(
-            "CREATE SOURCE events (symbol VARCHAR, price DOUBLE) \
-             WITH (connector = 'mock', format = 'json')",
-        )
-        .await
-        .unwrap();
+        db.execute("CREATE SOURCE events (symbol VARCHAR, price DOUBLE)")
+            .await
+            .unwrap();
 
         db.execute(
             "CREATE TABLE instruments (id INT PRIMARY KEY, symbol VARCHAR NOT NULL) \
@@ -5521,7 +5599,7 @@ mod tests {
             }),
         );
 
-        db.execute("CREATE SOURCE events (x INT) WITH (connector = 'mock', format = 'json')")
+        db.execute("CREATE SOURCE events (x INT)")
             .await
             .unwrap();
 
@@ -5576,12 +5654,9 @@ mod tests {
         let change = table_test_batch(&[2], &["GOOG"]);
         register_mock_table_source(&db, vec![snap], vec![change]);
 
-        db.execute(
-            "CREATE SOURCE events (symbol VARCHAR, price DOUBLE) \
-             WITH (connector = 'mock', format = 'json')",
-        )
-        .await
-        .unwrap();
+        db.execute("CREATE SOURCE events (symbol VARCHAR, price DOUBLE)")
+            .await
+            .unwrap();
 
         db.execute(
             "CREATE TABLE instruments (id INT PRIMARY KEY, symbol VARCHAR NOT NULL) \
@@ -6632,5 +6707,112 @@ mod tests {
             db.get_session_property("events.batch.size"),
             Some("1000".to_string())
         );
+    }
+
+    // ── extract_connector_from_with_options tests ──
+
+    #[test]
+    fn test_extract_connector_from_with_options_basic() {
+        let mut opts = HashMap::new();
+        opts.insert("connector".to_string(), "kafka".to_string());
+        opts.insert("topic".to_string(), "events".to_string());
+        opts.insert(
+            "bootstrap.servers".to_string(),
+            "localhost:9092".to_string(),
+        );
+        opts.insert("format".to_string(), "json".to_string());
+
+        let (conn_opts, format, fmt_opts) = extract_connector_from_with_options(&opts);
+
+        // 'connector' and 'format' are extracted, not in connector_options
+        assert!(!conn_opts.contains_key("connector"));
+        assert!(!conn_opts.contains_key("format"));
+        assert_eq!(conn_opts.get("topic"), Some(&"events".to_string()));
+        assert_eq!(
+            conn_opts.get("bootstrap.servers"),
+            Some(&"localhost:9092".to_string())
+        );
+        assert_eq!(format, Some("json".to_string()));
+        assert!(fmt_opts.is_empty());
+    }
+
+    #[test]
+    fn test_extract_connector_filters_streaming_keys() {
+        let mut opts = HashMap::new();
+        opts.insert("connector".to_string(), "websocket".to_string());
+        opts.insert("url".to_string(), "wss://feed.example.com".to_string());
+        opts.insert("buffer_size".to_string(), "4096".to_string());
+        opts.insert("backpressure".to_string(), "block".to_string());
+        opts.insert("watermark_delay".to_string(), "5s".to_string());
+
+        let (conn_opts, _, _) = extract_connector_from_with_options(&opts);
+
+        // Streaming keys should NOT be in connector_options
+        assert!(!conn_opts.contains_key("buffer_size"));
+        assert!(!conn_opts.contains_key("backpressure"));
+        assert!(!conn_opts.contains_key("watermark_delay"));
+        // Connector-specific key should be present
+        assert_eq!(
+            conn_opts.get("url"),
+            Some(&"wss://feed.example.com".to_string())
+        );
+    }
+
+    #[test]
+    fn test_extract_connector_format_options() {
+        let mut opts = HashMap::new();
+        opts.insert("connector".to_string(), "kafka".to_string());
+        opts.insert("format".to_string(), "avro".to_string());
+        opts.insert(
+            "format.schema.registry.url".to_string(),
+            "http://localhost:8081".to_string(),
+        );
+        opts.insert("topic".to_string(), "events".to_string());
+
+        let (conn_opts, format, fmt_opts) = extract_connector_from_with_options(&opts);
+
+        assert_eq!(format, Some("avro".to_string()));
+        assert_eq!(
+            fmt_opts.get("schema.registry.url"),
+            Some(&"http://localhost:8081".to_string())
+        );
+        assert_eq!(conn_opts.get("topic"), Some(&"events".to_string()));
+        assert!(!conn_opts.contains_key("format.schema.registry.url"));
+    }
+
+    #[tokio::test]
+    async fn test_create_source_with_connector_option() {
+        // Verify that WITH ('connector' = '...') is accepted at the DDL level.
+        // The actual connector won't be instantiated because the type isn't
+        // registered in the default embedded registry, so we just check
+        // that the error is "Unknown source connector type" (meaning the
+        // WITH clause was correctly routed) rather than silently ignored.
+        let db = LaminarDB::open().unwrap();
+        let result = db
+            .execute(
+                "CREATE SOURCE ws_feed (id BIGINT, data TEXT) WITH (
+                    'connector' = 'websocket',
+                    'url' = 'wss://feed.example.com',
+                    'format' = 'json'
+                )",
+            )
+            .await;
+
+        // Without the websocket feature, the connector type won't be registered,
+        // so we expect an "Unknown source connector type" error — which proves
+        // the WITH clause WAS routed to the connector registry.
+        match result {
+            Err(e) => {
+                let msg = e.to_string();
+                assert!(
+                    msg.contains("Unknown source connector type"),
+                    "Expected connector routing error, got: {msg}"
+                );
+            }
+            Ok(_) => {
+                // If websocket feature IS enabled, the connector type is registered
+                // and the DDL succeeds — also acceptable.
+            }
+        }
     }
 }

@@ -182,8 +182,13 @@ impl WebSocketSinkClient {
 
 #[async_trait]
 impl SinkConnector for WebSocketSinkClient {
-    async fn open(&mut self, _config: &ConnectorConfig) -> Result<(), ConnectorError> {
+    async fn open(&mut self, config: &ConnectorConfig) -> Result<(), ConnectorError> {
         self.state = ConnectorState::Initializing;
+
+        // If config has properties, re-parse (supports runtime config via SQL WITH).
+        if !config.properties().is_empty() {
+            self.config = WebSocketSinkConfig::from_config(config)?;
+        }
 
         let (url, reconnect) = match &self.config.mode {
             SinkMode::Client { url, reconnect, .. } => (url.clone(), reconnect.clone()),

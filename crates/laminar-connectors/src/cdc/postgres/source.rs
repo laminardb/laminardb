@@ -504,8 +504,13 @@ impl PostgresCdcSource {
 
 #[async_trait]
 impl SourceConnector for PostgresCdcSource {
-    async fn open(&mut self, _config: &ConnectorConfig) -> Result<(), ConnectorError> {
+    async fn open(&mut self, config: &ConnectorConfig) -> Result<(), ConnectorError> {
         self.state = ConnectorState::Initializing;
+
+        // If config has properties, re-parse (supports runtime config via SQL WITH).
+        if !config.properties().is_empty() {
+            self.config = PostgresCdcConfig::from_config(config)?;
+        }
 
         // Set start LSN if configured
         if let Some(lsn) = self.config.start_lsn {
