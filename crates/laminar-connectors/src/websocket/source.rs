@@ -293,8 +293,7 @@ impl SourceConnector for WebSocketSource {
                 "using SQL-defined schema for deserialization"
             );
             self.schema = schema;
-            self.parser =
-                MessageParser::new(self.schema.clone(), self.config.format.clone());
+            self.parser = MessageParser::new(self.schema.clone(), self.config.format.clone());
         }
 
         let mode = &self.config.mode;

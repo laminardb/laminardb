@@ -822,9 +822,7 @@ impl LaminarDB {
                 if let sqlparser::ast::TableConstraint::PrimaryKey { columns, .. } = constraint {
                     if let Some(first) = columns.first() {
                         primary_key = match &first.column.expr {
-                            sqlparser::ast::Expr::Identifier(ident) => {
-                                Some(ident.value.clone())
-                            }
+                            sqlparser::ast::Expr::Identifier(ident) => Some(ident.value.clone()),
                             other => Some(other.to_string()),
                         };
                     }
