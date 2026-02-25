@@ -114,6 +114,8 @@ pub(crate) struct IncrementalAggState {
     output_schema: SchemaRef,
     /// HAVING predicate SQL to apply after emitting aggregate results.
     having_sql: Option<String>,
+    /// Maximum number of distinct groups before new groups are dropped.
+    max_groups: usize,
 }
 
 impl IncrementalAggState {
@@ -313,6 +315,7 @@ impl IncrementalAggState {
             groups: HashMap::new(),
             output_schema,
             having_sql,
+            max_groups: 1_000_000,
         }))
     }
 
@@ -341,13 +344,23 @@ impl IncrementalAggState {
         // For each group, extract rows and update accumulators
         for (key, indices) in &group_indices {
             if !self.groups.contains_key(key) {
+                if self.groups.len() >= self.max_groups {
+                    tracing::warn!(
+                        max_groups = self.max_groups,
+                        current_groups = self.groups.len(),
+                        "group cardinality limit reached, dropping new group"
+                    );
+                    continue;
+                }
                 let mut accs = Vec::with_capacity(self.agg_specs.len());
                 for spec in &self.agg_specs {
                     accs.push(spec.create_accumulator()?);
                 }
                 self.groups.insert(key.clone(), accs);
             }
-            let accs = self.groups.get_mut(key).expect("just inserted");
+            let Some(accs) = self.groups.get_mut(key) else {
+                continue; // group was dropped due to cardinality limit
+            };
 
             let index_array =
                 arrow::array::UInt32Array::from(indices.clone());
@@ -1804,6 +1817,115 @@ mod tests {
             "simple column should be quoted: {}",
             state.pre_agg_sql
         );
+    }
+
+    // ── H-16: Group cardinality limit ──────────────────────────────
+
+    #[tokio::test]
+    async fn test_group_cardinality_limit_enforced() {
+        let (_, mut state) = setup_agg_state(
+            "SELECT name, SUM(value) as total FROM events GROUP BY name",
+        )
+        .await;
+
+        // Set a very small limit for testing
+        state.max_groups = 3;
+
+        // Feed 5 unique groups
+        let pre_agg_schema = Arc::new(Schema::new(vec![
+            Field::new("name", DataType::Utf8, true),
+            Field::new("__agg_input_1", DataType::Float64, true),
+        ]));
+        let batch = RecordBatch::try_new(
+            Arc::clone(&pre_agg_schema),
+            vec![
+                Arc::new(arrow::array::StringArray::from(vec![
+                    "a", "b", "c", "d", "e",
+                ])),
+                Arc::new(arrow::array::Float64Array::from(vec![
+                    1.0, 2.0, 3.0, 4.0, 5.0,
+                ])),
+            ],
+        )
+        .unwrap();
+        state.process_batch(&batch).unwrap();
+
+        let result = state.emit().unwrap();
+        assert_eq!(result.len(), 1);
+        assert!(
+            result[0].num_rows() <= 3,
+            "should have at most 3 groups, got {}",
+            result[0].num_rows()
+        );
+    }
+
+    #[tokio::test]
+    async fn test_group_cardinality_existing_groups_still_updated() {
+        let (_, mut state) = setup_agg_state(
+            "SELECT name, SUM(value) as total FROM events GROUP BY name",
+        )
+        .await;
+
+        state.max_groups = 2;
+
+        let pre_agg_schema = Arc::new(Schema::new(vec![
+            Field::new("name", DataType::Utf8, true),
+            Field::new("__agg_input_1", DataType::Float64, true),
+        ]));
+
+        // Batch 1: create 2 groups (at limit)
+        let batch1 = RecordBatch::try_new(
+            Arc::clone(&pre_agg_schema),
+            vec![
+                Arc::new(arrow::array::StringArray::from(vec![
+                    "a", "b",
+                ])),
+                Arc::new(arrow::array::Float64Array::from(vec![
+                    10.0, 20.0,
+                ])),
+            ],
+        )
+        .unwrap();
+        state.process_batch(&batch1).unwrap();
+
+        // Batch 2: update existing groups + attempt new group "c"
+        let batch2 = RecordBatch::try_new(
+            Arc::clone(&pre_agg_schema),
+            vec![
+                Arc::new(arrow::array::StringArray::from(vec![
+                    "a", "c",
+                ])),
+                Arc::new(arrow::array::Float64Array::from(vec![
+                    5.0, 100.0,
+                ])),
+            ],
+        )
+        .unwrap();
+        state.process_batch(&batch2).unwrap();
+
+        let result = state.emit().unwrap();
+        assert_eq!(result[0].num_rows(), 2, "still only 2 groups");
+
+        // Group "a" should have 10+5=15
+        let names = result[0]
+            .column(0)
+            .as_any()
+            .downcast_ref::<arrow::array::StringArray>()
+            .unwrap();
+        let totals = result[0]
+            .column(1)
+            .as_any()
+            .downcast_ref::<arrow::array::Float64Array>()
+            .unwrap();
+        for i in 0..2 {
+            if names.value(i) == "a" {
+                assert!(
+                    (totals.value(i) - 15.0).abs() < f64::EPSILON,
+                    "group 'a' should be 15, got {}",
+                    totals.value(i)
+                );
+            }
+        }
     }
 
     #[test]

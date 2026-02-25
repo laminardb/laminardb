@@ -785,30 +785,47 @@ impl StreamExecutor {
             compute_closed_boundary(current_watermark, cfg)
         });
 
-        // Check if accumulated rows exceed memory bounds (prevent OOM)
-        let force_emit = self
-            .eowc_states
-            .get(&idx)
-            .is_some_and(|s| s.accumulated_rows > MAX_EOWC_ACCUMULATED_ROWS);
-
         // Check if any new windows have closed since last emission
         let last_boundary = self
             .eowc_states
             .get(&idx)
             .map_or(i64::MIN, |s| s.last_closed_boundary);
 
-        if closed_cut <= last_boundary && !force_emit {
-            // No new windows closed and not over memory limit — suppress output
+        if closed_cut <= last_boundary {
+            // No new windows closed. Check if memory pressure requires
+            // coalescing, but do NOT advance the cutoff — that would emit
+            // rows from open windows, causing data loss (H-11).
+            let over_limit = self
+                .eowc_states
+                .get(&idx)
+                .is_some_and(|s| s.accumulated_rows > MAX_EOWC_ACCUMULATED_ROWS);
+            if over_limit {
+                tracing::warn!(
+                    query = query_name,
+                    accumulated_rows = self
+                        .eowc_states
+                        .get(&idx)
+                        .map_or(0, |s| s.accumulated_rows),
+                    limit = MAX_EOWC_ACCUMULATED_ROWS,
+                    "EOWC memory pressure: watermark has not advanced, \
+                     coalescing batches to reduce fragmentation"
+                );
+                // Coalesce to reduce fragmentation without changing semantics
+                if let Some(eowc) = self.eowc_states.get_mut(&idx) {
+                    for batches in eowc.accumulated_sources.values_mut() {
+                        if batches.len() > 1 {
+                            let schema = batches[0].schema();
+                            if let Ok(coalesced) =
+                                arrow::compute::concat_batches(&schema, batches.as_slice())
+                            {
+                                *batches = vec![coalesced];
+                            }
+                        }
+                    }
+                }
+            }
             return Ok(Vec::new());
         }
-
-        // When force-emitting due to memory bounds, advance the cutoff to
-        // the current watermark to flush all data older than the watermark.
-        let closed_cut = if force_emit && closed_cut <= last_boundary {
-            current_watermark
-        } else {
-            closed_cut
-        };
 
         // Get the time column from the window config for filtering
         let time_column = window_config.map(|cfg| cfg.time_column.clone());
@@ -2778,5 +2795,71 @@ mod tests {
         assert_eq!(schema.field(1).name(), "symbol");
         assert_eq!(schema.field(2).name(), "lastPrice");
         assert_eq!(schema.field(3).name(), "orderQty");
+    }
+
+    /// H-11: Verify that memory pressure does NOT cause force-emit of
+    /// open-window rows when the watermark hasn't advanced.
+    #[tokio::test]
+    async fn test_eowc_force_emit_does_not_lose_open_window_data() {
+        let ctx = create_session_context();
+        register_streaming_functions(&ctx);
+        let mut executor = StreamExecutor::new(ctx);
+
+        executor.add_query(
+            "total".to_string(),
+            "SELECT symbol, SUM(price) as total FROM trades GROUP BY symbol"
+                .to_string(),
+            Some(EmitClause::OnWindowClose),
+            Some(tumbling_window_config(1000)),
+            None,
+        );
+
+        // Cycle 1: push data in window [0, 1000) with watermark at 500
+        let mut batches1 = HashMap::new();
+        batches1.insert(
+            "trades".to_string(),
+            vec![eowc_batch(vec!["AAPL"], vec![100.0], vec![500])],
+        );
+        let r1 = executor.execute_cycle(&batches1, 500).await.unwrap();
+        assert!(
+            !r1.contains_key("total"),
+            "window not closed at wm=500"
+        );
+
+        // Cycle 2: push more data, watermark STAYS at 500 (hasn't
+        // advanced). Even if memory were over the threshold, should
+        // NOT emit open-window rows.
+        let mut batches2 = HashMap::new();
+        batches2.insert(
+            "trades".to_string(),
+            vec![eowc_batch(vec!["AAPL"], vec![200.0], vec![600])],
+        );
+        let r2 = executor.execute_cycle(&batches2, 500).await.unwrap();
+        assert!(
+            !r2.contains_key("total"),
+            "watermark unchanged at 500 — should NOT emit"
+        );
+
+        // Cycle 3: watermark advances to 1000 → window closes
+        let empty: HashMap<String, Vec<RecordBatch>> = HashMap::new();
+        let r3 = executor.execute_cycle(&empty, 1000).await.unwrap();
+        assert!(
+            r3.contains_key("total"),
+            "window closed at wm=1000"
+        );
+
+        // CRITICAL: Both rows (100 + 200) must be present — no data loss
+        let batches = &r3["total"];
+        let total_col = batches[0]
+            .column_by_name("total")
+            .unwrap()
+            .as_any()
+            .downcast_ref::<Float64Array>()
+            .unwrap();
+        assert!(
+            (total_col.value(0) - 300.0).abs() < f64::EPSILON,
+            "expected 300 (100+200), got {} — data loss from force-emit!",
+            total_col.value(0)
+        );
     }
 }
