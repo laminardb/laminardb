@@ -30,6 +30,7 @@ use laminar_sql::translator::{
 use crate::aggregate_state::IncrementalAggState;
 use crate::eowc_state::IncrementalEowcState;
 use crate::error::DbError;
+use crate::ring0_state::Ring0PipelineState;
 
 /// Convert a SQL-layer `EmitStrategy` to a core-layer `EmitStrategy`.
 ///
@@ -37,7 +38,6 @@ use crate::error::DbError;
 /// expect `EmitStrategy::Final`. This function maps all variants correctly.
 ///
 /// Cannot use a `From` impl due to the orphan rule (neither type is local).
-#[allow(dead_code)] // Bridge function for Phase 4 MV pipeline integration
 pub(crate) fn sql_emit_to_core(
     s: &SqlEmitStrategy,
 ) -> laminar_core::operator::window::EmitStrategy {
@@ -56,7 +56,6 @@ pub(crate) fn sql_emit_to_core(
 ///
 /// Calls `EmitClause::to_emit_strategy()` to resolve the clause to a
 /// runtime strategy, then converts via [`sql_emit_to_core`].
-#[allow(dead_code)] // Bridge function for Phase 4 MV pipeline integration
 pub(crate) fn emit_clause_to_core(
     clause: &EmitClause,
 ) -> Result<laminar_core::operator::window::EmitStrategy, laminar_sql::parser::ParseError> {
@@ -223,6 +222,12 @@ pub(crate) struct StreamExecutor {
     /// Set of EOWC query indices that have been checked for aggregation but
     /// found not to be aggregate queries (fall back to raw-batch path).
     non_eowc_agg_queries: HashSet<usize>,
+    /// Per-query Ring 0 pipeline state for tumbling-window aggregates.
+    /// Initialized lazily on first EOWC cycle when the query qualifies.
+    ring0_states: HashMap<usize, Ring0PipelineState>,
+    /// Set of EOWC query indices that were checked for Ring 0 routing but
+    /// found not to qualify (fall through to `IncrementalEowcState`).
+    non_ring0_queries: HashSet<usize>,
     /// Pending checkpoint data for deferred restore. Held until agg states
     /// are lazily initialized, then applied and cleared.
     pending_restore: Option<crate::aggregate_state::StreamExecutorCheckpoint>,
@@ -243,6 +248,8 @@ impl StreamExecutor {
             non_agg_queries: HashSet::new(),
             eowc_agg_states: HashMap::new(),
             non_eowc_agg_queries: HashSet::new(),
+            ring0_states: HashMap::new(),
+            non_ring0_queries: HashSet::new(),
             pending_restore: None,
         }
     }
@@ -801,6 +808,68 @@ impl StreamExecutor {
         Ok(batches)
     }
 
+    /// Execute a Ring 0 tumbling-window aggregate query.
+    ///
+    /// Runs pre-aggregation SQL, feeds results through Ring 0's
+    /// `TumblingWindowAssigner` for O(1) window assignment, then
+    /// closes windows whose end <= watermark.
+    async fn execute_ring0_query(
+        &mut self,
+        idx: usize,
+        query_name: &str,
+        current_watermark: i64,
+    ) -> Result<Vec<RecordBatch>, DbError> {
+        // Run pre-aggregation SQL
+        let pre_agg_sql = self
+            .ring0_states
+            .get(&idx)
+            .ok_or_else(|| {
+                DbError::Pipeline(format!(
+                    "internal: missing ring0_state for query index {idx}"
+                ))
+            })?
+            .pre_agg_sql()
+            .to_string();
+
+        let pre_agg_batches = match self.ctx.sql(&pre_agg_sql).await {
+            Ok(df) => df.collect().await.map_err(|e| {
+                DbError::query_pipeline(query_name, &e)
+            })?,
+            Err(e) => {
+                tracing::trace!(
+                    query = %query_name,
+                    error = %e,
+                    "Ring 0 pre-agg SQL failed, skipping update"
+                );
+                Vec::new()
+            }
+        };
+
+        // Feed pre-agg results to Ring 0 per-window accumulators
+        let ring0_state =
+            self.ring0_states.get_mut(&idx).ok_or_else(|| {
+                DbError::Pipeline(format!(
+                    "internal: missing ring0_state for query index {idx}"
+                ))
+            })?;
+        for batch in &pre_agg_batches {
+            ring0_state.update_batch(batch)?;
+        }
+
+        // Close windows and emit results
+        let having_sql = ring0_state.having_sql().map(String::from);
+        let mut batches = ring0_state.close_windows(current_watermark)?;
+
+        // Apply HAVING filter if present
+        if let Some(having_sql) = having_sql {
+            batches = self
+                .apply_having_filter(query_name, &batches, &having_sql)
+                .await?;
+        }
+
+        Ok(batches)
+    }
+
     /// Execute an EOWC (Emit On Window Close) query.
     ///
     /// For aggregate queries with a window config, routes through incremental
@@ -818,20 +887,73 @@ impl StreamExecutor {
         intermediate_results: &HashMap<String, Vec<RecordBatch>>,
         current_watermark: i64,
     ) -> Result<Vec<RecordBatch>, DbError> {
-        // Try incremental EOWC path for aggregate queries with window config
-        // (non-ASOF only — ASOF joins use a custom execution path).
+        // Try Ring 0 and incremental EOWC paths for aggregate queries with
+        // window config (non-ASOF only — ASOF joins use a custom execution path).
         if asof_config.is_none() {
             if let Some(cfg) = window_config {
-                // Fast path: already have incremental state
+                // ── Ring 0 fast path: already routed ──
+                if self.ring0_states.contains_key(&idx) {
+                    return self
+                        .execute_ring0_query(idx, query_name, current_watermark)
+                        .await;
+                }
+
+                // ── Ring 0 detection (first call only) ──
+                if !self.non_ring0_queries.contains(&idx)
+                    && !self.eowc_agg_states.contains_key(&idx)
+                    && !self.non_eowc_agg_queries.contains(&idx)
+                {
+                    let query_sql = self.queries[idx].sql.clone();
+                    let cfg_clone = cfg.clone();
+                    let emit_ref = self.queries[idx].emit_clause.as_ref();
+                    match Ring0PipelineState::try_from_sql(
+                        &self.ctx,
+                        &query_sql,
+                        &cfg_clone,
+                        emit_ref,
+                    )
+                    .await
+                    {
+                        Ok(Some(state)) => {
+                            tracing::info!(
+                                query = query_name,
+                                "EOWC query routed to Ring 0 \
+                                 tumbling window pipeline"
+                            );
+                            self.ring0_states.insert(idx, state);
+                            self.try_restore_pending_ring0(idx);
+                            return self
+                                .execute_ring0_query(
+                                    idx,
+                                    query_name,
+                                    current_watermark,
+                                )
+                                .await;
+                        }
+                        Ok(None) => {
+                            self.non_ring0_queries.insert(idx);
+                        }
+                        Err(e) => {
+                            tracing::debug!(
+                                query = query_name,
+                                error = %e,
+                                "Ring 0 detection failed, \
+                                 falling back to EOWC path"
+                            );
+                            self.non_ring0_queries.insert(idx);
+                        }
+                    }
+                }
+
+                // ── IncrementalEowcState fast path: already have state ──
                 if self.eowc_agg_states.contains_key(&idx) {
                     return self
                         .execute_incremental_eowc(idx, query_name, current_watermark)
                         .await;
                 }
 
-                // Fast path: already checked and found non-aggregate
+                // ── IncrementalEowcState detection (first call only) ──
                 if !self.non_eowc_agg_queries.contains(&idx) {
-                    // First call: try to detect aggregate query
                     let query_sql = self.queries[idx].sql.clone();
                     let cfg_clone = cfg.clone();
                     match IncrementalEowcState::try_from_sql(
@@ -1230,7 +1352,19 @@ impl StreamExecutor {
             );
         }
 
-        if agg_checkpoints.is_empty() && eowc_checkpoints.is_empty() {
+        let mut ring0_checkpoints = HashMap::new();
+        for (&idx, state) in &mut self.ring0_states {
+            let name = self.queries[idx].name.clone();
+            ring0_checkpoints.insert(
+                name,
+                state.checkpoint_windows()?,
+            );
+        }
+
+        if agg_checkpoints.is_empty()
+            && eowc_checkpoints.is_empty()
+            && ring0_checkpoints.is_empty()
+        {
             return Ok(None);
         }
 
@@ -1238,6 +1372,7 @@ impl StreamExecutor {
             version: 1,
             agg_states: agg_checkpoints,
             eowc_states: eowc_checkpoints,
+            ring0_states: ring0_checkpoints,
         };
 
         let bytes = serde_json::to_vec(&checkpoint).map_err(|e| {
@@ -1291,6 +1426,14 @@ impl StreamExecutor {
             if let Some(&idx) = name_to_idx.get(name.as_str()) {
                 if let Some(state) = self.eowc_agg_states.get_mut(&idx) {
                     state.restore_windows(eowc_cp)?;
+                    restored += 1;
+                }
+            }
+        }
+        for (name, ring0_cp) in &checkpoint.ring0_states {
+            if let Some(&idx) = name_to_idx.get(name.as_str()) {
+                if let Some(state) = self.ring0_states.get_mut(&idx) {
+                    state.restore_windows(ring0_cp)?;
                     restored += 1;
                 }
             }
@@ -1352,6 +1495,34 @@ impl StreamExecutor {
                             query = %query_name,
                             error = %e,
                             "Failed to restore EOWC state from checkpoint"
+                        );
+                    }
+                }
+            }
+        }
+    }
+
+    /// Try to restore pending checkpoint data for a newly initialized
+    /// Ring 0 pipeline state. Called after lazy initialization.
+    fn try_restore_pending_ring0(&mut self, idx: usize) {
+        let query_name = &self.queries[idx].name;
+        let pending = self.pending_restore.as_ref();
+        if let Some(cp) = pending.and_then(|p| p.ring0_states.get(query_name)) {
+            let cp_clone = cp.clone();
+            if let Some(state) = self.ring0_states.get_mut(&idx) {
+                match state.restore_windows(&cp_clone) {
+                    Ok(n) => {
+                        tracing::info!(
+                            query = %query_name,
+                            groups = n,
+                            "Restored Ring 0 state from checkpoint"
+                        );
+                    }
+                    Err(e) => {
+                        tracing::warn!(
+                            query = %query_name,
+                            error = %e,
+                            "Failed to restore Ring 0 state from checkpoint"
                         );
                     }
                 }

@@ -207,6 +207,9 @@ pub(crate) struct StreamExecutorCheckpoint {
     /// EOWC aggregate states, keyed by query name.
     #[serde(default)]
     pub eowc_states: HashMap<String, EowcStateCheckpoint>,
+    /// Ring 0 pipeline states, keyed by query name.
+    #[serde(default)]
+    pub ring0_states: HashMap<String, crate::ring0_state::Ring0StateCheckpoint>,
 }
 
 /// Specification for one aggregate function in a streaming query.

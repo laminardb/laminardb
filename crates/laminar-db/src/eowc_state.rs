@@ -731,7 +731,7 @@ impl IncrementalEowcState {
 ///
 /// Handles Int64 columns directly and Arrow Timestamp columns by extracting
 /// the underlying i64 values (already in the native time unit).
-fn extract_i64_timestamps(
+pub(crate) fn extract_i64_timestamps(
     batch: &RecordBatch,
     col_index: usize,
 ) -> Result<Vec<i64>, DbError> {
