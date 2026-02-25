@@ -27,6 +27,7 @@ use laminar_sql::translator::{
     WindowType,
 };
 
+use crate::aggregate_state::IncrementalAggState;
 use crate::error::DbError;
 
 /// Convert a SQL-layer `EmitStrategy` to a core-layer `EmitStrategy`.
@@ -162,11 +163,23 @@ impl StreamQuery {
 /// data keeps arriving.
 const MAX_EOWC_ACCUMULATED_ROWS: usize = 1_000_000;
 
+/// When an EOWC source has more than this many separate batches, coalesce
+/// them into a single batch to reduce per-batch overhead and memory
+/// fragmentation.
+const EOWC_COALESCE_BATCH_THRESHOLD: usize = 32;
+
 /// Per-query EOWC accumulation state.
 ///
 /// For queries with `EMIT ON WINDOW CLOSE` or `EMIT FINAL`, source batches
 /// are accumulated across cycles and only aggregated when the watermark
 /// indicates new windows have closed.
+///
+/// **Known limitation**: Raw batches are stored, so memory is
+/// `O(window_rows)` and window-close latency is `O(window_rows)`. The
+/// planned fix (P2) routes EOWC aggregate queries through Ring 0 stateful
+/// operators for `O(groups)` memory via incremental accumulators. Batches
+/// are coalesced at `EOWC_COALESCE_BATCH_THRESHOLD` to mitigate
+/// fragmentation.
 struct EowcState {
     /// Accumulated source batches keyed by source table name.
     accumulated_sources: HashMap<String, Vec<RecordBatch>>,
@@ -195,6 +208,13 @@ pub(crate) struct StreamExecutor {
     source_schemas: HashMap<String, SchemaRef>,
     /// Per-query EOWC accumulation state, keyed by query index.
     eowc_states: HashMap<usize, EowcState>,
+    /// Per-query incremental aggregation state, keyed by query index.
+    /// Initialized lazily on first cycle when the logical plan reveals
+    /// the query contains a GROUP BY / aggregate.
+    agg_states: HashMap<usize, IncrementalAggState>,
+    /// Set of query indices that have been checked for aggregation but
+    /// found not to be aggregate queries (avoids re-checking).
+    non_agg_queries: HashSet<usize>,
 }
 
 impl StreamExecutor {
@@ -208,6 +228,8 @@ impl StreamExecutor {
             topo_dirty: true,
             source_schemas: HashMap::new(),
             eowc_states: HashMap::new(),
+            agg_states: HashMap::new(),
+            non_agg_queries: HashSet::new(),
         }
     }
 
@@ -387,7 +409,10 @@ impl StreamExecutor {
                 .await?
             } else if has_asof {
                 let query_name = self.queries[idx].name.clone();
-                let cfg = self.queries[idx].asof_config.clone().unwrap();
+                let cfg = self.queries[idx]
+                    .asof_config
+                    .clone()
+                    .expect("has_asof guard ensures asof_config is Some");
                 let projection_sql = self.queries[idx].projection_sql.clone();
                 self.execute_asof_query(
                     &query_name,
@@ -398,16 +423,7 @@ impl StreamExecutor {
                 )
                 .await?
             } else {
-                let query_name = &self.queries[idx].name;
-                let query_sql = &self.queries[idx].sql;
-                let df = self
-                    .ctx
-                    .sql(query_sql)
-                    .await
-                    .map_err(|e| DbError::query_pipeline(query_name, &e))?;
-                df.collect()
-                    .await
-                    .map_err(|e| DbError::query_pipeline(query_name, &e))?
+                self.execute_standard_query(idx).await?
             };
 
             // Apply Top-K post-filter if configured
@@ -496,6 +512,189 @@ impl StreamExecutor {
         }
     }
 
+    /// Execute a standard (non-EOWC, non-ASOF) query.
+    ///
+    /// On the first call for each query, attempts to detect whether the query
+    /// contains a GROUP BY / aggregate. If so, creates an
+    /// `IncrementalAggState` and routes subsequent calls through incremental
+    /// accumulators for correct running totals across cycles.
+    ///
+    /// Non-aggregate queries continue using the existing `DataFusion`
+    /// `MemTable` + SQL execution path.
+    async fn execute_standard_query(
+        &mut self,
+        idx: usize,
+    ) -> Result<Vec<RecordBatch>, DbError> {
+        // Fast path: already have incremental agg state for this query
+        if self.agg_states.contains_key(&idx) {
+            return self.execute_incremental_agg(idx).await;
+        }
+
+        // Fast path: already checked and found non-aggregate
+        if self.non_agg_queries.contains(&idx) {
+            return self.execute_plain_query(idx).await;
+        }
+
+        // First call: try to initialize IncrementalAggState
+        let query_name = self.queries[idx].name.clone();
+        let query_sql = self.queries[idx].sql.clone();
+        match IncrementalAggState::try_from_sql(&self.ctx, &query_sql).await {
+            Ok(Some(state)) => {
+                self.agg_states.insert(idx, state);
+                self.execute_incremental_agg(idx).await
+            }
+            Ok(None) => {
+                // Not an aggregation query — use standard path
+                self.non_agg_queries.insert(idx);
+                self.execute_plain_query(idx).await
+            }
+            Err(e) => {
+                // Plan introspection failed — fall back to standard path
+                tracing::debug!(
+                    query = %query_name,
+                    error = %e,
+                    "Could not introspect query plan, using per-batch execution"
+                );
+                self.non_agg_queries.insert(idx);
+                self.execute_plain_query(idx).await
+            }
+        }
+    }
+
+    /// Execute a non-aggregate query via `DataFusion` SQL.
+    async fn execute_plain_query(
+        &self,
+        idx: usize,
+    ) -> Result<Vec<RecordBatch>, DbError> {
+        let query_name = &self.queries[idx].name;
+        let query_sql = &self.queries[idx].sql;
+        let df = self
+            .ctx
+            .sql(query_sql)
+            .await
+            .map_err(|e| DbError::query_pipeline(query_name, &e))?;
+        df.collect()
+            .await
+            .map_err(|e| DbError::query_pipeline(query_name, &e))
+    }
+
+    /// Execute an aggregation query using incremental accumulators.
+    ///
+    /// Runs the pre-aggregation SQL (projection only) through `DataFusion`,
+    /// then feeds the result to per-group accumulators. Emits running
+    /// aggregate totals.
+    async fn execute_incremental_agg(
+        &mut self,
+        idx: usize,
+    ) -> Result<Vec<RecordBatch>, DbError> {
+        let query_name = self.queries[idx].name.clone();
+
+        // Run pre-aggregation SQL to evaluate expressions
+        let agg_state = self.agg_states.get(&idx).ok_or_else(|| {
+            DbError::Pipeline(format!(
+                "internal: missing agg_state for query index {idx}"
+            ))
+        })?;
+        let pre_agg_sql = agg_state.pre_agg_sql().to_string();
+
+        let pre_agg_batches = match self.ctx.sql(&pre_agg_sql).await {
+            Ok(df) => df.collect().await.map_err(|e| {
+                DbError::query_pipeline(&query_name, &e)
+            })?,
+            Err(e) => {
+                // Pre-agg SQL failed (e.g., no source data this cycle)
+                // — emit current state without updating
+                tracing::trace!(
+                    query = %query_name,
+                    error = %e,
+                    "Pre-agg SQL failed, emitting current state"
+                );
+                let agg_state =
+                    self.agg_states.get_mut(&idx).ok_or_else(|| {
+                        DbError::Pipeline(format!(
+                            "internal: missing agg_state for query index {idx}"
+                        ))
+                    })?;
+                return agg_state.emit();
+            }
+        };
+
+        // Feed pre-agg results to accumulators
+        let agg_state =
+            self.agg_states.get_mut(&idx).ok_or_else(|| {
+                DbError::Pipeline(format!(
+                    "internal: missing agg_state for query index {idx}"
+                ))
+            })?;
+        for batch in &pre_agg_batches {
+            agg_state.process_batch(batch)?;
+        }
+
+        // Emit current aggregate state
+        let having_sql = agg_state.having_sql().map(String::from);
+        let mut batches = agg_state.emit()?;
+
+        // H-03: Apply HAVING filter post-emission
+        if let Some(having_sql) = having_sql {
+            batches = self
+                .apply_having_filter(&query_name, &batches, &having_sql)
+                .await?;
+        }
+
+        Ok(batches)
+    }
+
+    /// Apply a HAVING predicate to emitted aggregate batches using the
+    /// session context's SQL engine.
+    async fn apply_having_filter(
+        &self,
+        query_name: &str,
+        batches: &[RecordBatch],
+        having_sql: &str,
+    ) -> Result<Vec<RecordBatch>, DbError> {
+        if batches.is_empty() {
+            return Ok(Vec::new());
+        }
+
+        let schema = batches[0].schema();
+        let col_list: Vec<String> = schema
+            .fields()
+            .iter()
+            .map(|f| format!("\"{}\"", f.name()))
+            .collect();
+        let filter_sql = format!(
+            "SELECT {} FROM \"__having_{}\" WHERE {having_sql}",
+            col_list.join(", "),
+            query_name
+        );
+        let table_name = format!("__having_{query_name}");
+
+        let mem_table =
+            datafusion::datasource::MemTable::try_new(
+                schema,
+                vec![batches.to_vec()],
+            )
+            .map_err(|e| {
+                DbError::Pipeline(format!("HAVING setup: {e}"))
+            })?;
+        let _ = self.ctx.deregister_table(&table_name);
+        self.ctx
+            .register_table(&table_name, Arc::new(mem_table))
+            .map_err(|e| {
+                DbError::Pipeline(format!("HAVING register: {e}"))
+            })?;
+
+        let result = match self.ctx.sql(&filter_sql).await {
+            Ok(df) => df.collect().await.map_err(|e| {
+                DbError::query_pipeline(query_name, &e)
+            }),
+            Err(e) => Err(DbError::query_pipeline(query_name, &e)),
+        };
+
+        let _ = self.ctx.deregister_table(&table_name);
+        result
+    }
+
     /// Get the number of registered queries.
     #[allow(dead_code)] // Public API for admin/observability queries
     pub fn query_count(&self) -> usize {
@@ -538,7 +737,13 @@ impl StreamExecutor {
         // Use pre-computed table references (extracted once at registration)
         let table_refs = self.queries[idx].table_refs.clone();
 
-        // Accumulate current source batches into EOWC state
+        // Accumulate current source batches into EOWC state.
+        //
+        // NOTE: Raw-batch accumulation is O(N) memory where N is the total
+        // rows in the window. A future optimisation (P2) should route EOWC
+        // aggregate queries through Ring 0 stateful operators for O(groups)
+        // memory via incremental accumulators. See Gap 2 in the gap analysis:
+        // `docs/GAP-ANALYSIS-STATEFUL-STREAMING.md`
         if let Some(eowc) = self.eowc_states.get_mut(&idx) {
             for table_name in &table_refs {
                 // Check source_batches first, then intermediate_results
@@ -550,13 +755,25 @@ impl StreamExecutor {
                 };
 
                 if let Some(batches) = batches_to_add {
+                    let entry = eowc
+                        .accumulated_sources
+                        .entry(table_name.clone())
+                        .or_default();
                     for batch in batches {
                         if batch.num_rows() > 0 {
                             eowc.accumulated_rows += batch.num_rows();
-                            eowc.accumulated_sources
-                                .entry(table_name.clone())
-                                .or_default()
-                                .push(batch.clone());
+                            entry.push(batch.clone());
+                        }
+                    }
+
+                    // Coalesce when batch count exceeds threshold to reduce
+                    // per-batch overhead and memory fragmentation.
+                    if entry.len() > EOWC_COALESCE_BATCH_THRESHOLD {
+                        let schema = entry[0].schema();
+                        if let Ok(coalesced) =
+                            arrow::compute::concat_batches(&schema, entry.as_slice())
+                        {
+                            *entry = vec![coalesced];
                         }
                     }
                 }

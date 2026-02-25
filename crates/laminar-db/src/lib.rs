@@ -26,6 +26,7 @@
 
 #[allow(dead_code)]
 mod adaptive;
+mod aggregate_state;
 mod asof_batch;
 mod batch_filter;
 mod builder;

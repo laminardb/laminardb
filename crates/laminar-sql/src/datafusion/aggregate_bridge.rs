@@ -92,6 +92,8 @@ pub struct DataFusionAccumulatorAdapter {
     input_types: Vec<DataType>,
     /// Function name (for type_tag/debug)
     function_name: String,
+    /// Factory for creating fresh accumulators (enables clone_box)
+    factory: Arc<DataFusionAggregateFactory>,
 }
 
 // SAFETY: DataFusion accumulators are Send. RefCell is Send when T is Send.
@@ -116,12 +118,14 @@ impl DataFusionAccumulatorAdapter {
         column_indices: Vec<usize>,
         input_types: Vec<DataType>,
         function_name: String,
+        factory: Arc<DataFusionAggregateFactory>,
     ) -> Self {
         Self {
             inner: RefCell::new(inner),
             column_indices,
             input_types,
             function_name,
+            factory,
         }
     }
 
@@ -155,7 +159,13 @@ impl DataFusionAccumulatorAdapter {
 impl DynAccumulator for DataFusionAccumulatorAdapter {
     fn add_event(&mut self, event: &Event) {
         let columns = self.extract_columns(&event.data);
-        let _ = self.inner.borrow_mut().update_batch(&columns);
+        if let Err(e) = self.inner.borrow_mut().update_batch(&columns) {
+            tracing::warn!(
+                func = %self.function_name,
+                error = %e,
+                "Accumulator update_batch failed"
+            );
+        }
     }
 
     fn merge_dyn(&mut self, other: &dyn DynAccumulator) {
@@ -164,13 +174,45 @@ impl DynAccumulator for DataFusionAccumulatorAdapter {
             .downcast_ref::<DataFusionAccumulatorAdapter>()
             .expect("merge_dyn: type mismatch, expected DataFusionAccumulatorAdapter");
 
-        if let Ok(state_values) = other.inner.borrow_mut().state() {
-            let state_arrays: Vec<ArrayRef> = state_values
-                .iter()
-                .filter_map(|sv| sv.to_array().ok())
-                .collect();
-            if !state_arrays.is_empty() {
-                let _ = self.inner.borrow_mut().merge_batch(&state_arrays);
+        match other.inner.borrow_mut().state() {
+            Ok(state_values) => {
+                let mut failed_conversions = 0u32;
+                let state_arrays: Vec<ArrayRef> = state_values
+                    .iter()
+                    .filter_map(|sv| {
+                        if let Ok(arr) = sv.to_array() {
+                            Some(arr)
+                        } else {
+                            failed_conversions += 1;
+                            None
+                        }
+                    })
+                    .collect();
+                if failed_conversions > 0 {
+                    tracing::warn!(
+                        func = %self.function_name,
+                        count = failed_conversions,
+                        "ScalarValue to_array conversions failed during merge"
+                    );
+                }
+                if !state_arrays.is_empty() {
+                    if let Err(e) =
+                        self.inner.borrow_mut().merge_batch(&state_arrays)
+                    {
+                        tracing::warn!(
+                            func = %self.function_name,
+                            error = %e,
+                            "Accumulator merge_batch failed"
+                        );
+                    }
+                }
+            }
+            Err(e) => {
+                tracing::warn!(
+                    func = %self.function_name,
+                    error = %e,
+                    "Failed to extract state for merge"
+                );
             }
         }
     }
@@ -187,11 +229,34 @@ impl DynAccumulator for DataFusionAccumulatorAdapter {
     }
 
     fn clone_box(&self) -> Box<dyn DynAccumulator> {
-        panic!(
-            "clone_box not supported for DataFusion adapter '{}'; \
-             use the factory to create new accumulators",
-            self.function_name
-        )
+        let new_inner = self.factory.create_df_accumulator();
+        // Merge current state into the fresh accumulator
+        if let Ok(state_values) = self.inner.borrow_mut().state() {
+            let state_arrays: Vec<ArrayRef> = state_values
+                .iter()
+                .filter_map(|sv| sv.to_array().ok())
+                .collect();
+            if !state_arrays.is_empty() {
+                let mut new_acc = new_inner;
+                if new_acc.merge_batch(&state_arrays).is_ok() {
+                    return Box::new(DataFusionAccumulatorAdapter {
+                        inner: RefCell::new(new_acc),
+                        column_indices: self.column_indices.clone(),
+                        input_types: self.input_types.clone(),
+                        function_name: self.function_name.clone(),
+                        factory: Arc::clone(&self.factory),
+                    });
+                }
+            }
+        }
+        // Fallback: return a fresh empty accumulator
+        Box::new(DataFusionAccumulatorAdapter {
+            inner: RefCell::new(self.factory.create_df_accumulator()),
+            column_indices: self.column_indices.clone(),
+            input_types: self.input_types.clone(),
+            function_name: self.function_name.clone(),
+            factory: Arc::clone(&self.factory),
+        })
     }
 
     #[allow(clippy::cast_possible_truncation)] // Wire format uses fixed-width integers
@@ -246,6 +311,8 @@ pub struct DataFusionAggregateFactory {
     column_indices: Vec<usize>,
     /// Input types for the aggregate
     input_types: Vec<DataType>,
+    /// Whether this is a DISTINCT aggregate
+    is_distinct: bool,
 }
 
 impl std::fmt::Debug for DataFusionAggregateFactory {
@@ -254,6 +321,7 @@ impl std::fmt::Debug for DataFusionAggregateFactory {
             .field("name", &self.udf.name())
             .field("column_indices", &self.column_indices)
             .field("input_types", &self.input_types)
+            .field("is_distinct", &self.is_distinct)
             .finish()
     }
 }
@@ -270,7 +338,15 @@ impl DataFusionAggregateFactory {
             udf,
             column_indices,
             input_types,
+            is_distinct: false,
         }
+    }
+
+    /// Creates a new factory with the DISTINCT flag set.
+    #[must_use]
+    pub fn with_distinct(mut self, distinct: bool) -> Self {
+        self.is_distinct = distinct;
+        self
     }
 
     /// Returns the name of the wrapped aggregate function.
@@ -316,7 +392,7 @@ impl DataFusionAggregateFactory {
             order_bys: &[],
             is_reversed: false,
             name: self.udf.name(),
-            is_distinct: false,
+            is_distinct: self.is_distinct,
             exprs: &[],
             expr_fields: &expr_fields,
         };
@@ -326,14 +402,43 @@ impl DataFusionAggregateFactory {
     }
 }
 
-impl DynAggregatorFactory for DataFusionAggregateFactory {
-    fn create_accumulator(&self) -> Box<dyn DynAccumulator> {
+impl DataFusionAggregateFactory {
+    /// Creates an accumulator adapter with a back-reference to this factory.
+    ///
+    /// The factory must be wrapped in an `Arc` for the adapter to support
+    /// `clone_box()`.
+    #[must_use]
+    pub fn create_accumulator_with_factory(
+        self: &Arc<Self>,
+    ) -> Box<dyn DynAccumulator> {
         let inner = self.create_df_accumulator();
         Box::new(DataFusionAccumulatorAdapter::new(
             inner,
             self.column_indices.clone(),
             self.input_types.clone(),
             self.udf.name().to_string(),
+            Arc::clone(self),
+        ))
+    }
+}
+
+impl DynAggregatorFactory for DataFusionAggregateFactory {
+    fn create_accumulator(&self) -> Box<dyn DynAccumulator> {
+        // Without an Arc<Self>, we create a temporary Arc for the adapter.
+        // This is fine — the adapter only uses it for clone_box().
+        let factory_arc = Arc::new(DataFusionAggregateFactory {
+            udf: Arc::clone(&self.udf),
+            column_indices: self.column_indices.clone(),
+            input_types: self.input_types.clone(),
+            is_distinct: self.is_distinct,
+        });
+        let inner = self.create_df_accumulator();
+        Box::new(DataFusionAccumulatorAdapter::new(
+            inner,
+            self.column_indices.clone(),
+            self.input_types.clone(),
+            self.udf.name().to_string(),
+            factory_arc,
         ))
     }
 
@@ -350,6 +455,7 @@ impl DynAggregatorFactory for DataFusionAggregateFactory {
             udf: Arc::clone(&self.udf),
             column_indices: self.column_indices.clone(),
             input_types: self.input_types.clone(),
+            is_distinct: self.is_distinct,
         })
     }
 
@@ -944,5 +1050,45 @@ mod tests {
             .downcast_ref::<DataFusionAccumulatorAdapter>()
             .expect("should be adapter");
         assert_eq!(adapter.function_name(), "sum");
+    }
+
+    #[test]
+    fn test_clone_box_does_not_panic() {
+        let ctx = create_session_context();
+        let factory =
+            create_aggregate_factory(&ctx, "sum", vec![0], vec![DataType::Float64]).unwrap();
+        let mut acc = factory.create_accumulator();
+        acc.add_event(&float_event(1000, vec![1.0, 2.0, 3.0]));
+
+        // clone_box should not panic and should preserve state
+        let cloned = acc.clone_box();
+        assert_eq!(cloned.result_scalar(), ScalarResult::Float64(6.0));
+    }
+
+    #[test]
+    fn test_clone_box_empty_accumulator() {
+        let ctx = create_session_context();
+        let factory =
+            create_aggregate_factory(&ctx, "count", vec![0], vec![DataType::Int64]).unwrap();
+        let acc = factory.create_accumulator();
+
+        // clone_box on empty accumulator should work
+        let cloned = acc.clone_box();
+        let result = cloned.result_scalar();
+        assert!(
+            matches!(result, ScalarResult::Int64(0) | ScalarResult::UInt64(0)),
+            "Expected 0, got {result:?}"
+        );
+    }
+
+    #[test]
+    fn test_distinct_factory() {
+        let ctx = create_session_context();
+        let udf = lookup_aggregate_udf(&ctx, "count").unwrap();
+        let factory = DataFusionAggregateFactory::new(udf, vec![0], vec![DataType::Int64])
+            .with_distinct(true);
+        assert_eq!(factory.is_distinct, true);
+        // Should create accumulator successfully
+        let _acc = factory.create_accumulator();
     }
 }
