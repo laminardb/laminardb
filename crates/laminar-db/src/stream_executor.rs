@@ -168,18 +168,16 @@ const MAX_EOWC_ACCUMULATED_ROWS: usize = 1_000_000;
 /// fragmentation.
 const EOWC_COALESCE_BATCH_THRESHOLD: usize = 32;
 
-/// Per-query EOWC accumulation state.
+/// Per-query EOWC accumulation state (raw-batch path).
 ///
-/// For queries with `EMIT ON WINDOW CLOSE` or `EMIT FINAL`, source batches
-/// are accumulated across cycles and only aggregated when the watermark
-/// indicates new windows have closed.
-///
-/// **Known limitation**: Raw batches are stored, so memory is
-/// `O(window_rows)` and window-close latency is `O(window_rows)`. The
-/// planned fix (P2) routes EOWC aggregate queries through core window stateful
-/// operators for `O(groups)` memory via incremental accumulators. Batches
-/// are coalesced at `EOWC_COALESCE_BATCH_THRESHOLD` to mitigate
-/// fragmentation.
+/// For non-aggregate EOWC queries (`EMIT ON WINDOW CLOSE` / `EMIT FINAL`),
+/// source batches are accumulated across cycles and replayed when the
+/// watermark indicates new windows have closed. Aggregate EOWC queries
+/// bypass this struct entirely — they are routed through
+/// `CoreWindowState` (tumbling windows) or `IncrementalEowcState`
+/// (other window types) for `O(groups)` memory via incremental
+/// accumulators. Batches are coalesced at
+/// `EOWC_COALESCE_BATCH_THRESHOLD` to mitigate fragmentation.
 struct EowcState {
     /// Accumulated source batches keyed by source table name.
     accumulated_sources: HashMap<String, Vec<RecordBatch>>,
@@ -304,7 +302,7 @@ impl StreamExecutor {
     /// Register a static reference table (e.g., from `CREATE TABLE`).
     ///
     /// Unlike source tables, these persist across cycles.
-    #[allow(dead_code)] // Public API for Phase 3 CREATE TABLE support
+    #[allow(dead_code)]
     pub fn register_table(&self, name: &str, batch: RecordBatch) -> Result<(), DbError> {
         let schema = batch.schema();
         let mem_table = datafusion::datasource::MemTable::try_new(schema, vec![vec![batch]])
@@ -398,15 +396,12 @@ impl StreamExecutor {
         source_batches: &HashMap<String, Vec<RecordBatch>>,
         current_watermark: i64,
     ) -> Result<HashMap<String, Vec<RecordBatch>>, DbError> {
-        // 1. Recompute topological order if queries changed
         if self.topo_dirty {
             self.compute_topo_order();
         }
 
-        // 2. Register source data as temporary MemTables
         self.register_source_tables(source_batches)?;
 
-        // 3. Execute queries in dependency order, registering intermediate results
         let mut results = HashMap::new();
         let mut intermediate_tables: Vec<String> = Vec::new();
 
@@ -477,7 +472,6 @@ impl StreamExecutor {
             }
         }
 
-        // 4. Cleanup temporary source tables AND intermediate tables
         self.cleanup_source_tables();
         for name in &intermediate_tables {
             let _ = self.ctx.deregister_table(name);
@@ -617,7 +611,6 @@ impl StreamExecutor {
     ) -> Result<Vec<RecordBatch>, DbError> {
         let query_name = self.queries[idx].name.clone();
 
-        // Run pre-aggregation SQL to evaluate expressions
         let agg_state = self.agg_states.get(&idx).ok_or_else(|| {
             DbError::Pipeline(format!(
                 "internal: missing agg_state for query index {idx}"
@@ -647,7 +640,6 @@ impl StreamExecutor {
             }
         };
 
-        // Feed pre-agg results to accumulators
         let agg_state =
             self.agg_states.get_mut(&idx).ok_or_else(|| {
                 DbError::Pipeline(format!(
@@ -658,11 +650,10 @@ impl StreamExecutor {
             agg_state.process_batch(batch)?;
         }
 
-        // Emit current aggregate state
         let having_sql = agg_state.having_sql().map(String::from);
         let mut batches = agg_state.emit()?;
 
-        // H-03: Apply HAVING filter post-emission
+        // Apply HAVING filter post-emission
         if let Some(having_sql) = having_sql {
             batches = self
                 .apply_having_filter(&query_name, &batches, &having_sql)
@@ -723,15 +714,15 @@ impl StreamExecutor {
         result
     }
 
-    /// Get the number of registered queries.
-    #[allow(dead_code)] // Public API for admin/observability queries
+    /// Number of registered queries.
+    #[allow(dead_code)]
     pub fn query_count(&self) -> usize {
         self.queries.len()
     }
 
     /// Returns the current EOWC backpressure level (0.0 = no pressure,
     /// 1.0 = at memory limit). Callers can use this to throttle ingestion.
-    #[allow(dead_code)] // Public API for flow control
+    #[allow(dead_code)]
     pub fn backpressure_level(&self) -> f64 {
         let max_rows = self
             .eowc_states
@@ -755,7 +746,6 @@ impl StreamExecutor {
         query_name: &str,
         current_watermark: i64,
     ) -> Result<Vec<RecordBatch>, DbError> {
-        // Run pre-aggregation SQL
         let pre_agg_sql = self
             .eowc_agg_states
             .get(&idx)
@@ -781,7 +771,6 @@ impl StreamExecutor {
             }
         };
 
-        // Feed pre-agg results to per-window accumulators
         let eowc_state =
             self.eowc_agg_states.get_mut(&idx).ok_or_else(|| {
                 DbError::Pipeline(format!(
@@ -792,7 +781,6 @@ impl StreamExecutor {
             eowc_state.update_batch(batch)?;
         }
 
-        // Close windows and emit results
         let having_sql =
             eowc_state.having_sql().map(String::from);
         let mut batches =
@@ -819,7 +807,6 @@ impl StreamExecutor {
         query_name: &str,
         current_watermark: i64,
     ) -> Result<Vec<RecordBatch>, DbError> {
-        // Run pre-aggregation SQL
         let pre_agg_sql = self
             .core_window_states
             .get(&idx)
@@ -845,7 +832,6 @@ impl StreamExecutor {
             }
         };
 
-        // Feed pre-agg results to core window per-window accumulators
         let cw_state =
             self.core_window_states.get_mut(&idx).ok_or_else(|| {
                 DbError::Pipeline(format!(
@@ -856,7 +842,6 @@ impl StreamExecutor {
             cw_state.update_batch(batch)?;
         }
 
-        // Close windows and emit results
         let having_sql = cw_state.having_sql().map(String::from);
         let mut batches = cw_state.close_windows(current_watermark)?;
 
@@ -1006,12 +991,6 @@ impl StreamExecutor {
         let table_refs = self.queries[idx].table_refs.clone();
 
         // Accumulate current source batches into EOWC state.
-        //
-        // NOTE: Raw-batch accumulation is O(N) memory where N is the total
-        // rows in the window. A future optimisation (P2) should route EOWC
-        // aggregate queries through core window stateful operators for O(groups)
-        // memory via incremental accumulators. See Gap 2 in the gap analysis:
-        // `docs/GAP-ANALYSIS-STATEFUL-STREAMING.md`
         if let Some(eowc) = self.eowc_states.get_mut(&idx) {
             for table_name in &table_refs {
                 // Check source_batches first, then intermediate_results
@@ -1066,7 +1045,7 @@ impl StreamExecutor {
         if closed_cut <= last_boundary {
             // No new windows closed. Check if memory pressure requires
             // coalescing, but do NOT advance the cutoff — that would emit
-            // rows from open windows, causing data loss (H-11).
+            // rows from open windows, causing data loss.
             let over_limit = self
                 .eowc_states
                 .get(&idx)
@@ -3293,7 +3272,7 @@ mod tests {
         assert_eq!(schema.field(3).name(), "orderQty");
     }
 
-    /// H-11: Verify that memory pressure does NOT cause force-emit of
+    /// Verify that memory pressure does NOT cause force-emit of
     /// open-window rows when the watermark hasn't advanced.
     #[tokio::test]
     async fn test_eowc_force_emit_does_not_lose_open_window_data() {

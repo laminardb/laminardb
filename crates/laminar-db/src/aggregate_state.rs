@@ -285,7 +285,7 @@ pub(crate) struct IncrementalAggState {
     /// Number of group-by columns in the pre-agg output (first N columns).
     num_group_cols: usize,
     /// Group-by column names in the output schema.
-    #[allow(dead_code)] // Used in tests + future checkpoint serialization
+    #[allow(dead_code)]
     group_col_names: Vec<String>,
     /// Group-by column data types.
     group_types: Vec<DataType>,
@@ -349,11 +349,9 @@ impl IncrementalAggState {
             group_types.push(agg_field.data_type().clone());
         }
 
-        // Build agg specs from the aggregate expressions
         let mut agg_specs = Vec::new();
         let mut pre_agg_select_items: Vec<String> = Vec::new();
 
-        // H-15: Add group-by expressions to pre-agg SELECT.
         // For simple column refs, quote as identifier. For complex
         // expressions (EXTRACT, CASE WHEN, etc.), generate the SQL
         // expression with an alias so the source query evaluates it.
@@ -405,7 +403,7 @@ impl IncrementalAggState {
                         next_col_idx += 1;
                         let expr_sql = expr_to_sql(arg_expr);
 
-                        // H-02: If FILTER clause present, wrap input with
+                        // If FILTER clause present, wrap input with
                         // CASE WHEN so filtered rows become NULL (ignored
                         // by accumulators)
                         if let Some(filter_expr) = &agg_func.params.filter {
@@ -429,7 +427,7 @@ impl IncrementalAggState {
                     }
                 }
 
-                // H-02: Add a boolean filter column for masking rows
+                // Add a boolean filter column for masking rows
                 // in process_batch when FILTER clause is present
                 let filter_col_index =
                     if let Some(filter_expr) = &agg_func.params.filter {
@@ -464,7 +462,6 @@ impl IncrementalAggState {
             }
         }
 
-        // Build the pre-agg SQL. Extract source tables from the original query.
         let clauses = extract_clauses(sql);
         let pre_agg_sql = format!(
             "SELECT {} FROM {}{}",
@@ -473,7 +470,6 @@ impl IncrementalAggState {
             clauses.where_clause,
         );
 
-        // Build output schema
         let mut output_fields: Vec<Field> = Vec::new();
         for (name, dt) in group_col_names.iter().zip(group_types.iter()) {
             output_fields.push(Field::new(name, dt.clone(), true));
@@ -509,7 +505,6 @@ impl IncrementalAggState {
             return Ok(());
         }
 
-        // Build group key → row indices mapping
         let mut group_indices: HashMap<Vec<ScalarValue>, Vec<u32>> = HashMap::new();
         for row in 0..batch.num_rows() {
             let mut key = Vec::with_capacity(self.num_group_cols);
@@ -565,7 +560,7 @@ impl IncrementalAggState {
                     input_arrays.push(arr);
                 }
 
-                // H-02: Apply FILTER mask — only keep rows where the
+                // Apply FILTER mask -- only keep rows where the
                 // filter column is true
                 if let Some(filter_idx) = spec.filter_col_index {
                     let filter_arr = compute::take(
@@ -620,7 +615,6 @@ impl IncrementalAggState {
 
         let num_rows = self.groups.len();
 
-        // Build group-key columns
         let mut group_arrays: Vec<ArrayRef> = Vec::with_capacity(self.num_group_cols);
         for (col_idx, dt) in self.group_types.iter().enumerate() {
             let scalars: Vec<ScalarValue> = self
@@ -639,7 +633,6 @@ impl IncrementalAggState {
             }
         }
 
-        // Build aggregate result columns
         let mut agg_arrays: Vec<ArrayRef> =
             Vec::with_capacity(self.agg_specs.len());
         for (agg_idx, spec) in self.agg_specs.iter().enumerate() {
@@ -664,7 +657,6 @@ impl IncrementalAggState {
             }
         }
 
-        // Combine into output schema
         let mut all_arrays = group_arrays;
         all_arrays.extend(agg_arrays);
 
@@ -677,18 +669,18 @@ impl IncrementalAggState {
         Ok(vec![batch])
     }
 
-    /// Returns the pre-aggregation SQL for this query.
+    /// Pre-aggregation SQL.
     pub fn pre_agg_sql(&self) -> &str {
         &self.pre_agg_sql
     }
 
-    /// Returns the output schema.
-    #[allow(dead_code)] // Public API for checkpoint serialization
+    /// Output schema.
+    #[allow(dead_code)]
     pub fn output_schema(&self) -> &SchemaRef {
         &self.output_schema
     }
 
-    /// Returns the HAVING predicate SQL, if any.
+    /// HAVING predicate SQL, if any.
     pub fn having_sql(&self) -> Option<&str> {
         self.having_sql.as_deref()
     }
@@ -1668,7 +1660,7 @@ mod tests {
         assert!(state.process_batch(&batch).is_ok());
     }
 
-    // ── H-13: Type inference tests ─────────────────────────────────────
+    // ── Type inference tests ────────────────────────────────────────────
 
     #[tokio::test]
     async fn test_type_inference_preserves_source_int32() {
@@ -1700,7 +1692,7 @@ mod tests {
         .unwrap()
         .expect("expected aggregate state");
 
-        // H-13: Input type should be Int32 (source type), NOT Int64 (widened)
+        // Input type should be Int32 (source type), NOT Int64 (widened)
         assert_eq!(
             state.agg_specs[0].input_types[0],
             DataType::Int32,
@@ -1786,7 +1778,7 @@ mod tests {
         );
     }
 
-    // ── H-14: AST extraction tests ─────────────────────────────────────
+    // ── AST extraction tests ────────────────────────────────────────────
 
     #[test]
     fn test_extract_clauses_subquery_in_where() {
@@ -1802,7 +1794,7 @@ mod tests {
         );
     }
 
-    // ── H-12: expr_to_sql coverage ──────────────────────────────────
+    // ── expr_to_sql coverage ────────────────────────────────────────
 
     #[test]
     fn test_expr_to_sql_column() {
@@ -2016,7 +2008,7 @@ mod tests {
         );
     }
 
-    // ── H-15: GROUP BY expression tests ──────────────────────────────
+    // ── GROUP BY expression tests ───────────────────────────────────
 
     #[tokio::test]
     async fn test_group_by_expression_scalar_function() {
@@ -2048,7 +2040,7 @@ mod tests {
         .unwrap()
         .expect("expected aggregate state");
 
-        // H-15: The pre-agg SQL should contain the expression, not a
+        // The pre-agg SQL should contain the expression, not a
         // quoted identifier
         assert!(
             state.pre_agg_sql.contains("upper("),
@@ -2076,7 +2068,7 @@ mod tests {
         );
     }
 
-    // ── H-16: Group cardinality limit ──────────────────────────────
+    // ── Group cardinality limit ────────────────────────────────────
 
     #[tokio::test]
     async fn test_group_cardinality_limit_enforced() {

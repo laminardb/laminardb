@@ -133,7 +133,7 @@ pub(crate) struct IncrementalEowcState {
     /// Number of group-by columns in pre-agg output.
     num_group_cols: usize,
     /// Group-by column names in output schema.
-    #[allow(dead_code)] // Used in future checkpoint serialization
+    #[allow(dead_code)]
     group_col_names: Vec<String>,
     /// Group-by column data types.
     group_types: Vec<DataType>,
@@ -193,7 +193,6 @@ impl IncrementalEowcState {
             group_types.push(agg_field.data_type().clone());
         }
 
-        // Build pre-agg SELECT items (same logic as IncrementalAggState)
         let mut agg_specs = Vec::new();
         let mut pre_agg_select_items: Vec<String> = Vec::new();
 
@@ -298,7 +297,6 @@ impl IncrementalEowcState {
             window_config.time_column
         ));
 
-        // Build pre-agg SQL
         let clauses = extract_clauses(sql);
         let pre_agg_sql = format!(
             "SELECT {} FROM {}{}",
@@ -307,7 +305,6 @@ impl IncrementalEowcState {
             clauses.where_clause,
         );
 
-        // Build output schema: window_start + window_end + group cols + agg results
         let mut output_fields: Vec<Field> = vec![
             Field::new("window_start", DataType::Int64, false),
             Field::new("window_end", DataType::Int64, false),
@@ -470,7 +467,6 @@ impl IncrementalEowcState {
             return Ok(Vec::new());
         }
 
-        // Collect window starts that should close
         let to_close: Vec<i64> = self
             .windows
             .keys()
@@ -516,13 +512,11 @@ impl IncrementalEowcState {
             return Ok(None);
         }
 
-        // Build window_start and window_end columns
         let win_start_array: ArrayRef =
             Arc::new(arrow::array::Int64Array::from(vec![window_start; num_rows]));
         let win_end_array: ArrayRef =
             Arc::new(arrow::array::Int64Array::from(vec![window_end; num_rows]));
 
-        // Build group-key columns
         let mut group_arrays: Vec<ArrayRef> =
             Vec::with_capacity(self.num_group_cols);
         for (col_idx, dt) in self.group_types.iter().enumerate() {
@@ -543,7 +537,6 @@ impl IncrementalEowcState {
             }
         }
 
-        // Build aggregate result columns
         let mut agg_arrays: Vec<ArrayRef> =
             Vec::with_capacity(self.agg_specs.len());
         for (agg_idx, spec) in self.agg_specs.iter().enumerate() {
@@ -586,24 +579,24 @@ impl IncrementalEowcState {
         Ok(Some(batch))
     }
 
-    /// Returns the pre-aggregation SQL for this query.
+    /// Pre-aggregation SQL.
     pub fn pre_agg_sql(&self) -> &str {
         &self.pre_agg_sql
     }
 
-    /// Returns the output schema.
-    #[allow(dead_code)] // Public API for checkpoint serialization
+    /// Output schema.
+    #[allow(dead_code)]
     pub fn output_schema(&self) -> &SchemaRef {
         &self.output_schema
     }
 
-    /// Returns the HAVING predicate SQL, if any.
+    /// HAVING predicate SQL, if any.
     pub fn having_sql(&self) -> Option<&str> {
         self.having_sql.as_deref()
     }
 
     /// Return the number of open windows.
-    #[allow(dead_code)] // Public API for observability
+    #[allow(dead_code)]
     pub fn open_window_count(&self) -> usize {
         self.windows.len()
     }

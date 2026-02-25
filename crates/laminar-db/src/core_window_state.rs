@@ -5,8 +5,6 @@
 //! `Accumulator`s for aggregation. This eliminates the duplicated window
 //! assignment logic in `IncrementalEowcState`.
 //!
-//! Phase 1 scope: Tumbling windows only.
-
 use std::collections::{BTreeMap, HashMap};
 use std::sync::Arc;
 
@@ -42,32 +40,22 @@ pub(crate) struct CoreWindowCheckpoint {
 /// Uses the core engine's `TumblingWindowAssigner` for O(1) window assignment
 /// and `DataFusion` `Accumulator`s for per-group aggregation.
 pub(crate) struct CoreWindowState {
-    /// Core engine tumbling window assigner.
     assigner: TumblingWindowAssigner,
     /// Per-window aggregate state: `window_start` -> per-group accumulators.
     #[allow(clippy::type_complexity)]
     windows: BTreeMap<i64, HashMap<Vec<ScalarValue>, Vec<Box<dyn datafusion_expr::Accumulator>>>>,
-    /// Aggregate function specs (for creating fresh accumulators).
     agg_specs: Vec<AggFuncSpec>,
-    /// Number of group-by columns in pre-agg output.
     num_group_cols: usize,
-    /// Group-by column names in output schema.
     #[allow(dead_code)]
     group_col_names: Vec<String>,
-    /// Group-by column data types.
     group_types: Vec<DataType>,
-    /// Pre-aggregation SQL for expression evaluation.
     pre_agg_sql: String,
-    /// Index of the time column in the pre-agg output.
     time_col_index: usize,
-    /// Output schema (`window_start` + `window_end` + group cols + agg results).
     output_schema: SchemaRef,
     /// Converted emit strategy from SQL `EmitClause`.
-    #[allow(dead_code)] // Stored for Phase 2+ emit strategy variations
+    #[allow(dead_code)]
     emit_strategy: CoreEmitStrategy,
-    /// HAVING predicate SQL to apply after emitting.
     having_sql: Option<String>,
-    /// Maximum groups per window before new groups are dropped.
     max_groups_per_window: usize,
 }
 
@@ -82,7 +70,6 @@ impl CoreWindowState {
         window_config: &WindowOperatorConfig,
         emit_clause: Option<&EmitClause>,
     ) -> Result<Option<Self>, DbError> {
-        // Phase 1 gate: only tumbling windows
         if !matches!(
             window_config.window_type,
             WindowType::Tumbling | WindowType::Cumulate
@@ -129,7 +116,6 @@ impl CoreWindowState {
             group_types.push(agg_field.data_type().clone());
         }
 
-        // Build pre-agg SELECT items (same logic as IncrementalEowcState)
         let mut agg_specs = Vec::new();
         let mut pre_agg_select_items: Vec<String> = Vec::new();
 
@@ -231,7 +217,6 @@ impl CoreWindowState {
             window_config.time_column
         ));
 
-        // Build pre-agg SQL
         let clauses = extract_clauses(sql);
         let pre_agg_sql = format!(
             "SELECT {} FROM {}{}",
@@ -240,7 +225,6 @@ impl CoreWindowState {
             clauses.where_clause,
         );
 
-        // Build output schema: window_start + window_end + group cols + agg results
         let mut output_fields: Vec<Field> = vec![
             Field::new("window_start", DataType::Int64, false),
             Field::new("window_end", DataType::Int64, false),
@@ -300,7 +284,6 @@ impl CoreWindowState {
             let window_id = self.assigner.assign(ts_ms);
             let window_start = window_id.start;
 
-            // Extract group key
             let mut key = Vec::with_capacity(self.num_group_cols);
             for col_idx in 0..self.num_group_cols {
                 let sv = ScalarValue::try_from_array(batch.column(col_idx), row).map_err(|e| {
@@ -331,7 +314,6 @@ impl CoreWindowState {
                 continue;
             };
 
-            // Update each accumulator with this row's values
             let index_array =
                 arrow::array::UInt32Array::from(vec![
                     #[allow(clippy::cast_possible_truncation)]
@@ -382,7 +364,6 @@ impl CoreWindowState {
     pub fn close_windows(&mut self, watermark_ms: i64) -> Result<Vec<RecordBatch>, DbError> {
         let size_ms = self.assigner.size_ms();
 
-        // Collect window starts that should close
         let to_close: Vec<i64> = self
             .windows
             .keys()
@@ -432,7 +413,6 @@ impl CoreWindowState {
         let win_end_array: ArrayRef =
             Arc::new(arrow::array::Int64Array::from(vec![window_end; num_rows]));
 
-        // Build group-key columns
         let mut group_arrays: Vec<ArrayRef> = Vec::with_capacity(self.num_group_cols);
         for (col_idx, dt) in self.group_types.iter().enumerate() {
             let scalars: Vec<ScalarValue> =
@@ -447,7 +427,6 @@ impl CoreWindowState {
             }
         }
 
-        // Build aggregate result columns
         let mut agg_arrays: Vec<ArrayRef> = Vec::with_capacity(self.agg_specs.len());
         for (agg_idx, spec) in self.agg_specs.iter().enumerate() {
             let mut scalars: Vec<ScalarValue> = Vec::with_capacity(num_rows);
@@ -477,12 +456,12 @@ impl CoreWindowState {
         Ok(Some(batch))
     }
 
-    /// Returns the pre-aggregation SQL for this query.
+    /// Pre-aggregation SQL.
     pub fn pre_agg_sql(&self) -> &str {
         &self.pre_agg_sql
     }
 
-    /// Returns the HAVING predicate SQL, if any.
+    /// HAVING predicate SQL, if any.
     pub fn having_sql(&self) -> Option<&str> {
         self.having_sql.as_deref()
     }
@@ -757,7 +736,7 @@ mod tests {
         let mem = datafusion::datasource::MemTable::try_new(schema, vec![vec![]]).unwrap();
         ctx.register_table("events", Arc::new(mem)).unwrap();
 
-        // Sliding window → should return None (Phase 1 only supports tumbling)
+        // Sliding window should fall through
         let window_config = WindowOperatorConfig {
             window_type: WindowType::Sliding,
             time_column: "ts".to_string(),
