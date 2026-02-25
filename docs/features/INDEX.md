@@ -243,8 +243,8 @@ See [Stateful Streaming SQL Index](phase-3/stateful-sql/INDEX.md).
 
 | ID | Feature | Status | Spec |
 |----|---------|--------|------|
-| F-SSQL-000 | Streaming Aggregation Hardening | 📝 | [Link](phase-3/stateful-sql/F-SSQL-000-aggregation-hardening.md) |
-| F-SSQL-001 | EOWC Incremental Window Accumulators | 📝 | [Link](phase-3/stateful-sql/F-SSQL-001-eowc-incremental-accumulators.md) |
+| F-SSQL-000 | Streaming Aggregation Hardening | ✅ | [Link](phase-3/stateful-sql/F-SSQL-000-aggregation-hardening.md) |
+| F-SSQL-001 | EOWC Incremental Window Accumulators | ✅ | [Link](phase-3/stateful-sql/F-SSQL-001-eowc-incremental-accumulators.md) |
 | F-SSQL-002 | StreamExecutor State Checkpoint Integration | ✅ | [Link](phase-3/stateful-sql/F-SSQL-002-checkpoint-integration.md) |
 | F-SSQL-003 | Ring 0 SQL Operator Routing | 📝 | [Link](phase-3/stateful-sql/F-SSQL-003-ring0-sql-routing.md) |
 | F-SSQL-004 | Streaming Physical Optimizer Rule | 📝 | [Link](phase-3/stateful-sql/F-SSQL-004-streaming-physical-optimizer.md) |
