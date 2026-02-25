@@ -346,6 +346,12 @@ impl StreamExecutor {
 
         // Fallback: if cycle detected, append any missing indices in insertion order
         if self.topo_order.len() < self.queries.len() {
+            tracing::warn!(
+                ordered = self.topo_order.len(),
+                total = self.queries.len(),
+                "circular dependency detected in query DAG, \
+                 falling back to insertion order for remaining queries"
+            );
             let in_order: HashSet<usize> = self.topo_order.iter().copied().collect();
             for i in 0..self.queries.len() {
                 if !in_order.contains(&i) {
@@ -770,10 +776,14 @@ impl StreamExecutor {
                     // per-batch overhead and memory fragmentation.
                     if entry.len() > EOWC_COALESCE_BATCH_THRESHOLD {
                         let schema = entry[0].schema();
-                        if let Ok(coalesced) =
-                            arrow::compute::concat_batches(&schema, entry.as_slice())
-                        {
-                            *entry = vec![coalesced];
+                        match arrow::compute::concat_batches(&schema, entry.as_slice()) {
+                            Ok(coalesced) => *entry = vec![coalesced],
+                            Err(e) => tracing::warn!(
+                                table = %table_name,
+                                batches = entry.len(),
+                                "EOWC batch coalescing failed, \
+                                 keeping fragmented batches: {e}"
+                            ),
                         }
                     }
                 }
@@ -815,10 +825,14 @@ impl StreamExecutor {
                     for batches in eowc.accumulated_sources.values_mut() {
                         if batches.len() > 1 {
                             let schema = batches[0].schema();
-                            if let Ok(coalesced) =
-                                arrow::compute::concat_batches(&schema, batches.as_slice())
-                            {
-                                *batches = vec![coalesced];
+                            match arrow::compute::concat_batches(
+                                &schema,
+                                batches.as_slice(),
+                            ) {
+                                Ok(coalesced) => *batches = vec![coalesced],
+                                Err(e) => tracing::warn!(
+                                    "EOWC pressure coalescing failed: {e}"
+                                ),
                             }
                         }
                     }
@@ -876,12 +890,21 @@ impl StreamExecutor {
                 }
                 if !filtered_batches.is_empty() {
                     let schema = filtered_batches[0].schema();
-                    if let Ok(coalesced) =
-                        arrow::compute::concat_batches(&schema, &filtered_batches)
-                    {
-                        filtered_sources.insert(table_name.clone(), vec![coalesced]);
-                    } else {
-                        filtered_sources.insert(table_name.clone(), filtered_batches);
+                    match arrow::compute::concat_batches(&schema, &filtered_batches) {
+                        Ok(coalesced) => {
+                            filtered_sources
+                                .insert(table_name.clone(), vec![coalesced]);
+                        }
+                        Err(e) => {
+                            tracing::warn!(
+                                table = %table_name,
+                                batches = filtered_batches.len(),
+                                "EOWC filtered batch coalescing failed, \
+                                 keeping fragmented: {e}"
+                            );
+                            filtered_sources
+                                .insert(table_name.clone(), filtered_batches);
+                        }
                     }
                 }
                 if !retained_batches.is_empty() {
@@ -1061,6 +1084,7 @@ fn compute_closed_boundary(watermark_ms: i64, config: &WindowOperatorConfig) -> 
             #[allow(clippy::cast_possible_truncation)]
             let size = config.size.as_millis() as i64;
             if size <= 0 {
+                tracing::warn!("tumbling window size is zero or negative, EOWC filtering disabled");
                 return watermark_ms;
             }
             // Floor to nearest window boundary
@@ -1077,13 +1101,18 @@ fn compute_closed_boundary(watermark_ms: i64, config: &WindowOperatorConfig) -> 
             #[allow(clippy::cast_possible_truncation)]
             let slide = config.slide.map_or(size, |s| s.as_millis() as i64);
             if slide <= 0 || size <= 0 {
+                tracing::warn!(
+                    slide_ms = slide,
+                    size_ms = size,
+                    "sliding window size/slide is zero or negative, EOWC filtering disabled"
+                );
                 return watermark_ms;
             }
             // The earliest open window starts at the first slide-aligned
             // boundary after (watermark - size). Data below that start
             // belongs only to fully closed windows.
             let base = watermark_ms.saturating_sub(size);
-            (base / slide + 1) * slide
+            (base / slide).saturating_add(1).saturating_mul(slide)
         }
         WindowType::Cumulate => {
             // Cumulate windows share the same epoch alignment as tumbling.
@@ -1091,6 +1120,7 @@ fn compute_closed_boundary(watermark_ms: i64, config: &WindowOperatorConfig) -> 
             #[allow(clippy::cast_possible_truncation)]
             let size = config.size.as_millis() as i64;
             if size <= 0 {
+                tracing::warn!("cumulate window size is zero or negative, EOWC filtering disabled");
                 return watermark_ms;
             }
             (watermark_ms / size) * size
