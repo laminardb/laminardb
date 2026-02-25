@@ -1,6 +1,6 @@
-//! Ring 0 pipeline state for EOWC queries routed through core operators.
+//! Core window state for EOWC queries routed through core operators.
 //!
-//! Routes qualifying SQL EOWC queries through Ring 0's canonical
+//! Routes qualifying SQL EOWC queries through the core engine's canonical
 //! `TumblingWindowAssigner` for window assignment while using `DataFusion`
 //! `Accumulator`s for aggregation. This eliminates the duplicated window
 //! assignment logic in `IncrementalEowcState`.
@@ -28,21 +28,21 @@ use crate::aggregate_state::{
 use crate::error::DbError;
 use crate::eowc_state::extract_i64_timestamps;
 
-/// Serializable checkpoint for a Ring 0 pipeline state.
+/// Serializable checkpoint for a core window pipeline state.
 #[derive(Clone, serde::Serialize, serde::Deserialize)]
-pub(crate) struct Ring0StateCheckpoint {
+pub(crate) struct CoreWindowCheckpoint {
     /// Query fingerprint for schema validation.
     pub fingerprint: u64,
     /// Per-window checkpoint data (reuses EOWC format).
     pub windows: Vec<WindowCheckpoint>,
 }
 
-/// Ring 0 pipeline state for tumbling-window aggregate queries.
+/// Core window state for tumbling-window aggregate queries.
 ///
-/// Uses Ring 0's `TumblingWindowAssigner` for O(1) window assignment
+/// Uses the core engine's `TumblingWindowAssigner` for O(1) window assignment
 /// and `DataFusion` `Accumulator`s for per-group aggregation.
-pub(crate) struct Ring0PipelineState {
-    /// Ring 0 tumbling window assigner.
+pub(crate) struct CoreWindowState {
+    /// Core engine tumbling window assigner.
     assigner: TumblingWindowAssigner,
     /// Per-window aggregate state: `window_start` -> per-group accumulators.
     #[allow(clippy::type_complexity)]
@@ -71,8 +71,8 @@ pub(crate) struct Ring0PipelineState {
     max_groups_per_window: usize,
 }
 
-impl Ring0PipelineState {
-    /// Attempt to build a `Ring0PipelineState` by introspecting the logical
+impl CoreWindowState {
+    /// Attempt to build a `CoreWindowState` by introspecting the logical
     /// plan of the given SQL query. Returns `None` if the query is not a
     /// tumbling-window aggregate (falls through to `IncrementalEowcState`).
     #[allow(clippy::too_many_lines)]
@@ -227,7 +227,7 @@ impl Ring0PipelineState {
         // Add time column for window assignment
         let time_col_index = next_col_idx;
         pre_agg_select_items.push(format!(
-            "\"{}\" AS \"__ring0_ts\"",
+            "\"{}\" AS \"__cw_ts\"",
             window_config.time_column
         ));
 
@@ -285,7 +285,7 @@ impl Ring0PipelineState {
 
     /// Update per-window accumulators with a new pre-aggregation batch.
     ///
-    /// For each row: extracts the timestamp, uses Ring 0's
+    /// For each row: extracts the timestamp, uses the core engine's
     /// `TumblingWindowAssigner::assign()` for O(1) window assignment,
     /// extracts the group key, and updates the corresponding accumulators.
     pub fn update_batch(&mut self, batch: &RecordBatch) -> Result<(), DbError> {
@@ -296,7 +296,7 @@ impl Ring0PipelineState {
         let ts_array = extract_i64_timestamps(batch, self.time_col_index)?;
 
         for (row, &ts_ms) in ts_array.iter().enumerate() {
-            // Ring 0 O(1) window assignment
+            // Core engine O(1) window assignment
             let window_id = self.assigner.assign(ts_ms);
             let window_start = window_id.start;
 
@@ -316,7 +316,7 @@ impl Ring0PipelineState {
                     tracing::warn!(
                         max_groups = self.max_groups_per_window,
                         window_start,
-                        "Ring 0 per-window group cardinality limit reached"
+                        "Core window per-window group cardinality limit reached"
                     );
                     continue;
                 }
@@ -495,7 +495,7 @@ impl Ring0PipelineState {
     /// Checkpoint all per-window group states into a serializable struct.
     pub(crate) fn checkpoint_windows(
         &mut self,
-    ) -> Result<Ring0StateCheckpoint, DbError> {
+    ) -> Result<CoreWindowCheckpoint, DbError> {
         use crate::aggregate_state::scalar_to_json;
 
         let fingerprint = self.query_fingerprint();
@@ -522,7 +522,7 @@ impl Ring0PipelineState {
                 groups: group_checkpoints,
             });
         }
-        Ok(Ring0StateCheckpoint {
+        Ok(CoreWindowCheckpoint {
             fingerprint,
             windows,
         })
@@ -531,14 +531,14 @@ impl Ring0PipelineState {
     /// Restore per-window group states from a checkpoint.
     pub(crate) fn restore_windows(
         &mut self,
-        checkpoint: &Ring0StateCheckpoint,
+        checkpoint: &CoreWindowCheckpoint,
     ) -> Result<usize, DbError> {
         use crate::aggregate_state::json_to_scalar;
 
         let current_fp = self.query_fingerprint();
         if checkpoint.fingerprint != current_fp {
             return Err(DbError::Pipeline(format!(
-                "Ring 0 checkpoint fingerprint mismatch: saved={}, current={}",
+                "Core window checkpoint fingerprint mismatch: saved={}, current={}",
                 checkpoint.fingerprint, current_fp
             )));
         }
@@ -599,7 +599,7 @@ mod tests {
         let schema = Arc::new(Schema::new(vec![
             Field::new("symbol", DataType::Utf8, false),
             Field::new("__agg_input_1", DataType::Int64, false),
-            Field::new("__ring0_ts", DataType::Int64, false),
+            Field::new("__cw_ts", DataType::Int64, false),
         ]));
         RecordBatch::try_new(
             schema,
@@ -614,9 +614,9 @@ mod tests {
         .unwrap()
     }
 
-    /// Build a `Ring0PipelineState` for SUM(Int64) with 1-second tumbling
+    /// Build a `CoreWindowState` for SUM(Int64) with 1-second tumbling
     /// windows and a single Utf8 group-by column.
-    fn make_ring0_state(size_ms: i64) -> Ring0PipelineState {
+    fn make_core_window_state(size_ms: i64) -> CoreWindowState {
         let ctx = SessionContext::new();
         let udf = ctx.udaf("sum").expect("SUM should be registered");
 
@@ -637,7 +637,7 @@ mod tests {
             Field::new("total", DataType::Int64, true),
         ]));
 
-        Ring0PipelineState {
+        CoreWindowState {
             assigner: TumblingWindowAssigner::from_millis(size_ms),
             windows: BTreeMap::new(),
             agg_specs,
@@ -653,8 +653,8 @@ mod tests {
         }
     }
 
-    /// Build a multi-aggregate Ring0 state: SUM + COUNT.
-    fn make_ring0_state_multi_agg(size_ms: i64) -> Ring0PipelineState {
+    /// Build a multi-aggregate core window state: SUM + COUNT.
+    fn make_core_window_state_multi_agg(size_ms: i64) -> CoreWindowState {
         let ctx = SessionContext::new();
         let sum_udf = ctx.udaf("sum").expect("SUM");
         let count_udf = ctx.udaf("count").expect("COUNT");
@@ -688,7 +688,7 @@ mod tests {
             Field::new("cnt", DataType::Int64, true),
         ]));
 
-        Ring0PipelineState {
+        CoreWindowState {
             assigner: TumblingWindowAssigner::from_millis(size_ms),
             windows: BTreeMap::new(),
             agg_specs,
@@ -707,7 +707,7 @@ mod tests {
     // ── Detection tests ─────────────────────────────────────────────
 
     #[tokio::test]
-    async fn test_detect_tumbling_aggregate_returns_ring0_config() {
+    async fn test_detect_tumbling_aggregate_returns_core_window() {
         use laminar_sql::{create_session_context, register_streaming_functions};
         use std::time::Duration;
 
@@ -735,7 +735,7 @@ mod tests {
         };
 
         let sql = "SELECT symbol, SUM(price) AS total FROM trades GROUP BY symbol";
-        let result = Ring0PipelineState::try_from_sql(&ctx, sql, &window_config, None)
+        let result = CoreWindowState::try_from_sql(&ctx, sql, &window_config, None)
             .await
             .unwrap();
         assert!(result.is_some(), "Tumbling aggregate should return Some");
@@ -770,7 +770,7 @@ mod tests {
         };
 
         let sql = "SELECT id, SUM(val) AS total FROM events GROUP BY id";
-        let result = Ring0PipelineState::try_from_sql(&ctx, sql, &window_config, None)
+        let result = CoreWindowState::try_from_sql(&ctx, sql, &window_config, None)
             .await
             .unwrap();
         assert!(result.is_none(), "Sliding window should return None");
@@ -805,7 +805,7 @@ mod tests {
 
         // No aggregate → should return None
         let sql = "SELECT id, val FROM events";
-        let result = Ring0PipelineState::try_from_sql(&ctx, sql, &window_config, None)
+        let result = CoreWindowState::try_from_sql(&ctx, sql, &window_config, None)
             .await
             .unwrap();
         assert!(result.is_none(), "Projection-only should return None");
@@ -814,8 +814,8 @@ mod tests {
     // ── Pipeline tests ──────────────────────────────────────────────
 
     #[test]
-    fn test_ring0_tumbling_sum() {
-        let mut state = make_ring0_state(1000);
+    fn test_core_window_tumbling_sum() {
+        let mut state = make_core_window_state(1000);
 
         // Two events in window [0, 1000)
         let batch1 = make_pre_agg_batch(
@@ -850,8 +850,8 @@ mod tests {
     }
 
     #[test]
-    fn test_ring0_tumbling_multi_aggregate_multi_group() {
-        let mut state = make_ring0_state_multi_agg(1000);
+    fn test_core_window_tumbling_multi_aggregate_multi_group() {
+        let mut state = make_core_window_state_multi_agg(1000);
 
         // Window [0, 1000): AAPL=10,20  GOOG=100  MSFT=50
         let batch1 = make_pre_agg_batch(
@@ -881,8 +881,8 @@ mod tests {
     }
 
     #[test]
-    fn test_ring0_close_windows_watermark() {
-        let mut state = make_ring0_state(1000);
+    fn test_core_window_close_windows_watermark() {
+        let mut state = make_core_window_state(1000);
 
         // Events in three windows
         let batch = make_pre_agg_batch(
@@ -955,8 +955,8 @@ mod tests {
     // ── Checkpoint/Restore tests ────────────────────────────────────
 
     #[test]
-    fn test_ring0_pipeline_checkpoint_roundtrip() {
-        let mut state = make_ring0_state(1000);
+    fn test_core_window_checkpoint_roundtrip() {
+        let mut state = make_core_window_state(1000);
 
         // Feed data into two windows
         let batch = make_pre_agg_batch(
@@ -971,7 +971,7 @@ mod tests {
         assert_eq!(cp.windows.len(), 2);
 
         // Create fresh state and restore
-        let mut state2 = make_ring0_state(1000);
+        let mut state2 = make_core_window_state(1000);
         let restored = state2.restore_windows(&cp).unwrap();
         assert!(restored > 0, "Should have restored groups");
 
@@ -992,8 +992,8 @@ mod tests {
     }
 
     #[test]
-    fn test_ring0_checkpoint_fingerprint_mismatch() {
-        let mut state = make_ring0_state(1000);
+    fn test_core_window_checkpoint_fingerprint_mismatch() {
+        let mut state = make_core_window_state(1000);
 
         let batch = make_pre_agg_batch(vec!["AAPL"], vec![10], vec![100]);
         state.update_batch(&batch).unwrap();
@@ -1001,7 +1001,7 @@ mod tests {
         let mut cp = state.checkpoint_windows().unwrap();
         cp.fingerprint = 12345; // tamper
 
-        let mut state2 = make_ring0_state(1000);
+        let mut state2 = make_core_window_state(1000);
         let result = state2.restore_windows(&cp);
         assert!(result.is_err(), "Should fail on fingerprint mismatch");
     }

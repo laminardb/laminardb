@@ -43,7 +43,7 @@ mod metrics;
 mod pipeline_checkpoint;
 /// Deployment profiles.
 pub mod profile;
-mod ring0_state;
+mod core_window_state;
 /// Unified recovery manager.
 pub mod recovery_manager;
 mod sql_utils;
