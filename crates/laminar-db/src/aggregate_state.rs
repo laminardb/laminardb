@@ -168,9 +168,20 @@ impl IncrementalAggState {
         let mut agg_specs = Vec::new();
         let mut pre_agg_select_items: Vec<String> = Vec::new();
 
-        // First add group-by columns to pre-agg SELECT
-        for name in &group_col_names {
-            pre_agg_select_items.push(format!("\"{name}\""));
+        // H-15: Add group-by expressions to pre-agg SELECT.
+        // For simple column refs, quote as identifier. For complex
+        // expressions (EXTRACT, CASE WHEN, etc.), generate the SQL
+        // expression with an alias so the source query evaluates it.
+        for (i, group_expr) in group_exprs.iter().enumerate() {
+            if let datafusion_expr::Expr::Column(col) = group_expr {
+                pre_agg_select_items
+                    .push(format!("\"{}\"", col.name));
+            } else {
+                let group_sql = expr_to_sql(group_expr);
+                pre_agg_select_items.push(format!(
+                    "{group_sql} AS \"__group_{i}\""
+                ));
+            }
         }
 
         // Column index tracker for pre-agg output
@@ -558,25 +569,136 @@ fn find_aggregate_inner(
     }
 }
 
+/// Convert a `ScalarValue` to a SQL-safe literal string.
+fn scalar_value_to_sql(sv: &ScalarValue) -> String {
+    match sv {
+        ScalarValue::Utf8(Some(s))
+        | ScalarValue::LargeUtf8(Some(s))
+        | ScalarValue::Utf8View(Some(s)) => {
+            format!("'{}'", s.replace('\'', "''"))
+        }
+        ScalarValue::Utf8(None)
+        | ScalarValue::LargeUtf8(None)
+        | ScalarValue::Utf8View(None)
+        | ScalarValue::Null
+        | ScalarValue::Boolean(None) => "NULL".to_string(),
+        ScalarValue::Boolean(Some(b)) => {
+            if *b { "TRUE" } else { "FALSE" }.to_string()
+        }
+        _ => sv.to_string(),
+    }
+}
+
+/// Convert a `DataFusion` CASE expression to SQL.
+fn case_to_sql(case: &datafusion_expr::expr::Case) -> String {
+    use std::fmt::Write;
+    let mut sql = String::from("CASE");
+    if let Some(operand) = &case.expr {
+        let _ = write!(sql, " {}", expr_to_sql(operand));
+    }
+    for (when_expr, then_expr) in &case.when_then_expr {
+        let _ = write!(
+            sql,
+            " WHEN {} THEN {}",
+            expr_to_sql(when_expr),
+            expr_to_sql(then_expr)
+        );
+    }
+    if let Some(else_expr) = &case.else_expr {
+        let _ = write!(sql, " ELSE {}", expr_to_sql(else_expr));
+    }
+    sql.push_str(" END");
+    sql
+}
+
 /// Convert a `DataFusion` `Expr` to a SQL string for use in pre-aggregation
 /// queries.
 fn expr_to_sql(expr: &datafusion_expr::Expr) -> String {
+    use datafusion_expr::Expr;
     match expr {
-        datafusion_expr::Expr::Column(col) => {
-            format!("\"{}\"", col.name)
-        }
-        datafusion_expr::Expr::Literal(sv, _) => sv.to_string(),
-        datafusion_expr::Expr::BinaryExpr(bin) => {
+        Expr::Column(col) => format!("\"{}\"", col.name),
+        Expr::Literal(sv, _) => scalar_value_to_sql(sv),
+        Expr::Alias(alias) => expr_to_sql(&alias.expr),
+        Expr::BinaryExpr(bin) => {
             let left = expr_to_sql(&bin.left);
             let right = expr_to_sql(&bin.right);
             format!("({left} {op} {right})", op = bin.op)
         }
-        datafusion_expr::Expr::Cast(cast) => {
+        Expr::Cast(cast) => {
             let inner = expr_to_sql(&cast.expr);
             format!("CAST({inner} AS {})", cast.data_type)
         }
+        Expr::TryCast(cast) => {
+            let inner = expr_to_sql(&cast.expr);
+            format!("TRY_CAST({inner} AS {})", cast.data_type)
+        }
+        Expr::ScalarFunction(func) => {
+            let args: Vec<String> =
+                func.args.iter().map(expr_to_sql).collect();
+            format!("{}({})", func.func.name(), args.join(", "))
+        }
+        Expr::AggregateFunction(agg) => {
+            let name = agg.func.name();
+            let args: Vec<String> =
+                agg.params.args.iter().map(expr_to_sql).collect();
+            if agg.params.distinct {
+                format!("{name}(DISTINCT {})", args.join(", "))
+            } else {
+                format!("{name}({})", args.join(", "))
+            }
+        }
+        Expr::Case(case) => case_to_sql(case),
+        Expr::Not(inner) => format!("(NOT {})", expr_to_sql(inner)),
+        Expr::Negative(inner) => format!("(-{})", expr_to_sql(inner)),
+        Expr::IsNull(inner) => {
+            format!("({} IS NULL)", expr_to_sql(inner))
+        }
+        Expr::IsNotNull(inner) => {
+            format!("({} IS NOT NULL)", expr_to_sql(inner))
+        }
+        Expr::IsTrue(inner) => {
+            format!("({} IS TRUE)", expr_to_sql(inner))
+        }
+        Expr::IsFalse(inner) => {
+            format!("({} IS FALSE)", expr_to_sql(inner))
+        }
+        Expr::IsNotTrue(inner) => {
+            format!("({} IS NOT TRUE)", expr_to_sql(inner))
+        }
+        Expr::IsNotFalse(inner) => {
+            format!("({} IS NOT FALSE)", expr_to_sql(inner))
+        }
+        Expr::Between(between) => {
+            let e = expr_to_sql(&between.expr);
+            let low = expr_to_sql(&between.low);
+            let high = expr_to_sql(&between.high);
+            let not = if between.negated { " NOT" } else { "" };
+            format!("({e}{not} BETWEEN {low} AND {high})")
+        }
+        Expr::InList(in_list) => {
+            let e = expr_to_sql(&in_list.expr);
+            let items: Vec<String> =
+                in_list.list.iter().map(expr_to_sql).collect();
+            let not = if in_list.negated { " NOT" } else { "" };
+            format!("({e}{not} IN ({}))", items.join(", "))
+        }
+        Expr::Like(like) => {
+            let e = expr_to_sql(&like.expr);
+            let pat = expr_to_sql(&like.pattern);
+            let kw = if like.case_insensitive {
+                "ILIKE"
+            } else {
+                "LIKE"
+            };
+            let not = if like.negated { " NOT" } else { "" };
+            if let Some(esc) = &like.escape_char {
+                format!("({e}{not} {kw} {pat} ESCAPE '{esc}')")
+            } else {
+                format!("({e}{not} {kw} {pat})")
+            }
+        }
         #[allow(deprecated)]
-        datafusion_expr::Expr::Wildcard { .. } => "TRUE".to_string(),
+        Expr::Wildcard { .. } => "TRUE".to_string(),
         other => other.to_string(),
     }
 }
@@ -1407,6 +1529,280 @@ mod tests {
             c.where_clause.contains("AVG"),
             "subquery should be preserved: {}",
             c.where_clause
+        );
+    }
+
+    // ── H-12: expr_to_sql coverage ──────────────────────────────────
+
+    #[test]
+    fn test_expr_to_sql_column() {
+        use datafusion_expr::col;
+        assert_eq!(expr_to_sql(&col("price")), "\"price\"");
+    }
+
+    #[test]
+    fn test_expr_to_sql_string_literal() {
+        let e = datafusion_expr::Expr::Literal(
+            ScalarValue::Utf8(Some("it's".to_string())),
+            None,
+        );
+        assert_eq!(expr_to_sql(&e), "'it''s'");
+    }
+
+    #[test]
+    fn test_expr_to_sql_null_literal() {
+        let e = datafusion_expr::Expr::Literal(ScalarValue::Null, None);
+        assert_eq!(expr_to_sql(&e), "NULL");
+    }
+
+    #[test]
+    fn test_expr_to_sql_boolean_literal() {
+        let t = datafusion_expr::Expr::Literal(
+            ScalarValue::Boolean(Some(true)),
+            None,
+        );
+        assert_eq!(expr_to_sql(&t), "TRUE");
+        let f = datafusion_expr::Expr::Literal(
+            ScalarValue::Boolean(Some(false)),
+            None,
+        );
+        assert_eq!(expr_to_sql(&f), "FALSE");
+    }
+
+    #[test]
+    fn test_expr_to_sql_binary_expr() {
+        use datafusion_expr::{col, lit};
+        let e = col("x").gt(lit(10));
+        let sql = expr_to_sql(&e);
+        assert!(sql.contains("\"x\""), "should contain column: {sql}");
+        assert!(sql.contains(">"), "should contain >: {sql}");
+        assert!(sql.contains("10"), "should contain 10: {sql}");
+    }
+
+    #[test]
+    fn test_expr_to_sql_cast() {
+        use datafusion_expr::Expr;
+        let e = Expr::Cast(datafusion_expr::expr::Cast {
+            expr: Box::new(datafusion_expr::col("x")),
+            data_type: DataType::Float64,
+        });
+        let sql = expr_to_sql(&e);
+        assert!(
+            sql.contains("CAST"),
+            "should contain CAST: {sql}"
+        );
+        assert!(
+            sql.contains("Float64"),
+            "should contain target type: {sql}"
+        );
+    }
+
+    #[test]
+    fn test_expr_to_sql_scalar_function() {
+        use datafusion_expr::Expr;
+        // Build a scalar function expr via DataFusion
+        let func = datafusion::functions::string::upper();
+        let e =
+            Expr::ScalarFunction(datafusion_expr::expr::ScalarFunction {
+                func,
+                args: vec![datafusion_expr::col("name")],
+            });
+        let sql = expr_to_sql(&e);
+        assert!(
+            sql.contains("upper"),
+            "should contain function name: {sql}"
+        );
+        assert!(
+            sql.contains("\"name\""),
+            "should contain arg: {sql}"
+        );
+    }
+
+    #[test]
+    fn test_expr_to_sql_case() {
+        use datafusion_expr::{col, lit};
+        let e = datafusion_expr::Expr::Case(datafusion_expr::expr::Case {
+            expr: None,
+            when_then_expr: vec![(
+                Box::new(col("x").gt(lit(0))),
+                Box::new(lit(1)),
+            )],
+            else_expr: Some(Box::new(lit(0))),
+        });
+        let sql = expr_to_sql(&e);
+        assert!(sql.starts_with("CASE"), "should start with CASE: {sql}");
+        assert!(sql.contains("WHEN"), "should contain WHEN: {sql}");
+        assert!(sql.contains("THEN"), "should contain THEN: {sql}");
+        assert!(sql.contains("ELSE"), "should contain ELSE: {sql}");
+        assert!(sql.ends_with("END"), "should end with END: {sql}");
+    }
+
+    #[test]
+    fn test_expr_to_sql_not() {
+        use datafusion_expr::col;
+        let e = datafusion_expr::Expr::Not(Box::new(col("active")));
+        assert_eq!(expr_to_sql(&e), "(NOT \"active\")");
+    }
+
+    #[test]
+    fn test_expr_to_sql_negative() {
+        use datafusion_expr::col;
+        let e = datafusion_expr::Expr::Negative(Box::new(col("x")));
+        assert_eq!(expr_to_sql(&e), "(-\"x\")");
+    }
+
+    #[test]
+    fn test_expr_to_sql_is_null() {
+        use datafusion_expr::col;
+        let e =
+            datafusion_expr::Expr::IsNull(Box::new(col("x")));
+        assert_eq!(expr_to_sql(&e), "(\"x\" IS NULL)");
+    }
+
+    #[test]
+    fn test_expr_to_sql_is_not_null() {
+        use datafusion_expr::col;
+        let e = datafusion_expr::Expr::IsNotNull(Box::new(col("x")));
+        assert_eq!(expr_to_sql(&e), "(\"x\" IS NOT NULL)");
+    }
+
+    #[test]
+    fn test_expr_to_sql_between() {
+        use datafusion_expr::{col, lit};
+        let e = col("x").between(lit(1), lit(10));
+        let sql = expr_to_sql(&e);
+        assert!(
+            sql.contains("BETWEEN"),
+            "should contain BETWEEN: {sql}"
+        );
+        assert!(sql.contains("AND"), "should contain AND: {sql}");
+    }
+
+    #[test]
+    fn test_expr_to_sql_in_list() {
+        use datafusion_expr::{col, lit};
+        let e = col("status").in_list(vec![lit("a"), lit("b")], false);
+        let sql = expr_to_sql(&e);
+        assert!(sql.contains("IN"), "should contain IN: {sql}");
+        assert!(sql.contains("'a'"), "should contain 'a': {sql}");
+        assert!(sql.contains("'b'"), "should contain 'b': {sql}");
+    }
+
+    #[test]
+    fn test_expr_to_sql_like() {
+        use datafusion_expr::col;
+        let e = col("name").like(datafusion_expr::lit("foo%"));
+        let sql = expr_to_sql(&e);
+        assert!(sql.contains("LIKE"), "should contain LIKE: {sql}");
+        assert!(
+            sql.contains("'foo%'"),
+            "should contain pattern: {sql}"
+        );
+    }
+
+    #[test]
+    fn test_expr_to_sql_aggregate_function() {
+        // AggregateFunction in expr_to_sql is used for HAVING
+        use datafusion_expr::Expr;
+        let sum_udf = datafusion::functions_aggregate::sum::sum_udaf();
+        let e = Expr::AggregateFunction(
+            datafusion_expr::expr::AggregateFunction {
+                func: sum_udf,
+                params: datafusion_expr::expr::AggregateFunctionParams {
+                    args: vec![datafusion_expr::col("x")],
+                    distinct: false,
+                    filter: None,
+                    order_by: vec![],
+                    null_treatment: None,
+                },
+            },
+        );
+        let sql = expr_to_sql(&e);
+        assert!(sql.contains("sum"), "should contain sum: {sql}");
+        assert!(sql.contains("\"x\""), "should contain arg: {sql}");
+    }
+
+    #[test]
+    fn test_expr_to_sql_aggregate_distinct() {
+        use datafusion_expr::Expr;
+        let count_udf =
+            datafusion::functions_aggregate::count::count_udaf();
+        let e = Expr::AggregateFunction(
+            datafusion_expr::expr::AggregateFunction {
+                func: count_udf,
+                params: datafusion_expr::expr::AggregateFunctionParams {
+                    args: vec![datafusion_expr::col("id")],
+                    distinct: true,
+                    filter: None,
+                    order_by: vec![],
+                    null_treatment: None,
+                },
+            },
+        );
+        let sql = expr_to_sql(&e);
+        assert!(
+            sql.contains("DISTINCT"),
+            "should contain DISTINCT: {sql}"
+        );
+    }
+
+    // ── H-15: GROUP BY expression tests ──────────────────────────────
+
+    #[tokio::test]
+    async fn test_group_by_expression_scalar_function() {
+        let ctx = laminar_sql::create_session_context();
+        let schema = Arc::new(Schema::new(vec![
+            Field::new("name", DataType::Utf8, false),
+            Field::new("value", DataType::Float64, false),
+        ]));
+        let dummy = RecordBatch::try_new(
+            Arc::clone(&schema),
+            vec![
+                Arc::new(arrow::array::StringArray::from(vec!["hello"])),
+                Arc::new(arrow::array::Float64Array::from(vec![1.0])),
+            ],
+        )
+        .unwrap();
+        let mem_table = datafusion::datasource::MemTable::try_new(
+            Arc::clone(&schema),
+            vec![vec![dummy]],
+        )
+        .unwrap();
+        ctx.register_table("events", Arc::new(mem_table)).unwrap();
+
+        let state = IncrementalAggState::try_from_sql(
+            &ctx,
+            "SELECT upper(name), SUM(value) as total FROM events GROUP BY upper(name)",
+        )
+        .await
+        .unwrap()
+        .expect("expected aggregate state");
+
+        // H-15: The pre-agg SQL should contain the expression, not a
+        // quoted identifier
+        assert!(
+            state.pre_agg_sql.contains("upper("),
+            "pre-agg SQL should contain expression: {}",
+            state.pre_agg_sql
+        );
+        assert!(
+            !state.pre_agg_sql.contains("\"upper("),
+            "should NOT quote expression as identifier: {}",
+            state.pre_agg_sql
+        );
+    }
+
+    #[tokio::test]
+    async fn test_group_by_simple_column_still_works() {
+        let (_, state) = setup_agg_state(
+            "SELECT name, SUM(value) as total FROM events GROUP BY name",
+        )
+        .await;
+        // Simple column ref should be a quoted identifier
+        assert!(
+            state.pre_agg_sql.contains("\"name\""),
+            "simple column should be quoted: {}",
+            state.pre_agg_sql
         );
     }
 
