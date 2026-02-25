@@ -143,6 +143,7 @@ impl IncrementalAggState {
         let group_exprs = agg_info.group_exprs;
         let aggr_exprs = agg_info.aggr_exprs;
         let agg_schema = agg_info.schema;
+        let input_schema = agg_info.input_schema;
         let having_predicate = agg_info.having_predicate;
 
         if aggr_exprs.is_empty() {
@@ -223,9 +224,9 @@ impl IncrementalAggState {
                         }
 
                         input_col_indices.push(col_idx);
-                        let dt = infer_input_type(
-                            ctx,
-                            &udf,
+                        let dt = resolve_expr_type(
+                            arg_expr,
+                            &input_schema,
                             agg_field.data_type(),
                         );
                         input_types.push(dt);
@@ -268,11 +269,12 @@ impl IncrementalAggState {
         }
 
         // Build the pre-agg SQL. Extract source tables from the original query.
-        let from_clause = extract_from_clause(sql);
-        let where_clause = extract_where_clause(sql);
+        let clauses = extract_clauses(sql);
         let pre_agg_sql = format!(
-            "SELECT {} FROM {from_clause}{where_clause}",
-            pre_agg_select_items.join(", ")
+            "SELECT {} FROM {}{}",
+            pre_agg_select_items.join(", "),
+            clauses.from_clause,
+            clauses.where_clause,
         );
 
         // Build output schema
@@ -492,6 +494,8 @@ struct AggregateInfo {
     group_exprs: Vec<datafusion_expr::Expr>,
     aggr_exprs: Vec<datafusion_expr::Expr>,
     schema: Arc<Schema>,
+    /// Input schema (pre-widening) for resolving aggregate argument types.
+    input_schema: Arc<Schema>,
     /// HAVING predicate (from a Filter node directly above the Aggregate).
     having_predicate: Option<datafusion_expr::Expr>,
 }
@@ -508,10 +512,13 @@ fn find_aggregate_inner(
     match plan {
         LogicalPlan::Aggregate(agg) => {
             let schema = Arc::new(agg.schema.as_arrow().clone());
+            let input_schema =
+                Arc::new(agg.input.schema().as_arrow().clone());
             Some(AggregateInfo {
                 group_exprs: agg.group_expr.clone(),
                 aggr_exprs: agg.aggr_expr.clone(),
                 schema,
+                input_schema,
                 having_predicate: parent_filter.cloned(),
             })
         }
@@ -574,16 +581,83 @@ fn expr_to_sql(expr: &datafusion_expr::Expr) -> String {
     }
 }
 
-/// Extract the FROM clause from a SQL string (rough heuristic).
-fn extract_from_clause(sql: &str) -> String {
+/// Extracted FROM and WHERE clauses from a SQL query.
+struct SqlClauses {
+    /// The FROM clause (table references, joins, etc.)
+    from_clause: String,
+    /// The WHERE clause including the `WHERE` keyword, or empty string.
+    where_clause: String,
+}
+
+/// Extract FROM and WHERE clauses from a SQL string using the `sqlparser`
+/// AST. Falls back to heuristic string extraction if parsing fails.
+fn extract_clauses(sql: &str) -> SqlClauses {
+    if let Ok(clauses) = extract_clauses_ast(sql) {
+        return clauses;
+    }
+    // Fallback: heuristic extraction for non-standard SQL
+    SqlClauses {
+        from_clause: extract_from_clause_heuristic(sql),
+        where_clause: extract_where_clause_heuristic(sql),
+    }
+}
+
+/// AST-based clause extraction using `sqlparser`.
+fn extract_clauses_ast(sql: &str) -> Result<SqlClauses, DbError> {
+    use sqlparser::dialect::GenericDialect;
+    use sqlparser::parser::Parser;
+
+    let dialect = GenericDialect {};
+    let stmts = Parser::parse_sql(&dialect, sql).map_err(|e| {
+        DbError::Pipeline(format!("SQL parse error: {e}"))
+    })?;
+
+    let stmt = stmts.into_iter().next().ok_or_else(|| {
+        DbError::Pipeline("empty SQL statement".to_string())
+    })?;
+
+    let sqlparser::ast::Statement::Query(query) = stmt else {
+        return Err(DbError::Pipeline(
+            "expected SELECT statement".to_string(),
+        ));
+    };
+
+    let sqlparser::ast::SetExpr::Select(select) = *query.body
+    else {
+        return Err(DbError::Pipeline(
+            "expected simple SELECT".to_string(),
+        ));
+    };
+
+    let from_clause = select
+        .from
+        .iter()
+        .map(ToString::to_string)
+        .collect::<Vec<_>>()
+        .join(", ");
+
+    let where_clause = select
+        .selection
+        .as_ref()
+        .map(|expr| format!(" WHERE {expr}"))
+        .unwrap_or_default();
+
+    Ok(SqlClauses {
+        from_clause,
+        where_clause,
+    })
+}
+
+/// Heuristic FROM clause extraction (fallback).
+fn extract_from_clause_heuristic(sql: &str) -> String {
     let upper = sql.to_uppercase();
     let from_pos = upper.find(" FROM ").map(|p| p + 6);
     let Some(start) = from_pos else {
         return String::new();
     };
-    // Find the end of the FROM clause (WHERE, GROUP BY, ORDER BY, LIMIT, etc.)
     let rest = &sql[start..];
-    let end_keywords = [" WHERE ", " GROUP ", " ORDER ", " LIMIT ", " HAVING "];
+    let end_keywords =
+        [" WHERE ", " GROUP ", " ORDER ", " LIMIT ", " HAVING "];
     let end = end_keywords
         .iter()
         .filter_map(|kw| rest.to_uppercase().find(kw))
@@ -592,38 +666,65 @@ fn extract_from_clause(sql: &str) -> String {
     rest[..end].trim().to_string()
 }
 
-/// Extract the WHERE clause from a SQL string (rough heuristic).
-fn extract_where_clause(sql: &str) -> String {
+/// Heuristic WHERE clause extraction (fallback).
+fn extract_where_clause_heuristic(sql: &str) -> String {
     let upper = sql.to_uppercase();
     let where_pos = upper.find(" WHERE ");
     let Some(start) = where_pos else {
         return String::new();
     };
     let rest = &sql[start..];
-    // Find end of WHERE (GROUP BY, ORDER BY, LIMIT, etc.)
     let end_keywords = [" GROUP ", " ORDER ", " LIMIT ", " HAVING "];
     let end = end_keywords
         .iter()
-        .filter_map(|kw| rest[7..].to_uppercase().find(kw).map(|p| p + 7))
+        .filter_map(|kw| {
+            rest[7..].to_uppercase().find(kw).map(|p| p + 7)
+        })
         .min()
         .unwrap_or(rest.len());
     format!(" {}", rest[..end].trim())
 }
 
-/// Infer the input type for an aggregate function from context.
-///
-/// For most aggregates (SUM, COUNT, AVG, etc.) the input type can be
-/// inferred from the return type or defaults to Float64/Int64.
-fn infer_input_type(
-    _ctx: &SessionContext,
-    udf: &AggregateUDF,
-    output_type: &DataType,
+/// Resolve the data type of a `DataFusion` expression against the
+/// aggregate node's input schema. This gives the true pre-widening
+/// type (e.g., `Int32` for a column that SUM widens to `Int64`).
+fn resolve_expr_type(
+    expr: &datafusion_expr::Expr,
+    input_schema: &Schema,
+    fallback_type: &DataType,
 ) -> DataType {
-    let name = udf.name().to_lowercase();
-    match name.as_str() {
-        "count" => DataType::Boolean,
-        "avg" => DataType::Float64,
-        _ => output_type.clone(),
+    match expr {
+        datafusion_expr::Expr::Column(col) => input_schema
+            .field_with_name(&col.name)
+            .map_or_else(
+                |_| fallback_type.clone(),
+                |f| f.data_type().clone(),
+            ),
+        datafusion_expr::Expr::Literal(sv, _) => sv.data_type(),
+        datafusion_expr::Expr::Cast(cast) => cast.data_type.clone(),
+        datafusion_expr::Expr::TryCast(cast) => cast.data_type.clone(),
+        datafusion_expr::Expr::BinaryExpr(bin) => {
+            // For arithmetic, the result type is typically the wider
+            // of the two operands. Resolve the left side as a
+            // reasonable approximation.
+            resolve_expr_type(&bin.left, input_schema, fallback_type)
+        }
+        datafusion_expr::Expr::ScalarFunction(func) => {
+            // Try to get return type from input types
+            let arg_types: Vec<DataType> = func
+                .args
+                .iter()
+                .map(|a| {
+                    resolve_expr_type(a, input_schema, fallback_type)
+                })
+                .collect();
+            func.func
+                .return_type(&arg_types)
+                .unwrap_or_else(|_| fallback_type.clone())
+        }
+        #[allow(deprecated)]
+        datafusion_expr::Expr::Wildcard { .. } => DataType::Boolean,
+        _ => fallback_type.clone(),
     }
 }
 
@@ -632,39 +733,76 @@ mod tests {
     use super::*;
 
     #[test]
-    fn test_extract_from_clause() {
-        assert_eq!(
-            extract_from_clause(
-                "SELECT a, SUM(b) FROM trades GROUP BY a"
-            ),
-            "trades"
+    fn test_extract_clauses_simple() {
+        let c = extract_clauses(
+            "SELECT a, SUM(b) FROM trades GROUP BY a",
         );
-        assert_eq!(
-            extract_from_clause(
-                "SELECT * FROM events WHERE x > 1 GROUP BY y"
-            ),
-            "events"
+        assert_eq!(c.from_clause, "trades");
+        assert!(c.where_clause.is_empty());
+    }
+
+    #[test]
+    fn test_extract_clauses_with_where() {
+        let c = extract_clauses(
+            "SELECT * FROM events WHERE x > 1 GROUP BY y",
         );
-        assert_eq!(
-            extract_from_clause(
-                "SELECT * FROM events e JOIN dim d ON e.id = d.id"
-            ),
-            "events e JOIN dim d ON e.id = d.id"
+        assert_eq!(c.from_clause, "events");
+        assert!(
+            c.where_clause.contains("WHERE"),
+            "should contain WHERE: {}",
+            c.where_clause
+        );
+        assert!(
+            c.where_clause.contains("x > 1"),
+            "should contain predicate: {}",
+            c.where_clause
         );
     }
 
     #[test]
-    fn test_extract_where_clause() {
-        assert_eq!(
-            extract_where_clause(
-                "SELECT * FROM events WHERE x > 1 GROUP BY y"
-            ),
-            " WHERE x > 1"
+    fn test_extract_clauses_with_join() {
+        let c = extract_clauses(
+            "SELECT * FROM events e JOIN dim d ON e.id = d.id",
         );
-        assert_eq!(
-            extract_where_clause("SELECT * FROM events GROUP BY y"),
-            ""
+        // AST preserves join structure
+        assert!(
+            c.from_clause.contains("events"),
+            "should contain events: {}",
+            c.from_clause
         );
+        assert!(
+            c.from_clause.contains("JOIN"),
+            "should contain JOIN: {}",
+            c.from_clause
+        );
+        assert!(
+            c.from_clause.contains("dim"),
+            "should contain dim: {}",
+            c.from_clause
+        );
+    }
+
+    #[test]
+    fn test_extract_clauses_keyword_in_string_literal() {
+        // This would break heuristic extraction but works with AST
+        let c = extract_clauses(
+            "SELECT * FROM logs WHERE msg = 'joined GROUP chat' GROUP BY user_id",
+        );
+        assert_eq!(c.from_clause, "logs");
+        // WHERE should include the full predicate including the string
+        assert!(
+            c.where_clause.contains("GROUP chat"),
+            "string literal should be preserved: {}",
+            c.where_clause
+        );
+    }
+
+    #[test]
+    fn test_extract_clauses_no_where() {
+        let c =
+            extract_clauses("SELECT * FROM events GROUP BY y");
+        assert_eq!(c.from_clause, "events");
+        assert!(c.where_clause.is_empty());
     }
 
     #[tokio::test]
@@ -1136,5 +1274,166 @@ mod tests {
         .unwrap();
         // This should succeed without panicking
         assert!(state.process_batch(&batch).is_ok());
+    }
+
+    // ── H-13: Type inference tests ─────────────────────────────────────
+
+    #[tokio::test]
+    async fn test_type_inference_preserves_source_int32() {
+        let ctx = laminar_sql::create_session_context();
+        let schema = Arc::new(Schema::new(vec![
+            Field::new("name", DataType::Utf8, false),
+            Field::new("amount", DataType::Int32, false),
+        ]));
+        let dummy = RecordBatch::try_new(
+            Arc::clone(&schema),
+            vec![
+                Arc::new(arrow::array::StringArray::from(vec!["x"])),
+                Arc::new(arrow::array::Int32Array::from(vec![0])),
+            ],
+        )
+        .unwrap();
+        let mem_table = datafusion::datasource::MemTable::try_new(
+            Arc::clone(&schema),
+            vec![vec![dummy]],
+        )
+        .unwrap();
+        ctx.register_table("orders", Arc::new(mem_table)).unwrap();
+
+        let state = IncrementalAggState::try_from_sql(
+            &ctx,
+            "SELECT name, SUM(amount) as total FROM orders GROUP BY name",
+        )
+        .await
+        .unwrap()
+        .expect("expected aggregate state");
+
+        // H-13: Input type should be Int32 (source type), NOT Int64 (widened)
+        assert_eq!(
+            state.agg_specs[0].input_types[0],
+            DataType::Int32,
+            "SUM(int32_col) input type should be Int32, got {:?}",
+            state.agg_specs[0].input_types[0]
+        );
+    }
+
+    #[tokio::test]
+    async fn test_type_inference_preserves_source_float32() {
+        let ctx = laminar_sql::create_session_context();
+        let schema = Arc::new(Schema::new(vec![
+            Field::new("name", DataType::Utf8, false),
+            Field::new("price", DataType::Float32, false),
+        ]));
+        let dummy = RecordBatch::try_new(
+            Arc::clone(&schema),
+            vec![
+                Arc::new(arrow::array::StringArray::from(vec!["x"])),
+                Arc::new(arrow::array::Float32Array::from(vec![0.0f32])),
+            ],
+        )
+        .unwrap();
+        let mem_table = datafusion::datasource::MemTable::try_new(
+            Arc::clone(&schema),
+            vec![vec![dummy]],
+        )
+        .unwrap();
+        ctx.register_table("products", Arc::new(mem_table))
+            .unwrap();
+
+        let state = IncrementalAggState::try_from_sql(
+            &ctx,
+            "SELECT name, AVG(price) as avg_price FROM products GROUP BY name",
+        )
+        .await
+        .unwrap()
+        .expect("expected aggregate state");
+
+        // AVG input should be Float32 (source), not Float64 (widened)
+        assert_eq!(
+            state.agg_specs[0].input_types[0],
+            DataType::Float32,
+            "AVG(float32_col) input type should be Float32, got {:?}",
+            state.agg_specs[0].input_types[0]
+        );
+    }
+
+    #[tokio::test]
+    async fn test_type_inference_literal_expr() {
+        let ctx = laminar_sql::create_session_context();
+        let schema = Arc::new(Schema::new(vec![
+            Field::new("name", DataType::Utf8, false),
+            Field::new("value", DataType::Int64, false),
+        ]));
+        let dummy = RecordBatch::try_new(
+            Arc::clone(&schema),
+            vec![
+                Arc::new(arrow::array::StringArray::from(vec!["x"])),
+                Arc::new(arrow::array::Int64Array::from(vec![0])),
+            ],
+        )
+        .unwrap();
+        let mem_table = datafusion::datasource::MemTable::try_new(
+            Arc::clone(&schema),
+            vec![vec![dummy]],
+        )
+        .unwrap();
+        ctx.register_table("events", Arc::new(mem_table)).unwrap();
+
+        let state = IncrementalAggState::try_from_sql(
+            &ctx,
+            "SELECT name, MIN(value) as min_val FROM events GROUP BY name",
+        )
+        .await
+        .unwrap()
+        .expect("expected aggregate state");
+
+        // Int64 in, Int64 out — should still be Int64
+        assert_eq!(
+            state.agg_specs[0].input_types[0],
+            DataType::Int64,
+        );
+    }
+
+    // ── H-14: AST extraction tests ─────────────────────────────────────
+
+    #[test]
+    fn test_extract_clauses_subquery_in_where() {
+        // Subquery with its own WHERE — AST handles nesting
+        let c = extract_clauses(
+            "SELECT * FROM orders WHERE amount > (SELECT AVG(amount) FROM orders WHERE status = 'active') GROUP BY name",
+        );
+        assert_eq!(c.from_clause, "orders");
+        assert!(
+            c.where_clause.contains("AVG"),
+            "subquery should be preserved: {}",
+            c.where_clause
+        );
+    }
+
+    #[test]
+    fn test_extract_clauses_multiple_joins() {
+        let c = extract_clauses(
+            "SELECT * FROM orders o JOIN customers c ON o.cust_id = c.id JOIN products p ON o.prod_id = p.id WHERE o.amount > 100 GROUP BY c.name",
+        );
+        assert!(
+            c.from_clause.contains("orders"),
+            "should contain orders: {}",
+            c.from_clause
+        );
+        assert!(
+            c.from_clause.contains("customers"),
+            "should contain customers: {}",
+            c.from_clause
+        );
+        assert!(
+            c.from_clause.contains("products"),
+            "should contain products: {}",
+            c.from_clause
+        );
+        assert!(
+            c.where_clause.contains("100"),
+            "WHERE should contain predicate: {}",
+            c.where_clause
+        );
     }
 }
