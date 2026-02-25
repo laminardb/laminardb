@@ -29,6 +29,7 @@ mod adaptive;
 mod aggregate_state;
 mod asof_batch;
 mod batch_filter;
+mod eowc_state;
 mod builder;
 mod catalog;
 /// Unified checkpoint coordination.

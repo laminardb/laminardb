@@ -30,27 +30,27 @@ use datafusion_expr::{AggregateUDF, LogicalPlan};
 use crate::error::DbError;
 
 /// Specification for one aggregate function in a streaming query.
-struct AggFuncSpec {
+pub(crate) struct AggFuncSpec {
     /// The `DataFusion` aggregate UDF.
-    udf: Arc<AggregateUDF>,
+    pub(crate) udf: Arc<AggregateUDF>,
     /// Input data types for this aggregate.
-    input_types: Vec<DataType>,
+    pub(crate) input_types: Vec<DataType>,
     /// Column indices in the pre-aggregation output that feed this aggregate.
     /// These index into the pre-agg schema (group cols first, then agg inputs).
-    input_col_indices: Vec<usize>,
+    pub(crate) input_col_indices: Vec<usize>,
     /// Output column name (alias from the query).
-    output_name: String,
+    pub(crate) output_name: String,
     /// Output data type.
-    return_type: DataType,
+    pub(crate) return_type: DataType,
     /// Whether this is a DISTINCT aggregate (e.g., `COUNT(DISTINCT x)`).
-    distinct: bool,
+    pub(crate) distinct: bool,
     /// Column index of the FILTER boolean column in pre-agg output, if any.
-    filter_col_index: Option<usize>,
+    pub(crate) filter_col_index: Option<usize>,
 }
 
 impl AggFuncSpec {
     /// Create a fresh `DataFusion` accumulator for this function.
-    fn create_accumulator(
+    pub(crate) fn create_accumulator(
         &self,
     ) -> Result<Box<dyn datafusion_expr::Accumulator>, DbError> {
         let return_field = Arc::new(Field::new(
@@ -514,18 +514,18 @@ impl IncrementalAggState {
 // ── Plan introspection helpers ─────────────────────────────────────────
 
 /// Result of finding an aggregate node in a logical plan.
-struct AggregateInfo {
-    group_exprs: Vec<datafusion_expr::Expr>,
-    aggr_exprs: Vec<datafusion_expr::Expr>,
-    schema: Arc<Schema>,
+pub(crate) struct AggregateInfo {
+    pub(crate) group_exprs: Vec<datafusion_expr::Expr>,
+    pub(crate) aggr_exprs: Vec<datafusion_expr::Expr>,
+    pub(crate) schema: Arc<Schema>,
     /// Input schema (pre-widening) for resolving aggregate argument types.
-    input_schema: Arc<Schema>,
+    pub(crate) input_schema: Arc<Schema>,
     /// HAVING predicate (from a Filter node directly above the Aggregate).
-    having_predicate: Option<datafusion_expr::Expr>,
+    pub(crate) having_predicate: Option<datafusion_expr::Expr>,
 }
 
 /// Walk a `DataFusion` `LogicalPlan` tree to find the first `Aggregate` node.
-fn find_aggregate(plan: &LogicalPlan) -> Option<AggregateInfo> {
+pub(crate) fn find_aggregate(plan: &LogicalPlan) -> Option<AggregateInfo> {
     find_aggregate_inner(plan, None)
 }
 
@@ -626,7 +626,7 @@ fn case_to_sql(case: &datafusion_expr::expr::Case) -> String {
 
 /// Convert a `DataFusion` `Expr` to a SQL string for use in pre-aggregation
 /// queries.
-fn expr_to_sql(expr: &datafusion_expr::Expr) -> String {
+pub(crate) fn expr_to_sql(expr: &datafusion_expr::Expr) -> String {
     use datafusion_expr::Expr;
     match expr {
         Expr::Column(col) => format!("\"{}\"", col.name),
@@ -717,16 +717,16 @@ fn expr_to_sql(expr: &datafusion_expr::Expr) -> String {
 }
 
 /// Extracted FROM and WHERE clauses from a SQL query.
-struct SqlClauses {
+pub(crate) struct SqlClauses {
     /// The FROM clause (table references, joins, etc.)
-    from_clause: String,
+    pub(crate) from_clause: String,
     /// The WHERE clause including the `WHERE` keyword, or empty string.
-    where_clause: String,
+    pub(crate) where_clause: String,
 }
 
 /// Extract FROM and WHERE clauses from a SQL string using the `sqlparser`
 /// AST. Falls back to heuristic string extraction if parsing fails.
-fn extract_clauses(sql: &str) -> SqlClauses {
+pub(crate) fn extract_clauses(sql: &str) -> SqlClauses {
     if let Ok(clauses) = extract_clauses_ast(sql) {
         return clauses;
     }
@@ -823,7 +823,7 @@ fn extract_where_clause_heuristic(sql: &str) -> String {
 /// Resolve the data type of a `DataFusion` expression against the
 /// aggregate node's input schema. This gives the true pre-widening
 /// type (e.g., `Int32` for a column that SUM widens to `Int64`).
-fn resolve_expr_type(
+pub(crate) fn resolve_expr_type(
     expr: &datafusion_expr::Expr,
     input_schema: &Schema,
     fallback_type: &DataType,

@@ -28,6 +28,7 @@ use laminar_sql::translator::{
 };
 
 use crate::aggregate_state::IncrementalAggState;
+use crate::eowc_state::IncrementalEowcState;
 use crate::error::DbError;
 
 /// Convert a SQL-layer `EmitStrategy` to a core-layer `EmitStrategy`.
@@ -215,6 +216,13 @@ pub(crate) struct StreamExecutor {
     /// Set of query indices that have been checked for aggregation but
     /// found not to be aggregate queries (avoids re-checking).
     non_agg_queries: HashSet<usize>,
+    /// Per-query incremental EOWC aggregation state, keyed by query index.
+    /// Initialized lazily on first EOWC cycle when the logical plan reveals
+    /// the query contains a GROUP BY / aggregate.
+    eowc_agg_states: HashMap<usize, IncrementalEowcState>,
+    /// Set of EOWC query indices that have been checked for aggregation but
+    /// found not to be aggregate queries (fall back to raw-batch path).
+    non_eowc_agg_queries: HashSet<usize>,
 }
 
 impl StreamExecutor {
@@ -230,6 +238,8 @@ impl StreamExecutor {
             eowc_states: HashMap::new(),
             agg_states: HashMap::new(),
             non_agg_queries: HashSet::new(),
+            eowc_agg_states: HashMap::new(),
+            non_eowc_agg_queries: HashSet::new(),
         }
     }
 
@@ -722,12 +732,75 @@ impl StreamExecutor {
         level.min(1.0)
     }
 
+    /// Execute an EOWC aggregate query using incremental per-window accumulators.
+    ///
+    /// Runs the pre-aggregation SQL against currently registered source tables,
+    /// feeds the result to per-window-per-group accumulators, then closes
+    /// windows whose end <= watermark.
+    async fn execute_incremental_eowc(
+        &mut self,
+        idx: usize,
+        query_name: &str,
+        current_watermark: i64,
+    ) -> Result<Vec<RecordBatch>, DbError> {
+        // Run pre-aggregation SQL
+        let pre_agg_sql = self
+            .eowc_agg_states
+            .get(&idx)
+            .ok_or_else(|| {
+                DbError::Pipeline(format!(
+                    "internal: missing eowc_agg_state for query index {idx}"
+                ))
+            })?
+            .pre_agg_sql()
+            .to_string();
+
+        let pre_agg_batches = match self.ctx.sql(&pre_agg_sql).await {
+            Ok(df) => df.collect().await.map_err(|e| {
+                DbError::query_pipeline(query_name, &e)
+            })?,
+            Err(e) => {
+                tracing::trace!(
+                    query = %query_name,
+                    error = %e,
+                    "EOWC pre-agg SQL failed, skipping update"
+                );
+                Vec::new()
+            }
+        };
+
+        // Feed pre-agg results to per-window accumulators
+        let eowc_state =
+            self.eowc_agg_states.get_mut(&idx).ok_or_else(|| {
+                DbError::Pipeline(format!(
+                    "internal: missing eowc_agg_state for query index {idx}"
+                ))
+            })?;
+        for batch in &pre_agg_batches {
+            eowc_state.update_batch(batch)?;
+        }
+
+        // Close windows and emit results
+        let having_sql =
+            eowc_state.having_sql().map(String::from);
+        let mut batches =
+            eowc_state.close_windows(current_watermark)?;
+
+        // Apply HAVING filter if present
+        if let Some(having_sql) = having_sql {
+            batches = self
+                .apply_having_filter(query_name, &batches, &having_sql)
+                .await?;
+        }
+
+        Ok(batches)
+    }
+
     /// Execute an EOWC (Emit On Window Close) query.
     ///
-    /// Accumulates source batches across cycles, filters to closed-window data
-    /// when the watermark advances past a window boundary, and runs the aggregate
-    /// query only on closed-window data. Non-closed data is retained for the
-    /// next cycle.
+    /// For aggregate queries with a window config, routes through incremental
+    /// per-window accumulators (`IncrementalEowcState`) for O(groups) memory.
+    /// Non-aggregate queries and ASOF joins fall back to the raw-batch path.
     #[allow(clippy::too_many_lines, clippy::too_many_arguments)]
     async fn execute_eowc_query(
         &mut self,
@@ -740,6 +813,67 @@ impl StreamExecutor {
         intermediate_results: &HashMap<String, Vec<RecordBatch>>,
         current_watermark: i64,
     ) -> Result<Vec<RecordBatch>, DbError> {
+        // Try incremental EOWC path for aggregate queries with window config
+        // (non-ASOF only — ASOF joins use a custom execution path).
+        if asof_config.is_none() {
+            if let Some(cfg) = window_config {
+                // Fast path: already have incremental state
+                if self.eowc_agg_states.contains_key(&idx) {
+                    return self
+                        .execute_incremental_eowc(idx, query_name, current_watermark)
+                        .await;
+                }
+
+                // Fast path: already checked and found non-aggregate
+                if !self.non_eowc_agg_queries.contains(&idx) {
+                    // First call: try to detect aggregate query
+                    let query_sql = self.queries[idx].sql.clone();
+                    let cfg_clone = cfg.clone();
+                    match IncrementalEowcState::try_from_sql(
+                        &self.ctx,
+                        &query_sql,
+                        &cfg_clone,
+                    )
+                    .await
+                    {
+                        Ok(Some(state)) => {
+                            tracing::info!(
+                                query = query_name,
+                                "EOWC query detected as aggregate, \
+                                 using incremental per-window accumulators"
+                            );
+                            self.eowc_agg_states.insert(idx, state);
+                            return self
+                                .execute_incremental_eowc(
+                                    idx,
+                                    query_name,
+                                    current_watermark,
+                                )
+                                .await;
+                        }
+                        Ok(None) => {
+                            tracing::debug!(
+                                query = query_name,
+                                "EOWC query is not aggregate, \
+                                 using raw-batch path"
+                            );
+                            self.non_eowc_agg_queries.insert(idx);
+                        }
+                        Err(e) => {
+                            tracing::debug!(
+                                query = query_name,
+                                error = %e,
+                                "Could not introspect EOWC plan, \
+                                 falling back to raw-batch path"
+                            );
+                            self.non_eowc_agg_queries.insert(idx);
+                        }
+                    }
+                }
+            }
+        }
+
+        // Fall through to raw-batch EOWC path
         // Use pre-computed table references (extracted once at registration)
         let table_refs = self.queries[idx].table_refs.clone();
 
