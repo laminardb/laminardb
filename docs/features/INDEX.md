@@ -1,6 +1,6 @@
 # Feature Index
 
-> Last updated: 2026-02-22
+> Last updated: 2026-02-25
 
 ## Overview
 
@@ -10,16 +10,16 @@
 | Phase 1.5: SQL Parser | 1 | 0 | 0 | 0 | 1 | 0 |
 | Phase 2: Production Hardening | 38 | 0 | 0 | 0 | 38 | 0 |
 | Phase 2.5: JIT Compiler | 12 | 0 | 0 | 0 | 12 | 0 |
-| Phase 3: Connectors | 93 | 12 | 0 | 0 | 81 | 0 |
+| Phase 3: Connectors | 100 | 19 | 0 | 0 | 81 | 0 |
 | Phase 4: Enterprise Security | 11 | 11 | 0 | 0 | 0 | 0 |
 | Phase 5: Admin & Observability | 10 | 10 | 0 | 0 | 0 | 0 |
 | Phase 6a: Partition-Parallel | 29 | 0 | 0 | 0 | 27 | 2 |
 | Phase 6b: Delta Foundation | 14 | 0 | 0 | 0 | 14 | 0 |
 | Phase 6c: Delta Hardening | 10 | 9 | 0 | 0 | 0 | 1 |
 | Perf Optimization | 12 | 12 | 0 | 0 | 0 | 0 |
-| **Total** | **242** | **54** | **0** | **0** | **185** | **3** |
+| **Total** | **249** | **61** | **0** | **0** | **185** | **3** |
 
-**Completion: 185/242 features (76%).** Phases 1, 1.5, 2, 2.5, and 6b are fully complete. Phases 3 and 6a are nearly complete. Phases 4, 5, 6c, and Perf Optimization are planned with specifications written but no implementation started.
+**Completion: 185/249 features (74%).** Phases 1, 1.5, 2, 2.5, and 6b are fully complete. Phases 3 and 6a are nearly complete. Phases 4, 5, 6c, and Perf Optimization are planned with specifications written but no implementation started.
 
 ## Status Legend
 
@@ -144,7 +144,7 @@ See [Plan Compiler Index](plan-compiler/INDEX.md) for architecture details and [
 
 ## Phase 3: Connectors & Integration
 
-> **Status**: 81/93 features complete (87%)
+> **Status**: 81/100 features complete (81%)
 
 ### Streaming API ✅
 
@@ -236,6 +236,20 @@ See [Cloud Storage Index](phase-3/cloud/INDEX.md).
 | F-SQL-005 | Multi-Way JOIN Support | ✅ | [Link](phase-3/F-SQL-005-multi-way-joins.md) |
 | F-SQL-006 | Window Frame (ROWS BETWEEN) | ✅ | [Link](phase-3/F-SQL-006-window-frames.md) |
 | F-SQL-007 | Multi-Partition Streaming Scans | ✅ | [Link](phase-3/F-SQL-007-multi-partition-scans.md) |
+
+### Stateful Streaming SQL
+
+See [Stateful Streaming SQL Index](phase-3/stateful-sql/INDEX.md).
+
+| ID | Feature | Status | Spec |
+|----|---------|--------|------|
+| F-SSQL-000 | Streaming Aggregation Hardening | 📝 | [Link](phase-3/stateful-sql/F-SSQL-000-aggregation-hardening.md) |
+| F-SSQL-001 | EOWC Incremental Window Accumulators | 📝 | [Link](phase-3/stateful-sql/F-SSQL-001-eowc-incremental-accumulators.md) |
+| F-SSQL-002 | StreamExecutor State Checkpoint Integration | ✅ | [Link](phase-3/stateful-sql/F-SSQL-002-checkpoint-integration.md) |
+| F-SSQL-003 | Ring 0 SQL Operator Routing | 📝 | [Link](phase-3/stateful-sql/F-SSQL-003-ring0-sql-routing.md) |
+| F-SSQL-004 | Streaming Physical Optimizer Rule | 📝 | [Link](phase-3/stateful-sql/F-SSQL-004-streaming-physical-optimizer.md) |
+| F-SSQL-005 | DataFusion Cooperative Scheduling | 📝 | [Link](phase-3/stateful-sql/F-SSQL-005-cooperative-scheduling.md) |
+| F-SSQL-006 | Dynamic Watermark Filter Pushdown | 📝 | [Link](phase-3/stateful-sql/F-SSQL-006-dynamic-watermark-pushdown.md) |
 
 ### Connector Infrastructure
 

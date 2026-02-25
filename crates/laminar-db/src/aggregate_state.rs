@@ -16,6 +16,7 @@
 //! require multi-field state).
 
 use std::collections::HashMap;
+use std::hash::{Hash, Hasher};
 use std::sync::Arc;
 
 use arrow::array::ArrayRef;
@@ -26,8 +27,187 @@ use datafusion::prelude::SessionContext;
 use datafusion_common::ScalarValue;
 use datafusion_expr::function::AccumulatorArgs;
 use datafusion_expr::{AggregateUDF, LogicalPlan};
+use serde_json::json;
 
 use crate::error::DbError;
+
+// ── ScalarValue JSON encoding ────────────────────────────────────────
+
+/// Encode a `ScalarValue` to a JSON value for checkpoint serialization.
+///
+/// Supports the common types returned by `Accumulator::state()`:
+/// Null, Boolean, Int8–64, UInt8–64, Float32/64, Utf8, and List.
+/// Integer types are widened to i64/u64 for compact encoding.
+pub(crate) fn scalar_to_json(sv: &ScalarValue) -> serde_json::Value {
+    match sv {
+        ScalarValue::Null => json!({"t": "N"}),
+        ScalarValue::Boolean(None) => json!({"t": "B", "v": null}),
+        ScalarValue::Boolean(Some(b)) => json!({"t": "B", "v": b}),
+        ScalarValue::Int8(None)
+        | ScalarValue::Int16(None)
+        | ScalarValue::Int32(None)
+        | ScalarValue::Int64(None) => json!({"t": "I64", "v": null}),
+        ScalarValue::Int8(Some(n)) => json!({"t": "I64", "v": i64::from(*n)}),
+        ScalarValue::Int16(Some(n)) => json!({"t": "I64", "v": i64::from(*n)}),
+        ScalarValue::Int32(Some(n)) => json!({"t": "I64", "v": i64::from(*n)}),
+        ScalarValue::Int64(Some(n)) => json!({"t": "I64", "v": n}),
+        ScalarValue::UInt8(None)
+        | ScalarValue::UInt16(None)
+        | ScalarValue::UInt32(None)
+        | ScalarValue::UInt64(None) => json!({"t": "U64", "v": null}),
+        ScalarValue::UInt8(Some(n)) => json!({"t": "U64", "v": u64::from(*n)}),
+        ScalarValue::UInt16(Some(n)) => json!({"t": "U64", "v": u64::from(*n)}),
+        ScalarValue::UInt32(Some(n)) => json!({"t": "U64", "v": u64::from(*n)}),
+        ScalarValue::UInt64(Some(n)) => json!({"t": "U64", "v": n}),
+        ScalarValue::Float32(None) | ScalarValue::Float64(None) => {
+            json!({"t": "F64", "v": null})
+        }
+        ScalarValue::Float32(Some(f)) => json!({"t": "F64", "v": f64::from(*f)}),
+        ScalarValue::Float64(Some(f)) => json!({"t": "F64", "v": f}),
+        ScalarValue::Utf8(None)
+        | ScalarValue::LargeUtf8(None)
+        | ScalarValue::Utf8View(None) => json!({"t": "S", "v": null}),
+        ScalarValue::Utf8(Some(s))
+        | ScalarValue::LargeUtf8(Some(s))
+        | ScalarValue::Utf8View(Some(s)) => json!({"t": "S", "v": s}),
+        ScalarValue::List(arr) => {
+            use arrow::array::Array;
+            let list_arr: Option<&arrow::array::ListArray> =
+                arr.as_any().downcast_ref();
+            match list_arr {
+                Some(list) if !list.is_empty() => {
+                    let values = list.value(0);
+                    let mut items = Vec::with_capacity(values.len());
+                    for i in 0..values.len() {
+                        let sv =
+                            ScalarValue::try_from_array(&values, i).unwrap_or(ScalarValue::Null);
+                        items.push(scalar_to_json(&sv));
+                    }
+                    json!({"t": "L", "v": items})
+                }
+                _ => json!({"t": "L", "v": []}),
+            }
+        }
+        // Fallback: encode as string representation with type tag
+        other => json!({"t": "STR", "v": other.to_string()}),
+    }
+}
+
+/// Decode a JSON value back to a `ScalarValue`.
+pub(crate) fn json_to_scalar(v: &serde_json::Value) -> Result<ScalarValue, DbError> {
+    let t = v
+        .get("t")
+        .and_then(|t| t.as_str())
+        .ok_or_else(|| DbError::Pipeline("missing type tag in scalar JSON".to_string()))?;
+    let val = v.get("v");
+    match t {
+        "N" => Ok(ScalarValue::Null),
+        "B" => match val.and_then(serde_json::Value::as_bool) {
+            Some(b) => Ok(ScalarValue::Boolean(Some(b))),
+            None => Ok(ScalarValue::Boolean(None)),
+        },
+        "I64" => match val {
+            Some(serde_json::Value::Number(n)) => Ok(ScalarValue::Int64(n.as_i64())),
+            _ => Ok(ScalarValue::Int64(None)),
+        },
+        "U64" => match val {
+            Some(serde_json::Value::Number(n)) => Ok(ScalarValue::UInt64(n.as_u64())),
+            _ => Ok(ScalarValue::UInt64(None)),
+        },
+        "F64" => match val {
+            Some(serde_json::Value::Number(n)) => Ok(ScalarValue::Float64(n.as_f64())),
+            _ => Ok(ScalarValue::Float64(None)),
+        },
+        "S" => match val.and_then(|v| v.as_str()) {
+            Some(s) => Ok(ScalarValue::Utf8(Some(s.to_string()))),
+            None => Ok(ScalarValue::Utf8(None)),
+        },
+        "L" => {
+            let items = val
+                .and_then(|v| v.as_array())
+                .ok_or_else(|| DbError::Pipeline("expected array for List scalar".to_string()))?;
+            let scalars: Result<Vec<ScalarValue>, _> =
+                items.iter().map(json_to_scalar).collect();
+            let scalars = scalars?;
+            if scalars.is_empty() {
+                Ok(ScalarValue::List(Arc::new(
+                    arrow::array::GenericListArray::new_null(
+                        Arc::new(Field::new("item", DataType::Null, true)),
+                        1,
+                    ),
+                )))
+            } else {
+                let arr = ScalarValue::new_list(&scalars, &scalars[0].data_type(), true);
+                Ok(ScalarValue::List(arr))
+            }
+        }
+        other => Err(DbError::Pipeline(format!(
+            "unsupported scalar type tag in checkpoint: {other}"
+        ))),
+    }
+}
+
+/// Compute a u64 fingerprint for a query based on its SQL and output schema.
+///
+/// Used to detect schema evolution between checkpoint save and restore.
+pub(crate) fn query_fingerprint(pre_agg_sql: &str, output_schema: &Schema) -> u64 {
+    let mut hasher = std::hash::DefaultHasher::new();
+    pre_agg_sql.hash(&mut hasher);
+    for field in output_schema.fields() {
+        field.name().hash(&mut hasher);
+        field.data_type().to_string().hash(&mut hasher);
+    }
+    hasher.finish()
+}
+
+/// Serializable checkpoint for a single group's state.
+#[derive(Clone, serde::Serialize, serde::Deserialize)]
+pub(crate) struct GroupCheckpoint {
+    /// Serialized group key.
+    pub key: Vec<serde_json::Value>,
+    /// Per-accumulator state vectors.
+    pub acc_states: Vec<Vec<serde_json::Value>>,
+}
+
+/// Serializable checkpoint for all groups in an agg state.
+#[derive(Clone, serde::Serialize, serde::Deserialize)]
+pub(crate) struct AggStateCheckpoint {
+    /// Query fingerprint for schema validation.
+    pub fingerprint: u64,
+    /// Per-group checkpoint data.
+    pub groups: Vec<GroupCheckpoint>,
+}
+
+/// Serializable checkpoint for a single window's groups.
+#[derive(Clone, serde::Serialize, serde::Deserialize)]
+pub(crate) struct WindowCheckpoint {
+    /// Window start timestamp (ms since epoch).
+    pub window_start: i64,
+    /// Groups within this window.
+    pub groups: Vec<GroupCheckpoint>,
+}
+
+/// Serializable checkpoint for all windows in an EOWC state.
+#[derive(Clone, serde::Serialize, serde::Deserialize)]
+pub(crate) struct EowcStateCheckpoint {
+    /// Query fingerprint for schema validation.
+    pub fingerprint: u64,
+    /// Per-window checkpoint data.
+    pub windows: Vec<WindowCheckpoint>,
+}
+
+/// Top-level checkpoint for the entire `StreamExecutor`.
+#[derive(serde::Serialize, serde::Deserialize)]
+pub(crate) struct StreamExecutorCheckpoint {
+    /// Checkpoint format version.
+    pub version: u32,
+    /// Non-EOWC aggregate states, keyed by query name.
+    #[serde(default)]
+    pub agg_states: HashMap<String, AggStateCheckpoint>,
+    /// EOWC aggregate states, keyed by query name.
+    #[serde(default)]
+    pub eowc_states: HashMap<String, EowcStateCheckpoint>,
+}
 
 /// Specification for one aggregate function in a streaming query.
 pub(crate) struct AggFuncSpec {
@@ -508,6 +688,80 @@ impl IncrementalAggState {
     /// Returns the HAVING predicate SQL, if any.
     pub fn having_sql(&self) -> Option<&str> {
         self.having_sql.as_deref()
+    }
+
+    /// Compute a fingerprint for this query (SQL + schema).
+    pub(crate) fn query_fingerprint(&self) -> u64 {
+        query_fingerprint(&self.pre_agg_sql, &self.output_schema)
+    }
+
+    /// Checkpoint all group states into a serializable struct.
+    pub(crate) fn checkpoint_groups(&mut self) -> Result<AggStateCheckpoint, DbError> {
+        let fingerprint = self.query_fingerprint();
+        let mut groups = Vec::with_capacity(self.groups.len());
+        for (key, accs) in &mut self.groups {
+            let key_json: Vec<serde_json::Value> = key.iter().map(scalar_to_json).collect();
+            let mut acc_states = Vec::with_capacity(accs.len());
+            for acc in accs {
+                let state = acc.state().map_err(|e| {
+                    DbError::Pipeline(format!("accumulator state: {e}"))
+                })?;
+                acc_states.push(state.iter().map(scalar_to_json).collect());
+            }
+            groups.push(GroupCheckpoint {
+                key: key_json,
+                acc_states,
+            });
+        }
+        Ok(AggStateCheckpoint {
+            fingerprint,
+            groups,
+        })
+    }
+
+    /// Restore group states from a checkpoint.
+    ///
+    /// Creates fresh accumulators and restores their state via
+    /// `merge_batch()` with single-element arrays derived from the
+    /// checkpointed `ScalarValue`s.
+    pub(crate) fn restore_groups(
+        &mut self,
+        checkpoint: &AggStateCheckpoint,
+    ) -> Result<usize, DbError> {
+        let current_fp = self.query_fingerprint();
+        if checkpoint.fingerprint != current_fp {
+            return Err(DbError::Pipeline(format!(
+                "checkpoint fingerprint mismatch: saved={}, current={}",
+                checkpoint.fingerprint, current_fp
+            )));
+        }
+        self.groups.clear();
+        for gc in &checkpoint.groups {
+            let key: Result<Vec<ScalarValue>, _> =
+                gc.key.iter().map(json_to_scalar).collect();
+            let key = key?;
+            let mut accs = Vec::with_capacity(self.agg_specs.len());
+            for (i, spec) in self.agg_specs.iter().enumerate() {
+                let mut acc = spec.create_accumulator()?;
+                if i < gc.acc_states.len() {
+                    let state_scalars: Result<Vec<ScalarValue>, _> =
+                        gc.acc_states[i].iter().map(json_to_scalar).collect();
+                    let state_scalars = state_scalars?;
+                    let arrays: Vec<ArrayRef> = state_scalars
+                        .iter()
+                        .map(|sv| sv.to_array().map_err(|e| {
+                            DbError::Pipeline(format!("scalar to array: {e}"))
+                        }))
+                        .collect::<Result<_, _>>()?;
+                    acc.merge_batch(&arrays).map_err(|e| {
+                        DbError::Pipeline(format!("accumulator merge: {e}"))
+                    })?;
+                }
+                accs.push(acc);
+            }
+            self.groups.insert(key, accs);
+        }
+        Ok(checkpoint.groups.len())
     }
 }
 
@@ -1952,6 +2206,277 @@ mod tests {
             c.where_clause.contains("100"),
             "WHERE should contain predicate: {}",
             c.where_clause
+        );
+    }
+
+    // ── Checkpoint/restore tests ─────────────────────────────────────
+
+    #[test]
+    fn test_scalar_to_json_roundtrip() {
+        let cases: Vec<ScalarValue> = vec![
+            ScalarValue::Null,
+            ScalarValue::Boolean(Some(true)),
+            ScalarValue::Boolean(None),
+            ScalarValue::Int8(Some(42)),
+            ScalarValue::Int16(Some(-100)),
+            ScalarValue::Int32(Some(999)),
+            ScalarValue::Int64(Some(123_456_789)),
+            ScalarValue::Int64(None),
+            ScalarValue::UInt8(Some(255)),
+            ScalarValue::UInt16(Some(65535)),
+            ScalarValue::UInt32(Some(1_000_000)),
+            ScalarValue::UInt64(Some(9_999_999_999)),
+            ScalarValue::UInt64(None),
+            ScalarValue::Float32(Some(1.5)),
+            ScalarValue::Float64(Some(3.14159)),
+            ScalarValue::Float64(None),
+            ScalarValue::Utf8(Some("hello world".to_string())),
+            ScalarValue::Utf8(None),
+        ];
+
+        for original in &cases {
+            let json_val = scalar_to_json(original);
+            let restored = json_to_scalar(&json_val).unwrap();
+            // Compare by evaluate — widened types match on value
+            let orig_str = format!("{original:?}");
+            let rest_str = format!("{restored:?}");
+            match original {
+                ScalarValue::Null => {
+                    assert!(matches!(restored, ScalarValue::Null), "{orig_str} != {rest_str}");
+                }
+                ScalarValue::Boolean(v) => {
+                    assert_eq!(
+                        *v,
+                        match restored {
+                            ScalarValue::Boolean(r) => r,
+                            _ => panic!("type mismatch: {rest_str}"),
+                        }
+                    );
+                }
+                ScalarValue::Int8(Some(n)) => {
+                    assert_eq!(Some(i64::from(*n)), match restored {
+                        ScalarValue::Int64(r) => r,
+                        _ => panic!("type mismatch: {rest_str}"),
+                    });
+                }
+                ScalarValue::Int16(Some(n)) => {
+                    assert_eq!(Some(i64::from(*n)), match restored {
+                        ScalarValue::Int64(r) => r,
+                        _ => panic!("type mismatch: {rest_str}"),
+                    });
+                }
+                ScalarValue::Int32(Some(n)) => {
+                    assert_eq!(Some(i64::from(*n)), match restored {
+                        ScalarValue::Int64(r) => r,
+                        _ => panic!("type mismatch: {rest_str}"),
+                    });
+                }
+                ScalarValue::Int64(v) => {
+                    assert_eq!(*v, match restored {
+                        ScalarValue::Int64(r) => r,
+                        _ => panic!("type mismatch: {rest_str}"),
+                    });
+                }
+                ScalarValue::UInt8(Some(n)) => {
+                    assert_eq!(Some(u64::from(*n)), match restored {
+                        ScalarValue::UInt64(r) => r,
+                        _ => panic!("type mismatch: {rest_str}"),
+                    });
+                }
+                ScalarValue::UInt16(Some(n)) => {
+                    assert_eq!(Some(u64::from(*n)), match restored {
+                        ScalarValue::UInt64(r) => r,
+                        _ => panic!("type mismatch: {rest_str}"),
+                    });
+                }
+                ScalarValue::UInt32(Some(n)) => {
+                    assert_eq!(Some(u64::from(*n)), match restored {
+                        ScalarValue::UInt64(r) => r,
+                        _ => panic!("type mismatch: {rest_str}"),
+                    });
+                }
+                ScalarValue::UInt64(v) => {
+                    assert_eq!(*v, match restored {
+                        ScalarValue::UInt64(r) => r,
+                        _ => panic!("type mismatch: {rest_str}"),
+                    });
+                }
+                ScalarValue::Float32(Some(f)) => {
+                    let restored_f = match restored {
+                        ScalarValue::Float64(r) => r,
+                        _ => panic!("type mismatch: {rest_str}"),
+                    };
+                    assert!(
+                        (f64::from(*f) - restored_f.unwrap()).abs() < 1e-6,
+                        "{orig_str} != {rest_str}"
+                    );
+                }
+                ScalarValue::Float64(v) => {
+                    let restored_f = match restored {
+                        ScalarValue::Float64(r) => r,
+                        _ => panic!("type mismatch: {rest_str}"),
+                    };
+                    assert_eq!(*v, restored_f, "{orig_str} != {rest_str}");
+                }
+                ScalarValue::Utf8(v) => {
+                    assert_eq!(
+                        *v,
+                        match restored {
+                            ScalarValue::Utf8(r) => r,
+                            _ => panic!("type mismatch: {rest_str}"),
+                        }
+                    );
+                }
+                _ => {}
+            }
+        }
+    }
+
+    #[tokio::test]
+    async fn test_agg_checkpoint_roundtrip_single_group() {
+        let (_, mut state) = setup_agg_state(
+            "SELECT name, SUM(value) as total FROM events GROUP BY name",
+        )
+        .await;
+
+        // Feed data
+        let pre_agg_schema = Arc::new(Schema::new(vec![
+            Field::new("name", DataType::Utf8, true),
+            Field::new("__agg_input_1", DataType::Float64, true),
+        ]));
+        let batch = RecordBatch::try_new(
+            Arc::clone(&pre_agg_schema),
+            vec![
+                Arc::new(arrow::array::StringArray::from(vec!["a", "a"])),
+                Arc::new(arrow::array::Float64Array::from(vec![10.0, 20.0])),
+            ],
+        )
+        .unwrap();
+        state.process_batch(&batch).unwrap();
+
+        // Checkpoint
+        let cp = state.checkpoint_groups().unwrap();
+        assert_eq!(cp.groups.len(), 1);
+
+        // Create a fresh state and restore
+        let (_, mut state2) = setup_agg_state(
+            "SELECT name, SUM(value) as total FROM events GROUP BY name",
+        )
+        .await;
+        let restored = state2.restore_groups(&cp).unwrap();
+        assert_eq!(restored, 1);
+
+        // Emit and verify value matches
+        let result = state2.emit().unwrap();
+        assert_eq!(result.len(), 1);
+        let total = result[0]
+            .column(1)
+            .as_any()
+            .downcast_ref::<arrow::array::Float64Array>()
+            .unwrap();
+        assert!(
+            (total.value(0) - 30.0).abs() < f64::EPSILON,
+            "Restored SUM should be 30, got {}",
+            total.value(0)
+        );
+    }
+
+    #[tokio::test]
+    async fn test_agg_checkpoint_roundtrip_multi_group() {
+        let (_, mut state) = setup_agg_state(
+            "SELECT name, SUM(value) as total FROM events GROUP BY name",
+        )
+        .await;
+
+        let pre_agg_schema = Arc::new(Schema::new(vec![
+            Field::new("name", DataType::Utf8, true),
+            Field::new("__agg_input_1", DataType::Float64, true),
+        ]));
+        let batch = RecordBatch::try_new(
+            Arc::clone(&pre_agg_schema),
+            vec![
+                Arc::new(arrow::array::StringArray::from(vec![
+                    "a", "b", "a", "b", "c",
+                ])),
+                Arc::new(arrow::array::Float64Array::from(vec![
+                    10.0, 20.0, 30.0, 40.0, 50.0,
+                ])),
+            ],
+        )
+        .unwrap();
+        state.process_batch(&batch).unwrap();
+
+        let cp = state.checkpoint_groups().unwrap();
+        assert_eq!(cp.groups.len(), 3);
+
+        let (_, mut state2) = setup_agg_state(
+            "SELECT name, SUM(value) as total FROM events GROUP BY name",
+        )
+        .await;
+        let restored = state2.restore_groups(&cp).unwrap();
+        assert_eq!(restored, 3);
+
+        let result = state2.emit().unwrap();
+        assert_eq!(result[0].num_rows(), 3);
+    }
+
+    #[tokio::test]
+    async fn test_checkpoint_empty_state_returns_none() {
+        use crate::stream_executor::StreamExecutor;
+        let ctx = laminar_sql::create_session_context();
+        laminar_sql::register_streaming_functions(&ctx);
+        let mut executor = StreamExecutor::new(ctx);
+        // No queries registered = no state
+        let result = executor.checkpoint_state().unwrap();
+        assert!(result.is_none());
+    }
+
+    #[test]
+    fn test_restore_corrupt_bytes_returns_error() {
+        use crate::stream_executor::StreamExecutor;
+        let ctx = laminar_sql::create_session_context();
+        let mut executor = StreamExecutor::new(ctx);
+        let result = executor.restore_state(b"not valid json");
+        assert!(result.is_err());
+    }
+
+    #[tokio::test]
+    async fn test_restore_fingerprint_mismatch_errors() {
+        let (_, mut state) = setup_agg_state(
+            "SELECT name, SUM(value) as total FROM events GROUP BY name",
+        )
+        .await;
+
+        // Feed data and checkpoint
+        let pre_agg_schema = Arc::new(Schema::new(vec![
+            Field::new("name", DataType::Utf8, true),
+            Field::new("__agg_input_1", DataType::Float64, true),
+        ]));
+        let batch = RecordBatch::try_new(
+            Arc::clone(&pre_agg_schema),
+            vec![
+                Arc::new(arrow::array::StringArray::from(vec!["a"])),
+                Arc::new(arrow::array::Float64Array::from(vec![10.0])),
+            ],
+        )
+        .unwrap();
+        state.process_batch(&batch).unwrap();
+        let mut cp = state.checkpoint_groups().unwrap();
+
+        // Tamper with fingerprint
+        cp.fingerprint = 999_999;
+
+        // Restore should fail
+        let (_, mut state2) = setup_agg_state(
+            "SELECT name, SUM(value) as total FROM events GROUP BY name",
+        )
+        .await;
+        let result = state2.restore_groups(&cp);
+        assert!(result.is_err(), "Fingerprint mismatch should error");
+        let err = result.unwrap_err().to_string();
+        assert!(
+            err.contains("fingerprint mismatch"),
+            "Error should mention fingerprint: {err}"
         );
     }
 }

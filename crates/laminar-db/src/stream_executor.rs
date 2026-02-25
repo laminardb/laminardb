@@ -223,6 +223,9 @@ pub(crate) struct StreamExecutor {
     /// Set of EOWC query indices that have been checked for aggregation but
     /// found not to be aggregate queries (fall back to raw-batch path).
     non_eowc_agg_queries: HashSet<usize>,
+    /// Pending checkpoint data for deferred restore. Held until agg states
+    /// are lazily initialized, then applied and cleared.
+    pending_restore: Option<crate::aggregate_state::StreamExecutorCheckpoint>,
 }
 
 impl StreamExecutor {
@@ -240,6 +243,7 @@ impl StreamExecutor {
             non_agg_queries: HashSet::new(),
             eowc_agg_states: HashMap::new(),
             non_eowc_agg_queries: HashSet::new(),
+            pending_restore: None,
         }
     }
 
@@ -557,6 +561,7 @@ impl StreamExecutor {
         match IncrementalAggState::try_from_sql(&self.ctx, &query_sql).await {
             Ok(Some(state)) => {
                 self.agg_states.insert(idx, state);
+                self.try_restore_pending_agg(idx);
                 self.execute_incremental_agg(idx).await
             }
             Ok(None) => {
@@ -843,6 +848,7 @@ impl StreamExecutor {
                                  using incremental per-window accumulators"
                             );
                             self.eowc_agg_states.insert(idx, state);
+                            self.try_restore_pending_eowc(idx);
                             return self
                                 .execute_incremental_eowc(
                                     idx,
@@ -1196,6 +1202,161 @@ impl StreamExecutor {
         df.collect()
             .await
             .map_err(|e| DbError::query_pipeline(table_name, &e))
+    }
+
+    /// Checkpoint all aggregate state (both running-total and EOWC).
+    ///
+    /// Returns `Ok(None)` if there is no state to checkpoint (no aggregate
+    /// queries have accumulated any groups). Otherwise returns the serialized
+    /// JSON bytes.
+    pub fn checkpoint_state(&mut self) -> Result<Option<Vec<u8>>, DbError> {
+        use crate::aggregate_state::StreamExecutorCheckpoint;
+
+        let mut agg_checkpoints = HashMap::new();
+        for (&idx, state) in &mut self.agg_states {
+            let name = self.queries[idx].name.clone();
+            agg_checkpoints.insert(
+                name,
+                state.checkpoint_groups()?,
+            );
+        }
+
+        let mut eowc_checkpoints = HashMap::new();
+        for (&idx, state) in &mut self.eowc_agg_states {
+            let name = self.queries[idx].name.clone();
+            eowc_checkpoints.insert(
+                name,
+                state.checkpoint_windows()?,
+            );
+        }
+
+        if agg_checkpoints.is_empty() && eowc_checkpoints.is_empty() {
+            return Ok(None);
+        }
+
+        let checkpoint = StreamExecutorCheckpoint {
+            version: 1,
+            agg_states: agg_checkpoints,
+            eowc_states: eowc_checkpoints,
+        };
+
+        let bytes = serde_json::to_vec(&checkpoint).map_err(|e| {
+            DbError::Pipeline(format!(
+                "stream executor checkpoint serialization: {e}"
+            ))
+        })?;
+
+        Ok(Some(bytes))
+    }
+
+    /// Restore aggregate state from a previous checkpoint.
+    ///
+    /// Deserializes the checkpoint and stores it for deferred restore.
+    /// Aggregate states are lazily initialized on first execution cycle,
+    /// so the actual restore happens when each state is first created
+    /// (via `try_restore_pending`). Any already-initialized states are
+    /// restored immediately.
+    ///
+    /// Returns an error if the checkpoint is corrupt.
+    pub fn restore_state(&mut self, bytes: &[u8]) -> Result<usize, DbError> {
+        use crate::aggregate_state::StreamExecutorCheckpoint;
+
+        let checkpoint: StreamExecutorCheckpoint =
+            serde_json::from_slice(bytes).map_err(|e| {
+                DbError::Pipeline(format!(
+                    "stream executor checkpoint deserialization: {e}"
+                ))
+            })?;
+
+        let mut restored = 0usize;
+
+        // Build name → index lookup
+        let name_to_idx: HashMap<&str, usize> = self
+            .queries
+            .iter()
+            .enumerate()
+            .map(|(i, q)| (q.name.as_str(), i))
+            .collect();
+
+        // Immediately restore any already-initialized states
+        for (name, agg_cp) in &checkpoint.agg_states {
+            if let Some(&idx) = name_to_idx.get(name.as_str()) {
+                if let Some(state) = self.agg_states.get_mut(&idx) {
+                    state.restore_groups(agg_cp)?;
+                    restored += 1;
+                }
+            }
+        }
+        for (name, eowc_cp) in &checkpoint.eowc_states {
+            if let Some(&idx) = name_to_idx.get(name.as_str()) {
+                if let Some(state) = self.eowc_agg_states.get_mut(&idx) {
+                    state.restore_windows(eowc_cp)?;
+                    restored += 1;
+                }
+            }
+        }
+
+        // Store for deferred restore of lazily-initialized states
+        self.pending_restore = Some(checkpoint);
+
+        Ok(restored)
+    }
+
+    /// Try to restore pending checkpoint data for a newly initialized
+    /// aggregate state. Called after lazy initialization.
+    fn try_restore_pending_agg(&mut self, idx: usize) {
+        let query_name = &self.queries[idx].name;
+        let pending = self.pending_restore.as_ref();
+        if let Some(cp) = pending.and_then(|p| p.agg_states.get(query_name)) {
+            // Clone the checkpoint data to avoid borrow conflict
+            let cp_clone = cp.clone();
+            if let Some(state) = self.agg_states.get_mut(&idx) {
+                match state.restore_groups(&cp_clone) {
+                    Ok(n) => {
+                        tracing::info!(
+                            query = %query_name,
+                            groups = n,
+                            "Restored agg state from checkpoint"
+                        );
+                    }
+                    Err(e) => {
+                        tracing::warn!(
+                            query = %query_name,
+                            error = %e,
+                            "Failed to restore agg state from checkpoint"
+                        );
+                    }
+                }
+            }
+        }
+    }
+
+    /// Try to restore pending checkpoint data for a newly initialized
+    /// EOWC aggregate state. Called after lazy initialization.
+    fn try_restore_pending_eowc(&mut self, idx: usize) {
+        let query_name = &self.queries[idx].name;
+        let pending = self.pending_restore.as_ref();
+        if let Some(cp) = pending.and_then(|p| p.eowc_states.get(query_name)) {
+            let cp_clone = cp.clone();
+            if let Some(state) = self.eowc_agg_states.get_mut(&idx) {
+                match state.restore_windows(&cp_clone) {
+                    Ok(n) => {
+                        tracing::info!(
+                            query = %query_name,
+                            groups = n,
+                            "Restored EOWC state from checkpoint"
+                        );
+                    }
+                    Err(e) => {
+                        tracing::warn!(
+                            query = %query_name,
+                            error = %e,
+                            "Failed to restore EOWC state from checkpoint"
+                        );
+                    }
+                }
+            }
+        }
     }
 }
 

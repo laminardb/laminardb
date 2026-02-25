@@ -27,6 +27,7 @@ use laminar_sql::translator::{WindowOperatorConfig, WindowType};
 
 use crate::aggregate_state::{
     extract_clauses, expr_to_sql, find_aggregate, resolve_expr_type, AggFuncSpec,
+    EowcStateCheckpoint,
 };
 use crate::error::DbError;
 
@@ -612,6 +613,118 @@ impl IncrementalEowcState {
     pub fn total_group_count(&self) -> usize {
         self.windows.values().map(HashMap::len).sum()
     }
+
+    /// Compute a fingerprint for this query (SQL + schema).
+    pub(crate) fn query_fingerprint(&self) -> u64 {
+        crate::aggregate_state::query_fingerprint(
+            &self.pre_agg_sql,
+            &self.output_schema,
+        )
+    }
+
+    /// Checkpoint all per-window group states into a serializable struct.
+    pub(crate) fn checkpoint_windows(
+        &mut self,
+    ) -> Result<EowcStateCheckpoint, DbError> {
+        use crate::aggregate_state::{
+            scalar_to_json, GroupCheckpoint, WindowCheckpoint,
+        };
+
+        let fingerprint = self.query_fingerprint();
+        let mut windows = Vec::with_capacity(self.windows.len());
+        for (&window_start, groups) in &mut self.windows {
+            let mut group_checkpoints =
+                Vec::with_capacity(groups.len());
+            for (key, accs) in groups {
+                let key_json: Vec<serde_json::Value> =
+                    key.iter().map(scalar_to_json).collect();
+                let mut acc_states = Vec::with_capacity(accs.len());
+                for acc in accs {
+                    let state = acc.state().map_err(|e| {
+                        DbError::Pipeline(format!(
+                            "accumulator state: {e}"
+                        ))
+                    })?;
+                    acc_states
+                        .push(state.iter().map(scalar_to_json).collect());
+                }
+                group_checkpoints.push(GroupCheckpoint {
+                    key: key_json,
+                    acc_states,
+                });
+            }
+            windows.push(WindowCheckpoint {
+                window_start,
+                groups: group_checkpoints,
+            });
+        }
+        Ok(EowcStateCheckpoint {
+            fingerprint,
+            windows,
+        })
+    }
+
+    /// Restore per-window group states from a checkpoint.
+    pub(crate) fn restore_windows(
+        &mut self,
+        checkpoint: &EowcStateCheckpoint,
+    ) -> Result<usize, DbError> {
+        use crate::aggregate_state::json_to_scalar;
+
+        let current_fp = self.query_fingerprint();
+        if checkpoint.fingerprint != current_fp {
+            return Err(DbError::Pipeline(format!(
+                "EOWC checkpoint fingerprint mismatch: saved={}, current={}",
+                checkpoint.fingerprint, current_fp
+            )));
+        }
+        self.windows.clear();
+        let mut total_groups = 0usize;
+        for wc in &checkpoint.windows {
+            let mut groups = HashMap::new();
+            for gc in &wc.groups {
+                let key: Result<Vec<ScalarValue>, _> =
+                    gc.key.iter().map(json_to_scalar).collect();
+                let key = key?;
+                let mut accs =
+                    Vec::with_capacity(self.agg_specs.len());
+                for (i, spec) in self.agg_specs.iter().enumerate() {
+                    let mut acc = spec.create_accumulator()?;
+                    if i < gc.acc_states.len() {
+                        let state_scalars: Result<
+                            Vec<ScalarValue>,
+                            _,
+                        > = gc.acc_states[i]
+                            .iter()
+                            .map(json_to_scalar)
+                            .collect();
+                        let state_scalars = state_scalars?;
+                        let arrays: Vec<arrow::array::ArrayRef> =
+                            state_scalars
+                                .iter()
+                                .map(|sv| {
+                                    sv.to_array().map_err(|e| {
+                                        DbError::Pipeline(format!(
+                                            "scalar to array: {e}"
+                                        ))
+                                    })
+                                })
+                                .collect::<Result<_, _>>()?;
+                        acc.merge_batch(&arrays).map_err(|e| {
+                            DbError::Pipeline(format!(
+                                "accumulator merge: {e}"
+                            ))
+                        })?;
+                    }
+                    accs.push(acc);
+                }
+                groups.insert(key, accs);
+                total_groups += 1;
+            }
+            self.windows.insert(wc.window_start, groups);
+        }
+        Ok(total_groups)
+    }
 }
 
 /// Extract i64 timestamp values from a batch column.
@@ -1012,5 +1125,91 @@ mod tests {
         assert_eq!(schema.field(2).name(), "symbol");
         assert_eq!(schema.field(3).name(), "total");
         assert_eq!(schema.fields().len(), 4);
+    }
+
+    // ── Checkpoint/restore tests ─────────────────────────────────────
+
+    #[test]
+    fn test_eowc_checkpoint_roundtrip_tumbling() {
+        let mut state =
+            make_eowc_state(EowcWindowType::Tumbling { size_ms: 1000 });
+
+        // Feed data into two windows
+        let batch = make_pre_agg_batch(
+            vec!["AAPL", "AAPL", "GOOG"],
+            vec![10, 20, 100],
+            vec![100, 200, 1500],
+        );
+        state.update_batch(&batch).unwrap();
+
+        assert_eq!(state.open_window_count(), 2);
+
+        // Checkpoint
+        let cp = state.checkpoint_windows().unwrap();
+        assert_eq!(cp.windows.len(), 2);
+
+        // Create fresh state and restore
+        let mut state2 =
+            make_eowc_state(EowcWindowType::Tumbling { size_ms: 1000 });
+        let restored = state2.restore_windows(&cp).unwrap();
+        assert!(restored > 0, "Should have restored groups");
+        assert_eq!(state2.open_window_count(), 2);
+
+        // Close first window and verify SUM
+        let batches = state2.close_windows(1000).unwrap();
+        assert_eq!(batches.len(), 1);
+        let result = &batches[0];
+        assert_eq!(result.num_rows(), 1); // Only AAPL in window [0,1000)
+
+        let total = result
+            .column(3)
+            .as_any()
+            .downcast_ref::<Int64Array>()
+            .unwrap();
+        assert_eq!(total.value(0), 30, "SUM should be 10+20=30");
+
+        // Close second window
+        let batches = state2.close_windows(2000).unwrap();
+        assert_eq!(batches.len(), 1);
+        let total2 = batches[0]
+            .column(3)
+            .as_any()
+            .downcast_ref::<Int64Array>()
+            .unwrap();
+        assert_eq!(total2.value(0), 100, "SUM should be 100");
+    }
+
+    #[test]
+    fn test_eowc_checkpoint_empty_windows() {
+        let mut state =
+            make_eowc_state(EowcWindowType::Tumbling { size_ms: 1000 });
+
+        // No data = no windows
+        let cp = state.checkpoint_windows().unwrap();
+        assert!(cp.windows.is_empty());
+    }
+
+    #[test]
+    fn test_eowc_checkpoint_fingerprint_mismatch() {
+        let mut state =
+            make_eowc_state(EowcWindowType::Tumbling { size_ms: 1000 });
+
+        let batch =
+            make_pre_agg_batch(vec!["AAPL"], vec![10], vec![100]);
+        state.update_batch(&batch).unwrap();
+
+        let mut cp = state.checkpoint_windows().unwrap();
+        cp.fingerprint = 12345; // tamper
+
+        let mut state2 =
+            make_eowc_state(EowcWindowType::Tumbling { size_ms: 1000 });
+        let result = state2.restore_windows(&cp);
+        assert!(result.is_err());
+        assert!(
+            result
+                .unwrap_err()
+                .to_string()
+                .contains("fingerprint mismatch")
+        );
     }
 }
