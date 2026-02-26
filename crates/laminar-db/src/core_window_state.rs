@@ -24,11 +24,11 @@ use laminar_sql::parser::EmitClause;
 use laminar_sql::translator::{WindowOperatorConfig, WindowType};
 
 use crate::aggregate_state::{
-    extract_clauses, expr_to_sql, find_aggregate, query_fingerprint, resolve_expr_type,
+    expr_to_sql, extract_clauses, find_aggregate, query_fingerprint, resolve_expr_type,
     AggFuncSpec, GroupCheckpoint, WindowCheckpoint,
 };
-use crate::error::DbError;
 use crate::eowc_state::extract_i64_timestamps;
+use crate::error::DbError;
 
 /// Which core window assigner variant is in use.
 enum CoreWindowAssigner {
@@ -142,13 +142,14 @@ impl CoreWindowState {
                 if size_ms <= 0 || slide_ms <= 0 || slide_ms > size_ms {
                     return Ok(None);
                 }
-                CoreWindowAssigner::Hopping(SlidingWindowAssigner::from_millis(
-                    size_ms, slide_ms,
-                ))
+                CoreWindowAssigner::Hopping(SlidingWindowAssigner::from_millis(size_ms, slide_ms))
             }
             WindowType::Session => {
                 let gap_ms = i64::try_from(
-                    window_config.gap.map_or(std::time::Duration::ZERO, |g| g).as_millis(),
+                    window_config
+                        .gap
+                        .map_or(std::time::Duration::ZERO, |g| g)
+                        .as_millis(),
                 )
                 .unwrap_or(0);
                 if gap_ms <= 0 {
@@ -233,8 +234,7 @@ impl CoreWindowState {
                 if agg_func.params.args.is_empty() {
                     let col_idx = next_col_idx;
                     next_col_idx += 1;
-                    pre_agg_select_items
-                        .push(format!("TRUE AS \"__agg_input_{col_idx}\""));
+                    pre_agg_select_items.push(format!("TRUE AS \"__agg_input_{col_idx}\""));
                     input_col_indices.push(col_idx);
                     input_types.push(DataType::Boolean);
                 } else {
@@ -249,17 +249,12 @@ impl CoreWindowState {
                                 "CASE WHEN {filter_sql} THEN {expr_sql} ELSE NULL END AS \"__agg_input_{col_idx}\""
                             ));
                         } else {
-                            pre_agg_select_items.push(format!(
-                                "{expr_sql} AS \"__agg_input_{col_idx}\""
-                            ));
+                            pre_agg_select_items
+                                .push(format!("{expr_sql} AS \"__agg_input_{col_idx}\""));
                         }
 
                         input_col_indices.push(col_idx);
-                        let dt = resolve_expr_type(
-                            arg_expr,
-                            &input_schema,
-                            agg_field.data_type(),
-                        );
+                        let dt = resolve_expr_type(arg_expr, &input_schema, agg_field.data_type());
                         input_types.push(dt);
                     }
                 }
@@ -296,10 +291,7 @@ impl CoreWindowState {
 
         // Add time column for window assignment
         let time_col_index = next_col_idx;
-        pre_agg_select_items.push(format!(
-            "\"{}\" AS \"__cw_ts\"",
-            window_config.time_column
-        ));
+        pre_agg_select_items.push(format!("\"{}\" AS \"__cw_ts\"", window_config.time_column));
 
         let clauses = extract_clauses(sql);
         let pre_agg_sql = format!(
@@ -471,17 +463,20 @@ impl CoreWindowState {
             0 => {
                 let mut accs = self.create_fresh_accumulators()?;
                 Self::update_accumulators(&mut accs, &self.agg_specs, batch, row)?;
-                let group = self
-                    .session_groups
-                    .entry(key.to_vec())
-                    .or_insert_with(|| SessionGroupState {
-                        sessions: BTreeMap::new(),
-                    });
-                group.sessions.insert(new_start, SessionAccState {
-                    start: new_start,
-                    end: new_end,
-                    accs,
-                });
+                let group =
+                    self.session_groups
+                        .entry(key.to_vec())
+                        .or_insert_with(|| SessionGroupState {
+                            sessions: BTreeMap::new(),
+                        });
+                group.sessions.insert(
+                    new_start,
+                    SessionAccState {
+                        start: new_start,
+                        end: new_end,
+                        accs,
+                    },
+                );
             }
             1 => {
                 let group = self.session_groups.get_mut(key).unwrap();
@@ -491,12 +486,7 @@ impl CoreWindowState {
                 let merged_end = sess.end.max(new_end);
                 sess.start = merged_start;
                 sess.end = merged_end;
-                Self::update_accumulators(
-                    &mut sess.accs,
-                    &self.agg_specs,
-                    batch,
-                    row,
-                )?;
+                Self::update_accumulators(&mut sess.accs, &self.agg_specs, batch, row)?;
                 if merged_start != sess_key {
                     let sess = group.sessions.remove(&sess_key).unwrap();
                     group.sessions.insert(merged_start, sess);
@@ -506,9 +496,7 @@ impl CoreWindowState {
                 let group = self.session_groups.get_mut(key).unwrap();
                 let mut merged_start = new_start;
                 let mut merged_end = new_end;
-                let mut survivor_accs: Option<
-                    Vec<Box<dyn datafusion_expr::Accumulator>>,
-                > = None;
+                let mut survivor_accs: Option<Vec<Box<dyn datafusion_expr::Accumulator>>> = None;
 
                 for &sess_key in &overlapping {
                     let sess = group.sessions.remove(&sess_key).unwrap();
@@ -516,29 +504,21 @@ impl CoreWindowState {
                     merged_end = merged_end.max(sess.end);
 
                     if let Some(ref mut surv) = survivor_accs {
-                        for (i, mut acc) in
-                            sess.accs.into_iter().enumerate()
-                        {
+                        for (i, mut acc) in sess.accs.into_iter().enumerate() {
                             let state = acc.state().map_err(|e| {
-                                DbError::Pipeline(format!(
-                                    "session merge state: {e}"
-                                ))
+                                DbError::Pipeline(format!("session merge state: {e}"))
                             })?;
                             let arrays: Vec<ArrayRef> = state
                                 .iter()
                                 .map(|sv| {
                                     sv.to_array().map_err(|e| {
-                                        DbError::Pipeline(format!(
-                                            "session merge array: {e}"
-                                        ))
+                                        DbError::Pipeline(format!("session merge array: {e}"))
                                     })
                                 })
                                 .collect::<Result<_, _>>()?;
-                            surv[i].merge_batch(&arrays).map_err(|e| {
-                                DbError::Pipeline(format!(
-                                    "session merge: {e}"
-                                ))
-                            })?;
+                            surv[i]
+                                .merge_batch(&arrays)
+                                .map_err(|e| DbError::Pipeline(format!("session merge: {e}")))?;
                         }
                     } else {
                         survivor_accs = Some(sess.accs);
@@ -546,17 +526,15 @@ impl CoreWindowState {
                 }
 
                 let mut accs = survivor_accs.unwrap();
-                Self::update_accumulators(
-                    &mut accs,
-                    &self.agg_specs,
-                    batch,
-                    row,
-                )?;
-                group.sessions.insert(merged_start, SessionAccState {
-                    start: merged_start,
-                    end: merged_end,
-                    accs,
-                });
+                Self::update_accumulators(&mut accs, &self.agg_specs, batch, row)?;
+                group.sessions.insert(
+                    merged_start,
+                    SessionAccState {
+                        start: merged_start,
+                        end: merged_end,
+                        accs,
+                    },
+                );
             }
         }
 
@@ -586,38 +564,34 @@ impl CoreWindowState {
             (row as u32),
         ]);
         for (i, spec) in agg_specs.iter().enumerate() {
-            let mut input_arrays: Vec<ArrayRef> =
-                Vec::with_capacity(spec.input_col_indices.len());
+            let mut input_arrays: Vec<ArrayRef> = Vec::with_capacity(spec.input_col_indices.len());
             for &col_idx in &spec.input_col_indices {
-                let arr =
-                    compute::take(batch.column(col_idx), &index_array, None).map_err(|e| {
-                        DbError::Pipeline(format!("array take: {e}"))
-                    })?;
+                let arr = compute::take(batch.column(col_idx), &index_array, None)
+                    .map_err(|e| DbError::Pipeline(format!("array take: {e}")))?;
                 input_arrays.push(arr);
             }
 
             if let Some(filter_idx) = spec.filter_col_index {
-                let filter_arr =
-                    compute::take(batch.column(filter_idx), &index_array, None).map_err(
-                        |e| DbError::Pipeline(format!("filter take: {e}")),
-                    )?;
+                let filter_arr = compute::take(batch.column(filter_idx), &index_array, None)
+                    .map_err(|e| DbError::Pipeline(format!("filter take: {e}")))?;
                 if let Some(mask) = filter_arr
                     .as_any()
                     .downcast_ref::<arrow::array::BooleanArray>()
                 {
                     let mut filtered = Vec::with_capacity(input_arrays.len());
                     for arr in &input_arrays {
-                        filtered.push(compute::filter(arr, mask).map_err(|e| {
-                            DbError::Pipeline(format!("filter apply: {e}"))
-                        })?);
+                        filtered.push(
+                            compute::filter(arr, mask)
+                                .map_err(|e| DbError::Pipeline(format!("filter apply: {e}")))?,
+                        );
                     }
                     input_arrays = filtered;
                 }
             }
 
-            accs[i].update_batch(&input_arrays).map_err(|e| {
-                DbError::Pipeline(format!("accumulator update: {e}"))
-            })?;
+            accs[i]
+                .update_batch(&input_arrays)
+                .map_err(|e| DbError::Pipeline(format!("accumulator update: {e}")))?;
         }
         Ok(())
     }
@@ -625,15 +599,9 @@ impl CoreWindowState {
     /// Close windows whose end <= watermark, returning emitted batches.
     pub fn close_windows(&mut self, watermark_ms: i64) -> Result<Vec<RecordBatch>, DbError> {
         match &self.assigner {
-            CoreWindowAssigner::Tumbling(a) => {
-                self.close_fixed_windows(watermark_ms, a.size_ms())
-            }
-            CoreWindowAssigner::Hopping(a) => {
-                self.close_fixed_windows(watermark_ms, a.size_ms())
-            }
-            CoreWindowAssigner::Session { .. } => {
-                self.close_session_windows(watermark_ms)
-            }
+            CoreWindowAssigner::Tumbling(a) => self.close_fixed_windows(watermark_ms, a.size_ms()),
+            CoreWindowAssigner::Hopping(a) => self.close_fixed_windows(watermark_ms, a.size_ms()),
+            CoreWindowAssigner::Session { .. } => self.close_session_windows(watermark_ms),
         }
     }
 
@@ -673,10 +641,7 @@ impl CoreWindowState {
     }
 
     /// Close session windows whose end <= watermark.
-    fn close_session_windows(
-        &mut self,
-        watermark_ms: i64,
-    ) -> Result<Vec<RecordBatch>, DbError> {
+    fn close_session_windows(&mut self, watermark_ms: i64) -> Result<Vec<RecordBatch>, DbError> {
         // Collect all closeable sessions across all groups
         #[allow(clippy::type_complexity)]
         let mut rows: Vec<(
@@ -735,10 +700,12 @@ impl CoreWindowState {
 
         let mut starts = Vec::with_capacity(num_rows);
         let mut ends = Vec::with_capacity(num_rows);
-        let mut group_scalars: Vec<Vec<ScalarValue>> =
-            (0..self.num_group_cols).map(|_| Vec::with_capacity(num_rows)).collect();
-        let mut agg_scalars: Vec<Vec<ScalarValue>> =
-            (0..self.agg_specs.len()).map(|_| Vec::with_capacity(num_rows)).collect();
+        let mut group_scalars: Vec<Vec<ScalarValue>> = (0..self.num_group_cols)
+            .map(|_| Vec::with_capacity(num_rows))
+            .collect();
+        let mut agg_scalars: Vec<Vec<ScalarValue>> = (0..self.agg_specs.len())
+            .map(|_| Vec::with_capacity(num_rows))
+            .collect();
 
         for (ws, we, key, mut accs) in rows {
             starts.push(ws);
@@ -747,17 +714,15 @@ impl CoreWindowState {
                 group_scalars[i].push(sv);
             }
             for (i, acc) in accs.iter_mut().enumerate() {
-                let sv = acc.evaluate().map_err(|e| {
-                    DbError::Pipeline(format!("session accumulator evaluate: {e}"))
-                })?;
+                let sv = acc
+                    .evaluate()
+                    .map_err(|e| DbError::Pipeline(format!("session accumulator evaluate: {e}")))?;
                 agg_scalars[i].push(sv);
             }
         }
 
-        let win_start_array: ArrayRef =
-            Arc::new(arrow::array::Int64Array::from(starts));
-        let win_end_array: ArrayRef =
-            Arc::new(arrow::array::Int64Array::from(ends));
+        let win_start_array: ArrayRef = Arc::new(arrow::array::Int64Array::from(starts));
+        let win_end_array: ArrayRef = Arc::new(arrow::array::Int64Array::from(ends));
 
         let mut group_arrays: Vec<ArrayRef> = Vec::with_capacity(self.num_group_cols);
         for (col_idx, scalars) in group_scalars.into_iter().enumerate() {
@@ -814,8 +779,7 @@ impl CoreWindowState {
 
         let mut group_arrays: Vec<ArrayRef> = Vec::with_capacity(self.num_group_cols);
         for (col_idx, dt) in self.group_types.iter().enumerate() {
-            let scalars: Vec<ScalarValue> =
-                groups.keys().map(|key| key[col_idx].clone()).collect();
+            let scalars: Vec<ScalarValue> = groups.keys().map(|key| key[col_idx].clone()).collect();
             let array = ScalarValue::iter_to_array(scalars)
                 .map_err(|e| DbError::Pipeline(format!("group key array: {e}")))?;
             if array.data_type() == dt {
@@ -880,9 +844,7 @@ impl CoreWindowState {
     }
 
     /// Checkpoint all per-window group states into a serializable struct.
-    pub(crate) fn checkpoint_windows(
-        &mut self,
-    ) -> Result<CoreWindowCheckpoint, DbError> {
+    pub(crate) fn checkpoint_windows(&mut self) -> Result<CoreWindowCheckpoint, DbError> {
         use crate::aggregate_state::scalar_to_json;
 
         let fingerprint = self.query_fingerprint();
@@ -892,21 +854,16 @@ impl CoreWindowState {
             CoreWindowAssigner::Tumbling(_) | CoreWindowAssigner::Hopping(_) => {
                 let mut windows = Vec::with_capacity(self.windows.len());
                 for (&window_start, groups) in &mut self.windows {
-                    let mut group_checkpoints =
-                        Vec::with_capacity(groups.len());
+                    let mut group_checkpoints = Vec::with_capacity(groups.len());
                     for (key, accs) in groups {
                         let key_json: Vec<serde_json::Value> =
                             key.iter().map(scalar_to_json).collect();
                         let mut acc_states = Vec::with_capacity(accs.len());
                         for acc in accs {
                             let state = acc.state().map_err(|e| {
-                                DbError::Pipeline(format!(
-                                    "accumulator state: {e}"
-                                ))
+                                DbError::Pipeline(format!("accumulator state: {e}"))
                             })?;
-                            acc_states.push(
-                                state.iter().map(scalar_to_json).collect(),
-                            );
+                            acc_states.push(state.iter().map(scalar_to_json).collect());
                         }
                         group_checkpoints.push(GroupCheckpoint {
                             key: key_json,
@@ -926,27 +883,17 @@ impl CoreWindowState {
                 })
             }
             CoreWindowAssigner::Session { .. } => {
-                let mut session_state = Vec::with_capacity(
-                    self.session_groups.len(),
-                );
+                let mut session_state = Vec::with_capacity(self.session_groups.len());
                 for (key, group) in &mut self.session_groups {
-                    let key_json: Vec<serde_json::Value> =
-                        key.iter().map(scalar_to_json).collect();
-                    let mut sessions = Vec::with_capacity(
-                        group.sessions.len(),
-                    );
+                    let key_json: Vec<serde_json::Value> = key.iter().map(scalar_to_json).collect();
+                    let mut sessions = Vec::with_capacity(group.sessions.len());
                     for sess in group.sessions.values_mut() {
-                        let mut acc_states =
-                            Vec::with_capacity(sess.accs.len());
+                        let mut acc_states = Vec::with_capacity(sess.accs.len());
                         for acc in &mut sess.accs {
                             let state = acc.state().map_err(|e| {
-                                DbError::Pipeline(format!(
-                                    "session accumulator state: {e}"
-                                ))
+                                DbError::Pipeline(format!("session accumulator state: {e}"))
                             })?;
-                            acc_states.push(
-                                state.iter().map(scalar_to_json).collect(),
-                            );
+                            acc_states.push(state.iter().map(scalar_to_json).collect());
                         }
                         sessions.push(SessionCheckpoint {
                             start: sess.start,
@@ -1001,8 +948,7 @@ impl CoreWindowState {
         for wc in &checkpoint.windows {
             let mut groups = HashMap::new();
             for gc in &wc.groups {
-                let key: Result<Vec<ScalarValue>, _> =
-                    gc.key.iter().map(json_to_scalar).collect();
+                let key: Result<Vec<ScalarValue>, _> = gc.key.iter().map(json_to_scalar).collect();
                 let key = key?;
                 let mut accs = Vec::with_capacity(self.agg_specs.len());
                 for (i, spec) in self.agg_specs.iter().enumerate() {
@@ -1014,16 +960,12 @@ impl CoreWindowState {
                         let arrays: Vec<arrow::array::ArrayRef> = state_scalars
                             .iter()
                             .map(|sv| {
-                                sv.to_array().map_err(|e| {
-                                    DbError::Pipeline(format!(
-                                        "scalar to array: {e}"
-                                    ))
-                                })
+                                sv.to_array()
+                                    .map_err(|e| DbError::Pipeline(format!("scalar to array: {e}")))
                             })
                             .collect::<Result<_, _>>()?;
-                        acc.merge_batch(&arrays).map_err(|e| {
-                            DbError::Pipeline(format!("accumulator merge: {e}"))
-                        })?;
+                        acc.merge_batch(&arrays)
+                            .map_err(|e| DbError::Pipeline(format!("accumulator merge: {e}")))?;
                     }
                     accs.push(acc);
                 }
@@ -1045,8 +987,7 @@ impl CoreWindowState {
         self.session_groups.clear();
         let mut total_sessions = 0usize;
         for sgc in &checkpoint.session_state {
-            let key: Result<Vec<ScalarValue>, _> =
-                sgc.key.iter().map(json_to_scalar).collect();
+            let key: Result<Vec<ScalarValue>, _> = sgc.key.iter().map(json_to_scalar).collect();
             let key = key?;
             let mut sessions = BTreeMap::new();
             for sc in &sgc.sessions {
@@ -1060,26 +1001,24 @@ impl CoreWindowState {
                         let arrays: Vec<arrow::array::ArrayRef> = state_scalars
                             .iter()
                             .map(|sv| {
-                                sv.to_array().map_err(|e| {
-                                    DbError::Pipeline(format!(
-                                        "scalar to array: {e}"
-                                    ))
-                                })
+                                sv.to_array()
+                                    .map_err(|e| DbError::Pipeline(format!("scalar to array: {e}")))
                             })
                             .collect::<Result<_, _>>()?;
                         acc.merge_batch(&arrays).map_err(|e| {
-                            DbError::Pipeline(format!(
-                                "session accumulator merge: {e}"
-                            ))
+                            DbError::Pipeline(format!("session accumulator merge: {e}"))
                         })?;
                     }
                     accs.push(acc);
                 }
-                sessions.insert(sc.start, SessionAccState {
-                    start: sc.start,
-                    end: sc.end,
-                    accs,
-                });
+                sessions.insert(
+                    sc.start,
+                    SessionAccState {
+                        start: sc.start,
+                        end: sc.end,
+                        accs,
+                    },
+                );
                 total_sessions += 1;
             }
             self.session_groups
@@ -1147,9 +1086,7 @@ mod tests {
         ]));
 
         CoreWindowState {
-            assigner: CoreWindowAssigner::Tumbling(
-                TumblingWindowAssigner::from_millis(size_ms),
-            ),
+            assigner: CoreWindowAssigner::Tumbling(TumblingWindowAssigner::from_millis(size_ms)),
             windows: BTreeMap::new(),
             session_groups: HashMap::new(),
             agg_specs,
@@ -1201,9 +1138,7 @@ mod tests {
         ]));
 
         CoreWindowState {
-            assigner: CoreWindowAssigner::Tumbling(
-                TumblingWindowAssigner::from_millis(size_ms),
-            ),
+            assigner: CoreWindowAssigner::Tumbling(TumblingWindowAssigner::from_millis(size_ms)),
             windows: BTreeMap::new(),
             session_groups: HashMap::new(),
             agg_specs,
@@ -1220,10 +1155,7 @@ mod tests {
     }
 
     /// Build a hopping (sliding) `CoreWindowState` for SUM(Int64).
-    fn make_hopping_core_window_state(
-        size_ms: i64,
-        slide_ms: i64,
-    ) -> CoreWindowState {
+    fn make_hopping_core_window_state(size_ms: i64, slide_ms: i64) -> CoreWindowState {
         let ctx = SessionContext::new();
         let udf = ctx.udaf("sum").expect("SUM should be registered");
 
@@ -1245,9 +1177,9 @@ mod tests {
         ]));
 
         CoreWindowState {
-            assigner: CoreWindowAssigner::Hopping(
-                SlidingWindowAssigner::from_millis(size_ms, slide_ms),
-            ),
+            assigner: CoreWindowAssigner::Hopping(SlidingWindowAssigner::from_millis(
+                size_ms, slide_ms,
+            )),
             windows: BTreeMap::new(),
             session_groups: HashMap::new(),
             agg_specs,
@@ -1419,11 +1351,7 @@ mod tests {
         let mut state = make_core_window_state(1000);
 
         // Two events in window [0, 1000)
-        let batch1 = make_pre_agg_batch(
-            vec!["AAPL", "AAPL"],
-            vec![10, 20],
-            vec![100, 500],
-        );
+        let batch1 = make_pre_agg_batch(vec!["AAPL", "AAPL"], vec![10, 20], vec![100, 500]);
         state.update_batch(&batch1).unwrap();
 
         // One more event in same window
@@ -1438,15 +1366,27 @@ mod tests {
         assert_eq!(result.num_rows(), 1);
 
         // Check window_start = 0
-        let ws = result.column(0).as_any().downcast_ref::<Int64Array>().unwrap();
+        let ws = result
+            .column(0)
+            .as_any()
+            .downcast_ref::<Int64Array>()
+            .unwrap();
         assert_eq!(ws.value(0), 0);
 
         // Check window_end = 1000
-        let we = result.column(1).as_any().downcast_ref::<Int64Array>().unwrap();
+        let we = result
+            .column(1)
+            .as_any()
+            .downcast_ref::<Int64Array>()
+            .unwrap();
         assert_eq!(we.value(0), 1000);
 
         // Check SUM = 10 + 20 + 30 = 60
-        let total = result.column(3).as_any().downcast_ref::<Int64Array>().unwrap();
+        let total = result
+            .column(3)
+            .as_any()
+            .downcast_ref::<Int64Array>()
+            .unwrap();
         assert_eq!(total.value(0), 60);
     }
 
@@ -1486,23 +1426,27 @@ mod tests {
         let mut state = make_core_window_state(1000);
 
         // Events in three windows
-        let batch = make_pre_agg_batch(
-            vec!["A", "A", "A"],
-            vec![1, 2, 3],
-            vec![100, 1100, 2100],
-        );
+        let batch = make_pre_agg_batch(vec!["A", "A", "A"], vec![1, 2, 3], vec![100, 1100, 2100]);
         state.update_batch(&batch).unwrap();
 
         // Watermark at 1500 → only window [0, 1000) closes
         let batches = state.close_windows(1500).unwrap();
         assert_eq!(batches.len(), 1);
-        let ws = batches[0].column(0).as_any().downcast_ref::<Int64Array>().unwrap();
+        let ws = batches[0]
+            .column(0)
+            .as_any()
+            .downcast_ref::<Int64Array>()
+            .unwrap();
         assert_eq!(ws.value(0), 0);
 
         // Watermark at 2000 → window [1000, 2000) closes
         let batches = state.close_windows(2000).unwrap();
         assert_eq!(batches.len(), 1);
-        let ws = batches[0].column(0).as_any().downcast_ref::<Int64Array>().unwrap();
+        let ws = batches[0]
+            .column(0)
+            .as_any()
+            .downcast_ref::<Int64Array>()
+            .unwrap();
         assert_eq!(ws.value(0), 1000);
 
         // Watermark at 2500 → nothing to close (window [2000,3000) still open)
@@ -1525,18 +1469,9 @@ mod tests {
             sql_emit_to_core(&SqlEmit::OnWindowClose),
             CoreEmit::OnWindowClose
         );
-        assert_eq!(
-            sql_emit_to_core(&SqlEmit::OnUpdate),
-            CoreEmit::OnUpdate
-        );
-        assert_eq!(
-            sql_emit_to_core(&SqlEmit::Changelog),
-            CoreEmit::Changelog
-        );
-        assert_eq!(
-            sql_emit_to_core(&SqlEmit::FinalOnly),
-            CoreEmit::Final
-        );
+        assert_eq!(sql_emit_to_core(&SqlEmit::OnUpdate), CoreEmit::OnUpdate);
+        assert_eq!(sql_emit_to_core(&SqlEmit::Changelog), CoreEmit::Changelog);
+        assert_eq!(sql_emit_to_core(&SqlEmit::FinalOnly), CoreEmit::Final);
 
         // EmitClause → Core via bridge
         assert_eq!(
@@ -1582,13 +1517,21 @@ mod tests {
         let result = &batches[0];
         assert_eq!(result.num_rows(), 1); // Only AAPL in window [0,1000)
 
-        let total = result.column(3).as_any().downcast_ref::<Int64Array>().unwrap();
+        let total = result
+            .column(3)
+            .as_any()
+            .downcast_ref::<Int64Array>()
+            .unwrap();
         assert_eq!(total.value(0), 30, "SUM should be 10+20=30");
 
         // Close second window
         let batches = state2.close_windows(2000).unwrap();
         assert_eq!(batches.len(), 1);
-        let total2 = batches[0].column(3).as_any().downcast_ref::<Int64Array>().unwrap();
+        let total2 = batches[0]
+            .column(3)
+            .as_any()
+            .downcast_ref::<Int64Array>()
+            .unwrap();
         assert_eq!(total2.value(0), 100, "SUM should be 100");
     }
 
@@ -1622,8 +1565,7 @@ mod tests {
             Field::new("price", DataType::Float64, false),
             Field::new("ts", DataType::Int64, false),
         ]));
-        let mem =
-            datafusion::datasource::MemTable::try_new(schema, vec![vec![]]).unwrap();
+        let mem = datafusion::datasource::MemTable::try_new(schema, vec![vec![]]).unwrap();
         ctx.register_table("trades", Arc::new(mem)).unwrap();
 
         let window_config = WindowOperatorConfig {
@@ -1657,8 +1599,7 @@ mod tests {
             Field::new("price", DataType::Float64, false),
             Field::new("ts", DataType::Int64, false),
         ]));
-        let mem =
-            datafusion::datasource::MemTable::try_new(schema, vec![vec![]]).unwrap();
+        let mem = datafusion::datasource::MemTable::try_new(schema, vec![vec![]]).unwrap();
         ctx.register_table("trades", Arc::new(mem)).unwrap();
 
         let window_config = WindowOperatorConfig {
@@ -1692,8 +1633,7 @@ mod tests {
             Field::new("price", DataType::Float64, false),
             Field::new("ts", DataType::Int64, false),
         ]));
-        let mem =
-            datafusion::datasource::MemTable::try_new(schema, vec![vec![]]).unwrap();
+        let mem = datafusion::datasource::MemTable::try_new(schema, vec![vec![]]).unwrap();
         ctx.register_table("trades", Arc::new(mem)).unwrap();
 
         let window_config = WindowOperatorConfig {
@@ -1723,11 +1663,7 @@ mod tests {
 
         // ts=1000 → windows [-2000,2000) and [0,4000)
         // ts=3000 → windows [0,4000) and [2000,6000)
-        let batch = make_pre_agg_batch(
-            vec!["A", "A"],
-            vec![10, 20],
-            vec![1000, 3000],
-        );
+        let batch = make_pre_agg_batch(vec!["A", "A"], vec![10, 20], vec![1000, 3000]);
         state.update_batch(&batch).unwrap();
 
         // Close everything up to watermark 6000
@@ -1737,8 +1673,7 @@ mod tests {
         let mut results: Vec<(i64, i64)> = Vec::new();
         for b in &batches {
             let ws = b.column(0).as_any().downcast_ref::<Int64Array>().unwrap();
-            let totals =
-                b.column(3).as_any().downcast_ref::<Int64Array>().unwrap();
+            let totals = b.column(3).as_any().downcast_ref::<Int64Array>().unwrap();
             for i in 0..b.num_rows() {
                 results.push((ws.value(i), totals.value(i)));
             }
@@ -1767,16 +1702,10 @@ mod tests {
         let mut results: Vec<(i64, String, i64)> = Vec::new();
         for b in &batches {
             let ws = b.column(0).as_any().downcast_ref::<Int64Array>().unwrap();
-            let syms =
-                b.column(2).as_any().downcast_ref::<StringArray>().unwrap();
-            let totals =
-                b.column(3).as_any().downcast_ref::<Int64Array>().unwrap();
+            let syms = b.column(2).as_any().downcast_ref::<StringArray>().unwrap();
+            let totals = b.column(3).as_any().downcast_ref::<Int64Array>().unwrap();
             for i in 0..b.num_rows() {
-                results.push((
-                    ws.value(i),
-                    syms.value(i).to_string(),
-                    totals.value(i),
-                ));
+                results.push((ws.value(i), syms.value(i).to_string(), totals.value(i)));
             }
         }
         results.sort();
@@ -1795,11 +1724,7 @@ mod tests {
     fn test_hopping_watermark_ordering() {
         let mut state = make_hopping_core_window_state(4000, 2000);
 
-        let batch = make_pre_agg_batch(
-            vec!["A", "A"],
-            vec![10, 20],
-            vec![1000, 3000],
-        );
+        let batch = make_pre_agg_batch(vec!["A", "A"], vec![10, 20], vec![1000, 3000]);
         state.update_batch(&batch).unwrap();
 
         // Watermark at 2000 → only window [-2000, 2000) closes
@@ -1915,11 +1840,7 @@ mod tests {
         let mut state = make_session_core_window_state(3000);
 
         // First two events create separate sessions
-        let batch1 = make_pre_agg_batch(
-            vec!["A", "A"],
-            vec![10, 20],
-            vec![1000, 5000],
-        );
+        let batch1 = make_pre_agg_batch(vec!["A", "A"], vec![10, 20], vec![1000, 5000]);
         state.update_batch(&batch1).unwrap();
         // Session 1: [1000, 4000), Session 2: [5000, 8000)
 
@@ -1990,13 +1911,7 @@ mod tests {
             .unwrap();
 
         let mut results: Vec<(String, i64, i64)> = (0..result.num_rows())
-            .map(|i| {
-                (
-                    syms.value(i).to_string(),
-                    ws.value(i),
-                    totals.value(i),
-                )
-            })
+            .map(|i| (syms.value(i).to_string(), ws.value(i), totals.value(i)))
             .collect();
         results.sort();
 
@@ -2010,11 +1925,7 @@ mod tests {
     fn test_hopping_checkpoint_roundtrip() {
         let mut state = make_hopping_core_window_state(4000, 2000);
 
-        let batch = make_pre_agg_batch(
-            vec!["A", "A"],
-            vec![10, 20],
-            vec![1000, 3000],
-        );
+        let batch = make_pre_agg_batch(vec!["A", "A"], vec![10, 20], vec![1000, 3000]);
         state.update_batch(&batch).unwrap();
 
         let cp = state.checkpoint_windows().unwrap();
@@ -2029,8 +1940,7 @@ mod tests {
         let mut results: Vec<(i64, i64)> = Vec::new();
         for b in &batches {
             let ws = b.column(0).as_any().downcast_ref::<Int64Array>().unwrap();
-            let totals =
-                b.column(3).as_any().downcast_ref::<Int64Array>().unwrap();
+            let totals = b.column(3).as_any().downcast_ref::<Int64Array>().unwrap();
             for i in 0..b.num_rows() {
                 results.push((ws.value(i), totals.value(i)));
             }
@@ -2044,11 +1954,7 @@ mod tests {
         let mut state = make_session_core_window_state(3000);
 
         // Create two sessions then merge them
-        let batch1 = make_pre_agg_batch(
-            vec!["A", "A"],
-            vec![10, 20],
-            vec![1000, 5000],
-        );
+        let batch1 = make_pre_agg_batch(vec!["A", "A"], vec![10, 20], vec![1000, 5000]);
         state.update_batch(&batch1).unwrap();
 
         let batch2 = make_pre_agg_batch(vec!["A"], vec![30], vec![3500]);
@@ -2072,7 +1978,11 @@ mod tests {
             .as_any()
             .downcast_ref::<Int64Array>()
             .unwrap();
-        assert_eq!(total.value(0), 60, "SUM should be 10+20+30=60 after restore");
+        assert_eq!(
+            total.value(0),
+            60,
+            "SUM should be 10+20+30=60 after restore"
+        );
     }
 
     #[tokio::test]
@@ -2099,8 +2009,7 @@ mod tests {
         )
         .unwrap();
         let mem_table =
-            datafusion::datasource::MemTable::try_new(schema, vec![vec![batch]])
-                .unwrap();
+            datafusion::datasource::MemTable::try_new(schema, vec![vec![batch]]).unwrap();
         ctx.register_table("events", Arc::new(mem_table)).unwrap();
 
         let config = laminar_sql::translator::WindowOperatorConfig {

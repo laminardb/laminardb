@@ -64,16 +64,15 @@ pub(crate) fn scalar_to_json(sv: &ScalarValue) -> serde_json::Value {
         }
         ScalarValue::Float32(Some(f)) => json!({"t": "F64", "v": f64::from(*f)}),
         ScalarValue::Float64(Some(f)) => json!({"t": "F64", "v": f}),
-        ScalarValue::Utf8(None)
-        | ScalarValue::LargeUtf8(None)
-        | ScalarValue::Utf8View(None) => json!({"t": "S", "v": null}),
+        ScalarValue::Utf8(None) | ScalarValue::LargeUtf8(None) | ScalarValue::Utf8View(None) => {
+            json!({"t": "S", "v": null})
+        }
         ScalarValue::Utf8(Some(s))
         | ScalarValue::LargeUtf8(Some(s))
         | ScalarValue::Utf8View(Some(s)) => json!({"t": "S", "v": s}),
         ScalarValue::List(arr) => {
             use arrow::array::Array;
-            let list_arr: Option<&arrow::array::ListArray> =
-                arr.as_any().downcast_ref();
+            let list_arr: Option<&arrow::array::ListArray> = arr.as_any().downcast_ref();
             match list_arr {
                 Some(list) if !list.is_empty() => {
                     let values = list.value(0);
@@ -126,8 +125,7 @@ pub(crate) fn json_to_scalar(v: &serde_json::Value) -> Result<ScalarValue, DbErr
             let items = val
                 .and_then(|v| v.as_array())
                 .ok_or_else(|| DbError::Pipeline("expected array for List scalar".to_string()))?;
-            let scalars: Result<Vec<ScalarValue>, _> =
-                items.iter().map(json_to_scalar).collect();
+            let scalars: Result<Vec<ScalarValue>, _> = items.iter().map(json_to_scalar).collect();
             let scalars = scalars?;
             if scalars.is_empty() {
                 Ok(ScalarValue::List(Arc::new(
@@ -306,10 +304,7 @@ impl IncrementalAggState {
     /// plan of the given SQL query. Returns `None` if the query does not
     /// contain an `Aggregate` node (not an aggregation query).
     #[allow(clippy::too_many_lines)]
-    pub async fn try_from_sql(
-        ctx: &SessionContext,
-        sql: &str,
-    ) -> Result<Option<Self>, DbError> {
+    pub async fn try_from_sql(ctx: &SessionContext, sql: &str) -> Result<Option<Self>, DbError> {
         let df = ctx
             .sql(sql)
             .await
@@ -365,13 +360,10 @@ impl IncrementalAggState {
         // expression with an alias so the source query evaluates it.
         for (i, group_expr) in group_exprs.iter().enumerate() {
             if let datafusion_expr::Expr::Column(col) = group_expr {
-                pre_agg_select_items
-                    .push(format!("\"{}\"", col.name));
+                pre_agg_select_items.push(format!("\"{}\"", col.name));
             } else {
                 let group_sql = expr_to_sql(group_expr);
-                pre_agg_select_items.push(format!(
-                    "{group_sql} AS \"__group_{i}\""
-                ));
+                pre_agg_select_items.push(format!("{group_sql} AS \"__group_{i}\""));
             }
         }
 
@@ -401,8 +393,7 @@ impl IncrementalAggState {
                     // COUNT(*) — no input columns needed, pass a dummy boolean
                     let col_idx = next_col_idx;
                     next_col_idx += 1;
-                    pre_agg_select_items
-                        .push(format!("TRUE AS \"__agg_input_{col_idx}\""));
+                    pre_agg_select_items.push(format!("TRUE AS \"__agg_input_{col_idx}\""));
                     input_col_indices.push(col_idx);
                     input_types.push(DataType::Boolean);
                 } else {
@@ -420,35 +411,29 @@ impl IncrementalAggState {
                                 "CASE WHEN {filter_sql} THEN {expr_sql} ELSE NULL END AS \"__agg_input_{col_idx}\""
                             ));
                         } else {
-                            pre_agg_select_items.push(format!(
-                                "{expr_sql} AS \"__agg_input_{col_idx}\""
-                            ));
+                            pre_agg_select_items
+                                .push(format!("{expr_sql} AS \"__agg_input_{col_idx}\""));
                         }
 
                         input_col_indices.push(col_idx);
-                        let dt = resolve_expr_type(
-                            arg_expr,
-                            &input_schema,
-                            agg_field.data_type(),
-                        );
+                        let dt = resolve_expr_type(arg_expr, &input_schema, agg_field.data_type());
                         input_types.push(dt);
                     }
                 }
 
                 // Add a boolean filter column for masking rows
                 // in process_batch when FILTER clause is present
-                let filter_col_index =
-                    if let Some(filter_expr) = &agg_func.params.filter {
-                        let col_idx = next_col_idx;
-                        next_col_idx += 1;
-                        let filter_sql = expr_to_sql(filter_expr);
-                        pre_agg_select_items.push(format!(
+                let filter_col_index = if let Some(filter_expr) = &agg_func.params.filter {
+                    let col_idx = next_col_idx;
+                    next_col_idx += 1;
+                    let filter_sql = expr_to_sql(filter_expr);
+                    pre_agg_select_items.push(format!(
                             "CASE WHEN {filter_sql} THEN TRUE ELSE FALSE END AS \"__agg_filter_{col_idx}\""
                         ));
-                        Some(col_idx)
-                    } else {
-                        None
-                    };
+                    Some(col_idx)
+                } else {
+                    None
+                };
 
                 let return_type = udf
                     .return_type(&input_types)
@@ -536,7 +521,8 @@ impl IncrementalAggState {
         let converter = arrow::row::RowConverter::new(sort_fields)
             .map_err(|e| DbError::Pipeline(format!("row converter: {e}")))?;
 
-        let rows = converter.convert_columns(&group_cols)
+        let rows = converter
+            .convert_columns(&group_cols)
             .map_err(|e| DbError::Pipeline(format!("row conversion: {e}")))?;
 
         let estimated_groups = (batch.num_rows() / 4).max(16);
@@ -572,9 +558,7 @@ impl IncrementalAggState {
                 continue;
             };
 
-            Self::update_group_accumulators(
-                accs, batch, indices, &self.agg_specs,
-            )?;
+            Self::update_group_accumulators(accs, batch, indices, &self.agg_specs)?;
         }
 
         Ok(())
@@ -630,8 +614,7 @@ impl IncrementalAggState {
         let index_array = arrow::array::UInt32Array::from(indices.to_vec());
 
         for (i, spec) in agg_specs.iter().enumerate() {
-            let mut input_arrays: Vec<ArrayRef> =
-                Vec::with_capacity(spec.input_col_indices.len());
+            let mut input_arrays: Vec<ArrayRef> = Vec::with_capacity(spec.input_col_indices.len());
             for &col_idx in &spec.input_col_indices {
                 let arr = compute::take(batch.column(col_idx), &index_array, None)
                     .map_err(|e| DbError::Pipeline(format!("array take failed: {e}")))?;
@@ -639,26 +622,26 @@ impl IncrementalAggState {
             }
 
             if let Some(filter_idx) = spec.filter_col_index {
-                let filter_arr =
-                    compute::take(batch.column(filter_idx), &index_array, None)
-                        .map_err(|e| DbError::Pipeline(format!("filter take: {e}")))?;
+                let filter_arr = compute::take(batch.column(filter_idx), &index_array, None)
+                    .map_err(|e| DbError::Pipeline(format!("filter take: {e}")))?;
                 if let Some(mask) = filter_arr
                     .as_any()
                     .downcast_ref::<arrow::array::BooleanArray>()
                 {
                     let mut filtered = Vec::with_capacity(input_arrays.len());
                     for arr in &input_arrays {
-                        filtered.push(compute::filter(arr, mask).map_err(|e| {
-                            DbError::Pipeline(format!("filter apply: {e}"))
-                        })?);
+                        filtered.push(
+                            compute::filter(arr, mask)
+                                .map_err(|e| DbError::Pipeline(format!("filter apply: {e}")))?,
+                        );
                     }
                     input_arrays = filtered;
                 }
             }
 
-            accs[i].update_batch(&input_arrays).map_err(|e| {
-                DbError::Pipeline(format!("accumulator update: {e}"))
-            })?;
+            accs[i]
+                .update_batch(&input_arrays)
+                .map_err(|e| DbError::Pipeline(format!("accumulator update: {e}")))?;
         }
         Ok(())
     }
@@ -676,14 +659,10 @@ impl IncrementalAggState {
 
         let mut group_arrays: Vec<ArrayRef> = Vec::with_capacity(self.num_group_cols);
         for (col_idx, dt) in self.group_types.iter().enumerate() {
-            let scalars: Vec<ScalarValue> = self
-                .groups
-                .keys()
-                .map(|key| key[col_idx].clone())
-                .collect();
-            let array = ScalarValue::iter_to_array(scalars).map_err(|e| {
-                DbError::Pipeline(format!("group key array build: {e}"))
-            })?;
+            let scalars: Vec<ScalarValue> =
+                self.groups.keys().map(|key| key[col_idx].clone()).collect();
+            let array = ScalarValue::iter_to_array(scalars)
+                .map_err(|e| DbError::Pipeline(format!("group key array build: {e}")))?;
             if array.data_type() == dt {
                 group_arrays.push(array);
             } else {
@@ -692,26 +671,21 @@ impl IncrementalAggState {
             }
         }
 
-        let mut agg_arrays: Vec<ArrayRef> =
-            Vec::with_capacity(self.agg_specs.len());
+        let mut agg_arrays: Vec<ArrayRef> = Vec::with_capacity(self.agg_specs.len());
         for (agg_idx, spec) in self.agg_specs.iter().enumerate() {
             let mut scalars: Vec<ScalarValue> = Vec::with_capacity(num_rows);
             for accs in self.groups.values_mut() {
-                let sv = accs[agg_idx].evaluate().map_err(|e| {
-                    DbError::Pipeline(format!("accumulator evaluate: {e}"))
-                })?;
+                let sv = accs[agg_idx]
+                    .evaluate()
+                    .map_err(|e| DbError::Pipeline(format!("accumulator evaluate: {e}")))?;
                 scalars.push(sv);
             }
-            let array =
-                ScalarValue::iter_to_array(scalars).map_err(|e| {
-                    DbError::Pipeline(format!("agg result array build: {e}"))
-                })?;
+            let array = ScalarValue::iter_to_array(scalars)
+                .map_err(|e| DbError::Pipeline(format!("agg result array build: {e}")))?;
             if array.data_type() == &spec.return_type {
                 agg_arrays.push(array);
             } else {
-                let casted =
-                    arrow::compute::cast(&array, &spec.return_type)
-                        .unwrap_or(array);
+                let casted = arrow::compute::cast(&array, &spec.return_type).unwrap_or(array);
                 agg_arrays.push(casted);
             }
         }
@@ -719,11 +693,8 @@ impl IncrementalAggState {
         let mut all_arrays = group_arrays;
         all_arrays.extend(agg_arrays);
 
-        let batch =
-            RecordBatch::try_new(Arc::clone(&self.output_schema), all_arrays)
-                .map_err(|e| {
-                    DbError::Pipeline(format!("result batch build: {e}"))
-                })?;
+        let batch = RecordBatch::try_new(Arc::clone(&self.output_schema), all_arrays)
+            .map_err(|e| DbError::Pipeline(format!("result batch build: {e}")))?;
 
         Ok(vec![batch])
     }
@@ -757,9 +728,9 @@ impl IncrementalAggState {
             let key_json: Vec<serde_json::Value> = key.iter().map(scalar_to_json).collect();
             let mut acc_states = Vec::with_capacity(accs.len());
             for acc in accs {
-                let state = acc.state().map_err(|e| {
-                    DbError::Pipeline(format!("accumulator state: {e}"))
-                })?;
+                let state = acc
+                    .state()
+                    .map_err(|e| DbError::Pipeline(format!("accumulator state: {e}")))?;
                 acc_states.push(state.iter().map(scalar_to_json).collect());
             }
             groups.push(GroupCheckpoint {
@@ -791,8 +762,7 @@ impl IncrementalAggState {
         }
         self.groups.clear();
         for gc in &checkpoint.groups {
-            let key: Result<Vec<ScalarValue>, _> =
-                gc.key.iter().map(json_to_scalar).collect();
+            let key: Result<Vec<ScalarValue>, _> = gc.key.iter().map(json_to_scalar).collect();
             let key = key?;
             let mut accs = Vec::with_capacity(self.agg_specs.len());
             for (i, spec) in self.agg_specs.iter().enumerate() {
@@ -803,13 +773,13 @@ impl IncrementalAggState {
                     let state_scalars = state_scalars?;
                     let arrays: Vec<ArrayRef> = state_scalars
                         .iter()
-                        .map(|sv| sv.to_array().map_err(|e| {
-                            DbError::Pipeline(format!("scalar to array: {e}"))
-                        }))
+                        .map(|sv| {
+                            sv.to_array()
+                                .map_err(|e| DbError::Pipeline(format!("scalar to array: {e}")))
+                        })
                         .collect::<Result<_, _>>()?;
-                    acc.merge_batch(&arrays).map_err(|e| {
-                        DbError::Pipeline(format!("accumulator merge: {e}"))
-                    })?;
+                    acc.merge_batch(&arrays)
+                        .map_err(|e| DbError::Pipeline(format!("accumulator merge: {e}")))?;
                 }
                 accs.push(acc);
             }
@@ -844,8 +814,7 @@ fn find_aggregate_inner(
     match plan {
         LogicalPlan::Aggregate(agg) => {
             let schema = Arc::new(agg.schema.as_arrow().clone());
-            let input_schema =
-                Arc::new(agg.input.schema().as_arrow().clone());
+            let input_schema = Arc::new(agg.input.schema().as_arrow().clone());
             Some(AggregateInfo {
                 group_exprs: agg.group_expr.clone(),
                 aggr_exprs: agg.aggr_expr.clone(),
@@ -857,31 +826,19 @@ fn find_aggregate_inner(
         // A Filter directly above an Aggregate is a HAVING clause
         LogicalPlan::Filter(filter) => {
             if matches!(&*filter.input, LogicalPlan::Aggregate(_)) {
-                find_aggregate_inner(
-                    &filter.input,
-                    Some(&filter.predicate),
-                )
+                find_aggregate_inner(&filter.input, Some(&filter.predicate))
             } else {
                 find_aggregate_inner(&filter.input, None)
             }
         }
         // Walk through wrappers that don't change aggregation semantics
-        LogicalPlan::Projection(proj) => {
-            find_aggregate_inner(&proj.input, None)
-        }
-        LogicalPlan::Sort(sort) => {
-            find_aggregate_inner(&sort.input, None)
-        }
-        LogicalPlan::Limit(limit) => {
-            find_aggregate_inner(&limit.input, None)
-        }
-        LogicalPlan::SubqueryAlias(alias) => {
-            find_aggregate_inner(&alias.input, None)
-        }
+        LogicalPlan::Projection(proj) => find_aggregate_inner(&proj.input, None),
+        LogicalPlan::Sort(sort) => find_aggregate_inner(&sort.input, None),
+        LogicalPlan::Limit(limit) => find_aggregate_inner(&limit.input, None),
+        LogicalPlan::SubqueryAlias(alias) => find_aggregate_inner(&alias.input, None),
         _ => {
             for input in plan.inputs() {
-                if let Some(result) = find_aggregate_inner(input, None)
-                {
+                if let Some(result) = find_aggregate_inner(input, None) {
                     return Some(result);
                 }
             }
@@ -903,9 +860,7 @@ fn scalar_value_to_sql(sv: &ScalarValue) -> String {
         | ScalarValue::Utf8View(None)
         | ScalarValue::Null
         | ScalarValue::Boolean(None) => "NULL".to_string(),
-        ScalarValue::Boolean(Some(b)) => {
-            if *b { "TRUE" } else { "FALSE" }.to_string()
-        }
+        ScalarValue::Boolean(Some(b)) => if *b { "TRUE" } else { "FALSE" }.to_string(),
         ScalarValue::IntervalDayTime(Some(v)) => {
             let mut parts = Vec::new();
             if v.days != 0 {
@@ -1007,14 +962,12 @@ pub(crate) fn expr_to_sql(expr: &datafusion_expr::Expr) -> String {
             format!("TRY_CAST({inner} AS {})", cast.data_type)
         }
         Expr::ScalarFunction(func) => {
-            let args: Vec<String> =
-                func.args.iter().map(expr_to_sql).collect();
+            let args: Vec<String> = func.args.iter().map(expr_to_sql).collect();
             format!("{}({})", func.func.name(), args.join(", "))
         }
         Expr::AggregateFunction(agg) => {
             let name = agg.func.name();
-            let args: Vec<String> =
-                agg.params.args.iter().map(expr_to_sql).collect();
+            let args: Vec<String> = agg.params.args.iter().map(expr_to_sql).collect();
             if agg.params.distinct {
                 format!("{name}(DISTINCT {})", args.join(", "))
             } else {
@@ -1051,8 +1004,7 @@ pub(crate) fn expr_to_sql(expr: &datafusion_expr::Expr) -> String {
         }
         Expr::InList(in_list) => {
             let e = expr_to_sql(&in_list.expr);
-            let items: Vec<String> =
-                in_list.list.iter().map(expr_to_sql).collect();
+            let items: Vec<String> = in_list.list.iter().map(expr_to_sql).collect();
             let not = if in_list.negated { " NOT" } else { "" };
             format!("({e}{not} IN ({}))", items.join(", "))
         }
@@ -1104,25 +1056,20 @@ fn extract_clauses_ast(sql: &str) -> Result<SqlClauses, DbError> {
     use sqlparser::parser::Parser;
 
     let dialect = GenericDialect {};
-    let stmts = Parser::parse_sql(&dialect, sql).map_err(|e| {
-        DbError::Pipeline(format!("SQL parse error: {e}"))
-    })?;
+    let stmts = Parser::parse_sql(&dialect, sql)
+        .map_err(|e| DbError::Pipeline(format!("SQL parse error: {e}")))?;
 
-    let stmt = stmts.into_iter().next().ok_or_else(|| {
-        DbError::Pipeline("empty SQL statement".to_string())
-    })?;
+    let stmt = stmts
+        .into_iter()
+        .next()
+        .ok_or_else(|| DbError::Pipeline("empty SQL statement".to_string()))?;
 
     let sqlparser::ast::Statement::Query(query) = stmt else {
-        return Err(DbError::Pipeline(
-            "expected SELECT statement".to_string(),
-        ));
+        return Err(DbError::Pipeline("expected SELECT statement".to_string()));
     };
 
-    let sqlparser::ast::SetExpr::Select(select) = *query.body
-    else {
-        return Err(DbError::Pipeline(
-            "expected simple SELECT".to_string(),
-        ));
+    let sqlparser::ast::SetExpr::Select(select) = *query.body else {
+        return Err(DbError::Pipeline("expected simple SELECT".to_string()));
     };
 
     let from_clause = select
@@ -1152,8 +1099,7 @@ fn extract_from_clause_heuristic(sql: &str) -> String {
         return String::new();
     };
     let rest = &sql[start..];
-    let end_keywords =
-        [" WHERE ", " GROUP ", " ORDER ", " LIMIT ", " HAVING "];
+    let end_keywords = [" WHERE ", " GROUP ", " ORDER ", " LIMIT ", " HAVING "];
     let end = end_keywords
         .iter()
         .filter_map(|kw| rest.to_uppercase().find(kw))
@@ -1173,9 +1119,7 @@ fn extract_where_clause_heuristic(sql: &str) -> String {
     let end_keywords = [" GROUP ", " ORDER ", " LIMIT ", " HAVING "];
     let end = end_keywords
         .iter()
-        .filter_map(|kw| {
-            rest[7..].to_uppercase().find(kw).map(|p| p + 7)
-        })
+        .filter_map(|kw| rest[7..].to_uppercase().find(kw).map(|p| p + 7))
         .min()
         .unwrap_or(rest.len());
     format!(" {}", rest[..end].trim())
@@ -1192,10 +1136,7 @@ pub(crate) fn resolve_expr_type(
     match expr {
         datafusion_expr::Expr::Column(col) => input_schema
             .field_with_name(&col.name)
-            .map_or_else(
-                |_| fallback_type.clone(),
-                |f| f.data_type().clone(),
-            ),
+            .map_or_else(|_| fallback_type.clone(), |f| f.data_type().clone()),
         datafusion_expr::Expr::Literal(sv, _) => sv.data_type(),
         datafusion_expr::Expr::Cast(cast) => cast.data_type.clone(),
         datafusion_expr::Expr::TryCast(cast) => cast.data_type.clone(),
@@ -1210,9 +1151,7 @@ pub(crate) fn resolve_expr_type(
             let arg_types: Vec<DataType> = func
                 .args
                 .iter()
-                .map(|a| {
-                    resolve_expr_type(a, input_schema, fallback_type)
-                })
+                .map(|a| resolve_expr_type(a, input_schema, fallback_type))
                 .collect();
             func.func
                 .return_type(&arg_types)
@@ -1262,9 +1201,8 @@ mod tests {
     #[test]
     fn test_interval_month_day_nano() {
         use arrow::datatypes::IntervalMonthDayNano;
-        let sv = ScalarValue::IntervalMonthDayNano(Some(
-            IntervalMonthDayNano::new(2, 1, 3_000_000_000),
-        ));
+        let sv =
+            ScalarValue::IntervalMonthDayNano(Some(IntervalMonthDayNano::new(2, 1, 3_000_000_000)));
         let sql = scalar_value_to_sql(&sv);
         assert_eq!(sql, "INTERVAL '2 months 1 days 3 seconds'");
     }
@@ -1287,8 +1225,7 @@ mod tests {
         )
         .unwrap();
         let mem_table =
-            datafusion::datasource::MemTable::try_new(schema, vec![vec![batch]])
-                .unwrap();
+            datafusion::datasource::MemTable::try_new(schema, vec![vec![batch]]).unwrap();
         ctx.register_table("events", Arc::new(mem_table)).unwrap();
 
         // SUM(a)/SUM(b) collapses 2 aggregates into 1 derived column →
@@ -1307,18 +1244,14 @@ mod tests {
 
     #[test]
     fn test_extract_clauses_simple() {
-        let c = extract_clauses(
-            "SELECT a, SUM(b) FROM trades GROUP BY a",
-        );
+        let c = extract_clauses("SELECT a, SUM(b) FROM trades GROUP BY a");
         assert_eq!(c.from_clause, "trades");
         assert!(c.where_clause.is_empty());
     }
 
     #[test]
     fn test_extract_clauses_with_where() {
-        let c = extract_clauses(
-            "SELECT * FROM events WHERE x > 1 GROUP BY y",
-        );
+        let c = extract_clauses("SELECT * FROM events WHERE x > 1 GROUP BY y");
         assert_eq!(c.from_clause, "events");
         assert!(
             c.where_clause.contains("WHERE"),
@@ -1334,9 +1267,7 @@ mod tests {
 
     #[test]
     fn test_extract_clauses_with_join() {
-        let c = extract_clauses(
-            "SELECT * FROM events e JOIN dim d ON e.id = d.id",
-        );
+        let c = extract_clauses("SELECT * FROM events e JOIN dim d ON e.id = d.id");
         // AST preserves join structure
         assert!(
             c.from_clause.contains("events"),
@@ -1358,9 +1289,8 @@ mod tests {
     #[test]
     fn test_extract_clauses_keyword_in_string_literal() {
         // This would break heuristic extraction but works with AST
-        let c = extract_clauses(
-            "SELECT * FROM logs WHERE msg = 'joined GROUP chat' GROUP BY user_id",
-        );
+        let c =
+            extract_clauses("SELECT * FROM logs WHERE msg = 'joined GROUP chat' GROUP BY user_id");
         assert_eq!(c.from_clause, "logs");
         // WHERE should include the full predicate including the string
         assert!(
@@ -1372,8 +1302,7 @@ mod tests {
 
     #[test]
     fn test_extract_clauses_no_where() {
-        let c =
-            extract_clauses("SELECT * FROM events GROUP BY y");
+        let c = extract_clauses("SELECT * FROM events GROUP BY y");
         assert_eq!(c.from_clause, "events");
         assert!(c.where_clause.is_empty());
     }
@@ -1382,25 +1311,19 @@ mod tests {
     async fn test_try_from_sql_non_aggregate() {
         let ctx = laminar_sql::create_session_context();
         // Register a dummy table
-        let schema = Arc::new(Schema::new(vec![
-            Field::new("id", DataType::Int64, false),
-        ]));
+        let schema = Arc::new(Schema::new(vec![Field::new("id", DataType::Int64, false)]));
         let batch = RecordBatch::try_new(
             Arc::clone(&schema),
             vec![Arc::new(arrow::array::Int64Array::from(vec![1]))],
         )
         .unwrap();
         let mem_table =
-            datafusion::datasource::MemTable::try_new(schema, vec![vec![batch]])
-                .unwrap();
+            datafusion::datasource::MemTable::try_new(schema, vec![vec![batch]]).unwrap();
         ctx.register_table("events", Arc::new(mem_table)).unwrap();
 
-        let result = IncrementalAggState::try_from_sql(
-            &ctx,
-            "SELECT * FROM events",
-        )
-        .await
-        .unwrap();
+        let result = IncrementalAggState::try_from_sql(&ctx, "SELECT * FROM events")
+            .await
+            .unwrap();
         assert!(result.is_none(), "Non-aggregate query should return None");
     }
 
@@ -1420,8 +1343,7 @@ mod tests {
         )
         .unwrap();
         let mem_table =
-            datafusion::datasource::MemTable::try_new(schema, vec![vec![batch]])
-                .unwrap();
+            datafusion::datasource::MemTable::try_new(schema, vec![vec![batch]]).unwrap();
         ctx.register_table("events", Arc::new(mem_table)).unwrap();
 
         let result = IncrementalAggState::try_from_sql(
@@ -1430,10 +1352,7 @@ mod tests {
         )
         .await
         .unwrap();
-        assert!(
-            result.is_some(),
-            "Aggregate query should return Some"
-        );
+        assert!(result.is_some(), "Aggregate query should return Some");
         let state = result.unwrap();
         assert_eq!(state.num_group_cols, 1);
         assert_eq!(state.agg_specs.len(), 1);
@@ -1457,11 +1376,9 @@ mod tests {
             ],
         )
         .unwrap();
-        let mem_table = datafusion::datasource::MemTable::try_new(
-            Arc::clone(&schema),
-            vec![vec![dummy_batch]],
-        )
-        .unwrap();
+        let mem_table =
+            datafusion::datasource::MemTable::try_new(Arc::clone(&schema), vec![vec![dummy_batch]])
+                .unwrap();
         ctx.register_table("events", Arc::new(mem_table)).unwrap();
 
         let mut state = IncrementalAggState::try_from_sql(
@@ -1481,9 +1398,7 @@ mod tests {
             Arc::clone(&pre_agg_schema),
             vec![
                 Arc::new(arrow::array::StringArray::from(vec!["a", "b", "a"])),
-                Arc::new(arrow::array::Float64Array::from(vec![
-                    10.0, 20.0, 30.0,
-                ])),
+                Arc::new(arrow::array::Float64Array::from(vec![10.0, 20.0, 30.0])),
             ],
         )
         .unwrap();
@@ -1543,9 +1458,7 @@ mod tests {
     }
 
     /// Helper: register a table and build an IncrementalAggState from SQL.
-    async fn setup_agg_state(
-        sql: &str,
-    ) -> (SessionContext, IncrementalAggState) {
+    async fn setup_agg_state(sql: &str) -> (SessionContext, IncrementalAggState) {
         let ctx = laminar_sql::create_session_context();
         let schema = Arc::new(Schema::new(vec![
             Field::new("name", DataType::Utf8, false),
@@ -1559,17 +1472,14 @@ mod tests {
             ],
         )
         .unwrap();
-        let mem_table = datafusion::datasource::MemTable::try_new(
-            Arc::clone(&schema),
-            vec![vec![dummy]],
-        )
-        .unwrap();
+        let mem_table =
+            datafusion::datasource::MemTable::try_new(Arc::clone(&schema), vec![vec![dummy]])
+                .unwrap();
         ctx.register_table("events", Arc::new(mem_table)).unwrap();
-        let state =
-            IncrementalAggState::try_from_sql(&ctx, sql)
-                .await
-                .unwrap()
-                .expect("expected aggregate state");
+        let state = IncrementalAggState::try_from_sql(&ctx, sql)
+            .await
+            .unwrap()
+            .expect("expected aggregate state");
         (ctx, state)
     }
 
@@ -1588,11 +1498,9 @@ mod tests {
             ],
         )
         .unwrap();
-        let mem_table = datafusion::datasource::MemTable::try_new(
-            Arc::clone(&schema),
-            vec![vec![dummy]],
-        )
-        .unwrap();
+        let mem_table =
+            datafusion::datasource::MemTable::try_new(Arc::clone(&schema), vec![vec![dummy]])
+                .unwrap();
         ctx.register_table("events", Arc::new(mem_table)).unwrap();
 
         let state = IncrementalAggState::try_from_sql(
@@ -1602,18 +1510,14 @@ mod tests {
         .await
         .unwrap()
         .expect("expected aggregate state");
-        assert!(
-            state.agg_specs[0].distinct,
-            "DISTINCT flag should be set"
-        );
+        assert!(state.agg_specs[0].distinct, "DISTINCT flag should be set");
     }
 
     #[tokio::test]
     async fn test_distinct_count_produces_correct_result() {
-        let (_, mut state) = setup_agg_state(
-            "SELECT name, COUNT(DISTINCT value) as cnt FROM events GROUP BY name",
-        )
-        .await;
+        let (_, mut state) =
+            setup_agg_state("SELECT name, COUNT(DISTINCT value) as cnt FROM events GROUP BY name")
+                .await;
 
         // Pre-agg schema: name, __agg_input_1
         let pre_agg_schema = Arc::new(Schema::new(vec![
@@ -1625,9 +1529,7 @@ mod tests {
         let batch = RecordBatch::try_new(
             Arc::clone(&pre_agg_schema),
             vec![
-                Arc::new(arrow::array::StringArray::from(vec![
-                    "a", "a", "a", "a",
-                ])),
+                Arc::new(arrow::array::StringArray::from(vec!["a", "a", "a", "a"])),
                 Arc::new(arrow::array::Float64Array::from(vec![
                     10.0, 10.0, 10.0, 20.0,
                 ])),
@@ -1649,10 +1551,9 @@ mod tests {
 
     #[tokio::test]
     async fn test_distinct_sum_produces_correct_result() {
-        let (_, mut state) = setup_agg_state(
-            "SELECT name, SUM(DISTINCT value) as total FROM events GROUP BY name",
-        )
-        .await;
+        let (_, mut state) =
+            setup_agg_state("SELECT name, SUM(DISTINCT value) as total FROM events GROUP BY name")
+                .await;
 
         let pre_agg_schema = Arc::new(Schema::new(vec![
             Field::new("name", DataType::Utf8, true),
@@ -1663,12 +1564,8 @@ mod tests {
         let batch = RecordBatch::try_new(
             Arc::clone(&pre_agg_schema),
             vec![
-                Arc::new(arrow::array::StringArray::from(vec![
-                    "a", "a", "a",
-                ])),
-                Arc::new(arrow::array::Float64Array::from(vec![
-                    10.0, 10.0, 20.0,
-                ])),
+                Arc::new(arrow::array::StringArray::from(vec!["a", "a", "a"])),
+                Arc::new(arrow::array::Float64Array::from(vec![10.0, 10.0, 20.0])),
             ],
         )
         .unwrap();
@@ -1703,11 +1600,9 @@ mod tests {
             ],
         )
         .unwrap();
-        let mem_table = datafusion::datasource::MemTable::try_new(
-            Arc::clone(&schema),
-            vec![vec![dummy]],
-        )
-        .unwrap();
+        let mem_table =
+            datafusion::datasource::MemTable::try_new(Arc::clone(&schema), vec![vec![dummy]])
+                .unwrap();
         ctx.register_table("events", Arc::new(mem_table)).unwrap();
 
         let state = IncrementalAggState::try_from_sql(
@@ -1760,17 +1655,11 @@ mod tests {
         let batch = RecordBatch::try_new(
             Arc::clone(&pre_agg_schema),
             vec![
-                Arc::new(arrow::array::StringArray::from(vec![
-                    "a", "a", "a",
-                ])),
+                Arc::new(arrow::array::StringArray::from(vec!["a", "a", "a"])),
                 // value > 0 wrapped: -5 becomes NULL, 10 stays, 20 stays
-                Arc::new(arrow::array::Float64Array::from(vec![
-                    -5.0, 10.0, 20.0,
-                ])),
+                Arc::new(arrow::array::Float64Array::from(vec![-5.0, 10.0, 20.0])),
                 // filter mask: false, true, true
-                Arc::new(arrow::array::BooleanArray::from(vec![
-                    false, true, true,
-                ])),
+                Arc::new(arrow::array::BooleanArray::from(vec![false, true, true])),
             ],
         )
         .unwrap();
@@ -1805,11 +1694,9 @@ mod tests {
             ],
         )
         .unwrap();
-        let mem_table = datafusion::datasource::MemTable::try_new(
-            Arc::clone(&schema),
-            vec![vec![dummy]],
-        )
-        .unwrap();
+        let mem_table =
+            datafusion::datasource::MemTable::try_new(Arc::clone(&schema), vec![vec![dummy]])
+                .unwrap();
         ctx.register_table("events", Arc::new(mem_table)).unwrap();
 
         let state = IncrementalAggState::try_from_sql(
@@ -1827,10 +1714,8 @@ mod tests {
 
     #[tokio::test]
     async fn test_create_accumulator_error_propagated() {
-        let (_, mut state) = setup_agg_state(
-            "SELECT name, SUM(value) as total FROM events GROUP BY name",
-        )
-        .await;
+        let (_, mut state) =
+            setup_agg_state("SELECT name, SUM(value) as total FROM events GROUP BY name").await;
 
         // Verify create_accumulator returns Ok (not panic)
         let pre_agg_schema = Arc::new(Schema::new(vec![
@@ -1866,11 +1751,9 @@ mod tests {
             ],
         )
         .unwrap();
-        let mem_table = datafusion::datasource::MemTable::try_new(
-            Arc::clone(&schema),
-            vec![vec![dummy]],
-        )
-        .unwrap();
+        let mem_table =
+            datafusion::datasource::MemTable::try_new(Arc::clone(&schema), vec![vec![dummy]])
+                .unwrap();
         ctx.register_table("orders", Arc::new(mem_table)).unwrap();
 
         let state = IncrementalAggState::try_from_sql(
@@ -1905,13 +1788,10 @@ mod tests {
             ],
         )
         .unwrap();
-        let mem_table = datafusion::datasource::MemTable::try_new(
-            Arc::clone(&schema),
-            vec![vec![dummy]],
-        )
-        .unwrap();
-        ctx.register_table("products", Arc::new(mem_table))
-            .unwrap();
+        let mem_table =
+            datafusion::datasource::MemTable::try_new(Arc::clone(&schema), vec![vec![dummy]])
+                .unwrap();
+        ctx.register_table("products", Arc::new(mem_table)).unwrap();
 
         let state = IncrementalAggState::try_from_sql(
             &ctx,
@@ -1945,11 +1825,9 @@ mod tests {
             ],
         )
         .unwrap();
-        let mem_table = datafusion::datasource::MemTable::try_new(
-            Arc::clone(&schema),
-            vec![vec![dummy]],
-        )
-        .unwrap();
+        let mem_table =
+            datafusion::datasource::MemTable::try_new(Arc::clone(&schema), vec![vec![dummy]])
+                .unwrap();
         ctx.register_table("events", Arc::new(mem_table)).unwrap();
 
         let state = IncrementalAggState::try_from_sql(
@@ -1961,10 +1839,7 @@ mod tests {
         .expect("expected aggregate state");
 
         // Int64 in, Int64 out — should still be Int64
-        assert_eq!(
-            state.agg_specs[0].input_types[0],
-            DataType::Int64,
-        );
+        assert_eq!(state.agg_specs[0].input_types[0], DataType::Int64,);
     }
 
     // ── AST extraction tests ────────────────────────────────────────────
@@ -1993,10 +1868,7 @@ mod tests {
 
     #[test]
     fn test_expr_to_sql_string_literal() {
-        let e = datafusion_expr::Expr::Literal(
-            ScalarValue::Utf8(Some("it's".to_string())),
-            None,
-        );
+        let e = datafusion_expr::Expr::Literal(ScalarValue::Utf8(Some("it's".to_string())), None);
         assert_eq!(expr_to_sql(&e), "'it''s'");
     }
 
@@ -2008,15 +1880,9 @@ mod tests {
 
     #[test]
     fn test_expr_to_sql_boolean_literal() {
-        let t = datafusion_expr::Expr::Literal(
-            ScalarValue::Boolean(Some(true)),
-            None,
-        );
+        let t = datafusion_expr::Expr::Literal(ScalarValue::Boolean(Some(true)), None);
         assert_eq!(expr_to_sql(&t), "TRUE");
-        let f = datafusion_expr::Expr::Literal(
-            ScalarValue::Boolean(Some(false)),
-            None,
-        );
+        let f = datafusion_expr::Expr::Literal(ScalarValue::Boolean(Some(false)), None);
         assert_eq!(expr_to_sql(&f), "FALSE");
     }
 
@@ -2038,14 +1904,8 @@ mod tests {
             data_type: DataType::Float64,
         });
         let sql = expr_to_sql(&e);
-        assert!(
-            sql.contains("CAST"),
-            "should contain CAST: {sql}"
-        );
-        assert!(
-            sql.contains("Float64"),
-            "should contain target type: {sql}"
-        );
+        assert!(sql.contains("CAST"), "should contain CAST: {sql}");
+        assert!(sql.contains("Float64"), "should contain target type: {sql}");
     }
 
     #[test]
@@ -2053,20 +1913,13 @@ mod tests {
         use datafusion_expr::Expr;
         // Build a scalar function expr via DataFusion
         let func = datafusion::functions::string::upper();
-        let e =
-            Expr::ScalarFunction(datafusion_expr::expr::ScalarFunction {
-                func,
-                args: vec![datafusion_expr::col("name")],
-            });
+        let e = Expr::ScalarFunction(datafusion_expr::expr::ScalarFunction {
+            func,
+            args: vec![datafusion_expr::col("name")],
+        });
         let sql = expr_to_sql(&e);
-        assert!(
-            sql.contains("upper"),
-            "should contain function name: {sql}"
-        );
-        assert!(
-            sql.contains("\"name\""),
-            "should contain arg: {sql}"
-        );
+        assert!(sql.contains("upper"), "should contain function name: {sql}");
+        assert!(sql.contains("\"name\""), "should contain arg: {sql}");
     }
 
     #[test]
@@ -2074,10 +1927,7 @@ mod tests {
         use datafusion_expr::{col, lit};
         let e = datafusion_expr::Expr::Case(datafusion_expr::expr::Case {
             expr: None,
-            when_then_expr: vec![(
-                Box::new(col("x").gt(lit(0))),
-                Box::new(lit(1)),
-            )],
+            when_then_expr: vec![(Box::new(col("x").gt(lit(0))), Box::new(lit(1)))],
             else_expr: Some(Box::new(lit(0))),
         });
         let sql = expr_to_sql(&e);
@@ -2105,8 +1955,7 @@ mod tests {
     #[test]
     fn test_expr_to_sql_is_null() {
         use datafusion_expr::col;
-        let e =
-            datafusion_expr::Expr::IsNull(Box::new(col("x")));
+        let e = datafusion_expr::Expr::IsNull(Box::new(col("x")));
         assert_eq!(expr_to_sql(&e), "(\"x\" IS NULL)");
     }
 
@@ -2122,10 +1971,7 @@ mod tests {
         use datafusion_expr::{col, lit};
         let e = col("x").between(lit(1), lit(10));
         let sql = expr_to_sql(&e);
-        assert!(
-            sql.contains("BETWEEN"),
-            "should contain BETWEEN: {sql}"
-        );
+        assert!(sql.contains("BETWEEN"), "should contain BETWEEN: {sql}");
         assert!(sql.contains("AND"), "should contain AND: {sql}");
     }
 
@@ -2145,10 +1991,7 @@ mod tests {
         let e = col("name").like(datafusion_expr::lit("foo%"));
         let sql = expr_to_sql(&e);
         assert!(sql.contains("LIKE"), "should contain LIKE: {sql}");
-        assert!(
-            sql.contains("'foo%'"),
-            "should contain pattern: {sql}"
-        );
+        assert!(sql.contains("'foo%'"), "should contain pattern: {sql}");
     }
 
     #[test]
@@ -2156,18 +1999,16 @@ mod tests {
         // AggregateFunction in expr_to_sql is used for HAVING
         use datafusion_expr::Expr;
         let sum_udf = datafusion::functions_aggregate::sum::sum_udaf();
-        let e = Expr::AggregateFunction(
-            datafusion_expr::expr::AggregateFunction {
-                func: sum_udf,
-                params: datafusion_expr::expr::AggregateFunctionParams {
-                    args: vec![datafusion_expr::col("x")],
-                    distinct: false,
-                    filter: None,
-                    order_by: vec![],
-                    null_treatment: None,
-                },
+        let e = Expr::AggregateFunction(datafusion_expr::expr::AggregateFunction {
+            func: sum_udf,
+            params: datafusion_expr::expr::AggregateFunctionParams {
+                args: vec![datafusion_expr::col("x")],
+                distinct: false,
+                filter: None,
+                order_by: vec![],
+                null_treatment: None,
             },
-        );
+        });
         let sql = expr_to_sql(&e);
         assert!(sql.contains("sum"), "should contain sum: {sql}");
         assert!(sql.contains("\"x\""), "should contain arg: {sql}");
@@ -2176,25 +2017,19 @@ mod tests {
     #[test]
     fn test_expr_to_sql_aggregate_distinct() {
         use datafusion_expr::Expr;
-        let count_udf =
-            datafusion::functions_aggregate::count::count_udaf();
-        let e = Expr::AggregateFunction(
-            datafusion_expr::expr::AggregateFunction {
-                func: count_udf,
-                params: datafusion_expr::expr::AggregateFunctionParams {
-                    args: vec![datafusion_expr::col("id")],
-                    distinct: true,
-                    filter: None,
-                    order_by: vec![],
-                    null_treatment: None,
-                },
+        let count_udf = datafusion::functions_aggregate::count::count_udaf();
+        let e = Expr::AggregateFunction(datafusion_expr::expr::AggregateFunction {
+            func: count_udf,
+            params: datafusion_expr::expr::AggregateFunctionParams {
+                args: vec![datafusion_expr::col("id")],
+                distinct: true,
+                filter: None,
+                order_by: vec![],
+                null_treatment: None,
             },
-        );
+        });
         let sql = expr_to_sql(&e);
-        assert!(
-            sql.contains("DISTINCT"),
-            "should contain DISTINCT: {sql}"
-        );
+        assert!(sql.contains("DISTINCT"), "should contain DISTINCT: {sql}");
     }
 
     // ── GROUP BY expression tests ───────────────────────────────────
@@ -2214,11 +2049,9 @@ mod tests {
             ],
         )
         .unwrap();
-        let mem_table = datafusion::datasource::MemTable::try_new(
-            Arc::clone(&schema),
-            vec![vec![dummy]],
-        )
-        .unwrap();
+        let mem_table =
+            datafusion::datasource::MemTable::try_new(Arc::clone(&schema), vec![vec![dummy]])
+                .unwrap();
         ctx.register_table("events", Arc::new(mem_table)).unwrap();
 
         let state = IncrementalAggState::try_from_sql(
@@ -2245,10 +2078,8 @@ mod tests {
 
     #[tokio::test]
     async fn test_group_by_simple_column_still_works() {
-        let (_, state) = setup_agg_state(
-            "SELECT name, SUM(value) as total FROM events GROUP BY name",
-        )
-        .await;
+        let (_, state) =
+            setup_agg_state("SELECT name, SUM(value) as total FROM events GROUP BY name").await;
         // Simple column ref should be a quoted identifier
         assert!(
             state.pre_agg_sql.contains("\"name\""),
@@ -2261,10 +2092,8 @@ mod tests {
 
     #[tokio::test]
     async fn test_group_cardinality_limit_enforced() {
-        let (_, mut state) = setup_agg_state(
-            "SELECT name, SUM(value) as total FROM events GROUP BY name",
-        )
-        .await;
+        let (_, mut state) =
+            setup_agg_state("SELECT name, SUM(value) as total FROM events GROUP BY name").await;
 
         // Set a very small limit for testing
         state.max_groups = 3;
@@ -2299,10 +2128,8 @@ mod tests {
 
     #[tokio::test]
     async fn test_group_cardinality_existing_groups_still_updated() {
-        let (_, mut state) = setup_agg_state(
-            "SELECT name, SUM(value) as total FROM events GROUP BY name",
-        )
-        .await;
+        let (_, mut state) =
+            setup_agg_state("SELECT name, SUM(value) as total FROM events GROUP BY name").await;
 
         state.max_groups = 2;
 
@@ -2315,12 +2142,8 @@ mod tests {
         let batch1 = RecordBatch::try_new(
             Arc::clone(&pre_agg_schema),
             vec![
-                Arc::new(arrow::array::StringArray::from(vec![
-                    "a", "b",
-                ])),
-                Arc::new(arrow::array::Float64Array::from(vec![
-                    10.0, 20.0,
-                ])),
+                Arc::new(arrow::array::StringArray::from(vec!["a", "b"])),
+                Arc::new(arrow::array::Float64Array::from(vec![10.0, 20.0])),
             ],
         )
         .unwrap();
@@ -2330,12 +2153,8 @@ mod tests {
         let batch2 = RecordBatch::try_new(
             Arc::clone(&pre_agg_schema),
             vec![
-                Arc::new(arrow::array::StringArray::from(vec![
-                    "a", "c",
-                ])),
-                Arc::new(arrow::array::Float64Array::from(vec![
-                    5.0, 100.0,
-                ])),
+                Arc::new(arrow::array::StringArray::from(vec!["a", "c"])),
+                Arc::new(arrow::array::Float64Array::from(vec![5.0, 100.0])),
             ],
         )
         .unwrap();
@@ -2426,7 +2245,10 @@ mod tests {
             let rest_str = format!("{restored:?}");
             match original {
                 ScalarValue::Null => {
-                    assert!(matches!(restored, ScalarValue::Null), "{orig_str} != {rest_str}");
+                    assert!(
+                        matches!(restored, ScalarValue::Null),
+                        "{orig_str} != {rest_str}"
+                    );
                 }
                 ScalarValue::Boolean(v) => {
                     assert_eq!(
@@ -2438,52 +2260,76 @@ mod tests {
                     );
                 }
                 ScalarValue::Int8(Some(n)) => {
-                    assert_eq!(Some(i64::from(*n)), match restored {
-                        ScalarValue::Int64(r) => r,
-                        _ => panic!("type mismatch: {rest_str}"),
-                    });
+                    assert_eq!(
+                        Some(i64::from(*n)),
+                        match restored {
+                            ScalarValue::Int64(r) => r,
+                            _ => panic!("type mismatch: {rest_str}"),
+                        }
+                    );
                 }
                 ScalarValue::Int16(Some(n)) => {
-                    assert_eq!(Some(i64::from(*n)), match restored {
-                        ScalarValue::Int64(r) => r,
-                        _ => panic!("type mismatch: {rest_str}"),
-                    });
+                    assert_eq!(
+                        Some(i64::from(*n)),
+                        match restored {
+                            ScalarValue::Int64(r) => r,
+                            _ => panic!("type mismatch: {rest_str}"),
+                        }
+                    );
                 }
                 ScalarValue::Int32(Some(n)) => {
-                    assert_eq!(Some(i64::from(*n)), match restored {
-                        ScalarValue::Int64(r) => r,
-                        _ => panic!("type mismatch: {rest_str}"),
-                    });
+                    assert_eq!(
+                        Some(i64::from(*n)),
+                        match restored {
+                            ScalarValue::Int64(r) => r,
+                            _ => panic!("type mismatch: {rest_str}"),
+                        }
+                    );
                 }
                 ScalarValue::Int64(v) => {
-                    assert_eq!(*v, match restored {
-                        ScalarValue::Int64(r) => r,
-                        _ => panic!("type mismatch: {rest_str}"),
-                    });
+                    assert_eq!(
+                        *v,
+                        match restored {
+                            ScalarValue::Int64(r) => r,
+                            _ => panic!("type mismatch: {rest_str}"),
+                        }
+                    );
                 }
                 ScalarValue::UInt8(Some(n)) => {
-                    assert_eq!(Some(u64::from(*n)), match restored {
-                        ScalarValue::UInt64(r) => r,
-                        _ => panic!("type mismatch: {rest_str}"),
-                    });
+                    assert_eq!(
+                        Some(u64::from(*n)),
+                        match restored {
+                            ScalarValue::UInt64(r) => r,
+                            _ => panic!("type mismatch: {rest_str}"),
+                        }
+                    );
                 }
                 ScalarValue::UInt16(Some(n)) => {
-                    assert_eq!(Some(u64::from(*n)), match restored {
-                        ScalarValue::UInt64(r) => r,
-                        _ => panic!("type mismatch: {rest_str}"),
-                    });
+                    assert_eq!(
+                        Some(u64::from(*n)),
+                        match restored {
+                            ScalarValue::UInt64(r) => r,
+                            _ => panic!("type mismatch: {rest_str}"),
+                        }
+                    );
                 }
                 ScalarValue::UInt32(Some(n)) => {
-                    assert_eq!(Some(u64::from(*n)), match restored {
-                        ScalarValue::UInt64(r) => r,
-                        _ => panic!("type mismatch: {rest_str}"),
-                    });
+                    assert_eq!(
+                        Some(u64::from(*n)),
+                        match restored {
+                            ScalarValue::UInt64(r) => r,
+                            _ => panic!("type mismatch: {rest_str}"),
+                        }
+                    );
                 }
                 ScalarValue::UInt64(v) => {
-                    assert_eq!(*v, match restored {
-                        ScalarValue::UInt64(r) => r,
-                        _ => panic!("type mismatch: {rest_str}"),
-                    });
+                    assert_eq!(
+                        *v,
+                        match restored {
+                            ScalarValue::UInt64(r) => r,
+                            _ => panic!("type mismatch: {rest_str}"),
+                        }
+                    );
                 }
                 ScalarValue::Float32(Some(f)) => {
                     let restored_f = match restored {
@@ -2518,10 +2364,8 @@ mod tests {
 
     #[tokio::test]
     async fn test_agg_checkpoint_roundtrip_single_group() {
-        let (_, mut state) = setup_agg_state(
-            "SELECT name, SUM(value) as total FROM events GROUP BY name",
-        )
-        .await;
+        let (_, mut state) =
+            setup_agg_state("SELECT name, SUM(value) as total FROM events GROUP BY name").await;
 
         // Feed data
         let pre_agg_schema = Arc::new(Schema::new(vec![
@@ -2543,10 +2387,8 @@ mod tests {
         assert_eq!(cp.groups.len(), 1);
 
         // Create a fresh state and restore
-        let (_, mut state2) = setup_agg_state(
-            "SELECT name, SUM(value) as total FROM events GROUP BY name",
-        )
-        .await;
+        let (_, mut state2) =
+            setup_agg_state("SELECT name, SUM(value) as total FROM events GROUP BY name").await;
         let restored = state2.restore_groups(&cp).unwrap();
         assert_eq!(restored, 1);
 
@@ -2567,10 +2409,8 @@ mod tests {
 
     #[tokio::test]
     async fn test_agg_checkpoint_roundtrip_multi_group() {
-        let (_, mut state) = setup_agg_state(
-            "SELECT name, SUM(value) as total FROM events GROUP BY name",
-        )
-        .await;
+        let (_, mut state) =
+            setup_agg_state("SELECT name, SUM(value) as total FROM events GROUP BY name").await;
 
         let pre_agg_schema = Arc::new(Schema::new(vec![
             Field::new("name", DataType::Utf8, true),
@@ -2593,10 +2433,8 @@ mod tests {
         let cp = state.checkpoint_groups().unwrap();
         assert_eq!(cp.groups.len(), 3);
 
-        let (_, mut state2) = setup_agg_state(
-            "SELECT name, SUM(value) as total FROM events GROUP BY name",
-        )
-        .await;
+        let (_, mut state2) =
+            setup_agg_state("SELECT name, SUM(value) as total FROM events GROUP BY name").await;
         let restored = state2.restore_groups(&cp).unwrap();
         assert_eq!(restored, 3);
 
@@ -2626,10 +2464,8 @@ mod tests {
 
     #[tokio::test]
     async fn test_restore_fingerprint_mismatch_errors() {
-        let (_, mut state) = setup_agg_state(
-            "SELECT name, SUM(value) as total FROM events GROUP BY name",
-        )
-        .await;
+        let (_, mut state) =
+            setup_agg_state("SELECT name, SUM(value) as total FROM events GROUP BY name").await;
 
         // Feed data and checkpoint
         let pre_agg_schema = Arc::new(Schema::new(vec![
@@ -2651,10 +2487,8 @@ mod tests {
         cp.fingerprint = 999_999;
 
         // Restore should fail
-        let (_, mut state2) = setup_agg_state(
-            "SELECT name, SUM(value) as total FROM events GROUP BY name",
-        )
-        .await;
+        let (_, mut state2) =
+            setup_agg_state("SELECT name, SUM(value) as total FROM events GROUP BY name").await;
         let result = state2.restore_groups(&cp);
         assert!(result.is_err(), "Fingerprint mismatch should error");
         let err = result.unwrap_err().to_string();

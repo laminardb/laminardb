@@ -26,7 +26,7 @@ use datafusion_common::ScalarValue;
 use laminar_sql::translator::{WindowOperatorConfig, WindowType};
 
 use crate::aggregate_state::{
-    extract_clauses, expr_to_sql, find_aggregate, resolve_expr_type, AggFuncSpec,
+    expr_to_sql, extract_clauses, find_aggregate, resolve_expr_type, AggFuncSpec,
     EowcStateCheckpoint,
 };
 use crate::error::DbError;
@@ -47,26 +47,20 @@ impl EowcWindowType {
     fn from_config(config: &WindowOperatorConfig) -> Self {
         match config.window_type {
             WindowType::Tumbling | WindowType::Cumulate => {
-                let size_ms = i64::try_from(config.size.as_millis())
-                    .unwrap_or(i64::MAX);
+                let size_ms = i64::try_from(config.size.as_millis()).unwrap_or(i64::MAX);
                 EowcWindowType::Tumbling { size_ms }
             }
             WindowType::Sliding => {
-                let size_ms = i64::try_from(config.size.as_millis())
-                    .unwrap_or(i64::MAX);
-                let slide_ms = config
-                    .slide
-                    .map_or(size_ms, |s| {
-                        i64::try_from(s.as_millis()).unwrap_or(i64::MAX)
-                    });
+                let size_ms = i64::try_from(config.size.as_millis()).unwrap_or(i64::MAX);
+                let slide_ms = config.slide.map_or(size_ms, |s| {
+                    i64::try_from(s.as_millis()).unwrap_or(i64::MAX)
+                });
                 EowcWindowType::Hopping { size_ms, slide_ms }
             }
             WindowType::Session => {
                 let gap_ms = config
                     .gap
-                    .map_or(0, |g| {
-                        i64::try_from(g.as_millis()).unwrap_or(i64::MAX)
-                    });
+                    .map_or(0, |g| i64::try_from(g.as_millis()).unwrap_or(i64::MAX));
                 EowcWindowType::Session { gap_ms }
             }
         }
@@ -75,8 +69,9 @@ impl EowcWindowType {
     /// Window size in milliseconds (for close boundary computation).
     fn size_ms(&self) -> i64 {
         match self {
-            EowcWindowType::Tumbling { size_ms }
-            | EowcWindowType::Hopping { size_ms, .. } => *size_ms,
+            EowcWindowType::Tumbling { size_ms } | EowcWindowType::Hopping { size_ms, .. } => {
+                *size_ms
+            }
             EowcWindowType::Session { gap_ms } => *gap_ms,
         }
     }
@@ -209,9 +204,7 @@ impl IncrementalEowcState {
                 pre_agg_select_items.push(format!("\"{}\"", col.name));
             } else {
                 let group_sql = expr_to_sql(group_expr);
-                pre_agg_select_items.push(format!(
-                    "{group_sql} AS \"__group_{i}\""
-                ));
+                pre_agg_select_items.push(format!("{group_sql} AS \"__group_{i}\""));
             }
         }
 
@@ -236,8 +229,7 @@ impl IncrementalEowcState {
                 if agg_func.params.args.is_empty() {
                     let col_idx = next_col_idx;
                     next_col_idx += 1;
-                    pre_agg_select_items
-                        .push(format!("TRUE AS \"__agg_input_{col_idx}\""));
+                    pre_agg_select_items.push(format!("TRUE AS \"__agg_input_{col_idx}\""));
                     input_col_indices.push(col_idx);
                     input_types.push(DataType::Boolean);
                 } else {
@@ -252,33 +244,27 @@ impl IncrementalEowcState {
                                 "CASE WHEN {filter_sql} THEN {expr_sql} ELSE NULL END AS \"__agg_input_{col_idx}\""
                             ));
                         } else {
-                            pre_agg_select_items.push(format!(
-                                "{expr_sql} AS \"__agg_input_{col_idx}\""
-                            ));
+                            pre_agg_select_items
+                                .push(format!("{expr_sql} AS \"__agg_input_{col_idx}\""));
                         }
 
                         input_col_indices.push(col_idx);
-                        let dt = resolve_expr_type(
-                            arg_expr,
-                            &input_schema,
-                            agg_field.data_type(),
-                        );
+                        let dt = resolve_expr_type(arg_expr, &input_schema, agg_field.data_type());
                         input_types.push(dt);
                     }
                 }
 
-                let filter_col_index =
-                    if let Some(filter_expr) = &agg_func.params.filter {
-                        let col_idx = next_col_idx;
-                        next_col_idx += 1;
-                        let filter_sql = expr_to_sql(filter_expr);
-                        pre_agg_select_items.push(format!(
+                let filter_col_index = if let Some(filter_expr) = &agg_func.params.filter {
+                    let col_idx = next_col_idx;
+                    next_col_idx += 1;
+                    let filter_sql = expr_to_sql(filter_expr);
+                    pre_agg_select_items.push(format!(
                             "CASE WHEN {filter_sql} THEN TRUE ELSE FALSE END AS \"__agg_filter_{col_idx}\""
                         ));
-                        Some(col_idx)
-                    } else {
-                        None
-                    };
+                    Some(col_idx)
+                } else {
+                    None
+                };
 
                 let return_type = udf
                     .return_type(&input_types)
@@ -360,20 +346,14 @@ impl IncrementalEowcState {
         let ts_array = extract_i64_timestamps(batch, self.time_col_index)?;
 
         for (row, &ts_ms) in ts_array.iter().enumerate() {
-
             // Assign to window(s)
             let window_starts = assign_windows(ts_ms, &self.window_type);
 
             // Extract group key
             let mut key = Vec::with_capacity(self.num_group_cols);
             for col_idx in 0..self.num_group_cols {
-                let sv = ScalarValue::try_from_array(
-                    batch.column(col_idx),
-                    row,
-                )
-                .map_err(|e| {
-                    DbError::Pipeline(format!("group key extraction: {e}"))
-                })?;
+                let sv = ScalarValue::try_from_array(batch.column(col_idx), row)
+                    .map_err(|e| DbError::Pipeline(format!("group key extraction: {e}")))?;
                 key.push(sv);
             }
 
@@ -409,51 +389,33 @@ impl IncrementalEowcState {
                     let mut input_arrays: Vec<ArrayRef> =
                         Vec::with_capacity(spec.input_col_indices.len());
                     for &col_idx in &spec.input_col_indices {
-                        let arr = compute::take(
-                            batch.column(col_idx),
-                            &index_array,
-                            None,
-                        )
-                        .map_err(|e| {
-                            DbError::Pipeline(format!("array take: {e}"))
-                        })?;
+                        let arr = compute::take(batch.column(col_idx), &index_array, None)
+                            .map_err(|e| DbError::Pipeline(format!("array take: {e}")))?;
                         input_arrays.push(arr);
                     }
 
                     // Apply FILTER mask
                     if let Some(filter_idx) = spec.filter_col_index {
-                        let filter_arr = compute::take(
-                            batch.column(filter_idx),
-                            &index_array,
-                            None,
-                        )
-                        .map_err(|e| {
-                            DbError::Pipeline(format!("filter take: {e}"))
-                        })?;
+                        let filter_arr =
+                            compute::take(batch.column(filter_idx), &index_array, None)
+                                .map_err(|e| DbError::Pipeline(format!("filter take: {e}")))?;
                         if let Some(mask) = filter_arr
                             .as_any()
                             .downcast_ref::<arrow::array::BooleanArray>()
                         {
-                            let mut filtered =
-                                Vec::with_capacity(input_arrays.len());
+                            let mut filtered = Vec::with_capacity(input_arrays.len());
                             for arr in &input_arrays {
-                                filtered.push(
-                                    compute::filter(arr, mask).map_err(
-                                        |e| {
-                                            DbError::Pipeline(format!(
-                                                "filter apply: {e}"
-                                            ))
-                                        },
-                                    )?,
-                                );
+                                filtered.push(compute::filter(arr, mask).map_err(|e| {
+                                    DbError::Pipeline(format!("filter apply: {e}"))
+                                })?);
                             }
                             input_arrays = filtered;
                         }
                     }
 
-                    accs[i].update_batch(&input_arrays).map_err(|e| {
-                        DbError::Pipeline(format!("accumulator update: {e}"))
-                    })?;
+                    accs[i]
+                        .update_batch(&input_arrays)
+                        .map_err(|e| DbError::Pipeline(format!("accumulator update: {e}")))?;
                 }
             }
         }
@@ -466,10 +428,7 @@ impl IncrementalEowcState {
     /// Iterates the `BTreeMap` from earliest window and closes all windows
     /// where `window_start + window_size <= watermark_ms`. Closed windows
     /// are removed from state.
-    pub fn close_windows(
-        &mut self,
-        watermark_ms: i64,
-    ) -> Result<Vec<RecordBatch>, DbError> {
+    pub fn close_windows(&mut self, watermark_ms: i64) -> Result<Vec<RecordBatch>, DbError> {
         let size_ms = self.window_type.size_ms();
         if size_ms <= 0 {
             return Ok(Vec::new());
@@ -498,8 +457,7 @@ impl IncrementalEowcState {
             }
 
             let window_end = window_start.saturating_add(size_ms);
-            let batch =
-                self.emit_window(window_start, window_end, groups)?;
+            let batch = self.emit_window(window_start, window_end, groups)?;
             if let Some(b) = batch {
                 result_batches.push(b);
             }
@@ -525,48 +483,34 @@ impl IncrementalEowcState {
         let win_end_array: ArrayRef =
             Arc::new(arrow::array::Int64Array::from(vec![window_end; num_rows]));
 
-        let mut group_arrays: Vec<ArrayRef> =
-            Vec::with_capacity(self.num_group_cols);
+        let mut group_arrays: Vec<ArrayRef> = Vec::with_capacity(self.num_group_cols);
         for (col_idx, dt) in self.group_types.iter().enumerate() {
-            let scalars: Vec<ScalarValue> = groups
-                .keys()
-                .map(|key| key[col_idx].clone())
-                .collect();
-            let array =
-                ScalarValue::iter_to_array(scalars).map_err(|e| {
-                    DbError::Pipeline(format!("group key array: {e}"))
-                })?;
+            let scalars: Vec<ScalarValue> = groups.keys().map(|key| key[col_idx].clone()).collect();
+            let array = ScalarValue::iter_to_array(scalars)
+                .map_err(|e| DbError::Pipeline(format!("group key array: {e}")))?;
             if array.data_type() == dt {
                 group_arrays.push(array);
             } else {
-                let casted =
-                    arrow::compute::cast(&array, dt).unwrap_or(array);
+                let casted = arrow::compute::cast(&array, dt).unwrap_or(array);
                 group_arrays.push(casted);
             }
         }
 
-        let mut agg_arrays: Vec<ArrayRef> =
-            Vec::with_capacity(self.agg_specs.len());
+        let mut agg_arrays: Vec<ArrayRef> = Vec::with_capacity(self.agg_specs.len());
         for (agg_idx, spec) in self.agg_specs.iter().enumerate() {
-            let mut scalars: Vec<ScalarValue> =
-                Vec::with_capacity(num_rows);
+            let mut scalars: Vec<ScalarValue> = Vec::with_capacity(num_rows);
             for accs in groups.values_mut() {
-                let sv = accs[agg_idx].evaluate().map_err(|e| {
-                    DbError::Pipeline(format!(
-                        "accumulator evaluate: {e}"
-                    ))
-                })?;
+                let sv = accs[agg_idx]
+                    .evaluate()
+                    .map_err(|e| DbError::Pipeline(format!("accumulator evaluate: {e}")))?;
                 scalars.push(sv);
             }
-            let array =
-                ScalarValue::iter_to_array(scalars).map_err(|e| {
-                    DbError::Pipeline(format!("agg result array: {e}"))
-                })?;
+            let array = ScalarValue::iter_to_array(scalars)
+                .map_err(|e| DbError::Pipeline(format!("agg result array: {e}")))?;
             if array.data_type() == &spec.return_type {
                 agg_arrays.push(array);
             } else {
-                let casted = arrow::compute::cast(&array, &spec.return_type)
-                    .unwrap_or(array);
+                let casted = arrow::compute::cast(&array, &spec.return_type).unwrap_or(array);
                 agg_arrays.push(casted);
             }
         }
@@ -576,13 +520,8 @@ impl IncrementalEowcState {
         all_arrays.extend(group_arrays);
         all_arrays.extend(agg_arrays);
 
-        let batch = RecordBatch::try_new(
-            Arc::clone(&self.output_schema),
-            all_arrays,
-        )
-        .map_err(|e| {
-            DbError::Pipeline(format!("result batch build: {e}"))
-        })?;
+        let batch = RecordBatch::try_new(Arc::clone(&self.output_schema), all_arrays)
+            .map_err(|e| DbError::Pipeline(format!("result batch build: {e}")))?;
 
         Ok(Some(batch))
     }
@@ -617,37 +556,25 @@ impl IncrementalEowcState {
 
     /// Compute a fingerprint for this query (SQL + schema).
     pub(crate) fn query_fingerprint(&self) -> u64 {
-        crate::aggregate_state::query_fingerprint(
-            &self.pre_agg_sql,
-            &self.output_schema,
-        )
+        crate::aggregate_state::query_fingerprint(&self.pre_agg_sql, &self.output_schema)
     }
 
     /// Checkpoint all per-window group states into a serializable struct.
-    pub(crate) fn checkpoint_windows(
-        &mut self,
-    ) -> Result<EowcStateCheckpoint, DbError> {
-        use crate::aggregate_state::{
-            scalar_to_json, GroupCheckpoint, WindowCheckpoint,
-        };
+    pub(crate) fn checkpoint_windows(&mut self) -> Result<EowcStateCheckpoint, DbError> {
+        use crate::aggregate_state::{scalar_to_json, GroupCheckpoint, WindowCheckpoint};
 
         let fingerprint = self.query_fingerprint();
         let mut windows = Vec::with_capacity(self.windows.len());
         for (&window_start, groups) in &mut self.windows {
-            let mut group_checkpoints =
-                Vec::with_capacity(groups.len());
+            let mut group_checkpoints = Vec::with_capacity(groups.len());
             for (key, accs) in groups {
-                let key_json: Vec<serde_json::Value> =
-                    key.iter().map(scalar_to_json).collect();
+                let key_json: Vec<serde_json::Value> = key.iter().map(scalar_to_json).collect();
                 let mut acc_states = Vec::with_capacity(accs.len());
                 for acc in accs {
-                    let state = acc.state().map_err(|e| {
-                        DbError::Pipeline(format!(
-                            "accumulator state: {e}"
-                        ))
-                    })?;
-                    acc_states
-                        .push(state.iter().map(scalar_to_json).collect());
+                    let state = acc
+                        .state()
+                        .map_err(|e| DbError::Pipeline(format!("accumulator state: {e}")))?;
+                    acc_states.push(state.iter().map(scalar_to_json).collect());
                 }
                 group_checkpoints.push(GroupCheckpoint {
                     key: key_json,
@@ -684,38 +611,24 @@ impl IncrementalEowcState {
         for wc in &checkpoint.windows {
             let mut groups = HashMap::new();
             for gc in &wc.groups {
-                let key: Result<Vec<ScalarValue>, _> =
-                    gc.key.iter().map(json_to_scalar).collect();
+                let key: Result<Vec<ScalarValue>, _> = gc.key.iter().map(json_to_scalar).collect();
                 let key = key?;
-                let mut accs =
-                    Vec::with_capacity(self.agg_specs.len());
+                let mut accs = Vec::with_capacity(self.agg_specs.len());
                 for (i, spec) in self.agg_specs.iter().enumerate() {
                     let mut acc = spec.create_accumulator()?;
                     if i < gc.acc_states.len() {
-                        let state_scalars: Result<
-                            Vec<ScalarValue>,
-                            _,
-                        > = gc.acc_states[i]
-                            .iter()
-                            .map(json_to_scalar)
-                            .collect();
+                        let state_scalars: Result<Vec<ScalarValue>, _> =
+                            gc.acc_states[i].iter().map(json_to_scalar).collect();
                         let state_scalars = state_scalars?;
-                        let arrays: Vec<arrow::array::ArrayRef> =
-                            state_scalars
-                                .iter()
-                                .map(|sv| {
-                                    sv.to_array().map_err(|e| {
-                                        DbError::Pipeline(format!(
-                                            "scalar to array: {e}"
-                                        ))
-                                    })
-                                })
-                                .collect::<Result<_, _>>()?;
-                        acc.merge_batch(&arrays).map_err(|e| {
-                            DbError::Pipeline(format!(
-                                "accumulator merge: {e}"
-                            ))
-                        })?;
+                        let arrays: Vec<arrow::array::ArrayRef> = state_scalars
+                            .iter()
+                            .map(|sv| {
+                                sv.to_array()
+                                    .map_err(|e| DbError::Pipeline(format!("scalar to array: {e}")))
+                            })
+                            .collect::<Result<_, _>>()?;
+                        acc.merge_batch(&arrays)
+                            .map_err(|e| DbError::Pipeline(format!("accumulator merge: {e}")))?;
                     }
                     accs.push(acc);
                 }
@@ -747,9 +660,7 @@ pub(crate) fn extract_i64_timestamps(
             let arr = col
                 .as_any()
                 .downcast_ref::<Int64Array>()
-                .ok_or_else(|| {
-                    DbError::Pipeline("expected Int64Array".to_string())
-                })?;
+                .ok_or_else(|| DbError::Pipeline("expected Int64Array".to_string()))?;
             for i in 0..arr.len() {
                 result.push(if arr.is_null(i) { 0 } else { arr.value(i) });
             }
@@ -759,9 +670,7 @@ pub(crate) fn extract_i64_timestamps(
                 .as_any()
                 .downcast_ref::<arrow::array::TimestampMillisecondArray>()
                 .ok_or_else(|| {
-                    DbError::Pipeline(
-                        "expected TimestampMillisecondArray".to_string(),
-                    )
+                    DbError::Pipeline("expected TimestampMillisecondArray".to_string())
                 })?;
             for i in 0..arr.len() {
                 result.push(if arr.is_null(i) { 0 } else { arr.value(i) });
@@ -771,11 +680,7 @@ pub(crate) fn extract_i64_timestamps(
             let arr = col
                 .as_any()
                 .downcast_ref::<arrow::array::TimestampSecondArray>()
-                .ok_or_else(|| {
-                    DbError::Pipeline(
-                        "expected TimestampSecondArray".to_string(),
-                    )
-                })?;
+                .ok_or_else(|| DbError::Pipeline("expected TimestampSecondArray".to_string()))?;
             for i in 0..arr.len() {
                 let v = if arr.is_null(i) { 0 } else { arr.value(i) };
                 result.push(v.saturating_mul(1000));
@@ -786,9 +691,7 @@ pub(crate) fn extract_i64_timestamps(
                 .as_any()
                 .downcast_ref::<arrow::array::TimestampMicrosecondArray>()
                 .ok_or_else(|| {
-                    DbError::Pipeline(
-                        "expected TimestampMicrosecondArray".to_string(),
-                    )
+                    DbError::Pipeline("expected TimestampMicrosecondArray".to_string())
                 })?;
             for i in 0..arr.len() {
                 let v = if arr.is_null(i) { 0 } else { arr.value(i) };
@@ -800,9 +703,7 @@ pub(crate) fn extract_i64_timestamps(
                 .as_any()
                 .downcast_ref::<arrow::array::TimestampNanosecondArray>()
                 .ok_or_else(|| {
-                    DbError::Pipeline(
-                        "expected TimestampNanosecondArray".to_string(),
-                    )
+                    DbError::Pipeline("expected TimestampNanosecondArray".to_string())
                 })?;
             for i in 0..arr.len() {
                 let v = if arr.is_null(i) { 0 } else { arr.value(i) };
@@ -870,9 +771,7 @@ mod tests {
 
     #[test]
     fn test_extract_i64_timestamps_from_int64() {
-        let schema = Arc::new(Schema::new(vec![
-            Field::new("ts", DataType::Int64, false),
-        ]));
+        let schema = Arc::new(Schema::new(vec![Field::new("ts", DataType::Int64, false)]));
         let batch = RecordBatch::try_new(
             schema,
             vec![Arc::new(Int64Array::from(vec![100, 200, 300]))],
@@ -891,11 +790,9 @@ mod tests {
         )]));
         let batch = RecordBatch::try_new(
             schema,
-            vec![Arc::new(
-                arrow::array::TimestampMillisecondArray::from(vec![
-                    100, 200, 300,
-                ]),
-            )],
+            vec![Arc::new(arrow::array::TimestampMillisecondArray::from(
+                vec![100, 200, 300],
+            ))],
         )
         .unwrap();
         let ts = extract_i64_timestamps(&batch, 0).unwrap();
@@ -930,9 +827,7 @@ mod tests {
         .unwrap()
     }
 
-    fn make_eowc_state(
-        window_type: EowcWindowType,
-    ) -> IncrementalEowcState {
+    fn make_eowc_state(window_type: EowcWindowType) -> IncrementalEowcState {
         use datafusion::execution::FunctionRegistry;
 
         // Create a SUM(Int64) accumulator spec
@@ -973,20 +868,14 @@ mod tests {
 
     #[test]
     fn test_incremental_eowc_tumbling_sum() {
-        let mut state =
-            make_eowc_state(EowcWindowType::Tumbling { size_ms: 1000 });
+        let mut state = make_eowc_state(EowcWindowType::Tumbling { size_ms: 1000 });
 
         // Batch 1: two events in window [0, 1000)
-        let batch1 = make_pre_agg_batch(
-            vec!["AAPL", "AAPL"],
-            vec![10, 20],
-            vec![100, 500],
-        );
+        let batch1 = make_pre_agg_batch(vec!["AAPL", "AAPL"], vec![10, 20], vec![100, 500]);
         state.update_batch(&batch1).unwrap();
 
         // Batch 2: one more event in same window
-        let batch2 =
-            make_pre_agg_batch(vec!["AAPL"], vec![30], vec![800]);
+        let batch2 = make_pre_agg_batch(vec!["AAPL"], vec![30], vec![800]);
         state.update_batch(&batch2).unwrap();
 
         assert_eq!(state.open_window_count(), 1);
@@ -1028,8 +917,7 @@ mod tests {
 
     #[test]
     fn test_incremental_eowc_multi_group() {
-        let mut state =
-            make_eowc_state(EowcWindowType::Tumbling { size_ms: 1000 });
+        let mut state = make_eowc_state(EowcWindowType::Tumbling { size_ms: 1000 });
 
         let batch = make_pre_agg_batch(
             vec!["AAPL", "GOOG", "AAPL", "GOOG"],
@@ -1045,15 +933,10 @@ mod tests {
 
     #[test]
     fn test_incremental_eowc_multi_window() {
-        let mut state =
-            make_eowc_state(EowcWindowType::Tumbling { size_ms: 1000 });
+        let mut state = make_eowc_state(EowcWindowType::Tumbling { size_ms: 1000 });
 
         // Events across two windows
-        let batch = make_pre_agg_batch(
-            vec!["AAPL", "AAPL"],
-            vec![10, 20],
-            vec![500, 1500],
-        );
+        let batch = make_pre_agg_batch(vec!["AAPL", "AAPL"], vec![10, 20], vec![500, 1500]);
         state.update_batch(&batch).unwrap();
 
         assert_eq!(state.open_window_count(), 2);
@@ -1080,11 +963,9 @@ mod tests {
 
     #[test]
     fn test_close_windows_returns_empty_when_none_closed() {
-        let mut state =
-            make_eowc_state(EowcWindowType::Tumbling { size_ms: 1000 });
+        let mut state = make_eowc_state(EowcWindowType::Tumbling { size_ms: 1000 });
 
-        let batch =
-            make_pre_agg_batch(vec!["AAPL"], vec![10], vec![500]);
+        let batch = make_pre_agg_batch(vec!["AAPL"], vec![10], vec![500]);
         state.update_batch(&batch).unwrap();
 
         // Watermark hasn't reached window end
@@ -1095,8 +976,7 @@ mod tests {
 
     #[test]
     fn test_empty_batch_update_is_noop() {
-        let mut state =
-            make_eowc_state(EowcWindowType::Tumbling { size_ms: 1000 });
+        let mut state = make_eowc_state(EowcWindowType::Tumbling { size_ms: 1000 });
 
         let schema = Arc::new(Schema::new(vec![
             Field::new("symbol", DataType::Utf8, false),
@@ -1110,11 +990,9 @@ mod tests {
 
     #[test]
     fn test_window_close_emits_correct_schema() {
-        let mut state =
-            make_eowc_state(EowcWindowType::Tumbling { size_ms: 1000 });
+        let mut state = make_eowc_state(EowcWindowType::Tumbling { size_ms: 1000 });
 
-        let batch =
-            make_pre_agg_batch(vec!["AAPL"], vec![42], vec![100]);
+        let batch = make_pre_agg_batch(vec!["AAPL"], vec![42], vec![100]);
         state.update_batch(&batch).unwrap();
 
         let batches = state.close_windows(1000).unwrap();
@@ -1132,8 +1010,7 @@ mod tests {
 
     #[test]
     fn test_eowc_checkpoint_roundtrip_tumbling() {
-        let mut state =
-            make_eowc_state(EowcWindowType::Tumbling { size_ms: 1000 });
+        let mut state = make_eowc_state(EowcWindowType::Tumbling { size_ms: 1000 });
 
         // Feed data into two windows
         let batch = make_pre_agg_batch(
@@ -1150,8 +1027,7 @@ mod tests {
         assert_eq!(cp.windows.len(), 2);
 
         // Create fresh state and restore
-        let mut state2 =
-            make_eowc_state(EowcWindowType::Tumbling { size_ms: 1000 });
+        let mut state2 = make_eowc_state(EowcWindowType::Tumbling { size_ms: 1000 });
         let restored = state2.restore_windows(&cp).unwrap();
         assert!(restored > 0, "Should have restored groups");
         assert_eq!(state2.open_window_count(), 2);
@@ -1182,8 +1058,7 @@ mod tests {
 
     #[test]
     fn test_eowc_checkpoint_empty_windows() {
-        let mut state =
-            make_eowc_state(EowcWindowType::Tumbling { size_ms: 1000 });
+        let mut state = make_eowc_state(EowcWindowType::Tumbling { size_ms: 1000 });
 
         // No data = no windows
         let cp = state.checkpoint_windows().unwrap();
@@ -1192,25 +1067,20 @@ mod tests {
 
     #[test]
     fn test_eowc_checkpoint_fingerprint_mismatch() {
-        let mut state =
-            make_eowc_state(EowcWindowType::Tumbling { size_ms: 1000 });
+        let mut state = make_eowc_state(EowcWindowType::Tumbling { size_ms: 1000 });
 
-        let batch =
-            make_pre_agg_batch(vec!["AAPL"], vec![10], vec![100]);
+        let batch = make_pre_agg_batch(vec!["AAPL"], vec![10], vec![100]);
         state.update_batch(&batch).unwrap();
 
         let mut cp = state.checkpoint_windows().unwrap();
         cp.fingerprint = 12345; // tamper
 
-        let mut state2 =
-            make_eowc_state(EowcWindowType::Tumbling { size_ms: 1000 });
+        let mut state2 = make_eowc_state(EowcWindowType::Tumbling { size_ms: 1000 });
         let result = state2.restore_windows(&cp);
         assert!(result.is_err());
-        assert!(
-            result
-                .unwrap_err()
-                .to_string()
-                .contains("fingerprint mismatch")
-        );
+        assert!(result
+            .unwrap_err()
+            .to_string()
+            .contains("fingerprint mismatch"));
     }
 }

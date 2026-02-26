@@ -100,7 +100,7 @@ impl StreamingScanExec {
     /// Attaches a watermark filter that drops late rows at scan time.
     ///
     /// When set, `execute()` wraps the inner stream with a
-    /// [`WatermarkFilterStream`] that applies `ts >= watermark` before
+    /// `WatermarkFilterStream` that applies `ts >= watermark` before
     /// any downstream processing.
     #[must_use]
     pub fn with_watermark_filter(mut self, filter: Arc<WatermarkDynamicFilter>) -> Self {
@@ -525,7 +525,10 @@ mod tests {
         // Create a physical plan and verify CooperativeExec wrapping
         let df = ctx.sql("SELECT id FROM events").await.unwrap();
         let plan = df.create_physical_plan().await.unwrap();
-        let plan_str = format!("{}", datafusion::physical_plan::displayable(plan.as_ref()).indent(true));
+        let plan_str = format!(
+            "{}",
+            datafusion::physical_plan::displayable(plan.as_ref()).indent(true)
+        );
         assert!(
             plan_str.contains("CooperativeExec"),
             "Expected CooperativeExec wrapper around StreamingScanExec, got:\n{plan_str}"
@@ -536,8 +539,8 @@ mod tests {
 
     #[test]
     fn test_streaming_scan_with_watermark_filter() {
-        use std::sync::atomic::{AtomicI64, AtomicU64};
         use super::WatermarkDynamicFilter;
+        use std::sync::atomic::{AtomicI64, AtomicU64};
 
         let schema = test_schema();
         let source: StreamSourceRef = Arc::new(MockSource::new(schema));
@@ -547,8 +550,8 @@ mod tests {
             "id".to_string(),
         ));
 
-        let exec = StreamingScanExec::new(source, None, vec![])
-            .with_watermark_filter(Arc::clone(&filter));
+        let exec =
+            StreamingScanExec::new(source, None, vec![]).with_watermark_filter(Arc::clone(&filter));
 
         assert!(exec.watermark_filter().is_some());
         assert_eq!(exec.watermark_filter().unwrap().watermark_ms(), 100);
@@ -556,8 +559,8 @@ mod tests {
 
     #[test]
     fn test_streaming_scan_watermark_filter_preserved() {
-        use std::sync::atomic::{AtomicI64, AtomicU64};
         use super::WatermarkDynamicFilter;
+        use std::sync::atomic::{AtomicI64, AtomicU64};
 
         let schema = test_schema();
         let source: StreamSourceRef = Arc::new(MockSource::new(schema));
@@ -567,8 +570,8 @@ mod tests {
             "id".to_string(),
         ));
 
-        let exec = StreamingScanExec::new(source, None, vec![])
-            .with_watermark_filter(Arc::clone(&filter));
+        let exec =
+            StreamingScanExec::new(source, None, vec![]).with_watermark_filter(Arc::clone(&filter));
 
         // with_new_children(empty) should preserve the watermark filter
         let exec_arc: Arc<dyn ExecutionPlan> = Arc::new(exec);
