@@ -231,6 +231,10 @@ pub(crate) struct StreamExecutor {
     /// Pending checkpoint data for deferred restore. Held until agg states
     /// are lazily initialized, then applied and cleared.
     pending_restore: Option<crate::aggregate_state::StreamExecutorCheckpoint>,
+    /// Reusable per-cycle results map (cleared each cycle to avoid reallocation).
+    cycle_results: HashMap<String, Vec<RecordBatch>>,
+    /// Reusable per-cycle intermediate table name list.
+    cycle_intermediates: Vec<String>,
 }
 
 impl StreamExecutor {
@@ -251,6 +255,8 @@ impl StreamExecutor {
             core_window_states: HashMap::new(),
             non_core_window_queries: HashSet::new(),
             pending_restore: None,
+            cycle_results: HashMap::new(),
+            cycle_intermediates: Vec::new(),
         }
     }
 
@@ -406,8 +412,13 @@ impl StreamExecutor {
 
         self.register_source_tables(source_batches)?;
 
-        let mut results = HashMap::new();
-        let mut intermediate_tables: Vec<String> = Vec::new();
+        // Reuse per-cycle allocations: take the pre-allocated maps out of
+        // self so the borrow checker allows &mut self calls while results
+        // is borrowed immutably within the loop.
+        let mut results = std::mem::take(&mut self.cycle_results);
+        results.clear();
+        let mut intermediate_tables = std::mem::take(&mut self.cycle_intermediates);
+        intermediate_tables.clear();
 
         let topo_len = self.topo_order.len();
         for i in 0..topo_len {
@@ -416,8 +427,6 @@ impl StreamExecutor {
             let has_asof = self.queries[idx].asof_config.is_some();
             let has_temporal = self.queries[idx].temporal_config.is_some();
 
-            // ── EOWC branch: accumulate and gate on watermark ──
-            // Clone query fields only in branches needing &mut self.
             let batches = if is_eowc {
                 let query_name = self.queries[idx].name.clone();
                 let window_config = self.queries[idx].window_config.clone();
@@ -477,7 +486,6 @@ impl StreamExecutor {
 
             if !batches.is_empty() {
                 let query_name = self.queries[idx].name.clone();
-                // Register results as a temp MemTable for downstream queries
                 let schema = batches[0].schema();
                 if let Ok(mem_table) =
                     datafusion::datasource::MemTable::try_new(schema, vec![batches.clone()])
@@ -495,6 +503,8 @@ impl StreamExecutor {
             let _ = self.ctx.deregister_table(name);
         }
 
+        // Stash the (now-empty after take) intermediates back for reuse
+        self.cycle_intermediates = intermediate_tables;
         Ok(results)
     }
 
@@ -1004,9 +1014,14 @@ impl StreamExecutor {
             }
         }
 
-        // Fall through to raw-batch EOWC path
-        // Use pre-computed table references (extracted once at registration)
-        let table_refs = self.queries[idx].table_refs.clone();
+        // Fall through to raw-batch EOWC path.
+        // Collect table refs as owned strings to avoid borrowing self.queries
+        // while mutating self.eowc_states.
+        let table_refs: Vec<String> = self.queries[idx]
+            .table_refs
+            .iter()
+            .cloned()
+            .collect();
 
         // Accumulate current source batches into EOWC state.
         if let Some(eowc) = self.eowc_states.get_mut(&idx) {
@@ -1054,7 +1069,6 @@ impl StreamExecutor {
             compute_closed_boundary(current_watermark, cfg)
         });
 
-        // Check if any new windows have closed since last emission
         let last_boundary = self
             .eowc_states
             .get(&idx)
@@ -1100,7 +1114,6 @@ impl StreamExecutor {
             return Ok(Vec::new());
         }
 
-        // Get the time column from the window config for filtering
         let time_column = window_config.map(|cfg| cfg.time_column.clone());
 
         // Single-pass: split accumulated data into closed-window rows (for query)

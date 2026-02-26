@@ -149,28 +149,28 @@ impl<T, const N: usize> ObjectPool<T, N> {
         }
     }
 
-    /// Get the number of available objects in the pool.
+    /// Objects ready to be acquired.
     #[inline]
     #[must_use]
     pub fn available(&self) -> usize {
         self.free_list.len()
     }
 
-    /// Get the number of objects currently in use.
+    /// Objects currently held by callers.
     #[inline]
     #[must_use]
     pub fn in_use(&self) -> usize {
         self.in_use
     }
 
-    /// Get the maximum capacity of the pool.
+    /// Fixed pool size (`N`).
     #[inline]
     #[must_use]
     pub const fn capacity(&self) -> usize {
         N
     }
 
-    /// Check if the pool is empty (no objects available).
+    /// `true` when no objects are available for acquisition.
     #[inline]
     #[must_use]
     pub fn is_empty(&self) -> bool {

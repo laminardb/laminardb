@@ -31,7 +31,7 @@
 //! ## Implementations
 //!
 //! - `InMemoryTableLoader` - For testing and static reference data
-//! - (Phase 3) Redis, PostgreSQL, HTTP loaders
+//! - Redis, PostgreSQL, HTTP loaders
 //!
 //! ## Example
 //!

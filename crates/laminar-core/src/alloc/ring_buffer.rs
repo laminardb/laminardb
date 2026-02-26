@@ -159,21 +159,21 @@ impl<T, const N: usize> RingBuffer<T, N> {
         Some(unsafe { &mut *self.buffer[self.tail].as_mut_ptr() })
     }
 
-    /// Check if the buffer is empty.
+    /// `true` when no items are buffered.
     #[inline]
     #[must_use]
     pub fn is_empty(&self) -> bool {
         self.head == self.tail
     }
 
-    /// Check if the buffer is full.
+    /// `true` when inserting would overwrite the oldest item.
     #[inline]
     #[must_use]
     pub fn is_full(&self) -> bool {
         (self.head + 1) % N == self.tail
     }
 
-    /// Get the number of items in the buffer.
+    /// Number of items currently buffered.
     #[inline]
     #[must_use]
     pub fn len(&self) -> usize {

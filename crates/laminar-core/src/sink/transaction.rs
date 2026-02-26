@@ -351,7 +351,7 @@ pub trait TwoPhaseCommitSink: Send {
 
 /// Buffer for transactional writes
 #[derive(Debug, Default)]
-#[allow(dead_code)] // Public API for Phase 3 connector implementations
+#[allow(dead_code)]
 pub struct TransactionBuffer {
     /// Buffered outputs
     outputs: Vec<Output>,
@@ -360,7 +360,7 @@ pub struct TransactionBuffer {
     size_bytes: usize,
 }
 
-#[allow(dead_code)] // Public API for Phase 3 connector implementations
+#[allow(dead_code)]
 impl TransactionBuffer {
     /// Create a new transaction buffer
     #[must_use]

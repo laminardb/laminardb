@@ -43,22 +43,11 @@ pub struct StreamingScanExec {
     filters: Vec<Expr>,
     /// Cached plan properties
     properties: PlanProperties,
-    /// Optional watermark filter applied at scan level (F-SSQL-006)
+    /// Optional watermark filter applied at scan level
     watermark_filter: Option<Arc<WatermarkDynamicFilter>>,
 }
 
 impl StreamingScanExec {
-    /// Creates a new streaming scan execution plan.
-    ///
-    /// # Arguments
-    ///
-    /// * `source` - The streaming source to read from
-    /// * `projection` - Optional column projection indices
-    /// * `filters` - Filters to push down to the source
-    ///
-    /// # Returns
-    ///
-    /// A new `StreamingScanExec` instance.
     /// Creates a new streaming scan execution plan.
     ///
     /// If the source declares an `output_ordering`, the plan's
@@ -83,20 +72,18 @@ impl StreamingScanExec {
             None => source_schema,
         };
 
-        // Build equivalence properties, optionally with source ordering
         let eq_properties = Self::build_equivalence_properties(&schema, source_ordering.as_deref());
 
-        // Build plan properties for an unbounded streaming source.
         // SchedulingType::NonCooperative causes DataFusion's EnsureCooperative
         // optimizer rule to auto-wrap this leaf with CooperativeExec, which
-        // yields to the Tokio executor periodically (F-SSQL-005).
+        // yields to the Tokio executor periodically.
         let properties = PlanProperties::new(
             eq_properties,
-            Partitioning::UnknownPartitioning(1), // Single partition for streaming
-            EmissionType::Incremental,            // Streaming emits incrementally
+            Partitioning::UnknownPartitioning(1),
+            EmissionType::Incremental,
             Boundedness::Unbounded {
                 requires_infinite_memory: false,
-            }, // Streaming is unbounded
+            },
         )
         .with_scheduling_type(SchedulingType::NonCooperative);
 
@@ -501,7 +488,7 @@ mod tests {
         assert!(exec.output_ordering().is_none());
     }
 
-    // --- Cooperative scheduling tests (F-SSQL-005) ---
+    // Cooperative scheduling tests
 
     #[test]
     fn test_streaming_scan_exec_scheduling_type() {
@@ -545,7 +532,7 @@ mod tests {
         );
     }
 
-    // --- Watermark filter tests (F-SSQL-006) ---
+    // Watermark filter tests
 
     #[test]
     fn test_streaming_scan_with_watermark_filter() {

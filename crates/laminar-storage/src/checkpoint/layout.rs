@@ -147,7 +147,7 @@ impl Default for CheckpointPaths {
 
 /// V2 checkpoint manifest for distributed object-store checkpoints.
 ///
-/// This extends the Phase 1-3 [`CheckpointManifest`](super::super::CheckpointManifest)
+/// This extends the file-system [`CheckpointManifest`](super::super::CheckpointManifest)
 /// with per-operator partition entries, incremental delta support, and
 /// source offset tracking suitable for multi-partition recovery.
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]

@@ -139,28 +139,23 @@ impl TableStore {
         self.tables.keys().cloned().collect()
     }
 
-    /// Get the schema for a table.
     pub fn table_schema(&self, name: &str) -> Option<SchemaRef> {
         self.tables.get(name).map(|t| t.schema.clone())
     }
 
-    /// Get the primary key column name for a table.
     pub fn primary_key(&self, name: &str) -> Option<&str> {
         self.tables.get(name).map(|t| t.primary_key.as_str())
     }
 
-    /// Get the row count for a table.
     pub fn table_row_count(&self, name: &str) -> usize {
         self.tables.get(name).map_or(0, |t| t.row_count)
     }
 
-    /// Check if a table is ready (fully populated).
     #[allow(dead_code)]
     pub fn is_ready(&self, name: &str) -> bool {
         self.tables.get(name).is_some_and(|t| t.ready)
     }
 
-    /// Set the ready flag for a table.
     #[allow(dead_code)]
     pub fn set_ready(&mut self, name: &str, ready: bool) {
         if let Some(t) = self.tables.get_mut(name) {
@@ -168,14 +163,12 @@ impl TableStore {
         }
     }
 
-    /// Set the connector type for a table.
     pub fn set_connector(&mut self, name: &str, connector_type: &str) {
         if let Some(t) = self.tables.get_mut(name) {
             t.connector = Some(connector_type.to_string());
         }
     }
 
-    /// Get the connector type for a table.
     pub fn connector(&self, name: &str) -> Option<&str> {
         self.tables.get(name).and_then(|t| t.connector.as_deref())
     }

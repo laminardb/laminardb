@@ -13,7 +13,7 @@ use std::task::{Context, Poll};
 use arrow::compute::kernels::cmp::gt_eq;
 use arrow_array::cast::AsArray;
 use arrow_array::types::TimestampMillisecondType;
-use arrow_array::{BooleanArray, Int64Array, RecordBatch};
+use arrow_array::{Int64Array, RecordBatch};
 use arrow_schema::{DataType, SchemaRef, TimeUnit};
 use datafusion::physical_plan::RecordBatchStream;
 use datafusion_common::DataFusionError;
@@ -124,10 +124,9 @@ impl WatermarkDynamicFilter {
             }
             DataType::Timestamp(TimeUnit::Millisecond, _) => {
                 let ts_array = col.as_primitive::<TimestampMillisecondType>();
-                // Compare underlying i64 values against the watermark
-                let raw_values = ts_array.values();
-                let bools: Vec<bool> = raw_values.iter().map(|&v| v >= wm).collect();
-                BooleanArray::from(bools)
+                let threshold =
+                    arrow_array::TimestampMillisecondArray::new_scalar(wm);
+                gt_eq(ts_array, &threshold)?
             }
             other => {
                 return Err(DataFusionError::Plan(format!(

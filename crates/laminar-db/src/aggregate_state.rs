@@ -500,28 +500,52 @@ impl IncrementalAggState {
 
     /// Process a pre-aggregation batch: partition by group key and update
     /// accumulators.
+    ///
+    /// Uses Arrow's vectorized `RowConverter` to build binary-comparable
+    /// group keys in a single pass, avoiding per-row `Vec<ScalarValue>`
+    /// allocations.
     pub fn process_batch(&mut self, batch: &RecordBatch) -> Result<(), DbError> {
         if batch.num_rows() == 0 {
             return Ok(());
         }
 
-        let mut group_indices: HashMap<Vec<ScalarValue>, Vec<u32>> = HashMap::new();
-        for row in 0..batch.num_rows() {
-            let mut key = Vec::with_capacity(self.num_group_cols);
-            for col_idx in 0..self.num_group_cols {
-                let sv = ScalarValue::try_from_array(batch.column(col_idx), row)
-                    .map_err(|e| {
-                        DbError::Pipeline(format!("group key extraction: {e}"))
-                    })?;
-                key.push(sv);
-            }
-            #[allow(clippy::cast_possible_truncation)]
-            group_indices.entry(key).or_default().push(row as u32);
+        // Fast path for global aggregates (no GROUP BY): all rows go
+        // into a single group with an empty key, no row conversion needed.
+        if self.num_group_cols == 0 {
+            return self.process_batch_no_groups(batch);
         }
 
-        // For each group, extract rows and update accumulators
-        for (key, indices) in &group_indices {
-            if !self.groups.contains_key(key) {
+        // Vectorized group key extraction using Arrow row format.
+        let group_cols: Vec<ArrayRef> = (0..self.num_group_cols)
+            .map(|i| Arc::clone(batch.column(i)))
+            .collect();
+
+        let sort_fields: Vec<arrow::row::SortField> = group_cols
+            .iter()
+            .map(|c| arrow::row::SortField::new(c.data_type().clone()))
+            .collect();
+
+        let converter = arrow::row::RowConverter::new(sort_fields)
+            .map_err(|e| DbError::Pipeline(format!("row converter: {e}")))?;
+
+        let rows = converter.convert_columns(&group_cols)
+            .map_err(|e| DbError::Pipeline(format!("row conversion: {e}")))?;
+
+        let estimated_groups = (batch.num_rows() / 4).max(16);
+        let mut group_indices: HashMap<arrow::row::OwnedRow, Vec<u32>> =
+            HashMap::with_capacity(estimated_groups);
+        for row_idx in 0..batch.num_rows() {
+            #[allow(clippy::cast_possible_truncation)]
+            group_indices
+                .entry(rows.row(row_idx).owned())
+                .or_default()
+                .push(row_idx as u32);
+        }
+
+        for (row_key, indices) in &group_indices {
+            let sv_key = self.row_to_scalar_key(&converter, row_key)?;
+
+            if !self.groups.contains_key(&sv_key) {
                 if self.groups.len() >= self.max_groups {
                     tracing::warn!(
                         max_groups = self.max_groups,
@@ -534,73 +558,100 @@ impl IncrementalAggState {
                 for spec in &self.agg_specs {
                     accs.push(spec.create_accumulator()?);
                 }
-                self.groups.insert(key.clone(), accs);
+                self.groups.insert(sv_key.clone(), accs);
             }
-            let Some(accs) = self.groups.get_mut(key) else {
-                continue; // group was dropped due to cardinality limit
+            let Some(accs) = self.groups.get_mut(&sv_key) else {
+                continue;
             };
 
-            let index_array =
-                arrow::array::UInt32Array::from(indices.clone());
-
-            for (i, spec) in self.agg_specs.iter().enumerate() {
-                let mut input_arrays: Vec<ArrayRef> =
-                    Vec::with_capacity(spec.input_col_indices.len());
-                for &col_idx in &spec.input_col_indices {
-                    let arr = compute::take(
-                        batch.column(col_idx),
-                        &index_array,
-                        None,
-                    )
-                    .map_err(|e| {
-                        DbError::Pipeline(format!(
-                            "array take failed: {e}"
-                        ))
-                    })?;
-                    input_arrays.push(arr);
-                }
-
-                // Apply FILTER mask -- only keep rows where the
-                // filter column is true
-                if let Some(filter_idx) = spec.filter_col_index {
-                    let filter_arr = compute::take(
-                        batch.column(filter_idx),
-                        &index_array,
-                        None,
-                    )
-                    .map_err(|e| {
-                        DbError::Pipeline(format!(
-                            "filter take failed: {e}"
-                        ))
-                    })?;
-                    let bool_arr = filter_arr
-                        .as_any()
-                        .downcast_ref::<arrow::array::BooleanArray>();
-                    if let Some(mask) = bool_arr {
-                        let mut filtered = Vec::with_capacity(
-                            input_arrays.len(),
-                        );
-                        for arr in &input_arrays {
-                            filtered.push(
-                                compute::filter(arr, mask).map_err(
-                                    |e| {
-                                        DbError::Pipeline(format!(
-                                            "filter apply failed: {e}"
-                                        ))
-                                    },
-                                )?,
-                            );
-                        }
-                        input_arrays = filtered;
-                    }
-                }
-
-                accs[i].update_batch(&input_arrays).map_err(|e| {
-                    DbError::Pipeline(format!("accumulator update: {e}"))
-                })?;
-            }
+            Self::update_group_accumulators(
+                accs, batch, indices, &self.agg_specs,
+            )?;
         }
 
+        Ok(())
+    }
+
+    /// Fast path for global aggregates (COUNT(*), SUM(x), etc. with no GROUP BY).
+    fn process_batch_no_groups(&mut self, batch: &RecordBatch) -> Result<(), DbError> {
+        let empty_key: Vec<ScalarValue> = Vec::new();
+        if !self.groups.contains_key(&empty_key) {
+            let mut accs = Vec::with_capacity(self.agg_specs.len());
+            for spec in &self.agg_specs {
+                accs.push(spec.create_accumulator()?);
+            }
+            self.groups.insert(empty_key.clone(), accs);
+        }
+        let accs = self.groups.get_mut(&empty_key).unwrap();
+        #[allow(clippy::cast_possible_truncation)]
+        let all_indices: Vec<u32> = (0..batch.num_rows() as u32).collect();
+        Self::update_group_accumulators(accs, batch, &all_indices, &self.agg_specs)
+    }
+
+    /// Convert an `OwnedRow` back to a `Vec<ScalarValue>` group key,
+    /// casting types to match `self.group_types` when needed.
+    fn row_to_scalar_key(
+        &self,
+        converter: &arrow::row::RowConverter,
+        row_key: &arrow::row::OwnedRow,
+    ) -> Result<Vec<ScalarValue>, DbError> {
+        let row_as_cols = converter
+            .convert_rows(std::iter::once(row_key.row()))
+            .map_err(|e| DbError::Pipeline(format!("row→key: {e}")))?;
+
+        let mut sv_key = Vec::with_capacity(self.num_group_cols);
+        for (col_idx, arr) in row_as_cols.iter().enumerate() {
+            let sv = ScalarValue::try_from_array(arr, 0)
+                .map_err(|e| DbError::Pipeline(format!("group key decode: {e}")))?;
+            if sv.data_type() == self.group_types[col_idx] {
+                sv_key.push(sv);
+            } else {
+                sv_key.push(sv.cast_to(&self.group_types[col_idx]).unwrap_or(sv));
+            }
+        }
+        Ok(sv_key)
+    }
+
+    /// Update accumulators for a single group given the row indices.
+    fn update_group_accumulators(
+        accs: &mut [Box<dyn datafusion_expr::Accumulator>],
+        batch: &RecordBatch,
+        indices: &[u32],
+        agg_specs: &[AggFuncSpec],
+    ) -> Result<(), DbError> {
+        let index_array = arrow::array::UInt32Array::from(indices.to_vec());
+
+        for (i, spec) in agg_specs.iter().enumerate() {
+            let mut input_arrays: Vec<ArrayRef> =
+                Vec::with_capacity(spec.input_col_indices.len());
+            for &col_idx in &spec.input_col_indices {
+                let arr = compute::take(batch.column(col_idx), &index_array, None)
+                    .map_err(|e| DbError::Pipeline(format!("array take failed: {e}")))?;
+                input_arrays.push(arr);
+            }
+
+            if let Some(filter_idx) = spec.filter_col_index {
+                let filter_arr =
+                    compute::take(batch.column(filter_idx), &index_array, None)
+                        .map_err(|e| DbError::Pipeline(format!("filter take: {e}")))?;
+                if let Some(mask) = filter_arr
+                    .as_any()
+                    .downcast_ref::<arrow::array::BooleanArray>()
+                {
+                    let mut filtered = Vec::with_capacity(input_arrays.len());
+                    for arr in &input_arrays {
+                        filtered.push(compute::filter(arr, mask).map_err(|e| {
+                            DbError::Pipeline(format!("filter apply: {e}"))
+                        })?);
+                    }
+                    input_arrays = filtered;
+                }
+            }
+
+            accs[i].update_batch(&input_arrays).map_err(|e| {
+                DbError::Pipeline(format!("accumulator update: {e}"))
+            })?;
+        }
         Ok(())
     }
 

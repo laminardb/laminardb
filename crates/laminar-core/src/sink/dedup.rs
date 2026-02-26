@@ -260,7 +260,7 @@ impl DeduplicationStore for InMemoryDedup {
 /// Uses probabilistic deduplication - may have false positives
 /// (treating new records as duplicates) but never false negatives.
 /// Good for append-only sinks where occasional duplicates are acceptable.
-#[allow(dead_code)] // Public API for Phase 3 connector implementations
+#[allow(dead_code)]
 pub struct BloomFilterDedup {
     /// Bloom filter bits
     bits: Vec<u64>,
@@ -275,7 +275,7 @@ pub struct BloomFilterDedup {
     count: usize,
 }
 
-#[allow(dead_code)] // Public API for Phase 3 connector implementations
+#[allow(dead_code)]
 impl BloomFilterDedup {
     /// Create a new bloom filter dedup with target false positive rate
     ///

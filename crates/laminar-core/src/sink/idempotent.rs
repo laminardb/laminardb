@@ -49,13 +49,13 @@ impl RecordIdExtractor for DefaultIdExtractor {
 
 /// Column-based ID extractor that uses specific column values
 #[derive(Debug, Clone)]
-#[allow(dead_code)] // Public API for Phase 3 connector implementations
+#[allow(dead_code)]
 pub struct ColumnIdExtractor {
     /// Column names to use as the ID
     columns: Vec<String>,
 }
 
-#[allow(dead_code)] // Public API for Phase 3 connector implementations
+#[allow(dead_code)]
 impl ColumnIdExtractor {
     /// Create a new column-based extractor
     #[must_use]

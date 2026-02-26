@@ -354,7 +354,7 @@ pub enum FanOutError {
 /// Coordinates fan-out aggregate queries across delta nodes.
 ///
 /// The coordinator maintains a configuration and metrics. The actual
-/// gRPC transport is injected when `execute` is wired up (Phase 6b).
+/// gRPC transport is injected when `execute` is wired up.
 /// For now the coordinator provides routing logic, quorum evaluation,
 /// and result merging.
 pub struct FanOutCoordinator {

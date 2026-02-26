@@ -16,7 +16,7 @@ pub mod foyer_cache;
 #[cfg(feature = "delta")]
 pub mod partitioned;
 pub mod predicate;
-/// Async lookup source trait for Phase 6.
+/// Async lookup source trait.
 pub mod source;
 /// Lookup table trait and configuration.
 pub mod table;
