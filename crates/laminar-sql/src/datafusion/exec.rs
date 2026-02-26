@@ -13,7 +13,7 @@ use datafusion::execution::{SendableRecordBatchStream, TaskContext};
 use datafusion::physical_expr::{
     expressions::Column, EquivalenceProperties, LexOrdering, Partitioning, PhysicalSortExpr,
 };
-use datafusion::physical_plan::execution_plan::{Boundedness, EmissionType};
+use datafusion::physical_plan::execution_plan::{Boundedness, EmissionType, SchedulingType};
 use datafusion::physical_plan::{DisplayAs, DisplayFormatType, ExecutionPlan, PlanProperties};
 use datafusion_common::DataFusionError;
 use datafusion_expr::Expr;
@@ -83,7 +83,10 @@ impl StreamingScanExec {
         // Build equivalence properties, optionally with source ordering
         let eq_properties = Self::build_equivalence_properties(&schema, source_ordering.as_deref());
 
-        // Build plan properties for an unbounded streaming source
+        // Build plan properties for an unbounded streaming source.
+        // SchedulingType::NonCooperative causes DataFusion's EnsureCooperative
+        // optimizer rule to auto-wrap this leaf with CooperativeExec, which
+        // yields to the Tokio executor periodically (F-SSQL-005).
         let properties = PlanProperties::new(
             eq_properties,
             Partitioning::UnknownPartitioning(1), // Single partition for streaming
@@ -91,7 +94,8 @@ impl StreamingScanExec {
             Boundedness::Unbounded {
                 requires_infinite_memory: false,
             }, // Streaming is unbounded
-        );
+        )
+        .with_scheduling_type(SchedulingType::NonCooperative);
 
         Self {
             source,
@@ -460,5 +464,49 @@ mod tests {
 
         // "name" is not in the projection -> ordering should be None
         assert!(exec.output_ordering().is_none());
+    }
+
+    // --- Cooperative scheduling tests (F-SSQL-005) ---
+
+    #[test]
+    fn test_streaming_scan_exec_scheduling_type() {
+        let schema = test_schema();
+        let source: StreamSourceRef = Arc::new(MockSource::new(schema));
+        let exec = StreamingScanExec::new(source, None, vec![]);
+
+        // StreamingScanExec declares NonCooperative so that DataFusion's
+        // EnsureCooperative optimizer auto-wraps it with CooperativeExec.
+        assert_eq!(
+            exec.properties().scheduling_type,
+            SchedulingType::NonCooperative,
+        );
+    }
+
+    #[tokio::test]
+    async fn test_cooperative_exec_wraps_streaming_scan() {
+        use crate::datafusion::{
+            create_streaming_context, ChannelStreamSource, StreamingTableProvider,
+        };
+        use arrow_schema::{DataType, Field, Schema};
+
+        let ctx = create_streaming_context();
+        let schema = Arc::new(Schema::new(vec![
+            Field::new("id", DataType::Int64, false),
+            Field::new("value", DataType::Float64, true),
+        ]));
+
+        let source = Arc::new(ChannelStreamSource::new(Arc::clone(&schema)));
+        let _sender = source.take_sender();
+        let provider = StreamingTableProvider::new("events", source);
+        ctx.register_table("events", Arc::new(provider)).unwrap();
+
+        // Create a physical plan and verify CooperativeExec wrapping
+        let df = ctx.sql("SELECT id FROM events").await.unwrap();
+        let plan = df.create_physical_plan().await.unwrap();
+        let plan_str = format!("{}", datafusion::physical_plan::displayable(plan.as_ref()).indent(true));
+        assert!(
+            plan_str.contains("CooperativeExec"),
+            "Expected CooperativeExec wrapper around StreamingScanExec, got:\n{plan_str}"
+        );
     }
 }
