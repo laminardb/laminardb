@@ -23,8 +23,8 @@ use sqlparser::parser::Parser;
 use laminar_sql::parser::join_parser::analyze_joins;
 use laminar_sql::parser::{EmitClause, EmitStrategy as SqlEmitStrategy};
 use laminar_sql::translator::{
-    AsofJoinTranslatorConfig, JoinOperatorConfig, OrderOperatorConfig, WindowOperatorConfig,
-    WindowType,
+    AsofJoinTranslatorConfig, JoinOperatorConfig, OrderOperatorConfig,
+    TemporalJoinTranslatorConfig, WindowOperatorConfig, WindowType,
 };
 
 use crate::aggregate_state::IncrementalAggState;
@@ -137,6 +137,8 @@ pub(crate) struct StreamQuery {
     /// Rewritten projection SQL to apply aliases/expressions after the ASOF
     /// join result is registered as `__asof_tmp`.
     pub projection_sql: Option<String>,
+    /// Temporal join config (set when the query contains FOR `SYSTEM_TIME` AS OF).
+    pub temporal_config: Option<TemporalJoinTranslatorConfig>,
     /// EMIT clause from the planner (e.g., `OnWindowClose`, `Final`).
     pub emit_clause: Option<EmitClause>,
     /// Window configuration from the planner (window type, size, gap, etc.).
@@ -272,6 +274,7 @@ impl StreamExecutor {
         order_config: Option<OrderOperatorConfig>,
     ) {
         let (asof_config, projection_sql) = detect_asof_query(&sql);
+        let temporal_config = detect_temporal_query(&sql);
         let table_refs = extract_table_references(&sql);
         let idx = self.queries.len();
         let query = StreamQuery {
@@ -279,6 +282,7 @@ impl StreamExecutor {
             sql,
             asof_config,
             projection_sql,
+            temporal_config,
             emit_clause,
             window_config,
             order_config,
@@ -410,6 +414,7 @@ impl StreamExecutor {
             let idx = self.topo_order[i];
             let is_eowc = self.queries[idx].suppresses_intermediate();
             let has_asof = self.queries[idx].asof_config.is_some();
+            let has_temporal = self.queries[idx].temporal_config.is_some();
 
             // ── EOWC branch: accumulate and gate on watermark ──
             // Clone query fields only in branches needing &mut self.
@@ -440,6 +445,19 @@ impl StreamExecutor {
                     &query_name,
                     &cfg,
                     projection_sql.as_deref(),
+                    source_batches,
+                    &results,
+                )
+                .await?
+            } else if has_temporal {
+                let query_name = self.queries[idx].name.clone();
+                let cfg = self.queries[idx]
+                    .temporal_config
+                    .clone()
+                    .expect("has_temporal guard ensures temporal_config is Some");
+                self.execute_temporal_query(
+                    &query_name,
+                    &cfg,
                     source_batches,
                     &results,
                 )
@@ -694,13 +712,13 @@ impl StreamExecutor {
                 vec![batches.to_vec()],
             )
             .map_err(|e| {
-                DbError::Pipeline(format!("HAVING setup: {e}"))
+                DbError::query_pipeline(query_name, &e)
             })?;
         let _ = self.ctx.deregister_table(&table_name);
         self.ctx
             .register_table(&table_name, Arc::new(mem_table))
             .map_err(|e| {
-                DbError::Pipeline(format!("HAVING register: {e}"))
+                DbError::query_pipeline(query_name, &e)
             })?;
 
         let result = match self.ctx.sql(&filter_sql).await {
@@ -1185,11 +1203,20 @@ impl StreamExecutor {
 
         // Execute the query
         let query_sql = &self.queries[idx].sql;
+        let temporal_config = self.queries[idx].temporal_config.as_ref();
         let batches = if let Some(cfg) = asof_config {
             self.execute_asof_query(
                 query_name,
                 cfg,
                 projection_sql,
+                &filtered_sources,
+                intermediate_results,
+            )
+            .await?
+        } else if let Some(tcfg) = temporal_config {
+            self.execute_temporal_query(
+                query_name,
+                tcfg,
                 &filtered_sources,
                 intermediate_results,
             )
@@ -1277,6 +1304,46 @@ impl StreamExecutor {
         } else {
             Ok(vec![joined])
         }
+    }
+
+    /// Execute a temporal join query by fetching stream/table batches and
+    /// performing a point-in-time version lookup.
+    async fn execute_temporal_query(
+        &self,
+        query_name: &str,
+        config: &TemporalJoinTranslatorConfig,
+        source_batches: &HashMap<String, Vec<RecordBatch>>,
+        intermediate_results: &HashMap<String, Vec<RecordBatch>>,
+    ) -> Result<Vec<RecordBatch>, DbError> {
+        let stream_batches = self
+            .resolve_table_batches(
+                &config.stream_table,
+                source_batches,
+                intermediate_results,
+            )
+            .await?;
+        let table_batches = self
+            .resolve_table_batches(
+                &config.table_name,
+                source_batches,
+                intermediate_results,
+            )
+            .await?;
+
+        let joined = crate::temporal_batch::execute_temporal_join_batch(
+            &stream_batches,
+            &table_batches,
+            config,
+        )
+        .map_err(|e| {
+            DbError::Pipeline(format!("temporal join [{query_name}]: {e}"))
+        })?;
+
+        if joined.num_rows() == 0 {
+            return Ok(Vec::new());
+        }
+
+        Ok(vec![joined])
     }
 
     /// Resolve batches for a table name by checking source batches first,
@@ -1625,6 +1692,38 @@ fn detect_asof_query(sql: &str) -> (Option<AsofJoinTranslatorConfig>, Option<Str
     let projection_sql = build_projection_sql(select, asof_analysis, &config);
 
     (Some(config), Some(projection_sql))
+}
+
+fn detect_temporal_query(sql: &str) -> Option<TemporalJoinTranslatorConfig> {
+    let Ok(statements) = laminar_sql::parse_streaming_sql(sql) else {
+        return None;
+    };
+
+    let Some(laminar_sql::parser::StreamingStatement::Standard(stmt)) = statements.first() else {
+        return None;
+    };
+
+    let Statement::Query(query) = stmt.as_ref() else {
+        return None;
+    };
+
+    let SetExpr::Select(select) = query.body.as_ref() else {
+        return None;
+    };
+
+    let Ok(Some(multi)) = analyze_joins(select) else {
+        return None;
+    };
+
+    let temporal_analysis = multi.joins.iter().find(|j| j.is_temporal_join)?;
+
+    let JoinOperatorConfig::Temporal(config) =
+        JoinOperatorConfig::from_analysis(temporal_analysis)
+    else {
+        return None;
+    };
+
+    Some(config)
 }
 
 /// Build a `SELECT ... FROM __asof_tmp` projection query from the original

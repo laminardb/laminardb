@@ -48,6 +48,7 @@ mod core_window_state;
 pub mod recovery_manager;
 mod sql_utils;
 mod stream_executor;
+mod temporal_batch;
 mod table_backend;
 mod table_cache_mode;
 mod table_provider;

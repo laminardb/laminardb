@@ -66,11 +66,17 @@ pub enum LookupJoinType {
 /// Configuration for temporal join operator (FOR SYSTEM_TIME AS OF).
 #[derive(Debug, Clone)]
 pub struct TemporalJoinTranslatorConfig {
+    /// Stream (left) side table name
+    pub stream_table: String,
+    /// Table (right) side table name
+    pub table_name: String,
     /// Stream side key column
     pub stream_key_column: String,
     /// Table side key column
     pub table_key_column: String,
-    /// Version column from FOR SYSTEM_TIME AS OF
+    /// Stream-side column for lookup timestamp (from `FOR SYSTEM_TIME AS OF`)
+    pub stream_time_column: String,
+    /// Table-side version column (defaults to same as `stream_time_column`)
     pub table_version_column: String,
     /// Temporal semantics: "event_time" or "process_time"
     pub semantics: String,
@@ -237,10 +243,17 @@ impl JoinOperatorConfig {
                 JoinType::Left => "left",
                 _ => "inner",
             };
+            let version_col = analysis
+                .temporal_version_column
+                .clone()
+                .unwrap_or_default();
             return JoinOperatorConfig::Temporal(TemporalJoinTranslatorConfig {
+                stream_table: analysis.left_table.clone(),
+                table_name: analysis.right_table.clone(),
                 stream_key_column: analysis.left_key_column.clone(),
                 table_key_column: analysis.right_key_column.clone(),
-                table_version_column: analysis.temporal_version_column.clone().unwrap_or_default(),
+                stream_time_column: version_col.clone(),
+                table_version_column: version_col,
                 semantics: "event_time".to_string(),
                 join_type: join_type_str.to_string(),
             });

@@ -378,11 +378,11 @@ fn map_join_operator(op: &JoinOperator) -> JoinType {
         }
         JoinOperator::Left(_) | JoinOperator::LeftOuter(_) => JoinType::Left,
         JoinOperator::LeftSemi(_) | JoinOperator::Semi(_) => JoinType::LeftSemi,
-        JoinOperator::LeftAnti(_) => JoinType::LeftAnti,
+        JoinOperator::LeftAnti(_) | JoinOperator::Anti(_) => JoinType::LeftAnti,
         JoinOperator::AsOf { .. } => JoinType::AsOf,
         JoinOperator::Right(_) | JoinOperator::RightOuter(_) => JoinType::Right,
         JoinOperator::RightSemi(_) => JoinType::RightSemi,
-        JoinOperator::RightAnti(_) | JoinOperator::Anti(_) => JoinType::RightAnti,
+        JoinOperator::RightAnti(_) => JoinType::RightAnti,
         JoinOperator::FullOuter(_) => JoinType::Full,
         // CrossJoin, CrossApply, OuterApply are rejected by get_join_constraint()
         _ => JoinType::Inner,
@@ -1311,6 +1311,22 @@ mod tests {
 
         assert!(!analysis.is_temporal_join);
         assert!(analysis.temporal_version_column.is_none());
+    }
+
+    #[test]
+    fn test_unqualified_anti_maps_to_left_anti() {
+        let sql = "SELECT * FROM orders o ANTI JOIN returns r ON o.id = r.order_id";
+        let select = parse_select(sql);
+        let analysis = analyze_join(&select).unwrap().unwrap();
+        assert_eq!(analysis.join_type, JoinType::LeftAnti);
+    }
+
+    #[test]
+    fn test_unqualified_semi_maps_to_left_semi() {
+        let sql = "SELECT * FROM orders o SEMI JOIN payments p ON o.id = p.order_id";
+        let select = parse_select(sql);
+        let analysis = analyze_join(&select).unwrap().unwrap();
+        assert_eq!(analysis.join_type, JoinType::LeftSemi);
     }
 
     #[test]
