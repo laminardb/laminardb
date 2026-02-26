@@ -41,14 +41,16 @@ pub mod translator;
 
 // Re-export key types
 pub use parser::{parse_streaming_sql, StreamingStatement};
+pub use planner::streaming_optimizer::{StreamingPhysicalValidator, StreamingValidatorMode};
 pub use planner::StreamingPlanner;
 pub use translator::{OrderOperatorConfig, WindowOperatorConfig, WindowType};
 
 // Re-export types
 pub use datafusion::execute::execute_streaming_sql;
 pub use datafusion::{
-    base_session_config, create_session_context, register_streaming_functions,
-    register_streaming_functions_with_watermark, DdlResult, QueryResult, StreamingSqlResult,
+    base_session_config, create_session_context, create_streaming_context_with_validator,
+    register_streaming_functions, register_streaming_functions_with_watermark, DdlResult,
+    QueryResult, StreamingSqlResult,
 };
 
 /// Result type for SQL operations
