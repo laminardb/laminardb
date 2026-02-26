@@ -902,8 +902,8 @@ impl StreamExecutor {
                         Ok(Some(state)) => {
                             tracing::info!(
                                 query = query_name,
-                                "EOWC query routed to core window \
-                                 tumbling window pipeline"
+                                window_type = ?cfg_clone.window_type,
+                                "EOWC query routed to core window pipeline"
                             );
                             self.core_window_states.insert(idx, state);
                             self.try_restore_pending_core_window(idx);
