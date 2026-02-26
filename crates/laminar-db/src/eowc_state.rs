@@ -181,6 +181,14 @@ impl IncrementalEowcState {
             return Ok(None);
         }
 
+        // Bail out if the top-level plan has a non-trivial projection above
+        // the Aggregate (e.g., SUM(a)/SUM(b) AS ratio, CASE WHEN ... END).
+        // The incremental accumulator emits raw aggregate outputs and cannot
+        // apply post-aggregate projections.  Fall through to EOWC raw-batch.
+        if top_schema.fields().len() != agg_schema.fields().len() {
+            return Ok(None);
+        }
+
         let num_group_cols = group_exprs.len();
 
         // Resolve group-by column names and types

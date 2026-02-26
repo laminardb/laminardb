@@ -335,6 +335,14 @@ impl IncrementalAggState {
             return Ok(None);
         }
 
+        // Bail out if the top-level plan has a non-trivial projection above
+        // the Aggregate (e.g., SUM(a)/SUM(b) AS ratio, CASE WHEN ... END).
+        // The incremental accumulator emits raw aggregate outputs and cannot
+        // apply post-aggregate projections.  Fall through to EOWC raw-batch.
+        if top_schema.fields().len() != agg_schema.fields().len() {
+            return Ok(None);
+        }
+
         let num_group_cols = group_exprs.len();
 
         // Resolve group-by column names and types.
@@ -898,6 +906,59 @@ fn scalar_value_to_sql(sv: &ScalarValue) -> String {
         ScalarValue::Boolean(Some(b)) => {
             if *b { "TRUE" } else { "FALSE" }.to_string()
         }
+        ScalarValue::IntervalDayTime(Some(v)) => {
+            let mut parts = Vec::new();
+            if v.days != 0 {
+                parts.push(format!("{} days", v.days));
+            }
+            if v.milliseconds != 0 || parts.is_empty() {
+                let abs_ms = v.milliseconds.unsigned_abs();
+                let secs = abs_ms / 1000;
+                let frac = abs_ms % 1000;
+                let sign = if v.milliseconds < 0 { "-" } else { "" };
+                if frac == 0 {
+                    parts.push(format!("{sign}{secs} seconds"));
+                } else {
+                    parts.push(format!("{sign}{secs}.{frac:03} seconds"));
+                }
+            }
+            format!("INTERVAL '{}'", parts.join(" "))
+        }
+        ScalarValue::IntervalYearMonth(Some(v)) => {
+            let years = v / 12;
+            let months = v % 12;
+            let mut parts = Vec::new();
+            if years != 0 {
+                parts.push(format!("{years} years"));
+            }
+            if months != 0 || parts.is_empty() {
+                parts.push(format!("{months} months"));
+            }
+            format!("INTERVAL '{}'", parts.join(" "))
+        }
+        ScalarValue::IntervalMonthDayNano(Some(v)) => {
+            let mut parts = Vec::new();
+            if v.months != 0 {
+                parts.push(format!("{} months", v.months));
+            }
+            if v.days != 0 {
+                parts.push(format!("{} days", v.days));
+            }
+            let nanos = v.nanoseconds;
+            if nanos != 0 || parts.is_empty() {
+                let abs_ns = nanos.unsigned_abs();
+                let secs = abs_ns / 1_000_000_000;
+                let remainder_ns = abs_ns % 1_000_000_000;
+                let sign = if nanos < 0 { "-" } else { "" };
+                if remainder_ns == 0 {
+                    parts.push(format!("{sign}{secs} seconds"));
+                } else {
+                    let millis = remainder_ns / 1_000_000;
+                    parts.push(format!("{sign}{secs}.{millis:03} seconds"));
+                }
+            }
+            format!("INTERVAL '{}'", parts.join(" "))
+        }
         _ => sv.to_string(),
     }
 }
@@ -1166,6 +1227,83 @@ pub(crate) fn resolve_expr_type(
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn test_interval_day_time_seconds_only() {
+        use arrow::datatypes::IntervalDayTime;
+        let sv = ScalarValue::IntervalDayTime(Some(IntervalDayTime::new(0, 10_000)));
+        let sql = scalar_value_to_sql(&sv);
+        assert_eq!(sql, "INTERVAL '10 seconds'");
+    }
+
+    #[test]
+    fn test_interval_day_time_days_only() {
+        use arrow::datatypes::IntervalDayTime;
+        let sv = ScalarValue::IntervalDayTime(Some(IntervalDayTime::new(3, 0)));
+        let sql = scalar_value_to_sql(&sv);
+        assert_eq!(sql, "INTERVAL '3 days'");
+    }
+
+    #[test]
+    fn test_interval_day_time_mixed() {
+        use arrow::datatypes::IntervalDayTime;
+        let sv = ScalarValue::IntervalDayTime(Some(IntervalDayTime::new(1, 5_500)));
+        let sql = scalar_value_to_sql(&sv);
+        assert_eq!(sql, "INTERVAL '1 days 5.500 seconds'");
+    }
+
+    #[test]
+    fn test_interval_year_month() {
+        let sv = ScalarValue::IntervalYearMonth(Some(15));
+        let sql = scalar_value_to_sql(&sv);
+        assert_eq!(sql, "INTERVAL '1 years 3 months'");
+    }
+
+    #[test]
+    fn test_interval_month_day_nano() {
+        use arrow::datatypes::IntervalMonthDayNano;
+        let sv = ScalarValue::IntervalMonthDayNano(Some(
+            IntervalMonthDayNano::new(2, 1, 3_000_000_000),
+        ));
+        let sql = scalar_value_to_sql(&sv);
+        assert_eq!(sql, "INTERVAL '2 months 1 days 3 seconds'");
+    }
+
+    #[tokio::test]
+    async fn test_try_from_sql_rejects_post_aggregate_projection() {
+        let ctx = laminar_sql::create_session_context();
+        let schema = Arc::new(Schema::new(vec![
+            Field::new("name", DataType::Utf8, false),
+            Field::new("a", DataType::Float64, false),
+            Field::new("b", DataType::Float64, false),
+        ]));
+        let batch = RecordBatch::try_new(
+            Arc::clone(&schema),
+            vec![
+                Arc::new(arrow::array::StringArray::from(vec!["x"])),
+                Arc::new(arrow::array::Float64Array::from(vec![1.0])),
+                Arc::new(arrow::array::Float64Array::from(vec![2.0])),
+            ],
+        )
+        .unwrap();
+        let mem_table =
+            datafusion::datasource::MemTable::try_new(schema, vec![vec![batch]])
+                .unwrap();
+        ctx.register_table("events", Arc::new(mem_table)).unwrap();
+
+        // SUM(a)/SUM(b) collapses 2 aggregates into 1 derived column →
+        // top_schema fields != agg_schema fields → should return None.
+        let result = IncrementalAggState::try_from_sql(
+            &ctx,
+            "SELECT name, SUM(a) / SUM(b) AS ratio FROM events GROUP BY name",
+        )
+        .await
+        .unwrap();
+        assert!(
+            result.is_none(),
+            "Post-aggregate projection should return None"
+        );
+    }
 
     #[test]
     fn test_extract_clauses_simple() {

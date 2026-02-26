@@ -180,6 +180,14 @@ impl CoreWindowState {
             return Ok(None);
         }
 
+        // Bail out if the top-level plan has a non-trivial projection above
+        // the Aggregate (e.g., SUM(a)/SUM(b) AS ratio, CASE WHEN ... END).
+        // The incremental accumulator emits raw aggregate outputs and cannot
+        // apply post-aggregate projections.  Fall through to EOWC raw-batch.
+        if top_schema.fields().len() != agg_schema.fields().len() {
+            return Ok(None);
+        }
+
         let num_group_cols = group_exprs.len();
 
         // Resolve group-by column names and types
@@ -2065,5 +2073,58 @@ mod tests {
             .downcast_ref::<Int64Array>()
             .unwrap();
         assert_eq!(total.value(0), 60, "SUM should be 10+20+30=60 after restore");
+    }
+
+    #[tokio::test]
+    async fn test_try_from_sql_rejects_post_aggregate_projection() {
+        use arrow::datatypes::Field;
+
+        let ctx = laminar_sql::create_streaming_context_with_validator(
+            laminar_sql::StreamingValidatorMode::Off,
+        );
+        let schema = Arc::new(Schema::new(vec![
+            Field::new("symbol", DataType::Utf8, false),
+            Field::new("a", DataType::Float64, false),
+            Field::new("b", DataType::Float64, false),
+            Field::new("ts", DataType::Int64, false),
+        ]));
+        let batch = RecordBatch::try_new(
+            Arc::clone(&schema),
+            vec![
+                Arc::new(StringArray::from(vec!["X"])),
+                Arc::new(arrow::array::Float64Array::from(vec![1.0])),
+                Arc::new(arrow::array::Float64Array::from(vec![2.0])),
+                Arc::new(Int64Array::from(vec![1000])),
+            ],
+        )
+        .unwrap();
+        let mem_table =
+            datafusion::datasource::MemTable::try_new(schema, vec![vec![batch]])
+                .unwrap();
+        ctx.register_table("events", Arc::new(mem_table)).unwrap();
+
+        let config = laminar_sql::translator::WindowOperatorConfig {
+            window_type: laminar_sql::translator::WindowType::Tumbling,
+            time_column: "ts".to_string(),
+            size: std::time::Duration::from_secs(10),
+            slide: None,
+            gap: None,
+            allowed_lateness: std::time::Duration::ZERO,
+            emit_strategy: laminar_sql::parser::EmitStrategy::OnWindowClose,
+            late_data_side_output: None,
+        };
+
+        let result = CoreWindowState::try_from_sql(
+            &ctx,
+            "SELECT symbol, SUM(a) / SUM(b) AS ratio FROM events GROUP BY symbol, TUMBLE(ts, INTERVAL '10' SECOND)",
+            &config,
+            Some(&laminar_sql::parser::EmitClause::OnWindowClose),
+        )
+        .await
+        .unwrap();
+        assert!(
+            result.is_none(),
+            "Post-aggregate projection should return None"
+        );
     }
 }
