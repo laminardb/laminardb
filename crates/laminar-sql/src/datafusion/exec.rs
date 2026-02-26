@@ -19,6 +19,7 @@ use datafusion_common::DataFusionError;
 use datafusion_expr::Expr;
 
 use super::source::{SortColumn, StreamSourceRef};
+use super::watermark_filter::{WatermarkDynamicFilter, WatermarkFilterStream};
 
 /// A `DataFusion` execution plan that scans from a streaming source.
 ///
@@ -42,6 +43,8 @@ pub struct StreamingScanExec {
     filters: Vec<Expr>,
     /// Cached plan properties
     properties: PlanProperties,
+    /// Optional watermark filter applied at scan level (F-SSQL-006)
+    watermark_filter: Option<Arc<WatermarkDynamicFilter>>,
 }
 
 impl StreamingScanExec {
@@ -103,7 +106,25 @@ impl StreamingScanExec {
             projection,
             filters,
             properties,
+            watermark_filter: None,
         }
+    }
+
+    /// Attaches a watermark filter that drops late rows at scan time.
+    ///
+    /// When set, `execute()` wraps the inner stream with a
+    /// [`WatermarkFilterStream`] that applies `ts >= watermark` before
+    /// any downstream processing.
+    #[must_use]
+    pub fn with_watermark_filter(mut self, filter: Arc<WatermarkDynamicFilter>) -> Self {
+        self.watermark_filter = Some(filter);
+        self
+    }
+
+    /// Returns the watermark filter, if set.
+    #[must_use]
+    pub fn watermark_filter(&self) -> Option<&Arc<WatermarkDynamicFilter>> {
+        self.watermark_filter.as_ref()
     }
 
     /// Builds `EquivalenceProperties` with optional source ordering.
@@ -167,6 +188,7 @@ impl Debug for StreamingScanExec {
             .field("schema", &self.schema)
             .field("projection", &self.projection)
             .field("filters", &self.filters)
+            .field("watermark_filter", &self.watermark_filter)
             .finish_non_exhaustive()
     }
 }
@@ -240,8 +262,21 @@ impl ExecutionPlan for StreamingScanExec {
             )));
         }
 
-        self.source
-            .stream(self.projection.clone(), self.filters.clone())
+        let stream = self
+            .source
+            .stream(self.projection.clone(), self.filters.clone())?;
+
+        match &self.watermark_filter {
+            Some(filter) => {
+                let schema = stream.schema();
+                Ok(Box::pin(WatermarkFilterStream::new(
+                    stream,
+                    Arc::clone(filter),
+                    schema,
+                )))
+            }
+            None => Ok(stream),
+        }
     }
 }
 
@@ -508,5 +543,54 @@ mod tests {
             plan_str.contains("CooperativeExec"),
             "Expected CooperativeExec wrapper around StreamingScanExec, got:\n{plan_str}"
         );
+    }
+
+    // --- Watermark filter tests (F-SSQL-006) ---
+
+    #[test]
+    fn test_streaming_scan_with_watermark_filter() {
+        use std::sync::atomic::{AtomicI64, AtomicU64};
+        use super::WatermarkDynamicFilter;
+
+        let schema = test_schema();
+        let source: StreamSourceRef = Arc::new(MockSource::new(schema));
+        let filter = Arc::new(WatermarkDynamicFilter::new(
+            Arc::new(AtomicI64::new(100)),
+            Arc::new(AtomicU64::new(0)),
+            "id".to_string(),
+        ));
+
+        let exec = StreamingScanExec::new(source, None, vec![])
+            .with_watermark_filter(Arc::clone(&filter));
+
+        assert!(exec.watermark_filter().is_some());
+        assert_eq!(exec.watermark_filter().unwrap().watermark_ms(), 100);
+    }
+
+    #[test]
+    fn test_streaming_scan_watermark_filter_preserved() {
+        use std::sync::atomic::{AtomicI64, AtomicU64};
+        use super::WatermarkDynamicFilter;
+
+        let schema = test_schema();
+        let source: StreamSourceRef = Arc::new(MockSource::new(schema));
+        let filter = Arc::new(WatermarkDynamicFilter::new(
+            Arc::new(AtomicI64::new(200)),
+            Arc::new(AtomicU64::new(0)),
+            "id".to_string(),
+        ));
+
+        let exec = StreamingScanExec::new(source, None, vec![])
+            .with_watermark_filter(Arc::clone(&filter));
+
+        // with_new_children(empty) should preserve the watermark filter
+        let exec_arc: Arc<dyn ExecutionPlan> = Arc::new(exec);
+        let rebuilt = exec_arc.with_new_children(vec![]).unwrap();
+        let rebuilt_scan = rebuilt
+            .as_any()
+            .downcast_ref::<StreamingScanExec>()
+            .unwrap();
+        assert!(rebuilt_scan.watermark_filter().is_some());
+        assert_eq!(rebuilt_scan.watermark_filter().unwrap().watermark_ms(), 200);
     }
 }

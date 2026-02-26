@@ -96,6 +96,8 @@ pub mod lookup_join;
 pub mod proctime_udf;
 mod source;
 mod table_provider;
+/// Dynamic watermark filter for scan-level late-data pruning
+pub mod watermark_filter;
 /// Watermark UDF for current watermark access
 pub mod watermark_udf;
 /// Window function UDFs (TUMBLE, HOP, SESSION, CUMULATE)
@@ -136,6 +138,7 @@ pub use json_udf::{
 pub use proctime_udf::ProcTimeUdf;
 pub use source::{SortColumn, StreamSource, StreamSourceRef};
 pub use table_provider::StreamingTableProvider;
+pub use watermark_filter::WatermarkDynamicFilter;
 pub use watermark_udf::WatermarkUdf;
 pub use window_udf::{CumulateWindowStart, HopWindowStart, SessionWindowStart, TumbleWindowStart};
 
