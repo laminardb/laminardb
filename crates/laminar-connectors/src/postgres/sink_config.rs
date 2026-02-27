@@ -81,7 +81,7 @@ impl Default for PostgresSinkConfig {
             write_mode: WriteMode::Append,
             primary_key_columns: Vec::new(),
             batch_size: 4096,
-            flush_interval: Duration::from_secs(1),
+            flush_interval: Duration::from_millis(250),
             pool_size: 4,
             connect_timeout: Duration::from_secs(10),
             ssl_mode: SslMode::Prefer,

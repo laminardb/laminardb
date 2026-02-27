@@ -222,18 +222,10 @@ impl<'a> RecoveryManager<'a> {
                     continue;
                 }
 
-                let mut connector = sink.connector.lock().await;
-                match connector.rollback_epoch(manifest.epoch).await {
-                    Ok(()) => {
-                        result.sinks_rolled_back += 1;
-                        debug!(sink = %sink.name, epoch = manifest.epoch, "sink rolled back");
-                    }
-                    Err(e) => {
-                        let msg = format!("sink rollback failed: {e}");
-                        warn!(sink = %sink.name, error = %e, "sink rollback failed");
-                        result.sink_errors.insert(sink.name.clone(), msg);
-                    }
-                }
+                // Rollback is fire-and-forget via the task channel.
+                sink.handle.rollback_epoch(manifest.epoch).await;
+                result.sinks_rolled_back += 1;
+                debug!(sink = %sink.name, epoch = manifest.epoch, "sink rolled back");
             }
         }
 

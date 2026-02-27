@@ -331,7 +331,7 @@ impl SinkConnector for WebSocketSinkServer {
             watermark: None,
         };
 
-        let serialized = serde_json::to_string(&msg)
+        let serialized = serde_json::to_vec(&msg)
             .map_err(|e| ConnectorError::Serde(crate::error::SerdeError::Json(e.to_string())))?;
 
         let bytes_len = serialized.len() as u64;
