@@ -9,6 +9,7 @@ use std::time::Instant;
 use arrow_array::RecordBatch;
 use arrow_schema::{Schema, SchemaRef};
 use async_trait::async_trait;
+use tokio::sync::Notify;
 
 use crate::checkpoint::SourceCheckpoint;
 use crate::config::ConnectorConfig;
@@ -84,9 +85,20 @@ pub struct MySqlCdcSource {
     /// Last time we received data (for health checks).
     last_activity: Option<Instant>,
 
-    /// Active binlog stream (mysql_async feature only).
+    /// Notification handle signalled when binlog data arrives from the reader task.
+    data_ready: Arc<Notify>,
+
+    /// Channel receiver for decoded binlog messages from the background reader task.
     #[cfg(feature = "mysql-cdc")]
-    binlog_stream: Option<mysql_async::BinlogStream>,
+    msg_rx: Option<tokio::sync::mpsc::Receiver<BinlogMessage>>,
+
+    /// Background binlog reader task handle.
+    #[cfg(feature = "mysql-cdc")]
+    reader_handle: Option<tokio::task::JoinHandle<()>>,
+
+    /// Shutdown signal for the background reader task.
+    #[cfg(feature = "mysql-cdc")]
+    reader_shutdown: Option<tokio::sync::watch::Sender<bool>>,
 }
 
 // Manual Debug impl because BinlogStream doesn't implement Debug.
@@ -124,8 +136,13 @@ impl MySqlCdcSource {
             metrics: MySqlCdcMetrics::new(),
             schema: None,
             last_activity: None,
+            data_ready: Arc::new(Notify::new()),
             #[cfg(feature = "mysql-cdc")]
-            binlog_stream: None,
+            msg_rx: None,
+            #[cfg(feature = "mysql-cdc")]
+            reader_handle: None,
+            #[cfg(feature = "mysql-cdc")]
+            reader_shutdown: None,
         }
     }
 
@@ -278,7 +295,8 @@ impl SourceConnector for MySqlCdcSource {
             }
         }
 
-        // When mysql-cdc feature is enabled, establish a real connection.
+        // When mysql-cdc feature is enabled, establish a real connection
+        // and spawn a background reader task for event-driven wake-up.
         #[cfg(feature = "mysql-cdc")]
         {
             let conn = super::mysql_io::connect(&self.config).await?;
@@ -289,7 +307,51 @@ impl SourceConnector for MySqlCdcSource {
                 self.position.as_ref(),
             )
             .await?;
-            self.binlog_stream = Some(stream);
+
+            let (msg_tx, msg_rx) = tokio::sync::mpsc::channel(4096);
+            let (shutdown_tx, mut shutdown_rx) = tokio::sync::watch::channel(false);
+            let data_ready = Arc::clone(&self.data_ready);
+
+            let reader_handle = tokio::spawn(async move {
+                use futures_util::StreamExt as _;
+                let mut stream = stream;
+                loop {
+                    let event = tokio::select! {
+                        biased;
+                        _ = shutdown_rx.changed() => break,
+                        event = stream.next() => event,
+                    };
+                    match event {
+                        Some(Ok(raw_event)) => {
+                            match super::mysql_io::decode_binlog_event(&raw_event, &stream) {
+                                Ok(Some(msg)) => {
+                                    if msg_tx.send(msg).await.is_err() {
+                                        break;
+                                    }
+                                    data_ready.notify_one();
+                                }
+                                Ok(None) => {}
+                                Err(e) => {
+                                    tracing::warn!(error = %e, "binlog decode error");
+                                    break;
+                                }
+                            }
+                        }
+                        Some(Err(e)) => {
+                            tracing::warn!(error = %e, "binlog stream error");
+                            break;
+                        }
+                        None => break,
+                    }
+                }
+                if let Err(e) = stream.close().await {
+                    tracing::warn!(error = %e, "error closing binlog stream");
+                }
+            });
+
+            self.msg_rx = Some(msg_rx);
+            self.reader_handle = Some(reader_handle);
+            self.reader_shutdown = Some(shutdown_tx);
         }
 
         self.connected = true;
@@ -308,140 +370,129 @@ impl SourceConnector for MySqlCdcSource {
             ));
         }
 
-        // When mysql-cdc feature is enabled, read from the real binlog stream.
+        // Drain decoded binlog messages from background reader task.
         #[cfg(feature = "mysql-cdc")]
         {
-            let stream = self.binlog_stream.as_mut().ok_or_else(|| {
-                ConnectorError::Internal("binlog stream not initialized".to_string())
-            })?;
+            if let Some(rx) = self.msg_rx.as_mut() {
+                let mut last_table_info: Option<TableInfo> = None;
 
-            let events =
-                super::mysql_io::read_events(stream, max_records, self.config.poll_timeout).await?;
+                while self.event_buffer.len() < max_records {
+                    match rx.try_recv() {
+                        Ok(msg) => {
+                            self.metrics.inc_events_received();
+                            match msg {
+                                BinlogMessage::TableMap(tme) => {
+                                    self.metrics.inc_table_maps();
+                                    self.table_cache.update(&tme);
+                                }
+                                BinlogMessage::Insert(insert_msg) => {
+                                    if !self.config.should_include_table(
+                                        &insert_msg.database,
+                                        &insert_msg.table,
+                                    ) {
+                                        continue;
+                                    }
+                                    let row_count = insert_msg.rows.len() as u64;
+                                    let events = super::changelog::insert_to_events(
+                                        &insert_msg,
+                                        &self.current_binlog_file,
+                                        self.current_gtid.as_deref(),
+                                    );
+                                    self.event_buffer.extend(events);
+                                    self.metrics.inc_inserts(row_count);
+                                    last_table_info =
+                                        self.table_cache.get(insert_msg.table_id).cloned();
+                                }
+                                BinlogMessage::Update(update_msg) => {
+                                    if !self.config.should_include_table(
+                                        &update_msg.database,
+                                        &update_msg.table,
+                                    ) {
+                                        continue;
+                                    }
+                                    let row_count = update_msg.rows.len() as u64;
+                                    let events = super::changelog::update_to_events(
+                                        &update_msg,
+                                        &self.current_binlog_file,
+                                        self.current_gtid.as_deref(),
+                                    );
+                                    self.event_buffer.extend(events);
+                                    self.metrics.inc_updates(row_count);
+                                    last_table_info =
+                                        self.table_cache.get(update_msg.table_id).cloned();
+                                }
+                                BinlogMessage::Delete(delete_msg) => {
+                                    if !self.config.should_include_table(
+                                        &delete_msg.database,
+                                        &delete_msg.table,
+                                    ) {
+                                        continue;
+                                    }
+                                    let row_count = delete_msg.rows.len() as u64;
+                                    let events = super::changelog::delete_to_events(
+                                        &delete_msg,
+                                        &self.current_binlog_file,
+                                        self.current_gtid.as_deref(),
+                                    );
+                                    self.event_buffer.extend(events);
+                                    self.metrics.inc_deletes(row_count);
+                                    last_table_info =
+                                        self.table_cache.get(delete_msg.table_id).cloned();
+                                }
+                                BinlogMessage::Begin(begin_msg) => {
+                                    if let Some(ref gtid) = begin_msg.gtid {
+                                        self.current_gtid = Some(gtid.to_string());
+                                        if let Some(ref mut gtid_set) = self.gtid_set {
+                                            gtid_set.add(gtid);
+                                        }
+                                    } else {
+                                        self.current_gtid = None;
+                                    }
+                                }
+                                BinlogMessage::Commit(commit_msg) => {
+                                    self.metrics.inc_transactions();
+                                    self.metrics.set_binlog_position(commit_msg.binlog_position);
+                                    if let Some(ref mut pos) = self.position {
+                                        pos.position = commit_msg.binlog_position;
+                                    }
+                                }
+                                BinlogMessage::Rotate(rotate_msg) => {
+                                    self.current_binlog_file.clone_from(&rotate_msg.next_binlog);
+                                    if let Some(ref mut pos) = self.position {
+                                        pos.filename = rotate_msg.next_binlog;
+                                        pos.position = rotate_msg.position;
+                                    } else {
+                                        self.position = Some(BinlogPosition::new(
+                                            self.current_binlog_file.clone(),
+                                            rotate_msg.position,
+                                        ));
+                                    }
+                                }
+                                BinlogMessage::Query(query_msg) => {
+                                    self.metrics.inc_ddl_events();
+                                    let _ = query_msg;
+                                }
+                                BinlogMessage::Heartbeat => {
+                                    self.metrics.inc_heartbeats();
+                                }
+                            }
+                        }
+                        Err(_) => break,
+                    }
+                }
 
-            if events.is_empty() {
                 self.last_activity = Some(Instant::now());
+
+                if let Some(table_info) = last_table_info {
+                    if let Some(batch) = self.flush_events(&table_info)? {
+                        let schema = self.build_envelope_schema(&table_info.arrow_schema);
+                        self.schema = Some(schema);
+                        return Ok(Some(SourceBatch::new(batch)));
+                    }
+                }
+
                 return Ok(None);
             }
-
-            // Track the last table_id that had a TABLE_MAP so we can flush per-table.
-            let mut last_table_info: Option<TableInfo> = None;
-            let stream_ref = self.binlog_stream.as_ref().unwrap();
-
-            for event in &events {
-                self.metrics.inc_events_received();
-
-                let msg = super::mysql_io::decode_binlog_event(event, stream_ref)?;
-                let Some(msg) = msg else {
-                    continue;
-                };
-
-                match msg {
-                    BinlogMessage::TableMap(tme) => {
-                        self.metrics.inc_table_maps();
-                        self.table_cache.update(&tme);
-                    }
-                    BinlogMessage::Insert(insert_msg) => {
-                        if !self
-                            .config
-                            .should_include_table(&insert_msg.database, &insert_msg.table)
-                        {
-                            continue;
-                        }
-                        let row_count = insert_msg.rows.len() as u64;
-                        let events = super::changelog::insert_to_events(
-                            &insert_msg,
-                            &self.current_binlog_file,
-                            self.current_gtid.as_deref(),
-                        );
-                        self.event_buffer.extend(events);
-                        self.metrics.inc_inserts(row_count);
-                        last_table_info = self.table_cache.get(insert_msg.table_id).cloned();
-                    }
-                    BinlogMessage::Update(update_msg) => {
-                        if !self
-                            .config
-                            .should_include_table(&update_msg.database, &update_msg.table)
-                        {
-                            continue;
-                        }
-                        let row_count = update_msg.rows.len() as u64;
-                        let events = super::changelog::update_to_events(
-                            &update_msg,
-                            &self.current_binlog_file,
-                            self.current_gtid.as_deref(),
-                        );
-                        self.event_buffer.extend(events);
-                        self.metrics.inc_updates(row_count);
-                        last_table_info = self.table_cache.get(update_msg.table_id).cloned();
-                    }
-                    BinlogMessage::Delete(delete_msg) => {
-                        if !self
-                            .config
-                            .should_include_table(&delete_msg.database, &delete_msg.table)
-                        {
-                            continue;
-                        }
-                        let row_count = delete_msg.rows.len() as u64;
-                        let events = super::changelog::delete_to_events(
-                            &delete_msg,
-                            &self.current_binlog_file,
-                            self.current_gtid.as_deref(),
-                        );
-                        self.event_buffer.extend(events);
-                        self.metrics.inc_deletes(row_count);
-                        last_table_info = self.table_cache.get(delete_msg.table_id).cloned();
-                    }
-                    BinlogMessage::Begin(begin_msg) => {
-                        if let Some(ref gtid) = begin_msg.gtid {
-                            self.current_gtid = Some(gtid.to_string());
-                            if let Some(ref mut gtid_set) = self.gtid_set {
-                                gtid_set.add(gtid);
-                            }
-                        } else {
-                            self.current_gtid = None;
-                        }
-                    }
-                    BinlogMessage::Commit(commit_msg) => {
-                        self.metrics.inc_transactions();
-                        self.metrics.set_binlog_position(commit_msg.binlog_position);
-                        if let Some(ref mut pos) = self.position {
-                            pos.position = commit_msg.binlog_position;
-                        }
-                    }
-                    BinlogMessage::Rotate(rotate_msg) => {
-                        self.current_binlog_file.clone_from(&rotate_msg.next_binlog);
-                        if let Some(ref mut pos) = self.position {
-                            pos.filename = rotate_msg.next_binlog;
-                            pos.position = rotate_msg.position;
-                        } else {
-                            self.position = Some(BinlogPosition::new(
-                                self.current_binlog_file.clone(),
-                                rotate_msg.position,
-                            ));
-                        }
-                    }
-                    BinlogMessage::Query(query_msg) => {
-                        self.metrics.inc_ddl_events();
-                        let _ = query_msg; // DDL events are logged but not emitted.
-                    }
-                    BinlogMessage::Heartbeat => {
-                        self.metrics.inc_heartbeats();
-                    }
-                }
-            }
-
-            self.last_activity = Some(Instant::now());
-
-            // Flush buffered events to a RecordBatch.
-            if let Some(table_info) = last_table_info {
-                if let Some(batch) = self.flush_events(&table_info)? {
-                    let schema = self.build_envelope_schema(&table_info.arrow_schema);
-                    self.schema = Some(schema);
-                    return Ok(Some(SourceBatch::new(batch)));
-                }
-            }
-
-            return Ok(None);
         }
 
         // Without mysql-cdc feature: stub returns None.
@@ -502,13 +553,21 @@ impl SourceConnector for MySqlCdcSource {
         self.metrics.to_connector_metrics()
     }
 
+    fn data_ready_notify(&self) -> Option<Arc<Notify>> {
+        Some(Arc::clone(&self.data_ready))
+    }
+
     async fn close(&mut self) -> Result<(), ConnectorError> {
-        // Close the binlog stream if active.
+        // Signal reader task to shut down (it closes the binlog stream internally).
         #[cfg(feature = "mysql-cdc")]
-        if let Some(stream) = self.binlog_stream.take() {
-            if let Err(e) = stream.close().await {
-                tracing::warn!("error closing binlog stream: {}", e);
+        {
+            if let Some(tx) = self.reader_shutdown.take() {
+                let _ = tx.send(true);
             }
+            if let Some(handle) = self.reader_handle.take() {
+                let _ = tokio::time::timeout(std::time::Duration::from_secs(5), handle).await;
+            }
+            self.msg_rx = None;
         }
 
         self.connected = false;
