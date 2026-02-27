@@ -11,8 +11,8 @@ description = "External system connectors for LaminarDB - Kafka, CDC, lookup tab
 
 [dependencies]
 # Core dependencies
-laminar-core = { path = "../laminar-core", version = "0.15.0" }
-laminar-storage = { path = "../laminar-storage", version = "0.15.0" }
+laminar-core = { path = "../laminar-core", version = "0.16.0" }
+laminar-storage = { path = "../laminar-storage", version = "0.16.0" }
 
 # Kafka
 rdkafka = { version = "0.39", features = ["cmake-build"], optional = true }
@@ -68,8 +68,8 @@ csv = "1.3"
 tokio-util = { workspace = true, optional = true }
 
 # WebSocket
-tokio-tungstenite = { version = "0.26", features = ["native-tls"], optional = true }
-tungstenite = { version = "0.26", optional = true }
+tokio-tungstenite = { version = "0.28", features = ["native-tls"], optional = true }
+tungstenite = { version = "0.28", optional = true }
 futures-util = { version = "0.3", features = ["sink"], optional = true }
 
 [features]

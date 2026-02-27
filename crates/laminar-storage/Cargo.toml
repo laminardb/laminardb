@@ -11,7 +11,7 @@ description = "Storage layer for LaminarDB - WAL, checkpointing, and lakehouse i
 
 [dependencies]
 # Core dependency
-laminar-core = { path = "../laminar-core", version = "0.15.0" }
+laminar-core = { path = "../laminar-core", version = "0.16.0" }
 
 # Storage
 object_store = "0.13"  # For cloud storage

@@ -16,7 +16,7 @@ members = [
 resolver = "2"
 
 [workspace.package]
-version = "0.15.0"
+version = "0.16.0"
 authors = ["LaminarDB Contributors"]
 edition = "2021"
 rust-version = "1.85"
@@ -41,6 +41,9 @@ anyhow = "1.0"
 tracing = "0.1"
 tracing-subscriber = { version = "0.3", features = ["env-filter"] }
 chrono = "0.4"
+
+# Allocator
+tikv-jemallocator = "0.6"  # jemalloc for reduced fragmentation in Ring 1/2
 
 # Performance-critical
 rustc-hash = "2.1"  # Faster than std HashMap (replaces unmaintained fxhash)

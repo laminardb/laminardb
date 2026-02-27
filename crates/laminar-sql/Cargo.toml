@@ -11,7 +11,7 @@ description = "SQL layer for LaminarDB with streaming extensions"
 
 [dependencies]
 # Core dependency
-laminar-core = { path = "../laminar-core", version = "0.15.0" }
+laminar-core = { path = "../laminar-core", version = "0.16.0" }
 
 # DataFusion for SQL processing
 datafusion = { workspace = true }

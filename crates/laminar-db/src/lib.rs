@@ -41,6 +41,8 @@ mod eowc_state;
 mod error;
 mod handle;
 mod metrics;
+/// Event-driven connector pipeline (fan-out/fan-in architecture).
+pub mod pipeline;
 mod pipeline_checkpoint;
 /// Deployment profiles.
 pub mod profile;

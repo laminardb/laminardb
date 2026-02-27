@@ -9,12 +9,12 @@
 //! WebSocket is non-replayable. This connector provides **at-most-once** or
 //! **best-effort** delivery. On recovery, data gaps should be expected.
 
-use std::time::Instant;
+use std::sync::Arc;
 
 use arrow_schema::SchemaRef;
 use async_trait::async_trait;
 use futures_util::{SinkExt, StreamExt};
-use tokio::sync::mpsc;
+use tokio::sync::{mpsc, Notify};
 use tracing::{debug, info, warn};
 
 use crate::checkpoint::SourceCheckpoint;
@@ -71,6 +71,8 @@ pub struct WebSocketSource {
     message_buffer: Vec<Vec<u8>>,
     /// Maximum records per batch.
     max_batch_size: usize,
+    /// Notification handle signalled when data arrives from the reader task.
+    data_ready: Arc<Notify>,
 }
 
 impl WebSocketSource {
@@ -97,6 +99,7 @@ impl WebSocketSource {
             reader_handle: None,
             message_buffer: Vec::new(),
             max_batch_size: 1000,
+            data_ready: Arc::new(Notify::new()),
         }
     }
 
@@ -122,6 +125,7 @@ impl WebSocketSource {
         on_backpressure: BackpressureStrategy,
         tx: mpsc::Sender<WsMessage>,
         mut shutdown_rx: tokio::sync::watch::Receiver<bool>,
+        data_ready: Arc<Notify>,
     ) -> tokio::task::JoinHandle<()> {
         tokio::spawn(async move {
             let mut conn_mgr = ConnectionManager::new(urls, reconnect);
@@ -191,7 +195,7 @@ impl WebSocketSource {
                                         warn!(size = payload.len(), max = max_message_size, "message exceeds max size, dropping");
                                         continue;
                                     }
-                                    if send_with_backpressure(&tx, WsMessage::Data(payload), &on_backpressure).await.is_err() {
+                                    if send_with_backpressure(&tx, WsMessage::Data(payload), &on_backpressure, &data_ready).await.is_err() {
                                         break 'outer;
                                     }
                                 }
@@ -201,7 +205,7 @@ impl WebSocketSource {
                                         warn!(size = payload.len(), max = max_message_size, "message exceeds max size, dropping");
                                         continue;
                                     }
-                                    if send_with_backpressure(&tx, WsMessage::Data(payload), &on_backpressure).await.is_err() {
+                                    if send_with_backpressure(&tx, WsMessage::Data(payload), &on_backpressure, &data_ready).await.is_err() {
                                         break 'outer;
                                     }
                                 }
@@ -250,15 +254,17 @@ impl WebSocketSource {
 }
 
 /// Sends a message through the channel, applying the backpressure strategy
-/// if the channel is full.
+/// if the channel is full. Signals `data_ready` on successful send so the
+/// pipeline coordinator wakes immediately.
 ///
 /// Returns `Err(())` if the channel is closed (shutdown).
 async fn send_with_backpressure(
     tx: &mpsc::Sender<WsMessage>,
     msg: WsMessage,
     strategy: &BackpressureStrategy,
+    data_ready: &Notify,
 ) -> Result<(), ()> {
-    match strategy {
+    let result = match strategy {
         BackpressureStrategy::Block => tx.send(msg).await.map_err(|_| ()),
         BackpressureStrategy::DropNewest => match tx.try_send(msg) {
             Ok(()) | Err(tokio::sync::mpsc::error::TrySendError::Full(_)) => Ok(()),
@@ -273,7 +279,11 @@ async fn send_with_backpressure(
                 Err(tokio::sync::mpsc::error::TrySendError::Closed(_)) => Err(()),
             }
         }
+    };
+    if result.is_ok() {
+        data_ready.notify_one();
     }
+    result
 }
 
 #[async_trait]
@@ -350,6 +360,7 @@ impl SourceConnector for WebSocketSource {
             self.config.on_backpressure.clone(),
             tx,
             shutdown_rx,
+            Arc::clone(&self.data_ready),
         );
 
         self.conn_mgr = Some(ConnectionManager::new(urls, reconnect));
@@ -383,35 +394,27 @@ impl SourceConnector for WebSocketSource {
             })?;
 
         let limit = max_records.min(self.max_batch_size);
-        let deadline = Instant::now() + std::time::Duration::from_millis(100);
 
-        // Drain messages from the channel into the buffer.
+        // Non-blocking drain: pull all available messages from the channel.
+        // The pipeline coordinator handles wake-up timing via data_ready_notify().
         while self.message_buffer.len() < limit {
-            let remaining = deadline.saturating_duration_since(Instant::now());
-            if remaining.is_zero() {
-                break;
-            }
-
-            match tokio::time::timeout(remaining, rx.recv()).await {
-                Ok(Some(WsMessage::Data(payload))) => {
+            match rx.try_recv() {
+                Ok(WsMessage::Data(payload)) => {
                     self.metrics.record_message(payload.len() as u64);
                     self.message_buffer.push(payload);
                 }
-                Ok(Some(WsMessage::Disconnected(reason))) => {
+                Ok(WsMessage::Disconnected(reason)) => {
                     self.metrics.record_reconnect();
                     warn!(reason = %reason, "WebSocket disconnected");
                     break;
                 }
-                Ok(None) => {
+                Err(mpsc::error::TryRecvError::Empty) => break,
+                Err(mpsc::error::TryRecvError::Disconnected) => {
                     // Channel closed — reader task ended.
                     self.state = ConnectorState::Failed;
                     return Err(ConnectorError::ReadError(
                         "WebSocket reader task terminated".into(),
                     ));
-                }
-                Err(_) => {
-                    // Timeout — no more messages right now.
-                    break;
                 }
             }
         }
@@ -477,6 +480,10 @@ impl SourceConnector for WebSocketSource {
 
     fn metrics(&self) -> ConnectorMetrics {
         self.metrics.to_connector_metrics()
+    }
+
+    fn data_ready_notify(&self) -> Option<Arc<Notify>> {
+        Some(Arc::clone(&self.data_ready))
     }
 
     async fn close(&mut self) -> Result<(), ConnectorError> {

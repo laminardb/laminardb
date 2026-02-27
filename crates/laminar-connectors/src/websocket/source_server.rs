@@ -6,13 +6,12 @@
 
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::Arc;
-use std::time::Instant;
 
 use arrow_schema::SchemaRef;
 use async_trait::async_trait;
 use futures_util::StreamExt;
 use tokio::net::TcpListener;
-use tokio::sync::mpsc;
+use tokio::sync::{mpsc, Notify};
 use tracing::{debug, info, warn};
 
 use crate::checkpoint::SourceCheckpoint;
@@ -57,6 +56,8 @@ pub struct WebSocketSourceServer {
     connected_clients: Arc<AtomicU64>,
     /// Maximum records per batch.
     max_batch_size: usize,
+    /// Notification handle signalled when data arrives from client handler tasks.
+    data_ready: Arc<Notify>,
 }
 
 impl WebSocketSourceServer {
@@ -78,6 +79,7 @@ impl WebSocketSourceServer {
             message_buffer: Vec::new(),
             connected_clients: Arc::new(AtomicU64::new(0)),
             max_batch_size: 1000,
+            data_ready: Arc::new(Notify::new()),
         }
     }
 
@@ -136,6 +138,7 @@ impl SourceConnector for WebSocketSourceServer {
 
         let connected = Arc::clone(&self.connected_clients);
         let max_msg_size = self.config.max_message_size;
+        let data_ready = Arc::clone(&self.data_ready);
 
         let handle = tokio::spawn(async move {
             let mut shutdown_rx = shutdown_rx;
@@ -163,6 +166,7 @@ impl SourceConnector for WebSocketSourceServer {
                                 let tx = tx.clone();
                                 let connected = Arc::clone(&connected);
                                 let mut client_shutdown = shutdown_rx.clone();
+                                let data_ready = Arc::clone(&data_ready);
 
                                 connected.fetch_add(1, Ordering::Relaxed);
                                 debug!(addr = %addr, "accepted WebSocket client");
@@ -185,18 +189,20 @@ impl SourceConnector for WebSocketSourceServer {
                                                 match msg {
                                                     Some(Ok(tungstenite::Message::Text(text))) => {
                                                         let payload = text.as_bytes().to_vec();
-                                                        if payload.len() <= max_msg_size
-                                                            && tx.send(payload).await.is_err()
-                                                        {
-                                                            break;
+                                                        if payload.len() <= max_msg_size {
+                                                            if tx.send(payload).await.is_err() {
+                                                                break;
+                                                            }
+                                                            data_ready.notify_one();
                                                         }
                                                     }
                                                     Some(Ok(tungstenite::Message::Binary(data))) => {
                                                         let payload = data.to_vec();
-                                                        if payload.len() <= max_msg_size
-                                                            && tx.send(payload).await.is_err()
-                                                        {
-                                                            break;
+                                                        if payload.len() <= max_msg_size {
+                                                            if tx.send(payload).await.is_err() {
+                                                                break;
+                                                            }
+                                                            data_ready.notify_one();
                                                         }
                                                     }
                                                     Some(Ok(tungstenite::Message::Close(_))) | None => break,
@@ -258,20 +264,18 @@ impl SourceConnector for WebSocketSourceServer {
             })?;
 
         let limit = max_records.min(self.max_batch_size);
-        let deadline = Instant::now() + std::time::Duration::from_millis(100);
 
+        // Non-blocking drain: pull all available messages from the channel.
+        // The pipeline coordinator handles wake-up timing via data_ready_notify().
         while self.message_buffer.len() < limit {
-            let remaining = deadline.saturating_duration_since(Instant::now());
-            if remaining.is_zero() {
-                break;
-            }
-
-            match tokio::time::timeout(remaining, rx.recv()).await {
-                Ok(Some(payload)) => {
+            match rx.try_recv() {
+                Ok(payload) => {
                     self.metrics.record_message(payload.len() as u64);
                     self.message_buffer.push(payload);
                 }
-                Ok(None) | Err(_) => break,
+                Err(mpsc::error::TryRecvError::Empty | mpsc::error::TryRecvError::Disconnected) => {
+                    break
+                }
             }
         }
 
@@ -334,6 +338,10 @@ impl SourceConnector for WebSocketSourceServer {
 
     fn metrics(&self) -> ConnectorMetrics {
         self.metrics.to_connector_metrics()
+    }
+
+    fn data_ready_notify(&self) -> Option<Arc<Notify>> {
+        Some(Arc::clone(&self.data_ready))
     }
 
     async fn close(&mut self) -> Result<(), ConnectorError> {

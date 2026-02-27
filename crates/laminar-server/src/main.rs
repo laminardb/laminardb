@@ -1,5 +1,9 @@
 //! LaminarDB standalone server
 
+#[cfg(all(feature = "jemalloc", not(target_env = "msvc")))]
+#[global_allocator]
+static GLOBAL: tikv_jemallocator::Jemalloc = tikv_jemallocator::Jemalloc;
+
 use anyhow::Result;
 use clap::Parser;
 use tracing::info;
