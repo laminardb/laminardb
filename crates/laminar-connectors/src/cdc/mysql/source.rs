@@ -492,6 +492,9 @@ impl SourceConnector for MySqlCdcSource {
                 }
 
                 return Ok(None);
+            } else {
+                self.last_activity = Some(Instant::now());
+                return Ok(None);
             }
         }
 

@@ -564,7 +564,7 @@ impl SourceConnector for PostgresCdcSource {
                                             ..
                                         } => Some(WalPayload::XLogData {
                                             wal_end: wal_end.as_u64(),
-                                            data: data.clone(),
+                                            data: data.to_vec(),
                                         }),
                                         pgwire_replication::ReplicationEvent::KeepAlive {
                                             wal_end,
@@ -616,13 +616,14 @@ impl SourceConnector for PostgresCdcSource {
 
         // Drain WAL events from background reader task.
         #[cfg(feature = "postgres-cdc")]
-        if let Some(rx) = self.wal_rx.as_mut() {
+        if let Some(mut rx) = self.wal_rx.take() {
             while self.event_buffer.len() < max_records {
                 match rx.try_recv() {
                     Ok(payload) => self.process_wal_payload(payload)?,
                     Err(_) => break,
                 }
             }
+            self.wal_rx = Some(rx);
         }
 
         // Process any pending WAL messages (test injection path)
