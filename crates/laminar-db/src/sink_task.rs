@@ -31,9 +31,7 @@ const DEFAULT_FLUSH_INTERVAL: Duration = Duration::from_secs(5);
 #[allow(dead_code)]
 pub(crate) enum SinkCommand {
     /// Write a batch to the sink.
-    WriteBatch {
-        batch: RecordBatch,
-    },
+    WriteBatch { batch: RecordBatch },
     /// Explicitly flush buffered data.
     Flush {
         ack: oneshot::Sender<Result<(), ConnectorError>>,
@@ -49,9 +47,7 @@ pub(crate) enum SinkCommand {
         ack: oneshot::Sender<Result<(), ConnectorError>>,
     },
     /// Abort a failed epoch.
-    RollbackEpoch {
-        epoch: u64,
-    },
+    RollbackEpoch { epoch: u64 },
     /// Flush + close the connector and exit the task.
     Close,
 }
@@ -76,12 +72,14 @@ pub(crate) struct SinkTaskHandle {
 
 impl SinkTaskHandle {
     /// Spawns a new sink task and returns a handle.
-    pub fn spawn(
-        name: String,
-        connector: Box<dyn SinkConnector>,
-        exactly_once: bool,
-    ) -> Self {
-        Self::spawn_with_options(name, connector, exactly_once, DEFAULT_CHANNEL_CAPACITY, DEFAULT_FLUSH_INTERVAL)
+    pub fn spawn(name: String, connector: Box<dyn SinkConnector>, exactly_once: bool) -> Self {
+        Self::spawn_with_options(
+            name,
+            connector,
+            exactly_once,
+            DEFAULT_CHANNEL_CAPACITY,
+            DEFAULT_FLUSH_INTERVAL,
+        )
     }
 
     /// Spawns a new sink task with custom channel capacity and flush interval.
@@ -181,10 +179,7 @@ impl SinkTaskHandle {
 
     /// Abort a failed epoch (fire-and-forget).
     pub async fn rollback_epoch(&self, epoch: u64) {
-        let _ = self
-            .tx
-            .send(SinkCommand::RollbackEpoch { epoch })
-            .await;
+        let _ = self.tx.send(SinkCommand::RollbackEpoch { epoch }).await;
     }
 
     /// Signals the sink task to close and waits for it to finish.
@@ -316,7 +311,10 @@ mod tests {
             Ok(())
         }
 
-        async fn write_batch(&mut self, _batch: &RecordBatch) -> Result<WriteResult, ConnectorError> {
+        async fn write_batch(
+            &mut self,
+            _batch: &RecordBatch,
+        ) -> Result<WriteResult, ConnectorError> {
             self.writes.fetch_add(1, Ordering::Relaxed);
             Ok(WriteResult {
                 records_written: 1,

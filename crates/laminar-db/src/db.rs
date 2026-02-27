@@ -2466,8 +2466,7 @@ impl LaminarDB {
                 .await
                 .map_err(|e| DbError::Connector(format!("Failed to open sink '{name}': {e}")))?;
             let exactly_once = sink.capabilities().exactly_once;
-            let handle =
-                crate::sink_task::SinkTaskHandle::spawn(name.clone(), sink, exactly_once);
+            let handle = crate::sink_task::SinkTaskHandle::spawn(name.clone(), sink, exactly_once);
             sinks.push((
                 name.clone(),
                 handle,
