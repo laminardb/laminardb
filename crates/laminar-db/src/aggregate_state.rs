@@ -1457,7 +1457,7 @@ mod tests {
         }
     }
 
-    /// Helper: register a table and build an IncrementalAggState from SQL.
+    /// Helper: register a table and build an `IncrementalAggState` from SQL.
     async fn setup_agg_state(sql: &str) -> (SessionContext, IncrementalAggState) {
         let ctx = laminar_sql::create_session_context();
         let schema = Arc::new(Schema::new(vec![
@@ -1892,7 +1892,7 @@ mod tests {
         let e = col("x").gt(lit(10));
         let sql = expr_to_sql(&e);
         assert!(sql.contains("\"x\""), "should contain column: {sql}");
-        assert!(sql.contains(">"), "should contain >: {sql}");
+        assert!(sql.contains('>'), "should contain >: {sql}");
         assert!(sql.contains("10"), "should contain 10: {sql}");
     }
 
@@ -2215,6 +2215,7 @@ mod tests {
     // ── Checkpoint/restore tests ─────────────────────────────────────
 
     #[test]
+    #[allow(clippy::too_many_lines)]
     fn test_scalar_to_json_roundtrip() {
         let cases: Vec<ScalarValue> = vec![
             ScalarValue::Null,
@@ -2231,7 +2232,7 @@ mod tests {
             ScalarValue::UInt64(Some(9_999_999_999)),
             ScalarValue::UInt64(None),
             ScalarValue::Float32(Some(1.5)),
-            ScalarValue::Float64(Some(3.14159)),
+            ScalarValue::Float64(Some(3.141_59)),
             ScalarValue::Float64(None),
             ScalarValue::Utf8(Some("hello world".to_string())),
             ScalarValue::Utf8(None),
@@ -2332,9 +2333,8 @@ mod tests {
                     );
                 }
                 ScalarValue::Float32(Some(f)) => {
-                    let restored_f = match restored {
-                        ScalarValue::Float64(r) => r,
-                        _ => panic!("type mismatch: {rest_str}"),
+                    let ScalarValue::Float64(restored_f) = restored else {
+                        panic!("type mismatch: {rest_str}")
                     };
                     assert!(
                         (f64::from(*f) - restored_f.unwrap()).abs() < 1e-6,
@@ -2342,9 +2342,8 @@ mod tests {
                     );
                 }
                 ScalarValue::Float64(v) => {
-                    let restored_f = match restored {
-                        ScalarValue::Float64(r) => r,
-                        _ => panic!("type mismatch: {rest_str}"),
+                    let ScalarValue::Float64(restored_f) = restored else {
+                        panic!("type mismatch: {rest_str}")
                     };
                     assert_eq!(*v, restored_f, "{orig_str} != {rest_str}");
                 }

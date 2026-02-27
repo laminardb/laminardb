@@ -746,12 +746,12 @@ mod tests {
         };
         // ts=750 belongs to windows starting at [500, 0]
         let mut ws = assign_windows(750, &wt);
-        ws.sort();
+        ws.sort_unstable();
         assert_eq!(ws, vec![0, 500]);
 
         // ts=1250 belongs to windows starting at [1000, 500]
         let mut ws = assign_windows(1250, &wt);
-        ws.sort();
+        ws.sort_unstable();
         assert_eq!(ws, vec![500, 1000]);
     }
 

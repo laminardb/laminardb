@@ -1678,7 +1678,7 @@ mod tests {
                 results.push((ws.value(i), totals.value(i)));
             }
         }
-        results.sort();
+        results.sort_unstable();
 
         // window [-2000, 2000): only ts=1000 → SUM=10
         // window [0, 4000): ts=1000 + ts=3000 → SUM=30
@@ -1945,7 +1945,7 @@ mod tests {
                 results.push((ws.value(i), totals.value(i)));
             }
         }
-        results.sort();
+        results.sort_unstable();
         assert_eq!(results, vec![(-2000, 10), (0, 30), (2000, 20)]);
     }
 
