@@ -2362,6 +2362,11 @@ impl LaminarDB {
     ///
     /// Uses the `ConnectorRegistry` for generic dispatch — no
     /// connector-specific code in the pipeline setup or processing loop.
+    ///
+    /// The pipeline uses an event-driven fan-out/fan-in architecture:
+    /// each source runs in its own tokio task with exclusive ownership
+    /// (no `Arc<Mutex>`), sending batches through a bounded `mpsc`
+    /// channel to a single `PipelineCoordinator` task.
     #[allow(clippy::too_many_lines)]
     async fn start_connector_pipeline(
         &self,
@@ -2370,13 +2375,12 @@ impl LaminarDB {
         stream_regs: HashMap<String, crate::connector_manager::StreamRegistration>,
         table_regs: HashMap<String, crate::connector_manager::TableRegistration>,
     ) -> Result<(), DbError> {
-        use crate::checkpoint_coordinator::source_to_connector_checkpoint;
         use crate::connector_manager::{
             build_sink_config, build_source_config, build_table_config,
         };
+        use crate::pipeline::{PipelineConfig, PipelineCoordinator, SourceRegistration};
         use crate::stream_executor::StreamExecutor;
-        use laminar_connectors::config::ConnectorConfig;
-        use laminar_connectors::connector::{SinkConnector, SourceConnector};
+        use laminar_connectors::connector::SinkConnector;
         use laminar_connectors::reference::{ReferenceTableSource, RefreshMode};
 
         // Build StreamExecutor
@@ -2403,15 +2407,8 @@ impl LaminarDB {
             );
         }
 
-        // Build sources via registry (generic — no connector-specific code)
-        // Wrap in Arc<Mutex> so the coordinator can snapshot offsets while the
-        // loop holds a separate reference.
-        #[allow(clippy::type_complexity)]
-        let mut sources: Vec<(
-            String,
-            Arc<tokio::sync::Mutex<Box<dyn SourceConnector>>>,
-            ConnectorConfig,
-        )> = Vec::new();
+        // Build sources as owned SourceRegistrations (no Arc<Mutex>).
+        let mut sources: Vec<SourceRegistration> = Vec::new();
         for (name, reg) in &source_regs {
             if reg.connector_type.is_none() {
                 continue;
@@ -2435,21 +2432,20 @@ impl LaminarDB {
                         config.connector_type()
                     ))
                 })?;
-            sources.push((
-                name.clone(),
-                Arc::new(tokio::sync::Mutex::new(source)),
+            sources.push(SourceRegistration {
+                name: name.clone(),
+                connector: source,
                 config,
-            ));
+            });
         }
 
-        // Build sinks via registry (generic — no connector-specific code)
-        // Wrap in Arc<Mutex> so the coordinator can pre-commit/commit while
-        // the loop holds a separate reference.
+        // Build sinks via registry (generic — no connector-specific code).
+        // Sinks remain behind Arc<Mutex> since they're shared between the
+        // coordinator callback and the checkpoint coordinator.
         #[allow(clippy::type_complexity)]
         let mut sinks: Vec<(
             String,
             Arc<tokio::sync::Mutex<Box<dyn SinkConnector>>>,
-            ConnectorConfig,
             Option<String>,
         )> = Vec::new();
         for (name, reg) in &sink_regs {
@@ -2464,30 +2460,17 @@ impl LaminarDB {
                     config.connector_type()
                 ))
             })?;
-            sinks.push((
-                name.clone(),
-                Arc::new(tokio::sync::Mutex::new(sink)),
-                config,
-                reg.filter_expr.clone(),
-            ));
-        }
+            let sink_arc = Arc::new(tokio::sync::Mutex::new(sink));
 
-        // Open all connectors
-        for (name, source_arc, config) in &sources {
-            source_arc
-                .lock()
-                .await
-                .open(config)
-                .await
-                .map_err(|e| DbError::Connector(format!("Failed to open source '{name}': {e}")))?;
-        }
-        for (name, sink_arc, config, _) in &sinks {
+            // Open the sink.
             sink_arc
                 .lock()
                 .await
-                .open(config)
+                .open(&config)
                 .await
                 .map_err(|e| DbError::Connector(format!("Failed to open sink '{name}': {e}")))?;
+
+            sinks.push((name.clone(), sink_arc, reg.filter_expr.clone()));
         }
 
         // Build table sources from registrations
@@ -2508,21 +2491,22 @@ impl LaminarDB {
             table_sources.push((name.clone(), source, mode));
         }
 
-        // Register connector sources/sinks with the checkpoint coordinator
+        // Register sinks with the checkpoint coordinator.
+        // Sources are now owned by PipelineCoordinator — checkpoint reads go
+        // through lock-free watch channels instead.
         {
             let mut guard = self.coordinator.lock().await;
             if let Some(ref mut coord) = *guard {
-                for (name, source_arc, _) in &sources {
-                    coord.register_source(name.clone(), Arc::clone(source_arc));
-                }
-                for (name, sink_arc, _, _) in &sinks {
+                for (name, sink_arc, _) in &sinks {
                     let exactly_once = sink_arc.lock().await.capabilities().exactly_once;
                     coord.register_sink(name.clone(), Arc::clone(sink_arc), exactly_once);
                 }
             }
         }
 
-        // Recovery: restore source/sink/table state via unified coordinator
+        // Recovery: restore sink/table state via unified coordinator.
+        // Source recovery is handled inside PipelineCoordinator::new() via
+        // the checkpoint watch channels.
         {
             let mut guard = self.coordinator.lock().await;
             if let Some(ref mut coord) = *guard {
@@ -2690,23 +2674,12 @@ impl LaminarDB {
             }
         }
 
-        let mut tracker = if source_ids.is_empty() {
+        let tracker = if source_ids.is_empty() {
             None
         } else {
             Some(laminar_core::time::WatermarkTracker::new(source_ids.len()))
         };
 
-        tracing::info!(
-            sources = sources.len(),
-            sinks = sinks.len(),
-            streams = stream_regs.len(),
-            subscriptions = stream_sources.len(),
-            watermark_sources = source_ids.len(),
-            "Starting connector pipeline"
-        );
-
-        // Spawn processing loop
-        let shutdown = self.shutdown_signal.clone();
         let max_poll = self.config.default_buffer_size.min(1024);
         let checkpoint_interval = self
             .config
@@ -2714,440 +2687,59 @@ impl LaminarDB {
             .as_ref()
             .and_then(|c| c.interval_ms)
             .map(std::time::Duration::from_millis);
-        let table_store_for_loop = self.table_store.clone();
-        let ctx_for_sync = self.ctx.clone();
+
+        tracing::info!(
+            sources = sources.len(),
+            sinks = sinks.len(),
+            streams = stream_regs.len(),
+            subscriptions = stream_sources.len(),
+            watermark_sources = source_ids.len(),
+            "Starting event-driven connector pipeline"
+        );
+
+        // Build pipeline config.
+        let pipeline_config = PipelineConfig {
+            max_poll_records: max_poll,
+            channel_capacity: 64,
+            fallback_poll_interval: std::time::Duration::from_millis(10),
+            checkpoint_interval,
+            batch_window: std::time::Duration::from_millis(5),
+        };
+
+        // Create the coordinator (opens and spawns per-source tasks).
+        let shutdown = self.shutdown_signal.clone();
+        let pipeline_coordinator =
+            PipelineCoordinator::new(sources, pipeline_config, Arc::clone(&shutdown)).await?;
+
+        // Build the PipelineCallback implementation that bridges to db.rs internals.
         let counters = Arc::clone(&self.counters);
         let pipeline_watermark = Arc::clone(&self.pipeline_watermark);
         let checkpoint_in_progress = Arc::new(std::sync::atomic::AtomicBool::new(false));
         let coordinator = Arc::clone(&self.coordinator);
+        let table_store_for_loop = self.table_store.clone();
+        let ctx_for_sync = self.ctx.clone();
 
+        let callback = ConnectorPipelineCallback {
+            executor,
+            stream_sources,
+            sinks,
+            watermark_states,
+            source_entries_for_wm,
+            source_ids,
+            tracker,
+            counters,
+            pipeline_watermark,
+            checkpoint_in_progress,
+            coordinator,
+            table_sources,
+            table_store: table_store_for_loop,
+            ctx: ctx_for_sync,
+            last_checkpoint: std::time::Instant::now(),
+        };
+
+        // Spawn the coordinator as the single pipeline task.
         let handle = tokio::spawn(async move {
-            tracing::debug!("Connector pipeline task started");
-            let mut cycle_count: u64 = 0;
-            let mut total_batches: u64 = 0;
-            let mut total_records: u64 = 0;
-            let mut last_checkpoint = std::time::Instant::now();
-            loop {
-                // Check for shutdown
-                tokio::select! {
-                    () = shutdown.notified() => {
-                        tracing::info!("Pipeline shutdown signal received");
-                        break;
-                    }
-                    () = tokio::time::sleep(std::time::Duration::from_millis(100)) => {}
-                }
-
-                let cycle_start = std::time::Instant::now();
-
-                // Check external watermarks from Source::watermark() calls
-                for (name, _, _) in &sources {
-                    if let Some(entry) = source_entries_for_wm.get(name.as_str()) {
-                        let external_wm = entry.source.current_watermark();
-                        if let Some(wm_state) = watermark_states.get_mut(name.as_str()) {
-                            if let Some(wm) = wm_state.generator.advance_watermark(external_wm) {
-                                if let Some(ref mut trk) = tracker {
-                                    if let Some(sid) = source_ids.get(name.as_str()) {
-                                        if let Some(global_wm) =
-                                            trk.update_source(*sid, wm.timestamp())
-                                        {
-                                            pipeline_watermark.store(
-                                                global_wm.timestamp(),
-                                                std::sync::atomic::Ordering::Relaxed,
-                                            );
-                                        }
-                                    }
-                                }
-                            }
-                        }
-                    }
-                }
-
-                // Poll sources
-                let mut source_batches = HashMap::new();
-                for (name, source_arc, _) in &sources {
-                    match source_arc.lock().await.poll_batch(max_poll).await {
-                        Ok(Some(batch)) => {
-                            total_batches += 1;
-                            #[allow(clippy::cast_possible_truncation)]
-                            let row_count = batch.records.num_rows() as u64;
-                            total_records += row_count;
-                            counters
-                                .events_ingested
-                                .fetch_add(row_count, std::sync::atomic::Ordering::Relaxed);
-                            counters
-                                .total_batches
-                                .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
-
-                            // Extract watermark from batch
-                            if let Some(wm_state) = watermark_states.get_mut(name.as_str()) {
-                                if let Ok(max_ts) = wm_state.extractor.extract(&batch.records) {
-                                    if let Some(wm) = wm_state.generator.on_event(max_ts) {
-                                        if let Some(entry) =
-                                            source_entries_for_wm.get(name.as_str())
-                                        {
-                                            entry.source.watermark(wm.timestamp());
-                                        }
-                                        if let Some(ref mut trk) = tracker {
-                                            if let Some(sid) = source_ids.get(name.as_str()) {
-                                                if let Some(global_wm) =
-                                                    trk.update_source(*sid, wm.timestamp())
-                                                {
-                                                    pipeline_watermark.store(
-                                                        global_wm.timestamp(),
-                                                        std::sync::atomic::Ordering::Relaxed,
-                                                    );
-                                                }
-                                            }
-                                        }
-                                    }
-                                }
-
-                                // Filter late rows
-                                let current_wm = wm_state.generator.current_watermark();
-                                if current_wm > i64::MIN {
-                                    if let Some(filtered) = filter_late_rows(
-                                        &batch.records,
-                                        &wm_state.column,
-                                        current_wm,
-                                        wm_state.format,
-                                    ) {
-                                        source_batches
-                                            .entry(name.clone())
-                                            .or_insert_with(Vec::new)
-                                            .push(filtered);
-                                    }
-                                    // else: all rows were late, skip batch
-                                } else {
-                                    source_batches
-                                        .entry(name.clone())
-                                        .or_insert_with(Vec::new)
-                                        .push(batch.records);
-                                }
-                            } else {
-                                source_batches
-                                    .entry(name.clone())
-                                    .or_insert_with(Vec::new)
-                                    .push(batch.records);
-                            }
-                        }
-                        Ok(None) => {}
-                        Err(e) => {
-                            tracing::warn!(
-                                source = %name,
-                                error = %e,
-                                "Source poll error"
-                            );
-                        }
-                    }
-                }
-
-                // Execute stream queries
-                if !source_batches.is_empty() {
-                    if total_batches <= 3 {
-                        let src_summary: Vec<_> = source_batches
-                            .iter()
-                            .map(|(k, v)| {
-                                let rows: usize =
-                                    v.iter().map(arrow::array::RecordBatch::num_rows).sum();
-                                format!("{k}({rows} rows)")
-                            })
-                            .collect();
-                        tracing::debug!(sources = %src_summary.join(", "), "Executing queries");
-                    }
-                    let current_wm = pipeline_watermark.load(std::sync::atomic::Ordering::Relaxed);
-                    match executor.execute_cycle(&source_batches, current_wm).await {
-                        Ok(results) => {
-                            // Push results to stream sources for
-                            // db.subscribe() delivery (same as
-                            // embedded pipeline).
-                            for (stream_name, src) in &stream_sources {
-                                if let Some(batches) = results.get(stream_name) {
-                                    for batch in batches {
-                                        if batch.num_rows() > 0 {
-                                            #[allow(clippy::cast_possible_truncation)]
-                                            let row_count = batch.num_rows() as u64;
-                                            counters.events_emitted.fetch_add(
-                                                row_count,
-                                                std::sync::atomic::Ordering::Relaxed,
-                                            );
-                                            let _ = src.push_arrow(batch.clone());
-                                        }
-                                    }
-                                }
-                            }
-
-                            // Route results to external sinks
-                            for (sink_name, sink_arc, _, filter_expr) in &sinks {
-                                for (stream_name, batches) in &results {
-                                    for batch in batches {
-                                        // Apply WHERE filter if configured
-                                        let filtered = if let Some(filter_sql) = filter_expr {
-                                            match apply_filter(batch, filter_sql).await {
-                                                Ok(Some(fb)) => fb,
-                                                Ok(None) => continue,
-                                                Err(e) => {
-                                                    tracing::warn!(
-                                                        sink = %sink_name,
-                                                        filter = %filter_sql,
-                                                        error = %e,
-                                                        "Sink filter error"
-                                                    );
-                                                    continue;
-                                                }
-                                            }
-                                        } else {
-                                            batch.clone()
-                                        };
-
-                                        if filtered.num_rows() > 0 {
-                                            if let Err(e) =
-                                                sink_arc.lock().await.write_batch(&filtered).await
-                                            {
-                                                tracing::warn!(
-                                                    sink = %sink_name,
-                                                    stream = %stream_name,
-                                                    error = %e,
-                                                    "Sink write error"
-                                                );
-                                            }
-                                        }
-                                    }
-                                }
-                            }
-                        }
-                        Err(e) => {
-                            tracing::warn!(error = %e, "Stream execution cycle error");
-                        }
-                    }
-                }
-
-                // Poll table sources for incremental changes
-                for (name, source, mode) in &mut table_sources {
-                    if matches!(mode, RefreshMode::SnapshotOnly | RefreshMode::Manual) {
-                        continue;
-                    }
-                    match source.poll_changes().await {
-                        Ok(Some(batch)) => {
-                            // Single lock scope: upsert + xor rebuild + extract batch
-                            let maybe_batch = {
-                                let mut ts = table_store_for_loop.lock();
-                                if let Err(e) = ts.upsert_and_rebuild(name, &batch) {
-                                    tracing::warn!(table=%name, error=%e, "Table upsert error");
-                                    None
-                                } else if ts.is_persistent(name) {
-                                    None // persistent tables use ReferenceTableProvider
-                                } else {
-                                    ts.to_record_batch(name)
-                                }
-                            };
-                            if let Some(rb) = maybe_batch {
-                                let schema = rb.schema();
-                                let _ = ctx_for_sync.deregister_table(name.as_str());
-                                let data = if rb.num_rows() > 0 {
-                                    vec![vec![rb]]
-                                } else {
-                                    vec![vec![]]
-                                };
-                                if let Ok(mem_table) =
-                                    datafusion::datasource::MemTable::try_new(schema, data)
-                                {
-                                    let _ = ctx_for_sync
-                                        .register_table(name.as_str(), Arc::new(mem_table));
-                                }
-                            }
-                        }
-                        Ok(None) => {}
-                        Err(e) => {
-                            tracing::warn!(table=%name, error=%e, "Table poll error");
-                        }
-                    }
-                }
-
-                cycle_count += 1;
-                counters
-                    .cycles
-                    .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
-                #[allow(clippy::cast_possible_truncation)]
-                let elapsed_ns = cycle_start.elapsed().as_nanos() as u64;
-                counters
-                    .last_cycle_duration_ns
-                    .store(elapsed_ns, std::sync::atomic::Ordering::Relaxed);
-                if cycle_count.is_multiple_of(50) {
-                    tracing::debug!(
-                        cycles = cycle_count,
-                        batches = total_batches,
-                        records = total_records,
-                        "Pipeline processing"
-                    );
-                }
-
-                // Periodic checkpoint (non-blocking — spawned as a separate task)
-                if let Some(interval) = checkpoint_interval {
-                    if last_checkpoint.elapsed() >= interval
-                        && !checkpoint_in_progress.load(std::sync::atomic::Ordering::Relaxed)
-                    {
-                        // Capture table source offsets (fast, in-memory)
-                        let mut extra_tables = HashMap::new();
-                        for (name, source, _) in &table_sources {
-                            extra_tables.insert(
-                                name.clone(),
-                                source_to_connector_checkpoint(&source.checkpoint()),
-                            );
-                        }
-
-                        // Capture stream executor aggregate state
-                        let mut operator_states = HashMap::new();
-                        match executor.checkpoint_state() {
-                            Ok(Some(bytes)) => {
-                                operator_states.insert("stream_executor".to_string(), bytes);
-                            }
-                            Ok(None) => {}
-                            Err(e) => {
-                                tracing::warn!(
-                                    error = %e,
-                                    "Stream executor checkpoint capture failed"
-                                );
-                            }
-                        }
-
-                        let coord_clone = Arc::clone(&coordinator);
-                        let in_progress = Arc::clone(&checkpoint_in_progress);
-                        in_progress.store(true, std::sync::atomic::Ordering::Relaxed);
-
-                        tokio::spawn(async move {
-                            let mut guard = coord_clone.lock().await;
-                            if let Some(ref mut coord) = *guard {
-                                match coord
-                                    .checkpoint_with_extra_tables(
-                                        operator_states,
-                                        None,
-                                        0,
-                                        Vec::new(),
-                                        None,
-                                        extra_tables,
-                                    )
-                                    .await
-                                {
-                                    Ok(result) if result.success => {
-                                        tracing::info!(
-                                            epoch = result.epoch,
-                                            duration_ms = result.duration.as_millis(),
-                                            "Pipeline checkpoint completed"
-                                        );
-                                    }
-                                    Ok(result) => {
-                                        tracing::warn!(
-                                            epoch = result.epoch,
-                                            error = ?result.error,
-                                            "Pipeline checkpoint failed"
-                                        );
-                                    }
-                                    Err(e) => {
-                                        tracing::warn!(
-                                            error = %e,
-                                            "Checkpoint error"
-                                        );
-                                    }
-                                }
-                            }
-                            in_progress.store(false, std::sync::atomic::Ordering::Relaxed);
-                        });
-
-                        last_checkpoint = std::time::Instant::now();
-                    }
-                }
-            }
-
-            tracing::info!(
-                cycles = cycle_count,
-                batches = total_batches,
-                records = total_records,
-                "Pipeline stopping"
-            );
-
-            // Wait for any in-flight checkpoint to complete before final checkpoint
-            while checkpoint_in_progress.load(std::sync::atomic::Ordering::Relaxed) {
-                tokio::time::sleep(std::time::Duration::from_millis(50)).await;
-            }
-
-            // Final checkpoint before shutdown (blocking is OK at shutdown)
-            {
-                let mut guard = coordinator.lock().await;
-                if let Some(ref mut coord) = *guard {
-                    let mut extra_tables = HashMap::new();
-                    for (name, source, _) in &table_sources {
-                        extra_tables.insert(
-                            name.clone(),
-                            source_to_connector_checkpoint(&source.checkpoint()),
-                        );
-                    }
-
-                    // Capture stream executor aggregate state
-                    let mut operator_states = HashMap::new();
-                    match executor.checkpoint_state() {
-                        Ok(Some(bytes)) => {
-                            operator_states.insert("stream_executor".to_string(), bytes);
-                        }
-                        Ok(None) => {}
-                        Err(e) => {
-                            tracing::warn!(
-                                error = %e,
-                                "Final stream executor checkpoint capture failed"
-                            );
-                        }
-                    }
-
-                    match coord
-                        .checkpoint_with_extra_tables(
-                            operator_states,
-                            None,
-                            0,
-                            Vec::new(),
-                            None,
-                            extra_tables,
-                        )
-                        .await
-                    {
-                        Ok(result) if result.success => {
-                            tracing::info!(epoch = result.epoch, "Final pipeline checkpoint saved");
-                        }
-                        Ok(result) => {
-                            tracing::warn!(
-                                epoch = result.epoch,
-                                error = ?result.error,
-                                "Final checkpoint failed"
-                            );
-                        }
-                        Err(e) => {
-                            tracing::warn!(error = %e, "Final checkpoint error");
-                        }
-                    }
-                }
-            }
-
-            // Close table sources
-            for (name, source, _) in &mut table_sources {
-                if let Err(e) = source.close().await {
-                    tracing::warn!(table = %name, error = %e, "Table source close error");
-                }
-            }
-
-            // Close all connectors
-            for (name, source_arc, _) in &sources {
-                if let Err(e) = source_arc.lock().await.close().await {
-                    tracing::warn!(source = %name, error = %e, "Source close error");
-                }
-            }
-            for (name, sink_arc, _, _) in &sinks {
-                let mut sink = sink_arc.lock().await;
-                if let Err(e) = sink.flush().await {
-                    tracing::warn!(sink = %name, error = %e, "Sink flush error");
-                }
-                if let Err(e) = sink.close().await {
-                    tracing::warn!(sink = %name, error = %e, "Sink close error");
-                }
-            }
-            tracing::info!("Pipeline stopped after {cycle_count} cycles");
+            pipeline_coordinator.run(Box::new(callback)).await;
         });
 
         *self.runtime_handle.lock() = Some(handle);
@@ -3873,6 +3465,361 @@ fn extract_connector_from_with_options(
     }
 
     (connector_options, format, format_options)
+}
+
+/// Implements [`PipelineCallback`] to bridge the event-driven pipeline
+/// coordinator to the rest of db.rs (stream executor, sinks, watermarks,
+/// checkpoints, table sources).
+struct ConnectorPipelineCallback {
+    executor: crate::stream_executor::StreamExecutor,
+    stream_sources: Vec<(String, streaming::Source<crate::catalog::ArrowRecord>)>,
+    #[allow(clippy::type_complexity)]
+    sinks: Vec<(
+        String,
+        Arc<tokio::sync::Mutex<Box<dyn laminar_connectors::connector::SinkConnector>>>,
+        Option<String>,
+    )>,
+    watermark_states: HashMap<String, SourceWatermarkState>,
+    source_entries_for_wm: HashMap<String, Arc<crate::catalog::SourceEntry>>,
+    source_ids: HashMap<String, usize>,
+    tracker: Option<laminar_core::time::WatermarkTracker>,
+    counters: Arc<crate::metrics::PipelineCounters>,
+    pipeline_watermark: Arc<std::sync::atomic::AtomicI64>,
+    checkpoint_in_progress: Arc<std::sync::atomic::AtomicBool>,
+    coordinator:
+        Arc<tokio::sync::Mutex<Option<crate::checkpoint_coordinator::CheckpointCoordinator>>>,
+    #[allow(clippy::type_complexity)]
+    table_sources: Vec<(
+        String,
+        Box<dyn laminar_connectors::reference::ReferenceTableSource>,
+        laminar_connectors::reference::RefreshMode,
+    )>,
+    table_store: Arc<parking_lot::Mutex<crate::table_store::TableStore>>,
+    ctx: SessionContext,
+    last_checkpoint: std::time::Instant,
+}
+
+#[async_trait::async_trait]
+#[allow(clippy::too_many_lines)]
+impl crate::pipeline::PipelineCallback for ConnectorPipelineCallback {
+    async fn execute_cycle(
+        &mut self,
+        source_batches: &HashMap<String, Vec<RecordBatch>>,
+        watermark: i64,
+    ) -> Result<HashMap<String, Vec<RecordBatch>>, String> {
+        self.executor
+            .execute_cycle(source_batches, watermark)
+            .await
+            .map_err(|e| format!("{e}"))
+    }
+
+    fn push_to_streams(&self, results: &HashMap<String, Vec<RecordBatch>>) {
+        for (stream_name, src) in &self.stream_sources {
+            if let Some(batches) = results.get(stream_name) {
+                for batch in batches {
+                    if batch.num_rows() > 0 {
+                        #[allow(clippy::cast_possible_truncation)]
+                        let row_count = batch.num_rows() as u64;
+                        self.counters
+                            .events_emitted
+                            .fetch_add(row_count, std::sync::atomic::Ordering::Relaxed);
+                        let _ = src.push_arrow(batch.clone());
+                    }
+                }
+            }
+        }
+    }
+
+    async fn write_to_sinks(&mut self, results: &HashMap<String, Vec<RecordBatch>>) {
+        for (sink_name, sink_arc, filter_expr) in &self.sinks {
+            for batches in results.values() {
+                for batch in batches {
+                    let filtered = if let Some(filter_sql) = filter_expr {
+                        match apply_filter(batch, filter_sql).await {
+                            Ok(Some(fb)) => fb,
+                            Ok(None) => continue,
+                            Err(e) => {
+                                tracing::warn!(
+                                    sink = %sink_name,
+                                    filter = %filter_sql,
+                                    error = %e,
+                                    "Sink filter error"
+                                );
+                                continue;
+                            }
+                        }
+                    } else {
+                        batch.clone()
+                    };
+
+                    if filtered.num_rows() > 0 {
+                        if let Err(e) = sink_arc.lock().await.write_batch(&filtered).await {
+                            tracing::warn!(
+                                sink = %sink_name,
+                                error = %e,
+                                "Sink write error"
+                            );
+                        }
+                    }
+                }
+            }
+        }
+    }
+
+    fn extract_watermark(&mut self, source_name: &str, batch: &RecordBatch) {
+        if let Some(wm_state) = self.watermark_states.get_mut(source_name) {
+            // Check external watermarks from Source::watermark() calls.
+            if let Some(entry) = self.source_entries_for_wm.get(source_name) {
+                let external_wm = entry.source.current_watermark();
+                if let Some(wm) = wm_state.generator.advance_watermark(external_wm) {
+                    if let Some(ref mut trk) = self.tracker {
+                        if let Some(sid) = self.source_ids.get(source_name) {
+                            if let Some(global_wm) = trk.update_source(*sid, wm.timestamp()) {
+                                self.pipeline_watermark.store(
+                                    global_wm.timestamp(),
+                                    std::sync::atomic::Ordering::Relaxed,
+                                );
+                            }
+                        }
+                    }
+                }
+            }
+
+            // Extract watermark from batch data.
+            if let Ok(max_ts) = wm_state.extractor.extract(batch) {
+                if let Some(wm) = wm_state.generator.on_event(max_ts) {
+                    if let Some(entry) = self.source_entries_for_wm.get(source_name) {
+                        entry.source.watermark(wm.timestamp());
+                    }
+                    if let Some(ref mut trk) = self.tracker {
+                        if let Some(sid) = self.source_ids.get(source_name) {
+                            if let Some(global_wm) = trk.update_source(*sid, wm.timestamp()) {
+                                self.pipeline_watermark.store(
+                                    global_wm.timestamp(),
+                                    std::sync::atomic::Ordering::Relaxed,
+                                );
+                            }
+                        }
+                    }
+                }
+            }
+        }
+
+        // Update ingestion counters.
+        #[allow(clippy::cast_possible_truncation)]
+        let row_count = batch.num_rows() as u64;
+        self.counters
+            .events_ingested
+            .fetch_add(row_count, std::sync::atomic::Ordering::Relaxed);
+        self.counters
+            .total_batches
+            .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+    }
+
+    fn filter_late_rows(&self, source_name: &str, batch: &RecordBatch) -> Option<RecordBatch> {
+        if let Some(wm_state) = self.watermark_states.get(source_name) {
+            let current_wm = wm_state.generator.current_watermark();
+            if current_wm > i64::MIN {
+                return filter_late_rows(batch, &wm_state.column, current_wm, wm_state.format);
+            }
+        }
+        // No watermark configured → pass through all rows.
+        Some(batch.clone())
+    }
+
+    fn current_watermark(&self) -> i64 {
+        self.pipeline_watermark
+            .load(std::sync::atomic::Ordering::Relaxed)
+    }
+
+    async fn maybe_checkpoint(&mut self, force: bool) -> bool {
+        use crate::checkpoint_coordinator::source_to_connector_checkpoint;
+
+        if self
+            .counters
+            .cycles
+            .load(std::sync::atomic::Ordering::Relaxed)
+            == 0
+        {
+            return false;
+        }
+
+        if !force
+            && self
+                .checkpoint_in_progress
+                .load(std::sync::atomic::Ordering::Relaxed)
+        {
+            return false;
+        }
+
+        // For periodic checkpoints, check the timer.
+        if !force {
+            // No checkpoint_interval configured → coordinator handles this.
+            if self.last_checkpoint.elapsed() < std::time::Duration::from_millis(1000) {
+                return false;
+            }
+        }
+
+        if force {
+            // Wait for any in-flight checkpoint to complete.
+            while self
+                .checkpoint_in_progress
+                .load(std::sync::atomic::Ordering::Relaxed)
+            {
+                tokio::time::sleep(std::time::Duration::from_millis(50)).await;
+            }
+        }
+
+        // Capture table source offsets.
+        let mut extra_tables = HashMap::new();
+        for (name, source, _) in &self.table_sources {
+            extra_tables.insert(
+                name.clone(),
+                source_to_connector_checkpoint(&source.checkpoint()),
+            );
+        }
+
+        // Capture stream executor aggregate state.
+        let mut operator_states = HashMap::new();
+        match self.executor.checkpoint_state() {
+            Ok(Some(bytes)) => {
+                operator_states.insert("stream_executor".to_string(), bytes);
+            }
+            Ok(None) => {}
+            Err(e) => {
+                tracing::warn!(error = %e, "Stream executor checkpoint capture failed");
+            }
+        }
+
+        if force {
+            // Blocking checkpoint at shutdown.
+            let mut guard = self.coordinator.lock().await;
+            if let Some(ref mut coord) = *guard {
+                match coord
+                    .checkpoint_with_extra_tables(
+                        operator_states,
+                        None,
+                        0,
+                        Vec::new(),
+                        None,
+                        extra_tables,
+                    )
+                    .await
+                {
+                    Ok(result) if result.success => {
+                        tracing::info!(epoch = result.epoch, "Final pipeline checkpoint saved");
+                    }
+                    Ok(result) => {
+                        tracing::warn!(
+                            epoch = result.epoch,
+                            error = ?result.error,
+                            "Final checkpoint failed"
+                        );
+                    }
+                    Err(e) => {
+                        tracing::warn!(error = %e, "Final checkpoint error");
+                    }
+                }
+            }
+        } else {
+            // Non-blocking periodic checkpoint.
+            let coord_clone = Arc::clone(&self.coordinator);
+            let in_progress = Arc::clone(&self.checkpoint_in_progress);
+            in_progress.store(true, std::sync::atomic::Ordering::Relaxed);
+
+            tokio::spawn(async move {
+                let mut guard = coord_clone.lock().await;
+                if let Some(ref mut coord) = *guard {
+                    match coord
+                        .checkpoint_with_extra_tables(
+                            operator_states,
+                            None,
+                            0,
+                            Vec::new(),
+                            None,
+                            extra_tables,
+                        )
+                        .await
+                    {
+                        Ok(result) if result.success => {
+                            tracing::info!(
+                                epoch = result.epoch,
+                                duration_ms = result.duration.as_millis(),
+                                "Pipeline checkpoint completed"
+                            );
+                        }
+                        Ok(result) => {
+                            tracing::warn!(
+                                epoch = result.epoch,
+                                error = ?result.error,
+                                "Pipeline checkpoint failed"
+                            );
+                        }
+                        Err(e) => {
+                            tracing::warn!(error = %e, "Checkpoint error");
+                        }
+                    }
+                }
+                in_progress.store(false, std::sync::atomic::Ordering::Relaxed);
+            });
+        }
+
+        self.last_checkpoint = std::time::Instant::now();
+        true
+    }
+
+    fn record_cycle(&self, events_ingested: u64, _batches: u64, elapsed_ns: u64) {
+        let _ = events_ingested; // already recorded in extract_watermark
+        self.counters
+            .cycles
+            .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+        self.counters
+            .last_cycle_duration_ns
+            .store(elapsed_ns, std::sync::atomic::Ordering::Relaxed);
+    }
+
+    async fn poll_tables(&mut self) {
+        use laminar_connectors::reference::RefreshMode;
+
+        for (name, source, mode) in &mut self.table_sources {
+            if matches!(mode, RefreshMode::SnapshotOnly | RefreshMode::Manual) {
+                continue;
+            }
+            match source.poll_changes().await {
+                Ok(Some(batch)) => {
+                    let maybe_batch = {
+                        let mut ts = self.table_store.lock();
+                        if let Err(e) = ts.upsert_and_rebuild(name, &batch) {
+                            tracing::warn!(table=%name, error=%e, "Table upsert error");
+                            None
+                        } else if ts.is_persistent(name) {
+                            None
+                        } else {
+                            ts.to_record_batch(name)
+                        }
+                    };
+                    if let Some(rb) = maybe_batch {
+                        let schema = rb.schema();
+                        let _ = self.ctx.deregister_table(name.as_str());
+                        let data = if rb.num_rows() > 0 {
+                            vec![vec![rb]]
+                        } else {
+                            vec![vec![]]
+                        };
+                        if let Ok(mem_table) =
+                            datafusion::datasource::MemTable::try_new(schema, data)
+                        {
+                            let _ = self.ctx.register_table(name.as_str(), Arc::new(mem_table));
+                        }
+                    }
+                }
+                Ok(None) => {}
+                Err(e) => {
+                    tracing::warn!(table=%name, error=%e, "Table poll error");
+                }
+            }
+        }
+    }
 }
 
 ///

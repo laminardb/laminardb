@@ -218,6 +218,7 @@ mod tests {
             Field::new("ts", DataType::Int64, false),
             Field::new("value", DataType::Int64, false),
         ]));
+        #[allow(clippy::cast_possible_wrap)]
         let values: Vec<i64> = (0..timestamps.len() as i64).collect();
         RecordBatch::try_new(
             schema,
@@ -238,6 +239,7 @@ mod tests {
             ),
             Field::new("value", DataType::Int64, false),
         ]));
+        #[allow(clippy::cast_possible_wrap)]
         let values: Vec<i64> = (0..timestamps.len() as i64).collect();
         RecordBatch::try_new(
             schema,

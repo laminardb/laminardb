@@ -8,10 +8,12 @@
 //! through the streaming API (`Source<T>::push_arrow()` and subscriptions).
 
 use std::fmt;
+use std::sync::Arc;
 
 use arrow_array::RecordBatch;
 use arrow_schema::SchemaRef;
 use async_trait::async_trait;
+use tokio::sync::Notify;
 
 use crate::checkpoint::SourceCheckpoint;
 use crate::config::ConnectorConfig;
@@ -278,6 +280,19 @@ pub trait SourceConnector: Send {
     ///
     /// Returns `ConnectorError` if cleanup fails.
     async fn close(&mut self) -> Result<(), ConnectorError>;
+
+    /// Returns a [`Notify`] handle that is signalled when new data is available.
+    ///
+    /// When `Some`, the pipeline coordinator awaits the notification instead of
+    /// polling on a timer, eliminating idle CPU usage. Sources that receive data
+    /// asynchronously (WebSocket, CDC replication streams, Kafka) should return
+    /// `Some` and call `notify.notify_one()` when data arrives.
+    ///
+    /// The default implementation returns `None`, which causes the pipeline to
+    /// fall back to timer-based polling (suitable for batch/file sources).
+    fn data_ready_notify(&self) -> Option<Arc<Notify>> {
+        None
+    }
 
     /// Returns this connector as a [`SchemaProvider`](crate::schema::SchemaProvider), if supported.
     fn as_schema_provider(&self) -> Option<&dyn crate::schema::SchemaProvider> {

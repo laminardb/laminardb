@@ -14,6 +14,7 @@ use async_trait::async_trait;
 use rdkafka::consumer::{Consumer, StreamConsumer};
 use rdkafka::message::Message;
 use rdkafka::ClientConfig;
+use tokio::sync::Notify;
 use tracing::{debug, info, warn};
 
 use crate::checkpoint::SourceCheckpoint;
@@ -31,6 +32,14 @@ use super::metrics::KafkaSourceMetrics;
 use super::offsets::OffsetTracker;
 use super::rebalance::RebalanceState;
 use super::schema_registry::SchemaRegistryClient;
+
+/// Payload sent from the background Kafka reader task to [`KafkaSource::poll_batch`].
+struct KafkaPayload {
+    data: Vec<u8>,
+    topic: String,
+    partition: i32,
+    offset: i64,
+}
 
 /// Kafka source connector that consumes messages and produces Arrow batches.
 ///
@@ -72,8 +81,14 @@ pub struct KafkaSource {
     rebalance_state: RebalanceState,
     /// Optional Schema Registry client (shared with Avro deserializer).
     schema_registry: Option<Arc<SchemaRegistryClient>>,
-    /// Last time offsets were committed to Kafka.
-    last_commit_time: Instant,
+    /// Notification handle signalled when Kafka messages arrive from the reader task.
+    data_ready: Arc<Notify>,
+    /// Channel receiver for Kafka messages from the background reader task.
+    msg_rx: Option<tokio::sync::mpsc::Receiver<KafkaPayload>>,
+    /// Background Kafka reader task handle.
+    reader_handle: Option<tokio::task::JoinHandle<()>>,
+    /// Shutdown signal for the background reader task.
+    reader_shutdown: Option<tokio::sync::watch::Sender<bool>>,
 }
 
 impl KafkaSource {
@@ -106,7 +121,10 @@ impl KafkaSource {
             channel_len,
             rebalance_state: RebalanceState::new(),
             schema_registry: None,
-            last_commit_time: Instant::now(),
+            data_ready: Arc::new(Notify::new()),
+            msg_rx: None,
+            reader_handle: None,
+            reader_shutdown: None,
         }
     }
 
@@ -150,7 +168,10 @@ impl KafkaSource {
             channel_len,
             rebalance_state: RebalanceState::new(),
             schema_registry: Some(sr),
-            last_commit_time: Instant::now(),
+            data_ready: Arc::new(Notify::new()),
+            msg_rx: None,
+            reader_handle: None,
+            reader_shutdown: None,
         }
     }
 
@@ -194,30 +215,75 @@ impl KafkaSource {
         self.schema_registry.is_some()
     }
 
-    /// Commits offsets to Kafka if the commit interval has elapsed.
-    fn maybe_commit_offsets(&mut self) -> Result<(), ConnectorError> {
-        if self.last_commit_time.elapsed() < self.config.commit_interval {
-            return Ok(());
+    /// Spawns the background reader task on first `poll_batch()` call.
+    ///
+    /// Deferred to allow `restore()` to access the consumer directly after `open()`.
+    fn ensure_reader_started(&mut self) {
+        if self.reader_handle.is_some() || self.consumer.is_none() {
+            return;
         }
 
-        if let Some(ref consumer) = self.consumer {
-            if self.offsets.partition_count() > 0 {
-                let tpl = self.offsets.to_topic_partition_list();
-                consumer
-                    .commit(&tpl, rdkafka::consumer::CommitMode::Async)
-                    .map_err(|e| {
-                        ConnectorError::CheckpointError(format!("offset commit failed: {e}"))
-                    })?;
-                self.metrics.record_commit();
-                debug!(
-                    partitions = self.offsets.partition_count(),
-                    "committed offsets to Kafka"
-                );
+        let consumer = self.consumer.take().unwrap();
+        let (msg_tx, msg_rx) = tokio::sync::mpsc::channel(4096);
+        let (shutdown_tx, mut shutdown_rx) = tokio::sync::watch::channel(false);
+        let data_ready = Arc::clone(&self.data_ready);
+        let commit_interval = self.config.commit_interval;
+
+        let reader_handle = tokio::spawn(async move {
+            let mut reader_offsets = OffsetTracker::new();
+            let mut last_commit = Instant::now();
+
+            loop {
+                let msg_result = tokio::select! {
+                    biased;
+                    _ = shutdown_rx.changed() => break,
+                    msg = consumer.recv() => msg,
+                };
+                match msg_result {
+                    Ok(msg) => {
+                        if let Some(payload) = msg.payload() {
+                            let topic = msg.topic();
+                            let partition = msg.partition();
+                            let offset = msg.offset();
+                            reader_offsets.update(topic, partition, offset);
+
+                            let kp = KafkaPayload {
+                                data: payload.to_vec(),
+                                topic: topic.to_string(),
+                                partition,
+                                offset,
+                            };
+                            if msg_tx.send(kp).await.is_err() {
+                                break;
+                            }
+                            data_ready.notify_one();
+                        }
+
+                        if last_commit.elapsed() >= commit_interval
+                            && reader_offsets.partition_count() > 0
+                        {
+                            let tpl = reader_offsets.to_topic_partition_list();
+                            let _ = consumer.commit(&tpl, rdkafka::consumer::CommitMode::Async);
+                            last_commit = Instant::now();
+                        }
+                    }
+                    Err(e) => {
+                        warn!(error = %e, "Kafka consumer error");
+                    }
+                }
             }
-        }
 
-        self.last_commit_time = Instant::now();
-        Ok(())
+            // Final sync commit.
+            if reader_offsets.partition_count() > 0 {
+                let tpl = reader_offsets.to_topic_partition_list();
+                let _ = consumer.commit(&tpl, rdkafka::consumer::CommitMode::Sync);
+            }
+            consumer.unsubscribe();
+        });
+
+        self.msg_rx = Some(msg_rx);
+        self.reader_handle = Some(reader_handle);
+        self.reader_shutdown = Some(shutdown_tx);
     }
 }
 
@@ -312,75 +378,51 @@ impl SourceConnector for KafkaSource {
             return Ok(None);
         }
 
-        let consumer = self
-            .consumer
-            .as_ref()
+        // Lazily spawn the background reader task on first poll.
+        self.ensure_reader_started();
+
+        let rx = self
+            .msg_rx
+            .as_mut()
             .ok_or_else(|| ConnectorError::InvalidState {
-                expected: "consumer initialized".into(),
-                actual: "consumer is None".into(),
+                expected: "reader initialized".into(),
+                actual: "reader is None".into(),
             })?;
 
         let limit = max_records.min(self.config.max_poll_records);
-        let timeout = self.config.poll_timeout;
 
-        // Collect raw messages into a contiguous buffer (single allocation
-        // instead of per-message Vec<u8>).
+        // Drain messages from the background reader task.
         let mut payload_buf: Vec<u8> = Vec::with_capacity(limit * 256);
         let mut payload_offsets: Vec<(usize, usize)> = Vec::with_capacity(limit);
         let mut total_bytes: u64 = 0;
-        // Defer PartitionInfo string formatting until after the loop to
-        // avoid allocating format strings for every message.
         let mut last_topic = String::new();
         let mut last_partition_id: i32 = 0;
         let mut last_offset: i64 = -1;
 
-        let poll_start = Instant::now();
-        while payload_offsets.len() < limit && poll_start.elapsed() < timeout {
-            let remaining = timeout.saturating_sub(poll_start.elapsed());
-            match tokio::time::timeout(remaining, consumer.recv()).await {
-                Ok(Ok(msg)) => {
-                    if let Some(payload) = msg.payload() {
-                        total_bytes += payload.len() as u64;
-                        let start = payload_buf.len();
-                        payload_buf.extend_from_slice(payload);
-                        payload_offsets.push((start, payload.len()));
+        while payload_offsets.len() < limit {
+            match rx.try_recv() {
+                Ok(kp) => {
+                    total_bytes += kp.data.len() as u64;
+                    let start = payload_buf.len();
+                    payload_buf.extend_from_slice(&kp.data);
+                    payload_offsets.push((start, kp.data.len()));
 
-                        let topic = msg.topic();
-                        let partition = msg.partition();
-                        let offset = msg.offset();
+                    self.offsets.update(&kp.topic, kp.partition, kp.offset);
 
-                        self.offsets.update(topic, partition, offset);
-                        // Track raw values; only reallocate topic string
-                        // when the topic/partition actually changes.
-                        if last_topic.as_str() != topic || last_partition_id != partition {
-                            last_topic.clear();
-                            last_topic.push_str(topic);
-                            last_partition_id = partition;
-                        }
-                        last_offset = offset;
+                    if last_topic.as_str() != kp.topic || last_partition_id != kp.partition {
+                        last_topic = kp.topic;
+                        last_partition_id = kp.partition;
                     }
+                    last_offset = kp.offset;
                 }
-                Ok(Err(e)) => {
-                    self.metrics.record_error();
-                    warn!(error = %e, "Kafka consumer error");
-                    // Break on error but return what we have so far.
-                    break;
-                }
-                Err(_) => {
-                    // Timeout — no more messages available.
-                    break;
-                }
+                Err(_) => break,
             }
         }
-
-        // Periodically commit offsets.
-        self.maybe_commit_offsets()?;
 
         if payload_offsets.is_empty() {
             return Ok(None);
         }
 
-        // Build PartitionInfo once after the loop (not per-message).
         let last_partition = if last_offset >= 0 {
             Some(PartitionInfo::new(
                 format!("{last_topic}-{last_partition_id}"),
@@ -390,7 +432,6 @@ impl SourceConnector for KafkaSource {
             None
         };
 
-        // Deserialize messages into RecordBatch.
         let refs: Vec<&[u8]> = payload_offsets
             .iter()
             .map(|&(start, len)| &payload_buf[start..start + len])
@@ -469,10 +510,24 @@ impl SourceConnector for KafkaSource {
         self.metrics.to_connector_metrics()
     }
 
+    fn data_ready_notify(&self) -> Option<Arc<Notify>> {
+        Some(Arc::clone(&self.data_ready))
+    }
+
     async fn close(&mut self) -> Result<(), ConnectorError> {
         info!("closing Kafka source connector");
 
-        // Commit final offsets.
+        // Shut down the reader task (it handles final commit and unsubscribe).
+        if let Some(tx) = self.reader_shutdown.take() {
+            let _ = tx.send(true);
+        }
+        if let Some(handle) = self.reader_handle.take() {
+            let _ = tokio::time::timeout(std::time::Duration::from_secs(5), handle).await;
+        }
+        self.msg_rx = None;
+
+        // If consumer was never moved to the reader (no poll_batch called),
+        // do cleanup directly.
         if let Some(ref consumer) = self.consumer {
             if self.offsets.partition_count() > 0 {
                 let tpl = self.offsets.to_topic_partition_list();

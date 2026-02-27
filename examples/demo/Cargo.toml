@@ -1,6 +1,6 @@
 [package]
 name = "laminardb-demo"
-version = "0.15.0"
+version = "0.16.0"
 edition = "2021"
 publish = false
 description = "Market Data Demo: Real-time analytics with Ratatui TUI for LaminarDB"
@@ -23,9 +23,9 @@ default = []
 kafka = ["laminar-db/kafka", "dep:rdkafka", "dep:serde", "dep:serde_json"]
 
 [dependencies]
-laminar-db = { path = "../../crates/laminar-db", version = "0.15.0" }
-laminar-derive = { path = "../../crates/laminar-derive", version = "0.15.0" }
-laminar-core = { path = "../../crates/laminar-core", version = "0.15.0" }
+laminar-db = { path = "../../crates/laminar-db", version = "0.16.0" }
+laminar-derive = { path = "../../crates/laminar-derive", version = "0.16.0" }
+laminar-core = { path = "../../crates/laminar-core", version = "0.16.0" }
 
 # Arrow
 arrow = { workspace = true }

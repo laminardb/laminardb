@@ -1083,7 +1083,7 @@ mod tests {
         let udf = lookup_aggregate_udf(&ctx, "count").unwrap();
         let factory = DataFusionAggregateFactory::new(udf, vec![0], vec![DataType::Int64])
             .with_distinct(true);
-        assert_eq!(factory.is_distinct, true);
+        assert!(factory.is_distinct);
         // Should create accumulator successfully
         let _acc = factory.create_accumulator();
     }

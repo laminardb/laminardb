@@ -39,6 +39,31 @@ use std::path::{Path, PathBuf};
 
 use super::{prefix_successor, StateError, StateSnapshot, StateStore};
 
+/// Advise the kernel to back an mmap region with huge pages (Linux only).
+///
+/// Uses `MADV_HUGEPAGE` to request transparent huge pages for the given region,
+/// eliminating TLB misses for large state stores. This is advisory — if huge
+/// pages are unavailable the kernel falls back to regular pages silently.
+#[cfg(target_os = "linux")]
+fn advise_hugepages(mmap: &MmapMut) {
+    #[allow(unsafe_code)]
+    // SAFETY: `mmap.as_ptr()` points to a valid mmap region of `mmap.len()` bytes.
+    // MADV_HUGEPAGE is an advisory hint that cannot cause memory unsafety even if
+    // it fails or the kernel ignores it.
+    unsafe {
+        libc::madvise(
+            mmap.as_ptr() as *mut libc::c_void,
+            mmap.len(),
+            libc::MADV_HUGEPAGE,
+        );
+    }
+}
+
+#[cfg(not(target_os = "linux"))]
+fn advise_hugepages(_mmap: &MmapMut) {
+    // No-op on non-Linux platforms.
+}
+
 /// Header size in the mmap file (magic + version + entry count + data offset).
 const MMAP_HEADER_SIZE: usize = 32;
 /// Magic number for mmap file identification ("LAMINAR" in hex-ish).
@@ -151,6 +176,7 @@ impl Storage {
                     {
                         *mmap = unsafe { MmapMut::map_mut(&*file)? };
                     }
+                    advise_hugepages(mmap);
                     *capacity = new_capacity;
                 }
 
@@ -280,6 +306,8 @@ impl MmapStateStore {
         // with read/write permissions, and no other code has access to it yet.
         #[allow(unsafe_code)]
         let mut mmap = unsafe { MmapMut::map_mut(&file)? };
+
+        advise_hugepages(&mmap);
 
         let (index, write_pos, next_version) = if file_exists {
             // Try to load existing data

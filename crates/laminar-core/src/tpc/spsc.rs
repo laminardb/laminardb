@@ -18,10 +18,13 @@ use std::cell::UnsafeCell;
 use std::mem::MaybeUninit;
 use std::sync::atomic::{AtomicUsize, Ordering};
 
-/// A wrapper that pads a value to a cache line boundary to prevent false sharing.
+/// A wrapper that pads a value to a 128-byte boundary to prevent false sharing.
 ///
 /// False sharing occurs when two threads access different data that happens to
 /// reside on the same cache line, causing unnecessary cache invalidations.
+/// We use 128-byte alignment (two cache lines) because Intel's L2 spatial
+/// prefetcher on Skylake+ fetches adjacent 64-byte line pairs, which can cause
+/// false sharing effects that 64-byte padding alone does not prevent.
 ///
 /// # Example
 ///
@@ -29,14 +32,14 @@ use std::sync::atomic::{AtomicUsize, Ordering};
 /// use laminar_core::tpc::CachePadded;
 /// use std::sync::atomic::AtomicUsize;
 ///
-/// // Each counter gets its own cache line
+/// // Each counter gets its own cache line pair
 /// let counter1 = CachePadded::new(AtomicUsize::new(0));
 /// let counter2 = CachePadded::new(AtomicUsize::new(0));
 ///
 /// // Access the inner value
 /// assert_eq!(counter1.load(std::sync::atomic::Ordering::Relaxed), 0);
 /// ```
-#[repr(C, align(64))]
+#[repr(C, align(128))]
 pub struct CachePadded<T> {
     value: T,
 }
@@ -531,8 +534,9 @@ mod tests {
 
     #[test]
     fn test_cache_padded_size() {
-        // Verify CachePadded provides proper alignment (64 bytes = cache line)
-        assert!(std::mem::align_of::<CachePadded<AtomicUsize>>() == 64);
+        // Verify CachePadded provides 128-byte alignment (two cache lines)
+        // to prevent Intel L2 spatial prefetcher false sharing.
+        assert!(std::mem::align_of::<CachePadded<AtomicUsize>>() == 128);
     }
 
     #[test]

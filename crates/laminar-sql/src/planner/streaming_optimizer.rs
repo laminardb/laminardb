@@ -207,7 +207,7 @@ mod tests {
     }
 
     impl ExecutionPlan for MockUnboundedExec {
-        fn name(&self) -> &str {
+        fn name(&self) -> &'static str {
             "MockUnboundedExec"
         }
 
@@ -271,7 +271,7 @@ mod tests {
     }
 
     impl ExecutionPlan for MockBoundedExec {
-        fn name(&self) -> &str {
+        fn name(&self) -> &'static str {
             "MockBoundedExec"
         }
 
@@ -329,7 +329,7 @@ mod tests {
     }
 
     impl ExecutionPlan for MockPassthroughExec {
-        fn name(&self) -> &str {
+        fn name(&self) -> &'static str {
             "MockPassthroughExec"
         }
 

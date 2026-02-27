@@ -722,10 +722,14 @@ pub mod ahash_store;
 /// Changelog-aware state store wrapper.
 pub mod changelog_aware;
 
+/// Dictionary key encoder for low-cardinality GROUP BY keys.
+pub mod dict_encoder;
+
 // Re-export main types
 pub use self::StateError as Error;
 pub use ahash_store::AHashMapStore;
 pub use changelog_aware::{ChangelogAwareStore, ChangelogSink};
+pub use dict_encoder::DictionaryKeyEncoder;
 pub use mmap::MmapStateStore;
 
 #[cfg(test)]
