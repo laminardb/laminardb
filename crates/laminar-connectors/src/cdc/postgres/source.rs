@@ -116,7 +116,7 @@ struct TransactionState {
 }
 
 /// WAL event payload sent from the background reader task to [`PostgresCdcSource::poll_batch`].
-#[cfg_attr(not(feature = "postgres-cdc"), allow(dead_code))]
+#[allow(dead_code)]
 enum WalPayload {
     Begin {
         final_lsn: u64,
