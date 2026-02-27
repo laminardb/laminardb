@@ -2542,6 +2542,26 @@ impl LaminarDB {
                                 }
                             }
                         }
+                        // Restore stream executor aggregate state
+                        if let Some(op) = recovered.manifest.operator_states.get("stream_executor")
+                        {
+                            if let Some(bytes) = op.decode_inline() {
+                                match executor.restore_state(&bytes) {
+                                    Ok(n) => {
+                                        tracing::info!(
+                                            queries = n,
+                                            "Restored stream executor state from checkpoint"
+                                        );
+                                    }
+                                    Err(e) => {
+                                        tracing::warn!(
+                                            error = %e,
+                                            "Stream executor state restore failed, starting fresh"
+                                        );
+                                    }
+                                }
+                            }
+                        }
                         tracing::info!(
                             epoch = recovered.epoch(),
                             sources_restored = recovered.sources_restored,
@@ -2975,6 +2995,21 @@ impl LaminarDB {
                             );
                         }
 
+                        // Capture stream executor aggregate state
+                        let mut operator_states = HashMap::new();
+                        match executor.checkpoint_state() {
+                            Ok(Some(bytes)) => {
+                                operator_states.insert("stream_executor".to_string(), bytes);
+                            }
+                            Ok(None) => {}
+                            Err(e) => {
+                                tracing::warn!(
+                                    error = %e,
+                                    "Stream executor checkpoint capture failed"
+                                );
+                            }
+                        }
+
                         let coord_clone = Arc::clone(&coordinator);
                         let in_progress = Arc::clone(&checkpoint_in_progress);
                         in_progress.store(true, std::sync::atomic::Ordering::Relaxed);
@@ -2984,7 +3019,7 @@ impl LaminarDB {
                             if let Some(ref mut coord) = *guard {
                                 match coord
                                     .checkpoint_with_extra_tables(
-                                        HashMap::new(),
+                                        operator_states,
                                         None,
                                         0,
                                         Vec::new(),
@@ -3047,9 +3082,24 @@ impl LaminarDB {
                         );
                     }
 
+                    // Capture stream executor aggregate state
+                    let mut operator_states = HashMap::new();
+                    match executor.checkpoint_state() {
+                        Ok(Some(bytes)) => {
+                            operator_states.insert("stream_executor".to_string(), bytes);
+                        }
+                        Ok(None) => {}
+                        Err(e) => {
+                            tracing::warn!(
+                                error = %e,
+                                "Final stream executor checkpoint capture failed"
+                            );
+                        }
+                    }
+
                     match coord
                         .checkpoint_with_extra_tables(
-                            HashMap::new(),
+                            operator_states,
                             None,
                             0,
                             Vec::new(),

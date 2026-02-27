@@ -1,4 +1,4 @@
-//! Distributed recovery manager for Phase 6a.
+//! Distributed recovery manager.
 //!
 //! Complements the single-node `RecoveryManager` in `laminar-db` with
 //! distributed checkpoint discovery, incremental delta application,

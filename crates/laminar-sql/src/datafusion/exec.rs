@@ -13,12 +13,13 @@ use datafusion::execution::{SendableRecordBatchStream, TaskContext};
 use datafusion::physical_expr::{
     expressions::Column, EquivalenceProperties, LexOrdering, Partitioning, PhysicalSortExpr,
 };
-use datafusion::physical_plan::execution_plan::{Boundedness, EmissionType};
+use datafusion::physical_plan::execution_plan::{Boundedness, EmissionType, SchedulingType};
 use datafusion::physical_plan::{DisplayAs, DisplayFormatType, ExecutionPlan, PlanProperties};
 use datafusion_common::DataFusionError;
 use datafusion_expr::Expr;
 
 use super::source::{SortColumn, StreamSourceRef};
+use super::watermark_filter::{WatermarkDynamicFilter, WatermarkFilterStream};
 
 /// A `DataFusion` execution plan that scans from a streaming source.
 ///
@@ -42,20 +43,11 @@ pub struct StreamingScanExec {
     filters: Vec<Expr>,
     /// Cached plan properties
     properties: PlanProperties,
+    /// Optional watermark filter applied at scan level
+    watermark_filter: Option<Arc<WatermarkDynamicFilter>>,
 }
 
 impl StreamingScanExec {
-    /// Creates a new streaming scan execution plan.
-    ///
-    /// # Arguments
-    ///
-    /// * `source` - The streaming source to read from
-    /// * `projection` - Optional column projection indices
-    /// * `filters` - Filters to push down to the source
-    ///
-    /// # Returns
-    ///
-    /// A new `StreamingScanExec` instance.
     /// Creates a new streaming scan execution plan.
     ///
     /// If the source declares an `output_ordering`, the plan's
@@ -80,18 +72,20 @@ impl StreamingScanExec {
             None => source_schema,
         };
 
-        // Build equivalence properties, optionally with source ordering
         let eq_properties = Self::build_equivalence_properties(&schema, source_ordering.as_deref());
 
-        // Build plan properties for an unbounded streaming source
+        // SchedulingType::NonCooperative causes DataFusion's EnsureCooperative
+        // optimizer rule to auto-wrap this leaf with CooperativeExec, which
+        // yields to the Tokio executor periodically.
         let properties = PlanProperties::new(
             eq_properties,
-            Partitioning::UnknownPartitioning(1), // Single partition for streaming
-            EmissionType::Incremental,            // Streaming emits incrementally
+            Partitioning::UnknownPartitioning(1),
+            EmissionType::Incremental,
             Boundedness::Unbounded {
                 requires_infinite_memory: false,
-            }, // Streaming is unbounded
-        );
+            },
+        )
+        .with_scheduling_type(SchedulingType::NonCooperative);
 
         Self {
             source,
@@ -99,7 +93,25 @@ impl StreamingScanExec {
             projection,
             filters,
             properties,
+            watermark_filter: None,
         }
+    }
+
+    /// Attaches a watermark filter that drops late rows at scan time.
+    ///
+    /// When set, `execute()` wraps the inner stream with a
+    /// `WatermarkFilterStream` that applies `ts >= watermark` before
+    /// any downstream processing.
+    #[must_use]
+    pub fn with_watermark_filter(mut self, filter: Arc<WatermarkDynamicFilter>) -> Self {
+        self.watermark_filter = Some(filter);
+        self
+    }
+
+    /// Returns the watermark filter, if set.
+    #[must_use]
+    pub fn watermark_filter(&self) -> Option<&Arc<WatermarkDynamicFilter>> {
+        self.watermark_filter.as_ref()
     }
 
     /// Builds `EquivalenceProperties` with optional source ordering.
@@ -163,6 +175,7 @@ impl Debug for StreamingScanExec {
             .field("schema", &self.schema)
             .field("projection", &self.projection)
             .field("filters", &self.filters)
+            .field("watermark_filter", &self.watermark_filter)
             .finish_non_exhaustive()
     }
 }
@@ -236,8 +249,21 @@ impl ExecutionPlan for StreamingScanExec {
             )));
         }
 
-        self.source
-            .stream(self.projection.clone(), self.filters.clone())
+        let stream = self
+            .source
+            .stream(self.projection.clone(), self.filters.clone())?;
+
+        match &self.watermark_filter {
+            Some(filter) => {
+                let schema = stream.schema();
+                Ok(Box::pin(WatermarkFilterStream::new(
+                    stream,
+                    Arc::clone(filter),
+                    schema,
+                )))
+            }
+            None => Ok(stream),
+        }
     }
 }
 
@@ -460,5 +486,101 @@ mod tests {
 
         // "name" is not in the projection -> ordering should be None
         assert!(exec.output_ordering().is_none());
+    }
+
+    // Cooperative scheduling tests
+
+    #[test]
+    fn test_streaming_scan_exec_scheduling_type() {
+        let schema = test_schema();
+        let source: StreamSourceRef = Arc::new(MockSource::new(schema));
+        let exec = StreamingScanExec::new(source, None, vec![]);
+
+        // StreamingScanExec declares NonCooperative so that DataFusion's
+        // EnsureCooperative optimizer auto-wraps it with CooperativeExec.
+        assert_eq!(
+            exec.properties().scheduling_type,
+            SchedulingType::NonCooperative,
+        );
+    }
+
+    #[tokio::test]
+    async fn test_cooperative_exec_wraps_streaming_scan() {
+        use crate::datafusion::{
+            create_streaming_context, ChannelStreamSource, StreamingTableProvider,
+        };
+        use arrow_schema::{DataType, Field, Schema};
+
+        let ctx = create_streaming_context();
+        let schema = Arc::new(Schema::new(vec![
+            Field::new("id", DataType::Int64, false),
+            Field::new("value", DataType::Float64, true),
+        ]));
+
+        let source = Arc::new(ChannelStreamSource::new(Arc::clone(&schema)));
+        let _sender = source.take_sender();
+        let provider = StreamingTableProvider::new("events", source);
+        ctx.register_table("events", Arc::new(provider)).unwrap();
+
+        // Create a physical plan and verify CooperativeExec wrapping
+        let df = ctx.sql("SELECT id FROM events").await.unwrap();
+        let plan = df.create_physical_plan().await.unwrap();
+        let plan_str = format!(
+            "{}",
+            datafusion::physical_plan::displayable(plan.as_ref()).indent(true)
+        );
+        assert!(
+            plan_str.contains("CooperativeExec"),
+            "Expected CooperativeExec wrapper around StreamingScanExec, got:\n{plan_str}"
+        );
+    }
+
+    // Watermark filter tests
+
+    #[test]
+    fn test_streaming_scan_with_watermark_filter() {
+        use super::WatermarkDynamicFilter;
+        use std::sync::atomic::{AtomicI64, AtomicU64};
+
+        let schema = test_schema();
+        let source: StreamSourceRef = Arc::new(MockSource::new(schema));
+        let filter = Arc::new(WatermarkDynamicFilter::new(
+            Arc::new(AtomicI64::new(100)),
+            Arc::new(AtomicU64::new(0)),
+            "id".to_string(),
+        ));
+
+        let exec =
+            StreamingScanExec::new(source, None, vec![]).with_watermark_filter(Arc::clone(&filter));
+
+        assert!(exec.watermark_filter().is_some());
+        assert_eq!(exec.watermark_filter().unwrap().watermark_ms(), 100);
+    }
+
+    #[test]
+    fn test_streaming_scan_watermark_filter_preserved() {
+        use super::WatermarkDynamicFilter;
+        use std::sync::atomic::{AtomicI64, AtomicU64};
+
+        let schema = test_schema();
+        let source: StreamSourceRef = Arc::new(MockSource::new(schema));
+        let filter = Arc::new(WatermarkDynamicFilter::new(
+            Arc::new(AtomicI64::new(200)),
+            Arc::new(AtomicU64::new(0)),
+            "id".to_string(),
+        ));
+
+        let exec =
+            StreamingScanExec::new(source, None, vec![]).with_watermark_filter(Arc::clone(&filter));
+
+        // with_new_children(empty) should preserve the watermark filter
+        let exec_arc: Arc<dyn ExecutionPlan> = Arc::new(exec);
+        let rebuilt = exec_arc.with_new_children(vec![]).unwrap();
+        let rebuilt_scan = rebuilt
+            .as_any()
+            .downcast_ref::<StreamingScanExec>()
+            .unwrap();
+        assert!(rebuilt_scan.watermark_filter().is_some());
+        assert_eq!(rebuilt_scan.watermark_filter().unwrap().watermark_ms(), 200);
     }
 }

@@ -213,13 +213,18 @@ fn rewrite_select(select: &mut Select) {
 fn rewrite_join_operator(jo: &mut JoinOperator) {
     let (JoinOperator::Join(constraint)
     | JoinOperator::Inner(constraint)
+    | JoinOperator::Left(constraint)
     | JoinOperator::LeftOuter(constraint)
+    | JoinOperator::Right(constraint)
     | JoinOperator::RightOuter(constraint)
     | JoinOperator::FullOuter(constraint)
+    | JoinOperator::StraightJoin(constraint)
     | JoinOperator::LeftSemi(constraint)
     | JoinOperator::RightSemi(constraint)
     | JoinOperator::LeftAnti(constraint)
-    | JoinOperator::RightAnti(constraint)) = jo
+    | JoinOperator::RightAnti(constraint)
+    | JoinOperator::Semi(constraint)
+    | JoinOperator::Anti(constraint)) = jo
     else {
         return;
     };

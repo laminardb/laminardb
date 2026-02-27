@@ -50,32 +50,32 @@ impl MySqlCdcMetrics {
         Self::default()
     }
 
-    /// Increments the events received counter.
+    /// Increments the binlog events received counter.
     pub fn inc_events_received(&self) {
         self.events_received.fetch_add(1, Ordering::Relaxed);
     }
 
-    /// Increments the inserts counter.
+    /// Increments the INSERT row event counter by `count`.
     pub fn inc_inserts(&self, count: u64) {
         self.inserts.fetch_add(count, Ordering::Relaxed);
     }
 
-    /// Increments the updates counter.
+    /// Increments the UPDATE row event counter by `count`.
     pub fn inc_updates(&self, count: u64) {
         self.updates.fetch_add(count, Ordering::Relaxed);
     }
 
-    /// Increments the deletes counter.
+    /// Increments the DELETE row event counter by `count`.
     pub fn inc_deletes(&self, count: u64) {
         self.deletes.fetch_add(count, Ordering::Relaxed);
     }
 
-    /// Increments the transactions counter.
+    /// Increments the transaction counter.
     pub fn inc_transactions(&self) {
         self.transactions.fetch_add(1, Ordering::Relaxed);
     }
 
-    /// Increments the table maps counter.
+    /// Increments the TABLE_MAP event counter.
     pub fn inc_table_maps(&self) {
         self.table_maps.fetch_add(1, Ordering::Relaxed);
     }
@@ -85,17 +85,17 @@ impl MySqlCdcMetrics {
         self.bytes_received.fetch_add(bytes, Ordering::Relaxed);
     }
 
-    /// Increments the errors counter.
+    /// Increments the error counter.
     pub fn inc_errors(&self) {
         self.errors.fetch_add(1, Ordering::Relaxed);
     }
 
-    /// Increments the heartbeats counter.
+    /// Increments the heartbeat counter.
     pub fn inc_heartbeats(&self) {
         self.heartbeats.fetch_add(1, Ordering::Relaxed);
     }
 
-    /// Increments the DDL events counter.
+    /// Increments the DDL event counter.
     pub fn inc_ddl_events(&self) {
         self.ddl_events.fetch_add(1, Ordering::Relaxed);
     }

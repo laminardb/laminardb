@@ -91,22 +91,18 @@ impl AtomicXdpStats {
         }
     }
 
-    /// Increments the dropped counter.
     pub fn inc_dropped(&self) {
         self.dropped.fetch_add(1, Ordering::Relaxed);
     }
 
-    /// Increments the passed counter.
     pub fn inc_passed(&self) {
         self.passed.fetch_add(1, Ordering::Relaxed);
     }
 
-    /// Increments the redirected counter.
     pub fn inc_redirected(&self) {
         self.redirected.fetch_add(1, Ordering::Relaxed);
     }
 
-    /// Increments the invalid counter.
     pub fn inc_invalid(&self) {
         self.invalid.fetch_add(1, Ordering::Relaxed);
     }

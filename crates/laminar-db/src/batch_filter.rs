@@ -75,7 +75,10 @@ pub(crate) fn filter_batch_by_timestamp(
                 let arr = col
                     .as_any()
                     .downcast_ref::<arrow::array::TimestampSecondArray>()?;
-                let thr_secs = threshold_ms / 1000;
+                // Floor division: exact when threshold_ms is second-aligned
+                // (true for EOWC window boundaries). For sub-second thresholds,
+                // floor is conservative (may exclude borderline rows).
+                let thr_secs = threshold_ms.div_euclid(1000);
                 cmp_scalar!(
                     arr,
                     arrow::array::TimestampSecondArray::new_scalar(thr_secs)
@@ -107,7 +110,8 @@ pub(crate) fn filter_batch_by_timestamp(
             let Some(arr) = col.as_any().downcast_ref::<Int64Array>() else {
                 return Some(batch.clone());
             };
-            cmp_scalar!(arr, Int64Array::new_scalar(threshold_ms / 1000))
+            // Floor division: see Timestamp(Second) comment above.
+            cmp_scalar!(arr, Int64Array::new_scalar(threshold_ms.div_euclid(1000)))
         }
         TimestampFormat::UnixMicros => {
             let Some(arr) = col.as_any().downcast_ref::<Int64Array>() else {

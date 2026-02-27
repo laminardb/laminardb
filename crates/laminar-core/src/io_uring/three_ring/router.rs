@@ -28,7 +28,7 @@ pub struct PendingOperation {
 }
 
 impl PendingOperation {
-    /// Create a new pending operation.
+    /// Create a new pending operation with the given user data and ring affinity.
     #[must_use]
     pub fn new(user_data: u64, affinity: RingAffinity) -> Self {
         Self {
@@ -49,7 +49,7 @@ impl PendingOperation {
         self
     }
 
-    /// Set the buffer index.
+    /// Set the registered buffer index.
     #[must_use]
     pub const fn with_buffer_index(mut self, index: u16) -> Self {
         self.buffer_index = Some(index);
@@ -63,14 +63,14 @@ impl PendingOperation {
         self
     }
 
-    /// Set the expected bytes.
+    /// Set the expected byte count for read/write operations.
     #[must_use]
     pub const fn with_expected_bytes(mut self, bytes: u32) -> Self {
         self.expected_bytes = Some(bytes);
         self
     }
 
-    /// Get the latency since submission.
+    /// Elapsed time since this operation was submitted.
     #[must_use]
     pub fn latency(&self) -> std::time::Duration {
         self.submitted_at.elapsed()
@@ -95,13 +95,13 @@ pub struct RoutedCompletion {
 }
 
 impl RoutedCompletion {
-    /// Check if the operation succeeded.
+    /// Returns `true` if the operation completed successfully.
     #[must_use]
     pub const fn is_success(&self) -> bool {
         self.result >= 0
     }
 
-    /// Get the error if the operation failed.
+    /// Returns the OS error if the operation failed.
     #[must_use]
     pub fn error(&self) -> Option<std::io::Error> {
         if self.result < 0 {
@@ -111,7 +111,7 @@ impl RoutedCompletion {
         }
     }
 
-    /// Get the number of bytes transferred.
+    /// Returns the number of bytes transferred, or `None` on error.
     #[must_use]
     #[allow(clippy::cast_sign_loss)]
     pub const fn bytes_transferred(&self) -> Option<usize> {

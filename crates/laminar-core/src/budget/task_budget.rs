@@ -78,8 +78,6 @@ impl TaskBudget {
 
     // Ring 0 factory methods
 
-    /// Create budget for Ring 0 single event.
-    ///
     /// Budget: 500ns
     #[inline]
     #[must_use]
@@ -93,8 +91,6 @@ impl TaskBudget {
         }
     }
 
-    /// Create budget for Ring 0 single event without metrics.
-    ///
     /// Use this in extremely hot paths where even atomic counter
     /// updates are too expensive.
     #[inline]
@@ -109,8 +105,6 @@ impl TaskBudget {
         }
     }
 
-    /// Create budget for Ring 0 batch of events.
-    ///
     /// Budget: 5μs
     #[inline]
     #[must_use]
@@ -124,8 +118,6 @@ impl TaskBudget {
         }
     }
 
-    /// Create budget for Ring 0 state lookup.
-    ///
     /// Budget: 200ns
     #[inline]
     #[must_use]
@@ -139,8 +131,6 @@ impl TaskBudget {
         }
     }
 
-    /// Create budget for Ring 0 window trigger.
-    ///
     /// Budget: 10μs
     #[inline]
     #[must_use]
@@ -154,8 +144,6 @@ impl TaskBudget {
         }
     }
 
-    /// Create budget for Ring 0 iteration (one poll cycle).
-    ///
     /// Budget: 10μs
     #[inline]
     #[must_use]
@@ -171,8 +159,6 @@ impl TaskBudget {
 
     // Ring 1 factory methods
 
-    /// Create budget for Ring 1 background chunk.
-    ///
     /// Budget: 1ms
     #[inline]
     #[must_use]
@@ -186,8 +172,6 @@ impl TaskBudget {
         }
     }
 
-    /// Create budget for Ring 1 checkpoint preparation.
-    ///
     /// Budget: 10ms
     #[inline]
     #[must_use]
@@ -201,8 +185,6 @@ impl TaskBudget {
         }
     }
 
-    /// Create budget for Ring 1 WAL flush.
-    ///
     /// Budget: 100μs
     #[inline]
     #[must_use]
@@ -216,8 +198,6 @@ impl TaskBudget {
         }
     }
 
-    /// Create budget for Ring 1 compaction chunk.
-    ///
     /// Budget: 5ms
     #[inline]
     #[must_use]
@@ -267,21 +247,21 @@ impl TaskBudget {
 
     // Accessors
 
-    /// Get the task name.
+    /// Task label used in metrics.
     #[inline]
     #[must_use]
     pub fn name(&self) -> &'static str {
         self.name
     }
 
-    /// Get the ring number.
+    /// Ring number (0, 1, or 2).
     #[inline]
     #[must_use]
     pub fn ring(&self) -> u8 {
         self.ring
     }
 
-    /// Get the budget in nanoseconds.
+    /// Allowed budget in nanoseconds.
     #[inline]
     #[must_use]
     pub fn budget_ns(&self) -> u64 {
@@ -317,7 +297,7 @@ impl TaskBudget {
         self.budget_ns as i64 - self.elapsed_ns() as i64
     }
 
-    /// Check if budget is exceeded.
+    /// `true` when elapsed time exceeds the budget.
     #[inline]
     #[must_use]
     pub fn exceeded(&self) -> bool {
@@ -342,8 +322,6 @@ impl TaskBudget {
         self.elapsed_ns() > self.budget_ns / 2
     }
 
-    /// Get the percentage of budget used (0-100+).
-    ///
     /// Values over 100 indicate the budget was exceeded.
     #[inline]
     #[must_use]

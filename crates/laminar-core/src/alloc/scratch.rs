@@ -47,7 +47,7 @@ pub struct ScratchBuffer<const SIZE: usize = DEFAULT_SCRATCH_SIZE> {
 }
 
 impl<const SIZE: usize> ScratchBuffer<SIZE> {
-    /// Create a new scratch buffer.
+    /// Allocates a zeroed buffer on the stack.
     #[must_use]
     pub const fn new() -> Self {
         Self {
@@ -56,21 +56,21 @@ impl<const SIZE: usize> ScratchBuffer<SIZE> {
         }
     }
 
-    /// Get the total capacity of the scratch buffer.
+    /// Total byte capacity (`SIZE`).
     #[inline]
     #[must_use]
     pub const fn capacity(&self) -> usize {
         SIZE
     }
 
-    /// Get the number of bytes remaining.
+    /// Bytes available before the buffer is full.
     #[inline]
     #[must_use]
     pub fn remaining(&self) -> usize {
         SIZE - self.position
     }
 
-    /// Get the number of bytes used.
+    /// Bytes already written.
     #[inline]
     #[must_use]
     pub fn used(&self) -> usize {

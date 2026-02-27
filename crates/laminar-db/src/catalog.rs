@@ -1,13 +1,13 @@
 //! Source and sink catalog for tracking registered streaming objects.
 
-use std::collections::{HashMap, VecDeque};
-use std::sync::atomic::{AtomicU64, Ordering};
+use std::collections::HashMap;
+use std::sync::atomic::{AtomicU64, AtomicUsize, Ordering};
 use std::sync::Arc;
 use std::time::Duration;
 
 use arrow::array::RecordBatch;
 use arrow::datatypes::SchemaRef;
-use parking_lot::{Mutex, RwLock};
+use parking_lot::RwLock;
 
 use laminar_core::streaming::{self, BackpressureStrategy, SourceConfig, WaitStrategy};
 
@@ -30,6 +30,58 @@ impl laminar_core::streaming::Record for ArrowRecord {
     }
 }
 
+/// Lock-free bounded ring buffer for snapshot batches.
+///
+/// Uses a fixed-size `Vec<Option<RecordBatch>>` with atomic head/tail indices.
+/// Writers overwrite the oldest slot when full (bounded, non-blocking).
+/// Readers clone the current snapshot without blocking writers.
+struct SnapshotRing {
+    slots: Box<[std::sync::RwLock<Option<RecordBatch>>]>,
+    head: AtomicUsize,
+    len: AtomicUsize,
+    capacity: usize,
+}
+
+impl SnapshotRing {
+    fn new(capacity: usize) -> Self {
+        let cap = capacity.max(1);
+        let slots: Vec<_> = (0..cap).map(|_| std::sync::RwLock::new(None)).collect();
+        Self {
+            slots: slots.into_boxed_slice(),
+            head: AtomicUsize::new(0),
+            len: AtomicUsize::new(0),
+            capacity: cap,
+        }
+    }
+
+    fn push(&self, batch: RecordBatch) {
+        let current_len = self.len.load(Ordering::Acquire);
+        if current_len < self.capacity {
+            let idx = (self.head.load(Ordering::Acquire) + current_len) % self.capacity;
+            *self.slots[idx].write().unwrap() = Some(batch);
+            self.len.fetch_add(1, Ordering::Release);
+        } else {
+            let head = self.head.load(Ordering::Acquire);
+            *self.slots[head].write().unwrap() = Some(batch);
+            self.head
+                .store((head + 1) % self.capacity, Ordering::Release);
+        }
+    }
+
+    fn snapshot(&self) -> Vec<RecordBatch> {
+        let len = self.len.load(Ordering::Acquire);
+        let head = self.head.load(Ordering::Acquire);
+        let mut result = Vec::with_capacity(len);
+        for i in 0..len {
+            let idx = (head + i) % self.capacity;
+            if let Some(batch) = self.slots[idx].read().unwrap().as_ref() {
+                result.push(batch.clone());
+            }
+        }
+        result
+    }
+}
+
 /// A registered source in the catalog.
 pub struct SourceEntry {
     /// Source name.
@@ -45,40 +97,35 @@ pub struct SourceEntry {
     /// The underlying streaming source (type-erased via `ArrowRecord`).
     pub(crate) source: streaming::Source<ArrowRecord>,
     /// The underlying streaming sink (type-erased via `ArrowRecord`).
-    #[allow(dead_code)] // Reserved for Phase 3 connector manager sink routing
+    #[allow(dead_code)]
     pub(crate) sink: streaming::Sink<ArrowRecord>,
-    /// Bounded buffer of recent batches for ad-hoc snapshot queries.
-    buffer: Mutex<VecDeque<RecordBatch>>,
-    /// Max batches retained (defaults to channel `buffer_size`).
-    buffer_capacity: usize,
+    /// Lock-free bounded ring buffer for ad-hoc snapshot queries.
+    buffer: SnapshotRing,
 }
 
 impl SourceEntry {
     /// Push a batch to both the SPSC channel and the snapshot buffer.
     ///
     /// The snapshot buffer is bounded — oldest batches are dropped when
-    /// `buffer_capacity` is exceeded.
+    /// capacity is exceeded. The SPSC push is the primary delivery path;
+    /// the snapshot ring is only for ad-hoc queries.
     pub(crate) fn push_and_buffer(
         &self,
         batch: RecordBatch,
     ) -> Result<(), laminar_core::streaming::StreamingError> {
         self.source.push_arrow(batch.clone())?;
-        let mut buf = self.buffer.lock();
-        if buf.len() >= self.buffer_capacity {
-            buf.pop_front();
-        }
-        buf.push_back(batch);
+        self.buffer.push(batch);
         Ok(())
     }
 
     /// Return a snapshot of all buffered batches for ad-hoc queries.
     pub(crate) fn snapshot(&self) -> Vec<RecordBatch> {
-        self.buffer.lock().iter().cloned().collect()
+        self.buffer.snapshot()
     }
 }
 
 /// A registered sink in the catalog.
-#[allow(dead_code)] // Public API for Phase 3 CREATE SINK execution
+#[allow(dead_code)]
 pub(crate) struct SinkEntry {
     /// Sink name.
     pub(crate) name: String,
@@ -97,7 +144,7 @@ pub(crate) struct QueryEntry {
 }
 
 /// A registered stream in the catalog.
-#[allow(dead_code)] // Public API for Phase 3 CREATE STREAM execution
+#[allow(dead_code)]
 pub(crate) struct StreamEntry {
     /// Stream name.
     pub(crate) name: String,
@@ -172,8 +219,7 @@ impl SourceCatalog {
             is_processing_time: std::sync::atomic::AtomicBool::new(false),
             source,
             sink,
-            buffer: Mutex::new(VecDeque::with_capacity(buf_size)),
-            buffer_capacity: buf_size,
+            buffer: SnapshotRing::new(buf_size),
         });
 
         sources.insert(name.to_string(), Arc::clone(&entry));

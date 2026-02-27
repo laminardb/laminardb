@@ -744,6 +744,15 @@ where
                                 ChangelogRecord::insert(event.clone(), ctx.processing_time);
                             output.push(Output::Changelog(record));
                             self.last_emitted.insert(*window_id, event);
+                            if self.last_emitted.len().is_multiple_of(100_000) {
+                                tracing::warn!(
+                                    operator = %self.operator_id,
+                                    tracked_windows = self.last_emitted.len(),
+                                    "last_emitted map is large — windows \
+                                     may not be closing. Check watermark \
+                                     advancement and window configuration."
+                                );
+                            }
                         }
                     }
                 }

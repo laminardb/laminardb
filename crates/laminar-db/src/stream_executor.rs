@@ -23,10 +23,13 @@ use sqlparser::parser::Parser;
 use laminar_sql::parser::join_parser::analyze_joins;
 use laminar_sql::parser::{EmitClause, EmitStrategy as SqlEmitStrategy};
 use laminar_sql::translator::{
-    AsofJoinTranslatorConfig, JoinOperatorConfig, OrderOperatorConfig, WindowOperatorConfig,
-    WindowType,
+    AsofJoinTranslatorConfig, JoinOperatorConfig, OrderOperatorConfig,
+    TemporalJoinTranslatorConfig, WindowOperatorConfig, WindowType,
 };
 
+use crate::aggregate_state::IncrementalAggState;
+use crate::core_window_state::CoreWindowState;
+use crate::eowc_state::IncrementalEowcState;
 use crate::error::DbError;
 
 /// Convert a SQL-layer `EmitStrategy` to a core-layer `EmitStrategy`.
@@ -35,7 +38,6 @@ use crate::error::DbError;
 /// expect `EmitStrategy::Final`. This function maps all variants correctly.
 ///
 /// Cannot use a `From` impl due to the orphan rule (neither type is local).
-#[allow(dead_code)] // Bridge function for Phase 4 MV pipeline integration
 pub(crate) fn sql_emit_to_core(
     s: &SqlEmitStrategy,
 ) -> laminar_core::operator::window::EmitStrategy {
@@ -54,7 +56,6 @@ pub(crate) fn sql_emit_to_core(
 ///
 /// Calls `EmitClause::to_emit_strategy()` to resolve the clause to a
 /// runtime strategy, then converts via [`sql_emit_to_core`].
-#[allow(dead_code)] // Bridge function for Phase 4 MV pipeline integration
 pub(crate) fn emit_clause_to_core(
     clause: &EmitClause,
 ) -> Result<laminar_core::operator::window::EmitStrategy, laminar_sql::parser::ParseError> {
@@ -136,6 +137,8 @@ pub(crate) struct StreamQuery {
     /// Rewritten projection SQL to apply aliases/expressions after the ASOF
     /// join result is registered as `__asof_tmp`.
     pub projection_sql: Option<String>,
+    /// Temporal join config (set when the query contains FOR `SYSTEM_TIME` AS OF).
+    pub temporal_config: Option<TemporalJoinTranslatorConfig>,
     /// EMIT clause from the planner (e.g., `OnWindowClose`, `Final`).
     pub emit_clause: Option<EmitClause>,
     /// Window configuration from the planner (window type, size, gap, etc.).
@@ -162,11 +165,21 @@ impl StreamQuery {
 /// data keeps arriving.
 const MAX_EOWC_ACCUMULATED_ROWS: usize = 1_000_000;
 
-/// Per-query EOWC accumulation state.
+/// When an EOWC source has more than this many separate batches, coalesce
+/// them into a single batch to reduce per-batch overhead and memory
+/// fragmentation.
+const EOWC_COALESCE_BATCH_THRESHOLD: usize = 32;
+
+/// Per-query EOWC accumulation state (raw-batch path).
 ///
-/// For queries with `EMIT ON WINDOW CLOSE` or `EMIT FINAL`, source batches
-/// are accumulated across cycles and only aggregated when the watermark
-/// indicates new windows have closed.
+/// For non-aggregate EOWC queries (`EMIT ON WINDOW CLOSE` / `EMIT FINAL`),
+/// source batches are accumulated across cycles and replayed when the
+/// watermark indicates new windows have closed. Aggregate EOWC queries
+/// bypass this struct entirely — they are routed through
+/// `CoreWindowState` (tumbling windows) or `IncrementalEowcState`
+/// (other window types) for `O(groups)` memory via incremental
+/// accumulators. Batches are coalesced at
+/// `EOWC_COALESCE_BATCH_THRESHOLD` to mitigate fragmentation.
 struct EowcState {
     /// Accumulated source batches keyed by source table name.
     accumulated_sources: HashMap<String, Vec<RecordBatch>>,
@@ -195,6 +208,33 @@ pub(crate) struct StreamExecutor {
     source_schemas: HashMap<String, SchemaRef>,
     /// Per-query EOWC accumulation state, keyed by query index.
     eowc_states: HashMap<usize, EowcState>,
+    /// Per-query incremental aggregation state, keyed by query index.
+    /// Initialized lazily on first cycle when the logical plan reveals
+    /// the query contains a GROUP BY / aggregate.
+    agg_states: HashMap<usize, IncrementalAggState>,
+    /// Set of query indices that have been checked for aggregation but
+    /// found not to be aggregate queries (avoids re-checking).
+    non_agg_queries: HashSet<usize>,
+    /// Per-query incremental EOWC aggregation state, keyed by query index.
+    /// Initialized lazily on first EOWC cycle when the logical plan reveals
+    /// the query contains a GROUP BY / aggregate.
+    eowc_agg_states: HashMap<usize, IncrementalEowcState>,
+    /// Set of EOWC query indices that have been checked for aggregation but
+    /// found not to be aggregate queries (fall back to raw-batch path).
+    non_eowc_agg_queries: HashSet<usize>,
+    /// Per-query core window pipeline state for tumbling-window aggregates.
+    /// Initialized lazily on first EOWC cycle when the query qualifies.
+    core_window_states: HashMap<usize, CoreWindowState>,
+    /// Set of EOWC query indices that were checked for core window routing but
+    /// found not to qualify (fall through to `IncrementalEowcState`).
+    non_core_window_queries: HashSet<usize>,
+    /// Pending checkpoint data for deferred restore. Held until agg states
+    /// are lazily initialized, then applied and cleared.
+    pending_restore: Option<crate::aggregate_state::StreamExecutorCheckpoint>,
+    /// Reusable per-cycle results map (cleared each cycle to avoid reallocation).
+    cycle_results: HashMap<String, Vec<RecordBatch>>,
+    /// Reusable per-cycle intermediate table name list.
+    cycle_intermediates: Vec<String>,
 }
 
 impl StreamExecutor {
@@ -208,6 +248,15 @@ impl StreamExecutor {
             topo_dirty: true,
             source_schemas: HashMap::new(),
             eowc_states: HashMap::new(),
+            agg_states: HashMap::new(),
+            non_agg_queries: HashSet::new(),
+            eowc_agg_states: HashMap::new(),
+            non_eowc_agg_queries: HashSet::new(),
+            core_window_states: HashMap::new(),
+            non_core_window_queries: HashSet::new(),
+            pending_restore: None,
+            cycle_results: HashMap::new(),
+            cycle_intermediates: Vec::new(),
         }
     }
 
@@ -231,6 +280,7 @@ impl StreamExecutor {
         order_config: Option<OrderOperatorConfig>,
     ) {
         let (asof_config, projection_sql) = detect_asof_query(&sql);
+        let temporal_config = detect_temporal_query(&sql);
         let table_refs = extract_table_references(&sql);
         let idx = self.queries.len();
         let query = StreamQuery {
@@ -238,6 +288,7 @@ impl StreamExecutor {
             sql,
             asof_config,
             projection_sql,
+            temporal_config,
             emit_clause,
             window_config,
             order_config,
@@ -261,7 +312,7 @@ impl StreamExecutor {
     /// Register a static reference table (e.g., from `CREATE TABLE`).
     ///
     /// Unlike source tables, these persist across cycles.
-    #[allow(dead_code)] // Public API for Phase 3 CREATE TABLE support
+    #[allow(dead_code)]
     pub fn register_table(&self, name: &str, batch: RecordBatch) -> Result<(), DbError> {
         let schema = batch.schema();
         let mem_table = datafusion::datasource::MemTable::try_new(schema, vec![vec![batch]])
@@ -324,6 +375,12 @@ impl StreamExecutor {
 
         // Fallback: if cycle detected, append any missing indices in insertion order
         if self.topo_order.len() < self.queries.len() {
+            tracing::warn!(
+                ordered = self.topo_order.len(),
+                total = self.queries.len(),
+                "circular dependency detected in query DAG, \
+                 falling back to insertion order for remaining queries"
+            );
             let in_order: HashSet<usize> = self.topo_order.iter().copied().collect();
             for i in 0..self.queries.len() {
                 if !in_order.contains(&i) {
@@ -349,26 +406,27 @@ impl StreamExecutor {
         source_batches: &HashMap<String, Vec<RecordBatch>>,
         current_watermark: i64,
     ) -> Result<HashMap<String, Vec<RecordBatch>>, DbError> {
-        // 1. Recompute topological order if queries changed
         if self.topo_dirty {
             self.compute_topo_order();
         }
 
-        // 2. Register source data as temporary MemTables
         self.register_source_tables(source_batches)?;
 
-        // 3. Execute queries in dependency order, registering intermediate results
-        let mut results = HashMap::new();
-        let mut intermediate_tables: Vec<String> = Vec::new();
+        // Reuse per-cycle allocations: take the pre-allocated maps out of
+        // self so the borrow checker allows &mut self calls while results
+        // is borrowed immutably within the loop.
+        let mut results = std::mem::take(&mut self.cycle_results);
+        results.clear();
+        let mut intermediate_tables = std::mem::take(&mut self.cycle_intermediates);
+        intermediate_tables.clear();
 
         let topo_len = self.topo_order.len();
         for i in 0..topo_len {
             let idx = self.topo_order[i];
             let is_eowc = self.queries[idx].suppresses_intermediate();
             let has_asof = self.queries[idx].asof_config.is_some();
+            let has_temporal = self.queries[idx].temporal_config.is_some();
 
-            // ── EOWC branch: accumulate and gate on watermark ──
-            // Clone query fields only in branches needing &mut self.
             let batches = if is_eowc {
                 let query_name = self.queries[idx].name.clone();
                 let window_config = self.queries[idx].window_config.clone();
@@ -387,7 +445,10 @@ impl StreamExecutor {
                 .await?
             } else if has_asof {
                 let query_name = self.queries[idx].name.clone();
-                let cfg = self.queries[idx].asof_config.clone().unwrap();
+                let cfg = self.queries[idx]
+                    .asof_config
+                    .clone()
+                    .expect("has_asof guard ensures asof_config is Some");
                 let projection_sql = self.queries[idx].projection_sql.clone();
                 self.execute_asof_query(
                     &query_name,
@@ -397,17 +458,16 @@ impl StreamExecutor {
                     &results,
                 )
                 .await?
+            } else if has_temporal {
+                let query_name = self.queries[idx].name.clone();
+                let cfg = self.queries[idx]
+                    .temporal_config
+                    .clone()
+                    .expect("has_temporal guard ensures temporal_config is Some");
+                self.execute_temporal_query(&query_name, &cfg, source_batches, &results)
+                    .await?
             } else {
-                let query_name = &self.queries[idx].name;
-                let query_sql = &self.queries[idx].sql;
-                let df = self
-                    .ctx
-                    .sql(query_sql)
-                    .await
-                    .map_err(|e| DbError::query_pipeline(query_name, &e))?;
-                df.collect()
-                    .await
-                    .map_err(|e| DbError::query_pipeline(query_name, &e))?
+                self.execute_standard_query(idx).await?
             };
 
             // Apply Top-K post-filter if configured
@@ -421,7 +481,6 @@ impl StreamExecutor {
 
             if !batches.is_empty() {
                 let query_name = self.queries[idx].name.clone();
-                // Register results as a temp MemTable for downstream queries
                 let schema = batches[0].schema();
                 if let Ok(mem_table) =
                     datafusion::datasource::MemTable::try_new(schema, vec![batches.clone()])
@@ -434,12 +493,13 @@ impl StreamExecutor {
             }
         }
 
-        // 4. Cleanup temporary source tables AND intermediate tables
         self.cleanup_source_tables();
         for name in &intermediate_tables {
             let _ = self.ctx.deregister_table(name);
         }
 
+        // Stash the (now-empty after take) intermediates back for reuse
+        self.cycle_intermediates = intermediate_tables;
         Ok(results)
     }
 
@@ -496,15 +556,173 @@ impl StreamExecutor {
         }
     }
 
-    /// Get the number of registered queries.
-    #[allow(dead_code)] // Public API for admin/observability queries
+    /// Execute a standard (non-EOWC, non-ASOF) query.
+    ///
+    /// On the first call for each query, attempts to detect whether the query
+    /// contains a GROUP BY / aggregate. If so, creates an
+    /// `IncrementalAggState` and routes subsequent calls through incremental
+    /// accumulators for correct running totals across cycles.
+    ///
+    /// Non-aggregate queries continue using the existing `DataFusion`
+    /// `MemTable` + SQL execution path.
+    async fn execute_standard_query(&mut self, idx: usize) -> Result<Vec<RecordBatch>, DbError> {
+        // Fast path: already have incremental agg state for this query
+        if self.agg_states.contains_key(&idx) {
+            return self.execute_incremental_agg(idx).await;
+        }
+
+        // Fast path: already checked and found non-aggregate
+        if self.non_agg_queries.contains(&idx) {
+            return self.execute_plain_query(idx).await;
+        }
+
+        // First call: try to initialize IncrementalAggState
+        let query_name = self.queries[idx].name.clone();
+        let query_sql = self.queries[idx].sql.clone();
+        match IncrementalAggState::try_from_sql(&self.ctx, &query_sql).await {
+            Ok(Some(state)) => {
+                self.agg_states.insert(idx, state);
+                self.try_restore_pending_agg(idx);
+                self.execute_incremental_agg(idx).await
+            }
+            Ok(None) => {
+                // Not an aggregation query — use standard path
+                self.non_agg_queries.insert(idx);
+                self.execute_plain_query(idx).await
+            }
+            Err(e) => {
+                // Plan introspection failed — fall back to standard path
+                tracing::debug!(
+                    query = %query_name,
+                    error = %e,
+                    "Could not introspect query plan, using per-batch execution"
+                );
+                self.non_agg_queries.insert(idx);
+                self.execute_plain_query(idx).await
+            }
+        }
+    }
+
+    /// Execute a non-aggregate query via `DataFusion` SQL.
+    async fn execute_plain_query(&self, idx: usize) -> Result<Vec<RecordBatch>, DbError> {
+        let query_name = &self.queries[idx].name;
+        let query_sql = &self.queries[idx].sql;
+        let df = self
+            .ctx
+            .sql(query_sql)
+            .await
+            .map_err(|e| DbError::query_pipeline(query_name, &e))?;
+        df.collect()
+            .await
+            .map_err(|e| DbError::query_pipeline(query_name, &e))
+    }
+
+    /// Execute an aggregation query using incremental accumulators.
+    ///
+    /// Runs the pre-aggregation SQL (projection only) through `DataFusion`,
+    /// then feeds the result to per-group accumulators. Emits running
+    /// aggregate totals.
+    async fn execute_incremental_agg(&mut self, idx: usize) -> Result<Vec<RecordBatch>, DbError> {
+        let query_name = self.queries[idx].name.clone();
+
+        let agg_state = self.agg_states.get(&idx).ok_or_else(|| {
+            DbError::Pipeline(format!("internal: missing agg_state for query index {idx}"))
+        })?;
+        let pre_agg_sql = agg_state.pre_agg_sql().to_string();
+
+        let pre_agg_batches = match self.ctx.sql(&pre_agg_sql).await {
+            Ok(df) => df
+                .collect()
+                .await
+                .map_err(|e| DbError::query_pipeline(&query_name, &e))?,
+            Err(e) => {
+                // Pre-agg SQL failed (e.g., no source data this cycle)
+                // — emit current state without updating
+                tracing::trace!(
+                    query = %query_name,
+                    error = %e,
+                    "Pre-agg SQL failed, emitting current state"
+                );
+                let agg_state = self.agg_states.get_mut(&idx).ok_or_else(|| {
+                    DbError::Pipeline(format!("internal: missing agg_state for query index {idx}"))
+                })?;
+                return agg_state.emit();
+            }
+        };
+
+        let agg_state = self.agg_states.get_mut(&idx).ok_or_else(|| {
+            DbError::Pipeline(format!("internal: missing agg_state for query index {idx}"))
+        })?;
+        for batch in &pre_agg_batches {
+            agg_state.process_batch(batch)?;
+        }
+
+        let having_sql = agg_state.having_sql().map(String::from);
+        let mut batches = agg_state.emit()?;
+
+        // Apply HAVING filter post-emission
+        if let Some(having_sql) = having_sql {
+            batches = self
+                .apply_having_filter(&query_name, &batches, &having_sql)
+                .await?;
+        }
+
+        Ok(batches)
+    }
+
+    /// Apply a HAVING predicate to emitted aggregate batches using the
+    /// session context's SQL engine.
+    async fn apply_having_filter(
+        &self,
+        query_name: &str,
+        batches: &[RecordBatch],
+        having_sql: &str,
+    ) -> Result<Vec<RecordBatch>, DbError> {
+        if batches.is_empty() {
+            return Ok(Vec::new());
+        }
+
+        let schema = batches[0].schema();
+        let col_list: Vec<String> = schema
+            .fields()
+            .iter()
+            .map(|f| format!("\"{}\"", f.name()))
+            .collect();
+        let filter_sql = format!(
+            "SELECT {} FROM \"__having_{}\" WHERE {having_sql}",
+            col_list.join(", "),
+            query_name
+        );
+        let table_name = format!("__having_{query_name}");
+
+        let mem_table = datafusion::datasource::MemTable::try_new(schema, vec![batches.to_vec()])
+            .map_err(|e| DbError::query_pipeline(query_name, &e))?;
+        let _ = self.ctx.deregister_table(&table_name);
+        self.ctx
+            .register_table(&table_name, Arc::new(mem_table))
+            .map_err(|e| DbError::query_pipeline(query_name, &e))?;
+
+        let result = match self.ctx.sql(&filter_sql).await {
+            Ok(df) => df
+                .collect()
+                .await
+                .map_err(|e| DbError::query_pipeline(query_name, &e)),
+            Err(e) => Err(DbError::query_pipeline(query_name, &e)),
+        };
+
+        let _ = self.ctx.deregister_table(&table_name);
+        result
+    }
+
+    /// Number of registered queries.
+    #[allow(dead_code)]
     pub fn query_count(&self) -> usize {
         self.queries.len()
     }
 
     /// Returns the current EOWC backpressure level (0.0 = no pressure,
     /// 1.0 = at memory limit). Callers can use this to throttle ingestion.
-    #[allow(dead_code)] // Public API for flow control
+    #[allow(dead_code)]
     pub fn backpressure_level(&self) -> f64 {
         let max_rows = self
             .eowc_states
@@ -517,12 +735,125 @@ impl StreamExecutor {
         level.min(1.0)
     }
 
+    /// Execute an EOWC aggregate query using incremental per-window accumulators.
+    ///
+    /// Runs the pre-aggregation SQL against currently registered source tables,
+    /// feeds the result to per-window-per-group accumulators, then closes
+    /// windows whose end <= watermark.
+    async fn execute_incremental_eowc(
+        &mut self,
+        idx: usize,
+        query_name: &str,
+        current_watermark: i64,
+    ) -> Result<Vec<RecordBatch>, DbError> {
+        let pre_agg_sql = self
+            .eowc_agg_states
+            .get(&idx)
+            .ok_or_else(|| {
+                DbError::Pipeline(format!(
+                    "internal: missing eowc_agg_state for query index {idx}"
+                ))
+            })?
+            .pre_agg_sql()
+            .to_string();
+
+        let pre_agg_batches = match self.ctx.sql(&pre_agg_sql).await {
+            Ok(df) => df
+                .collect()
+                .await
+                .map_err(|e| DbError::query_pipeline(query_name, &e))?,
+            Err(e) => {
+                tracing::trace!(
+                    query = %query_name,
+                    error = %e,
+                    "EOWC pre-agg SQL failed, skipping update"
+                );
+                Vec::new()
+            }
+        };
+
+        let eowc_state = self.eowc_agg_states.get_mut(&idx).ok_or_else(|| {
+            DbError::Pipeline(format!(
+                "internal: missing eowc_agg_state for query index {idx}"
+            ))
+        })?;
+        for batch in &pre_agg_batches {
+            eowc_state.update_batch(batch)?;
+        }
+
+        let having_sql = eowc_state.having_sql().map(String::from);
+        let mut batches = eowc_state.close_windows(current_watermark)?;
+
+        // Apply HAVING filter if present
+        if let Some(having_sql) = having_sql {
+            batches = self
+                .apply_having_filter(query_name, &batches, &having_sql)
+                .await?;
+        }
+
+        Ok(batches)
+    }
+
+    /// Execute a core-window tumbling-window aggregate query.
+    ///
+    /// Runs pre-aggregation SQL, feeds results through the core engine's
+    /// `TumblingWindowAssigner` for O(1) window assignment, then
+    /// closes windows whose end <= watermark.
+    async fn execute_core_window_query(
+        &mut self,
+        idx: usize,
+        query_name: &str,
+        current_watermark: i64,
+    ) -> Result<Vec<RecordBatch>, DbError> {
+        let pre_agg_sql = self
+            .core_window_states
+            .get(&idx)
+            .ok_or_else(|| {
+                DbError::Pipeline(format!("internal: missing cw_state for query index {idx}"))
+            })?
+            .pre_agg_sql()
+            .to_string();
+
+        let pre_agg_batches = match self.ctx.sql(&pre_agg_sql).await {
+            Ok(df) => df
+                .collect()
+                .await
+                .map_err(|e| DbError::query_pipeline(query_name, &e))?,
+            Err(e) => {
+                tracing::trace!(
+                    query = %query_name,
+                    error = %e,
+                    "core window pre-agg SQL failed, skipping update"
+                );
+                Vec::new()
+            }
+        };
+
+        let cw_state = self.core_window_states.get_mut(&idx).ok_or_else(|| {
+            DbError::Pipeline(format!("internal: missing cw_state for query index {idx}"))
+        })?;
+        for batch in &pre_agg_batches {
+            cw_state.update_batch(batch)?;
+        }
+
+        let having_sql = cw_state.having_sql().map(String::from);
+        let mut batches = cw_state.close_windows(current_watermark)?;
+
+        // Apply HAVING filter if present
+        if let Some(having_sql) = having_sql {
+            batches = self
+                .apply_having_filter(query_name, &batches, &having_sql)
+                .await?;
+        }
+
+        Ok(batches)
+    }
+
     /// Execute an EOWC (Emit On Window Close) query.
     ///
-    /// Accumulates source batches across cycles, filters to closed-window data
-    /// when the watermark advances past a window boundary, and runs the aggregate
-    /// query only on closed-window data. Non-closed data is retained for the
-    /// next cycle.
+    /// For aggregate queries with a window config, routes through incremental
+    /// per-window accumulators (`IncrementalEowcState`) for O(groups) memory.
+    /// Non-aggregate queries and ASOF joins fall back to the raw-batch path.
     #[allow(clippy::too_many_lines, clippy::too_many_arguments)]
     async fn execute_eowc_query(
         &mut self,
@@ -535,10 +866,109 @@ impl StreamExecutor {
         intermediate_results: &HashMap<String, Vec<RecordBatch>>,
         current_watermark: i64,
     ) -> Result<Vec<RecordBatch>, DbError> {
-        // Use pre-computed table references (extracted once at registration)
-        let table_refs = self.queries[idx].table_refs.clone();
+        // Try core-window and incremental EOWC paths for aggregate queries with
+        // window config (non-ASOF only — ASOF joins use a custom execution path).
+        if asof_config.is_none() {
+            if let Some(cfg) = window_config {
+                // ── core window fast path: already routed ──
+                if self.core_window_states.contains_key(&idx) {
+                    return self
+                        .execute_core_window_query(idx, query_name, current_watermark)
+                        .await;
+                }
 
-        // Accumulate current source batches into EOWC state
+                // ── core window detection (first call only) ──
+                if !self.non_core_window_queries.contains(&idx)
+                    && !self.eowc_agg_states.contains_key(&idx)
+                    && !self.non_eowc_agg_queries.contains(&idx)
+                {
+                    let query_sql = self.queries[idx].sql.clone();
+                    let cfg_clone = cfg.clone();
+                    let emit_ref = self.queries[idx].emit_clause.as_ref();
+                    match CoreWindowState::try_from_sql(&self.ctx, &query_sql, &cfg_clone, emit_ref)
+                        .await
+                    {
+                        Ok(Some(state)) => {
+                            tracing::info!(
+                                query = query_name,
+                                window_type = ?cfg_clone.window_type,
+                                "EOWC query routed to core window pipeline"
+                            );
+                            self.core_window_states.insert(idx, state);
+                            self.try_restore_pending_core_window(idx);
+                            return self
+                                .execute_core_window_query(idx, query_name, current_watermark)
+                                .await;
+                        }
+                        Ok(None) => {
+                            self.non_core_window_queries.insert(idx);
+                        }
+                        Err(e) => {
+                            tracing::debug!(
+                                query = query_name,
+                                error = %e,
+                                "core window detection failed, \
+                                 falling back to EOWC path"
+                            );
+                            self.non_core_window_queries.insert(idx);
+                        }
+                    }
+                }
+
+                // ── IncrementalEowcState fast path: already have state ──
+                if self.eowc_agg_states.contains_key(&idx) {
+                    return self
+                        .execute_incremental_eowc(idx, query_name, current_watermark)
+                        .await;
+                }
+
+                // ── IncrementalEowcState detection (first call only) ──
+                if !self.non_eowc_agg_queries.contains(&idx) {
+                    let query_sql = self.queries[idx].sql.clone();
+                    let cfg_clone = cfg.clone();
+                    match IncrementalEowcState::try_from_sql(&self.ctx, &query_sql, &cfg_clone)
+                        .await
+                    {
+                        Ok(Some(state)) => {
+                            tracing::info!(
+                                query = query_name,
+                                "EOWC query detected as aggregate, \
+                                 using incremental per-window accumulators"
+                            );
+                            self.eowc_agg_states.insert(idx, state);
+                            self.try_restore_pending_eowc(idx);
+                            return self
+                                .execute_incremental_eowc(idx, query_name, current_watermark)
+                                .await;
+                        }
+                        Ok(None) => {
+                            tracing::debug!(
+                                query = query_name,
+                                "EOWC query is not aggregate, \
+                                 using raw-batch path"
+                            );
+                            self.non_eowc_agg_queries.insert(idx);
+                        }
+                        Err(e) => {
+                            tracing::debug!(
+                                query = query_name,
+                                error = %e,
+                                "Could not introspect EOWC plan, \
+                                 falling back to raw-batch path"
+                            );
+                            self.non_eowc_agg_queries.insert(idx);
+                        }
+                    }
+                }
+            }
+        }
+
+        // Fall through to raw-batch EOWC path.
+        // Collect table refs as owned strings to avoid borrowing self.queries
+        // while mutating self.eowc_states.
+        let table_refs: Vec<String> = self.queries[idx].table_refs.iter().cloned().collect();
+
+        // Accumulate current source batches into EOWC state.
         if let Some(eowc) = self.eowc_states.get_mut(&idx) {
             for table_name in &table_refs {
                 // Check source_batches first, then intermediate_results
@@ -550,13 +980,29 @@ impl StreamExecutor {
                 };
 
                 if let Some(batches) = batches_to_add {
+                    let entry = eowc
+                        .accumulated_sources
+                        .entry(table_name.clone())
+                        .or_default();
                     for batch in batches {
                         if batch.num_rows() > 0 {
                             eowc.accumulated_rows += batch.num_rows();
-                            eowc.accumulated_sources
-                                .entry(table_name.clone())
-                                .or_default()
-                                .push(batch.clone());
+                            entry.push(batch.clone());
+                        }
+                    }
+
+                    // Coalesce when batch count exceeds threshold to reduce
+                    // per-batch overhead and memory fragmentation.
+                    if entry.len() > EOWC_COALESCE_BATCH_THRESHOLD {
+                        let schema = entry[0].schema();
+                        match arrow::compute::concat_batches(&schema, entry.as_slice()) {
+                            Ok(coalesced) => *entry = vec![coalesced],
+                            Err(e) => tracing::warn!(
+                                table = %table_name,
+                                batches = entry.len(),
+                                "EOWC batch coalescing failed, \
+                                 keeping fragmented batches: {e}"
+                            ),
                         }
                     }
                 }
@@ -568,32 +1014,43 @@ impl StreamExecutor {
             compute_closed_boundary(current_watermark, cfg)
         });
 
-        // Check if accumulated rows exceed memory bounds (prevent OOM)
-        let force_emit = self
-            .eowc_states
-            .get(&idx)
-            .is_some_and(|s| s.accumulated_rows > MAX_EOWC_ACCUMULATED_ROWS);
-
-        // Check if any new windows have closed since last emission
         let last_boundary = self
             .eowc_states
             .get(&idx)
             .map_or(i64::MIN, |s| s.last_closed_boundary);
 
-        if closed_cut <= last_boundary && !force_emit {
-            // No new windows closed and not over memory limit — suppress output
+        if closed_cut <= last_boundary {
+            // No new windows closed. Check if memory pressure requires
+            // coalescing, but do NOT advance the cutoff — that would emit
+            // rows from open windows, causing data loss.
+            let over_limit = self
+                .eowc_states
+                .get(&idx)
+                .is_some_and(|s| s.accumulated_rows > MAX_EOWC_ACCUMULATED_ROWS);
+            if over_limit {
+                tracing::warn!(
+                    query = query_name,
+                    accumulated_rows = self.eowc_states.get(&idx).map_or(0, |s| s.accumulated_rows),
+                    limit = MAX_EOWC_ACCUMULATED_ROWS,
+                    "EOWC memory pressure: watermark has not advanced, \
+                     coalescing batches to reduce fragmentation"
+                );
+                // Coalesce to reduce fragmentation without changing semantics
+                if let Some(eowc) = self.eowc_states.get_mut(&idx) {
+                    for batches in eowc.accumulated_sources.values_mut() {
+                        if batches.len() > 1 {
+                            let schema = batches[0].schema();
+                            match arrow::compute::concat_batches(&schema, batches.as_slice()) {
+                                Ok(coalesced) => *batches = vec![coalesced],
+                                Err(e) => tracing::warn!("EOWC pressure coalescing failed: {e}"),
+                            }
+                        }
+                    }
+                }
+            }
             return Ok(Vec::new());
         }
 
-        // When force-emitting due to memory bounds, advance the cutoff to
-        // the current watermark to flush all data older than the watermark.
-        let closed_cut = if force_emit && closed_cut <= last_boundary {
-            current_watermark
-        } else {
-            closed_cut
-        };
-
-        // Get the time column from the window config for filtering
         let time_column = window_config.map(|cfg| cfg.time_column.clone());
 
         // Single-pass: split accumulated data into closed-window rows (for query)
@@ -642,12 +1099,19 @@ impl StreamExecutor {
                 }
                 if !filtered_batches.is_empty() {
                     let schema = filtered_batches[0].schema();
-                    if let Ok(coalesced) =
-                        arrow::compute::concat_batches(&schema, &filtered_batches)
-                    {
-                        filtered_sources.insert(table_name.clone(), vec![coalesced]);
-                    } else {
-                        filtered_sources.insert(table_name.clone(), filtered_batches);
+                    match arrow::compute::concat_batches(&schema, &filtered_batches) {
+                        Ok(coalesced) => {
+                            filtered_sources.insert(table_name.clone(), vec![coalesced]);
+                        }
+                        Err(e) => {
+                            tracing::warn!(
+                                table = %table_name,
+                                batches = filtered_batches.len(),
+                                "EOWC filtered batch coalescing failed, \
+                                 keeping fragmented: {e}"
+                            );
+                            filtered_sources.insert(table_name.clone(), filtered_batches);
+                        }
                     }
                 }
                 if !retained_batches.is_empty() {
@@ -687,6 +1151,7 @@ impl StreamExecutor {
 
         // Execute the query
         let query_sql = &self.queries[idx].sql;
+        let temporal_config = self.queries[idx].temporal_config.as_ref();
         let batches = if let Some(cfg) = asof_config {
             self.execute_asof_query(
                 query_name,
@@ -696,6 +1161,9 @@ impl StreamExecutor {
                 intermediate_results,
             )
             .await?
+        } else if let Some(tcfg) = temporal_config {
+            self.execute_temporal_query(query_name, tcfg, &filtered_sources, intermediate_results)
+                .await?
         } else {
             let df = self
                 .ctx
@@ -781,6 +1249,36 @@ impl StreamExecutor {
         }
     }
 
+    /// Execute a temporal join query by fetching stream/table batches and
+    /// performing a point-in-time version lookup.
+    async fn execute_temporal_query(
+        &self,
+        query_name: &str,
+        config: &TemporalJoinTranslatorConfig,
+        source_batches: &HashMap<String, Vec<RecordBatch>>,
+        intermediate_results: &HashMap<String, Vec<RecordBatch>>,
+    ) -> Result<Vec<RecordBatch>, DbError> {
+        let stream_batches = self
+            .resolve_table_batches(&config.stream_table, source_batches, intermediate_results)
+            .await?;
+        let table_batches = self
+            .resolve_table_batches(&config.table_name, source_batches, intermediate_results)
+            .await?;
+
+        let joined = crate::temporal_batch::execute_temporal_join_batch(
+            &stream_batches,
+            &table_batches,
+            config,
+        )
+        .map_err(|e| DbError::Pipeline(format!("temporal join [{query_name}]: {e}")))?;
+
+        if joined.num_rows() == 0 {
+            return Ok(Vec::new());
+        }
+
+        Ok(vec![joined])
+    }
+
     /// Resolve batches for a table name by checking source batches first,
     /// then intermediate results, then falling back to the `DataFusion` context.
     async fn resolve_table_batches(
@@ -806,6 +1304,193 @@ impl StreamExecutor {
             .await
             .map_err(|e| DbError::query_pipeline(table_name, &e))
     }
+
+    /// Checkpoint all aggregate state (both running-total and EOWC).
+    ///
+    /// Returns `Ok(None)` if there is no state to checkpoint (no aggregate
+    /// queries have accumulated any groups). Otherwise returns the serialized
+    /// JSON bytes.
+    pub fn checkpoint_state(&mut self) -> Result<Option<Vec<u8>>, DbError> {
+        use crate::aggregate_state::StreamExecutorCheckpoint;
+
+        let mut agg_checkpoints = HashMap::new();
+        for (&idx, state) in &mut self.agg_states {
+            let name = self.queries[idx].name.clone();
+            agg_checkpoints.insert(name, state.checkpoint_groups()?);
+        }
+
+        let mut eowc_checkpoints = HashMap::new();
+        for (&idx, state) in &mut self.eowc_agg_states {
+            let name = self.queries[idx].name.clone();
+            eowc_checkpoints.insert(name, state.checkpoint_windows()?);
+        }
+
+        let mut cw_checkpoints = HashMap::new();
+        for (&idx, state) in &mut self.core_window_states {
+            let name = self.queries[idx].name.clone();
+            cw_checkpoints.insert(name, state.checkpoint_windows()?);
+        }
+
+        if agg_checkpoints.is_empty() && eowc_checkpoints.is_empty() && cw_checkpoints.is_empty() {
+            return Ok(None);
+        }
+
+        let checkpoint = StreamExecutorCheckpoint {
+            version: 1,
+            agg_states: agg_checkpoints,
+            eowc_states: eowc_checkpoints,
+            core_window_states: cw_checkpoints,
+        };
+
+        let bytes = serde_json::to_vec(&checkpoint).map_err(|e| {
+            DbError::Pipeline(format!("stream executor checkpoint serialization: {e}"))
+        })?;
+
+        Ok(Some(bytes))
+    }
+
+    /// Restore aggregate state from a previous checkpoint.
+    ///
+    /// Deserializes the checkpoint and stores it for deferred restore.
+    /// Aggregate states are lazily initialized on first execution cycle,
+    /// so the actual restore happens when each state is first created
+    /// (via `try_restore_pending`). Any already-initialized states are
+    /// restored immediately.
+    ///
+    /// Returns an error if the checkpoint is corrupt.
+    pub fn restore_state(&mut self, bytes: &[u8]) -> Result<usize, DbError> {
+        use crate::aggregate_state::StreamExecutorCheckpoint;
+
+        let checkpoint: StreamExecutorCheckpoint = serde_json::from_slice(bytes).map_err(|e| {
+            DbError::Pipeline(format!("stream executor checkpoint deserialization: {e}"))
+        })?;
+
+        let mut restored = 0usize;
+
+        // Build name → index lookup
+        let name_to_idx: HashMap<&str, usize> = self
+            .queries
+            .iter()
+            .enumerate()
+            .map(|(i, q)| (q.name.as_str(), i))
+            .collect();
+
+        // Immediately restore any already-initialized states
+        for (name, agg_cp) in &checkpoint.agg_states {
+            if let Some(&idx) = name_to_idx.get(name.as_str()) {
+                if let Some(state) = self.agg_states.get_mut(&idx) {
+                    state.restore_groups(agg_cp)?;
+                    restored += 1;
+                }
+            }
+        }
+        for (name, eowc_cp) in &checkpoint.eowc_states {
+            if let Some(&idx) = name_to_idx.get(name.as_str()) {
+                if let Some(state) = self.eowc_agg_states.get_mut(&idx) {
+                    state.restore_windows(eowc_cp)?;
+                    restored += 1;
+                }
+            }
+        }
+        for (name, cw_cp) in &checkpoint.core_window_states {
+            if let Some(&idx) = name_to_idx.get(name.as_str()) {
+                if let Some(state) = self.core_window_states.get_mut(&idx) {
+                    state.restore_windows(cw_cp)?;
+                    restored += 1;
+                }
+            }
+        }
+
+        // Store for deferred restore of lazily-initialized states
+        self.pending_restore = Some(checkpoint);
+
+        Ok(restored)
+    }
+
+    /// Try to restore pending checkpoint data for a newly initialized
+    /// aggregate state. Called after lazy initialization.
+    fn try_restore_pending_agg(&mut self, idx: usize) {
+        let query_name = &self.queries[idx].name;
+        let pending = self.pending_restore.as_ref();
+        if let Some(cp) = pending.and_then(|p| p.agg_states.get(query_name)) {
+            // Clone the checkpoint data to avoid borrow conflict
+            let cp_clone = cp.clone();
+            if let Some(state) = self.agg_states.get_mut(&idx) {
+                match state.restore_groups(&cp_clone) {
+                    Ok(n) => {
+                        tracing::info!(
+                            query = %query_name,
+                            groups = n,
+                            "Restored agg state from checkpoint"
+                        );
+                    }
+                    Err(e) => {
+                        tracing::warn!(
+                            query = %query_name,
+                            error = %e,
+                            "Failed to restore agg state from checkpoint"
+                        );
+                    }
+                }
+            }
+        }
+    }
+
+    /// Try to restore pending checkpoint data for a newly initialized
+    /// EOWC aggregate state. Called after lazy initialization.
+    fn try_restore_pending_eowc(&mut self, idx: usize) {
+        let query_name = &self.queries[idx].name;
+        let pending = self.pending_restore.as_ref();
+        if let Some(cp) = pending.and_then(|p| p.eowc_states.get(query_name)) {
+            let cp_clone = cp.clone();
+            if let Some(state) = self.eowc_agg_states.get_mut(&idx) {
+                match state.restore_windows(&cp_clone) {
+                    Ok(n) => {
+                        tracing::info!(
+                            query = %query_name,
+                            groups = n,
+                            "Restored EOWC state from checkpoint"
+                        );
+                    }
+                    Err(e) => {
+                        tracing::warn!(
+                            query = %query_name,
+                            error = %e,
+                            "Failed to restore EOWC state from checkpoint"
+                        );
+                    }
+                }
+            }
+        }
+    }
+
+    /// Try to restore pending checkpoint data for a newly initialized
+    /// Core window pipeline state. Called after lazy initialization.
+    fn try_restore_pending_core_window(&mut self, idx: usize) {
+        let query_name = &self.queries[idx].name;
+        let pending = self.pending_restore.as_ref();
+        if let Some(cp) = pending.and_then(|p| p.core_window_states.get(query_name)) {
+            let cp_clone = cp.clone();
+            if let Some(state) = self.core_window_states.get_mut(&idx) {
+                match state.restore_windows(&cp_clone) {
+                    Ok(n) => {
+                        tracing::info!(
+                            query = %query_name,
+                            groups = n,
+                            "Restored core window state from checkpoint"
+                        );
+                    }
+                    Err(e) => {
+                        tracing::warn!(
+                            query = %query_name,
+                            error = %e,
+                            "Failed to restore core window state from checkpoint"
+                        );
+                    }
+                }
+            }
+        }
+    }
 }
 
 /// Detect whether a SQL query contains an ASOF JOIN and, if so, extract the
@@ -827,6 +1512,7 @@ fn compute_closed_boundary(watermark_ms: i64, config: &WindowOperatorConfig) -> 
             #[allow(clippy::cast_possible_truncation)]
             let size = config.size.as_millis() as i64;
             if size <= 0 {
+                tracing::warn!("tumbling window size is zero or negative, EOWC filtering disabled");
                 return watermark_ms;
             }
             // Floor to nearest window boundary
@@ -843,13 +1529,18 @@ fn compute_closed_boundary(watermark_ms: i64, config: &WindowOperatorConfig) -> 
             #[allow(clippy::cast_possible_truncation)]
             let slide = config.slide.map_or(size, |s| s.as_millis() as i64);
             if slide <= 0 || size <= 0 {
+                tracing::warn!(
+                    slide_ms = slide,
+                    size_ms = size,
+                    "sliding window size/slide is zero or negative, EOWC filtering disabled"
+                );
                 return watermark_ms;
             }
             // The earliest open window starts at the first slide-aligned
             // boundary after (watermark - size). Data below that start
             // belongs only to fully closed windows.
             let base = watermark_ms.saturating_sub(size);
-            (base / slide + 1) * slide
+            (base / slide).saturating_add(1).saturating_mul(slide)
         }
         WindowType::Cumulate => {
             // Cumulate windows share the same epoch alignment as tumbling.
@@ -857,6 +1548,7 @@ fn compute_closed_boundary(watermark_ms: i64, config: &WindowOperatorConfig) -> 
             #[allow(clippy::cast_possible_truncation)]
             let size = config.size.as_millis() as i64;
             if size <= 0 {
+                tracing::warn!("cumulate window size is zero or negative, EOWC filtering disabled");
                 return watermark_ms;
             }
             (watermark_ms / size) * size
@@ -916,6 +1608,37 @@ fn detect_asof_query(sql: &str) -> (Option<AsofJoinTranslatorConfig>, Option<Str
     let projection_sql = build_projection_sql(select, asof_analysis, &config);
 
     (Some(config), Some(projection_sql))
+}
+
+fn detect_temporal_query(sql: &str) -> Option<TemporalJoinTranslatorConfig> {
+    let Ok(statements) = laminar_sql::parse_streaming_sql(sql) else {
+        return None;
+    };
+
+    let Some(laminar_sql::parser::StreamingStatement::Standard(stmt)) = statements.first() else {
+        return None;
+    };
+
+    let Statement::Query(query) = stmt.as_ref() else {
+        return None;
+    };
+
+    let SetExpr::Select(select) = query.body.as_ref() else {
+        return None;
+    };
+
+    let Ok(Some(multi)) = analyze_joins(select) else {
+        return None;
+    };
+
+    let temporal_analysis = multi.joins.iter().find(|j| j.is_temporal_join)?;
+
+    let JoinOperatorConfig::Temporal(config) = JoinOperatorConfig::from_analysis(temporal_analysis)
+    else {
+        return None;
+    };
+
+    Some(config)
 }
 
 /// Build a `SELECT ... FROM __asof_tmp` projection query from the original
@@ -2561,5 +3284,64 @@ mod tests {
         assert_eq!(schema.field(1).name(), "symbol");
         assert_eq!(schema.field(2).name(), "lastPrice");
         assert_eq!(schema.field(3).name(), "orderQty");
+    }
+
+    /// Verify that memory pressure does NOT cause force-emit of
+    /// open-window rows when the watermark hasn't advanced.
+    #[tokio::test]
+    async fn test_eowc_force_emit_does_not_lose_open_window_data() {
+        let ctx = create_session_context();
+        register_streaming_functions(&ctx);
+        let mut executor = StreamExecutor::new(ctx);
+
+        executor.add_query(
+            "total".to_string(),
+            "SELECT symbol, SUM(price) as total FROM trades GROUP BY symbol".to_string(),
+            Some(EmitClause::OnWindowClose),
+            Some(tumbling_window_config(1000)),
+            None,
+        );
+
+        // Cycle 1: push data in window [0, 1000) with watermark at 500
+        let mut batches1 = HashMap::new();
+        batches1.insert(
+            "trades".to_string(),
+            vec![eowc_batch(vec!["AAPL"], vec![100.0], vec![500])],
+        );
+        let r1 = executor.execute_cycle(&batches1, 500).await.unwrap();
+        assert!(!r1.contains_key("total"), "window not closed at wm=500");
+
+        // Cycle 2: push more data, watermark STAYS at 500 (hasn't
+        // advanced). Even if memory were over the threshold, should
+        // NOT emit open-window rows.
+        let mut batches2 = HashMap::new();
+        batches2.insert(
+            "trades".to_string(),
+            vec![eowc_batch(vec!["AAPL"], vec![200.0], vec![600])],
+        );
+        let r2 = executor.execute_cycle(&batches2, 500).await.unwrap();
+        assert!(
+            !r2.contains_key("total"),
+            "watermark unchanged at 500 — should NOT emit"
+        );
+
+        // Cycle 3: watermark advances to 1000 → window closes
+        let empty: HashMap<String, Vec<RecordBatch>> = HashMap::new();
+        let r3 = executor.execute_cycle(&empty, 1000).await.unwrap();
+        assert!(r3.contains_key("total"), "window closed at wm=1000");
+
+        // CRITICAL: Both rows (100 + 200) must be present — no data loss
+        let batches = &r3["total"];
+        let total_col = batches[0]
+            .column_by_name("total")
+            .unwrap()
+            .as_any()
+            .downcast_ref::<Float64Array>()
+            .unwrap();
+        assert!(
+            (total_col.value(0) - 300.0).abs() < f64::EPSILON,
+            "expected 300 (100+200), got {} — data loss from force-emit!",
+            total_col.value(0)
+        );
     }
 }

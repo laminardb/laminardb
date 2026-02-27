@@ -1,6 +1,6 @@
 //! Async data source trait for lookup table refresh and query.
 //!
-//! [`LookupSource`] is the Phase 6 evolution of the connector-level
+//! [`LookupSource`] is the evolution of the connector-level
 //! `TableLoader` trait. It uses RPITIT (Rust 1.75+) for zero-overhead
 //! async — no `async_trait` boxing needed.
 //!

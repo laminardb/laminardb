@@ -26,6 +26,7 @@
 
 #[allow(dead_code)]
 mod adaptive;
+mod aggregate_state;
 mod asof_batch;
 mod batch_filter;
 mod builder;
@@ -34,7 +35,9 @@ mod catalog;
 pub mod checkpoint_coordinator;
 mod config;
 mod connector_manager;
+mod core_window_state;
 mod db;
+mod eowc_state;
 mod error;
 mod handle;
 mod metrics;
@@ -49,6 +52,7 @@ mod table_backend;
 mod table_cache_mode;
 mod table_provider;
 mod table_store;
+mod temporal_batch;
 
 /// FFI-friendly API for language bindings.
 ///

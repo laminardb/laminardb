@@ -96,6 +96,8 @@ pub mod lookup_join;
 pub mod proctime_udf;
 mod source;
 mod table_provider;
+/// Dynamic watermark filter for scan-level late-data pruning
+pub mod watermark_filter;
 /// Watermark UDF for current watermark access
 pub mod watermark_udf;
 /// Window function UDFs (TUMBLE, HOP, SESSION, CUMULATE)
@@ -136,14 +138,18 @@ pub use json_udf::{
 pub use proctime_udf::ProcTimeUdf;
 pub use source::{SortColumn, StreamSource, StreamSourceRef};
 pub use table_provider::StreamingTableProvider;
+pub use watermark_filter::WatermarkDynamicFilter;
 pub use watermark_udf::WatermarkUdf;
 pub use window_udf::{CumulateWindowStart, HopWindowStart, SessionWindowStart, TumbleWindowStart};
 
 use std::sync::atomic::AtomicI64;
 use std::sync::Arc;
 
+use datafusion::execution::SessionStateBuilder;
 use datafusion::prelude::*;
 use datafusion_expr::ScalarUDF;
+
+use crate::planner::streaming_optimizer::{StreamingPhysicalValidator, StreamingValidatorMode};
 
 /// Returns a base `SessionConfig` with identifier normalization disabled.
 ///
@@ -175,6 +181,7 @@ pub fn create_session_context() -> SessionContext {
 /// - Single partition (streaming sources are typically not partitioned)
 /// - Identifier normalization disabled (mixed-case columns work unquoted)
 /// - All streaming UDFs registered (TUMBLE, HOP, SESSION, WATERMARK)
+/// - `StreamingPhysicalValidator` in `Reject` mode (blocks unsafe plans)
 ///
 /// The watermark UDF is initialized with no watermark set (returns NULL).
 /// Use [`register_streaming_functions_with_watermark`] to provide a live
@@ -189,11 +196,45 @@ pub fn create_session_context() -> SessionContext {
 /// ```
 #[must_use]
 pub fn create_streaming_context() -> SessionContext {
+    create_streaming_context_with_validator(StreamingValidatorMode::Reject)
+}
+
+/// Creates a streaming context with a configurable validator mode.
+///
+/// Same as [`create_streaming_context`] but allows choosing how the
+/// [`StreamingPhysicalValidator`] handles plan violations.
+///
+/// Use [`StreamingValidatorMode::Off`] to get the previous behaviour
+/// (no plan-time validation).
+#[must_use]
+pub fn create_streaming_context_with_validator(mode: StreamingValidatorMode) -> SessionContext {
     let config = base_session_config()
         .with_batch_size(8192)
         .with_target_partitions(1); // Single partition for streaming
 
-    let ctx = SessionContext::new_with_config(config);
+    let ctx = if matches!(mode, StreamingValidatorMode::Off) {
+        SessionContext::new_with_config(config)
+    } else {
+        // Build a default state to get the standard optimizer rules, then
+        // prepend our streaming validator so it fires before DataFusion's
+        // built-in SanityCheckPlan (which produces generic error messages).
+        let default_state = SessionStateBuilder::new()
+            .with_config(config.clone())
+            .with_default_features()
+            .build();
+        let mut rules: Vec<
+            Arc<dyn datafusion::physical_optimizer::PhysicalOptimizerRule + Send + Sync>,
+        > = vec![Arc::new(StreamingPhysicalValidator::new(mode))];
+        rules.extend(default_state.physical_optimizers().iter().cloned());
+
+        let state = SessionStateBuilder::new()
+            .with_config(config)
+            .with_default_features()
+            .with_physical_optimizer_rules(rules)
+            .build();
+        SessionContext::new_with_state(state)
+    };
+
     register_streaming_functions(&ctx);
     ctx
 }

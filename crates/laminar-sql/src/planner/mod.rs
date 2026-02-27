@@ -9,6 +9,8 @@ pub mod channel_derivation;
 pub mod lookup_join;
 /// Predicate splitting and pushdown for lookup joins.
 pub mod predicate_split;
+/// Physical optimizer rule for streaming plan validation.
+pub mod streaming_optimizer;
 
 use std::collections::HashMap;
 
