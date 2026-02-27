@@ -313,7 +313,7 @@ impl SourceConnector for MySqlCdcSource {
             let data_ready = Arc::clone(&self.data_ready);
 
             let reader_handle = tokio::spawn(async move {
-                use futures_util::StreamExt as _;
+                use tokio_stream::StreamExt as _;
                 let mut stream = stream;
                 loop {
                     let event = tokio::select! {

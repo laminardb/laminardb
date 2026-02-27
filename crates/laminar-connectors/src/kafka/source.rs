@@ -81,8 +81,6 @@ pub struct KafkaSource {
     rebalance_state: RebalanceState,
     /// Optional Schema Registry client (shared with Avro deserializer).
     schema_registry: Option<Arc<SchemaRegistryClient>>,
-    /// Last time offsets were committed to Kafka.
-    last_commit_time: Instant,
     /// Notification handle signalled when Kafka messages arrive from the reader task.
     data_ready: Arc<Notify>,
     /// Channel receiver for Kafka messages from the background reader task.
@@ -123,7 +121,6 @@ impl KafkaSource {
             channel_len,
             rebalance_state: RebalanceState::new(),
             schema_registry: None,
-            last_commit_time: Instant::now(),
             data_ready: Arc::new(Notify::new()),
             msg_rx: None,
             reader_handle: None,
@@ -171,7 +168,6 @@ impl KafkaSource {
             channel_len,
             rebalance_state: RebalanceState::new(),
             schema_registry: Some(sr),
-            last_commit_time: Instant::now(),
             data_ready: Arc::new(Notify::new()),
             msg_rx: None,
             reader_handle: None,
@@ -217,32 +213,6 @@ impl KafkaSource {
     #[must_use]
     pub fn has_schema_registry(&self) -> bool {
         self.schema_registry.is_some()
-    }
-
-    /// Commits offsets to Kafka if the commit interval has elapsed.
-    fn maybe_commit_offsets(&mut self) -> Result<(), ConnectorError> {
-        if self.last_commit_time.elapsed() < self.config.commit_interval {
-            return Ok(());
-        }
-
-        if let Some(ref consumer) = self.consumer {
-            if self.offsets.partition_count() > 0 {
-                let tpl = self.offsets.to_topic_partition_list();
-                consumer
-                    .commit(&tpl, rdkafka::consumer::CommitMode::Async)
-                    .map_err(|e| {
-                        ConnectorError::CheckpointError(format!("offset commit failed: {e}"))
-                    })?;
-                self.metrics.record_commit();
-                debug!(
-                    partitions = self.offsets.partition_count(),
-                    "committed offsets to Kafka"
-                );
-            }
-        }
-
-        self.last_commit_time = Instant::now();
-        Ok(())
     }
 
     /// Spawns the background reader task on first `poll_batch()` call.
