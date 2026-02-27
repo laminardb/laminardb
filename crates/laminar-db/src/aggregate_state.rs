@@ -2232,7 +2232,7 @@ mod tests {
             ScalarValue::UInt64(Some(9_999_999_999)),
             ScalarValue::UInt64(None),
             ScalarValue::Float32(Some(1.5)),
-            ScalarValue::Float64(Some(3.141_59)),
+            ScalarValue::Float64(Some(2.718_28)),
             ScalarValue::Float64(None),
             ScalarValue::Utf8(Some("hello world".to_string())),
             ScalarValue::Utf8(None),
