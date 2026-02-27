@@ -38,13 +38,6 @@ async fn test_happy_path_checkpoint_and_recovery() {
     > = Arc::new(tokio::sync::Mutex::new(Box::new(source)));
     coord.register_source("trades", Arc::clone(&source_handle));
 
-    // Register a mock sink
-    let sink = laminar_connectors::testing::MockSinkConnector::new();
-    let sink_handle: Arc<
-        tokio::sync::Mutex<Box<dyn laminar_connectors::connector::SinkConnector>>,
-    > = Arc::new(tokio::sync::Mutex::new(Box::new(sink)));
-    coord.register_sink("output", Arc::clone(&sink_handle), false);
-
     // Perform checkpoint with operator state
     let mut ops = HashMap::new();
     ops.insert("window-agg".into(), b"accumulated-state".to_vec());
