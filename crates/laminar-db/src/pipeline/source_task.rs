@@ -82,17 +82,21 @@ pub fn spawn_source_task(
                     let _ = cp_tx.send(connector.checkpoint());
 
                     // Send batch to coordinator. If the channel is full,
-                    // backpressure naturally stalls this task.
-                    if tx
-                        .send(SourceEvent::Batch {
-                            idx,
-                            batch: batch.records,
-                        })
-                        .await
-                        .is_err()
-                    {
-                        tracing::debug!(source = %name, "Coordinator dropped, stopping");
-                        break;
+                    // backpressure naturally stalls this task. Also check
+                    // for shutdown while blocked so we don't hang forever.
+                    let event = SourceEvent::Batch {
+                        idx,
+                        batch: batch.records,
+                    };
+                    tokio::select! {
+                        biased;
+                        () = shutdown_rx.notified() => break,
+                        result = tx.send(event) => {
+                            if result.is_err() {
+                                tracing::debug!(source = %name, "Coordinator dropped, stopping");
+                                break;
+                            }
+                        }
                     }
                 }
                 Ok(None) => {
@@ -104,12 +108,13 @@ pub fn spawn_source_task(
                     metrics_tx.record_error();
                     let msg = format!("{e}");
                     tracing::warn!(source = %name, error = %e, "Source poll error");
-                    if tx
-                        .send(SourceEvent::Error { idx, message: msg })
-                        .await
-                        .is_err()
-                    {
-                        break;
+                    let event = SourceEvent::Error { idx, message: msg };
+                    tokio::select! {
+                        biased;
+                        () = shutdown_rx.notified() => break,
+                        result = tx.send(event) => {
+                            if result.is_err() { break; }
+                        }
                     }
                 }
             }
