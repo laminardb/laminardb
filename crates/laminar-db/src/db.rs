@@ -2543,10 +2543,7 @@ impl LaminarDB {
                             }
                         }
                         // Restore stream executor aggregate state
-                        if let Some(op) = recovered
-                            .manifest
-                            .operator_states
-                            .get("stream_executor")
+                        if let Some(op) = recovered.manifest.operator_states.get("stream_executor")
                         {
                             if let Some(bytes) = op.decode_inline() {
                                 match executor.restore_state(&bytes) {
@@ -3002,8 +2999,7 @@ impl LaminarDB {
                         let mut operator_states = HashMap::new();
                         match executor.checkpoint_state() {
                             Ok(Some(bytes)) => {
-                                operator_states
-                                    .insert("stream_executor".to_string(), bytes);
+                                operator_states.insert("stream_executor".to_string(), bytes);
                             }
                             Ok(None) => {}
                             Err(e) => {
@@ -3090,8 +3086,7 @@ impl LaminarDB {
                     let mut operator_states = HashMap::new();
                     match executor.checkpoint_state() {
                         Ok(Some(bytes)) => {
-                            operator_states
-                                .insert("stream_executor".to_string(), bytes);
+                            operator_states.insert("stream_executor".to_string(), bytes);
                         }
                         Ok(None) => {}
                         Err(e) => {

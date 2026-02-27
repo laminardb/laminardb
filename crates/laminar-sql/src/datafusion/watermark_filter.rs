@@ -116,16 +116,16 @@ impl WatermarkDynamicFilter {
         let col = batch.column(col_idx);
         let mask = match col.data_type() {
             DataType::Int64 => {
-                let ts_array = col.as_any().downcast_ref::<Int64Array>().ok_or_else(|| {
-                    DataFusionError::Internal("expected Int64Array".to_string())
-                })?;
+                let ts_array = col
+                    .as_any()
+                    .downcast_ref::<Int64Array>()
+                    .ok_or_else(|| DataFusionError::Internal("expected Int64Array".to_string()))?;
                 let threshold = Int64Array::new_scalar(wm);
                 gt_eq(ts_array, &threshold)?
             }
             DataType::Timestamp(TimeUnit::Millisecond, _) => {
                 let ts_array = col.as_primitive::<TimestampMillisecondType>();
-                let threshold =
-                    arrow_array::TimestampMillisecondArray::new_scalar(wm);
+                let threshold = arrow_array::TimestampMillisecondArray::new_scalar(wm);
                 gt_eq(ts_array, &threshold)?
             }
             other => {

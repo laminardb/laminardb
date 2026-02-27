@@ -196,9 +196,7 @@ impl DynAccumulator for DataFusionAccumulatorAdapter {
                     );
                 }
                 if !state_arrays.is_empty() {
-                    if let Err(e) =
-                        self.inner.borrow_mut().merge_batch(&state_arrays)
-                    {
+                    if let Err(e) = self.inner.borrow_mut().merge_batch(&state_arrays) {
                         tracing::warn!(
                             func = %self.function_name,
                             error = %e,
@@ -408,9 +406,7 @@ impl DataFusionAggregateFactory {
     /// The factory must be wrapped in an `Arc` for the adapter to support
     /// `clone_box()`.
     #[must_use]
-    pub fn create_accumulator_with_factory(
-        self: &Arc<Self>,
-    ) -> Box<dyn DynAccumulator> {
+    pub fn create_accumulator_with_factory(self: &Arc<Self>) -> Box<dyn DynAccumulator> {
         let inner = self.create_df_accumulator();
         Box::new(DataFusionAccumulatorAdapter::new(
             inner,

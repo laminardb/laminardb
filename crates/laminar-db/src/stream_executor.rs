@@ -28,9 +28,9 @@ use laminar_sql::translator::{
 };
 
 use crate::aggregate_state::IncrementalAggState;
+use crate::core_window_state::CoreWindowState;
 use crate::eowc_state::IncrementalEowcState;
 use crate::error::DbError;
-use crate::core_window_state::CoreWindowState;
 
 /// Convert a SQL-layer `EmitStrategy` to a core-layer `EmitStrategy`.
 ///
@@ -464,13 +464,8 @@ impl StreamExecutor {
                     .temporal_config
                     .clone()
                     .expect("has_temporal guard ensures temporal_config is Some");
-                self.execute_temporal_query(
-                    &query_name,
-                    &cfg,
-                    source_batches,
-                    &results,
-                )
-                .await?
+                self.execute_temporal_query(&query_name, &cfg, source_batches, &results)
+                    .await?
             } else {
                 self.execute_standard_query(idx).await?
             };
@@ -570,10 +565,7 @@ impl StreamExecutor {
     ///
     /// Non-aggregate queries continue using the existing `DataFusion`
     /// `MemTable` + SQL execution path.
-    async fn execute_standard_query(
-        &mut self,
-        idx: usize,
-    ) -> Result<Vec<RecordBatch>, DbError> {
+    async fn execute_standard_query(&mut self, idx: usize) -> Result<Vec<RecordBatch>, DbError> {
         // Fast path: already have incremental agg state for this query
         if self.agg_states.contains_key(&idx) {
             return self.execute_incremental_agg(idx).await;
@@ -612,10 +604,7 @@ impl StreamExecutor {
     }
 
     /// Execute a non-aggregate query via `DataFusion` SQL.
-    async fn execute_plain_query(
-        &self,
-        idx: usize,
-    ) -> Result<Vec<RecordBatch>, DbError> {
+    async fn execute_plain_query(&self, idx: usize) -> Result<Vec<RecordBatch>, DbError> {
         let query_name = &self.queries[idx].name;
         let query_sql = &self.queries[idx].sql;
         let df = self
@@ -633,23 +622,19 @@ impl StreamExecutor {
     /// Runs the pre-aggregation SQL (projection only) through `DataFusion`,
     /// then feeds the result to per-group accumulators. Emits running
     /// aggregate totals.
-    async fn execute_incremental_agg(
-        &mut self,
-        idx: usize,
-    ) -> Result<Vec<RecordBatch>, DbError> {
+    async fn execute_incremental_agg(&mut self, idx: usize) -> Result<Vec<RecordBatch>, DbError> {
         let query_name = self.queries[idx].name.clone();
 
         let agg_state = self.agg_states.get(&idx).ok_or_else(|| {
-            DbError::Pipeline(format!(
-                "internal: missing agg_state for query index {idx}"
-            ))
+            DbError::Pipeline(format!("internal: missing agg_state for query index {idx}"))
         })?;
         let pre_agg_sql = agg_state.pre_agg_sql().to_string();
 
         let pre_agg_batches = match self.ctx.sql(&pre_agg_sql).await {
-            Ok(df) => df.collect().await.map_err(|e| {
-                DbError::query_pipeline(&query_name, &e)
-            })?,
+            Ok(df) => df
+                .collect()
+                .await
+                .map_err(|e| DbError::query_pipeline(&query_name, &e))?,
             Err(e) => {
                 // Pre-agg SQL failed (e.g., no source data this cycle)
                 // — emit current state without updating
@@ -658,22 +643,16 @@ impl StreamExecutor {
                     error = %e,
                     "Pre-agg SQL failed, emitting current state"
                 );
-                let agg_state =
-                    self.agg_states.get_mut(&idx).ok_or_else(|| {
-                        DbError::Pipeline(format!(
-                            "internal: missing agg_state for query index {idx}"
-                        ))
-                    })?;
+                let agg_state = self.agg_states.get_mut(&idx).ok_or_else(|| {
+                    DbError::Pipeline(format!("internal: missing agg_state for query index {idx}"))
+                })?;
                 return agg_state.emit();
             }
         };
 
-        let agg_state =
-            self.agg_states.get_mut(&idx).ok_or_else(|| {
-                DbError::Pipeline(format!(
-                    "internal: missing agg_state for query index {idx}"
-                ))
-            })?;
+        let agg_state = self.agg_states.get_mut(&idx).ok_or_else(|| {
+            DbError::Pipeline(format!("internal: missing agg_state for query index {idx}"))
+        })?;
         for batch in &pre_agg_batches {
             agg_state.process_batch(batch)?;
         }
@@ -716,25 +695,18 @@ impl StreamExecutor {
         );
         let table_name = format!("__having_{query_name}");
 
-        let mem_table =
-            datafusion::datasource::MemTable::try_new(
-                schema,
-                vec![batches.to_vec()],
-            )
-            .map_err(|e| {
-                DbError::query_pipeline(query_name, &e)
-            })?;
+        let mem_table = datafusion::datasource::MemTable::try_new(schema, vec![batches.to_vec()])
+            .map_err(|e| DbError::query_pipeline(query_name, &e))?;
         let _ = self.ctx.deregister_table(&table_name);
         self.ctx
             .register_table(&table_name, Arc::new(mem_table))
-            .map_err(|e| {
-                DbError::query_pipeline(query_name, &e)
-            })?;
+            .map_err(|e| DbError::query_pipeline(query_name, &e))?;
 
         let result = match self.ctx.sql(&filter_sql).await {
-            Ok(df) => df.collect().await.map_err(|e| {
-                DbError::query_pipeline(query_name, &e)
-            }),
+            Ok(df) => df
+                .collect()
+                .await
+                .map_err(|e| DbError::query_pipeline(query_name, &e)),
             Err(e) => Err(DbError::query_pipeline(query_name, &e)),
         };
 
@@ -786,9 +758,10 @@ impl StreamExecutor {
             .to_string();
 
         let pre_agg_batches = match self.ctx.sql(&pre_agg_sql).await {
-            Ok(df) => df.collect().await.map_err(|e| {
-                DbError::query_pipeline(query_name, &e)
-            })?,
+            Ok(df) => df
+                .collect()
+                .await
+                .map_err(|e| DbError::query_pipeline(query_name, &e))?,
             Err(e) => {
                 tracing::trace!(
                     query = %query_name,
@@ -799,20 +772,17 @@ impl StreamExecutor {
             }
         };
 
-        let eowc_state =
-            self.eowc_agg_states.get_mut(&idx).ok_or_else(|| {
-                DbError::Pipeline(format!(
-                    "internal: missing eowc_agg_state for query index {idx}"
-                ))
-            })?;
+        let eowc_state = self.eowc_agg_states.get_mut(&idx).ok_or_else(|| {
+            DbError::Pipeline(format!(
+                "internal: missing eowc_agg_state for query index {idx}"
+            ))
+        })?;
         for batch in &pre_agg_batches {
             eowc_state.update_batch(batch)?;
         }
 
-        let having_sql =
-            eowc_state.having_sql().map(String::from);
-        let mut batches =
-            eowc_state.close_windows(current_watermark)?;
+        let having_sql = eowc_state.having_sql().map(String::from);
+        let mut batches = eowc_state.close_windows(current_watermark)?;
 
         // Apply HAVING filter if present
         if let Some(having_sql) = having_sql {
@@ -839,17 +809,16 @@ impl StreamExecutor {
             .core_window_states
             .get(&idx)
             .ok_or_else(|| {
-                DbError::Pipeline(format!(
-                    "internal: missing cw_state for query index {idx}"
-                ))
+                DbError::Pipeline(format!("internal: missing cw_state for query index {idx}"))
             })?
             .pre_agg_sql()
             .to_string();
 
         let pre_agg_batches = match self.ctx.sql(&pre_agg_sql).await {
-            Ok(df) => df.collect().await.map_err(|e| {
-                DbError::query_pipeline(query_name, &e)
-            })?,
+            Ok(df) => df
+                .collect()
+                .await
+                .map_err(|e| DbError::query_pipeline(query_name, &e))?,
             Err(e) => {
                 tracing::trace!(
                     query = %query_name,
@@ -860,12 +829,9 @@ impl StreamExecutor {
             }
         };
 
-        let cw_state =
-            self.core_window_states.get_mut(&idx).ok_or_else(|| {
-                DbError::Pipeline(format!(
-                    "internal: missing cw_state for query index {idx}"
-                ))
-            })?;
+        let cw_state = self.core_window_states.get_mut(&idx).ok_or_else(|| {
+            DbError::Pipeline(format!("internal: missing cw_state for query index {idx}"))
+        })?;
         for batch in &pre_agg_batches {
             cw_state.update_batch(batch)?;
         }
@@ -919,13 +885,8 @@ impl StreamExecutor {
                     let query_sql = self.queries[idx].sql.clone();
                     let cfg_clone = cfg.clone();
                     let emit_ref = self.queries[idx].emit_clause.as_ref();
-                    match CoreWindowState::try_from_sql(
-                        &self.ctx,
-                        &query_sql,
-                        &cfg_clone,
-                        emit_ref,
-                    )
-                    .await
+                    match CoreWindowState::try_from_sql(&self.ctx, &query_sql, &cfg_clone, emit_ref)
+                        .await
                     {
                         Ok(Some(state)) => {
                             tracing::info!(
@@ -936,11 +897,7 @@ impl StreamExecutor {
                             self.core_window_states.insert(idx, state);
                             self.try_restore_pending_core_window(idx);
                             return self
-                                .execute_core_window_query(
-                                    idx,
-                                    query_name,
-                                    current_watermark,
-                                )
+                                .execute_core_window_query(idx, query_name, current_watermark)
                                 .await;
                         }
                         Ok(None) => {
@@ -969,12 +926,8 @@ impl StreamExecutor {
                 if !self.non_eowc_agg_queries.contains(&idx) {
                     let query_sql = self.queries[idx].sql.clone();
                     let cfg_clone = cfg.clone();
-                    match IncrementalEowcState::try_from_sql(
-                        &self.ctx,
-                        &query_sql,
-                        &cfg_clone,
-                    )
-                    .await
+                    match IncrementalEowcState::try_from_sql(&self.ctx, &query_sql, &cfg_clone)
+                        .await
                     {
                         Ok(Some(state)) => {
                             tracing::info!(
@@ -985,11 +938,7 @@ impl StreamExecutor {
                             self.eowc_agg_states.insert(idx, state);
                             self.try_restore_pending_eowc(idx);
                             return self
-                                .execute_incremental_eowc(
-                                    idx,
-                                    query_name,
-                                    current_watermark,
-                                )
+                                .execute_incremental_eowc(idx, query_name, current_watermark)
                                 .await;
                         }
                         Ok(None) => {
@@ -1017,11 +966,7 @@ impl StreamExecutor {
         // Fall through to raw-batch EOWC path.
         // Collect table refs as owned strings to avoid borrowing self.queries
         // while mutating self.eowc_states.
-        let table_refs: Vec<String> = self.queries[idx]
-            .table_refs
-            .iter()
-            .cloned()
-            .collect();
+        let table_refs: Vec<String> = self.queries[idx].table_refs.iter().cloned().collect();
 
         // Accumulate current source batches into EOWC state.
         if let Some(eowc) = self.eowc_states.get_mut(&idx) {
@@ -1085,10 +1030,7 @@ impl StreamExecutor {
             if over_limit {
                 tracing::warn!(
                     query = query_name,
-                    accumulated_rows = self
-                        .eowc_states
-                        .get(&idx)
-                        .map_or(0, |s| s.accumulated_rows),
+                    accumulated_rows = self.eowc_states.get(&idx).map_or(0, |s| s.accumulated_rows),
                     limit = MAX_EOWC_ACCUMULATED_ROWS,
                     "EOWC memory pressure: watermark has not advanced, \
                      coalescing batches to reduce fragmentation"
@@ -1098,14 +1040,9 @@ impl StreamExecutor {
                     for batches in eowc.accumulated_sources.values_mut() {
                         if batches.len() > 1 {
                             let schema = batches[0].schema();
-                            match arrow::compute::concat_batches(
-                                &schema,
-                                batches.as_slice(),
-                            ) {
+                            match arrow::compute::concat_batches(&schema, batches.as_slice()) {
                                 Ok(coalesced) => *batches = vec![coalesced],
-                                Err(e) => tracing::warn!(
-                                    "EOWC pressure coalescing failed: {e}"
-                                ),
+                                Err(e) => tracing::warn!("EOWC pressure coalescing failed: {e}"),
                             }
                         }
                     }
@@ -1164,8 +1101,7 @@ impl StreamExecutor {
                     let schema = filtered_batches[0].schema();
                     match arrow::compute::concat_batches(&schema, &filtered_batches) {
                         Ok(coalesced) => {
-                            filtered_sources
-                                .insert(table_name.clone(), vec![coalesced]);
+                            filtered_sources.insert(table_name.clone(), vec![coalesced]);
                         }
                         Err(e) => {
                             tracing::warn!(
@@ -1174,8 +1110,7 @@ impl StreamExecutor {
                                 "EOWC filtered batch coalescing failed, \
                                  keeping fragmented: {e}"
                             );
-                            filtered_sources
-                                .insert(table_name.clone(), filtered_batches);
+                            filtered_sources.insert(table_name.clone(), filtered_batches);
                         }
                     }
                 }
@@ -1227,13 +1162,8 @@ impl StreamExecutor {
             )
             .await?
         } else if let Some(tcfg) = temporal_config {
-            self.execute_temporal_query(
-                query_name,
-                tcfg,
-                &filtered_sources,
-                intermediate_results,
-            )
-            .await?
+            self.execute_temporal_query(query_name, tcfg, &filtered_sources, intermediate_results)
+                .await?
         } else {
             let df = self
                 .ctx
@@ -1329,18 +1259,10 @@ impl StreamExecutor {
         intermediate_results: &HashMap<String, Vec<RecordBatch>>,
     ) -> Result<Vec<RecordBatch>, DbError> {
         let stream_batches = self
-            .resolve_table_batches(
-                &config.stream_table,
-                source_batches,
-                intermediate_results,
-            )
+            .resolve_table_batches(&config.stream_table, source_batches, intermediate_results)
             .await?;
         let table_batches = self
-            .resolve_table_batches(
-                &config.table_name,
-                source_batches,
-                intermediate_results,
-            )
+            .resolve_table_batches(&config.table_name, source_batches, intermediate_results)
             .await?;
 
         let joined = crate::temporal_batch::execute_temporal_join_batch(
@@ -1348,9 +1270,7 @@ impl StreamExecutor {
             &table_batches,
             config,
         )
-        .map_err(|e| {
-            DbError::Pipeline(format!("temporal join [{query_name}]: {e}"))
-        })?;
+        .map_err(|e| DbError::Pipeline(format!("temporal join [{query_name}]: {e}")))?;
 
         if joined.num_rows() == 0 {
             return Ok(Vec::new());
@@ -1396,34 +1316,22 @@ impl StreamExecutor {
         let mut agg_checkpoints = HashMap::new();
         for (&idx, state) in &mut self.agg_states {
             let name = self.queries[idx].name.clone();
-            agg_checkpoints.insert(
-                name,
-                state.checkpoint_groups()?,
-            );
+            agg_checkpoints.insert(name, state.checkpoint_groups()?);
         }
 
         let mut eowc_checkpoints = HashMap::new();
         for (&idx, state) in &mut self.eowc_agg_states {
             let name = self.queries[idx].name.clone();
-            eowc_checkpoints.insert(
-                name,
-                state.checkpoint_windows()?,
-            );
+            eowc_checkpoints.insert(name, state.checkpoint_windows()?);
         }
 
         let mut cw_checkpoints = HashMap::new();
         for (&idx, state) in &mut self.core_window_states {
             let name = self.queries[idx].name.clone();
-            cw_checkpoints.insert(
-                name,
-                state.checkpoint_windows()?,
-            );
+            cw_checkpoints.insert(name, state.checkpoint_windows()?);
         }
 
-        if agg_checkpoints.is_empty()
-            && eowc_checkpoints.is_empty()
-            && cw_checkpoints.is_empty()
-        {
+        if agg_checkpoints.is_empty() && eowc_checkpoints.is_empty() && cw_checkpoints.is_empty() {
             return Ok(None);
         }
 
@@ -1435,9 +1343,7 @@ impl StreamExecutor {
         };
 
         let bytes = serde_json::to_vec(&checkpoint).map_err(|e| {
-            DbError::Pipeline(format!(
-                "stream executor checkpoint serialization: {e}"
-            ))
+            DbError::Pipeline(format!("stream executor checkpoint serialization: {e}"))
         })?;
 
         Ok(Some(bytes))
@@ -1455,12 +1361,9 @@ impl StreamExecutor {
     pub fn restore_state(&mut self, bytes: &[u8]) -> Result<usize, DbError> {
         use crate::aggregate_state::StreamExecutorCheckpoint;
 
-        let checkpoint: StreamExecutorCheckpoint =
-            serde_json::from_slice(bytes).map_err(|e| {
-                DbError::Pipeline(format!(
-                    "stream executor checkpoint deserialization: {e}"
-                ))
-            })?;
+        let checkpoint: StreamExecutorCheckpoint = serde_json::from_slice(bytes).map_err(|e| {
+            DbError::Pipeline(format!("stream executor checkpoint deserialization: {e}"))
+        })?;
 
         let mut restored = 0usize;
 
@@ -1730,8 +1633,7 @@ fn detect_temporal_query(sql: &str) -> Option<TemporalJoinTranslatorConfig> {
 
     let temporal_analysis = multi.joins.iter().find(|j| j.is_temporal_join)?;
 
-    let JoinOperatorConfig::Temporal(config) =
-        JoinOperatorConfig::from_analysis(temporal_analysis)
+    let JoinOperatorConfig::Temporal(config) = JoinOperatorConfig::from_analysis(temporal_analysis)
     else {
         return None;
     };
@@ -3394,8 +3296,7 @@ mod tests {
 
         executor.add_query(
             "total".to_string(),
-            "SELECT symbol, SUM(price) as total FROM trades GROUP BY symbol"
-                .to_string(),
+            "SELECT symbol, SUM(price) as total FROM trades GROUP BY symbol".to_string(),
             Some(EmitClause::OnWindowClose),
             Some(tumbling_window_config(1000)),
             None,
@@ -3408,10 +3309,7 @@ mod tests {
             vec![eowc_batch(vec!["AAPL"], vec![100.0], vec![500])],
         );
         let r1 = executor.execute_cycle(&batches1, 500).await.unwrap();
-        assert!(
-            !r1.contains_key("total"),
-            "window not closed at wm=500"
-        );
+        assert!(!r1.contains_key("total"), "window not closed at wm=500");
 
         // Cycle 2: push more data, watermark STAYS at 500 (hasn't
         // advanced). Even if memory were over the threshold, should
@@ -3430,10 +3328,7 @@ mod tests {
         // Cycle 3: watermark advances to 1000 → window closes
         let empty: HashMap<String, Vec<RecordBatch>> = HashMap::new();
         let r3 = executor.execute_cycle(&empty, 1000).await.unwrap();
-        assert!(
-            r3.contains_key("total"),
-            "window closed at wm=1000"
-        );
+        assert!(r3.contains_key("total"), "window closed at wm=1000");
 
         // CRITICAL: Both rows (100 + 200) must be present — no data loss
         let batches = &r3["total"];

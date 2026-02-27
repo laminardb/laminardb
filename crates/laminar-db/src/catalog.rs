@@ -45,9 +45,7 @@ struct SnapshotRing {
 impl SnapshotRing {
     fn new(capacity: usize) -> Self {
         let cap = capacity.max(1);
-        let slots: Vec<_> = (0..cap)
-            .map(|_| std::sync::RwLock::new(None))
-            .collect();
+        let slots: Vec<_> = (0..cap).map(|_| std::sync::RwLock::new(None)).collect();
         Self {
             slots: slots.into_boxed_slice(),
             head: AtomicUsize::new(0),
@@ -59,14 +57,14 @@ impl SnapshotRing {
     fn push(&self, batch: RecordBatch) {
         let current_len = self.len.load(Ordering::Acquire);
         if current_len < self.capacity {
-            let idx = (self.head.load(Ordering::Acquire) + current_len)
-                % self.capacity;
+            let idx = (self.head.load(Ordering::Acquire) + current_len) % self.capacity;
             *self.slots[idx].write().unwrap() = Some(batch);
             self.len.fetch_add(1, Ordering::Release);
         } else {
             let head = self.head.load(Ordering::Acquire);
             *self.slots[head].write().unwrap() = Some(batch);
-            self.head.store((head + 1) % self.capacity, Ordering::Release);
+            self.head
+                .store((head + 1) % self.capacity, Ordering::Release);
         }
     }
 

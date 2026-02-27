@@ -29,30 +29,30 @@ mod adaptive;
 mod aggregate_state;
 mod asof_batch;
 mod batch_filter;
-mod eowc_state;
 mod builder;
 mod catalog;
 /// Unified checkpoint coordination.
 pub mod checkpoint_coordinator;
 mod config;
 mod connector_manager;
+mod core_window_state;
 mod db;
+mod eowc_state;
 mod error;
 mod handle;
 mod metrics;
 mod pipeline_checkpoint;
 /// Deployment profiles.
 pub mod profile;
-mod core_window_state;
 /// Unified recovery manager.
 pub mod recovery_manager;
 mod sql_utils;
 mod stream_executor;
-mod temporal_batch;
 mod table_backend;
 mod table_cache_mode;
 mod table_provider;
 mod table_store;
+mod temporal_batch;
 
 /// FFI-friendly API for language bindings.
 ///

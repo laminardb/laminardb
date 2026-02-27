@@ -10,8 +10,7 @@ use std::hash::{Hash, Hasher};
 use std::sync::Arc;
 
 use arrow::array::{
-    Array, ArrayRef, Float64Array, Int64Array, RecordBatch, StringArray,
-    TimestampMillisecondArray,
+    Array, ArrayRef, Float64Array, Int64Array, RecordBatch, StringArray, TimestampMillisecondArray,
 };
 use arrow::compute::concat_batches;
 use arrow::datatypes::{DataType, Field, Schema, SchemaRef, TimeUnit};
@@ -60,18 +59,14 @@ fn extract_key_column<'a>(
             let string_array = array
                 .as_any()
                 .downcast_ref::<StringArray>()
-                .ok_or_else(|| {
-                    DbError::Pipeline(format!("Column '{col_name}' is not Utf8"))
-                })?;
+                .ok_or_else(|| DbError::Pipeline(format!("Column '{col_name}' is not Utf8")))?;
             Ok(KeyColumn::Utf8(string_array))
         }
         DataType::Int64 => {
             let int_array = array
                 .as_any()
                 .downcast_ref::<Int64Array>()
-                .ok_or_else(|| {
-                    DbError::Pipeline(format!("Column '{col_name}' is not Int64"))
-                })?;
+                .ok_or_else(|| DbError::Pipeline(format!("Column '{col_name}' is not Int64")))?;
             Ok(KeyColumn::Int64(int_array))
         }
         other => Err(DbError::Pipeline(format!(
@@ -80,10 +75,7 @@ fn extract_key_column<'a>(
     }
 }
 
-fn extract_column_as_timestamps(
-    batch: &RecordBatch,
-    col_name: &str,
-) -> Result<Vec<i64>, DbError> {
+fn extract_column_as_timestamps(batch: &RecordBatch, col_name: &str) -> Result<Vec<i64>, DbError> {
     let col_idx = batch
         .schema()
         .index_of(col_name)
@@ -95,9 +87,7 @@ fn extract_column_as_timestamps(
             let int_array = array
                 .as_any()
                 .downcast_ref::<Int64Array>()
-                .ok_or_else(|| {
-                    DbError::Pipeline(format!("Column '{col_name}' is not Int64"))
-                })?;
+                .ok_or_else(|| DbError::Pipeline(format!("Column '{col_name}' is not Int64")))?;
             Ok(int_array.values().to_vec())
         }
         DataType::Timestamp(TimeUnit::Millisecond, _) => {
@@ -105,9 +95,7 @@ fn extract_column_as_timestamps(
                 .as_any()
                 .downcast_ref::<TimestampMillisecondArray>()
                 .ok_or_else(|| {
-                    DbError::Pipeline(format!(
-                        "Column '{col_name}' is not TimestampMillisecond"
-                    ))
+                    DbError::Pipeline(format!("Column '{col_name}' is not TimestampMillisecond"))
                 })?;
             Ok(ts_array.values().to_vec())
         }
@@ -115,9 +103,7 @@ fn extract_column_as_timestamps(
             let f_array = array
                 .as_any()
                 .downcast_ref::<Float64Array>()
-                .ok_or_else(|| {
-                    DbError::Pipeline(format!("Column '{col_name}' is not Float64"))
-                })?;
+                .ok_or_else(|| DbError::Pipeline(format!("Column '{col_name}' is not Float64")))?;
             #[allow(clippy::cast_possible_truncation)]
             Ok(f_array.values().iter().map(|v| *v as i64).collect())
         }
@@ -174,11 +160,8 @@ pub(crate) fn execute_temporal_join_batch(
             .map_err(|e| DbError::query_pipeline_arrow("temporal join (table)", &e))?
     };
 
-    let output_schema = build_temporal_output_schema(
-        &stream_schema,
-        &table_schema,
-        &config.stream_key_column,
-    );
+    let output_schema =
+        build_temporal_output_schema(&stream_schema, &table_schema, &config.stream_key_column);
 
     // Build table index: key_hash -> BTreeMap<version_ts, row_index>
     // BTreeMap ensures we can efficiently find the most recent version <= lookup_ts
@@ -186,10 +169,8 @@ pub(crate) fn execute_temporal_join_batch(
         HashMap::with_capacity(table.num_rows());
     let table_keys_col;
     if table.num_rows() > 0 {
-        table_keys_col =
-            Some(extract_key_column(&table, &config.table_key_column)?);
-        let table_versions =
-            extract_column_as_timestamps(&table, &config.table_version_column)?;
+        table_keys_col = Some(extract_key_column(&table, &config.table_key_column)?);
+        let table_versions = extract_column_as_timestamps(&table, &config.table_version_column)?;
         let tk = table_keys_col.as_ref().unwrap();
 
         for (i, &ver_ts) in table_versions.iter().enumerate() {
@@ -201,14 +182,11 @@ pub(crate) fn execute_temporal_join_batch(
     }
 
     // Extract stream key column and lookup timestamps
-    let stream_keys_col =
-        extract_key_column(&stream, &config.stream_key_column)?;
-    let stream_timestamps =
-        extract_column_as_timestamps(&stream, &config.stream_time_column)?;
+    let stream_keys_col = extract_key_column(&stream, &config.stream_key_column)?;
+    let stream_timestamps = extract_column_as_timestamps(&stream, &config.stream_time_column)?;
 
     let mut stream_indices: Vec<usize> = Vec::with_capacity(stream.num_rows());
-    let mut table_indices: Vec<Option<usize>> =
-        Vec::with_capacity(stream.num_rows());
+    let mut table_indices: Vec<Option<usize>> = Vec::with_capacity(stream.num_rows());
 
     for (stream_idx, &lookup_ts) in stream_timestamps.iter().enumerate() {
         let stream_hash = stream_keys_col.hash_at(stream_idx);
@@ -295,8 +273,7 @@ fn build_temporal_output_batch(
     stream_key_column: &str,
 ) -> Result<RecordBatch, DbError> {
     let num_rows = stream_indices.len();
-    let mut columns: Vec<ArrayRef> =
-        Vec::with_capacity(stream.num_columns() + table.num_columns());
+    let mut columns: Vec<ArrayRef> = Vec::with_capacity(stream.num_columns() + table.num_columns());
 
     // Stream-side columns
     #[allow(clippy::cast_possible_truncation)]
@@ -306,9 +283,7 @@ fn build_temporal_output_batch(
     for col_idx in 0..stream.num_columns() {
         let array = stream.column(col_idx);
         let taken = arrow::compute::take(array, &stream_idx_array, None)
-            .map_err(|e| {
-                DbError::query_pipeline_arrow("temporal join (stream take)", &e)
-            })?;
+            .map_err(|e| DbError::query_pipeline_arrow("temporal join (stream take)", &e))?;
         columns.push(taken);
     }
 
@@ -404,12 +379,8 @@ mod tests {
     #[test]
     fn test_inner_temporal_join() {
         let config = temporal_config("inner");
-        let result = execute_temporal_join_batch(
-            &[orders_batch()],
-            &[products_batch()],
-            &config,
-        )
-        .unwrap();
+        let result =
+            execute_temporal_join_batch(&[orders_batch()], &[products_batch()], &config).unwrap();
 
         // C1@100 -> version@50 (silver), C1@200 -> version@180 (gold),
         // C2@150 -> version@100 (bronze), C1@300 -> version@180 (gold)
@@ -446,12 +417,7 @@ mod tests {
         )
         .unwrap();
 
-        let result = execute_temporal_join_batch(
-            &[stream],
-            &[products_batch()],
-            &config,
-        )
-        .unwrap();
+        let result = execute_temporal_join_batch(&[stream], &[products_batch()], &config).unwrap();
 
         assert_eq!(result.num_rows(), 1);
         assert!(result.column(4).is_null(0)); // tier is null (no C3)
@@ -475,12 +441,7 @@ mod tests {
         )
         .unwrap();
 
-        let result = execute_temporal_join_batch(
-            &[stream],
-            &[products_batch()],
-            &config,
-        )
-        .unwrap();
+        let result = execute_temporal_join_batch(&[stream], &[products_batch()], &config).unwrap();
 
         // C3 skipped (inner), C1@100 matches
         assert_eq!(result.num_rows(), 1);
@@ -505,12 +466,7 @@ mod tests {
         )
         .unwrap();
 
-        let result = execute_temporal_join_batch(
-            &[stream],
-            &[products_batch()],
-            &config,
-        )
-        .unwrap();
+        let result = execute_temporal_join_batch(&[stream], &[products_batch()], &config).unwrap();
 
         assert_eq!(result.num_rows(), 1);
         assert!(result.column(4).is_null(0)); // no version <= 10
@@ -519,24 +475,14 @@ mod tests {
     #[test]
     fn test_empty_stream_input() {
         let config = temporal_config("inner");
-        let result = execute_temporal_join_batch(
-            &[],
-            &[products_batch()],
-            &config,
-        )
-        .unwrap();
+        let result = execute_temporal_join_batch(&[], &[products_batch()], &config).unwrap();
         assert_eq!(result.num_rows(), 0);
     }
 
     #[test]
     fn test_empty_table_input() {
         let config = temporal_config("left");
-        let result = execute_temporal_join_batch(
-            &[orders_batch()],
-            &[],
-            &config,
-        )
-        .unwrap();
+        let result = execute_temporal_join_batch(&[orders_batch()], &[], &config).unwrap();
 
         // Left join: all stream rows emitted with null table columns
         assert_eq!(result.num_rows(), 4);

@@ -100,11 +100,7 @@ fn find_streaming_violations(plan: &Arc<dyn ExecutionPlan>) -> Vec<StreamingViol
     violations
 }
 
-fn walk_plan(
-    plan: &Arc<dyn ExecutionPlan>,
-    violations: &mut Vec<StreamingViolation>,
-    path: &str,
-) {
+fn walk_plan(plan: &Arc<dyn ExecutionPlan>, violations: &mut Vec<StreamingViolation>, path: &str) {
     let name = plan.name();
     let current_path = if path.is_empty() {
         name.to_string()
@@ -380,12 +376,9 @@ mod tests {
         use arrow_schema::SortOptions;
         use datafusion::physical_expr::{expressions::Column, PhysicalSortExpr};
 
-        let sort_expr = PhysicalSortExpr::new(
-            Arc::new(Column::new("id", 0)),
-            SortOptions::default(),
-        );
-        let ordering =
-            LexOrdering::new(vec![sort_expr]).expect("non-empty sort expr list");
+        let sort_expr =
+            PhysicalSortExpr::new(Arc::new(Column::new("id", 0)), SortOptions::default());
+        let ordering = LexOrdering::new(vec![sort_expr]).expect("non-empty sort expr list");
         Arc::new(SortExec::new(ordering, child))
     }
 
@@ -515,9 +508,7 @@ mod tests {
         ctx.register_table("events", Arc::new(provider)).unwrap();
 
         // ORDER BY on unbounded source should fail at plan creation
-        let result = ctx
-            .sql("SELECT * FROM events ORDER BY id")
-            .await;
+        let result = ctx.sql("SELECT * FROM events ORDER BY id").await;
 
         // The physical optimizer should reject this plan
         // (DataFusion creates the physical plan during sql() or at collect())

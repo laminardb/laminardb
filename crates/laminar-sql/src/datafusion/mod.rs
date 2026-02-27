@@ -222,8 +222,9 @@ pub fn create_streaming_context_with_validator(mode: StreamingValidatorMode) -> 
             .with_config(config.clone())
             .with_default_features()
             .build();
-        let mut rules: Vec<Arc<dyn datafusion::physical_optimizer::PhysicalOptimizerRule + Send + Sync>> =
-            vec![Arc::new(StreamingPhysicalValidator::new(mode))];
+        let mut rules: Vec<
+            Arc<dyn datafusion::physical_optimizer::PhysicalOptimizerRule + Send + Sync>,
+        > = vec![Arc::new(StreamingPhysicalValidator::new(mode))];
         rules.extend(default_state.physical_optimizers().iter().cloned());
 
         let state = SessionStateBuilder::new()

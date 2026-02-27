@@ -243,10 +243,7 @@ impl JoinOperatorConfig {
                 JoinType::Left => "left",
                 _ => "inner",
             };
-            let version_col = analysis
-                .temporal_version_column
-                .clone()
-                .unwrap_or_default();
+            let version_col = analysis.temporal_version_column.clone().unwrap_or_default();
             return JoinOperatorConfig::Temporal(TemporalJoinTranslatorConfig {
                 stream_table: analysis.left_table.clone(),
                 table_name: analysis.right_table.clone(),
