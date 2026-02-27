@@ -2380,7 +2380,6 @@ impl LaminarDB {
         };
         use crate::pipeline::{PipelineConfig, PipelineCoordinator, SourceRegistration};
         use crate::stream_executor::StreamExecutor;
-        use laminar_connectors::connector::SinkConnector;
         use laminar_connectors::reference::{ReferenceTableSource, RefreshMode};
 
         // Build StreamExecutor
@@ -2440,37 +2439,41 @@ impl LaminarDB {
         }
 
         // Build sinks via registry (generic — no connector-specific code).
-        // Sinks remain behind Arc<Mutex> since they're shared between the
-        // coordinator callback and the checkpoint coordinator.
+        // Each sink runs in its own tokio task with a bounded command channel,
+        // eliminating Arc<Mutex> contention between pipeline writes and
+        // checkpoint operations.
         #[allow(clippy::type_complexity)]
         let mut sinks: Vec<(
             String,
-            Arc<tokio::sync::Mutex<Box<dyn SinkConnector>>>,
+            crate::sink_task::SinkTaskHandle,
             Option<String>,
+            String, // input stream name (FROM clause target)
         )> = Vec::new();
         for (name, reg) in &sink_regs {
             if reg.connector_type.is_none() {
                 continue;
             }
             let config = build_sink_config(reg)?;
-            let sink = self.connector_registry.create_sink(&config).map_err(|e| {
+            let mut sink = self.connector_registry.create_sink(&config).map_err(|e| {
                 DbError::Connector(format!(
                     "Cannot create sink '{}' (type '{}'): {e}",
                     name,
                     config.connector_type()
                 ))
             })?;
-            let sink_arc = Arc::new(tokio::sync::Mutex::new(sink));
-
-            // Open the sink.
-            sink_arc
-                .lock()
-                .await
-                .open(&config)
+            // Open the connector before handing it to the task.
+            sink.open(&config)
                 .await
                 .map_err(|e| DbError::Connector(format!("Failed to open sink '{name}': {e}")))?;
-
-            sinks.push((name.clone(), sink_arc, reg.filter_expr.clone()));
+            let exactly_once = sink.capabilities().exactly_once;
+            let handle =
+                crate::sink_task::SinkTaskHandle::spawn(name.clone(), sink, exactly_once);
+            sinks.push((
+                name.clone(),
+                handle,
+                reg.filter_expr.clone(),
+                reg.input.clone(),
+            ));
         }
 
         // Build table sources from registrations
@@ -2497,9 +2500,9 @@ impl LaminarDB {
         {
             let mut guard = self.coordinator.lock().await;
             if let Some(ref mut coord) = *guard {
-                for (name, sink_arc, _) in &sinks {
-                    let exactly_once = sink_arc.lock().await.capabilities().exactly_once;
-                    coord.register_sink(name.clone(), Arc::clone(sink_arc), exactly_once);
+                for (name, handle, _, _) in &sinks {
+                    let exactly_once = handle.exactly_once();
+                    coord.register_sink(name.clone(), handle.clone(), exactly_once);
                 }
             }
         }
@@ -3476,8 +3479,9 @@ struct ConnectorPipelineCallback {
     #[allow(clippy::type_complexity)]
     sinks: Vec<(
         String,
-        Arc<tokio::sync::Mutex<Box<dyn laminar_connectors::connector::SinkConnector>>>,
+        crate::sink_task::SinkTaskHandle,
         Option<String>,
+        String, // input stream name (FROM clause target)
     )>,
     watermark_states: HashMap<String, SourceWatermarkState>,
     source_entries_for_wm: HashMap<String, Arc<crate::catalog::SourceEntry>>,
@@ -3531,39 +3535,54 @@ impl crate::pipeline::PipelineCallback for ConnectorPipelineCallback {
     }
 
     async fn write_to_sinks(&mut self, results: &HashMap<String, Vec<RecordBatch>>) {
-        for (sink_name, sink_arc, filter_expr) in &self.sinks {
-            for batches in results.values() {
-                for batch in batches {
-                    let filtered = if let Some(filter_sql) = filter_expr {
-                        match apply_filter(batch, filter_sql).await {
-                            Ok(Some(fb)) => fb,
-                            Ok(None) => continue,
-                            Err(e) => {
+        // Route results to sinks concurrently, filtered by FROM clause.
+        let sink_futures: Vec<_> = self
+            .sinks
+            .iter()
+            .filter_map(|(sink_name, handle, filter_expr, sink_input)| {
+                // Route by FROM clause: only send matching results.
+                let batches = results.get(sink_input.as_str())?;
+                if batches.is_empty() {
+                    return None;
+                }
+                let sink_name = sink_name.clone();
+                let handle = handle.clone();
+                let filter_expr = filter_expr.clone();
+                let batches = batches.clone();
+                Some(async move {
+                    for batch in &batches {
+                        let filtered = if let Some(ref filter_sql) = filter_expr {
+                            match apply_filter(batch, filter_sql).await {
+                                Ok(Some(fb)) => fb,
+                                Ok(None) => continue,
+                                Err(e) => {
+                                    tracing::warn!(
+                                        sink = %sink_name,
+                                        filter = %filter_sql,
+                                        error = %e,
+                                        "Sink filter error"
+                                    );
+                                    continue;
+                                }
+                            }
+                        } else {
+                            batch.clone()
+                        };
+
+                        if filtered.num_rows() > 0 {
+                            if let Err(e) = handle.write_batch(filtered).await {
                                 tracing::warn!(
                                     sink = %sink_name,
-                                    filter = %filter_sql,
                                     error = %e,
-                                    "Sink filter error"
+                                    "Sink write error"
                                 );
-                                continue;
                             }
                         }
-                    } else {
-                        batch.clone()
-                    };
-
-                    if filtered.num_rows() > 0 {
-                        if let Err(e) = sink_arc.lock().await.write_batch(&filtered).await {
-                            tracing::warn!(
-                                sink = %sink_name,
-                                error = %e,
-                                "Sink write error"
-                            );
-                        }
                     }
-                }
-            }
-        }
+                })
+            })
+            .collect();
+        futures::future::join_all(sink_futures).await;
     }
 
     fn extract_watermark(&mut self, source_name: &str, batch: &RecordBatch) {

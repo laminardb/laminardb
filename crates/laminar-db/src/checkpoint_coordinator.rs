@@ -22,7 +22,7 @@ use std::time::{Duration, Instant};
 use std::sync::atomic::Ordering;
 
 use laminar_connectors::checkpoint::SourceCheckpoint;
-use laminar_connectors::connector::{SinkConnector, SourceConnector};
+use laminar_connectors::connector::SourceConnector;
 use laminar_storage::changelog_drainer::ChangelogDrainer;
 use laminar_storage::checkpoint_manifest::{
     CheckpointManifest, ConnectorCheckpoint, SinkCommitStatus,
@@ -121,8 +121,8 @@ pub(crate) struct RegisteredSource {
 pub(crate) struct RegisteredSink {
     /// Sink name.
     pub name: String,
-    /// Sink connector handle.
-    pub connector: Arc<tokio::sync::Mutex<Box<dyn SinkConnector>>>,
+    /// Sink task handle (channel-based, no mutex contention).
+    pub handle: crate::sink_task::SinkTaskHandle,
     /// Whether this sink supports exactly-once / two-phase commit.
     pub exactly_once: bool,
 }
@@ -206,15 +206,15 @@ impl CheckpointCoordinator {
     }
 
     /// Registers a sink connector for checkpoint coordination.
-    pub fn register_sink(
+    pub(crate) fn register_sink(
         &mut self,
         name: impl Into<String>,
-        connector: Arc<tokio::sync::Mutex<Box<dyn SinkConnector>>>,
+        handle: crate::sink_task::SinkTaskHandle,
         exactly_once: bool,
     ) {
         self.sinks.push(RegisteredSink {
             name: name.into(),
-            connector,
+            handle,
             exactly_once,
         });
     }
@@ -584,8 +584,7 @@ impl CheckpointCoordinator {
     async fn pre_commit_sinks_inner(&self, epoch: u64) -> Result<(), DbError> {
         for sink in &self.sinks {
             if sink.exactly_once {
-                let mut connector = sink.connector.lock().await;
-                connector.pre_commit(epoch).await.map_err(|e| {
+                sink.handle.pre_commit(epoch).await.map_err(|e| {
                     DbError::Checkpoint(format!("sink '{}' pre-commit failed: {e}", sink.name))
                 })?;
                 debug!(sink = %sink.name, epoch, "sink pre-committed");
@@ -604,8 +603,7 @@ impl CheckpointCoordinator {
 
         for sink in &self.sinks {
             if sink.exactly_once {
-                let mut connector = sink.connector.lock().await;
-                match connector.commit_epoch(epoch).await {
+                match sink.handle.commit_epoch(epoch).await {
                     Ok(()) => {
                         statuses.insert(sink.name.clone(), SinkCommitStatus::Committed);
                         debug!(sink = %sink.name, epoch, "sink committed");
@@ -650,10 +648,7 @@ impl CheckpointCoordinator {
     async fn rollback_sinks(&self, epoch: u64) -> Result<(), DbError> {
         for sink in &self.sinks {
             if sink.exactly_once {
-                let mut connector = sink.connector.lock().await;
-                if let Err(e) = connector.rollback_epoch(epoch).await {
-                    warn!(sink = %sink.name, epoch, error = %e, "sink rollback failed");
-                }
+                sink.handle.rollback_epoch(epoch).await;
             }
         }
         Ok(())

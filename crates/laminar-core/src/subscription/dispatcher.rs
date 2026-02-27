@@ -71,8 +71,8 @@ impl Default for DispatcherConfig {
     fn default() -> Self {
         Self {
             max_drain_per_cycle: 4096,
-            idle_sleep: Duration::from_micros(10),
-            spin_iterations: 100,
+            idle_sleep: Duration::from_micros(50),
+            spin_iterations: 16,
             batch_by_source: true,
             max_batch_per_source: 256,
         }
@@ -392,8 +392,8 @@ mod tests {
     fn test_dispatcher_config_default() {
         let cfg = DispatcherConfig::default();
         assert_eq!(cfg.max_drain_per_cycle, 4096);
-        assert_eq!(cfg.idle_sleep, Duration::from_micros(10));
-        assert_eq!(cfg.spin_iterations, 100);
+        assert_eq!(cfg.idle_sleep, Duration::from_micros(50));
+        assert_eq!(cfg.spin_iterations, 16);
         assert!(cfg.batch_by_source);
         assert_eq!(cfg.max_batch_per_source, 256);
     }

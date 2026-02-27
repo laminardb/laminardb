@@ -109,16 +109,12 @@ impl<T: Record> Subscription<T> {
 
     /// Receives the next record batch, blocking until available.
     ///
-    /// Uses adaptive backoff: spins briefly for ultra-low latency on hot
-    /// data, then yields to the OS, then parks the thread with 1 ms sleeps
-    /// to avoid burning a core while waiting for infrequent window emissions.
-    ///
     /// # Errors
     ///
     /// Returns `RecvError::Disconnected` if the source has been dropped
     /// and there are no more buffered records.
     pub fn recv(&self) -> Result<RecordBatch, RecvError> {
-        let mut spins: u32 = 0;
+        let mut spins = 0u32;
         loop {
             if let Some(batch) = self.poll() {
                 return Ok(batch);
@@ -128,13 +124,19 @@ impl<T: Record> Subscription<T> {
                 return Err(RecvError::Disconnected);
             }
 
-            spins = adaptive_wait(spins);
+            // Progressive backoff: spin → yield → park
+            if spins < 64 {
+                std::hint::spin_loop();
+            } else if spins < 128 {
+                std::thread::yield_now();
+            } else {
+                std::thread::park_timeout(Duration::from_micros(100));
+            }
+            spins = spins.saturating_add(1);
         }
     }
 
     /// Receives the next record batch with a timeout.
-    ///
-    /// Uses the same adaptive backoff as [`recv`](Self::recv).
     ///
     /// # Errors
     ///
@@ -142,7 +144,7 @@ impl<T: Record> Subscription<T> {
     /// Returns `RecvError::Disconnected` if the source has been dropped.
     pub fn recv_timeout(&self, timeout: Duration) -> Result<RecordBatch, RecvError> {
         let deadline = Instant::now() + timeout;
-        let mut spins: u32 = 0;
+        let mut spins = 0u32;
 
         loop {
             if let Some(batch) = self.poll() {
@@ -157,7 +159,16 @@ impl<T: Record> Subscription<T> {
                 return Err(RecvError::Timeout);
             }
 
-            spins = adaptive_wait(spins);
+            // Progressive backoff: spin → yield → park
+            if spins < 64 {
+                std::hint::spin_loop();
+            } else if spins < 128 {
+                std::thread::yield_now();
+            } else {
+                let remaining = deadline.saturating_duration_since(Instant::now());
+                std::thread::park_timeout(remaining.min(Duration::from_micros(100)));
+            }
+            spins = spins.saturating_add(1);
         }
     }
 
@@ -289,28 +300,6 @@ impl<T: Record> Subscription<T> {
             SourceMessage::Watermark(ts) => SubscriptionMessage::Watermark(ts),
         }
     }
-}
-
-/// Adaptive backoff for blocking subscription receive.
-///
-/// - First 4 iterations: `spin_loop` (PAUSE on x86, ~5 ns each).
-/// - Next 12 iterations: `yield_now` (kernel reschedule, ~1 μs each).
-/// - After that: `sleep(1 ms)` to park the thread and avoid burning a core.
-///
-/// Returns the updated spin counter (saturating).
-#[inline]
-fn adaptive_wait(spins: u32) -> u32 {
-    const SPIN_LIMIT: u32 = 4;
-    const YIELD_LIMIT: u32 = 16;
-
-    if spins < SPIN_LIMIT {
-        std::hint::spin_loop();
-    } else if spins < YIELD_LIMIT {
-        std::thread::yield_now();
-    } else {
-        std::thread::sleep(Duration::from_millis(1));
-    }
-    spins.saturating_add(1)
 }
 
 /// Message types that can be received from a subscription.

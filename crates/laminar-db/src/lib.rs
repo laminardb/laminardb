@@ -48,6 +48,7 @@ mod pipeline_checkpoint;
 pub mod profile;
 /// Unified recovery manager.
 pub mod recovery_manager;
+mod sink_task;
 mod sql_utils;
 mod stream_executor;
 mod table_backend;

@@ -241,17 +241,26 @@ impl CreditGate {
         }
     }
 
-    /// Acquires credits, spinning until available.
+    /// Acquires credits, blocking with progressive backoff until available.
     ///
     /// Only use when `OverflowStrategy::Block` is configured.
+    /// Uses spin → yield → park progression to balance latency vs CPU waste.
     pub fn acquire_blocking(&self, n: usize) {
+        let mut attempt = 0u32;
         loop {
             match self.try_acquire_n(n) {
                 // Success or dropped (shouldn't happen with Block strategy)
                 CreditAcquireResult::Acquired | CreditAcquireResult::Dropped => return,
                 CreditAcquireResult::WouldBlock => {
-                    // Spin with backoff
-                    std::hint::spin_loop();
+                    // Progressive backoff: spin → yield → park
+                    if attempt < 64 {
+                        std::hint::spin_loop();
+                    } else if attempt < 128 {
+                        std::thread::yield_now();
+                    } else {
+                        std::thread::park_timeout(std::time::Duration::from_micros(50));
+                    }
+                    attempt = attempt.saturating_add(1);
                 }
             }
         }
