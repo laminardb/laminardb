@@ -469,6 +469,7 @@ impl PostgresCdcSource {
 }
 
 #[async_trait]
+#[allow(clippy::too_many_lines)]
 impl SourceConnector for PostgresCdcSource {
     async fn open(&mut self, config: &ConnectorConfig) -> Result<(), ConnectorError> {
         self.state = ConnectorState::Initializing;
