@@ -3,13 +3,13 @@
 //! Manages multiple secondary indexes, handling creation, deletion,
 //! batch updates, and lookups across source/column pairs.
 
-use std::collections::HashMap;
 use std::path::PathBuf;
 use std::sync::Arc;
 
 use arrow::array::RecordBatch;
 use arrow::datatypes::DataType;
 use redb::Database;
+use rustc_hash::FxHashMap;
 
 use super::encoding::encode_comparable;
 use super::redb_index::{IndexError, SecondaryIndex};
@@ -21,7 +21,7 @@ use crate::lookup::ScalarValue;
 /// by a redb table within a shared database file.
 pub struct IndexManager {
     db: Arc<Database>,
-    indexes: HashMap<IndexKey, IndexEntry>,
+    indexes: FxHashMap<IndexKey, IndexEntry>,
 }
 
 /// Composite key for index lookup: `(source_id, column_name)`.
@@ -48,7 +48,7 @@ impl IndexManager {
         let db = Database::create(path).map_err(IndexError::Redb)?;
         Ok(Self {
             db: Arc::new(db),
-            indexes: HashMap::new(),
+            indexes: FxHashMap::default(),
         })
     }
 
@@ -57,7 +57,7 @@ impl IndexManager {
     pub fn from_database(db: Arc<Database>) -> Self {
         Self {
             db,
-            indexes: HashMap::new(),
+            indexes: FxHashMap::default(),
         }
     }
 

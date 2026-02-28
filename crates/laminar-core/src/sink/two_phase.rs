@@ -36,9 +36,10 @@
 //! 3. For PREPARING transactions: abort (presumed abort)
 //! 4. Clean up completed transactions
 
-use std::collections::HashMap;
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::time::{Duration, Instant};
+
+use rustc_hash::{FxHashMap, FxHashSet};
 
 use super::error::SinkError;
 use super::traits::TransactionId;
@@ -164,7 +165,7 @@ pub struct TransactionRecord {
     /// Current decision
     pub decision: CoordinatorDecision,
     /// Participant states
-    pub participants: HashMap<String, ParticipantState>,
+    pub participants: FxHashMap<String, ParticipantState>,
     /// Transaction start time
     pub started_at: Instant,
     /// When decision was made
@@ -366,7 +367,7 @@ pub struct TransactionLog {
     /// Log entries (in-memory, should be persisted to storage)
     entries: Vec<TransactionLogEntry>,
     /// Index by transaction ID
-    index: HashMap<u64, usize>,
+    index: FxHashMap<u64, usize>,
 }
 
 impl TransactionLog {
@@ -375,7 +376,7 @@ impl TransactionLog {
     pub fn new() -> Self {
         Self {
             entries: Vec::new(),
-            index: HashMap::new(),
+            index: FxHashMap::default(),
         }
     }
 
@@ -461,8 +462,7 @@ impl TransactionLog {
 
     /// Remove completed transactions from the log
     pub fn prune_completed(&mut self, tx_ids: &[TransactionId]) {
-        let ids_to_remove: std::collections::HashSet<u64> =
-            tx_ids.iter().map(TransactionId::id).collect();
+        let ids_to_remove: FxHashSet<u64> = tx_ids.iter().map(TransactionId::id).collect();
 
         self.entries
             .retain(|e| !ids_to_remove.contains(&e.tx_id.id()));
@@ -531,7 +531,7 @@ impl TransactionLog {
         pos += 4;
 
         let mut entries = Vec::with_capacity(num_entries);
-        let mut index = HashMap::new();
+        let mut index = FxHashMap::default();
 
         for i in 0..num_entries {
             if pos + 4 > bytes.len() {
@@ -611,7 +611,7 @@ pub struct TwoPhaseCoordinator {
     /// Transaction log for durability
     log: TransactionLog,
     /// Active transactions
-    active: HashMap<u64, TransactionRecord>,
+    active: FxHashMap<u64, TransactionRecord>,
     /// Registered participant IDs
     participants: Vec<String>,
     /// Transaction ID counter
@@ -625,7 +625,7 @@ impl TwoPhaseCoordinator {
         Self {
             config,
             log: TransactionLog::new(),
-            active: HashMap::new(),
+            active: FxHashMap::default(),
             participants: Vec::new(),
             next_tx_id: AtomicU64::new(1),
         }

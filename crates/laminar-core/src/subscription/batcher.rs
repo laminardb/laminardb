@@ -13,8 +13,9 @@
 //! When batching is disabled (`enabled: false`), events pass through
 //! immediately as single-event batches.
 
-use std::collections::HashMap;
 use std::time::{Duration, Instant};
+
+use rustc_hash::FxHashMap;
 
 use crate::subscription::event::{ChangeEvent, ChangeEventBatch};
 
@@ -55,9 +56,9 @@ impl Default for BatchConfig {
 /// events from different sources are never mixed.
 pub struct NotificationBatcher {
     /// Buffered events per `source_id`.
-    buffers: HashMap<u32, Vec<ChangeEvent>>,
+    buffers: FxHashMap<u32, Vec<ChangeEvent>>,
     /// Last flush time per `source_id`.
-    last_flush: HashMap<u32, Instant>,
+    last_flush: FxHashMap<u32, Instant>,
     /// Configuration.
     config: BatchConfig,
 }
@@ -67,8 +68,8 @@ impl NotificationBatcher {
     #[must_use]
     pub fn new(config: BatchConfig) -> Self {
         Self {
-            buffers: HashMap::new(),
-            last_flush: HashMap::new(),
+            buffers: FxHashMap::default(),
+            last_flush: FxHashMap::default(),
             config,
         }
     }
