@@ -44,6 +44,9 @@ serde = { workspace = true }
 serde_json = { workspace = true }
 toml = "1.0"
 
+# Vendored OpenSSL for musl cross-compilation (behind vendored-openssl feature)
+openssl = { version = "0.10", features = ["vendored"], optional = true }
+
 # Allocator: jemalloc for reduced fragmentation in Ring 1/2 (Unix only).
 # tikv-jemallocator does not support Windows MSVC.
 [target.'cfg(not(target_env = "msvc"))'.dependencies]
@@ -52,3 +55,6 @@ tikv-jemallocator = { workspace = true, optional = true }
 [features]
 default = ["jemalloc"]
 jemalloc = ["dep:tikv-jemallocator"]
+# Compile OpenSSL from source — required for musl cross-compilation where
+# system libssl-dev is not available for the target triple.
+vendored-openssl = ["dep:openssl"]

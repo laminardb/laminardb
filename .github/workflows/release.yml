@@ -73,22 +73,24 @@ jobs:
             target: aarch64-unknown-linux-gnu
             cross: true
             # Cross builds: skip hwloc (needs target-arch libhwloc) and xdp (needs libelf);
-            # io-uring is pure syscalls so cross-compiles fine
-            features: --features "allocation-tracking,io-uring,jit,kafka,postgres-cdc,postgres-sink,mysql-cdc,delta-lake,delta"
+            # io-uring is pure syscalls so cross-compiles fine;
+            # vendored-openssl compiles OpenSSL from source for the target triple
+            features: --features "allocation-tracking,io-uring,jit,kafka,postgres-cdc,postgres-sink,mysql-cdc,delta-lake,delta,websocket,vendored-openssl"
           - os: ubuntu-latest
             target: x86_64-unknown-linux-musl
             cross: true
-            features: --features "allocation-tracking,io-uring,jit,kafka,postgres-cdc,postgres-sink,mysql-cdc,delta-lake,delta"
+            # vendored-openssl: musl has no system libssl-dev; compile from source
+            features: --features "allocation-tracking,io-uring,jit,kafka,postgres-cdc,postgres-sink,mysql-cdc,delta-lake,delta,websocket,vendored-openssl"
           - os: macos-15  # ARM64
             target: aarch64-apple-darwin
             cross: false
             # macOS: skip Linux-only features (hwloc, io-uring, xdp)
-            features: --features "allocation-tracking,jit,kafka,postgres-cdc,postgres-sink,mysql-cdc,delta-lake,delta"
+            features: --features "allocation-tracking,jit,kafka,postgres-cdc,postgres-sink,mysql-cdc,delta-lake,delta,websocket"
           - os: windows-latest
             target: x86_64-pc-windows-msvc
             cross: false
             # Windows: skip Linux-only features (hwloc, io-uring, xdp)
-            features: --features "allocation-tracking,jit,kafka,postgres-cdc,postgres-sink,mysql-cdc,delta-lake,delta"
+            features: --features "allocation-tracking,jit,kafka,postgres-cdc,postgres-sink,mysql-cdc,delta-lake,delta,websocket"
     steps:
       - uses: actions/checkout@v6
       - uses: dtolnay/rust-toolchain@stable
