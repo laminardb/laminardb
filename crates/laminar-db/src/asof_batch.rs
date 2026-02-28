@@ -218,6 +218,28 @@ fn find_match(
             // Find earliest right row >= left_ts
             btree.range(left_ts..).next().map(|(&ts, &idx)| (ts, idx))
         }
+        AsofSqlDirection::Nearest => {
+            // Check both backward and forward, return whichever is closer
+            let backward = btree
+                .range(..=left_ts)
+                .next_back()
+                .map(|(&ts, &idx)| (ts, idx));
+            let forward = btree.range(left_ts..).next().map(|(&ts, &idx)| (ts, idx));
+            match (backward, forward) {
+                (Some((b_ts, b_idx)), Some((f_ts, f_idx))) => {
+                    let b_diff = (left_ts - b_ts).abs();
+                    let f_diff = (f_ts - left_ts).abs();
+                    if b_diff <= f_diff {
+                        Some((b_ts, b_idx))
+                    } else {
+                        Some((f_ts, f_idx))
+                    }
+                }
+                (Some(b), None) => Some(b),
+                (None, Some(f)) => Some(f),
+                (None, None) => None,
+            }
+        }
     };
 
     candidate.and_then(|(right_ts, right_idx)| {
@@ -612,5 +634,32 @@ mod tests {
             .unwrap();
         // AAPL trade@200: backward match picks 180 (closest <= 200), not 90
         assert_eq!(quote_ts.value(1), 180);
+    }
+
+    #[test]
+    fn test_nearest_join() {
+        // Trades: AAPL@100, AAPL@200, GOOG@150, AAPL@300
+        // Quotes: AAPL@90, AAPL@180, GOOG@140, AAPL@250, GOOG@160
+        // Nearest should pick closest by absolute time difference:
+        //   AAPL@100 → quote@90 (diff=10) vs quote@180 (diff=80) → 90
+        //   AAPL@200 → quote@180 (diff=20) vs quote@250 (diff=50) → 180
+        //   GOOG@150 → quote@140 (diff=10) vs quote@160 (diff=10) → 140 (tie: backward wins)
+        //   AAPL@300 → quote@250 (diff=50) → 250
+        let mut config = backward_config();
+        config.direction = AsofSqlDirection::Nearest;
+
+        let result =
+            execute_asof_join_batch(&[trades_batch()], &[quotes_batch()], &config).unwrap();
+
+        assert_eq!(result.num_rows(), 4);
+        let quote_ts = result
+            .column(3)
+            .as_any()
+            .downcast_ref::<Int64Array>()
+            .unwrap();
+        assert_eq!(quote_ts.value(0), 90); // AAPL@100 → nearest is 90
+        assert_eq!(quote_ts.value(1), 180); // AAPL@200 → nearest is 180
+        assert_eq!(quote_ts.value(2), 140); // GOOG@150 → tie, backward wins
+        assert_eq!(quote_ts.value(3), 250); // AAPL@300 → only 250 nearby
     }
 }

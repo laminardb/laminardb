@@ -198,6 +198,20 @@ impl StreamingParser {
             StreamingDdlKind::ShowCheckpointStatus => Ok(vec![StreamingStatement::Show(
                 ShowCommand::CheckpointStatus,
             )]),
+            StreamingDdlKind::ShowCreateSource => {
+                let mut parser =
+                    sqlparser::parser::Parser::new(&dialect).with_tokens_with_locations(tokens);
+                let stmt =
+                    parse_show_create_source(&mut parser).map_err(parse_error_to_parser_error)?;
+                Ok(vec![stmt])
+            }
+            StreamingDdlKind::ShowCreateSink => {
+                let mut parser =
+                    sqlparser::parser::Parser::new(&dialect).with_tokens_with_locations(tokens);
+                let stmt =
+                    parse_show_create_sink(&mut parser).map_err(parse_error_to_parser_error)?;
+                Ok(vec![stmt])
+            }
             StreamingDdlKind::Checkpoint => Ok(vec![StreamingStatement::Checkpoint]),
             StreamingDdlKind::RestoreCheckpoint => {
                 let mut parser =
@@ -629,9 +643,45 @@ fn parse_describe(
     Ok(StreamingStatement::Describe { name, extended })
 }
 
-/// Parse an EXPLAIN statement wrapping a streaming query.
+/// Parse `SHOW CREATE SOURCE <name>`.
+fn parse_show_create_source(
+    parser: &mut sqlparser::parser::Parser,
+) -> Result<StreamingStatement, ParseError> {
+    // Consume SHOW CREATE SOURCE
+    parser
+        .expect_keyword(sqlparser::keywords::Keyword::SHOW)
+        .map_err(ParseError::SqlParseError)?;
+    parser
+        .expect_keyword(sqlparser::keywords::Keyword::CREATE)
+        .map_err(ParseError::SqlParseError)?;
+    tokenizer::expect_custom_keyword(parser, "SOURCE")?;
+    let name = parser
+        .parse_object_name(false)
+        .map_err(ParseError::SqlParseError)?;
+    Ok(StreamingStatement::Show(ShowCommand::CreateSource { name }))
+}
+
+/// Parse `SHOW CREATE SINK <name>`.
+fn parse_show_create_sink(
+    parser: &mut sqlparser::parser::Parser,
+) -> Result<StreamingStatement, ParseError> {
+    // Consume SHOW CREATE SINK
+    parser
+        .expect_keyword(sqlparser::keywords::Keyword::SHOW)
+        .map_err(ParseError::SqlParseError)?;
+    parser
+        .expect_keyword(sqlparser::keywords::Keyword::CREATE)
+        .map_err(ParseError::SqlParseError)?;
+    tokenizer::expect_custom_keyword(parser, "SINK")?;
+    let name = parser
+        .parse_object_name(false)
+        .map_err(ParseError::SqlParseError)?;
+    Ok(StreamingStatement::Show(ShowCommand::CreateSink { name }))
+}
+
+/// Parse an EXPLAIN [ANALYZE] statement wrapping a streaming query.
 ///
-/// Syntax: `EXPLAIN <streaming_statement>`
+/// Syntax: `EXPLAIN [ANALYZE] <streaming_statement>`
 ///
 /// # Errors
 ///
@@ -644,12 +694,23 @@ fn parse_explain(
         .expect_keyword(sqlparser::keywords::Keyword::EXPLAIN)
         .map_err(ParseError::SqlParseError)?;
 
-    // Find the position after EXPLAIN in the original SQL
+    // Check for optional ANALYZE keyword
+    let analyze = tokenizer::try_parse_custom_keyword(parser, "ANALYZE");
+
+    // Find the position after EXPLAIN [ANALYZE] in the original SQL
     let explain_prefix_upper = original_sql.to_uppercase();
-    let inner_start = explain_prefix_upper
-        .find("EXPLAIN")
-        .map_or(0, |pos| pos + "EXPLAIN".len());
+    let skip_keyword = if analyze { "ANALYZE" } else { "EXPLAIN" };
+    let inner_start = if analyze {
+        explain_prefix_upper
+            .find("ANALYZE")
+            .map_or(0, |pos| pos + "ANALYZE".len())
+    } else {
+        explain_prefix_upper
+            .find("EXPLAIN")
+            .map_or(0, |pos| pos + "EXPLAIN".len())
+    };
     let inner_sql = original_sql[inner_start..].trim();
+    let _ = skip_keyword; // suppress unused warning
 
     // Parse the inner statement recursively
     let inner_stmts = StreamingParser::parse_sql(inner_sql)?;
@@ -658,6 +719,7 @@ fn parse_explain(
     })?;
     Ok(StreamingStatement::Explain {
         statement: Box::new(inner),
+        analyze,
     })
 }
 
@@ -1022,8 +1084,11 @@ mod tests {
     fn test_parse_explain_select() {
         let stmt = parse_one("EXPLAIN SELECT * FROM events");
         match stmt {
-            StreamingStatement::Explain { statement } => {
+            StreamingStatement::Explain {
+                statement, analyze, ..
+            } => {
                 assert!(matches!(*statement, StreamingStatement::Standard(_)));
+                assert!(!analyze);
             }
             _ => panic!("Expected Explain, got {stmt:?}"),
         }
@@ -1033,10 +1098,24 @@ mod tests {
     fn test_parse_explain_create_source() {
         let stmt = parse_one("EXPLAIN CREATE SOURCE events (id BIGINT)");
         match stmt {
-            StreamingStatement::Explain { statement } => {
+            StreamingStatement::Explain { statement, .. } => {
                 assert!(matches!(*statement, StreamingStatement::CreateSource(_)));
             }
             _ => panic!("Expected Explain wrapping CreateSource, got {stmt:?}"),
+        }
+    }
+
+    #[test]
+    fn test_parse_explain_analyze_select() {
+        let stmt = parse_one("EXPLAIN ANALYZE SELECT * FROM events");
+        match stmt {
+            StreamingStatement::Explain {
+                statement, analyze, ..
+            } => {
+                assert!(matches!(*statement, StreamingStatement::Standard(_)));
+                assert!(analyze, "Expected analyze=true for EXPLAIN ANALYZE");
+            }
+            _ => panic!("Expected Explain, got {stmt:?}"),
         }
     }
 
@@ -1351,6 +1430,28 @@ mod tests {
                 assert_eq!(checkpoint_id, 123_456);
             }
             _ => panic!("Expected RestoreCheckpoint, got {stmt:?}"),
+        }
+    }
+
+    #[test]
+    fn test_parse_show_create_source() {
+        let stmt = parse_one("SHOW CREATE SOURCE events");
+        match stmt {
+            StreamingStatement::Show(ShowCommand::CreateSource { name }) => {
+                assert_eq!(name.to_string(), "events");
+            }
+            _ => panic!("Expected Show(CreateSource), got {stmt:?}"),
+        }
+    }
+
+    #[test]
+    fn test_parse_show_create_sink() {
+        let stmt = parse_one("SHOW CREATE SINK output");
+        match stmt {
+            StreamingStatement::Show(ShowCommand::CreateSink { name }) => {
+                assert_eq!(name.to_string(), "output");
+            }
+            _ => panic!("Expected Show(CreateSink), got {stmt:?}"),
         }
     }
 }

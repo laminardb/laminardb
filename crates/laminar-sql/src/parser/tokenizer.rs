@@ -89,6 +89,10 @@ pub enum StreamingDdlKind {
     AlterSource,
     /// SHOW CHECKPOINT STATUS
     ShowCheckpointStatus,
+    /// SHOW CREATE SOURCE <name>
+    ShowCreateSource,
+    /// SHOW CREATE SINK <name>
+    ShowCreateSink,
     /// CHECKPOINT (trigger immediate)
     Checkpoint,
     /// RESTORE FROM CHECKPOINT <id>
@@ -332,6 +336,23 @@ fn detect_show_ddl(significant: &[&TokenWithSpan]) -> StreamingDdlKind {
             }
             StreamingDdlKind::None
         }
+        Token::Word(Word {
+            keyword: Keyword::CREATE,
+            ..
+        }) => {
+            // SHOW CREATE SOURCE <name> / SHOW CREATE SINK <name>
+            if significant.len() >= 4 {
+                if let Token::Word(w) = &significant[2].token {
+                    if is_word_ci(w, "SOURCE") {
+                        return StreamingDdlKind::ShowCreateSource;
+                    }
+                    if is_word_ci(w, "SINK") {
+                        return StreamingDdlKind::ShowCreateSink;
+                    }
+                }
+            }
+            StreamingDdlKind::None
+        }
         _ => StreamingDdlKind::None,
     }
 }
@@ -343,6 +364,7 @@ fn detect_explain_ddl(significant: &[&TokenWithSpan]) -> StreamingDdlKind {
     }
 
     // EXPLAIN followed by SELECT or CREATE (streaming DDL)
+    // Also: EXPLAIN ANALYZE followed by SELECT or CREATE
     match &significant[1].token {
         Token::Word(
             Word {
@@ -354,6 +376,26 @@ fn detect_explain_ddl(significant: &[&TokenWithSpan]) -> StreamingDdlKind {
                 ..
             },
         ) => StreamingDdlKind::ExplainStreaming,
+        Token::Word(w) if is_word_ci(w, "ANALYZE") => {
+            // EXPLAIN ANALYZE <SELECT|CREATE>
+            if significant.len() >= 3 {
+                match &significant[2].token {
+                    Token::Word(
+                        Word {
+                            keyword: Keyword::SELECT,
+                            ..
+                        }
+                        | Word {
+                            keyword: Keyword::CREATE,
+                            ..
+                        },
+                    ) => StreamingDdlKind::ExplainStreaming,
+                    _ => StreamingDdlKind::None,
+                }
+            } else {
+                StreamingDdlKind::None
+            }
+        }
         _ => StreamingDdlKind::None,
     }
 }

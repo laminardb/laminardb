@@ -128,12 +128,15 @@ impl CoreWindowState {
     ) -> Result<Option<Self>, DbError> {
         let size_ms = i64::try_from(window_config.size.as_millis()).unwrap_or(i64::MAX);
 
+        let offset_ms = window_config.offset_ms;
         let assigner = match window_config.window_type {
             WindowType::Tumbling | WindowType::Cumulate => {
                 if size_ms <= 0 {
                     return Ok(None);
                 }
-                CoreWindowAssigner::Tumbling(TumblingWindowAssigner::from_millis(size_ms))
+                CoreWindowAssigner::Tumbling(
+                    TumblingWindowAssigner::from_millis(size_ms).with_offset_ms(offset_ms),
+                )
             }
             WindowType::Sliding => {
                 let slide_ms = i64::try_from(
@@ -146,7 +149,9 @@ impl CoreWindowState {
                 if size_ms <= 0 || slide_ms <= 0 || slide_ms > size_ms {
                     return Ok(None);
                 }
-                CoreWindowAssigner::Hopping(SlidingWindowAssigner::from_millis(size_ms, slide_ms))
+                CoreWindowAssigner::Hopping(
+                    SlidingWindowAssigner::from_millis(size_ms, slide_ms).with_offset_ms(offset_ms),
+                )
             }
             WindowType::Session => {
                 let gap_ms = i64::try_from(
@@ -1274,6 +1279,7 @@ mod tests {
             size: Duration::from_secs(60),
             slide: None,
             gap: None,
+            offset_ms: 0,
             allowed_lateness: Duration::ZERO,
             emit_strategy: laminar_sql::parser::EmitStrategy::OnWindowClose,
             late_data_side_output: None,
@@ -1309,6 +1315,7 @@ mod tests {
             size: Duration::from_secs(10),
             slide: Some(Duration::from_secs(60)),
             gap: None,
+            offset_ms: 0,
             allowed_lateness: Duration::ZERO,
             emit_strategy: laminar_sql::parser::EmitStrategy::OnWindowClose,
             late_data_side_output: None,
@@ -1346,6 +1353,7 @@ mod tests {
             size: Duration::from_secs(60),
             slide: None,
             gap: None,
+            offset_ms: 0,
             allowed_lateness: Duration::ZERO,
             emit_strategy: laminar_sql::parser::EmitStrategy::OnWindowClose,
             late_data_side_output: None,
@@ -1589,6 +1597,7 @@ mod tests {
             size: Duration::from_secs(60),
             slide: Some(Duration::from_secs(10)),
             gap: None,
+            offset_ms: 0,
             allowed_lateness: Duration::ZERO,
             emit_strategy: laminar_sql::parser::EmitStrategy::OnWindowClose,
             late_data_side_output: None,
@@ -1623,6 +1632,7 @@ mod tests {
             size: Duration::ZERO,
             slide: None,
             gap: Some(Duration::from_secs(30)),
+            offset_ms: 0,
             allowed_lateness: Duration::ZERO,
             emit_strategy: laminar_sql::parser::EmitStrategy::OnWindowClose,
             late_data_side_output: None,
@@ -1657,6 +1667,7 @@ mod tests {
             size: Duration::ZERO,
             slide: None,
             gap: Some(Duration::ZERO),
+            offset_ms: 0,
             allowed_lateness: Duration::ZERO,
             emit_strategy: laminar_sql::parser::EmitStrategy::OnWindowClose,
             late_data_side_output: None,
@@ -2033,6 +2044,7 @@ mod tests {
             size: std::time::Duration::from_secs(10),
             slide: None,
             gap: None,
+            offset_ms: 0,
             allowed_lateness: std::time::Duration::ZERO,
             emit_strategy: laminar_sql::parser::EmitStrategy::OnWindowClose,
             late_data_side_output: None,

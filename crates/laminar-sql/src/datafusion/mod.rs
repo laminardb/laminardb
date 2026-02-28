@@ -770,4 +770,65 @@ mod tests {
         // Only event at 300s is after watermark (200s)
         assert_eq!(total_rows, 1);
     }
+
+    #[tokio::test]
+    async fn test_date_trunc_available() {
+        let ctx = create_streaming_context();
+        let df = ctx
+            .sql("SELECT date_trunc('hour', TIMESTAMP '2026-01-15 14:30:00')")
+            .await
+            .unwrap();
+        let batches = df.collect().await.unwrap();
+        assert_eq!(batches.len(), 1);
+        assert_eq!(batches[0].num_rows(), 1);
+    }
+
+    #[tokio::test]
+    async fn test_date_bin_available() {
+        let ctx = create_streaming_context();
+        let df = ctx
+            .sql(
+                "SELECT date_bin(\
+                 INTERVAL '15 minutes', \
+                 TIMESTAMP '2026-01-15 14:32:00', \
+                 TIMESTAMP '2026-01-01 00:00:00')",
+            )
+            .await
+            .unwrap();
+        let batches = df.collect().await.unwrap();
+        assert_eq!(batches.len(), 1);
+        assert_eq!(batches[0].num_rows(), 1);
+    }
+
+    #[tokio::test]
+    async fn test_unnest_literal_array() {
+        let ctx = create_streaming_context();
+        let df = ctx
+            .sql("SELECT unnest(make_array(1, 2, 3)) AS val")
+            .await
+            .unwrap();
+        let batches = df.collect().await.unwrap();
+        let total_rows: usize = batches.iter().map(RecordBatch::num_rows).sum();
+        assert_eq!(total_rows, 3);
+    }
+
+    #[tokio::test]
+    async fn test_unnest_from_table_with_array_col() {
+        let ctx = create_streaming_context();
+        // Register a table with an array column
+        ctx.sql(
+            "CREATE TABLE arr_table (id INT, tags INT[]) \
+             AS VALUES (1, make_array(10, 20)), (2, make_array(30))",
+        )
+        .await
+        .unwrap();
+        let df = ctx
+            .sql("SELECT id, unnest(tags) AS tag FROM arr_table")
+            .await
+            .unwrap();
+        let batches = df.collect().await.unwrap();
+        let total_rows: usize = batches.iter().map(RecordBatch::num_rows).sum();
+        // Row 1: [10,20] → 2 rows, Row 2: [30] → 1 row = 3 total
+        assert_eq!(total_rows, 3);
+    }
 }

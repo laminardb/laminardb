@@ -741,6 +741,8 @@ pub trait WindowAssigner: Send {
 pub struct TumblingWindowAssigner {
     /// Window size in milliseconds
     size_ms: i64,
+    /// Offset in milliseconds for timezone-aligned windows
+    offset_ms: i64,
 }
 
 impl TumblingWindowAssigner {
@@ -758,7 +760,10 @@ impl TumblingWindowAssigner {
         // Ensure window size fits in i64 and is positive
         let size_ms = i64::try_from(size.as_millis()).expect("Window size must fit in i64");
         assert!(size_ms > 0, "Window size must be positive");
-        Self { size_ms }
+        Self {
+            size_ms,
+            offset_ms: 0,
+        }
     }
 
     /// Creates a new tumbling window assigner with size in milliseconds.
@@ -769,7 +774,17 @@ impl TumblingWindowAssigner {
     #[must_use]
     pub fn from_millis(size_ms: i64) -> Self {
         assert!(size_ms > 0, "Window size must be positive");
-        Self { size_ms }
+        Self {
+            size_ms,
+            offset_ms: 0,
+        }
+    }
+
+    /// Set window offset in milliseconds.
+    #[must_use]
+    pub fn with_offset_ms(mut self, offset_ms: i64) -> Self {
+        self.offset_ms = offset_ms;
+        self
     }
 
     /// Returns the window size in milliseconds.
@@ -778,19 +793,27 @@ impl TumblingWindowAssigner {
         self.size_ms
     }
 
+    /// Returns the window offset in milliseconds.
+    #[must_use]
+    pub fn offset_ms(&self) -> i64 {
+        self.offset_ms
+    }
+
     /// Assigns a timestamp to a window.
     ///
     /// This is the core window assignment function with O(1) complexity.
+    /// When an offset is set, windows are shifted: `floor((ts - offset) / size) * size + offset`.
     #[inline]
     #[must_use]
     pub fn assign(&self, timestamp: i64) -> WindowId {
-        // Handle negative timestamps correctly
-        let window_start = if timestamp >= 0 {
-            (timestamp / self.size_ms) * self.size_ms
+        let adjusted = timestamp - self.offset_ms;
+        let window_start = if adjusted >= 0 {
+            (adjusted / self.size_ms) * self.size_ms
         } else {
             // For negative timestamps, we need to floor divide
-            ((timestamp - self.size_ms + 1) / self.size_ms) * self.size_ms
+            ((adjusted - self.size_ms + 1) / self.size_ms) * self.size_ms
         };
+        let window_start = window_start + self.offset_ms;
         let window_end = window_start + self.size_ms;
         WindowId::new(window_start, window_end)
     }

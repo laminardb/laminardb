@@ -28,6 +28,16 @@ pub enum ShowCommand {
     Tables,
     /// SHOW CHECKPOINT STATUS - display checkpoint state
     CheckpointStatus,
+    /// `SHOW CREATE SOURCE` — reconstruct source DDL
+    CreateSource {
+        /// Source name
+        name: ObjectName,
+    },
+    /// `SHOW CREATE SINK` — reconstruct sink DDL
+    CreateSink {
+        /// Sink name
+        name: ObjectName,
+    },
 }
 
 /// Streaming-specific SQL statements
@@ -93,10 +103,12 @@ pub enum StreamingStatement {
         extended: bool,
     },
 
-    /// EXPLAIN a streaming query plan
+    /// `EXPLAIN [ANALYZE]` a streaming query plan
     Explain {
         /// The statement to explain
         statement: Box<StreamingStatement>,
+        /// Whether ANALYZE was specified (execute and collect metrics)
+        analyze: bool,
     },
 
     /// CREATE MATERIALIZED VIEW
@@ -480,14 +492,16 @@ impl EmitClause {
 /// Window function types
 #[derive(Debug, Clone, PartialEq)]
 pub enum WindowFunction {
-    /// TUMBLE(column, interval)
+    /// TUMBLE(column, interval [, offset])
     Tumble {
         /// The time column to window on
         time_column: Box<Expr>,
         /// The window interval
         interval: Box<Expr>,
+        /// Optional offset for timezone-aligned windows
+        offset: Option<Box<Expr>>,
     },
-    /// HOP(column, slide, size)
+    /// HOP(column, slide, size [, offset])
     Hop {
         /// The time column to window on
         time_column: Box<Expr>,
@@ -495,6 +509,8 @@ pub enum WindowFunction {
         slide_interval: Box<Expr>,
         /// The window size interval
         window_interval: Box<Expr>,
+        /// Optional offset for timezone-aligned windows
+        offset: Option<Box<Expr>>,
     },
     /// SESSION(column, gap)
     Session {
@@ -596,12 +612,14 @@ mod tests {
         let tumble = WindowFunction::Tumble {
             time_column: Box::new(Expr::Identifier(Ident::new("event_time"))),
             interval: Box::new(Expr::Identifier(Ident::new("5_MINUTES"))),
+            offset: None,
         };
 
         let hop = WindowFunction::Hop {
             time_column: Box::new(Expr::Identifier(Ident::new("event_time"))),
             slide_interval: Box::new(Expr::Identifier(Ident::new("1_MINUTE"))),
             window_interval: Box::new(Expr::Identifier(Ident::new("5_MINUTES"))),
+            offset: None,
         };
 
         match tumble {
@@ -761,9 +779,10 @@ mod tests {
 
         let stmt = StreamingStatement::Explain {
             statement: Box::new(inner),
+            analyze: false,
         };
         match stmt {
-            StreamingStatement::Explain { statement } => {
+            StreamingStatement::Explain { statement, .. } => {
                 assert!(matches!(*statement, StreamingStatement::Standard(_)));
             }
             _ => panic!("Expected Explain"),

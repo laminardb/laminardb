@@ -383,8 +383,24 @@ impl LaminarDB {
         let statement = &statements[0];
 
         match statement {
-            StreamingStatement::CreateSource(create) => self.handle_create_source(create),
-            StreamingStatement::CreateSink(create) => self.handle_create_sink(create),
+            StreamingStatement::CreateSource(create) => {
+                let result = self.handle_create_source(create)?;
+                if let ExecuteResult::Ddl(ref info) = result {
+                    self.connector_manager
+                        .lock()
+                        .store_ddl(&info.object_name, sql);
+                }
+                Ok(result)
+            }
+            StreamingStatement::CreateSink(create) => {
+                let result = self.handle_create_sink(create)?;
+                if let ExecuteResult::Ddl(ref info) = result {
+                    self.connector_manager
+                        .lock()
+                        .store_ddl(&info.object_name, sql);
+                }
+                Ok(result)
+            }
             StreamingStatement::CreateStream {
                 name,
                 query,
@@ -445,6 +461,12 @@ impl LaminarDB {
                     ShowCommand::Streams => self.build_show_streams(),
                     ShowCommand::Tables => self.build_show_tables(),
                     ShowCommand::CheckpointStatus => self.build_show_checkpoint_status()?,
+                    ShowCommand::CreateSource { name } => {
+                        self.build_show_create_source(&name.to_string())?
+                    }
+                    ShowCommand::CreateSink { name } => {
+                        self.build_show_create_sink(&name.to_string())?
+                    }
                 };
                 Ok(ExecuteResult::Metadata(batch))
             }
@@ -463,7 +485,15 @@ impl LaminarDB {
                 let batch = self.build_describe(&name_str)?;
                 Ok(ExecuteResult::Metadata(batch))
             }
-            StreamingStatement::Explain { statement } => self.handle_explain(statement),
+            StreamingStatement::Explain {
+                statement, analyze, ..
+            } => {
+                if *analyze {
+                    self.handle_explain_analyze(statement, sql).await
+                } else {
+                    self.handle_explain(statement)
+                }
+            }
             StreamingStatement::CreateMaterializedView {
                 name,
                 query,
@@ -1541,6 +1571,79 @@ impl LaminarDB {
             ],
         )
         .map_err(|e| DbError::InvalidOperation(format!("explain metadata: {e}")))?;
+
+        Ok(ExecuteResult::Metadata(batch))
+    }
+
+    /// Handle EXPLAIN ANALYZE: run the plan and collect execution metrics.
+    async fn handle_explain_analyze(
+        &self,
+        statement: &StreamingStatement,
+        original_sql: &str,
+    ) -> Result<ExecuteResult, DbError> {
+        // First get the normal EXPLAIN output
+        let explain_result = self.handle_explain(statement)?;
+        let mut rows: Vec<(String, String)> = Vec::new();
+
+        if let ExecuteResult::Metadata(explain_batch) = &explain_result {
+            let keys_col = explain_batch
+                .column(0)
+                .as_any()
+                .downcast_ref::<StringArray>();
+            let vals_col = explain_batch
+                .column(1)
+                .as_any()
+                .downcast_ref::<StringArray>();
+            if let (Some(keys), Some(vals)) = (keys_col, vals_col) {
+                for i in 0..explain_batch.num_rows() {
+                    rows.push((keys.value(i).to_string(), vals.value(i).to_string()));
+                }
+            }
+        }
+
+        // Extract the inner SQL from the original EXPLAIN ANALYZE statement
+        let upper = original_sql.to_uppercase();
+        let inner_start = upper.find("ANALYZE").map_or(0, |pos| pos + "ANALYZE".len());
+        let inner_sql = original_sql[inner_start..].trim();
+
+        // Try to execute the inner query via DataFusion and collect metrics
+        let start = std::time::Instant::now();
+        match self.ctx.sql(inner_sql).await {
+            Ok(df) => match df.collect().await {
+                Ok(batches) => {
+                    let elapsed = start.elapsed();
+                    let total_rows: usize = batches.iter().map(RecordBatch::num_rows).sum();
+                    rows.push(("rows_produced".into(), total_rows.to_string()));
+                    rows.push(("execution_time_ms".into(), elapsed.as_millis().to_string()));
+                    rows.push(("batches_processed".into(), batches.len().to_string()));
+                }
+                Err(e) => {
+                    let elapsed = start.elapsed();
+                    rows.push(("execution_time_ms".into(), elapsed.as_millis().to_string()));
+                    rows.push(("analyze_error".into(), format!("{e}")));
+                }
+            },
+            Err(e) => {
+                rows.push(("analyze_error".into(), format!("{e}")));
+            }
+        }
+
+        let keys: Vec<&str> = rows.iter().map(|(k, _)| k.as_str()).collect();
+        let values: Vec<&str> = rows.iter().map(|(_, v)| v.as_str()).collect();
+
+        let schema = Arc::new(Schema::new(vec![
+            Field::new("plan_key", DataType::Utf8, false),
+            Field::new("plan_value", DataType::Utf8, false),
+        ]));
+
+        let batch = RecordBatch::try_new(
+            schema,
+            vec![
+                Arc::new(StringArray::from(keys)),
+                Arc::new(StringArray::from(values)),
+            ],
+        )
+        .map_err(|e| DbError::InvalidOperation(format!("explain analyze metadata: {e}")))?;
 
         Ok(ExecuteResult::Metadata(batch))
     }
@@ -3373,30 +3476,89 @@ impl LaminarDB {
         .expect("show materialized views: schema matches columns")
     }
 
-    /// Build a SHOW SOURCES metadata result.
+    /// Build a SHOW SOURCES metadata result with connector metadata.
     fn build_show_sources(&self) -> RecordBatch {
         let sources = self.sources();
-        let names: Vec<&str> = sources.iter().map(|s| s.name.as_str()).collect();
-        let schema = Arc::new(Schema::new(vec![Field::new(
-            "source_name",
-            DataType::Utf8,
-            false,
-        )]));
-        RecordBatch::try_new(schema, vec![Arc::new(StringArray::from(names))])
-            .expect("show sources: schema matches columns")
+        let mgr = self.connector_manager.lock();
+        let regs = mgr.sources();
+
+        let mut names = Vec::with_capacity(sources.len());
+        let mut connectors: Vec<Option<&str>> = Vec::with_capacity(sources.len());
+        let mut formats: Vec<Option<&str>> = Vec::with_capacity(sources.len());
+        let mut watermarks: Vec<Option<&str>> = Vec::with_capacity(sources.len());
+
+        for s in &sources {
+            names.push(s.name.as_str());
+            if let Some(reg) = regs.get(&s.name) {
+                connectors.push(reg.connector_type.as_deref());
+                formats.push(reg.format.as_deref());
+            } else {
+                connectors.push(None);
+                formats.push(None);
+            }
+            watermarks.push(s.watermark_column.as_deref());
+        }
+
+        let schema = Arc::new(Schema::new(vec![
+            Field::new("source_name", DataType::Utf8, false),
+            Field::new("connector", DataType::Utf8, true),
+            Field::new("format", DataType::Utf8, true),
+            Field::new("watermark_column", DataType::Utf8, true),
+        ]));
+        RecordBatch::try_new(
+            schema,
+            vec![
+                Arc::new(StringArray::from(names)),
+                Arc::new(StringArray::from(connectors)),
+                Arc::new(StringArray::from(formats)),
+                Arc::new(StringArray::from(watermarks)),
+            ],
+        )
+        .expect("show sources: schema matches columns")
     }
 
-    /// Build a SHOW SINKS metadata result.
+    /// Build a SHOW SINKS metadata result with connector metadata.
     fn build_show_sinks(&self) -> RecordBatch {
         let sinks = self.sinks();
-        let names: Vec<&str> = sinks.iter().map(|s| s.name.as_str()).collect();
-        let schema = Arc::new(Schema::new(vec![Field::new(
-            "sink_name",
-            DataType::Utf8,
-            false,
-        )]));
-        RecordBatch::try_new(schema, vec![Arc::new(StringArray::from(names))])
-            .expect("show sinks: schema matches columns")
+        let mgr = self.connector_manager.lock();
+        let regs = mgr.sinks();
+
+        let mut names = Vec::with_capacity(sinks.len());
+        let mut inputs: Vec<Option<String>> = Vec::with_capacity(sinks.len());
+        let mut connectors: Vec<Option<&str>> = Vec::with_capacity(sinks.len());
+        let mut formats: Vec<Option<&str>> = Vec::with_capacity(sinks.len());
+
+        for s in &sinks {
+            names.push(s.name.as_str());
+            // Input comes from catalog (always registered), connector metadata from ConnectorManager
+            let catalog_input = self.catalog.get_sink_input(&s.name);
+            if let Some(reg) = regs.get(&s.name) {
+                inputs.push(Some(reg.input.clone()));
+                connectors.push(reg.connector_type.as_deref());
+                formats.push(reg.format.as_deref());
+            } else {
+                inputs.push(catalog_input);
+                connectors.push(None);
+                formats.push(None);
+            }
+        }
+
+        let schema = Arc::new(Schema::new(vec![
+            Field::new("sink_name", DataType::Utf8, false),
+            Field::new("input", DataType::Utf8, true),
+            Field::new("connector", DataType::Utf8, true),
+            Field::new("format", DataType::Utf8, true),
+        ]));
+        RecordBatch::try_new(
+            schema,
+            vec![
+                Arc::new(StringArray::from(names)),
+                Arc::new(StringArray::from(inputs)),
+                Arc::new(StringArray::from(connectors)),
+                Arc::new(StringArray::from(formats)),
+            ],
+        )
+        .expect("show sinks: schema matches columns")
     }
 
     /// Build a SHOW QUERIES metadata result.
@@ -3421,17 +3583,80 @@ impl LaminarDB {
         .expect("show queries: schema matches columns")
     }
 
-    /// Build a SHOW STREAMS metadata result.
+    /// Build a SHOW STREAMS metadata result with SQL definitions.
     fn build_show_streams(&self) -> RecordBatch {
         let streams = self.catalog.list_streams();
-        let names: Vec<&str> = streams.iter().map(String::as_str).collect();
+        let mgr = self.connector_manager.lock();
+        let regs = mgr.streams();
+
+        let mut names = Vec::with_capacity(streams.len());
+        let mut sqls: Vec<Option<&str>> = Vec::with_capacity(streams.len());
+
+        for name in &streams {
+            names.push(name.as_str());
+            sqls.push(regs.get(name.as_str()).map(|r| r.query_sql.as_str()));
+        }
+
+        let schema = Arc::new(Schema::new(vec![
+            Field::new("stream_name", DataType::Utf8, false),
+            Field::new("sql", DataType::Utf8, true),
+        ]));
+        RecordBatch::try_new(
+            schema,
+            vec![
+                Arc::new(StringArray::from(names)),
+                Arc::new(StringArray::from(sqls)),
+            ],
+        )
+        .expect("show streams: schema matches columns")
+    }
+
+    /// Build a SHOW CREATE SOURCE result.
+    fn build_show_create_source(&self, name: &str) -> Result<RecordBatch, DbError> {
+        if self.catalog.get_source(name).is_none() {
+            return Err(DbError::SourceNotFound(name.to_string()));
+        }
+        let mgr = self.connector_manager.lock();
+        let ddl = mgr
+            .get_ddl(name)
+            .ok_or_else(|| DbError::InvalidOperation(format!("No stored DDL for source '{name}'")))?
+            .to_string();
+        drop(mgr);
+
         let schema = Arc::new(Schema::new(vec![Field::new(
-            "stream_name",
+            "create_statement",
             DataType::Utf8,
             false,
         )]));
-        RecordBatch::try_new(schema, vec![Arc::new(StringArray::from(names))])
-            .expect("show streams: schema matches columns")
+        Ok(RecordBatch::try_new(
+            schema,
+            vec![Arc::new(StringArray::from(vec![ddl.as_str()]))],
+        )
+        .expect("show create source: schema matches columns"))
+    }
+
+    /// Build a SHOW CREATE SINK result.
+    fn build_show_create_sink(&self, name: &str) -> Result<RecordBatch, DbError> {
+        if self.catalog.get_sink_input(name).is_none() {
+            return Err(DbError::SinkNotFound(name.to_string()));
+        }
+        let mgr = self.connector_manager.lock();
+        let ddl = mgr
+            .get_ddl(name)
+            .ok_or_else(|| DbError::InvalidOperation(format!("No stored DDL for sink '{name}'")))?
+            .to_string();
+        drop(mgr);
+
+        let schema = Arc::new(Schema::new(vec![Field::new(
+            "create_statement",
+            DataType::Utf8,
+            false,
+        )]));
+        Ok(RecordBatch::try_new(
+            schema,
+            vec![Arc::new(StringArray::from(vec![ddl.as_str()]))],
+        )
+        .expect("show create sink: schema matches columns"))
     }
 
     /// Handle DROP TABLE statement.
@@ -7169,6 +7394,222 @@ mod tests {
         } else {
             // If websocket feature IS enabled, the connector type is registered
             // and the DDL succeeds — also acceptable.
+        }
+    }
+
+    #[tokio::test]
+    async fn test_show_sources_enriched() {
+        let db = LaminarDB::open().unwrap();
+        db.execute(
+            "CREATE SOURCE events (id BIGINT, ts TIMESTAMP, WATERMARK FOR ts AS ts - INTERVAL '1' SECOND)",
+        )
+        .await
+        .unwrap();
+
+        let result = db.execute("SHOW SOURCES").await.unwrap();
+        match result {
+            ExecuteResult::Metadata(batch) => {
+                assert_eq!(batch.num_rows(), 1);
+                assert_eq!(batch.num_columns(), 4);
+                assert_eq!(batch.schema().field(0).name(), "source_name");
+                assert_eq!(batch.schema().field(1).name(), "connector");
+                assert_eq!(batch.schema().field(2).name(), "format");
+                assert_eq!(batch.schema().field(3).name(), "watermark_column");
+
+                let names = batch
+                    .column(0)
+                    .as_any()
+                    .downcast_ref::<StringArray>()
+                    .unwrap();
+                assert_eq!(names.value(0), "events");
+
+                let wm = batch
+                    .column(3)
+                    .as_any()
+                    .downcast_ref::<StringArray>()
+                    .unwrap();
+                assert_eq!(wm.value(0), "ts");
+            }
+            _ => panic!("Expected Metadata result"),
+        }
+    }
+
+    #[tokio::test]
+    async fn test_show_sinks_enriched() {
+        let db = LaminarDB::open().unwrap();
+        db.execute("CREATE SOURCE events (id INT)").await.unwrap();
+        db.execute("CREATE SINK output FROM events").await.unwrap();
+
+        let result = db.execute("SHOW SINKS").await.unwrap();
+        match result {
+            ExecuteResult::Metadata(batch) => {
+                assert_eq!(batch.num_rows(), 1);
+                assert_eq!(batch.num_columns(), 4);
+                assert_eq!(batch.schema().field(0).name(), "sink_name");
+                assert_eq!(batch.schema().field(1).name(), "input");
+                assert_eq!(batch.schema().field(2).name(), "connector");
+                assert_eq!(batch.schema().field(3).name(), "format");
+
+                let names = batch
+                    .column(0)
+                    .as_any()
+                    .downcast_ref::<StringArray>()
+                    .unwrap();
+                assert_eq!(names.value(0), "output");
+
+                let inputs = batch
+                    .column(1)
+                    .as_any()
+                    .downcast_ref::<StringArray>()
+                    .unwrap();
+                assert_eq!(inputs.value(0), "events");
+            }
+            _ => panic!("Expected Metadata result"),
+        }
+    }
+
+    #[tokio::test]
+    async fn test_show_streams_enriched() {
+        let db = LaminarDB::open().unwrap();
+        db.execute("CREATE STREAM my_stream AS SELECT 1 FROM events")
+            .await
+            .unwrap();
+
+        let result = db.execute("SHOW STREAMS").await.unwrap();
+        match result {
+            ExecuteResult::Metadata(batch) => {
+                assert_eq!(batch.num_rows(), 1);
+                assert_eq!(batch.num_columns(), 2);
+                assert_eq!(batch.schema().field(0).name(), "stream_name");
+                assert_eq!(batch.schema().field(1).name(), "sql");
+
+                let sqls = batch
+                    .column(1)
+                    .as_any()
+                    .downcast_ref::<StringArray>()
+                    .unwrap();
+                assert!(
+                    sqls.value(0).contains("SELECT"),
+                    "SQL column should contain query"
+                );
+            }
+            _ => panic!("Expected Metadata result"),
+        }
+    }
+
+    #[tokio::test]
+    async fn test_show_create_source() {
+        let db = LaminarDB::open().unwrap();
+        let ddl = "CREATE SOURCE events (id BIGINT, name VARCHAR)";
+        db.execute(ddl).await.unwrap();
+
+        let result = db.execute("SHOW CREATE SOURCE events").await.unwrap();
+        match result {
+            ExecuteResult::Metadata(batch) => {
+                assert_eq!(batch.num_rows(), 1);
+                assert_eq!(batch.schema().field(0).name(), "create_statement");
+                let stmts = batch
+                    .column(0)
+                    .as_any()
+                    .downcast_ref::<StringArray>()
+                    .unwrap();
+                assert_eq!(stmts.value(0), ddl);
+            }
+            _ => panic!("Expected Metadata result"),
+        }
+    }
+
+    #[tokio::test]
+    async fn test_show_create_sink() {
+        let db = LaminarDB::open().unwrap();
+        db.execute("CREATE SOURCE events (id INT)").await.unwrap();
+        let ddl = "CREATE SINK output FROM events";
+        db.execute(ddl).await.unwrap();
+
+        let result = db.execute("SHOW CREATE SINK output").await.unwrap();
+        match result {
+            ExecuteResult::Metadata(batch) => {
+                assert_eq!(batch.num_rows(), 1);
+                assert_eq!(batch.schema().field(0).name(), "create_statement");
+                let stmts = batch
+                    .column(0)
+                    .as_any()
+                    .downcast_ref::<StringArray>()
+                    .unwrap();
+                assert_eq!(stmts.value(0), ddl);
+            }
+            _ => panic!("Expected Metadata result"),
+        }
+    }
+
+    #[tokio::test]
+    async fn test_show_create_source_not_found() {
+        let db = LaminarDB::open().unwrap();
+        let result = db.execute("SHOW CREATE SOURCE nonexistent").await;
+        assert!(result.is_err());
+    }
+
+    #[tokio::test]
+    async fn test_show_create_sink_not_found() {
+        let db = LaminarDB::open().unwrap();
+        let result = db.execute("SHOW CREATE SINK nonexistent").await;
+        assert!(result.is_err());
+    }
+
+    #[tokio::test]
+    async fn test_explain_analyze_returns_metrics() {
+        let db = LaminarDB::open().unwrap();
+        db.execute("CREATE SOURCE events (id BIGINT, value DOUBLE)")
+            .await
+            .unwrap();
+
+        let result = db
+            .execute("EXPLAIN ANALYZE SELECT * FROM events")
+            .await
+            .unwrap();
+        match result {
+            ExecuteResult::Metadata(batch) => {
+                let keys = batch
+                    .column(0)
+                    .as_any()
+                    .downcast_ref::<StringArray>()
+                    .unwrap();
+                let key_vals: Vec<&str> = (0..batch.num_rows()).map(|i| keys.value(i)).collect();
+                assert!(
+                    key_vals.contains(&"rows_produced"),
+                    "Expected rows_produced metric, got: {key_vals:?}"
+                );
+                assert!(
+                    key_vals.contains(&"execution_time_ms"),
+                    "Expected execution_time_ms metric, got: {key_vals:?}"
+                );
+            }
+            _ => panic!("Expected Metadata result"),
+        }
+    }
+
+    #[tokio::test]
+    async fn test_explain_without_analyze_has_no_metrics() {
+        let db = LaminarDB::open().unwrap();
+        db.execute("CREATE SOURCE events (id BIGINT, value DOUBLE)")
+            .await
+            .unwrap();
+
+        let result = db.execute("EXPLAIN SELECT * FROM events").await.unwrap();
+        match result {
+            ExecuteResult::Metadata(batch) => {
+                let keys = batch
+                    .column(0)
+                    .as_any()
+                    .downcast_ref::<StringArray>()
+                    .unwrap();
+                let key_vals: Vec<&str> = (0..batch.num_rows()).map(|i| keys.value(i)).collect();
+                assert!(
+                    !key_vals.contains(&"rows_produced"),
+                    "EXPLAIN without ANALYZE should not have rows_produced"
+                );
+            }
+            _ => panic!("Expected Metadata result"),
         }
     }
 }

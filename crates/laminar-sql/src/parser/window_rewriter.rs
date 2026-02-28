@@ -213,11 +213,11 @@ impl WindowRewriter {
         }
     }
 
-    /// Parse TUMBLE(time_column, interval) arguments.
+    /// Parse TUMBLE(time_column, interval [, offset]) arguments.
     fn parse_tumble_args(args: &[Expr]) -> Result<Option<WindowFunction>, ParseError> {
-        if args.len() != 2 {
+        if args.len() < 2 || args.len() > 3 {
             return Err(ParseError::WindowError(format!(
-                "TUMBLE requires 2 arguments (time_column, interval), got {}",
+                "TUMBLE requires 2-3 arguments (time_column, interval [, offset]), got {}",
                 args.len()
             )));
         }
@@ -225,14 +225,15 @@ impl WindowRewriter {
         Ok(Some(WindowFunction::Tumble {
             time_column: Box::new(args[0].clone()),
             interval: Box::new(args[1].clone()),
+            offset: args.get(2).map(|e| Box::new(e.clone())),
         }))
     }
 
-    /// Parse HOP/SLIDE(time_column, slide_interval, window_size) arguments.
+    /// Parse HOP/SLIDE(time_column, slide_interval, window_size [, offset]) arguments.
     fn parse_hop_args(args: &[Expr]) -> Result<Option<WindowFunction>, ParseError> {
-        if args.len() != 3 {
+        if args.len() < 3 || args.len() > 4 {
             return Err(ParseError::WindowError(format!(
-                "HOP/SLIDE requires 3 arguments (time_column, slide_interval, window_size), got {}",
+                "HOP/SLIDE requires 3-4 arguments (time_column, slide_interval, window_size [, offset]), got {}",
                 args.len()
             )));
         }
@@ -241,6 +242,7 @@ impl WindowRewriter {
             time_column: Box::new(args[0].clone()),
             slide_interval: Box::new(args[1].clone()),
             window_interval: Box::new(args[2].clone()),
+            offset: args.get(3).map(|e| Box::new(e.clone())),
         }))
     }
 
@@ -471,6 +473,7 @@ mod tests {
                         WindowFunction::Tumble {
                             time_column,
                             interval,
+                            ..
                         } => {
                             // Verify time column is extracted correctly
                             assert_eq!(time_column.to_string(), "order_time");
@@ -503,6 +506,7 @@ mod tests {
                             time_column,
                             slide_interval,
                             window_interval,
+                            ..
                         } => {
                             assert_eq!(time_column.to_string(), "ts");
                             assert!(slide_interval.to_string().contains('1'));
@@ -555,7 +559,7 @@ mod tests {
                     let result = WindowRewriter::extract_window_function(expr);
                     assert!(result.is_err());
                     let err = result.unwrap_err();
-                    assert!(err.to_string().contains("2 arguments"));
+                    assert!(err.to_string().contains("2-3 arguments"));
                 }
             }
         }
@@ -573,7 +577,7 @@ mod tests {
                     let result = WindowRewriter::extract_window_function(expr);
                     assert!(result.is_err());
                     let err = result.unwrap_err();
-                    assert!(err.to_string().contains("3 arguments"));
+                    assert!(err.to_string().contains("3-4 arguments"));
                 }
             }
         }
@@ -790,6 +794,7 @@ mod tests {
                         WindowFunction::Tumble {
                             time_column: _,
                             interval,
+                            ..
                         } => {
                             let duration =
                                 WindowRewriter::parse_interval_to_duration(&interval).unwrap();
@@ -817,5 +822,79 @@ mod tests {
 
         let duration3 = WindowRewriter::parse_interval_string("750 MILLISECOND").unwrap();
         assert_eq!(duration3, std::time::Duration::from_millis(750));
+    }
+
+    #[test]
+    fn test_parse_tumble_with_offset() {
+        let sql = "SELECT TUMBLE(ts, INTERVAL '1' HOUR, INTERVAL '30' MINUTE) FROM events";
+        let dialect = GenericDialect {};
+        let statements = Parser::parse_sql(&dialect, sql).unwrap();
+
+        if let Statement::Query(query) = &statements[0] {
+            if let SetExpr::Select(select) = &*query.body {
+                if let SelectItem::UnnamedExpr(expr) = &select.projection[0] {
+                    let window = WindowRewriter::extract_window_function(expr)
+                        .unwrap()
+                        .unwrap();
+
+                    match window {
+                        WindowFunction::Tumble {
+                            interval, offset, ..
+                        } => {
+                            let dur =
+                                WindowRewriter::parse_interval_to_duration(&interval).unwrap();
+                            assert_eq!(dur, std::time::Duration::from_secs(3600));
+                            assert!(offset.is_some(), "Expected offset to be set");
+                            let off_dur = WindowRewriter::parse_interval_to_duration(
+                                offset.as_ref().unwrap(),
+                            )
+                            .unwrap();
+                            assert_eq!(off_dur, std::time::Duration::from_secs(1800));
+                        }
+                        _ => panic!("Expected Tumble window"),
+                    }
+                }
+            }
+        }
+    }
+
+    #[test]
+    fn test_parse_hop_with_offset() {
+        let sql = "SELECT HOP(ts, INTERVAL '5' MINUTE, INTERVAL '15' MINUTE, INTERVAL '2' MINUTE) FROM events";
+        let dialect = GenericDialect {};
+        let statements = Parser::parse_sql(&dialect, sql).unwrap();
+
+        if let Statement::Query(query) = &statements[0] {
+            if let SetExpr::Select(select) = &*query.body {
+                if let SelectItem::UnnamedExpr(expr) = &select.projection[0] {
+                    let window = WindowRewriter::extract_window_function(expr)
+                        .unwrap()
+                        .unwrap();
+
+                    match window {
+                        WindowFunction::Hop {
+                            slide_interval,
+                            window_interval,
+                            offset,
+                            ..
+                        } => {
+                            let slide = WindowRewriter::parse_interval_to_duration(&slide_interval)
+                                .unwrap();
+                            let size = WindowRewriter::parse_interval_to_duration(&window_interval)
+                                .unwrap();
+                            assert_eq!(slide, std::time::Duration::from_secs(300));
+                            assert_eq!(size, std::time::Duration::from_secs(900));
+                            assert!(offset.is_some(), "Expected offset to be set");
+                            let off_dur = WindowRewriter::parse_interval_to_duration(
+                                offset.as_ref().unwrap(),
+                            )
+                            .unwrap();
+                            assert_eq!(off_dur, std::time::Duration::from_secs(120));
+                        }
+                        _ => panic!("Expected Hop window"),
+                    }
+                }
+            }
+        }
     }
 }
