@@ -85,6 +85,11 @@ pub use wal_types::WalEntry;
 /// Size of the record header (length + CRC32).
 const RECORD_HEADER_SIZE: u64 = 8;
 
+/// Maximum allowed WAL entry size (256 MiB).
+/// Entries larger than this are almost certainly corrupted lengths. This guards
+/// against OOM from corrupted WAL files where the length field is garbage.
+const MAX_WAL_ENTRY_SIZE: u64 = 256 * 1024 * 1024;
+
 /// WAL position for checkpointing.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Archive, RkyvSerialize, RkyvDeserialize)]
 #[rkyv(compare(PartialEq))]
@@ -426,6 +431,17 @@ impl WriteAheadLog {
         reader.read_exact(&mut crc_bytes)?;
         let expected_crc = u32::from_le_bytes(crc_bytes);
 
+        // Reject unreasonably large entries (corrupted length field)
+        if len > MAX_WAL_ENTRY_SIZE {
+            return Err(WalError::Corrupted {
+                position,
+                reason: format!(
+                    "[LDB-6006] WAL entry length {len} exceeds maximum \
+                     {MAX_WAL_ENTRY_SIZE} bytes — likely corrupted"
+                ),
+            });
+        }
+
         // Check if we have enough bytes for the data
         let data_remaining = remaining - RECORD_HEADER_SIZE;
         if data_remaining < len {
@@ -438,7 +454,8 @@ impl WriteAheadLog {
         }
 
         // Read data and validate CRC
-        let mut data = vec![0u8; usize::try_from(len).unwrap_or(usize::MAX)];
+        #[allow(clippy::cast_possible_truncation)] // guarded by MAX_WAL_ENTRY_SIZE above
+        let mut data = vec![0u8; len as usize];
         reader.read_exact(&mut data)?;
 
         let actual_crc = crc32c::crc32c(&data);
@@ -488,6 +505,13 @@ pub enum WalReadResult {
         /// Position of the corrupted record.
         position: u64,
     },
+    /// Corrupted entry (e.g. unreasonable length).
+    Corrupted {
+        /// Position of the corrupted record.
+        position: u64,
+        /// Description of the corruption.
+        reason: String,
+    },
 }
 
 impl WalReader {
@@ -532,6 +556,17 @@ impl WalReader {
         let expected_crc = u32::from_le_bytes(crc_bytes);
         self.position += 4;
 
+        // Reject unreasonably large entries (corrupted length field)
+        if len > MAX_WAL_ENTRY_SIZE {
+            return Ok(WalReadResult::Corrupted {
+                position: record_start,
+                reason: format!(
+                    "[LDB-6006] WAL entry length {len} exceeds maximum \
+                     {MAX_WAL_ENTRY_SIZE} bytes — likely corrupted"
+                ),
+            });
+        }
+
         // Check for incomplete data
         let data_remaining = self.file_len.saturating_sub(self.position);
         if data_remaining < len {
@@ -544,7 +579,8 @@ impl WalReader {
         }
 
         // Read data
-        let mut data = vec![0u8; usize::try_from(len).unwrap_or(usize::MAX)];
+        #[allow(clippy::cast_possible_truncation)] // guarded by MAX_WAL_ENTRY_SIZE above
+        let mut data = vec![0u8; len as usize];
         self.reader.read_exact(&mut data)?;
         self.position += len;
 
@@ -580,6 +616,9 @@ impl Iterator for WalReader {
                     expected: 0, // We don't have the expected value here
                     actual: 0,
                 }))
+            }
+            Ok(WalReadResult::Corrupted { position, reason }) => {
+                Some(Err(WalError::Corrupted { position, reason }))
             }
             Err(e) => Some(Err(e)),
         }

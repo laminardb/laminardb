@@ -350,13 +350,45 @@ impl OperatorCheckpoint {
 
     /// Decodes the inline state, returning the raw bytes.
     ///
-    /// Returns `None` if the state is external or no inline data is present.
+    /// Returns `None` if the state is external, no inline data is present,
+    /// or if the base64 data is corrupted (logs a warning in that case).
     #[must_use]
     pub fn decode_inline(&self) -> Option<Vec<u8>> {
         use base64::Engine;
-        self.state_b64
-            .as_ref()
-            .and_then(|b64| base64::engine::general_purpose::STANDARD.decode(b64).ok())
+        self.state_b64.as_ref().and_then(|b64| {
+            match base64::engine::general_purpose::STANDARD.decode(b64) {
+                Ok(data) => Some(data),
+                Err(e) => {
+                    tracing::warn!(
+                        error = %e,
+                        b64_len = b64.len(),
+                        "[LDB-4004] Failed to decode inline operator state from base64 — \
+                         operator will start from scratch"
+                    );
+                    None
+                }
+            }
+        })
+    }
+
+    /// Decodes the inline state, returning a `Result` for callers that need
+    /// to distinguish between "no inline state" and "corrupted state".
+    ///
+    /// Returns `Ok(None)` if no inline data is present (external or absent).
+    /// Returns `Ok(Some(bytes))` on successful decode.
+    ///
+    /// # Errors
+    ///
+    /// Returns `Err` if base64 data is present but corrupted.
+    pub fn try_decode_inline(&self) -> Result<Option<Vec<u8>>, String> {
+        use base64::Engine;
+        match &self.state_b64 {
+            None => Ok(None),
+            Some(b64) => base64::engine::general_purpose::STANDARD
+                .decode(b64)
+                .map(Some)
+                .map_err(|e| format!("[LDB-4004] base64 decode failed: {e}")),
+        }
     }
 
     /// Creates an `OperatorCheckpoint` from raw bytes using a size threshold.

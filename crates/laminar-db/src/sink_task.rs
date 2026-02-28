@@ -218,8 +218,12 @@ async fn run_sink_task(
                 let Some(cmd) = cmd else {
                     // Channel closed — shut down gracefully
                     tracing::debug!(sink = %name, "Sink command channel closed");
-                    let _ = sink.flush().await;
-                    let _ = sink.close().await;
+                    if let Err(e) = sink.flush().await {
+                        tracing::warn!(sink = %name, error = %e, "Sink flush failed on channel close");
+                    }
+                    if let Err(e) = sink.close().await {
+                        tracing::warn!(sink = %name, error = %e, "Sink close failed on channel close");
+                    }
                     break;
                 };
                 match cmd {
@@ -245,11 +249,30 @@ async fn run_sink_task(
                         let _ = ack.send(result);
                     }
                     SinkCommand::RollbackEpoch { epoch } => {
-                        let _ = sink.rollback_epoch(epoch).await;
+                        if let Err(e) = sink.rollback_epoch(epoch).await {
+                            tracing::warn!(
+                                sink = %name,
+                                epoch,
+                                error = %e,
+                                "[LDB-6004] Sink rollback failed"
+                            );
+                        }
                     }
                     SinkCommand::Close => {
-                        let _ = sink.flush().await;
-                        let _ = sink.close().await;
+                        if let Err(e) = sink.flush().await {
+                            tracing::warn!(
+                                sink = %name,
+                                error = %e,
+                                "Sink flush failed during close"
+                            );
+                        }
+                        if let Err(e) = sink.close().await {
+                            tracing::warn!(
+                                sink = %name,
+                                error = %e,
+                                "Sink close failed"
+                            );
+                        }
                         tracing::debug!(sink = %name, "Sink task closed");
                         break;
                     }
