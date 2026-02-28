@@ -194,6 +194,24 @@ pub(crate) struct EowcStateCheckpoint {
     pub windows: Vec<WindowCheckpoint>,
 }
 
+/// Serializable checkpoint for join state (e.g., future stateful joins).
+///
+/// Currently ASOF and temporal joins are stateless per-cycle, so this is
+/// empty. The struct provides the extension point for future stateful
+/// streaming joins (e.g., interval joins with buffer windows).
+#[derive(Clone, serde::Serialize, serde::Deserialize, Default)]
+pub(crate) struct JoinStateCheckpoint {
+    /// Number of buffered left-side rows (for future stateful joins).
+    #[serde(default)]
+    pub left_buffer_rows: u64,
+    /// Number of buffered right-side rows (for future stateful joins).
+    #[serde(default)]
+    pub right_buffer_rows: u64,
+    /// Serialized join buffer state (opaque bytes).
+    #[serde(default)]
+    pub buffer_state: Option<Vec<u8>>,
+}
+
 /// Top-level checkpoint for the entire `StreamExecutor`.
 #[derive(serde::Serialize, serde::Deserialize)]
 pub(crate) struct StreamExecutorCheckpoint {
@@ -208,6 +226,12 @@ pub(crate) struct StreamExecutorCheckpoint {
     /// Core window pipeline states, keyed by query name.
     #[serde(default)]
     pub core_window_states: HashMap<String, crate::core_window_state::CoreWindowCheckpoint>,
+    /// Join states, keyed by query name.
+    ///
+    /// Currently empty for ASOF/temporal joins (stateless per-cycle).
+    /// Populated by future stateful joins (interval joins, etc.).
+    #[serde(default)]
+    pub join_states: HashMap<String, JoinStateCheckpoint>,
 }
 
 /// Specification for one aggregate function in a streaming query.
@@ -2495,5 +2519,50 @@ mod tests {
             err.contains("fingerprint mismatch"),
             "Error should mention fingerprint: {err}"
         );
+    }
+
+    #[test]
+    fn test_checkpoint_backward_compat_without_join_states() {
+        // Verify that checkpoints serialized before join_states was added
+        // still deserialize correctly (serde(default) handles it).
+        let json = r#"{
+            "version": 1,
+            "agg_states": {},
+            "eowc_states": {},
+            "core_window_states": {}
+        }"#;
+        let cp: StreamExecutorCheckpoint = serde_json::from_str(json).unwrap();
+        assert_eq!(cp.version, 1);
+        assert!(cp.join_states.is_empty());
+    }
+
+    #[test]
+    fn test_checkpoint_with_join_states_round_trip() {
+        let mut join_states = HashMap::new();
+        join_states.insert(
+            "enriched".to_string(),
+            JoinStateCheckpoint {
+                left_buffer_rows: 100,
+                right_buffer_rows: 50,
+                buffer_state: Some(vec![1, 2, 3]),
+            },
+        );
+
+        let cp = StreamExecutorCheckpoint {
+            version: 1,
+            agg_states: HashMap::new(),
+            eowc_states: HashMap::new(),
+            core_window_states: HashMap::new(),
+            join_states,
+        };
+
+        let bytes = serde_json::to_vec(&cp).unwrap();
+        let restored: StreamExecutorCheckpoint = serde_json::from_slice(&bytes).unwrap();
+
+        assert_eq!(restored.join_states.len(), 1);
+        let js = restored.join_states.get("enriched").unwrap();
+        assert_eq!(js.left_buffer_rows, 100);
+        assert_eq!(js.right_buffer_rows, 50);
+        assert_eq!(js.buffer_state, Some(vec![1, 2, 3]));
     }
 }

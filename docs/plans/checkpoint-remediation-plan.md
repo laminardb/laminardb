@@ -1263,8 +1263,8 @@ ground.
 - [x] Task 2.2: Barrier injection in pipeline coordinator
 - [x] Task 2.3: Barrier propagation through operators (out-of-band approach — operators don't need barriers since pipeline serializes execution)
 - [x] Task 2.4: Connect checkpoint coordinator to barrier flow
-- [ ] Task 2.5: Join state in stream executor
-- [ ] Task 2.6: End-to-end integration test
+- [x] Task 2.5: Join state in stream executor (join_states field + backward-compat serde; ASOF/temporal stateless per-cycle)
+- [x] Task 2.6: End-to-end integration test (checkpoint_exactly_once.rs — 4 tests)
 
 ### Phase 3 Checklist
 

@@ -1331,7 +1331,15 @@ impl StreamExecutor {
             cw_checkpoints.insert(name, state.checkpoint_windows()?);
         }
 
-        if agg_checkpoints.is_empty() && eowc_checkpoints.is_empty() && cw_checkpoints.is_empty() {
+        // Join states: currently ASOF/temporal joins are stateless per-cycle,
+        // so this map is empty. Future stateful joins will populate it.
+        let join_checkpoints = HashMap::new();
+
+        if agg_checkpoints.is_empty()
+            && eowc_checkpoints.is_empty()
+            && cw_checkpoints.is_empty()
+            && join_checkpoints.is_empty()
+        {
             return Ok(None);
         }
 
@@ -1340,6 +1348,7 @@ impl StreamExecutor {
             agg_states: agg_checkpoints,
             eowc_states: eowc_checkpoints,
             core_window_states: cw_checkpoints,
+            join_states: join_checkpoints,
         };
 
         let bytes = serde_json::to_vec(&checkpoint).map_err(|e| {
