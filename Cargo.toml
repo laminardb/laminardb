@@ -62,7 +62,7 @@ backoff = { version = "0.4", features = ["tokio"] }  # Exponential backoff retry
 arrow = { version = "57.2", default-features = true }
 arrow-array = "57.2"
 arrow-schema = "57.2"
-arrow-buffer = "57.2"
+arrow-buffer = "58.0"
 arrow-data = "57.2"
 arrow-cast = "57.2"
 arrow-ipc = "57.2"
