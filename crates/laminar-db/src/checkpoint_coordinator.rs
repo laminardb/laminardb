@@ -2065,8 +2065,10 @@ mod tests {
     async fn test_sidecar_round_trip() {
         let dir = tempfile::tempdir().unwrap();
         let store = Box::new(FileSystemCheckpointStore::new(dir.path(), 3));
-        let mut config = CheckpointConfig::default();
-        config.state_inline_threshold = 100; // 100 bytes threshold
+        let config = CheckpointConfig {
+            state_inline_threshold: 100, // 100 bytes threshold
+            ..CheckpointConfig::default()
+        };
         let mut coord = CheckpointCoordinator::new(config, store);
 
         // Small state stays inline, large state goes to sidecar
@@ -2130,8 +2132,10 @@ mod tests {
     fn test_adaptive_increases_interval_for_slow_checkpoints() {
         let dir = tempfile::tempdir().unwrap();
         let store = Box::new(FileSystemCheckpointStore::new(dir.path(), 3));
-        let mut config = CheckpointConfig::default();
-        config.adaptive = Some(AdaptiveCheckpointConfig::default());
+        let config = CheckpointConfig {
+            adaptive: Some(AdaptiveCheckpointConfig::default()),
+            ..CheckpointConfig::default()
+        };
         let mut coord = CheckpointCoordinator::new(config, store);
 
         // Simulate a 5-second checkpoint
@@ -2142,8 +2146,7 @@ mod tests {
         let interval = coord.config().interval.unwrap();
         assert!(
             interval >= Duration::from_secs(49) && interval <= Duration::from_secs(51),
-            "expected ~50s, got {:?}",
-            interval
+            "expected ~50s, got {interval:?}",
         );
     }
 
@@ -2151,8 +2154,10 @@ mod tests {
     fn test_adaptive_decreases_interval_for_fast_checkpoints() {
         let dir = tempfile::tempdir().unwrap();
         let store = Box::new(FileSystemCheckpointStore::new(dir.path(), 3));
-        let mut config = CheckpointConfig::default();
-        config.adaptive = Some(AdaptiveCheckpointConfig::default());
+        let config = CheckpointConfig {
+            adaptive: Some(AdaptiveCheckpointConfig::default()),
+            ..CheckpointConfig::default()
+        };
         let mut coord = CheckpointCoordinator::new(config, store);
 
         // Simulate a 100ms checkpoint → 100 / (1000 * 0.1) = 1s → clamped to 10s min
@@ -2171,13 +2176,15 @@ mod tests {
     fn test_adaptive_clamps_to_min_max() {
         let dir = tempfile::tempdir().unwrap();
         let store = Box::new(FileSystemCheckpointStore::new(dir.path(), 3));
-        let mut config = CheckpointConfig::default();
-        config.adaptive = Some(AdaptiveCheckpointConfig {
-            min_interval: Duration::from_secs(20),
-            max_interval: Duration::from_secs(120),
-            target_overhead_ratio: 0.1,
-            smoothing_alpha: 1.0, // Full weight on latest
-        });
+        let config = CheckpointConfig {
+            adaptive: Some(AdaptiveCheckpointConfig {
+                min_interval: Duration::from_secs(20),
+                max_interval: Duration::from_secs(120),
+                target_overhead_ratio: 0.1,
+                smoothing_alpha: 1.0, // Full weight on latest
+            }),
+            ..CheckpointConfig::default()
+        };
         let mut coord = CheckpointCoordinator::new(config, store);
 
         // Very slow → clamp to max
@@ -2198,13 +2205,15 @@ mod tests {
     fn test_adaptive_ema_smoothing() {
         let dir = tempfile::tempdir().unwrap();
         let store = Box::new(FileSystemCheckpointStore::new(dir.path(), 3));
-        let mut config = CheckpointConfig::default();
-        config.adaptive = Some(AdaptiveCheckpointConfig {
-            min_interval: Duration::from_secs(1),
-            max_interval: Duration::from_secs(600),
-            target_overhead_ratio: 0.1,
-            smoothing_alpha: 0.5,
-        });
+        let config = CheckpointConfig {
+            adaptive: Some(AdaptiveCheckpointConfig {
+                min_interval: Duration::from_secs(1),
+                max_interval: Duration::from_secs(600),
+                target_overhead_ratio: 0.1,
+                smoothing_alpha: 0.5,
+            }),
+            ..CheckpointConfig::default()
+        };
         let mut coord = CheckpointCoordinator::new(config, store);
 
         // First observation: 1000ms → EMA = 1000 (cold start)
