@@ -5,9 +5,11 @@
 //! with the highest version timestamp <= the stream row's event time.
 
 use std::collections::hash_map::DefaultHasher;
-use std::collections::{BTreeMap, HashMap, HashSet};
+use std::collections::BTreeMap;
 use std::hash::{Hash, Hasher};
 use std::sync::Arc;
+
+use rustc_hash::{FxHashMap, FxHashSet};
 
 use arrow::array::{
     Array, ArrayRef, Float64Array, Int64Array, RecordBatch, StringArray, TimestampMillisecondArray,
@@ -165,8 +167,8 @@ pub(crate) fn execute_temporal_join_batch(
 
     // Build table index: key_hash -> BTreeMap<version_ts, row_index>
     // BTreeMap ensures we can efficiently find the most recent version <= lookup_ts
-    let mut table_index: HashMap<u64, BTreeMap<i64, usize>> =
-        HashMap::with_capacity(table.num_rows());
+    let mut table_index: FxHashMap<u64, BTreeMap<i64, usize>> =
+        FxHashMap::with_capacity_and_hasher(table.num_rows(), rustc_hash::FxBuildHasher);
     let table_keys_col;
     if table.num_rows() > 0 {
         table_keys_col = Some(extract_key_column(&table, &config.table_key_column)?);
@@ -239,7 +241,7 @@ fn build_temporal_output_schema(
         .map(|f| f.as_ref().clone())
         .collect();
 
-    let stream_names: HashSet<&str> = stream_schema
+    let stream_names: FxHashSet<&str> = stream_schema
         .fields()
         .iter()
         .map(|f| f.name().as_str())

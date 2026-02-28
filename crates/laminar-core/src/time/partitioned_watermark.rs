@@ -46,8 +46,9 @@
 //! assert_eq!(tracker.current_watermark(), Some(Watermark::new(4000)));
 //! ```
 
-use std::collections::HashMap;
 use std::time::{Duration, Instant};
+
+use rustc_hash::FxHashMap;
 
 use super::Watermark;
 
@@ -219,7 +220,7 @@ pub enum WatermarkError {
 #[derive(Debug)]
 pub struct PartitionedWatermarkTracker {
     /// Per-partition state, keyed by `PartitionId`
-    partitions: HashMap<PartitionId, PartitionWatermarkState>,
+    partitions: FxHashMap<PartitionId, PartitionWatermarkState>,
 
     /// Number of partitions per source (for bounds checking)
     source_partition_counts: Vec<usize>,
@@ -242,7 +243,7 @@ impl PartitionedWatermarkTracker {
     #[must_use]
     pub fn new() -> Self {
         Self {
-            partitions: HashMap::new(),
+            partitions: FxHashMap::default(),
             source_partition_counts: Vec::new(),
             combined_watermark: i64::MIN,
             idle_timeout: Self::DEFAULT_IDLE_TIMEOUT,
@@ -254,7 +255,7 @@ impl PartitionedWatermarkTracker {
     #[must_use]
     pub fn with_idle_timeout(idle_timeout: Duration) -> Self {
         Self {
-            partitions: HashMap::new(),
+            partitions: FxHashMap::default(),
             source_partition_counts: Vec::new(),
             combined_watermark: i64::MIN,
             idle_timeout,

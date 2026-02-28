@@ -3,8 +3,9 @@
 //! Tracks pending operations and routes completions to the appropriate
 //! handlers based on their ring affinity.
 
-use std::collections::HashMap;
 use std::time::Instant;
+
+use rustc_hash::FxHashMap;
 
 use super::affinity::{OperationType, RingAffinity};
 
@@ -136,7 +137,7 @@ impl RoutedCompletion {
 #[derive(Debug, Default)]
 pub struct CompletionRouter {
     /// Pending operations by `user_data`.
-    pending: HashMap<u64, PendingOperation>,
+    pending: FxHashMap<u64, PendingOperation>,
     /// Next `user_data` ID for operations without explicit IDs.
     next_id: u64,
 }
@@ -146,7 +147,7 @@ impl CompletionRouter {
     #[must_use]
     pub fn new() -> Self {
         Self {
-            pending: HashMap::new(),
+            pending: FxHashMap::default(),
             next_id: 0,
         }
     }

@@ -5,10 +5,10 @@
 
 use std::collections::hash_map::DefaultHasher;
 use std::collections::BTreeMap;
-use std::collections::HashMap;
-use std::collections::HashSet;
 use std::hash::{Hash, Hasher};
 use std::sync::Arc;
+
+use rustc_hash::{FxHashMap, FxHashSet};
 
 use arrow::array::{
     Array, ArrayRef, Float64Array, Int64Array, RecordBatch, StringArray, TimestampMillisecondArray,
@@ -128,8 +128,8 @@ pub(crate) fn execute_asof_join_batch(
 
     // Build right-side index: key_hash -> BTreeMap<timestamp, row_index>
     // Keyed by hash to avoid per-row String allocations.
-    let mut right_index: HashMap<u64, BTreeMap<i64, usize>> =
-        HashMap::with_capacity(right.num_rows());
+    let mut right_index: FxHashMap<u64, BTreeMap<i64, usize>> =
+        FxHashMap::with_capacity_and_hasher(right.num_rows(), rustc_hash::FxBuildHasher);
     let right_keys_col;
     if right.num_rows() > 0 {
         right_keys_col = Some(extract_key_column(&right, &config.key_column)?);
@@ -287,7 +287,7 @@ fn build_output_schema(
         .map(|f| f.as_ref().clone())
         .collect();
 
-    let left_names: HashSet<&str> = left_schema
+    let left_names: FxHashSet<&str> = left_schema
         .fields()
         .iter()
         .map(|f| f.name().as_str())
