@@ -6,8 +6,10 @@
 //! `Accumulator`s for aggregation. This eliminates the duplicated window
 //! assignment logic in `IncrementalEowcState`.
 //!
-use std::collections::{BTreeMap, HashMap};
+use std::collections::BTreeMap;
 use std::sync::Arc;
+
+use ahash::AHashMap;
 
 use arrow::array::ArrayRef;
 use arrow::compute;
@@ -93,9 +95,9 @@ pub(crate) struct CoreWindowState {
     /// Per-window aggregate state: `window_start` -> per-group accumulators.
     /// Used by tumbling and hopping assigners.
     #[allow(clippy::type_complexity)]
-    windows: BTreeMap<i64, HashMap<Vec<ScalarValue>, Vec<Box<dyn datafusion_expr::Accumulator>>>>,
+    windows: BTreeMap<i64, AHashMap<Vec<ScalarValue>, Vec<Box<dyn datafusion_expr::Accumulator>>>>,
     /// Per-group session state. Only populated for session windows.
-    session_groups: HashMap<Vec<ScalarValue>, SessionGroupState>,
+    session_groups: AHashMap<Vec<ScalarValue>, SessionGroupState>,
     agg_specs: Vec<AggFuncSpec>,
     num_group_cols: usize,
     #[allow(dead_code)]
@@ -329,7 +331,7 @@ impl CoreWindowState {
         Ok(Some(Self {
             assigner,
             windows: BTreeMap::new(),
-            session_groups: HashMap::new(),
+            session_groups: AHashMap::new(),
             agg_specs,
             num_group_cols,
             group_col_names,
@@ -765,7 +767,7 @@ impl CoreWindowState {
         &self,
         window_start: i64,
         window_end: i64,
-        mut groups: HashMap<Vec<ScalarValue>, Vec<Box<dyn datafusion_expr::Accumulator>>>,
+        mut groups: AHashMap<Vec<ScalarValue>, Vec<Box<dyn datafusion_expr::Accumulator>>>,
     ) -> Result<Option<RecordBatch>, DbError> {
         let num_rows = groups.len();
         if num_rows == 0 {
@@ -946,7 +948,7 @@ impl CoreWindowState {
         self.windows.clear();
         let mut total_groups = 0usize;
         for wc in &checkpoint.windows {
-            let mut groups = HashMap::new();
+            let mut groups = AHashMap::new();
             for gc in &wc.groups {
                 let key: Result<Vec<ScalarValue>, _> = gc.key.iter().map(json_to_scalar).collect();
                 let key = key?;
@@ -1088,7 +1090,7 @@ mod tests {
         CoreWindowState {
             assigner: CoreWindowAssigner::Tumbling(TumblingWindowAssigner::from_millis(size_ms)),
             windows: BTreeMap::new(),
-            session_groups: HashMap::new(),
+            session_groups: AHashMap::new(),
             agg_specs,
             num_group_cols: 1,
             group_col_names: vec!["symbol".to_string()],
@@ -1140,7 +1142,7 @@ mod tests {
         CoreWindowState {
             assigner: CoreWindowAssigner::Tumbling(TumblingWindowAssigner::from_millis(size_ms)),
             windows: BTreeMap::new(),
-            session_groups: HashMap::new(),
+            session_groups: AHashMap::new(),
             agg_specs,
             num_group_cols: 1,
             group_col_names: vec!["symbol".to_string()],
@@ -1181,7 +1183,7 @@ mod tests {
                 size_ms, slide_ms,
             )),
             windows: BTreeMap::new(),
-            session_groups: HashMap::new(),
+            session_groups: AHashMap::new(),
             agg_specs,
             num_group_cols: 1,
             group_col_names: vec!["symbol".to_string()],
@@ -1220,7 +1222,7 @@ mod tests {
         CoreWindowState {
             assigner: CoreWindowAssigner::Session { gap_ms },
             windows: BTreeMap::new(),
-            session_groups: HashMap::new(),
+            session_groups: AHashMap::new(),
             agg_specs,
             num_group_cols: 1,
             group_col_names: vec!["symbol".to_string()],

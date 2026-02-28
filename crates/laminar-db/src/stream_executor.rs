@@ -11,6 +11,8 @@
 use std::collections::{HashMap, HashSet, VecDeque};
 use std::sync::Arc;
 
+use rustc_hash::{FxHashMap, FxHashSet};
+
 use arrow::array::RecordBatch;
 use arrow::datatypes::{DataType, SchemaRef};
 use datafusion::prelude::SessionContext;
@@ -207,27 +209,27 @@ pub(crate) struct StreamExecutor {
     /// has no data in a given cycle, preventing `DataFusion` planning errors.
     source_schemas: HashMap<String, SchemaRef>,
     /// Per-query EOWC accumulation state, keyed by query index.
-    eowc_states: HashMap<usize, EowcState>,
+    eowc_states: FxHashMap<usize, EowcState>,
     /// Per-query incremental aggregation state, keyed by query index.
     /// Initialized lazily on first cycle when the logical plan reveals
     /// the query contains a GROUP BY / aggregate.
-    agg_states: HashMap<usize, IncrementalAggState>,
+    agg_states: FxHashMap<usize, IncrementalAggState>,
     /// Set of query indices that have been checked for aggregation but
     /// found not to be aggregate queries (avoids re-checking).
-    non_agg_queries: HashSet<usize>,
+    non_agg_queries: FxHashSet<usize>,
     /// Per-query incremental EOWC aggregation state, keyed by query index.
     /// Initialized lazily on first EOWC cycle when the logical plan reveals
     /// the query contains a GROUP BY / aggregate.
-    eowc_agg_states: HashMap<usize, IncrementalEowcState>,
+    eowc_agg_states: FxHashMap<usize, IncrementalEowcState>,
     /// Set of EOWC query indices that have been checked for aggregation but
     /// found not to be aggregate queries (fall back to raw-batch path).
-    non_eowc_agg_queries: HashSet<usize>,
+    non_eowc_agg_queries: FxHashSet<usize>,
     /// Per-query core window pipeline state for tumbling-window aggregates.
     /// Initialized lazily on first EOWC cycle when the query qualifies.
-    core_window_states: HashMap<usize, CoreWindowState>,
+    core_window_states: FxHashMap<usize, CoreWindowState>,
     /// Set of EOWC query indices that were checked for core window routing but
     /// found not to qualify (fall through to `IncrementalEowcState`).
-    non_core_window_queries: HashSet<usize>,
+    non_core_window_queries: FxHashSet<usize>,
     /// Pending checkpoint data for deferred restore. Held until agg states
     /// are lazily initialized, then applied and cleared.
     pending_restore: Option<crate::aggregate_state::StreamExecutorCheckpoint>,
@@ -247,13 +249,13 @@ impl StreamExecutor {
             topo_order: Vec::new(),
             topo_dirty: true,
             source_schemas: HashMap::new(),
-            eowc_states: HashMap::new(),
-            agg_states: HashMap::new(),
-            non_agg_queries: HashSet::new(),
-            eowc_agg_states: HashMap::new(),
-            non_eowc_agg_queries: HashSet::new(),
-            core_window_states: HashMap::new(),
-            non_core_window_queries: HashSet::new(),
+            eowc_states: FxHashMap::default(),
+            agg_states: FxHashMap::default(),
+            non_agg_queries: FxHashSet::default(),
+            eowc_agg_states: FxHashMap::default(),
+            non_eowc_agg_queries: FxHashSet::default(),
+            core_window_states: FxHashMap::default(),
+            non_core_window_queries: FxHashSet::default(),
             pending_restore: None,
             cycle_results: HashMap::new(),
             cycle_intermediates: Vec::new(),
