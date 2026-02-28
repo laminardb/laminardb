@@ -327,6 +327,14 @@ impl RecoveryManager {
                     warn!(position, "CRC mismatch detected, stopping replay");
                     break;
                 }
+                Ok(WalReadResult::Corrupted { position, reason }) => {
+                    warn!(
+                        position,
+                        reason,
+                        "[LDB-6006] Corrupted WAL entry detected, stopping replay"
+                    );
+                    break;
+                }
                 Err(e) => {
                     return Err(IncrementalCheckpointError::Wal(format!(
                         "WAL read error: {e}"

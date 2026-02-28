@@ -625,8 +625,16 @@ impl CheckpointCoordinator {
             self.checkpoints_failed += 1;
             let duration = start.elapsed();
             self.emit_checkpoint_metrics(false, epoch, duration);
-            let _ = self.rollback_sinks(epoch).await;
-            error!(checkpoint_id, epoch, error = %e, "manifest persist failed");
+            if let Err(rollback_err) = self.rollback_sinks(epoch).await {
+                error!(
+                    checkpoint_id,
+                    epoch,
+                    error = %rollback_err,
+                    "[LDB-6004] sink rollback failed after manifest persist failure — \
+                     sinks may be in an inconsistent state"
+                );
+            }
+            error!(checkpoint_id, epoch, error = %e, "[LDB-6008] manifest persist failed");
             return Ok(CheckpointResult {
                 success: false,
                 checkpoint_id,
@@ -1097,8 +1105,16 @@ impl CheckpointCoordinator {
             self.checkpoints_failed += 1;
             let duration = start.elapsed();
             self.emit_checkpoint_metrics(false, epoch, duration);
-            let _ = self.rollback_sinks(epoch).await;
-            error!(checkpoint_id, epoch, error = %e, "manifest persist failed");
+            if let Err(rollback_err) = self.rollback_sinks(epoch).await {
+                error!(
+                    checkpoint_id,
+                    epoch,
+                    error = %rollback_err,
+                    "[LDB-6004] sink rollback failed after manifest persist failure — \
+                     sinks may be in an inconsistent state"
+                );
+            }
+            error!(checkpoint_id, epoch, error = %e, "[LDB-6008] manifest persist failed");
             return Ok(CheckpointResult {
                 success: false,
                 checkpoint_id,

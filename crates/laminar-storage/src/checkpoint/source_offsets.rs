@@ -216,7 +216,13 @@ impl SourcePosition {
 
         match connector_type {
             "kafka" => {
-                let group_id = cp.metadata.get("group_id").cloned().unwrap_or_default();
+                let group_id = cp.metadata.get("group_id").cloned().unwrap_or_else(|| {
+                    tracing::warn!(
+                        "[LDB-6011] Kafka source checkpoint missing 'group_id' metadata; \
+                         defaulting to empty — offset recovery may use wrong consumer group"
+                    );
+                    String::new()
+                });
                 let mut partitions = Vec::new();
                 for (key, value) in &cp.offsets {
                     // Keys are "topic-partition"
@@ -241,7 +247,13 @@ impl SourcePosition {
             "postgres_cdc" => {
                 let confirmed_flush_lsn = cp.offsets.get("confirmed_flush_lsn")?.clone();
                 let write_lsn = cp.offsets.get("write_lsn").cloned();
-                let slot_name = cp.metadata.get("slot_name").cloned().unwrap_or_default();
+                let slot_name = cp.metadata.get("slot_name").cloned().unwrap_or_else(|| {
+                    tracing::warn!(
+                        "[LDB-6011] Postgres CDC checkpoint missing 'slot_name' metadata; \
+                         defaulting to empty — replication slot recovery may fail"
+                    );
+                    String::new()
+                });
                 Some(Self::PostgresCdc(PostgresCdcPosition {
                     confirmed_flush_lsn,
                     write_lsn,

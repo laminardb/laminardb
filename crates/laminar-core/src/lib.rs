@@ -36,6 +36,8 @@
 
 /// Cross-partition aggregation.
 pub mod aggregation;
+/// Structured error code registry (`LDB-NNNN`) and Ring 0 hot path error type.
+pub mod error_codes;
 pub mod alloc;
 pub mod budget;
 /// Distributed checkpoint barrier protocol.

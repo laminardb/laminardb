@@ -326,7 +326,14 @@ pub fn column_value_to_json(value: &ColumnValue) -> serde_json::Value {
             }
         }
         ColumnValue::Timestamp(us) => serde_json::json!(us),
-        ColumnValue::Json(s) => serde_json::from_str(s).unwrap_or_else(|_| serde_json::json!(s)),
+        ColumnValue::Json(s) => serde_json::from_str(s).unwrap_or_else(|e| {
+            tracing::warn!(
+                error = %e,
+                json_len = s.len(),
+                "[LDB-4003] MySQL CDC JSON column parse failed, treating as string literal"
+            );
+            serde_json::json!(s)
+        }),
     }
 }
 
