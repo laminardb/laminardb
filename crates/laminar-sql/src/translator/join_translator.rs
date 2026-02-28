@@ -97,7 +97,7 @@ pub struct AsofJoinTranslatorConfig {
     pub left_time_column: String,
     /// Right side time column
     pub right_time_column: String,
-    /// Join direction (Backward or Forward)
+    /// Join direction (Backward, Forward, or Nearest)
     pub direction: AsofSqlDirection,
     /// Maximum allowed time difference
     pub tolerance: Option<Duration>,

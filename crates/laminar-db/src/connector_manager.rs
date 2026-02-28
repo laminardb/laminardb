@@ -230,6 +230,8 @@ pub struct ConnectorManager {
     sinks: HashMap<String, SinkRegistration>,
     streams: HashMap<String, StreamRegistration>,
     tables: HashMap<String, TableRegistration>,
+    /// Original DDL text for SHOW CREATE statements, keyed by object name.
+    ddl_store: HashMap<String, String>,
 }
 
 impl ConnectorManager {
@@ -240,7 +242,18 @@ impl ConnectorManager {
             sinks: HashMap::new(),
             streams: HashMap::new(),
             tables: HashMap::new(),
+            ddl_store: HashMap::new(),
         }
+    }
+
+    /// Store original DDL text for an object.
+    pub fn store_ddl(&mut self, name: &str, ddl: &str) {
+        self.ddl_store.insert(name.to_string(), ddl.to_string());
+    }
+
+    /// Retrieve stored DDL text for an object.
+    pub fn get_ddl(&self, name: &str) -> Option<&str> {
+        self.ddl_store.get(name).map(String::as_str)
     }
 
     /// Register a source from DDL.
@@ -359,6 +372,7 @@ impl ConnectorManager {
         self.sinks.clear();
         self.streams.clear();
         self.tables.clear();
+        self.ddl_store.clear();
     }
 }
 
@@ -375,6 +389,7 @@ impl std::fmt::Debug for ConnectorManager {
             .field("sinks", &self.sinks.len())
             .field("streams", &self.streams.len())
             .field("tables", &self.tables.len())
+            .field("ddl_entries", &self.ddl_store.len())
             .finish()
     }
 }

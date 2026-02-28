@@ -111,6 +111,8 @@ pub struct SlidingWindowAssigner {
     slide_ms: i64,
     /// Number of windows per event (cached for performance)
     windows_per_event: usize,
+    /// Offset in milliseconds for timezone-aligned windows
+    offset_ms: i64,
 }
 
 impl SlidingWindowAssigner {
@@ -149,6 +151,7 @@ impl SlidingWindowAssigner {
             size_ms,
             slide_ms,
             windows_per_event,
+            offset_ms: 0,
         }
     }
 
@@ -175,7 +178,15 @@ impl SlidingWindowAssigner {
             size_ms,
             slide_ms,
             windows_per_event,
+            offset_ms: 0,
         }
+    }
+
+    /// Set window offset in milliseconds.
+    #[must_use]
+    pub fn with_offset_ms(mut self, offset_ms: i64) -> Self {
+        self.offset_ms = offset_ms;
+        self
     }
 
     /// Returns the window size in milliseconds.
@@ -196,18 +207,27 @@ impl SlidingWindowAssigner {
         self.windows_per_event
     }
 
+    /// Returns the window offset in milliseconds.
+    #[must_use]
+    pub fn offset_ms(&self) -> i64 {
+        self.offset_ms
+    }
+
     /// Computes the last window start that could contain this timestamp.
     ///
     /// This is the window with the largest start time where start <= timestamp.
+    /// When an offset is set, window boundaries are shifted accordingly.
     #[inline]
     fn last_window_start(&self, timestamp: i64) -> i64 {
-        if timestamp >= 0 {
-            (timestamp / self.slide_ms) * self.slide_ms
+        let adjusted = timestamp - self.offset_ms;
+        let base = if adjusted >= 0 {
+            (adjusted / self.slide_ms) * self.slide_ms
         } else {
             // For negative timestamps, use floor division with saturating arithmetic
-            (timestamp.saturating_sub(self.slide_ms).saturating_add(1) / self.slide_ms)
+            (adjusted.saturating_sub(self.slide_ms).saturating_add(1) / self.slide_ms)
                 * self.slide_ms
-        }
+        };
+        base + self.offset_ms
     }
 }
 
@@ -1979,5 +1999,28 @@ mod tests {
                 w.end
             );
         }
+    }
+
+    #[test]
+    fn test_sliding_window_with_offset() {
+        // 60s window, 30s slide, 15s offset
+        let assigner = SlidingWindowAssigner::from_millis(60_000, 30_000).with_offset_ms(15_000);
+
+        // ts=45_000 → adjusted = 30_000
+        // last_window_start: floor(30_000 / 30_000) * 30_000 = 30_000 + 15_000 = 45_000
+        let windows = assigner.assign_windows(45_000);
+        assert!(!windows.is_empty());
+        // All windows should contain the timestamp
+        for w in &windows {
+            assert!(
+                w.start <= 45_000 && w.end > 45_000,
+                "Window [{}, {}) should contain 45000",
+                w.start,
+                w.end
+            );
+        }
+        // With offset 15s, windows start at 15_000, 45_000, etc.
+        // Windows containing 45_000: [45_000, 105_000) and [15_000, 75_000)
+        assert_eq!(windows.len(), 2);
     }
 }

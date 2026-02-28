@@ -45,6 +45,8 @@ pub struct WindowOperatorConfig {
     pub slide: Option<Duration>,
     /// Gap interval for session windows
     pub gap: Option<Duration>,
+    /// Window offset in milliseconds for timezone-aligned windows
+    pub offset_ms: i64,
     /// Maximum allowed lateness for late events
     pub allowed_lateness: Duration,
     /// Emit strategy (when to output results)
@@ -133,6 +135,7 @@ impl WindowOperatorConfig {
             size,
             slide: None,
             gap: None,
+            offset_ms: 0,
             allowed_lateness: Duration::ZERO,
             emit_strategy: EmitStrategy::OnWatermark,
             late_data_side_output: None,
@@ -148,6 +151,7 @@ impl WindowOperatorConfig {
             size,
             slide: Some(slide),
             gap: None,
+            offset_ms: 0,
             allowed_lateness: Duration::ZERO,
             emit_strategy: EmitStrategy::OnWatermark,
             late_data_side_output: None,
@@ -163,6 +167,7 @@ impl WindowOperatorConfig {
             size: Duration::ZERO, // Not used for session windows
             slide: None,
             gap: Some(gap),
+            offset_ms: 0,
             allowed_lateness: Duration::ZERO,
             emit_strategy: EmitStrategy::OnWatermark,
             late_data_side_output: None,
@@ -181,10 +186,18 @@ impl WindowOperatorConfig {
             size: max_size,
             slide: Some(step),
             gap: None,
+            offset_ms: 0,
             allowed_lateness: Duration::ZERO,
             emit_strategy: EmitStrategy::OnWatermark,
             late_data_side_output: None,
         }
+    }
+
+    /// Set window offset in milliseconds.
+    #[must_use]
+    pub fn with_offset_ms(mut self, offset_ms: i64) -> Self {
+        self.offset_ms = offset_ms;
+        self
     }
 
     /// Build configuration from a parsed `WindowFunction`.
@@ -200,18 +213,31 @@ impl WindowOperatorConfig {
         })?;
 
         match window {
-            WindowFunction::Tumble { interval, .. } => {
+            WindowFunction::Tumble {
+                interval, offset, ..
+            } => {
                 let size = WindowRewriter::parse_interval_to_duration(interval)?;
-                Ok(Self::tumbling(time_column, size))
+                let mut config = Self::tumbling(time_column, size);
+                if let Some(ref off) = offset {
+                    let off_dur = WindowRewriter::parse_interval_to_duration(off)?;
+                    config.offset_ms = i64::try_from(off_dur.as_millis()).unwrap_or(0);
+                }
+                Ok(config)
             }
             WindowFunction::Hop {
                 slide_interval,
                 window_interval,
+                offset,
                 ..
             } => {
                 let size = WindowRewriter::parse_interval_to_duration(window_interval)?;
                 let slide = WindowRewriter::parse_interval_to_duration(slide_interval)?;
-                Ok(Self::sliding(time_column, size, slide))
+                let mut config = Self::sliding(time_column, size, slide);
+                if let Some(ref off) = offset {
+                    let off_dur = WindowRewriter::parse_interval_to_duration(off)?;
+                    config.offset_ms = i64::try_from(off_dur.as_millis()).unwrap_or(0);
+                }
+                Ok(config)
             }
             WindowFunction::Session { gap_interval, .. } => {
                 let gap = WindowRewriter::parse_interval_to_duration(gap_interval)?;
@@ -343,6 +369,7 @@ mod tests {
         WindowFunction::Tumble {
             time_column: Box::new(Expr::Identifier(Ident::new("event_time"))),
             interval: Box::new(Expr::Identifier(Ident::new("5 MINUTE"))),
+            offset: None,
         }
     }
 

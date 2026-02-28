@@ -47,7 +47,10 @@ impl TumbleWindowStart {
     #[must_use]
     pub fn new() -> Self {
         Self {
-            signature: Signature::new(TypeSignature::Any(2), Volatility::Immutable),
+            signature: Signature::new(
+                TypeSignature::OneOf(vec![TypeSignature::Any(2), TypeSignature::Any(3)]),
+                Volatility::Immutable,
+            ),
         }
     }
 }
@@ -91,9 +94,9 @@ impl ScalarUDFImpl for TumbleWindowStart {
 
     fn invoke_with_args(&self, args: ScalarFunctionArgs) -> Result<ColumnarValue> {
         let ScalarFunctionArgs { args, .. } = args;
-        if args.len() != 2 {
+        if args.len() < 2 || args.len() > 3 {
             return Err(DataFusionError::Plan(
-                "tumble() requires exactly 2 arguments: (timestamp, interval)".to_string(),
+                "tumble() requires 2-3 arguments: (timestamp, interval [, offset])".to_string(),
             ));
         }
         let interval_ms = extract_interval_ms(&args[1])?;
@@ -102,7 +105,12 @@ impl ScalarUDFImpl for TumbleWindowStart {
                 "tumble() interval must be positive".to_string(),
             ));
         }
-        compute_tumble(&args[0], interval_ms)
+        let offset_ms = if args.len() == 3 {
+            extract_interval_ms(&args[2])?
+        } else {
+            0
+        };
+        compute_tumble_with_offset(&args[0], interval_ms, offset_ms)
     }
 }
 
@@ -133,7 +141,10 @@ impl HopWindowStart {
     #[must_use]
     pub fn new() -> Self {
         Self {
-            signature: Signature::new(TypeSignature::Any(3), Volatility::Immutable),
+            signature: Signature::new(
+                TypeSignature::OneOf(vec![TypeSignature::Any(3), TypeSignature::Any(4)]),
+                Volatility::Immutable,
+            ),
         }
     }
 }
@@ -177,9 +188,9 @@ impl ScalarUDFImpl for HopWindowStart {
 
     fn invoke_with_args(&self, args: ScalarFunctionArgs) -> Result<ColumnarValue> {
         let ScalarFunctionArgs { args, .. } = args;
-        if args.len() != 3 {
+        if args.len() < 3 || args.len() > 4 {
             return Err(DataFusionError::Plan(
-                "hop() requires exactly 3 arguments: (timestamp, slide, size)".to_string(),
+                "hop() requires 3-4 arguments: (timestamp, slide, size [, offset])".to_string(),
             ));
         }
         let slide_ms = extract_interval_ms(&args[1])?;
@@ -189,7 +200,12 @@ impl ScalarUDFImpl for HopWindowStart {
                 "hop() slide and size must be positive".to_string(),
             ));
         }
-        compute_hop(&args[0], slide_ms, size_ms)
+        let offset_ms = if args.len() == 4 {
+            extract_interval_ms(&args[3])?
+        } else {
+            0
+        };
+        compute_hop_with_offset(&args[0], slide_ms, size_ms, offset_ms)
     }
 }
 
@@ -473,6 +489,74 @@ fn compute_tumble_array(array: &ArrayRef, interval_ms: i64) -> Result<ArrayRef> 
     }
 }
 
+/// Computes tumble window start with offset for a `ColumnarValue`.
+fn compute_tumble_with_offset(
+    value: &ColumnarValue,
+    interval_ms: i64,
+    offset_ms: i64,
+) -> Result<ColumnarValue> {
+    if offset_ms == 0 {
+        return compute_tumble(value, interval_ms);
+    }
+    match value {
+        ColumnarValue::Array(array) => {
+            let result = compute_tumble_array_with_offset(array, interval_ms, offset_ms)?;
+            Ok(ColumnarValue::Array(result))
+        }
+        ColumnarValue::Scalar(scalar) => {
+            let ts_ms = scalar_to_timestamp_ms(scalar)?;
+            let window_start = ts_ms.map(|ts| {
+                let adj = ts - offset_ms;
+                (adj - adj.rem_euclid(interval_ms)) + offset_ms
+            });
+            Ok(ColumnarValue::Scalar(ScalarValue::TimestampMillisecond(
+                window_start,
+                None,
+            )))
+        }
+    }
+}
+
+/// Computes tumble window start with offset for an array of timestamps.
+fn compute_tumble_array_with_offset(
+    array: &ArrayRef,
+    interval_ms: i64,
+    offset_ms: i64,
+) -> Result<ArrayRef> {
+    match array.data_type() {
+        DataType::Timestamp(TimeUnit::Millisecond, _) => {
+            let input = array.as_primitive::<TimestampMillisecondType>();
+            let result: TimestampMillisecondArray = input
+                .iter()
+                .map(|opt_ts| {
+                    opt_ts.map(|ts| {
+                        let adj = ts - offset_ms;
+                        (adj - adj.rem_euclid(interval_ms)) + offset_ms
+                    })
+                })
+                .collect();
+            Ok(Arc::new(result))
+        }
+        DataType::Int64 => {
+            let input = array.as_primitive::<Int64Type>();
+            let result: TimestampMillisecondArray = input
+                .iter()
+                .map(|opt_ts| {
+                    opt_ts.map(|ts| {
+                        let adj = ts - offset_ms;
+                        (adj - adj.rem_euclid(interval_ms)) + offset_ms
+                    })
+                })
+                .collect();
+            Ok(Arc::new(result))
+        }
+        other => Err(DataFusionError::Plan(format!(
+            "Unsupported timestamp type for tumble(): {other:?}. \
+             Use TimestampMillisecond or Int64."
+        ))),
+    }
+}
+
 /// Computes hop (earliest) window start for a `ColumnarValue`.
 fn compute_hop(value: &ColumnarValue, slide_ms: i64, size_ms: i64) -> Result<ColumnarValue> {
     match value {
@@ -525,6 +609,70 @@ fn compute_hop_array(array: &ArrayRef, slide_ms: i64, size_ms: i64) -> Result<Ar
 fn hop_earliest_start(ts: i64, slide_ms: i64, size_ms: i64) -> i64 {
     let adjusted = ts - size_ms + slide_ms;
     adjusted - adjusted.rem_euclid(slide_ms)
+}
+
+/// Computes hop (earliest) window start with offset.
+fn compute_hop_with_offset(
+    value: &ColumnarValue,
+    slide_ms: i64,
+    size_ms: i64,
+    offset_ms: i64,
+) -> Result<ColumnarValue> {
+    if offset_ms == 0 {
+        return compute_hop(value, slide_ms, size_ms);
+    }
+    match value {
+        ColumnarValue::Array(array) => {
+            let result = compute_hop_array_with_offset(array, slide_ms, size_ms, offset_ms)?;
+            Ok(ColumnarValue::Array(result))
+        }
+        ColumnarValue::Scalar(scalar) => {
+            let ts_ms = scalar_to_timestamp_ms(scalar)?;
+            let window_start =
+                ts_ms.map(|ts| hop_earliest_start(ts - offset_ms, slide_ms, size_ms) + offset_ms);
+            Ok(ColumnarValue::Scalar(ScalarValue::TimestampMillisecond(
+                window_start,
+                None,
+            )))
+        }
+    }
+}
+
+/// Computes hop window start with offset for an array.
+fn compute_hop_array_with_offset(
+    array: &ArrayRef,
+    slide_ms: i64,
+    size_ms: i64,
+    offset_ms: i64,
+) -> Result<ArrayRef> {
+    match array.data_type() {
+        DataType::Timestamp(TimeUnit::Millisecond, _) => {
+            let input = array.as_primitive::<TimestampMillisecondType>();
+            let result: TimestampMillisecondArray = input
+                .iter()
+                .map(|opt_ts| {
+                    opt_ts
+                        .map(|ts| hop_earliest_start(ts - offset_ms, slide_ms, size_ms) + offset_ms)
+                })
+                .collect();
+            Ok(Arc::new(result))
+        }
+        DataType::Int64 => {
+            let input = array.as_primitive::<Int64Type>();
+            let result: TimestampMillisecondArray = input
+                .iter()
+                .map(|opt_ts| {
+                    opt_ts
+                        .map(|ts| hop_earliest_start(ts - offset_ms, slide_ms, size_ms) + offset_ms)
+                })
+                .collect();
+            Ok(Arc::new(result))
+        }
+        other => Err(DataFusionError::Plan(format!(
+            "Unsupported timestamp type for hop(): {other:?}. \
+             Use TimestampMillisecond or Int64."
+        ))),
+    }
 }
 
 /// Converts a timestamp array to `TimestampMillisecond` for consistent output.

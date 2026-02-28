@@ -2768,3 +2768,37 @@ fn test_changelog_retraction_pair() {
         "Second record should be Insert (new value)"
     );
 }
+
+#[test]
+fn test_tumbling_window_with_offset() {
+    // 1-hour windows (3_600_000ms) with 30-minute offset (1_800_000ms)
+    // Without offset: windows are [0, 3600000), [3600000, 7200000), ...
+    // With offset: windows are [1800000, 5400000), [5400000, 9000000), ...
+    let assigner = TumblingWindowAssigner::from_millis(3_600_000).with_offset_ms(1_800_000);
+
+    // Timestamp 2_000_000 (33min) → with offset, adjusted = 200_000
+    // floor(200_000 / 3_600_000) * 3_600_000 = 0 + offset = 1_800_000
+    let w = assigner.assign(2_000_000);
+    assert_eq!(w.start, 1_800_000);
+    assert_eq!(w.end, 5_400_000);
+
+    // Timestamp 5_000_000 → adjusted = 3_200_000
+    // floor(3_200_000 / 3_600_000) * 3_600_000 = 0 + offset = 1_800_000
+    let w = assigner.assign(5_000_000);
+    assert_eq!(w.start, 1_800_000);
+    assert_eq!(w.end, 5_400_000);
+
+    // Timestamp 5_500_000 → adjusted = 3_700_000
+    // floor(3_700_000 / 3_600_000) * 3_600_000 = 3_600_000 + offset = 5_400_000
+    let w = assigner.assign(5_500_000);
+    assert_eq!(w.start, 5_400_000);
+    assert_eq!(w.end, 9_000_000);
+}
+
+#[test]
+fn test_tumbling_window_zero_offset_unchanged() {
+    let assigner = TumblingWindowAssigner::from_millis(60_000).with_offset_ms(0);
+    let w = assigner.assign(90_000);
+    assert_eq!(w.start, 60_000);
+    assert_eq!(w.end, 120_000);
+}

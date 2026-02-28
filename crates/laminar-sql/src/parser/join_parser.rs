@@ -9,7 +9,8 @@
 use std::time::Duration;
 
 use sqlparser::ast::{
-    BinaryOperator, Expr, JoinConstraint, JoinOperator, Select, TableFactor, TableVersion,
+    BinaryOperator, Expr, FunctionArg, FunctionArgExpr, FunctionArguments, JoinConstraint,
+    JoinOperator, Select, TableFactor, TableVersion,
 };
 
 use super::window_rewriter::WindowRewriter;
@@ -45,6 +46,8 @@ pub enum AsofSqlDirection {
     Backward,
     /// `left.ts <= right.ts` — find next right row
     Forward,
+    /// Match by minimum absolute time difference
+    Nearest,
 }
 
 impl std::fmt::Display for AsofSqlDirection {
@@ -52,6 +55,7 @@ impl std::fmt::Display for AsofSqlDirection {
         match self {
             AsofSqlDirection::Backward => write!(f, "BACKWARD"),
             AsofSqlDirection::Forward => write!(f, "FORWARD"),
+            AsofSqlDirection::Nearest => write!(f, "NEAREST"),
         }
     }
 }
@@ -527,6 +531,23 @@ fn analyze_on_expression(
     }
 }
 
+/// Extract column reference from a function argument.
+fn extract_column_from_func_arg(arg: &FunctionArg) -> Option<String> {
+    let (FunctionArg::Unnamed(FunctionArgExpr::Expr(expr))
+    | FunctionArg::Named {
+        arg: FunctionArgExpr::Expr(expr),
+        ..
+    }
+    | FunctionArg::ExprNamed {
+        arg: FunctionArgExpr::Expr(expr),
+        ..
+    }) = arg
+    else {
+        return None;
+    };
+    extract_column_ref(expr)
+}
+
 /// Extract column reference from expression (e.g., "a.id" -> "id")
 fn extract_column_ref(expr: &Expr) -> Option<String> {
     match expr {
@@ -638,8 +659,42 @@ fn analyze_asof_direction(expr: &Expr) -> Result<(AsofSqlDirection, String, Stri
             })?;
             Ok((AsofSqlDirection::Forward, left_col, right_col))
         }
+        // NEAREST(left_col, right_col) — function-style syntax
+        Expr::Function(func) => {
+            let name = func.name.to_string().to_uppercase();
+            if name != "NEAREST" {
+                return Err(ParseError::StreamingError(format!(
+                    "Unknown ASOF MATCH_CONDITION function: {name}"
+                )));
+            }
+            let args = match &func.args {
+                FunctionArguments::List(arg_list) => &arg_list.args,
+                _ => {
+                    return Err(ParseError::StreamingError(
+                        "NEAREST() requires exactly 2 column arguments".to_string(),
+                    ))
+                }
+            };
+            if args.len() != 2 {
+                return Err(ParseError::StreamingError(format!(
+                    "NEAREST() requires exactly 2 arguments, got {}",
+                    args.len()
+                )));
+            }
+            let left_col = extract_column_from_func_arg(&args[0]).ok_or_else(|| {
+                ParseError::StreamingError(
+                    "Cannot extract left time column from NEAREST()".to_string(),
+                )
+            })?;
+            let right_col = extract_column_from_func_arg(&args[1]).ok_or_else(|| {
+                ParseError::StreamingError(
+                    "Cannot extract right time column from NEAREST()".to_string(),
+                )
+            })?;
+            Ok((AsofSqlDirection::Nearest, left_col, right_col))
+        }
         _ => Err(ParseError::StreamingError(
-            "ASOF MATCH_CONDITION must be >= or <= comparison".to_string(),
+            "ASOF MATCH_CONDITION must be >= or <= comparison, or NEAREST()".to_string(),
         )),
     }
 }
@@ -1065,6 +1120,21 @@ mod tests {
 
         assert!(analysis.is_asof_join);
         assert_eq!(analysis.asof_direction, Some(AsofSqlDirection::Forward));
+    }
+
+    #[test]
+    fn test_asof_join_nearest() {
+        let sql = "SELECT * FROM trades t \
+                    ASOF JOIN quotes q \
+                    MATCH_CONDITION(NEAREST(t.ts, q.ts)) \
+                    ON t.symbol = q.symbol";
+        let select = parse_select_snowflake(sql);
+        let analysis = analyze_join(&select).unwrap().unwrap();
+
+        assert!(analysis.is_asof_join);
+        assert_eq!(analysis.asof_direction, Some(AsofSqlDirection::Nearest));
+        assert_eq!(analysis.join_type, JoinType::AsOf);
+        assert!(analysis.asof_tolerance.is_none());
     }
 
     #[test]
