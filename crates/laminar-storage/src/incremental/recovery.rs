@@ -330,8 +330,7 @@ impl RecoveryManager {
                 Ok(WalReadResult::Corrupted { position, reason }) => {
                     warn!(
                         position,
-                        reason,
-                        "[LDB-6006] Corrupted WAL entry detected, stopping replay"
+                        reason, "[LDB-6006] Corrupted WAL entry detected, stopping replay"
                     );
                     break;
                 }

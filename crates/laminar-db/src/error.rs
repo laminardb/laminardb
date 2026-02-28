@@ -148,9 +148,9 @@ impl DbError {
             Self::DataFusion(_) => error_codes::QUERY_EXECUTION_FAILED,
             Self::SourceNotFound(_) => error_codes::SOURCE_NOT_FOUND,
             Self::SinkNotFound(_) => error_codes::SINK_NOT_FOUND,
-            Self::QueryNotFound(_)
-            | Self::StreamNotFound(_)
-            | Self::TableNotFound(_) => error_codes::SQL_TABLE_NOT_FOUND,
+            Self::QueryNotFound(_) | Self::StreamNotFound(_) | Self::TableNotFound(_) => {
+                error_codes::SQL_TABLE_NOT_FOUND
+            }
             Self::SourceAlreadyExists(_)
             | Self::StreamAlreadyExists(_)
             | Self::TableAlreadyExists(_) => error_codes::SOURCE_ALREADY_EXISTS,
