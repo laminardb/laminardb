@@ -126,12 +126,9 @@ impl RegisteredBufferPool {
     ///
     /// Returns an error if no buffers are available.
     pub fn acquire(&mut self) -> Result<(u16, &mut [u8]), IoUringError> {
-        let idx = match self.free_list.pop_front() {
-            Some(idx) => idx,
-            None => {
-                self.exhaustions += 1;
-                return Err(IoUringError::BufferPoolExhausted);
-            }
+        let Some(idx) = self.free_list.pop_front() else {
+            self.exhaustions += 1;
+            return Err(IoUringError::BufferPoolExhausted);
         };
 
         self.acquired_count += 1;
@@ -145,12 +142,9 @@ impl RegisteredBufferPool {
     /// Returns `None` if no buffers are available.
     #[must_use]
     pub fn try_acquire(&mut self) -> Option<(u16, &mut [u8])> {
-        let idx = match self.free_list.pop_front() {
-            Some(idx) => idx,
-            None => {
-                self.exhaustions += 1;
-                return None;
-            }
+        let Some(idx) = self.free_list.pop_front() else {
+            self.exhaustions += 1;
+            return None;
         };
         self.acquired_count += 1;
         self.acquisitions += 1;
