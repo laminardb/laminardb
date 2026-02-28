@@ -14,6 +14,9 @@ LaminarDB uses [Apache DataFusion](https://datafusion.apache.org/) as its SQL en
 | `FIRST(price)` / `LAST(price)` | `first_value(price)` / `last_value(price)` | DataFusion aggregate function names |
 | `ts - INTERVAL '10' SECOND` (on BIGINT) | `ts - 10000` | INTERVAL only works on TIMESTAMP types |
 | `CASE WHEN ... THEN vol ELSE 0` | `CASE WHEN ... THEN vol ELSE CAST(0 AS BIGINT)` | ELSE branch must match column type |
+| `SHOW TABLES` | `SHOW SOURCES` / `SHOW STREAMS` | LaminarDB uses source/stream terminology |
+| `date_trunc('hour', ts)` | `date_trunc('hour', ts)` | Available via DataFusion 52 built-ins |
+| `UNNEST(array_col)` | `UNNEST(array_col)` | Available via DataFusion 52 built-ins |
 
 ---
 
@@ -70,9 +73,21 @@ FROM trades
 GROUP BY symbol, tumble(ts, INTERVAL '5' SECOND)
 ```
 
+**Window offset for timezone alignment:**
+
+```sql
+-- Tumble with 8-hour offset (align to UTC+8 day boundaries)
+SELECT symbol,
+       CAST(tumble(ts, INTERVAL '1' HOUR, INTERVAL '8' HOUR) AS BIGINT) AS window_start,
+       COUNT(*) AS trade_count
+FROM trades
+GROUP BY symbol, tumble(ts, INTERVAL '1' HOUR, INTERVAL '8' HOUR)
+```
+
 **Key points:**
 - Use lowercase `tumble()` (not `TUMBLE()` — both work, but lowercase is canonical)
 - Extract window start with `CAST(tumble(...) AS BIGINT)` — there is no `TUMBLE_START()` function
+- Optional third argument for timezone offset alignment
 - Window closes when watermark passes window end
 
 ### HOP (Sliding windows)
@@ -160,6 +175,23 @@ ON t.symbol = r.symbol AND t.ts >= r.ts
 **Key points:**
 - Right source must have events preceding left source events
 - Useful for enrichment (e.g., matching trades to latest reference data)
+
+### ASOF NEAREST
+
+Match each row with the closest row by absolute time difference (forward or backward):
+
+```sql
+SELECT t.symbol,
+       t.price,
+       r.reference_price
+FROM trades t
+ASOF JOIN reference r
+ON t.symbol = r.symbol AND MATCH_CONDITION(NEAREST(t.ts, r.ts))
+```
+
+**Key points:**
+- Matches by minimum absolute time difference, not just preceding events
+- Useful when reference data may arrive slightly before or after the trade
 
 ---
 
@@ -257,6 +289,36 @@ source.watermark(current_ts + 10_000);  // 10s ahead covers HOP(10s) windows
 
 ---
 
+## Introspection
+
+### SHOW Commands
+
+List registered sources, sinks, and streams with metadata:
+
+```sql
+-- Returns columns: name, connector, format, watermark, ...
+SHOW SOURCES;
+
+-- Returns columns: name, input, sql, ...
+SHOW SINKS;
+SHOW STREAMS;
+
+-- Reconstruct the original DDL for a source or sink
+SHOW CREATE SOURCE trades;
+SHOW CREATE SINK my_sink;
+```
+
+### EXPLAIN ANALYZE
+
+Execute a query and report execution metrics:
+
+```sql
+EXPLAIN ANALYZE SELECT symbol, COUNT(*) FROM trades GROUP BY symbol;
+-- Returns: rows_produced, execution_time_ms, batches_processed
+```
+
+---
+
 ## Common Gotchas
 
 ### 1. BIGINT timestamps + INTERVAL don't mix
@@ -340,6 +402,11 @@ The following patterns are confirmed working in LaminarDB embedded mode (tested 
 | Cascading materialized views | Stream A -> Stream B -> Stream C |
 | 5+ concurrent streams, 2 sources | Single LaminarDB instance, sub-ms latency |
 | Multiple GROUP BY columns | account_id + symbol + window |
+| SHOW SOURCES/SINKS/STREAMS | Metadata listing with connector/format info |
+| SHOW CREATE SOURCE/SINK | DDL reconstruction |
+| EXPLAIN ANALYZE | Query plan with execution metrics |
+| TUMBLE with offset | Timezone-aligned window boundaries |
+| ASOF NEAREST | Bidirectional closest-match joins |
 
 ---
 
@@ -355,4 +422,4 @@ The following patterns are confirmed working in LaminarDB embedded mode (tested 
 
 ---
 
-*This reference is based on LaminarDB v0.15.x with DataFusion 52.x and Arrow 57.x. Contributions and corrections welcome -- please open an issue or PR.*
+*This reference is based on LaminarDB v0.16.x with DataFusion 52.x and Arrow 57.x. Contributions and corrections welcome -- please open an issue or PR.*

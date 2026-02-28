@@ -60,7 +60,7 @@ The event processing path where latency matters most. All code in Ring 0 runs on
 **Components:**
 - **Reactor Loop** -- Single-threaded event loop that pulls batches from sources, runs them through operators, and emits results. CPU-pinned via the thread-per-core runtime (`laminar-core/src/tpc/`).
 - **Operators** -- Stateless transforms (map, filter, project) and stateful operators (tumbling/sliding/hopping/session windows, stream-stream joins, ASOF joins, temporal joins, lookup joins, lag/lead, ranking).
-- **State Store** -- AHashMap/FxHashMap-based in-memory store wrapped in `ChangelogAwareStore` for zero-allocation changelog capture (~2-5ns per mutation). Supports mmap-backed persistence.
+- **State Store** -- AHashMap/FxHashMap-based in-memory store wrapped in `ChangelogAwareStore` for zero-allocation changelog capture (~2-5ns per mutation). Supports mmap-backed persistence. Ring 0 SQL operator routing (`core_window_state.rs`) directs tumbling/hopping/session window aggregates through optimized `CoreWindowAssigner` state instead of the generic DataFusion path.
 - **Emit** -- Pushes output RecordBatches to downstream streams and sinks via SPSC queues.
 
 **Constraints:**
@@ -71,6 +71,14 @@ The event processing path where latency matters most. All code in Ring 0 runs on
 - Task budget enforcement prevents any single operator from exceeding its time slice
 
 **Optional JIT compilation** (Cranelift): DataFusion logical plans can be compiled into native machine code for Ring 0 execution. The `AdaptiveQueryRunner` runs queries interpreted first, compiles in the background, and hot-swaps to compiled execution when ready. See `laminar-core/src/compiler/`.
+
+**Streaming physical optimizer** (`StreamingPhysicalValidator`): Catches invalid physical plans (e.g., SortExec on unbounded streams) before execution. Configurable via `StreamingValidatorMode` (Reject, Warn, Off).
+
+**Dynamic watermark filter pushdown** (`WatermarkDynamicFilter`): Pushes `ts >= watermark` predicates down to `StreamingScanExec` so late rows are dropped before expression evaluation, using shared `Arc<AtomicI64>` watermarks.
+
+**Cooperative scheduling**: DataFusion's cooperative scheduling integration marks `StreamingScanExec` as `NonCooperative` so the engine wraps it with budget-aware `CooperativeExec` automatically.
+
+**Structured error codes**: Every error carries a stable `LDB-NNNN` code (8 code ranges from general through internal). Ring 0 uses a zero-alloc `HotPathError` enum (2 bytes, `Copy`).
 
 ### Ring 1: Background
 
@@ -140,7 +148,9 @@ laminar-core          Ring 0: reactor, operators, state stores, time/watermarks,
                       |
 laminar-sql           SQL parser (streaming extensions), query planner,
                       DataFusion integration, operator config translators,
-                      custom UDFs (tumble, hop, session, slide, first_value, last_value)
+                      custom UDFs (tumble, hop, session, slide, first_value, last_value),
+                      streaming physical optimizer, watermark filter pushdown,
+                      cooperative scheduling, PROCTIME() UDF
                       |
 laminar-storage       Ring 1: WAL, incremental checkpointing, per-core WAL segments,
                       checkpoint manifest, checkpoint store, changelog drainer,
@@ -155,7 +165,9 @@ laminar-connectors    Kafka source/sink, PostgreSQL CDC/sink, MySQL CDC,
 laminar-db            Unified facade: LaminarDB struct, LaminarDbBuilder,
                       SQL execution, checkpoint coordination, recovery manager,
                       connector manager, pipeline observability, deployment profiles,
-                      FFI API (C bindings, Arrow C Data Interface)
+                      FFI API (C bindings, Arrow C Data Interface),
+                      Ring 0 SQL operator routing (core_window_state),
+                      EOWC incremental window accumulators (eowc_state)
                       |
 laminar-auth          JWT authentication, RBAC, ABAC (Ring 2 -- stubs only)
 laminar-admin         REST API with Axum, Swagger UI (Ring 2 -- stubs only)
@@ -334,14 +346,16 @@ Queries are planned by `StreamingPlanner` and executed either via DataFusion (in
 
 ## Performance Characteristics
 
-| Operation | Target | Technique |
-|-----------|--------|-----------|
-| State lookup | < 500ns | AHashMap, cache-aligned keys |
-| Event processing | < 1us | Zero allocation, inlined operators |
-| Throughput/core | 500K/s | Batch processing, Arrow columnar |
-| Checkpoint | < 10s recovery | Incremental snapshots, async I/O |
-| Window trigger | < 10us | Hierarchical timer wheel |
-| Changelog overhead | ~2-5ns/mutation | `ChangelogAwareStore` wrapper |
+| Operation | Target | Measured | Technique |
+|-----------|--------|----------|-----------|
+| State lookup | < 500ns | 10-105ns (AHash get_ref: 10-16ns) | AHashMap, cache-aligned keys |
+| Event processing | < 1us | 0.55-1.16us | Zero allocation, inlined operators |
+| Throughput/core | 500K/s | 1.1-1.46M/s | Batch processing, Arrow columnar |
+| Checkpoint | < 10s recovery | 1.39ms | Incremental snapshots, async I/O |
+| Window trigger | < 10us | -- | Hierarchical timer wheel |
+| Changelog overhead | ~2-5ns/mutation | -- | `ChangelogAwareStore` wrapper |
+
+See [BENCHMARKS.md](BENCHMARKS.md) for full benchmark baselines with hardware details.
 
 ## Thread-Per-Core Model
 

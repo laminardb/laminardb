@@ -49,13 +49,13 @@ cargo +nightly fmt --all -- --check
 |-------|------|---------|
 | `laminar-core` | 0 | Reactor, operators, state stores, streaming channels, JIT compiler |
 | `laminar-sql` | -- | SQL parser (streaming extensions), query planner, DataFusion integration |
-| `laminar-storage` | 1 | WAL, incremental checkpointing, RocksDB backend |
-| `laminar-connectors` | 1 | Kafka, PostgreSQL CDC, MySQL CDC, Delta Lake, connector SDK |
+| `laminar-storage` | 1 | WAL, incremental checkpointing, checkpoint manifest |
+| `laminar-connectors` | 1 | Kafka, PostgreSQL CDC, MySQL CDC, WebSocket, Delta Lake, Iceberg, connector SDK |
 | `laminar-db` | -- | Unified database facade, checkpoint coordination, FFI API |
-| `laminar-auth` | 2 | JWT authentication, RBAC, ABAC |
-| `laminar-admin` | 2 | REST API (Axum), Swagger UI |
-| `laminar-observe` | 2 | Prometheus metrics, OpenTelemetry tracing |
-| `laminar-derive` | -- | Proc macros for `Record` and `FromRecordBatch` traits |
+| `laminar-auth` | 2 | JWT authentication, RBAC, ABAC (stubs -- Phase 4) |
+| `laminar-admin` | 2 | REST API (Axum), Swagger UI (stubs -- Phase 5) |
+| `laminar-observe` | 2 | Prometheus metrics, OpenTelemetry tracing (stubs -- Phase 5) |
+| `laminar-derive` | -- | Proc macros: `Record`, `FromRecordBatch`, `FromRow`, `ConnectorConfig` |
 | `laminar-server` | -- | Standalone server binary |
 
 See [docs/ARCHITECTURE.md](docs/ARCHITECTURE.md) for the full design.
@@ -99,7 +99,7 @@ cargo test --all
 cargo test -p laminar-core
 
 # With feature flags
-cargo test --all --features kafka,postgres-cdc,mysql-cdc,delta-lake
+cargo test --all --features kafka,postgres-cdc,mysql-cdc,delta-lake,websocket
 
 # Run benchmarks
 cargo bench
@@ -118,10 +118,10 @@ Many features are optional to keep compile times manageable:
 | `kafka` | laminar-connectors, laminar-db | Kafka source/sink, Avro serde |
 | `postgres-cdc` | laminar-connectors, laminar-db | PostgreSQL CDC source |
 | `postgres-sink` | laminar-connectors, laminar-db | PostgreSQL sink |
-| `mysql-cdc` | laminar-connectors | MySQL CDC source |
+| `mysql-cdc` | laminar-connectors, laminar-db | MySQL CDC source |
+| `websocket` | laminar-connectors, laminar-db | WebSocket source and sink |
 | `delta-lake` | laminar-connectors, laminar-db | Delta Lake sink and source |
 | `delta-lake-s3` | laminar-connectors | S3 storage backend for Delta Lake |
-| `websocket` | laminar-connectors | WebSocket source and sink |
 | `ffi` | laminar-db | C FFI layer |
 | `api` | laminar-db | FFI-friendly API module |
 | `delta` | laminar-core, laminar-db | Distributed delta mode |
