@@ -299,6 +299,14 @@ impl WalStateStore {
                     tracing::warn!(position, "CRC mismatch during recovery - truncating WAL");
                     break;
                 }
+                Ok(WalReadResult::Corrupted { position, reason }) => {
+                    tracing::warn!(
+                        position,
+                        reason,
+                        "[LDB-6006] Corrupted WAL entry during recovery - truncating WAL"
+                    );
+                    break;
+                }
                 Err(e) => {
                     // Real error (I/O, deserialization)
                     return Err(StateError::Corruption(format!("WAL read error: {e}")));

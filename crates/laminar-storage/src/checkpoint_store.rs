@@ -252,7 +252,13 @@ impl CheckpointStore for FileSystemCheckpointStore {
 
         // Auto-prune if configured
         if self.max_retained > 0 {
-            let _ = self.prune(self.max_retained);
+            if let Err(e) = self.prune(self.max_retained) {
+                tracing::warn!(
+                    max_retained = self.max_retained,
+                    error = %e,
+                    "[LDB-6009] Checkpoint prune failed — old checkpoints may accumulate on disk"
+                );
+            }
         }
 
         Ok(())
