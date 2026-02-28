@@ -757,7 +757,7 @@ impl CheckpointCoordinator {
     /// successfully are `Committed`; failures are `Failed(message)`.
     /// All sinks are attempted even if some fail.
     async fn commit_sinks_tracked(&self, epoch: u64) -> HashMap<String, SinkCommitStatus> {
-        let mut statuses = HashMap::new();
+        let mut statuses = HashMap::with_capacity(self.sinks.len());
 
         for sink in &self.sinks {
             if sink.exactly_once {
@@ -825,7 +825,7 @@ impl CheckpointCoordinator {
 
     /// Collects the last committed epoch from each sink.
     fn collect_sink_epochs(&self) -> HashMap<String, u64> {
-        let mut epochs = HashMap::new();
+        let mut epochs = HashMap::with_capacity(self.sinks.len());
         for sink in &self.sinks {
             // The epoch being committed is the current one
             if sink.exactly_once {
@@ -841,7 +841,7 @@ impl CheckpointCoordinator {
     /// registered sources. This ensures watermark progress is not lost
     /// on recovery (prevents watermark regression).
     fn collect_source_watermarks(&self, global_watermark: i64) -> HashMap<String, i64> {
-        let mut watermarks = HashMap::new();
+        let mut watermarks = HashMap::with_capacity(self.sources.len());
         for source in &self.sources {
             watermarks.insert(source.name.clone(), global_watermark);
         }
@@ -1418,7 +1418,8 @@ pub fn manifest_operators_to_dag_states<S: std::hash::BuildHasher>(
     operators: &HashMap<String, laminar_storage::checkpoint_manifest::OperatorCheckpoint, S>,
 ) -> rustc_hash::FxHashMap<laminar_core::dag::topology::NodeId, laminar_core::operator::OperatorState>
 {
-    let mut states = rustc_hash::FxHashMap::default();
+    let mut states =
+        rustc_hash::FxHashMap::with_capacity_and_hasher(operators.len(), rustc_hash::FxBuildHasher);
     for (key, op_ckpt) in operators {
         if let Ok(node_id) = key.parse::<u32>() {
             if let Some(data) = op_ckpt.decode_inline() {

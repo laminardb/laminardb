@@ -864,9 +864,9 @@ impl LaminarDB {
 
         // Extract connector options from WITH (...)
         let mut connector_type: Option<String> = None;
-        let mut connector_options: HashMap<String, String> = HashMap::new();
+        let mut connector_options: HashMap<String, String> = HashMap::with_capacity(8);
         let mut format: Option<String> = None;
-        let mut format_options: HashMap<String, String> = HashMap::new();
+        let mut format_options: HashMap<String, String> = HashMap::with_capacity(4);
         let mut refresh_mode: Option<laminar_connectors::reference::RefreshMode> = None;
         let mut cache_mode: Option<crate::table_cache_mode::TableCacheMode> = None;
         let mut cache_max_entries: Option<usize> = None;
@@ -2297,10 +2297,13 @@ impl LaminarDB {
         }
 
         // Build per-source watermark tracking state
-        let mut watermark_states: HashMap<String, SourceWatermarkState> = HashMap::new();
-        let mut source_entries: HashMap<String, Arc<crate::catalog::SourceEntry>> = HashMap::new();
-        let mut source_ids: HashMap<String, usize> = HashMap::new();
-        for name in self.catalog.list_sources() {
+        let source_names = self.catalog.list_sources();
+        let mut watermark_states: HashMap<String, SourceWatermarkState> =
+            HashMap::with_capacity(source_names.len());
+        let mut source_entries: HashMap<String, Arc<crate::catalog::SourceEntry>> =
+            HashMap::with_capacity(source_names.len());
+        let mut source_ids: HashMap<String, usize> = HashMap::with_capacity(source_names.len());
+        for name in source_names {
             if let Some(entry) = self.catalog.get_source(&name) {
                 if let (Some(col), Some(dur)) =
                     (&entry.watermark_column, entry.max_out_of_orderness)
@@ -2429,7 +2432,8 @@ impl LaminarDB {
                 }
 
                 // Drain source subscriptions into batches
-                let mut source_batches: HashMap<String, Vec<RecordBatch>> = HashMap::new();
+                let mut source_batches: HashMap<String, Vec<RecordBatch>> =
+                    HashMap::with_capacity(source_subs.len());
                 for (name, sub) in &source_subs {
                     for _ in 0..256 {
                         match sub.poll() {
@@ -2790,11 +2794,13 @@ impl LaminarDB {
         }
 
         // Build per-source watermark tracking state (connector pipeline)
-        let mut watermark_states: HashMap<String, SourceWatermarkState> = HashMap::new();
+        let source_names = self.catalog.list_sources();
+        let mut watermark_states: HashMap<String, SourceWatermarkState> =
+            HashMap::with_capacity(source_names.len());
         let mut source_entries_for_wm: HashMap<String, Arc<crate::catalog::SourceEntry>> =
-            HashMap::new();
-        let mut source_ids: HashMap<String, usize> = HashMap::new();
-        for name in self.catalog.list_sources() {
+            HashMap::with_capacity(source_names.len());
+        let mut source_ids: HashMap<String, usize> = HashMap::with_capacity(source_names.len());
+        for name in source_names {
             if let Some(entry) = self.catalog.get_source(&name) {
                 if let (Some(col), Some(dur)) =
                     (&entry.watermark_column, entry.max_out_of_orderness)
@@ -3652,9 +3658,9 @@ fn extract_connector_from_with_options(
     Option<String>,
     HashMap<String, String>,
 ) {
-    let mut connector_options = HashMap::new();
+    let mut connector_options = HashMap::with_capacity(with_options.len());
     let mut format: Option<String> = None;
-    let mut format_options = HashMap::new();
+    let mut format_options = HashMap::with_capacity(4);
 
     for (key, value) in with_options {
         let lower = key.to_lowercase();
@@ -3901,7 +3907,7 @@ impl crate::pipeline::PipelineCallback for ConnectorPipelineCallback {
         }
 
         // Capture table source offsets.
-        let mut extra_tables = HashMap::new();
+        let mut extra_tables = HashMap::with_capacity(self.table_sources.len());
         for (name, source, _) in &self.table_sources {
             extra_tables.insert(
                 name.clone(),
@@ -3910,7 +3916,7 @@ impl crate::pipeline::PipelineCallback for ConnectorPipelineCallback {
         }
 
         // Capture stream executor aggregate state.
-        let mut operator_states = HashMap::new();
+        let mut operator_states = HashMap::with_capacity(1);
         match self.executor.checkpoint_state() {
             Ok(Some(bytes)) => {
                 operator_states.insert("stream_executor".to_string(), bytes);
@@ -3922,7 +3928,7 @@ impl crate::pipeline::PipelineCallback for ConnectorPipelineCallback {
         }
 
         // Collect per-source watermarks from the watermark tracker.
-        let mut per_source_watermarks = HashMap::new();
+        let mut per_source_watermarks = HashMap::with_capacity(self.watermark_states.len());
         for (name, wm_state) in &self.watermark_states {
             let wm = wm_state.generator.current_watermark();
             if wm > i64::MIN {
@@ -4028,7 +4034,7 @@ impl crate::pipeline::PipelineCallback for ConnectorPipelineCallback {
         }
 
         // Capture table source offsets.
-        let mut extra_tables = HashMap::new();
+        let mut extra_tables = HashMap::with_capacity(self.table_sources.len());
         for (name, source, _) in &self.table_sources {
             extra_tables.insert(
                 name.clone(),
@@ -4038,7 +4044,7 @@ impl crate::pipeline::PipelineCallback for ConnectorPipelineCallback {
 
         // Capture stream executor aggregate state — now consistent because
         // all pre-barrier data has been executed.
-        let mut operator_states = HashMap::new();
+        let mut operator_states = HashMap::with_capacity(1);
         match self.executor.checkpoint_state() {
             Ok(Some(bytes)) => {
                 operator_states.insert("stream_executor".to_string(), bytes);
@@ -4050,7 +4056,7 @@ impl crate::pipeline::PipelineCallback for ConnectorPipelineCallback {
         }
 
         // Collect per-source watermarks.
-        let mut per_source_watermarks = HashMap::new();
+        let mut per_source_watermarks = HashMap::with_capacity(self.watermark_states.len());
         for (name, wm_state) in &self.watermark_states {
             let wm = wm_state.generator.current_watermark();
             if wm > i64::MIN {

@@ -1061,8 +1061,10 @@ impl StreamExecutor {
             return Ok(Vec::new());
         };
 
-        let mut filtered_sources: HashMap<String, Vec<RecordBatch>> = HashMap::new();
-        let mut retained_sources: HashMap<String, Vec<RecordBatch>> = HashMap::new();
+        let mut filtered_sources: HashMap<String, Vec<RecordBatch>> =
+            HashMap::with_capacity(eowc.accumulated_sources.len());
+        let mut retained_sources: HashMap<String, Vec<RecordBatch>> =
+            HashMap::with_capacity(eowc.accumulated_sources.len());
         let mut has_data = false;
         let mut retained_rows = 0usize;
 
@@ -1315,19 +1317,19 @@ impl StreamExecutor {
     pub fn checkpoint_state(&mut self) -> Result<Option<Vec<u8>>, DbError> {
         use crate::aggregate_state::StreamExecutorCheckpoint;
 
-        let mut agg_checkpoints = HashMap::new();
+        let mut agg_checkpoints = HashMap::with_capacity(self.agg_states.len());
         for (&idx, state) in &mut self.agg_states {
             let name = self.queries[idx].name.clone();
             agg_checkpoints.insert(name, state.checkpoint_groups()?);
         }
 
-        let mut eowc_checkpoints = HashMap::new();
+        let mut eowc_checkpoints = HashMap::with_capacity(self.eowc_agg_states.len());
         for (&idx, state) in &mut self.eowc_agg_states {
             let name = self.queries[idx].name.clone();
             eowc_checkpoints.insert(name, state.checkpoint_windows()?);
         }
 
-        let mut cw_checkpoints = HashMap::new();
+        let mut cw_checkpoints = HashMap::with_capacity(self.core_window_states.len());
         for (&idx, state) in &mut self.core_window_states {
             let name = self.queries[idx].name.clone();
             cw_checkpoints.insert(name, state.checkpoint_windows()?);
