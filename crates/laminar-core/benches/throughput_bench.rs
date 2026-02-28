@@ -151,22 +151,27 @@ fn bench_verify_target_throughput(c: &mut Criterion) {
         reactor.add_operator(Box::new(MinimalOperator));
 
         b.iter_custom(|iters| {
-            let target_events = 500_000;
+            let target_events = 500_000u64;
             let mut total_duration = Duration::ZERO;
 
             for _ in 0..iters {
-                // Submit target number of events
-                let mut submitted = 0;
+                let start = Instant::now();
+                let mut submitted = 0u64;
+
+                // Interleave submission and processing to stay within queue capacity
                 while submitted < target_events {
                     let batch_size = (target_events - submitted).min(10000);
                     for i in 0..batch_size {
-                        reactor.submit(create_minimal_event(i as i64)).unwrap();
+                        if reactor.submit(create_minimal_event(i as i64)).is_err() {
+                            reactor.poll();
+                            reactor.submit(create_minimal_event(i as i64)).unwrap();
+                        }
                     }
                     submitted += batch_size;
+                    reactor.poll();
                 }
 
-                // Time the processing
-                let start = Instant::now();
+                // Drain remaining events
                 while reactor.queue_size() > 0 {
                     reactor.poll();
                 }
@@ -174,9 +179,8 @@ fn bench_verify_target_throughput(c: &mut Criterion) {
 
                 total_duration += elapsed;
 
-                // Print throughput for this iteration (only in verbose mode)
                 let throughput = target_events as f64 / elapsed.as_secs_f64();
-                black_box(throughput); // Prevent optimization
+                black_box(throughput);
             }
 
             total_duration
