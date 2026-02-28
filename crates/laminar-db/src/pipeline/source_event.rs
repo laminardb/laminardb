@@ -1,6 +1,7 @@
 //! Events emitted by per-source tasks to the pipeline coordinator.
 
 use arrow_array::RecordBatch;
+use laminar_core::checkpoint::CheckpointBarrier;
 
 /// An event sent from a per-source task to the pipeline coordinator.
 ///
@@ -14,6 +15,19 @@ pub enum SourceEvent {
         idx: usize,
         /// The record batch.
         batch: RecordBatch,
+    },
+
+    /// A checkpoint barrier from source `idx`.
+    ///
+    /// Emitted when the source task detects a pending barrier via its
+    /// [`BarrierPollHandle`](laminar_core::checkpoint::BarrierPollHandle). The source captures its checkpoint before
+    /// sending this event, so the coordinator can read the watch channel
+    /// to get the barrier-consistent offset.
+    Barrier {
+        /// Source index.
+        idx: usize,
+        /// The checkpoint barrier.
+        barrier: CheckpointBarrier,
     },
 
     /// Source `idx` encountered a poll error.

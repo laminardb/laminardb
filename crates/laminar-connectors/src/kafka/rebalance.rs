@@ -2,8 +2,18 @@
 //!
 //! [`RebalanceState`] tracks which topic-partitions are currently
 //! assigned to this consumer and counts rebalance events.
+//!
+//! [`LaminarConsumerContext`] is an rdkafka `ConsumerContext` that
+//! signals a checkpoint request on partition revocation, enabling
+//! the pipeline to persist offsets before ownership changes.
 
 use std::collections::HashSet;
+use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
+use std::sync::Arc;
+
+use rdkafka::consumer::ConsumerContext;
+use rdkafka::ClientContext;
+use tracing::{info, warn};
 
 /// Tracks partition assignments across consumer group rebalances.
 #[derive(Debug, Clone, Default)]
@@ -60,6 +70,76 @@ impl RebalanceState {
     }
 }
 
+/// rdkafka consumer context that signals a checkpoint on partition revocation.
+///
+/// When a consumer group rebalance revokes partitions from this consumer,
+/// the context notifies the pipeline coordinator to trigger an immediate
+/// checkpoint before the partitions are reassigned. This prevents offset
+/// loss during rebalance.
+///
+/// Rebalance callbacks run on rdkafka's background thread, so all shared
+/// state uses `Arc` + atomic types for thread safety.
+pub struct LaminarConsumerContext {
+    /// Set to `true` on partition revocation to request an immediate checkpoint.
+    checkpoint_requested: Arc<AtomicBool>,
+    /// Rebalance event counter (for observability).
+    rebalance_count: AtomicU64,
+}
+
+impl LaminarConsumerContext {
+    /// Creates a new consumer context with the given checkpoint request flag.
+    #[must_use]
+    pub fn new(checkpoint_requested: Arc<AtomicBool>) -> Self {
+        Self {
+            checkpoint_requested,
+            rebalance_count: AtomicU64::new(0),
+        }
+    }
+
+    /// Returns the total number of rebalance events observed.
+    #[must_use]
+    pub fn rebalance_count(&self) -> u64 {
+        self.rebalance_count.load(Ordering::Relaxed)
+    }
+}
+
+impl ClientContext for LaminarConsumerContext {}
+
+impl ConsumerContext for LaminarConsumerContext {
+    fn pre_rebalance(
+        &self,
+        _base_consumer: &rdkafka::consumer::BaseConsumer<Self>,
+        rebalance: &rdkafka::consumer::Rebalance<'_>,
+    ) {
+        use rdkafka::consumer::Rebalance;
+
+        match rebalance {
+            Rebalance::Revoke(tpl) => {
+                let count = tpl.count();
+                info!(
+                    partitions_revoked = count,
+                    "kafka rebalance: partitions being revoked, requesting checkpoint"
+                );
+                self.rebalance_count
+                    .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+                self.checkpoint_requested.store(true, Ordering::Relaxed);
+            }
+            Rebalance::Assign(tpl) => {
+                let count = tpl.count();
+                info!(
+                    partitions_assigned = count,
+                    "kafka rebalance: new partitions assigned"
+                );
+                self.rebalance_count
+                    .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+            }
+            Rebalance::Error(msg) => {
+                warn!(error = %msg, "kafka rebalance error");
+            }
+        }
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -111,5 +191,27 @@ mod tests {
         assert_eq!(state.assigned_partitions().len(), 0);
         assert_eq!(state.rebalance_count(), 0);
         assert!(!state.is_assigned("events", 0));
+    }
+
+    #[test]
+    fn test_consumer_context_initial_state() {
+        let flag = Arc::new(AtomicBool::new(false));
+        let ctx = LaminarConsumerContext::new(Arc::clone(&flag));
+        assert!(!flag.load(Ordering::Relaxed));
+        assert_eq!(ctx.rebalance_count(), 0);
+    }
+
+    #[test]
+    fn test_consumer_context_shared_flag() {
+        let flag = Arc::new(AtomicBool::new(false));
+        let _ctx = LaminarConsumerContext::new(Arc::clone(&flag));
+
+        // Simulate what pre_rebalance(Revoke) does.
+        flag.store(true, Ordering::Relaxed);
+        assert!(flag.load(Ordering::Relaxed));
+
+        // Coordinator would swap-clear the flag.
+        assert!(flag.swap(false, Ordering::Relaxed));
+        assert!(!flag.load(Ordering::Relaxed));
     }
 }

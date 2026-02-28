@@ -313,6 +313,32 @@ pub trait SourceConnector: Send {
     fn as_schema_evolvable(&self) -> Option<&dyn crate::schema::SchemaEvolvable> {
         None
     }
+
+    /// Whether this source supports replay from a checkpointed position.
+    ///
+    /// Sources that return `false` (e.g., WebSocket, raw TCP) cannot seek
+    /// back to a previous offset on recovery. Checkpointing still captures
+    /// their state for best-effort recovery, but exactly-once semantics
+    /// are degraded to at-most-once for events from this source.
+    ///
+    /// The default implementation returns `true` because most durable
+    /// sources (Kafka, CDC, files) support replay.
+    fn supports_replay(&self) -> bool {
+        true
+    }
+
+    /// Returns a shared flag that the source sets to `true` when it
+    /// requests an immediate checkpoint.
+    ///
+    /// This is used by sources that detect external state changes requiring
+    /// a checkpoint before proceeding — for example, Kafka consumer group
+    /// rebalance (partition revocation). The pipeline coordinator polls
+    /// this flag each cycle and clears it after triggering the checkpoint.
+    ///
+    /// The default returns `None` (no source-initiated checkpoints).
+    fn checkpoint_requested(&self) -> Option<Arc<std::sync::atomic::AtomicBool>> {
+        None
+    }
 }
 
 /// Trait for sink connectors that write data to external systems.

@@ -74,7 +74,15 @@ async fn test_checkpoint_non_blocking() {
     // This should take ~200ms total
     let start = Instant::now();
     let result = coordinator
-        .checkpoint(std::collections::HashMap::new(), None, 0, vec![], None)
+        .checkpoint(
+            std::collections::HashMap::new(),
+            None,
+            0,
+            vec![],
+            None,
+            std::collections::HashMap::new(),
+            None,
+        )
         .await
         .unwrap();
     let duration = start.elapsed();

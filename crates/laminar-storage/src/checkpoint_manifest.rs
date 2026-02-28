@@ -98,6 +98,35 @@ pub struct CheckpointManifest {
     #[serde(default)]
     pub source_watermarks: HashMap<String, i64>,
 
+    // ── Topology ──
+    /// Sorted names of all registered sources at checkpoint time.
+    ///
+    /// Used during recovery to detect topology changes (added/removed sources)
+    /// and warn the operator.
+    #[serde(default)]
+    pub source_names: Vec<String>,
+    /// Sorted names of all registered sinks at checkpoint time.
+    #[serde(default)]
+    pub sink_names: Vec<String>,
+
+    // ── Pipeline Identity ──
+    /// Hash of the pipeline configuration at checkpoint time.
+    ///
+    /// Computed from SQL queries, source/sink configuration, and connector
+    /// options. Recovery logs a warning when this changes, indicating
+    /// operator state may be incompatible with the new configuration.
+    #[serde(default)]
+    pub pipeline_hash: Option<u64>,
+
+    // ── In-flight Data (unaligned checkpoints) ──
+    /// In-flight channel data captured during unaligned checkpoints.
+    ///
+    /// Key: operator name. Value: list of in-flight records from input channels.
+    /// Empty for aligned checkpoints. During recovery, these events are replayed
+    /// before resuming normal processing.
+    #[serde(default)]
+    pub inflight_data: HashMap<String, Vec<InFlightRecord>>,
+
     // ── Metadata ──
     /// Total size of all checkpoint data in bytes (manifest + state.bin).
     #[serde(default)]
@@ -168,6 +197,17 @@ impl CheckpointManifest {
             }
         }
 
+        // Source offsets should reference known sources (if topology is recorded)
+        if !self.source_names.is_empty() {
+            for name in self.source_offsets.keys() {
+                if !self.source_names.contains(name) {
+                    errors.push(ManifestValidationError {
+                        message: format!("source_offsets contains '{name}' not in source_names"),
+                    });
+                }
+            }
+        }
+
         // Incremental checkpoints must have a parent
         if self.is_incremental && self.parent_id.is_none() {
             errors.push(ManifestValidationError {
@@ -202,6 +242,10 @@ impl CheckpointManifest {
             per_core_wal_positions: Vec::new(),
             watermark: None,
             source_watermarks: HashMap::new(),
+            source_names: Vec::new(),
+            sink_names: Vec::new(),
+            pipeline_hash: None,
+            inflight_data: HashMap::new(),
             size_bytes: 0,
             is_incremental: false,
             parent_id: None,
@@ -247,6 +291,18 @@ impl ConnectorCheckpoint {
             metadata: HashMap::new(),
         }
     }
+}
+
+/// In-flight data record from an unaligned checkpoint.
+///
+/// Each record represents serialized events buffered in a single input
+/// channel at the time of the unaligned snapshot.
+#[derive(Debug, Clone, serde::Serialize, serde::Deserialize, PartialEq, Eq)]
+pub struct InFlightRecord {
+    /// Input channel index.
+    pub input_id: usize,
+    /// Base64-encoded serialized event data.
+    pub data_b64: String,
 }
 
 /// Serialized operator state stored in the manifest.
@@ -301,6 +357,36 @@ impl OperatorCheckpoint {
         self.state_b64
             .as_ref()
             .and_then(|b64| base64::engine::general_purpose::STANDARD.decode(b64).ok())
+    }
+
+    /// Creates an `OperatorCheckpoint` from raw bytes using a size threshold.
+    ///
+    /// If `data.len() <= threshold`, the state is inlined as base64.
+    /// If `data.len() > threshold`, the state is marked as external with the
+    /// given offset and length, and the raw data is returned for sidecar storage.
+    ///
+    /// # Arguments
+    ///
+    /// * `data` — Raw operator state bytes
+    /// * `threshold` — Maximum size in bytes for inline storage
+    /// * `current_offset` — Byte offset into the sidecar file for this blob
+    ///
+    /// # Returns
+    ///
+    /// A tuple of the checkpoint entry and optional raw data for the sidecar.
+    #[must_use]
+    #[allow(clippy::cast_possible_truncation)]
+    pub fn from_bytes(
+        data: &[u8],
+        threshold: usize,
+        current_offset: u64,
+    ) -> (Self, Option<Vec<u8>>) {
+        if data.len() <= threshold {
+            (Self::inline(data), None)
+        } else {
+            let length = data.len() as u64;
+            (Self::external(current_offset, length), Some(data.to_vec()))
+        }
     }
 }
 
@@ -456,5 +542,153 @@ mod tests {
             restored.table_store_checkpoint_path.as_deref(),
             Some("/tmp/rocksdb_cp")
         );
+    }
+
+    #[test]
+    fn test_manifest_topology_fields_round_trip() {
+        let mut m = CheckpointManifest::new(1, 1);
+        m.source_names = vec!["kafka-clicks".into(), "ws-prices".into()];
+        m.sink_names = vec!["pg-sink".into()];
+
+        let json = serde_json::to_string(&m).unwrap();
+        let restored: CheckpointManifest = serde_json::from_str(&json).unwrap();
+
+        assert_eq!(restored.source_names, vec!["kafka-clicks", "ws-prices"]);
+        assert_eq!(restored.sink_names, vec!["pg-sink"]);
+    }
+
+    #[test]
+    fn test_manifest_topology_backward_compat() {
+        // Older manifests without topology fields should deserialize fine.
+        let json = r#"{
+            "version": 1,
+            "checkpoint_id": 5,
+            "epoch": 3,
+            "timestamp_ms": 1000
+        }"#;
+        let m: CheckpointManifest = serde_json::from_str(json).unwrap();
+        assert!(m.source_names.is_empty());
+        assert!(m.sink_names.is_empty());
+    }
+
+    #[test]
+    fn test_validate_orphaned_source_offset() {
+        let mut m = CheckpointManifest::new(1, 1);
+        m.source_names = vec!["a".into(), "b".into()];
+        m.source_offsets
+            .insert("c".into(), ConnectorCheckpoint::new(1));
+
+        let errors = m.validate();
+        assert!(
+            errors
+                .iter()
+                .any(|e| e.message.contains("'c' not in source_names")),
+            "expected orphaned source offset error: {errors:?}"
+        );
+    }
+
+    #[test]
+    fn test_manifest_pipeline_hash_round_trip() {
+        let mut m = CheckpointManifest::new(1, 1);
+        m.pipeline_hash = Some(0xDEAD_BEEF_CAFE_1234);
+
+        let json = serde_json::to_string(&m).unwrap();
+        let restored: CheckpointManifest = serde_json::from_str(&json).unwrap();
+
+        assert_eq!(restored.pipeline_hash, Some(0xDEAD_BEEF_CAFE_1234));
+    }
+
+    #[test]
+    fn test_from_bytes_inline() {
+        let data = b"small-state";
+        let (op, sidecar) = OperatorCheckpoint::from_bytes(data, 1024, 0);
+        assert!(!op.external);
+        assert!(sidecar.is_none());
+        assert_eq!(op.decode_inline().unwrap(), data);
+    }
+
+    #[test]
+    fn test_from_bytes_external() {
+        let data = vec![0xAB; 2048];
+        let (op, sidecar) = OperatorCheckpoint::from_bytes(&data, 1024, 512);
+        assert!(op.external);
+        assert_eq!(op.external_offset, 512);
+        assert_eq!(op.external_length, 2048);
+        assert!(op.decode_inline().is_none());
+        assert_eq!(sidecar.unwrap(), data);
+    }
+
+    #[test]
+    fn test_from_bytes_at_threshold_boundary() {
+        // Exactly at threshold → inline
+        let data = vec![0xFF; 100];
+        let (op, sidecar) = OperatorCheckpoint::from_bytes(&data, 100, 0);
+        assert!(!op.external);
+        assert!(sidecar.is_none());
+        assert_eq!(op.decode_inline().unwrap(), data);
+
+        // One byte over threshold → external
+        let data_over = vec![0xFF; 101];
+        let (op2, sidecar2) = OperatorCheckpoint::from_bytes(&data_over, 100, 0);
+        assert!(op2.external);
+        assert!(sidecar2.is_some());
+    }
+
+    #[test]
+    fn test_from_bytes_empty_data() {
+        let (op, sidecar) = OperatorCheckpoint::from_bytes(b"", 1024, 0);
+        assert!(!op.external);
+        assert!(sidecar.is_none());
+        assert_eq!(op.decode_inline().unwrap(), b"");
+    }
+
+    #[test]
+    fn test_manifest_inflight_round_trip() {
+        use base64::Engine;
+
+        let mut m = CheckpointManifest::new(1, 1);
+        let record = InFlightRecord {
+            input_id: 2,
+            data_b64: base64::engine::general_purpose::STANDARD.encode(b"buffered-event"),
+        };
+        m.inflight_data.insert("join-op".into(), vec![record]);
+
+        let json = serde_json::to_string_pretty(&m).unwrap();
+        let restored: CheckpointManifest = serde_json::from_str(&json).unwrap();
+
+        assert_eq!(restored.inflight_data.len(), 1);
+        let records = restored.inflight_data.get("join-op").unwrap();
+        assert_eq!(records.len(), 1);
+        assert_eq!(records[0].input_id, 2);
+
+        let decoded = base64::engine::general_purpose::STANDARD
+            .decode(&records[0].data_b64)
+            .unwrap();
+        assert_eq!(decoded, b"buffered-event");
+    }
+
+    #[test]
+    fn test_manifest_inflight_backward_compat() {
+        // Older manifests without inflight_data should deserialize fine.
+        let json = r#"{
+            "version": 1,
+            "checkpoint_id": 1,
+            "epoch": 1,
+            "timestamp_ms": 1000
+        }"#;
+        let m: CheckpointManifest = serde_json::from_str(json).unwrap();
+        assert!(m.inflight_data.is_empty());
+    }
+
+    #[test]
+    fn test_manifest_pipeline_hash_backward_compat() {
+        let json = r#"{
+            "version": 1,
+            "checkpoint_id": 1,
+            "epoch": 1,
+            "timestamp_ms": 1000
+        }"#;
+        let m: CheckpointManifest = serde_json::from_str(json).unwrap();
+        assert!(m.pipeline_hash.is_none());
     }
 }

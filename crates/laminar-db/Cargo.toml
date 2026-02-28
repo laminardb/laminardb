@@ -80,3 +80,8 @@ tracing = { workspace = true }
 tokio = { workspace = true, features = ["test-util", "macros"] }
 tempfile = { workspace = true }
 laminar-derive = { path = "../laminar-derive", version = "0.16.0" }
+criterion = { workspace = true }
+
+[[bench]]
+name = "recovery_bench"
+harness = false

@@ -19,6 +19,10 @@ tower-http = { version = "0.6", features = ["fs", "cors"] }
 utoipa = { version = "5.4", features = ["axum_extras"] }
 utoipa-swagger-ui = { version = "9.0", features = ["axum"] }
 
+# LaminarDB crates
+laminar-db = { path = "../laminar-db" }
+laminar-storage = { path = "../laminar-storage" }
+
 # Common
 tokio = { workspace = true }
 async-trait = { workspace = true }
