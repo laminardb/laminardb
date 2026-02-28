@@ -30,6 +30,12 @@ pub mod flags {
     pub const DRAIN: u64 = 1 << 1;
     /// Cancel any in-progress checkpoint with this ID.
     pub const CANCEL: u64 = 1 << 2;
+    /// This barrier was part of an unaligned checkpoint.
+    ///
+    /// Unaligned checkpoints capture in-flight channel data instead of
+    /// blocking on barrier alignment, trading larger checkpoint size for
+    /// faster completion under backpressure.
+    pub const UNALIGNED: u64 = 1 << 3;
 }
 
 /// A checkpoint barrier that flows through the dataflow graph.
@@ -96,6 +102,12 @@ impl CheckpointBarrier {
     #[must_use]
     pub const fn is_cancel(&self) -> bool {
         self.flags & flags::CANCEL != 0
+    }
+
+    /// Check whether this barrier is from an unaligned checkpoint.
+    #[must_use]
+    pub const fn is_unaligned(&self) -> bool {
+        self.flags & flags::UNALIGNED != 0
     }
 }
 

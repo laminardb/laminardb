@@ -300,7 +300,7 @@ mod tests {
                     saw_barrier = true;
                     break;
                 }
-                Ok(Some(_)) => continue,
+                Ok(Some(_)) => {}
                 _ => break,
             }
         }
@@ -355,7 +355,7 @@ mod tests {
                     saw_barrier = true;
                     break;
                 }
-                Ok(Some(_)) => continue,
+                Ok(Some(_)) => {}
                 _ => break,
             }
         }

@@ -46,6 +46,10 @@ pub struct RegisteredBufferPool {
     total_count: usize,
     /// Buffers currently acquired.
     acquired_count: usize,
+    /// Cumulative number of successful buffer acquisitions.
+    acquisitions: u64,
+    /// Cumulative number of times acquisition failed (pool exhausted).
+    exhaustions: u64,
 }
 
 impl RegisteredBufferPool {
@@ -109,6 +113,8 @@ impl RegisteredBufferPool {
             next_id: AtomicU64::new(0),
             total_count: buffer_count,
             acquired_count: 0,
+            acquisitions: 0,
+            exhaustions: 0,
         })
     }
 
@@ -120,12 +126,16 @@ impl RegisteredBufferPool {
     ///
     /// Returns an error if no buffers are available.
     pub fn acquire(&mut self) -> Result<(u16, &mut [u8]), IoUringError> {
-        let idx = self
-            .free_list
-            .pop_front()
-            .ok_or(IoUringError::BufferPoolExhausted)?;
+        let idx = match self.free_list.pop_front() {
+            Some(idx) => idx,
+            None => {
+                self.exhaustions += 1;
+                return Err(IoUringError::BufferPoolExhausted);
+            }
+        };
 
         self.acquired_count += 1;
+        self.acquisitions += 1;
 
         Ok((idx, &mut self.buffers[idx as usize]))
     }
@@ -135,8 +145,15 @@ impl RegisteredBufferPool {
     /// Returns `None` if no buffers are available.
     #[must_use]
     pub fn try_acquire(&mut self) -> Option<(u16, &mut [u8])> {
-        let idx = self.free_list.pop_front()?;
+        let idx = match self.free_list.pop_front() {
+            Some(idx) => idx,
+            None => {
+                self.exhaustions += 1;
+                return None;
+            }
+        };
         self.acquired_count += 1;
+        self.acquisitions += 1;
         Some((idx, &mut self.buffers[idx as usize]))
     }
 
@@ -321,6 +338,8 @@ impl RegisteredBufferPool {
             acquired_count: self.acquired_count,
             buffer_size: self.buffer_size,
             total_bytes: self.total_count * self.buffer_size,
+            acquisitions: self.acquisitions,
+            exhaustions: self.exhaustions,
         }
     }
 }
@@ -345,6 +364,10 @@ pub struct BufferPoolStats {
     pub buffer_size: usize,
     /// Total bytes allocated.
     pub total_bytes: usize,
+    /// Cumulative successful acquisitions.
+    pub acquisitions: u64,
+    /// Cumulative pool exhaustion events (acquire failed).
+    pub exhaustions: u64,
 }
 
 impl std::fmt::Display for BufferPoolStats {
@@ -476,10 +499,86 @@ mod tests {
         assert_eq!(stats.acquired_count, 0);
         assert_eq!(stats.buffer_size, 4096);
         assert_eq!(stats.total_bytes, 16 * 4096);
+        assert_eq!(stats.acquisitions, 0);
+        assert_eq!(stats.exhaustions, 0);
 
         let display = format!("{stats}");
         assert!(display.contains("16"));
         assert!(display.contains("4KB"));
+    }
+
+    #[test]
+    fn test_buffer_pool_stats_initial() {
+        let mut ring = match create_test_ring() {
+            Some(r) => r,
+            None => return,
+        };
+
+        let pool = match RegisteredBufferPool::new(&mut ring, 4096, 8) {
+            Ok(p) => p,
+            Err(_) => return,
+        };
+
+        let stats = pool.stats();
+        assert_eq!(stats.total_count, 8);
+        assert_eq!(stats.available_count, 8);
+        assert_eq!(stats.acquired_count, 0);
+        assert_eq!(stats.acquisitions, 0);
+        assert_eq!(stats.exhaustions, 0);
+    }
+
+    #[test]
+    fn test_buffer_pool_stats_after_acquire() {
+        let mut ring = match create_test_ring() {
+            Some(r) => r,
+            None => return,
+        };
+
+        let mut pool = match RegisteredBufferPool::new(&mut ring, 4096, 4) {
+            Ok(p) => p,
+            Err(_) => return,
+        };
+
+        let (idx, _) = pool.acquire().unwrap();
+        let stats = pool.stats();
+        assert_eq!(stats.acquisitions, 1);
+        assert_eq!(stats.exhaustions, 0);
+        assert_eq!(stats.acquired_count, 1);
+        assert_eq!(stats.available_count, 3);
+
+        pool.release(idx);
+        let _ = pool.acquire().unwrap();
+        let _ = pool.acquire().unwrap();
+        let stats = pool.stats();
+        assert_eq!(stats.acquisitions, 3);
+        assert_eq!(stats.exhaustions, 0);
+    }
+
+    #[test]
+    fn test_buffer_pool_exhaustion_counter() {
+        let mut ring = match create_test_ring() {
+            Some(r) => r,
+            None => return,
+        };
+
+        let mut pool = match RegisteredBufferPool::new(&mut ring, 4096, 2) {
+            Ok(p) => p,
+            Err(_) => return,
+        };
+
+        // Exhaust the pool
+        let _ = pool.acquire().unwrap();
+        let _ = pool.acquire().unwrap();
+
+        // This should fail and increment exhaustions
+        assert!(pool.acquire().is_err());
+        assert!(pool.try_acquire().is_none());
+
+        let stats = pool.stats();
+        assert_eq!(stats.acquisitions, 2);
+        assert_eq!(stats.exhaustions, 2); // One from acquire(), one from try_acquire()
+        assert_eq!(stats.acquired_count, 2);
+        assert_eq!(stats.available_count, 0);
     }
 
     #[test]

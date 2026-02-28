@@ -50,6 +50,98 @@ pub struct CheckpointConfig {
     pub pre_commit_timeout: Duration,
     /// Whether to use incremental checkpoints.
     pub incremental: bool,
+    /// Maximum operator state size (bytes) to inline in the JSON manifest.
+    ///
+    /// States larger than this threshold are written to a `state.bin` sidecar
+    /// file and referenced by offset/length in the manifest. This avoids
+    /// inflating the manifest with base64-encoded blobs (~33% overhead).
+    ///
+    /// Default: 1 MB (`1_048_576`). Set to `usize::MAX` to inline everything.
+    pub state_inline_threshold: usize,
+    /// Adaptive checkpoint interval configuration.
+    ///
+    /// When `Some`, the coordinator dynamically adjusts the checkpoint interval
+    /// based on observed checkpoint durations using an exponential moving average.
+    /// When `None` (default), the static `interval` is used unchanged.
+    pub adaptive: Option<AdaptiveCheckpointConfig>,
+    /// Unaligned checkpoint configuration.
+    ///
+    /// When `Some`, the coordinator can fall back to unaligned checkpoints
+    /// when barrier alignment takes too long under backpressure.
+    /// When `None` (default), only aligned checkpoints are used.
+    pub unaligned: Option<UnalignedCheckpointConfig>,
+}
+
+/// Configuration for adaptive checkpoint intervals.
+///
+/// Dynamically adjusts the checkpoint interval based on observed checkpoint
+/// durations: `interval = clamp(smoothed_duration / target_ratio, min, max)`.
+///
+/// This avoids checkpointing too frequently under light load (wasting I/O)
+/// or too infrequently under heavy load (increasing recovery time).
+#[derive(Debug, Clone)]
+pub struct AdaptiveCheckpointConfig {
+    /// Minimum checkpoint interval (floor). Default: 10s.
+    pub min_interval: Duration,
+    /// Maximum checkpoint interval (ceiling). Default: 300s.
+    pub max_interval: Duration,
+    /// Target ratio of checkpoint duration to interval.
+    ///
+    /// For example, 0.1 means checkpoints should take at most 10% of the
+    /// time between them. Default: 0.1.
+    pub target_overhead_ratio: f64,
+    /// EMA smoothing factor for checkpoint durations.
+    ///
+    /// Higher values give more weight to recent observations.
+    /// Range: 0.0–1.0. Default: 0.3.
+    pub smoothing_alpha: f64,
+}
+
+impl Default for AdaptiveCheckpointConfig {
+    fn default() -> Self {
+        Self {
+            min_interval: Duration::from_secs(10),
+            max_interval: Duration::from_secs(300),
+            target_overhead_ratio: 0.1,
+            smoothing_alpha: 0.3,
+        }
+    }
+}
+
+/// Configuration for unaligned checkpoints.
+///
+/// When barrier alignment takes too long (due to backpressure on slow inputs),
+/// the checkpoint can fall back to an unaligned snapshot that captures in-flight
+/// data from channels. This trades larger checkpoint size for faster completion.
+#[derive(Debug, Clone)]
+pub struct UnalignedCheckpointConfig {
+    /// Whether unaligned checkpoints are enabled.
+    pub enabled: bool,
+    /// Duration after which aligned checkpoint falls back to unaligned.
+    ///
+    /// If all barriers don't arrive within this threshold after the first
+    /// barrier, the checkpoint switches to unaligned mode. Default: 10s.
+    pub alignment_timeout_threshold: Duration,
+    /// Maximum bytes of in-flight data to buffer per checkpoint.
+    ///
+    /// If the total in-flight data exceeds this, the checkpoint fails
+    /// rather than consuming unbounded memory. Default: 256 MB.
+    pub max_inflight_buffer_bytes: usize,
+    /// Force unaligned mode for all checkpoints (skip aligned attempt).
+    ///
+    /// Useful for testing or when backpressure is known to be persistent.
+    pub force_unaligned: bool,
+}
+
+impl Default for UnalignedCheckpointConfig {
+    fn default() -> Self {
+        Self {
+            enabled: true,
+            alignment_timeout_threshold: Duration::from_secs(10),
+            max_inflight_buffer_bytes: 256 * 1024 * 1024,
+            force_unaligned: false,
+        }
+    }
 }
 
 impl Default for CheckpointConfig {
@@ -60,6 +152,9 @@ impl Default for CheckpointConfig {
             alignment_timeout: Duration::from_secs(30),
             pre_commit_timeout: Duration::from_secs(30),
             incremental: false,
+            state_inline_threshold: 1_048_576,
+            adaptive: None,
+            unaligned: None,
         }
     }
 }
@@ -169,6 +264,12 @@ pub struct CheckpointCoordinator {
     changelog_drainers: Vec<ChangelogDrainer>,
     /// Shared counters for observability.
     counters: Option<Arc<PipelineCounters>>,
+    /// Exponential moving average of checkpoint durations (milliseconds).
+    smoothed_duration_ms: f64,
+    /// Cumulative bytes written across all checkpoints (manifest + sidecar).
+    total_bytes_written: u64,
+    /// Number of checkpoints completed in unaligned mode.
+    unaligned_checkpoint_count: u64,
 }
 
 impl CheckpointCoordinator {
@@ -198,6 +299,9 @@ impl CheckpointCoordinator {
             wal_manager: None,
             changelog_drainers: Vec::new(),
             counters: None,
+            smoothed_duration_ms: 0.0,
+            total_bytes_written: 0,
+            unaligned_checkpoint_count: 0,
         }
     }
 
@@ -487,17 +591,36 @@ impl CheckpointCoordinator {
         manifest.sink_names = self.sorted_sink_names();
         manifest.pipeline_hash = pipeline_hash;
 
-        // Convert operator states to manifest format
+        // Convert operator states to manifest format with sidecar threshold
+        let mut sidecar_blobs: Vec<u8> = Vec::new();
+        let threshold = self.config.state_inline_threshold;
         for (name, data) in &operator_states {
-            manifest.operator_states.insert(
-                name.clone(),
-                laminar_storage::checkpoint_manifest::OperatorCheckpoint::inline(data),
-            );
+            let (op_ckpt, maybe_blob) =
+                laminar_storage::checkpoint_manifest::OperatorCheckpoint::from_bytes(
+                    data,
+                    threshold,
+                    sidecar_blobs.len() as u64,
+                );
+            if let Some(blob) = maybe_blob {
+                sidecar_blobs.extend_from_slice(&blob);
+            }
+            manifest.operator_states.insert(name.clone(), op_ckpt);
         }
+
+        let state_data = if sidecar_blobs.is_empty() {
+            None
+        } else {
+            debug!(
+                checkpoint_id,
+                sidecar_bytes = sidecar_blobs.len(),
+                "writing operator state sidecar"
+            );
+            Some(sidecar_blobs)
+        };
 
         // ── Step 5: Persist manifest (decision record — sinks are Pending) ──
         self.phase = CheckpointPhase::Persisting;
-        if let Err(e) = self.save_manifest(&manifest, None).await {
+        if let Err(e) = self.save_manifest(&manifest, state_data).await {
             self.phase = CheckpointPhase::Idle;
             self.checkpoints_failed += 1;
             let duration = start.elapsed();
@@ -555,6 +678,7 @@ impl CheckpointCoordinator {
         self.last_checkpoint_duration = Some(duration);
         self.duration_histogram.record(duration);
         self.emit_checkpoint_metrics(true, epoch, duration);
+        self.adjust_interval();
 
         info!(
             checkpoint_id,
@@ -762,6 +886,69 @@ impl CheckpointCoordinator {
         &self.config
     }
 
+    /// Adjusts the checkpoint interval based on observed durations.
+    ///
+    /// Uses an exponential moving average (EMA) of checkpoint durations to
+    /// compute a new interval: `interval = smoothed_duration / target_ratio`,
+    /// clamped to `[min_interval, max_interval]`.
+    ///
+    /// No-op if adaptive checkpointing is not configured.
+    fn adjust_interval(&mut self) {
+        let adaptive = match &self.config.adaptive {
+            Some(a) => a.clone(),
+            None => return,
+        };
+
+        #[allow(clippy::cast_precision_loss)] // Checkpoint durations are << 2^52 ms
+        let last_ms = match self.last_checkpoint_duration {
+            Some(d) => d.as_millis() as f64,
+            None => return,
+        };
+
+        // Update EMA
+        if self.smoothed_duration_ms == 0.0 {
+            self.smoothed_duration_ms = last_ms;
+        } else {
+            self.smoothed_duration_ms = adaptive.smoothing_alpha * last_ms
+                + (1.0 - adaptive.smoothing_alpha) * self.smoothed_duration_ms;
+        }
+
+        // Compute target interval: smoothed_ms / (1000 * ratio)
+        let new_interval_secs =
+            self.smoothed_duration_ms / (1000.0 * adaptive.target_overhead_ratio);
+        let new_interval = Duration::from_secs_f64(new_interval_secs);
+
+        // Clamp to bounds
+        let clamped = new_interval.clamp(adaptive.min_interval, adaptive.max_interval);
+
+        let old_interval = self.config.interval;
+        self.config.interval = Some(clamped);
+
+        if old_interval != Some(clamped) {
+            debug!(
+                old_interval_ms = old_interval.map(|d| d.as_millis()),
+                new_interval_ms = clamped.as_millis(),
+                smoothed_duration_ms = self.smoothed_duration_ms,
+                "adaptive checkpoint interval adjusted"
+            );
+        }
+    }
+
+    /// Returns the current smoothed checkpoint duration (milliseconds).
+    ///
+    /// Returns 0.0 if no checkpoints have been completed or adaptive mode
+    /// is not enabled.
+    #[must_use]
+    pub fn smoothed_duration_ms(&self) -> f64 {
+        self.smoothed_duration_ms
+    }
+
+    /// Returns the number of unaligned checkpoints completed.
+    #[must_use]
+    pub fn unaligned_checkpoint_count(&self) -> u64 {
+        self.unaligned_checkpoint_count
+    }
+
     /// Returns checkpoint statistics.
     #[must_use]
     pub fn stats(&self) -> CheckpointStats {
@@ -773,9 +960,10 @@ impl CheckpointCoordinator {
             duration_p50_ms: p50,
             duration_p95_ms: p95,
             duration_p99_ms: p99,
-            total_bytes_written: 0,
+            total_bytes_written: self.total_bytes_written,
             current_phase: self.phase,
             current_epoch: self.epoch,
+            unaligned_checkpoint_count: self.unaligned_checkpoint_count,
         }
     }
 
@@ -875,16 +1063,36 @@ impl CheckpointCoordinator {
         manifest.sink_names = self.sorted_sink_names();
         manifest.pipeline_hash = pipeline_hash;
 
+        // Convert operator states to manifest format with sidecar threshold
+        let mut sidecar_blobs: Vec<u8> = Vec::new();
+        let threshold = self.config.state_inline_threshold;
         for (name, data) in &operator_states {
-            manifest.operator_states.insert(
-                name.clone(),
-                laminar_storage::checkpoint_manifest::OperatorCheckpoint::inline(data),
-            );
+            let (op_ckpt, maybe_blob) =
+                laminar_storage::checkpoint_manifest::OperatorCheckpoint::from_bytes(
+                    data,
+                    threshold,
+                    sidecar_blobs.len() as u64,
+                );
+            if let Some(blob) = maybe_blob {
+                sidecar_blobs.extend_from_slice(&blob);
+            }
+            manifest.operator_states.insert(name.clone(), op_ckpt);
         }
+
+        let state_data = if sidecar_blobs.is_empty() {
+            None
+        } else {
+            debug!(
+                checkpoint_id,
+                sidecar_bytes = sidecar_blobs.len(),
+                "writing operator state sidecar"
+            );
+            Some(sidecar_blobs)
+        };
 
         // ── Step 5: Persist manifest (decision record — sinks are Pending) ──
         self.phase = CheckpointPhase::Persisting;
-        if let Err(e) = self.save_manifest(&manifest, None).await {
+        if let Err(e) = self.save_manifest(&manifest, state_data).await {
             self.phase = CheckpointPhase::Idle;
             self.checkpoints_failed += 1;
             let duration = start.elapsed();
@@ -934,6 +1142,7 @@ impl CheckpointCoordinator {
         self.last_checkpoint_duration = Some(duration);
         self.duration_histogram.record(duration);
         self.emit_checkpoint_metrics(true, epoch, duration);
+        self.adjust_interval();
 
         info!(
             checkpoint_id,
@@ -1131,6 +1340,8 @@ pub struct CheckpointStats {
     pub current_phase: CheckpointPhase,
     /// Current epoch number.
     pub current_epoch: u64,
+    /// Number of checkpoints completed in unaligned mode.
+    pub unaligned_checkpoint_count: u64,
 }
 
 // ── Conversion helpers ──
@@ -1828,9 +2039,9 @@ mod tests {
 
         // With values 1..=100:
         //   p50 ≈ 50, p95 ≈ 95, p99 ≈ 99
-        assert!(p50 >= 49 && p50 <= 51, "p50={p50}");
-        assert!(p95 >= 94 && p95 <= 96, "p95={p95}");
-        assert!(p99 >= 98 && p99 <= 100, "p99={p99}");
+        assert!((49..=51).contains(&p50), "p50={p50}");
+        assert!((94..=96).contains(&p95), "p95={p95}");
+        assert!((98..=100).contains(&p99), "p99={p99}");
     }
 
     #[test]
@@ -1845,7 +2056,171 @@ mod tests {
 
         // Only samples 51..=150 remain in the buffer.
         let p50 = h.percentile(0.50);
-        assert!(p50 >= 99 && p50 <= 101, "p50={p50}");
+        assert!((99..=101).contains(&p50), "p50={p50}");
+    }
+
+    // ── Sidecar threshold tests ──
+
+    #[tokio::test]
+    async fn test_sidecar_round_trip() {
+        let dir = tempfile::tempdir().unwrap();
+        let store = Box::new(FileSystemCheckpointStore::new(dir.path(), 3));
+        let mut config = CheckpointConfig::default();
+        config.state_inline_threshold = 100; // 100 bytes threshold
+        let mut coord = CheckpointCoordinator::new(config, store);
+
+        // Small state stays inline, large state goes to sidecar
+        let mut ops = HashMap::new();
+        ops.insert("small".into(), vec![0xAAu8; 50]);
+        ops.insert("large".into(), vec![0xBBu8; 200]);
+
+        let result = coord
+            .checkpoint(ops, None, 0, vec![], None, HashMap::new(), None)
+            .await
+            .unwrap();
+        assert!(result.success);
+
+        // Verify manifest
+        let loaded = coord.store().load_latest().unwrap().unwrap();
+        let small_op = loaded.operator_states.get("small").unwrap();
+        assert!(!small_op.external, "small state should be inline");
+        assert_eq!(small_op.decode_inline().unwrap(), vec![0xAAu8; 50]);
+
+        let large_op = loaded.operator_states.get("large").unwrap();
+        assert!(large_op.external, "large state should be external");
+        assert_eq!(large_op.external_length, 200);
+
+        // Verify sidecar file exists and has correct data
+        let state_data = coord.store().load_state_data(1).unwrap().unwrap();
+        assert_eq!(state_data.len(), 200);
+        assert!(state_data.iter().all(|&b| b == 0xBB));
+    }
+
+    #[tokio::test]
+    async fn test_all_inline_no_sidecar() {
+        let dir = tempfile::tempdir().unwrap();
+        let store = Box::new(FileSystemCheckpointStore::new(dir.path(), 3));
+        let config = CheckpointConfig::default(); // 1MB threshold
+        let mut coord = CheckpointCoordinator::new(config, store);
+
+        let mut ops = HashMap::new();
+        ops.insert("op1".into(), b"small-state".to_vec());
+
+        let result = coord
+            .checkpoint(ops, None, 0, vec![], None, HashMap::new(), None)
+            .await
+            .unwrap();
+        assert!(result.success);
+
+        // No sidecar file
+        assert!(coord.store().load_state_data(1).unwrap().is_none());
+    }
+
+    // ── Adaptive interval tests ──
+
+    #[test]
+    fn test_adaptive_disabled_by_default() {
+        let dir = tempfile::tempdir().unwrap();
+        let coord = make_coordinator(dir.path());
+        assert!(coord.config().adaptive.is_none());
+        assert_eq!(coord.config().interval, Some(Duration::from_secs(60)));
+    }
+
+    #[test]
+    fn test_adaptive_increases_interval_for_slow_checkpoints() {
+        let dir = tempfile::tempdir().unwrap();
+        let store = Box::new(FileSystemCheckpointStore::new(dir.path(), 3));
+        let mut config = CheckpointConfig::default();
+        config.adaptive = Some(AdaptiveCheckpointConfig::default());
+        let mut coord = CheckpointCoordinator::new(config, store);
+
+        // Simulate a 5-second checkpoint
+        coord.last_checkpoint_duration = Some(Duration::from_secs(5));
+        coord.adjust_interval();
+
+        // Expected: 5000ms / (1000 * 0.1) = 50s
+        let interval = coord.config().interval.unwrap();
+        assert!(
+            interval >= Duration::from_secs(49) && interval <= Duration::from_secs(51),
+            "expected ~50s, got {:?}",
+            interval
+        );
+    }
+
+    #[test]
+    fn test_adaptive_decreases_interval_for_fast_checkpoints() {
+        let dir = tempfile::tempdir().unwrap();
+        let store = Box::new(FileSystemCheckpointStore::new(dir.path(), 3));
+        let mut config = CheckpointConfig::default();
+        config.adaptive = Some(AdaptiveCheckpointConfig::default());
+        let mut coord = CheckpointCoordinator::new(config, store);
+
+        // Simulate a 100ms checkpoint → 100 / (1000 * 0.1) = 1s → clamped to 10s min
+        coord.last_checkpoint_duration = Some(Duration::from_millis(100));
+        coord.adjust_interval();
+
+        let interval = coord.config().interval.unwrap();
+        assert_eq!(
+            interval,
+            Duration::from_secs(10),
+            "should clamp to min_interval"
+        );
+    }
+
+    #[test]
+    fn test_adaptive_clamps_to_min_max() {
+        let dir = tempfile::tempdir().unwrap();
+        let store = Box::new(FileSystemCheckpointStore::new(dir.path(), 3));
+        let mut config = CheckpointConfig::default();
+        config.adaptive = Some(AdaptiveCheckpointConfig {
+            min_interval: Duration::from_secs(20),
+            max_interval: Duration::from_secs(120),
+            target_overhead_ratio: 0.1,
+            smoothing_alpha: 1.0, // Full weight on latest
+        });
+        let mut coord = CheckpointCoordinator::new(config, store);
+
+        // Very slow → clamp to max
+        coord.last_checkpoint_duration = Some(Duration::from_secs(60));
+        coord.adjust_interval();
+        let interval = coord.config().interval.unwrap();
+        assert_eq!(interval, Duration::from_secs(120), "should clamp to max");
+
+        // Very fast → clamp to min
+        coord.last_checkpoint_duration = Some(Duration::from_millis(10));
+        coord.smoothed_duration_ms = 0.0; // Reset EMA
+        coord.adjust_interval();
+        let interval = coord.config().interval.unwrap();
+        assert_eq!(interval, Duration::from_secs(20), "should clamp to min");
+    }
+
+    #[test]
+    fn test_adaptive_ema_smoothing() {
+        let dir = tempfile::tempdir().unwrap();
+        let store = Box::new(FileSystemCheckpointStore::new(dir.path(), 3));
+        let mut config = CheckpointConfig::default();
+        config.adaptive = Some(AdaptiveCheckpointConfig {
+            min_interval: Duration::from_secs(1),
+            max_interval: Duration::from_secs(600),
+            target_overhead_ratio: 0.1,
+            smoothing_alpha: 0.5,
+        });
+        let mut coord = CheckpointCoordinator::new(config, store);
+
+        // First observation: 1000ms → EMA = 1000 (cold start)
+        coord.last_checkpoint_duration = Some(Duration::from_millis(1000));
+        coord.adjust_interval();
+        assert!((coord.smoothed_duration_ms() - 1000.0).abs() < 1.0);
+
+        // Second observation: 2000ms → EMA = 0.5*2000 + 0.5*1000 = 1500
+        coord.last_checkpoint_duration = Some(Duration::from_millis(2000));
+        coord.adjust_interval();
+        assert!((coord.smoothed_duration_ms() - 1500.0).abs() < 1.0);
+
+        // Third observation: 2000ms → EMA = 0.5*2000 + 0.5*1500 = 1750
+        coord.last_checkpoint_duration = Some(Duration::from_millis(2000));
+        coord.adjust_interval();
+        assert!((coord.smoothed_duration_ms() - 1750.0).abs() < 1.0);
     }
 
     #[tokio::test]

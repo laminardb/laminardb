@@ -94,6 +94,25 @@ impl RecoveredState {
     pub fn table_store_checkpoint_path(&self) -> Option<&str> {
         self.manifest.table_store_checkpoint_path.as_deref()
     }
+
+    /// Returns whether this checkpoint has in-flight data (unaligned checkpoint).
+    ///
+    /// When true, the caller should replay the in-flight events before resuming
+    /// normal processing to maintain exactly-once semantics.
+    #[must_use]
+    pub fn has_inflight_data(&self) -> bool {
+        !self.manifest.inflight_data.is_empty()
+    }
+
+    /// Returns the in-flight data from an unaligned checkpoint.
+    ///
+    /// Key: operator name. Value: list of in-flight records per input channel.
+    #[must_use]
+    pub fn inflight_data(
+        &self,
+    ) -> &HashMap<String, Vec<laminar_storage::checkpoint_manifest::InFlightRecord>> {
+        &self.manifest.inflight_data
+    }
 }
 
 /// Unified recovery manager.
@@ -192,6 +211,65 @@ impl<'a> RecoveryManager<'a> {
         Ok(None)
     }
 
+    /// Resolves external operator states by loading the sidecar file.
+    ///
+    /// For any operator state marked as `external`, loads the corresponding
+    /// bytes from `state.bin` and replaces it with an inline entry. This
+    /// makes the rest of recovery code work uniformly with inline state.
+    fn resolve_external_states(&self, manifest: &mut CheckpointManifest) {
+        let has_external = manifest.operator_states.values().any(|op| op.external);
+
+        if !has_external {
+            return;
+        }
+
+        let state_data = match self.store.load_state_data(manifest.checkpoint_id) {
+            Ok(Some(data)) => data,
+            Ok(None) => {
+                warn!(
+                    checkpoint_id = manifest.checkpoint_id,
+                    "sidecar state.bin missing but manifest has external operator states"
+                );
+                return;
+            }
+            Err(e) => {
+                warn!(
+                    checkpoint_id = manifest.checkpoint_id,
+                    error = %e,
+                    "failed to load sidecar state.bin"
+                );
+                return;
+            }
+        };
+
+        for (name, op) in &mut manifest.operator_states {
+            if op.external {
+                #[allow(clippy::cast_possible_truncation)] // Sidecar files are always < 4 GB
+                let start = op.external_offset as usize;
+                #[allow(clippy::cast_possible_truncation)]
+                let end = start + op.external_length as usize;
+                if end <= state_data.len() {
+                    let data = &state_data[start..end];
+                    *op = laminar_storage::checkpoint_manifest::OperatorCheckpoint::inline(data);
+                    debug!(
+                        operator = %name,
+                        offset = op.external_offset,
+                        length = op.external_length,
+                        "resolved external operator state from sidecar"
+                    );
+                } else {
+                    warn!(
+                        operator = %name,
+                        offset = start,
+                        length = op.external_length,
+                        sidecar_len = state_data.len(),
+                        "sidecar too small for external operator state"
+                    );
+                }
+            }
+        }
+    }
+
     /// Restores pipeline state from a loaded manifest.
     ///
     /// This is the inner restore logic shared by both the fast path
@@ -199,11 +277,14 @@ impl<'a> RecoveryManager<'a> {
     #[allow(clippy::too_many_lines)]
     async fn restore_from(
         &self,
-        manifest: CheckpointManifest,
+        mut manifest: CheckpointManifest,
         sources: &[RegisteredSource],
         sinks: &[RegisteredSink],
         table_sources: &[RegisteredSource],
     ) -> RecoveredState {
+        // Resolve external operator states from sidecar before recovery.
+        self.resolve_external_states(&mut manifest);
+
         // Validate manifest consistency before restoring state.
         let validation_errors = manifest.validate();
         if !validation_errors.is_empty() {
@@ -360,6 +441,15 @@ impl<'a> RecoveryManager<'a> {
             }
         }
 
+        // Log inflight data if present (unaligned checkpoint recovery).
+        if !manifest.inflight_data.is_empty() {
+            let total_records: usize = manifest.inflight_data.values().map(Vec::len).sum();
+            info!(
+                operators = manifest.inflight_data.len(),
+                total_records, "unaligned checkpoint: inflight data present for replay"
+            );
+        }
+
         info!(
             checkpoint_id = manifest.checkpoint_id,
             epoch = manifest.epoch,
@@ -367,6 +457,7 @@ impl<'a> RecoveryManager<'a> {
             tables_restored = result.tables_restored,
             sinks_rolled_back = result.sinks_rolled_back,
             errors = result.source_errors.len() + result.sink_errors.len(),
+            has_inflight_data = !manifest.inflight_data.is_empty(),
             "recovery complete"
         );
 
@@ -607,6 +698,110 @@ mod tests {
         // Should use the latest (no fallback needed)
         assert_eq!(result.manifest.checkpoint_id, 2);
         assert_eq!(result.epoch(), 20);
+    }
+
+    #[tokio::test]
+    async fn test_recover_with_sidecar_state() {
+        let dir = tempfile::tempdir().unwrap();
+        let store = make_store(dir.path());
+
+        // Build a manifest with an external operator state
+        let mut manifest = CheckpointManifest::new(1, 5);
+        let large_data = vec![0xAB; 2048];
+        manifest
+            .operator_states
+            .insert("big-op".into(), OperatorCheckpoint::external(0, 2048));
+
+        // Write sidecar first, then manifest
+        store.save_state_data(1, &large_data).unwrap();
+        store.save(&manifest).unwrap();
+
+        let mgr = RecoveryManager::new(&store);
+        let result = mgr.recover(&[], &[], &[]).await.unwrap().unwrap();
+
+        // External state should have been resolved to inline
+        let op = result.operator_states().get("big-op").unwrap();
+        assert!(!op.external, "external state should be resolved to inline");
+        assert_eq!(op.decode_inline().unwrap(), large_data);
+    }
+
+    #[tokio::test]
+    async fn test_recover_mixed_inline_and_external() {
+        let dir = tempfile::tempdir().unwrap();
+        let store = make_store(dir.path());
+
+        let mut manifest = CheckpointManifest::new(1, 3);
+        // Small inline state
+        manifest
+            .operator_states
+            .insert("small-op".into(), OperatorCheckpoint::inline(b"tiny"));
+        // Large external state
+        let large_data = vec![0xCD; 4096];
+        manifest
+            .operator_states
+            .insert("big-op".into(), OperatorCheckpoint::external(0, 4096));
+
+        store.save_state_data(1, &large_data).unwrap();
+        store.save(&manifest).unwrap();
+
+        let mgr = RecoveryManager::new(&store);
+        let result = mgr.recover(&[], &[], &[]).await.unwrap().unwrap();
+
+        let small = result.operator_states().get("small-op").unwrap();
+        assert_eq!(small.decode_inline().unwrap(), b"tiny");
+
+        let big = result.operator_states().get("big-op").unwrap();
+        assert_eq!(big.decode_inline().unwrap(), large_data);
+    }
+
+    #[tokio::test]
+    async fn test_recover_with_inflight_data() {
+        use laminar_storage::checkpoint_manifest::InFlightRecord;
+
+        let dir = tempfile::tempdir().unwrap();
+        let store = make_store(dir.path());
+
+        let mut manifest = CheckpointManifest::new(1, 5);
+        // Pre-encoded "inflight-event" in base64
+        let record = InFlightRecord {
+            input_id: 0,
+            data_b64: "aW5mbGlnaHQtZXZlbnQ=".into(),
+        };
+        manifest
+            .inflight_data
+            .insert("join-op".into(), vec![record]);
+        store.save(&manifest).unwrap();
+
+        let mgr = RecoveryManager::new(&store);
+        let result = mgr.recover(&[], &[], &[]).await.unwrap().unwrap();
+
+        assert!(result.has_inflight_data());
+        let inflight = result.inflight_data();
+        assert_eq!(inflight.len(), 1);
+        let records = inflight.get("join-op").unwrap();
+        assert_eq!(records.len(), 1);
+        assert_eq!(records[0].input_id, 0);
+        assert_eq!(records[0].data_b64, "aW5mbGlnaHQtZXZlbnQ=");
+    }
+
+    #[tokio::test]
+    async fn test_recover_missing_sidecar_graceful() {
+        let dir = tempfile::tempdir().unwrap();
+        let store = make_store(dir.path());
+
+        // Manifest references external state but sidecar is missing
+        let mut manifest = CheckpointManifest::new(1, 1);
+        manifest
+            .operator_states
+            .insert("orphan".into(), OperatorCheckpoint::external(0, 100));
+        store.save(&manifest).unwrap();
+
+        let mgr = RecoveryManager::new(&store);
+        let result = mgr.recover(&[], &[], &[]).await.unwrap().unwrap();
+
+        // Should still recover (gracefully), but external state unresolved
+        let op = result.operator_states().get("orphan").unwrap();
+        assert!(op.external, "unresolved external state stays external");
     }
 
     #[tokio::test]
