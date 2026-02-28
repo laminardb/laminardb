@@ -14,3 +14,7 @@ laminar-db = { path = "../../crates/laminar-db", version = "0.16.0", features = 
 laminar-derive = { path = "../../crates/laminar-derive", version = "0.16.0" }
 arrow = { workspace = true }
 tokio = { workspace = true, features = ["full"] }
+crossterm = "0.29"
+ratatui = { version = "0.30", features = ["all-widgets"] }
+tracing-subscriber = { version = "0.3", features = ["env-filter"] }
+tracing-appender = "0.2"

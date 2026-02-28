@@ -189,8 +189,19 @@ impl CoreWindowState {
         // the Aggregate (e.g., SUM(a)/SUM(b) AS ratio, CASE WHEN ... END).
         // The incremental accumulator emits raw aggregate outputs and cannot
         // apply post-aggregate projections.  Fall through to EOWC raw-batch.
+        //
+        // Check both field count AND types — a coincidental count match (e.g.,
+        // 6 raw aggregates + 2 groups == 8 SELECT items) can mask a projection
+        // that remaps group columns to computed aggregates (causing schema
+        // corruption where a group type like Timestamp ends up under an
+        // aggregate alias like "vwap").
         if top_schema.fields().len() != agg_schema.fields().len() {
             return Ok(None);
+        }
+        for (top_f, agg_f) in top_schema.fields().iter().zip(agg_schema.fields()) {
+            if top_f.data_type() != agg_f.data_type() {
+                return Ok(None);
+            }
         }
 
         let num_group_cols = group_exprs.len();
