@@ -14,6 +14,13 @@
 //! 5. For each exactly-once sink: `sink.rollback_epoch(manifest.epoch)`
 //! 6. If DAG: `dag_executor.restore(manifest.operator_states)` via conversion
 //! 7. Return recovered state (watermark, epoch, operator states)
+//!
+//! ## Fallback Recovery
+//!
+//! If the latest checkpoint is corrupt or fails to restore, the manager
+//! iterates through all available checkpoints in reverse chronological order
+//! until one succeeds. This prevents a single corrupt checkpoint from causing
+//! total data loss.
 
 use std::collections::HashMap;
 
@@ -105,7 +112,8 @@ impl<'a> RecoveryManager<'a> {
         Self { store }
     }
 
-    /// Attempts to recover from the latest checkpoint.
+    /// Attempts to recover from the latest checkpoint, with fallback to older
+    /// checkpoints if the latest is corrupt or fails to restore.
     ///
     /// Returns `Ok(None)` if no checkpoint exists (fresh start).
     /// Returns `Ok(Some(RecoveredState))` on successful recovery.
@@ -114,27 +122,91 @@ impl<'a> RecoveryManager<'a> {
     /// in `RecoveredState` but do not abort the entire recovery. This allows
     /// partial recovery (e.g., one source fails to seek but others succeed).
     ///
+    /// ## Fallback Behavior
+    ///
+    /// If the latest checkpoint fails (corrupt manifest, deserialization error),
+    /// the manager iterates through all available checkpoints in reverse
+    /// chronological order until one succeeds or all are exhausted. This
+    /// prevents a single corrupt checkpoint from causing total data loss.
+    ///
     /// # Errors
     ///
-    /// Returns `DbError::Checkpoint` only if the checkpoint store itself fails.
-    #[allow(clippy::too_many_lines)]
+    /// Returns `DbError::Checkpoint` only if the checkpoint store itself fails
+    /// in an unrecoverable way (e.g., filesystem permissions).
     pub(crate) async fn recover(
         &self,
         sources: &[RegisteredSource],
         sinks: &[RegisteredSink],
         table_sources: &[RegisteredSource],
     ) -> Result<Option<RecoveredState>, DbError> {
-        // Step 1: Load latest manifest
-        let manifest = self
-            .store
-            .load_latest()
-            .map_err(|e| DbError::Checkpoint(format!("failed to load checkpoint: {e}")))?;
+        // Fast path: try load_latest() first.
+        match self.store.load_latest() {
+            Ok(Some(manifest)) => {
+                return Ok(Some(
+                    self.restore_from(manifest, sources, sinks, table_sources)
+                        .await,
+                ));
+            }
+            Ok(None) => {
+                info!("no checkpoint found, starting fresh");
+                return Ok(None);
+            }
+            Err(e) => {
+                warn!(error = %e, "latest checkpoint load failed, trying fallback");
+            }
+        }
 
-        let Some(manifest) = manifest else {
-            info!("no checkpoint found, starting fresh");
+        // Fallback: iterate through all checkpoints in reverse order.
+        let checkpoints = self.store.list().map_err(|e| {
+            DbError::Checkpoint(format!("failed to list checkpoints for fallback: {e}"))
+        })?;
+
+        if checkpoints.is_empty() {
+            warn!("no checkpoints available for fallback, starting fresh");
             return Ok(None);
-        };
+        }
 
+        for &(checkpoint_id, _epoch) in checkpoints.iter().rev() {
+            match self.store.load_by_id(checkpoint_id) {
+                Ok(Some(manifest)) => {
+                    info!(
+                        checkpoint_id,
+                        "recovering from fallback checkpoint"
+                    );
+                    let result = self
+                        .restore_from(manifest, sources, sinks, table_sources)
+                        .await;
+                    return Ok(Some(result));
+                }
+                Ok(None) => {
+                    debug!(checkpoint_id, "fallback checkpoint not found, skipping");
+                }
+                Err(e) => {
+                    warn!(
+                        checkpoint_id,
+                        error = %e,
+                        "fallback checkpoint load failed, trying next"
+                    );
+                }
+            }
+        }
+
+        warn!("all checkpoints failed to load, starting fresh");
+        Ok(None)
+    }
+
+    /// Restores pipeline state from a loaded manifest.
+    ///
+    /// This is the inner restore logic shared by both the fast path
+    /// (latest checkpoint) and fallback path (older checkpoints).
+    #[allow(clippy::too_many_lines)]
+    async fn restore_from(
+        &self,
+        manifest: CheckpointManifest,
+        sources: &[RegisteredSource],
+        sinks: &[RegisteredSink],
+        table_sources: &[RegisteredSource],
+    ) -> RecoveredState {
         // Validate manifest consistency before restoring state.
         let validation_errors = manifest.validate();
         if !validation_errors.is_empty() {
@@ -143,6 +215,63 @@ impl<'a> RecoveryManager<'a> {
                     checkpoint_id = manifest.checkpoint_id,
                     error = %err,
                     "manifest validation warning"
+                );
+            }
+        }
+
+        // Topology drift detection: compare current sources/sinks against
+        // the checkpoint to warn the operator about changes.
+        if !manifest.source_names.is_empty() {
+            let mut current_sources: Vec<&str> =
+                sources.iter().map(|s| s.name.as_str()).collect();
+            current_sources.sort_unstable();
+            let checkpoint_sources: Vec<&str> =
+                manifest.source_names.iter().map(String::as_str).collect();
+            let added: Vec<&&str> = current_sources
+                .iter()
+                .filter(|n| !checkpoint_sources.contains(n))
+                .collect();
+            let removed: Vec<&&str> = checkpoint_sources
+                .iter()
+                .filter(|n| !current_sources.contains(n))
+                .collect();
+            if !added.is_empty() {
+                warn!(
+                    sources = ?added,
+                    "new sources added since checkpoint — no saved offsets"
+                );
+            }
+            if !removed.is_empty() {
+                warn!(
+                    sources = ?removed,
+                    "sources removed since checkpoint — orphaned offsets"
+                );
+            }
+        }
+        if !manifest.sink_names.is_empty() {
+            let mut current_sinks: Vec<&str> =
+                sinks.iter().map(|s| s.name.as_str()).collect();
+            current_sinks.sort_unstable();
+            let checkpoint_sinks: Vec<&str> =
+                manifest.sink_names.iter().map(String::as_str).collect();
+            let added: Vec<&&str> = current_sinks
+                .iter()
+                .filter(|n| !checkpoint_sinks.contains(n))
+                .collect();
+            let removed: Vec<&&str> = checkpoint_sinks
+                .iter()
+                .filter(|n| !current_sinks.contains(n))
+                .collect();
+            if !added.is_empty() {
+                warn!(
+                    sinks = ?added,
+                    "new sinks added since checkpoint — no saved epoch"
+                );
+            }
+            if !removed.is_empty() {
+                warn!(
+                    sinks = ?removed,
+                    "sinks removed since checkpoint — orphaned epochs"
                 );
             }
         }
@@ -165,6 +294,13 @@ impl<'a> RecoveryManager<'a> {
 
         // Step 3: Restore source offsets
         for source in sources {
+            if !source.supports_replay {
+                info!(
+                    source = %source.name,
+                    "skipping restore for non-replayable source (at-most-once)"
+                );
+                continue;
+            }
             if let Some(cp) = manifest.source_offsets.get(&source.name) {
                 let source_cp = connector_to_source_checkpoint(cp);
                 let mut connector = source.connector.lock().await;
@@ -239,7 +375,7 @@ impl<'a> RecoveryManager<'a> {
             "recovery complete"
         );
 
-        Ok(Some(result))
+        result
     }
 
     /// Loads the latest manifest without performing recovery.
@@ -403,6 +539,79 @@ mod tests {
         assert_eq!(m2.checkpoint_id, 2);
 
         assert!(mgr.load_by_id(999).unwrap().is_none());
+    }
+
+    #[tokio::test]
+    async fn test_recover_fallback_to_previous_checkpoint() {
+        let dir = tempfile::tempdir().unwrap();
+        let store = FileSystemCheckpointStore::new(dir.path(), 10);
+
+        // Save two valid checkpoints
+        let mut m1 = CheckpointManifest::new(1, 10);
+        m1.watermark = Some(1000);
+        store.save(&m1).unwrap();
+
+        let mut m2 = CheckpointManifest::new(2, 20);
+        m2.watermark = Some(2000);
+        store.save(&m2).unwrap();
+
+        // Corrupt the latest checkpoint by writing invalid JSON
+        let latest_manifest_path = dir
+            .path()
+            .join("checkpoints")
+            .join("checkpoint_000002")
+            .join("manifest.json");
+        std::fs::write(&latest_manifest_path, "not valid json!!!").unwrap();
+
+        // Also corrupt latest.txt to point to the corrupt checkpoint
+        // (it already does from the save, but the manifest file is now corrupt)
+
+        let mgr = RecoveryManager::new(&store);
+        let result = mgr.recover(&[], &[], &[]).await.unwrap();
+
+        // Should fall back to checkpoint 1
+        let recovered = result.expect("should recover from fallback checkpoint");
+        assert_eq!(recovered.manifest.checkpoint_id, 1);
+        assert_eq!(recovered.epoch(), 10);
+        assert_eq!(recovered.watermark(), Some(1000));
+    }
+
+    #[tokio::test]
+    async fn test_recover_all_checkpoints_corrupt_starts_fresh() {
+        let dir = tempfile::tempdir().unwrap();
+        let store = FileSystemCheckpointStore::new(dir.path(), 10);
+
+        // Save a checkpoint then corrupt it
+        store.save(&CheckpointManifest::new(1, 5)).unwrap();
+
+        let manifest_path = dir
+            .path()
+            .join("checkpoints")
+            .join("checkpoint_000001")
+            .join("manifest.json");
+        std::fs::write(&manifest_path, "corrupt").unwrap();
+
+        let mgr = RecoveryManager::new(&store);
+        let result = mgr.recover(&[], &[], &[]).await.unwrap();
+
+        // All checkpoints corrupt → fresh start
+        assert!(result.is_none());
+    }
+
+    #[tokio::test]
+    async fn test_recover_latest_ok_no_fallback_needed() {
+        let dir = tempfile::tempdir().unwrap();
+        let store = FileSystemCheckpointStore::new(dir.path(), 10);
+
+        store.save(&CheckpointManifest::new(1, 10)).unwrap();
+        store.save(&CheckpointManifest::new(2, 20)).unwrap();
+
+        let mgr = RecoveryManager::new(&store);
+        let result = mgr.recover(&[], &[], &[]).await.unwrap().unwrap();
+
+        // Should use the latest (no fallback needed)
+        assert_eq!(result.manifest.checkpoint_id, 2);
+        assert_eq!(result.epoch(), 20);
     }
 
     #[tokio::test]

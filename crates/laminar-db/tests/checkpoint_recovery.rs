@@ -36,14 +36,14 @@ async fn test_happy_path_checkpoint_and_recovery() {
     let source_handle: Arc<
         tokio::sync::Mutex<Box<dyn laminar_connectors::connector::SourceConnector>>,
     > = Arc::new(tokio::sync::Mutex::new(Box::new(source)));
-    coord.register_source("trades", Arc::clone(&source_handle));
+    coord.register_source("trades", Arc::clone(&source_handle), true);
 
     // Perform checkpoint with operator state
     let mut ops = HashMap::new();
     ops.insert("window-agg".into(), b"accumulated-state".to_vec());
 
     let result = coord
-        .checkpoint(ops, Some(5000), 1024, vec![100, 200], None)
+        .checkpoint(ops, Some(5000), 1024, vec![100, 200], None, HashMap::new(), None)
         .await
         .unwrap();
 
@@ -201,6 +201,8 @@ async fn test_wal_positions_recovery() {
             8192,
             vec![512, 1024, 256, 768],
             None,
+            HashMap::new(),
+            None,
         )
         .await
         .unwrap();
@@ -230,6 +232,8 @@ async fn test_table_store_checkpoint_path_recovery() {
             0,
             vec![],
             Some("/data/rocksdb_cp_001".into()),
+            HashMap::new(),
+            None,
         )
         .await
         .unwrap();
@@ -257,11 +261,11 @@ async fn test_coordinator_resumes_epoch_after_recovery() {
     {
         let mut coord = make_coordinator(dir.path());
         coord
-            .checkpoint(HashMap::new(), Some(1000), 0, vec![], None)
+            .checkpoint(HashMap::new(), Some(1000), 0, vec![], None, HashMap::new(), None)
             .await
             .unwrap();
         coord
-            .checkpoint(HashMap::new(), Some(2000), 0, vec![], None)
+            .checkpoint(HashMap::new(), Some(2000), 0, vec![], None, HashMap::new(), None)
             .await
             .unwrap();
 
@@ -289,7 +293,7 @@ async fn test_incremental_checkpoint_flag() {
     let mut coord = CheckpointCoordinator::new(config, store);
 
     let result = coord
-        .checkpoint(HashMap::new(), None, 0, vec![], None)
+        .checkpoint(HashMap::new(), None, 0, vec![], None, HashMap::new(), None)
         .await
         .unwrap();
 

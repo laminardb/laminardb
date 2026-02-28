@@ -6,6 +6,7 @@ use std::sync::Arc;
 use arrow::array::{BooleanArray, RecordBatch, StringArray, UInt64Array};
 use arrow::datatypes::{DataType, Field, Schema};
 use datafusion::prelude::SessionContext;
+use laminar_connectors::checkpoint::SourceCheckpoint;
 use laminar_core::streaming;
 use laminar_sql::parser::{parse_streaming_sql, ShowCommand, StreamingStatement};
 use laminar_sql::planner::StreamingPlanner;
@@ -1949,7 +1950,7 @@ impl LaminarDB {
             DbError::Checkpoint("coordinator not initialized — call start() first".to_string())
         })?;
         coord
-            .checkpoint(HashMap::new(), None, 0, Vec::new(), None)
+            .checkpoint(HashMap::new(), None, 0, Vec::new(), None, HashMap::new(), None)
             .await
     }
 
@@ -2431,10 +2432,19 @@ impl LaminarDB {
                         config.connector_type()
                     ))
                 })?;
+            let supports_replay = source.supports_replay();
+            if !supports_replay {
+                tracing::warn!(
+                    source = %name,
+                    "source does not support replay — exactly-once semantics \
+                     are degraded to at-most-once for this source"
+                );
+            }
             sources.push(SourceRegistration {
                 name: name.clone(),
                 connector: source,
                 config,
+                supports_replay,
             });
         }
 
@@ -2706,6 +2716,7 @@ impl LaminarDB {
             fallback_poll_interval: std::time::Duration::from_millis(10),
             checkpoint_interval,
             batch_window: std::time::Duration::from_millis(5),
+            barrier_alignment_timeout: std::time::Duration::from_secs(30),
         };
 
         // Create the coordinator (opens and spawns per-source tasks).
@@ -2720,6 +2731,23 @@ impl LaminarDB {
         let coordinator = Arc::clone(&self.coordinator);
         let table_store_for_loop = self.table_store.clone();
         let ctx_for_sync = self.ctx.clone();
+
+        // Compute a pipeline hash for change detection across checkpoints.
+        let pipeline_hash = {
+            use std::hash::{Hash, Hasher};
+            let mut hasher = std::collections::hash_map::DefaultHasher::new();
+            for reg in stream_regs.values() {
+                reg.name.hash(&mut hasher);
+                reg.query_sql.hash(&mut hasher);
+            }
+            for name in source_regs.keys() {
+                name.hash(&mut hasher);
+            }
+            for name in sink_regs.keys() {
+                name.hash(&mut hasher);
+            }
+            Some(hasher.finish())
+        };
 
         let callback = ConnectorPipelineCallback {
             executor,
@@ -2737,6 +2765,7 @@ impl LaminarDB {
             table_store: table_store_for_loop,
             ctx: ctx_for_sync,
             last_checkpoint: std::time::Instant::now(),
+            pipeline_hash,
         };
 
         // Spawn the coordinator as the single pipeline task.
@@ -3500,6 +3529,7 @@ struct ConnectorPipelineCallback {
     table_store: Arc<parking_lot::Mutex<crate::table_store::TableStore>>,
     ctx: SessionContext,
     last_checkpoint: std::time::Instant,
+    pipeline_hash: Option<u64>,
 }
 
 #[async_trait::async_trait]
@@ -3709,6 +3739,15 @@ impl crate::pipeline::PipelineCallback for ConnectorPipelineCallback {
             }
         }
 
+        // Collect per-source watermarks from the watermark tracker.
+        let mut per_source_watermarks = HashMap::new();
+        for (name, wm_state) in &self.watermark_states {
+            let wm = wm_state.generator.current_watermark();
+            if wm > i64::MIN {
+                per_source_watermarks.insert(name.clone(), wm);
+            }
+        }
+
         if force {
             // Blocking checkpoint at shutdown.
             let mut guard = self.coordinator.lock().await;
@@ -3721,6 +3760,8 @@ impl crate::pipeline::PipelineCallback for ConnectorPipelineCallback {
                         Vec::new(),
                         None,
                         extra_tables,
+                        per_source_watermarks,
+                        self.pipeline_hash,
                     )
                     .await
                 {
@@ -3744,6 +3785,7 @@ impl crate::pipeline::PipelineCallback for ConnectorPipelineCallback {
             let coord_clone = Arc::clone(&self.coordinator);
             let in_progress = Arc::clone(&self.checkpoint_in_progress);
             in_progress.store(true, std::sync::atomic::Ordering::Relaxed);
+            let pipeline_hash = self.pipeline_hash;
 
             tokio::spawn(async move {
                 let mut guard = coord_clone.lock().await;
@@ -3756,6 +3798,8 @@ impl crate::pipeline::PipelineCallback for ConnectorPipelineCallback {
                             Vec::new(),
                             None,
                             extra_tables,
+                            per_source_watermarks,
+                            pipeline_hash,
                         )
                         .await
                     {
@@ -3784,6 +3828,99 @@ impl crate::pipeline::PipelineCallback for ConnectorPipelineCallback {
 
         self.last_checkpoint = std::time::Instant::now();
         true
+    }
+
+    async fn checkpoint_with_barrier(
+        &mut self,
+        source_checkpoints: HashMap<String, SourceCheckpoint>,
+    ) -> bool {
+        use crate::checkpoint_coordinator::source_to_connector_checkpoint;
+
+        if self
+            .counters
+            .cycles
+            .load(std::sync::atomic::Ordering::Relaxed)
+            == 0
+        {
+            return false;
+        }
+
+        // Capture table source offsets.
+        let mut extra_tables = HashMap::new();
+        for (name, source, _) in &self.table_sources {
+            extra_tables.insert(
+                name.clone(),
+                source_to_connector_checkpoint(&source.checkpoint()),
+            );
+        }
+
+        // Capture stream executor aggregate state — now consistent because
+        // all pre-barrier data has been executed.
+        let mut operator_states = HashMap::new();
+        match self.executor.checkpoint_state() {
+            Ok(Some(bytes)) => {
+                operator_states.insert("stream_executor".to_string(), bytes);
+            }
+            Ok(None) => {}
+            Err(e) => {
+                tracing::warn!(error = %e, "Stream executor checkpoint capture failed");
+            }
+        }
+
+        // Collect per-source watermarks.
+        let mut per_source_watermarks = HashMap::new();
+        for (name, wm_state) in &self.watermark_states {
+            let wm = wm_state.generator.current_watermark();
+            if wm > i64::MIN {
+                per_source_watermarks.insert(name.clone(), wm);
+            }
+        }
+
+        // Merge barrier-captured source offsets into the extra_tables map.
+        for (name, cp) in &source_checkpoints {
+            extra_tables
+                .entry(name.clone())
+                .or_insert_with(|| source_to_connector_checkpoint(cp));
+        }
+
+        let mut guard = self.coordinator.lock().await;
+        if let Some(ref mut coord) = *guard {
+            match coord
+                .checkpoint_with_extra_tables(
+                    operator_states,
+                    None,
+                    0,
+                    Vec::new(),
+                    None,
+                    extra_tables,
+                    per_source_watermarks,
+                    self.pipeline_hash,
+                )
+                .await
+            {
+                Ok(result) if result.success => {
+                    tracing::info!(
+                        epoch = result.epoch,
+                        duration_ms = result.duration.as_millis(),
+                        "Barrier-aligned checkpoint completed"
+                    );
+                    self.last_checkpoint = std::time::Instant::now();
+                    return true;
+                }
+                Ok(result) => {
+                    tracing::warn!(
+                        epoch = result.epoch,
+                        error = ?result.error,
+                        "Barrier-aligned checkpoint failed"
+                    );
+                }
+                Err(e) => {
+                    tracing::warn!(error = %e, "Barrier-aligned checkpoint error");
+                }
+            }
+        }
+
+        false
     }
 
     fn record_cycle(&self, events_ingested: u64, _batches: u64, elapsed_ns: u64) {

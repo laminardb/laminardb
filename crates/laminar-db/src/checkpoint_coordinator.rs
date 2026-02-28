@@ -115,6 +115,11 @@ pub(crate) struct RegisteredSource {
     pub name: String,
     /// Source connector handle.
     pub connector: Arc<tokio::sync::Mutex<Box<dyn SourceConnector>>>,
+    /// Whether this source supports replay from a checkpointed position.
+    ///
+    /// Sources that do not support replay (e.g., WebSocket) degrade
+    /// exactly-once semantics to at-most-once.
+    pub supports_replay: bool,
 }
 
 /// Registered sink for checkpoint coordination.
@@ -194,14 +199,29 @@ impl CheckpointCoordinator {
     }
 
     /// Registers a source connector for checkpoint coordination.
+    ///
+    /// The `supports_replay` flag indicates whether the source can seek
+    /// back to a checkpointed offset. Sources that cannot replay (e.g.,
+    /// WebSocket) will log a warning since exactly-once semantics are
+    /// degraded to at-most-once for events from that source.
     pub fn register_source(
         &mut self,
         name: impl Into<String>,
         connector: Arc<tokio::sync::Mutex<Box<dyn SourceConnector>>>,
+        supports_replay: bool,
     ) {
+        let name = name.into();
+        if !supports_replay {
+            warn!(
+                source = %name,
+                "source does not support replay — exactly-once semantics \
+                 are degraded to at-most-once for this source"
+            );
+        }
         self.sources.push(RegisteredSource {
-            name: name.into(),
+            name,
             connector,
+            supports_replay,
         });
     }
 
@@ -228,6 +248,7 @@ impl CheckpointCoordinator {
         self.table_sources.push(RegisteredSource {
             name: name.into(),
             connector,
+            supports_replay: true, // Table sources are always replayable
         });
     }
 
@@ -394,6 +415,8 @@ impl CheckpointCoordinator {
         wal_position: u64,
         per_core_wal_positions: Vec<u64>,
         table_store_checkpoint_path: Option<String>,
+        source_watermarks: HashMap<String, i64>,
+        pipeline_hash: Option<u64>,
     ) -> Result<CheckpointResult, DbError> {
         let start = Instant::now();
         let checkpoint_id = self.next_checkpoint_id;
@@ -444,15 +467,22 @@ impl CheckpointCoordinator {
         // Mark all exactly-once sinks as Pending before commit phase.
         manifest.sink_commit_statuses = self.initial_sink_commit_statuses();
         manifest.watermark = watermark;
-        // Persist per-source watermarks to prevent watermark regression on
-        // recovery. Uses the global watermark as a lower bound for all sources.
-        if let Some(wm) = watermark {
-            manifest.source_watermarks = self.collect_source_watermarks(wm);
+        // Prefer caller-provided per-source watermarks (from the pipeline's
+        // watermark tracker). Fall back to global watermark if none provided.
+        if source_watermarks.is_empty() {
+            if let Some(wm) = watermark {
+                manifest.source_watermarks = self.collect_source_watermarks(wm);
+            }
+        } else {
+            manifest.source_watermarks = source_watermarks;
         }
         manifest.wal_position = wal_position;
         manifest.per_core_wal_positions = per_core_wal_positions;
         manifest.table_store_checkpoint_path = table_store_checkpoint_path;
         manifest.is_incremental = self.config.incremental;
+        manifest.source_names = self.sorted_source_names();
+        manifest.sink_names = self.sorted_sink_names();
+        manifest.pipeline_hash = pipeline_hash;
 
         // Convert operator states to manifest format
         for (name, data) in &operator_states {
@@ -679,6 +709,20 @@ impl CheckpointCoordinator {
         watermarks
     }
 
+    /// Returns sorted source names for topology tracking in the manifest.
+    fn sorted_source_names(&self) -> Vec<String> {
+        let mut names: Vec<String> = self.sources.iter().map(|s| s.name.clone()).collect();
+        names.sort();
+        names
+    }
+
+    /// Returns sorted sink names for topology tracking in the manifest.
+    fn sorted_sink_names(&self) -> Vec<String> {
+        let mut names: Vec<String> = self.sinks.iter().map(|s| s.name.clone()).collect();
+        names.sort();
+        names
+    }
+
     /// Returns the current phase.
     #[must_use]
     pub fn phase(&self) -> CheckpointPhase {
@@ -740,6 +784,8 @@ impl CheckpointCoordinator {
         per_core_wal_positions: Vec<u64>,
         table_store_checkpoint_path: Option<String>,
         extra_table_offsets: HashMap<String, ConnectorCheckpoint>,
+        source_watermarks: HashMap<String, i64>,
+        pipeline_hash: Option<u64>,
     ) -> Result<CheckpointResult, DbError> {
         let start = Instant::now();
         let checkpoint_id = self.next_checkpoint_id;
@@ -794,13 +840,20 @@ impl CheckpointCoordinator {
         manifest.sink_epochs = self.collect_sink_epochs();
         manifest.sink_commit_statuses = self.initial_sink_commit_statuses();
         manifest.watermark = watermark;
-        if let Some(wm) = watermark {
-            manifest.source_watermarks = self.collect_source_watermarks(wm);
+        if source_watermarks.is_empty() {
+            if let Some(wm) = watermark {
+                manifest.source_watermarks = self.collect_source_watermarks(wm);
+            }
+        } else {
+            manifest.source_watermarks = source_watermarks;
         }
         manifest.wal_position = wal_position;
         manifest.per_core_wal_positions = per_core_wal_positions;
         manifest.table_store_checkpoint_path = table_store_checkpoint_path;
         manifest.is_incremental = self.config.incremental;
+        manifest.source_names = self.sorted_source_names();
+        manifest.sink_names = self.sorted_sink_names();
+        manifest.pipeline_hash = pipeline_hash;
 
         for (name, data) in &operator_states {
             manifest.operator_states.insert(
@@ -1139,7 +1192,7 @@ mod tests {
         let mut coord = make_coordinator(dir.path());
 
         let result = coord
-            .checkpoint(HashMap::new(), Some(1000), 0, vec![], None)
+            .checkpoint(HashMap::new(), Some(1000), 0, vec![], None, HashMap::new(), None)
             .await
             .unwrap();
 
@@ -1155,7 +1208,7 @@ mod tests {
 
         // Second checkpoint should increment
         let result2 = coord
-            .checkpoint(HashMap::new(), Some(2000), 100, vec![], None)
+            .checkpoint(HashMap::new(), Some(2000), 100, vec![], None, HashMap::new(), None)
             .await
             .unwrap();
 
@@ -1178,7 +1231,7 @@ mod tests {
         ops.insert("filter".into(), b"filter-state".to_vec());
 
         let result = coord
-            .checkpoint(ops, None, 4096, vec![100, 200], None)
+            .checkpoint(ops, None, 4096, vec![100, 200], None, HashMap::new(), None)
             .await
             .unwrap();
 
@@ -1205,6 +1258,8 @@ mod tests {
                 0,
                 vec![],
                 Some("/tmp/rocksdb_cp".into()),
+                HashMap::new(),
+                None,
             )
             .await
             .unwrap();
@@ -1466,6 +1521,8 @@ mod tests {
                 0,
                 wal_result.per_core_wal_positions.clone(),
                 None,
+                HashMap::new(),
+                None,
             )
             .await
             .unwrap();
@@ -1540,7 +1597,7 @@ mod tests {
         coord.set_counters(Arc::clone(&counters));
 
         let result = coord
-            .checkpoint(HashMap::new(), Some(1000), 0, vec![], None)
+            .checkpoint(HashMap::new(), Some(1000), 0, vec![], None, HashMap::new(), None)
             .await
             .unwrap();
 
@@ -1552,7 +1609,7 @@ mod tests {
 
         // Second checkpoint
         let result2 = coord
-            .checkpoint(HashMap::new(), Some(2000), 0, vec![], None)
+            .checkpoint(HashMap::new(), Some(2000), 0, vec![], None, HashMap::new(), None)
             .await
             .unwrap();
 
@@ -1568,7 +1625,7 @@ mod tests {
         let mut coord = make_coordinator(dir.path());
 
         let result = coord
-            .checkpoint(HashMap::new(), None, 0, vec![], None)
+            .checkpoint(HashMap::new(), None, 0, vec![], None, HashMap::new(), None)
             .await
             .unwrap();
 

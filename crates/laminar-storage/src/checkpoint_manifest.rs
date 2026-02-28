@@ -98,6 +98,26 @@ pub struct CheckpointManifest {
     #[serde(default)]
     pub source_watermarks: HashMap<String, i64>,
 
+    // ── Topology ──
+    /// Sorted names of all registered sources at checkpoint time.
+    ///
+    /// Used during recovery to detect topology changes (added/removed sources)
+    /// and warn the operator.
+    #[serde(default)]
+    pub source_names: Vec<String>,
+    /// Sorted names of all registered sinks at checkpoint time.
+    #[serde(default)]
+    pub sink_names: Vec<String>,
+
+    // ── Pipeline Identity ──
+    /// Hash of the pipeline configuration at checkpoint time.
+    ///
+    /// Computed from SQL queries, source/sink configuration, and connector
+    /// options. Recovery logs a warning when this changes, indicating
+    /// operator state may be incompatible with the new configuration.
+    #[serde(default)]
+    pub pipeline_hash: Option<u64>,
+
     // ── Metadata ──
     /// Total size of all checkpoint data in bytes (manifest + state.bin).
     #[serde(default)]
@@ -168,6 +188,19 @@ impl CheckpointManifest {
             }
         }
 
+        // Source offsets should reference known sources (if topology is recorded)
+        if !self.source_names.is_empty() {
+            for name in self.source_offsets.keys() {
+                if !self.source_names.contains(name) {
+                    errors.push(ManifestValidationError {
+                        message: format!(
+                            "source_offsets contains '{name}' not in source_names"
+                        ),
+                    });
+                }
+            }
+        }
+
         // Incremental checkpoints must have a parent
         if self.is_incremental && self.parent_id.is_none() {
             errors.push(ManifestValidationError {
@@ -202,6 +235,9 @@ impl CheckpointManifest {
             per_core_wal_positions: Vec::new(),
             watermark: None,
             source_watermarks: HashMap::new(),
+            source_names: Vec::new(),
+            sink_names: Vec::new(),
+            pipeline_hash: None,
             size_bytes: 0,
             is_incremental: false,
             parent_id: None,
@@ -456,5 +492,69 @@ mod tests {
             restored.table_store_checkpoint_path.as_deref(),
             Some("/tmp/rocksdb_cp")
         );
+    }
+
+    #[test]
+    fn test_manifest_topology_fields_round_trip() {
+        let mut m = CheckpointManifest::new(1, 1);
+        m.source_names = vec!["kafka-clicks".into(), "ws-prices".into()];
+        m.sink_names = vec!["pg-sink".into()];
+
+        let json = serde_json::to_string(&m).unwrap();
+        let restored: CheckpointManifest = serde_json::from_str(&json).unwrap();
+
+        assert_eq!(restored.source_names, vec!["kafka-clicks", "ws-prices"]);
+        assert_eq!(restored.sink_names, vec!["pg-sink"]);
+    }
+
+    #[test]
+    fn test_manifest_topology_backward_compat() {
+        // Older manifests without topology fields should deserialize fine.
+        let json = r#"{
+            "version": 1,
+            "checkpoint_id": 5,
+            "epoch": 3,
+            "timestamp_ms": 1000
+        }"#;
+        let m: CheckpointManifest = serde_json::from_str(json).unwrap();
+        assert!(m.source_names.is_empty());
+        assert!(m.sink_names.is_empty());
+    }
+
+    #[test]
+    fn test_validate_orphaned_source_offset() {
+        let mut m = CheckpointManifest::new(1, 1);
+        m.source_names = vec!["a".into(), "b".into()];
+        m.source_offsets
+            .insert("c".into(), ConnectorCheckpoint::new(1));
+
+        let errors = m.validate();
+        assert!(
+            errors.iter().any(|e| e.message.contains("'c' not in source_names")),
+            "expected orphaned source offset error: {errors:?}"
+        );
+    }
+
+    #[test]
+    fn test_manifest_pipeline_hash_round_trip() {
+        let mut m = CheckpointManifest::new(1, 1);
+        m.pipeline_hash = Some(0xDEAD_BEEF_CAFE_1234);
+
+        let json = serde_json::to_string(&m).unwrap();
+        let restored: CheckpointManifest = serde_json::from_str(&json).unwrap();
+
+        assert_eq!(restored.pipeline_hash, Some(0xDEAD_BEEF_CAFE_1234));
+    }
+
+    #[test]
+    fn test_manifest_pipeline_hash_backward_compat() {
+        let json = r#"{
+            "version": 1,
+            "checkpoint_id": 1,
+            "epoch": 1,
+            "timestamp_ms": 1000
+        }"#;
+        let m: CheckpointManifest = serde_json::from_str(json).unwrap();
+        assert!(m.pipeline_hash.is_none());
     }
 }

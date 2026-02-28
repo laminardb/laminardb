@@ -269,7 +269,8 @@ impl CheckpointStore for FileSystemCheckpointStore {
         let mut result = Vec::with_capacity(ids.len());
 
         for id in ids {
-            if let Some(manifest) = self.load_by_id(id)? {
+            // Skip missing/corrupt manifests — list() is best-effort.
+            if let Ok(Some(manifest)) = self.load_by_id(id) {
                 result.push((manifest.checkpoint_id, manifest.epoch));
             }
         }

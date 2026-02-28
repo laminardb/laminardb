@@ -486,6 +486,10 @@ impl SourceConnector for WebSocketSource {
         Some(Arc::clone(&self.data_ready))
     }
 
+    fn supports_replay(&self) -> bool {
+        false
+    }
+
     async fn close(&mut self) -> Result<(), ConnectorError> {
         info!("closing WebSocket source connector");
 

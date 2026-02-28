@@ -30,6 +30,10 @@ pub struct PipelineConfig {
     ///
     /// Set to `Duration::ZERO` to execute immediately (no batching).
     pub batch_window: Duration,
+
+    /// Maximum time to wait for all sources to align on a checkpoint
+    /// barrier before cancelling the checkpoint.
+    pub barrier_alignment_timeout: Duration,
 }
 
 impl Default for PipelineConfig {
@@ -40,6 +44,7 @@ impl Default for PipelineConfig {
             fallback_poll_interval: Duration::from_millis(10),
             checkpoint_interval: None,
             batch_window: Duration::from_millis(5),
+            barrier_alignment_timeout: Duration::from_secs(30),
         }
     }
 }
