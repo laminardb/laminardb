@@ -65,7 +65,7 @@ impl Default for CheckpointConfig {
 }
 
 /// Phase of the checkpoint lifecycle.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, serde::Serialize)]
 pub enum CheckpointPhase {
     /// No checkpoint in progress.
     Idle,
@@ -95,7 +95,7 @@ impl std::fmt::Display for CheckpointPhase {
 }
 
 /// Result of a checkpoint attempt.
-#[derive(Debug)]
+#[derive(Debug, serde::Serialize)]
 pub struct CheckpointResult {
     /// Whether the checkpoint succeeded.
     pub success: bool,
@@ -1111,7 +1111,7 @@ impl std::fmt::Debug for DurationHistogram {
 }
 
 /// Checkpoint performance statistics.
-#[derive(Debug, Clone)]
+#[derive(Debug, Clone, serde::Serialize)]
 pub struct CheckpointStats {
     /// Total completed checkpoints.
     pub completed: u64,

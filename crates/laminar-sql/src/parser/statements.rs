@@ -26,6 +26,8 @@ pub enum ShowCommand {
     Streams,
     /// SHOW TABLES - list all reference/dimension tables
     Tables,
+    /// SHOW CHECKPOINT STATUS - display checkpoint state
+    CheckpointStatus,
 }
 
 /// Streaming-specific SQL statements
@@ -162,6 +164,15 @@ pub enum StreamingStatement {
         name: ObjectName,
         /// Whether IF EXISTS was specified
         if_exists: bool,
+    },
+
+    /// CHECKPOINT — trigger an immediate checkpoint
+    Checkpoint,
+
+    /// `RESTORE FROM CHECKPOINT <id>`
+    RestoreCheckpoint {
+        /// The checkpoint ID to restore from
+        checkpoint_id: u64,
     },
 }
 

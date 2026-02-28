@@ -87,6 +87,12 @@ pub enum StreamingDdlKind {
     },
     /// ALTER SOURCE
     AlterSource,
+    /// SHOW CHECKPOINT STATUS
+    ShowCheckpointStatus,
+    /// CHECKPOINT (trigger immediate)
+    Checkpoint,
+    /// RESTORE FROM CHECKPOINT <id>
+    RestoreCheckpoint,
     /// Not a streaming DDL statement
     None,
 }
@@ -103,6 +109,17 @@ pub fn detect_streaming_ddl(tokens: &[TokenWithSpan]) -> StreamingDdlKind {
         .iter()
         .filter(|t| !matches!(t.token, Token::Whitespace(_)))
         .collect();
+
+    if significant.is_empty() {
+        return StreamingDdlKind::None;
+    }
+
+    // Single-token statements.
+    if let Token::Word(w) = &significant[0].token {
+        if is_word_ci(w, "CHECKPOINT") {
+            return StreamingDdlKind::Checkpoint;
+        }
+    }
 
     if significant.len() < 2 {
         return StreamingDdlKind::None;
@@ -137,6 +154,7 @@ pub fn detect_streaming_ddl(tokens: &[TokenWithSpan]) -> StreamingDdlKind {
             keyword: Keyword::ALTER,
             ..
         }) => detect_alter_ddl(&significant),
+        Token::Word(w) if is_word_ci(w, "RESTORE") => StreamingDdlKind::RestoreCheckpoint,
         _ => StreamingDdlKind::None,
     }
 }
@@ -289,6 +307,17 @@ fn detect_show_ddl(significant: &[&TokenWithSpan]) -> StreamingDdlKind {
         Token::Word(w) if is_word_ci(w, "QUERIES") => StreamingDdlKind::ShowQueries,
         Token::Word(w) if is_word_ci(w, "STREAMS") => StreamingDdlKind::ShowStreams,
         Token::Word(w) if is_word_ci(w, "TABLES") => StreamingDdlKind::ShowTables,
+        Token::Word(w) if is_word_ci(w, "CHECKPOINT") => {
+            // SHOW CHECKPOINT STATUS
+            if significant.len() >= 3 {
+                if let Token::Word(w2) = &significant[2].token {
+                    if is_word_ci(w2, "STATUS") {
+                        return StreamingDdlKind::ShowCheckpointStatus;
+                    }
+                }
+            }
+            StreamingDdlKind::None
+        }
         Token::Word(Word {
             keyword: Keyword::MATERIALIZED,
             ..
@@ -760,6 +789,38 @@ mod tests {
         assert_eq!(
             detect_streaming_ddl(&tokenize("drop source events")),
             StreamingDdlKind::DropSource { if_exists: false }
+        );
+    }
+
+    #[test]
+    fn test_detect_checkpoint() {
+        assert_eq!(
+            detect_streaming_ddl(&tokenize("CHECKPOINT")),
+            StreamingDdlKind::Checkpoint
+        );
+    }
+
+    #[test]
+    fn test_detect_checkpoint_case_insensitive() {
+        assert_eq!(
+            detect_streaming_ddl(&tokenize("checkpoint")),
+            StreamingDdlKind::Checkpoint
+        );
+    }
+
+    #[test]
+    fn test_detect_show_checkpoint_status() {
+        assert_eq!(
+            detect_streaming_ddl(&tokenize("SHOW CHECKPOINT STATUS")),
+            StreamingDdlKind::ShowCheckpointStatus
+        );
+    }
+
+    #[test]
+    fn test_detect_restore_checkpoint() {
+        assert_eq!(
+            detect_streaming_ddl(&tokenize("RESTORE FROM CHECKPOINT 42")),
+            StreamingDdlKind::RestoreCheckpoint
         );
     }
 }

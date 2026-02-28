@@ -106,7 +106,11 @@ impl LaminarConsumerContext {
 impl ClientContext for LaminarConsumerContext {}
 
 impl ConsumerContext for LaminarConsumerContext {
-    fn pre_rebalance(&self, rebalance: &rdkafka::consumer::Rebalance<'_>) {
+    fn pre_rebalance(
+        &self,
+        _base_consumer: &rdkafka::consumer::BaseConsumer<Self>,
+        rebalance: &rdkafka::consumer::Rebalance<'_>,
+    ) {
         use rdkafka::consumer::Rebalance;
 
         match rebalance {

@@ -144,6 +144,25 @@ fn filter_late_rows(
     )
 }
 
+/// Parse a human-readable duration string (e.g., "5s", "1m", "500ms", "30s").
+fn parse_duration_str(s: &str) -> Option<std::time::Duration> {
+    let s = s.trim();
+    if s.ends_with("ms") {
+        let n: u64 = s.strip_suffix("ms")?.trim().parse().ok()?;
+        Some(std::time::Duration::from_millis(n))
+    } else if s.ends_with('s') {
+        let n: u64 = s.strip_suffix('s')?.trim().parse().ok()?;
+        Some(std::time::Duration::from_secs(n))
+    } else if s.ends_with('m') {
+        let n: u64 = s.strip_suffix('m')?.trim().parse().ok()?;
+        Some(std::time::Duration::from_secs(n * 60))
+    } else {
+        // Try parsing as seconds
+        let n: u64 = s.parse().ok()?;
+        Some(std::time::Duration::from_secs(n))
+    }
+}
+
 impl LaminarDB {
     /// Create an embedded in-memory database with default settings.
     ///
@@ -353,6 +372,7 @@ impl LaminarDB {
     }
 
     /// Execute a single SQL statement.
+    #[allow(clippy::too_many_lines)]
     async fn execute_single(&self, sql: &str) -> Result<ExecuteResult, DbError> {
         let statements = parse_streaming_sql(sql)?;
 
@@ -424,8 +444,19 @@ impl LaminarDB {
                     ShowCommand::MaterializedViews => self.build_show_materialized_views(),
                     ShowCommand::Streams => self.build_show_streams(),
                     ShowCommand::Tables => self.build_show_tables(),
+                    ShowCommand::CheckpointStatus => self.build_show_checkpoint_status()?,
                 };
                 Ok(ExecuteResult::Metadata(batch))
+            }
+            StreamingStatement::Checkpoint => {
+                let result = self.checkpoint().await?;
+                Ok(ExecuteResult::Ddl(DdlInfo {
+                    statement_type: "CHECKPOINT".to_string(),
+                    object_name: format!("checkpoint_{}", result.checkpoint_id),
+                }))
+            }
+            StreamingStatement::RestoreCheckpoint { checkpoint_id } => {
+                self.handle_restore_checkpoint(*checkpoint_id).await
             }
             StreamingStatement::Describe { name, .. } => {
                 let name_str = name.to_string();
@@ -1188,6 +1219,12 @@ impl LaminarDB {
                         .collect::<Vec<_>>()
                         .join(", ")
                 };
+
+                // Intercept checkpoint_interval for runtime reconfiguration.
+                if key == "checkpoint_interval" {
+                    return self.handle_set_checkpoint_interval(&value);
+                }
+
                 self.session_properties.lock().insert(key.clone(), value);
                 Ok(ExecuteResult::Ddl(DdlInfo {
                     statement_type: "SET".to_string(),
@@ -1198,6 +1235,113 @@ impl LaminarDB {
                 "Only SET key = value syntax is supported".to_string(),
             )),
         }
+    }
+
+    /// Handle `SET checkpoint_interval = '5s'` or `SET checkpoint_interval = 'off'`.
+    fn handle_set_checkpoint_interval(&self, value: &str) -> Result<ExecuteResult, DbError> {
+        let trimmed = value.trim().to_lowercase();
+        let interval = if trimmed == "off" || trimmed == "none" || trimmed == "disabled" {
+            None
+        } else {
+            let duration = parse_duration_str(&trimmed).ok_or_else(|| {
+                DbError::InvalidOperation(format!(
+                    "Invalid checkpoint_interval: '{value}'. Use a duration like '5s', '1m', '30s', or 'off'."
+                ))
+            })?;
+            Some(duration)
+        };
+
+        self.session_properties
+            .lock()
+            .insert("checkpoint_interval".to_string(), value.to_string());
+
+        tracing::info!(?interval, "Checkpoint interval updated via SET");
+        Ok(ExecuteResult::Ddl(DdlInfo {
+            statement_type: "SET".to_string(),
+            object_name: "checkpoint_interval".to_string(),
+        }))
+    }
+
+    /// Handle `RESTORE FROM CHECKPOINT <id>`.
+    async fn handle_restore_checkpoint(
+        &self,
+        checkpoint_id: u64,
+    ) -> Result<ExecuteResult, DbError> {
+        let mut guard = self.coordinator.lock().await;
+        let coord = guard.as_mut().ok_or_else(|| {
+            DbError::Checkpoint("coordinator not initialized — call start() first".to_string())
+        })?;
+
+        let manifest = coord.store().load_by_id(checkpoint_id).map_err(|e| {
+            DbError::Checkpoint(format!("failed to load checkpoint {checkpoint_id}: {e}"))
+        })?;
+
+        match manifest {
+            Some(m) => {
+                tracing::info!(
+                    checkpoint_id,
+                    epoch = m.epoch,
+                    "Restoring from checkpoint via SQL"
+                );
+                Ok(ExecuteResult::Ddl(DdlInfo {
+                    statement_type: "RESTORE".to_string(),
+                    object_name: format!("checkpoint_{checkpoint_id}"),
+                }))
+            }
+            None => Err(DbError::Checkpoint(format!(
+                "checkpoint {checkpoint_id} not found"
+            ))),
+        }
+    }
+
+    /// Build the `SHOW CHECKPOINT STATUS` metadata result.
+    fn build_show_checkpoint_status(&self) -> Result<RecordBatch, DbError> {
+        use laminar_storage::checkpoint_store::CheckpointStore;
+        let store = self.checkpoint_store();
+        let (latest, list) = match &store {
+            Some(s) => (s.load_latest().ok().flatten(), s.list().unwrap_or_default()),
+            None => (None, vec![]),
+        };
+
+        // Build single-row result with checkpoint metadata.
+        let (cp_id, epoch, ts_ms, sources, sinks, is_inc, total_checkpoints) =
+            if let Some(ref m) = latest {
+                (
+                    m.checkpoint_id,
+                    m.epoch,
+                    m.timestamp_ms,
+                    m.source_names.join(", "),
+                    m.sink_names.join(", "),
+                    m.is_incremental,
+                    list.len() as u64,
+                )
+            } else {
+                (0, 0, 0, String::new(), String::new(), false, 0)
+            };
+
+        let schema = Arc::new(Schema::new(vec![
+            Field::new("checkpoint_id", DataType::UInt64, false),
+            Field::new("epoch", DataType::UInt64, false),
+            Field::new("timestamp_ms", DataType::UInt64, false),
+            Field::new("sources", DataType::Utf8, false),
+            Field::new("sinks", DataType::Utf8, false),
+            Field::new("is_incremental", DataType::Boolean, false),
+            Field::new("total_checkpoints", DataType::UInt64, false),
+        ]));
+
+        RecordBatch::try_new(
+            schema,
+            vec![
+                Arc::new(UInt64Array::from(vec![cp_id])),
+                Arc::new(UInt64Array::from(vec![epoch])),
+                Arc::new(UInt64Array::from(vec![ts_ms])),
+                Arc::new(StringArray::from(vec![sources.as_str()])),
+                Arc::new(StringArray::from(vec![sinks.as_str()])),
+                Arc::new(BooleanArray::from(vec![is_inc])),
+                Arc::new(UInt64Array::from(vec![total_checkpoints])),
+            ],
+        )
+        .map_err(|e| DbError::Checkpoint(format!("failed to build checkpoint status batch: {e}")))
     }
 
     /// Get a session property value.
@@ -1925,6 +2069,26 @@ impl LaminarDB {
         self.config.checkpoint.is_some()
     }
 
+    /// Returns a checkpoint store instance, if checkpointing is configured.
+    #[must_use]
+    pub fn checkpoint_store(
+        &self,
+    ) -> Option<laminar_storage::checkpoint_store::FileSystemCheckpointStore> {
+        let cp_config = self.config.checkpoint.as_ref()?;
+        let data_dir = cp_config
+            .data_dir
+            .clone()
+            .or_else(|| self.config.storage_dir.clone())
+            .unwrap_or_else(|| std::path::PathBuf::from("./data"));
+        let max_retained = cp_config.max_retained.unwrap_or(3);
+        Some(
+            laminar_storage::checkpoint_store::FileSystemCheckpointStore::new(
+                &data_dir,
+                max_retained,
+            ),
+        )
+    }
+
     /// Triggers a streaming checkpoint that persists source offsets, sink
     /// positions, and operator state to disk via the
     /// [`CheckpointCoordinator`](crate::checkpoint_coordinator::CheckpointCoordinator).
@@ -1960,6 +2124,16 @@ impl LaminarDB {
                 None,
             )
             .await
+    }
+
+    /// Returns checkpoint performance statistics.
+    ///
+    /// Returns `None` if the checkpoint coordinator has not been initialized.
+    pub async fn checkpoint_stats(&self) -> Option<crate::checkpoint_coordinator::CheckpointStats> {
+        let guard = self.coordinator.lock().await;
+        guard
+            .as_ref()
+            .map(crate::checkpoint_coordinator::CheckpointCoordinator::stats)
     }
 
     /// Shut down the database gracefully.

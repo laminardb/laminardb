@@ -1,7 +1,7 @@
 # LaminarDB Checkpoint Remediation Plan
 
 > **Created:** 2026-02-28
-> **Status:** Phase 1 Complete
+> **Status:** Phase 3 Complete
 > **Audit Score:** 72/100 → Target: 92/100
 > **Tracking:** Update status fields as work progresses
 
@@ -756,7 +756,7 @@ Create `crates/laminar-db/tests/checkpoint_exactly_once.rs`:
 
 ### Task 3.1: Checkpoint REST API / CLI
 
-**Status:** `[ ] Not Started`
+**Status:** `[x] Complete`
 **Severity:** High | **Effort:** M (2-3 days)
 **Ring Impact:** Ring 2
 
@@ -801,7 +801,7 @@ Response format:
 
 ### Task 3.2: SQL DDL for Checkpoint Configuration
 
-**Status:** `[ ] Not Started`
+**Status:** `[x] Complete`
 **Severity:** High | **Effort:** M (2-3 days)
 **Ring Impact:** Ring 2
 
@@ -1268,8 +1268,8 @@ ground.
 
 ### Phase 3 Checklist
 
-- [ ] Task 3.1: Checkpoint REST API / CLI
-- [ ] Task 3.2: SQL DDL for checkpoint config
+- [x] Task 3.1: Checkpoint REST API / CLI
+- [x] Task 3.2: SQL DDL for checkpoint config
 - [x] Task 3.3: Checkpoint duration histogram
 - [x] Task 3.4: Recovery benchmark in CI
 - [x] Task 3.5: State sidecar atomicity fix

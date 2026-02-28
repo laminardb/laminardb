@@ -195,6 +195,17 @@ impl StreamingParser {
                 let stmt = parse_alter_source(&mut parser).map_err(parse_error_to_parser_error)?;
                 Ok(vec![stmt])
             }
+            StreamingDdlKind::ShowCheckpointStatus => Ok(vec![StreamingStatement::Show(
+                ShowCommand::CheckpointStatus,
+            )]),
+            StreamingDdlKind::Checkpoint => Ok(vec![StreamingStatement::Checkpoint]),
+            StreamingDdlKind::RestoreCheckpoint => {
+                let mut parser =
+                    sqlparser::parser::Parser::new(&dialect).with_tokens_with_locations(tokens);
+                let stmt =
+                    parse_restore_checkpoint(&mut parser).map_err(parse_error_to_parser_error)?;
+                Ok(vec![stmt])
+            }
             StreamingDdlKind::None => {
                 // Standard SQL - check for INSERT INTO and convert
                 let statements = sqlparser::parser::Parser::parse_sql(&dialect, sql_trimmed)?;
@@ -252,6 +263,41 @@ fn parse_error_to_parser_error(e: ParseError) -> sqlparser::parser::ParserError 
         ParseError::ValidationError(msg) => {
             sqlparser::parser::ParserError::ParserError(format!("Validation error: {msg}"))
         }
+    }
+}
+
+/// Parse a RESTORE FROM CHECKPOINT statement.
+///
+/// Syntax: `RESTORE FROM CHECKPOINT <id>`
+///
+/// # Errors
+///
+/// Returns `ParseError` if the statement syntax is invalid.
+fn parse_restore_checkpoint(
+    parser: &mut sqlparser::parser::Parser,
+) -> Result<StreamingStatement, ParseError> {
+    // Consume RESTORE
+    tokenizer::expect_custom_keyword(parser, "RESTORE")?;
+    // Consume FROM
+    if !parser.parse_keyword(sqlparser::keywords::Keyword::FROM) {
+        return Err(ParseError::StreamingError(
+            "Expected FROM after RESTORE".to_string(),
+        ));
+    }
+    // Consume CHECKPOINT
+    tokenizer::expect_custom_keyword(parser, "CHECKPOINT")?;
+    // Parse checkpoint ID (numeric literal)
+    let token = parser.next_token();
+    match &token.token {
+        sqlparser::tokenizer::Token::Number(n, _) => {
+            let id: u64 = n
+                .parse()
+                .map_err(|_| ParseError::StreamingError(format!("Invalid checkpoint ID: {n}")))?;
+            Ok(StreamingStatement::RestoreCheckpoint { checkpoint_id: id })
+        }
+        other => Err(ParseError::StreamingError(format!(
+            "Expected checkpoint ID (number), found {other}"
+        ))),
     }
 }
 
@@ -1262,6 +1308,49 @@ mod tests {
                 }
             }
             _ => panic!("Expected AlterSource, got {stmt:?}"),
+        }
+    }
+
+    #[test]
+    fn test_parse_checkpoint() {
+        let stmt = parse_one("CHECKPOINT");
+        assert!(
+            matches!(stmt, StreamingStatement::Checkpoint),
+            "Expected Checkpoint, got {stmt:?}"
+        );
+    }
+
+    #[test]
+    fn test_parse_show_checkpoint_status() {
+        let stmt = parse_one("SHOW CHECKPOINT STATUS");
+        assert!(
+            matches!(
+                stmt,
+                StreamingStatement::Show(ShowCommand::CheckpointStatus)
+            ),
+            "Expected Show(CheckpointStatus), got {stmt:?}"
+        );
+    }
+
+    #[test]
+    fn test_parse_restore_checkpoint() {
+        let stmt = parse_one("RESTORE FROM CHECKPOINT 42");
+        match stmt {
+            StreamingStatement::RestoreCheckpoint { checkpoint_id } => {
+                assert_eq!(checkpoint_id, 42);
+            }
+            _ => panic!("Expected RestoreCheckpoint, got {stmt:?}"),
+        }
+    }
+
+    #[test]
+    fn test_parse_restore_checkpoint_large_id() {
+        let stmt = parse_one("RESTORE FROM CHECKPOINT 123456");
+        match stmt {
+            StreamingStatement::RestoreCheckpoint { checkpoint_id } => {
+                assert_eq!(checkpoint_id, 123_456);
+            }
+            _ => panic!("Expected RestoreCheckpoint, got {stmt:?}"),
         }
     }
 }
