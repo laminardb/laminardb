@@ -1,3 +1,4 @@
+#![allow(clippy::disallowed_types)]
 //! Cache hit/miss ratio benchmarks
 //!
 //! Measures foyer cache performance under realistic workloads with

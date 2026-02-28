@@ -1,3 +1,4 @@
+#![allow(clippy::disallowed_types)]
 //! End-to-end checkpoint recovery tests.
 //!
 //! Tests the full checkpoint → shutdown → restart → recovery cycle

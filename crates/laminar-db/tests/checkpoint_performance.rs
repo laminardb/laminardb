@@ -1,3 +1,4 @@
+#![allow(clippy::disallowed_types)]
 use laminar_db::checkpoint_coordinator::{CheckpointConfig, CheckpointCoordinator};
 use laminar_storage::checkpoint_manifest::CheckpointManifest;
 use laminar_storage::checkpoint_store::{CheckpointStore, CheckpointStoreError};
