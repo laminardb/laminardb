@@ -126,6 +126,30 @@ pub trait CheckpointStore: Send + Sync {
     ///
     /// Returns [`CheckpointStoreError`] on I/O failure.
     fn load_state_data(&self, id: u64) -> Result<Option<Vec<u8>>, CheckpointStoreError>;
+
+    /// Atomically saves a checkpoint manifest with optional sidecar state data.
+    ///
+    /// When `state_data` is provided, the sidecar (`state.bin`) is written and
+    /// fsynced **before** the manifest. This ensures that if the sidecar write
+    /// fails, the manifest is never persisted and `latest.txt` still points to
+    /// the previous valid checkpoint.
+    ///
+    /// Orphaned `state.bin` files (written but no manifest) are harmless and
+    /// cleaned up by [`prune()`](Self::prune).
+    ///
+    /// # Errors
+    ///
+    /// Returns [`CheckpointStoreError`] on I/O or serialization failure.
+    fn save_with_state(
+        &self,
+        manifest: &CheckpointManifest,
+        state_data: Option<&[u8]>,
+    ) -> Result<(), CheckpointStoreError> {
+        if let Some(data) = state_data {
+            self.save_state_data(manifest.checkpoint_id, data)?;
+        }
+        self.save(manifest)
+    }
 }
 
 /// Filesystem-backed checkpoint store.
@@ -304,9 +328,24 @@ impl CheckpointStore for FileSystemCheckpointStore {
         let path = self.state_path(id);
         let tmp = path.with_extension("bin.tmp");
         std::fs::write(&tmp, data)?;
+        sync_file(&tmp)?;
         std::fs::rename(&tmp, &path)?;
+        sync_dir(&cp_dir)?;
 
         Ok(())
+    }
+
+    fn save_with_state(
+        &self,
+        manifest: &CheckpointManifest,
+        state_data: Option<&[u8]>,
+    ) -> Result<(), CheckpointStoreError> {
+        // Write sidecar FIRST — if this fails, manifest is never written
+        // and latest.txt still points to the previous valid checkpoint.
+        if let Some(data) = state_data {
+            self.save_state_data(manifest.checkpoint_id, data)?;
+        }
+        self.save(manifest)
     }
 
     fn load_state_data(&self, id: u64) -> Result<Option<Vec<u8>>, CheckpointStoreError> {
@@ -529,5 +568,51 @@ mod tests {
         store.save(&make_manifest(1, 1)).unwrap();
         let removed = store.prune(5).unwrap();
         assert_eq!(removed, 0);
+    }
+
+    #[test]
+    fn test_save_with_state_writes_sidecar_before_manifest() {
+        let dir = tempfile::tempdir().unwrap();
+        let store = make_store(dir.path());
+
+        let m = make_manifest(1, 1);
+        let state = b"large-operator-state-blob";
+        store.save_with_state(&m, Some(state)).unwrap();
+
+        // Both manifest and state should be present.
+        let loaded = store.load_latest().unwrap().unwrap();
+        assert_eq!(loaded.checkpoint_id, 1);
+
+        let loaded_state = store.load_state_data(1).unwrap().unwrap();
+        assert_eq!(loaded_state, state);
+    }
+
+    #[test]
+    fn test_save_with_state_none_is_same_as_save() {
+        let dir = tempfile::tempdir().unwrap();
+        let store = make_store(dir.path());
+
+        let m = make_manifest(1, 1);
+        store.save_with_state(&m, None).unwrap();
+
+        let loaded = store.load_latest().unwrap().unwrap();
+        assert_eq!(loaded.checkpoint_id, 1);
+        assert!(store.load_state_data(1).unwrap().is_none());
+    }
+
+    #[test]
+    fn test_orphaned_state_without_manifest_is_ignored() {
+        let dir = tempfile::tempdir().unwrap();
+        let store = make_store(dir.path());
+
+        // Write only sidecar state, no manifest (simulates crash after
+        // state write but before manifest write).
+        store.save_state_data(1, b"orphaned").unwrap();
+
+        // load_latest should return None — the orphan is not visible.
+        assert!(store.load_latest().unwrap().is_none());
+
+        // list should not include the orphan (no manifest.json).
+        assert!(store.list().unwrap().is_empty());
     }
 }

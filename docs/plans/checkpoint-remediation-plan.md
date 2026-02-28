@@ -842,7 +842,7 @@ RESTORE FROM CHECKPOINT 42;
 
 ### Task 3.3: Checkpoint Duration Histogram
 
-**Status:** `[ ] Not Started`
+**Status:** `[x] Complete`
 **Severity:** Medium | **Effort:** S (half day)
 **Ring Impact:** Ring 2
 
@@ -909,7 +909,7 @@ fn bench_recovery_1gb(c: &mut Criterion) {
 
 ### Task 3.5: State Sidecar Atomicity Fix
 
-**Status:** `[ ] Not Started`
+**Status:** `[x] Complete`
 **Severity:** Medium | **Effort:** S (half day)
 **Ring Impact:** Ring 1
 
@@ -1270,9 +1270,9 @@ ground.
 
 - [ ] Task 3.1: Checkpoint REST API / CLI
 - [ ] Task 3.2: SQL DDL for checkpoint config
-- [ ] Task 3.3: Checkpoint duration histogram
+- [x] Task 3.3: Checkpoint duration histogram
 - [ ] Task 3.4: Recovery benchmark in CI
-- [ ] Task 3.5: State sidecar atomicity fix
+- [x] Task 3.5: State sidecar atomicity fix
 - [ ] Task 3.6: Checkpoint on Kafka rebalance
 
 ### Phase 4 Checklist

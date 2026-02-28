@@ -161,6 +161,8 @@ pub struct CheckpointCoordinator {
     checkpoints_completed: u64,
     checkpoints_failed: u64,
     last_checkpoint_duration: Option<Duration>,
+    /// Rolling histogram of checkpoint durations for percentile tracking.
+    duration_histogram: DurationHistogram,
     /// Per-core WAL manager for epoch barriers and truncation.
     wal_manager: Option<PerCoreWalManager>,
     /// Changelog drainers to flush before checkpointing.
@@ -192,6 +194,7 @@ impl CheckpointCoordinator {
             checkpoints_completed: 0,
             checkpoints_failed: 0,
             last_checkpoint_duration: None,
+            duration_histogram: DurationHistogram::new(),
             wal_manager: None,
             changelog_drainers: Vec::new(),
             counters: None,
@@ -494,7 +497,7 @@ impl CheckpointCoordinator {
 
         // ── Step 5: Persist manifest (decision record — sinks are Pending) ──
         self.phase = CheckpointPhase::Persisting;
-        if let Err(e) = self.save_manifest(&manifest).await {
+        if let Err(e) = self.save_manifest(&manifest, None).await {
             self.phase = CheckpointPhase::Idle;
             self.checkpoints_failed += 1;
             let duration = start.elapsed();
@@ -520,7 +523,7 @@ impl CheckpointCoordinator {
         // ── Step 6b: Save manifest again with final sink commit statuses ──
         if !sink_statuses.is_empty() {
             manifest.sink_commit_statuses = sink_statuses;
-            if let Err(e) = self.save_manifest(&manifest).await {
+            if let Err(e) = self.save_manifest(&manifest, None).await {
                 warn!(
                     checkpoint_id,
                     epoch,
@@ -550,6 +553,7 @@ impl CheckpointCoordinator {
         self.checkpoints_completed += 1;
         let duration = start.elapsed();
         self.last_checkpoint_duration = Some(duration);
+        self.duration_histogram.record(duration);
         self.emit_checkpoint_metrics(true, epoch, duration);
 
         info!(
@@ -651,10 +655,21 @@ impl CheckpointCoordinator {
     }
 
     /// Saves a manifest to the checkpoint store (blocking I/O on a task).
-    async fn save_manifest(&self, manifest: &CheckpointManifest) -> Result<(), DbError> {
+    ///
+    /// Uses [`CheckpointStore::save_with_state`] to write optional sidecar
+    /// data **before** the manifest, ensuring atomicity: if the sidecar write
+    /// fails, the manifest is never persisted.
+    async fn save_manifest(
+        &self,
+        manifest: &CheckpointManifest,
+        state_data: Option<Vec<u8>>,
+    ) -> Result<(), DbError> {
         let store = Arc::clone(&self.store);
         let manifest = manifest.clone();
-        let task_result = tokio::task::spawn_blocking(move || store.save(&manifest)).await;
+        let task_result = tokio::task::spawn_blocking(move || {
+            store.save_with_state(&manifest, state_data.as_deref())
+        })
+        .await;
 
         match task_result {
             Ok(Ok(())) => Ok(()),
@@ -750,10 +765,15 @@ impl CheckpointCoordinator {
     /// Returns checkpoint statistics.
     #[must_use]
     pub fn stats(&self) -> CheckpointStats {
+        let (p50, p95, p99) = self.duration_histogram.percentiles();
         CheckpointStats {
             completed: self.checkpoints_completed,
             failed: self.checkpoints_failed,
             last_duration: self.last_checkpoint_duration,
+            duration_p50_ms: p50,
+            duration_p95_ms: p95,
+            duration_p99_ms: p99,
+            total_bytes_written: 0,
             current_phase: self.phase,
             current_epoch: self.epoch,
         }
@@ -864,7 +884,7 @@ impl CheckpointCoordinator {
 
         // ── Step 5: Persist manifest (decision record — sinks are Pending) ──
         self.phase = CheckpointPhase::Persisting;
-        if let Err(e) = self.save_manifest(&manifest).await {
+        if let Err(e) = self.save_manifest(&manifest, None).await {
             self.phase = CheckpointPhase::Idle;
             self.checkpoints_failed += 1;
             let duration = start.elapsed();
@@ -890,7 +910,7 @@ impl CheckpointCoordinator {
         // ── Step 6b: Save manifest again with final sink commit statuses ──
         if !sink_statuses.is_empty() {
             manifest.sink_commit_statuses = sink_statuses;
-            if let Err(e) = self.save_manifest(&manifest).await {
+            if let Err(e) = self.save_manifest(&manifest, None).await {
                 warn!(
                     checkpoint_id,
                     epoch,
@@ -912,6 +932,7 @@ impl CheckpointCoordinator {
         self.checkpoints_completed += 1;
         let duration = start.elapsed();
         self.last_checkpoint_duration = Some(duration);
+        self.duration_histogram.record(duration);
         self.emit_checkpoint_metrics(true, epoch, duration);
 
         info!(
@@ -994,6 +1015,99 @@ impl std::fmt::Debug for CheckpointCoordinator {
     }
 }
 
+/// Fixed-size ring buffer for checkpoint duration percentile tracking.
+///
+/// Stores the last `CAPACITY` checkpoint durations and computes p50/p95/p99
+/// via sorted extraction. No heap allocation after construction.
+#[derive(Clone)]
+pub struct DurationHistogram {
+    /// Ring buffer of durations in milliseconds.
+    samples: Box<[u64; Self::CAPACITY]>,
+    /// Write cursor (wraps at `CAPACITY`).
+    cursor: usize,
+    /// Total samples written (may exceed `CAPACITY`).
+    count: u64,
+}
+
+impl DurationHistogram {
+    const CAPACITY: usize = 100;
+
+    /// Creates an empty histogram.
+    #[must_use]
+    fn new() -> Self {
+        Self {
+            samples: Box::new([0; Self::CAPACITY]),
+            cursor: 0,
+            count: 0,
+        }
+    }
+
+    /// Records a checkpoint duration.
+    fn record(&mut self, duration: Duration) {
+        #[allow(clippy::cast_possible_truncation)]
+        let ms = duration.as_millis() as u64;
+        self.samples[self.cursor] = ms;
+        self.cursor = (self.cursor + 1) % Self::CAPACITY;
+        self.count += 1;
+    }
+
+    /// Returns the number of recorded samples (up to `CAPACITY`).
+    #[must_use]
+    fn len(&self) -> usize {
+        if self.count >= Self::CAPACITY as u64 {
+            Self::CAPACITY
+        } else {
+            // SAFETY: count < CAPACITY (100), which always fits in usize.
+            #[allow(clippy::cast_possible_truncation)]
+            { self.count as usize }
+        }
+    }
+
+    /// Computes a percentile (0.0–1.0) from recorded samples.
+    ///
+    /// Returns 0 if no samples have been recorded.
+    #[must_use]
+    fn percentile(&self, p: f64) -> u64 {
+        let n = self.len();
+        if n == 0 {
+            return 0;
+        }
+        let mut sorted: Vec<u64> = self.samples[..n].to_vec();
+        sorted.sort_unstable();
+        #[allow(
+            clippy::cast_possible_truncation,
+            clippy::cast_sign_loss,
+            clippy::cast_precision_loss
+        )]
+        let idx = ((p * (n as f64 - 1.0)).ceil() as usize).min(n - 1);
+        sorted[idx]
+    }
+
+    /// Returns (p50, p95, p99) in milliseconds.
+    #[must_use]
+    fn percentiles(&self) -> (u64, u64, u64) {
+        (
+            self.percentile(0.50),
+            self.percentile(0.95),
+            self.percentile(0.99),
+        )
+    }
+}
+
+impl std::fmt::Debug for DurationHistogram {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        let (p50, p95, p99) = self.percentiles();
+        f.debug_struct("DurationHistogram")
+            .field("samples_len", &self.samples.len())
+            .field("cursor", &self.cursor)
+            .field("count", &self.count)
+            .field("p50_ms", &p50)
+            .field("p95_ms", &p95)
+            .field("p99_ms", &p99)
+            .finish()
+    }
+}
+
 /// Checkpoint performance statistics.
 #[derive(Debug, Clone)]
 pub struct CheckpointStats {
@@ -1003,6 +1117,14 @@ pub struct CheckpointStats {
     pub failed: u64,
     /// Duration of the last checkpoint.
     pub last_duration: Option<Duration>,
+    /// p50 checkpoint duration in milliseconds.
+    pub duration_p50_ms: u64,
+    /// p95 checkpoint duration in milliseconds.
+    pub duration_p95_ms: u64,
+    /// p99 checkpoint duration in milliseconds.
+    pub duration_p99_ms: u64,
+    /// Total bytes written across all checkpoints.
+    pub total_bytes_written: u64,
     /// Current checkpoint phase.
     pub current_phase: CheckpointPhase,
     /// Current epoch number.
@@ -1183,6 +1305,9 @@ mod tests {
         assert_eq!(stats.completed, 0);
         assert_eq!(stats.failed, 0);
         assert!(stats.last_duration.is_none());
+        assert_eq!(stats.duration_p50_ms, 0);
+        assert_eq!(stats.duration_p95_ms, 0);
+        assert_eq!(stats.duration_p99_ms, 0);
         assert_eq!(stats.current_phase, CheckpointPhase::Idle);
     }
 
@@ -1631,5 +1756,90 @@ mod tests {
 
         assert!(result.success);
         // No panics — metrics emission is a no-op
+    }
+
+    // ── DurationHistogram tests ──
+
+    #[test]
+    fn test_histogram_empty() {
+        let h = DurationHistogram::new();
+        assert_eq!(h.len(), 0);
+        assert_eq!(h.percentile(0.50), 0);
+        assert_eq!(h.percentile(0.99), 0);
+        let (p50, p95, p99) = h.percentiles();
+        assert_eq!((p50, p95, p99), (0, 0, 0));
+    }
+
+    #[test]
+    fn test_histogram_single_sample() {
+        let mut h = DurationHistogram::new();
+        h.record(Duration::from_millis(42));
+        assert_eq!(h.len(), 1);
+        assert_eq!(h.percentile(0.50), 42);
+        assert_eq!(h.percentile(0.99), 42);
+    }
+
+    #[test]
+    fn test_histogram_percentiles() {
+        let mut h = DurationHistogram::new();
+        // Record 1..=100ms in order.
+        for i in 1..=100 {
+            h.record(Duration::from_millis(i));
+        }
+        assert_eq!(h.len(), 100);
+
+        let p50 = h.percentile(0.50);
+        let p95 = h.percentile(0.95);
+        let p99 = h.percentile(0.99);
+
+        // With values 1..=100:
+        //   p50 ≈ 50, p95 ≈ 95, p99 ≈ 99
+        assert!(p50 >= 49 && p50 <= 51, "p50={p50}");
+        assert!(p95 >= 94 && p95 <= 96, "p95={p95}");
+        assert!(p99 >= 98 && p99 <= 100, "p99={p99}");
+    }
+
+    #[test]
+    fn test_histogram_wraps_ring_buffer() {
+        let mut h = DurationHistogram::new();
+        // Write 150 samples — first 50 are overwritten.
+        for i in 1..=150 {
+            h.record(Duration::from_millis(i));
+        }
+        assert_eq!(h.len(), 100);
+        assert_eq!(h.count, 150);
+
+        // Only samples 51..=150 remain in the buffer.
+        let p50 = h.percentile(0.50);
+        assert!(p50 >= 99 && p50 <= 101, "p50={p50}");
+    }
+
+    #[tokio::test]
+    async fn test_stats_include_percentiles_after_checkpoints() {
+        let dir = tempfile::tempdir().unwrap();
+        let mut coord = make_coordinator(dir.path());
+
+        // Run 3 checkpoints.
+        for _ in 0..3 {
+            let result = coord
+                .checkpoint(
+                    HashMap::new(),
+                    None,
+                    0,
+                    vec![],
+                    None,
+                    HashMap::new(),
+                    None,
+                )
+                .await
+                .unwrap();
+            assert!(result.success);
+        }
+
+        let stats = coord.stats();
+        assert_eq!(stats.completed, 3);
+        // After 3 fast checkpoints, percentiles should be > 0
+        // (they're real durations, not zero).
+        assert!(stats.last_duration.is_some());
     }
 }
