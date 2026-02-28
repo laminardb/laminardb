@@ -1950,7 +1950,15 @@ impl LaminarDB {
             DbError::Checkpoint("coordinator not initialized — call start() first".to_string())
         })?;
         coord
-            .checkpoint(HashMap::new(), None, 0, Vec::new(), None, HashMap::new(), None)
+            .checkpoint(
+                HashMap::new(),
+                None,
+                0,
+                Vec::new(),
+                None,
+                HashMap::new(),
+                None,
+            )
             .await
     }
 

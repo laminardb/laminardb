@@ -326,6 +326,19 @@ pub trait SourceConnector: Send {
     fn supports_replay(&self) -> bool {
         true
     }
+
+    /// Returns a shared flag that the source sets to `true` when it
+    /// requests an immediate checkpoint.
+    ///
+    /// This is used by sources that detect external state changes requiring
+    /// a checkpoint before proceeding — for example, Kafka consumer group
+    /// rebalance (partition revocation). The pipeline coordinator polls
+    /// this flag each cycle and clears it after triggering the checkpoint.
+    ///
+    /// The default returns `None` (no source-initiated checkpoints).
+    fn checkpoint_requested(&self) -> Option<Arc<std::sync::atomic::AtomicBool>> {
+        None
+    }
 }
 
 /// Trait for sink connectors that write data to external systems.

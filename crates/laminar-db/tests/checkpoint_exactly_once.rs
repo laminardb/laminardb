@@ -105,17 +105,17 @@ async fn test_barrier_aligned_checkpoint_fires() {
     let sources = vec![
         SourceRegistration {
             name: "src_a".to_string(),
-            connector: Box::new(laminar_connectors::testing::MockSourceConnector::with_batches(
-                50, 10,
-            )),
+            connector: Box::new(
+                laminar_connectors::testing::MockSourceConnector::with_batches(50, 10),
+            ),
             config: laminar_connectors::config::ConnectorConfig::new("mock"),
             supports_replay: true,
         },
         SourceRegistration {
             name: "src_b".to_string(),
-            connector: Box::new(laminar_connectors::testing::MockSourceConnector::with_batches(
-                50, 10,
-            )),
+            connector: Box::new(
+                laminar_connectors::testing::MockSourceConnector::with_batches(50, 10),
+            ),
             config: laminar_connectors::config::ConnectorConfig::new("mock"),
             supports_replay: true,
         },
@@ -133,14 +133,14 @@ async fn test_barrier_aligned_checkpoint_fires() {
         ..PipelineConfig::default()
     };
 
-    let coordinator = PipelineCoordinator::new(sources, config, shutdown).await.unwrap();
+    let coordinator = PipelineCoordinator::new(sources, config, shutdown)
+        .await
+        .unwrap();
 
     let should_trigger = Arc::new(AtomicBool::new(true));
     let record_counter = Arc::new(AtomicU64::new(0));
-    let callback = BarrierTrackingCallback::new(
-        Arc::clone(&should_trigger),
-        Arc::clone(&record_counter),
-    );
+    let callback =
+        BarrierTrackingCallback::new(Arc::clone(&should_trigger), Arc::clone(&record_counter));
 
     let handle = tokio::spawn(async move {
         coordinator.run(Box::new(callback)).await;
@@ -172,7 +172,10 @@ async fn test_barrier_checkpoint_recovery_round_trip() {
 
     // Simulate barrier-aligned checkpoint: operator state captured at barrier.
     let mut operator_states = HashMap::new();
-    operator_states.insert("stream_executor".to_string(), b"barrier-consistent-state".to_vec());
+    operator_states.insert(
+        "stream_executor".to_string(),
+        b"barrier-consistent-state".to_vec(),
+    );
 
     // Simulate source offsets captured at barrier.
     let mut extra_tables = HashMap::new();
@@ -261,9 +264,7 @@ async fn test_barrier_checkpoint_recovery_round_trip() {
 async fn test_single_source_barrier_checkpoint() {
     let sources = vec![SourceRegistration {
         name: "only_source".to_string(),
-        connector: Box::new(laminar_connectors::testing::MockSourceConnector::with_batches(
-            100, 5,
-        )),
+        connector: Box::new(laminar_connectors::testing::MockSourceConnector::with_batches(100, 5)),
         config: laminar_connectors::config::ConnectorConfig::new("mock"),
         supports_replay: true,
     }];
@@ -279,14 +280,14 @@ async fn test_single_source_barrier_checkpoint() {
         ..PipelineConfig::default()
     };
 
-    let coordinator = PipelineCoordinator::new(sources, config, shutdown).await.unwrap();
+    let coordinator = PipelineCoordinator::new(sources, config, shutdown)
+        .await
+        .unwrap();
 
     let should_trigger = Arc::new(AtomicBool::new(true));
     let record_counter = Arc::new(AtomicU64::new(0));
-    let callback = BarrierTrackingCallback::new(
-        Arc::clone(&should_trigger),
-        Arc::clone(&record_counter),
-    );
+    let callback =
+        BarrierTrackingCallback::new(Arc::clone(&should_trigger), Arc::clone(&record_counter));
 
     let handle = tokio::spawn(async move {
         coordinator.run(Box::new(callback)).await;
@@ -309,17 +310,17 @@ async fn test_exhausted_sources_with_shutdown() {
     let sources = vec![
         SourceRegistration {
             name: "fast_a".to_string(),
-            connector: Box::new(laminar_connectors::testing::MockSourceConnector::with_batches(
-                3, 5,
-            )),
+            connector: Box::new(
+                laminar_connectors::testing::MockSourceConnector::with_batches(3, 5),
+            ),
             config: laminar_connectors::config::ConnectorConfig::new("mock"),
             supports_replay: true,
         },
         SourceRegistration {
             name: "fast_b".to_string(),
-            connector: Box::new(laminar_connectors::testing::MockSourceConnector::with_batches(
-                3, 5,
-            )),
+            connector: Box::new(
+                laminar_connectors::testing::MockSourceConnector::with_batches(3, 5),
+            ),
             config: laminar_connectors::config::ConnectorConfig::new("mock"),
             supports_replay: true,
         },
@@ -336,14 +337,14 @@ async fn test_exhausted_sources_with_shutdown() {
         ..PipelineConfig::default()
     };
 
-    let coordinator = PipelineCoordinator::new(sources, config, shutdown).await.unwrap();
+    let coordinator = PipelineCoordinator::new(sources, config, shutdown)
+        .await
+        .unwrap();
 
     let should_trigger = Arc::new(AtomicBool::new(true));
     let record_counter = Arc::new(AtomicU64::new(0));
-    let callback = BarrierTrackingCallback::new(
-        Arc::clone(&should_trigger),
-        Arc::clone(&record_counter),
-    );
+    let callback =
+        BarrierTrackingCallback::new(Arc::clone(&should_trigger), Arc::clone(&record_counter));
 
     let handle = tokio::spawn(async move {
         coordinator.run(Box::new(callback)).await;

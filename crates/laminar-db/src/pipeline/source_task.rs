@@ -188,8 +188,14 @@ mod tests {
         };
 
         let (_injector, barrier_handle) = make_barrier_handle();
-        let handle =
-            spawn_source_task(0, "test".to_string(), connector, tx, &config, barrier_handle);
+        let handle = spawn_source_task(
+            0,
+            "test".to_string(),
+            connector,
+            tx,
+            &config,
+            barrier_handle,
+        );
 
         let mut batch_count = 0;
         let mut total_rows = 0u64;
@@ -233,8 +239,14 @@ mod tests {
         };
 
         let (_injector, barrier_handle) = make_barrier_handle();
-        let handle =
-            spawn_source_task(0, "test".to_string(), connector, tx, &config, barrier_handle);
+        let handle = spawn_source_task(
+            0,
+            "test".to_string(),
+            connector,
+            tx,
+            &config,
+            barrier_handle,
+        );
         // Give it a moment to start.
         tokio::time::sleep(std::time::Duration::from_millis(10)).await;
 
@@ -255,8 +267,14 @@ mod tests {
         };
 
         let (injector, barrier_handle) = make_barrier_handle();
-        let handle =
-            spawn_source_task(0, "test".to_string(), connector, tx, &config, barrier_handle);
+        let handle = spawn_source_task(
+            0,
+            "test".to_string(),
+            connector,
+            tx,
+            &config,
+            barrier_handle,
+        );
 
         // Wait for at least one batch to be produced.
         let mut got_batch = false;
@@ -303,8 +321,14 @@ mod tests {
         };
 
         let (injector, barrier_handle) = make_barrier_handle();
-        let handle =
-            spawn_source_task(0, "test".to_string(), connector, tx, &config, barrier_handle);
+        let handle = spawn_source_task(
+            0,
+            "test".to_string(),
+            connector,
+            tx,
+            &config,
+            barrier_handle,
+        );
 
         // Wait for a few batches.
         let mut batch_count = 0;

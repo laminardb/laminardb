@@ -43,7 +43,15 @@ async fn test_happy_path_checkpoint_and_recovery() {
     ops.insert("window-agg".into(), b"accumulated-state".to_vec());
 
     let result = coord
-        .checkpoint(ops, Some(5000), 1024, vec![100, 200], None, HashMap::new(), None)
+        .checkpoint(
+            ops,
+            Some(5000),
+            1024,
+            vec![100, 200],
+            None,
+            HashMap::new(),
+            None,
+        )
         .await
         .unwrap();
 
@@ -261,11 +269,27 @@ async fn test_coordinator_resumes_epoch_after_recovery() {
     {
         let mut coord = make_coordinator(dir.path());
         coord
-            .checkpoint(HashMap::new(), Some(1000), 0, vec![], None, HashMap::new(), None)
+            .checkpoint(
+                HashMap::new(),
+                Some(1000),
+                0,
+                vec![],
+                None,
+                HashMap::new(),
+                None,
+            )
             .await
             .unwrap();
         coord
-            .checkpoint(HashMap::new(), Some(2000), 0, vec![], None, HashMap::new(), None)
+            .checkpoint(
+                HashMap::new(),
+                Some(2000),
+                0,
+                vec![],
+                None,
+                HashMap::new(),
+                None,
+            )
             .await
             .unwrap();
 

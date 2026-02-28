@@ -1059,7 +1059,9 @@ impl DurationHistogram {
         } else {
             // SAFETY: count < CAPACITY (100), which always fits in usize.
             #[allow(clippy::cast_possible_truncation)]
-            { self.count as usize }
+            {
+                self.count as usize
+            }
         }
     }
 
@@ -1317,7 +1319,15 @@ mod tests {
         let mut coord = make_coordinator(dir.path());
 
         let result = coord
-            .checkpoint(HashMap::new(), Some(1000), 0, vec![], None, HashMap::new(), None)
+            .checkpoint(
+                HashMap::new(),
+                Some(1000),
+                0,
+                vec![],
+                None,
+                HashMap::new(),
+                None,
+            )
             .await
             .unwrap();
 
@@ -1333,7 +1343,15 @@ mod tests {
 
         // Second checkpoint should increment
         let result2 = coord
-            .checkpoint(HashMap::new(), Some(2000), 100, vec![], None, HashMap::new(), None)
+            .checkpoint(
+                HashMap::new(),
+                Some(2000),
+                100,
+                vec![],
+                None,
+                HashMap::new(),
+                None,
+            )
             .await
             .unwrap();
 
@@ -1722,7 +1740,15 @@ mod tests {
         coord.set_counters(Arc::clone(&counters));
 
         let result = coord
-            .checkpoint(HashMap::new(), Some(1000), 0, vec![], None, HashMap::new(), None)
+            .checkpoint(
+                HashMap::new(),
+                Some(1000),
+                0,
+                vec![],
+                None,
+                HashMap::new(),
+                None,
+            )
             .await
             .unwrap();
 
@@ -1734,7 +1760,15 @@ mod tests {
 
         // Second checkpoint
         let result2 = coord
-            .checkpoint(HashMap::new(), Some(2000), 0, vec![], None, HashMap::new(), None)
+            .checkpoint(
+                HashMap::new(),
+                Some(2000),
+                0,
+                vec![],
+                None,
+                HashMap::new(),
+                None,
+            )
             .await
             .unwrap();
 
@@ -1822,15 +1856,7 @@ mod tests {
         // Run 3 checkpoints.
         for _ in 0..3 {
             let result = coord
-                .checkpoint(
-                    HashMap::new(),
-                    None,
-                    0,
-                    vec![],
-                    None,
-                    HashMap::new(),
-                    None,
-                )
+                .checkpoint(HashMap::new(), None, 0, vec![], None, HashMap::new(), None)
                 .await
                 .unwrap();
             assert!(result.success);

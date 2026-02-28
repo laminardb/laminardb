@@ -116,6 +116,8 @@ pub struct PipelineCoordinator {
     pending_barrier: Option<PendingBarrier>,
     /// Monotonically increasing checkpoint ID for barrier-based checkpoints.
     next_barrier_checkpoint_id: u64,
+    /// Source-initiated checkpoint request flags (e.g., Kafka rebalance).
+    checkpoint_notifiers: Vec<Arc<std::sync::atomic::AtomicBool>>,
 }
 
 impl PipelineCoordinator {
@@ -136,6 +138,7 @@ impl PipelineCoordinator {
         let mut handles = Vec::with_capacity(sources.len());
         let mut source_names = Vec::with_capacity(sources.len());
         let mut injectors = Vec::with_capacity(sources.len());
+        let mut checkpoint_notifiers = Vec::new();
 
         for reg in &sources {
             source_names.push(reg.name.clone());
@@ -148,6 +151,11 @@ impl PipelineCoordinator {
                     reg.name
                 ))
             })?;
+
+            // Capture checkpoint_requested flag before moving connector into the task.
+            if let Some(flag) = reg.connector.checkpoint_requested() {
+                checkpoint_notifiers.push(flag);
+            }
 
             let injector = CheckpointBarrierInjector::new();
             let barrier_handle = injector.handle();
@@ -175,6 +183,7 @@ impl PipelineCoordinator {
             shutdown,
             pending_barrier: None,
             next_barrier_checkpoint_id: 1,
+            checkpoint_notifiers,
         })
     }
 
@@ -210,6 +219,17 @@ impl PipelineCoordinator {
     /// Each source will see the barrier on its next poll iteration
     /// (single atomic load, <10ns fast path) and send a
     /// [`SourceEvent::Barrier`] back to the coordinator.
+    /// Checks if any source has requested an immediate checkpoint
+    /// (e.g., Kafka consumer group rebalance). Non-blocking poll.
+    fn any_checkpoint_requested(&self) -> bool {
+        for flag in &self.checkpoint_notifiers {
+            if flag.swap(false, std::sync::atomic::Ordering::Relaxed) {
+                return true;
+            }
+        }
+        false
+    }
+
     fn inject_barriers(&mut self, flags: u64) {
         let checkpoint_id = self.next_barrier_checkpoint_id;
         self.next_barrier_checkpoint_id += 1;
@@ -426,11 +446,15 @@ impl PipelineCoordinator {
                 }
             }
 
-            // ── Phase 5: Periodic checkpoint via barrier injection. ──
-            if checkpoint_interval.is_some() && self.pending_barrier.is_none() {
-                // Instead of snapshotting at an arbitrary point, inject
-                // barriers so all sources align before we checkpoint.
-                if callback.maybe_checkpoint(false).await {
+            // ── Phase 5: Checkpoint via barrier injection. ─────────
+            // Check both periodic timer AND source-initiated requests
+            // (e.g., Kafka rebalance). Source requests take priority.
+            if self.pending_barrier.is_none() {
+                let source_requested = self.any_checkpoint_requested();
+                if source_requested {
+                    tracing::info!("Source-initiated checkpoint request (rebalance)");
+                    self.inject_barriers(barrier_flags::NONE);
+                } else if checkpoint_interval.is_some() && callback.maybe_checkpoint(false).await {
                     self.inject_barriers(barrier_flags::NONE);
                 }
             }
@@ -466,8 +490,7 @@ impl PipelineCoordinator {
             self.inject_barriers(barrier_flags::DRAIN);
 
             // Drain remaining events to collect barrier responses.
-            let deadline =
-                tokio::time::Instant::now() + self.config.barrier_alignment_timeout;
+            let deadline = tokio::time::Instant::now() + self.config.barrier_alignment_timeout;
             while self.pending_barrier.is_some() {
                 match tokio::time::timeout_at(deadline, self.rx.recv()).await {
                     Ok(Some(evt)) => {
@@ -608,11 +631,7 @@ mod tests {
 
         fn extract_watermark(&mut self, _source_name: &str, _batch: &RecordBatch) {}
 
-        fn filter_late_rows(
-            &self,
-            _source_name: &str,
-            batch: &RecordBatch,
-        ) -> Option<RecordBatch> {
+        fn filter_late_rows(&self, _source_name: &str, batch: &RecordBatch) -> Option<RecordBatch> {
             Some(batch.clone())
         }
 
@@ -668,7 +687,9 @@ mod tests {
             ..PipelineConfig::default()
         };
 
-        let coordinator = PipelineCoordinator::new(sources, config, shutdown).await.unwrap();
+        let coordinator = PipelineCoordinator::new(sources, config, shutdown)
+            .await
+            .unwrap();
 
         let callback = MockCallback::new();
         // Tell callback to trigger checkpoints when asked.
@@ -716,8 +737,9 @@ mod tests {
             ..PipelineConfig::default()
         };
 
-        let coordinator =
-            PipelineCoordinator::new(sources, config, shutdown).await.unwrap();
+        let coordinator = PipelineCoordinator::new(sources, config, shutdown)
+            .await
+            .unwrap();
 
         let callback = MockCallback::new();
         let handle = tokio::spawn(async move {

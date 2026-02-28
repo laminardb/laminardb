@@ -169,10 +169,7 @@ impl<'a> RecoveryManager<'a> {
         for &(checkpoint_id, _epoch) in checkpoints.iter().rev() {
             match self.store.load_by_id(checkpoint_id) {
                 Ok(Some(manifest)) => {
-                    info!(
-                        checkpoint_id,
-                        "recovering from fallback checkpoint"
-                    );
+                    info!(checkpoint_id, "recovering from fallback checkpoint");
                     let result = self
                         .restore_from(manifest, sources, sinks, table_sources)
                         .await;
@@ -222,8 +219,7 @@ impl<'a> RecoveryManager<'a> {
         // Topology drift detection: compare current sources/sinks against
         // the checkpoint to warn the operator about changes.
         if !manifest.source_names.is_empty() {
-            let mut current_sources: Vec<&str> =
-                sources.iter().map(|s| s.name.as_str()).collect();
+            let mut current_sources: Vec<&str> = sources.iter().map(|s| s.name.as_str()).collect();
             current_sources.sort_unstable();
             let checkpoint_sources: Vec<&str> =
                 manifest.source_names.iter().map(String::as_str).collect();
@@ -249,8 +245,7 @@ impl<'a> RecoveryManager<'a> {
             }
         }
         if !manifest.sink_names.is_empty() {
-            let mut current_sinks: Vec<&str> =
-                sinks.iter().map(|s| s.name.as_str()).collect();
+            let mut current_sinks: Vec<&str> = sinks.iter().map(|s| s.name.as_str()).collect();
             current_sinks.sort_unstable();
             let checkpoint_sinks: Vec<&str> =
                 manifest.sink_names.iter().map(String::as_str).collect();

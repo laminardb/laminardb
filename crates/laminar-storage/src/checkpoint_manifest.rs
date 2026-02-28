@@ -193,9 +193,7 @@ impl CheckpointManifest {
             for name in self.source_offsets.keys() {
                 if !self.source_names.contains(name) {
                     errors.push(ManifestValidationError {
-                        message: format!(
-                            "source_offsets contains '{name}' not in source_names"
-                        ),
+                        message: format!("source_offsets contains '{name}' not in source_names"),
                     });
                 }
             }
@@ -530,7 +528,9 @@ mod tests {
 
         let errors = m.validate();
         assert!(
-            errors.iter().any(|e| e.message.contains("'c' not in source_names")),
+            errors
+                .iter()
+                .any(|e| e.message.contains("'c' not in source_names")),
             "expected orphaned source offset error: {errors:?}"
         );
     }

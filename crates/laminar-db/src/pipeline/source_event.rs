@@ -20,7 +20,7 @@ pub enum SourceEvent {
     /// A checkpoint barrier from source `idx`.
     ///
     /// Emitted when the source task detects a pending barrier via its
-    /// [`BarrierPollHandle`]. The source captures its checkpoint before
+    /// [`BarrierPollHandle`](laminar_core::checkpoint::BarrierPollHandle). The source captures its checkpoint before
     /// sending this event, so the coordinator can read the watch channel
     /// to get the barrier-consistent offset.
     Barrier {

@@ -5,7 +5,7 @@
 //! messages using pluggable formats, and producing Arrow `RecordBatch`
 //! data through the connector SDK.
 
-use std::sync::atomic::AtomicUsize;
+use std::sync::atomic::{AtomicBool, AtomicUsize};
 use std::sync::Arc;
 use std::time::Instant;
 
@@ -16,6 +16,8 @@ use rdkafka::message::Message;
 use rdkafka::ClientConfig;
 use tokio::sync::Notify;
 use tracing::{debug, info, warn};
+
+use super::rebalance::LaminarConsumerContext;
 
 use crate::checkpoint::SourceCheckpoint;
 use crate::config::{ConnectorConfig, ConnectorState};
@@ -55,7 +57,7 @@ struct KafkaPayload {
 /// 5. Call `close()` for clean shutdown
 pub struct KafkaSource {
     /// rdkafka consumer (set during `open()`).
-    consumer: Option<StreamConsumer>,
+    consumer: Option<StreamConsumer<LaminarConsumerContext>>,
     /// Parsed Kafka configuration.
     config: KafkaSourceConfig,
     /// Format-specific deserializer.
@@ -83,6 +85,8 @@ pub struct KafkaSource {
     schema_registry: Option<Arc<SchemaRegistryClient>>,
     /// Notification handle signalled when Kafka messages arrive from the reader task.
     data_ready: Arc<Notify>,
+    /// Flag set to `true` on consumer group rebalance (partition revocation).
+    checkpoint_request: Arc<AtomicBool>,
     /// Channel receiver for Kafka messages from the background reader task.
     msg_rx: Option<tokio::sync::mpsc::Receiver<KafkaPayload>>,
     /// Background Kafka reader task handle.
@@ -122,6 +126,7 @@ impl KafkaSource {
             rebalance_state: RebalanceState::new(),
             schema_registry: None,
             data_ready: Arc::new(Notify::new()),
+            checkpoint_request: Arc::new(AtomicBool::new(false)),
             msg_rx: None,
             reader_handle: None,
             reader_shutdown: None,
@@ -169,6 +174,7 @@ impl KafkaSource {
             rebalance_state: RebalanceState::new(),
             schema_registry: Some(sr),
             data_ready: Arc::new(Notify::new()),
+            checkpoint_request: Arc::new(AtomicBool::new(false)),
             msg_rx: None,
             reader_handle: None,
             reader_shutdown: None,
@@ -319,11 +325,13 @@ impl SourceConnector for KafkaSource {
             "opening Kafka source connector"
         );
 
-        // Build rdkafka consumer.
+        // Build rdkafka consumer with rebalance-aware context.
         let rdkafka_config: ClientConfig = kafka_config.to_rdkafka_config();
-        let consumer: StreamConsumer = rdkafka_config.create().map_err(|e| {
-            ConnectorError::ConnectionFailed(format!("failed to create consumer: {e}"))
-        })?;
+        let context = LaminarConsumerContext::new(Arc::clone(&self.checkpoint_request));
+        let consumer: StreamConsumer<LaminarConsumerContext> =
+            rdkafka_config.create_with_context(context).map_err(|e| {
+                ConnectorError::ConnectionFailed(format!("failed to create consumer: {e}"))
+            })?;
 
         // Subscribe to topics (list or regex pattern).
         match &kafka_config.subscription {
@@ -512,6 +520,10 @@ impl SourceConnector for KafkaSource {
 
     fn data_ready_notify(&self) -> Option<Arc<Notify>> {
         Some(Arc::clone(&self.data_ready))
+    }
+
+    fn checkpoint_requested(&self) -> Option<Arc<AtomicBool>> {
+        Some(Arc::clone(&self.checkpoint_request))
     }
 
     async fn close(&mut self) -> Result<(), ConnectorError> {

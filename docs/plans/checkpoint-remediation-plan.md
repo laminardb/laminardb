@@ -879,7 +879,7 @@ extraction.
 
 ### Task 3.4: Recovery Benchmark in CI
 
-**Status:** `[ ] Not Started`
+**Status:** `[x] Complete`
 **Severity:** High | **Effort:** M (1-2 days)
 **Ring Impact:** Ring 1
 
@@ -942,7 +942,7 @@ a checkpoint valid if `.complete` exists.
 
 ### Task 3.6: Checkpoint on Kafka Rebalance
 
-**Status:** `[ ] Not Started`
+**Status:** `[x] Complete`
 **Severity:** Medium | **Effort:** M (1-2 days)
 **Ring Impact:** Ring 1
 
@@ -1271,9 +1271,9 @@ ground.
 - [ ] Task 3.1: Checkpoint REST API / CLI
 - [ ] Task 3.2: SQL DDL for checkpoint config
 - [x] Task 3.3: Checkpoint duration histogram
-- [ ] Task 3.4: Recovery benchmark in CI
+- [x] Task 3.4: Recovery benchmark in CI
 - [x] Task 3.5: State sidecar atomicity fix
-- [ ] Task 3.6: Checkpoint on Kafka rebalance
+- [x] Task 3.6: Checkpoint on Kafka rebalance
 
 ### Phase 4 Checklist
 
