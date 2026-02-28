@@ -1,3 +1,5 @@
+#![deny(clippy::disallowed_types)]
+
 //! Incremental per-window accumulator state for EOWC queries.
 //!
 //! Replaces the raw-batch accumulation pattern (`EowcState.accumulated_sources`)

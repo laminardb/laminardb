@@ -21,6 +21,7 @@
 //! - Function calls: `UPPER(name) = 'FOO'`
 //! - OR/NOT: `price > 100 OR qty > 50`
 //! - Pattern matching: `name LIKE '%foo%'`
+#![deny(clippy::disallowed_types)]
 
 use arrow_array::{BooleanArray, Float64Array, Int64Array, RecordBatch, StringArray};
 use arrow_schema::SchemaRef;

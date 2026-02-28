@@ -30,6 +30,7 @@
 #![deny(missing_docs)]
 #![warn(clippy::all, clippy::pedantic)]
 #![allow(clippy::module_name_repetitions)]
+#![allow(clippy::disallowed_types)]
 // Allow unsafe in alloc module for zero-copy optimizations
 #![allow(unsafe_code)]
 

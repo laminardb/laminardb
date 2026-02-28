@@ -2,6 +2,7 @@
 //!
 //! Provides a unified interface for managing `io_uring` operations on a single core,
 //! including ring management, buffer pools, and pending operation tracking.
+#![deny(clippy::disallowed_types)]
 
 use io_uring::opcode;
 use io_uring::types::{self, Fd};

@@ -1,3 +1,5 @@
+#![deny(clippy::disallowed_types)]
+
 //! Batch-level temporal join execution on `RecordBatch`es.
 //!
 //! Implements the temporal join algorithm (FOR `SYSTEM_TIME` AS OF) for batch

@@ -45,6 +45,7 @@
 //! // Now combined watermark advances to 4000 (min of active partitions)
 //! assert_eq!(tracker.current_watermark(), Some(Watermark::new(4000)));
 //! ```
+#![deny(clippy::disallowed_types)]
 
 use std::time::{Duration, Instant};
 

@@ -2,6 +2,7 @@
 
 #![deny(missing_docs)]
 #![warn(clippy::all, clippy::pedantic)]
+#![allow(clippy::disallowed_types)]
 
 /// Authentication mechanisms - JWT, mTLS, and other auth methods
 pub mod authn;

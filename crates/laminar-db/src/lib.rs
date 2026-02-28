@@ -23,6 +23,7 @@
 #![deny(missing_docs)]
 #![warn(clippy::all, clippy::pedantic)]
 #![allow(clippy::module_name_repetitions)]
+#![allow(clippy::disallowed_types)]
 
 #[allow(dead_code)]
 mod adaptive;

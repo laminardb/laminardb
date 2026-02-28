@@ -2,3 +2,16 @@
 # storage. The default array-size-threshold (16384) triggers a false positive
 # since the buffer lives in thread-local storage, not on the call stack.
 array-size-threshold = 131072
+
+# Prevent accidental use of std HashMap/HashSet on hot paths.
+#
+# Use `rustc_hash::FxHashMap` / `FxHashSet` for internal integer/string keys,
+# or `ahash::AHashMap` / `AHashSet` for user-derived keys needing DoS resistance.
+#
+# Each crate's lib.rs sets `#![allow(clippy::disallowed_types)]` by default.
+# Fully-migrated hot-path modules opt in with `#![deny(clippy::disallowed_types)]`
+# to prevent regression. New hot-path modules should do the same.
+disallowed-types = [
+    { path = "std::collections::HashMap", reason = "use rustc_hash::FxHashMap (integer/internal keys) or ahash::AHashMap (user-derived keys)" },
+    { path = "std::collections::HashSet", reason = "use rustc_hash::FxHashSet (integer/internal keys) or ahash::AHashSet (user-derived keys)" },
+]

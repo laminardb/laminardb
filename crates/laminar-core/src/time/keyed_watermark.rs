@@ -3,6 +3,7 @@
 //! Per-key watermark tracking to achieve 99%+ data accuracy compared to 63-67%
 //! with traditional global watermarks. This addresses the fundamental problem of
 //! fast-moving keys causing late data drops for slower keys.
+#![deny(clippy::disallowed_types)]
 //!
 //! ## Problem with Global Watermarks
 //!

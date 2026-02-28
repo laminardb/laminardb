@@ -1,3 +1,5 @@
+#![allow(clippy::disallowed_types)]
+
 use laminar_db::{ExecuteResult, LaminarDB};
 use laminar_derive::FromRow;
 

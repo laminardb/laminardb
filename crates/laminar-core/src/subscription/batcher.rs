@@ -12,6 +12,7 @@
 //!
 //! When batching is disabled (`enabled: false`), events pass through
 //! immediately as single-event batches.
+#![deny(clippy::disallowed_types)]
 
 use std::time::{Duration, Instant};
 

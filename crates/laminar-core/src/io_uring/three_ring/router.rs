@@ -2,6 +2,7 @@
 //!
 //! Tracks pending operations and routes completions to the appropriate
 //! handlers based on their ring affinity.
+#![deny(clippy::disallowed_types)]
 
 use std::time::Instant;
 

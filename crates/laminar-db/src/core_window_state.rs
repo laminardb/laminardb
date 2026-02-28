@@ -1,3 +1,5 @@
+#![deny(clippy::disallowed_types)]
+
 //! Core window state for EOWC queries routed through core operators.
 //!
 //! Routes qualifying SQL EOWC queries through the core engine's canonical

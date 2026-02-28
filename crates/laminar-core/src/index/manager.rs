@@ -2,6 +2,7 @@
 //!
 //! Manages multiple secondary indexes, handling creation, deletion,
 //! batch updates, and lookups across source/column pairs.
+#![deny(clippy::disallowed_types)]
 
 use std::path::PathBuf;
 use std::sync::Arc;

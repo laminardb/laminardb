@@ -2,6 +2,7 @@
 
 #![deny(missing_docs)]
 #![warn(clippy::all, clippy::pedantic)]
+#![allow(clippy::disallowed_types)]
 
 /// Metrics collection and export - Prometheus and OpenTelemetry metrics
 pub mod metrics;

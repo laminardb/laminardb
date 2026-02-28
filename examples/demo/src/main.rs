@@ -28,6 +28,8 @@
 //! - Source/stream backpressure: `db.source_metrics()`, `db.stream_metrics()`
 //! - System stats (CPU/memory) use `sysinfo` directly.
 
+#![allow(clippy::disallowed_types)]
+
 use std::io;
 use std::time::Duration;
 

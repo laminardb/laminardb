@@ -1,3 +1,5 @@
+#![deny(clippy::disallowed_types)]
+
 //! Batch-level ASOF join execution on `RecordBatch`es.
 //!
 //! Implements the ASOF join algorithm for batch data, matching each left row

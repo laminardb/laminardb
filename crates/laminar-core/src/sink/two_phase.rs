@@ -35,6 +35,7 @@
 //! 2. For COMMITTED transactions: re-send commit to participants
 //! 3. For PREPARING transactions: abort (presumed abort)
 //! 4. Clean up completed transactions
+#![deny(clippy::disallowed_types)]
 
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::time::{Duration, Instant};
