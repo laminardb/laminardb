@@ -98,7 +98,7 @@ rand = "0.10"
 # JIT compilation (Cranelift)
 cranelift-codegen = "0.128"
 cranelift-frontend = "0.128"
-cranelift-jit = "0.128"
+cranelift-jit = "0.129"
 cranelift-module = "0.128"
 cranelift-native = "0.128"
 
