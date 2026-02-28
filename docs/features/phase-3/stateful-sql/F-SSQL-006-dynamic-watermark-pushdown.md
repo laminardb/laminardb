@@ -5,14 +5,14 @@
 | Field | Value |
 |-------|-------|
 | **ID** | F-SSQL-006 |
-| **Status** | 📝 Draft |
+| **Status** | Done |
 | **Priority** | P3 |
 | **Phase** | 3 |
 | **Effort** | M |
 | **Dependencies** | F-SSQL-005 |
-| **Owner** | TBD |
+| **Owner** | -- |
 | **Created** | 2026-02-25 |
-| **Updated** | 2026-02-25 |
+| **Updated** | 2026-02-28 |
 
 ## Summary
 
