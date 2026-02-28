@@ -19,6 +19,9 @@ use std::collections::HashMap;
 use std::hash::{Hash, Hasher};
 use std::sync::Arc;
 
+use ahash::AHashMap;
+use rustc_hash::FxHashMap;
+
 use arrow::array::ArrayRef;
 use arrow::compute;
 use arrow::datatypes::{DataType, Field, Schema, SchemaRef};
@@ -314,7 +317,7 @@ pub(crate) struct IncrementalAggState {
     /// Aggregate function specifications.
     agg_specs: Vec<AggFuncSpec>,
     /// Per-group accumulator state.
-    groups: HashMap<Vec<ScalarValue>, Vec<Box<dyn datafusion_expr::Accumulator>>>,
+    groups: AHashMap<Vec<ScalarValue>, Vec<Box<dyn datafusion_expr::Accumulator>>>,
     /// Output schema (group columns + aggregate results).
     output_schema: SchemaRef,
     /// HAVING predicate SQL to apply after emitting aggregate results.
@@ -508,7 +511,7 @@ impl IncrementalAggState {
             group_col_names,
             group_types,
             agg_specs,
-            groups: HashMap::new(),
+            groups: AHashMap::new(),
             output_schema,
             having_sql,
             max_groups: 1_000_000,
@@ -550,8 +553,8 @@ impl IncrementalAggState {
             .map_err(|e| DbError::Pipeline(format!("row conversion: {e}")))?;
 
         let estimated_groups = (batch.num_rows() / 4).max(16);
-        let mut group_indices: HashMap<arrow::row::OwnedRow, Vec<u32>> =
-            HashMap::with_capacity(estimated_groups);
+        let mut group_indices: FxHashMap<arrow::row::OwnedRow, Vec<u32>> =
+            FxHashMap::with_capacity_and_hasher(estimated_groups, rustc_hash::FxBuildHasher);
         for row_idx in 0..batch.num_rows() {
             #[allow(clippy::cast_possible_truncation)]
             group_indices

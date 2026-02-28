@@ -2,11 +2,12 @@
 //!
 //! Provides a unified interface for managing `io_uring` operations on a single core,
 //! including ring management, buffer pools, and pending operation tracking.
+#![deny(clippy::disallowed_types)]
 
 use io_uring::opcode;
 use io_uring::types::{self, Fd};
 use io_uring::IoUring;
-use std::collections::HashMap;
+use rustc_hash::FxHashMap;
 use std::io;
 use std::os::fd::RawFd;
 use std::sync::atomic::{AtomicU64, Ordering};
@@ -177,7 +178,7 @@ pub struct CoreRingManager {
     #[allow(dead_code)]
     iopoll_buffer_pool: Option<RegisteredBufferPool>,
     /// Pending operations tracking.
-    pending: HashMap<u64, PendingOp>,
+    pending: FxHashMap<u64, PendingOp>,
     /// Next `user_data` ID.
     next_id: AtomicU64,
     /// Metrics.
@@ -251,7 +252,7 @@ impl CoreRingManager {
             buffer_pool,
             iopoll_ring,
             iopoll_buffer_pool,
-            pending: HashMap::new(),
+            pending: FxHashMap::default(),
             next_id: AtomicU64::new(0),
             metrics: RingMetrics::default(),
             closed: false,

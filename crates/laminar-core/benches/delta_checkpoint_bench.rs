@@ -1,3 +1,4 @@
+#![allow(clippy::disallowed_types)]
 //! Delta checkpoint benchmark
 //!
 //! Measures distributed checkpoint coordination primitives, partition

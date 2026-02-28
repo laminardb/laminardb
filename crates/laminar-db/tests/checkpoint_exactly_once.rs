@@ -1,3 +1,4 @@
+#![allow(clippy::disallowed_types)]
 //! End-to-end exactly-once checkpoint test via barrier protocol.
 //!
 //! Validates the full pipeline path:

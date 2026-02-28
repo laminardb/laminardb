@@ -1,3 +1,4 @@
+#![allow(clippy::disallowed_types)]
 //! Lookup join throughput benchmarks
 //!
 //! End-to-end lookup join throughput: stream event → key extraction →

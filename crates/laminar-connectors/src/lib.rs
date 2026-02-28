@@ -27,6 +27,7 @@
 
 #![deny(missing_docs)]
 #![warn(clippy::all, clippy::pedantic)]
+#![allow(clippy::disallowed_types)]
 #![allow(clippy::module_name_repetitions)]
 // Common test patterns that are acceptable
 #![cfg_attr(

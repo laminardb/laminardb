@@ -11,6 +11,8 @@
 use std::collections::HashMap;
 use std::sync::Arc;
 
+use rustc_hash::FxHashMap;
+
 use bytes::Bytes;
 
 use crate::delta::discovery::NodeId;
@@ -101,8 +103,8 @@ impl PartitionMap {
 
     /// Group keys by target node.
     #[must_use]
-    pub fn group_by_node<'a>(&self, keys: &'a [&[u8]]) -> HashMap<NodeId, Vec<&'a [u8]>> {
-        let mut groups: HashMap<NodeId, Vec<&[u8]>> = HashMap::new();
+    pub fn group_by_node<'a>(&self, keys: &'a [&[u8]]) -> FxHashMap<NodeId, Vec<&'a [u8]>> {
+        let mut groups: FxHashMap<NodeId, Vec<&[u8]>> = FxHashMap::default();
         for &key in keys {
             let node = self.owner_of(key);
             groups.entry(node).or_default().push(key);

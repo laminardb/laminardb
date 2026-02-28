@@ -21,11 +21,11 @@
 //! - Function calls: `UPPER(name) = 'FOO'`
 //! - OR/NOT: `price > 100 OR qty > 50`
 //! - Pattern matching: `name LIKE '%foo%'`
-
-use std::collections::HashMap;
+#![deny(clippy::disallowed_types)]
 
 use arrow_array::{BooleanArray, Float64Array, Int64Array, RecordBatch, StringArray};
 use arrow_schema::SchemaRef;
+use rustc_hash::FxHashMap;
 use smallvec::SmallVec;
 
 // ---------------------------------------------------------------------------
@@ -65,7 +65,7 @@ pub enum ScalarValue {
 #[derive(Debug, Clone)]
 pub struct StringInternTable {
     /// String to index mapping (used at compile time).
-    forward: HashMap<String, u32>,
+    forward: FxHashMap<String, u32>,
     /// Index to string mapping (used at evaluation time).
     reverse: Vec<String>,
 }
@@ -75,7 +75,7 @@ impl StringInternTable {
     #[must_use]
     pub fn new() -> Self {
         Self {
-            forward: HashMap::new(),
+            forward: FxHashMap::default(),
             reverse: Vec::new(),
         }
     }

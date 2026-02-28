@@ -1,3 +1,5 @@
+#![deny(clippy::disallowed_types)]
+
 //! Incremental per-window accumulator state for EOWC queries.
 //!
 //! Replaces the raw-batch accumulation pattern (`EowcState.accumulated_sources`)
@@ -13,8 +15,10 @@
 //! Watermark advance → close windows → evaluate() → emit RecordBatch
 //! ```
 
-use std::collections::{BTreeMap, HashMap};
+use std::collections::BTreeMap;
 use std::sync::Arc;
+
+use ahash::AHashMap;
 
 use arrow::array::ArrayRef;
 use arrow::compute;
@@ -122,7 +126,7 @@ pub(crate) struct IncrementalEowcState {
     window_type: EowcWindowType,
     /// Per-window aggregate state: `window_start` -> per-group accumulators.
     #[allow(clippy::type_complexity)]
-    windows: BTreeMap<i64, HashMap<Vec<ScalarValue>, Vec<Box<dyn datafusion_expr::Accumulator>>>>,
+    windows: BTreeMap<i64, AHashMap<Vec<ScalarValue>, Vec<Box<dyn datafusion_expr::Accumulator>>>>,
     /// Aggregate function specs (extracted once from the query plan).
     agg_specs: Vec<AggFuncSpec>,
     /// Number of group-by columns in pre-agg output.
@@ -471,7 +475,7 @@ impl IncrementalEowcState {
         &self,
         window_start: i64,
         window_end: i64,
-        mut groups: HashMap<Vec<ScalarValue>, Vec<Box<dyn datafusion_expr::Accumulator>>>,
+        mut groups: AHashMap<Vec<ScalarValue>, Vec<Box<dyn datafusion_expr::Accumulator>>>,
     ) -> Result<Option<RecordBatch>, DbError> {
         let num_rows = groups.len();
         if num_rows == 0 {
@@ -551,7 +555,7 @@ impl IncrementalEowcState {
     /// Return the total number of groups across all open windows.
     #[allow(dead_code)]
     pub fn total_group_count(&self) -> usize {
-        self.windows.values().map(HashMap::len).sum()
+        self.windows.values().map(|g| g.len()).sum()
     }
 
     /// Compute a fingerprint for this query (SQL + schema).
@@ -609,7 +613,7 @@ impl IncrementalEowcState {
         self.windows.clear();
         let mut total_groups = 0usize;
         for wc in &checkpoint.windows {
-            let mut groups = HashMap::new();
+            let mut groups = AHashMap::new();
             for gc in &wc.groups {
                 let key: Result<Vec<ScalarValue>, _> = gc.key.iter().map(json_to_scalar).collect();
                 let key = key?;

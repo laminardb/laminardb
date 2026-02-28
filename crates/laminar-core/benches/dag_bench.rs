@@ -1,3 +1,4 @@
+#![allow(clippy::disallowed_types)]
 //! DAG pipeline Criterion benchmarks.
 //!
 //! Measures routing lookup, multicast publish/consume, executor latency,

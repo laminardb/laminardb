@@ -3,6 +3,7 @@
 //! Per-key watermark tracking to achieve 99%+ data accuracy compared to 63-67%
 //! with traditional global watermarks. This addresses the fundamental problem of
 //! fast-moving keys causing late data drops for slower keys.
+#![deny(clippy::disallowed_types)]
 //!
 //! ## Problem with Global Watermarks
 //!
@@ -73,9 +74,10 @@
 //! assert!(tracker.is_late(&"tenant_a".to_string(), 3000));
 //! ```
 
-use std::collections::HashMap;
 use std::hash::Hash;
 use std::time::{Duration, Instant};
+
+use rustc_hash::FxHashMap;
 
 use super::Watermark;
 
@@ -283,7 +285,7 @@ impl KeyedWatermarkMetrics {
 #[derive(Debug)]
 pub struct KeyedWatermarkTracker<K: Hash + Eq + Clone> {
     /// Per-key watermark state
-    key_states: HashMap<K, KeyWatermarkState>,
+    key_states: FxHashMap<K, KeyWatermarkState>,
 
     /// Global watermark (minimum across all active keys)
     global_watermark: i64,
@@ -305,7 +307,7 @@ impl<K: Hash + Eq + Clone> KeyedWatermarkTracker<K> {
     pub fn new(config: KeyedWatermarkConfig) -> Self {
         let bounded_delay_ms = config.bounded_delay.as_millis() as i64;
         Self {
-            key_states: HashMap::new(),
+            key_states: FxHashMap::default(),
             global_watermark: i64::MIN,
             config,
             bounded_delay_ms,
@@ -345,7 +347,7 @@ impl<K: Hash + Eq + Clone> KeyedWatermarkTracker<K> {
     /// assert!(wm.is_some()); // Global watermark advances
     /// ```
     #[allow(clippy::missing_panics_doc)] // Internal invariant: key is always present after insert
-    #[allow(clippy::needless_pass_by_value)] // Key must be owned for HashMap insertion
+    #[allow(clippy::needless_pass_by_value)] // Key must be owned for FxHashMap insertion
     pub fn update(
         &mut self,
         key: K,
@@ -700,7 +702,7 @@ pub struct KeyedWatermarkTrackerWithLateHandling<K: Hash + Eq + Clone> {
     /// Inner tracker
     tracker: KeyedWatermarkTracker<K>,
     /// Count of late events per key
-    late_events_per_key: HashMap<K, u64>,
+    late_events_per_key: FxHashMap<K, u64>,
     /// Total late events
     total_late_events: u64,
 }
@@ -711,7 +713,7 @@ impl<K: Hash + Eq + Clone> KeyedWatermarkTrackerWithLateHandling<K> {
     pub fn new(config: KeyedWatermarkConfig) -> Self {
         Self {
             tracker: KeyedWatermarkTracker::new(config),
-            late_events_per_key: HashMap::new(),
+            late_events_per_key: FxHashMap::default(),
             total_late_events: 0,
         }
     }

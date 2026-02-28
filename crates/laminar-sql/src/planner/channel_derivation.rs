@@ -202,7 +202,7 @@ pub fn derive_channel_types(
 
 /// Counts how many MVs read from each source.
 fn count_consumers_per_source(mvs: &[MvDefinition]) -> HashMap<String, usize> {
-    let mut counts: HashMap<String, usize> = HashMap::new();
+    let mut counts: HashMap<String, usize> = HashMap::with_capacity(mvs.len());
 
     for mv in mvs {
         for source_ref in &mv.source_refs {

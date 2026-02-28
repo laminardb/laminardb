@@ -73,6 +73,9 @@ parking_lot = { workspace = true }
 # Fast hash maps (for DAG operator state maps)
 rustc-hash = { workspace = true }
 
+# Fast DoS-resistant hash map (for group-by keys from user SQL)
+ahash = { workspace = true }
+
 # Observability
 tracing = { workspace = true }
 

@@ -1,5 +1,7 @@
 //! LaminarDB standalone server
 
+#![allow(clippy::disallowed_types)]
+
 #[cfg(all(feature = "jemalloc", not(target_env = "msvc")))]
 #[global_allocator]
 static GLOBAL: tikv_jemallocator::Jemalloc = tikv_jemallocator::Jemalloc;

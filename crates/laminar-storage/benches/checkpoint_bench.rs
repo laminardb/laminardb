@@ -1,3 +1,4 @@
+#![allow(clippy::disallowed_types)]
 //! Benchmarks for checkpoint operations
 
 use std::time::Duration;

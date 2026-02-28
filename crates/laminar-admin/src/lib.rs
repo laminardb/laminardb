@@ -2,6 +2,7 @@
 
 #![deny(missing_docs)]
 #![warn(clippy::all, clippy::pedantic)]
+#![allow(clippy::disallowed_types)]
 
 /// REST API - Admin REST API endpoints
 pub mod api;

@@ -30,6 +30,7 @@
 #![deny(missing_docs)]
 #![warn(clippy::all, clippy::pedantic)]
 #![allow(clippy::module_name_repetitions)]
+#![allow(clippy::disallowed_types)]
 #![allow(clippy::doc_markdown)]
 #![allow(clippy::uninlined_format_args)]
 

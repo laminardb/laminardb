@@ -1,3 +1,4 @@
+#![allow(clippy::disallowed_types)]
 //! Recovery benchmark: measures checkpoint load + state restore time.
 //!
 //! Validates the <60s for 10GB recovery target (scaled: <6s for 1GB).

@@ -53,6 +53,8 @@
 use std::collections::HashMap;
 use std::time::{Duration, Instant};
 
+use rustc_hash::FxHashMap;
+
 /// Identifier for an alignment group.
 #[derive(Debug, Clone, Hash, Eq, PartialEq)]
 pub struct AlignmentGroupId(pub String);
@@ -286,7 +288,7 @@ pub struct WatermarkAlignmentGroup {
     /// Configuration.
     config: AlignmentGroupConfig,
     /// Per-source state.
-    sources: HashMap<usize, AlignmentSourceState>,
+    sources: FxHashMap<usize, AlignmentSourceState>,
     /// Current minimum watermark in the group.
     min_watermark: i64,
     /// Current maximum watermark in the group.
@@ -303,7 +305,7 @@ impl WatermarkAlignmentGroup {
     pub fn new(config: AlignmentGroupConfig) -> Self {
         Self {
             config,
-            sources: HashMap::new(),
+            sources: FxHashMap::default(),
             min_watermark: i64::MIN,
             max_watermark: i64::MIN,
             last_check: Instant::now(),
@@ -634,9 +636,9 @@ pub enum AlignmentError {
 #[derive(Debug, Default)]
 pub struct AlignmentGroupCoordinator {
     /// Groups by ID.
-    groups: HashMap<AlignmentGroupId, WatermarkAlignmentGroup>,
+    groups: FxHashMap<AlignmentGroupId, WatermarkAlignmentGroup>,
     /// Source to group mapping (a source can be in one group).
-    source_groups: HashMap<usize, AlignmentGroupId>,
+    source_groups: FxHashMap<usize, AlignmentGroupId>,
 }
 
 impl AlignmentGroupCoordinator {
