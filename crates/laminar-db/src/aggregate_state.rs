@@ -361,8 +361,18 @@ impl IncrementalAggState {
         // the Aggregate (e.g., SUM(a)/SUM(b) AS ratio, CASE WHEN ... END).
         // The incremental accumulator emits raw aggregate outputs and cannot
         // apply post-aggregate projections.  Fall through to EOWC raw-batch.
+        //
+        // Check both field count AND types — a coincidental count match (e.g.,
+        // 2 group keys + 3 aggregates == 5 SELECT items after projection drops
+        // a group key and adds a computed column) can mask a projection that
+        // remaps group columns to aggregate aliases.
         if top_schema.fields().len() != agg_schema.fields().len() {
             return Ok(None);
+        }
+        for (top_f, agg_f) in top_schema.fields().iter().zip(agg_schema.fields()) {
+            if top_f.data_type() != agg_f.data_type() {
+                return Ok(None);
+            }
         }
 
         let num_group_cols = group_exprs.len();
