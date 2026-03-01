@@ -143,11 +143,11 @@ jobs:
 
       - name: Build (cross)
         if: matrix.cross
-        run: cross build --workspace --release ${{ matrix.features }} --target ${{ matrix.target }}
+        run: cross build --workspace --exclude laminardb-demo --exclude binance-ws --release ${{ matrix.features }} --target ${{ matrix.target }}
 
       - name: Build (native)
         if: "!matrix.cross"
-        run: cargo build --workspace --release ${{ matrix.features }} --target ${{ matrix.target }}
+        run: cargo build --workspace --exclude laminardb-demo --exclude binance-ws --release ${{ matrix.features }} --target ${{ matrix.target }}
 
       - name: Package artifacts
         shell: bash
