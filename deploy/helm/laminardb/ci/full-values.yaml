@@ -1,0 +1,127 @@
+replicaCount: 3
+
+laminardb:
+  mode: delta
+  logLevel: debug
+  workers: 4
+  state:
+    backend: mmap
+    maxSizeBytes: 10737418240
+  checkpoint:
+    interval: "30s"
+    mode: aligned
+    snapshotStrategy: incremental
+  delta:
+    discovery:
+      strategy: dns
+      gossipPort: 7946
+    coordination:
+      strategy: raft
+      raftPort: 7947
+
+sources:
+  - name: trades
+    connector: kafka
+    format: json
+    properties:
+      brokers: "kafka:9092"
+      topic: raw-trades
+      group_id: laminardb-trades
+    schema:
+      - name: symbol
+        type: VARCHAR
+        nullable: false
+      - name: price
+        type: DOUBLE
+      - name: volume
+        type: BIGINT
+      - name: event_time
+        type: TIMESTAMP
+    watermark:
+      column: event_time
+      max_out_of_orderness: "5s"
+
+pipelines:
+  - name: trade-volumes
+    sql: |
+      SELECT symbol, SUM(volume) as total_vol, COUNT(*) as trade_count
+      FROM trades
+      GROUP BY symbol, TUMBLE(event_time, INTERVAL '1' MINUTE)
+    parallelism: 4
+
+sinks:
+  - name: output
+    pipeline: trade-volumes
+    connector: kafka
+    delivery: at_least_once
+    properties:
+      brokers: "kafka:9092"
+      topic: trade-volumes
+
+persistence:
+  state:
+    enabled: true
+    size: 50Gi
+  checkpoints:
+    enabled: true
+    size: 100Gi
+
+guaranteedQoS: true
+
+resources:
+  limits:
+    cpu: "4"
+    memory: 8Gi
+  requests:
+    cpu: "4"
+    memory: 8Gi
+
+podDisruptionBudget:
+  enabled: true
+  minAvailable: 2
+
+autoscaling:
+  enabled: false
+
+serviceMonitor:
+  enabled: true
+  interval: 15s
+
+prometheusRule:
+  enabled: true
+  rules:
+    - alert: LaminarDBDown
+      expr: up{job="laminardb"} == 0
+      for: 5m
+      labels:
+        severity: critical
+      annotations:
+        summary: "LaminarDB instance is down"
+
+grafanaDashboard:
+  enabled: true
+
+ingress:
+  enabled: true
+  className: nginx
+  hosts:
+    - host: laminardb.example.com
+      paths:
+        - path: /
+          pathType: Prefix
+
+networkPolicy:
+  enabled: true
+  ingress:
+    - from:
+        - namespaceSelector: {}
+      ports:
+        - port: 8080
+          protocol: TCP
+  egress:
+    - to:
+        - namespaceSelector: {}
+
+extraEnv:
+  - name: RUST_LOG
+    value: "laminardb=debug"

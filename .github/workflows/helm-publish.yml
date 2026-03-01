@@ -1,0 +1,64 @@
+name: Helm Chart Publish
+
+on:
+  push:
+    branches: [main]
+    paths:
+      - "deploy/helm/**"
+  workflow_dispatch:
+
+permissions:
+  contents: read
+  packages: write
+
+jobs:
+  lint:
+    name: Lint & validate
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+
+      - name: Set up Helm
+        uses: azure/setup-helm@v4
+
+      - name: Lint chart
+        run: helm lint deploy/helm/laminardb --strict
+
+      - name: Template with default values
+        run: helm template laminardb deploy/helm/laminardb
+
+      - name: Template with standalone values
+        run: helm template laminardb deploy/helm/laminardb -f deploy/helm/laminardb/ci/standalone-values.yaml
+
+      - name: Template with constellation values
+        run: helm template laminardb deploy/helm/laminardb -f deploy/helm/laminardb/ci/constellation-values.yaml
+
+      - name: Template with full values
+        run: helm template laminardb deploy/helm/laminardb -f deploy/helm/laminardb/ci/full-values.yaml
+
+  publish:
+    name: Publish to GHCR
+    runs-on: ubuntu-latest
+    needs: lint
+    if: github.ref == 'refs/heads/main'
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Set up Helm
+        uses: azure/setup-helm@v4
+
+      - name: Log in to GHCR
+        run: echo "${{ secrets.GITHUB_TOKEN }}" | helm registry login ghcr.io -u ${{ github.actor }} --password-stdin
+
+      - name: Package chart
+        run: helm package deploy/helm/laminardb -d .helm-packages
+
+      - name: Push to GHCR
+        run: |
+          for pkg in .helm-packages/*.tgz; do
+            helm push "$pkg" oci://ghcr.io/laminardb/charts
+          done

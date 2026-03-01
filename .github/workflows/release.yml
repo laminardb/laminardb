@@ -155,50 +155,66 @@ jobs:
           VERSION="${{ needs.verify.outputs.version }}"
           TARGET="${{ matrix.target }}"
           RELEASE_DIR="target/${TARGET}/release"
-          mkdir -p artifacts
+          mkdir -p server-pkg lib-pkg
 
-          # Copy the laminardb server binary
+          # Package 1: laminardb-server (standalone server binary)
           if [[ "${{ matrix.os }}" == "windows-latest" ]]; then
-            cp "${RELEASE_DIR}/laminardb.exe" artifacts/ 2>/dev/null || true
-            cp ${RELEASE_DIR}/*.dll artifacts/ 2>/dev/null || true
+            cp "${RELEASE_DIR}/laminardb.exe" server-pkg/ 2>/dev/null || true
           else
-            cp "${RELEASE_DIR}/laminardb" artifacts/ 2>/dev/null || true
-            cp ${RELEASE_DIR}/*.so artifacts/ 2>/dev/null || true
-            cp ${RELEASE_DIR}/*.dylib artifacts/ 2>/dev/null || true
-            cp ${RELEASE_DIR}/*.a artifacts/ 2>/dev/null || true
+            cp "${RELEASE_DIR}/laminardb" server-pkg/ 2>/dev/null || true
           fi
 
-          # Verify artifacts directory is not empty
-          if [ -z "$(ls -A artifacts)" ]; then
-            echo "::error::No artifacts found in ${RELEASE_DIR}"
+          # Package 2: laminardb-lib (C FFI / shared libraries)
+          if [[ "${{ matrix.os }}" == "windows-latest" ]]; then
+            cp ${RELEASE_DIR}/*.dll lib-pkg/ 2>/dev/null || true
+          else
+            cp ${RELEASE_DIR}/*.so lib-pkg/ 2>/dev/null || true
+            cp ${RELEASE_DIR}/*.dylib lib-pkg/ 2>/dev/null || true
+            cp ${RELEASE_DIR}/*.a lib-pkg/ 2>/dev/null || true
+          fi
+
+          # Verify server binary exists
+          if [ -z "$(ls -A server-pkg)" ]; then
+            echo "::error::Server binary not found in ${RELEASE_DIR}"
             ls -la "${RELEASE_DIR}/" | head -30
             exit 1
           fi
 
-          echo "Packaging artifacts:"
-          ls -la artifacts/
+          echo "Server package:"
+          ls -la server-pkg/
+          echo "Library package:"
+          ls -la lib-pkg/ 2>/dev/null || echo "(no library artifacts)"
 
-          # Create archive
-          cd artifacts
+          # Create server archive
+          cd server-pkg
           if [[ "${{ matrix.os }}" == "windows-latest" ]]; then
-            7z a ../laminardb-${TARGET}-v${VERSION}.zip *
+            7z a ../laminardb-server-${TARGET}-v${VERSION}.zip *
           else
-            tar -czvf ../laminardb-${TARGET}-v${VERSION}.tar.gz *
+            tar -czvf ../laminardb-server-${TARGET}-v${VERSION}.tar.gz *
+          fi
+          cd ..
+
+          # Create library archive (if any library artifacts exist)
+          if [ -n "$(ls -A lib-pkg 2>/dev/null)" ]; then
+            cd lib-pkg
+            if [[ "${{ matrix.os }}" == "windows-latest" ]]; then
+              7z a ../laminardb-lib-${TARGET}-v${VERSION}.zip *
+            else
+              tar -czvf ../laminardb-lib-${TARGET}-v${VERSION}.tar.gz *
+            fi
+            cd ..
           fi
 
-      - name: Upload artifact
+      - name: Upload server artifact
         uses: actions/upload-artifact@v4
         with:
           name: build-${{ matrix.target }}
-          path: laminardb-${{ matrix.target }}-v*.tar.gz
+          path: |
+            laminardb-server-${{ matrix.target }}-v*.tar.gz
+            laminardb-server-${{ matrix.target }}-v*.zip
+            laminardb-lib-${{ matrix.target }}-v*.tar.gz
+            laminardb-lib-${{ matrix.target }}-v*.zip
           if-no-files-found: ignore
-
-      - name: Upload artifact (Windows)
-        if: matrix.os == 'windows-latest'
-        uses: actions/upload-artifact@v4
-        with:
-          name: build-${{ matrix.target }}
-          path: laminardb-${{ matrix.target }}-v*.zip
 
   # ============================================
   # Create GitHub Release
@@ -250,14 +266,25 @@ jobs:
             FLAGS+=(--latest)
           fi
 
+          # Collect all release assets
+          ASSETS=()
+          for f in artifacts/laminardb-server-*.tar.gz artifacts/laminardb-server-*.zip \
+                   artifacts/laminardb-lib-*.tar.gz artifacts/laminardb-lib-*.zip \
+                   artifacts/checksums.sha256; do
+            [ -e "$f" ] && ASSETS+=("$f")
+          done
+
+          echo "Release assets:"
+          printf '  %s\n' "${ASSETS[@]}"
+
           # If the release already exists, upload assets to it; otherwise create it
           if gh release view "$TAG" > /dev/null 2>&1; then
             echo "Release $TAG already exists — updating assets"
-            gh release upload "$TAG" artifacts/laminardb-*.tar.gz artifacts/laminardb-*.zip artifacts/checksums.sha256 --clobber
+            gh release upload "$TAG" "${ASSETS[@]}" --clobber
             gh release edit "$TAG" --notes-file notes.md
           else
             echo "Creating release $TAG"
-            gh release create "$TAG" "${FLAGS[@]}" artifacts/laminardb-*.tar.gz artifacts/laminardb-*.zip artifacts/checksums.sha256
+            gh release create "$TAG" "${FLAGS[@]}" "${ASSETS[@]}"
           fi
 
   # ============================================
@@ -330,15 +357,6 @@ jobs:
       - name: Wait for index
         run: sleep 30
 
-      - name: Strip delta-lake feature from laminar-connectors
-        run: |
-          # deltalake 0.30.x on crates.io requires DataFusion 51, which conflicts
-          # with our DF 52 dependency tree. Remove it from the published crate.
-          # The delta-lake feature will be restored once deltalake publishes a DF 52-compatible release.
-          TOML="crates/laminar-connectors/Cargo.toml"
-          perl -i -ne 'print unless /^deltalake\s*=/' "$TOML"
-          perl -i -ne 'print unless /^delta-lake/' "$TOML"
-
       - name: Publish laminar-connectors
         run: cargo publish -p laminar-connectors --registry crates-io --allow-dirty --no-verify
         continue-on-error: true
@@ -346,8 +364,30 @@ jobs:
       - name: Wait for index
         run: sleep 30
 
+      - name: Strip iceberg feature before publishing laminar-db
+        run: |
+          # The iceberg feature is a placeholder that aliases laminar-connectors/delta-lake.
+          # Real iceberg support is not yet implemented — strip it so cargo publish
+          # doesn't advertise a non-functional feature.
+          # Also strip from laminar-server (publish=false, but workspace resolution
+          # requires consistency).
+          for TOML in crates/laminar-db/Cargo.toml crates/laminar-server/Cargo.toml; do
+            perl -i -ne 'print unless /^iceberg\s*=/' "$TOML"
+          done
+
       - name: Publish laminar-db
         run: cargo publish -p laminar-db --registry crates-io --allow-dirty --no-verify
+        continue-on-error: true
+
+      - name: Wait for index
+        run: sleep 30
+
+      - name: Publish laminar-auth
+        run: cargo publish -p laminar-auth --registry crates-io --allow-dirty --no-verify
+        continue-on-error: true
+
+      - name: Publish laminar-observe
+        run: cargo publish -p laminar-observe --registry crates-io --allow-dirty --no-verify
         continue-on-error: true
 
   # ============================================

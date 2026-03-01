@@ -1,0 +1,82 @@
+# LaminarDB Server Demo — Docker Compose
+#
+# Starts Redpanda (Kafka-compatible broker) + Console UI + topic initialization.
+# The LaminarDB server and producer run locally (not in Docker).
+#
+# Usage:
+#   docker compose up -d        # Start Redpanda stack
+#   docker compose down -v      # Tear down + remove volumes
+
+services:
+  redpanda:
+    image: docker.redpanda.com/redpandadata/redpanda:v24.2.5
+    container_name: laminardb-server-demo-redpanda
+    command:
+      - redpanda
+      - start
+      - --kafka-addr internal://0.0.0.0:9092,external://0.0.0.0:19092
+      - --advertise-kafka-addr internal://redpanda:9092,external://localhost:19092
+      - --pandaproxy-addr internal://0.0.0.0:8082,external://0.0.0.0:18082
+      - --advertise-pandaproxy-addr internal://redpanda:8082,external://localhost:18082
+      - --schema-registry-addr internal://0.0.0.0:8081,external://0.0.0.0:18081
+      - --rpc-addr redpanda:33145
+      - --advertise-rpc-addr redpanda:33145
+      - --mode dev-container
+      - --smp 1
+      - --default-log-level=warn
+    ports:
+      - "19092:19092"    # Kafka API (external)
+      - "18081:18081"    # Schema Registry
+      - "18082:18082"    # HTTP Proxy
+    healthcheck:
+      test: ["CMD-SHELL", "rpk cluster health | grep -E 'Healthy:.+true'"]
+      interval: 10s
+      timeout: 5s
+      retries: 5
+
+  console:
+    image: docker.redpanda.com/redpandadata/console:v2.7.2
+    container_name: laminardb-server-demo-console
+    depends_on:
+      redpanda:
+        condition: service_healthy
+    ports:
+      - "8888:8080"
+    entrypoint: /bin/sh
+    command: -c 'echo "$$CONSOLE_CONFIG_FILE" > /tmp/config.yml && /app/console'
+    environment:
+      CONFIG_FILEPATH: /tmp/config.yml
+      CONSOLE_CONFIG_FILE: |
+        kafka:
+          brokers: ["redpanda:9092"]
+        redpanda:
+          adminApi:
+            enabled: true
+            urls: ["http://redpanda:9644"]
+
+  init-topics:
+    image: docker.redpanda.com/redpandadata/redpanda:v24.2.5
+    container_name: laminardb-server-demo-init-topics
+    depends_on:
+      redpanda:
+        condition: service_healthy
+    restart: "no"
+    entrypoint: /bin/bash
+    command:
+      - -c
+      - |
+        set -e
+        echo "Creating input topics..."
+        rpk topic create market-ticks   --brokers redpanda:9092 --partitions 3 --config retention.ms=3600000
+        rpk topic create order-events   --brokers redpanda:9092 --partitions 3 --config retention.ms=3600000
+        rpk topic create book-updates   --brokers redpanda:9092 --partitions 3 --config retention.ms=3600000
+
+        echo "Creating output topics..."
+        rpk topic create ohlc-bars      --brokers redpanda:9092 --partitions 3 --config retention.ms=3600000
+        rpk topic create volume-metrics --brokers redpanda:9092 --partitions 3 --config retention.ms=3600000
+        rpk topic create vwap-results   --brokers redpanda:9092 --partitions 3 --config retention.ms=3600000
+        rpk topic create anomaly-alerts --brokers redpanda:9092 --partitions 1 --config retention.ms=3600000
+
+        echo ""
+        echo "All topics created:"
+        rpk topic list --brokers redpanda:9092

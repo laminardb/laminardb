@@ -1,0 +1,99 @@
+# LaminarDB Server Configuration — Embedded Mode (single node, in-process)
+#
+# Start with:
+#   cargo run -p laminar-server -- --config examples/laminardb.toml
+
+[server]
+mode = "embedded"
+bind = "127.0.0.1:8080"
+metrics_bind = "127.0.0.1:9090"
+workers = 0           # auto-detect CPU count
+log_level = "info"
+
+[state]
+backend = "memory"
+path = "./data/state"
+
+[checkpoint]
+url = "file:///tmp/laminardb/checkpoints"
+interval = "10s"
+mode = "aligned"
+snapshot_strategy = "full"
+
+# ── Sources ─────────────────────────────────────────────────────────────
+
+[[source]]
+name = "market_trades"
+connector = "kafka"
+format = "json"
+[source.properties]
+brokers = "${KAFKA_BROKERS:-localhost:9092}"
+topic = "trades"
+group_id = "laminardb-trades"
+start_offset = "latest"
+[[source.schema]]
+name = "symbol"
+type = "VARCHAR"
+nullable = false
+[[source.schema]]
+name = "price"
+type = "DOUBLE"
+nullable = false
+[[source.schema]]
+name = "quantity"
+type = "BIGINT"
+nullable = false
+[[source.schema]]
+name = "trade_time"
+type = "TIMESTAMP"
+nullable = false
+[source.watermark]
+column = "trade_time"
+max_out_of_orderness = "5s"
+
+# ── Lookup Tables ───────────────────────────────────────────────────────
+
+[[lookup]]
+name = "instruments"
+connector = "postgres"
+strategy = "poll"
+pushdown = true
+[lookup.properties]
+connection_string = "${POSTGRES_URL:-postgres://localhost/market_data}"
+table = "instruments"
+poll_interval = "60s"
+[lookup.cache]
+size_bytes = 104857600  # 100 MB
+ttl = "5m"
+hybrid = false
+
+# ── Pipelines ───────────────────────────────────────────────────────────
+
+[[pipeline]]
+name = "vwap_1m"
+sql = """
+SELECT
+    t.symbol,
+    SUM(t.price * t.quantity) / SUM(t.quantity) AS vwap,
+    SUM(t.quantity) AS total_volume,
+    COUNT(*) AS trade_count,
+    i.exchange,
+    i.currency
+FROM market_trades t
+JOIN instruments i ON t.symbol = i.symbol
+GROUP BY
+    TUMBLE(t.trade_time, INTERVAL '1' MINUTE),
+    t.symbol, i.exchange, i.currency
+EMIT AFTER WATERMARK
+"""
+
+# ── Sinks ───────────────────────────────────────────────────────────────
+
+[[sink]]
+name = "vwap_to_kafka"
+pipeline = "vwap_1m"
+connector = "kafka"
+delivery = "at_least_once"
+[sink.properties]
+brokers = "${KAFKA_BROKERS:-localhost:9092}"
+topic = "vwap_results"

@@ -13,12 +13,23 @@ target/
 # Documentation not needed in build
 docs/
 *.md
+!README.md
 
 # CI / config
 .github/
 .claude/
 
+# Tests and benchmarks
+tests/
+benches/
+
+# Deployment configs (not needed in image)
+deploy/
+
 # OS files
 nul
 Thumbs.db
 .DS_Store
+
+# Logs
+*.log

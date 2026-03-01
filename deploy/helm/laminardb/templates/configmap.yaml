@@ -1,0 +1,124 @@
+apiVersion: v1
+kind: ConfigMap
+metadata:
+  name: {{ include "laminardb.fullname" . }}
+  labels:
+    {{- include "laminardb.labels" . | nindent 4 }}
+data:
+  laminardb.toml: |
+    {{- if .Values.laminardb.configOverride }}
+    {{ .Values.laminardb.configOverride | nindent 4 }}
+    {{- else }}
+    {{- if eq .Values.laminardb.mode "delta" }}
+    node_id = "{{ default "$(HOSTNAME)" .Values.laminardb.delta.nodeId }}"
+    {{- end }}
+
+    [server]
+    mode = "{{ .Values.laminardb.mode }}"
+    bind = "{{ .Values.laminardb.httpBind }}"
+    workers = {{ .Values.laminardb.workers }}
+    log_level = "{{ .Values.laminardb.logLevel }}"
+
+    [state]
+    backend = "{{ .Values.laminardb.state.backend }}"
+    path = "{{ .Values.laminardb.state.path }}"
+    max_size_bytes = {{ .Values.laminardb.state.maxSizeBytes }}
+
+    [checkpoint]
+    url = "{{ .Values.laminardb.checkpoint.url }}"
+    interval = "{{ .Values.laminardb.checkpoint.interval }}"
+    mode = "{{ .Values.laminardb.checkpoint.mode }}"
+    snapshot_strategy = "{{ .Values.laminardb.checkpoint.snapshotStrategy }}"
+
+    {{- if eq .Values.laminardb.mode "delta" }}
+
+    [discovery]
+    strategy = "{{ .Values.laminardb.delta.discovery.strategy }}"
+    gossip_port = {{ .Values.laminardb.delta.discovery.gossipPort }}
+    {{- if .Values.laminardb.delta.discovery.seeds }}
+    seeds = [{{ range $i, $s := .Values.laminardb.delta.discovery.seeds }}{{ if $i }}, {{ end }}"{{ $s }}"{{ end }}]
+    {{- end }}
+
+    [coordination]
+    strategy = "{{ .Values.laminardb.delta.coordination.strategy }}"
+    raft_port = {{ .Values.laminardb.delta.coordination.raftPort }}
+    election_timeout = "{{ .Values.laminardb.delta.coordination.electionTimeout }}"
+    heartbeat_interval = "{{ .Values.laminardb.delta.coordination.heartbeatInterval }}"
+    {{- end }}
+
+    {{- range .Values.sources }}
+
+    [[source]]
+    name = "{{ .name }}"
+    connector = "{{ .connector }}"
+    {{- if .format }}
+    format = "{{ .format }}"
+    {{- end }}
+    {{- if .properties }}
+    [source.properties]
+    {{- range $key, $val := .properties }}
+    {{ $key }} = {{ $val | quote }}
+    {{- end }}
+    {{- end }}
+    {{- range .schema }}
+    [[source.schema]]
+    name = "{{ .name }}"
+    type = "{{ .type }}"
+    {{- if hasKey . "nullable" }}
+    nullable = {{ .nullable }}
+    {{- end }}
+    {{- end }}
+    {{- if .watermark }}
+    [source.watermark]
+    column = "{{ .watermark.column }}"
+    {{- if .watermark.max_out_of_orderness }}
+    max_out_of_orderness = "{{ .watermark.max_out_of_orderness }}"
+    {{- end }}
+    {{- end }}
+    {{- end }}
+
+    {{- range .Values.lookups }}
+
+    [[lookup]]
+    name = "{{ .name }}"
+    connector = "{{ .connector }}"
+    {{- if .strategy }}
+    strategy = "{{ .strategy }}"
+    {{- end }}
+    {{- if .properties }}
+    [lookup.properties]
+    {{- range $key, $val := .properties }}
+    {{ $key }} = {{ $val | quote }}
+    {{- end }}
+    {{- end }}
+    {{- end }}
+
+    {{- range .Values.pipelines }}
+
+    [[pipeline]]
+    name = "{{ .name }}"
+    sql = """
+    {{ .sql | indent 4 }}
+    """
+    {{- if .parallelism }}
+    parallelism = {{ .parallelism }}
+    {{- end }}
+    {{- end }}
+
+    {{- range .Values.sinks }}
+
+    [[sink]]
+    name = "{{ .name }}"
+    pipeline = "{{ .pipeline }}"
+    connector = "{{ .connector }}"
+    {{- if .delivery }}
+    delivery = "{{ .delivery }}"
+    {{- end }}
+    {{- if .properties }}
+    [sink.properties]
+    {{- range $key, $val := .properties }}
+    {{ $key }} = {{ $val | quote }}
+    {{- end }}
+    {{- end }}
+    {{- end }}
+    {{- end }}

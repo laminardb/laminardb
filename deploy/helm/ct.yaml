@@ -1,0 +1,7 @@
+remote: origin
+target-branch: main
+chart-dirs:
+  - deploy/helm
+chart-repos: []
+helm-extra-args: --timeout 120s
+validate-maintainers: false

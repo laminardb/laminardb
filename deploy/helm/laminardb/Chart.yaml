@@ -1,0 +1,19 @@
+apiVersion: v2
+name: laminardb
+description: LaminarDB - Embedded Streaming SQL Database for stream processing
+type: application
+version: 0.1.0
+appVersion: "0.17.0"
+keywords:
+  - streaming
+  - sql
+  - database
+  - real-time
+  - kafka
+  - stream-processing
+maintainers:
+  - name: LaminarDB
+    url: https://github.com/laminardb
+home: https://laminardb.dev
+sources:
+  - https://github.com/laminardb/laminardb

@@ -1,0 +1,182 @@
+{{- if include "laminardb.useStatefulSet" . }}
+apiVersion: apps/v1
+kind: StatefulSet
+metadata:
+  name: {{ include "laminardb.fullname" . }}
+  labels:
+    {{- include "laminardb.labels" . | nindent 4 }}
+spec:
+  {{- if not .Values.autoscaling.enabled }}
+  replicas: {{ .Values.replicaCount }}
+  {{- end }}
+  serviceName: {{ include "laminardb.headlessServiceName" . }}
+  selector:
+    matchLabels:
+      {{- include "laminardb.selectorLabels" . | nindent 6 }}
+  template:
+    metadata:
+      annotations:
+        {{- include "laminardb.configChecksum" . | nindent 8 }}
+        {{- with .Values.podAnnotations }}
+        {{- toYaml . | nindent 8 }}
+        {{- end }}
+      labels:
+        {{- include "laminardb.labels" . | nindent 8 }}
+        {{- with .Values.podLabels }}
+        {{- toYaml . | nindent 8 }}
+        {{- end }}
+    spec:
+      {{- with .Values.imagePullSecrets }}
+      imagePullSecrets:
+        {{- toYaml . | nindent 8 }}
+      {{- end }}
+      serviceAccountName: {{ include "laminardb.serviceAccountName" . }}
+      securityContext:
+        {{- toYaml .Values.podSecurityContext | nindent 8 }}
+      {{- with .Values.initContainers }}
+      initContainers:
+        {{- toYaml . | nindent 8 }}
+      {{- end }}
+      containers:
+        - name: {{ .Chart.Name }}
+          securityContext:
+            {{- toYaml .Values.securityContext | nindent 12 }}
+          image: {{ include "laminardb.image" . }}
+          imagePullPolicy: {{ .Values.image.pullPolicy }}
+          args:
+            - "--config"
+            - "/etc/laminardb/laminardb.toml"
+            - "--log-level"
+            - "{{ .Values.laminardb.logLevel }}"
+          ports:
+            - name: http
+              containerPort: 8080
+              protocol: TCP
+            {{- if .Values.service.pgEnabled }}
+            - name: pg
+              containerPort: 5432
+              protocol: TCP
+            {{- end }}
+            {{- if eq .Values.laminardb.mode "delta" }}
+            - name: gossip
+              containerPort: {{ .Values.laminardb.delta.discovery.gossipPort }}
+              protocol: TCP
+            - name: raft
+              containerPort: {{ .Values.laminardb.delta.coordination.raftPort }}
+              protocol: TCP
+            {{- end }}
+          startupProbe:
+            httpGet:
+              path: /health
+              port: http
+            initialDelaySeconds: 5
+            periodSeconds: 5
+            failureThreshold: 12
+          livenessProbe:
+            httpGet:
+              path: /health
+              port: http
+            periodSeconds: 10
+            timeoutSeconds: 3
+            failureThreshold: 3
+          readinessProbe:
+            httpGet:
+              path: /ready
+              port: http
+            periodSeconds: 5
+            timeoutSeconds: 3
+            failureThreshold: 3
+          {{- if or .Values.guaranteedQoS .Values.resources }}
+          resources:
+            {{- if .Values.guaranteedQoS }}
+            {{- $limits := .Values.resources.limits | default dict }}
+            limits:
+              {{- toYaml $limits | nindent 14 }}
+            requests:
+              {{- toYaml $limits | nindent 14 }}
+            {{- else }}
+            {{- toYaml .Values.resources | nindent 12 }}
+            {{- end }}
+          {{- end }}
+          env:
+            - name: HOSTNAME
+              valueFrom:
+                fieldRef:
+                  fieldPath: metadata.name
+            {{- with .Values.extraEnv }}
+            {{- toYaml . | nindent 12 }}
+            {{- end }}
+          volumeMounts:
+            - name: config
+              mountPath: /etc/laminardb
+              readOnly: true
+            - name: tmp
+              mountPath: /tmp
+            {{- if .Values.persistence.state.enabled }}
+            - name: state
+              mountPath: /var/lib/laminardb/state
+            {{- end }}
+            {{- if .Values.persistence.checkpoints.enabled }}
+            - name: checkpoints
+              mountPath: /var/lib/laminardb/checkpoints
+            {{- end }}
+            {{- with .Values.extraVolumeMounts }}
+            {{- toYaml . | nindent 12 }}
+            {{- end }}
+      volumes:
+        - name: config
+          configMap:
+            name: {{ include "laminardb.fullname" . }}
+        - name: tmp
+          emptyDir: {}
+        {{- with .Values.extraVolumes }}
+        {{- toYaml . | nindent 8 }}
+        {{- end }}
+      {{- with .Values.nodeSelector }}
+      nodeSelector:
+        {{- toYaml . | nindent 8 }}
+      {{- end }}
+      {{- with .Values.affinity }}
+      affinity:
+        {{- toYaml . | nindent 8 }}
+      {{- end }}
+      {{- with .Values.tolerations }}
+      tolerations:
+        {{- toYaml . | nindent 8 }}
+      {{- end }}
+      {{- with .Values.topologySpreadConstraints }}
+      topologySpreadConstraints:
+        {{- toYaml . | nindent 8 }}
+      {{- end }}
+  volumeClaimTemplates:
+    {{- if and .Values.persistence.state.enabled (not .Values.persistence.state.useEmptyDir) }}
+    - metadata:
+        name: state
+        labels:
+          {{- include "laminardb.selectorLabels" . | nindent 10 }}
+      spec:
+        accessModes:
+          {{- toYaml .Values.persistence.state.accessModes | nindent 10 }}
+        {{- if .Values.persistence.state.storageClass }}
+        storageClassName: {{ .Values.persistence.state.storageClass | quote }}
+        {{- end }}
+        resources:
+          requests:
+            storage: {{ .Values.persistence.state.size }}
+    {{- end }}
+    {{- if .Values.persistence.checkpoints.enabled }}
+    - metadata:
+        name: checkpoints
+        labels:
+          {{- include "laminardb.selectorLabels" . | nindent 10 }}
+      spec:
+        accessModes:
+          {{- toYaml .Values.persistence.checkpoints.accessModes | nindent 10 }}
+        {{- if .Values.persistence.checkpoints.storageClass }}
+        storageClassName: {{ .Values.persistence.checkpoints.storageClass | quote }}
+        {{- end }}
+        resources:
+          requests:
+            storage: {{ .Values.persistence.checkpoints.size }}
+    {{- end }}
+{{- end }}

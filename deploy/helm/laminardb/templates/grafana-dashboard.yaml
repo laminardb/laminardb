@@ -1,0 +1,142 @@
+{{- if .Values.grafanaDashboard.enabled }}
+apiVersion: v1
+kind: ConfigMap
+metadata:
+  name: {{ include "laminardb.fullname" . }}-dashboard
+  labels:
+    {{- include "laminardb.labels" . | nindent 4 }}
+    {{- with .Values.grafanaDashboard.labels }}
+    {{- toYaml . | nindent 4 }}
+    {{- end }}
+data:
+  laminardb-dashboard.json: |
+    {
+      "annotations": { "list": [] },
+      "editable": true,
+      "fiscalYearStartMonth": 0,
+      "graphTooltip": 1,
+      "links": [],
+      "panels": [
+        {
+          "title": "Pipeline State",
+          "type": "stat",
+          "gridPos": { "h": 4, "w": 6, "x": 0, "y": 0 },
+          "targets": [
+            {
+              "expr": "laminardb_pipeline_state_info",
+              "legendFormat": "{{`{{state}}`}}"
+            }
+          ],
+          "fieldConfig": {
+            "defaults": {
+              "mappings": [
+                { "type": "value", "options": { "1": { "text": "Running", "color": "green" } } }
+              ]
+            }
+          }
+        },
+        {
+          "title": "Uptime",
+          "type": "stat",
+          "gridPos": { "h": 4, "w": 6, "x": 6, "y": 0 },
+          "targets": [
+            {
+              "expr": "laminardb_uptime_seconds",
+              "legendFormat": "Uptime"
+            }
+          ],
+          "fieldConfig": {
+            "defaults": { "unit": "s" }
+          }
+        },
+        {
+          "title": "Sources / Streams / Sinks",
+          "type": "stat",
+          "gridPos": { "h": 4, "w": 12, "x": 12, "y": 0 },
+          "targets": [
+            { "expr": "laminardb_source_count", "legendFormat": "Sources" },
+            { "expr": "laminardb_stream_count", "legendFormat": "Streams" },
+            { "expr": "laminardb_sink_count", "legendFormat": "Sinks" }
+          ]
+        },
+        {
+          "title": "Events Ingested (rate/s)",
+          "type": "timeseries",
+          "gridPos": { "h": 8, "w": 12, "x": 0, "y": 4 },
+          "targets": [
+            {
+              "expr": "rate(laminardb_events_ingested_total[1m])",
+              "legendFormat": "Ingested/s"
+            }
+          ],
+          "fieldConfig": {
+            "defaults": { "unit": "ops", "custom": { "fillOpacity": 10 } }
+          }
+        },
+        {
+          "title": "Events Emitted (rate/s)",
+          "type": "timeseries",
+          "gridPos": { "h": 8, "w": 12, "x": 12, "y": 4 },
+          "targets": [
+            {
+              "expr": "rate(laminardb_events_emitted_total[1m])",
+              "legendFormat": "Emitted/s"
+            }
+          ],
+          "fieldConfig": {
+            "defaults": { "unit": "ops", "custom": { "fillOpacity": 10 } }
+          }
+        },
+        {
+          "title": "Events Dropped (rate/s)",
+          "type": "timeseries",
+          "gridPos": { "h": 8, "w": 12, "x": 0, "y": 12 },
+          "targets": [
+            {
+              "expr": "rate(laminardb_events_dropped_total[1m])",
+              "legendFormat": "Dropped/s"
+            }
+          ],
+          "fieldConfig": {
+            "defaults": { "unit": "ops", "custom": { "fillOpacity": 10, "lineStyle": { "fill": "solid" } } }
+          }
+        },
+        {
+          "title": "Per-Source Events (rate/s)",
+          "type": "timeseries",
+          "gridPos": { "h": 8, "w": 12, "x": 12, "y": 12 },
+          "targets": [
+            {
+              "expr": "rate(laminardb_source_events_total[1m])",
+              "legendFormat": "{{`{{source}}`}}"
+            }
+          ],
+          "fieldConfig": {
+            "defaults": { "unit": "ops", "custom": { "fillOpacity": 10 } }
+          }
+        },
+        {
+          "title": "Events Total (counters)",
+          "type": "timeseries",
+          "gridPos": { "h": 8, "w": 24, "x": 0, "y": 20 },
+          "targets": [
+            { "expr": "laminardb_events_ingested_total", "legendFormat": "Ingested" },
+            { "expr": "laminardb_events_emitted_total", "legendFormat": "Emitted" },
+            { "expr": "laminardb_events_dropped_total", "legendFormat": "Dropped" }
+          ],
+          "fieldConfig": {
+            "defaults": { "unit": "short" }
+          }
+        }
+      ],
+      "schemaVersion": 39,
+      "tags": ["laminardb", "streaming"],
+      "templating": { "list": [] },
+      "time": { "from": "now-1h", "to": "now" },
+      "timepicker": {},
+      "timezone": "",
+      "title": "LaminarDB Overview",
+      "uid": "laminardb-overview",
+      "version": 1
+    }
+{{- end }}
