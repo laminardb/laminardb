@@ -56,6 +56,9 @@ regex = { workspace = true }
 humantime-serde = { workspace = true }
 chrono = { workspace = true }
 
+# File watching for hot reload
+notify = { workspace = true }
+
 # Vendored OpenSSL for musl cross-compilation (behind vendored-openssl feature)
 openssl = { version = "0.10", features = ["vendored"], optional = true }
 
@@ -63,6 +66,9 @@ openssl = { version = "0.10", features = ["vendored"], optional = true }
 # tikv-jemallocator does not support Windows MSVC.
 [target.'cfg(not(target_env = "msvc"))'.dependencies]
 tikv-jemallocator = { workspace = true, optional = true }
+
+[dev-dependencies]
+tempfile = { workspace = true }
 
 [features]
 default = ["jemalloc", "kafka", "websocket", "delta-lake"]
