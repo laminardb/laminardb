@@ -539,7 +539,7 @@ impl StreamExecutor {
             if source_batches.contains_key(name) {
                 continue;
             }
-            let empty = datafusion::datasource::MemTable::try_new(schema.clone(), vec![])
+            let empty = datafusion::datasource::MemTable::try_new(schema.clone(), vec![vec![]])
                 .map_err(|e| DbError::query_pipeline(name, &e))?;
             let _ = self.ctx.deregister_table(name);
             self.ctx
