@@ -1,0 +1,257 @@
+# LaminarDB Server Demo — Embedded Mode with Kafka
+#
+# Runs 3 Kafka sources → 4 SQL pipelines → 4 Kafka sinks.
+# Pair with the demo producer for synthetic market data:
+#
+#   cargo run -p laminardb-demo --bin producer --features kafka
+#
+# Start the server:
+#   cargo run -p laminar-server --features kafka -- --config examples/server-demo/laminardb.toml
+
+[server]
+mode = "embedded"
+bind = "127.0.0.1:9000"
+metrics_bind = "127.0.0.1:9090"
+workers = 0
+log_level = "info"
+
+[state]
+backend = "memory"
+path = "./data/state"
+
+[checkpoint]
+url = "file:///tmp/laminardb-server-demo/checkpoints"
+interval = "10s"
+mode = "aligned"
+snapshot_strategy = "full"
+
+# ── Sources ─────────────────────────────────────────────────────────────
+
+[[source]]
+name = "market_ticks"
+connector = "kafka"
+format = "json"
+[source.properties]
+brokers = "${KAFKA_BROKERS:-localhost:19092}"
+topic = "market-ticks"
+group_id = "laminardb-server-demo-ticks"
+start_offset = "latest"
+"kafka.session.timeout.ms" = "6000"
+[[source.schema]]
+name = "symbol"
+type = "VARCHAR"
+nullable = false
+[[source.schema]]
+name = "price"
+type = "DOUBLE"
+nullable = false
+[[source.schema]]
+name = "bid"
+type = "DOUBLE"
+nullable = false
+[[source.schema]]
+name = "ask"
+type = "DOUBLE"
+nullable = false
+[[source.schema]]
+name = "volume"
+type = "BIGINT"
+nullable = false
+[[source.schema]]
+name = "side"
+type = "VARCHAR"
+nullable = false
+[[source.schema]]
+name = "ts"
+type = "BIGINT"
+nullable = false
+[source.watermark]
+column = "ts"
+max_out_of_orderness = "5s"
+
+[[source]]
+name = "order_events"
+connector = "kafka"
+format = "json"
+[source.properties]
+brokers = "${KAFKA_BROKERS:-localhost:19092}"
+topic = "order-events"
+group_id = "laminardb-server-demo-orders"
+start_offset = "latest"
+"kafka.session.timeout.ms" = "6000"
+[[source.schema]]
+name = "order_id"
+type = "VARCHAR"
+nullable = false
+[[source.schema]]
+name = "symbol"
+type = "VARCHAR"
+nullable = false
+[[source.schema]]
+name = "side"
+type = "VARCHAR"
+nullable = false
+[[source.schema]]
+name = "quantity"
+type = "BIGINT"
+nullable = false
+[[source.schema]]
+name = "price"
+type = "DOUBLE"
+nullable = false
+[[source.schema]]
+name = "ts"
+type = "BIGINT"
+nullable = false
+[source.watermark]
+column = "ts"
+max_out_of_orderness = "5s"
+
+[[source]]
+name = "book_updates"
+connector = "kafka"
+format = "json"
+[source.properties]
+brokers = "${KAFKA_BROKERS:-localhost:19092}"
+topic = "book-updates"
+group_id = "laminardb-server-demo-book"
+start_offset = "latest"
+"kafka.session.timeout.ms" = "6000"
+[[source.schema]]
+name = "symbol"
+type = "VARCHAR"
+nullable = false
+[[source.schema]]
+name = "side"
+type = "VARCHAR"
+nullable = false
+[[source.schema]]
+name = "action"
+type = "VARCHAR"
+nullable = false
+[[source.schema]]
+name = "price_level"
+type = "DOUBLE"
+nullable = false
+[[source.schema]]
+name = "quantity"
+type = "BIGINT"
+nullable = false
+[[source.schema]]
+name = "order_count"
+type = "BIGINT"
+nullable = false
+[[source.schema]]
+name = "ts"
+type = "BIGINT"
+nullable = false
+[source.watermark]
+column = "ts"
+max_out_of_orderness = "5s"
+
+# ── Pipelines ───────────────────────────────────────────────────────────
+
+[[pipeline]]
+name = "ohlc_bars"
+sql = """
+SELECT
+    symbol,
+    MIN(price) AS low,
+    MAX(price) AS high,
+    COUNT(*) AS trade_count,
+    SUM(volume) AS total_volume
+FROM market_ticks
+GROUP BY
+    TUMBLE(ts, INTERVAL '5' SECOND),
+    symbol
+EMIT AFTER WATERMARK
+"""
+
+[[pipeline]]
+name = "volume_metrics"
+sql = """
+SELECT
+    symbol,
+    SUM(CASE WHEN side = 'buy' THEN volume ELSE 0 END) AS buy_volume,
+    SUM(CASE WHEN side = 'sell' THEN volume ELSE 0 END) AS sell_volume,
+    SUM(CASE WHEN side = 'buy' THEN volume ELSE 0 END)
+      - SUM(CASE WHEN side = 'sell' THEN volume ELSE 0 END) AS net_volume,
+    COUNT(*) AS trade_count
+FROM market_ticks
+GROUP BY
+    TUMBLE(ts, INTERVAL '5' SECOND),
+    symbol
+EMIT AFTER WATERMARK
+"""
+
+[[pipeline]]
+name = "vwap"
+sql = """
+SELECT
+    symbol,
+    SUM(price * volume) / SUM(volume) AS vwap,
+    SUM(volume) AS total_volume,
+    COUNT(*) AS trade_count
+FROM market_ticks
+GROUP BY
+    TUMBLE(ts, INTERVAL '5' SECOND),
+    symbol
+EMIT AFTER WATERMARK
+"""
+
+[[pipeline]]
+name = "anomaly_alerts"
+sql = """
+SELECT
+    symbol,
+    COUNT(*) AS trade_count,
+    SUM(volume) AS total_volume
+FROM market_ticks
+GROUP BY
+    TUMBLE(ts, INTERVAL '5' SECOND),
+    symbol
+HAVING SUM(volume) > 500
+EMIT AFTER WATERMARK
+"""
+
+# ── Sinks ───────────────────────────────────────────────────────────────
+
+[[sink]]
+name = "ohlc_sink"
+pipeline = "ohlc_bars"
+connector = "kafka"
+delivery = "at_least_once"
+[sink.properties]
+brokers = "${KAFKA_BROKERS:-localhost:19092}"
+topic = "ohlc-bars"
+"key.column" = "symbol"
+
+[[sink]]
+name = "volume_sink"
+pipeline = "volume_metrics"
+connector = "kafka"
+delivery = "at_least_once"
+[sink.properties]
+brokers = "${KAFKA_BROKERS:-localhost:19092}"
+topic = "volume-metrics"
+"key.column" = "symbol"
+
+[[sink]]
+name = "vwap_sink"
+pipeline = "vwap"
+connector = "kafka"
+delivery = "at_least_once"
+[sink.properties]
+brokers = "${KAFKA_BROKERS:-localhost:19092}"
+topic = "vwap-results"
+"key.column" = "symbol"
+
+[[sink]]
+name = "anomaly_sink"
+pipeline = "anomaly_alerts"
+connector = "kafka"
+delivery = "at_least_once"
+[sink.properties]
+brokers = "${KAFKA_BROKERS:-localhost:19092}"
+topic = "anomaly-alerts"
+"key.column" = "symbol"

@@ -356,6 +356,13 @@ impl SourceConnector for KafkaSource {
 
         self.consumer = Some(consumer);
         self.state = ConnectorState::Running;
+
+        // Start the background reader immediately so that `data_ready_notify()`
+        // has an active producer.  Without this, the source task deadlocks:
+        // it awaits `data_ready.notified()` but the reader (which fires that
+        // notification) would only be spawned lazily in `poll_batch()`.
+        self.ensure_reader_started();
+
         info!("Kafka source connector opened successfully");
         Ok(())
     }

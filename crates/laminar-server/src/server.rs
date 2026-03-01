@@ -212,7 +212,13 @@ pub fn source_to_ddl(source: &SourceConfig) -> String {
     let mut opts = Vec::new();
     opts.push(format!("format = '{}'", source.format));
     for (key, value) in &source.properties {
-        opts.push(format!("{} = '{}'", key, toml_value_to_sql(value)));
+        // Quote keys that contain dots (e.g. kafka.session.timeout.ms)
+        // to prevent SQL parser errors with dotted identifiers.
+        if key.contains('.') {
+            opts.push(format!("\"{}\" = '{}'", key, toml_value_to_sql(value)));
+        } else {
+            opts.push(format!("{} = '{}'", key, toml_value_to_sql(value)));
+        }
     }
     parts.push(format!("FROM {} ({})", connector_keyword, opts.join(", ")));
 
@@ -235,7 +241,13 @@ pub fn sink_to_ddl(sink: &SinkConfig) -> String {
     let mut opts: Vec<String> = sink
         .properties
         .iter()
-        .map(|(key, value)| format!("{} = '{}'", key, toml_value_to_sql(value)))
+        .map(|(key, value)| {
+            if key.contains('.') {
+                format!("\"{}\" = '{}'", key, toml_value_to_sql(value))
+            } else {
+                format!("{} = '{}'", key, toml_value_to_sql(value))
+            }
+        })
         .collect();
     if sink.delivery != "at_least_once" {
         opts.push(format!("delivery = '{}'", sink.delivery));

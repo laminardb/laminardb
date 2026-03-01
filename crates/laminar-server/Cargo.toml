@@ -67,6 +67,12 @@ tikv-jemallocator = { workspace = true, optional = true }
 [features]
 default = ["jemalloc"]
 jemalloc = ["dep:tikv-jemallocator"]
+kafka = ["laminar-db/kafka"]
+websocket = ["laminar-db/websocket"]
+postgres-cdc = ["laminar-db/postgres-cdc"]
+postgres-sink = ["laminar-db/postgres-sink"]
+mysql-cdc = ["laminar-db/mysql-cdc"]
+delta-lake = ["laminar-db/delta-lake"]
 # Compile OpenSSL from source — required for musl cross-compilation where
 # system libssl-dev is not available for the target triple.
 vendored-openssl = ["dep:openssl"]
