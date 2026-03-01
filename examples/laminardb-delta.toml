@@ -1,0 +1,75 @@
+# LaminarDB Server Configuration — Delta Mode (multi-node distributed)
+#
+# Each node in the cluster runs with its own copy of this config file,
+# with a unique node_id.
+#
+# Start with:
+#   laminardb --config laminardb-delta.toml
+
+node_id = "star-1"
+
+[server]
+mode = "delta"
+bind = "0.0.0.0:8080"
+metrics_bind = "0.0.0.0:9090"
+workers = 8
+
+[state]
+backend = "mmap"
+path = "/data/laminardb/state"
+max_size_bytes = 10737418240  # 10 GB
+
+[checkpoint]
+url = "s3://laminardb-checkpoints/prod"
+interval = "30s"
+mode = "aligned"
+snapshot_strategy = "fork_cow"
+
+[discovery]
+strategy = "static"
+seeds = [
+    "star-1.laminardb.svc:7946",
+    "star-2.laminardb.svc:7946",
+    "star-3.laminardb.svc:7946",
+]
+gossip_port = 7946
+
+[coordination]
+strategy = "raft"
+raft_port = 7947
+election_timeout = "1500ms"
+heartbeat_interval = "300ms"
+
+# ── Sources ─────────────────────────────────────────────────────────────
+
+[[source]]
+name = "orders"
+connector = "kafka"
+format = "avro"
+[source.properties]
+brokers = "${KAFKA_BROKERS}"
+topic = "orders"
+group_id = "laminardb-orders"
+schema_registry = "${SCHEMA_REGISTRY_URL}"
+
+# ── Pipelines ───────────────────────────────────────────────────────────
+
+[[pipeline]]
+name = "order_enrichment"
+sql = """
+SELECT o.*, c.name AS customer_name, c.tier
+FROM orders o
+JOIN customers c ON o.customer_id = c.id
+"""
+parallelism = 8
+
+# ── Sinks ───────────────────────────────────────────────────────────────
+
+[[sink]]
+name = "enriched_orders"
+pipeline = "order_enrichment"
+connector = "kafka"
+delivery = "exactly_once"
+[sink.properties]
+brokers = "${KAFKA_BROKERS}"
+topic = "enriched_orders"

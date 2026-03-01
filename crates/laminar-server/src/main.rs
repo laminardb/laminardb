@@ -1,10 +1,22 @@
-//! LaminarDB standalone server
+//! LaminarDB standalone server binary.
+//!
+//! Reads a TOML config file and runs streaming SQL pipelines.
+//!
+//! ```bash
+//! laminardb --config laminardb.toml
+//! ```
 
 #![allow(clippy::disallowed_types)]
+
+mod config;
+mod http;
+mod server;
 
 #[cfg(all(feature = "jemalloc", not(target_env = "msvc")))]
 #[global_allocator]
 static GLOBAL: tikv_jemallocator::Jemalloc = tikv_jemallocator::Jemalloc;
+
+use std::path::PathBuf;
 
 use anyhow::Result;
 use clap::Parser;
@@ -23,9 +35,9 @@ struct Args {
     #[arg(long, default_value = "info")]
     log_level: String,
 
-    /// Bind address for admin API
-    #[arg(long, default_value = "127.0.0.1:8080")]
-    admin_bind: String,
+    /// Bind address for admin API (overrides config file)
+    #[arg(long)]
+    admin_bind: Option<String>,
 }
 
 #[tokio::main]
@@ -45,10 +57,20 @@ async fn main() -> Result<()> {
     info!("Version: {}", env!("CARGO_PKG_VERSION"));
     info!("Config file: {}", args.config);
 
-    // TODO(phase-5): Load configuration from args.config
-    // TODO(phase-5): Initialize reactor with thread-per-core
-    // TODO(phase-5): Start admin API on args.admin_bind
-    // TODO(phase-5): Run event loop
+    // Load configuration
+    let config_path = PathBuf::from(&args.config);
+    let mut config = config::load_config(&config_path)?;
+
+    // Override bind address from CLI if provided
+    if let Some(bind) = args.admin_bind {
+        config.server.bind = bind;
+    }
+
+    // Build and start server
+    let handle = server::run_server(config, config_path).await?;
+
+    // Block until shutdown signal
+    handle.wait_for_shutdown().await?;
 
     Ok(())
 }
