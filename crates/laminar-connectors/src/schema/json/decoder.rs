@@ -5,6 +5,7 @@
 //! the decoder is stateless after construction so the Ring 1 hot path
 //! has zero schema lookups.
 
+use std::collections::HashMap;
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::Arc;
 
@@ -57,6 +58,15 @@ impl TypeMismatchStrategy {
     }
 }
 
+/// Per-column extraction strategy, pre-computed at Ring 2.
+#[derive(Debug, Clone)]
+enum ColumnExtraction {
+    /// Extract field from the default path target (json.path or root).
+    DefaultPath,
+    /// Extract field from a custom absolute path from root.
+    CustomPath { segments: Vec<String> },
+}
+
 /// JSON decoder configuration.
 #[derive(Debug, Clone)]
 pub struct JsonDecoderConfig {
@@ -75,6 +85,21 @@ pub struct JsonDecoderConfig {
     /// instead of JSON-serialized Utf8. When true, nested objects
     /// become `LargeBinary` columns with JSONB encoding.
     pub nested_as_jsonb: bool,
+
+    /// Dot-separated path to navigate before field extraction.
+    /// e.g. `"data"` → navigate into `{"data": {...}}` before extraction.
+    /// e.g. `"data.trade"` → navigate into `{"data":{"trade":{...}}}`.
+    pub json_path: Option<Vec<String>>,
+
+    /// Per-column absolute path overrides: `column_name` → path segments.
+    /// Parsed from `json.column.<name> = 'path.to.field'` options.
+    /// These paths are absolute from the root, ignoring `json_path`.
+    pub json_column_paths: HashMap<String, Vec<String>>,
+
+    /// Column names for array-to-rows expansion.
+    /// When set, the target (after `json_path`) must be an array.
+    /// Each element becomes a row; positional names map array elements to columns.
+    pub json_explode: Option<Vec<String>>,
 }
 
 impl Default for JsonDecoderConfig {
@@ -90,7 +115,48 @@ impl Default for JsonDecoderConfig {
                 "%Y-%m-%d %H:%M:%S".into(),
             ],
             nested_as_jsonb: false,
+            json_path: None,
+            json_column_paths: HashMap::new(),
+            json_explode: None,
         }
+    }
+}
+
+impl JsonDecoderConfig {
+    /// Build config from a [`ConnectorConfig`](crate::config::ConnectorConfig).
+    ///
+    /// Parses `json.path`, `json.column.*`, `json.explode`,
+    /// `schema.enforcement`, and `nested.as.jsonb` properties.
+    /// Called once at Ring 2 (`CREATE SOURCE` time).
+    #[must_use]
+    pub fn from_connector_config(config: &crate::config::ConnectorConfig) -> Self {
+        let mut cfg = Self::default();
+
+        if let Some(path) = config.get("json.path") {
+            cfg.json_path = Some(path.split('.').map(ToString::to_string).collect());
+        }
+
+        let col_props = config.properties_with_prefix("json.column.");
+        for (col_name, path_str) in col_props {
+            cfg.json_column_paths.insert(
+                col_name,
+                path_str.split('.').map(ToString::to_string).collect(),
+            );
+        }
+
+        if let Some(explode) = config.get("json.explode") {
+            cfg.json_explode = Some(explode.split(',').map(|s| s.trim().to_string()).collect());
+        }
+
+        if let Some(enforcement) = config.get("schema.enforcement") {
+            if let Some(strategy) = TypeMismatchStrategy::from_enforcement_str(enforcement) {
+                cfg.type_mismatch = strategy;
+            }
+        }
+        if let Some(v) = config.get("nested.as.jsonb") {
+            cfg.nested_as_jsonb = v.eq_ignore_ascii_case("true");
+        }
+        cfg
     }
 }
 
@@ -109,6 +175,13 @@ pub struct JsonDecoder {
     field_indices: Vec<(String, usize)>,
     /// Cumulative type mismatch count (diagnostics).
     mismatch_count: AtomicU64,
+    /// Ring 2 pre-computed: extraction strategy per schema column.
+    column_extractions: Vec<ColumnExtraction>,
+    /// Ring 2 pre-computed: explode position → schema column index.
+    /// `Some` when `json.explode` is configured; each entry maps an
+    /// explode position to the schema column index (or `None` if
+    /// the explode name doesn't match any schema column).
+    explode_col_indices: Option<Vec<Option<usize>>>,
 }
 
 #[allow(clippy::missing_fields_in_debug)]
@@ -142,11 +215,40 @@ impl JsonDecoder {
             .map(|(i, f)| (f.name().clone(), i))
             .collect();
 
+        let column_extractions: Vec<ColumnExtraction> = schema
+            .fields()
+            .iter()
+            .map(|f| {
+                let col_name = f.name();
+                if let Some(path_segments) = config.json_column_paths.get(col_name.as_str()) {
+                    ColumnExtraction::CustomPath {
+                        segments: path_segments.clone(),
+                    }
+                } else {
+                    ColumnExtraction::DefaultPath
+                }
+            })
+            .collect();
+
+        let explode_col_indices = config.json_explode.as_ref().map(|names| {
+            names
+                .iter()
+                .map(|name| {
+                    field_indices
+                        .iter()
+                        .find(|(n, _)| n == name)
+                        .map(|(_, idx)| *idx)
+                })
+                .collect()
+        });
+
         Self {
             schema,
             config,
             field_indices,
             mismatch_count: AtomicU64::new(0),
+            column_extractions,
+            explode_col_indices,
         }
     }
 
@@ -161,6 +263,7 @@ impl FormatDecoder for JsonDecoder {
         self.schema.clone()
     }
 
+    #[allow(clippy::too_many_lines)]
     fn decode_batch(&self, records: &[RawRecord]) -> SchemaResult<RecordBatch> {
         if records.is_empty() {
             return Ok(RecordBatch::new_empty(self.schema.clone()));
@@ -189,76 +292,187 @@ impl FormatDecoder for JsonDecoder {
             None
         };
 
+        // Reusable populated-tracking buffer — avoids heap alloc per record.
+        let mut populated = vec![false; num_fields];
+
         for record in records {
             let value: serde_json::Value = serde_json::from_slice(&record.value)
                 .map_err(|e| SchemaError::DecodeError(format!("JSON parse error: {e}")))?;
 
-            let obj = value.as_object().ok_or_else(|| {
-                SchemaError::DecodeError("top-level JSON value must be an object".into())
-            })?;
+            // Navigate json.path → default target (borrowed, ZERO alloc).
+            let default_target: &serde_json::Value = if let Some(ref path) = self.config.json_path {
+                let mut current = &value;
+                for segment in path {
+                    current = current.get(segment.as_str()).ok_or_else(|| {
+                        SchemaError::DecodeError(format!("json.path segment '{segment}' not found"))
+                    })?;
+                }
+                current
+            } else {
+                &value
+            };
 
-            // Track which schema fields were populated for this record.
-            let mut populated = vec![false; num_fields];
-
-            // Collect unknown fields for CollectExtra.
-            let mut extra_fields: Option<serde_json::Map<String, serde_json::Value>> =
-                if collect_extra {
-                    Some(serde_json::Map::new())
-                } else {
-                    None
-                };
-
-            for (key, val) in obj {
-                if let Some(col_idx) = self.field_index(key) {
-                    populated[col_idx] = true;
-                    let field = &self.schema.fields()[col_idx];
-                    append_value(
-                        &mut builders[col_idx],
-                        field.data_type(),
-                        val,
-                        &self.config,
-                        &self.mismatch_count,
-                        jsonb_encoder.as_mut(),
-                    )?;
-                } else {
-                    match self.config.unknown_fields {
-                        UnknownFieldStrategy::Ignore => {}
-                        UnknownFieldStrategy::CollectExtra => {
-                            if let Some(ref mut extra) = extra_fields {
-                                extra.insert(key.clone(), val.clone());
+            if let Some(ref col_indices) = self.explode_col_indices {
+                // === EXPLODE MODE ===
+                let arr = default_target.as_array().ok_or_else(|| {
+                    SchemaError::DecodeError("json.explode target must be an array".into())
+                })?;
+                for element in arr {
+                    populated.fill(false);
+                    match element {
+                        serde_json::Value::Array(items) => {
+                            for (pos, col_idx_opt) in col_indices.iter().enumerate() {
+                                if let Some(col_idx) = col_idx_opt {
+                                    let val = items.get(pos).unwrap_or(&serde_json::Value::Null);
+                                    let field = &self.schema.fields()[*col_idx];
+                                    append_value(
+                                        &mut builders[*col_idx],
+                                        field.data_type(),
+                                        val,
+                                        &self.config,
+                                        &self.mismatch_count,
+                                        jsonb_encoder.as_mut(),
+                                    )?;
+                                    populated[*col_idx] = true;
+                                }
                             }
                         }
-                        UnknownFieldStrategy::Reject => {
+                        serde_json::Value::Object(obj) => {
+                            for (col_idx, (col_name, _)) in self.field_indices.iter().enumerate() {
+                                if let Some(val) = obj.get(col_name.as_str()) {
+                                    let field = &self.schema.fields()[col_idx];
+                                    append_value(
+                                        &mut builders[col_idx],
+                                        field.data_type(),
+                                        val,
+                                        &self.config,
+                                        &self.mismatch_count,
+                                        jsonb_encoder.as_mut(),
+                                    )?;
+                                    populated[col_idx] = true;
+                                }
+                            }
+                        }
+                        _ => {
+                            return Err(SchemaError::DecodeError(
+                                "json.explode array elements must be arrays or objects".into(),
+                            ));
+                        }
+                    }
+                    // Append nulls for missing fields.
+                    for (col_idx, was_populated) in populated.iter().enumerate() {
+                        if !was_populated {
+                            append_null(&mut builders[col_idx]);
+                        }
+                    }
+                    // _extra column: append null for each exploded row.
+                    if let Some(ref mut eb) = extra_builder {
+                        eb.append_null();
+                    }
+                }
+            } else {
+                // === NORMAL OBJECT MODE (with per-column path support) ===
+                let default_obj = default_target.as_object().ok_or_else(|| {
+                    SchemaError::DecodeError("JSON value must be an object".into())
+                })?;
+
+                populated.fill(false);
+
+                // Collect unknown fields for CollectExtra.
+                let mut extra_fields: Option<serde_json::Map<String, serde_json::Value>> =
+                    if collect_extra {
+                        Some(serde_json::Map::new())
+                    } else {
+                        None
+                    };
+
+                // Per-column extraction using pre-computed ColumnExtraction.
+                for (col_idx, (col_name, _)) in self.field_indices.iter().enumerate() {
+                    match &self.column_extractions[col_idx] {
+                        ColumnExtraction::DefaultPath => {
+                            if let Some(val) = default_obj.get(col_name.as_str()) {
+                                populated[col_idx] = true;
+                                let field = &self.schema.fields()[col_idx];
+                                append_value(
+                                    &mut builders[col_idx],
+                                    field.data_type(),
+                                    val,
+                                    &self.config,
+                                    &self.mismatch_count,
+                                    jsonb_encoder.as_mut(),
+                                )?;
+                            }
+                        }
+                        ColumnExtraction::CustomPath { segments } => {
+                            // Navigate custom path from root (ZERO alloc).
+                            let extracted = navigate_path(&value, segments);
+                            if let Some(val) = extracted {
+                                populated[col_idx] = true;
+                                let field = &self.schema.fields()[col_idx];
+                                append_value(
+                                    &mut builders[col_idx],
+                                    field.data_type(),
+                                    val,
+                                    &self.config,
+                                    &self.mismatch_count,
+                                    jsonb_encoder.as_mut(),
+                                )?;
+                            }
+                        }
+                    }
+                }
+
+                // Collect unknown fields (fields in default_obj not in schema).
+                if collect_extra {
+                    for (key, val) in default_obj {
+                        if self.field_index(key).is_none() {
+                            match self.config.unknown_fields {
+                                UnknownFieldStrategy::CollectExtra => {
+                                    if let Some(ref mut extra) = extra_fields {
+                                        extra.insert(key.clone(), val.clone());
+                                    }
+                                }
+                                UnknownFieldStrategy::Reject => {
+                                    return Err(SchemaError::DecodeError(format!(
+                                        "unknown field '{key}' not in schema"
+                                    )));
+                                }
+                                UnknownFieldStrategy::Ignore => {}
+                            }
+                        }
+                    }
+                } else if matches!(self.config.unknown_fields, UnknownFieldStrategy::Reject) {
+                    for key in default_obj.keys() {
+                        if self.field_index(key).is_none() {
                             return Err(SchemaError::DecodeError(format!(
                                 "unknown field '{key}' not in schema"
                             )));
                         }
                     }
                 }
-            }
 
-            // Append nulls for missing fields.
-            for (col_idx, was_populated) in populated.iter().enumerate() {
-                if !was_populated {
-                    append_null(&mut builders[col_idx]);
-                }
-            }
-
-            // Append _extra column.
-            if let Some(ref mut eb) = extra_builder {
-                if let Some(ref extra) = extra_fields {
-                    if extra.is_empty() {
-                        eb.append_null();
-                    } else {
-                        let mut enc = jsonb_encoder.as_mut().map_or_else(JsonbEncoder::new, |_| {
-                            // Borrow-safe: take a fresh encoder for extra.
-                            JsonbEncoder::new()
-                        });
-                        let bytes = enc.encode(&serde_json::Value::Object(extra.clone()));
-                        eb.append_value(&bytes);
+                // Append nulls for missing fields.
+                for (col_idx, was_populated) in populated.iter().enumerate() {
+                    if !was_populated {
+                        append_null(&mut builders[col_idx]);
                     }
-                } else {
-                    eb.append_null();
+                }
+
+                // Append _extra column.
+                if let Some(ref mut eb) = extra_builder {
+                    if let Some(ref extra) = extra_fields {
+                        if extra.is_empty() {
+                            eb.append_null();
+                        } else {
+                            let mut enc = jsonb_encoder
+                                .as_mut()
+                                .map_or_else(JsonbEncoder::new, |_| JsonbEncoder::new());
+                            let bytes = enc.encode(&serde_json::Value::Object(extra.clone()));
+                            eb.append_value(&bytes);
+                        }
+                    } else {
+                        eb.append_null();
+                    }
                 }
             }
         }
@@ -299,6 +513,19 @@ impl JsonDecoder {
             .find(|(n, _)| n == name)
             .map(|(_, idx)| *idx)
     }
+}
+
+/// Navigate a dot-path through a JSON value tree. Returns `None` if any
+/// segment is missing. Zero allocations — pure pointer-chasing.
+fn navigate_path<'a>(
+    root: &'a serde_json::Value,
+    segments: &[String],
+) -> Option<&'a serde_json::Value> {
+    let mut current = root;
+    for segment in segments {
+        current = current.get(segment.as_str())?;
+    }
+    Some(current)
 }
 
 // ── Builder helpers ────────────────────────────────────────────────
@@ -1433,5 +1660,277 @@ mod tests {
                 .value(0),
             200
         );
+    }
+
+    // ── json.path tests ─────────────────────────────────────────
+
+    #[test]
+    fn test_json_path_single() {
+        let schema = make_schema(vec![("id", DataType::Int64, false)]);
+        let config = JsonDecoderConfig {
+            json_path: Some(vec!["data".into()]),
+            ..Default::default()
+        };
+        let decoder = JsonDecoder::with_config(schema, config);
+        let records = vec![json_record(r#"{"data":{"id":1}}"#)];
+        let batch = decoder.decode_batch(&records).unwrap();
+        assert_eq!(batch.num_rows(), 1);
+        assert_eq!(
+            batch
+                .column(0)
+                .as_primitive::<arrow_array::types::Int64Type>()
+                .value(0),
+            1
+        );
+    }
+
+    #[test]
+    fn test_json_path_multi() {
+        let schema = make_schema(vec![("id", DataType::Int64, false)]);
+        let config = JsonDecoderConfig {
+            json_path: Some(vec!["a".into(), "b".into()]),
+            ..Default::default()
+        };
+        let decoder = JsonDecoder::with_config(schema, config);
+        let records = vec![json_record(r#"{"a":{"b":{"id":1}}}"#)];
+        let batch = decoder.decode_batch(&records).unwrap();
+        assert_eq!(
+            batch
+                .column(0)
+                .as_primitive::<arrow_array::types::Int64Type>()
+                .value(0),
+            1
+        );
+    }
+
+    #[test]
+    fn test_json_path_missing_errors() {
+        let schema = make_schema(vec![("id", DataType::Int64, false)]);
+        let config = JsonDecoderConfig {
+            json_path: Some(vec!["nonexistent".into()]),
+            ..Default::default()
+        };
+        let decoder = JsonDecoder::with_config(schema, config);
+        let records = vec![json_record(r#"{"data":{"id":1}}"#)];
+        let result = decoder.decode_batch(&records);
+        assert!(result.is_err());
+        assert!(result.unwrap_err().to_string().contains("not found"));
+    }
+
+    // ── json.column.* tests ─────────────────────────────────────
+
+    #[test]
+    fn test_json_column_custom_path() {
+        let schema = make_schema(vec![
+            ("p", DataType::Float64, false),
+            ("stream_name", DataType::Utf8, true),
+        ]);
+        let mut col_paths = HashMap::new();
+        col_paths.insert("stream_name".into(), vec!["stream".into()]);
+        let config = JsonDecoderConfig {
+            json_path: Some(vec!["data".into()]),
+            json_column_paths: col_paths,
+            ..Default::default()
+        };
+        let decoder = JsonDecoder::with_config(schema, config);
+        let records = vec![json_record(
+            r#"{"stream":"btcusdt@trade","data":{"p":67523.0}}"#,
+        )];
+        let batch = decoder.decode_batch(&records).unwrap();
+        assert_eq!(batch.num_rows(), 1);
+        let price = batch
+            .column(0)
+            .as_primitive::<arrow_array::types::Float64Type>()
+            .value(0);
+        assert!((price - 67523.0).abs() < f64::EPSILON);
+        assert_eq!(batch.column(1).as_string::<i32>().value(0), "btcusdt@trade");
+    }
+
+    #[test]
+    fn test_json_column_deep_path() {
+        let schema = make_schema(vec![
+            ("p", DataType::Float64, false),
+            ("ts", DataType::Int64, true),
+        ]);
+        let mut col_paths = HashMap::new();
+        col_paths.insert("ts".into(), vec!["meta".into(), "timestamp".into()]);
+        let config = JsonDecoderConfig {
+            json_path: Some(vec!["data".into()]),
+            json_column_paths: col_paths,
+            ..Default::default()
+        };
+        let decoder = JsonDecoder::with_config(schema, config);
+        let records = vec![json_record(
+            r#"{"meta":{"timestamp":123456},"data":{"p":99.5}}"#,
+        )];
+        let batch = decoder.decode_batch(&records).unwrap();
+        assert_eq!(batch.num_rows(), 1);
+        assert_eq!(
+            batch
+                .column(1)
+                .as_primitive::<arrow_array::types::Int64Type>()
+                .value(0),
+            123456
+        );
+    }
+
+    #[test]
+    fn test_json_column_missing_returns_null() {
+        let schema = make_schema(vec![
+            ("id", DataType::Int64, false),
+            ("missing_col", DataType::Utf8, true),
+        ]);
+        let mut col_paths = HashMap::new();
+        col_paths.insert("missing_col".into(), vec!["nowhere".into(), "gone".into()]);
+        let config = JsonDecoderConfig {
+            json_column_paths: col_paths,
+            ..Default::default()
+        };
+        let decoder = JsonDecoder::with_config(schema, config);
+        let records = vec![json_record(r#"{"id":42}"#)];
+        let batch = decoder.decode_batch(&records).unwrap();
+        assert_eq!(
+            batch
+                .column(0)
+                .as_primitive::<arrow_array::types::Int64Type>()
+                .value(0),
+            42
+        );
+        assert!(batch.column(1).is_null(0));
+    }
+
+    // ── json.explode tests ──────────────────────────────────────
+
+    #[test]
+    fn test_json_explode_arrays() {
+        let schema = make_schema(vec![
+            ("price", DataType::Utf8, true),
+            ("qty", DataType::Utf8, true),
+        ]);
+        let config = JsonDecoderConfig {
+            json_explode: Some(vec!["price".into(), "qty".into()]),
+            ..Default::default()
+        };
+        let decoder = JsonDecoder::with_config(schema, config);
+        let records = vec![json_record(r#"[["67523","1.5"],["67522","0.8"]]"#)];
+        let batch = decoder.decode_batch(&records).unwrap();
+        assert_eq!(batch.num_rows(), 2);
+        assert_eq!(batch.column(0).as_string::<i32>().value(0), "67523");
+        assert_eq!(batch.column(0).as_string::<i32>().value(1), "67522");
+        assert_eq!(batch.column(1).as_string::<i32>().value(0), "1.5");
+        assert_eq!(batch.column(1).as_string::<i32>().value(1), "0.8");
+    }
+
+    #[test]
+    fn test_json_explode_objects() {
+        let schema = make_schema(vec![
+            ("id", DataType::Int64, true),
+            ("name", DataType::Utf8, true),
+        ]);
+        let config = JsonDecoderConfig {
+            json_explode: Some(vec!["id".into(), "name".into()]),
+            ..Default::default()
+        };
+        let decoder = JsonDecoder::with_config(schema, config);
+        let records = vec![json_record(
+            r#"[{"id":1,"name":"Alice"},{"id":2,"name":"Bob"}]"#,
+        )];
+        let batch = decoder.decode_batch(&records).unwrap();
+        assert_eq!(batch.num_rows(), 2);
+        assert_eq!(
+            batch
+                .column(0)
+                .as_primitive::<arrow_array::types::Int64Type>()
+                .value(0),
+            1
+        );
+        assert_eq!(batch.column(1).as_string::<i32>().value(1), "Bob");
+    }
+
+    // ── Combined json.path + json.explode ───────────────────────
+
+    #[test]
+    fn test_json_path_plus_explode() {
+        let schema = make_schema(vec![
+            ("price", DataType::Utf8, true),
+            ("qty", DataType::Utf8, true),
+        ]);
+        let config = JsonDecoderConfig {
+            json_path: Some(vec!["bids".into()]),
+            json_explode: Some(vec!["price".into(), "qty".into()]),
+            ..Default::default()
+        };
+        let decoder = JsonDecoder::with_config(schema, config);
+        let records = vec![json_record(r#"{"bids":[["67523","1.5"],["67522","0.8"]]}"#)];
+        let batch = decoder.decode_batch(&records).unwrap();
+        assert_eq!(batch.num_rows(), 2);
+        assert_eq!(batch.column(0).as_string::<i32>().value(0), "67523");
+        assert_eq!(batch.column(1).as_string::<i32>().value(1), "0.8");
+    }
+
+    // ── from_connector_config tests ─────────────────────────────
+
+    #[test]
+    fn test_from_connector_config() {
+        let mut config = crate::config::ConnectorConfig::new("websocket");
+        config.set("json.path", "data.trade");
+        config.set("json.column.stream_name", "stream");
+        config.set("json.column.ts", "meta.timestamp");
+        config.set("json.explode", "price, qty");
+        config.set("schema.enforcement", "strict");
+        config.set("nested.as.jsonb", "true");
+
+        let cfg = JsonDecoderConfig::from_connector_config(&config);
+        assert_eq!(cfg.json_path, Some(vec!["data".into(), "trade".into()]));
+        assert_eq!(
+            cfg.json_column_paths.get("stream_name"),
+            Some(&vec!["stream".into()])
+        );
+        assert_eq!(
+            cfg.json_column_paths.get("ts"),
+            Some(&vec!["meta".into(), "timestamp".into()])
+        );
+        assert_eq!(cfg.json_explode, Some(vec!["price".into(), "qty".into()]));
+        assert_eq!(cfg.type_mismatch, TypeMismatchStrategy::Reject);
+        assert!(cfg.nested_as_jsonb);
+    }
+
+    #[test]
+    fn test_default_config_unchanged() {
+        let schema = make_schema(vec![
+            ("a", DataType::Int64, false),
+            ("b", DataType::Utf8, true),
+        ]);
+        let decoder = JsonDecoder::new(schema);
+        let records = vec![
+            json_record(r#"{"a": 1, "b": "hello"}"#),
+            json_record(r#"{"a": 2, "b": "world"}"#),
+        ];
+        let batch = decoder.decode_batch(&records).unwrap();
+        assert_eq!(batch.num_rows(), 2);
+        assert_eq!(
+            batch
+                .column(0)
+                .as_primitive::<arrow_array::types::Int64Type>()
+                .value(0),
+            1
+        );
+        assert_eq!(batch.column(1).as_string::<i32>().value(1), "world");
+    }
+
+    #[test]
+    fn test_unknown_fields_with_path() {
+        let schema = make_schema(vec![("a", DataType::Int64, false)]);
+        let config = JsonDecoderConfig {
+            json_path: Some(vec!["data".into()]),
+            unknown_fields: UnknownFieldStrategy::CollectExtra,
+            ..Default::default()
+        };
+        let decoder = JsonDecoder::with_config(schema, config);
+        let records = vec![json_record(r#"{"data":{"a":1,"extra":"value"}}"#)];
+        let batch = decoder.decode_batch(&records).unwrap();
+        assert_eq!(batch.num_columns(), 2); // a + _extra
+        assert_eq!(batch.schema().field(1).name(), "_extra");
+        assert!(!batch.column(1).is_null(0));
     }
 }

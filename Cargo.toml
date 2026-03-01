@@ -12,6 +12,7 @@ members = [
     "crates/laminar-db",
     "examples/demo",
     "examples/binance-ws",
+    "examples/microstructure",
 ]
 resolver = "2"
 

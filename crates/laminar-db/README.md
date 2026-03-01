@@ -18,6 +18,7 @@ This crate provides `LaminarDB`, the primary user-facing type that ties together
 - **`RecoveryManager`** -- Restores operator state, connector offsets, and watermarks from the latest checkpoint.
 - **`Profile`** -- Deployment profile (InMemory, Durable, Delta).
 - **`PipelineMetrics`** / **`PipelineCounters`** -- Real-time pipeline observability.
+- **`DbError`** -- Structured error type with `code()` returning stable `LDB-NNNN` codes and `is_transient()` for retry logic.
 
 ## Usage
 
@@ -89,7 +90,19 @@ laminar-db
 | `postgres-sink` | PostgreSQL sink |
 | `delta-lake` | Delta Lake sink and source |
 | `durable` | Object-store checkpoint profiles |
+| `websocket` | WebSocket source and sink connectors |
+| `mysql-cdc` | MySQL CDC source via binlog |
 | `delta` | Full distributed mode (Durable + gRPC + gossip + Raft) |
+
+## Internal Architecture
+
+### Ring 0 SQL Operator Routing
+
+The `core_window_state` module routes tumbling, hopping, and session window aggregates through optimized `CoreWindowAssigner` state instead of the generic DataFusion path. Detection is lazy on the first EOWC (Emit On Window Close) cycle, and non-qualifying queries fall through to `IncrementalEowcState` or raw-batch processing.
+
+### EOWC Incremental Accumulators
+
+The `eowc_state` module provides incremental per-window accumulators that maintain running aggregation state. This avoids re-scanning all records when a window closes, instead using the pre-computed accumulator values.
 
 ## Related Crates
 

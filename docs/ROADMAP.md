@@ -14,7 +14,7 @@ LaminarDB development is organized into phases, each building on the previous. D
 |  | Core |----->| SQL  |--->|Harden|--->  | JIT  |--->|Connect|  |
 |  |Engine|      |Parser|    | ing  |      |Compil|    | ors  |  |
 |  +------+      +------+    +------+      +------+    +------+  |
-|  DONE          DONE        DONE          DONE        87%       |
+|  DONE          DONE        DONE          DONE        85%       |
 |                                                                  |
 |  Phase 4       Phase 5     Phase 6a      Phase 6b    Phase 6c  |
 |  +------+      +------+    +------+      +------+    +------+  |
@@ -96,7 +96,7 @@ LaminarDB development is organized into phases, each building on the previous. D
 
 ---
 
-## Phase 3: Connectors & Integration -- 87% COMPLETE (81/93)
+## Phase 3: Connectors & Integration -- 85% COMPLETE (85/100)
 
 **Goal**: Connect to external systems for real-world data pipelines.
 
@@ -107,6 +107,7 @@ LaminarDB development is organized into phases, each building on the previous. D
 - Cloud storage infrastructure (credentials, validation, secret masking) -- 3/3
 - External connectors: Kafka source/sink, PostgreSQL CDC/sink, MySQL CDC, Delta Lake sink/source, Iceberg sink, Connector SDK -- 14/19
 - SQL extensions: ASOF JOIN, LAG/LEAD, ROW_NUMBER/RANK/DENSE_RANK, HAVING, multi-way JOINs, window frames, multi-partition scans -- 7/7
+- Stateful streaming SQL: aggregation hardening, EOWC incremental accumulators, checkpoint integration, Ring 0 SQL operator routing (tumbling/hopping/session), streaming physical optimizer, cooperative scheduling, dynamic watermark filter pushdown -- 7/7
 - Connector infrastructure: checkpoint recovery, reference tables, partial cache, RocksDB table store, Avro hardening -- 6/6
 - Pipeline observability -- 1/1
 - Demo application (market data pipeline, Ratatui TUI, Kafka mode, DAG visualization) -- 6/6
@@ -114,7 +115,7 @@ LaminarDB development is organized into phases, each building on the previous. D
 - FFI & language bindings (API module, C headers, Arrow C Data Interface, async callbacks) -- 4/4
 - Schema framework (trait architecture, resolver, inference registry, JSON/CSV/Avro/Parquet decoders, evolution, DLQ, JSON functions, array/struct/map functions, format bridges, schema hints) -- 15/16
 
-**Remaining (12 features, all Draft status):**
+**Remaining (15 features, all Draft status):**
 - MongoDB CDC Source (F029)
 - Redis Lookup Table (F030)
 - Delta Lake Recovery, Compaction, Schema Evolution (F031B-D)
@@ -246,13 +247,13 @@ Architectural performance improvements identified by audit. All actionable local
 | Phase 1.5: SQL Parser | 1 | 1 | COMPLETE |
 | Phase 2: Hardening | 38 | 38 | COMPLETE |
 | Phase 2.5: JIT Compiler | 12 | 12 | COMPLETE |
-| Phase 3: Connectors | 93 | 81 | 87% |
+| Phase 3: Connectors | 100 | 85 | 85% |
 | Phase 4: Security | 11 | 0 | Planned |
 | Phase 5: Admin | 10 | 0 | Planned |
 | Phase 6a: Partition-Parallel | 29 | 27 | 93% |
 | Phase 6b: Delta Foundation | 14 | 14 | COMPLETE |
 | Phase 6c: Delta Hardening | 10 | 0 | Planned |
 | Perf Optimization | 12 | 0 | Planned |
-| **Total** | **242** | **185** | **76%** |
+| **Total** | **249** | **189** | **76%** |
 
 Note: Phases 4 and 5 can be developed in parallel with Phase 3 completion and Phase 6c since they build on Phase 1 independently.

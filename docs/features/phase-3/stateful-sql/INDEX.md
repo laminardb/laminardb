@@ -1,7 +1,7 @@
 # Stateful Streaming SQL Feature Index
 
 > **Phase**: 3 - Connectors & Integration
-> **Status**: 📝 Draft (all specs written)
+> **Status**: Complete (all 7 features implemented)
 > **Reference**: [Gap Analysis](../../../GAP-ANALYSIS-STATEFUL-STREAMING.md)
 
 ## Overview
@@ -22,7 +22,7 @@ Gap 1 (non-EOWC aggregation state loss) has been fixed via `IncrementalAggState`
 | F-SSQL-003 | Ring 0 SQL Operator Routing | P2 | M-XL | ✅ | [Link](F-SSQL-003-ring0-sql-routing.md) |
 | F-SSQL-004 | Streaming Physical Optimizer Rule | P2 | M | ✅ | [Link](F-SSQL-004-streaming-physical-optimizer.md) |
 | F-SSQL-005 | DataFusion Cooperative Scheduling | P3 | S | ✅ | [Link](F-SSQL-005-cooperative-scheduling.md) |
-| F-SSQL-006 | Dynamic Watermark Filter Pushdown | P3 | M | 📝 | [Link](F-SSQL-006-dynamic-watermark-pushdown.md) |
+| F-SSQL-006 | Dynamic Watermark Filter Pushdown | P3 | M | ✅ | [Link](F-SSQL-006-dynamic-watermark-pushdown.md) |
 
 ---
 
@@ -93,8 +93,12 @@ Gap 1 fix (done) ──► F-SSQL-000 (Aggregation Hardening)
 |------|------|
 | `crates/laminar-db/src/stream_executor.rs` | SQL execution loop, EOWC state |
 | `crates/laminar-db/src/aggregate_state.rs` | `IncrementalAggState` (Gap 1 fix) |
+| `crates/laminar-db/src/eowc_state.rs` | EOWC incremental window accumulators |
+| `crates/laminar-db/src/core_window_state.rs` | Ring 0 SQL operator routing (tumbling/hopping/session) |
 | `crates/laminar-sql/src/datafusion/aggregate_bridge.rs` | DataFusion ↔ Ring 0 accumulator bridge |
 | `crates/laminar-sql/src/datafusion/exec.rs` | `StreamingScanExec` execution plan |
+| `crates/laminar-sql/src/planner/streaming_optimizer.rs` | `StreamingPhysicalValidator` rule |
+| `crates/laminar-sql/src/datafusion/watermark_filter.rs` | `WatermarkDynamicFilter` pushdown |
 | `crates/laminar-db/src/checkpoint_coordinator.rs` | Checkpoint coordination |
 | `crates/laminar-core/src/operator/window.rs` | Ring 0 window operators |
 

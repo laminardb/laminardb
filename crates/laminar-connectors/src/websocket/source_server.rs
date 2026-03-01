@@ -21,6 +21,8 @@ use crate::error::ConnectorError;
 use crate::health::HealthStatus;
 use crate::metrics::ConnectorMetrics;
 
+use crate::schema::json::decoder::JsonDecoderConfig;
+
 use super::checkpoint::WebSocketSourceCheckpoint;
 use super::metrics::WebSocketSourceMetrics;
 use super::parser::MessageParser;
@@ -64,7 +66,11 @@ impl WebSocketSourceServer {
     /// Creates a new WebSocket source connector in server mode.
     #[must_use]
     pub fn new(schema: SchemaRef, config: WebSocketSourceConfig) -> Self {
-        let parser = MessageParser::new(schema.clone(), config.format.clone());
+        let parser = MessageParser::new(
+            schema.clone(),
+            config.format.clone(),
+            JsonDecoderConfig::default(),
+        );
 
         Self {
             config,

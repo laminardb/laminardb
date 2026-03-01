@@ -29,6 +29,7 @@ This is the Ring 0 crate containing all latency-critical components. Everything 
 | `lookup` | Lookup table trait, predicate types, foyer caches (memory + hybrid), CDC-to-cache adapter |
 | `index` | redb secondary indexes for non-primary-key lookups |
 | `aggregation` | Cross-partition lock-free HashMap (papaya) |
+| `error_codes` | Structured `LDB-NNNN` error code registry and zero-alloc `HotPathError` |
 | `detect` | Platform detection utilities |
 | `xdp` | Linux eBPF/XDP network optimization |
 | `delta` | Distributed mode: discovery (gossip, Kafka), Raft consensus, partition ownership, gRPC RPC |
