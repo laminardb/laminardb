@@ -1,0 +1,28 @@
+{{- if or .Values.headlessService.enabled (eq .Values.laminardb.mode "delta") }}
+apiVersion: v1
+kind: Service
+metadata:
+  name: {{ include "laminardb.headlessServiceName" . }}
+  labels:
+    {{- include "laminardb.labels" . | nindent 4 }}
+spec:
+  type: ClusterIP
+  clusterIP: None
+  ports:
+    - port: {{ .Values.service.httpPort }}
+      targetPort: http
+      protocol: TCP
+      name: http
+    {{- if eq .Values.laminardb.mode "delta" }}
+    - port: {{ .Values.service.gossipPort }}
+      targetPort: gossip
+      protocol: TCP
+      name: gossip
+    - port: {{ .Values.service.raftPort }}
+      targetPort: raft
+      protocol: TCP
+      name: raft
+    {{- end }}
+  selector:
+    {{- include "laminardb.selectorLabels" . | nindent 4 }}
+{{- end }}

@@ -1,0 +1,40 @@
+replicaCount: 3
+
+laminardb:
+  mode: delta
+  logLevel: info
+  delta:
+    discovery:
+      strategy: dns
+      gossipPort: 7946
+    coordination:
+      strategy: raft
+      raftPort: 7947
+
+persistence:
+  state:
+    enabled: true
+    size: 10Gi
+  checkpoints:
+    enabled: true
+    size: 50Gi
+
+podDisruptionBudget:
+  enabled: true
+  minAvailable: 2
+
+resources:
+  limits:
+    cpu: "2"
+    memory: 4Gi
+  requests:
+    cpu: "1"
+    memory: 2Gi
+
+topologySpreadConstraints:
+  - maxSkew: 1
+    topologyKey: kubernetes.io/hostname
+    whenUnsatisfiable: DoNotSchedule
+    labelSelector:
+      matchLabels:
+        app.kubernetes.io/name: laminardb

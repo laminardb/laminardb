@@ -1,0 +1,43 @@
+LaminarDB has been deployed!
+
+Mode: {{ .Values.laminardb.mode }}
+{{- if eq .Values.laminardb.mode "delta" }}
+Replicas: {{ .Values.replicaCount }}
+{{- end }}
+
+1. Access the HTTP API:
+{{- if .Values.ingress.enabled }}
+  {{- range .Values.ingress.hosts }}
+  http{{ if $.Values.ingress.tls }}s{{ end }}://{{ .host }}
+  {{- end }}
+{{- else }}
+  kubectl port-forward svc/{{ include "laminardb.fullname" . }} {{ .Values.service.httpPort }}:{{ .Values.service.httpPort }}
+
+  Then open: http://localhost:{{ .Values.service.httpPort }}
+{{- end }}
+
+2. Check health:
+  curl http://localhost:{{ .Values.service.httpPort }}/health
+
+3. View metrics (Prometheus format):
+  curl http://localhost:{{ .Values.service.httpPort }}/metrics
+
+4. List pipelines:
+  curl http://localhost:{{ .Values.service.httpPort }}/api/v1/streams
+
+5. Execute SQL:
+  curl -X POST http://localhost:{{ .Values.service.httpPort }}/api/v1/sql \
+    -H "Content-Type: application/json" \
+    -d '{"sql": "SHOW SOURCES"}'
+
+6. Trigger a checkpoint:
+  curl -X POST http://localhost:{{ .Values.service.httpPort }}/api/v1/checkpoint
+
+{{- if eq .Values.laminardb.mode "delta" }}
+
+Delta mode cluster info:
+  Nodes: {{ .Values.replicaCount }}
+  Discovery: {{ .Values.laminardb.delta.discovery.strategy }}
+  Coordination: {{ .Values.laminardb.delta.coordination.strategy }}
+  Headless service: {{ include "laminardb.headlessServiceName" . }}
+{{- end }}

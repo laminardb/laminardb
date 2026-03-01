@@ -1,0 +1,15 @@
+apiVersion: v1
+kind: Pod
+metadata:
+  name: "{{ include "laminardb.fullname" . }}-test-connection"
+  labels:
+    {{- include "laminardb.labels" . | nindent 4 }}
+  annotations:
+    "helm.sh/hook": test
+spec:
+  containers:
+    - name: wget
+      image: busybox:1.36
+      command: ['wget']
+      args: ['--spider', '--timeout=5', 'http://{{ include "laminardb.fullname" . }}:{{ .Values.service.httpPort }}/health']
+  restartPolicy: Never

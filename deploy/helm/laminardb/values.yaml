@@ -1,0 +1,318 @@
+# -- Number of replicas (use 1 for embedded, >1 for delta/constellation)
+replicaCount: 1
+
+image:
+  # -- Docker image repository
+  repository: laminardb/laminardb-server
+  # -- Image pull policy
+  pullPolicy: IfNotPresent
+  # -- Image tag (defaults to chart appVersion)
+  tag: ""
+
+# -- Docker registry pull secrets
+imagePullSecrets: []
+# -- Override the chart name
+nameOverride: ""
+# -- Override the full release name
+fullnameOverride: ""
+
+# -- LaminarDB server configuration
+laminardb:
+  # -- Server mode: "embedded" (single-node) or "delta" (multi-node constellation)
+  mode: embedded
+  # -- Log level: trace, debug, info, warn, error
+  logLevel: info
+  # -- HTTP API bind address
+  httpBind: "0.0.0.0:8080"
+  # -- Number of worker threads (0 = auto-detect)
+  workers: 0
+  # -- Prometheus metrics endpoint
+  metrics:
+    enabled: true
+    bind: "0.0.0.0:8080"
+
+  # -- State storage configuration
+  state:
+    # -- Backend type: "memory" or "mmap"
+    backend: mmap
+    # -- Path for persistent state
+    path: /var/lib/laminardb/state
+    # -- Maximum state size in bytes (0 = unlimited)
+    maxSizeBytes: 0
+
+  # -- Checkpoint configuration
+  checkpoint:
+    # -- Enable checkpointing
+    enabled: true
+    # -- Checkpoint interval (Go/humantime duration)
+    interval: "30s"
+    # -- Checkpoint storage URL (file:// or s3://)
+    url: "file:///var/lib/laminardb/checkpoints"
+    # -- Checkpoint mode: "aligned" or "unaligned"
+    mode: aligned
+    # -- Snapshot strategy: "full", "incremental", or "fork_cow"
+    snapshotStrategy: full
+
+  # -- Custom laminardb.toml configuration (overrides all above).
+  # -- If set, this raw TOML string is used as the config file directly.
+  configOverride: ""
+
+  # -- Delta mode settings (only when mode=delta)
+  delta:
+    # -- Node ID (auto-generated from pod name if empty)
+    nodeId: ""
+    discovery:
+      # -- Discovery strategy: "dns", "gossip", or "static"
+      strategy: dns
+      # -- DNS name for discovery (auto-set to headless service if empty)
+      dnsName: ""
+      # -- Gossip port
+      gossipPort: 7946
+      # -- Seed nodes for static discovery
+      seeds: []
+    coordination:
+      # -- Coordination strategy (only "raft" supported)
+      strategy: raft
+      # -- Raft port
+      raftPort: 7947
+      # -- Raft election timeout
+      electionTimeout: "1500ms"
+      # -- Raft heartbeat interval
+      heartbeatInterval: "300ms"
+
+# -- Pipeline definitions (rendered into laminardb.toml [[pipeline]] sections)
+# -- Each entry needs: name, sql, and optionally parallelism
+pipelines: []
+# Example:
+# - name: trade-volumes
+#   sql: |
+#     SELECT symbol, SUM(volume) as total_vol
+#     FROM trades
+#     GROUP BY symbol, TUMBLE(event_time, INTERVAL '1' MINUTE)
+#   parallelism: 4
+
+# -- Source definitions (rendered into laminardb.toml [[source]] sections)
+sources: []
+# Example:
+# - name: trades
+#   connector: kafka
+#   format: json
+#   properties:
+#     brokers: "kafka:9092"
+#     topic: raw-trades
+#     group_id: laminardb-trades
+#   schema:
+#     - name: symbol
+#       type: VARCHAR
+#       nullable: false
+#     - name: price
+#       type: DOUBLE
+#   watermark:
+#     column: event_time
+#     max_out_of_orderness: "5s"
+
+# -- Lookup table definitions (rendered into laminardb.toml [[lookup]] sections)
+lookups: []
+# Example:
+# - name: instruments
+#   connector: postgres
+#   strategy: poll
+#   properties:
+#     connection_string: "postgres://localhost/market_data"
+#     table: instruments
+
+# -- Sink definitions (rendered into laminardb.toml [[sink]] sections)
+sinks: []
+# Example:
+# - name: output
+#   pipeline: trade-volumes
+#   connector: kafka
+#   delivery: at_least_once
+#   properties:
+#     brokers: "kafka:9092"
+#     topic: trade-volumes
+
+serviceAccount:
+  # -- Create a service account
+  create: true
+  # -- Automount API credentials
+  automount: true
+  # -- Service account annotations
+  annotations: {}
+  # -- Service account name (generated if empty)
+  name: ""
+
+# -- Pod annotations
+podAnnotations: {}
+# -- Pod labels
+podLabels: {}
+
+podSecurityContext:
+  fsGroup: 1000
+  runAsNonRoot: true
+
+securityContext:
+  allowPrivilegeEscalation: false
+  capabilities:
+    drop: [ALL]
+  readOnlyRootFilesystem: true
+  runAsNonRoot: true
+  runAsUser: 1000
+  seccompProfile:
+    type: RuntimeDefault
+
+# -- Service configuration
+service:
+  # -- Service type
+  type: ClusterIP
+  # -- HTTP API port
+  httpPort: 8080
+  # -- PostgreSQL wire protocol port (future)
+  pgPort: 5432
+  # -- Enable PostgreSQL wire protocol port
+  pgEnabled: false
+  # -- Gossip port for delta mode discovery
+  gossipPort: 7946
+  # -- Raft port for delta mode coordination
+  raftPort: 7947
+  # -- Service annotations
+  annotations: {}
+
+# -- Headless service for delta mode DNS discovery
+headlessService:
+  # -- Enable headless service (auto-enabled when mode=delta)
+  enabled: false
+
+# -- Ingress configuration (for HTTP API)
+ingress:
+  enabled: false
+  className: ""
+  annotations: {}
+  hosts:
+    - host: laminardb.local
+      paths:
+        - path: /
+          pathType: ImplementationSpecific
+  tls: []
+
+# -- Resource requests and limits
+resources: {}
+# Example for production:
+# limits:
+#   cpu: "4"
+#   memory: 8Gi
+# requests:
+#   cpu: "2"
+#   memory: 4Gi
+
+# -- Persistence for state and checkpoints
+persistence:
+  state:
+    # -- Enable persistent state storage
+    enabled: true
+    # -- Storage class (empty = default)
+    storageClass: ""
+    # -- Access modes
+    accessModes: [ReadWriteOnce]
+    # -- Volume size
+    size: 10Gi
+    # -- Use emptyDir instead of PVC (volatile)
+    useEmptyDir: false
+    # -- emptyDir medium (set to "Memory" for tmpfs)
+    emptyDirMedium: ""
+  checkpoints:
+    # -- Enable persistent checkpoint storage
+    enabled: true
+    # -- Storage class (empty = default)
+    storageClass: ""
+    # -- Access modes
+    accessModes: [ReadWriteOnce]
+    # -- Volume size
+    size: 50Gi
+
+# -- Node selector
+nodeSelector: {}
+# -- Tolerations
+tolerations: []
+# -- Affinity rules
+affinity: {}
+
+# -- For thread-per-core: request guaranteed CPU.
+# -- Set to true to use Guaranteed QoS class (requests == limits).
+guaranteedQoS: false
+
+# -- Topology spread constraints (useful for delta mode)
+topologySpreadConstraints: []
+
+# -- Pod disruption budget
+podDisruptionBudget:
+  enabled: false
+  minAvailable: 1
+  # maxUnavailable: 1
+
+# -- Autoscaling (mainly for delta mode)
+autoscaling:
+  enabled: false
+  minReplicas: 1
+  maxReplicas: 5
+  targetCPUUtilizationPercentage: 70
+
+# -- ServiceMonitor for Prometheus Operator
+serviceMonitor:
+  enabled: false
+  # -- Namespace for the ServiceMonitor (defaults to release namespace)
+  namespace: ""
+  # -- Scrape interval
+  interval: 15s
+  # -- Scrape timeout
+  scrapeTimeout: 10s
+  # -- Additional labels for the ServiceMonitor
+  labels: {}
+  # -- Metric relabeling configs
+  metricRelabelings: []
+  # -- Relabeling configs
+  relabelings: []
+
+# -- PrometheusRule for alerting
+prometheusRule:
+  enabled: false
+  # -- Namespace for the PrometheusRule
+  namespace: ""
+  # -- Additional labels
+  labels: {}
+  # -- Alert rules
+  rules: []
+  # Example:
+  # - alert: LaminarDBPipelineDown
+  #   expr: laminardb_pipeline_state_info{state="Stopped"} == 1
+  #   for: 5m
+  #   labels:
+  #     severity: critical
+  #   annotations:
+  #     summary: "LaminarDB pipeline is down"
+
+# -- Grafana dashboard ConfigMap
+grafanaDashboard:
+  enabled: false
+  # -- Labels to apply to the dashboard ConfigMap
+  labels:
+    grafana_dashboard: "1"
+
+# -- Init containers
+initContainers: []
+
+# -- Extra environment variables
+extraEnv: []
+# - name: RUST_LOG
+#   value: "laminardb=debug"
+
+# -- Extra volumes
+extraVolumes: []
+# -- Extra volume mounts
+extraVolumeMounts: []
+
+# -- Network policy
+networkPolicy:
+  enabled: false
+  ingress: []
+  egress: []
