@@ -85,7 +85,9 @@ pub async fn run_server(
         interval_ms: Some(config.checkpoint.interval.as_millis() as u64),
         data_dir: if checkpoint_url.starts_with("file:///") {
             Some(PathBuf::from(
-                checkpoint_url.strip_prefix("file://").unwrap_or(checkpoint_url),
+                checkpoint_url
+                    .strip_prefix("file://")
+                    .unwrap_or(checkpoint_url),
             ))
         } else {
             None
@@ -163,10 +165,7 @@ pub async fn run_server(
     let api_handle = http::serve(router, &config.server.bind).await?;
     info!("HTTP API listening on {}", config.server.bind);
 
-    Ok(ServerHandle {
-        db,
-        api_handle,
-    })
+    Ok(ServerHandle { db, api_handle })
 }
 
 // ---------------------------------------------------------------------------
@@ -298,10 +297,7 @@ pub fn lookup_to_ddl(lookup: &LookupConfig) -> String {
     opts.push(format!("'connector' = '{}'", lookup.connector));
     opts.push(format!("'strategy' = '{}'", lookup.strategy));
     if lookup.cache.size_bytes != 100 * 1024 * 1024 {
-        opts.push(format!(
-            "'cache_memory' = '{}'",
-            lookup.cache.size_bytes
-        ));
+        opts.push(format!("'cache_memory' = '{}'", lookup.cache.size_bytes));
     }
     if lookup.cache.ttl.as_secs() != 300 {
         opts.push(format!("'cache_ttl' = '{}'", lookup.cache.ttl.as_secs()));
@@ -424,12 +420,14 @@ mod tests {
     #[test]
     fn test_source_to_ddl_with_properties() {
         let mut source = make_source("events", "kafka");
-        source
-            .properties
-            .insert("brokers".to_string(), toml::Value::String("localhost:9092".to_string()));
-        source
-            .properties
-            .insert("topic".to_string(), toml::Value::String("events".to_string()));
+        source.properties.insert(
+            "brokers".to_string(),
+            toml::Value::String("localhost:9092".to_string()),
+        );
+        source.properties.insert(
+            "topic".to_string(),
+            toml::Value::String("events".to_string()),
+        );
         let ddl = source_to_ddl(&source);
         assert!(ddl.contains("brokers = 'localhost:9092'"));
         assert!(ddl.contains("topic = 'events'"));
@@ -452,7 +450,10 @@ mod tests {
     #[test]
     fn test_sink_to_ddl() {
         let mut props = toml::Table::new();
-        props.insert("topic".to_string(), toml::Value::String("output".to_string()));
+        props.insert(
+            "topic".to_string(),
+            toml::Value::String("output".to_string()),
+        );
         props.insert(
             "brokers".to_string(),
             toml::Value::String("localhost:9092".to_string()),
@@ -523,9 +524,6 @@ mod tests {
         );
         assert_eq!(toml_value_to_sql(&toml::Value::Integer(42)), "42");
         assert_eq!(toml_value_to_sql(&toml::Value::Boolean(true)), "true");
-        assert_eq!(
-            toml_value_to_sql(&toml::Value::Float(3.14)),
-            "3.14"
-        );
+        assert_eq!(toml_value_to_sql(&toml::Value::Float(3.25)), "3.25");
     }
 }

@@ -262,18 +262,9 @@ async fn prometheus_metrics(State(state): State<Arc<AppState>>) -> impl IntoResp
         "laminardb_pipeline_state_info{{state=\"{pipeline_state}\"}} 1"
     ));
     lines.push(format!("laminardb_uptime_seconds {uptime}"));
-    lines.push(format!(
-        "laminardb_source_count {}",
-        metrics.source_count
-    ));
-    lines.push(format!(
-        "laminardb_stream_count {}",
-        metrics.stream_count
-    ));
-    lines.push(format!(
-        "laminardb_sink_count {}",
-        metrics.sink_count
-    ));
+    lines.push(format!("laminardb_source_count {}", metrics.source_count));
+    lines.push(format!("laminardb_stream_count {}", metrics.stream_count));
+    lines.push(format!("laminardb_sink_count {}", metrics.sink_count));
 
     (
         StatusCode::OK,
@@ -333,10 +324,8 @@ async fn get_stream(
             sql: s.sql,
         })
         .into_response(),
-        None => {
-            error_response(StatusCode::NOT_FOUND, format!("stream '{name}' not found"))
-                .into_response()
-        }
+        None => error_response(StatusCode::NOT_FOUND, format!("stream '{name}' not found"))
+            .into_response(),
     }
 }
 
@@ -363,9 +352,7 @@ async fn trigger_checkpoint(State(state): State<Arc<AppState>>) -> impl IntoResp
             )
                 .into_response()
         }
-        Err(e) => {
-            error_response(StatusCode::INTERNAL_SERVER_ERROR, e.to_string()).into_response()
-        }
+        Err(e) => error_response(StatusCode::INTERNAL_SERVER_ERROR, e.to_string()).into_response(),
     }
 }
 
@@ -401,9 +388,7 @@ async fn execute_sql(
             };
             Json(resp).into_response()
         }
-        Err(e) => {
-            error_response(StatusCode::BAD_REQUEST, e.to_string()).into_response()
-        }
+        Err(e) => error_response(StatusCode::BAD_REQUEST, e.to_string()).into_response(),
     }
 }
 

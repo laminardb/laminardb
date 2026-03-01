@@ -80,8 +80,7 @@ fn validate_config(config: &ServerConfig) -> Result<(), ConfigError> {
     let mut errors = Vec::new();
 
     // Collect all pipeline names
-    let pipeline_names: HashSet<&str> =
-        config.pipelines.iter().map(|p| p.name.as_str()).collect();
+    let pipeline_names: HashSet<&str> = config.pipelines.iter().map(|p| p.name.as_str()).collect();
 
     // Validate: sink must reference an existing pipeline
     for sink in &config.sinks {
