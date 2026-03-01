@@ -1,6 +1,6 @@
 # Feature Index
 
-> Last updated: 2026-02-26
+> Last updated: 2026-02-28
 
 ## Overview
 
@@ -10,16 +10,16 @@
 | Phase 1.5: SQL Parser | 1 | 0 | 0 | 0 | 1 | 0 |
 | Phase 2: Production Hardening | 38 | 0 | 0 | 0 | 38 | 0 |
 | Phase 2.5: JIT Compiler | 12 | 0 | 0 | 0 | 12 | 0 |
-| Phase 3: Connectors | 100 | 16 | 0 | 0 | 84 | 0 |
+| Phase 3: Connectors | 100 | 15 | 0 | 0 | 85 | 0 |
 | Phase 4: Enterprise Security | 11 | 11 | 0 | 0 | 0 | 0 |
 | Phase 5: Admin & Observability | 10 | 10 | 0 | 0 | 0 | 0 |
 | Phase 6a: Partition-Parallel | 29 | 0 | 0 | 0 | 27 | 2 |
 | Phase 6b: Delta Foundation | 14 | 0 | 0 | 0 | 14 | 0 |
 | Phase 6c: Delta Hardening | 10 | 9 | 0 | 0 | 0 | 1 |
 | Perf Optimization | 12 | 12 | 0 | 0 | 0 | 0 |
-| **Total** | **249** | **58** | **0** | **0** | **188** | **3** |
+| **Total** | **249** | **57** | **0** | **0** | **189** | **3** |
 
-**Completion: 188/249 features (75%).** Phases 1, 1.5, 2, 2.5, and 6b are fully complete. Phases 3 and 6a are nearly complete. Phases 4, 5, 6c, and Perf Optimization are planned with specifications written but no implementation started.
+**Completion: 189/249 features (76%).** Phases 1, 1.5, 2, 2.5, and 6b are fully complete. Phases 3 and 6a are nearly complete. Phases 4, 5, 6c, and Perf Optimization are planned with specifications written but no implementation started.
 
 ## Status Legend
 
@@ -144,7 +144,7 @@ See [Plan Compiler Index](plan-compiler/INDEX.md) for architecture details and [
 
 ## Phase 3: Connectors & Integration
 
-> **Status**: 84/100 features complete (84%)
+> **Status**: 85/100 features complete (85%)
 
 ### Streaming API ✅
 
@@ -249,7 +249,7 @@ See [Stateful Streaming SQL Index](phase-3/stateful-sql/INDEX.md).
 | F-SSQL-003 | Ring 0 SQL Operator Routing | ✅ | [Link](phase-3/stateful-sql/F-SSQL-003-ring0-sql-routing.md) |
 | F-SSQL-004 | Streaming Physical Optimizer Rule | ✅ | [Link](phase-3/stateful-sql/F-SSQL-004-streaming-physical-optimizer.md) |
 | F-SSQL-005 | DataFusion Cooperative Scheduling | ✅ | [Link](phase-3/stateful-sql/F-SSQL-005-cooperative-scheduling.md) |
-| F-SSQL-006 | Dynamic Watermark Filter Pushdown | 📝 | [Link](phase-3/stateful-sql/F-SSQL-006-dynamic-watermark-pushdown.md) |
+| F-SSQL-006 | Dynamic Watermark Filter Pushdown | ✅ | [Link](phase-3/stateful-sql/F-SSQL-006-dynamic-watermark-pushdown.md) |
 
 ### Connector Infrastructure
 
@@ -634,13 +634,17 @@ See [Delta Index](delta/INDEX.md) for full details, dependency graph, performanc
 
 ## Active Gaps
 
-Remaining work for Phase 3:
+Remaining work for Phase 3 (15 features in Draft):
 
 | Gap | Feature | Priority | Notes |
 |-----|---------|----------|-------|
-| Delta Lake I/O | F031A | P0 | ✅ **COMPLETE** (2026-02-05) - 13 integration tests |
 | Delta Lake Advanced | F031B-D | P1 | Recovery, Compaction, Schema Evolution |
-| MySQL CDC I/O | F028A | P1 | ✅ **COMPLETE** (2026-02-06) - 21 new tests, mysql_async binlog I/O |
 | Iceberg I/O | F032A | P1 | Blocked by iceberg-datafusion 0.9.0 (needs DF 52.0 compat) |
+| Redis Lookup | F030 | P1 | Not started |
+| MongoDB CDC | F029 | P2 | Not started |
+| Parquet File Source | F033 | P2 | Not started |
+| Protobuf Decoder | F-SCHEMA-008 | P2 | Spec written |
+| Async State Access | F058 | P2 | Not started |
+| Historical Backfill | F061 | P2 | Not started |
 
 For historical gap analysis, see the [research documents](../research/).

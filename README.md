@@ -26,7 +26,7 @@ Or in your `Cargo.toml`:
 
 ```toml
 [dependencies]
-laminar-db = "0.15"
+laminar-db = "0.16"
 tokio = { version = "1", features = ["full"] }
 ```
 
@@ -211,6 +211,29 @@ SELECT symbol,
 FROM ohlc_1m
 GROUP BY symbol, tumble(window_start, INTERVAL '1' HOUR);
 ```
+
+#### Introspection
+
+```sql
+-- Show all registered sources/sinks/streams with metadata columns
+SHOW SOURCES;
+SHOW SINKS;
+SHOW STREAMS;
+
+-- Reconstruct the DDL for a source or sink
+SHOW CREATE SOURCE trades;
+
+-- Explain a query plan with execution metrics
+EXPLAIN ANALYZE SELECT symbol, COUNT(*) FROM trades GROUP BY symbol;
+```
+
+#### Additional SQL Features
+
+- **Window offsets** -- `tumble(ts, INTERVAL '1' HOUR, INTERVAL '8' HOUR)` for timezone-aligned windows
+- **ASOF NEAREST** -- Match by minimum absolute time difference via `MATCH_CONDITION(NEAREST(...))`
+- **date_trunc / date_bin** -- Available via DataFusion 52 built-ins
+- **UNNEST** -- Available via DataFusion 52 built-ins
+- **Structured error codes** -- Every error carries a stable `LDB-NNNN` code for grep-able diagnostics
 
 See [docs/SQL_REFERENCE.md](docs/SQL_REFERENCE.md) for the complete SQL dialect reference, including gotchas and tested patterns.
 
@@ -436,7 +459,7 @@ The `AdaptiveQueryRunner` runs queries interpreted first, compiles in the backgr
 
 ```toml
 [dependencies]
-laminar-db = { version = "0.15", features = ["jit"] }
+laminar-db = { version = "0.16", features = ["jit"] }
 ```
 
 ---
@@ -499,21 +522,21 @@ Implemented:
 
 ```toml
 [dependencies]
-laminar-db = { version = "0.15", features = ["delta"] }
+laminar-db = { version = "0.16", features = ["delta"] }
 ```
 
 ---
 
 ## Performance Targets
 
-| Metric | Target | Benchmark |
-|--------|--------|-----------|
-| State lookup | < 500ns p99 | `cargo bench --bench state_bench` |
-| Throughput/core | 500K events/sec | `cargo bench --bench throughput_bench` |
-| p99 latency | < 10us | `cargo bench --bench latency_bench` |
-| Checkpoint recovery | < 10s | Integration tests |
-| Window trigger | < 10us | `cargo bench --bench window_bench` |
-| Changelog overhead | ~2-5ns/mutation | `ChangelogAwareStore` wrapper |
+| Metric | Target | Measured | Benchmark |
+|--------|--------|----------|-----------|
+| State lookup | < 500ns p99 | 10-105ns | `cargo bench --bench state_bench` |
+| Throughput/core | 500K events/sec | 1.1-1.46M events/sec | `cargo bench --bench throughput_bench` |
+| p99 latency | < 10us | 0.55-1.16us | `cargo bench --bench latency_bench` |
+| Checkpoint recovery | < 10s | 1.39ms | `cargo bench --bench checkpoint_bench` |
+| Window trigger | < 10us | -- | `cargo bench --bench window_bench` |
+| Changelog overhead | ~2-5ns/mutation | -- | `ChangelogAwareStore` wrapper |
 
 Run all benchmarks:
 
@@ -521,7 +544,7 @@ Run all benchmarks:
 cargo bench
 ```
 
-Available benchmark suites (17 in laminar-core, 2 in laminar-storage):
+See [docs/BENCHMARKS.md](docs/BENCHMARKS.md) for measured baselines on real hardware. Available benchmark suites (17 in laminar-core, 2 in laminar-storage):
 
 ```bash
 cargo bench --bench state_bench          # State lookup latency
@@ -576,6 +599,7 @@ crates/
   laminar-server/      Standalone server binary (skeleton)
 examples/
   demo/                Market data TUI demo with Ratatui
+  binance-ws/          Live Binance WebSocket streaming SQL demo
 ```
 
 ### Crate Dependency Graph
@@ -605,13 +629,14 @@ LaminarDB is in active development. Here is the current phase progress:
 | Phase 1.5 | Production SQL Parser | 1/1 | Complete |
 | Phase 2 | Production Hardening | 38/38 | Complete |
 | Phase 2.5 | JIT Compiler | 12/12 | Complete |
-| Phase 3 | Connectors & Integration | 81/93 | 87% complete |
+| Phase 3 | Connectors & Integration | 85/100 | 85% complete |
 | Phase 4 | Enterprise Security | 0/11 | Planned (stubs exist) |
 | Phase 5 | Admin & Observability | 0/10 | Planned (stubs exist) |
 | Phase 6a | Delta Partition-Parallel | 27/29 | 93% complete |
 | Phase 6b | Delta Foundation | 14/14 | Complete |
 | Phase 6c | Delta Production Hardening | 0/10 | Planned |
-| **Total** | | **185/242** | **76%** |
+| Perf Optimization | Architectural improvements | 0/12 | Planned |
+| **Total** | | **189/249** | **76%** |
 
 See [docs/features/INDEX.md](docs/features/INDEX.md) for the full feature tracking breakdown and [docs/ROADMAP.md](docs/ROADMAP.md) for the phase timeline.
 
@@ -624,12 +649,12 @@ See [docs/features/INDEX.md](docs/features/INDEX.md) for the full feature tracki
 | `kafka` | laminar-db, laminar-connectors | Kafka source/sink, Avro serde, Schema Registry |
 | `postgres-cdc` | laminar-db, laminar-connectors | PostgreSQL CDC source via logical replication |
 | `postgres-sink` | laminar-db, laminar-connectors | PostgreSQL sink via COPY BINARY |
-| `mysql-cdc` | laminar-connectors | MySQL CDC source via binlog (not re-exported by laminar-db) |
+| `mysql-cdc` | laminar-db, laminar-connectors | MySQL CDC source via binlog replication |
 | `delta-lake` | laminar-db, laminar-connectors | Delta Lake sink and source |
 | `delta-lake-s3` | laminar-connectors | S3 storage backend for Delta Lake |
 | `delta-lake-azure` | laminar-connectors | Azure storage backend for Delta Lake |
 | `delta-lake-gcs` | laminar-connectors | GCS storage backend for Delta Lake |
-| `websocket` | laminar-connectors | WebSocket source and sink connectors |
+| `websocket` | laminar-db, laminar-connectors | WebSocket source and sink connectors |
 | `jit` | laminar-db, laminar-core | Cranelift JIT query compilation |
 | `ffi` | laminar-db | C FFI with Arrow C Data Interface |
 | `api` | laminar-db | FFI-friendly API module for language bindings |
@@ -693,7 +718,7 @@ cargo bench
 - [Architecture Guide](docs/ARCHITECTURE.md) -- Three-ring design, data flow, state management
 - [SQL Reference](docs/SQL_REFERENCE.md) -- Streaming SQL dialect, gotchas, tested patterns
 - [Development Roadmap](docs/ROADMAP.md) -- Phases, milestones, and feature status
-- [Feature Index](docs/features/INDEX.md) -- All 242 features with specifications
+- [Feature Index](docs/features/INDEX.md) -- All 249 features with specifications
 - [Contributing Guide](CONTRIBUTING.md) -- How to build, test, and submit PRs
 - [API Reference](https://docs.rs/laminar-db) -- Rustdoc API documentation
 

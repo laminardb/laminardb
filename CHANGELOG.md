@@ -7,6 +7,39 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [0.16.0] - 2026-02-28
+
+### Added
+- **Stateful Streaming SQL (F-SSQL-000 through F-SSQL-006)**:
+  - Streaming aggregation hardening with incremental per-window accumulators
+  - StreamExecutor state checkpoint integration
+  - Ring 0 SQL operator routing for tumbling, hopping, and session windows
+  - Streaming physical optimizer rule (`StreamingPhysicalValidator`)
+  - DataFusion cooperative scheduling integration
+  - Dynamic watermark filter pushdown (`WatermarkDynamicFilter`)
+- **SQL audit P2 fixes**:
+  - SHOW SOURCES/SINKS/STREAMS with metadata columns
+  - SHOW CREATE SOURCE/SINK for DDL reconstruction
+  - Window offset support for timezone-aligned tumble/hop
+  - EXPLAIN ANALYZE with execution metrics
+  - ASOF NEAREST join direction
+- **Unified error handling** with structured `LDB-NNNN` error codes across 8 code ranges
+- Zero-alloc `HotPathError` enum for Ring 0 (2 bytes, `Copy`)
+- `DbError::code()` and `DbError::is_transient()` for programmatic error handling
+- Binance WebSocket streaming SQL demo (`examples/binance-ws/`)
+- Event-driven fan-out/fan-in pipeline architecture
+- End-to-end barrier wiring and checkpoint operational maturity
+- Benchmark baselines document (`docs/BENCHMARKS.md`)
+
+### Fixed
+- QueueFull panic in throughput benchmark
+- WAL guard against OOM on corrupted entry length (MAX_WAL_ENTRY_SIZE validation)
+- Sink integration audit fixes
+- Identifier normalization disabled for mixed-case column support
+
+### Changed
+- Replaced std HashMap with FxHashMap/AHashMap on hot paths in laminar-db
+
 ## [0.15.0] - 2026-02-22
 
 ### Added

@@ -1,14 +1,14 @@
 # Steering Document
 
-> Last Updated: February 2026
+> Last Updated: February 28, 2026
 
 ## Current Focus
 
-**Phase 3 Connectors & Integration** -- 87% complete (81/93 features)
+**Phase 3 Connectors & Integration** -- 85% complete (85/100 features)
 
 ### Active Work
 
-Phase 3 is nearly complete. The remaining 12 features are all in Draft status:
+Phase 3 is nearly complete. The remaining 15 features are all in Draft status:
 
 | Feature | Priority | Notes |
 |---------|----------|-------|
@@ -22,8 +22,9 @@ Phase 3 is nearly complete. The remaining 12 features are all in Draft status:
 | Async State Access (F058) | P2 | Not started |
 | Historical Backfill (F061) | P2 | Not started |
 | Protobuf Format Decoder (F-SCHEMA-008) | P2 | Spec written |
-| WebSocket connector improvements | -- | Recently merged (PR #103) |
-| Schema inference framework | -- | Recently merged (PR #104) |
+| Stateful Streaming SQL (F-SSQL-000 through F-SSQL-006) | -- | Complete (merged PR #128) |
+| SQL audit P2 (SHOW, EXPLAIN ANALYZE, ASOF NEAREST) | -- | Complete (merged PR #136) |
+| Unified error handling with LDB-NNNN codes | -- | Complete (merged PR #134) |
 
 ### Phase 6 Status
 
@@ -146,7 +147,7 @@ All Phase 1 P0 issues resolved:
 | Phase 2 Complete | 2026-01-31 | Done |
 | Phase 2.5 JIT Complete | 2026-02-03 | Done |
 | Phase 6a/6b Complete | 2026-02-15 | Done (6b), 93% (6a) |
-| Phase 3 Complete | TBD | 87% |
+| Phase 3 Complete | TBD | 85% |
 | Phase 6c Server | TBD | Planned |
 | Phase 4 Security | TBD | Planned |
 | Phase 5 Admin | TBD | Planned |

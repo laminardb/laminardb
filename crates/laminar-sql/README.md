@@ -13,8 +13,8 @@ Extends standard SQL (via sqlparser-rs) with streaming constructs like tumbling 
 | `parser` | Streaming SQL parser: windows, emit, late data, joins, aggregation, analytics, ranking, DDL (CREATE SOURCE/STREAM/SINK/LOOKUP TABLE) |
 | `planner` | `StreamingPlanner` converts parsed SQL into `StreamingPlan` / `QueryPlan` |
 | `translator` | Operator config builders: window, join, analytic, order, having, DDL, ASOF join |
-| `datafusion` | DataFusion integration: custom UDFs (tumble, hop, session, slide, first_value, last_value), aggregate bridge, `execute_streaming_sql` |
-| `error` | User-friendly DataFusion error translation |
+| `datafusion` | DataFusion integration: custom UDFs (tumble, hop, session, slide, first_value, last_value), aggregate bridge, `execute_streaming_sql`, watermark filter pushdown, PROCTIME() UDF, JSON functions, complex type functions |
+| `error` | User-friendly DataFusion error translation with `LDB-NNNN` codes |
 
 ## Streaming SQL Extensions
 
@@ -68,11 +68,26 @@ CREATE SINK ... INTO DELTA_LAKE (path = '...')
 | Function | Description |
 |----------|-------------|
 | `tumble(ts, interval)` | Tumbling window assignment |
+| `tumble(ts, interval, offset)` | Tumbling window with timezone offset |
 | `hop(ts, slide, size)` | Hopping/sliding window assignment |
+| `hop(ts, slide, size, offset)` | Hopping window with timezone offset |
 | `session(ts, gap)` | Session window assignment |
 | `slide(ts, size, slide)` | Alias for hop |
 | `first_value(col)` | First value in window (retractable) |
 | `last_value(col)` | Last value in window (retractable) |
+| `PROCTIME()` | Processing time function |
+
+## Streaming Physical Optimizer
+
+The `StreamingPhysicalValidator` rule catches invalid physical plans (e.g., SortExec + Final AggregateExec on unbounded inputs) before execution. Configurable via `StreamingValidatorMode`:
+
+- **Reject** (default) -- fails with an error
+- **Warn** -- logs a warning but allows execution
+- **Off** -- disables validation
+
+## Watermark Filter Pushdown
+
+The `WatermarkDynamicFilter` pushes `ts >= watermark` predicates down to `StreamingScanExec` so late rows are dropped before expression evaluation. Uses shared `Arc<AtomicI64>` for zero-copy watermark updates from Ring 0.
 
 ## Public API
 
