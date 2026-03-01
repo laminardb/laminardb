@@ -5,6 +5,7 @@
 //! shutdown).
 
 use std::path::PathBuf;
+use std::sync::atomic::AtomicU64;
 use std::sync::Arc;
 
 use tokio::signal;
@@ -17,6 +18,7 @@ use crate::config::{
     ConfigError, LookupConfig, PipelineConfig, ServerConfig, SinkConfig, SourceConfig,
 };
 use crate::http;
+use crate::reload::ReloadGuard;
 
 /// Handle to a running LaminarDB server.
 ///
@@ -25,6 +27,7 @@ use crate::http;
 pub struct ServerHandle {
     db: Arc<LaminarDB>,
     api_handle: tokio::task::JoinHandle<()>,
+    watcher_handle: Option<tokio::task::JoinHandle<()>>,
 }
 
 impl ServerHandle {
@@ -36,6 +39,9 @@ impl ServerHandle {
 
         info!("Received shutdown signal, shutting down...");
 
+        if let Some(wh) = &self.watcher_handle {
+            wh.abort();
+        }
         self.db
             .shutdown()
             .await
@@ -156,16 +162,40 @@ pub async fn run_server(
     info!("Pipeline started");
 
     // 4. Start HTTP API
+    let bind = config.server.bind.clone();
     let app_state = Arc::new(http::AppState {
         db: Arc::clone(&db),
-        config_path,
+        config_path: config_path.clone(),
         started_at: chrono::Utc::now(),
+        current_config: tokio::sync::RwLock::new(config),
+        reload_guard: ReloadGuard::new(),
+        reload_total: AtomicU64::new(0),
+        reload_last_ts: AtomicU64::new(0),
     });
-    let router = http::build_router(app_state);
-    let api_handle = http::serve(router, &config.server.bind).await?;
-    info!("HTTP API listening on {}", config.server.bind);
+    let router = http::build_router(Arc::clone(&app_state));
+    let api_handle = http::serve(router, &bind).await?;
+    info!("HTTP API listening on {bind}");
 
-    Ok(ServerHandle { db, api_handle })
+    // 5. Spawn config file watcher
+    let watcher_handle = {
+        let watcher_state = Arc::clone(&app_state);
+        let watcher_path = config_path;
+        Some(tokio::spawn(async move {
+            crate::watcher::watch_config(
+                watcher_path,
+                watcher_state,
+                std::time::Duration::from_millis(500),
+            )
+            .await;
+        }))
+    };
+    info!("Config file watcher started");
+
+    Ok(ServerHandle {
+        db,
+        api_handle,
+        watcher_handle,
+    })
 }
 
 // ---------------------------------------------------------------------------

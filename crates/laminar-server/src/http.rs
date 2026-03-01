@@ -18,6 +18,7 @@
 //! | `POST` | `/api/v1/sql` | Execute ad-hoc SQL |
 
 use std::path::PathBuf;
+use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::Arc;
 use std::time::Instant;
 
@@ -28,10 +29,12 @@ use axum::routing::{get, post};
 use axum::{Json, Router};
 use serde::{Deserialize, Serialize};
 use tower_http::cors::CorsLayer;
-use tracing::info;
+use tracing::{info, warn};
 
 use laminar_db::LaminarDB;
 
+use crate::config::ServerConfig;
+use crate::reload::{self, ReloadGuard};
 use crate::server::ServerError;
 
 /// Shared application state for all HTTP handlers.
@@ -43,6 +46,14 @@ pub struct AppState {
     pub config_path: PathBuf,
     /// Server start time (UTC).
     pub started_at: chrono::DateTime<chrono::Utc>,
+    /// Current active configuration (updated on reload).
+    pub current_config: tokio::sync::RwLock<ServerConfig>,
+    /// Guard preventing concurrent reloads.
+    pub reload_guard: ReloadGuard,
+    /// Total number of successful + failed reloads.
+    pub reload_total: AtomicU64,
+    /// Unix timestamp (seconds) of last reload attempt.
+    pub reload_last_ts: AtomicU64,
 }
 
 /// Build the axum router with all endpoints.
@@ -60,10 +71,10 @@ pub fn build_router(state: Arc<AppState>) -> Router {
         // Actions
         .route("/api/v1/checkpoint", post(trigger_checkpoint))
         .route("/api/v1/sql", post(execute_sql))
+        .route("/api/v1/reload", post(handle_reload))
         // Stubs (501 Not Implemented)
         .route("/api/v1/pause", post(not_implemented))
         .route("/api/v1/resume", post(not_implemented))
-        .route("/api/v1/reload", post(not_implemented))
         .layer(CorsLayer::permissive())
         .layer(axum::middleware::from_fn(request_logging))
         .with_state(state)
@@ -266,6 +277,13 @@ async fn prometheus_metrics(State(state): State<Arc<AppState>>) -> impl IntoResp
     lines.push(format!("laminardb_stream_count {}", metrics.stream_count));
     lines.push(format!("laminardb_sink_count {}", metrics.sink_count));
 
+    let reload_total = state.reload_total.load(Ordering::Relaxed);
+    let reload_last_ts = state.reload_last_ts.load(Ordering::Relaxed);
+    lines.push(format!("laminardb_reload_total {reload_total}"));
+    if reload_last_ts > 0 {
+        lines.push(format!("laminardb_reload_last_timestamp {reload_last_ts}"));
+    }
+
     (
         StatusCode::OK,
         [("content-type", "text/plain; charset=utf-8")],
@@ -392,6 +410,75 @@ async fn execute_sql(
     }
 }
 
+/// `POST /api/v1/reload` — trigger a configuration reload.
+async fn handle_reload(State(state): State<Arc<AppState>>) -> impl IntoResponse {
+    // Acquire concurrency guard
+    let _guard = match state.reload_guard.try_acquire() {
+        Some(g) => g,
+        None => {
+            return error_response(StatusCode::CONFLICT, "a reload is already in progress")
+                .into_response();
+        }
+    };
+
+    // Load and validate the new config
+    let new_config = match crate::config::load_config(&state.config_path) {
+        Ok(c) => c,
+        Err(e) => {
+            warn!("Reload failed: config error: {e}");
+            return error_response(StatusCode::BAD_REQUEST, e.to_string()).into_response();
+        }
+    };
+
+    // Diff against current config
+    let current = state.current_config.read().await;
+    let diff = reload::diff_configs(&current, &new_config);
+    drop(current);
+
+    if diff.is_empty() && diff.warnings.is_empty() {
+        return Json(reload::ReloadResult {
+            success: true,
+            applied: vec![],
+            failed: vec![],
+            warnings: vec!["no changes detected".to_string()],
+        })
+        .into_response();
+    }
+
+    // Apply the diff
+    let result = reload::apply_reload(&state.db, &diff).await;
+
+    // Update metrics
+    state.reload_total.fetch_add(1, Ordering::Relaxed);
+    #[allow(clippy::cast_possible_truncation, clippy::cast_sign_loss)]
+    let now = chrono::Utc::now().timestamp() as u64;
+    state.reload_last_ts.store(now, Ordering::Relaxed);
+
+    // Update current config on success
+    if result.success {
+        let mut current = state.current_config.write().await;
+        *current = new_config;
+        info!(
+            "Configuration reloaded successfully ({} ops)",
+            result.applied.len()
+        );
+    } else {
+        warn!(
+            "Configuration reload partially failed: {} applied, {} failed",
+            result.applied.len(),
+            result.failed.len()
+        );
+    }
+
+    let status = if result.success {
+        StatusCode::OK
+    } else {
+        StatusCode::MULTI_STATUS
+    };
+
+    (status, Json(result)).into_response()
+}
+
 /// Stub handler for unimplemented endpoints.
 async fn not_implemented() -> impl IntoResponse {
     error_response(
@@ -416,6 +503,21 @@ mod tests {
             db: Arc::new(LaminarDB::open().unwrap()),
             config_path: PathBuf::from("test.toml"),
             started_at: chrono::Utc::now(),
+            current_config: tokio::sync::RwLock::new(crate::config::ServerConfig {
+                server: crate::config::ServerSection::default(),
+                state: crate::config::StateSection::default(),
+                checkpoint: crate::config::CheckpointSection::default(),
+                sources: vec![],
+                lookups: vec![],
+                pipelines: vec![],
+                sinks: vec![],
+                discovery: None,
+                coordination: None,
+                node_id: None,
+            }),
+            reload_guard: ReloadGuard::new(),
+            reload_total: AtomicU64::new(0),
+            reload_last_ts: AtomicU64::new(0),
         })
     }
 
@@ -590,5 +692,102 @@ mod tests {
             .unwrap();
         let resp = app.oneshot(req).await.unwrap();
         assert_eq!(resp.status(), StatusCode::BAD_REQUEST);
+    }
+
+    #[tokio::test]
+    async fn test_reload_invalid_config_path() {
+        // test_state has config_path = "test.toml" which doesn't exist → 400
+        let state = test_state();
+        let app = build_router(state);
+
+        let req = Request::builder()
+            .method("POST")
+            .uri("/api/v1/reload")
+            .body(Body::empty())
+            .unwrap();
+        let resp = app.oneshot(req).await.unwrap();
+        assert_eq!(resp.status(), StatusCode::BAD_REQUEST);
+    }
+
+    #[tokio::test]
+    async fn test_reload_concurrent_returns_conflict() {
+        let state = test_state();
+        // Hold the guard before making the request
+        let _guard = state.reload_guard.try_acquire().unwrap();
+
+        let app = build_router(state);
+        let req = Request::builder()
+            .method("POST")
+            .uri("/api/v1/reload")
+            .body(Body::empty())
+            .unwrap();
+        let resp = app.oneshot(req).await.unwrap();
+        assert_eq!(resp.status(), StatusCode::CONFLICT);
+    }
+
+    #[tokio::test]
+    async fn test_reload_with_valid_config() {
+        use std::io::Write;
+
+        // Create a real temp config file
+        let mut tmpfile = tempfile::NamedTempFile::new().unwrap();
+        writeln!(tmpfile, "[server]").unwrap();
+        let path = tmpfile.path().to_path_buf();
+
+        let state = Arc::new(AppState {
+            db: Arc::new(LaminarDB::open().unwrap()),
+            config_path: path,
+            started_at: chrono::Utc::now(),
+            current_config: tokio::sync::RwLock::new(crate::config::ServerConfig {
+                server: crate::config::ServerSection::default(),
+                state: crate::config::StateSection::default(),
+                checkpoint: crate::config::CheckpointSection::default(),
+                sources: vec![],
+                lookups: vec![],
+                pipelines: vec![],
+                sinks: vec![],
+                discovery: None,
+                coordination: None,
+                node_id: None,
+            }),
+            reload_guard: ReloadGuard::new(),
+            reload_total: AtomicU64::new(0),
+            reload_last_ts: AtomicU64::new(0),
+        });
+
+        let app = build_router(state.clone());
+        let req = Request::builder()
+            .method("POST")
+            .uri("/api/v1/reload")
+            .body(Body::empty())
+            .unwrap();
+        let resp = app.oneshot(req).await.unwrap();
+        assert_eq!(resp.status(), StatusCode::OK);
+
+        let body = axum::body::to_bytes(resp.into_body(), usize::MAX)
+            .await
+            .unwrap();
+        let json: serde_json::Value = serde_json::from_slice(&body).unwrap();
+        assert_eq!(json["success"], true);
+    }
+
+    #[tokio::test]
+    async fn test_metrics_includes_reload() {
+        let state = test_state();
+        state.reload_total.store(5, Ordering::Relaxed);
+        state.reload_last_ts.store(1_700_000_000, Ordering::Relaxed);
+        let app = build_router(state);
+
+        let req = Request::builder()
+            .uri("/metrics")
+            .body(Body::empty())
+            .unwrap();
+        let resp = app.oneshot(req).await.unwrap();
+        let body = axum::body::to_bytes(resp.into_body(), usize::MAX)
+            .await
+            .unwrap();
+        let text = String::from_utf8(body.to_vec()).unwrap();
+        assert!(text.contains("laminardb_reload_total 5"));
+        assert!(text.contains("laminardb_reload_last_timestamp 1700000000"));
     }
 }

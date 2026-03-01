@@ -10,7 +10,9 @@
 
 mod config;
 mod http;
+mod reload;
 mod server;
+mod watcher;
 
 #[cfg(all(feature = "jemalloc", not(target_env = "msvc")))]
 #[global_allocator]
