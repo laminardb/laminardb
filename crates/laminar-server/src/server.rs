@@ -64,18 +64,20 @@ pub async fn run_server(
     // 1. Build LaminarDB via builder API
     let mut builder = LaminarDB::builder();
 
-    // Map mode → profile
+    // Map state backend → storage_dir (must happen before profile selection)
+    let has_storage = config.state.backend != "memory";
+    if has_storage {
+        builder = builder.storage_dir(&config.state.path);
+    }
+
+    // Map mode → profile (Embedded requires storage_dir; fall back to BareMetal)
     let profile = match config.server.mode.as_str() {
-        "embedded" => Profile::Embedded,
+        "embedded" if has_storage => Profile::Embedded,
+        "embedded" => Profile::BareMetal,
         "delta" => Profile::Delta,
         _ => Profile::BareMetal,
     };
     builder = builder.profile(profile);
-
-    // Map state backend → storage_dir
-    if config.state.backend != "memory" {
-        builder = builder.storage_dir(&config.state.path);
-    }
 
     // Map checkpoint config
     let checkpoint_url = &config.checkpoint.url;

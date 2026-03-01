@@ -1,0 +1,12 @@
+# Minimal LaminarDB config for local testing (no external dependencies)
+
+[server]
+mode = "embedded"
+bind = "127.0.0.1:8080"
+
+[state]
+backend = "memory"
+
+[checkpoint]
+url = "file:///tmp/laminardb/checkpoints"
+interval = "10s"
