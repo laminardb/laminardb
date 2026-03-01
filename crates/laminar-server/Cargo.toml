@@ -67,12 +67,20 @@ tikv-jemallocator = { workspace = true, optional = true }
 [features]
 default = ["jemalloc"]
 jemalloc = ["dep:tikv-jemallocator"]
+# Connector features (forwarded to laminar-db → laminar-connectors)
 kafka = ["laminar-db/kafka"]
 websocket = ["laminar-db/websocket"]
 postgres-cdc = ["laminar-db/postgres-cdc"]
 postgres-sink = ["laminar-db/postgres-sink"]
 mysql-cdc = ["laminar-db/mysql-cdc"]
 delta-lake = ["laminar-db/delta-lake"]
+# Performance features (OS-specific)
+io-uring = ["laminar-storage/io-uring"]     # Linux 5.10+: async I/O for WAL/checkpoints
+hwloc = ["laminar-core/hwloc"]              # Linux/macOS: NUMA topology discovery
+xdp = ["laminar-core/xdp"]                  # Linux 4.15+: XDP/eBPF network optimization
+jit = ["laminar-db/jit"]                    # All platforms: Cranelift JIT for Ring 0
+# Meta-feature: enable all Linux-specific performance optimizations
+linux-perf = ["io-uring", "hwloc", "xdp"]
 # Compile OpenSSL from source — required for musl cross-compilation where
 # system libssl-dev is not available for the target triple.
 vendored-openssl = ["dep:openssl"]
