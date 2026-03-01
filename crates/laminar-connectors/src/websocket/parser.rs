@@ -10,7 +10,7 @@ use arrow_array::RecordBatch;
 use arrow_schema::{DataType, Field, Schema, SchemaRef};
 
 use crate::error::ConnectorError;
-use crate::schema::json::decoder::JsonDecoder;
+use crate::schema::json::decoder::{JsonDecoder, JsonDecoderConfig};
 use crate::schema::traits::FormatDecoder;
 use crate::schema::types::RawRecord;
 
@@ -27,12 +27,16 @@ pub struct MessageParser {
 }
 
 impl MessageParser {
-    /// Creates a new parser for the given schema and format.
+    /// Creates a new parser for the given schema, format, and JSON decoder config.
     #[must_use]
-    pub fn new(schema: SchemaRef, format: MessageFormat) -> Self {
+    pub fn new(
+        schema: SchemaRef,
+        format: MessageFormat,
+        decoder_config: JsonDecoderConfig,
+    ) -> Self {
         let json_decoder = match &format {
             MessageFormat::Json | MessageFormat::JsonLines => {
-                Some(JsonDecoder::new(schema.clone()))
+                Some(JsonDecoder::with_config(schema.clone(), decoder_config))
             }
             _ => None,
         };
@@ -161,13 +165,27 @@ impl MessageParser {
 
 /// Creates a default schema for JSON messages when no explicit schema is provided.
 ///
-/// Uses schema inference from the first message.
+/// Uses schema inference from the first message. If `json_path` is provided,
+/// navigates into the object before inferring fields.
 ///
 /// # Errors
 ///
 /// Returns `ConnectorError::Serde` if the sample is not valid UTF-8 or valid JSON,
 /// or if the top-level value is not a JSON object.
 pub fn infer_schema_from_json(sample: &[u8]) -> Result<SchemaRef, ConnectorError> {
+    infer_schema_from_json_with_path(sample, None)
+}
+
+/// Like [`infer_schema_from_json`] but navigates a `json.path` first.
+///
+/// # Errors
+///
+/// Returns `ConnectorError::Serde` if the sample is not valid UTF-8 or valid JSON,
+/// if a path segment is not found, or if the target is not a JSON object.
+pub fn infer_schema_from_json_with_path(
+    sample: &[u8],
+    json_path: Option<&[String]>,
+) -> Result<SchemaRef, ConnectorError> {
     let text = std::str::from_utf8(sample).map_err(|e| {
         ConnectorError::Serde(crate::error::SerdeError::MalformedInput(format!(
             "invalid UTF-8: {e}"
@@ -177,7 +195,21 @@ pub fn infer_schema_from_json(sample: &[u8]) -> Result<SchemaRef, ConnectorError
     let value: serde_json::Value = serde_json::from_str(text)
         .map_err(|e| ConnectorError::Serde(crate::error::SerdeError::Json(e.to_string())))?;
 
-    let obj = value.as_object().ok_or_else(|| {
+    let target = if let Some(path) = json_path {
+        let mut current = &value;
+        for segment in path {
+            current = current.get(segment.as_str()).ok_or_else(|| {
+                ConnectorError::Serde(crate::error::SerdeError::MalformedInput(format!(
+                    "json.path segment '{segment}' not found during inference"
+                )))
+            })?;
+        }
+        current
+    } else {
+        &value
+    };
+
+    let obj = target.as_object().ok_or_else(|| {
         ConnectorError::Serde(crate::error::SerdeError::MalformedInput(
             "schema inference requires a JSON object".into(),
         ))
@@ -217,7 +249,11 @@ mod tests {
 
     #[test]
     fn test_parse_json_batch() {
-        let parser = MessageParser::new(json_schema(), MessageFormat::Json);
+        let parser = MessageParser::new(
+            json_schema(),
+            MessageFormat::Json,
+            JsonDecoderConfig::default(),
+        );
         let messages: Vec<&[u8]> = vec![
             br#"{"id": "1", "value": "hello"}"#,
             br#"{"id": "2", "value": "world"}"#,
@@ -230,7 +266,11 @@ mod tests {
 
     #[test]
     fn test_parse_json_missing_field() {
-        let parser = MessageParser::new(json_schema(), MessageFormat::Json);
+        let parser = MessageParser::new(
+            json_schema(),
+            MessageFormat::Json,
+            JsonDecoderConfig::default(),
+        );
         let messages: Vec<&[u8]> = vec![br#"{"id": "1"}"#];
 
         let batch = parser.parse_batch(&messages).unwrap();
@@ -240,7 +280,11 @@ mod tests {
 
     #[test]
     fn test_parse_json_numeric_values() {
-        let parser = MessageParser::new(json_schema(), MessageFormat::Json);
+        let parser = MessageParser::new(
+            json_schema(),
+            MessageFormat::Json,
+            JsonDecoderConfig::default(),
+        );
         let messages: Vec<&[u8]> = vec![br#"{"id": "1", "value": 42}"#];
 
         let batch = parser.parse_batch(&messages).unwrap();
@@ -254,7 +298,8 @@ mod tests {
             DataType::Binary,
             false,
         )]));
-        let parser = MessageParser::new(schema, MessageFormat::Binary);
+        let parser =
+            MessageParser::new(schema, MessageFormat::Binary, JsonDecoderConfig::default());
         let messages: Vec<&[u8]> = vec![b"hello", b"world"];
 
         let batch = parser.parse_batch(&messages).unwrap();
@@ -269,6 +314,7 @@ mod tests {
                 delimiter: ',',
                 has_header: false,
             },
+            JsonDecoderConfig::default(),
         );
         let messages: Vec<&[u8]> = vec![b"1,hello", b"2,world"];
 
@@ -278,7 +324,11 @@ mod tests {
 
     #[test]
     fn test_parse_empty() {
-        let parser = MessageParser::new(json_schema(), MessageFormat::Json);
+        let parser = MessageParser::new(
+            json_schema(),
+            MessageFormat::Json,
+            JsonDecoderConfig::default(),
+        );
         let messages: Vec<&[u8]> = vec![];
 
         let batch = parser.parse_batch(&messages).unwrap();
@@ -287,7 +337,11 @@ mod tests {
 
     #[test]
     fn test_parse_invalid_json() {
-        let parser = MessageParser::new(json_schema(), MessageFormat::Json);
+        let parser = MessageParser::new(
+            json_schema(),
+            MessageFormat::Json,
+            JsonDecoderConfig::default(),
+        );
         let messages: Vec<&[u8]> = vec![b"not json"];
 
         assert!(parser.parse_batch(&messages).is_err());
@@ -300,7 +354,7 @@ mod tests {
             Field::new("price", DataType::Float64, false),
             Field::new("name", DataType::Utf8, true),
         ]));
-        let parser = MessageParser::new(schema, MessageFormat::Json);
+        let parser = MessageParser::new(schema, MessageFormat::Json, JsonDecoderConfig::default());
         let messages: Vec<&[u8]> = vec![
             br#"{"id": 1, "price": 99.5, "name": "Widget"}"#,
             br#"{"id": 2, "price": 10.0, "name": "Gadget"}"#,
@@ -330,7 +384,7 @@ mod tests {
             DataType::Float64,
             false,
         )]));
-        let parser = MessageParser::new(schema, MessageFormat::Json);
+        let parser = MessageParser::new(schema, MessageFormat::Json, JsonDecoderConfig::default());
         let messages: Vec<&[u8]> = vec![br#"{"price": "187.52"}"#];
 
         let batch = parser.parse_batch(&messages).unwrap();

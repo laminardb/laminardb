@@ -2677,12 +2677,17 @@ impl LaminarDB {
         laminar_sql::register_streaming_functions(&ctx);
         let mut executor = StreamExecutor::new(ctx);
 
-        // Register source schemas so the executor can create empty placeholder
-        // tables for sources that have no data in a given cycle (prevents
-        // DataFusion "table not found" errors when only some sources have data).
-        for name in self.catalog.list_sources() {
-            if let Some(entry) = self.catalog.get_source(&name) {
-                executor.register_source_schema(name, entry.schema.clone());
+        // Register source schemas for sources that have connectors so the
+        // executor can create empty placeholder tables when no data arrives in
+        // a given cycle.  Connector-less sources (created without a FROM clause)
+        // are intentionally skipped — they receive data via push_arrow() and
+        // registering them would create broken zero-row MemTables every cycle.
+        for (name, reg) in &source_regs {
+            if reg.connector_type.is_none() {
+                continue;
+            }
+            if let Some(entry) = self.catalog.get_source(name) {
+                executor.register_source_schema(name.clone(), entry.schema.clone());
             }
         }
 
@@ -7611,5 +7616,74 @@ mod tests {
             }
             _ => panic!("Expected Metadata result"),
         }
+    }
+
+    #[tokio::test]
+    async fn test_connectorless_source_does_not_break_pipeline() {
+        let db = LaminarDB::open().unwrap();
+
+        // Connector-less source (no FROM clause) — formerly caused
+        // LDB-1002 "No partitions provided" on every pipeline cycle.
+        db.execute("CREATE SOURCE metadata (symbol VARCHAR, category VARCHAR)")
+            .await
+            .unwrap();
+
+        // A real source with a watermark that the pipeline will process.
+        db.execute(
+            "CREATE SOURCE trades (id BIGINT, price DOUBLE, ts BIGINT, \
+             WATERMARK FOR ts AS ts - INTERVAL '0' SECOND)",
+        )
+        .await
+        .unwrap();
+
+        db.execute("CREATE STREAM out AS SELECT id, price FROM trades")
+            .await
+            .unwrap();
+
+        db.start().await.unwrap();
+
+        // Push data into the real source.
+        let handle = db.source_untyped("trades").unwrap();
+        let schema = handle.schema().clone();
+        let batch = RecordBatch::try_new(
+            schema,
+            vec![
+                Arc::new(arrow::array::Int64Array::from(vec![1, 2])),
+                Arc::new(arrow::array::Float64Array::from(vec![100.0, 200.0])),
+                Arc::new(arrow::array::Int64Array::from(vec![1000, 2000])),
+            ],
+        )
+        .unwrap();
+        handle.push_arrow(batch).unwrap();
+
+        // Let the pipeline run a few cycles.
+        tokio::time::sleep(std::time::Duration::from_millis(500)).await;
+
+        // Verify the pipeline processed data without errors.
+        let m = db.metrics();
+        assert!(m.total_events_ingested > 0, "pipeline should ingest events");
+
+        // Push data into the connector-less source via push_arrow — should
+        // work without causing pipeline errors.
+        let meta_handle = db.source_untyped("metadata").unwrap();
+        let meta_schema = meta_handle.schema().clone();
+        let meta_batch = RecordBatch::try_new(
+            meta_schema,
+            vec![
+                Arc::new(arrow::array::StringArray::from(vec!["BTC", "ETH"])),
+                Arc::new(arrow::array::StringArray::from(vec!["L1", "L1"])),
+            ],
+        )
+        .unwrap();
+        meta_handle.push_arrow(meta_batch).unwrap();
+
+        tokio::time::sleep(std::time::Duration::from_millis(300)).await;
+
+        // Pipeline should still be healthy.
+        let m2 = db.metrics();
+        assert!(
+            m2.total_events_ingested >= m.total_events_ingested,
+            "pipeline should continue after connector-less source push"
+        );
     }
 }

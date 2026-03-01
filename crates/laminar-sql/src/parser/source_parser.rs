@@ -264,7 +264,7 @@ fn parse_from_connector(
             if parser.consume_token(&Token::RParen) {
                 break;
             }
-            let key = parse_connector_option_string(parser)?;
+            let key = parse_connector_option_key(parser)?;
             parser
                 .expect_token(&Token::Eq)
                 .map_err(ParseError::SqlParseError)?;
@@ -309,6 +309,19 @@ fn parse_format_clause(parser: &mut Parser) -> Result<Option<FormatSpec>, ParseE
         format_type,
         options,
     }))
+}
+
+/// Parse a connector option key, which may be a dotted identifier
+/// (e.g., `json.path`, `json.column.stream_name`, `auth.type`).
+fn parse_connector_option_key(parser: &mut Parser) -> Result<String, ParseError> {
+    let first = parse_connector_option_string(parser)?;
+    let mut key = first;
+    while parser.consume_token(&Token::Period) {
+        let next = parse_connector_option_string(parser)?;
+        key.push('.');
+        key.push_str(&next);
+    }
+    Ok(key)
 }
 
 /// Parse a single option key or value string in connector options.
@@ -756,5 +769,52 @@ mod tests {
         let source = parse("CREATE SOURCE events (id BIGINT, name VARCHAR)");
         assert!(!source.has_wildcard);
         assert!(source.wildcard_prefix.is_none());
+    }
+
+    // ── Dotted option key tests ────────────────────────────
+
+    #[test]
+    fn test_dotted_option_keys_unquoted() {
+        let source = parse(
+            "CREATE SOURCE trades (
+                s VARCHAR, p DOUBLE
+            ) FROM WEBSOCKET (
+                url = 'wss://example.com/ws',
+                format = 'json',
+                json.path = 'data',
+                json.explode = 'price,qty'
+            )",
+        );
+        assert_eq!(source.connector_type, Some("WEBSOCKET".to_string()));
+        assert_eq!(
+            source.connector_options.get("json.path"),
+            Some(&"data".to_string())
+        );
+        assert_eq!(
+            source.connector_options.get("json.explode"),
+            Some(&"price,qty".to_string())
+        );
+    }
+
+    #[test]
+    fn test_deep_dotted_option_keys() {
+        let source = parse(
+            "CREATE SOURCE events FROM WEBSOCKET (
+                url = 'wss://example.com',
+                json.column.stream_name = 'stream',
+                json.column.ts = 'meta.timestamp'
+            ) SCHEMA (
+                stream_name VARCHAR,
+                ts BIGINT
+            )",
+        );
+        assert_eq!(
+            source.connector_options.get("json.column.stream_name"),
+            Some(&"stream".to_string())
+        );
+        assert_eq!(
+            source.connector_options.get("json.column.ts"),
+            Some(&"meta.timestamp".to_string())
+        );
     }
 }
