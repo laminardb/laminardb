@@ -1,7 +1,7 @@
 {
   "latest_version": "0.16.0",
   "abi_version": 1,
-  "released_at": "2026-02-22T22:50:34Z",
+  "released_at": "2026-03-01T09:50:34Z",
   "minimum_supported": "0.1.0",
   "platforms": [
     "x86_64-unknown-linux-gnu",
