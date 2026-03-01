@@ -65,7 +65,7 @@ openssl = { version = "0.10", features = ["vendored"], optional = true }
 tikv-jemallocator = { workspace = true, optional = true }
 
 [features]
-default = ["jemalloc"]
+default = ["jemalloc", "delta-lake"]
 jemalloc = ["dep:tikv-jemallocator"]
 # Connector features (forwarded to laminar-db → laminar-connectors)
 kafka = ["laminar-db/kafka"]
