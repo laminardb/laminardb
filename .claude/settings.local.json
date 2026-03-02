@@ -92,7 +92,26 @@
       "Bash(python3:*)",
       "WebFetch(domain:datafusion.apache.org)",
       "Bash(git:*)",
-      "Bash(GIT_EDITOR=true git rebase:*)"
+      "Bash(GIT_EDITOR=true git rebase:*)",
+      "WebFetch(domain:flink.apache.org)",
+      "WebFetch(domain:arxiv.org)",
+      "WebFetch(domain:iggy.apache.org)",
+      "WebFetch(domain:rkyv.org)",
+      "WebFetch(domain:www.vldb.org)",
+      "WebFetch(domain:nightlies.apache.org)",
+      "Bash(gh pr:*)",
+      "Bash(docker:*)",
+      "Bash(netstat:*)",
+      "Bash(chmod +x:*)",
+      "Bash(bash:*)",
+      "Bash(taskkill:*)",
+      "Bash(tasklist:*)",
+      "Bash(do echo:*)",
+      "Bash(cargo publish:*)",
+      "Bash(cp:*)",
+      "Bash(perl:*)",
+      "Bash(do perl:*)",
+      "Bash(gh run:*)"
     ]
   }
 }
