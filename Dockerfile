@@ -29,6 +29,12 @@ RUN apt-get update && apt-get install -y --no-install-recommends \
 
 WORKDIR /build
 
+# Override release profile for Docker builds: thin LTO + 2 CGUs to reduce
+# peak memory during linking (fat LTO needs 8-12GB, QEMU arm64 amplifies 2-4x).
+ENV CARGO_PROFILE_RELEASE_LTO=thin \
+    CARGO_PROFILE_RELEASE_CODEGEN_UNITS=2 \
+    CARGO_PROFILE_RELEASE_STRIP=symbols
+
 # --- Dependency caching layer ---
 # Copy workspace Cargo files first so dependency builds are cached.
 COPY Cargo.toml Cargo.lock ./
@@ -74,8 +80,7 @@ COPY examples/ examples/
 RUN touch crates/laminar-server/src/main.rs
 
 # Build the server binary in release mode
-RUN cargo build --release -p laminar-server \
-    && strip target/release/laminardb
+RUN cargo build --release -p laminar-server
 
 # --------------------------------------------------------------------------
 # Stage 2: Runtime
