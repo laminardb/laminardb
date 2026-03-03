@@ -47,7 +47,7 @@ pub mod incremental;
 /// Per-core WAL segments - Thread-per-core WAL for lock-free writes
 pub mod per_core_wal;
 
-/// Factory for building `ObjectStore` instances from URL schemes.
+/// Factory for building [`object_store::ObjectStore`] instances from URL schemes.
 pub mod object_store_factory;
 
 /// Disaggregated state backend — S3 as source of truth with foyer cache.
