@@ -1176,9 +1176,9 @@ mod tests {
         let protocol = MigrationProtocol::new();
         let metadata = setup_metadata_2_nodes();
 
-        let mut node3 = make_node(3, 4);
-        node3.state = NodeState::Left; // Should be excluded
-        let nodes = vec![make_node(1, 4), make_node(2, 4), node3];
+        let mut left_node = make_node(3, 4);
+        left_node.state = NodeState::Left; // Should be excluded
+        let nodes = vec![make_node(1, 4), make_node(2, 4), left_node];
 
         let plan = protocol
             .plan_rebalance(&metadata, &nodes, &AssignmentConstraints::default())

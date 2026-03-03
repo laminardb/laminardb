@@ -789,7 +789,7 @@ mod tests {
 
     #[test]
     fn test_finalize_min_some() {
-        assert!((PartialState::Min(Some(3.14)).finalize() - 3.14).abs() < f64::EPSILON);
+        assert!((PartialState::Min(Some(3.25)).finalize() - 3.25).abs() < f64::EPSILON);
     }
 
     // ── MergeAggregator ─────────────────────────────────────────────
@@ -1083,8 +1083,8 @@ mod tests {
 
         // Phase 1: each partition publishes partials
         for pid in 0..3u32 {
-            let count = (pid as i64 + 1) * 100; // 100, 200, 300
-            let sum = (pid as f64 + 1.0) * 1000.0; // 1000, 2000, 3000
+            let count = (i64::from(pid) + 1) * 100; // 100, 200, 300
+            let sum = (f64::from(pid) + 1.0) * 1000.0; // 1000, 2000, 3000
             let partial = PartialAggregate {
                 group_key: b"AAPL".to_vec(),
                 partition_id: pid,
