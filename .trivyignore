@@ -1,0 +1,5 @@
+# CVE-2023-45853: zlib minizip zipOpenNewFileInZip4_6 integer overflow.
+# This affects the minizip component bundled in Debian's zlib package.
+# LaminarDB does not use minizip — only zlib decompression (via libssl3/curl).
+# Debian has not patched this in bookworm as minizip is considered optional.
+CVE-2023-45853
