@@ -56,7 +56,6 @@ pub struct AppState {
     pub reload_last_ts: AtomicU64,
 }
 
-/// Build the axum router with all endpoints.
 pub fn build_router(state: Arc<AppState>) -> Router {
     Router::new()
         // Health and observability
@@ -72,6 +71,8 @@ pub fn build_router(state: Arc<AppState>) -> Router {
         .route("/api/v1/checkpoint", post(trigger_checkpoint))
         .route("/api/v1/sql", post(execute_sql))
         .route("/api/v1/reload", post(handle_reload))
+        // Cluster (delta mode)
+        .route("/api/v1/cluster", get(cluster_status))
         // Stubs (501 Not Implemented)
         .route("/api/v1/pause", post(not_implemented))
         .route("/api/v1/resume", post(not_implemented))
@@ -477,6 +478,36 @@ async fn handle_reload(State(state): State<Arc<AppState>>) -> impl IntoResponse 
     };
 
     (status, Json(result)).into_response()
+}
+
+/// `GET /api/v1/cluster` — cluster status (delta mode only).
+async fn cluster_status(State(state): State<Arc<AppState>>) -> impl IntoResponse {
+    let config = state.current_config.read().await;
+    if config.server.mode != "delta" {
+        return error_response(
+            StatusCode::NOT_FOUND,
+            "cluster endpoint is only available in delta mode",
+        )
+        .into_response();
+    }
+
+    let node_id = config.node_id.clone().unwrap_or_default();
+    drop(config);
+
+    #[derive(Serialize)]
+    struct ClusterStatusResponse {
+        mode: &'static str,
+        node_id: String,
+        pipeline_state: &'static str,
+    }
+
+    let pipeline_state = state.db.pipeline_state();
+    Json(ClusterStatusResponse {
+        mode: "delta",
+        node_id,
+        pipeline_state,
+    })
+    .into_response()
 }
 
 /// Stub handler for unimplemented endpoints.

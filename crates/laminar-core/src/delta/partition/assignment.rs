@@ -92,6 +92,7 @@ pub trait PartitionAssigner: Send + Sync {
 /// Uses virtual nodes proportional to each node's core count for
 /// weighted distribution. The hash ring is deterministic given the
 /// same set of nodes (fixed seed).
+#[derive(Debug)]
 pub struct ConsistentHashAssigner {
     /// Number of virtual nodes per core.
     pub vnodes_per_core: u32,

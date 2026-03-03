@@ -88,7 +88,7 @@ pub use checkpoint_coordinator::{
     CheckpointConfig, CheckpointCoordinator, CheckpointPhase, CheckpointResult, CheckpointStats,
     WalPrepareResult,
 };
-pub use config::{IdentifierCaseSensitivity, LaminarConfig};
+pub use config::{IdentifierCaseSensitivity, LaminarConfig, TieringConfig};
 pub use db::LaminarDB;
 pub use error::DbError;
 pub use handle::{

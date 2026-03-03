@@ -3,8 +3,17 @@
 //! Nodes are configured with a static list of seed addresses. Each node
 //! periodically sends heartbeats to all seeds and tracks failures based
 //! on missed heartbeat counts:
-//! - 3 missed → `Suspected`
-//! - 10 missed → `Left`
+//! - `suspect_threshold` missed → `Suspected`
+//! - `dead_threshold` missed → `Left`
+//!
+//! Design constraints:
+//! - The **heartbeater** (outbound) is the sole authority on failure state.
+//!   It increments `missed_heartbeats` on failed sends and transitions
+//!   peers through `Active → Suspected → Left`.
+//! - The **listener** (inbound) records that a peer exists and updates its
+//!   addresses/metadata, but never resets the heartbeater's failure counter.
+//!   This prevents a half-open partition (peer can send to us, but we cannot
+//!   reach it) from masking a failure.
 
 use std::collections::HashMap;
 use std::sync::Arc;
@@ -16,6 +25,21 @@ use tokio::sync::watch;
 use tokio_util::sync::CancellationToken;
 
 use super::{Discovery, DiscoveryError, NodeId, NodeInfo, NodeMetadata, NodeState};
+
+/// TCP connect timeout for heartbeat connections.
+const CONNECT_TIMEOUT: Duration = Duration::from_secs(2);
+
+/// TCP read/write timeout per I/O operation.
+const IO_TIMEOUT: Duration = Duration::from_secs(5);
+
+/// Maximum concurrent handler tasks in the listener.
+const MAX_HANDLER_TASKS: usize = 64;
+
+/// Maximum message size (1 MB).
+const MAX_MESSAGE_SIZE: usize = 1_048_576;
+
+/// Grace period after which `Left` peers are reaped from the peer map.
+const LEFT_REAP_THRESHOLD: u32 = 30;
 
 /// Configuration for static discovery.
 #[derive(Debug, Clone)]
@@ -59,7 +83,10 @@ impl Default for StaticDiscoveryConfig {
 #[derive(Debug)]
 struct PeerState {
     info: NodeInfo,
+    /// Missed *outbound* heartbeats (managed exclusively by the heartbeater).
     missed_heartbeats: u32,
+    /// Counter that keeps incrementing after `Left` state. Used for reaping.
+    left_ticks: u32,
 }
 
 /// Static discovery implementation with TCP heartbeats.
@@ -71,6 +98,8 @@ pub struct StaticDiscovery {
     membership_tx: watch::Sender<Vec<NodeInfo>>,
     membership_rx: watch::Receiver<Vec<NodeInfo>>,
     cancel: CancellationToken,
+    listener_handle: Option<tokio::task::JoinHandle<Result<(), DiscoveryError>>>,
+    heartbeater_handle: Option<tokio::task::JoinHandle<()>>,
     started: bool,
 }
 
@@ -78,6 +107,12 @@ impl StaticDiscovery {
     /// Create a new static discovery instance.
     #[must_use]
     pub fn new(config: StaticDiscoveryConfig) -> Self {
+        debug_assert!(
+            config.suspect_threshold < config.dead_threshold,
+            "suspect_threshold ({}) must be less than dead_threshold ({})",
+            config.suspect_threshold,
+            config.dead_threshold,
+        );
         let (tx, rx) = watch::channel(Vec::new());
         Self {
             config,
@@ -85,6 +120,8 @@ impl StaticDiscovery {
             membership_tx: tx,
             membership_rx: rx,
             cancel: CancellationToken::new(),
+            listener_handle: None,
+            heartbeater_handle: None,
             started: false,
         }
     }
@@ -109,40 +146,75 @@ impl StaticDiscovery {
         let _ = self.membership_tx.send(peer_list);
     }
 
-    /// Send a heartbeat to a single seed address.
+    /// Send a heartbeat to a single seed address with connect + I/O timeouts.
     #[allow(clippy::cast_possible_truncation)]
     async fn send_heartbeat(address: &str, data: &[u8]) -> Result<Option<Vec<u8>>, DiscoveryError> {
         use tokio::io::{AsyncReadExt, AsyncWriteExt};
 
-        let mut stream =
-            TcpStream::connect(address)
-                .await
-                .map_err(|e| DiscoveryError::Connection {
-                    address: address.into(),
-                    reason: e.to_string(),
-                })?;
+        // Connect with timeout (C2 fix)
+        let mut stream = tokio::time::timeout(CONNECT_TIMEOUT, TcpStream::connect(address))
+            .await
+            .map_err(|_| DiscoveryError::Connection {
+                address: address.into(),
+                reason: "connect timeout".into(),
+            })?
+            .map_err(|e| DiscoveryError::Connection {
+                address: address.into(),
+                reason: e.to_string(),
+            })?;
 
-        // Write length-prefixed message (max 1MB, fits in u32)
-        let len = data.len() as u32;
-        stream.write_all(&len.to_be_bytes()).await?;
-        stream.write_all(data).await?;
-
-        // Read response
-        let mut len_buf = [0u8; 4];
-        let Ok(_) = stream.read_exact(&mut len_buf).await else {
-            return Ok(None);
-        };
-
-        let resp_len = u32::from_be_bytes(len_buf) as usize;
-        if resp_len > 1_048_576 {
-            return Err(DiscoveryError::Serialization("response too large".into()));
+        // Validate message size before sending (W7 symmetric limit)
+        if data.len() > MAX_MESSAGE_SIZE {
+            return Err(DiscoveryError::Serialization(
+                "message too large to send".into(),
+            ));
         }
-        let mut resp = vec![0u8; resp_len];
-        stream.read_exact(&mut resp).await?;
-        Ok(Some(resp))
+
+        // Write length-prefixed message with I/O timeout (W1 fix)
+        let len = data.len() as u32;
+        tokio::time::timeout(IO_TIMEOUT, async {
+            stream.write_all(&len.to_be_bytes()).await?;
+            stream.write_all(data).await
+        })
+        .await
+        .map_err(|_| DiscoveryError::Connection {
+            address: address.into(),
+            reason: "write timeout".into(),
+        })?
+        .map_err(|e| DiscoveryError::Connection {
+            address: address.into(),
+            reason: e.to_string(),
+        })?;
+
+        // Read response with I/O timeout (W1 fix)
+        let resp = tokio::time::timeout(IO_TIMEOUT, async {
+            let mut len_buf = [0u8; 4];
+            if stream.read_exact(&mut len_buf).await.is_err() {
+                return Ok(None);
+            }
+
+            let resp_len = u32::from_be_bytes(len_buf) as usize;
+            if resp_len > MAX_MESSAGE_SIZE {
+                return Err(DiscoveryError::Serialization("response too large".into()));
+            }
+            let mut resp = vec![0u8; resp_len];
+            stream.read_exact(&mut resp).await?;
+            Ok(Some(resp))
+        })
+        .await
+        .map_err(|_| DiscoveryError::Connection {
+            address: address.into(),
+            reason: "read timeout".into(),
+        })?;
+
+        resp.map_err(|e: DiscoveryError| e)
     }
 
     /// Run the heartbeat listener (accepts incoming heartbeats).
+    ///
+    /// The listener records that remote peers exist and updates their
+    /// address/metadata, but does **not** reset the heartbeater's failure
+    /// counter. See module-level docs for the design rationale.
     #[allow(clippy::cast_possible_truncation)]
     async fn run_listener(
         listen_address: String,
@@ -157,6 +229,9 @@ impl StaticDiscovery {
             .await
             .map_err(|e| DiscoveryError::Bind(e.to_string()))?;
 
+        // Bound concurrent handler tasks (W3 fix)
+        let semaphore = Arc::new(tokio::sync::Semaphore::new(MAX_HANDLER_TASKS));
+
         loop {
             tokio::select! {
                 () = cancel.cancelled() => break,
@@ -165,45 +240,82 @@ impl StaticDiscovery {
                     let local_info = local_info.clone();
                     let peers = Arc::clone(&peers);
                     let membership_tx = membership_tx.clone();
+                    let permit = Arc::clone(&semaphore);
 
                     tokio::spawn(async move {
-                        let mut len_buf = [0u8; 4];
-                        if stream.read_exact(&mut len_buf).await.is_err() {
-                            return;
-                        }
-                        let msg_len = u32::from_be_bytes(len_buf) as usize;
-                        if msg_len > 1_048_576 {
-                            return;
-                        }
-                        let mut data = vec![0u8; msg_len];
-                        if stream.read_exact(&mut data).await.is_err() {
-                            return;
-                        }
+                        // Acquire semaphore permit — drop-guard releases on exit
+                        let Ok(_permit) = permit.try_acquire() else {
+                            return; // at capacity, drop connection
+                        };
 
-                        if let Ok(remote_info) = Self::deserialize_node_info(&data) {
-                            let peer_list = {
-                                let mut guard = peers.write();
-                                let now = chrono::Utc::now().timestamp_millis();
-                                let peer = guard.entry(remote_info.id.0).or_insert_with(|| {
-                                    PeerState {
-                                        info: remote_info.clone(),
-                                        missed_heartbeats: 0,
+                        // Wrap all handler I/O in a timeout (W1 fix)
+                        let result = tokio::time::timeout(IO_TIMEOUT, async {
+                            let mut len_buf = [0u8; 4];
+                            if stream.read_exact(&mut len_buf).await.is_err() {
+                                return;
+                            }
+                            let msg_len = u32::from_be_bytes(len_buf) as usize;
+                            if msg_len > MAX_MESSAGE_SIZE {
+                                return;
+                            }
+                            let mut data = vec![0u8; msg_len];
+                            if stream.read_exact(&mut data).await.is_err() {
+                                return;
+                            }
+
+                            if let Ok(remote_info) = Self::deserialize_node_info(&data) {
+                                // Skip self — don't add ourselves to the peer list
+                                if remote_info.id == local_info.id {
+                                    // Still respond so the heartbeater gets a reply
+                                    if let Ok(resp) = Self::serialize_node_info(&local_info) {
+                                        let len = resp.len() as u32;
+                                        let _ = stream.write_all(&len.to_be_bytes()).await;
+                                        let _ = stream.write_all(&resp).await;
                                     }
-                                });
-                                peer.info = NodeInfo {
-                                    last_heartbeat_ms: now,
-                                    ..remote_info
-                                };
-                                peer.missed_heartbeats = 0;
-                                guard.values().map(|p| p.info.clone()).collect::<Vec<_>>()
-                            };
-                            let _ = membership_tx.send(peer_list);
-                        }
+                                    return;
+                                }
 
-                        if let Ok(resp) = Self::serialize_node_info(&local_info) {
-                            let len = resp.len() as u32;
-                            let _ = stream.write_all(&len.to_be_bytes()).await;
-                            let _ = stream.write_all(&resp).await;
+                                let peer_list = {
+                                    let mut guard = peers.write();
+                                    let now = chrono::Utc::now().timestamp_millis();
+                                    let peer =
+                                        guard.entry(remote_info.id.0).or_insert_with(|| {
+                                            // First time seeing this peer via the listener.
+                                            // We know it can reach us, but we haven't
+                                            // confirmed outbound yet — start as Joining.
+                                            PeerState {
+                                                info: NodeInfo {
+                                                    last_heartbeat_ms: now,
+                                                    state: NodeState::Joining,
+                                                    ..remote_info.clone()
+                                                },
+                                                missed_heartbeats: 0,
+                                                left_ticks: 0,
+                                            }
+                                        });
+                                    // Update addresses/metadata from the remote.
+                                    // Do NOT touch missed_heartbeats or state — the
+                                    // heartbeater is the sole authority (C1 fix).
+                                    peer.info.rpc_address.clone_from(&remote_info.rpc_address);
+                                    peer.info.raft_address.clone_from(&remote_info.raft_address);
+                                    peer.info.name.clone_from(&remote_info.name);
+                                    peer.info.metadata = remote_info.metadata.clone();
+                                    peer.info.last_heartbeat_ms = now;
+                                    guard.values().map(|p| p.info.clone()).collect::<Vec<_>>()
+                                };
+                                let _ = membership_tx.send(peer_list);
+                            }
+
+                            if let Ok(resp) = Self::serialize_node_info(&local_info) {
+                                let len = resp.len() as u32;
+                                let _ = stream.write_all(&len.to_be_bytes()).await;
+                                let _ = stream.write_all(&resp).await;
+                            }
+                        })
+                        .await;
+
+                        if result.is_err() {
+                            // Handler timed out — connection dropped
                         }
                     });
                 }
@@ -214,8 +326,19 @@ impl StaticDiscovery {
     }
 
     /// Run the periodic heartbeat sender.
+    ///
+    /// Sends heartbeats concurrently to all seeds and uses the responses
+    /// to track failure state. The heartbeater is the sole authority on
+    /// `missed_heartbeats` and state transitions.
     async fn run_heartbeater(config: StaticDiscoveryConfig, ctx: HeartbeatContext) {
+        let local_id = config.local_node.id;
         let mut interval = tokio::time::interval(config.heartbeat_interval);
+        // Don't burst missed ticks — skip them to avoid thundering herd (W5 fix)
+        interval.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
+
+        // seed_to_peer tracks which seed address maps to which node ID.
+        // Protected by a Mutex since concurrent heartbeat tasks need it.
+        let seed_to_peer = Arc::new(parking_lot::Mutex::new(HashMap::<String, u64>::new()));
 
         loop {
             tokio::select! {
@@ -224,39 +347,91 @@ impl StaticDiscovery {
                     let Ok(data) = Self::serialize_node_info(&config.local_node) else {
                         continue;
                     };
+                    let data = Arc::new(data);
 
+                    // Send heartbeats to all seeds concurrently (W5 fix)
+                    let mut tasks = Vec::with_capacity(config.seeds.len());
                     for seed in &config.seeds {
-                        if let Ok(Some(resp_data)) = Self::send_heartbeat(seed, &data).await {
+                        let seed = seed.clone();
+                        let data = Arc::clone(&data);
+                        tasks.push(tokio::spawn(async move {
+                            let result = Self::send_heartbeat(&seed, &data).await;
+                            (seed, result)
+                        }));
+                    }
+
+                    // Collect results and update peer state
+                    for task in tasks {
+                        let Ok((seed, result)) = task.await else {
+                            continue; // task panicked
+                        };
+
+                        if let Ok(Some(resp_data)) = result {
                             if let Ok(remote_info) = Self::deserialize_node_info(&resp_data) {
+                                // Skip self
+                                if remote_info.id == local_id {
+                                    continue;
+                                }
+
+                                // Record seed → peer mapping
+                                seed_to_peer.lock().insert(seed, remote_info.id.0);
+
                                 let mut peers = ctx.peers.write();
                                 let now = chrono::Utc::now().timestamp_millis();
-                                let peer = peers.entry(remote_info.id.0).or_insert_with(|| {
-                                    PeerState {
-                                        info: remote_info.clone(),
-                                        missed_heartbeats: 0,
-                                    }
-                                });
+                                let peer =
+                                    peers.entry(remote_info.id.0).or_insert_with(|| {
+                                        PeerState {
+                                            info: remote_info.clone(),
+                                            missed_heartbeats: 0,
+                                            left_ticks: 0,
+                                        }
+                                    });
                                 peer.info = NodeInfo {
                                     last_heartbeat_ms: now,
+                                    state: NodeState::Active,
                                     ..remote_info
                                 };
                                 peer.missed_heartbeats = 0;
+                                peer.left_ticks = 0;
                             }
                         } else {
-                            let mut peers = ctx.peers.write();
-                            for peer in peers.values_mut() {
-                                if peer.info.rpc_address == *seed
-                                    || peer.info.raft_address == *seed
-                                {
+                            // Heartbeat failed — increment missed counter
+                            let map = seed_to_peer.lock();
+                            if let Some(&peer_id) = map.get(seed.as_str()) {
+                                drop(map);
+                                let mut peers = ctx.peers.write();
+                                if let Some(peer) = peers.get_mut(&peer_id) {
                                     peer.missed_heartbeats += 1;
                                     if peer.missed_heartbeats >= config.dead_threshold {
                                         peer.info.state = NodeState::Left;
-                                    } else if peer.missed_heartbeats >= config.suspect_threshold {
+                                    } else if peer.missed_heartbeats
+                                        >= config.suspect_threshold
+                                    {
                                         peer.info.state = NodeState::Suspected;
                                     }
                                 }
                             }
                         }
+                    }
+
+                    // Reap peers stuck in Left state for too long (W2 fix)
+                    {
+                        let mut peers = ctx.peers.write();
+                        peers.retain(|_id, peer| {
+                            if peer.info.state == NodeState::Left {
+                                peer.left_ticks += 1;
+                                peer.left_ticks < LEFT_REAP_THRESHOLD
+                            } else {
+                                true
+                            }
+                        });
+                    }
+
+                    // Also clean up seed_to_peer for reaped peers (W2 fix)
+                    {
+                        let peers = ctx.peers.read();
+                        let mut map = seed_to_peer.lock();
+                        map.retain(|_, peer_id| peers.contains_key(peer_id));
                     }
 
                     let peer_list: Vec<NodeInfo> = {
@@ -283,30 +458,33 @@ impl Discovery for StaticDiscovery {
             return Ok(());
         }
 
+        // Create a fresh cancellation token so restart after stop() works (W4 fix)
+        self.cancel = CancellationToken::new();
+
         let peers = Arc::clone(&self.peers);
         let membership_tx = self.membership_tx.clone();
         let cancel = self.cancel.clone();
         let listen_address = self.config.listen_address.clone();
         let local_info = self.config.local_node.clone();
 
-        // Spawn listener
-        tokio::spawn(Self::run_listener(
+        // Spawn listener and keep the handle (W4 fix)
+        self.listener_handle = Some(tokio::spawn(Self::run_listener(
             listen_address,
             local_info,
             Arc::clone(&peers),
             membership_tx.clone(),
             cancel.clone(),
-        ));
+        )));
 
-        // Spawn heartbeater
-        tokio::spawn(Self::run_heartbeater(
+        // Spawn heartbeater and keep the handle (W4 fix)
+        self.heartbeater_handle = Some(tokio::spawn(Self::run_heartbeater(
             self.config.clone(),
             HeartbeatContext {
                 peers,
                 membership_tx,
                 cancel,
             },
-        ));
+        )));
 
         self.started = true;
         Ok(())
@@ -331,6 +509,7 @@ impl Discovery for StaticDiscovery {
                 PeerState {
                     info,
                     missed_heartbeats: 0,
+                    left_ticks: 0,
                 },
             );
         }
@@ -345,6 +524,15 @@ impl Discovery for StaticDiscovery {
     async fn stop(&mut self) -> Result<(), DiscoveryError> {
         self.cancel.cancel();
         self.started = false;
+
+        // Wait for spawned tasks to exit (W4 fix)
+        if let Some(h) = self.listener_handle.take() {
+            let _ = h.await;
+        }
+        if let Some(h) = self.heartbeater_handle.take() {
+            let _ = h.await;
+        }
+
         Ok(())
     }
 }
@@ -515,5 +703,23 @@ mod tests {
 
         disc1.stop().await.unwrap();
         disc2.stop().await.unwrap();
+    }
+
+    #[tokio::test]
+    async fn test_restart_after_stop() {
+        let config = StaticDiscoveryConfig {
+            listen_address: "127.0.0.1:0".into(),
+            ..StaticDiscoveryConfig::default()
+        };
+        let mut disc = StaticDiscovery::new(config);
+
+        // First start/stop cycle
+        disc.start().await.unwrap();
+        disc.stop().await.unwrap();
+
+        // Second start should work (fresh CancellationToken)
+        disc.start().await.unwrap();
+        assert!(disc.started);
+        disc.stop().await.unwrap();
     }
 }

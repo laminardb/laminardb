@@ -24,7 +24,7 @@ pub struct PartitionOwnership {
 }
 
 /// Log entries applied to the delta metadata state machine.
-#[derive(Debug, Clone, Serialize, Deserialize)]
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub enum MetadataLogEntry {
     /// Assign a partition to a node (leader decision).
     AssignPartition {
@@ -124,7 +124,7 @@ impl DeltaMetadata {
                 node_id,
                 epoch,
             } => {
-                // C5: validate both epoch AND owner NodeId
+                // Reject stale assignments: epoch must be strictly increasing
                 if let Some(existing) = self.partition_map.get(partition_id) {
                     if *epoch <= existing.epoch {
                         return; // stale assignment, ignore
@@ -147,7 +147,7 @@ impl DeltaMetadata {
             } => {
                 if let Some(existing) = self.partition_map.get(partition_id) {
                     if existing.epoch == *epoch {
-                        // C6: set to unassigned sentinel
+                        // Epoch-exact match: only the current owner can release
                         self.partition_map.insert(
                             *partition_id,
                             PartitionOwnership {

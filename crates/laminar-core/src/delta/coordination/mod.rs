@@ -19,5 +19,5 @@ pub mod raft;
 pub mod orchestrator;
 
 pub use metadata::{DeltaMetadata, MetadataLogEntry, PartitionOwnership};
-pub use orchestrator::DeltaManager;
+pub use orchestrator::{DeltaManager, NodeLifecyclePhase};
 pub use raft::{CoordinationError, RaftCoordinator};

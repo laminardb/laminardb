@@ -30,7 +30,9 @@ pub struct LaminarDbBuilder {
     config_vars: HashMap<String, String>,
     connector_callbacks: Vec<ConnectorCallback>,
     profile: Profile,
+    profile_explicit: bool,
     object_store_url: Option<String>,
+    object_store_options: HashMap<String, String>,
     custom_udfs: Vec<ScalarUDF>,
     custom_udafs: Vec<AggregateUDF>,
 }
@@ -44,7 +46,9 @@ impl LaminarDbBuilder {
             config_vars: HashMap::new(),
             connector_callbacks: Vec::new(),
             profile: Profile::default(),
+            profile_explicit: false,
             object_store_url: None,
+            object_store_options: HashMap::new(),
             custom_udfs: Vec::new(),
             custom_udafs: Vec::new(),
         }
@@ -91,6 +95,7 @@ impl LaminarDbBuilder {
     #[must_use]
     pub fn profile(mut self, profile: Profile) -> Self {
         self.profile = profile;
+        self.profile_explicit = true;
         self
     }
 
@@ -101,6 +106,23 @@ impl LaminarDbBuilder {
     #[must_use]
     pub fn object_store_url(mut self, url: impl Into<String>) -> Self {
         self.object_store_url = Some(url.into());
+        self
+    }
+
+    /// Set explicit credential/config overrides for the object store.
+    ///
+    /// Keys are backend-specific (e.g., `aws_access_key_id`, `aws_region`).
+    /// These supplement environment-variable-based credential resolution.
+    #[must_use]
+    pub fn object_store_options(mut self, opts: HashMap<String, String>) -> Self {
+        self.object_store_options = opts;
+        self
+    }
+
+    /// Set the S3 storage class tiering configuration.
+    #[must_use]
+    pub fn tiering(mut self, tiering: crate::config::TieringConfig) -> Self {
+        self.config.tiering = Some(tiering);
         self
     }
 
@@ -176,12 +198,21 @@ impl LaminarDbBuilder {
     /// Returns `DbError` if database creation fails.
     #[allow(clippy::unused_async)]
     pub async fn build(mut self) -> Result<LaminarDB, DbError> {
+        // Forward object store settings into the config before profile detection.
+        self.config.object_store_url = self.object_store_url;
+        self.config.object_store_options = self.object_store_options;
+
+        // Auto-detect profile from config if not explicitly set.
+        if !self.profile_explicit {
+            self.profile = Profile::from_config(&self.config, false);
+        }
+
         // Validate profile feature gates and config requirements.
         self.profile
             .validate_features()
             .map_err(|e| DbError::Config(e.to_string()))?;
         self.profile
-            .validate_config(&self.config, self.object_store_url.as_deref())
+            .validate_config(&self.config, self.config.object_store_url.as_deref())
             .map_err(|e| DbError::Config(e.to_string()))?;
 
         // Apply profile defaults for fields the user hasn't set.
@@ -212,7 +243,12 @@ impl std::fmt::Debug for LaminarDbBuilder {
         f.debug_struct("LaminarDbBuilder")
             .field("config", &self.config)
             .field("profile", &self.profile)
+            .field("profile_explicit", &self.profile_explicit)
             .field("object_store_url", &self.object_store_url)
+            .field(
+                "object_store_options_count",
+                &self.object_store_options.len(),
+            )
             .field("config_vars_count", &self.config_vars.len())
             .field("connector_callbacks", &self.connector_callbacks.len())
             .field("custom_udfs", &self.custom_udfs.len())

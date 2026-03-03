@@ -137,6 +137,14 @@ pub struct CheckpointManifest {
     /// Parent checkpoint ID for incremental checkpoints.
     #[serde(default)]
     pub parent_id: Option<u64>,
+
+    // ── Integrity ──
+    /// SHA-256 hex digest of the sidecar `state.bin` file (if any).
+    ///
+    /// Written during checkpoint commit so that recovery can verify the
+    /// sidecar hasn't been corrupted or truncated on disk/S3.
+    #[serde(default)]
+    pub state_checksum: Option<String>,
 }
 
 /// Errors found during manifest validation.
@@ -249,6 +257,7 @@ impl CheckpointManifest {
             size_bytes: 0,
             is_incremental: false,
             parent_id: None,
+            state_checksum: None,
         }
     }
 }

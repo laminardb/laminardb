@@ -1,5 +1,6 @@
 //! Configuration for `LaminarDB`.
 
+use std::collections::HashMap;
 use std::path::PathBuf;
 
 use laminar_core::streaming::{BackpressureStrategy, StreamCheckpointConfig};
@@ -28,6 +29,37 @@ pub enum IdentifierCaseSensitivity {
     Lowercase,
 }
 
+/// S3 storage class tiering configuration.
+///
+/// Controls how checkpoint objects are assigned to S3 storage classes
+/// for cost optimization. Active checkpoints use the hot tier (fast access),
+/// older checkpoints are moved to warm/cold tiers via S3 Lifecycle rules.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct TieringConfig {
+    /// Storage class for active checkpoints (e.g., `"EXPRESS_ONE_ZONE"`, `"STANDARD"`).
+    pub hot_class: String,
+    /// Storage class for older checkpoints (e.g., `"STANDARD"`).
+    pub warm_class: String,
+    /// Storage class for archive checkpoints (e.g., `"GLACIER_IR"`). Empty = no cold tier.
+    pub cold_class: String,
+    /// Time before moving objects from hot to warm tier (seconds).
+    pub hot_retention_secs: u64,
+    /// Time before moving objects from warm to cold tier (seconds). 0 = no cold tier.
+    pub warm_retention_secs: u64,
+}
+
+impl Default for TieringConfig {
+    fn default() -> Self {
+        Self {
+            hot_class: "STANDARD".to_string(),
+            warm_class: "STANDARD".to_string(),
+            cold_class: String::new(),
+            hot_retention_secs: 86400,    // 24h
+            warm_retention_secs: 604_800, // 7d
+        }
+    }
+}
+
 /// Configuration for a `LaminarDB` instance.
 #[derive(Debug, Clone)]
 pub struct LaminarConfig {
@@ -41,6 +73,12 @@ pub struct LaminarConfig {
     pub checkpoint: Option<StreamCheckpointConfig>,
     /// SQL identifier case sensitivity mode.
     pub identifier_case: IdentifierCaseSensitivity,
+    /// Object store URL for cloud checkpoint storage (e.g., `s3://bucket/prefix`).
+    pub object_store_url: Option<String>,
+    /// Explicit credential/config overrides for the object store builder.
+    pub object_store_options: HashMap<String, String>,
+    /// S3 storage class tiering configuration (`None` = use default STANDARD).
+    pub tiering: Option<TieringConfig>,
 }
 
 impl Default for LaminarConfig {
@@ -51,6 +89,9 @@ impl Default for LaminarConfig {
             storage_dir: None,
             checkpoint: None,
             identifier_case: IdentifierCaseSensitivity::default(),
+            object_store_url: None,
+            object_store_options: HashMap::new(),
+            tiering: None,
         }
     }
 }

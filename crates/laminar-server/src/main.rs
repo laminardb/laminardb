@@ -9,6 +9,8 @@
 #![allow(clippy::disallowed_types)]
 
 mod config;
+mod delta;
+mod delta_config;
 mod http;
 mod reload;
 mod server;
@@ -40,13 +42,19 @@ struct Args {
     /// Bind address for admin API (overrides config file)
     #[arg(long)]
     admin_bind: Option<String>,
+
+    /// Validate checkpoints and exit without starting the server.
+    ///
+    /// Walks all checkpoints, verifies manifest integrity and state
+    /// checksums, and reports which are valid for recovery.
+    #[arg(long)]
+    validate_checkpoints: bool,
 }
 
 #[tokio::main]
 async fn main() -> Result<()> {
     let args = Args::parse();
 
-    // Initialize tracing
     tracing_subscriber::registry()
         .with(
             tracing_subscriber::EnvFilter::try_from_default_env()
@@ -59,20 +67,98 @@ async fn main() -> Result<()> {
     info!("Version: {}", env!("CARGO_PKG_VERSION"));
     info!("Config file: {}", args.config);
 
-    // Load configuration
     let config_path = PathBuf::from(&args.config);
     let mut config = config::load_config(&config_path)?;
 
-    // Override bind address from CLI if provided
     if let Some(bind) = args.admin_bind {
         config.server.bind = bind;
     }
 
-    // Build and start server
-    let handle = server::run_server(config, config_path).await?;
+    if args.validate_checkpoints {
+        return validate_checkpoints_and_exit(&config).await;
+    }
 
-    // Block until shutdown signal
+    let handle = server::run_server(config, config_path).await?;
     handle.wait_for_shutdown().await?;
 
     Ok(())
+}
+
+/// Validate all checkpoints and exit with a report.
+async fn validate_checkpoints_and_exit(config: &config::ServerConfig) -> Result<()> {
+    let store = build_checkpoint_store(config);
+    let Some(store) = store else {
+        info!("No checkpoint configuration found — nothing to validate");
+        return Ok(());
+    };
+
+    info!("Validating checkpoints...");
+    let report = store
+        .recover_latest_validated()
+        .map_err(|e| anyhow::anyhow!("validation failed: {e}"))?;
+
+    info!(
+        "Examined {} checkpoint(s) in {:?}",
+        report.examined, report.elapsed
+    );
+    for (id, reason) in &report.skipped {
+        info!("  INVALID checkpoint {id}: {reason}");
+    }
+    match report.chosen_id {
+        Some(id) => info!("  VALID checkpoint {id} selected for recovery"),
+        None if report.examined == 0 => info!("  No checkpoints found (fresh start)"),
+        None => info!("  WARNING: No valid checkpoint found — recovery would start fresh"),
+    }
+
+    // Also run orphan detection
+    let orphans = store
+        .cleanup_orphans()
+        .map_err(|e| anyhow::anyhow!("orphan cleanup failed: {e}"))?;
+    if orphans > 0 {
+        info!("Cleaned up {orphans} orphaned state file(s)");
+    }
+
+    Ok(())
+}
+
+/// Build a checkpoint store from server config (shared between validate and run).
+fn build_checkpoint_store(
+    config: &config::ServerConfig,
+) -> Option<Box<dyn laminar_storage::checkpoint_store::CheckpointStore>> {
+    let cp = &config.checkpoint;
+    let url = &cp.url;
+
+    let obj_store = match laminar_storage::object_store_factory::build_object_store(
+        url,
+        &cp.storage,
+    ) {
+        Ok(s) => s,
+        Err(e) => {
+            tracing::error!(url = %url, error = %e, "failed to build object store for checkpoint validation");
+            return None;
+        }
+    };
+
+    // file:// URLs use the local FS path directly; cloud URLs need a prefix.
+    if url.starts_with("file://") {
+        let path = url.strip_prefix("file://").unwrap_or(url);
+        Some(Box::new(
+            laminar_storage::checkpoint_store::FileSystemCheckpointStore::new(
+                std::path::Path::new(path),
+                3,
+            ),
+        ))
+    } else {
+        // Cloud URL: extract prefix from URL path (bucket is handled by object_store).
+        let prefix = url
+            .split("://")
+            .nth(1)
+            .and_then(|rest| rest.split_once('/').map(|(_, p)| format!("{p}/")))
+            .unwrap_or_default();
+        Some(Box::new(
+            laminar_storage::checkpoint_store::ObjectStoreCheckpointStore::new(
+                obj_store, prefix, 3,
+            ),
+        ))
+    }
 }

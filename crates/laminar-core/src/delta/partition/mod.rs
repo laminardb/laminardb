@@ -18,6 +18,11 @@ pub mod assignment;
 /// Partition migration protocol.
 pub mod migration;
 
-pub use assignment::{AssignmentPlan, ConsistentHashAssigner, PartitionAssigner};
+pub use assignment::{
+    AssignmentConstraints, AssignmentPlan, ConsistentHashAssigner, PartitionAssigner,
+};
 pub use guard::{PartitionGuard, PartitionGuardSet};
-pub use migration::{MigrationExecutor, MigrationPhase, MigrationTask};
+pub use migration::{
+    MigrationAction, MigrationConfig, MigrationError, MigrationExecutor, MigrationPhase,
+    MigrationPlan, MigrationProtocol, MigrationTask, PhaseResult,
+};

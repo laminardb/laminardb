@@ -22,7 +22,6 @@ use axum::{Json, Router};
 use serde::Serialize;
 
 use laminar_db::LaminarDB;
-use laminar_storage::checkpoint_store::CheckpointStore;
 
 /// Application state shared across all handlers.
 pub type AppState = Arc<LaminarDB>;
