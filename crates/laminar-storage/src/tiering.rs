@@ -428,7 +428,7 @@ mod tests {
     #[test]
     fn test_cold_compresses_better_than_warm() {
         // Repetitive data to make compression ratio visible
-        let data: Vec<u8> = (0..10_000).map(|i| (i % 256) as u8).collect();
+        let data: Vec<u8> = (0..10_000u16).map(|i| (i % 256) as u8).collect();
         let warm = compress_for_tier(&data, StorageTier::Warm);
         let cold = compress_for_tier(&data, StorageTier::Cold);
         assert!(

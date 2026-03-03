@@ -1318,7 +1318,7 @@ mod tests {
                 .unwrap();
         });
 
-        let latest = object_store::path::Path::from(format!("{}checkpoints/latest.txt", prefix));
+        let latest = object_store::path::Path::from(format!("{prefix}checkpoints/latest.txt"));
         let content = format!("checkpoint_{:06}", manifest.checkpoint_id);
         rt.block_on(async {
             store

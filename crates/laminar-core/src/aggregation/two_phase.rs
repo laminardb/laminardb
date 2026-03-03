@@ -796,7 +796,7 @@ mod tests {
 
     #[test]
     fn test_merge_single_group_three_partitions() {
-        let merger = MergeAggregator::new(vec![TwoPhaseKind::Count, TwoPhaseKind::Sum]);
+        let aggregator = MergeAggregator::new(vec![TwoPhaseKind::Count, TwoPhaseKind::Sum]);
 
         let partials = vec![
             PartialAggregate {
@@ -822,7 +822,7 @@ mod tests {
             },
         ];
 
-        let result = merger.merge_all(&partials).unwrap();
+        let result = aggregator.merge_all(&partials).unwrap();
         assert_eq!(result.len(), 1);
 
         let merged = &result[b"AAPL".as_ref()];
@@ -836,7 +836,7 @@ mod tests {
 
     #[test]
     fn test_merge_multi_group() {
-        let merger = MergeAggregator::new(vec![TwoPhaseKind::Count]);
+        let aggregator = MergeAggregator::new(vec![TwoPhaseKind::Count]);
 
         let partials = vec![
             PartialAggregate {
@@ -862,7 +862,7 @@ mod tests {
             },
         ];
 
-        let result = merger.merge_all(&partials).unwrap();
+        let result = aggregator.merge_all(&partials).unwrap();
         assert_eq!(result.len(), 2);
         assert_eq!(result[b"AAPL".as_ref()][0], PartialState::Count(40));
         assert_eq!(result[b"GOOG".as_ref()][0], PartialState::Count(20));
@@ -870,7 +870,7 @@ mod tests {
 
     #[test]
     fn test_merge_avg_weighted() {
-        let merger = MergeAggregator::new(vec![TwoPhaseKind::Avg]);
+        let aggregator = MergeAggregator::new(vec![TwoPhaseKind::Avg]);
 
         // Partition 0: avg of [10, 20, 30] = sum=60, count=3
         // Partition 1: avg of [40, 50] = sum=90, count=2
@@ -898,14 +898,14 @@ mod tests {
             },
         ];
 
-        let result = merger.merge_all(&partials).unwrap();
+        let result = aggregator.merge_all(&partials).unwrap();
         let finals = MergeAggregator::finalize(&result[b"g1".as_ref()]);
         assert!((finals[0] - 30.0).abs() < f64::EPSILON);
     }
 
     #[test]
     fn test_merge_min_max_global() {
-        let merger = MergeAggregator::new(vec![TwoPhaseKind::Min, TwoPhaseKind::Max]);
+        let aggregator = MergeAggregator::new(vec![TwoPhaseKind::Min, TwoPhaseKind::Max]);
 
         let partials = vec![
             PartialAggregate {
@@ -931,7 +931,7 @@ mod tests {
             },
         ];
 
-        let result = merger.merge_all(&partials).unwrap();
+        let result = aggregator.merge_all(&partials).unwrap();
         let merged = &result[b"g".as_ref()];
         assert_eq!(merged[0], PartialState::Min(Some(5.0)));
         assert_eq!(merged[1], PartialState::Max(Some(100.0)));
@@ -939,14 +939,14 @@ mod tests {
 
     #[test]
     fn test_merge_empty_partials() {
-        let merger = MergeAggregator::new(vec![TwoPhaseKind::Count]);
-        let result = merger.merge_all(&[]).unwrap();
+        let aggregator = MergeAggregator::new(vec![TwoPhaseKind::Count]);
+        let result = aggregator.merge_all(&[]).unwrap();
         assert!(result.is_empty());
     }
 
     #[test]
     fn test_merge_function_count_mismatch() {
-        let merger = MergeAggregator::new(vec![TwoPhaseKind::Count, TwoPhaseKind::Sum]);
+        let aggregator = MergeAggregator::new(vec![TwoPhaseKind::Count, TwoPhaseKind::Sum]);
 
         let bad = PartialAggregate {
             group_key: b"g".to_vec(),
@@ -957,7 +957,7 @@ mod tests {
         };
 
         let refs: Vec<&PartialAggregate> = vec![&bad];
-        let err = merger.merge_group(&refs).unwrap_err();
+        let err = aggregator.merge_group(&refs).unwrap_err();
         match err {
             TwoPhaseError::FunctionCountMismatch {
                 expected: 2,
@@ -1075,7 +1075,7 @@ mod tests {
     #[test]
     fn test_three_partition_full_pipeline() {
         let store = CrossPartitionAggregateStore::new(3);
-        let merger = MergeAggregator::new(vec![
+        let aggregator = MergeAggregator::new(vec![
             TwoPhaseKind::Count,
             TwoPhaseKind::Sum,
             TwoPhaseKind::Avg,
@@ -1103,7 +1103,7 @@ mod tests {
         let collected = collect_partials(&store, b"AAPL");
         assert_eq!(collected.len(), 3);
 
-        let result = merger.merge_all(&collected).unwrap();
+        let result = aggregator.merge_all(&collected).unwrap();
         let merged = &result[b"AAPL".as_ref()];
 
         // COUNT: 100 + 200 + 300 = 600
@@ -1263,9 +1263,12 @@ mod tests {
 
     #[test]
     fn test_merge_aggregator_accessors() {
-        let merger = MergeAggregator::new(vec![TwoPhaseKind::Count, TwoPhaseKind::Avg]);
-        assert_eq!(merger.num_functions(), 2);
-        assert_eq!(merger.kinds(), &[TwoPhaseKind::Count, TwoPhaseKind::Avg]);
+        let aggregator = MergeAggregator::new(vec![TwoPhaseKind::Count, TwoPhaseKind::Avg]);
+        assert_eq!(aggregator.num_functions(), 2);
+        assert_eq!(
+            aggregator.kinds(),
+            &[TwoPhaseKind::Count, TwoPhaseKind::Avg]
+        );
     }
 
     // ── PartialAggregate serde ──────────────────────────────────────

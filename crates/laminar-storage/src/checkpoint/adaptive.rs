@@ -305,7 +305,7 @@ mod tests {
         assert_eq!(tuner.changelog_rate_bytes_per_sec(), 0.0);
 
         // Simulate passage of time by advancing last_checkpoint_time
-        tuner.last_checkpoint_time = Some(Instant::now() - Duration::from_secs(5));
+        tuner.last_checkpoint_time = Instant::now().checked_sub(Duration::from_secs(5));
 
         // Second checkpoint — now we have a previous time
         tuner.record_checkpoint(Duration::from_millis(100), 5_000_000);
@@ -322,12 +322,12 @@ mod tests {
         tuner.record_checkpoint(Duration::from_millis(100), 0);
 
         // High-rate checkpoint
-        tuner.last_checkpoint_time = Some(Instant::now() - Duration::from_secs(1));
+        tuner.last_checkpoint_time = Instant::now().checked_sub(Duration::from_secs(1));
         tuner.record_checkpoint(Duration::from_millis(100), 10_000_000);
         let rate_after_high = tuner.changelog_rate_bytes_per_sec();
 
         // Low-rate checkpoint — EMA should decrease but not jump to the new rate
-        tuner.last_checkpoint_time = Some(Instant::now() - Duration::from_secs(1));
+        tuner.last_checkpoint_time = Instant::now().checked_sub(Duration::from_secs(1));
         tuner.record_checkpoint(Duration::from_millis(100), 100_000);
         let rate_after_low = tuner.changelog_rate_bytes_per_sec();
 
