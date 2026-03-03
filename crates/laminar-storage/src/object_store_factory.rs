@@ -1,4 +1,4 @@
-//! Factory for building [`ObjectStore`] instances from URL schemes.
+//! Factory for building `ObjectStore` instances from URL schemes.
 //!
 //! Detects the cloud provider from the URL scheme (`s3://`, `gs://`, `az://`,
 //! `file://`) and constructs the appropriate backend. Cloud providers require
