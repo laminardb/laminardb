@@ -192,7 +192,8 @@ jobs:
       - name: Inspect image
         id: inspect
         run: |
-          digest=$(docker buildx imagetools inspect '${{ env.GHCR_IMAGE }}:sha-${{ github.sha }}' --format '{{.Manifest.Digest}}')
+          short_sha=$(echo "${{ github.sha }}" | cut -c1-7)
+          digest=$(docker buildx imagetools inspect "${{ env.GHCR_IMAGE }}:sha-${short_sha}" --format '{{.Manifest.Digest}}')
           echo "digest=$digest" >> "$GITHUB_OUTPUT"
 
   # --------------------------------------------------------------------------
