@@ -42,7 +42,7 @@ jobs:
             type=semver,pattern={{version}}
             type=semver,pattern={{major}}.{{minor}}
             type=semver,pattern={{major}}
-            type=sha,prefix=sha-
+            type=sha,prefix=sha-,format=long
             type=ref,event=branch
           flavor: |
             latest=false
@@ -157,8 +157,6 @@ jobs:
     permissions:
       contents: read
       packages: write
-    outputs:
-      image-digest: ${{ steps.inspect.outputs.digest }}
     steps:
       - name: Download digests
         uses: actions/download-artifact@v4
@@ -189,13 +187,6 @@ jobs:
           docker buildx imagetools create $tag_args \
             $(printf '${{ env.GHCR_IMAGE }}@sha256:%s ' *)
 
-      - name: Inspect image
-        id: inspect
-        run: |
-          short_sha=$(echo "${{ github.sha }}" | cut -c1-7)
-          digest=$(docker buildx imagetools inspect "${{ env.GHCR_IMAGE }}:sha-${short_sha}" --format '{{.Manifest.Digest}}')
-          echo "digest=$digest" >> "$GITHUB_OUTPUT"
-
   # --------------------------------------------------------------------------
   # Scan: Trivy vulnerability scanner
   # --------------------------------------------------------------------------
@@ -222,7 +213,7 @@ jobs:
       - name: Run Trivy vulnerability scanner
         uses: aquasecurity/trivy-action@0.34.2
         with:
-          image-ref: "${{ env.GHCR_IMAGE }}@${{ needs.merge.outputs.image-digest }}"
+          image-ref: "${{ env.GHCR_IMAGE }}:sha-${{ github.sha }}"
           version: "v0.69.2"
           format: "sarif"
           output: "trivy-results.sarif"

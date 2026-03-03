@@ -378,13 +378,14 @@ mod tests {
 
     #[test]
     fn test_half_used() {
-        let budget = TaskBudget::custom("test", 0, 100_000); // 100μs
+        // Use a large budget (1s) so the first check can't race past 50%
+        let budget = TaskBudget::custom("test", 0, 1_000_000_000); // 1s
 
         // Should not be half used immediately
         assert!(!budget.half_used());
 
-        // Sleep for 60μs (60%)
-        thread::sleep(Duration::from_micros(60));
+        // Sleep for 600ms (60%)
+        thread::sleep(Duration::from_millis(600));
 
         // Should be half used now
         assert!(budget.half_used());
