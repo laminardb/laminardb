@@ -1668,10 +1668,6 @@ mod tests {
         assert_eq!(pointer.checkpoint_id, 5);
     }
 
-    // -----------------------------------------------------------------------
-    // F-CRASH-001: Validation & crash recovery tests
-    // -----------------------------------------------------------------------
-
     #[test]
     fn test_validate_checkpoint_valid() {
         let dir = tempfile::tempdir().unwrap();

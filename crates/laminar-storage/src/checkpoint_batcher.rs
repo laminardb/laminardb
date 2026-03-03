@@ -57,7 +57,6 @@ pub struct BatchMetrics {
 }
 
 impl BatchMetrics {
-    /// Create zeroed metrics.
     #[must_use]
     pub fn new() -> Self {
         Self {

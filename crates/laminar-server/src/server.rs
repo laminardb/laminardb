@@ -87,7 +87,6 @@ pub async fn run_server(
     config: ServerConfig,
     config_path: PathBuf,
 ) -> Result<ServerHandle, ServerError> {
-    // Check if delta mode is requested
     let delta_cfg = DeltaConfig::from_server_config(&config)?;
 
     if let Some(delta_cfg) = delta_cfg {

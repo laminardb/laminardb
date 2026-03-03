@@ -68,7 +68,6 @@ impl DeltaNodeId {
         Self(truncated)
     }
 
-    /// Return the inner string value.
     pub fn as_str(&self) -> &str {
         &self.0
     }

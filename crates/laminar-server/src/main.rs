@@ -55,7 +55,6 @@ struct Args {
 async fn main() -> Result<()> {
     let args = Args::parse();
 
-    // Initialize tracing
     tracing_subscriber::registry()
         .with(
             tracing_subscriber::EnvFilter::try_from_default_env()
@@ -68,24 +67,18 @@ async fn main() -> Result<()> {
     info!("Version: {}", env!("CARGO_PKG_VERSION"));
     info!("Config file: {}", args.config);
 
-    // Load configuration
     let config_path = PathBuf::from(&args.config);
     let mut config = config::load_config(&config_path)?;
 
-    // Override bind address from CLI if provided
     if let Some(bind) = args.admin_bind {
         config.server.bind = bind;
     }
 
-    // Validate-and-exit mode
     if args.validate_checkpoints {
         return validate_checkpoints_and_exit(&config).await;
     }
 
-    // Build and start server
     let handle = server::run_server(config, config_path).await?;
-
-    // Block until shutdown signal
     handle.wait_for_shutdown().await?;
 
     Ok(())

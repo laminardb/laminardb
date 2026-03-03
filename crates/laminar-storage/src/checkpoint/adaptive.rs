@@ -23,7 +23,6 @@ use std::time::{Duration, Instant};
 // Configuration
 // ---------------------------------------------------------------------------
 
-/// Configuration for the adaptive checkpoint interval tuner.
 #[derive(Debug, Clone)]
 pub struct AdaptiveConfig {
     /// Target upper bound for estimated recovery time.
@@ -50,8 +49,6 @@ impl Default for AdaptiveConfig {
 // Tuner
 // ---------------------------------------------------------------------------
 
-/// Adaptive checkpoint interval tuner.
-///
 /// After each checkpoint completes, call [`record_checkpoint()`](Self::record_checkpoint)
 /// with the checkpoint duration and the number of changelog bytes accumulated
 /// since the previous checkpoint. The tuner then recomputes the recommended

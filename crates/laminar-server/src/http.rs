@@ -56,7 +56,6 @@ pub struct AppState {
     pub reload_last_ts: AtomicU64,
 }
 
-/// Build the axum router with all endpoints.
 pub fn build_router(state: Arc<AppState>) -> Router {
     Router::new()
         // Health and observability

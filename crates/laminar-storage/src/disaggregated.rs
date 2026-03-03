@@ -39,7 +39,6 @@ use thiserror::Error;
 // Configuration
 // ---------------------------------------------------------------------------
 
-/// Configuration for the disaggregated state backend.
 #[derive(Debug, Clone)]
 pub struct DisaggregatedConfig {
     /// S3 prefix for state objects (e.g., `"nodes/abc123/"`).
@@ -66,7 +65,6 @@ impl Default for DisaggregatedConfig {
 // Errors
 // ---------------------------------------------------------------------------
 
-/// Errors from the disaggregated state backend.
 #[derive(Debug, Error)]
 pub enum DisaggregatedError {
     /// Write rejected because the epoch is stale (zombie fencing).
@@ -91,10 +89,6 @@ pub enum DisaggregatedError {
     InvalidBlob(String),
 }
 
-// ---------------------------------------------------------------------------
-// State entry
-// ---------------------------------------------------------------------------
-
 /// A single key-value state entry for a partition.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct StateEntry {
@@ -104,10 +98,6 @@ pub struct StateEntry {
     pub value: Vec<u8>,
 }
 
-// ---------------------------------------------------------------------------
-// Cache key
-// ---------------------------------------------------------------------------
-
 /// Cache key: `(partition_id, epoch)`.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
 struct CacheKey {
@@ -115,12 +105,6 @@ struct CacheKey {
     epoch: u64,
 }
 
-// ---------------------------------------------------------------------------
-// Backend
-// ---------------------------------------------------------------------------
-
-/// Disaggregated state backend.
-///
 /// Writes partition state to S3 as immutable, LZ4-compressed blobs.
 /// Reads go through a foyer in-memory cache — cache misses trigger
 /// S3 GETs (recovery path only; normal query path never touches S3).

@@ -83,14 +83,12 @@ fn spawn_membership_watcher(
 ) -> tokio::task::JoinHandle<()> {
     let local_name = local_node_id.to_string();
     tokio::spawn(async move {
-        // Snapshot the initial state
         let mut known: HashMap<u64, (String, NodeState)> = HashMap::new();
         for node in rx.borrow_and_update().iter() {
             known.insert(node.id.0, (node.name.clone(), node.state));
         }
 
         loop {
-            // Wait for the next membership change
             if rx.changed().await.is_err() {
                 // Sender dropped — discovery shut down
                 info!("[{local_name}] Membership watcher stopping (discovery shut down)");
@@ -99,13 +97,11 @@ fn spawn_membership_watcher(
 
             let current_peers = rx.borrow_and_update().clone();
 
-            // Build map of current peers
             let mut current: HashMap<u64, (String, NodeState)> = HashMap::new();
             for node in &current_peers {
                 current.insert(node.id.0, (node.name.clone(), node.state));
             }
 
-            // Detect new peers (joined)
             for (id, (name, state)) in &current {
                 if !known.contains_key(id) {
                     info!(
@@ -115,7 +111,6 @@ fn spawn_membership_watcher(
                 }
             }
 
-            // Detect removed peers (left or crashed)
             for (id, (name, old_state)) in &known {
                 if !current.contains_key(id) {
                     if *old_state == NodeState::Suspected {
@@ -132,7 +127,6 @@ fn spawn_membership_watcher(
                 }
             }
 
-            // Detect state changes
             for (id, (name, new_state)) in &current {
                 if let Some((_, old_state)) = known.get(id) {
                     if old_state != new_state {
@@ -156,7 +150,6 @@ fn spawn_membership_watcher(
                 }
             }
 
-            // Update snapshot
             known = current;
         }
     })
@@ -330,7 +323,6 @@ pub async fn start_delta(
         bind_addr.as_str()
     };
 
-    // Build local NodeInfo
     let local_node = NodeInfo {
         id: node_id,
         name: node_id_str.clone(),
@@ -595,7 +587,6 @@ pub async fn start_delta(
     })
 }
 
-/// Get the number of available CPU cores.
 fn num_cpus() -> u32 {
     std::thread::available_parallelism()
         .map(|n| n.get() as u32)
