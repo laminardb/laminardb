@@ -23,6 +23,7 @@ use std::time::{Duration, Instant};
 // Configuration
 // ---------------------------------------------------------------------------
 
+/// Knobs for the adaptive checkpoint interval tuner.
 #[derive(Debug, Clone)]
 pub struct AdaptiveConfig {
     /// Target upper bound for estimated recovery time.

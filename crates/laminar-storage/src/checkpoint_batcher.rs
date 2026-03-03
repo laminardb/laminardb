@@ -57,6 +57,7 @@ pub struct BatchMetrics {
 }
 
 impl BatchMetrics {
+    /// Returns zeroed counters.
     #[must_use]
     pub fn new() -> Self {
         Self {

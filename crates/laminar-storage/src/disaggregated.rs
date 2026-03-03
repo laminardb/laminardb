@@ -39,6 +39,7 @@ use thiserror::Error;
 // Configuration
 // ---------------------------------------------------------------------------
 
+/// Knobs for the disaggregated (S3-backed) state backend.
 #[derive(Debug, Clone)]
 pub struct DisaggregatedConfig {
     /// S3 prefix for state objects (e.g., `"nodes/abc123/"`).
@@ -65,6 +66,7 @@ impl Default for DisaggregatedConfig {
 // Errors
 // ---------------------------------------------------------------------------
 
+/// Failures from the disaggregated state backend.
 #[derive(Debug, Error)]
 pub enum DisaggregatedError {
     /// Write rejected because the epoch is stale (zombie fencing).
