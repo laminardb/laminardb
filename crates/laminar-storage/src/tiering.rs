@@ -165,10 +165,7 @@ impl TieringPolicy {
         let class = self.storage_class(tier);
 
         let mut attrs = Attributes::new();
-        attrs.insert(
-            Attribute::StorageClass,
-            class.as_s3_str().into(),
-        );
+        attrs.insert(Attribute::StorageClass, class.as_s3_str().into());
 
         let mut tags = TagSet::default();
         tags.push("laminardb-tier", tier.tag_value());
@@ -231,14 +228,10 @@ pub fn decompress_for_tier(
     tier: StorageTier,
 ) -> Result<Vec<u8>, DecompressionError> {
     match tier {
-        StorageTier::Hot => lz4_flex::decompress_size_prepended(compressed).map_err(|e| {
-            DecompressionError(format!("LZ4 decompression failed: {e}"))
-        }),
-        StorageTier::Warm | StorageTier::Cold => {
-            zstd::decode_all(compressed).map_err(|e| {
-                DecompressionError(format!("Zstd decompression failed: {e}"))
-            })
-        }
+        StorageTier::Hot => lz4_flex::decompress_size_prepended(compressed)
+            .map_err(|e| DecompressionError(format!("LZ4 decompression failed: {e}"))),
+        StorageTier::Warm | StorageTier::Cold => zstd::decode_all(compressed)
+            .map_err(|e| DecompressionError(format!("Zstd decompression failed: {e}"))),
     }
 }
 

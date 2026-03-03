@@ -117,13 +117,15 @@ impl AdaptiveCheckpointer {
         if let Some(last_time) = self.last_checkpoint_time {
             let elapsed_secs = now.duration_since(last_time).as_secs_f64();
             if elapsed_secs > 0.0 {
-                #[allow(clippy::cast_precision_loss)] // changelog_bytes fits in f64 mantissa for practical sizes
+                #[allow(clippy::cast_precision_loss)]
+                // changelog_bytes fits in f64 mantissa for practical sizes
                 let rate = changelog_bytes as f64 / elapsed_secs;
                 if self.changelog_rate_ema == 0.0 {
                     self.changelog_rate_ema = rate;
                 } else {
-                    self.changelog_rate_ema =
-                        self.ema_alpha.mul_add(rate, (1.0 - self.ema_alpha) * self.changelog_rate_ema);
+                    self.changelog_rate_ema = self
+                        .ema_alpha
+                        .mul_add(rate, (1.0 - self.ema_alpha) * self.changelog_rate_ema);
                 }
             }
         }

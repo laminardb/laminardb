@@ -59,6 +59,7 @@ pub mod io_uring_wal;
 
 // Re-export key types
 pub use changelog_drainer::ChangelogDrainer;
+pub use checkpoint::adaptive::{AdaptiveCheckpointer, AdaptiveConfig};
 pub use checkpoint::checkpointer::{
     verify_integrity, Checkpointer, CheckpointerError, ObjectStoreCheckpointer,
 };
@@ -71,20 +72,19 @@ pub use checkpoint::source_offsets::{
     KafkaPosition, MysqlCdcPosition, OperatorDescriptor, OperatorDeterminismWarning,
     PostgresCdcPosition, RecoveryPlan, SourceId, SourceOffset, SourcePosition, WarningSeverity,
 };
-pub use checkpoint::adaptive::{AdaptiveCheckpointer, AdaptiveConfig};
 pub use checkpoint::{Checkpoint, CheckpointManager, CheckpointMetadata};
-pub use checkpoint_manifest::{CheckpointManifest, ConnectorCheckpoint, OperatorCheckpoint};
 pub use checkpoint_batcher::{decode_batch, BatchMetrics, BatchMetricsSnapshot, CheckpointBatcher};
-pub use tiering::{
-    compress_for_tier, decompress_for_tier, DecompressionError, StorageClass, StorageTier,
-    TieringPolicy,
-};
+pub use checkpoint_manifest::{CheckpointManifest, ConnectorCheckpoint, OperatorCheckpoint};
 pub use checkpoint_store::{
     CheckpointStore, CheckpointStoreError, FileSystemCheckpointStore, ObjectStoreCheckpointStore,
     RecoveryReport, ValidationResult,
 };
 pub use disaggregated::{
     DisaggregatedConfig, DisaggregatedError, DisaggregatedStateBackend, StateEntry,
+};
+pub use tiering::{
+    compress_for_tier, decompress_for_tier, DecompressionError, StorageClass, StorageTier,
+    TieringPolicy,
 };
 pub use wal::{WalEntry, WalError, WalPosition, WriteAheadLog};
 pub use wal_state_store::WalStateStore;

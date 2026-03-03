@@ -240,8 +240,8 @@ pub trait CheckpointStore: Send + Sync {
             }
         }
 
-        let valid = issues.is_empty()
-            || issues.iter().all(|i| i.starts_with("manifest validation:"));
+        let valid =
+            issues.is_empty() || issues.iter().all(|i| i.starts_with("manifest validation:"));
         Ok(ValidationResult {
             checkpoint_id: id,
             valid,
@@ -673,10 +673,7 @@ impl ObjectStoreCheckpointStore {
     // ── v2 (hierarchical) paths ──
 
     fn manifest_path(&self, id: u64) -> object_store::path::Path {
-        object_store::path::Path::from(format!(
-            "{}manifests/manifest-{id:06}.json",
-            self.prefix
-        ))
+        object_store::path::Path::from(format!("{}manifests/manifest-{id:06}.json", self.prefix))
     }
 
     fn latest_pointer_path(&self) -> object_store::path::Path {
@@ -684,10 +681,7 @@ impl ObjectStoreCheckpointStore {
     }
 
     fn state_path(&self, id: u64) -> object_store::path::Path {
-        object_store::path::Path::from(format!(
-            "{}checkpoints/state-{id:06}.bin",
-            self.prefix
-        ))
+        object_store::path::Path::from(format!("{}checkpoints/state-{id:06}.bin", self.prefix))
     }
 
     // ── v1 (legacy) paths — for backward-compat reads only ──
@@ -750,8 +744,7 @@ impl ObjectStoreCheckpointStore {
         let mut ids = std::collections::BTreeSet::new();
 
         // v2 layout: manifests/manifest-NNNNNN.json
-        let manifests_prefix =
-            object_store::path::Path::from(format!("{}manifests/", self.prefix));
+        let manifests_prefix = object_store::path::Path::from(format!("{}manifests/", self.prefix));
         let entries: Vec<_> = self.rt.block_on(async {
             use futures::TryStreamExt;
             self.store
@@ -982,8 +975,7 @@ impl CheckpointStore for ObjectStoreCheckpointStore {
             self.list_checkpoint_ids()?.into_iter().collect();
 
         // List state files in v2 layout: checkpoints/state-NNNNNN.bin
-        let state_prefix =
-            object_store::path::Path::from(format!("{}checkpoints/", self.prefix));
+        let state_prefix = object_store::path::Path::from(format!("{}checkpoints/", self.prefix));
         let entries: Vec<_> = self.rt.block_on(async {
             use futures::TryStreamExt;
             self.store
@@ -1012,8 +1004,7 @@ impl CheckpointStore for ObjectStoreCheckpointStore {
         if !orphan_paths.is_empty() {
             self.rt.block_on(async {
                 use futures::StreamExt;
-                let stream =
-                    futures::stream::iter(orphan_paths.into_iter().map(Ok)).boxed();
+                let stream = futures::stream::iter(orphan_paths.into_iter().map(Ok)).boxed();
                 let mut results = self.store.delete_stream(stream);
                 while let Some(result) = results.next().await {
                     if let Err(e) = result {
@@ -1502,9 +1493,7 @@ mod tests {
         let result = rt.block_on(async {
             inner
                 .get_opts(
-                    &object_store::path::Path::from(
-                        "checkpoints/checkpoint_000001/manifest.json",
-                    ),
+                    &object_store::path::Path::from("checkpoints/checkpoint_000001/manifest.json"),
                     GetOptions::default(),
                 )
                 .await
@@ -1625,9 +1614,7 @@ mod tests {
         let result = rt.block_on(async {
             inner
                 .get_opts(
-                    &object_store::path::Path::from(
-                        "checkpoints/checkpoint_000001/state.bin",
-                    ),
+                    &object_store::path::Path::from("checkpoints/checkpoint_000001/state.bin"),
                     GetOptions::default(),
                 )
                 .await
@@ -1752,15 +1739,16 @@ mod tests {
         store.save_with_state(&m, Some(state)).unwrap();
 
         // Now corrupt the state.bin on disk.
-        let state_path = dir
-            .path()
-            .join("checkpoints/checkpoint_000001/state.bin");
+        let state_path = dir.path().join("checkpoints/checkpoint_000001/state.bin");
         std::fs::write(&state_path, b"corrupted data!!").unwrap();
 
         let result = store.validate_checkpoint(1).unwrap();
         assert!(!result.valid, "corrupted state should be invalid");
         assert!(
-            result.issues.iter().any(|i| i.contains("checksum mismatch")),
+            result
+                .issues
+                .iter()
+                .any(|i| i.contains("checksum mismatch")),
             "should report checksum mismatch: {:?}",
             result.issues
         );
@@ -1776,18 +1764,13 @@ mod tests {
         store.save_with_state(&m, Some(b"state")).unwrap();
 
         // Delete the state.bin file to simulate partial crash.
-        let state_path = dir
-            .path()
-            .join("checkpoints/checkpoint_000001/state.bin");
+        let state_path = dir.path().join("checkpoints/checkpoint_000001/state.bin");
         std::fs::remove_file(&state_path).unwrap();
 
         let result = store.validate_checkpoint(1).unwrap();
         assert!(!result.valid);
         assert!(
-            result
-                .issues
-                .iter()
-                .any(|i| i.contains("not found")),
+            result.issues.iter().any(|i| i.contains("not found")),
             "should report missing state: {:?}",
             result.issues
         );
@@ -1965,7 +1948,9 @@ mod tests {
 
         // Save a checkpoint (creates manifest + state).
         let state = b"state-with-manifest";
-        store.save_with_state(&make_manifest(1, 1), Some(state)).unwrap();
+        store
+            .save_with_state(&make_manifest(1, 1), Some(state))
+            .unwrap();
 
         // Write an orphan state file (no manifest).
         let rt = tokio::runtime::Builder::new_current_thread()

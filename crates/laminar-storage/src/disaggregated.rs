@@ -256,9 +256,9 @@ impl DisaggregatedStateBackend {
 
         // Cache miss → S3 GET.
         let path = self.state_path(partition_id, epoch);
-        let result = self.rt.block_on(async {
-            self.store.get_opts(&path, GetOptions::default()).await
-        });
+        let result = self
+            .rt
+            .block_on(async { self.store.get_opts(&path, GetOptions::default()).await });
 
         match result {
             Ok(get_result) => {
@@ -267,8 +267,7 @@ impl DisaggregatedStateBackend {
                 let entries = decode_body(&decompressed)?;
 
                 // Populate cache.
-                self.cache
-                    .insert(key, Bytes::from(decompressed));
+                self.cache.insert(key, Bytes::from(decompressed));
 
                 Ok(Some(entries))
             }
@@ -326,10 +325,7 @@ impl DisaggregatedStateBackend {
 
         let entries = self.rt.block_on(async {
             use futures::TryStreamExt;
-            self.store
-                .list(Some(&prefix))
-                .try_collect::<Vec<_>>()
-                .await
+            self.store.list(Some(&prefix)).try_collect::<Vec<_>>().await
         })?;
 
         let mut epochs: Vec<u64> = entries
@@ -347,11 +343,7 @@ impl DisaggregatedStateBackend {
     /// # Errors
     ///
     /// Returns [`DisaggregatedError::Store`] on S3 delete failure.
-    pub fn prune(
-        &self,
-        partition_id: u64,
-        keep_count: usize,
-    ) -> Result<usize, DisaggregatedError> {
+    pub fn prune(&self, partition_id: u64, keep_count: usize) -> Result<usize, DisaggregatedError> {
         let epochs = self.list_epochs(partition_id)?;
         if epochs.len() <= keep_count {
             return Ok(0);
@@ -483,8 +475,8 @@ fn decode_body(body: &[u8]) -> Result<Vec<StateEntry>, DisaggregatedError> {
                 "truncated key length".into(),
             ));
         }
-        let key_len = u32::from_le_bytes([body[pos], body[pos + 1], body[pos + 2], body[pos + 3]])
-            as usize;
+        let key_len =
+            u32::from_le_bytes([body[pos], body[pos + 1], body[pos + 2], body[pos + 3]]) as usize;
         pos += 4;
 
         // key
@@ -646,10 +638,8 @@ mod tests {
     fn get_populates_cache_on_miss() {
         // Use a shared store so we can write via one backend and read via another.
         let store = Arc::new(object_store::memory::InMemory::new());
-        let backend1 = DisaggregatedStateBackend::new(
-            store.clone(),
-            DisaggregatedConfig::default(),
-        );
+        let backend1 =
+            DisaggregatedStateBackend::new(store.clone(), DisaggregatedConfig::default());
         let backend2 = DisaggregatedStateBackend::new(store, DisaggregatedConfig::default());
 
         let entries = make_entries(2);

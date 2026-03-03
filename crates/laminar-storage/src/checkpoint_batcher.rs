@@ -267,7 +267,10 @@ fn encode_batch(entries: &[BatchEntry]) -> (usize, PutPayload) {
     out.extend_from_slice(&(uncompressed_size as u32).to_le_bytes());
     out.extend_from_slice(&compressed);
 
-    (uncompressed_size, PutPayload::from_bytes(bytes::Bytes::from(out)))
+    (
+        uncompressed_size,
+        PutPayload::from_bytes(bytes::Bytes::from(out)),
+    )
 }
 
 /// Decode a batch payload into `(key, data)` pairs.
