@@ -33,7 +33,10 @@ The Delta Architecture extends LaminarDB from an embedded single-process streami
 | Phase 6a — Partition-Parallel Embedded | 29 | 0 | 2 | 0 | 27 |
 | Phase 6b — Delta Foundation | 14 | 14 | 0 | 0 | 0 |
 | Phase 6c — Production Hardening | 10 | 9 | 1 | 0 | 0 |
-| **Total** | **53** | **21** | **3** | **0** | **27** |
+| Phase 7a — Platform Cleanup | 2 | 0 | 0 | 0 | 2 |
+| Phase 7b — Cloud-Native Storage | 4 | 0 | 0 | 0 | 4 |
+| Phase 7c — Distributed Operations | 4 | 0 | 0 | 0 | 4 |
+| **Total** | **63** | **21** | **3** | **0** | **37** |
 
 ## Key Dependencies
 
@@ -223,6 +226,74 @@ See [DEPENDENCIES.md](DEPENDENCIES.md) for the full project dependency graph.
 
 ---
 
+## Phase 7a: Platform Cleanup
+
+> **Goal**: Remove feature gate complexity and simplify config model. Unblock all downstream cloud-native work.
+
+### Feature Gate Removal
+
+| ID | Feature | Status | Priority | Effort | Spec |
+|----|---------|--------|----------|--------|------|
+| F-GATE-001 | Feature Gate Removal | ✅ | P0 | M | [Link](cloud/F-GATE-001-feature-gate-removal.md) |
+
+### Config Model
+
+| ID | Feature | Status | Priority | Effort | Spec |
+|----|---------|--------|----------|--------|------|
+| F-CFG-001 | Orthogonal Config Model | ✅ | P0 | M | [Link](cloud/F-CFG-001-orthogonal-config.md) |
+
+---
+
+## Phase 7b: Cloud-Native Storage
+
+> **Goal**: Production-ready S3 integration with crash safety, cost-optimized batching, and storage class tiering. Follows industry consensus: S3 as durable source of truth, never read from S3 on query path.
+
+### S3 Object Layout & Cost Optimization
+
+| ID | Feature | Status | Priority | Effort | Spec |
+|----|---------|--------|----------|--------|------|
+| F-S3-001 | S3 Object Layout | ✅ | P0 | L | [Link](cloud/F-S3-001-object-layout.md) |
+| F-S3-002 | Checkpoint Batching | ✅ | P1 | M | [Link](cloud/F-S3-002-checkpoint-batching.md) |
+| F-S3-003 | Storage Class Tiering | ✅ | P2 | M | [Link](cloud/F-S3-003-storage-class-tiering.md) |
+
+### Crash Safety
+
+| ID | Feature | Status | Priority | Effort | Spec |
+|----|---------|--------|----------|--------|------|
+| F-CRASH-001 | Checkpoint Validation & Crash Recovery | ✅ | P0 | L | [Link](cloud/F-CRASH-001-checkpoint-validation.md) |
+
+---
+
+## Phase 7c: Distributed Operations
+
+> **Goal**: Disaggregated state on S3, correct cross-partition aggregation, safe partition migration, and self-tuning checkpoints.
+
+### Disaggregated State
+
+| ID | Feature | Status | Priority | Effort | Spec |
+|----|---------|--------|----------|--------|------|
+| F-DISAGG-001 | Disaggregated State Backend | ✅ | P1 | XL | [Link](cloud/F-DISAGG-001-disaggregated-state.md) |
+
+### Cross-Partition Aggregation
+
+| ID | Feature | Status | Priority | Effort | Spec |
+|----|---------|--------|----------|--------|------|
+| F-XAGG-004 | Two-Phase Aggregation | ✅ | P1 | L | [Link](cloud/F-XAGG-004-two-phase-aggregation.md) |
+
+### Partition Migration
+
+| ID | Feature | Status | Priority | Effort | Spec |
+|----|---------|--------|----------|--------|------|
+| F-MIGRATE-001 | Partition Migration Protocol | ✅ | P1 | L | [Link](cloud/F-MIGRATE-001-partition-migration.md) |
+
+### Adaptive Checkpointing
+
+| ID | Feature | Status | Priority | Effort | Spec |
+|----|---------|--------|----------|--------|------|
+| F-DCKP-009 | Adaptive Checkpoint Interval | ✅ | P2 | M | [Link](cloud/F-DCKP-009-adaptive-checkpoint.md) |
+
+---
+
 ## Performance Budget
 
 ### Ring 0 (Hot Path) — < 500ns per event
@@ -274,9 +345,11 @@ All pure Rust. No C++ FFI.
 | `axum` | latest | HTTP API for laminardb-server | 2 |
 | `toml` | latest | Config file parsing | 2 |
 
-**Feature-gated:** `delta` (chitchat, openraft, tonic), `server` (axum, toml).
+**Always compiled** (after F-GATE-001): chitchat, openraft, tonic, axum, toml.
 
-**Deferred to Phase 7:** `slatedb` 0.10+ (AsyncStateStore for state exceeding RAM).
+**Platform-gated:** `aws` (S3), `gcs` (GCS), `azure` (ABS), `kafka`, `postgres-cdc`, `io-uring`, `jemalloc`.
+
+**Deferred evaluation:** `slatedb` 0.10+ (after Phase 7c, if disaggregated backend proves insufficient).
 
 ---
 
@@ -313,6 +386,10 @@ The prioritized fix plan is in **[ARCHITECTURE-FIX-PLAN.md](ARCHITECTURE-FIX-PLA
 | Predicate pushdown | Flat enum | Expression tree | Scope containment |
 | StateStore get_async | Removed | Keep in base trait | Clean Ring 0 interface |
 | Mmap state backend | Removed | MmapStateStore | FxHashMap faster; rkyv + object_store simpler durability |
+| Feature gate strategy | Always-compile (runtime config) | Cargo feature gates for durable/delta | Eliminates combinatorial testing; platform gates kept for C deps |
+| S3 role | Source of truth (write-only on hot path) | Backup/archive only | Industry consensus (RisingWave, WarpStream, AutoMQ); S3 Express pricing viable |
+| Durable state backend | Custom disaggregated (rkyv + object_store) | SlateDB LSM | Simpler for write-once checkpoint model; SlateDB deferred for evaluation |
+| Checkpoint object size | 4-32MB batched | Per-record or per-micro-batch | S3 PUT cost optimization ($0.005/1000); batching reduces cost ~10x |
 
 ---
 

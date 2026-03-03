@@ -238,7 +238,7 @@ impl Default for ServerSection {
 #[derive(Debug, Clone, PartialEq, Deserialize)]
 #[allow(dead_code)]
 pub struct StateSection {
-    /// Backend type: "memory" or "mmap".
+    /// Backend type: "memory", "mmap", or "disaggregated".
     #[serde(default = "default_state_backend")]
     pub backend: String,
 
@@ -249,6 +249,14 @@ pub struct StateSection {
     /// Maximum state size in bytes (0 = unlimited for memory backend).
     #[serde(default)]
     pub max_size_bytes: u64,
+
+    /// Cache capacity for disaggregated backend (number of entries).
+    #[serde(default = "default_disaggregated_cache_capacity")]
+    pub cache_capacity: usize,
+
+    /// Cache shard count for disaggregated backend.
+    #[serde(default = "default_disaggregated_cache_shards")]
+    pub cache_shards: usize,
 }
 
 impl Default for StateSection {
@@ -257,6 +265,8 @@ impl Default for StateSection {
             backend: default_state_backend(),
             path: default_state_path(),
             max_size_bytes: 0,
+            cache_capacity: default_disaggregated_cache_capacity(),
+            cache_shards: default_disaggregated_cache_shards(),
         }
     }
 }
@@ -281,6 +291,38 @@ pub struct CheckpointSection {
     /// Snapshot strategy: "full", "incremental", "fork_cow".
     #[serde(default = "default_snapshot_strategy")]
     pub snapshot_strategy: String,
+
+    /// Enable adaptive checkpoint interval tuning.
+    ///
+    /// When `true`, the checkpoint interval is dynamically adjusted based on
+    /// observed checkpoint costs to keep estimated recovery time within
+    /// `target_recovery_time`.
+    #[serde(default)]
+    pub adaptive: bool,
+
+    /// Target upper bound for estimated recovery time (e.g., `"10s"`).
+    /// Only used when `adaptive = true`.
+    #[serde(default = "default_target_recovery_time", with = "humantime_serde")]
+    pub target_recovery_time: Duration,
+
+    /// Minimum checkpoint interval for adaptive mode (e.g., `"1s"`).
+    #[serde(default = "default_min_interval", with = "humantime_serde")]
+    pub min_interval: Duration,
+
+    /// Maximum checkpoint interval for adaptive mode (e.g., `"5m"`).
+    #[serde(default = "default_max_interval", with = "humantime_serde")]
+    pub max_interval: Duration,
+
+    /// Explicit cloud storage credentials/config overrides.
+    ///
+    /// Keys are backend-specific (e.g., `aws_access_key_id`, `aws_region`).
+    /// These supplement environment-variable-based credential resolution.
+    #[serde(default)]
+    pub storage: std::collections::HashMap<String, String>,
+
+    /// S3 storage class tiering configuration.
+    #[serde(default)]
+    pub tiering: Option<TieringSection>,
 }
 
 impl Default for CheckpointSection {
@@ -290,8 +332,43 @@ impl Default for CheckpointSection {
             interval: default_checkpoint_interval(),
             mode: default_checkpoint_mode(),
             snapshot_strategy: default_snapshot_strategy(),
+            adaptive: false,
+            target_recovery_time: default_target_recovery_time(),
+            min_interval: default_min_interval(),
+            max_interval: default_max_interval(),
+            storage: std::collections::HashMap::new(),
+            tiering: None,
         }
     }
+}
+
+/// `[checkpoint.tiering]` section: S3 storage class tiering.
+///
+/// Controls how checkpoint objects are assigned to S3 storage classes
+/// for cost optimization. Active checkpoints use the hot tier,
+/// older checkpoints are moved to warm/cold tiers via S3 Lifecycle rules.
+#[derive(Debug, Clone, PartialEq, Deserialize)]
+#[allow(dead_code)]
+pub struct TieringSection {
+    /// Storage class for active checkpoints (e.g., `"EXPRESS_ONE_ZONE"`, `"STANDARD"`).
+    #[serde(default = "default_hot_class")]
+    pub hot_class: String,
+
+    /// Storage class for older checkpoints (e.g., `"STANDARD"`).
+    #[serde(default = "default_warm_class")]
+    pub warm_class: String,
+
+    /// Storage class for archive checkpoints (e.g., `"GLACIER_IR"`). Empty = no cold tier.
+    #[serde(default)]
+    pub cold_class: String,
+
+    /// Time before moving objects from hot to warm tier (e.g., `"24h"`).
+    #[serde(default = "default_hot_retention", with = "humantime_serde")]
+    pub hot_retention: Duration,
+
+    /// Time before moving objects from warm to cold tier (e.g., `"7d"`). 0 = no cold tier.
+    #[serde(default = "default_warm_retention", with = "humantime_serde")]
+    pub warm_retention: Duration,
 }
 
 /// `[[source]]` section: streaming source definition.
@@ -541,6 +618,12 @@ fn default_state_backend() -> String {
 fn default_state_path() -> String {
     "./data/state".to_string()
 }
+fn default_disaggregated_cache_capacity() -> usize {
+    1024
+}
+fn default_disaggregated_cache_shards() -> usize {
+    16
+}
 fn default_checkpoint_url() -> String {
     "file:///tmp/laminardb/checkpoints".to_string()
 }
@@ -552,6 +635,15 @@ fn default_checkpoint_mode() -> String {
 }
 fn default_snapshot_strategy() -> String {
     "full".to_string()
+}
+fn default_target_recovery_time() -> Duration {
+    Duration::from_secs(10)
+}
+fn default_min_interval() -> Duration {
+    Duration::from_secs(1)
+}
+fn default_max_interval() -> Duration {
+    Duration::from_secs(300) // 5m
 }
 fn default_format() -> String {
     "json".to_string()
@@ -573,6 +665,18 @@ fn default_cache_ttl() -> Duration {
 }
 fn default_delivery() -> String {
     "at_least_once".to_string()
+}
+fn default_hot_class() -> String {
+    "STANDARD".to_string()
+}
+fn default_warm_class() -> String {
+    "STANDARD".to_string()
+}
+fn default_hot_retention() -> Duration {
+    Duration::from_secs(86400) // 24h
+}
+fn default_warm_retention() -> Duration {
+    Duration::from_secs(604_800) // 7d
 }
 fn default_gossip_port() -> u16 {
     7946
@@ -964,6 +1068,56 @@ type = "VARCHAR"
         assert!(!config.sources[0].schema[0].nullable);
         assert_eq!(config.sources[0].schema[1].data_type, "VARCHAR");
         assert!(config.sources[0].schema[1].nullable); // default
+    }
+
+    #[test]
+    fn test_checkpoint_tiering_parsing() {
+        let toml = r#"
+[checkpoint]
+url = "s3://bucket/checkpoints"
+interval = "30s"
+
+[checkpoint.tiering]
+hot_class = "EXPRESS_ONE_ZONE"
+warm_class = "STANDARD"
+cold_class = "GLACIER_IR"
+hot_retention = "12h"
+warm_retention = "3d"
+"#;
+        let config: ServerConfig = toml::from_str(toml).unwrap();
+        let tiering = config.checkpoint.tiering.as_ref().unwrap();
+        assert_eq!(tiering.hot_class, "EXPRESS_ONE_ZONE");
+        assert_eq!(tiering.warm_class, "STANDARD");
+        assert_eq!(tiering.cold_class, "GLACIER_IR");
+        assert_eq!(tiering.hot_retention, Duration::from_secs(43200));
+        assert_eq!(tiering.warm_retention, Duration::from_secs(259_200));
+    }
+
+    #[test]
+    fn test_checkpoint_tiering_defaults() {
+        let toml = r#"
+[checkpoint]
+url = "s3://bucket/checkpoints"
+
+[checkpoint.tiering]
+"#;
+        let config: ServerConfig = toml::from_str(toml).unwrap();
+        let tiering = config.checkpoint.tiering.as_ref().unwrap();
+        assert_eq!(tiering.hot_class, "STANDARD");
+        assert_eq!(tiering.warm_class, "STANDARD");
+        assert!(tiering.cold_class.is_empty());
+        assert_eq!(tiering.hot_retention, Duration::from_secs(86400));
+        assert_eq!(tiering.warm_retention, Duration::from_secs(604_800));
+    }
+
+    #[test]
+    fn test_checkpoint_no_tiering() {
+        let toml = r#"
+[checkpoint]
+url = "s3://bucket/checkpoints"
+"#;
+        let config: ServerConfig = toml::from_str(toml).unwrap();
+        assert!(config.checkpoint.tiering.is_none());
     }
 
     #[test]

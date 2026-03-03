@@ -33,6 +33,15 @@ base64 = { workspace = true }
 # Fast hash for changelog entries
 rustc-hash = { workspace = true }
 
+# foyer cache for disaggregated state backend
+foyer = { workspace = true }
+
+# LZ4 compression for checkpoint batching
+lz4_flex = { workspace = true }
+
+# Zstd compression for archival storage tiers
+zstd = { workspace = true }
+
 # Identifiers
 uuid = { workspace = true }
 
@@ -56,6 +65,9 @@ tracing = { workspace = true }
 default = []
 delta = ["dep:delta_kernel"]
 io-uring = ["laminar-core/io-uring"]
+aws = ["object_store/aws"]
+gcs = ["object_store/gcp"]
+azure = ["object_store/azure"]
 
 [dev-dependencies]
 tempfile = { workspace = true }

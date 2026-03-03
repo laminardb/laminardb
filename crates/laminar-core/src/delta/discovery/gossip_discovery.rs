@@ -227,6 +227,9 @@ impl Discovery for GossipDiscovery {
             failure_detector_config: chitchat::FailureDetectorConfig {
                 phi_threshold: self.config.phi_threshold,
                 initial_interval: self.config.gossip_interval,
+                // Map dead_node_grace_period to the failure detector's GC
+                // timer (W6 fix). Default is 24h which is far too long.
+                dead_node_grace_period: self.config.dead_node_grace_period,
                 ..Default::default()
             },
             marked_for_deletion_grace_period: self.config.dead_node_grace_period,
@@ -258,20 +261,35 @@ impl Discovery for GossipDiscovery {
                         let chitchat_guard = chitchat.lock().await;
                         let mut new_peers = HashMap::new();
 
+                        // Collect the set of live node IDs from the failure
+                        // detector so we only include reachable peers (C3 fix).
+                        let live_ids: std::collections::HashSet<&chitchat::ChitchatId> =
+                            chitchat_guard.live_nodes().collect();
+
+                        // Iterate all known nodes, tagging dead ones
                         for (cc_id, state) in chitchat_guard.node_states() {
-                            // Collect key-values for this node
                             let kvs: HashMap<String, String> = state
                                 .key_values()
                                 .map(|(k, v)| (k.to_string(), v.to_string()))
                                 .collect();
 
-                            if let Some(info) = Self::parse_node_info(
+                            if let Some(mut info) = Self::parse_node_info(
                                 &cc_id.node_id,
                                 &kvs,
                             ) {
-                                if info.id != local_node_id {
-                                    new_peers.insert(info.id.0, info);
+                                if info.id == local_node_id {
+                                    continue;
                                 }
+
+                                // Override self-reported state with failure
+                                // detector opinion: if chitchat considers this
+                                // node dead, mark it as Suspected/Left rather
+                                // than trusting the gossip KV (C3 fix).
+                                if !live_ids.contains(cc_id) {
+                                    info.state = NodeState::Suspected;
+                                }
+
+                                new_peers.insert(info.id.0, info);
                             }
                         }
 
@@ -320,8 +338,15 @@ impl Discovery for GossipDiscovery {
     async fn stop(&mut self) -> Result<(), DiscoveryError> {
         self.cancel.cancel();
         self.started = false;
-        // Drop the chitchat handle to stop background tasks
-        self.chitchat_handle.take();
+        // Properly shut down chitchat (W8 fix): send shutdown command
+        // and wait for the background task to exit, releasing the UDP socket.
+        if let Some(handle) = self.chitchat_handle.take() {
+            if let Err(e) = handle.shutdown().await {
+                tracing::warn!("Chitchat shutdown error: {e}");
+            }
+        }
+        // Fresh token so restart after stop works
+        self.cancel = CancellationToken::new();
         Ok(())
     }
 }

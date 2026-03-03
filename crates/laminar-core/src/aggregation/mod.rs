@@ -6,6 +6,7 @@
 //! ## Module Overview
 //!
 //! - `cross_partition`: Concurrent partial aggregate store backed by `papaya::HashMap`
+//! - `two_phase`: Two-phase aggregation (partial per partition → merge on coordinator)
 
 /// Lock-free cross-partition aggregate store.
 pub mod cross_partition;
@@ -15,5 +16,7 @@ pub mod gossip_aggregates;
 /// gRPC aggregate fan-out across delta nodes.
 #[cfg(feature = "delta")]
 pub mod grpc_fanout;
+/// Two-phase cross-partition aggregation.
+pub mod two_phase;
 
 pub use cross_partition::CrossPartitionAggregateStore;

@@ -27,8 +27,9 @@ delta-lake-gcs = ["laminar-connectors/delta-lake-gcs"]
 delta-lake-unity = ["laminar-connectors/delta-lake-unity"]
 delta-lake-glue = ["laminar-connectors/delta-lake-glue"]
 parquet-lookup = ["laminar-connectors/parquet-lookup"]
-durable = []             # Object-store checkpoint profiles
-delta = ["durable"]  # Full distributed mode (Durable + gRPC + gossip + Raft)
+aws = ["laminar-storage/aws"]
+gcs = ["laminar-storage/gcs"]
+azure = ["laminar-storage/azure"]
 
 [dependencies]
 laminar-core = { path = "../laminar-core", version = "0.17.0" }

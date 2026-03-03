@@ -30,6 +30,36 @@ const STATE_RUNNING: u8 = 2;
 const STATE_SHUTTING_DOWN: u8 = 3;
 const STATE_STOPPED: u8 = 4;
 
+/// Extract a checkpoint path prefix from an object store URL.
+///
+/// For `s3://bucket/prefix/path` → `"prefix/path/"`.
+/// For `file:///some/path` → `""` (local FS uses the path directly).
+fn url_to_checkpoint_prefix(url: &str) -> String {
+    // Strip scheme
+    let after_scheme = url
+        .find("://")
+        .map_or(url, |i| &url[i + 3..]);
+
+    // For file:// URLs, the prefix is empty (LocalFileSystem already has the root)
+    if url.starts_with("file://") {
+        return String::new();
+    }
+
+    // For cloud URLs like s3://bucket/prefix → extract everything after bucket
+    if let Some(slash_pos) = after_scheme.find('/') {
+        let prefix = &after_scheme[slash_pos + 1..];
+        if prefix.is_empty() {
+            String::new()
+        } else if prefix.ends_with('/') {
+            prefix.to_string()
+        } else {
+            format!("{prefix}/")
+        }
+    } else {
+        String::new()
+    }
+}
+
 /// Extract SQL text from a `StreamingStatement` for storage in the connector manager.
 fn streaming_statement_to_sql(stmt: &StreamingStatement) -> String {
     match stmt {
@@ -1326,7 +1356,6 @@ impl LaminarDB {
 
     /// Build the `SHOW CHECKPOINT STATUS` metadata result.
     fn build_show_checkpoint_status(&self) -> Result<RecordBatch, DbError> {
-        use laminar_storage::checkpoint_store::CheckpointStore;
         let store = self.checkpoint_store();
         let (latest, list) = match &store {
             Some(s) => (s.load_latest().ok().flatten(), s.list().unwrap_or_default()),
@@ -2173,23 +2202,41 @@ impl LaminarDB {
     }
 
     /// Returns a checkpoint store instance, if checkpointing is configured.
-    #[must_use]
-    pub fn checkpoint_store(
-        &self,
-    ) -> Option<laminar_storage::checkpoint_store::FileSystemCheckpointStore> {
+    ///
+    /// Returns an [`ObjectStoreCheckpointStore`](laminar_storage::ObjectStoreCheckpointStore)
+    /// when `object_store_url` is set, otherwise a
+    /// [`FileSystemCheckpointStore`](laminar_storage::FileSystemCheckpointStore).
+    pub fn checkpoint_store(&self) -> Option<Box<dyn laminar_storage::CheckpointStore>> {
         let cp_config = self.config.checkpoint.as_ref()?;
-        let data_dir = cp_config
-            .data_dir
-            .clone()
-            .or_else(|| self.config.storage_dir.clone())
-            .unwrap_or_else(|| std::path::PathBuf::from("./data"));
         let max_retained = cp_config.max_retained.unwrap_or(3);
-        Some(
-            laminar_storage::checkpoint_store::FileSystemCheckpointStore::new(
-                &data_dir,
-                max_retained,
-            ),
-        )
+
+        if let Some(ref url) = self.config.object_store_url {
+            let obj_store = laminar_storage::object_store_factory::build_object_store(
+                url,
+                &self.config.object_store_options,
+            )
+            .ok()?;
+            let prefix = url_to_checkpoint_prefix(url);
+            Some(Box::new(
+                laminar_storage::checkpoint_store::ObjectStoreCheckpointStore::new(
+                    obj_store,
+                    prefix,
+                    max_retained,
+                ),
+            ))
+        } else {
+            let data_dir = cp_config
+                .data_dir
+                .clone()
+                .or_else(|| self.config.storage_dir.clone())
+                .unwrap_or_else(|| std::path::PathBuf::from("./data"));
+            Some(Box::new(
+                laminar_storage::checkpoint_store::FileSystemCheckpointStore::new(
+                    &data_dir,
+                    max_retained,
+                ),
+            ))
+        }
     }
 
     /// Triggers a streaming checkpoint that persists source offsets, sink
@@ -2304,21 +2351,47 @@ impl LaminarDB {
             use crate::checkpoint_coordinator::{
                 CheckpointConfig as CkpConfig, CheckpointCoordinator,
             };
-            use laminar_storage::checkpoint_store::FileSystemCheckpointStore;
 
-            let data_dir = cp_config
-                .data_dir
-                .clone()
-                .or_else(|| self.config.storage_dir.clone())
-                .unwrap_or_else(|| std::path::PathBuf::from("./data"));
             let max_retained = cp_config.max_retained.unwrap_or(3);
-            let store = FileSystemCheckpointStore::new(&data_dir, max_retained);
+
+            let store: Box<dyn laminar_storage::CheckpointStore> =
+                if let Some(ref url) = self.config.object_store_url {
+                    let obj_store =
+                        laminar_storage::object_store_factory::build_object_store(
+                            url,
+                            &self.config.object_store_options,
+                        )
+                        .map_err(|e| {
+                            DbError::Config(format!("object store: {e}"))
+                        })?;
+                    let prefix = url_to_checkpoint_prefix(url);
+                    Box::new(
+                        laminar_storage::checkpoint_store::ObjectStoreCheckpointStore::new(
+                            obj_store,
+                            prefix,
+                            max_retained,
+                        ),
+                    )
+                } else {
+                    let data_dir = cp_config
+                        .data_dir
+                        .clone()
+                        .or_else(|| self.config.storage_dir.clone())
+                        .unwrap_or_else(|| std::path::PathBuf::from("./data"));
+                    Box::new(
+                        laminar_storage::checkpoint_store::FileSystemCheckpointStore::new(
+                            &data_dir,
+                            max_retained,
+                        ),
+                    )
+                };
+
             let config = CkpConfig {
                 interval: cp_config.interval_ms.map(std::time::Duration::from_millis),
                 max_retained,
                 ..CkpConfig::default()
             };
-            let mut coord = CheckpointCoordinator::new(config, Box::new(store));
+            let mut coord = CheckpointCoordinator::new(config, store);
             coord.set_counters(Arc::clone(&self.counters));
             *self.coordinator.lock().await = Some(coord);
         }

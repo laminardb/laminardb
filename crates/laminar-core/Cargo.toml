@@ -27,13 +27,12 @@ jit = [
     "dep:cranelift-module", "dep:cranelift-native",
     "dep:datafusion-expr", "dep:datafusion-common",
 ]
-# Enable distributed delta mode (multi-node)
+# Enable distributed delta mode (multi-node) — heavy deps, server-only
 delta = [
     "dep:tonic", "dep:tonic-prost", "dep:prost", "dep:openraft", "dep:chitchat",
     "dep:tokio-util", "dep:xxhash-rust",
     "dep:tonic-build", "dep:tonic-prost-build", "dep:prost-build",
 ]
-
 [dependencies]
 # Performance critical - no allocations on hot path
 rustc-hash = { workspace = true }
@@ -88,7 +87,7 @@ datafusion-common = { workspace = true, optional = true }
 # Secondary indexes
 redb = { workspace = true }
 
-# Delta (optional, multi-node distributed mode)
+# Delta (optional, multi-node distributed mode — server-only)
 tonic = { workspace = true, optional = true }
 tonic-prost = { workspace = true, optional = true }
 prost = { workspace = true, optional = true }

@@ -4,6 +4,8 @@
 //! - `layout`: object-store checkpoint layout
 //! - `checkpointer`: Async checkpoint persistence via object stores
 
+/// Adaptive checkpoint interval tuning.
+pub mod adaptive;
 /// Async checkpoint persistence via object stores.
 pub mod checkpointer;
 /// Object-store checkpoint layout with UUID v7 identifiers.

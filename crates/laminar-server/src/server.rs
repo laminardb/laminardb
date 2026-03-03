@@ -17,39 +17,59 @@ use laminar_db::{DbError, LaminarDB, Profile};
 use crate::config::{
     ConfigError, LookupConfig, PipelineConfig, ServerConfig, SinkConfig, SourceConfig,
 };
+use crate::delta_config::{DeltaConfig, DeltaConfigError};
 use crate::http;
 use crate::reload::ReloadGuard;
 
-/// Handle to a running LaminarDB server.
+/// Handle to a running LaminarDB server (embedded or delta mode).
 ///
 /// Call [`wait_for_shutdown`](ServerHandle::wait_for_shutdown) to block until
 /// the server receives a shutdown signal (Ctrl-C).
-pub struct ServerHandle {
-    db: Arc<LaminarDB>,
-    api_handle: tokio::task::JoinHandle<()>,
-    watcher_handle: Option<tokio::task::JoinHandle<()>>,
+pub enum ServerHandle {
+    /// Embedded (single-node) mode.
+    Embedded {
+        /// LaminarDB engine.
+        db: Arc<LaminarDB>,
+        /// HTTP API task.
+        api_handle: tokio::task::JoinHandle<()>,
+        /// Config file watcher task.
+        watcher_handle: Option<tokio::task::JoinHandle<()>>,
+    },
+    /// Delta (multi-node) mode.
+    Delta(Box<crate::delta::DeltaHandle>),
 }
 
 impl ServerHandle {
     /// Block until `ctrl_c` is received, then gracefully shut down.
     pub async fn wait_for_shutdown(self) -> Result<(), ServerError> {
-        signal::ctrl_c()
-            .await
-            .map_err(|e| ServerError::Shutdown(format!("signal handler failed: {e}")))?;
+        match self {
+            Self::Embedded {
+                db,
+                api_handle,
+                watcher_handle,
+            } => {
+                signal::ctrl_c()
+                    .await
+                    .map_err(|e| ServerError::Shutdown(format!("signal handler failed: {e}")))?;
 
-        info!("Received shutdown signal, shutting down...");
+                info!("Received shutdown signal, shutting down...");
 
-        if let Some(wh) = &self.watcher_handle {
-            wh.abort();
+                if let Some(wh) = &watcher_handle {
+                    wh.abort();
+                }
+                db.shutdown()
+                    .await
+                    .map_err(|e| ServerError::Shutdown(e.to_string()))?;
+                api_handle.abort();
+
+                info!("Shutdown complete");
+                Ok(())
+            }
+            Self::Delta(handle) => (*handle)
+                .wait_for_shutdown()
+                .await
+                .map_err(|e| ServerError::Delta(e.to_string())),
         }
-        self.db
-            .shutdown()
-            .await
-            .map_err(|e| ServerError::Shutdown(e.to_string()))?;
-        self.api_handle.abort();
-
-        info!("Shutdown complete");
-        Ok(())
     }
 }
 
@@ -67,6 +87,16 @@ pub async fn run_server(
     config: ServerConfig,
     config_path: PathBuf,
 ) -> Result<ServerHandle, ServerError> {
+    // Check if delta mode is requested
+    let delta_cfg = DeltaConfig::from_server_config(&config)?;
+
+    if let Some(delta_cfg) = delta_cfg {
+        let handle = crate::delta::start_delta(config, delta_cfg, config_path)
+            .await
+            .map_err(|e| ServerError::Delta(e.to_string()))?;
+        return Ok(ServerHandle::Delta(Box::new(handle)));
+    }
+
     // 1. Build LaminarDB via builder API
     let mut builder = LaminarDB::builder();
 
@@ -106,6 +136,20 @@ pub async fn run_server(
     // Object store URL for non-file checkpoint URLs
     if !checkpoint_url.starts_with("file:///") && !checkpoint_url.is_empty() {
         builder = builder.object_store_url(checkpoint_url.clone());
+        if !config.checkpoint.storage.is_empty() {
+            builder = builder.object_store_options(config.checkpoint.storage.clone());
+        }
+    }
+
+    // Wire tiering config if present
+    if let Some(tiering) = &config.checkpoint.tiering {
+        builder = builder.tiering(laminar_db::TieringConfig {
+            hot_class: tiering.hot_class.clone(),
+            warm_class: tiering.warm_class.clone(),
+            cold_class: tiering.cold_class.clone(),
+            hot_retention_secs: tiering.hot_retention.as_secs(),
+            warm_retention_secs: tiering.warm_retention.as_secs(),
+        });
     }
 
     let db = builder
@@ -191,7 +235,7 @@ pub async fn run_server(
     };
     info!("Config file watcher started");
 
-    Ok(ServerHandle {
+    Ok(ServerHandle::Embedded {
         db,
         api_handle,
         watcher_handle,
@@ -392,6 +436,14 @@ pub enum ServerError {
     /// Configuration error.
     #[error(transparent)]
     Config(#[from] ConfigError),
+
+    /// Delta mode error.
+    #[error("delta mode error: {0}")]
+    Delta(String),
+
+    /// Delta configuration error.
+    #[error(transparent)]
+    DeltaConfig(#[from] DeltaConfigError),
 }
 
 // ---------------------------------------------------------------------------

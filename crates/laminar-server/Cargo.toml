@@ -16,7 +16,7 @@ path = "src/main.rs"
 
 [dependencies]
 # All LaminarDB crates
-laminar-core = { path = "../laminar-core", version = "0.17.0" }
+laminar-core = { path = "../laminar-core", version = "0.17.0", features = ["delta"] }
 laminar-sql = { path = "../laminar-sql", version = "0.17.0" }
 laminar-storage = { path = "../laminar-storage", version = "0.17.0" }
 laminar-connectors = { path = "../laminar-connectors", version = "0.17.0" }
@@ -59,6 +59,11 @@ chrono = { workspace = true }
 # File watching for hot reload
 notify = { workspace = true }
 
+# Delta mode: hostname discovery and unique node IDs
+gethostname = { workspace = true }
+uuid = { workspace = true }
+xxhash-rust = { workspace = true }
+
 # Vendored OpenSSL for musl cross-compilation (behind vendored-openssl feature)
 openssl = { version = "0.10", features = ["vendored"], optional = true }
 
@@ -80,6 +85,10 @@ postgres-cdc = ["laminar-db/postgres-cdc"]
 postgres-sink = ["laminar-db/postgres-sink"]
 mysql-cdc = ["laminar-db/mysql-cdc"]
 delta-lake = ["laminar-db/delta-lake"]
+# Cloud object store backends for checkpoints
+aws = ["laminar-db/aws"]
+gcs = ["laminar-db/gcs"]
+azure = ["laminar-db/azure"]
 # Performance features (OS-specific)
 io-uring = ["laminar-storage/io-uring"]     # Linux 5.10+: async I/O for WAL/checkpoints
 hwloc = ["laminar-core/hwloc"]              # Linux/macOS: NUMA topology discovery

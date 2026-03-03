@@ -43,6 +43,40 @@ pub enum Profile {
 }
 
 impl Profile {
+    /// Auto-detect the appropriate profile from configuration.
+    ///
+    /// Uses orthogonal signals (checkpoint URL scheme, presence of
+    /// discovery config) rather than requiring an explicit profile choice.
+    ///
+    /// | Signal | Detected Profile |
+    /// |--------|-----------------|
+    /// | `has_discovery` = true | `Delta` |
+    /// | `object_store_url` is `s3://`/`gs://`/`az://` | `Durable` |
+    /// | `object_store_url` is `file://` or `storage_dir` set | `Embedded` |
+    /// | None of the above | `BareMetal` |
+    #[must_use]
+    pub fn from_config(config: &LaminarConfig, has_discovery: bool) -> Self {
+        if has_discovery {
+            return Self::Delta;
+        }
+        if let Some(url) = &config.object_store_url {
+            if url.starts_with("s3://")
+                || url.starts_with("gs://")
+                || url.starts_with("az://")
+                || url.starts_with("abfs://")
+            {
+                return Self::Durable;
+            }
+            if url.starts_with("file://") {
+                return Self::Embedded;
+            }
+        }
+        if config.storage_dir.is_some() {
+            return Self::Embedded;
+        }
+        Self::BareMetal
+    }
+
     /// Validate that the compiled feature flags satisfy this profile's
     /// requirements. Returns an error if a required feature was not
     /// compiled in.
@@ -52,22 +86,13 @@ impl Profile {
     /// Returns [`ProfileError::FeatureNotCompiled`] if a required Cargo
     /// feature is missing.
     pub fn validate_features(self) -> Result<(), ProfileError> {
+        // Feature gates for durable/delta were removed — all profiles are
+        // always available. Heavy distributed deps (tonic, openraft, chitchat)
+        // are gated on laminar-core's `delta` feature, which the server binary
+        // enables unconditionally. Library users of laminar-db get lightweight
+        // builds without distributed infrastructure.
         match self {
-            Self::BareMetal | Self::Embedded => Ok(()),
-            Self::Durable => {
-                if cfg!(feature = "durable") {
-                    Ok(())
-                } else {
-                    Err(ProfileError::FeatureNotCompiled("durable".into()))
-                }
-            }
-            Self::Delta => {
-                if cfg!(feature = "delta") {
-                    Ok(())
-                } else {
-                    Err(ProfileError::FeatureNotCompiled("delta".into()))
-                }
-            }
+            Self::BareMetal | Self::Embedded | Self::Durable | Self::Delta => Ok(()),
         }
     }
 
@@ -233,19 +258,12 @@ mod tests {
     }
 
     #[test]
-    fn test_delta_requires_durable_feature() {
-        // When compiled without the `delta` feature, this should fail.
-        // In normal test builds (no `delta` feature), this checks the
-        // FeatureNotCompiled path.
-        let result = Profile::Delta.validate_features();
-        if cfg!(feature = "delta") {
-            assert!(result.is_ok());
-        } else {
-            assert!(matches!(
-                result.unwrap_err(),
-                ProfileError::FeatureNotCompiled(_)
-            ));
-        }
+    fn test_all_profiles_validate_features() {
+        // Feature gates removed — all profiles always pass validation.
+        assert!(Profile::BareMetal.validate_features().is_ok());
+        assert!(Profile::Embedded.validate_features().is_ok());
+        assert!(Profile::Durable.validate_features().is_ok());
+        assert!(Profile::Delta.validate_features().is_ok());
     }
 
     #[test]
@@ -278,5 +296,81 @@ mod tests {
         Profile::Durable.apply_defaults(&mut config);
         // User explicitly set 999 — should not be overridden
         assert_eq!(config.default_buffer_size, 999);
+    }
+
+    #[test]
+    fn test_from_config_bare_metal() {
+        let config = LaminarConfig::default();
+        assert_eq!(Profile::from_config(&config, false), Profile::BareMetal);
+    }
+
+    #[test]
+    fn test_from_config_embedded_storage_dir() {
+        let config = LaminarConfig {
+            storage_dir: Some(std::path::PathBuf::from("/tmp/data")),
+            ..LaminarConfig::default()
+        };
+        assert_eq!(Profile::from_config(&config, false), Profile::Embedded);
+    }
+
+    #[test]
+    fn test_from_config_embedded_file_url() {
+        let config = LaminarConfig {
+            object_store_url: Some("file:///tmp/checkpoints".to_string()),
+            ..LaminarConfig::default()
+        };
+        assert_eq!(Profile::from_config(&config, false), Profile::Embedded);
+    }
+
+    #[test]
+    fn test_from_config_durable_s3() {
+        let config = LaminarConfig {
+            object_store_url: Some("s3://my-bucket/prefix".to_string()),
+            ..LaminarConfig::default()
+        };
+        assert_eq!(Profile::from_config(&config, false), Profile::Durable);
+    }
+
+    #[test]
+    fn test_from_config_durable_gs() {
+        let config = LaminarConfig {
+            object_store_url: Some("gs://my-bucket/prefix".to_string()),
+            ..LaminarConfig::default()
+        };
+        assert_eq!(Profile::from_config(&config, false), Profile::Durable);
+    }
+
+    #[test]
+    fn test_from_config_durable_az() {
+        let config = LaminarConfig {
+            object_store_url: Some("az://container/prefix".to_string()),
+            ..LaminarConfig::default()
+        };
+        assert_eq!(Profile::from_config(&config, false), Profile::Durable);
+    }
+
+    #[test]
+    fn test_from_config_durable_abfs() {
+        let config = LaminarConfig {
+            object_store_url: Some("abfs://container/prefix".to_string()),
+            ..LaminarConfig::default()
+        };
+        assert_eq!(Profile::from_config(&config, false), Profile::Durable);
+    }
+
+    #[test]
+    fn test_from_config_delta() {
+        let config = LaminarConfig::default();
+        assert_eq!(Profile::from_config(&config, true), Profile::Delta);
+    }
+
+    #[test]
+    fn test_from_config_delta_overrides_url() {
+        let config = LaminarConfig {
+            object_store_url: Some("s3://bucket/prefix".to_string()),
+            ..LaminarConfig::default()
+        };
+        // Discovery takes priority over URL-based detection
+        assert_eq!(Profile::from_config(&config, true), Profile::Delta);
     }
 }
