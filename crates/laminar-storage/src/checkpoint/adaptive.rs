@@ -303,7 +303,7 @@ mod tests {
         let mut tuner = AdaptiveCheckpointer::new(config_10s());
         // First checkpoint — no previous time, rate stays 0
         tuner.record_checkpoint(Duration::from_millis(100), 0);
-        assert_eq!(tuner.changelog_rate_bytes_per_sec(), 0.0);
+        assert!(tuner.changelog_rate_bytes_per_sec().abs() < f64::EPSILON);
 
         // Simulate passage of time by advancing last_checkpoint_time
         tuner.last_checkpoint_time = Instant::now().checked_sub(Duration::from_secs(5));
