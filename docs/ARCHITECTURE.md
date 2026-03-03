@@ -2,7 +2,7 @@
 
 ## Overview
 
-LaminarDB is an embedded streaming database designed for sub-microsecond latency. It combines the deployment simplicity of SQLite with the streaming capabilities of Apache Flink.
+LaminarDB is an embedded streaming database designed for sub-microsecond latency. You link it into your application like SQLite, but instead of querying stored data, you're querying data as it arrives.
 
 ## Design Principles
 
@@ -15,7 +15,7 @@ LaminarDB is an embedded streaming database designed for sub-microsecond latency
 
 ## Three-Ring Architecture
 
-LaminarDB separates concerns into three concentric rings, each with different latency budgets and constraints:
+Three concentric rings, each with different latency budgets:
 
 ```
 +------------------------------------------------------------------+
@@ -55,7 +55,7 @@ LaminarDB separates concerns into three concentric rings, each with different la
 
 ### Ring 0: Hot Path
 
-The event processing path where latency matters most. All code in Ring 0 runs on a CPU-pinned reactor thread.
+All code here runs on a CPU-pinned reactor thread.
 
 **Components:**
 - **Reactor Loop** -- Single-threaded event loop that pulls batches from sources, runs them through operators, and emits results. CPU-pinned via the thread-per-core runtime (`laminar-core/src/tpc/`).
@@ -82,7 +82,7 @@ The event processing path where latency matters most. All code in Ring 0 runs on
 
 ### Ring 1: Background
 
-Handles durability and I/O without blocking the hot path. Runs on Tokio async runtime.
+Durability and I/O, never blocking the hot path. Runs on Tokio.
 
 **Components:**
 - **Checkpoint Manager** -- Incremental checkpointing with directory-based snapshots. Unified `CheckpointCoordinator` orchestrates two-phase commit across all operators and sinks (`laminar-db/src/checkpoint_coordinator.rs`).
@@ -97,7 +97,7 @@ Handles durability and I/O without blocking the hot path. Runs on Tokio async ru
 
 ### Ring 2: Control Plane
 
-Administrative and observability functions with no latency requirements.
+Admin and observability. No latency requirements.
 
 **Components (planned -- crate stubs exist, no implementation yet):**
 - **Admin API** -- REST API via Axum with Swagger UI (`laminar-admin/`)
@@ -109,7 +109,7 @@ Note: While the Ring 2 crate stubs (`laminar-auth`, `laminar-admin`, `laminar-ob
 
 ## Data Flow
 
-An event's journey through LaminarDB:
+How an event moves through the system:
 
 ```
                          Ring 0 (< 1us)
@@ -180,7 +180,7 @@ laminar-server        Standalone binary: CLI args, logging init (skeleton with T
 
 ### LaminarDB (Database Facade)
 
-The primary user-facing type. Manages the lifecycle of sources, streams, sinks, and the streaming pipeline.
+The main entry point. Owns sources, streams, sinks, and the pipeline lifecycle.
 
 ```rust
 let db = LaminarDB::open()?;
@@ -233,7 +233,7 @@ let db = LaminarDB::builder()
 
 ### State Store
 
-All operator state goes through the `StateStore` trait, optionally wrapped in `ChangelogAwareStore` for zero-allocation changelog capture:
+All operator state goes through the `StateStore` trait. Wrapping it in `ChangelogAwareStore` captures every mutation for checkpointing:
 
 ```rust
 pub trait StateStore: Send {
@@ -251,7 +251,7 @@ Implementations:
 
 ### Streaming Channels
 
-Lock-free communication between components:
+Lock-free channels between components:
 
 - **RingBuffer** -- Fixed-capacity, cache-line-padded ring buffer
 - **SPSC Channel** -- Single-producer single-consumer, zero-allocation on hot path
@@ -260,7 +260,7 @@ Lock-free communication between components:
 
 ### DAG Pipeline
 
-The DAG executor connects operators into a directed acyclic graph:
+Operators wired into a DAG:
 
 - **Core DAG Topology** -- Nodes (operators) and edges (channels) with type-safe wiring
 - **Multicast & Routing** -- Fan-out and key-based routing between DAG nodes
@@ -270,7 +270,7 @@ The DAG executor connects operators into a directed acyclic graph:
 
 ### Connector SDK
 
-Custom connectors implement the `SourceConnector` and `SinkConnector` traits:
+Custom connectors implement `SourceConnector` and `SinkConnector`:
 
 ```rust
 #[async_trait]
@@ -296,11 +296,11 @@ pub trait SinkConnector: Send {
 }
 ```
 
-The SDK provides retry policies, rate limiting, circuit breakers, and a test harness.
+The SDK adds retry policies, rate limiting, circuit breakers, and a test harness.
 
 ### Lookup Tables
 
-Lookup tables provide enrichment join support with multiple caching strategies:
+Enrichment joins with multiple caching strategies:
 
 - **Full cache (Ring 0)** -- foyer in-memory cache with S3-FIFO eviction
 - **Hybrid cache (Ring 1)** -- foyer HybridCache with disk-backed overflow
@@ -321,7 +321,7 @@ Pre-configured deployment tiers:
 
 ## Streaming SQL
 
-LaminarDB extends standard SQL (via sqlparser-rs) with streaming constructs:
+SQL parsing goes through sqlparser-rs with these streaming extensions:
 
 | Extension | Syntax | Example |
 |-----------|--------|---------|
@@ -388,7 +388,7 @@ Key-based routing ensures all events for a given key are processed on the same c
 
 ## Exactly-Once Semantics
 
-LaminarDB provides exactly-once processing through:
+Exactly-once processing works through:
 
 1. **Source offsets** -- Tracked per-source, persisted in checkpoint manifests
 2. **Changelog capture** -- `ChangelogAwareStore` records every state mutation
@@ -399,7 +399,7 @@ LaminarDB provides exactly-once processing through:
 
 ## Delta Architecture (Distributed Mode)
 
-When enabled with the `delta` feature, LaminarDB extends to multi-node operation:
+With the `delta` feature enabled, multi-node operation:
 
 - **Discovery** -- Static configuration, gossip-based (chitchat), or Kafka group discovery
 - **Coordination** -- Raft-based metadata consensus via openraft
@@ -408,4 +408,4 @@ When enabled with the `delta` feature, LaminarDB extends to multi-node operation
 - **Cross-Node Aggregation** -- Gossip partial aggregates and gRPC fan-out
 - **Inter-Node RPC** -- gRPC service definitions for remote lookups, barrier forwarding, aggregate fan-out
 
-The Delta architecture maintains Ring 0's sub-500ns hot path guarantees while adding distributed coordination in Ring 1 and Ring 2.
+Distributed coordination runs in Ring 1 and Ring 2 — Ring 0's sub-500ns hot path is not affected.

@@ -5,7 +5,7 @@
 
 ## Summary
 
-The LaminarDB SQL parser is **very comprehensive** for streaming use cases, with 30+ aggregate functions, all window types (TUMBLE/HOP/SESSION), and full EMIT clause support. However, several SQL features commonly used in timeseries analytics are missing.
+The LaminarDB SQL parser covers most streaming SQL needs for streaming use cases, with 30+ aggregate functions, all window types (TUMBLE/HOP/SESSION), and full EMIT clause support. However, several SQL features commonly used in timeseries analytics are missing.
 
 ---
 

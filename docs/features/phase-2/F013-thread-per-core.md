@@ -14,7 +14,7 @@
 
 ## Summary
 
-Implement thread-per-core architecture where each CPU core runs a dedicated reactor with its own state partition. This enables linear scaling and eliminates lock contention.
+Each CPU core runs a dedicated reactor with its own state partition. No shared state, no locks, linear scaling.
 
 ## Goals
 

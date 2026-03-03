@@ -4,17 +4,23 @@
   <meta charset="UTF-8">
   <meta name="viewport" content="width=device-width, initial-scale=1.0">
   <title>LaminarDB — The Embedded Streaming Database | Real-Time SQL Processing</title>
-  <meta name="description" content="Process streaming data with sub-microsecond latency using familiar SQL. Embedded like SQLite, powerful like Flink. Python and Rust APIs. Apache 2.0 open source.">
-  <meta name="keywords" content="streaming database, embedded database, real-time analytics, stream processing, Rust, Python, SQL, Apache Arrow, DataFusion, sub-microsecond latency, Kafka, CDC, Delta Lake, PyArrow">
+  <meta name="description" content="Process streaming data with sub-microsecond latency using familiar SQL. Embedded like SQLite, streams like Flink. Python and Rust APIs. Apache 2.0 open source.">
+  <meta name="keywords" content="streaming database, embedded database, real-time analytics, stream processing, Rust database, Python streaming, SQL stream processing, Apache Arrow, DataFusion, sub-microsecond latency, Kafka connector, CDC, Delta Lake, PyArrow, tumbling window, session window, ASOF join, embedded analytics, event processing, streaming SQL engine">
+  <meta name="robots" content="index, follow, max-image-preview:large, max-snippet:-1">
+  <meta name="author" content="LaminarDB Contributors">
+  <meta name="theme-color" content="#0a0a1a">
   <link rel="canonical" href="https://laminardb.io">
 
   <!-- Open Graph -->
   <meta property="og:title" content="LaminarDB — The Embedded Streaming Database | Real-Time SQL Processing">
-  <meta property="og:description" content="Process streaming data with sub-microsecond latency using familiar SQL. Embedded like SQLite, powerful like Flink. Python and Rust APIs.">
+  <meta property="og:description" content="Process streaming data with sub-microsecond latency using familiar SQL. Embedded like SQLite, streams like Flink. Python and Rust APIs.">
   <meta property="og:image" content="https://laminardb.io/img/logo.jpg">
   <meta property="og:url" content="https://laminardb.io">
   <meta property="og:type" content="website">
   <meta property="og:site_name" content="LaminarDB">
+  <meta property="og:locale" content="en_US">
+  <meta property="og:image:width" content="1200">
+  <meta property="og:image:height" content="630">
 
   <!-- Twitter -->
   <meta name="twitter:card" content="summary_large_image">
@@ -36,19 +42,44 @@
   <!-- Styles -->
   <link rel="stylesheet" href="css/style.css">
 
-  <!-- JSON-LD -->
+  <!-- JSON-LD: SoftwareApplication -->
   <script type="application/ld+json">
   {
     "@context": "https://schema.org",
     "@type": "SoftwareApplication",
     "name": "LaminarDB",
-    "description": "High-performance embedded streaming SQL database with sub-microsecond latency. Python and Rust APIs.",
+    "description": "High-performance embedded streaming SQL database with sub-microsecond latency. Process streaming data with familiar SQL, zero infrastructure, and Python or Rust APIs.",
     "applicationCategory": "Database",
+    "applicationSubCategory": "Streaming Database",
     "operatingSystem": "Linux, macOS, Windows",
     "license": "https://opensource.org/licenses/Apache-2.0",
     "url": "https://laminardb.io",
     "codeRepository": "https://github.com/laminardb/laminardb",
-    "programmingLanguage": ["Rust", "Python", "SQL"]
+    "programmingLanguage": ["Rust", "Python", "SQL"],
+    "softwareVersion": "0.18.0",
+    "datePublished": "2026-01-01",
+    "dateModified": "2026-03-03",
+    "offers": {
+      "@type": "Offer",
+      "price": "0",
+      "priceCurrency": "USD"
+    },
+    "author": {
+      "@type": "Organization",
+      "name": "LaminarDB Contributors",
+      "url": "https://github.com/laminardb"
+    },
+    "keywords": "streaming database, embedded database, real-time SQL, stream processing, Apache Arrow, DataFusion"
+  }
+  </script>
+  <!-- JSON-LD: WebSite (enables sitelinks search box) -->
+  <script type="application/ld+json">
+  {
+    "@context": "https://schema.org",
+    "@type": "WebSite",
+    "name": "LaminarDB",
+    "url": "https://laminardb.io",
+    "description": "The embedded streaming SQL database. Sub-microsecond latency, zero infrastructure, Python and Rust APIs."
   }
   </script>
 </head>
@@ -85,7 +116,7 @@
           <path d="M4 32 C12 32,14 30,22 30 C30 30,32 34,36 34" stroke="url(#nav-lg)" stroke-width="2.5" fill="none" stroke-linecap="round" opacity=".5"/>
         </svg>
         <span>LaminarDB</span>
-        <span class="version-badge">v0.15</span>
+        <span class="version-badge">v0.18</span>
       </a>
 
       <nav class="nav-links" aria-label="Main navigation">
@@ -138,14 +169,14 @@
 
       <div class="hero-content">
         <a href="https://github.com/laminardb/laminardb/releases" class="hero-eyebrow" target="_blank" rel="noopener">
-          <span class="eyebrow-badge">v0.15</span>
-          <span>WebSocket connectors, schema inference, and 185 features shipped</span>
+          <span class="eyebrow-badge">v0.18</span>
+          <span>Delta Lake, checkpoint barriers, and 189 features shipped</span>
           <span class="eyebrow-arrow">&rarr;</span>
         </a>
 
         <h1>
-          <span class="gradient-text">Stop stitching.</span><br>
-          Start streaming.
+          <span class="gradient-text">Embedded Streaming Database.</span><br>
+          Sub-Microsecond SQL.
         </h1>
 
         <p class="hero-subtitle">
@@ -190,7 +221,7 @@
             <div class="hero-metric-label">events/sec per core</div>
           </div>
           <div class="hero-metric">
-            <div class="hero-metric-value">185</div>
+            <div class="hero-metric-value">189</div>
             <div class="hero-metric-label">features shipped</div>
           </div>
           <div class="hero-metric">
@@ -348,7 +379,7 @@
       <div class="container">
         <div class="section-header text-center">
           <div class="section-label reveal">Use Cases</div>
-          <h2 class="section-title reveal">What will you <span class="gradient-text">build</span>?</h2>
+          <h2 class="section-title reveal">Real-time stream processing <span class="gradient-text">use cases</span></h2>
           <p class="section-desc centered reveal">
             From fraud detection to live dashboards, LaminarDB powers real-time workloads
             that used to require a distributed cluster.
@@ -400,7 +431,7 @@
       <div class="container">
         <div class="section-header text-center">
           <div class="section-label reveal">Performance</div>
-          <h2 class="section-title reveal">Engineered for <span class="gradient-text">every nanosecond</span></h2>
+          <h2 class="section-title reveal">Streaming database <span class="gradient-text">benchmarks</span></h2>
           <p class="section-desc centered reveal">
             Criterion benchmarks from <code>cargo bench</code>. Thread-per-core architecture
             with CPU pinning, lock-free SPSC queues, and arena allocators.
@@ -792,7 +823,7 @@ pipeline.run()</code></pre>
               </div>
               <div>
                 <h4>Native PyArrow Integration</h4>
-                <p>Query results arrive as PyArrow Tables. Seamless interop with pandas, Polars, DuckDB, and the entire PyData stack.</p>
+                <p>Query results arrive as PyArrow Tables. Works directly with pandas, Polars, DuckDB, and the rest of the PyData stack.</p>
               </div>
             </div>
             <div class="python-feature">
@@ -906,7 +937,7 @@ pipeline.run()</code></pre>
               <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><polyline points="22 12 18 12 15 21 9 3 6 12 2 12"/></svg>
             </div>
             <h4>Adaptive JIT</h4>
-            <p>Cranelift compiles SQL plans to native code in the background. Seamless hot-swap from interpreted to compiled execution.</p>
+            <p>Cranelift compiles SQL plans to native code in the background. Hot-swaps from interpreted to compiled with zero downtime.</p>
           </div>
         </div>
       </div>
@@ -917,7 +948,7 @@ pipeline.run()</code></pre>
       <div class="container">
         <div class="section-header text-center">
           <div class="section-label reveal">Connectors</div>
-          <h2 class="section-title reveal">Connect to <span class="gradient-text">everything</span></h2>
+          <h2 class="section-title reveal">Data source and sink <span class="gradient-text">connectors</span></h2>
           <p class="section-desc centered reveal">
             Feature-gated connectors with exactly-once semantics via two-phase commit.
             Build custom connectors with the SDK.
@@ -981,7 +1012,7 @@ pipeline.run()</code></pre>
       <div class="container">
         <div class="section-header text-center">
           <div class="section-label reveal">Features</div>
-          <h2 class="section-title reveal">185 features. <span class="gradient-text">76% complete.</span></h2>
+          <h2 class="section-title reveal">189 features. <span class="gradient-text">76% complete.</span></h2>
           <p class="section-desc centered reveal">
             From core engine primitives to distributed delta mode. Every feature is specified,
             implemented, and tested.
@@ -1040,7 +1071,7 @@ pipeline.run()</code></pre>
       <div class="container">
         <div class="section-header text-center">
           <div class="section-label reveal">Comparison</div>
-          <h2 class="section-title reveal">Why developers <span class="gradient-text">switch</span></h2>
+          <h2 class="section-title reveal">LaminarDB vs Flink vs Kafka Streams <span class="gradient-text">comparison</span></h2>
           <p class="section-desc centered reveal">
             Embedded deployment, sub-microsecond latency, dual Python + Rust APIs,
             and zero ops. No cluster to manage, no infrastructure to maintain.
@@ -1282,7 +1313,7 @@ for batch in db.subscribe("summary"):
           </svg>
           <span>LaminarDB</span>
         </a>
-        <p>The embedded streaming database. Sub-microsecond SQL stream processing in Rust and Python.</p>
+        <p>LaminarDB is an open-source embedded streaming SQL database. Sub-microsecond latency, zero infrastructure, with native Rust and Python APIs. Apache 2.0 licensed.</p>
       </div>
       <div>
         <h4>Resources</h4>
@@ -1316,22 +1347,22 @@ for batch in db.subscribe("summary"):
       <p>
         &copy; 2026 LaminarDB Contributors &middot;
         <a href="https://github.com/laminardb/laminardb/blob/main/LICENSE" target="_blank" rel="noopener">Apache 2.0 License</a> &middot;
-        v0.15.0
+        v0.18.0
       </p>
     </div>
   </footer>
 
-  <!-- Prism.js -->
-  <script src="https://cdnjs.cloudflare.com/ajax/libs/prism/1.29.0/prism.min.js"></script>
-  <script src="https://cdnjs.cloudflare.com/ajax/libs/prism/1.29.0/components/prism-sql.min.js"></script>
-  <script src="https://cdnjs.cloudflare.com/ajax/libs/prism/1.29.0/components/prism-rust.min.js"></script>
-  <script src="https://cdnjs.cloudflare.com/ajax/libs/prism/1.29.0/components/prism-bash.min.js"></script>
-  <script src="https://cdnjs.cloudflare.com/ajax/libs/prism/1.29.0/components/prism-python.min.js"></script>
+  <!-- Prism.js (defer for better Core Web Vitals) -->
+  <script defer src="https://cdnjs.cloudflare.com/ajax/libs/prism/1.29.0/prism.min.js"></script>
+  <script defer src="https://cdnjs.cloudflare.com/ajax/libs/prism/1.29.0/components/prism-sql.min.js"></script>
+  <script defer src="https://cdnjs.cloudflare.com/ajax/libs/prism/1.29.0/components/prism-rust.min.js"></script>
+  <script defer src="https://cdnjs.cloudflare.com/ajax/libs/prism/1.29.0/components/prism-bash.min.js"></script>
+  <script defer src="https://cdnjs.cloudflare.com/ajax/libs/prism/1.29.0/components/prism-python.min.js"></script>
 
   <!-- Playground -->
-  <script src="js/playground.js"></script>
+  <script defer src="js/playground.js"></script>
 
   <!-- Main JS -->
-  <script src="js/main.js"></script>
+  <script defer src="js/main.js"></script>
 </body>
 </html>

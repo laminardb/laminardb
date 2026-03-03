@@ -4,7 +4,7 @@ Core streaming engine for LaminarDB -- reactor, operators, state stores, and str
 
 ## Overview
 
-This is the Ring 0 crate containing all latency-critical components. Everything here is designed for sub-microsecond execution with zero heap allocations on the hot path.
+Ring 0 crate. Everything here targets sub-microsecond execution with zero heap allocations on the hot path.
 
 ## Key Modules
 
@@ -48,7 +48,7 @@ This is the Ring 0 crate containing all latency-critical components. Everything 
 
 ## Ring Placement
 
-This crate operates in **Ring 0 (Hot Path)**. All code must:
+All code in this crate must:
 - Make zero heap allocations
 - Use no locks (SPSC queues for communication)
 - Avoid system calls on the fast path

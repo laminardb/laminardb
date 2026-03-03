@@ -32,7 +32,7 @@ Ring 0 hot path continues processing. Schema history is tracked in the
 - SQL DDL for schema mutations: `ALTER SOURCE ... ADD COLUMN`, `DROP COLUMN`, `ALTER COLUMN TYPE`, `REFRESH SCHEMA`
 - Schema version history tracking with queryable `laminar_catalog.schema_history`
 - Safe handling of all evolution cases: add nullable, add with default, drop, rename (field-ID sources only), widen, reject narrow
-- `ColumnProjection` mapping from old to new schema for seamless batch translation
+- `ColumnProjection` mapping from old to new schema for transparent batch translation
 
 ## Non-Goals
 

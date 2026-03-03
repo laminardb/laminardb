@@ -2536,7 +2536,7 @@ if let WalMessage::Keepalive(ka) = msg {
 ### Phase 4: Initial Snapshot (2-3 days)
 - [ ] `perform_snapshot()` with SERIALIZABLE transaction
 - [ ] Batched table reading with progress logging
-- [ ] Snapshot LSN recording for seamless transition to streaming
+- [ ] Snapshot LSN recording for transition to streaming
 - [ ] Snapshot mode configuration (initial, never, always)
 - [ ] Unit tests for snapshot logic
 - [ ] Integration test: snapshot + streaming transition

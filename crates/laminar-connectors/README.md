@@ -4,7 +4,7 @@ External system connectors for LaminarDB -- Kafka, CDC, WebSocket, lakehouse sin
 
 ## Overview
 
-Provides source and sink connectors for integrating LaminarDB with external systems. Each connector implements the `SourceConnector` or `SinkConnector` trait and supports exactly-once semantics via two-phase commit.
+Source and sink connectors for Kafka, CDC, WebSocket, lakehouse sinks, and custom connectors. Each connector implements the `SourceConnector` or `SinkConnector` trait and supports exactly-once semantics via two-phase commit.
 
 ## Connectors
 
@@ -52,8 +52,6 @@ Provides source and sink connectors for integrating LaminarDB with external syst
 | `error_handling` | Dead letter queue and error routing for malformed records |
 
 ## Schema Framework
-
-The schema module provides a pluggable framework for format decoding and schema management:
 
 | Sub-module | Description |
 |------------|-------------|

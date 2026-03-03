@@ -4,7 +4,7 @@ Storage layer for LaminarDB -- WAL, checkpointing, and recovery.
 
 ## Overview
 
-Ring 1 crate handling all durability concerns. Provides write-ahead logging with per-core segments, incremental checkpointing with directory-based snapshots, and checkpoint manifests. Designed to never block Ring 0 operations.
+Ring 1 durability: write-ahead logging with per-core segments, incremental checkpointing with directory-based snapshots, and checkpoint manifests. Never blocks Ring 0.
 
 Note: Lakehouse sinks (Delta Lake, Iceberg) are in `laminar-connectors`, not here. This crate handles LaminarDB's internal durability.
 

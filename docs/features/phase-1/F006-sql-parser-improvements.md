@@ -47,7 +47,7 @@ The current F006 implementation uses a simplified parser that has several critic
    - Transform GROUP BY TUMBLE(...) into appropriate operators
    - Add window_start/window_end column generation
 
-3. **Comprehensive Testing**
+3. **Testing**
    - Test all SQL edge cases
    - Validate error messages
    - Performance benchmarks for parsing
@@ -137,7 +137,7 @@ EMIT AFTER WATERMARK;
 - [ ] Create proper AST visitor for streaming keywords
 - [ ] Implement tokenizer extensions for streaming SQL
 - [ ] Add proper error handling with line/column info
-- [ ] Create comprehensive test suite
+- [ ] Create test suite
 
 ### Step 2: Integrate with DataFusion (2 weeks)
 - [ ] Create custom LogicalPlan nodes
@@ -148,7 +148,7 @@ EMIT AFTER WATERMARK;
 ### Step 3: Production Hardening (1 week)
 - [ ] Add SQL injection protection
 - [ ] Performance optimization
-- [ ] Comprehensive error messages
+- [ ] Clear error messages
 - [ ] Documentation and examples
 
 ## Alternative: Use Existing Streaming SQL Parser
