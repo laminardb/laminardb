@@ -20,7 +20,7 @@ LaminarDB promises "Full SQL Support" as a key differentiator from competitors l
 1. **Production Requirements**
    - Must parse complex streaming SQL queries correctly
    - Must provide clear error messages with line/column information
-   - Must integrate seamlessly with DataFusion
+   - Must integrate with DataFusion without hacks
    - Must support all promised SQL features
 
 2. **Performance Requirements**
@@ -87,7 +87,7 @@ LaminarDB promises "Full SQL Support" as a key differentiator from competitors l
 
 This approach:
 1. Maintains compatibility with DataFusion
-2. Leverages existing parsing infrastructure
+2. Reuses existing parsing infrastructure
 3. Benefits from sqlparser community improvements
 4. Allows incremental enhancement
 
@@ -95,7 +95,7 @@ Implementation strategy:
 1. Create a `StreamingSqlDialect` that adds keywords: TUMBLE, HOP, SESSION, WATERMARK, EMIT
 2. Extend the parser with streaming-specific statement types
 3. Create a translation layer to DataFusion's LogicalPlan
-4. Add comprehensive tests for streaming SQL
+4. Add tests for streaming SQL
 
 ## Consequences
 
@@ -130,7 +130,7 @@ Implementation strategy:
 - Integration with DataFusion logical plans
 
 ### Phase 3: Production Hardening (2 weeks)
-- Comprehensive error messages
+- Clear error messages
 - Performance optimization
 - SQL injection prevention
 - Prepared statement support

@@ -57,7 +57,7 @@ LaminarDB development is organized into phases, each building on the previous. D
 
 ## Phase 2: Production Hardening -- COMPLETE
 
-**Goal**: Make the engine production-ready with advanced features.
+**Goal**: Harden the engine with advanced window types, joins, per-core WAL, exactly-once sinks, and performance infrastructure.
 
 **Completed Features (38/38):**
 - Thread-per-core architecture with CPU pinning (F013-F015)

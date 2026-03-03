@@ -71,7 +71,7 @@ during stream-table joins via DataFusion `TableProvider`.
 **Pros:**
 - Zero memory usage for reference data
 - Always-fresh data
-- Leverages existing DataFusion federation crate
+- Reuses existing DataFusion federation crate
 
 **Cons:**
 - Network round-trip per lookup (1-100ms) — **incompatible with Ring 0 latency**

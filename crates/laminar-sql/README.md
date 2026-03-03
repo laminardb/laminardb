@@ -4,7 +4,7 @@ SQL layer for LaminarDB with streaming extensions.
 
 ## Overview
 
-Extends standard SQL (via sqlparser-rs) with streaming constructs like tumbling windows, session windows, watermarks, EMIT clauses, and ASOF joins. Integrates with Apache DataFusion for query planning and execution.
+Streaming SQL extensions on top of sqlparser-rs: tumbling windows, session windows, watermarks, EMIT clauses, ASOF joins. DataFusion handles query planning and execution.
 
 ## Key Modules
 

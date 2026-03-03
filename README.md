@@ -26,7 +26,7 @@ Or in your `Cargo.toml`:
 
 ```toml
 [dependencies]
-laminar-db = "0.16"
+laminar-db = "0.18"
 tokio = { version = "1", features = ["full"] }
 ```
 
@@ -80,7 +80,7 @@ cargo run
 
 ### Python Quick Start
 
-LaminarDB also has Python bindings via [laminardb-python](https://github.com/laminardb/laminardb-python):
+Python bindings via [laminardb-python](https://github.com/laminardb/laminardb-python):
 
 ```bash
 pip install laminardb
@@ -111,7 +111,7 @@ See the [Python README](https://github.com/laminardb/laminardb-python) for the f
 
 ### Streaming SQL
 
-LaminarDB extends standard SQL with streaming primitives. All window types, join types, and EMIT strategies listed below are implemented and tested.
+Standard SQL with streaming extensions. All window types, join types, and EMIT strategies below are implemented and tested.
 
 #### Window Types
 
@@ -239,7 +239,7 @@ See [docs/SQL_REFERENCE.md](docs/SQL_REFERENCE.md) for the complete SQL dialect 
 
 ### Watermarks and Event Time
 
-LaminarDB uses event-time processing with watermarks to handle out-of-order data.
+Event-time processing with watermarks handles out-of-order data.
 
 ```sql
 -- Bounded out-of-orderness: allow up to 5 seconds of late data
@@ -260,7 +260,7 @@ Late data can be dropped (default) or redirected to a side output.
 
 ## Connectors
 
-LaminarDB connects to external systems via feature-gated connectors. Each connector implements the `SourceConnector` or `SinkConnector` trait with exactly-once semantics via two-phase commit.
+Feature-gated connectors for external systems. Each implements the `SourceConnector` or `SinkConnector` trait with exactly-once semantics via two-phase commit.
 
 ### Source Connectors
 
@@ -345,20 +345,20 @@ Cloud storage backends: S3 (`delta-lake-s3`), Azure ADLS (`delta-lake-azure`), G
 
 ### Connector SDK
 
-Build custom connectors using the SDK with operational resilience built in:
+Build custom connectors with the SDK:
 
 ```rust
 use laminar_connectors::connector::{SourceConnector, SinkConnector};
 use laminar_connectors::sdk::{RetryPolicy, CircuitBreaker, RateLimiter};
 ```
 
-The SDK provides retry policies with exponential backoff, circuit breakers, rate limiters, and a test harness for connector development.
+Includes retry policies, circuit breakers, rate limiters, and a test harness.
 
 ---
 
 ## Schema Framework
 
-LaminarDB includes a pluggable schema framework for format decoding, schema inference, and schema evolution.
+Pluggable format decoding, schema inference, and schema evolution.
 
 ### Format Decoders
 
@@ -382,7 +382,7 @@ LaminarDB includes a pluggable schema framework for format decoding, schema infe
 
 ## Architecture
 
-LaminarDB uses a three-ring architecture to separate latency-critical event processing from background I/O and control plane operations:
+Three-ring architecture separating latency-critical event processing from background I/O and the control plane:
 
 ```
 +------------------------------------------------------------------+
@@ -427,7 +427,7 @@ See [docs/ARCHITECTURE.md](docs/ARCHITECTURE.md) for the full design.
 
 ## Checkpointing and Recovery
 
-LaminarDB provides exactly-once semantics through a coordinated checkpointing system:
+Exactly-once semantics through coordinated checkpointing:
 
 1. **Ring 0 Changelog** -- Every state mutation is captured by `ChangelogAwareStore` (~2-5ns overhead per mutation)
 2. **Per-Core WAL** -- Each CPU core writes to its own WAL segment with CRC32C checksums and torn write detection
@@ -453,13 +453,13 @@ let db = LaminarDB::builder()
 
 ## JIT Compilation
 
-LaminarDB optionally compiles DataFusion logical plans into native machine code via Cranelift for Ring 0 execution. Enable with the `jit` feature flag.
+DataFusion logical plans can be compiled to native machine code via Cranelift for Ring 0 execution. Enable with the `jit` feature flag.
 
 The `AdaptiveQueryRunner` runs queries interpreted first, compiles in the background, and hot-swaps to compiled execution when ready -- zero downtime during compilation.
 
 ```toml
 [dependencies]
-laminar-db = { version = "0.16", features = ["jit"] }
+laminar-db = { version = "0.18", features = ["jit"] }
 ```
 
 ---
@@ -510,7 +510,7 @@ struct MySourceConfig {
 
 ## Distributed Mode (Delta Architecture)
 
-LaminarDB extends from single-process to multi-node via the Delta architecture. Enable with the `delta` feature flag.
+Single-process to multi-node via the Delta architecture. Enable with the `delta` feature flag.
 
 Implemented:
 - Gossip-based node discovery (chitchat)
@@ -522,7 +522,7 @@ Implemented:
 
 ```toml
 [dependencies]
-laminar-db = { version = "0.16", features = ["delta"] }
+laminar-db = { version = "0.18", features = ["delta"] }
 ```
 
 ---
@@ -621,7 +621,7 @@ laminar-server            (binary: laminar-db + laminar-admin + laminar-auth + l
 
 ## Project Status
 
-LaminarDB is in active development. Here is the current phase progress:
+Active development. Current phase progress:
 
 | Phase | Description | Features | Status |
 |-------|-------------|----------|--------|
@@ -726,7 +726,7 @@ cargo bench
 
 ## Contributing
 
-We welcome contributions! See [CONTRIBUTING.md](CONTRIBUTING.md) for development setup, code style guidelines, Ring 0 rules, and the pull request process.
+See [CONTRIBUTING.md](CONTRIBUTING.md) for development setup, code style, Ring 0 rules, and the PR process.
 
 ---
 

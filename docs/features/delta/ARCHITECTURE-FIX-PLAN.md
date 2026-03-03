@@ -719,7 +719,7 @@ Each fix must include:
 
 | Date | Decision | Rationale |
 |------|----------|-----------|
-| 2026-02-17 | Changelog-based incremental snapshots over `im::OrdMap` | Preserves FxHashMap O(1) get performance; leverages existing `ChangelogAwareStore` |
+| 2026-02-17 | Changelog-based incremental snapshots over `im::OrdMap` | Preserves FxHashMap O(1) get performance; reuses existing `ChangelogAwareStore` |
 | 2026-02-17 | Memcomparable key encoding over rkyv for index keys | rkyv doesn't preserve lexicographic order for numeric types |
 | 2026-02-17 | `WatermarkPassThrough` variant over silent discard | Type-safe, self-documenting, prevents future regressions |
 | 2026-02-17 | `AtomicU128` packed barrier over Mutex | Lock-free, single atomic operation, no contention |

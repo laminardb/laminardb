@@ -4,7 +4,7 @@
 
 ## Executive Summary
 
-LaminarDB occupies a unique position: **no existing system offers all of embedded-first deployment, thread-per-core architecture, sub-microsecond latency, SQL-native streaming, and lakehouse integration**.
+The closest alternatives are either distributed-only (Flink, RisingWave, Materialize) or lack SQL (Kafka Streams). LaminarDB is embedded, thread-per-core, sub-microsecond, and SQL-native.
 
 ## Competitive Matrix
 
@@ -176,4 +176,4 @@ LaminarDB occupies a unique position: **no existing system offers all of embedde
 2. **Simplicity**: Single binary, no cluster, immediate productivity
 3. **Flexibility**: Embedded or standalone, multiple sources/sinks
 4. **Open Source**: Apache 2.0, no licensing concerns
-5. **Modern Stack**: Rust, Arrow, DataFusion - cutting-edge foundations
+5. **Modern Stack**: Rust, Arrow, DataFusion

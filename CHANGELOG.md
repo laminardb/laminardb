@@ -43,7 +43,7 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 ## [0.15.0] - 2026-02-22
 
 ### Added
-- Comprehensive project documentation (README, ARCHITECTURE, CONTRIBUTING, crate READMEs)
+- Project documentation (README, ARCHITECTURE, CONTRIBUTING, crate READMEs)
 - PR template and SECURITY.md
 - Interactive data flow playground on docs website
 - WebSocket source and sink connectors registered in connector registry

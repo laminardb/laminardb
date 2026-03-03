@@ -451,7 +451,7 @@ No error counters exist. There is no Prometheus/metrics integration for error tr
 14. **Add Clippy lints** — `unwrap_used = "deny"` (after migration)
 15. **Ban `eprintln!`** — Replace with `tracing::warn!`
 
-### P3 — Polish (World-Class)
+### P3 — Polish
 
 16. **Ring 0 zero-alloc error type** — For hot path error reporting
 17. **Error snapshot debug mode** — Dump pipeline state on error

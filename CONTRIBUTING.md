@@ -1,6 +1,6 @@
 # Contributing to LaminarDB
 
-Thank you for your interest in contributing to LaminarDB! This guide covers everything you need to get started.
+This guide covers development setup, code style, and the pull request process.
 
 ## Prerequisites
 
@@ -189,4 +189,4 @@ Use the [GitHub issue templates](https://github.com/laminardb/laminardb/issues/n
 
 ## Questions?
 
-Feel free to open an issue for any questions!
+Open an issue on GitHub.

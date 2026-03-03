@@ -4,7 +4,7 @@ Unified database facade for LaminarDB.
 
 ## Overview
 
-This crate provides `LaminarDB`, the primary user-facing type that ties together the SQL parser, query planner, DataFusion context, streaming infrastructure, and connector registry into a single interface. It is the entry point for all LaminarDB applications.
+`LaminarDB` lives here -- the main entry point that wires together the SQL parser, query planner, DataFusion context, streaming infrastructure, and connector registry.
 
 ## Key Types
 

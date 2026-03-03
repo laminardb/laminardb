@@ -109,7 +109,7 @@ Gossip discovery, Raft consensus, partition ownership, distributed checkpoints, 
 All Phase 1 P0 issues resolved:
 - WAL durability fixes (fdatasync, CRC32C, torn write detection)
 - Watermark persistence in WAL commits and checkpoint metadata
-- Recovery integration tests (6 comprehensive tests)
+- Recovery integration tests (6 tests covering all recovery paths)
 
 ### Remaining
 
