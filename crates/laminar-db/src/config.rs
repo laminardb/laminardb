@@ -54,8 +54,8 @@ impl Default for TieringConfig {
             hot_class: "STANDARD".to_string(),
             warm_class: "STANDARD".to_string(),
             cold_class: String::new(),
-            hot_retention_secs: 86400,     // 24h
-            warm_retention_secs: 604_800,  // 7d
+            hot_retention_secs: 86400,    // 24h
+            warm_retention_secs: 604_800, // 7d
         }
     }
 }

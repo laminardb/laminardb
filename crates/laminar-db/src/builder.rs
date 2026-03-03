@@ -245,7 +245,10 @@ impl std::fmt::Debug for LaminarDbBuilder {
             .field("profile", &self.profile)
             .field("profile_explicit", &self.profile_explicit)
             .field("object_store_url", &self.object_store_url)
-            .field("object_store_options_count", &self.object_store_options.len())
+            .field(
+                "object_store_options_count",
+                &self.object_store_options.len(),
+            )
             .field("config_vars_count", &self.config_vars.len())
             .field("connector_callbacks", &self.connector_callbacks.len())
             .field("custom_udfs", &self.custom_udfs.len())

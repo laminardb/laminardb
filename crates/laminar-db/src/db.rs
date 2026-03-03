@@ -36,9 +36,7 @@ const STATE_STOPPED: u8 = 4;
 /// For `file:///some/path` → `""` (local FS uses the path directly).
 fn url_to_checkpoint_prefix(url: &str) -> String {
     // Strip scheme
-    let after_scheme = url
-        .find("://")
-        .map_or(url, |i| &url[i + 3..]);
+    let after_scheme = url.find("://").map_or(url, |i| &url[i + 3..]);
 
     // For file:// URLs, the prefix is empty (LocalFileSystem already has the root)
     if url.starts_with("file://") {
@@ -2356,14 +2354,11 @@ impl LaminarDB {
 
             let store: Box<dyn laminar_storage::CheckpointStore> =
                 if let Some(ref url) = self.config.object_store_url {
-                    let obj_store =
-                        laminar_storage::object_store_factory::build_object_store(
-                            url,
-                            &self.config.object_store_options,
-                        )
-                        .map_err(|e| {
-                            DbError::Config(format!("object store: {e}"))
-                        })?;
+                    let obj_store = laminar_storage::object_store_factory::build_object_store(
+                        url,
+                        &self.config.object_store_options,
+                    )
+                    .map_err(|e| DbError::Config(format!("object store: {e}")))?;
                     let prefix = url_to_checkpoint_prefix(url);
                     Box::new(
                         laminar_storage::checkpoint_store::ObjectStoreCheckpointStore::new(

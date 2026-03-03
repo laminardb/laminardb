@@ -100,11 +100,14 @@ async fn validate_checkpoints_and_exit(config: &config::ServerConfig) -> Result<
     };
 
     info!("Validating checkpoints...");
-    let report = store.recover_latest_validated().map_err(|e| {
-        anyhow::anyhow!("validation failed: {e}")
-    })?;
+    let report = store
+        .recover_latest_validated()
+        .map_err(|e| anyhow::anyhow!("validation failed: {e}"))?;
 
-    info!("Examined {} checkpoint(s) in {:?}", report.examined, report.elapsed);
+    info!(
+        "Examined {} checkpoint(s) in {:?}",
+        report.examined, report.elapsed
+    );
     for (id, reason) in &report.skipped {
         info!("  INVALID checkpoint {id}: {reason}");
     }
@@ -115,9 +118,9 @@ async fn validate_checkpoints_and_exit(config: &config::ServerConfig) -> Result<
     }
 
     // Also run orphan detection
-    let orphans = store.cleanup_orphans().map_err(|e| {
-        anyhow::anyhow!("orphan cleanup failed: {e}")
-    })?;
+    let orphans = store
+        .cleanup_orphans()
+        .map_err(|e| anyhow::anyhow!("orphan cleanup failed: {e}"))?;
     if orphans > 0 {
         info!("Cleaned up {orphans} orphaned state file(s)");
     }
@@ -161,9 +164,7 @@ fn build_checkpoint_store(
             .unwrap_or_default();
         Some(Box::new(
             laminar_storage::checkpoint_store::ObjectStoreCheckpointStore::new(
-                obj_store,
-                prefix,
-                3,
+                obj_store, prefix, 3,
             ),
         ))
     }
