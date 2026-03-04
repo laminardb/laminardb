@@ -11,7 +11,7 @@
 
 mod backpressure;
 mod core_handle;
-#[cfg(all(target_os = "linux", feature = "io-uring"))]
+#[cfg(all(test, target_os = "linux", feature = "io-uring"))]
 mod core_ring_handler;
 mod partitioned_router;
 mod router;
