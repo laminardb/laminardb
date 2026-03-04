@@ -40,6 +40,7 @@ mod db;
 mod eowc_state;
 // Reopened `impl LaminarDB` modules — split from db.rs
 mod metrics_api;
+mod pipeline_callback;
 mod show_commands;
 mod error;
 mod handle;
