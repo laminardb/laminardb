@@ -55,9 +55,12 @@
 //! let mut reactor = ThreeRingReactor::new(0, config)?;
 //!
 //! // Submit operations to appropriate rings
-//! reactor.submit_to_latency(recv_entry)?;
-//! reactor.submit_to_main(wal_write_entry)?;
-//! reactor.submit_to_poll(storage_read_entry)?;
+//! // SAFETY: SQE buffers remain valid until CQEs are reaped.
+//! unsafe {
+//!     reactor.submit_to_latency(recv_entry)?;
+//!     reactor.submit_to_main(wal_write_entry)?;
+//!     reactor.submit_to_poll(storage_read_entry)?;
+//! }
 //!
 //! // Poll completions (latency ring always first)
 //! let completions = reactor.poll_all()?;

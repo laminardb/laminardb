@@ -74,6 +74,15 @@ pub enum IoUringError {
     /// Pending operation not found.
     #[error("Pending operation not found: {0}")]
     PendingNotFound(u64),
+
+    /// Data exceeds buffer capacity.
+    #[error("Buffer too small: need {needed} bytes but buffer is {capacity} bytes")]
+    BufferTooSmall {
+        /// Bytes required.
+        needed: usize,
+        /// Buffer capacity.
+        capacity: usize,
+    },
 }
 
 impl IoUringError {

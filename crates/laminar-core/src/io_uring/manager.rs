@@ -6,11 +6,9 @@
 
 use io_uring::opcode;
 use io_uring::types::{self, Fd};
-use io_uring::IoUring;
 use rustc_hash::FxHashMap;
 use std::io;
 use std::os::fd::RawFd;
-use std::sync::atomic::{AtomicU64, Ordering};
 use std::time::{Duration, Instant};
 
 use super::buffer_pool::{BufferPoolStats, RegisteredBufferPool};
@@ -180,7 +178,7 @@ pub struct CoreRingManager {
     /// Pending operations tracking.
     pending: FxHashMap<u64, PendingOp>,
     /// Next `user_data` ID.
-    next_id: AtomicU64,
+    next_id: u64,
     /// Metrics.
     metrics: RingMetrics,
     /// Whether the ring is closed.
@@ -202,15 +200,14 @@ impl CoreRingManager {
         // Create main ring
         let main_ring = IoUringRing::new(config)?;
 
-        // Create buffer pool for main ring
+        // Create buffer pool and register buffers on the actual main ring.
+        // SAFETY: The buffer pool's memory outlives the ring registration because
+        // the pool is stored alongside the ring in this struct, and Rust drops
+        // fields in declaration order (main_ring drops before buffer_pool would,
+        // but we clear pending ops in close() before either drops).
         let buffer_pool = if config.buffer_count > 0 {
-            // Clone the ring for buffer registration
-            let mut ring_for_buffers = IoUring::builder()
-                .build(config.ring_entries)
-                .map_err(IoUringError::RingCreation)?;
-
             Some(RegisteredBufferPool::new(
-                &mut ring_for_buffers,
+                main_ring.ring_mut(),
                 config.buffer_size,
                 config.buffer_count,
             )?)
@@ -218,22 +215,18 @@ impl CoreRingManager {
             None
         };
 
-        // Create IOPOLL ring if requested and mode allows
+        // Create IOPOLL ring if requested and mode allows, registering buffers
+        // on the actual iopoll ring (not a temporary throw-away ring).
         let (iopoll_ring, iopoll_buffer_pool) = if config.mode.uses_iopoll() {
             let iopoll_config = IoUringConfig {
                 mode: RingMode::IoPoll,
                 ..config.clone()
             };
-            let ring = IoUringRing::new(&iopoll_config)?;
+            let mut ring = IoUringRing::new(&iopoll_config)?;
 
             let pool = if config.buffer_count > 0 {
-                let mut ring_for_buffers = IoUring::builder()
-                    .setup_iopoll()
-                    .build(config.ring_entries)
-                    .map_err(IoUringError::RingCreation)?;
-
                 Some(RegisteredBufferPool::new(
-                    &mut ring_for_buffers,
+                    ring.ring_mut(),
                     config.buffer_size,
                     config.buffer_count,
                 )?)
@@ -253,7 +246,7 @@ impl CoreRingManager {
             iopoll_ring,
             iopoll_buffer_pool,
             pending: FxHashMap::default(),
-            next_id: AtomicU64::new(0),
+            next_id: 0,
             metrics: RingMetrics::default(),
             closed: false,
         })
@@ -644,14 +637,35 @@ impl CoreRingManager {
     }
 
     /// Close the ring manager.
+    ///
+    /// Drains all pending operations before closing to prevent in-flight
+    /// operations from accessing freed memory.
     pub fn close(&mut self) {
+        if self.closed {
+            return;
+        }
         self.closed = true;
+
+        // Drain pending operations to ensure the kernel is not still accessing
+        // any user-space buffers before we drop them.
+        if !self.pending.is_empty() {
+            // Best-effort drain — ignore errors during shutdown.
+            let _ = self.main_ring.ring_mut().submit_and_wait(0);
+            for _ in self.main_ring.ring_mut().completion() {}
+            if let Some(ref mut iopoll) = self.iopoll_ring {
+                let _ = iopoll.ring_mut().submit_and_wait(0);
+                for _ in iopoll.ring_mut().completion() {}
+            }
+        }
+
         self.pending.clear();
     }
 
     /// Generate the next `user_data` ID.
-    fn next_user_data(&self) -> u64 {
-        self.next_id.fetch_add(1, Ordering::Relaxed)
+    fn next_user_data(&mut self) -> u64 {
+        let id = self.next_id;
+        self.next_id += 1;
+        id
     }
 }
 

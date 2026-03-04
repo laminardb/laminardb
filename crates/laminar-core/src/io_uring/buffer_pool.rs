@@ -5,9 +5,8 @@
 
 use io_uring::types::Fd;
 use io_uring::{opcode, IoUring};
-use std::collections::VecDeque;
+use std::collections::{HashSet, VecDeque};
 use std::os::fd::RawFd;
-use std::sync::atomic::{AtomicU64, Ordering};
 
 use super::error::IoUringError;
 
@@ -41,7 +40,7 @@ pub struct RegisteredBufferPool {
     /// Free buffer indices.
     free_list: VecDeque<u16>,
     /// Next `user_data` ID for tracking operations.
-    next_id: AtomicU64,
+    next_id: u64,
     /// Total buffers in pool.
     total_count: usize,
     /// Buffers currently acquired.
@@ -50,6 +49,9 @@ pub struct RegisteredBufferPool {
     acquisitions: u64,
     /// Cumulative number of times acquisition failed (pool exhausted).
     exhaustions: u64,
+    /// Buffers currently submitted to io_uring (debug-only tracking).
+    /// Used to detect use-after-free: releasing a buffer that is still in-flight.
+    in_flight: HashSet<u16>,
 }
 
 impl RegisteredBufferPool {
@@ -110,11 +112,12 @@ impl RegisteredBufferPool {
             buffers,
             buffer_size,
             free_list,
-            next_id: AtomicU64::new(0),
+            next_id: 0,
             total_count: buffer_count,
             acquired_count: 0,
             acquisitions: 0,
             exhaustions: 0,
+            in_flight: HashSet::new(),
         })
     }
 
@@ -153,16 +156,38 @@ impl RegisteredBufferPool {
 
     /// Release a buffer back to the pool.
     ///
+    /// The buffer must not be in-flight (submitted to io_uring but not yet
+    /// completed). In debug builds, this is checked via assertion.
+    ///
     /// # Panics
     ///
-    /// Panics if the buffer index is invalid.
+    /// Panics in debug builds if the buffer index is invalid or the buffer
+    /// is still in-flight.
     pub fn release(&mut self, buf_index: u16) {
         debug_assert!(
             (buf_index as usize) < self.total_count,
             "Invalid buffer index"
         );
+        debug_assert!(
+            !self.in_flight.contains(&buf_index),
+            "Releasing buffer {buf_index} that is still in-flight — \
+             wait for the CQE before releasing"
+        );
         self.free_list.push_back(buf_index);
         self.acquired_count = self.acquired_count.saturating_sub(1);
+    }
+
+    /// Mark a buffer as in-flight (submitted to io_uring).
+    ///
+    /// Call this after submitting a read/write operation that uses this buffer.
+    /// Call [`complete_in_flight`] when the CQE arrives.
+    pub fn mark_in_flight(&mut self, buf_index: u16) {
+        self.in_flight.insert(buf_index);
+    }
+
+    /// Mark a buffer as no longer in-flight (CQE received).
+    pub fn complete_in_flight(&mut self, buf_index: u16) {
+        self.in_flight.remove(&buf_index);
     }
 
     /// Get a reference to a buffer by index.
@@ -229,13 +254,16 @@ impl RegisteredBufferPool {
             .build()
             .user_data(user_data);
 
-        // SAFETY: We're submitting a valid SQE with properly registered buffer.
+        // SAFETY: We're submitting a valid SQE with a properly registered buffer.
+        // The buffer at buf_index was registered with this ring during pool creation
+        // and remains valid because the pool owns the backing Vec<u8>.
         unsafe {
             ring.submission()
                 .push(&entry)
                 .map_err(|_| IoUringError::SubmissionQueueFull)?;
         }
 
+        self.mark_in_flight(buf_index);
         Ok(user_data)
     }
 
@@ -278,13 +306,16 @@ impl RegisteredBufferPool {
             .build()
             .user_data(user_data);
 
-        // SAFETY: We're submitting a valid SQE with properly registered buffer.
+        // SAFETY: We're submitting a valid SQE with a properly registered buffer.
+        // The buffer at buf_index was registered with this ring during pool creation
+        // and remains valid because the pool owns the backing Vec<u8>.
         unsafe {
             ring.submission()
                 .push(&entry)
                 .map_err(|_| IoUringError::SubmissionQueueFull)?;
         }
 
+        self.mark_in_flight(buf_index);
         Ok(user_data)
     }
 
@@ -319,8 +350,10 @@ impl RegisteredBufferPool {
     }
 
     /// Generate the next `user_data` ID.
-    fn next_user_data(&self) -> u64 {
-        self.next_id.fetch_add(1, Ordering::Relaxed)
+    fn next_user_data(&mut self) -> u64 {
+        let id = self.next_id;
+        self.next_id += 1;
+        id
     }
 
     /// Get statistics about the buffer pool.
@@ -340,8 +373,18 @@ impl RegisteredBufferPool {
 
 impl Drop for RegisteredBufferPool {
     fn drop(&mut self) {
-        // Buffers will be unregistered when the ring is closed
-        // The Vec<Vec<u8>> will be dropped automatically
+        // Buffer memory is heap-allocated Vec<u8> that drops automatically.
+        // `unregister_buffers()` is NOT called here because the io_uring ring
+        // may already be dropped (field drop order in CoreRingManager: ring drops
+        // before pool). The ring's own drop handles kernel-side cleanup.
+        // The manager is responsible for draining in-flight operations before
+        // dropping either the ring or the pool.
+        debug_assert!(
+            self.acquired_count == 0,
+            "RegisteredBufferPool dropped with {} buffers still acquired — \
+             possible in-flight I/O operations referencing freed memory",
+            self.acquired_count,
+        );
     }
 }
 

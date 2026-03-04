@@ -46,6 +46,16 @@ impl IoUringRing {
             RingMode::SqPollIoPoll => create_sqpoll_iopoll_ring(config)?,
         };
 
+        // Check for FEAT_NODROP: without this feature, the kernel may silently
+        // drop CQEs when the completion queue overflows, causing completed I/O
+        // operations to be lost without notification.
+        if !ring.params().is_feature_nodrop() {
+            tracing::warn!(
+                "io_uring: FEAT_NODROP not supported — CQE overflow may silently \
+                 drop completions. Consider upgrading to Linux 5.5+."
+            );
+        }
+
         Ok(Self {
             ring,
             mode: config.mode,
@@ -161,9 +171,17 @@ fn create_sqpoll_ring(config: &IoUringConfig) -> Result<StandardIoUring, IoUring
         builder.setup_single_issuer();
     }
 
-    builder
-        .build(config.ring_entries)
-        .map_err(IoUringError::RingCreation)
+    builder.build(config.ring_entries).map_err(|e| {
+        if e.raw_os_error() == Some(libc::EPERM) {
+            IoUringError::FeatureNotSupported {
+                feature: "SQPOLL".to_string(),
+                required_version: "5.11+ with CAP_SYS_NICE (or kernel.io_uring_group sysctl)"
+                    .to_string(),
+            }
+        } else {
+            IoUringError::RingCreation(e)
+        }
+    })
 }
 
 /// Create an `io_uring` ring with IOPOLL mode for `NVMe` storage.
@@ -234,9 +252,17 @@ fn create_sqpoll_iopoll_ring(config: &IoUringConfig) -> Result<StandardIoUring, 
         builder.setup_single_issuer();
     }
 
-    builder
-        .build(config.ring_entries)
-        .map_err(IoUringError::RingCreation)
+    builder.build(config.ring_entries).map_err(|e| {
+        if e.raw_os_error() == Some(libc::EPERM) {
+            IoUringError::FeatureNotSupported {
+                feature: "SQPOLL+IOPOLL".to_string(),
+                required_version: "5.11+ with CAP_SYS_NICE (or kernel.io_uring_group sysctl)"
+                    .to_string(),
+            }
+        } else {
+            IoUringError::RingCreation(e)
+        }
+    })
 }
 
 /// Probe kernel for supported `io_uring` features.

@@ -188,9 +188,19 @@ mod linux_impl {
                 .acquire_buffer()
                 .map_err(|e| SinkError::WriteFailed(format!("Failed to acquire buffer: {e}")))?;
 
-            // Copy data to buffer
-            let len = bytes.len().min(buf.len());
-            buf[..len].copy_from_slice(&bytes[..len]);
+            // Fail on truncation instead of silently losing data.
+            if bytes.len() > buf.len() {
+                self.ring_manager.release_buffer(buf_index);
+                return Err(SinkError::WriteFailed(
+                    IoUringError::BufferTooSmall {
+                        needed: bytes.len(),
+                        capacity: buf.len(),
+                    }
+                    .to_string(),
+                ));
+            }
+            let len = bytes.len();
+            buf[..len].copy_from_slice(&bytes);
 
             // Submit write
             let fd = self.file.as_raw_fd();
