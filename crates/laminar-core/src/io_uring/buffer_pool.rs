@@ -494,6 +494,12 @@ mod tests {
         // Can acquire again
         let (idx, _) = pool.acquire().unwrap();
         assert_eq!(idx, indices[0]);
+
+        // Release all before drop
+        for &i in &indices[1..] {
+            pool.release(i);
+        }
+        pool.release(idx);
     }
 
     #[test]
@@ -584,11 +590,15 @@ mod tests {
         assert_eq!(stats.available_count, 3);
 
         pool.release(idx);
-        let _ = pool.acquire().unwrap();
-        let _ = pool.acquire().unwrap();
+        let (a, _) = pool.acquire().unwrap();
+        let (b, _) = pool.acquire().unwrap();
         let stats = pool.stats();
         assert_eq!(stats.acquisitions, 3);
         assert_eq!(stats.exhaustions, 0);
+
+        // Release all before drop
+        pool.release(a);
+        pool.release(b);
     }
 
     #[test]
@@ -616,6 +626,10 @@ mod tests {
         assert_eq!(stats.exhaustions, 2); // One from acquire(), one from try_acquire()
         assert_eq!(stats.acquired_count, 2);
         assert_eq!(stats.available_count, 0);
+
+        // Release all before drop
+        pool.release(0);
+        pool.release(1);
     }
 
     #[test]
