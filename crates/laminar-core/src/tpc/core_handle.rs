@@ -38,7 +38,7 @@ use crate::alloc::HotPathGuard;
 use crate::budget::TaskBudget;
 use crate::checkpoint::CheckpointBarrier;
 use crate::numa::NumaTopology;
-use crate::operator::{CheckpointCompleteData, Event, Operator, Output};
+use crate::operator::{CheckpointCompleteData, Event, Operator, OperatorState, Output};
 use crate::reactor::{Reactor, ReactorConfig};
 
 use super::backpressure::{
@@ -616,6 +616,17 @@ fn core_thread_main(
     // Reusable buffer for reactor outputs (avoids per-poll Vec allocation)
     let mut poll_buffer: Vec<Output> = Vec::with_capacity(256);
 
+    // Pre-allocated checkpoint data to avoid Box::new on the hot path.
+    // The Box is taken when a CheckpointRequest arrives and replenished
+    // after the inbox drain loop (still infrequent — once per checkpoint cycle).
+    let mut checkpoint_slot: Option<Box<CheckpointCompleteData>> =
+        Some(Box::new(CheckpointCompleteData {
+            checkpoint_id: 0,
+            operator_states: Vec::new(),
+        }));
+    // Reusable buffer for operator states (avoids Vec alloc per checkpoint)
+    let mut checkpoint_states_buf: Vec<OperatorState> = Vec::new();
+
     // Track the last source_idx seen for tagging reactor outputs.
     // When events from multiple sources are interleaved, reactor outputs
     // are attributed to source 0 (the coordinator resolves this).
@@ -672,14 +683,19 @@ fn core_thread_main(
                     had_work = true;
                 }
                 CoreMessage::CheckpointRequest(checkpoint_id) => {
-                    // Snapshot all operator states and push to outbox
-                    // for Ring 1 to persist via WAL.
-                    let operator_states = reactor.trigger_checkpoint();
-                    let checkpoint_output =
-                        Output::CheckpointComplete(Box::new(CheckpointCompleteData {
-                            checkpoint_id,
-                            operator_states,
-                        }));
+                    // Snapshot operator states into the reusable buffer,
+                    // then move them into the pre-allocated Box to avoid
+                    // any heap allocation on Ring 0.
+                    reactor.trigger_checkpoint_into(&mut checkpoint_states_buf);
+                    let mut data = checkpoint_slot.take().unwrap_or_else(|| {
+                        Box::new(CheckpointCompleteData {
+                            checkpoint_id: 0,
+                            operator_states: Vec::new(),
+                        })
+                    });
+                    data.checkpoint_id = checkpoint_id;
+                    std::mem::swap(&mut data.operator_states, &mut checkpoint_states_buf);
+                    let checkpoint_output = Output::CheckpointComplete(data);
                     if ctx
                         .outbox
                         .push(TaggedOutput {
@@ -743,6 +759,16 @@ fn core_thread_main(
         // This signals to senders that we have capacity for more
         if messages_processed > 0 {
             ctx.credit_gate.release(messages_processed);
+        }
+
+        // Replenish checkpoint slot if it was consumed.
+        // This allocation happens outside the inbox drain loop and only
+        // after a checkpoint (infrequent — typically every few seconds).
+        if checkpoint_slot.is_none() {
+            checkpoint_slot = Some(Box::new(CheckpointCompleteData {
+                checkpoint_id: 0,
+                operator_states: Vec::new(),
+            }));
         }
 
         // Process events in reactor (reuses poll_buffer capacity across iterations)

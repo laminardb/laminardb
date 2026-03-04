@@ -380,6 +380,16 @@ impl Reactor {
         self.operators.iter().map(|op| op.checkpoint()).collect()
     }
 
+    /// Triggers a checkpoint, appending operator states into a reusable buffer.
+    ///
+    /// Like [`trigger_checkpoint`](Self::trigger_checkpoint) but avoids
+    /// allocating a new `Vec` on every call — the caller provides a buffer
+    /// whose capacity is reused across checkpoint cycles.
+    pub fn trigger_checkpoint_into(&mut self, buf: &mut Vec<OperatorState>) {
+        buf.clear();
+        buf.extend(self.operators.iter().map(|op| op.checkpoint()));
+    }
+
     /// Get current processing time in microseconds since reactor start
     #[allow(clippy::cast_possible_truncation)] // Saturating conversion handles overflow on next line
     fn get_processing_time(&self) -> i64 {
