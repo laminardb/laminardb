@@ -83,9 +83,6 @@ pub mod schema;
 /// Connector registry with factory pattern.
 pub mod registry;
 
-/// Connector runtime for lifecycle management.
-pub mod runtime;
-
 /// Testing utilities (mock connectors, helpers).
 #[cfg(any(test, feature = "testing"))]
 pub mod testing;

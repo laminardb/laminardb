@@ -46,9 +46,6 @@
 //! // Use with LookupJoinOperator in laminar-core
 //! ```
 
-/// CDC-to-cache adapter for lookup table refresh.
-pub mod cdc_adapter;
-
 /// PostgreSQL lookup source with connection pooling and predicate pushdown.
 #[cfg(feature = "postgres-cdc")]
 pub mod postgres_source;
