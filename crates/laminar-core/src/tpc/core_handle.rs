@@ -114,8 +114,8 @@ impl Default for CoreConfig {
         Self {
             core_id: 0,
             cpu_affinity: None,
-            inbox_capacity: 65536,
-            outbox_capacity: 65536,
+            inbox_capacity: 8192,
+            outbox_capacity: 8192,
             reactor_config: ReactorConfig::default(),
             backpressure: BackpressureConfig::default(),
             numa_aware: false,
@@ -142,6 +142,8 @@ pub struct CoreHandle {
     credit_gate: Arc<CreditGate>,
     /// Thread handle (None if thread hasn't started or has been joined)
     thread: Option<JoinHandle<Result<(), TpcError>>>,
+    /// Core thread's `Thread` handle for `unpark()` wakeups.
+    core_thread_handle: thread::Thread,
     /// Shutdown flag
     shutdown: Arc<AtomicBool>,
     /// Events processed counter
@@ -214,6 +216,10 @@ impl CoreHandle {
                 message: e.to_string(),
             })?;
 
+        // Capture the thread handle for unpark() wakeups before we store
+        // the JoinHandle (which consumes it on join).
+        let core_thread_handle = thread.thread().clone();
+
         // Wait for thread to signal it's running
         while !is_running.load(Ordering::Acquire) {
             thread::yield_now();
@@ -226,6 +232,7 @@ impl CoreHandle {
             outbox,
             credit_gate,
             thread: Some(thread),
+            core_thread_handle,
             shutdown,
             events_processed,
             outputs_dropped,
@@ -249,6 +256,15 @@ impl CoreHandle {
     #[must_use]
     pub fn is_running(&self) -> bool {
         self.is_running.load(Ordering::Acquire)
+    }
+
+    /// Returns the core thread's handle for `unpark()` wakeups.
+    ///
+    /// Source I/O threads call `unpark()` on this handle after pushing
+    /// to the inbox SPSC queue, waking the core from `park_timeout()`.
+    #[must_use]
+    pub fn core_thread_handle(&self) -> &thread::Thread {
+        &self.core_thread_handle
     }
 
     /// Returns the number of events processed by this core.
@@ -452,6 +468,8 @@ impl CoreHandle {
         self.shutdown.store(true, Ordering::Release);
         // Also send a shutdown message to wake up the thread
         let _ = self.inbox.push(CoreMessage::Shutdown);
+        // Unpark the core thread in case it's sleeping in park_timeout()
+        self.core_thread_handle.unpark();
     }
 
     /// Waits for the core thread to finish.
@@ -487,6 +505,8 @@ impl Drop for CoreHandle {
         self.shutdown.store(true, Ordering::Release);
         // Try to send shutdown message (may fail if queue is full, that's OK)
         let _ = self.inbox.push(CoreMessage::Shutdown);
+        // Unpark the core thread in case it's sleeping in park_timeout()
+        self.core_thread_handle.unpark();
 
         // Join the thread if we haven't already
         if let Some(handle) = self.thread.take() {
@@ -600,6 +620,12 @@ fn core_thread_main(
     // When events from multiple sources are interleaved, reactor outputs
     // are attributed to source 0 (the coordinator resolves this).
     let mut last_source_idx: usize = 0;
+
+    // Tiered idle strategy: tracks consecutive iterations with no work.
+    // 0..64   → spin_loop() (PAUSE/YIELD hint, ~ns wake)
+    // 64..128 → thread::yield_now() (OS scheduler yield, ~μs wake)
+    // 128+    → thread::park_timeout(1ms) (sleep, woken by unpark())
+    let mut idle_spins: u32 = 0;
 
     // Main loop
     loop {
@@ -730,12 +756,20 @@ fn core_thread_main(
             had_work = true;
         }
 
-        // If no work was done, emit a CPU spin hint (PAUSE on x86,
-        // YIELD on ARM) instead of the heavier yield_now() syscall.
-        // Each core thread owns its CPU, so a lightweight hint is
-        // preferred over a kernel-mediated yield.
-        if !had_work {
-            std::hint::spin_loop();
+        // Tiered idle: progressively back off to avoid burning CPU
+        // when no work is available. Source I/O threads call unpark()
+        // after pushing to the inbox, giving sub-ms wake latency.
+        if had_work {
+            idle_spins = 0;
+        } else {
+            idle_spins = idle_spins.saturating_add(1);
+            if idle_spins < 64 {
+                std::hint::spin_loop();
+            } else if idle_spins < 128 {
+                thread::yield_now();
+            } else {
+                thread::park_timeout(std::time::Duration::from_millis(1));
+            }
         }
     }
 
@@ -993,8 +1027,8 @@ mod tests {
         let config = CoreConfig::default();
         assert_eq!(config.core_id, 0);
         assert!(config.cpu_affinity.is_none());
-        assert_eq!(config.inbox_capacity, 65536);
-        assert_eq!(config.outbox_capacity, 65536);
+        assert_eq!(config.inbox_capacity, 8192);
+        assert_eq!(config.outbox_capacity, 8192);
         assert!(!config.numa_aware);
     }
 

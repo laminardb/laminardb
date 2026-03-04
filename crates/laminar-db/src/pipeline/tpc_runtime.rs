@@ -84,6 +84,7 @@ impl TpcRuntime {
         self.next_core += 1;
 
         let target_inbox = Arc::clone(self.cores[core_id].inbox());
+        let core_thread = self.cores[core_id].core_thread_handle().clone();
 
         let io_thread = SourceIoThread::spawn(
             source_idx,
@@ -93,6 +94,7 @@ impl TpcRuntime {
             target_inbox,
             pipeline_config.max_poll_records,
             pipeline_config.fallback_poll_interval,
+            core_thread,
         );
 
         self.source_threads.push(io_thread);

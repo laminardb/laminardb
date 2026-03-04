@@ -126,10 +126,10 @@ impl LaminarDbBuilder {
         self
     }
 
-    /// Enable thread-per-core mode with the given configuration.
+    /// Override thread-per-core runtime settings.
     ///
-    /// When enabled, the pipeline uses CPU-pinned core threads with SPSC
-    /// queues instead of the default tokio-based coordinator.
+    /// The pipeline always uses TPC mode. This method overrides the
+    /// auto-detected defaults (core count, CPU pinning, NUMA awareness).
     #[must_use]
     pub fn with_tpc(mut self, tpc: crate::config::TpcRuntimeConfig) -> Self {
         self.config.tpc = Some(tpc);

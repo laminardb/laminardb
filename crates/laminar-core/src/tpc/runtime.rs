@@ -193,8 +193,8 @@ impl Default for TpcConfig {
             key_spec: KeySpec::RoundRobin,
             cpu_pinning: false,
             cpu_start: 0,
-            inbox_capacity: 65536,
-            outbox_capacity: 65536,
+            inbox_capacity: 8192,
+            outbox_capacity: 8192,
             reactor_config: ReactorConfig::default(),
             numa_aware: false,
         }
@@ -355,8 +355,8 @@ impl TpcConfigBuilder {
             key_spec: self.key_spec.unwrap_or_default(),
             cpu_pinning: self.cpu_pinning.unwrap_or(false),
             cpu_start: self.cpu_start.unwrap_or(0),
-            inbox_capacity: self.inbox_capacity.unwrap_or(65536),
-            outbox_capacity: self.outbox_capacity.unwrap_or(65536),
+            inbox_capacity: self.inbox_capacity.unwrap_or(8192),
+            outbox_capacity: self.outbox_capacity.unwrap_or(8192),
             reactor_config: self.reactor_config.unwrap_or_default(),
             numa_aware: self.numa_aware.unwrap_or(false),
         };

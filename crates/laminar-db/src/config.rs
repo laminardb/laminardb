@@ -62,9 +62,9 @@ impl Default for TieringConfig {
 
 /// Thread-per-core runtime configuration.
 ///
-/// When set on [`LaminarConfig`], the pipeline uses `TpcPipelineCoordinator`
-/// with CPU-pinned core threads and SPSC queues instead of the default
-/// tokio-based `PipelineCoordinator`.
+/// Controls CPU pinning, core count, and NUMA settings for the TPC
+/// pipeline. When `None` on [`LaminarConfig`], auto-detected defaults
+/// are used.
 #[derive(Debug, Clone)]
 pub struct TpcRuntimeConfig {
     /// Number of cores (`None` = auto-detect via `available_parallelism`).

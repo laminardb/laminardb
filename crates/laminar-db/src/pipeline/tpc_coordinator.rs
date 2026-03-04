@@ -14,8 +14,8 @@ use laminar_core::operator::Output;
 use laminar_core::tpc::TaggedOutput;
 use laminar_core::tpc::TpcConfig;
 
+use super::callback::{PipelineCallback, SourceRegistration};
 use super::config::PipelineConfig;
-use super::coordinator::{PipelineCallback, SourceRegistration};
 use super::tpc_runtime::TpcRuntime;
 use crate::error::DbError;
 
@@ -28,10 +28,10 @@ struct PendingBarrier {
     started_at: Instant,
 }
 
-/// TPC-mode pipeline coordinator.
+/// Thread-per-core pipeline coordinator.
 ///
-/// Replaces `PipelineCoordinator` when TPC mode is enabled. Drains
-/// core outboxes (SPSC queues) instead of reading from mpsc channels.
+/// Drains core outboxes (SPSC queues) from CPU-pinned core threads,
+/// runs SQL cycles via [`PipelineCallback`], and handles checkpoint barriers.
 pub struct TpcPipelineCoordinator {
     config: PipelineConfig,
     runtime: TpcRuntime,
@@ -111,13 +111,8 @@ impl TpcPipelineCoordinator {
                         if tagged.source_idx < self.runtime.source_names().len() {
                             let name = self.runtime.source_names()[tagged.source_idx].clone();
                             callback.extract_watermark(&name, &event.data);
-                            if let Some(filtered) =
-                                callback.filter_late_rows(&name, &event.data)
-                            {
-                                source_batches
-                                    .entry(name)
-                                    .or_default()
-                                    .push(filtered);
+                            if let Some(filtered) = callback.filter_late_rows(&name, &event.data) {
+                                source_batches.entry(name).or_default().push(filtered);
                             }
                         }
                     }
@@ -214,9 +209,7 @@ impl TpcPipelineCoordinator {
             let source_checkpoints = pending.source_checkpoints.clone();
             self.pending_barrier = None;
 
-            let success = callback
-                .checkpoint_with_barrier(source_checkpoints)
-                .await;
+            let success = callback.checkpoint_with_barrier(source_checkpoints).await;
             if !success {
                 tracing::warn!("Checkpoint with barrier failed");
             }

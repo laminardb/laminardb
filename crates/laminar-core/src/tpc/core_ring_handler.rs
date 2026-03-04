@@ -259,10 +259,7 @@ mod tests {
             }
         }
 
-        fn restore(
-            &mut self,
-            _state: OperatorState,
-        ) -> Result<(), crate::operator::OperatorError> {
+        fn restore(&mut self, _state: OperatorState) -> Result<(), crate::operator::OperatorError> {
             Ok(())
         }
     }
@@ -325,8 +322,7 @@ mod tests {
         let mut poll_buffer = Vec::new();
         let mut pending_wal = Vec::new();
 
-        let handler =
-            CoreRingHandler::new(&ctx, &mut reactor, &mut poll_buffer, &mut pending_wal);
+        let handler = CoreRingHandler::new(&ctx, &mut reactor, &mut poll_buffer, &mut pending_wal);
         assert!(handler.should_sleep());
     }
 
@@ -337,8 +333,7 @@ mod tests {
         let mut poll_buffer = Vec::new();
         let mut pending_wal = vec![42u64];
 
-        let handler =
-            CoreRingHandler::new(&ctx, &mut reactor, &mut poll_buffer, &mut pending_wal);
+        let handler = CoreRingHandler::new(&ctx, &mut reactor, &mut poll_buffer, &mut pending_wal);
         assert!(!handler.should_sleep());
     }
 
@@ -349,8 +344,7 @@ mod tests {
         let mut poll_buffer = Vec::new();
         let mut pending_wal = Vec::new();
 
-        let handler =
-            CoreRingHandler::new(&ctx, &mut reactor, &mut poll_buffer, &mut pending_wal);
+        let handler = CoreRingHandler::new(&ctx, &mut reactor, &mut poll_buffer, &mut pending_wal);
         assert!(!handler.should_shutdown());
 
         ctx.shutdown.store(true, Ordering::Release);

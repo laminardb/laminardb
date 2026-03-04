@@ -2828,10 +2828,10 @@ impl LaminarDB {
     /// Uses the `ConnectorRegistry` for generic dispatch — no
     /// connector-specific code in the pipeline setup or processing loop.
     ///
-    /// The pipeline uses an event-driven fan-out/fan-in architecture:
-    /// each source runs in its own tokio task with exclusive ownership
-    /// (no `Arc<Mutex>`), sending batches through a bounded `mpsc`
-    /// channel to a single `PipelineCoordinator` task.
+    /// The pipeline uses a thread-per-core architecture: each source
+    /// runs on a dedicated I/O thread, pushing events through SPSC
+    /// queues to CPU-pinned core threads. A `TpcPipelineCoordinator`
+    /// tokio task drains core outboxes and runs SQL cycles.
     #[allow(clippy::too_many_lines)]
     async fn start_connector_pipeline(
         &self,
@@ -2843,7 +2843,7 @@ impl LaminarDB {
         use crate::connector_manager::{
             build_sink_config, build_source_config, build_table_config,
         };
-        use crate::pipeline::{PipelineConfig, PipelineCoordinator, SourceRegistration};
+        use crate::pipeline::{PipelineConfig, SourceRegistration, TpcPipelineCoordinator};
         use crate::stream_executor::StreamExecutor;
         use laminar_connectors::reference::{ReferenceTableSource, RefreshMode};
 
@@ -2990,7 +2990,7 @@ impl LaminarDB {
         }
 
         // Register sinks with the checkpoint coordinator.
-        // Sources are now owned by PipelineCoordinator — checkpoint reads go
+        // Sources are owned by the TPC runtime — checkpoint reads go
         // through lock-free watch channels instead.
         {
             let mut guard = self.coordinator.lock().await;
@@ -3003,7 +3003,7 @@ impl LaminarDB {
         }
 
         // Recovery: restore sink/table state via unified coordinator.
-        // Source recovery is handled inside PipelineCoordinator::new() via
+        // Source recovery is handled inside TpcPipelineCoordinator::new() via
         // the checkpoint watch channels.
         {
             let mut guard = self.coordinator.lock().await;
@@ -3253,17 +3253,14 @@ impl LaminarDB {
             pipeline_hash,
         };
 
-        // Branch: TPC mode or tokio mode based on config.
-        if let Some(ref tpc_cfg) = self.config.tpc {
-            use crate::pipeline::TpcPipelineCoordinator;
+        // Build TPC config (use explicit settings or auto-detect defaults).
+        {
             use laminar_core::tpc::TpcConfig;
 
-            let num_cores = tpc_cfg
-                .num_cores
-                .unwrap_or_else(|| {
-                    std::thread::available_parallelism()
-                        .map_or(1, std::num::NonZero::get)
-                });
+            let tpc_cfg = self.config.tpc.clone().unwrap_or_default();
+            let num_cores = tpc_cfg.num_cores.unwrap_or_else(|| {
+                std::thread::available_parallelism().map_or(1, std::num::NonZero::get)
+            });
             let tpc_config = TpcConfig {
                 num_cores,
                 cpu_pinning: tpc_cfg.cpu_pinning,
@@ -3284,19 +3281,7 @@ impl LaminarDB {
             });
 
             *self.runtime_handle.lock() = Some(handle);
-            return Ok(());
         }
-
-        // Default: tokio-based coordinator (opens and spawns per-source tasks).
-        let pipeline_coordinator =
-            PipelineCoordinator::new(sources, pipeline_config, Arc::clone(&shutdown)).await?;
-
-        // Spawn the coordinator as the single pipeline task.
-        let handle = tokio::spawn(async move {
-            pipeline_coordinator.run(Box::new(callback)).await;
-        });
-
-        *self.runtime_handle.lock() = Some(handle);
         Ok(())
     }
 

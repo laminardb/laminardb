@@ -4,13 +4,13 @@
 //! the specified key columns, ensuring that rows with the same key always
 //! route to the same core.
 
+use arrow::compute::take;
 use arrow_array::cast::AsArray;
 use arrow_array::types::{
     Float32Type, Float64Type, Int16Type, Int32Type, Int64Type, Int8Type, UInt16Type, UInt32Type,
     UInt64Type, UInt8Type,
 };
 use arrow_array::{Array, RecordBatch, UInt32Array};
-use arrow::compute::take;
 use std::hash::{Hash, Hasher};
 
 use super::router::{KeySpec, RouterError};
@@ -187,20 +187,12 @@ mod tests {
 
     fn make_batch(keys: Vec<i64>) -> RecordBatch {
         let schema = Schema::new(vec![Field::new("key", DataType::Int64, false)]);
-        RecordBatch::try_new(
-            Arc::new(schema),
-            vec![Arc::new(Int64Array::from(keys))],
-        )
-        .unwrap()
+        RecordBatch::try_new(Arc::new(schema), vec![Arc::new(Int64Array::from(keys))]).unwrap()
     }
 
     fn make_string_batch(keys: Vec<&str>) -> RecordBatch {
         let schema = Schema::new(vec![Field::new("name", DataType::Utf8, false)]);
-        RecordBatch::try_new(
-            Arc::new(schema),
-            vec![Arc::new(StringArray::from(keys))],
-        )
-        .unwrap()
+        RecordBatch::try_new(Arc::new(schema), vec![Arc::new(StringArray::from(keys))]).unwrap()
     }
 
     #[test]
@@ -243,8 +235,7 @@ mod tests {
 
     #[test]
     fn test_column_names() {
-        let router =
-            PartitionedRouter::new(KeySpec::Columns(vec!["key".to_string()]), 2);
+        let router = PartitionedRouter::new(KeySpec::Columns(vec!["key".to_string()]), 2);
         let batch = make_batch(vec![1, 2, 3, 4]);
 
         let result = router.route_batch(&batch).unwrap();
@@ -254,8 +245,7 @@ mod tests {
 
     #[test]
     fn test_column_not_found() {
-        let router =
-            PartitionedRouter::new(KeySpec::Columns(vec!["missing".to_string()]), 2);
+        let router = PartitionedRouter::new(KeySpec::Columns(vec!["missing".to_string()]), 2);
         let batch = make_batch(vec![1, 2]);
 
         let result = router.route_batch(&batch);
@@ -282,8 +272,7 @@ mod tests {
 
     #[test]
     fn test_string_keys() {
-        let router =
-            PartitionedRouter::new(KeySpec::Columns(vec!["name".to_string()]), 4);
+        let router = PartitionedRouter::new(KeySpec::Columns(vec!["name".to_string()]), 4);
         let batch = make_string_batch(vec!["alice", "bob", "alice", "charlie"]);
 
         let result = router.route_batch(&batch).unwrap();

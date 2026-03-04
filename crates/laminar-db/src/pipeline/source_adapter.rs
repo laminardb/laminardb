@@ -3,7 +3,7 @@
 //! Bridges an async [`SourceConnector`] to a core thread's SPSC inbox.
 //! Each source runs on a dedicated `std::thread` with a single-threaded
 //! tokio runtime, pushing [`CoreMessage::Event`] into the target core's
-//! inbox after converting [`SourceBatch`] → [`Event`].
+//! inbox after converting `SourceBatch` → [`Event`].
 
 use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::sync::Arc;
@@ -64,6 +64,9 @@ impl SourceIoThread {
     /// The thread opens the connector, polls for batches, and pushes events
     /// into the target core's inbox. Barrier detection happens inline.
     ///
+    /// The `core_thread` handle is used to `unpark()` the core after each
+    /// inbox push, waking it from `park_timeout()` sleep.
+    ///
     /// # Panics
     ///
     /// Panics if the OS thread cannot be spawned.
@@ -76,6 +79,7 @@ impl SourceIoThread {
         target_inbox: Arc<SpscQueue<CoreMessage>>,
         max_poll_records: usize,
         fallback_poll_interval: Duration,
+        core_thread: thread::Thread,
     ) -> Self {
         let shutdown = Arc::new(AtomicBool::new(false));
         let injector = CheckpointBarrierInjector::new();
@@ -101,6 +105,7 @@ impl SourceIoThread {
                     barrier_handle,
                     metrics_clone,
                     cp_tx,
+                    core_thread,
                 )
             })
             .expect("failed to spawn source I/O thread");
@@ -117,10 +122,7 @@ impl SourceIoThread {
     /// Signal shutdown and join the thread, returning the connector for cleanup.
     pub fn shutdown_and_join(&mut self) -> Option<Box<dyn SourceConnector>> {
         self.shutdown.store(true, Ordering::Release);
-        self.thread
-            .take()
-            .and_then(|h| h.join().ok())
-            .flatten()
+        self.thread.take().and_then(|h| h.join().ok()).flatten()
     }
 }
 
@@ -182,6 +184,7 @@ fn source_io_main(
     barrier_handle: BarrierPollHandle,
     metrics: Arc<SourceIoMetrics>,
     cp_tx: tokio::sync::watch::Sender<SourceCheckpoint>,
+    core_thread: thread::Thread,
 ) -> Option<Box<dyn SourceConnector>> {
     let rt = tokio::runtime::Builder::new_current_thread()
         .enable_all()
@@ -223,31 +226,29 @@ fn source_io_main(
             match connector.poll_batch(max_poll_records).await {
                 Ok(Some(batch)) => {
                     let num_rows = batch.records.num_rows();
-                    metrics
-                        .batches
-                        .fetch_add(1, Ordering::Relaxed);
+                    metrics.batches.fetch_add(1, Ordering::Relaxed);
                     #[allow(clippy::cast_possible_truncation)]
                     metrics
                         .records
                         .fetch_add(num_rows as u64, Ordering::Relaxed);
                     #[allow(clippy::cast_possible_truncation)]
-                    metrics.last_poll_ns.store(
-                        poll_start.elapsed().as_nanos() as u64,
-                        Ordering::Relaxed,
-                    );
+                    metrics
+                        .last_poll_ns
+                        .store(poll_start.elapsed().as_nanos() as u64, Ordering::Relaxed);
 
                     // Convert SourceBatch → Event
                     let timestamp = extract_timestamp(&batch.records);
                     let event = Event::new(timestamp, batch.records);
 
                     // Push to core inbox (spin if full — backpressure)
-                    let mut msg = CoreMessage::Event {
-                        source_idx,
-                        event,
-                    };
+                    let mut msg = CoreMessage::Event { source_idx, event };
                     loop {
                         match target_inbox.push(msg) {
-                            Ok(()) => break,
+                            Ok(()) => {
+                                // Wake the core thread from park_timeout() sleep
+                                core_thread.unpark();
+                                break;
+                            }
                             Err(returned) => {
                                 if shutdown.load(Ordering::Acquire) {
                                     break;
@@ -261,10 +262,9 @@ fn source_io_main(
                 Ok(None) => {
                     // No data available
                     #[allow(clippy::cast_possible_truncation)]
-                    metrics.last_poll_ns.store(
-                        poll_start.elapsed().as_nanos() as u64,
-                        Ordering::Relaxed,
-                    );
+                    metrics
+                        .last_poll_ns
+                        .store(poll_start.elapsed().as_nanos() as u64, Ordering::Relaxed);
                 }
                 Err(e) => {
                     metrics.errors.fetch_add(1, Ordering::Relaxed);
@@ -282,7 +282,9 @@ fn source_io_main(
                     source_idx,
                     barrier,
                 };
-                let _ = target_inbox.push(msg);
+                if target_inbox.push(msg).is_ok() {
+                    core_thread.unpark();
+                }
             }
         }
 
@@ -342,11 +344,9 @@ mod tests {
     #[test]
     fn test_extract_timestamp_fallback() {
         let schema = Schema::new(vec![Field::new("value", DataType::Int64, false)]);
-        let batch = RecordBatch::try_new(
-            Arc::new(schema),
-            vec![Arc::new(Int64Array::from(vec![1]))],
-        )
-        .unwrap();
+        let batch =
+            RecordBatch::try_new(Arc::new(schema), vec![Arc::new(Int64Array::from(vec![1]))])
+                .unwrap();
         let ts = extract_timestamp(&batch);
         // Should be approximately current time in millis
         let now = std::time::SystemTime::now()
