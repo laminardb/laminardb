@@ -180,7 +180,7 @@ impl RegisteredBufferPool {
     /// Mark a buffer as in-flight (submitted to io_uring).
     ///
     /// Call this after submitting a read/write operation that uses this buffer.
-    /// Call [`complete_in_flight`] when the CQE arrives.
+    /// Call [`Self::complete_in_flight`] when the CQE arrives.
     pub fn mark_in_flight(&mut self, buf_index: u16) {
         self.in_flight.insert(buf_index);
     }
@@ -294,12 +294,12 @@ impl RegisteredBufferPool {
         offset: u64,
         len: u32,
     ) -> Result<u64, IoUringError> {
+        let user_data = self.next_user_data();
+
         let buf = self
             .buffers
             .get(buf_index as usize)
             .ok_or(IoUringError::InvalidBufferIndex(buf_index))?;
-
-        let user_data = self.next_user_data();
 
         let entry = opcode::WriteFixed::new(Fd(fd), buf.as_ptr(), len, buf_index)
             .offset(offset)

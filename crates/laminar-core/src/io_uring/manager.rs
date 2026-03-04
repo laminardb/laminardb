@@ -198,7 +198,7 @@ impl CoreRingManager {
     /// Returns an error if ring creation fails.
     pub fn new(core_id: usize, config: &IoUringConfig) -> Result<Self, IoUringError> {
         // Create main ring
-        let main_ring = IoUringRing::new(config)?;
+        let mut main_ring = IoUringRing::new(config)?;
 
         // Create buffer pool and register buffers on the actual main ring.
         // SAFETY: The buffer pool's memory outlives the ring registration because

@@ -189,12 +189,13 @@ mod linux_impl {
                 .map_err(|e| SinkError::WriteFailed(format!("Failed to acquire buffer: {e}")))?;
 
             // Fail on truncation instead of silently losing data.
-            if bytes.len() > buf.len() {
+            let buf_capacity = buf.len();
+            if bytes.len() > buf_capacity {
                 self.ring_manager.release_buffer(buf_index);
                 return Err(SinkError::WriteFailed(
                     IoUringError::BufferTooSmall {
                         needed: bytes.len(),
-                        capacity: buf.len(),
+                        capacity: buf_capacity,
                     }
                     .to_string(),
                 ));
