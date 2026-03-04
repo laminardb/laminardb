@@ -559,6 +559,15 @@ impl CoreRingManager {
         let op = self.pending.remove(&user_data);
         let latency = op.as_ref().map(|o| o.submitted_at().elapsed());
 
+        // Mark buffer as no longer in-flight now that the CQE has arrived.
+        if let Some(ref op) = op {
+            if let Some(buf_idx) = op.buf_index() {
+                if let Some(ref mut pool) = self.buffer_pool {
+                    pool.complete_in_flight(buf_idx);
+                }
+            }
+        }
+
         // Update metrics
         if result >= 0 {
             self.metrics.completions_success += 1;

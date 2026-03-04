@@ -667,7 +667,10 @@ mod tests {
         let cqe = cq.next().unwrap();
         assert_eq!(cqe.user_data(), user_data);
         assert!(cqe.result() >= 0);
+        drop(cq);
 
+        // Mark buffer as no longer in-flight before releasing
+        pool.complete_in_flight(idx);
         pool.release(idx);
     }
 }
