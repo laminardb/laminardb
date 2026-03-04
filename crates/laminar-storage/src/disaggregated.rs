@@ -121,7 +121,7 @@ struct CacheKey {
 ///
 /// let store = Arc::new(object_store::memory::InMemory::new());
 /// let config = DisaggregatedConfig::default();
-/// let backend = DisaggregatedStateBackend::new(store, config);
+/// let backend = DisaggregatedStateBackend::new(store, config).unwrap();
 ///
 /// // Write partition state at epoch 1
 /// let entries = vec![
