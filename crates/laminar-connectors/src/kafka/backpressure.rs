@@ -1,6 +1,6 @@
 //! Backpressure controller for Kafka source consumption.
 //!
-//! [`KafkaKafkaBackpressureController`] monitors downstream channel utilization
+//! [`KafkaBackpressureController`] monitors downstream channel utilization
 //! and signals when the consumer should pause or resume partition
 //! consumption to prevent unbounded memory growth.
 
