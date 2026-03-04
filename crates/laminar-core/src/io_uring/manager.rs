@@ -172,9 +172,6 @@ pub struct CoreRingManager {
     buffer_pool: Option<RegisteredBufferPool>,
     /// IOPOLL ring for storage (optional).
     iopoll_ring: Option<IoUringRing>,
-    /// IOPOLL buffer pool (separate from main).
-    #[allow(dead_code)]
-    iopoll_buffer_pool: Option<RegisteredBufferPool>,
     /// Pending operations tracking.
     pending: FxHashMap<u64, PendingOp>,
     /// Next `user_data` ID.
@@ -215,28 +212,16 @@ impl CoreRingManager {
             None
         };
 
-        // Create IOPOLL ring if requested and mode allows, registering buffers
-        // on the actual iopoll ring (not a temporary throw-away ring).
-        let (iopoll_ring, iopoll_buffer_pool) = if config.mode.uses_iopoll() {
+        // Create IOPOLL ring if requested and mode allows.
+        let iopoll_ring = if config.mode.uses_iopoll() {
             let iopoll_config = IoUringConfig {
                 mode: RingMode::IoPoll,
                 ..config.clone()
             };
-            let mut ring = IoUringRing::new(&iopoll_config)?;
-
-            let pool = if config.buffer_count > 0 {
-                Some(RegisteredBufferPool::new(
-                    ring.ring_mut(),
-                    config.buffer_size,
-                    config.buffer_count,
-                )?)
-            } else {
-                None
-            };
-
-            (Some(ring), pool)
+            let ring = IoUringRing::new(&iopoll_config)?;
+            Some(ring)
         } else {
-            (None, None)
+            None
         };
 
         Ok(Self {
@@ -244,7 +229,6 @@ impl CoreRingManager {
             main_ring,
             buffer_pool,
             iopoll_ring,
-            iopoll_buffer_pool,
             pending: FxHashMap::default(),
             next_id: 0,
             metrics: RingMetrics::default(),

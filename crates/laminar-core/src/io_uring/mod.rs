@@ -79,7 +79,7 @@ pub use buffer_pool::RegisteredBufferPool;
 #[cfg(all(target_os = "linux", feature = "io-uring"))]
 pub use manager::{Completion, CompletionKind, CoreRingManager, PendingOp, RingMetrics};
 #[cfg(all(target_os = "linux", feature = "io-uring"))]
-pub use ring::{create_iopoll_ring, create_optimized_ring, IoUringRing};
+pub use ring::IoUringRing;
 #[cfg(all(target_os = "linux", feature = "io-uring"))]
 pub use sink::IoUringSink;
 

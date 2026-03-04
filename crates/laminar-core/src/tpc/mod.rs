@@ -2,66 +2,12 @@
 //!
 //! Implements thread-per-core architecture for linear scaling on multi-core systems.
 //!
-//! ## Architecture
-//!
-//! Each CPU core runs a dedicated [`Reactor`](crate::reactor::Reactor) with its own state
-//! partition. Events are routed to cores based on key hash, ensuring state locality.
-//!
-//! ```text
-//! ┌─────────────────────────────────────────────────────────────┐
-//! │                   ThreadPerCoreRuntime                       │
-//! │  ┌──────────┐  ┌──────────┐  ┌──────────┐  ┌──────────┐    │
-//! │  │ Core 0   │  │ Core 1   │  │ Core 2   │  │ Core N   │    │
-//! │  │ Reactor  │  │ Reactor  │  │ Reactor  │  │ Reactor  │    │
-//! │  │ State₀   │  │ State₁   │  │ State₂   │  │ StateN   │    │
-//! │  └────▲─────┘  └────▲─────┘  └────▲─────┘  └────▲─────┘    │
-//! │       │             │             │             │          │
-//! │       └─────────────┴──────┬──────┴─────────────┘          │
-//! │                            │                                │
-//! │                    ┌───────┴───────┐                        │
-//! │                    │  KeyRouter    │                        │
-//! │                    │ hash(key) % N │                        │
-//! │                    └───────┬───────┘                        │
-//! │                            │                                │
-//! └────────────────────────────┼────────────────────────────────┘
-//!                              │
-//!                        Input Events
-//! ```
-//!
 //! ## Components
 //!
 //! - [`SpscQueue`] - Lock-free single-producer single-consumer queue
-//! - [`KeyRouter`] - Routes events to cores based on key hash
 //! - [`CoreHandle`] - Manages a single core's reactor thread
-//! - [`ThreadPerCoreRuntime`] - Orchestrates multi-core processing
-//!
-//! ## Example
-//!
-//! ```rust,ignore
-//! use laminar_core::tpc::{TpcConfig, ThreadPerCoreRuntime, KeySpec};
-//!
-//! // Configure for 4 cores, routing by "user_id" column
-//! let config = TpcConfig::builder()
-//!     .num_cores(4)
-//!     .key_columns(vec!["user_id"])
-//!     .build();
-//!
-//! let mut runtime = ThreadPerCoreRuntime::new(config)?;
-//!
-//! // Submit events - automatically routed by key
-//! runtime.submit(event)?;
-//!
-//! // Poll all cores for outputs
-//! let outputs = runtime.poll();
-//! ```
-//!
-//! ## Performance Targets
-//!
-//! | Metric | Target |
-//! |--------|--------|
-//! | SPSC push/pop | < 50ns |
-//! | Scaling efficiency | > 80% |
-//! | Inter-core latency | < 1μs |
+//! - [`CreditGate`] - Credit-based backpressure
+//! - [`TpcConfig`] / [`OutputBuffer`] - Runtime configuration and output collection
 
 mod backpressure;
 mod core_handle;
@@ -72,12 +18,12 @@ mod spsc;
 mod zero_alloc_tests;
 
 pub use backpressure::{
-    BackpressureConfig, BackpressureConfigBuilder, CreditAcquireResult, CreditChannel, CreditGate,
-    CreditMetrics, CreditMetricsSnapshot, CreditReceiver, CreditSender, OverflowStrategy,
+    BackpressureConfig, BackpressureConfigBuilder, CreditAcquireResult, CreditGate, CreditMetrics,
+    CreditMetricsSnapshot, OverflowStrategy,
 };
 pub use core_handle::{CoreConfig, CoreHandle, CoreMessage};
-pub use router::{KeyRouter, KeySpec, RouterError};
-pub use runtime::{OutputBuffer, ThreadPerCoreRuntime, TpcConfig, TpcConfigBuilder};
+pub use router::{KeySpec, RouterError};
+pub use runtime::{OutputBuffer, TpcConfig, TpcConfigBuilder};
 pub use spsc::{CachePadded, SpscQueue};
 
 /// Errors that can occur in the TPC runtime.

@@ -66,10 +66,6 @@ pub struct ThreeRingReactor {
     /// Statistics for monitoring.
     stats: ThreeRingStats,
 
-    /// Configuration.
-    #[allow(dead_code)]
-    config: ThreeRingConfig,
-
     /// Whether the reactor is closed.
     closed: bool,
 
@@ -132,7 +128,6 @@ impl ThreeRingReactor {
             router: CompletionRouter::new(),
             next_id: 0,
             stats: ThreeRingStats::new(),
-            config,
             closed: false,
             cqe_scratch: Vec::with_capacity(CQE_SCRATCH_CAPACITY),
             completion_scratch: Vec::with_capacity(CQE_SCRATCH_CAPACITY),

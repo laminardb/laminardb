@@ -183,93 +183,6 @@ impl RingHandler for SimpleRingHandler {
     }
 }
 
-/// Callback-based ring handler.
-///
-/// Allows providing closures for handling completions.
-#[allow(dead_code)]
-pub struct CallbackRingHandler<L, M, P>
-where
-    L: FnMut(RoutedCompletion),
-    M: FnMut(RoutedCompletion),
-    P: FnMut(RoutedCompletion),
-{
-    latency_callback: L,
-    main_callback: M,
-    poll_callback: P,
-    shutdown: bool,
-}
-
-impl<L, M, P> CallbackRingHandler<L, M, P>
-where
-    L: FnMut(RoutedCompletion),
-    M: FnMut(RoutedCompletion),
-    P: FnMut(RoutedCompletion),
-{
-    /// Create a new callback handler.
-    #[allow(dead_code)]
-    pub fn new(latency: L, main: M, poll: P) -> Self {
-        Self {
-            latency_callback: latency,
-            main_callback: main,
-            poll_callback: poll,
-            shutdown: false,
-        }
-    }
-
-    /// Request shutdown.
-    #[allow(dead_code)]
-    pub fn request_shutdown(&mut self) {
-        self.shutdown = true;
-    }
-}
-
-impl<L, M, P> RingHandler for CallbackRingHandler<L, M, P>
-where
-    L: FnMut(RoutedCompletion),
-    M: FnMut(RoutedCompletion),
-    P: FnMut(RoutedCompletion),
-{
-    fn handle_latency_completion(&mut self, completion: RoutedCompletion) {
-        (self.latency_callback)(completion);
-    }
-
-    fn handle_main_completion(&mut self, completion: RoutedCompletion) {
-        (self.main_callback)(completion);
-    }
-
-    fn handle_poll_completion(&mut self, completion: RoutedCompletion) {
-        (self.poll_callback)(completion);
-    }
-
-    fn process_ring0_events(&mut self) {
-        // No-op for callback handler
-    }
-
-    fn ring0_idle(&self) -> bool {
-        true
-    }
-
-    fn process_ring1_chunk(&mut self) {
-        // No-op for callback handler
-    }
-
-    fn has_control_message(&self) -> bool {
-        false
-    }
-
-    fn process_ring2(&mut self) {
-        // No-op for callback handler
-    }
-
-    fn should_sleep(&self) -> bool {
-        false
-    }
-
-    fn should_shutdown(&self) -> bool {
-        self.shutdown
-    }
-}
-
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -353,29 +266,5 @@ mod tests {
 
         handler.clear();
         assert_eq!(handler.total_completions(), 0);
-    }
-
-    #[test]
-    fn test_callback_handler() {
-        let mut latency_count = 0;
-        let mut main_count = 0;
-        let mut poll_count = 0;
-
-        {
-            let mut handler = CallbackRingHandler::new(
-                |_| latency_count += 1,
-                |_| main_count += 1,
-                |_| poll_count += 1,
-            );
-
-            handler.handle_latency_completion(make_completion(1, RingAffinity::Latency));
-            handler.handle_latency_completion(make_completion(2, RingAffinity::Latency));
-            handler.handle_main_completion(make_completion(3, RingAffinity::Main));
-            handler.handle_poll_completion(make_completion(4, RingAffinity::Poll));
-        }
-
-        assert_eq!(latency_count, 2);
-        assert_eq!(main_count, 1);
-        assert_eq!(poll_count, 1);
     }
 }

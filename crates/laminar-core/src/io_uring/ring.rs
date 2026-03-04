@@ -117,40 +117,6 @@ fn create_standard_ring(config: &IoUringConfig) -> Result<StandardIoUring, IoUri
         .map_err(IoUringError::RingCreation)
 }
 
-/// Create an `io_uring` ring with SQPOLL mode.
-///
-/// SQPOLL eliminates syscalls by using a dedicated kernel polling thread
-/// that continuously polls the submission queue. The kernel thread is
-/// optionally pinned to a specific CPU.
-///
-/// # Arguments
-///
-/// * `entries` - Number of submission queue entries (power of 2)
-/// * `sqpoll_idle_ms` - Idle timeout before kernel thread sleeps
-/// * `sqpoll_cpu` - Optional CPU to pin the SQPOLL thread to
-///
-/// # Returns
-///
-/// An optimized `io_uring` instance configured for SQPOLL mode.
-///
-/// # Errors
-///
-/// Returns an error if the ring cannot be created.
-pub fn create_optimized_ring(
-    entries: u32,
-    sqpoll_idle_ms: u32,
-    sqpoll_cpu: Option<u32>,
-) -> Result<StandardIoUring, IoUringError> {
-    let config = IoUringConfig {
-        ring_entries: entries,
-        mode: RingMode::SqPoll,
-        sqpoll_idle_ms,
-        sqpoll_cpu,
-        ..Default::default()
-    };
-    create_sqpoll_ring(&config)
-}
-
 /// Create a SQPOLL-enabled ring.
 fn create_sqpoll_ring(config: &IoUringConfig) -> Result<StandardIoUring, IoUringError> {
     let mut builder = IoUring::builder();
@@ -182,34 +148,6 @@ fn create_sqpoll_ring(config: &IoUringConfig) -> Result<StandardIoUring, IoUring
             IoUringError::RingCreation(e)
         }
     })
-}
-
-/// Create an `io_uring` ring with IOPOLL mode for `NVMe` storage.
-///
-/// IOPOLL polls completions directly from the `NVMe` device queue instead of
-/// using interrupts. This provides lower latency for storage operations.
-///
-/// **Note**: IOPOLL rings cannot be used with socket operations. Use a
-/// separate ring for network I/O.
-///
-/// # Arguments
-///
-/// * `entries` - Number of submission queue entries (power of 2)
-///
-/// # Returns
-///
-/// An `io_uring` instance configured for IOPOLL mode.
-///
-/// # Errors
-///
-/// Returns an error if the ring cannot be created.
-pub fn create_iopoll_ring(entries: u32) -> Result<StandardIoUring, IoUringError> {
-    let config = IoUringConfig {
-        ring_entries: entries,
-        mode: RingMode::IoPoll,
-        ..Default::default()
-    };
-    create_iopoll_ring_internal(&config)
 }
 
 /// Create an IOPOLL-enabled ring.
@@ -265,93 +203,9 @@ fn create_sqpoll_iopoll_ring(config: &IoUringConfig) -> Result<StandardIoUring, 
     })
 }
 
-/// Probe kernel for supported `io_uring` features.
-#[allow(dead_code)]
-#[must_use]
-pub fn probe_features() -> SupportedFeatures {
-    // Try to create a minimal ring to probe features
-    let ring: Result<StandardIoUring, _> = IoUring::builder().build(8);
-    let Ok(ring) = ring else {
-        return SupportedFeatures {
-            available: false,
-            sqpoll: false,
-            iopoll: false,
-            registered_buffers: false,
-            registered_files: false,
-            direct_descriptors: false,
-        };
-    };
-
-    // Check for SQPOLL support
-    let sqpoll: Result<StandardIoUring, _> = IoUring::builder().setup_sqpoll(1000).build(8);
-    let sqpoll = sqpoll.is_ok();
-
-    // Check for IOPOLL support
-    let iopoll: Result<StandardIoUring, _> = IoUring::builder().setup_iopoll().build(8);
-    let iopoll = iopoll.is_ok();
-
-    // Registered buffers and files are available on all io_uring versions
-    let registered_buffers = true;
-    let registered_files = true;
-
-    // Direct descriptors (requires newer kernel)
-    let direct_descriptors = false; // Would need actual probe
-
-    drop(ring);
-
-    SupportedFeatures {
-        available: true,
-        sqpoll,
-        iopoll,
-        registered_buffers,
-        registered_files,
-        direct_descriptors,
-    }
-}
-
-/// Supported `io_uring` features on the current system.
-#[allow(dead_code, clippy::struct_excessive_bools)]
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub struct SupportedFeatures {
-    /// `io_uring` is available.
-    pub available: bool,
-    /// SQPOLL mode is supported.
-    pub sqpoll: bool,
-    /// IOPOLL mode is supported.
-    pub iopoll: bool,
-    /// Registered buffers are supported.
-    pub registered_buffers: bool,
-    /// Registered files are supported.
-    pub registered_files: bool,
-    /// Direct file descriptors are supported.
-    pub direct_descriptors: bool,
-}
-
-impl SupportedFeatures {
-    /// Check if all advanced features are available.
-    #[allow(dead_code, clippy::trivially_copy_pass_by_ref)]
-    #[must_use]
-    pub const fn has_advanced_features(&self) -> bool {
-        self.sqpoll && self.iopoll && self.registered_buffers
-    }
-}
-
 #[cfg(test)]
-#[allow(
-    clippy::manual_let_else,
-    clippy::single_match_else,
-    clippy::items_after_statements
-)]
 mod tests {
     use super::*;
-
-    #[test]
-    fn test_probe_features() {
-        let features = probe_features();
-        // On Linux with io_uring, this should be true
-        // On other platforms or containers, may be false
-        println!("io_uring features: {features:?}");
-    }
 
     #[test]
     fn test_create_standard_ring() {
@@ -367,25 +221,6 @@ mod tests {
             assert_eq!(r.entries(), 32);
             assert!(!r.uses_sqpoll());
             assert!(!r.uses_iopoll());
-        }
-    }
-
-    #[test]
-    fn test_create_optimized_ring() {
-        // May fail without root privileges or in containers
-        let result = create_optimized_ring(32, 1000, None);
-        if let Ok(ring) = result {
-            // Ring created successfully
-            drop(ring);
-        }
-    }
-
-    #[test]
-    fn test_create_iopoll_ring() {
-        // May fail without NVMe or in containers
-        let result = create_iopoll_ring(32);
-        if let Ok(ring) = result {
-            drop(ring);
         }
     }
 
