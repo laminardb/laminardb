@@ -55,6 +55,8 @@ impl TpcRuntime {
                 reactor_config: config.reactor_config.clone(),
                 backpressure: laminar_core::tpc::BackpressureConfig::default(),
                 numa_aware: config.numa_aware,
+                #[cfg(all(target_os = "linux", feature = "io-uring"))]
+                io_uring_config: None,
             };
             cores.push(CoreHandle::spawn(core_config)?);
         }
