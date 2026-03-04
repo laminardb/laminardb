@@ -354,6 +354,7 @@ mod tests {
                 .unwrap();
         let ts = extract_timestamp(&batch);
         // Should be approximately current time in millis
+        #[allow(clippy::cast_possible_truncation)]
         let now = std::time::SystemTime::now()
             .duration_since(std::time::UNIX_EPOCH)
             .unwrap()
