@@ -250,11 +250,12 @@ impl IcebergSink {
         );
     }
 
-    /// Generates a mock snapshot ID for testing (in production, comes from catalog).
+    /// Generates a timestamp-based snapshot ID.
+    ///
+    /// When the `iceberg-sink` feature is enabled, this will be replaced
+    /// by the catalog-assigned snapshot ID from iceberg-rust.
     #[allow(clippy::cast_possible_truncation, clippy::cast_possible_wrap)]
     fn generate_snapshot_id(&self) -> i64 {
-        // Mock: use timestamp-like ID. In production, this comes from iceberg-rust.
-        // The truncation/wrap is acceptable here for mock IDs.
         std::time::SystemTime::now()
             .duration_since(std::time::UNIX_EPOCH)
             .map(|d| d.as_millis() as i64)
