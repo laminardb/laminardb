@@ -181,7 +181,7 @@ mod linux_impl {
                     format!("CHECKPOINT_COMPLETE id={}\n", data.checkpoint_id).into_bytes()
                 }
                 Output::Barrier(barrier) => {
-                    format!("BARRIER epoch={}\n", barrier.epoch()).into_bytes()
+                    format!("BARRIER epoch={}\n", barrier.epoch).into_bytes()
                 }
             };
 
