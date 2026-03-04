@@ -360,7 +360,7 @@ impl SinkConnector for IcebergSink {
             "opening Iceberg sink connector"
         );
 
-        // NOTE: In production with the `iceberg-sink` feature, this is where we would:
+        // TODO(iceberg-sink): When the `iceberg-sink` feature is enabled:
         // 1. Connect to the Iceberg catalog (REST, Glue, or Hive)
         // 2. Load or create the Iceberg table
         // 3. Resolve last committed epoch from snapshot summary properties

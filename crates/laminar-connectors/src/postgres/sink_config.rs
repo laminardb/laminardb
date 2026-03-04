@@ -131,9 +131,7 @@ impl PostgresSinkConfig {
             cfg.password = v.to_string();
         }
         if let Some(v) = config.get("port") {
-            cfg.port = v
-                .parse()
-                .map_err(|_| ConnectorError::ConfigurationError(format!("invalid port: '{v}'")))?;
+            cfg.port = crate::config::parse_port(v)?;
         }
         if let Some(v) = config.get("schema.name") {
             cfg.schema_name = v.to_string();

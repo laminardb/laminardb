@@ -216,6 +216,17 @@ pub fn require_non_empty(value: &str, field_name: &str) -> Result<(), ConnectorE
     Ok(())
 }
 
+/// Parses a port string into a `u16`.
+///
+/// # Errors
+///
+/// Returns `ConnectorError::ConfigurationError` if the value is not a valid port number.
+pub fn parse_port(value: &str) -> Result<u16, ConnectorError> {
+    value
+        .parse()
+        .map_err(|_| ConnectorError::ConfigurationError(format!("invalid port: '{value}'")))
+}
+
 /// Specification for a configuration key.
 ///
 /// Used by connectors to declare their expected configuration.
