@@ -304,9 +304,7 @@ impl DisaggregatedStateBackend {
     /// Returns [`DisaggregatedError::Store`] on S3 list failure.
     pub fn list_epochs(&self, partition_id: u64) -> Result<Vec<u64>, DisaggregatedError> {
         let pfx = self.prefix.as_deref().unwrap_or("");
-        let prefix = ObjectPath::from(format!(
-            "{pfx}partitions/{partition_id:06}/state/",
-        ));
+        let prefix = ObjectPath::from(format!("{pfx}partitions/{partition_id:06}/state/",));
 
         let entries = self.rt.block_on(async {
             use futures::TryStreamExt;

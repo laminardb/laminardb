@@ -220,9 +220,7 @@ impl InMemoryTableLoader {
 
     pub fn with_name(name: impl Into<String>) -> Self {
         Self {
-            data: std::sync::Arc::new(parking_lot::RwLock::new(
-                rustc_hash::FxHashMap::default(),
-            )),
+            data: std::sync::Arc::new(parking_lot::RwLock::new(rustc_hash::FxHashMap::default())),
             name: name.into(),
         }
     }
