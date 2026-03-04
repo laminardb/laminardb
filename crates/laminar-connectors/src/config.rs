@@ -174,6 +174,7 @@ impl ConnectorConfig {
     ///
     /// Uses [`SecretMasker`](crate::storage::SecretMasker) to replace
     /// values of secret keys (passwords, access keys, tokens) with `"***"`.
+    #[cfg(test)]
     #[must_use]
     pub fn display_redacted(&self) -> String {
         use crate::storage::SecretMasker;

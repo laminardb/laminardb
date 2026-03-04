@@ -193,23 +193,19 @@ impl Default for TieringPolicy {
 }
 
 // ---------------------------------------------------------------------------
-// Tier-aware compression
+// Tier-aware compression (test-only)
 // ---------------------------------------------------------------------------
 
+#[cfg(test)]
 /// Zstd compression level for warm tier (fast, good ratio).
 const ZSTD_WARM_LEVEL: i32 = 3;
 
+#[cfg(test)]
 /// Zstd compression level for cold tier (max ratio, slower).
 const ZSTD_COLD_LEVEL: i32 = 19;
 
-/// Compress data using the appropriate algorithm for the given tier.
-///
-/// - **Hot**: LZ4 (fastest decompression for active recovery)
-/// - **Warm**: Zstd level 3 (good balance of speed and ratio)
-/// - **Cold**: Zstd level 19 (maximum compression for archival)
-#[must_use]
-#[allow(clippy::missing_panics_doc)] // zstd::encode_all on &[u8] is infallible
-pub fn compress_for_tier(data: &[u8], tier: StorageTier) -> Vec<u8> {
+#[cfg(test)]
+fn compress_for_tier(data: &[u8], tier: StorageTier) -> Vec<u8> {
     match tier {
         StorageTier::Hot => lz4_flex::compress_prepend_size(data),
         StorageTier::Warm => zstd::encode_all(data, ZSTD_WARM_LEVEL).unwrap(),
@@ -217,13 +213,8 @@ pub fn compress_for_tier(data: &[u8], tier: StorageTier) -> Vec<u8> {
     }
 }
 
-/// Decompress data using the appropriate algorithm for the given tier.
-///
-/// # Errors
-///
-/// Returns [`DecompressionError`] if the data is corrupt or not valid
-/// for the tier's compression format.
-pub fn decompress_for_tier(
+#[cfg(test)]
+fn decompress_for_tier(
     compressed: &[u8],
     tier: StorageTier,
 ) -> Result<Vec<u8>, DecompressionError> {
@@ -236,6 +227,7 @@ pub fn decompress_for_tier(
 }
 
 /// Error from tier-aware decompression.
+#[cfg(test)]
 #[derive(Debug, thiserror::Error)]
 #[error("{0}")]
 pub struct DecompressionError(String);

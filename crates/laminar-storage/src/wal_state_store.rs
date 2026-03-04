@@ -27,6 +27,7 @@ pub struct WalStateStore {
     /// Path to the WAL file (kept for future use).
     _wal_path: PathBuf,
     /// Whether to sync WAL on every write (for testing).
+    #[cfg(test)]
     sync_on_write: bool,
     /// Checkpoint manager for periodic snapshots.
     checkpoint_manager: Option<CheckpointManager>,
@@ -67,40 +68,7 @@ impl WalStateStore {
             store,
             wal,
             _wal_path: wal_path_buf,
-            sync_on_write: false,
-            checkpoint_manager: None,
-            last_checkpoint: AtomicU64::new(0),
-            source_offsets: HashMap::new(),
-            current_watermark: None,
-        })
-    }
-
-    /// Create an in-memory WAL-backed state store (mainly for testing).
-    ///
-    /// # Arguments
-    ///
-    /// * `wal_path` - Path to the WAL file
-    /// * `capacity` - Initial capacity for the in-memory store
-    /// * `sync_interval` - WAL sync interval
-    ///
-    /// # Errors
-    ///
-    /// Returns an error if the WAL file cannot be created.
-    pub fn in_memory(
-        wal_path: &Path,
-        capacity: usize,
-        sync_interval: Duration,
-    ) -> Result<Self, StateError> {
-        let wal_path_buf = wal_path.to_path_buf();
-        let wal = WriteAheadLog::new(&wal_path_buf, sync_interval)
-            .map_err(|e| StateError::Io(std::io::Error::other(e)))?;
-
-        let store = MmapStateStore::in_memory(capacity);
-
-        Ok(Self {
-            store,
-            wal,
-            _wal_path: wal_path_buf,
+            #[cfg(test)]
             sync_on_write: false,
             checkpoint_manager: None,
             last_checkpoint: AtomicU64::new(0),
@@ -110,6 +78,7 @@ impl WalStateStore {
     }
 
     /// Enable sync on every write (for testing).
+    #[cfg(test)]
     pub fn set_sync_on_write(&mut self, enabled: bool) {
         self.sync_on_write = enabled;
         self.wal.set_sync_on_write(enabled);
@@ -160,11 +129,13 @@ impl WalStateStore {
     }
 
     /// Update source offset for exactly-once semantics.
+    #[cfg(test)]
     pub fn update_source_offset(&mut self, source: String, offset: u64) {
         self.source_offsets.insert(source, offset);
     }
 
     /// Get source offset for a given source.
+    #[cfg(test)]
     #[must_use]
     pub fn get_source_offset(&self, source: &str) -> Option<u64> {
         self.source_offsets.get(source).copied()
@@ -198,6 +169,7 @@ impl WalStateStore {
             })
             .map_err(|e| StateError::Io(std::io::Error::other(e)))?;
 
+        #[cfg(test)]
         if self.sync_on_write {
             self.wal
                 .sync()

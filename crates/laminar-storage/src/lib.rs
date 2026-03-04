@@ -82,10 +82,7 @@ pub use checkpoint_store::{
 pub use disaggregated::{
     DisaggregatedConfig, DisaggregatedError, DisaggregatedStateBackend, StateEntry,
 };
-pub use tiering::{
-    compress_for_tier, decompress_for_tier, DecompressionError, StorageClass, StorageTier,
-    TieringPolicy,
-};
+pub use tiering::{StorageClass, StorageTier, TieringPolicy};
 pub use wal::{WalEntry, WalError, WalPosition, WriteAheadLog};
 pub use wal_state_store::WalStateStore;
 
