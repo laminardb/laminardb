@@ -3207,10 +3207,7 @@ impl LaminarDB {
             barrier_alignment_timeout: std::time::Duration::from_secs(30),
         };
 
-        // Create the coordinator (opens and spawns per-source tasks).
         let shutdown = self.shutdown_signal.clone();
-        let pipeline_coordinator =
-            PipelineCoordinator::new(sources, pipeline_config, Arc::clone(&shutdown)).await?;
 
         // Build the PipelineCallback implementation that bridges to db.rs internals.
         let counters = Arc::clone(&self.counters);
@@ -3255,6 +3252,44 @@ impl LaminarDB {
             last_checkpoint: std::time::Instant::now(),
             pipeline_hash,
         };
+
+        // Branch: TPC mode or tokio mode based on config.
+        if let Some(ref tpc_cfg) = self.config.tpc {
+            use crate::pipeline::TpcPipelineCoordinator;
+            use laminar_core::tpc::TpcConfig;
+
+            let num_cores = tpc_cfg
+                .num_cores
+                .unwrap_or_else(|| {
+                    std::thread::available_parallelism()
+                        .map_or(1, std::num::NonZero::get)
+                });
+            let tpc_config = TpcConfig {
+                num_cores,
+                cpu_pinning: tpc_cfg.cpu_pinning,
+                cpu_start: tpc_cfg.cpu_start,
+                numa_aware: tpc_cfg.numa_aware,
+                ..Default::default()
+            };
+
+            let tpc_coordinator = TpcPipelineCoordinator::new(
+                sources,
+                pipeline_config,
+                tpc_config,
+                Arc::clone(&shutdown),
+            )?;
+
+            let handle = tokio::spawn(async move {
+                tpc_coordinator.run(Box::new(callback)).await;
+            });
+
+            *self.runtime_handle.lock() = Some(handle);
+            return Ok(());
+        }
+
+        // Default: tokio-based coordinator (opens and spawns per-source tasks).
+        let pipeline_coordinator =
+            PipelineCoordinator::new(sources, pipeline_config, Arc::clone(&shutdown)).await?;
 
         // Spawn the coordinator as the single pipeline task.
         let handle = tokio::spawn(async move {

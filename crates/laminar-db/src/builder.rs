@@ -126,6 +126,16 @@ impl LaminarDbBuilder {
         self
     }
 
+    /// Enable thread-per-core mode with the given configuration.
+    ///
+    /// When enabled, the pipeline uses CPU-pinned core threads with SPSC
+    /// queues instead of the default tokio-based coordinator.
+    #[must_use]
+    pub fn with_tpc(mut self, tpc: crate::config::TpcRuntimeConfig) -> Self {
+        self.config.tpc = Some(tpc);
+        self
+    }
+
     /// Register a custom scalar UDF with the database.
     ///
     /// The UDF will be available in SQL queries after `build()`.

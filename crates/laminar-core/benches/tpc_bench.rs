@@ -205,7 +205,7 @@ fn bench_core_submit(c: &mut Criterion) {
         b.iter(|| {
             let event = make_event(black_box(timestamp), timestamp);
             timestamp += 1;
-            let result = handle.send_event(event);
+            let result = handle.send_event(0, event);
             black_box(result)
         })
     });

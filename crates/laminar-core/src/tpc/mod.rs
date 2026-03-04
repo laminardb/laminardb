@@ -11,6 +11,9 @@
 
 mod backpressure;
 mod core_handle;
+#[cfg(all(target_os = "linux", feature = "io-uring"))]
+mod core_ring_handler;
+mod partitioned_router;
 mod router;
 mod runtime;
 mod spsc;
@@ -21,7 +24,8 @@ pub use backpressure::{
     BackpressureConfig, BackpressureConfigBuilder, CreditAcquireResult, CreditGate, CreditMetrics,
     CreditMetricsSnapshot, OverflowStrategy,
 };
-pub use core_handle::{CoreConfig, CoreHandle, CoreMessage};
+pub use core_handle::{CoreConfig, CoreHandle, CoreMessage, TaggedOutput};
+pub use partitioned_router::PartitionedRouter;
 pub use router::{KeySpec, RouterError};
 pub use runtime::{OutputBuffer, TpcConfig, TpcConfigBuilder};
 pub use spsc::{CachePadded, SpscQueue};

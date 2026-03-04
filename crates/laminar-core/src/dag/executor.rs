@@ -678,7 +678,7 @@ impl DagExecutor {
                 Output::Changelog(ChangelogRecord { event, .. }) => {
                     self.sink_outputs[source.0 as usize].push(event);
                 }
-                Output::CheckpointComplete(_) => {
+                Output::CheckpointComplete(_) | Output::Barrier(_) => {
                     // No-op: consumed by checkpoint coordinator
                 }
             }

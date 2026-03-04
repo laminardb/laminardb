@@ -36,6 +36,7 @@ use crate::io_uring::{CoreRingManager, IoUringConfig};
 
 use crate::alloc::HotPathGuard;
 use crate::budget::TaskBudget;
+use crate::checkpoint::CheckpointBarrier;
 use crate::numa::NumaTopology;
 use crate::operator::{CheckpointCompleteData, Event, Operator, Output};
 use crate::reactor::{Reactor, ReactorConfig};
@@ -49,14 +50,41 @@ use super::TpcError;
 /// Messages sent to a core thread.
 #[derive(Debug)]
 pub enum CoreMessage {
-    /// Process an event
-    Event(Event),
+    /// Process an event from a specific source.
+    Event {
+        /// Index of the source that produced this event.
+        source_idx: usize,
+        /// The event data.
+        event: Event,
+    },
     /// Watermark advancement
     Watermark(i64),
     /// Request a checkpoint
     CheckpointRequest(u64),
+    /// Checkpoint barrier from a source.
+    ///
+    /// The core thread flushes the reactor before forwarding this
+    /// as `Output::Barrier` so the coordinator can track alignment.
+    Barrier {
+        /// Index of the source that emitted this barrier.
+        source_idx: usize,
+        /// The checkpoint barrier.
+        barrier: CheckpointBarrier,
+    },
     /// Graceful shutdown
     Shutdown,
+}
+
+/// Output tagged with its source index for coordinator routing.
+///
+/// Core threads wrap every `Output` in a `TaggedOutput` so the
+/// coordinator can map outputs back to the originating source.
+#[derive(Debug)]
+pub struct TaggedOutput {
+    /// Index of the source that produced this output.
+    pub source_idx: usize,
+    /// The operator output.
+    pub output: Output,
 }
 
 /// Configuration for a core handle.
@@ -109,7 +137,7 @@ pub struct CoreHandle {
     /// Inbox queue (main thread writes, core reads)
     inbox: Arc<SpscQueue<CoreMessage>>,
     /// Outbox queue (core writes, main thread reads)
-    outbox: Arc<SpscQueue<Output>>,
+    outbox: Arc<SpscQueue<TaggedOutput>>,
     /// Credit gate for backpressure (sender acquires, receiver releases)
     credit_gate: Arc<CreditGate>,
     /// Thread handle (None if thread hasn't started or has been joined)
@@ -154,7 +182,7 @@ impl CoreHandle {
             cpu_affinity.map_or_else(|| topology.current_node(), |cpu| topology.node_for_cpu(cpu));
 
         let inbox = Arc::new(SpscQueue::new(config.inbox_capacity));
-        let outbox = Arc::new(SpscQueue::new(config.outbox_capacity));
+        let outbox: Arc<SpscQueue<TaggedOutput>> = Arc::new(SpscQueue::new(config.outbox_capacity));
         let credit_gate = Arc::new(CreditGate::new(config.backpressure.clone()));
         let shutdown = Arc::new(AtomicBool::new(false));
         let events_processed = Arc::new(AtomicU64::new(0));
@@ -301,11 +329,14 @@ impl CoreHandle {
 
     /// Sends an event to the core with credit-based flow control.
     ///
+    /// The `source_idx` identifies which source produced this event,
+    /// allowing the coordinator to route outputs back to the correct source.
+    ///
     /// # Errors
     ///
     /// Returns an error if the inbox queue is full or backpressure applies.
-    pub fn send_event(&self, event: Event) -> Result<(), TpcError> {
-        self.send(CoreMessage::Event(event))
+    pub fn send_event(&self, source_idx: usize, event: Event) -> Result<(), TpcError> {
+        self.send(CoreMessage::Event { source_idx, event })
     }
 
     /// Tries to send an event without blocking.
@@ -313,47 +344,41 @@ impl CoreHandle {
     /// # Errors
     ///
     /// Returns an error if credits exhausted or queue full.
-    pub fn try_send_event(&self, event: Event) -> Result<(), TpcError> {
-        self.try_send(CoreMessage::Event(event))
+    pub fn try_send_event(&self, source_idx: usize, event: Event) -> Result<(), TpcError> {
+        self.try_send(CoreMessage::Event { source_idx, event })
     }
 
-    /// Polls the outbox for outputs.
+    /// Returns a reference to the inbox queue (for direct SPSC push from I/O threads).
+    #[must_use]
+    pub fn inbox(&self) -> &Arc<SpscQueue<CoreMessage>> {
+        &self.inbox
+    }
+
+    /// Returns a reference to the outbox queue (for direct SPSC pop).
+    #[must_use]
+    pub fn outbox(&self) -> &Arc<SpscQueue<TaggedOutput>> {
+        &self.outbox
+    }
+
+    /// Polls the outbox for tagged outputs.
     ///
-    /// Returns up to `max_count` outputs.
+    /// Returns up to `max_count` outputs, each tagged with the source index.
     ///
     /// # Note
     ///
     /// This method allocates memory. For zero-allocation polling, use
     /// [`poll_outputs_into`](Self::poll_outputs_into) or [`poll_each`](Self::poll_each) instead.
     #[must_use]
-    pub fn poll_outputs(&self, max_count: usize) -> Vec<Output> {
+    pub fn poll_outputs(&self, max_count: usize) -> Vec<TaggedOutput> {
         self.outbox.pop_batch(max_count)
     }
 
-    /// Polls the outbox for outputs into a pre-allocated buffer (zero-allocation).
+    /// Polls the outbox for tagged outputs into a pre-allocated buffer (zero-allocation).
     ///
     /// Outputs are appended to `buffer`. Returns the number of outputs added.
     /// The buffer should have sufficient capacity to avoid reallocation.
-    ///
-    /// # Example
-    ///
-    /// ```rust,ignore
-    /// let mut buffer = Vec::with_capacity(1024);
-    ///
-    /// // First poll - fills buffer
-    /// let count1 = core_handle.poll_outputs_into(&mut buffer, 100);
-    ///
-    /// // Process outputs...
-    /// for output in &buffer[..count1] {
-    ///     process(output);
-    /// }
-    ///
-    /// // Clear and reuse buffer for next poll (no allocation)
-    /// buffer.clear();
-    /// let count2 = core_handle.poll_outputs_into(&mut buffer, 100);
-    /// ```
     #[inline]
-    pub fn poll_outputs_into(&self, buffer: &mut Vec<Output>, max_count: usize) -> usize {
+    pub fn poll_outputs_into(&self, buffer: &mut Vec<TaggedOutput>, max_count: usize) -> usize {
         let start_len = buffer.len();
 
         self.outbox.pop_each(max_count, |output| {
@@ -364,7 +389,7 @@ impl CoreHandle {
         buffer.len() - start_len
     }
 
-    /// Polls the outbox with a callback for each output (zero-allocation).
+    /// Polls the outbox with a callback for each tagged output (zero-allocation).
     ///
     /// Processing stops when:
     /// - `max_count` outputs have been processed
@@ -372,30 +397,17 @@ impl CoreHandle {
     /// - The callback returns `false`
     ///
     /// Returns the number of outputs processed.
-    ///
-    /// # Example
-    ///
-    /// ```rust,ignore
-    /// // Process outputs without any allocation
-    /// let count = core_handle.poll_each(100, |output| {
-    ///     match output {
-    ///         Output::Event(event) => handle_event(event),
-    ///         _ => {}
-    ///     }
-    ///     true // Continue processing
-    /// });
-    /// ```
     #[inline]
     pub fn poll_each<F>(&self, max_count: usize, f: F) -> usize
     where
-        F: FnMut(Output) -> bool,
+        F: FnMut(TaggedOutput) -> bool,
     {
         self.outbox.pop_each(max_count, f)
     }
 
-    /// Polls a single output from the outbox.
+    /// Polls a single tagged output from the outbox.
     #[must_use]
-    pub fn poll_output(&self) -> Option<Output> {
+    pub fn poll_output(&self) -> Option<TaggedOutput> {
         self.outbox.pop()
     }
 
@@ -500,19 +512,19 @@ impl std::fmt::Debug for CoreHandle {
 }
 
 /// Context passed to the core thread.
-struct CoreThreadContext {
-    core_id: usize,
+pub(super) struct CoreThreadContext {
+    pub(super) core_id: usize,
     cpu_affinity: Option<usize>,
     reactor_config: ReactorConfig,
     numa_aware: bool,
     numa_node: usize,
-    inbox: Arc<SpscQueue<CoreMessage>>,
-    outbox: Arc<SpscQueue<Output>>,
-    credit_gate: Arc<CreditGate>,
-    shutdown: Arc<AtomicBool>,
-    events_processed: Arc<AtomicU64>,
-    outputs_dropped: Arc<AtomicU64>,
-    is_running: Arc<AtomicBool>,
+    pub(super) inbox: Arc<SpscQueue<CoreMessage>>,
+    pub(super) outbox: Arc<SpscQueue<TaggedOutput>>,
+    pub(super) credit_gate: Arc<CreditGate>,
+    pub(super) shutdown: Arc<AtomicBool>,
+    pub(super) events_processed: Arc<AtomicU64>,
+    pub(super) outputs_dropped: Arc<AtomicU64>,
+    pub(super) is_running: Arc<AtomicBool>,
     #[cfg(all(target_os = "linux", feature = "io-uring"))]
     io_uring_config: Option<IoUringConfig>,
 }
@@ -571,6 +583,7 @@ fn init_core_thread(
 }
 
 /// Main function for the core thread.
+#[allow(clippy::too_many_lines)]
 fn core_thread_main(
     ctx: &CoreThreadContext,
     operators: Vec<Box<dyn Operator>>,
@@ -582,6 +595,11 @@ fn core_thread_main(
 
     // Reusable buffer for reactor outputs (avoids per-poll Vec allocation)
     let mut poll_buffer: Vec<Output> = Vec::with_capacity(256);
+
+    // Track the last source_idx seen for tagging reactor outputs.
+    // When events from multiple sources are interleaved, reactor outputs
+    // are attributed to source 0 (the coordinator resolves this).
+    let mut last_source_idx: usize = 0;
 
     // Main loop
     loop {
@@ -602,7 +620,8 @@ fn core_thread_main(
 
         while let Some(message) = ctx.inbox.pop() {
             match message {
-                CoreMessage::Event(event) => {
+                CoreMessage::Event { source_idx, event } => {
+                    last_source_idx = source_idx;
                     if let Err(e) = reactor.submit(event) {
                         tracing::error!("Core {}: Failed to submit event: {e}", ctx.core_id);
                     }
@@ -625,7 +644,44 @@ fn core_thread_main(
                             checkpoint_id,
                             operator_states,
                         }));
-                    if ctx.outbox.push(checkpoint_output).is_err() {
+                    if ctx
+                        .outbox
+                        .push(TaggedOutput {
+                            source_idx: 0,
+                            output: checkpoint_output,
+                        })
+                        .is_err()
+                    {
+                        ctx.outputs_dropped.fetch_add(1, Ordering::Relaxed);
+                    }
+                    messages_processed += 1;
+                    had_work = true;
+                }
+                CoreMessage::Barrier {
+                    source_idx,
+                    barrier,
+                } => {
+                    // Flush reactor: process all queued events before the barrier
+                    poll_buffer.clear();
+                    reactor.poll_into(&mut poll_buffer);
+                    for output in poll_buffer.drain(..) {
+                        if ctx
+                            .outbox
+                            .push(TaggedOutput { source_idx, output })
+                            .is_err()
+                        {
+                            ctx.outputs_dropped.fetch_add(1, Ordering::Relaxed);
+                        }
+                    }
+                    // Forward barrier to coordinator
+                    if ctx
+                        .outbox
+                        .push(TaggedOutput {
+                            source_idx,
+                            output: Output::Barrier(Box::new(barrier)),
+                        })
+                        .is_err()
+                    {
                         ctx.outputs_dropped.fetch_add(1, Ordering::Relaxed);
                     }
                     messages_processed += 1;
@@ -659,9 +715,16 @@ fn core_thread_main(
         ctx.events_processed
             .fetch_add(poll_buffer.len() as u64, Ordering::Relaxed);
 
-        // Push outputs to outbox
+        // Push outputs to outbox tagged with the last source index
         for output in poll_buffer.drain(..) {
-            if ctx.outbox.push(output).is_err() {
+            if ctx
+                .outbox
+                .push(TaggedOutput {
+                    source_idx: last_source_idx,
+                    output,
+                })
+                .is_err()
+            {
                 ctx.outputs_dropped.fetch_add(1, Ordering::Relaxed);
             }
             had_work = true;
@@ -680,7 +743,10 @@ fn core_thread_main(
     poll_buffer.clear();
     reactor.poll_into(&mut poll_buffer);
     for output in poll_buffer.drain(..) {
-        let _ = ctx.outbox.push(output);
+        let _ = ctx.outbox.push(TaggedOutput {
+            source_idx: last_source_idx,
+            output,
+        });
     }
 
     ctx.is_running.store(false, Ordering::Release);
@@ -836,7 +902,7 @@ mod tests {
 
         // Send an event
         let event = make_event(42);
-        handle.send_event(event).unwrap();
+        handle.send_event(0, event).unwrap();
 
         // Wait a bit for processing
         thread::sleep(Duration::from_millis(50));
@@ -844,6 +910,8 @@ mod tests {
         // Poll for outputs
         let outputs = handle.poll_outputs(10);
         assert!(!outputs.is_empty());
+        // Verify source_idx is preserved
+        assert_eq!(outputs[0].source_idx, 0);
 
         handle.shutdown_and_join().unwrap();
     }
@@ -865,9 +933,9 @@ mod tests {
         let handle =
             CoreHandle::spawn_with_operators(config, vec![Box::new(PassthroughOperator)]).unwrap();
 
-        // Send multiple events
+        // Send multiple events from source 0
         for i in 0..100 {
-            handle.send_event(make_event(i)).unwrap();
+            handle.send_event(0, make_event(i)).unwrap();
         }
 
         // Wait for processing
@@ -965,7 +1033,7 @@ mod tests {
 
         // Send events
         for i in 0..10 {
-            handle.send_event(make_event(i)).unwrap();
+            handle.send_event(0, make_event(i)).unwrap();
         }
 
         // Wait for processing
@@ -1006,7 +1074,7 @@ mod tests {
 
         // Send events
         for i in 0..10 {
-            handle.send_event(make_event(i)).unwrap();
+            handle.send_event(0, make_event(i)).unwrap();
         }
 
         // Wait for processing
@@ -1014,8 +1082,8 @@ mod tests {
 
         // Poll with callback
         let mut event_count = 0;
-        let count = handle.poll_each(100, |output| {
-            if matches!(output, Output::Event(_)) {
+        let count = handle.poll_each(100, |tagged| {
+            if matches!(tagged.output, Output::Event(_)) {
                 event_count += 1;
             }
             true
@@ -1046,7 +1114,7 @@ mod tests {
 
         // Send events
         for i in 0..20 {
-            handle.send_event(make_event(i)).unwrap();
+            handle.send_event(0, make_event(i)).unwrap();
         }
 
         // Wait for processing
@@ -1094,7 +1162,9 @@ mod tests {
 
         // Poll outputs - should contain a watermark
         let outputs = handle.poll_outputs(100);
-        let has_watermark = outputs.iter().any(|o| matches!(o, Output::Watermark(_)));
+        let has_watermark = outputs
+            .iter()
+            .any(|o| matches!(o.output, Output::Watermark(_)));
         assert!(
             has_watermark,
             "Expected watermark output after Watermark message"
@@ -1130,10 +1200,14 @@ mod tests {
         let outputs = handle.poll_outputs(100);
         let checkpoint = outputs
             .iter()
-            .find(|o| matches!(o, Output::CheckpointComplete(_)));
+            .find(|o| matches!(o.output, Output::CheckpointComplete(_)));
         assert!(checkpoint.is_some(), "Expected CheckpointComplete output");
 
-        if let Some(Output::CheckpointComplete(data)) = checkpoint {
+        if let Some(TaggedOutput {
+            output: Output::CheckpointComplete(data),
+            ..
+        }) = checkpoint
+        {
             assert_eq!(data.checkpoint_id, 42);
             // One operator (PassthroughOperator)
             assert_eq!(data.operator_states.len(), 1);
@@ -1162,7 +1236,7 @@ mod tests {
 
         // Send many events without polling - outbox should fill up
         for i in 0..100 {
-            let _ = handle.send_event(make_event(i));
+            let _ = handle.send_event(0, make_event(i));
         }
 
         // Wait for processing to fill and overflow the outbox
@@ -1174,6 +1248,53 @@ mod tests {
             dropped > 0,
             "Expected some outputs to be dropped with outbox_capacity=4"
         );
+
+        handle.shutdown_and_join().unwrap();
+    }
+
+    #[test]
+    fn test_barrier_handling() {
+        let config = CoreConfig {
+            core_id: 0,
+            cpu_affinity: None,
+            inbox_capacity: 1024,
+            outbox_capacity: 1024,
+            reactor_config: ReactorConfig::default(),
+            backpressure: super::BackpressureConfig::default(),
+            numa_aware: false,
+            #[cfg(all(target_os = "linux", feature = "io-uring"))]
+            io_uring_config: None,
+        };
+
+        let handle =
+            CoreHandle::spawn_with_operators(config, vec![Box::new(PassthroughOperator)]).unwrap();
+
+        // Send some events then a barrier
+        handle.send_event(0, make_event(1)).unwrap();
+        handle.send_event(0, make_event(2)).unwrap();
+        handle
+            .send(CoreMessage::Barrier {
+                source_idx: 0,
+                barrier: CheckpointBarrier::new(99, 1),
+            })
+            .unwrap();
+
+        // Wait for processing
+        thread::sleep(Duration::from_millis(100));
+
+        // Poll outputs - should contain events then a barrier
+        let outputs = handle.poll_outputs(100);
+        let has_barrier = outputs
+            .iter()
+            .any(|o| matches!(o.output, Output::Barrier(_)));
+        assert!(has_barrier, "Expected Barrier output");
+
+        // Barrier should have correct source_idx
+        let barrier_tagged = outputs
+            .iter()
+            .find(|o| matches!(o.output, Output::Barrier(_)))
+            .unwrap();
+        assert_eq!(barrier_tagged.source_idx, 0);
 
         handle.shutdown_and_join().unwrap();
     }

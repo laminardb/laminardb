@@ -26,11 +26,16 @@
 pub mod config;
 pub mod coordinator;
 pub mod metrics;
+pub mod source_adapter;
 pub mod source_event;
 pub mod source_task;
+pub mod tpc_coordinator;
+pub mod tpc_runtime;
 
 pub use config::PipelineConfig;
 pub use coordinator::{PipelineCallback, PipelineCoordinator, SourceRegistration};
 pub use metrics::{MetricsSnapshot, SourceTaskMetrics};
 pub use source_event::SourceEvent;
 pub use source_task::SourceTaskHandle;
+pub use tpc_coordinator::TpcPipelineCoordinator;
+pub use tpc_runtime::TpcRuntime;

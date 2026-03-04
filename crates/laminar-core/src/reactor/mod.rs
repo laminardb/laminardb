@@ -624,6 +624,12 @@ impl Sink for StdoutSink {
                         operator_states.len()
                     );
                 }
+                Output::Barrier(barrier) => {
+                    println!(
+                        "Barrier: checkpoint_id={}, epoch={}",
+                        barrier.checkpoint_id, barrier.epoch
+                    );
+                }
             }
         }
         Ok(())
