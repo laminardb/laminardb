@@ -180,6 +180,9 @@ mod linux_impl {
                 Output::CheckpointComplete(data) => {
                     format!("CHECKPOINT_COMPLETE id={}\n", data.checkpoint_id).into_bytes()
                 }
+                Output::Barrier(barrier) => {
+                    format!("BARRIER epoch={}\n", barrier.epoch()).into_bytes()
+                }
             };
 
             // Acquire a buffer

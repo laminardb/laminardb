@@ -211,7 +211,8 @@ impl CoreRingHandler<'_> {
         self.ctx
             .events_processed
             .fetch_add(self.poll_buffer.len() as u64, Ordering::Relaxed);
-        for output in self.poll_buffer.drain(..) {
+        let outputs: Vec<_> = self.poll_buffer.drain(..).collect();
+        for output in outputs {
             self.push_output(TaggedOutput { source_idx, output });
         }
     }
