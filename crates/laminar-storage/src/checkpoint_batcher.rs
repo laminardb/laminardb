@@ -374,7 +374,8 @@ mod tests {
 
     fn make_batcher(threshold: usize) -> (CheckpointBatcher, Arc<dyn ObjectStore>) {
         let store: Arc<dyn ObjectStore> = Arc::new(InMemory::new());
-        let batcher = CheckpointBatcher::new(store.clone(), String::new(), Some(threshold)).unwrap();
+        let batcher =
+            CheckpointBatcher::new(store.clone(), String::new(), Some(threshold)).unwrap();
         (batcher, store)
     }
 

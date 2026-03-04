@@ -1449,7 +1449,8 @@ mod tests {
     #[test]
     fn test_obj_with_prefix() {
         let inner = Arc::new(object_store::memory::InMemory::new());
-        let store = ObjectStoreCheckpointStore::new(inner, "nodes/abc123/".to_string(), 10).unwrap();
+        let store =
+            ObjectStoreCheckpointStore::new(inner, "nodes/abc123/".to_string(), 10).unwrap();
 
         store.save(&make_manifest(1, 42)).unwrap();
         let loaded = store.load_latest().unwrap().unwrap();

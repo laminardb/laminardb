@@ -232,7 +232,10 @@ impl DynAccumulator for DataFusionAccumulatorAdapter {
     fn clone_box(&self) -> Box<dyn DynAccumulator> {
         let create = || {
             self.factory.create_df_accumulator().unwrap_or_else(|e| {
-                panic!("failed to create DataFusion accumulator '{}': {e}", self.function_name);
+                panic!(
+                    "failed to create DataFusion accumulator '{}': {e}",
+                    self.function_name
+                );
             })
         };
         let new_inner = create();

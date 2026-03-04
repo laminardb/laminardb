@@ -107,8 +107,7 @@ impl SourceIoThread {
                     cp_tx,
                     core_thread,
                 )
-            })
-?;
+            })?;
 
         Ok(Self {
             thread: Some(thread),

@@ -93,8 +93,7 @@ fn build_local_file_system(url: &str) -> Result<Arc<dyn ObjectStore>, ObjectStor
         ));
     }
 
-    let fs = LocalFileSystem::new_with_prefix(path)
-        ?;
+    let fs = LocalFileSystem::new_with_prefix(path)?;
     Ok(Arc::new(fs))
 }
 
@@ -112,16 +111,10 @@ fn build_s3(
     let mut builder = AmazonS3Builder::from_env().with_url(url);
 
     for (key, value) in options {
-        builder = builder.with_config(
-            key.parse()
-                ?,
-            value,
-        );
+        builder = builder.with_config(key.parse()?, value);
     }
 
-    let store = builder
-        .build()
-        ?;
+    let store = builder.build()?;
     Ok(Arc::new(store))
 }
 
@@ -150,16 +143,10 @@ fn build_gcs(
     let mut builder = GoogleCloudStorageBuilder::from_env().with_url(url);
 
     for (key, value) in options {
-        builder = builder.with_config(
-            key.parse()
-                ?,
-            value,
-        );
+        builder = builder.with_config(key.parse()?, value);
     }
 
-    let store = builder
-        .build()
-        ?;
+    let store = builder.build()?;
     Ok(Arc::new(store))
 }
 
@@ -188,16 +175,10 @@ fn build_azure(
     let mut builder = MicrosoftAzureBuilder::from_env().with_url(url);
 
     for (key, value) in options {
-        builder = builder.with_config(
-            key.parse()
-                ?,
-            value,
-        );
+        builder = builder.with_config(key.parse()?, value);
     }
 
-    let store = builder
-        .build()
-        ?;
+    let store = builder.build()?;
     Ok(Arc::new(store))
 }
 
