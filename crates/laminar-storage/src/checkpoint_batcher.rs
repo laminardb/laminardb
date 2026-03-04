@@ -137,20 +137,18 @@ impl CheckpointBatcher {
     /// `flush_threshold` is the uncompressed buffer size that triggers a flush
     /// (default: 8 MB).
     ///
-    /// # Panics
+    /// # Errors
     ///
-    /// Panics if the internal Tokio runtime cannot be created.
-    #[must_use]
+    /// Returns `std::io::Error` if the internal Tokio runtime cannot be created.
     pub fn new(
         store: Arc<dyn ObjectStore>,
         prefix: String,
         flush_threshold: Option<usize>,
-    ) -> Self {
+    ) -> std::io::Result<Self> {
         let rt = tokio::runtime::Builder::new_current_thread()
             .enable_all()
-            .build()
-            .expect("failed to create batcher runtime");
-        Self {
+            .build()?;
+        Ok(Self {
             buffer: Vec::new(),
             buffer_size: 0,
             flush_threshold: flush_threshold.unwrap_or(DEFAULT_FLUSH_THRESHOLD),
@@ -158,7 +156,7 @@ impl CheckpointBatcher {
             prefix,
             rt,
             metrics: Arc::new(BatchMetrics::new()),
-        }
+        })
     }
 
     /// Add a state blob to the buffer.
@@ -376,7 +374,8 @@ mod tests {
 
     fn make_batcher(threshold: usize) -> (CheckpointBatcher, Arc<dyn ObjectStore>) {
         let store: Arc<dyn ObjectStore> = Arc::new(InMemory::new());
-        let batcher = CheckpointBatcher::new(store.clone(), String::new(), Some(threshold));
+        let batcher =
+            CheckpointBatcher::new(store.clone(), String::new(), Some(threshold)).unwrap();
         (batcher, store)
     }
 

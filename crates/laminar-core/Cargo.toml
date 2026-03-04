@@ -84,9 +84,6 @@ cranelift-native = { workspace = true, optional = true }
 datafusion-expr = { workspace = true, optional = true }
 datafusion-common = { workspace = true, optional = true }
 
-# Secondary indexes
-redb = { workspace = true }
-
 # Delta (optional, multi-node distributed mode — server-only)
 tonic = { workspace = true, optional = true }
 tonic-prost = { workspace = true, optional = true }

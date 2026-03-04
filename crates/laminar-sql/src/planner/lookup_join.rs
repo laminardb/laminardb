@@ -306,6 +306,10 @@ mod tests {
     use datafusion_optimizer::optimizer::OptimizerContext;
 
     fn test_lookup_info() -> LookupTableInfo {
+        let arrow_schema = Arc::new(Schema::new(vec![
+            Field::new("id", DataType::Int32, false),
+            Field::new("name", DataType::Utf8, true),
+        ]));
         LookupTableInfo {
             name: "customers".to_string(),
             columns: vec![
@@ -322,6 +326,8 @@ mod tests {
                 cache_ttl: None,
                 pushdown_mode: PushdownMode::Auto,
             },
+            arrow_schema,
+            raw_options: std::collections::HashMap::new(),
         }
     }
 

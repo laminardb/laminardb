@@ -9,7 +9,6 @@ use io_uring::types::{self, Fd};
 use io_uring::IoUring;
 use std::io;
 use std::os::fd::RawFd;
-use std::sync::atomic::{AtomicU64, Ordering};
 
 use super::affinity::{OperationType, RingAffinity};
 use super::config::ThreeRingConfig;
@@ -62,14 +61,10 @@ pub struct ThreeRingReactor {
     router: CompletionRouter,
 
     /// Next `user_data` ID.
-    next_id: AtomicU64,
+    next_id: u64,
 
     /// Statistics for monitoring.
     stats: ThreeRingStats,
-
-    /// Configuration.
-    #[allow(dead_code)]
-    config: ThreeRingConfig,
 
     /// Whether the reactor is closed.
     closed: bool,
@@ -92,6 +87,7 @@ impl ThreeRingReactor {
     /// # Errors
     ///
     /// Returns an error if ring creation fails.
+    #[allow(clippy::needless_pass_by_value)]
     pub fn new(core_id: usize, config: ThreeRingConfig) -> Result<Self, IoUringError> {
         config.validate()?;
 
@@ -131,9 +127,8 @@ impl ThreeRingReactor {
             eventfd,
             core_id,
             router: CompletionRouter::new(),
-            next_id: AtomicU64::new(0),
+            next_id: 0,
             stats: ThreeRingStats::new(),
-            config,
             closed: false,
             cqe_scratch: Vec::with_capacity(CQE_SCRATCH_CAPACITY),
             completion_scratch: Vec::with_capacity(CQE_SCRATCH_CAPACITY),
@@ -254,17 +249,24 @@ impl ThreeRingReactor {
     }
 
     /// Generate the next `user_data` ID.
-    pub fn next_user_data(&self) -> u64 {
-        self.next_id.fetch_add(1, Ordering::Relaxed)
+    pub fn next_user_data(&mut self) -> u64 {
+        let id = self.next_id;
+        self.next_id += 1;
+        id
     }
 
     /// Submit an entry to the latency ring.
+    ///
+    /// # Safety
+    ///
+    /// The caller must ensure all memory referenced by the SQE (buffers, file
+    /// descriptors) remains valid until the corresponding CQE is reaped.
     ///
     /// # Errors
     ///
     /// Returns an error if the ring is closed or submission fails.
     #[allow(clippy::needless_pass_by_value)]
-    pub fn submit_to_latency(&mut self, entry: SqEntry) -> Result<u64, IoUringError> {
+    pub unsafe fn submit_to_latency(&mut self, entry: SqEntry) -> Result<u64, IoUringError> {
         if self.closed {
             return Err(IoUringError::RingClosed);
         }
@@ -285,11 +287,16 @@ impl ThreeRingReactor {
 
     /// Submit an entry to the main ring.
     ///
+    /// # Safety
+    ///
+    /// The caller must ensure all memory referenced by the SQE (buffers, file
+    /// descriptors) remains valid until the corresponding CQE is reaped.
+    ///
     /// # Errors
     ///
     /// Returns an error if the ring is closed or submission fails.
     #[allow(clippy::needless_pass_by_value)]
-    pub fn submit_to_main(&mut self, entry: SqEntry) -> Result<u64, IoUringError> {
+    pub unsafe fn submit_to_main(&mut self, entry: SqEntry) -> Result<u64, IoUringError> {
         if self.closed {
             return Err(IoUringError::RingClosed);
         }
@@ -312,10 +319,15 @@ impl ThreeRingReactor {
     ///
     /// Falls back to main ring if poll ring is not enabled.
     ///
+    /// # Safety
+    ///
+    /// The caller must ensure all memory referenced by the SQE (buffers, file
+    /// descriptors) remains valid until the corresponding CQE is reaped.
+    ///
     /// # Errors
     ///
     /// Returns an error if the ring is closed or submission fails.
-    pub fn submit_to_poll(&mut self, entry: SqEntry) -> Result<u64, IoUringError> {
+    pub unsafe fn submit_to_poll(&mut self, entry: SqEntry) -> Result<u64, IoUringError> {
         if self.closed {
             return Err(IoUringError::RingClosed);
         }
@@ -341,10 +353,15 @@ impl ThreeRingReactor {
 
     /// Submit an entry with automatic ring selection based on operation type.
     ///
+    /// # Safety
+    ///
+    /// The caller must ensure all memory referenced by the SQE (buffers, file
+    /// descriptors) remains valid until the corresponding CQE is reaped.
+    ///
     /// # Errors
     ///
     /// Returns an error if submission fails.
-    pub fn submit_with_affinity(
+    pub unsafe fn submit_with_affinity(
         &mut self,
         entry: SqEntry,
         op_type: OperationType,
@@ -579,10 +596,21 @@ impl ThreeRingReactor {
 
     /// Submit a network receive operation (latency ring).
     ///
+    /// # Safety
+    ///
+    /// - `buf` must point to valid, writable memory of at least `len` bytes that
+    ///   remains valid until the corresponding CQE is reaped.
+    /// - `fd` must be a valid open file descriptor for the lifetime of the operation.
+    ///
     /// # Errors
     ///
     /// Returns an error if submission fails.
-    pub fn submit_recv(&mut self, fd: RawFd, buf: *mut u8, len: u32) -> Result<u64, IoUringError> {
+    pub unsafe fn submit_recv(
+        &mut self,
+        fd: RawFd,
+        buf: *mut u8,
+        len: u32,
+    ) -> Result<u64, IoUringError> {
         let user_data = self.next_user_data();
 
         let entry = opcode::Recv::new(Fd(fd), buf, len)
@@ -601,10 +629,16 @@ impl ThreeRingReactor {
 
     /// Submit a network send operation (latency ring).
     ///
+    /// # Safety
+    ///
+    /// - `buf` must point to valid, readable memory of at least `len` bytes that
+    ///   remains valid until the corresponding CQE is reaped.
+    /// - `fd` must be a valid open file descriptor for the lifetime of the operation.
+    ///
     /// # Errors
     ///
     /// Returns an error if submission fails.
-    pub fn submit_send(
+    pub unsafe fn submit_send(
         &mut self,
         fd: RawFd,
         buf: *const u8,
@@ -628,10 +662,16 @@ impl ThreeRingReactor {
 
     /// Submit a WAL write operation (main ring).
     ///
+    /// # Safety
+    ///
+    /// - `buf` must point to valid, readable memory of at least `len` bytes that
+    ///   remains valid until the corresponding CQE is reaped.
+    /// - `fd` must be a valid open file descriptor for the lifetime of the operation.
+    ///
     /// # Errors
     ///
     /// Returns an error if submission fails.
-    pub fn submit_wal_write(
+    pub unsafe fn submit_wal_write(
         &mut self,
         fd: RawFd,
         buf: *const u8,
@@ -657,10 +697,18 @@ impl ThreeRingReactor {
 
     /// Submit a WAL sync operation (main ring).
     ///
+    /// # Safety
+    ///
+    /// - `fd` must be a valid open file descriptor for the lifetime of the operation.
+    ///
     /// # Errors
     ///
     /// Returns an error if submission fails.
-    pub fn submit_wal_sync(&mut self, fd: RawFd, datasync: bool) -> Result<u64, IoUringError> {
+    pub unsafe fn submit_wal_sync(
+        &mut self,
+        fd: RawFd,
+        datasync: bool,
+    ) -> Result<u64, IoUringError> {
         let user_data = self.next_user_data();
 
         let entry = if datasync {
@@ -683,10 +731,16 @@ impl ThreeRingReactor {
 
     /// Submit a storage read operation (poll ring or main ring fallback).
     ///
+    /// # Safety
+    ///
+    /// - `buf` must point to valid, writable memory of at least `len` bytes that
+    ///   remains valid until the corresponding CQE is reaped.
+    /// - `fd` must be a valid open file descriptor for the lifetime of the operation.
+    ///
     /// # Errors
     ///
     /// Returns an error if submission fails.
-    pub fn submit_storage_read(
+    pub unsafe fn submit_storage_read(
         &mut self,
         fd: RawFd,
         buf: *mut u8,
@@ -718,10 +772,16 @@ impl ThreeRingReactor {
 
     /// Submit a storage write operation (poll ring or main ring fallback).
     ///
+    /// # Safety
+    ///
+    /// - `buf` must point to valid, readable memory of at least `len` bytes that
+    ///   remains valid until the corresponding CQE is reaped.
+    /// - `fd` must be a valid open file descriptor for the lifetime of the operation.
+    ///
     /// # Errors
     ///
     /// Returns an error if submission fails.
-    pub fn submit_storage_write(
+    pub unsafe fn submit_storage_write(
         &mut self,
         fd: RawFd,
         buf: *const u8,
@@ -752,12 +812,37 @@ impl ThreeRingReactor {
     }
 
     /// Close the reactor.
+    ///
+    /// Drains all pending operations before closing to prevent in-flight
+    /// operations from accessing freed memory.
     pub fn close(&mut self) {
         if !self.closed {
             self.closed = true;
+
+            // Drain pending operations: submit a NOP and reap all outstanding CQEs
+            // to ensure the kernel is not still accessing any user-space buffers.
+            if self.router.pending_count() > 0 {
+                let nop = opcode::Nop::new().build().user_data(u64::MAX);
+                // SAFETY: Nop references no user memory.
+                unsafe {
+                    let _ = self.latency_ring.submission().push(&nop);
+                }
+                // Best-effort drain — ignore errors during shutdown.
+                let _ = self.latency_ring.submit_and_wait(1);
+                let _ = self.main_ring.submit_and_wait(0);
+                // Drain all CQEs
+                for _ in self.latency_ring.completion() {}
+                for _ in self.main_ring.completion() {}
+                if let Some(ref mut ring) = self.poll_ring {
+                    let _ = ring.submit_and_wait(0);
+                    for _ in ring.completion() {}
+                }
+            }
+
             self.router.clear();
 
-            // Close eventfd
+            // SAFETY: eventfd is a valid file descriptor created in new().
+            // We close it exactly once (guarded by the `closed` flag).
             #[cfg(target_os = "linux")]
             unsafe {
                 libc::close(self.eventfd);
@@ -848,7 +933,7 @@ mod tests {
     #[test]
     fn test_next_user_data() {
         let config = make_config();
-        let reactor = match ThreeRingReactor::new(0, config) {
+        let mut reactor = match ThreeRingReactor::new(0, config) {
             Ok(r) => r,
             Err(_) => return,
         };
@@ -888,8 +973,9 @@ mod tests {
 
         // Operations should fail after close
         let entry = opcode::Nop::new().build().user_data(1);
+        // SAFETY: Nop has no memory references; testing error path only.
         assert!(matches!(
-            reactor.submit_to_latency(entry),
+            unsafe { reactor.submit_to_latency(entry) },
             Err(IoUringError::RingClosed)
         ));
     }
@@ -905,7 +991,8 @@ mod tests {
         let user_data = reactor.next_user_data();
         let entry = opcode::Nop::new().build().user_data(user_data);
 
-        let result = reactor.submit_to_latency(entry);
+        // SAFETY: Nop has no memory references.
+        let result = unsafe { reactor.submit_to_latency(entry) };
         assert!(result.is_ok());
         assert_eq!(reactor.stats().latency_submissions, 1);
     }
@@ -921,7 +1008,8 @@ mod tests {
         let user_data = reactor.next_user_data();
         let entry = opcode::Nop::new().build().user_data(user_data);
 
-        let result = reactor.submit_to_main(entry);
+        // SAFETY: Nop has no memory references.
+        let result = unsafe { reactor.submit_to_main(entry) };
         assert!(result.is_ok());
         assert_eq!(reactor.stats().main_submissions, 1);
     }
@@ -937,8 +1025,8 @@ mod tests {
         let user_data = reactor.next_user_data();
         let entry = opcode::Nop::new().build().user_data(user_data);
 
-        // Should fall back to main ring
-        let result = reactor.submit_to_poll(entry);
+        // SAFETY: Nop has no memory references.
+        let result = unsafe { reactor.submit_to_poll(entry) };
         assert!(result.is_ok());
         assert_eq!(reactor.stats().poll_fallbacks, 1);
         assert_eq!(reactor.stats().main_submissions, 1);
@@ -955,7 +1043,8 @@ mod tests {
         let user_data = reactor.next_user_data();
         let entry = opcode::Nop::new().build().user_data(user_data);
 
-        let result = reactor.submit_with_affinity(entry, OperationType::NetworkRecv);
+        // SAFETY: Nop has no memory references.
+        let result = unsafe { reactor.submit_with_affinity(entry, OperationType::NetworkRecv) };
         assert!(result.is_ok());
         assert_eq!(reactor.stats().latency_submissions, 1);
         assert!(reactor.router().is_pending(user_data));
@@ -974,9 +1063,12 @@ mod tests {
         let entry2 = opcode::Nop::new().build().user_data(2);
         let entry3 = opcode::Nop::new().build().user_data(3);
 
-        let _ = reactor.submit_to_latency(entry1);
-        let _ = reactor.submit_to_main(entry2);
-        let _ = reactor.submit_to_poll(entry3); // Falls back to main
+        // SAFETY: Nop has no memory references.
+        unsafe {
+            let _ = reactor.submit_to_latency(entry1);
+            let _ = reactor.submit_to_main(entry2);
+            let _ = reactor.submit_to_poll(entry3); // Falls back to main
+        }
 
         let stats = reactor.stats();
         assert_eq!(stats.latency_submissions, 1);

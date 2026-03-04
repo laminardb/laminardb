@@ -3,42 +3,24 @@
 //! Provides an in-memory backend for storing reference/dimension table rows.
 
 use std::collections::HashMap;
-use std::io::Cursor;
 
 use arrow::array::RecordBatch;
 use arrow::datatypes::SchemaRef;
 
 use crate::error::DbError;
 
-// ── Arrow IPC helpers ──
+// ── Arrow IPC helpers (delegates to laminar-core::serialization) ──
 
-/// Serialize a single `RecordBatch` to Arrow IPC bytes.
 #[allow(dead_code)]
 pub(crate) fn serialize_record_batch(batch: &RecordBatch) -> Result<Vec<u8>, DbError> {
-    let mut buf = Vec::new();
-    {
-        let mut writer = arrow_ipc::writer::StreamWriter::try_new(&mut buf, batch.schema_ref())
-            .map_err(|e| DbError::Storage(format!("IPC writer init: {e}")))?;
-        writer
-            .write(batch)
-            .map_err(|e| DbError::Storage(format!("IPC write: {e}")))?;
-        writer
-            .finish()
-            .map_err(|e| DbError::Storage(format!("IPC finish: {e}")))?;
-    }
-    Ok(buf)
+    laminar_core::serialization::serialize_batch_stream(batch)
+        .map_err(|e| DbError::Storage(format!("IPC: {e}")))
 }
 
-/// Deserialize a `RecordBatch` from Arrow IPC bytes.
 #[allow(dead_code)]
 pub(crate) fn deserialize_record_batch(data: &[u8]) -> Result<RecordBatch, DbError> {
-    let cursor = Cursor::new(data);
-    let mut reader = arrow_ipc::reader::StreamReader::try_new(cursor, None)
-        .map_err(|e| DbError::Storage(format!("IPC reader init: {e}")))?;
-    reader
-        .next()
-        .ok_or_else(|| DbError::Storage("IPC: no record batch in data".to_string()))?
-        .map_err(|e| DbError::Storage(format!("IPC read: {e}")))
+    laminar_core::serialization::deserialize_batch_stream(data)
+        .map_err(|e| DbError::Storage(format!("IPC: {e}")))
 }
 
 // ── TableBackend enum ──

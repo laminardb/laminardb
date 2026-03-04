@@ -1,36 +1,38 @@
-//! Event-driven connector pipeline.
+//! Thread-per-core connector pipeline.
 //!
-//! Replaces the monolithic polling loop in `db.rs` with a fan-out/fan-in
-//! architecture where each source connector runs in its own tokio task
-//! with exclusive ownership (no `Arc<Mutex>`).
+//! Each source connector runs on a dedicated I/O thread with a
+//! single-threaded tokio runtime, pushing events through SPSC queues
+//! to CPU-pinned core threads. The `TpcPipelineCoordinator` drains
+//! core outboxes, runs SQL execution cycles, routes results to sinks,
+//! and manages checkpoint barriers.
 //!
 //! # Architecture
 //!
 //! ```text
 //! ┌──────────┐     ┌──────────┐     ┌──────────┐
-//! │ Source 0  │     │ Source 1  │     │ Source N  │   Fan-out: per-source tasks
-//! │  (task)   │     │  (task)   │     │  (task)   │
+//! │ Source 0  │     │ Source 1  │     │ Source N  │   I/O threads
+//! │ (thread)  │     │ (thread)  │     │ (thread)  │
 //! └────┬─────┘     └────┬─────┘     └────┬─────┘
-//!      │                │                │
+//!      │ SPSC           │ SPSC           │ SPSC
+//!      ▼                ▼                ▼
+//! ┌──────────┐     ┌──────────┐     ┌──────────┐
+//! │  Core 0   │     │  Core 1   │     │  Core M   │   Pinned threads
+//! └────┬─────┘     └────┬─────┘     └────┬─────┘
+//!      │ SPSC           │ SPSC           │ SPSC
 //!      └───────┬────────┘────────────────┘
 //!              ▼
-//!     ┌─────────────────┐
-//!     │   mpsc channel   │  Fan-in: bounded channel
-//!     └───────┬─────────┘
-//!             ▼
-//!     ┌─────────────────┐
-//!     │  Coordinator    │  Single task: SQL exec, sink routing, checkpoints
-//!     └─────────────────┘
+//!     ┌─────────────────────┐
+//!     │ TpcPipelineCoordinator │  tokio task: SQL exec, sinks, checkpoints
+//!     └─────────────────────┘
 //! ```
 
+pub mod callback;
 pub mod config;
-pub mod coordinator;
-pub mod metrics;
-pub mod source_event;
-pub mod source_task;
+pub mod source_adapter;
+pub mod tpc_coordinator;
+pub mod tpc_runtime;
 
+pub use callback::{PipelineCallback, SourceRegistration};
 pub use config::PipelineConfig;
-pub use coordinator::{PipelineCallback, PipelineCoordinator, SourceRegistration};
-pub use metrics::{MetricsSnapshot, SourceTaskMetrics};
-pub use source_event::SourceEvent;
-pub use source_task::SourceTaskHandle;
+pub use tpc_coordinator::TpcPipelineCoordinator;
+pub use tpc_runtime::TpcRuntime;

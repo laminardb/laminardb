@@ -25,13 +25,12 @@
 #![allow(clippy::module_name_repetitions)]
 #![allow(clippy::disallowed_types)]
 
-#[allow(dead_code)]
-mod adaptive;
 mod aggregate_state;
 mod asof_batch;
 mod batch_filter;
 mod builder;
 mod catalog;
+mod catalog_connector;
 /// Unified checkpoint coordination.
 pub mod checkpoint_coordinator;
 mod config;
@@ -42,7 +41,7 @@ mod eowc_state;
 mod error;
 mod handle;
 mod metrics;
-/// Event-driven connector pipeline (fan-out/fan-in architecture).
+/// Thread-per-core connector pipeline.
 pub mod pipeline;
 mod pipeline_checkpoint;
 /// Deployment profiles.

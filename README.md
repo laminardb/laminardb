@@ -592,9 +592,6 @@ crates/
   laminar-storage/     Durability: WAL, checkpointing, per-core WAL, recovery
   laminar-connectors/  Connectors: Kafka, CDC, WebSocket, Delta Lake, Iceberg, SDK
   laminar-db/          Unified database facade, checkpoint coordination, FFI API
-  laminar-auth/        Authentication and authorization (planned -- stubs only)
-  laminar-admin/       Admin REST API (planned -- stubs only)
-  laminar-observe/     Observability: metrics, tracing (planned -- stubs only)
   laminar-derive/      Derive macros: Record, FromRecordBatch, FromRow, ConnectorConfig
   laminar-server/      Standalone server binary (skeleton)
 examples/
@@ -614,7 +611,7 @@ laminar-db  (facade)
         |-- laminar-storage
 
 laminar-derive            (proc macros, no internal deps)
-laminar-server            (binary: laminar-db + laminar-admin + laminar-auth + laminar-observe)
+laminar-server            (binary: laminar-db + laminar-connectors)
 ```
 
 ---

@@ -28,7 +28,7 @@ use crate::metrics::ConnectorMetrics;
 use crate::serde::{self, Format, RecordDeserializer};
 
 use super::avro::AvroDeserializer;
-use super::backpressure::BackpressureController;
+use super::backpressure::KafkaBackpressureController;
 use super::config::{KafkaSourceConfig, TopicSubscription};
 use super::metrics::KafkaSourceMetrics;
 use super::offsets::OffsetTracker;
@@ -71,7 +71,7 @@ pub struct KafkaSource {
     /// Arrow schema for output batches.
     schema: SchemaRef,
     /// Backpressure controller.
-    backpressure: BackpressureController,
+    backpressure: KafkaBackpressureController,
     /// Shared backpressure channel fill counter.
     ///
     /// Clone this Arc and update it from the downstream consumer to wire
@@ -106,7 +106,7 @@ impl KafkaSource {
     pub fn new(schema: SchemaRef, config: KafkaSourceConfig) -> Self {
         let deserializer = select_deserializer(config.format);
         let channel_len = Arc::new(AtomicUsize::new(0));
-        let backpressure = BackpressureController::new(
+        let backpressure = KafkaBackpressureController::new(
             config.backpressure_high_watermark,
             config.backpressure_low_watermark,
             config.max_poll_records * 10, // rough channel capacity estimate
@@ -154,7 +154,7 @@ impl KafkaSource {
         };
 
         let channel_len = Arc::new(AtomicUsize::new(0));
-        let backpressure = BackpressureController::new(
+        let backpressure = KafkaBackpressureController::new(
             config.backpressure_high_watermark,
             config.backpressure_low_watermark,
             config.max_poll_records * 10,
@@ -200,7 +200,7 @@ impl KafkaSource {
     /// - Increment (`fetch_add`) when a batch is placed into a buffer
     /// - Decrement (`fetch_sub`) when a batch is processed
     ///
-    /// The [`BackpressureController`] reads this counter to decide when
+    /// The [`KafkaBackpressureController`] reads this counter to decide when
     /// to pause/resume the Kafka consumer. Without wiring, the counter
     /// stays at 0 and backpressure is disabled (correct for sequential
     /// polling pipelines that inherently throttle by processing rate).

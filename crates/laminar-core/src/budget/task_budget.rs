@@ -2,8 +2,6 @@
 
 use std::time::Instant;
 
-use super::stats::BudgetMetrics;
-
 /// Tracks execution time budget for a task.
 ///
 /// Created at task start, automatically records metrics on drop.
@@ -338,7 +336,15 @@ impl Drop for TaskBudget {
     fn drop(&mut self) {
         if self.record_metrics {
             let elapsed = self.elapsed_ns();
-            BudgetMetrics::global().record_task(self.name, self.ring, self.budget_ns, elapsed);
+            if elapsed > self.budget_ns {
+                tracing::trace!(
+                    task = self.name,
+                    ring = self.ring,
+                    budget_ns = self.budget_ns,
+                    elapsed_ns = elapsed,
+                    "budget exceeded",
+                );
+            }
         }
     }
 }

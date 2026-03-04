@@ -27,7 +27,7 @@ use std::sync::Arc;
 use arrow_array::ArrayRef;
 use arrow_schema::{DataType, Field, FieldRef, Schema};
 use datafusion::execution::FunctionRegistry;
-use datafusion_common::ScalarValue;
+use datafusion_common::{DataFusionError, ScalarValue};
 use datafusion_expr::function::AccumulatorArgs;
 use datafusion_expr::AggregateUDF;
 
@@ -169,10 +169,13 @@ impl DynAccumulator for DataFusionAccumulatorAdapter {
     }
 
     fn merge_dyn(&mut self, other: &dyn DynAccumulator) {
-        let other = other
+        let Some(other) = other
             .as_any()
             .downcast_ref::<DataFusionAccumulatorAdapter>()
-            .expect("merge_dyn: type mismatch, expected DataFusionAccumulatorAdapter");
+        else {
+            tracing::error!("merge_dyn: type mismatch, expected DataFusionAccumulatorAdapter");
+            return;
+        };
 
         match other.inner.borrow_mut().state() {
             Ok(state_values) => {
@@ -227,7 +230,15 @@ impl DynAccumulator for DataFusionAccumulatorAdapter {
     }
 
     fn clone_box(&self) -> Box<dyn DynAccumulator> {
-        let new_inner = self.factory.create_df_accumulator();
+        let create = || {
+            self.factory.create_df_accumulator().unwrap_or_else(|e| {
+                panic!(
+                    "failed to create DataFusion accumulator '{}': {e}",
+                    self.function_name
+                );
+            })
+        };
+        let new_inner = create();
         // Merge current state into the fresh accumulator
         if let Ok(state_values) = self.inner.borrow_mut().state() {
             let state_arrays: Vec<ArrayRef> = state_values
@@ -249,7 +260,7 @@ impl DynAccumulator for DataFusionAccumulatorAdapter {
         }
         // Fallback: return a fresh empty accumulator
         Box::new(DataFusionAccumulatorAdapter {
-            inner: RefCell::new(self.factory.create_df_accumulator()),
+            inner: RefCell::new(create()),
             column_indices: self.column_indices.clone(),
             input_types: self.input_types.clone(),
             function_name: self.function_name.clone(),
@@ -364,7 +375,9 @@ impl DataFusionAggregateFactory {
     }
 
     /// Creates a DataFusion accumulator from the UDF.
-    fn create_df_accumulator(&self) -> Box<dyn datafusion_expr::Accumulator> {
+    fn create_df_accumulator(
+        &self,
+    ) -> std::result::Result<Box<dyn datafusion_expr::Accumulator>, DataFusionError> {
         let return_type = self
             .udf
             .return_type(&self.input_types)
@@ -394,9 +407,7 @@ impl DataFusionAggregateFactory {
             exprs: &[],
             expr_fields: &expr_fields,
         };
-        self.udf
-            .accumulator(args)
-            .expect("Failed to create DataFusion accumulator")
+        self.udf.accumulator(args)
     }
 }
 
@@ -405,16 +416,20 @@ impl DataFusionAggregateFactory {
     ///
     /// The factory must be wrapped in an `Arc` for the adapter to support
     /// `clone_box()`.
-    #[must_use]
-    pub fn create_accumulator_with_factory(self: &Arc<Self>) -> Box<dyn DynAccumulator> {
-        let inner = self.create_df_accumulator();
-        Box::new(DataFusionAccumulatorAdapter::new(
+    /// # Errors
+    ///
+    /// Returns `DataFusionError` if the underlying UDF fails to create an accumulator.
+    pub fn create_accumulator_with_factory(
+        self: &Arc<Self>,
+    ) -> std::result::Result<Box<dyn DynAccumulator>, DataFusionError> {
+        let inner = self.create_df_accumulator()?;
+        Ok(Box::new(DataFusionAccumulatorAdapter::new(
             inner,
             self.column_indices.clone(),
             self.input_types.clone(),
             self.udf.name().to_string(),
             Arc::clone(self),
-        ))
+        )))
     }
 }
 
@@ -428,7 +443,12 @@ impl DynAggregatorFactory for DataFusionAggregateFactory {
             input_types: self.input_types.clone(),
             is_distinct: self.is_distinct,
         });
-        let inner = self.create_df_accumulator();
+        let inner = self.create_df_accumulator().unwrap_or_else(|e| {
+            panic!(
+                "failed to create DataFusion accumulator '{}': {e}",
+                self.udf.name()
+            );
+        });
         Box::new(DataFusionAccumulatorAdapter::new(
             inner,
             self.column_indices.clone(),

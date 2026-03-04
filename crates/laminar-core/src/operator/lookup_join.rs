@@ -266,31 +266,12 @@ impl CacheEntry {
         now - self.inserted_at > ttl_us
     }
 
-    /// Serializes a record batch to bytes.
     fn serialize_batch(batch: &RecordBatch) -> Result<Vec<u8>, OperatorError> {
-        let mut buf = Vec::new();
-        {
-            let mut writer = arrow_ipc::writer::StreamWriter::try_new(&mut buf, &batch.schema())
-                .map_err(|e| OperatorError::SerializationFailed(e.to_string()))?;
-            writer
-                .write(batch)
-                .map_err(|e| OperatorError::SerializationFailed(e.to_string()))?;
-            writer
-                .finish()
-                .map_err(|e| OperatorError::SerializationFailed(e.to_string()))?;
-        }
-        Ok(buf)
+        Ok(crate::serialization::serialize_batch_stream(batch)?)
     }
 
-    /// Deserializes a record batch from bytes.
     fn deserialize_batch(data: &[u8]) -> Result<RecordBatch, OperatorError> {
-        let cursor = std::io::Cursor::new(data);
-        let mut reader = arrow_ipc::reader::StreamReader::try_new(cursor, None)
-            .map_err(|e| OperatorError::SerializationFailed(e.to_string()))?;
-        reader
-            .next()
-            .ok_or_else(|| OperatorError::SerializationFailed("Empty batch data".to_string()))?
-            .map_err(|e| OperatorError::SerializationFailed(e.to_string()))
+        Ok(crate::serialization::deserialize_batch_stream(data)?)
     }
 
     /// Returns the cached batch if found.

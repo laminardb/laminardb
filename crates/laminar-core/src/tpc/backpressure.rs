@@ -31,7 +31,6 @@
 // Max credits: 65535 (u16::MAX) to ensure clean i64/f64 conversions
 
 use std::sync::atomic::{AtomicI64, AtomicU64, Ordering};
-use std::sync::Arc;
 
 /// Configuration for backpressure handling.
 #[derive(Debug, Clone)]
@@ -129,15 +128,25 @@ impl BackpressureConfigBuilder {
     }
 
     /// Builds the configuration.
-    #[must_use]
-    pub fn build(self) -> BackpressureConfig {
-        BackpressureConfig {
+    ///
+    /// # Errors
+    ///
+    /// Returns an error if `high_watermark < low_watermark`.
+    pub fn build(self) -> std::result::Result<BackpressureConfig, String> {
+        let high = self.high_watermark.unwrap_or(0.8);
+        let low = self.low_watermark.unwrap_or(0.5);
+        if high < low {
+            return Err(format!(
+                "high_watermark ({high}) must be >= low_watermark ({low})"
+            ));
+        }
+        Ok(BackpressureConfig {
             exclusive_credits: self.exclusive_credits.unwrap_or(4).min(u16::MAX as usize),
             floating_credits: self.floating_credits.unwrap_or(8).min(u16::MAX as usize),
             overflow_strategy: self.overflow_strategy.unwrap_or(OverflowStrategy::Block),
-            high_watermark: self.high_watermark.unwrap_or(0.8),
-            low_watermark: self.low_watermark.unwrap_or(0.5),
-        }
+            high_watermark: high,
+            low_watermark: low,
+        })
     }
 }
 
@@ -458,128 +467,6 @@ impl CreditMetricsSnapshot {
     }
 }
 
-/// Manages credit flow between a sender and receiver.
-///
-/// This is a convenience wrapper that combines a `CreditGate` with
-/// additional sender-side state like backlog tracking.
-#[derive(Debug)]
-pub struct CreditChannel {
-    /// The credit gate (shared with receiver).
-    gate: Arc<CreditGate>,
-    /// Current backlog at sender (items waiting to be sent).
-    /// Wrapped in `Arc` for safe sharing with `CreditSender`.
-    backlog: Arc<AtomicU64>,
-}
-
-impl CreditChannel {
-    /// Creates a new credit channel.
-    #[must_use]
-    pub fn new(config: BackpressureConfig) -> Self {
-        Self {
-            gate: Arc::new(CreditGate::new(config)),
-            backlog: Arc::new(AtomicU64::new(0)),
-        }
-    }
-
-    /// Returns a handle for the sender side.
-    #[must_use]
-    pub fn sender(&self) -> CreditSender {
-        CreditSender {
-            gate: Arc::clone(&self.gate),
-            backlog: Arc::clone(&self.backlog),
-        }
-    }
-
-    /// Returns a handle for the receiver side.
-    #[must_use]
-    pub fn receiver(&self) -> CreditReceiver {
-        CreditReceiver {
-            gate: Arc::clone(&self.gate),
-        }
-    }
-
-    /// Returns the credit gate.
-    #[must_use]
-    pub fn gate(&self) -> &CreditGate {
-        &self.gate
-    }
-}
-
-/// Sender-side handle for credit flow control.
-#[derive(Debug, Clone)]
-pub struct CreditSender {
-    gate: Arc<CreditGate>,
-    /// Shared backlog counter with the channel.
-    backlog: Arc<AtomicU64>,
-}
-
-impl CreditSender {
-    /// Attempts to send (acquire credit).
-    #[must_use]
-    pub fn try_send(&self) -> CreditAcquireResult {
-        self.gate.try_acquire()
-    }
-
-    /// Sends with blocking if needed.
-    pub fn send_blocking(&self) {
-        self.gate.acquire_blocking(1);
-    }
-
-    /// Reports backlog size to receiver.
-    pub fn set_backlog(&self, size: u64) {
-        self.backlog.store(size, Ordering::Relaxed);
-    }
-
-    /// Returns current backlog.
-    #[must_use]
-    pub fn backlog(&self) -> u64 {
-        self.backlog.load(Ordering::Relaxed)
-    }
-
-    /// Returns available credits.
-    #[must_use]
-    pub fn available_credits(&self) -> usize {
-        self.gate.available()
-    }
-
-    /// Returns true if backpressured.
-    #[must_use]
-    pub fn is_backpressured(&self) -> bool {
-        self.gate.is_backpressured()
-    }
-}
-
-/// Receiver-side handle for credit flow control.
-#[derive(Debug, Clone)]
-pub struct CreditReceiver {
-    gate: Arc<CreditGate>,
-}
-
-impl CreditReceiver {
-    /// Releases credits after processing.
-    pub fn release(&self, n: usize) {
-        self.gate.release(n);
-    }
-
-    /// Returns available credits.
-    #[must_use]
-    pub fn available_credits(&self) -> usize {
-        self.gate.available()
-    }
-
-    /// Returns true if recovered from backpressure.
-    #[must_use]
-    pub fn is_recovered(&self) -> bool {
-        self.gate.is_recovered()
-    }
-
-    /// Returns metrics.
-    #[must_use]
-    pub fn metrics(&self) -> &CreditMetrics {
-        self.gate.metrics()
-    }
-}
-
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -651,24 +538,6 @@ mod tests {
     }
 
     #[test]
-    fn test_credit_channel() {
-        let config = BackpressureConfig::default();
-        let channel = CreditChannel::new(config);
-
-        let sender = channel.sender();
-        let receiver = channel.receiver();
-
-        // Sender can send
-        assert_eq!(sender.try_send(), CreditAcquireResult::Acquired);
-        sender.set_backlog(10);
-        assert_eq!(sender.backlog(), 10);
-
-        // Receiver releases
-        receiver.release(1);
-        assert_eq!(receiver.available_credits(), channel.gate().max_credits());
-    }
-
-    #[test]
     fn test_backpressure_watermarks() {
         let config = BackpressureConfig {
             exclusive_credits: 10,
@@ -719,7 +588,8 @@ mod tests {
             .overflow_strategy(OverflowStrategy::Drop)
             .high_watermark(0.9)
             .low_watermark(0.6)
-            .build();
+            .build()
+            .unwrap();
 
         assert_eq!(config.exclusive_credits, 8);
         assert_eq!(config.floating_credits, 16);

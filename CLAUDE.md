@@ -20,9 +20,8 @@ crates/
 ├── laminar-sql/       # DataFusion integration, SQL parsing
 ├── laminar-storage/   # WAL, checkpoints, Delta Lake/Iceberg
 ├── laminar-connectors/# Kafka, CDC, lookup joins
-├── laminar-auth/      # RBAC, ABAC, authentication
-├── laminar-admin/     # Dashboard UI, REST API
-├── laminar-observe/   # Metrics, tracing, health checks
+├── laminar-db/        # Unified database facade
+├── laminar-derive/    # Proc macros
 └── laminar-server/    # Standalone server binary
 ```
 

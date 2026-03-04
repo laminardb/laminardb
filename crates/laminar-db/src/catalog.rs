@@ -8,6 +8,7 @@ use std::time::Duration;
 use arrow::array::RecordBatch;
 use arrow::datatypes::SchemaRef;
 use parking_lot::RwLock;
+use tokio::sync::Notify;
 
 use laminar_core::streaming::{self, BackpressureStrategy, SourceConfig, WaitStrategy};
 
@@ -97,10 +98,11 @@ pub struct SourceEntry {
     /// The underlying streaming source (type-erased via `ArrowRecord`).
     pub(crate) source: streaming::Source<ArrowRecord>,
     /// The underlying streaming sink (type-erased via `ArrowRecord`).
-    #[allow(dead_code)]
     pub(crate) sink: streaming::Sink<ArrowRecord>,
     /// Lock-free bounded ring buffer for ad-hoc snapshot queries.
     buffer: SnapshotRing,
+    /// Notification handle for event-driven wakeup on `db.insert()`.
+    data_notify: Arc<Notify>,
 }
 
 impl SourceEntry {
@@ -115,12 +117,18 @@ impl SourceEntry {
     ) -> Result<(), laminar_core::streaming::StreamingError> {
         self.source.push_arrow(batch.clone())?;
         self.buffer.push(batch);
+        self.data_notify.notify_waiters();
         Ok(())
     }
 
     /// Return a snapshot of all buffered batches for ad-hoc queries.
     pub(crate) fn snapshot(&self) -> Vec<RecordBatch> {
         self.buffer.snapshot()
+    }
+
+    /// Get the notification handle for event-driven wakeup on data insertion.
+    pub(crate) fn data_notify(&self) -> Arc<Notify> {
+        Arc::clone(&self.data_notify)
     }
 }
 
@@ -220,6 +228,7 @@ impl SourceCatalog {
             source,
             sink,
             buffer: SnapshotRing::new(buf_size),
+            data_notify: Arc::new(Notify::new()),
         });
 
         sources.insert(name.to_string(), Arc::clone(&entry));

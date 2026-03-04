@@ -155,10 +155,14 @@ fn build_checkpoint_store(
             .nth(1)
             .and_then(|rest| rest.split_once('/').map(|(_, p)| format!("{p}/")))
             .unwrap_or_default();
-        Some(Box::new(
-            laminar_storage::checkpoint_store::ObjectStoreCheckpointStore::new(
-                obj_store, prefix, 3,
-            ),
-        ))
+        match laminar_storage::checkpoint_store::ObjectStoreCheckpointStore::new(
+            obj_store, prefix, 3,
+        ) {
+            Ok(s) => Some(Box::new(s)),
+            Err(e) => {
+                tracing::error!(error = %e, "failed to create checkpoint store runtime");
+                None
+            }
+        }
     }
 }

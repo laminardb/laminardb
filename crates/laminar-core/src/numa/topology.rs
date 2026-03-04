@@ -19,8 +19,10 @@ pub struct NumaTopology {
     /// CPUs per node (index = node ID)
     cpus_per_node: Vec<Vec<usize>>,
     /// Memory per node in bytes (index = node ID)
+    #[allow(dead_code)]
     memory_per_node: Vec<u64>,
     /// Total number of CPUs
+    #[allow(dead_code)]
     num_cpus: usize,
     /// CPU to NUMA node mapping
     cpu_to_node: Vec<usize>,
@@ -291,24 +293,12 @@ impl NumaTopology {
         self.num_nodes
     }
 
-    /// Returns the total number of CPUs.
-    #[must_use]
-    pub fn num_cpus(&self) -> usize {
-        self.num_cpus
-    }
-
     /// Returns the CPUs belonging to a specific NUMA node.
     ///
     /// Returns an empty slice if the node ID is invalid.
     #[must_use]
     pub fn cpus_for_node(&self, node: usize) -> &[usize] {
         self.cpus_per_node.get(node).map_or(&[], Vec::as_slice)
-    }
-
-    /// Returns the memory (in bytes) for a specific NUMA node.
-    #[must_use]
-    pub fn memory_for_node(&self, node: usize) -> u64 {
-        self.memory_per_node.get(node).copied().unwrap_or(0)
     }
 
     /// Returns the NUMA node for a given CPU.
@@ -342,52 +332,6 @@ impl NumaTopology {
         // Fallback: return 0
         0
     }
-
-    /// Check if the system has multiple NUMA nodes.
-    #[must_use]
-    pub fn is_numa(&self) -> bool {
-        self.num_nodes > 1
-    }
-
-    /// Log the detected topology for debugging.
-    pub fn log_topology(&self) {
-        tracing::info!(
-            "NUMA Topology: {} nodes, {} CPUs",
-            self.num_nodes,
-            self.num_cpus
-        );
-        for node in 0..self.num_nodes {
-            let cpus = self.cpus_for_node(node);
-            let memory_gb = self.memory_for_node(node) / (1024 * 1024 * 1024);
-            tracing::info!(
-                "  Node {}: {} CPUs ({:?}), {} GB memory",
-                node,
-                cpus.len(),
-                cpus,
-                memory_gb
-            );
-        }
-    }
-
-    /// Get a summary string of the topology.
-    #[must_use]
-    pub fn summary(&self) -> String {
-        use std::fmt::Write;
-
-        let mut s = format!("NUMA: {} nodes, {} CPUs", self.num_nodes, self.num_cpus);
-        for node in 0..self.num_nodes {
-            let cpus = self.cpus_for_node(node);
-            let memory_gb = self.memory_for_node(node) / (1024 * 1024 * 1024);
-            let _ = write!(
-                s,
-                "\n  Node {}: {} CPUs, {} GB",
-                node,
-                cpus.len(),
-                memory_gb
-            );
-        }
-        s
-    }
 }
 
 #[cfg(test)]
@@ -398,7 +342,6 @@ mod tests {
     fn test_detect() {
         let topo = NumaTopology::detect();
         assert!(topo.num_nodes() >= 1);
-        assert!(topo.num_cpus() >= 1);
     }
 
     #[test]
@@ -423,14 +366,6 @@ mod tests {
     }
 
     #[test]
-    fn test_summary() {
-        let topo = NumaTopology::detect();
-        let summary = topo.summary();
-        assert!(summary.contains("NUMA"));
-        assert!(summary.contains("nodes"));
-    }
-
-    #[test]
     #[cfg(target_os = "linux")]
     fn test_parse_cpulist() {
         assert_eq!(NumaTopology::parse_cpulist("0"), vec![0]);
@@ -446,7 +381,6 @@ mod tests {
     fn test_single_node_fallback() {
         let topo = NumaTopology::single_node_fallback();
         assert_eq!(topo.num_nodes(), 1);
-        assert!(topo.num_cpus() >= 1);
         assert_eq!(topo.node_for_cpu(0), 0);
     }
 }

@@ -17,7 +17,9 @@ pub mod unaligned;
 
 // Re-export key types
 pub use alignment::{AlignmentAction, BarrierAligner};
-pub use barrier::{BarrierPollHandle, CheckpointBarrier, CheckpointBarrierInjector, StreamMessage};
+pub use barrier::{
+    flags, BarrierPollHandle, CheckpointBarrier, CheckpointBarrierInjector, StreamMessage,
+};
 pub use unaligned::{
     InFlightChannelData, UnalignedAction, UnalignedCheckpointConfig, UnalignedCheckpointer,
     UnalignedSnapshot,

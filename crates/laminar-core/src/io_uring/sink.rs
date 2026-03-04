@@ -180,6 +180,9 @@ mod linux_impl {
                 Output::CheckpointComplete(data) => {
                     format!("CHECKPOINT_COMPLETE id={}\n", data.checkpoint_id).into_bytes()
                 }
+                Output::Barrier(barrier) => {
+                    format!("BARRIER epoch={}\n", barrier.epoch).into_bytes()
+                }
             };
 
             // Acquire a buffer
@@ -188,9 +191,20 @@ mod linux_impl {
                 .acquire_buffer()
                 .map_err(|e| SinkError::WriteFailed(format!("Failed to acquire buffer: {e}")))?;
 
-            // Copy data to buffer
-            let len = bytes.len().min(buf.len());
-            buf[..len].copy_from_slice(&bytes[..len]);
+            // Fail on truncation instead of silently losing data.
+            let buf_capacity = buf.len();
+            if bytes.len() > buf_capacity {
+                self.ring_manager.release_buffer(buf_index);
+                return Err(SinkError::WriteFailed(
+                    IoUringError::BufferTooSmall {
+                        needed: bytes.len(),
+                        capacity: buf_capacity,
+                    }
+                    .to_string(),
+                ));
+            }
+            let len = bytes.len();
+            buf[..len].copy_from_slice(&bytes);
 
             // Submit write
             let fd = self.file.as_raw_fd();

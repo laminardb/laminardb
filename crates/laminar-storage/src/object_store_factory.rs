@@ -38,6 +38,12 @@ pub enum ObjectStoreFactoryError {
     Build(String),
 }
 
+impl From<object_store::Error> for ObjectStoreFactoryError {
+    fn from(e: object_store::Error) -> Self {
+        Self::Build(e.to_string())
+    }
+}
+
 /// Build an [`ObjectStore`] from a URL and optional configuration overrides.
 ///
 /// # Supported schemes
@@ -87,8 +93,7 @@ fn build_local_file_system(url: &str) -> Result<Arc<dyn ObjectStore>, ObjectStor
         ));
     }
 
-    let fs = LocalFileSystem::new_with_prefix(path)
-        .map_err(|e| ObjectStoreFactoryError::Build(e.to_string()))?;
+    let fs = LocalFileSystem::new_with_prefix(path)?;
     Ok(Arc::new(fs))
 }
 
@@ -106,16 +111,10 @@ fn build_s3(
     let mut builder = AmazonS3Builder::from_env().with_url(url);
 
     for (key, value) in options {
-        builder = builder.with_config(
-            key.parse()
-                .map_err(|e: object_store::Error| ObjectStoreFactoryError::Build(e.to_string()))?,
-            value,
-        );
+        builder = builder.with_config(key.parse()?, value);
     }
 
-    let store = builder
-        .build()
-        .map_err(|e| ObjectStoreFactoryError::Build(e.to_string()))?;
+    let store = builder.build()?;
     Ok(Arc::new(store))
 }
 
@@ -144,16 +143,10 @@ fn build_gcs(
     let mut builder = GoogleCloudStorageBuilder::from_env().with_url(url);
 
     for (key, value) in options {
-        builder = builder.with_config(
-            key.parse()
-                .map_err(|e: object_store::Error| ObjectStoreFactoryError::Build(e.to_string()))?,
-            value,
-        );
+        builder = builder.with_config(key.parse()?, value);
     }
 
-    let store = builder
-        .build()
-        .map_err(|e| ObjectStoreFactoryError::Build(e.to_string()))?;
+    let store = builder.build()?;
     Ok(Arc::new(store))
 }
 
@@ -182,16 +175,10 @@ fn build_azure(
     let mut builder = MicrosoftAzureBuilder::from_env().with_url(url);
 
     for (key, value) in options {
-        builder = builder.with_config(
-            key.parse()
-                .map_err(|e: object_store::Error| ObjectStoreFactoryError::Build(e.to_string()))?,
-            value,
-        );
+        builder = builder.with_config(key.parse()?, value);
     }
 
-    let store = builder
-        .build()
-        .map_err(|e| ObjectStoreFactoryError::Build(e.to_string()))?;
+    let store = builder.build()?;
     Ok(Arc::new(store))
 }
 

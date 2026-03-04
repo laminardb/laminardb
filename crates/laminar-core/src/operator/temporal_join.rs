@@ -37,7 +37,8 @@
 //!     .semantics(TemporalJoinSemantics::EventTime)
 //!     .table_characteristics(TableCharacteristics::AppendOnly)
 //!     .join_type(TemporalJoinType::Inner)
-//!     .build();
+//!     .build()
+//!     .unwrap();
 //!
 //! let operator = TemporalJoinOperator::new(config);
 //! ```
@@ -218,25 +219,26 @@ impl TemporalJoinConfigBuilder {
 
     /// Builds the configuration.
     ///
-    /// # Panics
+    /// # Errors
     ///
-    /// Panics if required fields are not set.
-    #[must_use]
-    pub fn build(self) -> TemporalJoinConfig {
-        TemporalJoinConfig {
-            stream_key_column: self
-                .stream_key_column
-                .expect("stream_key_column is required"),
-            table_key_column: self.table_key_column.expect("table_key_column is required"),
-            table_version_column: self
-                .table_version_column
-                .expect("table_version_column is required"),
+    /// Returns `OperatorError::ConfigError` if required fields are not set.
+    pub fn build(self) -> std::result::Result<TemporalJoinConfig, OperatorError> {
+        Ok(TemporalJoinConfig {
+            stream_key_column: self.stream_key_column.ok_or_else(|| {
+                OperatorError::ConfigError("stream_key_column is required".into())
+            })?,
+            table_key_column: self
+                .table_key_column
+                .ok_or_else(|| OperatorError::ConfigError("table_key_column is required".into()))?,
+            table_version_column: self.table_version_column.ok_or_else(|| {
+                OperatorError::ConfigError("table_version_column is required".into())
+            })?,
             semantics: self.semantics.unwrap_or_default(),
             table_characteristics: self.table_characteristics.unwrap_or_default(),
             join_type: self.join_type.unwrap_or_default(),
             operator_id: self.operator_id,
             max_versions_per_key: self.max_versions_per_key.unwrap_or(0),
-        }
+        })
     }
 }
 
@@ -272,31 +274,12 @@ impl TableRow {
         })
     }
 
-    /// Serializes a record batch to bytes.
     fn serialize_batch(batch: &RecordBatch) -> Result<Vec<u8>, OperatorError> {
-        let mut buf = Vec::new();
-        {
-            let mut writer = arrow_ipc::writer::StreamWriter::try_new(&mut buf, &batch.schema())
-                .map_err(|e| OperatorError::SerializationFailed(e.to_string()))?;
-            writer
-                .write(batch)
-                .map_err(|e| OperatorError::SerializationFailed(e.to_string()))?;
-            writer
-                .finish()
-                .map_err(|e| OperatorError::SerializationFailed(e.to_string()))?;
-        }
-        Ok(buf)
+        Ok(crate::serialization::serialize_batch_stream(batch)?)
     }
 
-    /// Deserializes a record batch from bytes.
     fn deserialize_batch(data: &[u8]) -> Result<RecordBatch, OperatorError> {
-        let cursor = std::io::Cursor::new(data);
-        let mut reader = arrow_ipc::reader::StreamReader::try_new(cursor, None)
-            .map_err(|e| OperatorError::SerializationFailed(e.to_string()))?;
-        reader
-            .next()
-            .ok_or_else(|| OperatorError::SerializationFailed("Empty batch data".to_string()))?
-            .map_err(|e| OperatorError::SerializationFailed(e.to_string()))
+        Ok(crate::serialization::deserialize_batch_stream(data)?)
     }
 
     /// Converts this row back to a record batch.
@@ -1236,7 +1219,8 @@ mod tests {
             .join_type(TemporalJoinType::Left)
             .max_versions_per_key(100)
             .operator_id("test_temporal".to_string())
-            .build();
+            .build()
+            .unwrap();
 
         assert_eq!(config.stream_key_column, "currency");
         assert_eq!(config.table_key_column, "currency");
@@ -1258,7 +1242,8 @@ mod tests {
             .table_version_column("valid_from".to_string())
             .semantics(TemporalJoinSemantics::EventTime)
             .join_type(TemporalJoinType::Inner)
-            .build();
+            .build()
+            .unwrap();
 
         let mut operator = TemporalJoinOperator::with_id(config, "test_temporal".to_string());
 
@@ -1318,7 +1303,8 @@ mod tests {
             .table_version_column("valid_from".to_string())
             .semantics(TemporalJoinSemantics::EventTime)
             .join_type(TemporalJoinType::Inner)
-            .build();
+            .build()
+            .unwrap();
 
         let mut operator = TemporalJoinOperator::with_id(config, "test_temporal".to_string());
 
@@ -1387,7 +1373,8 @@ mod tests {
             .table_version_column("valid_from".to_string())
             .semantics(TemporalJoinSemantics::EventTime)
             .join_type(TemporalJoinType::Inner)
-            .build();
+            .build()
+            .unwrap();
 
         let mut operator = TemporalJoinOperator::with_id(config, "test_temporal".to_string());
 
@@ -1421,7 +1408,8 @@ mod tests {
             .table_version_column("valid_from".to_string())
             .semantics(TemporalJoinSemantics::EventTime)
             .join_type(TemporalJoinType::Left)
-            .build();
+            .build()
+            .unwrap();
 
         let mut operator = TemporalJoinOperator::with_id(config, "test_temporal".to_string());
 
@@ -1469,7 +1457,8 @@ mod tests {
             .table_version_column("valid_from".to_string())
             .semantics(TemporalJoinSemantics::ProcessTime) // Process time
             .join_type(TemporalJoinType::Inner)
-            .build();
+            .build()
+            .unwrap();
 
         let mut operator = TemporalJoinOperator::with_id(config, "test_temporal".to_string());
 
@@ -1510,7 +1499,8 @@ mod tests {
             .table_key_column("currency".to_string())
             .table_version_column("valid_from".to_string())
             .table_characteristics(TableCharacteristics::AppendOnly)
-            .build();
+            .build()
+            .unwrap();
 
         let mut operator = TemporalJoinOperator::with_id(config, "test_temporal".to_string());
 
@@ -1542,7 +1532,8 @@ mod tests {
             .table_key_column("currency".to_string())
             .table_version_column("valid_from".to_string())
             .table_characteristics(TableCharacteristics::NonAppendOnly)
-            .build();
+            .build()
+            .unwrap();
 
         let mut operator = TemporalJoinOperator::with_id(config, "test_temporal".to_string());
 
@@ -1574,7 +1565,8 @@ mod tests {
             .table_key_column("currency".to_string())
             .table_version_column("valid_from".to_string())
             .table_characteristics(TableCharacteristics::NonAppendOnly)
-            .build();
+            .build()
+            .unwrap();
 
         let mut operator = TemporalJoinOperator::with_id(config, "test_temporal".to_string());
 
@@ -1619,7 +1611,8 @@ mod tests {
             .stream_key_column("currency".to_string())
             .table_key_column("currency".to_string())
             .table_version_column("valid_from".to_string())
-            .build();
+            .build()
+            .unwrap();
 
         let mut operator = TemporalJoinOperator::with_id(config, "test_temporal".to_string());
 
@@ -1672,7 +1665,8 @@ mod tests {
             .table_key_column("currency".to_string())
             .table_version_column("valid_from".to_string())
             .max_versions_per_key(2) // Only keep 2 versions
-            .build();
+            .build()
+            .unwrap();
 
         let mut operator = TemporalJoinOperator::with_id(config, "test_temporal".to_string());
 
@@ -1706,7 +1700,8 @@ mod tests {
             .table_key_column("currency".to_string())
             .table_version_column("valid_from".to_string())
             .table_characteristics(TableCharacteristics::NonAppendOnly)
-            .build();
+            .build()
+            .unwrap();
 
         let mut operator =
             TemporalJoinOperator::with_id(config.clone(), "test_temporal".to_string());
@@ -1752,7 +1747,8 @@ mod tests {
             .stream_key_column("currency".to_string())
             .table_key_column("currency".to_string())
             .table_version_column("valid_from".to_string())
-            .build();
+            .build()
+            .unwrap();
 
         let mut operator = TemporalJoinOperator::with_id(config, "test_temporal".to_string());
 
@@ -1794,7 +1790,8 @@ mod tests {
             .stream_key_column("currency".to_string())
             .table_key_column("currency".to_string())
             .table_version_column("valid_from".to_string())
-            .build();
+            .build()
+            .unwrap();
 
         let mut operator = TemporalJoinOperator::with_id(config, "test_temporal".to_string());
 
@@ -1946,7 +1943,8 @@ mod tests {
             .table_key_column("currency".to_string())
             .table_version_column("valid_from".to_string())
             .table_characteristics(TableCharacteristics::NonAppendOnly)
-            .build();
+            .build()
+            .unwrap();
 
         let mut operator = TemporalJoinOperator::with_id(config, "test_temporal".to_string());
 

@@ -1676,6 +1676,7 @@ impl LaminarDB {
     }
 
     /// Handle a streaming or standard SQL query.
+    #[allow(clippy::too_many_lines)]
     async fn handle_query(&self, sql: &str) -> Result<ExecuteResult, DbError> {
         // Synchronous planning under the lock — released before any await
         let plan = {
@@ -1746,12 +1747,118 @@ impl LaminarDB {
                 }))
             }
             laminar_sql::planner::StreamingPlan::RegisterLookupTable(info) => {
+                use laminar_sql::parser::lookup_table::ConnectorType;
+
+                let pk = info
+                    .primary_key
+                    .first()
+                    .ok_or_else(|| {
+                        DbError::InvalidOperation("Lookup table requires a primary key".into())
+                    })?
+                    .clone();
+
+                // Register in TableStore for PK-based upsert
+                let cache_mode = info.properties.cache_memory.map(|mem| {
+                    let max_entries = (mem.as_bytes() / 256).max(1024) as usize;
+                    crate::table_cache_mode::TableCacheMode::Partial { max_entries }
+                });
+                if let Some(cache) = cache_mode {
+                    self.table_store.lock().create_table_with_cache(
+                        &info.name,
+                        info.arrow_schema.clone(),
+                        &pk,
+                        cache,
+                    )?;
+                } else {
+                    self.table_store.lock().create_table(
+                        &info.name,
+                        info.arrow_schema.clone(),
+                        &pk,
+                    )?;
+                }
+
+                // For external connectors: register in ConnectorManager so
+                // start_connector_pipeline() handles snapshot + CDC loading
+                if !matches!(info.properties.connector, ConnectorType::Static) {
+                    let connector_type_str = match &info.properties.connector {
+                        ConnectorType::PostgresCdc => "postgres-cdc",
+                        ConnectorType::MysqlCdc => "mysql-cdc",
+                        ConnectorType::Redis => "redis",
+                        ConnectorType::S3Parquet => "s3-parquet",
+                        ConnectorType::Custom(s) => s.as_str(),
+                        ConnectorType::Static => unreachable!(),
+                    };
+
+                    self.table_store
+                        .lock()
+                        .set_connector(&info.name, connector_type_str);
+
+                    let refresh = match info.properties.strategy {
+                        laminar_sql::parser::lookup_table::LookupStrategy::Replicated
+                        | laminar_sql::parser::lookup_table::LookupStrategy::Partitioned => {
+                            Some(laminar_connectors::reference::RefreshMode::SnapshotPlusCdc)
+                        }
+                        laminar_sql::parser::lookup_table::LookupStrategy::OnDemand => {
+                            Some(laminar_connectors::reference::RefreshMode::Manual)
+                        }
+                    };
+
+                    // Build connector options from raw WITH clause
+                    // (exclude keys already consumed by LookupTableProperties)
+                    let connector_options: HashMap<String, String> = info
+                        .raw_options
+                        .iter()
+                        .filter(|(k, _)| {
+                            ![
+                                "connector",
+                                "strategy",
+                                "cache.memory",
+                                "cache.disk",
+                                "cache.ttl",
+                                "pushdown",
+                            ]
+                            .contains(&k.as_str())
+                        })
+                        .map(|(k, v)| (k.clone(), v.clone()))
+                        .collect();
+
+                    let table_cache_mode = info.properties.cache_memory.map(|mem| {
+                        let max_entries = (mem.as_bytes() / 256).max(1024) as usize;
+                        crate::table_cache_mode::TableCacheMode::Partial { max_entries }
+                    });
+                    let cache_max = info
+                        .properties
+                        .cache_memory
+                        .map(|mem| (mem.as_bytes() / 256).max(1024) as usize);
+
+                    self.connector_manager.lock().register_table(
+                        crate::connector_manager::TableRegistration {
+                            name: info.name.clone(),
+                            primary_key: pk,
+                            connector_type: Some(connector_type_str.to_string()),
+                            connector_options,
+                            format: info.raw_options.get("format").cloned(),
+                            format_options: HashMap::new(),
+                            refresh,
+                            cache_mode: table_cache_mode,
+                            cache_max_entries: cache_max,
+                            storage: None,
+                        },
+                    );
+                }
+
+                // Register in DataFusion for SELECT/JOIN queries
+                self.sync_table_to_datafusion(&info.name)?;
+
                 Ok(ExecuteResult::Ddl(DdlInfo {
                     statement_type: "CREATE LOOKUP TABLE".to_string(),
                     object_name: info.name,
                 }))
             }
             laminar_sql::planner::StreamingPlan::DropLookupTable { name } => {
+                self.table_store.lock().drop_table(&name);
+                self.connector_manager.lock().unregister_table(&name);
+                let _ = self.ctx.deregister_table(&name);
                 Ok(ExecuteResult::Ddl(DdlInfo {
                     statement_type: "DROP LOOKUP TABLE".to_string(),
                     object_name: name,
@@ -2220,7 +2327,8 @@ impl LaminarDB {
                     obj_store,
                     prefix,
                     max_retained,
-                ),
+                )
+                .ok()?,
             ))
         } else {
             let data_dir = cp_config
@@ -2365,7 +2473,8 @@ impl LaminarDB {
                             obj_store,
                             prefix,
                             max_retained,
-                        ),
+                        )
+                        .map_err(|e| DbError::Config(format!("checkpoint store runtime: {e}")))?,
                     )
                 } else {
                     let data_dir = cp_config
@@ -2721,10 +2830,10 @@ impl LaminarDB {
     /// Uses the `ConnectorRegistry` for generic dispatch — no
     /// connector-specific code in the pipeline setup or processing loop.
     ///
-    /// The pipeline uses an event-driven fan-out/fan-in architecture:
-    /// each source runs in its own tokio task with exclusive ownership
-    /// (no `Arc<Mutex>`), sending batches through a bounded `mpsc`
-    /// channel to a single `PipelineCoordinator` task.
+    /// The pipeline uses a thread-per-core architecture: each source
+    /// runs on a dedicated I/O thread, pushing events through SPSC
+    /// queues to CPU-pinned core threads. A `TpcPipelineCoordinator`
+    /// tokio task drains core outboxes and runs SQL cycles.
     #[allow(clippy::too_many_lines)]
     async fn start_connector_pipeline(
         &self,
@@ -2736,7 +2845,7 @@ impl LaminarDB {
         use crate::connector_manager::{
             build_sink_config, build_source_config, build_table_config,
         };
-        use crate::pipeline::{PipelineConfig, PipelineCoordinator, SourceRegistration};
+        use crate::pipeline::{PipelineConfig, SourceRegistration, TpcPipelineCoordinator};
         use crate::stream_executor::StreamExecutor;
         use laminar_connectors::reference::{ReferenceTableSource, RefreshMode};
 
@@ -2745,15 +2854,10 @@ impl LaminarDB {
         laminar_sql::register_streaming_functions(&ctx);
         let mut executor = StreamExecutor::new(ctx);
 
-        // Register source schemas for sources that have connectors so the
-        // executor can create empty placeholder tables when no data arrives in
-        // a given cycle.  Connector-less sources (created without a FROM clause)
-        // are intentionally skipped — they receive data via push_arrow() and
-        // registering them would create broken zero-row MemTables every cycle.
-        for (name, reg) in &source_regs {
-            if reg.connector_type.is_none() {
-                continue;
-            }
+        // Register source schemas for ALL sources (both external connectors
+        // and catalog-bridge sources) so the executor can create empty
+        // placeholder tables when no data arrives in a given cycle.
+        for name in source_regs.keys() {
             if let Some(entry) = self.catalog.get_source(name) {
                 executor.register_source_schema(name.clone(), entry.schema.clone());
             }
@@ -2808,6 +2912,28 @@ impl LaminarDB {
                 config,
                 supports_replay,
             });
+        }
+
+        // Bridge connector-less sources into the pipeline so db.insert()
+        // data flows through the standard source task → coordinator path.
+        for (name, reg) in &source_regs {
+            if reg.connector_type.is_some() {
+                continue; // Already handled above
+            }
+            if let Some(entry) = self.catalog.get_source(name) {
+                let subscription = entry.sink.subscribe();
+                let connector = crate::catalog_connector::CatalogSourceConnector::new(
+                    subscription,
+                    entry.schema.clone(),
+                    entry.data_notify(),
+                );
+                sources.push(SourceRegistration {
+                    name: name.clone(),
+                    connector: Box::new(connector),
+                    config: laminar_connectors::config::ConnectorConfig::new("catalog-bridge"),
+                    supports_replay: false,
+                });
+            }
         }
 
         // Build sinks via registry (generic — no connector-specific code).
@@ -2866,7 +2992,7 @@ impl LaminarDB {
         }
 
         // Register sinks with the checkpoint coordinator.
-        // Sources are now owned by PipelineCoordinator — checkpoint reads go
+        // Sources are owned by the TPC runtime — checkpoint reads go
         // through lock-free watch channels instead.
         {
             let mut guard = self.coordinator.lock().await;
@@ -2879,7 +3005,7 @@ impl LaminarDB {
         }
 
         // Recovery: restore sink/table state via unified coordinator.
-        // Source recovery is handled inside PipelineCoordinator::new() via
+        // Source recovery is handled inside TpcPipelineCoordinator::new() via
         // the checkpoint watch channels.
         {
             let mut guard = self.coordinator.lock().await;
@@ -3083,10 +3209,7 @@ impl LaminarDB {
             barrier_alignment_timeout: std::time::Duration::from_secs(30),
         };
 
-        // Create the coordinator (opens and spawns per-source tasks).
         let shutdown = self.shutdown_signal.clone();
-        let pipeline_coordinator =
-            PipelineCoordinator::new(sources, pipeline_config, Arc::clone(&shutdown)).await?;
 
         // Build the PipelineCallback implementation that bridges to db.rs internals.
         let counters = Arc::clone(&self.counters);
@@ -3132,12 +3255,35 @@ impl LaminarDB {
             pipeline_hash,
         };
 
-        // Spawn the coordinator as the single pipeline task.
-        let handle = tokio::spawn(async move {
-            pipeline_coordinator.run(Box::new(callback)).await;
-        });
+        // Build TPC config (use explicit settings or auto-detect defaults).
+        {
+            use laminar_core::tpc::TpcConfig;
 
-        *self.runtime_handle.lock() = Some(handle);
+            let tpc_cfg = self.config.tpc.clone().unwrap_or_default();
+            let num_cores = tpc_cfg.num_cores.unwrap_or_else(|| {
+                std::thread::available_parallelism().map_or(1, std::num::NonZero::get)
+            });
+            let tpc_config = TpcConfig {
+                num_cores,
+                cpu_pinning: tpc_cfg.cpu_pinning,
+                cpu_start: tpc_cfg.cpu_start,
+                numa_aware: tpc_cfg.numa_aware,
+                ..Default::default()
+            };
+
+            let tpc_coordinator = TpcPipelineCoordinator::new(
+                sources,
+                pipeline_config,
+                tpc_config,
+                Arc::clone(&shutdown),
+            )?;
+
+            let handle = tokio::spawn(async move {
+                tpc_coordinator.run(Box::new(callback)).await;
+            });
+
+            *self.runtime_handle.lock() = Some(handle);
+        }
         Ok(())
     }
 

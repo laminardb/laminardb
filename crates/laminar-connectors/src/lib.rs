@@ -80,9 +80,6 @@ pub mod serde;
 /// Schema inference, resolution, and evolution framework.
 pub mod schema;
 
-/// Dead letter queue and error handling for source connectors (F-SCHEMA-010).
-pub mod error_handling;
-
 /// Connector registry with factory pattern.
 pub mod registry;
 
@@ -108,17 +105,11 @@ pub mod postgres;
 /// Lookup table support for enrichment joins.
 pub mod lookup;
 
-/// Connector bridge for DAG source/sink integration.
-pub mod bridge;
-
 /// Lakehouse connectors (Delta Lake, Iceberg).
 pub mod lakehouse;
 
 /// Cloud storage infrastructure (credential resolution, validation, secret masking).
 pub mod storage;
-
-/// Connector SDK - developer tooling and operational resilience.
-pub mod sdk;
 
 /// Reference table source trait and refresh modes.
 pub mod reference;

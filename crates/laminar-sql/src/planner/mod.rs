@@ -13,7 +13,9 @@ pub mod predicate_split;
 pub mod streaming_optimizer;
 
 use std::collections::HashMap;
+use std::sync::Arc;
 
+use arrow::datatypes::{Field, Schema, SchemaRef};
 use datafusion::logical_expr::LogicalPlan;
 use datafusion::prelude::SessionContext;
 use sqlparser::ast::{ObjectName, SetExpr, Statement};
@@ -45,6 +47,10 @@ pub struct LookupTableInfo {
     pub primary_key: Vec<String>,
     /// Validated properties.
     pub properties: LookupTableProperties,
+    /// Pre-computed Arrow schema from column definitions.
+    pub arrow_schema: SchemaRef,
+    /// Raw WITH options for connector configuration pass-through.
+    pub raw_options: HashMap<String, String>,
 }
 
 /// Streaming query planner
@@ -476,11 +482,29 @@ impl StreamingPlanner {
             PlanningError::InvalidQuery(format!("Invalid lookup table properties: {e}"))
         })?;
 
+        // Compute Arrow schema from column definitions
+        let arrow_fields: Vec<Field> = lt
+            .columns
+            .iter()
+            .map(|c| {
+                let dt = crate::translator::streaming_ddl::sql_type_to_arrow(&c.data_type)
+                    .map_err(|e| PlanningError::InvalidQuery(e.to_string()))?;
+                let nullable = !c
+                    .options
+                    .iter()
+                    .any(|opt| matches!(opt.option, sqlparser::ast::ColumnOption::NotNull));
+                Ok(Field::new(&c.name.value, dt, nullable))
+            })
+            .collect::<Result<_, PlanningError>>()?;
+        let arrow_schema = Arc::new(Schema::new(arrow_fields));
+
         let info = LookupTableInfo {
             name: name.clone(),
             columns,
             primary_key: lt.primary_key.clone(),
             properties,
+            arrow_schema,
+            raw_options: lt.with_options.clone(),
         };
 
         self.lookup_tables.insert(name, info.clone());

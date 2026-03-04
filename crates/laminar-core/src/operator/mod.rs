@@ -44,8 +44,8 @@ impl Event {
 
 /// Output from an operator
 ///
-/// Infrequent variants (`SideOutput`, `CheckpointComplete`) are boxed to keep
-/// the enum size small for the common hot-path variants (`Event`, `Watermark`).
+/// Infrequent variants (`SideOutput`, `CheckpointComplete`, `Barrier`) are boxed
+/// to keep the enum size small for the common hot-path variants (`Event`, `Watermark`).
 #[derive(Debug)]
 pub enum Output {
     /// Regular event output
@@ -66,6 +66,12 @@ pub enum Output {
     /// Emitted when a `CheckpointRequest` is processed by a core thread.
     /// Carries the checkpoint ID and all operator states for persistence by Ring 1.
     CheckpointComplete(Box<CheckpointCompleteData>),
+    /// Checkpoint barrier forwarded from a core thread (boxed — infrequent path).
+    ///
+    /// When a core receives a `CoreMessage::Barrier`, it flushes the reactor
+    /// and forwards the barrier as an output so the coordinator can track
+    /// barrier alignment across sources.
+    Barrier(Box<crate::checkpoint::CheckpointBarrier>),
 }
 
 /// Data for a late event routed to a named side output.
@@ -175,6 +181,19 @@ pub enum OperatorError {
     /// Configuration error (e.g., missing required builder field)
     #[error("Configuration error: {0}")]
     ConfigError(String),
+}
+
+impl From<arrow_schema::ArrowError> for OperatorError {
+    fn from(e: arrow_schema::ArrowError) -> Self {
+        Self::SerializationFailed(e.to_string())
+    }
+}
+
+#[cfg(feature = "jit")]
+impl From<datafusion_common::DataFusionError> for OperatorError {
+    fn from(e: datafusion_common::DataFusionError) -> Self {
+        Self::ProcessingFailed(e.to_string())
+    }
 }
 
 pub mod asof_join;

@@ -268,35 +268,16 @@ struct SerializableAsofRow {
 }
 
 impl SerializableAsofRow {
-    /// Serializes an `AsofRow` to IPC bytes for checkpointing.
     fn from_row(row: &AsofRow) -> Result<Self, OperatorError> {
-        let mut buf = Vec::new();
-        {
-            let mut writer =
-                arrow_ipc::writer::StreamWriter::try_new(&mut buf, &row.batch.schema())
-                    .map_err(|e| OperatorError::SerializationFailed(e.to_string()))?;
-            writer
-                .write(&row.batch)
-                .map_err(|e| OperatorError::SerializationFailed(e.to_string()))?;
-            writer
-                .finish()
-                .map_err(|e| OperatorError::SerializationFailed(e.to_string()))?;
-        }
+        let data = crate::serialization::serialize_batch_stream(&row.batch)?;
         Ok(Self {
             timestamp: row.timestamp,
-            data: buf,
+            data,
         })
     }
 
-    /// Deserializes IPC bytes back to an `AsofRow` during restore.
     fn to_row(&self) -> Result<AsofRow, OperatorError> {
-        let cursor = std::io::Cursor::new(&self.data);
-        let mut reader = arrow_ipc::reader::StreamReader::try_new(cursor, None)
-            .map_err(|e| OperatorError::SerializationFailed(e.to_string()))?;
-        let batch = reader
-            .next()
-            .ok_or_else(|| OperatorError::SerializationFailed("Empty batch data".to_string()))?
-            .map_err(|e| OperatorError::SerializationFailed(e.to_string()))?;
+        let batch = crate::serialization::deserialize_batch_stream(&self.data)?;
         Ok(AsofRow {
             timestamp: self.timestamp,
             batch: Arc::new(batch),

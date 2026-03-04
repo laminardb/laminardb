@@ -51,15 +51,11 @@
 //! - Budget violation counts
 //! - Amount exceeded (for capacity planning)
 //!
-//! Access metrics via `BudgetMetrics::global()` or per-task via `TaskBudget`.
+//! Access budget status via `TaskBudget` methods.
 
-mod monitor;
-mod stats;
 mod task_budget;
 mod yield_reason;
 
-pub use monitor::{BudgetAlert, BudgetMonitor, ViolationWindow};
-pub use stats::{BudgetMetrics, BudgetMetricsSnapshot, TaskStats};
 pub use task_budget::TaskBudget;
 pub use yield_reason::YieldReason;
 
@@ -112,44 +108,6 @@ mod tests {
         assert_eq!(
             format!("{}", YieldReason::ShutdownRequested),
             "ShutdownRequested"
-        );
-    }
-
-    #[test]
-    fn test_budget_metrics_snapshot() {
-        let metrics = BudgetMetrics::new();
-
-        // Record some test data
-        metrics.record_task("test_task", 0, 100, 50); // Under budget
-        metrics.record_task("test_task", 0, 100, 150); // Over budget by 50
-
-        let snapshot = metrics.snapshot();
-        assert_eq!(snapshot.total_tasks, 2);
-        assert_eq!(snapshot.total_violations, 1);
-        assert_eq!(snapshot.total_exceeded_ns, 50);
-    }
-
-    #[test]
-    fn test_budget_monitor_alert() {
-        // Use a 1-second window with threshold of 10 violations/sec
-        let mut monitor = BudgetMonitor::new(Duration::from_secs(1), 10.0);
-
-        // Record 20 violations - that's 20/sec which exceeds the 10/sec threshold
-        for _ in 0..20 {
-            monitor.record_violation("test_task", 0, 100);
-        }
-
-        let alerts = monitor.check_alerts();
-        assert!(
-            !alerts.is_empty(),
-            "Should have alerts for 20 violations in 1 second"
-        );
-        assert_eq!(alerts[0].task, "test_task");
-        // Rate should be 20 violations / 1 second = 20/sec
-        assert!(
-            alerts[0].violation_rate >= 10.0,
-            "Rate {} should be >= 10.0",
-            alerts[0].violation_rate
         );
     }
 

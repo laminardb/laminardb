@@ -20,9 +20,6 @@ laminar-core = { path = "../laminar-core", version = "0.18.0", features = ["delt
 laminar-sql = { path = "../laminar-sql", version = "0.18.0" }
 laminar-storage = { path = "../laminar-storage", version = "0.18.0" }
 laminar-connectors = { path = "../laminar-connectors", version = "0.18.0" }
-laminar-auth = { path = "../laminar-auth", version = "0.18.0" }
-laminar-admin = { path = "../laminar-admin", version = "0.18.0" }
-laminar-observe = { path = "../laminar-observe", version = "0.18.0" }
 laminar-db = { path = "../laminar-db", version = "0.18.0" }
 
 # CLI and configuration

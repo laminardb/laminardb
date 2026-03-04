@@ -44,9 +44,6 @@ COPY crates/laminar-core/Cargo.toml crates/laminar-core/Cargo.toml
 COPY crates/laminar-sql/Cargo.toml crates/laminar-sql/Cargo.toml
 COPY crates/laminar-storage/Cargo.toml crates/laminar-storage/Cargo.toml
 COPY crates/laminar-connectors/Cargo.toml crates/laminar-connectors/Cargo.toml
-COPY crates/laminar-auth/Cargo.toml crates/laminar-auth/Cargo.toml
-COPY crates/laminar-admin/Cargo.toml crates/laminar-admin/Cargo.toml
-COPY crates/laminar-observe/Cargo.toml crates/laminar-observe/Cargo.toml
 COPY crates/laminar-server/Cargo.toml crates/laminar-server/Cargo.toml
 COPY crates/laminar-db/Cargo.toml crates/laminar-db/Cargo.toml
 COPY crates/laminar-derive/Cargo.toml crates/laminar-derive/Cargo.toml
@@ -58,9 +55,6 @@ RUN mkdir -p crates/laminar-core/src && echo "pub fn _dummy() {}" > crates/lamin
     && mkdir -p crates/laminar-sql/src && echo "pub fn _dummy() {}" > crates/laminar-sql/src/lib.rs \
     && mkdir -p crates/laminar-storage/src && echo "pub fn _dummy() {}" > crates/laminar-storage/src/lib.rs \
     && mkdir -p crates/laminar-connectors/src && echo "pub fn _dummy() {}" > crates/laminar-connectors/src/lib.rs \
-    && mkdir -p crates/laminar-auth/src && echo "pub fn _dummy() {}" > crates/laminar-auth/src/lib.rs \
-    && mkdir -p crates/laminar-admin/src && echo "pub fn _dummy() {}" > crates/laminar-admin/src/lib.rs \
-    && mkdir -p crates/laminar-observe/src && echo "pub fn _dummy() {}" > crates/laminar-observe/src/lib.rs \
     && mkdir -p crates/laminar-db/src && echo "pub fn _dummy() {}" > crates/laminar-db/src/lib.rs \
     && mkdir -p crates/laminar-derive/src && echo "pub fn _dummy() {}" > crates/laminar-derive/src/lib.rs \
     && mkdir -p crates/laminar-server/src && echo "fn main() {}" > crates/laminar-server/src/main.rs \
