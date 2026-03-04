@@ -21,6 +21,7 @@ use super::core_handle::{CoreMessage, CoreThreadContext, TaggedOutput};
 /// Processes SPSC inbox messages via the `Reactor` operator chain and
 /// routes outputs to the SPSC outbox. Handles WAL write completions
 /// from the main ring and wakeup eventfd completions from the latency ring.
+#[allow(dead_code)]
 pub(super) struct CoreRingHandler<'a> {
     /// Shared core thread context (inbox, outbox, shutdown flag, etc.).
     ctx: &'a CoreThreadContext,

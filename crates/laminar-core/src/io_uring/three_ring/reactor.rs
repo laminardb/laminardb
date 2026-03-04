@@ -87,6 +87,7 @@ impl ThreeRingReactor {
     /// # Errors
     ///
     /// Returns an error if ring creation fails.
+    #[allow(clippy::needless_pass_by_value)]
     pub fn new(core_id: usize, config: ThreeRingConfig) -> Result<Self, IoUringError> {
         config.validate()?;
 
