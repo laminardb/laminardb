@@ -45,8 +45,6 @@ pub mod dag;
 pub mod detect;
 /// Structured error code registry (`LDB-NNNN`) and Ring 0 hot path error type.
 pub mod error_codes;
-/// Secondary index support using redb.
-pub mod index;
 pub mod io_uring;
 /// Lookup table types and predicate pushdown.
 pub mod lookup;
@@ -54,7 +52,6 @@ pub mod mv;
 pub mod numa;
 pub mod operator;
 pub mod reactor;
-pub mod sink;
 pub mod state;
 pub mod streaming;
 pub mod subscription;
@@ -102,10 +99,6 @@ pub enum Error {
     /// NUMA errors
     #[error("NUMA error: {0}")]
     Numa(#[from] numa::NumaError),
-
-    /// Sink errors
-    #[error("Sink error: {0}")]
-    Sink(#[from] sink::SinkError),
 
     /// Materialized view errors
     #[error("MV error: {0}")]

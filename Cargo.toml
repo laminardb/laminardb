@@ -4,9 +4,6 @@ members = [
     "crates/laminar-sql",
     "crates/laminar-storage",
     "crates/laminar-connectors",
-    "crates/laminar-auth",
-    "crates/laminar-admin",
-    "crates/laminar-observe",
     "crates/laminar-server",
     "crates/laminar-derive",
     "crates/laminar-db",
@@ -108,9 +105,6 @@ cranelift-frontend = "0.128"
 cranelift-jit = "0.128"
 cranelift-module = "0.128"
 cranelift-native = "0.128"
-
-# Embedded key-value (secondary indexes)
-redb = "3"
 
 # Constellation (distributed mode)
 tonic = "0.14"

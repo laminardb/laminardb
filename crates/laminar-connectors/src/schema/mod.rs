@@ -9,7 +9,7 @@
 //!   determining a source's Arrow schema
 //! - **Format inference** (`inference`) — registry of format-specific
 //!   schema inferencers with built-in JSON, CSV, and raw support
-//! - **Bridge adapters** ([`bridge`]) — adapters between legacy
+//! - **Bridge adapters** (`bridge`) — adapters between legacy
 //!   [`RecordDeserializer`](crate::serde::RecordDeserializer) /
 //!   [`RecordSerializer`](crate::serde::RecordSerializer) and the new
 //!   `FormatDecoder` / `FormatEncoder` traits

@@ -36,7 +36,7 @@ use crate::io_uring::{CoreRingManager, IoUringConfig};
 
 use crate::alloc::HotPathGuard;
 use crate::budget::TaskBudget;
-use crate::numa::{NumaAllocator, NumaTopology};
+use crate::numa::NumaTopology;
 use crate::operator::{CheckpointCompleteData, Event, Operator, Output};
 use crate::reactor::{Reactor, ReactorConfig};
 
@@ -534,12 +534,6 @@ fn init_core_thread(
             ctx.core_id,
             ctx.numa_node
         );
-    }
-
-    // Create NUMA allocator for this core (optional - for future state store integration)
-    if ctx.numa_aware {
-        let topology = NumaTopology::detect();
-        let _numa_allocator = NumaAllocator::new(&topology);
     }
 
     // Initialize io_uring ring manager if configured (Linux only)

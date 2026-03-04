@@ -107,9 +107,7 @@ impl WriteResult {
 
 /// Capabilities declared by a sink connector.
 ///
-/// This is distinct from `laminar_core::sink::SinkCapabilities` which is for
-/// the core reactor sink trait. `SinkConnectorCapabilities` describes the
-/// capabilities of an external sink connector implementation.
+/// Describes the capabilities of an external sink connector implementation.
 #[derive(Debug, Clone, Default)]
 #[allow(clippy::struct_excessive_bools)]
 pub struct SinkConnectorCapabilities {

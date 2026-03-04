@@ -1,1 +1,0 @@
-//! Prometheus and OpenTelemetry metrics

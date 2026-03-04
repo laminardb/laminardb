@@ -99,13 +99,11 @@ Durability and I/O, never blocking the hot path. Runs on Tokio.
 
 Admin and observability. No latency requirements.
 
-**Components (planned -- crate stubs exist, no implementation yet):**
-- **Admin API** -- REST API via Axum with Swagger UI (`laminar-admin/`)
-- **Metrics Export** -- Prometheus metrics and OpenTelemetry tracing (`laminar-observe/`)
-- **Auth Engine** -- JWT authentication, RBAC/ABAC authorization (`laminar-auth/`)
+**Components (planned):**
+- **Admin API** -- REST endpoints currently live in `laminar-server/src/http.rs`
+- **Metrics Export** -- Prometheus metrics and OpenTelemetry tracing (future)
+- **Auth Engine** -- JWT authentication, RBAC/ABAC authorization (future)
 - **Config Manager** -- Dynamic configuration, connector registry
-
-Note: While the Ring 2 crate stubs (`laminar-auth`, `laminar-admin`, `laminar-observe`) exist in the workspace, their source files contain only module-level doc comments with no implementation. These are planned for Phase 4 (Enterprise Security) and Phase 5 (Admin & Observability).
 
 ## Data Flow
 
@@ -169,9 +167,6 @@ laminar-db            Unified facade: LaminarDB struct, LaminarDbBuilder,
                       Ring 0 SQL operator routing (core_window_state),
                       EOWC incremental window accumulators (eowc_state)
                       |
-laminar-auth          JWT authentication, RBAC, ABAC (Ring 2 -- stubs only)
-laminar-admin         REST API with Axum, Swagger UI (Ring 2 -- stubs only)
-laminar-observe       Prometheus metrics, OpenTelemetry tracing (Ring 2 -- stubs only)
 laminar-derive        Proc macros: #[derive(Record, FromRecordBatch, FromRow, ConnectorConfig)]
 laminar-server        Standalone binary: CLI args, logging init (skeleton with TODOs)
 ```

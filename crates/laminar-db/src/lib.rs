@@ -25,13 +25,12 @@
 #![allow(clippy::module_name_repetitions)]
 #![allow(clippy::disallowed_types)]
 
-#[allow(dead_code)]
-mod adaptive;
 mod aggregate_state;
 mod asof_batch;
 mod batch_filter;
 mod builder;
 mod catalog;
+mod catalog_connector;
 /// Unified checkpoint coordination.
 pub mod checkpoint_coordinator;
 mod config;
