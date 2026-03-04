@@ -49,7 +49,7 @@ pub struct RegisteredBufferPool {
     acquisitions: u64,
     /// Cumulative number of times acquisition failed (pool exhausted).
     exhaustions: u64,
-    /// Buffers currently submitted to io_uring (debug-only tracking).
+    /// Buffers currently submitted to `io_uring` (debug-only tracking).
     /// Used to detect use-after-free: releasing a buffer that is still in-flight.
     in_flight: HashSet<u16>,
 }
@@ -156,7 +156,7 @@ impl RegisteredBufferPool {
 
     /// Release a buffer back to the pool.
     ///
-    /// The buffer must not be in-flight (submitted to io_uring but not yet
+    /// The buffer must not be in-flight (submitted to `io_uring` but not yet
     /// completed). In debug builds, this is checked via assertion.
     ///
     /// # Panics
@@ -177,7 +177,7 @@ impl RegisteredBufferPool {
         self.acquired_count = self.acquired_count.saturating_sub(1);
     }
 
-    /// Mark a buffer as in-flight (submitted to io_uring).
+    /// Mark a buffer as in-flight (submitted to `io_uring`).
     ///
     /// Call this after submitting a read/write operation that uses this buffer.
     /// Call [`Self::complete_in_flight`] when the CQE arrives.
