@@ -609,7 +609,12 @@ impl ThreeRingReactor {
     /// # Errors
     ///
     /// Returns an error if submission fails.
-    pub unsafe fn submit_recv(&mut self, fd: RawFd, buf: *mut u8, len: u32) -> Result<u64, IoUringError> {
+    pub unsafe fn submit_recv(
+        &mut self,
+        fd: RawFd,
+        buf: *mut u8,
+        len: u32,
+    ) -> Result<u64, IoUringError> {
         let user_data = self.next_user_data();
 
         let entry = opcode::Recv::new(Fd(fd), buf, len)
@@ -703,7 +708,11 @@ impl ThreeRingReactor {
     /// # Errors
     ///
     /// Returns an error if submission fails.
-    pub unsafe fn submit_wal_sync(&mut self, fd: RawFd, datasync: bool) -> Result<u64, IoUringError> {
+    pub unsafe fn submit_wal_sync(
+        &mut self,
+        fd: RawFd,
+        datasync: bool,
+    ) -> Result<u64, IoUringError> {
         let user_data = self.next_user_data();
 
         let entry = if datasync {
