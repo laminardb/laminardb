@@ -1,6 +1,6 @@
 //! Backpressure controller for Kafka source consumption.
 //!
-//! [`BackpressureController`] monitors downstream channel utilization
+//! [`KafkaKafkaBackpressureController`] monitors downstream channel utilization
 //! and signals when the consumer should pause or resume partition
 //! consumption to prevent unbounded memory growth.
 
@@ -14,7 +14,7 @@ use std::sync::Arc;
 /// consumption pauses. It resumes only when the ratio drops below the
 /// low watermark.
 #[derive(Debug)]
-pub struct BackpressureController {
+pub struct KafkaBackpressureController {
     /// Fill ratio above which to pause (e.g., 0.8 = 80%).
     high_watermark: f64,
     /// Fill ratio below which to resume (e.g., 0.5 = 50%).
@@ -27,7 +27,7 @@ pub struct BackpressureController {
     is_paused: bool,
 }
 
-impl BackpressureController {
+impl KafkaBackpressureController {
     /// Creates a new backpressure controller.
     ///
     /// # Arguments
@@ -97,9 +97,9 @@ impl BackpressureController {
 mod tests {
     use super::*;
 
-    fn make_controller(len: usize, capacity: usize) -> BackpressureController {
+    fn make_controller(len: usize, capacity: usize) -> KafkaBackpressureController {
         let channel_len = Arc::new(AtomicUsize::new(len));
-        BackpressureController::new(0.8, 0.5, capacity, channel_len)
+        KafkaBackpressureController::new(0.8, 0.5, capacity, channel_len)
     }
 
     #[test]

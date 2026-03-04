@@ -621,6 +621,9 @@ fn core_thread_main(
     // are attributed to source 0 (the coordinator resolves this).
     let mut last_source_idx: usize = 0;
 
+    // Rate-limit submit errors to avoid allocation storms on the hot path.
+    let mut submit_error_count: u64 = 0;
+
     // Tiered idle strategy: tracks consecutive iterations with no work.
     // 0..64   → spin_loop() (PAUSE/YIELD hint, ~ns wake)
     // 64..128 → thread::yield_now() (OS scheduler yield, ~μs wake)
@@ -649,7 +652,14 @@ fn core_thread_main(
                 CoreMessage::Event { source_idx, event } => {
                     last_source_idx = source_idx;
                     if let Err(e) = reactor.submit(event) {
-                        tracing::error!("Core {}: Failed to submit event: {e}", ctx.core_id);
+                        submit_error_count += 1;
+                        if submit_error_count.is_power_of_two() {
+                            tracing::error!(
+                                "Core {}: Failed to submit event (n={}): {e}",
+                                ctx.core_id,
+                                submit_error_count,
+                            );
+                        }
                     }
                     messages_processed += 1;
                     had_work = true;

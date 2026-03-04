@@ -52,6 +52,8 @@ pub mod mv;
 pub mod numa;
 pub mod operator;
 pub mod reactor;
+/// Shared Arrow IPC serialization for `RecordBatch` ↔ bytes.
+pub mod serialization;
 pub mod state;
 pub mod streaming;
 pub mod subscription;

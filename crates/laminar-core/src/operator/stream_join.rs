@@ -41,7 +41,8 @@
 //!     .row_encoding(JoinRowEncoding::CpuFriendly)  // 30-50% faster for memory-resident state
 //!     .asymmetric_compaction(true)                  // Skip compaction on finished sides
 //!     .per_key_tracking(true)                       // Aggressive cleanup for sparse keys
-//!     .build();
+//!     .build()
+//!     .unwrap();
 //! let optimized_operator = StreamJoinOperator::from_config(config);
 //! ```
 //!
@@ -224,7 +225,8 @@ impl std::str::FromStr for JoinRowEncoding {
 ///     .time_bound(Duration::from_secs(3600))
 ///     .join_type(JoinType::Inner)
 ///     .row_encoding(JoinRowEncoding::CpuFriendly)
-///     .build();
+///     .build()
+///     .unwrap();
 /// ```
 #[derive(Debug, Clone)]
 pub struct StreamJoinConfig {
@@ -385,9 +387,22 @@ impl StreamJoinConfigBuilder {
     }
 
     /// Builds the configuration.
-    #[must_use]
-    pub fn build(self) -> StreamJoinConfig {
-        self.config
+    ///
+    /// # Errors
+    ///
+    /// Returns `OperatorError::ConfigError` if key columns are empty.
+    pub fn build(self) -> std::result::Result<StreamJoinConfig, OperatorError> {
+        if self.config.left_key_column.is_empty() {
+            return Err(OperatorError::ConfigError(
+                "left_key_column is required".into(),
+            ));
+        }
+        if self.config.right_key_column.is_empty() {
+            return Err(OperatorError::ConfigError(
+                "right_key_column is required".into(),
+            ));
+        }
+        Ok(self.config)
     }
 }
 
@@ -560,20 +575,8 @@ impl JoinRow {
         })
     }
 
-    /// Serializes using compact Arrow IPC format.
     fn serialize_compact(batch: &RecordBatch) -> Result<Vec<u8>, OperatorError> {
-        let mut buf = Vec::new();
-        {
-            let mut writer = arrow_ipc::writer::StreamWriter::try_new(&mut buf, &batch.schema())
-                .map_err(|e| OperatorError::SerializationFailed(e.to_string()))?;
-            writer
-                .write(batch)
-                .map_err(|e| OperatorError::SerializationFailed(e.to_string()))?;
-            writer
-                .finish()
-                .map_err(|e| OperatorError::SerializationFailed(e.to_string()))?;
-        }
-        Ok(buf)
+        Ok(crate::serialization::serialize_batch_stream(batch)?)
     }
 
     /// Serializes using CPU-friendly format.
@@ -761,15 +764,8 @@ impl JoinRow {
         }
     }
 
-    /// Deserializes from compact Arrow IPC format.
     fn deserialize_compact(data: &[u8]) -> Result<RecordBatch, OperatorError> {
-        let cursor = std::io::Cursor::new(data);
-        let mut reader = arrow_ipc::reader::StreamReader::try_new(cursor, None)
-            .map_err(|e| OperatorError::SerializationFailed(e.to_string()))?;
-        reader
-            .next()
-            .ok_or_else(|| OperatorError::SerializationFailed("Empty batch data".to_string()))?
-            .map_err(|e| OperatorError::SerializationFailed(e.to_string()))
+        Ok(crate::serialization::deserialize_batch_stream(data)?)
     }
 
     /// Deserializes from CPU-friendly format.
@@ -1256,7 +1252,8 @@ impl StreamJoinOperator {
     ///     .time_bound(Duration::from_secs(3600))
     ///     .join_type(JoinType::Inner)
     ///     .row_encoding(JoinRowEncoding::CpuFriendly)
-    ///     .build();
+    ///     .build()
+///     .unwrap();
     ///
     /// let operator = StreamJoinOperator::from_config(config);
     /// ```
@@ -2984,7 +2981,8 @@ mod tests {
             .key_idle_threshold(Duration::from_secs(600))
             .build_side_pruning(true)
             .build_side(JoinSide::Left)
-            .build();
+            .build()
+            .unwrap();
 
         assert_eq!(config.left_key_column, "order_id");
         assert_eq!(config.right_key_column, "payment_id");
@@ -3008,7 +3006,8 @@ mod tests {
             .time_bound(Duration::from_secs(60))
             .join_type(JoinType::Inner)
             .row_encoding(JoinRowEncoding::CpuFriendly)
-            .build();
+            .build()
+            .unwrap();
 
         let operator = StreamJoinOperator::from_config(config);
 
@@ -3142,7 +3141,8 @@ mod tests {
             .time_bound(Duration::from_secs(3600))
             .join_type(JoinType::Inner)
             .per_key_tracking(true)
-            .build();
+            .build()
+            .unwrap();
 
         let mut operator = StreamJoinOperator::from_config(config);
         let mut timers = TimerService::new();
@@ -3171,7 +3171,8 @@ mod tests {
                 .time_bound(Duration::from_secs(3600))
                 .join_type(JoinType::Inner)
                 .row_encoding(JoinRowEncoding::Compact)
-                .build(),
+                .build()
+                .unwrap(),
         );
 
         let mut timers = TimerService::new();
@@ -3194,7 +3195,8 @@ mod tests {
                 .time_bound(Duration::from_secs(3600))
                 .join_type(JoinType::Inner)
                 .row_encoding(JoinRowEncoding::CpuFriendly)
-                .build(),
+                .build()
+                .unwrap(),
         );
 
         let mut state2 = InMemoryStore::new();
@@ -3215,7 +3217,8 @@ mod tests {
             .join_type(JoinType::Inner)
             .asymmetric_compaction(true)
             .idle_threshold(Duration::from_secs(10)) // 10 seconds
-            .build();
+            .build()
+            .unwrap();
 
         let mut operator = StreamJoinOperator::from_config(config);
         let mut timers = TimerService::new();
@@ -3250,7 +3253,8 @@ mod tests {
             .time_bound(Duration::from_secs(60))
             .join_type(JoinType::Inner)
             .build_side(JoinSide::Right)
-            .build();
+            .build()
+            .unwrap();
 
         let operator = StreamJoinOperator::from_config(config);
         assert_eq!(operator.effective_build_side(), JoinSide::Right);
@@ -3261,7 +3265,8 @@ mod tests {
             .right_key_column("key")
             .time_bound(Duration::from_secs(60))
             .join_type(JoinType::Inner)
-            .build();
+            .build()
+            .unwrap();
 
         let mut operator2 = StreamJoinOperator::from_config(config2);
         operator2.left_stats.events_received = 100;
@@ -3279,7 +3284,8 @@ mod tests {
             .time_bound(Duration::from_secs(3600))
             .join_type(JoinType::Inner)
             .row_encoding(JoinRowEncoding::CpuFriendly)
-            .build();
+            .build()
+            .unwrap();
 
         let mut operator = StreamJoinOperator::from_config(config);
         let mut timers = TimerService::new();
@@ -3319,7 +3325,8 @@ mod tests {
             .time_bound(Duration::from_secs(60))
             .join_type(JoinType::Inner)
             .operator_id("test_join")
-            .build();
+            .build()
+            .unwrap();
 
         let mut operator = StreamJoinOperator::from_config(config);
 
@@ -3347,7 +3354,8 @@ mod tests {
             .time_bound(Duration::from_secs(60))
             .join_type(JoinType::Inner)
             .operator_id("test_join")
-            .build();
+            .build()
+            .unwrap();
 
         let mut restored = StreamJoinOperator::from_config(config2);
         restored.restore(checkpoint).unwrap();
@@ -3376,7 +3384,8 @@ mod tests {
             .join_type(JoinType::Inner)
             .asymmetric_compaction(true)
             .idle_threshold(Duration::from_secs(10))
-            .build();
+            .build()
+            .unwrap();
 
         let mut operator = StreamJoinOperator::from_config(config);
 

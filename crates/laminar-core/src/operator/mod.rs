@@ -183,6 +183,19 @@ pub enum OperatorError {
     ConfigError(String),
 }
 
+impl From<arrow_schema::ArrowError> for OperatorError {
+    fn from(e: arrow_schema::ArrowError) -> Self {
+        Self::SerializationFailed(e.to_string())
+    }
+}
+
+#[cfg(feature = "jit")]
+impl From<datafusion_common::DataFusionError> for OperatorError {
+    fn from(e: datafusion_common::DataFusionError) -> Self {
+        Self::ProcessingFailed(e.to_string())
+    }
+}
+
 pub mod asof_join;
 pub mod changelog;
 pub mod cumulate_window;

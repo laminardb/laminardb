@@ -9,10 +9,10 @@
 //! - `GossipDiscovery`: Chitchat-based gossip protocol
 
 mod static_discovery;
-pub use static_discovery::*;
+pub use static_discovery::{StaticDiscovery, StaticDiscoveryConfig};
 
 mod gossip_discovery;
-pub use gossip_discovery::*;
+pub use gossip_discovery::{keys, GossipDiscovery, GossipDiscoveryConfig};
 
 use std::collections::HashMap;
 use std::fmt;

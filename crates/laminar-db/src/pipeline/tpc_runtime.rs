@@ -72,6 +72,9 @@ impl TpcRuntime {
     /// Attach a source to a core, spawning an I/O thread.
     ///
     /// Sources are assigned to cores in round-robin order.
+    /// # Errors
+    ///
+    /// Returns `std::io::Error` if the source I/O thread cannot be spawned.
     pub fn attach_source(
         &mut self,
         source_idx: usize,
@@ -79,7 +82,7 @@ impl TpcRuntime {
         connector: Box<dyn SourceConnector>,
         connector_config: ConnectorConfig,
         pipeline_config: &PipelineConfig,
-    ) {
+    ) -> std::io::Result<()> {
         let core_id = self.next_core % self.cores.len();
         self.next_core += 1;
 
@@ -95,11 +98,12 @@ impl TpcRuntime {
             pipeline_config.max_poll_records,
             pipeline_config.fallback_poll_interval,
             core_thread,
-        );
+        )?;
 
         self.source_threads.push(io_thread);
         self.source_names.push(name);
         self.routing.push(core_id);
+        Ok(())
     }
 
     /// Drain all core outboxes into the buffer. Returns total outputs collected.

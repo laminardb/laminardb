@@ -145,27 +145,25 @@ pub struct DisaggregatedStateBackend {
 impl DisaggregatedStateBackend {
     /// Creates a new disaggregated state backend.
     ///
-    /// # Panics
+    /// # Errors
     ///
-    /// Panics if the internal Tokio runtime cannot be created.
-    #[must_use]
-    pub fn new(store: Arc<dyn ObjectStore>, config: DisaggregatedConfig) -> Self {
+    /// Returns `std::io::Error` if the internal Tokio runtime cannot be created.
+    pub fn new(store: Arc<dyn ObjectStore>, config: DisaggregatedConfig) -> std::io::Result<Self> {
         let rt = tokio::runtime::Builder::new_current_thread()
             .enable_all()
-            .build()
-            .expect("failed to create disaggregated backend runtime");
+            .build()?;
 
         let cache = CacheBuilder::new(config.cache_capacity)
             .with_shards(config.cache_shards)
             .build();
 
-        Self {
+        Ok(Self {
             store,
             prefix: config.prefix,
             rt,
             fencing_epoch: AtomicU64::new(0),
             cache,
-        }
+        })
     }
 
     /// Write a batch of state entries for a partition at a given epoch.
@@ -515,7 +513,7 @@ mod tests {
 
     fn make_backend() -> DisaggregatedStateBackend {
         let store = Arc::new(object_store::memory::InMemory::new());
-        DisaggregatedStateBackend::new(store, DisaggregatedConfig::default())
+        DisaggregatedStateBackend::new(store, DisaggregatedConfig::default()).unwrap()
     }
 
     fn make_entries(n: usize) -> Vec<StateEntry> {
@@ -625,8 +623,9 @@ mod tests {
         // Use a shared store so we can write via one backend and read via another.
         let store = Arc::new(object_store::memory::InMemory::new());
         let backend1 =
-            DisaggregatedStateBackend::new(store.clone(), DisaggregatedConfig::default());
-        let backend2 = DisaggregatedStateBackend::new(store, DisaggregatedConfig::default());
+            DisaggregatedStateBackend::new(store.clone(), DisaggregatedConfig::default()).unwrap();
+        let backend2 =
+            DisaggregatedStateBackend::new(store, DisaggregatedConfig::default()).unwrap();
 
         let entries = make_entries(2);
         backend1.put_batch(0, 1, &entries).unwrap();

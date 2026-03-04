@@ -301,48 +301,6 @@ impl ConnectorManager {
         &self.tables
     }
 
-    /// Get registered table names.
-    #[allow(dead_code)]
-    pub fn table_names(&self) -> Vec<String> {
-        self.tables.keys().cloned().collect()
-    }
-
-    /// Get registered source names.
-    #[allow(dead_code)]
-    pub fn source_names(&self) -> Vec<String> {
-        self.sources.keys().cloned().collect()
-    }
-
-    /// Get registered sink names.
-    #[allow(dead_code)]
-    pub fn sink_names(&self) -> Vec<String> {
-        self.sinks.keys().cloned().collect()
-    }
-
-    /// Get registered stream names.
-    #[allow(dead_code)]
-    pub fn stream_names(&self) -> Vec<String> {
-        self.streams.keys().cloned().collect()
-    }
-
-    /// Get a source registration.
-    #[allow(dead_code)]
-    pub fn get_source(&self, name: &str) -> Option<&SourceRegistration> {
-        self.sources.get(name)
-    }
-
-    /// Get a sink registration.
-    #[allow(dead_code)]
-    pub fn get_sink(&self, name: &str) -> Option<&SinkRegistration> {
-        self.sinks.get(name)
-    }
-
-    /// Total number of registrations.
-    #[allow(dead_code)]
-    pub fn registration_count(&self) -> usize {
-        self.sources.len() + self.sinks.len() + self.streams.len() + self.tables.len()
-    }
-
     /// Check if a connector type requires external runtime (e.g., Kafka).
     pub fn has_external_connectors(&self) -> bool {
         self.sources.values().any(|s| s.connector_type.is_some())
@@ -365,8 +323,38 @@ impl ConnectorManager {
         &self.streams
     }
 
-    /// Clear all registrations.
-    #[allow(dead_code)]
+}
+
+#[cfg(test)]
+impl ConnectorManager {
+    pub fn table_names(&self) -> Vec<String> {
+        self.tables.keys().cloned().collect()
+    }
+
+    pub fn source_names(&self) -> Vec<String> {
+        self.sources.keys().cloned().collect()
+    }
+
+    pub fn sink_names(&self) -> Vec<String> {
+        self.sinks.keys().cloned().collect()
+    }
+
+    pub fn stream_names(&self) -> Vec<String> {
+        self.streams.keys().cloned().collect()
+    }
+
+    pub fn get_source(&self, name: &str) -> Option<&SourceRegistration> {
+        self.sources.get(name)
+    }
+
+    pub fn get_sink(&self, name: &str) -> Option<&SinkRegistration> {
+        self.sinks.get(name)
+    }
+
+    pub fn registration_count(&self) -> usize {
+        self.sources.len() + self.sinks.len() + self.streams.len() + self.tables.len()
+    }
+
     pub fn clear(&mut self) {
         self.sources.clear();
         self.sinks.clear();

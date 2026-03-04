@@ -61,7 +61,9 @@ impl TpcPipelineCoordinator {
         let mut runtime =
             TpcRuntime::new(tpc_config).map_err(|e| DbError::Config(e.to_string()))?;
         for (idx, src) in sources.into_iter().enumerate() {
-            runtime.attach_source(idx, src.name, src.connector, src.config, &config);
+            runtime
+                .attach_source(idx, src.name, src.connector, src.config, &config)
+                .map_err(|e| DbError::Config(format!("failed to spawn source thread: {e}")))?;
         }
 
         Ok(Self {

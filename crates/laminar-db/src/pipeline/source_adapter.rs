@@ -67,9 +67,9 @@ impl SourceIoThread {
     /// The `core_thread` handle is used to `unpark()` the core after each
     /// inbox push, waking it from `park_timeout()` sleep.
     ///
-    /// # Panics
+    /// # Errors
     ///
-    /// Panics if the OS thread cannot be spawned.
+    /// Returns `std::io::Error` if the OS thread cannot be spawned.
     #[allow(clippy::too_many_arguments)]
     pub fn spawn(
         source_idx: usize,
@@ -80,7 +80,7 @@ impl SourceIoThread {
         max_poll_records: usize,
         fallback_poll_interval: Duration,
         core_thread: thread::Thread,
-    ) -> Self {
+    ) -> std::io::Result<Self> {
         let shutdown = Arc::new(AtomicBool::new(false));
         let injector = CheckpointBarrierInjector::new();
         let barrier_handle = injector.handle();
@@ -108,15 +108,15 @@ impl SourceIoThread {
                     core_thread,
                 )
             })
-            .expect("failed to spawn source I/O thread");
+?;
 
-        Self {
+        Ok(Self {
             thread: Some(thread),
             shutdown,
             injector,
             metrics,
             checkpoint_rx: cp_rx,
-        }
+        })
     }
 
     /// Signal shutdown and join the thread, returning the connector for cleanup.
@@ -186,10 +186,16 @@ fn source_io_main(
     cp_tx: tokio::sync::watch::Sender<SourceCheckpoint>,
     core_thread: thread::Thread,
 ) -> Option<Box<dyn SourceConnector>> {
-    let rt = tokio::runtime::Builder::new_current_thread()
+    let rt = match tokio::runtime::Builder::new_current_thread()
         .enable_all()
         .build()
-        .expect("failed to create tokio runtime for source I/O thread");
+    {
+        Ok(rt) => rt,
+        Err(e) => {
+            tracing::error!("Source '{name}': failed to create tokio runtime: {e}");
+            return Some(connector);
+        }
+    };
 
     rt.block_on(async {
         // Open the connector

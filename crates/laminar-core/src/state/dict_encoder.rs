@@ -23,8 +23,8 @@
 //! let mut encoder = DictionaryKeyEncoder::new();
 //!
 //! // Ring 2: populate during query setup
-//! let code_aapl = encoder.encode_or_insert(b"AAPL");
-//! let code_goog = encoder.encode_or_insert(b"GOOG");
+//! let code_aapl = encoder.encode_or_insert(b"AAPL").unwrap();
+//! let code_goog = encoder.encode_or_insert(b"GOOG").unwrap();
 //! assert_ne!(code_aapl, code_goog);
 //!
 //! // Ring 0: fast lookup on hot path
@@ -86,18 +86,17 @@ impl DictionaryKeyEncoder {
     /// Allocates on first insertion of a new key. Subsequent calls for the
     /// same key return the existing code without allocation.
     ///
-    /// # Panics
+    /// # Errors
     ///
-    /// Panics if more than `u32::MAX` distinct keys are inserted.
-    pub fn encode_or_insert(&mut self, key: &[u8]) -> u32 {
+    /// Returns `None` if the dictionary already contains `u32::MAX` keys.
+    pub fn encode_or_insert(&mut self, key: &[u8]) -> Option<u32> {
         if let Some(&code) = self.key_to_code.get(key) {
-            return code;
+            return Some(code);
         }
-        let code =
-            u32::try_from(self.code_to_key.len()).expect("dictionary overflow: > u32::MAX keys");
+        let code = u32::try_from(self.code_to_key.len()).ok()?;
         self.key_to_code.insert(key.to_vec(), code);
         self.code_to_key.push(key.to_vec());
-        code
+        Some(code)
     }
 
     /// Decodes a compact code back to the original key bytes.
@@ -152,15 +151,15 @@ mod tests {
     #[test]
     fn test_encode_decode_roundtrip() {
         let mut enc = DictionaryKeyEncoder::new();
-        let code = enc.encode_or_insert(b"AAPL");
+        let code = enc.encode_or_insert(b"AAPL").unwrap();
         assert_eq!(enc.decode(code), Some(b"AAPL".as_slice()));
     }
 
     #[test]
     fn test_idempotent_insert() {
         let mut enc = DictionaryKeyEncoder::new();
-        let c1 = enc.encode_or_insert(b"GOOG");
-        let c2 = enc.encode_or_insert(b"GOOG");
+        let c1 = enc.encode_or_insert(b"GOOG").unwrap();
+        let c2 = enc.encode_or_insert(b"GOOG").unwrap();
         assert_eq!(c1, c2);
         assert_eq!(enc.len(), 1);
     }
@@ -168,9 +167,9 @@ mod tests {
     #[test]
     fn test_distinct_codes() {
         let mut enc = DictionaryKeyEncoder::new();
-        let c1 = enc.encode_or_insert(b"AAPL");
-        let c2 = enc.encode_or_insert(b"GOOG");
-        let c3 = enc.encode_or_insert(b"MSFT");
+        let c1 = enc.encode_or_insert(b"AAPL").unwrap();
+        let c2 = enc.encode_or_insert(b"GOOG").unwrap();
+        let c3 = enc.encode_or_insert(b"MSFT").unwrap();
         assert_ne!(c1, c2);
         assert_ne!(c2, c3);
         assert_eq!(enc.len(), 3);
@@ -185,7 +184,7 @@ mod tests {
     #[test]
     fn test_encode_to_bytes() {
         let mut enc = DictionaryKeyEncoder::new();
-        let code = enc.encode_or_insert(b"TEST");
+        let code = enc.encode_or_insert(b"TEST").unwrap();
         let bytes = enc.encode_to_bytes(b"TEST").unwrap();
         assert_eq!(bytes, code.to_le_bytes());
         assert_eq!(enc.encode_to_bytes(b"MISSING"), None);
@@ -208,8 +207,8 @@ mod tests {
     #[test]
     fn test_clear() {
         let mut enc = DictionaryKeyEncoder::new();
-        enc.encode_or_insert(b"A");
-        enc.encode_or_insert(b"B");
+        enc.encode_or_insert(b"A").unwrap();
+        enc.encode_or_insert(b"B").unwrap();
         assert_eq!(enc.len(), 2);
 
         enc.clear();
@@ -220,16 +219,16 @@ mod tests {
     #[test]
     fn test_sequential_codes() {
         let mut enc = DictionaryKeyEncoder::new();
-        assert_eq!(enc.encode_or_insert(b"first"), 0);
-        assert_eq!(enc.encode_or_insert(b"second"), 1);
-        assert_eq!(enc.encode_or_insert(b"third"), 2);
+        assert_eq!(enc.encode_or_insert(b"first"), Some(0));
+        assert_eq!(enc.encode_or_insert(b"second"), Some(1));
+        assert_eq!(enc.encode_or_insert(b"third"), Some(2));
     }
 
     #[test]
     fn test_binary_keys() {
         let mut enc = DictionaryKeyEncoder::new();
         let key = [0x00, 0xFF, 0xDE, 0xAD];
-        let code = enc.encode_or_insert(&key);
+        let code = enc.encode_or_insert(&key).unwrap();
         assert_eq!(enc.decode(code), Some(key.as_slice()));
     }
 }

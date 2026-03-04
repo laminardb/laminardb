@@ -653,21 +653,23 @@ impl ObjectStoreCheckpointStore {
     /// `prefix` is prepended to all object paths (e.g., `"nodes/abc123/"`).
     /// It should end with `/` or be empty.
     ///
-    /// # Panics
+    /// # Errors
     ///
-    /// Panics if the internal Tokio runtime cannot be created.
-    #[must_use]
-    pub fn new(store: Arc<dyn ObjectStore>, prefix: String, max_retained: usize) -> Self {
+    /// Returns `std::io::Error` if the internal Tokio runtime cannot be created.
+    pub fn new(
+        store: Arc<dyn ObjectStore>,
+        prefix: String,
+        max_retained: usize,
+    ) -> std::io::Result<Self> {
         let rt = tokio::runtime::Builder::new_current_thread()
             .enable_all()
-            .build()
-            .expect("failed to create checkpoint store runtime");
-        Self {
+            .build()?;
+        Ok(Self {
             store,
             prefix,
             max_retained,
             rt,
-        }
+        })
     }
 
     // ── v2 (hierarchical) paths ──
@@ -1282,13 +1284,13 @@ mod tests {
 
     fn make_obj_store() -> ObjectStoreCheckpointStore {
         let store = Arc::new(object_store::memory::InMemory::new());
-        ObjectStoreCheckpointStore::new(store, String::new(), 3)
+        ObjectStoreCheckpointStore::new(store, String::new(), 3).unwrap()
     }
 
     fn make_obj_store_shared(
         store: Arc<object_store::memory::InMemory>,
     ) -> ObjectStoreCheckpointStore {
-        ObjectStoreCheckpointStore::new(store, String::new(), 10)
+        ObjectStoreCheckpointStore::new(store, String::new(), 10).unwrap()
     }
 
     /// Write a manifest to the legacy (v1) layout for backward-compat testing.
@@ -1355,7 +1357,8 @@ mod tests {
             Arc::new(object_store::memory::InMemory::new()),
             String::new(),
             10,
-        );
+        )
+        .unwrap();
 
         store.save(&make_manifest(1, 10)).unwrap();
         store.save(&make_manifest(2, 20)).unwrap();
@@ -1373,7 +1376,8 @@ mod tests {
             Arc::new(object_store::memory::InMemory::new()),
             String::new(),
             10,
-        );
+        )
+        .unwrap();
 
         store.save(&make_manifest(1, 10)).unwrap();
         store.save(&make_manifest(3, 30)).unwrap();
@@ -1389,7 +1393,8 @@ mod tests {
             Arc::new(object_store::memory::InMemory::new()),
             String::new(),
             10,
-        );
+        )
+        .unwrap();
 
         for i in 1..=5 {
             store.save(&make_manifest(i, i)).unwrap();
@@ -1410,7 +1415,8 @@ mod tests {
             Arc::new(object_store::memory::InMemory::new()),
             String::new(),
             2,
-        );
+        )
+        .unwrap();
 
         for i in 1..=5 {
             store.save(&make_manifest(i, i)).unwrap();
@@ -1443,7 +1449,7 @@ mod tests {
     #[test]
     fn test_obj_with_prefix() {
         let inner = Arc::new(object_store::memory::InMemory::new());
-        let store = ObjectStoreCheckpointStore::new(inner, "nodes/abc123/".to_string(), 10);
+        let store = ObjectStoreCheckpointStore::new(inner, "nodes/abc123/".to_string(), 10).unwrap();
 
         store.save(&make_manifest(1, 42)).unwrap();
         let loaded = store.load_latest().unwrap().unwrap();
@@ -1458,7 +1464,7 @@ mod tests {
     #[test]
     fn test_obj_v2_layout_paths() {
         let inner = Arc::new(object_store::memory::InMemory::new());
-        let store = ObjectStoreCheckpointStore::new(inner.clone(), String::new(), 10);
+        let store = ObjectStoreCheckpointStore::new(inner.clone(), String::new(), 10).unwrap();
 
         store.save(&make_manifest(1, 10)).unwrap();
 
@@ -1546,7 +1552,8 @@ mod tests {
             Arc::new(object_store::memory::InMemory::new()),
             String::new(),
             10,
-        );
+        )
+        .unwrap();
 
         let m = make_manifest(1, 10);
         store.save(&m).unwrap();
@@ -1589,7 +1596,7 @@ mod tests {
     #[test]
     fn test_obj_v2_state_paths() {
         let inner = Arc::new(object_store::memory::InMemory::new());
-        let store = ObjectStoreCheckpointStore::new(inner.clone(), String::new(), 10);
+        let store = ObjectStoreCheckpointStore::new(inner.clone(), String::new(), 10).unwrap();
 
         store.save(&make_manifest(1, 1)).unwrap();
         store.save_state_data(1, b"v2-state").unwrap();
@@ -1628,7 +1635,7 @@ mod tests {
         // Checkpoint 1 in v1 layout
         write_legacy_manifest(&inner, "", &make_manifest(1, 10));
         // Checkpoints 2-4 in v2 layout
-        let store = ObjectStoreCheckpointStore::new(inner, String::new(), 10);
+        let store = ObjectStoreCheckpointStore::new(inner, String::new(), 10).unwrap();
         store.save(&make_manifest(2, 20)).unwrap();
         store.save(&make_manifest(3, 30)).unwrap();
         store.save(&make_manifest(4, 40)).unwrap();
@@ -1643,7 +1650,7 @@ mod tests {
     #[test]
     fn test_obj_latest_json_format() {
         let inner = Arc::new(object_store::memory::InMemory::new());
-        let store = ObjectStoreCheckpointStore::new(inner.clone(), String::new(), 10);
+        let store = ObjectStoreCheckpointStore::new(inner.clone(), String::new(), 10).unwrap();
 
         store.save(&make_manifest(5, 50)).unwrap();
 
@@ -1911,7 +1918,8 @@ mod tests {
             Arc::new(object_store::memory::InMemory::new()),
             String::new(),
             10,
-        );
+        )
+        .unwrap();
 
         let state = b"obj-store-state-data";
         let m = make_manifest(1, 1);
@@ -1927,7 +1935,8 @@ mod tests {
             Arc::new(object_store::memory::InMemory::new()),
             String::new(),
             10,
-        );
+        )
+        .unwrap();
 
         store.save(&make_manifest(1, 10)).unwrap();
         store.save(&make_manifest(2, 20)).unwrap();
@@ -1940,7 +1949,7 @@ mod tests {
     #[test]
     fn test_obj_cleanup_orphans() {
         let inner = Arc::new(object_store::memory::InMemory::new());
-        let store = ObjectStoreCheckpointStore::new(inner.clone(), String::new(), 10);
+        let store = ObjectStoreCheckpointStore::new(inner.clone(), String::new(), 10).unwrap();
 
         // Save a checkpoint (creates manifest + state).
         let state = b"state-with-manifest";

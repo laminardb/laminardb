@@ -128,15 +128,25 @@ impl BackpressureConfigBuilder {
     }
 
     /// Builds the configuration.
-    #[must_use]
-    pub fn build(self) -> BackpressureConfig {
-        BackpressureConfig {
+    ///
+    /// # Errors
+    ///
+    /// Returns an error if `high_watermark < low_watermark`.
+    pub fn build(self) -> std::result::Result<BackpressureConfig, String> {
+        let high = self.high_watermark.unwrap_or(0.8);
+        let low = self.low_watermark.unwrap_or(0.5);
+        if high < low {
+            return Err(format!(
+                "high_watermark ({high}) must be >= low_watermark ({low})"
+            ));
+        }
+        Ok(BackpressureConfig {
             exclusive_credits: self.exclusive_credits.unwrap_or(4).min(u16::MAX as usize),
             floating_credits: self.floating_credits.unwrap_or(8).min(u16::MAX as usize),
             overflow_strategy: self.overflow_strategy.unwrap_or(OverflowStrategy::Block),
-            high_watermark: self.high_watermark.unwrap_or(0.8),
-            low_watermark: self.low_watermark.unwrap_or(0.5),
-        }
+            high_watermark: high,
+            low_watermark: low,
+        })
     }
 }
 
@@ -578,7 +588,8 @@ mod tests {
             .overflow_strategy(OverflowStrategy::Drop)
             .high_watermark(0.9)
             .low_watermark(0.6)
-            .build();
+            .build()
+            .unwrap();
 
         assert_eq!(config.exclusive_credits, 8);
         assert_eq!(config.floating_credits, 16);

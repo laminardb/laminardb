@@ -38,6 +38,12 @@ pub enum ObjectStoreFactoryError {
     Build(String),
 }
 
+impl From<object_store::Error> for ObjectStoreFactoryError {
+    fn from(e: object_store::Error) -> Self {
+        Self::Build(e.to_string())
+    }
+}
+
 /// Build an [`ObjectStore`] from a URL and optional configuration overrides.
 ///
 /// # Supported schemes
@@ -88,7 +94,7 @@ fn build_local_file_system(url: &str) -> Result<Arc<dyn ObjectStore>, ObjectStor
     }
 
     let fs = LocalFileSystem::new_with_prefix(path)
-        .map_err(|e| ObjectStoreFactoryError::Build(e.to_string()))?;
+        ?;
     Ok(Arc::new(fs))
 }
 
@@ -108,14 +114,14 @@ fn build_s3(
     for (key, value) in options {
         builder = builder.with_config(
             key.parse()
-                .map_err(|e: object_store::Error| ObjectStoreFactoryError::Build(e.to_string()))?,
+                ?,
             value,
         );
     }
 
     let store = builder
         .build()
-        .map_err(|e| ObjectStoreFactoryError::Build(e.to_string()))?;
+        ?;
     Ok(Arc::new(store))
 }
 
@@ -146,14 +152,14 @@ fn build_gcs(
     for (key, value) in options {
         builder = builder.with_config(
             key.parse()
-                .map_err(|e: object_store::Error| ObjectStoreFactoryError::Build(e.to_string()))?,
+                ?,
             value,
         );
     }
 
     let store = builder
         .build()
-        .map_err(|e| ObjectStoreFactoryError::Build(e.to_string()))?;
+        ?;
     Ok(Arc::new(store))
 }
 
@@ -184,14 +190,14 @@ fn build_azure(
     for (key, value) in options {
         builder = builder.with_config(
             key.parse()
-                .map_err(|e: object_store::Error| ObjectStoreFactoryError::Build(e.to_string()))?,
+                ?,
             value,
         );
     }
 
     let store = builder
         .build()
-        .map_err(|e| ObjectStoreFactoryError::Build(e.to_string()))?;
+        ?;
     Ok(Arc::new(store))
 }
 

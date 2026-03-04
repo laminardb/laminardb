@@ -28,11 +28,11 @@ const DEFAULT_CHANNEL_CAPACITY: usize = 128;
 const DEFAULT_FLUSH_INTERVAL: Duration = Duration::from_secs(5);
 
 /// Commands sent to a sink's dedicated task.
-#[allow(dead_code)]
 pub(crate) enum SinkCommand {
     /// Write a batch to the sink.
     WriteBatch { batch: RecordBatch },
     /// Explicitly flush buffered data.
+    #[allow(dead_code)]
     Flush {
         ack: oneshot::Sender<Result<(), ConnectorError>>,
     },

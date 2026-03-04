@@ -2327,7 +2327,8 @@ impl LaminarDB {
                     obj_store,
                     prefix,
                     max_retained,
-                ),
+                )
+                .ok()?,
             ))
         } else {
             let data_dir = cp_config
@@ -2472,7 +2473,8 @@ impl LaminarDB {
                             obj_store,
                             prefix,
                             max_retained,
-                        ),
+                        )
+                        .map_err(|e| DbError::Config(format!("checkpoint store runtime: {e}")))?,
                     )
                 } else {
                     let data_dir = cp_config
