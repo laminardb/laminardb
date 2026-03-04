@@ -714,7 +714,7 @@ fn core_thread_main(
                         .outbox
                         .push(TaggedOutput {
                             source_idx,
-                            output: Output::Barrier(Box::new(barrier)),
+                            output: Output::Barrier(barrier),
                         })
                         .is_err()
                     {

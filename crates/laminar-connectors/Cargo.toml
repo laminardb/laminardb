@@ -74,6 +74,7 @@ futures-util = { version = "0.3", features = ["sink"], optional = true }
 
 [features]
 default = []
+testing = []
 kafka = ["dep:rdkafka", "dep:arrow-avro", "dep:reqwest"]
 postgres-cdc = ["dep:tokio-postgres", "dep:pgwire-replication", "dep:deadpool-postgres"]
 postgres-sink = ["dep:tokio-postgres", "dep:postgres-types"]

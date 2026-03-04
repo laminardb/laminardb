@@ -87,6 +87,7 @@ pub mod registry;
 pub mod runtime;
 
 /// Testing utilities (mock connectors, helpers).
+#[cfg(any(test, feature = "testing"))]
 pub mod testing;
 
 // ── Existing Modules ──

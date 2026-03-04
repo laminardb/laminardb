@@ -3154,18 +3154,18 @@ impl CompositeAccumulator {
 
     /// Merges another composite accumulator into this one.
     ///
-    /// # Panics
+    /// # Errors
     ///
-    /// Panics if the other accumulator has a different number of sub-accumulators.
-    pub fn merge(&mut self, other: &Self) {
-        assert_eq!(
-            self.accumulators.len(),
-            other.accumulators.len(),
-            "Cannot merge composite accumulators with different sizes"
-        );
+    /// Returns an error if the accumulators have different numbers of
+    /// sub-accumulators (mismatched window definitions).
+    pub fn merge(&mut self, other: &Self) -> Result<(), &'static str> {
+        if self.accumulators.len() != other.accumulators.len() {
+            return Err("cannot merge composite accumulators with different sizes");
+        }
         for (self_acc, other_acc) in self.accumulators.iter_mut().zip(&other.accumulators) {
             self_acc.merge_dyn(other_acc.as_ref());
         }
+        Ok(())
     }
 
     /// Returns all results as [`ScalarResult`] values.

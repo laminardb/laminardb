@@ -119,7 +119,7 @@ impl TpcPipelineCoordinator {
                         }
                     }
                     Output::Barrier(barrier) => {
-                        barriers.push((tagged.source_idx, *barrier));
+                        barriers.push((tagged.source_idx, barrier));
                     }
                     _ => {
                         // Watermark, CheckpointComplete, LateEvent, etc.

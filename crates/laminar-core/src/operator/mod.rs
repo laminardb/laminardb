@@ -44,7 +44,7 @@ impl Event {
 
 /// Output from an operator
 ///
-/// Infrequent variants (`SideOutput`, `CheckpointComplete`, `Barrier`) are boxed
+/// Infrequent variants (`SideOutput`, `CheckpointComplete`) are boxed
 /// to keep the enum size small for the common hot-path variants (`Event`, `Watermark`).
 #[derive(Debug)]
 pub enum Output {
@@ -66,12 +66,15 @@ pub enum Output {
     /// Emitted when a `CheckpointRequest` is processed by a core thread.
     /// Carries the checkpoint ID and all operator states for persistence by Ring 1.
     CheckpointComplete(Box<CheckpointCompleteData>),
-    /// Checkpoint barrier forwarded from a core thread (boxed — infrequent path).
+    /// Checkpoint barrier forwarded from a core thread.
     ///
     /// When a core receives a `CoreMessage::Barrier`, it flushes the reactor
     /// and forwards the barrier as an output so the coordinator can track
     /// barrier alignment across sources.
-    Barrier(Box<crate::checkpoint::CheckpointBarrier>),
+    ///
+    /// `CheckpointBarrier` is 24 bytes (`#[repr(C)]`, `Copy`), small enough
+    /// to store inline without boxing.
+    Barrier(crate::checkpoint::CheckpointBarrier),
 }
 
 /// Data for a late event routed to a named side output.

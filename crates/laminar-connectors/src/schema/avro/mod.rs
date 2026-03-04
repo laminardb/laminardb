@@ -1,23 +1,12 @@
 //! Avro format support (F-SCHEMA-006).
 //!
 //! Provides:
-//! - [`AvroFormatDecoder`] — decodes raw and Confluent wire-format Avro
-//!   into Arrow `RecordBatch` (implements [`FormatDecoder`])
-//! - [`AvroFormatEncoder`] — encodes Arrow `RecordBatch` into Confluent
-//!   wire-format Avro (implements [`FormatEncoder`])
 //! - [`avro_to_arrow_type`] — maps Avro JSON type definitions to Arrow
 //!   `DataType`
+//! - [`avro_to_arrow_schema`] — converts an Avro JSON schema string to
+//!   an Arrow [`SchemaRef`]
 //!
 //! All types require the `kafka` feature flag.
-//!
-//! [`FormatDecoder`]: crate::schema::traits::FormatDecoder
-//! [`FormatEncoder`]: crate::schema::traits::FormatEncoder
-
-pub mod decoder;
-pub mod encoder;
-
-pub use decoder::{AvroDecoderMode, AvroFormatDecoder};
-pub use encoder::AvroFormatEncoder;
 
 use std::sync::Arc;
 
