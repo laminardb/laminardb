@@ -322,7 +322,6 @@ impl ConnectorManager {
     pub fn streams(&self) -> &HashMap<String, StreamRegistration> {
         &self.streams
     }
-
 }
 
 #[cfg(test)]

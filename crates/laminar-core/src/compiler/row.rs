@@ -485,8 +485,7 @@ impl<'a> EventRow<'a> {
         }
         // SAFETY: Data should be valid UTF-8 by construction. If it isn't,
         // return a replacement rather than panicking on the hot path.
-        std::str::from_utf8(&self.data[var_off..var_off + var_len])
-            .unwrap_or("<invalid-utf8>")
+        std::str::from_utf8(&self.data[var_off..var_off + var_len]).unwrap_or("<invalid-utf8>")
     }
 
     /// Reads a variable-length binary field.

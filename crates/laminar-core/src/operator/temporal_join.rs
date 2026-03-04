@@ -224,9 +224,9 @@ impl TemporalJoinConfigBuilder {
     /// Returns `OperatorError::ConfigError` if required fields are not set.
     pub fn build(self) -> std::result::Result<TemporalJoinConfig, OperatorError> {
         Ok(TemporalJoinConfig {
-            stream_key_column: self
-                .stream_key_column
-                .ok_or_else(|| OperatorError::ConfigError("stream_key_column is required".into()))?,
+            stream_key_column: self.stream_key_column.ok_or_else(|| {
+                OperatorError::ConfigError("stream_key_column is required".into())
+            })?,
             table_key_column: self
                 .table_key_column
                 .ok_or_else(|| OperatorError::ConfigError("table_key_column is required".into()))?,

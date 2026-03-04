@@ -10,14 +10,11 @@
 use std::sync::atomic::Ordering;
 
 use crate::budget::TaskBudget;
-use crate::checkpoint::CheckpointBarrier;
-use crate::io_uring::three_ring::handler::RingHandler;
-use crate::io_uring::three_ring::router::RoutedCompletion;
+use crate::io_uring::three_ring::{RingHandler, RoutedCompletion};
 use crate::operator::{CheckpointCompleteData, Output};
 use crate::reactor::Reactor;
 
 use super::core_handle::{CoreMessage, CoreThreadContext, TaggedOutput};
-use super::spsc::SpscQueue;
 
 /// `RingHandler` for core threads.
 ///
@@ -223,9 +220,11 @@ impl CoreRingHandler<'_> {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::checkpoint::CheckpointBarrier;
     use crate::operator::{Event, Operator, OperatorState, OutputVec, Timer};
     use crate::reactor::ReactorConfig;
     use crate::tpc::backpressure::BackpressureConfig;
+    use crate::tpc::spsc::SpscQueue;
     use crate::tpc::CreditGate;
     use arrow_array::{Int64Array, RecordBatch};
     use std::sync::atomic::{AtomicBool, AtomicU64};

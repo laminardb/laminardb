@@ -1253,7 +1253,7 @@ impl StreamJoinOperator {
     ///     .join_type(JoinType::Inner)
     ///     .row_encoding(JoinRowEncoding::CpuFriendly)
     ///     .build()
-///     .unwrap();
+    ///     .unwrap();
     ///
     /// let operator = StreamJoinOperator::from_config(config);
     /// ```

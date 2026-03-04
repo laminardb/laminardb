@@ -58,9 +58,8 @@ pub use connection::{
 pub use error::{
     laminar_clear_error, laminar_last_error, laminar_last_error_code, LAMINAR_ERR_CONNECTION,
     LAMINAR_ERR_INGESTION, LAMINAR_ERR_INTERNAL, LAMINAR_ERR_INVALID_UTF8,
-    LAMINAR_ERR_NULL_POINTER, LAMINAR_ERR_QUERY, LAMINAR_ERR_SCHEMA_MISMATCH,
-    LAMINAR_ERR_SHUTDOWN, LAMINAR_ERR_SUBSCRIPTION, LAMINAR_ERR_TABLE_EXISTS,
-    LAMINAR_ERR_TABLE_NOT_FOUND, LAMINAR_OK,
+    LAMINAR_ERR_NULL_POINTER, LAMINAR_ERR_QUERY, LAMINAR_ERR_SCHEMA_MISMATCH, LAMINAR_ERR_SHUTDOWN,
+    LAMINAR_ERR_SUBSCRIPTION, LAMINAR_ERR_TABLE_EXISTS, LAMINAR_ERR_TABLE_NOT_FOUND, LAMINAR_OK,
 };
 pub use memory::{laminar_string_free, laminar_version};
 pub use query::{
@@ -71,8 +70,8 @@ pub use query::{
     LaminarQueryStream, LaminarRecordBatch,
 };
 pub use schema::{
-    laminar_get_schema, laminar_list_sources, laminar_schema_field_name,
-    laminar_schema_field_type, laminar_schema_free, laminar_schema_num_fields, LaminarSchema,
+    laminar_get_schema, laminar_list_sources, laminar_schema_field_name, laminar_schema_field_type,
+    laminar_schema_free, laminar_schema_num_fields, LaminarSchema,
 };
 pub use writer::{
     laminar_writer_close, laminar_writer_create, laminar_writer_flush, laminar_writer_free,
