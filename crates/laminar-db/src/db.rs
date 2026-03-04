@@ -13,7 +13,6 @@ use laminar_sql::register_streaming_functions;
 use laminar_sql::translator::{AsofJoinTranslatorConfig, JoinOperatorConfig};
 
 use crate::builder::LaminarDbBuilder;
-use crate::pipeline_lifecycle::url_to_checkpoint_prefix;
 use crate::catalog::SourceCatalog;
 use crate::config::LaminarConfig;
 use crate::error::DbError;
@@ -21,6 +20,7 @@ use crate::handle::{
     DdlInfo, ExecuteResult, QueryHandle, QueryInfo, SinkInfo, SourceHandle, SourceInfo,
     UntypedSourceHandle,
 };
+use crate::pipeline_lifecycle::url_to_checkpoint_prefix;
 use crate::sql_utils;
 
 pub(crate) const STATE_CREATED: u8 = 0;
@@ -28,7 +28,6 @@ pub(crate) const STATE_STARTING: u8 = 1;
 pub(crate) const STATE_RUNNING: u8 = 2;
 pub(crate) const STATE_SHUTTING_DOWN: u8 = 3;
 pub(crate) const STATE_STOPPED: u8 = 4;
-
 
 /// Extract SQL text from a `StreamingStatement` for storage in the connector manager.
 pub(crate) fn streaming_statement_to_sql(stmt: &StreamingStatement) -> String {
@@ -624,7 +623,6 @@ impl LaminarDB {
         }
     }
 
-
     /// Get a session property value.
     #[must_use]
     pub fn get_session_property(&self, key: &str) -> Option<String> {
@@ -639,7 +637,6 @@ impl LaminarDB {
     pub fn session_properties(&self) -> HashMap<String, String> {
         self.session_properties.lock().clone()
     }
-
 
     /// Subscribe to a named stream or materialized view.
     ///
@@ -1568,7 +1565,6 @@ impl LaminarDB {
             .as_ref()
             .map(crate::checkpoint_coordinator::CheckpointCoordinator::stats)
     }
-
 }
 
 impl std::fmt::Debug for LaminarDB {

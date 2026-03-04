@@ -166,7 +166,6 @@ impl LaminarDB {
         }))
     }
 
-
     pub(crate) fn handle_create_sink(
         &self,
         create: &laminar_sql::parser::CreateSinkStatement,
@@ -448,7 +447,6 @@ impl LaminarDB {
         }))
     }
 
-
     pub(crate) fn handle_drop_source(
         &self,
         name: &sqlparser::ast::ObjectName,
@@ -483,7 +481,6 @@ impl LaminarDB {
             object_name: name_str,
         }))
     }
-
 
     pub(crate) fn handle_alter_source(
         &self,
@@ -559,7 +556,6 @@ impl LaminarDB {
         }
     }
 
-
     pub(crate) fn handle_drop_sink(
         &self,
         name: &sqlparser::ast::ObjectName,
@@ -577,7 +573,6 @@ impl LaminarDB {
             object_name: name_str,
         }))
     }
-
 
     pub(crate) fn handle_create_stream(
         &self,
@@ -628,7 +623,6 @@ impl LaminarDB {
         }))
     }
 
-
     pub(crate) fn handle_drop_stream(
         &self,
         name: &sqlparser::ast::ObjectName,
@@ -662,8 +656,10 @@ impl LaminarDB {
         }))
     }
 
-
-    pub(crate) fn handle_set(&self, set_stmt: &sqlparser::ast::Set) -> Result<ExecuteResult, DbError> {
+    pub(crate) fn handle_set(
+        &self,
+        set_stmt: &sqlparser::ast::Set,
+    ) -> Result<ExecuteResult, DbError> {
         use sqlparser::ast::Set;
         match set_stmt {
             Set::SingleAssignment {
@@ -697,8 +693,10 @@ impl LaminarDB {
         }
     }
 
-
-    pub(crate) fn handle_set_checkpoint_interval(&self, value: &str) -> Result<ExecuteResult, DbError> {
+    pub(crate) fn handle_set_checkpoint_interval(
+        &self,
+        value: &str,
+    ) -> Result<ExecuteResult, DbError> {
         let trimmed = value.trim().to_lowercase();
         let interval = if trimmed == "off" || trimmed == "none" || trimmed == "disabled" {
             None
@@ -721,7 +719,6 @@ impl LaminarDB {
             object_name: "checkpoint_interval".to_string(),
         }))
     }
-
 
     /// Find streams and MVs that depend on the given object name.
     pub(crate) fn find_dependents(&self, name: &str) -> Vec<String> {
@@ -770,7 +767,6 @@ impl LaminarDB {
             }
         }
     }
-
 
     /// Handle CREATE MATERIALIZED VIEW statement.
     ///
@@ -1078,5 +1074,3 @@ pub(crate) fn extract_connector_from_with_options(
 
     (connector_options, format, format_options)
 }
-
-

@@ -40,20 +40,20 @@ mod db;
 mod eowc_state;
 // Reopened `impl LaminarDB` modules — split from db.rs
 mod ddl;
-mod metrics_api;
-mod pipeline_callback;
-mod pipeline_lifecycle;
-mod show_commands;
 mod error;
 mod handle;
 mod metrics;
+mod metrics_api;
 /// Thread-per-core connector pipeline.
 pub mod pipeline;
+mod pipeline_callback;
 mod pipeline_checkpoint;
+mod pipeline_lifecycle;
 /// Deployment profiles.
 pub mod profile;
 /// Unified recovery manager.
 pub mod recovery_manager;
+mod show_commands;
 mod sink_task;
 mod sql_utils;
 mod stream_executor;
