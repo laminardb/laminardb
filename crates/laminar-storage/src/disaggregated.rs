@@ -43,7 +43,8 @@ use thiserror::Error;
 #[derive(Debug, Clone)]
 pub struct DisaggregatedConfig {
     /// S3 prefix for state objects (e.g., `"nodes/abc123/"`).
-    pub prefix: String,
+    /// `None` means no prefix (root of bucket).
+    pub prefix: Option<String>,
 
     /// Maximum number of entries in the foyer cache.
     pub cache_capacity: usize,
@@ -55,7 +56,7 @@ pub struct DisaggregatedConfig {
 impl Default for DisaggregatedConfig {
     fn default() -> Self {
         Self {
-            prefix: String::new(),
+            prefix: None,
             cache_capacity: 1024,
             cache_shards: 16,
         }
@@ -136,7 +137,7 @@ struct CacheKey {
 /// ```
 pub struct DisaggregatedStateBackend {
     store: Arc<dyn ObjectStore>,
-    prefix: String,
+    prefix: Option<String>,
     rt: tokio::runtime::Runtime,
     fencing_epoch: AtomicU64,
     cache: Cache<CacheKey, Bytes>,
@@ -302,9 +303,9 @@ impl DisaggregatedStateBackend {
     ///
     /// Returns [`DisaggregatedError::Store`] on S3 list failure.
     pub fn list_epochs(&self, partition_id: u64) -> Result<Vec<u64>, DisaggregatedError> {
+        let pfx = self.prefix.as_deref().unwrap_or("");
         let prefix = ObjectPath::from(format!(
-            "{}partitions/{partition_id:06}/state/",
-            self.prefix
+            "{pfx}partitions/{partition_id:06}/state/",
         ));
 
         let entries = self.rt.block_on(async {
@@ -362,9 +363,9 @@ impl DisaggregatedStateBackend {
 
     /// Returns the S3 object path for a partition state blob.
     fn state_path(&self, partition_id: u64, epoch: u64) -> ObjectPath {
+        let pfx = self.prefix.as_deref().unwrap_or("");
         ObjectPath::from(format!(
-            "{}partitions/{partition_id:06}/state/epoch-{epoch:06}.lz4",
-            self.prefix
+            "{pfx}partitions/{partition_id:06}/state/epoch-{epoch:06}.lz4",
         ))
     }
 }
@@ -845,7 +846,7 @@ mod tests {
     #[test]
     fn default_config() {
         let config = DisaggregatedConfig::default();
-        assert!(config.prefix.is_empty());
+        assert!(config.prefix.is_none());
         assert_eq!(config.cache_capacity, 1024);
         assert_eq!(config.cache_shards, 16);
     }
