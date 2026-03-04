@@ -10,8 +10,7 @@
 //! - [`connector`] - Core traits (`SourceConnector`, `SinkConnector`)
 //! - [`serde`] - Serialization framework (JSON, CSV, Debezium)
 //! - [`registry`] - Factory pattern for connector instantiation
-//! - [`runtime`] - Lifecycle management
-//! - [`testing`] - Mock connectors and test utilities
+//! - `testing` - Mock connectors and test utilities (feature-gated)
 //!
 //! ## Architecture
 //!
