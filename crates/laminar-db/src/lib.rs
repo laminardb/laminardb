@@ -42,6 +42,7 @@ mod eowc_state;
 mod ddl;
 mod metrics_api;
 mod pipeline_callback;
+mod pipeline_lifecycle;
 mod show_commands;
 mod error;
 mod handle;
