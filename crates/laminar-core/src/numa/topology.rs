@@ -266,7 +266,7 @@ impl NumaTopology {
             libc::syscall(
                 libc::SYS_set_mempolicy,
                 libc::MPOL_BIND,
-                &nodemask as *const libc::c_ulong,
+                &raw const nodemask,
                 self.num_nodes + 1,
             )
         };

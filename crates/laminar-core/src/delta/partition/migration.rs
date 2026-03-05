@@ -8,7 +8,7 @@
 //! the action the caller must perform, and [`MigrationProtocol::complete_phase`]
 //! advances the task after the caller reports success or failure.
 
-#[allow(clippy::disallowed_types)] // cold path: partition migration protocol
+#![allow(clippy::disallowed_types)] // cold path: partition migration protocol
 use std::collections::HashMap;
 use std::fmt;
 use std::time::Duration;

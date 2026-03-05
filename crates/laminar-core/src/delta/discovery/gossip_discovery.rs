@@ -3,7 +3,7 @@
 //! Uses the chitchat protocol (from Quickwit) for decentralized
 //! node discovery with phi-accrual failure detection.
 
-#[allow(clippy::disallowed_types)] // cold path: gossip discovery coordination
+#![allow(clippy::disallowed_types)] // cold path: gossip discovery coordination
 use std::collections::HashMap;
 use std::sync::Arc;
 use std::time::Duration;
@@ -264,7 +264,6 @@ impl Discovery for GossipDiscovery {
 
                         // Collect the set of live node IDs from the failure
                         // detector so we only include reachable peers (C3 fix).
-                        #[allow(clippy::disallowed_types)] // cold path: gossip coordination
                         let live_ids: std::collections::HashSet<&chitchat::ChitchatId> =
                             chitchat_guard.live_nodes().collect();
 
