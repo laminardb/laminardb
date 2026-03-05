@@ -260,9 +260,11 @@ impl NumaTopology {
     pub fn bind_local_memory(&self) -> Result<(), NumaError> {
         let node = self.current_node();
         let nodemask: libc::c_ulong = 1 << node;
-        // SAFETY: set_mempolicy is thread-local. nodemask is valid for the call duration.
+        // SAFETY: syscall(SYS_set_mempolicy, ...) is thread-local.
+        // nodemask is valid for the call duration.
         let ret = unsafe {
-            libc::set_mempolicy(
+            libc::syscall(
+                libc::SYS_set_mempolicy,
                 libc::MPOL_BIND,
                 &nodemask as *const libc::c_ulong,
                 self.num_nodes + 1,
