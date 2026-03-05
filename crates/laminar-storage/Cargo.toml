@@ -16,7 +16,7 @@ laminar-core = { path = "../laminar-core", version = "0.18.0" }
 # Storage
 object_store = "0.13"  # For cloud storage
 parquet = "57.2"  # For lakehouse formats
-delta_kernel = { version = "0.19", optional = true }  # Delta Lake
+delta_kernel = { version = "0.20", optional = true }  # Delta Lake
 
 # Serialization (rkyv for zero-copy performance)
 rkyv = { workspace = true }
