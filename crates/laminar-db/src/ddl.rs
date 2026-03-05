@@ -1,6 +1,7 @@
 //! DDL (Data Definition Language) handlers for `LaminarDB`.
 //!
 //! Reopens `impl LaminarDB` to keep the main `db.rs` focused on dispatch.
+#![allow(clippy::disallowed_types)] // cold path
 
 use std::collections::HashMap;
 use std::sync::Arc;

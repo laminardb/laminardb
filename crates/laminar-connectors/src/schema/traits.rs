@@ -15,6 +15,7 @@
 //! and returning `Some(self)` from the corresponding `as_*()` method on
 //! [`SourceConnector`](crate::connector::SourceConnector) or
 //! [`SinkConnector`](crate::connector::SinkConnector).
+#![allow(clippy::disallowed_types)] // cold path: schema management
 
 use std::collections::HashMap;
 

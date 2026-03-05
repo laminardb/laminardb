@@ -15,7 +15,6 @@
 //! across all 50+ built-in aggregates (including AVG, STDDEV, etc. that
 //! require multi-field state).
 
-use std::collections::HashMap;
 use std::hash::{Hash, Hasher};
 use std::sync::Arc;
 
@@ -222,19 +221,19 @@ pub(crate) struct StreamExecutorCheckpoint {
     pub version: u32,
     /// Non-EOWC aggregate states, keyed by query name.
     #[serde(default)]
-    pub agg_states: HashMap<String, AggStateCheckpoint>,
+    pub agg_states: FxHashMap<String, AggStateCheckpoint>,
     /// EOWC aggregate states, keyed by query name.
     #[serde(default)]
-    pub eowc_states: HashMap<String, EowcStateCheckpoint>,
+    pub eowc_states: FxHashMap<String, EowcStateCheckpoint>,
     /// Core window pipeline states, keyed by query name.
     #[serde(default)]
-    pub core_window_states: HashMap<String, crate::core_window_state::CoreWindowCheckpoint>,
+    pub core_window_states: FxHashMap<String, crate::core_window_state::CoreWindowCheckpoint>,
     /// Join states, keyed by query name.
     ///
     /// Currently empty for ASOF/temporal joins (stateless per-cycle).
     /// Populated by future stateful joins (interval joins, etc.).
     #[serde(default)]
-    pub join_states: HashMap<String, JoinStateCheckpoint>,
+    pub join_states: FxHashMap<String, JoinStateCheckpoint>,
 }
 
 /// Specification for one aggregate function in a streaming query.
@@ -739,12 +738,6 @@ impl IncrementalAggState {
     /// Pre-aggregation SQL.
     pub fn pre_agg_sql(&self) -> &str {
         &self.pre_agg_sql
-    }
-
-    /// Output schema.
-    #[allow(dead_code)]
-    pub fn output_schema(&self) -> &SchemaRef {
-        &self.output_schema
     }
 
     /// HAVING predicate SQL, if any.
@@ -2551,7 +2544,7 @@ mod tests {
 
     #[test]
     fn test_checkpoint_with_join_states_round_trip() {
-        let mut join_states = HashMap::new();
+        let mut join_states = FxHashMap::default();
         join_states.insert(
             "enriched".to_string(),
             JoinStateCheckpoint {
@@ -2563,9 +2556,9 @@ mod tests {
 
         let cp = StreamExecutorCheckpoint {
             version: 1,
-            agg_states: HashMap::new(),
-            eowc_states: HashMap::new(),
-            core_window_states: HashMap::new(),
+            agg_states: FxHashMap::default(),
+            eowc_states: FxHashMap::default(),
+            core_window_states: FxHashMap::default(),
             join_states,
         };
 

@@ -33,6 +33,7 @@
 //! - Validates backpressure strategy names
 //! - Validates wait_strategy names
 
+#[allow(clippy::disallowed_types)] // cold path: SQL translation
 use std::collections::HashMap;
 use std::str::FromStr;
 use std::sync::Arc;

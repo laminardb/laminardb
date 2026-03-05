@@ -9,6 +9,7 @@
 //!   detect → diff → evaluate → apply → record
 //! - [`SchemaHistory`] — tracks per-source schema version history
 //! - [`is_safe_widening`] — determines whether a type can be safely widened
+#![allow(clippy::disallowed_types)] // cold path: schema management
 
 use std::collections::HashMap;
 use std::sync::Arc;

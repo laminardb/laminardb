@@ -207,12 +207,8 @@ impl<T: Record> Sink<T> {
     ///
     /// # Performance
     ///
-    /// Uses a read lock which is fast and non-blocking with other readers.
-    /// The lock is held for the minimum time necessary.
-    ///
-    /// # Panics
-    ///
-    /// Panics if the internal lock is poisoned (should not happen in normal use).
+    /// Snapshots subscriber producers under the read lock (cheap Arc bumps),
+    /// then releases the lock before the poll loop to avoid holding it during I/O.
     #[must_use]
     pub fn poll_and_distribute(&self) -> usize
     where
@@ -223,24 +219,28 @@ impl<T: Record> Sink<T> {
             return 0;
         }
 
-        // Take read lock (fast, doesn't block other readers)
-        let subscribers = self.subscribers.read();
-        if subscribers.is_empty() {
-            return 0;
-        }
+        // Snapshot producers under read lock, then release immediately
+        let producers: smallvec::SmallVec<[Producer<SourceMessage<T>>; 4]> = {
+            let subscribers = self.subscribers.read();
+            if subscribers.is_empty() {
+                return 0;
+            }
+            subscribers.iter().map(|s| s.producer.clone()).collect()
+        };
+        // RwLock released — iterate producers without holding lock
 
         let mut count = 0;
 
         // Poll records from source and broadcast
         while let Some(msg) = self.inner.consumer.poll() {
-            for sub in subscribers.iter() {
+            for producer in &producers {
                 // Clone and send to each subscriber
                 let msg_clone = match &msg {
                     SourceMessage::Record(r) => SourceMessage::Record(r.clone()),
                     SourceMessage::Batch(b) => SourceMessage::Batch(b.clone()),
                     SourceMessage::Watermark(ts) => SourceMessage::Watermark(*ts),
                 };
-                let _ = sub.producer.try_push(msg_clone);
+                let _ = producer.try_push(msg_clone);
             }
             count += 1;
         }

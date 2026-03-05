@@ -1,12 +1,14 @@
 //! WAL entry types with epoch-based ordering for per-core WAL.
 
 use std::cmp::Ordering;
+#[allow(clippy::disallowed_types)] // cold path: WAL coordination
 use std::collections::HashMap;
 
 // WAL entry types with derive macros
 mod entry_types {
     #![allow(missing_docs)] // Allow for derive-generated code
 
+    #[allow(clippy::disallowed_types)] // cold path: WAL coordination
     use std::collections::HashMap;
 
     use rkyv::{Archive, Deserialize as RkyvDeserialize, Serialize as RkyvSerialize};

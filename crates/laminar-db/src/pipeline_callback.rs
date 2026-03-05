@@ -1,14 +1,17 @@
 //! `PipelineCallback` implementation bridging the event-driven pipeline
 //! coordinator to the stream executor, sinks, watermarks, checkpoints,
 //! and table sources.
+#![allow(clippy::disallowed_types)] // cold path
+
+use std::sync::Arc;
 
 use std::collections::HashMap;
-use std::sync::Arc;
 
 use arrow::array::RecordBatch;
 use datafusion::prelude::SessionContext;
 use laminar_connectors::checkpoint::SourceCheckpoint;
 use laminar_core::streaming;
+use rustc_hash::FxHashMap;
 
 use crate::db::{filter_late_rows, SourceWatermarkState};
 use crate::error::DbError;
@@ -29,9 +32,9 @@ pub(crate) struct ConnectorPipelineCallback {
         Option<String>,
         String, // input stream name (FROM clause target)
     )>,
-    pub(crate) watermark_states: HashMap<String, SourceWatermarkState>,
-    pub(crate) source_entries_for_wm: HashMap<String, Arc<crate::catalog::SourceEntry>>,
-    pub(crate) source_ids: HashMap<String, usize>,
+    pub(crate) watermark_states: FxHashMap<String, SourceWatermarkState>,
+    pub(crate) source_entries_for_wm: FxHashMap<String, Arc<crate::catalog::SourceEntry>>,
+    pub(crate) source_ids: FxHashMap<String, usize>,
     pub(crate) tracker: Option<laminar_core::time::WatermarkTracker>,
     pub(crate) counters: Arc<crate::metrics::PipelineCounters>,
     pub(crate) pipeline_watermark: Arc<std::sync::atomic::AtomicI64>,
@@ -55,16 +58,16 @@ pub(crate) struct ConnectorPipelineCallback {
 impl crate::pipeline::PipelineCallback for ConnectorPipelineCallback {
     async fn execute_cycle(
         &mut self,
-        source_batches: &HashMap<String, Vec<RecordBatch>>,
+        source_batches: &FxHashMap<String, Vec<RecordBatch>>,
         watermark: i64,
-    ) -> Result<HashMap<String, Vec<RecordBatch>>, String> {
+    ) -> Result<FxHashMap<String, Vec<RecordBatch>>, String> {
         self.executor
             .execute_cycle(source_batches, watermark)
             .await
             .map_err(|e| format!("{e}"))
     }
 
-    fn push_to_streams(&self, results: &HashMap<String, Vec<RecordBatch>>) {
+    fn push_to_streams(&self, results: &FxHashMap<String, Vec<RecordBatch>>) {
         for (stream_name, src) in &self.stream_sources {
             if let Some(batches) = results.get(stream_name) {
                 for batch in batches {
@@ -81,7 +84,7 @@ impl crate::pipeline::PipelineCallback for ConnectorPipelineCallback {
         }
     }
 
-    async fn write_to_sinks(&mut self, results: &HashMap<String, Vec<RecordBatch>>) {
+    async fn write_to_sinks(&mut self, results: &FxHashMap<String, Vec<RecordBatch>>) {
         // Route results to sinks concurrently, filtered by FROM clause.
         let sink_futures: Vec<_> = self
             .sinks
@@ -350,7 +353,7 @@ impl crate::pipeline::PipelineCallback for ConnectorPipelineCallback {
 
     async fn checkpoint_with_barrier(
         &mut self,
-        source_checkpoints: HashMap<String, SourceCheckpoint>,
+        source_checkpoints: FxHashMap<String, SourceCheckpoint>,
     ) -> bool {
         use crate::checkpoint_coordinator::source_to_connector_checkpoint;
 

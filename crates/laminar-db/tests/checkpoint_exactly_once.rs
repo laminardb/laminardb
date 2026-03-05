@@ -9,6 +9,7 @@
 //! 5. Recovery from checkpoint restores correct offsets
 //! 6. No duplicate or lost data
 
+use rustc_hash::FxHashMap;
 use std::collections::HashMap;
 use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::sync::Arc;
@@ -29,7 +30,7 @@ use laminar_storage::checkpoint_store::FileSystemCheckpointStore;
 /// A callback that tracks barrier checkpoint calls and records state.
 struct BarrierTrackingCallback {
     cycle_count: u64,
-    barrier_checkpoints: Vec<HashMap<String, SourceCheckpoint>>,
+    barrier_checkpoints: Vec<FxHashMap<String, SourceCheckpoint>>,
     force_checkpoints: u64,
     should_trigger: Arc<AtomicBool>,
     total_records_processed: Arc<AtomicU64>,
@@ -51,9 +52,9 @@ impl BarrierTrackingCallback {
 impl PipelineCallback for BarrierTrackingCallback {
     async fn execute_cycle(
         &mut self,
-        source_batches: &HashMap<String, Vec<RecordBatch>>,
+        source_batches: &FxHashMap<String, Vec<RecordBatch>>,
         _watermark: i64,
-    ) -> Result<HashMap<String, Vec<RecordBatch>>, String> {
+    ) -> Result<FxHashMap<String, Vec<RecordBatch>>, String> {
         self.cycle_count += 1;
         let records: u64 = source_batches
             .values()
@@ -62,12 +63,12 @@ impl PipelineCallback for BarrierTrackingCallback {
             .sum();
         self.total_records_processed
             .fetch_add(records, Ordering::Relaxed);
-        Ok(HashMap::new())
+        Ok(FxHashMap::default())
     }
 
-    fn push_to_streams(&self, _results: &HashMap<String, Vec<RecordBatch>>) {}
+    fn push_to_streams(&self, _results: &FxHashMap<String, Vec<RecordBatch>>) {}
 
-    async fn write_to_sinks(&mut self, _results: &HashMap<String, Vec<RecordBatch>>) {}
+    async fn write_to_sinks(&mut self, _results: &FxHashMap<String, Vec<RecordBatch>>) {}
 
     fn extract_watermark(&mut self, _source_name: &str, _batch: &RecordBatch) {}
 
@@ -89,7 +90,7 @@ impl PipelineCallback for BarrierTrackingCallback {
 
     async fn checkpoint_with_barrier(
         &mut self,
-        source_checkpoints: HashMap<String, SourceCheckpoint>,
+        source_checkpoints: FxHashMap<String, SourceCheckpoint>,
     ) -> bool {
         self.barrier_checkpoints.push(source_checkpoints);
         true
@@ -145,7 +146,7 @@ async fn test_barrier_aligned_checkpoint_fires() {
     };
 
     let coordinator =
-        TpcPipelineCoordinator::new(sources, config, test_tpc_config(), shutdown).unwrap();
+        TpcPipelineCoordinator::new(sources, config, &test_tpc_config(), shutdown).unwrap();
 
     let should_trigger = Arc::new(AtomicBool::new(true));
     let record_counter = Arc::new(AtomicU64::new(0));
@@ -291,7 +292,7 @@ async fn test_single_source_barrier_checkpoint() {
     };
 
     let coordinator =
-        TpcPipelineCoordinator::new(sources, config, test_tpc_config(), shutdown).unwrap();
+        TpcPipelineCoordinator::new(sources, config, &test_tpc_config(), shutdown).unwrap();
 
     let should_trigger = Arc::new(AtomicBool::new(true));
     let record_counter = Arc::new(AtomicU64::new(0));
@@ -347,7 +348,7 @@ async fn test_exhausted_sources_with_shutdown() {
     };
 
     let coordinator =
-        TpcPipelineCoordinator::new(sources, config, test_tpc_config(), shutdown).unwrap();
+        TpcPipelineCoordinator::new(sources, config, &test_tpc_config(), shutdown).unwrap();
 
     let should_trigger = Arc::new(AtomicBool::new(true));
     let record_counter = Arc::new(AtomicU64::new(0));

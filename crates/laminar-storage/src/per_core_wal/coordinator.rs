@@ -3,6 +3,7 @@
 //! Coordinates checkpoint creation across all cores by merging WAL segments
 //! and creating incremental checkpoints.
 
+#[allow(clippy::disallowed_types)] // cold path: WAL coordination
 use std::collections::HashMap;
 use std::path::{Path, PathBuf};
 

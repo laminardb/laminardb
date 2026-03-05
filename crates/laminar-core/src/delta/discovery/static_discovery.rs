@@ -15,6 +15,7 @@
 //!   This prevents a half-open partition (peer can send to us, but we cannot
 //!   reach it) from masking a failure.
 
+#[allow(clippy::disallowed_types)] // cold path: static discovery coordination
 use std::collections::HashMap;
 use std::sync::Arc;
 use std::time::Duration;

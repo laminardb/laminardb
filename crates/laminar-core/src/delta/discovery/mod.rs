@@ -14,6 +14,7 @@ pub use static_discovery::{StaticDiscovery, StaticDiscoveryConfig};
 mod gossip_discovery;
 pub use gossip_discovery::{keys, GossipDiscovery, GossipDiscoveryConfig};
 
+#[allow(clippy::disallowed_types)] // cold path: discovery metadata (serde + rkyv)
 use std::collections::HashMap;
 use std::fmt;
 

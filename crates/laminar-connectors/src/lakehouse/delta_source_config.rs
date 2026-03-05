@@ -3,6 +3,7 @@
 //! [`DeltaSourceConfig`] encapsulates all settings for reading Arrow
 //! `RecordBatch` data from Delta Lake tables, parsed from SQL `WITH (...)`
 //! clauses via [`from_config`](DeltaSourceConfig::from_config).
+#![allow(clippy::disallowed_types)] // cold path: lakehouse configuration
 
 use std::collections::HashMap;
 use std::time::Duration;

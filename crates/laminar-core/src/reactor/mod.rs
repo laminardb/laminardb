@@ -500,6 +500,9 @@ impl Reactor {
                     }
                 }
                 self.output_buffer.clear();
+                if self.output_buffer.capacity() > 65536 {
+                    self.output_buffer.shrink_to(4096);
+                }
             }
 
             // If no events to process, emit a CPU spin hint (PAUSE on x86,

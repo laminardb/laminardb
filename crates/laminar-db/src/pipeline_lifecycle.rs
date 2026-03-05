@@ -1,12 +1,15 @@
 //! Pipeline lifecycle management: start, close, shutdown.
 //!
 //! Reopened `impl LaminarDB` — split from `db.rs`.
+#![allow(clippy::disallowed_types)] // cold path
 
 use std::collections::HashMap;
 use std::sync::Arc;
 
 use arrow::array::RecordBatch;
 use laminar_core::streaming;
+use rustc_hash::FxHashMap;
+
 
 use crate::db::{
     filter_late_rows, infer_timestamp_format, LaminarDB, SourceWatermarkState, STATE_RUNNING,
@@ -229,11 +232,11 @@ impl LaminarDB {
 
         // Build per-source watermark tracking state
         let source_names = self.catalog.list_sources();
-        let mut watermark_states: HashMap<String, SourceWatermarkState> =
-            HashMap::with_capacity(source_names.len());
-        let mut source_entries: HashMap<String, Arc<crate::catalog::SourceEntry>> =
-            HashMap::with_capacity(source_names.len());
-        let mut source_ids: HashMap<String, usize> = HashMap::with_capacity(source_names.len());
+        let mut watermark_states: FxHashMap<String, SourceWatermarkState> =
+            FxHashMap::with_capacity_and_hasher(source_names.len(), rustc_hash::FxBuildHasher);
+        let mut source_entries: FxHashMap<String, Arc<crate::catalog::SourceEntry>> =
+            FxHashMap::with_capacity_and_hasher(source_names.len(), rustc_hash::FxBuildHasher);
+        let mut source_ids: FxHashMap<String, usize> = FxHashMap::with_capacity_and_hasher(source_names.len(), rustc_hash::FxBuildHasher);
         for name in source_names {
             if let Some(entry) = self.catalog.get_source(&name) {
                 if let (Some(col), Some(dur)) =
@@ -363,8 +366,8 @@ impl LaminarDB {
                 }
 
                 // Drain source subscriptions into batches
-                let mut source_batches: HashMap<String, Vec<RecordBatch>> =
-                    HashMap::with_capacity(source_subs.len());
+                let mut source_batches: FxHashMap<String, Vec<RecordBatch>> =
+                    FxHashMap::with_capacity_and_hasher(source_subs.len(), rustc_hash::FxBuildHasher);
                 for (name, sub) in &source_subs {
                     for _ in 0..256 {
                         match sub.poll() {
@@ -748,11 +751,11 @@ impl LaminarDB {
 
         // Build per-source watermark tracking state (connector pipeline)
         let source_names = self.catalog.list_sources();
-        let mut watermark_states: HashMap<String, SourceWatermarkState> =
-            HashMap::with_capacity(source_names.len());
-        let mut source_entries_for_wm: HashMap<String, Arc<crate::catalog::SourceEntry>> =
-            HashMap::with_capacity(source_names.len());
-        let mut source_ids: HashMap<String, usize> = HashMap::with_capacity(source_names.len());
+        let mut watermark_states: FxHashMap<String, SourceWatermarkState> =
+            FxHashMap::with_capacity_and_hasher(source_names.len(), rustc_hash::FxBuildHasher);
+        let mut source_entries_for_wm: FxHashMap<String, Arc<crate::catalog::SourceEntry>> =
+            FxHashMap::with_capacity_and_hasher(source_names.len(), rustc_hash::FxBuildHasher);
+        let mut source_ids: FxHashMap<String, usize> = FxHashMap::with_capacity_and_hasher(source_names.len(), rustc_hash::FxBuildHasher);
         for name in source_names {
             if let Some(entry) = self.catalog.get_source(&name) {
                 if let (Some(col), Some(dur)) =
@@ -925,7 +928,7 @@ impl LaminarDB {
             let tpc_coordinator = TpcPipelineCoordinator::new(
                 sources,
                 pipeline_config,
-                tpc_config,
+                &tpc_config,
                 Arc::clone(&shutdown),
             )?;
 

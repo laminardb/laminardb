@@ -179,6 +179,7 @@ impl<S: LookupSource> LookupSource for PushdownAdapter<S> {
 }
 
 #[cfg(test)]
+#[allow(clippy::disallowed_types)] // test code
 mod tests {
     use super::*;
 

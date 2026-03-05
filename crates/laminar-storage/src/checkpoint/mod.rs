@@ -15,6 +15,7 @@ pub mod recovery;
 /// Typed source position tracking for checkpoint recovery.
 pub mod source_offsets;
 
+#[allow(clippy::disallowed_types)] // cold path: checkpoint recovery
 use std::collections::HashMap;
 use std::fs;
 use std::path::{Path, PathBuf};

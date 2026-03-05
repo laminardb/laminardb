@@ -3,6 +3,7 @@
 //! This module provides incremental checkpointing using directory-based
 //! snapshots with metadata tracking.
 
+#[allow(clippy::disallowed_types)] // cold path: incremental checkpoint
 use std::collections::HashMap;
 use std::fs;
 use std::path::{Path, PathBuf};

@@ -8,9 +8,8 @@ array-size-threshold = 131072
 # Use `rustc_hash::FxHashMap` / `FxHashSet` for internal integer/string keys,
 # or `ahash::AHashMap` / `AHashSet` for user-derived keys needing DoS resistance.
 #
-# Each crate's lib.rs sets `#![allow(clippy::disallowed_types)]` by default.
-# Fully-migrated hot-path modules opt in with `#![deny(clippy::disallowed_types)]`
-# to prevent regression. New hot-path modules should do the same.
+# Enforced workspace-wide. Cold-path code (config, DDL, catalog) may use
+# per-site `#[allow(clippy::disallowed_types)]` with a justification comment.
 disallowed-types = [
     { path = "std::collections::HashMap", reason = "use rustc_hash::FxHashMap (integer/internal keys) or ahash::AHashMap (user-derived keys)" },
     { path = "std::collections::HashSet", reason = "use rustc_hash::FxHashSet (integer/internal keys) or ahash::AHashSet (user-derived keys)" },

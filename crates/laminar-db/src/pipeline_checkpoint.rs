@@ -4,6 +4,7 @@
 //! backward-compatible checkpoint deserialization. The checkpoint coordinator
 //! ([`CheckpointCoordinator`](crate::checkpoint_coordinator::CheckpointCoordinator))
 //! is the active persistence mechanism.
+#![allow(clippy::disallowed_types)] // cold path
 
 use std::collections::HashMap;
 

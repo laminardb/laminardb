@@ -2,6 +2,7 @@
 //!
 //! The `ConnectorRegistry` maintains a catalog of available connector
 //! implementations and provides factory methods to instantiate them.
+#![allow(clippy::disallowed_types)] // cold path: connector registry
 
 use std::collections::HashMap;
 use std::sync::Arc;

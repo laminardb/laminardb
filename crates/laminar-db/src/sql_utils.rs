@@ -1,4 +1,5 @@
 //! SQL utility functions for multi-statement parsing and config variable substitution.
+#![allow(clippy::disallowed_types)] // cold path
 
 use std::collections::HashMap;
 

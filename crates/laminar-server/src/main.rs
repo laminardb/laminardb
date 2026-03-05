@@ -6,7 +6,7 @@
 //! laminardb --config laminardb.toml
 //! ```
 
-#![allow(clippy::disallowed_types)]
+#![allow(clippy::disallowed_types)] // cold path: server startup and config only
 
 mod config;
 mod delta;

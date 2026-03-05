@@ -314,9 +314,9 @@ pub struct SlidingWindowOperator<A: Aggregator> {
     /// Allowed lateness for late data
     allowed_lateness_ms: i64,
     /// Track registered timers to avoid duplicates
-    registered_windows: std::collections::HashSet<WindowId>,
+    registered_windows: rustc_hash::FxHashSet<WindowId>,
     /// Track windows with registered periodic timers
-    periodic_timer_windows: std::collections::HashSet<WindowId>,
+    periodic_timer_windows: rustc_hash::FxHashSet<WindowId>,
     /// Emit strategy for controlling when results are output
     emit_strategy: EmitStrategy,
     /// Late data handling configuration
@@ -369,8 +369,8 @@ where
             aggregator,
             allowed_lateness_ms: i64::try_from(allowed_lateness.as_millis())
                 .expect("Allowed lateness must fit in i64"),
-            registered_windows: std::collections::HashSet::new(),
-            periodic_timer_windows: std::collections::HashSet::new(),
+            registered_windows: rustc_hash::FxHashSet::default(),
+            periodic_timer_windows: rustc_hash::FxHashSet::default(),
             emit_strategy: EmitStrategy::default(),
             late_data_config: LateDataConfig::default(),
             late_data_metrics: LateDataMetrics::new(),
@@ -406,8 +406,8 @@ where
             aggregator,
             allowed_lateness_ms: i64::try_from(allowed_lateness.as_millis())
                 .expect("Allowed lateness must fit in i64"),
-            registered_windows: std::collections::HashSet::new(),
-            periodic_timer_windows: std::collections::HashSet::new(),
+            registered_windows: rustc_hash::FxHashSet::default(),
+            periodic_timer_windows: rustc_hash::FxHashSet::default(),
             emit_strategy: EmitStrategy::default(),
             late_data_config: LateDataConfig::default(),
             late_data_metrics: LateDataMetrics::new(),
@@ -924,7 +924,7 @@ where
             .map_err(|e| OperatorError::SerializationFailed(e.to_string()))?;
 
         self.registered_windows = windows.into_iter().collect();
-        self.periodic_timer_windows = std::collections::HashSet::new();
+        self.periodic_timer_windows = rustc_hash::FxHashSet::default();
         Ok(())
     }
 }

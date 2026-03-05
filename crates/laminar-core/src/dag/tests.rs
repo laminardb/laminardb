@@ -5,6 +5,7 @@
 #![allow(clippy::cast_possible_wrap)]
 #![allow(clippy::cast_possible_truncation)]
 #![allow(clippy::cast_sign_loss)]
+#![allow(clippy::disallowed_types)] // test code: DagCheckpointSnapshot uses std HashMap for serde
 
 use std::sync::Arc;
 

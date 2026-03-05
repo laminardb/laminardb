@@ -1,4 +1,5 @@
 //! The main `LaminarDB` database facade.
+#![allow(clippy::disallowed_types)] // cold path
 
 use std::collections::HashMap;
 use std::sync::Arc;
@@ -316,7 +317,7 @@ impl LaminarDB {
         &self,
         name: &str,
         table_uri: &str,
-        storage_options: std::collections::HashMap<String, String>,
+        storage_options: HashMap<String, String>,
     ) -> Result<(), DbError> {
         laminar_connectors::lakehouse::delta_table_provider::register_delta_table(
             &self.ctx,
@@ -3509,6 +3510,7 @@ mod tests {
 
         let all = db.all_source_metrics();
         assert_eq!(all.len(), 2);
+        #[allow(clippy::disallowed_types)] // test code
         let names: std::collections::HashSet<_> = all.iter().map(|m| m.name.clone()).collect();
         assert!(names.contains("a"));
         assert!(names.contains("b"));

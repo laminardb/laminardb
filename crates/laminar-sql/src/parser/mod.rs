@@ -586,6 +586,7 @@ fn parse_alter_source(
         parser
             .expect_token(&sqlparser::tokenizer::Token::LParen)
             .map_err(ParseError::SqlParseError)?;
+        #[allow(clippy::disallowed_types)] // cold path: SQL parsing
         let mut properties = std::collections::HashMap::new();
         loop {
             let key = parser

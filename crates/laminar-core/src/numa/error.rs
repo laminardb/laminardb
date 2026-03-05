@@ -12,4 +12,8 @@ pub enum NumaError {
     /// System call failed
     #[error("System call failed: {0}")]
     SyscallFailed(#[from] std::io::Error),
+
+    /// NUMA memory bind failed
+    #[error("NUMA memory bind failed: {0}")]
+    BindFailed(std::io::Error),
 }

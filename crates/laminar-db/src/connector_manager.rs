@@ -2,6 +2,7 @@
 //!
 //! Accumulates DDL registrations (CREATE SOURCE/SINK/STREAM) and translates
 //! them into live connector instances when `start()` is called.
+#![allow(clippy::disallowed_types)] // cold path
 
 use std::collections::HashMap;
 

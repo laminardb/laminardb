@@ -8,6 +8,7 @@
 //!
 //! Coordinator failover: abort in-progress, recover epoch from manifest.
 
+#[allow(clippy::disallowed_types)] // cold path: distributed checkpoint coordination
 use std::collections::HashMap;
 use std::time::Duration;
 

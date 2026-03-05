@@ -9,6 +9,8 @@
 //! - [`SourceConfig`]: Configuration for a source connector (schema module)
 //! - [`SinkConfig`]: Configuration for a sink connector (schema module)
 
+#![allow(clippy::disallowed_types)] // cold path: schema management
+
 use std::any::Any;
 use std::collections::HashMap;
 

@@ -8,7 +8,6 @@
 //! Uses xxhash (< 50ns) to map keys to partition IDs, then a
 //! `PartitionMap` to resolve the owning node.
 
-use std::collections::HashMap;
 use std::sync::Arc;
 
 use rustc_hash::FxHashMap;
@@ -45,7 +44,7 @@ impl PartitionMap {
     #[must_use]
     pub fn from_assignments(
         num_partitions: u32,
-        assignments: &HashMap<u32, NodeId>,
+        assignments: &FxHashMap<u32, NodeId>,
         local_node: NodeId,
     ) -> Self {
         let mut map = vec![NodeId::UNASSIGNED; num_partitions as usize];
@@ -351,7 +350,7 @@ mod tests {
 
     #[test]
     fn test_is_local_distributed() {
-        let mut assignments = HashMap::new();
+        let mut assignments = FxHashMap::default();
         assignments.insert(0, NodeId(1));
         assignments.insert(1, NodeId(2));
         let map = PartitionMap::from_assignments(2, &assignments, NodeId(1));
@@ -374,7 +373,7 @@ mod tests {
 
     #[test]
     fn test_group_by_node() {
-        let mut assignments = HashMap::new();
+        let mut assignments = FxHashMap::default();
         assignments.insert(0, NodeId(1));
         assignments.insert(1, NodeId(2));
         let map = PartitionMap::from_assignments(2, &assignments, NodeId(1));
@@ -388,7 +387,7 @@ mod tests {
 
     #[test]
     fn test_local_partitions() {
-        let mut assignments = HashMap::new();
+        let mut assignments = FxHashMap::default();
         assignments.insert(0, NodeId(1));
         assignments.insert(1, NodeId(2));
         assignments.insert(2, NodeId(1));
@@ -443,7 +442,7 @@ mod tests {
 
     #[test]
     fn test_partitioned_lookup_remote_pending() {
-        let mut assignments = HashMap::new();
+        let mut assignments = FxHashMap::default();
         // Make all partitions remote
         for i in 0..256u32 {
             assignments.insert(i, NodeId(2));
@@ -461,7 +460,7 @@ mod tests {
 
     #[test]
     fn test_partitioned_insert_only_local() {
-        let mut assignments = HashMap::new();
+        let mut assignments = FxHashMap::default();
         for i in 0..256u32 {
             assignments.insert(i, NodeId(2));
         }

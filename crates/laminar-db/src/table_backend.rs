@@ -1,6 +1,7 @@
 //! Backend storage for reference tables.
 //!
 //! Provides an in-memory backend for storing reference/dimension table rows.
+#![allow(clippy::disallowed_types)] // cold path
 
 use std::collections::HashMap;
 

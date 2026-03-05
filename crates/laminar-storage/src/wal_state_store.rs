@@ -4,6 +4,7 @@
 //! before applying them, enabling recovery after crashes and supporting exactly-once
 //! semantics.
 
+#[allow(clippy::disallowed_types)] // cold path: WAL operations
 use std::collections::HashMap;
 use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicU64, Ordering};

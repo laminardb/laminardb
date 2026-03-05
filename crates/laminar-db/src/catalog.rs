@@ -1,4 +1,5 @@
 //! Source and sink catalog for tracking registered streaming objects.
+#![allow(clippy::disallowed_types)] // cold path
 
 use std::collections::HashMap;
 use std::sync::atomic::{AtomicU64, AtomicUsize, Ordering};

@@ -1,5 +1,3 @@
-#![deny(clippy::disallowed_types)]
-
 //! Incremental per-window accumulator state for EOWC queries.
 //!
 //! Replaces the raw-batch accumulation pattern (`EowcState.accumulated_sources`)
@@ -543,28 +541,18 @@ impl IncrementalEowcState {
         &self.pre_agg_sql
     }
 
-    /// Output schema.
-    #[allow(dead_code)]
-    pub fn output_schema(&self) -> &SchemaRef {
-        &self.output_schema
-    }
-
     /// HAVING predicate SQL, if any.
     pub fn having_sql(&self) -> Option<&str> {
         self.having_sql.as_deref()
     }
 
     /// Return the number of open windows.
-    #[allow(dead_code)]
+    #[cfg(test)]
     pub fn open_window_count(&self) -> usize {
         self.windows.len()
     }
 
-    /// Return the total number of groups across all open windows.
-    #[allow(dead_code)]
-    pub fn total_group_count(&self) -> usize {
-        self.windows.values().map(|g| g.len()).sum()
-    }
+
 
     /// Compute a fingerprint for this query (SQL + schema).
     pub(crate) fn query_fingerprint(&self) -> u64 {

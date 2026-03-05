@@ -12,6 +12,8 @@
 //! Ring 2 (Control):    LaminarDB.checkpoint() -> manual trigger
 //! ```
 
+#![allow(clippy::disallowed_types)] // checkpoint serialization: Ring 1/Ring 2 path, not hot path
+
 use std::collections::HashMap;
 use std::fmt;
 use std::sync::atomic::{AtomicI64, AtomicU64, Ordering};

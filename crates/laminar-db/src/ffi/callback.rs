@@ -97,19 +97,6 @@ pub type LaminarErrorCallback = Option<
     unsafe extern "C" fn(user_data: *mut c_void, error_code: i32, error_message: *const c_char),
 >;
 
-/// Callback function type for completion notifications.
-///
-/// # Arguments
-///
-/// * `user_data` - Opaque pointer passed to the async function
-/// * `status` - `LAMINAR_OK` on success, or an error code
-/// * `result` - Operation-specific result (may be NULL)
-///
-/// Note: Currently unused but defined for future async operation support.
-#[allow(dead_code)]
-pub type LaminarCompletionCallback =
-    Option<unsafe extern "C" fn(user_data: *mut c_void, status: i32, result: *mut c_void)>;
-
 // ============================================================================
 // Subscription Handle
 // ============================================================================

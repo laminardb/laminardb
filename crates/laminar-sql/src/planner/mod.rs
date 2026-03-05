@@ -12,6 +12,7 @@ pub mod predicate_split;
 /// Physical optimizer rule for streaming plan validation.
 pub mod streaming_optimizer;
 
+#[allow(clippy::disallowed_types)] // cold path: query planning
 use std::collections::HashMap;
 use std::sync::Arc;
 

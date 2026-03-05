@@ -30,8 +30,9 @@
 //! Partial results can be shipped between nodes as Arrow IPC-encoded
 //! `RecordBatch`es via `encode_batch_to_ipc` / `decode_batch_from_ipc`.
 
-use std::collections::HashMap;
 use std::io::Cursor;
+
+use rustc_hash::FxHashMap;
 
 use arrow::ipc;
 use arrow::record_batch::RecordBatch;
@@ -288,8 +289,8 @@ impl MergeAggregator {
     pub fn merge_all(
         &self,
         partials: &[PartialAggregate],
-    ) -> Result<HashMap<Vec<u8>, Vec<PartialState>>, TwoPhaseError> {
-        let mut by_group: HashMap<&[u8], Vec<&PartialAggregate>> = HashMap::new();
+    ) -> Result<FxHashMap<Vec<u8>, Vec<PartialState>>, TwoPhaseError> {
+        let mut by_group: FxHashMap<&[u8], Vec<&PartialAggregate>> = FxHashMap::default();
         for partial in partials {
             by_group
                 .entry(&partial.group_key)
@@ -297,7 +298,7 @@ impl MergeAggregator {
                 .push(partial);
         }
 
-        let mut result = HashMap::with_capacity(by_group.len());
+        let mut result = FxHashMap::with_capacity_and_hasher(by_group.len(), rustc_hash::FxBuildHasher);
         for (key, group_partials) in by_group {
             let merged = self.merge_group(&group_partials)?;
             result.insert(key.to_vec(), merged);

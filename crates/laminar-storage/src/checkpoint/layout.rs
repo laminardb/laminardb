@@ -26,6 +26,7 @@
 //! lexicographic sorting of checkpoint directories equals chronological
 //! ordering — no need to parse timestamps or sequence numbers.
 
+#[allow(clippy::disallowed_types)] // cold path: checkpoint recovery
 use std::collections::HashMap;
 use std::fmt;
 

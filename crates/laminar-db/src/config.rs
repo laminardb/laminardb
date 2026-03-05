@@ -1,4 +1,5 @@
 //! Configuration for `LaminarDB`.
+#![allow(clippy::disallowed_types)] // cold path
 
 use std::collections::HashMap;
 use std::path::PathBuf;

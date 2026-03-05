@@ -2,6 +2,7 @@
 //!
 //! Checkpoints capture the position of a source connector so it can
 //! resume from where it left off after a restart.
+#![allow(clippy::disallowed_types)] // cold path: connector checkpoint
 
 use std::collections::HashMap;
 

@@ -50,7 +50,6 @@
 //! assert_eq!(action, AlignmentAction::Pause); // Too far ahead of source 1!
 //! ```
 
-use std::collections::HashMap;
 use std::time::{Duration, Instant};
 
 use rustc_hash::FxHashMap;
@@ -733,7 +732,7 @@ impl AlignmentGroupCoordinator {
 
     /// Returns metrics for all groups.
     #[must_use]
-    pub fn all_metrics(&self) -> HashMap<AlignmentGroupId, AlignmentGroupMetrics> {
+    pub fn all_metrics(&self) -> FxHashMap<AlignmentGroupId, AlignmentGroupMetrics> {
         self.groups
             .iter()
             .map(|(id, group)| (id.clone(), group.metrics().clone()))

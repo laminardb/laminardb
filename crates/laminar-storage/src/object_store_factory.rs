@@ -7,6 +7,7 @@
 //! Credentials are resolved via `from_env()` (reads standard env vars like
 //! `AWS_ACCESS_KEY_ID`) with explicit overrides from the `options` map.
 
+#[allow(clippy::disallowed_types)] // cold path: object store setup
 use std::collections::HashMap;
 use std::sync::Arc;
 
