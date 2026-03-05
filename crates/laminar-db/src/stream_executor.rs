@@ -1041,9 +1041,15 @@ impl StreamExecutor {
         };
 
         let mut filtered_sources: FxHashMap<String, Vec<RecordBatch>> =
-            FxHashMap::with_capacity_and_hasher(eowc.accumulated_sources.len(), rustc_hash::FxBuildHasher);
+            FxHashMap::with_capacity_and_hasher(
+                eowc.accumulated_sources.len(),
+                rustc_hash::FxBuildHasher,
+            );
         let mut retained_sources: FxHashMap<String, Vec<RecordBatch>> =
-            FxHashMap::with_capacity_and_hasher(eowc.accumulated_sources.len(), rustc_hash::FxBuildHasher);
+            FxHashMap::with_capacity_and_hasher(
+                eowc.accumulated_sources.len(),
+                rustc_hash::FxBuildHasher,
+            );
         let mut has_data = false;
         let mut retained_rows = 0usize;
 
@@ -1296,19 +1302,26 @@ impl StreamExecutor {
     pub fn checkpoint_state(&mut self) -> Result<Option<Vec<u8>>, DbError> {
         use crate::aggregate_state::StreamExecutorCheckpoint;
 
-        let mut agg_checkpoints = FxHashMap::with_capacity_and_hasher(self.agg_states.len(), rustc_hash::FxBuildHasher);
+        let mut agg_checkpoints =
+            FxHashMap::with_capacity_and_hasher(self.agg_states.len(), rustc_hash::FxBuildHasher);
         for (&idx, state) in &mut self.agg_states {
             let name = self.queries[idx].name.clone();
             agg_checkpoints.insert(name, state.checkpoint_groups()?);
         }
 
-        let mut eowc_checkpoints = FxHashMap::with_capacity_and_hasher(self.eowc_agg_states.len(), rustc_hash::FxBuildHasher);
+        let mut eowc_checkpoints = FxHashMap::with_capacity_and_hasher(
+            self.eowc_agg_states.len(),
+            rustc_hash::FxBuildHasher,
+        );
         for (&idx, state) in &mut self.eowc_agg_states {
             let name = self.queries[idx].name.clone();
             eowc_checkpoints.insert(name, state.checkpoint_windows()?);
         }
 
-        let mut cw_checkpoints = FxHashMap::with_capacity_and_hasher(self.core_window_states.len(), rustc_hash::FxBuildHasher);
+        let mut cw_checkpoints = FxHashMap::with_capacity_and_hasher(
+            self.core_window_states.len(),
+            rustc_hash::FxBuildHasher,
+        );
         for (&idx, state) in &mut self.core_window_states {
             let name = self.queries[idx].name.clone();
             cw_checkpoints.insert(name, state.checkpoint_windows()?);

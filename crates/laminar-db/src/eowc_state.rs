@@ -552,8 +552,6 @@ impl IncrementalEowcState {
         self.windows.len()
     }
 
-
-
     /// Compute a fingerprint for this query (SQL + schema).
     pub(crate) fn query_fingerprint(&self) -> u64 {
         crate::aggregate_state::query_fingerprint(&self.pre_agg_sql, &self.output_schema)

@@ -171,7 +171,11 @@ fn extract_timestamp(batch: &RecordBatch) -> i64 {
 }
 
 /// Main loop for the source I/O thread.
-#[allow(clippy::too_many_arguments, clippy::needless_pass_by_value, clippy::too_many_lines)]
+#[allow(
+    clippy::too_many_arguments,
+    clippy::needless_pass_by_value,
+    clippy::too_many_lines
+)]
 fn source_io_main(
     source_idx: usize,
     name: String,

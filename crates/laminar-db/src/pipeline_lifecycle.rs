@@ -10,7 +10,6 @@ use arrow::array::RecordBatch;
 use laminar_core::streaming;
 use rustc_hash::FxHashMap;
 
-
 use crate::db::{
     filter_late_rows, infer_timestamp_format, LaminarDB, SourceWatermarkState, STATE_RUNNING,
     STATE_SHUTTING_DOWN, STATE_STARTING, STATE_STOPPED,
@@ -236,7 +235,8 @@ impl LaminarDB {
             FxHashMap::with_capacity_and_hasher(source_names.len(), rustc_hash::FxBuildHasher);
         let mut source_entries: FxHashMap<String, Arc<crate::catalog::SourceEntry>> =
             FxHashMap::with_capacity_and_hasher(source_names.len(), rustc_hash::FxBuildHasher);
-        let mut source_ids: FxHashMap<String, usize> = FxHashMap::with_capacity_and_hasher(source_names.len(), rustc_hash::FxBuildHasher);
+        let mut source_ids: FxHashMap<String, usize> =
+            FxHashMap::with_capacity_and_hasher(source_names.len(), rustc_hash::FxBuildHasher);
         for name in source_names {
             if let Some(entry) = self.catalog.get_source(&name) {
                 if let (Some(col), Some(dur)) =
@@ -367,7 +367,10 @@ impl LaminarDB {
 
                 // Drain source subscriptions into batches
                 let mut source_batches: FxHashMap<String, Vec<RecordBatch>> =
-                    FxHashMap::with_capacity_and_hasher(source_subs.len(), rustc_hash::FxBuildHasher);
+                    FxHashMap::with_capacity_and_hasher(
+                        source_subs.len(),
+                        rustc_hash::FxBuildHasher,
+                    );
                 for (name, sub) in &source_subs {
                     for _ in 0..256 {
                         match sub.poll() {
@@ -755,7 +758,8 @@ impl LaminarDB {
             FxHashMap::with_capacity_and_hasher(source_names.len(), rustc_hash::FxBuildHasher);
         let mut source_entries_for_wm: FxHashMap<String, Arc<crate::catalog::SourceEntry>> =
             FxHashMap::with_capacity_and_hasher(source_names.len(), rustc_hash::FxBuildHasher);
-        let mut source_ids: FxHashMap<String, usize> = FxHashMap::with_capacity_and_hasher(source_names.len(), rustc_hash::FxBuildHasher);
+        let mut source_ids: FxHashMap<String, usize> =
+            FxHashMap::with_capacity_and_hasher(source_names.len(), rustc_hash::FxBuildHasher);
         for name in source_names {
             if let Some(entry) = self.catalog.get_source(&name) {
                 if let (Some(col), Some(dur)) =

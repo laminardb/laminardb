@@ -5,10 +5,10 @@
 //! through a narrow interface.
 
 use arrow_array::RecordBatch;
-use rustc_hash::FxHashMap;
 use laminar_connectors::checkpoint::SourceCheckpoint;
 use laminar_connectors::config::ConnectorConfig;
 use laminar_connectors::connector::SourceConnector;
+use rustc_hash::FxHashMap;
 
 /// A registered source with its name and config.
 pub struct SourceRegistration {

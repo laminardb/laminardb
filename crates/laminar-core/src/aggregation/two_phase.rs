@@ -298,7 +298,8 @@ impl MergeAggregator {
                 .push(partial);
         }
 
-        let mut result = FxHashMap::with_capacity_and_hasher(by_group.len(), rustc_hash::FxBuildHasher);
+        let mut result =
+            FxHashMap::with_capacity_and_hasher(by_group.len(), rustc_hash::FxBuildHasher);
         for (key, group_partials) in by_group {
             let merged = self.merge_group(&group_partials)?;
             result.insert(key.to_vec(), merged);

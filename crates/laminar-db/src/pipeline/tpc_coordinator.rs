@@ -7,12 +7,12 @@ use std::sync::Arc;
 use std::time::Instant;
 
 use arrow_array::RecordBatch;
-use rustc_hash::{FxHashMap, FxHashSet};
 use laminar_connectors::checkpoint::SourceCheckpoint;
 use laminar_core::checkpoint::CheckpointBarrier;
 use laminar_core::operator::Output;
 use laminar_core::tpc::TaggedOutput;
 use laminar_core::tpc::TpcConfig;
+use rustc_hash::{FxHashMap, FxHashSet};
 
 use super::callback::{PipelineCallback, SourceRegistration};
 use super::config::PipelineConfig;
@@ -120,7 +120,10 @@ impl TpcPipelineCoordinator {
                             let name = self.runtime.source_names()[tagged.source_idx].clone();
                             callback.extract_watermark(&name, &event.data);
                             if let Some(filtered) = callback.filter_late_rows(&name, &event.data) {
-                                self.source_batches_buf.entry(name).or_default().push(filtered);
+                                self.source_batches_buf
+                                    .entry(name)
+                                    .or_default()
+                                    .push(filtered);
                             }
                         }
                     }
