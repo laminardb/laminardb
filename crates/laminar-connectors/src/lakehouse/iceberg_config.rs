@@ -3,6 +3,7 @@
 //! [`IcebergSinkConfig`] encapsulates all settings for writing Arrow
 //! `RecordBatch` data to Iceberg tables, parsed from SQL `WITH (...)`
 //! clauses via [`from_config`](IcebergSinkConfig::from_config).
+#![allow(clippy::disallowed_types)] // cold path: lakehouse configuration
 
 use std::collections::HashMap;
 use std::fmt;

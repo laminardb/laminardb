@@ -4,6 +4,7 @@
 //! Each source runs on a dedicated `std::thread` with a single-threaded
 //! tokio runtime, pushing [`CoreMessage::Event`] into the target core's
 //! inbox after converting `SourceBatch` → [`Event`].
+#![allow(clippy::disallowed_types)] // cold path
 
 use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::sync::Arc;
@@ -170,7 +171,11 @@ fn extract_timestamp(batch: &RecordBatch) -> i64 {
 }
 
 /// Main loop for the source I/O thread.
-#[allow(clippy::too_many_arguments, clippy::needless_pass_by_value)]
+#[allow(
+    clippy::too_many_arguments,
+    clippy::needless_pass_by_value,
+    clippy::too_many_lines
+)]
 fn source_io_main(
     source_idx: usize,
     name: String,
@@ -245,8 +250,9 @@ fn source_io_main(
                     let timestamp = extract_timestamp(&batch.records);
                     let event = Event::new(timestamp, batch.records);
 
-                    // Push to core inbox (spin if full — backpressure)
+                    // Push to core inbox with tiered backoff under backpressure
                     let mut msg = CoreMessage::Event { source_idx, event };
+                    let mut backoff = 0u32;
                     loop {
                         match target_inbox.push(msg) {
                             Ok(()) => {
@@ -258,8 +264,15 @@ fn source_io_main(
                                 if shutdown.load(Ordering::Acquire) {
                                     break;
                                 }
-                                std::hint::spin_loop();
                                 msg = returned;
+                                backoff += 1;
+                                match backoff {
+                                    0..=63 => std::hint::spin_loop(),
+                                    64..=255 => std::thread::yield_now(),
+                                    _ => std::thread::park_timeout(
+                                        std::time::Duration::from_micros(100),
+                                    ),
+                                }
                             }
                         }
                     }

@@ -248,11 +248,14 @@ fn detect_cache_line_cpuid() -> Option<usize> {
     use std::arch::x86_64::__cpuid;
 
     // Check if extended CPUID is supported
-    // SAFETY: CPUID is a safe instruction on x86
+    // SAFETY: CPUID is a read-only instruction on x86.
+    // allow(unused_unsafe): __cpuid is safe on newer Rust toolchains.
+    #[allow(unused_unsafe)]
     let max_extended = unsafe { __cpuid(0x8000_0000) }.eax;
 
     if max_extended >= 0x8000_0006 {
-        // SAFETY: CPUID is a safe instruction on x86
+        // SAFETY: CPUID is a read-only instruction on x86.
+        #[allow(unused_unsafe)]
         let result = unsafe { __cpuid(0x8000_0006) };
         // ECX bits 0-7 contain L2 cache line size
         let line_size = (result.ecx & 0xFF) as usize;

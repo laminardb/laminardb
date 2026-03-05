@@ -3,6 +3,7 @@
 //! Provides helpers to detect streaming DDL types from a token stream and
 //! to consume custom keywords that are not in sqlparser's keyword enum.
 
+#[allow(clippy::disallowed_types)] // cold path: SQL parsing
 use std::collections::HashMap;
 
 use sqlparser::keywords::Keyword;

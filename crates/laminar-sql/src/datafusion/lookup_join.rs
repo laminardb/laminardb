@@ -4,6 +4,7 @@
 //! lookup table. It is produced by the `LookupJoinRewriteRule` optimizer
 //! rule when a standard JOIN references a registered lookup table.
 
+#[allow(clippy::disallowed_types)] // cold path: DataFusion integration
 use std::collections::HashSet;
 use std::fmt;
 use std::hash::{Hash, Hasher};

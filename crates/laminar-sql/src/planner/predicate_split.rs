@@ -17,6 +17,7 @@
 //! - **`NotEq`** predicates are classified normally but are never pushed
 //!   down (they cannot use equality indexes on the source).
 
+#[allow(clippy::disallowed_types)] // cold path: query planning
 use std::collections::{HashMap, HashSet};
 use std::sync::Arc;
 
@@ -476,6 +477,7 @@ impl OptimizerRule for PredicateSplitterRule {
 mod tests {
     use super::*;
 
+    #[allow(clippy::disallowed_types)] // cold path: query planning
     use std::collections::HashSet;
 
     use arrow::datatypes::{DataType, Field, Schema};

@@ -10,6 +10,7 @@
 //! - **Schema**: `json_to_columns`, `json_infer_schema`
 
 use std::any::Any;
+#[allow(clippy::disallowed_types)] // cold path: DataFusion integration
 use std::collections::HashSet;
 use std::hash::{Hash, Hasher};
 use std::sync::Arc;
@@ -505,6 +506,7 @@ impl ScalarUDFImpl for JsonbRenameKeys {
 }
 
 /// Extract a `HashMap<String, String>` from a `MapArray` at row `i`.
+#[allow(clippy::disallowed_types)] // cold path: DataFusion integration
 fn extract_string_map(map_arr: &MapArray, row: usize) -> std::collections::HashMap<String, String> {
     let mut result = std::collections::HashMap::new();
     let entries = map_arr.value(row);

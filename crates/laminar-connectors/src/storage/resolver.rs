@@ -8,6 +8,7 @@
 //! 1. Explicit options from SQL `WITH` clause (`storage.*` keys)
 //! 2. Environment variables (`AWS_ACCESS_KEY_ID`, etc.)
 //! 3. Instance metadata / default credential providers (handled by `object_store`)
+#![allow(clippy::disallowed_types)] // cold path: storage configuration
 
 use std::collections::HashMap;
 

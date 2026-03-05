@@ -13,8 +13,7 @@
 //!
 //! A window is considered FINAL when ALL nodes have a watermark >= window_end.
 
-use std::collections::HashMap;
-use std::hash::BuildHasher;
+use rustc_hash::FxHashMap;
 
 use serde::{Deserialize, Serialize};
 
@@ -188,9 +187,10 @@ pub enum WatermarkGateStatus {
 
 /// Checks watermark convergence for window completion.
 #[must_use]
-pub fn check_watermark_gate<S: BuildHasher>(
+#[allow(clippy::implicit_hasher)] // intentionally requires FxHashMap for hot-path hashing
+pub fn check_watermark_gate(
     window_end: i64,
-    node_watermarks: &HashMap<NodeId, i64, S>,
+    node_watermarks: &FxHashMap<NodeId, i64>,
 ) -> WatermarkGateStatus {
     if node_watermarks.is_empty() {
         return WatermarkGateStatus::Unknown;
@@ -364,7 +364,7 @@ mod tests {
 
     #[test]
     fn test_watermark_gate_complete() {
-        let mut wms = HashMap::new();
+        let mut wms = FxHashMap::default();
         wms.insert(NodeId(1), 2000);
         wms.insert(NodeId(2), 1500);
         assert_eq!(
@@ -375,7 +375,7 @@ mod tests {
 
     #[test]
     fn test_watermark_gate_incomplete() {
-        let mut wms = HashMap::new();
+        let mut wms = FxHashMap::default();
         wms.insert(NodeId(1), 2000);
         wms.insert(NodeId(2), 500);
         let status = check_watermark_gate(1000, &wms);
@@ -394,7 +394,7 @@ mod tests {
     #[test]
     fn test_watermark_gate_empty() {
         assert_eq!(
-            check_watermark_gate(1000, &HashMap::new()),
+            check_watermark_gate(1000, &FxHashMap::default()),
             WatermarkGateStatus::Unknown
         );
     }

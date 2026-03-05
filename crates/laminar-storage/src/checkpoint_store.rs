@@ -1024,6 +1024,7 @@ impl CheckpointStore for ObjectStoreCheckpointStore {
 mod tests {
     use super::*;
     use crate::checkpoint_manifest::{ConnectorCheckpoint, OperatorCheckpoint};
+    #[allow(clippy::disallowed_types)] // cold path: checkpoint store
     use std::collections::HashMap;
 
     fn make_store(dir: &Path) -> FileSystemCheckpointStore {

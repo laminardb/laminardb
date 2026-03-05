@@ -15,6 +15,7 @@
 //! 5. **Seek sources**: Reset source offsets to checkpoint positions
 //! 6. **Return** `RecoveryResult`
 
+#[allow(clippy::disallowed_types)] // cold path: checkpoint recovery
 use std::collections::HashMap;
 use std::sync::Arc;
 use std::time::Duration;
@@ -328,6 +329,7 @@ impl RecoveryManager {
             Ok(mut ids) => {
                 ids.sort();
                 ids.reverse(); // Newest first
+                #[allow(clippy::disallowed_types)] // cold path: checkpoint recovery
                 let mut seen: std::collections::HashSet<CheckpointId> =
                     candidates.iter().copied().collect();
                 for id in ids {

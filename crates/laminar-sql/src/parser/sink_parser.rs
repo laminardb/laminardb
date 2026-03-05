@@ -7,6 +7,7 @@
 //! [WITH ('key' = 'value', ...)];
 //! ```
 
+#[allow(clippy::disallowed_types)] // cold path: SQL parsing
 use std::collections::HashMap;
 
 use sqlparser::keywords::Keyword;

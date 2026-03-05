@@ -26,8 +26,9 @@
 
 #![deny(missing_docs)]
 #![warn(clippy::all, clippy::pedantic)]
-#![allow(clippy::disallowed_types)]
 #![allow(clippy::module_name_repetitions)]
+// cold path: all connector modules (config, CDC, Kafka, lakehouse)
+#![allow(clippy::disallowed_types)]
 // Common test patterns that are acceptable
 #![cfg_attr(
     test,

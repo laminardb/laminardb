@@ -4,6 +4,7 @@
 //! Constructed once at `CREATE SOURCE` time with a frozen Arrow schema;
 //! the decoder is stateless after construction so the Ring 1 hot path
 //! has zero schema lookups.
+#![allow(clippy::disallowed_types)] // cold path: schema management
 
 use std::collections::HashMap;
 use std::sync::atomic::{AtomicU64, Ordering};

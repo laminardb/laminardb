@@ -18,12 +18,6 @@ pub struct NumaTopology {
     num_nodes: usize,
     /// CPUs per node (index = node ID)
     cpus_per_node: Vec<Vec<usize>>,
-    /// Memory per node in bytes (index = node ID)
-    #[allow(dead_code)]
-    memory_per_node: Vec<u64>,
-    /// Total number of CPUs
-    #[allow(dead_code)]
-    num_cpus: usize,
     /// CPU to NUMA node mapping
     cpu_to_node: Vec<usize>,
 }
@@ -79,24 +73,20 @@ impl NumaTopology {
 
         let node_count = numa_nodes.len();
         let mut cpus_per_node = vec![Vec::new(); node_count];
-        let mut memory_per_node = vec![0u64; node_count];
 
         // Get total CPUs
-        let num_cpus = hwloc_topo
+        let total_cpus = hwloc_topo
             .objects_with_type(hwlocality::object::types::ObjectType::PU)
             .count();
 
-        let mut cpu_to_node = vec![0usize; num_cpus];
+        let mut cpu_to_node = vec![0usize; total_cpus];
 
         for (node_idx, numa_node) in numa_nodes.iter().enumerate() {
-            // Get memory for this node (total_memory returns u64 directly)
-            memory_per_node[node_idx] = numa_node.total_memory();
-
             // Get CPUs for this node
             if let Some(cpuset) = numa_node.cpuset() {
                 for cpu in cpuset.iter_set() {
                     let cpu_idx = usize::from(cpu);
-                    if cpu_idx < num_cpus {
+                    if cpu_idx < total_cpus {
                         cpus_per_node[node_idx].push(cpu_idx);
                         cpu_to_node[cpu_idx] = node_idx;
                     }
@@ -107,8 +97,6 @@ impl NumaTopology {
         Ok(Self {
             num_nodes: node_count,
             cpus_per_node,
-            memory_per_node,
-            num_cpus,
             cpu_to_node,
         })
     }
@@ -150,11 +138,10 @@ impl NumaTopology {
         let num_nodes = node_dirs.iter().max().map_or(1, |m| m + 1);
 
         // Get CPU count
-        let num_cpus = Self::get_cpu_count();
+        let total_cpus = Self::get_cpu_count();
 
         let mut cpus_per_node = vec![Vec::new(); num_nodes];
-        let mut memory_per_node = vec![0u64; num_nodes];
-        let mut cpu_to_node = vec![0usize; num_cpus];
+        let mut cpu_to_node = vec![0usize; total_cpus];
 
         for node_id in &node_dirs {
             let node_dir = node_path.join(format!("node{node_id}"));
@@ -164,25 +151,17 @@ impl NumaTopology {
             if let Ok(cpulist) = fs::read_to_string(&cpulist_path) {
                 let cpus = Self::parse_cpulist(cpulist.trim());
                 for cpu in &cpus {
-                    if *cpu < num_cpus {
+                    if *cpu < total_cpus {
                         cpu_to_node[*cpu] = *node_id;
                     }
                 }
                 cpus_per_node[*node_id] = cpus;
-            }
-
-            // Parse meminfo
-            let meminfo_path = node_dir.join("meminfo");
-            if let Ok(meminfo) = fs::read_to_string(&meminfo_path) {
-                memory_per_node[*node_id] = Self::parse_meminfo(&meminfo);
             }
         }
 
         Ok(Self {
             num_nodes,
             cpus_per_node,
-            memory_per_node,
-            num_cpus,
             cpu_to_node,
         })
     }
@@ -228,63 +207,16 @@ impl NumaTopology {
         cpus
     }
 
-    /// Parse meminfo file for total memory.
-    #[cfg(target_os = "linux")]
-    fn parse_meminfo(s: &str) -> u64 {
-        for line in s.lines() {
-            // Looking for "Node X MemTotal: NNNN kB"
-            if line.contains("MemTotal") {
-                let parts: Vec<&str> = line.split_whitespace().collect();
-                // Find the numeric value
-                for (i, part) in parts.iter().enumerate() {
-                    if let Ok(val) = part.parse::<u64>() {
-                        // Check if next part is "kB"
-                        if parts.get(i + 1).is_some_and(|&u| u == "kB") {
-                            return val * 1024;
-                        }
-                        return val;
-                    }
-                }
-            }
-        }
-        0
-    }
-
     /// Create a single-node fallback topology.
     fn single_node_fallback() -> Self {
-        let num_cpus = std::thread::available_parallelism().map_or(1, std::num::NonZero::get);
-        let cpus: Vec<usize> = (0..num_cpus).collect();
+        let total_cpus = std::thread::available_parallelism().map_or(1, std::num::NonZero::get);
+        let cpus: Vec<usize> = (0..total_cpus).collect();
 
         Self {
             num_nodes: 1,
             cpus_per_node: vec![cpus],
-            memory_per_node: vec![Self::estimate_system_memory()],
-            num_cpus,
-            cpu_to_node: vec![0; num_cpus],
+            cpu_to_node: vec![0; total_cpus],
         }
-    }
-
-    /// Estimate total system memory.
-    fn estimate_system_memory() -> u64 {
-        #[cfg(target_os = "linux")]
-        {
-            use std::fs;
-            if let Ok(meminfo) = fs::read_to_string("/proc/meminfo") {
-                for line in meminfo.lines() {
-                    if line.starts_with("MemTotal:") {
-                        let parts: Vec<&str> = line.split_whitespace().collect();
-                        if let Some(val) = parts.get(1) {
-                            if let Ok(kb) = val.parse::<u64>() {
-                                return kb * 1024;
-                            }
-                        }
-                    }
-                }
-            }
-        }
-
-        // Fallback: estimate 16GB
-        16 * 1024 * 1024 * 1024
     }
 
     /// Returns the number of NUMA nodes.
@@ -314,6 +246,34 @@ impl NumaTopology {
     pub fn current_node(&self) -> usize {
         let cpu = Self::current_cpu();
         self.node_for_cpu(cpu)
+    }
+
+    /// Bind the current thread's memory allocations to its local NUMA node.
+    ///
+    /// This should be called AFTER `set_cpu_affinity()` so that `current_node()`
+    /// returns the correct node.
+    ///
+    /// # Errors
+    ///
+    /// Returns `NumaError::BindFailed` if the `set_mempolicy` syscall fails.
+    #[cfg(target_os = "linux")]
+    pub fn bind_local_memory(&self) -> Result<(), NumaError> {
+        let node = self.current_node();
+        let nodemask: libc::c_ulong = 1 << node;
+        // SAFETY: syscall(SYS_set_mempolicy, ...) is thread-local.
+        // nodemask is valid for the call duration.
+        let ret = unsafe {
+            libc::syscall(
+                libc::SYS_set_mempolicy,
+                libc::MPOL_BIND,
+                &raw const nodemask,
+                self.num_nodes + 1,
+            )
+        };
+        if ret != 0 {
+            return Err(NumaError::BindFailed(std::io::Error::last_os_error()));
+        }
+        Ok(())
     }
 
     /// Returns the current CPU ID.

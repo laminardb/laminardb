@@ -32,7 +32,7 @@ use std::sync::Arc;
 use std::thread::{self, JoinHandle};
 
 #[cfg(all(target_os = "linux", feature = "io-uring"))]
-use crate::io_uring::{CoreRingManager, IoUringConfig};
+use crate::io_uring::IoUringConfig;
 
 use crate::alloc::HotPathGuard;
 use crate::budget::TaskBudget;
@@ -197,6 +197,8 @@ impl CoreHandle {
             reactor_config,
             numa_aware: config.numa_aware,
             numa_node,
+            #[cfg(target_os = "linux")]
+            numa_topology: topology,
             inbox: Arc::clone(&inbox),
             outbox: Arc::clone(&outbox),
             credit_gate: Arc::clone(&credit_gate),
@@ -204,8 +206,6 @@ impl CoreHandle {
             events_processed: Arc::clone(&events_processed),
             outputs_dropped: Arc::clone(&outputs_dropped),
             is_running: Arc::clone(&is_running),
-            #[cfg(all(target_os = "linux", feature = "io-uring"))]
-            io_uring_config: config.io_uring_config,
         };
 
         let thread = thread::Builder::new()
@@ -538,6 +538,8 @@ pub(super) struct CoreThreadContext {
     reactor_config: ReactorConfig,
     numa_aware: bool,
     numa_node: usize,
+    #[cfg(target_os = "linux")]
+    numa_topology: NumaTopology,
     pub(super) inbox: Arc<SpscQueue<CoreMessage>>,
     pub(super) outbox: Arc<SpscQueue<TaggedOutput>>,
     pub(super) credit_gate: Arc<CreditGate>,
@@ -545,8 +547,6 @@ pub(super) struct CoreThreadContext {
     pub(super) events_processed: Arc<AtomicU64>,
     pub(super) outputs_dropped: Arc<AtomicU64>,
     pub(super) is_running: Arc<AtomicBool>,
-    #[cfg(all(target_os = "linux", feature = "io-uring"))]
-    io_uring_config: Option<IoUringConfig>,
 }
 
 /// Initializes the core thread: sets CPU affinity, NUMA allocator, `io_uring`, and creates the reactor.
@@ -559,6 +559,14 @@ fn init_core_thread(
         set_cpu_affinity(ctx.core_id, cpu_id)?;
     }
 
+    // Bind memory allocations to local NUMA node (Linux only, after CPU affinity)
+    #[cfg(target_os = "linux")]
+    if ctx.numa_aware {
+        if let Err(e) = ctx.numa_topology.bind_local_memory() {
+            tracing::warn!(core_id = ctx.core_id, ?e, "NUMA memory bind failed");
+        }
+    }
+
     // Log NUMA information if NUMA-aware mode is enabled
     if ctx.numa_aware {
         tracing::info!(
@@ -567,23 +575,6 @@ fn init_core_thread(
             ctx.numa_node
         );
     }
-
-    // Initialize io_uring ring manager if configured (Linux only)
-    #[cfg(all(target_os = "linux", feature = "io-uring"))]
-    let _ring_manager = if let Some(ref io_uring_config) = ctx.io_uring_config {
-        match CoreRingManager::new(ctx.core_id, io_uring_config) {
-            Ok(manager) => Some(manager),
-            Err(e) => {
-                tracing::error!(
-                    "Core {}: Failed to initialize io_uring ring: {e}. Falling back to standard I/O.",
-                    ctx.core_id
-                );
-                None
-            }
-        }
-    } else {
-        None
-    };
 
     // Create the reactor with configured settings
     let mut reactor_config = ctx.reactor_config.clone();
@@ -616,9 +607,8 @@ fn core_thread_main(
     // Reusable buffer for reactor outputs (avoids per-poll Vec allocation)
     let mut poll_buffer: Vec<Output> = Vec::with_capacity(256);
 
-    // Pre-allocated checkpoint data to avoid Box::new on the hot path.
-    // The Box is taken when a CheckpointRequest arrives and replenished
-    // after the inbox drain loop (still infrequent — once per checkpoint cycle).
+    // Pre-allocated checkpoint Box reused across checkpoint cycles.
+    // Taken when a CheckpointRequest arrives, replenished after the inbox drain.
     let mut checkpoint_slot: Option<Box<CheckpointCompleteData>> =
         Some(Box::new(CheckpointCompleteData {
             checkpoint_id: 0,
@@ -683,9 +673,8 @@ fn core_thread_main(
                     had_work = true;
                 }
                 CoreMessage::CheckpointRequest(checkpoint_id) => {
-                    // Snapshot operator states into the reusable buffer,
-                    // then move them into the pre-allocated Box to avoid
-                    // any heap allocation on Ring 0.
+                    // Snapshot operator states into the pre-allocated Box.
+                    // The Box is taken and replenished after the inbox drain loop.
                     reactor.trigger_checkpoint_into(&mut checkpoint_states_buf);
                     let mut data = checkpoint_slot.take().unwrap_or_else(|| {
                         Box::new(CheckpointCompleteData {
@@ -761,14 +750,17 @@ fn core_thread_main(
             ctx.credit_gate.release(messages_processed);
         }
 
-        // Replenish checkpoint slot if it was consumed.
-        // This allocation happens outside the inbox drain loop and only
-        // after a checkpoint (infrequent — typically every few seconds).
+        // Replenish checkpoint slot if it was consumed (infrequent — once per checkpoint).
+        // checkpoint_states_buf was drained by the swap above; move its capacity into the
+        // new Box so both buffers retain their allocations across cycles.
         if checkpoint_slot.is_none() {
-            checkpoint_slot = Some(Box::new(CheckpointCompleteData {
+            checkpoint_states_buf.clear();
+            let mut data = Box::new(CheckpointCompleteData {
                 checkpoint_id: 0,
                 operator_states: Vec::new(),
-            }));
+            });
+            std::mem::swap(&mut data.operator_states, &mut checkpoint_states_buf);
+            checkpoint_slot = Some(data);
         }
 
         // Process events in reactor (reuses poll_buffer capacity across iterations)

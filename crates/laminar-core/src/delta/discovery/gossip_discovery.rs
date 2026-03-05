@@ -3,6 +3,7 @@
 //! Uses the chitchat protocol (from Quickwit) for decentralized
 //! node discovery with phi-accrual failure detection.
 
+#![allow(clippy::disallowed_types)] // cold path: gossip discovery coordination
 use std::collections::HashMap;
 use std::sync::Arc;
 use std::time::Duration;

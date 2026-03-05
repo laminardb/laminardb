@@ -17,6 +17,7 @@
 //! 3. Replay WAL entries from checkpoint's WAL position
 //! 4. Restore watermark and source offsets
 
+#[allow(clippy::disallowed_types)] // cold path: incremental checkpoint
 use std::collections::HashMap;
 use std::fs;
 use std::path::{Path, PathBuf};

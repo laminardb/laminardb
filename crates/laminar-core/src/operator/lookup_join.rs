@@ -892,6 +892,7 @@ impl Operator for LookupJoinOperator {
 }
 
 #[cfg(test)]
+#[allow(clippy::disallowed_types)] // test code
 mod tests {
     use super::*;
     use crate::state::{InMemoryStore, StateStore};

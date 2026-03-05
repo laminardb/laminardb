@@ -48,6 +48,7 @@ mod wal_types {
     #![allow(missing_docs)] // Allow for derive-generated code
 
     use rkyv::{Archive, Deserialize as RkyvDeserialize, Serialize as RkyvSerialize};
+    #[allow(clippy::disallowed_types)] // cold path: WAL operations
     use std::collections::HashMap;
 
     /// WAL entry types representing different operations.
@@ -634,6 +635,7 @@ impl Iterator for WalReader {
 
 #[cfg(test)]
 mod tests {
+    #[allow(clippy::disallowed_types)] // cold path: WAL operations
     use std::collections::HashMap;
 
     use super::*;

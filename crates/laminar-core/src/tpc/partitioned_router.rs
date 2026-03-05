@@ -19,9 +19,16 @@ use super::router::{KeySpec, RouterError};
 ///
 /// Uses `FxHasher` for fast, deterministic hashing. Same key always maps
 /// to the same core, guaranteeing state locality.
+///
+/// Pre-allocates per-core row buffers and reuses them across calls to avoid
+/// per-cycle heap allocations on the hot path.
 pub struct PartitionedRouter {
     key_spec: KeySpec,
     num_cores: usize,
+    /// Per-core row index buffers, cleared (not dropped) between calls.
+    core_rows: Vec<Vec<u32>>,
+    /// Reusable result buffer.
+    result_buf: Vec<(usize, RecordBatch)>,
 }
 
 impl PartitionedRouter {
@@ -36,6 +43,8 @@ impl PartitionedRouter {
         Self {
             key_spec,
             num_cores,
+            core_rows: (0..num_cores).map(|_| Vec::with_capacity(256)).collect(),
+            result_buf: Vec::with_capacity(num_cores),
         }
     }
 
@@ -48,7 +57,7 @@ impl PartitionedRouter {
     ///
     /// Returns an error if key columns are not found or have unsupported types.
     pub fn route_batch(
-        &self,
+        &mut self,
         batch: &RecordBatch,
     ) -> Result<Vec<(usize, RecordBatch)>, RouterError> {
         if batch.num_rows() == 0 {
@@ -73,12 +82,13 @@ impl PartitionedRouter {
                 self.route_by_indices(batch, &indices)
             }
             KeySpec::ColumnIndices(indices) => {
-                for &idx in indices {
+                let indices = indices.clone();
+                for &idx in &indices {
                     if idx >= batch.num_columns() {
                         return Err(RouterError::ColumnIndexOutOfRange);
                     }
                 }
-                self.route_by_indices(batch, indices)
+                self.route_by_indices(batch, &indices)
             }
             KeySpec::AllColumns => {
                 let indices: Vec<usize> = (0..batch.num_columns()).collect();
@@ -89,12 +99,15 @@ impl PartitionedRouter {
 
     /// Route rows by hashing the values at the given column indices.
     fn route_by_indices(
-        &self,
+        &mut self,
         batch: &RecordBatch,
         indices: &[usize],
     ) -> Result<Vec<(usize, RecordBatch)>, RouterError> {
         let num_rows = batch.num_rows();
-        let mut core_rows: Vec<Vec<u32>> = vec![Vec::new(); self.num_cores];
+
+        // Clear scratch buffers (retains capacity)
+        self.core_rows.iter_mut().for_each(Vec::clear);
+        self.result_buf.clear();
 
         for row in 0..num_rows {
             let mut hasher = rustc_hash::FxHasher::default();
@@ -104,13 +117,12 @@ impl PartitionedRouter {
             #[allow(clippy::cast_possible_truncation)]
             let core_id = (hasher.finish() as usize) % self.num_cores;
             #[allow(clippy::cast_possible_truncation)]
-            core_rows[core_id].push(row as u32);
+            self.core_rows[core_id].push(row as u32);
         }
 
-        let mut result = Vec::new();
-        for (core_id, rows) in core_rows.into_iter().enumerate() {
+        for (core_id, rows) in self.core_rows.iter().enumerate() {
             if !rows.is_empty() {
-                let take_indices = UInt32Array::from(rows);
+                let take_indices = UInt32Array::from_iter_values(rows.iter().copied());
                 let columns: Vec<_> = batch
                     .columns()
                     .iter()
@@ -119,10 +131,10 @@ impl PartitionedRouter {
                     .map_err(|_| RouterError::UnsupportedDataType)?;
                 let sub_batch = RecordBatch::try_new(batch.schema(), columns)
                     .map_err(|_| RouterError::UnsupportedDataType)?;
-                result.push((core_id, sub_batch));
+                self.result_buf.push((core_id, sub_batch));
             }
         }
-        Ok(result)
+        Ok(std::mem::take(&mut self.result_buf))
     }
 }
 
@@ -197,7 +209,7 @@ mod tests {
 
     #[test]
     fn test_deterministic_routing() {
-        let router = PartitionedRouter::new(KeySpec::ColumnIndices(vec![0]), 4);
+        let mut router = PartitionedRouter::new(KeySpec::ColumnIndices(vec![0]), 4);
         let batch = make_batch(vec![1, 2, 3, 4, 1, 2, 3, 4]);
 
         let result = router.route_batch(&batch).unwrap();
@@ -214,7 +226,7 @@ mod tests {
 
     #[test]
     fn test_same_key_same_core() {
-        let router = PartitionedRouter::new(KeySpec::ColumnIndices(vec![0]), 4);
+        let mut router = PartitionedRouter::new(KeySpec::ColumnIndices(vec![0]), 4);
         let batch = make_batch(vec![42, 42, 42]);
 
         let result = router.route_batch(&batch).unwrap();
@@ -224,7 +236,7 @@ mod tests {
 
     #[test]
     fn test_round_robin_passthrough() {
-        let router = PartitionedRouter::new(KeySpec::RoundRobin, 4);
+        let mut router = PartitionedRouter::new(KeySpec::RoundRobin, 4);
         let batch = make_batch(vec![1, 2, 3]);
 
         let result = router.route_batch(&batch).unwrap();
@@ -235,7 +247,7 @@ mod tests {
 
     #[test]
     fn test_column_names() {
-        let router = PartitionedRouter::new(KeySpec::Columns(vec!["key".to_string()]), 2);
+        let mut router = PartitionedRouter::new(KeySpec::Columns(vec!["key".to_string()]), 2);
         let batch = make_batch(vec![1, 2, 3, 4]);
 
         let result = router.route_batch(&batch).unwrap();
@@ -245,7 +257,7 @@ mod tests {
 
     #[test]
     fn test_column_not_found() {
-        let router = PartitionedRouter::new(KeySpec::Columns(vec!["missing".to_string()]), 2);
+        let mut router = PartitionedRouter::new(KeySpec::Columns(vec!["missing".to_string()]), 2);
         let batch = make_batch(vec![1, 2]);
 
         let result = router.route_batch(&batch);
@@ -254,7 +266,7 @@ mod tests {
 
     #[test]
     fn test_column_index_out_of_range() {
-        let router = PartitionedRouter::new(KeySpec::ColumnIndices(vec![5]), 2);
+        let mut router = PartitionedRouter::new(KeySpec::ColumnIndices(vec![5]), 2);
         let batch = make_batch(vec![1, 2]);
 
         let result = router.route_batch(&batch);
@@ -263,7 +275,7 @@ mod tests {
 
     #[test]
     fn test_empty_batch() {
-        let router = PartitionedRouter::new(KeySpec::ColumnIndices(vec![0]), 2);
+        let mut router = PartitionedRouter::new(KeySpec::ColumnIndices(vec![0]), 2);
         let batch = make_batch(vec![]);
 
         let result = router.route_batch(&batch);
@@ -272,7 +284,7 @@ mod tests {
 
     #[test]
     fn test_string_keys() {
-        let router = PartitionedRouter::new(KeySpec::Columns(vec!["name".to_string()]), 4);
+        let mut router = PartitionedRouter::new(KeySpec::Columns(vec!["name".to_string()]), 4);
         let batch = make_string_batch(vec!["alice", "bob", "alice", "charlie"]);
 
         let result = router.route_batch(&batch).unwrap();
@@ -296,7 +308,7 @@ mod tests {
 
     #[test]
     fn test_all_columns() {
-        let router = PartitionedRouter::new(KeySpec::AllColumns, 2);
+        let mut router = PartitionedRouter::new(KeySpec::AllColumns, 2);
         let batch = make_batch(vec![1, 2, 3, 4]);
 
         let result = router.route_batch(&batch).unwrap();
@@ -306,7 +318,7 @@ mod tests {
 
     #[test]
     fn test_preserves_schema() {
-        let router = PartitionedRouter::new(KeySpec::ColumnIndices(vec![0]), 2);
+        let mut router = PartitionedRouter::new(KeySpec::ColumnIndices(vec![0]), 2);
         let batch = make_batch(vec![1, 2, 3]);
 
         let result = router.route_batch(&batch).unwrap();

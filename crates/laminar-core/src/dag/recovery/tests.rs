@@ -1,3 +1,5 @@
+#![allow(clippy::disallowed_types)] // test code: DagCheckpointSnapshot uses std HashMap for serde
+
 use std::collections::HashMap;
 
 use rustc_hash::FxHashMap;

@@ -4,6 +4,7 @@
 //! nodes proportional to each node's core count. Supports failure domain
 //! diversity and weighted distribution.
 
+#![allow(clippy::disallowed_types)] // cold path: partition assignment planning
 use std::collections::HashMap;
 
 use crate::delta::discovery::{NodeId, NodeInfo};

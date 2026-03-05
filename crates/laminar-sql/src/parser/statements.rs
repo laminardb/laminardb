@@ -3,6 +3,7 @@
 //! This module defines AST types for streaming SQL extensions and provides
 //! conversion methods to translate them to runtime operator configurations.
 
+#[allow(clippy::disallowed_types)] // cold path: SQL parsing
 use std::collections::HashMap;
 use std::time::Duration;
 

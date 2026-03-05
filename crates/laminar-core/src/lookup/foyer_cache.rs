@@ -530,6 +530,7 @@ impl<S: LookupSource> std::fmt::Debug for LookupCacheHierarchy<S> {
 }
 
 #[cfg(test)]
+#[allow(clippy::disallowed_types)] // test code
 mod tests {
     use super::*;
 

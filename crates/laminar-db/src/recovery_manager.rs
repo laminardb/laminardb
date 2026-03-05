@@ -21,6 +21,7 @@
 //! iterates through all available checkpoints in reverse chronological order
 //! until one succeeds. This prevents a single corrupt checkpoint from causing
 //! total data loss.
+#![allow(clippy::disallowed_types)] // cold path
 
 use std::collections::HashMap;
 

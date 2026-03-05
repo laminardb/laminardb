@@ -15,7 +15,7 @@
 
 #![deny(missing_docs)]
 #![warn(clippy::all, clippy::pedantic)]
-#![allow(clippy::disallowed_types)]
+#![allow(clippy::disallowed_types)] // cold path: all storage modules (WAL, checkpoint, recovery) are off hot path
 
 /// Write-ahead log implementation - WAL for durability and exactly-once semantics
 pub mod wal;

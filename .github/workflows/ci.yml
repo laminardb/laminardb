@@ -120,6 +120,13 @@ jobs:
         if: runner.os == 'Windows'
         run: cargo nextest run --workspace --features "allocation-tracking,jit,kafka,postgres-cdc,postgres-sink,mysql-cdc,delta-lake,delta"
 
+      # Verify zero-allocation hot path (Linux only, requires global allocator)
+      - name: Verify zero-allocation hot path
+        if: runner.os == 'Linux'
+        run: cargo test --features allocation-tracking -p laminar-core --test zero_alloc_integration
+        env:
+          RUSTFLAGS: "-C link-arg=-fuse-ld=mold"
+
       # Doc tests only on Linux (redundant across platforms)
       - name: Run doc tests
         if: runner.os == 'Linux'

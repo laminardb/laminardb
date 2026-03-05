@@ -10,6 +10,7 @@
 //! - `RecoveryPlan` — recovery plan built from checkpoint manifests.
 //! - `DeterminismWarning` — warnings about non-determinism during recovery.
 
+#[allow(clippy::disallowed_types)] // cold path: checkpoint recovery
 use std::collections::HashMap;
 use std::fmt;
 

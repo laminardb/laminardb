@@ -191,6 +191,7 @@ impl CloudConfigValidator {
 }
 
 #[cfg(test)]
+#[allow(clippy::disallowed_types)] // cold path: storage configuration
 mod tests {
     use std::collections::HashMap;
 

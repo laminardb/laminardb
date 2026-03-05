@@ -25,7 +25,7 @@
 //! ```
 
 use parking_lot::RwLock;
-use std::collections::HashMap;
+use rustc_hash::FxHashMap;
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::time::{Duration, Instant};
 
@@ -189,13 +189,16 @@ pub struct SubscriptionMetrics {
 /// under normal operation.
 pub struct SubscriptionRegistry {
     /// All subscriptions by ID.
-    subscriptions: RwLock<HashMap<SubscriptionId, SubscriptionEntry>>,
+    subscriptions: RwLock<FxHashMap<SubscriptionId, SubscriptionEntry>>,
     /// Index: `source_id` → subscription IDs.
-    by_source: RwLock<HashMap<u32, Vec<SubscriptionId>>>,
+    by_source: RwLock<FxHashMap<u32, Vec<SubscriptionId>>>,
     /// Index: source name → subscription IDs.
-    by_name: RwLock<HashMap<String, Vec<SubscriptionId>>>,
+    by_name: RwLock<FxHashMap<String, Vec<SubscriptionId>>>,
     /// Next subscription ID (monotonically increasing).
     next_id: AtomicU64,
+    /// Version counter — bumped on every subscribe/unsubscribe mutation.
+    /// Ring 1 dispatcher can cache sender lists and re-query only when version changes.
+    version: AtomicU64,
 }
 
 #[allow(clippy::missing_panics_doc)] // All methods panic only on poisoned RwLock
@@ -204,10 +207,11 @@ impl SubscriptionRegistry {
     #[must_use]
     pub fn new() -> Self {
         Self {
-            subscriptions: RwLock::new(HashMap::new()),
-            by_source: RwLock::new(HashMap::new()),
-            by_name: RwLock::new(HashMap::new()),
+            subscriptions: RwLock::new(FxHashMap::default()),
+            by_source: RwLock::new(FxHashMap::default()),
+            by_name: RwLock::new(FxHashMap::default()),
             next_id: AtomicU64::new(1),
+            version: AtomicU64::new(0),
         }
     }
 
@@ -260,6 +264,7 @@ impl SubscriptionRegistry {
             .or_default()
             .push(id);
 
+        self.version.fetch_add(1, Ordering::Release);
         (id, rx)
     }
 
@@ -310,6 +315,7 @@ impl SubscriptionRegistry {
                 ids.retain(|&i| i != id);
             }
 
+            self.version.fetch_add(1, Ordering::Release);
             true
         } else {
             false
@@ -346,6 +352,15 @@ impl SubscriptionRegistry {
     pub fn get_subscriptions_by_name(&self, name: &str) -> Vec<SubscriptionId> {
         let by_name = self.by_name.read();
         by_name.get(name).cloned().unwrap_or_default()
+    }
+
+    /// Returns the current version counter.
+    ///
+    /// Bumped on every `create()` and `cancel()`. The Ring 1 dispatcher can
+    /// cache sender lists and only re-query when the version changes.
+    #[must_use]
+    pub fn version(&self) -> u64 {
+        self.version.load(Ordering::Acquire)
     }
 
     /// Returns the total number of registered subscriptions.

@@ -4,6 +4,7 @@
 //! They can be backed by external connectors (PostgreSQL CDC, Redis, etc.)
 //! with configurable caching and predicate pushdown strategies.
 
+#[allow(clippy::disallowed_types)] // cold path: SQL parsing
 use std::collections::HashMap;
 
 use sqlparser::ast::{ColumnDef, ObjectName};

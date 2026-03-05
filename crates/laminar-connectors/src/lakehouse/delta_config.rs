@@ -3,6 +3,7 @@
 //! [`DeltaLakeSinkConfig`] encapsulates all settings for writing Arrow
 //! `RecordBatch` data to Delta Lake tables, parsed from SQL `WITH (...)`
 //! clauses via [`from_config`](DeltaLakeSinkConfig::from_config).
+#![allow(clippy::disallowed_types)] // cold path: lakehouse configuration
 
 use std::collections::HashMap;
 use std::fmt;

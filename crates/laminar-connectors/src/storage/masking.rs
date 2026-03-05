@@ -3,6 +3,7 @@
 //! [`SecretMasker`] identifies keys that hold secret values (passwords,
 //! access keys, tokens) and replaces their values with `"***"` in
 //! `Display`/`Debug` output.
+#![allow(clippy::disallowed_types)] // cold path: storage configuration
 
 use std::collections::HashMap;
 

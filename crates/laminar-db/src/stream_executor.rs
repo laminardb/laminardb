@@ -8,7 +8,7 @@
 //! 3. Results are collected as `RecordBatch` vectors
 //! 4. Temporary tables are cleared for the next cycle
 
-use std::collections::{HashMap, HashSet, VecDeque};
+use std::collections::VecDeque;
 use std::sync::Arc;
 
 use rustc_hash::{FxHashMap, FxHashSet};
@@ -69,8 +69,8 @@ pub(crate) fn emit_clause_to_core(
 ///
 /// Parses the SQL and walks the AST to find `TableFactor::Table` references,
 /// recursing into subqueries, nested joins, and set operations (UNION, etc.).
-pub(crate) fn extract_table_references(sql: &str) -> HashSet<String> {
-    let mut tables = HashSet::new();
+pub(crate) fn extract_table_references(sql: &str) -> FxHashSet<String> {
+    let mut tables = FxHashSet::default();
     let dialect = GenericDialect {};
     let Ok(statements) = Parser::parse_sql(&dialect, sql) else {
         return tables;
@@ -84,7 +84,7 @@ pub(crate) fn extract_table_references(sql: &str) -> HashSet<String> {
 }
 
 /// Recursively collect table names from a `SetExpr`.
-fn collect_tables_from_set_expr(set_expr: &SetExpr, tables: &mut HashSet<String>) {
+fn collect_tables_from_set_expr(set_expr: &SetExpr, tables: &mut FxHashSet<String>) {
     match set_expr {
         SetExpr::Select(select) => {
             for table_with_joins in &select.from {
@@ -106,7 +106,7 @@ fn collect_tables_from_set_expr(set_expr: &SetExpr, tables: &mut HashSet<String>
 }
 
 /// Collect table names from a single `TableFactor`.
-fn collect_tables_from_factor(factor: &TableFactor, tables: &mut HashSet<String>) {
+fn collect_tables_from_factor(factor: &TableFactor, tables: &mut FxHashSet<String>) {
     match factor {
         TableFactor::Table { name, .. } => {
             // Use last component of potentially qualified name (e.g., "schema.table")
@@ -149,7 +149,7 @@ pub(crate) struct StreamQuery {
     pub order_config: Option<OrderOperatorConfig>,
     /// Pre-computed table references (extracted once at registration).
     /// Avoids re-parsing SQL for dependency analysis every cycle.
-    table_refs: HashSet<String>,
+    table_refs: FxHashSet<String>,
 }
 
 impl StreamQuery {
@@ -184,7 +184,7 @@ const EOWC_COALESCE_BATCH_THRESHOLD: usize = 32;
 /// `EOWC_COALESCE_BATCH_THRESHOLD` to mitigate fragmentation.
 struct EowcState {
     /// Accumulated source batches keyed by source table name.
-    accumulated_sources: HashMap<String, Vec<RecordBatch>>,
+    accumulated_sources: FxHashMap<String, Vec<RecordBatch>>,
     /// The last closed-window boundary that was emitted.
     last_closed_boundary: i64,
     /// Total rows currently accumulated (for diagnostics).
@@ -207,7 +207,7 @@ pub(crate) struct StreamExecutor {
     topo_dirty: bool,
     /// Known source schemas — used to register empty tables when a source
     /// has no data in a given cycle, preventing `DataFusion` planning errors.
-    source_schemas: HashMap<String, SchemaRef>,
+    source_schemas: FxHashMap<String, SchemaRef>,
     /// Per-query EOWC accumulation state, keyed by query index.
     eowc_states: FxHashMap<usize, EowcState>,
     /// Per-query incremental aggregation state, keyed by query index.
@@ -234,7 +234,7 @@ pub(crate) struct StreamExecutor {
     /// are lazily initialized, then applied and cleared.
     pending_restore: Option<crate::aggregate_state::StreamExecutorCheckpoint>,
     /// Reusable per-cycle results map (cleared each cycle to avoid reallocation).
-    cycle_results: HashMap<String, Vec<RecordBatch>>,
+    cycle_results: FxHashMap<String, Vec<RecordBatch>>,
     /// Reusable per-cycle intermediate table name list.
     cycle_intermediates: Vec<String>,
 }
@@ -248,7 +248,7 @@ impl StreamExecutor {
             registered_sources: Vec::new(),
             topo_order: Vec::new(),
             topo_dirty: true,
-            source_schemas: HashMap::new(),
+            source_schemas: FxHashMap::default(),
             eowc_states: FxHashMap::default(),
             agg_states: FxHashMap::default(),
             non_agg_queries: FxHashSet::default(),
@@ -257,7 +257,7 @@ impl StreamExecutor {
             core_window_states: FxHashMap::default(),
             non_core_window_queries: FxHashSet::default(),
             pending_restore: None,
-            cycle_results: HashMap::new(),
+            cycle_results: FxHashMap::default(),
             cycle_intermediates: Vec::new(),
         }
     }
@@ -301,7 +301,7 @@ impl StreamExecutor {
             self.eowc_states.insert(
                 idx,
                 EowcState {
-                    accumulated_sources: HashMap::new(),
+                    accumulated_sources: FxHashMap::default(),
                     last_closed_boundary: i64::MIN,
                     accumulated_rows: 0,
                 },
@@ -333,7 +333,7 @@ impl StreamExecutor {
     /// as temp tables before downstream queries execute.
     fn compute_topo_order(&mut self) {
         // Map query names to indices
-        let name_to_idx: HashMap<&str, usize> = self
+        let name_to_idx: FxHashMap<&str, usize> = self
             .queries
             .iter()
             .enumerate()
@@ -383,7 +383,7 @@ impl StreamExecutor {
                 "circular dependency detected in query DAG, \
                  falling back to insertion order for remaining queries"
             );
-            let in_order: HashSet<usize> = self.topo_order.iter().copied().collect();
+            let in_order: FxHashSet<usize> = self.topo_order.iter().copied().collect();
             for i in 0..self.queries.len() {
                 if !in_order.contains(&i) {
                     self.topo_order.push(i);
@@ -405,9 +405,9 @@ impl StreamExecutor {
     #[allow(clippy::too_many_lines)]
     pub async fn execute_cycle(
         &mut self,
-        source_batches: &HashMap<String, Vec<RecordBatch>>,
+        source_batches: &FxHashMap<String, Vec<RecordBatch>>,
         current_watermark: i64,
-    ) -> Result<HashMap<String, Vec<RecordBatch>>, DbError> {
+    ) -> Result<FxHashMap<String, Vec<RecordBatch>>, DbError> {
         if self.topo_dirty {
             self.compute_topo_order();
         }
@@ -512,7 +512,7 @@ impl StreamExecutor {
     /// `DataFusion` can still plan queries that reference them.
     fn register_source_tables(
         &mut self,
-        source_batches: &HashMap<String, Vec<RecordBatch>>,
+        source_batches: &FxHashMap<String, Vec<RecordBatch>>,
     ) -> Result<(), DbError> {
         for (name, batches) in source_batches {
             if batches.is_empty() {
@@ -716,27 +716,6 @@ impl StreamExecutor {
         result
     }
 
-    /// Number of registered queries.
-    #[allow(dead_code)]
-    pub fn query_count(&self) -> usize {
-        self.queries.len()
-    }
-
-    /// Returns the current EOWC backpressure level (0.0 = no pressure,
-    /// 1.0 = at memory limit). Callers can use this to throttle ingestion.
-    #[allow(dead_code)]
-    pub fn backpressure_level(&self) -> f64 {
-        let max_rows = self
-            .eowc_states
-            .values()
-            .map(|s| s.accumulated_rows)
-            .max()
-            .unwrap_or(0);
-        #[allow(clippy::cast_precision_loss)]
-        let level = max_rows as f64 / MAX_EOWC_ACCUMULATED_ROWS as f64;
-        level.min(1.0)
-    }
-
     /// Execute an EOWC aggregate query using incremental per-window accumulators.
     ///
     /// Runs the pre-aggregation SQL against currently registered source tables,
@@ -864,8 +843,8 @@ impl StreamExecutor {
         window_config: Option<&WindowOperatorConfig>,
         asof_config: Option<&AsofJoinTranslatorConfig>,
         projection_sql: Option<&str>,
-        source_batches: &HashMap<String, Vec<RecordBatch>>,
-        intermediate_results: &HashMap<String, Vec<RecordBatch>>,
+        source_batches: &FxHashMap<String, Vec<RecordBatch>>,
+        intermediate_results: &FxHashMap<String, Vec<RecordBatch>>,
         current_watermark: i64,
     ) -> Result<Vec<RecordBatch>, DbError> {
         // Try core-window and incremental EOWC paths for aggregate queries with
@@ -1061,10 +1040,16 @@ impl StreamExecutor {
             return Ok(Vec::new());
         };
 
-        let mut filtered_sources: HashMap<String, Vec<RecordBatch>> =
-            HashMap::with_capacity(eowc.accumulated_sources.len());
-        let mut retained_sources: HashMap<String, Vec<RecordBatch>> =
-            HashMap::with_capacity(eowc.accumulated_sources.len());
+        let mut filtered_sources: FxHashMap<String, Vec<RecordBatch>> =
+            FxHashMap::with_capacity_and_hasher(
+                eowc.accumulated_sources.len(),
+                rustc_hash::FxBuildHasher,
+            );
+        let mut retained_sources: FxHashMap<String, Vec<RecordBatch>> =
+            FxHashMap::with_capacity_and_hasher(
+                eowc.accumulated_sources.len(),
+                rustc_hash::FxBuildHasher,
+            );
         let mut has_data = false;
         let mut retained_rows = 0usize;
 
@@ -1207,8 +1192,8 @@ impl StreamExecutor {
         query_name: &str,
         config: &AsofJoinTranslatorConfig,
         projection_sql: Option<&str>,
-        source_batches: &HashMap<String, Vec<RecordBatch>>,
-        intermediate_results: &HashMap<String, Vec<RecordBatch>>,
+        source_batches: &FxHashMap<String, Vec<RecordBatch>>,
+        intermediate_results: &FxHashMap<String, Vec<RecordBatch>>,
     ) -> Result<Vec<RecordBatch>, DbError> {
         // Resolve left batches: source_batches → intermediate → DataFusion
         let left_batches = self
@@ -1259,8 +1244,8 @@ impl StreamExecutor {
         &self,
         query_name: &str,
         config: &TemporalJoinTranslatorConfig,
-        source_batches: &HashMap<String, Vec<RecordBatch>>,
-        intermediate_results: &HashMap<String, Vec<RecordBatch>>,
+        source_batches: &FxHashMap<String, Vec<RecordBatch>>,
+        intermediate_results: &FxHashMap<String, Vec<RecordBatch>>,
     ) -> Result<Vec<RecordBatch>, DbError> {
         let stream_batches = self
             .resolve_table_batches(&config.stream_table, source_batches, intermediate_results)
@@ -1288,8 +1273,8 @@ impl StreamExecutor {
     async fn resolve_table_batches(
         &self,
         table_name: &str,
-        source_batches: &HashMap<String, Vec<RecordBatch>>,
-        intermediate_results: &HashMap<String, Vec<RecordBatch>>,
+        source_batches: &FxHashMap<String, Vec<RecordBatch>>,
+        intermediate_results: &FxHashMap<String, Vec<RecordBatch>>,
     ) -> Result<Vec<RecordBatch>, DbError> {
         if let Some(batches) = source_batches.get(table_name) {
             return Ok(batches.clone());
@@ -1317,19 +1302,26 @@ impl StreamExecutor {
     pub fn checkpoint_state(&mut self) -> Result<Option<Vec<u8>>, DbError> {
         use crate::aggregate_state::StreamExecutorCheckpoint;
 
-        let mut agg_checkpoints = HashMap::with_capacity(self.agg_states.len());
+        let mut agg_checkpoints =
+            FxHashMap::with_capacity_and_hasher(self.agg_states.len(), rustc_hash::FxBuildHasher);
         for (&idx, state) in &mut self.agg_states {
             let name = self.queries[idx].name.clone();
             agg_checkpoints.insert(name, state.checkpoint_groups()?);
         }
 
-        let mut eowc_checkpoints = HashMap::with_capacity(self.eowc_agg_states.len());
+        let mut eowc_checkpoints = FxHashMap::with_capacity_and_hasher(
+            self.eowc_agg_states.len(),
+            rustc_hash::FxBuildHasher,
+        );
         for (&idx, state) in &mut self.eowc_agg_states {
             let name = self.queries[idx].name.clone();
             eowc_checkpoints.insert(name, state.checkpoint_windows()?);
         }
 
-        let mut cw_checkpoints = HashMap::with_capacity(self.core_window_states.len());
+        let mut cw_checkpoints = FxHashMap::with_capacity_and_hasher(
+            self.core_window_states.len(),
+            rustc_hash::FxBuildHasher,
+        );
         for (&idx, state) in &mut self.core_window_states {
             let name = self.queries[idx].name.clone();
             cw_checkpoints.insert(name, state.checkpoint_windows()?);
@@ -1337,7 +1329,7 @@ impl StreamExecutor {
 
         // Join states: currently ASOF/temporal joins are stateless per-cycle,
         // so this map is empty. Future stateful joins will populate it.
-        let join_checkpoints = HashMap::new();
+        let join_checkpoints = FxHashMap::default();
 
         if agg_checkpoints.is_empty()
             && eowc_checkpoints.is_empty()
@@ -1381,7 +1373,7 @@ impl StreamExecutor {
         let mut restored = 0usize;
 
         // Build name → index lookup
-        let name_to_idx: HashMap<&str, usize> = self
+        let name_to_idx: FxHashMap<&str, usize> = self
             .queries
             .iter()
             .enumerate()
@@ -1885,7 +1877,7 @@ mod tests {
             None,
         );
 
-        let mut source_batches = HashMap::new();
+        let mut source_batches = FxHashMap::default();
         source_batches.insert("events".to_string(), vec![test_batch()]);
 
         let results = executor
@@ -1914,7 +1906,7 @@ mod tests {
             None,
         );
 
-        let source_batches = HashMap::new();
+        let source_batches = FxHashMap::default();
         // When no source data is registered, the query references a missing table —
         // this should surface as an error, not silently produce empty results.
         let result = executor.execute_cycle(&source_batches, i64::MAX).await;
@@ -1947,7 +1939,7 @@ mod tests {
             None,
         );
 
-        let mut source_batches = HashMap::new();
+        let mut source_batches = FxHashMap::default();
         source_batches.insert("events".to_string(), vec![test_batch()]);
 
         let results = executor
@@ -1972,7 +1964,7 @@ mod tests {
             None,
         );
 
-        let mut source_batches = HashMap::new();
+        let mut source_batches = FxHashMap::default();
         source_batches.insert("events".to_string(), vec![test_batch()]);
 
         let results = executor
@@ -1999,7 +1991,7 @@ mod tests {
         );
 
         // First cycle
-        let mut source_batches = HashMap::new();
+        let mut source_batches = FxHashMap::default();
         source_batches.insert("events".to_string(), vec![test_batch()]);
         let r1 = executor
             .execute_cycle(&source_batches, i64::MAX)
@@ -2008,7 +2000,7 @@ mod tests {
         assert!(r1.contains_key("pass"));
 
         // Second cycle with no data — table was cleaned up, so query fails
-        let empty = HashMap::new();
+        let empty = FxHashMap::default();
         let r2 = executor.execute_cycle(&empty, i64::MAX).await;
         assert!(
             r2.is_err(),
@@ -2045,7 +2037,7 @@ mod tests {
             None,
         );
 
-        let mut source_batches = HashMap::new();
+        let mut source_batches = FxHashMap::default();
         source_batches.insert("events".to_string(), vec![test_batch()]);
 
         let results = executor
@@ -2108,7 +2100,7 @@ mod tests {
             None,
         );
 
-        let mut source_batches = HashMap::new();
+        let mut source_batches = FxHashMap::default();
         source_batches.insert("events".to_string(), vec![test_batch()]);
 
         let results = executor
@@ -2160,7 +2152,7 @@ mod tests {
             None,
         );
 
-        let mut source_batches = HashMap::new();
+        let mut source_batches = FxHashMap::default();
         source_batches.insert("events".to_string(), vec![test_batch()]);
 
         let results = executor
@@ -2216,7 +2208,7 @@ mod tests {
             None,
         );
 
-        let mut source_batches = HashMap::new();
+        let mut source_batches = FxHashMap::default();
         source_batches.insert("events".to_string(), vec![test_batch()]);
 
         let results = executor
@@ -2255,7 +2247,7 @@ mod tests {
             None,
         );
 
-        let mut source_batches = HashMap::new();
+        let mut source_batches = FxHashMap::default();
         source_batches.insert("events".to_string(), vec![test_batch()]);
 
         let results = executor
@@ -2299,7 +2291,7 @@ mod tests {
         );
 
         // No source data — first query references missing table, so cycle fails
-        let source_batches = HashMap::new();
+        let source_batches = FxHashMap::default();
         let result = executor.execute_cycle(&source_batches, i64::MAX).await;
         assert!(result.is_err());
     }
@@ -2319,7 +2311,7 @@ mod tests {
             None,
         );
 
-        let mut source_batches = HashMap::new();
+        let mut source_batches = FxHashMap::default();
         source_batches.insert("events".to_string(), vec![test_batch()]);
 
         let result = executor.execute_cycle(&source_batches, i64::MAX).await;
@@ -2346,7 +2338,7 @@ mod tests {
             None,
         );
 
-        let mut source_batches = HashMap::new();
+        let mut source_batches = FxHashMap::default();
         source_batches.insert("events".to_string(), vec![test_batch()]);
 
         let result = executor.execute_cycle(&source_batches, i64::MAX).await;
@@ -2454,7 +2446,7 @@ mod tests {
             None,
         );
 
-        let mut source_batches = HashMap::new();
+        let mut source_batches = FxHashMap::default();
         source_batches.insert("trades".to_string(), vec![trades_batch_for_asof()]);
         source_batches.insert("quotes".to_string(), vec![quotes_batch_for_asof()]);
 
@@ -2493,7 +2485,7 @@ mod tests {
             None,
         );
 
-        let mut source_batches = HashMap::new();
+        let mut source_batches = FxHashMap::default();
         source_batches.insert("trades".to_string(), vec![trades_batch_for_asof()]);
         source_batches.insert("quotes".to_string(), vec![quotes_batch_for_asof()]);
 
@@ -2539,7 +2531,7 @@ mod tests {
         );
 
         // Only trades, no quotes → should still work (left join with nulls)
-        let mut source_batches = HashMap::new();
+        let mut source_batches = FxHashMap::default();
         source_batches.insert("trades".to_string(), vec![trades_batch_for_asof()]);
         source_batches.insert(
             "quotes".to_string(),
@@ -2581,7 +2573,7 @@ mod tests {
             None,
         );
 
-        let mut source_batches = HashMap::new();
+        let mut source_batches = FxHashMap::default();
         source_batches.insert("trades".to_string(), vec![trades_batch_for_asof()]);
         source_batches.insert("quotes".to_string(), vec![quotes_batch_for_asof()]);
 
@@ -2612,7 +2604,7 @@ mod tests {
             None,
         );
 
-        let mut source_batches = HashMap::new();
+        let mut source_batches = FxHashMap::default();
         source_batches.insert("events".to_string(), vec![test_batch()]);
 
         let results = executor
@@ -2676,7 +2668,7 @@ mod tests {
             None,
         );
 
-        let mut source_batches = HashMap::new();
+        let mut source_batches = FxHashMap::default();
         source_batches.insert(
             "trades".to_string(),
             vec![eowc_batch(vec!["AAPL"], vec![150.0], vec![500])],
@@ -2690,7 +2682,7 @@ mod tests {
         );
 
         // Advance watermark to 1000 → window [0, 1000) is now closed
-        let empty: HashMap<String, Vec<RecordBatch>> = HashMap::new();
+        let empty: FxHashMap<String, Vec<RecordBatch>> = FxHashMap::default();
         let results = executor.execute_cycle(&empty, 1000).await.unwrap();
         assert!(
             results.contains_key("avg_price"),
@@ -2715,7 +2707,7 @@ mod tests {
         );
 
         // Cycle 1: push data at ts=100
-        let mut batches1 = HashMap::new();
+        let mut batches1 = FxHashMap::default();
         batches1.insert(
             "trades".to_string(),
             vec![eowc_batch(vec!["AAPL"], vec![100.0], vec![100])],
@@ -2724,7 +2716,7 @@ mod tests {
         assert!(!r1.contains_key("total"), "window not closed at wm=200");
 
         // Cycle 2: push more data at ts=400
-        let mut batches2 = HashMap::new();
+        let mut batches2 = FxHashMap::default();
         batches2.insert(
             "trades".to_string(),
             vec![eowc_batch(vec!["AAPL"], vec![200.0], vec![400])],
@@ -2733,7 +2725,7 @@ mod tests {
         assert!(!r2.contains_key("total"), "window not closed at wm=600");
 
         // Cycle 3: watermark crosses 1000 → emit accumulated
-        let empty: HashMap<String, Vec<RecordBatch>> = HashMap::new();
+        let empty: FxHashMap<String, Vec<RecordBatch>> = FxHashMap::default();
         let r3 = executor.execute_cycle(&empty, 1000).await.unwrap();
         assert!(r3.contains_key("total"), "window closed at wm=1000");
         let batches = &r3["total"];
@@ -2765,7 +2757,7 @@ mod tests {
         );
 
         // Push data spanning two windows: [0,1000) and [1000,2000)
-        let mut batches = HashMap::new();
+        let mut batches = FxHashMap::default();
         batches.insert(
             "trades".to_string(),
             vec![eowc_batch(
@@ -2788,7 +2780,7 @@ mod tests {
         assert_eq!(cnt, 2, "first window should have 2 rows");
 
         // Watermark at 2000 → window [1000,2000) closes, 1 row (ts=1500)
-        let empty: HashMap<String, Vec<RecordBatch>> = HashMap::new();
+        let empty: FxHashMap<String, Vec<RecordBatch>> = FxHashMap::default();
         let r2 = executor.execute_cycle(&empty, 2000).await.unwrap();
         assert!(r2.contains_key("cnt"));
         let cnt2 = r2["cnt"][0]
@@ -2816,7 +2808,7 @@ mod tests {
             None,
         );
 
-        let mut source_batches = HashMap::new();
+        let mut source_batches = FxHashMap::default();
         source_batches.insert(
             "trades".to_string(),
             vec![eowc_batch(vec!["AAPL"], vec![150.0], vec![500])],
@@ -2859,7 +2851,7 @@ mod tests {
             None,
         );
 
-        let mut source_batches = HashMap::new();
+        let mut source_batches = FxHashMap::default();
         source_batches.insert(
             "trades".to_string(),
             vec![eowc_batch(vec!["AAPL"], vec![150.0], vec![500])],
@@ -2872,7 +2864,7 @@ mod tests {
 
         // Advance watermark → EOWC now emits
         // Provide an empty batch so the "trades" table is still registered
-        let mut empty_source = HashMap::new();
+        let mut empty_source = FxHashMap::default();
         empty_source.insert(
             "trades".to_string(),
             vec![RecordBatch::new_empty(eowc_test_schema())],
@@ -3025,7 +3017,7 @@ mod tests {
         assert!(executor.queries[0].table_refs.contains("upstream"));
         assert!(executor.queries[1].table_refs.contains("events"));
 
-        let mut source_batches = HashMap::new();
+        let mut source_batches = FxHashMap::default();
         source_batches.insert("events".to_string(), vec![test_batch()]);
 
         let results = executor
@@ -3146,7 +3138,7 @@ mod tests {
             )),
         );
 
-        let mut source_batches = HashMap::new();
+        let mut source_batches = FxHashMap::default();
         source_batches.insert("events".to_string(), vec![test_batch()]); // 3 rows
 
         let results = executor
@@ -3196,7 +3188,7 @@ mod tests {
             None,
         );
 
-        let mut source_batches = HashMap::new();
+        let mut source_batches = FxHashMap::default();
         source_batches.insert("trades".to_string(), vec![mixed_case_batch()]);
 
         let results = executor
@@ -3231,7 +3223,7 @@ mod tests {
             None,
         );
 
-        let mut source_batches = HashMap::new();
+        let mut source_batches = FxHashMap::default();
         source_batches.insert("trades".to_string(), vec![mixed_case_batch()]);
 
         let results = executor
@@ -3259,7 +3251,7 @@ mod tests {
             None,
         );
 
-        let mut source_batches = HashMap::new();
+        let mut source_batches = FxHashMap::default();
         source_batches.insert("trades".to_string(), vec![mixed_case_batch()]);
 
         let results = executor
@@ -3286,7 +3278,7 @@ mod tests {
             None,
         );
 
-        let mut source_batches = HashMap::new();
+        let mut source_batches = FxHashMap::default();
         source_batches.insert("trades".to_string(), vec![mixed_case_batch()]);
 
         let results = executor
@@ -3320,7 +3312,7 @@ mod tests {
         );
 
         // Cycle 1: push data in window [0, 1000) with watermark at 500
-        let mut batches1 = HashMap::new();
+        let mut batches1 = FxHashMap::default();
         batches1.insert(
             "trades".to_string(),
             vec![eowc_batch(vec!["AAPL"], vec![100.0], vec![500])],
@@ -3331,7 +3323,7 @@ mod tests {
         // Cycle 2: push more data, watermark STAYS at 500 (hasn't
         // advanced). Even if memory were over the threshold, should
         // NOT emit open-window rows.
-        let mut batches2 = HashMap::new();
+        let mut batches2 = FxHashMap::default();
         batches2.insert(
             "trades".to_string(),
             vec![eowc_batch(vec!["AAPL"], vec![200.0], vec![600])],
@@ -3343,7 +3335,7 @@ mod tests {
         );
 
         // Cycle 3: watermark advances to 1000 → window closes
-        let empty: HashMap<String, Vec<RecordBatch>> = HashMap::new();
+        let empty: FxHashMap<String, Vec<RecordBatch>> = FxHashMap::default();
         let r3 = executor.execute_cycle(&empty, 1000).await.unwrap();
         assert!(r3.contains_key("total"), "window closed at wm=1000");
 

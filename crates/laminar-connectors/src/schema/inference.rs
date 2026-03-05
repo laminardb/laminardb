@@ -6,6 +6,7 @@
 //! - Built-in implementations for JSON, CSV, and raw formats
 //! - [`default_infer_from_samples`] free function used by the default
 //!   [`SchemaInferable`](super::traits::SchemaInferable) implementation
+#![allow(clippy::disallowed_types)] // cold path: schema management
 
 use std::collections::HashMap;
 use std::sync::{Arc, LazyLock, RwLock};

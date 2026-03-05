@@ -30,6 +30,7 @@
 //! In this example, `trades` source has 2 consumers (`vwap` and `max_price`),
 //! so the planner derives `Broadcast { consumer_count: 2 }` for `trades`.
 
+#[allow(clippy::disallowed_types)] // cold path: query planning
 use std::collections::HashMap;
 
 /// Channel type derived from query analysis.

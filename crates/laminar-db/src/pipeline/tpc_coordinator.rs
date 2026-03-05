@@ -3,7 +3,6 @@
 //! Runs as a tokio task. Drains core outboxes from [`TpcRuntime`], runs SQL
 //! cycles via [`PipelineCallback`], and handles checkpoint barriers.
 
-use std::collections::HashMap;
 use std::sync::Arc;
 use std::time::Instant;
 
@@ -13,6 +12,7 @@ use laminar_core::checkpoint::CheckpointBarrier;
 use laminar_core::operator::Output;
 use laminar_core::tpc::TaggedOutput;
 use laminar_core::tpc::TpcConfig;
+use rustc_hash::{FxHashMap, FxHashSet};
 
 use super::callback::{PipelineCallback, SourceRegistration};
 use super::config::PipelineConfig;
@@ -23,8 +23,8 @@ use crate::error::DbError;
 struct PendingBarrier {
     checkpoint_id: u64,
     sources_total: usize,
-    sources_aligned: std::collections::HashSet<usize>,
-    source_checkpoints: HashMap<String, SourceCheckpoint>,
+    sources_aligned: FxHashSet<usize>,
+    source_checkpoints: FxHashMap<String, SourceCheckpoint>,
     started_at: Instant,
 }
 
@@ -38,6 +38,10 @@ pub struct TpcPipelineCoordinator {
     shutdown: Arc<tokio::sync::Notify>,
     /// Pre-allocated drain buffer (reused each cycle, zero alloc).
     drain_buffer: Vec<TaggedOutput>,
+    /// Pre-allocated source batches buffer (cleared per cycle, not dropped).
+    source_batches_buf: FxHashMap<String, Vec<RecordBatch>>,
+    /// Pre-allocated barriers buffer (cleared per cycle, not dropped).
+    barriers_buf: Vec<(usize, CheckpointBarrier)>,
     /// Pending barrier alignment tracking.
     pending_barrier: Option<PendingBarrier>,
     /// Next checkpoint ID.
@@ -55,7 +59,7 @@ impl TpcPipelineCoordinator {
     pub fn new(
         sources: Vec<SourceRegistration>,
         config: PipelineConfig,
-        tpc_config: TpcConfig,
+        tpc_config: &TpcConfig,
         shutdown: Arc<tokio::sync::Notify>,
     ) -> Result<Self, DbError> {
         let mut runtime =
@@ -71,6 +75,8 @@ impl TpcPipelineCoordinator {
             runtime,
             shutdown,
             drain_buffer: Vec::with_capacity(4096),
+            source_batches_buf: FxHashMap::default(),
+            barriers_buf: Vec::new(),
             pending_barrier: None,
             next_checkpoint_id: 1,
             last_checkpoint: Instant::now(),
@@ -101,25 +107,28 @@ impl TpcPipelineCoordinator {
                 continue;
             }
 
-            // Phase 3: Convert TaggedOutput → HashMap<String, Vec<RecordBatch>>
+            // Phase 3: Convert TaggedOutput → FxHashMap<String, Vec<RecordBatch>>
             // Collect barriers separately to avoid borrow conflicts.
-            let mut source_batches: HashMap<String, Vec<RecordBatch>> = HashMap::new();
-            let mut barriers: Vec<(usize, CheckpointBarrier)> = Vec::new();
+            // Reuse pre-allocated buffers (cleared, not dropped).
+            self.source_batches_buf.clear();
+            self.barriers_buf.clear();
 
-            let outputs: Vec<TaggedOutput> = self.drain_buffer.drain(..).collect();
-            for tagged in outputs {
+            for tagged in self.drain_buffer.drain(..) {
                 match tagged.output {
                     Output::Event(event) => {
                         if tagged.source_idx < self.runtime.source_names().len() {
                             let name = self.runtime.source_names()[tagged.source_idx].clone();
                             callback.extract_watermark(&name, &event.data);
                             if let Some(filtered) = callback.filter_late_rows(&name, &event.data) {
-                                source_batches.entry(name).or_default().push(filtered);
+                                self.source_batches_buf
+                                    .entry(name)
+                                    .or_default()
+                                    .push(filtered);
                             }
                         }
                     }
                     Output::Barrier(barrier) => {
-                        barriers.push((tagged.source_idx, barrier));
+                        self.barriers_buf.push((tagged.source_idx, barrier));
                     }
                     _ => {
                         // Watermark, CheckpointComplete, LateEvent, etc.
@@ -127,16 +136,20 @@ impl TpcPipelineCoordinator {
                 }
             }
 
-            // Process barriers after drain is complete
-            for (source_idx, barrier) in barriers {
+            // Process barriers after drain is complete.
+            // Swap with empty to avoid borrow conflict with self.handle_barrier.
+            let mut barriers = std::mem::take(&mut self.barriers_buf);
+            for (source_idx, barrier) in barriers.drain(..) {
                 self.handle_barrier(source_idx, &barrier, &mut *callback)
                     .await;
             }
+            // Restore capacity for next cycle.
+            self.barriers_buf = barriers;
 
             // Phase 4: SQL cycle
-            if !source_batches.is_empty() {
+            if !self.source_batches_buf.is_empty() {
                 let wm = callback.current_watermark();
-                match callback.execute_cycle(&source_batches, wm).await {
+                match callback.execute_cycle(&self.source_batches_buf, wm).await {
                     Ok(results) => {
                         callback.push_to_streams(&results);
                         callback.write_to_sinks(&results).await;
@@ -187,8 +200,8 @@ impl TpcPipelineCoordinator {
         let pending = self.pending_barrier.get_or_insert_with(|| PendingBarrier {
             checkpoint_id: barrier.checkpoint_id,
             sources_total: self.runtime.num_sources(),
-            sources_aligned: std::collections::HashSet::new(),
-            source_checkpoints: HashMap::new(),
+            sources_aligned: FxHashSet::default(),
+            source_checkpoints: FxHashMap::default(),
             started_at: Instant::now(),
         });
 
@@ -257,8 +270,8 @@ mod tests {
         let pending = PendingBarrier {
             checkpoint_id: 1,
             sources_total: 3,
-            sources_aligned: std::collections::HashSet::new(),
-            source_checkpoints: HashMap::new(),
+            sources_aligned: FxHashSet::default(),
+            source_checkpoints: FxHashMap::default(),
             started_at: Instant::now(),
         };
         assert_eq!(pending.sources_total, 3);

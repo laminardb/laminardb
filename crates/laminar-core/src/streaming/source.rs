@@ -28,7 +28,7 @@
 //! ```
 
 use std::sync::atomic::{AtomicI64, AtomicU64, Ordering};
-use std::sync::{Arc, Mutex};
+use std::sync::{Arc, OnceLock};
 
 use arrow::array::RecordBatch;
 use arrow::datatypes::SchemaRef;
@@ -187,7 +187,7 @@ struct SourceInner<T: Record> {
 
     /// Event-time column name set via programmatic API.
     /// Read once at pipeline startup, not on the hot path.
-    event_time_column: Mutex<Option<String>>,
+    event_time_column: OnceLock<String>,
 }
 
 /// A streaming data source.
@@ -233,7 +233,7 @@ impl<T: Record> Source<T> {
             schema: schema.clone(),
             name: config.name,
             sequence: Arc::new(AtomicU64::new(0)),
-            event_time_column: Mutex::new(None),
+            event_time_column: OnceLock::new(),
         });
 
         let source = Self { inner };
@@ -477,21 +477,15 @@ impl<T: Record> Source<T> {
     /// When set, `source.watermark()` enables late-row filtering
     /// without a SQL `WATERMARK FOR` clause.
     ///
-    /// # Panics
-    ///
-    /// Panics if the internal mutex is poisoned.
+    /// Only the first call takes effect; subsequent calls are silently ignored.
     pub fn set_event_time_column(&self, column: &str) {
-        *self.inner.event_time_column.lock().unwrap() = Some(column.to_owned());
+        let _ = self.inner.event_time_column.set(column.to_owned());
     }
 
     /// Returns the configured event-time column, if any.
-    ///
-    /// # Panics
-    ///
-    /// Panics if the internal mutex is poisoned.
     #[must_use]
     pub fn event_time_column(&self) -> Option<String> {
-        self.inner.event_time_column.lock().unwrap().clone()
+        self.inner.event_time_column.get().cloned()
     }
 }
 
@@ -513,7 +507,11 @@ impl<T: Record> Clone for Source<T> {
         // Create new inner with cloned producer.
         // Sequence and watermark are shared across clones so the checkpoint
         // manager sees a single, consistent counter per logical source.
-        let event_time_col = self.inner.event_time_column.lock().unwrap().clone();
+        let event_time_col = self.inner.event_time_column.get().cloned();
+        let event_time_column = OnceLock::new();
+        if let Some(col) = event_time_col {
+            let _ = event_time_column.set(col);
+        }
         Self {
             inner: Arc::new(SourceInner {
                 producer,
@@ -521,7 +519,7 @@ impl<T: Record> Clone for Source<T> {
                 schema: Arc::clone(&self.inner.schema),
                 name: self.inner.name.clone(),
                 sequence: Arc::clone(&self.inner.sequence),
-                event_time_column: Mutex::new(event_time_col),
+                event_time_column,
             }),
         }
     }

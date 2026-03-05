@@ -7,6 +7,7 @@
 //! - **Full**: all rows in memory (default, unchanged behavior)
 //! - **Partial**: LRU cache of hot keys with xor filter for negative lookups
 //! - **None**: no caching, direct backend access (same as Full for in-memory)
+#![allow(clippy::disallowed_types)] // cold path
 
 use std::collections::HashMap;
 

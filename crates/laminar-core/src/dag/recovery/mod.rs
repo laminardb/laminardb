@@ -6,6 +6,8 @@
 //!
 //! [`DagRecoveryManager`] holds snapshots and provides recovery APIs.
 
+#![allow(clippy::disallowed_types)] // serde serialization requires std HashMap
+
 use std::collections::HashMap;
 
 use rustc_hash::FxHashMap;

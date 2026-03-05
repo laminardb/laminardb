@@ -6,6 +6,8 @@
 //! - Latest checkpoint metadata
 //! - Cluster epoch
 
+#![allow(clippy::disallowed_types)]
+// cold path: Raft state machine (serde + distributed coordination)
 use std::collections::HashMap;
 
 use serde::{Deserialize, Serialize};

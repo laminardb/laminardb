@@ -327,6 +327,7 @@ mod linux_impl {
     #[allow(clippy::manual_let_else, clippy::needless_return)]
     mod tests {
         use super::*;
+        #[allow(clippy::disallowed_types)] // cold path: WAL operations
         use std::collections::HashMap;
         use tempfile::tempdir;
 

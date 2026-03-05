@@ -14,6 +14,7 @@
 //! 5. Manifest persist — `store.save(&manifest)` (atomic write)
 //! 6. Sink commit — `sink.commit_epoch(epoch)` for each exactly-once sink
 //! 7. On ANY failure at 6 — `sink.rollback_epoch()` on remaining sinks
+#![allow(clippy::disallowed_types)] // cold path
 
 use std::collections::HashMap;
 use std::sync::Arc;
@@ -1666,7 +1667,7 @@ mod tests {
     fn test_dag_snapshot_to_manifest_operators() {
         use laminar_core::dag::recovery::SerializableOperatorState;
 
-        let mut node_states = std::collections::HashMap::new();
+        let mut node_states = HashMap::new();
         node_states.insert(
             0,
             SerializableOperatorState {
@@ -1718,7 +1719,7 @@ mod tests {
         use laminar_core::dag::recovery::SerializableOperatorState;
 
         // Original DAG states
-        let mut node_states = std::collections::HashMap::new();
+        let mut node_states = HashMap::new();
         node_states.insert(
             7,
             SerializableOperatorState {

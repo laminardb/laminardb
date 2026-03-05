@@ -17,6 +17,7 @@
 //! that supports all connector types (Kafka partitions, PostgreSQL LSNs, MySQL GTIDs)
 //! through string key-value pairs.
 
+#[allow(clippy::disallowed_types)] // cold path: manifest serialization
 use std::collections::HashMap;
 
 /// Per-sink commit status tracked during the checkpoint commit phase.

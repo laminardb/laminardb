@@ -3,6 +3,7 @@
 //! The `TpcRuntime` is the entry point for TPC mode. It spawns core threads,
 //! attaches source connectors via [`SourceIoThread`]s, and provides a unified
 //! interface for polling all core outboxes.
+#![allow(clippy::disallowed_types)] // cold path
 
 use std::sync::Arc;
 
@@ -18,8 +19,6 @@ use super::source_adapter::{SourceIoMetrics, SourceIoThread};
 
 /// Thread-per-core runtime managing N `CoreHandle`s and their source I/O threads.
 pub struct TpcRuntime {
-    #[allow(dead_code)] // Used in Phase 5 for key-spec routing
-    config: TpcConfig,
     cores: Vec<CoreHandle>,
     source_threads: Vec<SourceIoThread>,
     source_names: Vec<String>,
@@ -38,7 +37,7 @@ impl TpcRuntime {
     ///
     /// Returns an error if the configuration is invalid or core threads
     /// fail to spawn.
-    pub fn new(config: TpcConfig) -> Result<Self, TpcError> {
+    pub fn new(config: &TpcConfig) -> Result<Self, TpcError> {
         config.validate()?;
 
         let mut cores = Vec::with_capacity(config.num_cores);
@@ -62,7 +61,6 @@ impl TpcRuntime {
         }
 
         Ok(Self {
-            config,
             cores,
             source_threads: Vec::new(),
             source_names: Vec::new(),
@@ -199,7 +197,7 @@ mod tests {
             cpu_pinning: false,
             ..Default::default()
         };
-        let runtime = TpcRuntime::new(config).unwrap();
+        let runtime = TpcRuntime::new(&config).unwrap();
         assert_eq!(runtime.num_cores(), 2);
         assert_eq!(runtime.num_sources(), 0);
     }
@@ -210,7 +208,7 @@ mod tests {
             num_cores: 0,
             ..Default::default()
         };
-        assert!(TpcRuntime::new(config).is_err());
+        assert!(TpcRuntime::new(&config).is_err());
     }
 
     #[test]
@@ -220,7 +218,7 @@ mod tests {
             cpu_pinning: false,
             ..Default::default()
         };
-        let runtime = TpcRuntime::new(config).unwrap();
+        let runtime = TpcRuntime::new(&config).unwrap();
         let mut buffer = Vec::new();
         let count = runtime.poll_all_outputs(&mut buffer);
         assert_eq!(count, 0);
@@ -233,7 +231,7 @@ mod tests {
             cpu_pinning: false,
             ..Default::default()
         };
-        let runtime = TpcRuntime::new(config).unwrap();
+        let runtime = TpcRuntime::new(&config).unwrap();
         let debug = format!("{runtime:?}");
         assert!(debug.contains("TpcRuntime"));
         assert!(debug.contains("num_cores"));

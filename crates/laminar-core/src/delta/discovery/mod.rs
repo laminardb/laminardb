@@ -7,6 +7,7 @@
 //!
 //! - `StaticDiscovery`: Pre-configured seed list with TCP heartbeats
 //! - `GossipDiscovery`: Chitchat-based gossip protocol
+#![allow(clippy::disallowed_types)] // cold path: discovery metadata (serde + rkyv)
 
 mod static_discovery;
 pub use static_discovery::{StaticDiscovery, StaticDiscoveryConfig};

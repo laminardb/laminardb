@@ -225,7 +225,7 @@ fn bench_partition_routing(c: &mut Criterion) {
 
     // Benchmark group_by_node for batch routing
     let key_refs: Vec<&[u8]> = keys.iter().map(|k| k.as_slice()).collect();
-    let mut assignments = std::collections::HashMap::new();
+    let mut assignments = rustc_hash::FxHashMap::default();
     for pid in 0..256u32 {
         // Distribute across 3 nodes
         assignments.insert(pid, NodeId((pid as u64 % 3) + 1));

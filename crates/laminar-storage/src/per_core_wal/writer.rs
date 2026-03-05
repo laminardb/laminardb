@@ -279,6 +279,7 @@ impl CoreWalWriter {
     ///
     /// Returns an error if serialization or I/O fails.
     #[allow(clippy::cast_possible_truncation)] // core_id bounded by physical CPU count (< u16::MAX)
+    #[allow(clippy::disallowed_types)] // cold path: WAL coordination
     pub fn append_commit(
         &mut self,
         offsets: std::collections::HashMap<String, u64>,
@@ -486,6 +487,7 @@ mod tests {
     fn test_append_commit() {
         let (mut writer, _temp_dir) = create_temp_writer(0);
 
+        #[allow(clippy::disallowed_types)] // cold path: WAL coordination
         let mut offsets = std::collections::HashMap::new();
         offsets.insert("topic1".to_string(), 100);
 

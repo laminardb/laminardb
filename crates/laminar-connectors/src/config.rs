@@ -5,6 +5,7 @@
 //! - `ConfigKeySpec`: Specification for a configuration key
 //! - `ConnectorInfo`: Metadata about a connector implementation
 //! - `ConnectorState`: Lifecycle state of a running connector
+#![allow(clippy::disallowed_types)] // cold path: connector configuration
 
 use std::collections::HashMap;
 use std::fmt;

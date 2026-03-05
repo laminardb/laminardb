@@ -4,6 +4,7 @@
 //! the `LookupJoinRewriteRule` replaces the standard hash/merge join
 //! with a `LookupJoinNode` that uses the lookup source connector.
 
+#[allow(clippy::disallowed_types)] // cold path: query planning
 use std::collections::{HashMap, HashSet};
 use std::fmt;
 use std::sync::Arc;
@@ -327,6 +328,7 @@ mod tests {
                 pushdown_mode: PushdownMode::Auto,
             },
             arrow_schema,
+            #[allow(clippy::disallowed_types)] // cold path: query planning
             raw_options: std::collections::HashMap::new(),
         }
     }

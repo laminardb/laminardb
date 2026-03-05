@@ -4,6 +4,7 @@
 //! at the current epoch before processing events. The hot-path `check()`
 //! is a single `AtomicU64::load(Acquire)` — target < 10ns.
 
+#![allow(clippy::disallowed_types)] // cold path: partition guard management
 use std::collections::HashMap;
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::Arc;

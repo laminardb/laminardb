@@ -2,6 +2,7 @@
 //!
 //! Registers buffers once at startup to avoid per-operation buffer mapping overhead.
 //! Uses fixed-size buffers for predictable performance.
+#![allow(clippy::disallowed_types)] // cold path: buffer pool setup (io_uring infrastructure)
 
 use io_uring::types::Fd;
 use io_uring::{opcode, IoUring};
