@@ -206,8 +206,6 @@ impl CoreHandle {
             events_processed: Arc::clone(&events_processed),
             outputs_dropped: Arc::clone(&outputs_dropped),
             is_running: Arc::clone(&is_running),
-            #[cfg(all(target_os = "linux", feature = "io-uring"))]
-            io_uring_config: config.io_uring_config,
         };
 
         let thread = thread::Builder::new()
@@ -549,8 +547,6 @@ pub(super) struct CoreThreadContext {
     pub(super) events_processed: Arc<AtomicU64>,
     pub(super) outputs_dropped: Arc<AtomicU64>,
     pub(super) is_running: Arc<AtomicBool>,
-    #[cfg(all(target_os = "linux", feature = "io-uring"))]
-    io_uring_config: Option<IoUringConfig>,
 }
 
 /// Initializes the core thread: sets CPU affinity, NUMA allocator, `io_uring`, and creates the reactor.

@@ -187,6 +187,7 @@ pub enum WatermarkGateStatus {
 
 /// Checks watermark convergence for window completion.
 #[must_use]
+#[allow(clippy::implicit_hasher)] // intentionally requires FxHashMap for hot-path hashing
 pub fn check_watermark_gate(
     window_end: i64,
     node_watermarks: &FxHashMap<NodeId, i64>,

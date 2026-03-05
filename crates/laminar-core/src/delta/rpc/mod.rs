@@ -8,7 +8,8 @@
 //! - `RpcConnectionPool`: Lazy, cached gRPC channel pool
 //! - `RpcError`: Unified error type with gRPC status code mapping
 
-#[allow(clippy::disallowed_types)] // cold path: gRPC connection pool
+#![allow(clippy::disallowed_types)] // cold path: gRPC connection pool
+
 use std::collections::HashMap;
 use std::sync::Arc;
 use std::time::Duration;
