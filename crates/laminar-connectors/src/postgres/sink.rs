@@ -416,7 +416,7 @@ impl SinkConnector for PostgresSink {
             self.config.sink_id = self.config.effective_sink_id();
         }
 
-        // NOTE: In production, this is where we would:
+        // TODO(postgres-sink): When the `postgres-sink` feature is enabled:
         // 1. Create connection pool (deadpool-postgres)
         // 2. Verify connectivity
         // 3. Auto-create target table if configured

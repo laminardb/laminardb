@@ -47,18 +47,10 @@ pub mod resolver;
 pub mod traits;
 pub mod types;
 
-#[cfg(feature = "kafka")]
-pub mod avro;
-
 #[cfg(feature = "parquet-lookup")]
 pub mod parquet;
 
 // ── Re-exports for convenience ─────────────────────────────────────
-
-#[cfg(feature = "kafka")]
-pub use avro::{
-    avro_to_arrow_schema, avro_to_arrow_type, AvroDecoderMode, AvroFormatDecoder, AvroFormatEncoder,
-};
 pub use csv::{CsvDecoder, CsvDecoderConfig, FieldCountMismatchStrategy};
 pub use error::{SchemaError, SchemaResult};
 pub use evolution::{

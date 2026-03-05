@@ -13,9 +13,6 @@ pub mod cross_partition;
 /// Gossip-based partial aggregate replication across nodes.
 #[cfg(feature = "delta")]
 pub mod gossip_aggregates;
-/// gRPC aggregate fan-out across delta nodes.
-#[cfg(feature = "delta")]
-pub mod grpc_fanout;
 /// Two-phase cross-partition aggregation.
 pub mod two_phase;
 

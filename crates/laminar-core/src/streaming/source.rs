@@ -106,7 +106,8 @@ pub trait Record: Send + Sized + 'static {
         if batches.is_empty() {
             return RecordBatch::new_empty(Self::schema());
         }
-        arrow::compute::concat_batches(&Self::schema(), &batches).expect("concat failed")
+        arrow::compute::concat_batches(&Self::schema(), &batches)
+            .unwrap_or_else(|_| RecordBatch::new_empty(Self::schema()))
     }
 }
 

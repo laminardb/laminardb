@@ -134,7 +134,10 @@ impl<'a> ExprCompiler<'a> {
         self.jit.module().finalize_definitions().unwrap();
 
         let code_ptr = self.jit.module().get_finalized_function(func_id);
-        // SAFETY: The generated function has the declared ABI signature.
+        // SAFETY: `get_finalized_function` returns a pointer to machine code compiled by
+        // Cranelift with the ABI signature declared via `declare_function` (one i64 param,
+        // one i8 return). The pointer remains valid for the lifetime of the JIT module
+        // (held by `JitContext`), which outlives every compiled function reference.
         Ok(unsafe { std::mem::transmute::<*const u8, FilterFn>(code_ptr) })
     }
 
@@ -218,7 +221,10 @@ impl<'a> ExprCompiler<'a> {
         self.jit.module().finalize_definitions().unwrap();
 
         let code_ptr = self.jit.module().get_finalized_function(func_id);
-        // SAFETY: The generated function has the declared ABI signature.
+        // SAFETY: `get_finalized_function` returns a pointer to machine code compiled by
+        // Cranelift with the ABI signature declared via `declare_function` (two pointer
+        // params, one i8 return). The pointer remains valid for the lifetime of the JIT
+        // module (held by `JitContext`), which outlives every compiled function reference.
         Ok(unsafe { std::mem::transmute::<*const u8, ScalarFn>(code_ptr) })
     }
 }

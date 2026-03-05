@@ -17,8 +17,11 @@ use super::topk::{
 use super::{
     Event, Operator, OperatorContext, OperatorError, OperatorState, Output, OutputVec, Timer,
 };
-use arrow_array::{Array, Float64Array, Int64Array, StringArray, TimestampMicrosecondArray};
-use arrow_schema::DataType;
+use arrow_array::{
+    Array, Float64Array, Int64Array, StringArray, TimestampMicrosecondArray,
+    TimestampMillisecondArray, TimestampNanosecondArray, TimestampSecondArray,
+};
+use arrow_schema::{DataType, TimeUnit};
 use rustc_hash::FxHashMap;
 
 /// Window-local sort operator.
@@ -113,27 +116,56 @@ impl WindowLocalSortOperator {
 
             match array.data_type() {
                 DataType::Int64 => {
-                    let arr = array.as_any().downcast_ref::<Int64Array>().unwrap();
-                    encode_not_null(col_spec.nulls_first, col_spec.descending, &mut key);
-                    encode_i64(arr.value(0), col_spec.descending, &mut key);
+                    if let Some(arr) = array.as_any().downcast_ref::<Int64Array>() {
+                        encode_not_null(col_spec.nulls_first, col_spec.descending, &mut key);
+                        encode_i64(arr.value(0), col_spec.descending, &mut key);
+                    } else {
+                        encode_null(col_spec.nulls_first, col_spec.descending, &mut key);
+                    }
                 }
                 DataType::Float64 => {
-                    let arr = array.as_any().downcast_ref::<Float64Array>().unwrap();
-                    encode_not_null(col_spec.nulls_first, col_spec.descending, &mut key);
-                    encode_f64(arr.value(0), col_spec.descending, &mut key);
+                    if let Some(arr) = array.as_any().downcast_ref::<Float64Array>() {
+                        encode_not_null(col_spec.nulls_first, col_spec.descending, &mut key);
+                        encode_f64(arr.value(0), col_spec.descending, &mut key);
+                    } else {
+                        encode_null(col_spec.nulls_first, col_spec.descending, &mut key);
+                    }
                 }
                 DataType::Utf8 => {
-                    let arr = array.as_any().downcast_ref::<StringArray>().unwrap();
-                    encode_not_null(col_spec.nulls_first, col_spec.descending, &mut key);
-                    encode_utf8(arr.value(0), col_spec.descending, &mut key);
+                    if let Some(arr) = array.as_any().downcast_ref::<StringArray>() {
+                        encode_not_null(col_spec.nulls_first, col_spec.descending, &mut key);
+                        encode_utf8(arr.value(0), col_spec.descending, &mut key);
+                    } else {
+                        encode_null(col_spec.nulls_first, col_spec.descending, &mut key);
+                    }
                 }
-                DataType::Timestamp(_, _) => {
-                    let arr = array
-                        .as_any()
-                        .downcast_ref::<TimestampMicrosecondArray>()
-                        .unwrap();
-                    encode_not_null(col_spec.nulls_first, col_spec.descending, &mut key);
-                    encode_i64(arr.value(0), col_spec.descending, &mut key);
+                DataType::Timestamp(unit, _) => {
+                    // All Arrow timestamp arrays store i64 values internally.
+                    // Extract via the correct concrete type for the TimeUnit.
+                    let val = match unit {
+                        TimeUnit::Second => array
+                            .as_any()
+                            .downcast_ref::<TimestampSecondArray>()
+                            .map(|a| a.value(0)),
+                        TimeUnit::Millisecond => array
+                            .as_any()
+                            .downcast_ref::<TimestampMillisecondArray>()
+                            .map(|a| a.value(0)),
+                        TimeUnit::Microsecond => array
+                            .as_any()
+                            .downcast_ref::<TimestampMicrosecondArray>()
+                            .map(|a| a.value(0)),
+                        TimeUnit::Nanosecond => array
+                            .as_any()
+                            .downcast_ref::<TimestampNanosecondArray>()
+                            .map(|a| a.value(0)),
+                    };
+                    if let Some(v) = val {
+                        encode_not_null(col_spec.nulls_first, col_spec.descending, &mut key);
+                        encode_i64(v, col_spec.descending, &mut key);
+                    } else {
+                        encode_null(col_spec.nulls_first, col_spec.descending, &mut key);
+                    }
                 }
                 _ => {
                     encode_null(col_spec.nulls_first, col_spec.descending, &mut key);

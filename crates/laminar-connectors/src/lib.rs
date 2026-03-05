@@ -10,8 +10,7 @@
 //! - [`connector`] - Core traits (`SourceConnector`, `SinkConnector`)
 //! - [`serde`] - Serialization framework (JSON, CSV, Debezium)
 //! - [`registry`] - Factory pattern for connector instantiation
-//! - [`runtime`] - Lifecycle management
-//! - [`testing`] - Mock connectors and test utilities
+//! - `testing` - Mock connectors and test utilities (feature-gated)
 //!
 //! ## Architecture
 //!
@@ -83,10 +82,8 @@ pub mod schema;
 /// Connector registry with factory pattern.
 pub mod registry;
 
-/// Connector runtime for lifecycle management.
-pub mod runtime;
-
 /// Testing utilities (mock connectors, helpers).
+#[cfg(any(test, feature = "testing"))]
 pub mod testing;
 
 // ── Existing Modules ──

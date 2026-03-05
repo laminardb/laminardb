@@ -174,6 +174,7 @@ impl ConnectorConfig {
     ///
     /// Uses [`SecretMasker`](crate::storage::SecretMasker) to replace
     /// values of secret keys (passwords, access keys, tokens) with `"***"`.
+    #[cfg(test)]
     #[must_use]
     pub fn display_redacted(&self) -> String {
         use crate::storage::SecretMasker;
@@ -213,6 +214,17 @@ pub fn require_non_empty(value: &str, field_name: &str) -> Result<(), ConnectorE
         )));
     }
     Ok(())
+}
+
+/// Parses a port string into a `u16`.
+///
+/// # Errors
+///
+/// Returns `ConnectorError::ConfigurationError` if the value is not a valid port number.
+pub fn parse_port(value: &str) -> Result<u16, ConnectorError> {
+    value
+        .parse()
+        .map_err(|_| ConnectorError::ConfigurationError(format!("invalid port: '{value}'")))
 }
 
 /// Specification for a configuration key.

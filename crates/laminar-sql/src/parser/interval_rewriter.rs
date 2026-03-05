@@ -63,15 +63,15 @@ fn extract_interval_numeric(expr: &Expr) -> Option<i64> {
 ///
 /// Uses sqlparser's own parser to construct the AST node, ensuring
 /// correct internal representation.
-fn make_number_expr(n: i64) -> Expr {
+fn make_number_expr(n: i64) -> Option<Expr> {
     use sqlparser::dialect::GenericDialect;
     let s = n.to_string();
     let dialect = GenericDialect {};
     sqlparser::parser::Parser::new(&dialect)
         .try_with_sql(&s)
-        .expect("number literal should tokenize")
+        .ok()?
         .parse_expr()
-        .expect("number literal should parse as Expr")
+        .ok()
 }
 
 // ---------------------------------------------------------------------------
@@ -95,9 +95,11 @@ pub fn rewrite_expr_mut(expr: &mut Expr) {
             };
 
             if let Some(ms) = right_ms {
-                **right = make_number_expr(ms);
-                rewrite_expr_mut(left);
-                return;
+                if let Some(num_expr) = make_number_expr(ms) {
+                    **right = num_expr;
+                    rewrite_expr_mut(left);
+                    return;
+                }
             }
 
             // Check left side: INTERVAL + col → millis + col (only addition)
@@ -109,9 +111,11 @@ pub fn rewrite_expr_mut(expr: &mut Expr) {
                 };
 
                 if let Some(ms) = left_ms {
-                    **left = make_number_expr(ms);
-                    rewrite_expr_mut(right);
-                    return;
+                    if let Some(num_expr) = make_number_expr(ms) {
+                        **left = num_expr;
+                        rewrite_expr_mut(right);
+                        return;
+                    }
                 }
             }
         }

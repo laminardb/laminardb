@@ -111,6 +111,7 @@ pub struct WriteAheadLog {
     /// Current file position.
     position: u64,
     /// Whether to sync on every write (for testing).
+    #[cfg(test)]
     sync_on_write: bool,
     /// Pre-allocated write buffer reused across `append()` calls.
     /// Grows to high-water mark and stays, eliminating per-append allocation.
@@ -187,6 +188,7 @@ impl WriteAheadLog {
             sync_interval,
             last_sync: Instant::now(),
             position,
+            #[cfg(test)]
             sync_on_write: false,
             write_buffer: Vec::with_capacity(4096),
             serialize_buffer: AlignedVec::with_capacity(256),
@@ -194,6 +196,7 @@ impl WriteAheadLog {
     }
 
     /// Enable sync on every write (for testing).
+    #[cfg(test)]
     pub fn set_sync_on_write(&mut self, enabled: bool) {
         self.sync_on_write = enabled;
     }
@@ -251,7 +254,11 @@ impl WriteAheadLog {
         self.serialize_buffer = bytes;
 
         // Check if we need to sync (group commit)
-        if self.sync_on_write || self.last_sync.elapsed() >= self.sync_interval {
+        #[cfg(test)]
+        let force_sync = self.sync_on_write;
+        #[cfg(not(test))]
+        let force_sync = false;
+        if force_sync || self.last_sync.elapsed() >= self.sync_interval {
             self.sync()?;
         }
 

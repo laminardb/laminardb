@@ -2061,13 +2061,13 @@ impl DynAccumulator for SumF64Accumulator {
     }
 
     fn merge_dyn(&mut self, other: &dyn DynAccumulator) {
-        // Downcast via serialize/deserialize for safety
         let data = other.serialize();
-        if data.len() == 16 {
-            let sum = f64::from_le_bytes(data[..8].try_into().unwrap());
-            let count = u64::from_le_bytes(data[8..16].try_into().unwrap());
-            self.sum += sum;
-            self.count += count;
+        if let (Some(sum_bytes), Some(count_bytes)) = (
+            data.get(..8).and_then(|s| <[u8; 8]>::try_from(s).ok()),
+            data.get(8..16).and_then(|s| <[u8; 8]>::try_from(s).ok()),
+        ) {
+            self.sum += f64::from_le_bytes(sum_bytes);
+            self.count += u64::from_le_bytes(count_bytes);
         }
     }
 
@@ -2190,11 +2190,12 @@ impl DynAccumulator for SumF64IndexedAccumulator {
 
     fn merge_dyn(&mut self, other: &dyn DynAccumulator) {
         let data = other.serialize();
-        if data.len() >= 16 {
-            let sum = f64::from_le_bytes(data[..8].try_into().unwrap());
-            let count = u64::from_le_bytes(data[8..16].try_into().unwrap());
-            self.sum += sum;
-            self.count += count;
+        if let (Some(sum_bytes), Some(count_bytes)) = (
+            data.get(..8).and_then(|s| <[u8; 8]>::try_from(s).ok()),
+            data.get(8..16).and_then(|s| <[u8; 8]>::try_from(s).ok()),
+        ) {
+            self.sum += f64::from_le_bytes(sum_bytes);
+            self.count += u64::from_le_bytes(count_bytes);
         }
     }
 
@@ -2314,8 +2315,10 @@ impl DynAccumulator for MinF64IndexedAccumulator {
     fn merge_dyn(&mut self, other: &dyn DynAccumulator) {
         let data = other.serialize();
         if data.len() >= 9 && data[0] == 1 {
-            let other_min = f64::from_le_bytes(data[1..9].try_into().unwrap());
-            self.min = Some(self.min.map_or(other_min, |m: f64| m.min(other_min)));
+            if let Ok(bytes) = <[u8; 8]>::try_from(&data[1..9]) {
+                let other_min = f64::from_le_bytes(bytes);
+                self.min = Some(self.min.map_or(other_min, |m: f64| m.min(other_min)));
+            }
         }
     }
 
@@ -2436,8 +2439,10 @@ impl DynAccumulator for MaxF64IndexedAccumulator {
     fn merge_dyn(&mut self, other: &dyn DynAccumulator) {
         let data = other.serialize();
         if data.len() >= 9 && data[0] == 1 {
-            let other_max = f64::from_le_bytes(data[1..9].try_into().unwrap());
-            self.max = Some(self.max.map_or(other_max, |m: f64| m.max(other_max)));
+            if let Ok(bytes) = <[u8; 8]>::try_from(&data[1..9]) {
+                let other_max = f64::from_le_bytes(bytes);
+                self.max = Some(self.max.map_or(other_max, |m: f64| m.max(other_max)));
+            }
         }
     }
 
@@ -2561,11 +2566,12 @@ impl DynAccumulator for AvgF64IndexedAccumulator {
 
     fn merge_dyn(&mut self, other: &dyn DynAccumulator) {
         let data = other.serialize();
-        if data.len() >= 16 {
-            let sum = f64::from_le_bytes(data[..8].try_into().unwrap());
-            let count = u64::from_le_bytes(data[8..16].try_into().unwrap());
-            self.sum += sum;
-            self.count += count;
+        if let (Some(sum_bytes), Some(count_bytes)) = (
+            data.get(..8).and_then(|s| <[u8; 8]>::try_from(s).ok()),
+            data.get(8..16).and_then(|s| <[u8; 8]>::try_from(s).ok()),
+        ) {
+            self.sum += f64::from_le_bytes(sum_bytes);
+            self.count += u64::from_le_bytes(count_bytes);
         }
     }
 
@@ -2658,9 +2664,8 @@ impl DynAccumulator for CountDynAccumulator {
 
     fn merge_dyn(&mut self, other: &dyn DynAccumulator) {
         let data = other.serialize();
-        if data.len() >= 8 {
-            let count = u64::from_le_bytes(data[..8].try_into().unwrap());
-            self.count += count;
+        if let Some(bytes) = data.get(..8).and_then(|s| <[u8; 8]>::try_from(s).ok()) {
+            self.count += u64::from_le_bytes(bytes);
         }
     }
 
@@ -2811,8 +2816,14 @@ impl DynAccumulator for FirstValueF64DynAccumulator {
     fn merge_dyn(&mut self, other: &dyn DynAccumulator) {
         let data = other.serialize();
         if data.len() >= 17 && data[0] == 1 {
-            let other_val = f64::from_le_bytes(data[1..9].try_into().unwrap());
-            let other_ts = i64::from_le_bytes(data[9..17].try_into().unwrap());
+            let (Some(val_bytes), Some(ts_bytes)) = (
+                <[u8; 8]>::try_from(&data[1..9]).ok(),
+                <[u8; 8]>::try_from(&data[9..17]).ok(),
+            ) else {
+                return;
+            };
+            let other_val = f64::from_le_bytes(val_bytes);
+            let other_ts = i64::from_le_bytes(ts_bytes);
             match self.timestamp {
                 None => {
                     self.value = Some(other_val);
@@ -2981,8 +2992,14 @@ impl DynAccumulator for LastValueF64DynAccumulator {
     fn merge_dyn(&mut self, other: &dyn DynAccumulator) {
         let data = other.serialize();
         if data.len() >= 17 && data[0] == 1 {
-            let other_val = f64::from_le_bytes(data[1..9].try_into().unwrap());
-            let other_ts = i64::from_le_bytes(data[9..17].try_into().unwrap());
+            let (Some(val_bytes), Some(ts_bytes)) = (
+                <[u8; 8]>::try_from(&data[1..9]).ok(),
+                <[u8; 8]>::try_from(&data[9..17]).ok(),
+            ) else {
+                return;
+            };
+            let other_val = f64::from_le_bytes(val_bytes);
+            let other_ts = i64::from_le_bytes(ts_bytes);
             match self.timestamp {
                 None => {
                     self.value = Some(other_val);
@@ -3154,18 +3171,18 @@ impl CompositeAccumulator {
 
     /// Merges another composite accumulator into this one.
     ///
-    /// # Panics
+    /// # Errors
     ///
-    /// Panics if the other accumulator has a different number of sub-accumulators.
-    pub fn merge(&mut self, other: &Self) {
-        assert_eq!(
-            self.accumulators.len(),
-            other.accumulators.len(),
-            "Cannot merge composite accumulators with different sizes"
-        );
+    /// Returns an error if the accumulators have different numbers of
+    /// sub-accumulators (mismatched window definitions).
+    pub fn merge(&mut self, other: &Self) -> Result<(), &'static str> {
+        if self.accumulators.len() != other.accumulators.len() {
+            return Err("cannot merge composite accumulators with different sizes");
+        }
         for (self_acc, other_acc) in self.accumulators.iter_mut().zip(&other.accumulators) {
             self_acc.merge_dyn(other_acc.as_ref());
         }
+        Ok(())
     }
 
     /// Returns all results as [`ScalarResult`] values.

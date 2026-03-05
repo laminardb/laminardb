@@ -11,6 +11,7 @@
 //! - `Periodic` — re-snapshot on a timer.
 //! - `Manual` — no automatic loading; the user triggers refreshes.
 
+#[cfg(any(test, feature = "testing"))]
 use std::collections::VecDeque;
 use std::time::Duration;
 
@@ -95,6 +96,7 @@ pub trait ReferenceTableSource: Send {
 ///
 /// Configurable queues of snapshot and change batches. Tracks lifecycle flags
 /// (`snapshot_complete`, `restored`, `closed`) for test assertions.
+#[cfg(any(test, feature = "testing"))]
 pub struct MockReferenceTableSource {
     /// Snapshot batches to deliver (drained in order).
     pub snapshot_batches: VecDeque<RecordBatch>,
@@ -110,6 +112,7 @@ pub struct MockReferenceTableSource {
     pub mock_checkpoint: SourceCheckpoint,
 }
 
+#[cfg(any(test, feature = "testing"))]
 impl MockReferenceTableSource {
     /// Creates a new mock with the given snapshot and change batches.
     #[must_use]
@@ -131,6 +134,7 @@ impl MockReferenceTableSource {
     }
 }
 
+#[cfg(any(test, feature = "testing"))]
 #[async_trait::async_trait]
 impl ReferenceTableSource for MockReferenceTableSource {
     async fn poll_snapshot(&mut self) -> Result<Option<RecordBatch>, ConnectorError> {

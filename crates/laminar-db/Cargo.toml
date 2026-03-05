@@ -86,6 +86,7 @@ tracing = { workspace = true }
 tokio = { workspace = true, features = ["test-util", "macros"] }
 tempfile = { workspace = true }
 laminar-derive = { path = "../laminar-derive", version = "0.18.0" }
+laminar-connectors = { path = "../laminar-connectors", version = "0.18.0", features = ["testing"] }
 criterion = { workspace = true }
 
 [[bench]]

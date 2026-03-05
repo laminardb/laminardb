@@ -147,8 +147,9 @@ impl StorageCredentialResolver {
 
     /// Resolves credentials using a custom environment lookup function.
     ///
-    /// This is primarily for testing — allows injecting env var values
-    /// without mutating the actual process environment.
+    /// Allows injecting env var values without mutating the actual
+    /// process environment.
+    #[cfg(test)]
     #[must_use]
     pub fn resolve_with_env<F>(
         table_path: &str,

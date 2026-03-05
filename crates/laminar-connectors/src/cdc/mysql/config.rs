@@ -156,9 +156,7 @@ impl MySqlCdcConfig {
         };
 
         if let Some(port) = config.get("port") {
-            cfg.port = port
-                .parse()
-                .map_err(|_| ConnectorError::ConfigurationError(format!("invalid port: {port}")))?;
+            cfg.port = crate::config::parse_port(port)?;
         }
         cfg.database = config.get("database").map(String::from);
         cfg.password = config.get("password").map(String::from);

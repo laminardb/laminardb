@@ -6,7 +6,9 @@
 use super::error::MvError;
 use super::registry::MvRegistry;
 use super::watermark::CascadingWatermarkTracker;
-use crate::operator::{Event, Operator, OperatorContext, OperatorState, Output, OutputVec};
+#[cfg(test)]
+use crate::operator::OutputVec;
+use crate::operator::{Event, Operator, OperatorContext, OperatorState, Output};
 use rustc_hash::FxHashMap;
 use std::collections::VecDeque;
 use std::sync::Arc;
@@ -387,21 +389,20 @@ impl MvPipelineExecutor {
     }
 }
 
-/// A simple pass-through operator for testing.
+#[cfg(test)]
 #[derive(Debug, Clone)]
 pub struct PassThroughOperator {
-    /// Operator ID for checkpointing.
     pub id: String,
 }
 
+#[cfg(test)]
 impl PassThroughOperator {
-    /// Creates a new pass-through operator.
-    #[must_use]
     pub fn new(id: impl Into<String>) -> Self {
         Self { id: id.into() }
     }
 }
 
+#[cfg(test)]
 impl Operator for PassThroughOperator {
     fn process(&mut self, event: &Event, _ctx: &mut OperatorContext) -> OutputVec {
         let mut outputs = OutputVec::new();

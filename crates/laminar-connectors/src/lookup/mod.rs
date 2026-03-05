@@ -32,22 +32,6 @@
 //!
 //! - `InMemoryTableLoader` - For testing and static reference data
 //! - Redis, PostgreSQL, HTTP loaders
-//!
-//! ## Example
-//!
-//! ```rust,no_run
-//! use laminar_connectors::lookup::{TableLoader, InMemoryTableLoader, LookupResult};
-//! use arrow_array::RecordBatch;
-//!
-//! // Create an in-memory lookup table
-//! let mut loader = InMemoryTableLoader::new();
-//! // loader.insert(b"customer_1".to_vec(), batch);
-//!
-//! // Use with LookupJoinOperator in laminar-core
-//! ```
-
-/// CDC-to-cache adapter for lookup table refresh.
-pub mod cdc_adapter;
 
 /// PostgreSQL lookup source with connection pooling and predicate pushdown.
 #[cfg(feature = "postgres-cdc")]
@@ -65,8 +49,6 @@ pub use parquet_source::{ParquetLookupSource, ParquetLookupSourceConfig};
 
 use arrow_array::RecordBatch;
 use async_trait::async_trait;
-use rustc_hash::FxHashMap;
-use std::sync::Arc;
 use thiserror::Error;
 
 /// Errors that can occur during table lookup operations.
@@ -197,139 +179,6 @@ pub trait TableLoader: Send + Sync {
     }
 }
 
-/// In-memory table loader for testing and static reference data.
-///
-/// This implementation stores all data in memory using a `HashMap`.
-/// Suitable for:
-/// - Testing lookup join operators
-/// - Small, static reference tables
-/// - Development and prototyping
-///
-/// # Example
-///
-/// ```rust
-/// use laminar_connectors::lookup::InMemoryTableLoader;
-/// use arrow_array::{RecordBatch, StringArray, Int64Array};
-/// use arrow_schema::{Schema, Field, DataType};
-/// use std::sync::Arc;
-///
-/// // Create loader with customer data
-/// let mut loader = InMemoryTableLoader::new();
-///
-/// let schema = Arc::new(Schema::new(vec![
-///     Field::new("customer_id", DataType::Utf8, false),
-///     Field::new("name", DataType::Utf8, false),
-///     Field::new("tier", DataType::Utf8, false),
-/// ]));
-///
-/// let batch = RecordBatch::try_new(
-///     schema,
-///     vec![
-///         Arc::new(StringArray::from(vec!["cust_1"])),
-///         Arc::new(StringArray::from(vec!["Alice"])),
-///         Arc::new(StringArray::from(vec!["gold"])),
-///     ],
-/// ).unwrap();
-///
-/// loader.insert(b"cust_1".to_vec(), batch);
-/// ```
-#[derive(Debug, Clone)]
-pub struct InMemoryTableLoader {
-    /// The underlying data store.
-    data: Arc<parking_lot::RwLock<FxHashMap<Vec<u8>, RecordBatch>>>,
-    /// Name for logging.
-    name: String,
-}
-
-impl InMemoryTableLoader {
-    /// Creates a new empty in-memory table loader.
-    #[must_use]
-    pub fn new() -> Self {
-        Self::with_name("in_memory")
-    }
-
-    /// Creates a new empty in-memory table loader with a custom name.
-    #[must_use]
-    pub fn with_name(name: impl Into<String>) -> Self {
-        Self {
-            data: Arc::new(parking_lot::RwLock::new(FxHashMap::default())),
-            name: name.into(),
-        }
-    }
-
-    /// Creates a new in-memory table loader from existing data.
-    #[must_use]
-    pub fn from_map(data: FxHashMap<Vec<u8>, RecordBatch>) -> Self {
-        Self {
-            data: Arc::new(parking_lot::RwLock::new(data)),
-            name: "in_memory".to_string(),
-        }
-    }
-
-    /// Inserts a key-value pair into the table.
-    pub fn insert(&self, key: Vec<u8>, value: RecordBatch) {
-        self.data.write().insert(key, value);
-    }
-
-    /// Removes a key from the table.
-    ///
-    /// Returns the previous value if the key existed.
-    #[must_use]
-    pub fn remove(&self, key: &[u8]) -> Option<RecordBatch> {
-        self.data.write().remove(key)
-    }
-
-    /// Returns the number of entries in the table.
-    #[must_use]
-    pub fn len(&self) -> usize {
-        self.data.read().len()
-    }
-
-    /// Returns `true` if the table is empty.
-    #[must_use]
-    pub fn is_empty(&self) -> bool {
-        self.data.read().is_empty()
-    }
-
-    /// Clears all entries from the table.
-    pub fn clear(&self) {
-        self.data.write().clear();
-    }
-}
-
-impl Default for InMemoryTableLoader {
-    fn default() -> Self {
-        Self::new()
-    }
-}
-
-#[async_trait]
-impl TableLoader for InMemoryTableLoader {
-    async fn lookup(&self, key: &[u8]) -> Result<LookupResult, LookupError> {
-        let data = self.data.read();
-        match data.get(key) {
-            Some(batch) => Ok(LookupResult::Found(batch.clone())),
-            None => Ok(LookupResult::NotFound),
-        }
-    }
-
-    async fn lookup_batch(&self, keys: &[&[u8]]) -> Result<Vec<LookupResult>, LookupError> {
-        let data = self.data.read();
-        let results = keys
-            .iter()
-            .map(|key| match data.get(*key) {
-                Some(batch) => LookupResult::Found(batch.clone()),
-                None => LookupResult::NotFound,
-            })
-            .collect();
-        Ok(results)
-    }
-
-    fn name(&self) -> &str {
-        &self.name
-    }
-}
-
 /// A no-op table loader that always returns `NotFound`.
 ///
 /// Useful for testing the lookup join operator without an actual data source.
@@ -357,10 +206,80 @@ impl TableLoader for NoOpTableLoader {
 }
 
 #[cfg(test)]
+#[derive(Debug, Clone)]
+pub(crate) struct InMemoryTableLoader {
+    data: std::sync::Arc<parking_lot::RwLock<rustc_hash::FxHashMap<Vec<u8>, RecordBatch>>>,
+    name: String,
+}
+
+#[cfg(test)]
+impl InMemoryTableLoader {
+    pub fn new() -> Self {
+        Self::with_name("in_memory")
+    }
+
+    pub fn with_name(name: impl Into<String>) -> Self {
+        Self {
+            data: std::sync::Arc::new(parking_lot::RwLock::new(rustc_hash::FxHashMap::default())),
+            name: name.into(),
+        }
+    }
+
+    pub fn insert(&self, key: Vec<u8>, value: RecordBatch) {
+        self.data.write().insert(key, value);
+    }
+
+    pub fn remove(&self, key: &[u8]) -> Option<RecordBatch> {
+        self.data.write().remove(key)
+    }
+
+    pub fn len(&self) -> usize {
+        self.data.read().len()
+    }
+
+    pub fn is_empty(&self) -> bool {
+        self.data.read().is_empty()
+    }
+
+    pub fn clear(&self) {
+        self.data.write().clear();
+    }
+}
+
+#[cfg(test)]
+#[async_trait]
+impl TableLoader for InMemoryTableLoader {
+    async fn lookup(&self, key: &[u8]) -> Result<LookupResult, LookupError> {
+        let data = self.data.read();
+        match data.get(key) {
+            Some(batch) => Ok(LookupResult::Found(batch.clone())),
+            None => Ok(LookupResult::NotFound),
+        }
+    }
+
+    async fn lookup_batch(&self, keys: &[&[u8]]) -> Result<Vec<LookupResult>, LookupError> {
+        let data = self.data.read();
+        let results = keys
+            .iter()
+            .map(|key| match data.get(*key) {
+                Some(batch) => LookupResult::Found(batch.clone()),
+                None => LookupResult::NotFound,
+            })
+            .collect();
+        Ok(results)
+    }
+
+    fn name(&self) -> &str {
+        &self.name
+    }
+}
+
+#[cfg(test)]
 mod tests {
     use super::*;
     use arrow_array::StringArray;
     use arrow_schema::{DataType, Field, Schema};
+    use std::sync::Arc;
 
     fn create_customer_batch(id: &str, name: &str, tier: &str) -> RecordBatch {
         let schema = Arc::new(Schema::new(vec![

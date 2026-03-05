@@ -27,9 +27,7 @@ use std::time::{Duration, Instant};
 
 use crate::alloc::HotPathGuard;
 use crate::budget::TaskBudget;
-use crate::operator::{
-    CheckpointCompleteData, Event, Operator, OperatorContext, OperatorState, Output, SideOutputData,
-};
+use crate::operator::{Event, Operator, OperatorContext, OperatorState, Output};
 use crate::state::{AHashMapStore, StateStore};
 use crate::time::{BoundedOutOfOrdernessGenerator, TimerService, WatermarkGenerator};
 
@@ -382,6 +380,16 @@ impl Reactor {
         self.operators.iter().map(|op| op.checkpoint()).collect()
     }
 
+    /// Triggers a checkpoint, appending operator states into a reusable buffer.
+    ///
+    /// Like [`trigger_checkpoint`](Self::trigger_checkpoint) but avoids
+    /// allocating a new `Vec` on every call — the caller provides a buffer
+    /// whose capacity is reused across checkpoint cycles.
+    pub fn trigger_checkpoint_into(&mut self, buf: &mut Vec<OperatorState>) {
+        buf.clear();
+        buf.extend(self.operators.iter().map(|op| op.checkpoint()));
+    }
+
     /// Get current processing time in microseconds since reactor start
     #[allow(clippy::cast_possible_truncation)] // Saturating conversion handles overflow on next line
     fn get_processing_time(&self) -> i64 {
@@ -575,9 +583,14 @@ pub enum ReactorError {
     },
 }
 
+#[cfg(test)]
+use crate::operator::{CheckpointCompleteData, SideOutputData};
+
+#[cfg(test)]
 /// A simple sink that writes outputs to stdout (for testing).
 pub struct StdoutSink;
 
+#[cfg(test)]
 impl Sink for StdoutSink {
     fn write(&mut self, outputs: &mut Vec<Output>) -> Result<(), SinkError> {
         for output in outputs.drain(..) {
@@ -640,12 +653,14 @@ impl Sink for StdoutSink {
     }
 }
 
+#[cfg(test)]
 /// A buffering sink that collects outputs (for testing).
 #[derive(Default)]
 pub struct BufferingSink {
     buffer: Vec<Output>,
 }
 
+#[cfg(test)]
 impl BufferingSink {
     /// Create a new buffering sink.
     #[must_use]
@@ -660,6 +675,7 @@ impl BufferingSink {
     }
 }
 
+#[cfg(test)]
 impl Sink for BufferingSink {
     fn write(&mut self, outputs: &mut Vec<Output>) -> Result<(), SinkError> {
         self.buffer.append(outputs);

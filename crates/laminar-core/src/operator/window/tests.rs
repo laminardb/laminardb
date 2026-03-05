@@ -1712,7 +1712,7 @@ fn test_composite_accumulator_merge() {
     let mut acc2 = acc2_holder;
     acc2.add_event(&make_f64_event(&[3.0, 4.0]));
 
-    acc1.merge(&acc2);
+    acc1.merge(&acc2).unwrap();
     let results = acc1.results();
     assert_eq!(results[0], ScalarResult::Int64(4));
     match &results[1] {

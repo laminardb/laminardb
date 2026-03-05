@@ -65,6 +65,7 @@ mod linux_impl {
         /// Last sync time.
         last_sync: Instant,
         /// Whether to sync on every write (for testing).
+        #[cfg(test)]
         sync_on_write: bool,
         /// Records written since last sync.
         records_since_sync: u64,
@@ -123,12 +124,14 @@ mod linux_impl {
                 pending_writes: VecDeque::new(),
                 sync_interval,
                 last_sync: Instant::now(),
+                #[cfg(test)]
                 sync_on_write: false,
                 records_since_sync: 0,
             })
         }
 
         /// Enable sync on every write (for testing).
+        #[cfg(test)]
         pub fn set_sync_on_write(&mut self, enabled: bool) {
             self.sync_on_write = enabled;
         }
@@ -191,7 +194,11 @@ mod linux_impl {
                 .map_err(|e| WalError::Io(io::Error::other(e.to_string())))?;
 
             // Check if we need to sync
-            if self.sync_on_write || self.last_sync.elapsed() >= self.sync_interval {
+            #[cfg(test)]
+            let force_sync = self.sync_on_write;
+            #[cfg(not(test))]
+            let force_sync = false;
+            if force_sync || self.last_sync.elapsed() >= self.sync_interval {
                 self.sync()?;
             }
 

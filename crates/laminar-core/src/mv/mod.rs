@@ -30,8 +30,8 @@
 //!
 //! ## Example: Cascading OHLC Bars
 //!
-//! ```rust
-//! use laminar_core::mv::{MvRegistry, MaterializedView, MvPipelineExecutor, PassThroughOperator};
+//! ```rust,ignore
+//! use laminar_core::mv::{MvRegistry, MaterializedView, MvPipelineExecutor};
 //! use arrow_schema::{Schema, Field, DataType};
 //! use std::sync::Arc;
 //!
@@ -175,9 +175,7 @@ mod registry;
 pub mod watermark;
 
 pub use error::{MvError, MvState};
-pub use executor::{
-    MvPipelineCheckpoint, MvPipelineExecutor, PassThroughOperator, PipelineMetrics,
-};
+pub use executor::{MvPipelineCheckpoint, MvPipelineExecutor, PipelineMetrics};
 pub use registry::{MaterializedView, MvRegistry};
 pub use watermark::{CascadingWatermarkTracker, WatermarkTrackerCheckpoint};
 
@@ -185,6 +183,7 @@ pub use watermark::{CascadingWatermarkTracker, WatermarkTrackerCheckpoint};
 #[allow(clippy::similar_names)]
 mod tests {
     use super::*;
+    use crate::mv::executor::PassThroughOperator;
     use crate::operator::{Event, OperatorContext};
     use crate::state::InMemoryStore;
     use crate::time::{BoundedOutOfOrdernessGenerator, TimerService};

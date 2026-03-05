@@ -1,23 +1,12 @@
 //! # gRPC Inter-Node Communication
 //!
-//! Provides the gRPC service implementations and connection pool for
+//! Provides the connection pool and error types for
 //! inter-node communication in the delta.
-//!
-//! ## Services
-//!
-//! - `LookupService` (`lookup_service`): Remote lookup table queries
-//! - `BarrierService` (`barrier_service`): Checkpoint barrier forwarding
 //!
 //! ## Infrastructure
 //!
 //! - `RpcConnectionPool`: Lazy, cached gRPC channel pool
 //! - `RpcError`: Unified error type with gRPC status code mapping
-
-/// Remote lookup service implementation.
-pub mod lookup_service;
-
-/// Barrier forwarding service implementation.
-pub mod barrier_service;
 
 use std::collections::HashMap;
 use std::sync::Arc;
