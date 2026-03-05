@@ -46,8 +46,8 @@ pub use arrow_ffi::{
 };
 pub use callback::{
     laminar_subscribe_callback, laminar_subscription_cancel, laminar_subscription_free,
-    laminar_subscription_is_active, laminar_subscription_user_data, LaminarCompletionCallback,
-    LaminarErrorCallback, LaminarSubscriptionCallback, LaminarSubscriptionHandle,
+    laminar_subscription_is_active, laminar_subscription_user_data, LaminarErrorCallback,
+    LaminarSubscriptionCallback, LaminarSubscriptionHandle,
     LAMINAR_EVENT_DELETE, LAMINAR_EVENT_INSERT, LAMINAR_EVENT_SNAPSHOT, LAMINAR_EVENT_UPDATE,
     LAMINAR_EVENT_WATERMARK,
 };
