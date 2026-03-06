@@ -49,3 +49,9 @@ data/
 checkpoints/
 wal/
 /tools
+
+# Private configs (symlinked from private repo)
+CLAUDE.md
+.claude/
+docs/features/
+docs/research/

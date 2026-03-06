@@ -168,14 +168,6 @@ test(connectors): add Kafka exactly-once integration test
 chore(deps): update arrow to 57.2
 ```
 
-## Feature Specifications
-
-Each feature has a specification document in `docs/features/`. If you're implementing a new feature:
-
-1. Check the [Feature Index](docs/features/INDEX.md) for existing specs
-2. For new features, create a spec using `/new-feature` or follow the template in `docs/features/`
-3. Reference the feature ID (e.g., F025) in commits and PR titles
-
 ## Architecture Decisions
 
 Significant architectural changes are documented as ADRs (Architecture Decision Records) in `docs/adr/`. If your change involves a design decision with multiple valid approaches, create an ADR first.
