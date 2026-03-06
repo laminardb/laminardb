@@ -363,11 +363,11 @@ impl PostgresSink {
         }
     }
 
-    /// Flushes the internal buffer by writing to PostgreSQL.
+    /// Flushes the internal buffer by writing to `PostgreSQL`.
     ///
     /// # Errors
     ///
-    /// Returns `ConnectorError::UnsupportedOperation` because the PostgreSQL
+    /// Returns `ConnectorError::UnsupportedOperation` because the `PostgreSQL`
     /// write path requires `tokio-postgres` which is not yet wired. Enable
     /// the `postgres-sink` feature once the implementation is complete.
     #[allow(clippy::unused_self)] // will use self when tokio-postgres is wired
@@ -454,10 +454,10 @@ impl SinkConnector for PostgresSink {
     async fn begin_epoch(&mut self, epoch: u64) -> Result<(), ConnectorError> {
         self.current_epoch = epoch;
 
-        if self.config.delivery_guarantee == DeliveryGuarantee::ExactlyOnce {
-            if !self.buffer.is_empty() {
-                self.flush_buffer_local()?;
-            }
+        if self.config.delivery_guarantee == DeliveryGuarantee::ExactlyOnce
+            && !self.buffer.is_empty()
+        {
+            self.flush_buffer_local()?;
         }
 
         debug!(epoch, "PostgreSQL sink epoch started");
