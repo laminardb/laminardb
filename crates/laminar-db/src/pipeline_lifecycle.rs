@@ -566,6 +566,24 @@ impl LaminarDB {
                      are degraded to at-most-once for this source"
                 );
             }
+
+            // Auto-wire event_time_column for CDC sources so downstream
+            // windowed aggregations receive watermark progress without
+            // requiring a SQL WATERMARK clause. The CDC envelope always
+            // contains _ts_ms (commit timestamp in milliseconds).
+            if let Some(entry) = self.catalog.get_source(name) {
+                if entry.source.event_time_column().is_none() {
+                    let ct = config.connector_type().to_lowercase();
+                    if ct == "postgres-cdc" || ct == "mysql-cdc" {
+                        entry.source.set_event_time_column("_ts_ms");
+                    }
+                    // Also honor explicit event.time.column from WITH clause
+                    if let Some(col) = config.get("event.time.column") {
+                        entry.source.set_event_time_column(col);
+                    }
+                }
+            }
+
             sources.push(SourceRegistration {
                 name: name.clone(),
                 connector: source,
