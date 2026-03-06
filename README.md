@@ -635,7 +635,7 @@ Active development. Current phase progress:
 | Perf Optimization | Architectural improvements | 0/12 | Planned |
 | **Total** | | **189/249** | **76%** |
 
-See [docs/features/INDEX.md](docs/features/INDEX.md) for the full feature tracking breakdown and [docs/ROADMAP.md](docs/ROADMAP.md) for the phase timeline.
+See [docs/ROADMAP.md](docs/ROADMAP.md) for the phase timeline.
 
 ---
 
@@ -715,7 +715,6 @@ cargo bench
 - [Architecture Guide](docs/ARCHITECTURE.md) -- Three-ring design, data flow, state management
 - [SQL Reference](docs/SQL_REFERENCE.md) -- Streaming SQL dialect, gotchas, tested patterns
 - [Development Roadmap](docs/ROADMAP.md) -- Phases, milestones, and feature status
-- [Feature Index](docs/features/INDEX.md) -- All 249 features with specifications
 - [Contributing Guide](CONTRIBUTING.md) -- How to build, test, and submit PRs
 - [API Reference](https://docs.rs/laminar-db) -- Rustdoc API documentation
 

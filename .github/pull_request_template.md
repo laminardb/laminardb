@@ -27,4 +27,3 @@
 
 - [ ] Public APIs are documented
 - [ ] Breaking changes documented (if any)
-- [ ] Feature spec updated in `docs/features/` (if applicable)
