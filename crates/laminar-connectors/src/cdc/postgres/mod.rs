@@ -113,6 +113,12 @@ fn postgres_cdc_config_keys() -> Vec<ConfigKeySpec> {
         ConfigKeySpec::optional("ssl.sni.hostname", "SNI hostname for SSL connections", ""),
         // Replication start position
         ConfigKeySpec::optional("start.lsn", "Starting LSN for replication", ""),
+        // Watermark
+        ConfigKeySpec::optional(
+            "event.time.column",
+            "Column for watermark extraction (default: _ts_ms)",
+            "_ts_ms",
+        ),
     ]
 }
 

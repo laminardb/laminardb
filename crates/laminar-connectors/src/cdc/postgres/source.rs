@@ -631,11 +631,9 @@ impl SourceConnector for PostgresCdcSource {
         self.process_pending_messages()?;
 
         // Drain buffered events into a RecordBatch.
-        // Watermark advancement: the batch contains `_ts_ms` (commit timestamp)
-        // which downstream pipeline watermark extractors should use. The LSN
-        // in PartitionInfo tracks replication progress for offset management.
-        // TODO: extract max(_ts_ms) and expose as source-level watermark for
-        // windowed aggregations that depend on CDC event time.
+        // Watermark: the pipeline auto-wires _ts_ms as event time column for
+        // CDC sources, so SourceWatermarkState extracts max(_ts_ms) per batch.
+        // The LSN in PartitionInfo tracks replication progress for offsets.
         match self.drain_events(max_records)? {
             Some(batch) => {
                 let lsn_str = self.write_lsn.to_string();
