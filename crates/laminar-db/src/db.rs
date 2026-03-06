@@ -1516,8 +1516,6 @@ impl LaminarDB {
             .checkpoint(
                 HashMap::new(),
                 None,
-                0,
-                Vec::new(),
                 None,
                 HashMap::new(),
                 None,

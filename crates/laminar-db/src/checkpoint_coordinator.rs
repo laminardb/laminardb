@@ -579,8 +579,6 @@ impl CheckpointCoordinator {
         &mut self,
         operator_states: HashMap<String, Vec<u8>>,
         watermark: Option<i64>,
-        wal_position: u64,
-        per_core_wal_positions: Vec<u64>,
         table_store_checkpoint_path: Option<String>,
         source_watermarks: HashMap<String, i64>,
         pipeline_hash: Option<u64>,
@@ -588,8 +586,6 @@ impl CheckpointCoordinator {
         self.checkpoint_inner(
             operator_states,
             watermark,
-            wal_position,
-            per_core_wal_positions,
             table_store_checkpoint_path,
             HashMap::new(),
             source_watermarks,
@@ -955,8 +951,6 @@ impl CheckpointCoordinator {
         &mut self,
         operator_states: HashMap<String, Vec<u8>>,
         watermark: Option<i64>,
-        wal_position: u64,
-        per_core_wal_positions: Vec<u64>,
         table_store_checkpoint_path: Option<String>,
         extra_table_offsets: HashMap<String, ConnectorCheckpoint>,
         source_watermarks: HashMap<String, i64>,
@@ -965,8 +959,6 @@ impl CheckpointCoordinator {
         self.checkpoint_inner(
             operator_states,
             watermark,
-            wal_position,
-            per_core_wal_positions,
             table_store_checkpoint_path,
             extra_table_offsets,
             source_watermarks,
@@ -977,13 +969,16 @@ impl CheckpointCoordinator {
 
     /// Shared checkpoint implementation for both [`checkpoint()`](Self::checkpoint)
     /// and [`checkpoint_with_extra_tables()`](Self::checkpoint_with_extra_tables).
+    ///
+    /// WAL preparation is performed internally to guarantee atomicity:
+    /// changelog drain + epoch barrier + WAL sync happen after operator
+    /// states are received, so the WAL positions in the manifest always
+    /// reflect the state after the operator snapshot.
     #[allow(clippy::too_many_arguments, clippy::too_many_lines)]
     async fn checkpoint_inner(
         &mut self,
         operator_states: HashMap<String, Vec<u8>>,
         watermark: Option<i64>,
-        wal_position: u64,
-        per_core_wal_positions: Vec<u64>,
         table_store_checkpoint_path: Option<String>,
         extra_table_offsets: HashMap<String, ConnectorCheckpoint>,
         source_watermarks: HashMap<String, i64>,
@@ -995,16 +990,12 @@ impl CheckpointCoordinator {
 
         info!(checkpoint_id, epoch, "starting checkpoint");
 
-        // ── Step 2b: Defense-in-depth changelog drain ──
-        // Flush any straggler changelog entries that arrived between
-        // prepare_wal_for_checkpoint() and this call. This ensures the
-        // operator state snapshot and source offsets are consistent.
-        for drainer in &mut self.changelog_drainers {
-            let extra = drainer.drain();
-            if extra > 0 {
-                debug!(extra_drained = extra, "drained straggler changelog entries");
-            }
-        }
+        // ── Step 2b: WAL preparation (internal) ──
+        // Drain changelog, write epoch barriers, sync WAL, capture positions.
+        // This MUST happen after operator states are received (passed as args)
+        // to guarantee WAL positions reflect post-snapshot state.
+        let wal_result = self.prepare_wal_for_checkpoint()?;
+        let per_core_wal_positions = wal_result.per_core_wal_positions;
 
         // ── Step 3: Source snapshot (parallel) ──
         self.phase = CheckpointPhase::Snapshotting;
@@ -1049,7 +1040,7 @@ impl CheckpointCoordinator {
         // manifest.watermark. Do NOT fabricate per-source values from the
         // global watermark, as that loses granularity on recovery.
         manifest.source_watermarks = source_watermarks;
-        manifest.wal_position = wal_position;
+        // wal_position is legacy (single-writer mode); per-core positions are authoritative.
         manifest.per_core_wal_positions = per_core_wal_positions;
         manifest.table_store_checkpoint_path = table_store_checkpoint_path;
         manifest.is_incremental = self.config.incremental;
@@ -1564,8 +1555,6 @@ mod tests {
             .checkpoint(
                 HashMap::new(),
                 Some(1000),
-                0,
-                vec![],
                 None,
                 HashMap::new(),
                 None,
@@ -1588,8 +1577,6 @@ mod tests {
             .checkpoint(
                 HashMap::new(),
                 Some(2000),
-                100,
-                vec![],
                 None,
                 HashMap::new(),
                 None,
@@ -1616,7 +1603,7 @@ mod tests {
         ops.insert("filter".into(), b"filter-state".to_vec());
 
         let result = coord
-            .checkpoint(ops, None, 4096, vec![100, 200], None, HashMap::new(), None)
+            .checkpoint(ops, None, None, HashMap::new(), None)
             .await
             .unwrap();
 
@@ -1624,8 +1611,8 @@ mod tests {
 
         let loaded = coord.store().load_latest().unwrap().unwrap();
         assert_eq!(loaded.operator_states.len(), 2);
-        assert_eq!(loaded.wal_position, 4096);
-        assert_eq!(loaded.per_core_wal_positions, vec![100, 200]);
+        // No WAL manager registered → positions are empty
+        assert!(loaded.per_core_wal_positions.is_empty());
 
         let window_op = loaded.operator_states.get("window-agg").unwrap();
         assert_eq!(window_op.decode_inline().unwrap(), b"state-data");
@@ -1640,8 +1627,6 @@ mod tests {
             .checkpoint(
                 HashMap::new(),
                 None,
-                0,
-                vec![],
                 Some("/tmp/rocksdb_cp".into()),
                 HashMap::new(),
                 None,
@@ -1895,16 +1880,11 @@ mod tests {
         let drainer = ChangelogDrainer::new(buf, 100);
         coord.register_changelog_drainer(drainer);
 
-        // Full cycle: prepare → checkpoint → truncate
-        let wal_result = coord.prepare_wal_for_checkpoint().unwrap();
-        assert_eq!(wal_result.entries_drained, 1);
-
+        // Full cycle: checkpoint (WAL preparation is internal) → truncate
         let result = coord
             .checkpoint(
                 HashMap::new(),
                 Some(5000),
-                0,
-                wal_result.per_core_wal_positions.clone(),
                 None,
                 HashMap::new(),
                 None,
@@ -1921,12 +1901,9 @@ mod tests {
             "pending entries should be cleared after checkpoint"
         );
 
-        // Manifest should have per-core WAL positions
+        // Manifest should have per-core WAL positions (captured internally)
         let loaded = coord.store().load_latest().unwrap().unwrap();
-        assert_eq!(
-            loaded.per_core_wal_positions.len(),
-            wal_result.per_core_wal_positions.len()
-        );
+        assert_eq!(loaded.per_core_wal_positions.len(), 2);
 
         // Truncate WAL
         coord.truncate_wal_after_checkpoint().unwrap();
@@ -1985,8 +1962,6 @@ mod tests {
             .checkpoint(
                 HashMap::new(),
                 Some(1000),
-                0,
-                vec![],
                 None,
                 HashMap::new(),
                 None,
@@ -2005,8 +1980,6 @@ mod tests {
             .checkpoint(
                 HashMap::new(),
                 Some(2000),
-                0,
-                vec![],
                 None,
                 HashMap::new(),
                 None,
@@ -2026,7 +1999,7 @@ mod tests {
         let mut coord = make_coordinator(dir.path());
 
         let result = coord
-            .checkpoint(HashMap::new(), None, 0, vec![], None, HashMap::new(), None)
+            .checkpoint(HashMap::new(), None, None, HashMap::new(), None)
             .await
             .unwrap();
 
@@ -2108,7 +2081,7 @@ mod tests {
         ops.insert("large".into(), vec![0xBBu8; 200]);
 
         let result = coord
-            .checkpoint(ops, None, 0, vec![], None, HashMap::new(), None)
+            .checkpoint(ops, None, None, HashMap::new(), None)
             .await
             .unwrap();
         assert!(result.success);
@@ -2140,7 +2113,7 @@ mod tests {
         ops.insert("op1".into(), b"small-state".to_vec());
 
         let result = coord
-            .checkpoint(ops, None, 0, vec![], None, HashMap::new(), None)
+            .checkpoint(ops, None, None, HashMap::new(), None)
             .await
             .unwrap();
         assert!(result.success);
@@ -2271,7 +2244,7 @@ mod tests {
         // Run 3 checkpoints.
         for _ in 0..3 {
             let result = coord
-                .checkpoint(HashMap::new(), None, 0, vec![], None, HashMap::new(), None)
+                .checkpoint(HashMap::new(), None, None, HashMap::new(), None)
                 .await
                 .unwrap();
             assert!(result.success);
