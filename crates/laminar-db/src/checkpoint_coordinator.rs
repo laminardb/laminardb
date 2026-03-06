@@ -632,6 +632,10 @@ impl CheckpointCoordinator {
     }
 
     /// Inner pre-commit loop (no timeout).
+    ///
+    /// Only sinks with `exactly_once = true` participate in two-phase commit.
+    /// At-most-once sinks are skipped — they receive no `pre_commit`/`commit`
+    /// calls and provide no transactional guarantees.
     async fn pre_commit_sinks_inner(&self, epoch: u64) -> Result<(), DbError> {
         for sink in &self.sinks {
             if sink.exactly_once {
@@ -798,19 +802,6 @@ impl CheckpointCoordinator {
             }
         }
         epochs
-    }
-
-    /// Collects per-source watermarks for the manifest.
-    ///
-    /// Uses the global watermark as a conservative lower bound for all
-    /// registered sources. This ensures watermark progress is not lost
-    /// on recovery (prevents watermark regression).
-    fn collect_source_watermarks(&self, global_watermark: i64) -> HashMap<String, i64> {
-        let mut watermarks = HashMap::with_capacity(self.sources.len());
-        for source in &self.sources {
-            watermarks.insert(source.name.clone(), global_watermark);
-        }
-        watermarks
     }
 
     /// Returns sorted source names for topology tracking in the manifest.
@@ -1042,15 +1033,11 @@ impl CheckpointCoordinator {
         // Mark all exactly-once sinks as Pending before commit phase.
         manifest.sink_commit_statuses = self.initial_sink_commit_statuses();
         manifest.watermark = watermark;
-        // Prefer caller-provided per-source watermarks (from the pipeline's
-        // watermark tracker). Fall back to global watermark if none provided.
-        if source_watermarks.is_empty() {
-            if let Some(wm) = watermark {
-                manifest.source_watermarks = self.collect_source_watermarks(wm);
-            }
-        } else {
-            manifest.source_watermarks = source_watermarks;
-        }
+        // Use caller-provided per-source watermarks if available. When empty,
+        // leave source_watermarks empty — recovery falls back to the global
+        // manifest.watermark. Do NOT fabricate per-source values from the
+        // global watermark, as that loses granularity on recovery.
+        manifest.source_watermarks = source_watermarks;
         manifest.wal_position = wal_position;
         manifest.per_core_wal_positions = per_core_wal_positions;
         manifest.table_store_checkpoint_path = table_store_checkpoint_path;
