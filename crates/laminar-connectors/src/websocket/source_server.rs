@@ -312,10 +312,17 @@ impl SourceConnector for WebSocketSourceServer {
         let num_rows = batch.num_rows();
         self.message_buffer.clear();
 
-        self.checkpoint_state.watermark = std::time::SystemTime::now()
-            .duration_since(std::time::UNIX_EPOCH)
-            .unwrap_or_default()
-            .as_millis() as i64;
+        // Use event time from batch data if configured, otherwise wall-clock.
+        if let Some(ref field) = self.config.event_time_field {
+            if let Some(max_ts) = super::parser::extract_max_event_time(&batch, field) {
+                self.checkpoint_state.watermark = max_ts;
+            }
+        } else {
+            self.checkpoint_state.watermark = std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .unwrap_or_default()
+                .as_millis() as i64;
+        }
 
         debug!(
             records = num_rows,
