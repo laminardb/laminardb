@@ -168,10 +168,6 @@ test(connectors): add Kafka exactly-once integration test
 chore(deps): update arrow to 57.2
 ```
 
-## Architecture Decisions
-
-Significant architectural changes are documented as ADRs (Architecture Decision Records) in `docs/adr/`. If your change involves a design decision with multiple valid approaches, create an ADR first.
-
 ## Reporting Issues
 
 Use the [GitHub issue templates](https://github.com/laminardb/laminardb/issues/new/choose):
