@@ -196,70 +196,34 @@ impl IcebergSink {
             .sum()
     }
 
-    /// Flushes the internal buffer (updates metrics; actual Parquet write
-    /// happens via the `iceberg` crate when the `iceberg-sink` feature is
-    /// enabled).
-    fn flush_buffer_local(&mut self) -> WriteResult {
-        let total_rows = self.buffered_rows;
-        let estimated_bytes: u64 = self
-            .buffer
-            .iter()
-            .map(|b| b.get_array_memory_size() as u64)
-            .sum();
-
-        // In production, this is where iceberg-rust writer creates Parquet files.
-        // Each flush may produce multiple data files based on partitioning.
-        self.pending_data_files += 1;
-        self.metrics.record_data_files(1);
-
-        self.buffer.clear();
-        self.buffered_rows = 0;
-        self.buffered_bytes = 0;
-        self.buffer_start_time = None;
-
-        self.metrics
-            .record_flush(total_rows as u64, estimated_bytes);
-
-        debug!(
-            rows = total_rows,
-            bytes = estimated_bytes,
-            pending_data_files = self.pending_data_files,
-            pending_delete_files = self.pending_delete_files,
-            "Iceberg: flushed buffer to Parquet"
-        );
-
-        WriteResult::new(total_rows, estimated_bytes)
-    }
-
-    /// Commits pending files as an Iceberg snapshot (updates metrics).
-    fn commit_local(&mut self, epoch: u64) {
-        // In production, this commits via iceberg-rust catalog:
-        // - Creates new snapshot with data files and delete files
-        // - Sets summary properties: laminardb.writer-id, laminardb.epoch
-        self.table_version += 1;
-        self.snapshot_id = self.generate_snapshot_id();
-        self.pending_data_files = 0;
-        self.pending_delete_files = 0;
-        self.metrics.record_commit(self.snapshot_id);
-
-        debug!(
-            epoch,
-            snapshot_id = self.snapshot_id,
-            table_version = self.table_version,
-            "Iceberg: committed snapshot"
-        );
-    }
-
-    /// Generates a timestamp-based snapshot ID.
+    /// Flushes the internal buffer by writing Parquet data files to Iceberg.
     ///
-    /// When the `iceberg-sink` feature is enabled, this will be replaced
-    /// by the catalog-assigned snapshot ID from iceberg-rust.
-    #[allow(clippy::cast_possible_truncation, clippy::cast_possible_wrap)]
-    fn generate_snapshot_id(&self) -> i64 {
-        std::time::SystemTime::now()
-            .duration_since(std::time::UNIX_EPOCH)
-            .map(|d| d.as_millis() as i64)
-            .unwrap_or(self.table_version as i64)
+    /// # Errors
+    ///
+    /// Returns `ConnectorError::UnsupportedOperation` because the Iceberg
+    /// write path requires iceberg-rust which is not yet wired.
+    #[allow(clippy::unused_self)] // will use self when iceberg-rust is wired
+    fn flush_buffer_local(&mut self) -> Result<WriteResult, ConnectorError> {
+        Err(ConnectorError::UnsupportedOperation(
+            "Iceberg sink write path is not yet implemented — \
+             flush_buffer_local requires iceberg-rust writer for Parquet file creation"
+                .into(),
+        ))
+    }
+
+    /// Commits pending files as an Iceberg snapshot.
+    ///
+    /// # Errors
+    ///
+    /// Returns `ConnectorError::UnsupportedOperation` because the Iceberg
+    /// catalog commit path requires iceberg-rust which is not yet wired.
+    #[allow(clippy::unused_self)] // will use self when iceberg-rust is wired
+    fn commit_local(&mut self, _epoch: u64) -> Result<(), ConnectorError> {
+        Err(ConnectorError::UnsupportedOperation(
+            "Iceberg sink commit is not yet implemented — \
+             commit_local requires iceberg-rust catalog for snapshot creation"
+                .into(),
+        ))
     }
 
     /// Splits a changelog `RecordBatch` into insert and delete batches.
@@ -360,17 +324,12 @@ impl SinkConnector for IcebergSink {
             "opening Iceberg sink connector"
         );
 
-        // TODO(iceberg-sink): When the `iceberg-sink` feature is enabled:
-        // 1. Connect to the Iceberg catalog (REST, Glue, or Hive)
-        // 2. Load or create the Iceberg table
-        // 3. Resolve last committed epoch from snapshot summary properties
-        // 4. Read existing table schema
-        // 5. Start background maintenance manager if enabled
-
-        self.state = ConnectorState::Running;
-
-        info!("Iceberg sink connector opened successfully");
-        Ok(())
+        return Err(ConnectorError::UnsupportedOperation(
+            "Iceberg sink is not yet implemented — \
+             requires iceberg-rust catalog connection (REST/Glue/Hive), \
+             table loading, epoch recovery, and schema resolution"
+                .into(),
+        ));
     }
 
     async fn write_batch(&mut self, batch: &RecordBatch) -> Result<WriteResult, ConnectorError> {
@@ -413,7 +372,7 @@ impl SinkConnector for IcebergSink {
 
         // Flush if buffer threshold reached.
         if self.should_flush() {
-            let result = self.flush_buffer_local();
+            let result = self.flush_buffer_local()?;
             return Ok(result);
         }
 
@@ -459,9 +418,8 @@ impl SinkConnector for IcebergSink {
             return Ok(());
         }
 
-        // Write any remaining buffered data to data files (phase 1).
         if !self.buffer.is_empty() {
-            let _ = self.flush_buffer_local();
+            self.flush_buffer_local()?;
         }
 
         debug!(epoch, "Iceberg: pre-committed (data files written)");
@@ -476,9 +434,8 @@ impl SinkConnector for IcebergSink {
             return Ok(());
         }
 
-        // Commit all pending files as a single Iceberg snapshot (phase 2).
         if self.pending_data_files > 0 || self.pending_delete_files > 0 {
-            self.commit_local(epoch);
+            self.commit_local(epoch)?;
         }
 
         self.last_committed_epoch = epoch;
@@ -545,7 +502,7 @@ impl SinkConnector for IcebergSink {
 
     async fn flush(&mut self) -> Result<(), ConnectorError> {
         if !self.buffer.is_empty() {
-            let _ = self.flush_buffer_local();
+            self.flush_buffer_local()?;
         }
         Ok(())
     }
@@ -553,16 +510,13 @@ impl SinkConnector for IcebergSink {
     async fn close(&mut self) -> Result<(), ConnectorError> {
         info!("closing Iceberg sink connector");
 
-        // Flush remaining data.
         if !self.buffer.is_empty() {
-            let _ = self.flush_buffer_local();
+            self.flush_buffer_local()?;
             if self.pending_data_files > 0 || self.pending_delete_files > 0 {
-                self.commit_local(self.current_epoch);
+                self.commit_local(self.current_epoch)?;
                 self.last_committed_epoch = self.current_epoch;
             }
         }
-
-        // In production: stop background maintenance manager.
 
         self.state = ConnectorState::Closed;
 
@@ -776,19 +730,21 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn test_write_batch_auto_flush() {
+    async fn test_write_batch_auto_flush_returns_error() {
         let mut config = test_config();
         config.max_buffer_records = 10;
         let mut sink = IcebergSink::new(config);
         sink.state = ConnectorState::Running;
 
         let batch = test_batch(15);
-        let result = sink.write_batch(&batch).await.unwrap();
+        let result = sink.write_batch(&batch).await;
 
-        // Should flush because 15 >= 10
-        assert_eq!(result.records_written, 15);
-        assert_eq!(sink.buffered_rows(), 0);
-        assert_eq!(sink.pending_data_files, 1);
+        // Flush triggers UnsupportedOperation because write path is not implemented
+        assert!(result.is_err());
+        assert!(result
+            .unwrap_err()
+            .to_string()
+            .contains("not yet implemented"));
     }
 
     #[tokio::test]
@@ -842,30 +798,23 @@ mod tests {
     // ── Epoch lifecycle tests ──
 
     #[tokio::test]
-    async fn test_epoch_lifecycle() {
+    async fn test_epoch_lifecycle_pre_commit_fails() {
         let mut sink = IcebergSink::new(test_config());
         sink.state = ConnectorState::Running;
 
-        // Begin epoch
         sink.begin_epoch(1).await.unwrap();
         assert_eq!(sink.current_epoch(), 1);
 
-        // Write some data
         let batch = test_batch(10);
         sink.write_batch(&batch).await.unwrap();
 
-        // Two-phase commit: pre_commit flushes buffer, commit_epoch commits
-        sink.pre_commit(1).await.unwrap();
-        assert_eq!(sink.buffered_rows(), 0);
-        sink.commit_epoch(1).await.unwrap();
-        assert_eq!(sink.last_committed_epoch(), 1);
-        assert_eq!(sink.table_version(), 1);
-        assert!(sink.snapshot_id() > 0);
-
-        // Metrics should show 1 commit
-        let m = sink.metrics();
-        let commits = m.custom.iter().find(|(k, _)| k == "iceberg.commits");
-        assert_eq!(commits.unwrap().1, 1.0);
+        // pre_commit triggers flush which is not implemented
+        let result = sink.pre_commit(1).await;
+        assert!(result.is_err());
+        assert!(result
+            .unwrap_err()
+            .to_string()
+            .contains("not yet implemented"));
     }
 
     #[tokio::test]
@@ -875,23 +824,15 @@ mod tests {
         let mut sink = IcebergSink::new(config);
         sink.state = ConnectorState::Running;
 
-        // Commit epoch 1
-        sink.begin_epoch(1).await.unwrap();
-        let batch = test_batch(5);
-        sink.write_batch(&batch).await.unwrap();
-        sink.pre_commit(1).await.unwrap();
-        sink.commit_epoch(1).await.unwrap();
-        assert_eq!(sink.last_committed_epoch(), 1);
-        let version_after_first = sink.table_version();
+        // Simulate having already committed epoch 1
+        sink.last_committed_epoch = 1;
 
-        // Try to begin epoch 1 again (should skip)
+        // begin_epoch(1) should skip for exactly-once (epoch <= last_committed)
         sink.begin_epoch(1).await.unwrap();
 
-        // Commit epoch 1 again (should be no-op due to idempotency)
-        sink.pre_commit(1).await.unwrap();
+        // commit_epoch(1) should also skip
         sink.commit_epoch(1).await.unwrap();
         assert_eq!(sink.last_committed_epoch(), 1);
-        assert_eq!(sink.table_version(), version_after_first); // No new version
     }
 
     #[tokio::test]
@@ -901,16 +842,11 @@ mod tests {
         let mut sink = IcebergSink::new(config);
         sink.state = ConnectorState::Running;
 
-        sink.begin_epoch(1).await.unwrap();
-        let batch = test_batch(5);
-        sink.write_batch(&batch).await.unwrap();
-        sink.pre_commit(1).await.unwrap();
-        sink.commit_epoch(1).await.unwrap();
-
-        // Begin epoch 1 again (at-least-once doesn't skip)
+        // At-least-once doesn't skip even if epoch <= last_committed
+        sink.last_committed_epoch = 1;
         sink.begin_epoch(1).await.unwrap();
         assert_eq!(sink.current_epoch(), 1);
-        assert_eq!(sink.buffered_rows(), 0); // Buffer was cleared
+        assert_eq!(sink.buffered_rows(), 0);
     }
 
     #[tokio::test]
@@ -944,26 +880,23 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn test_sequential_epochs() {
+    async fn test_sequential_epochs_pre_commit_fails() {
         let mut sink = IcebergSink::new(test_config());
         sink.state = ConnectorState::Running;
 
-        for epoch in 1..=5 {
-            sink.begin_epoch(epoch).await.unwrap();
-            let batch = test_batch(10);
-            sink.write_batch(&batch).await.unwrap();
-            sink.pre_commit(epoch).await.unwrap();
-            sink.commit_epoch(epoch).await.unwrap();
-        }
+        sink.begin_epoch(1).await.unwrap();
+        let batch = test_batch(10);
+        sink.write_batch(&batch).await.unwrap();
 
-        assert_eq!(sink.last_committed_epoch(), 5);
-        assert_eq!(sink.table_version(), 5);
+        // pre_commit flushes, which is not implemented
+        let result = sink.pre_commit(1).await;
+        assert!(result.is_err());
     }
 
     // ── Flush tests ──
 
     #[tokio::test]
-    async fn test_explicit_flush() {
+    async fn test_explicit_flush_returns_error() {
         let mut config = test_config();
         config.max_buffer_records = 1000;
         let mut sink = IcebergSink::new(config);
@@ -973,28 +906,32 @@ mod tests {
         sink.write_batch(&batch).await.unwrap();
         assert_eq!(sink.buffered_rows(), 20);
 
-        sink.flush().await.unwrap();
-        assert_eq!(sink.buffered_rows(), 0);
-        assert_eq!(sink.pending_data_files, 1);
-
-        let m = sink.metrics();
-        assert_eq!(m.records_total, 20);
+        let result = sink.flush().await;
+        assert!(result.is_err());
+        assert!(result
+            .unwrap_err()
+            .to_string()
+            .contains("not yet implemented"));
     }
 
     // ── Open and close tests ──
 
     #[tokio::test]
-    async fn test_open() {
+    async fn test_open_returns_unsupported() {
         let mut sink = IcebergSink::new(test_config());
 
         let connector_config = ConnectorConfig::new("iceberg");
-        sink.open(&connector_config).await.unwrap();
+        let result = sink.open(&connector_config).await;
 
-        assert_eq!(sink.state(), ConnectorState::Running);
+        assert!(result.is_err());
+        assert!(result
+            .unwrap_err()
+            .to_string()
+            .contains("not yet implemented"));
     }
 
     #[tokio::test]
-    async fn test_open_with_properties() {
+    async fn test_open_with_properties_returns_unsupported() {
         let mut sink = IcebergSink::new(IcebergSinkConfig::default());
 
         let mut connector_config = ConnectorConfig::new("iceberg");
@@ -1005,11 +942,12 @@ mod tests {
         connector_config.set("write.mode", "upsert");
         connector_config.set("equality.delete.columns", "id");
 
-        sink.open(&connector_config).await.unwrap();
-        assert_eq!(sink.config().warehouse, "/data/new_warehouse");
-        assert_eq!(sink.config().namespace, vec!["db", "schema"]);
-        assert_eq!(sink.config().table_name, "new_table");
-        assert_eq!(sink.config().write_mode, IcebergWriteMode::Upsert);
+        let result = sink.open(&connector_config).await;
+        assert!(result.is_err());
+        assert!(result
+            .unwrap_err()
+            .to_string()
+            .contains("not yet implemented"));
     }
 
     #[tokio::test]
@@ -1022,7 +960,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn test_close_flushes_remaining() {
+    async fn test_close_with_buffered_data_returns_error() {
         let mut config = test_config();
         config.max_buffer_records = 1000;
         let mut sink = IcebergSink::new(config);
@@ -1032,11 +970,13 @@ mod tests {
         sink.write_batch(&batch).await.unwrap();
         assert_eq!(sink.buffered_rows(), 30);
 
-        sink.close().await.unwrap();
-        assert_eq!(sink.buffered_rows(), 0);
-
-        let m = sink.metrics();
-        assert_eq!(m.records_total, 30);
+        // close() tries to flush remaining data, which fails
+        let result = sink.close().await;
+        assert!(result.is_err());
+        assert!(result
+            .unwrap_err()
+            .to_string()
+            .contains("not yet implemented"));
     }
 
     // ── Health check tests ──
@@ -1144,18 +1084,16 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn test_metrics_after_writes() {
+    async fn test_metrics_after_writes_flush_fails() {
         let mut config = test_config();
         config.max_buffer_records = 5;
         let mut sink = IcebergSink::new(config);
         sink.state = ConnectorState::Running;
 
+        // 10 > max_buffer_records(5), so write_batch triggers flush which fails
         let batch = test_batch(10);
-        sink.write_batch(&batch).await.unwrap();
-
-        let m = sink.metrics();
-        assert_eq!(m.records_total, 10);
-        assert!(m.bytes_total > 0);
+        let result = sink.write_batch(&batch).await;
+        assert!(result.is_err());
     }
 
     // ── Changelog splitting tests ──

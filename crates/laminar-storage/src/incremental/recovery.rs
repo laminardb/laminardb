@@ -324,7 +324,7 @@ impl RecoveryManager {
                     warn!(position, reason, "Torn write detected, stopping replay");
                     break;
                 }
-                Ok(WalReadResult::ChecksumMismatch { position }) => {
+                Ok(WalReadResult::ChecksumMismatch { position, .. }) => {
                     warn!(position, "CRC mismatch detected, stopping replay");
                     break;
                 }

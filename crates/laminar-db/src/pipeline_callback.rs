@@ -50,6 +50,8 @@ pub(crate) struct ConnectorPipelineCallback {
     pub(crate) table_store: Arc<parking_lot::Mutex<crate::table_store::TableStore>>,
     pub(crate) ctx: SessionContext,
     pub(crate) last_checkpoint: std::time::Instant,
+    /// `None` = no automatic checkpointing (manual only via coordinator).
+    pub(crate) checkpoint_interval: Option<std::time::Duration>,
     pub(crate) pipeline_hash: Option<u64>,
 }
 
@@ -221,10 +223,11 @@ impl crate::pipeline::PipelineCallback for ConnectorPipelineCallback {
             return false;
         }
 
-        // For periodic checkpoints, check the timer.
         if !force {
-            // No checkpoint_interval configured → coordinator handles this.
-            if self.last_checkpoint.elapsed() < std::time::Duration::from_millis(1000) {
+            let Some(interval) = self.checkpoint_interval else {
+                return false; // no auto-checkpointing configured
+            };
+            if self.last_checkpoint.elapsed() < interval {
                 return false;
             }
         }
@@ -545,12 +548,17 @@ async fn apply_filter(
         return Ok(None);
     }
 
-    // Concatenate all result batches
     let total_rows: usize = batches.iter().map(RecordBatch::num_rows).sum();
     if total_rows == 0 {
         return Ok(None);
     }
 
-    // Return the first batch (typically there's only one)
-    Ok(Some(batches.into_iter().next().unwrap()))
+    // Merge all result batches into one (DataFusion may split output across
+    // multiple partitions, so dropping all but the first would lose rows).
+    if batches.len() == 1 {
+        return Ok(batches.into_iter().next());
+    }
+    let merged = arrow::compute::concat_batches(&batches[0].schema(), &batches)
+        .map_err(|e| DbError::query_pipeline_arrow("sink filter concat", &e))?;
+    Ok(Some(merged))
 }

@@ -32,7 +32,6 @@ pub(crate) enum SinkCommand {
     /// Write a batch to the sink.
     WriteBatch { batch: RecordBatch },
     /// Explicitly flush buffered data.
-    #[allow(dead_code)]
     Flush {
         ack: oneshot::Sender<Result<(), ConnectorError>>,
     },

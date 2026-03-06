@@ -22,6 +22,7 @@
 //! [version: u32 LE = 1]
 //! [entry_count: u32 LE]
 //! [uncompressed_size: u32 LE]
+//! [crc32c: u32 LE]           ← over compressed_body
 //! [compressed_body: LZ4 block]
 //!   → decoded body: [key_len: u32 LE][key][value_len: u32 LE][value]...
 //! ```
@@ -376,10 +377,12 @@ impl DisaggregatedStateBackend {
 const MAGIC: &[u8; 4] = b"LDS1";
 
 /// Current blob format version.
-const BLOB_VERSION: u32 = 1;
+/// Current blob version (v2 adds CRC32C integrity check).
+const BLOB_VERSION: u32 = 2;
 
 /// Header size in bytes: magic + version + count + uncompressed size (4 bytes each).
-const HEADER_SIZE: usize = 16;
+// Header: magic(4) + version(4) + count(4) + size(4) + crc(4) = 20.
+const HEADER_SIZE: usize = 20;
 
 /// Serialize entries into an uncompressed body.
 ///
@@ -408,12 +411,14 @@ fn encode_state_blob(entries: &[StateEntry]) -> Vec<u8> {
     let body = encode_body(entries);
     let uncompressed_size = body.len();
     let compressed = lz4_flex::compress_prepend_size(&body);
+    let crc = crc32c::crc32c(&compressed);
 
     let mut blob = Vec::with_capacity(HEADER_SIZE + compressed.len());
     blob.extend_from_slice(MAGIC);
     blob.extend_from_slice(&BLOB_VERSION.to_le_bytes());
     blob.extend_from_slice(&(entries.len() as u32).to_le_bytes());
     blob.extend_from_slice(&(uncompressed_size as u32).to_le_bytes());
+    blob.extend_from_slice(&crc.to_le_bytes());
     blob.extend_from_slice(&compressed);
 
     blob
@@ -433,16 +438,38 @@ fn decompress_blob(data: &[u8]) -> Result<Vec<u8>, DisaggregatedError> {
     }
 
     let version = u32::from_le_bytes([data[4], data[5], data[6], data[7]]);
-    if version != BLOB_VERSION {
+
+    // Determine header size and CRC presence based on version
+    let (header_size, has_crc) = match version {
+        1 => (16, false), // v1: no CRC field
+        2 => (20, true),  // v2: CRC32C after size field
+        _ => {
+            return Err(DisaggregatedError::InvalidBlob(format!(
+                "unsupported version {version}"
+            )));
+        }
+    };
+
+    if data.len() < header_size {
         return Err(DisaggregatedError::InvalidBlob(format!(
-            "unsupported version {version}"
+            "blob too short for v{version} header"
         )));
     }
 
-    // entry_count at data[8..12] — used for validation after decode.
-    // uncompressed_size at data[12..16] — informational.
+    let compressed_body = &data[header_size..];
 
-    lz4_flex::decompress_size_prepended(&data[HEADER_SIZE..])
+    // Verify CRC32C if present (v2+)
+    if has_crc {
+        let expected_crc = u32::from_le_bytes([data[16], data[17], data[18], data[19]]);
+        let actual_crc = crc32c::crc32c(compressed_body);
+        if actual_crc != expected_crc {
+            return Err(DisaggregatedError::InvalidBlob(format!(
+                "CRC32C mismatch: expected {expected_crc:#010x}, actual {actual_crc:#010x}"
+            )));
+        }
+    }
+
+    lz4_flex::decompress_size_prepended(compressed_body)
         .map_err(|e| DisaggregatedError::Decompression(e.to_string()))
 }
 

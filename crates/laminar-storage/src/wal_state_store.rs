@@ -266,10 +266,8 @@ impl WalStateStore {
                     );
                     break;
                 }
-                Ok(WalReadResult::ChecksumMismatch { position }) => {
-                    // Checksum error - corruption or torn write
-                    // Treat as end of valid data
-                    tracing::warn!(position, "CRC mismatch during recovery - truncating WAL");
+                Ok(WalReadResult::ChecksumMismatch { position, .. }) => {
+                    tracing::warn!(position, "CRC mismatch during recovery — truncating WAL");
                     break;
                 }
                 Ok(WalReadResult::Corrupted { position, reason }) => {
@@ -306,12 +304,25 @@ impl WalStateStore {
                 .to_bytes()
                 .map_err(|e| StateError::Io(std::io::Error::other(e)))?;
 
-            // Get current WAL position
+            // Write checkpoint marker FIRST so the WAL position recorded
+            // in the checkpoint is AFTER the marker. On recovery, replay
+            // starts after the marker and doesn't re-process it.
+            let checkpoint_id = manager.next_checkpoint_id();
+            self.wal
+                .append(&WalEntry::Checkpoint { id: checkpoint_id })
+                .map_err(|e| StateError::Io(std::io::Error::other(e)))?;
+
+            // Force sync so the marker is durable before we record position
+            self.wal
+                .sync()
+                .map_err(|e| StateError::Io(std::io::Error::other(e)))?;
+
+            // NOW capture the WAL position (after marker write + sync)
             let wal_position = WalPosition {
                 offset: self.wal.position(),
             };
 
-            // Create checkpoint
+            // Create checkpoint with the post-marker position
             let checkpoint = manager
                 .create_checkpoint(
                     &state_data,
@@ -319,18 +330,6 @@ impl WalStateStore {
                     self.source_offsets.clone(),
                     self.current_watermark,
                 )
-                .map_err(|e| StateError::Io(std::io::Error::other(e)))?;
-
-            // Write checkpoint marker to WAL
-            self.wal
-                .append(&WalEntry::Checkpoint {
-                    id: checkpoint.metadata.id,
-                })
-                .map_err(|e| StateError::Io(std::io::Error::other(e)))?;
-
-            // Force sync after checkpoint
-            self.wal
-                .sync()
                 .map_err(|e| StateError::Io(std::io::Error::other(e)))?;
 
             // Update last checkpoint time
@@ -432,14 +431,25 @@ impl StateStore for WalStateStore {
     }
 
     fn restore(&mut self, snapshot: StateSnapshot) {
-        // Note: This bypasses the WAL. In production, we'd want to
-        // log this operation or handle it differently.
+        // Best-effort WAL sync before state replacement to create a
+        // recovery boundary. If append/sync fails, log and proceed —
+        // the StateStore trait returns () so we can't propagate errors.
+        if let Err(e) = self.wal.append(&WalEntry::Checkpoint { id: 0 }) {
+            tracing::error!(error = %e, "WAL append failed before restore");
+        }
+        if let Err(e) = self.wal.sync() {
+            tracing::error!(error = %e, "WAL sync failed before restore");
+        }
         self.store.restore(snapshot);
     }
 
     fn clear(&mut self) {
-        // Note: This bypasses the WAL. In production, we'd want to
-        // log this operation or handle it differently.
+        if let Err(e) = self.wal.append(&WalEntry::Checkpoint { id: 0 }) {
+            tracing::error!(error = %e, "WAL append failed before clear");
+        }
+        if let Err(e) = self.wal.sync() {
+            tracing::error!(error = %e, "WAL sync failed before clear");
+        }
         self.store.clear();
     }
 

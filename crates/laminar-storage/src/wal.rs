@@ -512,6 +512,10 @@ pub enum WalReadResult {
     ChecksumMismatch {
         /// Position of the corrupted record.
         position: u64,
+        /// Expected CRC32C value from the record header.
+        expected: u32,
+        /// Actual CRC32C computed from the data.
+        actual: u32,
     },
     /// Corrupted entry (e.g. unreasonable length).
     Corrupted {
@@ -597,6 +601,8 @@ impl WalReader {
         if actual_crc != expected_crc {
             return Ok(WalReadResult::ChecksumMismatch {
                 position: record_start,
+                expected: expected_crc,
+                actual: actual_crc,
             });
         }
 
@@ -618,13 +624,15 @@ impl Iterator for WalReader {
             Ok(WalReadResult::TornWrite { position, reason }) => {
                 Some(Err(WalError::TornWrite { position, reason }))
             }
-            Ok(WalReadResult::ChecksumMismatch { position }) => {
-                Some(Err(WalError::ChecksumMismatch {
-                    position,
-                    expected: 0, // We don't have the expected value here
-                    actual: 0,
-                }))
-            }
+            Ok(WalReadResult::ChecksumMismatch {
+                position,
+                expected,
+                actual,
+            }) => Some(Err(WalError::ChecksumMismatch {
+                position,
+                expected,
+                actual,
+            })),
             Ok(WalReadResult::Corrupted { position, reason }) => {
                 Some(Err(WalError::Corrupted { position, reason }))
             }
@@ -817,8 +825,13 @@ mod tests {
         // Reading should detect CRC mismatch
         let mut reader = wal.read_from(0).unwrap();
         match reader.read_next().unwrap() {
-            WalReadResult::ChecksumMismatch { position } => {
+            WalReadResult::ChecksumMismatch {
+                position,
+                expected,
+                actual,
+            } => {
                 assert_eq!(position, 0);
+                assert_ne!(expected, actual);
             }
             other => panic!("Expected ChecksumMismatch, got {other:?}"),
         }

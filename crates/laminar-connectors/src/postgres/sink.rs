@@ -363,31 +363,20 @@ impl PostgresSink {
         }
     }
 
-    /// Flushes the internal buffer (updates metrics; actual PG write is
-    /// a no-op without a live connection — the flush method is designed
-    /// so that real writes happen in production via `tokio-postgres`).
-    fn flush_buffer_local(&mut self) -> WriteResult {
-        let total_rows = self.buffered_rows;
-        let estimated_bytes = self
-            .buffer
-            .iter()
-            .map(|b| b.get_array_memory_size() as u64)
-            .sum::<u64>();
-
-        self.buffer.clear();
-        self.buffered_rows = 0;
-        self.last_flush = Instant::now();
-
-        self.metrics
-            .record_write(total_rows as u64, estimated_bytes);
-        self.metrics.record_flush();
-
-        match self.config.write_mode {
-            WriteMode::Append => self.metrics.record_copy(),
-            WriteMode::Upsert => self.metrics.record_upsert(),
-        }
-
-        WriteResult::new(total_rows, estimated_bytes)
+    /// Flushes the internal buffer by writing to PostgreSQL.
+    ///
+    /// # Errors
+    ///
+    /// Returns `ConnectorError::UnsupportedOperation` because the PostgreSQL
+    /// write path requires `tokio-postgres` which is not yet wired. Enable
+    /// the `postgres-sink` feature once the implementation is complete.
+    #[allow(clippy::unused_self)] // will use self when tokio-postgres is wired
+    fn flush_buffer_local(&mut self) -> Result<WriteResult, ConnectorError> {
+        Err(ConnectorError::UnsupportedOperation(
+            "PostgreSQL sink write path is not yet implemented — \
+             flush_buffer_local requires tokio-postgres connection"
+                .into(),
+        ))
     }
 }
 
@@ -416,18 +405,12 @@ impl SinkConnector for PostgresSink {
             self.config.sink_id = self.config.effective_sink_id();
         }
 
-        // TODO(postgres-sink): When the `postgres-sink` feature is enabled:
-        // 1. Create connection pool (deadpool-postgres)
-        // 2. Verify connectivity
-        // 3. Auto-create target table if configured
-        // 4. Ensure offset tracking table (exactly-once)
-        // 5. Recover last committed epoch
-
-        self.state = ConnectorState::Running;
-        self.last_flush = Instant::now();
-
-        info!("PostgreSQL sink connector opened successfully");
-        Ok(())
+        return Err(ConnectorError::UnsupportedOperation(
+            "PostgreSQL sink is not yet implemented — \
+             requires tokio-postgres connection pool (deadpool-postgres), \
+             table auto-creation, and offset tracking table for exactly-once"
+                .into(),
+        ));
     }
 
     #[allow(clippy::cast_possible_truncation)] // Record batch row/column counts fit in narrower types
@@ -452,7 +435,7 @@ impl SinkConnector for PostgresSink {
             || self.last_flush.elapsed() >= self.config.flush_interval;
 
         if should_flush {
-            let result = self.flush_buffer_local();
+            let result = self.flush_buffer_local()?;
             debug!(
                 records = result.records_written,
                 bytes = result.bytes_written,
@@ -472,9 +455,8 @@ impl SinkConnector for PostgresSink {
         self.current_epoch = epoch;
 
         if self.config.delivery_guarantee == DeliveryGuarantee::ExactlyOnce {
-            // Flush any remaining data from previous epoch.
             if !self.buffer.is_empty() {
-                let _ = self.flush_buffer_local();
+                self.flush_buffer_local()?;
             }
         }
 
@@ -490,9 +472,8 @@ impl SinkConnector for PostgresSink {
             )));
         }
 
-        // Flush any remaining buffered COPY data (phase 1).
         if !self.buffer.is_empty() {
-            let _ = self.flush_buffer_local();
+            self.flush_buffer_local()?;
         }
 
         debug!(epoch, "PostgreSQL sink pre-committed (flushed)");
@@ -557,7 +538,7 @@ impl SinkConnector for PostgresSink {
 
     async fn flush(&mut self) -> Result<(), ConnectorError> {
         if !self.buffer.is_empty() {
-            let _ = self.flush_buffer_local();
+            self.flush_buffer_local()?;
         }
         Ok(())
     }
@@ -565,9 +546,8 @@ impl SinkConnector for PostgresSink {
     async fn close(&mut self) -> Result<(), ConnectorError> {
         info!("closing PostgreSQL sink connector");
 
-        // Flush remaining data.
         if !self.buffer.is_empty() {
-            let _ = self.flush_buffer_local();
+            self.flush_buffer_local()?;
         }
 
         self.state = ConnectorState::Closed;
@@ -1097,18 +1077,21 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn test_write_batch_auto_flush() {
+    async fn test_write_batch_auto_flush_returns_error() {
         let mut config = test_config();
         config.batch_size = 10;
         let mut sink = PostgresSink::new(test_schema(), config);
         sink.state = ConnectorState::Running;
 
         let batch = test_batch(15);
-        let result = sink.write_batch(&batch).await.unwrap();
+        let result = sink.write_batch(&batch).await;
 
-        // Should flush because 15 >= 10
-        assert_eq!(result.records_written, 15);
-        assert_eq!(sink.buffered_rows(), 0);
+        // Flush triggers UnsupportedOperation because write path is not implemented
+        assert!(result.is_err());
+        assert!(result
+            .unwrap_err()
+            .to_string()
+            .contains("not yet implemented"));
     }
 
     #[tokio::test]
@@ -1183,9 +1166,9 @@ mod tests {
     // ── Flush tests ──
 
     #[tokio::test]
-    async fn test_explicit_flush() {
+    async fn test_explicit_flush_returns_error() {
         let mut config = test_config();
-        config.batch_size = 1000; // Won't auto-flush
+        config.batch_size = 1000;
         let mut sink = PostgresSink::new(test_schema(), config);
         sink.state = ConnectorState::Running;
 
@@ -1193,27 +1176,29 @@ mod tests {
         sink.write_batch(&batch).await.unwrap();
         assert_eq!(sink.buffered_rows(), 20);
 
-        sink.flush().await.unwrap();
-        assert_eq!(sink.buffered_rows(), 0);
-
-        let m = sink.metrics();
-        assert_eq!(m.records_total, 20);
+        let result = sink.flush().await;
+        assert!(result.is_err());
+        assert!(result
+            .unwrap_err()
+            .to_string()
+            .contains("not yet implemented"));
     }
 
     // ── Open and close tests ──
 
     #[tokio::test]
-    async fn test_open_prepares_statements() {
+    async fn test_open_returns_unsupported() {
         let config = upsert_config();
         let mut sink = PostgresSink::new(test_schema(), config);
 
         let connector_config = ConnectorConfig::new("postgres-sink");
-        // open() with empty properties uses existing config
-        sink.open(&connector_config).await.unwrap();
+        let result = sink.open(&connector_config).await;
 
-        assert_eq!(sink.state(), ConnectorState::Running);
-        assert!(sink.copy_sql.is_some());
-        assert!(sink.upsert_sql.is_some());
+        assert!(result.is_err());
+        assert!(result
+            .unwrap_err()
+            .to_string()
+            .contains("not yet implemented"));
     }
 
     #[tokio::test]
@@ -1226,7 +1211,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn test_close_flushes_remaining() {
+    async fn test_close_with_buffered_data_returns_error() {
         let mut config = test_config();
         config.batch_size = 1000;
         let mut sink = PostgresSink::new(test_schema(), config);
@@ -1236,11 +1221,13 @@ mod tests {
         sink.write_batch(&batch).await.unwrap();
         assert_eq!(sink.buffered_rows(), 30);
 
-        sink.close().await.unwrap();
-        assert_eq!(sink.buffered_rows(), 0);
-
-        let m = sink.metrics();
-        assert_eq!(m.records_total, 30);
+        // close() tries to flush remaining data, which fails
+        let result = sink.close().await;
+        assert!(result.is_err());
+        assert!(result
+            .unwrap_err()
+            .to_string()
+            .contains("not yet implemented"));
     }
 
     // ── Debug output test ──

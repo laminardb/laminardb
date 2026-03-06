@@ -502,6 +502,18 @@ impl CheckpointStore for FileSystemCheckpointStore {
 
         let json = std::fs::read_to_string(&path)?;
         let manifest: CheckpointManifest = serde_json::from_str(&json)?;
+
+        // Validate manifest consistency on load
+        let errors = manifest.validate();
+        if !errors.is_empty() {
+            tracing::warn!(
+                checkpoint_id = id,
+                error_count = errors.len(),
+                first_error = %errors[0],
+                "loaded checkpoint manifest has validation warnings"
+            );
+        }
+
         Ok(Some(manifest))
     }
 

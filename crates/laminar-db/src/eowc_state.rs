@@ -107,9 +107,21 @@ fn assign_windows(ts_ms: i64, window_type: &EowcWindowType) -> Vec<i64> {
             }
             windows
         }
-        EowcWindowType::Session { .. } => {
-            // Session windows use the event timestamp as the initial window start.
-            // Merging of adjacent windows is deferred to a future PR.
+        EowcWindowType::Session { gap_ms } => {
+            // Session windows are routed through CoreWindowState (Ring 0 operators)
+            // which implements proper gap-based merge. This EOWC fallback creates
+            // one "window" per event timestamp, which is incorrect for session
+            // semantics. It exists only as a no-crash fallback — the compiler
+            // should never route session queries here.
+            use std::sync::atomic::{AtomicBool, Ordering};
+            static WARNED: AtomicBool = AtomicBool::new(false);
+            if !WARNED.swap(true, Ordering::Relaxed) {
+                tracing::warn!(
+                    gap_ms,
+                    "session window used in EOWC path — results will be \
+                     incorrect; use Ring 0 operator routing instead"
+                );
+            }
             vec![ts_ms]
         }
     }

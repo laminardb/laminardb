@@ -36,6 +36,8 @@ pub struct TpcPipelineCoordinator {
     config: PipelineConfig,
     runtime: TpcRuntime,
     shutdown: Arc<tokio::sync::Notify>,
+    /// Pre-built source names indexed by `source_idx` (avoids clone per event).
+    source_name_cache: Vec<String>,
     /// Pre-allocated drain buffer (reused each cycle, zero alloc).
     drain_buffer: Vec<TaggedOutput>,
     /// Pre-allocated source batches buffer (cleared per cycle, not dropped).
@@ -44,6 +46,8 @@ pub struct TpcPipelineCoordinator {
     barriers_buf: Vec<(usize, CheckpointBarrier)>,
     /// Pending barrier alignment tracking.
     pending_barrier: Option<PendingBarrier>,
+    /// Counter for late events (arrived after watermark).
+    late_events: u64,
     /// Next checkpoint ID.
     next_checkpoint_id: u64,
     /// Last checkpoint time.
@@ -70,14 +74,19 @@ impl TpcPipelineCoordinator {
                 .map_err(|e| DbError::Config(format!("failed to spawn source thread: {e}")))?;
         }
 
+        let source_name_cache: Vec<String> =
+            runtime.source_names().iter().map(String::clone).collect();
+
         Ok(Self {
             config,
             runtime,
             shutdown,
+            source_name_cache,
             drain_buffer: Vec::with_capacity(4096),
             source_batches_buf: FxHashMap::default(),
             barriers_buf: Vec::new(),
             pending_barrier: None,
+            late_events: 0,
             next_checkpoint_id: 1,
             last_checkpoint: Instant::now(),
         })
@@ -87,6 +96,7 @@ impl TpcPipelineCoordinator {
     ///
     /// Drains core outboxes, converts tagged outputs to source batches,
     /// executes SQL cycles via the callback, and handles checkpoints.
+    #[allow(clippy::too_many_lines)]
     pub async fn run(mut self, mut callback: Box<dyn PipelineCallback>) {
         let batch_window = self.config.batch_window;
         let barrier_timeout = self.config.barrier_alignment_timeout;
@@ -113,25 +123,47 @@ impl TpcPipelineCoordinator {
             self.source_batches_buf.clear();
             self.barriers_buf.clear();
 
+            let mut cycle_events: u64 = 0;
+            let mut cycle_batches: u64 = 0;
+            let cycle_start = Instant::now();
+
             for tagged in self.drain_buffer.drain(..) {
                 match tagged.output {
                     Output::Event(event) => {
-                        if tagged.source_idx < self.runtime.source_names().len() {
-                            let name = self.runtime.source_names()[tagged.source_idx].clone();
-                            callback.extract_watermark(&name, &event.data);
-                            if let Some(filtered) = callback.filter_late_rows(&name, &event.data) {
+                        if let Some(name) = self.source_name_cache.get(tagged.source_idx) {
+                            callback.extract_watermark(name, &event.data);
+                            cycle_events += event.data.num_rows() as u64;
+                            if let Some(filtered) = callback.filter_late_rows(name, &event.data) {
                                 self.source_batches_buf
-                                    .entry(name)
+                                    .entry(name.clone())
                                     .or_default()
                                     .push(filtered);
+                                cycle_batches += 1;
                             }
                         }
                     }
                     Output::Barrier(barrier) => {
                         self.barriers_buf.push((tagged.source_idx, barrier));
                     }
-                    _ => {
-                        // Watermark, CheckpointComplete, LateEvent, etc.
+                    Output::Watermark(_ts) => {
+                        // Watermark progression is already tracked via
+                        // extract_watermark() on each Event batch
+                    }
+                    Output::CheckpointComplete(data) => {
+                        tracing::debug!(
+                            checkpoint_id = data.checkpoint_id,
+                            "core checkpoint complete"
+                        );
+                    }
+                    Output::LateEvent(_event) => {
+                        self.late_events += 1;
+                        tracing::trace!(total_late = self.late_events, "late event past watermark");
+                    }
+                    Output::SideOutput(_) | Output::Changelog(_) => {
+                        tracing::warn!(
+                            source_idx = tagged.source_idx,
+                            "SideOutput/Changelog leaked past DAG boundary — dropped"
+                        );
                     }
                 }
             }
@@ -156,7 +188,10 @@ impl TpcPipelineCoordinator {
                     }
                     Err(e) => tracing::warn!(error = %e, "SQL cycle error"),
                 }
-                callback.record_cycle(0, 0, 0);
+                #[allow(clippy::cast_possible_truncation)]
+                // Cycle duration will never exceed u64::MAX nanoseconds (~584 years)
+                let elapsed_ns = cycle_start.elapsed().as_nanos() as u64;
+                callback.record_cycle(cycle_events, cycle_batches, elapsed_ns);
             }
 
             // Phase 5: Periodic checkpoint injection
@@ -205,23 +240,28 @@ impl TpcPipelineCoordinator {
             started_at: Instant::now(),
         });
 
-        // Only track if this barrier matches the pending checkpoint
         if pending.checkpoint_id != barrier.checkpoint_id {
+            tracing::debug!(
+                expected = pending.checkpoint_id,
+                actual = barrier.checkpoint_id,
+                source_idx,
+                "ignoring barrier with mismatched checkpoint ID"
+            );
             return;
         }
 
         pending.sources_aligned.insert(source_idx);
 
         // Capture this source's checkpoint
-        if source_idx < self.runtime.source_names().len() {
-            let name = self.runtime.source_names()[source_idx].clone();
+        if let Some(name) = self.source_name_cache.get(source_idx) {
             let cp = self.runtime.source_checkpoint(source_idx);
-            pending.source_checkpoints.insert(name, cp);
+            pending.source_checkpoints.insert(name.clone(), cp);
         }
 
         // Check if all sources are aligned
         if pending.sources_aligned.len() >= pending.sources_total {
-            let source_checkpoints = pending.source_checkpoints.clone();
+            // Move checkpoints out — pending_barrier is about to be cleared
+            let source_checkpoints = std::mem::take(&mut pending.source_checkpoints);
             self.pending_barrier = None;
 
             let success = callback.checkpoint_with_barrier(source_checkpoints).await;

@@ -592,32 +592,18 @@ impl CheckpointCoordinator {
         manifest.sink_names = self.sorted_sink_names();
         manifest.pipeline_hash = pipeline_hash;
 
-        // Convert operator states to manifest format with sidecar threshold
-        let mut sidecar_blobs: Vec<u8> = Vec::new();
-        let threshold = self.config.state_inline_threshold;
-        for (name, data) in &operator_states {
-            let (op_ckpt, maybe_blob) =
-                laminar_storage::checkpoint_manifest::OperatorCheckpoint::from_bytes(
-                    data,
-                    threshold,
-                    sidecar_blobs.len() as u64,
-                );
-            if let Some(blob) = maybe_blob {
-                sidecar_blobs.extend_from_slice(&blob);
-            }
-            manifest.operator_states.insert(name.clone(), op_ckpt);
-        }
-
-        let state_data = if sidecar_blobs.is_empty() {
-            None
-        } else {
+        let state_data = Self::pack_operator_states(
+            &mut manifest,
+            &operator_states,
+            self.config.state_inline_threshold,
+        );
+        if let Some(ref sd) = state_data {
             debug!(
                 checkpoint_id,
-                sidecar_bytes = sidecar_blobs.len(),
+                sidecar_bytes = sd.len(),
                 "writing operator state sidecar"
             );
-            Some(sidecar_blobs)
-        };
+        }
 
         // ── Step 5: Persist manifest (decision record — sinks are Pending) ──
         self.phase = CheckpointPhase::Persisting;
@@ -820,6 +806,36 @@ impl CheckpointCoordinator {
             .filter(|s| s.exactly_once)
             .map(|s| (s.name.clone(), SinkCommitStatus::Pending))
             .collect()
+    }
+
+    /// Packs operator states into a manifest with optional sidecar blob.
+    ///
+    /// States larger than `threshold` are stored in a sidecar blob rather
+    /// than base64-inlined in the JSON manifest.
+    fn pack_operator_states(
+        manifest: &mut CheckpointManifest,
+        operator_states: &HashMap<String, Vec<u8>>,
+        threshold: usize,
+    ) -> Option<Vec<u8>> {
+        let mut sidecar_blobs: Vec<u8> = Vec::new();
+        for (name, data) in operator_states {
+            let (op_ckpt, maybe_blob) =
+                laminar_storage::checkpoint_manifest::OperatorCheckpoint::from_bytes(
+                    data,
+                    threshold,
+                    sidecar_blobs.len() as u64,
+                );
+            if let Some(blob) = maybe_blob {
+                sidecar_blobs.extend_from_slice(&blob);
+            }
+            manifest.operator_states.insert(name.clone(), op_ckpt);
+        }
+
+        if sidecar_blobs.is_empty() {
+            None
+        } else {
+            Some(sidecar_blobs)
+        }
     }
 
     /// Rolls back all exactly-once sinks.
@@ -1072,32 +1088,18 @@ impl CheckpointCoordinator {
         manifest.sink_names = self.sorted_sink_names();
         manifest.pipeline_hash = pipeline_hash;
 
-        // Convert operator states to manifest format with sidecar threshold
-        let mut sidecar_blobs: Vec<u8> = Vec::new();
-        let threshold = self.config.state_inline_threshold;
-        for (name, data) in &operator_states {
-            let (op_ckpt, maybe_blob) =
-                laminar_storage::checkpoint_manifest::OperatorCheckpoint::from_bytes(
-                    data,
-                    threshold,
-                    sidecar_blobs.len() as u64,
-                );
-            if let Some(blob) = maybe_blob {
-                sidecar_blobs.extend_from_slice(&blob);
-            }
-            manifest.operator_states.insert(name.clone(), op_ckpt);
-        }
-
-        let state_data = if sidecar_blobs.is_empty() {
-            None
-        } else {
+        let state_data = Self::pack_operator_states(
+            &mut manifest,
+            &operator_states,
+            self.config.state_inline_threshold,
+        );
+        if let Some(ref sd) = state_data {
             debug!(
                 checkpoint_id,
-                sidecar_bytes = sidecar_blobs.len(),
+                sidecar_bytes = sd.len(),
                 "writing operator state sidecar"
             );
-            Some(sidecar_blobs)
-        };
+        }
 
         // ── Step 5: Persist manifest (decision record — sinks are Pending) ──
         self.phase = CheckpointPhase::Persisting;

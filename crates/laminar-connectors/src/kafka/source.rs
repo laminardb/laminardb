@@ -5,15 +5,13 @@
 //! messages using pluggable formats, and producing Arrow `RecordBatch`
 //! data through the connector SDK.
 
-use std::sync::atomic::{AtomicBool, AtomicUsize};
-use std::sync::Arc;
-use std::time::Instant;
-
 use arrow_schema::SchemaRef;
 use async_trait::async_trait;
 use rdkafka::consumer::{Consumer, StreamConsumer};
 use rdkafka::message::Message;
 use rdkafka::ClientConfig;
+use std::sync::atomic::{AtomicBool, AtomicUsize};
+use std::sync::Arc;
 use tokio::sync::Notify;
 use tracing::{debug, info, warn};
 
@@ -233,12 +231,11 @@ impl KafkaSource {
         let (msg_tx, msg_rx) = tokio::sync::mpsc::channel(4096);
         let (shutdown_tx, mut shutdown_rx) = tokio::sync::watch::channel(false);
         let data_ready = Arc::clone(&self.data_ready);
-        let commit_interval = self.config.commit_interval;
 
+        // Offset commits are handled exclusively through the checkpoint path
+        // (self.offsets → checkpoint() → coordinator commit). The reader task
+        // does NOT auto-commit to avoid violating exactly-once semantics.
         let reader_handle = tokio::spawn(async move {
-            let mut reader_offsets = OffsetTracker::new();
-            let mut last_commit = Instant::now();
-
             loop {
                 let msg_result = tokio::select! {
                     biased;
@@ -248,29 +245,16 @@ impl KafkaSource {
                 match msg_result {
                     Ok(msg) => {
                         if let Some(payload) = msg.payload() {
-                            let topic = msg.topic();
-                            let partition = msg.partition();
-                            let offset = msg.offset();
-                            reader_offsets.update(topic, partition, offset);
-
                             let kp = KafkaPayload {
                                 data: payload.to_vec(),
-                                topic: topic.to_string(),
-                                partition,
-                                offset,
+                                topic: msg.topic().to_string(),
+                                partition: msg.partition(),
+                                offset: msg.offset(),
                             };
                             if msg_tx.send(kp).await.is_err() {
                                 break;
                             }
                             data_ready.notify_one();
-                        }
-
-                        if last_commit.elapsed() >= commit_interval
-                            && reader_offsets.partition_count() > 0
-                        {
-                            let tpl = reader_offsets.to_topic_partition_list();
-                            let _ = consumer.commit(&tpl, rdkafka::consumer::CommitMode::Async);
-                            last_commit = Instant::now();
                         }
                     }
                     Err(e) => {
@@ -279,11 +263,6 @@ impl KafkaSource {
                 }
             }
 
-            // Final sync commit.
-            if reader_offsets.partition_count() > 0 {
-                let tpl = reader_offsets.to_topic_partition_list();
-                let _ = consumer.commit(&tpl, rdkafka::consumer::CommitMode::Sync);
-            }
             consumer.unsubscribe();
         });
 

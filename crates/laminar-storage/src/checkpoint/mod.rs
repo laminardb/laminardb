@@ -162,6 +162,14 @@ impl CheckpointManager {
         })
     }
 
+    /// Returns the next checkpoint ID that will be used by `create_checkpoint`.
+    ///
+    /// Use this to pre-allocate an ID for WAL marker writes that must happen
+    /// before checkpoint creation.
+    pub fn next_checkpoint_id(&self) -> u64 {
+        self.next_id.load(Ordering::Relaxed)
+    }
+
     /// Create a new checkpoint from the given state snapshot.
     ///
     /// # Arguments
@@ -189,9 +197,19 @@ impl CheckpointManager {
         // Generate checkpoint ID
         let checkpoint_id = self.next_id.fetch_add(1, Ordering::Relaxed);
 
-        // Create checkpoint directory
+        // Write all files into a staging directory first, then atomically
+        // rename to the final path. A crash during writes leaves only the
+        // staging dir which is ignored on recovery (no metadata.rkyv at the
+        // expected path).
         let checkpoint_path = self.checkpoint_path(checkpoint_id);
-        fs::create_dir_all(&checkpoint_path).context("Failed to create checkpoint directory")?;
+        let staging_path = checkpoint_path.with_extension("tmp");
+
+        // Clean up any leftover staging dir from a previous crash
+        if staging_path.exists() {
+            let _ = fs::remove_dir_all(&staging_path);
+        }
+
+        fs::create_dir_all(&staging_path).context("Failed to create staging directory")?;
 
         // Create metadata
         let timestamp = SystemTime::now()
@@ -208,19 +226,19 @@ impl CheckpointManager {
             watermark,
         };
 
-        // Write state snapshot
-        let state_path = checkpoint_path.join("state.rkyv");
+        // Write state snapshot to staging
+        let state_path = staging_path.join("state.rkyv");
         fs::write(&state_path, state_snapshot).context("Failed to write state snapshot")?;
 
-        // Write source offsets as JSON (since HashMap<String, u64> doesn't serialize well with rkyv)
+        // Write source offsets as JSON to staging
         if !metadata.source_offsets.is_empty() {
-            let offsets_path = checkpoint_path.join("offsets.json");
+            let offsets_path = staging_path.join("offsets.json");
             let offsets_json = serde_json::to_string_pretty(&metadata.source_offsets)
                 .context("Failed to serialize source offsets")?;
             fs::write(&offsets_path, offsets_json).context("Failed to write source offsets")?;
         }
 
-        // Write metadata (convert to internal format)
+        // Write metadata to staging
         let metadata_internal = CheckpointMetadataInternal {
             id: metadata.id,
             timestamp: metadata.timestamp,
@@ -229,10 +247,19 @@ impl CheckpointManager {
             watermark: metadata.watermark,
         };
 
-        let metadata_path = checkpoint_path.join("metadata.rkyv");
+        let metadata_path = staging_path.join("metadata.rkyv");
         let metadata_bytes = rkyv::to_bytes::<Error>(&metadata_internal)?;
         fs::write(&metadata_path, &metadata_bytes)
             .context("Failed to write checkpoint metadata")?;
+
+        // Rename staging → final path. On POSIX this is atomic; on Windows
+        // `MoveFileExW` is not guaranteed atomic for directories. In the
+        // Windows case, recovery validates that metadata.rkyv exists — a
+        // partially-moved directory without it is skipped.
+        fs::rename(&staging_path, &checkpoint_path).context(
+            "Failed to rename staging checkpoint to final path — \
+             checkpoint is incomplete",
+        )?;
 
         let checkpoint = Checkpoint {
             metadata,
@@ -327,13 +354,17 @@ impl CheckpointManager {
             anyhow::bail!("State file missing for checkpoint {checkpoint_id}");
         }
 
-        // Load source offsets if they exist
         let mut checkpoint = Checkpoint {
             metadata,
             path: checkpoint_path,
         };
 
-        if let Ok(offsets) = checkpoint.load_offsets() {
+        // Load source offsets — propagate errors instead of silently ignoring
+        let offsets_path = checkpoint.path.join("offsets.json");
+        if offsets_path.exists() {
+            let offsets = checkpoint.load_offsets().context(
+                "Failed to load source offsets for checkpoint — file exists but is corrupt",
+            )?;
             checkpoint.metadata.source_offsets = offsets;
         }
 

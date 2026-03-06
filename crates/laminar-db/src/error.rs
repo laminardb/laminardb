@@ -89,6 +89,9 @@ pub enum DbError {
 
     /// Configuration / profile validation error
     Config(String),
+
+    /// Operation is not yet implemented.
+    Unsupported(String),
 }
 
 impl DbError {
@@ -157,7 +160,7 @@ impl DbError {
             Self::SinkAlreadyExists(_) => error_codes::SINK_ALREADY_EXISTS,
             Self::InsertError(_) => error_codes::CONNECTOR_WRITE_ERROR,
             Self::SchemaMismatch(_) => error_codes::SCHEMA_MISMATCH,
-            Self::InvalidOperation(_) => error_codes::INVALID_OPERATION,
+            Self::InvalidOperation(_) | Self::Unsupported(_) => error_codes::INVALID_OPERATION,
             Self::Shutdown => error_codes::SHUTDOWN,
             Self::Checkpoint(_) => error_codes::CHECKPOINT_FAILED,
             Self::UnresolvedConfigVar(_) => error_codes::UNRESOLVED_CONFIG_VAR,
@@ -254,6 +257,9 @@ impl std::fmt::Display for DbError {
             }
             Self::Config(msg) => {
                 write!(f, "[{}] Config error: {msg}", self.code())
+            }
+            Self::Unsupported(msg) => {
+                write!(f, "[{}] Unsupported: {msg}", self.code())
             }
         }
     }

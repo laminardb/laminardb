@@ -279,7 +279,11 @@ async fn send_with_backpressure(
         BackpressureStrategy::DropOldest
         | BackpressureStrategy::Buffer { .. }
         | BackpressureStrategy::Sample { .. } => {
-            // For simplicity, DropOldest/Buffer/Sample all use try_send + drop.
+            // These strategies are not yet differentiated from DropNewest.
+            // DropOldest would need drain-and-re-send, Buffer a secondary
+            // queue, and Sample a counter-based skip. All degrade to
+            // DropNewest (try_send, drop on full) for now.
+            tracing::debug!("backpressure strategy not fully implemented, using DropNewest");
             match tx.try_send(msg) {
                 Ok(()) | Err(tokio::sync::mpsc::error::TrySendError::Full(_)) => Ok(()),
                 Err(tokio::sync::mpsc::error::TrySendError::Closed(_)) => Err(()),
@@ -346,7 +350,14 @@ impl SourceConnector for WebSocketSource {
             ));
         }
 
-        let _ = (ping_interval, ping_timeout); // reserved for future heartbeat use
+        if ping_interval.is_some() || ping_timeout.is_some() {
+            tracing::info!(
+                ?ping_interval,
+                ?ping_timeout,
+                "ping_interval/ping_timeout configured but not yet implemented — \
+                 WebSocket connections will not send keepalive pings"
+            );
+        }
 
         info!(
             urls = ?urls,
@@ -443,7 +454,11 @@ impl SourceConnector for WebSocketSource {
         let num_rows = batch.num_rows();
         self.message_buffer.clear();
 
-        // Update checkpoint state.
+        // Update checkpoint state with wall-clock watermark.
+        // Ideally this would extract event time from the batch using the
+        // configured event_time_field, but that requires schema knowledge
+        // at this layer. The pipeline's WatermarkExtractor handles proper
+        // event-time watermarking at the SQL layer.
         self.checkpoint_state.watermark = std::time::SystemTime::now()
             .duration_since(std::time::UNIX_EPOCH)
             .unwrap_or_default()
@@ -458,6 +473,9 @@ impl SourceConnector for WebSocketSource {
     }
 
     fn checkpoint(&self) -> SourceCheckpoint {
+        // Epoch is managed by the checkpoint coordinator, not individual
+        // sources. Pass 0 here; the coordinator stamps the real epoch on
+        // the manifest. SourceCheckpoint.epoch is informational only.
         self.checkpoint_state.to_source_checkpoint(0)
     }
 

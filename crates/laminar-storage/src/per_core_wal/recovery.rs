@@ -74,9 +74,11 @@ impl PerCoreRecoveryManager {
         let recovery_manager = RecoveryManager::new(self.recovery_config.clone());
         let base_state = recovery_manager.recover()?;
 
-        // 2. Determine starting positions for each segment
-        // For now, we replay from the start of each segment
-        // In a production system, checkpoint would store per-core positions
+        // 2. Determine starting positions for each segment.
+        // Per-core WAL positions are not yet stored in the checkpoint
+        // (RecoveredState carries only a single WAL position). Until
+        // the checkpoint format includes per-core positions, replay
+        // from the start — this is safe (idempotent) but slower.
         let starting_positions = vec![0u64; self.wal_config.num_cores];
 
         // 3. Read and merge WAL segments

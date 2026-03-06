@@ -67,10 +67,21 @@ impl WatermarkDynamicFilter {
     /// On a successful advance the generation counter is incremented.
     /// No-op when `new_ms <= current`.
     pub fn advance_watermark(&self, new_ms: i64) {
-        let old = self.watermark_ms.load(Ordering::Acquire);
-        if new_ms > old {
-            self.watermark_ms.store(new_ms, Ordering::Release);
-            self.generation.fetch_add(1, Ordering::Release);
+        // Atomic compare-and-swap loop to avoid TOCTOU race where two
+        // concurrent callers both see old < new_ms and clobber each other.
+        loop {
+            let old = self.watermark_ms.load(Ordering::Acquire);
+            if new_ms <= old {
+                break;
+            }
+            if self
+                .watermark_ms
+                .compare_exchange(old, new_ms, Ordering::Release, Ordering::Acquire)
+                .is_ok()
+            {
+                self.generation.fetch_add(1, Ordering::Release);
+                break;
+            }
         }
     }
 

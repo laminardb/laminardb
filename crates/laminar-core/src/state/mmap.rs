@@ -377,10 +377,12 @@ impl MmapStateStore {
             )));
         }
 
-        // For now, we don't persist the index in the file, so we start fresh
-        // A full implementation would store the index at the end of the file
-        // and rebuild it on load. For now, we focus on the mmap data storage.
-        Ok((BTreeMap::new(), 0, 1))
+        Err(StateError::Corruption(
+            "mmap file exists but no .idx index file found — \
+             data cannot be recovered without the index; \
+             call save_index()/flush() before closing the store"
+                .to_string(),
+        ))
     }
 
     /// Check if this store is persistent.
@@ -663,18 +665,20 @@ impl StateStore for MmapStateStore {
         self.next_version = 1;
 
         for (key, value) in snapshot.data() {
-            if let Ok(offset) = self.storage.write(value) {
-                self.index.insert(
-                    key.clone(),
-                    ValueEntry {
-                        offset,
-                        len: value.len(),
-                        version: self.next_version,
-                    },
-                );
-                self.next_version += 1;
-                self.size_bytes += key.len() + value.len();
-            }
+            let offset = self
+                .storage
+                .write(value)
+                .expect("storage write failed during restore — state is irrecoverable");
+            self.index.insert(
+                key.clone(),
+                ValueEntry {
+                    offset,
+                    len: value.len(),
+                    version: self.next_version,
+                },
+            );
+            self.next_version += 1;
+            self.size_bytes += key.len() + value.len();
         }
     }
 
