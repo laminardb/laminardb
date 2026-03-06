@@ -165,7 +165,7 @@ pub fn encode_standby_status(write_lsn: Lsn, flush_lsn: Lsn, apply_lsn: Lsn) -> 
     buf
 }
 
-/// Validates that a string is a safe PostgreSQL identifier (alphanumeric + underscore).
+/// Validates that a string is a safe `PostgreSQL` identifier (alphanumeric + underscore).
 fn validate_pg_identifier(value: &str, field: &str) -> Result<(), ConnectorError> {
     if value.is_empty() {
         return Err(ConnectorError::ConfigurationError(format!(
@@ -569,7 +569,10 @@ mod tests {
             "pub",
         );
         assert!(result.is_err());
-        assert!(result.unwrap_err().to_string().contains("unsafe characters"));
+        assert!(result
+            .unwrap_err()
+            .to_string()
+            .contains("unsafe characters"));
     }
 
     #[test]

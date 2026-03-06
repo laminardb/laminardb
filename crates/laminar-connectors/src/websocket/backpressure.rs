@@ -14,7 +14,7 @@ use serde::{Deserialize, Serialize};
 ///
 /// **Note**: Currently only `Block` is implemented in `WebSocketSourceServer`.
 /// The other variants are parsed from SQL WITH but not yet dispatched.
-/// TODO(backpressure): wire strategy dispatch in source_server.rs.
+/// TODO(backpressure): wire strategy dispatch in `source_server.rs`.
 #[derive(Debug, Clone, Default, Serialize, Deserialize)]
 pub enum BackpressureStrategy {
     /// Block WS read -- TCP backpressure propagates to sender.
