@@ -12,8 +12,8 @@
 //! 3. For each source: `source.restore(manifest.source_offsets[name])`
 //! 4. For each table source: `source.restore(manifest.table_offsets[name])`
 //! 5. For each exactly-once sink: `sink.rollback_epoch(manifest.epoch)`
-//! 6. If DAG: `dag_executor.restore(manifest.operator_states)` via conversion
-//! 7. Return recovered state (watermark, epoch, operator states)
+//! 6. Return recovered state (watermark, epoch, operator states)
+//!    — caller is responsible for restoring DAG/TPC operators from `operator_states`
 //!
 //! ## Fallback Recovery
 //!
@@ -123,13 +123,38 @@ impl RecoveredState {
 /// state.
 pub struct RecoveryManager<'a> {
     store: &'a dyn CheckpointStore,
+    /// When true, any source/sink restore failure aborts the entire recovery.
+    /// When false (default), failures are logged and recorded in `RecoveredState`
+    /// but recovery continues — the pipeline resumes with potentially
+    /// mismatched offsets.
+    strict: bool,
 }
 
 impl<'a> RecoveryManager<'a> {
     /// Creates a new recovery manager using the given checkpoint store.
+    ///
+    /// Uses lenient mode by default: source/sink restore failures are
+    /// recorded but do not abort recovery. Use [`Self::strict`] for
+    /// strict mode.
     #[must_use]
     pub fn new(store: &'a dyn CheckpointStore) -> Self {
-        Self { store }
+        Self {
+            store,
+            strict: false,
+        }
+    }
+
+    /// Creates a strict recovery manager.
+    ///
+    /// In strict mode, any source or sink restore failure aborts the
+    /// entire recovery and returns an error. Use this when exactly-once
+    /// semantics are critical and partial recovery is unacceptable.
+    #[must_use]
+    pub fn strict(store: &'a dyn CheckpointStore) -> Self {
+        Self {
+            store,
+            strict: true,
+        }
     }
 
     /// Attempts to recover from the latest checkpoint, with fallback to older
@@ -151,8 +176,8 @@ impl<'a> RecoveryManager<'a> {
     ///
     /// # Errors
     ///
-    /// Returns `DbError::Checkpoint` only if the checkpoint store itself fails
-    /// in an unrecoverable way (e.g., filesystem permissions).
+    /// Returns `DbError::Checkpoint` if the checkpoint store fails, or
+    /// in strict mode, if any source/sink restore fails.
     pub(crate) async fn recover(
         &self,
         sources: &[RegisteredSource],
@@ -162,10 +187,11 @@ impl<'a> RecoveryManager<'a> {
         // Fast path: try load_latest() first.
         match self.store.load_latest() {
             Ok(Some(manifest)) => {
-                return Ok(Some(
-                    self.restore_from(manifest, sources, sinks, table_sources)
-                        .await,
-                ));
+                let state = self
+                    .restore_from(manifest, sources, sinks, table_sources)
+                    .await;
+                self.check_strict(&state)?;
+                return Ok(Some(state));
             }
             Ok(None) => {
                 info!("no checkpoint found, starting fresh");
@@ -190,10 +216,11 @@ impl<'a> RecoveryManager<'a> {
             match self.store.load_by_id(checkpoint_id) {
                 Ok(Some(manifest)) => {
                     info!(checkpoint_id, "recovering from fallback checkpoint");
-                    let result = self
+                    let state = self
                         .restore_from(manifest, sources, sinks, table_sources)
                         .await;
-                    return Ok(Some(result));
+                    self.check_strict(&state)?;
+                    return Ok(Some(state));
                 }
                 Ok(None) => {
                     debug!(checkpoint_id, "fallback checkpoint not found, skipping");
@@ -488,6 +515,26 @@ impl<'a> RecoveryManager<'a> {
         );
 
         result
+    }
+
+    /// In strict mode, returns an error if any source or sink had restore failures.
+    fn check_strict(&self, state: &RecoveredState) -> Result<(), DbError> {
+        if !self.strict || !state.has_errors() {
+            return Ok(());
+        }
+        let mut msgs: Vec<String> = state
+            .source_errors
+            .iter()
+            .map(|(k, v)| format!("source '{k}': {v}"))
+            .collect();
+        for (k, v) in &state.sink_errors {
+            msgs.push(format!("sink '{k}': {v}"));
+        }
+        Err(DbError::Checkpoint(format!(
+            "strict recovery failed — {} restore error(s): {}",
+            msgs.len(),
+            msgs.join("; ")
+        )))
     }
 
     /// Loads the latest manifest without performing recovery.

@@ -44,15 +44,7 @@ async fn test_happy_path_checkpoint_and_recovery() {
     ops.insert("window-agg".into(), b"accumulated-state".to_vec());
 
     let result = coord
-        .checkpoint(
-            ops,
-            Some(5000),
-            1024,
-            vec![100, 200],
-            None,
-            HashMap::new(),
-            None,
-        )
+        .checkpoint(ops, Some(5000), None, HashMap::new(), None)
         .await
         .unwrap();
 
@@ -68,8 +60,8 @@ async fn test_happy_path_checkpoint_and_recovery() {
     assert_eq!(manifest.checkpoint_id, 1);
     assert_eq!(manifest.epoch, 1);
     assert_eq!(manifest.watermark, Some(5000));
-    assert_eq!(manifest.wal_position, 1024);
-    assert_eq!(manifest.per_core_wal_positions, vec![100, 200]);
+    // No WAL manager registered → positions are empty/default
+    assert!(manifest.per_core_wal_positions.is_empty());
 
     // Verify operator state
     let op = manifest.operator_states.get("window-agg").unwrap();
@@ -201,18 +193,11 @@ fn test_operator_state_round_trip() {
 async fn test_wal_positions_recovery() {
     let dir = tempfile::tempdir().unwrap();
 
-    // Checkpoint with WAL positions
+    // WAL positions are now captured internally by checkpoint_inner.
+    // Verify they are stored in the manifest (empty without a WAL manager).
     let mut coord = make_coordinator(dir.path());
     let result = coord
-        .checkpoint(
-            HashMap::new(),
-            Some(42_000),
-            8192,
-            vec![512, 1024, 256, 768],
-            None,
-            HashMap::new(),
-            None,
-        )
+        .checkpoint(HashMap::new(), Some(42_000), None, HashMap::new(), None)
         .await
         .unwrap();
 
@@ -223,8 +208,9 @@ async fn test_wal_positions_recovery() {
     let mgr = RecoveryManager::new(&store);
     let manifest = mgr.load_latest().unwrap().unwrap();
 
-    assert_eq!(manifest.wal_position, 8192);
-    assert_eq!(manifest.per_core_wal_positions, vec![512, 1024, 256, 768]);
+    // No WAL manager → positions default to empty
+    assert!(manifest.per_core_wal_positions.is_empty());
+    assert_eq!(manifest.watermark, Some(42_000));
 }
 
 // ── Scenario 7: Table store checkpoint path ──
@@ -238,8 +224,6 @@ async fn test_table_store_checkpoint_path_recovery() {
         .checkpoint(
             HashMap::new(),
             None,
-            0,
-            vec![],
             Some("/data/rocksdb_cp_001".into()),
             HashMap::new(),
             None,
@@ -270,27 +254,11 @@ async fn test_coordinator_resumes_epoch_after_recovery() {
     {
         let mut coord = make_coordinator(dir.path());
         coord
-            .checkpoint(
-                HashMap::new(),
-                Some(1000),
-                0,
-                vec![],
-                None,
-                HashMap::new(),
-                None,
-            )
+            .checkpoint(HashMap::new(), Some(1000), None, HashMap::new(), None)
             .await
             .unwrap();
         coord
-            .checkpoint(
-                HashMap::new(),
-                Some(2000),
-                0,
-                vec![],
-                None,
-                HashMap::new(),
-                None,
-            )
+            .checkpoint(HashMap::new(), Some(2000), None, HashMap::new(), None)
             .await
             .unwrap();
 
@@ -318,7 +286,7 @@ async fn test_incremental_checkpoint_flag() {
     let mut coord = CheckpointCoordinator::new(config, store);
 
     let result = coord
-        .checkpoint(HashMap::new(), None, 0, vec![], None, HashMap::new(), None)
+        .checkpoint(HashMap::new(), None, None, HashMap::new(), None)
         .await
         .unwrap();
 

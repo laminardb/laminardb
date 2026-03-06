@@ -876,16 +876,32 @@ impl Operator for AsofJoinOperator {
     }
 
     fn checkpoint(&self) -> OperatorState {
-        // Serialize metrics and state summary
-        let state_entries: Vec<(Vec<u8>, SerializableKeyState)> = self
-            .right_state
-            .iter()
-            .filter_map(|(k, v)| {
-                SerializableKeyState::from_key_state(v)
-                    .ok()
-                    .map(|s| (k.to_vec(), s))
-            })
-            .collect();
+        let mut keys_dropped: u64 = 0;
+        let mut state_entries: Vec<(Vec<u8>, SerializableKeyState)> =
+            Vec::with_capacity(self.right_state.len());
+        for (k, v) in &self.right_state {
+            match SerializableKeyState::from_key_state(v) {
+                Ok(s) => state_entries.push((k.to_vec(), s)),
+                Err(e) => {
+                    keys_dropped += 1;
+                    tracing::error!(
+                        operator_id = %self.operator_id,
+                        error = %e,
+                        "[LDB-6013] ASOF join key failed serialization during checkpoint — \
+                         this key will be MISSING after recovery"
+                    );
+                }
+            }
+        }
+        if keys_dropped > 0 {
+            tracing::error!(
+                operator_id = %self.operator_id,
+                keys_dropped,
+                keys_total = self.right_state.len(),
+                "[LDB-6013] ASOF join checkpoint lost state — \
+                 {keys_dropped} keys could not be serialized"
+            );
+        }
 
         let checkpoint_data = (
             self.watermark,

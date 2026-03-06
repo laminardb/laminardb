@@ -78,8 +78,6 @@ async fn test_checkpoint_non_blocking() {
         .checkpoint(
             std::collections::HashMap::new(),
             None,
-            0,
-            vec![],
             None,
             std::collections::HashMap::new(),
             None,

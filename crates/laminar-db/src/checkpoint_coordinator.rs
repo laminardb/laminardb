@@ -49,6 +49,15 @@ pub struct CheckpointConfig {
     /// A stuck sink will not block checkpointing indefinitely.
     /// Defaults to 30 seconds.
     pub pre_commit_timeout: Duration,
+    /// Maximum time to wait for manifest persist (filesystem I/O).
+    ///
+    /// A hung or degraded filesystem will not stall the runtime indefinitely.
+    /// Defaults to 120 seconds.
+    pub persist_timeout: Duration,
+    /// Maximum time to wait for all sinks to commit (phase 2).
+    ///
+    /// Defaults to 60 seconds.
+    pub commit_timeout: Duration,
     /// Whether to use incremental checkpoints.
     pub incremental: bool,
     /// Maximum operator state size (bytes) to inline in the JSON manifest.
@@ -59,6 +68,23 @@ pub struct CheckpointConfig {
     ///
     /// Default: 1 MB (`1_048_576`). Set to `usize::MAX` to inline everything.
     pub state_inline_threshold: usize,
+    /// Maximum total checkpoint size in bytes (manifest + sidecar).
+    ///
+    /// If the packed operator state exceeds this limit, the checkpoint is
+    /// rejected with `[LDB-6014]` and not persisted. This prevents
+    /// unbounded state from creating multi-GB sidecar files.
+    ///
+    /// `None` means no limit (default). A warning is logged at 80% of the cap.
+    pub max_checkpoint_bytes: Option<usize>,
+    /// Maximum pending changelog entries per drainer before forced clear.
+    ///
+    /// On checkpoint failure, `clear_pending()` is normally skipped. If
+    /// failures repeat, pending entries grow unboundedly → OOM. This cap
+    /// is a safety valve: if any drainer exceeds it after a failure, all
+    /// drainers are cleared and an `[LDB-6010]` warning is logged.
+    ///
+    /// Default: 10,000,000 entries.
+    pub max_pending_changelog_entries: usize,
     /// Adaptive checkpoint interval configuration.
     ///
     /// When `Some`, the coordinator dynamically adjusts the checkpoint interval
@@ -152,8 +178,12 @@ impl Default for CheckpointConfig {
             max_retained: 3,
             alignment_timeout: Duration::from_secs(30),
             pre_commit_timeout: Duration::from_secs(30),
+            persist_timeout: Duration::from_secs(120),
+            commit_timeout: Duration::from_secs(60),
             incremental: false,
             state_inline_threshold: 1_048_576,
+            max_checkpoint_bytes: None,
+            max_pending_changelog_entries: 10_000_000,
             adaptive: None,
             unaligned: None,
         }
@@ -499,6 +529,35 @@ impl CheckpointCoordinator {
         &mut self.changelog_drainers
     }
 
+    /// Safety valve: clears changelog drainer buffers if any exceeds the cap.
+    ///
+    /// Called on checkpoint failure to prevent unbounded memory growth when
+    /// checkpoints fail repeatedly. Under normal operation, `clear_pending()`
+    /// is called on the success path in `checkpoint_inner()`.
+    fn maybe_cap_drainers(&mut self) {
+        let cap = self.config.max_pending_changelog_entries;
+        let needs_clear = self
+            .changelog_drainers
+            .iter()
+            .any(|d| d.pending_count() > cap);
+        if needs_clear {
+            let total: usize = self
+                .changelog_drainers
+                .iter()
+                .map(ChangelogDrainer::pending_count)
+                .sum();
+            warn!(
+                total_pending = total,
+                cap,
+                "[LDB-6010] changelog drainer exceeded cap after checkpoint failure — \
+                 clearing to prevent OOM"
+            );
+            for drainer in &mut self.changelog_drainers {
+                drainer.clear_pending();
+            }
+        }
+    }
+
     /// Performs a full checkpoint cycle (steps 3-7).
     ///
     /// Steps 1-2 (barrier propagation + operator snapshots) are handled
@@ -520,175 +579,19 @@ impl CheckpointCoordinator {
         &mut self,
         operator_states: HashMap<String, Vec<u8>>,
         watermark: Option<i64>,
-        wal_position: u64,
-        per_core_wal_positions: Vec<u64>,
         table_store_checkpoint_path: Option<String>,
         source_watermarks: HashMap<String, i64>,
         pipeline_hash: Option<u64>,
     ) -> Result<CheckpointResult, DbError> {
-        let start = Instant::now();
-        let checkpoint_id = self.next_checkpoint_id;
-        let epoch = self.epoch;
-
-        info!(checkpoint_id, epoch, "starting checkpoint");
-
-        // ── Step 2b: Defense-in-depth changelog drain ──
-        // Flush any straggler changelog entries that arrived between
-        // prepare_wal_for_checkpoint() and this call. This ensures the
-        // operator state snapshot and source offsets are consistent.
-        for drainer in &mut self.changelog_drainers {
-            let extra = drainer.drain();
-            if extra > 0 {
-                debug!(extra_drained = extra, "drained straggler changelog entries");
-            }
-        }
-
-        // ── Step 3: Source snapshot (parallel) ──
-        self.phase = CheckpointPhase::Snapshotting;
-        let (source_offsets, table_offsets) = tokio::try_join!(
-            self.snapshot_sources(&self.sources),
-            self.snapshot_sources(&self.table_sources),
-        )?;
-
-        // ── Step 4: Sink pre-commit ──
-        self.phase = CheckpointPhase::PreCommitting;
-        if let Err(e) = self.pre_commit_sinks(epoch).await {
-            self.phase = CheckpointPhase::Idle;
-            self.checkpoints_failed += 1;
-            let duration = start.elapsed();
-            self.emit_checkpoint_metrics(false, epoch, duration);
-            error!(checkpoint_id, epoch, error = %e, "pre-commit failed");
-            return Ok(CheckpointResult {
-                success: false,
-                checkpoint_id,
-                epoch,
-                duration,
-                error: Some(format!("pre-commit failed: {e}")),
-            });
-        }
-
-        // ── Build manifest ──
-        let mut manifest = CheckpointManifest::new(checkpoint_id, epoch);
-        manifest.source_offsets = source_offsets;
-        manifest.table_offsets = table_offsets;
-        manifest.sink_epochs = self.collect_sink_epochs();
-        // Mark all exactly-once sinks as Pending before commit phase.
-        manifest.sink_commit_statuses = self.initial_sink_commit_statuses();
-        manifest.watermark = watermark;
-        // Prefer caller-provided per-source watermarks (from the pipeline's
-        // watermark tracker). Fall back to global watermark if none provided.
-        if source_watermarks.is_empty() {
-            if let Some(wm) = watermark {
-                manifest.source_watermarks = self.collect_source_watermarks(wm);
-            }
-        } else {
-            manifest.source_watermarks = source_watermarks;
-        }
-        manifest.wal_position = wal_position;
-        manifest.per_core_wal_positions = per_core_wal_positions;
-        manifest.table_store_checkpoint_path = table_store_checkpoint_path;
-        manifest.is_incremental = self.config.incremental;
-        manifest.source_names = self.sorted_source_names();
-        manifest.sink_names = self.sorted_sink_names();
-        manifest.pipeline_hash = pipeline_hash;
-
-        let state_data = Self::pack_operator_states(
-            &mut manifest,
-            &operator_states,
-            self.config.state_inline_threshold,
-        );
-        if let Some(ref sd) = state_data {
-            debug!(
-                checkpoint_id,
-                sidecar_bytes = sd.len(),
-                "writing operator state sidecar"
-            );
-        }
-
-        // ── Step 5: Persist manifest (decision record — sinks are Pending) ──
-        self.phase = CheckpointPhase::Persisting;
-        if let Err(e) = self.save_manifest(&manifest, state_data).await {
-            self.phase = CheckpointPhase::Idle;
-            self.checkpoints_failed += 1;
-            let duration = start.elapsed();
-            self.emit_checkpoint_metrics(false, epoch, duration);
-            if let Err(rollback_err) = self.rollback_sinks(epoch).await {
-                error!(
-                    checkpoint_id,
-                    epoch,
-                    error = %rollback_err,
-                    "[LDB-6004] sink rollback failed after manifest persist failure — \
-                     sinks may be in an inconsistent state"
-                );
-            }
-            error!(checkpoint_id, epoch, error = %e, "[LDB-6008] manifest persist failed");
-            return Ok(CheckpointResult {
-                success: false,
-                checkpoint_id,
-                epoch,
-                duration,
-                error: Some(format!("manifest persist failed: {e}")),
-            });
-        }
-
-        // ── Step 6: Sink commit (per-sink tracking) ──
-        self.phase = CheckpointPhase::Committing;
-        let sink_statuses = self.commit_sinks_tracked(epoch).await;
-        let has_failures = sink_statuses
-            .values()
-            .any(|s| matches!(s, SinkCommitStatus::Failed(_)));
-
-        // ── Step 6b: Save manifest again with final sink commit statuses ──
-        if !sink_statuses.is_empty() {
-            manifest.sink_commit_statuses = sink_statuses;
-            if let Err(e) = self.save_manifest(&manifest, None).await {
-                warn!(
-                    checkpoint_id,
-                    epoch,
-                    error = %e,
-                    "post-commit manifest update failed"
-                );
-            }
-        }
-
-        if has_failures {
-            self.checkpoints_failed += 1;
-            warn!(checkpoint_id, epoch, "sink commit partially failed");
-        }
-
-        // ── Step 7: Clear changelog drainer pending buffers ──
-        // Entries are metadata-only (key_hash + mmap_offset) used for SPSC
-        // backpressure relief. The checkpoint captured full state, so the
-        // metadata is no longer needed. Clearing prevents unbounded growth.
-        for drainer in &mut self.changelog_drainers {
-            drainer.clear_pending();
-        }
-
-        // ── Success ──
-        self.phase = CheckpointPhase::Idle;
-        self.next_checkpoint_id += 1;
-        self.epoch += 1;
-        self.checkpoints_completed += 1;
-        let duration = start.elapsed();
-        self.last_checkpoint_duration = Some(duration);
-        self.duration_histogram.record(duration);
-        self.emit_checkpoint_metrics(true, epoch, duration);
-        self.adjust_interval();
-
-        info!(
-            checkpoint_id,
-            epoch,
-            duration_ms = duration.as_millis(),
-            "checkpoint completed"
-        );
-
-        Ok(CheckpointResult {
-            success: true,
-            checkpoint_id,
-            epoch,
-            duration,
-            error: None,
-        })
+        self.checkpoint_inner(
+            operator_states,
+            watermark,
+            table_store_checkpoint_path,
+            HashMap::new(),
+            source_watermarks,
+            pipeline_hash,
+        )
+        .await
     }
 
     /// Snapshots all registered source connectors concurrently.
@@ -734,6 +637,10 @@ impl CheckpointCoordinator {
     }
 
     /// Inner pre-commit loop (no timeout).
+    ///
+    /// Only sinks with `exactly_once = true` participate in two-phase commit.
+    /// At-most-once sinks are skipped — they receive no `pre_commit`/`commit`
+    /// calls and provide no transactional guarantees.
     async fn pre_commit_sinks_inner(&self, epoch: u64) -> Result<(), DbError> {
         for sink in &self.sinks {
             if sink.exactly_once {
@@ -751,7 +658,40 @@ impl CheckpointCoordinator {
     /// Returns a map of sink name → commit status. Sinks that committed
     /// successfully are `Committed`; failures are `Failed(message)`.
     /// All sinks are attempted even if some fail.
+    ///
+    /// Bounded by [`CheckpointConfig::commit_timeout`] to prevent a stuck
+    /// sink from blocking checkpoint completion indefinitely.
     async fn commit_sinks_tracked(&self, epoch: u64) -> HashMap<String, SinkCommitStatus> {
+        let timeout_dur = self.config.commit_timeout;
+
+        match tokio::time::timeout(timeout_dur, self.commit_sinks_inner(epoch)).await {
+            Ok(statuses) => statuses,
+            Err(_elapsed) => {
+                error!(
+                    epoch,
+                    timeout_secs = timeout_dur.as_secs(),
+                    "[LDB-6012] sink commit timed out — marking all pending sinks as failed"
+                );
+                self.sinks
+                    .iter()
+                    .filter(|s| s.exactly_once)
+                    .map(|s| {
+                        (
+                            s.name.clone(),
+                            SinkCommitStatus::Failed(format!(
+                                "sink '{}' commit timed out after {}s",
+                                s.name,
+                                timeout_dur.as_secs()
+                            )),
+                        )
+                    })
+                    .collect()
+            }
+        }
+    }
+
+    /// Inner commit loop (no timeout).
+    async fn commit_sinks_inner(&self, epoch: u64) -> HashMap<String, SinkCommitStatus> {
         let mut statuses = HashMap::with_capacity(self.sinks.len());
 
         for sink in &self.sinks {
@@ -778,23 +718,34 @@ impl CheckpointCoordinator {
     /// Uses [`CheckpointStore::save_with_state`] to write optional sidecar
     /// data **before** the manifest, ensuring atomicity: if the sidecar write
     /// fails, the manifest is never persisted.
+    ///
+    /// Takes `manifest` by value to avoid cloning on the common path.
+    /// Callers that need the manifest after save should clone before calling.
+    ///
+    /// Bounded by [`CheckpointConfig::persist_timeout`] to prevent a hung
+    /// filesystem from stalling the runtime indefinitely.
     async fn save_manifest(
         &self,
-        manifest: &CheckpointManifest,
+        manifest: CheckpointManifest,
         state_data: Option<Vec<u8>>,
     ) -> Result<(), DbError> {
         let store = Arc::clone(&self.store);
-        let manifest = manifest.clone();
-        let task_result = tokio::task::spawn_blocking(move || {
-            store.save_with_state(&manifest, state_data.as_deref())
-        })
-        .await;
+        let timeout_dur = self.config.persist_timeout;
 
-        match task_result {
-            Ok(Ok(())) => Ok(()),
-            Ok(Err(e)) => Err(DbError::Checkpoint(format!("manifest persist failed: {e}"))),
-            Err(join_err) => Err(DbError::Checkpoint(format!(
+        let task = tokio::task::spawn_blocking(move || {
+            store.save_with_state(&manifest, state_data.as_deref())
+        });
+
+        match tokio::time::timeout(timeout_dur, task).await {
+            Ok(Ok(Ok(()))) => Ok(()),
+            Ok(Ok(Err(e))) => Err(DbError::Checkpoint(format!("manifest persist failed: {e}"))),
+            Ok(Err(join_err)) => Err(DbError::Checkpoint(format!(
                 "manifest persist task failed: {join_err}"
+            ))),
+            Err(_elapsed) => Err(DbError::Checkpoint(format!(
+                "[LDB-6011] manifest persist timed out after {}s — \
+                 filesystem may be degraded",
+                timeout_dur.as_secs()
             ))),
         }
     }
@@ -858,19 +809,6 @@ impl CheckpointCoordinator {
             }
         }
         epochs
-    }
-
-    /// Collects per-source watermarks for the manifest.
-    ///
-    /// Uses the global watermark as a conservative lower bound for all
-    /// registered sources. This ensures watermark progress is not lost
-    /// on recovery (prevents watermark regression).
-    fn collect_source_watermarks(&self, global_watermark: i64) -> HashMap<String, i64> {
-        let mut watermarks = HashMap::with_capacity(self.sources.len());
-        for source in &self.sources {
-            watermarks.insert(source.name.clone(), global_watermark);
-        }
-        watermarks
     }
 
     /// Returns sorted source names for topology tracking in the manifest.
@@ -1008,13 +946,39 @@ impl CheckpointCoordinator {
     /// # Errors
     ///
     /// Returns `DbError::Checkpoint` if any phase fails.
-    #[allow(clippy::too_many_arguments, clippy::too_many_lines)]
+    #[allow(clippy::too_many_arguments)]
     pub async fn checkpoint_with_extra_tables(
         &mut self,
         operator_states: HashMap<String, Vec<u8>>,
         watermark: Option<i64>,
-        wal_position: u64,
-        per_core_wal_positions: Vec<u64>,
+        table_store_checkpoint_path: Option<String>,
+        extra_table_offsets: HashMap<String, ConnectorCheckpoint>,
+        source_watermarks: HashMap<String, i64>,
+        pipeline_hash: Option<u64>,
+    ) -> Result<CheckpointResult, DbError> {
+        self.checkpoint_inner(
+            operator_states,
+            watermark,
+            table_store_checkpoint_path,
+            extra_table_offsets,
+            source_watermarks,
+            pipeline_hash,
+        )
+        .await
+    }
+
+    /// Shared checkpoint implementation for both [`checkpoint()`](Self::checkpoint)
+    /// and [`checkpoint_with_extra_tables()`](Self::checkpoint_with_extra_tables).
+    ///
+    /// WAL preparation is performed internally to guarantee atomicity:
+    /// changelog drain + epoch barrier + WAL sync happen after operator
+    /// states are received, so the WAL positions in the manifest always
+    /// reflect the state after the operator snapshot.
+    #[allow(clippy::too_many_arguments, clippy::too_many_lines)]
+    async fn checkpoint_inner(
+        &mut self,
+        operator_states: HashMap<String, Vec<u8>>,
+        watermark: Option<i64>,
         table_store_checkpoint_path: Option<String>,
         extra_table_offsets: HashMap<String, ConnectorCheckpoint>,
         source_watermarks: HashMap<String, i64>,
@@ -1024,18 +988,14 @@ impl CheckpointCoordinator {
         let checkpoint_id = self.next_checkpoint_id;
         let epoch = self.epoch;
 
-        info!(
-            checkpoint_id,
-            epoch, "starting checkpoint (with extra tables)"
-        );
+        info!(checkpoint_id, epoch, "starting checkpoint");
 
-        // ── Step 2b: Defense-in-depth changelog drain ──
-        for drainer in &mut self.changelog_drainers {
-            let extra = drainer.drain();
-            if extra > 0 {
-                debug!(extra_drained = extra, "drained straggler changelog entries");
-            }
-        }
+        // ── Step 2b: WAL preparation (internal) ──
+        // Drain changelog, write epoch barriers, sync WAL, capture positions.
+        // This MUST happen after operator states are received (passed as args)
+        // to guarantee WAL positions reflect post-snapshot state.
+        let wal_result = self.prepare_wal_for_checkpoint()?;
+        let per_core_wal_positions = wal_result.per_core_wal_positions;
 
         // ── Step 3: Source snapshot (parallel) ──
         self.phase = CheckpointPhase::Snapshotting;
@@ -1044,7 +1004,7 @@ impl CheckpointCoordinator {
             self.snapshot_sources(&self.table_sources),
         )?;
 
-        // Merge extra table offsets (from ReferenceTableSource instances)
+        // Merge extra table offsets (from ReferenceTableSource instances).
         for (name, cp) in extra_table_offsets {
             table_offsets.insert(name, cp);
         }
@@ -1054,6 +1014,7 @@ impl CheckpointCoordinator {
         if let Err(e) = self.pre_commit_sinks(epoch).await {
             self.phase = CheckpointPhase::Idle;
             self.checkpoints_failed += 1;
+            self.maybe_cap_drainers();
             let duration = start.elapsed();
             self.emit_checkpoint_metrics(false, epoch, duration);
             error!(checkpoint_id, epoch, error = %e, "pre-commit failed");
@@ -1071,16 +1032,15 @@ impl CheckpointCoordinator {
         manifest.source_offsets = source_offsets;
         manifest.table_offsets = table_offsets;
         manifest.sink_epochs = self.collect_sink_epochs();
+        // Mark all exactly-once sinks as Pending before commit phase.
         manifest.sink_commit_statuses = self.initial_sink_commit_statuses();
         manifest.watermark = watermark;
-        if source_watermarks.is_empty() {
-            if let Some(wm) = watermark {
-                manifest.source_watermarks = self.collect_source_watermarks(wm);
-            }
-        } else {
-            manifest.source_watermarks = source_watermarks;
-        }
-        manifest.wal_position = wal_position;
+        // Use caller-provided per-source watermarks if available. When empty,
+        // leave source_watermarks empty — recovery falls back to the global
+        // manifest.watermark. Do NOT fabricate per-source values from the
+        // global watermark, as that loses granularity on recovery.
+        manifest.source_watermarks = source_watermarks;
+        // wal_position is legacy (single-writer mode); per-core positions are authoritative.
         manifest.per_core_wal_positions = per_core_wal_positions;
         manifest.table_store_checkpoint_path = table_store_checkpoint_path;
         manifest.is_incremental = self.config.incremental;
@@ -1093,19 +1053,52 @@ impl CheckpointCoordinator {
             &operator_states,
             self.config.state_inline_threshold,
         );
-        if let Some(ref sd) = state_data {
+        let sidecar_bytes = state_data.as_ref().map_or(0, Vec::len);
+        if sidecar_bytes > 0 {
             debug!(
                 checkpoint_id,
-                sidecar_bytes = sd.len(),
-                "writing operator state sidecar"
+                sidecar_bytes, "writing operator state sidecar"
             );
         }
 
+        // ── Step 4b: Checkpoint size check ──
+        if let Some(cap) = self.config.max_checkpoint_bytes {
+            if sidecar_bytes > cap {
+                self.phase = CheckpointPhase::Idle;
+                self.checkpoints_failed += 1;
+                self.maybe_cap_drainers();
+                let duration = start.elapsed();
+                self.emit_checkpoint_metrics(false, epoch, duration);
+                let msg = format!(
+                    "[LDB-6014] checkpoint size {sidecar_bytes} bytes exceeds \
+                     cap {cap} bytes — checkpoint rejected"
+                );
+                error!(checkpoint_id, epoch, sidecar_bytes, cap, "{msg}");
+                return Ok(CheckpointResult {
+                    success: false,
+                    checkpoint_id,
+                    epoch,
+                    duration,
+                    error: Some(msg),
+                });
+            }
+            let warn_threshold = cap * 4 / 5; // 80%
+            if sidecar_bytes > warn_threshold {
+                warn!(
+                    checkpoint_id,
+                    epoch, sidecar_bytes, cap, "checkpoint size approaching cap (>80%)"
+                );
+            }
+        }
+        // Track cumulative bytes written (updated after successful persist below).
+        let checkpoint_bytes = sidecar_bytes as u64;
+
         // ── Step 5: Persist manifest (decision record — sinks are Pending) ──
         self.phase = CheckpointPhase::Persisting;
-        if let Err(e) = self.save_manifest(&manifest, state_data).await {
+        if let Err(e) = self.save_manifest(manifest.clone(), state_data).await {
             self.phase = CheckpointPhase::Idle;
             self.checkpoints_failed += 1;
+            self.maybe_cap_drainers();
             let duration = start.elapsed();
             self.emit_checkpoint_metrics(false, epoch, duration);
             if let Err(rollback_err) = self.rollback_sinks(epoch).await {
@@ -1137,7 +1130,7 @@ impl CheckpointCoordinator {
         // ── Step 6b: Save manifest again with final sink commit statuses ──
         if !sink_statuses.is_empty() {
             manifest.sink_commit_statuses = sink_statuses;
-            if let Err(e) = self.save_manifest(&manifest, None).await {
+            if let Err(e) = self.save_manifest(manifest, None).await {
                 warn!(
                     checkpoint_id,
                     epoch,
@@ -1152,11 +1145,20 @@ impl CheckpointCoordinator {
             warn!(checkpoint_id, epoch, "sink commit partially failed");
         }
 
+        // ── Step 7: Clear changelog drainer pending buffers ──
+        // Entries are metadata-only (key_hash + mmap_offset) used for SPSC
+        // backpressure relief. The checkpoint captured full state, so the
+        // metadata is no longer needed. Clearing prevents unbounded growth.
+        for drainer in &mut self.changelog_drainers {
+            drainer.clear_pending();
+        }
+
         // ── Success ──
         self.phase = CheckpointPhase::Idle;
         self.next_checkpoint_id += 1;
         self.epoch += 1;
         self.checkpoints_completed += 1;
+        self.total_bytes_written += checkpoint_bytes;
         let duration = start.elapsed();
         self.last_checkpoint_duration = Some(duration);
         self.duration_histogram.record(duration);
@@ -1550,15 +1552,7 @@ mod tests {
         let mut coord = make_coordinator(dir.path());
 
         let result = coord
-            .checkpoint(
-                HashMap::new(),
-                Some(1000),
-                0,
-                vec![],
-                None,
-                HashMap::new(),
-                None,
-            )
+            .checkpoint(HashMap::new(), Some(1000), None, HashMap::new(), None)
             .await
             .unwrap();
 
@@ -1574,15 +1568,7 @@ mod tests {
 
         // Second checkpoint should increment
         let result2 = coord
-            .checkpoint(
-                HashMap::new(),
-                Some(2000),
-                100,
-                vec![],
-                None,
-                HashMap::new(),
-                None,
-            )
+            .checkpoint(HashMap::new(), Some(2000), None, HashMap::new(), None)
             .await
             .unwrap();
 
@@ -1605,7 +1591,7 @@ mod tests {
         ops.insert("filter".into(), b"filter-state".to_vec());
 
         let result = coord
-            .checkpoint(ops, None, 4096, vec![100, 200], None, HashMap::new(), None)
+            .checkpoint(ops, None, None, HashMap::new(), None)
             .await
             .unwrap();
 
@@ -1613,8 +1599,8 @@ mod tests {
 
         let loaded = coord.store().load_latest().unwrap().unwrap();
         assert_eq!(loaded.operator_states.len(), 2);
-        assert_eq!(loaded.wal_position, 4096);
-        assert_eq!(loaded.per_core_wal_positions, vec![100, 200]);
+        // No WAL manager registered → positions are empty
+        assert!(loaded.per_core_wal_positions.is_empty());
 
         let window_op = loaded.operator_states.get("window-agg").unwrap();
         assert_eq!(window_op.decode_inline().unwrap(), b"state-data");
@@ -1629,8 +1615,6 @@ mod tests {
             .checkpoint(
                 HashMap::new(),
                 None,
-                0,
-                vec![],
                 Some("/tmp/rocksdb_cp".into()),
                 HashMap::new(),
                 None,
@@ -1884,20 +1868,9 @@ mod tests {
         let drainer = ChangelogDrainer::new(buf, 100);
         coord.register_changelog_drainer(drainer);
 
-        // Full cycle: prepare → checkpoint → truncate
-        let wal_result = coord.prepare_wal_for_checkpoint().unwrap();
-        assert_eq!(wal_result.entries_drained, 1);
-
+        // Full cycle: checkpoint (WAL preparation is internal) → truncate
         let result = coord
-            .checkpoint(
-                HashMap::new(),
-                Some(5000),
-                0,
-                wal_result.per_core_wal_positions.clone(),
-                None,
-                HashMap::new(),
-                None,
-            )
+            .checkpoint(HashMap::new(), Some(5000), None, HashMap::new(), None)
             .await
             .unwrap();
 
@@ -1910,12 +1883,9 @@ mod tests {
             "pending entries should be cleared after checkpoint"
         );
 
-        // Manifest should have per-core WAL positions
+        // Manifest should have per-core WAL positions (captured internally)
         let loaded = coord.store().load_latest().unwrap().unwrap();
-        assert_eq!(
-            loaded.per_core_wal_positions.len(),
-            wal_result.per_core_wal_positions.len()
-        );
+        assert_eq!(loaded.per_core_wal_positions.len(), 2);
 
         // Truncate WAL
         coord.truncate_wal_after_checkpoint().unwrap();
@@ -1971,15 +1941,7 @@ mod tests {
         coord.set_counters(Arc::clone(&counters));
 
         let result = coord
-            .checkpoint(
-                HashMap::new(),
-                Some(1000),
-                0,
-                vec![],
-                None,
-                HashMap::new(),
-                None,
-            )
+            .checkpoint(HashMap::new(), Some(1000), None, HashMap::new(), None)
             .await
             .unwrap();
 
@@ -1991,15 +1953,7 @@ mod tests {
 
         // Second checkpoint
         let result2 = coord
-            .checkpoint(
-                HashMap::new(),
-                Some(2000),
-                0,
-                vec![],
-                None,
-                HashMap::new(),
-                None,
-            )
+            .checkpoint(HashMap::new(), Some(2000), None, HashMap::new(), None)
             .await
             .unwrap();
 
@@ -2015,7 +1969,7 @@ mod tests {
         let mut coord = make_coordinator(dir.path());
 
         let result = coord
-            .checkpoint(HashMap::new(), None, 0, vec![], None, HashMap::new(), None)
+            .checkpoint(HashMap::new(), None, None, HashMap::new(), None)
             .await
             .unwrap();
 
@@ -2097,7 +2051,7 @@ mod tests {
         ops.insert("large".into(), vec![0xBBu8; 200]);
 
         let result = coord
-            .checkpoint(ops, None, 0, vec![], None, HashMap::new(), None)
+            .checkpoint(ops, None, None, HashMap::new(), None)
             .await
             .unwrap();
         assert!(result.success);
@@ -2129,7 +2083,7 @@ mod tests {
         ops.insert("op1".into(), b"small-state".to_vec());
 
         let result = coord
-            .checkpoint(ops, None, 0, vec![], None, HashMap::new(), None)
+            .checkpoint(ops, None, None, HashMap::new(), None)
             .await
             .unwrap();
         assert!(result.success);
@@ -2260,7 +2214,7 @@ mod tests {
         // Run 3 checkpoints.
         for _ in 0..3 {
             let result = coord
-                .checkpoint(HashMap::new(), None, 0, vec![], None, HashMap::new(), None)
+                .checkpoint(HashMap::new(), None, None, HashMap::new(), None)
                 .await
                 .unwrap();
             assert!(result.success);

@@ -87,7 +87,11 @@ pub struct CheckpointManifest {
     /// WAL position for single-writer mode.
     #[serde(default)]
     pub wal_position: u64,
-    /// Per-core WAL positions for thread-per-core mode.
+    /// Per-core WAL positions at the time of operator snapshot.
+    ///
+    /// During recovery, WAL replay must start **after** these positions to
+    /// avoid replaying entries already reflected in the operator state.
+    /// Index `i` corresponds to the WAL segment for core `i`.
     #[serde(default)]
     pub per_core_wal_positions: Vec<u64>,
 

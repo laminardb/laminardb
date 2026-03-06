@@ -215,8 +215,6 @@ async fn test_barrier_checkpoint_recovery_round_trip() {
         .checkpoint_with_extra_tables(
             operator_states,
             Some(4500), // global watermark = min of sources
-            0,
-            Vec::new(),
             None,
             extra_tables,
             source_watermarks,

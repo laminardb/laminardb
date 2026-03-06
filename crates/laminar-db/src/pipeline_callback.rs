@@ -280,8 +280,6 @@ impl crate::pipeline::PipelineCallback for ConnectorPipelineCallback {
                     .checkpoint_with_extra_tables(
                         operator_states,
                         None,
-                        0,
-                        Vec::new(),
                         None,
                         extra_tables,
                         per_source_watermarks,
@@ -318,8 +316,6 @@ impl crate::pipeline::PipelineCallback for ConnectorPipelineCallback {
                         .checkpoint_with_extra_tables(
                             operator_states,
                             None,
-                            0,
-                            Vec::new(),
                             None,
                             extra_tables,
                             per_source_watermarks,
@@ -413,8 +409,6 @@ impl crate::pipeline::PipelineCallback for ConnectorPipelineCallback {
                 .checkpoint_with_extra_tables(
                     operator_states,
                     None,
-                    0,
-                    Vec::new(),
                     None,
                     extra_tables,
                     per_source_watermarks,
