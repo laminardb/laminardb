@@ -68,6 +68,14 @@ pub struct CheckpointConfig {
     ///
     /// Default: 1 MB (`1_048_576`). Set to `usize::MAX` to inline everything.
     pub state_inline_threshold: usize,
+    /// Maximum total checkpoint size in bytes (manifest + sidecar).
+    ///
+    /// If the packed operator state exceeds this limit, the checkpoint is
+    /// rejected with `[LDB-6014]` and not persisted. This prevents
+    /// unbounded state from creating multi-GB sidecar files.
+    ///
+    /// `None` means no limit (default). A warning is logged at 80% of the cap.
+    pub max_checkpoint_bytes: Option<usize>,
     /// Maximum pending changelog entries per drainer before forced clear.
     ///
     /// On checkpoint failure, `clear_pending()` is normally skipped. If
@@ -174,6 +182,7 @@ impl Default for CheckpointConfig {
             commit_timeout: Duration::from_secs(60),
             incremental: false,
             state_inline_threshold: 1_048_576,
+            max_checkpoint_bytes: None,
             max_pending_changelog_entries: 10_000_000,
             adaptive: None,
             unaligned: None,
@@ -1053,13 +1062,45 @@ impl CheckpointCoordinator {
             &operator_states,
             self.config.state_inline_threshold,
         );
-        if let Some(ref sd) = state_data {
-            debug!(
-                checkpoint_id,
-                sidecar_bytes = sd.len(),
-                "writing operator state sidecar"
-            );
+        let sidecar_bytes = state_data.as_ref().map_or(0, Vec::len);
+        if sidecar_bytes > 0 {
+            debug!(checkpoint_id, sidecar_bytes, "writing operator state sidecar");
         }
+
+        // ── Step 4b: Checkpoint size check ──
+        if let Some(cap) = self.config.max_checkpoint_bytes {
+            if sidecar_bytes > cap {
+                self.phase = CheckpointPhase::Idle;
+                self.checkpoints_failed += 1;
+                self.maybe_cap_drainers();
+                let duration = start.elapsed();
+                self.emit_checkpoint_metrics(false, epoch, duration);
+                let msg = format!(
+                    "[LDB-6014] checkpoint size {sidecar_bytes} bytes exceeds \
+                     cap {cap} bytes — checkpoint rejected"
+                );
+                error!(checkpoint_id, epoch, sidecar_bytes, cap, "{msg}");
+                return Ok(CheckpointResult {
+                    success: false,
+                    checkpoint_id,
+                    epoch,
+                    duration,
+                    error: Some(msg),
+                });
+            }
+            let warn_threshold = cap * 4 / 5; // 80%
+            if sidecar_bytes > warn_threshold {
+                warn!(
+                    checkpoint_id,
+                    epoch,
+                    sidecar_bytes,
+                    cap,
+                    "checkpoint size approaching cap (>80%)"
+                );
+            }
+        }
+        // Track cumulative bytes written (updated after successful persist below).
+        let checkpoint_bytes = sidecar_bytes as u64;
 
         // ── Step 5: Persist manifest (decision record — sinks are Pending) ──
         self.phase = CheckpointPhase::Persisting;
@@ -1126,6 +1167,7 @@ impl CheckpointCoordinator {
         self.next_checkpoint_id += 1;
         self.epoch += 1;
         self.checkpoints_completed += 1;
+        self.total_bytes_written += checkpoint_bytes;
         let duration = start.elapsed();
         self.last_checkpoint_duration = Some(duration);
         self.duration_histogram.record(duration);
