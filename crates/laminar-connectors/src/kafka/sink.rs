@@ -118,6 +118,8 @@ pub struct KafkaSink {
     schema: SchemaRef,
     /// Optional Schema Registry client.
     schema_registry: Option<Arc<SchemaRegistryClient>>,
+    /// Shared Avro schema ID (updated after SR registration).
+    avro_schema_id: Arc<std::sync::atomic::AtomicU32>,
     /// Cached topic partition count (queried from broker metadata after open).
     topic_partition_count: i32,
 }
@@ -128,6 +130,7 @@ impl KafkaSink {
     pub fn new(schema: SchemaRef, config: KafkaSinkConfig) -> Self {
         let serializer = select_serializer(config.format, &schema);
         let partitioner = select_partitioner(config.partitioner);
+        let avro_schema_id = Arc::new(std::sync::atomic::AtomicU32::new(0));
 
         Self {
             producer: None,
@@ -142,6 +145,7 @@ impl KafkaSink {
             metrics: KafkaSinkMetrics::new(),
             schema,
             schema_registry: None,
+            avro_schema_id,
             topic_partition_count: DEFAULT_PARTITION_COUNT,
         }
     }
@@ -154,13 +158,12 @@ impl KafkaSink {
         sr_client: SchemaRegistryClient,
     ) -> Self {
         let sr = Arc::new(sr_client);
+        let avro_schema_id = Arc::new(std::sync::atomic::AtomicU32::new(0));
         let serializer: Box<dyn RecordSerializer> = if config.format == Format::Avro {
-            // Schema ID 0 as placeholder — will be updated during open()
-            // after schema registration with the registry.
-            Box::new(AvroSerializer::with_schema_registry(
+            Box::new(AvroSerializer::with_shared_schema_id(
                 schema.clone(),
-                0,
-                Arc::clone(&sr),
+                Arc::clone(&avro_schema_id),
+                Some(Arc::clone(&sr)),
             ))
         } else {
             select_serializer(config.format, &schema)
@@ -181,6 +184,7 @@ impl KafkaSink {
             metrics: KafkaSinkMetrics::new(),
             schema,
             schema_registry: Some(sr),
+            avro_schema_id,
             topic_partition_count: DEFAULT_PARTITION_COUNT,
         }
     }
@@ -377,10 +381,61 @@ impl SinkConnector for KafkaSink {
         // Initialize Schema Registry client if configured.
         if let Some(ref url) = self.config.schema_registry_url {
             if self.schema_registry.is_none() {
-                self.schema_registry = Some(Arc::new(SchemaRegistryClient::new(
-                    url,
-                    self.config.schema_registry_auth.clone(),
-                )));
+                let sr = if let Some(ref ca_path) = self.config.schema_registry_ssl_ca_location {
+                    SchemaRegistryClient::with_tls(
+                        url,
+                        self.config.schema_registry_auth.clone(),
+                        ca_path,
+                    )?
+                } else {
+                    SchemaRegistryClient::new(url, self.config.schema_registry_auth.clone())
+                };
+                self.schema_registry = Some(Arc::new(sr));
+            }
+        }
+
+        // Register Avro schema with Schema Registry if configured.
+        if self.config.format == Format::Avro {
+            if let Some(ref sr) = self.schema_registry {
+                let subject = format!("{}-value", self.config.topic);
+
+                // Set compatibility level if configured.
+                if let Some(ref compat) = self.config.schema_compatibility {
+                    sr.set_compatibility_level(&subject, *compat)
+                        .await
+                        .map_err(|e| {
+                            ConnectorError::ConnectionFailed(format!(
+                                "failed to set SR compatibility for '{subject}': {e}"
+                            ))
+                        })?;
+                }
+
+                let avro_schema =
+                    super::schema_registry::arrow_to_avro_schema(&self.schema, &self.config.topic)
+                        .map_err(ConnectorError::Serde)?;
+
+                let schema_id = sr
+                    .register_schema(
+                        &subject,
+                        &avro_schema,
+                        super::schema_registry::SchemaType::Avro,
+                    )
+                    .await
+                    .map_err(|e| {
+                        ConnectorError::ConnectionFailed(format!(
+                            "failed to register schema for '{subject}': {e}"
+                        ))
+                    })?;
+
+                #[allow(clippy::cast_sign_loss)]
+                self.avro_schema_id
+                    .store(schema_id as u32, std::sync::atomic::Ordering::Relaxed);
+
+                info!(
+                    subject = %subject,
+                    schema_id,
+                    "registered Avro schema with Schema Registry"
+                );
             }
         }
 

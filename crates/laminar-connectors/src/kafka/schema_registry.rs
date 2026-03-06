@@ -182,6 +182,49 @@ impl SchemaRegistryClient {
         Self::with_cache_config(base_url, auth, SchemaRegistryCacheConfig::default())
     }
 
+    /// Creates a new Schema Registry client with a custom CA certificate.
+    ///
+    /// # Errors
+    ///
+    /// Returns `ConnectorError::ConfigurationError` if the CA cert file
+    /// cannot be read or parsed.
+    pub fn with_tls(
+        base_url: impl Into<String>,
+        auth: Option<SrAuth>,
+        ca_cert_path: &str,
+    ) -> Result<Self, ConnectorError> {
+        let pem = std::fs::read(ca_cert_path).map_err(|e| {
+            ConnectorError::ConfigurationError(format!(
+                "failed to read SR CA cert at '{ca_cert_path}': {e}"
+            ))
+        })?;
+        let cert = reqwest::tls::Certificate::from_pem(&pem).map_err(|e| {
+            ConnectorError::ConfigurationError(format!(
+                "invalid PEM CA cert at '{ca_cert_path}': {e}"
+            ))
+        })?;
+        let client = Client::builder()
+            .add_root_certificate(cert)
+            .build()
+            .map_err(|e| {
+                ConnectorError::ConfigurationError(format!("failed to build TLS client: {e}"))
+            })?;
+
+        let cache_config = SchemaRegistryCacheConfig::default();
+        let cache = CacheBuilder::new(cache_config.max_entries)
+            .with_shards(4)
+            .build();
+        let subject_cache = CacheBuilder::new(256).with_shards(4).build();
+        Ok(Self {
+            client,
+            base_url: base_url.into().trim_end_matches('/').to_string(),
+            auth,
+            cache,
+            subject_cache,
+            cache_config,
+        })
+    }
+
     /// Creates a new Schema Registry client with custom cache config.
     #[must_use]
     pub fn with_cache_config(
