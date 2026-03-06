@@ -13,7 +13,7 @@ use arrow_schema::{DataType, Field, Schema};
 use criterion::{criterion_group, criterion_main, BenchmarkId, Criterion, Throughput};
 use laminar_core::operator::asof_join::{AsofDirection, AsofJoinConfig, AsofJoinOperator};
 use laminar_core::operator::stream_join::{JoinSide, JoinType, StreamJoinOperator};
-use laminar_core::operator::{Event, Operator, OperatorContext};
+use laminar_core::operator::{Event, OperatorContext};
 use laminar_core::state::InMemoryStore;
 use laminar_core::time::{BoundedOutOfOrdernessGenerator, TimerService};
 
