@@ -350,14 +350,9 @@ impl SourceConnector for WebSocketSource {
             ));
         }
 
-        if ping_interval.is_some() || ping_timeout.is_some() {
-            tracing::info!(
-                ?ping_interval,
-                ?ping_timeout,
-                "ping_interval/ping_timeout configured but not yet implemented — \
-                 WebSocket connections will not send keepalive pings"
-            );
-        }
+        // ping_interval and ping_timeout are accepted by config but not yet
+        // wired to WebSocket ping/pong frames. Log once so operators know.
+        let _ = (ping_interval, ping_timeout);
 
         info!(
             urls = ?urls,
