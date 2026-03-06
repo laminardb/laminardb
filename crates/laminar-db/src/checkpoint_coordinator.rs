@@ -49,6 +49,15 @@ pub struct CheckpointConfig {
     /// A stuck sink will not block checkpointing indefinitely.
     /// Defaults to 30 seconds.
     pub pre_commit_timeout: Duration,
+    /// Maximum time to wait for manifest persist (filesystem I/O).
+    ///
+    /// A hung or degraded filesystem will not stall the runtime indefinitely.
+    /// Defaults to 120 seconds.
+    pub persist_timeout: Duration,
+    /// Maximum time to wait for all sinks to commit (phase 2).
+    ///
+    /// Defaults to 60 seconds.
+    pub commit_timeout: Duration,
     /// Whether to use incremental checkpoints.
     pub incremental: bool,
     /// Maximum operator state size (bytes) to inline in the JSON manifest.
@@ -161,6 +170,8 @@ impl Default for CheckpointConfig {
             max_retained: 3,
             alignment_timeout: Duration::from_secs(30),
             pre_commit_timeout: Duration::from_secs(30),
+            persist_timeout: Duration::from_secs(120),
+            commit_timeout: Duration::from_secs(60),
             incremental: false,
             state_inline_threshold: 1_048_576,
             max_pending_changelog_entries: 10_000_000,
@@ -638,7 +649,40 @@ impl CheckpointCoordinator {
     /// Returns a map of sink name → commit status. Sinks that committed
     /// successfully are `Committed`; failures are `Failed(message)`.
     /// All sinks are attempted even if some fail.
+    ///
+    /// Bounded by [`CheckpointConfig::commit_timeout`] to prevent a stuck
+    /// sink from blocking checkpoint completion indefinitely.
     async fn commit_sinks_tracked(&self, epoch: u64) -> HashMap<String, SinkCommitStatus> {
+        let timeout_dur = self.config.commit_timeout;
+
+        match tokio::time::timeout(timeout_dur, self.commit_sinks_inner(epoch)).await {
+            Ok(statuses) => statuses,
+            Err(_elapsed) => {
+                error!(
+                    epoch,
+                    timeout_secs = timeout_dur.as_secs(),
+                    "[LDB-6012] sink commit timed out — marking all pending sinks as failed"
+                );
+                self.sinks
+                    .iter()
+                    .filter(|s| s.exactly_once)
+                    .map(|s| {
+                        (
+                            s.name.clone(),
+                            SinkCommitStatus::Failed(format!(
+                                "sink '{}' commit timed out after {}s",
+                                s.name,
+                                timeout_dur.as_secs()
+                            )),
+                        )
+                    })
+                    .collect()
+            }
+        }
+    }
+
+    /// Inner commit loop (no timeout).
+    async fn commit_sinks_inner(&self, epoch: u64) -> HashMap<String, SinkCommitStatus> {
         let mut statuses = HashMap::with_capacity(self.sinks.len());
 
         for sink in &self.sinks {
@@ -665,6 +709,9 @@ impl CheckpointCoordinator {
     /// Uses [`CheckpointStore::save_with_state`] to write optional sidecar
     /// data **before** the manifest, ensuring atomicity: if the sidecar write
     /// fails, the manifest is never persisted.
+    ///
+    /// Bounded by [`CheckpointConfig::persist_timeout`] to prevent a hung
+    /// filesystem from stalling the runtime indefinitely.
     async fn save_manifest(
         &self,
         manifest: &CheckpointManifest,
@@ -672,16 +719,22 @@ impl CheckpointCoordinator {
     ) -> Result<(), DbError> {
         let store = Arc::clone(&self.store);
         let manifest = manifest.clone();
-        let task_result = tokio::task::spawn_blocking(move || {
-            store.save_with_state(&manifest, state_data.as_deref())
-        })
-        .await;
+        let timeout_dur = self.config.persist_timeout;
 
-        match task_result {
-            Ok(Ok(())) => Ok(()),
-            Ok(Err(e)) => Err(DbError::Checkpoint(format!("manifest persist failed: {e}"))),
-            Err(join_err) => Err(DbError::Checkpoint(format!(
+        let task = tokio::task::spawn_blocking(move || {
+            store.save_with_state(&manifest, state_data.as_deref())
+        });
+
+        match tokio::time::timeout(timeout_dur, task).await {
+            Ok(Ok(Ok(()))) => Ok(()),
+            Ok(Ok(Err(e))) => Err(DbError::Checkpoint(format!("manifest persist failed: {e}"))),
+            Ok(Err(join_err)) => Err(DbError::Checkpoint(format!(
                 "manifest persist task failed: {join_err}"
+            ))),
+            Err(_elapsed) => Err(DbError::Checkpoint(format!(
+                "[LDB-6011] manifest persist timed out after {}s — \
+                 filesystem may be degraded",
+                timeout_dur.as_secs()
             ))),
         }
     }
