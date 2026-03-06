@@ -41,6 +41,17 @@ pub enum PerCoreWalError {
         reason: String,
     },
 
+    /// Data corruption detected (e.g., oversized entry).
+    #[error("Corrupted WAL entry at position {position} in segment {core_id}: {reason}")]
+    Corrupted {
+        /// Core ID of the segment.
+        core_id: usize,
+        /// Position of the corrupted record.
+        position: u64,
+        /// Description of the corruption.
+        reason: String,
+    },
+
     /// Invalid core ID.
     #[error("Invalid core ID {core_id}: max is {max_core_id}")]
     InvalidCoreId {

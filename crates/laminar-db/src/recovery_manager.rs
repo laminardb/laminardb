@@ -27,7 +27,7 @@ use std::collections::HashMap;
 
 use laminar_storage::checkpoint_manifest::{CheckpointManifest, SinkCommitStatus};
 use laminar_storage::checkpoint_store::CheckpointStore;
-use tracing::{debug, info, warn};
+use tracing::{debug, error, info, warn};
 
 use crate::checkpoint_coordinator::{
     connector_to_source_checkpoint, RegisteredSink, RegisteredSource,
@@ -218,27 +218,48 @@ impl<'a> RecoveryManager<'a> {
     /// bytes from `state.bin` and replaces it with an inline entry. This
     /// makes the rest of recovery code work uniformly with inline state.
     fn resolve_external_states(&self, manifest: &mut CheckpointManifest) {
-        let has_external = manifest.operator_states.values().any(|op| op.external);
+        let external_ops: Vec<String> = manifest
+            .operator_states
+            .iter()
+            .filter(|(_, op)| op.external)
+            .map(|(name, _)| name.clone())
+            .collect();
 
-        if !has_external {
+        if external_ops.is_empty() {
             return;
         }
 
         let state_data = match self.store.load_state_data(manifest.checkpoint_id) {
             Ok(Some(data)) => data,
             Ok(None) => {
-                warn!(
+                error!(
                     checkpoint_id = manifest.checkpoint_id,
-                    "sidecar state.bin missing but manifest has external operator states"
+                    operators = ?external_ops,
+                    "sidecar state.bin missing — external operator states \
+                     cannot be resolved; operators will start with empty state"
                 );
+                // Clear external flag so recovery doesn't attempt to
+                // dereference invalid offsets later
+                for name in &external_ops {
+                    if let Some(op) = manifest.operator_states.get_mut(name) {
+                        *op = laminar_storage::checkpoint_manifest::OperatorCheckpoint::inline(&[]);
+                    }
+                }
                 return;
             }
             Err(e) => {
-                warn!(
+                error!(
                     checkpoint_id = manifest.checkpoint_id,
                     error = %e,
-                    "failed to load sidecar state.bin"
+                    operators = ?external_ops,
+                    "failed to load sidecar state.bin — external operator states \
+                     cannot be resolved; operators will start with empty state"
                 );
+                for name in &external_ops {
+                    if let Some(op) = manifest.operator_states.get_mut(name) {
+                        *op = laminar_storage::checkpoint_manifest::OperatorCheckpoint::inline(&[]);
+                    }
+                }
                 return;
             }
         };
@@ -250,22 +271,26 @@ impl<'a> RecoveryManager<'a> {
                 #[allow(clippy::cast_possible_truncation)]
                 let end = start + op.external_length as usize;
                 if end <= state_data.len() {
+                    let external_offset = op.external_offset;
+                    let external_length = op.external_length;
                     let data = &state_data[start..end];
                     *op = laminar_storage::checkpoint_manifest::OperatorCheckpoint::inline(data);
                     debug!(
                         operator = %name,
-                        offset = op.external_offset,
-                        length = op.external_length,
+                        offset = external_offset,
+                        length = external_length,
                         "resolved external operator state from sidecar"
                     );
                 } else {
-                    warn!(
+                    error!(
                         operator = %name,
                         offset = start,
                         length = op.external_length,
                         sidecar_len = state_data.len(),
-                        "sidecar too small for external operator state"
+                        "sidecar too small for external operator state — \
+                         operator will start with empty state"
                     );
+                    *op = laminar_storage::checkpoint_manifest::OperatorCheckpoint::inline(&[]);
                 }
             }
         }
@@ -800,9 +825,17 @@ mod tests {
         let mgr = RecoveryManager::new(&store);
         let result = mgr.recover(&[], &[], &[]).await.unwrap().unwrap();
 
-        // Should still recover (gracefully), but external state unresolved
+        // Should still recover (gracefully) — external state replaced with
+        // empty inline to avoid dangling offset references
         let op = result.operator_states().get("orphan").unwrap();
-        assert!(op.external, "unresolved external state stays external");
+        assert!(
+            !op.external,
+            "unresolved external state replaced with inline empty"
+        );
+        assert!(
+            op.state_b64.as_ref().is_none_or(String::is_empty),
+            "replaced state should be empty"
+        );
     }
 
     #[tokio::test]

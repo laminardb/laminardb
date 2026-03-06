@@ -30,6 +30,17 @@ pub enum WalReadResult {
     ChecksumMismatch {
         /// Position of the corrupted record.
         position: u64,
+        /// Expected CRC32C value from the record header.
+        expected: u32,
+        /// Actual CRC32C computed from the data.
+        actual: u32,
+    },
+    /// Data corruption detected (e.g., oversized entry).
+    Corrupted {
+        /// Position of the corrupted record.
+        position: u64,
+        /// Description of the corruption.
+        reason: String,
     },
 }
 
@@ -144,6 +155,14 @@ impl PerCoreWalReader {
         let expected_crc = u32::from_le_bytes(crc_bytes);
         self.position += 4;
 
+        // Guard against corrupted length field causing OOM (256 MiB)
+        if len > 256 * 1024 * 1024 {
+            return Ok(WalReadResult::Corrupted {
+                position: record_start,
+                reason: format!("entry length {len} exceeds 256 MiB — likely corrupted"),
+            });
+        }
+
         // Check for incomplete data
         let data_remaining = self.file_len.saturating_sub(self.position);
         if data_remaining < len {
@@ -167,6 +186,8 @@ impl PerCoreWalReader {
         if actual_crc != expected_crc {
             return Ok(WalReadResult::ChecksumMismatch {
                 position: record_start,
+                expected: expected_crc,
+                actual: actual_crc,
             });
         }
 
@@ -234,7 +255,9 @@ impl PerCoreWalReader {
                 WalReadResult::Eof => {
                     break;
                 }
-                WalReadResult::TornWrite { .. } | WalReadResult::ChecksumMismatch { .. } => {
+                WalReadResult::TornWrite { .. }
+                | WalReadResult::ChecksumMismatch { .. }
+                | WalReadResult::Corrupted { .. } => {
                     // Truncate at the start of the invalid record
                     valid_position = pos_before;
                     break;
@@ -260,12 +283,21 @@ impl Iterator for PerCoreWalReader {
                     reason,
                 }))
             }
-            Ok(WalReadResult::ChecksumMismatch { position }) => {
-                Some(Err(PerCoreWalError::ChecksumMismatch {
+            Ok(WalReadResult::ChecksumMismatch {
+                position,
+                expected,
+                actual,
+            }) => Some(Err(PerCoreWalError::ChecksumMismatch {
+                core_id: self.core_id,
+                position,
+                expected,
+                actual,
+            })),
+            Ok(WalReadResult::Corrupted { position, reason }) => {
+                Some(Err(PerCoreWalError::Corrupted {
                     core_id: self.core_id,
                     position,
-                    expected: 0,
-                    actual: 0,
+                    reason,
                 }))
             }
             Err(e) => Some(Err(e)),
@@ -457,8 +489,13 @@ mod tests {
         let mut reader = PerCoreWalReader::open(0, &path).unwrap();
 
         match reader.read_next().unwrap() {
-            WalReadResult::ChecksumMismatch { position } => {
+            WalReadResult::ChecksumMismatch {
+                position,
+                expected,
+                actual,
+            } => {
                 assert_eq!(position, 0);
+                assert_ne!(expected, actual);
             }
             other => panic!("Expected ChecksumMismatch, got {other:?}"),
         }

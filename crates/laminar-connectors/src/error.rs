@@ -66,6 +66,10 @@ pub enum ConnectorError {
     #[error("connector closed")]
     Closed,
 
+    /// The requested operation is not yet implemented.
+    #[error("unsupported operation: {0}")]
+    UnsupportedOperation(String),
+
     /// An internal error that doesn't fit other categories.
     #[error("internal error: {0}")]
     Internal(String),

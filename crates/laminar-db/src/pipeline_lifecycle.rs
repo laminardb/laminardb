@@ -337,7 +337,10 @@ impl LaminarDB {
                         tracing::info!("Embedded pipeline shutdown signal received");
                         break;
                     }
-                    () = tokio::time::sleep(std::time::Duration::from_millis(100)) => {}
+                    // 10ms fallback poll — embedded pipelines are driven by
+                    // Source::push_arrow() which is synchronous. This matches
+                    // the connector pipeline's polling interval.
+                    () = tokio::time::sleep(std::time::Duration::from_millis(10)) => {}
                 }
 
                 let cycle_start = std::time::Instant::now();
@@ -910,6 +913,12 @@ impl LaminarDB {
             table_store: table_store_for_loop,
             ctx: ctx_for_sync,
             last_checkpoint: std::time::Instant::now(),
+            checkpoint_interval: self
+                .config
+                .checkpoint
+                .as_ref()
+                .and_then(|c| c.interval_ms)
+                .map(std::time::Duration::from_millis),
             pipeline_hash,
         };
 

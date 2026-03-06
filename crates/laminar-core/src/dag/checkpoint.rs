@@ -384,14 +384,6 @@ impl DagCheckpointCoordinator {
         Ok(snapshot)
     }
 
-    /// Returns the in-flight checkpoint progress (if any).
-    #[must_use]
-    pub fn in_progress(&self) -> Option<&CheckpointBarrier> {
-        // We reconstruct a temporary barrier from progress for API consumers.
-        // Since we can't return a reference to a temporary, we expose a simpler API.
-        None // Use is_checkpoint_in_progress() instead.
-    }
-
     /// Returns whether a checkpoint is currently in progress.
     #[must_use]
     pub fn is_checkpoint_in_progress(&self) -> bool {

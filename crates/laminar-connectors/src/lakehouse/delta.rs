@@ -308,7 +308,11 @@ impl DeltaLakeSink {
             let save_mode = match self.config.write_mode {
                 DeltaWriteMode::Append => SaveMode::Append,
                 DeltaWriteMode::Overwrite => SaveMode::Overwrite,
-                DeltaWriteMode::Upsert => unreachable!(),
+                DeltaWriteMode::Upsert => {
+                    return Err(ConnectorError::ConfigurationError(
+                        "upsert mode should be handled by the merge branch above".into(),
+                    ));
+                }
             };
 
             let partition_cols = if self.config.partition_columns.is_empty() {

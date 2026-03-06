@@ -478,7 +478,7 @@ impl LaminarDB {
                 }))
             }
             StreamingStatement::RestoreCheckpoint { checkpoint_id } => {
-                self.handle_restore_checkpoint(*checkpoint_id).await
+                self.handle_restore_checkpoint(*checkpoint_id)
             }
             StreamingStatement::Describe { name, .. } => {
                 let name_str = name.to_string();
@@ -531,21 +531,19 @@ impl LaminarDB {
             return Ok(ExecuteResult::RowsAffected(values.len() as u64));
         }
 
-        // Try inserting into a TableStore-managed table (with PK upsert)
+        // Try inserting into a TableStore-managed table (with PK upsert).
+        // Single lock scope avoids TOCTOU race between has_table/schema/upsert.
         {
-            let has_table = self.table_store.lock().has_table(&name);
-            if has_table {
-                let schema = self
-                    .table_store
-                    .lock()
+            let mut ts = self.table_store.lock();
+            if ts.has_table(&name) {
+                let schema = ts
                     .table_schema(&name)
                     .ok_or_else(|| DbError::TableNotFound(name.clone()))?;
                 let batch = sql_utils::sql_values_to_record_batch(&schema, values)?;
-                self.table_store.lock().upsert(&name, &batch)?;
+                ts.upsert(&name, &batch)?;
+                drop(ts); // release before sync (which may also lock)
 
-                // Sync to DataFusion MemTable
                 self.sync_table_to_datafusion(&name)?;
-
                 return Ok(ExecuteResult::RowsAffected(values.len() as u64));
             }
         }
@@ -584,44 +582,14 @@ impl LaminarDB {
     /// in the `TableStore` for upsert/delete/lookup semantics.
     /// If `WITH (...)` options include a `connector` key, the table is
     /// registered in the `ConnectorManager` for connector-backed population.
-    #[allow(clippy::too_many_lines)]
-    /// Handle DROP SOURCE statement.
-    /// Handle ALTER SOURCE statement.
-    /// Handle DROP SINK statement.
-    /// Handle CREATE STREAM statement.
-    /// Handle DROP STREAM statement.
-    /// Handle SET statement — stores session properties.
-    /// Handle `SET checkpoint_interval = '5s'` or `SET checkpoint_interval = 'off'`.
-    /// Handle `RESTORE FROM CHECKPOINT <id>`.
-    async fn handle_restore_checkpoint(
-        &self,
-        checkpoint_id: u64,
-    ) -> Result<ExecuteResult, DbError> {
-        let mut guard = self.coordinator.lock().await;
-        let coord = guard.as_mut().ok_or_else(|| {
-            DbError::Checkpoint("coordinator not initialized — call start() first".to_string())
-        })?;
-
-        let manifest = coord.store().load_by_id(checkpoint_id).map_err(|e| {
-            DbError::Checkpoint(format!("failed to load checkpoint {checkpoint_id}: {e}"))
-        })?;
-
-        match manifest {
-            Some(m) => {
-                tracing::info!(
-                    checkpoint_id,
-                    epoch = m.epoch,
-                    "Restoring from checkpoint via SQL"
-                );
-                Ok(ExecuteResult::Ddl(DdlInfo {
-                    statement_type: "RESTORE".to_string(),
-                    object_name: format!("checkpoint_{checkpoint_id}"),
-                }))
-            }
-            None => Err(DbError::Checkpoint(format!(
-                "checkpoint {checkpoint_id} not found"
-            ))),
-        }
+    #[allow(clippy::unused_self)] // will use self when restore is implemented
+    fn handle_restore_checkpoint(&self, _checkpoint_id: u64) -> Result<ExecuteResult, DbError> {
+        Err(DbError::Unsupported(
+            "RESTORE FROM CHECKPOINT is not yet implemented — \
+             requires pipeline stop, state reload from manifest, \
+             source offset seek, and pipeline restart"
+                .to_string(),
+        ))
     }
 
     /// Get a session property value.

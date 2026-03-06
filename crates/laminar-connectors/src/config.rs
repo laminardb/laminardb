@@ -158,7 +158,26 @@ impl ConnectorConfig {
                     "Boolean" => DataType::Boolean,
                     "Date32" => DataType::Date32,
                     "Date64" => DataType::Date64,
-                    _ => return None,
+                    "Timestamp(Millisecond)" => {
+                        DataType::Timestamp(arrow_schema::TimeUnit::Millisecond, None)
+                    }
+                    "Timestamp(Microsecond)" => {
+                        DataType::Timestamp(arrow_schema::TimeUnit::Microsecond, None)
+                    }
+                    "Timestamp(Nanosecond)" => {
+                        DataType::Timestamp(arrow_schema::TimeUnit::Nanosecond, None)
+                    }
+                    "Timestamp(Second)" => {
+                        DataType::Timestamp(arrow_schema::TimeUnit::Second, None)
+                    }
+                    other => {
+                        tracing::warn!(
+                            type_str = other,
+                            field = name,
+                            "unknown Arrow type in _arrow_schema — column skipped"
+                        );
+                        return None;
+                    }
                 };
                 Some(Field::new(name, dt, true))
             })

@@ -13,7 +13,6 @@
 //!
 //! - **[`InMemoryStore`]**: BTreeMap-based, fast lookups with O(log n + k) prefix/range scans
 //! - **[`MmapStateStore`]**: Memory-mapped, supports larger-than-memory state with optional persistence
-//! - **Hybrid**: Combination with hot/cold separation (future)
 //!
 //! ## Example
 //!
@@ -700,18 +699,6 @@ pub enum StateError {
     /// Corruption error
     #[error("Corruption error: {0}")]
     Corruption(String),
-
-    /// Operation not supported by this store type
-    #[error("Operation not supported: {0}")]
-    NotSupported(String),
-
-    /// Key not found (for operations that require existing key)
-    #[error("Key not found")]
-    KeyNotFound,
-
-    /// Store capacity exceeded
-    #[error("Store capacity exceeded: {0}")]
-    CapacityExceeded(String),
 }
 
 mod mmap;

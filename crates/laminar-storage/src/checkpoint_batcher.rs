@@ -11,6 +11,7 @@
 //! [version: u32 LE = 1]
 //! [entry_count: u32 LE]
 //! [uncompressed_size: u32 LE]
+//! [crc32c: u32 LE]           ← over compressed_body
 //! [compressed_body: LZ4 block]
 //!   → decoded body is a sequence of frames:
 //!     [key_len: u32 LE][key: UTF-8][data_len: u32 LE][data: bytes]
@@ -26,14 +27,14 @@ use crate::checkpoint_store::CheckpointStoreError;
 /// Magic bytes identifying a checkpoint batch file.
 const BATCH_MAGIC: &[u8; 4] = b"LCB1";
 
-/// Current batch format version.
-const BATCH_VERSION: u32 = 1;
+/// Current batch format version (v2 adds CRC32C integrity check).
+const BATCH_VERSION: u32 = 2;
 
 /// Default flush threshold: 8 MB.
 const DEFAULT_FLUSH_THRESHOLD: usize = 8 * 1024 * 1024;
 
-/// Batch header size in bytes (magic + version + count + size).
-const HEADER_SIZE: usize = 16;
+/// Batch header size in bytes (magic + version + count + size + crc32c).
+const HEADER_SIZE: usize = 20;
 
 /// A single entry in the batch buffer.
 struct BatchEntry {
@@ -257,12 +258,16 @@ fn encode_batch(entries: &[BatchEntry]) -> (usize, PutPayload) {
     let uncompressed_size = body.len();
     let compressed = lz4_flex::compress_prepend_size(&body);
 
+    // CRC32C over the compressed body for integrity verification
+    let crc = crc32c::crc32c(&compressed);
+
     // Build header + compressed body.
     let mut out = Vec::with_capacity(HEADER_SIZE + compressed.len());
     out.extend_from_slice(BATCH_MAGIC);
     out.extend_from_slice(&BATCH_VERSION.to_le_bytes());
     out.extend_from_slice(&(entries.len() as u32).to_le_bytes());
     out.extend_from_slice(&(uncompressed_size as u32).to_le_bytes());
+    out.extend_from_slice(&crc.to_le_bytes());
     out.extend_from_slice(&compressed);
 
     (
@@ -292,19 +297,48 @@ pub fn decode_batch(raw: &[u8]) -> Result<Vec<(String, Vec<u8>)>, CheckpointStor
         )));
     }
 
-    // Safe: length checked above (HEADER_SIZE = 16 ≥ all slice ends).
     let version = u32::from_le_bytes([raw[4], raw[5], raw[6], raw[7]]);
-    if version != BATCH_VERSION {
+
+    // Determine header size and whether CRC is present based on version
+    let (header_size, has_crc) = match version {
+        1 => (16, false), // v1: no CRC field
+        2 => (20, true),  // v2: CRC32C after size field
+        _ => {
+            return Err(CheckpointStoreError::Io(std::io::Error::new(
+                std::io::ErrorKind::InvalidData,
+                format!("unsupported batch version {version}"),
+            )));
+        }
+    };
+
+    if raw.len() < header_size {
         return Err(CheckpointStoreError::Io(std::io::Error::new(
             std::io::ErrorKind::InvalidData,
-            format!("unsupported batch version {version}"),
+            format!("batch too short for v{version} header"),
         )));
     }
 
     let entry_count = u32::from_le_bytes([raw[8], raw[9], raw[10], raw[11]]) as usize;
     let _uncompressed_size = u32::from_le_bytes([raw[12], raw[13], raw[14], raw[15]]);
 
-    let body = lz4_flex::decompress_size_prepended(&raw[HEADER_SIZE..]).map_err(|e| {
+    let compressed_body = &raw[header_size..];
+
+    // Verify CRC32C if present (v2+)
+    if has_crc {
+        let expected_crc = u32::from_le_bytes([raw[16], raw[17], raw[18], raw[19]]);
+        let actual_crc = crc32c::crc32c(compressed_body);
+        if actual_crc != expected_crc {
+            return Err(CheckpointStoreError::Io(std::io::Error::new(
+                std::io::ErrorKind::InvalidData,
+                format!(
+                    "batch CRC32C mismatch: expected {expected_crc:#010x}, \
+                     actual {actual_crc:#010x}"
+                ),
+            )));
+        }
+    }
+
+    let body = lz4_flex::decompress_size_prepended(compressed_body).map_err(|e| {
         CheckpointStoreError::Io(std::io::Error::new(
             std::io::ErrorKind::InvalidData,
             format!("LZ4 decompression failed: {e}"),
@@ -533,7 +567,7 @@ mod tests {
 
     #[test]
     fn test_decode_invalid_magic() {
-        let bad = b"XXXX\x01\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00";
+        let bad = b"XXXX\x01\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00";
         let err = decode_batch(bad).unwrap_err();
         assert!(err.to_string().contains("invalid batch magic"));
     }
@@ -549,8 +583,9 @@ mod tests {
         let mut buf = Vec::new();
         buf.extend_from_slice(b"LCB1");
         buf.extend_from_slice(&99u32.to_le_bytes()); // bad version
-        buf.extend_from_slice(&0u32.to_le_bytes());
-        buf.extend_from_slice(&0u32.to_le_bytes());
+        buf.extend_from_slice(&0u32.to_le_bytes()); // count
+        buf.extend_from_slice(&0u32.to_le_bytes()); // size
+        buf.extend_from_slice(&0u32.to_le_bytes()); // crc
         let err = decode_batch(&buf).unwrap_err();
         assert!(err.to_string().contains("unsupported batch version"));
     }
