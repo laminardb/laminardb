@@ -163,7 +163,6 @@ impl SinkConnector for WebSocketSinkServer {
         let (shutdown_tx, shutdown_rx) = tokio::sync::watch::channel(false);
         let fanout = Arc::clone(&self.fanout);
         let metrics = Arc::clone(&self.metrics);
-        let _ = (ping_interval, ping_timeout); // reserved for heartbeat
 
         let handle = tokio::spawn(async move {
             let mut shutdown_rx = shutdown_rx;
@@ -183,6 +182,8 @@ impl SinkConnector for WebSocketSinkServer {
                                 let fanout = Arc::clone(&fanout);
                                 let metrics = metrics.clone();
                                 let mut client_shutdown = shutdown_rx.clone();
+                                let client_ping_interval = ping_interval;
+                                let client_ping_timeout = ping_timeout;
 
                                 tokio::spawn(async move {
                                     let ws_stream = match tokio_tungstenite::accept_async(stream).await {
@@ -252,7 +253,12 @@ impl SinkConnector for WebSocketSinkServer {
                                         }
                                     }
 
-                                    // Fan-out loop: forward messages to this client.
+                                    // Fan-out loop with ping/pong heartbeats.
+                                    let mut ping_ticker = tokio::time::interval(client_ping_interval);
+                                    ping_ticker.tick().await; // consume initial immediate tick
+                                    let mut awaiting_pong = false;
+                                    let mut last_ping_sent = tokio::time::Instant::now();
+
                                     loop {
                                         tokio::select! {
                                             Some(data) = rx.recv() => {
@@ -265,8 +271,10 @@ impl SinkConnector for WebSocketSinkServer {
                                             msg = read.next() => {
                                                 match msg {
                                                     Some(Ok(tungstenite::Message::Close(_))) | None => break,
+                                                    Some(Ok(tungstenite::Message::Pong(_))) => {
+                                                        awaiting_pong = false;
+                                                    }
                                                     Some(Ok(tungstenite::Message::Text(text))) => {
-                                                        // Handle unsubscribe.
                                                         if let Ok(ClientMessage::Unsubscribe { .. }) =
                                                             serde_json::from_str::<ClientMessage>(text.as_ref())
                                                         {
@@ -275,6 +283,18 @@ impl SinkConnector for WebSocketSinkServer {
                                                     }
                                                     _ => {}
                                                 }
+                                            }
+                                            _ = ping_ticker.tick() => {
+                                                if awaiting_pong && last_ping_sent.elapsed() > client_ping_timeout {
+                                                    debug!(addr = %addr, "ping timeout — disconnecting");
+                                                    metrics.record_ping_timeout();
+                                                    break;
+                                                }
+                                                if write.send(tungstenite::Message::Ping(bytes::Bytes::new())).await.is_err() {
+                                                    break;
+                                                }
+                                                awaiting_pong = true;
+                                                last_ping_sent = tokio::time::Instant::now();
                                             }
                                             _ = client_shutdown.changed() => break,
                                         }

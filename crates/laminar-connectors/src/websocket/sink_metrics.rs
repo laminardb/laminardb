@@ -27,6 +27,8 @@ pub struct WebSocketSinkMetrics {
     pub client_disconnects: AtomicU64,
     /// Total replay requests received from clients.
     pub replay_requests: AtomicU64,
+    /// Total clients disconnected due to ping timeout.
+    pub ping_timeouts: AtomicU64,
 }
 
 impl WebSocketSinkMetrics {
@@ -40,6 +42,7 @@ impl WebSocketSinkMetrics {
             connected_clients: AtomicU64::new(0),
             client_disconnects: AtomicU64::new(0),
             replay_requests: AtomicU64::new(0),
+            ping_timeouts: AtomicU64::new(0),
         }
     }
 
@@ -76,6 +79,11 @@ impl WebSocketSinkMetrics {
         self.replay_requests.fetch_add(1, Ordering::Relaxed);
     }
 
+    /// Records a client disconnected due to ping timeout.
+    pub fn record_ping_timeout(&self) {
+        self.ping_timeouts.fetch_add(1, Ordering::Relaxed);
+    }
+
     /// Converts to the SDK's [`ConnectorMetrics`].
     #[must_use]
     #[allow(clippy::cast_precision_loss)]
@@ -102,6 +110,10 @@ impl WebSocketSinkMetrics {
         m.add_custom(
             "ws.messages_dropped_slow_client",
             self.messages_dropped_slow_client.load(Ordering::Relaxed) as f64,
+        );
+        m.add_custom(
+            "ws.ping_timeouts",
+            self.ping_timeouts.load(Ordering::Relaxed) as f64,
         );
         m
     }
@@ -202,7 +214,7 @@ mod tests {
         assert_eq!(cm.records_total, 0);
         assert_eq!(cm.bytes_total, 0);
         assert_eq!(cm.errors_total, 0);
-        assert_eq!(cm.custom.len(), 4);
+        assert_eq!(cm.custom.len(), 5);
     }
 
     #[test]
@@ -210,7 +222,7 @@ mod tests {
         let m = WebSocketSinkMetrics::new();
         let cm = m.to_connector_metrics();
         // Should have exactly 4 custom metrics
-        assert_eq!(cm.custom.len(), 4);
+        assert_eq!(cm.custom.len(), 5);
     }
 
     #[test]
