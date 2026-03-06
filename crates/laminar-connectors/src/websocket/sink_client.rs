@@ -226,8 +226,9 @@ impl SinkConnector for WebSocketSinkClient {
 
         let rows = self.serializer.serialize_rows(batch)?;
         let mut bytes_written: u64 = 0;
+        let mut records_written: usize = 0;
 
-        for row in &rows {
+        for (i, row) in rows.iter().enumerate() {
             if let Some(ref mut sink) = self.ws_sink {
                 match sink
                     .send(tungstenite::Message::Text(row.clone().into()))
@@ -235,6 +236,7 @@ impl SinkConnector for WebSocketSinkClient {
                 {
                     Ok(()) => {
                         bytes_written += row.len() as u64;
+                        records_written += 1;
                         self.metrics.record_send(row.len() as u64);
                     }
                     Err(e) => {
@@ -244,11 +246,11 @@ impl SinkConnector for WebSocketSinkClient {
 
                         // Try to reconnect.
                         if self.try_reconnect().await.is_err() {
-                            // Buffer remaining rows.
-                            for remaining in rows.iter().skip(1) {
+                            // Buffer rows after the failed one.
+                            for remaining in &rows[i + 1..] {
                                 self.buffer_message(remaining.clone());
                             }
-                            return Ok(WriteResult::new(0, 0));
+                            return Ok(WriteResult::new(records_written, bytes_written));
                         }
                     }
                 }
@@ -258,12 +260,12 @@ impl SinkConnector for WebSocketSinkClient {
         }
 
         debug!(
-            records = batch.num_rows(),
+            records = records_written,
             bytes = bytes_written,
             "wrote batch to WebSocket"
         );
 
-        Ok(WriteResult::new(batch.num_rows(), bytes_written))
+        Ok(WriteResult::new(records_written, bytes_written))
     }
 
     fn schema(&self) -> SchemaRef {

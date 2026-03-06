@@ -13,6 +13,11 @@ use std::sync::Arc;
 /// oscillation. When the channel fill ratio exceeds the high watermark,
 /// consumption pauses. It resumes only when the ratio drops below the
 /// low watermark.
+///
+/// **Callers must wire the `channel_len` `Arc<AtomicUsize>`**: increment
+/// when sending messages into the downstream channel, decrement when
+/// receiving. Without this wiring, `fill_ratio()` always returns 0.0
+/// and backpressure never triggers.
 #[derive(Debug)]
 pub struct KafkaBackpressureController {
     /// Fill ratio above which to pause (e.g., 0.8 = 80%).

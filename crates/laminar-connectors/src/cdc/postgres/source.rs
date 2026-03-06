@@ -75,8 +75,8 @@ pub struct PostgresCdcSource {
     /// Write LSN (latest position received from server).
     write_lsn: Lsn,
 
-    /// Last time a keepalive was sent (used by production I/O path).
-    #[allow(dead_code)]
+    /// Last time a keepalive was received (used by production I/O path via `process_wal_payload`).
+    #[allow(dead_code)] // updated in process_wal_payload (feature = "postgres-cdc")
     last_keepalive: Instant,
 
     /// Pending WAL messages to process (for testing and batch processing).
@@ -116,7 +116,7 @@ struct TransactionState {
 }
 
 /// WAL event payload sent from the background reader task to [`PostgresCdcSource::poll_batch`].
-#[allow(dead_code)]
+#[allow(dead_code)] // constructed + consumed only with feature = "postgres-cdc"
 enum WalPayload {
     Begin {
         final_lsn: u64,
@@ -630,7 +630,12 @@ impl SourceConnector for PostgresCdcSource {
         // Process any pending WAL messages (test injection path)
         self.process_pending_messages()?;
 
-        // Drain buffered events into a RecordBatch
+        // Drain buffered events into a RecordBatch.
+        // Watermark advancement: the batch contains `_ts_ms` (commit timestamp)
+        // which downstream pipeline watermark extractors should use. The LSN
+        // in PartitionInfo tracks replication progress for offset management.
+        // TODO: extract max(_ts_ms) and expose as source-level watermark for
+        // windowed aggregations that depend on CDC event time.
         match self.drain_events(max_records)? {
             Some(batch) => {
                 let lsn_str = self.write_lsn.to_string();

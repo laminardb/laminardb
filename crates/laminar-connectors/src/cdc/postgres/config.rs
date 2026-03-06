@@ -132,7 +132,9 @@ impl PostgresCdcConfig {
             self.host, self.port, self.database, self.username
         );
         if let Some(ref pw) = self.password {
-            let _ = write!(s, " password={pw}");
+            // Escape for libpq: wrap in single quotes, escape \ and '
+            let escaped = pw.replace('\\', "\\\\").replace('\'', "\\'");
+            let _ = write!(s, " password='{escaped}'");
         }
         let _ = write!(s, " sslmode={}", self.ssl_mode);
         s
@@ -318,8 +320,32 @@ mod tests {
         let conn = cfg.connection_string();
         assert!(conn.contains("host=db.example.com"));
         assert!(conn.contains("dbname=mydb"));
-        assert!(conn.contains("password=secret"));
+        assert!(conn.contains("password='secret'"));
         assert!(conn.contains("sslmode=prefer"));
+    }
+
+    #[test]
+    fn test_connection_string_password_with_spaces() {
+        let mut cfg = PostgresCdcConfig::new("h", "d", "s", "p");
+        cfg.password = Some("my secret pass".to_string());
+        let conn = cfg.connection_string();
+        assert!(conn.contains("password='my secret pass'"));
+    }
+
+    #[test]
+    fn test_connection_string_password_with_quotes() {
+        let mut cfg = PostgresCdcConfig::new("h", "d", "s", "p");
+        cfg.password = Some("it's a p@ss'word".to_string());
+        let conn = cfg.connection_string();
+        assert!(conn.contains(r"password='it\'s a p@ss\'word'"));
+    }
+
+    #[test]
+    fn test_connection_string_password_with_backslash() {
+        let mut cfg = PostgresCdcConfig::new("h", "d", "s", "p");
+        cfg.password = Some(r"pass\word".to_string());
+        let conn = cfg.connection_string();
+        assert!(conn.contains(r"password='pass\\word'"));
     }
 
     #[test]

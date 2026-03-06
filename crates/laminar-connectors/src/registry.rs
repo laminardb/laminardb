@@ -2,8 +2,6 @@
 //!
 //! The `ConnectorRegistry` maintains a catalog of available connector
 //! implementations and provides factory methods to instantiate them.
-#![allow(clippy::disallowed_types)] // cold path: connector registry
-
 use std::collections::HashMap;
 use std::sync::Arc;
 
@@ -88,6 +86,9 @@ impl ConnectorRegistry {
     ///
     /// Returns `ConnectorError::ConfigurationError` if the connector type
     /// is not registered.
+    ///
+    /// The factory creates a default-configured connector. The caller must
+    /// subsequently call `open(config)` to forward WITH clause properties.
     pub fn create_source(
         &self,
         config: &ConnectorConfig,
