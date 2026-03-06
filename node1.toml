@@ -1,0 +1,21 @@
+node_id = "node-1"
+
+[server]
+mode = "delta"
+bind = "127.0.0.1:8081"
+
+[state]
+backend = "memory"
+
+[checkpoint]
+url = "file:///tmp/laminardb/ckpt1"
+interval = "10s"
+
+[discovery]
+strategy = "static"
+seeds = ["127.0.0.1:7946", "127.0.0.1:7956"]
+gossip_port = 7946
+
+[coordination]
+strategy = "raft"
+raft_port = 7947

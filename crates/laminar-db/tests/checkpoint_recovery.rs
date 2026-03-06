@@ -44,13 +44,7 @@ async fn test_happy_path_checkpoint_and_recovery() {
     ops.insert("window-agg".into(), b"accumulated-state".to_vec());
 
     let result = coord
-        .checkpoint(
-            ops,
-            Some(5000),
-            None,
-            HashMap::new(),
-            None,
-        )
+        .checkpoint(ops, Some(5000), None, HashMap::new(), None)
         .await
         .unwrap();
 
@@ -203,13 +197,7 @@ async fn test_wal_positions_recovery() {
     // Verify they are stored in the manifest (empty without a WAL manager).
     let mut coord = make_coordinator(dir.path());
     let result = coord
-        .checkpoint(
-            HashMap::new(),
-            Some(42_000),
-            None,
-            HashMap::new(),
-            None,
-        )
+        .checkpoint(HashMap::new(), Some(42_000), None, HashMap::new(), None)
         .await
         .unwrap();
 
@@ -266,23 +254,11 @@ async fn test_coordinator_resumes_epoch_after_recovery() {
     {
         let mut coord = make_coordinator(dir.path());
         coord
-            .checkpoint(
-                HashMap::new(),
-                Some(1000),
-                None,
-                HashMap::new(),
-                None,
-            )
+            .checkpoint(HashMap::new(), Some(1000), None, HashMap::new(), None)
             .await
             .unwrap();
         coord
-            .checkpoint(
-                HashMap::new(),
-                Some(2000),
-                None,
-                HashMap::new(),
-                None,
-            )
+            .checkpoint(HashMap::new(), Some(2000), None, HashMap::new(), None)
             .await
             .unwrap();
 

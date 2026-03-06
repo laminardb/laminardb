@@ -1055,7 +1055,10 @@ impl CheckpointCoordinator {
         );
         let sidecar_bytes = state_data.as_ref().map_or(0, Vec::len);
         if sidecar_bytes > 0 {
-            debug!(checkpoint_id, sidecar_bytes, "writing operator state sidecar");
+            debug!(
+                checkpoint_id,
+                sidecar_bytes, "writing operator state sidecar"
+            );
         }
 
         // ── Step 4b: Checkpoint size check ──
@@ -1083,10 +1086,7 @@ impl CheckpointCoordinator {
             if sidecar_bytes > warn_threshold {
                 warn!(
                     checkpoint_id,
-                    epoch,
-                    sidecar_bytes,
-                    cap,
-                    "checkpoint size approaching cap (>80%)"
+                    epoch, sidecar_bytes, cap, "checkpoint size approaching cap (>80%)"
                 );
             }
         }
@@ -1552,13 +1552,7 @@ mod tests {
         let mut coord = make_coordinator(dir.path());
 
         let result = coord
-            .checkpoint(
-                HashMap::new(),
-                Some(1000),
-                None,
-                HashMap::new(),
-                None,
-            )
+            .checkpoint(HashMap::new(), Some(1000), None, HashMap::new(), None)
             .await
             .unwrap();
 
@@ -1574,13 +1568,7 @@ mod tests {
 
         // Second checkpoint should increment
         let result2 = coord
-            .checkpoint(
-                HashMap::new(),
-                Some(2000),
-                None,
-                HashMap::new(),
-                None,
-            )
+            .checkpoint(HashMap::new(), Some(2000), None, HashMap::new(), None)
             .await
             .unwrap();
 
@@ -1882,13 +1870,7 @@ mod tests {
 
         // Full cycle: checkpoint (WAL preparation is internal) → truncate
         let result = coord
-            .checkpoint(
-                HashMap::new(),
-                Some(5000),
-                None,
-                HashMap::new(),
-                None,
-            )
+            .checkpoint(HashMap::new(), Some(5000), None, HashMap::new(), None)
             .await
             .unwrap();
 
@@ -1959,13 +1941,7 @@ mod tests {
         coord.set_counters(Arc::clone(&counters));
 
         let result = coord
-            .checkpoint(
-                HashMap::new(),
-                Some(1000),
-                None,
-                HashMap::new(),
-                None,
-            )
+            .checkpoint(HashMap::new(), Some(1000), None, HashMap::new(), None)
             .await
             .unwrap();
 
@@ -1977,13 +1953,7 @@ mod tests {
 
         // Second checkpoint
         let result2 = coord
-            .checkpoint(
-                HashMap::new(),
-                Some(2000),
-                None,
-                HashMap::new(),
-                None,
-            )
+            .checkpoint(HashMap::new(), Some(2000), None, HashMap::new(), None)
             .await
             .unwrap();
 
