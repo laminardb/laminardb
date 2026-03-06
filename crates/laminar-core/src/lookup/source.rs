@@ -528,8 +528,8 @@ mod tests {
     #[tokio::test]
     async fn test_mock_source_batch_chunking() {
         let mut source = InMemoryLookupSource::new();
-        for i in 0..10i64 {
-            source.insert(vec![i as u8], make_batch(i, &format!("name_{i}")));
+        for i in 0..10u8 {
+            source.insert(vec![i], make_batch(i64::from(i), &format!("name_{i}")));
         }
 
         let caps = LookupSourceCapabilities {
@@ -614,9 +614,9 @@ mod tests {
             column: "id".into(),
         };
         let mask = evaluate_predicate(&batch, &pred).unwrap();
-        assert_eq!(mask.value(0), false);
-        assert_eq!(mask.value(1), true);
-        assert_eq!(mask.value(2), false);
+        assert!(!mask.value(0));
+        assert!(mask.value(1));
+        assert!(!mask.value(2));
     }
 
     #[test]
@@ -636,8 +636,8 @@ mod tests {
             ],
         };
         let mask = evaluate_predicate(&batch, &pred).unwrap();
-        assert_eq!(mask.value(0), true);
-        assert_eq!(mask.value(1), false);
-        assert_eq!(mask.value(2), true);
+        assert!(mask.value(0));
+        assert!(!mask.value(1));
+        assert!(mask.value(2));
     }
 }
