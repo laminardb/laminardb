@@ -175,8 +175,7 @@ Crate stubs exist (`laminar-admin/`, `laminar-observe/`) but source files contai
 **Completed:**
 - State store architecture (revised trait, InMemoryStateStore) -- 2/2 (2 superseded)
 - Distributed checkpoint barriers and alignment -- 5/5
-- Lookup tables (trait, sources, predicates, foyer caches, CDC adapter, Postgres/Parquet sources, RocksDB removal) -- 9/9
-- Secondary indexes (redb) -- 1/1
+- Lookup tables (trait, sources, predicates, foyer caches, CDC adapter, Postgres/Parquet sources, RocksDB removal, physical executor, predicate pushdown) -- 9/9
 - Deployment profiles -- 1/1
 - Cross-partition lock-free HashMap -- 1/1
 - Source offset checkpoint -- 1/1
@@ -250,10 +249,10 @@ Architectural performance improvements identified by audit. All actionable local
 | Phase 3: Connectors | 100 | 85 | 85% |
 | Phase 4: Security | 11 | 0 | Planned |
 | Phase 5: Admin | 10 | 0 | Planned |
-| Phase 6a: Partition-Parallel | 29 | 27 | 93% |
+| Phase 6a: Partition-Parallel | 28 | 26 | 93% |
 | Phase 6b: Delta Foundation | 14 | 14 | COMPLETE |
 | Phase 6c: Delta Hardening | 10 | 0 | Planned |
 | Perf Optimization | 12 | 0 | Planned |
-| **Total** | **249** | **189** | **76%** |
+| **Total** | **248** | **188** | **76%** |
 
 Note: Phases 4 and 5 can be developed in parallel with Phase 3 completion and Phase 6c since they build on Phase 1 independently.

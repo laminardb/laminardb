@@ -756,6 +756,16 @@ impl LaminarDB {
                 ts.rebuild_xor_filter(name);
                 ts.set_ready(name, true);
             }
+            // Update lookup registry so join queries see fresh data
+            if let Some(batch) = self.table_store.lock().to_record_batch(name) {
+                self.lookup_registry.register(
+                    name,
+                    laminar_sql::datafusion::LookupSnapshot {
+                        batch,
+                        key_columns: vec![], // already indexed by primary key
+                    },
+                );
+            }
         }
 
         // Get stream source handles so results also flow to db.subscribe().
@@ -923,6 +933,7 @@ impl LaminarDB {
             coordinator,
             table_sources,
             table_store: table_store_for_loop,
+            lookup_registry: Arc::clone(&self.lookup_registry),
             ctx: ctx_for_sync,
             last_checkpoint: std::time::Instant::now(),
             checkpoint_interval: self

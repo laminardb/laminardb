@@ -94,6 +94,8 @@ pub struct LaminarDB {
     /// Protected by `Mutex` — only locked during compilation, not execution.
     #[cfg(feature = "jit")]
     pub(crate) compiler_cache: parking_lot::Mutex<laminar_core::compiler::CompilerCache>,
+    /// Shared lookup table registry for physical planning of lookup joins.
+    pub(crate) lookup_registry: Arc<laminar_sql::datafusion::LookupTableRegistry>,
 }
 
 /// Per-source watermark tracking state for the pipeline loop.
@@ -192,7 +194,26 @@ impl LaminarDB {
         config: LaminarConfig,
         config_vars: HashMap<String, String>,
     ) -> Result<Self, DbError> {
-        let ctx = laminar_sql::create_session_context();
+        let lookup_registry = Arc::new(laminar_sql::datafusion::LookupTableRegistry::new());
+
+        // Build a SessionContext with the LookupJoinExtensionPlanner wired
+        // into the physical planner so LookupJoinNode → LookupJoinExec works.
+        let ctx = {
+            let session_config = laminar_sql::datafusion::base_session_config();
+            let extension_planner: Arc<
+                dyn datafusion::physical_planner::ExtensionPlanner + Send + Sync,
+            > = Arc::new(laminar_sql::datafusion::LookupJoinExtensionPlanner::new(
+                Arc::clone(&lookup_registry),
+            ));
+            let query_planner: Arc<dyn datafusion::execution::context::QueryPlanner + Send + Sync> =
+                Arc::new(LookupQueryPlanner { extension_planner });
+            let state = datafusion::execution::SessionStateBuilder::new()
+                .with_config(session_config)
+                .with_default_features()
+                .with_query_planner(query_planner)
+                .build();
+            SessionContext::new_with_state(state)
+        };
         register_streaming_functions(&ctx);
 
         let catalog = Arc::new(SourceCatalog::new(
@@ -231,6 +252,7 @@ impl LaminarDB {
                 laminar_core::compiler::CompilerCache::new(64)
                     .expect("JIT compiler cache initialization"),
             ),
+            lookup_registry,
         })
     }
 
@@ -271,6 +293,56 @@ impl LaminarDB {
         {
             laminar_connectors::cdc::mysql::register_mysql_cdc_source(registry);
         }
+    }
+
+    /// Replaces the `LookupJoinRewriteRule` on the `DataFusion` context
+    /// with one that knows the current set of registered lookup tables.
+    fn refresh_lookup_optimizer_rule(&self) {
+        use laminar_sql::planner::lookup_join::{LookupColumnPruningRule, LookupJoinRewriteRule};
+        use laminar_sql::planner::predicate_split::{
+            PlanPushdownMode, PlanSourceCapabilities, PredicateSplitterRule,
+            SourceCapabilitiesRegistry,
+        };
+
+        // Remove old rules if present
+        self.ctx.remove_optimizer_rule("lookup_join_rewrite");
+        self.ctx.remove_optimizer_rule("predicate_splitter");
+        self.ctx.remove_optimizer_rule("lookup_column_pruning");
+
+        let tables = self.planner.lock().lookup_tables_cloned();
+        if tables.is_empty() {
+            return;
+        }
+
+        // Build capabilities registry from table properties
+        let mut caps_registry = SourceCapabilitiesRegistry::default();
+        for (name, info) in &tables {
+            let mode = match info.properties.pushdown_mode {
+                laminar_sql::parser::lookup_table::PushdownMode::Enabled
+                | laminar_sql::parser::lookup_table::PushdownMode::Auto => PlanPushdownMode::Full,
+                laminar_sql::parser::lookup_table::PushdownMode::Disabled => PlanPushdownMode::None,
+            };
+            let pk_set: std::collections::HashSet<String> =
+                info.primary_key.iter().cloned().collect();
+            caps_registry.register(
+                name.clone(),
+                PlanSourceCapabilities {
+                    pushdown_mode: mode,
+                    eq_columns: pk_set,
+                    range_columns: std::collections::HashSet::new(),
+                    in_columns: std::collections::HashSet::new(),
+                    supports_null_check: false,
+                },
+            );
+        }
+
+        // Register rules in order: rewrite → predicate split → column pruning
+        self.ctx
+            .add_optimizer_rule(Arc::new(LookupJoinRewriteRule::new(tables)));
+        self.ctx
+            .add_optimizer_rule(Arc::new(PredicateSplitterRule::new(caps_registry)));
+        self.ctx
+            .add_optimizer_rule(Arc::new(LookupColumnPruningRule));
     }
 
     /// Returns the connector registry for registering custom connectors.
@@ -993,6 +1065,22 @@ impl LaminarDB {
                 // Register in DataFusion for SELECT/JOIN queries
                 self.sync_table_to_datafusion(&info.name)?;
 
+                // Register snapshot in the lookup registry so the physical
+                // planner can build LookupJoinExec nodes for JOIN queries.
+                if let Some(batch) = self.table_store.lock().to_record_batch(&info.name) {
+                    self.lookup_registry.register(
+                        &info.name,
+                        laminar_sql::datafusion::LookupSnapshot {
+                            batch,
+                            key_columns: info.primary_key.clone(),
+                        },
+                    );
+                }
+
+                // Register the logical optimizer rule so JOINs referencing
+                // this table are rewritten to LookupJoinNode.
+                self.refresh_lookup_optimizer_rule();
+
                 Ok(ExecuteResult::Ddl(DdlInfo {
                     statement_type: "CREATE LOOKUP TABLE".to_string(),
                     object_name: info.name,
@@ -1002,6 +1090,8 @@ impl LaminarDB {
                 self.table_store.lock().drop_table(&name);
                 self.connector_manager.lock().unregister_table(&name);
                 let _ = self.ctx.deregister_table(&name);
+                self.lookup_registry.unregister(&name);
+                self.refresh_lookup_optimizer_rule();
                 Ok(ExecuteResult::Ddl(DdlInfo {
                     statement_type: "DROP LOOKUP TABLE".to_string(),
                     object_name: name,
@@ -1537,6 +1627,35 @@ impl std::fmt::Debug for LaminarDB {
             .field("checkpoint_enabled", &self.is_checkpoint_enabled())
             .field("shutdown", &self.is_closed())
             .finish_non_exhaustive()
+    }
+}
+
+/// Wraps `DefaultPhysicalPlanner` with lookup join extension support.
+struct LookupQueryPlanner {
+    extension_planner: Arc<dyn datafusion::physical_planner::ExtensionPlanner + Send + Sync>,
+}
+
+impl std::fmt::Debug for LookupQueryPlanner {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("LookupQueryPlanner").finish_non_exhaustive()
+    }
+}
+
+#[async_trait::async_trait]
+impl datafusion::execution::context::QueryPlanner for LookupQueryPlanner {
+    async fn create_physical_plan(
+        &self,
+        logical_plan: &datafusion::logical_expr::LogicalPlan,
+        session_state: &datafusion::execution::SessionState,
+    ) -> datafusion_common::Result<Arc<dyn datafusion::physical_plan::ExecutionPlan>> {
+        use datafusion::physical_planner::PhysicalPlanner;
+        let planner =
+            datafusion::physical_planner::DefaultPhysicalPlanner::with_extension_planners(vec![
+                Arc::clone(&self.extension_planner),
+            ]);
+        planner
+            .create_physical_plan(logical_plan, session_state)
+            .await
     }
 }
 

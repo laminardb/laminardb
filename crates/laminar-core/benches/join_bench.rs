@@ -12,7 +12,6 @@ use arrow_array::{Int64Array, RecordBatch, StringArray};
 use arrow_schema::{DataType, Field, Schema};
 use criterion::{criterion_group, criterion_main, BenchmarkId, Criterion, Throughput};
 use laminar_core::operator::asof_join::{AsofDirection, AsofJoinConfig, AsofJoinOperator};
-use laminar_core::operator::lookup_join::{LookupJoinConfig, LookupJoinOperator};
 use laminar_core::operator::stream_join::{JoinSide, JoinType, StreamJoinOperator};
 use laminar_core::operator::{Event, Operator, OperatorContext};
 use laminar_core::state::InMemoryStore;
@@ -243,50 +242,10 @@ fn bench_asof_join(c: &mut Criterion) {
     group.finish();
 }
 
-/// Benchmark lookup join
-fn bench_lookup_join(c: &mut Criterion) {
-    let mut group = c.benchmark_group("lookup_join");
-
-    group.throughput(Throughput::Elements(1));
-
-    // Benchmark lookup join stream event processing
-    group.bench_function("stream_event_process", |b| {
-        let config = LookupJoinConfig::builder()
-            .stream_key_column("key".to_string())
-            .lookup_key_column("key".to_string())
-            .cache_ttl(Duration::from_secs(300))
-            .build()
-            .unwrap();
-        let mut operator = LookupJoinOperator::new(config);
-        let mut timers = TimerService::new();
-        let mut state = InMemoryStore::new();
-        let mut watermark_gen = BoundedOutOfOrdernessGenerator::new(100);
-        let mut ts = 0i64;
-
-        b.iter(|| {
-            let event = create_join_event("k1", ts, 42);
-            let mut ctx = OperatorContext {
-                event_time: ts,
-                processing_time: 0,
-                timers: &mut timers,
-                state: &mut state,
-                watermark_generator: &mut watermark_gen,
-                operator_index: 0,
-            };
-            let output = operator.process(black_box(&event), &mut ctx);
-            ts += 100;
-            black_box(output)
-        })
-    });
-
-    group.finish();
-}
-
 criterion_group!(
     benches,
     bench_stream_join,
     bench_join_state_scaling,
     bench_asof_join,
-    bench_lookup_join,
 );
 criterion_main!(benches);

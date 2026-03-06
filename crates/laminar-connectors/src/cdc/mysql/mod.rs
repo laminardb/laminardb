@@ -121,9 +121,22 @@ pub fn register_mysql_cdc_source(registry: &ConnectorRegistry) {
 
     registry.register_source(
         "mysql-cdc",
-        info,
+        info.clone(),
         Arc::new(|| {
             Box::new(MySqlCdcSource::new(MySqlCdcConfig::default())) as Box<dyn SourceConnector>
+        }),
+    );
+
+    registry.register_table_source(
+        "mysql-cdc",
+        info,
+        Arc::new(|config| {
+            let connector = Box::new(MySqlCdcSource::new(MySqlCdcConfig::default()));
+            Ok(Box::new(crate::lookup::cdc_adapter::CdcTableSource::new(
+                connector,
+                config.clone(),
+                4096,
+            )))
         }),
     );
 }

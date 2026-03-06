@@ -203,7 +203,6 @@ pub mod asof_join;
 pub mod changelog;
 pub mod cumulate_window;
 pub mod lag_lead;
-pub mod lookup_join;
 pub mod partitioned_topk;
 pub mod session_window;
 pub mod sliding_window;

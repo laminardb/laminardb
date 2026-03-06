@@ -65,8 +65,23 @@ pub fn register_postgres_cdc(registry: &ConnectorRegistry) {
 
     registry.register_source(
         "postgres-cdc",
-        info,
+        info.clone(),
         Arc::new(|| Box::new(PostgresCdcSource::new(PostgresCdcConfig::default()))),
+    );
+
+    // Also register as a table source so CREATE LOOKUP TABLE ... WITH
+    // ('connector' = 'postgres-cdc') can use CDC for reference table refresh.
+    registry.register_table_source(
+        "postgres-cdc",
+        info,
+        Arc::new(|config| {
+            let connector = Box::new(PostgresCdcSource::new(PostgresCdcConfig::default()));
+            Ok(Box::new(crate::lookup::cdc_adapter::CdcTableSource::new(
+                connector,
+                config.clone(),
+                4096,
+            )))
+        }),
     );
 }
 

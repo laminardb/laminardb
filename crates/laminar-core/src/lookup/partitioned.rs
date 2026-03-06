@@ -12,7 +12,7 @@ use std::sync::Arc;
 
 use rustc_hash::FxHashMap;
 
-use bytes::Bytes;
+use arrow_array::RecordBatch;
 
 use crate::delta::discovery::NodeId;
 use crate::lookup::foyer_cache::FoyerMemoryCache;
@@ -283,8 +283,7 @@ impl LookupTable for PartitionedLookupTable {
         }
     }
 
-    fn insert(&self, key: &[u8], value: Bytes) {
-        // Only insert if the key is local
+    fn insert(&self, key: &[u8], value: RecordBatch) {
         if self.partition_map.is_local(key) {
             self.local_cache.insert(key, value);
         }
@@ -305,6 +304,8 @@ impl LookupTable for PartitionedLookupTable {
 mod tests {
     use super::*;
     use crate::lookup::foyer_cache::FoyerMemoryCacheConfig;
+    use arrow_array::StringArray;
+    use arrow_schema::{DataType, Field, Schema};
 
     fn make_cache() -> Arc<FoyerMemoryCache> {
         Arc::new(FoyerMemoryCache::new(
@@ -314,6 +315,11 @@ mod tests {
                 shards: 1,
             },
         ))
+    }
+
+    fn test_batch(val: &str) -> RecordBatch {
+        let schema = Arc::new(Schema::new(vec![Field::new("v", DataType::Utf8, false)]));
+        RecordBatch::try_new(schema, vec![Arc::new(StringArray::from(vec![val]))]).unwrap()
     }
 
     #[test]
@@ -356,7 +362,6 @@ mod tests {
         let map = PartitionMap::from_assignments(2, &assignments, NodeId(1));
 
         assert!(!map.is_embedded());
-        // Some keys will be local, some remote
         let mut has_local = false;
         let mut has_remote = false;
         for i in 0..100 {
@@ -416,10 +421,8 @@ mod tests {
         let cache = make_cache();
         let table = PartitionedLookupTable::new(map, cache, PartitionedLookupConfig::default());
 
-        // Insert a value
-        table.insert(b"key1", Bytes::from_static(b"value1"));
+        table.insert(b"key1", test_batch("value1"));
 
-        // Should be a local hit
         let result = table.get_cached(b"key1");
         assert!(result.is_hit());
 
@@ -443,7 +446,6 @@ mod tests {
     #[test]
     fn test_partitioned_lookup_remote_pending() {
         let mut assignments = FxHashMap::default();
-        // Make all partitions remote
         for i in 0..256u32 {
             assignments.insert(i, NodeId(2));
         }
@@ -468,8 +470,7 @@ mod tests {
         let cache = make_cache();
         let table = PartitionedLookupTable::new(map, cache, PartitionedLookupConfig::default());
 
-        // Insert to a remote partition should be no-op
-        table.insert(b"key1", Bytes::from_static(b"value1"));
+        table.insert(b"key1", test_batch("value1"));
         assert_eq!(table.len(), 0);
     }
 
@@ -479,7 +480,7 @@ mod tests {
         let cache = make_cache();
         let table = PartitionedLookupTable::new(map, cache, PartitionedLookupConfig::default());
 
-        table.insert(b"key1", Bytes::from_static(b"value1"));
+        table.insert(b"key1", test_batch("value1"));
         assert!(table.get_cached(b"key1").is_hit());
 
         table.invalidate(b"key1");

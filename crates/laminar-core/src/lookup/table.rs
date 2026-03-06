@@ -13,13 +13,13 @@
 
 use std::time::Duration;
 
-use bytes::Bytes;
+use arrow_array::RecordBatch;
 
 /// Result of a lookup operation.
-#[derive(Debug, Clone, PartialEq, Eq)]
+#[derive(Debug, Clone)]
 pub enum LookupResult {
     /// Cache hit — value found in memory.
-    Hit(Bytes),
+    Hit(RecordBatch),
     /// The lookup is in progress (async source query pending).
     Pending,
     /// Key does not exist in the source.
@@ -39,15 +39,27 @@ impl LookupResult {
         matches!(self, Self::NotFound)
     }
 
-    /// Extracts the value from a `Hit`, consuming `self`.
+    /// Extracts the `RecordBatch` from a `Hit`, consuming `self`.
     #[must_use]
-    pub fn into_bytes(self) -> Option<Bytes> {
+    pub fn into_batch(self) -> Option<RecordBatch> {
         match self {
             Self::Hit(b) => Some(b),
             _ => None,
         }
     }
 }
+
+impl PartialEq for LookupResult {
+    fn eq(&self, other: &Self) -> bool {
+        match (self, other) {
+            (Self::Hit(a), Self::Hit(b)) => a == b,
+            (Self::Pending, Self::Pending) | (Self::NotFound, Self::NotFound) => true,
+            _ => false,
+        }
+    }
+}
+
+impl Eq for LookupResult {}
 
 /// Strategy for how lookup table data is distributed.
 #[derive(Debug, Clone, Default, PartialEq, Eq)]
@@ -119,7 +131,7 @@ pub trait LookupTable: Send + Sync {
     ///
     /// Called by the CDC adapter or bulk-load path when new data arrives
     /// from the source. This is NOT on the hot path.
-    fn insert(&self, key: &[u8], value: Bytes);
+    fn insert(&self, key: &[u8], value: RecordBatch);
 
     /// Invalidate a cached entry.
     ///
@@ -138,18 +150,26 @@ pub trait LookupTable: Send + Sync {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use arrow_array::StringArray;
+    use arrow_schema::{DataType, Field, Schema};
+    use std::sync::Arc;
+
+    fn test_batch() -> RecordBatch {
+        let schema = Arc::new(Schema::new(vec![Field::new("v", DataType::Utf8, false)]));
+        RecordBatch::try_new(schema, vec![Arc::new(StringArray::from(vec!["value"]))]).unwrap()
+    }
 
     #[test]
     fn test_lookup_result_methods() {
-        let hit = LookupResult::Hit(Bytes::from_static(b"value"));
+        let hit = LookupResult::Hit(test_batch());
         assert!(hit.is_hit());
         assert!(!hit.is_not_found());
-        assert_eq!(hit.into_bytes(), Some(Bytes::from_static(b"value")));
+        assert!(hit.into_batch().is_some());
 
         let miss = LookupResult::NotFound;
         assert!(miss.is_not_found());
         assert!(!miss.is_hit());
-        assert!(miss.into_bytes().is_none());
+        assert!(miss.into_batch().is_none());
 
         let pending = LookupResult::Pending;
         assert!(!pending.is_hit());

@@ -80,7 +80,7 @@ Gossip discovery, Raft consensus, partition ownership, distributed checkpoints, 
 | Schema trait architecture | Extensible connector traits | Pluggable format decoders, schema inference | ADR-006 |
 | Distributed coordination | openraft + chitchat | Proven Raft for consensus, gossip for discovery | -- |
 | Cache implementation | foyer | S3-FIFO eviction, serde for HybridCache | -- |
-| Secondary indexes | redb | Embedded B-tree, no external dependencies | -- |
+| Lookup join execution | Hash-indexed snapshot | Arrow RowConverter key encoding, pre-filtered at plan time | -- |
 | Concurrent HashMap | papaya | Lock-free, better than dashmap for cross-partition | -- |
 
 ---

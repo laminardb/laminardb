@@ -27,7 +27,7 @@ const DEFAULT_PARTIAL_MAX_ENTRIES: usize = 500_000;
 
 impl TableCacheMode {
     /// Return the max entries for partial mode, or `None` for other modes.
-    #[allow(dead_code)]
+    #[allow(dead_code)] // test verification API
     pub fn max_entries(&self) -> Option<usize> {
         match self {
             Self::Partial { max_entries } => Some(*max_entries),

@@ -22,12 +22,11 @@ pub mod source;
 pub mod table;
 
 // Re-export commonly used types
-pub use foyer_cache::{
-    CachedValue, FoyerMemoryCache, FoyerMemoryCacheConfig, HierarchyMetrics, HybridCacheConfig,
-    LookupCacheHierarchy, LookupCacheKey,
-};
+pub use foyer_cache::{FoyerMemoryCache, FoyerMemoryCacheConfig, LookupCacheKey};
 pub use predicate::{
     predicate_to_sql, split_predicates, Predicate, ScalarValue, SourceCapabilities, SplitPredicates,
 };
-pub use source::{ColumnId, LookupError, LookupSource, LookupSourceCapabilities, PushdownAdapter};
+pub use source::{
+    ColumnId, LookupError, LookupSource, LookupSourceCapabilities, LookupSourceDyn, PushdownAdapter,
+};
 pub use table::{LookupResult, LookupStrategy, LookupTable, LookupTableConfig};

@@ -23,7 +23,6 @@ use crate::table_backend::TableBackend;
 use crate::table_cache_mode::TableCacheMode;
 
 /// Internal state for a single reference table.
-#[allow(dead_code)]
 struct TableState {
     /// Arrow schema for this table.
     schema: SchemaRef,
@@ -40,6 +39,7 @@ struct TableState {
     /// Connector type backing this table, if any.
     connector: Option<String>,
     /// Cache mode for this table.
+    #[allow(dead_code)] // read in test-only lookup() path
     cache_mode: TableCacheMode,
     /// LRU cache (only used in Partial mode).
     lru_cache: Option<TableLruCache>,
@@ -152,12 +152,11 @@ impl TableStore {
         self.tables.get(name).map_or(0, |t| t.row_count)
     }
 
-    #[allow(dead_code)]
+    #[allow(dead_code)] // test verification API
     pub fn is_ready(&self, name: &str) -> bool {
         self.tables.get(name).is_some_and(|t| t.ready)
     }
 
-    #[allow(dead_code)]
     pub fn set_ready(&mut self, name: &str, ready: bool) {
         if let Some(t) = self.tables.get_mut(name) {
             t.ready = ready;
@@ -175,7 +174,6 @@ impl TableStore {
     }
 
     /// Whether a table uses persistent storage.
-    #[allow(dead_code)]
     pub fn is_persistent(&self, name: &str) -> bool {
         self.tables
             .get(name)
@@ -220,7 +218,7 @@ impl TableStore {
 
     /// Delete a row by primary key. Returns `true` if the key existed.
     /// Invalidates the LRU cache entry if present.
-    #[allow(dead_code)]
+    #[allow(dead_code)] // test verification API
     pub fn delete(&mut self, name: &str, key: &str) -> bool {
         if let Some(state) = self.tables.get_mut(name) {
             if let Some(ref mut lru) = state.lru_cache {
@@ -242,7 +240,7 @@ impl TableStore {
     ///
     /// In **Full** / **None** mode: direct backend lookup (unchanged behavior).
     /// In **Partial** mode: xor filter -> LRU cache -> backend -> populate LRU.
-    #[allow(dead_code)]
+    #[allow(dead_code)] // test verification API
     pub fn lookup(&mut self, name: &str, key: &str) -> Option<RecordBatch> {
         let state = self.tables.get_mut(name)?;
 
@@ -289,7 +287,6 @@ impl TableStore {
     }
 
     /// Rebuild the xor filter for a table from all current keys.
-    #[allow(dead_code)]
     pub fn rebuild_xor_filter(&mut self, name: &str) {
         if let Some(state) = self.tables.get_mut(name) {
             let keys = state.backend.keys().unwrap_or_default();
@@ -298,7 +295,7 @@ impl TableStore {
     }
 
     /// Get cache metrics for a table.
-    #[allow(dead_code)]
+    #[allow(dead_code)] // test verification API
     pub fn cache_metrics(&self, name: &str) -> Option<TableCacheMetrics> {
         let state = self.tables.get(name)?;
         state
