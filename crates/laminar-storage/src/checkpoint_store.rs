@@ -329,7 +329,11 @@ pub trait CheckpointStore: Send + Sync {
     ) -> Result<(), CheckpointStoreError> {
         let mut manifest = manifest.clone();
         if let Some(data) = state_data {
-            // Compute checksum before writing for crash-safe verification.
+            // Compute checksum from in-memory bytes before writing. This is safe
+            // because: (1) save_state_data writes to a temp file then renames
+            // atomically, so the on-disk bytes match the in-memory data exactly;
+            // (2) if the sidecar write fails, save() is never called, so the
+            // manifest with the checksum is never persisted.
             manifest.state_checksum = Some(sha256_hex(data));
             self.save_state_data(manifest.checkpoint_id, data)?;
         }

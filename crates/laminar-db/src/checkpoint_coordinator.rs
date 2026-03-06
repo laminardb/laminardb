@@ -714,15 +714,17 @@ impl CheckpointCoordinator {
     /// data **before** the manifest, ensuring atomicity: if the sidecar write
     /// fails, the manifest is never persisted.
     ///
+    /// Takes `manifest` by value to avoid cloning on the common path.
+    /// Callers that need the manifest after save should clone before calling.
+    ///
     /// Bounded by [`CheckpointConfig::persist_timeout`] to prevent a hung
     /// filesystem from stalling the runtime indefinitely.
     async fn save_manifest(
         &self,
-        manifest: &CheckpointManifest,
+        manifest: CheckpointManifest,
         state_data: Option<Vec<u8>>,
     ) -> Result<(), DbError> {
         let store = Arc::clone(&self.store);
-        let manifest = manifest.clone();
         let timeout_dur = self.config.persist_timeout;
 
         let task = tokio::task::spawn_blocking(move || {
@@ -1061,7 +1063,7 @@ impl CheckpointCoordinator {
 
         // ── Step 5: Persist manifest (decision record — sinks are Pending) ──
         self.phase = CheckpointPhase::Persisting;
-        if let Err(e) = self.save_manifest(&manifest, state_data).await {
+        if let Err(e) = self.save_manifest(manifest.clone(), state_data).await {
             self.phase = CheckpointPhase::Idle;
             self.checkpoints_failed += 1;
             self.maybe_cap_drainers();
@@ -1096,7 +1098,7 @@ impl CheckpointCoordinator {
         // ── Step 6b: Save manifest again with final sink commit statuses ──
         if !sink_statuses.is_empty() {
             manifest.sink_commit_statuses = sink_statuses;
-            if let Err(e) = self.save_manifest(&manifest, None).await {
+            if let Err(e) = self.save_manifest(manifest, None).await {
                 warn!(
                     checkpoint_id,
                     epoch,
