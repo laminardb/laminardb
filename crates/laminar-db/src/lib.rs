@@ -55,6 +55,8 @@ pub mod recovery_manager;
 mod show_commands;
 mod sink_task;
 mod sql_utils;
+// Used in production by `ConnectorPipelineCallback` for SQL execution and
+// checkpoint state capture. Not dead code.
 mod stream_executor;
 mod table_backend;
 mod table_cache_mode;

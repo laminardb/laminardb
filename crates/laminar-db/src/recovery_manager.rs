@@ -12,8 +12,8 @@
 //! 3. For each source: `source.restore(manifest.source_offsets[name])`
 //! 4. For each table source: `source.restore(manifest.table_offsets[name])`
 //! 5. For each exactly-once sink: `sink.rollback_epoch(manifest.epoch)`
-//! 6. If DAG: `dag_executor.restore(manifest.operator_states)` via conversion
-//! 7. Return recovered state (watermark, epoch, operator states)
+//! 6. Return recovered state (watermark, epoch, operator states)
+//!    — caller is responsible for restoring DAG/TPC operators from `operator_states`
 //!
 //! ## Fallback Recovery
 //!

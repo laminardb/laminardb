@@ -389,7 +389,7 @@ Exactly-once processing works through:
 2. **Changelog capture** -- `ChangelogAwareStore` records every state mutation
 3. **WAL** -- Per-core WAL segments with CRC32C checksums and torn write detection
 4. **Incremental checkpoints** -- Directory-based snapshots of operator state
-5. **Two-phase commit** -- Coordinated across all sinks via `CheckpointCoordinator`
+5. **Two-phase commit** -- Coordinated across exactly-once sinks via `CheckpointCoordinator` (at-most-once sinks receive no pre_commit/commit guarantees)
 6. **Recovery** -- `RecoveryManager` restores from the latest checkpoint manifest, replays WAL entries, and resumes from committed offsets
 
 ## Delta Architecture (Distributed Mode)
@@ -399,7 +399,7 @@ With the `delta` feature enabled, multi-node operation:
 - **Discovery** -- Static configuration, gossip-based (chitchat), or Kafka group discovery
 - **Coordination** -- Raft-based metadata consensus via openraft
 - **Partition Ownership** -- Epoch-fenced partition guards with consistent assignment
-- **Distributed Checkpoints** -- Cross-node barrier coordination
+- **Distributed Checkpoints** -- Cross-node barrier coordination (planned; not yet implemented in checkpoint_coordinator)
 - **Cross-Node Aggregation** -- Gossip partial aggregates and gRPC fan-out
 - **Inter-Node RPC** -- gRPC service definitions for remote lookups, barrier forwarding, aggregate fan-out
 
