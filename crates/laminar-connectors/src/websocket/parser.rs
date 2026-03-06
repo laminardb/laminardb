@@ -6,7 +6,7 @@
 use std::sync::Arc;
 
 use arrow_array::builder::{BinaryBuilder, StringBuilder};
-use arrow_array::RecordBatch;
+use arrow_array::{Array, RecordBatch};
 use arrow_schema::{DataType, Field, Schema, SchemaRef};
 
 use crate::error::ConnectorError;
@@ -159,6 +159,34 @@ impl MessageParser {
                 "failed to build CSV RecordBatch: {e}"
             )))
         })
+    }
+}
+
+/// Extracts the maximum event time (as epoch milliseconds) from a named column.
+///
+/// Supports `Int64` and `TimestampMillisecond` column types. Returns `None`
+/// if the column is missing, has an unsupported type, or is entirely null.
+#[must_use]
+#[allow(clippy::cast_possible_truncation)]
+pub fn extract_max_event_time(batch: &RecordBatch, field: &str) -> Option<i64> {
+    let col_idx = batch.schema().index_of(field).ok()?;
+    let col = batch.column(col_idx);
+
+    if let Some(arr) = col.as_any().downcast_ref::<arrow_array::Int64Array>() {
+        (0..arr.len())
+            .filter(|&i| !arr.is_null(i))
+            .map(|i| arr.value(i))
+            .max()
+    } else if let Some(arr) = col
+        .as_any()
+        .downcast_ref::<arrow_array::TimestampMillisecondArray>()
+    {
+        (0..arr.len())
+            .filter(|&i| !arr.is_null(i))
+            .map(|i| arr.value(i))
+            .max()
+    } else {
+        None
     }
 }
 
@@ -408,5 +436,41 @@ mod tests {
         assert_eq!(active_field.data_type(), &DataType::Boolean);
         let score_field = schema.field_with_name("score").unwrap();
         assert_eq!(score_field.data_type(), &DataType::Float64);
+    }
+
+    #[test]
+    fn test_extract_max_event_time_int64() {
+        let schema = Arc::new(Schema::new(vec![Field::new("ts", DataType::Int64, false)]));
+        let ts = arrow_array::Int64Array::from(vec![1000, 3000, 2000]);
+        let batch = RecordBatch::try_new(schema, vec![Arc::new(ts)]).unwrap();
+
+        assert_eq!(extract_max_event_time(&batch, "ts"), Some(3000));
+    }
+
+    #[test]
+    fn test_extract_max_event_time_missing_column() {
+        let schema = Arc::new(Schema::new(vec![Field::new("id", DataType::Int64, false)]));
+        let ids = arrow_array::Int64Array::from(vec![1, 2, 3]);
+        let batch = RecordBatch::try_new(schema, vec![Arc::new(ids)]).unwrap();
+
+        assert_eq!(extract_max_event_time(&batch, "ts"), None);
+    }
+
+    #[test]
+    fn test_extract_max_event_time_with_nulls() {
+        let schema = Arc::new(Schema::new(vec![Field::new("ts", DataType::Int64, true)]));
+        let ts = arrow_array::Int64Array::from(vec![Some(1000), None, Some(3000), None]);
+        let batch = RecordBatch::try_new(schema, vec![Arc::new(ts)]).unwrap();
+
+        assert_eq!(extract_max_event_time(&batch, "ts"), Some(3000));
+    }
+
+    #[test]
+    fn test_extract_max_event_time_unsupported_type() {
+        let schema = Arc::new(Schema::new(vec![Field::new("ts", DataType::Utf8, false)]));
+        let ts = arrow_array::StringArray::from(vec!["2026-01-01"]);
+        let batch = RecordBatch::try_new(schema, vec![Arc::new(ts)]).unwrap();
+
+        assert_eq!(extract_max_event_time(&batch, "ts"), None);
     }
 }

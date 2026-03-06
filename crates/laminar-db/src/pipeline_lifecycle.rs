@@ -566,6 +566,18 @@ impl LaminarDB {
                      are degraded to at-most-once for this source"
                 );
             }
+            // Wire event.time.column from connector config to the core Source
+            // so SourceWatermarkState can extract watermarks from batch data.
+            if let Some(entry) = self.catalog.get_source(name) {
+                if entry.source.event_time_column().is_none() {
+                    if let Some(col) = config.get("event.time.column") {
+                        entry.source.set_event_time_column(col);
+                    } else if let Some(col) = config.get("event.time.field") {
+                        entry.source.set_event_time_column(col);
+                    }
+                }
+            }
+
             sources.push(SourceRegistration {
                 name: name.clone(),
                 connector: source,
