@@ -1,8 +1,12 @@
 //! Per-client fan-out manager for WebSocket sink server mode.
 //!
 //! Manages per-client state, bounded send buffers, and slow client
-//! eviction. Each connected client gets its own `tokio::sync::mpsc`
-//! channel so that a slow client cannot block or affect other clients.
+//! eviction. Each connected client gets its own ring-buffer channel
+//! so that a slow client cannot block or affect other clients.
+//!
+//! The [`RingSender`]/[`RingReceiver`] pair implements true `DropOldest`
+//! semantics: when the buffer is full, the oldest message is evicted
+//! to make room for the new one.
 
 use std::collections::HashMap;
 use std::collections::VecDeque;
@@ -10,10 +14,126 @@ use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::Arc;
 
 use bytes::Bytes;
-use parking_lot::RwLock;
+use parking_lot::{Mutex, RwLock};
+use tokio::sync::Notify;
 use tracing::{debug, warn};
 
 use super::sink_config::SlowClientPolicy;
+
+// ── Ring-buffer channel ─────────────────────────────────────────────
+
+struct RingInner<T> {
+    buffer: VecDeque<T>,
+    capacity: usize,
+    closed: bool,
+}
+
+/// Sender half of a bounded ring-buffer channel.
+///
+/// When the buffer is full:
+/// - `DropOldest`: evicts the oldest entry and pushes the new one.
+/// - `DropNewest`: discards the new entry.
+///
+/// Uses `parking_lot::Mutex` for the shared buffer (one writer from
+/// `broadcast()`, one reader from the per-client tokio task).
+pub struct RingSender<T> {
+    inner: Arc<Mutex<RingInner<T>>>,
+    notify: Arc<Notify>,
+}
+
+/// Receiver half of a bounded ring-buffer channel.
+pub struct RingReceiver<T> {
+    inner: Arc<Mutex<RingInner<T>>>,
+    notify: Arc<Notify>,
+}
+
+/// Result of a send attempt on a ring channel.
+pub enum RingSendResult {
+    /// Message was enqueued.
+    Sent,
+    /// Buffer was full; oldest message evicted to make room.
+    Evicted,
+    /// Buffer was full; incoming message dropped (`DropNewest` policy).
+    Dropped,
+    /// Receiver was dropped.
+    Closed,
+}
+
+/// Creates a ring-buffer channel pair with the given capacity.
+#[must_use]
+pub fn ring_channel<T>(capacity: usize) -> (RingSender<T>, RingReceiver<T>) {
+    let cap = capacity.max(1);
+    let inner = Arc::new(Mutex::new(RingInner {
+        buffer: VecDeque::with_capacity(cap),
+        capacity: cap,
+        closed: false,
+    }));
+    let notify = Arc::new(Notify::new());
+    (
+        RingSender {
+            inner: Arc::clone(&inner),
+            notify: Arc::clone(&notify),
+        },
+        RingReceiver { inner, notify },
+    )
+}
+
+impl<T> RingSender<T> {
+    /// Sends a value, applying the given policy when the buffer is full.
+    #[must_use]
+    pub fn send(&self, value: T, drop_oldest: bool) -> RingSendResult {
+        let mut guard = self.inner.lock();
+        if guard.closed {
+            return RingSendResult::Closed;
+        }
+        if guard.buffer.len() >= guard.capacity {
+            if drop_oldest {
+                guard.buffer.pop_front();
+                guard.buffer.push_back(value);
+                self.notify.notify_one();
+                return RingSendResult::Evicted;
+            }
+            return RingSendResult::Dropped;
+        }
+        guard.buffer.push_back(value);
+        self.notify.notify_one();
+        RingSendResult::Sent
+    }
+}
+
+impl<T> Drop for RingSender<T> {
+    fn drop(&mut self) {
+        self.inner.lock().closed = true;
+        self.notify.notify_one();
+    }
+}
+
+impl<T> RingReceiver<T> {
+    /// Receives the next value, waiting asynchronously if the buffer is empty.
+    /// Returns `None` if the sender is dropped and the buffer is empty.
+    pub async fn recv(&self) -> Option<T> {
+        loop {
+            {
+                let mut guard = self.inner.lock();
+                if let Some(item) = guard.buffer.pop_front() {
+                    return Some(item);
+                }
+                if guard.closed {
+                    return None;
+                }
+            }
+            self.notify.notified().await;
+        }
+    }
+}
+
+impl<T> Drop for RingReceiver<T> {
+    fn drop(&mut self) {
+        self.inner.lock().closed = true;
+    }
+}
+
+// ── Fan-out types ───────────────────────────────────────────────────
 
 /// Unique identifier for a connected WebSocket client.
 pub type ClientId = u64;
@@ -21,8 +141,8 @@ pub type ClientId = u64;
 /// Per-client state within the fan-out manager.
 #[derive(Debug)]
 pub struct ClientState {
-    /// Bounded send channel for this client.
-    pub tx: tokio::sync::mpsc::Sender<Bytes>,
+    /// Ring-buffer sender for this client.
+    pub tx: RingSender<Bytes>,
     /// Client's subscription filter expression (if any).
     pub filter: Option<String>,
     /// Subscription ID assigned to this client.
@@ -31,6 +151,16 @@ pub struct ClientState {
     pub format: Option<super::sink_config::SinkFormat>,
     /// Number of messages dropped for this client.
     pub messages_dropped: AtomicU64,
+}
+
+impl std::fmt::Debug for RingSender<Bytes> {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        let guard = self.inner.lock();
+        f.debug_struct("RingSender")
+            .field("buffered", &guard.buffer.len())
+            .field("capacity", &guard.capacity)
+            .finish()
+    }
 }
 
 /// Circular replay buffer for client resume support.
@@ -141,9 +271,9 @@ impl FanoutManager {
         subscription_id: String,
         filter: Option<String>,
         format: Option<super::sink_config::SinkFormat>,
-    ) -> (ClientId, tokio::sync::mpsc::Receiver<Bytes>) {
+    ) -> (ClientId, RingReceiver<Bytes>) {
         let id = self.next_id.fetch_add(1, Ordering::Relaxed);
-        let (tx, rx) = tokio::sync::mpsc::channel(self.buffer_capacity);
+        let (tx, rx) = ring_channel(self.buffer_capacity);
 
         let state = ClientState {
             tx,
@@ -203,48 +333,37 @@ impl FanoutManager {
         let mut dropped = 0u64;
         let mut disconnected: Vec<ClientId> = Vec::new();
 
+        let drop_oldest = matches!(self.policy, SlowClientPolicy::DropOldest);
+
         for (&id, state) in clients.iter() {
-            match state.tx.try_send(data.clone()) {
-                Ok(()) => {
+            match state.tx.send(data.clone(), drop_oldest) {
+                RingSendResult::Sent => {
                     sent += 1;
                 }
-                Err(tokio::sync::mpsc::error::TrySendError::Full(_rejected)) => {
-                    match &self.policy {
-                        SlowClientPolicy::DropNewest => {
-                            state.messages_dropped.fetch_add(1, Ordering::Relaxed);
-                            dropped += 1;
-                        }
-                        SlowClientPolicy::DropOldest => {
-                            // Cannot evict oldest from mpsc sender side — drops incoming instead.
-                            // TODO: replace mpsc with ring-buffer channel for true DropOldest.
-                            state.messages_dropped.fetch_add(1, Ordering::Relaxed);
-                            dropped += 1;
-                            if state.messages_dropped.load(Ordering::Relaxed) == 1 {
-                                warn!(
-                                    client_id = id,
-                                    "DropOldest: mpsc cannot evict; dropping incoming message"
-                                );
-                            }
-                        }
-                        SlowClientPolicy::Disconnect { .. } => {
+                RingSendResult::Evicted => {
+                    state.messages_dropped.fetch_add(1, Ordering::Relaxed);
+                    sent += 1; // new message was enqueued after eviction
+                    dropped += 1; // but the old message was lost
+                }
+                RingSendResult::Dropped => match &self.policy {
+                    SlowClientPolicy::DropNewest | SlowClientPolicy::DropOldest => {
+                        state.messages_dropped.fetch_add(1, Ordering::Relaxed);
+                        dropped += 1;
+                    }
+                    SlowClientPolicy::Disconnect { .. } => {
+                        disconnected.push(id);
+                    }
+                    SlowClientPolicy::WarnThenDisconnect { .. } => {
+                        let total_drops =
+                            state.messages_dropped.fetch_add(1, Ordering::Relaxed) + 1;
+                        if total_drops > self.buffer_capacity as u64 {
                             disconnected.push(id);
-                        }
-                        SlowClientPolicy::WarnThenDisconnect {
-                            warn_pct: _,
-                            disconnect_pct: _,
-                        } => {
-                            // Approximate: if drops exceed threshold, disconnect.
-                            let total_drops =
-                                state.messages_dropped.fetch_add(1, Ordering::Relaxed) + 1;
-                            if total_drops > self.buffer_capacity as u64 {
-                                disconnected.push(id);
-                            } else {
-                                dropped += 1;
-                            }
+                        } else {
+                            dropped += 1;
                         }
                     }
-                }
-                Err(tokio::sync::mpsc::error::TrySendError::Closed(_)) => {
+                },
+                RingSendResult::Closed => {
                     disconnected.push(id);
                 }
             }
@@ -423,6 +542,45 @@ mod tests {
         let result = mgr.broadcast(Bytes::from("hello"));
         assert_eq!(result.disconnected, 1);
         assert_eq!(mgr.client_count(), 0);
+    }
+
+    #[tokio::test]
+    async fn test_fanout_drop_oldest_evicts() {
+        let mgr = FanoutManager::new(SlowClientPolicy::DropOldest, 2, None);
+        let (_id, rx) = mgr.add_client("sub1".into(), None, None);
+
+        // Fill the buffer.
+        mgr.broadcast(Bytes::from("a"));
+        mgr.broadcast(Bytes::from("b"));
+
+        // This should evict "a" and enqueue "c".
+        let result = mgr.broadcast(Bytes::from("c"));
+        assert_eq!(result.sent, 1); // new message was enqueued
+        assert_eq!(result.dropped, 1); // old message was evicted
+
+        // Receiver should get "b" then "c" (not "a").
+        let msg1 = rx.recv().await.unwrap();
+        assert_eq!(msg1.as_ref(), b"b");
+        let msg2 = rx.recv().await.unwrap();
+        assert_eq!(msg2.as_ref(), b"c");
+    }
+
+    #[tokio::test]
+    async fn test_ring_channel_basic() {
+        let (tx, rx) = ring_channel::<Bytes>(4);
+        let _ = tx.send(Bytes::from("hello"), false);
+        let msg = rx.recv().await.unwrap();
+        assert_eq!(msg.as_ref(), b"hello");
+    }
+
+    #[tokio::test]
+    async fn test_ring_channel_sender_dropped() {
+        let (tx, rx) = ring_channel::<Bytes>(4);
+        let _ = tx.send(Bytes::from("last"), false);
+        drop(tx);
+        let msg = rx.recv().await.unwrap();
+        assert_eq!(msg.as_ref(), b"last");
+        assert!(rx.recv().await.is_none());
     }
 
     #[test]
