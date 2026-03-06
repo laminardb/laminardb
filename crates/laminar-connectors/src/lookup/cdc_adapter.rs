@@ -1,7 +1,7 @@
 //! CDC-to-reference-table adapter.
 //!
-//! Wraps any [`SourceConnector`] (Postgres CDC, MySQL CDC) as a
-//! [`ReferenceTableSource`] so CDC streams can populate lookup tables.
+//! Wraps any `SourceConnector` (Postgres CDC, MySQL CDC) as a
+//! `ReferenceTableSource` so CDC streams can populate lookup tables.
 //!
 //! The adapter has two phases:
 //! 1. **Snapshot**: calls `poll_batch()` until the source returns `None`,

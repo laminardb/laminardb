@@ -1,6 +1,6 @@
 //! Physical execution plan for lookup joins.
 //!
-//! Bridges [`LookupJoinNode`] (logical) to a hash-probe executor that
+//! Bridges `LookupJoinNode` (logical) to a hash-probe executor that
 //! joins streaming input against a pre-indexed lookup table snapshot.
 //!
 //! ## Data flow
@@ -864,7 +864,7 @@ async fn probe_partial_batch_with_fallback(
 
 // ── Extension Planner ────────────────────────────────────────────
 
-/// Converts [`LookupJoinNode`] logical plans to [`LookupJoinExec`]
+/// Converts `LookupJoinNode` logical plans to [`LookupJoinExec`]
 /// or [`PartialLookupJoinExec`] physical plans by resolving table
 /// data from the registry.
 pub struct LookupJoinExtensionPlanner {
