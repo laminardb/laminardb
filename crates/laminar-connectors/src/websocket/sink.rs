@@ -220,7 +220,7 @@ impl SinkConnector for WebSocketSinkServer {
                                     };
 
                                     // Register the client.
-                                    let (client_id, mut rx) =
+                                    let (client_id, rx) =
                                         fanout.add_client(sub_id.clone(), filter, None);
 
                                     metrics.record_connect();
