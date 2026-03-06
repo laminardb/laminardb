@@ -5,6 +5,7 @@
 //! with the Confluent wire format prefix (`0x00` + 4-byte BE schema ID
 //! + Avro body).
 
+use std::sync::atomic::{AtomicU32, Ordering};
 use std::sync::Arc;
 
 use arrow_array::RecordBatch;
@@ -28,8 +29,8 @@ const CONFLUENT_MAGIC: u8 = 0x00;
 /// Produces per-row byte payloads in the Confluent wire format suitable
 /// for individual Kafka producer messages.
 pub struct AvroSerializer {
-    /// Schema ID to embed in the Confluent wire format prefix.
-    schema_id: u32,
+    /// Schema ID shared with `KafkaSink` for post-registration updates.
+    schema_id: Arc<AtomicU32>,
     /// Arrow schema for the records being serialized.
     schema: SchemaRef,
     /// Optional Schema Registry client for schema registration.
@@ -43,16 +44,30 @@ impl AvroSerializer {
     #[must_use]
     pub fn new(schema: SchemaRef, schema_id: u32) -> Self {
         Self {
-            schema_id,
+            schema_id: Arc::new(AtomicU32::new(schema_id)),
             schema,
             schema_registry: None,
         }
     }
 
-    /// Creates a new Avro serializer with Schema Registry integration.
+    /// Creates a new Avro serializer with a shared schema ID handle.
     ///
-    /// The schema ID is obtained from the registry. Call
-    /// `set_schema_id` after registering the schema.
+    /// The `KafkaSink` retains a clone of the `Arc<AtomicU32>` so it can
+    /// update the schema ID after registration without downcasting.
+    #[must_use]
+    pub fn with_shared_schema_id(
+        schema: SchemaRef,
+        schema_id: Arc<AtomicU32>,
+        registry: Option<Arc<SchemaRegistryClient>>,
+    ) -> Self {
+        Self {
+            schema_id,
+            schema,
+            schema_registry: registry,
+        }
+    }
+
+    /// Creates a new Avro serializer with Schema Registry integration.
     #[must_use]
     pub fn with_schema_registry(
         schema: SchemaRef,
@@ -60,21 +75,22 @@ impl AvroSerializer {
         registry: Arc<SchemaRegistryClient>,
     ) -> Self {
         Self {
-            schema_id,
+            schema_id: Arc::new(AtomicU32::new(schema_id)),
             schema,
             schema_registry: Some(registry),
         }
     }
 
-    /// Updates the schema ID (e.g., after registering with the registry).
-    pub fn set_schema_id(&mut self, id: u32) {
-        self.schema_id = id;
+    /// Returns a shared handle to the schema ID for external updates.
+    #[must_use]
+    pub fn schema_id_handle(&self) -> Arc<AtomicU32> {
+        Arc::clone(&self.schema_id)
     }
 
     /// Returns the current schema ID.
     #[must_use]
     pub fn schema_id(&self) -> u32 {
-        self.schema_id
+        self.schema_id.load(Ordering::Relaxed)
     }
 
     /// Returns whether a Schema Registry client is configured.
@@ -99,8 +115,9 @@ impl AvroSerializer {
         let mut buf = Vec::new();
         let arrow_schema = (*self.schema).clone();
 
+        let id = self.schema_id.load(Ordering::Relaxed);
         let mut writer = WriterBuilder::new(arrow_schema)
-            .with_fingerprint_strategy(FingerprintStrategy::Id(self.schema_id))
+            .with_fingerprint_strategy(FingerprintStrategy::Id(id))
             .build::<_, AvroSoeFormat>(&mut buf)
             .map_err(|e| SerdeError::MalformedInput(format!("failed to build Avro writer: {e}")))?;
 
@@ -112,8 +129,6 @@ impl AvroSerializer {
             .finish()
             .map_err(|e| SerdeError::MalformedInput(format!("Avro flush error: {e}")))?;
 
-        // Split the buffer into per-record payloads.
-        // Each record starts with CONFLUENT_MAGIC (0x00) + 4-byte schema ID.
         split_confluent_records(&buf, batch.num_rows())
     }
 }
@@ -130,9 +145,10 @@ impl RecordSerializer for AvroSerializer {
 
         let mut buf = Vec::new();
         let arrow_schema = (*self.schema).clone();
+        let id = self.schema_id.load(Ordering::Relaxed);
 
         let mut writer = WriterBuilder::new(arrow_schema)
-            .with_fingerprint_strategy(FingerprintStrategy::Id(self.schema_id))
+            .with_fingerprint_strategy(FingerprintStrategy::Id(id))
             .build::<_, AvroSoeFormat>(&mut buf)
             .map_err(|e| SerdeError::MalformedInput(format!("failed to build Avro writer: {e}")))?;
 
@@ -155,7 +171,7 @@ impl RecordSerializer for AvroSerializer {
 impl std::fmt::Debug for AvroSerializer {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         f.debug_struct("AvroSerializer")
-            .field("schema_id", &self.schema_id)
+            .field("schema_id", &self.schema_id.load(Ordering::Relaxed))
             .field("has_registry", &self.schema_registry.is_some())
             .finish_non_exhaustive()
     }
@@ -253,10 +269,11 @@ mod tests {
     }
 
     #[test]
-    fn test_set_schema_id() {
-        let mut ser = AvroSerializer::new(test_schema(), 1);
+    fn test_shared_schema_id() {
+        let ser = AvroSerializer::new(test_schema(), 1);
         assert_eq!(ser.schema_id(), 1);
-        ser.set_schema_id(99);
+        let handle = ser.schema_id_handle();
+        handle.store(99, std::sync::atomic::Ordering::Relaxed);
         assert_eq!(ser.schema_id(), 99);
     }
 
