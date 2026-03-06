@@ -28,7 +28,7 @@ categories = ["database", "embedded", "data-structures"]
 
 [workspace.dependencies]
 # Core dependencies
-tokio = { version = "1.49", features = ["full"] }
+tokio = { version = "1.50", features = ["full"] }
 async-trait = "0.1"
 serde = { version = "1.0", features = ["derive"] }
 serde_json = "1.0"
@@ -48,8 +48,8 @@ rustc-hash = "2.1"  # Faster than std HashMap (replaces unmaintained fxhash)
 crossbeam = "0.8"  # Lock-free data structures
 parking_lot = "0.12"  # Faster Mutex/RwLock
 memmap2 = "0.9"  # Memory-mapped files
-bumpalo = "3.19"  # Arena allocator
-uuid = { version = "1.19", features = ["v4", "v7", "serde"] }  # Unique IDs
+bumpalo = "3.20"  # Arena allocator
+uuid = { version = "1.21", features = ["v4", "v7", "serde"] }  # Unique IDs
 gethostname = "0.5"  # Pure Rust hostname lookup
 ahash = "0.8"  # Fast hashing for state stores
 papaya = "0.2"  # Lock-free concurrent HashMap
@@ -58,7 +58,7 @@ sha2 = "0.10"  # SHA-256 for checkpoint integrity
 lz4_flex = "0.11"  # Pure Rust LZ4 compression (fastest decompression for recovery)
 zstd = "0.13"  # Zstd compression for archival storage tiers (warm/cold)
 backoff = { version = "0.4", features = ["tokio"] }  # Exponential backoff retry
-regex = "1.10"
+regex = "1.12"
 humantime-serde = "1.1"
 notify = "8"
 
@@ -71,7 +71,7 @@ arrow-data = "57.2"
 arrow-cast = "57.2"
 arrow-ipc = "57.2"
 arrow-select = "57.2"
-datafusion = "52.0"
+datafusion = "52.2"
 datafusion-common = "52.0"
 datafusion-expr = "52.0"
 datafusion-sql = "52.0"
@@ -120,8 +120,8 @@ xxhash-rust = { version = "0.8", features = ["xxh3"] }
 
 # Testing
 criterion = { version = "0.8", features = ["html_reports"] }
-proptest = "1.9"
-tempfile = "3.24"
+proptest = "1.10"
+tempfile = "3.26"
 
 [profile.release]
 lto = "fat"
