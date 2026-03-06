@@ -108,6 +108,7 @@ fn serialize_pk(
 /// Extract a single row from a `RecordBatch` as a new single-row batch.
 fn extract_row(batch: &RecordBatch, row: usize) -> Result<RecordBatch, LookupError> {
     use arrow_select::take::take;
+    #[allow(clippy::cast_possible_truncation)] // row index within a RecordBatch fits u32
     let indices = arrow_array::UInt32Array::from(vec![row as u32]);
     let columns: Vec<_> = batch
         .columns()
