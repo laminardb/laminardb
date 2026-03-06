@@ -195,19 +195,31 @@ impl SourceConnector for WebSocketSourceServer {
                                                 match msg {
                                                     Some(Ok(tungstenite::Message::Text(text))) => {
                                                         let payload = text.as_bytes().to_vec();
-                                                        if payload.len() <= max_msg_size {
-                                                            if tx.send(payload).await.is_err() {
-                                                                break;
-                                                            }
+                                                        if payload.len() > max_msg_size {
+                                                            warn!(
+                                                                size = payload.len(),
+                                                                max = max_msg_size,
+                                                                addr = %addr,
+                                                                "dropping oversized text message"
+                                                            );
+                                                        } else if tx.send(payload).await.is_err() {
+                                                            break;
+                                                        } else {
                                                             data_ready.notify_one();
                                                         }
                                                     }
                                                     Some(Ok(tungstenite::Message::Binary(data))) => {
                                                         let payload = data.to_vec();
-                                                        if payload.len() <= max_msg_size {
-                                                            if tx.send(payload).await.is_err() {
-                                                                break;
-                                                            }
+                                                        if payload.len() > max_msg_size {
+                                                            warn!(
+                                                                size = payload.len(),
+                                                                max = max_msg_size,
+                                                                addr = %addr,
+                                                                "dropping oversized binary message"
+                                                            );
+                                                        } else if tx.send(payload).await.is_err() {
+                                                            break;
+                                                        } else {
                                                             data_ready.notify_one();
                                                         }
                                                     }

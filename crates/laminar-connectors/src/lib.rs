@@ -27,7 +27,8 @@
 #![deny(missing_docs)]
 #![warn(clippy::all, clippy::pedantic)]
 #![allow(clippy::module_name_repetitions)]
-// cold path: all connector modules (config, CDC, Kafka, lakehouse)
+// Connectors are Ring 1 (cold path): std HashMap/HashSet are acceptable
+// throughout config, registry, schema, checkpoint, and CDC modules.
 #![allow(clippy::disallowed_types)]
 // Common test patterns that are acceptable
 #![cfg_attr(

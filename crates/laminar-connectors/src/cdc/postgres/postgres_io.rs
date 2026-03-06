@@ -97,6 +97,7 @@ pub fn parse_replication_message(data: &[u8]) -> Result<ReplicationMessage, Conn
                 )));
             }
 
+            // SAFETY: length checked by `data.len() < HEADER_LEN` guard above
             let wal_start = Lsn::new(u64::from_be_bytes(data[1..9].try_into().unwrap()));
             let wal_end = Lsn::new(u64::from_be_bytes(data[9..17].try_into().unwrap()));
             let server_time_us = i64::from_be_bytes(data[17..25].try_into().unwrap());
@@ -119,6 +120,7 @@ pub fn parse_replication_message(data: &[u8]) -> Result<ReplicationMessage, Conn
                 )));
             }
 
+            // SAFETY: length checked by `data.len() < KEEPALIVE_LEN` guard above
             let wal_end = Lsn::new(u64::from_be_bytes(data[1..9].try_into().unwrap()));
             let server_time_us = i64::from_be_bytes(data[9..17].try_into().unwrap());
             let reply_requested = data[17] != 0;
@@ -163,17 +165,45 @@ pub fn encode_standby_status(write_lsn: Lsn, flush_lsn: Lsn, apply_lsn: Lsn) -> 
     buf
 }
 
+/// Validates that a string is a safe `PostgreSQL` identifier (alphanumeric + underscore).
+fn validate_pg_identifier(value: &str, field: &str) -> Result<(), ConnectorError> {
+    if value.is_empty() {
+        return Err(ConnectorError::ConfigurationError(format!(
+            "{field} must not be empty"
+        )));
+    }
+    if !value
+        .bytes()
+        .all(|b| b.is_ascii_alphanumeric() || b == b'_')
+    {
+        return Err(ConnectorError::ConfigurationError(format!(
+            "{field} contains unsafe characters (only [a-zA-Z0-9_] allowed): {value:?}"
+        )));
+    }
+    Ok(())
+}
+
 /// Builds the `START_REPLICATION` SQL command.
 ///
 /// This returns the query string to be sent via the `CopyBoth` protocol.
 /// Currently used for documentation; will be used directly once
 /// `CopyBoth` support is available in `tokio-postgres`.
-#[must_use]
-pub fn build_start_replication_query(slot_name: &str, start_lsn: Lsn, publication: &str) -> String {
-    format!(
+///
+/// # Errors
+///
+/// Returns `ConnectorError::ConfigurationError` if `slot_name` or
+/// `publication` contain characters outside `[a-zA-Z0-9_]`.
+pub fn build_start_replication_query(
+    slot_name: &str,
+    start_lsn: Lsn,
+    publication: &str,
+) -> Result<String, ConnectorError> {
+    validate_pg_identifier(slot_name, "slot_name")?;
+    validate_pg_identifier(publication, "publication")?;
+    Ok(format!(
         "START_REPLICATION SLOT {slot_name} LOGICAL {start_lsn} \
          (proto_version '1', publication_names '{publication}')"
-    )
+    ))
 }
 
 // ── Feature-gated I/O functions ──
@@ -205,11 +235,20 @@ pub async fn connect(
 
     let conn_str = config.connection_string();
 
-    if config.ssl_mode != SslMode::Disable {
-        tracing::warn!(
-            ssl_mode = %config.ssl_mode,
-            "TLS not yet supported for control-plane connections; falling back to NoTls"
-        );
+    match config.ssl_mode {
+        SslMode::Disable => {}
+        SslMode::Prefer => {
+            tracing::info!(
+                ssl_mode = %config.ssl_mode,
+                "TLS not yet implemented for control-plane connections; using NoTls (Prefer mode)"
+            );
+        }
+        mode => {
+            return Err(ConnectorError::ConfigurationError(format!(
+                "ssl.mode={mode} requires TLS support which is not yet implemented \
+                 for control-plane connections"
+            )));
+        }
     }
 
     let (client, connection) = tokio_postgres::connect(&conn_str, tokio_postgres::NoTls)
@@ -243,37 +282,35 @@ pub async fn ensure_replication_slot(
     slot_name: &str,
     plugin: &str,
 ) -> Result<Option<Lsn>, ConnectorError> {
-    // Check if slot already exists
-    let query = format!(
-        "SELECT confirmed_flush_lsn FROM pg_replication_slots \
-         WHERE slot_name = '{slot_name}'"
-    );
-    let messages = client
-        .simple_query(&query)
+    // Check if slot already exists (parameterized to prevent SQL injection)
+    let rows = client
+        .query(
+            "SELECT confirmed_flush_lsn::text FROM pg_replication_slots WHERE slot_name = $1",
+            &[&slot_name],
+        )
         .await
         .map_err(|e| ConnectorError::ConnectionFailed(format!("query replication slots: {e}")))?;
 
-    // simple_query returns SimpleQueryMessage variants
-    for msg in &messages {
-        if let tokio_postgres::SimpleQueryMessage::Row(row) = msg {
-            if let Some(lsn_str) = row.get(0) {
-                let lsn: Lsn = lsn_str.parse().map_err(|e| {
-                    ConnectorError::ReadError(format!("invalid confirmed_flush_lsn: {e}"))
-                })?;
-                tracing::info!(slot = slot_name, lsn = %lsn, "replication slot exists");
-                return Ok(Some(lsn));
-            }
-            // Row exists but LSN column is NULL
-            tracing::info!(slot = slot_name, "replication slot exists (no flush LSN)");
-            return Ok(None);
+    if let Some(row) = rows.first() {
+        let lsn_str: Option<&str> = row.get(0);
+        if let Some(lsn_str) = lsn_str {
+            let lsn: Lsn = lsn_str.parse().map_err(|e| {
+                ConnectorError::ReadError(format!("invalid confirmed_flush_lsn: {e}"))
+            })?;
+            tracing::info!(slot = slot_name, lsn = %lsn, "replication slot exists");
+            return Ok(Some(lsn));
         }
+        // Row exists but LSN column is NULL
+        tracing::info!(slot = slot_name, "replication slot exists (no flush LSN)");
+        return Ok(None);
     }
 
-    // Slot doesn't exist — create it via SQL function (works on regular connections)
-    let create_sql =
-        format!("SELECT pg_create_logical_replication_slot('{slot_name}', '{plugin}')");
+    // Slot doesn't exist — create it via SQL function (parameterized)
     client
-        .simple_query(&create_sql)
+        .execute(
+            "SELECT pg_create_logical_replication_slot($1, $2)",
+            &[&slot_name, &plugin],
+        )
         .await
         .map_err(|e| ConnectorError::ConnectionFailed(format!("create replication slot: {e}")))?;
 
@@ -517,10 +554,36 @@ mod tests {
     #[test]
     fn test_build_start_replication_query() {
         let query =
-            build_start_replication_query("my_slot", "0/1234ABCD".parse().unwrap(), "my_pub");
+            build_start_replication_query("my_slot", "0/1234ABCD".parse().unwrap(), "my_pub")
+                .unwrap();
         assert!(query.contains("START_REPLICATION SLOT my_slot LOGICAL 0/1234ABCD"));
         assert!(query.contains("proto_version '1'"));
         assert!(query.contains("publication_names 'my_pub'"));
+    }
+
+    #[test]
+    fn test_build_start_replication_query_rejects_injection() {
+        let result = build_start_replication_query(
+            "slot'; DROP TABLE users; --",
+            "0/0".parse().unwrap(),
+            "pub",
+        );
+        assert!(result.is_err());
+        assert!(result
+            .unwrap_err()
+            .to_string()
+            .contains("unsafe characters"));
+    }
+
+    #[test]
+    fn test_build_start_replication_query_rejects_empty() {
+        let result = build_start_replication_query("", "0/0".parse().unwrap(), "pub");
+        assert!(result.is_err());
+    }
+
+    #[test]
+    fn test_validate_pg_identifier_accepts_valid() {
+        assert!(validate_pg_identifier("my_slot_123", "test").is_ok());
     }
 
     // ── build_replication_config TLS mapping ──

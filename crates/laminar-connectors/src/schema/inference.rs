@@ -6,8 +6,6 @@
 //! - Built-in implementations for JSON, CSV, and raw formats
 //! - [`default_infer_from_samples`] free function used by the default
 //!   [`SchemaInferable`](super::traits::SchemaInferable) implementation
-#![allow(clippy::disallowed_types)] // cold path: schema management
-
 use std::collections::HashMap;
 use std::sync::{Arc, LazyLock, RwLock};
 
@@ -69,34 +67,26 @@ impl FormatInferenceRegistry {
         let name = inferencer.format_name().to_string();
         self.inferencers
             .write()
-            .expect("inference registry poisoned")
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
             .insert(name, inferencer);
     }
 
     /// Gets the inferencer for a format, if registered.
-    ///
-    /// # Panics
-    ///
-    /// Panics if the internal lock is poisoned.
     #[must_use]
     pub fn get(&self, format: &str) -> Option<Arc<dyn FormatInference>> {
         self.inferencers
             .read()
-            .expect("inference registry poisoned")
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
             .get(format)
             .cloned()
     }
 
     /// Returns the names of all registered formats.
-    ///
-    /// # Panics
-    ///
-    /// Panics if the internal lock is poisoned.
     #[must_use]
     pub fn registered_formats(&self) -> Vec<String> {
         self.inferencers
             .read()
-            .expect("inference registry poisoned")
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
             .keys()
             .cloned()
             .collect()

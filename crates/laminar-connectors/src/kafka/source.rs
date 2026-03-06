@@ -10,7 +10,7 @@ use async_trait::async_trait;
 use rdkafka::consumer::{Consumer, StreamConsumer};
 use rdkafka::message::Message;
 use rdkafka::ClientConfig;
-use std::sync::atomic::{AtomicBool, AtomicUsize};
+use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
 use std::sync::Arc;
 use tokio::sync::Notify;
 use tracing::{debug, info, warn};
@@ -36,7 +36,7 @@ use super::schema_registry::SchemaRegistryClient;
 /// Payload sent from the background Kafka reader task to [`KafkaSource::poll_batch`].
 struct KafkaPayload {
     data: Vec<u8>,
-    topic: String,
+    topic: Arc<str>,
     partition: i32,
     offset: i64,
 }
@@ -231,11 +231,13 @@ impl KafkaSource {
         let (msg_tx, msg_rx) = tokio::sync::mpsc::channel(4096);
         let (shutdown_tx, mut shutdown_rx) = tokio::sync::watch::channel(false);
         let data_ready = Arc::clone(&self.data_ready);
+        let channel_len = Arc::clone(&self.channel_len);
 
         // Offset commits are handled exclusively through the checkpoint path
         // (self.offsets → checkpoint() → coordinator commit). The reader task
         // does NOT auto-commit to avoid violating exactly-once semantics.
         let reader_handle = tokio::spawn(async move {
+            let mut cached_topic: Arc<str> = Arc::from("");
             loop {
                 let msg_result = tokio::select! {
                     biased;
@@ -245,15 +247,21 @@ impl KafkaSource {
                 match msg_result {
                     Ok(msg) => {
                         if let Some(payload) = msg.payload() {
+                            // Cache topic as Arc<str> — only allocates when topic changes.
+                            let topic = msg.topic();
+                            if &*cached_topic != topic {
+                                cached_topic = Arc::from(topic);
+                            }
                             let kp = KafkaPayload {
                                 data: payload.to_vec(),
-                                topic: msg.topic().to_string(),
+                                topic: Arc::clone(&cached_topic),
                                 partition: msg.partition(),
                                 offset: msg.offset(),
                             };
                             if msg_tx.send(kp).await.is_err() {
                                 break;
                             }
+                            channel_len.fetch_add(1, Ordering::Relaxed);
                             data_ready.notify_one();
                         }
                     }
@@ -396,6 +404,7 @@ impl SourceConnector for KafkaSource {
         while payload_offsets.len() < limit {
             match rx.try_recv() {
                 Ok(kp) => {
+                    self.channel_len.fetch_sub(1, Ordering::Relaxed);
                     total_bytes += kp.data.len() as u64;
                     let start = payload_buf.len();
                     payload_buf.extend_from_slice(&kp.data);
@@ -403,8 +412,8 @@ impl SourceConnector for KafkaSource {
 
                     self.offsets.update(&kp.topic, kp.partition, kp.offset);
 
-                    if last_topic.as_str() != kp.topic || last_partition_id != kp.partition {
-                        last_topic = kp.topic;
+                    if last_topic.as_str() != &*kp.topic || last_partition_id != kp.partition {
+                        last_topic = kp.topic.to_string();
                         last_partition_id = kp.partition;
                     }
                     last_offset = kp.offset;
@@ -417,6 +426,9 @@ impl SourceConnector for KafkaSource {
             return Ok(None);
         }
 
+        // PartitionInfo reflects the last topic-partition seen in this batch.
+        // Per-partition offsets are tracked correctly in `self.offsets` and
+        // persisted via checkpoint(); this field is informational only.
         let last_partition = if last_offset >= 0 {
             Some(PartitionInfo::new(
                 format!("{last_topic}-{last_partition_id}"),

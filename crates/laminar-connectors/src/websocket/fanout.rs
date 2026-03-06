@@ -208,11 +208,23 @@ impl FanoutManager {
                 Ok(()) => {
                     sent += 1;
                 }
-                Err(tokio::sync::mpsc::error::TrySendError::Full(_)) => {
+                Err(tokio::sync::mpsc::error::TrySendError::Full(_rejected)) => {
                     match &self.policy {
-                        SlowClientPolicy::DropOldest | SlowClientPolicy::DropNewest => {
+                        SlowClientPolicy::DropNewest => {
                             state.messages_dropped.fetch_add(1, Ordering::Relaxed);
                             dropped += 1;
+                        }
+                        SlowClientPolicy::DropOldest => {
+                            // Cannot evict oldest from mpsc sender side — drops incoming instead.
+                            // TODO: replace mpsc with ring-buffer channel for true DropOldest.
+                            state.messages_dropped.fetch_add(1, Ordering::Relaxed);
+                            dropped += 1;
+                            if state.messages_dropped.load(Ordering::Relaxed) == 1 {
+                                warn!(
+                                    client_id = id,
+                                    "DropOldest: mpsc cannot evict; dropping incoming message"
+                                );
+                            }
                         }
                         SlowClientPolicy::Disconnect { .. } => {
                             disconnected.push(id);

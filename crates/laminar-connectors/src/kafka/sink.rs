@@ -31,6 +31,9 @@ use super::schema_registry::SchemaRegistryClient;
 use super::sink_config::{DeliveryGuarantee, KafkaSinkConfig, PartitionStrategy};
 use super::sink_metrics::KafkaSinkMetrics;
 
+/// Default assumed partition count when broker metadata is not yet available.
+const DEFAULT_PARTITION_COUNT: i32 = 6;
+
 /// Contiguous key buffer — stores all key bytes in a single allocation
 /// with per-row `(offset, length)` pairs. Avoids N separate heap
 /// allocations for N rows.
@@ -115,6 +118,8 @@ pub struct KafkaSink {
     schema: SchemaRef,
     /// Optional Schema Registry client.
     schema_registry: Option<Arc<SchemaRegistryClient>>,
+    /// Cached topic partition count (queried from broker metadata after open).
+    topic_partition_count: i32,
 }
 
 impl KafkaSink {
@@ -137,6 +142,7 @@ impl KafkaSink {
             metrics: KafkaSinkMetrics::new(),
             schema,
             schema_registry: None,
+            topic_partition_count: DEFAULT_PARTITION_COUNT,
         }
     }
 
@@ -175,6 +181,7 @@ impl KafkaSink {
             metrics: KafkaSinkMetrics::new(),
             schema,
             schema_registry: Some(sr),
+            topic_partition_count: DEFAULT_PARTITION_COUNT,
         }
     }
 
@@ -424,8 +431,10 @@ impl SinkConnector for KafkaSink {
             let key: Option<&[u8]> = keys.as_ref().map(|kb| kb.key(i)).filter(|k| !k.is_empty());
 
             // Determine partition.
-            // Use a reasonable default for num_partitions when metadata isn't cached.
-            let partition = self.partitioner.partition(key, 6);
+            // TODO: query topic metadata after open() and cache actual partition count.
+            // Using None lets rdkafka handle partitioning via its built-in partitioner
+            // when our partitioner returns None for the default num_partitions.
+            let partition = self.partitioner.partition(key, self.topic_partition_count);
 
             // Build the Kafka record.
             let mut record = FutureRecord::to(&self.config.topic).payload(payload);

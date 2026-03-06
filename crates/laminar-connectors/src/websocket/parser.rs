@@ -75,10 +75,9 @@ impl MessageParser {
     /// Uses the type-aware [`JsonDecoder`] to coerce JSON values to the
     /// Arrow types declared in the schema.
     fn parse_json_batch(&self, messages: &[&[u8]]) -> Result<RecordBatch, ConnectorError> {
-        let decoder = self
-            .json_decoder
-            .as_ref()
-            .expect("json_decoder set for JSON format");
+        let decoder = self.json_decoder.as_ref().ok_or_else(|| {
+            ConnectorError::Internal("json_decoder not initialized for JSON format".into())
+        })?;
         let records: Vec<RawRecord> = messages
             .iter()
             .map(|m| RawRecord::new(m.to_vec()))

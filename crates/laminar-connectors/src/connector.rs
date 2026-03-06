@@ -263,8 +263,10 @@ pub trait SourceConnector: Send {
     async fn restore(&mut self, checkpoint: &SourceCheckpoint) -> Result<(), ConnectorError>;
 
     /// Returns the current health status of the connector.
+    ///
+    /// Defaults to `Unknown`; connectors should override with actual status.
     fn health_check(&self) -> HealthStatus {
-        HealthStatus::Healthy
+        HealthStatus::Unknown
     }
 
     /// Returns current metrics from the connector.
@@ -436,8 +438,10 @@ pub trait SinkConnector: Send {
     }
 
     /// Returns the current health status of the connector.
+    ///
+    /// Defaults to `Unknown`; connectors should override with actual status.
     fn health_check(&self) -> HealthStatus {
-        HealthStatus::Healthy
+        HealthStatus::Unknown
     }
 
     /// Returns current metrics from the connector.
