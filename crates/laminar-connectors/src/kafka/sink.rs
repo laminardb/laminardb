@@ -412,7 +412,7 @@ impl SinkConnector for KafkaSink {
 
                 let avro_schema =
                     super::schema_registry::arrow_to_avro_schema(&self.schema, &self.config.topic)
-                        .map_err(|e| ConnectorError::Serde(e))?;
+                        .map_err(ConnectorError::Serde)?;
 
                 let schema_id = sr
                     .register_schema(
