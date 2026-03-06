@@ -267,6 +267,45 @@ impl KafkaSink {
         Ok(Some(buf))
     }
 
+    /// Awaits delivery futures and collects results, routing failures to DLQ if configured.
+    #[allow(clippy::cast_possible_truncation)]
+    async fn collect_delivery_results(
+        &mut self,
+        futures: &mut Vec<rdkafka::producer::DeliveryFuture>,
+        payloads: &[Vec<u8>],
+        keys: &Option<KeyBuffer>,
+        chunk_start: usize,
+        records_written: &mut usize,
+        bytes_written: &mut u64,
+    ) -> Result<(), ConnectorError> {
+        for (j, future) in futures.drain(..).enumerate() {
+            let payload_idx = chunk_start + j;
+            match future.await {
+                Ok(_delivery) => {
+                    *records_written += 1;
+                    *bytes_written += payloads[payload_idx].len() as u64;
+                }
+                Err((err, _msg)) => {
+                    self.metrics.record_error();
+                    let err_msg = err.to_string();
+                    if self.dlq_producer.is_some() {
+                        let key: Option<&[u8]> = keys
+                            .as_ref()
+                            .map(|kb| kb.key(payload_idx))
+                            .filter(|k| !k.is_empty());
+                        self.route_to_dlq(&payloads[payload_idx], key, &err_msg)
+                            .await?;
+                    } else {
+                        return Err(ConnectorError::WriteError(format!(
+                            "Kafka produce failed: {err_msg}"
+                        )));
+                    }
+                }
+            }
+        }
+        Ok(())
+    }
+
     /// Routes a failed record to the dead letter queue.
     async fn route_to_dlq(
         &self,
@@ -422,23 +461,21 @@ impl SinkConnector for KafkaSink {
         let mut records_written: usize = 0;
         let mut bytes_written: u64 = 0;
 
-        // Phase 1: Enqueue all records into librdkafka's internal queue.
-        // producer.send() copies data synchronously and returns a
-        // DeliveryFuture, allowing rdkafka to batch network writes
-        // instead of waiting for each acknowledgement sequentially.
-        let mut delivery_futures = Vec::with_capacity(payloads.len());
+        // Enqueue records into librdkafka's internal queue in chunks of
+        // flush_batch_size. producer.send() copies data synchronously and
+        // returns a DeliveryFuture; we collect futures per chunk, flush the
+        // internal queue, then await delivery before continuing. This
+        // prevents rdkafka queue overflow on large batches.
+        let flush_size = self.config.flush_batch_size;
+        let mut delivery_futures = Vec::with_capacity(flush_size.min(payloads.len()));
+
         for (i, payload) in payloads.iter().enumerate() {
             let key: Option<&[u8]> = keys.as_ref().map(|kb| kb.key(i)).filter(|k| !k.is_empty());
 
-            // Determine partition.
             // TODO: query topic metadata after open() and cache actual partition count.
-            // Using None lets rdkafka handle partitioning via its built-in partitioner
-            // when our partitioner returns None for the default num_partitions.
             let partition = self.partitioner.partition(key, self.topic_partition_count);
 
-            // Build the Kafka record.
             let mut record = FutureRecord::to(&self.config.topic).payload(payload);
-
             if let Some(k) = key {
                 record = record.key(k);
             }
@@ -447,30 +484,36 @@ impl SinkConnector for KafkaSink {
             }
 
             delivery_futures.push(producer.send(record, Duration::from_secs(0)));
+
+            // Flush at batch boundary to drain rdkafka's internal queue.
+            if delivery_futures.len() >= flush_size {
+                producer.flush(self.config.delivery_timeout).map_err(|e| {
+                    ConnectorError::WriteError(format!("periodic flush at record {i}: {e}"))
+                })?;
+                self.collect_delivery_results(
+                    &mut delivery_futures,
+                    &payloads,
+                    &keys,
+                    i + 1 - delivery_futures.len(),
+                    &mut records_written,
+                    &mut bytes_written,
+                )
+                .await?;
+            }
         }
 
-        // Phase 2: Collect delivery reports.
-        for (i, future) in delivery_futures.into_iter().enumerate() {
-            match future.await {
-                Ok(_delivery) => {
-                    records_written += 1;
-                    bytes_written += payloads[i].len() as u64;
-                }
-                Err((err, _msg)) => {
-                    self.metrics.record_error();
-                    let err_msg = err.to_string();
-
-                    if self.dlq_producer.is_some() {
-                        let key: Option<&[u8]> =
-                            keys.as_ref().map(|kb| kb.key(i)).filter(|k| !k.is_empty());
-                        self.route_to_dlq(&payloads[i], key, &err_msg).await?;
-                    } else {
-                        return Err(ConnectorError::WriteError(format!(
-                            "Kafka produce failed: {err_msg}"
-                        )));
-                    }
-                }
-            }
+        // Drain remaining delivery futures.
+        if !delivery_futures.is_empty() {
+            let chunk_start = payloads.len() - delivery_futures.len();
+            self.collect_delivery_results(
+                &mut delivery_futures,
+                &payloads,
+                &keys,
+                chunk_start,
+                &mut records_written,
+                &mut bytes_written,
+            )
+            .await?;
         }
 
         self.metrics
