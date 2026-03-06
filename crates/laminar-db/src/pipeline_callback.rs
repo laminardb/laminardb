@@ -48,6 +48,7 @@ pub(crate) struct ConnectorPipelineCallback {
         laminar_connectors::reference::RefreshMode,
     )>,
     pub(crate) table_store: Arc<parking_lot::Mutex<crate::table_store::TableStore>>,
+    pub(crate) lookup_registry: Arc<laminar_sql::datafusion::LookupTableRegistry>,
     pub(crate) ctx: SessionContext,
     pub(crate) last_checkpoint: std::time::Instant,
     /// `None` = no automatic checkpointing (manual only via coordinator).
@@ -460,29 +461,52 @@ impl crate::pipeline::PipelineCallback for ConnectorPipelineCallback {
             }
             match source.poll_changes().await {
                 Ok(Some(batch)) => {
-                    let maybe_batch = {
+                    // Check if this table uses partial (foyer) cache mode.
+                    // If so, update the foyer cache per-row instead of
+                    // re-building the full LookupSnapshot.
+                    if let Some(
+                        laminar_sql::datafusion::lookup_join_exec::RegisteredLookup::Partial(
+                            partial,
+                        ),
+                    ) = self.lookup_registry.get_entry(name)
+                    {
+                        update_partial_cache_from_batch(&partial, &batch);
                         let mut ts = self.table_store.lock();
                         if let Err(e) = ts.upsert_and_rebuild(name, &batch) {
-                            tracing::warn!(table=%name, error=%e, "Table upsert error");
-                            None
-                        } else if ts.is_persistent(name) {
-                            None
-                        } else {
-                            ts.to_record_batch(name)
+                            tracing::warn!(table=%name, error=%e, "Table upsert error (partial)");
                         }
-                    };
-                    if let Some(rb) = maybe_batch {
-                        let schema = rb.schema();
-                        let _ = self.ctx.deregister_table(name.as_str());
-                        let data = if rb.num_rows() > 0 {
-                            vec![vec![rb]]
-                        } else {
-                            vec![vec![]]
+                    } else {
+                        let maybe_batch = {
+                            let mut ts = self.table_store.lock();
+                            if let Err(e) = ts.upsert_and_rebuild(name, &batch) {
+                                tracing::warn!(table=%name, error=%e, "Table upsert error");
+                                None
+                            } else if ts.is_persistent(name) {
+                                None
+                            } else {
+                                ts.to_record_batch(name)
+                            }
                         };
-                        if let Ok(mem_table) =
-                            datafusion::datasource::MemTable::try_new(schema, data)
-                        {
-                            let _ = self.ctx.register_table(name.as_str(), Arc::new(mem_table));
+                        if let Some(rb) = maybe_batch {
+                            self.lookup_registry.register(
+                                name,
+                                laminar_sql::datafusion::LookupSnapshot {
+                                    batch: rb.clone(),
+                                    key_columns: vec![],
+                                },
+                            );
+                            let schema = rb.schema();
+                            let _ = self.ctx.deregister_table(name.as_str());
+                            let data = if rb.num_rows() > 0 {
+                                vec![vec![rb]]
+                            } else {
+                                vec![vec![]]
+                            };
+                            if let Ok(mem_table) =
+                                datafusion::datasource::MemTable::try_new(schema, data)
+                            {
+                                let _ = self.ctx.register_table(name.as_str(), Arc::new(mem_table));
+                            }
                         }
                     }
                 }
@@ -490,6 +514,59 @@ impl crate::pipeline::PipelineCallback for ConnectorPipelineCallback {
                 Err(e) => {
                     tracing::warn!(table=%name, error=%e, "Table poll error");
                 }
+            }
+        }
+    }
+}
+
+/// Update a partial foyer cache from a CDC batch by inserting each row
+/// keyed by the primary key column(s).
+fn update_partial_cache_from_batch(
+    partial: &laminar_sql::datafusion::PartialLookupState,
+    batch: &RecordBatch,
+) {
+    use laminar_core::lookup::table::LookupTable;
+
+    if partial.key_columns.is_empty() {
+        return;
+    }
+
+    let key_cols: Vec<_> = partial
+        .key_columns
+        .iter()
+        .filter_map(|name| {
+            batch
+                .schema()
+                .index_of(name)
+                .ok()
+                .map(|idx| batch.column(idx).clone())
+        })
+        .collect();
+    if key_cols.len() != partial.key_columns.len() {
+        return;
+    }
+
+    let Ok(converter) = arrow::row::RowConverter::new(partial.key_sort_fields.clone()) else {
+        return;
+    };
+    let Ok(rows) = converter.convert_columns(&key_cols) else {
+        return;
+    };
+
+    let num_rows = batch.num_rows();
+    for row in 0..num_rows {
+        let key = rows.row(row);
+        #[allow(clippy::cast_possible_truncation)]
+        let idx = row as u32;
+        let indices = arrow_array::UInt32Array::from_value(idx, 1);
+        let cols: Result<Vec<_>, _> = batch
+            .columns()
+            .iter()
+            .map(|col| arrow::compute::take(col.as_ref(), &indices, None))
+            .collect();
+        if let Ok(cols) = cols {
+            if let Ok(row_batch) = RecordBatch::try_new(batch.schema(), cols) {
+                partial.foyer_cache.insert(key.as_ref(), row_batch);
             }
         }
     }

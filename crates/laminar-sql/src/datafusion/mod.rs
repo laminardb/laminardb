@@ -92,6 +92,8 @@ pub mod json_udaf;
 pub mod json_udf;
 /// Lookup join plan node for DataFusion.
 pub mod lookup_join;
+/// Physical execution plan and extension planner for lookup joins.
+pub mod lookup_join_exec;
 /// Processing-time UDF for `PROCTIME()` support
 pub mod proctime_udf;
 mod source;
@@ -134,6 +136,10 @@ pub use json_udf::{
     JsonBuildArray, JsonBuildObject, JsonTypeof, JsonbContainedBy, JsonbContains, JsonbExists,
     JsonbExistsAll, JsonbExistsAny, JsonbGet, JsonbGetIdx, JsonbGetPath, JsonbGetPathText,
     JsonbGetText, JsonbGetTextIdx, ToJsonb,
+};
+pub use lookup_join_exec::{
+    LookupJoinExec, LookupJoinExtensionPlanner, LookupSnapshot, LookupTableRegistry,
+    PartialLookupJoinExec, PartialLookupState, RegisteredLookup,
 };
 pub use proctime_udf::ProcTimeUdf;
 pub use source::{SortColumn, StreamSource, StreamSourceRef};

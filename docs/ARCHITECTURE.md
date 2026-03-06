@@ -295,14 +295,13 @@ The SDK adds retry policies, rate limiting, circuit breakers, and a test harness
 
 ### Lookup Tables
 
-Enrichment joins with multiple caching strategies:
+Enrichment joins via `CREATE LOOKUP TABLE` DDL with hash-probe physical execution:
 
-- **Full cache (Ring 0)** -- foyer in-memory cache with S3-FIFO eviction
-- **Hybrid cache (Ring 1)** -- foyer HybridCache with disk-backed overflow
-- **Partial cache with Xor filter** -- probabilistic membership test to avoid cache misses
-- **CDC-to-cache adapter** -- keep lookup tables fresh from CDC streams
-- **Lookup sources** -- PostgresLookupSource, ParquetLookupSource
-- **redb secondary indexes** -- B-tree indexes for non-primary-key lookups
+- **Hash-indexed snapshot** -- lookup data pre-indexed at query planning time via Arrow `RowConverter`
+- **Predicate pushdown** -- `PredicateSplitterRule` splits WHERE predicates; pushdown predicates filter the snapshot before index build
+- **CDC refresh** -- `CdcTableSource` adapter wraps any `SourceConnector` (Postgres CDC, MySQL CDC) as a `ReferenceTableSource` for snapshot + incremental updates
+- **Partial cache with Xor filter** -- probabilistic membership test to avoid full scans
+- **Lookup sources** -- `PostgresLookupSource`, `ParquetLookupSource` for direct queries
 
 ### Deployment Profiles
 

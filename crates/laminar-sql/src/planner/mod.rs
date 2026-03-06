@@ -569,6 +569,12 @@ impl StreamingPlanner {
         self.lookup_tables.values().collect()
     }
 
+    /// Returns a clone of the lookup tables map for optimizer rule construction.
+    #[must_use]
+    pub fn lookup_tables_cloned(&self) -> HashMap<String, LookupTableInfo> {
+        self.lookup_tables.clone()
+    }
+
     /// Creates a `DataFusion` logical plan from a query plan.
     ///
     /// Converts the query plan's SQL statement into a `DataFusion`

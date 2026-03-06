@@ -56,14 +56,14 @@ impl Default for ParquetLookupSourceConfig {
 ///
 /// All data is loaded eagerly at construction time. Lookups are served
 /// from an in-memory `HashMap` keyed by the serialized primary key
-/// columns. The values are serialized Arrow IPC row bytes.
+/// columns. The values are single-row `RecordBatch` instances.
 ///
 /// This is appropriate for dimension tables that fit in memory and are
 /// read-mostly or static.
 pub struct ParquetLookupSource {
     config: ParquetLookupSourceConfig,
-    /// Primary key bytes → serialized row bytes.
-    data: HashMap<Vec<u8>, Vec<u8>>,
+    /// Primary key bytes → single-row `RecordBatch`.
+    data: HashMap<Vec<u8>, RecordBatch>,
     /// Schema of the loaded Parquet file.
     schema: SchemaRef,
     /// Number of rows loaded.
@@ -105,22 +105,19 @@ fn serialize_pk(
     Ok(key)
 }
 
-/// Serialize all columns of a single row into bytes.
-///
-/// Uses a simple format: column values separated by `\x01`.
-fn serialize_row(batch: &RecordBatch, row: usize) -> Result<Vec<u8>, LookupError> {
-    let mut buf = Vec::new();
-    for (i, col) in batch.columns().iter().enumerate() {
-        if i > 0 {
-            buf.push(1); // separator
-        }
-        let formatter =
-            ArrayFormatter::try_new(col.as_ref(), &arrow_cast::display::FormatOptions::default())
-                .map_err(|e| LookupError::Internal(format!("format row: {e}")))?;
-        let display = formatter.value(row);
-        buf.extend_from_slice(format!("{display}").as_bytes());
-    }
-    Ok(buf)
+/// Extract a single row from a `RecordBatch` as a new single-row batch.
+fn extract_row(batch: &RecordBatch, row: usize) -> Result<RecordBatch, LookupError> {
+    use arrow_select::take::take;
+    #[allow(clippy::cast_possible_truncation)] // row index within a RecordBatch fits u32
+    let indices = arrow_array::UInt32Array::from(vec![row as u32]);
+    let columns: Vec<_> = batch
+        .columns()
+        .iter()
+        .map(|col| take(col.as_ref(), &indices, None))
+        .collect::<Result<_, _>>()
+        .map_err(|e| LookupError::Internal(format!("extract row: {e}")))?;
+    RecordBatch::try_new(batch.schema(), columns)
+        .map_err(|e| LookupError::Internal(format!("build row batch: {e}")))
 }
 
 impl ParquetLookupSource {
@@ -167,7 +164,7 @@ impl ParquetLookupSource {
 
             for row in 0..batch.num_rows() {
                 let key = serialize_pk(&batch, &pk_indices, row)?;
-                let value = serialize_row(&batch, row)?;
+                let value = extract_row(&batch, row)?;
                 data.insert(key, value);
                 row_count += 1;
             }
@@ -194,8 +191,8 @@ impl LookupSource for ParquetLookupSource {
         keys: &[&[u8]],
         _predicates: &[Predicate],
         _projection: &[ColumnId],
-    ) -> impl Future<Output = Result<Vec<Option<Vec<u8>>>, LookupError>> + Send {
-        let results: Vec<Option<Vec<u8>>> = keys
+    ) -> impl Future<Output = Result<Vec<Option<RecordBatch>>, LookupError>> + Send {
+        let results: Vec<Option<RecordBatch>> = keys
             .iter()
             .map(|k| self.data.get::<[u8]>(k).cloned())
             .collect();
@@ -214,6 +211,10 @@ impl LookupSource for ParquetLookupSource {
     #[allow(clippy::unnecessary_literal_bound)]
     fn source_name(&self) -> &str {
         "parquet"
+    }
+
+    fn schema(&self) -> SchemaRef {
+        Arc::clone(&self.schema)
     }
 
     fn estimated_row_count(&self) -> Option<u64> {

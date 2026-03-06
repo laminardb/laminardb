@@ -32,6 +32,10 @@
 //! ```
 
 use std::sync::atomic::{AtomicU64, Ordering};
+use std::sync::Arc;
+
+use arrow_array::RecordBatch;
+use arrow_schema::SchemaRef;
 
 use laminar_core::lookup::predicate::{predicate_to_sql, Predicate};
 use laminar_core::lookup::source::{ColumnId, LookupError, LookupSource, LookupSourceCapabilities};
@@ -101,6 +105,8 @@ pub struct PostgresLookupSource {
     pool: deadpool_postgres::Pool,
     /// Configuration.
     config: PostgresLookupSourceConfig,
+    /// Schema of the returned `RecordBatch` values.
+    output_schema: SchemaRef,
     /// Total queries executed (for metrics).
     query_count: AtomicU64,
     /// Total rows returned (for metrics).
@@ -112,14 +118,17 @@ pub struct PostgresLookupSource {
 impl PostgresLookupSource {
     /// Create a new `PostgreSQL` lookup source.
     ///
-    /// Parses the connection string and creates a connection pool. Does
-    /// not validate connectivity until the first query or health check.
+    /// `output_schema` describes the Arrow schema of each returned row.
+    /// Typically derived from the table DDL or introspected at startup.
     ///
     /// # Errors
     ///
     /// Returns [`LookupError::Connection`] if the connection string is
     /// invalid or pool creation fails.
-    pub fn new(config: PostgresLookupSourceConfig) -> Result<Self, LookupError> {
+    pub fn new(
+        config: PostgresLookupSourceConfig,
+        output_schema: SchemaRef,
+    ) -> Result<Self, LookupError> {
         let pg_config: tokio_postgres::Config = config
             .connection_string
             .parse()
@@ -139,6 +148,7 @@ impl PostgresLookupSource {
         Ok(Self {
             pool,
             config,
+            output_schema,
             query_count: AtomicU64::new(0),
             row_count: AtomicU64::new(0),
             error_count: AtomicU64::new(0),
@@ -170,7 +180,7 @@ impl LookupSource for PostgresLookupSource {
         keys: &[&[u8]],
         predicates: &[Predicate],
         projection: &[ColumnId],
-    ) -> Result<Vec<Option<Vec<u8>>>, LookupError> {
+    ) -> Result<Vec<Option<RecordBatch>>, LookupError> {
         let client = self.pool.get().await.map_err(|e| {
             self.error_count.fetch_add(1, Ordering::Relaxed);
             LookupError::Connection(format!("pool get failed: {e}"))
@@ -193,7 +203,6 @@ impl LookupSource for PostgresLookupSource {
             if projection.is_empty() {
                 self.config.column_names.as_deref()
             } else {
-                // Resolve column IDs to names if we have column_names
                 None
             },
         );
@@ -201,7 +210,6 @@ impl LookupSource for PostgresLookupSource {
         let timeout = std::time::Duration::from_secs(self.config.query_timeout_secs);
 
         let rows = tokio::time::timeout(timeout, async {
-            // Build params array for tokio-postgres
             let param_refs: Vec<&(dyn tokio_postgres::types::ToSql + Sync)> = params
                 .iter()
                 .map(|s| s as &(dyn tokio_postgres::types::ToSql + Sync))
@@ -222,12 +230,9 @@ impl LookupSource for PostgresLookupSource {
         self.row_count
             .fetch_add(rows.len() as u64, Ordering::Relaxed);
 
-        // Align results with input keys
         let pk_col = &self.config.primary_key_columns[0];
-        let mut result: Vec<Option<Vec<u8>>> = vec![None; keys.len()];
+        let mut result: Vec<Option<RecordBatch>> = vec![None; keys.len()];
 
-        // Build a map from key string to index in the input.
-        // For single-column PK, use the first (only) element of each key.
         let mut key_index: std::collections::HashMap<&str, usize> =
             std::collections::HashMap::with_capacity(keys.len());
         for (i, ks) in key_strings.iter().enumerate() {
@@ -237,13 +242,25 @@ impl LookupSource for PostgresLookupSource {
         }
 
         for row in &rows {
-            // Try to get the PK value as a string for matching
             let pk_val: Option<String> = row.try_get::<_, String>(pk_col.as_str()).ok();
             if let Some(pk) = pk_val {
                 if let Some(&idx) = key_index.get(pk.as_str()) {
-                    // Serialize all columns as a simple JSON bytes representation
-                    let serialized = pk.into_bytes();
-                    result[idx] = Some(serialized);
+                    // Build a single-row RecordBatch with all columns from
+                    // the output schema. Columns beyond the PK are filled
+                    // with nulls since tokio-postgres row → Arrow column
+                    // conversion is not wired yet.
+                    let mut cols: Vec<Arc<dyn arrow_array::Array>> =
+                        Vec::with_capacity(self.output_schema.fields().len());
+                    for field in self.output_schema.fields() {
+                        if field.name() == pk_col {
+                            cols.push(Arc::new(arrow_array::StringArray::from(vec![pk.as_str()])));
+                        } else {
+                            cols.push(arrow_array::new_null_array(field.data_type(), 1));
+                        }
+                    }
+                    if let Ok(batch) = RecordBatch::try_new(Arc::clone(&self.output_schema), cols) {
+                        result[idx] = Some(batch);
+                    }
                 }
             }
         }
@@ -263,6 +280,10 @@ impl LookupSource for PostgresLookupSource {
     #[allow(clippy::unnecessary_literal_bound)]
     fn source_name(&self) -> &str {
         "postgres"
+    }
+
+    fn schema(&self) -> SchemaRef {
+        Arc::clone(&self.output_schema)
     }
 
     async fn health_check(&self) -> Result<(), LookupError> {

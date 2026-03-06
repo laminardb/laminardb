@@ -33,6 +33,9 @@
 //! - `InMemoryTableLoader` - For testing and static reference data
 //! - Redis, PostgreSQL, HTTP loaders
 
+/// CDC-to-reference-table adapter for using CDC sources as lookup tables.
+pub mod cdc_adapter;
+
 /// PostgreSQL lookup source with connection pooling and predicate pushdown.
 #[cfg(feature = "postgres-cdc")]
 pub mod postgres_source;
@@ -182,9 +185,11 @@ pub trait TableLoader: Send + Sync {
 /// A no-op table loader that always returns `NotFound`.
 ///
 /// Useful for testing the lookup join operator without an actual data source.
+#[cfg(any(test, feature = "testing"))]
 #[derive(Debug, Clone, Default)]
 pub struct NoOpTableLoader;
 
+#[cfg(any(test, feature = "testing"))]
 impl NoOpTableLoader {
     /// Creates a new no-op table loader.
     #[must_use]
@@ -193,6 +198,7 @@ impl NoOpTableLoader {
     }
 }
 
+#[cfg(any(test, feature = "testing"))]
 #[async_trait]
 impl TableLoader for NoOpTableLoader {
     async fn lookup(&self, _key: &[u8]) -> Result<LookupResult, LookupError> {

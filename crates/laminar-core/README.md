@@ -26,8 +26,7 @@ Ring 0 crate. Everything here targets sub-microsecond execution with zero heap a
 | `io_uring` | io_uring integration, three-ring I/O architecture |
 | `budget` | Task budget enforcement |
 | `checkpoint` | Distributed checkpoint barrier protocol, barrier alignment |
-| `lookup` | Lookup table trait, predicate types, foyer caches (memory + hybrid), CDC-to-cache adapter |
-| `index` | redb secondary indexes for non-primary-key lookups |
+| `lookup` | Lookup table trait, predicate types, foyer caches (memory + hybrid) |
 | `aggregation` | Cross-partition lock-free HashMap (papaya) |
 | `error_codes` | Structured `LDB-NNNN` error code registry and zero-alloc `HotPathError` |
 | `detect` | Platform detection utilities |
