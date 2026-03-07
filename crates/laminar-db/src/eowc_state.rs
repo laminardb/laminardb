@@ -407,12 +407,23 @@ impl IncrementalEowcState {
                     for spec in &self.agg_specs {
                         accs.push(spec.create_accumulator()?);
                     }
-                    self.windows.entry(*window_start).or_default().insert(sv_key.clone(), accs);
+                    self.windows
+                        .entry(*window_start)
+                        .or_default()
+                        .insert(sv_key.clone(), accs);
                 }
-                let Some(accs) = self.windows.get_mut(window_start).and_then(|g| g.get_mut(&sv_key))
-                else { continue; };
+                let Some(accs) = self
+                    .windows
+                    .get_mut(window_start)
+                    .and_then(|g| g.get_mut(&sv_key))
+                else {
+                    continue;
+                };
                 crate::aggregate_state::IncrementalAggState::update_group_accumulators(
-                    accs, batch, indices, &self.agg_specs,
+                    accs,
+                    batch,
+                    indices,
+                    &self.agg_specs,
                 )?;
             }
             return Ok(());
@@ -433,7 +444,9 @@ impl IncrementalEowcState {
         let conv = converter.as_ref().expect("converter set when has_groups");
         for ((window_start, row_key), indices) in &grouped {
             let sv_key = crate::aggregate_state::row_to_scalar_key_with_types(
-                conv, row_key, &self.group_types,
+                conv,
+                row_key,
+                &self.group_types,
             )?;
 
             // Ensure group exists (borrow-split pattern)

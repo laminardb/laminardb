@@ -436,12 +436,23 @@ impl CoreWindowState {
                 };
                 if needs_insert {
                     let accs = self.create_fresh_accumulators()?;
-                    self.windows.entry(*window_start).or_default().insert(sv_key.clone(), accs);
+                    self.windows
+                        .entry(*window_start)
+                        .or_default()
+                        .insert(sv_key.clone(), accs);
                 }
-                let Some(accs) = self.windows.get_mut(window_start).and_then(|g| g.get_mut(&sv_key))
-                else { continue; };
+                let Some(accs) = self
+                    .windows
+                    .get_mut(window_start)
+                    .and_then(|g| g.get_mut(&sv_key))
+                else {
+                    continue;
+                };
                 crate::aggregate_state::IncrementalAggState::update_group_accumulators(
-                    accs, batch, indices, &self.agg_specs,
+                    accs,
+                    batch,
+                    indices,
+                    &self.agg_specs,
                 )?;
             }
             return Ok(());
@@ -457,11 +468,17 @@ impl CoreWindowState {
             let idx = row_idx as u32;
             match &self.assigner {
                 CoreWindowAssigner::Tumbling(a) => {
-                    grouped.entry((a.assign(ts_ms).start, row_key)).or_default().push(idx);
+                    grouped
+                        .entry((a.assign(ts_ms).start, row_key))
+                        .or_default()
+                        .push(idx);
                 }
                 CoreWindowAssigner::Hopping(a) => {
                     for wid in a.assign_windows(ts_ms) {
-                        grouped.entry((wid.start, row_key.clone())).or_default().push(idx);
+                        grouped
+                            .entry((wid.start, row_key.clone()))
+                            .or_default()
+                            .push(idx);
                     }
                 }
                 CoreWindowAssigner::Session { .. } => unreachable!("handled above"),
@@ -471,7 +488,9 @@ impl CoreWindowState {
         let conv = converter.as_ref().expect("converter set when has_groups");
         for ((window_start, row_key), indices) in &grouped {
             let sv_key = crate::aggregate_state::row_to_scalar_key_with_types(
-                conv, row_key, &self.group_types,
+                conv,
+                row_key,
+                &self.group_types,
             )?;
 
             // Ensure group exists in window state (borrow-split pattern)
@@ -498,7 +517,10 @@ impl CoreWindowState {
                     .insert(sv_key.clone(), accs);
             }
 
-            let Some(accs) = self.windows.get_mut(window_start).and_then(|g| g.get_mut(&sv_key))
+            let Some(accs) = self
+                .windows
+                .get_mut(window_start)
+                .and_then(|g| g.get_mut(&sv_key))
             else {
                 continue;
             };

@@ -430,7 +430,7 @@ impl StreamExecutor {
             let has_asof = self.queries[idx].asof_config.is_some();
             let has_temporal = self.queries[idx].temporal_config.is_some();
 
-            let batches = if is_eowc {
+            let query_result = if is_eowc {
                 let query_name = self.queries[idx].name.clone();
                 let window_config = self.queries[idx].window_config.clone();
                 let asof_config = self.queries[idx].asof_config.clone();
@@ -445,7 +445,7 @@ impl StreamExecutor {
                     &results,
                     current_watermark,
                 )
-                .await?
+                .await
             } else if has_asof {
                 let query_name = self.queries[idx].name.clone();
                 let cfg = self.queries[idx]
@@ -460,7 +460,7 @@ impl StreamExecutor {
                     source_batches,
                     &results,
                 )
-                .await?
+                .await
             } else if has_temporal {
                 let query_name = self.queries[idx].name.clone();
                 let cfg = self.queries[idx]
@@ -468,9 +468,32 @@ impl StreamExecutor {
                     .clone()
                     .expect("has_temporal guard ensures temporal_config is Some");
                 self.execute_temporal_query(&query_name, &cfg, source_batches, &results)
-                    .await?
+                    .await
             } else {
-                self.execute_standard_query(idx).await?
+                self.execute_standard_query(idx).await
+            };
+
+            // Queries that depend on other stream queries may fail during
+            // warmup because their upstream (e.g. EOWC) hasn't emitted yet.
+            // Skip those gracefully. Queries that only reference source tables
+            // propagate errors normally.
+            let batches = match query_result {
+                Ok(b) => b,
+                Err(e) => {
+                    let depends_on_stream = self.queries[idx]
+                        .table_refs
+                        .iter()
+                        .any(|tr| self.queries.iter().any(|q| q.name == *tr));
+                    if depends_on_stream {
+                        tracing::debug!(
+                            query = %self.queries[idx].name,
+                            error = %e,
+                            "Query skipped (upstream not ready)"
+                        );
+                        continue;
+                    }
+                    return Err(e);
+                }
             };
 
             // Apply Top-K post-filter if configured
@@ -482,13 +505,12 @@ impl StreamExecutor {
                 _ => batches,
             };
 
+            let query_name = self.queries[idx].name.clone();
             if !batches.is_empty() {
-                let query_name = self.queries[idx].name.clone();
                 let schema = batches[0].schema();
                 if let Ok(mem_table) =
                     datafusion::datasource::MemTable::try_new(schema, vec![batches.clone()])
                 {
-                    // Cleanup: deregister failures are benign (table may not exist yet)
                     let _ = self.ctx.deregister_table(&query_name);
                     if let Err(e) = self.ctx.register_table(&query_name, Arc::new(mem_table)) {
                         tracing::warn!(
@@ -1432,32 +1454,66 @@ impl StreamExecutor {
     ) {
         let cp_clone = cp.clone();
         match restore_fn(state, &cp_clone) {
-            Ok(n) => tracing::info!(query = %query_name, groups = n, "Restored {label} from checkpoint"),
-            Err(e) => tracing::warn!(query = %query_name, error = %e, "Failed to restore {label} from checkpoint"),
+            Ok(n) => {
+                tracing::info!(query = %query_name, groups = n, "Restored {label} from checkpoint");
+            }
+            Err(e) => {
+                tracing::warn!(query = %query_name, error = %e, "Failed to restore {label} from checkpoint");
+            }
         }
     }
 
     fn try_restore_pending_agg(&mut self, idx: usize) {
         let name = self.queries[idx].name.clone();
-        let cp = self.pending_restore.as_ref().and_then(|p| p.agg_states.get(&name)).cloned();
+        let cp = self
+            .pending_restore
+            .as_ref()
+            .and_then(|p| p.agg_states.get(&name))
+            .cloned();
         if let (Some(cp), Some(state)) = (cp, self.agg_states.get_mut(&idx)) {
-            Self::log_restore(&name, &cp, state, IncrementalAggState::restore_groups, "agg state");
+            Self::log_restore(
+                &name,
+                &cp,
+                state,
+                IncrementalAggState::restore_groups,
+                "agg state",
+            );
         }
     }
 
     fn try_restore_pending_eowc(&mut self, idx: usize) {
         let name = self.queries[idx].name.clone();
-        let cp = self.pending_restore.as_ref().and_then(|p| p.eowc_states.get(&name)).cloned();
+        let cp = self
+            .pending_restore
+            .as_ref()
+            .and_then(|p| p.eowc_states.get(&name))
+            .cloned();
         if let (Some(cp), Some(state)) = (cp, self.eowc_agg_states.get_mut(&idx)) {
-            Self::log_restore(&name, &cp, state, IncrementalEowcState::restore_windows, "EOWC state");
+            Self::log_restore(
+                &name,
+                &cp,
+                state,
+                IncrementalEowcState::restore_windows,
+                "EOWC state",
+            );
         }
     }
 
     fn try_restore_pending_core_window(&mut self, idx: usize) {
         let name = self.queries[idx].name.clone();
-        let cp = self.pending_restore.as_ref().and_then(|p| p.core_window_states.get(&name)).cloned();
+        let cp = self
+            .pending_restore
+            .as_ref()
+            .and_then(|p| p.core_window_states.get(&name))
+            .cloned();
         if let (Some(cp), Some(state)) = (cp, self.core_window_states.get_mut(&idx)) {
-            Self::log_restore(&name, &cp, state, CoreWindowState::restore_windows, "core window state");
+            Self::log_restore(
+                &name,
+                &cp,
+                state,
+                CoreWindowState::restore_windows,
+                "core window state",
+            );
         }
     }
 }

@@ -76,7 +76,10 @@ fn bench_max_throughput(c: &mut Criterion) {
                     // Time only the processing
                     let start = Instant::now();
                     while reactor.queue_size() > 0 {
-                        { reactor.poll_into(&mut buf); buf.clear(); }
+                        {
+                            reactor.poll_into(&mut buf);
+                            buf.clear();
+                        }
                     }
                     total_duration += start.elapsed();
                 }
@@ -116,18 +119,27 @@ fn bench_sustained_throughput(c: &mut Criterion) {
                     for i in 0..1000 {
                         if reactor.submit(create_minimal_event(i)).is_err() {
                             // Queue full, process some events
-                            { reactor.poll_into(&mut buf); buf.clear(); }
+                            {
+                                reactor.poll_into(&mut buf);
+                                buf.clear();
+                            }
                         }
                     }
 
                     // Process events
-                    { reactor.poll_into(&mut buf); buf.clear(); }
+                    {
+                        reactor.poll_into(&mut buf);
+                        buf.clear();
+                    }
                     events_processed = reactor.events_processed();
                 }
 
                 // Process remaining events
                 while reactor.queue_size() > 0 {
-                    { reactor.poll_into(&mut buf); buf.clear(); }
+                    {
+                        reactor.poll_into(&mut buf);
+                        buf.clear();
+                    }
                 }
 
                 total_duration += start.elapsed();
@@ -166,17 +178,26 @@ fn bench_verify_target_throughput(c: &mut Criterion) {
                     let batch_size = (target_events - submitted).min(10000);
                     for i in 0..batch_size {
                         if reactor.submit(create_minimal_event(i as i64)).is_err() {
-                            { reactor.poll_into(&mut buf); buf.clear(); }
+                            {
+                                reactor.poll_into(&mut buf);
+                                buf.clear();
+                            }
                             reactor.submit(create_minimal_event(i as i64)).unwrap();
                         }
                     }
                     submitted += batch_size;
-                    { reactor.poll_into(&mut buf); buf.clear(); }
+                    {
+                        reactor.poll_into(&mut buf);
+                        buf.clear();
+                    }
                 }
 
                 // Drain remaining events
                 while reactor.queue_size() > 0 {
-                    { reactor.poll_into(&mut buf); buf.clear(); }
+                    {
+                        reactor.poll_into(&mut buf);
+                        buf.clear();
+                    }
                 }
                 let elapsed = start.elapsed();
 

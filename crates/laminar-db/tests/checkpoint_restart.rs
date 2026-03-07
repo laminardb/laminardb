@@ -27,14 +27,8 @@ fn config_for(dir: &std::path::Path) -> LaminarConfig {
 
 fn make_batch(symbol: &str, price: f64, ts: i64) -> RecordBatch {
     RecordBatch::try_from_iter(vec![
-        (
-            "symbol",
-            Arc::new(StringArray::from(vec![symbol])) as _,
-        ),
-        (
-            "price",
-            Arc::new(Float64Array::from(vec![price])) as _,
-        ),
+        ("symbol", Arc::new(StringArray::from(vec![symbol])) as _),
+        ("price", Arc::new(Float64Array::from(vec![price])) as _),
         ("ts", Arc::new(Int64Array::from(vec![ts])) as _),
     ])
     .unwrap()
@@ -71,7 +65,11 @@ async fn test_checkpoint_survives_restart() {
         let source = db.source_untyped("trades").unwrap();
         for i in 0..10 {
             source
-                .push_arrow(make_batch("AAPL", 100.0 + f64::from(i), i64::from(i) * 1000))
+                .push_arrow(make_batch(
+                    "AAPL",
+                    100.0 + f64::from(i),
+                    i64::from(i) * 1000,
+                ))
                 .unwrap();
         }
 
