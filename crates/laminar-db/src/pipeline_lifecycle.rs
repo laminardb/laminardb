@@ -6,13 +6,12 @@
 use std::collections::HashMap;
 use std::sync::Arc;
 
-use arrow::array::RecordBatch;
 use laminar_core::streaming;
 use rustc_hash::FxHashMap;
 
 use crate::db::{
-    filter_late_rows, infer_timestamp_format, LaminarDB, SourceWatermarkState, STATE_RUNNING,
-    STATE_SHUTTING_DOWN, STATE_STARTING, STATE_STOPPED,
+    infer_timestamp_format, LaminarDB, SourceWatermarkState, STATE_RUNNING, STATE_SHUTTING_DOWN,
+    STATE_STARTING, STATE_STOPPED,
 };
 use crate::error::DbError;
 
@@ -153,19 +152,23 @@ impl LaminarDB {
             *self.coordinator.lock().await = Some(coord);
         }
 
-        if has_external {
+        if has_external || !stream_regs.is_empty() {
             tracing::info!(
                 sources = source_regs.len(),
                 sinks = sink_regs.len(),
                 streams = stream_regs.len(),
                 tables = table_regs.len(),
-                "Starting connector pipeline"
+                has_external,
+                "Starting pipeline"
             );
-            self.start_connector_pipeline(source_regs, sink_regs, stream_regs, table_regs)
-                .await?;
-        } else if !stream_regs.is_empty() {
-            tracing::info!(streams = stream_regs.len(), "Starting embedded pipeline");
-            self.start_embedded_pipeline(&stream_regs);
+            self.start_connector_pipeline(
+                source_regs,
+                sink_regs,
+                stream_regs,
+                table_regs,
+                has_external,
+            )
+            .await?;
         } else {
             tracing::info!(
                 sources = source_regs.len(),
@@ -179,341 +182,21 @@ impl LaminarDB {
         Ok(())
     }
 
-    /// Start a lightweight embedded processing loop for in-memory sources.
+    /// Build and start the unified pipeline with sources, sinks, and streams.
     ///
-    /// When no external connectors are registered but named streams exist,
-    /// this spawns a background task that:
-    ///
-    /// 1. Polls each source's sink for pushed `RecordBatch` data.
-    /// 2. Executes registered stream queries via `DataFusion`.
-    /// 3. Pushes query results into the corresponding stream sources so
-    ///    that callers of [`subscribe`](Self::subscribe) receive data.
-    #[allow(clippy::too_many_lines)]
-    fn start_embedded_pipeline(
-        &self,
-        stream_regs: &HashMap<String, crate::connector_manager::StreamRegistration>,
-    ) {
-        use crate::stream_executor::StreamExecutor;
-
-        // Build StreamExecutor with the registered stream queries
-        let ctx = laminar_sql::create_session_context();
-        laminar_sql::register_streaming_functions(&ctx);
-        let mut executor = StreamExecutor::new(ctx);
-
-        for reg in stream_regs.values() {
-            executor.add_query(
-                reg.name.clone(),
-                reg.query_sql.clone(),
-                reg.emit_clause.clone(),
-                reg.window_config.clone(),
-                reg.order_config.clone(),
-            );
-        }
-
-        // Subscribe to every source's sink so we can read pushed data.
-        let mut source_subs: Vec<(String, streaming::Subscription<crate::catalog::ArrowRecord>)> =
-            Vec::new();
-        for name in self.catalog.list_sources() {
-            if let Some(entry) = self.catalog.get_source(&name) {
-                let sub = entry.sink.subscribe();
-                source_subs.push((name, sub));
-            }
-        }
-
-        // Get stream source handles for pushing results.
-        let mut stream_sources: Vec<(String, streaming::Source<crate::catalog::ArrowRecord>)> =
-            Vec::new();
-        for reg in stream_regs.values() {
-            if let Some(src) = self.catalog.get_stream_source(&reg.name) {
-                stream_sources.push((reg.name.clone(), src));
-            }
-        }
-
-        // Build per-source watermark tracking state
-        let source_names = self.catalog.list_sources();
-        let mut watermark_states: FxHashMap<String, SourceWatermarkState> =
-            FxHashMap::with_capacity_and_hasher(source_names.len(), rustc_hash::FxBuildHasher);
-        let mut source_entries: FxHashMap<String, Arc<crate::catalog::SourceEntry>> =
-            FxHashMap::with_capacity_and_hasher(source_names.len(), rustc_hash::FxBuildHasher);
-        let mut source_ids: FxHashMap<String, usize> =
-            FxHashMap::with_capacity_and_hasher(source_names.len(), rustc_hash::FxBuildHasher);
-        for name in source_names {
-            if let Some(entry) = self.catalog.get_source(&name) {
-                if let (Some(col), Some(dur)) =
-                    (&entry.watermark_column, entry.max_out_of_orderness)
-                {
-                    let format = infer_timestamp_format(&entry.schema, col);
-                    let extractor =
-                        laminar_core::time::EventTimeExtractor::from_column(col, format)
-                            .with_mode(laminar_core::time::ExtractionMode::Max);
-                    let generator: Box<dyn laminar_core::time::WatermarkGenerator> = if entry
-                        .is_processing_time
-                        .load(std::sync::atomic::Ordering::Relaxed)
-                    {
-                        Box::new(laminar_core::time::ProcessingTimeGenerator::new())
-                    } else {
-                        Box::new(
-                            laminar_core::time::BoundedOutOfOrdernessGenerator::from_duration(dur),
-                        )
-                    };
-                    let id = source_ids.len();
-                    source_ids.insert(name.clone(), id);
-                    watermark_states.insert(
-                        name.clone(),
-                        SourceWatermarkState {
-                            extractor,
-                            generator,
-                            column: col.clone(),
-                            format,
-                        },
-                    );
-                }
-                source_entries.insert(name, entry);
-            }
-        }
-
-        // Also create watermark state for sources that declared event_time_column
-        // programmatically (via source.set_event_time_column()) but have no SQL WATERMARK
-        for name in self.catalog.list_sources() {
-            if watermark_states.contains_key(&name) {
-                continue;
-            }
-            if let Some(entry) = self.catalog.get_source(&name) {
-                if let Some(col) = entry.source.event_time_column() {
-                    let format = infer_timestamp_format(&entry.schema, &col);
-                    let extractor =
-                        laminar_core::time::EventTimeExtractor::from_column(&col, format)
-                            .with_mode(laminar_core::time::ExtractionMode::Max);
-                    let generator: Box<dyn laminar_core::time::WatermarkGenerator> = if entry
-                        .is_processing_time
-                        .load(std::sync::atomic::Ordering::Relaxed)
-                    {
-                        Box::new(laminar_core::time::ProcessingTimeGenerator::new())
-                    } else {
-                        Box::new(
-                            laminar_core::time::BoundedOutOfOrdernessGenerator::from_duration(
-                                std::time::Duration::ZERO,
-                            ),
-                        )
-                    };
-                    let id = source_ids.len();
-                    source_ids.insert(name.clone(), id);
-                    watermark_states.insert(
-                        name.clone(),
-                        SourceWatermarkState {
-                            extractor,
-                            generator,
-                            column: col,
-                            format,
-                        },
-                    );
-                }
-            }
-        }
-
-        let mut tracker = if source_ids.is_empty() {
-            None
-        } else {
-            Some(laminar_core::time::WatermarkTracker::new(source_ids.len()))
-        };
-
-        tracing::info!(
-            sources = source_subs.len(),
-            streams = stream_sources.len(),
-            watermark_sources = source_ids.len(),
-            "Starting embedded pipeline"
-        );
-
-        let shutdown = self.shutdown_signal.clone();
-        let counters = Arc::clone(&self.counters);
-        let pipeline_watermark = Arc::clone(&self.pipeline_watermark);
-
-        let handle = tokio::spawn(async move {
-            let mut cycle_count: u64 = 0;
-            let mut consecutive_sql_errors: u32 = 0;
-            loop {
-                // Check for shutdown
-                tokio::select! {
-                    () = shutdown.notified() => {
-                        tracing::info!("Embedded pipeline shutdown signal received");
-                        break;
-                    }
-                    // 10ms fallback poll — embedded pipelines are driven by
-                    // Source::push_arrow() which is synchronous. This matches
-                    // the connector pipeline's polling interval.
-                    () = tokio::time::sleep(std::time::Duration::from_millis(10)) => {}
-                }
-
-                let cycle_start = std::time::Instant::now();
-
-                // Check external watermarks from Source::watermark() calls
-                for (name, _sub) in &source_subs {
-                    if let Some(entry) = source_entries.get(name.as_str()) {
-                        let external_wm = entry.source.current_watermark();
-                        if let Some(wm_state) = watermark_states.get_mut(name.as_str()) {
-                            if let Some(wm) = wm_state.generator.advance_watermark(external_wm) {
-                                if let Some(ref mut trk) = tracker {
-                                    if let Some(sid) = source_ids.get(name.as_str()) {
-                                        if let Some(global_wm) =
-                                            trk.update_source(*sid, wm.timestamp())
-                                        {
-                                            pipeline_watermark.store(
-                                                global_wm.timestamp(),
-                                                std::sync::atomic::Ordering::Relaxed,
-                                            );
-                                        }
-                                    }
-                                }
-                            }
-                        }
-                    }
-                }
-
-                // Drain source subscriptions into batches
-                let mut source_batches: FxHashMap<String, Vec<RecordBatch>> =
-                    FxHashMap::with_capacity_and_hasher(
-                        source_subs.len(),
-                        rustc_hash::FxBuildHasher,
-                    );
-                for (name, sub) in &source_subs {
-                    for _ in 0..256 {
-                        match sub.poll() {
-                            Some(batch) if batch.num_rows() > 0 => {
-                                #[allow(clippy::cast_possible_truncation)]
-                                let row_count = batch.num_rows() as u64;
-                                counters
-                                    .events_ingested
-                                    .fetch_add(row_count, std::sync::atomic::Ordering::Relaxed);
-                                counters
-                                    .total_batches
-                                    .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
-
-                                // Extract watermark from batch
-                                if let Some(wm_state) = watermark_states.get_mut(name.as_str()) {
-                                    if let Ok(max_ts) = wm_state.extractor.extract(&batch) {
-                                        if let Some(wm) = wm_state.generator.on_event(max_ts) {
-                                            if let Some(entry) = source_entries.get(name.as_str()) {
-                                                entry.source.watermark(wm.timestamp());
-                                            }
-                                            if let Some(ref mut trk) = tracker {
-                                                if let Some(sid) = source_ids.get(name.as_str()) {
-                                                    if let Some(global_wm) =
-                                                        trk.update_source(*sid, wm.timestamp())
-                                                    {
-                                                        pipeline_watermark.store(
-                                                            global_wm.timestamp(),
-                                                            std::sync::atomic::Ordering::Relaxed,
-                                                        );
-                                                    }
-                                                }
-                                            }
-                                        }
-                                    }
-
-                                    // Filter late rows
-                                    let current_wm = wm_state.generator.current_watermark();
-                                    if current_wm > i64::MIN {
-                                        if let Some(filtered) = filter_late_rows(
-                                            &batch,
-                                            &wm_state.column,
-                                            current_wm,
-                                            wm_state.format,
-                                        ) {
-                                            source_batches
-                                                .entry(name.clone())
-                                                .or_default()
-                                                .push(filtered);
-                                        }
-                                        // else: all rows were late, skip batch
-                                    } else {
-                                        source_batches.entry(name.clone()).or_default().push(batch);
-                                    }
-                                } else {
-                                    source_batches.entry(name.clone()).or_default().push(batch);
-                                }
-                            }
-                            _ => break,
-                        }
-                    }
-                }
-
-                if source_batches.is_empty() {
-                    continue;
-                }
-
-                // Execute stream queries
-                let current_wm = pipeline_watermark.load(std::sync::atomic::Ordering::Relaxed);
-                match executor.execute_cycle(&source_batches, current_wm).await {
-                    Ok(results) => {
-                        consecutive_sql_errors = 0;
-                        for (stream_name, src) in &stream_sources {
-                            if let Some(batches) = results.get(stream_name) {
-                                for batch in batches {
-                                    if batch.num_rows() > 0 {
-                                        #[allow(clippy::cast_possible_truncation)]
-                                        let row_count = batch.num_rows() as u64;
-                                        counters.events_emitted.fetch_add(
-                                            row_count,
-                                            std::sync::atomic::Ordering::Relaxed,
-                                        );
-                                        if src.push_arrow(batch.clone()).is_err() {
-                                            #[allow(clippy::cast_possible_truncation)]
-                                            let dropped = batch.num_rows() as u64;
-                                            counters.events_dropped.fetch_add(
-                                                dropped,
-                                                std::sync::atomic::Ordering::Relaxed,
-                                            );
-                                        }
-                                    }
-                                }
-                            }
-                        }
-                    }
-                    Err(e) => {
-                        consecutive_sql_errors += 1;
-                        tracing::warn!(
-                            error = %e,
-                            consecutive = consecutive_sql_errors,
-                            "[LDB-3020] Embedded stream execution error"
-                        );
-                        if consecutive_sql_errors >= 100 {
-                            tracing::error!(
-                                "[LDB-3021] {} consecutive SQL errors — shutting down embedded pipeline",
-                                consecutive_sql_errors
-                            );
-                            break;
-                        }
-                    }
-                }
-
-                cycle_count += 1;
-                counters
-                    .cycles
-                    .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
-                #[allow(clippy::cast_possible_truncation)]
-                let elapsed_ns = cycle_start.elapsed().as_nanos() as u64;
-                counters
-                    .last_cycle_duration_ns
-                    .store(elapsed_ns, std::sync::atomic::Ordering::Relaxed);
-                if cycle_count.is_multiple_of(100) {
-                    tracing::debug!(cycles = cycle_count, "Embedded pipeline processing");
-                }
-            }
-            tracing::info!("Embedded pipeline stopped after {cycle_count} cycles");
-        });
-
-        *self.runtime_handle.lock() = Some(handle);
-    }
-
-    /// Build and start the connector pipeline with external sources/sinks.
-    ///
-    /// Uses the `ConnectorRegistry` for generic dispatch — no
-    /// connector-specific code in the pipeline setup or processing loop.
+    /// Handles both embedded (in-memory only) and connector-backed sources
+    /// through a single code path. Connector-less sources are wrapped as
+    /// `CatalogSourceConnector` to participate in the pipeline alongside
+    /// external connectors (Kafka, CDC, etc.).
     ///
     /// The pipeline uses a thread-per-core architecture: each source
     /// runs on a dedicated I/O thread, pushing events through SPSC
     /// queues to CPU-pinned core threads. A `TpcPipelineCoordinator`
     /// tokio task drains core outboxes and runs SQL cycles.
+    ///
+    /// When `has_external` is false (pure embedded mode), one core thread
+    /// per source is used to minimize overhead while providing unified
+    /// watermark tracking, error handling, and checkpointing.
     #[allow(clippy::too_many_lines)]
     async fn start_connector_pipeline(
         &self,
@@ -521,6 +204,7 @@ impl LaminarDB {
         sink_regs: HashMap<String, crate::connector_manager::SinkRegistration>,
         stream_regs: HashMap<String, crate::connector_manager::StreamRegistration>,
         table_regs: HashMap<String, crate::connector_manager::TableRegistration>,
+        has_external: bool,
     ) -> Result<(), DbError> {
         use crate::connector_manager::{
             build_sink_config, build_source_config, build_table_config,
@@ -608,11 +292,41 @@ impl LaminarDB {
 
         // Bridge connector-less sources into the pipeline so db.insert()
         // data flows through the standard source task → coordinator path.
+        // This covers two cases:
+        //   1. Sources in source_regs with connector_type == None (registered
+        //      in connector manager but without a FROM clause).
+        //   2. Sources in the catalog but NOT in source_regs at all (pure
+        //      embedded sources created without any connector specification).
+        let bridged_names: rustc_hash::FxHashSet<String> =
+            sources.iter().map(|s| s.name.clone()).collect();
+        // First: bridge sources in source_regs that have no connector.
         for (name, reg) in &source_regs {
             if reg.connector_type.is_some() {
-                continue; // Already handled above
+                continue; // Already created as external connector above
             }
             if let Some(entry) = self.catalog.get_source(name) {
+                let subscription = entry.sink.subscribe();
+                let connector = crate::catalog_connector::CatalogSourceConnector::new(
+                    subscription,
+                    entry.schema.clone(),
+                    entry.data_notify(),
+                );
+                sources.push(SourceRegistration {
+                    name: name.clone(),
+                    connector: Box::new(connector),
+                    config: laminar_connectors::config::ConnectorConfig::new("catalog-bridge"),
+                    supports_replay: false,
+                });
+            }
+        }
+        // Second: bridge catalog sources not in source_regs (embedded-only
+        // sources that were never registered with the connector manager).
+        for name in self.catalog.list_sources() {
+            if bridged_names.contains(&name) || source_regs.contains_key(&name) {
+                continue;
+            }
+            if let Some(entry) = self.catalog.get_source(&name) {
+                executor.register_source_schema(name.clone(), entry.schema.clone());
                 let subscription = entry.sink.subscribe();
                 let connector = crate::catalog_connector::CatalogSourceConnector::new(
                     subscription,
@@ -903,12 +617,24 @@ impl LaminarDB {
         );
 
         // Build pipeline config.
+        // Embedded mode (no external connectors): zero batch window for
+        // minimal latency — data is processed as soon as it arrives.
+        // Connector mode: 5ms batch window amortizes SQL overhead across
+        // high-throughput external sources (Kafka, CDC).
         let pipeline_config = PipelineConfig {
             max_poll_records: max_poll,
             channel_capacity: 64,
-            fallback_poll_interval: std::time::Duration::from_millis(10),
+            fallback_poll_interval: if has_external {
+                std::time::Duration::from_millis(10)
+            } else {
+                std::time::Duration::from_millis(1)
+            },
             checkpoint_interval,
-            batch_window: std::time::Duration::from_millis(5),
+            batch_window: if has_external {
+                std::time::Duration::from_millis(5)
+            } else {
+                std::time::Duration::ZERO
+            },
             barrier_alignment_timeout: std::time::Duration::from_secs(30),
         };
 
@@ -970,9 +696,29 @@ impl LaminarDB {
             use laminar_core::tpc::TpcConfig;
 
             let tpc_cfg = self.config.tpc.clone().unwrap_or_default();
+            let num_sources = sources.len().max(1);
             let num_cores = tpc_cfg.num_cores.unwrap_or_else(|| {
-                std::thread::available_parallelism().map_or(1, std::num::NonZero::get)
+                if has_external {
+                    std::thread::available_parallelism().map_or(1, std::num::NonZero::get)
+                } else {
+                    // Pure embedded mode: one core per source.
+                    num_sources
+                }
             });
+            // Ensure at least one core per source — SPSC queues require
+            // exactly one producer thread. When num_cores < num_sources,
+            // round-robin routing puts multiple producers on the same inbox.
+            let num_cores = num_cores.max(num_sources);
+            if let Some(configured) = tpc_cfg.num_cores {
+                if configured < num_sources {
+                    tracing::warn!(
+                        configured_cores = configured,
+                        required_cores = num_sources,
+                        "Overriding num_cores to match source count \
+                         (SPSC single-producer invariant)"
+                    );
+                }
+            }
             let tpc_config = TpcConfig {
                 num_cores,
                 cpu_pinning: tpc_cfg.cpu_pinning,

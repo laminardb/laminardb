@@ -118,7 +118,7 @@ impl SourceEntry {
     ) -> Result<(), laminar_core::streaming::StreamingError> {
         self.source.push_arrow(batch.clone())?;
         self.buffer.push(batch);
-        self.data_notify.notify_waiters();
+        self.data_notify.notify_one();
         Ok(())
     }
 

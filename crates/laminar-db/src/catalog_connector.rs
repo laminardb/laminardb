@@ -79,13 +79,20 @@ impl SourceConnector for CatalogSourceConnector {
             return Ok(None);
         }
 
-        let combined = arrow::compute::concat_batches(&self.schema, &batches)
-            .map_err(|e| ConnectorError::ReadError(format!("Failed to concat batches: {e}")))?;
+        // Fast path: skip concat_batches when there's only one batch
+        // (common case for embedded sources). Avoids a memcpy of the
+        // entire RecordBatch (~1-5μs for typical batch sizes).
+        let records = if batches.len() == 1 {
+            batches.into_iter().next().unwrap()
+        } else {
+            arrow::compute::concat_batches(&self.schema, &batches)
+                .map_err(|e| ConnectorError::ReadError(format!("Failed to concat batches: {e}")))?
+        };
 
-        self.records_polled += u64::try_from(combined.num_rows()).unwrap_or(u64::MAX);
+        self.records_polled += u64::try_from(records.num_rows()).unwrap_or(u64::MAX);
 
         Ok(Some(SourceBatch {
-            records: combined,
+            records,
             partition: None,
         }))
     }
