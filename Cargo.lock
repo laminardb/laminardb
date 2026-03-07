@@ -1241,6 +1241,16 @@ dependencies = [
 ]
 
 [[package]]
+name = "bstr"
+version = "1.12.1"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "63044e1ae8e69f3b5a92c736ca6269b8d12fa7efe39bf34ddb06d102cf0e2cab"
+dependencies = [
+ "memchr",
+ "serde",
+]
+
+[[package]]
 name = "btoi"
 version = "0.4.3"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -3892,6 +3902,19 @@ source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "0cc23270f6e1808e30a928bdc84dea0b9b4136a8bc82338574f23baf47bbd280"
 
 [[package]]
+name = "globset"
+version = "0.4.18"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "52dfc19153a48bde0cbd630453615c8151bce3a5adfac7a0aebfbf0a1e1f57e3"
+dependencies = [
+ "aho-corasick",
+ "bstr",
+ "log",
+ "regex-automata",
+ "regex-syntax",
+]
+
+[[package]]
 name = "h2"
 version = "0.4.13"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -4607,6 +4630,7 @@ dependencies = [
  "arrow-schema",
  "arrow-select",
  "async-trait",
+ "base64 0.22.1",
  "bytes",
  "chrono",
  "csv",
@@ -4615,9 +4639,12 @@ dependencies = [
  "deltalake",
  "foyer",
  "futures-util",
+ "globset",
  "laminar-core",
  "laminar-storage",
+ "libc",
  "mysql_async",
+ "notify",
  "object_store 0.13.1",
  "parking_lot 0.12.5",
  "parquet",
@@ -4642,6 +4669,7 @@ dependencies = [
  "tungstenite",
  "url",
  "uuid",
+ "xorf",
 ]
 
 [[package]]

@@ -116,3 +116,20 @@ pub mod reference;
 /// WebSocket source and sink connectors.
 #[cfg(feature = "websocket")]
 pub mod websocket;
+
+/// AutoLoader-style file source and sink connectors.
+#[cfg(feature = "files")]
+#[allow(
+    clippy::similar_names,
+    clippy::cast_possible_truncation,
+    clippy::must_use_candidate,
+    clippy::items_after_statements,
+    clippy::manual_let_else,
+    clippy::missing_fields_in_debug,
+    clippy::unnecessary_wraps,
+    clippy::case_sensitive_file_extension_comparisons,
+    clippy::map_unwrap_or,
+    clippy::unnecessary_literal_bound,
+    clippy::too_many_lines
+)]
+pub mod files;

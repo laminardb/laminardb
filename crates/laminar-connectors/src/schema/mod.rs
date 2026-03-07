@@ -47,7 +47,7 @@ pub mod resolver;
 pub mod traits;
 pub mod types;
 
-#[cfg(feature = "parquet-lookup")]
+#[cfg(any(feature = "parquet-lookup", feature = "files"))]
 pub mod parquet;
 
 // ── Re-exports for convenience ─────────────────────────────────────
@@ -65,7 +65,7 @@ pub use json::{
     JsonDecoder, JsonDecoderConfig, JsonEncoder, JsonbAccessor, JsonbEncoder, TypeMismatchStrategy,
     UnknownFieldStrategy,
 };
-#[cfg(feature = "parquet-lookup")]
+#[cfg(any(feature = "parquet-lookup", feature = "files"))]
 pub use parquet::{
     ParquetDecoder, ParquetDecoderConfig, ParquetEncoder, ParquetEncoderConfig,
     ParquetSchemaProvider, RowGroupPredicate,
