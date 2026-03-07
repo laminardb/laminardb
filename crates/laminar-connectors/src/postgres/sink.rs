@@ -34,11 +34,11 @@ use super::sink_metrics::PostgresSinkMetrics;
 use super::types::{arrow_to_pg_ddl_type, arrow_type_to_pg_array_cast, arrow_type_to_pg_sql};
 
 #[cfg(feature = "postgres-sink")]
+use super::types::arrow_column_to_pg_array;
+#[cfg(feature = "postgres-sink")]
 use bytes::BytesMut;
 #[cfg(feature = "postgres-sink")]
 use deadpool_postgres::Pool;
-#[cfg(feature = "postgres-sink")]
-use super::types::arrow_column_to_pg_array;
 
 /// `PostgreSQL` sink connector.
 ///
@@ -428,9 +428,8 @@ impl PostgresSink {
             return Ok(WriteResult::new(0, 0));
         }
 
-        let mut encoder =
-            pgpq::ArrowToPostgresBinaryEncoder::try_new(self.user_schema.as_ref())
-                .map_err(|e| ConnectorError::Internal(format!("pgpq encoder init: {e}")))?;
+        let mut encoder = pgpq::ArrowToPostgresBinaryEncoder::try_new(self.user_schema.as_ref())
+            .map_err(|e| ConnectorError::Internal(format!("pgpq encoder init: {e}")))?;
 
         self.encode_buf.clear();
         encoder.write_header(&mut self.encode_buf);
@@ -685,10 +684,11 @@ impl SinkConnector for PostgresSink {
         pool_cfg.pool = Some(deadpool_postgres::PoolConfig::new(self.config.pool_size));
 
         let pool = pool_cfg
-            .create_pool(Some(deadpool_postgres::Runtime::Tokio1), tokio_postgres::NoTls)
-            .map_err(|e| {
-                ConnectorError::ConnectionFailed(format!("pool creation failed: {e}"))
-            })?;
+            .create_pool(
+                Some(deadpool_postgres::Runtime::Tokio1),
+                tokio_postgres::NoTls,
+            )
+            .map_err(|e| ConnectorError::ConnectionFailed(format!("pool creation failed: {e}")))?;
 
         // Validate connectivity.
         let client = pool.get().await.map_err(|e| {
@@ -720,13 +720,13 @@ impl SinkConnector for PostgresSink {
                 let row = client
                     .query_opt(Self::build_epoch_recover_sql(), &[&recover_sink_id])
                     .await
-                    .map_err(|e| {
-                        ConnectorError::Internal(format!("epoch recovery: {e}"))
-                    })?;
+                    .map_err(|e| ConnectorError::Internal(format!("epoch recovery: {e}")))?;
                 if let Some(row) = row {
                     let epoch: i64 = row.get(0);
                     #[allow(clippy::cast_sign_loss)]
-                    { self.last_committed_epoch = epoch as u64; }
+                    {
+                        self.last_committed_epoch = epoch as u64;
+                    }
                     info!(epoch, "recovered last committed epoch");
                 }
             }
@@ -770,9 +770,11 @@ impl SinkConnector for PostgresSink {
             || self.last_flush.elapsed() >= self.config.flush_interval;
 
         if should_flush {
-            let client = self.pool()?.get().await.map_err(|e| {
-                ConnectorError::ConnectionFailed(format!("pool checkout: {e}"))
-            })?;
+            let client = self
+                .pool()?
+                .get()
+                .await
+                .map_err(|e| ConnectorError::ConnectionFailed(format!("pool checkout: {e}")))?;
             let result = self.flush_to_client(&client).await?;
             self.buffer.clear();
             self.buffered_rows = 0;
@@ -805,9 +807,11 @@ impl SinkConnector for PostgresSink {
             return Ok(());
         }
 
-        let client = self.pool()?.get().await.map_err(|e| {
-            ConnectorError::ConnectionFailed(format!("pool checkout: {e}"))
-        })?;
+        let client = self
+            .pool()?
+            .get()
+            .await
+            .map_err(|e| ConnectorError::ConnectionFailed(format!("pool checkout: {e}")))?;
 
         if self.config.delivery_guarantee == DeliveryGuarantee::ExactlyOnce {
             // Check for already-committed epoch (recovery replay).
@@ -934,9 +938,11 @@ impl SinkConnector for PostgresSink {
         if self.buffer.is_empty() {
             return Ok(());
         }
-        let client = self.pool()?.get().await.map_err(|e| {
-            ConnectorError::ConnectionFailed(format!("pool checkout: {e}"))
-        })?;
+        let client = self
+            .pool()?
+            .get()
+            .await
+            .map_err(|e| ConnectorError::ConnectionFailed(format!("pool checkout: {e}")))?;
         self.flush_to_client(&client).await?;
         self.buffer.clear();
         self.buffered_rows = 0;
@@ -1147,8 +1153,10 @@ fn strip_metadata_columns(batch: &RecordBatch) -> Result<RecordBatch, ConnectorE
             .map(|&i| schema.field(i).clone())
             .collect::<Vec<_>>(),
     ));
-    let columns: Vec<Arc<dyn Array>> =
-        user_indices.iter().map(|&i| batch.column(i).clone()).collect();
+    let columns: Vec<Arc<dyn Array>> = user_indices
+        .iter()
+        .map(|&i| batch.column(i).clone())
+        .collect();
 
     RecordBatch::try_new(user_schema, columns)
         .map_err(|e| ConnectorError::Internal(format!("strip metadata: {e}")))

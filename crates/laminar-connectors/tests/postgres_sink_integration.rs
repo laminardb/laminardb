@@ -59,7 +59,8 @@ fn sink_config(host: &str, port: u16, mode: WriteMode) -> PostgresSinkConfig {
 }
 
 async fn connect(host: &str, port: u16) -> tokio_postgres::Client {
-    let conn_str = format!("host={host} port={port} user=postgres password=postgres dbname=postgres");
+    let conn_str =
+        format!("host={host} port={port} user=postgres password=postgres dbname=postgres");
     let (client, conn) = tokio_postgres::connect(&conn_str, NoTls)
         .await
         .expect("direct pg connect");
@@ -77,15 +78,8 @@ async fn start_pg() -> (testcontainers::ContainerAsync<Postgres>, String, u16) {
         .start()
         .await
         .expect("start postgres container");
-    let host = container
-        .get_host()
-        .await
-        .expect("get host")
-        .to_string();
-    let port = container
-        .get_host_port_ipv4(5432)
-        .await
-        .expect("get port");
+    let host = container.get_host().await.expect("get host").to_string();
+    let port = container.get_host_port_ipv4(5432).await.expect("get port");
     (container, host, port)
 }
 
@@ -108,7 +102,10 @@ async fn test_append_flush_writes_data() {
     // Verify data in PG.
     let pg = connect(&host, port).await;
     let rows = pg
-        .query("SELECT id, name, value FROM public.test_events ORDER BY id", &[])
+        .query(
+            "SELECT id, name, value FROM public.test_events ORDER BY id",
+            &[],
+        )
         .await
         .expect("select");
 
@@ -180,7 +177,10 @@ async fn test_upsert_insert_and_update() {
 
     let pg = connect(&host, port).await;
     let rows = pg
-        .query("SELECT name, value FROM public.test_events WHERE id = 1", &[])
+        .query(
+            "SELECT name, value FROM public.test_events WHERE id = 1",
+            &[],
+        )
         .await
         .expect("select");
 
@@ -264,10 +264,7 @@ async fn test_exactly_once_commit() {
 
     // Epoch marker should be written.
     let epoch_row = pg
-        .query_one(
-            "SELECT epoch FROM _laminardb_sink_offsets LIMIT 1",
-            &[],
-        )
+        .query_one("SELECT epoch FROM _laminardb_sink_offsets LIMIT 1", &[])
         .await
         .expect("epoch select");
     assert_eq!(epoch_row.get::<_, i64>(0), 1);
@@ -380,10 +377,7 @@ async fn test_changelog_upsert_and_delete() {
 
     let pg = connect(&host, port).await;
     let rows = pg
-        .query(
-            "SELECT id, name FROM public.test_events ORDER BY id",
-            &[],
-        )
+        .query("SELECT id, name FROM public.test_events ORDER BY id", &[])
         .await
         .expect("select");
 
@@ -444,7 +438,10 @@ async fn test_epoch_recovery_skips_replay() {
     // Verify original data is unchanged (replay was skipped).
     let pg = connect(&host, port).await;
     let row = pg
-        .query_one("SELECT name, value FROM public.test_events WHERE id = 1", &[])
+        .query_one(
+            "SELECT name, value FROM public.test_events WHERE id = 1",
+            &[],
+        )
         .await
         .expect("select");
     assert_eq!(row.get::<_, &str>(0), "original");

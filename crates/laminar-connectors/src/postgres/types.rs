@@ -112,31 +112,33 @@ pub fn arrow_type_to_pg_array_cast(dt: &DataType, param_index: usize) -> String 
 /// Returns `ConnectorError::Internal` if the array cannot be downcast to
 /// the expected Arrow array type.
 #[cfg(feature = "postgres-sink")]
-#[allow(clippy::too_many_lines, clippy::cast_possible_truncation, clippy::missing_panics_doc)]
+#[allow(
+    clippy::too_many_lines,
+    clippy::cast_possible_truncation,
+    clippy::missing_panics_doc
+)]
 pub fn arrow_column_to_pg_array(
     array: &dyn arrow_array::Array,
 ) -> Result<Box<dyn postgres_types::ToSql + Sync + Send>, crate::error::ConnectorError> {
+    use crate::error::ConnectorError;
     use arrow_array::{
-        Array as _, BinaryArray, BooleanArray, Date32Array, Float32Array, Float64Array,
-        Int8Array, Int16Array, Int32Array, Int64Array, LargeStringArray, StringArray,
+        Array as _, BinaryArray, BooleanArray, Date32Array, Float32Array, Float64Array, Int16Array,
+        Int32Array, Int64Array, Int8Array, LargeStringArray, StringArray,
         TimestampMicrosecondArray, TimestampMillisecondArray, TimestampNanosecondArray,
-        TimestampSecondArray, UInt8Array, UInt16Array, UInt32Array, UInt64Array,
+        TimestampSecondArray, UInt16Array, UInt32Array, UInt64Array, UInt8Array,
     };
     use arrow_schema::TimeUnit;
-    use crate::error::ConnectorError;
 
     macro_rules! extract_primitive {
         ($array:expr, $arrow_ty:ty, $rust_ty:ty) => {{
-            let arr = $array
-                .as_any()
-                .downcast_ref::<$arrow_ty>()
-                .ok_or_else(|| {
-                    ConnectorError::Internal(format!(
-                        "downcast to {} failed",
-                        stringify!($arrow_ty)
-                    ))
-                })?;
-            #[allow(clippy::cast_possible_truncation, clippy::cast_possible_wrap, clippy::cast_sign_loss)]
+            let arr = $array.as_any().downcast_ref::<$arrow_ty>().ok_or_else(|| {
+                ConnectorError::Internal(format!("downcast to {} failed", stringify!($arrow_ty)))
+            })?;
+            #[allow(
+                clippy::cast_possible_truncation,
+                clippy::cast_possible_wrap,
+                clippy::cast_sign_loss
+            )]
             let vals: Vec<Option<$rust_ty>> = (0..arr.len())
                 .map(|i| {
                     if arr.is_null(i) {
@@ -155,9 +157,17 @@ pub fn arrow_column_to_pg_array(
             let arr = array
                 .as_any()
                 .downcast_ref::<BooleanArray>()
-                .ok_or_else(|| ConnectorError::Internal("downcast to BooleanArray failed".into()))?;
+                .ok_or_else(|| {
+                    ConnectorError::Internal("downcast to BooleanArray failed".into())
+                })?;
             let vals: Vec<Option<bool>> = (0..arr.len())
-                .map(|i| if arr.is_null(i) { None } else { Some(arr.value(i)) })
+                .map(|i| {
+                    if arr.is_null(i) {
+                        None
+                    } else {
+                        Some(arr.value(i))
+                    }
+                })
                 .collect();
             Ok(Box::new(vals))
         }
@@ -243,8 +253,8 @@ pub fn arrow_column_to_pg_array(
                 .as_any()
                 .downcast_ref::<Date32Array>()
                 .ok_or_else(|| ConnectorError::Internal("downcast to Date32Array failed".into()))?;
-            let epoch = chrono::NaiveDate::from_ymd_opt(1970, 1, 1)
-                .expect("1970-01-01 is a valid date");
+            let epoch =
+                chrono::NaiveDate::from_ymd_opt(1970, 1, 1).expect("1970-01-01 is a valid date");
             let vals: Vec<Option<chrono::NaiveDate>> = (0..arr.len())
                 .map(|i| {
                     if arr.is_null(i) {
@@ -370,16 +380,22 @@ pub fn arrow_column_to_pg_array(
 /// Converts a raw timestamp value to [`chrono::NaiveDateTime`] based on the Arrow `TimeUnit`.
 #[cfg(feature = "postgres-sink")]
 #[allow(clippy::trivially_copy_pass_by_ref, clippy::cast_possible_truncation)]
-fn to_naive_datetime(
-    value: i64,
-    unit: &arrow_schema::TimeUnit,
-) -> Option<chrono::NaiveDateTime> {
+fn to_naive_datetime(value: i64, unit: &arrow_schema::TimeUnit) -> Option<chrono::NaiveDateTime> {
     use arrow_schema::TimeUnit;
     let (secs, nanos) = match unit {
         TimeUnit::Second => (value, 0_u32),
-        TimeUnit::Millisecond => (value / 1_000, ((value % 1_000).unsigned_abs() as u32) * 1_000_000),
-        TimeUnit::Microsecond => (value / 1_000_000, ((value % 1_000_000).unsigned_abs() as u32) * 1_000),
-        TimeUnit::Nanosecond => (value / 1_000_000_000, (value % 1_000_000_000).unsigned_abs() as u32),
+        TimeUnit::Millisecond => (
+            value / 1_000,
+            ((value % 1_000).unsigned_abs() as u32) * 1_000_000,
+        ),
+        TimeUnit::Microsecond => (
+            value / 1_000_000,
+            ((value % 1_000_000).unsigned_abs() as u32) * 1_000,
+        ),
+        TimeUnit::Nanosecond => (
+            value / 1_000_000_000,
+            (value % 1_000_000_000).unsigned_abs() as u32,
+        ),
     };
     chrono::DateTime::from_timestamp(secs, nanos).map(|dt| dt.naive_utc())
 }
