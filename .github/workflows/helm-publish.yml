@@ -24,7 +24,13 @@ jobs:
       - name: Set up Helm
         uses: azure/setup-helm@v4
 
-      - name: Lint chart
+      - name: Set up chart-testing
+        uses: helm/chart-testing-action@v2
+
+      - name: Lint with chart-testing
+        run: ct lint --config deploy/helm/ct.yaml --charts deploy/helm/laminardb
+
+      - name: Lint chart (strict)
         run: helm lint deploy/helm/laminardb --strict
 
       - name: Template with default values
@@ -53,6 +59,12 @@ jobs:
 
       - name: Log in to GHCR
         run: echo "${{ secrets.GITHUB_TOKEN }}" | helm registry login ghcr.io -u ${{ github.actor }} --password-stdin
+
+      - name: Sync appVersion from Cargo.toml
+        run: |
+          APP_VERSION=$(grep -m1 '^version' Cargo.toml | sed 's/version = "\(.*\)"/\1/')
+          sed -i "s/^appVersion:.*/appVersion: \"${APP_VERSION}\"/" deploy/helm/laminardb/Chart.yaml
+          echo "Set appVersion to ${APP_VERSION}"
 
       - name: Package chart
         run: helm package deploy/helm/laminardb -d .helm-packages

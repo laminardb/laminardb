@@ -86,6 +86,11 @@ jobs:
             cross: false
             # macOS: skip Linux-only features (hwloc, io-uring, xdp)
             features: --features "allocation-tracking,jit,kafka,postgres-cdc,postgres-sink,mysql-cdc,delta-lake,delta,websocket"
+          - os: macos-13  # Intel
+            target: x86_64-apple-darwin
+            cross: false
+            # macOS: skip Linux-only features (hwloc, io-uring, xdp)
+            features: --features "allocation-tracking,jit,kafka,postgres-cdc,postgres-sink,mysql-cdc,delta-lake,delta,websocket"
           - os: windows-latest
             target: x86_64-pc-windows-msvc
             cross: false
@@ -115,6 +120,9 @@ jobs:
             perl -i -pe 's/(path = "\.\.\/[^"]*", )version = "[^"]*"/${1}version = "'"$VERSION"'"/g' {} +
           find crates examples -name Cargo.toml -exec \
             perl -i -pe 's/(path = "\.\.\/\.\.\/[^"]*", )version = "[^"]*"/${1}version = "'"$VERSION"'"/g' {} +
+
+          # Sync Helm chart appVersion
+          perl -i -pe 's/^appVersion:.*/appVersion: "'"$VERSION"'"/' deploy/helm/laminardb/Chart.yaml
 
           echo "Workspace version:"
           grep '^version' Cargo.toml
@@ -163,6 +171,11 @@ jobs:
           else
             cp "${RELEASE_DIR}/laminardb" server-pkg/ 2>/dev/null || true
           fi
+
+          # Include documentation and example config in server archive
+          cp README.md LICENSE server-pkg/ 2>/dev/null || true
+          mkdir -p server-pkg/examples
+          cp examples/laminardb.toml server-pkg/examples/ 2>/dev/null || true
 
           # Package 2: laminardb-lib (C FFI / shared libraries)
           if [[ "${{ matrix.os }}" == "windows-latest" ]]; then
@@ -236,8 +249,8 @@ jobs:
       - name: Generate checksums
         run: |
           cd artifacts
-          sha256sum * > checksums.sha256
-          cat checksums.sha256
+          sha256sum * > SHA256SUMS
+          cat SHA256SUMS
 
       - name: Extract release notes
         id: notes
@@ -270,7 +283,7 @@ jobs:
           ASSETS=()
           for f in artifacts/laminardb-server-*.tar.gz artifacts/laminardb-server-*.zip \
                    artifacts/laminardb-lib-*.tar.gz artifacts/laminardb-lib-*.zip \
-                   artifacts/checksums.sha256; do
+                   artifacts/SHA256SUMS; do
             [ -e "$f" ] && ASSETS+=("$f")
           done
 
@@ -407,7 +420,7 @@ jobs:
 
       - name: Download checksums
         run: |
-          gh release download ${{ github.ref_name }} --pattern checksums.sha256
+          gh release download ${{ github.ref_name }} --pattern SHA256SUMS
         env:
           GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
 
