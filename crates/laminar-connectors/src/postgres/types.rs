@@ -94,6 +94,296 @@ pub fn arrow_type_to_pg_array_cast(dt: &DataType, param_index: usize) -> String 
     format!("${}::{}[]", param_index, arrow_type_to_pg_sql(dt))
 }
 
+/// Converts an Arrow array column to a boxed `PostgreSQL` array parameter for UNNEST queries.
+///
+/// Each Arrow type maps to the corresponding Rust type that implements
+/// `postgres_types::ToSql`. The returned `Box` is passed as a bind parameter
+/// to `tokio_postgres::Client::execute`.
+///
+/// # Supported Types
+///
+/// `Boolean`, `Int8`–`Int64`, `UInt8`–`UInt64` (widened), `Float32`/`Float64`,
+/// `Utf8`, `LargeUtf8`, `Binary`, `LargeBinary`, `Date32`,
+/// `Timestamp` (all units, with/without tz).
+/// Unsupported types fall back to string representation.
+///
+/// # Errors
+///
+/// Returns `ConnectorError::Internal` if the array cannot be downcast to
+/// the expected Arrow array type.
+#[cfg(feature = "postgres-sink")]
+#[allow(clippy::too_many_lines, clippy::cast_possible_truncation, clippy::missing_panics_doc)]
+pub fn arrow_column_to_pg_array(
+    array: &dyn arrow_array::Array,
+) -> Result<Box<dyn postgres_types::ToSql + Sync + Send>, crate::error::ConnectorError> {
+    use arrow_array::{
+        Array as _, BinaryArray, BooleanArray, Date32Array, Float32Array, Float64Array,
+        Int8Array, Int16Array, Int32Array, Int64Array, LargeStringArray, StringArray,
+        TimestampMicrosecondArray, TimestampMillisecondArray, TimestampNanosecondArray,
+        TimestampSecondArray, UInt8Array, UInt16Array, UInt32Array, UInt64Array,
+    };
+    use arrow_schema::TimeUnit;
+    use crate::error::ConnectorError;
+
+    macro_rules! extract_primitive {
+        ($array:expr, $arrow_ty:ty, $rust_ty:ty) => {{
+            let arr = $array
+                .as_any()
+                .downcast_ref::<$arrow_ty>()
+                .ok_or_else(|| {
+                    ConnectorError::Internal(format!(
+                        "downcast to {} failed",
+                        stringify!($arrow_ty)
+                    ))
+                })?;
+            #[allow(clippy::cast_possible_truncation, clippy::cast_possible_wrap, clippy::cast_sign_loss)]
+            let vals: Vec<Option<$rust_ty>> = (0..arr.len())
+                .map(|i| {
+                    if arr.is_null(i) {
+                        None
+                    } else {
+                        Some(arr.value(i) as $rust_ty)
+                    }
+                })
+                .collect();
+            Ok(Box::new(vals))
+        }};
+    }
+
+    match array.data_type() {
+        DataType::Boolean => {
+            let arr = array
+                .as_any()
+                .downcast_ref::<BooleanArray>()
+                .ok_or_else(|| ConnectorError::Internal("downcast to BooleanArray failed".into()))?;
+            let vals: Vec<Option<bool>> = (0..arr.len())
+                .map(|i| if arr.is_null(i) { None } else { Some(arr.value(i)) })
+                .collect();
+            Ok(Box::new(vals))
+        }
+        DataType::Int8 => extract_primitive!(array, Int8Array, i16),
+        DataType::UInt8 => extract_primitive!(array, UInt8Array, i16),
+        DataType::Int16 => extract_primitive!(array, Int16Array, i16),
+        DataType::UInt16 => extract_primitive!(array, UInt16Array, i32),
+        DataType::Int32 => extract_primitive!(array, Int32Array, i32),
+        DataType::UInt32 => extract_primitive!(array, UInt32Array, i64),
+        DataType::Int64 => extract_primitive!(array, Int64Array, i64),
+        DataType::UInt64 => {
+            // PG has no unsigned 64-bit; cast to i64 (wraps for > i64::MAX).
+            let arr = array
+                .as_any()
+                .downcast_ref::<UInt64Array>()
+                .ok_or_else(|| ConnectorError::Internal("downcast to UInt64Array failed".into()))?;
+            #[allow(clippy::cast_possible_wrap)]
+            let vals: Vec<Option<i64>> = (0..arr.len())
+                .map(|i| {
+                    if arr.is_null(i) {
+                        None
+                    } else {
+                        Some(arr.value(i) as i64)
+                    }
+                })
+                .collect();
+            Ok(Box::new(vals))
+        }
+        DataType::Float32 => extract_primitive!(array, Float32Array, f32),
+        DataType::Float64 => extract_primitive!(array, Float64Array, f64),
+        DataType::Utf8 => {
+            let arr = array
+                .as_any()
+                .downcast_ref::<StringArray>()
+                .ok_or_else(|| ConnectorError::Internal("downcast to StringArray failed".into()))?;
+            let vals: Vec<Option<String>> = (0..arr.len())
+                .map(|i| {
+                    if arr.is_null(i) {
+                        None
+                    } else {
+                        Some(arr.value(i).to_owned())
+                    }
+                })
+                .collect();
+            Ok(Box::new(vals))
+        }
+        DataType::LargeUtf8 => {
+            let arr = array
+                .as_any()
+                .downcast_ref::<LargeStringArray>()
+                .ok_or_else(|| {
+                    ConnectorError::Internal("downcast to LargeStringArray failed".into())
+                })?;
+            let vals: Vec<Option<String>> = (0..arr.len())
+                .map(|i| {
+                    if arr.is_null(i) {
+                        None
+                    } else {
+                        Some(arr.value(i).to_owned())
+                    }
+                })
+                .collect();
+            Ok(Box::new(vals))
+        }
+        DataType::Binary | DataType::LargeBinary | DataType::FixedSizeBinary(_) => {
+            let arr = array
+                .as_any()
+                .downcast_ref::<BinaryArray>()
+                .ok_or_else(|| ConnectorError::Internal("downcast to BinaryArray failed".into()))?;
+            let vals: Vec<Option<Vec<u8>>> = (0..arr.len())
+                .map(|i| {
+                    if arr.is_null(i) {
+                        None
+                    } else {
+                        Some(arr.value(i).to_vec())
+                    }
+                })
+                .collect();
+            Ok(Box::new(vals))
+        }
+        DataType::Date32 => {
+            let arr = array
+                .as_any()
+                .downcast_ref::<Date32Array>()
+                .ok_or_else(|| ConnectorError::Internal("downcast to Date32Array failed".into()))?;
+            let epoch = chrono::NaiveDate::from_ymd_opt(1970, 1, 1)
+                .expect("1970-01-01 is a valid date");
+            let vals: Vec<Option<chrono::NaiveDate>> = (0..arr.len())
+                .map(|i| {
+                    if arr.is_null(i) {
+                        None
+                    } else {
+                        let days = i64::from(arr.value(i));
+                        if days >= 0 {
+                            epoch.checked_add_days(chrono::Days::new(days.unsigned_abs()))
+                        } else {
+                            epoch.checked_sub_days(chrono::Days::new(days.unsigned_abs()))
+                        }
+                    }
+                })
+                .collect();
+            Ok(Box::new(vals))
+        }
+        DataType::Timestamp(unit, tz) => {
+            let arr = array
+                .as_any()
+                .downcast_ref::<TimestampMicrosecondArray>()
+                .map(|a| {
+                    (0..a.len())
+                        .map(|i| {
+                            if a.is_null(i) {
+                                None
+                            } else {
+                                to_naive_datetime(a.value(i), &TimeUnit::Microsecond)
+                            }
+                        })
+                        .collect::<Vec<_>>()
+                })
+                .or_else(|| {
+                    array
+                        .as_any()
+                        .downcast_ref::<TimestampMillisecondArray>()
+                        .map(|a| {
+                            (0..a.len())
+                                .map(|i| {
+                                    if a.is_null(i) {
+                                        None
+                                    } else {
+                                        to_naive_datetime(a.value(i), &TimeUnit::Millisecond)
+                                    }
+                                })
+                                .collect()
+                        })
+                })
+                .or_else(|| {
+                    array
+                        .as_any()
+                        .downcast_ref::<TimestampSecondArray>()
+                        .map(|a| {
+                            (0..a.len())
+                                .map(|i| {
+                                    if a.is_null(i) {
+                                        None
+                                    } else {
+                                        to_naive_datetime(a.value(i), &TimeUnit::Second)
+                                    }
+                                })
+                                .collect()
+                        })
+                })
+                .or_else(|| {
+                    array
+                        .as_any()
+                        .downcast_ref::<TimestampNanosecondArray>()
+                        .map(|a| {
+                            (0..a.len())
+                                .map(|i| {
+                                    if a.is_null(i) {
+                                        None
+                                    } else {
+                                        to_naive_datetime(a.value(i), &TimeUnit::Nanosecond)
+                                    }
+                                })
+                                .collect()
+                        })
+                });
+
+            let vals = arr.ok_or_else(|| {
+                ConnectorError::Internal(format!(
+                    "unsupported timestamp unit {unit:?} for pg array conversion"
+                ))
+            })?;
+
+            if tz.is_some() {
+                // TIMESTAMPTZ: wrap as DateTime<Utc>
+                let tz_vals: Vec<Option<chrono::DateTime<chrono::Utc>>> = vals
+                    .into_iter()
+                    .map(|opt| opt.map(|ndt| ndt.and_utc()))
+                    .collect();
+                Ok(Box::new(tz_vals))
+            } else {
+                Ok(Box::new(vals))
+            }
+        }
+        // Fallback: convert to string representation
+        other => {
+            let formatter = arrow_cast::display::ArrayFormatter::try_new(
+                array,
+                &arrow_cast::display::FormatOptions::default(),
+            )
+            .map_err(|e| ConnectorError::Internal(format!("arrow format error: {e}")))?;
+            let vals: Vec<Option<String>> = (0..array.len())
+                .map(|i| {
+                    if array.is_null(i) {
+                        None
+                    } else {
+                        Some(formatter.value(i).to_string())
+                    }
+                })
+                .collect();
+            tracing::debug!(
+                data_type = ?other,
+                "falling back to text conversion for unsupported Arrow type"
+            );
+            Ok(Box::new(vals))
+        }
+    }
+}
+
+/// Converts a raw timestamp value to [`chrono::NaiveDateTime`] based on the Arrow `TimeUnit`.
+#[cfg(feature = "postgres-sink")]
+#[allow(clippy::trivially_copy_pass_by_ref, clippy::cast_possible_truncation)]
+fn to_naive_datetime(
+    value: i64,
+    unit: &arrow_schema::TimeUnit,
+) -> Option<chrono::NaiveDateTime> {
+    use arrow_schema::TimeUnit;
+    let (secs, nanos) = match unit {
+        TimeUnit::Second => (value, 0_u32),
+        TimeUnit::Millisecond => (value / 1_000, ((value % 1_000).unsigned_abs() as u32) * 1_000_000),
+        TimeUnit::Microsecond => (value / 1_000_000, ((value % 1_000_000).unsigned_abs() as u32) * 1_000),
+        TimeUnit::Nanosecond => (value / 1_000_000_000, (value % 1_000_000_000).unsigned_abs() as u32),
+    };
+    chrono::DateTime::from_timestamp(secs, nanos).map(|dt| dt.naive_utc())
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
