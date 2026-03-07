@@ -80,7 +80,13 @@ impl crate::pipeline::PipelineCallback for ConnectorPipelineCallback {
                         self.counters
                             .events_emitted
                             .fetch_add(row_count, std::sync::atomic::Ordering::Relaxed);
-                        let _ = src.push_arrow(batch.clone());
+                        if src.push_arrow(batch.clone()).is_err() {
+                            #[allow(clippy::cast_possible_truncation)]
+                            let dropped = batch.num_rows() as u64;
+                            self.counters
+                                .events_dropped
+                                .fetch_add(dropped, std::sync::atomic::Ordering::Relaxed);
+                        }
                     }
                 }
             }

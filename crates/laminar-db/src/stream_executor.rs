@@ -314,7 +314,8 @@ impl StreamExecutor {
     /// Register a static reference table (e.g., from `CREATE TABLE`).
     ///
     /// Unlike source tables, these persist across cycles.
-    #[allow(dead_code)]
+    /// Currently only called from tests; will be wired to `CREATE TABLE` DDL.
+    #[cfg(test)]
     pub fn register_table(&self, name: &str, batch: RecordBatch) -> Result<(), DbError> {
         let schema = batch.schema();
         let mem_table = datafusion::datasource::MemTable::try_new(schema, vec![vec![batch]])
@@ -429,7 +430,7 @@ impl StreamExecutor {
             let has_asof = self.queries[idx].asof_config.is_some();
             let has_temporal = self.queries[idx].temporal_config.is_some();
 
-            let batches = if is_eowc {
+            let query_result = if is_eowc {
                 let query_name = self.queries[idx].name.clone();
                 let window_config = self.queries[idx].window_config.clone();
                 let asof_config = self.queries[idx].asof_config.clone();
@@ -444,7 +445,7 @@ impl StreamExecutor {
                     &results,
                     current_watermark,
                 )
-                .await?
+                .await
             } else if has_asof {
                 let query_name = self.queries[idx].name.clone();
                 let cfg = self.queries[idx]
@@ -459,7 +460,7 @@ impl StreamExecutor {
                     source_batches,
                     &results,
                 )
-                .await?
+                .await
             } else if has_temporal {
                 let query_name = self.queries[idx].name.clone();
                 let cfg = self.queries[idx]
@@ -467,9 +468,32 @@ impl StreamExecutor {
                     .clone()
                     .expect("has_temporal guard ensures temporal_config is Some");
                 self.execute_temporal_query(&query_name, &cfg, source_batches, &results)
-                    .await?
+                    .await
             } else {
-                self.execute_standard_query(idx).await?
+                self.execute_standard_query(idx).await
+            };
+
+            // Queries that depend on other stream queries may fail during
+            // warmup because their upstream (e.g. EOWC) hasn't emitted yet.
+            // Skip those gracefully. Queries that only reference source tables
+            // propagate errors normally.
+            let batches = match query_result {
+                Ok(b) => b,
+                Err(e) => {
+                    let depends_on_stream = self.queries[idx]
+                        .table_refs
+                        .iter()
+                        .any(|tr| self.queries.iter().any(|q| q.name == *tr));
+                    if depends_on_stream {
+                        tracing::debug!(
+                            query = %self.queries[idx].name,
+                            error = %e,
+                            "Query skipped (upstream not ready)"
+                        );
+                        continue;
+                    }
+                    return Err(e);
+                }
             };
 
             // Apply Top-K post-filter if configured
@@ -481,14 +505,20 @@ impl StreamExecutor {
                 _ => batches,
             };
 
+            let query_name = self.queries[idx].name.clone();
             if !batches.is_empty() {
-                let query_name = self.queries[idx].name.clone();
                 let schema = batches[0].schema();
                 if let Ok(mem_table) =
                     datafusion::datasource::MemTable::try_new(schema, vec![batches.clone()])
                 {
                     let _ = self.ctx.deregister_table(&query_name);
-                    let _ = self.ctx.register_table(&query_name, Arc::new(mem_table));
+                    if let Err(e) = self.ctx.register_table(&query_name, Arc::new(mem_table)) {
+                        tracing::warn!(
+                            query = %query_name,
+                            error = %e,
+                            "[LDB-3015] Failed to register intermediate table"
+                        );
+                    }
                     intermediate_tables.push(query_name.clone());
                 }
                 results.insert(query_name, batches);
@@ -497,6 +527,7 @@ impl StreamExecutor {
 
         self.cleanup_source_tables();
         for name in &intermediate_tables {
+            // Cleanup: deregister failures during teardown are benign
             let _ = self.ctx.deregister_table(name);
         }
 
@@ -1412,88 +1443,77 @@ impl StreamExecutor {
         Ok(restored)
     }
 
-    /// Try to restore pending checkpoint data for a newly initialized
-    /// aggregate state. Called after lazy initialization.
+    /// Try to restore checkpoint data for a newly initialized state.
+    /// Logs success/failure with `label`.
+    fn log_restore<C: Clone, S>(
+        query_name: &str,
+        cp: &C,
+        state: &mut S,
+        restore_fn: impl FnOnce(&mut S, &C) -> Result<usize, DbError>,
+        label: &str,
+    ) {
+        let cp_clone = cp.clone();
+        match restore_fn(state, &cp_clone) {
+            Ok(n) => {
+                tracing::info!(query = %query_name, groups = n, "Restored {label} from checkpoint");
+            }
+            Err(e) => {
+                tracing::warn!(query = %query_name, error = %e, "Failed to restore {label} from checkpoint");
+            }
+        }
+    }
+
     fn try_restore_pending_agg(&mut self, idx: usize) {
-        let query_name = &self.queries[idx].name;
-        let pending = self.pending_restore.as_ref();
-        if let Some(cp) = pending.and_then(|p| p.agg_states.get(query_name)) {
-            // Clone the checkpoint data to avoid borrow conflict
-            let cp_clone = cp.clone();
-            if let Some(state) = self.agg_states.get_mut(&idx) {
-                match state.restore_groups(&cp_clone) {
-                    Ok(n) => {
-                        tracing::info!(
-                            query = %query_name,
-                            groups = n,
-                            "Restored agg state from checkpoint"
-                        );
-                    }
-                    Err(e) => {
-                        tracing::warn!(
-                            query = %query_name,
-                            error = %e,
-                            "Failed to restore agg state from checkpoint"
-                        );
-                    }
-                }
-            }
+        let name = self.queries[idx].name.clone();
+        let cp = self
+            .pending_restore
+            .as_ref()
+            .and_then(|p| p.agg_states.get(&name))
+            .cloned();
+        if let (Some(cp), Some(state)) = (cp, self.agg_states.get_mut(&idx)) {
+            Self::log_restore(
+                &name,
+                &cp,
+                state,
+                IncrementalAggState::restore_groups,
+                "agg state",
+            );
         }
     }
 
-    /// Try to restore pending checkpoint data for a newly initialized
-    /// EOWC aggregate state. Called after lazy initialization.
     fn try_restore_pending_eowc(&mut self, idx: usize) {
-        let query_name = &self.queries[idx].name;
-        let pending = self.pending_restore.as_ref();
-        if let Some(cp) = pending.and_then(|p| p.eowc_states.get(query_name)) {
-            let cp_clone = cp.clone();
-            if let Some(state) = self.eowc_agg_states.get_mut(&idx) {
-                match state.restore_windows(&cp_clone) {
-                    Ok(n) => {
-                        tracing::info!(
-                            query = %query_name,
-                            groups = n,
-                            "Restored EOWC state from checkpoint"
-                        );
-                    }
-                    Err(e) => {
-                        tracing::warn!(
-                            query = %query_name,
-                            error = %e,
-                            "Failed to restore EOWC state from checkpoint"
-                        );
-                    }
-                }
-            }
+        let name = self.queries[idx].name.clone();
+        let cp = self
+            .pending_restore
+            .as_ref()
+            .and_then(|p| p.eowc_states.get(&name))
+            .cloned();
+        if let (Some(cp), Some(state)) = (cp, self.eowc_agg_states.get_mut(&idx)) {
+            Self::log_restore(
+                &name,
+                &cp,
+                state,
+                IncrementalEowcState::restore_windows,
+                "EOWC state",
+            );
         }
     }
 
-    /// Try to restore pending checkpoint data for a newly initialized
-    /// Core window pipeline state. Called after lazy initialization.
     fn try_restore_pending_core_window(&mut self, idx: usize) {
-        let query_name = &self.queries[idx].name;
-        let pending = self.pending_restore.as_ref();
-        if let Some(cp) = pending.and_then(|p| p.core_window_states.get(query_name)) {
-            let cp_clone = cp.clone();
-            if let Some(state) = self.core_window_states.get_mut(&idx) {
-                match state.restore_windows(&cp_clone) {
-                    Ok(n) => {
-                        tracing::info!(
-                            query = %query_name,
-                            groups = n,
-                            "Restored core window state from checkpoint"
-                        );
-                    }
-                    Err(e) => {
-                        tracing::warn!(
-                            query = %query_name,
-                            error = %e,
-                            "Failed to restore core window state from checkpoint"
-                        );
-                    }
-                }
-            }
+        let name = self.queries[idx].name.clone();
+        let cp = self
+            .pending_restore
+            .as_ref()
+            .and_then(|p| p.core_window_states.get(&name))
+            .cloned();
+        if let (Some(cp), Some(state)) = (cp, self.core_window_states.get_mut(&idx)) {
+            Self::log_restore(
+                &name,
+                &cp,
+                state,
+                CoreWindowState::restore_windows,
+                "core window state",
+            );
         }
     }
 }

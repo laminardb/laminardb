@@ -29,7 +29,7 @@ jit = [
 ]
 # Enable distributed delta mode (multi-node) — heavy deps, server-only
 delta = [
-    "dep:tonic", "dep:tonic-prost", "dep:prost", "dep:openraft", "dep:chitchat",
+    "dep:tonic", "dep:tonic-prost", "dep:prost", "dep:chitchat",
     "dep:tokio-util", "dep:xxhash-rust",
     "dep:tonic-build", "dep:tonic-prost-build", "dep:prost-build",
 ]
@@ -88,7 +88,6 @@ datafusion-common = { workspace = true, optional = true }
 tonic = { workspace = true, optional = true }
 tonic-prost = { workspace = true, optional = true }
 prost = { workspace = true, optional = true }
-openraft = { workspace = true, optional = true }
 chitchat = { workspace = true, optional = true }
 tokio-util = { workspace = true, optional = true }
 xxhash-rust = { workspace = true, optional = true }

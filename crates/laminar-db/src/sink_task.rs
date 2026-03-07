@@ -28,6 +28,7 @@ const DEFAULT_CHANNEL_CAPACITY: usize = 128;
 const DEFAULT_FLUSH_INTERVAL: Duration = Duration::from_secs(5);
 
 /// Commands sent to a sink's dedicated task.
+#[allow(dead_code)] // Flush and Close constructed only by flush()/close() which are reserved public API
 pub(crate) enum SinkCommand {
     /// Write a batch to the sink.
     WriteBatch { batch: RecordBatch },
@@ -64,8 +65,9 @@ pub(crate) struct SinkTaskHandle {
     tx: mpsc::Sender<SinkCommand>,
     /// Whether this sink supports exactly-once semantics.
     exactly_once: bool,
-    /// Background task join handle (owned by the first handle only).
-    #[allow(dead_code)]
+    /// Background task join handle. Used by `close()` for explicit shutdown.
+    /// Implicit shutdown (channel drop) works without awaiting the handle.
+    #[allow(dead_code)] // used by close(); implicit channel-drop handles normal shutdown
     task: Arc<tokio::sync::Mutex<Option<JoinHandle<()>>>>,
 }
 
@@ -116,7 +118,10 @@ impl SinkTaskHandle {
     }
 
     /// Requests an explicit flush and waits for acknowledgment.
-    #[allow(dead_code)]
+    ///
+    /// Not called on the normal shutdown path (channel drop triggers
+    /// flush implicitly in `run_sink_task`). Available for manual use.
+    #[allow(dead_code)] // public API for manual flush; implicit channel-drop handles normal shutdown
     pub async fn flush(&self) -> Result<(), ConnectorError> {
         let (ack_tx, ack_rx) = oneshot::channel();
         self.tx
@@ -181,8 +186,12 @@ impl SinkTaskHandle {
         let _ = self.tx.send(SinkCommand::RollbackEpoch { epoch }).await;
     }
 
-    /// Signals the sink task to close and waits for it to finish.
-    #[allow(dead_code)]
+    /// Signals the sink task to close and waits for it to finish (30s timeout).
+    ///
+    /// Not called on the normal shutdown path — dropping the `SinkTaskHandle`
+    /// closes the command channel, which triggers flush+close in `run_sink_task`.
+    /// This method is for explicit shutdown when you need to wait for completion.
+    #[allow(dead_code)] // public API for explicit close; implicit channel-drop handles normal shutdown
     pub async fn close(&self) {
         let _ = self.tx.send(SinkCommand::Close).await;
         let mut guard = self.task.lock().await;

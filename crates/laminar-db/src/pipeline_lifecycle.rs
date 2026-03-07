@@ -330,6 +330,7 @@ impl LaminarDB {
 
         let handle = tokio::spawn(async move {
             let mut cycle_count: u64 = 0;
+            let mut consecutive_sql_errors: u32 = 0;
             loop {
                 // Check for shutdown
                 tokio::select! {
@@ -444,7 +445,7 @@ impl LaminarDB {
                 let current_wm = pipeline_watermark.load(std::sync::atomic::Ordering::Relaxed);
                 match executor.execute_cycle(&source_batches, current_wm).await {
                     Ok(results) => {
-                        // Push results to stream sources for subscriber delivery
+                        consecutive_sql_errors = 0;
                         for (stream_name, src) in &stream_sources {
                             if let Some(batches) = results.get(stream_name) {
                                 for batch in batches {
@@ -455,14 +456,33 @@ impl LaminarDB {
                                             row_count,
                                             std::sync::atomic::Ordering::Relaxed,
                                         );
-                                        let _ = src.push_arrow(batch.clone());
+                                        if src.push_arrow(batch.clone()).is_err() {
+                                            #[allow(clippy::cast_possible_truncation)]
+                                            let dropped = batch.num_rows() as u64;
+                                            counters.events_dropped.fetch_add(
+                                                dropped,
+                                                std::sync::atomic::Ordering::Relaxed,
+                                            );
+                                        }
                                     }
                                 }
                             }
                         }
                     }
                     Err(e) => {
-                        tracing::error!(error = %e, "Embedded stream execution error");
+                        consecutive_sql_errors += 1;
+                        tracing::warn!(
+                            error = %e,
+                            consecutive = consecutive_sql_errors,
+                            "[LDB-3020] Embedded stream execution error"
+                        );
+                        if consecutive_sql_errors >= 100 {
+                            tracing::error!(
+                                "[LDB-3021] {} consecutive SQL errors — shutting down embedded pipeline",
+                                consecutive_sql_errors
+                            );
+                            break;
+                        }
                     }
                 }
 

@@ -52,6 +52,8 @@ pub struct TpcPipelineCoordinator {
     next_checkpoint_id: u64,
     /// Last checkpoint time.
     last_checkpoint: Instant,
+    /// Consecutive SQL cycle errors (reset on success).
+    consecutive_sql_errors: u32,
 }
 
 impl TpcPipelineCoordinator {
@@ -89,6 +91,7 @@ impl TpcPipelineCoordinator {
             late_events: 0,
             next_checkpoint_id: 1,
             last_checkpoint: Instant::now(),
+            consecutive_sql_errors: 0,
         })
     }
 
@@ -183,10 +186,25 @@ impl TpcPipelineCoordinator {
                 let wm = callback.current_watermark();
                 match callback.execute_cycle(&self.source_batches_buf, wm).await {
                     Ok(results) => {
+                        self.consecutive_sql_errors = 0;
                         callback.push_to_streams(&results);
                         callback.write_to_sinks(&results).await;
                     }
-                    Err(e) => tracing::warn!(error = %e, "SQL cycle error"),
+                    Err(e) => {
+                        self.consecutive_sql_errors += 1;
+                        tracing::warn!(
+                            error = %e,
+                            consecutive = self.consecutive_sql_errors,
+                            "[LDB-3020] SQL cycle error"
+                        );
+                        if self.consecutive_sql_errors >= 100 {
+                            tracing::error!(
+                                "[LDB-3021] {} consecutive SQL errors — shutting down pipeline",
+                                self.consecutive_sql_errors
+                            );
+                            break;
+                        }
+                    }
                 }
                 #[allow(clippy::cast_possible_truncation)]
                 // Cycle duration will never exceed u64::MAX nanoseconds (~584 years)

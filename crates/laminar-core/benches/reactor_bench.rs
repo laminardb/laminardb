@@ -47,6 +47,7 @@ fn create_test_event(timestamp: i64) -> Event {
 fn bench_reactor_submit(c: &mut Criterion) {
     let config = ReactorConfig::default();
     let mut reactor = Reactor::new(config).unwrap();
+    let mut buf = Vec::new();
 
     let event = create_test_event(12345);
 
@@ -54,7 +55,8 @@ fn bench_reactor_submit(c: &mut Criterion) {
         b.iter(|| {
             let result = reactor.submit(black_box(event.clone()));
             // Clear the queue to avoid filling it up
-            reactor.poll();
+            reactor.poll_into(&mut buf);
+            buf.clear();
             result
         })
     });
@@ -65,13 +67,15 @@ fn bench_reactor_poll_single_event(c: &mut Criterion) {
     let config = ReactorConfig::default();
     let mut reactor = Reactor::new(config).unwrap();
     reactor.add_operator(Box::new(PassthroughOperator));
+    let mut buf = Vec::new();
 
     c.bench_function("reactor_poll_single_event", |b| {
         b.iter(|| {
             let event = create_test_event(12345);
             reactor.submit(event).unwrap();
-            let outputs = reactor.poll();
-            black_box(outputs)
+            reactor.poll_into(&mut buf);
+            black_box(&buf);
+            buf.clear();
         })
     });
 }
@@ -92,6 +96,7 @@ fn bench_reactor_throughput(c: &mut Criterion) {
                 })
                 .unwrap();
                 reactor.add_operator(Box::new(PassthroughOperator));
+                let mut buf = Vec::new();
 
                 // Pre-create events
                 let events: Vec<Event> = (0..batch_size)
@@ -104,8 +109,9 @@ fn bench_reactor_throughput(c: &mut Criterion) {
                         reactor.submit(event.clone()).unwrap();
                     }
                     // Process them all
-                    let outputs = reactor.poll();
-                    black_box(outputs);
+                    reactor.poll_into(&mut buf);
+                    black_box(&buf);
+                    buf.clear();
                 })
             },
         );
@@ -126,6 +132,7 @@ fn bench_reactor_events_per_second(c: &mut Criterion) {
         })
         .unwrap();
         reactor.add_operator(Box::new(PassthroughOperator));
+        let mut buf = Vec::new();
 
         b.iter(|| {
             // Submit 100k events
@@ -134,7 +141,8 @@ fn bench_reactor_events_per_second(c: &mut Criterion) {
             }
             // Process them all
             while reactor.queue_size() > 0 {
-                reactor.poll();
+                reactor.poll_into(&mut buf);
+                buf.clear();
             }
         });
     });
@@ -153,6 +161,7 @@ fn bench_reactor_operator_chain(c: &mut Criterion) {
             |b, &num_operators| {
                 let config = ReactorConfig::default();
                 let mut reactor = Reactor::new(config).unwrap();
+                let mut buf = Vec::new();
 
                 // Add multiple operators
                 for _ in 0..num_operators {
@@ -163,8 +172,9 @@ fn bench_reactor_operator_chain(c: &mut Criterion) {
 
                 b.iter(|| {
                     reactor.submit(black_box(event.clone())).unwrap();
-                    let outputs = reactor.poll();
-                    black_box(outputs)
+                    reactor.poll_into(&mut buf);
+                    black_box(&buf);
+                    buf.clear();
                 })
             },
         );
@@ -177,6 +187,7 @@ fn bench_reactor_timer_performance(c: &mut Criterion) {
     let config = ReactorConfig::default();
     let mut reactor = Reactor::new(config).unwrap();
     reactor.add_operator(Box::new(PassthroughOperator));
+    let mut buf = Vec::new();
 
     c.bench_function("reactor_timer_registration", |b| {
         b.iter(|| {
@@ -185,8 +196,9 @@ fn bench_reactor_timer_performance(c: &mut Criterion) {
             reactor.submit(event).unwrap();
 
             // Process the event (this advances time and fires timers)
-            let outputs = reactor.poll();
-            black_box(outputs)
+            reactor.poll_into(&mut buf);
+            black_box(&buf);
+            buf.clear();
         })
     });
 }
@@ -198,6 +210,6 @@ criterion_group!(
     bench_reactor_throughput,
     bench_reactor_events_per_second,
     bench_reactor_operator_chain,
-    bench_reactor_timer_performance
+    bench_reactor_timer_performance,
 );
 criterion_main!(benches);

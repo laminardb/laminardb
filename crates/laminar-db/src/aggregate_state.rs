@@ -33,6 +33,100 @@ use serde_json::json;
 
 use crate::error::DbError;
 
+// ── Shared group-key helpers ─────────────────────────────────────────
+
+/// Convert an `OwnedRow` back to a `Vec<ScalarValue>` group key,
+/// casting types to match `group_types` when needed.
+///
+/// Used by `IncrementalAggState`, `CoreWindowState`, and `IncrementalEowcState`
+/// to convert from the compact row format back to the `Vec<ScalarValue>` keys
+/// used in the per-group accumulator maps.
+pub(crate) fn row_to_scalar_key_with_types(
+    converter: &arrow::row::RowConverter,
+    row_key: &arrow::row::OwnedRow,
+    group_types: &[DataType],
+) -> Result<Vec<ScalarValue>, DbError> {
+    let row_as_cols = converter
+        .convert_rows(std::iter::once(row_key.row()))
+        .map_err(|e| DbError::Pipeline(format!("row→key: {e}")))?;
+
+    let mut sv_key = Vec::with_capacity(group_types.len());
+    for (col_idx, arr) in row_as_cols.iter().enumerate() {
+        let sv = ScalarValue::try_from_array(arr, 0)
+            .map_err(|e| DbError::Pipeline(format!("group key decode: {e}")))?;
+        if sv.data_type() == group_types[col_idx] {
+            sv_key.push(sv);
+        } else {
+            sv_key.push(sv.cast_to(&group_types[col_idx]).unwrap_or(sv));
+        }
+    }
+    Ok(sv_key)
+}
+
+/// Emit a single window's accumulated state as a `RecordBatch`.
+///
+/// Shared by `CoreWindowState` and `IncrementalEowcState`. Builds columns
+/// for `window_start`, `window_end`, group keys, and aggregate results.
+pub(crate) fn emit_window_batch(
+    window_start: i64,
+    window_end: i64,
+    mut groups: ahash::AHashMap<Vec<ScalarValue>, Vec<Box<dyn datafusion_expr::Accumulator>>>,
+    group_types: &[DataType],
+    agg_specs: &[AggFuncSpec],
+    output_schema: &SchemaRef,
+) -> Result<Option<RecordBatch>, DbError> {
+    let num_rows = groups.len();
+    if num_rows == 0 {
+        return Ok(None);
+    }
+
+    let win_start_array: ArrayRef =
+        Arc::new(arrow::array::Int64Array::from(vec![window_start; num_rows]));
+    let win_end_array: ArrayRef =
+        Arc::new(arrow::array::Int64Array::from(vec![window_end; num_rows]));
+
+    let mut group_arrays: Vec<ArrayRef> = Vec::with_capacity(group_types.len());
+    for (col_idx, dt) in group_types.iter().enumerate() {
+        let scalars: Vec<ScalarValue> = groups.keys().map(|key| key[col_idx].clone()).collect();
+        let array = ScalarValue::iter_to_array(scalars)
+            .map_err(|e| DbError::Pipeline(format!("group key array: {e}")))?;
+        if array.data_type() == dt {
+            group_arrays.push(array);
+        } else {
+            let casted = arrow::compute::cast(&array, dt).unwrap_or(array);
+            group_arrays.push(casted);
+        }
+    }
+
+    let mut agg_arrays: Vec<ArrayRef> = Vec::with_capacity(agg_specs.len());
+    for (agg_idx, spec) in agg_specs.iter().enumerate() {
+        let mut scalars: Vec<ScalarValue> = Vec::with_capacity(num_rows);
+        for accs in groups.values_mut() {
+            let sv = accs[agg_idx]
+                .evaluate()
+                .map_err(|e| DbError::Pipeline(format!("accumulator evaluate: {e}")))?;
+            scalars.push(sv);
+        }
+        let array = ScalarValue::iter_to_array(scalars)
+            .map_err(|e| DbError::Pipeline(format!("agg result array: {e}")))?;
+        if array.data_type() == &spec.return_type {
+            agg_arrays.push(array);
+        } else {
+            let casted = arrow::compute::cast(&array, &spec.return_type).unwrap_or(array);
+            agg_arrays.push(casted);
+        }
+    }
+
+    let mut all_arrays = vec![win_start_array, win_end_array];
+    all_arrays.extend(group_arrays);
+    all_arrays.extend(agg_arrays);
+
+    let batch = RecordBatch::try_new(Arc::clone(output_schema), all_arrays)
+        .map_err(|e| DbError::Pipeline(format!("result batch build: {e}")))?;
+
+    Ok(Some(batch))
+}
+
 // ── ScalarValue JSON encoding ────────────────────────────────────────
 
 /// Encode a `ScalarValue` to a JSON value for checkpoint serialization.
@@ -616,32 +710,21 @@ impl IncrementalAggState {
         Self::update_group_accumulators(accs, batch, &all_indices, &self.agg_specs)
     }
 
-    /// Convert an `OwnedRow` back to a `Vec<ScalarValue>` group key,
-    /// casting types to match `self.group_types` when needed.
+    /// Convert an `OwnedRow` back to a `Vec<ScalarValue>` group key.
     fn row_to_scalar_key(
         &self,
         converter: &arrow::row::RowConverter,
         row_key: &arrow::row::OwnedRow,
     ) -> Result<Vec<ScalarValue>, DbError> {
-        let row_as_cols = converter
-            .convert_rows(std::iter::once(row_key.row()))
-            .map_err(|e| DbError::Pipeline(format!("row→key: {e}")))?;
-
-        let mut sv_key = Vec::with_capacity(self.num_group_cols);
-        for (col_idx, arr) in row_as_cols.iter().enumerate() {
-            let sv = ScalarValue::try_from_array(arr, 0)
-                .map_err(|e| DbError::Pipeline(format!("group key decode: {e}")))?;
-            if sv.data_type() == self.group_types[col_idx] {
-                sv_key.push(sv);
-            } else {
-                sv_key.push(sv.cast_to(&self.group_types[col_idx]).unwrap_or(sv));
-            }
-        }
-        Ok(sv_key)
+        row_to_scalar_key_with_types(converter, row_key, &self.group_types)
     }
 
     /// Update accumulators for a single group given the row indices.
-    fn update_group_accumulators(
+    ///
+    /// Takes a batch and a slice of row indices, does a single `take()` per
+    /// column per accumulator, and feeds the resulting sub-arrays to
+    /// `Accumulator::update_batch`. This avoids per-row allocation.
+    pub(crate) fn update_group_accumulators(
         accs: &mut [Box<dyn datafusion_expr::Accumulator>],
         batch: &RecordBatch,
         indices: &[u32],
