@@ -91,6 +91,10 @@ impl<S: StateStore> StateStore for ChangelogAwareStore<S> {
         self.inner.get(key)
     }
 
+    fn get_ref(&self, key: &[u8]) -> Option<&[u8]> {
+        self.inner.get_ref(key)
+    }
+
     fn put(&mut self, key: &[u8], value: &[u8]) -> Result<(), StateError> {
         self.inner.put(key, value)?;
         // Record the mutation; ignore backpressure (state store is source of truth).
@@ -481,5 +485,23 @@ mod tests {
         store.clear();
         assert_eq!(sink.puts.load(Ordering::Relaxed), 0);
         assert!(store.incremental_snapshot().is_none());
+    }
+
+    #[test]
+    fn test_get_ref_forwarding() {
+        let sink = Arc::new(CountingSink::new());
+        let mut store = ChangelogAwareStore::new(InMemoryStore::new(), sink.clone());
+
+        store.put(b"hello", b"world").unwrap();
+
+        // get_ref should return the value without going through Bytes
+        let val = store.get_ref(b"hello");
+        assert_eq!(val, Some(b"world".as_slice()));
+
+        // Missing key returns None
+        assert!(store.get_ref(b"missing").is_none());
+
+        // get_ref should not record to changelog (reads are not tracked)
+        assert_eq!(sink.puts.load(Ordering::Relaxed), 1); // only the put
     }
 }

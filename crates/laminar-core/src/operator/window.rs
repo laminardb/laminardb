@@ -3328,6 +3328,8 @@ pub struct TumblingWindowOperator<A: Aggregator> {
     output_schema: SchemaRef,
     /// Last emitted events per window for changelog retraction
     last_emitted: FxHashMap<WindowId, Event>,
+    /// Cached Arc for late-data side output name (avoids allocation per late event)
+    side_output_arc: Option<Arc<str>>,
     /// Phantom data for accumulator type
     _phantom: PhantomData<A::Acc>,
 }
@@ -3382,6 +3384,7 @@ where
             operator_id: format!("tumbling_window_{operator_num}"),
             output_schema,
             last_emitted: FxHashMap::default(),
+            side_output_arc: None,
             _phantom: PhantomData,
         }
     }
@@ -3421,6 +3424,7 @@ where
             operator_id,
             output_schema,
             last_emitted: FxHashMap::default(),
+            side_output_arc: None,
             _phantom: PhantomData,
         }
     }
@@ -3761,10 +3765,14 @@ where
 
             // Handle late event based on configuration
             if let Some(side_output_name) = self.late_data_config.side_output() {
-                // Route to named side output
+                // Route to named side output (cached Arc avoids allocation per late event)
                 self.late_data_metrics.record_side_output();
+                let name_arc = self
+                    .side_output_arc
+                    .get_or_insert_with(|| Arc::from(side_output_name))
+                    .clone();
                 output.push(Output::SideOutput(Box::new(SideOutputData {
-                    name: Arc::from(side_output_name),
+                    name: name_arc,
                     event: event.clone(),
                 })));
             } else {

@@ -259,6 +259,18 @@ impl TpcConfig {
                 "outbox_capacity must be > 0".to_string(),
             ));
         }
+        if self.cpu_pinning {
+            let available = std::thread::available_parallelism()
+                .map(std::num::NonZero::get)
+                .unwrap_or(1);
+            let max_cpu = self.cpu_start + self.num_cores;
+            if max_cpu > available {
+                return Err(TpcError::InvalidConfig(format!(
+                    "cpu_start({}) + num_cores({}) = {max_cpu} exceeds available CPUs ({available})",
+                    self.cpu_start, self.num_cores,
+                )));
+            }
+        }
         Ok(())
     }
 }

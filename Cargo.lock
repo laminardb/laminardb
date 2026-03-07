@@ -4666,6 +4666,7 @@ dependencies = [
  "cranelift-jit",
  "cranelift-module",
  "cranelift-native",
+ "crc32c",
  "criterion",
  "crossbeam",
  "datafusion-common",

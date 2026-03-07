@@ -33,7 +33,9 @@ use super::{prefix_successor, StateError, StateSnapshot, StateStore};
 /// slower writes due to dual-map maintenance.
 pub struct AHashMapStore {
     /// Primary data store for O(1) point lookups.
-    data: AHashMap<Vec<u8>, Vec<u8>>,
+    /// Values are `Bytes` so `get()` returns a cheap Arc bump (~2ns) instead
+    /// of `Bytes::copy_from_slice` (alloc + memcpy).
+    data: AHashMap<Vec<u8>, Bytes>,
     /// Sorted index for prefix/range scans (keys only).
     index: BTreeSet<Vec<u8>>,
     /// Track total size in bytes (keys + values).
@@ -71,28 +73,28 @@ impl Default for AHashMapStore {
 impl StateStore for AHashMapStore {
     #[inline]
     fn get(&self, key: &[u8]) -> Option<Bytes> {
-        self.data.get(key).map(|v| Bytes::copy_from_slice(v))
+        self.data.get(key).cloned() // Arc bump ~2ns, not copy
     }
 
     #[inline]
     fn get_ref(&self, key: &[u8]) -> Option<&[u8]> {
-        self.data.get(key).map(Vec::as_slice)
+        self.data.get(key).map(Bytes::as_ref)
     }
 
     #[inline]
     fn put(&mut self, key: &[u8], value: &[u8]) -> Result<(), StateError> {
+        let value_bytes = Bytes::copy_from_slice(value);
         if let Some(old_value) = self.data.get_mut(key) {
             // Update existing: only value size changes, no key allocation
             self.size_bytes -= old_value.len();
             self.size_bytes += value.len();
-            old_value.clear();
-            old_value.extend_from_slice(value);
+            *old_value = value_bytes;
         } else {
             // New key: allocate only on insert path
             self.size_bytes += key.len() + value.len();
             let key_vec = key.to_vec();
             self.index.insert(key_vec.clone());
-            self.data.insert(key_vec, value.to_vec());
+            self.data.insert(key_vec, value_bytes);
         }
         Ok(())
     }
@@ -113,7 +115,7 @@ impl StateStore for AHashMapStore {
         if prefix.is_empty() {
             return Box::new(self.index.iter().map(move |k| {
                 let v = &self.data[k.as_slice()];
-                (Bytes::copy_from_slice(k), Bytes::copy_from_slice(v))
+                (Bytes::copy_from_slice(k), v.clone())
             }));
         }
         if let Some(end) = prefix_successor(prefix) {
@@ -122,7 +124,7 @@ impl StateStore for AHashMapStore {
                     .range::<[u8], _>((Bound::Included(prefix), Bound::Excluded(end.as_slice())))
                     .map(move |k| {
                         let v = &self.data[k.as_slice()];
-                        (Bytes::copy_from_slice(k), Bytes::copy_from_slice(v))
+                        (Bytes::copy_from_slice(k), v.clone())
                     }),
             )
         } else {
@@ -131,7 +133,7 @@ impl StateStore for AHashMapStore {
                     .range::<[u8], _>((Bound::Included(prefix), Bound::Unbounded))
                     .map(move |k| {
                         let v = &self.data[k.as_slice()];
-                        (Bytes::copy_from_slice(k), Bytes::copy_from_slice(v))
+                        (Bytes::copy_from_slice(k), v.clone())
                     }),
             )
         }
@@ -146,7 +148,7 @@ impl StateStore for AHashMapStore {
                 .range::<[u8], _>((Bound::Included(range.start), Bound::Excluded(range.end)))
                 .map(move |k| {
                     let v = &self.data[k.as_slice()];
-                    (Bytes::copy_from_slice(k), Bytes::copy_from_slice(v))
+                    (Bytes::copy_from_slice(k), v.clone())
                 }),
         )
     }
@@ -169,7 +171,7 @@ impl StateStore for AHashMapStore {
             .index
             .iter()
             .map(|k| {
-                let v = self.data[k.as_slice()].clone();
+                let v = self.data[k.as_slice()].to_vec();
                 (k.clone(), v)
             })
             .collect();
@@ -184,7 +186,7 @@ impl StateStore for AHashMapStore {
         for (key, value) in snapshot.data() {
             self.size_bytes += key.len() + value.len();
             self.index.insert(key.clone());
-            self.data.insert(key.clone(), value.clone());
+            self.data.insert(key.clone(), Bytes::copy_from_slice(value));
         }
     }
 

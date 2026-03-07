@@ -232,19 +232,20 @@ pub fn split_predicates(
 /// A SQL string fragment like `"column = 42"` or `"column IN (1, 2, 3)"`.
 #[must_use]
 pub fn predicate_to_sql(predicate: &Predicate) -> String {
+    let q = |col: &str| col.replace('"', "\"\"");
     match predicate {
-        Predicate::Eq { column, value } => format!("{column} = {value}"),
-        Predicate::NotEq { column, value } => format!("{column} != {value}"),
-        Predicate::Lt { column, value } => format!("{column} < {value}"),
-        Predicate::LtEq { column, value } => format!("{column} <= {value}"),
-        Predicate::Gt { column, value } => format!("{column} > {value}"),
-        Predicate::GtEq { column, value } => format!("{column} >= {value}"),
+        Predicate::Eq { column, value } => format!("\"{}\" = {value}", q(column)),
+        Predicate::NotEq { column, value } => format!("\"{}\" != {value}", q(column)),
+        Predicate::Lt { column, value } => format!("\"{}\" < {value}", q(column)),
+        Predicate::LtEq { column, value } => format!("\"{}\" <= {value}", q(column)),
+        Predicate::Gt { column, value } => format!("\"{}\" > {value}", q(column)),
+        Predicate::GtEq { column, value } => format!("\"{}\" >= {value}", q(column)),
         Predicate::In { column, values } => {
             let vals: Vec<String> = values.iter().map(ToString::to_string).collect();
-            format!("{column} IN ({})", vals.join(", "))
+            format!("\"{}\" IN ({})", q(column), vals.join(", "))
         }
-        Predicate::IsNull { column } => format!("{column} IS NULL"),
-        Predicate::IsNotNull { column } => format!("{column} IS NOT NULL"),
+        Predicate::IsNull { column } => format!("\"{}\" IS NULL", q(column)),
+        Predicate::IsNotNull { column } => format!("\"{}\" IS NOT NULL", q(column)),
     }
 }
 
@@ -283,7 +284,7 @@ mod tests {
                 column: "id".into(),
                 value: ScalarValue::Int64(42),
             }),
-            "id = 42"
+            "\"id\" = 42"
         );
 
         assert_eq!(
@@ -294,14 +295,23 @@ mod tests {
                     ScalarValue::Utf8("pending".into()),
                 ],
             }),
-            "status IN ('active', 'pending')"
+            "\"status\" IN ('active', 'pending')"
+        );
+
+        // Reserved word column name
+        assert_eq!(
+            predicate_to_sql(&Predicate::Gt {
+                column: "order".into(),
+                value: ScalarValue::Int64(10),
+            }),
+            "\"order\" > 10"
         );
 
         assert_eq!(
             predicate_to_sql(&Predicate::IsNull {
                 column: "deleted_at".into(),
             }),
-            "deleted_at IS NULL"
+            "\"deleted_at\" IS NULL"
         );
     }
 

@@ -208,7 +208,9 @@ impl TpcPipelineCoordinator {
                     Output::CheckpointComplete(data) => {
                         tracing::debug!(
                             checkpoint_id = data.checkpoint_id,
-                            "core checkpoint complete"
+                            operators = data.operator_states.len(),
+                            "core checkpoint complete (operator states not yet persisted — \
+                             cores currently run no operators)"
                         );
                     }
                     Output::LateEvent(_event) => {

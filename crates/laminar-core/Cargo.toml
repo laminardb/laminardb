@@ -58,6 +58,9 @@ arrow-cast = { workspace = true }
 arrow-ipc = { workspace = true }
 chrono = { workspace = true }
 
+# Integrity
+crc32c = "0.6"
+
 # Error handling
 thiserror = { workspace = true }
 anyhow = { workspace = true }

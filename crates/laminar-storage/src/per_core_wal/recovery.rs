@@ -70,16 +70,38 @@ impl PerCoreRecoveryManager {
     ///
     /// Returns an error if recovery fails.
     pub fn recover(&self) -> Result<PerCoreRecoveredState, PerCoreWalError> {
+        self.recover_from_positions(&[])
+    }
+
+    /// Recovers state using checkpoint-stored per-core WAL positions.
+    ///
+    /// If `positions` matches `num_cores`, replay starts from those positions
+    /// instead of the beginning. On mismatch, falls back to full replay.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error if checkpoint recovery or WAL replay fails.
+    pub fn recover_from_positions(
+        &self,
+        positions: &[u64],
+    ) -> Result<PerCoreRecoveredState, PerCoreWalError> {
         // 1. Recover base state from checkpoint
         let recovery_manager = RecoveryManager::new(self.recovery_config.clone());
         let base_state = recovery_manager.recover()?;
 
         // 2. Determine starting positions for each segment.
-        // Per-core WAL positions are not yet stored in the checkpoint
-        // (RecoveredState carries only a single WAL position). Until
-        // the checkpoint format includes per-core positions, replay
-        // from the start — this is safe (idempotent) but slower.
-        let starting_positions = vec![0u64; self.wal_config.num_cores];
+        let starting_positions = if positions.len() == self.wal_config.num_cores {
+            positions.to_vec()
+        } else {
+            if !positions.is_empty() {
+                tracing::warn!(
+                    expected = self.wal_config.num_cores,
+                    got = positions.len(),
+                    "Per-core WAL position count mismatch, replaying from 0"
+                );
+            }
+            vec![0u64; self.wal_config.num_cores]
+        };
 
         // 3. Read and merge WAL segments
         let (entries, wal_positions) = self.read_all_segments(&starting_positions)?;

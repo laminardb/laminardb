@@ -111,11 +111,15 @@ enum Storage {
 
 impl Storage {
     /// Get a slice of data at the given offset and length.
-    fn get(&self, offset: usize, len: usize) -> &[u8] {
+    ///
+    /// Returns `None` if the offset+length is out of bounds (e.g., corrupted index).
+    fn get(&self, offset: usize, len: usize) -> Option<&[u8]> {
+        let end = offset.checked_add(len)?;
         match self {
-            Storage::Arena { data, .. } => &data[offset..offset + len],
+            Storage::Arena { data, .. } => data.get(offset..end),
             Storage::Mmap { mmap, .. } => {
-                &mmap[MMAP_HEADER_SIZE + offset..MMAP_HEADER_SIZE + offset + len]
+                let start = MMAP_HEADER_SIZE.checked_add(offset)?;
+                mmap.get(start..start.checked_add(len)?)
             }
         }
     }
@@ -412,9 +416,9 @@ impl MmapStateStore {
         let live_data: Vec<(Vec<u8>, Vec<u8>)> = self
             .index
             .iter()
-            .map(|(k, entry)| {
-                let value = self.storage.get(entry.offset, entry.len).to_vec();
-                (k.clone(), value)
+            .filter_map(|(k, entry)| {
+                let value = self.storage.get(entry.offset, entry.len)?;
+                Some((k.clone(), value.to_vec()))
             })
             .collect();
 
@@ -543,9 +547,9 @@ impl MmapStateStore {
 impl StateStore for MmapStateStore {
     #[inline]
     fn get(&self, key: &[u8]) -> Option<Bytes> {
-        self.index.get(key).map(|entry| {
-            let data = self.storage.get(entry.offset, entry.len);
-            Bytes::copy_from_slice(data)
+        self.index.get(key).and_then(|entry| {
+            let data = self.storage.get(entry.offset, entry.len)?;
+            Some(Bytes::copy_from_slice(data))
         })
     }
 
@@ -553,7 +557,7 @@ impl StateStore for MmapStateStore {
     fn get_ref(&self, key: &[u8]) -> Option<&[u8]> {
         self.index
             .get(key)
-            .map(|entry| self.storage.get(entry.offset, entry.len))
+            .and_then(|entry| self.storage.get(entry.offset, entry.len))
     }
 
     #[inline]
@@ -576,6 +580,15 @@ impl StateStore for MmapStateStore {
             self.size_bytes += key.len() + value.len();
             self.index.insert(key.to_vec(), entry);
         }
+
+        // Auto-compact when fragmentation exceeds 50% and store is non-trivial.
+        // Failure is non-fatal — the store is still correct, just wastes space.
+        if self.len() > 100 && self.fragmentation() > 0.5 {
+            if let Err(e) = self.compact() {
+                tracing::warn!(error = %e, "mmap auto-compact failed, will retry later");
+            }
+        }
+
         Ok(())
     }
 
@@ -593,27 +606,27 @@ impl StateStore for MmapStateStore {
         prefix: &'a [u8],
     ) -> Box<dyn Iterator<Item = (Bytes, Bytes)> + 'a> {
         if prefix.is_empty() {
-            return Box::new(self.index.iter().map(|(k, entry)| {
-                let value = self.storage.get(entry.offset, entry.len);
-                (Bytes::copy_from_slice(k), Bytes::copy_from_slice(value))
+            return Box::new(self.index.iter().filter_map(|(k, entry)| {
+                let value = self.storage.get(entry.offset, entry.len)?;
+                Some((Bytes::copy_from_slice(k), Bytes::copy_from_slice(value)))
             }));
         }
         if let Some(end) = prefix_successor(prefix) {
             Box::new(
                 self.index
                     .range::<[u8], _>((Bound::Included(prefix), Bound::Excluded(end.as_slice())))
-                    .map(|(k, entry)| {
-                        let value = self.storage.get(entry.offset, entry.len);
-                        (Bytes::copy_from_slice(k), Bytes::copy_from_slice(value))
+                    .filter_map(|(k, entry)| {
+                        let value = self.storage.get(entry.offset, entry.len)?;
+                        Some((Bytes::copy_from_slice(k), Bytes::copy_from_slice(value)))
                     }),
             )
         } else {
             Box::new(
                 self.index
                     .range::<[u8], _>((Bound::Included(prefix), Bound::Unbounded))
-                    .map(|(k, entry)| {
-                        let value = self.storage.get(entry.offset, entry.len);
-                        (Bytes::copy_from_slice(k), Bytes::copy_from_slice(value))
+                    .filter_map(|(k, entry)| {
+                        let value = self.storage.get(entry.offset, entry.len)?;
+                        Some((Bytes::copy_from_slice(k), Bytes::copy_from_slice(value)))
                     }),
             )
         }
@@ -626,9 +639,9 @@ impl StateStore for MmapStateStore {
         Box::new(
             self.index
                 .range::<[u8], _>((Bound::Included(range.start), Bound::Excluded(range.end)))
-                .map(|(k, entry)| {
-                    let value = self.storage.get(entry.offset, entry.len);
-                    (Bytes::copy_from_slice(k), Bytes::copy_from_slice(value))
+                .filter_map(|(k, entry)| {
+                    let value = self.storage.get(entry.offset, entry.len)?;
+                    Some((Bytes::copy_from_slice(k), Bytes::copy_from_slice(value)))
                 }),
         )
     }
@@ -650,9 +663,9 @@ impl StateStore for MmapStateStore {
         let data: Vec<(Vec<u8>, Vec<u8>)> = self
             .index
             .iter()
-            .map(|(k, entry)| {
-                let value = self.storage.get(entry.offset, entry.len).to_vec();
-                (k.clone(), value)
+            .filter_map(|(k, entry)| {
+                let value = self.storage.get(entry.offset, entry.len)?;
+                Some((k.clone(), value.to_vec()))
             })
             .collect();
         StateSnapshot::new(data)

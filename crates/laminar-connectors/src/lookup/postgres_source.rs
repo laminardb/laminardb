@@ -427,7 +427,7 @@ mod tests {
             None,
         );
         assert!(sql.contains("id = ANY($1)"));
-        assert!(sql.contains("region = 'APAC'"));
+        assert!(sql.contains("\"region\" = 'APAC'"));
         assert!(sql.contains(" AND "));
     }
 
@@ -512,9 +512,9 @@ mod tests {
         // NotEq should NOT appear in the SQL
         assert!(!sql.contains("!="));
         assert!(!sql.contains("region"));
-        // Eq and Gt should be present
-        assert!(sql.contains("status = 'active'"));
-        assert!(sql.contains("score > 100"));
+        // Eq and Gt should be present (column names are now double-quoted)
+        assert!(sql.contains("\"status\" = 'active'"));
+        assert!(sql.contains("\"score\" > 100"));
     }
 
     #[test]

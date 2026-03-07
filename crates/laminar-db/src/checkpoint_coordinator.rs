@@ -301,6 +301,9 @@ pub struct CheckpointCoordinator {
     total_bytes_written: u64,
     /// Number of checkpoints completed in unaligned mode.
     unaligned_checkpoint_count: u64,
+    /// WAL positions from the previous checkpoint, used as a truncation
+    /// safety buffer — we keep one checkpoint's worth of WAL replay data.
+    previous_wal_positions: Option<Vec<u64>>,
 }
 
 impl CheckpointCoordinator {
@@ -333,6 +336,7 @@ impl CheckpointCoordinator {
             smoothed_duration_ms: 0.0,
             total_bytes_written: 0,
             unaligned_checkpoint_count: 0,
+            previous_wal_positions: None,
         }
     }
 
@@ -498,12 +502,25 @@ impl CheckpointCoordinator {
     /// # Errors
     ///
     /// Returns `DbError::Checkpoint` if truncation fails.
-    pub fn truncate_wal_after_checkpoint(&mut self) -> Result<(), DbError> {
+    pub fn truncate_wal_after_checkpoint(
+        &mut self,
+        current_positions: Vec<u64>,
+    ) -> Result<(), DbError> {
         if let Some(ref mut wal) = self.wal_manager {
-            wal.reset_all()
-                .map_err(|e| DbError::Checkpoint(format!("WAL truncation failed: {e}")))?;
-            debug!("WAL segments truncated after checkpoint");
+            if let Some(ref prev) = self.previous_wal_positions {
+                // Truncate to previous checkpoint's positions, keeping one
+                // checkpoint's worth of WAL data as a safety buffer.
+                wal.truncate_all(prev)
+                    .map_err(|e| DbError::Checkpoint(format!("WAL truncation failed: {e}")))?;
+                debug!("WAL segments truncated to previous checkpoint positions");
+            } else {
+                // First checkpoint — no previous positions, truncate to 0.
+                wal.reset_all()
+                    .map_err(|e| DbError::Checkpoint(format!("WAL truncation failed: {e}")))?;
+                debug!("WAL segments reset after first checkpoint");
+            }
         }
+        self.previous_wal_positions = Some(current_positions);
         Ok(())
     }
 
@@ -745,6 +762,29 @@ impl CheckpointCoordinator {
             Err(_elapsed) => Err(DbError::Checkpoint(format!(
                 "[LDB-6011] manifest persist timed out after {}s — \
                  filesystem may be degraded",
+                timeout_dur.as_secs()
+            ))),
+        }
+    }
+
+    /// Overwrites an existing manifest with updated fields (e.g., sink commit
+    /// statuses after Step 6). Uses [`CheckpointStore::update_manifest`] which
+    /// does NOT use conditional PUT, so the overwrite always succeeds.
+    async fn update_manifest_only(&self, manifest: &CheckpointManifest) -> Result<(), DbError> {
+        let store = Arc::clone(&self.store);
+        let manifest = manifest.clone();
+        let timeout_dur = self.config.persist_timeout;
+
+        let task = tokio::task::spawn_blocking(move || store.update_manifest(&manifest));
+
+        match tokio::time::timeout(timeout_dur, task).await {
+            Ok(Ok(Ok(()))) => Ok(()),
+            Ok(Ok(Err(e))) => Err(DbError::Checkpoint(format!("manifest update failed: {e}"))),
+            Ok(Err(join_err)) => Err(DbError::Checkpoint(format!(
+                "manifest update task failed: {join_err}"
+            ))),
+            Err(_elapsed) => Err(DbError::Checkpoint(format!(
+                "manifest update timed out after {}s",
                 timeout_dur.as_secs()
             ))),
         }
@@ -1127,10 +1167,10 @@ impl CheckpointCoordinator {
             .values()
             .any(|s| matches!(s, SinkCommitStatus::Failed(_)));
 
-        // ── Step 6b: Save manifest again with final sink commit statuses ──
+        // ── Step 6b: Overwrite manifest with final sink commit statuses ──
         if !sink_statuses.is_empty() {
             manifest.sink_commit_statuses = sink_statuses;
-            if let Err(e) = self.save_manifest(manifest, None).await {
+            if let Err(e) = self.update_manifest_only(&manifest).await {
                 warn!(
                     checkpoint_id,
                     epoch,
@@ -1142,7 +1182,20 @@ impl CheckpointCoordinator {
 
         if has_failures {
             self.checkpoints_failed += 1;
-            warn!(checkpoint_id, epoch, "sink commit partially failed");
+            error!(
+                checkpoint_id,
+                epoch, "sink commit partially failed — epoch NOT advanced, will retry"
+            );
+            self.phase = CheckpointPhase::Idle;
+            let duration = start.elapsed();
+            self.emit_checkpoint_metrics(false, epoch, duration);
+            return Ok(CheckpointResult {
+                success: false,
+                checkpoint_id,
+                epoch,
+                duration,
+                error: Some("partial sink commit failure".into()),
+            });
         }
 
         // ── Step 7: Clear changelog drainer pending buffers ──
@@ -1789,7 +1842,7 @@ mod tests {
         let mut coord = make_coordinator(dir.path());
 
         // Without a WAL manager, truncation is a no-op.
-        coord.truncate_wal_after_checkpoint().unwrap();
+        coord.truncate_wal_after_checkpoint(vec![]).unwrap();
     }
 
     #[test]
@@ -1814,8 +1867,50 @@ mod tests {
         assert!(coord.wal_manager().unwrap().total_size() > 0);
 
         // Truncate
-        coord.truncate_wal_after_checkpoint().unwrap();
+        coord.truncate_wal_after_checkpoint(vec![]).unwrap();
         assert_eq!(coord.wal_manager().unwrap().total_size(), 0);
+    }
+
+    #[test]
+    fn test_truncate_wal_safety_buffer() {
+        let dir = tempfile::tempdir().unwrap();
+        let mut coord = make_coordinator(dir.path());
+
+        let wal_dir = dir.path().join("wal");
+        std::fs::create_dir_all(&wal_dir).unwrap();
+        let wal_config = laminar_storage::per_core_wal::PerCoreWalConfig::new(&wal_dir, 2);
+        let wal = laminar_storage::per_core_wal::PerCoreWalManager::new(wal_config).unwrap();
+        coord.register_wal_manager(wal);
+
+        // Write some data before first checkpoint
+        coord
+            .wal_manager_mut()
+            .unwrap()
+            .writer(0)
+            .append_put(b"k1", b"v1")
+            .unwrap();
+
+        // First truncation (no previous positions) — resets to 0
+        coord.truncate_wal_after_checkpoint(vec![100, 200]).unwrap();
+        assert_eq!(coord.wal_manager().unwrap().total_size(), 0);
+
+        // Write more data
+        coord
+            .wal_manager_mut()
+            .unwrap()
+            .writer(0)
+            .append_put(b"k2", b"v2")
+            .unwrap();
+        let size_after_write = coord.wal_manager().unwrap().total_size();
+        assert!(size_after_write > 0);
+
+        // Second truncation — truncates to previous positions (100, 200),
+        // not to 0. Since actual WAL positions are smaller than 100, this
+        // effectively keeps all current data as safety buffer.
+        coord.truncate_wal_after_checkpoint(vec![300, 400]).unwrap();
+        // Data should still be present (positions 100,200 are beyond what
+        // was written, so truncation is a no-op for the data range)
+        assert!(coord.wal_manager().unwrap().total_size() > 0);
     }
 
     #[test]
@@ -1888,7 +1983,7 @@ mod tests {
         assert_eq!(loaded.per_core_wal_positions.len(), 2);
 
         // Truncate WAL
-        coord.truncate_wal_after_checkpoint().unwrap();
+        coord.truncate_wal_after_checkpoint(vec![]).unwrap();
         assert_eq!(coord.wal_manager().unwrap().total_size(), 0);
     }
 

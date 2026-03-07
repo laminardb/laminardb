@@ -133,27 +133,26 @@ pub struct RecoveryManager<'a> {
 impl<'a> RecoveryManager<'a> {
     /// Creates a new recovery manager using the given checkpoint store.
     ///
-    /// Uses lenient mode by default: source/sink restore failures are
-    /// recorded but do not abort recovery. Use [`Self::strict`] for
-    /// strict mode.
+    /// Defaults to strict mode: any source/sink restore failure aborts
+    /// the entire recovery. Use [`Self::lenient`] to allow partial recovery.
     #[must_use]
     pub fn new(store: &'a dyn CheckpointStore) -> Self {
         Self {
             store,
-            strict: false,
+            strict: true,
         }
     }
 
-    /// Creates a strict recovery manager.
+    /// Creates a lenient recovery manager.
     ///
-    /// In strict mode, any source or sink restore failure aborts the
-    /// entire recovery and returns an error. Use this when exactly-once
-    /// semantics are critical and partial recovery is unacceptable.
+    /// In lenient mode, source/sink restore failures are logged and
+    /// recorded in `RecoveredState` but do not abort recovery. The
+    /// pipeline resumes with potentially mismatched offsets.
     #[must_use]
-    pub fn strict(store: &'a dyn CheckpointStore) -> Self {
+    pub fn lenient(store: &'a dyn CheckpointStore) -> Self {
         Self {
             store,
-            strict: true,
+            strict: false,
         }
     }
 

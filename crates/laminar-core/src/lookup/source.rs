@@ -195,7 +195,8 @@ fn compare_column_scalar(
         &dyn arrow_array::Datum,
     ) -> Result<BooleanArray, arrow::error::ArrowError>,
 ) -> Option<BooleanArray> {
-    use arrow_array::{Float64Array, Int64Array, Scalar, StringArray};
+    use arrow_array::types::{TimestampMicrosecondType, TimestampMillisecondType};
+    use arrow_array::{Float64Array, Int64Array, PrimitiveArray, Scalar, StringArray};
 
     let idx = batch.schema().index_of(column).ok()?;
     let col = batch.column(idx);
@@ -204,6 +205,23 @@ fn compare_column_scalar(
         ScalarValue::Float64(v) => cmp_fn(col, &Scalar::new(Float64Array::from(vec![*v]))).ok(),
         ScalarValue::Utf8(v) => cmp_fn(col, &Scalar::new(StringArray::from(vec![v.as_str()]))).ok(),
         ScalarValue::Bool(v) => cmp_fn(col, &Scalar::new(BooleanArray::from(vec![*v]))).ok(),
+        ScalarValue::Timestamp(us) => {
+            if col
+                .as_any()
+                .is::<PrimitiveArray<TimestampMicrosecondType>>()
+            {
+                let scalar = PrimitiveArray::<TimestampMicrosecondType>::from(vec![*us]);
+                cmp_fn(col, &Scalar::new(scalar)).ok()
+            } else if col
+                .as_any()
+                .is::<PrimitiveArray<TimestampMillisecondType>>()
+            {
+                let scalar = PrimitiveArray::<TimestampMillisecondType>::from(vec![*us / 1000]);
+                cmp_fn(col, &Scalar::new(scalar)).ok()
+            } else {
+                None
+            }
+        }
         _ => None,
     }
 }
@@ -639,5 +657,54 @@ mod tests {
         assert!(mask.value(0));
         assert!(!mask.value(1));
         assert!(mask.value(2));
+    }
+
+    #[test]
+    fn test_evaluate_predicate_timestamp_microsecond() {
+        use arrow_array::types::TimestampMicrosecondType;
+        use arrow_array::PrimitiveArray;
+
+        let schema = Arc::new(Schema::new(vec![Field::new(
+            "ts",
+            DataType::Timestamp(arrow_schema::TimeUnit::Microsecond, None),
+            false,
+        )]));
+        let ts_arr: PrimitiveArray<TimestampMicrosecondType> =
+            vec![1_000_000i64, 2_000_000, 3_000_000].into();
+        let batch = RecordBatch::try_new(schema, vec![Arc::new(ts_arr)]).unwrap();
+
+        let pred = Predicate::Eq {
+            column: "ts".into(),
+            value: ScalarValue::Timestamp(2_000_000),
+        };
+        let mask = evaluate_predicate(&batch, &pred).unwrap();
+        assert!(!mask.value(0));
+        assert!(mask.value(1));
+        assert!(!mask.value(2));
+    }
+
+    #[test]
+    fn test_evaluate_predicate_timestamp_millisecond() {
+        use arrow_array::types::TimestampMillisecondType;
+        use arrow_array::PrimitiveArray;
+
+        let schema = Arc::new(Schema::new(vec![Field::new(
+            "ts",
+            DataType::Timestamp(arrow_schema::TimeUnit::Millisecond, None),
+            false,
+        )]));
+        // Column values in milliseconds
+        let ts_arr: PrimitiveArray<TimestampMillisecondType> = vec![1_000i64, 2_000, 3_000].into();
+        let batch = RecordBatch::try_new(schema, vec![Arc::new(ts_arr)]).unwrap();
+
+        // ScalarValue::Timestamp is in microseconds — 2_000_000 us = 2_000 ms
+        let pred = Predicate::Gt {
+            column: "ts".into(),
+            value: ScalarValue::Timestamp(2_000_000),
+        };
+        let mask = evaluate_predicate(&batch, &pred).unwrap();
+        assert!(!mask.value(0)); // 1000 ms > 2000 ms = false
+        assert!(!mask.value(1)); // 2000 ms > 2000 ms = false
+        assert!(mask.value(2)); // 3000 ms > 2000 ms = true
     }
 }

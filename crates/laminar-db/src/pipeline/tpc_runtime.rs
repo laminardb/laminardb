@@ -28,6 +28,8 @@ pub struct TpcRuntime {
     next_core: usize,
     has_new_data: Arc<std::sync::atomic::AtomicBool>,
     output_notify: Arc<tokio::sync::Notify>,
+    /// Tracks whether each core already has a source attached (SPSC invariant).
+    core_has_source: Vec<bool>,
 }
 
 impl TpcRuntime {
@@ -69,6 +71,7 @@ impl TpcRuntime {
             )?);
         }
 
+        let core_count = cores.len();
         Ok(Self {
             cores,
             source_threads: Vec::new(),
@@ -77,12 +80,19 @@ impl TpcRuntime {
             next_core: 0,
             has_new_data,
             output_notify,
+            core_has_source: vec![false; core_count],
         })
     }
 
     /// Attach a source to a core, spawning an I/O thread.
     ///
     /// Sources are assigned to cores in round-robin order.
+    ///
+    /// # Panics
+    ///
+    /// Panics if a core already has a source attached (SPSC invariant).
+    /// Ensure `num_cores >= num_sources`.
+    ///
     /// # Errors
     ///
     /// Returns `std::io::Error` if the source I/O thread cannot be spawned.
@@ -95,6 +105,12 @@ impl TpcRuntime {
         pipeline_config: &PipelineConfig,
     ) -> std::io::Result<()> {
         let core_id = self.next_core % self.cores.len();
+        assert!(
+            !self.core_has_source[core_id],
+            "SPSC violation: core {core_id} already has a source attached. \
+             Ensure num_cores >= num_sources."
+        );
+        self.core_has_source[core_id] = true;
         self.next_core += 1;
 
         let target_inbox = Arc::clone(self.cores[core_id].inbox());
@@ -158,10 +174,12 @@ impl TpcRuntime {
             }
         }
 
-        // Shutdown core threads
+        // Shutdown core threads and join them (Drop impl joins on take)
         for core in &self.cores {
             core.shutdown();
         }
+        // Drain cores to trigger Drop (which joins the threads)
+        self.cores.drain(..);
 
         connectors
     }

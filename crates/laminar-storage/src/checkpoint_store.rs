@@ -171,6 +171,23 @@ pub trait CheckpointStore: Send + Sync {
     /// Returns [`CheckpointStoreError`] on I/O failure.
     fn prune(&self, keep_count: usize) -> Result<usize, CheckpointStoreError>;
 
+    /// Overwrites an existing checkpoint manifest.
+    ///
+    /// Used by Step 6b of the checkpoint protocol to update sink commit
+    /// statuses after the initial `save()`. Unlike `save()`, this does NOT
+    /// use conditional PUT — it unconditionally overwrites the manifest.
+    ///
+    /// The default implementation delegates to `save()`, which is correct
+    /// for backends where `save()` is idempotent (e.g., filesystem with
+    /// write-to-temp + rename).
+    ///
+    /// # Errors
+    ///
+    /// Returns [`CheckpointStoreError`] on I/O or serialization failure.
+    fn update_manifest(&self, manifest: &CheckpointManifest) -> Result<(), CheckpointStoreError> {
+        self.save(manifest)
+    }
+
     /// Writes large operator state data to a sidecar file for a given checkpoint.
     ///
     /// # Errors
@@ -238,6 +255,17 @@ pub trait CheckpointStore: Send + Sync {
                     issues.push("state.bin referenced by checksum but not found".into());
                 }
             }
+        }
+
+        // epoch=0 or checkpoint_id=0 indicates a corrupted or nonsensical
+        // manifest — reject as invalid regardless of other issues.
+        if manifest.epoch == 0 || manifest.checkpoint_id == 0 {
+            issues.push("epoch or checkpoint_id is 0 — likely corrupted".into());
+            return Ok(ValidationResult {
+                checkpoint_id: id,
+                valid: false,
+                issues,
+            });
         }
 
         let valid =
@@ -877,6 +905,21 @@ impl CheckpointStore for ObjectStoreCheckpointStore {
                 );
             }
         }
+
+        Ok(())
+    }
+
+    fn update_manifest(&self, manifest: &CheckpointManifest) -> Result<(), CheckpointStoreError> {
+        let json = serde_json::to_string_pretty(manifest)?;
+        let path = self.manifest_path(manifest.checkpoint_id);
+        let payload = PutPayload::from_bytes(bytes::Bytes::from(json));
+
+        // Unconditional PUT — overwrites the existing manifest.
+        self.rt.block_on(async {
+            self.store
+                .put_opts(&path, payload, PutOptions::default())
+                .await
+        })?;
 
         Ok(())
     }
@@ -1585,6 +1628,81 @@ mod tests {
     }
 
     #[test]
+    fn test_obj_update_manifest_overwrites() {
+        use crate::checkpoint_manifest::SinkCommitStatus;
+
+        let store = make_obj_store();
+
+        // Step 5: initial save with Pending sink status
+        let mut m = make_manifest(1, 10);
+        m.sink_commit_statuses
+            .insert("pg-sink".into(), SinkCommitStatus::Pending);
+        store.save(&m).unwrap();
+
+        // Verify Pending persisted
+        let loaded = store.load_by_id(1).unwrap().unwrap();
+        assert_eq!(
+            loaded.sink_commit_statuses.get("pg-sink"),
+            Some(&SinkCommitStatus::Pending)
+        );
+
+        // Step 6b: update manifest with Committed status
+        m.sink_commit_statuses
+            .insert("pg-sink".into(), SinkCommitStatus::Committed);
+        store.update_manifest(&m).unwrap();
+
+        // Verify Committed persisted (the bug: save() would skip this)
+        let loaded = store.load_by_id(1).unwrap().unwrap();
+        assert_eq!(
+            loaded.sink_commit_statuses.get("pg-sink"),
+            Some(&SinkCommitStatus::Committed)
+        );
+    }
+
+    #[test]
+    fn test_obj_save_still_uses_conditional_put() {
+        let store = make_obj_store();
+
+        let m = make_manifest(1, 10);
+        store.save(&m).unwrap();
+
+        // Second save() with same ID skips (conditional PUT)
+        // but does not error
+        store.save(&m).unwrap();
+
+        // update_manifest() with same ID overwrites
+        let mut m2 = make_manifest(1, 10);
+        m2.watermark = Some(42);
+        store.update_manifest(&m2).unwrap();
+
+        let loaded = store.load_by_id(1).unwrap().unwrap();
+        assert_eq!(loaded.watermark, Some(42));
+    }
+
+    #[test]
+    fn test_fs_update_manifest_overwrites() {
+        use crate::checkpoint_manifest::SinkCommitStatus;
+
+        let dir = tempfile::tempdir().unwrap();
+        let store = make_store(dir.path());
+
+        let mut m = make_manifest(1, 10);
+        m.sink_commit_statuses
+            .insert("sink-a".into(), SinkCommitStatus::Pending);
+        store.save(&m).unwrap();
+
+        m.sink_commit_statuses
+            .insert("sink-a".into(), SinkCommitStatus::Committed);
+        store.update_manifest(&m).unwrap();
+
+        let loaded = store.load_by_id(1).unwrap().unwrap();
+        assert_eq!(
+            loaded.sink_commit_statuses.get("sink-a"),
+            Some(&SinkCommitStatus::Committed)
+        );
+    }
+
+    #[test]
     fn test_obj_v1_state_backward_compat() {
         let inner = Arc::new(object_store::memory::InMemory::new());
         let rt = tokio::runtime::Builder::new_current_thread()
@@ -1704,6 +1822,24 @@ mod tests {
         let result = store.validate_checkpoint(1).unwrap();
         assert!(result.valid, "valid checkpoint: {:?}", result.issues);
         assert!(result.issues.is_empty());
+    }
+
+    #[test]
+    fn test_validate_checkpoint_epoch_zero_invalid() {
+        let dir = tempfile::tempdir().unwrap();
+        let store = make_store(dir.path());
+
+        // Manually save a manifest with epoch=0 (bypassing normal creation)
+        let m = make_manifest(1, 0);
+        store.save(&m).unwrap();
+
+        let result = store.validate_checkpoint(1).unwrap();
+        assert!(!result.valid, "epoch=0 should be invalid");
+        assert!(
+            result.issues.iter().any(|i| i.contains("epoch")),
+            "should mention epoch: {:?}",
+            result.issues
+        );
     }
 
     #[test]

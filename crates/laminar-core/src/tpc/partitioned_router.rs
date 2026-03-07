@@ -29,6 +29,8 @@ pub struct PartitionedRouter {
     core_rows: Vec<Vec<u32>>,
     /// Reusable result buffer.
     result_buf: Vec<(usize, RecordBatch)>,
+    /// Round-robin counter for `KeySpec::RoundRobin`.
+    rr_counter: usize,
 }
 
 impl PartitionedRouter {
@@ -45,6 +47,7 @@ impl PartitionedRouter {
             num_cores,
             core_rows: (0..num_cores).map(|_| Vec::with_capacity(256)).collect(),
             result_buf: Vec::with_capacity(num_cores),
+            rr_counter: 0,
         }
     }
 
@@ -66,8 +69,9 @@ impl PartitionedRouter {
 
         match &self.key_spec {
             KeySpec::RoundRobin => {
-                // Round-robin: not partitioned, return as-is to core 0
-                Ok(vec![(0, batch.clone())])
+                let core = self.rr_counter % self.num_cores;
+                self.rr_counter += 1;
+                Ok(vec![(core, batch.clone())])
             }
             KeySpec::Columns(names) => {
                 let indices: Vec<usize> = names
@@ -184,6 +188,18 @@ fn hash_array_value(
         a.value(row).hash(hasher);
     } else if let Some(a) = array.as_boolean_opt() {
         a.value(row).hash(hasher);
+    } else if let Some(a) = array.as_primitive_opt::<arrow_array::types::TimestampMillisecondType>()
+    {
+        a.value(row).hash(hasher);
+    } else if let Some(a) = array.as_primitive_opt::<arrow_array::types::TimestampMicrosecondType>()
+    {
+        a.value(row).hash(hasher);
+    } else if let Some(a) = array.as_primitive_opt::<arrow_array::types::Date32Type>() {
+        a.value(row).hash(hasher);
+    } else if let Some(a) = array.as_primitive_opt::<arrow_array::types::Date64Type>() {
+        a.value(row).hash(hasher);
+    } else if let Some(a) = array.as_primitive_opt::<arrow_array::types::Decimal128Type>() {
+        a.value(row).hash(hasher);
     } else {
         return Err(RouterError::UnsupportedDataType);
     }
@@ -235,14 +251,22 @@ mod tests {
     }
 
     #[test]
-    fn test_round_robin_passthrough() {
-        let mut router = PartitionedRouter::new(KeySpec::RoundRobin, 4);
+    fn test_round_robin_cycles_across_cores() {
+        let mut router = PartitionedRouter::new(KeySpec::RoundRobin, 3);
         let batch = make_batch(vec![1, 2, 3]);
 
-        let result = router.route_batch(&batch).unwrap();
-        assert_eq!(result.len(), 1);
-        assert_eq!(result[0].0, 0);
-        assert_eq!(result[0].1.num_rows(), 3);
+        let r0 = router.route_batch(&batch).unwrap();
+        assert_eq!(r0[0].0, 0);
+
+        let r1 = router.route_batch(&batch).unwrap();
+        assert_eq!(r1[0].0, 1);
+
+        let r2 = router.route_batch(&batch).unwrap();
+        assert_eq!(r2[0].0, 2);
+
+        // Wraps back to core 0
+        let r3 = router.route_batch(&batch).unwrap();
+        assert_eq!(r3[0].0, 0);
     }
 
     #[test]

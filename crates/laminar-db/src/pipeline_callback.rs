@@ -525,12 +525,17 @@ impl crate::pipeline::PipelineCallback for ConnectorPipelineCallback {
     }
 }
 
-/// Update a partial foyer cache from a CDC batch by inserting each row
-/// keyed by the primary key column(s).
+/// Update a partial foyer cache from a CDC batch by inserting or deleting
+/// each row keyed by the primary key column(s).
+///
+/// CDC delete detection: if the batch has a column named `__op`, `__operation`,
+/// or `op` with values `"d"`, `"D"`, `"delete"`, or `"DELETE"`, the row is
+/// removed from the cache instead of upserted.
 fn update_partial_cache_from_batch(
     partial: &laminar_sql::datafusion::PartialLookupState,
     batch: &RecordBatch,
 ) {
+    use arrow_array::{Array, StringArray};
     use laminar_core::lookup::table::LookupTable;
 
     if partial.key_columns.is_empty() {
@@ -559,21 +564,33 @@ fn update_partial_cache_from_batch(
         return;
     };
 
+    // Detect CDC operation column for delete handling.
+    let op_col_idx = batch
+        .schema()
+        .fields()
+        .iter()
+        .position(|f| matches!(f.name().as_str(), "__op" | "__operation" | "op"));
+    let op_array = op_col_idx.and_then(|idx| {
+        batch
+            .column(idx)
+            .as_any()
+            .downcast_ref::<StringArray>()
+            .map(|a| (idx, a))
+    });
+
     let num_rows = batch.num_rows();
     for row in 0..num_rows {
         let key = rows.row(row);
-        #[allow(clippy::cast_possible_truncation)]
-        let idx = row as u32;
-        let indices = arrow_array::UInt32Array::from_value(idx, 1);
-        let cols: Result<Vec<_>, _> = batch
-            .columns()
-            .iter()
-            .map(|col| arrow::compute::take(col.as_ref(), &indices, None))
-            .collect();
-        if let Ok(cols) = cols {
-            if let Ok(row_batch) = RecordBatch::try_new(batch.schema(), cols) {
-                partial.foyer_cache.insert(key.as_ref(), row_batch);
-            }
+
+        let is_delete = op_array.is_some_and(|(_, arr)| {
+            !arr.is_null(row) && matches!(arr.value(row), "d" | "D" | "delete" | "DELETE")
+        });
+
+        if is_delete {
+            partial.foyer_cache.invalidate(key.as_ref());
+        } else {
+            let row_batch = batch.slice(row, 1);
+            partial.foyer_cache.insert(key.as_ref(), row_batch);
         }
     }
 }

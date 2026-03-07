@@ -885,6 +885,11 @@ fn set_cpu_affinity(core_id: usize, cpu_id: usize) -> Result<(), TpcError> {
     {
         use windows_sys::Win32::System::Threading::{GetCurrentThread, SetThreadAffinityMask};
 
+        assert!(
+            cpu_id < usize::BITS as usize,
+            "cpu_id {cpu_id} >= {} — Windows processor groups not yet supported",
+            usize::BITS
+        );
         // SAFETY: We're calling Windows API functions with valid parameters.
         // GetCurrentThread returns a pseudo-handle that doesn't need to be closed.
         // The mask is a valid CPU mask for the specified core.

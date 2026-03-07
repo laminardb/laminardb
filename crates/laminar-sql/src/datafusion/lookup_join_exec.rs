@@ -16,7 +16,9 @@
 use std::any::Any;
 use std::collections::HashMap;
 use std::fmt::{self, Debug, Formatter};
-use std::sync::{Arc, RwLock};
+use std::sync::Arc;
+
+use parking_lot::RwLock;
 
 use arrow::compute::take;
 use arrow::row::{RowConverter, SortField};
@@ -97,7 +99,7 @@ impl LookupTableRegistry {
     ///
     /// Panics if the internal lock is poisoned.
     pub fn register(&self, name: &str, snapshot: LookupSnapshot) {
-        self.tables.write().expect("registry lock poisoned").insert(
+        self.tables.write().insert(
             name.to_lowercase(),
             RegisteredLookup::Snapshot(Arc::new(snapshot)),
         );
@@ -109,7 +111,7 @@ impl LookupTableRegistry {
     ///
     /// Panics if the internal lock is poisoned.
     pub fn register_partial(&self, name: &str, state: PartialLookupState) {
-        self.tables.write().expect("registry lock poisoned").insert(
+        self.tables.write().insert(
             name.to_lowercase(),
             RegisteredLookup::Partial(Arc::new(state)),
         );
@@ -121,10 +123,7 @@ impl LookupTableRegistry {
     ///
     /// Panics if the internal lock is poisoned.
     pub fn unregister(&self, name: &str) {
-        self.tables
-            .write()
-            .expect("registry lock poisoned")
-            .remove(&name.to_lowercase());
+        self.tables.write().remove(&name.to_lowercase());
     }
 
     /// Returns the current snapshot for a table, if registered as a snapshot.
@@ -134,7 +133,7 @@ impl LookupTableRegistry {
     /// Panics if the internal lock is poisoned.
     #[must_use]
     pub fn get(&self, name: &str) -> Option<Arc<LookupSnapshot>> {
-        let tables = self.tables.read().expect("registry lock poisoned");
+        let tables = self.tables.read();
         match tables.get(&name.to_lowercase())? {
             RegisteredLookup::Snapshot(s) => Some(Arc::clone(s)),
             RegisteredLookup::Partial(_) => None,
@@ -147,7 +146,7 @@ impl LookupTableRegistry {
     ///
     /// Panics if the internal lock is poisoned.
     pub fn get_entry(&self, name: &str) -> Option<RegisteredLookup> {
-        let tables = self.tables.read().expect("registry lock poisoned");
+        let tables = self.tables.read();
         tables.get(&name.to_lowercase()).map(|e| match e {
             RegisteredLookup::Snapshot(s) => RegisteredLookup::Snapshot(Arc::clone(s)),
             RegisteredLookup::Partial(p) => RegisteredLookup::Partial(Arc::clone(p)),
@@ -447,6 +446,15 @@ fn probe_batch(
 
     #[allow(clippy::cast_possible_truncation)] // batch row count fits u32
     for row in 0..num_rows {
+        // SQL semantics: NULL != NULL, so rows with any null key never match.
+        if key_cols.iter().any(|c| c.is_null(row)) {
+            if join_type == LookupJoinType::LeftOuter {
+                stream_indices.push(row as u32);
+                lookup_indices.push(None);
+            }
+            continue;
+        }
+
         let key = rows.row(row);
         match index.probe(key.as_ref()) {
             Some(matches) => {
@@ -774,6 +782,15 @@ async fn probe_partial_batch_with_fallback(
 
     #[allow(clippy::cast_possible_truncation)]
     for row in 0..num_rows {
+        // SQL semantics: NULL != NULL, so rows with any null key never match.
+        if key_cols.iter().any(|c| c.is_null(row)) {
+            if join_type == LookupJoinType::LeftOuter {
+                stream_indices.push(row as u32);
+                lookup_batches.push(None);
+            }
+            continue;
+        }
+
         let key = rows.row(row);
         let result = foyer_cache.get_cached(key.as_ref());
         if let Some(batch) = result.into_batch() {
@@ -943,6 +960,20 @@ impl ExtensionPlanner for LookupJoinExtensionPlanner {
                 };
 
                 let stream_key_indices = resolve_stream_keys(lookup_node, &stream_schema)?;
+
+                // Validate join key types are compatible
+                for (si, li) in stream_key_indices.iter().zip(&lookup_key_indices) {
+                    let st = stream_schema.field(*si).data_type();
+                    let lt = lookup_schema.field(*li).data_type();
+                    if st != lt {
+                        return Err(DataFusionError::Plan(format!(
+                            "Lookup join key type mismatch: stream '{}' is {st:?} \
+                             but lookup '{}' is {lt:?}",
+                            stream_schema.field(*si).name(),
+                            lookup_schema.field(*li).name(),
+                        )));
+                    }
+                }
 
                 let mut output_fields = stream_schema.fields().to_vec();
                 output_fields.extend(lookup_batch.schema().fields().iter().cloned());
@@ -1723,5 +1754,105 @@ mod tests {
         let entry = reg.get_entry("t");
         assert!(matches!(entry.unwrap(), RegisteredLookup::Snapshot(_)));
         assert!(reg.get("t").is_some());
+    }
+
+    // ── NULL key tests ────────────────────────────────────────────────
+
+    fn nullable_orders_schema() -> SchemaRef {
+        Arc::new(Schema::new(vec![
+            Field::new("order_id", DataType::Int64, false),
+            Field::new("customer_id", DataType::Int64, true), // nullable key
+            Field::new("amount", DataType::Float64, false),
+        ]))
+    }
+
+    fn nullable_output_schema(join_type: LookupJoinType) -> SchemaRef {
+        let lookup_nullable = join_type == LookupJoinType::LeftOuter;
+        Arc::new(Schema::new(vec![
+            Field::new("order_id", DataType::Int64, false),
+            Field::new("customer_id", DataType::Int64, true),
+            Field::new("amount", DataType::Float64, false),
+            Field::new("id", DataType::Int64, lookup_nullable),
+            Field::new("name", DataType::Utf8, true),
+        ]))
+    }
+
+    #[tokio::test]
+    async fn null_key_inner_join_no_match() {
+        // Stream: customer_id = [1, NULL, 2]
+        let stream_batch = RecordBatch::try_new(
+            nullable_orders_schema(),
+            vec![
+                Arc::new(Int64Array::from(vec![100, 101, 102])),
+                Arc::new(Int64Array::from(vec![Some(1), None, Some(2)])),
+                Arc::new(Float64Array::from(vec![10.0, 20.0, 30.0])),
+            ],
+        )
+        .unwrap();
+
+        let input = batch_exec(stream_batch);
+        let exec = LookupJoinExec::try_new(
+            input,
+            customers_batch(),
+            vec![1],
+            vec![0],
+            LookupJoinType::Inner,
+            nullable_output_schema(LookupJoinType::Inner),
+        )
+        .unwrap();
+
+        let ctx = Arc::new(TaskContext::default());
+        let stream = exec.execute(0, ctx).unwrap();
+        let batches: Vec<RecordBatch> = stream.try_collect().await.unwrap();
+
+        let total: usize = batches.iter().map(RecordBatch::num_rows).sum();
+        // Only customer_id=1 and customer_id=2 match; NULL is skipped
+        assert_eq!(total, 2, "NULL key row should not match in inner join");
+    }
+
+    #[tokio::test]
+    async fn null_key_left_outer_produces_nulls() {
+        // Stream: customer_id = [1, NULL, 2]
+        let stream_batch = RecordBatch::try_new(
+            nullable_orders_schema(),
+            vec![
+                Arc::new(Int64Array::from(vec![100, 101, 102])),
+                Arc::new(Int64Array::from(vec![Some(1), None, Some(2)])),
+                Arc::new(Float64Array::from(vec![10.0, 20.0, 30.0])),
+            ],
+        )
+        .unwrap();
+
+        let input = batch_exec(stream_batch);
+        let out_schema = nullable_output_schema(LookupJoinType::LeftOuter);
+        let exec = LookupJoinExec::try_new(
+            input,
+            customers_batch(),
+            vec![1],
+            vec![0],
+            LookupJoinType::LeftOuter,
+            out_schema,
+        )
+        .unwrap();
+
+        let ctx = Arc::new(TaskContext::default());
+        let stream = exec.execute(0, ctx).unwrap();
+        let batches: Vec<RecordBatch> = stream.try_collect().await.unwrap();
+
+        let total: usize = batches.iter().map(RecordBatch::num_rows).sum();
+        // All 3 rows preserved; NULL key row has null lookup columns
+        assert_eq!(total, 3, "all rows preserved in left outer");
+
+        let names = batches[0]
+            .column(4)
+            .as_any()
+            .downcast_ref::<StringArray>()
+            .unwrap();
+        assert_eq!(names.value(0), "Alice");
+        assert!(
+            names.is_null(1),
+            "NULL key row should have null lookup name"
+        );
+        assert_eq!(names.value(2), "Bob");
     }
 }

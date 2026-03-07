@@ -101,8 +101,18 @@ impl PipelineCallback for BarrierTrackingCallback {
     async fn poll_tables(&mut self) {}
 }
 
-/// Default single-core TPC config for tests.
+/// TPC config for tests. Uses 2 cores to satisfy the SPSC invariant
+/// (each source gets its own core inbox).
 fn test_tpc_config() -> TpcConfig {
+    TpcConfig {
+        num_cores: 2,
+        cpu_pinning: false,
+        ..Default::default()
+    }
+}
+
+/// Single-core TPC config for single-source tests.
+fn test_tpc_config_single() -> TpcConfig {
     TpcConfig {
         num_cores: 1,
         cpu_pinning: false,
@@ -290,7 +300,7 @@ async fn test_single_source_barrier_checkpoint() {
     };
 
     let coordinator =
-        TpcPipelineCoordinator::new(sources, config, &test_tpc_config(), shutdown).unwrap();
+        TpcPipelineCoordinator::new(sources, config, &test_tpc_config_single(), shutdown).unwrap();
 
     let should_trigger = Arc::new(AtomicBool::new(true));
     let record_counter = Arc::new(AtomicU64::new(0));

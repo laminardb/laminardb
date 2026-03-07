@@ -360,13 +360,14 @@ pub struct StreamCheckpoint {
 impl StreamCheckpoint {
     /// Serializes the checkpoint to bytes.
     ///
-    /// Format:
+    /// Format (v2):
     /// ```text
-    /// [version: 1][id: 8][epoch: 8][created_at: 8]
+    /// [version: 2][id: 8][epoch: 8][created_at: 8]
     /// [num_sources: 4][ [name_len:4][name][seq:8] ... ]
     /// [num_sinks: 4][ [name_len:4][name][pos:8] ... ]
     /// [num_watermarks: 4][ [name_len:4][name][wm:8] ... ]
     /// [num_ops: 4][ [name_len:4][name][data_len:4][data] ... ]
+    /// [crc32c: 4]  (over all bytes after version)
     /// ```
     #[must_use]
     #[allow(clippy::cast_possible_truncation)] // Wire format uses u32 for collection lengths
@@ -374,7 +375,7 @@ impl StreamCheckpoint {
         let mut buf = Vec::with_capacity(256);
 
         // Version
-        buf.push(1u8);
+        buf.push(2u8);
 
         // Header
         buf.extend_from_slice(&self.id.to_le_bytes());
@@ -413,6 +414,10 @@ impl StreamCheckpoint {
             buf.extend_from_slice(&(data.len() as u32).to_le_bytes());
             buf.extend_from_slice(data);
         }
+
+        // CRC32C over payload (everything after the version byte)
+        let crc = crc32c::crc32c(&buf[1..]);
+        buf.extend_from_slice(&crc.to_le_bytes());
 
         buf
     }
@@ -484,11 +489,33 @@ impl StreamCheckpoint {
         }
         let version = data[pos];
         pos += 1;
-        if version != 1 {
+        if version != 2 {
             return Err(CheckpointError::IoError(format!(
-                "unsupported checkpoint version: {version}"
+                "unsupported checkpoint version: {version} (expected 2)"
             )));
         }
+
+        // Verify CRC32C: last 4 bytes are the checksum over bytes[1..len-4]
+        if data.len() < 5 {
+            return Err(CheckpointError::IoError(
+                "checkpoint too short for CRC".into(),
+            ));
+        }
+        let crc_start = data.len() - 4;
+        let stored_crc = u32::from_le_bytes(
+            data[crc_start..]
+                .try_into()
+                .map_err(|_| CheckpointError::IoError("bad CRC bytes".into()))?,
+        );
+        let computed_crc = crc32c::crc32c(&data[1..crc_start]);
+        if stored_crc != computed_crc {
+            return Err(CheckpointError::IoError(format!(
+                "CRC mismatch: stored={stored_crc:#010x} computed={computed_crc:#010x}"
+            )));
+        }
+
+        // Limit deserialization to the payload (exclude trailing CRC)
+        let data = &data[..crc_start];
 
         // Header
         let id = read_u64_val(&mut pos)?;
@@ -1031,5 +1058,63 @@ mod tests {
 
         seq2.fetch_add(5, Ordering::Relaxed);
         assert_eq!(seq.load(Ordering::Acquire), 6);
+    }
+
+    #[test]
+    fn test_stream_checkpoint_crc_roundtrip() {
+        let mut cp = StreamCheckpoint {
+            id: 42,
+            epoch: 10,
+            source_sequences: HashMap::new(),
+            sink_positions: HashMap::new(),
+            watermarks: HashMap::new(),
+            operator_states: HashMap::new(),
+            created_at: 0,
+        };
+        cp.source_sequences.insert("kafka".into(), 1000);
+        cp.watermarks.insert("src".into(), 500);
+        cp.operator_states.insert("agg".into(), vec![1, 2, 3]);
+
+        let bytes = cp.to_bytes();
+        let restored = StreamCheckpoint::from_bytes(&bytes).unwrap();
+        assert_eq!(restored.id, 42);
+        assert_eq!(restored.epoch, 10);
+        assert_eq!(restored.source_sequences.get("kafka"), Some(&1000));
+        assert_eq!(restored.watermarks.get("src"), Some(&500));
+        assert_eq!(restored.operator_states.get("agg").unwrap(), &[1, 2, 3]);
+    }
+
+    #[test]
+    fn test_stream_checkpoint_crc_corruption_detected() {
+        let cp = StreamCheckpoint {
+            id: 1,
+            epoch: 1,
+            source_sequences: HashMap::new(),
+            sink_positions: HashMap::new(),
+            watermarks: HashMap::new(),
+            operator_states: HashMap::new(),
+            created_at: 0,
+        };
+        let mut bytes = cp.to_bytes();
+        // Flip a byte in the payload (not the version or CRC)
+        bytes[5] ^= 0xFF;
+
+        let result = StreamCheckpoint::from_bytes(&bytes);
+        assert!(result.is_err());
+        let err = result.unwrap_err().to_string();
+        assert!(err.contains("CRC mismatch"), "got: {err}");
+    }
+
+    #[test]
+    fn test_stream_checkpoint_v1_rejected() {
+        let mut bytes = vec![1u8];
+        bytes.extend_from_slice(&[0u8; 40]);
+        let result = StreamCheckpoint::from_bytes(&bytes);
+        assert!(result.is_err());
+        let err = result.unwrap_err().to_string();
+        assert!(
+            err.contains("unsupported checkpoint version: 1"),
+            "got: {err}"
+        );
     }
 }

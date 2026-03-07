@@ -213,6 +213,9 @@ pub struct StateChangelogBuffer {
     total_drained: AtomicUsize,
     /// Metrics: overflow count (backpressure signals).
     overflow_count: AtomicUsize,
+    /// Thread ID of the first producer (for debug-mode SPSC violation detection).
+    #[cfg(debug_assertions)]
+    producer_thread_id: std::sync::Mutex<Option<std::thread::ThreadId>>,
 }
 
 impl StateChangelogBuffer {
@@ -256,6 +259,8 @@ impl StateChangelogBuffer {
             total_pushed: AtomicUsize::new(0),
             total_drained: AtomicUsize::new(0),
             overflow_count: AtomicUsize::new(0),
+            #[cfg(debug_assertions)]
+            producer_thread_id: std::sync::Mutex::new(None),
         }
     }
 
@@ -286,7 +291,22 @@ impl StateChangelogBuffer {
     ///
     /// Returns `true` if successful, `false` if buffer is full (backpressure).
     #[inline]
+    #[allow(clippy::missing_panics_doc)] // debug-only SPSC violation check
     pub fn push(&self, entry: StateChangelogEntry) -> bool {
+        #[cfg(debug_assertions)]
+        {
+            let current = std::thread::current().id();
+            let mut guard = self.producer_thread_id.lock().unwrap();
+            if let Some(expected) = *guard {
+                debug_assert_eq!(
+                    current, expected,
+                    "SPSC violation: push() called from a different thread"
+                );
+            } else {
+                *guard = Some(current);
+            }
+        }
+
         let write_pos = self.write_pos.load(Ordering::Relaxed);
         let read_pos = self.read_pos.load(Ordering::Acquire);
 

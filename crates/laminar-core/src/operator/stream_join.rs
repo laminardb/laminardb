@@ -511,6 +511,32 @@ const LEFT_TIMER_PREFIX: u8 = 0x10;
 const RIGHT_TIMER_PREFIX: u8 = 0x20;
 /// Timer key prefix for unmatched event emission.
 const UNMATCHED_TIMER_PREFIX: u8 = 0x30;
+/// Prefix for matched-flag keys (separate from `JoinRow` to avoid serde roundtrips).
+const MATCHED_FLAG_PREFIX: u8 = 0x40;
+
+/// Build a matched-flag key from a 28-byte state key.
+#[inline]
+fn matched_flag_key(state_key: &[u8]) -> [u8; 29] {
+    debug_assert_eq!(state_key.len(), 28, "join state keys are always 28 bytes");
+    let mut k = [0u8; 29];
+    k[0] = MATCHED_FLAG_PREFIX;
+    k[1..].copy_from_slice(&state_key[..28]);
+    k
+}
+
+/// Mark a join row as matched by writing a 1-byte flag.
+#[inline]
+fn mark_matched(state: &mut dyn StateStore, state_key: &[u8]) {
+    let k = matched_flag_key(state_key);
+    let _ = state.put(&k, &[1]);
+}
+
+/// Check if a join row has been matched.
+#[inline]
+fn is_matched(state: &dyn StateStore, state_key: &[u8]) -> bool {
+    let k = matched_flag_key(state_key);
+    state.get_ref(&k).is_some()
+}
 
 /// Static counter for generating unique operator IDs.
 static JOIN_OPERATOR_COUNTER: AtomicU64 = AtomicU64::new(0);
@@ -1592,7 +1618,7 @@ impl StreamJoinOperator {
     #[allow(clippy::too_many_arguments)]
     fn process_matches(
         &mut self,
-        matches: Vec<(Vec<u8>, JoinRow)>,
+        matches: SmallVec<[([u8; 28], JoinRow); 4]>,
         side: JoinSide,
         event: &Event,
         event_time: i64,
@@ -1604,57 +1630,44 @@ impl StreamJoinOperator {
         if self.join_type.is_semi() {
             // Semi join: emit the kept side's row on first match only
             let kept_side = self.join_type.kept_side().unwrap();
-            for (other_row_key, mut other_row) in matches {
+            for (other_row_key, other_row) in matches {
                 self.metrics.matches += 1;
-                let was_other_matched = other_row.matched;
-                other_row.matched = true;
-                let _ = ctx.state.put_typed(&other_row_key, &other_row);
+                let was_other_matched = is_matched(&*ctx.state, &other_row_key);
+                mark_matched(&mut *ctx.state, &other_row_key);
 
-                if let Ok(Some(mut our_row)) = ctx.state.get_typed::<JoinRow>(state_key) {
-                    let was_our_matched = our_row.matched;
-                    our_row.matched = true;
-                    let _ = ctx.state.put_typed(state_key, &our_row);
+                let was_our_matched = is_matched(&*ctx.state, state_key);
+                mark_matched(&mut *ctx.state, state_key);
 
-                    if side == kept_side && !was_our_matched {
-                        // Incoming event is the kept side — emit it
-                        output.push(Output::Event(Event::new(
-                            event_time,
-                            RecordBatch::clone(&event.data),
-                        )));
-                        break; // One match is enough for semi
-                    } else if side != kept_side && !was_other_matched {
-                        // Other side is the kept side — emit the other row
-                        if let Ok(batch) = other_row.to_batch() {
-                            output.push(Output::Event(Event::new(other_row.timestamp, batch)));
-                        }
+                if side == kept_side && !was_our_matched {
+                    output.push(Output::Event(Event::new(
+                        event_time,
+                        RecordBatch::clone(&event.data),
+                    )));
+                    break; // One match is enough for semi
+                } else if side != kept_side && !was_other_matched {
+                    if let Ok(batch) = other_row.to_batch() {
+                        output.push(Output::Event(Event::new(other_row.timestamp, batch)));
                     }
                 }
             }
         } else if self.join_type.is_anti() {
             // Anti join: mark rows as matched (suppresses unmatched timer emission)
-            for (other_row_key, mut other_row) in matches {
+            for (other_row_key, _other_row) in matches {
                 self.metrics.matches += 1;
-                other_row.matched = true;
-                let _ = ctx.state.put_typed(&other_row_key, &other_row);
-
-                if let Ok(Some(mut our_row)) = ctx.state.get_typed::<JoinRow>(state_key) {
-                    our_row.matched = true;
-                    let _ = ctx.state.put_typed(state_key, &our_row);
-                }
+                mark_matched(&mut *ctx.state, &other_row_key);
+                mark_matched(&mut *ctx.state, state_key);
             }
         } else {
             // Standard join: emit concatenated left+right rows
-            for (other_row_key, mut other_row) in matches {
+            let needs_matched_flag =
+                self.join_type.emits_unmatched_left() || self.join_type.emits_unmatched_right();
+            for (other_row_key, other_row) in matches {
                 self.metrics.matches += 1;
 
-                // Mark this row as matched in state
-                other_row.matched = true;
-                let _ = ctx.state.put_typed(&other_row_key, &other_row);
-
-                // Also mark our row as matched
-                if let Ok(Some(mut our_row)) = ctx.state.get_typed::<JoinRow>(state_key) {
-                    our_row.matched = true;
-                    let _ = ctx.state.put_typed(state_key, &our_row);
+                // Mark both sides as matched (only needed for outer joins)
+                if needs_matched_flag {
+                    mark_matched(&mut *ctx.state, &other_row_key);
+                    mark_matched(&mut *ctx.state, state_key);
                 }
 
                 // Create joined output
@@ -1733,6 +1746,7 @@ impl StreamJoinOperator {
 
             for key in &self.prune_buffer {
                 if ctx.state.delete(key).is_ok() {
+                    let _ = ctx.state.delete(&matched_flag_key(key));
                     self.metrics.build_side_prunes += 1;
                 }
             }
@@ -1890,8 +1904,8 @@ impl StreamJoinOperator {
         key_value: &[u8],
         timestamp: i64,
         state: &dyn StateStore,
-    ) -> Vec<(Vec<u8>, JoinRow)> {
-        let mut matches = Vec::new();
+    ) -> SmallVec<[([u8; 28], JoinRow); 4]> {
+        let mut matches = SmallVec::new();
 
         let prefix = match current_side {
             JoinSide::Left => RIGHT_STATE_PREFIX,
@@ -1922,7 +1936,11 @@ impl StreamJoinOperator {
             if time_diff <= self.time_bound_ms {
                 // Verify key matches (in case of hash collision)
                 if row.key_value == key_value {
-                    matches.push((state_key.to_vec(), row));
+                    let mut key_buf = [0u8; 28];
+                    if state_key.len() == 28 {
+                        key_buf.copy_from_slice(&state_key);
+                    }
+                    matches.push((key_buf, row));
                 }
             }
         }
@@ -2042,6 +2060,7 @@ impl StreamJoinOperator {
             JoinSide::Right => self.join_type.emits_unmatched_right(),
         };
         if !defer_cleanup && ctx.state.delete(state_key).is_ok() {
+            let _ = ctx.state.delete(&matched_flag_key(state_key));
             self.metrics.state_cleanups += 1;
         }
 
@@ -2062,8 +2081,8 @@ impl StreamJoinOperator {
             return output;
         };
 
-        // Only emit if not matched
-        if !row.matched {
+        // Only emit if not matched (check separate flag key, not JoinRow field)
+        if !is_matched(&*ctx.state, state_key) {
             match side {
                 JoinSide::Left if self.join_type.emits_unmatched_left() => {
                     self.metrics.unmatched_left += 1;
@@ -2093,6 +2112,7 @@ impl StreamJoinOperator {
 
         // Clean up state (deferred from cleanup timer for outer/anti joins)
         if ctx.state.delete(state_key).is_ok() {
+            let _ = ctx.state.delete(&matched_flag_key(state_key));
             self.metrics.state_cleanups += 1;
         }
 
