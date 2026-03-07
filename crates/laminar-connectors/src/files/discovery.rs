@@ -380,7 +380,7 @@ fn should_use_poll_watcher(path: &str) -> bool {
         if let Ok(c_path) = CString::new(path) {
             unsafe {
                 let mut buf: libc::statfs = std::mem::zeroed();
-                if libc::statfs(c_path.as_ptr(), &mut buf) == 0 {
+                if libc::statfs(c_path.as_ptr(), &raw mut buf) == 0 {
                     #[allow(clippy::cast_sign_loss)]
                     let fs_type = buf.f_type as u64;
                     return matches!(
