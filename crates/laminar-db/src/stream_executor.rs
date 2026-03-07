@@ -314,7 +314,8 @@ impl StreamExecutor {
     /// Register a static reference table (e.g., from `CREATE TABLE`).
     ///
     /// Unlike source tables, these persist across cycles.
-    #[allow(dead_code)]
+    /// Currently only called from tests; will be wired to `CREATE TABLE` DDL.
+    #[cfg(test)]
     pub fn register_table(&self, name: &str, batch: RecordBatch) -> Result<(), DbError> {
         let schema = batch.schema();
         let mem_table = datafusion::datasource::MemTable::try_new(schema, vec![vec![batch]])
@@ -487,8 +488,15 @@ impl StreamExecutor {
                 if let Ok(mem_table) =
                     datafusion::datasource::MemTable::try_new(schema, vec![batches.clone()])
                 {
+                    // Cleanup: deregister failures are benign (table may not exist yet)
                     let _ = self.ctx.deregister_table(&query_name);
-                    let _ = self.ctx.register_table(&query_name, Arc::new(mem_table));
+                    if let Err(e) = self.ctx.register_table(&query_name, Arc::new(mem_table)) {
+                        tracing::warn!(
+                            query = %query_name,
+                            error = %e,
+                            "[LDB-3015] Failed to register intermediate table"
+                        );
+                    }
                     intermediate_tables.push(query_name.clone());
                 }
                 results.insert(query_name, batches);
@@ -497,6 +505,7 @@ impl StreamExecutor {
 
         self.cleanup_source_tables();
         for name in &intermediate_tables {
+            // Cleanup: deregister failures during teardown are benign
             let _ = self.ctx.deregister_table(name);
         }
 

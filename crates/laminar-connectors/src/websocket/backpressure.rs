@@ -12,9 +12,11 @@ use serde::{Deserialize, Serialize};
 /// downstream processing pipeline cannot keep up, one of these strategies
 /// governs how the connector handles the overflow.
 ///
-/// **Note**: Currently only `Block` is implemented in `WebSocketSourceServer`.
-/// The other variants are parsed from SQL WITH but not yet dispatched.
-/// TODO(backpressure): wire strategy dispatch in `source_server.rs`.
+/// **Implementation status** (2026-03-07):
+/// - `Block`: fully implemented (TCP backpressure propagation)
+/// - `DropNewest`: implemented in `source.rs` via `try_send`
+/// - `DropOldest`, `Buffer`, `Sample`: parsed from SQL WITH, fall back to
+///   `DropNewest` behavior with a debug log. Full dispatch planned for Phase 6c.
 #[derive(Debug, Clone, Default, Serialize, Deserialize)]
 pub enum BackpressureStrategy {
     /// Block WS read -- TCP backpressure propagates to sender.

@@ -1,23 +1,23 @@
-//! # Raft Metadata Consensus
+//! # Delta Coordination
 //!
-//! Implements the Raft-based metadata consensus layer for the delta.
-//! This module manages the distributed state machine that tracks partition
+//! Implements the metadata and orchestration layer for the delta.
+//! This module manages the state machine that tracks partition
 //! ownership, node states, and checkpoint metadata.
 //!
 //! ## Architecture
 //!
 //! - `metadata`: `DeltaMetadata` state machine with apply logic
-//! - `raft`: `RaftCoordinator` wrapping `openraft::Raft`
+//! - `orchestrator`: `DeltaManager` lifecycle orchestration
+//!
+//! Note: Raft-based consensus (openraft) is planned for Phase 6c.
+//! The `raft` module was removed in the 2026-03-07 production audit
+//! because it contained only a stub struct with no openraft integration.
 
 /// Delta metadata state machine.
 pub mod metadata;
-
-/// Raft coordinator wrapper.
-pub mod raft;
 
 /// Top-level orchestration of the delta lifecycle.
 pub mod orchestrator;
 
 pub use metadata::{DeltaMetadata, MetadataLogEntry, PartitionOwnership};
 pub use orchestrator::{DeltaManager, NodeLifecyclePhase};
-pub use raft::{CoordinationError, RaftCoordinator};
