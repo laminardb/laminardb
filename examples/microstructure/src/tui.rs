@@ -443,15 +443,18 @@ fn draw_latency(frame: &mut ratatui::Frame, area: Rect, s: &DashState) {
     frame.render_widget(sparkline, chunks[0]);
 
     let lat = &s.latency;
-    let wm_lag = if s.pipeline_watermark > 0 {
+    let wm_lag = if s.pipeline_watermark != i64::MIN && s.pipeline_watermark > 0 {
         let now_ms = std::time::SystemTime::now()
             .duration_since(std::time::UNIX_EPOCH)
             .unwrap_or_default()
             .as_millis() as i64;
-        format!(
-            "{}ms",
-            fmt_int(now_ms.saturating_sub(s.pipeline_watermark) as u64)
-        )
+        let lag = now_ms.saturating_sub(s.pipeline_watermark);
+        if lag >= 0 {
+            format!("{}ms", fmt_int(lag as u64))
+        } else {
+            // Watermark ahead of local clock (clock skew) — show 0
+            "0ms".to_string()
+        }
     } else {
         "-".to_string()
     };

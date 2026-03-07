@@ -569,14 +569,14 @@ mod tests {
 
         let (sql, _) = build_query("t", &[], &[], Some(&predicates), None);
 
-        assert!(sql.contains("a = 1"));
-        assert!(sql.contains("b < 10"));
-        assert!(sql.contains("c <= 20"));
-        assert!(sql.contains("d > 30"));
-        assert!(sql.contains("e >= 40"));
-        assert!(sql.contains("f IN ('x', 'y')"));
-        assert!(sql.contains("g IS NULL"));
-        assert!(sql.contains("h IS NOT NULL"));
+        assert!(sql.contains("\"a\" = 1"), "got: {sql}");
+        assert!(sql.contains("\"b\" < 10"), "got: {sql}");
+        assert!(sql.contains("\"c\" <= 20"), "got: {sql}");
+        assert!(sql.contains("\"d\" > 30"), "got: {sql}");
+        assert!(sql.contains("\"e\" >= 40"), "got: {sql}");
+        assert!(sql.contains("\"f\" IN ('x', 'y')"), "got: {sql}");
+        assert!(sql.contains("\"g\" IS NULL"), "got: {sql}");
+        assert!(sql.contains("\"h\" IS NOT NULL"), "got: {sql}");
     }
 
     #[test]
