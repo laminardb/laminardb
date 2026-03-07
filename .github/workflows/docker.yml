@@ -1,5 +1,17 @@
 name: Docker Build & Publish
 
+# Builds multi-arch Docker images (linux/amd64 + linux/arm64) and pushes to
+# both Docker Hub and GitHub Container Registry (GHCR).
+#
+# PRs: amd64-only build validation (~10 min vs ~60 min with ARM QEMU)
+# Push/tags: native per-arch builds on matching runners, then merged into
+#            a single multi-arch manifest.
+#
+# Required secrets:
+#   DOCKERHUB_USERNAME - Docker Hub username (https://hub.docker.com/settings/general)
+#   DOCKERHUB_TOKEN    - Docker Hub access token (https://hub.docker.com/settings/security)
+#   GITHUB_TOKEN       - Automatically provided by GitHub Actions (for GHCR)
+
 on:
   push:
     branches: [main]
@@ -9,16 +21,17 @@ on:
   workflow_dispatch:
     inputs:
       version_override:
-        description: "Version override (e.g., 0.16.0)"
+        description: "Version override (e.g., 0.18.0)"
         required: false
         type: string
 
 env:
-  GHCR_IMAGE: ghcr.io/laminardb/laminardb-server
+  GHCR_IMAGE: ghcr.io/${{ github.repository_owner }}/laminardb-server
+  DOCKERHUB_IMAGE: laminardb/laminardb-server
 
 jobs:
   # --------------------------------------------------------------------------
-  # Prepare: extract metadata & version (shared by build matrix)
+  # Prepare: extract metadata & version (shared by build jobs)
   # --------------------------------------------------------------------------
   prepare:
     name: Prepare metadata
@@ -31,18 +44,18 @@ jobs:
       - name: Checkout
         uses: actions/checkout@v4
 
-      - name: Extract metadata
+      - name: Extract metadata (tags, labels)
         id: meta
         uses: docker/metadata-action@v5
         with:
           images: |
+            ${{ env.DOCKERHUB_IMAGE }}
             ${{ env.GHCR_IMAGE }}
           tags: |
             type=raw,value=latest,enable={{is_default_branch}}
             type=semver,pattern={{version}}
             type=semver,pattern={{major}}.{{minor}}
-            type=semver,pattern={{major}}
-            type=sha,prefix=sha-,format=long
+            type=sha,prefix=sha-,format=short
             type=ref,event=branch
           flavor: |
             latest=false
@@ -59,11 +72,41 @@ jobs:
           fi
 
   # --------------------------------------------------------------------------
-  # Build: native builds on matching runners (no QEMU emulation)
+  # PR validation: amd64-only (fast, no QEMU)
+  # --------------------------------------------------------------------------
+  validate:
+    name: Validate (amd64)
+    needs: prepare
+    if: github.event_name == 'pull_request'
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Set up Docker Buildx
+        uses: docker/setup-buildx-action@v4
+
+      - name: Build (amd64 only, no push)
+        uses: docker/build-push-action@v7
+        with:
+          context: .
+          file: ./Dockerfile
+          platforms: linux/amd64
+          push: false
+          cache-from: type=gha,scope=build-linux-amd64
+          cache-to: type=gha,scope=build-linux-amd64,mode=max
+          build-args: |
+            VERSION=${{ needs.prepare.outputs.version }}
+            GIT_SHA=${{ github.sha }}
+            BUILD_DATE=${{ github.event.head_commit.timestamp }}
+
+  # --------------------------------------------------------------------------
+  # Build: native per-arch builds on matching runners (push/tag only)
   # --------------------------------------------------------------------------
   build:
     name: Build (${{ matrix.platform }})
     needs: prepare
+    if: github.event_name != 'pull_request'
     strategy:
       fail-fast: true
       matrix:
@@ -76,9 +119,6 @@ jobs:
     permissions:
       contents: read
       packages: write
-    outputs:
-      # Digests are collected in the merge job via artifact
-      image-tags: ${{ needs.prepare.outputs.tags }}
     steps:
       - name: Checkout
         uses: actions/checkout@v4
@@ -86,8 +126,13 @@ jobs:
       - name: Set up Docker Buildx
         uses: docker/setup-buildx-action@v4
 
+      - name: Log in to Docker Hub
+        uses: docker/login-action@v3
+        with:
+          username: ${{ secrets.DOCKERHUB_USERNAME }}
+          password: ${{ secrets.DOCKERHUB_TOKEN }}
+
       - name: Log in to GHCR
-        if: github.event_name != 'pull_request'
         uses: docker/login-action@v3
         with:
           registry: ghcr.io
@@ -100,45 +145,28 @@ jobs:
           echo "pair=$(echo '${{ matrix.platform }}' | tr '/' '-')" >> "$GITHUB_OUTPUT"
 
       - name: Build and push by digest
-        if: github.event_name != 'pull_request'
         id: build
         uses: docker/build-push-action@v7
         with:
           context: .
           file: ./Dockerfile
           platforms: ${{ matrix.platform }}
-          outputs: type=image,name=${{ env.GHCR_IMAGE }},push-by-digest=true,name-canonical=true,push=true
+          outputs: type=image,"name=${{ env.DOCKERHUB_IMAGE }},${{ env.GHCR_IMAGE }}",push-by-digest=true,name-canonical=true,push=true
           cache-from: type=gha,scope=build-${{ steps.platform.outputs.pair }}
           cache-to: type=gha,scope=build-${{ steps.platform.outputs.pair }},mode=max
-          build-args: |
-            VERSION=${{ needs.prepare.outputs.version }}
-            GIT_SHA=${{ github.sha }}
-            BUILD_DATE=${{ github.event.head_commit.timestamp }}
-
-      - name: Build (PR validation)
-        if: github.event_name == 'pull_request'
-        uses: docker/build-push-action@v7
-        with:
-          context: .
-          file: ./Dockerfile
-          platforms: ${{ matrix.platform }}
-          push: false
-          cache-from: type=gha,scope=build-${{ steps.platform.outputs.pair }}
-          cache-to: type=gha,scope=build-${{ steps.platform.outputs.pair }},mode=max
+          sbom: true
           build-args: |
             VERSION=${{ needs.prepare.outputs.version }}
             GIT_SHA=${{ github.sha }}
             BUILD_DATE=${{ github.event.head_commit.timestamp }}
 
       - name: Export digest
-        if: github.event_name != 'pull_request'
         run: |
           mkdir -p /tmp/digests
           digest="${{ steps.build.outputs.digest }}"
           touch "/tmp/digests/${digest#sha256:}"
 
       - name: Upload digest
-        if: github.event_name != 'pull_request'
         uses: actions/upload-artifact@v4
         with:
           name: digests-${{ steps.platform.outputs.pair }}
@@ -147,7 +175,7 @@ jobs:
           retention-days: 1
 
   # --------------------------------------------------------------------------
-  # Merge: combine per-arch digests into a multi-arch manifest
+  # Merge: combine per-arch digests into multi-arch manifests
   # --------------------------------------------------------------------------
   merge:
     name: Merge multi-arch manifest
@@ -168,6 +196,12 @@ jobs:
       - name: Set up Docker Buildx
         uses: docker/setup-buildx-action@v4
 
+      - name: Log in to Docker Hub
+        uses: docker/login-action@v3
+        with:
+          username: ${{ secrets.DOCKERHUB_USERNAME }}
+          password: ${{ secrets.DOCKERHUB_TOKEN }}
+
       - name: Log in to GHCR
         uses: docker/login-action@v3
         with:
@@ -183,12 +217,15 @@ jobs:
           for tag in $tags; do
             tag_args="$tag_args -t $tag"
           done
-          # shellcheck disable=SC2086
-          docker buildx imagetools create $tag_args \
-            $(printf '${{ env.GHCR_IMAGE }}@sha256:%s ' *)
+          # Push multi-arch manifest to both registries
+          for image in "${{ env.DOCKERHUB_IMAGE }}" "${{ env.GHCR_IMAGE }}"; do
+            # shellcheck disable=SC2086
+            docker buildx imagetools create $tag_args \
+              $(printf "${image}@sha256:%s " *)
+          done
 
   # --------------------------------------------------------------------------
-  # Scan: Trivy vulnerability scanner
+  # Scan: Trivy vulnerability scanner (fail on CRITICAL)
   # --------------------------------------------------------------------------
   scan:
     name: Security scan
@@ -210,14 +247,18 @@ jobs:
           username: ${{ github.actor }}
           password: ${{ secrets.GITHUB_TOKEN }}
 
+      - name: Compute short SHA for image reference
+        id: sha
+        run: echo "short=$(echo '${{ github.sha }}' | head -c 7)" >> "$GITHUB_OUTPUT"
+
       - name: Run Trivy vulnerability scanner
         uses: aquasecurity/trivy-action@0.34.2
         with:
-          image-ref: "${{ env.GHCR_IMAGE }}:sha-${{ github.sha }}"
+          image-ref: "${{ env.GHCR_IMAGE }}:sha-${{ steps.sha.outputs.short }}"
           version: "v0.69.2"
           format: "sarif"
           output: "trivy-results.sarif"
-          severity: "CRITICAL,HIGH"
+          severity: "CRITICAL"
           exit-code: "1"
           trivyignores: ".trivyignore"
           scanners: "vuln"

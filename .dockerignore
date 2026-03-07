@@ -31,5 +31,8 @@ nul
 Thumbs.db
 .DS_Store
 
+# Examples (not needed in server image)
+examples/
+
 # Logs
 *.log

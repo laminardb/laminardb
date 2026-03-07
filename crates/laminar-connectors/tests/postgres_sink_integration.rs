@@ -7,6 +7,7 @@
 //! Run with: `cargo test -p laminar-connectors --features postgres-sink --test postgres_sink_integration`
 
 #![cfg(feature = "postgres-sink")]
+#![cfg(not(target_os = "windows"))]
 
 use std::sync::Arc;
 

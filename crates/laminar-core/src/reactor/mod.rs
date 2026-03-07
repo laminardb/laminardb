@@ -336,8 +336,8 @@ impl Reactor {
 
     /// Run one iteration, appending outputs to a caller-provided buffer.
     ///
-    /// This avoids the per-poll allocation of [`poll`](Self::poll) — the caller can
-    /// reuse the same `Vec` across iterations, retaining its capacity.
+    /// The caller can reuse the same `Vec` across iterations, retaining
+    /// its capacity and avoiding per-poll allocation.
     pub fn poll_into(&mut self, output: &mut Vec<Output>) {
         self.process_events();
         output.append(&mut self.output_buffer);
