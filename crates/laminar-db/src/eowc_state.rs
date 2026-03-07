@@ -386,55 +386,55 @@ impl IncrementalEowcState {
             (None, None)
         };
 
-        // Deduplicate group keys: row_idx → group_id
-        let mut row_to_group: Vec<u32> = Vec::with_capacity(batch.num_rows());
-        let mut group_keys: Vec<arrow::row::OwnedRow> = Vec::new();
-        let mut key_index: AHashMap<Vec<u8>, u32> = AHashMap::new();
-
-        for row_idx in 0..batch.num_rows() {
-            if has_groups {
-                let rows_ref = rows.as_ref().expect("rows set when has_groups");
-                let row = rows_ref.row(row_idx);
-                let raw = row.as_ref().to_vec();
-                let gid = if let Some(&gid) = key_index.get(&raw) {
-                    gid
-                } else {
-                    #[allow(clippy::cast_possible_truncation)]
-                    let gid = group_keys.len() as u32;
-                    group_keys.push(row.owned());
-                    key_index.insert(raw, gid);
-                    gid
-                };
-                row_to_group.push(gid);
-            } else {
-                row_to_group.push(0);
+        // Group row indices by (window_start, group_key).
+        if !has_groups {
+            let mut grouped: AHashMap<i64, Vec<u32>> = AHashMap::new();
+            for (row_idx, &ts_ms) in ts_array.iter().enumerate() {
+                #[allow(clippy::cast_possible_truncation)]
+                let idx = row_idx as u32;
+                for ws in assign_windows(ts_ms, &self.window_type) {
+                    grouped.entry(ws).or_default().push(idx);
+                }
             }
+            for (window_start, indices) in &grouped {
+                let sv_key: Vec<ScalarValue> = Vec::new();
+                let needs_insert = {
+                    let wg = self.windows.entry(*window_start).or_default();
+                    !wg.contains_key(&sv_key)
+                };
+                if needs_insert {
+                    let mut accs = Vec::with_capacity(self.agg_specs.len());
+                    for spec in &self.agg_specs {
+                        accs.push(spec.create_accumulator()?);
+                    }
+                    self.windows.entry(*window_start).or_default().insert(sv_key.clone(), accs);
+                }
+                let Some(accs) = self.windows.get_mut(window_start).and_then(|g| g.get_mut(&sv_key))
+                else { continue; };
+                crate::aggregate_state::IncrementalAggState::update_group_accumulators(
+                    accs, batch, indices, &self.agg_specs,
+                )?;
+            }
+            return Ok(());
         }
 
-        // Group row indices by (window_start, group_id)
-        let mut grouped: AHashMap<(i64, u32), Vec<u32>> = AHashMap::new();
+        // Grouped path: OwnedRow as key
+        let rows_ref = rows.as_ref().expect("rows set when has_groups");
+        let mut grouped: AHashMap<(i64, arrow::row::OwnedRow), Vec<u32>> = AHashMap::new();
         for (row_idx, &ts_ms) in ts_array.iter().enumerate() {
-            let gid = row_to_group[row_idx];
+            let row_key = rows_ref.row(row_idx).owned();
             #[allow(clippy::cast_possible_truncation)]
             let idx = row_idx as u32;
-            let window_starts = assign_windows(ts_ms, &self.window_type);
-            for ws in window_starts {
-                grouped.entry((ws, gid)).or_default().push(idx);
+            for ws in assign_windows(ts_ms, &self.window_type) {
+                grouped.entry((ws, row_key.clone())).or_default().push(idx);
             }
         }
 
-        // One update_group_accumulators call per (window, group)
-        for ((window_start, gid), indices) in &grouped {
-            let sv_key = if has_groups {
-                let conv = converter.as_ref().expect("converter set when has_groups");
-                crate::aggregate_state::row_to_scalar_key_with_types(
-                    conv,
-                    &group_keys[*gid as usize],
-                    &self.group_types,
-                )?
-            } else {
-                Vec::new()
-            };
+        let conv = converter.as_ref().expect("converter set when has_groups");
+        for ((window_start, row_key), indices) in &grouped {
+            let sv_key = crate::aggregate_state::row_to_scalar_key_with_types(
+                conv, row_key, &self.group_types,
+            )?;
 
             // Ensure group exists (borrow-split pattern)
             let needs_insert = {
