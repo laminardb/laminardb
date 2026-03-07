@@ -1256,6 +1256,7 @@ impl LaminarDB {
             let _ = query.send_eof();
             for action in query.poll_ring1() {
                 if let Ring1Action::ProcessBatch(batch) = action {
+                    // Best-effort push; subscription channel may be full
                     let _ = source_clone.push_arrow(batch);
                 }
             }
