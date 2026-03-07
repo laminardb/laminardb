@@ -21,7 +21,8 @@ reqwest = { version = "0.13", default-features = false, features = ["json", "rus
 
 # Database drivers for CDC and sinks
 tokio-postgres = { version = "0.7", optional = true }
-postgres-types = { version = "0.2", optional = true }
+postgres-types = { version = "0.2", optional = true, features = ["with-chrono-0_4"] }
+pgpq = { version = "0.11", optional = true }
 deadpool-postgres = { version = "0.14", optional = true }
 pgwire-replication = { version = "0.2", optional = true }
 # MySQL async driver with rustls (no OpenSSL required)
@@ -77,7 +78,7 @@ default = []
 testing = []
 kafka = ["dep:rdkafka", "dep:arrow-avro", "dep:reqwest"]
 postgres-cdc = ["dep:tokio-postgres", "dep:pgwire-replication", "dep:deadpool-postgres"]
-postgres-sink = ["dep:tokio-postgres", "dep:postgres-types"]
+postgres-sink = ["dep:tokio-postgres", "dep:postgres-types", "dep:deadpool-postgres", "dep:pgpq", "dep:futures-util"]
 # mysql-cdc: Business logic + mysql_async driver with rustls (no OpenSSL required)
 mysql-cdc = ["dep:mysql_async", "dep:tokio-stream"]
 # Delta Lake
@@ -97,3 +98,5 @@ websocket = ["dep:tokio-tungstenite", "dep:tungstenite", "dep:futures-util", "de
 [dev-dependencies]
 tempfile = { workspace = true }
 tokio = { workspace = true, features = ["macros", "rt-multi-thread"] }
+testcontainers = "0.27"
+testcontainers-modules = { version = "0.15", features = ["postgres"] }

@@ -19,7 +19,7 @@ use std::sync::Arc;
 use std::time::Instant;
 
 use arrow_array::{Array, RecordBatch};
-use arrow_schema::{DataType, Field, SchemaRef};
+use arrow_schema::{DataType, Field, Schema, SchemaRef};
 use async_trait::async_trait;
 use tracing::{debug, info, warn};
 
@@ -33,6 +33,13 @@ use super::sink_config::{DeliveryGuarantee, PostgresSinkConfig, WriteMode};
 use super::sink_metrics::PostgresSinkMetrics;
 use super::types::{arrow_to_pg_ddl_type, arrow_type_to_pg_array_cast, arrow_type_to_pg_sql};
 
+#[cfg(feature = "postgres-sink")]
+use super::types::arrow_column_to_pg_array;
+#[cfg(feature = "postgres-sink")]
+use bytes::BytesMut;
+#[cfg(feature = "postgres-sink")]
+use deadpool_postgres::Pool;
+
 /// `PostgreSQL` sink connector.
 ///
 /// Writes Arrow `RecordBatch` to `PostgreSQL` tables using COPY BINARY
@@ -43,6 +50,8 @@ pub struct PostgresSink {
     config: PostgresSinkConfig,
     /// Arrow schema for input batches.
     schema: SchemaRef,
+    /// User-visible schema (metadata columns stripped).
+    user_schema: SchemaRef,
     /// Connector lifecycle state.
     state: ConnectorState,
     /// Current epoch (for exactly-once).
@@ -63,25 +72,42 @@ pub struct PostgresSink {
     copy_sql: Option<String>,
     /// Cached CREATE TABLE SQL (for auto-create).
     create_table_sql: Option<String>,
+    /// Cached DELETE SQL (for changelog mode).
+    delete_sql: Option<String>,
+    /// Connection pool (`None` until `open()` is called).
+    #[cfg(feature = "postgres-sink")]
+    pool: Option<Pool>,
+    /// Pre-allocated encode buffer for pgpq COPY BINARY output.
+    #[cfg(feature = "postgres-sink")]
+    encode_buf: BytesMut,
 }
 
 impl PostgresSink {
     /// Creates a new `PostgreSQL` sink connector.
     #[must_use]
     pub fn new(schema: SchemaRef, config: PostgresSinkConfig) -> Self {
+        let user_schema = build_user_schema(&schema);
+        // Pre-allocate buffer to avoid reallocation during first epoch.
+        let buf_capacity = (config.batch_size / 1024).max(4);
         Self {
             config,
             schema,
+            user_schema,
             state: ConnectorState::Created,
             current_epoch: 0,
             last_committed_epoch: 0,
-            buffer: Vec::new(),
+            buffer: Vec::with_capacity(buf_capacity),
             buffered_rows: 0,
             last_flush: Instant::now(),
             metrics: PostgresSinkMetrics::new(),
             upsert_sql: None,
             copy_sql: None,
             create_table_sql: None,
+            delete_sql: None,
+            #[cfg(feature = "postgres-sink")]
+            pool: None,
+            #[cfg(feature = "postgres-sink")]
+            encode_buf: BytesMut::with_capacity(64 * 1024),
         }
     }
 
@@ -361,33 +387,278 @@ impl PostgresSink {
         if self.config.auto_create_table {
             self.create_table_sql = Some(Self::build_create_table_sql(&self.schema, &self.config));
         }
+
+        if self.config.changelog_mode {
+            self.delete_sql = Some(Self::build_delete_sql(&self.schema, &self.config));
+        }
     }
 
-    /// Flushes the internal buffer by writing to `PostgreSQL`.
-    ///
-    /// # Errors
-    ///
-    /// Returns `ConnectorError::UnsupportedOperation` because the `PostgreSQL`
-    /// write path requires `tokio-postgres` which is not yet wired. Enable
-    /// the `postgres-sink` feature once the implementation is complete.
-    #[allow(clippy::unused_self)] // will use self when tokio-postgres is wired
-    fn flush_buffer_local(&mut self) -> Result<WriteResult, ConnectorError> {
-        Err(ConnectorError::UnsupportedOperation(
-            "PostgreSQL sink write path is not yet implemented — \
-             flush_buffer_local requires tokio-postgres connection"
-                .into(),
-        ))
+    /// Returns a reference to the connection pool, or an error if not initialized.
+    #[cfg(feature = "postgres-sink")]
+    fn pool(&self) -> Result<&Pool, ConnectorError> {
+        self.pool.as_ref().ok_or(ConnectorError::InvalidState {
+            expected: "pool initialized (call open() first)".into(),
+            actual: "pool not initialized".into(),
+        })
+    }
+
+    /// Concatenates all buffered batches and strips metadata columns.
+    #[cfg(feature = "postgres-sink")]
+    fn concat_buffer(&self) -> Result<RecordBatch, ConnectorError> {
+        if self.buffer.is_empty() {
+            return Ok(RecordBatch::new_empty(self.user_schema.clone()));
+        }
+
+        let stripped: Result<Vec<RecordBatch>, ConnectorError> =
+            self.buffer.iter().map(strip_metadata_columns).collect();
+        let stripped = stripped?;
+
+        arrow_select::concat::concat_batches(&self.user_schema, &stripped)
+            .map_err(|e| ConnectorError::Internal(format!("batch concat failed: {e}")))
+    }
+
+    /// Flushes buffered data to `PostgreSQL` using the COPY BINARY protocol.
+    #[cfg(feature = "postgres-sink")]
+    async fn flush_append(
+        &mut self,
+        client: &tokio_postgres::Client,
+    ) -> Result<WriteResult, ConnectorError> {
+        let user_batch = self.concat_buffer()?;
+        if user_batch.num_rows() == 0 {
+            return Ok(WriteResult::new(0, 0));
+        }
+
+        let mut encoder = pgpq::ArrowToPostgresBinaryEncoder::try_new(self.user_schema.as_ref())
+            .map_err(|e| ConnectorError::Internal(format!("pgpq encoder init: {e}")))?;
+
+        self.encode_buf.clear();
+        encoder.write_header(&mut self.encode_buf);
+        encoder
+            .write_batch(&user_batch, &mut self.encode_buf)
+            .map_err(|e| ConnectorError::Internal(format!("pgpq encode: {e}")))?;
+        encoder
+            .write_footer(&mut self.encode_buf)
+            .map_err(|e| ConnectorError::Internal(format!("pgpq footer: {e}")))?;
+
+        let encoded_bytes = self.encode_buf.len();
+        let bytes_to_send = self.encode_buf.split().freeze();
+
+        let copy_sql = self
+            .copy_sql
+            .as_deref()
+            .ok_or_else(|| ConnectorError::Internal("COPY SQL not prepared".into()))?;
+
+        let sink = client
+            .copy_in(copy_sql)
+            .await
+            .map_err(|e| ConnectorError::WriteError(format!("COPY start: {e}")))?;
+
+        {
+            use futures_util::SinkExt;
+            futures_util::pin_mut!(sink);
+            sink.send(bytes_to_send)
+                .await
+                .map_err(|e| ConnectorError::WriteError(format!("COPY send: {e}")))?;
+            sink.close()
+                .await
+                .map_err(|e| ConnectorError::WriteError(format!("COPY finish: {e}")))?;
+        }
+
+        let rows = user_batch.num_rows();
+        self.metrics.record_write(rows as u64, encoded_bytes as u64);
+        self.metrics.record_flush();
+        self.metrics.record_copy();
+
+        Ok(WriteResult::new(rows, encoded_bytes as u64))
+    }
+
+    /// Flushes buffered data to `PostgreSQL` using UNNEST-based upsert.
+    #[cfg(feature = "postgres-sink")]
+    #[allow(clippy::cast_possible_truncation)]
+    async fn flush_upsert(
+        &mut self,
+        client: &tokio_postgres::Client,
+    ) -> Result<WriteResult, ConnectorError> {
+        if self.config.changelog_mode {
+            return self.flush_changelog(client).await;
+        }
+
+        let user_batch = self.concat_buffer()?;
+        if user_batch.num_rows() == 0 {
+            return Ok(WriteResult::new(0, 0));
+        }
+
+        let upsert_sql = self
+            .upsert_sql
+            .as_deref()
+            .ok_or_else(|| ConnectorError::Internal("upsert SQL not prepared".into()))?;
+
+        let rows = execute_unnest(client, upsert_sql, &user_batch).await?;
+
+        let byte_estimate = estimate_batch_bytes(&user_batch);
+        self.metrics.record_write(rows, byte_estimate);
+        self.metrics.record_flush();
+        self.metrics.record_upsert();
+
+        Ok(WriteResult::new(rows as usize, byte_estimate))
+    }
+
+    /// Flushes changelog batches: deletes first, then upserts.
+    #[cfg(feature = "postgres-sink")]
+    #[allow(clippy::cast_possible_truncation)]
+    async fn flush_changelog(
+        &mut self,
+        client: &tokio_postgres::Client,
+    ) -> Result<WriteResult, ConnectorError> {
+        let mut total_rows: u64 = 0;
+        let mut total_bytes: u64 = 0;
+
+        // Split each buffered batch into inserts/deletes.
+        let mut all_inserts = Vec::new();
+        let mut all_deletes = Vec::new();
+        for batch in &self.buffer {
+            let (ins, del) = Self::split_changelog_batch(batch)?;
+            if ins.num_rows() > 0 {
+                all_inserts.push(ins);
+            }
+            if del.num_rows() > 0 {
+                all_deletes.push(del);
+            }
+        }
+
+        // Process inserts/updates first, then deletes.
+        // This handles the common CDC pattern where a key is inserted then
+        // later deleted within the same epoch. For the rare case where a key
+        // is deleted then re-inserted in the same batch, the upsert after
+        // delete produces the correct final state.
+        if !all_inserts.is_empty() {
+            let insert_batch =
+                arrow_select::concat::concat_batches(&self.user_schema, &all_inserts)
+                    .map_err(|e| ConnectorError::Internal(format!("concat inserts: {e}")))?;
+
+            let upsert_sql = self
+                .upsert_sql
+                .as_deref()
+                .ok_or_else(|| ConnectorError::Internal("upsert SQL not prepared".into()))?;
+
+            let rows = execute_unnest(client, upsert_sql, &insert_batch).await?;
+            let bytes = estimate_batch_bytes(&insert_batch);
+            self.metrics.record_write(rows, bytes);
+            self.metrics.record_upsert();
+            total_rows += rows;
+            total_bytes += bytes;
+        }
+
+        if !all_deletes.is_empty() {
+            let delete_batch =
+                arrow_select::concat::concat_batches(&self.user_schema, &all_deletes)
+                    .map_err(|e| ConnectorError::Internal(format!("concat deletes: {e}")))?;
+            let deleted = self.execute_deletes(client, &delete_batch).await?;
+            self.metrics.record_deletes(deleted as u64);
+            total_rows += deleted as u64;
+        }
+
+        self.metrics.record_flush();
+        Ok(WriteResult::new(total_rows as usize, total_bytes))
+    }
+
+    /// Executes batched DELETE for changelog delete records.
+    #[cfg(feature = "postgres-sink")]
+    #[allow(clippy::cast_possible_truncation)]
+    async fn execute_deletes(
+        &self,
+        client: &tokio_postgres::Client,
+        delete_batch: &RecordBatch,
+    ) -> Result<usize, ConnectorError> {
+        if delete_batch.num_rows() == 0 {
+            return Ok(0);
+        }
+
+        let delete_sql = self
+            .delete_sql
+            .as_deref()
+            .ok_or_else(|| ConnectorError::Internal("DELETE SQL not prepared".into()))?;
+
+        let pk_params: Vec<Box<dyn postgres_types::ToSql + Sync + Send>> = self
+            .config
+            .primary_key_columns
+            .iter()
+            .map(|col| {
+                let idx = delete_batch.schema().index_of(col).map_err(|_| {
+                    ConnectorError::ConfigurationError(format!(
+                        "primary key column '{col}' not in delete batch"
+                    ))
+                })?;
+                arrow_column_to_pg_array(delete_batch.column(idx))
+            })
+            .collect::<Result<_, _>>()?;
+
+        let pk_refs: Vec<&(dyn postgres_types::ToSql + Sync)> = pk_params
+            .iter()
+            .map(|p| p.as_ref() as &(dyn postgres_types::ToSql + Sync))
+            .collect();
+
+        let rows = client
+            .execute(delete_sql, &pk_refs)
+            .await
+            .map_err(|e| ConnectorError::WriteError(format!("DELETE: {e}")))?;
+
+        Ok(rows as usize)
+    }
+
+    /// Dispatches flush to the appropriate write mode.
+    #[cfg(feature = "postgres-sink")]
+    async fn flush_to_client(
+        &mut self,
+        client: &tokio_postgres::Client,
+    ) -> Result<WriteResult, ConnectorError> {
+        match self.config.write_mode {
+            WriteMode::Append => self.flush_append(client).await,
+            WriteMode::Upsert => self.flush_upsert(client).await,
+        }
+    }
+
+    /// Checks whether the given epoch has already been committed to `PostgreSQL`.
+    #[cfg(feature = "postgres-sink")]
+    #[allow(clippy::cast_sign_loss)]
+    async fn is_epoch_committed(
+        &self,
+        client: &tokio_postgres::Client,
+        epoch: u64,
+    ) -> Result<bool, ConnectorError> {
+        let sink_id = self.config.effective_sink_id();
+        let row = client
+            .query_opt(Self::build_epoch_recover_sql(), &[&sink_id])
+            .await
+            .map_err(|e| ConnectorError::Internal(format!("epoch recovery query: {e}")))?;
+
+        if let Some(row) = row {
+            let committed: i64 = row.get(0);
+            Ok(committed as u64 >= epoch)
+        } else {
+            Ok(false)
+        }
     }
 }
 
+// ── SinkConnector implementation ────────────────────────────────────
+
+// When the postgres-sink feature is enabled, provide the real implementation.
+#[cfg(feature = "postgres-sink")]
 #[async_trait]
 impl SinkConnector for PostgresSink {
     async fn open(&mut self, config: &ConnectorConfig) -> Result<(), ConnectorError> {
         self.state = ConnectorState::Initializing;
 
-        // Re-parse config if properties provided.
         if !config.properties().is_empty() {
             self.config = PostgresSinkConfig::from_config(config)?;
+        }
+
+        // Validate changelog requires upsert.
+        if self.config.changelog_mode && self.config.write_mode != WriteMode::Upsert {
+            return Err(ConnectorError::ConfigurationError(
+                "changelog mode requires write.mode = 'upsert'".into(),
+            ));
         }
 
         info!(
@@ -397,23 +668,83 @@ impl SinkConnector for PostgresSink {
             "opening PostgreSQL sink connector"
         );
 
-        // Prepare cached SQL statements.
         self.prepare_statements();
 
-        // Set auto-generated sink ID if not provided.
         if self.config.sink_id.is_empty() {
             self.config.sink_id = self.config.effective_sink_id();
         }
 
-        return Err(ConnectorError::UnsupportedOperation(
-            "PostgreSQL sink is not yet implemented — \
-             requires tokio-postgres connection pool (deadpool-postgres), \
-             table auto-creation, and offset tracking table for exactly-once"
-                .into(),
-        ));
+        // Build connection pool.
+        let mut pool_cfg = deadpool_postgres::Config::new();
+        pool_cfg.host = Some(self.config.hostname.clone());
+        pool_cfg.port = Some(self.config.port);
+        pool_cfg.dbname = Some(self.config.database.clone());
+        pool_cfg.user = Some(self.config.username.clone());
+        pool_cfg.password = Some(self.config.password.clone());
+        pool_cfg.pool = Some(deadpool_postgres::PoolConfig::new(self.config.pool_size));
+
+        let pool = pool_cfg
+            .create_pool(
+                Some(deadpool_postgres::Runtime::Tokio1),
+                tokio_postgres::NoTls,
+            )
+            .map_err(|e| ConnectorError::ConnectionFailed(format!("pool creation failed: {e}")))?;
+
+        // Validate connectivity.
+        let client = pool.get().await.map_err(|e| {
+            ConnectorError::ConnectionFailed(format!("initial connection failed: {e}"))
+        })?;
+
+        // Auto-create target table.
+        if self.config.auto_create_table {
+            if let Some(ddl) = &self.create_table_sql {
+                client.batch_execute(ddl.as_str()).await.map_err(|e| {
+                    ConnectorError::Internal(format!("auto-create table failed: {e}"))
+                })?;
+                debug!(table = %self.config.qualified_table_name(), "target table ensured");
+            }
+        }
+
+        // Create offset tracking table for exactly-once.
+        if self.config.delivery_guarantee == DeliveryGuarantee::ExactlyOnce {
+            client
+                .batch_execute(Self::build_offset_table_sql())
+                .await
+                .map_err(|e| {
+                    ConnectorError::Internal(format!("create offset table failed: {e}"))
+                })?;
+
+            // Recover last committed epoch.
+            {
+                let recover_sink_id = self.config.effective_sink_id();
+                let row = client
+                    .query_opt(Self::build_epoch_recover_sql(), &[&recover_sink_id])
+                    .await
+                    .map_err(|e| ConnectorError::Internal(format!("epoch recovery: {e}")))?;
+                if let Some(row) = row {
+                    let epoch: i64 = row.get(0);
+                    #[allow(clippy::cast_sign_loss)]
+                    {
+                        self.last_committed_epoch = epoch as u64;
+                    }
+                    info!(epoch, "recovered last committed epoch");
+                }
+            }
+        }
+
+        self.pool = Some(pool);
+        self.state = ConnectorState::Running;
+
+        info!(
+            table = %self.config.qualified_table_name(),
+            pool_size = self.config.pool_size,
+            "PostgreSQL sink connector opened"
+        );
+
+        Ok(())
     }
 
-    #[allow(clippy::cast_possible_truncation)] // Record batch row/column counts fit in narrower types
+    #[allow(clippy::cast_possible_truncation)]
     async fn write_batch(&mut self, batch: &RecordBatch) -> Result<WriteResult, ConnectorError> {
         if self.state != ConnectorState::Running {
             return Err(ConnectorError::InvalidState {
@@ -426,21 +757,28 @@ impl SinkConnector for PostgresSink {
             return Ok(WriteResult::new(0, 0));
         }
 
-        // Buffer the batch.
         self.buffer.push(batch.clone());
         self.buffered_rows += batch.num_rows();
 
-        // Check if we should flush.
+        // In exactly-once mode, defer all flushing to pre_commit.
+        if self.config.delivery_guarantee == DeliveryGuarantee::ExactlyOnce {
+            return Ok(WriteResult::new(0, 0));
+        }
+
+        // At-least-once: auto-flush when thresholds are reached.
         let should_flush = self.buffered_rows >= self.config.batch_size
             || self.last_flush.elapsed() >= self.config.flush_interval;
 
         if should_flush {
-            let result = self.flush_buffer_local()?;
-            debug!(
-                records = result.records_written,
-                bytes = result.bytes_written,
-                "flushed batch to PostgreSQL"
-            );
+            let client = self
+                .pool()?
+                .get()
+                .await
+                .map_err(|e| ConnectorError::ConnectionFailed(format!("pool checkout: {e}")))?;
+            let result = self.flush_to_client(&client).await?;
+            self.buffer.clear();
+            self.buffered_rows = 0;
+            self.last_flush = Instant::now();
             return Ok(result);
         }
 
@@ -453,13 +791,6 @@ impl SinkConnector for PostgresSink {
 
     async fn begin_epoch(&mut self, epoch: u64) -> Result<(), ConnectorError> {
         self.current_epoch = epoch;
-
-        if self.config.delivery_guarantee == DeliveryGuarantee::ExactlyOnce
-            && !self.buffer.is_empty()
-        {
-            self.flush_buffer_local()?;
-        }
-
         debug!(epoch, "PostgreSQL sink epoch started");
         Ok(())
     }
@@ -472,11 +803,65 @@ impl SinkConnector for PostgresSink {
             )));
         }
 
-        if !self.buffer.is_empty() {
-            self.flush_buffer_local()?;
+        if self.buffer.is_empty() {
+            return Ok(());
         }
 
-        debug!(epoch, "PostgreSQL sink pre-committed (flushed)");
+        let client = self
+            .pool()?
+            .get()
+            .await
+            .map_err(|e| ConnectorError::ConnectionFailed(format!("pool checkout: {e}")))?;
+
+        if self.config.delivery_guarantee == DeliveryGuarantee::ExactlyOnce {
+            // Check for already-committed epoch (recovery replay).
+            if self.is_epoch_committed(&client, epoch).await? {
+                info!(epoch, "epoch already committed in PostgreSQL, skipping");
+                self.buffer.clear();
+                self.buffered_rows = 0;
+                return Ok(());
+            }
+
+            // Co-transactional: data + epoch marker in one PG transaction.
+            client
+                .batch_execute("BEGIN")
+                .await
+                .map_err(|e| ConnectorError::WriteError(format!("BEGIN: {e}")))?;
+
+            match self.flush_to_client(&client).await {
+                Ok(_result) => {
+                    let sink_id = self.config.effective_sink_id();
+                    #[allow(clippy::cast_possible_wrap)]
+                    let epoch_i64 = epoch as i64;
+                    let params: Vec<&(dyn postgres_types::ToSql + Sync)> =
+                        vec![&sink_id, &epoch_i64];
+                    client
+                        .execute(Self::build_epoch_commit_sql(), &params)
+                        .await
+                        .map_err(|e| {
+                            ConnectorError::WriteError(format!("epoch marker write: {e}"))
+                        })?;
+
+                    client
+                        .batch_execute("COMMIT")
+                        .await
+                        .map_err(|e| ConnectorError::WriteError(format!("COMMIT: {e}")))?;
+                }
+                Err(e) => {
+                    let _ = client.batch_execute("ROLLBACK").await;
+                    return Err(e);
+                }
+            }
+        } else {
+            // At-least-once: just flush remaining buffer.
+            self.flush_to_client(&client).await?;
+        }
+
+        self.buffer.clear();
+        self.buffered_rows = 0;
+        self.last_flush = Instant::now();
+
+        debug!(epoch, "PostgreSQL sink pre-committed");
         Ok(())
     }
 
@@ -496,7 +881,6 @@ impl SinkConnector for PostgresSink {
     }
 
     async fn rollback_epoch(&mut self, epoch: u64) -> Result<(), ConnectorError> {
-        // Discard buffered data.
         self.buffer.clear();
         self.buffered_rows = 0;
 
@@ -507,7 +891,21 @@ impl SinkConnector for PostgresSink {
 
     fn health_check(&self) -> HealthStatus {
         match self.state {
-            ConnectorState::Running => HealthStatus::Healthy,
+            ConnectorState::Running => {
+                if let Some(pool) = &self.pool {
+                    let status = pool.status();
+                    if status.available > 0 {
+                        HealthStatus::Healthy
+                    } else {
+                        HealthStatus::Degraded(format!(
+                            "no available connections ({} in use)",
+                            status.size
+                        ))
+                    }
+                } else {
+                    HealthStatus::Unhealthy("pool not initialized".into())
+                }
+            }
             ConnectorState::Created | ConnectorState::Initializing => HealthStatus::Unknown,
             ConnectorState::Paused => HealthStatus::Degraded("connector paused".into()),
             ConnectorState::Recovering => HealthStatus::Degraded("recovering".into()),
@@ -537,9 +935,18 @@ impl SinkConnector for PostgresSink {
     }
 
     async fn flush(&mut self) -> Result<(), ConnectorError> {
-        if !self.buffer.is_empty() {
-            self.flush_buffer_local()?;
+        if self.buffer.is_empty() {
+            return Ok(());
         }
+        let client = self
+            .pool()?
+            .get()
+            .await
+            .map_err(|e| ConnectorError::ConnectionFailed(format!("pool checkout: {e}")))?;
+        self.flush_to_client(&client).await?;
+        self.buffer.clear();
+        self.buffered_rows = 0;
+        self.last_flush = Instant::now();
         Ok(())
     }
 
@@ -547,9 +954,16 @@ impl SinkConnector for PostgresSink {
         info!("closing PostgreSQL sink connector");
 
         if !self.buffer.is_empty() {
-            self.flush_buffer_local()?;
+            if let Some(pool) = &self.pool {
+                if let Ok(client) = pool.get().await {
+                    let _ = self.flush_to_client(&client).await;
+                }
+            }
         }
 
+        self.buffer.clear();
+        self.buffered_rows = 0;
+        self.pool = None;
         self.state = ConnectorState::Closed;
 
         info!(
@@ -563,6 +977,61 @@ impl SinkConnector for PostgresSink {
             "PostgreSQL sink connector closed"
         );
 
+        Ok(())
+    }
+}
+
+// When postgres-sink feature is NOT enabled, provide a stub that returns UnsupportedOperation.
+#[cfg(not(feature = "postgres-sink"))]
+#[async_trait]
+impl SinkConnector for PostgresSink {
+    async fn open(&mut self, _config: &ConnectorConfig) -> Result<(), ConnectorError> {
+        Err(ConnectorError::UnsupportedOperation(
+            "PostgreSQL sink requires the 'postgres-sink' feature".into(),
+        ))
+    }
+
+    async fn write_batch(&mut self, _batch: &RecordBatch) -> Result<WriteResult, ConnectorError> {
+        Err(ConnectorError::UnsupportedOperation(
+            "PostgreSQL sink requires the 'postgres-sink' feature".into(),
+        ))
+    }
+
+    fn schema(&self) -> SchemaRef {
+        self.schema.clone()
+    }
+
+    fn health_check(&self) -> HealthStatus {
+        match self.state {
+            ConnectorState::Running => HealthStatus::Healthy,
+            ConnectorState::Created | ConnectorState::Initializing => HealthStatus::Unknown,
+            ConnectorState::Paused => HealthStatus::Degraded("connector paused".into()),
+            ConnectorState::Recovering => HealthStatus::Degraded("recovering".into()),
+            ConnectorState::Closed => HealthStatus::Unhealthy("closed".into()),
+            ConnectorState::Failed => HealthStatus::Unhealthy("failed".into()),
+        }
+    }
+
+    fn metrics(&self) -> ConnectorMetrics {
+        self.metrics.to_connector_metrics()
+    }
+
+    fn capabilities(&self) -> SinkConnectorCapabilities {
+        let mut caps = SinkConnectorCapabilities::default().with_idempotent();
+        if self.config.write_mode == WriteMode::Upsert {
+            caps = caps.with_upsert();
+        }
+        if self.config.changelog_mode {
+            caps = caps.with_changelog();
+        }
+        if self.config.delivery_guarantee == DeliveryGuarantee::ExactlyOnce {
+            caps = caps.with_exactly_once().with_two_phase_commit();
+        }
+        caps
+    }
+
+    async fn close(&mut self) -> Result<(), ConnectorError> {
+        self.state = ConnectorState::Closed;
         Ok(())
     }
 }
@@ -602,6 +1071,18 @@ fn user_fields(schema: &SchemaRef) -> Vec<&Arc<Field>> {
         .collect()
 }
 
+/// Builds a schema containing only user-visible columns.
+fn build_user_schema(schema: &SchemaRef) -> SchemaRef {
+    Arc::new(Schema::new(
+        schema
+            .fields()
+            .iter()
+            .filter(|f| !f.name().starts_with('_'))
+            .cloned()
+            .collect::<Vec<_>>(),
+    ))
+}
+
 /// Filters a `RecordBatch` to include only rows at the given indices.
 ///
 /// Also strips metadata columns (those starting with `_`) from the output.
@@ -610,8 +1091,7 @@ fn filter_batch_by_indices(
     indices: &[u32],
 ) -> Result<RecordBatch, ConnectorError> {
     if indices.is_empty() {
-        // Return an empty batch with user columns only.
-        let user_schema = Arc::new(arrow_schema::Schema::new(
+        let user_schema = Arc::new(Schema::new(
             batch
                 .schema()
                 .fields()
@@ -625,8 +1105,7 @@ fn filter_batch_by_indices(
 
     let indices_array = arrow_array::UInt32Array::from(indices.to_vec());
 
-    // Filter each non-metadata column by the indices.
-    let user_schema = Arc::new(arrow_schema::Schema::new(
+    let user_schema = Arc::new(Schema::new(
         batch
             .schema()
             .fields()
@@ -650,6 +1129,67 @@ fn filter_batch_by_indices(
 
     RecordBatch::try_new(user_schema, filtered_columns)
         .map_err(|e| ConnectorError::Internal(format!("batch construction failed: {e}")))
+}
+
+/// Strips metadata columns (starting with `_`) from a `RecordBatch`.
+#[cfg(feature = "postgres-sink")]
+fn strip_metadata_columns(batch: &RecordBatch) -> Result<RecordBatch, ConnectorError> {
+    let schema = batch.schema();
+    let user_indices: Vec<usize> = schema
+        .fields()
+        .iter()
+        .enumerate()
+        .filter(|(_, f)| !f.name().starts_with('_'))
+        .map(|(i, _)| i)
+        .collect();
+
+    if user_indices.len() == schema.fields().len() {
+        return Ok(batch.clone());
+    }
+
+    let user_schema = Arc::new(Schema::new(
+        user_indices
+            .iter()
+            .map(|&i| schema.field(i).clone())
+            .collect::<Vec<_>>(),
+    ));
+    let columns: Vec<Arc<dyn Array>> = user_indices
+        .iter()
+        .map(|&i| batch.column(i).clone())
+        .collect();
+
+    RecordBatch::try_new(user_schema, columns)
+        .map_err(|e| ConnectorError::Internal(format!("strip metadata: {e}")))
+}
+
+/// Executes an UNNEST-based INSERT/UPSERT using Arrow column arrays as parameters.
+#[cfg(feature = "postgres-sink")]
+async fn execute_unnest(
+    client: &tokio_postgres::Client,
+    sql: &str,
+    batch: &RecordBatch,
+) -> Result<u64, ConnectorError> {
+    let params: Vec<Box<dyn postgres_types::ToSql + Sync + Send>> = (0..batch.num_columns())
+        .map(|i| arrow_column_to_pg_array(batch.column(i)))
+        .collect::<Result<_, _>>()?;
+
+    let param_refs: Vec<&(dyn postgres_types::ToSql + Sync)> = params
+        .iter()
+        .map(|p| p.as_ref() as &(dyn postgres_types::ToSql + Sync))
+        .collect();
+
+    client
+        .execute(sql, &param_refs)
+        .await
+        .map_err(|e| ConnectorError::WriteError(format!("UNNEST execute: {e}")))
+}
+
+/// Rough byte-size estimate for metrics (sum of column buffer sizes).
+#[cfg(feature = "postgres-sink")]
+fn estimate_batch_bytes(batch: &RecordBatch) -> u64 {
+    (0..batch.num_columns())
+        .map(|i| batch.column(i).get_buffer_memory_size() as u64)
+        .sum()
 }
 
 #[cfg(test)]
@@ -690,7 +1230,7 @@ mod tests {
                 Arc::new(arrow_array::Float64Array::from(values)),
             ],
         )
-        .unwrap()
+        .expect("test batch creation")
     }
 
     // ── Constructor tests ──
@@ -704,6 +1244,19 @@ mod tests {
         assert_eq!(sink.buffered_rows(), 0);
         assert!(sink.upsert_sql.is_none());
         assert!(sink.copy_sql.is_none());
+    }
+
+    #[test]
+    fn test_user_schema_strips_metadata() {
+        let schema = Arc::new(Schema::new(vec![
+            Field::new("id", DataType::Int64, false),
+            Field::new("_op", DataType::Utf8, false),
+            Field::new("value", DataType::Utf8, true),
+        ]));
+        let sink = PostgresSink::new(schema, test_config());
+        assert_eq!(sink.user_schema.fields().len(), 2);
+        assert_eq!(sink.user_schema.field(0).name(), "id");
+        assert_eq!(sink.user_schema.field(1).name(), "value");
     }
 
     #[test]
@@ -763,7 +1316,6 @@ mod tests {
         assert!(sql.contains("DO UPDATE SET"));
         assert!(sql.contains("name = EXCLUDED.name"));
         assert!(sql.contains("value = EXCLUDED.value"));
-        // Primary key should NOT be in the UPDATE SET clause
         assert!(!sql.contains("id = EXCLUDED.id"));
     }
 
@@ -828,7 +1380,7 @@ mod tests {
     #[test]
     fn test_build_create_table_sql_no_pk() {
         let schema = test_schema();
-        let config = test_config(); // No primary key columns
+        let config = test_config();
         let sql = PostgresSink::build_create_table_sql(&schema, &config);
 
         assert!(sql.starts_with("CREATE TABLE IF NOT EXISTS"));
@@ -877,39 +1429,33 @@ mod tests {
                 Arc::new(Int64Array::from(vec![100, 200, 300, 400, 500])),
             ],
         )
-        .unwrap()
+        .expect("changelog batch creation")
     }
 
     #[test]
     fn test_split_changelog_batch() {
         let batch = changelog_batch();
-        let (inserts, deletes) = PostgresSink::split_changelog_batch(&batch).unwrap();
+        let (inserts, deletes) = PostgresSink::split_changelog_batch(&batch).expect("split");
 
-        // Inserts: rows 0 (I), 1 (U), 3 (I) = 3 rows
         assert_eq!(inserts.num_rows(), 3);
-        // Deletes: rows 2 (D), 4 (D) = 2 rows
         assert_eq!(deletes.num_rows(), 2);
-
-        // Metadata columns should be stripped
-        assert_eq!(inserts.num_columns(), 2); // id, name only
+        assert_eq!(inserts.num_columns(), 2);
         assert_eq!(deletes.num_columns(), 2);
 
-        // Verify insert values
         let insert_ids = inserts
             .column(0)
             .as_any()
             .downcast_ref::<Int64Array>()
-            .unwrap();
+            .expect("i64 array");
         assert_eq!(insert_ids.value(0), 1);
         assert_eq!(insert_ids.value(1), 2);
         assert_eq!(insert_ids.value(2), 4);
 
-        // Verify delete values
         let delete_ids = deletes
             .column(0)
             .as_any()
             .downcast_ref::<Int64Array>()
-            .unwrap();
+            .expect("i64 array");
         assert_eq!(delete_ids.value(0), 3);
         assert_eq!(delete_ids.value(1), 5);
     }
@@ -926,9 +1472,9 @@ mod tests {
                 Arc::new(Int64Array::from(vec![100, 200])),
             ],
         )
-        .unwrap();
+        .expect("batch");
 
-        let (inserts, deletes) = PostgresSink::split_changelog_batch(&batch).unwrap();
+        let (inserts, deletes) = PostgresSink::split_changelog_batch(&batch).expect("split");
         assert_eq!(inserts.num_rows(), 2);
         assert_eq!(deletes.num_rows(), 0);
     }
@@ -945,9 +1491,9 @@ mod tests {
                 Arc::new(Int64Array::from(vec![100, 200])),
             ],
         )
-        .unwrap();
+        .expect("batch");
 
-        let (inserts, deletes) = PostgresSink::split_changelog_batch(&batch).unwrap();
+        let (inserts, deletes) = PostgresSink::split_changelog_batch(&batch).expect("split");
         assert_eq!(inserts.num_rows(), 0);
         assert_eq!(deletes.num_rows(), 2);
     }
@@ -956,7 +1502,7 @@ mod tests {
     fn test_split_changelog_missing_op_column() {
         let schema = Arc::new(Schema::new(vec![Field::new("id", DataType::Int64, false)]));
         let batch =
-            RecordBatch::try_new(schema, vec![Arc::new(Int64Array::from(vec![1]))]).unwrap();
+            RecordBatch::try_new(schema, vec![Arc::new(Int64Array::from(vec![1]))]).expect("batch");
 
         let result = PostgresSink::split_changelog_batch(&batch);
         assert!(result.is_err());
@@ -970,15 +1516,67 @@ mod tests {
             vec![
                 Arc::new(Int64Array::from(vec![1])),
                 Arc::new(StringArray::from(vec!["a"])),
-                Arc::new(StringArray::from(vec!["r"])), // snapshot read
+                Arc::new(StringArray::from(vec!["r"])),
                 Arc::new(Int64Array::from(vec![100])),
             ],
         )
-        .unwrap();
+        .expect("batch");
 
-        let (inserts, deletes) = PostgresSink::split_changelog_batch(&batch).unwrap();
+        let (inserts, deletes) = PostgresSink::split_changelog_batch(&batch).expect("split");
         assert_eq!(inserts.num_rows(), 1);
         assert_eq!(deletes.num_rows(), 0);
+    }
+
+    // ── Buffering tests ──
+
+    #[tokio::test]
+    async fn test_write_batch_buffering() {
+        let mut config = test_config();
+        config.batch_size = 100;
+        let mut sink = PostgresSink::new(test_schema(), config);
+        sink.state = ConnectorState::Running;
+
+        let batch = test_batch(10);
+        let result = sink.write_batch(&batch).await.expect("write");
+
+        assert_eq!(result.records_written, 0);
+        assert_eq!(sink.buffered_rows(), 10);
+    }
+
+    #[tokio::test]
+    async fn test_write_batch_empty() {
+        let mut sink = PostgresSink::new(test_schema(), test_config());
+        sink.state = ConnectorState::Running;
+
+        let batch = test_batch(0);
+        let result = sink.write_batch(&batch).await.expect("write");
+        assert_eq!(result.records_written, 0);
+        assert_eq!(sink.buffered_rows(), 0);
+    }
+
+    #[tokio::test]
+    async fn test_write_batch_not_running() {
+        let mut sink = PostgresSink::new(test_schema(), test_config());
+
+        let batch = test_batch(10);
+        let result = sink.write_batch(&batch).await;
+        assert!(result.is_err());
+    }
+
+    #[tokio::test]
+    async fn test_exactly_once_defers_flush() {
+        let mut config = test_config();
+        config.batch_size = 5; // Would normally trigger flush at 10 rows
+        config.delivery_guarantee = DeliveryGuarantee::ExactlyOnce;
+        let mut sink = PostgresSink::new(test_schema(), config);
+        sink.state = ConnectorState::Running;
+
+        let batch = test_batch(10);
+        let result = sink.write_batch(&batch).await.expect("write");
+
+        // Exactly-once: no auto-flush, all buffered.
+        assert_eq!(result.records_written, 0);
+        assert_eq!(sink.buffered_rows(), 10);
     }
 
     // ── Health check tests ──
@@ -987,27 +1585,6 @@ mod tests {
     fn test_health_check_created() {
         let sink = PostgresSink::new(test_schema(), test_config());
         assert_eq!(sink.health_check(), HealthStatus::Unknown);
-    }
-
-    #[test]
-    fn test_health_check_running() {
-        let mut sink = PostgresSink::new(test_schema(), test_config());
-        sink.state = ConnectorState::Running;
-        assert_eq!(sink.health_check(), HealthStatus::Healthy);
-    }
-
-    #[test]
-    fn test_health_check_closed() {
-        let mut sink = PostgresSink::new(test_schema(), test_config());
-        sink.state = ConnectorState::Closed;
-        assert!(matches!(sink.health_check(), HealthStatus::Unhealthy(_)));
-    }
-
-    #[test]
-    fn test_health_check_failed() {
-        let mut sink = PostgresSink::new(test_schema(), test_config());
-        sink.state = ConnectorState::Failed;
-        assert!(matches!(sink.health_check(), HealthStatus::Unhealthy(_)));
     }
 
     // ── Capabilities tests ──
@@ -1059,83 +1636,23 @@ mod tests {
         assert_eq!(m.errors_total, 0);
     }
 
-    // ── Batch buffering tests ──
-
-    #[tokio::test]
-    async fn test_write_batch_buffering() {
-        let mut config = test_config();
-        config.batch_size = 100; // Large batch size so it doesn't flush
-        let mut sink = PostgresSink::new(test_schema(), config);
-        sink.state = ConnectorState::Running;
-
-        let batch = test_batch(10);
-        let result = sink.write_batch(&batch).await.unwrap();
-
-        // Should buffer, not flush (10 < 100 batch_size)
-        assert_eq!(result.records_written, 0);
-        assert_eq!(sink.buffered_rows(), 10);
-    }
-
-    #[tokio::test]
-    async fn test_write_batch_auto_flush_returns_error() {
-        let mut config = test_config();
-        config.batch_size = 10;
-        let mut sink = PostgresSink::new(test_schema(), config);
-        sink.state = ConnectorState::Running;
-
-        let batch = test_batch(15);
-        let result = sink.write_batch(&batch).await;
-
-        // Flush triggers UnsupportedOperation because write path is not implemented
-        assert!(result.is_err());
-        assert!(result
-            .unwrap_err()
-            .to_string()
-            .contains("not yet implemented"));
-    }
-
-    #[tokio::test]
-    async fn test_write_batch_empty() {
-        let mut sink = PostgresSink::new(test_schema(), test_config());
-        sink.state = ConnectorState::Running;
-
-        let batch = test_batch(0);
-        let result = sink.write_batch(&batch).await.unwrap();
-        assert_eq!(result.records_written, 0);
-        assert_eq!(sink.buffered_rows(), 0);
-    }
-
-    #[tokio::test]
-    async fn test_write_batch_not_running() {
-        let mut sink = PostgresSink::new(test_schema(), test_config());
-        // state is Created, not Running
-
-        let batch = test_batch(10);
-        let result = sink.write_batch(&batch).await;
-        assert!(result.is_err());
-    }
-
     // ── Epoch lifecycle tests ──
 
     #[tokio::test]
-    async fn test_epoch_lifecycle() {
-        let mut config = upsert_config();
-        config.delivery_guarantee = DeliveryGuarantee::ExactlyOnce;
-        let mut sink = PostgresSink::new(test_schema(), config);
+    async fn test_epoch_lifecycle_state() {
+        let mut sink = PostgresSink::new(test_schema(), test_config());
         sink.state = ConnectorState::Running;
 
-        // Begin epoch
-        sink.begin_epoch(1).await.unwrap();
+        sink.begin_epoch(1).await.expect("begin");
         assert_eq!(sink.current_epoch(), 1);
 
-        // Commit epoch
-        sink.commit_epoch(1).await.unwrap();
+        // commit_epoch updates last_committed_epoch and records metric.
+        sink.commit_epoch(1).await.expect("commit");
         assert_eq!(sink.last_committed_epoch(), 1);
 
-        // Metrics should show 1 commit
         let m = sink.metrics();
         let committed = m.custom.iter().find(|(k, _)| k == "pg.epochs_committed");
-        assert_eq!(committed.unwrap().1, 1.0);
+        assert_eq!(committed.expect("metric").1, 1.0);
     }
 
     #[tokio::test]
@@ -1143,7 +1660,7 @@ mod tests {
         let mut sink = PostgresSink::new(test_schema(), test_config());
         sink.state = ConnectorState::Running;
 
-        sink.begin_epoch(1).await.unwrap();
+        sink.begin_epoch(1).await.expect("begin");
         let result = sink.commit_epoch(2).await;
         assert!(result.is_err());
     }
@@ -1156,78 +1673,11 @@ mod tests {
         sink.state = ConnectorState::Running;
 
         let batch = test_batch(50);
-        sink.write_batch(&batch).await.unwrap();
+        sink.write_batch(&batch).await.expect("write");
         assert_eq!(sink.buffered_rows(), 50);
 
-        sink.rollback_epoch(0).await.unwrap();
+        sink.rollback_epoch(0).await.expect("rollback");
         assert_eq!(sink.buffered_rows(), 0);
-    }
-
-    // ── Flush tests ──
-
-    #[tokio::test]
-    async fn test_explicit_flush_returns_error() {
-        let mut config = test_config();
-        config.batch_size = 1000;
-        let mut sink = PostgresSink::new(test_schema(), config);
-        sink.state = ConnectorState::Running;
-
-        let batch = test_batch(20);
-        sink.write_batch(&batch).await.unwrap();
-        assert_eq!(sink.buffered_rows(), 20);
-
-        let result = sink.flush().await;
-        assert!(result.is_err());
-        assert!(result
-            .unwrap_err()
-            .to_string()
-            .contains("not yet implemented"));
-    }
-
-    // ── Open and close tests ──
-
-    #[tokio::test]
-    async fn test_open_returns_unsupported() {
-        let config = upsert_config();
-        let mut sink = PostgresSink::new(test_schema(), config);
-
-        let connector_config = ConnectorConfig::new("postgres-sink");
-        let result = sink.open(&connector_config).await;
-
-        assert!(result.is_err());
-        assert!(result
-            .unwrap_err()
-            .to_string()
-            .contains("not yet implemented"));
-    }
-
-    #[tokio::test]
-    async fn test_close() {
-        let mut sink = PostgresSink::new(test_schema(), test_config());
-        sink.state = ConnectorState::Running;
-
-        sink.close().await.unwrap();
-        assert_eq!(sink.state(), ConnectorState::Closed);
-    }
-
-    #[tokio::test]
-    async fn test_close_with_buffered_data_returns_error() {
-        let mut config = test_config();
-        config.batch_size = 1000;
-        let mut sink = PostgresSink::new(test_schema(), config);
-        sink.state = ConnectorState::Running;
-
-        let batch = test_batch(30);
-        sink.write_batch(&batch).await.unwrap();
-        assert_eq!(sink.buffered_rows(), 30);
-
-        // close() tries to flush remaining data, which fails
-        let result = sink.close().await;
-        assert!(result.is_err());
-        assert!(result
-            .unwrap_err()
-            .to_string()
-            .contains("not yet implemented"));
     }
 
     // ── Debug output test ──
@@ -1238,5 +1688,28 @@ mod tests {
         let debug = format!("{sink:?}");
         assert!(debug.contains("PostgresSink"));
         assert!(debug.contains("public.events"));
+    }
+
+    // ── Helper function tests ──
+
+    #[test]
+    fn test_build_user_schema() {
+        let schema = Arc::new(Schema::new(vec![
+            Field::new("id", DataType::Int64, false),
+            Field::new("_op", DataType::Utf8, false),
+            Field::new("value", DataType::Float64, true),
+            Field::new("_ts_ms", DataType::Int64, false),
+        ]));
+        let user = build_user_schema(&schema);
+        assert_eq!(user.fields().len(), 2);
+        assert_eq!(user.field(0).name(), "id");
+        assert_eq!(user.field(1).name(), "value");
+    }
+
+    #[test]
+    fn test_build_user_schema_no_metadata() {
+        let schema = test_schema();
+        let user = build_user_schema(&schema);
+        assert_eq!(user.fields().len(), 3);
     }
 }

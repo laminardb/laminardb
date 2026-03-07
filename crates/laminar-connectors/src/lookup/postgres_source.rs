@@ -15,6 +15,8 @@
 //! ## Example
 //!
 //! ```rust,no_run
+//! use std::sync::Arc;
+//! use arrow_schema::{DataType, Field, Schema};
 //! use laminar_connectors::lookup::postgres_source::{
 //!     PostgresLookupSource, PostgresLookupSourceConfig,
 //! };
@@ -26,7 +28,11 @@
 //!     primary_key_columns: vec!["id".into()],
 //!     ..Default::default()
 //! };
-//! let source = PostgresLookupSource::new(config)?;
+//! let schema = Arc::new(Schema::new(vec![
+//!     Field::new("id", DataType::Int64, false),
+//!     Field::new("name", DataType::Utf8, true),
+//! ]));
+//! let source = PostgresLookupSource::new(config, schema)?;
 //! # Ok(())
 //! # }
 //! ```
