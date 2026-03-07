@@ -121,6 +121,9 @@ jobs:
           find crates examples -name Cargo.toml -exec \
             perl -i -pe 's/(path = "\.\.\/\.\.\/[^"]*", )version = "[^"]*"/${1}version = "'"$VERSION"'"/g' {} +
 
+          # Sync Helm chart appVersion
+          perl -i -pe 's/^appVersion:.*/appVersion: "'"$VERSION"'"/' deploy/helm/laminardb/Chart.yaml
+
           echo "Workspace version:"
           grep '^version' Cargo.toml
 

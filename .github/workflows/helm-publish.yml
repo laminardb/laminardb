@@ -60,6 +60,12 @@ jobs:
       - name: Log in to GHCR
         run: echo "${{ secrets.GITHUB_TOKEN }}" | helm registry login ghcr.io -u ${{ github.actor }} --password-stdin
 
+      - name: Sync appVersion from Cargo.toml
+        run: |
+          APP_VERSION=$(grep -m1 '^version' Cargo.toml | sed 's/version = "\(.*\)"/\1/')
+          sed -i "s/^appVersion:.*/appVersion: \"${APP_VERSION}\"/" deploy/helm/laminardb/Chart.yaml
+          echo "Set appVersion to ${APP_VERSION}"
+
       - name: Package chart
         run: helm package deploy/helm/laminardb -d .helm-packages
 
