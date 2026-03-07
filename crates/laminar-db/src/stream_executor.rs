@@ -1421,88 +1421,43 @@ impl StreamExecutor {
         Ok(restored)
     }
 
-    /// Try to restore pending checkpoint data for a newly initialized
-    /// aggregate state. Called after lazy initialization.
+    /// Try to restore checkpoint data for a newly initialized state.
+    /// Logs success/failure with `label`.
+    fn log_restore<C: Clone, S>(
+        query_name: &str,
+        cp: &C,
+        state: &mut S,
+        restore_fn: impl FnOnce(&mut S, &C) -> Result<usize, DbError>,
+        label: &str,
+    ) {
+        let cp_clone = cp.clone();
+        match restore_fn(state, &cp_clone) {
+            Ok(n) => tracing::info!(query = %query_name, groups = n, "Restored {label} from checkpoint"),
+            Err(e) => tracing::warn!(query = %query_name, error = %e, "Failed to restore {label} from checkpoint"),
+        }
+    }
+
     fn try_restore_pending_agg(&mut self, idx: usize) {
-        let query_name = &self.queries[idx].name;
-        let pending = self.pending_restore.as_ref();
-        if let Some(cp) = pending.and_then(|p| p.agg_states.get(query_name)) {
-            // Clone the checkpoint data to avoid borrow conflict
-            let cp_clone = cp.clone();
-            if let Some(state) = self.agg_states.get_mut(&idx) {
-                match state.restore_groups(&cp_clone) {
-                    Ok(n) => {
-                        tracing::info!(
-                            query = %query_name,
-                            groups = n,
-                            "Restored agg state from checkpoint"
-                        );
-                    }
-                    Err(e) => {
-                        tracing::warn!(
-                            query = %query_name,
-                            error = %e,
-                            "Failed to restore agg state from checkpoint"
-                        );
-                    }
-                }
-            }
+        let name = self.queries[idx].name.clone();
+        let cp = self.pending_restore.as_ref().and_then(|p| p.agg_states.get(&name)).cloned();
+        if let (Some(cp), Some(state)) = (cp, self.agg_states.get_mut(&idx)) {
+            Self::log_restore(&name, &cp, state, IncrementalAggState::restore_groups, "agg state");
         }
     }
 
-    /// Try to restore pending checkpoint data for a newly initialized
-    /// EOWC aggregate state. Called after lazy initialization.
     fn try_restore_pending_eowc(&mut self, idx: usize) {
-        let query_name = &self.queries[idx].name;
-        let pending = self.pending_restore.as_ref();
-        if let Some(cp) = pending.and_then(|p| p.eowc_states.get(query_name)) {
-            let cp_clone = cp.clone();
-            if let Some(state) = self.eowc_agg_states.get_mut(&idx) {
-                match state.restore_windows(&cp_clone) {
-                    Ok(n) => {
-                        tracing::info!(
-                            query = %query_name,
-                            groups = n,
-                            "Restored EOWC state from checkpoint"
-                        );
-                    }
-                    Err(e) => {
-                        tracing::warn!(
-                            query = %query_name,
-                            error = %e,
-                            "Failed to restore EOWC state from checkpoint"
-                        );
-                    }
-                }
-            }
+        let name = self.queries[idx].name.clone();
+        let cp = self.pending_restore.as_ref().and_then(|p| p.eowc_states.get(&name)).cloned();
+        if let (Some(cp), Some(state)) = (cp, self.eowc_agg_states.get_mut(&idx)) {
+            Self::log_restore(&name, &cp, state, IncrementalEowcState::restore_windows, "EOWC state");
         }
     }
 
-    /// Try to restore pending checkpoint data for a newly initialized
-    /// Core window pipeline state. Called after lazy initialization.
     fn try_restore_pending_core_window(&mut self, idx: usize) {
-        let query_name = &self.queries[idx].name;
-        let pending = self.pending_restore.as_ref();
-        if let Some(cp) = pending.and_then(|p| p.core_window_states.get(query_name)) {
-            let cp_clone = cp.clone();
-            if let Some(state) = self.core_window_states.get_mut(&idx) {
-                match state.restore_windows(&cp_clone) {
-                    Ok(n) => {
-                        tracing::info!(
-                            query = %query_name,
-                            groups = n,
-                            "Restored core window state from checkpoint"
-                        );
-                    }
-                    Err(e) => {
-                        tracing::warn!(
-                            query = %query_name,
-                            error = %e,
-                            "Failed to restore core window state from checkpoint"
-                        );
-                    }
-                }
-            }
+        let name = self.queries[idx].name.clone();
+        let cp = self.pending_restore.as_ref().and_then(|p| p.core_window_states.get(&name)).cloned();
+        if let (Some(cp), Some(state)) = (cp, self.core_window_states.get_mut(&idx)) {
+            Self::log_restore(&name, &cp, state, CoreWindowState::restore_windows, "core window state");
         }
     }
 }

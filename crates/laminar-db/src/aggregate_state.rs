@@ -63,6 +63,70 @@ pub(crate) fn row_to_scalar_key_with_types(
     Ok(sv_key)
 }
 
+/// Emit a single window's accumulated state as a `RecordBatch`.
+///
+/// Shared by `CoreWindowState` and `IncrementalEowcState`. Builds columns
+/// for `window_start`, `window_end`, group keys, and aggregate results.
+pub(crate) fn emit_window_batch(
+    window_start: i64,
+    window_end: i64,
+    mut groups: ahash::AHashMap<Vec<ScalarValue>, Vec<Box<dyn datafusion_expr::Accumulator>>>,
+    group_types: &[DataType],
+    agg_specs: &[AggFuncSpec],
+    output_schema: &SchemaRef,
+) -> Result<Option<RecordBatch>, DbError> {
+    let num_rows = groups.len();
+    if num_rows == 0 {
+        return Ok(None);
+    }
+
+    let win_start_array: ArrayRef =
+        Arc::new(arrow::array::Int64Array::from(vec![window_start; num_rows]));
+    let win_end_array: ArrayRef =
+        Arc::new(arrow::array::Int64Array::from(vec![window_end; num_rows]));
+
+    let mut group_arrays: Vec<ArrayRef> = Vec::with_capacity(group_types.len());
+    for (col_idx, dt) in group_types.iter().enumerate() {
+        let scalars: Vec<ScalarValue> = groups.keys().map(|key| key[col_idx].clone()).collect();
+        let array = ScalarValue::iter_to_array(scalars)
+            .map_err(|e| DbError::Pipeline(format!("group key array: {e}")))?;
+        if array.data_type() == dt {
+            group_arrays.push(array);
+        } else {
+            let casted = arrow::compute::cast(&array, dt).unwrap_or(array);
+            group_arrays.push(casted);
+        }
+    }
+
+    let mut agg_arrays: Vec<ArrayRef> = Vec::with_capacity(agg_specs.len());
+    for (agg_idx, spec) in agg_specs.iter().enumerate() {
+        let mut scalars: Vec<ScalarValue> = Vec::with_capacity(num_rows);
+        for accs in groups.values_mut() {
+            let sv = accs[agg_idx]
+                .evaluate()
+                .map_err(|e| DbError::Pipeline(format!("accumulator evaluate: {e}")))?;
+            scalars.push(sv);
+        }
+        let array = ScalarValue::iter_to_array(scalars)
+            .map_err(|e| DbError::Pipeline(format!("agg result array: {e}")))?;
+        if array.data_type() == &spec.return_type {
+            agg_arrays.push(array);
+        } else {
+            let casted = arrow::compute::cast(&array, &spec.return_type).unwrap_or(array);
+            agg_arrays.push(casted);
+        }
+    }
+
+    let mut all_arrays = vec![win_start_array, win_end_array];
+    all_arrays.extend(group_arrays);
+    all_arrays.extend(agg_arrays);
+
+    let batch = RecordBatch::try_new(Arc::clone(output_schema), all_arrays)
+        .map_err(|e| DbError::Pipeline(format!("result batch build: {e}")))?;
+
+    Ok(Some(batch))
+}
+
 // ── ScalarValue JSON encoding ────────────────────────────────────────
 
 /// Encode a `ScalarValue` to a JSON value for checkpoint serialization.
