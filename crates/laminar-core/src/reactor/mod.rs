@@ -334,16 +334,6 @@ impl Reactor {
         }
     }
 
-    /// Run one iteration of the event loop.
-    ///
-    /// Returns outputs ready for downstream. Allocates a new `Vec` per call.
-    /// Prefer [`poll_into`](Self::poll_into) or the internal `run` loop for zero-allocation
-    /// processing.
-    pub fn poll(&mut self) -> Vec<Output> {
-        self.process_events();
-        self.output_buffer.drain(..).collect()
-    }
-
     /// Run one iteration, appending outputs to a caller-provided buffer.
     ///
     /// This avoids the per-poll allocation of [`poll`](Self::poll) — the caller can
@@ -784,7 +774,8 @@ mod tests {
         reactor.submit(event.clone()).unwrap();
 
         // Poll should process the event
-        let outputs = reactor.poll();
+        let mut outputs = Vec::new();
+        reactor.poll_into(&mut outputs);
         assert!(!outputs.is_empty());
         assert_eq!(reactor.events_processed(), 1);
         assert_eq!(reactor.queue_size(), 0);
@@ -834,18 +825,21 @@ mod tests {
             reactor.submit(event).unwrap();
         }
 
+        let mut buf = Vec::new();
         // First poll should process only batch_size events
-        reactor.poll();
+        reactor.poll_into(&mut buf);
         assert_eq!(reactor.events_processed(), 2);
         assert_eq!(reactor.queue_size(), 3);
 
         // Second poll should process 2 more
-        reactor.poll();
+        buf.clear();
+        reactor.poll_into(&mut buf);
         assert_eq!(reactor.events_processed(), 4);
         assert_eq!(reactor.queue_size(), 1);
 
         // Third poll should process the last one
-        reactor.poll();
+        buf.clear();
+        reactor.poll_into(&mut buf);
         assert_eq!(reactor.events_processed(), 5);
         assert_eq!(reactor.queue_size(), 0);
     }
@@ -870,7 +864,8 @@ mod tests {
         reactor.submit(event).unwrap();
 
         // Process
-        let outputs = reactor.poll();
+        let mut outputs = Vec::new();
+        reactor.poll_into(&mut outputs);
         // Should get the event output (and possibly a watermark)
         assert!(!outputs.is_empty());
 

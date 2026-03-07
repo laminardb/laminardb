@@ -365,8 +365,14 @@ impl CoreWindowState {
 
     /// Update per-window accumulators with a new pre-aggregation batch.
     ///
-    /// For each row: extracts the timestamp, dispatches to the appropriate
-    /// window assigner, extracts the group key, and updates accumulators.
+    /// Vectorized batch update: extracts timestamps and group keys at the
+    /// batch level using `RowConverter`, groups row indices by
+    /// `(window_start, group_key)`, then calls `update_group_accumulators`
+    /// once per group with a single `take()` per column.
+    ///
+    /// Session windows fall back to per-row processing because session
+    /// merging depends on insertion order.
+    #[allow(clippy::too_many_lines)]
     pub fn update_batch(&mut self, batch: &RecordBatch) -> Result<(), DbError> {
         if batch.num_rows() == 0 {
             return Ok(());
@@ -374,32 +380,157 @@ impl CoreWindowState {
 
         let ts_array = extract_i64_timestamps(batch, self.time_col_index)?;
 
-        for (row, &ts_ms) in ts_array.iter().enumerate() {
-            let key = self.extract_group_key(batch, row)?;
+        // Session windows require per-row processing (merge depends on order)
+        if matches!(self.assigner, CoreWindowAssigner::Session { .. }) {
+            return self.update_batch_session(batch, &ts_array);
+        }
+
+        // ── Vectorized path for tumbling/hopping ────────────────────────
+
+        // Batch-level group key extraction via RowConverter (one allocation)
+        let (converter, rows) = if self.num_group_cols > 0 {
+            let group_cols: Vec<ArrayRef> = (0..self.num_group_cols)
+                .map(|i| Arc::clone(batch.column(i)))
+                .collect();
+            let sort_fields: Vec<arrow::row::SortField> = group_cols
+                .iter()
+                .map(|c| arrow::row::SortField::new(c.data_type().clone()))
+                .collect();
+            let converter = arrow::row::RowConverter::new(sort_fields)
+                .map_err(|e| DbError::Pipeline(format!("row converter: {e}")))?;
+            let rows = converter
+                .convert_columns(&group_cols)
+                .map_err(|e| DbError::Pipeline(format!("row conversion: {e}")))?;
+            (Some(converter), Some(rows))
+        } else {
+            (None, None)
+        };
+
+        // Group row indices by (window_start, group_index).
+        // We use a u32 group index as key: rows with identical RowConverter
+        // output get the same group index. This avoids cloning OwnedRow.
+        let has_groups = self.num_group_cols > 0;
+        let mut row_to_group: Vec<u32> = Vec::with_capacity(batch.num_rows());
+        // Stores one OwnedRow per distinct group. Only used when has_groups.
+        let mut group_keys: Vec<arrow::row::OwnedRow> = Vec::new();
+        let mut key_index: AHashMap<Vec<u8>, u32> = AHashMap::new();
+
+        for row_idx in 0..batch.num_rows() {
+            if has_groups {
+                let rows_ref = rows.as_ref().expect("rows set when has_groups");
+                let row = rows_ref.row(row_idx);
+                let raw = row.as_ref().to_vec();
+                let gid = if let Some(&gid) = key_index.get(&raw) {
+                    gid
+                } else {
+                    #[allow(clippy::cast_possible_truncation)]
+                    let gid = group_keys.len() as u32;
+                    group_keys.push(row.owned());
+                    key_index.insert(raw, gid);
+                    gid
+                };
+                row_to_group.push(gid);
+            } else {
+                // No GROUP BY: all rows map to group 0 with empty ScalarValue key
+                row_to_group.push(0);
+            }
+        }
+
+        // Group row indices by (window_start, group_id)
+        let mut grouped: AHashMap<(i64, u32), Vec<u32>> = AHashMap::new();
+
+        for (row_idx, &ts_ms) in ts_array.iter().enumerate() {
+            let gid = row_to_group[row_idx];
+
+            #[allow(clippy::cast_possible_truncation)]
+            let idx = row_idx as u32;
 
             match &self.assigner {
                 CoreWindowAssigner::Tumbling(assigner) => {
-                    let window_start = assigner.assign(ts_ms).start;
-                    self.update_fixed_window(window_start, &key, batch, row)?;
+                    let ws = assigner.assign(ts_ms).start;
+                    grouped.entry((ws, gid)).or_default().push(idx);
                 }
                 CoreWindowAssigner::Hopping(assigner) => {
                     let window_ids = assigner.assign_windows(ts_ms);
                     for wid in window_ids {
-                        self.update_fixed_window(wid.start, &key, batch, row)?;
+                        grouped.entry((wid.start, gid)).or_default().push(idx);
                     }
                 }
-                CoreWindowAssigner::Session { gap_ms } => {
-                    let gap = *gap_ms;
-                    self.update_session_window(ts_ms, gap, &key, batch, row)?;
-                }
+                CoreWindowAssigner::Session { .. } => unreachable!("handled above"),
             }
+        }
+
+        // One update_group_accumulators call per (window, group)
+        for ((window_start, gid), indices) in &grouped {
+            let sv_key = if has_groups {
+                let conv = converter.as_ref().expect("converter set when has_groups");
+                crate::aggregate_state::row_to_scalar_key_with_types(
+                    conv,
+                    &group_keys[*gid as usize],
+                    &self.group_types,
+                )?
+            } else {
+                Vec::new()
+            };
+
+            // Ensure group exists in window state (borrow-split pattern)
+            let needs_insert = {
+                let window_groups = self.windows.entry(*window_start).or_default();
+                if window_groups.contains_key(&sv_key) {
+                    false
+                } else if window_groups.len() >= self.max_groups_per_window {
+                    tracing::warn!(
+                        max_groups = self.max_groups_per_window,
+                        window_start,
+                        "Core window per-window group cardinality limit reached"
+                    );
+                    continue;
+                } else {
+                    true
+                }
+            };
+            if needs_insert {
+                let accs = self.create_fresh_accumulators()?;
+                self.windows
+                    .entry(*window_start)
+                    .or_default()
+                    .insert(sv_key.clone(), accs);
+            }
+
+            let Some(accs) = self.windows.get_mut(window_start).and_then(|g| g.get_mut(&sv_key))
+            else {
+                continue;
+            };
+
+            crate::aggregate_state::IncrementalAggState::update_group_accumulators(
+                accs,
+                batch,
+                indices,
+                &self.agg_specs,
+            )?;
         }
 
         Ok(())
     }
 
-    /// Extract group key for a single row.
-    fn extract_group_key(
+    /// Per-row fallback for session windows (merge depends on insertion order).
+    fn update_batch_session(
+        &mut self,
+        batch: &RecordBatch,
+        ts_array: &[i64],
+    ) -> Result<(), DbError> {
+        let CoreWindowAssigner::Session { gap_ms } = self.assigner else {
+            unreachable!("update_batch_session called on non-session assigner");
+        };
+        for (row, &ts_ms) in ts_array.iter().enumerate() {
+            let key = self.extract_group_key_scalar(batch, row)?;
+            self.update_session_window(ts_ms, gap_ms, &key, batch, row)?;
+        }
+        Ok(())
+    }
+
+    /// Extract group key for a single row (scalar fallback for session windows).
+    fn extract_group_key_scalar(
         &self,
         batch: &RecordBatch,
         row: usize,
@@ -411,46 +542,6 @@ impl CoreWindowState {
             key.push(sv);
         }
         Ok(key)
-    }
-
-    /// Update accumulators for a fixed (tumbling/hopping) window.
-    fn update_fixed_window(
-        &mut self,
-        window_start: i64,
-        key: &[ScalarValue],
-        batch: &RecordBatch,
-        row: usize,
-    ) -> Result<(), DbError> {
-        let needs_insert = {
-            let window_groups = self.windows.entry(window_start).or_default();
-            if window_groups.contains_key(key) {
-                false
-            } else if window_groups.len() >= self.max_groups_per_window {
-                tracing::warn!(
-                    max_groups = self.max_groups_per_window,
-                    window_start,
-                    "Core window per-window group cardinality limit reached"
-                );
-                return Ok(());
-            } else {
-                true
-            }
-        };
-
-        if needs_insert {
-            let accs = self.create_fresh_accumulators()?;
-            self.windows
-                .entry(window_start)
-                .or_default()
-                .insert(key.to_vec(), accs);
-        }
-
-        let window_groups = self.windows.get_mut(&window_start).unwrap();
-        let Some(accs) = window_groups.get_mut(key) else {
-            return Ok(());
-        };
-
-        Self::update_accumulators(accs, &self.agg_specs, batch, row)
     }
 
     /// Update accumulators for a session window, merging overlapping sessions.

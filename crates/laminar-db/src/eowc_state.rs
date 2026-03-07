@@ -19,7 +19,6 @@ use std::sync::Arc;
 use ahash::AHashMap;
 
 use arrow::array::ArrayRef;
-use arrow::compute;
 use arrow::datatypes::{DataType, Field, Schema, SchemaRef};
 use arrow::record_batch::RecordBatch;
 use datafusion::prelude::SessionContext;
@@ -355,91 +354,129 @@ impl IncrementalEowcState {
         }))
     }
 
-    /// Update per-window accumulators with a new pre-aggregation batch.
-    ///
-    /// For each row: extracts the timestamp, assigns to window(s), extracts
-    /// the group key, and updates the corresponding accumulators.
+    /// Vectorized batch update: extracts timestamps and group keys at the
+    /// batch level using `RowConverter`, groups row indices by
+    /// `(window_start, group_key)`, then calls `update_group_accumulators`
+    /// once per group with a single `take()` per column.
+    #[allow(clippy::too_many_lines)]
     pub fn update_batch(&mut self, batch: &RecordBatch) -> Result<(), DbError> {
         if batch.num_rows() == 0 {
             return Ok(());
         }
 
-        // Extract timestamps from the time column
         let ts_array = extract_i64_timestamps(batch, self.time_col_index)?;
+        let has_groups = self.num_group_cols > 0;
 
-        for (row, &ts_ms) in ts_array.iter().enumerate() {
-            // Assign to window(s)
-            let window_starts = assign_windows(ts_ms, &self.window_type);
+        // Batch-level group key extraction via RowConverter
+        let (converter, rows) = if has_groups {
+            let group_cols: Vec<ArrayRef> = (0..self.num_group_cols)
+                .map(|i| Arc::clone(batch.column(i)))
+                .collect();
+            let sort_fields: Vec<arrow::row::SortField> = group_cols
+                .iter()
+                .map(|c| arrow::row::SortField::new(c.data_type().clone()))
+                .collect();
+            let converter = arrow::row::RowConverter::new(sort_fields)
+                .map_err(|e| DbError::Pipeline(format!("row converter: {e}")))?;
+            let rows = converter
+                .convert_columns(&group_cols)
+                .map_err(|e| DbError::Pipeline(format!("row conversion: {e}")))?;
+            (Some(converter), Some(rows))
+        } else {
+            (None, None)
+        };
 
-            // Extract group key
-            let mut key = Vec::with_capacity(self.num_group_cols);
-            for col_idx in 0..self.num_group_cols {
-                let sv = ScalarValue::try_from_array(batch.column(col_idx), row)
-                    .map_err(|e| DbError::Pipeline(format!("group key extraction: {e}")))?;
-                key.push(sv);
-            }
+        // Deduplicate group keys: row_idx → group_id
+        let mut row_to_group: Vec<u32> = Vec::with_capacity(batch.num_rows());
+        let mut group_keys: Vec<arrow::row::OwnedRow> = Vec::new();
+        let mut key_index: AHashMap<Vec<u8>, u32> = AHashMap::new();
 
-            for window_start in &window_starts {
-                let window_groups = self.windows.entry(*window_start).or_default();
-
-                if !window_groups.contains_key(&key) {
-                    if window_groups.len() >= self.max_groups_per_window {
-                        tracing::warn!(
-                            max_groups = self.max_groups_per_window,
-                            window_start,
-                            "EOWC per-window group cardinality limit reached"
-                        );
-                        continue;
-                    }
-                    let mut accs = Vec::with_capacity(self.agg_specs.len());
-                    for spec in &self.agg_specs {
-                        accs.push(spec.create_accumulator()?);
-                    }
-                    window_groups.insert(key.clone(), accs);
-                }
-
-                let Some(accs) = window_groups.get_mut(&key) else {
-                    continue;
-                };
-
-                // Update each accumulator with this row's values
-                let index_array = arrow::array::UInt32Array::from(vec![
+        for row_idx in 0..batch.num_rows() {
+            if has_groups {
+                let rows_ref = rows.as_ref().expect("rows set when has_groups");
+                let row = rows_ref.row(row_idx);
+                let raw = row.as_ref().to_vec();
+                let gid = if let Some(&gid) = key_index.get(&raw) {
+                    gid
+                } else {
                     #[allow(clippy::cast_possible_truncation)]
-                    (row as u32),
-                ]);
-                for (i, spec) in self.agg_specs.iter().enumerate() {
-                    let mut input_arrays: Vec<ArrayRef> =
-                        Vec::with_capacity(spec.input_col_indices.len());
-                    for &col_idx in &spec.input_col_indices {
-                        let arr = compute::take(batch.column(col_idx), &index_array, None)
-                            .map_err(|e| DbError::Pipeline(format!("array take: {e}")))?;
-                        input_arrays.push(arr);
-                    }
-
-                    // Apply FILTER mask
-                    if let Some(filter_idx) = spec.filter_col_index {
-                        let filter_arr =
-                            compute::take(batch.column(filter_idx), &index_array, None)
-                                .map_err(|e| DbError::Pipeline(format!("filter take: {e}")))?;
-                        if let Some(mask) = filter_arr
-                            .as_any()
-                            .downcast_ref::<arrow::array::BooleanArray>()
-                        {
-                            let mut filtered = Vec::with_capacity(input_arrays.len());
-                            for arr in &input_arrays {
-                                filtered.push(compute::filter(arr, mask).map_err(|e| {
-                                    DbError::Pipeline(format!("filter apply: {e}"))
-                                })?);
-                            }
-                            input_arrays = filtered;
-                        }
-                    }
-
-                    accs[i]
-                        .update_batch(&input_arrays)
-                        .map_err(|e| DbError::Pipeline(format!("accumulator update: {e}")))?;
-                }
+                    let gid = group_keys.len() as u32;
+                    group_keys.push(row.owned());
+                    key_index.insert(raw, gid);
+                    gid
+                };
+                row_to_group.push(gid);
+            } else {
+                row_to_group.push(0);
             }
+        }
+
+        // Group row indices by (window_start, group_id)
+        let mut grouped: AHashMap<(i64, u32), Vec<u32>> = AHashMap::new();
+        for (row_idx, &ts_ms) in ts_array.iter().enumerate() {
+            let gid = row_to_group[row_idx];
+            #[allow(clippy::cast_possible_truncation)]
+            let idx = row_idx as u32;
+            let window_starts = assign_windows(ts_ms, &self.window_type);
+            for ws in window_starts {
+                grouped.entry((ws, gid)).or_default().push(idx);
+            }
+        }
+
+        // One update_group_accumulators call per (window, group)
+        for ((window_start, gid), indices) in &grouped {
+            let sv_key = if has_groups {
+                let conv = converter.as_ref().expect("converter set when has_groups");
+                crate::aggregate_state::row_to_scalar_key_with_types(
+                    conv,
+                    &group_keys[*gid as usize],
+                    &self.group_types,
+                )?
+            } else {
+                Vec::new()
+            };
+
+            // Ensure group exists (borrow-split pattern)
+            let needs_insert = {
+                let window_groups = self.windows.entry(*window_start).or_default();
+                if window_groups.contains_key(&sv_key) {
+                    false
+                } else if window_groups.len() >= self.max_groups_per_window {
+                    tracing::warn!(
+                        max_groups = self.max_groups_per_window,
+                        window_start,
+                        "EOWC per-window group cardinality limit reached"
+                    );
+                    continue;
+                } else {
+                    true
+                }
+            };
+            if needs_insert {
+                let mut accs = Vec::with_capacity(self.agg_specs.len());
+                for spec in &self.agg_specs {
+                    accs.push(spec.create_accumulator()?);
+                }
+                self.windows
+                    .entry(*window_start)
+                    .or_default()
+                    .insert(sv_key.clone(), accs);
+            }
+
+            let Some(accs) = self
+                .windows
+                .get_mut(window_start)
+                .and_then(|g| g.get_mut(&sv_key))
+            else {
+                continue;
+            };
+
+            crate::aggregate_state::IncrementalAggState::update_group_accumulators(
+                accs,
+                batch,
+                indices,
+                &self.agg_specs,
+            )?;
         }
 
         Ok(())
