@@ -26,6 +26,8 @@ pub struct TpcRuntime {
     routing: Vec<usize>,
     /// Round-robin counter for source attachment.
     next_core: usize,
+    has_new_data: Arc<std::sync::atomic::AtomicBool>,
+    output_notify: Arc<tokio::sync::Notify>,
 }
 
 impl TpcRuntime {
@@ -40,6 +42,8 @@ impl TpcRuntime {
     pub fn new(config: &TpcConfig) -> Result<Self, TpcError> {
         config.validate()?;
 
+        let has_new_data = Arc::new(std::sync::atomic::AtomicBool::new(false));
+        let output_notify = Arc::new(tokio::sync::Notify::new());
         let mut cores = Vec::with_capacity(config.num_cores);
         for i in 0..config.num_cores {
             let core_config = CoreConfig {
@@ -57,7 +61,12 @@ impl TpcRuntime {
                 #[cfg(all(target_os = "linux", feature = "io-uring"))]
                 io_uring_config: None,
             };
-            cores.push(CoreHandle::spawn(core_config)?);
+            cores.push(CoreHandle::spawn_with_notify(
+                core_config,
+                Vec::new(),
+                Arc::clone(&has_new_data),
+                Arc::clone(&output_notify),
+            )?);
         }
 
         Ok(Self {
@@ -66,6 +75,8 @@ impl TpcRuntime {
             source_names: Vec::new(),
             routing: Vec::new(),
             next_core: 0,
+            has_new_data,
+            output_notify,
         })
     }
 
@@ -171,6 +182,18 @@ impl TpcRuntime {
     #[must_use]
     pub fn num_sources(&self) -> usize {
         self.source_threads.len()
+    }
+
+    /// Returns the shared output signaling handles.
+    ///
+    /// The coordinator awaits `notified()` on the `Notify` and clears
+    /// the `AtomicBool` after each drain cycle.
+    #[must_use]
+    pub fn output_signal(&self) -> (Arc<std::sync::atomic::AtomicBool>, Arc<tokio::sync::Notify>) {
+        (
+            Arc::clone(&self.has_new_data),
+            Arc::clone(&self.output_notify),
+        )
     }
 }
 
