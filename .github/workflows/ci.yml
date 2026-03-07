@@ -118,7 +118,7 @@ jobs:
       # Windows: explicit features (skip hwloc, io-uring, xdp)
       - name: Run tests (Windows)
         if: runner.os == 'Windows'
-        run: cargo nextest run --workspace --features "allocation-tracking,jit,kafka,postgres-cdc,postgres-sink,mysql-cdc,delta-lake,delta,files"
+        run: cargo nextest run --workspace --features "allocation-tracking,jit,kafka,postgres-cdc,postgres-sink,mysql-cdc,delta-lake,delta,files,parquet-lookup"
 
       # Verify zero-allocation hot path (Linux only, requires global allocator)
       - name: Verify zero-allocation hot path
@@ -211,6 +211,7 @@ jobs:
           cargo check -p laminar-connectors --features mysql-cdc
           cargo check -p laminar-connectors --features kafka-discovery
           cargo check -p laminar-connectors --features files
+          cargo check -p laminar-connectors --features parquet-lookup
 
   # ============================================
   # MSRV Check
