@@ -293,6 +293,11 @@ impl LaminarDB {
         {
             laminar_connectors::cdc::mysql::register_mysql_cdc_source(registry);
         }
+        #[cfg(feature = "files")]
+        {
+            laminar_connectors::files::register_file_source(registry);
+            laminar_connectors::files::register_file_sink(registry);
+        }
     }
 
     /// Replaces the `LookupJoinRewriteRule` on the `DataFusion` context
@@ -2272,6 +2277,11 @@ mod tests {
         #[cfg(feature = "mysql-cdc")]
         {
             expected_sources += 1; // mysql CDC source
+        }
+        #[cfg(feature = "files")]
+        {
+            expected_sources += 1; // file source
+            expected_sinks += 1; // file sink
         }
 
         assert_eq!(registry.list_sources().len(), expected_sources);
