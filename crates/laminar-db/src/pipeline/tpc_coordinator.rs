@@ -26,7 +26,35 @@ struct PendingBarrier {
     sources_aligned: FxHashSet<usize>,
     source_checkpoints: FxHashMap<String, SourceCheckpoint>,
     started_at: Instant,
+    /// Whether this barrier is currently active (tracking alignment).
+    active: bool,
 }
+
+impl PendingBarrier {
+    fn new() -> Self {
+        Self {
+            checkpoint_id: 0,
+            sources_total: 0,
+            sources_aligned: FxHashSet::default(),
+            source_checkpoints: FxHashMap::default(),
+            started_at: Instant::now(),
+            active: false,
+        }
+    }
+
+    fn reset(&mut self, checkpoint_id: u64, sources_total: usize) {
+        self.checkpoint_id = checkpoint_id;
+        self.sources_total = sources_total;
+        self.sources_aligned.clear();
+        self.source_checkpoints.clear();
+        self.started_at = Instant::now();
+        self.active = true;
+    }
+}
+
+/// Fallback timeout for idle periods. Ensures `maybe_inject_checkpoint`
+/// is called even when no data flows.
+const IDLE_FALLBACK_TIMEOUT: std::time::Duration = std::time::Duration::from_millis(100);
 
 /// Thread-per-core pipeline coordinator.
 ///
@@ -36,6 +64,10 @@ pub struct TpcPipelineCoordinator {
     config: PipelineConfig,
     runtime: TpcRuntime,
     shutdown: Arc<tokio::sync::Notify>,
+    /// Lock-free flag set by core threads when outputs are available.
+    has_new_data: Arc<std::sync::atomic::AtomicBool>,
+    /// Signaled on the false→true transition of `has_new_data`.
+    data_notify: Arc<tokio::sync::Notify>,
     /// Pre-built source names indexed by `source_idx` (avoids clone per event).
     source_name_cache: Vec<String>,
     /// Pre-allocated drain buffer (reused each cycle, zero alloc).
@@ -44,8 +76,8 @@ pub struct TpcPipelineCoordinator {
     source_batches_buf: FxHashMap<String, Vec<RecordBatch>>,
     /// Pre-allocated barriers buffer (cleared per cycle, not dropped).
     barriers_buf: Vec<(usize, CheckpointBarrier)>,
-    /// Pending barrier alignment tracking.
-    pending_barrier: Option<PendingBarrier>,
+    /// Pre-allocated barrier alignment tracking (reused across checkpoints).
+    pending_barrier: PendingBarrier,
     /// Counter for late events (arrived after watermark).
     late_events: u64,
     /// Next checkpoint ID.
@@ -78,16 +110,19 @@ impl TpcPipelineCoordinator {
 
         let source_name_cache: Vec<String> =
             runtime.source_names().iter().map(String::clone).collect();
+        let (has_new_data, data_notify) = runtime.output_signal();
 
         Ok(Self {
             config,
             runtime,
             shutdown,
+            has_new_data,
+            data_notify,
             source_name_cache,
             drain_buffer: Vec::with_capacity(4096),
             source_batches_buf: FxHashMap::default(),
             barriers_buf: Vec::new(),
-            pending_barrier: None,
+            pending_barrier: PendingBarrier::new(),
             late_events: 0,
             next_checkpoint_id: 1,
             last_checkpoint: Instant::now(),
@@ -105,12 +140,29 @@ impl TpcPipelineCoordinator {
         let barrier_timeout = self.config.barrier_alignment_timeout;
 
         loop {
-            // Phase 1: Wait (yield to tokio, check shutdown)
+            // Phase 1: Wait for data, shutdown, or fallback timeout.
+            // Core threads call notify_one() after pushing to the outbox,
+            // waking the coordinator immediately instead of polling on a timer.
             tokio::select! {
                 biased;
                 () = self.shutdown.notified() => break,
-                () = tokio::time::sleep(batch_window) => {}
+                () = self.data_notify.notified() => {
+                    // Data available. If batch_window > 0, coalesce: sleep
+                    // briefly to let more data accumulate before executing
+                    // the SQL cycle. This amortizes DataFusion overhead for
+                    // high-throughput sources (e.g., Kafka at 500K events/sec).
+                    if !batch_window.is_zero() {
+                        tokio::time::sleep(batch_window).await;
+                    }
+                }
+                // Fallback: wake periodically for checkpoint injection
+                // even when no data flows.
+                () = tokio::time::sleep(IDLE_FALLBACK_TIMEOUT) => {}
             }
+
+            // Clear the flag so the next core output triggers a new wake.
+            self.has_new_data
+                .store(false, std::sync::atomic::Ordering::Release);
 
             // Phase 2: Drain all core outboxes
             self.drain_buffer.clear();
@@ -137,10 +189,11 @@ impl TpcPipelineCoordinator {
                             callback.extract_watermark(name, &event.data);
                             cycle_events += event.data.num_rows() as u64;
                             if let Some(filtered) = callback.filter_late_rows(name, &event.data) {
-                                self.source_batches_buf
-                                    .entry(name.clone())
-                                    .or_default()
-                                    .push(filtered);
+                                if let Some(vec) = self.source_batches_buf.get_mut(name.as_str()) {
+                                    vec.push(filtered);
+                                } else {
+                                    self.source_batches_buf.insert(name.clone(), vec![filtered]);
+                                }
                                 cycle_batches += 1;
                             }
                         }
@@ -216,16 +269,16 @@ impl TpcPipelineCoordinator {
             self.maybe_inject_checkpoint(&mut *callback).await;
 
             // Phase 6: Barrier timeout check
-            if let Some(ref pending) = self.pending_barrier {
-                if pending.started_at.elapsed() > barrier_timeout {
-                    tracing::warn!(
-                        checkpoint_id = pending.checkpoint_id,
-                        aligned = pending.sources_aligned.len(),
-                        total = pending.sources_total,
-                        "Barrier alignment timeout — cancelling checkpoint"
-                    );
-                    self.pending_barrier = None;
-                }
+            if self.pending_barrier.active
+                && self.pending_barrier.started_at.elapsed() > barrier_timeout
+            {
+                tracing::warn!(
+                    checkpoint_id = self.pending_barrier.checkpoint_id,
+                    aligned = self.pending_barrier.sources_aligned.len(),
+                    total = self.pending_barrier.sources_total,
+                    "Barrier alignment timeout — cancelling checkpoint"
+                );
+                self.pending_barrier.active = false;
             }
         }
 
@@ -250,17 +303,14 @@ impl TpcPipelineCoordinator {
         barrier: &CheckpointBarrier,
         callback: &mut dyn PipelineCallback,
     ) {
-        let pending = self.pending_barrier.get_or_insert_with(|| PendingBarrier {
-            checkpoint_id: barrier.checkpoint_id,
-            sources_total: self.runtime.num_sources(),
-            sources_aligned: FxHashSet::default(),
-            source_checkpoints: FxHashMap::default(),
-            started_at: Instant::now(),
-        });
+        if !self.pending_barrier.active {
+            self.pending_barrier
+                .reset(barrier.checkpoint_id, self.runtime.num_sources());
+        }
 
-        if pending.checkpoint_id != barrier.checkpoint_id {
+        if self.pending_barrier.checkpoint_id != barrier.checkpoint_id {
             tracing::debug!(
-                expected = pending.checkpoint_id,
+                expected = self.pending_barrier.checkpoint_id,
                 actual = barrier.checkpoint_id,
                 source_idx,
                 "ignoring barrier with mismatched checkpoint ID"
@@ -268,19 +318,22 @@ impl TpcPipelineCoordinator {
             return;
         }
 
-        pending.sources_aligned.insert(source_idx);
+        self.pending_barrier.sources_aligned.insert(source_idx);
 
         // Capture this source's checkpoint
         if let Some(name) = self.source_name_cache.get(source_idx) {
             let cp = self.runtime.source_checkpoint(source_idx);
-            pending.source_checkpoints.insert(name.clone(), cp);
+            self.pending_barrier
+                .source_checkpoints
+                .insert(name.clone(), cp);
         }
 
         // Check if all sources are aligned
-        if pending.sources_aligned.len() >= pending.sources_total {
-            // Move checkpoints out — pending_barrier is about to be cleared
-            let source_checkpoints = std::mem::take(&mut pending.source_checkpoints);
-            self.pending_barrier = None;
+        if self.pending_barrier.sources_aligned.len() >= self.pending_barrier.sources_total {
+            // drain() preserves the map's allocated capacity for reuse.
+            let source_checkpoints: FxHashMap<String, SourceCheckpoint> =
+                self.pending_barrier.source_checkpoints.drain().collect();
+            self.pending_barrier.active = false;
 
             let success = callback.checkpoint_with_barrier(source_checkpoints).await;
             if !success {
@@ -295,7 +348,7 @@ impl TpcPipelineCoordinator {
             return;
         };
 
-        if self.pending_barrier.is_some() {
+        if self.pending_barrier.active {
             return; // Already waiting for alignment
         }
 
@@ -324,15 +377,19 @@ mod tests {
     use super::*;
 
     #[test]
-    fn test_pending_barrier_creation() {
-        let pending = PendingBarrier {
-            checkpoint_id: 1,
-            sources_total: 3,
-            sources_aligned: FxHashSet::default(),
-            source_checkpoints: FxHashMap::default(),
-            started_at: Instant::now(),
-        };
+    fn test_pending_barrier_creation_and_reset() {
+        let mut pending = PendingBarrier::new();
+        assert!(!pending.active);
+
+        pending.reset(1, 3);
+        assert!(pending.active);
+        assert_eq!(pending.checkpoint_id, 1);
         assert_eq!(pending.sources_total, 3);
+        assert!(pending.sources_aligned.is_empty());
+
+        pending.sources_aligned.insert(0);
+        pending.reset(2, 5);
+        assert_eq!(pending.checkpoint_id, 2);
         assert!(pending.sources_aligned.is_empty());
     }
 }

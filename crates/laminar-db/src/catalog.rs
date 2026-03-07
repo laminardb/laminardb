@@ -32,51 +32,48 @@ impl laminar_core::streaming::Record for ArrowRecord {
     }
 }
 
-/// Lock-free bounded ring buffer for snapshot batches.
+/// Bounded ring buffer for snapshot batches.
 ///
-/// Uses a fixed-size `Vec<Option<RecordBatch>>` with atomic head/tail indices.
-/// Writers overwrite the oldest slot when full (bounded, non-blocking).
-/// Readers clone the current snapshot without blocking writers.
+/// Uses an atomic tail counter (`fetch_add`) so concurrent `push()`
+/// calls from multiple threads each get a unique slot — no lost writes.
+/// Per-slot `parking_lot::Mutex` protects the actual slot write/read.
 struct SnapshotRing {
-    slots: Box<[std::sync::RwLock<Option<RecordBatch>>]>,
-    head: AtomicUsize,
-    len: AtomicUsize,
+    slots: Box<[parking_lot::Mutex<Option<RecordBatch>>]>,
+    /// Monotonically increasing write counter. `tail % capacity` = next slot.
+    tail: AtomicUsize,
     capacity: usize,
 }
 
 impl SnapshotRing {
     fn new(capacity: usize) -> Self {
         let cap = capacity.max(1);
-        let slots: Vec<_> = (0..cap).map(|_| std::sync::RwLock::new(None)).collect();
+        let slots: Vec<_> = (0..cap).map(|_| parking_lot::Mutex::new(None)).collect();
         Self {
             slots: slots.into_boxed_slice(),
-            head: AtomicUsize::new(0),
-            len: AtomicUsize::new(0),
+            tail: AtomicUsize::new(0),
             capacity: cap,
         }
     }
 
     fn push(&self, batch: RecordBatch) {
-        let current_len = self.len.load(Ordering::Acquire);
-        if current_len < self.capacity {
-            let idx = (self.head.load(Ordering::Acquire) + current_len) % self.capacity;
-            *self.slots[idx].write().unwrap() = Some(batch);
-            self.len.fetch_add(1, Ordering::Release);
-        } else {
-            let head = self.head.load(Ordering::Acquire);
-            *self.slots[head].write().unwrap() = Some(batch);
-            self.head
-                .store((head + 1) % self.capacity, Ordering::Release);
-        }
+        // fetch_add is atomic — concurrent pushers each get a unique slot.
+        let idx = self.tail.fetch_add(1, Ordering::Relaxed) % self.capacity;
+        *self.slots[idx].lock() = Some(batch);
     }
 
     fn snapshot(&self) -> Vec<RecordBatch> {
-        let len = self.len.load(Ordering::Acquire);
-        let head = self.head.load(Ordering::Acquire);
-        let mut result = Vec::with_capacity(len);
-        for i in 0..len {
-            let idx = (head + i) % self.capacity;
-            if let Some(batch) = self.slots[idx].read().unwrap().as_ref() {
+        let tail = self.tail.load(Ordering::Acquire);
+        let count = tail.min(self.capacity);
+        // Read the most recent `count` slots, oldest first.
+        let start = if tail <= self.capacity {
+            0
+        } else {
+            tail % self.capacity
+        };
+        let mut result = Vec::with_capacity(count);
+        for i in 0..count {
+            let idx = (start + i) % self.capacity;
+            if let Some(batch) = self.slots[idx].lock().as_ref() {
                 result.push(batch.clone());
             }
         }
@@ -118,6 +115,9 @@ impl SourceEntry {
     ) -> Result<(), laminar_core::streaming::StreamingError> {
         self.source.push_arrow(batch.clone())?;
         self.buffer.push(batch);
+        // notify_one() stores a permit so the CatalogSourceConnector
+        // IO thread wakes immediately. Assumes exactly one IO thread per
+        // source — if multiple consumers are added, switch to notify_waiters().
         self.data_notify.notify_one();
         Ok(())
     }

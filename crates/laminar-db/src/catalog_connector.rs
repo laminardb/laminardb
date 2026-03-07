@@ -83,7 +83,7 @@ impl SourceConnector for CatalogSourceConnector {
         // (common case for embedded sources). Avoids a memcpy of the
         // entire RecordBatch (~1-5μs for typical batch sizes).
         let records = if batches.len() == 1 {
-            batches.into_iter().next().unwrap()
+            batches.into_iter().next().expect("len==1 checked above")
         } else {
             arrow::compute::concat_batches(&self.schema, &batches)
                 .map_err(|e| ConnectorError::ReadError(format!("Failed to concat batches: {e}")))?

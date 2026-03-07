@@ -31,6 +31,8 @@ use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::sync::Arc;
 use std::thread::{self, JoinHandle};
 
+use tokio::sync::Notify;
+
 #[cfg(all(target_os = "linux", feature = "io-uring"))]
 use crate::io_uring::IoUringConfig;
 
@@ -161,7 +163,9 @@ impl CoreHandle {
     ///
     /// Returns an error if the thread cannot be spawned.
     pub fn spawn(config: CoreConfig) -> Result<Self, TpcError> {
-        Self::spawn_with_operators(config, Vec::new())
+        let notify = Arc::new(Notify::new());
+        let flag = Arc::new(AtomicBool::new(false));
+        Self::spawn_with_notify(config, Vec::new(), flag, notify)
     }
 
     /// Spawns a new core thread with operators.
@@ -173,6 +177,28 @@ impl CoreHandle {
     pub fn spawn_with_operators(
         config: CoreConfig,
         operators: Vec<Box<dyn Operator>>,
+    ) -> Result<Self, TpcError> {
+        let notify = Arc::new(Notify::new());
+        let flag = Arc::new(AtomicBool::new(false));
+        Self::spawn_with_notify(config, operators, flag, notify)
+    }
+
+    /// Spawns a new core thread with operators and shared signaling.
+    ///
+    /// `has_new_data` is a lock-free flag set by the core thread when
+    /// outputs are available. Only the false→true transition triggers
+    /// `output_notify.notify_one()`, ensuring at most one mutex
+    /// acquisition per coordinator drain cycle across all cores.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error if the thread cannot be spawned.
+    #[allow(clippy::needless_pass_by_value)]
+    pub fn spawn_with_notify(
+        config: CoreConfig,
+        operators: Vec<Box<dyn Operator>>,
+        has_new_data: Arc<AtomicBool>,
+        output_notify: Arc<Notify>,
     ) -> Result<Self, TpcError> {
         let core_id = config.core_id;
         let cpu_affinity = config.cpu_affinity;
@@ -206,6 +232,8 @@ impl CoreHandle {
             events_processed: Arc::clone(&events_processed),
             outputs_dropped: Arc::clone(&outputs_dropped),
             is_running: Arc::clone(&is_running),
+            has_new_data: Arc::clone(&has_new_data),
+            output_notify: Arc::clone(&output_notify),
         };
 
         let thread = thread::Builder::new()
@@ -547,6 +575,8 @@ pub(super) struct CoreThreadContext {
     pub(super) events_processed: Arc<AtomicU64>,
     pub(super) outputs_dropped: Arc<AtomicU64>,
     pub(super) is_running: Arc<AtomicBool>,
+    pub(super) has_new_data: Arc<AtomicBool>,
+    pub(super) output_notify: Arc<Notify>,
 }
 
 /// Initializes the core thread: sets CPU affinity, NUMA allocator, `io_uring`, and creates the reactor.
@@ -788,6 +818,13 @@ fn core_thread_main(
         // when no work is available. Source I/O threads call unpark()
         // after pushing to the inbox, giving sub-ms wake latency.
         if had_work {
+            // Signal the coordinator that outputs are available.
+            // Lock-free: atomic swap is ~5ns. Only the false→true
+            // transition calls notify_one(), so at most ONE core per
+            // coordinator cycle hits the Notify mutex — no N-way contention.
+            if !ctx.has_new_data.swap(true, Ordering::Release) {
+                ctx.output_notify.notify_one();
+            }
             idle_spins = 0;
         } else {
             idle_spins = idle_spins.saturating_add(1);
