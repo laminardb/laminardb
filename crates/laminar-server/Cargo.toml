@@ -84,6 +84,7 @@ default = [
     "postgres-cdc",
     "postgres-sink",
     "mysql-cdc",
+    "files",
 ]
 jemalloc = ["dep:tikv-jemallocator"]
 # Connector features (forwarded to laminar-db → laminar-connectors)
@@ -93,6 +94,7 @@ postgres-cdc = ["laminar-db/postgres-cdc"]
 postgres-sink = ["laminar-db/postgres-sink"]
 mysql-cdc = ["laminar-db/mysql-cdc"]
 delta-lake = ["laminar-db/delta-lake"]
+files = ["laminar-db/files"]
 # Cloud object store backends for checkpoints
 aws = ["laminar-db/aws"]
 gcs = ["laminar-db/gcs"]
