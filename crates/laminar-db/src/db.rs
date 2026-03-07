@@ -2278,6 +2278,11 @@ mod tests {
         {
             expected_sources += 1; // mysql CDC source
         }
+        #[cfg(feature = "files")]
+        {
+            expected_sources += 1; // file source
+            expected_sinks += 1; // file sink
+        }
 
         assert_eq!(registry.list_sources().len(), expected_sources);
         assert_eq!(registry.list_sinks().len(), expected_sinks);
