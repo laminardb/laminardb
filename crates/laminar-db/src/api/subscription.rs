@@ -28,6 +28,18 @@ pub struct ArrowSubscription {
 }
 
 impl ArrowSubscription {
+    /// Create from internal subscription.
+    pub(crate) fn new(
+        inner: laminar_core::streaming::Subscription<ArrowRecord>,
+        schema: SchemaRef,
+    ) -> Self {
+        Self {
+            inner,
+            schema,
+            active: true,
+        }
+    }
+
     /// Get the schema.
     #[must_use]
     pub fn schema(&self) -> SchemaRef {
