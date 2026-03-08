@@ -79,42 +79,10 @@
 //! assert!(executor.is_ready());
 //! ```
 //!
-//! ## Watermark Propagation
+//! ## Dependency Tracking
 //!
-//! Watermarks flow through the DAG using min semantics:
-//! - A view's watermark = minimum of all source watermarks
-//! - Updates propagate automatically to all dependents
-//!
-//! ```rust
-//! use laminar_core::mv::{MvRegistry, MaterializedView, CascadingWatermarkTracker};
-//! use arrow_schema::{Schema, Field, DataType};
-//! use std::sync::Arc;
-//!
-//! let mut registry = MvRegistry::new();
-//! registry.register_base_table("orders");
-//! registry.register_base_table("payments");
-//!
-//! let schema = Arc::new(Schema::new(vec![Field::new("v", DataType::Int64, false)]));
-//!
-//! // View with multiple sources
-//! let order_payments = MaterializedView::new(
-//!     "order_payments",
-//!     "SELECT * FROM orders JOIN payments ON orders.id = payments.order_id",
-//!     vec!["orders".into(), "payments".into()],
-//!     schema,
-//! );
-//! registry.register(order_payments).unwrap();
-//!
-//! let registry = Arc::new(registry);
-//! let mut tracker = CascadingWatermarkTracker::new(registry);
-//!
-//! // Update source watermarks
-//! tracker.update_watermark("orders", 100);
-//! tracker.update_watermark("payments", 80);
-//!
-//! // View watermark is the minimum
-//! assert_eq!(tracker.get_watermark("order_payments"), Some(80));
-//! ```
+//! The registry tracks view dependencies and provides topological ordering
+//! for cascading evaluation.
 //!
 //! ## Cycle Detection
 //!

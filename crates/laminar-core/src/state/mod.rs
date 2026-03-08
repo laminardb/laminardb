@@ -17,6 +17,7 @@
 //! ## Example
 //!
 //! ```rust
+//! use bytes::Bytes;
 //! use laminar_core::state::{StateStore, StateStoreExt, InMemoryStore};
 //!
 //! let mut store = InMemoryStore::new();
@@ -43,6 +44,7 @@
 //! ## Memory-Mapped Store Example
 //!
 //! ```rust,no_run
+//! use bytes::Bytes;
 //! use laminar_core::state::{StateStore, MmapStateStore};
 //! use std::path::Path;
 //!
