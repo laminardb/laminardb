@@ -82,5 +82,3 @@ pub use per_core_wal::{
     PerCoreWalReader, SegmentStats, WalOperation,
 };
 
-#[cfg(all(target_os = "linux", feature = "io-uring"))]
-pub use io_uring_wal::IoUringWal;
