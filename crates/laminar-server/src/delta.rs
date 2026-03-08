@@ -23,7 +23,6 @@ use laminar_core::delta::partition::assignment::{
     AssignmentConstraints, ConsistentHashAssigner, PartitionAssigner,
 };
 use laminar_core::delta::partition::guard::PartitionGuardSet;
-use laminar_core::delta::rpc::{RpcConnectionPool, RpcPoolConfig};
 
 /// Enum dispatch for discovery implementations.
 ///
@@ -228,8 +227,6 @@ pub struct DeltaHandle {
     discovery: DiscoveryImpl,
     /// Epoch-fenced partition guards.
     guard_set: PartitionGuardSet,
-    /// gRPC connection pool to peers.
-    rpc_pool: RpcConnectionPool,
     /// HTTP API server task.
     api_handle: tokio::task::JoinHandle<()>,
     /// Config file watcher task.
@@ -438,10 +435,7 @@ pub async fn start_delta(
     }
     info!("Created {} partition guards", guard_set.len());
 
-    // 6. Create RPC connection pool
-    let rpc_pool = RpcConnectionPool::new(RpcPoolConfig::default());
-
-    // 7. Build LaminarDB with Profile::Delta
+    // 6. Build LaminarDB with Profile::Delta
     let mut builder = LaminarDB::builder();
     builder = builder.profile(Profile::Delta);
 
@@ -580,7 +574,6 @@ pub async fn start_delta(
         manager,
         discovery,
         guard_set,
-        rpc_pool,
         api_handle,
         watcher_handle,
         membership_handle,
