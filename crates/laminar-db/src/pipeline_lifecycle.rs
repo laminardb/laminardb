@@ -70,6 +70,7 @@ impl LaminarDB {
     /// # Errors
     ///
     /// Returns an error if the pipeline cannot be started.
+    #[allow(clippy::too_many_lines)]
     pub async fn start(&self) -> Result<(), DbError> {
         let current = self.state.load(std::sync::atomic::Ordering::Acquire);
         if current == STATE_RUNNING || current == STATE_STARTING {
