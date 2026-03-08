@@ -28,11 +28,11 @@ const DEFAULT_CHANNEL_CAPACITY: usize = 128;
 const DEFAULT_FLUSH_INTERVAL: Duration = Duration::from_secs(5);
 
 /// Commands sent to a sink's dedicated task.
-#[allow(dead_code)] // Flush and Close constructed only by flush()/close() which are reserved public API
 pub(crate) enum SinkCommand {
     /// Write a batch to the sink.
     WriteBatch { batch: RecordBatch },
-    /// Explicitly flush buffered data.
+    /// Explicitly flush buffered data (test-only).
+    #[cfg(test)]
     Flush {
         ack: oneshot::Sender<Result<(), ConnectorError>>,
     },
@@ -48,7 +48,8 @@ pub(crate) enum SinkCommand {
     },
     /// Abort a failed epoch.
     RollbackEpoch { epoch: u64 },
-    /// Flush + close the connector and exit the task.
+    /// Flush + close the connector and exit the task (test-only).
+    #[cfg(test)]
     Close,
 }
 
@@ -121,7 +122,7 @@ impl SinkTaskHandle {
     ///
     /// Not called on the normal shutdown path (channel drop triggers
     /// flush implicitly in `run_sink_task`). Available for manual use.
-    #[allow(dead_code)] // public API for manual flush; implicit channel-drop handles normal shutdown
+    #[cfg(test)]
     pub async fn flush(&self) -> Result<(), ConnectorError> {
         let (ack_tx, ack_rx) = oneshot::channel();
         self.tx
@@ -191,7 +192,7 @@ impl SinkTaskHandle {
     /// Not called on the normal shutdown path — dropping the `SinkTaskHandle`
     /// closes the command channel, which triggers flush+close in `run_sink_task`.
     /// This method is for explicit shutdown when you need to wait for completion.
-    #[allow(dead_code)] // public API for explicit close; implicit channel-drop handles normal shutdown
+    #[cfg(test)]
     pub async fn close(&self) {
         let _ = self.tx.send(SinkCommand::Close).await;
         let mut guard = self.task.lock().await;
@@ -244,6 +245,7 @@ async fn run_sink_task(
                             );
                         }
                     }
+                    #[cfg(test)]
                     SinkCommand::Flush { ack } => {
                         let result = sink.flush().await;
                         let _ = ack.send(result);
@@ -266,6 +268,7 @@ async fn run_sink_task(
                             );
                         }
                     }
+                    #[cfg(test)]
                     SinkCommand::Close => {
                         if let Err(e) = sink.flush().await {
                             tracing::warn!(

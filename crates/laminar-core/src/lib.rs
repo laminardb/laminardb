@@ -58,7 +58,6 @@ pub mod streaming;
 pub mod subscription;
 pub mod time;
 pub mod tpc;
-pub mod xdp;
 
 /// Distributed delta mode (multi-node coordination).
 #[cfg(feature = "delta")]
@@ -104,10 +103,6 @@ pub enum Error {
     /// Materialized view errors
     #[error("MV error: {0}")]
     Mv(#[from] mv::MvError),
-
-    /// XDP/eBPF errors
-    #[error("XDP error: {0}")]
-    Xdp(#[from] xdp::XdpError),
 
     /// DAG topology errors
     #[error("DAG error: {0}")]

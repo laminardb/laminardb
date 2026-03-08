@@ -61,10 +61,6 @@ pub(crate) struct SinkInner<T: Record> {
 
     /// Number of active subscribers.
     subscriber_count: AtomicUsize,
-
-    /// Whether the sink is disconnected (source dropped).
-    #[allow(dead_code)] // Reserved for future use
-    disconnected: std::sync::atomic::AtomicBool,
 }
 
 /// A streaming data sink.
@@ -119,7 +115,6 @@ impl<T: Record> Sink<T> {
                 schema,
                 channel_config,
                 subscriber_count: AtomicUsize::new(0),
-                disconnected: std::sync::atomic::AtomicBool::new(false),
             }),
             subscribers: Arc::new(parking_lot::RwLock::new(Vec::new())),
         }

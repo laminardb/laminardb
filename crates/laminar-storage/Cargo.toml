@@ -76,7 +76,3 @@ criterion = { workspace = true }
 [[bench]]
 name = "wal_bench"
 harness = false
-
-[[bench]]
-name = "checkpoint_bench"
-harness = false

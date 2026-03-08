@@ -82,19 +82,16 @@ impl StateStore for AHashMapStore {
     }
 
     #[inline]
-    fn put(&mut self, key: &[u8], value: &[u8]) -> Result<(), StateError> {
-        let value_bytes = Bytes::copy_from_slice(value);
+    fn put(&mut self, key: &[u8], value: Bytes) -> Result<(), StateError> {
         if let Some(old_value) = self.data.get_mut(key) {
-            // Update existing: only value size changes, no key allocation
             self.size_bytes -= old_value.len();
             self.size_bytes += value.len();
-            *old_value = value_bytes;
+            *old_value = value;
         } else {
-            // New key: allocate only on insert path
             self.size_bytes += key.len() + value.len();
             let key_vec = key.to_vec();
             self.index.insert(key_vec.clone());
-            self.data.insert(key_vec, value_bytes);
+            self.data.insert(key_vec, value);
         }
         Ok(())
     }
@@ -205,12 +202,12 @@ mod tests {
     fn test_basic_operations() {
         let mut store = AHashMapStore::new();
 
-        store.put(b"key1", b"value1").unwrap();
+        store.put(b"key1", Bytes::from_static(b"value1")).unwrap();
         assert_eq!(store.get(b"key1").unwrap(), Bytes::from("value1"));
         assert_eq!(store.len(), 1);
 
         // Overwrite
-        store.put(b"key1", b"value2").unwrap();
+        store.put(b"key1", Bytes::from_static(b"value2")).unwrap();
         assert_eq!(store.get(b"key1").unwrap(), Bytes::from("value2"));
         assert_eq!(store.len(), 1);
 
@@ -223,7 +220,7 @@ mod tests {
     #[test]
     fn test_get_ref_zero_copy() {
         let mut store = AHashMapStore::new();
-        store.put(b"key1", b"value1").unwrap();
+        store.put(b"key1", Bytes::from_static(b"value1")).unwrap();
 
         // get_ref returns a direct slice
         let slice = store.get_ref(b"key1").unwrap();
@@ -238,7 +235,7 @@ mod tests {
         let mut store = AHashMapStore::new();
         assert!(!store.contains(b"key1"));
 
-        store.put(b"key1", b"value1").unwrap();
+        store.put(b"key1", Bytes::from_static(b"value1")).unwrap();
         assert!(store.contains(b"key1"));
 
         store.delete(b"key1").unwrap();
@@ -248,10 +245,18 @@ mod tests {
     #[test]
     fn test_prefix_scan() {
         let mut store = AHashMapStore::new();
-        store.put(b"prefix:1", b"value1").unwrap();
-        store.put(b"prefix:2", b"value2").unwrap();
-        store.put(b"prefix:10", b"value10").unwrap();
-        store.put(b"other:1", b"value3").unwrap();
+        store
+            .put(b"prefix:1", Bytes::from_static(b"value1"))
+            .unwrap();
+        store
+            .put(b"prefix:2", Bytes::from_static(b"value2"))
+            .unwrap();
+        store
+            .put(b"prefix:10", Bytes::from_static(b"value10"))
+            .unwrap();
+        store
+            .put(b"other:1", Bytes::from_static(b"value3"))
+            .unwrap();
 
         let results: Vec<_> = store.prefix_scan(b"prefix:").collect();
         assert_eq!(results.len(), 3);
@@ -267,9 +272,9 @@ mod tests {
     #[test]
     fn test_prefix_scan_sorted() {
         let mut store = AHashMapStore::new();
-        store.put(b"prefix:c", b"3").unwrap();
-        store.put(b"prefix:a", b"1").unwrap();
-        store.put(b"prefix:b", b"2").unwrap();
+        store.put(b"prefix:c", Bytes::from_static(b"3")).unwrap();
+        store.put(b"prefix:a", Bytes::from_static(b"1")).unwrap();
+        store.put(b"prefix:b", Bytes::from_static(b"2")).unwrap();
 
         let results: Vec<_> = store.prefix_scan(b"prefix:").collect();
         let keys: Vec<_> = results.iter().map(|(k, _)| k.as_ref().to_vec()).collect();
@@ -286,10 +291,10 @@ mod tests {
     #[test]
     fn test_range_scan() {
         let mut store = AHashMapStore::new();
-        store.put(b"a", b"1").unwrap();
-        store.put(b"b", b"2").unwrap();
-        store.put(b"c", b"3").unwrap();
-        store.put(b"d", b"4").unwrap();
+        store.put(b"a", Bytes::from_static(b"1")).unwrap();
+        store.put(b"b", Bytes::from_static(b"2")).unwrap();
+        store.put(b"c", Bytes::from_static(b"3")).unwrap();
+        store.put(b"d", Bytes::from_static(b"4")).unwrap();
 
         let results: Vec<_> = store.range_scan(b"b".as_slice()..b"d".as_slice()).collect();
         assert_eq!(results.len(), 2);
@@ -302,14 +307,14 @@ mod tests {
     #[test]
     fn test_snapshot_and_restore() {
         let mut store = AHashMapStore::new();
-        store.put(b"key1", b"value1").unwrap();
-        store.put(b"key2", b"value2").unwrap();
+        store.put(b"key1", Bytes::from_static(b"value1")).unwrap();
+        store.put(b"key2", Bytes::from_static(b"value2")).unwrap();
 
         let snapshot = store.snapshot();
         assert_eq!(snapshot.len(), 2);
 
-        store.put(b"key1", b"modified").unwrap();
-        store.put(b"key3", b"value3").unwrap();
+        store.put(b"key1", Bytes::from_static(b"modified")).unwrap();
+        store.put(b"key3", Bytes::from_static(b"value3")).unwrap();
         store.delete(b"key2").unwrap();
 
         store.restore(snapshot);
@@ -324,14 +329,14 @@ mod tests {
         let mut store = AHashMapStore::new();
         assert_eq!(store.size_bytes(), 0);
 
-        store.put(b"key1", b"value1").unwrap();
+        store.put(b"key1", Bytes::from_static(b"value1")).unwrap();
         assert_eq!(store.size_bytes(), 4 + 6);
 
-        store.put(b"key2", b"value2").unwrap();
+        store.put(b"key2", Bytes::from_static(b"value2")).unwrap();
         assert_eq!(store.size_bytes(), (4 + 6) * 2);
 
         // Overwrite with smaller value
-        store.put(b"key1", b"v1").unwrap();
+        store.put(b"key1", Bytes::from_static(b"v1")).unwrap();
         assert_eq!(store.size_bytes(), 4 + 2 + 4 + 6);
 
         store.delete(b"key1").unwrap();

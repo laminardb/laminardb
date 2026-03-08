@@ -4,6 +4,7 @@
 //!
 //! Run with: cargo bench --bench state_bench
 
+use bytes::Bytes;
 use criterion::{criterion_group, criterion_main, BenchmarkId, Criterion, Throughput};
 use laminar_core::state::{
     AHashMapStore, InMemoryStore, MmapStateStore, StateStore, StateStoreExt,
@@ -16,7 +17,7 @@ fn populate_store(n: usize) -> InMemoryStore {
     for i in 0..n {
         let key = format!("key:{i:08}");
         let value = format!("value:{i:08}");
-        store.put(key.as_bytes(), value.as_bytes()).unwrap();
+        store.put(key.as_bytes(), Bytes::from(value)).unwrap();
     }
     store
 }
@@ -93,7 +94,10 @@ fn bench_state_put(c: &mut Criterion) {
                 },
                 |(mut store, key)| {
                     store
-                        .put(black_box(key.as_bytes()), black_box(b"newvalue"))
+                        .put(
+                            black_box(key.as_bytes()),
+                            Bytes::from_static(black_box(b"newvalue")),
+                        )
                         .unwrap();
                     black_box(store)
                 },
@@ -109,7 +113,10 @@ fn bench_state_put(c: &mut Criterion) {
             b.iter(|| {
                 let value = counter.to_le_bytes();
                 store
-                    .put(black_box(key.as_bytes()), black_box(&value))
+                    .put(
+                        black_box(key.as_bytes()),
+                        Bytes::copy_from_slice(black_box(&value)),
+                    )
                     .unwrap();
                 counter += 1;
             })
@@ -128,9 +135,9 @@ fn bench_state_delete(c: &mut Criterion) {
     // Delete existing key (need to re-insert each iteration)
     group.bench_function("delete_existing", |b| {
         let mut store = InMemoryStore::new();
-        store.put(b"key", b"value").unwrap();
+        store.put(b"key", Bytes::from_static(b"value")).unwrap();
         b.iter(|| {
-            store.put(b"key", b"value").unwrap();
+            store.put(b"key", Bytes::from_static(b"value")).unwrap();
             store.delete(black_box(b"key")).unwrap();
         })
     });
@@ -154,11 +161,15 @@ fn bench_prefix_scan(c: &mut Criterion) {
     // Insert keys with different prefixes
     for i in 0..5_000 {
         let key = format!("prefix_a:{i:08}");
-        store.put(key.as_bytes(), b"value").unwrap();
+        store
+            .put(key.as_bytes(), Bytes::from_static(b"value"))
+            .unwrap();
     }
     for i in 0..5_000 {
         let key = format!("prefix_b:{i:08}");
-        store.put(key.as_bytes(), b"value").unwrap();
+        store
+            .put(key.as_bytes(), Bytes::from_static(b"value"))
+            .unwrap();
     }
 
     group.bench_function("scan_50%", |b| {
@@ -296,7 +307,9 @@ fn bench_throughput(c: &mut Criterion) {
         b.iter(|| {
             store.clear();
             for (key, value) in &pairs {
-                store.put(key.as_bytes(), value).unwrap();
+                store
+                    .put(key.as_bytes(), Bytes::copy_from_slice(value))
+                    .unwrap();
             }
         })
     });
@@ -311,7 +324,7 @@ fn populate_mmap_store(n: usize) -> MmapStateStore {
     for i in 0..n {
         let key = format!("key:{i:08}");
         let value = format!("value:{i:08}");
-        store.put(key.as_bytes(), value.as_bytes()).unwrap();
+        store.put(key.as_bytes(), Bytes::from(value)).unwrap();
     }
     store
 }
@@ -361,7 +374,10 @@ fn bench_mmap_put(c: &mut Criterion) {
                 let key = format!("newkey:{counter:08}");
                 let value = b"newvalue";
                 store
-                    .put(black_box(key.as_bytes()), black_box(value))
+                    .put(
+                        black_box(key.as_bytes()),
+                        Bytes::copy_from_slice(black_box(value)),
+                    )
                     .unwrap();
                 counter += 1;
             })
@@ -375,7 +391,10 @@ fn bench_mmap_put(c: &mut Criterion) {
             b.iter(|| {
                 let value = counter.to_le_bytes();
                 store
-                    .put(black_box(key.as_bytes()), black_box(&value))
+                    .put(
+                        black_box(key.as_bytes()),
+                        Bytes::copy_from_slice(black_box(&value)),
+                    )
                     .unwrap();
                 counter += 1;
             })
@@ -393,11 +412,15 @@ fn bench_mmap_prefix_scan(c: &mut Criterion) {
     // Insert keys with different prefixes
     for i in 0..5_000 {
         let key = format!("prefix_a:{i:08}");
-        store.put(key.as_bytes(), b"value").unwrap();
+        store
+            .put(key.as_bytes(), Bytes::from_static(b"value"))
+            .unwrap();
     }
     for i in 0..5_000 {
         let key = format!("prefix_b:{i:08}");
-        store.put(key.as_bytes(), b"value").unwrap();
+        store
+            .put(key.as_bytes(), Bytes::from_static(b"value"))
+            .unwrap();
     }
 
     group.bench_function("scan_50%", |b| {
@@ -532,7 +555,7 @@ fn populate_ahash_store(n: usize) -> AHashMapStore {
     for i in 0..n {
         let key = format!("key:{i:08}");
         let value = format!("value:{i:08}");
-        store.put(key.as_bytes(), value.as_bytes()).unwrap();
+        store.put(key.as_bytes(), Bytes::from(value)).unwrap();
     }
     store
 }
@@ -597,7 +620,10 @@ fn bench_ahash_put(c: &mut Criterion) {
             b.iter(|| {
                 let key = format!("newkey:{counter:08}");
                 store
-                    .put(black_box(key.as_bytes()), black_box(b"newvalue"))
+                    .put(
+                        black_box(key.as_bytes()),
+                        Bytes::from_static(black_box(b"newvalue")),
+                    )
                     .unwrap();
                 counter += 1;
             })
@@ -610,7 +636,10 @@ fn bench_ahash_put(c: &mut Criterion) {
             b.iter(|| {
                 let value = counter.to_le_bytes();
                 store
-                    .put(black_box(key.as_bytes()), black_box(&value))
+                    .put(
+                        black_box(key.as_bytes()),
+                        Bytes::copy_from_slice(black_box(&value)),
+                    )
                     .unwrap();
                 counter += 1;
             })

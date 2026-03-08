@@ -270,6 +270,9 @@ impl TpcPipelineCoordinator {
             // Phase 5: Periodic checkpoint injection
             self.maybe_inject_checkpoint(&mut *callback).await;
 
+            // Phase 5b: Poll reference table CDC updates
+            callback.poll_tables().await;
+
             // Phase 6: Barrier timeout check
             if self.pending_barrier.active
                 && self.pending_barrier.started_at.elapsed() > barrier_timeout

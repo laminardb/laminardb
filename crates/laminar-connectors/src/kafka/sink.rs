@@ -31,8 +31,8 @@ use super::schema_registry::SchemaRegistryClient;
 use super::sink_config::{DeliveryGuarantee, KafkaSinkConfig, PartitionStrategy};
 use super::sink_metrics::KafkaSinkMetrics;
 
-/// Default assumed partition count when broker metadata is not yet available.
-const DEFAULT_PARTITION_COUNT: i32 = 6;
+/// Fallback partition count used only when broker metadata query fails.
+const FALLBACK_PARTITION_COUNT: i32 = 1;
 
 /// Contiguous key buffer — stores all key bytes in a single allocation
 /// with per-row `(offset, length)` pairs. Avoids N separate heap
@@ -146,7 +146,7 @@ impl KafkaSink {
             schema,
             schema_registry: None,
             avro_schema_id,
-            topic_partition_count: DEFAULT_PARTITION_COUNT,
+            topic_partition_count: FALLBACK_PARTITION_COUNT,
         }
     }
 
@@ -185,7 +185,7 @@ impl KafkaSink {
             schema,
             schema_registry: Some(sr),
             avro_schema_id,
-            topic_partition_count: DEFAULT_PARTITION_COUNT,
+            topic_partition_count: FALLBACK_PARTITION_COUNT,
         }
     }
 
@@ -439,6 +439,34 @@ impl SinkConnector for KafkaSink {
             }
         }
 
+        // Query broker metadata for actual topic partition count.
+        match producer
+            .client()
+            .fetch_metadata(Some(&self.config.topic), Duration::from_secs(5))
+        {
+            Ok(metadata) => {
+                if let Some(topic_meta) = metadata.topics().first() {
+                    let count = topic_meta.partitions().len() as i32;
+                    if count > 0 {
+                        self.topic_partition_count = count;
+                        info!(
+                            topic = %self.config.topic,
+                            partitions = count,
+                            "queried topic partition count from broker"
+                        );
+                    }
+                }
+            }
+            Err(e) => {
+                warn!(
+                    topic = %self.config.topic,
+                    error = %e,
+                    fallback = FALLBACK_PARTITION_COUNT,
+                    "failed to query topic metadata — using fallback partition count"
+                );
+            }
+        }
+
         self.producer = Some(producer);
         self.state = ConnectorState::Running;
         info!("Kafka sink connector opened successfully");
@@ -485,10 +513,7 @@ impl SinkConnector for KafkaSink {
         for (i, payload) in payloads.iter().enumerate() {
             let key: Option<&[u8]> = keys.as_ref().map(|kb| kb.key(i)).filter(|k| !k.is_empty());
 
-            // Determine partition.
-            // TODO: query topic metadata after open() and cache actual partition count.
-            // Using None lets rdkafka handle partitioning via its built-in partitioner
-            // when our partitioner returns None for the default num_partitions.
+            // Determine partition using the count queried from broker metadata in open().
             let partition = self.partitioner.partition(key, self.topic_partition_count);
 
             // Build the Kafka record.

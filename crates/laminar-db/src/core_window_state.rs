@@ -113,6 +113,9 @@ pub(crate) struct CoreWindowState {
     emit_strategy: CoreEmitStrategy,
     having_sql: Option<String>,
     max_groups_per_window: usize,
+    /// Grace period (ms) after window end before closing. Late events
+    /// arriving within this window are included instead of dropped.
+    allowed_lateness_ms: i64,
 }
 
 impl CoreWindowState {
@@ -130,7 +133,14 @@ impl CoreWindowState {
 
         let offset_ms = window_config.offset_ms;
         let assigner = match window_config.window_type {
-            WindowType::Tumbling | WindowType::Cumulate => {
+            WindowType::Cumulate => {
+                return Err(DbError::Unsupported(
+                    "CUMULATE windows are not yet supported in the streaming pipeline. \
+                     Use TUMBLE or HOP instead."
+                        .into(),
+                ));
+            }
+            WindowType::Tumbling => {
                 if size_ms <= 0 {
                     return Ok(None);
                 }
@@ -360,6 +370,8 @@ impl CoreWindowState {
             emit_strategy,
             having_sql,
             max_groups_per_window: 1_000_000,
+            allowed_lateness_ms: i64::try_from(window_config.allowed_lateness.as_millis())
+                .unwrap_or(0),
         }))
     }
 
@@ -749,7 +761,11 @@ impl CoreWindowState {
             .windows
             .keys()
             .copied()
-            .take_while(|&ws| ws.saturating_add(size_ms) <= watermark_ms)
+            .take_while(|&ws| {
+                ws.saturating_add(size_ms)
+                    .saturating_add(self.allowed_lateness_ms)
+                    <= watermark_ms
+            })
             .collect();
 
         if to_close.is_empty() {
@@ -791,7 +807,7 @@ impl CoreWindowState {
             let to_close: Vec<i64> = group
                 .sessions
                 .iter()
-                .filter(|(_, s)| s.end <= watermark_ms)
+                .filter(|(_, s)| s.end.saturating_add(self.allowed_lateness_ms) <= watermark_ms)
                 .map(|(&k, _)| k)
                 .collect();
 
@@ -1191,6 +1207,7 @@ mod tests {
             emit_strategy: CoreEmit::OnWindowClose,
             having_sql: None,
             max_groups_per_window: 1_000_000,
+            allowed_lateness_ms: 0,
         }
     }
 
@@ -1243,6 +1260,7 @@ mod tests {
             emit_strategy: CoreEmit::OnWindowClose,
             having_sql: None,
             max_groups_per_window: 1_000_000,
+            allowed_lateness_ms: 0,
         }
     }
 
@@ -1284,6 +1302,7 @@ mod tests {
             emit_strategy: CoreEmit::OnWindowClose,
             having_sql: None,
             max_groups_per_window: 1_000_000,
+            allowed_lateness_ms: 0,
         }
     }
 
@@ -1323,6 +1342,7 @@ mod tests {
             emit_strategy: CoreEmit::OnWindowClose,
             having_sql: None,
             max_groups_per_window: 1_000_000,
+            allowed_lateness_ms: 0,
         }
     }
 

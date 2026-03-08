@@ -135,29 +135,36 @@ impl Drop for SourceIoThread {
     }
 }
 
-/// Extract a timestamp from a `RecordBatch`.
+/// Extract the maximum timestamp from a `RecordBatch`.
 ///
 /// Scans for a column named `event_time` or `timestamp` (i64 or
-/// `TimestampMillisecond`). If not found, falls back to wall-clock time.
+/// `TimestampMillisecond`) and returns the MAX value across all rows.
+/// Using MAX ensures watermark correctness for out-of-order batches.
+/// If not found, falls back to wall-clock time.
 fn extract_timestamp(batch: &RecordBatch) -> i64 {
+    use arrow::compute::kernels::aggregate::max as arrow_max;
     use arrow_array::Array;
 
     for name in &["event_time", "timestamp"] {
         if let Ok(col_idx) = batch.schema().index_of(name) {
             let col = batch.column(col_idx);
-            // Try i64 array
+            // Try i64 array — use max across all rows
             if let Some(arr) = col.as_any().downcast_ref::<arrow_array::Int64Array>() {
-                if !arr.is_empty() && !arr.is_null(0) {
-                    return arr.value(0);
+                if !arr.is_empty() {
+                    if let Some(max_val) = arrow_max(arr) {
+                        return max_val;
+                    }
                 }
             }
-            // Try TimestampMillisecond array
+            // Try TimestampMillisecond array — use max across all rows
             if let Some(arr) = col
                 .as_any()
                 .downcast_ref::<arrow_array::TimestampMillisecondArray>()
             {
-                if !arr.is_empty() && !arr.is_null(0) {
-                    return arr.value(0);
+                if !arr.is_empty() {
+                    if let Some(max_val) = arrow_max(arr) {
+                        return max_val;
+                    }
                 }
             }
         }

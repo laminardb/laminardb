@@ -83,9 +83,6 @@ struct ValueEntry {
     offset: usize,
     /// Length of the value in bytes.
     len: usize,
-    /// Version for optimistic concurrency (future use).
-    #[allow(dead_code)]
-    version: u64,
 }
 
 /// Storage backend for the mmap store.
@@ -245,7 +242,7 @@ pub struct MmapStateStore {
     storage: Storage,
     /// Total size of keys + values for size tracking.
     size_bytes: usize,
-    /// Next version number for entries.
+    /// Next version number (persisted in index file for format compatibility).
     next_version: u64,
 }
 
@@ -435,7 +432,6 @@ impl MmapStateStore {
                 ValueEntry {
                     offset,
                     len: value.len(),
-                    version: self.next_version,
                 },
             );
             self.next_version += 1;
@@ -561,16 +557,14 @@ impl StateStore for MmapStateStore {
     }
 
     #[inline]
-    fn put(&mut self, key: &[u8], value: &[u8]) -> Result<(), StateError> {
+    fn put(&mut self, key: &[u8], value: Bytes) -> Result<(), StateError> {
         // Write value to storage
-        let offset = self.storage.write(value)?;
+        let offset = self.storage.write(&value)?;
 
         let entry = ValueEntry {
             offset,
             len: value.len(),
-            version: self.next_version,
         };
-        self.next_version += 1;
 
         // Fast path: update existing key without allocating key.to_vec()
         if let Some(existing) = self.index.get_mut(key) {
@@ -687,7 +681,6 @@ impl StateStore for MmapStateStore {
                 ValueEntry {
                     offset,
                     len: value.len(),
-                    version: self.next_version,
                 },
             );
             self.next_version += 1;
@@ -720,12 +713,12 @@ mod tests {
         let mut store = MmapStateStore::in_memory(1024);
 
         // Test put and get
-        store.put(b"key1", b"value1").unwrap();
+        store.put(b"key1", Bytes::from_static(b"value1")).unwrap();
         assert_eq!(store.get(b"key1").unwrap(), Bytes::from("value1"));
         assert_eq!(store.len(), 1);
 
         // Test overwrite
-        store.put(b"key1", b"value2").unwrap();
+        store.put(b"key1", Bytes::from_static(b"value2")).unwrap();
         assert_eq!(store.get(b"key1").unwrap(), Bytes::from("value2"));
         assert_eq!(store.len(), 1);
 
@@ -743,8 +736,8 @@ mod tests {
         // Create store and write data
         {
             let mut store = MmapStateStore::persistent(&path, 4096).unwrap();
-            store.put(b"key1", b"value1").unwrap();
-            store.put(b"key2", b"value2").unwrap();
+            store.put(b"key1", Bytes::from_static(b"value1")).unwrap();
+            store.put(b"key2", Bytes::from_static(b"value2")).unwrap();
             store.flush().unwrap();
         }
 
@@ -762,7 +755,7 @@ mod tests {
         let mut store = MmapStateStore::in_memory(1024);
         assert!(!store.contains(b"key1"));
 
-        store.put(b"key1", b"value1").unwrap();
+        store.put(b"key1", Bytes::from_static(b"value1")).unwrap();
         assert!(store.contains(b"key1"));
 
         store.delete(b"key1").unwrap();
@@ -772,10 +765,18 @@ mod tests {
     #[test]
     fn test_prefix_scan() {
         let mut store = MmapStateStore::in_memory(4096);
-        store.put(b"prefix:1", b"value1").unwrap();
-        store.put(b"prefix:2", b"value2").unwrap();
-        store.put(b"prefix:10", b"value10").unwrap();
-        store.put(b"other:1", b"value3").unwrap();
+        store
+            .put(b"prefix:1", Bytes::from_static(b"value1"))
+            .unwrap();
+        store
+            .put(b"prefix:2", Bytes::from_static(b"value2"))
+            .unwrap();
+        store
+            .put(b"prefix:10", Bytes::from_static(b"value10"))
+            .unwrap();
+        store
+            .put(b"other:1", Bytes::from_static(b"value3"))
+            .unwrap();
 
         let results: Vec<_> = store.prefix_scan(b"prefix:").collect();
         assert_eq!(results.len(), 3);
@@ -788,10 +789,10 @@ mod tests {
     #[test]
     fn test_range_scan() {
         let mut store = MmapStateStore::in_memory(4096);
-        store.put(b"a", b"1").unwrap();
-        store.put(b"b", b"2").unwrap();
-        store.put(b"c", b"3").unwrap();
-        store.put(b"d", b"4").unwrap();
+        store.put(b"a", Bytes::from_static(b"1")).unwrap();
+        store.put(b"b", Bytes::from_static(b"2")).unwrap();
+        store.put(b"c", Bytes::from_static(b"3")).unwrap();
+        store.put(b"d", Bytes::from_static(b"4")).unwrap();
 
         let results: Vec<_> = store.range_scan(b"b".as_slice()..b"d".as_slice()).collect();
         assert_eq!(results.len(), 2);
@@ -804,16 +805,16 @@ mod tests {
     #[test]
     fn test_snapshot_and_restore() {
         let mut store = MmapStateStore::in_memory(4096);
-        store.put(b"key1", b"value1").unwrap();
-        store.put(b"key2", b"value2").unwrap();
+        store.put(b"key1", Bytes::from_static(b"value1")).unwrap();
+        store.put(b"key2", Bytes::from_static(b"value2")).unwrap();
 
         // Take snapshot
         let snapshot = store.snapshot();
         assert_eq!(snapshot.len(), 2);
 
         // Modify store
-        store.put(b"key1", b"modified").unwrap();
-        store.put(b"key3", b"value3").unwrap();
+        store.put(b"key1", Bytes::from_static(b"modified")).unwrap();
+        store.put(b"key3", Bytes::from_static(b"value3")).unwrap();
         store.delete(b"key2").unwrap();
 
         assert_eq!(store.len(), 2);
@@ -833,14 +834,14 @@ mod tests {
         let mut store = MmapStateStore::in_memory(4096);
         assert_eq!(store.size_bytes(), 0);
 
-        store.put(b"key1", b"value1").unwrap();
+        store.put(b"key1", Bytes::from_static(b"value1")).unwrap();
         assert_eq!(store.size_bytes(), 4 + 6); // "key1" + "value1"
 
-        store.put(b"key2", b"value2").unwrap();
+        store.put(b"key2", Bytes::from_static(b"value2")).unwrap();
         assert_eq!(store.size_bytes(), (4 + 6) * 2);
 
         // Overwrite with smaller value (old value becomes fragmentation)
-        store.put(b"key1", b"v1").unwrap();
+        store.put(b"key1", Bytes::from_static(b"v1")).unwrap();
         assert_eq!(store.size_bytes(), 4 + 2 + 4 + 6);
 
         store.delete(b"key1").unwrap();
@@ -855,15 +856,17 @@ mod tests {
         let mut store = MmapStateStore::in_memory(4096);
 
         // Add some data
-        store.put(b"key1", b"value1").unwrap();
-        store.put(b"key2", b"value2").unwrap();
-        store.put(b"key3", b"value3").unwrap();
+        store.put(b"key1", Bytes::from_static(b"value1")).unwrap();
+        store.put(b"key2", Bytes::from_static(b"value2")).unwrap();
+        store.put(b"key3", Bytes::from_static(b"value3")).unwrap();
 
         // Delete middle key to create fragmentation
         store.delete(b"key2").unwrap();
 
         // Overwrite to create more fragmentation
-        store.put(b"key1", b"new_value1").unwrap();
+        store
+            .put(b"key1", Bytes::from_static(b"new_value1"))
+            .unwrap();
 
         let frag_before = store.fragmentation();
         assert!(frag_before > 0.0);
@@ -890,7 +893,7 @@ mod tests {
         for i in 0..100 {
             let key = format!("key{i:04}");
             let value = format!("value{i:04}");
-            store.put(key.as_bytes(), value.as_bytes()).unwrap();
+            store.put(key.as_bytes(), Bytes::from(value)).unwrap();
         }
 
         assert_eq!(store.len(), 100);
@@ -909,8 +912,8 @@ mod tests {
     #[test]
     fn test_clear() {
         let mut store = MmapStateStore::in_memory(4096);
-        store.put(b"key1", b"value1").unwrap();
-        store.put(b"key2", b"value2").unwrap();
+        store.put(b"key1", Bytes::from_static(b"value1")).unwrap();
+        store.put(b"key2", Bytes::from_static(b"value2")).unwrap();
 
         assert_eq!(store.len(), 2);
         assert!(store.size_bytes() > 0);
@@ -938,7 +941,9 @@ mod tests {
 
         // 100KB value
         let large_value = vec![0xABu8; 100 * 1024];
-        store.put(b"large", &large_value).unwrap();
+        store
+            .put(b"large", Bytes::from(large_value.clone()))
+            .unwrap();
 
         let retrieved = store.get(b"large").unwrap();
         assert_eq!(retrieved.len(), large_value.len());
@@ -953,7 +958,7 @@ mod tests {
         let key = [0x00, 0x01, 0x02, 0xFF, 0xFE];
         let value = [0xDE, 0xAD, 0xBE, 0xEF];
 
-        store.put(&key, &value).unwrap();
+        store.put(&key, Bytes::copy_from_slice(&value)).unwrap();
         assert_eq!(store.get(&key).unwrap().as_ref(), &value);
     }
 
@@ -965,8 +970,8 @@ mod tests {
         // 1. Create persistent store and add data
         {
             let mut store = MmapStateStore::persistent(&db_path, 1024 * 1024).unwrap();
-            store.put(b"key1", b"value1").unwrap();
-            store.put(b"key2", b"value2").unwrap();
+            store.put(b"key1", Bytes::from_static(b"value1")).unwrap();
+            store.put(b"key2", Bytes::from_static(b"value2")).unwrap();
             // Flush should save the index
             store.flush().unwrap();
         }

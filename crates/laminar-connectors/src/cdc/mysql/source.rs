@@ -295,6 +295,17 @@ impl SourceConnector for MySqlCdcSource {
             }
         }
 
+        // Without mysql-cdc feature, open() must fail loudly to prevent
+        // silent data loss (poll_batch would return Ok(None) forever).
+        #[cfg(not(feature = "mysql-cdc"))]
+        {
+            return Err(ConnectorError::ConfigurationError(
+                "MySQL CDC source requires the `mysql-cdc` feature flag. \
+                 Rebuild with `--features mysql-cdc` to enable."
+                    .to_string(),
+            ));
+        }
+
         // When mysql-cdc feature is enabled, establish a real connection
         // and spawn a background reader task for event-driven wake-up.
         #[cfg(feature = "mysql-cdc")]
@@ -776,19 +787,19 @@ mod tests {
         assert!(!source.should_include_table("testdb", "other"));
     }
 
-    // With mysql-cdc feature, open() attempts a real connection, so this test
-    // only works without the feature (stub mode).
+    // Without mysql-cdc feature, open() must return an error to prevent silent data loss.
     #[cfg(not(feature = "mysql-cdc"))]
     #[tokio::test]
-    async fn test_open_close() {
+    async fn test_open_fails_without_feature() {
         let mut source = MySqlCdcSource::new(test_config());
 
-        source.open(&ConnectorConfig::default()).await.unwrap();
-        assert!(source.is_connected());
-
-        source.close().await.unwrap();
-        assert!(!source.is_connected());
-        assert_eq!(source.cached_table_count(), 0);
+        let result = source.open(&ConnectorConfig::default()).await;
+        assert!(result.is_err());
+        let err = result.unwrap_err().to_string();
+        assert!(
+            err.contains("mysql-cdc"),
+            "error should mention feature flag: {err}"
+        );
     }
 
     #[tokio::test]
@@ -799,18 +810,8 @@ mod tests {
         assert!(result.is_err());
     }
 
-    // With mysql-cdc feature, open() attempts a real connection, so this test
-    // only works without the feature (stub mode).
-    #[cfg(not(feature = "mysql-cdc"))]
-    #[tokio::test]
-    async fn test_poll_connected() {
-        let mut source = MySqlCdcSource::new(test_config());
-        source.open(&ConnectorConfig::default()).await.unwrap();
-
-        // Should return None (no actual data without real connection)
-        let result = source.poll_batch(100).await.unwrap();
-        assert!(result.is_none());
-    }
+    // Without mysql-cdc feature, open() returns an error, so poll is unreachable.
+    // With mysql-cdc, open() needs a real MySQL server. Covered by integration tests.
 
     #[tokio::test]
     async fn test_restore_async() {

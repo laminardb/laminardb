@@ -40,15 +40,11 @@
 
 mod detector;
 mod guard;
-mod object_pool;
 mod ring_buffer;
-mod scratch;
 
 pub use detector::AllocationStats;
 pub use guard::HotPathGuard;
-pub use object_pool::ObjectPool;
 pub use ring_buffer::RingBuffer;
-pub use scratch::ScratchBuffer;
 
 // Re-export feature-gated items
 #[cfg(feature = "allocation-tracking")]

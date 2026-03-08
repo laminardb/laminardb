@@ -7,7 +7,7 @@ LaminarDB is an embedded streaming database designed for sub-microsecond latency
 ## Design Principles
 
 1. **Embedded First** -- Single binary, no external dependencies
-2. **Sub-Microsecond Latency** -- Zero allocations on hot path
+2. **Sub-Microsecond Latency** -- Minimal allocations on hot path
 3. **SQL Native** -- Full SQL support via Apache DataFusion
 4. **Thread-Per-Core** -- Linear scaling with CPU cores
 5. **Exactly-Once** -- End-to-end exactly-once semantics
@@ -345,9 +345,8 @@ Queries are planned by `StreamingPlanner` and executed either via DataFusion (in
 | State lookup | < 500ns | 10-105ns (AHash get_ref: 10-16ns) | AHashMap, cache-aligned keys |
 | Event processing | < 1us | 0.55-1.16us | Zero allocation, inlined operators |
 | Throughput/core | 500K/s | 1.1-1.46M/s | Batch processing, Arrow columnar |
-| Checkpoint | < 10s recovery | 1.39ms | Incremental snapshots, async I/O |
+| Checkpoint | < 10s recovery | 1.39ms | Full snapshots, per-core WAL |
 | Window trigger | < 10us | -- | Hierarchical timer wheel |
-| Changelog overhead | ~2-5ns/mutation | -- | `ChangelogAwareStore` wrapper |
 
 See [BENCHMARKS.md](BENCHMARKS.md) for full benchmark baselines with hardware details.
 

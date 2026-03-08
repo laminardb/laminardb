@@ -528,7 +528,7 @@ fn matched_flag_key(state_key: &[u8]) -> [u8; 29] {
 #[inline]
 fn mark_matched(state: &mut dyn StateStore, state_key: &[u8]) {
     let k = matched_flag_key(state_key);
-    let _ = state.put(&k, &[1]);
+    let _ = state.put(&k, Bytes::from_static(&[1]));
 }
 
 /// Check if a join row has been matched.

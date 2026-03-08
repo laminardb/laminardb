@@ -14,9 +14,9 @@ use std::collections::HashMap;
 use arrow::array::{Array, RecordBatch, StringArray};
 use arrow::datatypes::SchemaRef;
 
-use laminar_core::operator::table_cache::{
-    collect_cache_metrics, TableCacheMetrics, TableLruCache, TableXorFilter,
-};
+#[cfg(test)]
+use laminar_core::operator::table_cache::{collect_cache_metrics, TableCacheMetrics};
+use laminar_core::operator::table_cache::{TableLruCache, TableXorFilter};
 
 use crate::error::DbError;
 use crate::table_backend::TableBackend;
@@ -38,8 +38,8 @@ struct TableState {
     ready: bool,
     /// Connector type backing this table, if any.
     connector: Option<String>,
-    /// Cache mode for this table.
-    #[allow(dead_code)] // read in test-only lookup() path
+    /// Cache mode for this table (used by test-only `lookup()` path).
+    #[cfg_attr(not(test), allow(dead_code))]
     cache_mode: TableCacheMode,
     /// LRU cache (only used in Partial mode).
     lru_cache: Option<TableLruCache>,
@@ -152,7 +152,7 @@ impl TableStore {
         self.tables.get(name).map_or(0, |t| t.row_count)
     }
 
-    #[allow(dead_code)] // test verification API
+    #[cfg(test)]
     pub fn is_ready(&self, name: &str) -> bool {
         self.tables.get(name).is_some_and(|t| t.ready)
     }
@@ -218,7 +218,7 @@ impl TableStore {
 
     /// Delete a row by primary key. Returns `true` if the key existed.
     /// Invalidates the LRU cache entry if present.
-    #[allow(dead_code)] // test verification API
+    #[cfg(test)]
     pub fn delete(&mut self, name: &str, key: &str) -> bool {
         if let Some(state) = self.tables.get_mut(name) {
             if let Some(ref mut lru) = state.lru_cache {
@@ -240,7 +240,7 @@ impl TableStore {
     ///
     /// In **Full** / **None** mode: direct backend lookup (unchanged behavior).
     /// In **Partial** mode: xor filter -> LRU cache -> backend -> populate LRU.
-    #[allow(dead_code)] // test verification API
+    #[cfg(test)]
     pub fn lookup(&mut self, name: &str, key: &str) -> Option<RecordBatch> {
         let state = self.tables.get_mut(name)?;
 
@@ -295,7 +295,7 @@ impl TableStore {
     }
 
     /// Get cache metrics for a table.
-    #[allow(dead_code)] // test verification API
+    #[cfg(test)]
     pub fn cache_metrics(&self, name: &str) -> Option<TableCacheMetrics> {
         let state = self.tables.get(name)?;
         state

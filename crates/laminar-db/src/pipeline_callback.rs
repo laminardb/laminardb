@@ -6,6 +6,7 @@
 use std::sync::Arc;
 
 use std::collections::HashMap;
+use std::sync::atomic::{AtomicUsize, Ordering};
 
 use arrow::array::RecordBatch;
 use datafusion::prelude::SessionContext;
@@ -16,8 +17,11 @@ use rustc_hash::FxHashMap;
 use crate::db::{filter_late_rows, SourceWatermarkState};
 use crate::error::DbError;
 
-/// Internal table name used by the sink WHERE filter.
+/// Base prefix for the temporary table used by sink WHERE filters.
 const FILTER_INPUT_TABLE: &str = "__laminar_filter_input";
+
+/// Monotonic counter for unique filter table names (concurrent-safe).
+static FILTER_TABLE_COUNTER: AtomicUsize = AtomicUsize::new(0);
 
 /// Implements [`PipelineCallback`](crate::pipeline::PipelineCallback) to bridge
 /// the event-driven pipeline coordinator to the rest of the database (stream
@@ -50,6 +54,8 @@ pub(crate) struct ConnectorPipelineCallback {
     pub(crate) table_store: Arc<parking_lot::Mutex<crate::table_store::TableStore>>,
     pub(crate) lookup_registry: Arc<laminar_sql::datafusion::LookupTableRegistry>,
     pub(crate) ctx: SessionContext,
+    /// Cached `SessionContext` for sink WHERE filters (avoids per-batch allocation).
+    pub(crate) filter_ctx: SessionContext,
     pub(crate) last_checkpoint: std::time::Instant,
     /// `None` = no automatic checkpointing (manual only via coordinator).
     pub(crate) checkpoint_interval: Option<std::time::Duration>,
@@ -95,6 +101,7 @@ impl crate::pipeline::PipelineCallback for ConnectorPipelineCallback {
 
     async fn write_to_sinks(&mut self, results: &FxHashMap<String, Vec<RecordBatch>>) {
         // Route results to sinks concurrently, filtered by FROM clause.
+        let filter_ctx = self.filter_ctx.clone(); // Arc bump — cheap
         let sink_futures: Vec<_> = self
             .sinks
             .iter()
@@ -108,10 +115,11 @@ impl crate::pipeline::PipelineCallback for ConnectorPipelineCallback {
                 let handle = handle.clone();
                 let filter_expr = filter_expr.clone();
                 let batches = batches.clone();
+                let ctx = filter_ctx.clone();
                 Some(async move {
                     for batch in &batches {
                         let filtered = if let Some(ref filter_sql) = filter_expr {
-                            match apply_filter(batch, filter_sql).await {
+                            match apply_filter(&ctx, batch, filter_sql).await {
                                 Ok(Some(fb)) => fb,
                                 Ok(None) => continue,
                                 Err(e) => {
@@ -608,51 +616,66 @@ pub(crate) fn encode_arrow_schema(schema: &arrow_schema::Schema) -> String {
         .join(",")
 }
 
-/// Apply a SQL WHERE filter to a `RecordBatch`.
+/// Apply a SQL WHERE filter to a `RecordBatch` using a cached `SessionContext`.
+///
+/// Each call uses a unique temporary table name so concurrent calls on the
+/// same context (via `join_all`) do not interfere with each other.
 ///
 /// Returns `Ok(Some(filtered_batch))` if rows match, `Ok(None)` if no rows match,
 /// or an error if the filter expression is invalid.
 async fn apply_filter(
+    ctx: &SessionContext,
     batch: &RecordBatch,
     filter_sql: &str,
 ) -> Result<Option<RecordBatch>, DbError> {
-    let ctx = laminar_sql::create_session_context();
+    // Unique table name per call to avoid concurrent conflicts.
+    let id = FILTER_TABLE_COUNTER.fetch_add(1, Ordering::Relaxed);
+    let table_name = format!("{FILTER_INPUT_TABLE}_{id}");
+
     let schema = batch.schema();
 
     // Register the batch as a temporary table
     let mem_table = datafusion::datasource::MemTable::try_new(schema, vec![vec![batch.clone()]])
         .map_err(|e| DbError::query_pipeline("sink filter", &e))?;
 
-    ctx.register_table(FILTER_INPUT_TABLE, Arc::new(mem_table))
+    ctx.register_table(&*table_name, Arc::new(mem_table))
         .map_err(|e| DbError::query_pipeline("sink filter", &e))?;
 
-    // Execute the filter query
-    let sql = format!("SELECT * FROM {FILTER_INPUT_TABLE} WHERE {filter_sql}");
-    let df = ctx
-        .sql(&sql)
-        .await
-        .map_err(|e| DbError::query_pipeline("sink filter", &e))?;
+    // Execute the filter query, always deregistering the temp table afterward.
+    let sql = format!("SELECT * FROM {table_name} WHERE {filter_sql}");
+    let result = async {
+        let df = ctx
+            .sql(&sql)
+            .await
+            .map_err(|e| DbError::query_pipeline("sink filter", &e))?;
 
-    let batches = df
-        .collect()
-        .await
-        .map_err(|e| DbError::query_pipeline("sink filter", &e))?;
+        let batches = df
+            .collect()
+            .await
+            .map_err(|e| DbError::query_pipeline("sink filter", &e))?;
 
-    if batches.is_empty() {
-        return Ok(None);
+        if batches.is_empty() {
+            return Ok(None);
+        }
+
+        let total_rows: usize = batches.iter().map(RecordBatch::num_rows).sum();
+        if total_rows == 0 {
+            return Ok(None);
+        }
+
+        // Merge all result batches into one (DataFusion may split output across
+        // multiple partitions, so dropping all but the first would lose rows).
+        if batches.len() == 1 {
+            return Ok(batches.into_iter().next());
+        }
+        let merged = arrow::compute::concat_batches(&batches[0].schema(), &batches)
+            .map_err(|e| DbError::query_pipeline_arrow("sink filter concat", &e))?;
+        Ok(Some(merged))
     }
+    .await;
 
-    let total_rows: usize = batches.iter().map(RecordBatch::num_rows).sum();
-    if total_rows == 0 {
-        return Ok(None);
-    }
+    // Clean up: deregister the temporary table to avoid catalog bloat.
+    let _ = ctx.deregister_table(&*table_name);
 
-    // Merge all result batches into one (DataFusion may split output across
-    // multiple partitions, so dropping all but the first would lose rows).
-    if batches.len() == 1 {
-        return Ok(batches.into_iter().next());
-    }
-    let merged = arrow::compute::concat_batches(&batches[0].schema(), &batches)
-        .map_err(|e| DbError::query_pipeline_arrow("sink filter concat", &e))?;
-    Ok(Some(merged))
+    result
 }

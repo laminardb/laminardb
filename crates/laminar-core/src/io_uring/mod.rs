@@ -66,11 +66,6 @@ mod buffer_pool;
 mod manager;
 #[cfg(all(target_os = "linux", feature = "io-uring"))]
 mod ring;
-#[cfg(all(target_os = "linux", feature = "io-uring"))]
-mod sink;
-#[cfg(all(target_os = "linux", feature = "io-uring"))]
-pub mod three_ring;
-
 pub use config::{IoUringConfig, IoUringConfigBuilder, RingMode};
 pub use error::IoUringError;
 
@@ -80,8 +75,6 @@ pub use buffer_pool::RegisteredBufferPool;
 pub use manager::{Completion, CompletionKind, CoreRingManager, PendingOp, RingMetrics};
 #[cfg(all(target_os = "linux", feature = "io-uring"))]
 pub use ring::IoUringRing;
-#[cfg(all(target_os = "linux", feature = "io-uring"))]
-pub use sink::IoUringSink;
 
 /// Check if `io_uring` is available on this platform.
 #[must_use]

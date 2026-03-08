@@ -12,9 +12,6 @@
 
 /// foyer-backed in-memory cache for lookup tables.
 pub mod foyer_cache;
-/// Partitioned lookup strategy for distributed lookup tables.
-#[cfg(feature = "delta")]
-pub mod partitioned;
 pub mod predicate;
 /// Async lookup source trait.
 pub mod source;

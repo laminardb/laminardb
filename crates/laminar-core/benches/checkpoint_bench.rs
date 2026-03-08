@@ -9,6 +9,7 @@ use std::hint::black_box;
 
 use criterion::{criterion_group, criterion_main, BenchmarkId, Criterion, Throughput};
 
+use bytes::Bytes;
 use laminar_core::checkpoint::barrier::CheckpointBarrierInjector;
 use laminar_core::state::{InMemoryStore, StateStore};
 
@@ -18,7 +19,7 @@ fn populated_store(n: usize) -> InMemoryStore {
     for i in 0..n {
         let key = format!("key:{i:08}");
         let value = format!("value:{i:08}");
-        store.put(key.as_bytes(), value.as_bytes()).unwrap();
+        store.put(key.as_bytes(), Bytes::from(value)).unwrap();
     }
     store
 }

@@ -485,6 +485,18 @@ impl SourceConnector for PostgresCdcSource {
             self.write_lsn = lsn;
         }
 
+        // Without postgres-cdc feature, open() must fail loudly to prevent
+        // silent data loss (poll_batch would return Ok(None) forever).
+        // Excluded from test builds where events are injected directly.
+        #[cfg(all(not(feature = "postgres-cdc"), not(test)))]
+        {
+            return Err(ConnectorError::ConfigurationError(
+                "PostgreSQL CDC source requires the `postgres-cdc` feature flag. \
+                 Rebuild with `--features postgres-cdc` to enable."
+                    .to_string(),
+            ));
+        }
+
         #[cfg(all(feature = "postgres-cdc", not(test)))]
         {
             use super::postgres_io;
