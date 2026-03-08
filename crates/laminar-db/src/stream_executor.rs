@@ -940,11 +940,12 @@ impl StreamExecutor {
                 // incorrect. If CoreWindowState rejected this query, skip
                 // the broken EOWC path and fall through to raw-batch.
                 if matches!(cfg.window_type, WindowType::Session) {
-                    return Err(DbError::Unsupported(
-                        "Session windows must route through CoreWindowState. \
-                         Check that the query's projection matches the aggregate output schema."
-                            .to_string(),
-                    ));
+                    tracing::warn!(
+                        query = query_name,
+                        "session window query could not route through CoreWindowState; \
+                         skipping incremental EOWC (falling back to raw-batch)"
+                    );
+                    self.non_eowc_agg_queries.insert(idx);
                 }
 
                 if !self.non_eowc_agg_queries.contains(&idx) {
