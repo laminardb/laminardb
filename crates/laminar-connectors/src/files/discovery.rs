@@ -12,9 +12,10 @@ use std::sync::Arc;
 use std::time::{Duration, SystemTime, UNIX_EPOCH};
 
 use tokio::sync::mpsc;
-use tracing::{debug, info, warn};
+use tracing::{debug, error, info, warn};
 
 use super::manifest::FileIngestionManifest;
+use crate::error::ConnectorError;
 
 /// A file discovered by the discovery engine.
 #[derive(Debug, Clone)]
@@ -58,7 +59,11 @@ impl FileDiscoveryEngine {
         let abort = if is_cloud_path(&config.path) {
             tokio::spawn(cloud_poll_loop(config, tx, known_files))
         } else {
-            tokio::spawn(local_discovery_loop(config, tx, known_files))
+            tokio::spawn(async move {
+                if let Err(e) = local_discovery_loop(config, tx, known_files).await {
+                    error!(error = %e, "file discovery loop failed");
+                }
+            })
         };
 
         Self { rx, _abort: abort }
@@ -205,7 +210,7 @@ async fn local_discovery_loop(
     config: DiscoveryConfig,
     tx: mpsc::Sender<DiscoveredFile>,
     known: Arc<FileIngestionManifest>,
-) {
+) -> Result<(), ConnectorError> {
     use notify::{RecursiveMode, Watcher};
 
     // Determine the directory to watch (strip glob from path).
@@ -218,8 +223,9 @@ async fn local_discovery_loop(
         .map(|g| g.compile_matcher());
 
     if !Path::new(&watch_dir).is_dir() {
-        warn!("file discovery: path '{}' is not a directory", watch_dir);
-        return;
+        return Err(ConnectorError::ConfigurationError(format!(
+            "file discovery: path '{watch_dir}' is not a directory",
+        )));
     }
 
     let use_poll = should_use_poll_watcher(&watch_dir);
@@ -254,10 +260,14 @@ async fn local_discovery_loop(
             },
             poll_config,
         )
-        .expect("failed to create PollWatcher");
+        .map_err(|e| {
+            ConnectorError::ConfigurationError(format!("failed to create PollWatcher: {e}"))
+        })?;
         watcher
             .watch(Path::new(&watch_dir), RecursiveMode::NonRecursive)
-            .expect("failed to watch directory");
+            .map_err(|e| {
+                ConnectorError::ConfigurationError(format!("failed to watch directory: {e}"))
+            })?;
         WatcherHolder::Poll(watcher)
     } else {
         let notify_tx_clone = notify_tx.clone();
@@ -278,10 +288,14 @@ async fn local_discovery_loop(
                     }
                 }
             })
-            .expect("failed to create watcher");
+            .map_err(|e| {
+                ConnectorError::ConfigurationError(format!("failed to create watcher: {e}"))
+            })?;
         watcher
             .watch(Path::new(&watch_dir), RecursiveMode::NonRecursive)
-            .expect("failed to watch directory");
+            .map_err(|e| {
+                ConnectorError::ConfigurationError(format!("failed to watch directory: {e}"))
+            })?;
         WatcherHolder::Recommended(watcher)
     };
 

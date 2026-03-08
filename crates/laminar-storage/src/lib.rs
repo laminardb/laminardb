@@ -8,7 +8,6 @@
 //! - [`checkpoint`]: Basic checkpointing for fast recovery
 //! - [`incremental`]: Incremental checkpointing
 //! - [`per_core_wal`]: Per-core WAL segments for thread-per-core architecture
-//! - [`wal_state_store`]: Combines `MmapStateStore` with WAL for durability
 //!
 //! **Note:** Lakehouse sinks (Delta Lake, Iceberg) are in `laminar-connectors` crate,
 //! not here. This crate handles `LaminarDB`'s internal durability, not external storage formats.
@@ -19,9 +18,6 @@
 
 /// Write-ahead log implementation - WAL for durability and exactly-once semantics
 pub mod wal;
-
-/// WAL-backed state store - Combines MmapStateStore with WAL for durability
-pub mod wal_state_store;
 
 /// Checkpointing for fast recovery
 pub mod checkpoint;
@@ -50,19 +46,9 @@ pub mod per_core_wal;
 /// Object store factory — builds S3, GCS, Azure, or local backends from URL schemes.
 pub mod object_store_factory;
 
-/// Disaggregated state backend — S3 as source of truth with foyer cache.
-pub mod disaggregated;
-
-/// `io_uring`-backed Write-Ahead Log for high-performance durability (Linux only).
-#[cfg(all(target_os = "linux", feature = "io-uring"))]
-pub mod io_uring_wal;
-
 // Re-export key types
 pub use changelog_drainer::ChangelogDrainer;
-pub use checkpoint::adaptive::{AdaptiveCheckpointer, AdaptiveConfig};
-pub use checkpoint::checkpointer::{
-    verify_integrity, Checkpointer, CheckpointerError, ObjectStoreCheckpointer,
-};
+pub use checkpoint::checkpointer::{verify_integrity, Checkpointer, CheckpointerError};
 pub use checkpoint::layout::{
     CheckpointId, CheckpointManifestV2, CheckpointPaths, OperatorSnapshotEntry,
     PartitionSnapshotEntry, SourceOffsetEntry,
@@ -72,19 +58,15 @@ pub use checkpoint::source_offsets::{
     KafkaPosition, MysqlCdcPosition, OperatorDescriptor, OperatorDeterminismWarning,
     PostgresCdcPosition, RecoveryPlan, SourceId, SourceOffset, SourcePosition, WarningSeverity,
 };
-pub use checkpoint::{Checkpoint, CheckpointManager, CheckpointMetadata};
+pub use checkpoint::{Checkpoint, CheckpointMetadata};
 pub use checkpoint_batcher::{decode_batch, BatchMetrics, BatchMetricsSnapshot, CheckpointBatcher};
 pub use checkpoint_manifest::{CheckpointManifest, ConnectorCheckpoint, OperatorCheckpoint};
 pub use checkpoint_store::{
     CheckpointStore, CheckpointStoreError, FileSystemCheckpointStore, ObjectStoreCheckpointStore,
     RecoveryReport, ValidationResult,
 };
-pub use disaggregated::{
-    DisaggregatedConfig, DisaggregatedError, DisaggregatedStateBackend, StateEntry,
-};
 pub use tiering::{StorageClass, StorageTier, TieringPolicy};
 pub use wal::{WalEntry, WalError, WalPosition, WriteAheadLog};
-pub use wal_state_store::WalStateStore;
 
 // Re-export incremental checkpoint types
 pub use incremental::{
@@ -99,6 +81,3 @@ pub use per_core_wal::{
     PerCoreRecoveryManager, PerCoreWalConfig, PerCoreWalEntry, PerCoreWalError, PerCoreWalManager,
     PerCoreWalReader, SegmentStats, WalOperation,
 };
-
-#[cfg(all(target_os = "linux", feature = "io-uring"))]
-pub use io_uring_wal::IoUringWal;

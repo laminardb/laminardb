@@ -485,6 +485,17 @@ impl SourceConnector for PostgresCdcSource {
             self.write_lsn = lsn;
         }
 
+        // Without postgres-cdc feature, open() must fail loudly to prevent
+        // silent data loss (poll_batch would return Ok(None) forever).
+        #[cfg(not(feature = "postgres-cdc"))]
+        {
+            return Err(ConnectorError::ConfigurationError(
+                "PostgreSQL CDC source requires the `postgres-cdc` feature flag. \
+                 Rebuild with `--features postgres-cdc` to enable."
+                    .to_string(),
+            ));
+        }
+
         #[cfg(all(feature = "postgres-cdc", not(test)))]
         {
             use super::postgres_io;
@@ -902,24 +913,19 @@ mod tests {
 
     // ── Lifecycle ──
 
+    // Without postgres-cdc feature, open() must return an error.
+    #[cfg(not(feature = "postgres-cdc"))]
     #[tokio::test]
-    async fn test_open_sets_running() {
+    async fn test_open_fails_without_feature() {
         let mut src = default_source();
         let config = ConnectorConfig::new("postgres-cdc");
-        src.open(&config).await.unwrap();
-        assert_eq!(src.state, ConnectorState::Running);
-    }
-
-    #[tokio::test]
-    async fn test_open_with_start_lsn() {
-        let mut pg_config = PostgresCdcConfig::default();
-        pg_config.start_lsn = Some("0/ABCD".parse().unwrap());
-        let mut src = PostgresCdcSource::new(pg_config);
-
-        let config = ConnectorConfig::new("postgres-cdc");
-        src.open(&config).await.unwrap();
-
-        assert_eq!(src.confirmed_flush_lsn.as_u64(), 0xABCD);
+        let result = src.open(&config).await;
+        assert!(result.is_err());
+        let err = result.unwrap_err().to_string();
+        assert!(
+            err.contains("postgres-cdc"),
+            "error should mention feature flag: {err}"
+        );
     }
 
     #[tokio::test]

@@ -935,6 +935,19 @@ impl StreamExecutor {
                 }
 
                 // ── IncrementalEowcState detection (first call only) ──
+                // Guard: session windows MUST route through CoreWindowState.
+                // The EOWC session fallback (one "window" per timestamp) is
+                // incorrect. If CoreWindowState rejected this query, skip
+                // the broken EOWC path and fall through to raw-batch.
+                if matches!(cfg.window_type, WindowType::Session) {
+                    tracing::warn!(
+                        query = query_name,
+                        "session window query could not route through CoreWindowState; \
+                         skipping incremental EOWC (falling back to raw-batch)"
+                    );
+                    self.non_eowc_agg_queries.insert(idx);
+                }
+
                 if !self.non_eowc_agg_queries.contains(&idx) {
                     let query_sql = self.queries[idx].sql.clone();
                     let cfg_clone = cfg.clone();

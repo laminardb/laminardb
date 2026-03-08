@@ -17,12 +17,13 @@
 //! ## Example
 //!
 //! ```rust
+//! use bytes::Bytes;
 //! use laminar_core::state::{StateStore, StateStoreExt, InMemoryStore};
 //!
 //! let mut store = InMemoryStore::new();
 //!
 //! // Basic key-value operations
-//! store.put(b"user:1", b"alice").unwrap();
+//! store.put(b"user:1", Bytes::from_static(b"alice")).unwrap();
 //! assert_eq!(store.get(b"user:1").unwrap().as_ref(), b"alice");
 //!
 //! // Typed state access (requires StateStoreExt)
@@ -43,19 +44,20 @@
 //! ## Memory-Mapped Store Example
 //!
 //! ```rust,no_run
+//! use bytes::Bytes;
 //! use laminar_core::state::{StateStore, MmapStateStore};
 //! use std::path::Path;
 //!
 //! // In-memory mode (fast, not persistent)
 //! let mut store = MmapStateStore::in_memory(1024 * 1024);
-//! store.put(b"key", b"value").unwrap();
+//! store.put(b"key", Bytes::from_static(b"value")).unwrap();
 //!
 //! // Persistent mode (survives restarts)
 //! let mut persistent = MmapStateStore::persistent(
 //!     Path::new("/tmp/state.db"),
 //!     1024 * 1024
 //! ).unwrap();
-//! persistent.put(b"key", b"value").unwrap();
+//! persistent.put(b"key", Bytes::from_static(b"value")).unwrap();
 //! persistent.flush().unwrap();
 //! ```
 
@@ -72,36 +74,6 @@ use std::cell::RefCell;
 use std::collections::BTreeMap;
 use std::ops::Bound;
 use std::ops::Range;
-
-/// A single mutation entry within an incremental snapshot.
-///
-/// Captures the exact key/value bytes for each state change, enabling
-/// delta-based checkpointing to object stores without full state copies.
-///
-/// - `Put(key, value)` — a key was inserted or updated
-/// - `Delete(key)` — a key was removed
-#[derive(Debug, Clone, PartialEq, Eq)]
-pub enum ChangeEntry {
-    /// A key was inserted or updated: `(key, value)`.
-    Put(Vec<u8>, Vec<u8>),
-    /// A key was deleted.
-    Delete(Vec<u8>),
-}
-
-/// An incremental snapshot capturing only mutations since the last checkpoint.
-///
-/// State stores that support incremental snapshots return this from
-/// [`StateStore::incremental_snapshot`]. The recovery system applies
-/// these deltas on top of a base snapshot to reconstruct full state.
-#[derive(Debug, Clone)]
-pub struct IncrementalSnapshot {
-    /// The ordered list of mutations since `base_epoch`.
-    pub changes: Vec<ChangeEntry>,
-    /// The epoch of the base (full) snapshot these changes apply to.
-    pub base_epoch: u64,
-    /// The epoch this incremental snapshot represents.
-    pub epoch: u64,
-}
 
 /// Compute the lexicographic successor of a byte prefix.
 ///
@@ -158,12 +130,14 @@ pub trait StateStore: Send {
     /// Store a key-value pair.
     ///
     /// If the key already exists, the value is overwritten.
+    /// Accepts owned `Bytes` to avoid mandatory copy — callers with `&[u8]`
+    /// use `Bytes::copy_from_slice()` at the call site.
     ///
     /// # Errors
     ///
     /// Returns `StateError` if the operation fails (e.g., disk full for
     /// memory-mapped stores).
-    fn put(&mut self, key: &[u8], value: &[u8]) -> Result<(), StateError>;
+    fn put(&mut self, key: &[u8], value: Bytes) -> Result<(), StateError>;
 
     /// Delete a key.
     ///
@@ -269,16 +243,6 @@ pub trait StateStore: Send {
         None
     }
 
-    /// Return an incremental snapshot of mutations since the last checkpoint.
-    ///
-    /// Backends that track per-mutation changelogs return
-    /// `Some(IncrementalSnapshot)` containing only the puts and deletes
-    /// since `base_epoch`. Backends without changelog support return `None`,
-    /// and the checkpointer falls back to a full [`snapshot`](Self::snapshot).
-    fn incremental_snapshot(&self) -> Option<IncrementalSnapshot> {
-        None
-    }
-
     /// Get a value or insert a default.
     ///
     /// If the key doesn't exist, the default is inserted and returned.
@@ -290,8 +254,9 @@ pub trait StateStore: Send {
         if let Some(value) = self.get(key) {
             Ok(value)
         } else {
-            self.put(key, default)?;
-            Ok(Bytes::copy_from_slice(default))
+            let value = Bytes::copy_from_slice(default);
+            self.put(key, value.clone())?;
+            Ok(value)
         }
     }
 }
@@ -377,7 +342,7 @@ pub trait StateStoreExt: StateStore {
             let taken = std::mem::take(&mut *vec);
             match high::to_bytes_in::<_, RkyvError>(value, taken) {
                 Ok(filled) => {
-                    let result = self.put(key, &filled);
+                    let result = self.put(key, Bytes::copy_from_slice(&filled));
                     *vec = filled;
                     result
                 }
@@ -404,7 +369,7 @@ pub trait StateStoreExt: StateStore {
     {
         let current = self.get(key);
         match f(current) {
-            Some(new_value) => self.put(key, &new_value),
+            Some(new_value) => self.put(key, Bytes::from(new_value)),
             None => self.delete(key),
         }
     }
@@ -581,18 +546,16 @@ impl StateStore for InMemoryStore {
     }
 
     #[inline]
-    fn put(&mut self, key: &[u8], value: &[u8]) -> Result<(), StateError> {
-        let value_bytes = Bytes::copy_from_slice(value);
-
+    fn put(&mut self, key: &[u8], value: Bytes) -> Result<(), StateError> {
         // Check-then-insert: avoids key.to_vec() allocation on the
         // update path, which is the common case for accumulator state.
         if let Some(existing) = self.data.get_mut(key) {
             self.size_bytes -= existing.len();
             self.size_bytes += value.len();
-            *existing = value_bytes;
+            *existing = value;
         } else {
             self.size_bytes += key.len() + value.len();
-            self.data.insert(key.to_vec(), value_bytes);
+            self.data.insert(key.to_vec(), value);
         }
         Ok(())
     }
@@ -706,16 +669,12 @@ mod mmap;
 /// AHashMap-backed state store with O(1) lookups and zero-copy reads.
 pub mod ahash_store;
 
-/// Changelog-aware state store wrapper.
-pub mod changelog_aware;
-
 /// Dictionary key encoder for low-cardinality GROUP BY keys.
 pub mod dict_encoder;
 
 // Re-export main types
 pub use self::StateError as Error;
 pub use ahash_store::AHashMapStore;
-pub use changelog_aware::{ChangelogAwareStore, ChangelogSink};
 pub use dict_encoder::DictionaryKeyEncoder;
 pub use mmap::MmapStateStore;
 
@@ -728,12 +687,12 @@ mod tests {
         let mut store = InMemoryStore::new();
 
         // Test put and get
-        store.put(b"key1", b"value1").unwrap();
+        store.put(b"key1", Bytes::from_static(b"value1")).unwrap();
         assert_eq!(store.get(b"key1").unwrap(), Bytes::from("value1"));
         assert_eq!(store.len(), 1);
 
         // Test overwrite
-        store.put(b"key1", b"value2").unwrap();
+        store.put(b"key1", Bytes::from_static(b"value2")).unwrap();
         assert_eq!(store.get(b"key1").unwrap(), Bytes::from("value2"));
         assert_eq!(store.len(), 1);
 
@@ -751,7 +710,7 @@ mod tests {
         let mut store = InMemoryStore::new();
         assert!(!store.contains(b"key1"));
 
-        store.put(b"key1", b"value1").unwrap();
+        store.put(b"key1", Bytes::from_static(b"value1")).unwrap();
         assert!(store.contains(b"key1"));
 
         store.delete(b"key1").unwrap();
@@ -761,10 +720,18 @@ mod tests {
     #[test]
     fn test_prefix_scan() {
         let mut store = InMemoryStore::new();
-        store.put(b"prefix:1", b"value1").unwrap();
-        store.put(b"prefix:2", b"value2").unwrap();
-        store.put(b"prefix:10", b"value10").unwrap();
-        store.put(b"other:1", b"value3").unwrap();
+        store
+            .put(b"prefix:1", Bytes::from_static(b"value1"))
+            .unwrap();
+        store
+            .put(b"prefix:2", Bytes::from_static(b"value2"))
+            .unwrap();
+        store
+            .put(b"prefix:10", Bytes::from_static(b"value10"))
+            .unwrap();
+        store
+            .put(b"other:1", Bytes::from_static(b"value3"))
+            .unwrap();
 
         let results: Vec<_> = store.prefix_scan(b"prefix:").collect();
         assert_eq!(results.len(), 3);
@@ -782,10 +749,10 @@ mod tests {
     #[test]
     fn test_range_scan() {
         let mut store = InMemoryStore::new();
-        store.put(b"a", b"1").unwrap();
-        store.put(b"b", b"2").unwrap();
-        store.put(b"c", b"3").unwrap();
-        store.put(b"d", b"4").unwrap();
+        store.put(b"a", Bytes::from_static(b"1")).unwrap();
+        store.put(b"b", Bytes::from_static(b"2")).unwrap();
+        store.put(b"c", Bytes::from_static(b"3")).unwrap();
+        store.put(b"d", Bytes::from_static(b"4")).unwrap();
 
         let results: Vec<_> = store.range_scan(b"b".as_slice()..b"d".as_slice()).collect();
         assert_eq!(results.len(), 2);
@@ -798,16 +765,16 @@ mod tests {
     #[test]
     fn test_snapshot_and_restore() {
         let mut store = InMemoryStore::new();
-        store.put(b"key1", b"value1").unwrap();
-        store.put(b"key2", b"value2").unwrap();
+        store.put(b"key1", Bytes::from_static(b"value1")).unwrap();
+        store.put(b"key2", Bytes::from_static(b"value2")).unwrap();
 
         // Take snapshot
         let snapshot = store.snapshot();
         assert_eq!(snapshot.len(), 2);
 
         // Modify store
-        store.put(b"key1", b"modified").unwrap();
-        store.put(b"key3", b"value3").unwrap();
+        store.put(b"key1", Bytes::from_static(b"modified")).unwrap();
+        store.put(b"key3", Bytes::from_static(b"value3")).unwrap();
         store.delete(b"key2").unwrap();
 
         assert_eq!(store.len(), 2);
@@ -825,8 +792,8 @@ mod tests {
     #[test]
     fn test_snapshot_serialization() {
         let mut store = InMemoryStore::new();
-        store.put(b"key1", b"value1").unwrap();
-        store.put(b"key2", b"value2").unwrap();
+        store.put(b"key1", Bytes::from_static(b"value1")).unwrap();
+        store.put(b"key2", Bytes::from_static(b"value2")).unwrap();
 
         let snapshot = store.snapshot();
 
@@ -873,7 +840,7 @@ mod tests {
         assert_eq!(store.len(), 1);
 
         // Second call returns existing
-        store.put(b"key1", b"modified").unwrap();
+        store.put(b"key1", Bytes::from_static(b"modified")).unwrap();
         let value = store.get_or_insert(b"key1", b"default").unwrap();
         assert_eq!(value, Bytes::from("modified"));
     }
@@ -881,7 +848,9 @@ mod tests {
     #[test]
     fn test_update() {
         let mut store = InMemoryStore::new();
-        store.put(b"counter", b"\x00\x00\x00\x00").unwrap();
+        store
+            .put(b"counter", Bytes::from_static(b"\x00\x00\x00\x00"))
+            .unwrap();
 
         // Update existing
         store
@@ -907,14 +876,14 @@ mod tests {
         let mut store = InMemoryStore::new();
         assert_eq!(store.size_bytes(), 0);
 
-        store.put(b"key1", b"value1").unwrap();
+        store.put(b"key1", Bytes::from_static(b"value1")).unwrap();
         assert_eq!(store.size_bytes(), 4 + 6); // "key1" + "value1"
 
-        store.put(b"key2", b"value2").unwrap();
+        store.put(b"key2", Bytes::from_static(b"value2")).unwrap();
         assert_eq!(store.size_bytes(), (4 + 6) * 2);
 
         // Overwrite with smaller value
-        store.put(b"key1", b"v1").unwrap();
+        store.put(b"key1", Bytes::from_static(b"v1")).unwrap();
         assert_eq!(store.size_bytes(), 4 + 2 + 4 + 6); // "key1" + "v1" + "key2" + "value2"
 
         store.delete(b"key1").unwrap();
@@ -935,8 +904,8 @@ mod tests {
     #[test]
     fn test_clear() {
         let mut store = InMemoryStore::new();
-        store.put(b"key1", b"value1").unwrap();
-        store.put(b"key2", b"value2").unwrap();
+        store.put(b"key1", Bytes::from_static(b"value1")).unwrap();
+        store.put(b"key2", Bytes::from_static(b"value2")).unwrap();
 
         assert_eq!(store.len(), 2);
         assert!(store.size_bytes() > 0);
@@ -989,11 +958,21 @@ mod tests {
         let prefix_a = [0x00, 0x01]; // partition 0, stream 1
         let prefix_b = [0x00, 0x02]; // partition 0, stream 2
 
-        store.put(&[0x00, 0x01, 0xAA], b"val1").unwrap();
-        store.put(&[0x00, 0x01, 0xBB], b"val2").unwrap();
-        store.put(&[0x00, 0x02, 0xCC], b"val3").unwrap();
-        store.put(&[0x00, 0x02, 0xDD], b"val4").unwrap();
-        store.put(&[0x01, 0x01, 0xEE], b"val5").unwrap();
+        store
+            .put(&[0x00, 0x01, 0xAA], Bytes::from_static(b"val1"))
+            .unwrap();
+        store
+            .put(&[0x00, 0x01, 0xBB], Bytes::from_static(b"val2"))
+            .unwrap();
+        store
+            .put(&[0x00, 0x02, 0xCC], Bytes::from_static(b"val3"))
+            .unwrap();
+        store
+            .put(&[0x00, 0x02, 0xDD], Bytes::from_static(b"val4"))
+            .unwrap();
+        store
+            .put(&[0x01, 0x01, 0xEE], Bytes::from_static(b"val5"))
+            .unwrap();
 
         // Prefix scan for partition_a
         let results_a: Vec<_> = store.prefix_scan(&prefix_a).collect();
@@ -1017,9 +996,9 @@ mod tests {
     #[test]
     fn test_prefix_scan_returns_sorted() {
         let mut store = InMemoryStore::new();
-        store.put(b"prefix:c", b"3").unwrap();
-        store.put(b"prefix:a", b"1").unwrap();
-        store.put(b"prefix:b", b"2").unwrap();
+        store.put(b"prefix:c", Bytes::from_static(b"3")).unwrap();
+        store.put(b"prefix:a", Bytes::from_static(b"1")).unwrap();
+        store.put(b"prefix:b", Bytes::from_static(b"2")).unwrap();
 
         let results: Vec<_> = store.prefix_scan(b"prefix:").collect();
         let keys: Vec<_> = results.iter().map(|(k, _)| k.as_ref().to_vec()).collect();

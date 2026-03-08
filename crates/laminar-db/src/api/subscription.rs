@@ -29,7 +29,6 @@ pub struct ArrowSubscription {
 
 impl ArrowSubscription {
     /// Create from internal subscription.
-    #[allow(dead_code)] // Used when subscribe() is fully implemented
     pub(crate) fn new(
         inner: laminar_core::streaming::Subscription<ArrowRecord>,
         schema: SchemaRef,

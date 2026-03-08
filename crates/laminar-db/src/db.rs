@@ -282,7 +282,6 @@ impl LaminarDB {
         {
             laminar_connectors::lakehouse::register_delta_lake_sink(registry);
             laminar_connectors::lakehouse::register_delta_lake_source(registry);
-            laminar_connectors::lakehouse::register_iceberg_sink(registry);
         }
         #[cfg(feature = "websocket")]
         {
@@ -2267,7 +2266,7 @@ mod tests {
         #[cfg(feature = "delta-lake")]
         {
             expected_sources += 1; // delta-lake source
-            expected_sinks += 2; // delta-lake sink + iceberg sink
+            expected_sinks += 1; // delta-lake sink
         }
         #[cfg(feature = "websocket")]
         {

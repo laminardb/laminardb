@@ -29,9 +29,7 @@ jit = [
 ]
 # Enable distributed delta mode (multi-node) — heavy deps, server-only
 delta = [
-    "dep:tonic", "dep:tonic-prost", "dep:prost", "dep:chitchat",
-    "dep:tokio-util", "dep:xxhash-rust",
-    "dep:tonic-build", "dep:tonic-prost-build", "dep:prost-build",
+    "dep:chitchat", "dep:tokio-util", "dep:xxhash-rust",
 ]
 [dependencies]
 # Performance critical - no allocations on hot path
@@ -88,9 +86,6 @@ datafusion-expr = { workspace = true, optional = true }
 datafusion-common = { workspace = true, optional = true }
 
 # Delta (optional, multi-node distributed mode — server-only)
-tonic = { workspace = true, optional = true }
-tonic-prost = { workspace = true, optional = true }
-prost = { workspace = true, optional = true }
 chitchat = { workspace = true, optional = true }
 tokio-util = { workspace = true, optional = true }
 xxhash-rust = { workspace = true, optional = true }
@@ -115,11 +110,6 @@ libc = { workspace = true }
 
 [target.'cfg(target_os = "windows")'.dependencies]
 windows-sys = { version = "0.59", features = ["Win32_System_Threading"] }
-
-[build-dependencies]
-tonic-build = { workspace = true, optional = true }
-tonic-prost-build = { workspace = true, optional = true }
-prost-build = { workspace = true, optional = true }
 
 [dev-dependencies]
 criterion = { workspace = true }
@@ -192,8 +182,3 @@ harness = false
 [[bench]]
 name = "lookup_join_bench"
 harness = false
-
-[[bench]]
-name = "delta_checkpoint_bench"
-harness = false
-required-features = ["delta"]

@@ -281,7 +281,7 @@ Feature-gated connectors for external systems. Each implements the `SourceConnec
 | **Kafka** | `kafka` | Exactly-once transactions, configurable partitioning | Implemented |
 | **PostgreSQL** | `postgres-sink` | COPY BINARY, upsert, co-transactional exactly-once | Implemented |
 | **Delta Lake** | `delta-lake` | S3/Azure/GCS, epoch-aligned Parquet commits | Implemented |
-| **Apache Iceberg** | -- | Buffering, epoch, partition transforms | Implemented (business logic; I/O integration planned) |
+| **Apache Iceberg** | -- | -- | Planned |
 | **WebSocket Server** | `websocket` | Fan-out results to connected subscribers | Implemented |
 | **WebSocket Client** | `websocket` | Push results to external WebSocket server | Implemented |
 
@@ -387,7 +387,7 @@ Three-ring architecture separating latency-critical event processing from backgr
 ```
 +------------------------------------------------------------------+
 |                        RING 0: HOT PATH                          |
-|  Zero allocations, no locks, < 1us latency                      |
+|  Minimal allocations, no locks, < 1us latency                   |
 |  +---------+  +----------+  +----------+  +----------+          |
 |  | Reactor |->| Operators|->|  State   |->|   Emit   |          |
 |  |  Loop   |  | (window, |  |  Store   |  | (output) |          |
@@ -417,7 +417,7 @@ Three-ring architecture separating latency-critical event processing from backgr
 +------------------------------------------------------------------+
 ```
 
-- **Ring 0** -- CPU-pinned reactor loop, zero heap allocations, SPSC queues, optional Cranelift JIT compilation
+- **Ring 0** -- CPU-pinned reactor loop, minimal heap allocations, SPSC queues, optional Cranelift JIT compilation
 - **Ring 1** -- Tokio async runtime for WAL, checkpointing, connectors, changelog draining
 - **Ring 2** -- Admin API, metrics, auth, configuration (planned; crate stubs exist)
 
@@ -429,12 +429,11 @@ See [docs/ARCHITECTURE.md](docs/ARCHITECTURE.md) for the full design.
 
 Exactly-once semantics through coordinated checkpointing:
 
-1. **Ring 0 Changelog** -- Every state mutation is captured by `ChangelogAwareStore` (~2-5ns overhead per mutation)
-2. **Per-Core WAL** -- Each CPU core writes to its own WAL segment with CRC32C checksums and torn write detection
-3. **Incremental Checkpoints** -- Only changed state is written; backed by directory-based delta snapshots
-4. **Checkpoint Coordinator** -- Orchestrates consistent snapshots across all operators and sinks using Chandy-Lamport barriers
-5. **Two-Phase Commit** -- Sinks participate in the checkpoint protocol with pre-commit/commit phases
-6. **Recovery** -- `RecoveryManager` restores from the latest checkpoint manifest, replays WAL, resumes connectors from committed offsets
+1. **Per-Core WAL** -- Each CPU core writes to its own WAL segment with CRC32C checksums and torn write detection
+2. **Full Snapshots** -- State is checkpointed to disk at configurable intervals
+3. **Checkpoint Coordinator** -- Orchestrates consistent snapshots across all operators and sinks using barrier-based checkpoints
+4. **Two-Phase Commit** -- Sinks participate in the checkpoint protocol with pre-commit/commit phases
+5. **Recovery** -- `RecoveryManager` restores from the latest checkpoint manifest, replays WAL, resumes connectors from committed offsets
 
 ```rust
 use laminar_db::LaminarDB;
@@ -577,7 +576,7 @@ cargo bench --bench wal_bench            # WAL write throughput
 | No JVM | Yes | No | No | Yes | Yes |
 | Windows | Tumble/Slide/Session/Hop | All | Tumble/Slide/Session | Tumble/Hop | N/A |
 | CDC sources | PostgreSQL, MySQL | Many | Debezium only | PostgreSQL, MySQL | PostgreSQL |
-| Lakehouse sinks | Delta Lake, Iceberg | Limited | No | Delta Lake, Iceberg | No |
+| Lakehouse sinks | Delta Lake | Limited | No | Delta Lake, Iceberg | No |
 | JIT compilation | Yes (Cranelift) | No | No | No | No |
 | License | Apache-2.0 | Apache-2.0 | Apache-2.0 | Apache-2.0 | BSL |
 
@@ -590,7 +589,7 @@ crates/
   laminar-core/        Core engine: reactor, operators, state, windows, joins, JIT compiler
   laminar-sql/         SQL layer: DataFusion integration, streaming SQL parser
   laminar-storage/     Durability: WAL, checkpointing, per-core WAL, recovery
-  laminar-connectors/  Connectors: Kafka, CDC, WebSocket, Delta Lake, Iceberg, SDK
+  laminar-connectors/  Connectors: Kafka, CDC, WebSocket, Delta Lake, Files, SDK
   laminar-db/          Unified database facade, checkpoint coordination, FFI API
   laminar-derive/      Derive macros: Record, FromRecordBatch, FromRow, ConnectorConfig
   laminar-server/      Standalone server binary (skeleton)

@@ -43,12 +43,3 @@ pub mod partition;
 
 /// Distributed checkpoint coordination.
 pub mod checkpoint;
-
-/// gRPC inter-node communication services.
-pub mod rpc;
-
-/// Generated protobuf types.
-pub mod proto {
-    #![allow(clippy::all, clippy::pedantic, missing_docs)]
-    tonic::include_proto!("laminardb.delta.v1");
-}

@@ -10,20 +10,6 @@ use arrow::datatypes::SchemaRef;
 
 use crate::error::DbError;
 
-// ── Arrow IPC helpers (delegates to laminar-core::serialization) ──
-
-#[allow(dead_code)]
-pub(crate) fn serialize_record_batch(batch: &RecordBatch) -> Result<Vec<u8>, DbError> {
-    laminar_core::serialization::serialize_batch_stream(batch)
-        .map_err(|e| DbError::Storage(format!("IPC: {e}")))
-}
-
-#[allow(dead_code)]
-pub(crate) fn deserialize_record_batch(data: &[u8]) -> Result<RecordBatch, DbError> {
-    laminar_core::serialization::deserialize_batch_stream(data)
-        .map_err(|e| DbError::Storage(format!("IPC: {e}")))
-}
-
 // ── TableBackend enum ──
 
 /// Backend storage for a single reference table.
@@ -152,53 +138,6 @@ mod tests {
             ],
         )
         .unwrap()
-    }
-
-    // ── IPC round-trip tests ──
-
-    #[test]
-    fn test_ipc_round_trip_basic() {
-        let batch = make_batch(1, "Widget", 9.99);
-        let data = serialize_record_batch(&batch).unwrap();
-        let restored = deserialize_record_batch(&data).unwrap();
-        assert_eq!(restored.num_rows(), 1);
-        assert_eq!(restored.schema(), batch.schema());
-        let ids = restored
-            .column(0)
-            .as_any()
-            .downcast_ref::<Int32Array>()
-            .unwrap();
-        assert_eq!(ids.value(0), 1);
-    }
-
-    #[test]
-    fn test_ipc_round_trip_multiple_types() {
-        let batch = make_batch(42, "Gadget", 123.456);
-        let data = serialize_record_batch(&batch).unwrap();
-        let restored = deserialize_record_batch(&data).unwrap();
-
-        let names = restored
-            .column(1)
-            .as_any()
-            .downcast_ref::<StringArray>()
-            .unwrap();
-        assert_eq!(names.value(0), "Gadget");
-
-        let prices = restored
-            .column(2)
-            .as_any()
-            .downcast_ref::<Float64Array>()
-            .unwrap();
-        assert!((prices.value(0) - 123.456).abs() < f64::EPSILON);
-    }
-
-    #[test]
-    fn test_ipc_round_trip_empty_batch() {
-        let batch = RecordBatch::new_empty(test_schema());
-        let data = serialize_record_batch(&batch).unwrap();
-        let restored = deserialize_record_batch(&data).unwrap();
-        assert_eq!(restored.num_rows(), 0);
-        assert_eq!(restored.schema(), test_schema());
     }
 
     // ── InMemory backend tests ──
