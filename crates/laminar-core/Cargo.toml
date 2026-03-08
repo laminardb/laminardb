@@ -86,9 +86,6 @@ datafusion-expr = { workspace = true, optional = true }
 datafusion-common = { workspace = true, optional = true }
 
 # Delta (optional, multi-node distributed mode — server-only)
-tonic = { workspace = true, optional = true }
-tonic-prost = { workspace = true, optional = true }
-prost = { workspace = true, optional = true }
 chitchat = { workspace = true, optional = true }
 tokio-util = { workspace = true, optional = true }
 xxhash-rust = { workspace = true, optional = true }
@@ -113,11 +110,6 @@ libc = { workspace = true }
 
 [target.'cfg(target_os = "windows")'.dependencies]
 windows-sys = { version = "0.59", features = ["Win32_System_Threading"] }
-
-[build-dependencies]
-tonic-build = { workspace = true, optional = true }
-tonic-prost-build = { workspace = true, optional = true }
-prost-build = { workspace = true, optional = true }
 
 [dev-dependencies]
 criterion = { workspace = true }
