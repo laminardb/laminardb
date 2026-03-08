@@ -417,7 +417,7 @@ Three-ring architecture separating latency-critical event processing from backgr
 +------------------------------------------------------------------+
 ```
 
-- **Ring 0** -- CPU-pinned reactor loop, zero heap allocations, SPSC queues, optional Cranelift JIT compilation
+- **Ring 0** -- CPU-pinned reactor loop, minimal heap allocations, SPSC queues, optional Cranelift JIT compilation
 - **Ring 1** -- Tokio async runtime for WAL, checkpointing, connectors, changelog draining
 - **Ring 2** -- Admin API, metrics, auth, configuration (planned; crate stubs exist)
 
@@ -432,8 +432,8 @@ Exactly-once semantics through coordinated checkpointing:
 1. **Per-Core WAL** -- Each CPU core writes to its own WAL segment with CRC32C checksums and torn write detection
 2. **Full Snapshots** -- State is checkpointed to disk at configurable intervals
 3. **Checkpoint Coordinator** -- Orchestrates consistent snapshots across all operators and sinks using barrier-based checkpoints
-5. **Two-Phase Commit** -- Sinks participate in the checkpoint protocol with pre-commit/commit phases
-6. **Recovery** -- `RecoveryManager` restores from the latest checkpoint manifest, replays WAL, resumes connectors from committed offsets
+4. **Two-Phase Commit** -- Sinks participate in the checkpoint protocol with pre-commit/commit phases
+5. **Recovery** -- `RecoveryManager` restores from the latest checkpoint manifest, replays WAL, resumes connectors from committed offsets
 
 ```rust
 use laminar_db::LaminarDB;

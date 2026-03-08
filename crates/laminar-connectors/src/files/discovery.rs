@@ -223,8 +223,10 @@ async fn local_discovery_loop(
         .map(|g| g.compile_matcher());
 
     if !Path::new(&watch_dir).is_dir() {
-        warn!("file discovery: path '{}' is not a directory", watch_dir);
-        return Ok(());
+        return Err(ConnectorError::ConfigurationError(format!(
+            "file discovery: path '{}' is not a directory",
+            watch_dir
+        )));
     }
 
     let use_poll = should_use_poll_watcher(&watch_dir);

@@ -169,6 +169,7 @@ impl TpcPipelineCoordinator {
             self.runtime.poll_all_outputs(&mut self.drain_buffer);
             if self.drain_buffer.is_empty() {
                 self.maybe_inject_checkpoint(&mut *callback).await;
+                callback.poll_tables().await;
                 continue;
             }
 

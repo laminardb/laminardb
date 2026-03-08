@@ -158,12 +158,20 @@ impl LaminarDB {
                 .or_else(|| self.config.storage_dir.clone())
                 .unwrap_or_else(|| std::path::PathBuf::from("./data"))
                 .join("wal");
+            // Match the TPC runtime's core count logic: explicit config,
+            // available_parallelism for external connectors, or source count.
             let num_cores = self
                 .config
                 .tpc
                 .as_ref()
                 .and_then(|t| t.num_cores)
-                .unwrap_or(1);
+                .unwrap_or_else(|| {
+                    if has_external {
+                        std::thread::available_parallelism().map_or(1, std::num::NonZero::get)
+                    } else {
+                        source_regs.len().max(1)
+                    }
+                });
             match laminar_storage::per_core_wal::PerCoreWalManager::new(
                 laminar_storage::per_core_wal::PerCoreWalConfig::new(&wal_dir, num_cores),
             ) {
