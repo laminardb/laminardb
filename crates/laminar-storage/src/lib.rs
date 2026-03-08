@@ -81,4 +81,3 @@ pub use per_core_wal::{
     PerCoreRecoveryManager, PerCoreWalConfig, PerCoreWalEntry, PerCoreWalError, PerCoreWalManager,
     PerCoreWalReader, SegmentStats, WalOperation,
 };
-
