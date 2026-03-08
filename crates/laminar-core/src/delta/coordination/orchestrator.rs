@@ -88,20 +88,19 @@ impl DeltaManager {
     ///
     /// Returns `true` if the transition was valid.
     pub fn transition(&mut self, next: NodeLifecyclePhase) -> bool {
-        let valid = match (self.phase, next) {
-            (Self::DISCOVERING, NodeLifecyclePhase::FormingRaft) => true,
-            (NodeLifecyclePhase::FormingRaft, NodeLifecyclePhase::WaitingForAssignment) => true,
-            (NodeLifecyclePhase::WaitingForAssignment, NodeLifecyclePhase::RestoringPartitions) => {
-                true
-            }
-            (NodeLifecyclePhase::WaitingForAssignment, NodeLifecyclePhase::Active) => true,
-            (NodeLifecyclePhase::RestoringPartitions, NodeLifecyclePhase::Active) => true,
-            (NodeLifecyclePhase::Active, NodeLifecyclePhase::Draining) => true,
-            (NodeLifecyclePhase::Draining, NodeLifecyclePhase::Shutdown) => true,
-            // Allow direct shutdown from any phase (crash recovery)
-            (_, NodeLifecyclePhase::Shutdown) => true,
-            _ => false,
-        };
+        let valid = matches!(
+            (self.phase, next),
+            (NodeLifecyclePhase::Discovering, NodeLifecyclePhase::FormingRaft)
+                | (NodeLifecyclePhase::FormingRaft, NodeLifecyclePhase::WaitingForAssignment)
+                | (
+                    NodeLifecyclePhase::WaitingForAssignment,
+                    NodeLifecyclePhase::RestoringPartitions | NodeLifecyclePhase::Active
+                )
+                | (NodeLifecyclePhase::RestoringPartitions, NodeLifecyclePhase::Active)
+                | (NodeLifecyclePhase::Active, NodeLifecyclePhase::Draining)
+                // Allow direct shutdown from any phase (crash recovery)
+                | (_, NodeLifecyclePhase::Shutdown)
+        );
 
         if valid {
             self.phase = next;
@@ -156,10 +155,6 @@ impl DeltaManager {
     pub fn set_constraints(&mut self, constraints: AssignmentConstraints) {
         self.constraints = constraints;
     }
-}
-
-impl DeltaManager {
-    const DISCOVERING: NodeLifecyclePhase = NodeLifecyclePhase::Discovering;
 }
 
 impl fmt::Debug for DeltaManager {
