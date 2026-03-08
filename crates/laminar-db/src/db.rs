@@ -2266,7 +2266,7 @@ mod tests {
         #[cfg(feature = "delta-lake")]
         {
             expected_sources += 1; // delta-lake source
-            expected_sinks += 2; // delta-lake sink + iceberg sink
+            expected_sinks += 1; // delta-lake sink
         }
         #[cfg(feature = "websocket")]
         {
