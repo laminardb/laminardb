@@ -70,7 +70,7 @@ pub(crate) fn row_to_scalar_key_with_types(
 pub(crate) fn emit_window_batch(
     window_start: i64,
     window_end: i64,
-    mut groups: ahash::AHashMap<Vec<ScalarValue>, Vec<Box<dyn datafusion_expr::Accumulator>>>,
+    groups: ahash::AHashMap<Vec<ScalarValue>, Vec<Box<dyn datafusion_expr::Accumulator>>>,
     group_types: &[DataType],
     agg_specs: &[AggFuncSpec],
     output_schema: &SchemaRef,
@@ -80,14 +80,36 @@ pub(crate) fn emit_window_batch(
         return Ok(None);
     }
 
+    // Single pass: drain the map, split keys into per-column scalar vecs
+    // and evaluate accumulators. This avoids cloning ScalarValue keys.
+    let num_group_cols = group_types.len();
+    let mut group_scalars: Vec<Vec<ScalarValue>> = (0..num_group_cols)
+        .map(|_| Vec::with_capacity(num_rows))
+        .collect();
+    let mut agg_scalars: Vec<Vec<ScalarValue>> = (0..agg_specs.len())
+        .map(|_| Vec::with_capacity(num_rows))
+        .collect();
+
+    for (key, mut accs) in groups {
+        for (i, sv) in key.into_iter().enumerate() {
+            group_scalars[i].push(sv);
+        }
+        for (i, acc) in accs.iter_mut().enumerate() {
+            let sv = acc
+                .evaluate()
+                .map_err(|e| DbError::Pipeline(format!("accumulator evaluate: {e}")))?;
+            agg_scalars[i].push(sv);
+        }
+    }
+
     let win_start_array: ArrayRef =
         Arc::new(arrow::array::Int64Array::from(vec![window_start; num_rows]));
     let win_end_array: ArrayRef =
         Arc::new(arrow::array::Int64Array::from(vec![window_end; num_rows]));
 
-    let mut group_arrays: Vec<ArrayRef> = Vec::with_capacity(group_types.len());
-    for (col_idx, dt) in group_types.iter().enumerate() {
-        let scalars: Vec<ScalarValue> = groups.keys().map(|key| key[col_idx].clone()).collect();
+    let mut group_arrays: Vec<ArrayRef> = Vec::with_capacity(num_group_cols);
+    for (col_idx, scalars) in group_scalars.into_iter().enumerate() {
+        let dt = &group_types[col_idx];
         let array = ScalarValue::iter_to_array(scalars)
             .map_err(|e| DbError::Pipeline(format!("group key array: {e}")))?;
         if array.data_type() == dt {
@@ -99,14 +121,8 @@ pub(crate) fn emit_window_batch(
     }
 
     let mut agg_arrays: Vec<ArrayRef> = Vec::with_capacity(agg_specs.len());
-    for (agg_idx, spec) in agg_specs.iter().enumerate() {
-        let mut scalars: Vec<ScalarValue> = Vec::with_capacity(num_rows);
-        for accs in groups.values_mut() {
-            let sv = accs[agg_idx]
-                .evaluate()
-                .map_err(|e| DbError::Pipeline(format!("accumulator evaluate: {e}")))?;
-            scalars.push(sv);
-        }
+    for (agg_idx, scalars) in agg_scalars.into_iter().enumerate() {
+        let spec = &agg_specs[agg_idx];
         let array = ScalarValue::iter_to_array(scalars)
             .map_err(|e| DbError::Pipeline(format!("agg result array: {e}")))?;
         if array.data_type() == &spec.return_type {
