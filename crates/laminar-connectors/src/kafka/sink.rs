@@ -331,6 +331,7 @@ impl KafkaSink {
 }
 
 #[async_trait]
+#[allow(clippy::too_many_lines)]
 impl SinkConnector for KafkaSink {
     async fn open(&mut self, config: &ConnectorConfig) -> Result<(), ConnectorError> {
         self.state = ConnectorState::Initializing;
@@ -446,6 +447,7 @@ impl SinkConnector for KafkaSink {
         {
             Ok(metadata) => {
                 if let Some(topic_meta) = metadata.topics().first() {
+                    #[allow(clippy::cast_possible_truncation, clippy::cast_possible_wrap)]
                     let count = topic_meta.partitions().len() as i32;
                     if count > 0 {
                         self.topic_partition_count = count;

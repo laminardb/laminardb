@@ -224,8 +224,7 @@ async fn local_discovery_loop(
 
     if !Path::new(&watch_dir).is_dir() {
         return Err(ConnectorError::ConfigurationError(format!(
-            "file discovery: path '{}' is not a directory",
-            watch_dir
+            "file discovery: path '{watch_dir}' is not a directory",
         )));
     }
 
