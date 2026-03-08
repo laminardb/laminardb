@@ -441,6 +441,8 @@ impl SinkConnector for KafkaSink {
         }
 
         // Query broker metadata for actual topic partition count.
+        // Reset to fallback first so a reopened sink doesn't keep a stale count.
+        self.topic_partition_count = FALLBACK_PARTITION_COUNT;
         match producer
             .client()
             .fetch_metadata(Some(&self.config.topic), Duration::from_secs(5))
