@@ -17,6 +17,7 @@ use arrow::array::ArrayRef;
 use arrow::compute;
 use arrow::datatypes::{DataType, Field, Schema, SchemaRef};
 use arrow::record_batch::RecordBatch;
+use datafusion::physical_expr::{create_physical_expr, PhysicalExpr};
 use datafusion::prelude::SessionContext;
 use datafusion_common::ScalarValue;
 
@@ -39,6 +40,17 @@ enum CoreWindowAssigner {
     Tumbling(TumblingWindowAssigner),
     Hopping(SlidingWindowAssigner),
     Session { gap_ms: i64 },
+}
+
+/// Pre-compiled post-aggregate projection (e.g., `SUM(a)/SUM(b) AS ratio`).
+struct PostProjection {
+    /// One `PhysicalExpr` per column in `final_schema`, evaluated against
+    /// an intermediate batch with the `Aggregate` node's output schema.
+    exprs: Vec<Arc<dyn PhysicalExpr>>,
+    /// Output schema after projection: `[window_start, window_end, projected...]`.
+    final_schema: SchemaRef,
+    /// Schema matching the `Aggregate` output: `[group_cols..., agg_results...]`.
+    intermediate_schema: SchemaRef,
 }
 
 /// Accumulator state for a single session window instance.
@@ -116,6 +128,7 @@ pub(crate) struct CoreWindowState {
     /// Grace period (ms) after window end before closing. Late events
     /// arriving within this window are included instead of dropped.
     allowed_lateness_ms: i64,
+    post_projection: Option<PostProjection>,
 }
 
 impl CoreWindowState {
@@ -200,34 +213,51 @@ impl CoreWindowState {
             return Ok(None);
         }
 
-        // Bail out if the top-level plan has a non-trivial projection above
-        // the Aggregate (e.g., SUM(a)/SUM(b) AS ratio, CASE WHEN ... END).
-        // The incremental accumulator emits raw aggregate outputs and cannot
-        // apply post-aggregate projections.  Fall through to EOWC raw-batch.
-        //
-        // Check both field count AND types — a coincidental count match (e.g.,
-        // 6 raw aggregates + 2 groups == 8 SELECT items) can mask a projection
-        // that remaps group columns to computed aggregates (causing schema
-        // corruption where a group type like Timestamp ends up under an
-        // aggregate alias like "vwap").
-        if top_schema.fields().len() != agg_schema.fields().len() {
-            return Ok(None);
-        }
-        for (top_f, agg_f) in top_schema.fields().iter().zip(agg_schema.fields()) {
-            if top_f.data_type() != agg_f.data_type() {
-                return Ok(None);
+        // Detect post-aggregate projection: top schema differs from Aggregate
+        // schema when a Projection sits above the Aggregate.
+        let has_projection = {
+            let same = top_schema.fields().len() == agg_schema.fields().len()
+                && top_schema
+                    .fields()
+                    .iter()
+                    .zip(agg_schema.fields())
+                    .all(|(t, a)| t.data_type() == a.data_type());
+            !same
+        };
+
+        // Extract projection expressions + DFSchema (carries table qualifiers).
+        let projection_info = if has_projection {
+            fn find_projection(
+                plan: &datafusion_expr::LogicalPlan,
+            ) -> Option<&datafusion_expr::logical_plan::Projection> {
+                match plan {
+                    datafusion_expr::LogicalPlan::Projection(p) => Some(p),
+                    datafusion_expr::LogicalPlan::Sort(s) => find_projection(&s.input),
+                    datafusion_expr::LogicalPlan::Limit(l) => find_projection(&l.input),
+                    datafusion_expr::LogicalPlan::SubqueryAlias(a) => find_projection(&a.input),
+                    _ => None,
+                }
             }
-        }
+            match find_projection(plan) {
+                Some(proj) => Some((proj.expr.as_slice(), proj.input.schema().clone())),
+                None => return Ok(None), // Unknown plan shape — bail
+            }
+        } else {
+            None
+        };
 
         let num_group_cols = group_exprs.len();
 
-        // Resolve group-by column names and types
         let mut group_col_names = Vec::new();
         let mut group_types = Vec::new();
         for i in 0..num_group_cols {
-            let top_field = top_schema.field(i);
+            let name_field = if has_projection {
+                agg_schema.field(i)
+            } else {
+                top_schema.field(i)
+            };
             let agg_field = agg_schema.field(i);
-            group_col_names.push(top_field.name().clone());
+            group_col_names.push(name_field.name().clone());
             group_types.push(agg_field.data_type().clone());
         }
 
@@ -248,7 +278,11 @@ impl CoreWindowState {
         for (i, expr) in aggr_exprs.iter().enumerate() {
             let agg_schema_idx = num_group_cols + i;
             let agg_field = agg_schema.field(agg_schema_idx);
-            let output_name = if agg_schema_idx < top_schema.fields().len() {
+            // When a projection is present, use the Aggregate output name
+            // so the intermediate batch columns match what PhysicalExpr expects.
+            let output_name = if has_projection {
+                agg_field.name().clone()
+            } else if agg_schema_idx < top_schema.fields().len() {
                 top_schema.field(agg_schema_idx).name().clone()
             } else {
                 agg_field.name().clone()
@@ -331,21 +365,55 @@ impl CoreWindowState {
             clauses.where_clause,
         );
 
-        let mut output_fields: Vec<Field> = vec![
-            Field::new("window_start", DataType::Int64, false),
-            Field::new("window_end", DataType::Int64, false),
-        ];
+        let mut intermediate_fields: Vec<Field> = Vec::new();
         for (name, dt) in group_col_names.iter().zip(group_types.iter()) {
-            output_fields.push(Field::new(name, dt.clone(), true));
+            intermediate_fields.push(Field::new(name, dt.clone(), true));
         }
         for spec in &agg_specs {
-            output_fields.push(Field::new(
+            intermediate_fields.push(Field::new(
                 &spec.output_name,
                 spec.return_type.clone(),
                 true,
             ));
         }
+        let intermediate_schema = Arc::new(Schema::new(intermediate_fields));
+
+        let mut output_fields: Vec<Field> = vec![
+            Field::new("window_start", DataType::Int64, false),
+            Field::new("window_end", DataType::Int64, false),
+        ];
+        for f in intermediate_schema.fields() {
+            output_fields.push(f.as_ref().clone());
+        }
         let output_schema = Arc::new(Schema::new(output_fields));
+
+        let post_projection = if let Some((proj_exprs, agg_df_schema)) = projection_info {
+            let state = ctx.state();
+            let props = state.execution_props();
+            let mut compiled = Vec::with_capacity(proj_exprs.len());
+            for expr in proj_exprs {
+                let phys = create_physical_expr(expr, &agg_df_schema, props).map_err(|e| {
+                    DbError::Pipeline(format!("compile post-aggregate projection: {e}"))
+                })?;
+                compiled.push(phys);
+            }
+            let mut final_fields = vec![
+                Field::new("window_start", DataType::Int64, false),
+                Field::new("window_end", DataType::Int64, false),
+            ];
+            for f in top_schema.fields() {
+                final_fields.push(f.as_ref().clone());
+            }
+            let final_schema = Arc::new(Schema::new(final_fields));
+
+            Some(PostProjection {
+                exprs: compiled,
+                final_schema,
+                intermediate_schema: Arc::clone(&intermediate_schema),
+            })
+        } else {
+            None
+        };
 
         let having_sql = having_predicate.as_ref().map(expr_to_sql);
 
@@ -372,6 +440,7 @@ impl CoreWindowState {
             max_groups_per_window: 1_000_000,
             allowed_lateness_ms: i64::try_from(window_config.allowed_lateness.as_millis())
                 .unwrap_or(0),
+            post_projection,
         }))
     }
 
@@ -744,11 +813,12 @@ impl CoreWindowState {
 
     /// Close windows whose end <= watermark, returning emitted batches.
     pub fn close_windows(&mut self, watermark_ms: i64) -> Result<Vec<RecordBatch>, DbError> {
-        match &self.assigner {
+        let batches = match &self.assigner {
             CoreWindowAssigner::Tumbling(a) => self.close_fixed_windows(watermark_ms, a.size_ms()),
             CoreWindowAssigner::Hopping(a) => self.close_fixed_windows(watermark_ms, a.size_ms()),
             CoreWindowAssigner::Session { .. } => self.close_session_windows(watermark_ms),
-        }
+        }?;
+        self.apply_post_projection(batches)
     }
 
     /// Close fixed-size windows (tumbling/hopping) whose end <= watermark.
@@ -757,6 +827,19 @@ impl CoreWindowState {
         watermark_ms: i64,
         size_ms: i64,
     ) -> Result<Vec<RecordBatch>, DbError> {
+        // Fast check: if the earliest window hasn't expired, nothing to close.
+        if let Some((&first_ws, _)) = self.windows.first_key_value() {
+            if first_ws
+                .saturating_add(size_ms)
+                .saturating_add(self.allowed_lateness_ms)
+                > watermark_ms
+            {
+                return Ok(Vec::new());
+            }
+        } else {
+            return Ok(Vec::new());
+        }
+
         let to_close: Vec<i64> = self
             .windows
             .keys()
@@ -767,10 +850,6 @@ impl CoreWindowState {
                     <= watermark_ms
             })
             .collect();
-
-        if to_close.is_empty() {
-            return Ok(Vec::new());
-        }
 
         let mut result_batches = Vec::new();
 
@@ -792,7 +871,16 @@ impl CoreWindowState {
 
     /// Close session windows whose end <= watermark.
     fn close_session_windows(&mut self, watermark_ms: i64) -> Result<Vec<RecordBatch>, DbError> {
-        // Collect all closeable sessions across all groups
+        // Fast check: skip allocation if no sessions are closeable.
+        let any_closeable = self.session_groups.values().any(|g| {
+            g.sessions
+                .values()
+                .any(|s| s.end.saturating_add(self.allowed_lateness_ms) <= watermark_ms)
+        });
+        if !any_closeable {
+            return Ok(Vec::new());
+        }
+
         #[allow(clippy::type_complexity)]
         let mut rows: Vec<(
             i64,
@@ -925,6 +1013,54 @@ impl CoreWindowState {
             &self.agg_specs,
             &self.output_schema,
         )
+    }
+
+    /// Apply compiled post-aggregate projection to emitted batches.
+    fn apply_post_projection(
+        &self,
+        batches: Vec<RecordBatch>,
+    ) -> Result<Vec<RecordBatch>, DbError> {
+        let Some(proj) = &self.post_projection else {
+            return Ok(batches);
+        };
+
+        let mut result = Vec::with_capacity(batches.len());
+        for batch in &batches {
+            let num_rows = batch.num_rows();
+            if num_rows == 0 {
+                continue;
+            }
+
+            let win_start = Arc::clone(batch.column(0));
+            let win_end = Arc::clone(batch.column(1));
+
+            let content_cols: Vec<ArrayRef> = (2..batch.num_columns())
+                .map(|i| Arc::clone(batch.column(i)))
+                .collect();
+            let intermediate =
+                RecordBatch::try_new(Arc::clone(&proj.intermediate_schema), content_cols).map_err(
+                    |e| DbError::Pipeline(format!("post-projection intermediate batch: {e}")),
+                )?;
+
+            let mut projected_cols = Vec::with_capacity(2 + proj.exprs.len());
+            projected_cols.push(win_start);
+            projected_cols.push(win_end);
+            for phys_expr in &proj.exprs {
+                let col_val = phys_expr
+                    .evaluate(&intermediate)
+                    .map_err(|e| DbError::Pipeline(format!("post-projection evaluate: {e}")))?;
+                let array = col_val
+                    .into_array(num_rows)
+                    .map_err(|e| DbError::Pipeline(format!("post-projection into_array: {e}")))?;
+                projected_cols.push(array);
+            }
+
+            let projected_batch =
+                RecordBatch::try_new(Arc::clone(&proj.final_schema), projected_cols)
+                    .map_err(|e| DbError::Pipeline(format!("post-projection result batch: {e}")))?;
+            result.push(projected_batch);
+        }
+        Ok(result)
     }
 
     /// Pre-aggregation SQL.
@@ -1208,6 +1344,7 @@ mod tests {
             having_sql: None,
             max_groups_per_window: 1_000_000,
             allowed_lateness_ms: 0,
+            post_projection: None,
         }
     }
 
@@ -1261,6 +1398,7 @@ mod tests {
             having_sql: None,
             max_groups_per_window: 1_000_000,
             allowed_lateness_ms: 0,
+            post_projection: None,
         }
     }
 
@@ -1303,6 +1441,7 @@ mod tests {
             having_sql: None,
             max_groups_per_window: 1_000_000,
             allowed_lateness_ms: 0,
+            post_projection: None,
         }
     }
 
@@ -1343,6 +1482,7 @@ mod tests {
             having_sql: None,
             max_groups_per_window: 1_000_000,
             allowed_lateness_ms: 0,
+            post_projection: None,
         }
     }
 
@@ -2103,8 +2243,10 @@ mod tests {
         );
     }
 
+    // ── Post-aggregate projection tests ──────────────────────────────
+
     #[tokio::test]
-    async fn test_try_from_sql_rejects_post_aggregate_projection() {
+    async fn test_post_aggregate_projection_detection() {
         use arrow::datatypes::Field;
 
         let ctx = laminar_sql::create_streaming_context_with_validator(
@@ -2142,17 +2284,174 @@ mod tests {
             late_data_side_output: None,
         };
 
+        // SUM(a)/SUM(b) is a post-aggregate projection — should now be accepted.
         let result = CoreWindowState::try_from_sql(
             &ctx,
-            "SELECT symbol, SUM(a) / SUM(b) AS ratio FROM events GROUP BY symbol, TUMBLE(ts, INTERVAL '10' SECOND)",
+            "SELECT symbol, SUM(a) / SUM(b) AS ratio \
+             FROM events GROUP BY symbol, \
+             TUMBLE(ts, INTERVAL '10' SECOND)",
             &config,
             Some(&laminar_sql::parser::EmitClause::OnWindowClose),
         )
         .await
         .unwrap();
         assert!(
-            result.is_none(),
-            "Post-aggregate projection should return None"
+            result.is_some(),
+            "Post-aggregate projection should now be accepted"
         );
+        let state = result.unwrap();
+        assert!(
+            state.post_projection.is_some(),
+            "PostProjection should be compiled"
+        );
+    }
+
+    #[tokio::test]
+    async fn test_tumbling_ratio_projection_pipeline() {
+        use arrow::datatypes::Field;
+
+        let ctx = laminar_sql::create_streaming_context_with_validator(
+            laminar_sql::StreamingValidatorMode::Off,
+        );
+        let schema = Arc::new(Schema::new(vec![
+            Field::new("symbol", DataType::Utf8, false),
+            Field::new("a", DataType::Float64, false),
+            Field::new("b", DataType::Float64, false),
+            Field::new("ts", DataType::Int64, false),
+        ]));
+        let batch = RecordBatch::try_new(
+            Arc::clone(&schema),
+            vec![
+                Arc::new(StringArray::from(vec!["X"])),
+                Arc::new(arrow::array::Float64Array::from(vec![1.0])),
+                Arc::new(arrow::array::Float64Array::from(vec![2.0])),
+                Arc::new(Int64Array::from(vec![1000])),
+            ],
+        )
+        .unwrap();
+        let mem_table =
+            datafusion::datasource::MemTable::try_new(schema, vec![vec![batch]]).unwrap();
+        ctx.register_table("events", Arc::new(mem_table)).unwrap();
+
+        let config = laminar_sql::translator::WindowOperatorConfig {
+            window_type: laminar_sql::translator::WindowType::Tumbling,
+            time_column: "ts".to_string(),
+            size: std::time::Duration::from_secs(10),
+            slide: None,
+            gap: None,
+            offset_ms: 0,
+            allowed_lateness: std::time::Duration::ZERO,
+            emit_strategy: laminar_sql::parser::EmitStrategy::OnWindowClose,
+            late_data_side_output: None,
+        };
+
+        let mut state = CoreWindowState::try_from_sql(
+            &ctx,
+            "SELECT symbol, SUM(a) / SUM(b) AS ratio \
+             FROM events GROUP BY symbol, \
+             TUMBLE(ts, INTERVAL '10' SECOND)",
+            &config,
+            Some(&laminar_sql::parser::EmitClause::OnWindowClose),
+        )
+        .await
+        .unwrap()
+        .expect("should detect as core window");
+
+        // Execute the pre-agg SQL to get correctly shaped input batches.
+        let pre_agg_sql = state.pre_agg_sql().to_string();
+        let pre_agg_df = ctx.sql(&pre_agg_sql).await.unwrap();
+        let pre_agg_batches = pre_agg_df.collect().await.unwrap();
+        for batch in &pre_agg_batches {
+            state.update_batch(batch).unwrap();
+        }
+
+        // Close the window (watermark past window end = 10_000).
+        let batches = state.close_windows(11_000).unwrap();
+        assert_eq!(batches.len(), 1, "should emit one batch");
+        let out = &batches[0];
+
+        // The projection SELECT has 2 items (symbol, ratio), so the
+        // final schema is [window_start, window_end, symbol, ratio].
+        assert_eq!(out.num_columns(), 4, "schema: {:?}", out.schema());
+        assert_eq!(out.num_rows(), 1);
+
+        // MemTable has 1 row: a=1.0, b=2.0.
+        // ratio = SUM(a) / SUM(b) = 1.0 / 2.0 = 0.5
+        // Output columns: [window_start, window_end, symbol, ratio]
+        // (group_1 = TUMBLE is consumed by window assignment, projection
+        //  selects only symbol + ratio)
+        let ratio_col = out
+            .column(out.num_columns() - 1)
+            .as_any()
+            .downcast_ref::<arrow::array::Float64Array>()
+            .expect("ratio should be Float64");
+        let ratio = ratio_col.value(0);
+        assert!(
+            (ratio - 0.5).abs() < 1e-9,
+            "expected ratio=0.5, got {ratio}"
+        );
+    }
+
+    #[tokio::test]
+    async fn test_session_with_projection() {
+        use arrow::datatypes::Field;
+
+        let ctx = laminar_sql::create_streaming_context_with_validator(
+            laminar_sql::StreamingValidatorMode::Off,
+        );
+        let schema = Arc::new(Schema::new(vec![
+            Field::new("user_id", DataType::Utf8, false),
+            Field::new("amount", DataType::Float64, false),
+            Field::new("ts", DataType::Int64, false),
+        ]));
+        let batch = RecordBatch::try_new(
+            Arc::clone(&schema),
+            vec![
+                Arc::new(StringArray::from(vec!["alice"])),
+                Arc::new(arrow::array::Float64Array::from(vec![100.0])),
+                Arc::new(Int64Array::from(vec![1000])),
+            ],
+        )
+        .unwrap();
+        let mem_table =
+            datafusion::datasource::MemTable::try_new(schema, vec![vec![batch]]).unwrap();
+        ctx.register_table("events", Arc::new(mem_table)).unwrap();
+
+        let config = laminar_sql::translator::WindowOperatorConfig {
+            window_type: laminar_sql::translator::WindowType::Session,
+            time_column: "ts".to_string(),
+            size: std::time::Duration::from_secs(5),
+            slide: None,
+            gap: Some(std::time::Duration::from_secs(5)),
+            offset_ms: 0,
+            allowed_lateness: std::time::Duration::ZERO,
+            emit_strategy: laminar_sql::parser::EmitStrategy::OnWindowClose,
+            late_data_side_output: None,
+        };
+
+        // Session window + derived column: SUM(amount) * 2 AS double_total
+        let result = CoreWindowState::try_from_sql(
+            &ctx,
+            "SELECT user_id, SUM(amount) * 2 AS double_total \
+             FROM events GROUP BY user_id, \
+             SESSION(ts, INTERVAL '5' SECOND)",
+            &config,
+            Some(&laminar_sql::parser::EmitClause::OnWindowClose),
+        )
+        .await
+        .unwrap();
+        assert!(result.is_some(), "Session + projection should be accepted");
+        let state = result.unwrap();
+        assert!(state.post_projection.is_some());
+    }
+
+    #[test]
+    fn test_apply_post_projection_passthrough() {
+        // Without post_projection, batches pass through unchanged.
+        let state = make_core_window_state(1000);
+        let batch = make_pre_agg_batch(vec!["A"], vec![10], vec![100]);
+        let result = state.apply_post_projection(vec![batch.clone()]).unwrap();
+        assert_eq!(result.len(), 1);
+        assert_eq!(result[0].num_rows(), batch.num_rows());
     }
 }
