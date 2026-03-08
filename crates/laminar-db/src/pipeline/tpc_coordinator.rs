@@ -170,6 +170,19 @@ impl TpcPipelineCoordinator {
             if self.drain_buffer.is_empty() {
                 self.maybe_inject_checkpoint(&mut *callback).await;
                 callback.poll_tables().await;
+                // Check barrier timeout even when idle — otherwise an
+                // in-flight barrier from a stalled source never expires.
+                if self.pending_barrier.active
+                    && self.pending_barrier.started_at.elapsed() > barrier_timeout
+                {
+                    tracing::warn!(
+                        checkpoint_id = self.pending_barrier.checkpoint_id,
+                        aligned = self.pending_barrier.sources_aligned.len(),
+                        total = self.pending_barrier.sources_total,
+                        "Barrier alignment timeout — cancelling checkpoint"
+                    );
+                    self.pending_barrier.active = false;
+                }
                 continue;
             }
 
