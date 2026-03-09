@@ -625,6 +625,145 @@ pub async fn delete_by_merge(
     Ok((table, rows_deleted))
 }
 
+/// Atomic changelog MERGE: inserts, updates, and deletes in one Delta commit.
+///
+/// The source batch must contain an `_op` column (Utf8) with values:
+/// - `"I"`, `"U"`, `"r"` → upsert (update if matched, insert if not)
+/// - `"D"` → delete matched rows
+///
+/// Columns prefixed with `_` are excluded from SET clauses but remain
+/// in the source `DataFrame` for predicate filtering.
+///
+/// # Errors
+///
+/// Returns `ConnectorError::WriteError` if the merge fails.
+#[cfg(feature = "delta-lake")]
+#[allow(clippy::too_many_lines)]
+pub async fn merge_changelog(
+    table: DeltaTable,
+    source_batch: RecordBatch,
+    key_columns: &[String],
+    writer_id: &str,
+    epoch: u64,
+    schema_evolution: bool,
+) -> Result<(DeltaTable, MergeResult), ConnectorError> {
+    use datafusion::prelude::*;
+    use deltalake::kernel::transaction::CommitProperties;
+    use deltalake::kernel::Transaction;
+
+    const CDC_COLUMNS: &[&str] = &["_op", "_ts_ms"];
+
+    if source_batch.num_rows() == 0 {
+        return Ok((
+            table,
+            MergeResult {
+                rows_inserted: 0,
+                rows_updated: 0,
+                rows_deleted: 0,
+            },
+        ));
+    }
+
+    debug!(
+        key_columns = ?key_columns,
+        source_rows = source_batch.num_rows(),
+        "performing atomic changelog MERGE"
+    );
+
+    let ctx = SessionContext::new();
+    let source_df = ctx.read_batch(source_batch).map_err(|e| {
+        ConnectorError::WriteError(format!("failed to create source DataFrame: {e}"))
+    })?;
+
+    // Join predicate: target.k1 = source.k1 AND ...
+    let predicate = key_columns
+        .iter()
+        .map(|k| col(format!("target.{k}")).eq(col(format!("source.{k}"))))
+        .reduce(Expr::and)
+        .ok_or_else(|| {
+            ConnectorError::ConfigurationError("merge requires at least one key column".into())
+        })?;
+
+    let source_schema = source_df.schema().clone();
+    let key_set: std::collections::HashSet<&str> = key_columns.iter().map(String::as_str).collect();
+
+    // Exclude CDC metadata columns from SET clauses (preserve user columns like _id).
+    let all_user_columns: Vec<String> = source_schema
+        .fields()
+        .iter()
+        .map(|f| f.name().clone())
+        .filter(|name| !CDC_COLUMNS.contains(&name.as_str()))
+        .collect();
+
+    let non_key_user_columns: Vec<String> = all_user_columns
+        .iter()
+        .filter(|c| !key_set.contains(c.as_str()))
+        .cloned()
+        .collect();
+
+    // Predicates for conditional clause execution.
+    let upsert_pred = col("source._op").in_list(vec![lit("I"), lit("U"), lit("r")], false);
+    let delete_pred = col("source._op").eq(lit("D"));
+
+    #[allow(clippy::cast_possible_wrap)]
+    let epoch_i64 = epoch as i64;
+
+    let non_key_for_update = non_key_user_columns;
+    let all_for_insert = all_user_columns;
+
+    let mut merge_builder = table
+        .merge(source_df, predicate)
+        .with_source_alias("source")
+        .with_target_alias("target")
+        .with_commit_properties(
+            CommitProperties::default()
+                .with_application_transaction(Transaction::new(writer_id, epoch_i64)),
+        )
+        .when_matched_update(|update| {
+            let mut u = update.predicate(upsert_pred.clone());
+            for col_name in &non_key_for_update {
+                u = u.update(col_name.as_str(), col(format!("source.{col_name}")));
+            }
+            u
+        })
+        .map_err(|e| ConnectorError::WriteError(format!("merge matched-update failed: {e}")))?
+        .when_matched_delete(|delete| delete.predicate(delete_pred))
+        .map_err(|e| ConnectorError::WriteError(format!("merge matched-delete failed: {e}")))?
+        .when_not_matched_insert(|insert| {
+            let mut ins = insert.predicate(upsert_pred);
+            for col_name in &all_for_insert {
+                ins = ins.set(col_name.as_str(), col(format!("source.{col_name}")));
+            }
+            ins
+        })
+        .map_err(|e| ConnectorError::WriteError(format!("merge not-matched-insert failed: {e}")))?;
+
+    if schema_evolution {
+        merge_builder = merge_builder.with_merge_schema(true);
+    }
+
+    let (table, metrics) = merge_builder.await.map_err(|e| {
+        ConnectorError::WriteError(format!("Delta Lake changelog MERGE failed: {e}"))
+    })?;
+
+    let result = MergeResult {
+        rows_inserted: metrics.num_target_rows_inserted,
+        rows_updated: metrics.num_target_rows_updated,
+        rows_deleted: metrics.num_target_rows_deleted,
+    };
+
+    info!(
+        writer_id,
+        epoch,
+        rows_inserted = result.rows_inserted,
+        rows_updated = result.rows_updated,
+        rows_deleted = result.rows_deleted,
+        "Delta Lake changelog MERGE complete"
+    );
+
+    Ok((table, result))
+}
+
 /// Result of a compaction (OPTIMIZE) operation.
 #[cfg(feature = "delta-lake")]
 #[derive(Debug)]
@@ -716,41 +855,99 @@ pub async fn run_vacuum(
 
 /// Resolves catalog-aware table URI and merges catalog-specific storage options.
 ///
-/// Returns `(resolved_table_uri, merged_storage_options)`.
+/// - `None`: returns table path and storage options as-is.
+/// - `Glue`: calls AWS Glue API to resolve the table's S3 location.
+/// - `Unity`: injects workspace URL and access token into storage options.
 ///
-/// - `None` catalog: returns the table path and base storage options as-is.
-/// - `Glue` catalog: returns the table path as-is (Glue resolves via AWS env).
-/// - `Unity` catalog: injects `DATABRICKS_WORKSPACE_URL` and
-///   `DATABRICKS_ACCESS_TOKEN` into the storage options.
+/// # Errors
+///
+/// Returns `ConnectorError` if catalog resolution fails.
 #[cfg(feature = "delta-lake")]
-#[must_use]
-#[allow(clippy::implicit_hasher)]
-pub fn resolve_catalog_options(
+#[allow(clippy::implicit_hasher, clippy::unused_async)]
+pub async fn resolve_catalog_options(
     catalog: &super::delta_config::DeltaCatalogType,
-    _catalog_database: Option<&str>,
-    _catalog_name: Option<&str>,
+    #[allow(unused_variables)] catalog_database: Option<&str>,
+    #[allow(unused_variables)] catalog_name: Option<&str>,
     _catalog_schema: Option<&str>,
     table_path: &str,
     base_storage_options: &HashMap<String, String>,
-) -> (String, HashMap<String, String>) {
+    catalog_properties: &HashMap<String, String>,
+) -> Result<(String, HashMap<String, String>), ConnectorError> {
     use super::delta_config::DeltaCatalogType;
 
     match catalog {
-        DeltaCatalogType::None | DeltaCatalogType::Glue => {
-            (table_path.to_string(), base_storage_options.clone())
+        DeltaCatalogType::None => Ok((table_path.to_string(), base_storage_options.clone())),
+        #[cfg(feature = "delta-lake-glue")]
+        DeltaCatalogType::Glue => {
+            use deltalake::DataCatalog;
+            let database = catalog_database.ok_or_else(|| {
+                ConnectorError::ConfigurationError(
+                    "Glue catalog requires 'catalog.database'".into(),
+                )
+            })?;
+            let glue = deltalake_catalog_glue::GlueDataCatalog::from_env()
+                .await
+                .map_err(|e| {
+                    ConnectorError::ConnectionFailed(format!("failed to init Glue catalog: {e}"))
+                })?;
+            let resolved = glue
+                .get_table_storage_location(catalog_name.map(String::from), database, table_path)
+                .await
+                .map_err(|e| {
+                    ConnectorError::ConnectionFailed(format!(
+                        "Glue catalog lookup failed for '{database}.{table_path}': {e}"
+                    ))
+                })?;
+            info!(
+                glue_database = database,
+                table = table_path,
+                resolved_path = %resolved,
+                "resolved table path via Glue catalog"
+            );
+            let mut opts = base_storage_options.clone();
+            opts.extend(
+                catalog_properties
+                    .iter()
+                    .map(|(k, v)| (k.clone(), v.clone())),
+            );
+            Ok((resolved, opts))
         }
+        #[cfg(not(feature = "delta-lake-glue"))]
+        DeltaCatalogType::Glue => Err(ConnectorError::ConfigurationError(
+            "Glue catalog requires the 'delta-lake-glue' feature. \
+             Build with: cargo build --features delta-lake-glue"
+                .into(),
+        )),
+        #[cfg(feature = "delta-lake-unity")]
         DeltaCatalogType::Unity {
             workspace_url,
             access_token,
         } => {
+            // The deltalake-catalog-unity crate auto-registers a factory for
+            // uc:// URIs via #[ctor]. It reads `databricks_host` and
+            // `databricks_token` from storage options (or DATABRICKS_HOST /
+            // DATABRICKS_TOKEN env vars). We inject from config so users can
+            // specify credentials in TOML instead of env vars.
             let mut opts = base_storage_options.clone();
-            opts.insert(
-                "DATABRICKS_WORKSPACE_URL".to_string(),
-                workspace_url.clone(),
+            opts.extend(
+                catalog_properties
+                    .iter()
+                    .map(|(k, v)| (k.clone(), v.clone())),
             );
-            opts.insert("DATABRICKS_ACCESS_TOKEN".to_string(), access_token.clone());
-            (table_path.to_string(), opts)
+            if !workspace_url.is_empty() {
+                opts.insert("databricks_host".to_string(), workspace_url.clone());
+            }
+            if !access_token.is_empty() {
+                opts.insert("databricks_token".to_string(), access_token.clone());
+            }
+            Ok((table_path.to_string(), opts))
         }
+        #[cfg(not(feature = "delta-lake-unity"))]
+        DeltaCatalogType::Unity { .. } => Err(ConnectorError::ConfigurationError(
+            "Unity catalog requires the 'delta-lake-unity' feature. \
+             Build with: cargo build --features delta-lake-unity"
+                .into(),
+        )),
     }
 }
 

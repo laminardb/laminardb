@@ -312,6 +312,13 @@ impl SourceConnector for KafkaSource {
             } else {
                 select_deserializer(kafka_config.format)
             };
+        } else if let Some(ref sr) = self.schema_registry {
+            // Preserve SR client injected via with_schema_registry().
+            self.deserializer = if kafka_config.format == Format::Avro {
+                Box::new(AvroDeserializer::with_schema_registry(Arc::clone(sr)))
+            } else {
+                select_deserializer(kafka_config.format)
+            };
         } else {
             self.deserializer = select_deserializer(kafka_config.format);
         }
@@ -702,6 +709,23 @@ mod tests {
         cfg.schema_registry_url = Some("http://localhost:8081".into());
 
         let source = KafkaSource::with_schema_registry(test_schema(), cfg, sr);
+        assert!(source.schema_registry.is_some());
+        assert_eq!(source.deserializer.format(), Format::Avro);
+    }
+
+    #[tokio::test]
+    async fn test_open_preserves_injected_schema_registry() {
+        let sr = SchemaRegistryClient::new("http://localhost:8081", None);
+        let mut cfg = test_config();
+        cfg.format = Format::Avro;
+        cfg.schema_registry_url = Some("http://localhost:8081".into());
+        let mut source = KafkaSource::with_schema_registry(test_schema(), cfg, sr);
+
+        // open() with empty config should preserve injected SR.
+        let empty_config = crate::config::ConnectorConfig::new("kafka");
+        // open() will fail to connect (no broker), but the deserializer
+        // re-selection happens before the connection attempt.
+        let _ = source.open(&empty_config).await;
         assert!(source.schema_registry.is_some());
         assert_eq!(source.deserializer.format(), Format::Avro);
     }
