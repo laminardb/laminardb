@@ -57,11 +57,6 @@ mod sink_task;
 mod sql_utils;
 // Used in production by `ConnectorPipelineCallback` for SQL execution and
 // checkpoint state capture. Not dead code.
-mod stream_executor;
-mod table_backend;
-mod table_cache_mode;
-mod table_provider;
-mod table_store;
 /// FFI-friendly API for language bindings.
 ///
 /// Enable with the `api` feature flag:
@@ -73,6 +68,11 @@ mod table_store;
 /// explicit resource management, and Arrow RecordBatch at all boundaries.
 #[cfg(feature = "api")]
 pub mod api;
+mod stream_executor;
+mod table_backend;
+mod table_cache_mode;
+mod table_provider;
+mod table_store;
 
 /// C FFI layer for LaminarDB.
 ///

@@ -266,7 +266,10 @@ impl StreamExecutor {
     }
 
     /// Set the lookup table registry for versioned temporal join lookups.
-    pub fn set_lookup_registry(&mut self, registry: Arc<laminar_sql::datafusion::LookupTableRegistry>) {
+    pub fn set_lookup_registry(
+        &mut self,
+        registry: Arc<laminar_sql::datafusion::LookupTableRegistry>,
+    ) {
         self.lookup_registry = Some(registry);
     }
 
@@ -1427,9 +1430,7 @@ impl StreamExecutor {
         let input = mem_table
             .scan(&self.ctx.state(), None, &[], None)
             .await
-            .map_err(|e| {
-                DbError::Pipeline(format!("temporal join [{query_name}]: scan: {e}"))
-            })?;
+            .map_err(|e| DbError::Pipeline(format!("temporal join [{query_name}]: scan: {e}")))?;
         let exec = VersionedLookupJoinExec::try_new(
             input,
             versioned.batch.clone(),
@@ -1441,7 +1442,9 @@ impl StreamExecutor {
             key_sort_fields,
         )
         .map_err(|e| {
-            DbError::Pipeline(format!("temporal join [{query_name}]: exec build error: {e}"))
+            DbError::Pipeline(format!(
+                "temporal join [{query_name}]: exec build error: {e}"
+            ))
         })?;
 
         let task_ctx = self.ctx.state().task_ctx();

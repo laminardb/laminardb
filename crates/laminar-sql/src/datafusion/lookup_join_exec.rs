@@ -284,8 +284,7 @@ impl VersionedIndex {
         let timestamps = extract_i64_timestamps(batch.column(version_col_idx))?;
 
         let num_rows = batch.num_rows();
-        let mut map: HashMap<Box<[u8]>, BTreeMap<i64, Vec<u32>>> =
-            HashMap::with_capacity(num_rows);
+        let mut map: HashMap<Box<[u8]>, BTreeMap<i64, Vec<u32>>> = HashMap::with_capacity(num_rows);
         #[allow(clippy::cast_possible_truncation)]
         for (i, ts_opt) in timestamps.iter().enumerate() {
             // Skip rows with null keys or null version timestamps.
@@ -329,12 +328,15 @@ fn extract_i64_timestamps(col: &dyn arrow_array::Array) -> Result<Vec<Option<i64
     let mut out = Vec::with_capacity(n);
     macro_rules! extract_typed {
         ($arr_type:ty, $scale:expr) => {{
-            let arr = col
-                .as_any()
-                .downcast_ref::<$arr_type>()
-                .ok_or_else(|| DataFusionError::Internal(concat!("expected ", stringify!($arr_type)).into()))?;
+            let arr = col.as_any().downcast_ref::<$arr_type>().ok_or_else(|| {
+                DataFusionError::Internal(concat!("expected ", stringify!($arr_type)).into())
+            })?;
             for i in 0..n {
-                out.push(if col.is_null(i) { None } else { Some(arr.value(i) * $scale) });
+                out.push(if col.is_null(i) {
+                    None
+                } else {
+                    Some(arr.value(i) * $scale)
+                });
             }
         }};
     }
@@ -348,9 +350,15 @@ fn extract_i64_timestamps(col: &dyn arrow_array::Array) -> Result<Vec<Option<i64
             let arr = col
                 .as_any()
                 .downcast_ref::<TimestampMicrosecondArray>()
-                .ok_or_else(|| DataFusionError::Internal("expected TimestampMicrosecondArray".into()))?;
+                .ok_or_else(|| {
+                    DataFusionError::Internal("expected TimestampMicrosecondArray".into())
+                })?;
             for i in 0..n {
-                out.push(if col.is_null(i) { None } else { Some(arr.value(i) / 1000) });
+                out.push(if col.is_null(i) {
+                    None
+                } else {
+                    Some(arr.value(i) / 1000)
+                });
             }
         }
         DataType::Timestamp(TimeUnit::Second, _) => {
@@ -360,18 +368,29 @@ fn extract_i64_timestamps(col: &dyn arrow_array::Array) -> Result<Vec<Option<i64
             let arr = col
                 .as_any()
                 .downcast_ref::<TimestampNanosecondArray>()
-                .ok_or_else(|| DataFusionError::Internal("expected TimestampNanosecondArray".into()))?;
+                .ok_or_else(|| {
+                    DataFusionError::Internal("expected TimestampNanosecondArray".into())
+                })?;
             for i in 0..n {
-                out.push(if col.is_null(i) { None } else { Some(arr.value(i) / 1_000_000) });
+                out.push(if col.is_null(i) {
+                    None
+                } else {
+                    Some(arr.value(i) / 1_000_000)
+                });
             }
         }
         DataType::Float64 => {
-            let arr = col.as_any().downcast_ref::<Float64Array>().ok_or_else(|| {
-                DataFusionError::Internal("expected Float64Array".into())
-            })?;
+            let arr = col
+                .as_any()
+                .downcast_ref::<Float64Array>()
+                .ok_or_else(|| DataFusionError::Internal("expected Float64Array".into()))?;
             #[allow(clippy::cast_possible_truncation)]
             for i in 0..n {
-                out.push(if col.is_null(i) { None } else { Some(arr.value(i) as i64) });
+                out.push(if col.is_null(i) {
+                    None
+                } else {
+                    Some(arr.value(i) as i64)
+                });
             }
         }
         other => {
@@ -383,7 +402,6 @@ fn extract_i64_timestamps(col: &dyn arrow_array::Array) -> Result<Vec<Option<i64
 
     Ok(out)
 }
-
 
 // ── Physical Execution Plan ──────────────────────────────────────
 
@@ -720,7 +738,6 @@ impl VersionedLookupJoinExec {
         output_schema: SchemaRef,
         key_sort_fields: Vec<SortField>,
     ) -> Result<Self> {
-
         let output_schema = if join_type == LookupJoinType::LeftOuter {
             let stream_count = input.schema().fields().len();
             let mut fields = output_schema.fields().to_vec();

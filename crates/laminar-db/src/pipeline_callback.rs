@@ -521,9 +521,8 @@ impl crate::pipeline::PipelineCallback for ConnectorPipelineCallback {
                             .iter()
                             .filter_map(|k| combined.schema().index_of(k).ok())
                             .collect();
-                        let Ok(version_col_idx) = combined
-                            .schema()
-                            .index_of(&versioned.version_column)
+                        let Ok(version_col_idx) =
+                            combined.schema().index_of(&versioned.version_column)
                         else {
                             tracing::warn!(
                                 table=%name,
@@ -532,20 +531,21 @@ impl crate::pipeline::PipelineCallback for ConnectorPipelineCallback {
                             );
                             continue;
                         };
-                        let index = match laminar_sql::datafusion::lookup_join_exec::VersionedIndex::build(
-                            &combined,
-                            &key_indices,
-                            version_col_idx,
-                        ) {
-                            Ok(idx) => Arc::new(idx),
-                            Err(e) => {
-                                tracing::warn!(
-                                    table=%name, error=%e,
-                                    "Versioned index build error"
-                                );
-                                continue;
-                            }
-                        };
+                        let index =
+                            match laminar_sql::datafusion::lookup_join_exec::VersionedIndex::build(
+                                &combined,
+                                &key_indices,
+                                version_col_idx,
+                            ) {
+                                Ok(idx) => Arc::new(idx),
+                                Err(e) => {
+                                    tracing::warn!(
+                                        table=%name, error=%e,
+                                        "Versioned index build error"
+                                    );
+                                    continue;
+                                }
+                            };
                         self.lookup_registry.register_versioned(
                             name,
                             laminar_sql::datafusion::VersionedLookupState {

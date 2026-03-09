@@ -306,9 +306,8 @@ impl LaminarDB {
                     .iter()
                     .filter_map(|k| initial_batch.schema().index_of(k).ok())
                     .collect();
-                let Ok(version_col_idx) = initial_batch
-                    .schema()
-                    .index_of(&tcfg.table_version_column)
+                let Ok(version_col_idx) =
+                    initial_batch.schema().index_of(&tcfg.table_version_column)
                 else {
                     if !initial_batch.schema().fields().is_empty() {
                         tracing::warn!(
@@ -324,7 +323,8 @@ impl LaminarDB {
                         laminar_sql::datafusion::VersionedLookupState {
                             batch: initial_batch,
                             index: Arc::new(
-                                laminar_sql::datafusion::lookup_join_exec::VersionedIndex::default(),
+                                laminar_sql::datafusion::lookup_join_exec::VersionedIndex::default(
+                                ),
                             ),
                             key_columns,
                             version_column: tcfg.table_version_column.clone(),
