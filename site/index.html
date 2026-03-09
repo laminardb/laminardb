@@ -3,211 +3,161 @@
 <head>
   <meta charset="UTF-8">
   <meta name="viewport" content="width=device-width, initial-scale=1.0">
-  <title>LaminarDB — The Embedded Streaming Database | Real-Time SQL Processing</title>
-  <meta name="description" content="Process streaming data with sub-microsecond latency using familiar SQL. Embedded like SQLite, streams like Flink. Python and Rust APIs. Apache 2.0 open source.">
-  <meta name="keywords" content="streaming database, embedded database, real-time analytics, stream processing, Rust database, Python streaming, SQL stream processing, Apache Arrow, DataFusion, sub-microsecond latency, Kafka connector, CDC, Delta Lake, PyArrow, tumbling window, session window, ASOF join, embedded analytics, event processing, streaming SQL engine">
-  <meta name="robots" content="index, follow, max-image-preview:large, max-snippet:-1">
-  <meta name="author" content="LaminarDB Contributors">
-  <meta name="theme-color" content="#0a0a1a">
+  <title>LaminarDB — Streaming SQL Engine</title>
+  <meta name="description" content="The streaming engine that starts embedded. Sub-microsecond SQL over event streams. Embed in Rust or Python, run standalone, or scale to a cluster. Arrow, DataFusion. Apache 2.0.">
+  <meta name="keywords" content="streaming database, embedded database, stream processing, Rust, SQL, Apache Arrow, DataFusion, Kafka, CDC, Delta Lake, sub-microsecond, ASOF join, tumbling window, session window">
+  <meta name="robots" content="index, follow">
+  <meta name="theme-color" content="#0a0a0a">
   <link rel="canonical" href="https://laminardb.io">
 
-  <!-- Open Graph -->
-  <meta property="og:title" content="LaminarDB — The Embedded Streaming Database | Real-Time SQL Processing">
-  <meta property="og:description" content="Process streaming data with sub-microsecond latency using familiar SQL. Embedded like SQLite, streams like Flink. Python and Rust APIs.">
+  <meta property="og:title" content="LaminarDB — Streaming SQL Engine">
+  <meta property="og:description" content="The streaming engine that starts embedded. Sub-microsecond SQL over event streams. Embed in Rust or Python, run standalone, or scale to a cluster.">
   <meta property="og:image" content="https://laminardb.io/img/logo.jpg">
   <meta property="og:url" content="https://laminardb.io">
   <meta property="og:type" content="website">
-  <meta property="og:site_name" content="LaminarDB">
-  <meta property="og:locale" content="en_US">
-  <meta property="og:image:width" content="1200">
-  <meta property="og:image:height" content="630">
 
-  <!-- Twitter -->
   <meta name="twitter:card" content="summary_large_image">
-  <meta name="twitter:title" content="LaminarDB — The Embedded Streaming Database">
-  <meta name="twitter:description" content="Sub-microsecond SQL stream processing. No cluster required. Python + Rust. Apache 2.0.">
+  <meta name="twitter:title" content="LaminarDB — Streaming SQL Engine">
+  <meta name="twitter:description" content="The streaming engine that starts embedded. Sub-microsecond SQL. Embed in Rust or Python, run standalone, or scale to a cluster.">
   <meta name="twitter:image" content="https://laminardb.io/img/logo.jpg">
 
-  <!-- Favicon -->
   <link rel="icon" type="image/svg+xml" href="favicon.svg">
 
-  <!-- Fonts -->
   <link rel="preconnect" href="https://fonts.googleapis.com">
   <link rel="preconnect" href="https://fonts.gstatic.com" crossorigin>
-  <link href="https://fonts.googleapis.com/css2?family=Inter:wght@400;500;600;700;800&family=JetBrains+Mono:wght@400;500;700&display=swap" rel="stylesheet">
+  <link href="https://fonts.googleapis.com/css2?family=JetBrains+Mono:wght@400;500;700&display=swap" rel="stylesheet">
 
-  <!-- Prism.js -->
   <link href="https://cdnjs.cloudflare.com/ajax/libs/prism/1.29.0/themes/prism-tomorrow.min.css" rel="stylesheet">
-
-  <!-- Styles -->
   <link rel="stylesheet" href="css/style.css">
 
-  <!-- JSON-LD: SoftwareApplication -->
   <script type="application/ld+json">
   {
     "@context": "https://schema.org",
     "@type": "SoftwareApplication",
     "name": "LaminarDB",
-    "description": "High-performance embedded streaming SQL database with sub-microsecond latency. Process streaming data with familiar SQL, zero infrastructure, and Python or Rust APIs.",
+    "description": "Embedded streaming SQL engine with sub-microsecond latency. Process event streams using SQL, Rust, Apache Arrow, and DataFusion.",
     "applicationCategory": "Database",
-    "applicationSubCategory": "Streaming Database",
     "operatingSystem": "Linux, macOS, Windows",
     "license": "https://opensource.org/licenses/Apache-2.0",
     "url": "https://laminardb.io",
     "codeRepository": "https://github.com/laminardb/laminardb",
     "programmingLanguage": ["Rust", "Python", "SQL"],
-    "softwareVersion": "0.18.0",
-    "datePublished": "2026-01-01",
-    "dateModified": "2026-03-03",
-    "offers": {
-      "@type": "Offer",
-      "price": "0",
-      "priceCurrency": "USD"
-    },
+    "softwareVersion": "0.18.1",
     "author": {
       "@type": "Organization",
       "name": "LaminarDB Contributors",
       "url": "https://github.com/laminardb"
-    },
-    "keywords": "streaming database, embedded database, real-time SQL, stream processing, Apache Arrow, DataFusion"
-  }
-  </script>
-  <!-- JSON-LD: WebSite (enables sitelinks search box) -->
-  <script type="application/ld+json">
-  {
-    "@context": "https://schema.org",
-    "@type": "WebSite",
-    "name": "LaminarDB",
-    "url": "https://laminardb.io",
-    "description": "The embedded streaming SQL database. Sub-microsecond latency, zero infrastructure, Python and Rust APIs."
+    }
   }
   </script>
 </head>
 <body>
 
-  <!-- ======== Sticky Top Bar (appears on scroll) ======== -->
-  <div class="sticky-bar" id="sticky-bar" aria-hidden="true">
-    <div class="sticky-bar-inner">
-      <a href="#" class="sticky-bar-brand" aria-label="LaminarDB home">
-        <svg class="logo-icon" viewBox="0 0 40 40" width="24" height="24" aria-hidden="true">
-          <defs><linearGradient id="sticky-lg" x1="0" y1="0" x2="1" y2="1"><stop offset="0%" stop-color="#06b6d4"/><stop offset="100%" stop-color="#8b5cf6"/></linearGradient></defs>
-          <path d="M0 20 C8 20,14 17,22 17 C30 17,32 21,40 21" stroke="url(#sticky-lg)" stroke-width="3" fill="none" stroke-linecap="round"/>
-        </svg>
-        <span>LaminarDB</span>
-      </a>
-      <div class="sticky-bar-install" role="button" tabindex="0" aria-label="Copy install command">
-        <span class="prompt">$</span>
-        <span class="cmd">pip install laminardb</span>
-      </div>
-      <a href="#get-started" class="btn btn-primary btn-sm">Get Started</a>
-    </div>
-  </div>
-
-  <!-- ======== Navigation ======== -->
+  <!-- Nav -->
   <header class="nav" role="banner">
     <div class="nav-inner">
       <a href="#" class="nav-brand" aria-label="LaminarDB home">
-        <svg class="logo-icon" viewBox="0 0 40 40" width="32" height="32" aria-hidden="true">
-          <defs><linearGradient id="nav-lg" x1="0" y1="0" x2="1" y2="1"><stop offset="0%" stop-color="#06b6d4"/><stop offset="100%" stop-color="#8b5cf6"/></linearGradient></defs>
-          <path d="M4 8 C12 8,14 6,22 6 C30 6,32 10,36 10" stroke="url(#nav-lg)" stroke-width="2.5" fill="none" stroke-linecap="round" opacity=".5"/>
-          <path d="M2 14 C10 14,14 11,22 11 C30 11,32 15,38 15" stroke="url(#nav-lg)" stroke-width="2.5" fill="none" stroke-linecap="round" opacity=".7"/>
-          <path d="M0 20 C8 20,14 17,22 17 C30 17,32 21,40 21" stroke="url(#nav-lg)" stroke-width="3" fill="none" stroke-linecap="round"/>
-          <path d="M2 26 C10 26,14 23,22 23 C30 23,32 27,38 27" stroke="url(#nav-lg)" stroke-width="2.5" fill="none" stroke-linecap="round" opacity=".7"/>
-          <path d="M4 32 C12 32,14 30,22 30 C30 30,32 34,36 34" stroke="url(#nav-lg)" stroke-width="2.5" fill="none" stroke-linecap="round" opacity=".5"/>
+        <svg viewBox="0 0 40 40" width="28" height="28" aria-hidden="true">
+          <defs><linearGradient id="logo-g" x1="0" y1="0" x2="1" y2="1"><stop offset="0%" stop-color="#00b4d8"/><stop offset="100%" stop-color="#38cbeb"/></linearGradient></defs>
+          <path d="M4 8 C12 8,14 6,22 6 C30 6,32 10,36 10" stroke="url(#logo-g)" stroke-width="2.5" fill="none" stroke-linecap="round" opacity=".4"/>
+          <path d="M2 14 C10 14,14 11,22 11 C30 11,32 15,38 15" stroke="url(#logo-g)" stroke-width="2.5" fill="none" stroke-linecap="round" opacity=".6"/>
+          <path d="M0 20 C8 20,14 17,22 17 C30 17,32 21,40 21" stroke="url(#logo-g)" stroke-width="3" fill="none" stroke-linecap="round"/>
+          <path d="M2 26 C10 26,14 23,22 23 C30 23,32 27,38 27" stroke="url(#logo-g)" stroke-width="2.5" fill="none" stroke-linecap="round" opacity=".6"/>
+          <path d="M4 32 C12 32,14 30,22 30 C30 30,32 34,36 34" stroke="url(#logo-g)" stroke-width="2.5" fill="none" stroke-linecap="round" opacity=".4"/>
         </svg>
         <span>LaminarDB</span>
-        <span class="version-badge">v0.18</span>
+        <span class="version-badge">v0.18.1</span>
       </a>
 
       <nav class="nav-links" aria-label="Main navigation">
-        <a href="#why">Why</a>
-        <a href="#use-cases">Use Cases</a>
-        <a href="#performance">Performance</a>
-        <a href="#code">Code</a>
-        <a href="#python">Python</a>
-        <a href="#architecture">Architecture</a>
-        <a href="#playground">Playground</a>
+        <a href="#quick-start">Quick Start</a>
+        <a href="#connectors">Connectors</a>
+        <a href="#comparison">Comparison</a>
+        <a href="#status">Status</a>
         <a href="https://laminardb.io/api/laminar_db/" target="_blank" rel="noopener">Docs</a>
-      </nav>
-
-      <div class="nav-actions">
-        <a href="https://github.com/laminardb/laminardb" class="github-btn" target="_blank" rel="noopener" aria-label="Star on GitHub">
-          <svg viewBox="0 0 16 16" fill="currentColor"><path d="M8 0C3.58 0 0 3.58 0 8c0 3.54 2.29 6.53 5.47 7.59.4.07.55-.17.55-.38 0-.19-.01-.82-.01-1.49-2.01.37-2.53-.49-2.69-.94-.09-.23-.48-.94-.82-1.13-.28-.15-.68-.52-.01-.53.63-.01 1.08.58 1.23.82.72 1.21 1.87.87 2.33.66.07-.52.28-.87.51-1.07-1.78-.2-3.64-.89-3.64-3.95 0-.87.31-1.59.82-2.15-.08-.2-.36-1.02.08-2.12 0 0 .67-.21 2.2.82.64-.18 1.32-.27 2-.27.68 0 1.36.09 2 .27 1.53-1.04 2.2-.82 2.2-.82.44 1.1.16 1.92.08 2.12.51.56.82 1.27.82 2.15 0 3.07-1.87 3.75-3.65 3.95.29.25.54.73.54 1.48 0 1.07-.01 1.93-.01 2.2 0 .21.15.46.55.38A8.013 8.013 0 0016 8c0-4.42-3.58-8-8-8z"/></svg>
-          <span>Star on GitHub</span>
+        <a href="https://github.com/laminardb/laminardb" class="github-link" target="_blank" rel="noopener">
+          <svg viewBox="0 0 16 16"><path d="M8 0C3.58 0 0 3.58 0 8c0 3.54 2.29 6.53 5.47 7.59.4.07.55-.17.55-.38 0-.19-.01-.82-.01-1.49-2.01.37-2.53-.49-2.69-.94-.09-.23-.48-.94-.82-1.13-.28-.15-.68-.52-.01-.53.63-.01 1.08.58 1.23.82.72 1.21 1.87.87 2.33.66.07-.52.28-.87.51-1.07-1.78-.2-3.64-.89-3.64-3.95 0-.87.31-1.59.82-2.15-.08-.2-.36-1.02.08-2.12 0 0 .67-.21 2.2.82.64-.18 1.32-.27 2-.27.68 0 1.36.09 2 .27 1.53-1.04 2.2-.82 2.2-.82.44 1.1.16 1.92.08 2.12.51.56.82 1.27.82 2.15 0 3.07-1.87 3.75-3.65 3.95.29.25.54.73.54 1.48 0 1.07-.01 1.93-.01 2.2 0 .21.15.46.55.38A8.013 8.013 0 0016 8c0-4.42-3.58-8-8-8z"/></svg>
+          GitHub
         </a>
-        <a href="#get-started" class="btn btn-primary">Get Started</a>
-      </div>
+      </nav>
 
       <button class="nav-toggle" aria-label="Toggle menu">
         <span></span><span></span><span></span>
       </button>
 
       <div class="mobile-menu">
-        <a href="#why">Why LaminarDB</a>
-        <a href="#use-cases">Use Cases</a>
-        <a href="#performance">Performance</a>
-        <a href="#code">Code Examples</a>
-        <a href="#python">Python</a>
-        <a href="#architecture">Architecture</a>
-        <a href="#playground">Playground</a>
+        <a href="#quick-start">Quick Start</a>
         <a href="#connectors">Connectors</a>
-        <a href="#features">Features</a>
         <a href="#comparison">Comparison</a>
+        <a href="#status">Status</a>
         <a href="https://laminardb.io/api/laminar_db/" target="_blank" rel="noopener">API Docs</a>
-        <a href="https://github.com/laminardb/laminardb" class="btn btn-secondary" target="_blank" rel="noopener">GitHub</a>
-        <a href="#get-started" class="btn btn-primary">Get Started</a>
+        <a href="https://github.com/laminardb/laminardb" target="_blank" rel="noopener">GitHub</a>
       </div>
     </div>
   </header>
 
   <main>
-    <!-- ======== Hero ======== -->
+
+    <!-- Hero -->
     <section class="hero" id="hero">
-      <div class="hero-glow" aria-hidden="true"></div>
-      <div class="hero-grid" aria-hidden="true"></div>
-      <div class="hero-particles" aria-hidden="true"></div>
-
-      <div class="hero-content">
-        <a href="https://github.com/laminardb/laminardb/releases" class="hero-eyebrow" target="_blank" rel="noopener">
-          <span class="eyebrow-badge">v0.18</span>
-          <span>Delta Lake, checkpoint barriers, and 189 features shipped</span>
-          <span class="eyebrow-arrow">&rarr;</span>
-        </a>
-
-        <h1>
-          <span class="gradient-text">Embedded Streaming Database.</span><br>
-          Sub-Microsecond SQL.
-        </h1>
-
-        <p class="hero-subtitle">
-          Replace Kafka + Flink + a database with one embedded engine.
-          Sub-microsecond SQL, minimal allocations, no JVM, no cluster &mdash; just
-          add a dependency and go.
+      <div class="container">
+        <h1 class="hero-tagline">The streaming engine that starts embedded</h1>
+        <p class="hero-desc">
+          Sub-microsecond SQL over event streams.
+          Embed in Rust or Python, run as a standalone server,
+          or scale to a cluster. No JVM.
         </p>
 
+        <div class="hero-install-group">
+          <div class="hero-install" role="button" tabindex="0" aria-label="Copy Rust install command">
+            <span class="prompt">$</span>
+            <span class="cmd">cargo add laminar-db</span>
+            <span class="copy-hint">copy</span>
+          </div>
+          <div class="hero-install" role="button" tabindex="0" aria-label="Copy Python install command">
+            <span class="prompt">$</span>
+            <span class="cmd">pip install laminardb</span>
+            <span class="copy-hint">copy</span>
+          </div>
+        </div>
+
         <div class="hero-actions">
-          <a href="#get-started" class="btn btn-primary btn-lg">Get Started &mdash; It's Free</a>
-          <a href="https://github.com/laminardb/laminardb" class="btn btn-secondary btn-lg" target="_blank" rel="noopener">
-            <svg width="16" height="16" viewBox="0 0 16 16" fill="currentColor"><path d="M8 0C3.58 0 0 3.58 0 8c0 3.54 2.29 6.53 5.47 7.59.4.07.55-.17.55-.38 0-.19-.01-.82-.01-1.49-2.01.37-2.53-.49-2.69-.94-.09-.23-.48-.94-.82-1.13-.28-.15-.68-.52-.01-.53.63-.01 1.08.58 1.23.82.72 1.21 1.87.87 2.33.66.07-.52.28-.87.51-1.07-1.78-.2-3.64-.89-3.64-3.95 0-.87.31-1.59.82-2.15-.08-.2-.36-1.02.08-2.12 0 0 .67-.21 2.2.82.64-.18 1.32-.27 2-.27.68 0 1.36.09 2 .27 1.53-1.04 2.2-.82 2.2-.82.44 1.1.16 1.92.08 2.12.51.56.82 1.27.82 2.15 0 3.07-1.87 3.75-3.65 3.95.29.25.54.73.54 1.48 0 1.07-.01 1.93-.01 2.2 0 .21.15.46.55.38A8.013 8.013 0 0016 8c0-4.42-3.58-8-8-8z"/></svg>
-            Star on GitHub
+          <a href="#quick-start" class="btn btn-primary">Quick Start</a>
+          <a href="https://github.com/laminardb/laminardb" class="btn btn-secondary" target="_blank" rel="noopener">
+            <svg viewBox="0 0 16 16"><path d="M8 0C3.58 0 0 3.58 0 8c0 3.54 2.29 6.53 5.47 7.59.4.07.55-.17.55-.38 0-.19-.01-.82-.01-1.49-2.01.37-2.53-.49-2.69-.94-.09-.23-.48-.94-.82-1.13-.28-.15-.68-.52-.01-.53.63-.01 1.08.58 1.23.82.72 1.21 1.87.87 2.33.66.07-.52.28-.87.51-1.07-1.78-.2-3.64-.89-3.64-3.95 0-.87.31-1.59.82-2.15-.08-.2-.36-1.02.08-2.12 0 0 .67-.21 2.2.82.64-.18 1.32-.27 2-.27.68 0 1.36.09 2 .27 1.53-1.04 2.2-.82 2.2-.82.44 1.1.16 1.92.08 2.12.51.56.82 1.27.82 2.15 0 3.07-1.87 3.75-3.65 3.95.29.25.54.73.54 1.48 0 1.07-.01 1.93-.01 2.2 0 .21.15.46.55.38A8.013 8.013 0 0016 8c0-4.42-3.58-8-8-8z"/></svg>
+            View on GitHub
           </a>
         </div>
 
-        <!-- Language toggle install snippet -->
-        <div class="hero-install-wrapper">
-          <div class="hero-install-tabs">
-            <button class="install-tab active" data-install="rust">Rust</button>
-            <button class="install-tab" data-install="python">Python</button>
-          </div>
-          <div class="hero-install" role="button" tabindex="0" aria-label="Copy install command" data-install-panel="rust">
-            <span class="prompt">$</span>
-            <span class="cmd">cargo add laminar-db</span>
-            <span class="copy-hint">Click to copy</span>
-          </div>
-          <div class="hero-install" role="button" tabindex="0" aria-label="Copy install command" data-install-panel="python" style="display: none;">
-            <span class="prompt">$</span>
-            <span class="cmd">pip install laminardb</span>
-            <span class="copy-hint">Click to copy</span>
+        <div class="hero-code">
+          <div class="code-block">
+            <div class="code-header">
+              <span style="font-family: var(--font-mono); font-size: 0.75rem; color: var(--text-dim);">main.rs</span>
+              <button class="copy-btn" aria-label="Copy code">
+                <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><rect x="9" y="9" width="13" height="13" rx="2"/><path d="M5 15H4a2 2 0 0 1-2-2V4a2 2 0 0 1 2-2h9a2 2 0 0 1 2 2v1"/></svg>
+                Copy
+              </button>
+            </div>
+            <div class="code-body">
+              <div class="tab-panel active">
+                <pre><code class="language-rust">let db = LaminarDB::open()?;
+
+db.execute("CREATE SOURCE trades (
+    symbol VARCHAR, price DOUBLE, volume BIGINT, ts BIGINT
+)").await?;
+
+db.execute("CREATE STREAM vwap AS
+    SELECT symbol,
+           SUM(price * CAST(volume AS DOUBLE))
+             / SUM(CAST(volume AS DOUBLE)) AS vwap
+    FROM trades
+    GROUP BY symbol, tumble(ts, INTERVAL '1' MINUTE)
+    EMIT ON WINDOW CLOSE
+").await?;
+
+db.start().await?;</code></pre>
+              </div>
+            </div>
           </div>
         </div>
 
@@ -215,455 +165,227 @@
           <div class="hero-metric">
             <div class="hero-metric-value">&lt;500<span class="unit">ns</span></div>
             <div class="hero-metric-label">state lookup p99</div>
+            <div class="hero-metric-source"><a href="https://github.com/laminardb/laminardb/blob/main/crates/laminar-core/benches/state_bench.rs" target="_blank" rel="noopener">state_bench.rs</a></div>
           </div>
           <div class="hero-metric">
-            <div class="hero-metric-value">2.24<span class="unit">M</span></div>
-            <div class="hero-metric-label">events/sec per core</div>
-          </div>
-          <div class="hero-metric">
-            <div class="hero-metric-value">189</div>
-            <div class="hero-metric-label">features shipped</div>
+            <div class="hero-metric-value">1M+<span class="unit">/s</span></div>
+            <div class="hero-metric-label">events per core</div>
+            <div class="hero-metric-source"><a href="https://github.com/laminardb/laminardb/blob/main/crates/laminar-core/benches/throughput_bench.rs" target="_blank" rel="noopener">throughput_bench.rs</a></div>
           </div>
           <div class="hero-metric">
             <div class="hero-metric-value">0</div>
-            <div class="hero-metric-label">allocations on hot path</div>
+            <div class="hero-metric-label">hot-path allocations</div>
+            <div class="hero-metric-source"><a href="https://github.com/laminardb/laminardb/blob/main/crates/laminar-core/tests/zero_alloc_integration.rs" target="_blank" rel="noopener">zero_alloc_integration.rs</a></div>
           </div>
         </div>
       </div>
     </section>
 
-    <!-- ======== Data Flow Playground ======== -->
-    <section class="playground-section" id="playground">
+    <!-- What It Is -->
+    <section id="what">
       <div class="container">
-        <div class="section-header text-center">
-          <div class="section-label reveal">Interactive</div>
-          <h2 class="section-title reveal">Data Flow <span class="gradient-text">Playground</span></h2>
-          <p class="section-desc centered reveal">
-            See how LaminarDB processes streaming data in real-time. Click operators to toggle, drag to rearrange.
+        <h2>What it is</h2>
+        <div class="text-block">
+          <p>
+            LaminarDB is a streaming SQL engine.
+            Write SQL queries over event streams &mdash; windows, joins, aggregations &mdash;
+            and the engine evaluates them continuously as events arrive.
+            Built on <a href="https://arrow.apache.org/" target="_blank" rel="noopener">Apache Arrow 57</a>
+            and <a href="https://datafusion.apache.org/" target="_blank" rel="noopener">DataFusion 52</a>.
+          </p>
+          <p>
+            <strong>Three deployment modes.</strong>
+            Embed it in your application &mdash; Rust (<code>cargo add laminar-db</code>) or Python (<code>pip install laminardb</code>).
+            Run it as a standalone server (<code>laminardb</code> binary) with Kafka, CDC, and Delta Lake connectors.
+            Or deploy as a cluster &mdash; distributed mode is coming soon.
+          </p>
+          <p>
+            It is not a message broker (it consumes from Kafka, doesn't replace it)
+            and it is not a general-purpose OLTP/OLAP database &mdash; it processes streams.
           </p>
         </div>
 
-        <div class="playground-container reveal">
-          <div class="playground-canvas-wrapper">
-            <div class="playground-presets">
-              <button class="preset-btn active" data-preset="fraud" aria-label="Switch to Fraud Detection pipeline">
-                <span class="preset-icon" aria-hidden="true">&#x1f6e1;&#xfe0f;</span>
-                <span>Fraud Detection</span>
-              </button>
-              <button class="preset-btn" data-preset="join" aria-label="Switch to Stream Join pipeline">
-                <span class="preset-icon" aria-hidden="true">&#x1f517;</span>
-                <span>Stream Join</span>
-              </button>
-              <button class="preset-btn" data-preset="asof" aria-label="Switch to ASOF Join pipeline">
-                <span class="preset-icon" aria-hidden="true">&#x23f1;&#xfe0f;</span>
-                <span>ASOF Join</span>
-              </button>
+        <div class="arch-rings">
+          <div class="ring ring-0">
+            <div class="ring-header">
+              <span class="ring-name">Ring 0 &mdash; Hot Path</span>
+              <span class="ring-constraint">&lt;500ns &middot; zero alloc &middot; no locks</span>
             </div>
-            <canvas id="playground-canvas" aria-label="Interactive data flow visualization showing particles flowing through streaming pipeline operators"></canvas>
-            <div class="playground-controls">
-              <div class="playground-controls-left">
-                <div class="playground-speed-control">
-                  <label for="playground-speed">Speed</label>
-                  <input type="range" id="playground-speed" min="0.2" max="3" step="0.1" value="1">
-                  <span class="playground-speed-value" id="playground-speed-label">1.0x</span>
-                </div>
-                <span class="playground-eps" id="playground-eps">0 events/sec</span>
-              </div>
-              <div class="playground-controls-right">
-                <button class="playground-add-btn" id="playground-add-event" aria-label="Inject five events into the pipeline">
-                  <svg viewBox="0 0 16 16" fill="none" stroke="currentColor" stroke-width="2"><line x1="8" y1="3" x2="8" y2="13"/><line x1="3" y1="8" x2="13" y2="8"/></svg>
-                  Add Events
-                </button>
-              </div>
+            <div class="ring-chips">
+              <span class="ring-chip">Reactor</span>
+              <span class="ring-chip">Operators</span>
+              <span class="ring-chip">State Store</span>
+              <span class="ring-chip">JIT</span>
             </div>
-            <div class="playground-hint">
-              <span><span class="playground-hint-dot"></span> <span class="hint-desktop">Click</span><span class="hint-touch">Tap</span> operators to toggle on/off</span>
-              <span><span class="playground-hint-dot"></span> Drag operators to rearrange</span>
-              <span class="hint-hover"><span class="playground-hint-dot"></span> Hover for details</span>
+          </div>
+          <div class="ring-divider">SPSC queues</div>
+          <div class="ring ring-1">
+            <div class="ring-header">
+              <span class="ring-name">Ring 1 &mdash; Background I/O</span>
+              <span class="ring-constraint">async &middot; bounded latency impact</span>
+            </div>
+            <div class="ring-chips">
+              <span class="ring-chip">WAL</span>
+              <span class="ring-chip">Checkpoints</span>
+              <span class="ring-chip">Connectors</span>
+              <span class="ring-chip">Recovery</span>
+            </div>
+          </div>
+          <div class="ring-divider">Bounded channels</div>
+          <div class="ring ring-2">
+            <div class="ring-header">
+              <span class="ring-name">Ring 2 &mdash; Control Plane</span>
+              <span class="ring-constraint">no latency requirements</span>
+            </div>
+            <div class="ring-chips">
+              <span class="ring-chip">REST API</span>
+              <span class="ring-chip">Metrics</span>
+              <span class="ring-chip">Config</span>
             </div>
           </div>
         </div>
       </div>
     </section>
 
-    <!-- Playground tooltip (positioned fixed, outside flow) -->
-    <div id="playground-tooltip" role="tooltip" aria-hidden="true">
-      <div class="playground-tooltip-title"></div>
-      <div class="playground-tooltip-desc"></div>
-    </div>
-
-    <!-- ======== Built With Strip ======== -->
-    <div class="tech-strip">
-      <div class="tech-strip-inner">
-        <div class="tech-badge">
-          <svg viewBox="0 0 24 24" fill="currentColor"><path d="M23.687 11.709l-.995-.959a1.397 1.397 0 0 1 0-1.922l.995-.96a.537.537 0 0 0-.161-.878l-1.281-.56a1.397 1.397 0 0 1-.735-1.727l.436-1.323a.537.537 0 0 0-.558-.707l-1.386.108a1.397 1.397 0 0 1-1.444-1.162l-.219-1.372a.537.537 0 0 0-.808-.399l-1.147.808a1.397 1.397 0 0 1-1.854-.274L8.07.068a.537.537 0 0 0-.89.099L5.949 1.58a1.397 1.397 0 0 1-1.709.694l-1.296-.461a.537.537 0 0 0-.72.548l.096 1.387a1.397 1.397 0 0 1-1.197 1.425l-1.377.192a.537.537 0 0 0-.417.799l.794 1.156a1.397 1.397 0 0 1-.308 1.848L-.14 8.11a.537.537 0 0 0 .087.89l1.171.752c.578.372.845 1.066.654 1.705l-.459 1.264a.537.537 0 0 0 .538.724l1.386-.13a1.397 1.397 0 0 1 1.465 1.128l.239 1.37a.537.537 0 0 0 .799.406l1.164-.787a1.397 1.397 0 0 1 1.851.239l.894.961a.537.537 0 0 0 .884-.115l.545-1.38a1.397 1.397 0 0 1 1.697-.732l1.308.425a.537.537 0 0 0 .729-.534l-.068-1.387a1.397 1.397 0 0 1 1.225-1.405l1.381-.165a.537.537 0 0 0 .43-.789l-.769-1.172a1.397 1.397 0 0 1 .343-1.84z"/></svg>
-          Built with <span class="tech-name">Rust</span>
-        </div>
-        <div class="tech-badge">
-          <svg viewBox="0 0 24 24" fill="currentColor"><path d="M12 2L2 7l10 5 10-5-10-5zM2 17l10 5 10-5M2 12l10 5 10-5"/></svg>
-          <span class="tech-name">Apache Arrow</span>
-        </div>
-        <div class="tech-badge">
-          <svg viewBox="0 0 24 24" fill="currentColor"><circle cx="12" cy="12" r="10"/></svg>
-          <span class="tech-name">DataFusion</span>
-        </div>
-        <div class="tech-badge">
-          <svg viewBox="0 0 24 24" fill="currentColor"><path d="M12 2a10 10 0 1 0 0 20 10 10 0 0 0 0-20z"/></svg>
-          <span class="tech-name">Cranelift JIT</span>
-        </div>
-        <div class="tech-badge">
-          <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><path d="M12 2C6.48 2 2 6.48 2 12s4.48 10 10 10 10-4.48 10-10S17.52 2 12 2z"/><path d="M12 6v6l4 2"/></svg>
-          <span class="tech-name">Python + Rust</span>
-        </div>
-        <div class="tech-badge">
-          Apache 2.0 License
-        </div>
-      </div>
-    </div>
-
-    <!-- ======== Why LaminarDB ======== -->
-    <section class="why-section" id="why">
+    <!-- Quick Start -->
+    <section id="quick-start">
       <div class="container">
-        <div class="section-header text-center">
-          <div class="section-label reveal">Why LaminarDB</div>
-          <h2 class="section-title reveal">Your streaming stack is <span class="gradient-text">too complex</span></h2>
-          <p class="section-desc centered reveal">
-            You shouldn't need Kafka, Flink, and a database just to aggregate a stream.
-            LaminarDB embeds a full streaming engine directly in your application &mdash;
-            one dependency, zero infrastructure.
-          </p>
-        </div>
+        <h2>Quick start</h2>
+        <p class="section-desc">Add the dependency and write your first streaming query.</p>
 
-        <div class="why-grid">
-          <div class="why-card reveal reveal-delay-1">
-            <div class="why-card-icon cyan">
-              <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><polyline points="13 2 3 14 12 14 11 22 21 10 12 10 13 2"/></svg>
+        <div class="code-block">
+          <div class="code-header">
+            <div class="code-tabs">
+              <button class="code-tab active" data-tab="qs-rust">Rust Library</button>
+              <button class="code-tab" data-tab="qs-sql">SQL Examples</button>
+              <button class="code-tab" data-tab="qs-server">Standalone Server</button>
+              <button class="code-tab" data-tab="qs-kafka">Kafka Pipeline</button>
             </div>
-            <h3>Sub-Microsecond Latency</h3>
-            <p>Minimal allocations on the hot path. No GC pauses, no JVM warmup, no serialization overhead. 325ns measured through a 3-node DAG pipeline.</p>
-            <span class="card-stat">325ns measured &bull; &lt;500ns p99</span>
+            <button class="copy-btn" aria-label="Copy code">
+              <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><rect x="9" y="9" width="13" height="13" rx="2"/><path d="M5 15H4a2 2 0 0 1-2-2V4a2 2 0 0 1 2-2h9a2 2 0 0 1 2 2v1"/></svg>
+              Copy
+            </button>
           </div>
+          <div class="code-body">
+            <div class="tab-panel active" id="qs-rust">
+              <pre><code class="language-rust">// Cargo.toml: laminar-db = "0.18", tokio = { version = "1", features = ["full"] }
 
-          <div class="why-card reveal reveal-delay-2">
-            <div class="why-card-icon violet">
-              <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><rect x="2" y="3" width="20" height="14" rx="2" ry="2"/><line x1="8" y1="21" x2="16" y2="21"/><line x1="12" y1="17" x2="12" y2="21"/></svg>
-            </div>
-            <h3>Zero Infrastructure</h3>
-            <p>Single binary, no cluster, no external dependencies. Embed in your application like SQLite. Add a dependency, not infrastructure.</p>
-            <span class="card-stat">cargo add laminar-db</span>
-          </div>
-
-          <div class="why-card reveal reveal-delay-3">
-            <div class="why-card-icon green">
-              <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><polyline points="16 18 22 12 16 6"/><polyline points="8 6 2 12 8 18"/></svg>
-            </div>
-            <h3>SQL You Already Know</h3>
-            <p>DataFusion-powered SQL with streaming extensions: TUMBLE, HOP, SESSION windows, ASOF/temporal/lookup joins, EMIT strategies, and 30+ aggregates.</p>
-            <span class="card-stat">DataFusion 52 + Arrow 57</span>
-          </div>
-
-          <div class="why-card reveal reveal-delay-4">
-            <div class="why-card-icon amber">
-              <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><path d="M12 22s8-4 8-10V5l-8-3-8 3v7c0 6 8 10 8 10z"/></svg>
-            </div>
-            <h3>Never Lose an Event</h3>
-            <p>Write-ahead log, full-state checkpointing, two-phase commit, and barrier-based coordination. Production-grade durability without a cluster.</p>
-            <span class="card-stat">WAL + 2PC + epoch tracking</span>
-          </div>
-        </div>
-      </div>
-    </section>
-
-    <!-- ======== Use Cases ======== -->
-    <section class="use-cases-section" id="use-cases">
-      <div class="container">
-        <div class="section-header text-center">
-          <div class="section-label reveal">Use Cases</div>
-          <h2 class="section-title reveal">Real-time stream processing <span class="gradient-text">use cases</span></h2>
-          <p class="section-desc centered reveal">
-            From fraud detection to live dashboards, LaminarDB powers real-time workloads
-            that used to require a distributed cluster.
-          </p>
-        </div>
-
-        <div class="use-cases-grid-v2">
-          <div class="use-case-card-v2 reveal reveal-delay-1">
-            <div class="use-case-card-icon" style="background: rgba(251,113,133,0.1); color: var(--rose-400);">
-              <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><path d="M12 22s8-4 8-10V5l-8-3-8 3v7c0 6 8 10 8 10z"/><path d="M12 8v4"/><path d="M12 16h.01"/></svg>
-            </div>
-            <h3>Real-Time Fraud Detection</h3>
-            <p>Detect suspicious patterns in payment streams with sub-microsecond windowed aggregations. Flag anomalies before the transaction completes.</p>
-            <a href="#code" class="use-case-link">See example code <span>&rarr;</span></a>
-          </div>
-
-          <div class="use-case-card-v2 reveal reveal-delay-2">
-            <div class="use-case-card-icon" style="background: rgba(74,222,128,0.1); color: var(--green-400);">
-              <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><path d="M22 11.08V12a10 10 0 1 1-5.93-9.14"/><polyline points="22 4 12 14.01 9 11.01"/></svg>
-            </div>
-            <h3>IoT Analytics at the Edge</h3>
-            <p>Process millions of sensor readings per second with exactly-once guarantees. Runs embedded on a single machine, no cloud dependency required.</p>
-            <a href="#architecture" class="use-case-link">Explore architecture <span>&rarr;</span></a>
-          </div>
-
-          <div class="use-case-card-v2 reveal reveal-delay-3">
-            <div class="use-case-card-icon" style="background: rgba(6,182,212,0.1); color: var(--cyan-400);">
-              <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><path d="M18 20V10M12 20V4M6 20v-6"/></svg>
-            </div>
-            <h3>Live Dashboards</h3>
-            <p>Power real-time dashboards with continuous SQL queries over streaming data. WebSocket sinks push updates the instant they happen.</p>
-            <a href="#connectors" class="use-case-link">View connectors <span>&rarr;</span></a>
-          </div>
-
-          <div class="use-case-card-v2 reveal reveal-delay-4">
-            <div class="use-case-card-icon" style="background: rgba(139,92,246,0.1); color: var(--violet-400);">
-              <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><polyline points="16 18 22 12 16 6"/><polyline points="8 6 2 12 8 18"/></svg>
-            </div>
-            <h3>Event-Driven Microservices</h3>
-            <p>Replace complex event choreography with declarative SQL pipelines. CDC connectors keep your services in sync without custom integration code.</p>
-            <a href="#code" class="use-case-link">See CDC example <span>&rarr;</span></a>
-          </div>
-        </div>
-      </div>
-    </section>
-
-    <!-- ======== Performance ======== -->
-    <section class="perf-section" id="performance">
-      <div class="container">
-        <div class="section-header text-center">
-          <div class="section-label reveal">Performance</div>
-          <h2 class="section-title reveal">Streaming database <span class="gradient-text">benchmarks</span></h2>
-          <p class="section-desc centered reveal">
-            Criterion benchmarks from <code>cargo bench</code>. Thread-per-core architecture
-            with CPU pinning, lock-free SPSC queues, and arena allocators.
-          </p>
-        </div>
-
-        <div class="perf-grid">
-          <div class="perf-card reveal reveal-delay-1">
-            <div class="perf-value">&lt;500ns</div>
-            <div class="perf-label">State lookup p99</div>
-            <div class="perf-sublabel">AHashMap, cache-aligned</div>
-          </div>
-          <div class="perf-card reveal reveal-delay-2">
-            <div class="perf-value">2.24M</div>
-            <div class="perf-label">Events/sec per core</div>
-            <div class="perf-sublabel">linear pipeline</div>
-          </div>
-          <div class="perf-card reveal reveal-delay-3">
-            <div class="perf-value">325ns</div>
-            <div class="perf-label">3-node DAG latency</div>
-            <div class="perf-sublabel">routing + state + emit</div>
-          </div>
-          <div class="perf-card reveal reveal-delay-4">
-            <div class="perf-value">4.8ns</div>
-            <div class="perf-label">SPSC queue operation</div>
-            <div class="perf-sublabel">lock-free, minimal-alloc</div>
-          </div>
-        </div>
-      </div>
-    </section>
-
-    <!-- ======== Code Examples ======== -->
-    <section class="code-section" id="code">
-      <div class="container">
-        <div class="section-header text-center">
-          <div class="section-label reveal">Code</div>
-          <h2 class="section-title reveal">Write SQL, get <span class="gradient-text">real-time results</span></h2>
-          <p class="section-desc centered reveal">
-            Streaming SQL, real-time joins, CDC pipelines, and lakehouse sinks &mdash; all from a single binary.
-          </p>
-        </div>
-
-        <div class="code-container reveal">
-          <div class="code-block">
-            <div class="code-header">
-              <div class="tab-buttons">
-                <button class="tab-btn active" data-tab="tab-rust">Rust API</button>
-                <button class="tab-btn" data-tab="tab-sql">Streaming SQL</button>
-                <button class="tab-btn" data-tab="tab-python">Python</button>
-                <button class="tab-btn" data-tab="tab-kafka">Kafka Pipeline</button>
-                <button class="tab-btn" data-tab="tab-joins">Stream Joins</button>
-                <button class="tab-btn" data-tab="tab-cdc">CDC</button>
-              </div>
-              <div class="code-actions">
-                <button class="copy-btn" aria-label="Copy code">
-                  <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><rect x="9" y="9" width="13" height="13" rx="2" ry="2"/><path d="M5 15H4a2 2 0 0 1-2-2V4a2 2 0 0 1 2-2h9a2 2 0 0 1 2 2v1"/></svg>
-                  Copy
-                </button>
-              </div>
-            </div>
-
-            <div class="tab-panel active" id="tab-rust">
-              <pre><code class="language-rust">use laminar_db::LaminarDB;
-use laminar_derive::{Record, FromRow};
-
-#[derive(Record)]
-struct Trade {
-    symbol: String,
-    price: f64,
-    volume: i64,
-    #[event_time]
-    ts: i64,
-}
-
-#[derive(FromRow)]
-struct OhlcBar {
-    symbol: String,
-    window_start: i64,
-    open: f64,
-    high: f64,
-    low: f64,
-    close: f64,
-    volume: i64,
-}
+use laminar_db::LaminarDB;
 
 #[tokio::main]
-async fn main() -> Result&lt;(), Box&lt;dyn std::error::Error&gt;&gt; {
+async fn main() -&gt; anyhow::Result&lt;()&gt; {
     let db = LaminarDB::open()?;
 
-    db.execute("CREATE SOURCE trades (
-        symbol VARCHAR, price DOUBLE, volume BIGINT, ts BIGINT
+    db.execute("CREATE SOURCE events (
+        key VARCHAR, value DOUBLE, ts BIGINT
     )").await?;
 
-    db.execute("CREATE STREAM ohlc_1m AS
-        SELECT symbol,
-               CAST(tumble(ts, INTERVAL '1' MINUTE) AS BIGINT) AS window_start,
-               first_value(price) AS open,
-               MAX(price) AS high, MIN(price) AS low,
-               last_value(price) AS close,
-               SUM(volume) AS volume
-        FROM trades
-        GROUP BY symbol, tumble(ts, INTERVAL '1' MINUTE)
+    db.execute("CREATE STREAM summary AS
+        SELECT key, COUNT(*) AS total, AVG(value) AS avg
+        FROM events
+        GROUP BY key, tumble(ts, INTERVAL '1' MINUTE)
         EMIT ON WINDOW CLOSE
     ").await?;
 
-    let source = db.source::&lt;Trade&gt;("trades")?;
-    let sub = db.subscribe::&lt;OhlcBar&gt;("ohlc_1m")?;
-
     db.start().await?;
 
-    // Push events and consume results
-    source.push(Trade { symbol: "AAPL".into(), price: 150.0, volume: 100, ts: 1700000000000 });
-    source.watermark(1700000060000); // Advance past window boundary
+    // Push events into the source (typed via derive macro)
+    let source = db.source::&lt;Event&gt;("events")?;
+    source.push(Event { key: "sensor-1".into(), value: 42.0, ts: 1700000000000 });
 
-    while let Some(bars) = sub.poll() {
-        for bar in &amp;bars {
-            println!("{}: O={:.2} H={:.2} L={:.2} C={:.2}", bar.symbol, bar.open, bar.high, bar.low, bar.close);
+    // Subscribe to streaming results
+    let sub = db.subscribe::&lt;Summary&gt;("summary")?;
+    while let Some(rows) = sub.poll() {
+        for row in &amp;rows {
+            println!("{}: count={}, avg={:.2}", row.key, row.total, row.avg);
         }
     }
+
     Ok(())
 }</code></pre>
             </div>
 
-            <div class="tab-panel" id="tab-sql">
-              <pre><code class="language-sql">-- Real-time OHLC bars with tumbling windows
+            <div class="tab-panel" id="qs-sql">
+              <pre><code class="language-sql">-- Tumbling window: 1-minute OHLC bars
 CREATE STREAM ohlc_1m AS
 SELECT symbol,
-       CAST(tumble(ts, INTERVAL '1' MINUTE) AS BIGINT) AS window_start,
        first_value(price) AS open,
-       MAX(price) AS high,
-       MIN(price) AS low,
+       MAX(price) AS high, MIN(price) AS low,
        last_value(price) AS close,
        SUM(volume) AS volume
 FROM trades
 GROUP BY symbol, tumble(ts, INTERVAL '1' MINUTE)
 EMIT ON WINDOW CLOSE;
 
--- Cascading MV: roll up 1-minute bars to 1-hour bars
-CREATE MATERIALIZED VIEW ohlc_1h AS
-SELECT symbol,
-       first_value(open) AS open,
-       MAX(high) AS high,
-       MIN(low) AS low,
-       last_value(close) AS close
-FROM ohlc_1m
-GROUP BY symbol, tumble(window_start, INTERVAL '1' HOUR);
-
--- Session windows: detect activity bursts
-CREATE STREAM user_sessions AS
-SELECT user_id,
-       COUNT(*) AS clicks,
+-- Session window: detect activity bursts
+CREATE STREAM sessions AS
+SELECT user_id, COUNT(*) AS clicks,
        MAX(ts) - MIN(ts) AS duration_ms
 FROM clickstream
 GROUP BY user_id, session(ts, INTERVAL '30' SECOND)
 EMIT ON WINDOW CLOSE;
 
--- Hopping windows: rolling 10-second average
-CREATE STREAM rolling_avg AS
-SELECT symbol,
-       AVG(price) AS avg_price,
-       SUM(volume) AS total_volume
-FROM trades
-GROUP BY symbol, HOP(ts, INTERVAL '2' SECOND, INTERVAL '10' SECOND);</code></pre>
+-- ASOF join: enrich trades with closest preceding quote
+SELECT t.symbol, t.price, q.bid, q.ask,
+       t.price - q.bid AS spread
+FROM trades t
+ASOF JOIN quotes q
+    ON t.symbol = q.symbol AND t.ts &gt;= q.ts;
+
+-- Stream-stream join with time bounds
+CREATE STREAM matched AS
+SELECT t.symbol, t.price, o.order_id
+FROM trades t
+INNER JOIN orders o ON t.symbol = o.symbol
+    AND o.ts BETWEEN t.ts - 10000 AND t.ts + 10000;</code></pre>
             </div>
 
-            <div class="tab-panel" id="tab-python">
-              <pre><code class="language-python">import laminardb
-import pyarrow as pa
+            <div class="tab-panel" id="qs-server">
+              <pre><code class="language-bash"># Install the standalone server
+cargo install laminar-server
 
-# Open an in-memory streaming database
-db = laminardb.open()
+# Run with a config file (see examples/ directory)
+laminardb --config laminardb.toml
 
-# Define source and streaming query
-db.execute("""CREATE SOURCE trades (
-    symbol VARCHAR, price DOUBLE, volume BIGINT, ts BIGINT
-)""")
+# Or run with Docker
+docker compose up
 
-db.execute("""CREATE STREAM vwap AS
-    SELECT symbol,
-           SUM(price * CAST(volume AS DOUBLE)) / SUM(CAST(volume AS DOUBLE)) AS vwap,
-           COUNT(*) AS trade_count
-    FROM trades
-    GROUP BY symbol, tumble(ts, INTERVAL '1' MINUTE)
-    EMIT ON WINDOW CLOSE
-""")
+# Docker Compose includes:
+#   - laminardb (port 8080)
+#   - Redpanda/Kafka (port 19092)
+#   - Schema Registry (port 18081)
+#   - Prometheus + Grafana (optional)
 
-db.start()
-
-# Insert data (dict or PyArrow RecordBatch -- zero-copy)
-db.insert("trades", {
-    "symbol": "AAPL", "price": 150.25,
-    "volume": 100, "ts": 1700000000000
-})
-
-# Query results as PyArrow Table
-result = db.query("SELECT * FROM vwap")
-print(result.to_pandas())
-
-# Subscribe for streaming updates
-sub = db.subscribe("vwap")
-for batch in sub:
-    print(batch.to_pandas())
-
-# pip install laminardb</code></pre>
+# Example configs in the repo:
+#   examples/laminardb.toml          — full config
+#   examples/laminardb-minimal.toml  — minimal
+#   examples/laminardb-delta.toml    — Delta Lake</code></pre>
             </div>
 
-            <div class="tab-panel" id="tab-kafka">
-              <pre><code class="language-sql">-- Kafka source with SASL/SSL and Schema Registry
+            <div class="tab-panel" id="qs-kafka">
+              <pre><code class="language-sql">-- Kafka source with Avro and Schema Registry
 CREATE SOURCE trades (
     symbol VARCHAR, price DOUBLE, volume BIGINT, ts BIGINT
 ) FROM KAFKA (
-    brokers = '${KAFKA_BROKERS}',
+    brokers = 'localhost:9092',
     topic = 'market-trades',
     group_id = 'laminar-analytics',
     format = 'avro',
-    schema.registry.url = 'http://schema-registry:8081',
-    offset_reset = 'earliest'
+    schema.registry.url = 'http://schema-registry:8081'
 );
 
 -- Real-time aggregation
 CREATE STREAM trade_summary AS
-SELECT symbol,
-       COUNT(*) AS trades,
-       SUM(price * CAST(volume AS DOUBLE)) AS notional,
-       AVG(price) AS avg_price
+SELECT symbol, COUNT(*) AS trades,
+       AVG(price) AS avg_price,
+       SUM(volume) AS total_volume
 FROM trades
 GROUP BY symbol, tumble(ts, INTERVAL '1' MINUTE)
 EMIT ON WINDOW CLOSE;
 
 -- Kafka sink with exactly-once delivery
 CREATE SINK output INTO KAFKA (
-    brokers = '${KAFKA_BROKERS}',
+    brokers = 'localhost:9092',
     topic = 'trade-summaries',
     format = 'json',
     delivery.guarantee = 'exactly-once'
@@ -676,693 +398,438 @@ CREATE SINK lake INTO DELTA_LAKE (
     delivery.guarantee = 'exactly-once'
 ) AS SELECT * FROM trade_summary;</code></pre>
             </div>
-
-            <div class="tab-panel" id="tab-joins">
-              <pre><code class="language-sql">-- ASOF JOIN: enrich trades with closest preceding quote
-SELECT t.symbol,
-       t.price AS trade_price,
-       t.volume,
-       q.bid, q.ask,
-       t.price - q.bid AS spread
-FROM trades t
-ASOF JOIN quotes q
-    ON t.symbol = q.symbol
-    AND t.ts >= q.ts;
-
--- Stream-stream join with time bounds
-CREATE STREAM enriched_orders AS
-SELECT t.symbol,
-       t.price AS trade_price,
-       o.order_id, o.account_id,
-       t.price - o.price AS price_diff
-FROM trades t
-INNER JOIN orders o
-    ON t.symbol = o.symbol
-    AND o.ts BETWEEN t.ts - 10000 AND t.ts + 10000;
-
--- Lookup join against a reference table
-CREATE LOOKUP TABLE instruments FROM POSTGRES (
-    hostname = 'db.example.com', port = '5432',
-    database = 'market', query = 'SELECT * FROM instruments'
-);
-
-SELECT t.symbol, t.price, i.sector, i.exchange
-FROM trades t
-JOIN instruments i ON t.symbol = i.symbol;</code></pre>
-            </div>
-
-            <div class="tab-panel" id="tab-cdc">
-              <pre><code class="language-sql">-- PostgreSQL CDC via logical replication
-CREATE SOURCE orders_cdc (
-    id INT, customer_id INT, amount DOUBLE,
-    status VARCHAR, ts BIGINT
-) FROM POSTGRES_CDC (
-    hostname = 'db.example.com',
-    port = '5432',
-    database = 'shop',
-    slot.name = 'laminar_orders',
-    publication = 'laminar_pub'
-);
-
--- MySQL CDC via binlog
-CREATE SOURCE products_cdc (
-    id INT, name VARCHAR, price DOUBLE, updated_at BIGINT
-) FROM MYSQL_CDC (
-    hostname = 'mysql.example.com',
-    port = '3306',
-    database = 'inventory',
-    table = 'products',
-    server_id = '12345'
-);
-
--- Aggregate CDC changes with Z-set changelog
-CREATE STREAM customer_totals AS
-SELECT customer_id,
-       COUNT(*) AS total_orders,
-       SUM(amount) AS total_spent
-FROM orders_cdc
-WHERE _op IN ('I', 'U')
-GROUP BY customer_id
-EMIT CHANGES;</code></pre>
-            </div>
-          </div>
-        </div>
-      </div>
-    </section>
-
-    <!-- ======== Python API ======== -->
-    <section class="python-section" id="python">
-      <div class="container">
-        <div class="section-header text-center">
-          <div class="section-label reveal">Python</div>
-          <h2 class="section-title reveal">First-class <span class="gradient-text">Python</span> support</h2>
-          <p class="section-desc centered reveal">
-            Use LaminarDB from Python with a Pythonic API.
-            No Rust knowledge required. Same engine, same performance.
-          </p>
-        </div>
-
-        <div class="python-showcase reveal">
-          <div class="python-code-side">
-            <div class="code-block">
-              <div class="code-header">
-                <div class="tab-buttons">
-                  <button class="tab-btn active" style="cursor: default;">python</button>
-                </div>
-                <div class="code-actions">
-                  <button class="copy-btn" aria-label="Copy code">
-                    <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><rect x="9" y="9" width="13" height="13" rx="2" ry="2"/><path d="M5 15H4a2 2 0 0 1-2-2V4a2 2 0 0 1 2-2h9a2 2 0 0 1 2 2v1"/></svg>
-                    Copy
-                  </button>
-                </div>
-              </div>
-              <div class="tab-panel active" id="tab-python-showcase">
-                <pre><code class="language-python">from laminardb import Pipeline, KafkaSource, DeltaSink
-
-pipeline = Pipeline()
-
-# Define a streaming SQL query
-pipeline.sql("""
-    SELECT
-        user_id,
-        COUNT(*) as event_count,
-        SUM(amount) as total_amount
-    FROM TUMBLE(payments, interval '1 minute')
-    GROUP BY user_id
-    HAVING total_amount > 10000
-""")
-
-# Connect source and sink
-pipeline.source(KafkaSource(
-    "payments",
-    broker="localhost:9092"
-))
-pipeline.sink(DeltaSink(
-    "s3://warehouse/fraud_alerts"
-))
-
-# Run the pipeline
-pipeline.run()</code></pre>
-              </div>
-            </div>
-          </div>
-
-          <div class="python-features-side">
-            <div class="python-feature">
-              <div class="python-feature-icon">
-                <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round"><polyline points="13 2 3 14 12 14 11 22 21 10 12 10 13 2"/></svg>
-              </div>
-              <div>
-                <h4>Zero-Copy Data Sharing</h4>
-                <p>Arrow memory is shared directly between the Rust engine and Python. No serialization, no copies, no overhead.</p>
-              </div>
-            </div>
-            <div class="python-feature">
-              <div class="python-feature-icon">
-                <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round"><path d="M12 2L2 7l10 5 10-5-10-5zM2 17l10 5 10-5M2 12l10 5 10-5"/></svg>
-              </div>
-              <div>
-                <h4>Native PyArrow Integration</h4>
-                <p>Query results arrive as PyArrow Tables. Works directly with pandas, Polars, DuckDB, and the rest of the PyData stack.</p>
-              </div>
-            </div>
-            <div class="python-feature">
-              <div class="python-feature-icon">
-                <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round"><rect x="2" y="3" width="20" height="14" rx="2" ry="2"/><line x1="8" y1="21" x2="16" y2="21"/><line x1="12" y1="17" x2="12" y2="21"/></svg>
-              </div>
-              <div>
-                <h4>Jupyter Notebook Support</h4>
-                <p>Prototype streaming queries interactively. Push data, inspect results, and iterate in real time from a notebook cell.</p>
-              </div>
-            </div>
-            <div class="python-feature">
-              <div class="python-feature-icon">
-                <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round"><path d="M17 21v-2a4 4 0 0 0-4-4H5a4 4 0 0 0-4 4v2"/><circle cx="9" cy="7" r="4"/><path d="M23 21v-2a4 4 0 0 0-3-3.87"/><path d="M16 3.13a4 4 0 0 1 0 7.75"/></svg>
-              </div>
-              <div>
-                <h4>Async/Await Compatible</h4>
-                <p>Full asyncio support for non-blocking pipelines. Works natively with FastAPI, Starlette, and modern async Python.</p>
-              </div>
-            </div>
           </div>
         </div>
 
-        <div class="python-install-cta reveal">
-          <div class="hero-install" role="button" tabindex="0" aria-label="Copy install command">
-            <span class="prompt">$</span>
-            <span class="cmd">pip install laminardb</span>
-            <span class="copy-hint">Click to copy</span>
-          </div>
-        </div>
-      </div>
-    </section>
-
-    <!-- ======== Architecture ======== -->
-    <section class="arch-section" id="architecture">
-      <div class="container">
-        <div class="section-header text-center">
-          <div class="section-label reveal">Architecture</div>
-          <h2 class="section-title reveal">Three-ring <span class="gradient-text">isolation</span></h2>
-          <p class="section-desc centered reveal">
-            Strict separation between the hot path, background I/O, and control plane.
-            Each ring has its own latency budget and allocation policy.
-          </p>
-        </div>
-
-        <div class="arch-visual reveal">
-          <div class="ring-layer ring-0">
-            <div class="ring-label">
-              <span class="ring-name">Ring 0 &mdash; Hot Path</span>
-              <span class="ring-constraint">&lt; 500ns &middot; minimal alloc &middot; no locks</span>
-            </div>
-            <div class="ring-chips">
-              <span class="ring-chip">Reactor Loop</span>
-              <span class="ring-chip">DAG Executor</span>
-              <span class="ring-chip">State Store</span>
-              <span class="ring-chip">Window Ops</span>
-              <span class="ring-chip">Join Ops</span>
-              <span class="ring-chip">JIT Compiler</span>
-            </div>
-          </div>
-
-          <div class="ring-divider"><span>SPSC Queues (~4.8ns)</span></div>
-
-          <div class="ring-layer ring-1">
-            <div class="ring-label">
-              <span class="ring-name">Ring 1 &mdash; Background</span>
-              <span class="ring-constraint">async I/O &middot; bounded latency impact</span>
-            </div>
-            <div class="ring-chips">
-              <span class="ring-chip">Per-Core WAL</span>
-              <span class="ring-chip">Checkpointing</span>
-              <span class="ring-chip">Connectors</span>
-              <span class="ring-chip">io_uring</span>
-              <span class="ring-chip">Recovery</span>
-            </div>
-          </div>
-
-          <div class="ring-divider"><span>Bounded Channels</span></div>
-
-          <div class="ring-layer ring-2">
-            <div class="ring-label">
-              <span class="ring-name">Ring 2 &mdash; Control Plane</span>
-              <span class="ring-constraint">full flexibility &middot; no latency requirements</span>
-            </div>
-            <div class="ring-chips">
-              <span class="ring-chip">Admin API</span>
-              <span class="ring-chip">Metrics</span>
-              <span class="ring-chip">Auth</span>
-              <span class="ring-chip">Config</span>
-            </div>
-          </div>
-        </div>
-
-        <div class="arch-details reveal">
-          <div class="arch-detail">
-            <div class="arch-detail-icon">
-              <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><circle cx="12" cy="12" r="3"/><path d="M19.4 15a1.65 1.65 0 0 0 .33 1.82l.06.06a2 2 0 0 1 0 2.83 2 2 0 0 1-2.83 0l-.06-.06a1.65 1.65 0 0 0-1.82-.33 1.65 1.65 0 0 0-1 1.51V21a2 2 0 0 1-2 2 2 2 0 0 1-2-2v-.09A1.65 1.65 0 0 0 9 19.4a1.65 1.65 0 0 0-1.82.33l-.06.06a2 2 0 0 1-2.83 0 2 2 0 0 1 0-2.83l.06-.06A1.65 1.65 0 0 0 4.68 15a1.65 1.65 0 0 0-1.51-1H3a2 2 0 0 1-2-2 2 2 0 0 1 2-2h.09A1.65 1.65 0 0 0 4.6 9a1.65 1.65 0 0 0-.33-1.82l-.06-.06a2 2 0 0 1 0-2.83 2 2 0 0 1 2.83 0l.06.06A1.65 1.65 0 0 0 9 4.68a1.65 1.65 0 0 0 1-1.51V3a2 2 0 0 1 2-2 2 2 0 0 1 2 2v.09a1.65 1.65 0 0 0 1 1.51 1.65 1.65 0 0 0 1.82-.33l.06-.06a2 2 0 0 1 2.83 0 2 2 0 0 1 0 2.83l-.06.06A1.65 1.65 0 0 0 19.4 9a1.65 1.65 0 0 0 1.51 1H21a2 2 0 0 1 2 2 2 2 0 0 1-2 2h-.09a1.65 1.65 0 0 0-1.51 1z"/></svg>
-            </div>
-            <h4>Thread-per-Core</h4>
-            <p>Each CPU core runs its own reactor, state store, and WAL segment. No cross-core locks. NUMA-aware memory allocation.</p>
-          </div>
-          <div class="arch-detail">
-            <div class="arch-detail-icon">
-              <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><path d="M22 11.08V12a10 10 0 1 1-5.93-9.14"/><polyline points="22 4 12 14.01 9 11.01"/></svg>
-            </div>
-            <h4>Exactly-Once Delivery</h4>
-            <p>Barrier-based checkpoints, two-phase commit, and epoch-aligned sinks ensure exactly-once semantics end-to-end.</p>
-          </div>
-          <div class="arch-detail">
-            <div class="arch-detail-icon">
-              <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><polyline points="22 12 18 12 15 21 9 3 6 12 2 12"/></svg>
-            </div>
-            <h4>Adaptive JIT</h4>
-            <p>Cranelift compiles SQL plans to native code in the background. Hot-swaps from interpreted to compiled with zero downtime.</p>
-          </div>
-        </div>
-      </div>
-    </section>
-
-    <!-- ======== Connectors ======== -->
-    <section class="connectors-section" id="connectors">
-      <div class="container">
-        <div class="section-header text-center">
-          <div class="section-label reveal">Connectors</div>
-          <h2 class="section-title reveal">Data source and sink <span class="gradient-text">connectors</span></h2>
-          <p class="section-desc centered reveal">
-            Feature-gated connectors with exactly-once semantics via two-phase commit.
-            Build custom connectors with the SDK.
-          </p>
-        </div>
-
-        <div class="connectors-grid reveal">
-          <div class="connector-card">
-            <div class="connector-icon kafka">K</div>
-            <div class="connector-name">Kafka</div>
-            <div class="connector-type">Source + Sink</div>
-            <span class="connector-badge impl">Implemented</span>
-          </div>
-          <div class="connector-card">
-            <div class="connector-icon postgres">P</div>
-            <div class="connector-name">PostgreSQL CDC</div>
-            <div class="connector-type">Source</div>
-            <span class="connector-badge impl">Implemented</span>
-          </div>
-          <div class="connector-card">
-            <div class="connector-icon postgres">P</div>
-            <div class="connector-name">PostgreSQL</div>
-            <div class="connector-type">Sink</div>
-            <span class="connector-badge impl">Implemented</span>
-          </div>
-          <div class="connector-card">
-            <div class="connector-icon mysql">M</div>
-            <div class="connector-name">MySQL CDC</div>
-            <div class="connector-type">Source</div>
-            <span class="connector-badge impl">Implemented</span>
-          </div>
-          <div class="connector-card">
-            <div class="connector-icon delta">D</div>
-            <div class="connector-name">Delta Lake</div>
-            <div class="connector-type">Source + Sink</div>
-            <span class="connector-badge impl">Implemented</span>
-          </div>
-          <div class="connector-card">
-            <div class="connector-icon iceberg">F</div>
-            <div class="connector-name">File Sources</div>
-            <div class="connector-type">Sink</div>
-            <span class="connector-badge impl">Implemented</span>
-          </div>
-          <div class="connector-card">
-            <div class="connector-icon websocket">W</div>
-            <div class="connector-name">WebSocket</div>
-            <div class="connector-type">Source + Sink</div>
-            <span class="connector-badge impl">Implemented</span>
-          </div>
-          <div class="connector-card" style="opacity: 0.5;">
-            <div class="connector-icon" style="background: rgba(148,163,184,0.06); color: var(--text-muted);">+</div>
-            <div class="connector-name" style="color: var(--text-muted);">Custom</div>
-            <div class="connector-type">Connector SDK</div>
-          </div>
-        </div>
-      </div>
-    </section>
-
-    <!-- ======== Features ======== -->
-    <section class="features-section" id="features">
-      <div class="container">
-        <div class="section-header text-center">
-          <div class="section-label reveal">Features</div>
-          <h2 class="section-title reveal">189 features. <span class="gradient-text">76% complete.</span></h2>
-          <p class="section-desc centered reveal">
-            From core engine primitives to distributed delta mode. Every feature is specified,
-            implemented, and tested.
-          </p>
-        </div>
-
-        <div class="features-grid">
-          <div class="feature-card reveal reveal-delay-1">
-            <div class="feature-card-icon" style="background: var(--cyan-glow); color: var(--cyan-400);">
-              <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" width="18" height="18"><circle cx="12" cy="12" r="10"/><path d="M12 6v6l4 2"/></svg>
-            </div>
-            <h3>Window Functions</h3>
-            <p>Tumbling, sliding, hopping, and session windows with configurable EMIT strategies and merge support.</p>
-          </div>
-          <div class="feature-card reveal reveal-delay-2">
-            <div class="feature-card-icon" style="background: var(--violet-glow); color: var(--violet-400);">
-              <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" width="18" height="18"><path d="M18 20V10M12 20V4M6 20v-6"/></svg>
-            </div>
-            <h3>Stream Joins</h3>
-            <p>Stream-stream, ASOF, temporal, and lookup joins with time bounds and foyer-cached dimension tables.</p>
-          </div>
-          <div class="feature-card reveal reveal-delay-3">
-            <div class="feature-card-icon" style="background: rgba(251,191,36,0.1); color: var(--amber-400);">
-              <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" width="18" height="18"><path d="M4 4h16v16H4z"/><path d="M4 12h16M12 4v16"/></svg>
-            </div>
-            <h3>JIT Compilation</h3>
-            <p>Cranelift compiles SQL plans to native x86/ARM code. Adaptive warmup with zero-downtime hot-swap.</p>
-          </div>
-          <div class="feature-card reveal reveal-delay-4">
-            <div class="feature-card-icon" style="background: rgba(74,222,128,0.1); color: var(--green-400);">
-              <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" width="18" height="18"><path d="M12 22s8-4 8-10V5l-8-3-8 3v7c0 6 8 10 8 10z"/></svg>
-            </div>
-            <h3>Checkpointing</h3>
-            <p>Per-core WAL, barrier-based checkpoints, and full state recovery.</p>
-          </div>
-          <div class="feature-card reveal reveal-delay-5">
-            <div class="feature-card-icon" style="background: rgba(251,113,133,0.1); color: var(--rose-400);">
-              <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" width="18" height="18"><path d="M2 3h6a4 4 0 0 1 4 4v14a3 3 0 0 0-3-3H2z"/><path d="M22 3h-6a4 4 0 0 0-4 4v14a3 3 0 0 1 3-3h7z"/></svg>
-            </div>
-            <h3>Schema Framework</h3>
-            <p>Pluggable format decoders (JSON, CSV, Avro, Parquet), schema inference, evolution, and dead letter queues.</p>
-          </div>
-          <div class="feature-card reveal reveal-delay-6">
-            <div class="feature-card-icon" style="background: var(--cyan-glow); color: var(--cyan-400);">
-              <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" width="18" height="18"><circle cx="12" cy="12" r="10"/><line x1="2" y1="12" x2="22" y2="12"/><path d="M12 2a15.3 15.3 0 0 1 4 10 15.3 15.3 0 0 1-4 10 15.3 15.3 0 0 1-4-10 15.3 15.3 0 0 1 4-10z"/></svg>
-            </div>
-            <h3>Distributed Mode</h3>
-            <p>Gossip discovery, Raft consensus, epoch-fenced partitions, and cross-node gRPC. Delta architecture.</p>
-          </div>
-        </div>
-      </div>
-    </section>
-
-    <!-- ======== Comparison ======== -->
-    <section class="comparison-section" id="comparison">
-      <div class="container">
-        <div class="section-header text-center">
-          <div class="section-label reveal">Comparison</div>
-          <h2 class="section-title reveal">LaminarDB vs Flink vs Kafka Streams <span class="gradient-text">comparison</span></h2>
-          <p class="section-desc centered reveal">
-            Embedded deployment, sub-microsecond latency, dual Python + Rust APIs,
-            and zero ops. No cluster to manage, no infrastructure to maintain.
-          </p>
-        </div>
-
-        <div class="comparison-highlights reveal">
-          <div class="comparison-hl-card">
-            <div class="comparison-hl-value">Embedded</div>
-            <div class="comparison-hl-desc">No infrastructure to deploy or manage</div>
-          </div>
-          <div class="comparison-hl-card">
-            <div class="comparison-hl-value">Sub-&micro;s</div>
-            <div class="comparison-hl-desc">325ns measured through a 3-node DAG</div>
-          </div>
-          <div class="comparison-hl-card">
-            <div class="comparison-hl-value">Python + Rust</div>
-            <div class="comparison-hl-desc">Dual language APIs, one engine</div>
-          </div>
-          <div class="comparison-hl-card">
-            <div class="comparison-hl-value">Zero ops</div>
-            <div class="comparison-hl-desc">No cluster, no JVM, no tuning</div>
-          </div>
-        </div>
-
-        <div class="comparison-wrapper reveal">
-          <table class="comparison-table">
-            <thead>
-              <tr>
-                <th>Feature</th>
-                <th class="hl">LaminarDB</th>
-                <th>Flink</th>
-                <th>Kafka Streams</th>
-                <th>RisingWave</th>
-                <th>Materialize</th>
-              </tr>
-            </thead>
-            <tbody>
-              <tr>
-                <td>Deployment</td>
-                <td class="hl"><strong>Embedded</strong></td>
-                <td>Distributed</td>
-                <td>Embedded</td>
-                <td>Distributed</td>
-                <td>Distributed</td>
-              </tr>
-              <tr>
-                <td>Architecture</td>
-                <td class="hl"><strong>Embedded (&lt; 1&micro;s)</strong></td>
-                <td>Distributed (ms)</td>
-                <td>Embedded (~1ms)</td>
-                <td>Distributed (ms)</td>
-                <td>Distributed (ms)</td>
-              </tr>
-              <tr>
-                <td>SQL support</td>
-                <td class="hl"><span class="check">&#10003;</span> Full</td>
-                <td>Limited</td>
-                <td><span class="cross">&#10007;</span></td>
-                <td><span class="check">&#10003;</span> Full</td>
-                <td><span class="check">&#10003;</span> Full</td>
-              </tr>
-              <tr>
-                <td>Python API</td>
-                <td class="hl"><span class="check">&#10003;</span> Native</td>
-                <td>PyFlink</td>
-                <td><span class="cross">&#10007;</span></td>
-                <td><span class="cross">&#10007;</span></td>
-                <td><span class="cross">&#10007;</span></td>
-              </tr>
-              <tr>
-                <td>Exactly-once</td>
-                <td class="hl"><span class="check">&#10003;</span></td>
-                <td><span class="check">&#10003;</span></td>
-                <td><span class="check">&#10003;</span></td>
-                <td><span class="check">&#10003;</span></td>
-                <td><span class="check">&#10003;</span></td>
-              </tr>
-              <tr>
-                <td>Thread-per-core</td>
-                <td class="hl"><span class="check">&#10003;</span></td>
-                <td><span class="cross">&#10007;</span></td>
-                <td><span class="cross">&#10007;</span></td>
-                <td><span class="cross">&#10007;</span></td>
-                <td><span class="cross">&#10007;</span></td>
-              </tr>
-              <tr>
-                <td>JIT compilation</td>
-                <td class="hl"><span class="check">&#10003;</span> Cranelift</td>
-                <td><span class="cross">&#10007;</span></td>
-                <td><span class="cross">&#10007;</span></td>
-                <td><span class="cross">&#10007;</span></td>
-                <td><span class="cross">&#10007;</span></td>
-              </tr>
-              <tr>
-                <td>Lakehouse sinks</td>
-                <td class="hl"><span class="check">&#10003;</span> Delta Lake</td>
-                <td>Limited</td>
-                <td><span class="cross">&#10007;</span></td>
-                <td><span class="check">&#10003;</span></td>
-                <td><span class="cross">&#10007;</span></td>
-              </tr>
-              <tr>
-                <td>Language</td>
-                <td class="hl"><strong>Rust + Python</strong></td>
-                <td>Java</td>
-                <td>Java</td>
-                <td>Rust</td>
-                <td>Rust / C++</td>
-              </tr>
-              <tr>
-                <td>License</td>
-                <td class="hl"><strong>Apache 2.0</strong></td>
-                <td>Apache 2.0</td>
-                <td>Apache 2.0</td>
-                <td>Apache 2.0</td>
-                <td>BSL</td>
-              </tr>
-            </tbody>
-          </table>
-        </div>
-        <p class="comparison-note reveal">
-          Flink, RisingWave, and Materialize are distributed systems designed for cluster-scale workloads.
-          LaminarDB is an embedded engine optimized for single-node, in-process use cases.
-          Different architectures serve different needs &mdash; we believe both have a place.
+        <p style="margin-top: 1rem; font-size: 0.85rem; color: var(--text-dim);">
+          More examples:
+          <a href="https://github.com/laminardb/laminardb/tree/main/examples" target="_blank" rel="noopener">examples/</a> &middot;
+          <a href="https://laminardb.io/api/laminar_db/" target="_blank" rel="noopener">API reference</a> &middot;
+          <a href="https://github.com/laminardb/laminardb/blob/main/docs/SQL_REFERENCE.md" target="_blank" rel="noopener">SQL reference</a>
         </p>
       </div>
     </section>
 
-    <!-- ======== Developer Experience: Zero to Streaming ======== -->
-    <section class="dx-section" id="get-started">
+    <!-- Connectors -->
+    <section id="connectors">
       <div class="container">
-        <div class="section-header text-center">
-          <div class="section-label reveal">Developer Experience</div>
-          <h2 class="section-title reveal">From zero to streaming in <span class="gradient-text">60 seconds</span></h2>
+        <h2>Connectors</h2>
+        <p class="section-desc">
+          All connectors are feature-gated. Compile only what you use.
+          Enable via <code>cargo add laminar-db --features kafka,delta-lake</code>.
+        </p>
+
+        <div class="connector-table-wrapper">
+          <table class="connector-table">
+            <thead>
+              <tr>
+                <th>Connector</th>
+                <th>Direction</th>
+                <th>Status</th>
+                <th>Feature Flag</th>
+                <th>Notes</th>
+              </tr>
+            </thead>
+            <tbody>
+              <tr>
+                <td>Kafka</td>
+                <td>Source + Sink</td>
+                <td><span class="status-impl">Implemented</span></td>
+                <td><code class="feature-flag">kafka</code></td>
+                <td>Avro, JSON, CSV. Confluent Schema Registry. Exactly-once via 2PC.</td>
+              </tr>
+              <tr>
+                <td>PostgreSQL CDC</td>
+                <td>Source</td>
+                <td><span class="status-impl">Implemented</span></td>
+                <td><code class="feature-flag">postgres-cdc</code></td>
+                <td>Logical replication via pgoutput. LSN-based checkpoint tracking.</td>
+              </tr>
+              <tr>
+                <td>PostgreSQL Sink</td>
+                <td>Sink</td>
+                <td><span class="status-impl">Implemented</span></td>
+                <td><code class="feature-flag">postgres-sink</code></td>
+                <td>COPY BINARY (append) or INSERT ON CONFLICT (upsert).</td>
+              </tr>
+              <tr>
+                <td>MySQL CDC</td>
+                <td>Source</td>
+                <td><span class="status-impl">Implemented</span></td>
+                <td><code class="feature-flag">mysql-cdc</code></td>
+                <td>Binlog replication. GTID or file+position modes.</td>
+              </tr>
+              <tr>
+                <td>Delta Lake</td>
+                <td>Source + Sink</td>
+                <td><span class="status-impl">Implemented</span></td>
+                <td><code class="feature-flag">delta-lake</code></td>
+                <td>S3, Azure, GCS, Unity, Glue catalogs. Exactly-once epoch tracking.</td>
+              </tr>
+              <tr>
+                <td>WebSocket</td>
+                <td>Source + Sink</td>
+                <td><span class="status-impl">Implemented</span></td>
+                <td><code class="feature-flag">websocket</code></td>
+                <td>Client and server modes. JSON/CSV serialization.</td>
+              </tr>
+              <tr>
+                <td>File Auto-Loader</td>
+                <td>Source + Sink</td>
+                <td><span class="status-impl">Implemented</span></td>
+                <td><code class="feature-flag">files</code></td>
+                <td>CSV, JSON Lines, Parquet, plain text. Schema inference and evolution.</td>
+              </tr>
+              <tr>
+                <td>Parquet Lookup</td>
+                <td>Source</td>
+                <td><span class="status-impl">Implemented</span></td>
+                <td><code class="feature-flag">parquet-lookup</code></td>
+                <td>Object-store-backed dimension tables for lookup joins.</td>
+              </tr>
+            </tbody>
+          </table>
         </div>
 
-        <div class="dx-steps">
-          <div class="dx-step reveal reveal-delay-1">
-            <div class="dx-step-num">1</div>
-            <div class="dx-step-body">
-              <h3>Install</h3>
-              <p>One command. No containers, no clusters, no config files.</p>
-              <pre><code class="language-bash"># Python
-pip install laminardb
+        <p style="margin-top: 1rem; font-size: 0.85rem; color: var(--text-dim);">
+          Custom connectors: implement the
+          <a href="https://laminardb.io/api/laminar_connectors/connector/trait.SourceConnector.html" target="_blank" rel="noopener">SourceConnector</a> /
+          <a href="https://laminardb.io/api/laminar_connectors/connector/trait.SinkConnector.html" target="_blank" rel="noopener">SinkConnector</a>
+          traits.
+        </p>
+      </div>
+    </section>
 
-# Rust
-cargo add laminar-db</code></pre>
-            </div>
+    <!-- Deployment Modes -->
+    <section id="deployment">
+      <div class="container">
+        <h2>Deployment</h2>
+
+        <div class="deploy-grid">
+          <div class="deploy-card">
+            <h3>Embedded</h3>
+            <p>
+              Rust: <code>cargo add laminar-db</code>.
+              Python: <code>pip install laminardb</code>.
+              The engine runs in your process &mdash; push events, subscribe to results.
+            </p>
+            <p>Good fit for edge processing, embedded analytics, and latency-sensitive apps.</p>
           </div>
-
-          <div class="dx-step reveal reveal-delay-2">
-            <div class="dx-step-num">2</div>
-            <div class="dx-step-body">
-              <h3>Write SQL</h3>
-              <p>Define your streaming query using familiar SQL syntax.</p>
-              <pre><code class="language-sql">CREATE SOURCE events (
-    key VARCHAR, value DOUBLE, ts BIGINT
-);
-
-CREATE STREAM summary AS
-    SELECT key, COUNT(*) AS total, AVG(value) AS avg
-    FROM events
-    GROUP BY key, tumble(ts, INTERVAL '1' MINUTE)
-    EMIT ON WINDOW CLOSE;</code></pre>
-            </div>
+          <div class="deploy-card">
+            <h3>Standalone Server</h3>
+            <p>
+              Run the <code>laminardb</code> binary with a TOML config.
+              REST API on port 8080. Connects to Kafka, databases, Delta Lake.
+              Docker image and Helm chart available.
+            </p>
+            <p>Use for: CDC pipelines, stream-to-lakehouse, event routing.</p>
           </div>
-
-          <div class="dx-step reveal reveal-delay-3">
-            <div class="dx-step-num">3</div>
-            <div class="dx-step-body">
-              <h3>Run</h3>
-              <p>Push data and get real-time results. That's it.</p>
-              <pre><code class="language-python">import laminardb
-
-db = laminardb.open()
-# ... execute SQL from step 2 ...
-db.start()
-
-db.insert("events", {"key": "sensor-1", "value": 42.0, "ts": 1700000000000})
-
-for batch in db.subscribe("summary"):
-    print(batch.to_pandas())</code></pre>
-            </div>
+          <div class="deploy-card">
+            <h3>Cluster</h3>
+            <span class="label-planned">Coming Soon</span>
+            <p>
+              Multi-node deployment using Raft consensus and gossip discovery.
+              Core primitives are in the workspace &mdash; cluster mode is being wired into the server.
+            </p>
+            <p><a href="https://github.com/laminardb/laminardb/blob/main/docs/ROADMAP.md" target="_blank" rel="noopener">Track progress on the roadmap</a></p>
           </div>
-        </div>
-
-        <div class="dx-cta reveal">
-          <a href="https://laminardb.io/api/laminar_db/" class="btn btn-primary btn-lg" target="_blank" rel="noopener">Read the Docs</a>
-          <a href="https://crates.io/crates/laminar-db" class="btn btn-secondary btn-lg" target="_blank" rel="noopener">Crates.io</a>
-          <a href="https://github.com/laminardb/laminardb-python" class="btn btn-secondary btn-lg" target="_blank" rel="noopener">Python Package</a>
         </div>
       </div>
     </section>
 
-    <!-- ======== CTA Banner ======== -->
-    <section class="cta-section">
+    <!-- Comparison -->
+    <section id="comparison">
       <div class="container">
-        <div class="cta-box reveal">
-          <h2>Ready to process your <span class="gradient-text">first stream</span>?</h2>
-          <p>LaminarDB is free, open source, and Apache 2.0 licensed. Get started in under a minute.</p>
-          <div class="cta-actions">
-            <a href="https://laminardb.io/api/laminar_db/" class="btn btn-primary btn-lg" target="_blank" rel="noopener">
-              Read the Docs
-            </a>
-            <a href="https://github.com/laminardb/laminardb" class="btn btn-secondary btn-lg" target="_blank" rel="noopener">
-              <svg width="16" height="16" viewBox="0 0 16 16" fill="currentColor"><path d="M8 0C3.58 0 0 3.58 0 8c0 3.54 2.29 6.53 5.47 7.59.4.07.55-.17.55-.38 0-.19-.01-.82-.01-1.49-2.01.37-2.53-.49-2.69-.94-.09-.23-.48-.94-.82-1.13-.28-.15-.68-.52-.01-.53.63-.01 1.08.58 1.23.82.72 1.21 1.87.87 2.33.66.07-.52.28-.87.51-1.07-1.78-.2-3.64-.89-3.64-3.95 0-.87.31-1.59.82-2.15-.08-.2-.36-1.02.08-2.12 0 0 .67-.21 2.2.82.64-.18 1.32-.27 2-.27.68 0 1.36.09 2 .27 1.53-1.04 2.2-.82 2.2-.82.44 1.1.16 1.92.08 2.12.51.56.82 1.27.82 2.15 0 3.07-1.87 3.75-3.65 3.95.29.25.54.73.54 1.48 0 1.07-.01 1.93-.01 2.2 0 .21.15.46.55.38A8.013 8.013 0 0016 8c0-4.42-3.58-8-8-8z"/></svg>
-              Star on GitHub
-            </a>
+        <h2>How it compares</h2>
+        <p class="section-desc">
+          Different tools for different problems.
+          LaminarDB targets low-latency, single-node workloads today &mdash; cluster mode is coming.
+        </p>
+
+        <div class="comparison-wrapper">
+          <table class="comparison-table">
+            <thead>
+              <tr>
+                <th></th>
+                <th class="hl">LaminarDB</th>
+                <th>Apache Flink</th>
+                <th>Kafka Streams</th>
+                <th>Arroyo</th>
+                <th>kdb+</th>
+              </tr>
+            </thead>
+            <tbody>
+              <tr>
+                <td>Type</td>
+                <td class="hl">SQL engine</td>
+                <td>Distributed framework</td>
+                <td>Stream library (JVM)</td>
+                <td>Distributed engine</td>
+                <td>Timeseries DB</td>
+              </tr>
+              <tr>
+                <td>Language</td>
+                <td class="hl">Rust + Python</td>
+                <td>Java / Scala</td>
+                <td>Java</td>
+                <td>Rust</td>
+                <td>q/k (proprietary)</td>
+              </tr>
+              <tr>
+                <td>SQL</td>
+                <td class="hl">DataFusion</td>
+                <td>Flink SQL</td>
+                <td>None</td>
+                <td>DataFusion</td>
+                <td>q language</td>
+              </tr>
+              <tr>
+                <td>Deployment</td>
+                <td class="hl">Embedded, server, cluster (soon)</td>
+                <td class="win">Cluster (YARN/K8s)</td>
+                <td>In-app (JVM)</td>
+                <td class="win">Kubernetes</td>
+                <td>Single process</td>
+              </tr>
+              <tr>
+                <td>Latency target</td>
+                <td class="hl">&lt;1&micro;s state lookup</td>
+                <td>~10ms</td>
+                <td>~1ms</td>
+                <td>~10ms</td>
+                <td>&lt;1&micro;s</td>
+              </tr>
+              <tr>
+                <td>Horizontal scale</td>
+                <td class="hl">No (single node)</td>
+                <td class="win">Yes</td>
+                <td class="win">Via Kafka partitions</td>
+                <td class="win">Yes</td>
+                <td>No</td>
+              </tr>
+              <tr>
+                <td>Exactly-once</td>
+                <td class="hl">Barrier checkpoints</td>
+                <td>Barrier checkpoints</td>
+                <td>Kafka transactions</td>
+                <td>Barrier checkpoints</td>
+                <td>N/A</td>
+              </tr>
+              <tr>
+                <td>Connectors</td>
+                <td class="hl">8</td>
+                <td class="win">100+</td>
+                <td>Kafka only</td>
+                <td class="win">15+</td>
+                <td>Custom</td>
+              </tr>
+              <tr>
+                <td>Ops overhead</td>
+                <td class="hl">None (lib) / low</td>
+                <td>High (cluster, JVM)</td>
+                <td>Low</td>
+                <td>Medium (K8s)</td>
+                <td>Low</td>
+              </tr>
+              <tr>
+                <td>License</td>
+                <td class="hl">Apache 2.0</td>
+                <td>Apache 2.0</td>
+                <td>Apache 2.0</td>
+                <td>Apache 2.0</td>
+                <td>Proprietary</td>
+              </tr>
+              <tr>
+                <td>Maturity</td>
+                <td class="hl">Pre-1.0 (v0.18.1)</td>
+                <td class="win">Production (10+ yrs)</td>
+                <td class="win">Production (8+ yrs)</td>
+                <td class="win">Production (~2 yrs)</td>
+                <td class="win">Production (30+ yrs)</td>
+              </tr>
+            </tbody>
+          </table>
+        </div>
+
+        <p class="comparison-note">
+          Bold cells show where a competitor has a clear advantage.
+          LaminarDB wins on latency and deployment flexibility.
+          It loses on maturity, horizontal scale (until cluster ships), and ecosystem breadth.
+        </p>
+
+        <h3 style="margin-bottom: 1rem;">When to choose something else</h3>
+        <div class="alternatives">
+          <div class="alt-card">
+            <h4>Apache Flink</h4>
+            <p>Need to scale across a cluster? Flink handles 100+ connectors and complex event processing. Trade-off: heavyweight JVM footprint and operational overhead.</p>
           </div>
-          <div class="cta-community">
-            <a href="https://github.com/laminardb/laminardb/discussions" class="cta-community-link" target="_blank" rel="noopener">
-              Join the community on GitHub Discussions &rarr;
-            </a>
+          <div class="alt-card">
+            <h4>Kafka Streams</h4>
+            <p>Strictly Kafka in/out and already running JVM services? Streams is the simplest fit. No SQL though.</p>
           </div>
-          <div class="cta-built-with">
-            <div class="cta-built-item">Built with Rust</div>
-            <div class="cta-built-item">Apache Arrow</div>
-            <div class="cta-built-item">DataFusion</div>
-            <div class="cta-built-item">Cranelift</div>
+          <div class="alt-card">
+            <h4>Arroyo</h4>
+            <p>Distributed streaming in Rust with a web UI. Runs on Kubernetes. Shares the DataFusion SQL foundation with LaminarDB.</p>
+          </div>
+          <div class="alt-card">
+            <h4>kdb+</h4>
+            <p>Finance teams with q/k expertise and sub-microsecond timeseries analytics. 30+ years of production track record. Licensing is steep.</p>
           </div>
         </div>
       </div>
     </section>
+
+    <!-- Benchmarks -->
+    <section id="benchmarks">
+      <div class="container">
+        <h2>Benchmarks</h2>
+        <p class="section-desc">
+          Criterion benchmarks run on an AMD Ryzen AI 7 350 laptop.
+          These are not server numbers. Dedicated hardware with isolated cores will perform better.
+          <a href="https://github.com/laminardb/laminardb/blob/main/docs/BENCHMARKS.md" target="_blank" rel="noopener">Full results</a>.
+        </p>
+
+        <div class="connector-table-wrapper">
+          <table class="connector-table">
+            <thead>
+              <tr>
+                <th>Metric</th>
+                <th>Target</th>
+                <th>Measured</th>
+                <th>Benchmark File</th>
+              </tr>
+            </thead>
+            <tbody>
+              <tr>
+                <td>State lookup (AHash get_ref)</td>
+                <td>&lt;500ns</td>
+                <td>10&ndash;16ns (zero-copy)</td>
+                <td><a href="https://github.com/laminardb/laminardb/blob/main/crates/laminar-core/benches/state_bench.rs" target="_blank" rel="noopener">state_bench.rs</a></td>
+              </tr>
+              <tr>
+                <td>Throughput / core</td>
+                <td>500K events/s</td>
+                <td>1.1&ndash;3.17M events/s</td>
+                <td><a href="https://github.com/laminardb/laminardb/blob/main/crates/laminar-core/benches/throughput_bench.rs" target="_blank" rel="noopener">throughput_bench.rs</a></td>
+              </tr>
+              <tr>
+                <td>p99 latency</td>
+                <td>&lt;10&micro;s</td>
+                <td>0.55&ndash;1.16&micro;s</td>
+                <td><a href="https://github.com/laminardb/laminardb/blob/main/crates/laminar-core/benches/latency_bench.rs" target="_blank" rel="noopener">latency_bench.rs</a></td>
+              </tr>
+              <tr>
+                <td>Checkpoint recovery</td>
+                <td>&lt;10s</td>
+                <td>1.39ms</td>
+                <td><a href="https://github.com/laminardb/laminardb/blob/main/crates/laminar-core/benches/checkpoint_bench.rs" target="_blank" rel="noopener">checkpoint_bench.rs</a></td>
+              </tr>
+              <tr>
+                <td>WAL append</td>
+                <td>&lt;1&micro;s</td>
+                <td>541ns</td>
+                <td><a href="https://github.com/laminardb/laminardb/blob/main/crates/laminar-storage/benches/wal_bench.rs" target="_blank" rel="noopener">wal_bench.rs</a></td>
+              </tr>
+            </tbody>
+          </table>
+        </div>
+
+        <p style="margin-top: 1rem; font-size: 0.85rem; color: var(--text-dim);">
+          Reproduce: <code>cargo bench --bench state_bench</code>,
+          <code>cargo bench --bench throughput_bench</code>,
+          <code>cargo bench --bench latency_bench</code>.
+          All benchmarks use <a href="https://github.com/bheisler/criterion.rs" target="_blank" rel="noopener">Criterion</a> for statistical analysis.
+        </p>
+      </div>
+    </section>
+
+    <!-- Status -->
+    <section id="status">
+      <div class="container">
+        <h2>Status</h2>
+        <p class="section-desc">
+          Current version: <strong>0.18.1</strong> (pre-1.0).
+          <a href="https://github.com/laminardb/laminardb/releases" target="_blank" rel="noopener">Releases</a> &middot;
+          <a href="https://github.com/laminardb/laminardb/blob/main/docs/ROADMAP.md" target="_blank" rel="noopener">Roadmap</a>
+        </p>
+
+        <div class="status-grid">
+          <div class="status-col stable">
+            <h3>Stable</h3>
+            <ul>
+              <li>Core engine (reactor, state stores, DAG executor)</li>
+              <li>Window functions (tumbling, sliding, hopping, session)</li>
+              <li>Joins (stream-stream, ASOF, temporal, lookup)</li>
+              <li>All 8 connectors (Kafka, CDC, Delta, WS, files)</li>
+              <li>Barrier-based checkpointing and recovery</li>
+              <li>Per-core WAL with exactly-once semantics</li>
+              <li>Standalone server with REST API</li>
+              <li>Docker and Helm chart deployment</li>
+              <li>JIT compilation via Cranelift</li>
+            </ul>
+          </div>
+          <div class="status-col experimental">
+            <h3>Experimental</h3>
+            <ul>
+              <li>io_uring storage (Linux only)</li>
+              <li>Incremental checkpoints</li>
+              <li>Cross-partition aggregation (gossip)</li>
+            </ul>
+          </div>
+          <div class="status-col unimplemented">
+            <h3>Not yet implemented</h3>
+            <ul>
+              <li>Cluster / multi-node deployment (coming soon)</li>
+              <li>PostgreSQL wire protocol (planned)</li>
+              <li>MongoDB, Redis connectors</li>
+            </ul>
+          </div>
+        </div>
+      </div>
+    </section>
+
+    <!-- Contributing -->
+    <section id="contributing">
+      <div class="container">
+        <h2>Contributing</h2>
+        <p style="max-width: 600px; margin-bottom: 1.5rem;">
+          LaminarDB is Apache 2.0 licensed. Contributions welcome.
+          Rust 1.85+ required. See the contribution guide for Ring 0 constraints
+          (no allocations, no locks, no syscalls on the hot path).
+        </p>
+        <div class="contrib-links">
+          <a href="https://github.com/laminardb/laminardb/blob/main/CONTRIBUTING.md" class="btn btn-secondary" target="_blank" rel="noopener">Contribution Guide</a>
+          <a href="https://github.com/laminardb/laminardb/discussions" class="btn btn-secondary" target="_blank" rel="noopener">Discussions</a>
+          <a href="https://github.com/laminardb/laminardb/labels/good%20first%20issue" class="btn btn-secondary" target="_blank" rel="noopener">Good First Issues</a>
+        </div>
+      </div>
+    </section>
+
   </main>
 
-  <!-- ======== Footer ======== -->
+  <!-- Footer -->
   <footer class="footer">
-    <div class="footer-grid">
-      <div class="footer-brand">
-        <a href="#" class="nav-brand">
-          <svg class="logo-icon" viewBox="0 0 40 40" width="32" height="32" aria-hidden="true">
-            <defs><linearGradient id="footer-lg" x1="0" y1="0" x2="1" y2="1"><stop offset="0%" stop-color="#06b6d4"/><stop offset="100%" stop-color="#8b5cf6"/></linearGradient></defs>
-            <path d="M4 8 C12 8,14 6,22 6 C30 6,32 10,36 10" stroke="url(#footer-lg)" stroke-width="2.5" fill="none" stroke-linecap="round" opacity=".5"/>
-            <path d="M2 14 C10 14,14 11,22 11 C30 11,32 15,38 15" stroke="url(#footer-lg)" stroke-width="2.5" fill="none" stroke-linecap="round" opacity=".7"/>
-            <path d="M0 20 C8 20,14 17,22 17 C30 17,32 21,40 21" stroke="url(#footer-lg)" stroke-width="3" fill="none" stroke-linecap="round"/>
-            <path d="M2 26 C10 26,14 23,22 23 C30 23,32 27,38 27" stroke="url(#footer-lg)" stroke-width="2.5" fill="none" stroke-linecap="round" opacity=".7"/>
-            <path d="M4 32 C12 32,14 30,22 30 C30 30,32 34,36 34" stroke="url(#footer-lg)" stroke-width="2.5" fill="none" stroke-linecap="round" opacity=".5"/>
-          </svg>
-          <span>LaminarDB</span>
-        </a>
-        <p>LaminarDB is an open-source embedded streaming SQL database. Sub-microsecond latency, zero infrastructure, with native Rust and Python APIs. Apache 2.0 licensed.</p>
-      </div>
-      <div>
-        <h4>Resources</h4>
+    <div class="container">
+      <div class="footer-inner">
+        <div class="footer-left">
+          LaminarDB &middot;
+          <a href="https://github.com/laminardb/laminardb/blob/main/LICENSE" target="_blank" rel="noopener">Apache 2.0</a> &middot;
+          v0.18.1
+        </div>
         <div class="footer-links">
-          <a href="https://laminardb.io/api/laminar_db/" target="_blank" rel="noopener">API Docs</a>
           <a href="https://github.com/laminardb/laminardb" target="_blank" rel="noopener">GitHub</a>
           <a href="https://crates.io/crates/laminar-db" target="_blank" rel="noopener">Crates.io</a>
+          <a href="https://laminardb.io/api/laminar_db/" target="_blank" rel="noopener">API Docs</a>
           <a href="https://github.com/laminardb/laminardb/blob/main/CONTRIBUTING.md" target="_blank" rel="noopener">Contributing</a>
         </div>
       </div>
-      <div>
-        <h4>Product</h4>
-        <div class="footer-links">
-          <a href="#features">Features</a>
-          <a href="#performance">Performance</a>
-          <a href="#architecture">Architecture</a>
-          <a href="#connectors">Connectors</a>
-          <a href="#python">Python API</a>
-        </div>
-      </div>
-      <div>
-        <h4>Bindings</h4>
-        <div class="footer-links">
-          <a href="https://crates.io/crates/laminar-db" target="_blank" rel="noopener">Rust (primary)</a>
-          <a href="https://github.com/laminardb/laminardb-python" target="_blank" rel="noopener">Python (PyO3)</a>
-          <a href="https://github.com/laminardb/laminardb" target="_blank" rel="noopener">C FFI</a>
-        </div>
-      </div>
-    </div>
-    <div class="footer-bottom">
-      <p>
-        &copy; 2026 LaminarDB Contributors &middot;
-        <a href="https://github.com/laminardb/laminardb/blob/main/LICENSE" target="_blank" rel="noopener">Apache 2.0 License</a> &middot;
-        v0.18.0
-      </p>
     </div>
   </footer>
 
-  <!-- Prism.js (defer for better Core Web Vitals) -->
   <script defer src="https://cdnjs.cloudflare.com/ajax/libs/prism/1.29.0/prism.min.js"></script>
   <script defer src="https://cdnjs.cloudflare.com/ajax/libs/prism/1.29.0/components/prism-sql.min.js"></script>
   <script defer src="https://cdnjs.cloudflare.com/ajax/libs/prism/1.29.0/components/prism-rust.min.js"></script>
   <script defer src="https://cdnjs.cloudflare.com/ajax/libs/prism/1.29.0/components/prism-bash.min.js"></script>
-  <script defer src="https://cdnjs.cloudflare.com/ajax/libs/prism/1.29.0/components/prism-python.min.js"></script>
-
-  <!-- Playground -->
-  <script defer src="js/playground.js"></script>
-
-  <!-- Main JS -->
   <script defer src="js/main.js"></script>
 </body>
 </html>
