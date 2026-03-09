@@ -2481,7 +2481,7 @@ mod tests {
     /// Helper to build a VersionedLookupJoinExec for tests.
     fn build_versioned_exec(
         table: RecordBatch,
-        stream: RecordBatch,
+        stream: &RecordBatch,
         join_type: LookupJoinType,
     ) -> VersionedLookupJoinExec {
         let input = batch_exec(stream.clone());
@@ -2507,7 +2507,7 @@ mod tests {
     async fn test_versioned_join_exec_inner() {
         let table = versioned_table_batch();
         let stream = stream_batch_with_time();
-        let exec = build_versioned_exec(table, stream, LookupJoinType::Inner);
+        let exec = build_versioned_exec(table, &stream, LookupJoinType::Inner);
 
         let ctx = Arc::new(TaskContext::default());
         let stream_out = exec.execute(0, ctx).unwrap();
@@ -2535,7 +2535,7 @@ mod tests {
     async fn test_versioned_join_exec_left_outer() {
         let table = versioned_table_batch();
         let stream = stream_batch_with_time();
-        let exec = build_versioned_exec(table, stream, LookupJoinType::LeftOuter);
+        let exec = build_versioned_exec(table, &stream, LookupJoinType::LeftOuter);
 
         let ctx = Arc::new(TaskContext::default());
         let stream_out = exec.execute(0, ctx).unwrap();
