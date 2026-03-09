@@ -294,6 +294,28 @@ impl SourceConnector for KafkaSource {
             parsed
         };
 
+        // Re-select deserializer (factory defaults to JSON).
+        if let Some(ref sr_url) = kafka_config.schema_registry_url {
+            let sr_client = if let Some(ref ca) = kafka_config.schema_registry_ssl_ca_location {
+                SchemaRegistryClient::with_tls(
+                    sr_url.clone(),
+                    kafka_config.schema_registry_auth.clone(),
+                    ca,
+                )?
+            } else {
+                SchemaRegistryClient::new(sr_url.clone(), kafka_config.schema_registry_auth.clone())
+            };
+            let sr = Arc::new(sr_client);
+            self.schema_registry = Some(Arc::clone(&sr));
+            self.deserializer = if kafka_config.format == Format::Avro {
+                Box::new(AvroDeserializer::with_schema_registry(sr))
+            } else {
+                select_deserializer(kafka_config.format)
+            };
+        } else {
+            self.deserializer = select_deserializer(kafka_config.format);
+        }
+
         // Override schema from SQL DDL if provided.
         if let Some(schema) = config.arrow_schema() {
             info!(
