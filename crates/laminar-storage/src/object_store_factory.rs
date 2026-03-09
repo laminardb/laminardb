@@ -112,7 +112,10 @@ fn build_s3(
     let mut builder = AmazonS3Builder::from_env().with_url(url);
 
     for (key, value) in options {
-        builder = builder.with_config(key.parse()?, value);
+        let config_key = key.parse().map_err(|e: object_store::Error| {
+            ObjectStoreFactoryError::Build(format!("invalid S3 config key '{key}': {e}"))
+        })?;
+        builder = builder.with_config(config_key, value);
     }
 
     let store = builder.build()?;
@@ -144,7 +147,10 @@ fn build_gcs(
     let mut builder = GoogleCloudStorageBuilder::from_env().with_url(url);
 
     for (key, value) in options {
-        builder = builder.with_config(key.parse()?, value);
+        let config_key = key.parse().map_err(|e: object_store::Error| {
+            ObjectStoreFactoryError::Build(format!("invalid GCS config key '{key}': {e}"))
+        })?;
+        builder = builder.with_config(config_key, value);
     }
 
     let store = builder.build()?;
@@ -176,7 +182,10 @@ fn build_azure(
     let mut builder = MicrosoftAzureBuilder::from_env().with_url(url);
 
     for (key, value) in options {
-        builder = builder.with_config(key.parse()?, value);
+        let config_key = key.parse().map_err(|e: object_store::Error| {
+            ObjectStoreFactoryError::Build(format!("invalid Azure config key '{key}': {e}"))
+        })?;
+        builder = builder.with_config(config_key, value);
     }
 
     let store = builder.build()?;

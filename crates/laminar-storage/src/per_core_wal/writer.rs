@@ -330,7 +330,10 @@ impl CoreWalWriter {
             .truncate(false)
             .open(&self.path)?;
 
+        // Sync after truncation to make it durable.
+        // Without this, a crash could leave the file at its old length.
         file.set_len(position)?;
+        file.sync_all()?;
 
         // Reopen for append
         let file = OpenOptions::new().append(true).open(&self.path)?;

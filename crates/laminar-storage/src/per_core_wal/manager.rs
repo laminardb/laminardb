@@ -107,14 +107,25 @@ impl PerCoreWalManager {
                 return Err(PerCoreWalError::SegmentNotFound { core_id, path });
             }
 
-            // Read to find last valid position and max epoch
+            // Single pass: read all valid entries, tracking max epoch and
+            // the last valid position. Avoids reading the file twice.
             let mut reader = PerCoreWalReader::open(core_id, &path)?;
-            let valid_end = reader.find_valid_end()?;
-
-            // Read entries to find max epoch
-            let mut reader = PerCoreWalReader::open(core_id, &path)?;
-            for entry in reader.read_all()? {
-                max_epoch = max_epoch.max(entry.epoch);
+            let mut valid_end = 0u64;
+            loop {
+                let pos_before = reader.position();
+                match reader.read_next()? {
+                    super::reader::WalReadResult::Entry(entry) => {
+                        max_epoch = max_epoch.max(entry.epoch);
+                        valid_end = reader.position();
+                    }
+                    super::reader::WalReadResult::Eof => break,
+                    super::reader::WalReadResult::TornWrite { .. }
+                    | super::reader::WalReadResult::ChecksumMismatch { .. }
+                    | super::reader::WalReadResult::Corrupted { .. } => {
+                        valid_end = pos_before;
+                        break;
+                    }
+                }
             }
 
             let writer = CoreWalWriter::open_at(core_id, &path, valid_end)?;
