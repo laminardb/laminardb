@@ -86,7 +86,7 @@ jobs:
             cross: false
             # macOS: skip Linux-only features (hwloc, io-uring, xdp)
             features: --features "allocation-tracking,jit,kafka,postgres-cdc,postgres-sink,mysql-cdc,delta-lake,delta,websocket"
-          - os: macos-13  # Intel
+          - os: macos-15  # Cross-compile Intel from ARM64 (macos-13 deprecated)
             target: x86_64-apple-darwin
             cross: false
             # macOS: skip Linux-only features (hwloc, io-uring, xdp)
