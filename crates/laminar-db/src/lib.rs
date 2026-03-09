@@ -62,8 +62,6 @@ mod table_backend;
 mod table_cache_mode;
 mod table_provider;
 mod table_store;
-mod temporal_batch;
-
 /// FFI-friendly API for language bindings.
 ///
 /// Enable with the `api` feature flag:

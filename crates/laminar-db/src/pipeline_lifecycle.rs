@@ -6,6 +6,7 @@
 use std::collections::HashMap;
 use std::sync::Arc;
 
+use arrow_array::RecordBatch;
 use laminar_core::streaming;
 use rustc_hash::FxHashMap;
 
@@ -261,6 +262,7 @@ impl LaminarDB {
         let ctx = laminar_sql::create_session_context();
         laminar_sql::register_streaming_functions(&ctx);
         let mut executor = StreamExecutor::new(ctx);
+        executor.set_lookup_registry(Arc::clone(&self.lookup_registry));
 
         // Register source schemas for ALL sources (both external connectors
         // and catalog-bridge sources) so the executor can create empty
@@ -279,6 +281,77 @@ impl LaminarDB {
                 reg.window_config.clone(),
                 reg.order_config.clone(),
             );
+        }
+
+        // Register temporal join tables as Versioned in the lookup registry
+        // so that execute_temporal_query() can use persistent versioned state.
+        for tcfg in executor.temporal_join_configs() {
+            if self.lookup_registry.get_entry(&tcfg.table_name).is_none() {
+                // Get initial data. If none exists yet, use an empty batch
+                // with the correct schema from the catalog (not Schema::empty).
+                let initial_batch = self
+                    .table_store
+                    .lock()
+                    .to_record_batch(&tcfg.table_name)
+                    .or_else(|| {
+                        self.catalog
+                            .get_source(&tcfg.table_name)
+                            .map(|e| RecordBatch::new_empty(e.schema.clone()))
+                    })
+                    .unwrap_or_else(|| {
+                        RecordBatch::new_empty(Arc::new(arrow::datatypes::Schema::empty()))
+                    });
+                let key_columns = vec![tcfg.table_key_column.clone()];
+                let key_indices: Vec<usize> = key_columns
+                    .iter()
+                    .filter_map(|k| initial_batch.schema().index_of(k).ok())
+                    .collect();
+                let Ok(version_col_idx) = initial_batch
+                    .schema()
+                    .index_of(&tcfg.table_version_column)
+                else {
+                    if !initial_batch.schema().fields().is_empty() {
+                        tracing::warn!(
+                            table=%tcfg.table_name,
+                            version_col=%tcfg.table_version_column,
+                            "Version column not found in temporal table schema; \
+                             will resolve on first CDC batch"
+                        );
+                    }
+                    // Register with empty index — built on first CDC update.
+                    self.lookup_registry.register_versioned(
+                        &tcfg.table_name,
+                        laminar_sql::datafusion::VersionedLookupState {
+                            batch: initial_batch,
+                            index: Arc::new(
+                                laminar_sql::datafusion::lookup_join_exec::VersionedIndex::default(),
+                            ),
+                            key_columns,
+                            version_column: tcfg.table_version_column.clone(),
+                            stream_time_column: tcfg.stream_time_column.clone(),
+                        },
+                    );
+                    continue;
+                };
+                let index = Arc::new(
+                    laminar_sql::datafusion::lookup_join_exec::VersionedIndex::build(
+                        &initial_batch,
+                        &key_indices,
+                        version_col_idx,
+                    )
+                    .unwrap_or_default(),
+                );
+                self.lookup_registry.register_versioned(
+                    &tcfg.table_name,
+                    laminar_sql::datafusion::VersionedLookupState {
+                        batch: initial_batch,
+                        index,
+                        key_columns,
+                        version_column: tcfg.table_version_column.clone(),
+                        stream_time_column: tcfg.stream_time_column.clone(),
+                    },
+                );
+            }
         }
 
         // Build sources as owned SourceRegistrations (no Arc<Mutex>).

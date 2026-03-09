@@ -20,6 +20,8 @@ use std::sync::Arc;
 
 use parking_lot::RwLock;
 
+use std::collections::BTreeMap;
+
 use arrow::compute::take;
 use arrow::row::{RowConverter, SortField};
 use arrow_array::{RecordBatch, UInt32Array};
@@ -53,13 +55,15 @@ pub struct LookupTableRegistry {
     tables: RwLock<HashMap<String, RegisteredLookup>>,
 }
 
-/// A registered lookup table entry — either a full snapshot or a
-/// partial (on-demand) cache backed by foyer.
+/// A registered lookup table entry — snapshot, partial (on-demand), or
+/// versioned (temporal join with version history).
 pub enum RegisteredLookup {
     /// Full snapshot: all rows pre-loaded in a single batch.
     Snapshot(Arc<LookupSnapshot>),
     /// Partial (on-demand): bounded foyer cache with S3-FIFO eviction.
     Partial(Arc<PartialLookupState>),
+    /// Versioned: all versions of all keys for temporal joins.
+    Versioned(Arc<VersionedLookupState>),
 }
 
 /// Point-in-time snapshot of a lookup table for join execution.
@@ -68,6 +72,25 @@ pub struct LookupSnapshot {
     pub batch: RecordBatch,
     /// Primary key column names used to build the hash index.
     pub key_columns: Vec<String>,
+}
+
+/// State for a versioned (temporal) lookup table.
+///
+/// Holds all versions of all keys in a single `RecordBatch`, plus a
+/// pre-built `VersionedIndex` for efficient point-in-time lookups.
+/// The index is built once at registration time and rebuilt only when
+/// the table is updated via CDC.
+pub struct VersionedLookupState {
+    /// All rows (all versions) concatenated into a single batch.
+    pub batch: RecordBatch,
+    /// Pre-built versioned index (built at registration time, not per-cycle).
+    pub index: Arc<VersionedIndex>,
+    /// Primary key column names for the equi-join.
+    pub key_columns: Vec<String>,
+    /// Column containing the version timestamp in the table.
+    pub version_column: String,
+    /// Stream-side column name for event time (the AS OF column).
+    pub stream_time_column: String,
 }
 
 /// State for a partial (on-demand) lookup table.
@@ -117,6 +140,18 @@ impl LookupTableRegistry {
         );
     }
 
+    /// Registers or replaces a versioned (temporal) lookup table.
+    ///
+    /// # Panics
+    ///
+    /// Panics if the internal lock is poisoned.
+    pub fn register_versioned(&self, name: &str, state: VersionedLookupState) {
+        self.tables.write().insert(
+            name.to_lowercase(),
+            RegisteredLookup::Versioned(Arc::new(state)),
+        );
+    }
+
     /// Removes a lookup table from the registry.
     ///
     /// # Panics
@@ -136,11 +171,11 @@ impl LookupTableRegistry {
         let tables = self.tables.read();
         match tables.get(&name.to_lowercase())? {
             RegisteredLookup::Snapshot(s) => Some(Arc::clone(s)),
-            RegisteredLookup::Partial(_) => None,
+            RegisteredLookup::Partial(_) | RegisteredLookup::Versioned(_) => None,
         }
     }
 
-    /// Returns the registered lookup entry (snapshot or partial).
+    /// Returns the registered lookup entry (snapshot, partial, or versioned).
     ///
     /// # Panics
     ///
@@ -150,6 +185,7 @@ impl LookupTableRegistry {
         tables.get(&name.to_lowercase()).map(|e| match e {
             RegisteredLookup::Snapshot(s) => RegisteredLookup::Snapshot(Arc::clone(s)),
             RegisteredLookup::Partial(p) => RegisteredLookup::Partial(Arc::clone(p)),
+            RegisteredLookup::Versioned(v) => RegisteredLookup::Versioned(Arc::clone(v)),
         })
     }
 }
@@ -201,6 +237,153 @@ impl HashIndex {
         self.map.get(key).map(Vec::as_slice)
     }
 }
+
+// ── Versioned Index ──────────────────────────────────────────────
+
+/// Pre-built versioned index mapping encoded key bytes to a BTreeMap
+/// of version timestamps to row indices. Supports point-in-time lookups
+/// via `probe_at_time` for temporal joins.
+#[derive(Default)]
+pub struct VersionedIndex {
+    map: HashMap<Box<[u8]>, BTreeMap<i64, Vec<u32>>>,
+}
+
+impl VersionedIndex {
+    /// Builds a versioned index over `key_indices` and `version_col_idx`
+    /// columns in `batch`.
+    ///
+    /// Uses Arrow's `RowConverter` for binary-comparable key encoding.
+    /// Null keys and null version timestamps are skipped.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error if key encoding or timestamp extraction fails.
+    pub fn build(
+        batch: &RecordBatch,
+        key_indices: &[usize],
+        version_col_idx: usize,
+    ) -> Result<Self> {
+        if batch.num_rows() == 0 {
+            return Ok(Self {
+                map: HashMap::new(),
+            });
+        }
+
+        let sort_fields: Vec<SortField> = key_indices
+            .iter()
+            .map(|&i| SortField::new(batch.schema().field(i).data_type().clone()))
+            .collect();
+        let converter = RowConverter::new(sort_fields)?;
+
+        let key_cols: Vec<_> = key_indices
+            .iter()
+            .map(|&i| batch.column(i).clone())
+            .collect();
+        let rows = converter.convert_columns(&key_cols)?;
+
+        let timestamps = extract_i64_timestamps(batch.column(version_col_idx))?;
+
+        let num_rows = batch.num_rows();
+        let mut map: HashMap<Box<[u8]>, BTreeMap<i64, Vec<u32>>> =
+            HashMap::with_capacity(num_rows);
+        #[allow(clippy::cast_possible_truncation)]
+        for (i, ts_opt) in timestamps.iter().enumerate() {
+            // Skip rows with null keys or null version timestamps.
+            let Some(version_ts) = ts_opt else { continue };
+            if key_cols.iter().any(|c| c.is_null(i)) {
+                continue;
+            }
+            let key = Box::from(rows.row(i).as_ref());
+            map.entry(key)
+                .or_default()
+                .entry(*version_ts)
+                .or_default()
+                .push(i as u32);
+        }
+
+        Ok(Self { map })
+    }
+
+    /// Finds the row index for the latest version `<= event_ts` for the
+    /// given key. Returns the last row index at that version.
+    fn probe_at_time(&self, key: &[u8], event_ts: i64) -> Option<u32> {
+        let versions = self.map.get(key)?;
+        let (_, indices) = versions.range(..=event_ts).next_back()?;
+        indices.last().copied()
+    }
+}
+
+/// Extracts `Option<i64>` timestamp values from an Arrow array column.
+///
+/// Returns `None` for null entries (callers must handle nulls explicitly).
+/// Supports `Int64`, all `Timestamp` variants (scaled to milliseconds),
+/// and `Float64` (truncated to `i64`).
+fn extract_i64_timestamps(col: &dyn arrow_array::Array) -> Result<Vec<Option<i64>>> {
+    use arrow_array::{
+        Float64Array, Int64Array, TimestampMicrosecondArray, TimestampMillisecondArray,
+        TimestampNanosecondArray, TimestampSecondArray,
+    };
+    use arrow_schema::{DataType, TimeUnit};
+
+    let n = col.len();
+    let mut out = Vec::with_capacity(n);
+    macro_rules! extract_typed {
+        ($arr_type:ty, $scale:expr) => {{
+            let arr = col
+                .as_any()
+                .downcast_ref::<$arr_type>()
+                .ok_or_else(|| DataFusionError::Internal(concat!("expected ", stringify!($arr_type)).into()))?;
+            for i in 0..n {
+                out.push(if col.is_null(i) { None } else { Some(arr.value(i) * $scale) });
+            }
+        }};
+    }
+
+    match col.data_type() {
+        DataType::Int64 => extract_typed!(Int64Array, 1),
+        DataType::Timestamp(TimeUnit::Millisecond, _) => {
+            extract_typed!(TimestampMillisecondArray, 1);
+        }
+        DataType::Timestamp(TimeUnit::Microsecond, _) => {
+            let arr = col
+                .as_any()
+                .downcast_ref::<TimestampMicrosecondArray>()
+                .ok_or_else(|| DataFusionError::Internal("expected TimestampMicrosecondArray".into()))?;
+            for i in 0..n {
+                out.push(if col.is_null(i) { None } else { Some(arr.value(i) / 1000) });
+            }
+        }
+        DataType::Timestamp(TimeUnit::Second, _) => {
+            extract_typed!(TimestampSecondArray, 1000);
+        }
+        DataType::Timestamp(TimeUnit::Nanosecond, _) => {
+            let arr = col
+                .as_any()
+                .downcast_ref::<TimestampNanosecondArray>()
+                .ok_or_else(|| DataFusionError::Internal("expected TimestampNanosecondArray".into()))?;
+            for i in 0..n {
+                out.push(if col.is_null(i) { None } else { Some(arr.value(i) / 1_000_000) });
+            }
+        }
+        DataType::Float64 => {
+            let arr = col.as_any().downcast_ref::<Float64Array>().ok_or_else(|| {
+                DataFusionError::Internal("expected Float64Array".into())
+            })?;
+            #[allow(clippy::cast_possible_truncation)]
+            for i in 0..n {
+                out.push(if col.is_null(i) { None } else { Some(arr.value(i) as i64) });
+            }
+        }
+        other => {
+            return Err(DataFusionError::Plan(format!(
+                "unsupported timestamp type for temporal join: {other:?}"
+            )));
+        }
+    }
+
+    Ok(out)
+}
+
 
 // ── Physical Execution Plan ──────────────────────────────────────
 
@@ -492,6 +675,300 @@ fn probe_batch(
     debug_assert_eq!(
         columns.len(),
         stream_field_count + lookup_batch.num_columns(),
+        "output column count mismatch"
+    );
+
+    Ok(RecordBatch::try_new(Arc::clone(output_schema), columns)?)
+}
+
+// ── Versioned Lookup Join Exec ────────────────────────────────────
+
+/// Physical plan that probes a versioned (temporal) index for each
+/// batch from the streaming input. For each stream row, finds the
+/// table row with the latest version timestamp `<= event_ts`.
+pub struct VersionedLookupJoinExec {
+    input: Arc<dyn ExecutionPlan>,
+    index: Arc<VersionedIndex>,
+    table_batch: Arc<RecordBatch>,
+    stream_key_indices: Vec<usize>,
+    stream_time_col_idx: usize,
+    join_type: LookupJoinType,
+    schema: SchemaRef,
+    properties: PlanProperties,
+    key_sort_fields: Vec<SortField>,
+    stream_field_count: usize,
+}
+
+impl VersionedLookupJoinExec {
+    /// Creates a new versioned lookup join executor.
+    ///
+    /// The `index` should be pre-built via `VersionedIndex::build()` and
+    /// cached in `VersionedLookupState`. The index is only rebuilt when
+    /// the table data changes (CDC update), not per execution cycle.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error if the output schema cannot be constructed.
+    #[allow(clippy::too_many_arguments, clippy::needless_pass_by_value)]
+    pub fn try_new(
+        input: Arc<dyn ExecutionPlan>,
+        table_batch: RecordBatch,
+        index: Arc<VersionedIndex>,
+        stream_key_indices: Vec<usize>,
+        stream_time_col_idx: usize,
+        join_type: LookupJoinType,
+        output_schema: SchemaRef,
+        key_sort_fields: Vec<SortField>,
+    ) -> Result<Self> {
+
+        let output_schema = if join_type == LookupJoinType::LeftOuter {
+            let stream_count = input.schema().fields().len();
+            let mut fields = output_schema.fields().to_vec();
+            for f in &mut fields[stream_count..] {
+                if !f.is_nullable() {
+                    *f = Arc::new(f.as_ref().clone().with_nullable(true));
+                }
+            }
+            Arc::new(Schema::new_with_metadata(
+                fields,
+                output_schema.metadata().clone(),
+            ))
+        } else {
+            output_schema
+        };
+
+        let properties = PlanProperties::new(
+            EquivalenceProperties::new(Arc::clone(&output_schema)),
+            Partitioning::UnknownPartitioning(1),
+            EmissionType::Incremental,
+            Boundedness::Unbounded {
+                requires_infinite_memory: false,
+            },
+        );
+
+        let stream_field_count = input.schema().fields().len();
+
+        Ok(Self {
+            input,
+            index,
+            table_batch: Arc::new(table_batch),
+            stream_key_indices,
+            stream_time_col_idx,
+            join_type,
+            schema: output_schema,
+            properties,
+            key_sort_fields,
+            stream_field_count,
+        })
+    }
+}
+
+impl Debug for VersionedLookupJoinExec {
+    fn fmt(&self, f: &mut Formatter<'_>) -> fmt::Result {
+        f.debug_struct("VersionedLookupJoinExec")
+            .field("join_type", &self.join_type)
+            .field("stream_keys", &self.stream_key_indices)
+            .field("table_rows", &self.table_batch.num_rows())
+            .finish_non_exhaustive()
+    }
+}
+
+impl DisplayAs for VersionedLookupJoinExec {
+    fn fmt_as(&self, t: DisplayFormatType, f: &mut Formatter<'_>) -> fmt::Result {
+        match t {
+            DisplayFormatType::Default | DisplayFormatType::Verbose => {
+                write!(
+                    f,
+                    "VersionedLookupJoinExec: type={}, stream_keys={:?}, table_rows={}",
+                    self.join_type,
+                    self.stream_key_indices,
+                    self.table_batch.num_rows(),
+                )
+            }
+            DisplayFormatType::TreeRender => write!(f, "VersionedLookupJoinExec"),
+        }
+    }
+}
+
+impl ExecutionPlan for VersionedLookupJoinExec {
+    fn name(&self) -> &'static str {
+        "VersionedLookupJoinExec"
+    }
+
+    fn as_any(&self) -> &dyn Any {
+        self
+    }
+
+    fn schema(&self) -> SchemaRef {
+        Arc::clone(&self.schema)
+    }
+
+    fn properties(&self) -> &PlanProperties {
+        &self.properties
+    }
+
+    fn children(&self) -> Vec<&Arc<dyn ExecutionPlan>> {
+        vec![&self.input]
+    }
+
+    fn with_new_children(
+        self: Arc<Self>,
+        mut children: Vec<Arc<dyn ExecutionPlan>>,
+    ) -> Result<Arc<dyn ExecutionPlan>> {
+        if children.len() != 1 {
+            return Err(DataFusionError::Plan(
+                "VersionedLookupJoinExec requires exactly one child".into(),
+            ));
+        }
+        Ok(Arc::new(Self {
+            input: children.swap_remove(0),
+            index: Arc::clone(&self.index),
+            table_batch: Arc::clone(&self.table_batch),
+            stream_key_indices: self.stream_key_indices.clone(),
+            stream_time_col_idx: self.stream_time_col_idx,
+            join_type: self.join_type,
+            schema: Arc::clone(&self.schema),
+            properties: self.properties.clone(),
+            key_sort_fields: self.key_sort_fields.clone(),
+            stream_field_count: self.stream_field_count,
+        }))
+    }
+
+    fn execute(
+        &self,
+        partition: usize,
+        context: Arc<TaskContext>,
+    ) -> Result<SendableRecordBatchStream> {
+        let input_stream = self.input.execute(partition, context)?;
+        let converter = RowConverter::new(self.key_sort_fields.clone())?;
+        let index = Arc::clone(&self.index);
+        let table_batch = Arc::clone(&self.table_batch);
+        let stream_key_indices = self.stream_key_indices.clone();
+        let stream_time_col_idx = self.stream_time_col_idx;
+        let join_type = self.join_type;
+        let schema = self.schema();
+        let stream_field_count = self.stream_field_count;
+
+        let output = input_stream.map(move |result| {
+            let batch = result?;
+            if batch.num_rows() == 0 {
+                return Ok(RecordBatch::new_empty(Arc::clone(&schema)));
+            }
+            probe_versioned_batch(
+                &batch,
+                &converter,
+                &index,
+                &table_batch,
+                &stream_key_indices,
+                stream_time_col_idx,
+                join_type,
+                &schema,
+                stream_field_count,
+            )
+        });
+
+        Ok(Box::pin(RecordBatchStreamAdapter::new(
+            self.schema(),
+            output,
+        )))
+    }
+}
+
+impl datafusion::physical_plan::ExecutionPlanProperties for VersionedLookupJoinExec {
+    fn output_partitioning(&self) -> &Partitioning {
+        self.properties.output_partitioning()
+    }
+
+    fn output_ordering(&self) -> Option<&LexOrdering> {
+        self.properties.output_ordering()
+    }
+
+    fn boundedness(&self) -> Boundedness {
+        Boundedness::Unbounded {
+            requires_infinite_memory: false,
+        }
+    }
+
+    fn pipeline_behavior(&self) -> EmissionType {
+        EmissionType::Incremental
+    }
+
+    fn equivalence_properties(&self) -> &EquivalenceProperties {
+        self.properties.equivalence_properties()
+    }
+}
+
+/// Probes the versioned index for each row in `stream_batch`, finding
+/// the table row with the latest version `<= event_ts`.
+#[allow(clippy::too_many_arguments)]
+fn probe_versioned_batch(
+    stream_batch: &RecordBatch,
+    converter: &RowConverter,
+    index: &VersionedIndex,
+    table_batch: &RecordBatch,
+    stream_key_indices: &[usize],
+    stream_time_col_idx: usize,
+    join_type: LookupJoinType,
+    output_schema: &SchemaRef,
+    stream_field_count: usize,
+) -> Result<RecordBatch> {
+    let key_cols: Vec<_> = stream_key_indices
+        .iter()
+        .map(|&i| stream_batch.column(i).clone())
+        .collect();
+    let rows = converter.convert_columns(&key_cols)?;
+    let event_timestamps =
+        extract_i64_timestamps(stream_batch.column(stream_time_col_idx).as_ref())?;
+
+    let num_rows = stream_batch.num_rows();
+    let mut stream_indices: Vec<u32> = Vec::with_capacity(num_rows);
+    let mut lookup_indices: Vec<Option<u32>> = Vec::with_capacity(num_rows);
+
+    #[allow(clippy::cast_possible_truncation)]
+    for (row, event_ts_opt) in event_timestamps.iter().enumerate() {
+        // Null keys or null event timestamps cannot match.
+        if key_cols.iter().any(|c| c.is_null(row)) || event_ts_opt.is_none() {
+            if join_type == LookupJoinType::LeftOuter {
+                stream_indices.push(row as u32);
+                lookup_indices.push(None);
+            }
+            continue;
+        }
+
+        let key = rows.row(row);
+        let event_ts = event_ts_opt.unwrap();
+        match index.probe_at_time(key.as_ref(), event_ts) {
+            Some(table_row_idx) => {
+                stream_indices.push(row as u32);
+                lookup_indices.push(Some(table_row_idx));
+            }
+            None if join_type == LookupJoinType::LeftOuter => {
+                stream_indices.push(row as u32);
+                lookup_indices.push(None);
+            }
+            None => {}
+        }
+    }
+
+    if stream_indices.is_empty() {
+        return Ok(RecordBatch::new_empty(Arc::clone(output_schema)));
+    }
+
+    let take_stream = UInt32Array::from(stream_indices);
+    let mut columns = Vec::with_capacity(output_schema.fields().len());
+
+    for col in stream_batch.columns() {
+        columns.push(take(col.as_ref(), &take_stream, None)?);
+    }
+
+    let take_lookup: UInt32Array = lookup_indices.into_iter().collect();
+    for col in table_batch.columns() {
+        columns.push(take(col.as_ref(), &take_lookup, None)?);
+    }
+
+    debug_assert_eq!(
+        columns.len(),
+        stream_field_count + table_batch.num_columns(),
         "output column count mismatch"
     );
 
@@ -897,6 +1374,7 @@ impl LookupJoinExtensionPlanner {
 
 #[async_trait]
 impl ExtensionPlanner for LookupJoinExtensionPlanner {
+    #[allow(clippy::too_many_lines)]
     async fn plan_extension(
         &self,
         _planner: &dyn PhysicalPlanner,
@@ -986,6 +1464,56 @@ impl ExtensionPlanner for LookupJoinExtensionPlanner {
                     lookup_key_indices,
                     lookup_node.join_type(),
                     output_schema,
+                )?;
+
+                Ok(Some(Arc::new(exec)))
+            }
+            RegisteredLookup::Versioned(versioned_state) => {
+                let table_schema = versioned_state.batch.schema();
+                let lookup_key_indices = resolve_lookup_keys(lookup_node, &table_schema)?;
+                let stream_key_indices = resolve_stream_keys(lookup_node, &stream_schema)?;
+
+                // Validate key type compatibility.
+                for (si, li) in stream_key_indices.iter().zip(&lookup_key_indices) {
+                    let st = stream_schema.field(*si).data_type();
+                    let lt = table_schema.field(*li).data_type();
+                    if st != lt {
+                        return Err(DataFusionError::Plan(format!(
+                            "Temporal join key type mismatch: stream '{}' is {st:?} \
+                             but table '{}' is {lt:?}",
+                            stream_schema.field(*si).name(),
+                            table_schema.field(*li).name(),
+                        )));
+                    }
+                }
+
+                let stream_time_col_idx = stream_schema
+                    .index_of(&versioned_state.stream_time_column)
+                    .map_err(|_| {
+                        DataFusionError::Plan(format!(
+                            "stream time column '{}' not found in stream schema",
+                            versioned_state.stream_time_column
+                        ))
+                    })?;
+
+                let key_sort_fields: Vec<SortField> = lookup_key_indices
+                    .iter()
+                    .map(|&i| SortField::new(table_schema.field(i).data_type().clone()))
+                    .collect();
+
+                let mut output_fields = stream_schema.fields().to_vec();
+                output_fields.extend(table_schema.fields().iter().cloned());
+                let output_schema = Arc::new(Schema::new(output_fields));
+
+                let exec = VersionedLookupJoinExec::try_new(
+                    input,
+                    versioned_state.batch.clone(),
+                    Arc::clone(&versioned_state.index),
+                    stream_key_indices,
+                    stream_time_col_idx,
+                    lookup_node.join_type(),
+                    output_schema,
+                    key_sort_fields,
                 )?;
 
                 Ok(Some(Arc::new(exec)))
@@ -1854,5 +2382,195 @@ mod tests {
             "NULL key row should have null lookup name"
         );
         assert_eq!(names.value(2), "Bob");
+    }
+
+    // ── Versioned Lookup Join Tests ────────────────────────────────
+
+    fn versioned_table_batch() -> RecordBatch {
+        // Table with key=currency, version_ts=valid_from, rate=value
+        // Two currencies with multiple versions each
+        let schema = Arc::new(Schema::new(vec![
+            Field::new("currency", DataType::Utf8, false),
+            Field::new("valid_from", DataType::Int64, false),
+            Field::new("rate", DataType::Float64, false),
+        ]));
+        RecordBatch::try_new(
+            schema,
+            vec![
+                Arc::new(StringArray::from(vec!["USD", "USD", "EUR", "EUR", "EUR"])),
+                Arc::new(Int64Array::from(vec![100, 200, 100, 150, 300])),
+                Arc::new(Float64Array::from(vec![1.0, 1.1, 0.85, 0.90, 0.88])),
+            ],
+        )
+        .unwrap()
+    }
+
+    fn stream_batch_with_time() -> RecordBatch {
+        let schema = Arc::new(Schema::new(vec![
+            Field::new("order_id", DataType::Int64, false),
+            Field::new("currency", DataType::Utf8, false),
+            Field::new("event_ts", DataType::Int64, false),
+        ]));
+        RecordBatch::try_new(
+            schema,
+            vec![
+                Arc::new(Int64Array::from(vec![1, 2, 3, 4])),
+                Arc::new(StringArray::from(vec!["USD", "EUR", "USD", "EUR"])),
+                Arc::new(Int64Array::from(vec![150, 160, 250, 50])),
+            ],
+        )
+        .unwrap()
+    }
+
+    #[test]
+    fn test_versioned_index_build_and_probe() {
+        let batch = versioned_table_batch();
+        let index = VersionedIndex::build(&batch, &[0], 1).unwrap();
+
+        // USD has versions at 100 and 200
+        // Probe at 150 → should find version 100 (latest <= 150)
+        let key_sf = vec![SortField::new(DataType::Utf8)];
+        let converter = RowConverter::new(key_sf).unwrap();
+        let usd_col = Arc::new(StringArray::from(vec!["USD"]));
+        let usd_rows = converter.convert_columns(&[usd_col]).unwrap();
+        let usd_key = usd_rows.row(0);
+
+        let result = index.probe_at_time(usd_key.as_ref(), 150);
+        assert!(result.is_some());
+        // Row 0 is USD@100, Row 1 is USD@200. At time 150, should get row 0.
+        assert_eq!(result.unwrap(), 0);
+
+        // Probe at 250 → should find version 200 (row 1)
+        let result = index.probe_at_time(usd_key.as_ref(), 250);
+        assert_eq!(result.unwrap(), 1);
+    }
+
+    #[test]
+    fn test_versioned_index_no_version_before_ts() {
+        let batch = versioned_table_batch();
+        let index = VersionedIndex::build(&batch, &[0], 1).unwrap();
+
+        let key_sf = vec![SortField::new(DataType::Utf8)];
+        let converter = RowConverter::new(key_sf).unwrap();
+        let eur_col = Arc::new(StringArray::from(vec!["EUR"]));
+        let eur_rows = converter.convert_columns(&[eur_col]).unwrap();
+        let eur_key = eur_rows.row(0);
+
+        // EUR versions start at 100. Probe at 50 → None
+        let result = index.probe_at_time(eur_key.as_ref(), 50);
+        assert!(result.is_none());
+    }
+
+    /// Helper to build a VersionedLookupJoinExec for tests.
+    fn build_versioned_exec(
+        table: RecordBatch,
+        stream: RecordBatch,
+        join_type: LookupJoinType,
+    ) -> VersionedLookupJoinExec {
+        let input = batch_exec(stream.clone());
+        let index = Arc::new(VersionedIndex::build(&table, &[0], 1).unwrap());
+        let key_sort_fields = vec![SortField::new(DataType::Utf8)];
+        let mut output_fields = stream.schema().fields().to_vec();
+        output_fields.extend(table.schema().fields().iter().cloned());
+        let output_schema = Arc::new(Schema::new(output_fields));
+        VersionedLookupJoinExec::try_new(
+            input,
+            table,
+            index,
+            vec![1], // stream key col: currency
+            2,       // stream time col: event_ts
+            join_type,
+            output_schema,
+            key_sort_fields,
+        )
+        .unwrap()
+    }
+
+    #[tokio::test]
+    async fn test_versioned_join_exec_inner() {
+        let table = versioned_table_batch();
+        let stream = stream_batch_with_time();
+        let exec = build_versioned_exec(table, stream, LookupJoinType::Inner);
+
+        let ctx = Arc::new(TaskContext::default());
+        let stream_out = exec.execute(0, ctx).unwrap();
+        let batches: Vec<RecordBatch> = stream_out.try_collect().await.unwrap();
+
+        assert_eq!(batches.len(), 1);
+        let batch = &batches[0];
+        // Row 1: order_id=1, USD, ts=150 → USD@100 (rate=1.0)
+        // Row 2: order_id=2, EUR, ts=160 → EUR@150 (rate=0.90)
+        // Row 3: order_id=3, USD, ts=250 → USD@200 (rate=1.1)
+        // Row 4: order_id=4, EUR, ts=50 → no EUR version <= 50 → SKIP (inner)
+        assert_eq!(batch.num_rows(), 3);
+
+        let rates = batch
+            .column(5) // rate is 6th column (3 stream + 3 table, rate is table col 2)
+            .as_any()
+            .downcast_ref::<Float64Array>()
+            .unwrap();
+        assert!((rates.value(0) - 1.0).abs() < f64::EPSILON); // USD@100
+        assert!((rates.value(1) - 0.90).abs() < f64::EPSILON); // EUR@150
+        assert!((rates.value(2) - 1.1).abs() < f64::EPSILON); // USD@200
+    }
+
+    #[tokio::test]
+    async fn test_versioned_join_exec_left_outer() {
+        let table = versioned_table_batch();
+        let stream = stream_batch_with_time();
+        let exec = build_versioned_exec(table, stream, LookupJoinType::LeftOuter);
+
+        let ctx = Arc::new(TaskContext::default());
+        let stream_out = exec.execute(0, ctx).unwrap();
+        let batches: Vec<RecordBatch> = stream_out.try_collect().await.unwrap();
+
+        assert_eq!(batches.len(), 1);
+        let batch = &batches[0];
+        // All 4 rows present (left outer)
+        assert_eq!(batch.num_rows(), 4);
+
+        // Row 4 (EUR@50): no version → null rate
+        let rates = batch
+            .column(5)
+            .as_any()
+            .downcast_ref::<Float64Array>()
+            .unwrap();
+        assert!(rates.is_null(3), "EUR@50 should have null rate");
+    }
+
+    #[test]
+    fn test_versioned_index_empty_batch() {
+        let schema = Arc::new(Schema::new(vec![
+            Field::new("k", DataType::Utf8, false),
+            Field::new("v", DataType::Int64, false),
+        ]));
+        let batch = RecordBatch::new_empty(schema);
+        let index = VersionedIndex::build(&batch, &[0], 1).unwrap();
+        assert!(index.map.is_empty());
+    }
+
+    #[test]
+    fn test_versioned_lookup_registry() {
+        let registry = LookupTableRegistry::new();
+        let table = versioned_table_batch();
+        let index = Arc::new(VersionedIndex::build(&table, &[0], 1).unwrap());
+
+        registry.register_versioned(
+            "rates",
+            VersionedLookupState {
+                batch: table,
+                index,
+                key_columns: vec!["currency".to_string()],
+                version_column: "valid_from".to_string(),
+                stream_time_column: "event_ts".to_string(),
+            },
+        );
+
+        let entry = registry.get_entry("rates");
+        assert!(entry.is_some());
+        assert!(matches!(entry.unwrap(), RegisteredLookup::Versioned(_)));
+
+        // get() should return None for versioned entries (snapshot-only)
+        assert!(registry.get("rates").is_none());
     }
 }

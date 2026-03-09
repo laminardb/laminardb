@@ -1,28 +1,18 @@
-# LaminarDB
-
-**Embedded streaming SQL database written in Rust.**
-
 [![CI](https://github.com/laminardb/laminardb/actions/workflows/ci.yml/badge.svg)](https://github.com/laminardb/laminardb/actions/workflows/ci.yml)
 [![Crates.io](https://img.shields.io/crates/v/laminar-db.svg)](https://crates.io/crates/laminar-db)
 [![docs.rs](https://docs.rs/laminar-db/badge.svg)](https://docs.rs/laminar-db)
 [![License](https://img.shields.io/badge/license-Apache--2.0-blue)](LICENSE)
 [![Rust](https://img.shields.io/badge/rust-1.85%2B-orange)](https://www.rust-lang.org)
 
-Think "SQLite for stream processing." LaminarDB is an embedded streaming database that lets you run continuous SQL queries over real-time data with sub-microsecond latency. No cluster, no JVM, no external dependencies -- just link it as a Rust library.
+# LaminarDB
 
-Built on [Apache Arrow](https://arrow.apache.org/) and [DataFusion](https://datafusion.apache.org/), LaminarDB targets use cases like financial market data, IoT edge analytics, and real-time application state where every microsecond counts.
+A streaming SQL engine for Rust — embed it in your process or run it standalone.
 
----
+Stream processing today means running a JVM cluster (Flink), paying for a managed service (RisingWave, Confluent), or hand-rolling state machines. LaminarDB brings continuous SQL queries, event-time windowing, and exactly-once checkpointing to a single Rust crate. Rust gives you predictable latency without GC pauses and memory safety without a runtime. No JVM. No cluster. `cargo add laminar-db` and go.
 
-## Getting Started
+## Quick Start
 
-### 1. Add the dependency
-
-```bash
-cargo add laminar-db
-```
-
-Or in your `Cargo.toml`:
+### Rust
 
 ```toml
 [dependencies]
@@ -30,57 +20,46 @@ laminar-db = "0.18"
 tokio = { version = "1", features = ["full"] }
 ```
 
-### 2. Write your first streaming query
-
 ```rust
 use laminar_db::LaminarDB;
 
 #[tokio::main]
 async fn main() -> Result<(), Box<dyn std::error::Error>> {
-    // Open an in-memory database
     let db = LaminarDB::open()?;
 
-    // Create a streaming source
     db.execute("CREATE SOURCE trades (
         symbol VARCHAR NOT NULL,
         price DOUBLE NOT NULL,
         volume BIGINT NOT NULL,
-        ts BIGINT NOT NULL
+        ts BIGINT NOT NULL,
+        WATERMARK FOR ts AS ts - INTERVAL '5' SECOND
     )").await?;
 
-    // Define a continuous aggregation with a tumbling window
     db.execute("CREATE STREAM vwap AS
         SELECT symbol,
                SUM(price * CAST(volume AS DOUBLE)) / SUM(CAST(volume AS DOUBLE)) AS vwap,
                COUNT(*) AS trades
         FROM trades
-        GROUP BY symbol, tumble(ts, INTERVAL '1' MINUTE)
+        GROUP BY symbol, TUMBLE(ts, INTERVAL '1' MINUTE)
+        EMIT ON WINDOW CLOSE
     ").await?;
 
-    // Get a handle to push data
     let source = db.source_untyped("trades")?;
-
-    // Start the streaming pipeline
     db.start().await?;
 
-    // Push data via source.push(record_batch)
-    // Subscribe to results via db.subscribe::<T>("vwap")
+    // Push Arrow RecordBatches via source.push(batch)
+    // Read results via db.subscribe::<T>("vwap")
 
     db.shutdown().await?;
     Ok(())
 }
 ```
 
-### 3. Build and run
+This example compiles and runs against the `laminar-db` v0.18 public API. See [`examples/binance-ws`](examples/binance-ws) for a complete working demo that streams live Binance trades through 18 SQL pipeline stages with a TUI dashboard.
 
-```bash
-cargo build --release
-cargo run
-```
+### Python
 
-### Python Quick Start
-
-Python bindings via [laminardb-python](https://github.com/laminardb/laminardb-python):
+Python bindings are available via the separate [`laminardb-python`](https://github.com/laminardb/laminardb-python) repository:
 
 ```bash
 pip install laminardb
@@ -95,80 +74,80 @@ conn.insert("sensors", [
     {"ts": 1, "device": "sensor_a", "value": 42.0},
     {"ts": 2, "device": "sensor_b", "value": 43.5},
 ])
-
 conn.sql("SELECT * FROM sensors WHERE value > 42.0").show()
-#    ts    device  value
-# 0   2  sensor_b   43.5
-
 conn.close()
 ```
 
-See the [Python README](https://github.com/laminardb/laminardb-python) for the full API including streaming subscriptions, DataFrame integration, and async support.
+---
+
+## What It Is
+
+LaminarDB is a streaming SQL engine built on [Apache Arrow](https://arrow.apache.org/) and [DataFusion](https://datafusion.apache.org/). It runs continuous queries over unbounded data streams, manages windowed state, and handles event-time semantics including watermarks and late data.
+
+Three deployment modes:
+
+| Mode | How | Status |
+|------|-----|--------|
+| **Embedded** | `cargo add laminar-db` — runs inside your Rust process | ✅ Implemented |
+| **Standalone** | `laminardb` binary with HTTP API, configurable via TOML | ✅ Implemented |
+| **Distributed** | Multi-node via gossip discovery, Raft consensus, gRPC — `--features delta` | ✅ Implemented (not yet production-hardened; Phase 6c pending) |
+
+The embedded mode is the primary deployment target. You get a `LaminarDB` handle, register sources with SQL DDL, push `RecordBatch` data in, subscribe to output streams, and let the engine handle windowing, joins, checkpointing, and exactly-once delivery.
 
 ---
 
-## Feature Overview
+## Streaming SQL
 
-### Streaming SQL
+Standard SQL with streaming extensions. Built on DataFusion 52.
 
-Standard SQL with streaming extensions. All window types, join types, and EMIT strategies below are implemented and tested.
+### Window Types
 
-#### Window Types
-
-| Window | Syntax | Description |
-|--------|--------|-------------|
-| Tumbling | `tumble(ts, INTERVAL '1' MINUTE)` | Fixed-size, non-overlapping windows |
-| Sliding | `slide(ts, INTERVAL '5' MINUTE, INTERVAL '1' MINUTE)` | Overlapping windows with configurable slide |
-| Hopping | `hop(ts, INTERVAL '10' SECOND, INTERVAL '5' SECOND)` | Alias for sliding windows |
-| Session | `session(ts, INTERVAL '30' SECOND)` | Gap-based dynamic windows with merge support |
+| Window | Syntax | Status |
+|--------|--------|--------|
+| Tumbling | `TUMBLE(ts, INTERVAL '1' MINUTE)` | ✅ |
+| Sliding / Hopping | `HOP(ts, INTERVAL '10' SECOND, INTERVAL '5' SECOND)` | ✅ |
+| Session | `SESSION(ts, INTERVAL '30' SECOND)` | ✅ |
+| Cumulate | `CUMULATE(ts, INTERVAL '1' MINUTE, INTERVAL '1' HOUR)` | 🔧 Parsed, not yet in streaming pipeline |
 
 ```sql
--- Tumbling window: 1-minute OHLC bars
+-- 1-minute OHLC bars
 CREATE STREAM ohlc_1m AS
 SELECT symbol,
-       CAST(tumble(ts, INTERVAL '1' MINUTE) AS BIGINT) AS window_start,
-       first_value(price) AS open,
-       MAX(price) AS high,
-       MIN(price) AS low,
-       last_value(price) AS close,
+       FIRST_VALUE(price) AS open,
+       MAX(price) AS high, MIN(price) AS low,
+       LAST_VALUE(price) AS close,
        SUM(volume) AS volume
 FROM trades
-GROUP BY symbol, tumble(ts, INTERVAL '1' MINUTE)
+GROUP BY symbol, TUMBLE(ts, INTERVAL '1' MINUTE)
 EMIT ON WINDOW CLOSE;
 
--- Session window: detect activity bursts
+-- Session windows: detect activity bursts
 CREATE STREAM user_sessions AS
-SELECT user_id,
-       COUNT(*) AS clicks,
+SELECT user_id, COUNT(*) AS clicks,
        MAX(ts) - MIN(ts) AS duration_ms
 FROM clickstream
-GROUP BY user_id, session(ts, INTERVAL '30' SECOND)
+GROUP BY user_id, SESSION(ts, INTERVAL '30' SECOND)
 EMIT ON WINDOW CLOSE;
 ```
 
-#### Join Types
+### Join Types
 
-| Join | Description |
-|------|-------------|
-| Stream-Stream | Time-bounded inner/outer joins between two streams |
-| ASOF | Point-in-time lookups (match closest preceding row) |
-| Temporal | Versioned joins with time-validity semantics |
-| Lookup | Enrichment joins against reference/lookup tables |
+| Join | Description | Status |
+|------|-------------|--------|
+| Inner / Left / Right / Full | Standard SQL joins | ✅ |
+| Left Semi / Anti | Existence checks | ✅ |
+| ASOF | Point-in-time lookup (backward, forward, nearest) | ✅ |
+| Lookup | Enrichment against reference tables (Postgres, Parquet) | ✅ |
+| Stream-Stream | Time-bounded joins between two streams | ✅ |
+| Temporal | Versioned joins with time-validity semantics (`FOR SYSTEM_TIME AS OF`) | ✅ |
 
 ```sql
--- Stream-stream join with time window
-CREATE STREAM enriched_orders AS
-SELECT o.order_id, o.symbol, t.price AS market_price
-FROM orders o
-INNER JOIN trades t ON o.symbol = t.symbol
-    AND t.ts BETWEEN o.ts - 10000 AND o.ts + 10000;
-
--- ASOF join for point-in-time lookup
+-- ASOF join: latest trade price for each order
 SELECT o.*, t.price AS last_trade_price
 FROM orders o
 ASOF JOIN trades t ON o.symbol = t.symbol AND o.ts >= t.ts;
 
--- Lookup join against a reference table
+-- Lookup join against external Postgres table
 CREATE LOOKUP TABLE instruments FROM POSTGRES (
     hostname = 'db.example.com', port = '5432',
     database = 'market', query = 'SELECT * FROM instruments'
@@ -179,117 +158,84 @@ FROM trades t
 JOIN instruments i ON t.symbol = i.symbol;
 ```
 
-#### EMIT Strategies
+### EMIT Strategies
 
-| Strategy | Behavior | Use Case |
-|----------|----------|----------|
-| `EMIT ON WINDOW CLOSE` | Emit once when the window closes | Final aggregates (OHLC bars, billing) |
-| `EMIT CHANGES` | Emit insert/retract pairs on every update | Live dashboards, cascading MVs |
-| `EMIT FINAL` | Alias for ON WINDOW CLOSE | Explicit final-only output |
+| Strategy | Behavior |
+|----------|----------|
+| `EMIT ON WINDOW CLOSE` | Emit once when the window closes |
+| `EMIT CHANGES` | Emit insert/retract pairs (Z-set changelog) on every update |
+| `EMIT FINAL` | Alias for ON WINDOW CLOSE |
 
-`EMIT CHANGES` uses the **Z-set changelog model** (DBSP/Feldera-inspired): each update produces a `+1` insert for the new value and a `-1` retraction for the previous value, enabling correct incremental computation and cascading materialized views.
-
-#### Analytics Functions
-
-```sql
--- LAG/LEAD
-SELECT symbol, price,
-       LAG(price, 1) OVER (PARTITION BY symbol ORDER BY ts) AS prev_price,
-       price - LAG(price, 1) OVER (PARTITION BY symbol ORDER BY ts) AS delta
-FROM trades;
-
--- Ranking
-SELECT symbol, price,
-       ROW_NUMBER() OVER (PARTITION BY symbol ORDER BY price DESC) AS rank
-FROM trades;
-
--- Cascading materialized views (MV reading from MV)
-CREATE MATERIALIZED VIEW ohlc_1h AS
-SELECT symbol,
-       first_value(open) AS open, MAX(high) AS high,
-       MIN(low) AS low, last_value(close) AS close
-FROM ohlc_1m
-GROUP BY symbol, tumble(window_start, INTERVAL '1' HOUR);
-```
-
-#### Introspection
-
-```sql
--- Show all registered sources/sinks/streams with metadata columns
-SHOW SOURCES;
-SHOW SINKS;
-SHOW STREAMS;
-
--- Reconstruct the DDL for a source or sink
-SHOW CREATE SOURCE trades;
-
--- Explain a query plan with execution metrics
-EXPLAIN ANALYZE SELECT symbol, COUNT(*) FROM trades GROUP BY symbol;
-```
-
-#### Additional SQL Features
-
-- **Window offsets** -- `tumble(ts, INTERVAL '1' HOUR, INTERVAL '8' HOUR)` for timezone-aligned windows
-- **ASOF NEAREST** -- Match by minimum absolute time difference via `MATCH_CONDITION(NEAREST(...))`
-- **date_trunc / date_bin** -- Available via DataFusion 52 built-ins
-- **UNNEST** -- Available via DataFusion 52 built-ins
-- **Structured error codes** -- Every error carries a stable `LDB-NNNN` code for grep-able diagnostics
-
-See [docs/SQL_REFERENCE.md](docs/SQL_REFERENCE.md) for the complete SQL dialect reference, including gotchas and tested patterns.
+`EMIT CHANGES` produces `+1` insert and `-1` retraction pairs, enabling correct incremental computation and cascading materialized views.
 
 ### Watermarks and Event Time
 
-Event-time processing with watermarks handles out-of-order data.
-
 ```sql
--- Bounded out-of-orderness: allow up to 5 seconds of late data
 CREATE SOURCE trades (
     symbol VARCHAR, price DOUBLE, volume BIGINT, ts BIGINT,
     WATERMARK FOR ts AS ts - INTERVAL '5' SECOND
 );
 ```
 
-Watermark types:
-- **Per-partition** -- independent watermark per source partition
-- **Per-key** -- independent watermark per key (e.g., per symbol)
-- **Alignment groups** -- synchronized watermarks across related sources for join correctness
+Watermark types: per-partition, per-key, and alignment groups (synchronized across related sources for join correctness). Late data can be dropped or redirected to a side output.
 
-Late data can be dropped (default) or redirected to a side output.
+### DDL
+
+```sql
+CREATE SOURCE ... [FROM connector(...)]
+CREATE STREAM ... AS SELECT ...
+CREATE MATERIALIZED VIEW ... AS SELECT ...
+CREATE SINK ... INTO connector(...) AS SELECT ...
+CREATE LOOKUP TABLE ... FROM POSTGRES(...) | PARQUET(...)
+DROP SOURCE | STREAM | SINK | MATERIALIZED VIEW
+SHOW SOURCES | STREAMS | SINKS | MATERIALIZED VIEWS
+SHOW CREATE SOURCE name
+DESCRIBE [EXTENDED] table_name
+EXPLAIN ANALYZE SELECT ...
+```
+
+All aggregation functions from DataFusion 52 are available: `COUNT`, `SUM`, `AVG`, `MIN`, `MAX`, `FIRST_VALUE`, `LAST_VALUE`, `STDDEV`, `PERCENTILE_CONT`, `APPROX_COUNT_DISTINCT`, `LAG`, `LEAD`, `ROW_NUMBER`, and 40+ more. JSON extraction, array/struct/map functions, and `UNNEST` are also supported.
 
 ---
 
 ## Connectors
 
-Feature-gated connectors for external systems. Each implements the `SourceConnector` or `SinkConnector` trait with exactly-once semantics via two-phase commit.
+Feature-gated connectors for external systems. Each implements `SourceConnector` or `SinkConnector` with two-phase commit for exactly-once semantics.
 
-### Source Connectors
+### Sources
 
-| Connector | Feature Flag | Description | Status |
-|-----------|-------------|-------------|--------|
-| **Kafka** | `kafka` | Consumer group, backpressure, Schema Registry | Implemented |
-| **PostgreSQL CDC** | `postgres-cdc` | Logical replication (pgoutput), Z-set changelog | Implemented |
-| **MySQL CDC** | `mysql-cdc` | Binlog decoding, GTID position tracking | Implemented |
-| **WebSocket Client** | `websocket` | Connect to external WebSocket servers | Implemented |
-| **WebSocket Server** | `websocket` | Accept incoming WebSocket connections | Implemented |
-| **Delta Lake** | `delta-lake` | Read from Delta Lake tables (version polling) | Implemented |
-| MongoDB CDC | -- | -- | Planned |
+| Connector | Feature Flag | Notes | Status |
+|-----------|-------------|-------|--------|
+| Kafka | `kafka` | Consumer group, Schema Registry, Avro/JSON/CSV/Debezium | ✅ |
+| PostgreSQL CDC | `postgres-cdc` | Logical replication (pgoutput), Z-set changelog | ✅ |
+| MySQL CDC | `mysql-cdc` | Binlog replication, GTID position tracking | ✅ |
+| WebSocket Client | `websocket` | Connect to external WebSocket servers | ✅ |
+| WebSocket Server | `websocket` | Accept incoming WebSocket connections | ✅ |
+| Delta Lake | `delta-lake` | Read from Delta Lake tables, version polling | ✅ |
+| Files (AutoLoader) | `files` | Glob pattern discovery, watch mode, Parquet/CSV | ✅ |
+| Parquet Lookup | `parquet-lookup` | Read Parquet files as reference tables | ✅ |
+| Postgres Lookup | -- | Query external Postgres tables for enrichment | ✅ |
 
-### Sink Connectors
+### Sinks
 
-| Connector | Feature Flag | Description | Status |
-|-----------|-------------|-------------|--------|
-| **Kafka** | `kafka` | Exactly-once transactions, configurable partitioning | Implemented |
-| **PostgreSQL** | `postgres-sink` | COPY BINARY, upsert, co-transactional exactly-once | Implemented |
-| **Delta Lake** | `delta-lake` | S3/Azure/GCS, epoch-aligned Parquet commits | Implemented |
-| **Apache Iceberg** | -- | -- | Planned |
-| **WebSocket Server** | `websocket` | Fan-out results to connected subscribers | Implemented |
-| **WebSocket Client** | `websocket` | Push results to external WebSocket server | Implemented |
+| Connector | Feature Flag | Notes | Status |
+|-----------|-------------|-------|--------|
+| Kafka | `kafka` | Exactly-once transactions, configurable partitioning | ✅ |
+| PostgreSQL | `postgres-sink` | COPY BINARY, upsert, co-transactional exactly-once | ✅ |
+| Delta Lake | `delta-lake` | S3/Azure/GCS, epoch-aligned Parquet commits | ✅ |
+| WebSocket Server | `websocket` | Fan-out to connected subscribers | ✅ |
+| WebSocket Client | `websocket` | Push to external WebSocket server | ✅ |
+| Files | `files` | Parquet/CSV with timestamp/partition templates | ✅ |
+| Apache Iceberg | -- | -- | 📋 Planned |
 
-### Kafka Source Example
+Cloud storage backends for Delta Lake: S3 (`delta-lake-s3`), Azure ADLS (`delta-lake-azure`), GCS (`delta-lake-gcs`). Supports Unity and Glue catalogs.
+
+### Connector Example
 
 ```sql
 CREATE SOURCE trades (
-    symbol VARCHAR, price DOUBLE, volume BIGINT, ts BIGINT
+    symbol VARCHAR, price DOUBLE, volume BIGINT, ts BIGINT,
+    WATERMARK FOR ts AS ts - INTERVAL '5' SECOND
 ) FROM KAFKA (
     brokers = '${KAFKA_BROKERS}',
     topic = 'market-trades',
@@ -297,147 +243,72 @@ CREATE SOURCE trades (
     format = 'json',
     offset_reset = 'earliest'
 );
-```
 
-Supported formats: `json`, `csv`, `avro` (with Schema Registry), `raw` (bytes), `debezium` (CDC envelope).
-
-### PostgreSQL CDC Example
-
-```sql
-CREATE SOURCE orders_cdc (
-    id INT, customer_id INT, amount DOUBLE, status VARCHAR, ts BIGINT
-) FROM POSTGRES_CDC (
-    hostname = 'db.example.com',
-    port = '5432',
-    database = 'shop',
-    slot.name = 'laminar_orders',
-    publication = 'laminar_pub'
-);
-```
-
-CDC events are emitted as a Z-set changelog with `_op` column (`I`=insert, `U`=update, `D`=delete).
-
-### MySQL CDC Example
-
-```sql
-CREATE SOURCE products_cdc (
-    id INT, name VARCHAR, price DOUBLE, updated_at BIGINT
-) FROM MYSQL_CDC (
-    hostname = 'mysql.example.com',
-    port = '3306',
-    database = 'inventory',
-    table = 'products',
-    server_id = '12345'
-);
-```
-
-### Delta Lake Sink Example
-
-```sql
-CREATE SINK lake INTO DELTA_LAKE (
+CREATE SINK trade_archive INTO DELTA_LAKE (
     path = 's3://my-bucket/trade_summary',
     write_mode = 'append',
     delivery.guarantee = 'exactly-once'
 ) AS SELECT * FROM trade_summary;
 ```
 
-Cloud storage backends: S3 (`delta-lake-s3`), Azure ADLS (`delta-lake-azure`), GCS (`delta-lake-gcs`). Supports Glue and Unity catalogs.
+Supported formats: `json`, `csv`, `avro` (with Schema Registry), `raw` (bytes), `debezium` (CDC envelope).
 
-### Connector SDK
-
-Build custom connectors with the SDK:
-
-```rust
-use laminar_connectors::connector::{SourceConnector, SinkConnector};
-use laminar_connectors::sdk::{RetryPolicy, CircuitBreaker, RateLimiter};
-```
-
-Includes retry policies, circuit breakers, rate limiters, and a test harness.
-
----
-
-## Schema Framework
-
-Pluggable format decoding, schema inference, and schema evolution.
-
-### Format Decoders
-
-| Format | Inference | Description |
-|--------|-----------|-------------|
-| JSON | Yes | Type inference, nested object/array support |
-| CSV | Yes | Header-based inference, type sampling |
-| Avro | Yes | Schema Registry integration |
-| Parquet | Yes | Metadata-driven schema |
-| Protobuf | -- | Planned |
-
-### Additional Capabilities
-
-- **Schema Evolution** -- additive column changes with backward/forward compatibility
-- **Dead Letter Queue** -- malformed records routed to DLQ for inspection
-- **Schema Hints** -- partial schema specification with wildcard inference for the rest
-- **JSON Functions** -- PostgreSQL-compatible JSON extraction, table-valued functions, LaminarDB extensions
-- **Array/Struct/Map Functions** -- complex type manipulation in SQL
+Custom connectors can be built using the `SourceConnector` / `SinkConnector` traits with retry policies, circuit breakers, and rate limiters from the connector SDK.
 
 ---
 
 ## Architecture
 
-Three-ring architecture separating latency-critical event processing from background I/O and the control plane:
+Three-ring model separating latency-critical event processing from background I/O and the control plane:
 
 ```
-+------------------------------------------------------------------+
-|                        RING 0: HOT PATH                          |
-|  Minimal allocations, no locks, < 1us latency                   |
-|  +---------+  +----------+  +----------+  +----------+          |
-|  | Reactor |->| Operators|->|  State   |->|   Emit   |          |
-|  |  Loop   |  | (window, |  |  Store   |  | (output) |          |
-|  |         |  |  join,   |  | (ahash/  |  |          |          |
-|  |         |  |  filter) |  |  fxhash) |  |          |          |
-|  +---------+  +----------+  +----------+  +----------+          |
-|       |                                                          |
-|       | SPSC queues (lock-free)                                  |
-|       v                                                          |
-+------------------------------------------------------------------+
-|                     RING 1: BACKGROUND                           |
-|  Async I/O, can allocate, bounded latency impact                 |
-|  +----------+  +----------+  +----------+  +----------+         |
-|  |Checkpoint|  |   WAL    |  |Compaction|  |  Timer   |         |
-|  | Manager  |  |  Writer  |  |  Thread  |  |  Wheel   |         |
-|  +----------+  +----------+  +----------+  +----------+         |
-|       |                                                          |
-|       | Channels (bounded)                                       |
-|       v                                                          |
-+------------------------------------------------------------------+
-|                     RING 2: CONTROL PLANE                        |
-|  No latency requirements, full flexibility                       |
-|  +----------+  +----------+  +----------+  +----------+         |
-|  |  Admin   |  | Metrics  |  |   Auth   |  |  Config  |         |
-|  |   API    |  |  Export  |  |  Engine  |  | Manager  |         |
-|  +----------+  +----------+  +----------+  +----------+         |
-+------------------------------------------------------------------+
+┌──────────────────────────────────────────────────────────────┐
+│                     RING 0: HOT PATH                         │
+│  CPU-pinned reactor, minimal allocations, SPSC queues        │
+│  ┌─────────┐  ┌──────────┐  ┌──────────┐  ┌──────────┐     │
+│  │ Reactor │→ │ Operators│→ │  State   │→ │   Emit   │     │
+│  │  Loop   │  │ (window, │  │  Store   │  │ (output) │     │
+│  │         │  │  join,   │  │ (ahash/  │  │          │     │
+│  │         │  │  filter) │  │  foyer)  │  │          │     │
+│  └─────────┘  └──────────┘  └──────────┘  └──────────┘     │
+│       │                                                      │
+│       │ SPSC queues (lock-free)                              │
+│       ▼                                                      │
+├──────────────────────────────────────────────────────────────┤
+│                    RING 1: BACKGROUND                        │
+│  Tokio async runtime, bounded latency impact                 │
+│  ┌──────────┐  ┌──────────┐  ┌──────────┐  ┌──────────┐    │
+│  │Checkpoint│  │   WAL    │  │Changelog │  │  Timer   │    │
+│  │ Manager  │  │  Writer  │  │ Drainer  │  │  Wheel   │    │
+│  └──────────┘  └──────────┘  └──────────┘  └──────────┘    │
+│       │                                                      │
+│       │ Bounded channels                                     │
+│       ▼                                                      │
+├──────────────────────────────────────────────────────────────┤
+│                    RING 2: CONTROL PLANE                     │
+│  No latency requirements                                     │
+│  ┌──────────┐  ┌──────────┐  ┌──────────┐                  │
+│  │  Admin   │  │ Metrics  │  │  Config  │                  │
+│  │   API    │  │  Export  │  │ Manager  │                  │
+│  └──────────┘  └──────────┘  └──────────┘                  │
+└──────────────────────────────────────────────────────────────┘
 ```
 
-- **Ring 0** -- CPU-pinned reactor loop, minimal heap allocations, SPSC queues, optional Cranelift JIT compilation
-- **Ring 1** -- Tokio async runtime for WAL, checkpointing, connectors, changelog draining
-- **Ring 2** -- Admin API, metrics, auth, configuration (planned; crate stubs exist)
+- **Ring 0** — CPU-pinned reactor loop with thread-per-core execution. Minimal heap allocations. SPSC lock-free queues between cores. Optional Cranelift JIT compilation for query expressions (`--features jit`). Target: sub-microsecond per-event latency.
+- **Ring 1** — Tokio async runtime handling WAL writes, checkpointing, connector I/O, and changelog draining. Communicates with Ring 0 via bounded channels.
+- **Ring 2** — HTTP admin API, metrics, configuration management. Auth and observability are planned (Phase 4/5).
 
 See [docs/ARCHITECTURE.md](docs/ARCHITECTURE.md) for the full design.
 
----
+### Checkpointing and Recovery
 
-## Checkpointing and Recovery
-
-Exactly-once semantics through coordinated checkpointing:
-
-1. **Per-Core WAL** -- Each CPU core writes to its own WAL segment with CRC32C checksums and torn write detection
-2. **Full Snapshots** -- State is checkpointed to disk at configurable intervals
-3. **Checkpoint Coordinator** -- Orchestrates consistent snapshots across all operators and sinks using barrier-based checkpoints
-4. **Two-Phase Commit** -- Sinks participate in the checkpoint protocol with pre-commit/commit phases
-5. **Recovery** -- `RecoveryManager` restores from the latest checkpoint manifest, replays WAL, resumes connectors from committed offsets
+1. **Per-Core WAL** — Each CPU core writes to its own WAL segment with CRC32C checksums and torn write detection
+2. **Coordinated Snapshots** — Barrier-based checkpoint protocol across all operators and sinks
+3. **Two-Phase Commit** — Sinks participate in pre-commit/commit phases for exactly-once delivery
+4. **Recovery** — `RecoveryManager` restores from the latest checkpoint manifest, replays WAL, resumes connectors from committed offsets
 
 ```rust
-use laminar_db::LaminarDB;
-
+// Note: StreamCheckpointConfig is from laminar-core (add as a dependency)
 let db = LaminarDB::builder()
     .storage_dir("./data")
     .checkpoint(laminar_core::streaming::StreamCheckpointConfig {
@@ -448,252 +319,28 @@ let db = LaminarDB::builder()
     .await?;
 ```
 
----
+On crash, events between the last completed checkpoint and the crash are lost. Checkpoint interval is configurable; shorter intervals reduce the data loss window at the cost of higher I/O overhead.
 
-## JIT Compilation
+### JIT Compilation
 
-DataFusion logical plans can be compiled to native machine code via Cranelift for Ring 0 execution. Enable with the `jit` feature flag.
-
-The `AdaptiveQueryRunner` runs queries interpreted first, compiles in the background, and hot-swaps to compiled execution when ready -- zero downtime during compilation.
-
-```toml
-[dependencies]
-laminar-db = { version = "0.18", features = ["jit"] }
-```
+Enable with `--features jit`. The `AdaptiveQueryRunner` runs queries interpreted first, compiles to native code via Cranelift in the background, and hot-swaps to compiled execution when ready.
 
 ---
 
-## Derive Macros
+## Benchmarks
 
-The `laminar-derive` crate provides procedural macros to eliminate boilerplate:
+Benchmark suites are in `crates/laminar-core/benches/`, `crates/laminar-storage/benches/`, and `crates/laminar-db/benches/` (18 total, using Criterion):
 
-```rust
-use laminar_derive::{Record, FromRow, ConnectorConfig};
+| Metric | Target | Measured | Benchmark File |
+|--------|--------|----------|----------------|
+| State lookup | < 500ns p99 | 10–105ns | `state_bench.rs` |
+| Throughput/core | 500K events/sec | 1.1–1.46M events/sec | `throughput_bench.rs` |
+| p99 latency | < 10us | 0.55–1.16us | `latency_bench.rs` |
+| Checkpoint recovery | < 10s | 1.39ms | `checkpoint_bench.rs` |
 
-// Typed data ingestion
-#[derive(Record)]
-struct Trade {
-    symbol: String,
-    price: f64,
-    volume: i64,
-    #[event_time]
-    ts: i64,
-}
+These numbers were measured on development hardware (specific hardware not recorded) against minimal operator chains (single tumbling window for latency, single state lookup for state bench). Real pipelines with multiple operators, joins, and state lookups will show higher latency. Run `cargo bench` to measure on your own hardware.
 
-// Typed result consumption
-#[derive(FromRow)]
-struct OhlcBar {
-    symbol: String,
-    window_start: i64,
-    open: f64,
-    high: f64,
-    low: f64,
-    close: f64,
-}
-
-// Connector configuration parsing
-#[derive(ConnectorConfig)]
-struct MySourceConfig {
-    #[config(key = "bootstrap.servers", required)]
-    bootstrap_servers: String,
-
-    #[config(key = "batch.size", default = "1000")]
-    batch_size: usize,
-
-    #[config(key = "timeout.ms", default = "30000", duration_ms)]
-    timeout: std::time::Duration,
-}
-```
-
----
-
-## Distributed Mode (Delta Architecture)
-
-Single-process to multi-node via the Delta architecture. Enable with the `delta` feature flag.
-
-Implemented:
-- Gossip-based node discovery (chitchat)
-- Raft metadata consensus (openraft)
-- Partition ownership with epoch fencing
-- Cross-node gRPC RPC (tonic)
-- Distributed checkpoint coordination
-- Partitioned lookups and cross-node aggregation
-
-```toml
-[dependencies]
-laminar-db = { version = "0.18", features = ["delta"] }
-```
-
----
-
-## Performance Targets
-
-| Metric | Target | Measured | Benchmark |
-|--------|--------|----------|-----------|
-| State lookup | < 500ns p99 | 10-105ns | `cargo bench --bench state_bench` |
-| Throughput/core | 500K events/sec | 1.1-1.46M events/sec | `cargo bench --bench throughput_bench` |
-| p99 latency | < 10us | 0.55-1.16us | `cargo bench --bench latency_bench` |
-| Checkpoint recovery | < 10s | 1.39ms | `cargo bench --bench checkpoint_bench` |
-| Window trigger | < 10us | -- | `cargo bench --bench window_bench` |
-| Changelog overhead | ~2-5ns/mutation | -- | `ChangelogAwareStore` wrapper |
-
-Run all benchmarks:
-
-```bash
-cargo bench
-```
-
-See [docs/BENCHMARKS.md](docs/BENCHMARKS.md) for measured baselines on real hardware. Available benchmark suites (17 in laminar-core, 2 in laminar-storage):
-
-```bash
-cargo bench --bench state_bench          # State lookup latency
-cargo bench --bench throughput_bench     # Throughput per core
-cargo bench --bench latency_bench        # p99 latency
-cargo bench --bench window_bench         # Window operations
-cargo bench --bench join_bench           # Join throughput
-cargo bench --bench dag_bench            # DAG pipeline
-cargo bench --bench lookup_join_bench    # Lookup join throughput
-cargo bench --bench cache_bench          # foyer cache hit/miss
-cargo bench --bench compiler_bench       # JIT compilation
-cargo bench --bench streaming_bench      # Streaming channels
-cargo bench --bench subscription_bench   # Subscription dispatch
-cargo bench --bench reactor_bench        # Reactor loop
-cargo bench --bench tpc_bench            # Thread-per-core
-cargo bench --bench checkpoint_bench     # Checkpoint cycle
-cargo bench --bench wal_bench            # WAL write throughput
-```
-
----
-
-## Comparison
-
-| Feature | LaminarDB | Apache Flink | Kafka Streams | RisingWave | Materialize |
-|---------|-----------|--------------|---------------|------------|-------------|
-| Deployment | Embedded | Distributed | Embedded | Distributed | Distributed |
-| Latency | < 1us | ~10ms | ~1ms | ~10ms | ~10ms |
-| SQL support | Full (DataFusion) | Limited | None | Full | Full |
-| Exactly-once | Yes | Yes | Yes | Yes | Yes |
-| No JVM | Yes | No | No | Yes | Yes |
-| Windows | Tumble/Slide/Session/Hop | All | Tumble/Slide/Session | Tumble/Hop | N/A |
-| CDC sources | PostgreSQL, MySQL | Many | Debezium only | PostgreSQL, MySQL | PostgreSQL |
-| Lakehouse sinks | Delta Lake | Limited | No | Delta Lake, Iceberg | No |
-| JIT compilation | Yes (Cranelift) | No | No | No | No |
-| License | Apache-2.0 | Apache-2.0 | Apache-2.0 | Apache-2.0 | BSL |
-
----
-
-## Project Structure
-
-```
-crates/
-  laminar-core/        Core engine: reactor, operators, state, windows, joins, JIT compiler
-  laminar-sql/         SQL layer: DataFusion integration, streaming SQL parser
-  laminar-storage/     Durability: WAL, checkpointing, per-core WAL, recovery
-  laminar-connectors/  Connectors: Kafka, CDC, WebSocket, Delta Lake, Files, SDK
-  laminar-db/          Unified database facade, checkpoint coordination, FFI API
-  laminar-derive/      Derive macros: Record, FromRecordBatch, FromRow, ConnectorConfig
-  laminar-server/      Standalone server binary (skeleton)
-examples/
-  demo/                Market data TUI demo with Ratatui
-  binance-ws/          Live Binance WebSocket streaming SQL demo
-```
-
-### Crate Dependency Graph
-
-```
-laminar-db  (facade)
-  |-- laminar-core        (Ring 0 engine)
-  |-- laminar-sql         (SQL parsing + DataFusion)
-  |-- laminar-storage     (WAL + checkpointing)
-  |-- laminar-connectors  (external connectors)
-        |-- laminar-core
-        |-- laminar-storage
-
-laminar-derive            (proc macros, no internal deps)
-laminar-server            (binary: laminar-db + laminar-connectors)
-```
-
----
-
-## Project Status
-
-Active development. Current phase progress:
-
-| Phase | Description | Features | Status |
-|-------|-------------|----------|--------|
-| Phase 1 | Core Engine | 12/12 | Complete |
-| Phase 1.5 | Production SQL Parser | 1/1 | Complete |
-| Phase 2 | Production Hardening | 38/38 | Complete |
-| Phase 2.5 | JIT Compiler | 12/12 | Complete |
-| Phase 3 | Connectors & Integration | 85/100 | 85% complete |
-| Phase 4 | Enterprise Security | 0/11 | Planned (stubs exist) |
-| Phase 5 | Admin & Observability | 0/10 | Planned (stubs exist) |
-| Phase 6a | Delta Partition-Parallel | 27/29 | 93% complete |
-| Phase 6b | Delta Foundation | 14/14 | Complete |
-| Phase 6c | Delta Production Hardening | 0/10 | Planned |
-| Perf Optimization | Architectural improvements | 0/12 | Planned |
-| **Total** | | **189/249** | **76%** |
-
-See [docs/ROADMAP.md](docs/ROADMAP.md) for the phase timeline.
-
----
-
-## Feature Flags
-
-| Flag | Crate | Description |
-|------|-------|-------------|
-| `kafka` | laminar-db, laminar-connectors | Kafka source/sink, Avro serde, Schema Registry |
-| `postgres-cdc` | laminar-db, laminar-connectors | PostgreSQL CDC source via logical replication |
-| `postgres-sink` | laminar-db, laminar-connectors | PostgreSQL sink via COPY BINARY |
-| `mysql-cdc` | laminar-db, laminar-connectors | MySQL CDC source via binlog replication |
-| `delta-lake` | laminar-db, laminar-connectors | Delta Lake sink and source |
-| `delta-lake-s3` | laminar-connectors | S3 storage backend for Delta Lake |
-| `delta-lake-azure` | laminar-connectors | Azure storage backend for Delta Lake |
-| `delta-lake-gcs` | laminar-connectors | GCS storage backend for Delta Lake |
-| `websocket` | laminar-db, laminar-connectors | WebSocket source and sink connectors |
-| `jit` | laminar-db, laminar-core | Cranelift JIT query compilation |
-| `ffi` | laminar-db | C FFI with Arrow C Data Interface |
-| `api` | laminar-db | FFI-friendly API module for language bindings |
-| `delta` | laminar-db, laminar-core | Distributed delta mode (gossip, Raft, gRPC) |
-| `allocation-tracking` | laminar-core | Panic on hot-path allocation |
-| `io-uring` | laminar-core | Linux 5.10+ io_uring integration |
-| `hwloc` | laminar-core | Enhanced NUMA topology discovery |
-| `xdp` | laminar-core | Linux eBPF/XDP network optimization |
-
----
-
-## Building from Source
-
-```bash
-# Prerequisites: Rust 1.85+ (stable)
-rustup update stable
-
-# Clone and build
-git clone https://github.com/laminardb/laminardb.git
-cd laminardb
-cargo build --release
-
-# Run tests
-cargo test --all
-
-# Run with optional features
-cargo test --all --features kafka,postgres-cdc,mysql-cdc
-
-# Lint
-cargo clippy --all -- -D warnings
-
-# Format check
-cargo fmt --all -- --check
-
-# Generate API docs
-cargo doc --no-deps --open
-
-# Run the market data demo
-cargo run -p laminardb-demo
-
-# Run benchmarks
-cargo bench
-```
+Additional benchmark suites: `window_bench`, `join_bench`, `lookup_join_bench`, `cache_bench`, `compiler_bench`, `streaming_bench`, `subscription_bench`, `reactor_bench`, `tpc_bench`, `dag_bench`, `dag_stress`, `wal_bench`, `io_uring_bench`, `recovery_bench`.
 
 ---
 
@@ -702,29 +349,134 @@ cargo bench
 | Language | Package | Status |
 |----------|---------|--------|
 | **Rust** | [`laminar-db`](https://crates.io/crates/laminar-db) | Primary API |
-| **Python** | [`laminardb`](https://pypi.org/project/laminardb/) | Via [laminardb-python](https://github.com/laminardb/laminardb-python) |
-| C/C++ | Via FFI (`--features ffi`) | Implemented (Arrow C Data Interface) |
-| Java | laminardb-java | Planned |
-| Node.js | @laminardb/node | Planned |
+| **Python** | [`laminardb`](https://pypi.org/project/laminardb/) | Via [`laminardb-python`](https://github.com/laminardb/laminardb-python) (separate repo) |
+| **C/C++** | Via FFI (`--features ffi`) | ✅ Arrow C Data Interface, 78 exported functions |
+| Java | `laminardb-java` | 📋 Planned |
+| Node.js | `@laminardb/node` | 📋 Planned |
+
+---
+
+## Why LaminarDB vs. X?
+
+| | LaminarDB | Apache Flink | Kafka Streams | RisingWave | kdb+ |
+|---|---|---|---|---|---|
+| Deployment | Library or binary | JVM cluster | JVM library | Distributed cluster | Proprietary binary |
+| Language | Rust (+ Python, C FFI) | Java/Scala/Python | Java | Rust/Python/SQL | Q/Python |
+| Embed in your process | Yes | No | Yes (JVM) | No | No |
+| Latency (per-event, microbench) | Sub-microsecond (Ring 0) | Milliseconds–seconds | Milliseconds | Milliseconds | Microseconds |
+| Operational overhead | None (embedded) or single binary | K8s operator or YARN | Kafka cluster | etcd/K8s/S3 | Vendor support |
+| SQL | Full (DataFusion) | Flink SQL | None (DSL only) | Full (Postgres-compatible) | Q language |
+| Exactly-once | Yes (checkpoint + 2PC) | Yes | Yes | Yes | No |
+| License | Apache-2.0 | Apache-2.0 | Apache-2.0 | Apache-2.0 | Commercial |
+| Maturity | Pre-1.0, active development | Production (10+ years) | Production | Production | Production (25+ years) |
+
+**Where competitors are stronger:**
+- Flink has a decade of production hardening, hundreds of connectors, TB-scale state management (RocksDB backend), and a massive ecosystem.
+- kdb+ has unmatched time-series query performance, handles billions of rows in-memory, and has decades of finance-specific optimization.
+- RisingWave offers managed cloud deployment with zero operational overhead and Postgres wire compatibility.
+- Kafka Streams has been validated across thousands of production deployments for JVM-based event processing at scale.
+
+**Where LaminarDB fits:**
+- You want stream processing without a cluster or JVM dependency.
+- You need sub-millisecond latency and are willing to work with a pre-1.0 project.
+- You want to embed a streaming SQL engine directly in a Rust, C, or Python application.
+
+---
+
+## Project Status
+
+**Version 0.18.0** — active development, pre-1.0. APIs may change between minor versions.
+
+| Phase | Description | Progress |
+|-------|-------------|----------|
+| Phase 1 | Core Engine | ✅ 12/12 |
+| Phase 1.5 | SQL Parser | ✅ 1/1 |
+| Phase 2 | Production Hardening | ✅ 38/38 |
+| Phase 2.5 | JIT Compiler | ✅ 12/12 |
+| Phase 3 | Connectors & Integration | 🔧 85/100 |
+| Phase 4 | Enterprise Security (Auth, RBAC) | 📋 Planned |
+| Phase 5 | Admin & Observability | 📋 Planned |
+| Phase 6a | Distributed Partition-Parallel | ✅ 27/29 (+2 superseded) |
+| Phase 6b | Distributed Foundation | ✅ 14/14 |
+| Phase 6c | Distributed Production Hardening | 📋 Planned |
+
+Test coverage: 3,000+ tests (unit + integration). CI runs on Linux and Windows.
+
+See [docs/ROADMAP.md](docs/ROADMAP.md) for the full phase timeline.
+
+---
+
+## Feature Flags
+
+| Flag | Description |
+|------|-------------|
+| `kafka` | Kafka source/sink, Avro serde, Schema Registry |
+| `postgres-cdc` | PostgreSQL CDC source via logical replication |
+| `postgres-sink` | PostgreSQL sink via COPY BINARY |
+| `mysql-cdc` | MySQL CDC source via binlog replication |
+| `delta-lake` | Delta Lake source and sink |
+| `delta-lake-s3` / `delta-lake-azure` / `delta-lake-gcs` | Cloud storage backends |
+| `websocket` | WebSocket source and sink connectors |
+| `files` | File source and sink (Parquet, CSV) |
+| `jit` | Cranelift JIT query compilation |
+| `ffi` | C FFI with Arrow C Data Interface |
+| `delta` | Distributed mode (gossip, Raft, gRPC) |
+| `parquet-lookup` | Parquet lookup source for reference tables |
+| `allocation-tracking` | Panic on hot-path allocation (`laminar-core` only) |
+| `io-uring` | Linux 5.10+ io_uring integration |
+
+---
+
+## Building from Source
+
+```bash
+# Prerequisites: Rust 1.85+ (stable)
+git clone https://github.com/laminardb/laminardb.git
+cd laminardb
+
+cargo build --release
+cargo test
+cargo clippy -- -D warnings
+cargo bench                    # Run all benchmarks
+cargo doc --no-deps --open     # Generate API docs
+
+# With optional connectors
+cargo test --features kafka,postgres-cdc,mysql-cdc,delta-lake,websocket
+
+# Run the Binance WebSocket demo
+cargo run -p binance-ws
+```
+
+## Project Structure
+
+```
+crates/
+  laminar-core/        Core engine: reactor, operators, state, windows, joins
+  laminar-sql/         SQL parser, DataFusion integration, streaming optimizer
+  laminar-storage/     WAL, checkpointing, per-core WAL, recovery
+  laminar-connectors/  Kafka, CDC, WebSocket, Delta Lake, files, connector SDK
+  laminar-db/          Unified database facade, checkpoint coordination, FFI
+  laminar-derive/      Derive macros: Record, FromRecordBatch, FromRow, ConnectorConfig
+  laminar-server/      Standalone server binary (HTTP API, Docker, Helm)
+examples/
+  demo/                Market data TUI demo with Ratatui
+  binance-ws/          Live Binance WebSocket streaming SQL demo
+  microstructure/      Market microstructure analysis demo
+```
 
 ---
 
 ## Documentation
 
-- [Architecture Guide](docs/ARCHITECTURE.md) -- Three-ring design, data flow, state management
-- [SQL Reference](docs/SQL_REFERENCE.md) -- Streaming SQL dialect, gotchas, tested patterns
-- [Development Roadmap](docs/ROADMAP.md) -- Phases, milestones, and feature status
-- [Contributing Guide](CONTRIBUTING.md) -- How to build, test, and submit PRs
-- [API Reference](https://docs.rs/laminar-db) -- Rustdoc API documentation
-
----
+- [Architecture Guide](docs/ARCHITECTURE.md) — Three-ring design, data flow, state management
+- [SQL Reference](docs/SQL_REFERENCE.md) — Streaming SQL dialect, tested patterns, gotchas
+- [Roadmap](docs/ROADMAP.md) — Phases, milestones, feature status
+- [API Reference](https://docs.rs/laminar-db) — Rustdoc
 
 ## Contributing
 
 See [CONTRIBUTING.md](CONTRIBUTING.md) for development setup, code style, Ring 0 rules, and the PR process.
 
----
-
 ## License
 
-Apache License 2.0 -- see [LICENSE](LICENSE) for details.
+Apache License 2.0 — see [LICENSE](LICENSE).

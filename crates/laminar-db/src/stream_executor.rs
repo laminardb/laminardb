@@ -199,6 +199,8 @@ struct EowcState {
 pub(crate) struct StreamExecutor {
     ctx: SessionContext,
     queries: Vec<StreamQuery>,
+    /// Lookup table registry for versioned temporal join state.
+    lookup_registry: Option<Arc<laminar_sql::datafusion::LookupTableRegistry>>,
     /// Tracks which temporary source tables are registered (for cleanup).
     registered_sources: Vec<String>,
     /// Indices into `queries` in topological (dependency) order.
@@ -245,6 +247,7 @@ impl StreamExecutor {
         Self {
             ctx,
             queries: Vec::new(),
+            lookup_registry: None,
             registered_sources: Vec::new(),
             topo_order: Vec::new(),
             topo_dirty: true,
@@ -260,6 +263,21 @@ impl StreamExecutor {
             cycle_results: FxHashMap::default(),
             cycle_intermediates: Vec::new(),
         }
+    }
+
+    /// Set the lookup table registry for versioned temporal join lookups.
+    pub fn set_lookup_registry(&mut self, registry: Arc<laminar_sql::datafusion::LookupTableRegistry>) {
+        self.lookup_registry = Some(registry);
+    }
+
+    /// Returns the temporal join configs for tables that appear as right-side
+    /// in temporal joins. Used during pipeline startup to pre-register versioned
+    /// tables in the lookup registry.
+    pub fn temporal_join_configs(&self) -> Vec<TemporalJoinTranslatorConfig> {
+        self.queries
+            .iter()
+            .filter_map(|q| q.temporal_config.clone())
+            .collect()
     }
 
     /// Register a source schema so that empty placeholder tables can be
@@ -1282,8 +1300,11 @@ impl StreamExecutor {
         }
     }
 
-    /// Execute a temporal join query by fetching stream/table batches and
-    /// performing a point-in-time version lookup.
+    /// Execute a temporal join query using the versioned lookup registry.
+    ///
+    /// The table must be registered as `RegisteredLookup::Versioned` in
+    /// the lookup registry. The pre-built `VersionedIndex` is reused
+    /// across cycles (only rebuilt on CDC updates in `poll_tables`).
     async fn execute_temporal_query(
         &self,
         query_name: &str,
@@ -1291,25 +1312,149 @@ impl StreamExecutor {
         source_batches: &FxHashMap<String, Vec<RecordBatch>>,
         intermediate_results: &FxHashMap<String, Vec<RecordBatch>>,
     ) -> Result<Vec<RecordBatch>, DbError> {
+        let registry = self.lookup_registry.as_ref().ok_or_else(|| {
+            DbError::Pipeline(format!(
+                "temporal join [{query_name}]: lookup registry not set"
+            ))
+        })?;
+
+        let Some(laminar_sql::datafusion::RegisteredLookup::Versioned(versioned)) =
+            registry.get_entry(&config.table_name)
+        else {
+            return Err(DbError::Pipeline(format!(
+                "temporal join [{query_name}]: table '{}' not registered as versioned",
+                config.table_name
+            )));
+        };
+
+        self.execute_versioned_temporal_query(
+            query_name,
+            config,
+            &versioned,
+            source_batches,
+            intermediate_results,
+        )
+        .await
+    }
+
+    /// Execute a temporal join against a versioned lookup table from the registry.
+    #[allow(clippy::too_many_lines)]
+    async fn execute_versioned_temporal_query(
+        &self,
+        query_name: &str,
+        config: &TemporalJoinTranslatorConfig,
+        versioned: &laminar_sql::datafusion::VersionedLookupState,
+        source_batches: &FxHashMap<String, Vec<RecordBatch>>,
+        intermediate_results: &FxHashMap<String, Vec<RecordBatch>>,
+    ) -> Result<Vec<RecordBatch>, DbError> {
+        use datafusion::catalog::TableProvider;
+        use datafusion::physical_plan::ExecutionPlan as _;
+        use futures::TryStreamExt as _;
+        use laminar_sql::datafusion::lookup_join::LookupJoinType;
+        use laminar_sql::datafusion::lookup_join_exec::VersionedLookupJoinExec;
+
         let stream_batches = self
             .resolve_table_batches(&config.stream_table, source_batches, intermediate_results)
             .await?;
-        let table_batches = self
-            .resolve_table_batches(&config.table_name, source_batches, intermediate_results)
-            .await?;
 
-        let joined = crate::temporal_batch::execute_temporal_join_batch(
-            &stream_batches,
-            &table_batches,
-            config,
-        )
-        .map_err(|e| DbError::Pipeline(format!("temporal join [{query_name}]: {e}")))?;
-
-        if joined.num_rows() == 0 {
+        if stream_batches.is_empty() {
             return Ok(Vec::new());
         }
 
-        Ok(vec![joined])
+        let table_schema = versioned.batch.schema();
+        let stream_schema = stream_batches[0].schema();
+
+        let stream_key_idx = stream_schema
+            .index_of(&config.stream_key_column)
+            .map_err(|_| {
+                DbError::Pipeline(format!(
+                    "temporal join [{query_name}]: stream key column '{}' not found",
+                    config.stream_key_column
+                ))
+            })?;
+        let stream_time_idx = stream_schema
+            .index_of(&config.stream_time_column)
+            .map_err(|_| {
+                DbError::Pipeline(format!(
+                    "temporal join [{query_name}]: stream time column '{}' not found",
+                    config.stream_time_column
+                ))
+            })?;
+
+        let join_type = if config.join_type == "left" {
+            LookupJoinType::LeftOuter
+        } else {
+            LookupJoinType::Inner
+        };
+
+        let key_sort_fields: Vec<arrow::row::SortField> = versioned
+            .key_columns
+            .iter()
+            .filter_map(|k| {
+                table_schema
+                    .index_of(k)
+                    .ok()
+                    .map(|i| arrow::row::SortField::new(table_schema.field(i).data_type().clone()))
+            })
+            .collect();
+
+        let mut output_fields = stream_schema.fields().to_vec();
+        output_fields.extend(table_schema.fields().iter().cloned());
+        let output_schema = Arc::new(arrow::datatypes::Schema::new(output_fields));
+
+        // Concat all stream batches into one for single-pass probing.
+        let stream_batch = if stream_batches.len() == 1 {
+            stream_batches[0].clone()
+        } else {
+            arrow::compute::concat_batches(&stream_schema, &stream_batches).map_err(|e| {
+                DbError::Pipeline(format!("temporal join [{query_name}]: concat error: {e}"))
+            })?
+        };
+
+        if stream_batch.num_rows() == 0 {
+            return Ok(Vec::new());
+        }
+
+        // Build the exec node with the persistent versioned table data.
+        // The index is pre-built and cached in the registry — not rebuilt per cycle.
+        let mem_table = datafusion::datasource::MemTable::try_new(
+            Arc::clone(&stream_schema),
+            vec![vec![stream_batch]],
+        )
+        .map_err(|e| {
+            DbError::Pipeline(format!("temporal join [{query_name}]: memory table: {e}"))
+        })?;
+        let input = mem_table
+            .scan(&self.ctx.state(), None, &[], None)
+            .await
+            .map_err(|e| {
+                DbError::Pipeline(format!("temporal join [{query_name}]: scan: {e}"))
+            })?;
+        let exec = VersionedLookupJoinExec::try_new(
+            input,
+            versioned.batch.clone(),
+            Arc::clone(&versioned.index),
+            vec![stream_key_idx],
+            stream_time_idx,
+            join_type,
+            output_schema,
+            key_sort_fields,
+        )
+        .map_err(|e| {
+            DbError::Pipeline(format!("temporal join [{query_name}]: exec build error: {e}"))
+        })?;
+
+        let task_ctx = self.ctx.state().task_ctx();
+        let stream = exec
+            .execute(0, task_ctx)
+            .map_err(|e| DbError::Pipeline(format!("temporal join [{query_name}]: {e}")))?;
+
+        let batches: Vec<arrow_array::RecordBatch> = stream
+            .try_collect()
+            .await
+            .map_err(|e| DbError::Pipeline(format!("temporal join [{query_name}]: {e}")))?;
+
+        Ok(batches)
     }
 
     /// Resolve batches for a table name by checking source batches first,
