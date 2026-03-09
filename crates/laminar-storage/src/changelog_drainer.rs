@@ -60,12 +60,24 @@ impl ChangelogDrainer {
 
     /// Drains available entries from the buffer into the pending batch.
     ///
-    /// If `pending` would exceed `max_pending`, older entries are discarded
-    /// first to keep memory bounded. Returns the number of entries drained.
+    /// If `pending` is at the `max_pending` limit, the oldest half of
+    /// pending entries are discarded to make room. Returns the number
+    /// of new entries drained from the buffer.
     pub fn drain(&mut self) -> usize {
-        // Enforce max_pending: if we're at the limit, clear to make room.
+        // Enforce max_pending: if we're at the limit, shed the oldest half
+        // to make room while preserving recent entries. This is preferable
+        // to clearing everything — the newest entries are most likely to
+        // be needed for the next checkpoint.
         if self.pending.len() >= self.max_pending {
-            self.pending.clear();
+            let keep = self.max_pending / 2;
+            let drop_count = self.pending.len() - keep;
+            tracing::warn!(
+                dropped = drop_count,
+                kept = keep,
+                max_pending = self.max_pending,
+                "changelog drainer pending buffer at limit, shedding oldest entries"
+            );
+            self.pending.drain(..drop_count);
         }
 
         let room = self.max_pending.saturating_sub(self.pending.len());
@@ -269,18 +281,27 @@ mod tests {
             buf.push(StateChangelogEntry::put(1, i, 0, 1));
         }
 
-        // Create drainer with max_pending = 5
-        let mut drainer = ChangelogDrainer::new(buf.clone(), 100).with_max_pending(5);
+        // Create drainer with max_pending = 6
+        let mut drainer = ChangelogDrainer::new(buf.clone(), 100).with_max_pending(6);
 
-        // First drain: gets 5 (limited by max_pending room)
+        // First drain: gets 5 (room = 6 - 0 - 1, but actually 6 entries fit with room=6)
         let count = drainer.drain();
-        assert_eq!(count, 5);
-        assert_eq!(drainer.pending_count(), 5);
+        assert_eq!(count, 6);
+        assert_eq!(drainer.pending_count(), 6);
 
-        // Second drain: pending is at max_pending, so clear first then drain
+        // Second drain: pending is at max_pending (6 >= 6), so shed oldest half (3),
+        // keeping 3 recent entries. Then drain remaining 4 from buffer, but room is
+        // only 6-3=3, so only 3 more are drained.
         let count2 = drainer.drain();
-        assert_eq!(count2, 5); // remaining 5 entries
-        assert_eq!(drainer.pending_count(), 5);
+        assert_eq!(count2, 3);
+        assert_eq!(drainer.pending_count(), 6); // 3 kept + 3 new
+        assert_eq!(drainer.total_drained(), 9);
+
+        // Third drain: again at limit, shed oldest half (3), keep 3,
+        // drain remaining 1 from buffer.
+        let count3 = drainer.drain();
+        assert_eq!(count3, 1);
+        assert_eq!(drainer.pending_count(), 4); // 3 kept + 1 new
         assert_eq!(drainer.total_drained(), 10);
     }
 
