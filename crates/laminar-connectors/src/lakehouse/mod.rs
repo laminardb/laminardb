@@ -155,7 +155,7 @@ fn delta_lake_config_keys() -> Vec<ConfigKeySpec> {
         ConfigKeySpec::optional(
             "delivery.guarantee",
             "exactly-once or at-least-once",
-            "exactly-once",
+            "at-least-once",
         ),
         ConfigKeySpec::optional(
             "compaction.enabled",

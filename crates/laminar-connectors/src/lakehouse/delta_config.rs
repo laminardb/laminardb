@@ -95,7 +95,7 @@ impl Default for DeltaLakeSinkConfig {
             storage_options: HashMap::new(),
             compaction: CompactionConfig::default(),
             vacuum_retention: Duration::from_secs(7 * 24 * 3600), // 7 days
-            delivery_guarantee: DeliveryGuarantee::ExactlyOnce,
+            delivery_guarantee: DeliveryGuarantee::AtLeastOnce,
             writer_id: uuid::Uuid::new_v4().to_string(),
             catalog_type: DeltaCatalogType::None,
             catalog_database: None,
@@ -325,17 +325,19 @@ impl DeltaLakeSinkConfig {
             }
         }
 
-        // Validate cloud storage credentials for the detected provider.
-        let resolved = ResolvedStorageOptions {
-            provider: StorageProvider::detect(&self.table_path),
-            options: self.storage_options.clone(),
-            env_resolved_keys: Vec::new(),
-        };
-        let cloud_result = CloudConfigValidator::validate(&resolved);
-        if !cloud_result.is_valid() {
-            return Err(ConnectorError::ConfigurationError(
-                cloud_result.error_message(),
-            ));
+        // Validate cloud storage credentials (skip when catalog resolves the path).
+        if self.catalog_type == DeltaCatalogType::None {
+            let resolved = ResolvedStorageOptions {
+                provider: StorageProvider::detect(&self.table_path),
+                options: self.storage_options.clone(),
+                env_resolved_keys: Vec::new(),
+            };
+            let cloud_result = CloudConfigValidator::validate(&resolved);
+            if !cloud_result.is_valid() {
+                return Err(ConnectorError::ConfigurationError(
+                    cloud_result.error_message(),
+                ));
+            }
         }
 
         Ok(())
@@ -478,7 +480,7 @@ impl Default for CompactionConfig {
             min_files_for_compaction: 10,
             target_file_size: 128 * 1024 * 1024, // 128 MB
             z_order_columns: Vec::new(),
-            check_interval: Duration::from_secs(300), // 5 minutes
+            check_interval: Duration::from_secs(3600), // 60 minutes
         }
     }
 }
@@ -508,7 +510,7 @@ mod tests {
         let cfg = DeltaLakeSinkConfig::from_config(&config).unwrap();
         assert_eq!(cfg.table_path, "/data/warehouse/trades");
         assert_eq!(cfg.write_mode, DeltaWriteMode::Append);
-        assert_eq!(cfg.delivery_guarantee, DeliveryGuarantee::ExactlyOnce);
+        assert_eq!(cfg.delivery_guarantee, DeliveryGuarantee::AtLeastOnce);
         assert!(cfg.partition_columns.is_empty());
         assert!(cfg.merge_key_columns.is_empty());
         assert_eq!(cfg.target_file_size, 128 * 1024 * 1024);
@@ -660,7 +662,7 @@ mod tests {
         assert_eq!(cfg.checkpoint_interval, 10);
         assert!(!cfg.schema_evolution);
         assert_eq!(cfg.write_mode, DeltaWriteMode::Append);
-        assert_eq!(cfg.delivery_guarantee, DeliveryGuarantee::ExactlyOnce);
+        assert_eq!(cfg.delivery_guarantee, DeliveryGuarantee::AtLeastOnce);
         assert!(!cfg.writer_id.is_empty());
     }
 
@@ -735,7 +737,7 @@ mod tests {
         assert_eq!(cfg.min_files_for_compaction, 10);
         assert_eq!(cfg.target_file_size, 128 * 1024 * 1024);
         assert!(cfg.z_order_columns.is_empty());
-        assert_eq!(cfg.check_interval, Duration::from_secs(300));
+        assert_eq!(cfg.check_interval, Duration::from_secs(3600));
     }
 
     #[test]

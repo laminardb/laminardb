@@ -1,7 +1,8 @@
 //! Delta Lake sink connector implementation.
 //!
 //! [`DeltaLakeSink`] implements [`SinkConnector`], writing Arrow `RecordBatch`
-//! data to Delta Lake tables with ACID transactions and exactly-once semantics.
+//! data to Delta Lake tables with ACID transactions and at-least-once delivery
+//! (exactly-once opt-in via `delivery.guarantee = 'exactly-once'`).
 //!
 //! # Write Strategies
 //!
@@ -45,7 +46,8 @@ use super::delta_metrics::DeltaLakeSinkMetrics;
 /// Delta Lake sink connector.
 ///
 /// Writes Arrow `RecordBatch` to Delta Lake tables with ACID transactions,
-/// exactly-once semantics, partitioning, and background compaction.
+/// at-least-once delivery (exactly-once opt-in), partitioning, and
+/// background compaction.
 ///
 /// # Lifecycle
 ///
@@ -89,6 +91,8 @@ pub struct DeltaLakeSink {
     /// Delta Lake table handle (present when `delta-lake` feature is enabled).
     #[cfg(feature = "delta-lake")]
     table: Option<DeltaTable>,
+    /// Whether the current epoch was skipped (already committed).
+    epoch_skipped: bool,
     /// Cancellation token for the background compaction task.
     #[cfg(feature = "delta-lake")]
     compaction_cancel: Option<tokio_util::sync::CancellationToken>,
@@ -114,6 +118,7 @@ impl DeltaLakeSink {
             delta_version: 0,
             buffer_start_time: None,
             metrics: DeltaLakeSinkMetrics::new(),
+            epoch_skipped: false,
             #[cfg(feature = "delta-lake")]
             table: None,
             #[cfg(feature = "delta-lake")]
@@ -234,10 +239,10 @@ impl DeltaLakeSink {
         WriteResult::new(total_rows, estimated_bytes)
     }
 
-    /// Flushes buffered data to Delta Lake when the `delta-lake` feature is enabled.
+    /// Writes all buffered data to Delta Lake as a single atomic transaction.
     ///
-    /// This writes the buffered `RecordBatch`es to Parquet files and commits them
-    /// as a Delta Lake transaction with the current epoch in txn metadata.
+    /// Called from `pre_commit()` only — never mid-epoch. This ensures rollback
+    /// can discard the buffer without leaving orphaned commits.
     #[cfg(feature = "delta-lake")]
     async fn flush_buffer_to_delta(&mut self) -> Result<WriteResult, ConnectorError> {
         if self.buffer.is_empty() {
@@ -496,6 +501,25 @@ async fn compaction_loop(
                     }
                 };
 
+                // Skip compaction if not enough files.
+                match table.snapshot() {
+                    Ok(snapshot) => {
+                        let file_count = snapshot.log_data().num_files();
+                        if file_count < config.min_files_for_compaction {
+                            debug!(
+                                file_count,
+                                min = config.min_files_for_compaction,
+                                "compaction: skipping, not enough files"
+                            );
+                            continue;
+                        }
+                    }
+                    Err(e) => {
+                        warn!(error = %e, "compaction: snapshot failed, skipping tick");
+                        continue;
+                    }
+                }
+
                 // Run OPTIMIZE.
                 let target_size = config.target_file_size as u64;
                 match delta_io::run_compaction(table, target_size, &config.z_order_columns).await {
@@ -547,10 +571,20 @@ impl SinkConnector for DeltaLakeSink {
         {
             use super::delta_io;
 
-            // Open or create the Delta Lake table.
-            let table = delta_io::open_or_create_table(
+            // Merge catalog options (Unity/Glue) into storage options.
+            let (resolved_path, merged_options) = delta_io::resolve_catalog_options(
+                &self.config.catalog_type,
+                self.config.catalog_database.as_deref(),
+                self.config.catalog_name.as_deref(),
+                self.config.catalog_schema.as_deref(),
                 &self.config.table_path,
-                self.config.storage_options.clone(),
+                &self.config.storage_options,
+            )
+            .await?;
+
+            let table = delta_io::open_or_create_table(
+                &resolved_path,
+                merged_options.clone(),
                 self.schema.as_ref(),
             )
             .await?;
@@ -588,8 +622,8 @@ impl SinkConnector for DeltaLakeSink {
             if self.config.compaction.enabled {
                 let cancel = tokio_util::sync::CancellationToken::new();
                 let handle = tokio::spawn(compaction_loop(
-                    self.config.table_path.clone(),
-                    Arc::new(self.config.storage_options.clone()),
+                    resolved_path.clone(),
+                    Arc::new(merged_options),
                     self.config.compaction.clone(),
                     self.config.vacuum_retention,
                     cancel.clone(),
@@ -599,10 +633,22 @@ impl SinkConnector for DeltaLakeSink {
             }
         }
 
-        self.state = ConnectorState::Running;
+        #[cfg(not(feature = "delta-lake"))]
+        {
+            self.state = ConnectorState::Failed;
+            return Err(ConnectorError::ConfigurationError(
+                "Delta Lake sink requires the 'delta-lake' feature to be enabled. \
+                 Build with: cargo build --features delta-lake"
+                    .into(),
+            ));
+        }
 
-        info!("Delta Lake sink connector opened successfully");
-        Ok(())
+        #[cfg(feature = "delta-lake")]
+        {
+            self.state = ConnectorState::Running;
+            info!("Delta Lake sink connector opened successfully");
+            Ok(())
+        }
     }
 
     async fn write_batch(&mut self, batch: &RecordBatch) -> Result<WriteResult, ConnectorError> {
@@ -614,6 +660,10 @@ impl SinkConnector for DeltaLakeSink {
         }
 
         if batch.num_rows() == 0 {
+            return Ok(WriteResult::new(0, 0));
+        }
+
+        if self.epoch_skipped {
             return Ok(WriteResult::new(0, 0));
         }
 
@@ -633,19 +683,7 @@ impl SinkConnector for DeltaLakeSink {
         self.buffered_rows += num_rows;
         self.buffered_bytes += estimated_bytes;
 
-        // Flush if buffer threshold reached.
-        if self.should_flush() {
-            #[cfg(feature = "delta-lake")]
-            {
-                self.flush_buffer_to_delta().await?;
-                return Ok(WriteResult::new(0, 0));
-            }
-            #[cfg(not(feature = "delta-lake"))]
-            {
-                let result = self.flush_buffer_local();
-                return Ok(result);
-            }
-        }
+        // Data stays in buffer until pre_commit(). No mid-epoch Delta writes.
 
         Ok(WriteResult::new(0, 0))
     }
@@ -666,9 +704,11 @@ impl SinkConnector for DeltaLakeSink {
                 last_committed = self.last_committed_epoch,
                 "Delta Lake: skipping already-committed epoch"
             );
+            self.epoch_skipped = true;
             return Ok(());
         }
 
+        self.epoch_skipped = false;
         self.current_epoch = epoch;
         self.buffer.clear();
         self.buffered_rows = 0;
@@ -741,6 +781,7 @@ impl SinkConnector for DeltaLakeSink {
         self.pending_files = 0;
         self.buffer_start_time = None;
 
+        self.epoch_skipped = false;
         self.metrics.record_rollback();
         warn!(epoch, "Delta Lake: rolled back epoch");
         Ok(())
@@ -781,15 +822,14 @@ impl SinkConnector for DeltaLakeSink {
     }
 
     async fn flush(&mut self) -> Result<(), ConnectorError> {
-        if !self.buffer.is_empty() {
-            #[cfg(feature = "delta-lake")]
-            {
-                self.flush_buffer_to_delta().await?;
-            }
-            #[cfg(not(feature = "delta-lake"))]
-            {
-                let _ = self.flush_buffer_local();
-            }
+        // Coalesce buffered batches to reduce memory fragmentation.
+        // Actual Delta write is deferred to pre_commit().
+        if self.buffer.len() > 1 {
+            let schema = self.buffer[0].schema();
+            let combined = arrow_select::concat::concat_batches(&schema, &self.buffer)
+                .map_err(|e| ConnectorError::Internal(format!("concat failed: {e}")))?;
+            self.buffer.clear();
+            self.buffer.push(combined);
         }
         Ok(())
     }
@@ -797,20 +837,10 @@ impl SinkConnector for DeltaLakeSink {
     async fn close(&mut self) -> Result<(), ConnectorError> {
         info!("closing Delta Lake sink connector");
 
-        // Flush remaining data.
+        // Commit any remaining buffered data before closing.
         if !self.buffer.is_empty() {
-            #[cfg(feature = "delta-lake")]
-            {
-                self.flush_buffer_to_delta().await?;
-            }
-            #[cfg(not(feature = "delta-lake"))]
-            {
-                let _ = self.flush_buffer_local();
-                if self.pending_files > 0 {
-                    self.commit_local(self.current_epoch);
-                    self.last_committed_epoch = self.current_epoch;
-                }
-            }
+            self.pre_commit(self.current_epoch).await?;
+            self.commit_epoch(self.current_epoch).await?;
         }
 
         // Cancel and join the background compaction task.
@@ -854,6 +884,7 @@ impl std::fmt::Debug for DeltaLakeSink {
             .field("last_committed_epoch", &self.last_committed_epoch)
             .field("buffered_rows", &self.buffered_rows)
             .field("delta_version", &self.delta_version)
+            .field("epoch_skipped", &self.epoch_skipped)
             .finish_non_exhaustive()
     }
 }
@@ -1020,24 +1051,21 @@ mod tests {
         assert!(sink.buffered_bytes() > 0);
     }
 
-    // When delta-lake feature is enabled, auto-flush calls flush_buffer_to_delta()
-    // which requires an actual table. See delta_io::tests::test_auto_flush_writes_data
-    // for the real I/O integration test.
-    #[cfg(not(feature = "delta-lake"))]
     #[tokio::test]
-    async fn test_write_batch_auto_flush() {
+    async fn test_write_batch_buffers_without_commit() {
         let mut config = test_config();
         config.max_buffer_records = 10;
         let mut sink = DeltaLakeSink::new(config);
         sink.state = ConnectorState::Running;
 
-        let batch = test_batch(15);
-        let result = sink.write_batch(&batch).await.unwrap();
+        // Write batches that exceed the threshold — no mid-epoch commit.
+        let batch = test_batch(6);
+        sink.write_batch(&batch).await.unwrap();
+        sink.write_batch(&batch).await.unwrap();
 
-        // Should flush because 15 >= 10
-        assert_eq!(result.records_written, 15);
-        assert_eq!(sink.buffered_rows(), 0);
-        assert_eq!(sink.pending_files, 1);
+        assert_eq!(sink.buffered_rows(), 12);
+        assert_eq!(sink.buffer.len(), 2);
+        assert_eq!(sink.pending_files, 0);
     }
 
     #[tokio::test]
@@ -1218,24 +1246,20 @@ mod tests {
     // ── Flush tests ──
     // Note: These tests bypass open() and test business logic only.
 
-    #[cfg(not(feature = "delta-lake"))]
     #[tokio::test]
-    async fn test_explicit_flush() {
-        let mut config = test_config();
-        config.max_buffer_records = 1000;
-        let mut sink = DeltaLakeSink::new(config);
+    async fn test_flush_coalesces_buffer() {
+        let mut sink = DeltaLakeSink::new(test_config());
         sink.state = ConnectorState::Running;
 
-        let batch = test_batch(20);
+        let batch = test_batch(10);
         sink.write_batch(&batch).await.unwrap();
-        assert_eq!(sink.buffered_rows(), 20);
+        sink.write_batch(&batch).await.unwrap();
+        assert_eq!(sink.buffer.len(), 2);
 
+        // flush() coalesces batches but does not write to Delta.
         sink.flush().await.unwrap();
-        assert_eq!(sink.buffered_rows(), 0);
-        assert_eq!(sink.pending_files, 1);
-
-        let m = sink.metrics();
-        assert_eq!(m.records_total, 20);
+        assert_eq!(sink.buffer.len(), 1);
+        assert_eq!(sink.buffered_rows(), 20);
     }
 
     // ── Open and close tests ──
@@ -1245,27 +1269,15 @@ mod tests {
 
     #[cfg(not(feature = "delta-lake"))]
     #[tokio::test]
-    async fn test_open() {
+    async fn test_open_requires_feature() {
         let mut sink = DeltaLakeSink::new(test_config());
 
         let connector_config = ConnectorConfig::new("delta-lake");
-        sink.open(&connector_config).await.unwrap();
+        let result = sink.open(&connector_config).await;
 
-        assert_eq!(sink.state(), ConnectorState::Running);
-    }
-
-    #[cfg(not(feature = "delta-lake"))]
-    #[tokio::test]
-    async fn test_open_with_properties() {
-        let mut sink = DeltaLakeSink::new(DeltaLakeSinkConfig::default());
-
-        let mut connector_config = ConnectorConfig::new("delta-lake");
-        connector_config.set("table.path", "/data/new_table");
-        connector_config.set("write.mode", "overwrite");
-
-        sink.open(&connector_config).await.unwrap();
-        assert_eq!(sink.config().table_path, "/data/new_table");
-        assert_eq!(sink.config().write_mode, DeltaWriteMode::Overwrite);
+        assert!(result.is_err());
+        let err = result.unwrap_err().to_string();
+        assert!(err.contains("delta-lake"), "error: {err}");
     }
 
     #[tokio::test]
@@ -1400,15 +1412,16 @@ mod tests {
     // needs a real table. See delta_io::tests for integration coverage.
     #[cfg(not(feature = "delta-lake"))]
     #[tokio::test]
-    async fn test_metrics_after_writes() {
-        let mut config = test_config();
-        config.max_buffer_records = 5;
-        let mut sink = DeltaLakeSink::new(config);
+    async fn test_metrics_after_flush() {
+        let mut sink = DeltaLakeSink::new(test_config());
         sink.state = ConnectorState::Running;
 
         let batch = test_batch(10);
         sink.write_batch(&batch).await.unwrap();
+        assert_eq!(sink.buffered_rows(), 10);
 
+        // Metrics are recorded on flush, not on write_batch.
+        sink.pre_commit(0).await.unwrap();
         let m = sink.metrics();
         assert_eq!(m.records_total, 10);
         assert!(m.bytes_total > 0);

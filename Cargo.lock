@@ -4637,6 +4637,7 @@ dependencies = [
  "datafusion",
  "deadpool-postgres",
  "deltalake",
+ "deltalake-catalog-glue",
  "foyer",
  "futures-util",
  "globset",

@@ -716,29 +716,62 @@ pub async fn run_vacuum(
 
 /// Resolves catalog-aware table URI and merges catalog-specific storage options.
 ///
-/// Returns `(resolved_table_uri, merged_storage_options)`.
+/// - `None`: returns table path and storage options as-is.
+/// - `Glue`: calls AWS Glue API to resolve the table's S3 location.
+/// - `Unity`: injects workspace URL and access token into storage options.
 ///
-/// - `None` catalog: returns the table path and base storage options as-is.
-/// - `Glue` catalog: returns the table path as-is (Glue resolves via AWS env).
-/// - `Unity` catalog: injects `DATABRICKS_WORKSPACE_URL` and
-///   `DATABRICKS_ACCESS_TOKEN` into the storage options.
+/// # Errors
+///
+/// Returns `ConnectorError` if catalog resolution fails.
 #[cfg(feature = "delta-lake")]
-#[must_use]
-#[allow(clippy::implicit_hasher)]
-pub fn resolve_catalog_options(
+#[allow(clippy::implicit_hasher, clippy::unused_async)]
+pub async fn resolve_catalog_options(
     catalog: &super::delta_config::DeltaCatalogType,
-    _catalog_database: Option<&str>,
-    _catalog_name: Option<&str>,
+    #[allow(unused_variables)] catalog_database: Option<&str>,
+    #[allow(unused_variables)] catalog_name: Option<&str>,
     _catalog_schema: Option<&str>,
     table_path: &str,
     base_storage_options: &HashMap<String, String>,
-) -> (String, HashMap<String, String>) {
+) -> Result<(String, HashMap<String, String>), ConnectorError> {
     use super::delta_config::DeltaCatalogType;
 
     match catalog {
-        DeltaCatalogType::None | DeltaCatalogType::Glue => {
-            (table_path.to_string(), base_storage_options.clone())
+        DeltaCatalogType::None => Ok((table_path.to_string(), base_storage_options.clone())),
+        #[cfg(feature = "delta-lake-glue")]
+        DeltaCatalogType::Glue => {
+            let database = catalog_database.ok_or_else(|| {
+                ConnectorError::ConfigurationError(
+                    "Glue catalog requires 'catalog.database'".into(),
+                )
+            })?;
+            use deltalake::DataCatalog;
+            let glue = deltalake_catalog_glue::GlueDataCatalog::from_env()
+                .await
+                .map_err(|e| {
+                    ConnectorError::ConnectionFailed(format!("failed to init Glue catalog: {e}"))
+                })?;
+            let resolved = glue
+                .get_table_storage_location(catalog_name.map(String::from), database, table_path)
+                .await
+                .map_err(|e| {
+                    ConnectorError::ConnectionFailed(format!(
+                        "Glue catalog lookup failed for '{database}.{table_path}': {e}"
+                    ))
+                })?;
+            info!(
+                glue_database = database,
+                table = table_path,
+                resolved_path = %resolved,
+                "resolved table path via Glue catalog"
+            );
+            Ok((resolved, base_storage_options.clone()))
         }
+        #[cfg(not(feature = "delta-lake-glue"))]
+        DeltaCatalogType::Glue => Err(ConnectorError::ConfigurationError(
+            "Glue catalog requires the 'delta-lake-glue' feature. \
+             Build with: cargo build --features delta-lake-glue"
+                .into(),
+        )),
         DeltaCatalogType::Unity {
             workspace_url,
             access_token,
@@ -749,7 +782,7 @@ pub fn resolve_catalog_options(
                 workspace_url.clone(),
             );
             opts.insert("DATABRICKS_ACCESS_TOKEN".to_string(), access_token.clone());
-            (table_path.to_string(), opts)
+            Ok((table_path.to_string(), opts))
         }
     }
 }
