@@ -80,7 +80,7 @@ default = [
     "jit",
     "kafka",
     "websocket",
-    "delta-lake",
+    "delta",
     "postgres-cdc",
     "postgres-sink",
     "mysql-cdc",
@@ -95,6 +95,13 @@ postgres-cdc = ["laminar-db/postgres-cdc"]
 postgres-sink = ["laminar-db/postgres-sink"]
 mysql-cdc = ["laminar-db/mysql-cdc"]
 delta-lake = ["laminar-db/delta-lake"]
+delta-lake-s3 = ["delta-lake", "laminar-db/delta-lake-s3"]
+delta-lake-azure = ["delta-lake", "laminar-db/delta-lake-azure"]
+delta-lake-gcs = ["delta-lake", "laminar-db/delta-lake-gcs"]
+delta-lake-unity = ["delta-lake", "laminar-db/delta-lake-unity"]
+delta-lake-glue = ["delta-lake", "laminar-db/delta-lake-glue"]
+# Meta-feature: all Delta Lake backends + catalogs
+delta = ["delta-lake", "delta-lake-s3", "delta-lake-azure", "delta-lake-gcs", "delta-lake-unity", "delta-lake-glue", "laminar-db/delta-lake-all"]
 files = ["laminar-db/files"]
 parquet-lookup = ["laminar-db/parquet-lookup"]
 # Cloud object store backends for checkpoints

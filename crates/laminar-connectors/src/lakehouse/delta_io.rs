@@ -739,12 +739,12 @@ pub async fn resolve_catalog_options(
         DeltaCatalogType::None => Ok((table_path.to_string(), base_storage_options.clone())),
         #[cfg(feature = "delta-lake-glue")]
         DeltaCatalogType::Glue => {
+            use deltalake::DataCatalog;
             let database = catalog_database.ok_or_else(|| {
                 ConnectorError::ConfigurationError(
                     "Glue catalog requires 'catalog.database'".into(),
                 )
             })?;
-            use deltalake::DataCatalog;
             let glue = deltalake_catalog_glue::GlueDataCatalog::from_env()
                 .await
                 .map_err(|e| {
