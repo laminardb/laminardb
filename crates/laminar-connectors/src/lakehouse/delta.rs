@@ -201,6 +201,25 @@ impl DeltaLakeSink {
         false
     }
 
+    /// Returns the target table schema, stripping metadata columns (`_op`, etc.)
+    /// in upsert mode so the Delta table isn't created with changelog columns.
+    /// CDC metadata columns stripped from the target Delta table schema.
+    const CDC_METADATA_COLUMNS: &'static [&'static str] = &["_op", "_ts_ms"];
+
+    fn target_schema(batch_schema: &SchemaRef, write_mode: DeltaWriteMode) -> SchemaRef {
+        if write_mode == DeltaWriteMode::Upsert {
+            let fields: Vec<_> = batch_schema
+                .fields()
+                .iter()
+                .filter(|f| !Self::CDC_METADATA_COLUMNS.contains(&f.name().as_str()))
+                .cloned()
+                .collect();
+            Arc::new(arrow_schema::Schema::new(fields))
+        } else {
+            batch_schema.clone()
+        }
+    }
+
     /// Estimates the byte size of a `RecordBatch`.
     #[must_use]
     pub fn estimate_batch_size(batch: &RecordBatch) -> u64 {
@@ -265,48 +284,24 @@ impl DeltaLakeSink {
 
         if self.config.write_mode == DeltaWriteMode::Upsert {
             // ── Upsert/Merge path ──
-            // Coalesce all buffered batches into one, split by changelog op,
-            // then issue a single MERGE + single DELETE transaction.
+            // Single atomic MERGE handles inserts, updates, and deletes
+            // via conditional clauses on the _op column.
             let combined = arrow_select::concat::concat_batches(&batches[0].schema(), &batches)
                 .map_err(|e| ConnectorError::Internal(format!("failed to concat batches: {e}")))?;
 
-            let (inserts, deletes) = Self::split_changelog_batch(&combined)?;
-
-            // Merge inserts/updates into the target table.
-            if inserts.num_rows() > 0 {
-                let (t, result) = super::delta_io::merge_batches(
-                    table,
-                    inserts,
-                    &self.config.merge_key_columns,
-                    &self.config.writer_id,
-                    self.current_epoch,
-                    self.config.schema_evolution,
-                )
-                .await?;
-                table = t;
-                self.metrics.record_merge();
-                debug!(
-                    inserted = result.rows_inserted,
-                    updated = result.rows_updated,
-                    "Delta Lake: merged inserts/updates"
-                );
-            }
-
-            // Delete matching rows from the target table.
-            if deletes.num_rows() > 0 {
-                let delete_count = deletes.num_rows();
-                let (t, rows_deleted) = super::delta_io::delete_by_merge(
-                    table,
-                    deletes,
-                    &self.config.merge_key_columns,
-                    &self.config.writer_id,
-                    self.current_epoch,
-                )
-                .await?;
-                table = t;
-                #[allow(clippy::cast_possible_truncation)]
-                self.metrics.record_deletes(delete_count as u64);
-                debug!(rows_deleted, "Delta Lake: merged deletes");
+            let (t, result) = super::delta_io::merge_changelog(
+                table,
+                combined,
+                &self.config.merge_key_columns,
+                &self.config.writer_id,
+                self.current_epoch,
+                self.config.schema_evolution,
+            )
+            .await?;
+            table = t;
+            self.metrics.record_merge();
+            if result.rows_deleted > 0 {
+                self.metrics.record_deletes(result.rows_deleted as u64);
             }
         } else {
             // ── Append/Overwrite path ──
@@ -668,9 +663,10 @@ impl SinkConnector for DeltaLakeSink {
             return Ok(WriteResult::new(0, 0));
         }
 
-        // Handle schema on first write.
+        // Handle schema on first write. In upsert mode, strip metadata columns
+        // (_op, _ts_ms) so the Delta table isn't created with changelog columns.
         if self.schema.is_none() {
-            self.schema = Some(batch.schema());
+            self.schema = Some(Self::target_schema(&batch.schema(), self.config.write_mode));
         }
 
         let num_rows = batch.num_rows();
