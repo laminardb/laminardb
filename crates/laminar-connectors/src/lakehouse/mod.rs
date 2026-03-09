@@ -1,7 +1,7 @@
 //! Lakehouse connectors (Delta Lake).
 //!
 //! Writes Arrow `RecordBatch` data to lakehouse table formats with
-//! ACID transactions and exactly-once semantics.
+//! ACID transactions and at-least-once delivery (exactly-once opt-in).
 //!
 //! # Architecture
 //!

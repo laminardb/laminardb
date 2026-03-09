@@ -209,6 +209,12 @@ impl DeltaLakeSinkConfig {
         }
         if let Some(v) = config.get("writer.id") {
             cfg.writer_id = v.to_string();
+        } else if cfg.delivery_guarantee == DeliveryGuarantee::ExactlyOnce {
+            return Err(ConnectorError::ConfigurationError(
+                "exactly-once delivery requires an explicit 'writer.id' for stable \
+                 recovery across restarts"
+                    .into(),
+            ));
         }
 
         // ── Catalog configuration ──
@@ -617,6 +623,25 @@ mod tests {
         pairs.push(("checkpoint.interval", "0"));
         let config = make_config(&pairs);
         assert!(DeltaLakeSinkConfig::from_config(&config).is_err());
+    }
+
+    #[test]
+    fn test_exactly_once_requires_writer_id() {
+        let mut pairs = required_pairs();
+        pairs.push(("delivery.guarantee", "exactly-once"));
+        let config = make_config(&pairs);
+        let err = DeltaLakeSinkConfig::from_config(&config).unwrap_err();
+        assert!(err.to_string().contains("writer.id"), "error: {err}");
+    }
+
+    #[test]
+    fn test_exactly_once_with_writer_id_ok() {
+        let mut pairs = required_pairs();
+        pairs.push(("delivery.guarantee", "exactly-once"));
+        pairs.push(("writer.id", "my-stable-writer"));
+        let config = make_config(&pairs);
+        let cfg = DeltaLakeSinkConfig::from_config(&config).unwrap();
+        assert_eq!(cfg.writer_id, "my-stable-writer");
     }
 
     #[test]

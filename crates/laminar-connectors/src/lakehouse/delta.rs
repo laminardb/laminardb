@@ -579,6 +579,7 @@ impl SinkConnector for DeltaLakeSink {
                 self.config.catalog_schema.as_deref(),
                 &self.config.table_path,
                 &self.config.storage_options,
+                &self.config.catalog_properties,
             )
             .await?;
 

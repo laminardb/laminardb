@@ -732,6 +732,7 @@ pub async fn resolve_catalog_options(
     _catalog_schema: Option<&str>,
     table_path: &str,
     base_storage_options: &HashMap<String, String>,
+    catalog_properties: &HashMap<String, String>,
 ) -> Result<(String, HashMap<String, String>), ConnectorError> {
     use super::delta_config::DeltaCatalogType;
 
@@ -764,7 +765,13 @@ pub async fn resolve_catalog_options(
                 resolved_path = %resolved,
                 "resolved table path via Glue catalog"
             );
-            Ok((resolved, base_storage_options.clone()))
+            let mut opts = base_storage_options.clone();
+            opts.extend(
+                catalog_properties
+                    .iter()
+                    .map(|(k, v)| (k.clone(), v.clone())),
+            );
+            Ok((resolved, opts))
         }
         #[cfg(not(feature = "delta-lake-glue"))]
         DeltaCatalogType::Glue => Err(ConnectorError::ConfigurationError(
@@ -783,6 +790,11 @@ pub async fn resolve_catalog_options(
             // DATABRICKS_TOKEN env vars). We inject from config so users can
             // specify credentials in TOML instead of env vars.
             let mut opts = base_storage_options.clone();
+            opts.extend(
+                catalog_properties
+                    .iter()
+                    .map(|(k, v)| (k.clone(), v.clone())),
+            );
             if !workspace_url.is_empty() {
                 opts.insert("databricks_host".to_string(), workspace_url.clone());
             }
