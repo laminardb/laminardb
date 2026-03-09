@@ -475,19 +475,93 @@ impl crate::pipeline::PipelineCallback for ConnectorPipelineCallback {
             }
             match source.poll_changes().await {
                 Ok(Some(batch)) => {
-                    // Check if this table uses partial (foyer) cache mode.
-                    // If so, update the foyer cache per-row instead of
-                    // re-building the full LookupSnapshot.
+                    // Single registry lookup — dispatch by variant.
+                    let entry = self.lookup_registry.get_entry(name);
                     if let Some(
                         laminar_sql::datafusion::lookup_join_exec::RegisteredLookup::Partial(
                             partial,
                         ),
-                    ) = self.lookup_registry.get_entry(name)
+                    ) = &entry
                     {
-                        update_partial_cache_from_batch(&partial, &batch);
+                        update_partial_cache_from_batch(partial, &batch);
                         let mut ts = self.table_store.lock();
                         if let Err(e) = ts.upsert_and_rebuild(name, &batch) {
                             tracing::warn!(table=%name, error=%e, "Table upsert error (partial)");
+                        }
+                    } else if let Some(
+                        laminar_sql::datafusion::lookup_join_exec::RegisteredLookup::Versioned(
+                            versioned,
+                        ),
+                    ) = &entry
+                    {
+                        // Versioned path: append new CDC rows, preserving
+                        // all versions for temporal point-in-time lookups.
+                        let combined = if versioned.batch.num_rows() == 0
+                            || versioned.batch.schema().fields().is_empty()
+                        {
+                            batch.clone()
+                        } else {
+                            match arrow::compute::concat_batches(
+                                &versioned.batch.schema(),
+                                [&versioned.batch, &batch],
+                            ) {
+                                Ok(b) => b,
+                                Err(e) => {
+                                    tracing::warn!(
+                                        table=%name, error=%e,
+                                        "Versioned table concat error (schema mismatch?); \
+                                         keeping existing state"
+                                    );
+                                    // Preserve existing versioned history rather than
+                                    // discarding it. The CDC batch is silently dropped.
+                                    continue;
+                                }
+                            }
+                        };
+                        // Build versioned index from the combined batch.
+                        let key_indices: Vec<usize> = versioned
+                            .key_columns
+                            .iter()
+                            .filter_map(|k| combined.schema().index_of(k).ok())
+                            .collect();
+                        let Ok(version_col_idx) =
+                            combined.schema().index_of(&versioned.version_column)
+                        else {
+                            tracing::warn!(
+                                table=%name,
+                                version_col=%versioned.version_column,
+                                "Version column not found; skipping index rebuild"
+                            );
+                            continue;
+                        };
+                        let index =
+                            match laminar_sql::datafusion::lookup_join_exec::VersionedIndex::build(
+                                &combined,
+                                &key_indices,
+                                version_col_idx,
+                            ) {
+                                Ok(idx) => Arc::new(idx),
+                                Err(e) => {
+                                    tracing::warn!(
+                                        table=%name, error=%e,
+                                        "Versioned index build error"
+                                    );
+                                    continue;
+                                }
+                            };
+                        self.lookup_registry.register_versioned(
+                            name,
+                            laminar_sql::datafusion::VersionedLookupState {
+                                batch: combined,
+                                index,
+                                key_columns: versioned.key_columns.clone(),
+                                version_column: versioned.version_column.clone(),
+                                stream_time_column: versioned.stream_time_column.clone(),
+                            },
+                        );
+                        let mut ts = self.table_store.lock();
+                        if let Err(e) = ts.upsert_and_rebuild(name, &batch) {
+                            tracing::warn!(table=%name, error=%e, "Table upsert error (versioned)");
                         }
                     } else {
                         let maybe_batch = {

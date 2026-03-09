@@ -139,7 +139,8 @@ pub use json_udf::{
 };
 pub use lookup_join_exec::{
     LookupJoinExec, LookupJoinExtensionPlanner, LookupSnapshot, LookupTableRegistry,
-    PartialLookupJoinExec, PartialLookupState, RegisteredLookup,
+    PartialLookupJoinExec, PartialLookupState, RegisteredLookup, VersionedLookupJoinExec,
+    VersionedLookupState,
 };
 pub use proctime_udf::ProcTimeUdf;
 pub use source::{SortColumn, StreamSource, StreamSourceRef};

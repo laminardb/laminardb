@@ -199,6 +199,8 @@ struct EowcState {
 pub(crate) struct StreamExecutor {
     ctx: SessionContext,
     queries: Vec<StreamQuery>,
+    /// Lookup table registry for versioned temporal join state.
+    lookup_registry: Option<Arc<laminar_sql::datafusion::LookupTableRegistry>>,
     /// Tracks which temporary source tables are registered (for cleanup).
     registered_sources: Vec<String>,
     /// Indices into `queries` in topological (dependency) order.
@@ -245,6 +247,7 @@ impl StreamExecutor {
         Self {
             ctx,
             queries: Vec::new(),
+            lookup_registry: None,
             registered_sources: Vec::new(),
             topo_order: Vec::new(),
             topo_dirty: true,
@@ -260,6 +263,24 @@ impl StreamExecutor {
             cycle_results: FxHashMap::default(),
             cycle_intermediates: Vec::new(),
         }
+    }
+
+    /// Set the lookup table registry for versioned temporal join lookups.
+    pub fn set_lookup_registry(
+        &mut self,
+        registry: Arc<laminar_sql::datafusion::LookupTableRegistry>,
+    ) {
+        self.lookup_registry = Some(registry);
+    }
+
+    /// Returns the temporal join configs for tables that appear as right-side
+    /// in temporal joins. Used during pipeline startup to pre-register versioned
+    /// tables in the lookup registry.
+    pub fn temporal_join_configs(&self) -> Vec<TemporalJoinTranslatorConfig> {
+        self.queries
+            .iter()
+            .filter_map(|q| q.temporal_config.clone())
+            .collect()
     }
 
     /// Register a source schema so that empty placeholder tables can be
@@ -281,8 +302,11 @@ impl StreamExecutor {
         window_config: Option<WindowOperatorConfig>,
         order_config: Option<OrderOperatorConfig>,
     ) {
-        let (asof_config, projection_sql) = detect_asof_query(&sql);
-        let temporal_config = detect_temporal_query(&sql);
+        let (asof_config, mut projection_sql) = detect_asof_query(&sql);
+        let (temporal_config, temporal_projection_sql) = detect_temporal_query(&sql);
+        if projection_sql.is_none() {
+            projection_sql = temporal_projection_sql;
+        }
         let table_refs = extract_table_references(&sql);
         let idx = self.queries.len();
         let query = StreamQuery {
@@ -467,8 +491,15 @@ impl StreamExecutor {
                     .temporal_config
                     .clone()
                     .expect("has_temporal guard ensures temporal_config is Some");
-                self.execute_temporal_query(&query_name, &cfg, source_batches, &results)
-                    .await
+                let projection_sql = self.queries[idx].projection_sql.clone();
+                self.execute_temporal_query(
+                    &query_name,
+                    &cfg,
+                    projection_sql.as_deref(),
+                    source_batches,
+                    &results,
+                )
+                .await
             } else {
                 self.execute_standard_query(idx).await
             };
@@ -1195,8 +1226,15 @@ impl StreamExecutor {
             )
             .await?
         } else if let Some(tcfg) = temporal_config {
-            self.execute_temporal_query(query_name, tcfg, &filtered_sources, intermediate_results)
-                .await?
+            let temporal_proj = self.queries[idx].projection_sql.as_deref();
+            self.execute_temporal_query(
+                query_name,
+                tcfg,
+                temporal_proj,
+                &filtered_sources,
+                intermediate_results,
+            )
+            .await?
         } else {
             let df = self
                 .ctx
@@ -1282,34 +1320,183 @@ impl StreamExecutor {
         }
     }
 
-    /// Execute a temporal join query by fetching stream/table batches and
-    /// performing a point-in-time version lookup.
+    /// Execute a temporal join query using the versioned lookup registry.
+    ///
+    /// The table must be registered as `RegisteredLookup::Versioned` in
+    /// the lookup registry. The pre-built `VersionedIndex` is reused
+    /// across cycles (only rebuilt on CDC updates in `poll_tables`).
     async fn execute_temporal_query(
         &self,
         query_name: &str,
         config: &TemporalJoinTranslatorConfig,
+        projection_sql: Option<&str>,
         source_batches: &FxHashMap<String, Vec<RecordBatch>>,
         intermediate_results: &FxHashMap<String, Vec<RecordBatch>>,
     ) -> Result<Vec<RecordBatch>, DbError> {
+        let registry = self.lookup_registry.as_ref().ok_or_else(|| {
+            DbError::Pipeline(format!(
+                "temporal join [{query_name}]: lookup registry not set"
+            ))
+        })?;
+
+        let Some(laminar_sql::datafusion::RegisteredLookup::Versioned(versioned)) =
+            registry.get_entry(&config.table_name)
+        else {
+            return Err(DbError::Pipeline(format!(
+                "temporal join [{query_name}]: table '{}' not registered as versioned",
+                config.table_name
+            )));
+        };
+
+        self.execute_versioned_temporal_query(
+            query_name,
+            config,
+            projection_sql,
+            &versioned,
+            source_batches,
+            intermediate_results,
+        )
+        .await
+    }
+
+    /// Execute a temporal join against a versioned lookup table from the registry.
+    #[allow(clippy::too_many_lines)]
+    async fn execute_versioned_temporal_query(
+        &self,
+        query_name: &str,
+        config: &TemporalJoinTranslatorConfig,
+        projection_sql: Option<&str>,
+        versioned: &laminar_sql::datafusion::VersionedLookupState,
+        source_batches: &FxHashMap<String, Vec<RecordBatch>>,
+        intermediate_results: &FxHashMap<String, Vec<RecordBatch>>,
+    ) -> Result<Vec<RecordBatch>, DbError> {
+        use datafusion::catalog::TableProvider;
+        use datafusion::physical_plan::ExecutionPlan as _;
+        use futures::TryStreamExt as _;
+        use laminar_sql::datafusion::lookup_join::LookupJoinType;
+        use laminar_sql::datafusion::lookup_join_exec::VersionedLookupJoinExec;
+
         let stream_batches = self
             .resolve_table_batches(&config.stream_table, source_batches, intermediate_results)
             .await?;
-        let table_batches = self
-            .resolve_table_batches(&config.table_name, source_batches, intermediate_results)
-            .await?;
 
-        let joined = crate::temporal_batch::execute_temporal_join_batch(
-            &stream_batches,
-            &table_batches,
-            config,
-        )
-        .map_err(|e| DbError::Pipeline(format!("temporal join [{query_name}]: {e}")))?;
-
-        if joined.num_rows() == 0 {
+        if stream_batches.is_empty() {
             return Ok(Vec::new());
         }
 
-        Ok(vec![joined])
+        let table_schema = versioned.batch.schema();
+        let stream_schema = stream_batches[0].schema();
+
+        let stream_key_idx = stream_schema
+            .index_of(&config.stream_key_column)
+            .map_err(|_| {
+                DbError::Pipeline(format!(
+                    "temporal join [{query_name}]: stream key column '{}' not found",
+                    config.stream_key_column
+                ))
+            })?;
+        let stream_time_idx = stream_schema
+            .index_of(&config.stream_time_column)
+            .map_err(|_| {
+                DbError::Pipeline(format!(
+                    "temporal join [{query_name}]: stream time column '{}' not found",
+                    config.stream_time_column
+                ))
+            })?;
+
+        let join_type = if config.join_type == "left" {
+            LookupJoinType::LeftOuter
+        } else {
+            LookupJoinType::Inner
+        };
+
+        let key_sort_fields: Vec<arrow::row::SortField> = versioned
+            .key_columns
+            .iter()
+            .filter_map(|k| {
+                table_schema
+                    .index_of(k)
+                    .ok()
+                    .map(|i| arrow::row::SortField::new(table_schema.field(i).data_type().clone()))
+            })
+            .collect();
+
+        let mut output_fields = stream_schema.fields().to_vec();
+        output_fields.extend(table_schema.fields().iter().cloned());
+        let output_schema = Arc::new(arrow::datatypes::Schema::new(output_fields));
+
+        if stream_batches.iter().all(|b| b.num_rows() == 0) {
+            return Ok(Vec::new());
+        }
+
+        // Build the exec node with the persistent versioned table data.
+        // The index is pre-built and cached in the registry — not rebuilt per cycle.
+        let mem_table = datafusion::datasource::MemTable::try_new(
+            Arc::clone(&stream_schema),
+            vec![stream_batches],
+        )
+        .map_err(|e| {
+            DbError::Pipeline(format!("temporal join [{query_name}]: memory table: {e}"))
+        })?;
+        let input = mem_table
+            .scan(&self.ctx.state(), None, &[], None)
+            .await
+            .map_err(|e| DbError::Pipeline(format!("temporal join [{query_name}]: scan: {e}")))?;
+        let exec = VersionedLookupJoinExec::try_new(
+            input,
+            versioned.batch.clone(),
+            Arc::clone(&versioned.index),
+            vec![stream_key_idx],
+            stream_time_idx,
+            join_type,
+            output_schema,
+            key_sort_fields,
+        )
+        .map_err(|e| {
+            DbError::Pipeline(format!(
+                "temporal join [{query_name}]: exec build error: {e}"
+            ))
+        })?;
+
+        let task_ctx = self.ctx.state().task_ctx();
+        let stream = exec
+            .execute(0, task_ctx)
+            .map_err(|e| DbError::Pipeline(format!("temporal join [{query_name}]: {e}")))?;
+
+        let batches: Vec<arrow_array::RecordBatch> = stream
+            .try_collect()
+            .await
+            .map_err(|e| DbError::Pipeline(format!("temporal join [{query_name}]: {e}")))?;
+
+        // Apply projection SQL to rewrite column names/aliases/expressions.
+        if let Some(proj_sql) = projection_sql {
+            if batches.is_empty() || batches.iter().all(|b| b.num_rows() == 0) {
+                return Ok(Vec::new());
+            }
+            let schema = batches[0].schema();
+            let mem_table = datafusion::datasource::MemTable::try_new(schema, vec![batches])
+                .map_err(|e| DbError::query_pipeline(query_name, &e))?;
+
+            let _ = self.ctx.deregister_table("__temporal_tmp");
+            self.ctx
+                .register_table("__temporal_tmp", Arc::new(mem_table))
+                .map_err(|e| DbError::query_pipeline(query_name, &e))?;
+
+            let df = self
+                .ctx
+                .sql(proj_sql)
+                .await
+                .map_err(|e| DbError::query_pipeline(query_name, &e))?;
+            let result = df
+                .collect()
+                .await
+                .map_err(|e| DbError::query_pipeline(query_name, &e))?;
+
+            let _ = self.ctx.deregister_table("__temporal_tmp");
+            Ok(result)
+        } else {
+            Ok(batches)
+        }
     }
 
     /// Resolve batches for a table name by checking source batches first,
@@ -1648,35 +1835,150 @@ fn detect_asof_query(sql: &str) -> (Option<AsofJoinTranslatorConfig>, Option<Str
     (Some(config), Some(projection_sql))
 }
 
-fn detect_temporal_query(sql: &str) -> Option<TemporalJoinTranslatorConfig> {
+fn detect_temporal_query(sql: &str) -> (Option<TemporalJoinTranslatorConfig>, Option<String>) {
     let Ok(statements) = laminar_sql::parse_streaming_sql(sql) else {
-        return None;
+        return (None, None);
     };
 
     let Some(laminar_sql::parser::StreamingStatement::Standard(stmt)) = statements.first() else {
-        return None;
+        return (None, None);
     };
 
     let Statement::Query(query) = stmt.as_ref() else {
-        return None;
+        return (None, None);
     };
 
     let SetExpr::Select(select) = query.body.as_ref() else {
-        return None;
+        return (None, None);
     };
 
     let Ok(Some(multi)) = analyze_joins(select) else {
-        return None;
+        return (None, None);
     };
 
-    let temporal_analysis = multi.joins.iter().find(|j| j.is_temporal_join)?;
+    let Some(temporal_analysis) = multi.joins.iter().find(|j| j.is_temporal_join) else {
+        return (None, None);
+    };
 
     let JoinOperatorConfig::Temporal(config) = JoinOperatorConfig::from_analysis(temporal_analysis)
     else {
-        return None;
+        return (None, None);
     };
 
-    Some(config)
+    let projection_sql = build_temporal_projection_sql(select, temporal_analysis, &config);
+
+    (Some(config), Some(projection_sql))
+}
+
+/// Build a `SELECT ... FROM __temporal_tmp` projection query from the original
+/// SELECT items, rewriting table-qualified references to plain column names.
+fn build_temporal_projection_sql(
+    select: &sqlparser::ast::Select,
+    analysis: &laminar_sql::parser::join_parser::JoinAnalysis,
+    config: &TemporalJoinTranslatorConfig,
+) -> String {
+    let left_alias = analysis.left_alias.as_deref();
+    let right_alias = analysis.right_alias.as_deref();
+
+    let items: Vec<String> = select
+        .projection
+        .iter()
+        .map(|item| match item {
+            SelectItem::UnnamedExpr(expr) => {
+                rewrite_temporal_expr(expr, left_alias, right_alias, config)
+            }
+            SelectItem::ExprWithAlias { expr, alias } => {
+                let rewritten = rewrite_temporal_expr(expr, left_alias, right_alias, config);
+                format!("{rewritten} AS {alias}")
+            }
+            SelectItem::Wildcard(_) => "*".to_string(),
+            SelectItem::QualifiedWildcard(name, _) => {
+                let table = name.to_string();
+                if Some(table.as_str()) == left_alias || Some(table.as_str()) == right_alias {
+                    "*".to_string()
+                } else {
+                    format!("{table}.*")
+                }
+            }
+        })
+        .collect();
+
+    let select_clause = items.join(", ");
+
+    let where_clause = select.selection.as_ref().map(|expr| {
+        let rewritten = rewrite_temporal_expr(expr, left_alias, right_alias, config);
+        format!(" WHERE {rewritten}")
+    });
+
+    format!(
+        "SELECT {select_clause} FROM __temporal_tmp{}",
+        where_clause.unwrap_or_default()
+    )
+}
+
+/// Rewrite an expression tree to remove table qualifiers for temporal joins.
+/// Stream-side columns keep their names. Table-side columns keep their names
+/// (temporal join output is a flat concatenation of both sides).
+fn rewrite_temporal_expr(
+    expr: &Expr,
+    left_alias: Option<&str>,
+    right_alias: Option<&str>,
+    config: &TemporalJoinTranslatorConfig,
+) -> String {
+    match expr {
+        Expr::CompoundIdentifier(parts) if parts.len() == 2 => {
+            let table = parts[0].value.as_str();
+            let column = parts[1].value.as_str();
+
+            let is_left = Some(table) == left_alias || table == config.stream_table;
+            let is_right = Some(table) == right_alias || table == config.table_name;
+
+            if is_left || is_right {
+                column.to_string()
+            } else {
+                expr.to_string()
+            }
+        }
+        Expr::BinaryOp { left, op, right } => {
+            let l = rewrite_temporal_expr(left, left_alias, right_alias, config);
+            let r = rewrite_temporal_expr(right, left_alias, right_alias, config);
+            format!("{l} {op} {r}")
+        }
+        Expr::UnaryOp { op, expr: inner } => {
+            let e = rewrite_temporal_expr(inner, left_alias, right_alias, config);
+            format!("{op} {e}")
+        }
+        Expr::Nested(inner) => {
+            let e = rewrite_temporal_expr(inner, left_alias, right_alias, config);
+            format!("({e})")
+        }
+        Expr::Function(func) => {
+            let name = &func.name;
+            let args: Vec<String> = match &func.args {
+                sqlparser::ast::FunctionArguments::List(arg_list) => arg_list
+                    .args
+                    .iter()
+                    .map(|arg| match arg {
+                        sqlparser::ast::FunctionArg::Unnamed(
+                            sqlparser::ast::FunctionArgExpr::Expr(e),
+                        ) => rewrite_temporal_expr(e, left_alias, right_alias, config),
+                        other => other.to_string(),
+                    })
+                    .collect(),
+                other => vec![other.to_string()],
+            };
+            format!("{name}({})", args.join(", "))
+        }
+        Expr::Cast {
+            expr: inner,
+            data_type,
+            ..
+        } => {
+            let e = rewrite_temporal_expr(inner, left_alias, right_alias, config);
+            format!("CAST({e} AS {data_type})")
+        }
+        _ => expr.to_string(),
+    }
 }
 
 /// Build a `SELECT ... FROM __asof_tmp` projection query from the original
