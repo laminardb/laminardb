@@ -772,18 +772,31 @@ pub async fn resolve_catalog_options(
              Build with: cargo build --features delta-lake-glue"
                 .into(),
         )),
+        #[cfg(feature = "delta-lake-unity")]
         DeltaCatalogType::Unity {
             workspace_url,
             access_token,
         } => {
+            // The deltalake-catalog-unity crate auto-registers a factory for
+            // uc:// URIs via #[ctor]. It reads `databricks_host` and
+            // `databricks_token` from storage options (or DATABRICKS_HOST /
+            // DATABRICKS_TOKEN env vars). We inject from config so users can
+            // specify credentials in TOML instead of env vars.
             let mut opts = base_storage_options.clone();
-            opts.insert(
-                "DATABRICKS_WORKSPACE_URL".to_string(),
-                workspace_url.clone(),
-            );
-            opts.insert("DATABRICKS_ACCESS_TOKEN".to_string(), access_token.clone());
+            if !workspace_url.is_empty() {
+                opts.insert("databricks_host".to_string(), workspace_url.clone());
+            }
+            if !access_token.is_empty() {
+                opts.insert("databricks_token".to_string(), access_token.clone());
+            }
             Ok((table_path.to_string(), opts))
         }
+        #[cfg(not(feature = "delta-lake-unity"))]
+        DeltaCatalogType::Unity { .. } => Err(ConnectorError::ConfigurationError(
+            "Unity catalog requires the 'delta-lake-unity' feature. \
+             Build with: cargo build --features delta-lake-unity"
+                .into(),
+        )),
     }
 }
 
