@@ -509,9 +509,12 @@ impl crate::pipeline::PipelineCallback for ConnectorPipelineCallback {
                                 Err(e) => {
                                     tracing::warn!(
                                         table=%name, error=%e,
-                                        "Versioned table concat error (schema mismatch?)"
+                                        "Versioned table concat error (schema mismatch?); \
+                                         keeping existing state"
                                     );
-                                    batch.clone()
+                                    // Preserve existing versioned history rather than
+                                    // discarding it. The CDC batch is silently dropped.
+                                    continue;
                                 }
                             }
                         };

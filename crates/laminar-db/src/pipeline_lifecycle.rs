@@ -607,8 +607,15 @@ impl LaminarDB {
                 ts.rebuild_xor_filter(name);
                 ts.set_ready(name, true);
             }
-            // Update lookup registry so join queries see fresh data
-            if let Some(batch) = self.table_store.lock().to_record_batch(name) {
+            // Update lookup registry so join queries see fresh data.
+            // Skip if already registered as Versioned (temporal join tables
+            // must keep their version history, not be overwritten as Snapshot).
+            if matches!(
+                self.lookup_registry.get_entry(name),
+                Some(laminar_sql::datafusion::RegisteredLookup::Versioned(_))
+            ) {
+                // Already versioned — don't downgrade to Snapshot.
+            } else if let Some(batch) = self.table_store.lock().to_record_batch(name) {
                 self.lookup_registry.register(
                     name,
                     laminar_sql::datafusion::LookupSnapshot {

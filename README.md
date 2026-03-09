@@ -261,7 +261,7 @@ Custom connectors can be built using the `SourceConnector` / `SinkConnector` tra
 
 Three-ring model separating latency-critical event processing from background I/O and the control plane:
 
-```
+```text
 ┌──────────────────────────────────────────────────────────────┐
 │                     RING 0: HOT PATH                         │
 │  CPU-pinned reactor, minimal allocations, SPSC queues        │
@@ -449,7 +449,7 @@ cargo run -p binance-ws
 
 ## Project Structure
 
-```
+```text
 crates/
   laminar-core/        Core engine: reactor, operators, state, windows, joins
   laminar-sql/         SQL parser, DataFusion integration, streaming optimizer

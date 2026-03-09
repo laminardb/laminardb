@@ -1405,16 +1405,7 @@ impl StreamExecutor {
         output_fields.extend(table_schema.fields().iter().cloned());
         let output_schema = Arc::new(arrow::datatypes::Schema::new(output_fields));
 
-        // Concat all stream batches into one for single-pass probing.
-        let stream_batch = if stream_batches.len() == 1 {
-            stream_batches[0].clone()
-        } else {
-            arrow::compute::concat_batches(&stream_schema, &stream_batches).map_err(|e| {
-                DbError::Pipeline(format!("temporal join [{query_name}]: concat error: {e}"))
-            })?
-        };
-
-        if stream_batch.num_rows() == 0 {
+        if stream_batches.iter().all(|b| b.num_rows() == 0) {
             return Ok(Vec::new());
         }
 
@@ -1422,7 +1413,7 @@ impl StreamExecutor {
         // The index is pre-built and cached in the registry — not rebuilt per cycle.
         let mem_table = datafusion::datasource::MemTable::try_new(
             Arc::clone(&stream_schema),
-            vec![vec![stream_batch]],
+            vec![stream_batches],
         )
         .map_err(|e| {
             DbError::Pipeline(format!("temporal join [{query_name}]: memory table: {e}"))
