@@ -164,7 +164,7 @@ db.start().await?;</code></pre>
         <div class="hero-metrics">
           <div class="hero-metric">
             <div class="hero-metric-value">&lt;500<span class="unit">ns</span></div>
-            <div class="hero-metric-label">state lookup p99</div>
+            <div class="hero-metric-label">state lookup</div>
             <div class="hero-metric-source"><a href="https://github.com/laminardb/laminardb/blob/main/crates/laminar-core/benches/state_bench.rs" target="_blank" rel="noopener">state_bench.rs</a></div>
           </div>
           <div class="hero-metric">
@@ -709,11 +709,11 @@ CREATE SINK lake INTO DELTA_LAKE (
               <tr>
                 <td>Throughput / core</td>
                 <td>500K events/s</td>
-                <td>1.1&ndash;3.17M events/s</td>
+                <td>1.1&ndash;1.46M events/s</td>
                 <td><a href="https://github.com/laminardb/laminardb/blob/main/crates/laminar-core/benches/throughput_bench.rs" target="_blank" rel="noopener">throughput_bench.rs</a></td>
               </tr>
               <tr>
-                <td>p99 latency</td>
+                <td>Event latency (mean)</td>
                 <td>&lt;10&micro;s</td>
                 <td>0.55&ndash;1.16&micro;s</td>
                 <td><a href="https://github.com/laminardb/laminardb/blob/main/crates/laminar-core/benches/latency_bench.rs" target="_blank" rel="noopener">latency_bench.rs</a></td>

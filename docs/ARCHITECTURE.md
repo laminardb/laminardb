@@ -346,7 +346,7 @@ Queries are planned by `StreamingPlanner` and executed either via DataFusion (in
 | Event processing | < 1us | 0.55-1.16us | Zero allocation, inlined operators |
 | Throughput/core | 500K/s | 1.1-1.46M/s | Batch processing, Arrow columnar |
 | Checkpoint | < 10s recovery | 1.39ms | Full snapshots, per-core WAL |
-| Window trigger | < 10us | -- | Hierarchical timer wheel |
+| Window trigger | < 10us | not yet measured | Hierarchical timer wheel |
 
 See [BENCHMARKS.md](BENCHMARKS.md) for full benchmark baselines with hardware details.
 

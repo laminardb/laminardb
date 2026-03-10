@@ -152,7 +152,10 @@
 | Count window (hot/steady) | **691.6 ns** | 1.45 M events/s |
 | SUM window (hot/steady) | **735.8 ns** | 1.36 M events/s |
 
-**Target: < 10 us p99** — Single-event processing is well under at ~0.5-1.2 us.
+**Target: < 10 us** — Single-event mean latency is well under at ~0.5-1.2 us.
+Note: these are Criterion mean/median measurements, not p99 percentiles from a
+latency distribution. True p99 under sustained load may be higher due to
+checkpoint barriers, cache misses, and GC pauses.
 
 ### Sustained Processing (1000-event bursts)
 
@@ -207,7 +210,7 @@ Exceeds the 500K target by 2.2-2.9x.
 
 ---
 
-## 5. Checkpoint Benchmarks (`checkpoint_bench` — laminar-storage)
+## 5. Checkpoint Benchmarks (`checkpoint_bench` — laminar-core)
 
 | Benchmark | Latency |
 |-----------|---------|
@@ -232,11 +235,14 @@ Exceeds the 500K target by 2.2-2.9x.
 | State lookup (AHash get_ref) | < 150 ns | **10.6-16.3 ns** | PASS | 9-14x |
 | State lookup (Mmap) | < 500 ns | **63-208 ns** | PASS | 2.4-7.9x |
 | Throughput/core | 500K events/s | **1.1-1.46M events/s** | PASS | 2.2-2.9x |
-| p99 latency | < 10 us | **0.55-1.16 us** | PASS | 8.6-18x |
+| Event latency (mean) | < 10 us | **0.55-1.16 us** | PASS | 8.6-18x |
 | Checkpoint recovery | < 10 s | **1.39 ms** | PASS | 7,194x |
 | WAL append | < 1 us | **541 ns** | PASS | 1.8x |
 
-All primary performance targets are met or exceeded.
+All primary performance targets are met or exceeded on mean latency.
+Latency numbers are Criterion mean/median; true p99 under sustained load
+is not yet measured. 14 of 18 benchmark suites were not run in this session
+(see below), limiting validation coverage.
 
 ---
 
@@ -269,7 +275,7 @@ cargo bench --bench throughput_bench
 
 # Storage benchmarks
 cargo bench --bench wal_bench -p laminar-storage
-cargo bench --bench checkpoint_bench -p laminar-storage
+cargo bench --bench checkpoint_bench -p laminar-core
 
 # All benchmarks (requires ~20GB free disk, Linux for io_uring)
 cargo bench
