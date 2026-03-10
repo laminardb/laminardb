@@ -1531,7 +1531,7 @@ impl StreamExecutor {
     /// queries have accumulated any groups). Otherwise returns the serialized
     /// JSON bytes.
     pub fn checkpoint_state(&mut self) -> Result<Option<Vec<u8>>, DbError> {
-        use crate::aggregate_state::StreamExecutorCheckpoint;
+        use crate::aggregate_state::{RawEowcCheckpoint, StreamExecutorCheckpoint};
 
         let mut agg_checkpoints =
             FxHashMap::with_capacity_and_hasher(self.agg_states.len(), rustc_hash::FxBuildHasher);
@@ -1558,6 +1558,46 @@ impl StreamExecutor {
             cw_checkpoints.insert(name, state.checkpoint_windows()?);
         }
 
+        // Checkpoint raw-batch EOWC states (non-aggregate EOWC queries)
+        let mut raw_eowc_checkpoints = FxHashMap::with_capacity_and_hasher(
+            self.eowc_states.len(),
+            rustc_hash::FxBuildHasher,
+        );
+        for (&idx, eowc) in &self.eowc_states {
+            if eowc.accumulated_rows == 0 {
+                continue;
+            }
+            let name = self.queries[idx].name.clone();
+            let mut sources = FxHashMap::with_capacity_and_hasher(
+                eowc.accumulated_sources.len(),
+                rustc_hash::FxBuildHasher,
+            );
+            for (src_name, batches) in &eowc.accumulated_sources {
+                let mut ipc_batches = Vec::with_capacity(batches.len());
+                for batch in batches {
+                    if batch.num_rows() == 0 {
+                        continue;
+                    }
+                    let ipc_bytes =
+                        laminar_core::serialization::serialize_batch_stream(batch).map_err(
+                            |e| DbError::Pipeline(format!("EOWC batch serialization: {e}")),
+                        )?;
+                    ipc_batches.push(ipc_bytes);
+                }
+                if !ipc_batches.is_empty() {
+                    sources.insert(src_name.clone(), ipc_batches);
+                }
+            }
+            raw_eowc_checkpoints.insert(
+                name,
+                RawEowcCheckpoint {
+                    last_closed_boundary: eowc.last_closed_boundary,
+                    accumulated_rows: eowc.accumulated_rows,
+                    sources,
+                },
+            );
+        }
+
         // Join states: currently ASOF/temporal joins are stateless per-cycle,
         // so this map is empty. Future stateful joins will populate it.
         let join_checkpoints = FxHashMap::default();
@@ -1566,6 +1606,7 @@ impl StreamExecutor {
             && eowc_checkpoints.is_empty()
             && cw_checkpoints.is_empty()
             && join_checkpoints.is_empty()
+            && raw_eowc_checkpoints.is_empty()
         {
             return Ok(None);
         }
@@ -1576,6 +1617,7 @@ impl StreamExecutor {
             eowc_states: eowc_checkpoints,
             core_window_states: cw_checkpoints,
             join_states: join_checkpoints,
+            raw_eowc_states: raw_eowc_checkpoints,
         };
 
         let bytes = serde_json::to_vec(&checkpoint).map_err(|e| {
@@ -1634,6 +1676,46 @@ impl StreamExecutor {
                     state.restore_windows(cw_cp)?;
                     restored += 1;
                 }
+            }
+        }
+
+        // Restore raw-batch EOWC states
+        for (name, raw_cp) in &checkpoint.raw_eowc_states {
+            if let Some(&idx) = name_to_idx.get(name.as_str()) {
+                let mut accumulated_sources = FxHashMap::with_capacity_and_hasher(
+                    raw_cp.sources.len(),
+                    rustc_hash::FxBuildHasher,
+                );
+                let mut total_rows = 0usize;
+                for (src_name, ipc_batches) in &raw_cp.sources {
+                    let mut batches = Vec::with_capacity(ipc_batches.len());
+                    for ipc_bytes in ipc_batches {
+                        let batch = laminar_core::serialization::deserialize_batch_stream(
+                            ipc_bytes,
+                        )
+                        .map_err(|e| {
+                            DbError::Pipeline(format!("EOWC batch deserialization: {e}"))
+                        })?;
+                        total_rows += batch.num_rows();
+                        batches.push(batch);
+                    }
+                    accumulated_sources.insert(src_name.clone(), batches);
+                }
+                self.eowc_states.insert(
+                    idx,
+                    EowcState {
+                        accumulated_sources,
+                        last_closed_boundary: raw_cp.last_closed_boundary,
+                        accumulated_rows: total_rows,
+                    },
+                );
+                restored += 1;
+                tracing::info!(
+                    query = %name,
+                    rows = total_rows,
+                    boundary = raw_cp.last_closed_boundary,
+                    "Restored raw EOWC state from checkpoint"
+                );
             }
         }
 
@@ -1740,8 +1822,17 @@ fn compute_closed_boundary(watermark_ms: i64, config: &WindowOperatorConfig) -> 
                 tracing::warn!("tumbling window size is zero or negative, EOWC filtering disabled");
                 return watermark_ms;
             }
-            // Floor to nearest window boundary
-            (watermark_ms / size) * size
+            // Floor to nearest window boundary, accounting for offset.
+            // Must match TumblingWindowAssigner::assign() formula:
+            //   floor((ts - offset) / size) * size + offset
+            let offset = config.offset_ms;
+            let adjusted = watermark_ms - offset;
+            let floored = if adjusted >= 0 {
+                (adjusted / size) * size
+            } else {
+                ((adjusted - size + 1) / size) * size
+            };
+            floored + offset
         }
         WindowType::Session => {
             #[allow(clippy::cast_possible_truncation)]
@@ -1764,8 +1855,15 @@ fn compute_closed_boundary(watermark_ms: i64, config: &WindowOperatorConfig) -> 
             // The earliest open window starts at the first slide-aligned
             // boundary after (watermark - size). Data below that start
             // belongs only to fully closed windows.
-            let base = watermark_ms.saturating_sub(size);
-            (base / slide).saturating_add(1).saturating_mul(slide)
+            // Account for window offset to match SlidingWindowAssigner.
+            let offset = config.offset_ms;
+            let base = (watermark_ms - offset).saturating_sub(size);
+            let boundary = if base >= 0 {
+                (base / slide).saturating_add(1).saturating_mul(slide)
+            } else {
+                ((base - slide + 1) / slide).saturating_add(1).saturating_mul(slide)
+            };
+            boundary + offset
         }
         WindowType::Cumulate => {
             // Cumulate windows share the same epoch alignment as tumbling.
@@ -1776,7 +1874,15 @@ fn compute_closed_boundary(watermark_ms: i64, config: &WindowOperatorConfig) -> 
                 tracing::warn!("cumulate window size is zero or negative, EOWC filtering disabled");
                 return watermark_ms;
             }
-            (watermark_ms / size) * size
+            // Same offset-aware floor as Tumbling
+            let offset = config.offset_ms;
+            let adjusted = watermark_ms - offset;
+            let floored = if adjusted >= 0 {
+                (adjusted / size) * size
+            } else {
+                ((adjusted - size + 1) / size) * size
+            };
+            floored + offset
         }
     }
 }
@@ -3276,6 +3382,58 @@ mod tests {
         // At watermark=3000: closed=…[1000,3000), open=[1500,3500)…
         // Earliest open window starts at 1500 → boundary=1500
         assert_eq!(compute_closed_boundary(3000, &config), 1500);
+    }
+
+    #[test]
+    fn test_compute_closed_boundary_tumbling_with_offset() {
+        use laminar_sql::parser::EmitStrategy;
+
+        // 1-hour window with UTC+8 offset (28_800_000 ms)
+        let config = WindowOperatorConfig {
+            window_type: WindowType::Tumbling,
+            time_column: "ts".to_string(),
+            size: std::time::Duration::from_millis(3_600_000),
+            slide: None,
+            gap: None,
+            offset_ms: 28_800_000, // 8 hours
+            allowed_lateness: std::time::Duration::ZERO,
+            emit_strategy: EmitStrategy::OnWindowClose,
+            late_data_side_output: None,
+        };
+
+        // Window boundaries: ..., [28800000, 32400000), [32400000, 36000000), ...
+        // watermark=32000000 is inside [28800000, 32400000) → boundary=28800000
+        assert_eq!(
+            compute_closed_boundary(32_000_000, &config),
+            28_800_000
+        );
+        // watermark=32400000 is at window boundary → boundary=32400000
+        assert_eq!(
+            compute_closed_boundary(32_400_000, &config),
+            32_400_000
+        );
+    }
+
+    #[test]
+    fn test_compute_closed_boundary_sliding_with_offset() {
+        use laminar_sql::parser::EmitStrategy;
+
+        let config = WindowOperatorConfig {
+            window_type: WindowType::Sliding,
+            time_column: "ts".to_string(),
+            size: std::time::Duration::from_millis(2000),
+            slide: Some(std::time::Duration::from_millis(500)),
+            gap: None,
+            offset_ms: 200,
+            allowed_lateness: std::time::Duration::ZERO,
+            emit_strategy: EmitStrategy::OnWindowClose,
+            late_data_side_output: None,
+        };
+
+        // With offset=200, slide boundaries are at 200, 700, 1200, 1700, 2200, ...
+        // At watermark=2200: adjusted=2000, base=2000-2000=0, boundary=(0/500+1)*500=500
+        //   result=500+200=700
+        assert_eq!(compute_closed_boundary(2200, &config), 700);
     }
 
     // ── Pre-computed table refs tests ──

@@ -97,12 +97,13 @@ fn assign_windows(ts_ms: i64, window_type: &EowcWindowType) -> Vec<i64> {
             // The last slide-aligned start at or before ts
             let last_start = ts_ms.div_euclid(*slide_ms) * slide_ms;
             let mut start = last_start;
+            // Loop terminates naturally: runs at most ceil(size/slide) iterations
+            // because `start` decreases by `slide_ms` each iteration.
+            // Do NOT break on `start < 0` — windows with negative start times
+            // are valid when the event falls within [start, start + size).
             while start + size_ms > ts_ms {
                 windows.push(start);
                 start -= slide_ms;
-                if start < 0 {
-                    break;
-                }
             }
             windows
         }

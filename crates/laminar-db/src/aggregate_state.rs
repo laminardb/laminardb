@@ -344,6 +344,28 @@ pub(crate) struct StreamExecutorCheckpoint {
     /// Populated by future stateful joins (interval joins, etc.).
     #[serde(default)]
     pub join_states: FxHashMap<String, JoinStateCheckpoint>,
+    /// Raw-batch EOWC states, keyed by query name.
+    ///
+    /// These are non-aggregate EOWC queries that accumulate raw
+    /// `RecordBatch` data until the watermark closes their windows.
+    /// Each batch is serialized as Arrow IPC bytes.
+    #[serde(default)]
+    pub raw_eowc_states: FxHashMap<String, RawEowcCheckpoint>,
+}
+
+/// Checkpoint for raw-batch EOWC state (non-aggregate EOWC queries).
+///
+/// Stores accumulated `RecordBatch` data as Arrow IPC bytes plus
+/// the watermark boundary used for window-close tracking.
+#[derive(Clone, serde::Serialize, serde::Deserialize)]
+pub(crate) struct RawEowcCheckpoint {
+    /// The last closed-window boundary that was emitted.
+    pub last_closed_boundary: i64,
+    /// Total accumulated rows (for diagnostics).
+    pub accumulated_rows: usize,
+    /// Accumulated source batches, keyed by source table name.
+    /// Each inner `Vec<u8>` is a single `RecordBatch` serialized as Arrow IPC.
+    pub sources: FxHashMap<String, Vec<Vec<u8>>>,
 }
 
 /// Specification for one aggregate function in a streaming query.
@@ -2659,6 +2681,7 @@ mod tests {
             eowc_states: FxHashMap::default(),
             core_window_states: FxHashMap::default(),
             join_states,
+            raw_eowc_states: FxHashMap::default(),
         };
 
         let bytes = serde_json::to_vec(&cp).unwrap();
