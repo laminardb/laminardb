@@ -291,7 +291,7 @@ impl LaminarDB {
                 // with the correct schema from the catalog (not Schema::empty).
                 let initial_batch = self
                     .table_store
-                    .lock()
+                    .read()
                     .to_record_batch(&tcfg.table_name)
                     .or_else(|| {
                         self.catalog
@@ -597,13 +597,13 @@ impl LaminarDB {
                 .map_err(|e| DbError::Connector(format!("Table '{name}' snapshot error: {e}")))?
             {
                 self.table_store
-                    .lock()
+                    .write()
                     .upsert(name, &batch)
                     .map_err(|e| DbError::Connector(format!("Table '{name}' upsert error: {e}")))?;
             }
             self.sync_table_to_datafusion(name)?;
             {
-                let mut ts = self.table_store.lock();
+                let mut ts = self.table_store.write();
                 ts.rebuild_xor_filter(name);
                 ts.set_ready(name, true);
             }
@@ -615,7 +615,7 @@ impl LaminarDB {
                 Some(laminar_sql::datafusion::RegisteredLookup::Versioned(_))
             ) {
                 // Already versioned — don't downgrade to Snapshot.
-            } else if let Some(batch) = self.table_store.lock().to_record_batch(name) {
+            } else if let Some(batch) = self.table_store.read().to_record_batch(name) {
                 self.lookup_registry.register(
                     name,
                     laminar_sql::datafusion::LookupSnapshot {
@@ -770,8 +770,6 @@ impl LaminarDB {
         let checkpoint_in_progress = Arc::new(std::sync::atomic::AtomicBool::new(false));
         let coordinator = Arc::clone(&self.coordinator);
         let table_store_for_loop = self.table_store.clone();
-        let ctx_for_sync = self.ctx.clone();
-
         // Compute a pipeline hash for change detection across checkpoints.
         let pipeline_hash = {
             use std::hash::{Hash, Hasher};
@@ -804,7 +802,6 @@ impl LaminarDB {
             table_sources,
             table_store: table_store_for_loop,
             lookup_registry: Arc::clone(&self.lookup_registry),
-            ctx: ctx_for_sync,
             filter_ctx: laminar_sql::create_session_context(),
             last_checkpoint: std::time::Instant::now(),
             checkpoint_interval: self

@@ -11,7 +11,7 @@ description = "Storage layer for LaminarDB - WAL, checkpointing, and lakehouse i
 
 [dependencies]
 # Core dependency
-laminar-core = { path = "../laminar-core", version = "0.18.1" }
+laminar-core = { path = "../laminar-core", version = "0.18.2" }
 
 # Storage
 object_store = "0.13"  # For cloud storage
@@ -32,9 +32,6 @@ base64 = { workspace = true }
 
 # Fast hash for changelog entries
 rustc-hash = { workspace = true }
-
-# foyer cache for disaggregated state backend
-foyer = { workspace = true }
 
 # LZ4 compression for checkpoint batching
 lz4_flex = { workspace = true }

@@ -32,7 +32,7 @@ use crate::aggregate_state::{
     expr_to_sql, extract_clauses, find_aggregate, query_fingerprint, resolve_expr_type,
     AggFuncSpec, GroupCheckpoint, WindowCheckpoint,
 };
-use crate::eowc_state::extract_i64_timestamps;
+use crate::eowc_state::{extract_i64_timestamps, NULL_TIMESTAMP};
 use crate::error::DbError;
 
 /// Which core window assigner variant is in use.
@@ -495,6 +495,9 @@ impl CoreWindowState {
         if !has_groups {
             let mut grouped: AHashMap<i64, Vec<u32>> = AHashMap::new();
             for (row_idx, &ts_ms) in ts_array.iter().enumerate() {
+                if ts_ms == NULL_TIMESTAMP {
+                    continue; // skip rows with null timestamps
+                }
                 #[allow(clippy::cast_possible_truncation)]
                 let idx = row_idx as u32;
                 match &self.assigner {
@@ -544,6 +547,9 @@ impl CoreWindowState {
         let mut grouped: AHashMap<(i64, arrow::row::OwnedRow), Vec<u32>> = AHashMap::new();
 
         for (row_idx, &ts_ms) in ts_array.iter().enumerate() {
+            if ts_ms == NULL_TIMESTAMP {
+                continue; // skip rows with null timestamps
+            }
             let row_key = rows_ref.row(row_idx).owned();
             #[allow(clippy::cast_possible_truncation)]
             let idx = row_idx as u32;
@@ -627,6 +633,9 @@ impl CoreWindowState {
             unreachable!("update_batch_session called on non-session assigner");
         };
         for (row, &ts_ms) in ts_array.iter().enumerate() {
+            if ts_ms == NULL_TIMESTAMP {
+                continue; // skip rows with null timestamps
+            }
             let key = self.extract_group_key_scalar(batch, row)?;
             self.update_session_window(ts_ms, gap_ms, &key, batch, row)?;
         }

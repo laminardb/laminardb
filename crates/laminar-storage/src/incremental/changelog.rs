@@ -21,6 +21,7 @@
 //! └─────────┴──────────┴─────────────┴───────────┴────┴─────────┘
 //! ```
 
+use std::cell::UnsafeCell;
 use std::hash::{BuildHasher, Hasher};
 use std::sync::atomic::{AtomicUsize, Ordering};
 
@@ -197,8 +198,15 @@ const _: () = assert!(std::mem::size_of::<StateChangelogEntry>() == 32);
 /// let entries: Vec<_> = buffer.drain_all().collect();
 /// ```
 pub struct StateChangelogBuffer {
-    /// Pre-allocated entry storage.
-    entries: Vec<StateChangelogEntry>,
+    /// Pre-allocated entry storage with per-slot interior mutability.
+    ///
+    /// Each slot is wrapped in `UnsafeCell` because this is an SPSC ring buffer:
+    /// the producer (Ring 0) writes slots via `push()` and the consumer
+    /// (Ring 1) reads slots via `pop()`, both through `&self`. Without
+    /// `UnsafeCell`, writing through a shared reference would violate Rust's
+    /// aliasing rules (UB under Stacked Borrows / Tree Borrows).
+    /// This matches the pattern used by `SpscQueue` in `laminar-core`.
+    entries: Box<[UnsafeCell<StateChangelogEntry>]>,
     /// Current write position (producer).
     write_pos: AtomicUsize,
     /// Current read position (consumer).
@@ -236,22 +244,20 @@ impl StateChangelogBuffer {
         // Round up to power of 2 for fast modulo
         let capacity = capacity.next_power_of_two();
 
-        // Pre-allocate and zero-initialize
-        let mut entries = Vec::with_capacity(capacity);
-        entries.resize(
-            capacity,
-            StateChangelogEntry {
-                epoch: 0,
-                key_hash: 0,
-                mmap_offset: 0,
-                value_len: 0,
-                op: 0,
-                _padding: [0; 3],
-            },
-        );
+        // Pre-allocate and zero-initialize with per-slot UnsafeCell
+        let zero_entry = StateChangelogEntry {
+            epoch: 0,
+            key_hash: 0,
+            mmap_offset: 0,
+            value_len: 0,
+            op: 0,
+            _padding: [0; 3],
+        };
+        let entries: Vec<UnsafeCell<StateChangelogEntry>> =
+            (0..capacity).map(|_| UnsafeCell::new(zero_entry)).collect();
 
         Self {
-            entries,
+            entries: entries.into_boxed_slice(),
             write_pos: AtomicUsize::new(0),
             read_pos: AtomicUsize::new(0),
             capacity,
@@ -317,12 +323,13 @@ impl StateChangelogBuffer {
             return false;
         }
 
-        // Write entry (safe because we have exclusive access to this slot)
-        // SAFETY: We're the only writer to this position and haven't published it yet
-        let entries_ptr = self.entries.as_ptr().cast_mut();
+        // SAFETY: This is an SPSC ring buffer. We are the sole producer, and
+        // `write_pos` has not yet been published (the Release store is below),
+        // so the consumer cannot be reading this slot. The slot index is valid
+        // because `write_pos < capacity` is maintained by the mask above.
         #[allow(unsafe_code)]
         unsafe {
-            entries_ptr.add(write_pos).write(entry);
+            self.entries[write_pos].get().write(entry);
         }
 
         // Publish the entry
@@ -362,8 +369,13 @@ impl StateChangelogBuffer {
             return None;
         }
 
-        // Read entry
-        let entry = self.entries[read_pos];
+        // SAFETY: This is an SPSC ring buffer. We are the sole consumer, and
+        // `read_pos` points to a slot that was published by the producer (the
+        // Acquire load of `write_pos` above synchronizes with the producer's
+        // Release store). The producer will not write to this slot until we
+        // advance `read_pos` past it (Release store below).
+        #[allow(unsafe_code)]
+        let entry = unsafe { self.entries[read_pos].get().read() };
 
         // Advance read position
         let next_pos = (read_pos + 1) & (self.capacity - 1);
@@ -464,13 +476,17 @@ impl Default for StateChangelogBuffer {
 
 // SAFETY: StateChangelogBuffer is Send because:
 // 1. All fields are either Send or thread-safe (atomics)
-// 2. The Vec<StateChangelogEntry> is pre-allocated and accessed via atomics
+// 2. The Box<[UnsafeCell<StateChangelogEntry>]> is pre-allocated and slot access
+//    is coordinated via atomic indices with proper Acquire/Release ordering
 #[allow(unsafe_code)]
 unsafe impl Send for StateChangelogBuffer {}
 
 // SAFETY: StateChangelogBuffer is Sync because:
-// 1. Access is coordinated via atomic indices
-// 2. Single producer (Ring 0) and single consumer (Ring 1) access pattern
+// 1. It is an SPSC ring buffer — exactly one producer and one consumer
+// 2. Slot access is coordinated via atomic write_pos/read_pos with
+//    Release (producer) and Acquire (consumer) ordering
+// 3. The producer only writes to unpublished slots; the consumer only
+//    reads from published slots — no data race is possible
 #[allow(unsafe_code)]
 unsafe impl Sync for StateChangelogBuffer {}
 

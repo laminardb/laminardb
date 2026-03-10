@@ -243,18 +243,27 @@ impl LagLeadOperator {
 
             match array.data_type() {
                 DataType::Int64 => {
-                    let arr = array.as_any().downcast_ref::<Int64Array>().unwrap();
-                    self.key_buf.extend_from_slice(&arr.value(0).to_le_bytes());
+                    if let Some(arr) = array.as_any().downcast_ref::<Int64Array>() {
+                        self.key_buf.extend_from_slice(&arr.value(0).to_le_bytes());
+                    } else {
+                        self.key_buf.push(0x00);
+                    }
                 }
                 DataType::Utf8 => {
-                    let arr = array.as_any().downcast_ref::<StringArray>().unwrap();
-                    self.key_buf.extend_from_slice(arr.value(0).as_bytes());
-                    self.key_buf.push(0x00); // null terminator
+                    if let Some(arr) = array.as_any().downcast_ref::<StringArray>() {
+                        self.key_buf.extend_from_slice(arr.value(0).as_bytes());
+                        self.key_buf.push(0x00); // null terminator
+                    } else {
+                        self.key_buf.push(0x00);
+                    }
                 }
                 DataType::Float64 => {
-                    let arr = array.as_any().downcast_ref::<Float64Array>().unwrap();
-                    self.key_buf
-                        .extend_from_slice(&arr.value(0).to_bits().to_le_bytes());
+                    if let Some(arr) = array.as_any().downcast_ref::<Float64Array>() {
+                        self.key_buf
+                            .extend_from_slice(&arr.value(0).to_bits().to_le_bytes());
+                    } else {
+                        self.key_buf.push(0x00);
+                    }
                 }
                 _ => {
                     self.key_buf.push(0x00);
@@ -285,24 +294,30 @@ impl LagLeadOperator {
 
         match array.data_type() {
             DataType::Float64 => {
-                let arr = array.as_any().downcast_ref::<Float64Array>().unwrap();
-                arr.value(0)
+                if let Some(arr) = array.as_any().downcast_ref::<Float64Array>() {
+                    arr.value(0)
+                } else {
+                    f64::NAN
+                }
             }
             DataType::Int64 => {
-                let arr = array.as_any().downcast_ref::<Int64Array>().unwrap();
-                #[allow(clippy::cast_precision_loss)]
-                {
-                    arr.value(0) as f64
+                if let Some(arr) = array.as_any().downcast_ref::<Int64Array>() {
+                    #[allow(clippy::cast_precision_loss)]
+                    {
+                        arr.value(0) as f64
+                    }
+                } else {
+                    f64::NAN
                 }
             }
             DataType::Timestamp(_, _) => {
-                let arr = array
-                    .as_any()
-                    .downcast_ref::<TimestampMicrosecondArray>()
-                    .unwrap();
-                #[allow(clippy::cast_precision_loss)]
-                {
-                    arr.value(0) as f64
+                if let Some(arr) = array.as_any().downcast_ref::<TimestampMicrosecondArray>() {
+                    #[allow(clippy::cast_precision_loss)]
+                    {
+                        arr.value(0) as f64
+                    }
+                } else {
+                    f64::NAN
                 }
             }
             _ => f64::NAN,

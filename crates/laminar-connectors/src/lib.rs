@@ -66,9 +66,6 @@ pub mod connector;
 /// Connector checkpoint types.
 pub mod checkpoint;
 
-/// Typed checkpoint extension for source connectors (F-E2E-001).
-pub mod checkpoint_typed;
-
 /// Connector health status types.
 pub mod health;
 

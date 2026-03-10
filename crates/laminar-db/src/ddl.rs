@@ -94,7 +94,9 @@ impl LaminarDB {
                 Arc::clone(entry),
                 num_partitions,
             );
-            let _ = self.ctx.register_table(name, Arc::new(provider));
+            if let Err(e) = self.ctx.register_table(name, Arc::new(provider)) {
+                tracing::warn!(table = %name, error = %e, "failed to register source table in DataFusion");
+            }
         }
 
         // Register as a base table in the MV registry for dependency tracking
@@ -104,7 +106,9 @@ impl LaminarDB {
         {
             let mut planner = self.planner.lock();
             let stmt = StreamingStatement::CreateSource(Box::new(create.clone()));
-            let _ = planner.plan(&stmt);
+            if let Err(e) = planner.plan(&stmt) {
+                tracing::warn!(source = %name, error = %e, "failed to register source in planner");
+            }
         }
 
         // Register connector info in ConnectorManager if external connector specified.
@@ -190,7 +194,9 @@ impl LaminarDB {
         {
             let mut planner = self.planner.lock();
             let stmt = StreamingStatement::CreateSink(Box::new(create.clone()));
-            let _ = planner.plan(&stmt);
+            if let Err(e) = planner.plan(&stmt) {
+                tracing::warn!(sink = %name, error = %e, "failed to register sink in planner");
+            }
         }
 
         // Register connector info in ConnectorManager if external connector specified.
@@ -390,10 +396,10 @@ impl LaminarDB {
                     "storage = 'persistent' is no longer supported; use in-memory tables with foyer caching instead".to_string(),
                 ));
             } else if resolved_cache_mode.is_some() {
-                let mut ts = self.table_store.lock();
+                let mut ts = self.table_store.write();
                 ts.create_table_with_cache(&name, schema.clone(), pk, cache)?;
             } else {
-                let mut ts = self.table_store.lock();
+                let mut ts = self.table_store.write();
                 ts.create_table(&name, schema.clone(), pk)?;
             }
         }
@@ -402,7 +408,7 @@ impl LaminarDB {
         if connector_type.is_some() || !connector_options.is_empty() {
             if let Some(ref pk) = primary_key {
                 if let Some(ref ct) = connector_type {
-                    let mut ts = self.table_store.lock();
+                    let mut ts = self.table_store.write();
                     ts.set_connector(&name, ct);
                 }
 
@@ -422,9 +428,12 @@ impl LaminarDB {
             }
         }
 
-        // Register with DataFusion.
-        // Persistent tables use a live ReferenceTableProvider; others use MemTable.
-        if is_persistent && primary_key.is_some() {
+        // Register with DataFusion using a live ReferenceTableProvider.
+        // Every scan() reads the current snapshot from the TableStore, so
+        // no deregister/re-register is needed after INSERTs. This eliminates
+        // the TOCTOU race in sync_table_to_datafusion that previously caused
+        // concurrent INSERTs to leave the DataFusion catalog stale.
+        {
             let provider = crate::table_provider::ReferenceTableProvider::new(
                 name.clone(),
                 schema.clone(),
@@ -432,13 +441,6 @@ impl LaminarDB {
             );
             self.ctx
                 .register_table(&name, Arc::new(provider))
-                .map_err(|e| DbError::InvalidOperation(format!("Failed to register table: {e}")))?;
-        } else {
-            let mem_table = datafusion::datasource::MemTable::try_new(schema.clone(), vec![vec![]])
-                .map_err(|e| DbError::InvalidOperation(format!("Failed to create table: {e}")))?;
-
-            self.ctx
-                .register_table(&name, Arc::new(mem_table))
                 .map_err(|e| DbError::InvalidOperation(format!("Failed to register table: {e}")))?;
         }
 
@@ -947,7 +949,7 @@ impl LaminarDB {
             let name_str = obj_name.to_string();
 
             // Remove from TableStore
-            self.table_store.lock().drop_table(&name_str);
+            self.table_store.write().drop_table(&name_str);
 
             // Remove from ConnectorManager
             self.connector_manager.lock().unregister_table(&name_str);
@@ -977,42 +979,12 @@ impl LaminarDB {
         }))
     }
 
-    /// Synchronize a `TableStore` table to the `DataFusion` `MemTable`.
+    /// No-op: all tables now use `ReferenceTableProvider` which reads live
+    /// data on every `scan()`. No deregister/re-register needed.
     ///
-    /// Deregisters the existing table (if any) and re-registers with the
-    /// current contents of the `TableStore`.
-    pub(crate) fn sync_table_to_datafusion(&self, name: &str) -> Result<(), DbError> {
-        // Persistent tables use ReferenceTableProvider which reads live data —
-        // no need to deregister/re-register.
-        if self.table_store.lock().is_persistent(name) {
-            return Ok(());
-        }
-
-        let batch = self
-            .table_store
-            .lock()
-            .to_record_batch(name)
-            .ok_or_else(|| DbError::TableNotFound(name.to_string()))?;
-
-        let schema = batch.schema();
-
-        // Deregister old
-        let _ = self.ctx.deregister_table(name);
-
-        // Register new
-        let data = if batch.num_rows() > 0 {
-            vec![vec![batch]]
-        } else {
-            vec![vec![]]
-        };
-
-        let mem_table = datafusion::datasource::MemTable::try_new(schema, data)
-            .map_err(|e| DbError::InsertError(format!("Failed to create table: {e}")))?;
-
-        self.ctx
-            .register_table(name, Arc::new(mem_table))
-            .map_err(|e| DbError::InsertError(format!("Failed to register table: {e}")))?;
-
+    /// Retained as a function so callers don't need to change.
+    #[allow(clippy::unnecessary_wraps, clippy::unused_self)]
+    pub(crate) fn sync_table_to_datafusion(&self, _name: &str) -> Result<(), DbError> {
         Ok(())
     }
 }

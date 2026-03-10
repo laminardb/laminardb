@@ -136,10 +136,10 @@ pub struct SubscriptionEntry {
     pub sender: broadcast::Sender<ChangeEvent>,
     /// Creation timestamp.
     pub created_at: Instant,
-    /// Total events delivered.
-    pub events_delivered: u64,
-    /// Total events dropped (backpressure).
-    pub events_dropped: u64,
+    /// Total events delivered (atomic for lock-free counter bumps from Ring 1).
+    pub events_delivered: AtomicU64,
+    /// Total events dropped due to backpressure (atomic, same reason).
+    pub events_dropped: AtomicU64,
     /// Current lag (events pending in channel).
     pub current_lag: u64,
 }
@@ -242,8 +242,8 @@ impl SubscriptionRegistry {
             config,
             sender: tx,
             created_at: Instant::now(),
-            events_delivered: 0,
-            events_dropped: 0,
+            events_delivered: AtomicU64::new(0),
+            events_dropped: AtomicU64::new(0),
             current_lag: 0,
         };
 
@@ -387,8 +387,8 @@ impl SubscriptionRegistry {
             id: entry.id,
             source_name: entry.source_name.clone(),
             state: entry.state,
-            events_delivered: entry.events_delivered,
-            events_dropped: entry.events_dropped,
+            events_delivered: entry.events_delivered.load(Ordering::Relaxed),
+            events_dropped: entry.events_dropped.load(Ordering::Relaxed),
             current_lag: entry.current_lag,
             age: entry.created_at.elapsed(),
         })
@@ -404,8 +404,8 @@ impl SubscriptionRegistry {
     ///
     /// Called by the Ring 1 dispatcher after successful delivery.
     pub fn record_delivery(&self, id: SubscriptionId, count: u64) {
-        if let Some(entry) = self.subscriptions.write().get_mut(&id) {
-            entry.events_delivered += count;
+        if let Some(entry) = self.subscriptions.read().get(&id) {
+            entry.events_delivered.fetch_add(count, Ordering::Relaxed);
         }
     }
 
@@ -413,8 +413,8 @@ impl SubscriptionRegistry {
     ///
     /// Called by the Ring 1 dispatcher on backpressure.
     pub fn record_drop(&self, id: SubscriptionId, count: u64) {
-        if let Some(entry) = self.subscriptions.write().get_mut(&id) {
-            entry.events_dropped += count;
+        if let Some(entry) = self.subscriptions.read().get(&id) {
+            entry.events_dropped.fetch_add(count, Ordering::Relaxed);
         }
     }
 }
