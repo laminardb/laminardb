@@ -94,7 +94,9 @@ impl LaminarDB {
                 Arc::clone(entry),
                 num_partitions,
             );
-            let _ = self.ctx.register_table(name, Arc::new(provider));
+            if let Err(e) = self.ctx.register_table(name, Arc::new(provider)) {
+                tracing::warn!(table = %name, error = %e, "failed to register source table in DataFusion");
+            }
         }
 
         // Register as a base table in the MV registry for dependency tracking
@@ -104,7 +106,9 @@ impl LaminarDB {
         {
             let mut planner = self.planner.lock();
             let stmt = StreamingStatement::CreateSource(Box::new(create.clone()));
-            let _ = planner.plan(&stmt);
+            if let Err(e) = planner.plan(&stmt) {
+                tracing::warn!(source = %name, error = %e, "failed to register source in planner");
+            }
         }
 
         // Register connector info in ConnectorManager if external connector specified.
@@ -190,7 +194,9 @@ impl LaminarDB {
         {
             let mut planner = self.planner.lock();
             let stmt = StreamingStatement::CreateSink(Box::new(create.clone()));
-            let _ = planner.plan(&stmt);
+            if let Err(e) = planner.plan(&stmt) {
+                tracing::warn!(sink = %name, error = %e, "failed to register sink in planner");
+            }
         }
 
         // Register connector info in ConnectorManager if external connector specified.
