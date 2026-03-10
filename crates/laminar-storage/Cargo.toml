@@ -33,9 +33,6 @@ base64 = { workspace = true }
 # Fast hash for changelog entries
 rustc-hash = { workspace = true }
 
-# foyer cache for disaggregated state backend
-foyer = { workspace = true }
-
 # LZ4 compression for checkpoint batching
 lz4_flex = { workspace = true }
 
