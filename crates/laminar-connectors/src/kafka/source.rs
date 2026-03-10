@@ -293,9 +293,7 @@ impl KafkaSource {
                                         json.push_str(header.key);
                                         json.push_str("\":\"");
                                         if let Some(val) = header.value {
-                                            json.push_str(
-                                                &String::from_utf8_lossy(val),
-                                            );
+                                            json.push_str(&String::from_utf8_lossy(val));
                                         }
                                         json.push('"');
                                     }
@@ -461,12 +459,8 @@ impl SourceConnector for KafkaSource {
                 };
                 for topic in &topics {
                     for (&partition, &offset) in offsets {
-                        tpl.add_partition_offset(
-                            topic,
-                            partition,
-                            rdkafka::Offset::Offset(offset),
-                        )
-                        .ok();
+                        tpl.add_partition_offset(topic, partition, rdkafka::Offset::Offset(offset))
+                            .ok();
                     }
                 }
                 if tpl.count() > 0 {

@@ -131,11 +131,18 @@ impl OffsetTracker {
                             }
                         }
                     } else {
-                        tracing::warn!(key, "skipping checkpoint entry without topic-partition separator");
+                        tracing::warn!(
+                            key,
+                            "skipping checkpoint entry without topic-partition separator"
+                        );
                     }
                 }
                 Err(_) => {
-                    tracing::warn!(key, value, "skipping checkpoint entry with unparseable offset");
+                    tracing::warn!(
+                        key,
+                        value,
+                        "skipping checkpoint entry with unparseable offset"
+                    );
                 }
             }
         }

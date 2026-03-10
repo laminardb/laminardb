@@ -238,9 +238,7 @@ impl SchemaRegistryClient {
             // reqwest Identity expects cert + key concatenated in PEM format.
             identity_pem.extend_from_slice(&key_pem);
             let identity = reqwest::tls::Identity::from_pem(&identity_pem).map_err(|e| {
-                ConnectorError::ConfigurationError(format!(
-                    "invalid client cert/key PEM: {e}"
-                ))
+                ConnectorError::ConfigurationError(format!("invalid client cert/key PEM: {e}"))
             })?;
             builder = builder.identity(identity);
         }

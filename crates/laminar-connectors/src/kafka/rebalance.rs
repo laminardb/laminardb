@@ -227,11 +227,7 @@ mod tests {
         let flag = Arc::new(AtomicBool::new(false));
         let state = Arc::new(Mutex::new(RebalanceState::new()));
         let metric = Arc::new(AtomicU64::new(0));
-        let ctx = LaminarConsumerContext::new(
-            Arc::clone(&flag),
-            state,
-            metric,
-        );
+        let ctx = LaminarConsumerContext::new(Arc::clone(&flag), state, metric);
         (flag, ctx)
     }
 

@@ -129,12 +129,8 @@ impl KafkaSink {
     #[must_use]
     pub fn new(schema: SchemaRef, config: KafkaSinkConfig) -> Self {
         let avro_schema_id = Arc::new(std::sync::atomic::AtomicU32::new(0));
-        let serializer = select_serializer(
-            config.format,
-            &schema,
-            Arc::clone(&avro_schema_id),
-            None,
-        );
+        let serializer =
+            select_serializer(config.format, &schema, Arc::clone(&avro_schema_id), None);
         let partitioner = select_partitioner(config.partitioner);
 
         Self {
