@@ -196,6 +196,15 @@ impl KafkaSource {
         self.schema_registry.is_some()
     }
 
+    /// Returns the configured event-time column name, if any.
+    ///
+    /// Used by the pipeline to identify which column contains event timestamps
+    /// for watermark generation, instead of hardcoding `event_time`/`timestamp`.
+    #[must_use]
+    pub fn event_time_column(&self) -> Option<&str> {
+        self.config.event_time_column.as_deref()
+    }
+
     /// Spawns the background reader task on first `poll_batch()` call.
     ///
     /// Deferred to allow `restore()` to access the consumer directly after `open()`.

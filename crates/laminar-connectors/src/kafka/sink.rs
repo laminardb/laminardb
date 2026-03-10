@@ -515,10 +515,10 @@ impl SinkConnector for KafkaSink {
         let mut records_written: usize = 0;
         let mut bytes_written: u64 = 0;
 
-        // Phase 1: Enqueue all records into librdkafka's internal queue.
-        // producer.send() copies data synchronously and returns a
-        // DeliveryFuture, allowing rdkafka to batch network writes
-        // instead of waiting for each acknowledgement sequentially.
+        // Phase 1: Enqueue records into librdkafka's internal queue.
+        // Flush every flush_batch_size records to bound memory usage
+        // and provide delivery confirmation in chunks.
+        let flush_threshold = self.config.flush_batch_size;
         let mut delivery_futures = Vec::with_capacity(payloads.len());
         for (i, payload) in payloads.iter().enumerate() {
             let key: Option<&[u8]> = keys.as_ref().map(|kb| kb.key(i)).filter(|k| !k.is_empty());
@@ -540,6 +540,13 @@ impl SinkConnector for KafkaSink {
             // with QueueFull. Zero timeout causes legitimate messages to be
             // rejected under transient burst load.
             delivery_futures.push(producer.send(record, Duration::from_millis(500)));
+
+            // Intermediate flush to bound in-flight records and memory.
+            if flush_threshold > 0 && (i + 1) % flush_threshold == 0 {
+                producer
+                    .flush(self.config.delivery_timeout)
+                    .map_err(|e| ConnectorError::WriteError(format!("flush failed: {e}")))?;
+            }
         }
 
         // Phase 2: Collect delivery reports.
