@@ -1559,10 +1559,8 @@ impl StreamExecutor {
         }
 
         // Checkpoint raw-batch EOWC states (non-aggregate EOWC queries)
-        let mut raw_eowc_checkpoints = FxHashMap::with_capacity_and_hasher(
-            self.eowc_states.len(),
-            rustc_hash::FxBuildHasher,
-        );
+        let mut raw_eowc_checkpoints =
+            FxHashMap::with_capacity_and_hasher(self.eowc_states.len(), rustc_hash::FxBuildHasher);
         for (&idx, eowc) in &self.eowc_states {
             if eowc.accumulated_rows == 0 {
                 continue;
@@ -1578,10 +1576,8 @@ impl StreamExecutor {
                     if batch.num_rows() == 0 {
                         continue;
                     }
-                    let ipc_bytes =
-                        laminar_core::serialization::serialize_batch_stream(batch).map_err(
-                            |e| DbError::Pipeline(format!("EOWC batch serialization: {e}")),
-                        )?;
+                    let ipc_bytes = laminar_core::serialization::serialize_batch_stream(batch)
+                        .map_err(|e| DbError::Pipeline(format!("EOWC batch serialization: {e}")))?;
                     ipc_batches.push(ipc_bytes);
                 }
                 if !ipc_batches.is_empty() {
@@ -1690,12 +1686,11 @@ impl StreamExecutor {
                 for (src_name, ipc_batches) in &raw_cp.sources {
                     let mut batches = Vec::with_capacity(ipc_batches.len());
                     for ipc_bytes in ipc_batches {
-                        let batch = laminar_core::serialization::deserialize_batch_stream(
-                            ipc_bytes,
-                        )
-                        .map_err(|e| {
-                            DbError::Pipeline(format!("EOWC batch deserialization: {e}"))
-                        })?;
+                        let batch =
+                            laminar_core::serialization::deserialize_batch_stream(ipc_bytes)
+                                .map_err(|e| {
+                                    DbError::Pipeline(format!("EOWC batch deserialization: {e}"))
+                                })?;
                         total_rows += batch.num_rows();
                         batches.push(batch);
                     }
@@ -1861,7 +1856,9 @@ fn compute_closed_boundary(watermark_ms: i64, config: &WindowOperatorConfig) -> 
             let boundary = if base >= 0 {
                 (base / slide).saturating_add(1).saturating_mul(slide)
             } else {
-                ((base - slide + 1) / slide).saturating_add(1).saturating_mul(slide)
+                ((base - slide + 1) / slide)
+                    .saturating_add(1)
+                    .saturating_mul(slide)
             };
             boundary + offset
         }
@@ -3403,15 +3400,9 @@ mod tests {
 
         // Window boundaries: ..., [28800000, 32400000), [32400000, 36000000), ...
         // watermark=32000000 is inside [28800000, 32400000) → boundary=28800000
-        assert_eq!(
-            compute_closed_boundary(32_000_000, &config),
-            28_800_000
-        );
+        assert_eq!(compute_closed_boundary(32_000_000, &config), 28_800_000);
         // watermark=32400000 is at window boundary → boundary=32400000
-        assert_eq!(
-            compute_closed_boundary(32_400_000, &config),
-            32_400_000
-        );
+        assert_eq!(compute_closed_boundary(32_400_000, &config), 32_400_000);
     }
 
     #[test]

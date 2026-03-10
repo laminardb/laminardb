@@ -311,10 +311,7 @@ impl LagLeadOperator {
                 }
             }
             DataType::Timestamp(_, _) => {
-                if let Some(arr) = array
-                    .as_any()
-                    .downcast_ref::<TimestampMicrosecondArray>()
-                {
+                if let Some(arr) = array.as_any().downcast_ref::<TimestampMicrosecondArray>() {
                     #[allow(clippy::cast_precision_loss)]
                     {
                         arr.value(0) as f64

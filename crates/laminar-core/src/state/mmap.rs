@@ -532,9 +532,10 @@ impl MmapStateStore {
 
         // Skip padding (12..16)
 
-        let write_pos =
-            usize::try_from(u64::from_le_bytes(buffer[16..24].try_into().unwrap()))
-                .map_err(|_| StateError::Corruption("write_pos exceeds platform address space".to_string()))?;
+        let write_pos = usize::try_from(u64::from_le_bytes(buffer[16..24].try_into().unwrap()))
+            .map_err(|_| {
+                StateError::Corruption("write_pos exceeds platform address space".to_string())
+            })?;
         let next_version = u64::from_le_bytes(buffer[24..32].try_into().unwrap());
 
         let index: BTreeMap<Vec<u8>, ValueEntry> =

@@ -703,7 +703,11 @@ pub(crate) fn extract_i64_timestamps(
                 .downcast_ref::<Int64Array>()
                 .ok_or_else(|| DbError::Pipeline("expected Int64Array".to_string()))?;
             for i in 0..arr.len() {
-                result.push(if arr.is_null(i) { NULL_TIMESTAMP } else { arr.value(i) });
+                result.push(if arr.is_null(i) {
+                    NULL_TIMESTAMP
+                } else {
+                    arr.value(i)
+                });
             }
         }
         DataType::Timestamp(TimeUnit::Millisecond, _) => {
@@ -714,7 +718,11 @@ pub(crate) fn extract_i64_timestamps(
                     DbError::Pipeline("expected TimestampMillisecondArray".to_string())
                 })?;
             for i in 0..arr.len() {
-                result.push(if arr.is_null(i) { NULL_TIMESTAMP } else { arr.value(i) });
+                result.push(if arr.is_null(i) {
+                    NULL_TIMESTAMP
+                } else {
+                    arr.value(i)
+                });
             }
         }
         DataType::Timestamp(TimeUnit::Second, _) => {
@@ -723,7 +731,10 @@ pub(crate) fn extract_i64_timestamps(
                 .downcast_ref::<arrow::array::TimestampSecondArray>()
                 .ok_or_else(|| DbError::Pipeline("expected TimestampSecondArray".to_string()))?;
             for i in 0..arr.len() {
-                if arr.is_null(i) { result.push(NULL_TIMESTAMP); continue; }
+                if arr.is_null(i) {
+                    result.push(NULL_TIMESTAMP);
+                    continue;
+                }
                 let v = arr.value(i);
                 result.push(v.saturating_mul(1000));
             }
@@ -736,7 +747,10 @@ pub(crate) fn extract_i64_timestamps(
                     DbError::Pipeline("expected TimestampMicrosecondArray".to_string())
                 })?;
             for i in 0..arr.len() {
-                if arr.is_null(i) { result.push(NULL_TIMESTAMP); continue; }
+                if arr.is_null(i) {
+                    result.push(NULL_TIMESTAMP);
+                    continue;
+                }
                 let v = arr.value(i);
                 result.push(v / 1000);
             }
@@ -749,7 +763,10 @@ pub(crate) fn extract_i64_timestamps(
                     DbError::Pipeline("expected TimestampNanosecondArray".to_string())
                 })?;
             for i in 0..arr.len() {
-                if arr.is_null(i) { result.push(NULL_TIMESTAMP); continue; }
+                if arr.is_null(i) {
+                    result.push(NULL_TIMESTAMP);
+                    continue;
+                }
                 let v = arr.value(i);
                 result.push(v / 1_000_000);
             }

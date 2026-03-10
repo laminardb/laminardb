@@ -217,10 +217,7 @@ impl StreamingTopKOperator {
                     }
                 }
                 DataType::Timestamp(_, _) => {
-                    if let Some(arr) = array
-                        .as_any()
-                        .downcast_ref::<TimestampMicrosecondArray>()
-                    {
+                    if let Some(arr) = array.as_any().downcast_ref::<TimestampMicrosecondArray>() {
                         encode_not_null(col_spec.nulls_first, col_spec.descending, &mut key);
                         encode_i64(arr.value(0), col_spec.descending, &mut key);
                     } else {
