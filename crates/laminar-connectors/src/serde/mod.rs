@@ -130,6 +130,11 @@ pub trait RecordDeserializer: Send + Sync {
 
     /// Returns the format this deserializer handles.
     fn format(&self) -> Format;
+
+    /// Downcasts to concrete type (e.g., for Avro schema resolution).
+    fn as_any_mut(&mut self) -> Option<&mut dyn std::any::Any> {
+        None
+    }
 }
 
 /// Trait for serializing Arrow `RecordBatch` into raw bytes.

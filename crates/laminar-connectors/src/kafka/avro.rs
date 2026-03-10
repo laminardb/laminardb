@@ -173,6 +173,10 @@ impl RecordDeserializer for AvroDeserializer {
     fn format(&self) -> Format {
         Format::Avro
     }
+
+    fn as_any_mut(&mut self) -> Option<&mut dyn std::any::Any> {
+        Some(self)
+    }
 }
 
 impl std::fmt::Debug for AvroDeserializer {

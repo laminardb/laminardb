@@ -467,6 +467,24 @@ impl SourceConnector for KafkaSource {
             None
         };
 
+        // Resolve Avro schemas from Schema Registry before deserialization.
+        if let Some(avro_deser) = self
+            .deserializer
+            .as_any_mut()
+            .and_then(|any| any.downcast_mut::<AvroDeserializer>())
+        {
+            for &(start, len) in &payload_offsets {
+                if let Some(schema_id) =
+                    AvroDeserializer::extract_confluent_id(&payload_buf[start..start + len])
+                {
+                    avro_deser
+                        .ensure_schema_registered(schema_id)
+                        .await
+                        .map_err(ConnectorError::Serde)?;
+                }
+            }
+        }
+
         let refs: Vec<&[u8]> = payload_offsets
             .iter()
             .map(|&(start, len)| &payload_buf[start..start + len])
