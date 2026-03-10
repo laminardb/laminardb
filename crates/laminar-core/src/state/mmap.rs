@@ -362,6 +362,10 @@ impl MmapStateStore {
     fn load_from_mmap(
         mmap: &MmapMut,
     ) -> Result<(BTreeMap<Vec<u8>, ValueEntry>, usize, u64), StateError> {
+        if mmap.len() < 12 {
+            return Err(StateError::Corruption("State file too short".to_string()));
+        }
+
         // Check magic number
         let magic = u64::from_le_bytes(mmap[0..8].try_into().unwrap());
         if magic != MMAP_MAGIC {
@@ -529,7 +533,8 @@ impl MmapStateStore {
         // Skip padding (12..16)
 
         let write_pos =
-            usize::try_from(u64::from_le_bytes(buffer[16..24].try_into().unwrap())).unwrap();
+            usize::try_from(u64::from_le_bytes(buffer[16..24].try_into().unwrap()))
+                .map_err(|_| StateError::Corruption("write_pos exceeds platform address space".to_string()))?;
         let next_version = u64::from_le_bytes(buffer[24..32].try_into().unwrap());
 
         let index: BTreeMap<Vec<u8>, ValueEntry> =
