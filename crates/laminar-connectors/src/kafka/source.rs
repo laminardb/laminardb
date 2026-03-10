@@ -11,8 +11,8 @@ use rdkafka::consumer::{CommitMode, Consumer, StreamConsumer};
 use rdkafka::message::Message;
 use rdkafka::ClientConfig;
 use rdkafka::TopicPartitionList;
-use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
-use std::sync::Arc;
+use std::sync::atomic::{AtomicBool, AtomicU64, AtomicUsize, Ordering};
+use std::sync::{Arc, Mutex};
 use tokio::sync::Notify;
 use tracing::{debug, info, warn};
 
@@ -33,6 +33,7 @@ use super::metrics::KafkaSourceMetrics;
 use super::offsets::OffsetTracker;
 use super::rebalance::RebalanceState;
 use super::schema_registry::SchemaRegistryClient;
+use super::watermarks::KafkaWatermarkTracker;
 
 /// Payload sent from the background Kafka reader task to [`KafkaSource::poll_batch`].
 struct KafkaPayload {
@@ -68,7 +69,9 @@ pub struct KafkaSource {
     schema: SchemaRef,
     backpressure: KafkaBackpressureController,
     channel_len: Arc<AtomicUsize>,
-    rebalance_state: RebalanceState,
+    rebalance_state: Arc<Mutex<RebalanceState>>,
+    /// Shared rebalance counter bridging `LaminarConsumerContext` → `KafkaSourceMetrics`.
+    rebalance_counter: Arc<AtomicU64>,
     schema_registry: Option<Arc<SchemaRegistryClient>>,
     data_ready: Arc<Notify>,
     checkpoint_request: Arc<AtomicBool>,
@@ -76,6 +79,7 @@ pub struct KafkaSource {
     reader_handle: Option<tokio::task::JoinHandle<()>>,
     reader_shutdown: Option<tokio::sync::watch::Sender<bool>>,
     offset_commit_tx: Option<tokio::sync::watch::Sender<TopicPartitionList>>,
+    watermark_tracker: Option<KafkaWatermarkTracker>,
 }
 
 impl KafkaSource {
@@ -96,6 +100,15 @@ impl KafkaSource {
             Arc::clone(&channel_len),
         );
 
+        let watermark_tracker = if config.enable_watermark_tracking {
+            Some(
+                KafkaWatermarkTracker::new(0, config.idle_timeout)
+                    .with_max_out_of_orderness(config.max_out_of_orderness),
+            )
+        } else {
+            None
+        };
+
         Self {
             consumer: None,
             config,
@@ -106,7 +119,8 @@ impl KafkaSource {
             schema,
             backpressure,
             channel_len,
-            rebalance_state: RebalanceState::new(),
+            rebalance_state: Arc::new(Mutex::new(RebalanceState::new())),
+            rebalance_counter: Arc::new(AtomicU64::new(0)),
             schema_registry: None,
             data_ready: Arc::new(Notify::new()),
             checkpoint_request: Arc::new(AtomicBool::new(false)),
@@ -114,6 +128,7 @@ impl KafkaSource {
             reader_handle: None,
             reader_shutdown: None,
             offset_commit_tx: None,
+            watermark_tracker,
         }
     }
 
@@ -145,6 +160,15 @@ impl KafkaSource {
             Arc::clone(&channel_len),
         );
 
+        let watermark_tracker = if config.enable_watermark_tracking {
+            Some(
+                KafkaWatermarkTracker::new(0, config.idle_timeout)
+                    .with_max_out_of_orderness(config.max_out_of_orderness),
+            )
+        } else {
+            None
+        };
+
         Self {
             consumer: None,
             config,
@@ -155,7 +179,8 @@ impl KafkaSource {
             schema,
             backpressure,
             channel_len,
-            rebalance_state: RebalanceState::new(),
+            rebalance_state: Arc::new(Mutex::new(RebalanceState::new())),
+            rebalance_counter: Arc::new(AtomicU64::new(0)),
             schema_registry: Some(sr),
             data_ready: Arc::new(Notify::new()),
             checkpoint_request: Arc::new(AtomicBool::new(false)),
@@ -163,6 +188,7 @@ impl KafkaSource {
             reader_handle: None,
             reader_shutdown: None,
             offset_commit_tx: None,
+            watermark_tracker,
         }
     }
 
@@ -184,16 +210,27 @@ impl KafkaSource {
         Arc::clone(&self.channel_len)
     }
 
-    /// Current partition assignment state.
+    /// Shared partition assignment state (updated by rebalance callbacks).
     #[must_use]
-    pub fn rebalance_state(&self) -> &RebalanceState {
-        &self.rebalance_state
+    pub fn rebalance_state(&self) -> Arc<Mutex<RebalanceState>> {
+        Arc::clone(&self.rebalance_state)
     }
 
     /// Whether a Schema Registry client is configured.
     #[must_use]
     pub fn has_schema_registry(&self) -> bool {
         self.schema_registry.is_some()
+    }
+
+    /// Current combined watermark from the watermark tracker.
+    ///
+    /// Returns `None` if watermark tracking is disabled or no partitions
+    /// have received data yet.
+    #[must_use]
+    pub fn current_watermark(&self) -> Option<i64> {
+        self.watermark_tracker
+            .as_ref()
+            .and_then(KafkaWatermarkTracker::current_watermark)
     }
 
     /// Returns the configured event-time column name, if any.
@@ -381,7 +418,11 @@ impl SourceConnector for KafkaSource {
 
         // Build rdkafka consumer with rebalance-aware context.
         let rdkafka_config: ClientConfig = kafka_config.to_rdkafka_config();
-        let context = LaminarConsumerContext::new(Arc::clone(&self.checkpoint_request));
+        let context = LaminarConsumerContext::new(
+            Arc::clone(&self.checkpoint_request),
+            Arc::clone(&self.rebalance_state),
+            Arc::clone(&self.rebalance_counter),
+        );
         let consumer: StreamConsumer<LaminarConsumerContext> =
             rdkafka_config.create_with_context(context).map_err(|e| {
                 ConnectorError::ConnectionFailed(format!("failed to create consumer: {e}"))
@@ -592,6 +633,13 @@ impl SourceConnector for KafkaSource {
                         meta_headers.push(kp.headers_json);
                     }
 
+                    // Update watermark tracker with event timestamp.
+                    if let Some(ref mut tracker) = self.watermark_tracker {
+                        if let Some(ts) = kp.timestamp_ms {
+                            tracker.update_partition(kp.partition, ts);
+                        }
+                    }
+
                     if last_topic.as_str() != &*kp.topic || last_partition_id != kp.partition {
                         last_topic = kp.topic.to_string();
                         last_partition_id = kp.partition;
@@ -600,6 +648,17 @@ impl SourceConnector for KafkaSource {
                 }
                 Err(_) => break,
             }
+        }
+
+        // Check for idle partitions on each poll cycle.
+        if let Some(ref mut tracker) = self.watermark_tracker {
+            tracker.check_idle_partitions();
+        }
+
+        // Sync rebalance counter → metrics (bridge from rdkafka background thread).
+        let rebalance_events = self.rebalance_counter.swap(0, Ordering::Relaxed);
+        for _ in 0..rebalance_events {
+            self.metrics.record_rebalance();
         }
 
         if payload_offsets.is_empty() {

@@ -409,9 +409,6 @@ pub struct KafkaSourceConfig {
     pub group_id: String,
     /// Topic subscription (explicit list or regex pattern).
     pub subscription: TopicSubscription,
-    /// Topics to subscribe to (deprecated: use `subscription` instead).
-    #[deprecated(since = "0.2.0", note = "use `subscription` field instead")]
-    pub topics: Vec<String>,
 
     // -- Security --
     /// Security protocol for broker connections.
@@ -523,13 +520,11 @@ impl std::fmt::Debug for KafkaSourceConfig {
 }
 
 impl Default for KafkaSourceConfig {
-    #[allow(deprecated)]
     fn default() -> Self {
         Self {
             bootstrap_servers: String::new(),
             group_id: String::new(),
             subscription: TopicSubscription::default(),
-            topics: Vec::new(),
             security_protocol: SecurityProtocol::default(),
             sasl_mechanism: None,
             sasl_username: None,
@@ -592,11 +587,6 @@ impl KafkaSourceConfig {
                 .map(|s| s.trim().to_string())
                 .collect();
             TopicSubscription::Topics(topics.clone())
-        };
-
-        let topics = match &subscription {
-            TopicSubscription::Topics(t) => t.clone(),
-            TopicSubscription::Pattern(_) => Vec::new(),
         };
 
         let security_protocol = match config.get("security.protocol") {
@@ -752,7 +742,6 @@ impl KafkaSourceConfig {
             bootstrap_servers,
             group_id,
             subscription,
-            topics,
             security_protocol,
             sasl_mechanism,
             sasl_username,
@@ -926,6 +915,12 @@ impl KafkaSourceConfig {
 
         config.set("isolation.level", self.isolation_level.as_rdkafka_str());
 
+        // Socket timeout controls how long rdkafka waits for broker responses.
+        config.set(
+            "socket.timeout.ms",
+            self.poll_timeout.as_millis().to_string(),
+        );
+
         if let Some(fetch_min) = self.fetch_min_bytes {
             config.set("fetch.min.bytes", fetch_min.to_string());
         }
@@ -1040,7 +1035,7 @@ mod tests {
         let cfg = KafkaSourceConfig::from_config(&make_config(&[])).unwrap();
         assert_eq!(cfg.bootstrap_servers, "localhost:9092");
         assert_eq!(cfg.group_id, "test-group");
-        assert_eq!(cfg.topics, vec!["events"]);
+        assert_eq!(cfg.subscription.topics().unwrap(), &["events"]);
         assert!(matches!(
             cfg.subscription,
             TopicSubscription::Topics(ref t) if t == &["events"]
@@ -1057,7 +1052,7 @@ mod tests {
     #[allow(deprecated)]
     fn test_parse_multi_topic() {
         let cfg = KafkaSourceConfig::from_config(&make_config(&[("topic", "a, b, c")])).unwrap();
-        assert_eq!(cfg.topics, vec!["a", "b", "c"]);
+        assert_eq!(cfg.subscription.topics().unwrap(), &["a", "b", "c"]);
         assert!(matches!(
             cfg.subscription,
             TopicSubscription::Topics(ref t) if t == &["a", "b", "c"]
