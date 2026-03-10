@@ -156,6 +156,10 @@ pub(crate) struct IncrementalEowcState {
     having_sql: Option<String>,
     /// Maximum groups per window before new groups are dropped.
     max_groups_per_window: usize,
+    /// Grace period (ms) after window end before closing. Late events
+    /// arriving within this window are included instead of dropped.
+    /// Must match `CoreWindowState::allowed_lateness_ms` behavior.
+    allowed_lateness_ms: i64,
 }
 
 impl IncrementalEowcState {
@@ -352,6 +356,8 @@ impl IncrementalEowcState {
             time_col_index,
             having_sql,
             max_groups_per_window: 1_000_000,
+            allowed_lateness_ms: i64::try_from(window_config.allowed_lateness.as_millis())
+                .unwrap_or(0),
         }))
     }
 
@@ -391,6 +397,9 @@ impl IncrementalEowcState {
         if !has_groups {
             let mut grouped: AHashMap<i64, Vec<u32>> = AHashMap::new();
             for (row_idx, &ts_ms) in ts_array.iter().enumerate() {
+                if ts_ms == NULL_TIMESTAMP {
+                    continue; // skip rows with null timestamps
+                }
                 #[allow(clippy::cast_possible_truncation)]
                 let idx = row_idx as u32;
                 for ws in assign_windows(ts_ms, &self.window_type) {
@@ -434,6 +443,9 @@ impl IncrementalEowcState {
         let rows_ref = rows.as_ref().expect("rows set when has_groups");
         let mut grouped: AHashMap<(i64, arrow::row::OwnedRow), Vec<u32>> = AHashMap::new();
         for (row_idx, &ts_ms) in ts_array.iter().enumerate() {
+            if ts_ms == NULL_TIMESTAMP {
+                continue; // skip rows with null timestamps
+            }
             let row_key = rows_ref.row(row_idx).owned();
             #[allow(clippy::cast_possible_truncation)]
             let idx = row_idx as u32;
@@ -511,7 +523,11 @@ impl IncrementalEowcState {
             .windows
             .keys()
             .copied()
-            .take_while(|&ws| ws.saturating_add(size_ms) <= watermark_ms)
+            .take_while(|&ws| {
+                ws.saturating_add(size_ms)
+                    .saturating_add(self.allowed_lateness_ms)
+                    <= watermark_ms
+            })
             .collect();
 
         if to_close.is_empty() {
@@ -659,10 +675,17 @@ impl IncrementalEowcState {
     }
 }
 
+/// Sentinel value for null timestamps. Callers must skip rows with this value
+/// instead of assigning them to the epoch-0 window.
+pub(crate) const NULL_TIMESTAMP: i64 = i64::MIN;
+
 /// Extract i64 timestamp values from a batch column.
 ///
 /// Handles Int64 columns directly and Arrow Timestamp columns by extracting
 /// the underlying i64 values (already in the native time unit).
+///
+/// Null values are mapped to [`NULL_TIMESTAMP`] (`i64::MIN`). Callers must
+/// check for this sentinel and skip the corresponding rows.
 pub(crate) fn extract_i64_timestamps(
     batch: &RecordBatch,
     col_index: usize,
@@ -680,7 +703,7 @@ pub(crate) fn extract_i64_timestamps(
                 .downcast_ref::<Int64Array>()
                 .ok_or_else(|| DbError::Pipeline("expected Int64Array".to_string()))?;
             for i in 0..arr.len() {
-                result.push(if arr.is_null(i) { 0 } else { arr.value(i) });
+                result.push(if arr.is_null(i) { NULL_TIMESTAMP } else { arr.value(i) });
             }
         }
         DataType::Timestamp(TimeUnit::Millisecond, _) => {
@@ -691,7 +714,7 @@ pub(crate) fn extract_i64_timestamps(
                     DbError::Pipeline("expected TimestampMillisecondArray".to_string())
                 })?;
             for i in 0..arr.len() {
-                result.push(if arr.is_null(i) { 0 } else { arr.value(i) });
+                result.push(if arr.is_null(i) { NULL_TIMESTAMP } else { arr.value(i) });
             }
         }
         DataType::Timestamp(TimeUnit::Second, _) => {
@@ -700,7 +723,8 @@ pub(crate) fn extract_i64_timestamps(
                 .downcast_ref::<arrow::array::TimestampSecondArray>()
                 .ok_or_else(|| DbError::Pipeline("expected TimestampSecondArray".to_string()))?;
             for i in 0..arr.len() {
-                let v = if arr.is_null(i) { 0 } else { arr.value(i) };
+                if arr.is_null(i) { result.push(NULL_TIMESTAMP); continue; }
+                let v = arr.value(i);
                 result.push(v.saturating_mul(1000));
             }
         }
@@ -712,7 +736,8 @@ pub(crate) fn extract_i64_timestamps(
                     DbError::Pipeline("expected TimestampMicrosecondArray".to_string())
                 })?;
             for i in 0..arr.len() {
-                let v = if arr.is_null(i) { 0 } else { arr.value(i) };
+                if arr.is_null(i) { result.push(NULL_TIMESTAMP); continue; }
+                let v = arr.value(i);
                 result.push(v / 1000);
             }
         }
@@ -724,7 +749,8 @@ pub(crate) fn extract_i64_timestamps(
                     DbError::Pipeline("expected TimestampNanosecondArray".to_string())
                 })?;
             for i in 0..arr.len() {
-                let v = if arr.is_null(i) { 0 } else { arr.value(i) };
+                if arr.is_null(i) { result.push(NULL_TIMESTAMP); continue; }
+                let v = arr.value(i);
                 result.push(v / 1_000_000);
             }
         }
@@ -881,6 +907,7 @@ mod tests {
             time_col_index: 2,
             having_sql: None,
             max_groups_per_window: 1_000_000,
+            allowed_lateness_ms: 0,
         }
     }
 
