@@ -122,7 +122,7 @@ impl ConsumerContext for LaminarConsumerContext {
                 );
                 self.rebalance_count
                     .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
-                self.checkpoint_requested.store(true, Ordering::Relaxed);
+                self.checkpoint_requested.store(true, Ordering::Release);
             }
             Rebalance::Assign(tpl) => {
                 let count = tpl.count();

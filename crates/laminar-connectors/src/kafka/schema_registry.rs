@@ -606,31 +606,81 @@ impl SchemaRegistryClient {
     }
 
     /// Helper to perform a GET request and deserialize JSON.
+    ///
+    /// Retries transient failures (5xx, timeouts) up to 3 times with
+    /// exponential backoff (100ms, 500ms, 2s). Non-retryable errors
+    /// (4xx client errors) fail immediately.
     async fn get_json<T: serde::de::DeserializeOwned>(
         &self,
         url: &str,
     ) -> Result<T, ConnectorError> {
-        let mut req = self.client.get(url);
-        if let Some(ref auth) = self.auth {
-            req = req.basic_auth(&auth.username, Some(&auth.password));
-        }
+        let backoffs = [
+            std::time::Duration::from_millis(100),
+            std::time::Duration::from_millis(500),
+            std::time::Duration::from_secs(2),
+        ];
+        let mut last_err = None;
 
-        let resp = req
-            .send()
-            .await
-            .map_err(|e| ConnectorError::ConnectionFailed(format!("schema registry: {e}")))?;
+        for (attempt, backoff) in std::iter::once(&std::time::Duration::ZERO)
+            .chain(backoffs.iter())
+            .enumerate()
+        {
+            if attempt > 0 {
+                tokio::time::sleep(*backoff).await;
+            }
 
-        if !resp.status().is_success() {
+            let mut req = self.client.get(url);
+            if let Some(ref auth) = self.auth {
+                req = req.basic_auth(&auth.username, Some(&auth.password));
+            }
+
+            let resp = match req.send().await {
+                Ok(r) => r,
+                Err(e) => {
+                    tracing::warn!(
+                        attempt = attempt + 1,
+                        error = %e,
+                        "schema registry request failed, retrying"
+                    );
+                    last_err = Some(ConnectorError::ConnectionFailed(format!(
+                        "schema registry: {e}"
+                    )));
+                    continue;
+                }
+            };
+
             let status = resp.status();
+            if status.is_success() {
+                return resp.json::<T>().await.map_err(|e| {
+                    ConnectorError::Internal(format!(
+                        "failed to parse schema registry response: {e}"
+                    ))
+                });
+            }
+
+            // Client errors (4xx) are not retryable.
+            if status.is_client_error() {
+                let text = resp.text().await.unwrap_or_default();
+                return Err(ConnectorError::ConnectionFailed(format!(
+                    "schema registry client error: {status} {text}"
+                )));
+            }
+
+            // Server errors (5xx) are retryable.
             let text = resp.text().await.unwrap_or_default();
-            return Err(ConnectorError::ConnectionFailed(format!(
+            tracing::warn!(
+                attempt = attempt + 1,
+                status = %status,
+                "schema registry server error, retrying"
+            );
+            last_err = Some(ConnectorError::ConnectionFailed(format!(
                 "schema registry request failed: {status} {text}"
             )));
         }
 
-        resp.json::<T>().await.map_err(|e| {
-            ConnectorError::Internal(format!("failed to parse schema registry response: {e}"))
-        })
+        Err(last_err.unwrap_or_else(|| {
+            ConnectorError::ConnectionFailed("schema registry: all retries exhausted".into())
+        }))
     }
 }
 

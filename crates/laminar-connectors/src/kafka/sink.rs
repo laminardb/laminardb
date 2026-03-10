@@ -128,9 +128,14 @@ impl KafkaSink {
     /// Creates a new Kafka sink connector with explicit schema.
     #[must_use]
     pub fn new(schema: SchemaRef, config: KafkaSinkConfig) -> Self {
-        let serializer = select_serializer(config.format, &schema);
-        let partitioner = select_partitioner(config.partitioner);
         let avro_schema_id = Arc::new(std::sync::atomic::AtomicU32::new(0));
+        let serializer = select_serializer(
+            config.format,
+            &schema,
+            Arc::clone(&avro_schema_id),
+            None,
+        );
+        let partitioner = select_partitioner(config.partitioner);
 
         Self {
             producer: None,
@@ -159,16 +164,12 @@ impl KafkaSink {
     ) -> Self {
         let sr = Arc::new(sr_client);
         let avro_schema_id = Arc::new(std::sync::atomic::AtomicU32::new(0));
-        let serializer: Box<dyn RecordSerializer> = if config.format == Format::Avro {
-            Box::new(AvroSerializer::with_shared_schema_id(
-                schema.clone(),
-                Arc::clone(&avro_schema_id),
-                Some(Arc::clone(&sr)),
-            ))
-        } else {
-            select_serializer(config.format, &schema)
-        };
-
+        let serializer = select_serializer(
+            config.format,
+            &schema,
+            Arc::clone(&avro_schema_id),
+            Some(Arc::clone(&sr)),
+        );
         let partitioner = select_partitioner(config.partitioner);
 
         Self {
@@ -340,7 +341,12 @@ impl SinkConnector for KafkaSink {
         if !config.properties().is_empty() {
             let parsed = KafkaSinkConfig::from_config(config)?;
             self.config = parsed;
-            self.serializer = select_serializer(self.config.format, &self.schema);
+            self.serializer = select_serializer(
+                self.config.format,
+                &self.schema,
+                Arc::clone(&self.avro_schema_id),
+                self.schema_registry.clone(),
+            );
             self.partitioner = select_partitioner(self.config.partitioner);
         }
 
@@ -367,15 +373,15 @@ impl SinkConnector for KafkaSink {
                 })?;
         }
 
-        // Create DLQ producer if configured.
+        // Create DLQ producer if configured. Inherits security settings
+        // (SASL, SSL) from the main producer config but is non-transactional.
+        // DLQ records bypass the exactly-once transaction to avoid coupling
+        // error routing with the main data path.
         if self.config.dlq_topic.is_some() {
-            let dlq_producer: FutureProducer = ClientConfig::new()
-                .set("bootstrap.servers", &self.config.bootstrap_servers)
-                .set("enable.idempotence", "true")
-                .create()
-                .map_err(|e| {
-                    ConnectorError::ConnectionFailed(format!("failed to create DLQ producer: {e}"))
-                })?;
+            let dlq_config = self.config.to_dlq_rdkafka_config();
+            let dlq_producer: FutureProducer = dlq_config.create().map_err(|e| {
+                ConnectorError::ConnectionFailed(format!("failed to create DLQ producer: {e}"))
+            })?;
             self.dlq_producer = Some(dlq_producer);
         }
 
@@ -530,7 +536,10 @@ impl SinkConnector for KafkaSink {
                 record = record.partition(p);
             }
 
-            delivery_futures.push(producer.send(record, Duration::from_secs(0)));
+            // Allow 500ms for rdkafka's internal queue to drain before failing
+            // with QueueFull. Zero timeout causes legitimate messages to be
+            // rejected under transient burst load.
+            delivery_futures.push(producer.send(record, Duration::from_millis(500)));
         }
 
         // Phase 2: Collect delivery reports.
@@ -777,14 +786,25 @@ impl std::fmt::Debug for KafkaSink {
 }
 
 /// Selects the appropriate serializer for the given format.
-fn select_serializer(format: Format, schema: &SchemaRef) -> Box<dyn RecordSerializer> {
+///
+/// For Avro, uses the shared `schema_id` handle so that Schema Registry
+/// registration updates are visible to the serializer.
+fn select_serializer(
+    format: Format,
+    schema: &SchemaRef,
+    schema_id: Arc<std::sync::atomic::AtomicU32>,
+    registry: Option<Arc<SchemaRegistryClient>>,
+) -> Box<dyn RecordSerializer> {
     match format {
-        Format::Avro => {
-            // Without schema registry, use schema ID 0 (placeholder).
-            Box::new(AvroSerializer::new(schema.clone(), 0))
-        }
-        other => serde::create_serializer(other)
-            .expect("supported format should always create a serializer"),
+        Format::Avro => Box::new(AvroSerializer::with_shared_schema_id(
+            schema.clone(),
+            schema_id,
+            registry,
+        )),
+        other => serde::create_serializer(other).unwrap_or_else(|_| {
+            tracing::warn!(format = %other, "unsupported serializer format, falling back to JSON");
+            Box::new(serde::json::JsonSerializer::new())
+        }),
     }
 }
 

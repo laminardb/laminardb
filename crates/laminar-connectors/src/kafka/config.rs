@@ -379,7 +379,7 @@ impl std::fmt::Display for CompatibilityLevel {
 }
 
 /// Schema Registry authentication credentials.
-#[derive(Debug, Clone)]
+#[derive(Clone)]
 pub struct SrAuth {
     /// Basic auth username.
     pub username: String,
@@ -387,8 +387,20 @@ pub struct SrAuth {
     pub password: String,
 }
 
+impl std::fmt::Debug for SrAuth {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("SrAuth")
+            .field("username", &self.username)
+            .field("password", &"***")
+            .finish()
+    }
+}
+
 /// Kafka source connector configuration.
-#[derive(Debug, Clone)]
+///
+/// Uses a custom `Debug` impl that redacts `sasl_password` and
+/// `ssl_key_password` to prevent credential leakage in logs.
+#[derive(Clone)]
 pub struct KafkaSourceConfig {
     // -- Required --
     /// Comma-separated list of broker addresses.
@@ -488,6 +500,26 @@ pub struct KafkaSourceConfig {
     // -- Pass-through --
     /// Additional rdkafka properties passed directly to librdkafka.
     pub kafka_properties: HashMap<String, String>,
+}
+
+impl std::fmt::Debug for KafkaSourceConfig {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("KafkaSourceConfig")
+            .field("bootstrap_servers", &self.bootstrap_servers)
+            .field("group_id", &self.group_id)
+            .field("subscription", &self.subscription)
+            .field("format", &self.format)
+            .field("security_protocol", &self.security_protocol)
+            .field("sasl_mechanism", &self.sasl_mechanism)
+            .field("sasl_username", &self.sasl_username)
+            .field("sasl_password", &self.sasl_password.as_ref().map(|_| "***"))
+            .field(
+                "ssl_key_password",
+                &self.ssl_key_password.as_ref().map(|_| "***"),
+            )
+            .field("max_poll_records", &self.max_poll_records)
+            .finish_non_exhaustive()
+    }
 }
 
 impl Default for KafkaSourceConfig {
@@ -910,13 +942,39 @@ impl KafkaSourceConfig {
             config.set("max.partition.fetch.bytes", partition_max.to_string());
         }
 
-        // Apply pass-through properties (these can override defaults).
+        // Apply pass-through properties, blocking security-critical keys
+        // that could silently downgrade authentication or break semantics.
         for (key, value) in &self.kafka_properties {
+            if is_blocked_passthrough_key(key) {
+                tracing::warn!(
+                    key,
+                    "ignoring kafka.* pass-through property that overrides a security setting"
+                );
+                continue;
+            }
             config.set(key, value);
         }
 
         config
     }
+}
+
+/// Returns `true` if a pass-through kafka.* key must not override explicit settings.
+fn is_blocked_passthrough_key(key: &str) -> bool {
+    matches!(
+        key,
+        "security.protocol"
+            | "sasl.mechanism"
+            | "sasl.username"
+            | "sasl.password"
+            | "sasl.oauthbearer.config"
+            | "ssl.ca.location"
+            | "ssl.certificate.location"
+            | "ssl.key.location"
+            | "ssl.key.password"
+            | "enable.auto.commit"
+            | "enable.idempotence"
+    )
 }
 
 /// Parses a specific offsets string in the format "partition:offset,partition:offset,...".

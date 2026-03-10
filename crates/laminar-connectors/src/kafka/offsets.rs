@@ -5,6 +5,7 @@
 //! [`SourceCheckpoint`].
 
 use std::collections::HashMap;
+use std::sync::Arc;
 
 use rdkafka::Offset;
 use rdkafka::TopicPartitionList;
@@ -18,32 +19,75 @@ use crate::checkpoint::SourceCheckpoint;
 /// (the next offset to consume) per Kafka convention.
 #[derive(Debug, Clone, Default)]
 pub struct OffsetTracker {
-    /// Map from (topic, partition) to last-consumed offset.
-    offsets: HashMap<(String, i32), i64>,
+    /// Two-level map: topic -> (partition -> offset). Uses `Arc<str>` keys
+    /// to avoid per-message String allocations on the hot path.
+    topics: HashMap<Arc<str>, HashMap<i32, i64>>,
 }
 
 impl OffsetTracker {
-    /// Creates a new empty offset tracker.
+    /// Creates an empty offset tracker.
     #[must_use]
     pub fn new() -> Self {
         Self::default()
     }
 
-    /// Updates the offset for a topic-partition.
+    /// Updates the offset (monotonic: only advances forward).
     pub fn update(&mut self, topic: &str, partition: i32, offset: i64) {
-        self.offsets.insert((topic.to_string(), partition), offset);
+        if let Some(partitions) = self.topics.get_mut(topic as &str) {
+            partitions
+                .entry(partition)
+                .and_modify(|existing| {
+                    if offset > *existing {
+                        *existing = offset;
+                    }
+                })
+                .or_insert(offset);
+        } else {
+            let mut partitions = HashMap::new();
+            partitions.insert(partition, offset);
+            self.topics.insert(Arc::from(topic), partitions);
+        }
+    }
+
+    /// Updates the offset using a pre-interned topic Arc (avoids allocation).
+    pub fn update_arc(&mut self, topic: &Arc<str>, partition: i32, offset: i64) {
+        if let Some(partitions) = self.topics.get_mut(&**topic as &str) {
+            partitions
+                .entry(partition)
+                .and_modify(|existing| {
+                    if offset > *existing {
+                        *existing = offset;
+                    }
+                })
+                .or_insert(offset);
+        } else {
+            let mut partitions = HashMap::new();
+            partitions.insert(partition, offset);
+            self.topics.insert(Arc::clone(topic), partitions);
+        }
+    }
+
+    /// Unconditionally sets the offset for a topic-partition (used by restore).
+    pub fn update_force(&mut self, topic: &str, partition: i32, offset: i64) {
+        self.topics
+            .entry(Arc::from(topic))
+            .or_default()
+            .insert(partition, offset);
     }
 
     /// Gets the last-consumed offset for a topic-partition.
     #[must_use]
     pub fn get(&self, topic: &str, partition: i32) -> Option<i64> {
-        self.offsets.get(&(topic.to_string(), partition)).copied()
+        self.topics
+            .get(topic)
+            .and_then(|p| p.get(&partition))
+            .copied()
     }
 
-    /// Returns the number of tracked partitions.
+    /// Returns the total number of tracked partitions across all topics.
     #[must_use]
     pub fn partition_count(&self) -> usize {
-        self.offsets.len()
+        self.topics.values().map(HashMap::len).sum()
     }
 
     /// Converts tracked offsets to a [`SourceCheckpoint`].
@@ -52,10 +96,12 @@ impl OffsetTracker {
     #[must_use]
     pub fn to_checkpoint(&self) -> SourceCheckpoint {
         let offsets: HashMap<String, String> = self
-            .offsets
+            .topics
             .iter()
-            .map(|((topic, partition), offset)| {
-                (format!("{topic}-{partition}"), offset.to_string())
+            .flat_map(|(topic, partitions)| {
+                partitions.iter().map(move |(partition, offset)| {
+                    (format!("{topic}-{partition}"), offset.to_string())
+                })
             })
             .collect();
         let mut cp = SourceCheckpoint::with_offsets(0, offsets);
@@ -71,11 +117,10 @@ impl OffsetTracker {
         let mut tracker = Self::new();
         for (key, value) in cp.offsets() {
             if let Ok(offset) = value.parse::<i64>() {
-                // Find the last '-' to split topic from partition
                 if let Some(dash_pos) = key.rfind('-') {
                     let topic = &key[..dash_pos];
                     if let Ok(partition) = key[dash_pos + 1..].parse::<i32>() {
-                        tracker.update(topic, partition, offset);
+                        tracker.update_force(topic, partition, offset);
                     }
                 }
             }
@@ -89,16 +134,18 @@ impl OffsetTracker {
     #[must_use]
     pub fn to_topic_partition_list(&self) -> TopicPartitionList {
         let mut tpl = TopicPartitionList::new();
-        for ((topic, partition), offset) in &self.offsets {
-            tpl.add_partition_offset(topic, *partition, Offset::Offset(offset + 1))
-                .ok();
+        for (topic, partitions) in &self.topics {
+            for (&partition, &offset) in partitions {
+                tpl.add_partition_offset(topic, partition, Offset::Offset(offset + 1))
+                    .ok();
+            }
         }
         tpl
     }
 
     /// Clears all tracked offsets.
     pub fn clear(&mut self) {
-        self.offsets.clear();
+        self.topics.clear();
     }
 }
 
@@ -119,11 +166,35 @@ mod tests {
     }
 
     #[test]
-    fn test_update_overwrites() {
+    fn test_update_advances_forward() {
         let mut tracker = OffsetTracker::new();
         tracker.update("events", 0, 100);
         tracker.update("events", 0, 200);
         assert_eq!(tracker.get("events", 0), Some(200));
+    }
+
+    #[test]
+    fn test_update_rejects_regression() {
+        let mut tracker = OffsetTracker::new();
+        tracker.update("events", 0, 200);
+        tracker.update("events", 0, 100); // should be ignored
+        assert_eq!(tracker.get("events", 0), Some(200));
+    }
+
+    #[test]
+    fn test_update_rejects_equal() {
+        let mut tracker = OffsetTracker::new();
+        tracker.update("events", 0, 100);
+        tracker.update("events", 0, 100); // same offset, no change
+        assert_eq!(tracker.get("events", 0), Some(100));
+    }
+
+    #[test]
+    fn test_update_force_overwrites() {
+        let mut tracker = OffsetTracker::new();
+        tracker.update("events", 0, 200);
+        tracker.update_force("events", 0, 50); // force allows regression
+        assert_eq!(tracker.get("events", 0), Some(50));
     }
 
     #[test]
@@ -156,7 +227,6 @@ mod tests {
         tracker.update("events", 1, 199);
 
         let tpl = tracker.to_topic_partition_list();
-        // rdkafka TPL commit offset = next-to-fetch = offset+1
         let elements = tpl.elements();
         assert_eq!(elements.len(), 2);
 

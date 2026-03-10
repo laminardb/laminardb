@@ -524,6 +524,9 @@ impl LaminarDB {
                     let exactly_once = handle.exactly_once();
                     coord.register_sink(name.clone(), handle.clone(), exactly_once);
                 }
+                // Begin the initial epoch on exactly-once sinks so that the
+                // first writes are covered by a Kafka transaction.
+                coord.begin_initial_epoch().await?;
             }
         }
 

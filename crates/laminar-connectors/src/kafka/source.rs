@@ -7,9 +7,10 @@
 
 use arrow_schema::SchemaRef;
 use async_trait::async_trait;
-use rdkafka::consumer::{Consumer, StreamConsumer};
+use rdkafka::consumer::{CommitMode, Consumer, StreamConsumer};
 use rdkafka::message::Message;
 use rdkafka::ClientConfig;
+use rdkafka::TopicPartitionList;
 use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
 use std::sync::Arc;
 use tokio::sync::Notify;
@@ -54,43 +55,23 @@ struct KafkaPayload {
 /// 4. Call `checkpoint()` / `restore()` for fault tolerance
 /// 5. Call `close()` for clean shutdown
 pub struct KafkaSource {
-    /// rdkafka consumer (set during `open()`).
     consumer: Option<StreamConsumer<LaminarConsumerContext>>,
-    /// Parsed Kafka configuration.
     config: KafkaSourceConfig,
-    /// Format-specific deserializer.
     deserializer: Box<dyn RecordDeserializer>,
-    /// Per-partition offset tracking.
     offsets: OffsetTracker,
-    /// Connector lifecycle state.
     state: ConnectorState,
-    /// Consumption metrics.
     metrics: KafkaSourceMetrics,
-    /// Arrow schema for output batches.
     schema: SchemaRef,
-    /// Backpressure controller.
     backpressure: KafkaBackpressureController,
-    /// Shared backpressure channel fill counter.
-    ///
-    /// Clone this Arc and update it from the downstream consumer to wire
-    /// backpressure. Increment when batches are buffered, decrement when
-    /// consumed. Without wiring, the counter stays at 0 and backpressure
-    /// is effectively disabled (correct for sequential polling pipelines).
     channel_len: Arc<AtomicUsize>,
-    /// Consumer group rebalance tracking.
     rebalance_state: RebalanceState,
-    /// Optional Schema Registry client (shared with Avro deserializer).
     schema_registry: Option<Arc<SchemaRegistryClient>>,
-    /// Notification handle signalled when Kafka messages arrive from the reader task.
     data_ready: Arc<Notify>,
-    /// Flag set to `true` on consumer group rebalance (partition revocation).
     checkpoint_request: Arc<AtomicBool>,
-    /// Channel receiver for Kafka messages from the background reader task.
     msg_rx: Option<tokio::sync::mpsc::Receiver<KafkaPayload>>,
-    /// Background Kafka reader task handle.
     reader_handle: Option<tokio::task::JoinHandle<()>>,
-    /// Shutdown signal for the background reader task.
     reader_shutdown: Option<tokio::sync::watch::Sender<bool>>,
+    offset_commit_tx: Option<tokio::sync::watch::Sender<TopicPartitionList>>,
 }
 
 impl KafkaSource {
@@ -128,6 +109,7 @@ impl KafkaSource {
             msg_rx: None,
             reader_handle: None,
             reader_shutdown: None,
+            offset_commit_tx: None,
         }
     }
 
@@ -176,44 +158,35 @@ impl KafkaSource {
             msg_rx: None,
             reader_handle: None,
             reader_shutdown: None,
+            offset_commit_tx: None,
         }
     }
 
-    /// Returns the current connector state.
+    /// Connector lifecycle state.
     #[must_use]
     pub fn state(&self) -> ConnectorState {
         self.state
     }
 
-    /// Returns a reference to the offset tracker.
+    /// Per-partition offset tracker.
     #[must_use]
     pub fn offsets(&self) -> &OffsetTracker {
         &self.offsets
     }
 
-    /// Returns the shared backpressure channel fill counter.
-    ///
-    /// The downstream consumer should clone this `Arc` and update the
-    /// counter as batches are buffered and consumed:
-    /// - Increment (`fetch_add`) when a batch is placed into a buffer
-    /// - Decrement (`fetch_sub`) when a batch is processed
-    ///
-    /// The [`KafkaBackpressureController`] reads this counter to decide when
-    /// to pause/resume the Kafka consumer. Without wiring, the counter
-    /// stays at 0 and backpressure is disabled (correct for sequential
-    /// polling pipelines that inherently throttle by processing rate).
+    /// Shared backpressure fill counter for downstream wiring.
     #[must_use]
     pub fn channel_len(&self) -> Arc<AtomicUsize> {
         Arc::clone(&self.channel_len)
     }
 
-    /// Returns a reference to the rebalance state.
+    /// Current partition assignment state.
     #[must_use]
     pub fn rebalance_state(&self) -> &RebalanceState {
         &self.rebalance_state
     }
 
-    /// Returns whether a Schema Registry client is configured.
+    /// Whether a Schema Registry client is configured.
     #[must_use]
     pub fn has_schema_registry(&self) -> bool {
         self.schema_registry.is_some()
@@ -230,12 +203,14 @@ impl KafkaSource {
         let consumer = self.consumer.take().unwrap();
         let (msg_tx, msg_rx) = tokio::sync::mpsc::channel(4096);
         let (shutdown_tx, mut shutdown_rx) = tokio::sync::watch::channel(false);
+        let (offset_tx, offset_rx) = tokio::sync::watch::channel(TopicPartitionList::new());
         let data_ready = Arc::clone(&self.data_ready);
         let channel_len = Arc::clone(&self.channel_len);
 
-        // Offset commits are handled exclusively through the checkpoint path
-        // (self.offsets → checkpoint() → coordinator commit). The reader task
-        // does NOT auto-commit to avoid violating exactly-once semantics.
+        // The reader task owns the consumer. On shutdown it commits the latest
+        // offsets received via the offset_rx watch channel, then unsubscribes.
+        // During normal operation, offset commits are driven by the checkpoint
+        // coordinator which calls checkpoint() → sends offsets via offset_tx.
         let reader_handle = tokio::spawn(async move {
             let mut cached_topic: Arc<str> = Arc::from("");
             loop {
@@ -271,16 +246,32 @@ impl KafkaSource {
                 }
             }
 
+            // Commit final offsets before unsubscribing. The close() method
+            // sends the latest TPL via offset_tx before signaling shutdown,
+            // so offset_rx.borrow() contains the most recent offsets.
+            let tpl = offset_rx.borrow().clone();
+            if tpl.count() > 0 {
+                match consumer.commit(&tpl, CommitMode::Sync) {
+                    Ok(()) => info!(
+                        partitions = tpl.count(),
+                        "committed final offsets on shutdown"
+                    ),
+                    Err(e) => warn!(error = %e, "failed to commit final offsets on shutdown"),
+                }
+            }
+
             consumer.unsubscribe();
         });
 
         self.msg_rx = Some(msg_rx);
         self.reader_handle = Some(reader_handle);
         self.reader_shutdown = Some(shutdown_tx);
+        self.offset_commit_tx = Some(offset_tx);
     }
 }
 
 #[async_trait]
+#[allow(clippy::too_many_lines)] // poll_batch has legitimate complexity (backpressure + deser + poison pill fallback)
 impl SourceConnector for KafkaSource {
     async fn open(&mut self, config: &ConnectorConfig) -> Result<(), ConnectorError> {
         self.state = ConnectorState::Initializing;
@@ -439,7 +430,7 @@ impl SourceConnector for KafkaSource {
                     payload_buf.extend_from_slice(&kp.data);
                     payload_offsets.push((start, kp.data.len()));
 
-                    self.offsets.update(&kp.topic, kp.partition, kp.offset);
+                    self.offsets.update_arc(&kp.topic, kp.partition, kp.offset);
 
                     if last_topic.as_str() != &*kp.topic || last_partition_id != kp.partition {
                         last_topic = kp.topic.to_string();
@@ -489,10 +480,44 @@ impl SourceConnector for KafkaSource {
             .iter()
             .map(|&(start, len)| &payload_buf[start..start + len])
             .collect();
-        let batch = self
-            .deserializer
-            .deserialize_batch(&refs, &self.schema)
-            .map_err(ConnectorError::Serde)?;
+
+        // Try batch deserialization first (fast path). If it fails, fall back
+        // to per-record deserialization to isolate poison pills.
+        let batch = match self.deserializer.deserialize_batch(&refs, &self.schema) {
+            Ok(batch) => batch,
+            Err(batch_err) => {
+                // Per-record fallback: deserialize one at a time, skip failures.
+                let mut good_refs = Vec::with_capacity(refs.len());
+                let mut error_count = 0u64;
+                for r in &refs {
+                    match self
+                        .deserializer
+                        .deserialize_batch(std::slice::from_ref(r), &self.schema)
+                    {
+                        Ok(_) => good_refs.push(*r),
+                        Err(e) => {
+                            error_count += 1;
+                            self.metrics.record_error();
+                            warn!(error = %e, "skipping poison pill record");
+                        }
+                    }
+                }
+                if good_refs.is_empty() {
+                    // All records failed — propagate the original batch error.
+                    return Err(ConnectorError::Serde(batch_err));
+                }
+                if error_count > 0 {
+                    warn!(
+                        skipped = error_count,
+                        total = refs.len(),
+                        "deserialized batch with poison pill isolation"
+                    );
+                }
+                self.deserializer
+                    .deserialize_batch(&good_refs, &self.schema)
+                    .map_err(ConnectorError::Serde)?
+            }
+        };
 
         let num_rows = batch.num_rows();
         self.metrics.record_poll(num_rows as u64, total_bytes);
@@ -517,6 +542,12 @@ impl SourceConnector for KafkaSource {
     }
 
     fn checkpoint(&self) -> SourceCheckpoint {
+        // Push current offsets to the reader task so it can commit them on
+        // shutdown even if close() is called without a subsequent checkpoint.
+        if let Some(ref tx) = self.offset_commit_tx {
+            let tpl = self.offsets.to_topic_partition_list();
+            let _ = tx.send(tpl);
+        }
         self.offsets.to_checkpoint()
     }
 
@@ -574,7 +605,16 @@ impl SourceConnector for KafkaSource {
     async fn close(&mut self) -> Result<(), ConnectorError> {
         info!("closing Kafka source connector");
 
-        // Shut down the reader task (it handles final commit and unsubscribe).
+        // Send final offsets to the reader task before signaling shutdown.
+        // The reader task will commit these offsets before unsubscribing.
+        if let Some(ref tx) = self.offset_commit_tx {
+            if self.offsets.partition_count() > 0 {
+                let tpl = self.offsets.to_topic_partition_list();
+                let _ = tx.send(tpl);
+            }
+        }
+
+        // Signal shutdown and wait for the reader task to commit and exit.
         if let Some(tx) = self.reader_shutdown.take() {
             let _ = tx.send(true);
         }
@@ -582,13 +622,14 @@ impl SourceConnector for KafkaSource {
             let _ = tokio::time::timeout(std::time::Duration::from_secs(5), handle).await;
         }
         self.msg_rx = None;
+        self.offset_commit_tx = None;
 
-        // If consumer was never moved to the reader (no poll_batch called),
-        // do cleanup directly.
+        // If consumer was never moved to the reader (e.g., close() called
+        // before any poll_batch()), commit directly.
         if let Some(ref consumer) = self.consumer {
             if self.offsets.partition_count() > 0 {
                 let tpl = self.offsets.to_topic_partition_list();
-                if let Err(e) = consumer.commit(&tpl, rdkafka::consumer::CommitMode::Sync) {
+                if let Err(e) = consumer.commit(&tpl, CommitMode::Sync) {
                     warn!(error = %e, "failed to commit final offsets");
                 }
             }
@@ -614,12 +655,13 @@ impl std::fmt::Debug for KafkaSource {
     }
 }
 
-/// Selects the appropriate deserializer for the given format.
 fn select_deserializer(format: Format) -> Box<dyn RecordDeserializer> {
     match format {
         Format::Avro => Box::new(AvroDeserializer::new()),
-        other => serde::create_deserializer(other)
-            .expect("supported format should always create a deserializer"),
+        other => serde::create_deserializer(other).unwrap_or_else(|_| {
+            warn!(format = %other, "unsupported format, falling back to JSON");
+            Box::new(serde::json::JsonDeserializer::new())
+        }),
     }
 }
 
