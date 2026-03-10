@@ -111,17 +111,31 @@ impl OffsetTracker {
 
     /// Restores offset state from a [`SourceCheckpoint`].
     ///
-    /// Parses keys in `"{topic}-{partition}"` format.
+    /// Parses keys in `"{topic}-{partition}"` format. Logs warnings for
+    /// unparseable entries rather than silently dropping them.
     #[must_use]
     pub fn from_checkpoint(cp: &SourceCheckpoint) -> Self {
         let mut tracker = Self::new();
         for (key, value) in cp.offsets() {
-            if let Ok(offset) = value.parse::<i64>() {
-                if let Some(dash_pos) = key.rfind('-') {
-                    let topic = &key[..dash_pos];
-                    if let Ok(partition) = key[dash_pos + 1..].parse::<i32>() {
-                        tracker.update_force(topic, partition, offset);
+            match value.parse::<i64>() {
+                Ok(offset) => {
+                    if let Some(dash_pos) = key.rfind('-') {
+                        let topic = &key[..dash_pos];
+                        match key[dash_pos + 1..].parse::<i32>() {
+                            Ok(partition) => tracker.update_force(topic, partition, offset),
+                            Err(_) => {
+                                tracing::warn!(
+                                    key,
+                                    "skipping checkpoint entry with unparseable partition"
+                                );
+                            }
+                        }
+                    } else {
+                        tracing::warn!(key, "skipping checkpoint entry without topic-partition separator");
                     }
+                }
+                Err(_) => {
+                    tracing::warn!(key, value, "skipping checkpoint entry with unparseable offset");
                 }
             }
         }

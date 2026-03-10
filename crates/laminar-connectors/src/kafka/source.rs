@@ -28,7 +28,7 @@ use crate::serde::{self, Format, RecordDeserializer};
 
 use super::avro::AvroDeserializer;
 use super::backpressure::KafkaBackpressureController;
-use super::config::{KafkaSourceConfig, TopicSubscription};
+use super::config::{KafkaSourceConfig, StartupMode, TopicSubscription};
 use super::metrics::KafkaSourceMetrics;
 use super::offsets::OffsetTracker;
 use super::rebalance::RebalanceState;
@@ -40,6 +40,7 @@ struct KafkaPayload {
     topic: Arc<str>,
     partition: i32,
     offset: i64,
+    timestamp_ms: Option<i64>,
 }
 
 /// Kafka source connector that consumes messages and produces Arrow batches.
@@ -227,11 +228,17 @@ impl KafkaSource {
                             if &*cached_topic != topic {
                                 cached_topic = Arc::from(topic);
                             }
+                            let timestamp_ms = match msg.timestamp() {
+                                rdkafka::Timestamp::CreateTime(ts)
+                                | rdkafka::Timestamp::LogAppendTime(ts) => Some(ts),
+                                rdkafka::Timestamp::NotAvailable => None,
+                            };
                             let kp = KafkaPayload {
                                 data: payload.to_vec(),
                                 topic: Arc::clone(&cached_topic),
                                 partition: msg.partition(),
                                 offset: msg.offset(),
+                                timestamp_ms,
                             };
                             if msg_tx.send(kp).await.is_err() {
                                 break;
@@ -361,13 +368,94 @@ impl SourceConnector for KafkaSource {
             }
         }
 
+        // Apply startup mode positioning before starting the reader.
+        match &kafka_config.startup_mode {
+            // GroupOffsets/Earliest/Latest are handled via auto.offset.reset in to_rdkafka_config().
+            StartupMode::GroupOffsets | StartupMode::Earliest | StartupMode::Latest => {}
+            StartupMode::SpecificOffsets(offsets) => {
+                let mut tpl = rdkafka::TopicPartitionList::new();
+                let topics = match &kafka_config.subscription {
+                    TopicSubscription::Topics(t) => t.clone(),
+                    TopicSubscription::Pattern(_) => Vec::new(),
+                };
+                for topic in &topics {
+                    for (&partition, &offset) in offsets {
+                        tpl.add_partition_offset(
+                            topic,
+                            partition,
+                            rdkafka::Offset::Offset(offset),
+                        )
+                        .ok();
+                    }
+                }
+                if tpl.count() > 0 {
+                    consumer.assign(&tpl).map_err(|e| {
+                        ConnectorError::ConnectionFailed(format!(
+                            "failed to assign specific offsets: {e}"
+                        ))
+                    })?;
+                    info!(
+                        partitions = tpl.count(),
+                        "assigned consumer to specific offsets"
+                    );
+                }
+            }
+            StartupMode::Timestamp(ts_ms) => {
+                // rdkafka requires assignment before offsets_for_times.
+                // Wait briefly for partition assignment from the group coordinator,
+                // then seek each assigned partition to the target timestamp.
+                let mut tpl = rdkafka::TopicPartitionList::new();
+                let topics = match &kafka_config.subscription {
+                    TopicSubscription::Topics(t) => t.clone(),
+                    TopicSubscription::Pattern(_) => Vec::new(),
+                };
+                // Query metadata to discover partition count per topic.
+                if let Ok(metadata) = consumer.fetch_metadata(
+                    topics.first().map(String::as_str),
+                    std::time::Duration::from_secs(10),
+                ) {
+                    for topic_meta in metadata.topics() {
+                        for partition_meta in topic_meta.partitions() {
+                            tpl.add_partition_offset(
+                                topic_meta.name(),
+                                partition_meta.id(),
+                                rdkafka::Offset::Offset(*ts_ms),
+                            )
+                            .ok();
+                        }
+                    }
+                }
+                if tpl.count() > 0 {
+                    match consumer.offsets_for_times(tpl, std::time::Duration::from_secs(10)) {
+                        Ok(resolved) => {
+                            consumer.assign(&resolved).map_err(|e| {
+                                ConnectorError::ConnectionFailed(format!(
+                                    "failed to assign timestamp offsets: {e}"
+                                ))
+                            })?;
+                            info!(
+                                timestamp_ms = ts_ms,
+                                partitions = resolved.count(),
+                                "assigned consumer to timestamp offsets"
+                            );
+                        }
+                        Err(e) => {
+                            warn!(
+                                error = %e,
+                                timestamp_ms = ts_ms,
+                                "failed to resolve timestamp offsets, falling back to group offsets"
+                            );
+                        }
+                    }
+                }
+            }
+        }
+
         self.consumer = Some(consumer);
         self.state = ConnectorState::Running;
 
         // Start the background reader immediately so that `data_ready_notify()`
-        // has an active producer.  Without this, the source task deadlocks:
-        // it awaits `data_ready.notified()` but the reader (which fires that
-        // notification) would only be spawned lazily in `poll_batch()`.
+        // has an active producer.
         self.ensure_reader_started();
 
         info!("Kafka source connector opened successfully");
@@ -420,6 +508,23 @@ impl SourceConnector for KafkaSource {
         let mut last_topic = String::new();
         let mut last_partition_id: i32 = 0;
         let mut last_offset: i64 = -1;
+        // Metadata columns (only collected when include_metadata is true).
+        let include_metadata = self.config.include_metadata;
+        let mut meta_partitions: Vec<i32> = if include_metadata {
+            Vec::with_capacity(limit)
+        } else {
+            Vec::new()
+        };
+        let mut meta_offsets: Vec<i64> = if include_metadata {
+            Vec::with_capacity(limit)
+        } else {
+            Vec::new()
+        };
+        let mut meta_timestamps: Vec<Option<i64>> = if include_metadata {
+            Vec::with_capacity(limit)
+        } else {
+            Vec::new()
+        };
 
         while payload_offsets.len() < limit {
             match rx.try_recv() {
@@ -431,6 +536,12 @@ impl SourceConnector for KafkaSource {
                     payload_offsets.push((start, kp.data.len()));
 
                     self.offsets.update_arc(&kp.topic, kp.partition, kp.offset);
+
+                    if include_metadata {
+                        meta_partitions.push(kp.partition);
+                        meta_offsets.push(kp.offset);
+                        meta_timestamps.push(kp.timestamp_ms);
+                    }
 
                     if last_topic.as_str() != &*kp.topic || last_partition_id != kp.partition {
                         last_topic = kp.topic.to_string();
@@ -519,6 +630,31 @@ impl SourceConnector for KafkaSource {
             }
         };
 
+        // Append metadata columns if configured.
+        let batch = if include_metadata && !meta_partitions.is_empty() {
+            use arrow_array::{Int32Array, Int64Array};
+            use arrow_schema::{DataType, Field};
+
+            let mut fields = batch.schema().fields().to_vec();
+            let mut columns: Vec<Arc<dyn arrow_array::Array>> = batch.columns().to_vec();
+
+            fields.push(Arc::new(Field::new("_partition", DataType::Int32, false)));
+            columns.push(Arc::new(Int32Array::from(meta_partitions)));
+
+            fields.push(Arc::new(Field::new("_offset", DataType::Int64, false)));
+            columns.push(Arc::new(Int64Array::from(meta_offsets)));
+
+            fields.push(Arc::new(Field::new("_timestamp", DataType::Int64, true)));
+            columns.push(Arc::new(Int64Array::from(meta_timestamps)));
+
+            let meta_schema = Arc::new(arrow_schema::Schema::new(fields));
+            arrow_array::RecordBatch::try_new(meta_schema, columns).map_err(|e| {
+                ConnectorError::Internal(format!("failed to append metadata columns: {e}"))
+            })?
+        } else {
+            batch
+        };
+
         let num_rows = batch.num_rows();
         self.metrics.record_poll(num_rows as u64, total_bytes);
 
@@ -547,6 +683,7 @@ impl SourceConnector for KafkaSource {
         if let Some(ref tx) = self.offset_commit_tx {
             let tpl = self.offsets.to_topic_partition_list();
             let _ = tx.send(tpl);
+            self.metrics.record_commit();
         }
         self.offsets.to_checkpoint()
     }
