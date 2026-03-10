@@ -190,25 +190,25 @@ impl KafkaSink {
         }
     }
 
-    /// Returns the current connector state.
+    /// Lifecycle state (Created → Running → Closed).
     #[must_use]
     pub fn state(&self) -> ConnectorState {
         self.state
     }
 
-    /// Returns whether a Schema Registry client is configured.
+    /// Whether Avro schema registration is available.
     #[must_use]
     pub fn has_schema_registry(&self) -> bool {
         self.schema_registry.is_some()
     }
 
-    /// Returns the current epoch.
+    /// Active epoch (incremented by checkpoint coordinator).
     #[must_use]
     pub fn current_epoch(&self) -> u64 {
         self.current_epoch
     }
 
-    /// Returns the last committed epoch.
+    /// Last epoch that was successfully committed to Kafka.
     #[must_use]
     pub fn last_committed_epoch(&self) -> u64 {
         self.last_committed_epoch

@@ -25,7 +25,7 @@ pub struct OffsetTracker {
 }
 
 impl OffsetTracker {
-    /// Creates an empty offset tracker.
+    /// Offsets start empty; populated by `update()` / `from_checkpoint()`.
     #[must_use]
     pub fn new() -> Self {
         Self::default()

@@ -25,7 +25,7 @@ pub struct RebalanceState {
 }
 
 impl RebalanceState {
-    /// Creates a new empty rebalance state.
+    /// Starts with no partitions assigned.
     #[must_use]
     pub fn new() -> Self {
         Self::default()
@@ -89,7 +89,7 @@ pub struct LaminarConsumerContext {
 }
 
 impl LaminarConsumerContext {
-    /// Creates a new consumer context.
+    /// Wires checkpoint signaling, partition tracking, and rebalance metrics.
     #[must_use]
     pub fn new(
         checkpoint_requested: Arc<AtomicBool>,

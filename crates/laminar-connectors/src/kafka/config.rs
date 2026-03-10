@@ -463,8 +463,6 @@ pub struct KafkaSourceConfig {
     pub poll_timeout: Duration,
     /// Partition assignment strategy.
     pub partition_assignment_strategy: AssignmentStrategy,
-    /// How often to commit offsets to Kafka.
-    pub commit_interval: Duration,
     /// Minimum bytes to return from a fetch (allows batching).
     pub fetch_min_bytes: Option<i32>,
     /// Maximum bytes to return from broker per request.
@@ -549,7 +547,6 @@ impl Default for KafkaSourceConfig {
             max_poll_records: 1000,
             poll_timeout: Duration::from_millis(100),
             partition_assignment_strategy: AssignmentStrategy::Range,
-            commit_interval: Duration::from_secs(5),
             fetch_min_bytes: None,
             fetch_max_bytes: None,
             fetch_max_wait_ms: None,
@@ -695,10 +692,6 @@ impl KafkaSourceConfig {
             None => AssignmentStrategy::Range,
         };
 
-        let commit_interval_ms = config
-            .get_parsed::<u64>("commit.interval.ms")?
-            .unwrap_or(5000);
-
         let fetch_min_bytes = config.get_parsed::<i32>("fetch.min.bytes")?;
         let fetch_max_bytes = config.get_parsed::<i32>("fetch.max.bytes")?;
         let fetch_max_wait_ms = config.get_parsed::<i32>("fetch.max.wait.ms")?;
@@ -766,7 +759,6 @@ impl KafkaSourceConfig {
             max_poll_records,
             poll_timeout: Duration::from_millis(poll_timeout_ms),
             partition_assignment_strategy,
-            commit_interval: Duration::from_millis(commit_interval_ms),
             fetch_min_bytes,
             fetch_max_bytes,
             fetch_max_wait_ms,
@@ -1085,7 +1077,6 @@ mod tests {
         assert_eq!(cfg.max_poll_records, 1000);
         assert_eq!(cfg.poll_timeout, Duration::from_millis(100));
         assert_eq!(cfg.partition_assignment_strategy, AssignmentStrategy::Range);
-        assert_eq!(cfg.commit_interval, Duration::from_secs(5));
         assert!(!cfg.include_metadata);
         assert!(!cfg.include_headers);
         assert!(cfg.schema_registry_url.is_none());
@@ -1114,7 +1105,6 @@ mod tests {
         assert_eq!(cfg.isolation_level, IsolationLevel::ReadUncommitted);
         assert_eq!(cfg.max_poll_records, 500);
         assert_eq!(cfg.poll_timeout, Duration::from_millis(200));
-        assert_eq!(cfg.commit_interval, Duration::from_secs(10));
         assert!(cfg.include_metadata);
         assert!(cfg.include_headers);
         assert_eq!(cfg.event_time_column, Some("ts".to_string()));

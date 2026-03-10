@@ -192,13 +192,13 @@ impl KafkaSource {
         }
     }
 
-    /// Connector lifecycle state.
+    /// Lifecycle state (Created → Initializing → Running → Closed).
     #[must_use]
     pub fn state(&self) -> ConnectorState {
         self.state
     }
 
-    /// Per-partition offset tracker.
+    /// Per-topic-partition offset state for checkpoint and monitoring.
     #[must_use]
     pub fn offsets(&self) -> &OffsetTracker {
         &self.offsets

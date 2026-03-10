@@ -219,7 +219,6 @@ fn kafka_source_config_keys() -> Vec<ConfigKeySpec> {
         ),
         ConfigKeySpec::optional("max.poll.records", "Max records per poll", "1000"),
         ConfigKeySpec::optional("poll.timeout.ms", "Poll timeout in milliseconds", "100"),
-        ConfigKeySpec::optional("commit.interval.ms", "Offset commit interval", "5000"),
         ConfigKeySpec::optional(
             "partition.assignment.strategy",
             "Partition assignment (range/roundrobin/cooperative-sticky)",

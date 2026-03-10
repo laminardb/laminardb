@@ -26,7 +26,7 @@ pub struct KafkaSourceMetrics {
 }
 
 impl KafkaSourceMetrics {
-    /// Creates a new metrics instance with all counters at zero.
+    /// All counters start at zero.
     #[must_use]
     pub fn new() -> Self {
         Self {

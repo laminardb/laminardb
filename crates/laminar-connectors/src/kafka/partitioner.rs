@@ -29,7 +29,7 @@ pub trait KafkaPartitioner: Send + Sync {
 pub struct KeyHashPartitioner;
 
 impl KeyHashPartitioner {
-    /// Creates a new key-hash partitioner.
+    /// Uses Kafka-compatible Murmur2 hash on the key bytes.
     #[must_use]
     pub fn new() -> Self {
         Self
@@ -60,7 +60,7 @@ pub struct RoundRobinPartitioner {
 }
 
 impl RoundRobinPartitioner {
-    /// Creates a new round-robin partitioner.
+    /// Cycles through partitions sequentially, ignoring keys.
     #[must_use]
     pub fn new() -> Self {
         Self { counter: 0 }
