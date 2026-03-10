@@ -316,7 +316,7 @@ dependencies = [
  "arrow-schema",
  "arrow-select",
  "flatbuffers",
- "lz4_flex 0.12.0",
+ "lz4_flex",
  "zstd",
 ]
 
@@ -1935,19 +1935,6 @@ checksum = "d8d80a2f4f5b554395e47b5d8305bc3d27813bacb73493eb1001e8f76dae29ea"
 dependencies = [
  "cast",
  "itertools 0.13.0",
-]
-
-[[package]]
-name = "crossbeam"
-version = "0.8.4"
-source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "1137cd7e7fc0fb5d3c5a8678be38ec56e819125d8d7907411fe24ccb943faca8"
-dependencies = [
- "crossbeam-channel",
- "crossbeam-deque",
- "crossbeam-epoch",
- "crossbeam-queue",
- "crossbeam-utils",
 ]
 
 [[package]]
@@ -4697,7 +4684,6 @@ dependencies = [
  "cranelift-native",
  "crc32c",
  "criterion",
- "crossbeam",
  "datafusion-common",
  "datafusion-expr",
  "equivalent",
@@ -4852,10 +4838,9 @@ dependencies = [
  "crc32c",
  "criterion",
  "delta_kernel 0.20.0",
- "foyer",
  "futures",
  "laminar-core",
- "lz4_flex 0.11.5",
+ "lz4_flex",
  "object_store 0.13.1",
  "parquet",
  "rkyv",
@@ -5143,15 +5128,6 @@ checksum = "6bd8c0d6c6ed0cd30b3652886bb8711dc4bb01d637a68105a3d5158039b418e6"
 dependencies = [
  "cc",
  "libc",
-]
-
-[[package]]
-name = "lz4_flex"
-version = "0.11.5"
-source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "08ab2867e3eeeca90e844d1940eab391c9dc5228783db2ed999acbc0a9ed375a"
-dependencies = [
- "twox-hash",
 ]
 
 [[package]]
@@ -5951,7 +5927,7 @@ dependencies = [
  "futures",
  "half",
  "hashbrown 0.16.1",
- "lz4_flex 0.12.0",
+ "lz4_flex",
  "num-bigint",
  "num-integer",
  "num-traits",
