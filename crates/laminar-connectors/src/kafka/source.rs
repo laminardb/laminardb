@@ -41,6 +41,9 @@ struct KafkaPayload {
     partition: i32,
     offset: i64,
     timestamp_ms: Option<i64>,
+    /// Kafka message headers serialized as JSON string ("{key: value, ...}").
+    /// Only populated when `include_headers` is enabled.
+    headers_json: Option<String>,
 }
 
 /// Kafka source connector that consumes messages and produces Arrow batches.
@@ -207,11 +210,10 @@ impl KafkaSource {
         let (offset_tx, offset_rx) = tokio::sync::watch::channel(TopicPartitionList::new());
         let data_ready = Arc::clone(&self.data_ready);
         let channel_len = Arc::clone(&self.channel_len);
+        let capture_headers = self.config.include_headers;
 
         // The reader task owns the consumer. On shutdown it commits the latest
         // offsets received via the offset_rx watch channel, then unsubscribes.
-        // During normal operation, offset commits are driven by the checkpoint
-        // coordinator which calls checkpoint() → sends offsets via offset_tx.
         let reader_handle = tokio::spawn(async move {
             let mut cached_topic: Arc<str> = Arc::from("");
             loop {
@@ -223,7 +225,6 @@ impl KafkaSource {
                 match msg_result {
                     Ok(msg) => {
                         if let Some(payload) = msg.payload() {
-                            // Cache topic as Arc<str> — only allocates when topic changes.
                             let topic = msg.topic();
                             if &*cached_topic != topic {
                                 cached_topic = Arc::from(topic);
@@ -233,12 +234,38 @@ impl KafkaSource {
                                 | rdkafka::Timestamp::LogAppendTime(ts) => Some(ts),
                                 rdkafka::Timestamp::NotAvailable => None,
                             };
+                            let headers_json = if capture_headers {
+                                use rdkafka::message::Headers;
+                                msg.headers().map(|hdrs| {
+                                    let mut json = String::from('{');
+                                    for i in 0..hdrs.count() {
+                                        let header = hdrs.get(i);
+                                        if i > 0 {
+                                            json.push(',');
+                                        }
+                                        json.push('"');
+                                        json.push_str(header.key);
+                                        json.push_str("\":\"");
+                                        if let Some(val) = header.value {
+                                            json.push_str(
+                                                &String::from_utf8_lossy(val),
+                                            );
+                                        }
+                                        json.push('"');
+                                    }
+                                    json.push('}');
+                                    json
+                                })
+                            } else {
+                                None
+                            };
                             let kp = KafkaPayload {
                                 data: payload.to_vec(),
                                 topic: Arc::clone(&cached_topic),
                                 partition: msg.partition(),
                                 offset: msg.offset(),
                                 timestamp_ms,
+                                headers_json,
                             };
                             if msg_tx.send(kp).await.is_err() {
                                 break;
@@ -295,10 +322,14 @@ impl SourceConnector for KafkaSource {
         // Re-select deserializer (factory defaults to JSON).
         if let Some(ref sr_url) = kafka_config.schema_registry_url {
             let sr_client = if let Some(ref ca) = kafka_config.schema_registry_ssl_ca_location {
-                SchemaRegistryClient::with_tls(
+                SchemaRegistryClient::with_tls_mtls(
                     sr_url.clone(),
                     kafka_config.schema_registry_auth.clone(),
                     ca,
+                    kafka_config
+                        .schema_registry_ssl_certificate_location
+                        .as_deref(),
+                    kafka_config.schema_registry_ssl_key_location.as_deref(),
                 )?
             } else {
                 SchemaRegistryClient::new(sr_url.clone(), kafka_config.schema_registry_auth.clone())
@@ -510,6 +541,7 @@ impl SourceConnector for KafkaSource {
         let mut last_offset: i64 = -1;
         // Metadata columns (only collected when include_metadata is true).
         let include_metadata = self.config.include_metadata;
+        let include_headers = self.config.include_headers;
         let mut meta_partitions: Vec<i32> = if include_metadata {
             Vec::with_capacity(limit)
         } else {
@@ -521,6 +553,11 @@ impl SourceConnector for KafkaSource {
             Vec::new()
         };
         let mut meta_timestamps: Vec<Option<i64>> = if include_metadata {
+            Vec::with_capacity(limit)
+        } else {
+            Vec::new()
+        };
+        let mut meta_headers: Vec<Option<String>> = if include_headers {
             Vec::with_capacity(limit)
         } else {
             Vec::new()
@@ -541,6 +578,9 @@ impl SourceConnector for KafkaSource {
                         meta_partitions.push(kp.partition);
                         meta_offsets.push(kp.offset);
                         meta_timestamps.push(kp.timestamp_ms);
+                    }
+                    if include_headers {
+                        meta_headers.push(kp.headers_json);
                     }
 
                     if last_topic.as_str() != &*kp.topic || last_partition_id != kp.partition {
@@ -646,6 +686,11 @@ impl SourceConnector for KafkaSource {
 
             fields.push(Arc::new(Field::new("_timestamp", DataType::Int64, true)));
             columns.push(Arc::new(Int64Array::from(meta_timestamps)));
+
+            if include_headers && !meta_headers.is_empty() {
+                fields.push(Arc::new(Field::new("_headers", DataType::Utf8, true)));
+                columns.push(Arc::new(arrow_array::StringArray::from(meta_headers)));
+            }
 
             let meta_schema = Arc::new(arrow_schema::Schema::new(fields));
             arrow_array::RecordBatch::try_new(meta_schema, columns).map_err(|e| {

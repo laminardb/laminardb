@@ -188,10 +188,27 @@ impl SchemaRegistryClient {
     ///
     /// Returns `ConnectorError::ConfigurationError` if the CA cert file
     /// cannot be read or parsed.
+    /// Creates a client with TLS (CA cert + optional mTLS client cert/key).
     pub fn with_tls(
         base_url: impl Into<String>,
         auth: Option<SrAuth>,
         ca_cert_path: &str,
+    ) -> Result<Self, ConnectorError> {
+        Self::with_tls_mtls(base_url, auth, ca_cert_path, None, None)
+    }
+
+    /// Creates a client with full TLS/mTLS support.
+    ///
+    /// # Errors
+    ///
+    /// Returns `ConnectorError::ConfigurationError` if any cert/key file
+    /// cannot be read or parsed.
+    pub fn with_tls_mtls(
+        base_url: impl Into<String>,
+        auth: Option<SrAuth>,
+        ca_cert_path: &str,
+        client_cert_path: Option<&str>,
+        client_key_path: Option<&str>,
     ) -> Result<Self, ConnectorError> {
         let pem = std::fs::read(ca_cert_path).map_err(|e| {
             ConnectorError::ConfigurationError(format!(
@@ -203,12 +220,34 @@ impl SchemaRegistryClient {
                 "invalid PEM CA cert at '{ca_cert_path}': {e}"
             ))
         })?;
-        let client = Client::builder()
-            .add_root_certificate(cert)
-            .build()
-            .map_err(|e| {
-                ConnectorError::ConfigurationError(format!("failed to build TLS client: {e}"))
+
+        let mut builder = Client::builder().add_root_certificate(cert);
+
+        // mTLS: client certificate + private key for mutual authentication.
+        if let (Some(cert_path), Some(key_path)) = (client_cert_path, client_key_path) {
+            let mut identity_pem = std::fs::read(cert_path).map_err(|e| {
+                ConnectorError::ConfigurationError(format!(
+                    "failed to read SR client cert at '{cert_path}': {e}"
+                ))
             })?;
+            let key_pem = std::fs::read(key_path).map_err(|e| {
+                ConnectorError::ConfigurationError(format!(
+                    "failed to read SR client key at '{key_path}': {e}"
+                ))
+            })?;
+            // reqwest Identity expects cert + key concatenated in PEM format.
+            identity_pem.extend_from_slice(&key_pem);
+            let identity = reqwest::tls::Identity::from_pem(&identity_pem).map_err(|e| {
+                ConnectorError::ConfigurationError(format!(
+                    "invalid client cert/key PEM: {e}"
+                ))
+            })?;
+            builder = builder.identity(identity);
+        }
+
+        let client = builder.build().map_err(|e| {
+            ConnectorError::ConfigurationError(format!("failed to build TLS client: {e}"))
+        })?;
 
         let cache_config = SchemaRegistryCacheConfig::default();
         let cache = CacheBuilder::new(cache_config.max_entries)
