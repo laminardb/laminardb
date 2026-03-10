@@ -770,8 +770,6 @@ impl LaminarDB {
         let checkpoint_in_progress = Arc::new(std::sync::atomic::AtomicBool::new(false));
         let coordinator = Arc::clone(&self.coordinator);
         let table_store_for_loop = self.table_store.clone();
-        let ctx_for_sync = self.ctx.clone();
-
         // Compute a pipeline hash for change detection across checkpoints.
         let pipeline_hash = {
             use std::hash::{Hash, Hasher};
@@ -804,7 +802,6 @@ impl LaminarDB {
             table_sources,
             table_store: table_store_for_loop,
             lookup_registry: Arc::clone(&self.lookup_registry),
-            ctx: ctx_for_sync,
             filter_ctx: laminar_sql::create_session_context(),
             last_checkpoint: std::time::Instant::now(),
             checkpoint_interval: self

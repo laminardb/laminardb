@@ -53,7 +53,6 @@ pub(crate) struct ConnectorPipelineCallback {
     )>,
     pub(crate) table_store: Arc<parking_lot::RwLock<crate::table_store::TableStore>>,
     pub(crate) lookup_registry: Arc<laminar_sql::datafusion::LookupTableRegistry>,
-    pub(crate) ctx: SessionContext,
     /// Cached `SessionContext` for sink WHERE filters (avoids per-batch allocation).
     pub(crate) filter_ctx: SessionContext,
     pub(crate) last_checkpoint: std::time::Instant,
@@ -575,26 +574,17 @@ impl crate::pipeline::PipelineCallback for ConnectorPipelineCallback {
                                 ts.to_record_batch(name)
                             }
                         };
+                        // Update lookup registry for join operators.
+                        // DataFusion table registration is NOT needed here — all
+                        // tables use ReferenceTableProvider which reads live data.
                         if let Some(rb) = maybe_batch {
                             self.lookup_registry.register(
                                 name,
                                 laminar_sql::datafusion::LookupSnapshot {
-                                    batch: rb.clone(),
+                                    batch: rb,
                                     key_columns: vec![],
                                 },
                             );
-                            let schema = rb.schema();
-                            let _ = self.ctx.deregister_table(name.as_str());
-                            let data = if rb.num_rows() > 0 {
-                                vec![vec![rb]]
-                            } else {
-                                vec![vec![]]
-                            };
-                            if let Ok(mem_table) =
-                                datafusion::datasource::MemTable::try_new(schema, data)
-                            {
-                                let _ = self.ctx.register_table(name.as_str(), Arc::new(mem_table));
-                            }
                         }
                     }
                 }

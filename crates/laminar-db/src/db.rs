@@ -1067,7 +1067,21 @@ impl LaminarDB {
                 }
 
                 // Register in DataFusion for SELECT/JOIN queries
-                self.sync_table_to_datafusion(&info.name)?;
+                {
+                    let provider = crate::table_provider::ReferenceTableProvider::new(
+                        info.name.clone(),
+                        info.arrow_schema.clone(),
+                        self.table_store.clone(),
+                    );
+                    let _ = self.ctx.deregister_table(&info.name);
+                    self.ctx
+                        .register_table(&info.name, Arc::new(provider))
+                        .map_err(|e| {
+                            DbError::InvalidOperation(format!(
+                                "Failed to register lookup table: {e}"
+                            ))
+                        })?;
+                }
 
                 // Register snapshot in the lookup registry so the physical
                 // planner can build LookupJoinExec nodes for JOIN queries.
