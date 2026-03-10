@@ -27,7 +27,7 @@ use crate::table_store::TableStore;
 pub(crate) struct ReferenceTableProvider {
     table_name: String,
     schema: SchemaRef,
-    table_store: Arc<parking_lot::Mutex<TableStore>>,
+    table_store: Arc<parking_lot::RwLock<TableStore>>,
 }
 
 impl ReferenceTableProvider {
@@ -35,7 +35,7 @@ impl ReferenceTableProvider {
     pub fn new(
         table_name: String,
         schema: SchemaRef,
-        table_store: Arc<parking_lot::Mutex<TableStore>>,
+        table_store: Arc<parking_lot::RwLock<TableStore>>,
     ) -> Self {
         Self {
             table_name,
@@ -68,7 +68,7 @@ impl TableProvider for ReferenceTableProvider {
     ) -> Result<Arc<dyn ExecutionPlan>, DataFusionError> {
         let batch = self
             .table_store
-            .lock()
+            .read()
             .to_record_batch(&self.table_name)
             .unwrap_or_else(|| arrow::array::RecordBatch::new_empty(self.schema.clone()));
 
@@ -202,23 +202,23 @@ mod tests {
 
     #[test]
     fn test_provider_schema() {
-        let ts = Arc::new(parking_lot::Mutex::new(TableStore::new()));
+        let ts = Arc::new(parking_lot::RwLock::new(TableStore::new()));
         let provider = ReferenceTableProvider::new("test".to_string(), test_schema(), ts);
         assert_eq!(provider.schema(), test_schema());
     }
 
     #[test]
     fn test_provider_table_type() {
-        let ts = Arc::new(parking_lot::Mutex::new(TableStore::new()));
+        let ts = Arc::new(parking_lot::RwLock::new(TableStore::new()));
         let provider = ReferenceTableProvider::new("test".to_string(), test_schema(), ts);
         assert_eq!(provider.table_type(), TableType::Base);
     }
 
     #[tokio::test]
     async fn test_provider_scan_empty() {
-        let ts = Arc::new(parking_lot::Mutex::new(TableStore::new()));
+        let ts = Arc::new(parking_lot::RwLock::new(TableStore::new()));
         {
-            let mut store = ts.lock();
+            let mut store = ts.write();
             store.create_table("test", test_schema(), "id").unwrap();
         }
 
@@ -234,9 +234,9 @@ mod tests {
 
     #[tokio::test]
     async fn test_provider_scan_with_data() {
-        let ts = Arc::new(parking_lot::Mutex::new(TableStore::new()));
+        let ts = Arc::new(parking_lot::RwLock::new(TableStore::new()));
         {
-            let mut store = ts.lock();
+            let mut store = ts.write();
             store.create_table("test", test_schema(), "id").unwrap();
             store
                 .upsert("test", &make_batch(&[1, 2], &["A", "B"], &[1.0, 2.0]))
@@ -255,9 +255,9 @@ mod tests {
 
     #[tokio::test]
     async fn test_provider_reads_live_data() {
-        let ts = Arc::new(parking_lot::Mutex::new(TableStore::new()));
+        let ts = Arc::new(parking_lot::RwLock::new(TableStore::new()));
         {
-            let mut store = ts.lock();
+            let mut store = ts.write();
             store.create_table("test", test_schema(), "id").unwrap();
         }
 
@@ -277,7 +277,7 @@ mod tests {
 
         // Insert data
         {
-            let mut store = ts.lock();
+            let mut store = ts.write();
             store
                 .upsert("test", &make_batch(&[1], &["A"], &[1.0]))
                 .unwrap();
@@ -296,7 +296,7 @@ mod tests {
 
     #[test]
     fn test_provider_debug() {
-        let ts = Arc::new(parking_lot::Mutex::new(TableStore::new()));
+        let ts = Arc::new(parking_lot::RwLock::new(TableStore::new()));
         let provider = ReferenceTableProvider::new("test".to_string(), test_schema(), ts);
         let debug = format!("{provider:?}");
         assert!(debug.contains("ReferenceTableProvider"));

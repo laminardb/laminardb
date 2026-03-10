@@ -76,7 +76,7 @@ pub struct LaminarDB {
     pub(crate) connector_manager: parking_lot::Mutex<crate::connector_manager::ConnectorManager>,
     pub(crate) connector_registry: Arc<laminar_connectors::registry::ConnectorRegistry>,
     pub(crate) mv_registry: parking_lot::Mutex<laminar_core::mv::MvRegistry>,
-    pub(crate) table_store: Arc<parking_lot::Mutex<crate::table_store::TableStore>>,
+    pub(crate) table_store: Arc<parking_lot::RwLock<crate::table_store::TableStore>>,
     pub(crate) state: std::sync::atomic::AtomicU8,
     /// Handle to the background processing task (if running).
     pub(crate) runtime_handle: parking_lot::Mutex<Option<tokio::task::JoinHandle<()>>>,
@@ -237,7 +237,7 @@ impl LaminarDB {
             ),
             connector_registry,
             mv_registry: parking_lot::Mutex::new(laminar_core::mv::MvRegistry::new()),
-            table_store: Arc::new(parking_lot::Mutex::new(
+            table_store: Arc::new(parking_lot::RwLock::new(
                 crate::table_store::TableStore::new(),
             )),
             state: std::sync::atomic::AtomicU8::new(STATE_CREATED),
@@ -610,7 +610,7 @@ impl LaminarDB {
         // Try inserting into a TableStore-managed table (with PK upsert).
         // Single lock scope avoids TOCTOU race between has_table/schema/upsert.
         {
-            let mut ts = self.table_store.lock();
+            let mut ts = self.table_store.write();
             if ts.has_table(&name) {
                 let schema = ts
                     .table_schema(&name)
@@ -982,14 +982,14 @@ impl LaminarDB {
                     crate::table_cache_mode::TableCacheMode::Partial { max_entries }
                 });
                 if let Some(cache) = cache_mode {
-                    self.table_store.lock().create_table_with_cache(
+                    self.table_store.write().create_table_with_cache(
                         &info.name,
                         info.arrow_schema.clone(),
                         &pk,
                         cache,
                     )?;
                 } else {
-                    self.table_store.lock().create_table(
+                    self.table_store.write().create_table(
                         &info.name,
                         info.arrow_schema.clone(),
                         &pk,
@@ -1009,7 +1009,7 @@ impl LaminarDB {
                     };
 
                     self.table_store
-                        .lock()
+                        .write()
                         .set_connector(&info.name, connector_type_str);
 
                     let refresh = match info.properties.strategy {
@@ -1071,7 +1071,7 @@ impl LaminarDB {
 
                 // Register snapshot in the lookup registry so the physical
                 // planner can build LookupJoinExec nodes for JOIN queries.
-                if let Some(batch) = self.table_store.lock().to_record_batch(&info.name) {
+                if let Some(batch) = self.table_store.read().to_record_batch(&info.name) {
                     self.lookup_registry.register(
                         &info.name,
                         laminar_sql::datafusion::LookupSnapshot {
@@ -1091,7 +1091,7 @@ impl LaminarDB {
                 }))
             }
             laminar_sql::planner::StreamingPlan::DropLookupTable { name } => {
-                self.table_store.lock().drop_table(&name);
+                self.table_store.write().drop_table(&name);
                 self.connector_manager.lock().unregister_table(&name);
                 let _ = self.ctx.deregister_table(&name);
                 self.lookup_registry.unregister(&name);
@@ -2704,7 +2704,7 @@ mod tests {
         }
 
         // Verify TableStore registration
-        let ts = db.table_store.lock();
+        let ts = db.table_store.read();
         assert!(ts.has_table("instruments"));
         assert_eq!(ts.primary_key("instruments"), Some("symbol"));
         assert_eq!(ts.table_row_count("instruments"), 0);
@@ -2739,7 +2739,7 @@ mod tests {
         assert_eq!(reg.primary_key, "symbol");
 
         // Verify TableStore connector
-        let ts = db.table_store.lock();
+        let ts = db.table_store.read();
         assert_eq!(ts.connector("instruments"), Some("kafka"));
     }
 
@@ -2760,19 +2760,19 @@ mod tests {
         db.execute("INSERT INTO products VALUES (1, 'Widget', 9.99)")
             .await
             .unwrap();
-        assert_eq!(db.table_store.lock().table_row_count("products"), 1);
+        assert_eq!(db.table_store.read().table_row_count("products"), 1);
 
         // Upsert (same PK = overwrite)
         db.execute("INSERT INTO products VALUES (1, 'Super Widget', 19.99)")
             .await
             .unwrap();
-        assert_eq!(db.table_store.lock().table_row_count("products"), 1);
+        assert_eq!(db.table_store.read().table_row_count("products"), 1);
 
         // Insert another row (different PK)
         db.execute("INSERT INTO products VALUES (2, 'Gadget', 14.99)")
             .await
             .unwrap();
-        assert_eq!(db.table_store.lock().table_row_count("products"), 2);
+        assert_eq!(db.table_store.read().table_row_count("products"), 2);
 
         // Verify via SELECT
         let result = db.execute("SELECT * FROM products").await.unwrap();
@@ -2821,10 +2821,10 @@ mod tests {
         db.execute("CREATE TABLE t (id INT PRIMARY KEY, val VARCHAR)")
             .await
             .unwrap();
-        assert!(db.table_store.lock().has_table("t"));
+        assert!(db.table_store.read().has_table("t"));
 
         db.execute("DROP TABLE t").await.unwrap();
-        assert!(!db.table_store.lock().has_table("t"));
+        assert!(!db.table_store.read().has_table("t"));
     }
 
     #[tokio::test]
@@ -3329,7 +3329,7 @@ mod tests {
         db.start().await.unwrap();
 
         // Table should be populated by snapshot
-        let ts = db.table_store.lock();
+        let ts = db.table_store.read();
         assert!(ts.is_ready("instruments"));
         assert_eq!(ts.table_row_count("instruments"), 2);
     }
@@ -3354,7 +3354,7 @@ mod tests {
         db.start().await.unwrap();
 
         // Manual mode: table stays empty
-        let ts = db.table_store.lock();
+        let ts = db.table_store.read();
         assert!(!ts.is_ready("instruments"));
         assert_eq!(ts.table_row_count("instruments"), 0);
     }
@@ -3415,7 +3415,7 @@ mod tests {
 
         db.start().await.unwrap();
 
-        let ts = db.table_store.lock();
+        let ts = db.table_store.read();
         // Both tables should be snapshot-populated (order may vary)
         let total = ts.table_row_count("t1") + ts.table_row_count("t2");
         assert_eq!(total, 3); // 1 + 2
@@ -3464,7 +3464,7 @@ mod tests {
         db.start().await.unwrap();
 
         // Should have snapshot data but not the change batch (it's snapshot_only)
-        let mut ts = db.table_store.lock();
+        let mut ts = db.table_store.write();
         assert!(ts.is_ready("instruments"));
         assert_eq!(ts.table_row_count("instruments"), 1);
         // The change batch id=2/GOOG should NOT be present
@@ -3487,7 +3487,7 @@ mod tests {
 
         // Verify table exists
         {
-            let ts = db.table_store.lock();
+            let ts = db.table_store.read();
             assert!(ts.has_table("large_dim"));
             // Cache metrics should exist for partial-mode tables
         }
@@ -3500,7 +3500,7 @@ mod tests {
             .await
             .unwrap();
 
-        let ts = db.table_store.lock();
+        let ts = db.table_store.read();
         assert_eq!(ts.table_row_count("large_dim"), 2);
     }
 
@@ -3516,7 +3516,7 @@ mod tests {
         .await
         .unwrap();
 
-        let ts = db.table_store.lock();
+        let ts = db.table_store.read();
         assert!(ts.has_table("customers"));
         // Verify the cache metrics report the correct max_entries
         let metrics = ts.cache_metrics("customers").unwrap();

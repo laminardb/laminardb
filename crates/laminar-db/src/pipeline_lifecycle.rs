@@ -291,7 +291,7 @@ impl LaminarDB {
                 // with the correct schema from the catalog (not Schema::empty).
                 let initial_batch = self
                     .table_store
-                    .lock()
+                    .read()
                     .to_record_batch(&tcfg.table_name)
                     .or_else(|| {
                         self.catalog
@@ -597,13 +597,13 @@ impl LaminarDB {
                 .map_err(|e| DbError::Connector(format!("Table '{name}' snapshot error: {e}")))?
             {
                 self.table_store
-                    .lock()
+                    .write()
                     .upsert(name, &batch)
                     .map_err(|e| DbError::Connector(format!("Table '{name}' upsert error: {e}")))?;
             }
             self.sync_table_to_datafusion(name)?;
             {
-                let mut ts = self.table_store.lock();
+                let mut ts = self.table_store.write();
                 ts.rebuild_xor_filter(name);
                 ts.set_ready(name, true);
             }
@@ -615,7 +615,7 @@ impl LaminarDB {
                 Some(laminar_sql::datafusion::RegisteredLookup::Versioned(_))
             ) {
                 // Already versioned — don't downgrade to Snapshot.
-            } else if let Some(batch) = self.table_store.lock().to_record_batch(name) {
+            } else if let Some(batch) = self.table_store.read().to_record_batch(name) {
                 self.lookup_registry.register(
                     name,
                     laminar_sql::datafusion::LookupSnapshot {

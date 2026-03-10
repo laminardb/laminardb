@@ -275,7 +275,7 @@ impl LaminarDB {
 
     /// Build a SHOW TABLES metadata result.
     pub(crate) fn build_show_tables(&self) -> RecordBatch {
-        let ts = self.table_store.lock();
+        let ts = self.table_store.read();
         let mut names = Vec::new();
         let mut pks = Vec::new();
         let mut row_counts = Vec::new();
@@ -321,7 +321,7 @@ impl LaminarDB {
         let schema = if let Some(s) = self.catalog.describe_source(name) {
             s
         // Then reference/dimension tables
-        } else if let Some(s) = self.table_store.lock().table_schema(name) {
+        } else if let Some(s) = self.table_store.read().table_schema(name) {
             s
         // Then materialized views
         } else if let Some(s) = self

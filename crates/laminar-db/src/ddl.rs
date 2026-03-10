@@ -396,10 +396,10 @@ impl LaminarDB {
                     "storage = 'persistent' is no longer supported; use in-memory tables with foyer caching instead".to_string(),
                 ));
             } else if resolved_cache_mode.is_some() {
-                let mut ts = self.table_store.lock();
+                let mut ts = self.table_store.write();
                 ts.create_table_with_cache(&name, schema.clone(), pk, cache)?;
             } else {
-                let mut ts = self.table_store.lock();
+                let mut ts = self.table_store.write();
                 ts.create_table(&name, schema.clone(), pk)?;
             }
         }
@@ -408,7 +408,7 @@ impl LaminarDB {
         if connector_type.is_some() || !connector_options.is_empty() {
             if let Some(ref pk) = primary_key {
                 if let Some(ref ct) = connector_type {
-                    let mut ts = self.table_store.lock();
+                    let mut ts = self.table_store.write();
                     ts.set_connector(&name, ct);
                 }
 
@@ -953,7 +953,7 @@ impl LaminarDB {
             let name_str = obj_name.to_string();
 
             // Remove from TableStore
-            self.table_store.lock().drop_table(&name_str);
+            self.table_store.write().drop_table(&name_str);
 
             // Remove from ConnectorManager
             self.connector_manager.lock().unregister_table(&name_str);
@@ -990,13 +990,13 @@ impl LaminarDB {
     pub(crate) fn sync_table_to_datafusion(&self, name: &str) -> Result<(), DbError> {
         // Persistent tables use ReferenceTableProvider which reads live data —
         // no need to deregister/re-register.
-        if self.table_store.lock().is_persistent(name) {
+        if self.table_store.read().is_persistent(name) {
             return Ok(());
         }
 
         let batch = self
             .table_store
-            .lock()
+            .read()
             .to_record_batch(name)
             .ok_or_else(|| DbError::TableNotFound(name.to_string()))?;
 

@@ -51,7 +51,7 @@ pub(crate) struct ConnectorPipelineCallback {
         Box<dyn laminar_connectors::reference::ReferenceTableSource>,
         laminar_connectors::reference::RefreshMode,
     )>,
-    pub(crate) table_store: Arc<parking_lot::Mutex<crate::table_store::TableStore>>,
+    pub(crate) table_store: Arc<parking_lot::RwLock<crate::table_store::TableStore>>,
     pub(crate) lookup_registry: Arc<laminar_sql::datafusion::LookupTableRegistry>,
     pub(crate) ctx: SessionContext,
     /// Cached `SessionContext` for sink WHERE filters (avoids per-batch allocation).
@@ -484,7 +484,7 @@ impl crate::pipeline::PipelineCallback for ConnectorPipelineCallback {
                     ) = &entry
                     {
                         update_partial_cache_from_batch(partial, &batch);
-                        let mut ts = self.table_store.lock();
+                        let mut ts = self.table_store.write();
                         if let Err(e) = ts.upsert_and_rebuild(name, &batch) {
                             tracing::warn!(table=%name, error=%e, "Table upsert error (partial)");
                         }
@@ -559,13 +559,13 @@ impl crate::pipeline::PipelineCallback for ConnectorPipelineCallback {
                                 stream_time_column: versioned.stream_time_column.clone(),
                             },
                         );
-                        let mut ts = self.table_store.lock();
+                        let mut ts = self.table_store.write();
                         if let Err(e) = ts.upsert_and_rebuild(name, &batch) {
                             tracing::warn!(table=%name, error=%e, "Table upsert error (versioned)");
                         }
                     } else {
                         let maybe_batch = {
-                            let mut ts = self.table_store.lock();
+                            let mut ts = self.table_store.write();
                             if let Err(e) = ts.upsert_and_rebuild(name, &batch) {
                                 tracing::warn!(table=%name, error=%e, "Table upsert error");
                                 None
