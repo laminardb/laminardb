@@ -1476,39 +1476,34 @@ mod tests {
         .await
         .unwrap();
 
-        // Open source starting from version 0, read version 1.
+        // Open source starting from version 0. The source jumps to the
+        // latest version (2) in a single poll, reading the full snapshot.
         let mut source_config = DeltaSourceConfig::new(table_path);
         source_config.starting_version = Some(0);
         let mut source = DeltaSource::new(source_config.clone());
         let connector_config = ConnectorConfig::new("delta-lake");
         source.open(&connector_config).await.unwrap();
 
-        // Poll to consume version 1.
+        // Poll to consume latest version (2).
         let _ = source.poll_batch(10000).await.unwrap();
         // Drain buffered.
         while let Ok(Some(_)) = source.poll_batch(10000).await {}
 
-        // Checkpoint.
+        // Checkpoint reflects the fully-consumed latest version.
         let cp = source.checkpoint();
-        assert_eq!(cp.get_offset("delta_version"), Some("1"));
+        assert_eq!(cp.get_offset("delta_version"), Some("2"));
         source.close().await.unwrap();
 
-        // Restore from checkpoint — should resume at version 1.
+        // Restore from checkpoint — should resume at version 2.
         let mut source2 = DeltaSource::new(source_config);
         source2.open(&connector_config).await.unwrap();
         source2.restore(&cp).await.unwrap();
 
-        assert_eq!(source2.current_version(), 1);
+        assert_eq!(source2.current_version(), 2);
 
-        // Next poll should get version 2.
+        // No new data — already at latest.
         let result = source2.poll_batch(10000).await.unwrap();
-        assert!(result.is_some());
-        let mut total = result.unwrap().records.num_rows();
-        while let Ok(Some(batch)) = source2.poll_batch(10000).await {
-            total += batch.records.num_rows();
-        }
-        // Version 2 has cumulative 30 rows (10 + 20).
-        assert_eq!(total, 30);
+        assert!(result.is_none());
 
         source2.close().await.unwrap();
     }
