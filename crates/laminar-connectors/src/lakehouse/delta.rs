@@ -1246,8 +1246,8 @@ mod tests {
         assert_eq!(sink.pending_files, 0);
     }
 
-    /// D001: Rollback after pre_commit must discard staged data.
-    /// pre_commit stages batches; rollback discards them without writing to Delta.
+    /// D001: Rollback after `pre_commit` must discard staged data.
+    /// `pre_commit` stages batches; rollback discards them without writing to Delta.
     #[tokio::test]
     async fn test_rollback_after_pre_commit_discards_staged() {
         let mut config = test_config();
@@ -1275,8 +1275,8 @@ mod tests {
         assert_eq!(sink.delta_version(), 0); // no Delta write occurred
     }
 
-    /// Staged data is preserved across pre_commit → failed commit → rollback.
-    /// This verifies that pre_commit does not destroy staged state, so a
+    /// Staged data is preserved across `pre_commit` → failed commit → rollback.
+    /// This verifies that `pre_commit` does not destroy staged state, so a
     /// subsequent rollback can discard it cleanly.
     #[tokio::test]
     async fn test_staged_data_preserved_until_commit_or_rollback() {

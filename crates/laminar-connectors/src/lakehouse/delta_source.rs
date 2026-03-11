@@ -511,7 +511,7 @@ mod tests {
     }
 
     /// Version is only advanced after the inflight buffer is fully drained.
-    /// With multiple buffered batches, current_version stays at the old value
+    /// With multiple buffered batches, `current_version` stays at the old value
     /// until the last batch is consumed, then jumps to the target version.
     #[tokio::test]
     async fn test_version_deferred_until_buffer_drained() {
@@ -544,7 +544,7 @@ mod tests {
         assert_eq!(source.records_read, 30);
     }
 
-    /// D004: poll_interval is parsed and stored in config.
+    /// D004: `poll_interval` is parsed and stored in config.
     /// The field is used by the delta-lake feature to throttle version checks.
     #[test]
     fn test_poll_interval_is_stored() {
