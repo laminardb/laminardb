@@ -180,6 +180,9 @@ pub struct CoreRingManager {
     metrics: RingMetrics,
     /// Whether the ring is closed.
     closed: bool,
+    /// Pre-allocated scratch buffer for CQE data collection.
+    /// Avoids per-poll allocation in [`poll_completions_into`].
+    cqe_scratch: Vec<(u64, i32, u32)>,
 }
 
 impl CoreRingManager {
@@ -233,6 +236,7 @@ impl CoreRingManager {
             next_id: 0,
             metrics: RingMetrics::default(),
             closed: false,
+            cqe_scratch: Vec::with_capacity(config.ring_entries as usize),
         })
     }
 
@@ -490,29 +494,41 @@ impl CoreRingManager {
     /// Poll for completions without blocking.
     ///
     /// Returns all available completions from both rings.
+    /// **Allocates a Vec per call** — prefer [`Self::poll_completions_into`] on hot paths.
     #[must_use]
     pub fn poll_completions(&mut self) -> Vec<Completion> {
-        if self.closed {
-            return Vec::new();
-        }
-
         let mut completions = Vec::new();
-
-        // Poll main ring
-        self.poll_ring_completions(&mut completions, false);
-
-        // Poll IOPOLL ring if present
-        if self.iopoll_ring.is_some() {
-            self.poll_ring_completions(&mut completions, true);
-        }
-
+        self.poll_completions_into(&mut completions);
         completions
     }
 
-    /// Poll completions from a specific ring.
-    fn poll_ring_completions(&mut self, completions: &mut Vec<Completion>, iopoll: bool) {
-        // Collect CQE data first to avoid borrow conflict
-        let cqe_data: Vec<(u64, i32, u32)> = {
+    /// Poll for completions into a caller-provided buffer. **Zero-alloc.**
+    ///
+    /// Appends completions to `out`. The caller should clear `out` between
+    /// iterations to reuse capacity. Uses an internal scratch buffer for
+    /// CQE data collection (pre-allocated at ring creation).
+    pub fn poll_completions_into(&mut self, out: &mut Vec<Completion>) {
+        if self.closed {
+            return;
+        }
+
+        // Poll main ring
+        self.poll_ring_completions_into(out, false);
+
+        // Poll IOPOLL ring if present
+        if self.iopoll_ring.is_some() {
+            self.poll_ring_completions_into(out, true);
+        }
+    }
+
+    /// Poll completions from a specific ring into caller's buffer.
+    /// Uses `self.cqe_scratch` to avoid per-call allocation.
+    fn poll_ring_completions_into(&mut self, completions: &mut Vec<Completion>, iopoll: bool) {
+        // Collect CQE data into pre-allocated scratch buffer to avoid
+        // borrow conflict (iterating CQ borrows ring, process_completion
+        // borrows &mut self).
+        self.cqe_scratch.clear();
+        {
             let ring = if iopoll {
                 match &mut self.iopoll_ring {
                     Some(r) => r.ring_mut(),
@@ -523,18 +539,21 @@ impl CoreRingManager {
             };
 
             let cq = ring.completion();
-            let mut data = Vec::new();
             for cqe in cq {
-                data.push((cqe.user_data(), cqe.result(), cqe.flags()));
+                self.cqe_scratch
+                    .push((cqe.user_data(), cqe.result(), cqe.flags()));
             }
-            data
-        };
+        }
 
-        // Process collected completions
-        for (user_data, result, flags) in cqe_data {
+        // Process collected completions (ring borrow released).
+        // Index loop rather than drain() because process_completion_data
+        // needs &mut self, which conflicts with drain's borrow.
+        for i in 0..self.cqe_scratch.len() {
+            let (user_data, result, flags) = self.cqe_scratch[i];
             let completion = self.process_completion_data(user_data, result, flags);
             completions.push(completion);
         }
+        self.cqe_scratch.clear();
     }
 
     /// Process completion data from a CQE.
@@ -543,7 +562,10 @@ impl CoreRingManager {
         let op = self.pending.remove(&user_data);
         let latency = op.as_ref().map(|o| o.submitted_at().elapsed());
 
-        // Mark buffer as no longer in-flight now that the CQE has arrived.
+        // Mark buffer as no longer in-flight. The caller is responsible
+        // for calling release_buffer(idx) after consuming the completion.
+        // (UringStorageIo does this in poll_completions; direct callers
+        // of wait_for must release explicitly.)
         if let Some(ref op) = op {
             if let Some(buf_idx) = op.buf_index() {
                 if let Some(ref mut pool) = self.buffer_pool {

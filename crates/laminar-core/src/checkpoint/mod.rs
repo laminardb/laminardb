@@ -6,17 +6,15 @@
 //!
 //! - `barrier`: Checkpoint barrier types, `StreamMessage<T>` enum, and
 //!   cross-thread barrier injection
-//! - `alignment`: Multi-input barrier alignment with buffering
+//! - `unaligned`: Unaligned checkpoint protocol with optional timeout-based
+//!   semantics for alignment-less checkpointing
 
-/// Barrier alignment for multi-input operators.
-pub mod alignment;
 /// Checkpoint barrier types and cross-thread injection.
 pub mod barrier;
-/// Unaligned checkpoint protocol with timeout-based fallback.
+/// Unaligned checkpoint protocol with optional timeout-based semantics.
 pub mod unaligned;
 
 // Re-export key types
-pub use alignment::{AlignmentAction, BarrierAligner};
 pub use barrier::{
     flags, BarrierPollHandle, CheckpointBarrier, CheckpointBarrierInjector, StreamMessage,
 };

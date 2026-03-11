@@ -87,7 +87,7 @@ impl Default for ReactorConfig {
         Self {
             batch_size: 1024,
             cpu_affinity: None,
-            max_iteration_time: Duration::from_millis(10),
+            max_iteration_time: Duration::from_micros(5),
             event_buffer_size: 65536,
             max_out_of_orderness: 1000, // 1 second
         }
@@ -809,7 +809,8 @@ mod tests {
     #[test]
     fn test_reactor_batch_processing() {
         let config = ReactorConfig {
-            batch_size: 2, // Small batch size
+            batch_size: 2,                              // Small batch size
+            max_iteration_time: Duration::from_secs(1), // time-limit not under test
             ..ReactorConfig::default()
         };
         let mut reactor = Reactor::new(config).unwrap();

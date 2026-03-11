@@ -115,7 +115,7 @@ impl DagBuilder {
     where
         F: FnOnce(FanOutBuilder) -> FanOutBuilder,
     {
-        let fan_out = branches(FanOutBuilder::new(shared_node.to_string()));
+        let fan_out = branches(FanOutBuilder::new());
         for (branch_name, branch_type, branch_schema) in fan_out.branches {
             let idx = self.nodes.len();
             self.nodes
@@ -197,15 +197,12 @@ impl Default for DagBuilder {
 
 /// Builder for fan-out branches from a shared stage.
 pub struct FanOutBuilder {
-    #[allow(dead_code)] // Stored for future DAG visualization and error messages
-    shared_node: String,
     branches: Vec<(String, DagNodeType, SchemaRef)>,
 }
 
 impl FanOutBuilder {
-    fn new(shared_node: String) -> Self {
+    fn new() -> Self {
         Self {
-            shared_node,
             branches: Vec::new(),
         }
     }
