@@ -134,8 +134,12 @@ impl ConsumerContext for LaminarConsumerContext {
                     .iter()
                     .map(|e| (e.topic().to_string(), e.partition()))
                     .collect();
-                if let Ok(mut state) = self.rebalance_state.lock() {
-                    state.on_revoke(&partitions);
+                match self.rebalance_state.lock() {
+                    Ok(mut state) => state.on_revoke(&partitions),
+                    Err(poisoned) => {
+                        warn!("rebalance_state mutex poisoned, recovering");
+                        poisoned.into_inner().on_revoke(&partitions);
+                    }
                 }
                 self.rebalance_count
                     .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
@@ -155,8 +159,12 @@ impl ConsumerContext for LaminarConsumerContext {
                     .iter()
                     .map(|e| (e.topic().to_string(), e.partition()))
                     .collect();
-                if let Ok(mut state) = self.rebalance_state.lock() {
-                    state.on_assign(&partitions);
+                match self.rebalance_state.lock() {
+                    Ok(mut state) => state.on_assign(&partitions),
+                    Err(poisoned) => {
+                        warn!("rebalance_state mutex poisoned, recovering");
+                        poisoned.into_inner().on_assign(&partitions);
+                    }
                 }
                 self.rebalance_count
                     .fetch_add(1, std::sync::atomic::Ordering::Relaxed);

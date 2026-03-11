@@ -644,9 +644,8 @@ impl SchemaRegistryClient {
 
     /// Helper to perform a GET request and deserialize JSON.
     ///
-    /// Retries transient failures (5xx, timeouts) up to 3 times with
-    /// exponential backoff (100ms, 500ms, 2s). Non-retryable errors
-    /// (4xx client errors) fail immediately.
+    /// Retries transient failures (5xx, timeouts) up to 3 attempts with
+    /// exponential backoff (100ms, 500ms). 4xx client errors fail immediately.
     async fn get_json<T: serde::de::DeserializeOwned>(
         &self,
         url: &str,
@@ -654,7 +653,6 @@ impl SchemaRegistryClient {
         let backoffs = [
             std::time::Duration::from_millis(100),
             std::time::Duration::from_millis(500),
-            std::time::Duration::from_secs(2),
         ];
         let mut last_err = None;
 

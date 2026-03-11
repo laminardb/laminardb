@@ -484,12 +484,16 @@ fn is_blocked_passthrough_key(key: &str) -> bool {
             | "sasl.username"
             | "sasl.password"
             | "sasl.oauthbearer.config"
+            | "sasl.kerberos.service.name"
+            | "sasl.kerberos.principal"
             | "ssl.ca.location"
             | "ssl.certificate.location"
             | "ssl.key.location"
             | "ssl.key.password"
+            | "ssl.endpoint.identification.algorithm"
             | "enable.auto.commit"
             | "enable.idempotence"
+            | "transactional.id"
     )
 }
 

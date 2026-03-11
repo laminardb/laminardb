@@ -459,8 +459,6 @@ pub struct KafkaSourceConfig {
     pub isolation_level: IsolationLevel,
     /// Maximum records per poll batch.
     pub max_poll_records: usize,
-    /// Timeout for each poll call.
-    pub poll_timeout: Duration,
     /// Partition assignment strategy.
     pub partition_assignment_strategy: AssignmentStrategy,
     /// Minimum bytes to return from a fetch (allows batching).
@@ -545,7 +543,6 @@ impl Default for KafkaSourceConfig {
             auto_offset_reset: OffsetReset::Earliest,
             isolation_level: IsolationLevel::default(),
             max_poll_records: 1000,
-            poll_timeout: Duration::from_millis(100),
             partition_assignment_strategy: AssignmentStrategy::Range,
             fetch_min_bytes: None,
             fetch_max_bytes: None,
@@ -685,8 +682,6 @@ impl KafkaSourceConfig {
             .get_parsed::<usize>("max.poll.records")?
             .unwrap_or(1000);
 
-        let poll_timeout_ms = config.get_parsed::<u64>("poll.timeout.ms")?.unwrap_or(100);
-
         let partition_assignment_strategy = match config.get("partition.assignment.strategy") {
             Some(s) => s.parse::<AssignmentStrategy>()?,
             None => AssignmentStrategy::Range,
@@ -757,7 +752,6 @@ impl KafkaSourceConfig {
             auto_offset_reset,
             isolation_level,
             max_poll_records,
-            poll_timeout: Duration::from_millis(poll_timeout_ms),
             partition_assignment_strategy,
             fetch_min_bytes,
             fetch_max_bytes,
@@ -907,12 +901,6 @@ impl KafkaSourceConfig {
 
         config.set("isolation.level", self.isolation_level.as_rdkafka_str());
 
-        // Socket timeout controls how long rdkafka waits for broker responses.
-        config.set(
-            "socket.timeout.ms",
-            self.poll_timeout.as_millis().to_string(),
-        );
-
         if let Some(fetch_min) = self.fetch_min_bytes {
             config.set("fetch.min.bytes", fetch_min.to_string());
         }
@@ -955,10 +943,13 @@ fn is_blocked_passthrough_key(key: &str) -> bool {
             | "sasl.username"
             | "sasl.password"
             | "sasl.oauthbearer.config"
+            | "sasl.kerberos.service.name"
+            | "sasl.kerberos.principal"
             | "ssl.ca.location"
             | "ssl.certificate.location"
             | "ssl.key.location"
             | "ssl.key.password"
+            | "ssl.endpoint.identification.algorithm"
             | "enable.auto.commit"
             | "enable.idempotence"
     )
@@ -1075,7 +1066,6 @@ mod tests {
         assert_eq!(cfg.auto_offset_reset, OffsetReset::Earliest);
         assert_eq!(cfg.isolation_level, IsolationLevel::ReadCommitted);
         assert_eq!(cfg.max_poll_records, 1000);
-        assert_eq!(cfg.poll_timeout, Duration::from_millis(100));
         assert_eq!(cfg.partition_assignment_strategy, AssignmentStrategy::Range);
         assert!(!cfg.include_metadata);
         assert!(!cfg.include_headers);
@@ -1090,8 +1080,6 @@ mod tests {
             ("format", "csv"),
             ("auto.offset.reset", "latest"),
             ("max.poll.records", "500"),
-            ("poll.timeout.ms", "200"),
-            ("commit.interval.ms", "10000"),
             ("include.metadata", "true"),
             ("include.headers", "true"),
             ("event.time.column", "ts"),
@@ -1104,7 +1092,6 @@ mod tests {
         assert_eq!(cfg.auto_offset_reset, OffsetReset::Latest);
         assert_eq!(cfg.isolation_level, IsolationLevel::ReadUncommitted);
         assert_eq!(cfg.max_poll_records, 500);
-        assert_eq!(cfg.poll_timeout, Duration::from_millis(200));
         assert!(cfg.include_metadata);
         assert!(cfg.include_headers);
         assert_eq!(cfg.event_time_column, Some("ts".to_string()));

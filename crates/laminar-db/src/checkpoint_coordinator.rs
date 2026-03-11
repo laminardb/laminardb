@@ -392,16 +392,31 @@ impl CheckpointCoordinator {
     ///
     /// Returns the first error from any sink that fails to begin the epoch.
     pub async fn begin_initial_epoch(&self) -> Result<(), DbError> {
-        let epoch = self.epoch;
+        self.begin_epoch_for_sinks(self.epoch).await
+    }
+
+    /// Begins an epoch on all exactly-once sinks. If any sink fails,
+    /// rolls back sinks that already started the epoch.
+    async fn begin_epoch_for_sinks(&self, epoch: u64) -> Result<(), DbError> {
+        let mut started: Vec<&RegisteredSink> = Vec::new();
         for sink in &self.sinks {
             if sink.exactly_once {
-                sink.handle.begin_epoch(epoch).await.map_err(|e| {
-                    DbError::Checkpoint(format!(
-                        "sink '{}' failed to begin initial epoch {epoch}: {e}",
-                        sink.name
-                    ))
-                })?;
-                debug!(sink = %sink.name, epoch, "began initial epoch");
+                match sink.handle.begin_epoch(epoch).await {
+                    Ok(()) => {
+                        started.push(sink);
+                        debug!(sink = %sink.name, epoch, "began epoch");
+                    }
+                    Err(e) => {
+                        // Roll back sinks that already started.
+                        for s in &started {
+                            s.handle.rollback_epoch(epoch).await;
+                        }
+                        return Err(DbError::Checkpoint(format!(
+                            "sink '{}' failed to begin epoch {epoch}: {e}",
+                            sink.name
+                        )));
+                    }
+                }
             }
         }
         Ok(())
@@ -1245,29 +1260,18 @@ impl CheckpointCoordinator {
         self.adjust_interval();
 
         // ── Step 8: Begin next epoch on exactly-once sinks ──
-        // After a successful commit, start a new transaction for the next
-        // epoch so that writes between checkpoints are covered. If this
-        // fails, report a partial success — the checkpoint itself completed
-        // but the next epoch was not started, so subsequent writes will be
-        // outside a transaction boundary.
         let next_epoch = self.epoch;
-        let mut begin_epoch_error = None;
-        for sink in &self.sinks {
-            if sink.exactly_once {
-                if let Err(e) = sink.handle.begin_epoch(next_epoch).await {
-                    error!(
-                        sink = %sink.name,
-                        next_epoch,
-                        error = %e,
-                        "[LDB-6015] failed to begin next epoch — writes will be non-transactional"
-                    );
-                    begin_epoch_error = Some(format!(
-                        "sink '{}' failed to begin epoch {next_epoch}: {e}",
-                        sink.name
-                    ));
-                }
+        let begin_epoch_error = match self.begin_epoch_for_sinks(next_epoch).await {
+            Ok(()) => None,
+            Err(e) => {
+                error!(
+                    next_epoch,
+                    error = %e,
+                    "[LDB-6015] failed to begin next epoch — writes will be non-transactional"
+                );
+                Some(e.to_string())
             }
-        }
+        };
 
         info!(
             checkpoint_id,
@@ -1276,8 +1280,11 @@ impl CheckpointCoordinator {
             "checkpoint completed"
         );
 
+        // The checkpoint itself succeeded (state persisted, sinks committed).
+        // begin_epoch failure for the *next* epoch is reported as a warning
+        // but does not retroactively fail the completed checkpoint.
         Ok(CheckpointResult {
-            success: begin_epoch_error.is_none(),
+            success: true,
             checkpoint_id,
             epoch,
             duration,

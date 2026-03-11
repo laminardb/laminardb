@@ -12,7 +12,7 @@
 //! - `RollbackEpoch` — abort a failed epoch
 //! - `Close` — flush + close the connector
 
-use std::sync::atomic::{AtomicU64, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::sync::Arc;
 use std::time::Duration;
 
@@ -77,9 +77,11 @@ pub(crate) struct SinkTaskHandle {
     #[allow(dead_code)] // used by close(); implicit channel-drop handles normal shutdown
     task: Arc<tokio::sync::Mutex<Option<JoinHandle<()>>>>,
     /// Counter for write errors (shared with the task loop).
-    /// Exposed via `write_error_count()` for pipeline-level error tracking.
     #[allow(dead_code)]
     write_errors: Arc<AtomicU64>,
+    /// Set by the task loop on write failure; checked by `PreCommit` to reject the epoch.
+    #[allow(dead_code)]
+    epoch_poisoned: Arc<AtomicBool>,
 }
 
 impl SinkTaskHandle {
@@ -105,13 +107,14 @@ impl SinkTaskHandle {
         let (tx, rx) = mpsc::channel(channel_capacity);
         let task_name = name.clone();
         let write_errors = Arc::new(AtomicU64::new(0));
-        let write_errors_inner = Arc::clone(&write_errors);
+        let epoch_poisoned = Arc::new(AtomicBool::new(false));
         let handle = tokio::spawn(run_sink_task(
             task_name,
             connector,
             rx,
             flush_interval,
-            write_errors_inner,
+            Arc::clone(&write_errors),
+            Arc::clone(&epoch_poisoned),
         ));
 
         Self {
@@ -120,6 +123,7 @@ impl SinkTaskHandle {
             exactly_once,
             task: Arc::new(tokio::sync::Mutex::new(Some(handle))),
             write_errors,
+            epoch_poisoned,
         }
     }
 
@@ -264,6 +268,7 @@ async fn run_sink_task(
     mut rx: mpsc::Receiver<SinkCommand>,
     flush_interval: Duration,
     write_errors: Arc<AtomicU64>,
+    epoch_poisoned: Arc<AtomicBool>,
 ) {
     let mut flush_timer = tokio::time::interval(flush_interval);
     flush_timer.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
@@ -288,15 +293,17 @@ async fn run_sink_task(
                     SinkCommand::WriteBatch { batch } => {
                         if let Err(e) = sink.write_batch(&batch).await {
                             write_errors.fetch_add(1, Ordering::Relaxed);
+                            epoch_poisoned.store(true, Ordering::Release);
                             tracing::warn!(
                                 sink = %name,
                                 error = %e,
                                 write_errors = write_errors.load(Ordering::Relaxed),
-                                "Sink write error"
+                                "Sink write error — epoch poisoned"
                             );
                         }
                     }
                     SinkCommand::BeginEpoch { epoch, ack } => {
+                        epoch_poisoned.store(false, Ordering::Release);
                         let result = sink.begin_epoch(epoch).await;
                         let _ = ack.send(result);
                     }
@@ -306,7 +313,13 @@ async fn run_sink_task(
                         let _ = ack.send(result);
                     }
                     SinkCommand::PreCommit { epoch, ack } => {
-                        let result = sink.pre_commit(epoch).await;
+                        let result = if epoch_poisoned.load(Ordering::Acquire) {
+                            Err(ConnectorError::WriteError(
+                                "epoch poisoned by prior write failure".into(),
+                            ))
+                        } else {
+                            sink.pre_commit(epoch).await
+                        };
                         let _ = ack.send(result);
                     }
                     SinkCommand::CommitEpoch { epoch, ack } => {
