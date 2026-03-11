@@ -489,9 +489,9 @@ mod tests {
         assert_eq!(source.records_read, 8);
     }
 
-    /// D002/D003: Verify max_records bounds the pending buffer.
-    /// Without the delta-lake feature, poll_batch returns buffered data
-    /// incrementally; with the feature, read_batches_at_version applies LIMIT.
+    /// D002/D003: Verify `max_records` bounds the pending buffer.
+    /// Without the delta-lake feature, `poll_batch` returns buffered data
+    /// incrementally; with the feature, `read_batches_at_version` applies LIMIT.
     #[tokio::test]
     async fn test_poll_batch_returns_buffered_incrementally() {
         let mut source = DeltaSource::new(test_config());
