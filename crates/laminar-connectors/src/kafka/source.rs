@@ -7,11 +7,12 @@
 
 use arrow_schema::SchemaRef;
 use async_trait::async_trait;
-use rdkafka::consumer::{Consumer, StreamConsumer};
+use rdkafka::consumer::{CommitMode, Consumer, StreamConsumer};
 use rdkafka::message::Message;
 use rdkafka::ClientConfig;
-use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
-use std::sync::Arc;
+use rdkafka::TopicPartitionList;
+use std::sync::atomic::{AtomicBool, AtomicU64, AtomicUsize, Ordering};
+use std::sync::{Arc, Mutex};
 use tokio::sync::Notify;
 use tracing::{debug, info, warn};
 
@@ -27,11 +28,12 @@ use crate::serde::{self, Format, RecordDeserializer};
 
 use super::avro::AvroDeserializer;
 use super::backpressure::KafkaBackpressureController;
-use super::config::{KafkaSourceConfig, TopicSubscription};
+use super::config::{KafkaSourceConfig, StartupMode, TopicSubscription};
 use super::metrics::KafkaSourceMetrics;
 use super::offsets::OffsetTracker;
 use super::rebalance::RebalanceState;
 use super::schema_registry::SchemaRegistryClient;
+use super::watermarks::KafkaWatermarkTracker;
 
 /// Payload sent from the background Kafka reader task to [`KafkaSource::poll_batch`].
 struct KafkaPayload {
@@ -39,6 +41,10 @@ struct KafkaPayload {
     topic: Arc<str>,
     partition: i32,
     offset: i64,
+    timestamp_ms: Option<i64>,
+    /// Kafka message headers serialized as JSON string ("{key: value, ...}").
+    /// Only populated when `include_headers` is enabled.
+    headers_json: Option<String>,
 }
 
 /// Kafka source connector that consumes messages and produces Arrow batches.
@@ -54,43 +60,26 @@ struct KafkaPayload {
 /// 4. Call `checkpoint()` / `restore()` for fault tolerance
 /// 5. Call `close()` for clean shutdown
 pub struct KafkaSource {
-    /// rdkafka consumer (set during `open()`).
     consumer: Option<StreamConsumer<LaminarConsumerContext>>,
-    /// Parsed Kafka configuration.
     config: KafkaSourceConfig,
-    /// Format-specific deserializer.
     deserializer: Box<dyn RecordDeserializer>,
-    /// Per-partition offset tracking.
     offsets: OffsetTracker,
-    /// Connector lifecycle state.
     state: ConnectorState,
-    /// Consumption metrics.
     metrics: KafkaSourceMetrics,
-    /// Arrow schema for output batches.
     schema: SchemaRef,
-    /// Backpressure controller.
     backpressure: KafkaBackpressureController,
-    /// Shared backpressure channel fill counter.
-    ///
-    /// Clone this Arc and update it from the downstream consumer to wire
-    /// backpressure. Increment when batches are buffered, decrement when
-    /// consumed. Without wiring, the counter stays at 0 and backpressure
-    /// is effectively disabled (correct for sequential polling pipelines).
     channel_len: Arc<AtomicUsize>,
-    /// Consumer group rebalance tracking.
-    rebalance_state: RebalanceState,
-    /// Optional Schema Registry client (shared with Avro deserializer).
+    rebalance_state: Arc<Mutex<RebalanceState>>,
+    /// Shared rebalance counter bridging `LaminarConsumerContext` → `KafkaSourceMetrics`.
+    rebalance_counter: Arc<AtomicU64>,
     schema_registry: Option<Arc<SchemaRegistryClient>>,
-    /// Notification handle signalled when Kafka messages arrive from the reader task.
     data_ready: Arc<Notify>,
-    /// Flag set to `true` on consumer group rebalance (partition revocation).
     checkpoint_request: Arc<AtomicBool>,
-    /// Channel receiver for Kafka messages from the background reader task.
     msg_rx: Option<tokio::sync::mpsc::Receiver<KafkaPayload>>,
-    /// Background Kafka reader task handle.
     reader_handle: Option<tokio::task::JoinHandle<()>>,
-    /// Shutdown signal for the background reader task.
     reader_shutdown: Option<tokio::sync::watch::Sender<bool>>,
+    offset_commit_tx: Option<tokio::sync::watch::Sender<TopicPartitionList>>,
+    watermark_tracker: Option<KafkaWatermarkTracker>,
 }
 
 impl KafkaSource {
@@ -111,6 +100,15 @@ impl KafkaSource {
             Arc::clone(&channel_len),
         );
 
+        let watermark_tracker = if config.enable_watermark_tracking {
+            Some(
+                KafkaWatermarkTracker::new(0, config.idle_timeout)
+                    .with_max_out_of_orderness(config.max_out_of_orderness),
+            )
+        } else {
+            None
+        };
+
         Self {
             consumer: None,
             config,
@@ -121,13 +119,16 @@ impl KafkaSource {
             schema,
             backpressure,
             channel_len,
-            rebalance_state: RebalanceState::new(),
+            rebalance_state: Arc::new(Mutex::new(RebalanceState::new())),
+            rebalance_counter: Arc::new(AtomicU64::new(0)),
             schema_registry: None,
             data_ready: Arc::new(Notify::new()),
             checkpoint_request: Arc::new(AtomicBool::new(false)),
             msg_rx: None,
             reader_handle: None,
             reader_shutdown: None,
+            offset_commit_tx: None,
+            watermark_tracker,
         }
     }
 
@@ -159,6 +160,15 @@ impl KafkaSource {
             Arc::clone(&channel_len),
         );
 
+        let watermark_tracker = if config.enable_watermark_tracking {
+            Some(
+                KafkaWatermarkTracker::new(0, config.idle_timeout)
+                    .with_max_out_of_orderness(config.max_out_of_orderness),
+            )
+        } else {
+            None
+        };
+
         Self {
             consumer: None,
             config,
@@ -169,54 +179,67 @@ impl KafkaSource {
             schema,
             backpressure,
             channel_len,
-            rebalance_state: RebalanceState::new(),
+            rebalance_state: Arc::new(Mutex::new(RebalanceState::new())),
+            rebalance_counter: Arc::new(AtomicU64::new(0)),
             schema_registry: Some(sr),
             data_ready: Arc::new(Notify::new()),
             checkpoint_request: Arc::new(AtomicBool::new(false)),
             msg_rx: None,
             reader_handle: None,
             reader_shutdown: None,
+            offset_commit_tx: None,
+            watermark_tracker,
         }
     }
 
-    /// Returns the current connector state.
+    /// Lifecycle state (Created → Initializing → Running → Closed).
     #[must_use]
     pub fn state(&self) -> ConnectorState {
         self.state
     }
 
-    /// Returns a reference to the offset tracker.
+    /// Per-topic-partition offset state for checkpoint and monitoring.
     #[must_use]
     pub fn offsets(&self) -> &OffsetTracker {
         &self.offsets
     }
 
-    /// Returns the shared backpressure channel fill counter.
-    ///
-    /// The downstream consumer should clone this `Arc` and update the
-    /// counter as batches are buffered and consumed:
-    /// - Increment (`fetch_add`) when a batch is placed into a buffer
-    /// - Decrement (`fetch_sub`) when a batch is processed
-    ///
-    /// The [`KafkaBackpressureController`] reads this counter to decide when
-    /// to pause/resume the Kafka consumer. Without wiring, the counter
-    /// stays at 0 and backpressure is disabled (correct for sequential
-    /// polling pipelines that inherently throttle by processing rate).
+    /// Shared backpressure fill counter for downstream wiring.
     #[must_use]
     pub fn channel_len(&self) -> Arc<AtomicUsize> {
         Arc::clone(&self.channel_len)
     }
 
-    /// Returns a reference to the rebalance state.
+    /// Shared partition assignment state (updated by rebalance callbacks).
     #[must_use]
-    pub fn rebalance_state(&self) -> &RebalanceState {
-        &self.rebalance_state
+    pub fn rebalance_state(&self) -> Arc<Mutex<RebalanceState>> {
+        Arc::clone(&self.rebalance_state)
     }
 
-    /// Returns whether a Schema Registry client is configured.
+    /// Whether a Schema Registry client is configured.
     #[must_use]
     pub fn has_schema_registry(&self) -> bool {
         self.schema_registry.is_some()
+    }
+
+    /// Current combined watermark from the watermark tracker.
+    ///
+    /// Returns `None` if watermark tracking is disabled or no partitions
+    /// have received data yet.
+    #[must_use]
+    pub fn current_watermark(&self) -> Option<i64> {
+        self.watermark_tracker
+            .as_ref()
+            .and_then(KafkaWatermarkTracker::current_watermark)
+    }
+
+    /// Returns the configured event-time column name, if any.
+    ///
+    /// Used by the pipeline to identify which column contains event timestamps
+    /// for watermark generation, instead of hardcoding `event_time`/`timestamp`.
+    #[must_use]
+    pub fn event_time_column(&self) -> Option<&str> {
+        self.config.event_time_column.as_deref()
     }
 
     /// Spawns the background reader task on first `poll_batch()` call.
@@ -230,12 +253,13 @@ impl KafkaSource {
         let consumer = self.consumer.take().unwrap();
         let (msg_tx, msg_rx) = tokio::sync::mpsc::channel(4096);
         let (shutdown_tx, mut shutdown_rx) = tokio::sync::watch::channel(false);
+        let (offset_tx, offset_rx) = tokio::sync::watch::channel(TopicPartitionList::new());
         let data_ready = Arc::clone(&self.data_ready);
         let channel_len = Arc::clone(&self.channel_len);
+        let capture_headers = self.config.include_headers;
 
-        // Offset commits are handled exclusively through the checkpoint path
-        // (self.offsets → checkpoint() → coordinator commit). The reader task
-        // does NOT auto-commit to avoid violating exactly-once semantics.
+        // The reader task owns the consumer. On shutdown it commits the latest
+        // offsets received via the offset_rx watch channel, then unsubscribes.
         let reader_handle = tokio::spawn(async move {
             let mut cached_topic: Arc<str> = Arc::from("");
             loop {
@@ -247,16 +271,45 @@ impl KafkaSource {
                 match msg_result {
                     Ok(msg) => {
                         if let Some(payload) = msg.payload() {
-                            // Cache topic as Arc<str> — only allocates when topic changes.
                             let topic = msg.topic();
                             if &*cached_topic != topic {
                                 cached_topic = Arc::from(topic);
                             }
+                            let timestamp_ms = match msg.timestamp() {
+                                rdkafka::Timestamp::CreateTime(ts)
+                                | rdkafka::Timestamp::LogAppendTime(ts) => Some(ts),
+                                rdkafka::Timestamp::NotAvailable => None,
+                            };
+                            let headers_json = if capture_headers {
+                                use rdkafka::message::Headers;
+                                msg.headers().map(|hdrs| {
+                                    let mut json = String::from('{');
+                                    for i in 0..hdrs.count() {
+                                        let header = hdrs.get(i);
+                                        if i > 0 {
+                                            json.push(',');
+                                        }
+                                        json.push('"');
+                                        json.push_str(header.key);
+                                        json.push_str("\":\"");
+                                        if let Some(val) = header.value {
+                                            json.push_str(&String::from_utf8_lossy(val));
+                                        }
+                                        json.push('"');
+                                    }
+                                    json.push('}');
+                                    json
+                                })
+                            } else {
+                                None
+                            };
                             let kp = KafkaPayload {
                                 data: payload.to_vec(),
                                 topic: Arc::clone(&cached_topic),
                                 partition: msg.partition(),
                                 offset: msg.offset(),
+                                timestamp_ms,
+                                headers_json,
                             };
                             if msg_tx.send(kp).await.is_err() {
                                 break;
@@ -271,16 +324,32 @@ impl KafkaSource {
                 }
             }
 
+            // Commit final offsets before unsubscribing. The close() method
+            // sends the latest TPL via offset_tx before signaling shutdown,
+            // so offset_rx.borrow() contains the most recent offsets.
+            let tpl = offset_rx.borrow().clone();
+            if tpl.count() > 0 {
+                match consumer.commit(&tpl, CommitMode::Sync) {
+                    Ok(()) => info!(
+                        partitions = tpl.count(),
+                        "committed final offsets on shutdown"
+                    ),
+                    Err(e) => warn!(error = %e, "failed to commit final offsets on shutdown"),
+                }
+            }
+
             consumer.unsubscribe();
         });
 
         self.msg_rx = Some(msg_rx);
         self.reader_handle = Some(reader_handle);
         self.reader_shutdown = Some(shutdown_tx);
+        self.offset_commit_tx = Some(offset_tx);
     }
 }
 
 #[async_trait]
+#[allow(clippy::too_many_lines)] // poll_batch has legitimate complexity (backpressure + deser + poison pill fallback)
 impl SourceConnector for KafkaSource {
     async fn open(&mut self, config: &ConnectorConfig) -> Result<(), ConnectorError> {
         self.state = ConnectorState::Initializing;
@@ -297,10 +366,14 @@ impl SourceConnector for KafkaSource {
         // Re-select deserializer (factory defaults to JSON).
         if let Some(ref sr_url) = kafka_config.schema_registry_url {
             let sr_client = if let Some(ref ca) = kafka_config.schema_registry_ssl_ca_location {
-                SchemaRegistryClient::with_tls(
+                SchemaRegistryClient::with_tls_mtls(
                     sr_url.clone(),
                     kafka_config.schema_registry_auth.clone(),
                     ca,
+                    kafka_config
+                        .schema_registry_ssl_certificate_location
+                        .as_deref(),
+                    kafka_config.schema_registry_ssl_key_location.as_deref(),
                 )?
             } else {
                 SchemaRegistryClient::new(sr_url.clone(), kafka_config.schema_registry_auth.clone())
@@ -343,7 +416,11 @@ impl SourceConnector for KafkaSource {
 
         // Build rdkafka consumer with rebalance-aware context.
         let rdkafka_config: ClientConfig = kafka_config.to_rdkafka_config();
-        let context = LaminarConsumerContext::new(Arc::clone(&self.checkpoint_request));
+        let context = LaminarConsumerContext::new(
+            Arc::clone(&self.checkpoint_request),
+            Arc::clone(&self.rebalance_state),
+            Arc::clone(&self.rebalance_counter),
+        );
         let consumer: StreamConsumer<LaminarConsumerContext> =
             rdkafka_config.create_with_context(context).map_err(|e| {
                 ConnectorError::ConnectionFailed(format!("failed to create consumer: {e}"))
@@ -370,13 +447,90 @@ impl SourceConnector for KafkaSource {
             }
         }
 
+        // Apply startup mode positioning before starting the reader.
+        match &kafka_config.startup_mode {
+            // GroupOffsets/Earliest/Latest are handled via auto.offset.reset in to_rdkafka_config().
+            StartupMode::GroupOffsets | StartupMode::Earliest | StartupMode::Latest => {}
+            StartupMode::SpecificOffsets(offsets) => {
+                let mut tpl = rdkafka::TopicPartitionList::new();
+                let topics = match &kafka_config.subscription {
+                    TopicSubscription::Topics(t) => t.clone(),
+                    TopicSubscription::Pattern(_) => Vec::new(),
+                };
+                for topic in &topics {
+                    for (&partition, &offset) in offsets {
+                        tpl.add_partition_offset(topic, partition, rdkafka::Offset::Offset(offset))
+                            .ok();
+                    }
+                }
+                if tpl.count() > 0 {
+                    consumer.assign(&tpl).map_err(|e| {
+                        ConnectorError::ConnectionFailed(format!(
+                            "failed to assign specific offsets: {e}"
+                        ))
+                    })?;
+                    info!(
+                        partitions = tpl.count(),
+                        "assigned consumer to specific offsets"
+                    );
+                }
+            }
+            StartupMode::Timestamp(ts_ms) => {
+                // rdkafka requires assignment before offsets_for_times.
+                // Wait briefly for partition assignment from the group coordinator,
+                // then seek each assigned partition to the target timestamp.
+                let mut tpl = rdkafka::TopicPartitionList::new();
+                let topics = match &kafka_config.subscription {
+                    TopicSubscription::Topics(t) => t.clone(),
+                    TopicSubscription::Pattern(_) => Vec::new(),
+                };
+                // Query metadata to discover partition count per topic.
+                if let Ok(metadata) = consumer.fetch_metadata(
+                    topics.first().map(String::as_str),
+                    std::time::Duration::from_secs(10),
+                ) {
+                    for topic_meta in metadata.topics() {
+                        for partition_meta in topic_meta.partitions() {
+                            tpl.add_partition_offset(
+                                topic_meta.name(),
+                                partition_meta.id(),
+                                rdkafka::Offset::Offset(*ts_ms),
+                            )
+                            .ok();
+                        }
+                    }
+                }
+                if tpl.count() > 0 {
+                    match consumer.offsets_for_times(tpl, std::time::Duration::from_secs(10)) {
+                        Ok(resolved) => {
+                            consumer.assign(&resolved).map_err(|e| {
+                                ConnectorError::ConnectionFailed(format!(
+                                    "failed to assign timestamp offsets: {e}"
+                                ))
+                            })?;
+                            info!(
+                                timestamp_ms = ts_ms,
+                                partitions = resolved.count(),
+                                "assigned consumer to timestamp offsets"
+                            );
+                        }
+                        Err(e) => {
+                            warn!(
+                                error = %e,
+                                timestamp_ms = ts_ms,
+                                "failed to resolve timestamp offsets, falling back to group offsets"
+                            );
+                        }
+                    }
+                }
+            }
+        }
+
         self.consumer = Some(consumer);
         self.state = ConnectorState::Running;
 
         // Start the background reader immediately so that `data_ready_notify()`
-        // has an active producer.  Without this, the source task deadlocks:
-        // it awaits `data_ready.notified()` but the reader (which fires that
-        // notification) would only be spawned lazily in `poll_batch()`.
+        // has an active producer.
         self.ensure_reader_started();
 
         info!("Kafka source connector opened successfully");
@@ -429,6 +583,29 @@ impl SourceConnector for KafkaSource {
         let mut last_topic = String::new();
         let mut last_partition_id: i32 = 0;
         let mut last_offset: i64 = -1;
+        // Metadata columns (only collected when include_metadata is true).
+        let include_metadata = self.config.include_metadata;
+        let include_headers = self.config.include_headers;
+        let mut meta_partitions: Vec<i32> = if include_metadata {
+            Vec::with_capacity(limit)
+        } else {
+            Vec::new()
+        };
+        let mut meta_offsets: Vec<i64> = if include_metadata {
+            Vec::with_capacity(limit)
+        } else {
+            Vec::new()
+        };
+        let mut meta_timestamps: Vec<Option<i64>> = if include_metadata {
+            Vec::with_capacity(limit)
+        } else {
+            Vec::new()
+        };
+        let mut meta_headers: Vec<Option<String>> = if include_headers {
+            Vec::with_capacity(limit)
+        } else {
+            Vec::new()
+        };
 
         while payload_offsets.len() < limit {
             match rx.try_recv() {
@@ -439,7 +616,23 @@ impl SourceConnector for KafkaSource {
                     payload_buf.extend_from_slice(&kp.data);
                     payload_offsets.push((start, kp.data.len()));
 
-                    self.offsets.update(&kp.topic, kp.partition, kp.offset);
+                    self.offsets.update_arc(&kp.topic, kp.partition, kp.offset);
+
+                    if include_metadata {
+                        meta_partitions.push(kp.partition);
+                        meta_offsets.push(kp.offset);
+                        meta_timestamps.push(kp.timestamp_ms);
+                    }
+                    if include_headers {
+                        meta_headers.push(kp.headers_json);
+                    }
+
+                    // Update watermark tracker with event timestamp.
+                    if let Some(ref mut tracker) = self.watermark_tracker {
+                        if let Some(ts) = kp.timestamp_ms {
+                            tracker.update_partition(kp.partition, ts);
+                        }
+                    }
 
                     if last_topic.as_str() != &*kp.topic || last_partition_id != kp.partition {
                         last_topic = kp.topic.to_string();
@@ -449,6 +642,17 @@ impl SourceConnector for KafkaSource {
                 }
                 Err(_) => break,
             }
+        }
+
+        // Check for idle partitions on each poll cycle.
+        if let Some(ref mut tracker) = self.watermark_tracker {
+            tracker.check_idle_partitions();
+        }
+
+        // Sync rebalance counter → metrics (bridge from rdkafka background thread).
+        let rebalance_events = self.rebalance_counter.swap(0, Ordering::Relaxed);
+        for _ in 0..rebalance_events {
+            self.metrics.record_rebalance();
         }
 
         if payload_offsets.is_empty() {
@@ -489,10 +693,74 @@ impl SourceConnector for KafkaSource {
             .iter()
             .map(|&(start, len)| &payload_buf[start..start + len])
             .collect();
-        let batch = self
-            .deserializer
-            .deserialize_batch(&refs, &self.schema)
-            .map_err(ConnectorError::Serde)?;
+
+        // Try batch deserialization first (fast path). If it fails, fall back
+        // to per-record deserialization to isolate poison pills.
+        let batch = match self.deserializer.deserialize_batch(&refs, &self.schema) {
+            Ok(batch) => batch,
+            Err(batch_err) => {
+                // Per-record fallback: deserialize one at a time, skip failures.
+                let mut good_refs = Vec::with_capacity(refs.len());
+                let mut error_count = 0u64;
+                for r in &refs {
+                    match self
+                        .deserializer
+                        .deserialize_batch(std::slice::from_ref(r), &self.schema)
+                    {
+                        Ok(_) => good_refs.push(*r),
+                        Err(e) => {
+                            error_count += 1;
+                            self.metrics.record_error();
+                            warn!(error = %e, "skipping poison pill record");
+                        }
+                    }
+                }
+                if good_refs.is_empty() {
+                    // All records failed — propagate the original batch error.
+                    return Err(ConnectorError::Serde(batch_err));
+                }
+                if error_count > 0 {
+                    warn!(
+                        skipped = error_count,
+                        total = refs.len(),
+                        "deserialized batch with poison pill isolation"
+                    );
+                }
+                self.deserializer
+                    .deserialize_batch(&good_refs, &self.schema)
+                    .map_err(ConnectorError::Serde)?
+            }
+        };
+
+        // Append metadata columns if configured.
+        let batch = if include_metadata && !meta_partitions.is_empty() {
+            use arrow_array::{Int32Array, Int64Array};
+            use arrow_schema::{DataType, Field};
+
+            let mut fields = batch.schema().fields().to_vec();
+            let mut columns: Vec<Arc<dyn arrow_array::Array>> = batch.columns().to_vec();
+
+            fields.push(Arc::new(Field::new("_partition", DataType::Int32, false)));
+            columns.push(Arc::new(Int32Array::from(meta_partitions)));
+
+            fields.push(Arc::new(Field::new("_offset", DataType::Int64, false)));
+            columns.push(Arc::new(Int64Array::from(meta_offsets)));
+
+            fields.push(Arc::new(Field::new("_timestamp", DataType::Int64, true)));
+            columns.push(Arc::new(Int64Array::from(meta_timestamps)));
+
+            if include_headers && !meta_headers.is_empty() {
+                fields.push(Arc::new(Field::new("_headers", DataType::Utf8, true)));
+                columns.push(Arc::new(arrow_array::StringArray::from(meta_headers)));
+            }
+
+            let meta_schema = Arc::new(arrow_schema::Schema::new(fields));
+            arrow_array::RecordBatch::try_new(meta_schema, columns).map_err(|e| {
+                ConnectorError::Internal(format!("failed to append metadata columns: {e}"))
+            })?
+        } else {
+            batch
+        };
 
         let num_rows = batch.num_rows();
         self.metrics.record_poll(num_rows as u64, total_bytes);
@@ -517,6 +785,13 @@ impl SourceConnector for KafkaSource {
     }
 
     fn checkpoint(&self) -> SourceCheckpoint {
+        // Push current offsets to the reader task so it can commit them on
+        // shutdown even if close() is called without a subsequent checkpoint.
+        if let Some(ref tx) = self.offset_commit_tx {
+            let tpl = self.offsets.to_topic_partition_list();
+            let _ = tx.send(tpl);
+            self.metrics.record_commit();
+        }
         self.offsets.to_checkpoint()
     }
 
@@ -574,7 +849,16 @@ impl SourceConnector for KafkaSource {
     async fn close(&mut self) -> Result<(), ConnectorError> {
         info!("closing Kafka source connector");
 
-        // Shut down the reader task (it handles final commit and unsubscribe).
+        // Send final offsets to the reader task before signaling shutdown.
+        // The reader task will commit these offsets before unsubscribing.
+        if let Some(ref tx) = self.offset_commit_tx {
+            if self.offsets.partition_count() > 0 {
+                let tpl = self.offsets.to_topic_partition_list();
+                let _ = tx.send(tpl);
+            }
+        }
+
+        // Signal shutdown and wait for the reader task to commit and exit.
         if let Some(tx) = self.reader_shutdown.take() {
             let _ = tx.send(true);
         }
@@ -582,13 +866,14 @@ impl SourceConnector for KafkaSource {
             let _ = tokio::time::timeout(std::time::Duration::from_secs(5), handle).await;
         }
         self.msg_rx = None;
+        self.offset_commit_tx = None;
 
-        // If consumer was never moved to the reader (no poll_batch called),
-        // do cleanup directly.
+        // If consumer was never moved to the reader (e.g., close() called
+        // before any poll_batch()), commit directly.
         if let Some(ref consumer) = self.consumer {
             if self.offsets.partition_count() > 0 {
                 let tpl = self.offsets.to_topic_partition_list();
-                if let Err(e) = consumer.commit(&tpl, rdkafka::consumer::CommitMode::Sync) {
+                if let Err(e) = consumer.commit(&tpl, CommitMode::Sync) {
                     warn!(error = %e, "failed to commit final offsets");
                 }
             }
@@ -614,12 +899,13 @@ impl std::fmt::Debug for KafkaSource {
     }
 }
 
-/// Selects the appropriate deserializer for the given format.
 fn select_deserializer(format: Format) -> Box<dyn RecordDeserializer> {
     match format {
         Format::Avro => Box::new(AvroDeserializer::new()),
-        other => serde::create_deserializer(other)
-            .expect("supported format should always create a deserializer"),
+        other => serde::create_deserializer(other).unwrap_or_else(|_| {
+            warn!(format = %other, "unsupported format, falling back to JSON");
+            Box::new(serde::json::JsonDeserializer::new())
+        }),
     }
 }
 

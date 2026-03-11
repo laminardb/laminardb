@@ -128,9 +128,10 @@ impl KafkaSink {
     /// Creates a new Kafka sink connector with explicit schema.
     #[must_use]
     pub fn new(schema: SchemaRef, config: KafkaSinkConfig) -> Self {
-        let serializer = select_serializer(config.format, &schema);
-        let partitioner = select_partitioner(config.partitioner);
         let avro_schema_id = Arc::new(std::sync::atomic::AtomicU32::new(0));
+        let serializer =
+            select_serializer(config.format, &schema, Arc::clone(&avro_schema_id), None);
+        let partitioner = select_partitioner(config.partitioner);
 
         Self {
             producer: None,
@@ -159,16 +160,12 @@ impl KafkaSink {
     ) -> Self {
         let sr = Arc::new(sr_client);
         let avro_schema_id = Arc::new(std::sync::atomic::AtomicU32::new(0));
-        let serializer: Box<dyn RecordSerializer> = if config.format == Format::Avro {
-            Box::new(AvroSerializer::with_shared_schema_id(
-                schema.clone(),
-                Arc::clone(&avro_schema_id),
-                Some(Arc::clone(&sr)),
-            ))
-        } else {
-            select_serializer(config.format, &schema)
-        };
-
+        let serializer = select_serializer(
+            config.format,
+            &schema,
+            Arc::clone(&avro_schema_id),
+            Some(Arc::clone(&sr)),
+        );
         let partitioner = select_partitioner(config.partitioner);
 
         Self {
@@ -189,25 +186,25 @@ impl KafkaSink {
         }
     }
 
-    /// Returns the current connector state.
+    /// Lifecycle state (Created → Running → Closed).
     #[must_use]
     pub fn state(&self) -> ConnectorState {
         self.state
     }
 
-    /// Returns whether a Schema Registry client is configured.
+    /// Whether Avro schema registration is available.
     #[must_use]
     pub fn has_schema_registry(&self) -> bool {
         self.schema_registry.is_some()
     }
 
-    /// Returns the current epoch.
+    /// Active epoch (incremented by checkpoint coordinator).
     #[must_use]
     pub fn current_epoch(&self) -> u64 {
         self.current_epoch
     }
 
-    /// Returns the last committed epoch.
+    /// Last epoch that was successfully committed to Kafka.
     #[must_use]
     pub fn last_committed_epoch(&self) -> u64 {
         self.last_committed_epoch
@@ -340,7 +337,12 @@ impl SinkConnector for KafkaSink {
         if !config.properties().is_empty() {
             let parsed = KafkaSinkConfig::from_config(config)?;
             self.config = parsed;
-            self.serializer = select_serializer(self.config.format, &self.schema);
+            self.serializer = select_serializer(
+                self.config.format,
+                &self.schema,
+                Arc::clone(&self.avro_schema_id),
+                self.schema_registry.clone(),
+            );
             self.partitioner = select_partitioner(self.config.partitioner);
         }
 
@@ -367,15 +369,15 @@ impl SinkConnector for KafkaSink {
                 })?;
         }
 
-        // Create DLQ producer if configured.
+        // Create DLQ producer if configured. Inherits security settings
+        // (SASL, SSL) from the main producer config but is non-transactional.
+        // DLQ records bypass the exactly-once transaction to avoid coupling
+        // error routing with the main data path.
         if self.config.dlq_topic.is_some() {
-            let dlq_producer: FutureProducer = ClientConfig::new()
-                .set("bootstrap.servers", &self.config.bootstrap_servers)
-                .set("enable.idempotence", "true")
-                .create()
-                .map_err(|e| {
-                    ConnectorError::ConnectionFailed(format!("failed to create DLQ producer: {e}"))
-                })?;
+            let dlq_config = self.config.to_dlq_rdkafka_config();
+            let dlq_producer: FutureProducer = dlq_config.create().map_err(|e| {
+                ConnectorError::ConnectionFailed(format!("failed to create DLQ producer: {e}"))
+            })?;
             self.dlq_producer = Some(dlq_producer);
         }
 
@@ -509,10 +511,10 @@ impl SinkConnector for KafkaSink {
         let mut records_written: usize = 0;
         let mut bytes_written: u64 = 0;
 
-        // Phase 1: Enqueue all records into librdkafka's internal queue.
-        // producer.send() copies data synchronously and returns a
-        // DeliveryFuture, allowing rdkafka to batch network writes
-        // instead of waiting for each acknowledgement sequentially.
+        // Phase 1: Enqueue records into librdkafka's internal queue.
+        // Flush every flush_batch_size records to bound memory usage
+        // and provide delivery confirmation in chunks.
+        let flush_threshold = self.config.flush_batch_size;
         let mut delivery_futures = Vec::with_capacity(payloads.len());
         for (i, payload) in payloads.iter().enumerate() {
             let key: Option<&[u8]> = keys.as_ref().map(|kb| kb.key(i)).filter(|k| !k.is_empty());
@@ -530,7 +532,17 @@ impl SinkConnector for KafkaSink {
                 record = record.partition(p);
             }
 
-            delivery_futures.push(producer.send(record, Duration::from_secs(0)));
+            // Allow 500ms for rdkafka's internal queue to drain before failing
+            // with QueueFull. Zero timeout causes legitimate messages to be
+            // rejected under transient burst load.
+            delivery_futures.push(producer.send(record, Duration::from_millis(500)));
+
+            // Intermediate flush to bound in-flight records and memory.
+            if flush_threshold > 0 && (i + 1) % flush_threshold == 0 {
+                producer
+                    .flush(self.config.delivery_timeout)
+                    .map_err(|e| ConnectorError::WriteError(format!("flush failed: {e}")))?;
+            }
         }
 
         // Phase 2: Collect delivery reports.
@@ -777,14 +789,25 @@ impl std::fmt::Debug for KafkaSink {
 }
 
 /// Selects the appropriate serializer for the given format.
-fn select_serializer(format: Format, schema: &SchemaRef) -> Box<dyn RecordSerializer> {
+///
+/// For Avro, uses the shared `schema_id` handle so that Schema Registry
+/// registration updates are visible to the serializer.
+fn select_serializer(
+    format: Format,
+    schema: &SchemaRef,
+    schema_id: Arc<std::sync::atomic::AtomicU32>,
+    registry: Option<Arc<SchemaRegistryClient>>,
+) -> Box<dyn RecordSerializer> {
     match format {
-        Format::Avro => {
-            // Without schema registry, use schema ID 0 (placeholder).
-            Box::new(AvroSerializer::new(schema.clone(), 0))
-        }
-        other => serde::create_serializer(other)
-            .expect("supported format should always create a serializer"),
+        Format::Avro => Box::new(AvroSerializer::with_shared_schema_id(
+            schema.clone(),
+            schema_id,
+            registry,
+        )),
+        other => serde::create_serializer(other).unwrap_or_else(|_| {
+            tracing::warn!(format = %other, "unsupported serializer format, falling back to JSON");
+            Box::new(serde::json::JsonSerializer::new())
+        }),
     }
 }
 

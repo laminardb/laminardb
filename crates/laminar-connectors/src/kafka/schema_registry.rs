@@ -182,16 +182,31 @@ impl SchemaRegistryClient {
         Self::with_cache_config(base_url, auth, SchemaRegistryCacheConfig::default())
     }
 
-    /// Creates a new Schema Registry client with a custom CA certificate.
+    /// Creates a TLS client (CA cert only). Delegates to [`Self::with_tls_mtls`].
     ///
     /// # Errors
     ///
-    /// Returns `ConnectorError::ConfigurationError` if the CA cert file
-    /// cannot be read or parsed.
+    /// Returns `ConnectorError::ConfigurationError` if the CA cert cannot be read.
     pub fn with_tls(
         base_url: impl Into<String>,
         auth: Option<SrAuth>,
         ca_cert_path: &str,
+    ) -> Result<Self, ConnectorError> {
+        Self::with_tls_mtls(base_url, auth, ca_cert_path, None, None)
+    }
+
+    /// Creates a client with full TLS/mTLS support.
+    ///
+    /// # Errors
+    ///
+    /// Returns `ConnectorError::ConfigurationError` if any cert/key file
+    /// cannot be read or parsed.
+    pub fn with_tls_mtls(
+        base_url: impl Into<String>,
+        auth: Option<SrAuth>,
+        ca_cert_path: &str,
+        client_cert_path: Option<&str>,
+        client_key_path: Option<&str>,
     ) -> Result<Self, ConnectorError> {
         let pem = std::fs::read(ca_cert_path).map_err(|e| {
             ConnectorError::ConfigurationError(format!(
@@ -203,12 +218,36 @@ impl SchemaRegistryClient {
                 "invalid PEM CA cert at '{ca_cert_path}': {e}"
             ))
         })?;
-        let client = Client::builder()
-            .add_root_certificate(cert)
-            .build()
-            .map_err(|e| {
-                ConnectorError::ConfigurationError(format!("failed to build TLS client: {e}"))
+
+        let mut builder = Client::builder().add_root_certificate(cert);
+
+        if client_cert_path.is_some() != client_key_path.is_some() {
+            return Err(ConnectorError::ConfigurationError(
+                "mTLS requires both client cert and key — only one was provided".into(),
+            ));
+        }
+        if let (Some(cert_path), Some(key_path)) = (client_cert_path, client_key_path) {
+            let mut identity_pem = std::fs::read(cert_path).map_err(|e| {
+                ConnectorError::ConfigurationError(format!(
+                    "failed to read SR client cert at '{cert_path}': {e}"
+                ))
             })?;
+            let key_pem = std::fs::read(key_path).map_err(|e| {
+                ConnectorError::ConfigurationError(format!(
+                    "failed to read SR client key at '{key_path}': {e}"
+                ))
+            })?;
+            // reqwest Identity expects cert + key concatenated in PEM format.
+            identity_pem.extend_from_slice(&key_pem);
+            let identity = reqwest::tls::Identity::from_pem(&identity_pem).map_err(|e| {
+                ConnectorError::ConfigurationError(format!("invalid client cert/key PEM: {e}"))
+            })?;
+            builder = builder.identity(identity);
+        }
+
+        let client = builder.build().map_err(|e| {
+            ConnectorError::ConfigurationError(format!("failed to build TLS client: {e}"))
+        })?;
 
         let cache_config = SchemaRegistryCacheConfig::default();
         let cache = CacheBuilder::new(cache_config.max_entries)
@@ -606,31 +645,79 @@ impl SchemaRegistryClient {
     }
 
     /// Helper to perform a GET request and deserialize JSON.
+    ///
+    /// Retries transient failures (5xx, timeouts) up to 3 attempts with
+    /// exponential backoff (100ms, 500ms). 4xx client errors fail immediately.
     async fn get_json<T: serde::de::DeserializeOwned>(
         &self,
         url: &str,
     ) -> Result<T, ConnectorError> {
-        let mut req = self.client.get(url);
-        if let Some(ref auth) = self.auth {
-            req = req.basic_auth(&auth.username, Some(&auth.password));
-        }
+        let backoffs = [
+            std::time::Duration::from_millis(100),
+            std::time::Duration::from_millis(500),
+        ];
+        let mut last_err = None;
 
-        let resp = req
-            .send()
-            .await
-            .map_err(|e| ConnectorError::ConnectionFailed(format!("schema registry: {e}")))?;
+        for (attempt, backoff) in std::iter::once(&std::time::Duration::ZERO)
+            .chain(backoffs.iter())
+            .enumerate()
+        {
+            if attempt > 0 {
+                tokio::time::sleep(*backoff).await;
+            }
 
-        if !resp.status().is_success() {
+            let mut req = self.client.get(url);
+            if let Some(ref auth) = self.auth {
+                req = req.basic_auth(&auth.username, Some(&auth.password));
+            }
+
+            let resp = match req.send().await {
+                Ok(r) => r,
+                Err(e) => {
+                    tracing::warn!(
+                        attempt = attempt + 1,
+                        error = %e,
+                        "schema registry request failed, retrying"
+                    );
+                    last_err = Some(ConnectorError::ConnectionFailed(format!(
+                        "schema registry: {e}"
+                    )));
+                    continue;
+                }
+            };
+
             let status = resp.status();
+            if status.is_success() {
+                return resp.json::<T>().await.map_err(|e| {
+                    ConnectorError::Internal(format!(
+                        "failed to parse schema registry response: {e}"
+                    ))
+                });
+            }
+
+            // Client errors (4xx) are not retryable.
+            if status.is_client_error() {
+                let text = resp.text().await.unwrap_or_default();
+                return Err(ConnectorError::ConnectionFailed(format!(
+                    "schema registry client error: {status} {text}"
+                )));
+            }
+
+            // Server errors (5xx) are retryable.
             let text = resp.text().await.unwrap_or_default();
-            return Err(ConnectorError::ConnectionFailed(format!(
+            tracing::warn!(
+                attempt = attempt + 1,
+                status = %status,
+                "schema registry server error, retrying"
+            );
+            last_err = Some(ConnectorError::ConnectionFailed(format!(
                 "schema registry request failed: {status} {text}"
             )));
         }
 
-        resp.json::<T>().await.map_err(|e| {
-            ConnectorError::Internal(format!("failed to parse schema registry response: {e}"))
-        })
+        Err(last_err.unwrap_or_else(|| {
+            ConnectorError::ConnectionFailed("schema registry: all retries exhausted".into())
+        }))
     }
 }
 

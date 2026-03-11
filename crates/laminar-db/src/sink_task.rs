@@ -12,6 +12,7 @@
 //! - `RollbackEpoch` — abort a failed epoch
 //! - `Close` — flush + close the connector
 
+use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::sync::Arc;
 use std::time::Duration;
 
@@ -31,6 +32,11 @@ const DEFAULT_FLUSH_INTERVAL: Duration = Duration::from_secs(5);
 pub(crate) enum SinkCommand {
     /// Write a batch to the sink.
     WriteBatch { batch: RecordBatch },
+    /// Begin a new epoch (starts Kafka transaction for exactly-once sinks).
+    BeginEpoch {
+        epoch: u64,
+        ack: oneshot::Sender<Result<(), ConnectorError>>,
+    },
     /// Explicitly flush buffered data (test-only).
     #[cfg(test)]
     Flush {
@@ -70,6 +76,12 @@ pub(crate) struct SinkTaskHandle {
     /// Implicit shutdown (channel drop) works without awaiting the handle.
     #[allow(dead_code)] // used by close(); implicit channel-drop handles normal shutdown
     task: Arc<tokio::sync::Mutex<Option<JoinHandle<()>>>>,
+    /// Shared with the task loop; read via `write_error_count()`.
+    write_errors: Arc<AtomicU64>,
+    /// Shared with the task loop for epoch poisoning. The struct holds the
+    /// Arc to keep it alive; the task loop reads/writes it directly.
+    #[allow(dead_code)]
+    epoch_poisoned: Arc<AtomicBool>,
 }
 
 impl SinkTaskHandle {
@@ -94,13 +106,24 @@ impl SinkTaskHandle {
     ) -> Self {
         let (tx, rx) = mpsc::channel(channel_capacity);
         let task_name = name.clone();
-        let handle = tokio::spawn(run_sink_task(task_name, connector, rx, flush_interval));
+        let write_errors = Arc::new(AtomicU64::new(0));
+        let epoch_poisoned = Arc::new(AtomicBool::new(false));
+        let handle = tokio::spawn(run_sink_task(
+            task_name,
+            connector,
+            rx,
+            flush_interval,
+            Arc::clone(&write_errors),
+            Arc::clone(&epoch_poisoned),
+        ));
 
         Self {
             name: Arc::from(name),
             tx,
             exactly_once,
             task: Arc::new(tokio::sync::Mutex::new(Some(handle))),
+            write_errors,
+            epoch_poisoned,
         }
     }
 
@@ -116,6 +139,35 @@ impl SinkTaskHandle {
                     self.name
                 ))
             })
+    }
+
+    /// Begins a new epoch (starts a Kafka transaction for exactly-once sinks).
+    ///
+    /// Must be called before `write_batch()` for each epoch when using
+    /// exactly-once delivery. For at-least-once sinks this is a no-op.
+    pub async fn begin_epoch(&self, epoch: u64) -> Result<(), ConnectorError> {
+        let (ack_tx, ack_rx) = oneshot::channel();
+        self.tx
+            .send(SinkCommand::BeginEpoch { epoch, ack: ack_tx })
+            .await
+            .map_err(|_| {
+                ConnectorError::ConnectionFailed(format!(
+                    "sink task '{}' closed unexpectedly",
+                    self.name
+                ))
+            })?;
+        ack_rx.await.map_err(|_| {
+            ConnectorError::ConnectionFailed(format!(
+                "sink task '{}' dropped begin-epoch acknowledgment",
+                self.name
+            ))
+        })?
+    }
+
+    /// Returns the cumulative count of write errors.
+    #[allow(dead_code)] // will be wired to pipeline metrics
+    pub fn write_error_count(&self) -> u64 {
+        self.write_errors.load(Ordering::Relaxed)
     }
 
     /// Requests an explicit flush and waits for acknowledgment.
@@ -210,11 +262,14 @@ impl SinkTaskHandle {
 /// Main loop for a sink task.
 ///
 /// Owns the `SinkConnector` exclusively — no external locking needed.
+#[allow(clippy::too_many_lines)]
 async fn run_sink_task(
     name: String,
     mut sink: Box<dyn SinkConnector>,
     mut rx: mpsc::Receiver<SinkCommand>,
     flush_interval: Duration,
+    write_errors: Arc<AtomicU64>,
+    epoch_poisoned: Arc<AtomicBool>,
 ) {
     let mut flush_timer = tokio::time::interval(flush_interval);
     flush_timer.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
@@ -238,12 +293,22 @@ async fn run_sink_task(
                 match cmd {
                     SinkCommand::WriteBatch { batch } => {
                         if let Err(e) = sink.write_batch(&batch).await {
+                            write_errors.fetch_add(1, Ordering::Relaxed);
+                            epoch_poisoned.store(true, Ordering::Release);
                             tracing::warn!(
                                 sink = %name,
                                 error = %e,
-                                "Sink write error"
+                                write_errors = write_errors.load(Ordering::Relaxed),
+                                "Sink write error — epoch poisoned"
                             );
                         }
+                    }
+                    SinkCommand::BeginEpoch { epoch, ack } => {
+                        let result = sink.begin_epoch(epoch).await;
+                        if result.is_ok() {
+                            epoch_poisoned.store(false, Ordering::Release);
+                        }
+                        let _ = ack.send(result);
                     }
                     #[cfg(test)]
                     SinkCommand::Flush { ack } => {
@@ -251,11 +316,23 @@ async fn run_sink_task(
                         let _ = ack.send(result);
                     }
                     SinkCommand::PreCommit { epoch, ack } => {
-                        let result = sink.pre_commit(epoch).await;
+                        let result = if epoch_poisoned.load(Ordering::Acquire) {
+                            Err(ConnectorError::WriteError(
+                                "epoch poisoned by prior write failure".into(),
+                            ))
+                        } else {
+                            sink.pre_commit(epoch).await
+                        };
                         let _ = ack.send(result);
                     }
                     SinkCommand::CommitEpoch { epoch, ack } => {
-                        let result = sink.commit_epoch(epoch).await;
+                        let result = if epoch_poisoned.load(Ordering::Acquire) {
+                            Err(ConnectorError::WriteError(
+                                "epoch poisoned by prior write failure".into(),
+                            ))
+                        } else {
+                            sink.commit_epoch(epoch).await
+                        };
                         let _ = ack.send(result);
                     }
                     SinkCommand::RollbackEpoch { epoch } => {

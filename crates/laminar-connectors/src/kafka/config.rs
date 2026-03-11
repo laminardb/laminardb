@@ -379,7 +379,7 @@ impl std::fmt::Display for CompatibilityLevel {
 }
 
 /// Schema Registry authentication credentials.
-#[derive(Debug, Clone)]
+#[derive(Clone)]
 pub struct SrAuth {
     /// Basic auth username.
     pub username: String,
@@ -387,8 +387,20 @@ pub struct SrAuth {
     pub password: String,
 }
 
+impl std::fmt::Debug for SrAuth {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("SrAuth")
+            .field("username", &self.username)
+            .field("password", &"***")
+            .finish()
+    }
+}
+
 /// Kafka source connector configuration.
-#[derive(Debug, Clone)]
+///
+/// Uses a custom `Debug` impl that redacts `sasl_password` and
+/// `ssl_key_password` to prevent credential leakage in logs.
+#[derive(Clone)]
 pub struct KafkaSourceConfig {
     // -- Required --
     /// Comma-separated list of broker addresses.
@@ -397,9 +409,6 @@ pub struct KafkaSourceConfig {
     pub group_id: String,
     /// Topic subscription (explicit list or regex pattern).
     pub subscription: TopicSubscription,
-    /// Topics to subscribe to (deprecated: use `subscription` instead).
-    #[deprecated(since = "0.2.0", note = "use `subscription` field instead")]
-    pub topics: Vec<String>,
 
     // -- Security --
     /// Security protocol for broker connections.
@@ -450,12 +459,8 @@ pub struct KafkaSourceConfig {
     pub isolation_level: IsolationLevel,
     /// Maximum records per poll batch.
     pub max_poll_records: usize,
-    /// Timeout for each poll call.
-    pub poll_timeout: Duration,
     /// Partition assignment strategy.
     pub partition_assignment_strategy: AssignmentStrategy,
-    /// How often to commit offsets to Kafka.
-    pub commit_interval: Duration,
     /// Minimum bytes to return from a fetch (allows batching).
     pub fetch_min_bytes: Option<i32>,
     /// Maximum bytes to return from broker per request.
@@ -490,14 +495,32 @@ pub struct KafkaSourceConfig {
     pub kafka_properties: HashMap<String, String>,
 }
 
+impl std::fmt::Debug for KafkaSourceConfig {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("KafkaSourceConfig")
+            .field("bootstrap_servers", &self.bootstrap_servers)
+            .field("group_id", &self.group_id)
+            .field("subscription", &self.subscription)
+            .field("format", &self.format)
+            .field("security_protocol", &self.security_protocol)
+            .field("sasl_mechanism", &self.sasl_mechanism)
+            .field("sasl_username", &self.sasl_username)
+            .field("sasl_password", &self.sasl_password.as_ref().map(|_| "***"))
+            .field(
+                "ssl_key_password",
+                &self.ssl_key_password.as_ref().map(|_| "***"),
+            )
+            .field("max_poll_records", &self.max_poll_records)
+            .finish_non_exhaustive()
+    }
+}
+
 impl Default for KafkaSourceConfig {
-    #[allow(deprecated)]
     fn default() -> Self {
         Self {
             bootstrap_servers: String::new(),
             group_id: String::new(),
             subscription: TopicSubscription::default(),
-            topics: Vec::new(),
             security_protocol: SecurityProtocol::default(),
             sasl_mechanism: None,
             sasl_username: None,
@@ -520,9 +543,7 @@ impl Default for KafkaSourceConfig {
             auto_offset_reset: OffsetReset::Earliest,
             isolation_level: IsolationLevel::default(),
             max_poll_records: 1000,
-            poll_timeout: Duration::from_millis(100),
             partition_assignment_strategy: AssignmentStrategy::Range,
-            commit_interval: Duration::from_secs(5),
             fetch_min_bytes: None,
             fetch_max_bytes: None,
             fetch_max_wait_ms: None,
@@ -560,11 +581,6 @@ impl KafkaSourceConfig {
                 .map(|s| s.trim().to_string())
                 .collect();
             TopicSubscription::Topics(topics.clone())
-        };
-
-        let topics = match &subscription {
-            TopicSubscription::Topics(t) => t.clone(),
-            TopicSubscription::Pattern(_) => Vec::new(),
         };
 
         let security_protocol = match config.get("security.protocol") {
@@ -666,16 +682,10 @@ impl KafkaSourceConfig {
             .get_parsed::<usize>("max.poll.records")?
             .unwrap_or(1000);
 
-        let poll_timeout_ms = config.get_parsed::<u64>("poll.timeout.ms")?.unwrap_or(100);
-
         let partition_assignment_strategy = match config.get("partition.assignment.strategy") {
             Some(s) => s.parse::<AssignmentStrategy>()?,
             None => AssignmentStrategy::Range,
         };
-
-        let commit_interval_ms = config
-            .get_parsed::<u64>("commit.interval.ms")?
-            .unwrap_or(5000);
 
         let fetch_min_bytes = config.get_parsed::<i32>("fetch.min.bytes")?;
         let fetch_max_bytes = config.get_parsed::<i32>("fetch.max.bytes")?;
@@ -720,7 +730,6 @@ impl KafkaSourceConfig {
             bootstrap_servers,
             group_id,
             subscription,
-            topics,
             security_protocol,
             sasl_mechanism,
             sasl_username,
@@ -743,9 +752,7 @@ impl KafkaSourceConfig {
             auto_offset_reset,
             isolation_level,
             max_poll_records,
-            poll_timeout: Duration::from_millis(poll_timeout_ms),
             partition_assignment_strategy,
-            commit_interval: Duration::from_millis(commit_interval_ms),
             fetch_min_bytes,
             fetch_max_bytes,
             fetch_max_wait_ms,
@@ -910,13 +917,41 @@ impl KafkaSourceConfig {
             config.set("max.partition.fetch.bytes", partition_max.to_string());
         }
 
-        // Apply pass-through properties (these can override defaults).
+        // Apply pass-through properties, blocking security-critical keys
+        // that could silently downgrade authentication or break semantics.
         for (key, value) in &self.kafka_properties {
+            if is_blocked_passthrough_key(key) {
+                tracing::warn!(
+                    key,
+                    "ignoring kafka.* pass-through property that overrides a security setting"
+                );
+                continue;
+            }
             config.set(key, value);
         }
 
         config
     }
+}
+
+/// Returns `true` if a pass-through kafka.* key must not override explicit settings.
+fn is_blocked_passthrough_key(key: &str) -> bool {
+    key.starts_with("sasl.kerberos.")
+        || matches!(
+            key,
+            "security.protocol"
+                | "sasl.mechanism"
+                | "sasl.username"
+                | "sasl.password"
+                | "sasl.oauthbearer.config"
+                | "ssl.ca.location"
+                | "ssl.certificate.location"
+                | "ssl.key.location"
+                | "ssl.key.password"
+                | "ssl.endpoint.identification.algorithm"
+                | "enable.auto.commit"
+                | "enable.idempotence"
+        )
 }
 
 /// Parses a specific offsets string in the format "partition:offset,partition:offset,...".
@@ -982,7 +1017,7 @@ mod tests {
         let cfg = KafkaSourceConfig::from_config(&make_config(&[])).unwrap();
         assert_eq!(cfg.bootstrap_servers, "localhost:9092");
         assert_eq!(cfg.group_id, "test-group");
-        assert_eq!(cfg.topics, vec!["events"]);
+        assert_eq!(cfg.subscription.topics().unwrap(), &["events"]);
         assert!(matches!(
             cfg.subscription,
             TopicSubscription::Topics(ref t) if t == &["events"]
@@ -999,7 +1034,7 @@ mod tests {
     #[allow(deprecated)]
     fn test_parse_multi_topic() {
         let cfg = KafkaSourceConfig::from_config(&make_config(&[("topic", "a, b, c")])).unwrap();
-        assert_eq!(cfg.topics, vec!["a", "b", "c"]);
+        assert_eq!(cfg.subscription.topics().unwrap(), &["a", "b", "c"]);
         assert!(matches!(
             cfg.subscription,
             TopicSubscription::Topics(ref t) if t == &["a", "b", "c"]
@@ -1030,9 +1065,7 @@ mod tests {
         assert_eq!(cfg.auto_offset_reset, OffsetReset::Earliest);
         assert_eq!(cfg.isolation_level, IsolationLevel::ReadCommitted);
         assert_eq!(cfg.max_poll_records, 1000);
-        assert_eq!(cfg.poll_timeout, Duration::from_millis(100));
         assert_eq!(cfg.partition_assignment_strategy, AssignmentStrategy::Range);
-        assert_eq!(cfg.commit_interval, Duration::from_secs(5));
         assert!(!cfg.include_metadata);
         assert!(!cfg.include_headers);
         assert!(cfg.schema_registry_url.is_none());
@@ -1046,8 +1079,6 @@ mod tests {
             ("format", "csv"),
             ("auto.offset.reset", "latest"),
             ("max.poll.records", "500"),
-            ("poll.timeout.ms", "200"),
-            ("commit.interval.ms", "10000"),
             ("include.metadata", "true"),
             ("include.headers", "true"),
             ("event.time.column", "ts"),
@@ -1060,8 +1091,6 @@ mod tests {
         assert_eq!(cfg.auto_offset_reset, OffsetReset::Latest);
         assert_eq!(cfg.isolation_level, IsolationLevel::ReadUncommitted);
         assert_eq!(cfg.max_poll_records, 500);
-        assert_eq!(cfg.poll_timeout, Duration::from_millis(200));
-        assert_eq!(cfg.commit_interval, Duration::from_secs(10));
         assert!(cfg.include_metadata);
         assert!(cfg.include_headers);
         assert_eq!(cfg.event_time_column, Some("ts".to_string()));

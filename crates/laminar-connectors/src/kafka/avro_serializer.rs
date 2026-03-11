@@ -18,12 +18,6 @@ use crate::error::SerdeError;
 use crate::kafka::schema_registry::SchemaRegistryClient;
 use crate::serde::{Format, RecordSerializer};
 
-/// Confluent wire format header size (1 magic + 4 schema ID).
-const CONFLUENT_HEADER_SIZE: usize = 5;
-
-/// Confluent wire format magic byte.
-const CONFLUENT_MAGIC: u8 = 0x00;
-
 /// Avro serializer backed by `arrow-avro` with optional Schema Registry.
 ///
 /// Produces per-row byte payloads in the Confluent wire format suitable
@@ -103,33 +97,49 @@ impl AvroSerializer {
     /// Confluent wire format prefix.
     ///
     /// Each output `Vec<u8>` is: `0x00` | `schema_id` (4-byte BE) | Avro body.
+    ///
+    /// Serializes one row at a time to produce exact record boundaries.
+    /// This avoids the unsound byte-scanning approach where Avro data values
+    /// could contain the magic byte + schema ID pattern.
     fn serialize_with_confluent_prefix(
         &self,
         batch: &RecordBatch,
     ) -> Result<Vec<Vec<u8>>, SerdeError> {
-        if batch.num_rows() == 0 {
+        let num_rows = batch.num_rows();
+        if num_rows == 0 {
             return Ok(Vec::new());
         }
 
-        // Serialize all rows into a single buffer using SOE format.
-        let mut buf = Vec::new();
-        let arrow_schema = (*self.schema).clone();
-
         let id = self.schema_id.load(Ordering::Relaxed);
-        let mut writer = WriterBuilder::new(arrow_schema)
-            .with_fingerprint_strategy(FingerprintStrategy::Id(id))
-            .build::<_, AvroSoeFormat>(&mut buf)
-            .map_err(|e| SerdeError::MalformedInput(format!("failed to build Avro writer: {e}")))?;
+        // Clone schema once, outside the loop.
+        let arrow_schema = (*self.schema).clone();
+        let mut records = Vec::with_capacity(num_rows);
 
-        writer
-            .write(batch)
-            .map_err(|e| SerdeError::MalformedInput(format!("Avro encode error: {e}")))?;
+        // Serialize each row individually to get exact record boundaries.
+        // batch.slice() is zero-copy (Arc offset adjustment only).
+        for row_idx in 0..num_rows {
+            let mut buf = Vec::new();
+            let row_batch = batch.slice(row_idx, 1);
 
-        writer
-            .finish()
-            .map_err(|e| SerdeError::MalformedInput(format!("Avro flush error: {e}")))?;
+            let mut writer = WriterBuilder::new(arrow_schema.clone())
+                .with_fingerprint_strategy(FingerprintStrategy::Id(id))
+                .build::<_, AvroSoeFormat>(&mut buf)
+                .map_err(|e| {
+                    SerdeError::MalformedInput(format!("failed to build Avro writer: {e}"))
+                })?;
 
-        split_confluent_records(&buf, batch.num_rows())
+            writer
+                .write(&row_batch)
+                .map_err(|e| SerdeError::MalformedInput(format!("Avro encode error: {e}")))?;
+
+            writer
+                .finish()
+                .map_err(|e| SerdeError::MalformedInput(format!("Avro flush error: {e}")))?;
+
+            records.push(buf);
+        }
+
+        Ok(records)
     }
 }
 
@@ -177,67 +187,16 @@ impl std::fmt::Debug for AvroSerializer {
     }
 }
 
-/// Splits a buffer of concatenated Confluent-format Avro records into
-/// individual per-record payloads.
-///
-/// Each record starts with `0x00` + 4-byte BE schema ID + Avro body.
-fn split_confluent_records(buf: &[u8], expected_rows: usize) -> Result<Vec<Vec<u8>>, SerdeError> {
-    let mut records = Vec::with_capacity(expected_rows);
-    let mut offset = 0;
-
-    while offset < buf.len() {
-        // Validate magic byte.
-        if buf[offset] != CONFLUENT_MAGIC {
-            return Err(SerdeError::InvalidConfluentHeader {
-                expected: CONFLUENT_MAGIC,
-                got: buf[offset],
-            });
-        }
-
-        // Find the start of the next record (next occurrence of magic byte
-        // followed by the same schema ID).
-        let next_start = if offset + CONFLUENT_HEADER_SIZE < buf.len() {
-            let schema_id_bytes = &buf[offset + 1..offset + CONFLUENT_HEADER_SIZE];
-            find_next_record(&buf[offset + CONFLUENT_HEADER_SIZE..], schema_id_bytes)
-                .map_or(buf.len(), |pos| offset + CONFLUENT_HEADER_SIZE + pos)
-        } else {
-            buf.len()
-        };
-
-        records.push(buf[offset..next_start].to_vec());
-        offset = next_start;
-    }
-
-    if records.len() != expected_rows {
-        return Err(SerdeError::RecordCountMismatch {
-            expected: expected_rows,
-            got: records.len(),
-        });
-    }
-
-    Ok(records)
-}
-
-/// Finds the next Confluent record boundary in a buffer.
-///
-/// Looks for `0x00` followed by the expected schema ID bytes.
-fn find_next_record(buf: &[u8], schema_id_bytes: &[u8]) -> Option<usize> {
-    let mut pos = 0;
-    while pos + CONFLUENT_HEADER_SIZE <= buf.len() {
-        if buf[pos] == CONFLUENT_MAGIC
-            && buf[pos + 1..pos + CONFLUENT_HEADER_SIZE] == *schema_id_bytes
-        {
-            return Some(pos);
-        }
-        pos += 1;
-    }
-    None
-}
-
 #[cfg(test)]
 mod tests {
     use super::*;
     use arrow_array::{Int64Array, StringArray};
+
+    /// Confluent wire format header size (1 magic + 4 schema ID).
+    const CONFLUENT_HEADER_SIZE: usize = 5;
+
+    /// Confluent wire format magic byte.
+    const CONFLUENT_MAGIC: u8 = 0x00;
     use arrow_schema::{DataType, Field, Schema};
 
     fn test_schema() -> SchemaRef {

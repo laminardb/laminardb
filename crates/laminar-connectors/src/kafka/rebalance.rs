@@ -9,7 +9,7 @@
 
 use std::collections::HashSet;
 use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
-use std::sync::Arc;
+use std::sync::{Arc, Mutex};
 
 use rdkafka::consumer::ConsumerContext;
 use rdkafka::ClientContext;
@@ -25,7 +25,7 @@ pub struct RebalanceState {
 }
 
 impl RebalanceState {
-    /// Creates a new empty rebalance state.
+    /// Starts with no partitions assigned.
     #[must_use]
     pub fn new() -> Self {
         Self::default()
@@ -80,23 +80,31 @@ impl RebalanceState {
 /// Rebalance callbacks run on rdkafka's background thread, so all shared
 /// state uses `Arc` + atomic types for thread safety.
 pub struct LaminarConsumerContext {
-    /// Set to `true` on partition revocation to request an immediate checkpoint.
     checkpoint_requested: Arc<AtomicBool>,
-    /// Rebalance event counter (for observability).
     rebalance_count: AtomicU64,
+    /// Shared rebalance state updated on Assign/Revoke events.
+    rebalance_state: Arc<Mutex<RebalanceState>>,
+    /// Shared rebalance event counter for source-level metrics.
+    rebalance_metric: Arc<AtomicU64>,
 }
 
 impl LaminarConsumerContext {
-    /// Creates a new consumer context with the given checkpoint request flag.
+    /// Wires checkpoint signaling, partition tracking, and rebalance metrics.
     #[must_use]
-    pub fn new(checkpoint_requested: Arc<AtomicBool>) -> Self {
+    pub fn new(
+        checkpoint_requested: Arc<AtomicBool>,
+        rebalance_state: Arc<Mutex<RebalanceState>>,
+        rebalance_metric: Arc<AtomicU64>,
+    ) -> Self {
         Self {
             checkpoint_requested,
             rebalance_count: AtomicU64::new(0),
+            rebalance_state,
+            rebalance_metric,
         }
     }
 
-    /// Returns the total number of rebalance events observed.
+    /// Total rebalance events observed.
     #[must_use]
     pub fn rebalance_count(&self) -> u64 {
         self.rebalance_count.load(Ordering::Relaxed)
@@ -120,9 +128,24 @@ impl ConsumerContext for LaminarConsumerContext {
                     partitions_revoked = count,
                     "kafka rebalance: partitions being revoked, requesting checkpoint"
                 );
+                // Update shared rebalance state.
+                let partitions: Vec<(String, i32)> = tpl
+                    .elements()
+                    .iter()
+                    .map(|e| (e.topic().to_string(), e.partition()))
+                    .collect();
+                match self.rebalance_state.lock() {
+                    Ok(mut state) => state.on_revoke(&partitions),
+                    Err(poisoned) => {
+                        warn!("rebalance_state mutex poisoned, recovering");
+                        poisoned.into_inner().on_revoke(&partitions);
+                    }
+                }
                 self.rebalance_count
                     .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
-                self.checkpoint_requested.store(true, Ordering::Relaxed);
+                self.rebalance_metric
+                    .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+                self.checkpoint_requested.store(true, Ordering::Release);
             }
             Rebalance::Assign(tpl) => {
                 let count = tpl.count();
@@ -130,7 +153,22 @@ impl ConsumerContext for LaminarConsumerContext {
                     partitions_assigned = count,
                     "kafka rebalance: new partitions assigned"
                 );
+                // Update shared rebalance state.
+                let partitions: Vec<(String, i32)> = tpl
+                    .elements()
+                    .iter()
+                    .map(|e| (e.topic().to_string(), e.partition()))
+                    .collect();
+                match self.rebalance_state.lock() {
+                    Ok(mut state) => state.on_assign(&partitions),
+                    Err(poisoned) => {
+                        warn!("rebalance_state mutex poisoned, recovering");
+                        poisoned.into_inner().on_assign(&partitions);
+                    }
+                }
                 self.rebalance_count
+                    .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+                self.rebalance_metric
                     .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
             }
             Rebalance::Error(msg) => {
@@ -193,18 +231,24 @@ mod tests {
         assert!(!state.is_assigned("events", 0));
     }
 
+    fn make_context() -> (Arc<AtomicBool>, LaminarConsumerContext) {
+        let flag = Arc::new(AtomicBool::new(false));
+        let state = Arc::new(Mutex::new(RebalanceState::new()));
+        let metric = Arc::new(AtomicU64::new(0));
+        let ctx = LaminarConsumerContext::new(Arc::clone(&flag), state, metric);
+        (flag, ctx)
+    }
+
     #[test]
     fn test_consumer_context_initial_state() {
-        let flag = Arc::new(AtomicBool::new(false));
-        let ctx = LaminarConsumerContext::new(Arc::clone(&flag));
+        let (flag, ctx) = make_context();
         assert!(!flag.load(Ordering::Relaxed));
         assert_eq!(ctx.rebalance_count(), 0);
     }
 
     #[test]
     fn test_consumer_context_shared_flag() {
-        let flag = Arc::new(AtomicBool::new(false));
-        let _ctx = LaminarConsumerContext::new(Arc::clone(&flag));
+        let (flag, _ctx) = make_context();
 
         // Simulate what pre_rebalance(Revoke) does.
         flag.store(true, Ordering::Relaxed);

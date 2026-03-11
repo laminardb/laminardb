@@ -381,6 +381,47 @@ impl CheckpointCoordinator {
         });
     }
 
+    /// Begins the initial epoch on all exactly-once sinks.
+    ///
+    /// Must be called once after all sinks are registered and before any
+    /// writes occur. This starts the first Kafka transaction for exactly-once
+    /// sinks. Subsequent epochs are started automatically after each
+    /// successful checkpoint commit.
+    ///
+    /// # Errors
+    ///
+    /// Returns the first error from any sink that fails to begin the epoch.
+    pub async fn begin_initial_epoch(&self) -> Result<(), DbError> {
+        self.begin_epoch_for_sinks(self.epoch).await
+    }
+
+    /// Begins an epoch on all exactly-once sinks. If any sink fails,
+    /// rolls back sinks that already started the epoch.
+    async fn begin_epoch_for_sinks(&self, epoch: u64) -> Result<(), DbError> {
+        let mut started: Vec<&RegisteredSink> = Vec::new();
+        for sink in &self.sinks {
+            if sink.exactly_once {
+                match sink.handle.begin_epoch(epoch).await {
+                    Ok(()) => {
+                        started.push(sink);
+                        debug!(sink = %sink.name, epoch, "began epoch");
+                    }
+                    Err(e) => {
+                        // Roll back sinks that already started.
+                        for s in &started {
+                            s.handle.rollback_epoch(epoch).await;
+                        }
+                        return Err(DbError::Checkpoint(format!(
+                            "sink '{}' failed to begin epoch {epoch}: {e}",
+                            sink.name
+                        )));
+                    }
+                }
+            }
+        }
+        Ok(())
+    }
+
     /// Registers a reference table source connector.
     pub fn register_table_source(
         &mut self,
@@ -1218,6 +1259,20 @@ impl CheckpointCoordinator {
         self.emit_checkpoint_metrics(true, epoch, duration);
         self.adjust_interval();
 
+        // ── Step 8: Begin next epoch on exactly-once sinks ──
+        let next_epoch = self.epoch;
+        let begin_epoch_error = match self.begin_epoch_for_sinks(next_epoch).await {
+            Ok(()) => None,
+            Err(e) => {
+                error!(
+                    next_epoch,
+                    error = %e,
+                    "[LDB-6015] failed to begin next epoch — writes will be non-transactional"
+                );
+                Some(e.to_string())
+            }
+        };
+
         info!(
             checkpoint_id,
             epoch,
@@ -1225,12 +1280,15 @@ impl CheckpointCoordinator {
             "checkpoint completed"
         );
 
+        // The checkpoint itself succeeded (state persisted, sinks committed).
+        // begin_epoch failure for the *next* epoch is reported as a warning
+        // but does not retroactively fail the completed checkpoint.
         Ok(CheckpointResult {
             success: true,
             checkpoint_id,
             epoch,
             duration,
-            error: None,
+            error: begin_epoch_error,
         })
     }
 

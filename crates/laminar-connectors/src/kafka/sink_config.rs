@@ -16,7 +16,10 @@ use crate::serde::Format;
 /// Configuration for the Kafka Sink Connector.
 ///
 /// Parsed from SQL `WITH (...)` clause options.
-#[derive(Debug, Clone)]
+///
+/// Uses a custom `Debug` impl that redacts `sasl_password` and
+/// `ssl_key_password` to prevent credential leakage in logs.
+#[derive(Clone)]
 pub struct KafkaSinkConfig {
     /// Kafka broker addresses (comma-separated).
     pub bootstrap_servers: String,
@@ -78,6 +81,26 @@ pub struct KafkaSinkConfig {
     pub flush_batch_size: usize,
     /// Additional rdkafka client properties (pass-through).
     pub kafka_properties: HashMap<String, String>,
+}
+
+impl std::fmt::Debug for KafkaSinkConfig {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("KafkaSinkConfig")
+            .field("bootstrap_servers", &self.bootstrap_servers)
+            .field("topic", &self.topic)
+            .field("format", &self.format)
+            .field("delivery_guarantee", &self.delivery_guarantee)
+            .field("security_protocol", &self.security_protocol)
+            .field("sasl_mechanism", &self.sasl_mechanism)
+            .field("sasl_password", &self.sasl_password.as_ref().map(|_| "***"))
+            .field(
+                "ssl_key_password",
+                &self.ssl_key_password.as_ref().map(|_| "***"),
+            )
+            .field("partitioner", &self.partitioner)
+            .field("acks", &self.acks)
+            .finish_non_exhaustive()
+    }
 }
 
 impl Default for KafkaSinkConfig {
@@ -397,13 +420,80 @@ impl KafkaSinkConfig {
             );
         }
 
-        // Apply pass-through properties (can override any of the above).
+        // Apply pass-through properties, blocking security-critical keys
+        // that could silently downgrade authentication or break semantics.
         for (key, value) in &self.kafka_properties {
+            if is_blocked_passthrough_key(key) {
+                tracing::warn!(
+                    key,
+                    "ignoring kafka.* pass-through property that overrides a security setting"
+                );
+                continue;
+            }
             config.set(key, value);
         }
 
         config
     }
+
+    /// Builds an rdkafka [`ClientConfig`] for the dead letter queue producer.
+    ///
+    /// Inherits security settings (SASL, SSL) from the main config but is
+    /// non-transactional. Does not set `transactional.id`.
+    #[must_use]
+    pub fn to_dlq_rdkafka_config(&self) -> ClientConfig {
+        let mut config = ClientConfig::new();
+
+        config.set("bootstrap.servers", &self.bootstrap_servers);
+        config.set("security.protocol", self.security_protocol.as_rdkafka_str());
+
+        if let Some(ref mechanism) = self.sasl_mechanism {
+            config.set("sasl.mechanism", mechanism.as_rdkafka_str());
+        }
+        if let Some(ref username) = self.sasl_username {
+            config.set("sasl.username", username);
+        }
+        if let Some(ref password) = self.sasl_password {
+            config.set("sasl.password", password);
+        }
+        if let Some(ref ca) = self.ssl_ca_location {
+            config.set("ssl.ca.location", ca);
+        }
+        if let Some(ref cert) = self.ssl_certificate_location {
+            config.set("ssl.certificate.location", cert);
+        }
+        if let Some(ref key) = self.ssl_key_location {
+            config.set("ssl.key.location", key);
+        }
+        if let Some(ref key_pass) = self.ssl_key_password {
+            config.set("ssl.key.password", key_pass);
+        }
+
+        config.set("enable.idempotence", "true");
+
+        config
+    }
+}
+
+/// Returns `true` if a pass-through kafka.* key must not override explicit settings.
+fn is_blocked_passthrough_key(key: &str) -> bool {
+    key.starts_with("sasl.kerberos.")
+        || matches!(
+            key,
+            "security.protocol"
+                | "sasl.mechanism"
+                | "sasl.username"
+                | "sasl.password"
+                | "sasl.oauthbearer.config"
+                | "ssl.ca.location"
+                | "ssl.certificate.location"
+                | "ssl.key.location"
+                | "ssl.key.password"
+                | "ssl.endpoint.identification.algorithm"
+                | "enable.auto.commit"
+                | "enable.idempotence"
+                | "transactional.id"
+        )
 }
 
 /// Delivery guarantee level for the Kafka sink.
