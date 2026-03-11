@@ -292,7 +292,6 @@ mod tests {
         let path = tmp.path().to_path_buf();
 
         let file = std::fs::OpenOptions::new()
-            .write(true)
             .append(true)
             .open(&path)
             .unwrap();
