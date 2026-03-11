@@ -304,8 +304,10 @@ async fn run_sink_task(
                         }
                     }
                     SinkCommand::BeginEpoch { epoch, ack } => {
-                        epoch_poisoned.store(false, Ordering::Release);
                         let result = sink.begin_epoch(epoch).await;
+                        if result.is_ok() {
+                            epoch_poisoned.store(false, Ordering::Release);
+                        }
                         let _ = ack.send(result);
                     }
                     #[cfg(test)]
