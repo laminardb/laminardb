@@ -63,6 +63,13 @@ use super::delta_metrics::DeltaLakeSinkMetrics;
 /// On recovery, the sink checks `_delta_log/` for the last committed epoch
 /// via `txn` (application transaction) metadata. If an epoch was already
 /// committed, it is skipped (idempotent commit).
+///
+/// # 2PC Protocol
+///
+/// `pre_commit()` coalesces the buffer but does NOT write to Delta.
+/// `commit_epoch()` performs the actual Delta write+commit atomically.
+/// `rollback_epoch()` discards the staged buffer without side effects.
+/// This ensures that a rolled-back epoch never leaves data in Delta.
 pub struct DeltaLakeSink {
     /// Sink configuration.
     config: DeltaLakeSinkConfig,
@@ -93,6 +100,14 @@ pub struct DeltaLakeSink {
     table: Option<DeltaTable>,
     /// Whether the current epoch was skipped (already committed).
     epoch_skipped: bool,
+    /// Staged batches ready for commit (populated by `pre_commit()`, consumed
+    /// by `commit_epoch()`). This separation ensures `rollback_epoch()` can
+    /// discard prepared data without leaving orphan files in Delta.
+    staged_batches: Vec<RecordBatch>,
+    /// Rows staged for commit (mirrors `staged_batches`).
+    staged_rows: usize,
+    /// Estimated bytes staged for commit.
+    staged_bytes: u64,
     /// Cancellation token for the background compaction task.
     #[cfg(feature = "delta-lake")]
     compaction_cancel: Option<tokio_util::sync::CancellationToken>,
@@ -119,6 +134,9 @@ impl DeltaLakeSink {
             buffer_start_time: None,
             metrics: DeltaLakeSinkMetrics::new(),
             epoch_skipped: false,
+            staged_batches: Vec::new(),
+            staged_rows: 0,
+            staged_bytes: 0,
             #[cfg(feature = "delta-lake")]
             table: None,
             #[cfg(feature = "delta-lake")]
@@ -230,48 +248,21 @@ impl DeltaLakeSink {
             .sum()
     }
 
-    /// Flushes the internal buffer (updates metrics; actual Parquet write
-    /// happens via the `deltalake` crate when the `delta-lake` feature is
-    /// enabled).
-    #[cfg(not(feature = "delta-lake"))]
-    fn flush_buffer_local(&mut self) -> WriteResult {
-        let total_rows = self.buffered_rows;
-        let estimated_bytes = self.buffered_bytes;
-
-        self.pending_files += 1;
-
-        self.buffer.clear();
-        self.buffered_rows = 0;
-        self.buffered_bytes = 0;
-        self.buffer_start_time = None;
-
-        self.metrics
-            .record_flush(total_rows as u64, estimated_bytes);
-
-        debug!(
-            rows = total_rows,
-            bytes = estimated_bytes,
-            pending_files = self.pending_files,
-            "Delta Lake: flushed buffer to Parquet"
-        );
-
-        WriteResult::new(total_rows, estimated_bytes)
-    }
-
-    /// Writes all buffered data to Delta Lake as a single atomic transaction.
+    /// Writes all staged data to Delta Lake as a single atomic transaction.
     ///
-    /// Called from `pre_commit()` only — never mid-epoch. This ensures rollback
-    /// can discard the buffer without leaving orphaned commits.
+    /// Called from `commit_epoch()` only — after the checkpoint manifest is
+    /// persisted. This ensures `rollback_epoch()` can discard staged data
+    /// without leaving orphaned files in Delta.
     #[cfg(feature = "delta-lake")]
-    async fn flush_buffer_to_delta(&mut self) -> Result<WriteResult, ConnectorError> {
-        if self.buffer.is_empty() {
+    async fn flush_staged_to_delta(&mut self) -> Result<WriteResult, ConnectorError> {
+        if self.staged_batches.is_empty() {
             return Ok(WriteResult::new(0, 0));
         }
 
-        let total_rows = self.buffered_rows;
-        let estimated_bytes = self.buffered_bytes;
+        let total_rows = self.staged_rows;
+        let estimated_bytes = self.staged_bytes;
 
-        // Take the table and buffer for the write operation.
+        // Take the table and staged batches for the write operation.
         let mut table = self
             .table
             .take()
@@ -280,7 +271,9 @@ impl DeltaLakeSink {
                 actual: "table not initialized".into(),
             })?;
 
-        let batches = std::mem::take(&mut self.buffer);
+        let batches = std::mem::take(&mut self.staged_batches);
+        self.staged_rows = 0;
+        self.staged_bytes = 0;
 
         if self.config.write_mode == DeltaWriteMode::Upsert {
             // ── Upsert/Merge path ──
@@ -343,9 +336,6 @@ impl DeltaLakeSink {
         }
         self.table = Some(table);
         self.pending_files = 0;
-        self.buffered_rows = 0;
-        self.buffered_bytes = 0;
-        self.buffer_start_time = None;
 
         self.metrics
             .record_flush(total_rows as u64, estimated_bytes);
@@ -355,7 +345,7 @@ impl DeltaLakeSink {
             rows = total_rows,
             bytes = estimated_bytes,
             delta_version = self.delta_version,
-            "Delta Lake: flushed and committed buffer"
+            "Delta Lake: committed staged data to Delta"
         );
 
         Ok(WriteResult::new(total_rows, estimated_bytes))
@@ -367,6 +357,10 @@ impl DeltaLakeSink {
     fn commit_local(&mut self, epoch: u64) {
         self.delta_version += 1;
         self.pending_files = 0;
+
+        // Record flush metrics for staged data.
+        self.metrics
+            .record_flush(self.staged_rows as u64, self.staged_bytes);
         self.metrics.record_commit(self.delta_version);
 
         debug!(
@@ -725,21 +719,24 @@ impl SinkConnector for DeltaLakeSink {
             return Ok(());
         }
 
-        // Write any remaining buffered data to Parquet files (phase 1).
-        #[cfg(feature = "delta-lake")]
-        {
-            if !self.buffer.is_empty() {
-                self.flush_buffer_to_delta().await?;
-            }
-        }
-        #[cfg(not(feature = "delta-lake"))]
-        {
-            if !self.buffer.is_empty() {
-                let _ = self.flush_buffer_local();
-            }
+        // Stage buffered data for commit. The actual Delta write happens in
+        // commit_epoch() — this ensures rollback_epoch() can discard the data
+        // without leaving orphan files in Delta.
+        if !self.buffer.is_empty() {
+            self.staged_batches = std::mem::take(&mut self.buffer);
+            self.staged_rows = self.buffered_rows;
+            self.staged_bytes = self.buffered_bytes;
+            self.buffered_rows = 0;
+            self.buffered_bytes = 0;
+            self.buffer_start_time = None;
         }
 
-        debug!(epoch, "Delta Lake: pre-committed (files written)");
+        #[cfg(not(feature = "delta-lake"))]
+        {
+            self.pending_files += 1;
+        }
+
+        debug!(epoch, "Delta Lake: pre-committed (batches staged)");
         Ok(())
     }
 
@@ -751,11 +748,20 @@ impl SinkConnector for DeltaLakeSink {
             return Ok(());
         }
 
-        // Commit all pending files as a single Delta Lake transaction (phase 2).
+        // Write staged data to Delta as a single atomic transaction.
+        #[cfg(feature = "delta-lake")]
+        {
+            if !self.staged_batches.is_empty() {
+                self.flush_staged_to_delta().await?;
+            }
+        }
         #[cfg(not(feature = "delta-lake"))]
         {
-            if self.pending_files > 0 {
+            if self.pending_files > 0 || !self.staged_batches.is_empty() {
                 self.commit_local(epoch);
+                self.staged_batches.clear();
+                self.staged_rows = 0;
+                self.staged_bytes = 0;
             }
         }
 
@@ -771,12 +777,16 @@ impl SinkConnector for DeltaLakeSink {
     }
 
     async fn rollback_epoch(&mut self, epoch: u64) -> Result<(), ConnectorError> {
-        // Discard buffered data and pending files.
+        // Discard both buffered and staged data. Because the actual Delta
+        // write only happens in commit_epoch(), no orphan files are created.
         self.buffer.clear();
         self.buffered_rows = 0;
         self.buffered_bytes = 0;
         self.pending_files = 0;
         self.buffer_start_time = None;
+        self.staged_batches.clear();
+        self.staged_rows = 0;
+        self.staged_bytes = 0;
 
         self.epoch_skipped = false;
         self.metrics.record_rollback();
@@ -820,7 +830,7 @@ impl SinkConnector for DeltaLakeSink {
 
     async fn flush(&mut self) -> Result<(), ConnectorError> {
         // Coalesce buffered batches to reduce memory fragmentation.
-        // Actual Delta write is deferred to pre_commit().
+        // Actual Delta write is deferred to commit_epoch().
         if self.buffer.len() > 1 {
             let schema = self.buffer[0].schema();
             let combined = arrow_select::concat::concat_batches(&schema, &self.buffer)
@@ -1210,6 +1220,35 @@ mod tests {
         assert_eq!(sink.pending_files, 0);
     }
 
+    /// D001: Rollback after pre_commit must discard staged data.
+    /// pre_commit stages batches; rollback discards them without writing to Delta.
+    #[tokio::test]
+    async fn test_rollback_after_pre_commit_discards_staged() {
+        let mut config = test_config();
+        config.max_buffer_records = 1000;
+        let mut sink = DeltaLakeSink::new(config);
+        sink.state = ConnectorState::Running;
+
+        sink.begin_epoch(1).await.unwrap();
+        let batch = test_batch(50);
+        sink.write_batch(&batch).await.unwrap();
+        assert_eq!(sink.buffered_rows(), 50);
+
+        // pre_commit stages the buffer
+        sink.pre_commit(1).await.unwrap();
+        assert_eq!(sink.buffered_rows(), 0);
+        assert_eq!(sink.staged_rows, 50);
+        assert!(!sink.staged_batches.is_empty());
+
+        // rollback discards both buffer and staged data
+        sink.rollback_epoch(1).await.unwrap();
+        assert_eq!(sink.buffered_rows(), 0);
+        assert_eq!(sink.staged_rows, 0);
+        assert_eq!(sink.staged_bytes, 0);
+        assert!(sink.staged_batches.is_empty());
+        assert_eq!(sink.delta_version(), 0); // no Delta write occurred
+    }
+
     #[tokio::test]
     async fn test_commit_empty_epoch() {
         let mut sink = DeltaLakeSink::new(test_config());
@@ -1409,7 +1448,7 @@ mod tests {
     // needs a real table. See delta_io::tests for integration coverage.
     #[cfg(not(feature = "delta-lake"))]
     #[tokio::test]
-    async fn test_metrics_after_flush() {
+    async fn test_metrics_after_commit() {
         let mut sink = DeltaLakeSink::new(test_config());
         sink.state = ConnectorState::Running;
 
@@ -1417,8 +1456,9 @@ mod tests {
         sink.write_batch(&batch).await.unwrap();
         assert_eq!(sink.buffered_rows(), 10);
 
-        // Metrics are recorded on flush, not on write_batch.
+        // Metrics are recorded on commit_epoch, not on pre_commit.
         sink.pre_commit(0).await.unwrap();
+        sink.commit_epoch(0).await.unwrap();
         let m = sink.metrics();
         assert_eq!(m.records_total, 10);
         assert!(m.bytes_total > 0);
