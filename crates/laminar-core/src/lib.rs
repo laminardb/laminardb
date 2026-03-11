@@ -54,6 +54,8 @@ pub mod reactor;
 /// Shared Arrow IPC serialization for `RecordBatch` ↔ bytes.
 pub mod serialization;
 pub mod state;
+/// Platform-abstracted non-blocking storage I/O for Ring 0.
+pub mod storage_io;
 pub mod streaming;
 pub mod subscription;
 pub mod time;

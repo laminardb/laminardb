@@ -322,6 +322,37 @@ pub async fn ensure_replication_slot(
     Ok(None)
 }
 
+/// Drop a PostgreSQL logical replication slot.
+///
+/// Use this for administrative cleanup when a pipeline is permanently
+/// deleted and the slot is no longer needed.  Do NOT call this on normal
+/// shutdown — the slot must survive restarts for resume-from-checkpoint.
+///
+/// An unconsumed slot holds WAL on the server until it is either consumed
+/// or dropped.  Monitor `pg_replication_slots` for stale slots.
+///
+/// # Errors
+///
+/// Returns `ConnectorError` if the DROP fails (e.g., slot does not exist,
+/// or it is still active).
+#[cfg(feature = "postgres-cdc")]
+pub async fn drop_replication_slot(
+    client: &tokio_postgres::Client,
+    slot_name: &str,
+) -> Result<(), ConnectorError> {
+    client
+        .execute(
+            "SELECT pg_drop_replication_slot($1)",
+            &[&slot_name],
+        )
+        .await
+        .map_err(|e| {
+            ConnectorError::ConnectionFailed(format!("drop replication slot '{slot_name}': {e}"))
+        })?;
+    tracing::info!(slot = slot_name, "dropped replication slot");
+    Ok(())
+}
+
 /// Builds a [`pgwire_replication::ReplicationConfig`] from a
 /// [`PostgresCdcConfig`](super::config::PostgresCdcConfig).
 ///

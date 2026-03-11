@@ -184,6 +184,18 @@ pub struct TpcConfig {
     pub reactor_config: ReactorConfig,
     /// Enable NUMA-aware memory allocation
     pub numa_aware: bool,
+    /// Enable per-core storage I/O backend.
+    ///
+    /// When true, each core gets a [`StorageIo`](crate::storage_io::StorageIo)
+    /// instance. On Linux with `io-uring` feature, uses `io_uring` with SQPOLL.
+    /// Everywhere else, uses synchronous `std::fs`.
+    pub enable_storage_io: bool,
+    /// `io_uring` configuration (Linux only, requires `io-uring` feature).
+    ///
+    /// When `enable_storage_io` is true and this is `Some`, the `io_uring`
+    /// backend is used. When `None`, falls back to the sync backend.
+    #[cfg(all(target_os = "linux", feature = "io-uring"))]
+    pub io_uring_config: Option<crate::io_uring::IoUringConfig>,
 }
 
 impl Default for TpcConfig {
@@ -197,6 +209,9 @@ impl Default for TpcConfig {
             outbox_capacity: 8192,
             reactor_config: ReactorConfig::default(),
             numa_aware: false,
+            enable_storage_io: false,
+            #[cfg(all(target_os = "linux", feature = "io-uring"))]
+            io_uring_config: None,
         }
     }
 }
@@ -237,6 +252,9 @@ impl TpcConfig {
             outbox_capacity: recommended.queue_capacity,
             reactor_config: ReactorConfig::default(),
             numa_aware: recommended.numa_aware,
+            enable_storage_io: false,
+            #[cfg(all(target_os = "linux", feature = "io-uring"))]
+            io_uring_config: None,
         }
     }
 
@@ -371,6 +389,9 @@ impl TpcConfigBuilder {
             outbox_capacity: self.outbox_capacity.unwrap_or(8192),
             reactor_config: self.reactor_config.unwrap_or_default(),
             numa_aware: self.numa_aware.unwrap_or(false),
+            enable_storage_io: false,
+            #[cfg(all(target_os = "linux", feature = "io-uring"))]
+            io_uring_config: None,
         };
         config.validate()?;
         Ok(config)

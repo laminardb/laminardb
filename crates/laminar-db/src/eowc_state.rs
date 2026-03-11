@@ -107,22 +107,16 @@ fn assign_windows(ts_ms: i64, window_type: &EowcWindowType) -> Vec<i64> {
             }
             windows
         }
-        EowcWindowType::Session { gap_ms } => {
-            // Session windows are routed through CoreWindowState (Ring 0 operators)
-            // which implements proper gap-based merge. This EOWC fallback creates
-            // one "window" per event timestamp, which is incorrect for session
-            // semantics. It exists only as a no-crash fallback — the compiler
-            // should never route session queries here.
-            use std::sync::atomic::{AtomicBool, Ordering};
-            static WARNED: AtomicBool = AtomicBool::new(false);
-            if !WARNED.swap(true, Ordering::Relaxed) {
-                tracing::warn!(
-                    gap_ms,
-                    "session window used in EOWC path — results will be \
-                     incorrect; use Ring 0 operator routing instead"
-                );
-            }
-            vec![ts_ms]
+        EowcWindowType::Session { .. } => {
+            // Session windows MUST be routed through CoreWindowState (Ring 0
+            // operators) which implements proper gap-based merge.  The guard
+            // at stream_executor.rs:973-980 prevents session queries from
+            // reaching IncrementalEowcState.  If we get here, the routing
+            // logic has a bug — crash rather than produce wrong results.
+            unreachable!(
+                "session window reached EOWC assign_windows — \
+                 this is a routing bug; session queries must use CoreWindowState"
+            )
         }
     }
 }
@@ -817,9 +811,11 @@ mod tests {
     }
 
     #[test]
-    fn test_session_window_assignment_uses_event_timestamp() {
+    #[test]
+    #[should_panic(expected = "session window reached EOWC assign_windows")]
+    fn test_session_window_assignment_panics() {
         let wt = EowcWindowType::Session { gap_ms: 5000 };
-        assert_eq!(assign_windows(1234, &wt), vec![1234]);
+        assign_windows(1234, &wt); // must not reach EOWC path
     }
 
     #[test]

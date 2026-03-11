@@ -76,7 +76,8 @@ pub(crate) struct SinkTaskHandle {
     /// Implicit shutdown (channel drop) works without awaiting the handle.
     #[allow(dead_code)] // used by close(); implicit channel-drop handles normal shutdown
     task: Arc<tokio::sync::Mutex<Option<JoinHandle<()>>>>,
-    /// Shared with the task loop; read via `write_error_count()`.
+    /// Shared with the task loop — kept alive so the task can increment it.
+    #[allow(dead_code)]
     write_errors: Arc<AtomicU64>,
     /// Shared with the task loop for epoch poisoning. The struct holds the
     /// Arc to keep it alive; the task loop reads/writes it directly.
@@ -162,12 +163,6 @@ impl SinkTaskHandle {
                 self.name
             ))
         })?
-    }
-
-    /// Returns the cumulative count of write errors.
-    #[allow(dead_code)] // will be wired to pipeline metrics
-    pub fn write_error_count(&self) -> u64 {
-        self.write_errors.load(Ordering::Relaxed)
     }
 
     /// Requests an explicit flush and waits for acknowledgment.

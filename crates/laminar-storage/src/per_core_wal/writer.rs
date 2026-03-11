@@ -1,10 +1,18 @@
 //! Per-core WAL writer for lock-free segment writes.
+//!
+//! Supports two write paths:
+//! - **Direct** (`append` / `sync`): uses `BufWriter<File>` — always available.
+//! - **Storage I/O** (`append_via_storage_io` / `sync_via_storage_io`): uses the
+//!   [`StorageIo`] trait for non-blocking writes. On Linux with `io_uring` +
+//!   SQPOLL this is zero-syscall. On Windows it falls back to synchronous I/O
+//!   through the same trait interface.
 
 use std::fs::{File, OpenOptions};
 use std::io::{BufWriter, Write};
 use std::path::{Path, PathBuf};
 use std::time::Instant;
 
+use laminar_core::storage_io::{IoCompletion, IoFd, StorageIo, StorageIoError};
 use rkyv::api::high;
 use rkyv::rancor::Error as RkyvError;
 use rkyv::util::AlignedVec;
@@ -46,6 +54,9 @@ pub struct CoreWalWriter {
     write_buffer: Vec<u8>,
     /// Reusable rkyv serialization buffer (avoids `AlignedVec` alloc per append).
     serialize_buffer: AlignedVec,
+    /// Token from the last `sync_via_storage_io` call, if pending.
+    /// Cleared when the matching completion arrives in [`check_completions`].
+    pending_sync_token: Option<u64>,
 }
 
 impl CoreWalWriter {
@@ -76,6 +87,7 @@ impl CoreWalWriter {
             entries_since_sync: 0,
             write_buffer: Vec::with_capacity(4096),
             serialize_buffer: AlignedVec::with_capacity(256),
+            pending_sync_token: None,
         })
     }
 
@@ -106,6 +118,7 @@ impl CoreWalWriter {
             entries_since_sync: 0,
             write_buffer: Vec::with_capacity(4096),
             serialize_buffer: AlignedVec::with_capacity(256),
+            pending_sync_token: None,
         })
     }
 
@@ -198,6 +211,56 @@ impl CoreWalWriter {
         self.append(&entry)
     }
 
+    /// Appends a Put operation via [`StorageIo`].
+    ///
+    /// # Errors
+    ///
+    /// Returns an error if serialization or I/O submission fails.
+    #[inline]
+    #[allow(clippy::cast_possible_truncation)]
+    pub fn append_put_via_storage_io(
+        &mut self,
+        key: &[u8],
+        value: &[u8],
+        sio: &mut dyn StorageIo,
+        fd: IoFd,
+    ) -> Result<u64, PerCoreWalError> {
+        let ts = PerCoreWalEntry::now_ns();
+        let entry = PerCoreWalEntry::put(
+            self.core_id as u16,
+            self.epoch,
+            self.sequence,
+            key.to_vec(),
+            value.to_vec(),
+            ts,
+        );
+        self.append_via_storage_io(&entry, sio, fd)
+    }
+
+    /// Appends a Delete operation via [`StorageIo`].
+    ///
+    /// # Errors
+    ///
+    /// Returns an error if serialization or I/O submission fails.
+    #[inline]
+    #[allow(clippy::cast_possible_truncation)]
+    pub fn append_delete_via_storage_io(
+        &mut self,
+        key: &[u8],
+        sio: &mut dyn StorageIo,
+        fd: IoFd,
+    ) -> Result<u64, PerCoreWalError> {
+        let ts = PerCoreWalEntry::now_ns();
+        let entry = PerCoreWalEntry::delete(
+            self.core_id as u16,
+            self.epoch,
+            self.sequence,
+            key.to_vec(),
+            ts,
+        );
+        self.append_via_storage_io(&entry, sio, fd)
+    }
+
     /// Appends a raw entry to the WAL.
     ///
     /// Record format: `[length: 4 bytes][crc32: 4 bytes][data: length bytes]`
@@ -240,6 +303,115 @@ impl CoreWalWriter {
         self.entries_since_sync += 1;
 
         Ok(start_pos)
+    }
+
+    /// Appends a raw entry to the WAL via a [`StorageIo`] backend.
+    ///
+    /// Identical to [`append`](Self::append) but uses non-blocking I/O.
+    /// The caller must poll `sio.poll_completions()` to drain completions.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error if serialization fails or the I/O submission fails.
+    pub fn append_via_storage_io(
+        &mut self,
+        entry: &PerCoreWalEntry,
+        sio: &mut dyn StorageIo,
+        fd: IoFd,
+    ) -> Result<u64, PerCoreWalError> {
+        let start_pos = self.position;
+
+        // Serialize into reusable buffer (same path as direct append)
+        self.serialize_buffer.clear();
+        let taken = std::mem::take(&mut self.serialize_buffer);
+        let bytes = high::to_bytes_in::<_, RkyvError>(entry, taken)
+            .map_err(|e| PerCoreWalError::Serialization(e.to_string()))?;
+
+        let crc = crc32c::crc32c(&bytes);
+
+        #[allow(clippy::cast_possible_truncation)]
+        let len = bytes.len() as u32;
+        self.write_buffer.clear();
+        #[allow(clippy::cast_possible_truncation)]
+        self.write_buffer
+            .reserve(RECORD_HEADER_SIZE as usize + bytes.len());
+        self.write_buffer.extend_from_slice(&len.to_le_bytes());
+        self.write_buffer.extend_from_slice(&crc.to_le_bytes());
+        self.write_buffer.extend_from_slice(&bytes);
+
+        // Submit via StorageIo (non-blocking — data copied by backend)
+        sio.submit_append(fd, &self.write_buffer)
+            .map_err(storage_io_to_wal_error)?;
+
+        // Restore serialize buffer for reuse
+        self.serialize_buffer = bytes;
+
+        #[allow(clippy::cast_possible_truncation)]
+        let data_len = self.write_buffer.len() as u64 - RECORD_HEADER_SIZE;
+        self.position += RECORD_HEADER_SIZE + data_len;
+        self.sequence += 1;
+        self.entries_since_sync += 1;
+
+        Ok(start_pos)
+    }
+
+    /// Syncs the WAL segment via a [`StorageIo`] backend.
+    ///
+    /// Submits an `fdatasync` through the I/O backend. Non-blocking — the
+    /// caller must poll for the completion token.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error if the submission fails.
+    pub fn sync_via_storage_io(
+        &mut self,
+        sio: &mut dyn StorageIo,
+        fd: IoFd,
+    ) -> Result<u64, PerCoreWalError> {
+        let token = sio
+            .submit_datasync(fd)
+            .map_err(storage_io_to_wal_error)?;
+        self.pending_sync_token = Some(token);
+        Ok(token)
+    }
+
+    /// Check I/O completions and update sync state.
+    ///
+    /// Scans `completions` for the pending sync token. If found, calls
+    /// [`mark_synced`](Self::mark_synced) to update `synced_position`.
+    /// Returns `true` if the sync completed.
+    ///
+    /// Call this after every `StorageIo::poll_completions` round.
+    pub fn check_completions(&mut self, completions: &[IoCompletion]) -> bool {
+        let Some(token) = self.pending_sync_token else {
+            return false;
+        };
+        for c in completions {
+            if c.token == token {
+                self.pending_sync_token = None;
+                if c.result >= 0 {
+                    self.mark_synced();
+                }
+                return true;
+            }
+        }
+        false
+    }
+
+    /// Returns `true` if a sync is pending (submitted but not yet completed).
+    #[must_use]
+    pub fn is_sync_pending(&self) -> bool {
+        self.pending_sync_token.is_some()
+    }
+
+    /// Mark the current write position as synced (durable).
+    ///
+    /// Called when the `fdatasync` completion arrives from [`StorageIo`],
+    /// either directly or via [`check_completions`](Self::check_completions).
+    pub fn mark_synced(&mut self) {
+        self.synced_position = self.position;
+        self.last_sync = Instant::now();
+        self.entries_since_sync = 0;
     }
 
     /// Appends a Checkpoint marker to the WAL.
@@ -356,6 +528,14 @@ impl CoreWalWriter {
         self.truncate(0)?;
         self.sequence = 0;
         Ok(())
+    }
+}
+
+/// Convert a [`StorageIoError`] to a [`PerCoreWalError`].
+fn storage_io_to_wal_error(e: StorageIoError) -> PerCoreWalError {
+    match e {
+        StorageIoError::Io(io_err) => PerCoreWalError::Io(io_err),
+        other => PerCoreWalError::Io(std::io::Error::other(other.to_string())),
     }
 }
 
@@ -554,5 +734,71 @@ mod tests {
         // File should be truncated
         let new_size = std::fs::metadata(&path).unwrap().len();
         assert!(new_size < file_size);
+    }
+
+    #[test]
+    fn test_append_via_storage_io() {
+        use laminar_core::storage_io::SyncStorageIo;
+
+        let temp_dir = TempDir::new().unwrap();
+        let path = temp_dir.path().join("wal-sio.log");
+
+        // Create the writer (owns the BufWriter path)
+        let mut writer = CoreWalWriter::new(0, &path).unwrap();
+
+        // Create a SyncStorageIo backend and register the same file
+        let mut sio = SyncStorageIo::new();
+        let sio_file = std::fs::OpenOptions::new()
+            .write(true)
+            .append(true)
+            .open(&path)
+            .unwrap();
+        let fd = sio.register_fd(sio_file).unwrap();
+
+        // Write via storage I/O path
+        let pos = writer
+            .append_put_via_storage_io(b"key1", b"value1", &mut sio, fd)
+            .unwrap();
+        assert_eq!(pos, 0);
+        assert!(writer.position() > 0);
+        assert_eq!(writer.sequence(), 1);
+
+        // Sync via storage I/O path — stores token internally
+        assert!(!writer.is_sync_pending());
+        let _token = writer.sync_via_storage_io(&mut sio, fd).unwrap();
+        assert!(writer.is_sync_pending());
+        assert_eq!(writer.synced_position(), 0); // not yet synced
+
+        // Drain completions (write + sync)
+        let mut completions = Vec::new();
+        sio.poll_completions(&mut completions);
+        assert!(completions.len() >= 2);
+
+        // Pass completions to writer — it matches the sync token and calls mark_synced
+        let synced = writer.check_completions(&completions);
+        assert!(synced);
+        assert!(!writer.is_sync_pending());
+        assert_eq!(writer.synced_position(), writer.position());
+
+        // Verify data is on disk and readable via the standard reader
+        let file_size = std::fs::metadata(&path).unwrap().len();
+        assert!(file_size > 0);
+    }
+
+    #[test]
+    fn test_check_completions_no_match() {
+        use laminar_core::storage_io::IoCompletion;
+
+        let (mut writer, _temp_dir) = create_temp_writer(0);
+
+        // No pending sync → check returns false
+        let completions = vec![IoCompletion {
+            token: 999,
+            result: 0,
+        }];
+        assert!(!writer.check_completions(&completions));
+
+        // Empty completions → returns false
+        assert!(!writer.check_completions(&[]));
     }
 }

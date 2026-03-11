@@ -302,13 +302,35 @@ fn source_io_main(
                 epoch += 1;
                 // Capture checkpoint at barrier point
                 let _ = cp_tx.send(connector.checkpoint());
-                // Forward barrier to core
-                let msg = CoreMessage::Barrier {
+                // Forward barrier to core with same backpressure as events.
+                // A dropped barrier breaks Chandy-Lamport alignment — the
+                // coordinator would wait 30 s then abandon the checkpoint.
+                let mut bmsg = CoreMessage::Barrier {
                     source_idx,
                     barrier,
                 };
-                if target_inbox.push(msg).is_ok() {
-                    core_thread.unpark();
+                let mut barrier_backoff = 0u32;
+                loop {
+                    match target_inbox.push(bmsg) {
+                        Ok(()) => {
+                            core_thread.unpark();
+                            break;
+                        }
+                        Err(returned) => {
+                            if shutdown.load(Ordering::Acquire) {
+                                break;
+                            }
+                            bmsg = returned;
+                            barrier_backoff += 1;
+                            match barrier_backoff {
+                                0..=63 => std::hint::spin_loop(),
+                                64..=255 => std::thread::yield_now(),
+                                _ => std::thread::park_timeout(
+                                    std::time::Duration::from_micros(100),
+                                ),
+                            }
+                        }
+                    }
                 }
             }
         }

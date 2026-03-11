@@ -27,6 +27,7 @@
 //! - Registered buffers for zero-copy I/O
 //! - Per-core I/O isolation for thread-per-core architecture
 
+use std::panic::{catch_unwind, AssertUnwindSafe};
 use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::sync::Arc;
 use std::thread::{self, JoinHandle};
@@ -42,6 +43,7 @@ use crate::checkpoint::CheckpointBarrier;
 use crate::numa::NumaTopology;
 use crate::operator::{CheckpointCompleteData, Event, Operator, OperatorState, Output};
 use crate::reactor::{Reactor, ReactorConfig};
+use crate::storage_io::{IoCompletion, StorageIo, SyncStorageIo};
 
 use super::backpressure::{
     BackpressureConfig, CreditAcquireResult, CreditGate, CreditMetrics, OverflowStrategy,
@@ -106,6 +108,12 @@ pub struct CoreConfig {
     pub backpressure: BackpressureConfig,
     /// Enable NUMA-aware memory allocation
     pub numa_aware: bool,
+    /// Enable per-core storage I/O backend.
+    ///
+    /// When true, creates a [`StorageIo`] instance for this core. On Linux
+    /// with the `io-uring` feature and a supported kernel, this uses
+    /// `io_uring` with SQPOLL. Otherwise falls back to synchronous I/O.
+    pub enable_storage_io: bool,
     /// `io_uring` configuration (Linux only, requires `io-uring` feature)
     #[cfg(all(target_os = "linux", feature = "io-uring"))]
     pub io_uring_config: Option<IoUringConfig>,
@@ -121,6 +129,7 @@ impl Default for CoreConfig {
             reactor_config: ReactorConfig::default(),
             backpressure: BackpressureConfig::default(),
             numa_aware: false,
+            enable_storage_io: false,
             #[cfg(all(target_os = "linux", feature = "io-uring"))]
             io_uring_config: None,
         }
@@ -140,6 +149,10 @@ pub struct CoreHandle {
     inbox: Arc<SpscQueue<CoreMessage>>,
     /// Outbox queue (core writes, main thread reads)
     outbox: Arc<SpscQueue<TaggedOutput>>,
+    /// Storage I/O completion queue (Ring 0 writes, Ring 2 reads).
+    /// Ring 0 pushes completions from `StorageIo::poll_completions`.
+    /// Ring 2 drains during checkpoint to feed `PerCoreWalManager::check_all_completions`.
+    io_completion_outbox: Arc<SpscQueue<IoCompletion>>,
     /// Credit gate for backpressure (sender acquires, receiver releases)
     credit_gate: Arc<CreditGate>,
     /// Thread handle (None if thread hasn't started or has been joined)
@@ -211,11 +224,49 @@ impl CoreHandle {
 
         let inbox = Arc::new(SpscQueue::new(config.inbox_capacity));
         let outbox: Arc<SpscQueue<TaggedOutput>> = Arc::new(SpscQueue::new(config.outbox_capacity));
+        // I/O completion queue: Ring 0 produces, Ring 2 consumes during checkpoint.
+        // Capacity 256 matches default io_uring ring_entries.
+        let io_completion_outbox: Arc<SpscQueue<IoCompletion>> =
+            Arc::new(SpscQueue::new(256));
         let credit_gate = Arc::new(CreditGate::new(config.backpressure.clone()));
         let shutdown = Arc::new(AtomicBool::new(false));
         let events_processed = Arc::new(AtomicU64::new(0));
         let outputs_dropped = Arc::new(AtomicU64::new(0));
         let is_running = Arc::new(AtomicBool::new(false));
+
+        // Create per-core storage I/O backend (cold path — allocation is fine here).
+        let storage_io: Option<Box<dyn StorageIo>> = if config.enable_storage_io {
+            // On Linux with io-uring feature, try io_uring first.
+            #[cfg(all(target_os = "linux", feature = "io-uring"))]
+            {
+                if let Some(ref uring_cfg) = config.io_uring_config {
+                    match crate::storage_io::UringStorageIo::new(core_id, uring_cfg) {
+                        Ok(backend) => {
+                            tracing::info!(
+                                "Core {core_id}: using io_uring storage I/O (SQPOLL={})",
+                                backend.manager.uses_sqpoll()
+                            );
+                            Some(Box::new(backend))
+                        }
+                        Err(e) => {
+                            tracing::warn!(
+                                "Core {core_id}: io_uring init failed ({e}), falling back to sync"
+                            );
+                            Some(Box::new(SyncStorageIo::new()))
+                        }
+                    }
+                } else {
+                    Some(Box::new(SyncStorageIo::new()))
+                }
+            }
+            // On non-Linux or without io-uring feature, use sync backend.
+            #[cfg(not(all(target_os = "linux", feature = "io-uring")))]
+            {
+                Some(Box::new(SyncStorageIo::new()))
+            }
+        } else {
+            None
+        };
 
         let thread_context = CoreThreadContext {
             core_id,
@@ -238,7 +289,10 @@ impl CoreHandle {
 
         let thread = thread::Builder::new()
             .name(format!("laminar-core-{core_id}"))
-            .spawn(move || core_thread_main(&thread_context, operators))
+            .spawn({
+                let io_cq = Arc::clone(&io_completion_outbox);
+                move || core_thread_main(&thread_context, operators, storage_io, io_cq)
+            })
             .map_err(|e| TpcError::SpawnFailed {
                 core_id,
                 message: e.to_string(),
@@ -258,6 +312,7 @@ impl CoreHandle {
             numa_node,
             inbox,
             outbox,
+            io_completion_outbox,
             credit_gate,
             thread: Some(thread),
             core_thread_handle,
@@ -455,6 +510,18 @@ impl CoreHandle {
         self.outbox.pop()
     }
 
+    /// Drain storage I/O completions from this core.
+    ///
+    /// Ring 0 pushes completions from `StorageIo::poll_completions` into a
+    /// per-core SPSC queue. Ring 2 (checkpoint coordinator) calls this to
+    /// retrieve them and pass to `PerCoreWalManager::check_all_completions`.
+    pub fn drain_io_completions(&self, out: &mut Vec<IoCompletion>) {
+        self.io_completion_outbox.pop_each(256, |c| {
+            out.push(c);
+            true
+        });
+    }
+
     /// Returns the number of pending messages in the inbox.
     #[must_use]
     pub fn inbox_len(&self) -> usize {
@@ -624,10 +691,12 @@ fn init_core_thread(
 }
 
 /// Main function for the core thread.
-#[allow(clippy::too_many_lines)]
+#[allow(clippy::too_many_lines, clippy::needless_pass_by_value)]
 fn core_thread_main(
     ctx: &CoreThreadContext,
     operators: Vec<Box<dyn Operator>>,
+    mut storage_io: Option<Box<dyn StorageIo>>,
+    io_completion_outbox: Arc<SpscQueue<IoCompletion>>,
 ) -> Result<(), TpcError> {
     let mut reactor = init_core_thread(ctx, operators)?;
 
@@ -636,6 +705,9 @@ fn core_thread_main(
 
     // Reusable buffer for reactor outputs (avoids per-poll Vec allocation)
     let mut poll_buffer: Vec<Output> = Vec::with_capacity(256);
+
+    // Reusable buffer for storage I/O completions (zero-alloc across iterations)
+    let mut io_completions: Vec<IoCompletion> = Vec::with_capacity(64);
 
     // Pre-allocated checkpoint Box reused across checkpoint cycles.
     // Taken when a CheckpointRequest arrives, replenished after the inbox drain.
@@ -660,6 +732,11 @@ fn core_thread_main(
     // 64..128 → thread::yield_now() (OS scheduler yield, ~μs wake)
     // 128+    → thread::park_timeout(1ms) (sleep, woken by unpark())
     let mut idle_spins: u32 = 0;
+
+    // Wrap the main loop in catch_unwind so an operator panic does not
+    // silently kill this core thread.  On panic we set is_running = false
+    // (the coordinator checks this) and propagate the error.
+    let panic_result = catch_unwind(AssertUnwindSafe(|| -> Result<(), TpcError> {
 
     // Main loop
     loop {
@@ -714,16 +791,24 @@ fn core_thread_main(
                     });
                     data.checkpoint_id = checkpoint_id;
                     std::mem::swap(&mut data.operator_states, &mut checkpoint_states_buf);
-                    let checkpoint_output = Output::CheckpointComplete(data);
-                    if ctx
-                        .outbox
-                        .push(TaggedOutput {
-                            source_idx: 0,
-                            output: checkpoint_output,
-                        })
-                        .is_err()
-                    {
-                        ctx.outputs_dropped.fetch_add(1, Ordering::Relaxed);
+                    // Checkpoint completion must not be dropped — the coordinator
+                    // would stall waiting for a response that never arrives.
+                    // Spin-wait: checkpoints are infrequent (seconds apart).
+                    let mut cp_out = TaggedOutput {
+                        source_idx: 0,
+                        output: Output::CheckpointComplete(data),
+                    };
+                    loop {
+                        match ctx.outbox.push(cp_out) {
+                            Ok(()) => break,
+                            Err(returned) => {
+                                if ctx.shutdown.load(Ordering::Acquire) {
+                                    break;
+                                }
+                                cp_out = returned;
+                                std::hint::spin_loop();
+                            }
+                        }
                     }
                     messages_processed += 1;
                     had_work = true;
@@ -744,16 +829,23 @@ fn core_thread_main(
                             ctx.outputs_dropped.fetch_add(1, Ordering::Relaxed);
                         }
                     }
-                    // Forward barrier to coordinator
-                    if ctx
-                        .outbox
-                        .push(TaggedOutput {
-                            source_idx,
-                            output: Output::Barrier(barrier),
-                        })
-                        .is_err()
-                    {
-                        ctx.outputs_dropped.fetch_add(1, Ordering::Relaxed);
+                    // Barrier must not be dropped — a missing barrier breaks
+                    // checkpoint alignment. Spin-wait until outbox has space.
+                    let mut barrier_out = TaggedOutput {
+                        source_idx,
+                        output: Output::Barrier(barrier),
+                    };
+                    loop {
+                        match ctx.outbox.push(barrier_out) {
+                            Ok(()) => break,
+                            Err(returned) => {
+                                if ctx.shutdown.load(Ordering::Acquire) {
+                                    break;
+                                }
+                                barrier_out = returned;
+                                std::hint::spin_loop();
+                            }
+                        }
                     }
                     messages_processed += 1;
                     had_work = true;
@@ -778,6 +870,23 @@ fn core_thread_main(
         // This signals to senders that we have capacity for more
         if messages_processed > 0 {
             ctx.credit_gate.release(messages_processed);
+        }
+
+        // Poll storage I/O completions (non-blocking, zero-alloc).
+        // Push completions to the SPSC outbox for Ring 2 (checkpoint coordinator)
+        // to drain and feed to PerCoreWalManager::check_all_completions().
+        if let Some(ref mut sio) = storage_io {
+            io_completions.clear();
+            sio.poll_completions(&mut io_completions);
+            for completion in &io_completions {
+                // Best-effort push — if queue is full, drop the completion.
+                // This is safe: the WAL writer treats missing completions as
+                // "sync still pending" and the checkpoint coordinator will retry.
+                let _ = io_completion_outbox.push(*completion);
+            }
+            if !io_completions.is_empty() {
+                had_work = true;
+            }
         }
 
         // Replenish checkpoint slot if it was consumed (infrequent — once per checkpoint).
@@ -848,8 +957,34 @@ fn core_thread_main(
         });
     }
 
-    ctx.is_running.store(false, Ordering::Release);
     Ok(())
+    })); // end catch_unwind
+
+    // Always clear is_running so coordinator detects core death.
+    ctx.is_running.store(false, Ordering::Release);
+    // Signal coordinator — it may be parked waiting for output.
+    ctx.output_notify.notify_one();
+
+    match panic_result {
+        Ok(inner) => inner,
+        Err(payload) => {
+            let message = if let Some(s) = payload.downcast_ref::<&str>() {
+                (*s).to_string()
+            } else if let Some(s) = payload.downcast_ref::<String>() {
+                s.clone()
+            } else {
+                "unknown panic".to_string()
+            };
+            tracing::error!(
+                "Core {}: operator panic caught: {message}",
+                ctx.core_id,
+            );
+            Err(TpcError::OperatorPanic {
+                core_id: ctx.core_id,
+                message,
+            })
+        }
+    }
 }
 
 /// Sets CPU affinity for the current thread.
@@ -885,11 +1020,15 @@ fn set_cpu_affinity(core_id: usize, cpu_id: usize) -> Result<(), TpcError> {
     {
         use windows_sys::Win32::System::Threading::{GetCurrentThread, SetThreadAffinityMask};
 
-        assert!(
-            cpu_id < usize::BITS as usize,
-            "cpu_id {cpu_id} >= {} — Windows processor groups not yet supported",
-            usize::BITS
-        );
+        if cpu_id >= usize::BITS as usize {
+            return Err(TpcError::AffinityFailed {
+                core_id,
+                message: format!(
+                    "cpu_id {cpu_id} >= {} — Windows processor groups not yet supported",
+                    usize::BITS
+                ),
+            });
+        }
         // SAFETY: We're calling Windows API functions with valid parameters.
         // GetCurrentThread returns a pseudo-handle that doesn't need to be closed.
         // The mask is a valid CPU mask for the specified core.
@@ -976,6 +1115,7 @@ mod tests {
             reactor_config: ReactorConfig::default(),
             backpressure: super::BackpressureConfig::default(),
             numa_aware: false,
+            enable_storage_io: false,
             #[cfg(all(target_os = "linux", feature = "io-uring"))]
             io_uring_config: None,
         };
@@ -997,6 +1137,7 @@ mod tests {
             reactor_config: ReactorConfig::default(),
             backpressure: super::BackpressureConfig::default(),
             numa_aware: false,
+            enable_storage_io: false,
             #[cfg(all(target_os = "linux", feature = "io-uring"))]
             io_uring_config: None,
         };
@@ -1030,6 +1171,7 @@ mod tests {
             reactor_config: ReactorConfig::default(),
             backpressure: super::BackpressureConfig::default(),
             numa_aware: false,
+            enable_storage_io: false,
             #[cfg(all(target_os = "linux", feature = "io-uring"))]
             io_uring_config: None,
         };
@@ -1128,6 +1270,7 @@ mod tests {
             reactor_config: ReactorConfig::default(),
             backpressure: super::BackpressureConfig::default(),
             numa_aware: false,
+            enable_storage_io: false,
             #[cfg(all(target_os = "linux", feature = "io-uring"))]
             io_uring_config: None,
         };
@@ -1169,6 +1312,7 @@ mod tests {
             reactor_config: ReactorConfig::default(),
             backpressure: super::BackpressureConfig::default(),
             numa_aware: false,
+            enable_storage_io: false,
             #[cfg(all(target_os = "linux", feature = "io-uring"))]
             io_uring_config: None,
         };
@@ -1209,6 +1353,7 @@ mod tests {
             reactor_config: ReactorConfig::default(),
             backpressure: super::BackpressureConfig::default(),
             numa_aware: false,
+            enable_storage_io: false,
             #[cfg(all(target_os = "linux", feature = "io-uring"))]
             io_uring_config: None,
         };
@@ -1251,6 +1396,7 @@ mod tests {
             reactor_config: ReactorConfig::default(),
             backpressure: super::BackpressureConfig::default(),
             numa_aware: false,
+            enable_storage_io: false,
             #[cfg(all(target_os = "linux", feature = "io-uring"))]
             io_uring_config: None,
         };
@@ -1287,6 +1433,7 @@ mod tests {
             reactor_config: ReactorConfig::default(),
             backpressure: super::BackpressureConfig::default(),
             numa_aware: false,
+            enable_storage_io: false,
             #[cfg(all(target_os = "linux", feature = "io-uring"))]
             io_uring_config: None,
         };
@@ -1331,6 +1478,7 @@ mod tests {
             reactor_config: ReactorConfig::default(),
             backpressure: super::BackpressureConfig::default(),
             numa_aware: false,
+            enable_storage_io: false,
             #[cfg(all(target_os = "linux", feature = "io-uring"))]
             io_uring_config: None,
         };
@@ -1366,6 +1514,7 @@ mod tests {
             reactor_config: ReactorConfig::default(),
             backpressure: super::BackpressureConfig::default(),
             numa_aware: false,
+            enable_storage_io: false,
             #[cfg(all(target_os = "linux", feature = "io-uring"))]
             io_uring_config: None,
         };

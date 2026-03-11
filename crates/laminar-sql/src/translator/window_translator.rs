@@ -274,6 +274,13 @@ impl WindowOperatorConfig {
         mut self,
         late_data_clause: &LateDataClause,
     ) -> Result<Self, ParseError> {
+        if late_data_clause.side_output.is_some() {
+            return Err(ParseError::WindowError(
+                "LATE DATA SIDE OUTPUT is not yet supported in pipeline mode; \
+                 use ALLOWED LATENESS without a side output, or omit the clause"
+                    .to_string(),
+            ));
+        }
         self.allowed_lateness = late_data_clause.to_allowed_lateness()?;
         self.late_data_side_output
             .clone_from(&late_data_clause.side_output);
@@ -430,16 +437,33 @@ mod tests {
     }
 
     #[test]
-    fn test_with_late_data_clause() {
+    fn test_with_late_data_clause_side_output_rejected() {
         let config = WindowOperatorConfig::tumbling("ts".to_string(), Duration::from_secs(300));
 
+        // Side output is not yet wired in pipeline mode — must be rejected
         let late_clause = LateDataClause::side_output_only("late_events".to_string());
-        let config = config.with_late_data_clause(&late_clause).unwrap();
-
-        assert_eq!(
-            config.late_data_side_output,
-            Some("late_events".to_string())
+        let result = config.with_late_data_clause(&late_clause);
+        assert!(result.is_err());
+        assert!(
+            result
+                .unwrap_err()
+                .to_string()
+                .contains("not yet supported")
         );
+    }
+
+    #[test]
+    fn test_with_late_data_clause_lateness_only_accepted() {
+        use sqlparser::ast::Expr;
+
+        let config = WindowOperatorConfig::tumbling("ts".to_string(), Duration::from_secs(300));
+
+        // Allowed lateness without side output is fine
+        let late_clause =
+            LateDataClause::with_allowed_lateness(Expr::Value(sqlparser::ast::Value::SingleQuotedString("5 SECONDS".to_string()).into()));
+        let config = config.with_late_data_clause(&late_clause).unwrap();
+        assert_eq!(config.allowed_lateness, Duration::from_secs(5));
+        assert!(config.late_data_side_output.is_none());
     }
 
     #[test]

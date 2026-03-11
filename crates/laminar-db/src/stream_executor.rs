@@ -2344,7 +2344,7 @@ mod tests {
             None,
         );
 
-        let source_batches = FxHashMap::default();
+        let mut source_batches = FxHashMap::default();
         // When no source data is registered, the query references a missing table —
         // this should surface as an error, not silently produce empty results.
         let result = executor.execute_cycle(&source_batches, i64::MAX).await;
@@ -2438,7 +2438,7 @@ mod tests {
         assert!(r1.contains_key("pass"));
 
         // Second cycle with no data — table was cleaned up, so query fails
-        let empty = FxHashMap::default();
+        let mut empty = FxHashMap::default();
         let r2 = executor.execute_cycle(&empty, i64::MAX).await;
         assert!(
             r2.is_err(),
@@ -2729,7 +2729,7 @@ mod tests {
         );
 
         // No source data — first query references missing table, so cycle fails
-        let source_batches = FxHashMap::default();
+        let mut source_batches = FxHashMap::default();
         let result = executor.execute_cycle(&source_batches, i64::MAX).await;
         assert!(result.is_err());
     }
@@ -3120,7 +3120,7 @@ mod tests {
         );
 
         // Advance watermark to 1000 → window [0, 1000) is now closed
-        let empty: FxHashMap<String, Vec<RecordBatch>> = FxHashMap::default();
+        let mut empty: FxHashMap<String, Vec<RecordBatch>> = FxHashMap::default();
         let results = executor.execute_cycle(&empty, 1000).await.unwrap();
         assert!(
             results.contains_key("avg_price"),
@@ -3163,7 +3163,7 @@ mod tests {
         assert!(!r2.contains_key("total"), "window not closed at wm=600");
 
         // Cycle 3: watermark crosses 1000 → emit accumulated
-        let empty: FxHashMap<String, Vec<RecordBatch>> = FxHashMap::default();
+        let mut empty: FxHashMap<String, Vec<RecordBatch>> = FxHashMap::default();
         let r3 = executor.execute_cycle(&empty, 1000).await.unwrap();
         assert!(r3.contains_key("total"), "window closed at wm=1000");
         let batches = &r3["total"];
@@ -3218,7 +3218,7 @@ mod tests {
         assert_eq!(cnt, 2, "first window should have 2 rows");
 
         // Watermark at 2000 → window [1000,2000) closes, 1 row (ts=1500)
-        let empty: FxHashMap<String, Vec<RecordBatch>> = FxHashMap::default();
+        let mut empty: FxHashMap<String, Vec<RecordBatch>> = FxHashMap::default();
         let r2 = executor.execute_cycle(&empty, 2000).await.unwrap();
         assert!(r2.contains_key("cnt"));
         let cnt2 = r2["cnt"][0]
@@ -3819,7 +3819,7 @@ mod tests {
         );
 
         // Cycle 3: watermark advances to 1000 → window closes
-        let empty: FxHashMap<String, Vec<RecordBatch>> = FxHashMap::default();
+        let mut empty: FxHashMap<String, Vec<RecordBatch>> = FxHashMap::default();
         let r3 = executor.execute_cycle(&empty, 1000).await.unwrap();
         assert!(r3.contains_key("total"), "window closed at wm=1000");
 

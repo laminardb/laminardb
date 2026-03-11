@@ -60,7 +60,7 @@ impl Default for IoUringConfig {
     fn default() -> Self {
         Self {
             ring_entries: 256,
-            mode: RingMode::Standard,
+            mode: RingMode::SqPoll,
             sqpoll_idle_ms: 1000,
             sqpoll_cpu: None,
             buffer_size: 64 * 1024, // 64KB per buffer
@@ -289,7 +289,7 @@ mod tests {
     fn test_default_config() {
         let config = IoUringConfig::default();
         assert_eq!(config.ring_entries, 256);
-        assert_eq!(config.mode, RingMode::Standard);
+        assert_eq!(config.mode, RingMode::SqPoll);
         assert_eq!(config.buffer_size, 64 * 1024);
         assert_eq!(config.buffer_count, 256);
         assert!(config.coop_taskrun);

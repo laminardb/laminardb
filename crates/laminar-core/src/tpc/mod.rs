@@ -85,6 +85,15 @@ pub enum TpcError {
         source: crate::reactor::ReactorError,
     },
 
+    /// An operator panicked inside Ring 0.
+    #[error("Operator panic on core {core_id}: {message}")]
+    OperatorPanic {
+        /// The core ID where the panic occurred.
+        core_id: usize,
+        /// Panic message extracted from the payload.
+        message: String,
+    },
+
     /// Key extraction failed
     #[error("Key extraction failed: {0}")]
     KeyExtractionFailed(String),
