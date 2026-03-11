@@ -282,19 +282,17 @@ impl DeltaLakeSink {
 
         let write_result = if self.config.write_mode == DeltaWriteMode::Upsert {
             // ── Upsert/Merge path ──
-            let combined = match arrow_select::concat::concat_batches(
-                &batches[0].schema(),
-                &batches,
-            ) {
-                Ok(c) => c,
-                Err(e) => {
-                    // Concat is a local op — restore table and propagate.
-                    self.table = Some(table);
-                    return Err(ConnectorError::Internal(format!(
-                        "failed to concat batches: {e}"
-                    )));
-                }
-            };
+            let combined =
+                match arrow_select::concat::concat_batches(&batches[0].schema(), &batches) {
+                    Ok(c) => c,
+                    Err(e) => {
+                        // Concat is a local op — restore table and propagate.
+                        self.table = Some(table);
+                        return Err(ConnectorError::Internal(format!(
+                            "failed to concat batches: {e}"
+                        )));
+                    }
+                };
 
             super::delta_io::merge_changelog(
                 table,

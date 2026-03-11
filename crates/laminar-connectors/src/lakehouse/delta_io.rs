@@ -417,8 +417,8 @@ pub async fn read_batches_at_version(
     let mut total_rows: usize = 0;
 
     while let Some(result) = stream.next().await {
-        let batch = result
-            .map_err(|e| ConnectorError::ReadError(format!("stream batch failed: {e}")))?;
+        let batch =
+            result.map_err(|e| ConnectorError::ReadError(format!("stream batch failed: {e}")))?;
         if batch.num_rows() == 0 {
             continue;
         }
