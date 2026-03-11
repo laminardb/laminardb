@@ -764,7 +764,6 @@ mod tests {
         // Create a SyncStorageIo backend and register the same file
         let mut sio = SyncStorageIo::new();
         let sio_file = std::fs::OpenOptions::new()
-            .write(true)
             .append(true)
             .open(&path)
             .unwrap();
@@ -827,7 +826,6 @@ mod tests {
 
         let mut sio = SyncStorageIo::new();
         let sio_file = std::fs::OpenOptions::new()
-            .write(true)
             .append(true)
             .open(&path)
             .unwrap();
@@ -865,7 +863,6 @@ mod tests {
 
         let mut sio = SyncStorageIo::new();
         let sio_file = std::fs::OpenOptions::new()
-            .write(true)
             .append(true)
             .open(&path)
             .unwrap();

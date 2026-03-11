@@ -625,9 +625,9 @@ impl CheckpointCoordinator {
     ///
     /// * `operator_states` — serialized operator state from `DagCheckpointCoordinator`
     /// * `watermark` — current global watermark
-    /// * `wal_position` — single-writer WAL position
-    /// * `per_core_wal_positions` — thread-per-core WAL positions
     /// * `table_store_checkpoint_path` — table store checkpoint path
+    /// * `source_watermarks` — per-source watermarks
+    /// * `pipeline_hash` — pipeline identity hash
     ///
     /// # Errors
     ///
@@ -648,6 +648,7 @@ impl CheckpointCoordinator {
             HashMap::new(),
             source_watermarks,
             pipeline_hash,
+            HashMap::new(),
         )
         .await
     }
@@ -659,6 +660,29 @@ impl CheckpointCoordinator {
     async fn snapshot_sources(
         &self,
         sources: &[RegisteredSource],
+    ) -> Result<HashMap<String, ConnectorCheckpoint>, DbError> {
+        use futures::future::join_all;
+
+        let futs = sources.iter().map(|source| {
+            let connector = Arc::clone(&source.connector);
+            let name = source.name.clone();
+            async move {
+                let guard = connector.lock().await;
+                let cp = guard.checkpoint();
+                let result = source_to_connector_checkpoint(&cp);
+                debug!(source = %name, epoch = cp.epoch(), "source snapshotted");
+                (name, result)
+            }
+        });
+
+        let results = join_all(futs).await;
+        Ok(results.into_iter().collect())
+    }
+
+    /// Like `snapshot_sources` but takes a slice of references (for filtering).
+    async fn snapshot_source_refs(
+        &self,
+        sources: &[&RegisteredSource],
     ) -> Result<HashMap<String, ConnectorCheckpoint>, DbError> {
         use futures::future::join_all;
 
@@ -918,6 +942,12 @@ impl CheckpointCoordinator {
         self.epoch
     }
 
+    /// Returns the registered sources (for pre-capture by the callback).
+    #[must_use]
+    pub(crate) fn registered_sources(&self) -> &[RegisteredSource] {
+        &self.sources
+    }
+
     /// Returns the next checkpoint ID.
     #[must_use]
     pub fn next_checkpoint_id(&self) -> u64 {
@@ -1044,17 +1074,54 @@ impl CheckpointCoordinator {
             extra_table_offsets,
             source_watermarks,
             pipeline_hash,
+            HashMap::new(),
         )
         .await
     }
 
-    /// Shared checkpoint implementation for both [`checkpoint()`](Self::checkpoint)
-    /// and [`checkpoint_with_extra_tables()`](Self::checkpoint_with_extra_tables).
+    /// Performs a full checkpoint with pre-captured source offsets.
+    ///
+    /// When `source_offset_overrides` is non-empty, those sources skip the
+    /// live `snapshot_sources()` call and use the provided offsets instead.
+    /// This is essential for barrier-aligned checkpoints where source
+    /// positions must match the operator state at the barrier point.
+    ///
+    /// # Errors
+    ///
+    /// Returns `DbError::Checkpoint` if any phase fails.
+    #[allow(clippy::too_many_arguments)]
+    pub async fn checkpoint_with_offsets(
+        &mut self,
+        operator_states: HashMap<String, Vec<u8>>,
+        watermark: Option<i64>,
+        table_store_checkpoint_path: Option<String>,
+        extra_table_offsets: HashMap<String, ConnectorCheckpoint>,
+        source_watermarks: HashMap<String, i64>,
+        pipeline_hash: Option<u64>,
+        source_offset_overrides: HashMap<String, ConnectorCheckpoint>,
+    ) -> Result<CheckpointResult, DbError> {
+        self.checkpoint_inner(
+            operator_states,
+            watermark,
+            table_store_checkpoint_path,
+            extra_table_offsets,
+            source_watermarks,
+            pipeline_hash,
+            source_offset_overrides,
+        )
+        .await
+    }
+
+    /// Shared checkpoint implementation for all checkpoint entry points.
     ///
     /// WAL preparation is performed internally to guarantee atomicity:
     /// changelog drain + epoch barrier + WAL sync happen after operator
     /// states are received, so the WAL positions in the manifest always
     /// reflect the state after the operator snapshot.
+    ///
+    /// When `source_offset_overrides` is non-empty, those sources use the
+    /// provided offsets instead of calling `snapshot_sources()`. This ensures
+    /// barrier-aligned and pre-captured offsets are used atomically.
     #[allow(clippy::too_many_arguments, clippy::too_many_lines)]
     async fn checkpoint_inner(
         &mut self,
@@ -1064,6 +1131,7 @@ impl CheckpointCoordinator {
         extra_table_offsets: HashMap<String, ConnectorCheckpoint>,
         source_watermarks: HashMap<String, i64>,
         pipeline_hash: Option<u64>,
+        source_offset_overrides: HashMap<String, ConnectorCheckpoint>,
     ) -> Result<CheckpointResult, DbError> {
         let start = Instant::now();
         let checkpoint_id = self.next_checkpoint_id;
@@ -1080,10 +1148,24 @@ impl CheckpointCoordinator {
 
         // ── Step 3: Source snapshot (parallel) ──
         self.phase = CheckpointPhase::Snapshotting;
-        let (source_offsets, mut table_offsets) = tokio::try_join!(
-            self.snapshot_sources(&self.sources),
+
+        // Only live-snapshot sources that don't have pre-captured overrides.
+        // Sources with overrides were captured at a consistent point (barrier
+        // alignment or pre-spawn) and must not be re-queried.
+        let sources_to_snapshot: Vec<&RegisteredSource> = self
+            .sources
+            .iter()
+            .filter(|s| !source_offset_overrides.contains_key(&s.name))
+            .collect();
+        let (mut source_offsets, mut table_offsets) = tokio::try_join!(
+            self.snapshot_source_refs(&sources_to_snapshot),
             self.snapshot_sources(&self.table_sources),
         )?;
+
+        // Merge pre-captured source offset overrides into source_offsets.
+        for (name, cp) in source_offset_overrides {
+            source_offsets.insert(name, cp);
+        }
 
         // Merge extra table offsets (from ReferenceTableSource instances).
         for (name, cp) in extra_table_offsets {
@@ -1496,26 +1578,6 @@ pub fn connector_to_source_checkpoint(cp: &ConnectorCheckpoint) -> SourceCheckpo
         source_cp.set_metadata(k.clone(), v.clone());
     }
     source_cp
-}
-
-/// Converts from the legacy `SerializableSourceCheckpoint` format.
-#[must_use]
-pub fn legacy_to_connector_checkpoint<S: std::hash::BuildHasher>(
-    offsets: &HashMap<String, String, S>,
-    epoch: u64,
-    metadata: &HashMap<String, String, S>,
-) -> ConnectorCheckpoint {
-    ConnectorCheckpoint {
-        offsets: offsets
-            .iter()
-            .map(|(k, v)| (k.clone(), v.clone()))
-            .collect(),
-        epoch,
-        metadata: metadata
-            .iter()
-            .map(|(k, v)| (k.clone(), v.clone()))
-            .collect(),
-    }
 }
 
 // ── DAG operator state conversion helpers ──
