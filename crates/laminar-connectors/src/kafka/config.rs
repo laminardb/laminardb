@@ -936,23 +936,22 @@ impl KafkaSourceConfig {
 
 /// Returns `true` if a pass-through kafka.* key must not override explicit settings.
 fn is_blocked_passthrough_key(key: &str) -> bool {
-    matches!(
-        key,
-        "security.protocol"
-            | "sasl.mechanism"
-            | "sasl.username"
-            | "sasl.password"
-            | "sasl.oauthbearer.config"
-            | "sasl.kerberos.service.name"
-            | "sasl.kerberos.principal"
-            | "ssl.ca.location"
-            | "ssl.certificate.location"
-            | "ssl.key.location"
-            | "ssl.key.password"
-            | "ssl.endpoint.identification.algorithm"
-            | "enable.auto.commit"
-            | "enable.idempotence"
-    )
+    key.starts_with("sasl.kerberos.")
+        || matches!(
+            key,
+            "security.protocol"
+                | "sasl.mechanism"
+                | "sasl.username"
+                | "sasl.password"
+                | "sasl.oauthbearer.config"
+                | "ssl.ca.location"
+                | "ssl.certificate.location"
+                | "ssl.key.location"
+                | "ssl.key.password"
+                | "ssl.endpoint.identification.algorithm"
+                | "enable.auto.commit"
+                | "enable.idempotence"
+        )
 }
 
 /// Parses a specific offsets string in the format "partition:offset,partition:offset,...".

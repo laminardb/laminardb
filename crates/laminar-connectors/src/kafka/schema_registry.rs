@@ -182,13 +182,11 @@ impl SchemaRegistryClient {
         Self::with_cache_config(base_url, auth, SchemaRegistryCacheConfig::default())
     }
 
-    /// Creates a new Schema Registry client with a custom CA certificate.
+    /// Creates a TLS client (CA cert only). Delegates to [`Self::with_tls_mtls`].
     ///
     /// # Errors
     ///
-    /// Returns `ConnectorError::ConfigurationError` if the CA cert file
-    /// cannot be read or parsed.
-    /// Creates a client with TLS (CA cert + optional mTLS client cert/key).
+    /// Returns `ConnectorError::ConfigurationError` if the CA cert cannot be read.
     pub fn with_tls(
         base_url: impl Into<String>,
         auth: Option<SrAuth>,
@@ -223,7 +221,11 @@ impl SchemaRegistryClient {
 
         let mut builder = Client::builder().add_root_certificate(cert);
 
-        // mTLS: client certificate + private key for mutual authentication.
+        if client_cert_path.is_some() != client_key_path.is_some() {
+            return Err(ConnectorError::ConfigurationError(
+                "mTLS requires both client cert and key — only one was provided".into(),
+            ));
+        }
         if let (Some(cert_path), Some(key_path)) = (client_cert_path, client_key_path) {
             let mut identity_pem = std::fs::read(cert_path).map_err(|e| {
                 ConnectorError::ConfigurationError(format!(

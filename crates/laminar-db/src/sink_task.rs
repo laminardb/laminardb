@@ -76,10 +76,10 @@ pub(crate) struct SinkTaskHandle {
     /// Implicit shutdown (channel drop) works without awaiting the handle.
     #[allow(dead_code)] // used by close(); implicit channel-drop handles normal shutdown
     task: Arc<tokio::sync::Mutex<Option<JoinHandle<()>>>>,
-    /// Counter for write errors (shared with the task loop).
-    #[allow(dead_code)]
+    /// Shared with the task loop; read via `write_error_count()`.
     write_errors: Arc<AtomicU64>,
-    /// Set by the task loop on write failure; checked by `PreCommit` to reject the epoch.
+    /// Shared with the task loop for epoch poisoning. The struct holds the
+    /// Arc to keep it alive; the task loop reads/writes it directly.
     #[allow(dead_code)]
     epoch_poisoned: Arc<AtomicBool>,
 }
@@ -262,6 +262,7 @@ impl SinkTaskHandle {
 /// Main loop for a sink task.
 ///
 /// Owns the `SinkConnector` exclusively — no external locking needed.
+#[allow(clippy::too_many_lines)]
 async fn run_sink_task(
     name: String,
     mut sink: Box<dyn SinkConnector>,
@@ -323,7 +324,13 @@ async fn run_sink_task(
                         let _ = ack.send(result);
                     }
                     SinkCommand::CommitEpoch { epoch, ack } => {
-                        let result = sink.commit_epoch(epoch).await;
+                        let result = if epoch_poisoned.load(Ordering::Acquire) {
+                            Err(ConnectorError::WriteError(
+                                "epoch poisoned by prior write failure".into(),
+                            ))
+                        } else {
+                            sink.commit_epoch(epoch).await
+                        };
                         let _ = ack.send(result);
                     }
                     SinkCommand::RollbackEpoch { epoch } => {
