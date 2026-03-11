@@ -286,18 +286,25 @@ impl crate::pipeline::PipelineCallback for ConnectorPipelineCallback {
             }
         }
 
+        // Pre-capture source offsets synchronously. These must match the
+        // operator state that was just captured above — if we defer snapshot
+        // to the spawned task, the sources may have advanced past the
+        // operator state point, breaking exactly-once on recovery.
+        let source_overrides = capture_source_offsets_from_coordinator(&self.coordinator).await;
+
         if force {
             // Blocking checkpoint at shutdown.
             let mut guard = self.coordinator.lock().await;
             if let Some(ref mut coord) = *guard {
                 match coord
-                    .checkpoint_with_extra_tables(
+                    .checkpoint_with_offsets(
                         operator_states,
                         None,
                         None,
                         extra_tables,
                         per_source_watermarks,
                         self.pipeline_hash,
+                        source_overrides,
                     )
                     .await
                 {
@@ -327,13 +334,14 @@ impl crate::pipeline::PipelineCallback for ConnectorPipelineCallback {
                 let mut guard = coord_clone.lock().await;
                 if let Some(ref mut coord) = *guard {
                     match coord
-                        .checkpoint_with_extra_tables(
+                        .checkpoint_with_offsets(
                             operator_states,
                             None,
                             None,
                             extra_tables,
                             per_source_watermarks,
                             pipeline_hash,
+                            source_overrides,
                         )
                         .await
                     {
@@ -410,23 +418,26 @@ impl crate::pipeline::PipelineCallback for ConnectorPipelineCallback {
             }
         }
 
-        // Merge barrier-captured source offsets into the extra_tables map.
+        // Barrier-captured source offsets go into source_offset_overrides
+        // so they land in manifest.source_offsets (not table_offsets).
+        // These positions are consistent with the operator state at the
+        // barrier point and must not be re-queried from the live connectors.
+        let mut source_overrides = HashMap::with_capacity(source_checkpoints.len());
         for (name, cp) in &source_checkpoints {
-            extra_tables
-                .entry(name.clone())
-                .or_insert_with(|| source_to_connector_checkpoint(cp));
+            source_overrides.insert(name.clone(), source_to_connector_checkpoint(cp));
         }
 
         let mut guard = self.coordinator.lock().await;
         if let Some(ref mut coord) = *guard {
             match coord
-                .checkpoint_with_extra_tables(
+                .checkpoint_with_offsets(
                     operator_states,
                     None,
                     None,
                     extra_tables,
                     per_source_watermarks,
                     self.pipeline_hash,
+                    source_overrides,
                 )
                 .await
             {
@@ -595,6 +606,40 @@ impl crate::pipeline::PipelineCallback for ConnectorPipelineCallback {
             }
         }
     }
+}
+
+/// Captures current source offsets from a coordinator's registered sources.
+///
+/// Locks each source connector to call `checkpoint()` and converts the
+/// result to `ConnectorCheckpoint`. Must be called at a consistent point
+/// (same time as operator state capture) before spawning async work.
+async fn capture_source_offsets_from_coordinator(
+    coordinator: &Arc<
+        tokio::sync::Mutex<Option<crate::checkpoint_coordinator::CheckpointCoordinator>>,
+    >,
+) -> HashMap<String, laminar_storage::checkpoint_manifest::ConnectorCheckpoint> {
+    use crate::checkpoint_coordinator::source_to_connector_checkpoint;
+
+    let guard = coordinator.lock().await;
+    let Some(ref coord) = *guard else {
+        return HashMap::new();
+    };
+    // Collect connector Arcs + names first, then drop the coordinator lock
+    // before locking individual sources (avoids holding two locks).
+    let source_refs: Vec<_> = coord
+        .registered_sources()
+        .iter()
+        .map(|s| (s.name.clone(), Arc::clone(&s.connector)))
+        .collect();
+    drop(guard);
+
+    let mut overrides = HashMap::with_capacity(source_refs.len());
+    for (name, connector) in source_refs {
+        let guard = connector.lock().await;
+        let cp = guard.checkpoint();
+        overrides.insert(name, source_to_connector_checkpoint(&cp));
+    }
+    overrides
 }
 
 /// Update a partial foyer cache from a CDC batch by inserting or deleting

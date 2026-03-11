@@ -46,7 +46,6 @@ mod metrics_api;
 /// Thread-per-core connector pipeline.
 pub mod pipeline;
 mod pipeline_callback;
-mod pipeline_checkpoint;
 mod pipeline_lifecycle;
 /// Deployment profiles.
 pub mod profile;
@@ -101,7 +100,6 @@ pub use handle::{
     TypedSubscription, UntypedSourceHandle,
 };
 pub use metrics::{PipelineCounters, PipelineMetrics, PipelineState, SourceMetrics, StreamMetrics};
-pub use pipeline_checkpoint::PipelineCheckpoint;
 pub use profile::{Profile, ProfileError};
 pub use recovery_manager::{RecoveredState, RecoveryManager};
 

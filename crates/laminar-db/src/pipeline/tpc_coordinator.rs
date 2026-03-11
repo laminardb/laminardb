@@ -86,6 +86,9 @@ pub struct TpcPipelineCoordinator {
     last_checkpoint: Instant,
     /// Consecutive SQL cycle errors (reset on success).
     consecutive_sql_errors: u32,
+    /// Source-initiated checkpoint request flags (e.g., Kafka rebalance).
+    /// Polled each cycle; when any flag is set, a forced checkpoint is triggered.
+    checkpoint_request_flags: Vec<Arc<std::sync::atomic::AtomicBool>>,
 }
 
 impl TpcPipelineCoordinator {
@@ -102,6 +105,15 @@ impl TpcPipelineCoordinator {
     ) -> Result<Self, DbError> {
         let mut runtime =
             TpcRuntime::new(tpc_config).map_err(|e| DbError::Config(e.to_string()))?;
+
+        // Capture checkpoint_requested flags before connectors are moved.
+        let mut checkpoint_request_flags = Vec::new();
+        for src in &sources {
+            if let Some(flag) = src.connector.checkpoint_requested() {
+                checkpoint_request_flags.push(flag);
+            }
+        }
+
         for (idx, src) in sources.into_iter().enumerate() {
             runtime
                 .attach_source(idx, src.name, src.connector, src.config, &config)
@@ -127,6 +139,7 @@ impl TpcPipelineCoordinator {
             next_checkpoint_id: 1,
             last_checkpoint: Instant::now(),
             consecutive_sql_errors: 0,
+            checkpoint_request_flags,
         })
     }
 
@@ -361,17 +374,33 @@ impl TpcPipelineCoordinator {
         }
     }
 
-    /// Inject checkpoint barriers if the interval has elapsed.
+    /// Inject checkpoint barriers if the interval has elapsed or a source
+    /// has requested an immediate checkpoint (e.g., Kafka partition revocation).
     async fn maybe_inject_checkpoint(&mut self, callback: &mut dyn PipelineCallback) {
-        let Some(interval) = self.config.checkpoint_interval else {
-            return;
-        };
-
         if self.pending_barrier.active {
             return; // Already waiting for alignment
         }
 
-        if self.last_checkpoint.elapsed() < interval {
+        // Check source-initiated checkpoint requests (e.g., Kafka rebalance).
+        let source_requested = self.checkpoint_request_flags.iter().any(|flag| {
+            flag.compare_exchange(
+                true,
+                false,
+                std::sync::atomic::Ordering::AcqRel,
+                std::sync::atomic::Ordering::Relaxed,
+            )
+            .is_ok()
+        });
+
+        let Some(interval) = self.config.checkpoint_interval else {
+            if source_requested {
+                // Manual-only mode but a source needs a checkpoint. Force one.
+                let _ = callback.maybe_checkpoint(true).await;
+            }
+            return;
+        };
+
+        if !source_requested && self.last_checkpoint.elapsed() < interval {
             return;
         }
 
