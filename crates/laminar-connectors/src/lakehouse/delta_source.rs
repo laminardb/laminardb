@@ -10,7 +10,7 @@
 //! 2. Throttle: skip version check if less than `poll_interval` since last check
 //! 3. Check if the table has a newer version than `current_version`
 //! 4. If yes, jump directly to the latest version (O(1) catch-up)
-//! 5. Scan bounded by `max_records` via DataFusion streaming execution
+//! 5. Scan bounded by `max_records` via `DataFusion` streaming execution
 //! 6. Buffer results; `current_version` only advances after the buffer is
 //!    fully drained, so checkpoint always reflects fully-consumed state
 //!
