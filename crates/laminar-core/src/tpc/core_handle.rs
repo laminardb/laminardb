@@ -226,8 +226,7 @@ impl CoreHandle {
         let outbox: Arc<SpscQueue<TaggedOutput>> = Arc::new(SpscQueue::new(config.outbox_capacity));
         // I/O completion queue: Ring 0 produces, Ring 2 consumes during checkpoint.
         // Capacity 256 matches default io_uring ring_entries.
-        let io_completion_outbox: Arc<SpscQueue<IoCompletion>> =
-            Arc::new(SpscQueue::new(256));
+        let io_completion_outbox: Arc<SpscQueue<IoCompletion>> = Arc::new(SpscQueue::new(256));
         let credit_gate = Arc::new(CreditGate::new(config.backpressure.clone()));
         let shutdown = Arc::new(AtomicBool::new(false));
         let events_processed = Arc::new(AtomicU64::new(0));
@@ -244,7 +243,7 @@ impl CoreHandle {
                         Ok(backend) => {
                             tracing::info!(
                                 "Core {core_id}: using io_uring storage I/O (SQPOLL={})",
-                                backend.manager.uses_sqpoll()
+                                backend.uses_sqpoll()
                             );
                             Some(Box::new(backend))
                         }
@@ -737,227 +736,247 @@ fn core_thread_main(
     // silently kill this core thread.  On panic we set is_running = false
     // (the coordinator checks this) and propagate the error.
     let panic_result = catch_unwind(AssertUnwindSafe(|| -> Result<(), TpcError> {
+        // Main loop
+        loop {
+            // Check for shutdown
+            if ctx.shutdown.load(Ordering::Acquire) {
+                break;
+            }
 
-    // Main loop
-    loop {
-        // Check for shutdown
-        if ctx.shutdown.load(Ordering::Acquire) {
-            break;
-        }
+            // Hot path guard for inbox processing
+            let _guard = HotPathGuard::enter("CoreThread::process_inbox");
 
-        // Hot path guard for inbox processing
-        let _guard = HotPathGuard::enter("CoreThread::process_inbox");
+            // Task budget tracking for batch processing
+            let batch_budget = TaskBudget::ring0_batch();
 
-        // Task budget tracking for batch processing
-        let batch_budget = TaskBudget::ring0_batch();
+            // Drain inbox and track messages processed for credit release
+            let mut had_work = false;
+            let mut messages_processed = 0usize;
 
-        // Drain inbox and track messages processed for credit release
-        let mut had_work = false;
-        let mut messages_processed = 0usize;
-
-        while let Some(message) = ctx.inbox.pop() {
-            match message {
-                CoreMessage::Event { source_idx, event } => {
-                    last_source_idx = source_idx;
-                    if let Err(e) = reactor.submit(event) {
-                        submit_error_count += 1;
-                        if submit_error_count.is_power_of_two() {
-                            tracing::error!(
-                                "Core {}: Failed to submit event (n={}): {e}",
-                                ctx.core_id,
-                                submit_error_count,
-                            );
-                        }
-                    }
-                    messages_processed += 1;
-                    had_work = true;
-                }
-                CoreMessage::Watermark(timestamp) => {
-                    // Advance the reactor's watermark so downstream operators
-                    // see the updated event-time progress on the next poll().
-                    reactor.advance_watermark(timestamp);
-                    messages_processed += 1;
-                    had_work = true;
-                }
-                CoreMessage::CheckpointRequest(checkpoint_id) => {
-                    // Snapshot operator states into the pre-allocated Box.
-                    // The Box is taken and replenished after the inbox drain loop.
-                    reactor.trigger_checkpoint_into(&mut checkpoint_states_buf);
-                    let mut data = checkpoint_slot.take().unwrap_or_else(|| {
-                        Box::new(CheckpointCompleteData {
-                            checkpoint_id: 0,
-                            operator_states: Vec::new(),
-                        })
-                    });
-                    data.checkpoint_id = checkpoint_id;
-                    std::mem::swap(&mut data.operator_states, &mut checkpoint_states_buf);
-                    // Checkpoint completion must not be dropped — the coordinator
-                    // would stall waiting for a response that never arrives.
-                    // Spin-wait: checkpoints are infrequent (seconds apart).
-                    let mut cp_out = TaggedOutput {
-                        source_idx: 0,
-                        output: Output::CheckpointComplete(data),
-                    };
-                    loop {
-                        match ctx.outbox.push(cp_out) {
-                            Ok(()) => break,
-                            Err(returned) => {
-                                if ctx.shutdown.load(Ordering::Acquire) {
-                                    break;
-                                }
-                                cp_out = returned;
-                                std::hint::spin_loop();
+            while let Some(message) = ctx.inbox.pop() {
+                match message {
+                    CoreMessage::Event { source_idx, event } => {
+                        last_source_idx = source_idx;
+                        if let Err(e) = reactor.submit(event) {
+                            submit_error_count += 1;
+                            if submit_error_count.is_power_of_two() {
+                                tracing::error!(
+                                    "Core {}: Failed to submit event (n={}): {e}",
+                                    ctx.core_id,
+                                    submit_error_count,
+                                );
                             }
                         }
+                        messages_processed += 1;
+                        had_work = true;
                     }
-                    messages_processed += 1;
-                    had_work = true;
-                }
-                CoreMessage::Barrier {
-                    source_idx,
-                    barrier,
-                } => {
-                    // Flush reactor: process all queued events before the barrier
-                    poll_buffer.clear();
-                    reactor.poll_into(&mut poll_buffer);
-                    for output in poll_buffer.drain(..) {
-                        if ctx
-                            .outbox
-                            .push(TaggedOutput { source_idx, output })
-                            .is_err()
-                        {
-                            ctx.outputs_dropped.fetch_add(1, Ordering::Relaxed);
+                    CoreMessage::Watermark(timestamp) => {
+                        // Advance the reactor's watermark so downstream operators
+                        // see the updated event-time progress on the next poll().
+                        reactor.advance_watermark(timestamp);
+                        messages_processed += 1;
+                        had_work = true;
+                    }
+                    CoreMessage::CheckpointRequest(checkpoint_id) => {
+                        // Snapshot operator states into the pre-allocated Box.
+                        // The Box is taken and replenished after the inbox drain loop.
+                        reactor.trigger_checkpoint_into(&mut checkpoint_states_buf);
+                        let mut data = checkpoint_slot.take().unwrap_or_else(|| {
+                            Box::new(CheckpointCompleteData {
+                                checkpoint_id: 0,
+                                operator_states: Vec::new(),
+                            })
+                        });
+                        data.checkpoint_id = checkpoint_id;
+                        std::mem::swap(&mut data.operator_states, &mut checkpoint_states_buf);
+                        // Checkpoint completion must not be dropped — the coordinator
+                        // would stall waiting for a response that never arrives.
+                        // Spin-wait: checkpoints are infrequent (seconds apart).
+                        let mut cp_out = TaggedOutput {
+                            source_idx: 0,
+                            output: Output::CheckpointComplete(data),
+                        };
+                        loop {
+                            match ctx.outbox.push(cp_out) {
+                                Ok(()) => break,
+                                Err(returned) => {
+                                    if ctx.shutdown.load(Ordering::Acquire) {
+                                        break;
+                                    }
+                                    cp_out = returned;
+                                    std::hint::spin_loop();
+                                }
+                            }
                         }
+                        messages_processed += 1;
+                        had_work = true;
                     }
-                    // Barrier must not be dropped — a missing barrier breaks
-                    // checkpoint alignment. Spin-wait until outbox has space.
-                    let mut barrier_out = TaggedOutput {
+                    CoreMessage::Barrier {
                         source_idx,
-                        output: Output::Barrier(barrier),
-                    };
-                    loop {
-                        match ctx.outbox.push(barrier_out) {
-                            Ok(()) => break,
-                            Err(returned) => {
-                                if ctx.shutdown.load(Ordering::Acquire) {
-                                    break;
+                        barrier,
+                    } => {
+                        // Fully drain the reactor before forwarding the barrier.
+                        // A single poll_into may only process batch_size events;
+                        // we must loop until the queue is empty so no pre-barrier
+                        // event slips past the barrier.
+                        loop {
+                            poll_buffer.clear();
+                            reactor.poll_into(&mut poll_buffer);
+                            if poll_buffer.is_empty() {
+                                break;
+                            }
+                            for output in poll_buffer.drain(..) {
+                                if ctx
+                                    .outbox
+                                    .push(TaggedOutput { source_idx, output })
+                                    .is_err()
+                                {
+                                    ctx.outputs_dropped.fetch_add(1, Ordering::Relaxed);
                                 }
-                                barrier_out = returned;
-                                std::hint::spin_loop();
                             }
                         }
+                        // Barrier must not be dropped — a missing barrier breaks
+                        // checkpoint alignment. Spin-wait until outbox has space.
+                        let mut barrier_out = TaggedOutput {
+                            source_idx,
+                            output: Output::Barrier(barrier),
+                        };
+                        loop {
+                            match ctx.outbox.push(barrier_out) {
+                                Ok(()) => break,
+                                Err(returned) => {
+                                    if ctx.shutdown.load(Ordering::Acquire) {
+                                        break;
+                                    }
+                                    barrier_out = returned;
+                                    std::hint::spin_loop();
+                                }
+                            }
+                        }
+                        messages_processed += 1;
+                        had_work = true;
                     }
-                    messages_processed += 1;
-                    had_work = true;
+                    CoreMessage::Shutdown => {
+                        // Release credits for any messages we've processed so far
+                        if messages_processed > 0 {
+                            ctx.credit_gate.release(messages_processed);
+                            messages_processed = 0;
+                        }
+                        break;
+                    }
                 }
-                CoreMessage::Shutdown => {
-                    // Release credits for any messages we've processed so far
-                    if messages_processed > 0 {
-                        ctx.credit_gate.release(messages_processed);
-                    }
+
+                // Check if batch budget is almost exceeded and break to process reactor
+                // This ensures Ring 0 latency guarantees by limiting batch processing time
+                if batch_budget.almost_exceeded() {
                     break;
                 }
             }
 
-            // Check if batch budget is almost exceeded and break to process reactor
-            // This ensures Ring 0 latency guarantees by limiting batch processing time
-            if batch_budget.almost_exceeded() {
-                break;
+            // Release credits for processed messages
+            // This signals to senders that we have capacity for more
+            if messages_processed > 0 {
+                ctx.credit_gate.release(messages_processed);
             }
-        }
 
-        // Release credits for processed messages
-        // This signals to senders that we have capacity for more
-        if messages_processed > 0 {
-            ctx.credit_gate.release(messages_processed);
-        }
-
-        // Poll storage I/O completions (non-blocking, zero-alloc).
-        // Push completions to the SPSC outbox for Ring 2 (checkpoint coordinator)
-        // to drain and feed to PerCoreWalManager::check_all_completions().
-        if let Some(ref mut sio) = storage_io {
-            io_completions.clear();
-            sio.poll_completions(&mut io_completions);
-            for completion in &io_completions {
-                // Best-effort push — if queue is full, drop the completion.
-                // This is safe: the WAL writer treats missing completions as
-                // "sync still pending" and the checkpoint coordinator will retry.
-                let _ = io_completion_outbox.push(*completion);
+            // Poll storage I/O completions (non-blocking, zero-alloc).
+            // Push completions to the SPSC outbox for Ring 2 (checkpoint coordinator)
+            // to drain and feed to PerCoreWalManager::check_all_completions().
+            if let Some(ref mut sio) = storage_io {
+                io_completions.clear();
+                sio.poll_completions(&mut io_completions);
+                for completion in &io_completions {
+                    // Spin-wait on push failure. A dropped completion
+                    // permanently stalls the WAL writer (pending_sync
+                    // never clears, blocking all future syncs).
+                    let mut c = *completion;
+                    loop {
+                        match io_completion_outbox.push(c) {
+                            Ok(()) => break,
+                            Err(returned) => {
+                                if ctx.shutdown.load(Ordering::Acquire) {
+                                    break;
+                                }
+                                c = returned;
+                                std::hint::spin_loop();
+                            }
+                        }
+                    }
+                }
+                if !io_completions.is_empty() {
+                    had_work = true;
+                }
             }
-            if !io_completions.is_empty() {
+
+            // Replenish checkpoint slot if it was consumed (infrequent — once per checkpoint).
+            // checkpoint_states_buf was drained by the swap above; move its capacity into the
+            // new Box so both buffers retain their allocations across cycles.
+            if checkpoint_slot.is_none() {
+                checkpoint_states_buf.clear();
+                let mut data = Box::new(CheckpointCompleteData {
+                    checkpoint_id: 0,
+                    operator_states: Vec::new(),
+                });
+                std::mem::swap(&mut data.operator_states, &mut checkpoint_states_buf);
+                checkpoint_slot = Some(data);
+            }
+
+            // Process events in reactor (reuses poll_buffer capacity across iterations)
+            poll_buffer.clear();
+            reactor.poll_into(&mut poll_buffer);
+            ctx.events_processed
+                .fetch_add(poll_buffer.len() as u64, Ordering::Relaxed);
+
+            // Push outputs to outbox tagged with the last source index
+            for output in poll_buffer.drain(..) {
+                if ctx
+                    .outbox
+                    .push(TaggedOutput {
+                        source_idx: last_source_idx,
+                        output,
+                    })
+                    .is_err()
+                {
+                    ctx.outputs_dropped.fetch_add(1, Ordering::Relaxed);
+                }
                 had_work = true;
             }
+
+            // Tiered idle: progressively back off to avoid burning CPU
+            // when no work is available. Source I/O threads call unpark()
+            // after pushing to the inbox, giving sub-ms wake latency.
+            if had_work {
+                // Signal the coordinator that outputs are available.
+                // Lock-free: atomic swap is ~5ns. Only the false→true
+                // transition calls notify_one(), so at most ONE core per
+                // coordinator cycle hits the Notify mutex — no N-way contention.
+                if !ctx.has_new_data.swap(true, Ordering::Release) {
+                    ctx.output_notify.notify_one();
+                }
+                idle_spins = 0;
+            } else {
+                idle_spins = idle_spins.saturating_add(1);
+                if idle_spins < 64 {
+                    std::hint::spin_loop();
+                } else if idle_spins < 128 {
+                    thread::yield_now();
+                } else {
+                    thread::park_timeout(std::time::Duration::from_millis(1));
+                }
+            }
         }
 
-        // Replenish checkpoint slot if it was consumed (infrequent — once per checkpoint).
-        // checkpoint_states_buf was drained by the swap above; move its capacity into the
-        // new Box so both buffers retain their allocations across cycles.
-        if checkpoint_slot.is_none() {
-            checkpoint_states_buf.clear();
-            let mut data = Box::new(CheckpointCompleteData {
-                checkpoint_id: 0,
-                operator_states: Vec::new(),
-            });
-            std::mem::swap(&mut data.operator_states, &mut checkpoint_states_buf);
-            checkpoint_slot = Some(data);
-        }
-
-        // Process events in reactor (reuses poll_buffer capacity across iterations)
+        // Drain any remaining events before shutdown
         poll_buffer.clear();
         reactor.poll_into(&mut poll_buffer);
-        ctx.events_processed
-            .fetch_add(poll_buffer.len() as u64, Ordering::Relaxed);
-
-        // Push outputs to outbox tagged with the last source index
         for output in poll_buffer.drain(..) {
-            if ctx
-                .outbox
-                .push(TaggedOutput {
-                    source_idx: last_source_idx,
-                    output,
-                })
-                .is_err()
-            {
-                ctx.outputs_dropped.fetch_add(1, Ordering::Relaxed);
-            }
-            had_work = true;
+            let _ = ctx.outbox.push(TaggedOutput {
+                source_idx: last_source_idx,
+                output,
+            });
         }
 
-        // Tiered idle: progressively back off to avoid burning CPU
-        // when no work is available. Source I/O threads call unpark()
-        // after pushing to the inbox, giving sub-ms wake latency.
-        if had_work {
-            // Signal the coordinator that outputs are available.
-            // Lock-free: atomic swap is ~5ns. Only the false→true
-            // transition calls notify_one(), so at most ONE core per
-            // coordinator cycle hits the Notify mutex — no N-way contention.
-            if !ctx.has_new_data.swap(true, Ordering::Release) {
-                ctx.output_notify.notify_one();
-            }
-            idle_spins = 0;
-        } else {
-            idle_spins = idle_spins.saturating_add(1);
-            if idle_spins < 64 {
-                std::hint::spin_loop();
-            } else if idle_spins < 128 {
-                thread::yield_now();
-            } else {
-                thread::park_timeout(std::time::Duration::from_millis(1));
-            }
-        }
-    }
-
-    // Drain any remaining events before shutdown
-    poll_buffer.clear();
-    reactor.poll_into(&mut poll_buffer);
-    for output in poll_buffer.drain(..) {
-        let _ = ctx.outbox.push(TaggedOutput {
-            source_idx: last_source_idx,
-            output,
-        });
-    }
-
-    Ok(())
+        Ok(())
     })); // end catch_unwind
 
     // Always clear is_running so coordinator detects core death.
@@ -975,10 +994,7 @@ fn core_thread_main(
             } else {
                 "unknown panic".to_string()
             };
-            tracing::error!(
-                "Core {}: operator panic caught: {message}",
-                ctx.core_id,
-            );
+            tracing::error!("Core {}: operator panic caught: {message}", ctx.core_id,);
             Err(TpcError::OperatorPanic {
                 core_id: ctx.core_id,
                 message,

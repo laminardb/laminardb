@@ -811,7 +811,6 @@ mod tests {
     }
 
     #[test]
-    #[test]
     #[should_panic(expected = "session window reached EOWC assign_windows")]
     fn test_session_window_assignment_panics() {
         let wt = EowcWindowType::Session { gap_ms: 5000 };

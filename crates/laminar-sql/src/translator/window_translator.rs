@@ -444,12 +444,10 @@ mod tests {
         let late_clause = LateDataClause::side_output_only("late_events".to_string());
         let result = config.with_late_data_clause(&late_clause);
         assert!(result.is_err());
-        assert!(
-            result
-                .unwrap_err()
-                .to_string()
-                .contains("not yet supported")
-        );
+        assert!(result
+            .unwrap_err()
+            .to_string()
+            .contains("not yet supported"));
     }
 
     #[test]
@@ -459,8 +457,9 @@ mod tests {
         let config = WindowOperatorConfig::tumbling("ts".to_string(), Duration::from_secs(300));
 
         // Allowed lateness without side output is fine
-        let late_clause =
-            LateDataClause::with_allowed_lateness(Expr::Value(sqlparser::ast::Value::SingleQuotedString("5 SECONDS".to_string()).into()));
+        let late_clause = LateDataClause::with_allowed_lateness(Expr::Value(
+            sqlparser::ast::Value::SingleQuotedString("5 SECONDS".to_string()).into(),
+        ));
         let config = config.with_late_data_clause(&late_clause).unwrap();
         assert_eq!(config.allowed_lateness, Duration::from_secs(5));
         assert!(config.late_data_side_output.is_none());

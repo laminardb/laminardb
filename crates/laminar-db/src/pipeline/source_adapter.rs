@@ -325,9 +325,11 @@ fn source_io_main(
                             match barrier_backoff {
                                 0..=63 => std::hint::spin_loop(),
                                 64..=255 => std::thread::yield_now(),
-                                _ => std::thread::park_timeout(
-                                    std::time::Duration::from_micros(100),
-                                ),
+                                _ => {
+                                    std::thread::park_timeout(std::time::Duration::from_micros(
+                                        100,
+                                    ));
+                                }
                             }
                         }
                     }

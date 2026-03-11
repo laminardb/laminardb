@@ -73,10 +73,7 @@ impl SyncStorageIo {
     /// Find a free slot in the fd table.
     fn find_free_slot(&self) -> Option<u32> {
         #[allow(clippy::cast_possible_truncation)]
-        self.fds
-            .iter()
-            .position(Option::is_none)
-            .map(|i| i as u32)
+        self.fds.iter().position(Option::is_none).map(|i| i as u32)
     }
 
     /// Get a mutable reference to an fd entry.
@@ -89,8 +86,12 @@ impl SyncStorageIo {
 
     /// Stage a completion for the next poll.
     fn stage_completion(&mut self, token: u64, result: i32) {
-        self.completions
-            .push_back(IoCompletion { token, result });
+        debug_assert!(
+            self.completions.len() < self.completions.capacity(),
+            "completion queue at capacity {} — poll_completions not draining fast enough",
+            self.completions.capacity()
+        );
+        self.completions.push_back(IoCompletion { token, result });
         self.pending += 1;
     }
 }
@@ -128,12 +129,7 @@ impl StorageIo for SyncStorageIo {
         Ok(())
     }
 
-    fn submit_write(
-        &mut self,
-        fd: IoFd,
-        data: &[u8],
-        offset: u64,
-    ) -> Result<u64, StorageIoError> {
+    fn submit_write(&mut self, fd: IoFd, data: &[u8], offset: u64) -> Result<u64, StorageIoError> {
         let token = self.next_token();
         let entry = self.get_entry(fd)?;
 
@@ -143,8 +139,12 @@ impl StorageIo for SyncStorageIo {
             use std::os::unix::fs::FileExt;
             match entry.file.write_at(data, offset) {
                 Ok(n) => {
-                    #[allow(clippy::cast_possible_truncation, clippy::cast_possible_wrap)]
-                    self.stage_completion(token, n as i32);
+                    debug_assert!(
+                        i32::try_from(n).is_ok(),
+                        "write returned {n} bytes > i32::MAX"
+                    );
+                    let clamped = i32::try_from(n).unwrap_or(i32::MAX);
+                    self.stage_completion(token, clamped);
                 }
                 Err(e) => {
                     let errno = e.raw_os_error().unwrap_or(-1);
@@ -158,8 +158,12 @@ impl StorageIo for SyncStorageIo {
             use std::os::windows::fs::FileExt;
             match entry.file.seek_write(data, offset) {
                 Ok(n) => {
-                    #[allow(clippy::cast_possible_truncation, clippy::cast_possible_wrap)]
-                    self.stage_completion(token, n as i32);
+                    debug_assert!(
+                        i32::try_from(n).is_ok(),
+                        "write returned {n} bytes > i32::MAX"
+                    );
+                    let clamped = i32::try_from(n).unwrap_or(i32::MAX);
+                    self.stage_completion(token, clamped);
                 }
                 Err(e) => {
                     let code = e.raw_os_error().unwrap_or(-1);
@@ -171,11 +175,7 @@ impl StorageIo for SyncStorageIo {
         Ok(token)
     }
 
-    fn submit_append(
-        &mut self,
-        fd: IoFd,
-        data: &[u8],
-    ) -> Result<u64, StorageIoError> {
+    fn submit_append(&mut self, fd: IoFd, data: &[u8]) -> Result<u64, StorageIoError> {
         let token = self.next_token();
         let entry = self.get_entry(fd)?;
 
@@ -184,8 +184,12 @@ impl StorageIo for SyncStorageIo {
         // the file was opened in append mode, so write() appends atomically.
         match entry.file.write_all(data) {
             Ok(()) => {
-                #[allow(clippy::cast_possible_truncation, clippy::cast_possible_wrap)]
-                let n = data.len() as i32;
+                debug_assert!(
+                    i32::try_from(data.len()).is_ok(),
+                    "append of {} bytes > i32::MAX",
+                    data.len()
+                );
+                let n = i32::try_from(data.len()).unwrap_or(i32::MAX);
                 entry.append_offset += data.len() as u64;
                 self.stage_completion(token, n);
             }
@@ -256,10 +260,7 @@ mod tests {
         let path = tmp.path().to_path_buf();
 
         // Register the file
-        let file = std::fs::OpenOptions::new()
-            .write(true)
-            .open(&path)
-            .unwrap();
+        let file = std::fs::OpenOptions::new().write(true).open(&path).unwrap();
         let fd = backend.register_fd(file).unwrap();
 
         // Submit a write at offset 0
@@ -318,10 +319,7 @@ mod tests {
         let tmp = NamedTempFile::new().unwrap();
         let path = tmp.path().to_path_buf();
 
-        let file = std::fs::OpenOptions::new()
-            .write(true)
-            .open(&path)
-            .unwrap();
+        let file = std::fs::OpenOptions::new().write(true).open(&path).unwrap();
         let fd = backend.register_fd(file).unwrap();
 
         let token = backend.submit_datasync(fd).unwrap();

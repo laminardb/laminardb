@@ -304,6 +304,9 @@ pub struct TpcConfigBuilder {
     outbox_capacity: Option<usize>,
     reactor_config: Option<ReactorConfig>,
     numa_aware: Option<bool>,
+    enable_storage_io: Option<bool>,
+    #[cfg(all(target_os = "linux", feature = "io-uring"))]
+    io_uring_config: Option<crate::io_uring::IoUringConfig>,
 }
 
 impl TpcConfigBuilder {
@@ -372,6 +375,21 @@ impl TpcConfigBuilder {
         self
     }
 
+    /// Enables per-core storage I/O backend.
+    #[must_use]
+    pub fn enable_storage_io(mut self, enabled: bool) -> Self {
+        self.enable_storage_io = Some(enabled);
+        self
+    }
+
+    /// Sets the `io_uring` configuration (Linux only).
+    #[cfg(all(target_os = "linux", feature = "io-uring"))]
+    #[must_use]
+    pub fn io_uring_config(mut self, config: crate::io_uring::IoUringConfig) -> Self {
+        self.io_uring_config = Some(config);
+        self
+    }
+
     /// Builds the configuration.
     ///
     /// # Errors
@@ -389,9 +407,9 @@ impl TpcConfigBuilder {
             outbox_capacity: self.outbox_capacity.unwrap_or(8192),
             reactor_config: self.reactor_config.unwrap_or_default(),
             numa_aware: self.numa_aware.unwrap_or(false),
-            enable_storage_io: false,
+            enable_storage_io: self.enable_storage_io.unwrap_or(false),
             #[cfg(all(target_os = "linux", feature = "io-uring"))]
-            io_uring_config: None,
+            io_uring_config: self.io_uring_config,
         };
         config.validate()?;
         Ok(config)

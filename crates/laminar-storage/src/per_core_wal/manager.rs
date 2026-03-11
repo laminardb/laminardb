@@ -339,18 +339,36 @@ impl PerCoreWalManager {
     /// that has a pending sync token matching a completion will update its
     /// `synced_position`.
     ///
-    /// Returns the number of writers whose syncs completed.
-    pub fn check_all_completions(&mut self, completions: &[IoCompletion]) -> usize {
+    /// Returns the number of writers whose syncs completed successfully.
+    ///
+    /// # Errors
+    ///
+    /// Returns the first `PerCoreWalError` encountered if any writer's
+    /// sync failed.
+    pub fn check_all_completions(
+        &mut self,
+        completions: &[IoCompletion],
+    ) -> Result<usize, PerCoreWalError> {
         if completions.is_empty() {
-            return 0;
+            return Ok(0);
         }
         let mut count = 0;
+        let mut first_err: Option<PerCoreWalError> = None;
         for writer in &mut self.writers {
-            if writer.check_completions(completions) {
-                count += 1;
+            match writer.check_completions(completions) {
+                Ok(true) => count += 1,
+                Ok(false) => {}
+                Err(e) => {
+                    if first_err.is_none() {
+                        first_err = Some(e);
+                    }
+                }
             }
         }
-        count
+        match first_err {
+            Some(e) => Err(e),
+            None => Ok(count),
+        }
     }
 
     /// Returns `true` if any writer has a pending sync.

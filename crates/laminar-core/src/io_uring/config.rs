@@ -1,12 +1,18 @@
 //! Configuration types for `io_uring`.
 
 /// Ring operation mode.
+///
+/// Defaults to [`SqPoll`](RingMode::SqPoll) for thread-per-core workloads
+/// (zero-syscall submission). `SqPoll` requires `CAP_SYS_NICE` or root;
+/// ring creation will fail with `EPERM` on unprivileged processes — callers
+/// should fall back to [`Standard`](RingMode::Standard).
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
 pub enum RingMode {
     /// Standard mode with interrupt-based completions.
-    #[default]
     Standard,
     /// SQPOLL mode with kernel polling thread (no syscalls under load).
+    /// Requires `CAP_SYS_NICE` or root privileges.
+    #[default]
     SqPoll,
     /// IOPOLL mode for `NVMe` devices (polls completions from device).
     /// Cannot be used with socket operations.
@@ -60,7 +66,7 @@ impl Default for IoUringConfig {
     fn default() -> Self {
         Self {
             ring_entries: 256,
-            mode: RingMode::SqPoll,
+            mode: RingMode::default(),
             sqpoll_idle_ms: 1000,
             sqpoll_cpu: None,
             buffer_size: 64 * 1024, // 64KB per buffer

@@ -322,7 +322,7 @@ pub async fn ensure_replication_slot(
     Ok(None)
 }
 
-/// Drop a PostgreSQL logical replication slot.
+/// Drop a `PostgreSQL` logical replication slot.
 ///
 /// Use this for administrative cleanup when a pipeline is permanently
 /// deleted and the slot is no longer needed.  Do NOT call this on normal
@@ -341,10 +341,7 @@ pub async fn drop_replication_slot(
     slot_name: &str,
 ) -> Result<(), ConnectorError> {
     client
-        .execute(
-            "SELECT pg_drop_replication_slot($1)",
-            &[&slot_name],
-        )
+        .execute("SELECT pg_drop_replication_slot($1)", &[&slot_name])
         .await
         .map_err(|e| {
             ConnectorError::ConnectionFailed(format!("drop replication slot '{slot_name}': {e}"))

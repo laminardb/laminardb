@@ -809,7 +809,7 @@ mod tests {
     #[test]
     fn test_reactor_batch_processing() {
         let config = ReactorConfig {
-            batch_size: 2, // Small batch size
+            batch_size: 2,                              // Small batch size
             max_iteration_time: Duration::from_secs(1), // time-limit not under test
             ..ReactorConfig::default()
         };

@@ -12,7 +12,7 @@
 //!
 //! Two backends implement this interface:
 //!
-//! - [`SyncStorageIo`] — executes I/O inline via `std::fs`. Write "completes"
+//! - `SyncStorageIo` — executes I/O inline via `std::fs`. Write "completes"
 //!   when data is in the kernel page cache. Sync "completes" after `fdatasync`.
 //!   Works on all platforms. This is the default.
 //!
@@ -164,12 +164,7 @@ pub trait StorageIo: Send {
     ///
     /// Returns a token for tracking completion, or [`StorageIoError::BadFd`]
     /// / [`StorageIoError::BufferExhausted`] on failure.
-    fn submit_write(
-        &mut self,
-        fd: IoFd,
-        data: &[u8],
-        offset: u64,
-    ) -> Result<u64, StorageIoError>;
+    fn submit_write(&mut self, fd: IoFd, data: &[u8], offset: u64) -> Result<u64, StorageIoError>;
 
     /// Submit an append (write at current end-of-file). **Non-blocking.**
     ///
@@ -179,11 +174,7 @@ pub trait StorageIo: Send {
     ///
     /// Returns a token for tracking completion, or [`StorageIoError::BadFd`]
     /// / [`StorageIoError::BufferExhausted`] on failure.
-    fn submit_append(
-        &mut self,
-        fd: IoFd,
-        data: &[u8],
-    ) -> Result<u64, StorageIoError>;
+    fn submit_append(&mut self, fd: IoFd, data: &[u8]) -> Result<u64, StorageIoError>;
 
     /// Submit an `fdatasync` (data-only sync, no metadata). **Non-blocking.**
     ///

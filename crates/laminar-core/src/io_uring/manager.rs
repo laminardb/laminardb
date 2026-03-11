@@ -494,7 +494,7 @@ impl CoreRingManager {
     /// Poll for completions without blocking.
     ///
     /// Returns all available completions from both rings.
-    /// **Allocates a Vec per call** — prefer [`poll_completions_into`] on hot paths.
+    /// **Allocates a Vec per call** — prefer [`Self::poll_completions_into`] on hot paths.
     #[must_use]
     pub fn poll_completions(&mut self) -> Vec<Completion> {
         let mut completions = Vec::new();
@@ -545,12 +545,15 @@ impl CoreRingManager {
             }
         }
 
-        // Process collected completions (ring borrow released)
+        // Process collected completions (ring borrow released).
+        // Index loop rather than drain() because process_completion_data
+        // needs &mut self, which conflicts with drain's borrow.
         for i in 0..self.cqe_scratch.len() {
             let (user_data, result, flags) = self.cqe_scratch[i];
             let completion = self.process_completion_data(user_data, result, flags);
             completions.push(completion);
         }
+        self.cqe_scratch.clear();
     }
 
     /// Process completion data from a CQE.
@@ -559,14 +562,14 @@ impl CoreRingManager {
         let op = self.pending.remove(&user_data);
         let latency = op.as_ref().map(|o| o.submitted_at().elapsed());
 
-        // Mark buffer as no longer in-flight and release it back to the pool.
-        // Without the release, every acquired buffer leaks and the pool
-        // exhausts after `buffer_count` writes.
+        // Mark buffer as no longer in-flight. The caller is responsible
+        // for calling release_buffer(idx) after consuming the completion.
+        // (UringStorageIo does this in poll_completions; direct callers
+        // of wait_for must release explicitly.)
         if let Some(ref op) = op {
             if let Some(buf_idx) = op.buf_index() {
                 if let Some(ref mut pool) = self.buffer_pool {
                     pool.complete_in_flight(buf_idx);
-                    pool.release(buf_idx);
                 }
             }
         }

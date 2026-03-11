@@ -54,9 +54,19 @@ pub struct CoreWalWriter {
     write_buffer: Vec<u8>,
     /// Reusable rkyv serialization buffer (avoids `AlignedVec` alloc per append).
     serialize_buffer: AlignedVec,
-    /// Token from the last `sync_via_storage_io` call, if pending.
-    /// Cleared when the matching completion arrives in [`check_completions`].
-    pending_sync_token: Option<u64>,
+    /// Pending sync state: (token, position boundary at submission time).
+    /// The boundary is the `position` when `sync_via_storage_io` was called.
+    /// On completion, `synced_position` advances to the boundary — not to
+    /// the current `position`, which may have advanced from later appends.
+    pending_sync: Option<PendingSync>,
+}
+
+/// In-flight fdatasync: token + position at submission time.
+#[derive(Debug, Clone, Copy)]
+struct PendingSync {
+    token: u64,
+    /// Only data up to this offset is durable when the CQE arrives.
+    boundary: u64,
 }
 
 impl CoreWalWriter {
@@ -87,7 +97,7 @@ impl CoreWalWriter {
             entries_since_sync: 0,
             write_buffer: Vec::with_capacity(4096),
             serialize_buffer: AlignedVec::with_capacity(256),
-            pending_sync_token: None,
+            pending_sync: None,
         })
     }
 
@@ -118,7 +128,7 @@ impl CoreWalWriter {
             entries_since_sync: 0,
             write_buffer: Vec::with_capacity(4096),
             serialize_buffer: AlignedVec::with_capacity(256),
-            pending_sync_token: None,
+            pending_sync: None,
         })
     }
 
@@ -261,6 +271,41 @@ impl CoreWalWriter {
         self.append_via_storage_io(&entry, sio, fd)
     }
 
+    /// Serialize an entry into `self.write_buffer` (header + CRC + data).
+    ///
+    /// Shared by [`append`] and [`append_via_storage_io`]. After this call,
+    /// `self.write_buffer` contains the complete record ready for I/O.
+    fn serialize_entry(&mut self, entry: &PerCoreWalEntry) -> Result<(), PerCoreWalError> {
+        self.serialize_buffer.clear();
+        let taken = std::mem::take(&mut self.serialize_buffer);
+        let bytes = high::to_bytes_in::<_, RkyvError>(entry, taken)
+            .map_err(|e| PerCoreWalError::Serialization(e.to_string()))?;
+
+        let crc = crc32c::crc32c(&bytes);
+
+        #[allow(clippy::cast_possible_truncation)]
+        let len = bytes.len() as u32;
+        self.write_buffer.clear();
+        #[allow(clippy::cast_possible_truncation)]
+        self.write_buffer
+            .reserve(RECORD_HEADER_SIZE as usize + bytes.len());
+        self.write_buffer.extend_from_slice(&len.to_le_bytes());
+        self.write_buffer.extend_from_slice(&crc.to_le_bytes());
+        self.write_buffer.extend_from_slice(&bytes);
+
+        self.serialize_buffer = bytes;
+        Ok(())
+    }
+
+    /// Advance position/sequence counters after a successful write.
+    fn advance_position(&mut self) {
+        #[allow(clippy::cast_possible_truncation)]
+        let data_len = self.write_buffer.len() as u64 - RECORD_HEADER_SIZE;
+        self.position += RECORD_HEADER_SIZE + data_len;
+        self.sequence += 1;
+        self.entries_since_sync += 1;
+    }
+
     /// Appends a raw entry to the WAL.
     ///
     /// Record format: `[length: 4 bytes][crc32: 4 bytes][data: length bytes]`
@@ -270,38 +315,9 @@ impl CoreWalWriter {
     /// Returns an error if serialization or I/O fails.
     pub fn append(&mut self, entry: &PerCoreWalEntry) -> Result<u64, PerCoreWalError> {
         let start_pos = self.position;
-
-        // Serialize into reusable buffer (avoids AlignedVec alloc per append)
-        self.serialize_buffer.clear();
-        let taken = std::mem::take(&mut self.serialize_buffer);
-        let bytes = high::to_bytes_in::<_, RkyvError>(entry, taken)
-            .map_err(|e| PerCoreWalError::Serialization(e.to_string()))?;
-
-        // Compute CRC32C checksum
-        let crc = crc32c::crc32c(&bytes);
-
-        // Coalesce header + data into single write_all() call
-        #[allow(clippy::cast_possible_truncation)]
-        // rkyv entry serialization is well below u32::MAX
-        let len = bytes.len() as u32;
-        self.write_buffer.clear();
-        #[allow(clippy::cast_possible_truncation)] // RECORD_HEADER_SIZE is 8, always fits usize
-        self.write_buffer
-            .reserve(RECORD_HEADER_SIZE as usize + bytes.len());
-        self.write_buffer.extend_from_slice(&len.to_le_bytes());
-        self.write_buffer.extend_from_slice(&crc.to_le_bytes());
-        self.write_buffer.extend_from_slice(&bytes);
+        self.serialize_entry(entry)?;
         self.writer.write_all(&self.write_buffer)?;
-
-        // Restore serialize buffer for reuse
-        self.serialize_buffer = bytes;
-
-        #[allow(clippy::cast_possible_truncation)] // usize → u64: lossless on 64-bit
-        let data_len = self.write_buffer.len() as u64 - RECORD_HEADER_SIZE;
-        self.position += RECORD_HEADER_SIZE + data_len;
-        self.sequence += 1;
-        self.entries_since_sync += 1;
-
+        self.advance_position();
         Ok(start_pos)
     }
 
@@ -320,38 +336,10 @@ impl CoreWalWriter {
         fd: IoFd,
     ) -> Result<u64, PerCoreWalError> {
         let start_pos = self.position;
-
-        // Serialize into reusable buffer (same path as direct append)
-        self.serialize_buffer.clear();
-        let taken = std::mem::take(&mut self.serialize_buffer);
-        let bytes = high::to_bytes_in::<_, RkyvError>(entry, taken)
-            .map_err(|e| PerCoreWalError::Serialization(e.to_string()))?;
-
-        let crc = crc32c::crc32c(&bytes);
-
-        #[allow(clippy::cast_possible_truncation)]
-        let len = bytes.len() as u32;
-        self.write_buffer.clear();
-        #[allow(clippy::cast_possible_truncation)]
-        self.write_buffer
-            .reserve(RECORD_HEADER_SIZE as usize + bytes.len());
-        self.write_buffer.extend_from_slice(&len.to_le_bytes());
-        self.write_buffer.extend_from_slice(&crc.to_le_bytes());
-        self.write_buffer.extend_from_slice(&bytes);
-
-        // Submit via StorageIo (non-blocking — data copied by backend)
+        self.serialize_entry(entry)?;
         sio.submit_append(fd, &self.write_buffer)
             .map_err(storage_io_to_wal_error)?;
-
-        // Restore serialize buffer for reuse
-        self.serialize_buffer = bytes;
-
-        #[allow(clippy::cast_possible_truncation)]
-        let data_len = self.write_buffer.len() as u64 - RECORD_HEADER_SIZE;
-        self.position += RECORD_HEADER_SIZE + data_len;
-        self.sequence += 1;
-        self.entries_since_sync += 1;
-
+        self.advance_position();
         Ok(start_pos)
     }
 
@@ -368,46 +356,73 @@ impl CoreWalWriter {
         sio: &mut dyn StorageIo,
         fd: IoFd,
     ) -> Result<u64, PerCoreWalError> {
-        let token = sio
-            .submit_datasync(fd)
-            .map_err(storage_io_to_wal_error)?;
-        self.pending_sync_token = Some(token);
+        if self.pending_sync.is_some() {
+            return Err(PerCoreWalError::Io(std::io::Error::other(
+                "sync already in flight — wait for completion before submitting another",
+            )));
+        }
+        let token = sio.submit_datasync(fd).map_err(storage_io_to_wal_error)?;
+        self.pending_sync = Some(PendingSync {
+            token,
+            boundary: self.position,
+        });
         Ok(token)
     }
 
     /// Check I/O completions and update sync state.
     ///
-    /// Scans `completions` for the pending sync token. If found, calls
-    /// [`mark_synced`](Self::mark_synced) to update `synced_position`.
-    /// Returns `true` if the sync completed.
+    /// Scans `completions` for the pending sync token. If found and
+    /// successful, calls [`mark_synced`](Self::mark_synced). If found
+    /// and failed (negative result = errno), returns an error.
+    ///
+    /// Returns `Ok(true)` if the sync completed successfully,
+    /// `Ok(false)` if no matching completion was found,
+    /// or `Err` if the sync failed.
     ///
     /// Call this after every `StorageIo::poll_completions` round.
-    pub fn check_completions(&mut self, completions: &[IoCompletion]) -> bool {
-        let Some(token) = self.pending_sync_token else {
-            return false;
+    ///
+    /// # Errors
+    ///
+    /// Returns `PerCoreWalError::Io` if the kernel reported a sync failure.
+    pub fn check_completions(
+        &mut self,
+        completions: &[IoCompletion],
+    ) -> Result<bool, PerCoreWalError> {
+        let Some(pending) = self.pending_sync else {
+            return Ok(false);
         };
         for c in completions {
-            if c.token == token {
-                self.pending_sync_token = None;
+            if c.token == pending.token {
+                self.pending_sync = None;
                 if c.result >= 0 {
-                    self.mark_synced();
+                    // Advance synced_position only to the boundary that was
+                    // current when the sync was submitted — not to the
+                    // current position, which may include later appends.
+                    self.synced_position = pending.boundary;
+                    self.last_sync = Instant::now();
+                    self.entries_since_sync = 0;
+                    return Ok(true);
                 }
-                return true;
+                return Err(PerCoreWalError::Io(std::io::Error::from_raw_os_error(
+                    -c.result,
+                )));
             }
         }
-        false
+        Ok(false)
     }
 
     /// Returns `true` if a sync is pending (submitted but not yet completed).
     #[must_use]
     pub fn is_sync_pending(&self) -> bool {
-        self.pending_sync_token.is_some()
+        self.pending_sync.is_some()
     }
 
     /// Mark the current write position as synced (durable).
     ///
-    /// Called when the `fdatasync` completion arrives from [`StorageIo`],
-    /// either directly or via [`check_completions`](Self::check_completions).
+    /// Used by the direct (non-`StorageIo`) sync path after a blocking
+    /// `fdatasync` where all data up to `position` is guaranteed durable.
+    /// The `StorageIo` path uses [`Self::check_completions`] instead, which
+    /// advances only to the boundary recorded at submission time.
     pub fn mark_synced(&mut self) {
         self.synced_position = self.position;
         self.last_sync = Instant::now();
@@ -775,7 +790,7 @@ mod tests {
         assert!(completions.len() >= 2);
 
         // Pass completions to writer — it matches the sync token and calls mark_synced
-        let synced = writer.check_completions(&completions);
+        let synced = writer.check_completions(&completions).unwrap();
         assert!(synced);
         assert!(!writer.is_sync_pending());
         assert_eq!(writer.synced_position(), writer.position());
@@ -791,14 +806,78 @@ mod tests {
 
         let (mut writer, _temp_dir) = create_temp_writer(0);
 
-        // No pending sync → check returns false
+        // No pending sync → returns Ok(false)
         let completions = vec![IoCompletion {
             token: 999,
             result: 0,
         }];
-        assert!(!writer.check_completions(&completions));
+        assert!(!writer.check_completions(&completions).unwrap());
 
-        // Empty completions → returns false
-        assert!(!writer.check_completions(&[]));
+        // Empty completions → returns Ok(false)
+        assert!(!writer.check_completions(&[]).unwrap());
+    }
+
+    #[test]
+    fn test_sync_boundary_not_advanced_past_submission() {
+        use laminar_core::storage_io::SyncStorageIo;
+
+        let temp_dir = TempDir::new().unwrap();
+        let path = temp_dir.path().join("wal-boundary.log");
+        let mut writer = CoreWalWriter::new(0, &path).unwrap();
+
+        let mut sio = SyncStorageIo::new();
+        let sio_file = std::fs::OpenOptions::new()
+            .write(true)
+            .append(true)
+            .open(&path)
+            .unwrap();
+        let fd = sio.register_fd(sio_file).unwrap();
+
+        // Write, then sync
+        writer
+            .append_put_via_storage_io(b"k1", b"v1", &mut sio, fd)
+            .unwrap();
+        let pos_at_sync = writer.position();
+        let _token = writer.sync_via_storage_io(&mut sio, fd).unwrap();
+
+        // Write MORE after sync was submitted
+        writer
+            .append_put_via_storage_io(b"k2", b"v2", &mut sio, fd)
+            .unwrap();
+        assert!(writer.position() > pos_at_sync);
+
+        // Drain and check — synced_position must be pos_at_sync, NOT position()
+        let mut completions = Vec::new();
+        sio.poll_completions(&mut completions);
+        let synced = writer.check_completions(&completions).unwrap();
+        assert!(synced);
+        assert_eq!(writer.synced_position(), pos_at_sync);
+        assert!(writer.synced_position() < writer.position());
+    }
+
+    #[test]
+    fn test_overlapping_sync_rejected() {
+        use laminar_core::storage_io::SyncStorageIo;
+
+        let temp_dir = TempDir::new().unwrap();
+        let path = temp_dir.path().join("wal-overlap.log");
+        let mut writer = CoreWalWriter::new(0, &path).unwrap();
+
+        let mut sio = SyncStorageIo::new();
+        let sio_file = std::fs::OpenOptions::new()
+            .write(true)
+            .append(true)
+            .open(&path)
+            .unwrap();
+        let fd = sio.register_fd(sio_file).unwrap();
+
+        writer
+            .append_put_via_storage_io(b"k1", b"v1", &mut sio, fd)
+            .unwrap();
+        writer.sync_via_storage_io(&mut sio, fd).unwrap();
+
+        // Second sync while first is pending → error
+        let result = writer.sync_via_storage_io(&mut sio, fd);
+        assert!(result.is_err());
     }
 }

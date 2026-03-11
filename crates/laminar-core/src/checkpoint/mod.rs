@@ -6,11 +6,12 @@
 //!
 //! - `barrier`: Checkpoint barrier types, `StreamMessage<T>` enum, and
 //!   cross-thread barrier injection
-//! - `unaligned`: Timeout-based fallback for unaligned checkpoints
+//! - `unaligned`: Unaligned checkpoint protocol with optional timeout-based
+//!   semantics for alignment-less checkpointing
 
 /// Checkpoint barrier types and cross-thread injection.
 pub mod barrier;
-/// Unaligned checkpoint protocol with timeout-based fallback.
+/// Unaligned checkpoint protocol with optional timeout-based semantics.
 pub mod unaligned;
 
 // Re-export key types
