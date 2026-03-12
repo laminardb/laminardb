@@ -296,10 +296,17 @@ impl SourceConnector for WebSocketSourceServer {
                 }
                 Err(mpsc::error::TryRecvError::Empty) => break,
                 Err(mpsc::error::TryRecvError::Disconnected) => {
-                    self.state = ConnectorState::Failed;
-                    return Err(ConnectorError::ReadError(
-                        "WebSocket source server acceptor terminated".into(),
-                    ));
+                    if self.message_buffer.is_empty() {
+                        self.state = ConnectorState::Failed;
+                        return Err(ConnectorError::ReadError(
+                            "WebSocket source server acceptor terminated".into(),
+                        ));
+                    }
+                    // Buffer has data already dequeued — break so we can
+                    // parse and return the final batch. Next poll_batch()
+                    // call will see Disconnected again with an empty buffer
+                    // and transition to Failed.
+                    break;
                 }
             }
         }

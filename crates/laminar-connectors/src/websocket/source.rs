@@ -434,10 +434,14 @@ impl SourceConnector for WebSocketSource {
                 Err(mpsc::error::TryRecvError::Empty) => break,
                 Err(mpsc::error::TryRecvError::Disconnected) => {
                     // Channel closed — reader task ended.
-                    self.state = ConnectorState::Failed;
-                    return Err(ConnectorError::ReadError(
-                        "WebSocket reader task terminated".into(),
-                    ));
+                    if self.message_buffer.is_empty() {
+                        self.state = ConnectorState::Failed;
+                        return Err(ConnectorError::ReadError(
+                            "WebSocket reader task terminated".into(),
+                        ));
+                    }
+                    // Drain the final batch before failing on next call.
+                    break;
                 }
             }
         }

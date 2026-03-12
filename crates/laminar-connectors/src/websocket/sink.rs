@@ -222,6 +222,10 @@ impl SinkConnector for WebSocketSinkServer {
                                                 _ => (None, None),
                                             }
                                         }
+                                        Ok(Some(Err(e))) => {
+                                            warn!(addr = %addr, error = %e, "client read error during subscribe, rejecting");
+                                            return;
+                                        }
                                         _ => (filter, None),
                                     };
 
@@ -285,6 +289,10 @@ impl SinkConnector for WebSocketSinkServer {
                                                         {
                                                             break;
                                                         }
+                                                    }
+                                                    Some(Err(e)) => {
+                                                        warn!(addr = %addr, error = %e, "client read error, disconnecting");
+                                                        break;
                                                     }
                                                     _ => {}
                                                 }
