@@ -180,6 +180,7 @@ impl TpcPipelineCoordinator {
     pub async fn run(mut self, mut callback: Box<dyn PipelineCallback>) {
         let batch_window = self.config.batch_window;
         let barrier_timeout = self.config.barrier_alignment_timeout;
+        let startup_time = Instant::now();
         let mut source_health_checked = false;
 
         loop {
@@ -212,9 +213,9 @@ impl TpcPipelineCoordinator {
             self.runtime.poll_all_outputs(&mut self.drain_buffer);
             if self.drain_buffer.is_empty() {
                 // Deferred source health check — run once after sources have
-                // had time to open and restore (~1s after first idle cycle).
+                // had time to open and restore (~1s after coordinator start).
                 if !source_health_checked
-                    && self.last_checkpoint.elapsed() > std::time::Duration::from_secs(1)
+                    && startup_time.elapsed() > std::time::Duration::from_secs(1)
                 {
                     source_health_checked = true;
                     let failed = self.runtime.failed_sources();
@@ -465,9 +466,13 @@ impl TpcPipelineCoordinator {
             .is_ok()
         });
 
+        let is_exactly_once = self.config.delivery_guarantee
+            == laminar_connectors::connector::DeliveryGuarantee::ExactlyOnce;
+
         let Some(interval) = self.config.checkpoint_interval else {
-            if source_requested {
+            if source_requested && !is_exactly_once {
                 // Manual-only mode but a source needs a checkpoint. Force one.
+                // Skipped under exactly-once — use barriers instead.
                 let offsets = self.runtime.snapshot_all_source_checkpoints();
                 let _ = callback.maybe_checkpoint(true, offsets).await;
             }
@@ -489,9 +494,11 @@ impl TpcPipelineCoordinator {
                 .trigger(checkpoint_id, laminar_core::checkpoint::flags::NONE);
         }
 
-        // Also try a non-barrier checkpoint via callback
-        let offsets = self.runtime.snapshot_all_source_checkpoints();
-        let _ = callback.maybe_checkpoint(false, offsets).await;
+        // Timer-based checkpoint alongside barriers (at-least-once only).
+        if !is_exactly_once {
+            let offsets = self.runtime.snapshot_all_source_checkpoints();
+            let _ = callback.maybe_checkpoint(false, offsets).await;
+        }
     }
 }
 

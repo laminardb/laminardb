@@ -204,7 +204,7 @@ impl OffsetTracker {
 
     /// Builds an rdkafka [`TopicPartitionList`] for only assigned partitions.
     ///
-    /// Like [`to_topic_partition_list`] but filtered to the `assigned` set.
+    /// Like [`Self::to_topic_partition_list`] but filtered to the `assigned` set.
     /// When `assigned` is empty, returns an empty TPL.
     #[must_use]
     pub fn to_topic_partition_list_filtered(

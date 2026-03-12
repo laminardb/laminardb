@@ -196,8 +196,15 @@ impl<'a> RecoveryManager<'a> {
                     let state = self
                         .restore_from(manifest, sources, sinks, table_sources)
                         .await;
-                    self.check_strict(&state)?;
-                    return Ok(Some(state));
+                    if let Err(e) = self.check_strict(&state) {
+                        warn!(
+                            checkpoint_id = state.manifest.checkpoint_id,
+                            error = %e,
+                            "latest checkpoint restore had strict errors, trying fallback"
+                        );
+                    } else {
+                        return Ok(Some(state));
+                    }
                 }
             }
             Ok(None) => {
@@ -233,7 +240,14 @@ impl<'a> RecoveryManager<'a> {
                     let state = self
                         .restore_from(manifest, sources, sinks, table_sources)
                         .await;
-                    self.check_strict(&state)?;
+                    if let Err(e) = self.check_strict(&state) {
+                        warn!(
+                            checkpoint_id,
+                            error = %e,
+                            "fallback checkpoint restore had strict errors, trying next"
+                        );
+                        continue;
+                    }
                     return Ok(Some(state));
                 }
                 Ok(None) => {

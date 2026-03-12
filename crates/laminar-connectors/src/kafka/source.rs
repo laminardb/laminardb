@@ -937,11 +937,16 @@ impl SourceConnector for KafkaSource {
     async fn close(&mut self) -> Result<(), ConnectorError> {
         info!("closing Kafka source connector");
 
-        // Send final offsets to the reader task before signaling shutdown.
-        // The reader task will commit these offsets before unsubscribing.
+        // Filter to assigned partitions — same as checkpoint().
+        let assigned = match self.rebalance_state.lock() {
+            Ok(state) => state.assigned_partitions().clone(),
+            Err(poisoned) => poisoned.into_inner().assigned_partitions().clone(),
+        };
+
+        // Send final filtered offsets to the reader task before signaling shutdown.
         if let Some(ref tx) = self.offset_commit_tx {
-            if self.offsets.partition_count() > 0 {
-                let tpl = self.offsets.to_topic_partition_list();
+            let tpl = self.offsets.to_topic_partition_list_filtered(&assigned);
+            if tpl.count() > 0 {
                 let _ = tx.send(tpl);
             }
         }
@@ -959,8 +964,8 @@ impl SourceConnector for KafkaSource {
         // If consumer was never moved to the reader (e.g., close() called
         // before any poll_batch()), commit directly.
         if let Some(ref consumer) = self.consumer {
-            if self.offsets.partition_count() > 0 {
-                let tpl = self.offsets.to_topic_partition_list();
+            let tpl = self.offsets.to_topic_partition_list_filtered(&assigned);
+            if tpl.count() > 0 {
                 if let Err(e) = consumer.commit(&tpl, CommitMode::Sync) {
                     warn!(error = %e, "failed to commit final offsets");
                 }
