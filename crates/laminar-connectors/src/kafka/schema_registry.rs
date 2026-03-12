@@ -544,9 +544,11 @@ impl SchemaRegistryClient {
         schema_str: &str,
         schema_type: SchemaType,
     ) -> Result<i32, ConnectorError> {
-        // Check subject cache first.
+        // Check subject cache — only return cached ID if schema hasn't changed.
         if let Some(entry) = self.subject_cache.get(subject) {
-            return Ok(entry.value().id);
+            if entry.value().schema_str == schema_str {
+                return Ok(entry.value().id);
+            }
         }
 
         let url = format!("{}/subjects/{}/versions", self.base_url, subject);
@@ -1003,6 +1005,19 @@ fn arrow_to_avro_type(data_type: &DataType) -> Result<serde_json::Value, SerdeEr
                 "name": "enum_field",
                 "symbols": [],
             }))
+        }
+        DataType::Timestamp(arrow_schema::TimeUnit::Millisecond, _) => {
+            Ok(serde_json::json!({"type": "long", "logicalType": "timestamp-millis"}))
+        }
+        DataType::Timestamp(arrow_schema::TimeUnit::Microsecond, _) => {
+            Ok(serde_json::json!({"type": "long", "logicalType": "timestamp-micros"}))
+        }
+        DataType::Date32 => Ok(serde_json::json!({"type": "int", "logicalType": "date"})),
+        DataType::Time32(arrow_schema::TimeUnit::Millisecond) => {
+            Ok(serde_json::json!({"type": "int", "logicalType": "time-millis"}))
+        }
+        DataType::Time64(arrow_schema::TimeUnit::Microsecond) => {
+            Ok(serde_json::json!({"type": "long", "logicalType": "time-micros"}))
         }
         DataType::FixedSizeBinary(size) => Ok(serde_json::json!({
             "type": "fixed",
