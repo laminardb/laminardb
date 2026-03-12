@@ -179,13 +179,11 @@ impl OffsetTracker {
     /// Builds a checkpoint containing only offsets for currently assigned partitions.
     ///
     /// Non-mutating alternative to `retain_assigned()` + `to_checkpoint()`.
-    /// If `assigned` is empty (no rebalance has occurred yet), returns the
-    /// full unfiltered checkpoint to avoid losing offsets at startup.
+    /// When `assigned` is empty (either before first rebalance or after full
+    /// revocation), returns an empty checkpoint — this is correct because
+    /// there are no partitions this consumer owns.
     #[must_use]
     pub fn to_checkpoint_filtered(&self, assigned: &HashSet<(String, i32)>) -> SourceCheckpoint {
-        if assigned.is_empty() {
-            return self.to_checkpoint();
-        }
         let offsets: HashMap<String, String> = self
             .topics
             .iter()
@@ -202,6 +200,27 @@ impl OffsetTracker {
         let mut cp = SourceCheckpoint::with_offsets(0, offsets);
         cp.set_metadata("connector", "kafka");
         cp
+    }
+
+    /// Builds an rdkafka [`TopicPartitionList`] for only assigned partitions.
+    ///
+    /// Like [`to_topic_partition_list`] but filtered to the `assigned` set.
+    /// When `assigned` is empty, returns an empty TPL.
+    #[must_use]
+    pub fn to_topic_partition_list_filtered(
+        &self,
+        assigned: &HashSet<(String, i32)>,
+    ) -> TopicPartitionList {
+        let mut tpl = TopicPartitionList::new();
+        for (topic, partitions) in &self.topics {
+            for (&partition, &offset) in partitions {
+                if assigned.contains(&(topic.to_string(), partition)) {
+                    tpl.add_partition_offset(topic, partition, Offset::Offset(offset + 1))
+                        .ok();
+                }
+            }
+        }
+        tpl
     }
 
     /// Clears all tracked offsets.
@@ -380,15 +399,14 @@ mod tests {
     }
 
     #[test]
-    fn test_to_checkpoint_filtered_empty_returns_all() {
+    fn test_to_checkpoint_filtered_empty_returns_empty() {
         let mut tracker = OffsetTracker::new();
         tracker.update("events", 0, 100);
         tracker.update("events", 1, 200);
 
-        // Empty assigned set = no rebalance yet → return all
+        // Empty assigned set → no owned partitions → empty checkpoint
         let cp = tracker.to_checkpoint_filtered(&HashSet::new());
 
-        assert_eq!(cp.get_offset("events-0"), Some("100"));
-        assert_eq!(cp.get_offset("events-1"), Some("200"));
+        assert!(cp.is_empty());
     }
 }

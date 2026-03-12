@@ -129,6 +129,7 @@ impl TpcRuntime {
             pipeline_config.fallback_poll_interval,
             core_thread,
             restore_checkpoint,
+            pipeline_config.delivery_guarantee,
         )?;
 
         self.source_threads.push(io_thread);

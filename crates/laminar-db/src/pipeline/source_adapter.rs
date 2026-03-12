@@ -14,7 +14,7 @@ use std::time::Duration;
 use arrow_array::RecordBatch;
 use laminar_connectors::checkpoint::SourceCheckpoint;
 use laminar_connectors::config::ConnectorConfig;
-use laminar_connectors::connector::SourceConnector;
+use laminar_connectors::connector::{DeliveryGuarantee, SourceConnector};
 use laminar_core::checkpoint::{BarrierPollHandle, CheckpointBarrierInjector};
 use laminar_core::operator::Event;
 use laminar_core::tpc::{CoreMessage, SpscQueue};
@@ -82,6 +82,7 @@ impl SourceIoThread {
         fallback_poll_interval: Duration,
         core_thread: thread::Thread,
         restore_checkpoint: Option<SourceCheckpoint>,
+        delivery_guarantee: DeliveryGuarantee,
     ) -> std::io::Result<Self> {
         let shutdown = Arc::new(AtomicBool::new(false));
         let injector = CheckpointBarrierInjector::new();
@@ -109,6 +110,7 @@ impl SourceIoThread {
                     cp_tx,
                     core_thread,
                     restore_checkpoint,
+                    delivery_guarantee,
                 )
             })?;
 
@@ -199,6 +201,7 @@ fn source_io_main(
     cp_tx: tokio::sync::watch::Sender<SourceCheckpoint>,
     core_thread: thread::Thread,
     restore_checkpoint: Option<SourceCheckpoint>,
+    delivery_guarantee: DeliveryGuarantee,
 ) -> Option<Box<dyn SourceConnector>> {
     let rt = match tokio::runtime::Builder::new_current_thread()
         .enable_all()
@@ -231,6 +234,15 @@ fn source_io_main(
                     );
                 }
                 Err(e) => {
+                    if matches!(delivery_guarantee, DeliveryGuarantee::ExactlyOnce) {
+                        tracing::error!(
+                            source = %name,
+                            error = %e,
+                            "[LDB-5030] source checkpoint restore failed under exactly-once \
+                             — cannot guarantee delivery semantics"
+                        );
+                        return None;
+                    }
                     tracing::warn!(
                         source = %name,
                         error = %e,

@@ -714,16 +714,24 @@ impl SourceConnector for KafkaSource {
                 Ok(state) => state.assigned_partitions().clone(),
                 Err(poisoned) => poisoned.into_inner().assigned_partitions().clone(),
             };
-            if !assigned.is_empty() {
-                let before = self.offsets.partition_count();
-                self.offsets.retain_assigned(&assigned);
-                let after = self.offsets.partition_count();
-                if before != after {
-                    debug!(
-                        before,
-                        after, "purged revoked partition offsets after rebalance"
-                    );
-                }
+            let before = self.offsets.partition_count();
+            self.offsets.retain_assigned(&assigned);
+            let after = self.offsets.partition_count();
+            if before != after {
+                debug!(
+                    before,
+                    after, "purged revoked partition offsets after rebalance"
+                );
+            }
+        }
+
+        // Publish current offsets to the reader task's watch channel so
+        // periodic broker commits always use fresh data — not just the
+        // snapshot from the last checkpoint() call.
+        if !payload_offsets.is_empty() {
+            if let Some(ref tx) = self.offset_commit_tx {
+                let tpl = self.offsets.to_topic_partition_list();
+                let _ = tx.send(tpl);
             }
         }
 
@@ -857,23 +865,20 @@ impl SourceConnector for KafkaSource {
     }
 
     fn checkpoint(&self) -> SourceCheckpoint {
-        // Push current offsets to the reader task so it can commit them on
-        // shutdown even if close() is called without a subsequent checkpoint.
-        // Note: this does NOT commit to the Kafka broker — it only updates the
-        // "offsets to commit on shutdown" watch channel. The actual broker
-        // commit happens only in the reader task's shutdown path.
-        if let Some(ref tx) = self.offset_commit_tx {
-            let tpl = self.offsets.to_topic_partition_list();
-            let _ = tx.send(tpl);
-        }
-
-        // Filter checkpoint to only include currently assigned partitions.
-        // This prevents revoked partition offsets from leaking into the
-        // checkpoint and causing incorrect partition assignment on recovery.
+        // Filter to only currently assigned partitions — prevents revoked
+        // partition offsets from leaking into checkpoints or broker commits.
         let assigned = match self.rebalance_state.lock() {
             Ok(state) => state.assigned_partitions().clone(),
             Err(poisoned) => poisoned.into_inner().assigned_partitions().clone(),
         };
+
+        // Push filtered offsets to the reader task so it can commit them
+        // on shutdown even if close() is called without a subsequent checkpoint.
+        if let Some(ref tx) = self.offset_commit_tx {
+            let tpl = self.offsets.to_topic_partition_list_filtered(&assigned);
+            let _ = tx.send(tpl);
+        }
+
         self.offsets.to_checkpoint_filtered(&assigned)
     }
 
@@ -1039,6 +1044,12 @@ mod tests {
         source.offsets.update("events", 0, 100);
         source.offsets.update("events", 1, 200);
 
+        // Simulate rebalance assign so partitions are in the assigned set.
+        {
+            let mut state = source.rebalance_state.lock().unwrap();
+            state.on_assign(&[("events".into(), 0), ("events".into(), 1)]);
+        }
+
         let cp = source.checkpoint();
         assert_eq!(cp.get_offset("events-0"), Some("100"));
         assert_eq!(cp.get_offset("events-1"), Some("200"));
@@ -1144,15 +1155,14 @@ mod tests {
     }
 
     #[test]
-    fn test_checkpoint_includes_all_before_first_rebalance() {
+    fn test_checkpoint_empty_before_first_rebalance() {
         let mut source = KafkaSource::new(test_schema(), test_config());
         source.offsets.update("events", 0, 100);
         source.offsets.update("events", 1, 200);
 
         // No rebalance has occurred — assigned_partitions is empty.
-        // Checkpoint should include all offsets.
+        // No assigned partitions means no offsets should be checkpointed.
         let cp = source.checkpoint();
-        assert_eq!(cp.get_offset("events-0"), Some("100"));
-        assert_eq!(cp.get_offset("events-1"), Some("200"));
+        assert!(cp.is_empty());
     }
 }
