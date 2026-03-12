@@ -106,6 +106,28 @@ impl TpcPipelineCoordinator {
         let mut runtime =
             TpcRuntime::new(tpc_config).map_err(|e| DbError::Config(e.to_string()))?;
 
+        // Validate delivery guarantee constraints before spawning threads.
+        if config.delivery_guarantee
+            == laminar_connectors::connector::DeliveryGuarantee::ExactlyOnce
+        {
+            for src in &sources {
+                if !src.supports_replay {
+                    return Err(DbError::Config(format!(
+                        "[LDB-5031] exactly-once requires source '{}' to support replay, \
+                         but supports_replay=false",
+                        src.name
+                    )));
+                }
+            }
+            if config.checkpoint_interval.is_none() {
+                return Err(DbError::Config(
+                    "[LDB-5032] exactly-once requires checkpointing to be enabled \
+                     (checkpoint_interval must be set)"
+                        .into(),
+                ));
+            }
+        }
+
         // Capture checkpoint_requested flags before connectors are moved.
         let mut checkpoint_request_flags = Vec::new();
         for src in &sources {
@@ -158,6 +180,7 @@ impl TpcPipelineCoordinator {
     pub async fn run(mut self, mut callback: Box<dyn PipelineCallback>) {
         let batch_window = self.config.batch_window;
         let barrier_timeout = self.config.barrier_alignment_timeout;
+        let mut source_health_checked = false;
 
         loop {
             // Phase 1: Wait for data, shutdown, or fallback timeout.
@@ -188,6 +211,27 @@ impl TpcPipelineCoordinator {
             self.drain_buffer.clear();
             self.runtime.poll_all_outputs(&mut self.drain_buffer);
             if self.drain_buffer.is_empty() {
+                // Deferred source health check — run once after sources have
+                // had time to open and restore (~1s after first idle cycle).
+                if !source_health_checked
+                    && self.last_checkpoint.elapsed() > std::time::Duration::from_secs(1)
+                {
+                    source_health_checked = true;
+                    let failed = self.runtime.failed_sources();
+                    if !failed.is_empty() {
+                        tracing::error!(
+                            sources = ?failed,
+                            "[LDB-5033] source threads failed to start"
+                        );
+                        if self.config.delivery_guarantee
+                            == laminar_connectors::connector::DeliveryGuarantee::ExactlyOnce
+                        {
+                            tracing::error!("aborting: exactly-once requires all sources to start");
+                            break;
+                        }
+                    }
+                }
+
                 self.maybe_inject_checkpoint(&mut *callback).await;
                 callback.poll_tables().await;
                 // Check barrier timeout even when idle — otherwise an
@@ -195,10 +239,18 @@ impl TpcPipelineCoordinator {
                 if self.pending_barrier.active
                     && self.pending_barrier.started_at.elapsed() > barrier_timeout
                 {
+                    let missing: Vec<&str> = self
+                        .source_name_cache
+                        .iter()
+                        .enumerate()
+                        .filter(|(i, _)| !self.pending_barrier.sources_aligned.contains(i))
+                        .map(|(_, name)| name.as_str())
+                        .collect();
                     tracing::warn!(
                         checkpoint_id = self.pending_barrier.checkpoint_id,
                         aligned = self.pending_barrier.sources_aligned.len(),
                         total = self.pending_barrier.sources_total,
+                        missing_sources = ?missing,
                         "Barrier alignment timeout — cancelling checkpoint"
                     );
                     self.pending_barrier.active = false;
@@ -311,10 +363,18 @@ impl TpcPipelineCoordinator {
             if self.pending_barrier.active
                 && self.pending_barrier.started_at.elapsed() > barrier_timeout
             {
+                let missing: Vec<&str> = self
+                    .source_name_cache
+                    .iter()
+                    .enumerate()
+                    .filter(|(i, _)| !self.pending_barrier.sources_aligned.contains(i))
+                    .map(|(_, name)| name.as_str())
+                    .collect();
                 tracing::warn!(
                     checkpoint_id = self.pending_barrier.checkpoint_id,
                     aligned = self.pending_barrier.sources_aligned.len(),
                     total = self.pending_barrier.sources_total,
+                    missing_sources = ?missing,
                     "Barrier alignment timeout — cancelling checkpoint"
                 );
                 self.pending_barrier.active = false;

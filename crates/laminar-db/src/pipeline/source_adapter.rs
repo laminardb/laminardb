@@ -51,6 +51,9 @@ impl Default for SourceIoMetrics {
 pub struct SourceIoThread {
     thread: Option<JoinHandle<Option<Box<dyn SourceConnector>>>>,
     shutdown: Arc<AtomicBool>,
+    /// Set to `true` once the source has successfully opened and restored.
+    /// Remains `false` if open/restore fails (thread exits early).
+    started: Arc<AtomicBool>,
     /// Barrier injector for this source (coordinator uses this to trigger barriers).
     pub injector: CheckpointBarrierInjector,
     /// Lock-free metrics.
@@ -85,12 +88,14 @@ impl SourceIoThread {
         delivery_guarantee: DeliveryGuarantee,
     ) -> std::io::Result<Self> {
         let shutdown = Arc::new(AtomicBool::new(false));
+        let started = Arc::new(AtomicBool::new(false));
         let injector = CheckpointBarrierInjector::new();
         let barrier_handle = injector.handle();
         let metrics = Arc::new(SourceIoMetrics::default());
         let (cp_tx, cp_rx) = tokio::sync::watch::channel(SourceCheckpoint::new(0));
 
         let shutdown_clone = Arc::clone(&shutdown);
+        let started_clone = Arc::clone(&started);
         let metrics_clone = Arc::clone(&metrics);
 
         let thread = thread::Builder::new()
@@ -111,16 +116,27 @@ impl SourceIoThread {
                     core_thread,
                     restore_checkpoint,
                     delivery_guarantee,
+                    started_clone,
                 )
             })?;
 
         Ok(Self {
             thread: Some(thread),
             shutdown,
+            started,
             injector,
             metrics,
             checkpoint_rx: cp_rx,
         })
+    }
+
+    /// Returns true if the source successfully opened and restored its checkpoint.
+    ///
+    /// Returns false if the thread exited before entering the poll loop
+    /// (e.g., due to a fatal restore failure under exactly-once).
+    #[must_use]
+    pub fn has_started(&self) -> bool {
+        self.started.load(Ordering::Acquire)
     }
 
     /// Signal shutdown and join the thread, returning the connector for cleanup.
@@ -202,6 +218,7 @@ fn source_io_main(
     core_thread: thread::Thread,
     restore_checkpoint: Option<SourceCheckpoint>,
     delivery_guarantee: DeliveryGuarantee,
+    started: Arc<AtomicBool>,
 ) -> Option<Box<dyn SourceConnector>> {
     let rt = match tokio::runtime::Builder::new_current_thread()
         .enable_all()
@@ -252,6 +269,7 @@ fn source_io_main(
             }
         }
 
+        started.store(true, Ordering::Release);
         let notify = connector.data_ready_notify();
         let mut epoch: u64 = 0;
 

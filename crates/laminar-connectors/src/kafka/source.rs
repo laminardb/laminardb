@@ -707,6 +707,9 @@ impl SourceConnector for KafkaSource {
         // Lock-free revoke detection: check if a rebalance revoke happened
         // since the last poll cycle. If so, lock the mutex once to purge
         // offsets for partitions we no longer own.
+        //
+        // Offset publishing to the reader task happens AFTER purge to ensure
+        // revoked partitions are never committed to the broker.
         let current_revoke_gen = self.revoke_generation.load(Ordering::Relaxed);
         if current_revoke_gen != self.last_seen_revoke_gen {
             self.last_seen_revoke_gen = current_revoke_gen;
@@ -723,15 +726,21 @@ impl SourceConnector for KafkaSource {
                     after, "purged revoked partition offsets after rebalance"
                 );
             }
-        }
-
-        // Publish current offsets to the reader task's watch channel so
-        // periodic broker commits always use fresh data — not just the
-        // snapshot from the last checkpoint() call.
-        if !payload_offsets.is_empty() {
+            // Immediately publish filtered offsets to the reader task so
+            // any pending periodic broker commit uses the purged set.
             if let Some(ref tx) = self.offset_commit_tx {
                 let tpl = self.offsets.to_topic_partition_list();
-                let _ = tx.send(tpl);
+                if tx.send(tpl).is_err() {
+                    debug!("offset_commit_tx closed, reader task shutting down");
+                }
+            }
+        } else if !payload_offsets.is_empty() {
+            // No rebalance — publish fresh offsets from consumed messages.
+            if let Some(ref tx) = self.offset_commit_tx {
+                let tpl = self.offsets.to_topic_partition_list();
+                if tx.send(tpl).is_err() {
+                    debug!("offset_commit_tx closed, reader task shutting down");
+                }
             }
         }
 

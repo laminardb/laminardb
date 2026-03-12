@@ -888,6 +888,7 @@ impl LaminarDB {
                 .and_then(|c| c.interval_ms)
                 .map(std::time::Duration::from_millis),
             pipeline_hash,
+            delivery_guarantee: pipeline_config.delivery_guarantee,
         };
 
         // Build TPC config (use explicit settings or auto-detect defaults).

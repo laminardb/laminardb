@@ -59,6 +59,7 @@ pub(crate) struct ConnectorPipelineCallback {
     /// `None` = no automatic checkpointing (manual only via coordinator).
     pub(crate) checkpoint_interval: Option<std::time::Duration>,
     pub(crate) pipeline_hash: Option<u64>,
+    pub(crate) delivery_guarantee: laminar_connectors::connector::DeliveryGuarantee,
 }
 
 #[async_trait::async_trait]
@@ -229,6 +230,17 @@ impl crate::pipeline::PipelineCallback for ConnectorPipelineCallback {
         source_offsets: FxHashMap<String, SourceCheckpoint>,
     ) -> bool {
         use crate::checkpoint_coordinator::source_to_connector_checkpoint;
+
+        // Under exactly-once, timer-based checkpoints violate consistency
+        // (source offsets and operator state are captured at different times).
+        // Only forced (shutdown) checkpoints are allowed; barrier-aligned
+        // checkpoints handle the exactly-once path via checkpoint_with_barrier.
+        if !force
+            && self.delivery_guarantee
+                == laminar_connectors::connector::DeliveryGuarantee::ExactlyOnce
+        {
+            return false;
+        }
 
         if self
             .counters

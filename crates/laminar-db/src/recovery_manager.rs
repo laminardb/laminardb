@@ -187,10 +187,10 @@ impl<'a> RecoveryManager<'a> {
         // Fast path: try load_latest() first.
         match self.store.load_latest() {
             Ok(Some(manifest)) => {
-                if self.has_sidecar_corruption(&manifest) {
+                if self.is_checkpoint_corrupt(&manifest) {
                     warn!(
                         checkpoint_id = manifest.checkpoint_id,
-                        "[LDB-6010] latest checkpoint sidecar corrupt, trying fallback"
+                        "[LDB-6010] latest checkpoint corrupt, trying fallback"
                     );
                 } else {
                     let state = self
@@ -222,10 +222,10 @@ impl<'a> RecoveryManager<'a> {
         for &(checkpoint_id, _epoch) in checkpoints.iter().rev() {
             match self.store.load_by_id(checkpoint_id) {
                 Ok(Some(manifest)) => {
-                    if self.has_sidecar_corruption(&manifest) {
+                    if self.is_checkpoint_corrupt(&manifest) {
                         warn!(
                             checkpoint_id,
-                            "[LDB-6010] fallback checkpoint sidecar corrupt, skipping"
+                            "[LDB-6010] fallback checkpoint corrupt, skipping"
                         );
                         continue;
                     }
@@ -538,8 +538,19 @@ impl<'a> RecoveryManager<'a> {
     /// or missing sidecar. Returns `false` if there is no sidecar, or
     /// if the sidecar is valid, or if validation I/O fails (we proceed
     /// with caution rather than blocking recovery).
-    fn has_sidecar_corruption(&self, manifest: &CheckpointManifest) -> bool {
-        if manifest.state_checksum.is_none() {
+    /// Returns `true` if the checkpoint fails integrity validation.
+    ///
+    /// Checks both sidecar checksum and manifest validity. Any validation
+    /// failure (sidecar corruption, missing data, or manifest issues like
+    /// epoch=0) causes the checkpoint to be rejected so fallback can try
+    /// an older one.
+    ///
+    /// Only returns `false` (proceed) when validation passes OR when the
+    /// checkpoint has no sidecar to validate.
+    fn is_checkpoint_corrupt(&self, manifest: &CheckpointManifest) -> bool {
+        // No sidecar and no state_checksum → nothing to validate beyond
+        // manifest parsing (which already succeeded if we got here).
+        if manifest.state_checksum.is_none() && manifest.operator_states.is_empty() {
             return false;
         }
         match self.store.validate_checkpoint(manifest.checkpoint_id) {
@@ -548,30 +559,24 @@ impl<'a> RecoveryManager<'a> {
                 ref issues,
                 ..
             }) => {
-                let sidecar_issue = issues
-                    .iter()
-                    .any(|i| i.contains("checksum mismatch") || i.contains("not found"));
-                if sidecar_issue {
-                    error!(
-                        checkpoint_id = manifest.checkpoint_id,
-                        issues = ?issues,
-                        "[LDB-6010] sidecar integrity check failed — \
-                         operator state may be corrupted"
-                    );
-                    return true;
-                }
-                // Non-sidecar issues (e.g. manifest validation warnings)
-                // are not blocking — proceed with this checkpoint.
-                false
+                error!(
+                    checkpoint_id = manifest.checkpoint_id,
+                    issues = ?issues,
+                    "[LDB-6010] checkpoint integrity check failed"
+                );
+                true
             }
             Ok(_) => false, // valid
             Err(e) => {
-                warn!(
+                // I/O errors during validation are treated as corruption —
+                // if we can't verify the checkpoint, don't trust it.
+                error!(
                     checkpoint_id = manifest.checkpoint_id,
                     error = %e,
-                    "sidecar validation I/O error, proceeding with caution"
+                    "[LDB-6010] checkpoint validation I/O error — \
+                     treating as corrupt for safety"
                 );
-                false
+                true
             }
         }
     }

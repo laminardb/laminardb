@@ -177,6 +177,18 @@ impl TpcRuntime {
             .collect()
     }
 
+    /// Returns names of sources whose I/O threads have not yet started
+    /// (failed open/restore). Empty means all sources are healthy.
+    #[must_use]
+    pub fn failed_sources(&self) -> Vec<String> {
+        self.source_threads
+            .iter()
+            .zip(self.source_names.iter())
+            .filter(|(thread, _)| !thread.has_started())
+            .map(|(_, name)| name.clone())
+            .collect()
+    }
+
     /// Get metrics for a source.
     #[must_use]
     pub fn source_metrics(&self, source_idx: usize) -> &Arc<SourceIoMetrics> {
