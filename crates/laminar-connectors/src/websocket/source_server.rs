@@ -178,7 +178,10 @@ impl SourceConnector for WebSocketSourceServer {
                                 debug!(addr = %addr, "accepted WebSocket client");
 
                                 tokio::spawn(async move {
-                                    let ws_stream = match tokio_tungstenite::accept_async(stream).await {
+                                    let mut ws_config = tungstenite::protocol::WebSocketConfig::default();
+                                    ws_config.max_message_size = Some(max_msg_size);
+                                    ws_config.max_frame_size = Some(max_msg_size);
+                                    let ws_stream = match tokio_tungstenite::accept_async_with_config(stream, Some(ws_config)).await {
                                         Ok(ws) => ws,
                                         Err(e) => {
                                             warn!(addr = %addr, error = %e, "WebSocket handshake failed");
@@ -291,8 +294,12 @@ impl SourceConnector for WebSocketSourceServer {
                     self.metrics.record_message(payload.len() as u64);
                     self.message_buffer.push(payload);
                 }
-                Err(mpsc::error::TryRecvError::Empty | mpsc::error::TryRecvError::Disconnected) => {
-                    break
+                Err(mpsc::error::TryRecvError::Empty) => break,
+                Err(mpsc::error::TryRecvError::Disconnected) => {
+                    self.state = ConnectorState::Failed;
+                    return Err(ConnectorError::ReadError(
+                        "WebSocket source server acceptor terminated".into(),
+                    ));
                 }
             }
         }
@@ -367,6 +374,10 @@ impl SourceConnector for WebSocketSourceServer {
 
     fn data_ready_notify(&self) -> Option<Arc<Notify>> {
         Some(Arc::clone(&self.data_ready))
+    }
+
+    fn supports_replay(&self) -> bool {
+        false
     }
 
     async fn close(&mut self) -> Result<(), ConnectorError> {

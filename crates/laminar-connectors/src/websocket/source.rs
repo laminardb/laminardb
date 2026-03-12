@@ -55,8 +55,6 @@ pub struct WebSocketSource {
     schema: SchemaRef,
     /// Message parser (JSON/CSV/Binary → Arrow).
     parser: MessageParser,
-    /// Connection manager for reconnection and failover.
-    conn_mgr: Option<ConnectionManager>,
     /// Connector lifecycle state.
     state: ConnectorState,
     /// Metrics.
@@ -96,7 +94,6 @@ impl WebSocketSource {
             config,
             schema,
             parser,
-            conn_mgr: None,
             state: ConnectorState::Created,
             metrics: WebSocketSourceMetrics::new(),
             checkpoint_state: WebSocketSourceCheckpoint::default(),
@@ -145,8 +142,17 @@ impl WebSocketSource {
                 let url = conn_mgr.current_url().to_string();
                 info!(url = %url, "connecting to WebSocket server");
 
-                // Attempt connection.
-                let ws_stream = match tokio_tungstenite::connect_async(&url).await {
+                // Attempt connection with frame-level size cap.
+                let mut ws_config = tungstenite::protocol::WebSocketConfig::default();
+                ws_config.max_message_size = Some(max_message_size);
+                ws_config.max_frame_size = Some(max_message_size);
+                let ws_stream = match tokio_tungstenite::connect_async_with_config(
+                    &url,
+                    Some(ws_config),
+                    true, // disable Nagle for low latency
+                )
+                .await
+                {
                     Ok((stream, _response)) => {
                         conn_mgr.reset();
                         info!(url = %url, "WebSocket connection established");
@@ -351,7 +357,8 @@ impl SourceConnector for WebSocketSource {
         }
 
         // ping_interval and ping_timeout are accepted by config but not yet
-        // wired to WebSocket ping/pong frames. Log once so operators know.
+        // wired to WebSocket ping/pong frames in client-mode source.
+        // Tungstenite handles pong replies automatically for incoming pings.
         let _ = (ping_interval, ping_timeout);
 
         info!(
@@ -380,7 +387,6 @@ impl SourceConnector for WebSocketSource {
             Arc::clone(&self.data_ready),
         );
 
-        self.conn_mgr = Some(ConnectionManager::new(urls, reconnect));
         self.rx = Some(rx);
         self.shutdown_tx = Some(shutdown_tx);
         self.reader_handle = Some(handle);
