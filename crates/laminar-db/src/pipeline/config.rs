@@ -2,6 +2,8 @@
 
 use std::time::Duration;
 
+use laminar_connectors::connector::DeliveryGuarantee;
+
 /// Configuration for the event-driven connector pipeline.
 #[derive(Debug, Clone)]
 pub struct PipelineConfig {
@@ -15,6 +17,13 @@ pub struct PipelineConfig {
     pub fallback_poll_interval: Duration,
 
     /// Checkpoint interval (if checkpointing is enabled).
+    ///
+    /// This controls the **timer-based** checkpoint mode (at-least-once).
+    /// For exactly-once semantics, use barrier-aligned checkpoints via
+    /// [`PipelineCallback::checkpoint_with_barrier`](super::callback::PipelineCallback::checkpoint_with_barrier) instead. Timer-based
+    /// checkpoints capture offsets *before* operator state, which means
+    /// on recovery the consumer replays from the offset and operators may
+    /// re-process some records (at-least-once, not exactly-once).
     pub checkpoint_interval: Option<Duration>,
 
     /// Coordinator micro-batch window.
@@ -34,6 +43,13 @@ pub struct PipelineConfig {
     /// Maximum time to wait for all sources to align on a checkpoint
     /// barrier before cancelling the checkpoint.
     pub barrier_alignment_timeout: Duration,
+
+    /// End-to-end delivery guarantee for the pipeline.
+    ///
+    /// Validated at startup: `ExactlyOnce` requires all sources to support
+    /// replay, all sinks to support exactly-once, and checkpointing to be
+    /// enabled. See [`DeliveryGuarantee`] for details.
+    pub delivery_guarantee: DeliveryGuarantee,
 }
 
 impl Default for PipelineConfig {
@@ -45,6 +61,7 @@ impl Default for PipelineConfig {
             checkpoint_interval: None,
             batch_window: Duration::from_millis(5),
             barrier_alignment_timeout: Duration::from_secs(30),
+            delivery_guarantee: DeliveryGuarantee::default(),
         }
     }
 }

@@ -27,6 +27,7 @@ use std::collections::HashMap;
 
 use laminar_storage::checkpoint_manifest::{CheckpointManifest, SinkCommitStatus};
 use laminar_storage::checkpoint_store::CheckpointStore;
+use laminar_storage::ValidationResult;
 use tracing::{debug, error, info, warn};
 
 use crate::checkpoint_coordinator::{
@@ -186,11 +187,25 @@ impl<'a> RecoveryManager<'a> {
         // Fast path: try load_latest() first.
         match self.store.load_latest() {
             Ok(Some(manifest)) => {
-                let state = self
-                    .restore_from(manifest, sources, sinks, table_sources)
-                    .await;
-                self.check_strict(&state)?;
-                return Ok(Some(state));
+                if self.is_checkpoint_corrupt(&manifest) {
+                    warn!(
+                        checkpoint_id = manifest.checkpoint_id,
+                        "[LDB-6010] latest checkpoint corrupt, trying fallback"
+                    );
+                } else {
+                    let state = self
+                        .restore_from(manifest, sources, sinks, table_sources)
+                        .await;
+                    if let Err(e) = self.check_strict(&state) {
+                        warn!(
+                            checkpoint_id = state.manifest.checkpoint_id,
+                            error = %e,
+                            "latest checkpoint restore had strict errors, trying fallback"
+                        );
+                    } else {
+                        return Ok(Some(state));
+                    }
+                }
             }
             Ok(None) => {
                 info!("no checkpoint found, starting fresh");
@@ -214,11 +229,25 @@ impl<'a> RecoveryManager<'a> {
         for &(checkpoint_id, _epoch) in checkpoints.iter().rev() {
             match self.store.load_by_id(checkpoint_id) {
                 Ok(Some(manifest)) => {
+                    if self.is_checkpoint_corrupt(&manifest) {
+                        warn!(
+                            checkpoint_id,
+                            "[LDB-6010] fallback checkpoint corrupt, skipping"
+                        );
+                        continue;
+                    }
                     info!(checkpoint_id, "recovering from fallback checkpoint");
                     let state = self
                         .restore_from(manifest, sources, sinks, table_sources)
                         .await;
-                    self.check_strict(&state)?;
+                    if let Err(e) = self.check_strict(&state) {
+                        warn!(
+                            checkpoint_id,
+                            error = %e,
+                            "fallback checkpoint restore had strict errors, trying next"
+                        );
+                        continue;
+                    }
                     return Ok(Some(state));
                 }
                 Ok(None) => {
@@ -514,6 +543,56 @@ impl<'a> RecoveryManager<'a> {
         );
 
         result
+    }
+
+    /// Checks whether a checkpoint's sidecar data is corrupt.
+    ///
+    /// Returns `true` if the checkpoint has a `state_checksum` and
+    /// [`CheckpointStore::validate_checkpoint`] reports a checksum mismatch
+    /// or missing sidecar. Returns `false` if there is no sidecar, or
+    /// if the sidecar is valid, or if validation I/O fails (we proceed
+    /// with caution rather than blocking recovery).
+    /// Returns `true` if the checkpoint fails integrity validation.
+    ///
+    /// Checks both sidecar checksum and manifest validity. Any validation
+    /// failure (sidecar corruption, missing data, or manifest issues like
+    /// epoch=0) causes the checkpoint to be rejected so fallback can try
+    /// an older one.
+    ///
+    /// Only returns `false` (proceed) when validation passes OR when the
+    /// checkpoint has no sidecar to validate.
+    fn is_checkpoint_corrupt(&self, manifest: &CheckpointManifest) -> bool {
+        // No sidecar and no state_checksum → nothing to validate beyond
+        // manifest parsing (which already succeeded if we got here).
+        if manifest.state_checksum.is_none() && manifest.operator_states.is_empty() {
+            return false;
+        }
+        match self.store.validate_checkpoint(manifest.checkpoint_id) {
+            Ok(ValidationResult {
+                valid: false,
+                ref issues,
+                ..
+            }) => {
+                error!(
+                    checkpoint_id = manifest.checkpoint_id,
+                    issues = ?issues,
+                    "[LDB-6010] checkpoint integrity check failed"
+                );
+                true
+            }
+            Ok(_) => false, // valid
+            Err(e) => {
+                // I/O errors during validation are treated as corruption —
+                // if we can't verify the checkpoint, don't trust it.
+                error!(
+                    checkpoint_id = manifest.checkpoint_id,
+                    error = %e,
+                    "[LDB-6010] checkpoint validation I/O error — \
+                     treating as corrupt for safety"
+                );
+                true
+            }
+        }
     }
 
     /// In strict mode, returns an error if any source or sink had restore failures.

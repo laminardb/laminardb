@@ -21,6 +21,32 @@ use crate::error::ConnectorError;
 use crate::health::HealthStatus;
 use crate::metrics::ConnectorMetrics;
 
+/// Delivery guarantee level for the pipeline.
+///
+/// Configures the expected end-to-end delivery semantics. The pipeline
+/// validates at startup that all sources and sinks meet the requirements
+/// for the chosen guarantee level.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+pub enum DeliveryGuarantee {
+    /// At-least-once: records may be replayed on recovery. Requires
+    /// checkpointing but tolerates non-replayable sources (with degradation).
+    #[default]
+    AtLeastOnce,
+    /// Exactly-once: no duplicates or losses. Requires all sources to
+    /// support replay, all sinks to support exactly-once, and checkpoint
+    /// to be enabled.
+    ExactlyOnce,
+}
+
+impl std::fmt::Display for DeliveryGuarantee {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            DeliveryGuarantee::AtLeastOnce => write!(f, "at-least-once"),
+            DeliveryGuarantee::ExactlyOnce => write!(f, "exactly-once"),
+        }
+    }
+}
+
 /// A batch of records read from a source connector.
 #[derive(Debug, Clone)]
 pub struct SourceBatch {

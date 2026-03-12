@@ -14,7 +14,7 @@ use std::time::Duration;
 use arrow_array::RecordBatch;
 use laminar_connectors::checkpoint::SourceCheckpoint;
 use laminar_connectors::config::ConnectorConfig;
-use laminar_connectors::connector::SourceConnector;
+use laminar_connectors::connector::{DeliveryGuarantee, SourceConnector};
 use laminar_core::checkpoint::{BarrierPollHandle, CheckpointBarrierInjector};
 use laminar_core::operator::Event;
 use laminar_core::tpc::{CoreMessage, SpscQueue};
@@ -51,6 +51,9 @@ impl Default for SourceIoMetrics {
 pub struct SourceIoThread {
     thread: Option<JoinHandle<Option<Box<dyn SourceConnector>>>>,
     shutdown: Arc<AtomicBool>,
+    /// Set to `true` once the source has successfully opened and restored.
+    /// Remains `false` if open/restore fails (thread exits early).
+    started: Arc<AtomicBool>,
     /// Barrier injector for this source (coordinator uses this to trigger barriers).
     pub injector: CheckpointBarrierInjector,
     /// Lock-free metrics.
@@ -81,14 +84,18 @@ impl SourceIoThread {
         max_poll_records: usize,
         fallback_poll_interval: Duration,
         core_thread: thread::Thread,
+        restore_checkpoint: Option<SourceCheckpoint>,
+        delivery_guarantee: DeliveryGuarantee,
     ) -> std::io::Result<Self> {
         let shutdown = Arc::new(AtomicBool::new(false));
+        let started = Arc::new(AtomicBool::new(false));
         let injector = CheckpointBarrierInjector::new();
         let barrier_handle = injector.handle();
         let metrics = Arc::new(SourceIoMetrics::default());
         let (cp_tx, cp_rx) = tokio::sync::watch::channel(SourceCheckpoint::new(0));
 
         let shutdown_clone = Arc::clone(&shutdown);
+        let started_clone = Arc::clone(&started);
         let metrics_clone = Arc::clone(&metrics);
 
         let thread = thread::Builder::new()
@@ -107,16 +114,38 @@ impl SourceIoThread {
                     metrics_clone,
                     cp_tx,
                     core_thread,
+                    restore_checkpoint,
+                    delivery_guarantee,
+                    started_clone,
                 )
             })?;
 
         Ok(Self {
             thread: Some(thread),
             shutdown,
+            started,
             injector,
             metrics,
             checkpoint_rx: cp_rx,
         })
+    }
+
+    /// Returns true if the source successfully opened and restored.
+    #[must_use]
+    pub fn has_started(&self) -> bool {
+        self.started.load(Ordering::Acquire)
+    }
+
+    /// Returns true if the source thread has exited without starting.
+    /// This indicates a fatal startup failure (open or restore failed).
+    /// Returns false if the thread is still running or started successfully.
+    #[must_use]
+    pub fn has_failed(&self) -> bool {
+        !self.has_started()
+            && self
+                .thread
+                .as_ref()
+                .is_some_and(std::thread::JoinHandle::is_finished)
     }
 
     /// Signal shutdown and join the thread, returning the connector for cleanup.
@@ -196,6 +225,9 @@ fn source_io_main(
     metrics: Arc<SourceIoMetrics>,
     cp_tx: tokio::sync::watch::Sender<SourceCheckpoint>,
     core_thread: thread::Thread,
+    restore_checkpoint: Option<SourceCheckpoint>,
+    delivery_guarantee: DeliveryGuarantee,
+    started: Arc<AtomicBool>,
 ) -> Option<Box<dyn SourceConnector>> {
     let rt = match tokio::runtime::Builder::new_current_thread()
         .enable_all()
@@ -215,6 +247,38 @@ fn source_io_main(
             return None;
         }
 
+        // Restore checkpoint offsets AFTER open but BEFORE first poll.
+        // For Kafka, this calls consumer.assign() to seek to the checkpoint
+        // position. The consumer must still be owned by the source (not yet
+        // moved to a background reader task) for assign() to take effect.
+        if let Some(ref checkpoint) = restore_checkpoint {
+            match connector.restore(checkpoint).await {
+                Ok(()) => {
+                    tracing::info!(
+                        source = %name,
+                        "restored source from checkpoint"
+                    );
+                }
+                Err(e) => {
+                    if matches!(delivery_guarantee, DeliveryGuarantee::ExactlyOnce) {
+                        tracing::error!(
+                            source = %name,
+                            error = %e,
+                            "[LDB-5030] source checkpoint restore failed under exactly-once \
+                             — cannot guarantee delivery semantics"
+                        );
+                        return None;
+                    }
+                    tracing::warn!(
+                        source = %name,
+                        error = %e,
+                        "source checkpoint restore failed, starting from group offsets"
+                    );
+                }
+            }
+        }
+
+        started.store(true, Ordering::Release);
         let notify = connector.data_ready_notify();
         let mut epoch: u64 = 0;
 
@@ -296,6 +360,10 @@ fn source_io_main(
                     tracing::warn!("Source '{name}': poll error: {e}");
                 }
             }
+
+            // Publish current offsets for timer-based checkpoints.
+            // watch::send is a lock-free atomic pointer swap (~5ns).
+            let _ = cp_tx.send(connector.checkpoint());
 
             // Check for pending barrier
             if let Some(barrier) = barrier_handle.poll(epoch) {

@@ -5,7 +5,6 @@
 //! using the unified checkpoint system.
 
 use std::collections::HashMap;
-use std::sync::Arc;
 
 use laminar_db::checkpoint_coordinator::{CheckpointConfig, CheckpointCoordinator};
 use laminar_db::recovery_manager::RecoveryManager;
@@ -31,13 +30,6 @@ async fn test_happy_path_checkpoint_and_recovery() {
 
     // Phase 1: Process and checkpoint
     let mut coord = make_coordinator(dir.path());
-
-    // Register a mock source
-    let source = laminar_connectors::testing::MockSourceConnector::new();
-    let source_handle: Arc<
-        tokio::sync::Mutex<Box<dyn laminar_connectors::connector::SourceConnector>>,
-    > = Arc::new(tokio::sync::Mutex::new(Box::new(source)));
-    coord.register_source("trades", Arc::clone(&source_handle), true);
 
     // Perform checkpoint with operator state
     let mut ops = HashMap::new();

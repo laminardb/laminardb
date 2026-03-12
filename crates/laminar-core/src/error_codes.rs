@@ -114,6 +114,14 @@ pub const SINK_ALREADY_EXISTS: &str = "LDB-5013";
 pub const CONNECTOR_SERDE_ERROR: &str = "LDB-5020";
 /// Schema inference or compatibility error.
 pub const CONNECTOR_SCHEMA_ERROR: &str = "LDB-5021";
+/// Exactly-once requires all sources to support replay.
+pub const EXACTLY_ONCE_NON_REPLAYABLE: &str = "LDB-5030";
+/// Exactly-once requires all sinks to support exactly-once semantics.
+pub const EXACTLY_ONCE_SINK_UNSUPPORTED: &str = "LDB-5031";
+/// Exactly-once requires checkpointing to be enabled.
+pub const EXACTLY_ONCE_NO_CHECKPOINT: &str = "LDB-5032";
+/// Mixed delivery capabilities — some sources are non-replayable.
+pub const MIXED_DELIVERY_CAPABILITIES: &str = "LDB-5033";
 
 // ── Checkpoint / Recovery (LDB-6xxx) ──
 

@@ -105,6 +105,7 @@ impl TpcRuntime {
         connector: Box<dyn SourceConnector>,
         connector_config: ConnectorConfig,
         pipeline_config: &PipelineConfig,
+        restore_checkpoint: Option<SourceCheckpoint>,
     ) -> std::io::Result<()> {
         let core_id = self.next_core % self.cores.len();
         assert!(
@@ -127,6 +128,8 @@ impl TpcRuntime {
             pipeline_config.max_poll_records,
             pipeline_config.fallback_poll_interval,
             core_thread,
+            restore_checkpoint,
+            pipeline_config.delivery_guarantee,
         )?;
 
         self.source_threads.push(io_thread);
@@ -157,6 +160,34 @@ impl TpcRuntime {
             .checkpoint_rx
             .borrow()
             .clone()
+    }
+
+    /// Snapshot all source checkpoints (lock-free watch reads).
+    ///
+    /// Returns a map of source name → current checkpoint. Used by
+    /// timer-based checkpoints to capture source offsets without barriers.
+    #[must_use]
+    pub fn snapshot_all_source_checkpoints(
+        &self,
+    ) -> rustc_hash::FxHashMap<String, SourceCheckpoint> {
+        self.source_threads
+            .iter()
+            .zip(self.source_names.iter())
+            .map(|(thread, name)| (name.clone(), thread.checkpoint_rx.borrow().clone()))
+            .collect()
+    }
+
+    /// Returns names of sources whose I/O threads exited without starting
+    /// (open or restore failed). Empty means all sources are healthy or
+    /// still initializing.
+    #[must_use]
+    pub fn failed_sources(&self) -> Vec<String> {
+        self.source_threads
+            .iter()
+            .zip(self.source_names.iter())
+            .filter(|(thread, _)| thread.has_failed())
+            .map(|(_, name)| name.clone())
+            .collect()
     }
 
     /// Get metrics for a source.
