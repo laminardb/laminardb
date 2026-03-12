@@ -216,33 +216,21 @@ impl KafkaSink {
         batch_schema: &SchemaRef,
     ) -> Result<(), ConnectorError> {
         let schema_changed = self.schema != *batch_schema;
-        if schema_changed {
-            debug!(
-                old = ?self.schema.fields().iter().map(|f| f.name()).collect::<Vec<_>>(),
-                new = ?batch_schema.fields().iter().map(|f| f.name()).collect::<Vec<_>>(),
-                "sink schema updated from incoming batch"
-            );
-            self.schema = batch_schema.clone();
-            self.serializer = select_serializer(
-                self.config.format,
-                &self.schema,
-                Arc::clone(&self.avro_schema_id),
-                self.schema_registry.clone(),
-            );
-        }
-
-        // Register on first write (schema_id still 0) or after schema change.
-        if self.config.format == Format::Avro
+        let needs_registration = self.config.format == Format::Avro
             && (schema_changed
                 || self
                     .avro_schema_id
                     .load(std::sync::atomic::Ordering::Relaxed)
-                    == 0)
-        {
+                    == 0);
+
+        // Register with SR *before* advancing schema/serializer so a failure
+        // doesn't leave avro_schema_id stale while the serializer already
+        // encodes with the new schema.
+        if needs_registration {
             if let Some(ref sr) = self.schema_registry {
                 let subject = format!("{}-value", self.config.topic);
                 let avro_schema =
-                    super::schema_registry::arrow_to_avro_schema(&self.schema, &self.config.topic)
+                    super::schema_registry::arrow_to_avro_schema(batch_schema, &self.config.topic)
                         .map_err(ConnectorError::Serde)?;
                 let schema_id = sr
                     .register_schema(
@@ -261,6 +249,21 @@ impl KafkaSink {
                     .store(schema_id as u32, std::sync::atomic::Ordering::Relaxed);
                 info!(subject = %subject, schema_id, "registered Avro schema");
             }
+        }
+
+        if schema_changed {
+            debug!(
+                old = ?self.schema.fields().iter().map(|f| f.name()).collect::<Vec<_>>(),
+                new = ?batch_schema.fields().iter().map(|f| f.name()).collect::<Vec<_>>(),
+                "sink schema updated from incoming batch"
+            );
+            self.schema = batch_schema.clone();
+            self.serializer = select_serializer(
+                self.config.format,
+                &self.schema,
+                Arc::clone(&self.avro_schema_id),
+                self.schema_registry.clone(),
+            );
         }
 
         Ok(())
