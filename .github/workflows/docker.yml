@@ -252,7 +252,7 @@ jobs:
         run: echo "short=$(echo '${{ github.sha }}' | head -c 7)" >> "$GITHUB_OUTPUT"
 
       - name: Run Trivy vulnerability scanner
-        uses: aquasecurity/trivy-action@0.34.2
+        uses: aquasecurity/trivy-action@0.35.0
         with:
           image-ref: "${{ env.GHCR_IMAGE }}:sha-${{ steps.sha.outputs.short }}"
           version: "v0.69.2"
