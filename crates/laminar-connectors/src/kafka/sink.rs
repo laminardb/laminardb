@@ -234,7 +234,10 @@ impl KafkaSink {
         // Register on first write (schema_id still 0) or after schema change.
         if self.config.format == Format::Avro
             && (schema_changed
-                || self.avro_schema_id.load(std::sync::atomic::Ordering::Relaxed) == 0)
+                || self
+                    .avro_schema_id
+                    .load(std::sync::atomic::Ordering::Relaxed)
+                    == 0)
         {
             if let Some(ref sr) = self.schema_registry {
                 let subject = format!("{}-value", self.config.topic);
