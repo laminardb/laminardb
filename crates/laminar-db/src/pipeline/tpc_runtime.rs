@@ -177,14 +177,15 @@ impl TpcRuntime {
             .collect()
     }
 
-    /// Returns names of sources whose I/O threads have not yet started
-    /// (failed open/restore). Empty means all sources are healthy.
+    /// Returns names of sources whose I/O threads exited without starting
+    /// (open or restore failed). Empty means all sources are healthy or
+    /// still initializing.
     #[must_use]
     pub fn failed_sources(&self) -> Vec<String> {
         self.source_threads
             .iter()
             .zip(self.source_names.iter())
-            .filter(|(thread, _)| !thread.has_started())
+            .filter(|(thread, _)| thread.has_failed())
             .map(|(_, name)| name.clone())
             .collect()
     }

@@ -130,13 +130,22 @@ impl SourceIoThread {
         })
     }
 
-    /// Returns true if the source successfully opened and restored its checkpoint.
-    ///
-    /// Returns false if the thread exited before entering the poll loop
-    /// (e.g., due to a fatal restore failure under exactly-once).
+    /// Returns true if the source successfully opened and restored.
     #[must_use]
     pub fn has_started(&self) -> bool {
         self.started.load(Ordering::Acquire)
+    }
+
+    /// Returns true if the source thread has exited without starting.
+    /// This indicates a fatal startup failure (open or restore failed).
+    /// Returns false if the thread is still running or started successfully.
+    #[must_use]
+    pub fn has_failed(&self) -> bool {
+        !self.has_started()
+            && self
+                .thread
+                .as_ref()
+                .is_some_and(std::thread::JoinHandle::is_finished)
     }
 
     /// Signal shutdown and join the thread, returning the connector for cleanup.

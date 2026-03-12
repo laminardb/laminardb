@@ -231,14 +231,13 @@ impl crate::pipeline::PipelineCallback for ConnectorPipelineCallback {
     ) -> bool {
         use crate::checkpoint_coordinator::source_to_connector_checkpoint;
 
-        // Under exactly-once, timer-based checkpoints violate consistency
-        // (source offsets and operator state are captured at different times).
-        // Only forced (shutdown) checkpoints are allowed; barrier-aligned
-        // checkpoints handle the exactly-once path via checkpoint_with_barrier.
+        // Under exactly-once, only barrier-aligned checkpoints are consistent.
+        // Timer-based checkpoints are skipped (barrier path handles exactly-once).
         if !force
             && self.delivery_guarantee
                 == laminar_connectors::connector::DeliveryGuarantee::ExactlyOnce
         {
+            tracing::debug!("skipping timer checkpoint under exactly-once (use barriers)");
             return false;
         }
 

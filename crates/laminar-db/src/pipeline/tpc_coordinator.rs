@@ -436,7 +436,13 @@ impl TpcPipelineCoordinator {
 
             let success = callback.checkpoint_with_barrier(source_checkpoints).await;
             if !success {
-                tracing::warn!("Checkpoint with barrier failed");
+                if self.config.delivery_guarantee
+                    == laminar_connectors::connector::DeliveryGuarantee::ExactlyOnce
+                {
+                    tracing::error!("[LDB-6011] barrier checkpoint failed under exactly-once");
+                } else {
+                    tracing::warn!("checkpoint with barrier failed");
+                }
             }
         }
     }

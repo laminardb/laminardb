@@ -705,13 +705,10 @@ impl SourceConnector for KafkaSource {
         }
 
         // Lock-free revoke detection: check if a rebalance revoke happened
-        // since the last poll cycle. If so, lock the mutex once to purge
-        // offsets for partitions we no longer own.
-        //
-        // Offset publishing to the reader task happens AFTER purge to ensure
-        // revoked partitions are never committed to the broker.
+        // since the last poll cycle. If so, purge offsets for revoked partitions.
         let current_revoke_gen = self.revoke_generation.load(Ordering::Relaxed);
-        if current_revoke_gen != self.last_seen_revoke_gen {
+        let had_revoke = current_revoke_gen != self.last_seen_revoke_gen;
+        if had_revoke {
             self.last_seen_revoke_gen = current_revoke_gen;
             let assigned = match self.rebalance_state.lock() {
                 Ok(state) => state.assigned_partitions().clone(),
@@ -726,16 +723,11 @@ impl SourceConnector for KafkaSource {
                     after, "purged revoked partition offsets after rebalance"
                 );
             }
-            // Immediately publish filtered offsets to the reader task so
-            // any pending periodic broker commit uses the purged set.
-            if let Some(ref tx) = self.offset_commit_tx {
-                let tpl = self.offsets.to_topic_partition_list();
-                if tx.send(tpl).is_err() {
-                    debug!("offset_commit_tx closed, reader task shutting down");
-                }
-            }
-        } else if !payload_offsets.is_empty() {
-            // No rebalance — publish fresh offsets from consumed messages.
+        }
+
+        // Publish current offsets to the reader task for periodic broker commits.
+        // After retain_assigned, self.offsets only contains assigned partitions.
+        if had_revoke || !payload_offsets.is_empty() {
             if let Some(ref tx) = self.offset_commit_tx {
                 let tpl = self.offsets.to_topic_partition_list();
                 if tx.send(tpl).is_err() {
