@@ -223,7 +223,11 @@ impl crate::pipeline::PipelineCallback for ConnectorPipelineCallback {
     /// consumer replays from offset → operator may re-process some
     /// records. This is correct for at-least-once but NOT exactly-once.
     /// For exactly-once, use barrier-aligned checkpoints instead.
-    async fn maybe_checkpoint(&mut self, force: bool) -> bool {
+    async fn maybe_checkpoint(
+        &mut self,
+        force: bool,
+        source_offsets: FxHashMap<String, SourceCheckpoint>,
+    ) -> bool {
         use crate::checkpoint_coordinator::source_to_connector_checkpoint;
 
         if self
@@ -271,9 +275,11 @@ impl crate::pipeline::PipelineCallback for ConnectorPipelineCallback {
             );
         }
 
-        // Source offsets are captured by the TPC pipeline's barrier-aligned
-        // checkpoint path (via SourceRegistration), not by the coordinator.
-        let source_overrides = HashMap::new();
+        // Convert source offsets from connector format to manifest format.
+        let source_overrides: HashMap<String, _> = source_offsets
+            .iter()
+            .map(|(name, cp)| (name.clone(), source_to_connector_checkpoint(cp)))
+            .collect();
 
         // Capture stream executor aggregate state.
         let mut operator_states = HashMap::with_capacity(1);

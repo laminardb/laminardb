@@ -334,6 +334,10 @@ fn source_io_main(
                 }
             }
 
+            // Publish current offsets for timer-based checkpoints.
+            // watch::send is a lock-free atomic pointer swap (~5ns).
+            let _ = cp_tx.send(connector.checkpoint());
+
             // Check for pending barrier
             if let Some(barrier) = barrier_handle.poll(epoch) {
                 epoch += 1;

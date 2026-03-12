@@ -162,6 +162,21 @@ impl TpcRuntime {
             .clone()
     }
 
+    /// Snapshot all source checkpoints (lock-free watch reads).
+    ///
+    /// Returns a map of source name → current checkpoint. Used by
+    /// timer-based checkpoints to capture source offsets without barriers.
+    #[must_use]
+    pub fn snapshot_all_source_checkpoints(
+        &self,
+    ) -> rustc_hash::FxHashMap<String, SourceCheckpoint> {
+        self.source_threads
+            .iter()
+            .zip(self.source_names.iter())
+            .map(|(thread, name)| (name.clone(), thread.checkpoint_rx.borrow().clone()))
+            .collect()
+    }
+
     /// Get metrics for a source.
     #[must_use]
     pub fn source_metrics(&self, source_idx: usize) -> &Arc<SourceIoMetrics> {

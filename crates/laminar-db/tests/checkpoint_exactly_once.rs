@@ -80,7 +80,11 @@ impl PipelineCallback for BarrierTrackingCallback {
         0
     }
 
-    async fn maybe_checkpoint(&mut self, force: bool) -> bool {
+    async fn maybe_checkpoint(
+        &mut self,
+        force: bool,
+        _source_offsets: rustc_hash::FxHashMap<String, laminar_connectors::checkpoint::SourceCheckpoint>,
+    ) -> bool {
         if force {
             self.force_checkpoints += 1;
             return true;

@@ -67,7 +67,11 @@ pub trait PipelineCallback: Send + 'static {
     /// all sources.
     ///
     /// [`checkpoint_with_barrier`]: PipelineCallback::checkpoint_with_barrier
-    async fn maybe_checkpoint(&mut self, force: bool) -> bool;
+    async fn maybe_checkpoint(
+        &mut self,
+        force: bool,
+        source_offsets: FxHashMap<String, SourceCheckpoint>,
+    ) -> bool;
 
     /// Called when all sources have aligned on a barrier.
     ///

@@ -402,7 +402,8 @@ impl TpcPipelineCoordinator {
         let Some(interval) = self.config.checkpoint_interval else {
             if source_requested {
                 // Manual-only mode but a source needs a checkpoint. Force one.
-                let _ = callback.maybe_checkpoint(true).await;
+                let offsets = self.runtime.snapshot_all_source_checkpoints();
+                let _ = callback.maybe_checkpoint(true, offsets).await;
             }
             return;
         };
@@ -423,7 +424,8 @@ impl TpcPipelineCoordinator {
         }
 
         // Also try a non-barrier checkpoint via callback
-        let _ = callback.maybe_checkpoint(false).await;
+        let offsets = self.runtime.snapshot_all_source_checkpoints();
+        let _ = callback.maybe_checkpoint(false, offsets).await;
     }
 }
 
