@@ -1004,32 +1004,19 @@ fn arrow_to_avro_type(data_type: &DataType) -> Result<serde_json::Value, SerdeEr
                 "symbols": [],
             }))
         }
-        DataType::Timestamp(unit, _) => {
-            let logical_type = match unit {
-                arrow_schema::TimeUnit::Millisecond => "timestamp-millis",
-                _ => "timestamp-micros",
-            };
-            Ok(serde_json::json!({
-                "type": "long",
-                "logicalType": logical_type,
-            }))
+        DataType::Timestamp(arrow_schema::TimeUnit::Millisecond, _) => {
+            Ok(serde_json::json!({"type": "long", "logicalType": "timestamp-millis"}))
         }
-        DataType::Date32 => Ok(serde_json::json!({
-            "type": "int",
-            "logicalType": "date",
-        })),
-        DataType::Time32(_) => Ok(serde_json::json!({
-            "type": "int",
-            "logicalType": "time-millis",
-        })),
-        DataType::Time64(_) => Ok(serde_json::json!({
-            "type": "long",
-            "logicalType": "time-micros",
-        })),
-        DataType::Duration(_) => Ok(serde_json::json!({
-            "type": "long",
-            "logicalType": "timestamp-micros",
-        })),
+        DataType::Timestamp(arrow_schema::TimeUnit::Microsecond, _) => {
+            Ok(serde_json::json!({"type": "long", "logicalType": "timestamp-micros"}))
+        }
+        DataType::Date32 => Ok(serde_json::json!({"type": "int", "logicalType": "date"})),
+        DataType::Time32(arrow_schema::TimeUnit::Millisecond) => {
+            Ok(serde_json::json!({"type": "int", "logicalType": "time-millis"}))
+        }
+        DataType::Time64(arrow_schema::TimeUnit::Microsecond) => {
+            Ok(serde_json::json!({"type": "long", "logicalType": "time-micros"}))
+        }
         DataType::FixedSizeBinary(size) => Ok(serde_json::json!({
             "type": "fixed",
             "name": "fixed_field",
