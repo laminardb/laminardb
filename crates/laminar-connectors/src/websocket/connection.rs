@@ -21,6 +21,9 @@ pub struct ConnectionManager {
     attempt: u32,
     /// Current backoff delay.
     current_delay: Duration,
+    /// Per-instance seed for jitter (prevents thundering herd when
+    /// multiple instances reconnect simultaneously).
+    jitter_seed: u32,
 }
 
 impl ConnectionManager {
@@ -31,14 +34,22 @@ impl ConnectionManager {
     /// * `urls` - One or more WebSocket URLs for failover. First is primary.
     /// * `config` - Reconnection settings.
     #[must_use]
+    #[allow(clippy::cast_possible_truncation)]
     pub fn new(urls: Vec<String>, config: ReconnectConfig) -> Self {
         let initial_delay = config.initial_delay;
+        // Seed jitter from current time so each instance gets a unique
+        // offset, preventing thundering-herd on simultaneous reconnects.
+        let jitter_seed = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .unwrap_or_default()
+            .subsec_nanos();
         Self {
             config,
             urls,
             current_url_index: 0,
             attempt: 0,
             current_delay: initial_delay,
+            jitter_seed,
         }
     }
 
@@ -107,12 +118,13 @@ impl ConnectionManager {
 
         let delay = self.current_delay;
 
-        // Apply jitter: ±25% of the delay.
+        // Apply jitter: ±25% of the delay. Uses per-instance seed XOR
+        // attempt so different instances get different offsets.
         let delay = if self.config.jitter {
             let jitter_range = delay.as_millis() as f64 * 0.25;
-            // Simple deterministic jitter based on attempt number.
+            let mixed = self.jitter_seed ^ (self.attempt.wrapping_mul(2_654_435_761));
             let jitter_offset =
-                (f64::from(self.attempt) * 7.0 % jitter_range) - (jitter_range / 2.0);
+                (f64::from(mixed % 1000) / 1000.0 * jitter_range * 2.0) - jitter_range;
             let jittered_ms = (delay.as_millis() as f64 + jitter_offset).max(1.0);
             Duration::from_millis(jittered_ms as u64)
         } else {

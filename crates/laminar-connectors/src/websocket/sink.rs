@@ -186,7 +186,12 @@ impl SinkConnector for WebSocketSinkServer {
                                 let client_ping_timeout = ping_timeout;
 
                                 tokio::spawn(async move {
-                                    let ws_stream = match tokio_tungstenite::accept_async(stream).await {
+                                    // Cap incoming frames at 1 MiB — clients only send
+                                    // small control messages (subscribe/unsubscribe/ping).
+                                    let mut ws_config = tungstenite::protocol::WebSocketConfig::default();
+                                    ws_config.max_message_size = Some(1024 * 1024);
+                                    ws_config.max_frame_size = Some(1024 * 1024);
+                                    let ws_stream = match tokio_tungstenite::accept_async_with_config(stream, Some(ws_config)).await {
                                         Ok(ws) => ws,
                                         Err(e) => {
                                             warn!(addr = %addr, error = %e, "handshake failed");
@@ -216,6 +221,10 @@ impl SinkConnector for WebSocketSinkServer {
                                                 }) => (filter, last_sequence),
                                                 _ => (None, None),
                                             }
+                                        }
+                                        Ok(Some(Err(e))) => {
+                                            warn!(addr = %addr, error = %e, "client read error during subscribe, rejecting");
+                                            return;
                                         }
                                         _ => (filter, None),
                                     };
@@ -280,6 +289,10 @@ impl SinkConnector for WebSocketSinkServer {
                                                         {
                                                             break;
                                                         }
+                                                    }
+                                                    Some(Err(e)) => {
+                                                        warn!(addr = %addr, error = %e, "client read error, disconnecting");
+                                                        break;
                                                     }
                                                     _ => {}
                                                 }

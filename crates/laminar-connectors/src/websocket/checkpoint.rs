@@ -44,14 +44,15 @@ impl WebSocketSourceCheckpoint {
     ///
     /// * `epoch` - The epoch number for the checkpoint.
     ///
-    /// # Panics
-    ///
-    /// Panics if the struct cannot be serialized to JSON (should never
-    /// happen for these field types).
     #[must_use]
     pub fn to_source_checkpoint(&self, epoch: u64) -> SourceCheckpoint {
-        let json = serde_json::to_string(self)
-            .expect("WebSocketSourceCheckpoint should always be JSON-serializable");
+        let json = match serde_json::to_string(self) {
+            Ok(j) => j,
+            Err(e) => {
+                tracing::error!(error = %e, "failed to serialize WebSocket checkpoint state");
+                return SourceCheckpoint::new(epoch);
+            }
+        };
         let mut cp = SourceCheckpoint::new(epoch);
         cp.set_offset(CHECKPOINT_KEY, json);
         cp
