@@ -210,6 +210,59 @@ impl KafkaSink {
         self.last_committed_epoch
     }
 
+    /// Ensures the sink schema and SR registration match the actual data.
+    async fn ensure_schema_ready(
+        &mut self,
+        batch_schema: &SchemaRef,
+    ) -> Result<(), ConnectorError> {
+        let schema_changed = self.schema != *batch_schema;
+        if schema_changed {
+            debug!(
+                old = ?self.schema.fields().iter().map(|f| f.name()).collect::<Vec<_>>(),
+                new = ?batch_schema.fields().iter().map(|f| f.name()).collect::<Vec<_>>(),
+                "sink schema updated from incoming batch"
+            );
+            self.schema = batch_schema.clone();
+            self.serializer = select_serializer(
+                self.config.format,
+                &self.schema,
+                Arc::clone(&self.avro_schema_id),
+                self.schema_registry.clone(),
+            );
+        }
+
+        // Register on first write (schema_id still 0) or after schema change.
+        if self.config.format == Format::Avro
+            && (schema_changed
+                || self.avro_schema_id.load(std::sync::atomic::Ordering::Relaxed) == 0)
+        {
+            if let Some(ref sr) = self.schema_registry {
+                let subject = format!("{}-value", self.config.topic);
+                let avro_schema =
+                    super::schema_registry::arrow_to_avro_schema(&self.schema, &self.config.topic)
+                        .map_err(ConnectorError::Serde)?;
+                let schema_id = sr
+                    .register_schema(
+                        &subject,
+                        &avro_schema,
+                        super::schema_registry::SchemaType::Avro,
+                    )
+                    .await
+                    .map_err(|e| {
+                        ConnectorError::ConnectionFailed(format!(
+                            "failed to register Avro schema for '{subject}': {e}"
+                        ))
+                    })?;
+                #[allow(clippy::cast_sign_loss)]
+                self.avro_schema_id
+                    .store(schema_id as u32, std::sync::atomic::Ordering::Relaxed);
+                info!(subject = %subject, schema_id, "registered Avro schema");
+            }
+        }
+
+        Ok(())
+    }
+
     /// Contiguous key buffer: all key bytes in one allocation with per-row offsets.
     ///
     /// Returns `None` if no key column is configured.
@@ -397,13 +450,14 @@ impl SinkConnector for KafkaSink {
             }
         }
 
-        // Register Avro schema with Schema Registry if configured.
+        // Set SR compatibility level if configured.
+        // Schema registration is deferred to first write_batch() where the
+        // real pipeline output schema is known (the factory default is a
+        // placeholder that would pollute the registry and break compat checks).
         if self.config.format == Format::Avro {
             if let Some(ref sr) = self.schema_registry {
-                let subject = format!("{}-value", self.config.topic);
-
-                // Set compatibility level if configured.
                 if let Some(ref compat) = self.config.schema_compatibility {
+                    let subject = format!("{}-value", self.config.topic);
                     sr.set_compatibility_level(&subject, *compat)
                         .await
                         .map_err(|e| {
@@ -412,33 +466,6 @@ impl SinkConnector for KafkaSink {
                             ))
                         })?;
                 }
-
-                let avro_schema =
-                    super::schema_registry::arrow_to_avro_schema(&self.schema, &self.config.topic)
-                        .map_err(ConnectorError::Serde)?;
-
-                let schema_id = sr
-                    .register_schema(
-                        &subject,
-                        &avro_schema,
-                        super::schema_registry::SchemaType::Avro,
-                    )
-                    .await
-                    .map_err(|e| {
-                        ConnectorError::ConnectionFailed(format!(
-                            "failed to register schema for '{subject}': {e}"
-                        ))
-                    })?;
-
-                #[allow(clippy::cast_sign_loss)]
-                self.avro_schema_id
-                    .store(schema_id as u32, std::sync::atomic::Ordering::Relaxed);
-
-                info!(
-                    subject = %subject,
-                    schema_id,
-                    "registered Avro schema with Schema Registry"
-                );
             }
         }
 
@@ -498,6 +525,8 @@ impl SinkConnector for KafkaSink {
                 expected: "producer initialized".into(),
                 actual: "producer is None".into(),
             })?;
+
+        self.ensure_schema_ready(&batch.schema()).await?;
 
         // Serialize the RecordBatch into per-row byte payloads.
         let payloads = self.serializer.serialize(batch).map_err(|e| {
