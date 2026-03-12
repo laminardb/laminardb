@@ -544,9 +544,11 @@ impl SchemaRegistryClient {
         schema_str: &str,
         schema_type: SchemaType,
     ) -> Result<i32, ConnectorError> {
-        // Check subject cache first.
+        // Check subject cache — only return cached ID if schema hasn't changed.
         if let Some(entry) = self.subject_cache.get(subject) {
-            return Ok(entry.value().id);
+            if entry.value().schema_str == schema_str {
+                return Ok(entry.value().id);
+            }
         }
 
         let url = format!("{}/subjects/{}/versions", self.base_url, subject);
