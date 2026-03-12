@@ -484,6 +484,15 @@ pub struct KafkaSourceConfig {
     /// Enforcement mode for watermark alignment.
     pub alignment_mode: Option<super::watermarks::KafkaAlignmentMode>,
 
+    // -- Broker commit --
+    /// Interval at which to asynchronously commit offsets to the Kafka broker.
+    ///
+    /// This is advisory — it keeps `kafka-consumer-groups` lag monitoring
+    /// accurate. The authoritative offset state lives in `LaminarDB`'s
+    /// checkpoint system. Set to `Duration::ZERO` to disable periodic
+    /// broker commits (default: 60s).
+    pub broker_commit_interval: Duration,
+
     // -- Backpressure --
     /// Channel fill ratio at which to pause consumption.
     pub backpressure_high_watermark: f64,
@@ -554,6 +563,7 @@ impl Default for KafkaSourceConfig {
             alignment_group_id: None,
             alignment_max_drift: None,
             alignment_mode: None,
+            broker_commit_interval: Duration::from_secs(60),
             backpressure_high_watermark: 0.8,
             backpressure_low_watermark: 0.5,
             kafka_properties: HashMap::new(),
@@ -716,6 +726,10 @@ impl KafkaSourceConfig {
             None => None,
         };
 
+        let broker_commit_interval_ms = config
+            .get_parsed::<u64>("broker.commit.interval.ms")?
+            .unwrap_or(60_000);
+
         let backpressure_high_watermark = config
             .get_parsed::<f64>("backpressure.high.watermark")?
             .unwrap_or(0.8);
@@ -763,6 +777,7 @@ impl KafkaSourceConfig {
             alignment_group_id,
             alignment_max_drift: alignment_max_drift_ms.map(Duration::from_millis),
             alignment_mode,
+            broker_commit_interval: Duration::from_millis(broker_commit_interval_ms),
             backpressure_high_watermark,
             backpressure_low_watermark,
             kafka_properties,
@@ -1071,6 +1086,23 @@ mod tests {
         assert!(cfg.schema_registry_url.is_none());
         assert_eq!(cfg.security_protocol, SecurityProtocol::Plaintext);
         assert!(cfg.sasl_mechanism.is_none());
+        assert_eq!(cfg.broker_commit_interval, Duration::from_secs(60));
+    }
+
+    #[test]
+    fn test_parse_broker_commit_interval() {
+        let cfg =
+            KafkaSourceConfig::from_config(&make_config(&[("broker.commit.interval.ms", "5000")]))
+                .unwrap();
+        assert_eq!(cfg.broker_commit_interval, Duration::from_millis(5000));
+    }
+
+    #[test]
+    fn test_parse_broker_commit_interval_zero_disables() {
+        let cfg =
+            KafkaSourceConfig::from_config(&make_config(&[("broker.commit.interval.ms", "0")]))
+                .unwrap();
+        assert!(cfg.broker_commit_interval.is_zero());
     }
 
     #[test]

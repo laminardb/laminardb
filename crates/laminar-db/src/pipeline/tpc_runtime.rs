@@ -105,6 +105,7 @@ impl TpcRuntime {
         connector: Box<dyn SourceConnector>,
         connector_config: ConnectorConfig,
         pipeline_config: &PipelineConfig,
+        restore_checkpoint: Option<SourceCheckpoint>,
     ) -> std::io::Result<()> {
         let core_id = self.next_core % self.cores.len();
         assert!(
@@ -127,6 +128,7 @@ impl TpcRuntime {
             pipeline_config.max_poll_records,
             pipeline_config.fallback_poll_interval,
             core_thread,
+            restore_checkpoint,
         )?;
 
         self.source_threads.push(io_thread);

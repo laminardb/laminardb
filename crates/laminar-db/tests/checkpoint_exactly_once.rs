@@ -132,6 +132,7 @@ async fn test_barrier_aligned_checkpoint_fires() {
             ),
             config: laminar_connectors::config::ConnectorConfig::new("mock"),
             supports_replay: true,
+            restore_checkpoint: None,
         },
         SourceRegistration {
             name: "src_b".to_string(),
@@ -140,6 +141,7 @@ async fn test_barrier_aligned_checkpoint_fires() {
             ),
             config: laminar_connectors::config::ConnectorConfig::new("mock"),
             supports_replay: true,
+            restore_checkpoint: None,
         },
     ];
 
@@ -286,6 +288,7 @@ async fn test_single_source_barrier_checkpoint() {
         connector: Box::new(laminar_connectors::testing::MockSourceConnector::with_batches(100, 5)),
         config: laminar_connectors::config::ConnectorConfig::new("mock"),
         supports_replay: true,
+        restore_checkpoint: None,
     }];
 
     let shutdown = Arc::new(Notify::new());
@@ -333,6 +336,7 @@ async fn test_exhausted_sources_with_shutdown() {
             ),
             config: laminar_connectors::config::ConnectorConfig::new("mock"),
             supports_replay: true,
+            restore_checkpoint: None,
         },
         SourceRegistration {
             name: "fast_b".to_string(),
@@ -341,6 +345,7 @@ async fn test_exhausted_sources_with_shutdown() {
             ),
             config: laminar_connectors::config::ConnectorConfig::new("mock"),
             supports_replay: true,
+            restore_checkpoint: None,
         },
     ];
 

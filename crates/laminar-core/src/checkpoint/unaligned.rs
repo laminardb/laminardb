@@ -1,5 +1,10 @@
 //! Unaligned checkpoint protocol with timeout-based fallback.
 //!
+//! **Future feature:** This module is self-contained and fully tested but not
+//! yet wired into the TPC pipeline checkpoint path. It will be integrated in
+//! Phase 4 of the checkpoint remediation plan. The [`UnalignedCheckpointConfig`]
+//! is re-exported by `laminar_db::checkpoint_coordinator` for configuration.
+//!
 //! When barrier alignment takes too long (due to backpressure on slow inputs),
 //! the checkpoint can fall back to an unaligned snapshot that captures in-flight
 //! data from channels. This trades larger checkpoint size for faster completion.

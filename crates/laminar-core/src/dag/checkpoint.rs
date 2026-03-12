@@ -1,5 +1,10 @@
 //! Chandy-Lamport barrier checkpointing for DAG pipelines.
 //!
+//! **Note:** This module is used by the DAG execution model only. The TPC
+//! pipeline path uses [`CheckpointCoordinator`](crate::checkpoint) and
+//! barrier injection via [`CheckpointBarrierInjector`](crate::checkpoint::CheckpointBarrierInjector).
+//! Both models share the same barrier types from [`crate::checkpoint::barrier`].
+//!
 //! This module implements barrier-based checkpointing:
 //!
 //! - [`CheckpointBarrier`] — marker injected at source nodes

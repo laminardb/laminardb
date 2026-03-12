@@ -27,6 +27,7 @@ use std::collections::HashMap;
 
 use laminar_storage::checkpoint_manifest::{CheckpointManifest, SinkCommitStatus};
 use laminar_storage::checkpoint_store::CheckpointStore;
+use laminar_storage::ValidationResult;
 use tracing::{debug, error, info, warn};
 
 use crate::checkpoint_coordinator::{
@@ -186,11 +187,18 @@ impl<'a> RecoveryManager<'a> {
         // Fast path: try load_latest() first.
         match self.store.load_latest() {
             Ok(Some(manifest)) => {
-                let state = self
-                    .restore_from(manifest, sources, sinks, table_sources)
-                    .await;
-                self.check_strict(&state)?;
-                return Ok(Some(state));
+                if self.has_sidecar_corruption(&manifest) {
+                    warn!(
+                        checkpoint_id = manifest.checkpoint_id,
+                        "[LDB-6010] latest checkpoint sidecar corrupt, trying fallback"
+                    );
+                } else {
+                    let state = self
+                        .restore_from(manifest, sources, sinks, table_sources)
+                        .await;
+                    self.check_strict(&state)?;
+                    return Ok(Some(state));
+                }
             }
             Ok(None) => {
                 info!("no checkpoint found, starting fresh");
@@ -214,6 +222,13 @@ impl<'a> RecoveryManager<'a> {
         for &(checkpoint_id, _epoch) in checkpoints.iter().rev() {
             match self.store.load_by_id(checkpoint_id) {
                 Ok(Some(manifest)) => {
+                    if self.has_sidecar_corruption(&manifest) {
+                        warn!(
+                            checkpoint_id,
+                            "[LDB-6010] fallback checkpoint sidecar corrupt, skipping"
+                        );
+                        continue;
+                    }
                     info!(checkpoint_id, "recovering from fallback checkpoint");
                     let state = self
                         .restore_from(manifest, sources, sinks, table_sources)
@@ -514,6 +529,51 @@ impl<'a> RecoveryManager<'a> {
         );
 
         result
+    }
+
+    /// Checks whether a checkpoint's sidecar data is corrupt.
+    ///
+    /// Returns `true` if the checkpoint has a `state_checksum` and
+    /// [`CheckpointStore::validate_checkpoint`] reports a checksum mismatch
+    /// or missing sidecar. Returns `false` if there is no sidecar, or
+    /// if the sidecar is valid, or if validation I/O fails (we proceed
+    /// with caution rather than blocking recovery).
+    fn has_sidecar_corruption(&self, manifest: &CheckpointManifest) -> bool {
+        if manifest.state_checksum.is_none() {
+            return false;
+        }
+        match self.store.validate_checkpoint(manifest.checkpoint_id) {
+            Ok(ValidationResult {
+                valid: false,
+                ref issues,
+                ..
+            }) => {
+                let sidecar_issue = issues
+                    .iter()
+                    .any(|i| i.contains("checksum mismatch") || i.contains("not found"));
+                if sidecar_issue {
+                    error!(
+                        checkpoint_id = manifest.checkpoint_id,
+                        issues = ?issues,
+                        "[LDB-6010] sidecar integrity check failed — \
+                         operator state may be corrupted"
+                    );
+                    return true;
+                }
+                // Non-sidecar issues (e.g. manifest validation warnings)
+                // are not blocking — proceed with this checkpoint.
+                false
+            }
+            Ok(_) => false, // valid
+            Err(e) => {
+                warn!(
+                    checkpoint_id = manifest.checkpoint_id,
+                    error = %e,
+                    "sidecar validation I/O error, proceeding with caution"
+                );
+                false
+            }
+        }
     }
 
     /// In strict mode, returns an error if any source or sink had restore failures.

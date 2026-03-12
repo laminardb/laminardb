@@ -135,41 +135,8 @@ impl Default for AdaptiveCheckpointConfig {
     }
 }
 
-/// Configuration for unaligned checkpoints.
-///
-/// When barrier alignment takes too long (due to backpressure on slow inputs),
-/// the checkpoint can fall back to an unaligned snapshot that captures in-flight
-/// data from channels. This trades larger checkpoint size for faster completion.
-#[derive(Debug, Clone)]
-pub struct UnalignedCheckpointConfig {
-    /// Whether unaligned checkpoints are enabled.
-    pub enabled: bool,
-    /// Duration after which aligned checkpoint falls back to unaligned.
-    ///
-    /// If all barriers don't arrive within this threshold after the first
-    /// barrier, the checkpoint switches to unaligned mode. Default: 10s.
-    pub alignment_timeout_threshold: Duration,
-    /// Maximum bytes of in-flight data to buffer per checkpoint.
-    ///
-    /// If the total in-flight data exceeds this, the checkpoint fails
-    /// rather than consuming unbounded memory. Default: 256 MB.
-    pub max_inflight_buffer_bytes: usize,
-    /// Force unaligned mode for all checkpoints (skip aligned attempt).
-    ///
-    /// Useful for testing or when backpressure is known to be persistent.
-    pub force_unaligned: bool,
-}
-
-impl Default for UnalignedCheckpointConfig {
-    fn default() -> Self {
-        Self {
-            enabled: true,
-            alignment_timeout_threshold: Duration::from_secs(10),
-            max_inflight_buffer_bytes: 256 * 1024 * 1024,
-            force_unaligned: false,
-        }
-    }
-}
+/// Re-export from `laminar_core::checkpoint::unaligned`.
+pub use laminar_core::checkpoint::UnalignedCheckpointConfig;
 
 impl Default for CheckpointConfig {
     fn default() -> Self {
@@ -278,9 +245,7 @@ pub struct WalPrepareResult {
 pub struct CheckpointCoordinator {
     config: CheckpointConfig,
     store: Arc<dyn CheckpointStore>,
-    sources: Vec<RegisteredSource>,
     sinks: Vec<RegisteredSink>,
-    table_sources: Vec<RegisteredSource>,
     next_checkpoint_id: u64,
     epoch: u64,
     phase: CheckpointPhase,
@@ -320,9 +285,7 @@ impl CheckpointCoordinator {
         Self {
             config,
             store,
-            sources: Vec::new(),
             sinks: Vec::new(),
-            table_sources: Vec::new(),
             next_checkpoint_id: next_id,
             epoch,
             phase: CheckpointPhase::Idle,
@@ -338,33 +301,6 @@ impl CheckpointCoordinator {
             unaligned_checkpoint_count: 0,
             previous_wal_positions: None,
         }
-    }
-
-    /// Registers a source connector for checkpoint coordination.
-    ///
-    /// The `supports_replay` flag indicates whether the source can seek
-    /// back to a checkpointed offset. Sources that cannot replay (e.g.,
-    /// WebSocket) will log a warning since exactly-once semantics are
-    /// degraded to at-most-once for events from that source.
-    pub fn register_source(
-        &mut self,
-        name: impl Into<String>,
-        connector: Arc<tokio::sync::Mutex<Box<dyn SourceConnector>>>,
-        supports_replay: bool,
-    ) {
-        let name = name.into();
-        if !supports_replay {
-            warn!(
-                source = %name,
-                "source does not support replay — exactly-once semantics \
-                 are degraded to at-most-once for this source"
-            );
-        }
-        self.sources.push(RegisteredSource {
-            name,
-            connector,
-            supports_replay,
-        });
     }
 
     /// Registers a sink connector for checkpoint coordination.
@@ -420,19 +356,6 @@ impl CheckpointCoordinator {
             }
         }
         Ok(())
-    }
-
-    /// Registers a reference table source connector.
-    pub fn register_table_source(
-        &mut self,
-        name: impl Into<String>,
-        connector: Arc<tokio::sync::Mutex<Box<dyn SourceConnector>>>,
-    ) {
-        self.table_sources.push(RegisteredSource {
-            name: name.into(),
-            connector,
-            supports_replay: true, // Table sources are always replayable
-        });
     }
 
     // ── Observability ──
@@ -653,55 +576,6 @@ impl CheckpointCoordinator {
         .await
     }
 
-    /// Snapshots all registered source connectors concurrently.
-    ///
-    /// Uses `join_all` to lock and checkpoint each source in parallel rather
-    /// than sequentially, reducing snapshot latency proportional to source count.
-    async fn snapshot_sources(
-        &self,
-        sources: &[RegisteredSource],
-    ) -> Result<HashMap<String, ConnectorCheckpoint>, DbError> {
-        use futures::future::join_all;
-
-        let futs = sources.iter().map(|source| {
-            let connector = Arc::clone(&source.connector);
-            let name = source.name.clone();
-            async move {
-                let guard = connector.lock().await;
-                let cp = guard.checkpoint();
-                let result = source_to_connector_checkpoint(&cp);
-                debug!(source = %name, epoch = cp.epoch(), "source snapshotted");
-                (name, result)
-            }
-        });
-
-        let results = join_all(futs).await;
-        Ok(results.into_iter().collect())
-    }
-
-    /// Like `snapshot_sources` but takes a slice of references (for filtering).
-    async fn snapshot_source_refs(
-        &self,
-        sources: &[&RegisteredSource],
-    ) -> Result<HashMap<String, ConnectorCheckpoint>, DbError> {
-        use futures::future::join_all;
-
-        let futs = sources.iter().map(|source| {
-            let connector = Arc::clone(&source.connector);
-            let name = source.name.clone();
-            async move {
-                let guard = connector.lock().await;
-                let cp = guard.checkpoint();
-                let result = source_to_connector_checkpoint(&cp);
-                debug!(source = %name, epoch = cp.epoch(), "source snapshotted");
-                (name, result)
-            }
-        });
-
-        let results = join_all(futs).await;
-        Ok(results.into_iter().collect())
-    }
-
     /// Pre-commits all exactly-once sinks (phase 1) with a timeout.
     ///
     /// A stuck sink will not block checkpointing indefinitely. The timeout
@@ -916,13 +790,6 @@ impl CheckpointCoordinator {
         epochs
     }
 
-    /// Returns sorted source names for topology tracking in the manifest.
-    fn sorted_source_names(&self) -> Vec<String> {
-        let mut names: Vec<String> = self.sources.iter().map(|s| s.name.clone()).collect();
-        names.sort();
-        names
-    }
-
     /// Returns sorted sink names for topology tracking in the manifest.
     fn sorted_sink_names(&self) -> Vec<String> {
         let mut names: Vec<String> = self.sinks.iter().map(|s| s.name.clone()).collect();
@@ -940,12 +807,6 @@ impl CheckpointCoordinator {
     #[must_use]
     pub fn epoch(&self) -> u64 {
         self.epoch
-    }
-
-    /// Returns the registered sources (for pre-capture by the callback).
-    #[must_use]
-    pub(crate) fn registered_sources(&self) -> &[RegisteredSource] {
-        &self.sources
     }
 
     /// Returns the next checkpoint ID.
@@ -1146,31 +1007,12 @@ impl CheckpointCoordinator {
         let wal_result = self.prepare_wal_for_checkpoint()?;
         let per_core_wal_positions = wal_result.per_core_wal_positions;
 
-        // ── Step 3: Source snapshot (parallel) ──
+        // ── Step 3: Source offsets ──
+        // Source offsets are provided by the caller (pre-captured at barrier
+        // alignment or pre-spawn). Table offsets come from extra_table_offsets.
         self.phase = CheckpointPhase::Snapshotting;
-
-        // Only live-snapshot sources that don't have pre-captured overrides.
-        // Sources with overrides were captured at a consistent point (barrier
-        // alignment or pre-spawn) and must not be re-queried.
-        let sources_to_snapshot: Vec<&RegisteredSource> = self
-            .sources
-            .iter()
-            .filter(|s| !source_offset_overrides.contains_key(&s.name))
-            .collect();
-        let (mut source_offsets, mut table_offsets) = tokio::try_join!(
-            self.snapshot_source_refs(&sources_to_snapshot),
-            self.snapshot_sources(&self.table_sources),
-        )?;
-
-        // Merge pre-captured source offset overrides into source_offsets.
-        for (name, cp) in source_offset_overrides {
-            source_offsets.insert(name, cp);
-        }
-
-        // Merge extra table offsets (from ReferenceTableSource instances).
-        for (name, cp) in extra_table_offsets {
-            table_offsets.insert(name, cp);
-        }
+        let source_offsets = source_offset_overrides;
+        let table_offsets = extra_table_offsets;
 
         // ── Step 4: Sink pre-commit ──
         self.phase = CheckpointPhase::PreCommitting;
@@ -1207,7 +1049,11 @@ impl CheckpointCoordinator {
         manifest.per_core_wal_positions = per_core_wal_positions;
         manifest.table_store_checkpoint_path = table_store_checkpoint_path;
         manifest.is_incremental = self.config.incremental;
-        manifest.source_names = self.sorted_source_names();
+        manifest.source_names = {
+            let mut names: Vec<String> = manifest.source_offsets.keys().cloned().collect();
+            names.sort();
+            names
+        };
         manifest.sink_names = self.sorted_sink_names();
         manifest.pipeline_hash = pipeline_hash;
 
@@ -1392,9 +1238,10 @@ impl CheckpointCoordinator {
         use crate::recovery_manager::RecoveryManager;
 
         let mgr = RecoveryManager::new(&*self.store);
-        let result = mgr
-            .recover(&self.sources, &self.sinks, &self.table_sources)
-            .await?;
+        // Sources and table sources are restored by the pipeline lifecycle
+        // (via SourceRegistration.restore_checkpoint), not by the coordinator.
+        // Pass empty slices — the coordinator only manages sink recovery here.
+        let result = mgr.recover(&[], &self.sinks, &[]).await?;
 
         if let Some(ref recovered) = result {
             // Advance epoch past the recovered one
@@ -1428,7 +1275,6 @@ impl std::fmt::Debug for CheckpointCoordinator {
             .field("epoch", &self.epoch)
             .field("next_checkpoint_id", &self.next_checkpoint_id)
             .field("phase", &self.phase)
-            .field("sources", &self.sources.len())
             .field("sinks", &self.sinks.len())
             .field("has_wal_manager", &self.wal_manager.is_some())
             .field("changelog_drainers", &self.changelog_drainers.len())

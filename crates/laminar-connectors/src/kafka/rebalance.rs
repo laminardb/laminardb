@@ -86,6 +86,13 @@ pub struct LaminarConsumerContext {
     rebalance_state: Arc<Mutex<RebalanceState>>,
     /// Shared rebalance event counter for source-level metrics.
     rebalance_metric: Arc<AtomicU64>,
+    /// Monotonically increasing generation bumped on each Revoke event.
+    ///
+    /// Allows lock-free detection of revoke events from the hot path
+    /// (`poll_batch`) — the source compares its cached generation against
+    /// this value using `Relaxed` ordering, and only locks the mutex when
+    /// a change is detected.
+    revoke_generation: Arc<AtomicU64>,
 }
 
 impl LaminarConsumerContext {
@@ -95,12 +102,14 @@ impl LaminarConsumerContext {
         checkpoint_requested: Arc<AtomicBool>,
         rebalance_state: Arc<Mutex<RebalanceState>>,
         rebalance_metric: Arc<AtomicU64>,
+        revoke_generation: Arc<AtomicU64>,
     ) -> Self {
         Self {
             checkpoint_requested,
             rebalance_count: AtomicU64::new(0),
             rebalance_state,
             rebalance_metric,
+            revoke_generation,
         }
     }
 
@@ -108,6 +117,12 @@ impl LaminarConsumerContext {
     #[must_use]
     pub fn rebalance_count(&self) -> u64 {
         self.rebalance_count.load(Ordering::Relaxed)
+    }
+
+    /// Returns the shared revoke generation counter.
+    #[must_use]
+    pub fn revoke_generation(&self) -> &Arc<AtomicU64> {
+        &self.revoke_generation
     }
 }
 
@@ -141,6 +156,8 @@ impl ConsumerContext for LaminarConsumerContext {
                         poisoned.into_inner().on_revoke(&partitions);
                     }
                 }
+                self.revoke_generation
+                    .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
                 self.rebalance_count
                     .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
                 self.rebalance_metric
@@ -235,7 +252,8 @@ mod tests {
         let flag = Arc::new(AtomicBool::new(false));
         let state = Arc::new(Mutex::new(RebalanceState::new()));
         let metric = Arc::new(AtomicU64::new(0));
-        let ctx = LaminarConsumerContext::new(Arc::clone(&flag), state, metric);
+        let revoke_gen = Arc::new(AtomicU64::new(0));
+        let ctx = LaminarConsumerContext::new(Arc::clone(&flag), state, metric, revoke_gen);
         (flag, ctx)
     }
 

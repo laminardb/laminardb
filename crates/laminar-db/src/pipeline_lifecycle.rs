@@ -404,6 +404,7 @@ impl LaminarDB {
                 connector: source,
                 config,
                 supports_replay,
+                restore_checkpoint: None, // Set after recovery below
             });
         }
 
@@ -433,6 +434,7 @@ impl LaminarDB {
                     connector: Box::new(connector),
                     config: laminar_connectors::config::ConnectorConfig::new("catalog-bridge"),
                     supports_replay: false,
+                    restore_checkpoint: None,
                 });
             }
         }
@@ -455,6 +457,7 @@ impl LaminarDB {
                     connector: Box::new(connector),
                     config: laminar_connectors::config::ConnectorConfig::new("catalog-bridge"),
                     supports_replay: false,
+                    restore_checkpoint: None,
                 });
             }
         }
@@ -547,6 +550,27 @@ impl LaminarDB {
                                         "Table source restore failed"
                                     );
                                 }
+                            }
+                        }
+                        // Attach recovered source offsets to SourceRegistrations.
+                        // These will be passed to the TPC source adapters, which
+                        // call connector.restore() after open() to seek Kafka
+                        // consumers to their checkpoint positions.
+                        for src in &mut sources {
+                            if !src.supports_replay {
+                                continue;
+                            }
+                            if let Some(cp) = recovered.manifest.source_offsets.get(&src.name) {
+                                let restored =
+                                    crate::checkpoint_coordinator::connector_to_source_checkpoint(
+                                        cp,
+                                    );
+                                tracing::info!(
+                                    source = %src.name,
+                                    offsets = cp.offsets.len(),
+                                    "attaching checkpoint offsets for source recovery"
+                                );
+                                src.restore_checkpoint = Some(restored);
                             }
                         }
                         // Restore stream executor aggregate state
@@ -769,7 +793,51 @@ impl LaminarDB {
                 std::time::Duration::ZERO
             },
             barrier_alignment_timeout: std::time::Duration::from_secs(30),
+            delivery_guarantee: laminar_connectors::connector::DeliveryGuarantee::default(),
         };
+
+        // Validate delivery guarantee constraints.
+        {
+            use laminar_connectors::connector::DeliveryGuarantee;
+
+            if pipeline_config.delivery_guarantee == DeliveryGuarantee::ExactlyOnce {
+                for src in &sources {
+                    if !src.supports_replay {
+                        return Err(DbError::Config(format!(
+                            "[LDB-5030] exactly-once requires all sources to support replay, \
+                             but source '{}' does not. Use at-least-once or remove this source.",
+                            src.name
+                        )));
+                    }
+                }
+                for (name, handle, _, _) in &sinks {
+                    if !handle.exactly_once() {
+                        return Err(DbError::Config(format!(
+                            "[LDB-5031] exactly-once requires all sinks to support \
+                             exactly-once semantics, but sink '{name}' does not. \
+                             Use at-least-once or configure a transactional sink."
+                        )));
+                    }
+                }
+                if pipeline_config.checkpoint_interval.is_none() {
+                    return Err(DbError::Config(
+                        "[LDB-5032] exactly-once requires checkpointing to be enabled. \
+                         Set checkpoint.interval.ms in the pipeline configuration."
+                            .into(),
+                    ));
+                }
+            } else if pipeline_config.delivery_guarantee == DeliveryGuarantee::AtLeastOnce {
+                let has_non_replayable = sources.iter().any(|s| !s.supports_replay);
+                let has_eo_sink = sinks.iter().any(|(_, h, _, _)| h.exactly_once());
+                if has_non_replayable && has_eo_sink {
+                    tracing::warn!(
+                        "[LDB-5033] pipeline has exactly-once sinks but some sources \
+                         do not support replay — effective guarantee is at-most-once \
+                         for events from non-replayable sources"
+                    );
+                }
+            }
+        }
 
         let shutdown = self.shutdown_signal.clone();
 

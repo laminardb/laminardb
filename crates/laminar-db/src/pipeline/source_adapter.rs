@@ -81,6 +81,7 @@ impl SourceIoThread {
         max_poll_records: usize,
         fallback_poll_interval: Duration,
         core_thread: thread::Thread,
+        restore_checkpoint: Option<SourceCheckpoint>,
     ) -> std::io::Result<Self> {
         let shutdown = Arc::new(AtomicBool::new(false));
         let injector = CheckpointBarrierInjector::new();
@@ -107,6 +108,7 @@ impl SourceIoThread {
                     metrics_clone,
                     cp_tx,
                     core_thread,
+                    restore_checkpoint,
                 )
             })?;
 
@@ -196,6 +198,7 @@ fn source_io_main(
     metrics: Arc<SourceIoMetrics>,
     cp_tx: tokio::sync::watch::Sender<SourceCheckpoint>,
     core_thread: thread::Thread,
+    restore_checkpoint: Option<SourceCheckpoint>,
 ) -> Option<Box<dyn SourceConnector>> {
     let rt = match tokio::runtime::Builder::new_current_thread()
         .enable_all()
@@ -213,6 +216,28 @@ fn source_io_main(
         if let Err(e) = connector.open(&config).await {
             tracing::error!("Source '{name}': failed to open connector: {e}");
             return None;
+        }
+
+        // Restore checkpoint offsets AFTER open but BEFORE first poll.
+        // For Kafka, this calls consumer.assign() to seek to the checkpoint
+        // position. The consumer must still be owned by the source (not yet
+        // moved to a background reader task) for assign() to take effect.
+        if let Some(ref checkpoint) = restore_checkpoint {
+            match connector.restore(checkpoint).await {
+                Ok(()) => {
+                    tracing::info!(
+                        source = %name,
+                        "restored source from checkpoint"
+                    );
+                }
+                Err(e) => {
+                    tracing::warn!(
+                        source = %name,
+                        error = %e,
+                        "source checkpoint restore failed, starting from group offsets"
+                    );
+                }
+            }
         }
 
         let notify = connector.data_ready_notify();

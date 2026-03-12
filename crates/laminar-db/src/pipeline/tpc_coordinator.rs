@@ -116,7 +116,14 @@ impl TpcPipelineCoordinator {
 
         for (idx, src) in sources.into_iter().enumerate() {
             runtime
-                .attach_source(idx, src.name, src.connector, src.config, &config)
+                .attach_source(
+                    idx,
+                    src.name,
+                    src.connector,
+                    src.config,
+                    &config,
+                    src.restore_checkpoint,
+                )
                 .map_err(|e| DbError::Config(format!("failed to spawn source thread: {e}")))?;
         }
 

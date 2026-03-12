@@ -1029,7 +1029,7 @@ dependencies = [
 
 [[package]]
 name = "binance-ws"
-version = "0.18.2"
+version = "0.18.5"
 dependencies = [
  "arrow",
  "crossterm",
@@ -4524,7 +4524,7 @@ checksum = "bf36173d4167ed999940f804952e6b08197cae5ad5d572eb4db150ce8ad5d58f"
 
 [[package]]
 name = "laminar-connectors"
-version = "0.18.2"
+version = "0.18.5"
 dependencies = [
  "arrow-array",
  "arrow-avro",
@@ -4577,7 +4577,7 @@ dependencies = [
 
 [[package]]
 name = "laminar-core"
-version = "0.18.2"
+version = "0.18.5"
 dependencies = [
  "ahash",
  "anyhow",
@@ -4633,7 +4633,7 @@ dependencies = [
 
 [[package]]
 name = "laminar-db"
-version = "0.18.2"
+version = "0.18.5"
 dependencies = [
  "ahash",
  "anyhow",
@@ -4667,7 +4667,7 @@ dependencies = [
 
 [[package]]
 name = "laminar-derive"
-version = "0.18.2"
+version = "0.18.5"
 dependencies = [
  "arrow",
  "arrow-array",
@@ -4681,7 +4681,7 @@ dependencies = [
 
 [[package]]
 name = "laminar-server"
-version = "0.18.2"
+version = "0.18.5"
 dependencies = [
  "anyhow",
  "axum",
@@ -4716,7 +4716,7 @@ dependencies = [
 
 [[package]]
 name = "laminar-sql"
-version = "0.18.2"
+version = "0.18.5"
 dependencies = [
  "anyhow",
  "arrow",
@@ -4743,7 +4743,7 @@ dependencies = [
 
 [[package]]
 name = "laminar-storage"
-version = "0.18.2"
+version = "0.18.5"
 dependencies = [
  "anyhow",
  "async-trait",
@@ -4773,7 +4773,7 @@ dependencies = [
 
 [[package]]
 name = "laminardb-demo"
-version = "0.18.2"
+version = "0.18.5"
 dependencies = [
  "arrow",
  "arrow-array",
@@ -5139,7 +5139,7 @@ dependencies = [
 
 [[package]]
 name = "microstructure"
-version = "0.18.2"
+version = "0.18.5"
 dependencies = [
  "arrow",
  "crossterm",

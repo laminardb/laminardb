@@ -4,7 +4,7 @@
 //! topic-partition and supports checkpoint/restore roundtrips via
 //! [`SourceCheckpoint`].
 
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet};
 use std::sync::Arc;
 
 use rdkafka::Offset;
@@ -164,6 +164,46 @@ impl OffsetTracker {
         tpl
     }
 
+    /// Removes partitions that are not in the `assigned` set.
+    ///
+    /// Called after a rebalance revoke to purge offsets for partitions this
+    /// consumer no longer owns. This prevents stale offsets from leaking
+    /// into checkpoints and causing incorrect partition assignment on recovery.
+    pub fn retain_assigned(&mut self, assigned: &HashSet<(String, i32)>) {
+        self.topics.retain(|topic, partitions| {
+            partitions.retain(|&partition, _| assigned.contains(&(topic.to_string(), partition)));
+            !partitions.is_empty()
+        });
+    }
+
+    /// Builds a checkpoint containing only offsets for currently assigned partitions.
+    ///
+    /// Non-mutating alternative to `retain_assigned()` + `to_checkpoint()`.
+    /// If `assigned` is empty (no rebalance has occurred yet), returns the
+    /// full unfiltered checkpoint to avoid losing offsets at startup.
+    #[must_use]
+    pub fn to_checkpoint_filtered(&self, assigned: &HashSet<(String, i32)>) -> SourceCheckpoint {
+        if assigned.is_empty() {
+            return self.to_checkpoint();
+        }
+        let offsets: HashMap<String, String> = self
+            .topics
+            .iter()
+            .flat_map(|(topic, partitions)| {
+                partitions.iter().filter_map(move |(partition, offset)| {
+                    if assigned.contains(&(topic.to_string(), *partition)) {
+                        Some((format!("{topic}-{partition}"), offset.to_string()))
+                    } else {
+                        None
+                    }
+                })
+            })
+            .collect();
+        let mut cp = SourceCheckpoint::with_offsets(0, offsets);
+        cp.set_metadata("connector", "kafka");
+        cp
+    }
+
     /// Clears all tracked offsets.
     pub fn clear(&mut self) {
         self.topics.clear();
@@ -287,5 +327,68 @@ mod tests {
         let tracker = OffsetTracker::new();
         let cp = tracker.to_checkpoint();
         assert_eq!(cp.get_metadata("connector"), Some("kafka"));
+    }
+
+    #[test]
+    fn test_retain_assigned() {
+        let mut tracker = OffsetTracker::new();
+        tracker.update("events", 0, 100);
+        tracker.update("events", 1, 200);
+        tracker.update("events", 2, 300);
+        tracker.update("orders", 0, 50);
+
+        let mut assigned = HashSet::new();
+        assigned.insert(("events".to_string(), 0));
+        assigned.insert(("events".to_string(), 2));
+        // orders-0 and events-1 are NOT assigned (revoked)
+
+        tracker.retain_assigned(&assigned);
+
+        assert_eq!(tracker.get("events", 0), Some(100));
+        assert_eq!(tracker.get("events", 1), None); // removed
+        assert_eq!(tracker.get("events", 2), Some(300));
+        assert_eq!(tracker.get("orders", 0), None); // removed
+        assert_eq!(tracker.partition_count(), 2);
+    }
+
+    #[test]
+    fn test_retain_assigned_empty_set_clears_all() {
+        let mut tracker = OffsetTracker::new();
+        tracker.update("events", 0, 100);
+
+        tracker.retain_assigned(&HashSet::new());
+
+        assert_eq!(tracker.partition_count(), 0);
+    }
+
+    #[test]
+    fn test_to_checkpoint_filtered() {
+        let mut tracker = OffsetTracker::new();
+        tracker.update("events", 0, 100);
+        tracker.update("events", 1, 200);
+        tracker.update("orders", 0, 50);
+
+        let mut assigned = HashSet::new();
+        assigned.insert(("events".to_string(), 0));
+        assigned.insert(("orders".to_string(), 0));
+
+        let cp = tracker.to_checkpoint_filtered(&assigned);
+
+        assert_eq!(cp.get_offset("events-0"), Some("100"));
+        assert_eq!(cp.get_offset("events-1"), None); // filtered out
+        assert_eq!(cp.get_offset("orders-0"), Some("50"));
+    }
+
+    #[test]
+    fn test_to_checkpoint_filtered_empty_returns_all() {
+        let mut tracker = OffsetTracker::new();
+        tracker.update("events", 0, 100);
+        tracker.update("events", 1, 200);
+
+        // Empty assigned set = no rebalance yet → return all
+        let cp = tracker.to_checkpoint_filtered(&HashSet::new());
+
+        assert_eq!(cp.get_offset("events-0"), Some("100"));
+        assert_eq!(cp.get_offset("events-1"), Some("200"));
     }
 }

@@ -20,6 +20,12 @@ pub struct SourceRegistration {
     pub config: ConnectorConfig,
     /// Whether this source supports replay from a checkpointed position.
     pub supports_replay: bool,
+    /// Checkpoint to restore on startup (set during recovery).
+    ///
+    /// When `Some`, the source adapter calls `connector.restore()` after
+    /// `open()` to seek to the checkpointed position. This is how Kafka
+    /// sources resume from their last checkpoint offset on recovery.
+    pub restore_checkpoint: Option<SourceCheckpoint>,
 }
 
 /// Callback trait for the coordinator to interact with the rest of the DB.
@@ -49,7 +55,18 @@ pub trait PipelineCallback: Send + 'static {
     /// Get the current pipeline watermark.
     fn current_watermark(&self) -> i64;
 
-    /// Perform a periodic checkpoint. Returns true if checkpoint was triggered.
+    /// Perform a periodic (timer-based) checkpoint. Returns true if checkpoint was triggered.
+    ///
+    /// **Semantics: at-least-once.** Timer-based checkpoints capture source
+    /// offsets *before* operator state. On recovery the consumer replays
+    /// from the offset, and operators may re-process records that were
+    /// already processed before the crash (at-least-once, not exactly-once).
+    ///
+    /// For exactly-once semantics, use [`checkpoint_with_barrier`] instead,
+    /// which captures offsets and operator state at a consistent cut across
+    /// all sources.
+    ///
+    /// [`checkpoint_with_barrier`]: PipelineCallback::checkpoint_with_barrier
     async fn maybe_checkpoint(&mut self, force: bool) -> bool;
 
     /// Called when all sources have aligned on a barrier.

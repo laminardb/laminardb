@@ -217,6 +217,12 @@ impl crate::pipeline::PipelineCallback for ConnectorPipelineCallback {
             .load(std::sync::atomic::Ordering::Relaxed)
     }
 
+    /// Timer-based checkpoint (at-least-once semantics).
+    ///
+    /// Source offsets are captured BEFORE operator state. On recovery:
+    /// consumer replays from offset → operator may re-process some
+    /// records. This is correct for at-least-once but NOT exactly-once.
+    /// For exactly-once, use barrier-aligned checkpoints instead.
     async fn maybe_checkpoint(&mut self, force: bool) -> bool {
         use crate::checkpoint_coordinator::source_to_connector_checkpoint;
 
@@ -265,6 +271,10 @@ impl crate::pipeline::PipelineCallback for ConnectorPipelineCallback {
             );
         }
 
+        // Source offsets are captured by the TPC pipeline's barrier-aligned
+        // checkpoint path (via SourceRegistration), not by the coordinator.
+        let source_overrides = HashMap::new();
+
         // Capture stream executor aggregate state.
         let mut operator_states = HashMap::with_capacity(1);
         match self.executor.checkpoint_state() {
@@ -285,12 +295,6 @@ impl crate::pipeline::PipelineCallback for ConnectorPipelineCallback {
                 per_source_watermarks.insert(name.clone(), wm);
             }
         }
-
-        // Pre-capture source offsets synchronously. These must match the
-        // operator state that was just captured above — if we defer snapshot
-        // to the spawned task, the sources may have advanced past the
-        // operator state point, breaking exactly-once on recovery.
-        let source_overrides = capture_source_offsets_from_coordinator(&self.coordinator).await;
 
         if force {
             // Blocking checkpoint at shutdown.
@@ -606,40 +610,6 @@ impl crate::pipeline::PipelineCallback for ConnectorPipelineCallback {
             }
         }
     }
-}
-
-/// Captures current source offsets from a coordinator's registered sources.
-///
-/// Locks each source connector to call `checkpoint()` and converts the
-/// result to `ConnectorCheckpoint`. Must be called at a consistent point
-/// (same time as operator state capture) before spawning async work.
-async fn capture_source_offsets_from_coordinator(
-    coordinator: &Arc<
-        tokio::sync::Mutex<Option<crate::checkpoint_coordinator::CheckpointCoordinator>>,
-    >,
-) -> HashMap<String, laminar_storage::checkpoint_manifest::ConnectorCheckpoint> {
-    use crate::checkpoint_coordinator::source_to_connector_checkpoint;
-
-    let guard = coordinator.lock().await;
-    let Some(ref coord) = *guard else {
-        return HashMap::new();
-    };
-    // Collect connector Arcs + names first, then drop the coordinator lock
-    // before locking individual sources (avoids holding two locks).
-    let source_refs: Vec<_> = coord
-        .registered_sources()
-        .iter()
-        .map(|s| (s.name.clone(), Arc::clone(&s.connector)))
-        .collect();
-    drop(guard);
-
-    let mut overrides = HashMap::with_capacity(source_refs.len());
-    for (name, connector) in source_refs {
-        let guard = connector.lock().await;
-        let cp = guard.checkpoint();
-        overrides.insert(name, source_to_connector_checkpoint(&cp));
-    }
-    overrides
 }
 
 /// Update a partial foyer cache from a CDC batch by inserting or deleting
