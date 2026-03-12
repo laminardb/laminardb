@@ -521,6 +521,8 @@ impl SinkConnector for KafkaSink {
             });
         }
 
+        self.ensure_schema_ready(&batch.schema()).await?;
+
         let producer = self
             .producer
             .as_ref()
@@ -528,8 +530,6 @@ impl SinkConnector for KafkaSink {
                 expected: "producer initialized".into(),
                 actual: "producer is None".into(),
             })?;
-
-        self.ensure_schema_ready(&batch.schema()).await?;
 
         // Serialize the RecordBatch into per-row byte payloads.
         let payloads = self.serializer.serialize(batch).map_err(|e| {
