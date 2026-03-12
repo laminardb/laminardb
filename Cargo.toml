@@ -48,7 +48,7 @@ rustc-hash = "2.1"  # Faster than std HashMap (replaces unmaintained fxhash)
 parking_lot = "0.12"  # Faster Mutex/RwLock
 memmap2 = "0.9"  # Memory-mapped files
 bumpalo = "3.20"  # Arena allocator
-uuid = { version = "1.21", features = ["v4", "v7", "serde"] }  # Unique IDs
+uuid = { version = "1.22", features = ["v4", "v7", "serde"] }  # Unique IDs
 gethostname = "0.5"  # Pure Rust hostname lookup
 ahash = "0.8"  # Fast hashing for state stores
 papaya = "0.2"  # Lock-free concurrent HashMap
@@ -69,7 +69,7 @@ arrow-schema = "57.2"
 arrow-cast = "57.2"
 arrow-ipc = "57.2"
 arrow-select = "57.2"
-datafusion = "52.2"
+datafusion = "52.3"
 datafusion-common = "52.0"
 datafusion-expr = "52.0"
 datafusion-sql = "52.0"
@@ -112,7 +112,7 @@ xxhash-rust = { version = "0.8", features = ["xxh3"] }
 # Testing
 criterion = { version = "0.8", features = ["html_reports"] }
 proptest = "1.10"
-tempfile = "3.26"
+tempfile = "3.27"
 
 [profile.release]
 lto = "fat"
