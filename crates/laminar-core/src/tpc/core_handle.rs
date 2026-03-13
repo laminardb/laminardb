@@ -714,7 +714,6 @@ fn core_thread_main(
         Some(Box::new(CheckpointCompleteData {
             checkpoint_id: 0,
             operator_states: Vec::new(),
-            state_store_snapshot: None,
         }));
     // Reusable buffer for operator states (avoids Vec alloc per checkpoint)
     let mut checkpoint_states_buf: Vec<OperatorState> = Vec::new();
@@ -779,19 +778,16 @@ fn core_thread_main(
                         had_work = true;
                     }
                     CoreMessage::CheckpointRequest(checkpoint_id) => {
-                        // Snapshot operator states and state store into the pre-allocated Box.
+                        // Snapshot operator states into the pre-allocated Box.
                         // The Box is taken and replenished after the inbox drain loop.
-                        let state_snapshot =
-                            reactor.trigger_checkpoint_into(&mut checkpoint_states_buf);
+                        reactor.trigger_checkpoint_into(&mut checkpoint_states_buf);
                         let mut data = checkpoint_slot.take().unwrap_or_else(|| {
                             Box::new(CheckpointCompleteData {
                                 checkpoint_id: 0,
                                 operator_states: Vec::new(),
-                                state_store_snapshot: None,
                             })
                         });
                         data.checkpoint_id = checkpoint_id;
-                        data.state_store_snapshot = Some(state_snapshot);
                         std::mem::swap(&mut data.operator_states, &mut checkpoint_states_buf);
                         // Checkpoint completion must not be dropped — the coordinator
                         // would stall waiting for a response that never arrives.
@@ -920,7 +916,6 @@ fn core_thread_main(
                 let mut data = Box::new(CheckpointCompleteData {
                     checkpoint_id: 0,
                     operator_states: Vec::new(),
-                    state_store_snapshot: None,
                 });
                 std::mem::swap(&mut data.operator_states, &mut checkpoint_states_buf);
                 checkpoint_slot = Some(data);

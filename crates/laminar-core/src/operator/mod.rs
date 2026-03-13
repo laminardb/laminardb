@@ -100,8 +100,6 @@ pub struct CheckpointCompleteData {
     pub checkpoint_id: u64,
     /// Snapshotted states from all operators on this core
     pub operator_states: Vec<OperatorState>,
-    /// Snapshot of the shared state store (keyed state written via `ctx.state`).
-    pub state_store_snapshot: Option<crate::state::StateSnapshot>,
 }
 
 /// Collection type for operator outputs.
