@@ -34,6 +34,21 @@ pub enum BackpressureStrategy {
     Reject,
 }
 
+impl std::str::FromStr for BackpressureStrategy {
+    type Err = String;
+
+    fn from_str(s: &str) -> Result<Self, Self::Err> {
+        match s.to_lowercase().as_str() {
+            "block" | "blocking" => Ok(Self::Block),
+            "drop" | "drop_oldest" | "dropoldest" => Ok(Self::DropOldest),
+            "reject" | "error" => Ok(Self::Reject),
+            _ => Err(format!(
+                "invalid backpressure strategy: '{s}'. Valid values: block, drop_oldest, reject"
+            )),
+        }
+    }
+}
+
 /// Wait strategy for consumers when channel is empty.
 ///
 /// This determines how a consumer waits for data when the channel is empty.
@@ -54,6 +69,21 @@ pub enum WaitStrategy {
     ///
     /// Best for batch processing where latency is less critical.
     Park,
+}
+
+impl std::str::FromStr for WaitStrategy {
+    type Err = String;
+
+    fn from_str(s: &str) -> Result<Self, Self::Err> {
+        match s.to_lowercase().as_str() {
+            "spin" => Ok(Self::Spin),
+            "spin_yield" | "spinyield" | "yield" => Ok(Self::SpinYield),
+            "park" | "parking" => Ok(Self::Park),
+            _ => Err(format!(
+                "invalid wait strategy: '{s}'. Valid values: spin, spin_yield, park"
+            )),
+        }
+    }
 }
 
 /// Configuration for a streaming channel.

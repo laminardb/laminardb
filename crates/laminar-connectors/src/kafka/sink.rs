@@ -28,8 +28,9 @@ use super::partitioner::{
     KafkaPartitioner, KeyHashPartitioner, RoundRobinPartitioner, StickyPartitioner,
 };
 use super::schema_registry::SchemaRegistryClient;
-use super::sink_config::{DeliveryGuarantee, KafkaSinkConfig, PartitionStrategy};
+use super::sink_config::{KafkaSinkConfig, PartitionStrategy};
 use super::sink_metrics::KafkaSinkMetrics;
+use crate::connector::DeliveryGuarantee;
 
 /// Fallback partition count used only when broker metadata query fails.
 const FALLBACK_PARTITION_COUNT: i32 = 1;

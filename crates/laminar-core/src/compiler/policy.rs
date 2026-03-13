@@ -1,7 +1,7 @@
 //! Batching and backpressure policies for the Ring 0 / Ring 1 pipeline bridge.
 //!
 //! [`BatchPolicy`] controls when the [`BridgeConsumer`](super::pipeline_bridge::BridgeConsumer)
-//! flushes accumulated rows into a `RecordBatch`. [`BackpressureStrategy`] determines how the
+//! flushes accumulated rows into a `RecordBatch`. [`BridgeOverflow`] determines how the
 //! [`PipelineBridge`](super::pipeline_bridge::PipelineBridge) handles a full SPSC queue.
 
 use std::time::Duration;
@@ -63,7 +63,7 @@ impl BatchPolicy {
 
 /// How the bridge producer handles a full SPSC queue.
 #[derive(Debug, Clone, Default)]
-pub enum BackpressureStrategy {
+pub enum BridgeOverflow {
     /// Drop the newest event and increment a drop counter (best-effort delivery).
     #[default]
     DropNewest,
@@ -102,17 +102,17 @@ mod tests {
 
     #[test]
     fn backpressure_strategy_default() {
-        let strategy = BackpressureStrategy::default();
-        assert!(matches!(strategy, BackpressureStrategy::DropNewest));
+        let strategy = BridgeOverflow::default();
+        assert!(matches!(strategy, BridgeOverflow::DropNewest));
     }
 
     #[test]
     fn backpressure_strategy_spill() {
-        let strategy = BackpressureStrategy::SpillToDisk {
+        let strategy = BridgeOverflow::SpillToDisk {
             max_spill_bytes: 1024 * 1024,
         };
         match strategy {
-            BackpressureStrategy::SpillToDisk { max_spill_bytes } => {
+            BridgeOverflow::SpillToDisk { max_spill_bytes } => {
                 assert_eq!(max_spill_bytes, 1024 * 1024);
             }
             _ => panic!("expected SpillToDisk"),

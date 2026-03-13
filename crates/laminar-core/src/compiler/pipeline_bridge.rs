@@ -18,7 +18,7 @@ use arrow_array::RecordBatch;
 use smallvec::SmallVec;
 
 use super::bridge::{BridgeError, RowBatchBridge};
-use super::policy::{BackpressureStrategy, BatchPolicy};
+use super::policy::{BatchPolicy, BridgeOverflow};
 use super::row::{EventRow, RowSchema};
 use crate::tpc::SpscQueue;
 
@@ -174,7 +174,7 @@ pub struct BridgeStatsSnapshot {
 pub struct PipelineBridge {
     queue: Arc<SpscQueue<BridgeMessage>>,
     output_schema: Arc<RowSchema>,
-    backpressure_strategy: BackpressureStrategy,
+    backpressure_strategy: BridgeOverflow,
     stats: Arc<BridgeStats>,
 }
 
@@ -187,7 +187,7 @@ impl PipelineBridge {
     /// # Errors
     ///
     /// Returns [`PipelineBridgeError::Backpressure`] if the queue is full and
-    /// the strategy is [`BackpressureStrategy::DropNewest`].
+    /// the strategy is [`BridgeOverflow::DropNewest`].
     pub fn send_event(
         &self,
         row: &EventRow<'_>,
@@ -280,12 +280,12 @@ impl PipelineBridge {
         }
         // Queue full — apply strategy.
         match &self.backpressure_strategy {
-            BackpressureStrategy::DropNewest => {
+            BridgeOverflow::DropNewest => {
                 self.stats.events_dropped.fetch_add(1, Ordering::Relaxed);
                 Err(PipelineBridgeError::Backpressure(1))
             }
-            BackpressureStrategy::PauseSource => Err(PipelineBridgeError::Backpressure(0)),
-            BackpressureStrategy::SpillToDisk { .. } => {
+            BridgeOverflow::PauseSource => Err(PipelineBridgeError::Backpressure(0)),
+            BridgeOverflow::SpillToDisk { .. } => {
                 // Spill-to-disk is not yet implemented; fall back to drop.
                 self.stats.events_dropped.fetch_add(1, Ordering::Relaxed);
                 Err(PipelineBridgeError::Backpressure(1))
@@ -480,7 +480,7 @@ pub fn create_pipeline_bridge(
     queue_capacity: usize,
     batch_capacity: usize,
     policy: BatchPolicy,
-    strategy: BackpressureStrategy,
+    strategy: BridgeOverflow,
 ) -> Result<(PipelineBridge, BridgeConsumer), PipelineBridgeError> {
     if batch_capacity < policy.max_rows {
         return Err(PipelineBridgeError::SchemaMismatch(format!(
@@ -550,7 +550,7 @@ mod tests {
             64,
             1024,
             BatchPolicy::default(),
-            BackpressureStrategy::DropNewest,
+            BridgeOverflow::DropNewest,
         )
         .unwrap()
     }
@@ -565,7 +565,7 @@ mod tests {
             queue_cap,
             max_rows.max(1),
             BatchPolicy::default().with_max_rows(max_rows.max(1)),
-            BackpressureStrategy::DropNewest,
+            BridgeOverflow::DropNewest,
         )
         .unwrap()
     }
@@ -605,7 +605,7 @@ mod tests {
             32,
             1024,
             BatchPolicy::default(),
-            BackpressureStrategy::DropNewest,
+            BridgeOverflow::DropNewest,
         );
         assert!(result.is_ok());
     }
@@ -618,7 +618,7 @@ mod tests {
             32,
             10, // < default max_rows of 1024
             BatchPolicy::default(),
-            BackpressureStrategy::DropNewest,
+            BridgeOverflow::DropNewest,
         );
         assert!(result.is_err());
         let err = result.unwrap_err();
@@ -882,7 +882,7 @@ mod tests {
             64,
             1024,
             BatchPolicy::default().with_flush_on_watermark(false),
-            BackpressureStrategy::DropNewest,
+            BridgeOverflow::DropNewest,
         )
         .unwrap();
 
@@ -1058,7 +1058,7 @@ mod tests {
             64,
             1024,
             BatchPolicy::default().with_max_latency(std::time::Duration::from_secs(60)),
-            BackpressureStrategy::DropNewest,
+            BridgeOverflow::DropNewest,
         )
         .unwrap();
 
@@ -1078,7 +1078,7 @@ mod tests {
             64,
             1024,
             BatchPolicy::default().with_max_latency(std::time::Duration::from_millis(1)),
-            BackpressureStrategy::DropNewest,
+            BridgeOverflow::DropNewest,
         )
         .unwrap();
 
@@ -1146,7 +1146,7 @@ mod tests {
             1024,
             1024,
             BatchPolicy::default().with_max_rows(1024),
-            BackpressureStrategy::DropNewest,
+            BridgeOverflow::DropNewest,
         )
         .unwrap();
 

@@ -45,8 +45,8 @@ pub use filter::{
 pub use handle::{PushSubscription, PushSubscriptionError};
 pub use notification::{NotificationHub, NotificationRing, NotificationSlot};
 pub use registry::{
-    BackpressureStrategy, SubscriptionConfig, SubscriptionEntry, SubscriptionId,
-    SubscriptionMetrics, SubscriptionRegistry, SubscriptionState,
+    SubscriptionConfig, SubscriptionEntry, SubscriptionId, SubscriptionMetrics,
+    SubscriptionOverflow, SubscriptionRegistry, SubscriptionState,
 };
 pub use stream::{
     subscribe_stream, subscribe_stream_with_errors, ChangeEventResultStream, ChangeEventStream,

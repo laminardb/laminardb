@@ -25,9 +25,7 @@
 //! ```text
 //! SourceConnector
 //!   ├── as_schema_provider()      → SchemaProvider
-//!   ├── as_schema_inferable()     → SchemaInferable
-//!   ├── as_schema_registry_aware()→ SchemaRegistryAware
-//!   └── as_schema_evolvable()     → SchemaEvolvable
+//!   └── as_schema_registry_aware()→ SchemaRegistryAware
 //!
 //! SchemaResolver::resolve()
 //!   1. Full DDL         → Declared
@@ -54,8 +52,8 @@ pub mod parquet;
 pub use csv::{CsvDecoder, CsvDecoderConfig, FieldCountMismatchStrategy};
 pub use error::{SchemaError, SchemaResult};
 pub use evolution::{
-    diff_schemas_by_name, is_safe_widening, DefaultSchemaEvolver, EvolutionResult,
-    EvolutionTrigger, SchemaEvolutionEngine, SchemaHistory, SchemaHistoryEntry,
+    diff_schemas_by_name, is_safe_widening, EvolutionResult, EvolutionTrigger, SchemaEvolution,
+    SchemaEvolutionEngine, SchemaHistory, SchemaHistoryEntry,
 };
 pub use inference::{
     CsvFormatInference, FormatInference, FormatInferenceRegistry, JsonFormatInference,
@@ -77,7 +75,7 @@ pub use traits::{
     ArrayInference, ColumnProjection, CompatibilityMode, ConfigOption, ConfigValueType,
     ConnectorConfigSchema, EvolutionVerdict, FieldInferenceDetail, FormatDecoder, FormatEncoder,
     InferenceConfig, InferenceWarning, InferredSchema, NumberInference, RegisteredSchema,
-    RegistryConfig, RegistryCredentials, RegistrySchemaType, SchemaChange, SchemaEvolvable,
-    SchemaInferable, SchemaProvider, SchemaRegistryAware, WarningSeverity,
+    RegistryConfig, RegistryCredentials, RegistrySchemaType, SchemaChange, SchemaProvider,
+    SchemaRegistryAware, WarningSeverity,
 };
 pub use types::{FieldMeta, RawRecord, SinkConfig, SourceConfig, SourceMetadata};

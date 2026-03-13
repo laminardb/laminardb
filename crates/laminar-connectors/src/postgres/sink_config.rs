@@ -257,19 +257,7 @@ str_enum!(WriteMode, lowercase_nodash, String, "unknown write mode",
     Upsert => "upsert", "insert"
 );
 
-/// Delivery guarantee for the `PostgreSQL` sink.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub enum DeliveryGuarantee {
-    /// At-least-once: records may be duplicated on failure recovery.
-    AtLeastOnce,
-    /// Exactly-once: co-transactional offset storage in `PostgreSQL`.
-    ExactlyOnce,
-}
-
-str_enum!(DeliveryGuarantee, lowercase_nodash, String, "unknown delivery guarantee",
-    AtLeastOnce => "at_least_once", "at-least-once", "atleastonce";
-    ExactlyOnce => "exactly_once", "exactly-once", "exactlyonce"
-);
+pub use crate::connector::DeliveryGuarantee;
 
 /// SSL mode for `PostgreSQL` connections.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]

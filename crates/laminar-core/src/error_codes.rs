@@ -294,3 +294,14 @@ mod tests {
         assert_eq!(INTERNAL, "LDB-8001");
     }
 }
+
+/// Severity level for warnings (schema inference, recovery, etc.).
+#[derive(Debug, Clone, Copy, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
+pub enum WarningSeverity {
+    /// Informational — operation succeeded but with caveats.
+    Info,
+    /// Warning — result may be inaccurate or degraded.
+    Warning,
+    /// Error — operation for this item failed; a fallback was used.
+    Error,
+}

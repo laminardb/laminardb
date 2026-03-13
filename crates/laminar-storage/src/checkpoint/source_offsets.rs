@@ -404,16 +404,7 @@ impl SourcePosition {
     }
 }
 
-/// Severity level for recovery warnings.
-#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
-pub enum WarningSeverity {
-    /// Informational — recovery can proceed normally.
-    Info,
-    /// Warning — recovery can proceed but results may differ.
-    Warning,
-    /// Error — recovery may produce incorrect results.
-    Error,
-}
+pub use laminar_core::error_codes::WarningSeverity;
 
 /// A warning generated during recovery planning.
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]

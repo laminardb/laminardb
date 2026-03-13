@@ -385,35 +385,7 @@ impl fmt::Display for DeltaWriteMode {
     }
 }
 
-/// Delivery guarantee level.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub enum DeliveryGuarantee {
-    /// May produce duplicates on recovery. Simpler, slightly higher throughput.
-    AtLeastOnce,
-    /// No duplicates. Uses epoch-to-Delta-version mapping.
-    ExactlyOnce,
-}
-
-impl FromStr for DeliveryGuarantee {
-    type Err = String;
-
-    fn from_str(s: &str) -> Result<Self, Self::Err> {
-        match s.to_lowercase().replace('-', "_").as_str() {
-            "at_least_once" | "atleastonce" => Ok(Self::AtLeastOnce),
-            "exactly_once" | "exactlyonce" => Ok(Self::ExactlyOnce),
-            other => Err(format!("unknown delivery guarantee: '{other}'")),
-        }
-    }
-}
-
-impl fmt::Display for DeliveryGuarantee {
-    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
-        match self {
-            Self::AtLeastOnce => write!(f, "at-least-once"),
-            Self::ExactlyOnce => write!(f, "exactly-once"),
-        }
-    }
-}
+pub use crate::connector::DeliveryGuarantee;
 
 /// Delta Lake catalog type for table discovery.
 ///

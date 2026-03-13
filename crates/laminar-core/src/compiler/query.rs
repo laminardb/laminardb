@@ -499,7 +499,7 @@ mod tests {
     use super::*;
     use crate::compiler::pipeline::{CompiledPipeline, PipelineId};
     use crate::compiler::pipeline_bridge::create_pipeline_bridge;
-    use crate::compiler::policy::{BackpressureStrategy, BatchPolicy};
+    use crate::compiler::policy::{BatchPolicy, BridgeOverflow};
     use crate::compiler::row::MutableEventRow;
     use arrow_schema::{DataType, Field, Schema};
     use bumpalo::Bump;
@@ -541,7 +541,7 @@ mod tests {
             64,
             1024,
             BatchPolicy::default(),
-            BackpressureStrategy::DropNewest,
+            BridgeOverflow::DropNewest,
         )
         .unwrap();
         (exec, bridge, consumer, Arc::clone(row_schema))
@@ -575,7 +575,7 @@ mod tests {
             64,
             1024,
             BatchPolicy::default(),
-            BackpressureStrategy::DropNewest,
+            BridgeOverflow::DropNewest,
         )
         .unwrap();
         (exec, bridge, consumer, Arc::clone(row_schema))
@@ -607,7 +607,7 @@ mod tests {
             64,
             1024,
             BatchPolicy::default(),
-            BackpressureStrategy::DropNewest,
+            BridgeOverflow::DropNewest,
         )
         .unwrap();
         (exec, bridge, consumer, Arc::clone(row_schema))

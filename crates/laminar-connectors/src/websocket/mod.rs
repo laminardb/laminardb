@@ -34,7 +34,7 @@ pub mod source;
 pub mod source_config;
 pub mod source_server;
 
-pub use backpressure::BackpressureStrategy;
+pub use backpressure::WsBackpressure;
 pub use checkpoint::WebSocketSourceCheckpoint;
 pub use metrics::WebSocketSourceMetrics;
 pub use protocol::{ClientMessage, ServerMessage};
