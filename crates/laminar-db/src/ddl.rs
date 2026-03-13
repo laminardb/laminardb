@@ -141,7 +141,7 @@ impl LaminarDB {
         };
 
         if let Some(ref ct) = resolved_connector_type {
-            let normalized = ct.to_lowercase();
+            let normalized = ct.to_lowercase().replace('_', "-");
             if self.connector_registry.source_info(&normalized).is_none() {
                 return Err(DbError::Connector(format!(
                     "Unknown source connector type '{ct}'. Available: {:?}",
@@ -228,7 +228,7 @@ impl LaminarDB {
         };
 
         if let Some(ref ct) = resolved_connector_type {
-            let normalized = ct.to_lowercase();
+            let normalized = ct.to_lowercase().replace('_', "-");
             if self.connector_registry.sink_info(&normalized).is_none() {
                 return Err(DbError::Connector(format!(
                     "Unknown sink connector type '{ct}'. Available: {:?}",

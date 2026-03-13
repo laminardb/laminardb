@@ -88,11 +88,11 @@ pub(crate) struct TableRegistration {
     pub storage: Option<String>,
 }
 
-/// Build a [`ConnectorConfig`] from a [`SourceRegistration`].
-///
-/// Normalizes `connector_type` to lowercase, copies all options,
-/// and validates the format property (rejecting unknown formats
-/// at build time instead of silently defaulting).
+/// Normalize a connector type to the canonical registry form (lowercase, hyphens).
+fn normalize_connector_type(raw: &str) -> String {
+    raw.to_lowercase().replace('_', "-")
+}
+
 /// Map SQL-friendly option names to connector-native names.
 fn normalize_option_key(key: &str) -> String {
     match key {
@@ -108,7 +108,7 @@ pub(crate) fn build_source_config(reg: &SourceRegistration) -> Result<ConnectorC
         DbError::Connector(format!("Source '{}' has no connector type", reg.name))
     })?;
 
-    let mut config = ConnectorConfig::new(connector_type.to_lowercase());
+    let mut config = ConnectorConfig::new(normalize_connector_type(connector_type));
     for (k, v) in &reg.connector_options {
         config.set(normalize_option_key(k), v.clone());
     }
@@ -139,7 +139,7 @@ pub(crate) fn build_sink_config(reg: &SinkRegistration) -> Result<ConnectorConfi
         .as_deref()
         .ok_or_else(|| DbError::Connector(format!("Sink '{}' has no connector type", reg.name)))?;
 
-    let mut config = ConnectorConfig::new(connector_type.to_lowercase());
+    let mut config = ConnectorConfig::new(normalize_connector_type(connector_type));
     for (k, v) in &reg.connector_options {
         config.set(normalize_option_key(k), v.clone());
     }
@@ -170,7 +170,7 @@ pub(crate) fn build_table_config(reg: &TableRegistration) -> Result<ConnectorCon
         .as_deref()
         .ok_or_else(|| DbError::Connector(format!("Table '{}' has no connector type", reg.name)))?;
 
-    let mut config = ConnectorConfig::new(connector_type.to_lowercase());
+    let mut config = ConnectorConfig::new(normalize_connector_type(connector_type));
     for (k, v) in &reg.connector_options {
         config.set(normalize_option_key(k), v.clone());
     }
