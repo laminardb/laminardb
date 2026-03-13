@@ -1608,7 +1608,8 @@ impl StreamExecutor {
         }
 
         let checkpoint = StreamExecutorCheckpoint {
-            version: 1,
+            version: 2,
+            vnode_count: laminar_core::state::VNODE_COUNT,
             agg_states: agg_checkpoints,
             eowc_states: eowc_checkpoints,
             core_window_states: cw_checkpoints,

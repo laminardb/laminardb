@@ -361,13 +361,15 @@ impl Reactor {
         }
     }
 
-    /// Triggers a checkpoint by snapshotting all operator states.
+    /// Triggers a checkpoint by snapshotting all operator states and the state store.
     ///
     /// Called when a `CheckpointRequest` arrives from the control plane.
-    /// Collects the serialized state from each operator and returns it
-    /// for persistence by Ring 1.
-    pub fn trigger_checkpoint(&mut self) -> Vec<OperatorState> {
-        self.operators.iter().map(|op| op.checkpoint()).collect()
+    /// Returns both operator-serialized metadata and the full state store
+    /// snapshot, which captures all keyed state written via `ctx.state`.
+    pub fn trigger_checkpoint(&mut self) -> (Vec<OperatorState>, crate::state::StateSnapshot) {
+        let ops = self.operators.iter().map(|op| op.checkpoint()).collect();
+        let snap = self.state_store.snapshot();
+        (ops, snap)
     }
 
     /// Triggers a checkpoint, appending operator states into a reusable buffer.
@@ -375,9 +377,13 @@ impl Reactor {
     /// Like [`trigger_checkpoint`](Self::trigger_checkpoint) but avoids
     /// allocating a new `Vec` on every call — the caller provides a buffer
     /// whose capacity is reused across checkpoint cycles.
-    pub fn trigger_checkpoint_into(&mut self, buf: &mut Vec<OperatorState>) {
+    pub fn trigger_checkpoint_into(
+        &mut self,
+        buf: &mut Vec<OperatorState>,
+    ) -> crate::state::StateSnapshot {
         buf.clear();
         buf.extend(self.operators.iter().map(|op| op.checkpoint()));
+        self.state_store.snapshot()
     }
 
     /// Get current processing time in microseconds since reactor start
@@ -624,6 +630,7 @@ impl Sink for StdoutSink {
                     let CheckpointCompleteData {
                         checkpoint_id,
                         operator_states,
+                        state_store_snapshot: _,
                     } = *data;
                     println!(
                         "Checkpoint: id={checkpoint_id}, operators={}",

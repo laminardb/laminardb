@@ -133,6 +133,12 @@ pub struct CheckpointManifest {
     pub inflight_data: HashMap<String, Vec<InFlightRecord>>,
 
     // ── Metadata ──
+    /// Virtual partition count used for state key distribution.
+    ///
+    /// Immutable after the first checkpoint. All future checkpoints must
+    /// use the same value. Enables per-vnode restore in distributed mode.
+    #[serde(default)]
+    pub vnode_count: u16,
     /// Total size of all checkpoint data in bytes (manifest + state.bin).
     #[serde(default)]
     pub size_bytes: u64,
@@ -259,6 +265,7 @@ impl CheckpointManifest {
             sink_names: Vec::new(),
             pipeline_hash: None,
             inflight_data: HashMap::new(),
+            vnode_count: laminar_core::state::VNODE_COUNT,
             size_bytes: 0,
             is_incremental: false,
             parent_id: None,

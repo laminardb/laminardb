@@ -75,6 +75,35 @@ use std::collections::BTreeMap;
 use std::ops::Bound;
 use std::ops::Range;
 
+/// Number of virtual partitions for state distribution.
+///
+/// This value is **immutable after the first checkpoint** — changing it
+/// invalidates all existing checkpoint state. 256 supports up to 256-way
+/// parallelism (cores or distributed nodes) with negligible per-key overhead
+/// (2-byte prefix).
+pub const VNODE_COUNT: u16 = 256;
+
+/// Assigns a byte key to a virtual partition (vnode).
+///
+/// Uses FNV-1a hash for deterministic, zero-allocation mapping.
+/// The same key always maps to the same vnode across restarts and nodes.
+///
+/// # Performance
+///
+/// ~2ns per call (no allocation, no state, inlined).
+#[inline]
+#[must_use]
+#[allow(clippy::cast_possible_truncation)]
+pub fn vnode_of(key: &[u8]) -> u16 {
+    // FNV-1a 32-bit — deterministic, no seed, good distribution for power-of-2 mod.
+    let mut h: u32 = 0x811c_9dc5;
+    for &b in key {
+        h ^= u32::from(b);
+        h = h.wrapping_mul(0x0100_0193);
+    }
+    (h % u32::from(VNODE_COUNT)) as u16
+}
+
 /// Compute the lexicographic successor of a byte prefix.
 ///
 /// Returns `None` if no successor exists (empty prefix or all bytes are 0xFF).
