@@ -4,6 +4,7 @@
 use std::collections::HashMap;
 use std::path::PathBuf;
 
+use laminar_connectors::connector::DeliveryGuarantee;
 use laminar_core::streaming::{BackpressureStrategy, StreamCheckpointConfig};
 
 /// SQL identifier case sensitivity mode.
@@ -118,6 +119,8 @@ pub struct LaminarConfig {
     pub tiering: Option<TieringConfig>,
     /// Thread-per-core runtime configuration (`None` = use tokio mode).
     pub tpc: Option<TpcRuntimeConfig>,
+    /// End-to-end delivery guarantee (default: at-least-once).
+    pub delivery_guarantee: DeliveryGuarantee,
 }
 
 impl Default for LaminarConfig {
@@ -132,6 +135,7 @@ impl Default for LaminarConfig {
             object_store_options: HashMap::new(),
             tiering: None,
             tpc: None,
+            delivery_guarantee: DeliveryGuarantee::default(),
         }
     }
 }
