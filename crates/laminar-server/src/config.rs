@@ -507,7 +507,7 @@ pub struct SinkConfig {
     /// Pipeline this sink reads from.
     pub pipeline: String,
 
-    /// Connector type: "kafka", "postgres", "delta_lake", "iceberg", "stdout".
+    /// Connector type: "kafka", "postgres", "delta-lake", "iceberg", "stdout".
     pub connector: String,
 
     /// Delivery guarantee: "at_least_once", "exactly_once".

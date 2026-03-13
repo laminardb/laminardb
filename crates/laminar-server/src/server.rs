@@ -280,7 +280,7 @@ pub fn source_to_ddl(source: &SourceConfig) -> String {
     }
 
     // FROM CONNECTOR (...) clause
-    let connector_keyword = source.connector.to_uppercase();
+    let connector_keyword = source.connector.replace('-', "_").to_uppercase();
     let mut opts = Vec::new();
     opts.push(format!("format = '{}'", source.format));
     for (key, value) in &source.properties {
@@ -309,7 +309,7 @@ pub fn pipeline_to_ddl(pipeline: &PipelineConfig) -> String {
 /// CREATE SINK name FROM pipeline INTO KAFKA (key = 'value', ...)
 /// ```
 pub fn sink_to_ddl(sink: &SinkConfig) -> String {
-    let connector_keyword = sink.connector.to_uppercase();
+    let connector_keyword = sink.connector.replace('-', "_").to_uppercase();
     let mut opts: Vec<String> = sink
         .properties
         .iter()

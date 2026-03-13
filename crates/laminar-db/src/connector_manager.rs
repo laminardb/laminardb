@@ -88,11 +88,11 @@ pub(crate) struct TableRegistration {
     pub storage: Option<String>,
 }
 
-/// Build a [`ConnectorConfig`] from a [`SourceRegistration`].
-///
-/// Normalizes `connector_type` to lowercase, copies all options,
-/// and validates the format property (rejecting unknown formats
-/// at build time instead of silently defaulting).
+/// Normalize a connector type to the canonical registry form (lowercase, hyphens).
+pub(crate) fn normalize_connector_type(raw: &str) -> String {
+    raw.to_lowercase().replace('_', "-")
+}
+
 /// Map SQL-friendly option names to connector-native names.
 fn normalize_option_key(key: &str) -> String {
     match key {
@@ -108,7 +108,7 @@ pub(crate) fn build_source_config(reg: &SourceRegistration) -> Result<ConnectorC
         DbError::Connector(format!("Source '{}' has no connector type", reg.name))
     })?;
 
-    let mut config = ConnectorConfig::new(connector_type.to_lowercase());
+    let mut config = ConnectorConfig::new(normalize_connector_type(connector_type));
     for (k, v) in &reg.connector_options {
         config.set(normalize_option_key(k), v.clone());
     }
@@ -139,7 +139,7 @@ pub(crate) fn build_sink_config(reg: &SinkRegistration) -> Result<ConnectorConfi
         .as_deref()
         .ok_or_else(|| DbError::Connector(format!("Sink '{}' has no connector type", reg.name)))?;
 
-    let mut config = ConnectorConfig::new(connector_type.to_lowercase());
+    let mut config = ConnectorConfig::new(normalize_connector_type(connector_type));
     for (k, v) in &reg.connector_options {
         config.set(normalize_option_key(k), v.clone());
     }
@@ -170,7 +170,7 @@ pub(crate) fn build_table_config(reg: &TableRegistration) -> Result<ConnectorCon
         .as_deref()
         .ok_or_else(|| DbError::Connector(format!("Table '{}' has no connector type", reg.name)))?;
 
-    let mut config = ConnectorConfig::new(connector_type.to_lowercase());
+    let mut config = ConnectorConfig::new(normalize_connector_type(connector_type));
     for (k, v) in &reg.connector_options {
         config.set(normalize_option_key(k), v.clone());
     }
@@ -860,5 +860,63 @@ mod tests {
     fn test_parse_refresh_mode_invalid() {
         assert!(parse_refresh_mode("bogus").is_err());
         assert!(parse_refresh_mode("periodic:abc").is_err());
+    }
+
+    // ── normalize_connector_type tests ──
+
+    #[test]
+    fn test_normalize_connector_type_variants() {
+        // All forms of "delta-lake" must resolve to the same canonical name.
+        assert_eq!(normalize_connector_type("delta-lake"), "delta-lake");
+        assert_eq!(normalize_connector_type("delta_lake"), "delta-lake");
+        assert_eq!(normalize_connector_type("DELTA_LAKE"), "delta-lake");
+        assert_eq!(normalize_connector_type("DELTA-LAKE"), "delta-lake");
+        assert_eq!(normalize_connector_type("Delta_Lake"), "delta-lake");
+    }
+
+    #[test]
+    fn test_normalize_connector_type_simple_names() {
+        // Names without hyphens or underscores are just lowercased.
+        assert_eq!(normalize_connector_type("kafka"), "kafka");
+        assert_eq!(normalize_connector_type("KAFKA"), "kafka");
+        assert_eq!(normalize_connector_type("websocket"), "websocket");
+    }
+
+    #[test]
+    fn test_normalize_connector_type_hyphenated() {
+        assert_eq!(normalize_connector_type("postgres-cdc"), "postgres-cdc");
+        assert_eq!(normalize_connector_type("POSTGRES_CDC"), "postgres-cdc");
+        assert_eq!(normalize_connector_type("mysql-cdc"), "mysql-cdc");
+        assert_eq!(normalize_connector_type("MYSQL_CDC"), "mysql-cdc");
+        assert_eq!(normalize_connector_type("postgres-sink"), "postgres-sink");
+        assert_eq!(normalize_connector_type("POSTGRES_SINK"), "postgres-sink");
+    }
+
+    #[test]
+    fn test_build_source_config_normalizes_hyphenated_type() {
+        let reg = SourceRegistration {
+            name: "cdc".to_string(),
+            connector_type: Some("POSTGRES_CDC".to_string()),
+            connector_options: HashMap::new(),
+            format: None,
+            format_options: HashMap::new(),
+        };
+        let config = build_source_config(&reg).unwrap();
+        assert_eq!(config.connector_type(), "postgres-cdc");
+    }
+
+    #[test]
+    fn test_build_sink_config_normalizes_hyphenated_type() {
+        let reg = SinkRegistration {
+            name: "lake".to_string(),
+            input: "events".to_string(),
+            connector_type: Some("DELTA_LAKE".to_string()),
+            connector_options: HashMap::new(),
+            format: None,
+            format_options: HashMap::new(),
+            filter_expr: None,
+        };
+        let config = build_sink_config(&reg).unwrap();
+        assert_eq!(config.connector_type(), "delta-lake");
     }
 }
