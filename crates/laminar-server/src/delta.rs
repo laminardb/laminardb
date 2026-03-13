@@ -14,7 +14,7 @@ use tokio::signal;
 use tokio::sync::watch;
 use tracing::{info, warn};
 
-use laminar_core::delta::coordination::orchestrator::{DeltaManager, NodeLifecyclePhase};
+use laminar_core::delta::coordination::{DeltaManager, NodeLifecyclePhase};
 use laminar_core::delta::discovery::{
     Discovery, DiscoveryError, GossipDiscovery, GossipDiscoveryConfig, NodeId, NodeInfo,
     NodeMetadata, NodeState, StaticDiscovery, StaticDiscoveryConfig,
