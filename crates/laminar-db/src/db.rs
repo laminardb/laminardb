@@ -1568,7 +1568,7 @@ impl LaminarDB {
         let max_retained = cp_config.max_retained.unwrap_or(3);
 
         if let Some(ref url) = self.config.object_store_url {
-            let obj_store = laminar_storage::object_store_factory::build_object_store(
+            let obj_store = laminar_storage::object_store_builder::build_object_store(
                 url,
                 &self.config.object_store_options,
             )
