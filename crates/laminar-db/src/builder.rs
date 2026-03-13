@@ -137,6 +137,16 @@ impl LaminarDbBuilder {
         self
     }
 
+    /// Set the end-to-end delivery guarantee for the pipeline.
+    #[must_use]
+    pub fn delivery_guarantee(
+        mut self,
+        guarantee: laminar_connectors::connector::DeliveryGuarantee,
+    ) -> Self {
+        self.config.delivery_guarantee = guarantee;
+        self
+    }
+
     /// Register a custom scalar UDF with the database.
     ///
     /// The UDF will be available in SQL queries after `build()`.

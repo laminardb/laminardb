@@ -267,6 +267,13 @@ fn source_io_main(
                             "[LDB-5030] source checkpoint restore failed under exactly-once \
                              — cannot guarantee delivery semantics"
                         );
+                        if let Err(close_err) = connector.close().await {
+                            tracing::warn!(
+                                source = %name,
+                                error = %close_err,
+                                "error closing connector after restore failure"
+                            );
+                        }
                         return None;
                     }
                     tracing::warn!(

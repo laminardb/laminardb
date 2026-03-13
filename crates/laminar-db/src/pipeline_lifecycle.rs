@@ -793,7 +793,7 @@ impl LaminarDB {
                 std::time::Duration::ZERO
             },
             barrier_alignment_timeout: std::time::Duration::from_secs(30),
-            delivery_guarantee: laminar_connectors::connector::DeliveryGuarantee::default(),
+            delivery_guarantee: self.config.delivery_guarantee,
         };
 
         // Validate delivery guarantee constraints.
