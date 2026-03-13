@@ -39,5 +39,3 @@ pub mod coordination;
 
 /// Epoch-fenced partition ownership, assignment, and migration.
 pub mod partition;
-
-

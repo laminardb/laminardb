@@ -833,5 +833,4 @@ mod tests {
         let restored: DeterminismWarning = serde_json::from_str(&json).unwrap();
         assert_eq!(warning, restored);
     }
-
 }
