@@ -8,8 +8,6 @@
 pub mod checkpointer;
 /// Object-store checkpoint layout with UUID v7 identifiers.
 pub mod layout;
-/// Distributed recovery manager.
-pub mod recovery;
 /// Typed source position tracking for checkpoint recovery.
 pub mod source_offsets;
 

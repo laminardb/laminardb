@@ -75,6 +75,14 @@ use std::collections::BTreeMap;
 use std::ops::Bound;
 use std::ops::Range;
 
+/// Number of virtual partitions for state distribution.
+///
+/// This value is **immutable after the first checkpoint** — changing it
+/// invalidates all existing checkpoint state. 256 supports up to 256-way
+/// parallelism (cores or distributed nodes) with negligible per-key overhead
+/// (2-byte prefix).
+pub const VNODE_COUNT: u16 = 256;
+
 /// Compute the lexicographic successor of a byte prefix.
 ///
 /// Returns `None` if no successor exists (empty prefix or all bytes are 0xFF).
@@ -242,23 +250,6 @@ pub trait StateStore: Send {
     fn get_ref(&self, _key: &[u8]) -> Option<&[u8]> {
         None
     }
-
-    /// Get a value or insert a default.
-    ///
-    /// If the key doesn't exist, the default is inserted and returned.
-    ///
-    /// # Errors
-    ///
-    /// Returns `StateError` if inserting the default value fails.
-    fn get_or_insert(&mut self, key: &[u8], default: &[u8]) -> Result<Bytes, StateError> {
-        if let Some(value) = self.get(key) {
-            Ok(value)
-        } else {
-            let value = Bytes::copy_from_slice(default);
-            self.put(key, value.clone())?;
-            Ok(value)
-        }
-    }
 }
 
 /// Extension trait for [`StateStore`] providing typed access methods.
@@ -353,25 +344,6 @@ pub trait StateStoreExt: StateStore {
                 }
             }
         })
-    }
-
-    /// Update a value in place using a closure.
-    ///
-    /// The update function receives the current value (or None) and returns
-    /// the new value. If `None` is returned, the key is deleted.
-    ///
-    /// # Errors
-    ///
-    /// Returns `StateError` if the put or delete operation fails.
-    fn update<F>(&mut self, key: &[u8], f: F) -> Result<(), StateError>
-    where
-        F: FnOnce(Option<Bytes>) -> Option<Vec<u8>>,
-    {
-        let current = self.get(key);
-        match f(current) {
-            Some(new_value) => self.put(key, Bytes::from(new_value)),
-            None => self.delete(key),
-        }
     }
 }
 
@@ -508,23 +480,6 @@ impl InMemoryStore {
     #[must_use]
     pub fn with_capacity(_capacity: usize) -> Self {
         Self::new()
-    }
-
-    /// Returns the number of entries in the store.
-    ///
-    /// `BTreeMap` does not expose a capacity concept, so this returns
-    /// the current entry count.
-    #[must_use]
-    pub fn capacity(&self) -> usize {
-        self.data.len()
-    }
-
-    /// No-op for API compatibility.
-    ///
-    /// `BTreeMap` manages its own memory and does not support
-    /// explicit shrinking.
-    pub fn shrink_to_fit(&mut self) {
-        // BTreeMap does not support shrink_to_fit
     }
 }
 
@@ -669,13 +624,9 @@ mod mmap;
 /// AHashMap-backed state store with O(1) lookups and zero-copy reads.
 pub mod ahash_store;
 
-/// Dictionary key encoder for low-cardinality GROUP BY keys.
-pub mod dict_encoder;
-
 // Re-export main types
 pub use self::StateError as Error;
 pub use ahash_store::AHashMapStore;
-pub use dict_encoder::DictionaryKeyEncoder;
 pub use mmap::MmapStateStore;
 
 #[cfg(test)]
@@ -790,22 +741,6 @@ mod tests {
     }
 
     #[test]
-    fn test_snapshot_serialization() {
-        let mut store = InMemoryStore::new();
-        store.put(b"key1", Bytes::from_static(b"value1")).unwrap();
-        store.put(b"key2", Bytes::from_static(b"value2")).unwrap();
-
-        let snapshot = store.snapshot();
-
-        // Serialize and deserialize
-        let bytes = snapshot.to_bytes().unwrap();
-        let restored = StateSnapshot::from_bytes(&bytes).unwrap();
-
-        assert_eq!(restored.len(), snapshot.len());
-        assert_eq!(restored.data(), snapshot.data());
-    }
-
-    #[test]
     fn test_typed_access() {
         let mut store = InMemoryStore::new();
 
@@ -831,47 +766,6 @@ mod tests {
     }
 
     #[test]
-    fn test_get_or_insert() {
-        let mut store = InMemoryStore::new();
-
-        // First call inserts default
-        let value = store.get_or_insert(b"key1", b"default").unwrap();
-        assert_eq!(value, Bytes::from("default"));
-        assert_eq!(store.len(), 1);
-
-        // Second call returns existing
-        store.put(b"key1", Bytes::from_static(b"modified")).unwrap();
-        let value = store.get_or_insert(b"key1", b"default").unwrap();
-        assert_eq!(value, Bytes::from("modified"));
-    }
-
-    #[test]
-    fn test_update() {
-        let mut store = InMemoryStore::new();
-        store
-            .put(b"counter", Bytes::from_static(b"\x00\x00\x00\x00"))
-            .unwrap();
-
-        // Update existing
-        store
-            .update(b"counter", |current| {
-                let val = current.map_or(0u32, |b| {
-                    u32::from_le_bytes(b.as_ref().try_into().unwrap_or([0; 4]))
-                });
-                Some((val + 1).to_le_bytes().to_vec())
-            })
-            .unwrap();
-
-        let bytes = store.get(b"counter").unwrap();
-        let val = u32::from_le_bytes(bytes.as_ref().try_into().unwrap());
-        assert_eq!(val, 1);
-
-        // Update to delete
-        store.update(b"counter", |_| None).unwrap();
-        assert!(store.get(b"counter").is_none());
-    }
-
-    #[test]
     fn test_size_tracking() {
         let mut store = InMemoryStore::new();
         assert_eq!(store.size_bytes(), 0);
@@ -891,14 +785,6 @@ mod tests {
 
         store.clear();
         assert_eq!(store.size_bytes(), 0);
-    }
-
-    #[test]
-    fn test_with_capacity() {
-        let store = InMemoryStore::with_capacity(1000);
-        // BTreeMap does not pre-allocate; capacity() returns len() which is 0
-        assert_eq!(store.capacity(), 0);
-        assert!(store.is_empty());
     }
 
     #[test]

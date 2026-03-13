@@ -28,9 +28,6 @@ pub mod checkpoint_manifest;
 /// Checkpoint persistence trait and filesystem store
 pub mod checkpoint_store;
 
-/// Checkpoint batching for S3 cost optimization
-pub mod checkpoint_batcher;
-
 /// S3 storage class tiering for cost optimization
 pub mod tiering;
 
@@ -54,12 +51,11 @@ pub use checkpoint::layout::{
     PartitionSnapshotEntry, SourceOffsetEntry,
 };
 pub use checkpoint::source_offsets::{
-    DeterminismValidator, DeterminismWarning, FilePosition, GenericPosition, KafkaPartitionOffset,
-    KafkaPosition, MysqlCdcPosition, OperatorDescriptor, OperatorDeterminismWarning,
-    PostgresCdcPosition, RecoveryPlan, SourceId, SourceOffset, SourcePosition, WarningSeverity,
+    DeterminismWarning, FilePosition, GenericPosition, KafkaPartitionOffset, KafkaPosition,
+    MysqlCdcPosition, PostgresCdcPosition, RecoveryPlan, SourceId, SourceOffset, SourcePosition,
+    WarningSeverity,
 };
 pub use checkpoint::{Checkpoint, CheckpointMetadata};
-pub use checkpoint_batcher::{decode_batch, BatchMetrics, BatchMetricsSnapshot, CheckpointBatcher};
 pub use checkpoint_manifest::{CheckpointManifest, ConnectorCheckpoint, OperatorCheckpoint};
 pub use checkpoint_store::{
     CheckpointStore, CheckpointStoreError, FileSystemCheckpointStore, ObjectStoreCheckpointStore,

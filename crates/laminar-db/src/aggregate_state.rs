@@ -329,6 +329,9 @@ pub(crate) struct JoinStateCheckpoint {
 pub(crate) struct StreamExecutorCheckpoint {
     /// Checkpoint format version.
     pub version: u32,
+    /// Virtual partition count at checkpoint time.
+    #[serde(default)]
+    pub vnode_count: u16,
     /// Non-EOWC aggregate states, keyed by query name.
     #[serde(default)]
     pub agg_states: FxHashMap<String, AggStateCheckpoint>,
@@ -2676,7 +2679,8 @@ mod tests {
         );
 
         let cp = StreamExecutorCheckpoint {
-            version: 1,
+            version: 2,
+            vnode_count: laminar_core::state::VNODE_COUNT,
             agg_states: FxHashMap::default(),
             eowc_states: FxHashMap::default(),
             core_window_states: FxHashMap::default(),

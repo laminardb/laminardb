@@ -89,9 +89,8 @@ impl StateStore for AHashMapStore {
             *old_value = value;
         } else {
             self.size_bytes += key.len() + value.len();
-            let key_vec = key.to_vec();
-            self.index.insert(key_vec.clone());
-            self.data.insert(key_vec, value);
+            self.index.insert(key.to_vec());
+            self.data.insert(key.to_vec(), value);
         }
         Ok(())
     }

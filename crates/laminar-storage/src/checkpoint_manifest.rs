@@ -133,6 +133,12 @@ pub struct CheckpointManifest {
     pub inflight_data: HashMap<String, Vec<InFlightRecord>>,
 
     // ── Metadata ──
+    /// Virtual partition count used for state key distribution.
+    ///
+    /// Immutable after the first checkpoint. All future checkpoints must
+    /// use the same value. Enables per-vnode restore in distributed mode.
+    #[serde(default)]
+    pub vnode_count: u16,
     /// Total size of all checkpoint data in bytes (manifest + state.bin).
     #[serde(default)]
     pub size_bytes: u64,
@@ -228,6 +234,23 @@ impl CheckpointManifest {
             });
         }
 
+        // vnode_count must be set (non-zero) and match the runtime constant.
+        // A mismatch means the checkpoint was created with a different partition
+        // scheme and cannot be safely restored.
+        if self.vnode_count == 0 {
+            errors.push(ManifestValidationError {
+                message: "vnode_count is 0 (missing or legacy checkpoint)".into(),
+            });
+        } else if self.vnode_count != laminar_core::state::VNODE_COUNT {
+            errors.push(ManifestValidationError {
+                message: format!(
+                    "vnode_count mismatch: checkpoint has {}, runtime expects {}",
+                    self.vnode_count,
+                    laminar_core::state::VNODE_COUNT
+                ),
+            });
+        }
+
         errors
     }
 
@@ -259,6 +282,7 @@ impl CheckpointManifest {
             sink_names: Vec::new(),
             pipeline_hash: None,
             inflight_data: HashMap::new(),
+            vnode_count: laminar_core::state::VNODE_COUNT,
             size_bytes: 0,
             is_incremental: false,
             parent_id: None,
