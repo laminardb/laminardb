@@ -10,6 +10,7 @@ use arrow::datatypes::{DataType, Field, Schema};
 use laminar_sql::parser::StreamingStatement;
 use laminar_sql::translator::streaming_ddl;
 
+use crate::connector_manager::normalize_connector_type;
 use crate::db::{parse_duration_str, streaming_statement_to_sql, LaminarDB};
 use crate::error::DbError;
 use crate::handle::{DdlInfo, ExecuteResult};
@@ -141,7 +142,7 @@ impl LaminarDB {
         };
 
         if let Some(ref ct) = resolved_connector_type {
-            let normalized = ct.to_lowercase().replace('_', "-");
+            let normalized = normalize_connector_type(ct);
             if self.connector_registry.source_info(&normalized).is_none() {
                 return Err(DbError::Connector(format!(
                     "Unknown source connector type '{ct}'. Available: {:?}",
@@ -228,7 +229,7 @@ impl LaminarDB {
         };
 
         if let Some(ref ct) = resolved_connector_type {
-            let normalized = ct.to_lowercase().replace('_', "-");
+            let normalized = normalize_connector_type(ct);
             if self.connector_registry.sink_info(&normalized).is_none() {
                 return Err(DbError::Connector(format!(
                     "Unknown sink connector type '{ct}'. Available: {:?}",
