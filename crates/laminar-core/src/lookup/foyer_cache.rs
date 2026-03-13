@@ -14,7 +14,7 @@ use arrow_array::RecordBatch;
 use equivalent::Equivalent;
 use foyer::{Cache, CacheBuilder};
 
-use crate::lookup::table::{LookupResult, LookupTable};
+use crate::lookup::table::LookupResult;
 
 /// Composite cache key: table ID + raw key bytes.
 ///
@@ -149,10 +149,9 @@ impl FoyerMemoryCache {
             key: key.to_vec(),
         }
     }
-}
 
-impl LookupTable for FoyerMemoryCache {
-    fn get_cached(&self, key: &[u8]) -> LookupResult {
+    /// Look up a key in the in-memory cache only (Ring 0, < 500ns).
+    pub fn get_cached(&self, key: &[u8]) -> LookupResult {
         let ref_key = LookupCacheKeyRef {
             table_id: self.table_id,
             key,
@@ -167,16 +166,19 @@ impl LookupTable for FoyerMemoryCache {
         }
     }
 
-    fn get(&self, key: &[u8]) -> LookupResult {
+    /// Look up a key, potentially checking slower storage tiers.
+    pub fn get(&self, key: &[u8]) -> LookupResult {
         self.get_cached(key)
     }
 
-    fn insert(&self, key: &[u8], value: RecordBatch) {
+    /// Insert or update a cached entry.
+    pub fn insert(&self, key: &[u8], value: RecordBatch) {
         let cache_key = self.make_key(key);
         self.cache.insert(cache_key, value);
     }
 
-    fn invalidate(&self, key: &[u8]) {
+    /// Invalidate a cached entry.
+    pub fn invalidate(&self, key: &[u8]) {
         let ref_key = LookupCacheKeyRef {
             table_id: self.table_id,
             key,
@@ -184,8 +186,15 @@ impl LookupTable for FoyerMemoryCache {
         self.cache.remove(&ref_key);
     }
 
-    fn len(&self) -> usize {
+    /// Number of entries currently in the cache.
+    pub fn len(&self) -> usize {
         self.cache.usage()
+    }
+
+    /// Whether the cache is empty.
+    #[must_use]
+    pub fn is_empty(&self) -> bool {
+        self.len() == 0
     }
 }
 
@@ -283,13 +292,12 @@ mod tests {
     }
 
     #[test]
-    fn test_foyer_cache_implements_lookup_table() {
+    fn test_foyer_cache_lookup_methods() {
         let cache = small_cache(1);
-        let table: &dyn LookupTable = &cache;
 
-        table.insert(b"k", test_batch("v"));
-        assert!(!table.is_empty());
-        assert!(table.get(b"k").is_hit());
+        cache.insert(b"k", test_batch("v"));
+        assert!(!cache.is_empty());
+        assert!(cache.get(b"k").is_hit());
     }
 
     #[test]

@@ -6,7 +6,7 @@
 //! 1. **Full DDL** — user-declared schema without wildcards
 //! 2. **Schema registry** — via [`SchemaRegistryAware`](super::traits::SchemaRegistryAware)
 //! 3. **Source provider** — via [`SchemaProvider`](super::traits::SchemaProvider)
-//! 4. **Sample inference** — via [`SchemaInferable`](super::traits::SchemaInferable)
+//! 4. *(removed — sample inference trait had no implementors)*
 //! 5. **Error** — no schema could be determined
 //!
 //! When partial DDL is provided (with wildcard `*`), the resolver merges
@@ -258,45 +258,7 @@ impl SchemaResolver {
             }
         }
 
-        // Level 4: Sample-based inference.
-        if let Some(inferable) = connector.as_schema_inferable() {
-            let samples = inferable
-                .sample_records(inference_config.max_samples)
-                .await?;
-
-            if !samples.is_empty() {
-                let inferred = inferable
-                    .infer_from_samples(&samples, inference_config)
-                    .await?;
-
-                let inf_warnings: Vec<String> = inferred
-                    .warnings
-                    .iter()
-                    .map(|w| w.message.clone())
-                    .collect();
-
-                let kind = ResolutionKind::Inferred {
-                    sample_count: inferred.sample_count,
-                    warnings: inf_warnings.clone(),
-                };
-
-                if declared.has_wildcard {
-                    let mut resolved = Self::merge_with_declared(declared, &inferred.schema, kind)?;
-                    resolved.warnings.extend(inf_warnings);
-                    return Ok(resolved);
-                }
-
-                let origins = vec![FieldOrigin::AutoResolved; inferred.schema.fields().len()];
-                return Ok(ResolvedSchema {
-                    schema: inferred.schema,
-                    kind,
-                    field_origins: origins,
-                    warnings: inf_warnings,
-                });
-            }
-        }
-
-        // Level 5: Error.
+        // Level 4: Error.
         Err(SchemaError::InferenceFailed(
             "no schema could be resolved: declare a schema, configure a registry, \
              or ensure the connector supports schema inference"
@@ -400,9 +362,8 @@ impl SchemaResolver {
         // At least one resolution path must be available.
         let has_provider = connector.as_schema_provider().is_some();
         let has_registry = connector.as_schema_registry_aware().is_some();
-        let has_inference = connector.as_schema_inferable().is_some();
 
-        if !has_provider && !has_registry && !has_inference {
+        if !has_provider && !has_registry {
             return Err(SchemaError::WildcardWithoutInference);
         }
 

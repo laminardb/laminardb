@@ -1,15 +1,7 @@
-//! Lookup table trait and configuration types.
+//! Lookup table configuration types.
 //!
-//! A [`LookupTable`] provides synchronous key-value access for enriching
-//! stream events via lookup joins. The trait is `Send + Sync` so tables
-//! can be shared across operator instances in a thread-per-core runtime.
-//!
-//! ## Lookup Flow
-//!
-//! 1. Stream event arrives at a lookup join operator
-//! 2. Operator calls [`get_cached`](LookupTable::get_cached) (Ring 0, < 500ns)
-//! 3. On cache miss, calls [`get`](LookupTable::get) (may hit disk/network)
-//! 4. Result is joined with the stream event
+//! Provides types for configuring lookup joins: [`LookupResult`],
+//! [`LookupStrategy`], and [`LookupTableConfig`].
 
 use std::time::Duration;
 
@@ -97,53 +89,6 @@ impl Default for LookupTableConfig {
             max_cache_entries: 100_000,
             source: None,
         }
-    }
-}
-
-/// Synchronous lookup table interface for Ring 0 operators.
-///
-/// Implementations must be `Send + Sync` to allow sharing across threads
-/// in the thread-per-core runtime. The hot-path method is
-/// [`get_cached`](Self::get_cached) which should be < 500ns.
-///
-/// Writes (insert/invalidate) come from the Ring 1 CDC adapter or
-/// bulk-load path, not from the hot path.
-pub trait LookupTable: Send + Sync {
-    /// Look up a key in the in-memory cache only (Ring 0).
-    ///
-    /// This is the fast path — must not block or perform I/O.
-    /// Returns [`LookupResult::NotFound`] on cache miss; callers should
-    /// then try [`get`](Self::get) for a deeper lookup.
-    ///
-    /// # Performance
-    ///
-    /// Target: < 500ns
-    fn get_cached(&self, key: &[u8]) -> LookupResult;
-
-    /// Look up a key, potentially checking slower storage tiers.
-    ///
-    /// May check a disk cache, remote cache, or trigger an async
-    /// source query. Returns [`LookupResult::Pending`] if the lookup
-    /// requires an async fetch that hasn't completed yet.
-    fn get(&self, key: &[u8]) -> LookupResult;
-
-    /// Insert or update a cached entry.
-    ///
-    /// Called by the CDC adapter or bulk-load path when new data arrives
-    /// from the source. This is NOT on the hot path.
-    fn insert(&self, key: &[u8], value: RecordBatch);
-
-    /// Invalidate a cached entry.
-    ///
-    /// Called when the source signals a delete or the TTL expires.
-    fn invalidate(&self, key: &[u8]);
-
-    /// Number of entries currently in the cache.
-    fn len(&self) -> usize;
-
-    /// Whether the cache is empty.
-    fn is_empty(&self) -> bool {
-        self.len() == 0
     }
 }
 

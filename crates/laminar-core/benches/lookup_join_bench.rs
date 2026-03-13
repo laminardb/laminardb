@@ -15,7 +15,6 @@ use criterion::{criterion_group, criterion_main, BenchmarkId, Criterion, Through
 use rand::RngExt;
 
 use laminar_core::lookup::foyer_cache::{FoyerMemoryCache, FoyerMemoryCacheConfig};
-use laminar_core::lookup::table::LookupTable;
 
 fn bench_schema() -> SchemaRef {
     Arc::new(Schema::new(vec![Field::new("v", DataType::Utf8, false)]))
