@@ -29,10 +29,13 @@
 pub mod callback;
 pub mod config;
 pub mod source_adapter;
+#[allow(dead_code)] // Infrastructure for Phase E integration
+pub mod streaming_coordinator;
 pub mod tpc_coordinator;
 pub mod tpc_runtime;
 
 pub use callback::{PipelineCallback, SourceRegistration};
 pub use config::PipelineConfig;
+pub use streaming_coordinator::StreamingCoordinator;
 pub use tpc_coordinator::TpcPipelineCoordinator;
 pub use tpc_runtime::TpcRuntime;
