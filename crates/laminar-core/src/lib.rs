@@ -25,7 +25,6 @@
 /// Cross-partition aggregation.
 pub mod aggregation;
 pub mod alloc;
-pub mod budget;
 /// Distributed checkpoint barrier protocol.
 pub mod checkpoint;
 pub mod compiler;
