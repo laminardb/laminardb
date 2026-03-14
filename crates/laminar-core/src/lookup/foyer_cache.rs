@@ -187,12 +187,8 @@ impl FoyerMemoryCache {
     }
 
     /// Number of entries currently in the cache.
-    ///
-    /// Returns `foyer::Cache::usage()` which equals the entry count for
-    /// unweighted caches (the default). If custom weighers are added,
-    /// this will return total weight instead.
     pub fn len(&self) -> usize {
-        self.cache.usage()
+        self.cache.entries()
     }
 
     /// Whether the cache is empty.
@@ -206,7 +202,7 @@ impl std::fmt::Debug for FoyerMemoryCache {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         f.debug_struct("FoyerMemoryCache")
             .field("table_id", &self.table_id)
-            .field("entries", &self.cache.usage())
+            .field("entries", &self.cache.entries())
             .field("hits", &self.hits.load(Ordering::Relaxed))
             .field("misses", &self.misses.load(Ordering::Relaxed))
             .finish()
