@@ -24,7 +24,7 @@ use std::time::Instant;
 use smallvec::SmallVec;
 
 use super::fallback::ExecutablePipeline;
-use super::metrics::{
+use super::query_lifecycle::{
     QueryConfig, QueryError, QueryId, QueryMetadata, QueryMetrics, QueryState, SubmitResult,
 };
 use super::pipeline::PipelineAction;
