@@ -160,20 +160,13 @@ impl LaminarDB {
                 .or_else(|| self.config.storage_dir.clone())
                 .unwrap_or_else(|| std::path::PathBuf::from("./data"))
                 .join("wal");
-            // Match the TPC runtime's core count logic: explicit config,
-            // available_parallelism for external connectors, or source count.
-            let num_cores = self
-                .config
-                .tpc
-                .as_ref()
-                .and_then(|t| t.num_cores)
-                .unwrap_or_else(|| {
-                    if has_external {
-                        std::thread::available_parallelism().map_or(1, std::num::NonZero::get)
-                    } else {
-                        source_regs.len().max(1)
-                    }
-                });
+            // WAL uses one file per source (or per available core for
+            // external connectors).
+            let num_cores = if has_external {
+                std::thread::available_parallelism().map_or(1, std::num::NonZero::get)
+            } else {
+                source_regs.len().max(1)
+            };
             match laminar_storage::per_core_wal::PerCoreWalManager::new(
                 laminar_storage::per_core_wal::PerCoreWalConfig::new(&wal_dir, num_cores),
             ) {
@@ -234,14 +227,9 @@ impl LaminarDB {
     /// `CatalogSourceConnector` to participate in the pipeline alongside
     /// external connectors (Kafka, CDC, etc.).
     ///
-    /// The pipeline uses a thread-per-core architecture: each source
-    /// runs on a dedicated I/O thread, pushing events through SPSC
-    /// queues to CPU-pinned core threads. A `TpcPipelineCoordinator`
-    /// tokio task drains core outboxes and runs SQL cycles.
-    ///
-    /// When `has_external` is false (pure embedded mode), one core thread
-    /// per source is used to minimize overhead while providing unified
-    /// watermark tracking, error handling, and checkpointing.
+    /// Each source runs as a tokio task pushing batches via mpsc channel
+    /// to a `StreamingCoordinator` that drives SQL cycles, sink writes,
+    /// and checkpoint coordination.
     #[allow(clippy::too_many_lines)]
     async fn start_connector_pipeline(
         &self,
@@ -254,7 +242,7 @@ impl LaminarDB {
         use crate::connector_manager::{
             build_sink_config, build_source_config, build_table_config,
         };
-        use crate::pipeline::{PipelineConfig, SourceRegistration, TpcPipelineCoordinator};
+        use crate::pipeline::{PipelineConfig, SourceRegistration};
         use crate::stream_executor::StreamExecutor;
         use laminar_connectors::reference::{ReferenceTableSource, RefreshMode};
 
@@ -891,50 +879,16 @@ impl LaminarDB {
             delivery_guarantee: pipeline_config.delivery_guarantee,
         };
 
-        // Build TPC config (use explicit settings or auto-detect defaults).
+        // Start the streaming coordinator (sources push directly via mpsc).
         {
-            use laminar_core::tpc::TpcConfig;
-
-            let tpc_cfg = self.config.tpc.clone().unwrap_or_default();
-            let num_sources = sources.len().max(1);
-            let num_cores = tpc_cfg.num_cores.unwrap_or_else(|| {
-                if has_external {
-                    std::thread::available_parallelism().map_or(1, std::num::NonZero::get)
-                } else {
-                    // Pure embedded mode: one core per source.
-                    num_sources
-                }
-            });
-            // Ensure at least one core per source — SPSC queues require
-            // exactly one producer thread. When num_cores < num_sources,
-            // round-robin routing puts multiple producers on the same inbox.
-            let num_cores = num_cores.max(num_sources);
-            if let Some(configured) = tpc_cfg.num_cores {
-                if configured < num_sources {
-                    tracing::warn!(
-                        configured_cores = configured,
-                        required_cores = num_sources,
-                        "Overriding num_cores to match source count \
-                         (SPSC single-producer invariant)"
-                    );
-                }
-            }
-            let tpc_config = TpcConfig {
-                num_cores,
-                cpu_pinning: tpc_cfg.cpu_pinning,
-                cpu_start: tpc_cfg.cpu_start,
-                ..Default::default()
-            };
-
-            let tpc_coordinator = TpcPipelineCoordinator::new(
+            let coordinator = crate::pipeline::StreamingCoordinator::new(
                 sources,
                 pipeline_config,
-                &tpc_config,
                 Arc::clone(&shutdown),
             )?;
 
             let handle = tokio::spawn(async move {
-                tpc_coordinator.run(Box::new(callback)).await;
+                coordinator.run(Box::new(callback)).await;
             });
 
             *self.runtime_handle.lock() = Some(handle);

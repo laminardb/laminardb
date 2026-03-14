@@ -62,38 +62,6 @@ impl Default for TieringConfig {
     }
 }
 
-/// Thread-per-core runtime configuration.
-///
-/// Controls CPU pinning and core count for the TPC pipeline. When
-/// `None` on [`LaminarConfig`], auto-detected defaults are used.
-#[derive(Debug, Clone)]
-pub struct TpcRuntimeConfig {
-    /// Number of cores (`None` = auto-detect via `available_parallelism`).
-    pub num_cores: Option<usize>,
-    /// Pin core threads to CPUs starting from `cpu_start`.
-    pub cpu_pinning: bool,
-    /// First CPU ID for pinning.
-    pub cpu_start: usize,
-}
-
-impl TpcRuntimeConfig {
-    /// Auto-detect system capabilities.
-    #[must_use]
-    pub fn auto() -> Self {
-        Self {
-            num_cores: None,
-            cpu_pinning: cfg!(target_os = "linux"),
-            cpu_start: 0,
-        }
-    }
-}
-
-impl Default for TpcRuntimeConfig {
-    fn default() -> Self {
-        Self::auto()
-    }
-}
-
 /// Configuration for a `LaminarDB` instance.
 #[derive(Debug, Clone)]
 pub struct LaminarConfig {
@@ -113,8 +81,6 @@ pub struct LaminarConfig {
     pub object_store_options: HashMap<String, String>,
     /// S3 storage class tiering configuration (`None` = use default STANDARD).
     pub tiering: Option<TieringConfig>,
-    /// Thread-per-core runtime configuration (`None` = use tokio mode).
-    pub tpc: Option<TpcRuntimeConfig>,
     /// End-to-end delivery guarantee (default: at-least-once).
     pub delivery_guarantee: DeliveryGuarantee,
 }
@@ -130,7 +96,6 @@ impl Default for LaminarConfig {
             object_store_url: None,
             object_store_options: HashMap::new(),
             tiering: None,
-            tpc: None,
             delivery_guarantee: DeliveryGuarantee::default(),
         }
     }

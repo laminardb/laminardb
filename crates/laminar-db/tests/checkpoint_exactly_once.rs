@@ -19,10 +19,9 @@ use arrow_array::RecordBatch;
 use tokio::sync::Notify;
 
 use laminar_connectors::checkpoint::SourceCheckpoint;
-use laminar_core::tpc::TpcConfig;
 use laminar_db::checkpoint_coordinator::{CheckpointConfig, CheckpointCoordinator};
 use laminar_db::pipeline::{
-    PipelineCallback, PipelineConfig, SourceRegistration, TpcPipelineCoordinator,
+    PipelineCallback, PipelineConfig, SourceRegistration, StreamingCoordinator,
 };
 use laminar_db::recovery_manager::RecoveryManager;
 use laminar_storage::checkpoint_store::FileSystemCheckpointStore;
@@ -108,25 +107,6 @@ impl PipelineCallback for BarrierTrackingCallback {
     async fn poll_tables(&mut self) {}
 }
 
-/// TPC config for tests. Uses 2 cores to satisfy the SPSC invariant
-/// (each source gets its own core inbox).
-fn test_tpc_config() -> TpcConfig {
-    TpcConfig {
-        num_cores: 2,
-        cpu_pinning: false,
-        ..Default::default()
-    }
-}
-
-/// Single-core TPC config for single-source tests.
-fn test_tpc_config_single() -> TpcConfig {
-    TpcConfig {
-        num_cores: 1,
-        cpu_pinning: false,
-        ..Default::default()
-    }
-}
-
 /// Test that barriers are injected and aligned across multiple sources,
 /// and that the checkpoint callback fires with consistent offsets.
 #[tokio::test]
@@ -164,8 +144,7 @@ async fn test_barrier_aligned_checkpoint_fires() {
         ..PipelineConfig::default()
     };
 
-    let coordinator =
-        TpcPipelineCoordinator::new(sources, config, &test_tpc_config(), shutdown).unwrap();
+    let coordinator = StreamingCoordinator::new(sources, config, shutdown).unwrap();
 
     let should_trigger = Arc::new(AtomicBool::new(true));
     let record_counter = Arc::new(AtomicU64::new(0));
@@ -309,8 +288,7 @@ async fn test_single_source_barrier_checkpoint() {
         ..PipelineConfig::default()
     };
 
-    let coordinator =
-        TpcPipelineCoordinator::new(sources, config, &test_tpc_config_single(), shutdown).unwrap();
+    let coordinator = StreamingCoordinator::new(sources, config, shutdown).unwrap();
 
     let should_trigger = Arc::new(AtomicBool::new(true));
     let record_counter = Arc::new(AtomicU64::new(0));
@@ -367,8 +345,7 @@ async fn test_exhausted_sources_with_shutdown() {
         ..PipelineConfig::default()
     };
 
-    let coordinator =
-        TpcPipelineCoordinator::new(sources, config, &test_tpc_config(), shutdown).unwrap();
+    let coordinator = StreamingCoordinator::new(sources, config, shutdown).unwrap();
 
     let should_trigger = Arc::new(AtomicBool::new(true));
     let record_counter = Arc::new(AtomicU64::new(0));

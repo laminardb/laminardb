@@ -34,6 +34,7 @@ use super::config::PipelineConfig;
 use crate::error::DbError;
 
 /// Message sent from a source task to the coordinator.
+#[allow(dead_code)] // Barrier variant used when barrier injection is wired
 enum SourceMsg {
     /// A batch of records from a source.
     Batch {
@@ -71,7 +72,8 @@ pub struct StreamingCoordinator {
     shutdown: Arc<tokio::sync::Notify>,
     /// Pending barrier alignment.
     pending_barrier: PendingBarrier,
-    /// Next checkpoint ID.
+    /// Next checkpoint ID (used when barrier injection is wired).
+    #[allow(dead_code)]
     next_checkpoint_id: u64,
     /// Last checkpoint time.
     last_checkpoint: Instant,
@@ -103,6 +105,7 @@ impl PendingBarrier {
         }
     }
 
+    #[allow(dead_code)] // Used when barrier injection is wired
     fn reset(&mut self, checkpoint_id: u64, sources_total: usize) {
         self.checkpoint_id = checkpoint_id;
         self.sources_total = sources_total;
