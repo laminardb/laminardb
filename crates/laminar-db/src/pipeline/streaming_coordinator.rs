@@ -551,7 +551,10 @@ mod tests {
 
         fn extract_watermark(&mut self, _source_name: &str, batch: &RecordBatch) {
             // Use row count as a simple watermark proxy.
-            self.watermark += batch.num_rows() as i64;
+            #[allow(clippy::cast_possible_wrap)]
+            {
+                self.watermark += batch.num_rows() as i64;
+            }
         }
 
         fn filter_late_rows(&self, _source_name: &str, batch: &RecordBatch) -> Option<RecordBatch> {

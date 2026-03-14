@@ -259,34 +259,35 @@ Custom connectors can be built using the `SourceConnector` / `SinkConnector` tra
 
 ## Architecture
 
-Three-ring model separating latency-critical event processing from background I/O and the control plane:
-
 ```text
 ┌──────────────────────────────────────────────────────────────┐
-│                     RING 0: HOT PATH                         │
-│  CPU-pinned reactor, minimal allocations, SPSC queues        │
-│  ┌─────────┐  ┌──────────┐  ┌──────────┐  ┌──────────┐     │
-│  │ Reactor │→ │ Operators│→ │  State   │→ │   Emit   │     │
-│  │  Loop   │  │ (window, │  │  Store   │  │ (output) │     │
-│  │         │  │  join,   │  │ (ahash/  │  │          │     │
-│  │         │  │  filter) │  │  foyer)  │  │          │     │
-│  └─────────┘  └──────────┘  └──────────┘  └──────────┘     │
-│       │                                                      │
-│       │ SPSC queues (lock-free)                              │
-│       ▼                                                      │
+│                     SOURCE CONNECTORS                        │
+│  ┌──────────┐  ┌──────────┐  ┌──────────┐                  │
+│  │ Kafka    │  │ Postgres │  │  File    │  tokio tasks      │
+│  │ Source   │  │ CDC      │  │ Source   │                   │
+│  └────┬─────┘  └────┬─────┘  └────┬─────┘                  │
+│       │ mpsc         │ mpsc        │ mpsc                    │
+│       └──────┬───────┘─────────────┘                         │
+│              ▼                                                │
 ├──────────────────────────────────────────────────────────────┤
-│                    RING 1: BACKGROUND                        │
-│  Tokio async runtime, bounded latency impact                 │
+│                  STREAMING COORDINATOR                        │
+│  Single tokio task: SQL cycles, compiled projections,         │
+│  cached logical plans, checkpoint barriers                    │
+│  ┌──────────┐  ┌──────────┐  ┌──────────┐  ┌──────────┐    │
+│  │ Compiled │→ │ Operators│→ │  State   │→ │  Sink    │    │
+│  │Projection│  │ (window, │  │  Store   │  │ Writers  │    │
+│  │/ Cached  │  │  join,   │  │ (ahash/  │  │          │    │
+│  │  Plans   │  │  filter) │  │  foyer)  │  │          │    │
+│  └──────────┘  └──────────┘  └──────────┘  └──────────┘    │
+├──────────────────────────────────────────────────────────────┤
+│                     BACKGROUND I/O                            │
+│  Tokio async runtime, bounded latency impact                  │
 │  ┌──────────┐  ┌──────────┐  ┌──────────┐  ┌──────────┐    │
 │  │Checkpoint│  │   WAL    │  │Changelog │  │  Timer   │    │
 │  │ Manager  │  │  Writer  │  │ Drainer  │  │  Wheel   │    │
 │  └──────────┘  └──────────┘  └──────────┘  └──────────┘    │
-│       │                                                      │
-│       │ Bounded channels                                     │
-│       ▼                                                      │
 ├──────────────────────────────────────────────────────────────┤
-│                    RING 2: CONTROL PLANE                     │
-│  No latency requirements                                     │
+│                      CONTROL PLANE                            │
 │  ┌──────────┐  ┌──────────┐  ┌──────────┐                  │
 │  │  Admin   │  │ Metrics  │  │  Config  │                  │
 │  │   API    │  │  Export  │  │ Manager  │                  │

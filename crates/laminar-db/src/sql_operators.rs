@@ -258,7 +258,7 @@ mod tests {
             schema,
             vec![
                 Arc::new(StringArray::from(
-                    symbols.iter().map(|s| *s).collect::<Vec<_>>(),
+                    symbols.iter().copied().collect::<Vec<_>>(),
                 )),
                 Arc::new(Float64Array::from(prices.to_vec())),
                 Arc::new(Int64Array::from(volumes.to_vec())),
@@ -336,7 +336,7 @@ mod tests {
 
     #[test]
     fn test_projection_adapter_checkpoint_restore() {
-        let schema = Arc::new(Schema::new(vec![
+        let _schema = Arc::new(Schema::new(vec![
             Field::new("a", DataType::Int64, false),
             Field::new("b", DataType::Int64, false),
         ]));
@@ -384,8 +384,8 @@ mod tests {
         let src_id = dag.node_id_by_name("src").unwrap();
         let proj_xy_id = dag.node_id_by_name("proj_xy").unwrap();
         let proj_yz_id = dag.node_id_by_name("proj_yz").unwrap();
-        let sink_a_id = dag.node_id_by_name("sink_a").unwrap();
-        let sink_b_id = dag.node_id_by_name("sink_b").unwrap();
+        let sink_first_id = dag.node_id_by_name("sink_a").unwrap();
+        let sink_second_id = dag.node_id_by_name("sink_b").unwrap();
 
         let mut executor = DagExecutor::from_dag(&dag);
         executor.register_operator(
@@ -420,13 +420,13 @@ mod tests {
             .unwrap();
 
         // sink_a should have x,y columns
-        let out_a = executor.take_sink_outputs(sink_a_id);
+        let out_a = executor.take_sink_outputs(sink_first_id);
         assert_eq!(out_a.len(), 1);
         assert_eq!(out_a[0].data.num_columns(), 2);
         assert_eq!(out_a[0].data.schema().field(0).name(), "x");
 
         // sink_b should have y,z columns
-        let out_b = executor.take_sink_outputs(sink_b_id);
+        let out_b = executor.take_sink_outputs(sink_second_id);
         assert_eq!(out_b.len(), 1);
         assert_eq!(out_b[0].data.num_columns(), 2);
         assert_eq!(out_b[0].data.schema().field(0).name(), "y");

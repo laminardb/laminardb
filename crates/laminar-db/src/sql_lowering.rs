@@ -239,10 +239,15 @@ pub(crate) fn build_query_dag(
     }
 
     // Connect each operator to its source tables.
+    // If any operator ends up with zero resolved sources, the DAG is
+    // disconnected and we should abort rather than silently produce
+    // empty output.
     for (op_name, source_tables) in &op_sources {
+        let mut connected = false;
         for table in source_tables {
             if available_sources.contains(table.as_str()) {
                 builder = builder.connect(table, op_name);
+                connected = true;
             } else {
                 tracing::warn!(
                     operator = %op_name,
@@ -250,6 +255,13 @@ pub(crate) fn build_query_dag(
                     "source not found in DAG — skipping edge"
                 );
             }
+        }
+        if !connected {
+            tracing::warn!(
+                operator = %op_name,
+                "operator has no resolved sources — aborting DAG construction"
+            );
+            return None;
         }
     }
 
@@ -287,7 +299,7 @@ mod tests {
         ]))
     }
 
-    async fn ctx_with_trades() -> SessionContext {
+    fn ctx_with_trades() -> SessionContext {
         let ctx = laminar_sql::create_session_context();
         let schema = trades_schema();
         let mem_table = datafusion::datasource::MemTable::try_new(schema, vec![vec![]]).unwrap();
@@ -297,7 +309,7 @@ mod tests {
 
     #[tokio::test]
     async fn test_lower_aggregate_query() {
-        let ctx = ctx_with_trades().await;
+        let ctx = ctx_with_trades();
         let result = try_lower_query(
             &ctx,
             "trade_summary",
@@ -332,7 +344,7 @@ mod tests {
 
     #[tokio::test]
     async fn test_lower_non_aggregate_returns_fallback() {
-        let ctx = ctx_with_trades().await;
+        let ctx = ctx_with_trades();
         let result = try_lower_query(
             &ctx,
             "passthrough",
@@ -352,7 +364,7 @@ mod tests {
 
     #[tokio::test]
     async fn test_lower_aggregate_with_having() {
-        let ctx = ctx_with_trades().await;
+        let ctx = ctx_with_trades();
         let result = try_lower_query(
             &ctx,
             "filtered_agg",
@@ -374,7 +386,7 @@ mod tests {
 
     #[tokio::test]
     async fn test_build_query_dag() {
-        let ctx = ctx_with_trades().await;
+        let ctx = ctx_with_trades();
         let schema = trades_schema();
 
         // Lower a query.
@@ -412,7 +424,7 @@ mod tests {
 
     #[tokio::test]
     async fn test_build_dag_all_fallback_returns_none() {
-        let ctx = ctx_with_trades().await;
+        let ctx = ctx_with_trades();
         let schema = trades_schema();
 
         // Lower a non-aggregate query (returns Fallback).
