@@ -24,11 +24,11 @@ use std::time::Instant;
 use smallvec::SmallVec;
 
 use super::fallback::ExecutablePipeline;
+use super::pipeline::PipelineAction;
+use super::pipeline_bridge::{BridgeConsumer, PipelineBridge, Ring1Action};
 use super::query_lifecycle::{
     QueryConfig, QueryError, QueryId, QueryMetadata, QueryMetrics, QueryState, SubmitResult,
 };
-use super::pipeline::PipelineAction;
-use super::pipeline_bridge::{BridgeConsumer, PipelineBridge, Ring1Action};
 use super::row::{EventRow, RowSchema};
 
 // ────────────────────────────── Builder ──────────────────────────────

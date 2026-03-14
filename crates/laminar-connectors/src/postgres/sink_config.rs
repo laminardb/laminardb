@@ -258,29 +258,7 @@ str_enum!(WriteMode, lowercase_nodash, String, "unknown write mode",
 );
 
 pub use crate::connector::DeliveryGuarantee;
-
-/// SSL mode for `PostgreSQL` connections.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub enum SslMode {
-    /// No SSL.
-    Disable,
-    /// Use SSL if available, fall back to unencrypted.
-    Prefer,
-    /// Require SSL.
-    Require,
-    /// Require SSL and verify server certificate.
-    VerifyCa,
-    /// Require SSL, verify certificate and hostname.
-    VerifyFull,
-}
-
-str_enum!(SslMode, lowercase_nodash, String, "unknown SSL mode",
-    Disable => "disable", "off";
-    Prefer => "prefer";
-    Require => "require";
-    VerifyCa => "verify-ca", "verify_ca", "verifyca";
-    VerifyFull => "verify-full", "verify_full", "verifyfull"
-);
+pub use crate::connector::PostgresSslMode as SslMode;
 
 #[cfg(test)]
 mod tests {

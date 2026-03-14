@@ -481,11 +481,11 @@ impl Connection {
 unsafe impl Send for Connection {}
 unsafe impl Sync for Connection {}
 
-/// Result of executing a SQL statement (FFI variant).
+/// Result of executing a SQL statement (API variant).
 #[derive(Debug)]
 pub enum ExecuteResult {
     /// DDL statement completed (CREATE, DROP, ALTER).
-    Ddl(DdlInfo),
+    Ddl(crate::DdlInfo),
     /// Query is running, results available via stream.
     Query(QueryStream),
     /// Rows were affected (INSERT INTO).
@@ -494,22 +494,10 @@ pub enum ExecuteResult {
     Metadata(RecordBatch),
 }
 
-/// Information about a completed DDL statement.
-#[derive(Debug, Clone)]
-pub struct DdlInfo {
-    /// The statement type (e.g., "CREATE SOURCE").
-    pub statement_type: String,
-    /// The object name affected.
-    pub object_name: String,
-}
-
 impl From<crate::ExecuteResult> for ExecuteResult {
     fn from(result: crate::ExecuteResult) -> Self {
         match result {
-            crate::ExecuteResult::Ddl(info) => Self::Ddl(DdlInfo {
-                statement_type: info.statement_type,
-                object_name: info.object_name,
-            }),
+            crate::ExecuteResult::Ddl(info) => Self::Ddl(info),
             crate::ExecuteResult::Query(handle) => Self::Query(QueryStream::from_handle(handle)),
             crate::ExecuteResult::RowsAffected(n) => Self::RowsAffected(n),
             crate::ExecuteResult::Metadata(batch) => Self::Metadata(batch),

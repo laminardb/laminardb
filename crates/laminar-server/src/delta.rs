@@ -397,8 +397,10 @@ pub async fn start_delta(
 
     // 3. Create DeltaManager and advance to Active
     let mut manager = DeltaManager::new(node_id);
-    manager.phase = NodeLifecyclePhase::Active;
-    info!("DeltaManager phase: {}", manager.phase);
+    manager.transition(NodeLifecyclePhase::FormingRaft);
+    manager.transition(NodeLifecyclePhase::WaitingForAssignment);
+    manager.transition(NodeLifecyclePhase::Active);
+    info!("DeltaManager phase: {}", manager.phase());
 
     // 4. Compute initial partition assignment
     let workers = if config.server.workers == 0 {

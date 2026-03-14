@@ -260,8 +260,8 @@ impl SchemaResolver {
 
         // Level 4: Error.
         Err(SchemaError::InferenceFailed(
-            "no schema could be resolved: declare a schema, configure a registry, \
-             or ensure the connector supports schema inference"
+            "no schema could be resolved: declare a schema, \
+             or configure a schema provider or registry"
                 .into(),
         ))
     }
@@ -342,13 +342,13 @@ impl SchemaResolver {
     ///
     /// Checks:
     /// - The connector supports at least one schema resolution path
-    ///   (provider, registry, or inference).
+    ///   (provider or registry).
     /// - If a prefix is set, no prefixed column name collides with a
     ///   declared column name.
     ///
     /// # Errors
     ///
-    /// Returns [`SchemaError::WildcardWithoutInference`] if no resolution
+    /// Returns [`SchemaError::WildcardWithoutResolution`] if no resolution
     /// path is available, or [`SchemaError::WildcardPrefixCollision`] if
     /// a prefixed name collides with a declared column.
     pub fn validate_wildcard(
@@ -364,7 +364,7 @@ impl SchemaResolver {
         let has_registry = connector.as_schema_registry_aware().is_some();
 
         if !has_provider && !has_registry {
-            return Err(SchemaError::WildcardWithoutInference);
+            return Err(SchemaError::WildcardWithoutResolution);
         }
 
         Ok(())

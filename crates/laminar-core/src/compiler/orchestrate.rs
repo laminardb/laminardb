@@ -30,9 +30,9 @@ use super::cache::CompilerCache;
 use super::error::CompileError;
 use super::extractor::PipelineExtractor;
 use super::fallback::ExecutablePipeline;
-use super::query_lifecycle::{QueryConfig, QueryMetadata};
 use super::pipeline_bridge::create_pipeline_bridge;
 use super::query::{StreamingQuery, StreamingQueryBuilder};
+use super::query_lifecycle::{QueryConfig, QueryMetadata};
 use super::row::RowSchema;
 
 /// Result of successful compilation — ready for execution.

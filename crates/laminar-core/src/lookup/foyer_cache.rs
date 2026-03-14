@@ -166,7 +166,7 @@ impl FoyerMemoryCache {
         }
     }
 
-    /// Look up a key, potentially checking slower storage tiers.
+    /// Alias for [`get_cached`](Self::get_cached). No slower storage tiers are wired yet.
     pub fn get(&self, key: &[u8]) -> LookupResult {
         self.get_cached(key)
     }
@@ -187,6 +187,10 @@ impl FoyerMemoryCache {
     }
 
     /// Number of entries currently in the cache.
+    ///
+    /// Returns `foyer::Cache::usage()` which equals the entry count for
+    /// unweighted caches (the default). If custom weighers are added,
+    /// this will return total weight instead.
     pub fn len(&self) -> usize {
         self.cache.usage()
     }

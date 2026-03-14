@@ -62,13 +62,9 @@ impl fmt::Display for NodeLifecyclePhase {
 /// Manages the node lifecycle and coordinates partition ownership
 /// when cluster membership changes.
 pub struct DeltaManager {
-    /// This node's ID.
-    pub node_id: NodeId,
-    /// Current lifecycle phase.
-    pub phase: NodeLifecyclePhase,
-    /// Partition guards for this node.
-    pub guards: PartitionGuardSet,
-    /// Assignment constraints.
+    node_id: NodeId,
+    phase: NodeLifecyclePhase,
+    guards: PartitionGuardSet,
     constraints: AssignmentConstraints,
 }
 
@@ -82,6 +78,29 @@ impl DeltaManager {
             guards: PartitionGuardSet::new(node_id),
             constraints: AssignmentConstraints::default(),
         }
+    }
+
+    /// This node's ID.
+    #[must_use]
+    pub fn node_id(&self) -> NodeId {
+        self.node_id
+    }
+
+    /// Current lifecycle phase.
+    #[must_use]
+    pub fn phase(&self) -> NodeLifecyclePhase {
+        self.phase
+    }
+
+    /// Partition guards for this node.
+    #[must_use]
+    pub fn guards(&self) -> &PartitionGuardSet {
+        &self.guards
+    }
+
+    /// Mutable access to partition guards.
+    pub fn guards_mut(&mut self) -> &mut PartitionGuardSet {
+        &mut self.guards
     }
 
     /// Transition to the next lifecycle phase.
@@ -211,8 +230,8 @@ mod tests {
     #[test]
     fn test_manager_initial_phase() {
         let mgr = DeltaManager::new(NodeId(1));
-        assert_eq!(mgr.phase, NodeLifecyclePhase::Discovering);
-        assert!(mgr.guards.is_empty());
+        assert_eq!(mgr.phase(), NodeLifecyclePhase::Discovering);
+        assert!(mgr.guards().is_empty());
     }
 
     #[test]
@@ -220,22 +239,22 @@ mod tests {
         let mut mgr = DeltaManager::new(NodeId(1));
 
         assert!(mgr.transition(NodeLifecyclePhase::FormingRaft));
-        assert_eq!(mgr.phase, NodeLifecyclePhase::FormingRaft);
+        assert_eq!(mgr.phase(), NodeLifecyclePhase::FormingRaft);
 
         assert!(mgr.transition(NodeLifecyclePhase::WaitingForAssignment));
-        assert_eq!(mgr.phase, NodeLifecyclePhase::WaitingForAssignment);
+        assert_eq!(mgr.phase(), NodeLifecyclePhase::WaitingForAssignment);
 
         assert!(mgr.transition(NodeLifecyclePhase::RestoringPartitions));
-        assert_eq!(mgr.phase, NodeLifecyclePhase::RestoringPartitions);
+        assert_eq!(mgr.phase(), NodeLifecyclePhase::RestoringPartitions);
 
         assert!(mgr.transition(NodeLifecyclePhase::Active));
-        assert_eq!(mgr.phase, NodeLifecyclePhase::Active);
+        assert_eq!(mgr.phase(), NodeLifecyclePhase::Active);
 
         assert!(mgr.transition(NodeLifecyclePhase::Draining));
-        assert_eq!(mgr.phase, NodeLifecyclePhase::Draining);
+        assert_eq!(mgr.phase(), NodeLifecyclePhase::Draining);
 
         assert!(mgr.transition(NodeLifecyclePhase::Shutdown));
-        assert_eq!(mgr.phase, NodeLifecyclePhase::Shutdown);
+        assert_eq!(mgr.phase(), NodeLifecyclePhase::Shutdown);
     }
 
     #[test]
@@ -250,17 +269,19 @@ mod tests {
     fn test_invalid_transitions() {
         let mut mgr = DeltaManager::new(NodeId(1));
         assert!(!mgr.transition(NodeLifecyclePhase::Active));
-        assert_eq!(mgr.phase, NodeLifecyclePhase::Discovering);
+        assert_eq!(mgr.phase(), NodeLifecyclePhase::Discovering);
 
         mgr.transition(NodeLifecyclePhase::FormingRaft);
         assert!(!mgr.transition(NodeLifecyclePhase::Discovering));
-        assert_eq!(mgr.phase, NodeLifecyclePhase::FormingRaft);
+        assert_eq!(mgr.phase(), NodeLifecyclePhase::FormingRaft);
     }
 
     #[test]
     fn test_should_rebalance_when_active() {
         let mut mgr = DeltaManager::new(NodeId(1));
-        mgr.phase = NodeLifecyclePhase::Active;
+        mgr.transition(NodeLifecyclePhase::FormingRaft);
+        mgr.transition(NodeLifecyclePhase::WaitingForAssignment);
+        mgr.transition(NodeLifecyclePhase::Active);
 
         assert!(mgr.should_rebalance(&MembershipEvent::NodeJoined(Box::new(make_node(2, 4)))));
         assert!(mgr.should_rebalance(&MembershipEvent::NodeLeft(NodeId(2))));
@@ -275,17 +296,17 @@ mod tests {
     #[test]
     fn test_apply_migration_result_source() {
         let mut mgr = DeltaManager::new(NodeId(1));
-        mgr.guards.insert(5, 1);
+        mgr.guards_mut().insert(5, 1);
         mgr.apply_migration_result(5, NodeId(1), NodeId(2), 2);
-        assert!(mgr.guards.is_empty());
+        assert!(mgr.guards().is_empty());
     }
 
     #[test]
     fn test_apply_migration_result_target() {
         let mut mgr = DeltaManager::new(NodeId(2));
         mgr.apply_migration_result(5, NodeId(1), NodeId(2), 2);
-        assert_eq!(mgr.guards.len(), 1);
-        assert!(mgr.guards.check(5).is_ok());
+        assert_eq!(mgr.guards().len(), 1);
+        assert!(mgr.guards().check(5).is_ok());
     }
 
     #[test]

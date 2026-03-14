@@ -244,29 +244,7 @@ impl PostgresCdcConfig {
     }
 }
 
-/// SSL connection mode.
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
-pub enum SslMode {
-    /// No SSL.
-    Disable,
-    /// Try SSL, fall back to unencrypted.
-    #[default]
-    Prefer,
-    /// Require SSL.
-    Require,
-    /// Require SSL and verify CA certificate.
-    VerifyCa,
-    /// Require SSL and verify server hostname.
-    VerifyFull,
-}
-
-str_enum!(SslMode, lowercase_nodash, String, "unknown SSL mode",
-    Disable => "disable";
-    Prefer => "prefer";
-    Require => "require";
-    VerifyCa => "verify-ca", "verify_ca";
-    VerifyFull => "verify-full", "verify_full"
-);
+pub use crate::connector::PostgresSslMode as SslMode;
 
 /// How to handle the initial snapshot when no prior checkpoint exists.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]

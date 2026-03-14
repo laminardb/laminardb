@@ -1,7 +1,8 @@
-//! Lookup table configuration types.
+//! Lookup table types — runtime results, distribution strategies, and configuration.
 //!
-//! Provides types for configuring lookup joins: [`LookupResult`],
-//! [`LookupStrategy`], and [`LookupTableConfig`].
+//! - [`LookupResult`]: Outcome of a cache lookup (hit, pending, or miss)
+//! - [`LookupStrategy`]: How table data is distributed across nodes
+//! - [`LookupTableConfig`]: Per-table instance configuration
 
 use std::time::Duration;
 
