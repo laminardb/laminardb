@@ -341,13 +341,8 @@ impl StreamingCoordinator {
                 self.process_msg(msg, &mut *callback, &mut barriers, &mut cycle_events);
             }
 
-            // Phase 3: Handle barriers.
-            for (source_idx, barrier) in &barriers {
-                self.handle_barrier(*source_idx, barrier, &mut *callback)
-                    .await;
-            }
-
-            // Phase 4: Execute SQL cycle.
+            // Phase 3: Execute SQL cycle (before committing barriers so that
+            // checkpoint state includes the processed batches).
             if !self.source_batches_buf.is_empty() {
                 let wm = callback.current_watermark();
                 match callback.execute_cycle(&self.source_batches_buf, wm).await {
@@ -362,6 +357,13 @@ impl StreamingCoordinator {
                 #[allow(clippy::cast_possible_truncation)]
                 let elapsed_ns = cycle_start.elapsed().as_nanos() as u64;
                 callback.record_cycle(cycle_events, 0, elapsed_ns);
+            }
+
+            // Phase 4: Handle barriers (after SQL cycle so checkpoint state
+            // includes the effects of processed batches).
+            for (source_idx, barrier) in &barriers {
+                self.handle_barrier(*source_idx, barrier, &mut *callback)
+                    .await;
             }
 
             // Phase 5: Periodic checkpoint.
@@ -455,9 +457,20 @@ impl StreamingCoordinator {
         // Check if all sources aligned.
         if self.pending_barrier.sources_aligned.len() >= self.pending_barrier.sources_total {
             let checkpoints = std::mem::take(&mut self.pending_barrier.source_checkpoints);
-            callback.checkpoint_with_barrier(checkpoints).await;
-            self.pending_barrier.active = false;
-            self.last_checkpoint = Instant::now();
+            let ok = callback.checkpoint_with_barrier(checkpoints).await;
+            if ok {
+                self.pending_barrier.active = false;
+                self.last_checkpoint = Instant::now();
+            } else {
+                tracing::warn!(
+                    checkpoint_id = self.pending_barrier.checkpoint_id,
+                    "barrier checkpoint failed, will retry on next interval"
+                );
+                // Keep active=true so next periodic trigger retries.
+                // Source checkpoints were consumed; sources will re-checkpoint
+                // on the next barrier injection.
+                self.pending_barrier.active = false;
+            }
         }
     }
 

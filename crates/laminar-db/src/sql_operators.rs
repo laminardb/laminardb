@@ -257,9 +257,7 @@ mod tests {
         RecordBatch::try_new(
             schema,
             vec![
-                Arc::new(StringArray::from(
-                    symbols.iter().copied().collect::<Vec<_>>(),
-                )),
+                Arc::new(StringArray::from(symbols.to_vec())),
                 Arc::new(Float64Array::from(prices.to_vec())),
                 Arc::new(Int64Array::from(volumes.to_vec())),
             ],
