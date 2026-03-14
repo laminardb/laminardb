@@ -144,7 +144,9 @@ async fn test_barrier_aligned_checkpoint_fires() {
         ..PipelineConfig::default()
     };
 
-    let coordinator = StreamingCoordinator::new(sources, config, shutdown).unwrap();
+    let coordinator = StreamingCoordinator::new(sources, config, shutdown)
+        .await
+        .unwrap();
 
     let should_trigger = Arc::new(AtomicBool::new(true));
     let record_counter = Arc::new(AtomicU64::new(0));
@@ -288,7 +290,9 @@ async fn test_single_source_barrier_checkpoint() {
         ..PipelineConfig::default()
     };
 
-    let coordinator = StreamingCoordinator::new(sources, config, shutdown).unwrap();
+    let coordinator = StreamingCoordinator::new(sources, config, shutdown)
+        .await
+        .unwrap();
 
     let should_trigger = Arc::new(AtomicBool::new(true));
     let record_counter = Arc::new(AtomicU64::new(0));
@@ -345,7 +349,9 @@ async fn test_exhausted_sources_with_shutdown() {
         ..PipelineConfig::default()
     };
 
-    let coordinator = StreamingCoordinator::new(sources, config, shutdown).unwrap();
+    let coordinator = StreamingCoordinator::new(sources, config, shutdown)
+        .await
+        .unwrap();
 
     let should_trigger = Arc::new(AtomicBool::new(true));
     let record_counter = Arc::new(AtomicU64::new(0));

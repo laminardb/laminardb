@@ -50,7 +50,7 @@ enum SourceMsg {
 /// Handle to a running source I/O task.
 struct SourceHandle {
     name: String,
-    shutdown: Arc<AtomicBool>,
+    shutdown: Arc<tokio::sync::Notify>,
     join: tokio::task::JoinHandle<()>,
     checkpoint_rx: tokio::sync::watch::Receiver<SourceCheckpoint>,
     /// Injector for Chandy-Lamport checkpoint barriers.
@@ -129,9 +129,10 @@ impl StreamingCoordinator {
     ///
     /// # Errors
     ///
-    /// Returns an error if delivery guarantee constraints are violated.
+    /// Returns an error if delivery guarantee constraints are violated
+    /// or if any source connector fails to open.
     #[allow(clippy::too_many_lines)]
-    pub fn new(
+    pub async fn new(
         sources: Vec<SourceRegistration>,
         config: PipelineConfig,
         shutdown: Arc<tokio::sync::Notify>,
@@ -172,7 +173,7 @@ impl StreamingCoordinator {
                 .clone()
                 .unwrap_or_else(|| SourceCheckpoint::new(0));
             let (cp_tx, cp_rx) = tokio::sync::watch::channel(initial_cp);
-            let task_shutdown = Arc::new(AtomicBool::new(false));
+            let task_shutdown = Arc::new(tokio::sync::Notify::new());
             let task_shutdown_clone = Arc::clone(&task_shutdown);
             let task_tx = tx.clone();
             let max_poll = config.max_poll_records;
@@ -182,39 +183,42 @@ impl StreamingCoordinator {
             let mut connector = src.connector;
             let connector_config = src.config;
 
+            // Open connector eagerly so startup fails fast on bad config.
+            connector
+                .open(&connector_config)
+                .await
+                .map_err(|e| DbError::Config(format!("source '{src_name}' open failed: {e}")))?;
+
+            // Restore checkpoint if available.
+            if let Some(ref cp) = restore {
+                if let Err(e) = connector.restore(cp).await {
+                    tracing::warn!(
+                        source = %src_name, error = %e,
+                        "source restore failed, starting from beginning"
+                    );
+                }
+            }
+
+            // Publish initial offset after open/restore.
+            let _ = cp_tx.send(connector.checkpoint());
+
             // Barrier injection: coordinator triggers → source polls → sends SourceMsg::Barrier
             let barrier_injector = CheckpointBarrierInjector::new();
             let barrier_handle = barrier_injector.handle();
 
             let join = tokio::spawn(async move {
                 let mut epoch: u64 = 0;
-                // Open the connector.
-                if let Err(e) = connector.open(&connector_config).await {
-                    tracing::error!(source = %src_name, error = %e, "source open failed");
-                    return;
-                }
 
-                // Restore checkpoint if available.
-                if let Some(ref cp) = restore {
-                    if let Err(e) = connector.restore(cp).await {
-                        tracing::warn!(
-                            source = %src_name, error = %e,
-                            "source restore failed, starting from beginning"
-                        );
-                    }
-                }
-
-                // Publish initial offset after open/restore so
-                // maybe_checkpoint() has the correct starting position.
-                let _ = cp_tx.send(connector.checkpoint());
-
-                // Poll loop.
+                // Poll loop — tokio::select! ensures shutdown cancels a
+                // long-running poll_batch without waiting for it to return.
                 loop {
-                    if task_shutdown_clone.load(Ordering::Acquire) {
-                        break;
-                    }
+                    let poll_result = tokio::select! {
+                        biased;
+                        () = task_shutdown_clone.notified() => break,
+                        result = connector.poll_batch(max_poll) => result,
+                    };
 
-                    match connector.poll_batch(max_poll).await {
+                    match poll_result {
                         Ok(Some(batch)) => {
                             // Publish offset BEFORE sending the batch so
                             // maybe_checkpoint() never sees an offset ahead
@@ -230,12 +234,20 @@ impl StreamingCoordinator {
                             }
                         }
                         Ok(None) => {
-                            // No data — sleep briefly.
-                            tokio::time::sleep(poll_interval).await;
+                            // No data — sleep briefly (cancellable).
+                            tokio::select! {
+                                biased;
+                                () = task_shutdown_clone.notified() => break,
+                                () = tokio::time::sleep(poll_interval) => {}
+                            }
                         }
                         Err(e) => {
                             tracing::warn!(source = %src_name, error = %e, "poll error");
-                            tokio::time::sleep(poll_interval).await;
+                            tokio::select! {
+                                biased;
+                                () = task_shutdown_clone.notified() => break,
+                                () = tokio::time::sleep(poll_interval) => {}
+                            }
                         }
                     }
 
@@ -372,7 +384,7 @@ impl StreamingCoordinator {
 
         // Shutdown: signal all source tasks and wait.
         for handle in &self.source_handles {
-            handle.shutdown.store(true, Ordering::Release);
+            handle.shutdown.notify_one();
         }
         for handle in self.source_handles {
             if let Err(e) = handle.join.await {

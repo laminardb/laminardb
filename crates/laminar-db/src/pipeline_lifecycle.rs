@@ -885,7 +885,8 @@ impl LaminarDB {
                 sources,
                 pipeline_config,
                 Arc::clone(&shutdown),
-            )?;
+            )
+            .await?;
 
             let handle = tokio::spawn(async move {
                 coordinator.run(Box::new(callback)).await;
