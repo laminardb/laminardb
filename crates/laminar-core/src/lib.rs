@@ -25,9 +25,7 @@
 pub mod alloc;
 /// Distributed checkpoint barrier protocol.
 pub mod checkpoint;
-pub mod compiler;
 pub mod dag;
-pub mod detect;
 /// Structured error code registry (`LDB-NNNN`) and Ring 0 hot path error type.
 pub mod error_codes;
 /// Lookup table types and predicate pushdown.
