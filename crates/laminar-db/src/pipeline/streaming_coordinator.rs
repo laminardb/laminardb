@@ -165,7 +165,13 @@ impl StreamingCoordinator {
                 checkpoint_request_flags.push(flag);
             }
 
-            let (cp_tx, cp_rx) = tokio::sync::watch::channel(SourceCheckpoint::new(0));
+            // Initialize watch with the restored checkpoint (not zero) so
+            // maybe_checkpoint() sees correct offsets from the start.
+            let initial_cp = src
+                .restore_checkpoint
+                .clone()
+                .unwrap_or_else(|| SourceCheckpoint::new(0));
+            let (cp_tx, cp_rx) = tokio::sync::watch::channel(initial_cp);
             let task_shutdown = Arc::new(AtomicBool::new(false));
             let task_shutdown_clone = Arc::clone(&task_shutdown);
             let task_tx = tx.clone();
@@ -198,6 +204,10 @@ impl StreamingCoordinator {
                     }
                 }
 
+                // Publish initial offset after open/restore so
+                // maybe_checkpoint() has the correct starting position.
+                let _ = cp_tx.send(connector.checkpoint());
+
                 // Poll loop.
                 loop {
                     if task_shutdown_clone.load(Ordering::Acquire) {
@@ -206,6 +216,11 @@ impl StreamingCoordinator {
 
                     match connector.poll_batch(max_poll).await {
                         Ok(Some(batch)) => {
+                            // Publish offset BEFORE sending the batch so
+                            // maybe_checkpoint() never sees an offset ahead
+                            // of what the coordinator has consumed.
+                            let _ = cp_tx.send(connector.checkpoint());
+
                             let msg = SourceMsg::Batch {
                                 source_idx: idx,
                                 batch: batch.records,
@@ -223,9 +238,6 @@ impl StreamingCoordinator {
                             tokio::time::sleep(poll_interval).await;
                         }
                     }
-
-                    // Publish checkpoint offset.
-                    let _ = cp_tx.send(connector.checkpoint());
 
                     // Poll for pending checkpoint barrier.
                     if let Some(barrier) = barrier_handle.poll(epoch) {
