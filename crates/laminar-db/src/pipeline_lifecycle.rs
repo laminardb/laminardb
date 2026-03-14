@@ -868,6 +868,7 @@ impl LaminarDB {
             table_store: table_store_for_loop,
             lookup_registry: Arc::clone(&self.lookup_registry),
             filter_ctx: laminar_sql::create_session_context(),
+            compiled_sink_filters: Vec::new(),
             last_checkpoint: std::time::Instant::now(),
             checkpoint_interval: self
                 .config

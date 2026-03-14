@@ -77,7 +77,7 @@ pub struct QueryConfig {
 impl Default for QueryConfig {
     fn default() -> Self {
         Self {
-            jit_enabled: cfg!(feature = "jit"),
+            jit_enabled: false,
             batch_policy: BatchPolicy::default(),
             backpressure: BridgeOverflow::default(),
             max_cache_entries: 64,

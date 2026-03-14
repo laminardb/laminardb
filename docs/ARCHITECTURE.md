@@ -70,7 +70,7 @@ All code here runs on a CPU-pinned reactor thread.
 - Predictable branching (likely/unlikely hints)
 - Task budget enforcement prevents any single operator from exceeding its time slice
 
-**Optional JIT compilation** (Cranelift): DataFusion logical plans can be compiled into native machine code for Ring 0 execution. The `AdaptiveQueryRunner` runs queries interpreted first, compiles in the background, and hot-swaps to compiled execution when ready. See `laminar-core/src/compiler/`.
+**Compiled query execution**: Non-aggregate single-source queries are compiled to `PhysicalExpr` projections on first execution, eliminating per-cycle SQL overhead. Complex queries cache their optimized logical plans.
 
 **Streaming physical optimizer** (`StreamingPhysicalValidator`): Catches invalid physical plans (e.g., SortExec on unbounded streams) before execution. Configurable via `StreamingValidatorMode` (Reject, Warn, Off).
 
@@ -140,7 +140,7 @@ How an event moves through the system:
 
 ```
 laminar-core          Ring 0: reactor, operators, state stores, time/watermarks,
-                      streaming channels, DAG pipeline, subscriptions, JIT compiler,
+                      streaming channels, DAG pipeline, subscriptions,
                       lookup tables, secondary indexes, cross-partition aggregation,
                       checkpoint barriers, NUMA allocation, io_uring, task budgets
                       |
@@ -336,7 +336,7 @@ SQL parsing goes through sqlparser-rs with these streaming extensions:
 | Window frames | `ROWS BETWEEN ... AND ...` | Custom frame bounds |
 | Config vars | `${VAR}` in SQL strings | Variable substitution |
 
-Queries are planned by `StreamingPlanner` and executed either via DataFusion (interpreted) or via the JIT compiler (compiled to native code for Ring 0).
+Queries are planned by `StreamingPlanner` and executed via DataFusion, with compiled projections and cached logical plans eliminating per-cycle planning overhead for hot-path queries.
 
 ## Performance Characteristics
 

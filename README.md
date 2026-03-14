@@ -294,7 +294,7 @@ Three-ring model separating latency-critical event processing from background I/
 └──────────────────────────────────────────────────────────────┘
 ```
 
-- **Ring 0** — CPU-pinned reactor loop with thread-per-core execution. Minimal heap allocations. SPSC lock-free queues between cores. Optional Cranelift JIT compilation for query expressions (`--features jit`). Target: sub-microsecond per-event latency.
+- **Ring 0** — CPU-pinned reactor loop with thread-per-core execution. Minimal heap allocations. SPSC lock-free queues between cores. Target: sub-microsecond per-event latency.
 - **Ring 1** — Tokio async runtime handling WAL writes, checkpointing, connector I/O, and changelog draining. Communicates with Ring 0 via bounded channels.
 - **Ring 2** — HTTP admin API, metrics, configuration management. Auth and observability are planned (Phase 4/5).
 
@@ -321,9 +321,9 @@ let db = LaminarDB::builder()
 
 On crash, events between the last completed checkpoint and the crash are lost. Checkpoint interval is configurable; shorter intervals reduce the data loss window at the cost of higher I/O overhead.
 
-### JIT Compilation
+### Compiled Query Execution
 
-Enable with `--features jit`. The `AdaptiveQueryRunner` runs queries interpreted first, compiles to native code via Cranelift in the background, and hot-swaps to compiled execution when ready.
+Non-aggregate single-source queries are compiled to `PhysicalExpr` projections on first execution, eliminating per-cycle SQL parsing overhead. Complex queries cache their optimized logical plans to skip repeated planning.
 
 ---
 
@@ -392,7 +392,7 @@ Additional benchmark suites: `window_bench`, `join_bench`, `lookup_join_bench`, 
 | Phase 1 | Core Engine | ✅ 12/12 |
 | Phase 1.5 | SQL Parser | ✅ 1/1 |
 | Phase 2 | Production Hardening | ✅ 38/38 |
-| Phase 2.5 | JIT Compiler | ✅ 12/12 |
+| Phase 2.5 | JIT Compiler | ❌ Removed |
 | Phase 3 | Connectors & Integration | 🔧 85/100 |
 | Phase 4 | Enterprise Security (Auth, RBAC) | 📋 Planned |
 | Phase 5 | Admin & Observability | 📋 Planned |
@@ -418,7 +418,6 @@ See [docs/ROADMAP.md](docs/ROADMAP.md) for the full phase timeline.
 | `delta-lake-s3` / `delta-lake-azure` / `delta-lake-gcs` | Cloud storage backends |
 | `websocket` | WebSocket source and sink connectors |
 | `files` | File source and sink (Parquet, CSV) |
-| `jit` | Cranelift JIT query compilation |
 | `ffi` | C FFI with Arrow C Data Interface |
 | `delta` | Distributed mode (gossip, Raft, gRPC) |
 | `parquet-lookup` | Parquet lookup source for reference tables |

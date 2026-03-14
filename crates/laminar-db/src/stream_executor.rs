@@ -29,7 +29,9 @@ use laminar_sql::translator::{
     TemporalJoinTranslatorConfig, WindowOperatorConfig, WindowType,
 };
 
-use crate::aggregate_state::IncrementalAggState;
+use datafusion_expr::LogicalPlan;
+
+use crate::aggregate_state::{apply_compiled_having, CompiledProjection, IncrementalAggState};
 use crate::core_window_state::CoreWindowState;
 use crate::eowc_state::IncrementalEowcState;
 use crate::error::DbError;
@@ -219,6 +221,16 @@ pub(crate) struct StreamExecutor {
     /// Set of query indices that have been checked for aggregation but
     /// found not to be aggregate queries (avoids re-checking).
     non_agg_queries: FxHashSet<usize>,
+    /// Pre-compiled projections for non-aggregate single-source queries.
+    /// Evaluates SELECT + WHERE via `PhysicalExpr` without SQL parsing.
+    plain_compiled: FxHashMap<usize, CompiledProjection>,
+    /// Cached optimized logical plans for complex non-aggregate queries
+    /// (ORDER BY, LIMIT, DISTINCT, JOINs). Skips SQL parsing + optimization
+    /// on subsequent cycles; only physical planning runs per cycle.
+    cached_logical_plans: FxHashMap<usize, LogicalPlan>,
+    /// Schema fingerprints at cache time, keyed by query index.
+    /// Used to invalidate `cached_logical_plans` when source schema changes.
+    cached_plan_fingerprints: FxHashMap<usize, u64>,
     /// Per-query incremental EOWC aggregation state, keyed by query index.
     /// Initialized lazily on first EOWC cycle when the logical plan reveals
     /// the query contains a GROUP BY / aggregate.
@@ -255,6 +267,9 @@ impl StreamExecutor {
             eowc_states: FxHashMap::default(),
             agg_states: FxHashMap::default(),
             non_agg_queries: FxHashSet::default(),
+            plain_compiled: FxHashMap::default(),
+            cached_logical_plans: FxHashMap::default(),
+            cached_plan_fingerprints: FxHashMap::default(),
             eowc_agg_states: FxHashMap::default(),
             non_eowc_agg_queries: FxHashSet::default(),
             core_window_states: FxHashMap::default(),
@@ -501,7 +516,8 @@ impl StreamExecutor {
                 )
                 .await
             } else {
-                self.execute_standard_query(idx).await
+                self.execute_standard_query(idx, source_batches, &results)
+                    .await
             };
 
             // Queries that depend on other stream queries may fail during
@@ -619,7 +635,164 @@ impl StreamExecutor {
             let _ = self.ctx.deregister_table(&name);
         }
     }
+}
 
+/// Evaluate a compiled projection against source data.
+///
+/// Looks up the source table in both `source_batches` and `results`,
+/// then evaluates the projection against each batch.
+fn evaluate_compiled_projection(
+    proj: &CompiledProjection,
+    source_batches: &FxHashMap<String, Vec<RecordBatch>>,
+    results: &FxHashMap<String, Vec<RecordBatch>>,
+) -> Vec<RecordBatch> {
+    let batches = source_batches
+        .get(proj.source_table())
+        .or_else(|| results.get(proj.source_table()));
+    let Some(batches) = batches else {
+        return Vec::new();
+    };
+    let mut result = Vec::with_capacity(batches.len());
+    for batch in batches {
+        match proj.evaluate(batch) {
+            Ok(b) if b.num_rows() > 0 => result.push(b),
+            Ok(_) => {}
+            Err(e) => {
+                tracing::trace!(
+                    source = proj.source_table(),
+                    error = %e,
+                    "Compiled projection failed, skipping batch"
+                );
+            }
+        }
+    }
+    result
+}
+
+/// Information extracted from a simple Projection + Filter logical plan.
+struct ProjectionFilterInfo {
+    /// Projection expressions from the top-level Projection node.
+    proj_exprs: Vec<datafusion_expr::Expr>,
+    /// Optional WHERE predicate from a Filter node below the Projection.
+    filter_predicate: Option<datafusion_expr::Expr>,
+    /// `DFSchema` of the scan input (for compiling expressions).
+    input_df_schema: Arc<datafusion_common::DFSchema>,
+    /// Source table name from the `TableScan`.
+    source_table: String,
+}
+
+/// Walk an optimized `LogicalPlan` to extract a simple Projection + Filter shape.
+///
+/// Returns `Some` only for plans of the shape:
+///   `Projection? → Filter? → TableScan`
+/// (with optional `SubqueryAlias` wrappers).
+///
+/// Returns `None` if the plan has Sort, Limit, Distinct, Join, Aggregate,
+/// or any other node that `CompiledProjection` cannot handle.
+fn extract_projection_filter(plan: &LogicalPlan) -> Option<ProjectionFilterInfo> {
+    match plan {
+        LogicalPlan::Projection(proj) => {
+            let proj_exprs = proj.expr.clone();
+            extract_filter_or_scan(&proj.input).map(
+                |(filter_pred, input_schema, table_name)| ProjectionFilterInfo {
+                    proj_exprs,
+                    filter_predicate: filter_pred,
+                    input_df_schema: input_schema,
+                    source_table: table_name,
+                },
+            )
+        }
+        // No Projection wrapper — check for Filter → TableScan directly
+        _ => match extract_filter_or_scan(plan) {
+            Some((filter_pred, input_schema, table_name)) => {
+                // Build identity projection from the scan schema
+                let proj_exprs: Vec<datafusion_expr::Expr> = input_schema
+                    .fields()
+                    .iter()
+                    .map(|f| {
+                        datafusion_expr::Expr::Column(datafusion_common::Column::new_unqualified(
+                            f.name(),
+                        ))
+                    })
+                    .collect();
+                Some(ProjectionFilterInfo {
+                    proj_exprs,
+                    filter_predicate: filter_pred,
+                    input_df_schema: input_schema,
+                    source_table: table_name,
+                })
+            }
+            None => None,
+        },
+    }
+}
+
+/// Extract optional `Filter` predicate + `TableScan` from the inner plan.
+/// Returns `(optional_predicate, input_df_schema, table_name)`.
+fn extract_filter_or_scan(
+    plan: &LogicalPlan,
+) -> Option<(Option<datafusion_expr::Expr>, Arc<datafusion_common::DFSchema>, String)> {
+    match plan {
+        LogicalPlan::Filter(filter) => match &*filter.input {
+            LogicalPlan::TableScan(scan) => Some((
+                Some(filter.predicate.clone()),
+                Arc::clone(filter.input.schema()),
+                scan.table_name.to_string(),
+            )),
+            LogicalPlan::SubqueryAlias(alias) => {
+                if let LogicalPlan::TableScan(scan) = &*alias.input {
+                    Some((
+                        Some(filter.predicate.clone()),
+                        Arc::clone(filter.input.schema()),
+                        scan.table_name.to_string(),
+                    ))
+                } else {
+                    None
+                }
+            }
+            _ => None,
+        },
+        LogicalPlan::TableScan(scan) => Some((
+            None,
+            Arc::clone(plan.schema()),
+            scan.table_name.to_string(),
+        )),
+        LogicalPlan::SubqueryAlias(alias) => extract_filter_or_scan(&alias.input),
+        _ => None,
+    }
+}
+
+/// Compute a fast schema fingerprint from field names and types.
+fn schema_fingerprint(schema: &arrow::datatypes::Schema) -> u64 {
+    use std::hash::{Hash, Hasher};
+    let mut hasher = rustc_hash::FxHasher::default();
+    for field in schema.fields() {
+        field.name().hash(&mut hasher);
+        std::mem::discriminant(field.data_type()).hash(&mut hasher);
+    }
+    hasher.finish()
+}
+
+/// Compute a combined fingerprint of all source schemas that a query references.
+fn source_schemas_fingerprint(
+    table_refs: &FxHashSet<String>,
+    source_schemas: &FxHashMap<String, SchemaRef>,
+) -> u64 {
+    use std::hash::{Hash, Hasher};
+    let mut hasher = rustc_hash::FxHasher::default();
+    // Sort table names for deterministic hashing
+    let mut refs: Vec<&String> = table_refs.iter().collect();
+    refs.sort();
+    for name in refs {
+        name.hash(&mut hasher);
+        if let Some(schema) = source_schemas.get(name.as_str()) {
+            schema_fingerprint(schema).hash(&mut hasher);
+        }
+    }
+    hasher.finish()
+}
+
+impl StreamExecutor {
     /// Execute a standard (non-EOWC, non-ASOF) query.
     ///
     /// On the first call for each query, attempts to detect whether the query
@@ -627,17 +800,36 @@ impl StreamExecutor {
     /// `IncrementalAggState` and routes subsequent calls through incremental
     /// accumulators for correct running totals across cycles.
     ///
-    /// Non-aggregate queries continue using the existing `DataFusion`
-    /// `MemTable` + SQL execution path.
-    async fn execute_standard_query(&mut self, idx: usize) -> Result<Vec<RecordBatch>, DbError> {
+    /// Non-aggregate queries are optimized in two tiers:
+    /// 1. **Compiled projection**: Single-source SELECT+WHERE queries get compiled
+    ///    to `PhysicalExpr` evaluation (zero SQL overhead per cycle).
+    /// 2. **Cached logical plan**: Complex queries (ORDER BY, LIMIT, DISTINCT, JOINs)
+    ///    cache the optimized logical plan to skip parsing + optimization.
+    async fn execute_standard_query(
+        &mut self,
+        idx: usize,
+        source_batches: &FxHashMap<String, Vec<RecordBatch>>,
+        results: &FxHashMap<String, Vec<RecordBatch>>,
+    ) -> Result<Vec<RecordBatch>, DbError> {
         // Fast path: already have incremental agg state for this query
         if self.agg_states.contains_key(&idx) {
-            return self.execute_incremental_agg(idx).await;
+            return self.execute_incremental_agg(idx, source_batches, results).await;
+        }
+
+        // Fast path: already have compiled projection for this query
+        if self.plain_compiled.contains_key(&idx) {
+            let proj = &self.plain_compiled[&idx];
+            return Ok(evaluate_compiled_projection(proj, source_batches, results));
+        }
+
+        // Fast path: already have cached logical plan for this query
+        if self.cached_logical_plans.contains_key(&idx) {
+            return self.execute_cached_plan_query(idx).await;
         }
 
         // Fast path: already checked and found non-aggregate
         if self.non_agg_queries.contains(&idx) {
-            return self.execute_plain_query(idx).await;
+            return self.execute_plain_query_with_caching(idx).await;
         }
 
         // First call: try to initialize IncrementalAggState
@@ -647,12 +839,12 @@ impl StreamExecutor {
             Ok(Some(state)) => {
                 self.agg_states.insert(idx, state);
                 self.try_restore_pending_agg(idx);
-                self.execute_incremental_agg(idx).await
+                self.execute_incremental_agg(idx, source_batches, results).await
             }
             Ok(None) => {
-                // Not an aggregation query — use standard path
+                // Not an aggregation query — try compiled projection or plan caching
                 self.non_agg_queries.insert(idx);
-                self.execute_plain_query(idx).await
+                self.try_compile_plain_query(idx, source_batches, results).await
             }
             Err(e) => {
                 // Plan introspection failed — fall back to standard path
@@ -662,55 +854,238 @@ impl StreamExecutor {
                     "Could not introspect query plan, using per-batch execution"
                 );
                 self.non_agg_queries.insert(idx);
-                self.execute_plain_query(idx).await
+                self.execute_plain_query_with_caching(idx).await
             }
         }
     }
 
-    /// Execute a non-aggregate query via `DataFusion` SQL.
-    async fn execute_plain_query(&self, idx: usize) -> Result<Vec<RecordBatch>, DbError> {
-        let query_name = &self.queries[idx].name;
-        let query_sql = &self.queries[idx].sql;
+    /// First-call path for non-aggregate queries: attempt to compile a projection
+    /// or cache the logical plan, then execute.
+    async fn try_compile_plain_query(
+        &mut self,
+        idx: usize,
+        source_batches: &FxHashMap<String, Vec<RecordBatch>>,
+        results: &FxHashMap<String, Vec<RecordBatch>>,
+    ) -> Result<Vec<RecordBatch>, DbError> {
+        let query_sql = self.queries[idx].sql.clone();
+        let query_name = self.queries[idx].name.clone();
+        let table_refs = &self.queries[idx].table_refs;
+
+        // Only attempt compiled projection for single-source queries
+        if table_refs.len() != 1 {
+            return self.execute_plain_query_with_caching(idx).await;
+        }
+
+        // Plan the query to get the optimized logical plan
         let df = self
             .ctx
-            .sql(query_sql)
+            .sql(&query_sql)
             .await
-            .map_err(|e| DbError::query_pipeline(query_name, &e))?;
+            .map_err(|e| DbError::query_pipeline(&query_name, &e))?;
+
+        let plan = df.logical_plan();
+        if let Some(proj) = self.try_build_compiled_projection(plan) {
+            let result = evaluate_compiled_projection(&proj, source_batches, results);
+            self.plain_compiled.insert(idx, proj);
+            tracing::debug!(
+                query = %query_name,
+                "Compiled non-aggregate single-source query to PhysicalExpr"
+            );
+            return Ok(result);
+        }
+
+        // Could not compile — cache the logical plan instead
+        let plan = df.logical_plan().clone();
+        let fingerprint = source_schemas_fingerprint(table_refs, &self.source_schemas);
+        self.cached_logical_plans.insert(idx, plan);
+        self.cached_plan_fingerprints.insert(idx, fingerprint);
+        tracing::debug!(
+            query = %query_name,
+            "Cached optimized logical plan for complex non-aggregate query"
+        );
         df.collect()
             .await
-            .map_err(|e| DbError::query_pipeline(query_name, &e))
+            .map_err(|e| DbError::query_pipeline(&query_name, &e))
     }
+
+    /// Try to build a `CompiledProjection` from a logical plan.
+    ///
+    /// Returns `Some` if the plan is a simple Projection + Filter over a single
+    /// `TableScan` and all expressions compile to `PhysicalExpr`.
+    fn try_build_compiled_projection(&self, plan: &LogicalPlan) -> Option<CompiledProjection> {
+        let info = extract_projection_filter(plan)?;
+        let state = self.ctx.state();
+        let props = state.execution_props();
+        let mut compiled_exprs = Vec::with_capacity(info.proj_exprs.len());
+        let mut proj_fields = Vec::with_capacity(info.proj_exprs.len());
+
+        for expr in &info.proj_exprs {
+            let phys = datafusion::physical_expr::create_physical_expr(
+                expr,
+                &info.input_df_schema,
+                props,
+            )
+            .ok()?;
+            let dt = phys
+                .data_type(info.input_df_schema.as_arrow())
+                .unwrap_or(DataType::Utf8);
+            let name = match expr {
+                datafusion_expr::Expr::Column(col) => col.name.clone(),
+                datafusion_expr::Expr::Alias(alias) => alias.name.clone(),
+                _ => expr.schema_name().to_string(),
+            };
+            proj_fields.push(arrow::datatypes::Field::new(name, dt, true));
+            compiled_exprs.push(phys);
+        }
+
+        // Compile filter predicate if present
+        let compiled_filter = if let Some(ref pred) = info.filter_predicate {
+            Some(
+                datafusion::physical_expr::create_physical_expr(
+                    pred,
+                    &info.input_df_schema,
+                    props,
+                )
+                .ok()?,
+            )
+        } else {
+            None
+        };
+
+        let output_schema = Arc::new(arrow::datatypes::Schema::new(proj_fields));
+        Some(CompiledProjection {
+            source_table: info.source_table,
+            exprs: compiled_exprs,
+            filter: compiled_filter,
+            output_schema,
+        })
+    }
+
+    /// Execute a non-aggregate query, caching the optimized logical plan on first call.
+    async fn execute_plain_query_with_caching(
+        &mut self,
+        idx: usize,
+    ) -> Result<Vec<RecordBatch>, DbError> {
+        // Already cached → use cached plan path
+        if self.cached_logical_plans.contains_key(&idx) {
+            return self.execute_cached_plan_query(idx).await;
+        }
+
+        // First call — plan from SQL and cache
+        let query_name = self.queries[idx].name.clone();
+        let query_sql = self.queries[idx].sql.clone();
+        let df = self
+            .ctx
+            .sql(&query_sql)
+            .await
+            .map_err(|e| DbError::query_pipeline(&query_name, &e))?;
+
+        let plan = df.logical_plan().clone();
+        let table_refs = &self.queries[idx].table_refs;
+        let fingerprint = source_schemas_fingerprint(table_refs, &self.source_schemas);
+        self.cached_logical_plans.insert(idx, plan);
+        self.cached_plan_fingerprints.insert(idx, fingerprint);
+
+        df.collect()
+            .await
+            .map_err(|e| DbError::query_pipeline(&query_name, &e))
+    }
+
+    /// Execute a query using a cached optimized logical plan.
+    ///
+    /// Skips SQL parsing and logical optimization. Only physical planning
+    /// runs per cycle, producing fresh physical operators with no stale state.
+    async fn execute_cached_plan_query(&mut self, idx: usize) -> Result<Vec<RecordBatch>, DbError> {
+        let query_name = self.queries[idx].name.clone();
+        let query_sql = self.queries[idx].sql.clone();
+        let table_refs = &self.queries[idx].table_refs;
+
+        // Schema guard: invalidate cache if source schema changed
+        let current_fingerprint = source_schemas_fingerprint(table_refs, &self.source_schemas);
+        if let Some(&cached_fp) = self.cached_plan_fingerprints.get(&idx) {
+            if cached_fp != current_fingerprint {
+                tracing::debug!(
+                    query = %query_name,
+                    "Source schema changed, invalidating cached logical plan"
+                );
+                self.cached_logical_plans.remove(&idx);
+                self.cached_plan_fingerprints.remove(&idx);
+                // Re-plan from SQL and re-cache
+                let df = self
+                    .ctx
+                    .sql(&query_sql)
+                    .await
+                    .map_err(|e| DbError::query_pipeline(&query_name, &e))?;
+                let plan = df.logical_plan().clone();
+                self.cached_logical_plans.insert(idx, plan);
+                self.cached_plan_fingerprints.insert(idx, current_fingerprint);
+                return df
+                    .collect()
+                    .await
+                    .map_err(|e| DbError::query_pipeline(&query_name, &e));
+            }
+        }
+
+        let plan = self.cached_logical_plans.get(&idx).ok_or_else(|| {
+            DbError::Pipeline(format!(
+                "internal: missing cached_logical_plan for query index {idx}"
+            ))
+        })?;
+
+        let physical = self
+            .ctx
+            .state()
+            .create_physical_plan(plan)
+            .await
+            .map_err(|e| DbError::query_pipeline(&query_name, &e))?;
+
+        let task_ctx = self.ctx.task_ctx();
+        datafusion::physical_plan::collect(physical, task_ctx)
+            .await
+            .map_err(|e| DbError::query_pipeline(&query_name, &e))
+    }
+
 
     /// Execute an aggregation query using incremental accumulators.
     ///
     /// Runs the pre-aggregation SQL (projection only) through `DataFusion`,
     /// then feeds the result to per-group accumulators. Emits running
     /// aggregate totals.
-    async fn execute_incremental_agg(&mut self, idx: usize) -> Result<Vec<RecordBatch>, DbError> {
+    async fn execute_incremental_agg(
+        &mut self,
+        idx: usize,
+        source_batches: &FxHashMap<String, Vec<RecordBatch>>,
+        results: &FxHashMap<String, Vec<RecordBatch>>,
+    ) -> Result<Vec<RecordBatch>, DbError> {
         let query_name = self.queries[idx].name.clone();
 
         let agg_state = self.agg_states.get(&idx).ok_or_else(|| {
             DbError::Pipeline(format!("internal: missing agg_state for query index {idx}"))
         })?;
-        let pre_agg_sql = agg_state.pre_agg_sql().to_string();
 
-        let pre_agg_batches = match self.ctx.sql(&pre_agg_sql).await {
-            Ok(df) => df
-                .collect()
-                .await
-                .map_err(|e| DbError::query_pipeline(&query_name, &e))?,
-            Err(e) => {
-                // Pre-agg SQL failed (e.g., no source data this cycle)
-                // — emit current state without updating
-                tracing::trace!(
-                    query = %query_name,
-                    error = %e,
-                    "Pre-agg SQL failed, emitting current state"
-                );
-                let agg_state = self.agg_states.get_mut(&idx).ok_or_else(|| {
-                    DbError::Pipeline(format!("internal: missing agg_state for query index {idx}"))
-                })?;
-                return agg_state.emit();
+        // Use compiled projection if available, otherwise fall back to SQL.
+        let pre_agg_batches = if let Some(proj) = agg_state.compiled_projection() {
+            evaluate_compiled_projection(proj, source_batches, results)
+        } else {
+            let pre_agg_sql = agg_state.pre_agg_sql().to_string();
+            match self.ctx.sql(&pre_agg_sql).await {
+                Ok(df) => df
+                    .collect()
+                    .await
+                    .map_err(|e| DbError::query_pipeline(&query_name, &e))?,
+                Err(e) => {
+                    tracing::trace!(
+                        query = %query_name,
+                        error = %e,
+                        "Pre-agg SQL failed, emitting current state"
+                    );
+                    let agg_state = self.agg_states.get_mut(&idx).ok_or_else(|| {
+                        DbError::Pipeline(format!(
+                            "internal: missing agg_state for query index {idx}"
+                        ))
+                    })?;
+                    return agg_state.emit();
+                }
             }
         };
 
@@ -721,11 +1096,14 @@ impl StreamExecutor {
             agg_state.process_batch(batch)?;
         }
 
+        let having_filter = agg_state.having_filter().cloned();
         let having_sql = agg_state.having_sql().map(String::from);
         let mut batches = agg_state.emit()?;
 
-        // Apply HAVING filter post-emission
-        if let Some(having_sql) = having_sql {
+        // Apply HAVING filter post-emission (compiled or SQL fallback)
+        if let Some(ref filter) = having_filter {
+            batches = apply_compiled_having(&batches, filter)?;
+        } else if let Some(having_sql) = having_sql {
             batches = self
                 .apply_having_filter(&query_name, &batches, &having_sql)
                 .await?;
@@ -788,30 +1166,32 @@ impl StreamExecutor {
         idx: usize,
         query_name: &str,
         current_watermark: i64,
+        source_batches: &FxHashMap<String, Vec<RecordBatch>>,
+        results: &FxHashMap<String, Vec<RecordBatch>>,
     ) -> Result<Vec<RecordBatch>, DbError> {
-        let pre_agg_sql = self
-            .eowc_agg_states
-            .get(&idx)
-            .ok_or_else(|| {
-                DbError::Pipeline(format!(
-                    "internal: missing eowc_agg_state for query index {idx}"
-                ))
-            })?
-            .pre_agg_sql()
-            .to_string();
+        let eowc_state = self.eowc_agg_states.get(&idx).ok_or_else(|| {
+            DbError::Pipeline(format!(
+                "internal: missing eowc_agg_state for query index {idx}"
+            ))
+        })?;
 
-        let pre_agg_batches = match self.ctx.sql(&pre_agg_sql).await {
-            Ok(df) => df
-                .collect()
-                .await
-                .map_err(|e| DbError::query_pipeline(query_name, &e))?,
-            Err(e) => {
-                tracing::trace!(
-                    query = %query_name,
-                    error = %e,
-                    "EOWC pre-agg SQL failed, skipping update"
-                );
-                Vec::new()
+        let pre_agg_batches = if let Some(proj) = eowc_state.compiled_projection() {
+            evaluate_compiled_projection(proj, source_batches, results)
+        } else {
+            let pre_agg_sql = eowc_state.pre_agg_sql().to_string();
+            match self.ctx.sql(&pre_agg_sql).await {
+                Ok(df) => df
+                    .collect()
+                    .await
+                    .map_err(|e| DbError::query_pipeline(query_name, &e))?,
+                Err(e) => {
+                    tracing::trace!(
+                        query = %query_name,
+                        error = %e,
+                        "EOWC pre-agg SQL failed, skipping update"
+                    );
+                    Vec::new()
+                }
             }
         };
 
@@ -824,11 +1204,14 @@ impl StreamExecutor {
             eowc_state.update_batch(batch)?;
         }
 
+        let having_filter = eowc_state.having_filter().cloned();
         let having_sql = eowc_state.having_sql().map(String::from);
         let mut batches = eowc_state.close_windows(current_watermark)?;
 
-        // Apply HAVING filter if present
-        if let Some(having_sql) = having_sql {
+        // Apply HAVING filter (compiled or SQL fallback)
+        if let Some(ref filter) = having_filter {
+            batches = apply_compiled_having(&batches, filter)?;
+        } else if let Some(having_sql) = having_sql {
             batches = self
                 .apply_having_filter(query_name, &batches, &having_sql)
                 .await?;
@@ -847,28 +1230,30 @@ impl StreamExecutor {
         idx: usize,
         query_name: &str,
         current_watermark: i64,
+        source_batches: &FxHashMap<String, Vec<RecordBatch>>,
+        results: &FxHashMap<String, Vec<RecordBatch>>,
     ) -> Result<Vec<RecordBatch>, DbError> {
-        let pre_agg_sql = self
-            .core_window_states
-            .get(&idx)
-            .ok_or_else(|| {
-                DbError::Pipeline(format!("internal: missing cw_state for query index {idx}"))
-            })?
-            .pre_agg_sql()
-            .to_string();
+        let cw_state = self.core_window_states.get(&idx).ok_or_else(|| {
+            DbError::Pipeline(format!("internal: missing cw_state for query index {idx}"))
+        })?;
 
-        let pre_agg_batches = match self.ctx.sql(&pre_agg_sql).await {
-            Ok(df) => df
-                .collect()
-                .await
-                .map_err(|e| DbError::query_pipeline(query_name, &e))?,
-            Err(e) => {
-                tracing::trace!(
-                    query = %query_name,
-                    error = %e,
-                    "core window pre-agg SQL failed, skipping update"
-                );
-                Vec::new()
+        let pre_agg_batches = if let Some(proj) = cw_state.compiled_projection() {
+            evaluate_compiled_projection(proj, source_batches, results)
+        } else {
+            let pre_agg_sql = cw_state.pre_agg_sql().to_string();
+            match self.ctx.sql(&pre_agg_sql).await {
+                Ok(df) => df
+                    .collect()
+                    .await
+                    .map_err(|e| DbError::query_pipeline(query_name, &e))?,
+                Err(e) => {
+                    tracing::trace!(
+                        query = %query_name,
+                        error = %e,
+                        "core window pre-agg SQL failed, skipping update"
+                    );
+                    Vec::new()
+                }
             }
         };
 
@@ -879,11 +1264,14 @@ impl StreamExecutor {
             cw_state.update_batch(batch)?;
         }
 
+        let having_filter = cw_state.having_filter().cloned();
         let having_sql = cw_state.having_sql().map(String::from);
         let mut batches = cw_state.close_windows(current_watermark)?;
 
-        // Apply HAVING filter if present
-        if let Some(having_sql) = having_sql {
+        // Apply HAVING filter (compiled or SQL fallback)
+        if let Some(ref filter) = having_filter {
+            batches = apply_compiled_having(&batches, filter)?;
+        } else if let Some(having_sql) = having_sql {
             batches = self
                 .apply_having_filter(query_name, &batches, &having_sql)
                 .await?;
@@ -916,7 +1304,13 @@ impl StreamExecutor {
                 // ── core window fast path: already routed ──
                 if self.core_window_states.contains_key(&idx) {
                     return self
-                        .execute_core_window_query(idx, query_name, current_watermark)
+                        .execute_core_window_query(
+                            idx,
+                            query_name,
+                            current_watermark,
+                            source_batches,
+                            intermediate_results,
+                        )
                         .await;
                 }
 
@@ -940,7 +1334,13 @@ impl StreamExecutor {
                             self.core_window_states.insert(idx, state);
                             self.try_restore_pending_core_window(idx);
                             return self
-                                .execute_core_window_query(idx, query_name, current_watermark)
+                                .execute_core_window_query(
+                            idx,
+                            query_name,
+                            current_watermark,
+                            source_batches,
+                            intermediate_results,
+                        )
                                 .await;
                         }
                         Ok(None) => {
@@ -961,7 +1361,13 @@ impl StreamExecutor {
                 // ── IncrementalEowcState fast path: already have state ──
                 if self.eowc_agg_states.contains_key(&idx) {
                     return self
-                        .execute_incremental_eowc(idx, query_name, current_watermark)
+                        .execute_incremental_eowc(
+                            idx,
+                            query_name,
+                            current_watermark,
+                            source_batches,
+                            intermediate_results,
+                        )
                         .await;
                 }
 
@@ -994,7 +1400,13 @@ impl StreamExecutor {
                             self.eowc_agg_states.insert(idx, state);
                             self.try_restore_pending_eowc(idx);
                             return self
-                                .execute_incremental_eowc(idx, query_name, current_watermark)
+                                .execute_incremental_eowc(
+                            idx,
+                            query_name,
+                            current_watermark,
+                            source_batches,
+                            intermediate_results,
+                        )
                                 .await;
                         }
                         Ok(None) => {
@@ -2438,13 +2850,15 @@ mod tests {
             .unwrap();
         assert!(r1.contains_key("pass"));
 
-        // Second cycle with no data — table was cleaned up, so query fails
+        // Second cycle with no data — compiled projection returns empty results
+        // (no SQL execution needed, so no table-not-found error)
         let empty = FxHashMap::default();
-        let r2 = executor.execute_cycle(&empty, i64::MAX).await;
-        assert!(
-            r2.is_err(),
-            "query referencing cleaned-up table should fail"
-        );
+        let r2 = executor.execute_cycle(&empty, i64::MAX).await.unwrap();
+        let pass_rows: usize = r2
+            .get("pass")
+            .map(|bs| bs.iter().map(|b| b.num_rows()).sum())
+            .unwrap_or(0);
+        assert_eq!(pass_rows, 0, "no source data should produce no output");
     }
 
     #[tokio::test]
