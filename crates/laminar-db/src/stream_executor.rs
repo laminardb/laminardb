@@ -693,14 +693,14 @@ fn extract_projection_filter(plan: &LogicalPlan) -> Option<ProjectionFilterInfo>
     match plan {
         LogicalPlan::Projection(proj) => {
             let proj_exprs = proj.expr.clone();
-            extract_filter_or_scan(&proj.input).map(
-                |(filter_pred, input_schema, table_name)| ProjectionFilterInfo {
+            extract_filter_or_scan(&proj.input).map(|(filter_pred, input_schema, table_name)| {
+                ProjectionFilterInfo {
                     proj_exprs,
                     filter_predicate: filter_pred,
                     input_df_schema: input_schema,
                     source_table: table_name,
-                },
-            )
+                }
+            })
         }
         // No Projection wrapper — check for Filter → TableScan directly
         _ => match extract_filter_or_scan(plan) {
@@ -731,7 +731,11 @@ fn extract_projection_filter(plan: &LogicalPlan) -> Option<ProjectionFilterInfo>
 /// Returns `(optional_predicate, input_df_schema, table_name)`.
 fn extract_filter_or_scan(
     plan: &LogicalPlan,
-) -> Option<(Option<datafusion_expr::Expr>, Arc<datafusion_common::DFSchema>, String)> {
+) -> Option<(
+    Option<datafusion_expr::Expr>,
+    Arc<datafusion_common::DFSchema>,
+    String,
+)> {
     match plan {
         LogicalPlan::Filter(filter) => match &*filter.input {
             LogicalPlan::TableScan(scan) => Some((
@@ -752,11 +756,9 @@ fn extract_filter_or_scan(
             }
             _ => None,
         },
-        LogicalPlan::TableScan(scan) => Some((
-            None,
-            Arc::clone(plan.schema()),
-            scan.table_name.to_string(),
-        )),
+        LogicalPlan::TableScan(scan) => {
+            Some((None, Arc::clone(plan.schema()), scan.table_name.to_string()))
+        }
         LogicalPlan::SubqueryAlias(alias) => extract_filter_or_scan(&alias.input),
         _ => None,
     }
@@ -813,7 +815,9 @@ impl StreamExecutor {
     ) -> Result<Vec<RecordBatch>, DbError> {
         // Fast path: already have incremental agg state for this query
         if self.agg_states.contains_key(&idx) {
-            return self.execute_incremental_agg(idx, source_batches, results).await;
+            return self
+                .execute_incremental_agg(idx, source_batches, results)
+                .await;
         }
 
         // Fast path: already have compiled projection for this query
@@ -839,12 +843,14 @@ impl StreamExecutor {
             Ok(Some(state)) => {
                 self.agg_states.insert(idx, state);
                 self.try_restore_pending_agg(idx);
-                self.execute_incremental_agg(idx, source_batches, results).await
+                self.execute_incremental_agg(idx, source_batches, results)
+                    .await
             }
             Ok(None) => {
                 // Not an aggregation query — try compiled projection or plan caching
                 self.non_agg_queries.insert(idx);
-                self.try_compile_plain_query(idx, source_batches, results).await
+                self.try_compile_plain_query(idx, source_batches, results)
+                    .await
             }
             Err(e) => {
                 // Plan introspection failed — fall back to standard path
@@ -920,12 +926,9 @@ impl StreamExecutor {
         let mut proj_fields = Vec::with_capacity(info.proj_exprs.len());
 
         for expr in &info.proj_exprs {
-            let phys = datafusion::physical_expr::create_physical_expr(
-                expr,
-                &info.input_df_schema,
-                props,
-            )
-            .ok()?;
+            let phys =
+                datafusion::physical_expr::create_physical_expr(expr, &info.input_df_schema, props)
+                    .ok()?;
             let dt = phys
                 .data_type(info.input_df_schema.as_arrow())
                 .unwrap_or(DataType::Utf8);
@@ -941,12 +944,8 @@ impl StreamExecutor {
         // Compile filter predicate if present
         let compiled_filter = if let Some(ref pred) = info.filter_predicate {
             Some(
-                datafusion::physical_expr::create_physical_expr(
-                    pred,
-                    &info.input_df_schema,
-                    props,
-                )
-                .ok()?,
+                datafusion::physical_expr::create_physical_expr(pred, &info.input_df_schema, props)
+                    .ok()?,
             )
         } else {
             None
@@ -1018,7 +1017,8 @@ impl StreamExecutor {
                     .map_err(|e| DbError::query_pipeline(&query_name, &e))?;
                 let plan = df.logical_plan().clone();
                 self.cached_logical_plans.insert(idx, plan);
-                self.cached_plan_fingerprints.insert(idx, current_fingerprint);
+                self.cached_plan_fingerprints
+                    .insert(idx, current_fingerprint);
                 return df
                     .collect()
                     .await
@@ -1044,7 +1044,6 @@ impl StreamExecutor {
             .await
             .map_err(|e| DbError::query_pipeline(&query_name, &e))
     }
-
 
     /// Execute an aggregation query using incremental accumulators.
     ///
@@ -1335,12 +1334,12 @@ impl StreamExecutor {
                             self.try_restore_pending_core_window(idx);
                             return self
                                 .execute_core_window_query(
-                            idx,
-                            query_name,
-                            current_watermark,
-                            source_batches,
-                            intermediate_results,
-                        )
+                                    idx,
+                                    query_name,
+                                    current_watermark,
+                                    source_batches,
+                                    intermediate_results,
+                                )
                                 .await;
                         }
                         Ok(None) => {
@@ -1401,12 +1400,12 @@ impl StreamExecutor {
                             self.try_restore_pending_eowc(idx);
                             return self
                                 .execute_incremental_eowc(
-                            idx,
-                            query_name,
-                            current_watermark,
-                            source_batches,
-                            intermediate_results,
-                        )
+                                    idx,
+                                    query_name,
+                                    current_watermark,
+                                    source_batches,
+                                    intermediate_results,
+                                )
                                 .await;
                         }
                         Ok(None) => {

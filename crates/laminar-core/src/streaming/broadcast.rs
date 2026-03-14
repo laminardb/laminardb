@@ -41,7 +41,7 @@ use std::cell::UnsafeCell;
 use std::sync::atomic::{AtomicBool, AtomicU64, AtomicUsize, Ordering};
 use std::time::Duration;
 
-use crate::tpc::CachePadded;
+use crate::alloc::CachePadded;
 
 /// Default buffer capacity (power of 2).
 pub const DEFAULT_BROADCAST_CAPACITY: usize = 1024;

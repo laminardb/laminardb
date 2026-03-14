@@ -20,7 +20,7 @@ use smallvec::SmallVec;
 use super::bridge::{BridgeError, RowBatchBridge};
 use super::policy::{BatchPolicy, BridgeOverflow};
 use super::row::{EventRow, RowSchema};
-use crate::tpc::SpscQueue;
+use crate::alloc::SpscQueue;
 
 // ────────────────────────────── Errors ──────────────────────────────
 

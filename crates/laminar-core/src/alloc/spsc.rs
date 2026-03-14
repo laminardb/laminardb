@@ -1,7 +1,7 @@
 //! # SPSC Queue
 //!
-//! Lock-free single-producer single-consumer bounded queue optimized for
-//! inter-core communication in thread-per-core architectures.
+//! Lock-free single-producer single-consumer bounded queue and cache-line
+//! padding primitives for high-performance concurrent data structures.
 //!
 //! ## Design
 //!
@@ -29,7 +29,7 @@ use std::sync::atomic::{AtomicUsize, Ordering};
 /// # Example
 ///
 /// ```rust
-/// use laminar_core::tpc::CachePadded;
+/// use laminar_core::alloc::CachePadded;
 /// use std::sync::atomic::AtomicUsize;
 ///
 /// // Each counter gets its own cache line pair
@@ -125,7 +125,7 @@ impl<T: std::fmt::Debug> std::fmt::Debug for CachePadded<T> {
 /// # Example
 ///
 /// ```rust
-/// use laminar_core::tpc::SpscQueue;
+/// use laminar_core::alloc::SpscQueue;
 ///
 /// let queue: SpscQueue<i32> = SpscQueue::new(1024);
 ///
@@ -340,7 +340,7 @@ impl<T> SpscQueue<T> {
     /// # Example
     ///
     /// ```rust
-    /// use laminar_core::tpc::SpscQueue;
+    /// use laminar_core::alloc::SpscQueue;
     /// use std::mem::MaybeUninit;
     ///
     /// let queue: SpscQueue<i32> = SpscQueue::new(16);
@@ -416,7 +416,7 @@ impl<T> SpscQueue<T> {
     /// # Example
     ///
     /// ```rust
-    /// use laminar_core::tpc::SpscQueue;
+    /// use laminar_core::alloc::SpscQueue;
     ///
     /// let queue: SpscQueue<i32> = SpscQueue::new(16);
     /// queue.push(1).unwrap();

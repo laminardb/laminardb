@@ -97,23 +97,11 @@ tokio = { workspace = true, features = ["test-util", "macros"] }
 tempfile = { workspace = true }
 
 [[bench]]
-name = "reactor_bench"
-harness = false
-
-[[bench]]
 name = "state_bench"
 harness = false
 
 [[bench]]
-name = "throughput_bench"
-harness = false
-
-[[bench]]
 name = "window_bench"
-harness = false
-
-[[bench]]
-name = "tpc_bench"
 harness = false
 
 [[bench]]

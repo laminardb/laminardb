@@ -30,12 +30,14 @@ fn bench_schema() -> SchemaRef {
 /// Generate a synthetic batch of the given size.
 fn synthetic_batch(rows: usize) -> RecordBatch {
     let ids: Vec<i64> = (0..rows as i64).collect();
-    let regions: Vec<&str> = (0..rows).map(|i| match i % 4 {
-        0 => "us-east",
-        1 => "us-west",
-        2 => "eu-west",
-        _ => "ap-south",
-    }).collect();
+    let regions: Vec<&str> = (0..rows)
+        .map(|i| match i % 4 {
+            0 => "us-east",
+            1 => "us-west",
+            2 => "eu-west",
+            _ => "ap-south",
+        })
+        .collect();
     let prices: Vec<f64> = (0..rows).map(|i| 10.0 + (i as f64) * 0.1).collect();
     let quantities: Vec<i64> = (0..rows).map(|i| (i % 100) as i64 + 1).collect();
     let timestamps: Vec<i64> = (0..rows).map(|i| 1_000_000 + i as i64).collect();

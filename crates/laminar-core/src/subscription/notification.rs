@@ -16,8 +16,8 @@
 use std::cell::UnsafeCell;
 use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 
+use crate::alloc::CachePadded;
 use crate::subscription::event::{EventType, NotificationRef};
-use crate::tpc::CachePadded;
 
 // ---------------------------------------------------------------------------
 // NotificationSlot — per-source atomic sequence counter

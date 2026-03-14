@@ -379,7 +379,11 @@ impl CoreWindowState {
                                             ScalarValue::Null,
                                         ))),
                                     });
-                                match create_physical_expr(&case_expr, input_df_schema, compile_props) {
+                                match create_physical_expr(
+                                    &case_expr,
+                                    input_df_schema,
+                                    compile_props,
+                                ) {
                                     Ok(phys) => {
                                         let dt = resolve_expr_type(
                                             arg_expr,
@@ -402,7 +406,8 @@ impl CoreWindowState {
 
                             // Compile the arg expression directly
                             if compile_ok {
-                                match create_physical_expr(arg_expr, input_df_schema, compile_props) {
+                                match create_physical_expr(arg_expr, input_df_schema, compile_props)
+                                {
                                     Ok(phys) => {
                                         let dt = resolve_expr_type(
                                             arg_expr,
@@ -437,15 +442,14 @@ impl CoreWindowState {
 
                     // Compile: CASE WHEN filter THEN TRUE ELSE FALSE END
                     if compile_ok {
-                        let case_expr =
-                            datafusion_expr::Expr::Case(datafusion_expr::expr::Case {
-                                expr: None,
-                                when_then_expr: vec![(
-                                    Box::new(filter_expr.as_ref().clone()),
-                                    Box::new(datafusion_expr::lit(true)),
-                                )],
-                                else_expr: Some(Box::new(datafusion_expr::lit(false))),
-                            });
+                        let case_expr = datafusion_expr::Expr::Case(datafusion_expr::expr::Case {
+                            expr: None,
+                            when_then_expr: vec![(
+                                Box::new(filter_expr.as_ref().clone()),
+                                Box::new(datafusion_expr::lit(true)),
+                            )],
+                            else_expr: Some(Box::new(datafusion_expr::lit(false))),
+                        });
                         match create_physical_expr(&case_expr, input_df_schema, compile_props) {
                             Ok(phys) => {
                                 proj_fields.push(Field::new(
@@ -564,9 +568,10 @@ impl CoreWindowState {
         let post_projection = if let Some((proj_exprs, agg_df_schema)) = projection_info {
             let mut compiled = Vec::with_capacity(proj_exprs.len());
             for expr in proj_exprs {
-                let phys = create_physical_expr(expr, &agg_df_schema, compile_props).map_err(
-                    |e| DbError::Pipeline(format!("compile post-aggregate projection: {e}")),
-                )?;
+                let phys =
+                    create_physical_expr(expr, &agg_df_schema, compile_props).map_err(|e| {
+                        DbError::Pipeline(format!("compile post-aggregate projection: {e}"))
+                    })?;
                 compiled.push(phys);
             }
             let mut final_fields = vec![
@@ -588,8 +593,7 @@ impl CoreWindowState {
         };
 
         // Compile HAVING filter.
-        let having_filter =
-            compile_having_filter(ctx, having_predicate.as_ref(), &output_schema);
+        let having_filter = compile_having_filter(ctx, having_predicate.as_ref(), &output_schema);
         let having_sql = if having_filter.is_none() {
             having_predicate.as_ref().map(expr_to_sql)
         } else {

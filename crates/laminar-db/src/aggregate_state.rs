@@ -711,15 +711,14 @@ impl IncrementalAggState {
 
                     // Compile: CASE WHEN filter THEN TRUE ELSE FALSE END
                     if compile_ok {
-                        let case_expr =
-                            datafusion_expr::Expr::Case(datafusion_expr::expr::Case {
-                                expr: None,
-                                when_then_expr: vec![(
-                                    Box::new(filter_expr.as_ref().clone()),
-                                    Box::new(datafusion_expr::lit(true)),
-                                )],
-                                else_expr: Some(Box::new(datafusion_expr::lit(false))),
-                            });
+                        let case_expr = datafusion_expr::Expr::Case(datafusion_expr::expr::Case {
+                            expr: None,
+                            when_then_expr: vec![(
+                                Box::new(filter_expr.as_ref().clone()),
+                                Box::new(datafusion_expr::lit(true)),
+                            )],
+                            else_expr: Some(Box::new(datafusion_expr::lit(false))),
+                        });
                         match create_physical_expr(&case_expr, input_df_schema, props) {
                             Ok(phys) => {
                                 proj_fields.push(Field::new(
@@ -808,8 +807,7 @@ impl IncrementalAggState {
         let output_schema = Arc::new(Schema::new(output_fields));
 
         // Compile HAVING filter.
-        let having_filter =
-            compile_having_filter(ctx, having_predicate.as_ref(), &output_schema);
+        let having_filter = compile_having_filter(ctx, having_predicate.as_ref(), &output_schema);
         let having_sql = if having_filter.is_none() {
             having_predicate.as_ref().map(expr_to_sql)
         } else {

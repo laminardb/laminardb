@@ -192,7 +192,6 @@ impl From<arrow_schema::ArrowError> for OperatorError {
     }
 }
 
-
 pub mod asof_join;
 pub mod changelog;
 pub mod lag_lead;

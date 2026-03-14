@@ -22,6 +22,9 @@
 
 mod guard;
 mod ring_buffer;
+/// Lock-free SPSC queue and cache-line padding.
+pub mod spsc;
 
 pub use guard::HotPathGuard;
 pub use ring_buffer::RingBuffer;
+pub use spsc::{CachePadded, SpscQueue};
