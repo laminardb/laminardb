@@ -1072,6 +1072,11 @@ impl CoreWindowState {
         Ok(result)
     }
 
+    /// Output schema for windowed aggregate results.
+    pub(crate) fn output_schema(&self) -> Arc<arrow::datatypes::Schema> {
+        Arc::clone(&self.output_schema)
+    }
+
     /// Pre-aggregation SQL.
     pub fn pre_agg_sql(&self) -> &str {
         &self.pre_agg_sql

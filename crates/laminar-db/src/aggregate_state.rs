@@ -859,6 +859,11 @@ impl IncrementalAggState {
         Ok(vec![batch])
     }
 
+    /// Output schema (group columns + aggregate results).
+    pub(crate) fn output_schema(&self) -> Arc<Schema> {
+        Arc::clone(&self.output_schema)
+    }
+
     /// Pre-aggregation SQL.
     pub fn pre_agg_sql(&self) -> &str {
         &self.pre_agg_sql
