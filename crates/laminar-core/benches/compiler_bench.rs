@@ -20,7 +20,7 @@ use criterion::{criterion_group, criterion_main, Criterion, Throughput};
 use laminar_core::compiler::error::CompileError;
 use laminar_core::compiler::pipeline::{CompiledPipeline, PipelineId};
 use laminar_core::compiler::pipeline_bridge::create_pipeline_bridge;
-use laminar_core::compiler::policy::{BackpressureStrategy, BatchPolicy};
+use laminar_core::compiler::policy::{BatchPolicy, BridgeOverflow};
 use laminar_core::compiler::row::{MutableEventRow, RowSchema};
 use laminar_core::compiler::{ExecutablePipeline, StreamingQuery, StreamingQueryBuilder};
 
@@ -67,7 +67,7 @@ fn make_compiled_emit(
         4096,
         1024,
         BatchPolicy::default(),
-        BackpressureStrategy::DropNewest,
+        BridgeOverflow::DropNewest,
     )
     .unwrap();
     (exec, bridge, consumer, Arc::clone(schema))
@@ -98,7 +98,7 @@ fn make_compiled_drop(
         4096,
         1024,
         BatchPolicy::default(),
-        BackpressureStrategy::DropNewest,
+        BridgeOverflow::DropNewest,
     )
     .unwrap();
     (exec, bridge, consumer, Arc::clone(schema))
@@ -122,7 +122,7 @@ fn make_fallback(
         4096,
         1024,
         BatchPolicy::default(),
-        BackpressureStrategy::DropNewest,
+        BridgeOverflow::DropNewest,
     )
     .unwrap();
     (exec, bridge, consumer, Arc::clone(schema))
@@ -195,7 +195,7 @@ fn bench_bridge(c: &mut Criterion) {
             4096,
             1024,
             BatchPolicy::default().with_max_rows(1024),
-            BackpressureStrategy::DropNewest,
+            BridgeOverflow::DropNewest,
         )
         .unwrap();
         let arena = Bump::new();
@@ -220,7 +220,7 @@ fn bench_bridge(c: &mut Criterion) {
             4096,
             1024,
             BatchPolicy::default().with_max_rows(1024),
-            BackpressureStrategy::DropNewest,
+            BridgeOverflow::DropNewest,
         )
         .unwrap();
         let arena = Bump::new();

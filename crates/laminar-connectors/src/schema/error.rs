@@ -50,9 +50,11 @@ pub enum SchemaError {
     #[error("duplicate wildcard: only one `*` is allowed in the column list")]
     DuplicateWildcard,
 
-    /// Wildcard `*` used without a connector that supports schema inference.
-    #[error("wildcard without inference: `*` requires a connector that supports schema inference or a schema registry")]
-    WildcardWithoutInference,
+    /// Wildcard `*` used without a connector that provides schema resolution.
+    #[error(
+        "wildcard without resolution: `*` requires a connector with a schema provider or registry"
+    )]
+    WildcardWithoutResolution,
 
     /// A wildcard-prefixed column name collides with a declared column.
     #[error("wildcard prefix collision: prefixed column '{0}' collides with a declared column")]
@@ -152,8 +154,8 @@ mod tests {
         let e1 = SchemaError::DuplicateWildcard;
         assert!(e1.to_string().contains("duplicate wildcard"));
 
-        let e2 = SchemaError::WildcardWithoutInference;
-        assert!(e2.to_string().contains("schema inference"));
+        let e2 = SchemaError::WildcardWithoutResolution;
+        assert!(e2.to_string().contains("schema provider"));
 
         let e3 = SchemaError::WildcardPrefixCollision("src_id".into());
         assert!(e3.to_string().contains("src_id"));

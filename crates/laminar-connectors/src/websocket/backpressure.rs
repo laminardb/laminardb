@@ -1,7 +1,7 @@
 //! Backpressure strategies for WebSocket connectors.
 //!
 //! When the internal Ring 0 bounded channel is full and cannot accept more
-//! messages from a WebSocket source, a [`BackpressureStrategy`] determines
+//! messages from a WebSocket source, a `WsBackpressure` strategy determines
 //! what happens to incoming data.
 
 use serde::{Deserialize, Serialize};
@@ -18,7 +18,7 @@ use serde::{Deserialize, Serialize};
 /// - `DropOldest`, `Buffer`, `Sample`: parsed from SQL WITH, fall back to
 ///   `DropNewest` behavior with a debug log. Full dispatch planned for Phase 6c.
 #[derive(Debug, Clone, Default, Serialize, Deserialize)]
-pub enum BackpressureStrategy {
+pub enum WsBackpressure {
     /// Block WS read -- TCP backpressure propagates to sender.
     ///
     /// This is the safest option: the WebSocket read loop simply stops
@@ -62,23 +62,23 @@ mod tests {
 
     #[test]
     fn test_default_is_block() {
-        let strategy = BackpressureStrategy::default();
-        assert!(matches!(strategy, BackpressureStrategy::Block));
+        let strategy = WsBackpressure::default();
+        assert!(matches!(strategy, WsBackpressure::Block));
     }
 
     #[test]
     fn test_debug_format() {
-        let strategy = BackpressureStrategy::Block;
+        let strategy = WsBackpressure::Block;
         let debug = format!("{strategy:?}");
         assert_eq!(debug, "Block");
     }
 
     #[test]
     fn test_buffer_variant() {
-        let strategy = BackpressureStrategy::Buffer {
+        let strategy = WsBackpressure::Buffer {
             max_bytes: 1_048_576,
         };
-        if let BackpressureStrategy::Buffer { max_bytes } = strategy {
+        if let WsBackpressure::Buffer { max_bytes } = strategy {
             assert_eq!(max_bytes, 1_048_576);
         } else {
             panic!("expected Buffer variant");
@@ -87,8 +87,8 @@ mod tests {
 
     #[test]
     fn test_sample_variant() {
-        let strategy = BackpressureStrategy::Sample { rate: 10 };
-        if let BackpressureStrategy::Sample { rate } = strategy {
+        let strategy = WsBackpressure::Sample { rate: 10 };
+        if let WsBackpressure::Sample { rate } = strategy {
             assert_eq!(rate, 10);
         } else {
             panic!("expected Sample variant");
@@ -97,25 +97,25 @@ mod tests {
 
     #[test]
     fn test_clone() {
-        let original = BackpressureStrategy::DropOldest;
+        let original = WsBackpressure::DropOldest;
         let cloned = original.clone();
-        assert!(matches!(cloned, BackpressureStrategy::DropOldest));
+        assert!(matches!(cloned, WsBackpressure::DropOldest));
     }
 
     #[test]
     fn test_serde_roundtrip_block() {
-        let strategy = BackpressureStrategy::Block;
+        let strategy = WsBackpressure::Block;
         let json = serde_json::to_string(&strategy).unwrap();
-        let deserialized: BackpressureStrategy = serde_json::from_str(&json).unwrap();
-        assert!(matches!(deserialized, BackpressureStrategy::Block));
+        let deserialized: WsBackpressure = serde_json::from_str(&json).unwrap();
+        assert!(matches!(deserialized, WsBackpressure::Block));
     }
 
     #[test]
     fn test_serde_roundtrip_buffer() {
-        let strategy = BackpressureStrategy::Buffer { max_bytes: 65_536 };
+        let strategy = WsBackpressure::Buffer { max_bytes: 65_536 };
         let json = serde_json::to_string(&strategy).unwrap();
-        let deserialized: BackpressureStrategy = serde_json::from_str(&json).unwrap();
-        if let BackpressureStrategy::Buffer { max_bytes } = deserialized {
+        let deserialized: WsBackpressure = serde_json::from_str(&json).unwrap();
+        if let WsBackpressure::Buffer { max_bytes } = deserialized {
             assert_eq!(max_bytes, 65_536);
         } else {
             panic!("expected Buffer variant after deserialization");
@@ -124,10 +124,10 @@ mod tests {
 
     #[test]
     fn test_serde_roundtrip_sample() {
-        let strategy = BackpressureStrategy::Sample { rate: 5 };
+        let strategy = WsBackpressure::Sample { rate: 5 };
         let json = serde_json::to_string(&strategy).unwrap();
-        let deserialized: BackpressureStrategy = serde_json::from_str(&json).unwrap();
-        if let BackpressureStrategy::Sample { rate } = deserialized {
+        let deserialized: WsBackpressure = serde_json::from_str(&json).unwrap();
+        if let WsBackpressure::Sample { rate } = deserialized {
             assert_eq!(rate, 5);
         } else {
             panic!("expected Sample variant after deserialization");
@@ -136,17 +136,17 @@ mod tests {
 
     #[test]
     fn test_serde_roundtrip_drop_oldest() {
-        let strategy = BackpressureStrategy::DropOldest;
+        let strategy = WsBackpressure::DropOldest;
         let json = serde_json::to_string(&strategy).unwrap();
-        let deserialized: BackpressureStrategy = serde_json::from_str(&json).unwrap();
-        assert!(matches!(deserialized, BackpressureStrategy::DropOldest));
+        let deserialized: WsBackpressure = serde_json::from_str(&json).unwrap();
+        assert!(matches!(deserialized, WsBackpressure::DropOldest));
     }
 
     #[test]
     fn test_serde_roundtrip_drop_newest() {
-        let strategy = BackpressureStrategy::DropNewest;
+        let strategy = WsBackpressure::DropNewest;
         let json = serde_json::to_string(&strategy).unwrap();
-        let deserialized: BackpressureStrategy = serde_json::from_str(&json).unwrap();
-        assert!(matches!(deserialized, BackpressureStrategy::DropNewest));
+        let deserialized: WsBackpressure = serde_json::from_str(&json).unwrap();
+        assert!(matches!(deserialized, WsBackpressure::DropNewest));
     }
 }

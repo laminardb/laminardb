@@ -640,7 +640,6 @@ fn update_partial_cache_from_batch(
     batch: &RecordBatch,
 ) {
     use arrow_array::{Array, StringArray};
-    use laminar_core::lookup::table::LookupTable;
 
     if partial.key_columns.is_empty() {
         return;

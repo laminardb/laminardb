@@ -24,11 +24,11 @@ use std::time::Instant;
 use smallvec::SmallVec;
 
 use super::fallback::ExecutablePipeline;
-use super::metrics::{
-    QueryConfig, QueryError, QueryId, QueryMetadata, QueryMetrics, QueryState, SubmitResult,
-};
 use super::pipeline::PipelineAction;
 use super::pipeline_bridge::{BridgeConsumer, PipelineBridge, Ring1Action};
+use super::query_lifecycle::{
+    QueryConfig, QueryError, QueryId, QueryMetadata, QueryMetrics, QueryState, SubmitResult,
+};
 use super::row::{EventRow, RowSchema};
 
 // ────────────────────────────── Builder ──────────────────────────────
@@ -499,7 +499,7 @@ mod tests {
     use super::*;
     use crate::compiler::pipeline::{CompiledPipeline, PipelineId};
     use crate::compiler::pipeline_bridge::create_pipeline_bridge;
-    use crate::compiler::policy::{BackpressureStrategy, BatchPolicy};
+    use crate::compiler::policy::{BatchPolicy, BridgeOverflow};
     use crate::compiler::row::MutableEventRow;
     use arrow_schema::{DataType, Field, Schema};
     use bumpalo::Bump;
@@ -541,7 +541,7 @@ mod tests {
             64,
             1024,
             BatchPolicy::default(),
-            BackpressureStrategy::DropNewest,
+            BridgeOverflow::DropNewest,
         )
         .unwrap();
         (exec, bridge, consumer, Arc::clone(row_schema))
@@ -575,7 +575,7 @@ mod tests {
             64,
             1024,
             BatchPolicy::default(),
-            BackpressureStrategy::DropNewest,
+            BridgeOverflow::DropNewest,
         )
         .unwrap();
         (exec, bridge, consumer, Arc::clone(row_schema))
@@ -607,7 +607,7 @@ mod tests {
             64,
             1024,
             BatchPolicy::default(),
-            BackpressureStrategy::DropNewest,
+            BridgeOverflow::DropNewest,
         )
         .unwrap();
         (exec, bridge, consumer, Arc::clone(row_schema))

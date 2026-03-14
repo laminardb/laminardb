@@ -65,12 +65,12 @@ pub enum SubscriptionState {
 }
 
 // ---------------------------------------------------------------------------
-// BackpressureStrategy
+// SubscriptionOverflow
 // ---------------------------------------------------------------------------
 
 /// Strategy applied when a subscription's channel buffer is full.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub enum BackpressureStrategy {
+pub enum SubscriptionOverflow {
     /// Drop oldest events when buffer full (real-time priority).
     DropOldest,
     /// Drop newest events when buffer full (completeness priority).
@@ -91,7 +91,7 @@ pub struct SubscriptionConfig {
     /// Channel buffer capacity.
     pub buffer_size: usize,
     /// Backpressure strategy when buffer is full.
-    pub backpressure: BackpressureStrategy,
+    pub backpressure: SubscriptionOverflow,
     /// Optional filter predicate (evaluated in Ring 1).
     pub filter: Option<String>,
     /// Whether to send an initial snapshot on subscribe.
@@ -106,7 +106,7 @@ impl Default for SubscriptionConfig {
     fn default() -> Self {
         Self {
             buffer_size: 1024,
-            backpressure: BackpressureStrategy::DropOldest,
+            backpressure: SubscriptionOverflow::DropOldest,
             filter: None,
             send_snapshot: false,
             max_batch_size: 64,
@@ -451,7 +451,7 @@ mod tests {
     fn test_registry_config_default() {
         let cfg = SubscriptionConfig::default();
         assert_eq!(cfg.buffer_size, 1024);
-        assert_eq!(cfg.backpressure, BackpressureStrategy::DropOldest);
+        assert_eq!(cfg.backpressure, SubscriptionOverflow::DropOldest);
         assert!(cfg.filter.is_none());
         assert!(!cfg.send_snapshot);
         assert_eq!(cfg.max_batch_size, 64);

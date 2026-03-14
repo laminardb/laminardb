@@ -7,7 +7,7 @@ use std::fmt;
 use std::time::Duration;
 
 use super::pipeline_bridge::PipelineBridgeError;
-use super::policy::{BackpressureStrategy, BatchPolicy};
+use super::policy::{BatchPolicy, BridgeOverflow};
 
 // ────────────────────────────── QueryId ──────────────────────────────
 
@@ -65,7 +65,7 @@ pub struct QueryConfig {
     /// Batching policy for the Ring 0 → Ring 1 bridge.
     pub batch_policy: BatchPolicy,
     /// Backpressure strategy for the bridge producer.
-    pub backpressure: BackpressureStrategy,
+    pub backpressure: BridgeOverflow,
     /// Maximum entries in the pipeline compiler cache.
     pub max_cache_entries: usize,
     /// SPSC queue capacity for each bridge.
@@ -79,7 +79,7 @@ impl Default for QueryConfig {
         Self {
             jit_enabled: cfg!(feature = "jit"),
             batch_policy: BatchPolicy::default(),
-            backpressure: BackpressureStrategy::default(),
+            backpressure: BridgeOverflow::default(),
             max_cache_entries: 64,
             queue_capacity: 4096,
             output_buffer_size: 8192,
@@ -223,10 +223,7 @@ mod tests {
         assert_eq!(config.max_cache_entries, 64);
         assert_eq!(config.queue_capacity, 4096);
         assert_eq!(config.output_buffer_size, 8192);
-        assert!(matches!(
-            config.backpressure,
-            BackpressureStrategy::DropNewest
-        ));
+        assert!(matches!(config.backpressure, BridgeOverflow::DropNewest));
     }
 
     #[test]

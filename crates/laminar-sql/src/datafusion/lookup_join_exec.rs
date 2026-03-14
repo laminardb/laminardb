@@ -39,7 +39,6 @@ use datafusion_expr::Expr;
 use futures::StreamExt;
 use laminar_core::lookup::foyer_cache::FoyerMemoryCache;
 use laminar_core::lookup::source::LookupSourceDyn;
-use laminar_core::lookup::table::LookupTable;
 use tokio::sync::Semaphore;
 
 use super::lookup_join::{LookupJoinNode, LookupJoinType};

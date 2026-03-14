@@ -116,7 +116,7 @@ impl LaminarDB {
 
             let store: Box<dyn laminar_storage::CheckpointStore> =
                 if let Some(ref url) = self.config.object_store_url {
-                    let obj_store = laminar_storage::object_store_factory::build_object_store(
+                    let obj_store = laminar_storage::object_store_builder::build_object_store(
                         url,
                         &self.config.object_store_options,
                     )

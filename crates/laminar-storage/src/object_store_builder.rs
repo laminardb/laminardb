@@ -16,7 +16,7 @@ use object_store::ObjectStore;
 
 /// Errors from object store construction.
 #[derive(Debug, thiserror::Error)]
-pub enum ObjectStoreFactoryError {
+pub enum ObjectStoreBuilderError {
     /// The URL scheme requires a feature that is not compiled in.
     #[error("scheme '{scheme}' requires the '{feature}' feature flag (compile with --features {feature})")]
     MissingFeature {
@@ -39,7 +39,7 @@ pub enum ObjectStoreFactoryError {
     Build(String),
 }
 
-impl From<object_store::Error> for ObjectStoreFactoryError {
+impl From<object_store::Error> for ObjectStoreBuilderError {
     fn from(e: object_store::Error) -> Self {
         Self::Build(e.to_string())
     }
@@ -58,38 +58,38 @@ impl From<object_store::Error> for ObjectStoreFactoryError {
 ///
 /// # Errors
 ///
-/// Returns [`ObjectStoreFactoryError`] if the scheme is unsupported, requires
+/// Returns [`ObjectStoreBuilderError`] if the scheme is unsupported, requires
 /// an uncompiled feature, or the backend fails to build.
 #[allow(clippy::implicit_hasher)]
 pub fn build_object_store(
     url: &str,
     options: &HashMap<String, String>,
-) -> Result<Arc<dyn ObjectStore>, ObjectStoreFactoryError> {
+) -> Result<Arc<dyn ObjectStore>, ObjectStoreBuilderError> {
     let scheme = url
         .find("://")
         .map(|i| &url[..i])
-        .ok_or_else(|| ObjectStoreFactoryError::InvalidUrl(format!("no scheme in '{url}'")))?;
+        .ok_or_else(|| ObjectStoreBuilderError::InvalidUrl(format!("no scheme in '{url}'")))?;
 
     match scheme {
         "file" => build_local_file_system(url),
         "s3" => build_s3(url, options),
         "gs" => build_gcs(url, options),
         "az" | "abfs" | "abfss" => build_azure(url, options),
-        other => Err(ObjectStoreFactoryError::UnsupportedScheme(
+        other => Err(ObjectStoreBuilderError::UnsupportedScheme(
             other.to_string(),
         )),
     }
 }
 
 /// Extract the local path from a `file://` URL and create a `LocalFileSystem`.
-fn build_local_file_system(url: &str) -> Result<Arc<dyn ObjectStore>, ObjectStoreFactoryError> {
+fn build_local_file_system(url: &str) -> Result<Arc<dyn ObjectStore>, ObjectStoreBuilderError> {
     // file:///path/to/dir → /path/to/dir
     let path = url
         .strip_prefix("file://")
-        .ok_or_else(|| ObjectStoreFactoryError::InvalidUrl(url.to_string()))?;
+        .ok_or_else(|| ObjectStoreBuilderError::InvalidUrl(url.to_string()))?;
 
     if path.is_empty() {
-        return Err(ObjectStoreFactoryError::InvalidUrl(
+        return Err(ObjectStoreBuilderError::InvalidUrl(
             "file:// URL has empty path".to_string(),
         ));
     }
@@ -106,14 +106,14 @@ fn build_local_file_system(url: &str) -> Result<Arc<dyn ObjectStore>, ObjectStor
 fn build_s3(
     url: &str,
     options: &HashMap<String, String>,
-) -> Result<Arc<dyn ObjectStore>, ObjectStoreFactoryError> {
+) -> Result<Arc<dyn ObjectStore>, ObjectStoreBuilderError> {
     use object_store::aws::AmazonS3Builder;
 
     let mut builder = AmazonS3Builder::from_env().with_url(url);
 
     for (key, value) in options {
         let config_key = key.parse().map_err(|e: object_store::Error| {
-            ObjectStoreFactoryError::Build(format!("invalid S3 config key '{key}': {e}"))
+            ObjectStoreBuilderError::Build(format!("invalid S3 config key '{key}': {e}"))
         })?;
         builder = builder.with_config(config_key, value);
     }
@@ -126,8 +126,8 @@ fn build_s3(
 fn build_s3(
     _url: &str,
     _options: &HashMap<String, String>,
-) -> Result<Arc<dyn ObjectStore>, ObjectStoreFactoryError> {
-    Err(ObjectStoreFactoryError::MissingFeature {
+) -> Result<Arc<dyn ObjectStore>, ObjectStoreBuilderError> {
+    Err(ObjectStoreBuilderError::MissingFeature {
         scheme: "s3".to_string(),
         feature: "aws".to_string(),
     })
@@ -141,14 +141,14 @@ fn build_s3(
 fn build_gcs(
     url: &str,
     options: &HashMap<String, String>,
-) -> Result<Arc<dyn ObjectStore>, ObjectStoreFactoryError> {
+) -> Result<Arc<dyn ObjectStore>, ObjectStoreBuilderError> {
     use object_store::gcp::GoogleCloudStorageBuilder;
 
     let mut builder = GoogleCloudStorageBuilder::from_env().with_url(url);
 
     for (key, value) in options {
         let config_key = key.parse().map_err(|e: object_store::Error| {
-            ObjectStoreFactoryError::Build(format!("invalid GCS config key '{key}': {e}"))
+            ObjectStoreBuilderError::Build(format!("invalid GCS config key '{key}': {e}"))
         })?;
         builder = builder.with_config(config_key, value);
     }
@@ -161,8 +161,8 @@ fn build_gcs(
 fn build_gcs(
     _url: &str,
     _options: &HashMap<String, String>,
-) -> Result<Arc<dyn ObjectStore>, ObjectStoreFactoryError> {
-    Err(ObjectStoreFactoryError::MissingFeature {
+) -> Result<Arc<dyn ObjectStore>, ObjectStoreBuilderError> {
+    Err(ObjectStoreBuilderError::MissingFeature {
         scheme: "gs".to_string(),
         feature: "gcs".to_string(),
     })
@@ -176,14 +176,14 @@ fn build_gcs(
 fn build_azure(
     url: &str,
     options: &HashMap<String, String>,
-) -> Result<Arc<dyn ObjectStore>, ObjectStoreFactoryError> {
+) -> Result<Arc<dyn ObjectStore>, ObjectStoreBuilderError> {
     use object_store::azure::MicrosoftAzureBuilder;
 
     let mut builder = MicrosoftAzureBuilder::from_env().with_url(url);
 
     for (key, value) in options {
         let config_key = key.parse().map_err(|e: object_store::Error| {
-            ObjectStoreFactoryError::Build(format!("invalid Azure config key '{key}': {e}"))
+            ObjectStoreBuilderError::Build(format!("invalid Azure config key '{key}': {e}"))
         })?;
         builder = builder.with_config(config_key, value);
     }
@@ -196,8 +196,8 @@ fn build_azure(
 fn build_azure(
     _url: &str,
     _options: &HashMap<String, String>,
-) -> Result<Arc<dyn ObjectStore>, ObjectStoreFactoryError> {
-    Err(ObjectStoreFactoryError::MissingFeature {
+) -> Result<Arc<dyn ObjectStore>, ObjectStoreBuilderError> {
+    Err(ObjectStoreBuilderError::MissingFeature {
         scheme: "az".to_string(),
         feature: "azure".to_string(),
     })

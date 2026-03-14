@@ -257,42 +257,8 @@ str_enum!(WriteMode, lowercase_nodash, String, "unknown write mode",
     Upsert => "upsert", "insert"
 );
 
-/// Delivery guarantee for the `PostgreSQL` sink.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub enum DeliveryGuarantee {
-    /// At-least-once: records may be duplicated on failure recovery.
-    AtLeastOnce,
-    /// Exactly-once: co-transactional offset storage in `PostgreSQL`.
-    ExactlyOnce,
-}
-
-str_enum!(DeliveryGuarantee, lowercase_nodash, String, "unknown delivery guarantee",
-    AtLeastOnce => "at_least_once", "at-least-once", "atleastonce";
-    ExactlyOnce => "exactly_once", "exactly-once", "exactlyonce"
-);
-
-/// SSL mode for `PostgreSQL` connections.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub enum SslMode {
-    /// No SSL.
-    Disable,
-    /// Use SSL if available, fall back to unencrypted.
-    Prefer,
-    /// Require SSL.
-    Require,
-    /// Require SSL and verify server certificate.
-    VerifyCa,
-    /// Require SSL, verify certificate and hostname.
-    VerifyFull,
-}
-
-str_enum!(SslMode, lowercase_nodash, String, "unknown SSL mode",
-    Disable => "disable", "off";
-    Prefer => "prefer";
-    Require => "require";
-    VerifyCa => "verify-ca", "verify_ca", "verifyca";
-    VerifyFull => "verify-full", "verify_full", "verifyfull"
-);
+pub use crate::connector::DeliveryGuarantee;
+pub use crate::connector::PostgresSslMode as SslMode;
 
 #[cfg(test)]
 mod tests {
@@ -487,8 +453,8 @@ mod tests {
 
     #[test]
     fn test_delivery_guarantee_display() {
-        assert_eq!(DeliveryGuarantee::AtLeastOnce.to_string(), "at_least_once");
-        assert_eq!(DeliveryGuarantee::ExactlyOnce.to_string(), "exactly_once");
+        assert_eq!(DeliveryGuarantee::AtLeastOnce.to_string(), "at-least-once");
+        assert_eq!(DeliveryGuarantee::ExactlyOnce.to_string(), "exactly-once");
     }
 
     #[test]

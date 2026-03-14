@@ -40,8 +40,9 @@ use crate::error::ConnectorError;
 use crate::health::HealthStatus;
 use crate::metrics::ConnectorMetrics;
 
-use super::delta_config::{DeliveryGuarantee, DeltaLakeSinkConfig, DeltaWriteMode};
+use super::delta_config::{DeltaLakeSinkConfig, DeltaWriteMode};
 use super::delta_metrics::DeltaLakeSinkMetrics;
+use crate::connector::DeliveryGuarantee;
 
 /// Delta Lake sink connector.
 ///

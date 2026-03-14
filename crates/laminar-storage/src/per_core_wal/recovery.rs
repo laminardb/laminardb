@@ -312,7 +312,7 @@ pub fn recover_per_core(
 mod tests {
     use super::*;
     use crate::incremental::CheckpointConfig;
-    use crate::per_core_wal::{CheckpointCoordinator, PerCoreWalManager};
+    use crate::per_core_wal::{PerCoreCheckpointCoordinator, PerCoreWalManager};
     use tempfile::TempDir;
 
     fn setup_recovery_test() -> (TempDir, PathBuf, PathBuf) {
@@ -332,7 +332,8 @@ mod tests {
         let wal_config = PerCoreWalConfig::new(&wal_dir, 2);
         let wal_manager = PerCoreWalManager::new(wal_config.clone()).unwrap();
         let checkpoint_config = CheckpointConfig::new(&checkpoint_dir).with_wal_path(&wal_dir);
-        let mut coordinator = CheckpointCoordinator::new(wal_manager, checkpoint_config).unwrap();
+        let mut coordinator =
+            PerCoreCheckpointCoordinator::new(wal_manager, checkpoint_config).unwrap();
         coordinator.create_checkpoint(1).unwrap();
 
         // Now recover
@@ -354,7 +355,7 @@ mod tests {
             let wal_manager = PerCoreWalManager::new(wal_config).unwrap();
             let checkpoint_config = CheckpointConfig::new(&checkpoint_dir).with_wal_path(&wal_dir);
             let mut coordinator =
-                CheckpointCoordinator::new(wal_manager, checkpoint_config).unwrap();
+                PerCoreCheckpointCoordinator::new(wal_manager, checkpoint_config).unwrap();
 
             coordinator.wal_manager_mut().set_epoch_all(1);
             coordinator
@@ -498,7 +499,7 @@ mod tests {
             let wal_manager = PerCoreWalManager::new(wal_config).unwrap();
             let checkpoint_config = CheckpointConfig::new(&checkpoint_dir).with_wal_path(&wal_dir);
             let mut coordinator =
-                CheckpointCoordinator::new(wal_manager, checkpoint_config).unwrap();
+                PerCoreCheckpointCoordinator::new(wal_manager, checkpoint_config).unwrap();
             coordinator.create_checkpoint(1).unwrap();
         }
 

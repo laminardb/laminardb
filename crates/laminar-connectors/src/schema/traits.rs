@@ -7,9 +7,9 @@
 //! | [`FormatDecoder`] | Decode raw bytes → Arrow | Sync |
 //! | [`FormatEncoder`] | Encode Arrow → raw bytes | Sync |
 //! | [`SchemaProvider`] | Authoritative schema from source | Async |
-//! | [`SchemaInferable`] | Sample-based schema inference | Async |
+//! | (inference) | Sample-based schema inference | Via `FormatInference` |
 //! | [`SchemaRegistryAware`] | Schema registry integration | Async |
-//! | [`SchemaEvolvable`] | Schema evolution & diffing | Sync |
+//! | [`SchemaEvolution`](super::evolution::SchemaEvolution) | Schema evolution & diffing | Sync |
 //!
 //! Connectors opt in to capabilities by implementing the relevant traits
 //! and returning `Some(self)` from the corresponding `as_*()` method on
@@ -108,40 +108,6 @@ pub trait SchemaProvider: Send + Sync {
     /// Default returns an empty map.
     async fn field_metadata(&self) -> SchemaResult<HashMap<String, super::types::FieldMeta>> {
         Ok(HashMap::new())
-    }
-}
-
-// ── SchemaInferable ────────────────────────────────────────────────
-
-/// A connector that supports sample-based schema inference.
-///
-/// The connector provides raw sample records, and the inference engine
-/// determines the Arrow schema from the data.
-#[async_trait]
-pub trait SchemaInferable: Send + Sync {
-    /// Reads sample records from the source for inference.
-    ///
-    /// The `max_records` parameter is a hint; implementations may return fewer.
-    ///
-    /// # Errors
-    ///
-    /// Returns a schema error if samples cannot be read.
-    async fn sample_records(&self, max_records: usize) -> SchemaResult<Vec<RawRecord>>;
-
-    /// Infers a schema from sample records.
-    ///
-    /// Default implementation delegates to the global
-    /// [`FormatInferenceRegistry`](super::inference::FormatInferenceRegistry).
-    ///
-    /// # Errors
-    ///
-    /// Returns a schema error if inference fails.
-    async fn infer_from_samples(
-        &self,
-        samples: &[RawRecord],
-        config: &InferenceConfig,
-    ) -> SchemaResult<InferredSchema> {
-        super::inference::default_infer_from_samples(samples, config)
     }
 }
 
@@ -297,16 +263,7 @@ pub struct InferenceWarning {
     pub severity: WarningSeverity,
 }
 
-/// Severity level for inference warnings.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub enum WarningSeverity {
-    /// Informational — inference succeeded but with caveats.
-    Info,
-    /// Warning — inference may be inaccurate.
-    Warning,
-    /// Error — inference for this field failed; a fallback type was used.
-    Error,
-}
+pub use laminar_core::error_codes::WarningSeverity;
 
 // ── SchemaRegistryAware ────────────────────────────────────────────
 
@@ -439,37 +396,7 @@ pub struct RegisteredSchema {
     pub schema_type: RegistrySchemaType,
 }
 
-// ── SchemaEvolvable ────────────────────────────────────────────────
-
-/// A connector that supports schema evolution.
-///
-/// Provides diffing, evaluation, and application of schema changes.
-pub trait SchemaEvolvable: Send + Sync {
-    /// Computes the differences between two schemas.
-    fn diff_schemas(&self, old: &SchemaRef, new: &SchemaRef) -> Vec<SchemaChange>;
-
-    /// Evaluates whether a set of schema changes is acceptable.
-    fn evaluate_evolution(&self, changes: &[SchemaChange]) -> EvolutionVerdict;
-
-    /// Applies schema changes, returning a column projection that maps
-    /// old data to the new schema.
-    ///
-    /// # Errors
-    ///
-    /// Returns a schema error if the evolution cannot be applied.
-    fn apply_evolution(
-        &self,
-        old: &SchemaRef,
-        changes: &[SchemaChange],
-    ) -> SchemaResult<ColumnProjection>;
-
-    /// Returns the current schema version, if tracked.
-    fn schema_version(&self) -> Option<u32> {
-        None
-    }
-}
-
-/// A single schema change detected by [`SchemaEvolvable::diff_schemas`].
+/// A single schema change detected by schema diffing.
 #[derive(Debug, Clone, PartialEq)]
 pub enum SchemaChange {
     /// A new column was added.
@@ -602,9 +529,8 @@ const _: () = {
     fn _assert_format_decoder_object_safe(_: &dyn FormatDecoder) {}
     fn _assert_format_encoder_object_safe(_: &dyn FormatEncoder) {}
     fn _assert_schema_provider_object_safe(_: &dyn SchemaProvider) {}
-    fn _assert_schema_inferable_object_safe(_: &dyn SchemaInferable) {}
+
     fn _assert_schema_registry_aware_object_safe(_: &dyn SchemaRegistryAware) {}
-    fn _assert_schema_evolvable_object_safe(_: &dyn SchemaEvolvable) {}
 };
 
 #[cfg(test)]

@@ -29,9 +29,10 @@ use crate::error::ConnectorError;
 use crate::health::HealthStatus;
 use crate::metrics::ConnectorMetrics;
 
-use super::sink_config::{DeliveryGuarantee, PostgresSinkConfig, WriteMode};
+use super::sink_config::{PostgresSinkConfig, WriteMode};
 use super::sink_metrics::PostgresSinkMetrics;
 use super::types::{arrow_to_pg_ddl_type, arrow_type_to_pg_array_cast, arrow_type_to_pg_sql};
+use crate::connector::DeliveryGuarantee;
 
 #[cfg(feature = "postgres-sink")]
 use super::types::arrow_column_to_pg_array;

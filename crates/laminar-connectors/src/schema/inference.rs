@@ -4,8 +4,7 @@
 //! - [`FormatInference`] trait for format-specific schema inference
 //! - [`FormatInferenceRegistry`] for registering and looking up inferencers
 //! - Built-in implementations for JSON, CSV, and raw formats
-//! - [`default_infer_from_samples`] free function used by the default
-//!   [`SchemaInferable`](super::traits::SchemaInferable) implementation
+//! - [`default_infer_from_samples`] free function for sample-based inference
 use std::collections::HashMap;
 use std::sync::{Arc, LazyLock, RwLock};
 
@@ -110,7 +109,7 @@ pub static FORMAT_INFERENCE_REGISTRY: LazyLock<FormatInferenceRegistry> = LazyLo
 
 /// Default inference implementation that delegates to the global registry.
 ///
-/// Used by the default [`SchemaInferable::infer_from_samples`](super::traits::SchemaInferable::infer_from_samples).
+/// Used for sample-based schema inference.
 ///
 /// # Errors
 ///

@@ -128,7 +128,7 @@ fn build_checkpoint_store(
     let cp = &config.checkpoint;
     let url = &cp.url;
 
-    let obj_store = match laminar_storage::object_store_factory::build_object_store(
+    let obj_store = match laminar_storage::object_store_builder::build_object_store(
         url,
         &cp.storage,
     ) {
