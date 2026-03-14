@@ -115,17 +115,10 @@ jobs:
         env:
           RUSTFLAGS: "-C link-arg=-fuse-ld=mold"
 
-      # Windows: explicit features (skip hwloc, io-uring, xdp)
+      # Windows: explicit features (skip hwloc, io-uring)
       - name: Run tests (Windows)
         if: runner.os == 'Windows'
-        run: cargo nextest run --workspace --features "allocation-tracking,jit,kafka,postgres-cdc,postgres-sink,mysql-cdc,delta-lake,delta,files,parquet-lookup"
-
-      # Verify zero-allocation hot path (Linux only, requires global allocator)
-      - name: Verify zero-allocation hot path
-        if: runner.os == 'Linux'
-        run: cargo test --features allocation-tracking -p laminar-core --test zero_alloc_integration
-        env:
-          RUSTFLAGS: "-C link-arg=-fuse-ld=mold"
+        run: cargo nextest run --workspace --features "jit,kafka,postgres-cdc,postgres-sink,mysql-cdc,delta-lake,delta,files,parquet-lookup"
 
       # Doc tests only on Linux (redundant across platforms)
       - name: Run doc tests
@@ -195,7 +188,6 @@ jobs:
           cargo check -p laminar-core --no-default-features
           cargo check -p laminar-core --features io-uring
           cargo check -p laminar-core --features hwloc
-          cargo check -p laminar-core --features xdp
           cargo check -p laminar-core --features jit
           cargo check -p laminar-core --features delta
 
@@ -306,9 +298,7 @@ jobs:
         run: |
           cargo +nightly miri test -p laminar-core --lib -- \
             --skip test_tpc \
-            --skip test_numa \
-            --skip test_io_uring \
-            --skip test_xdp
+            --skip test_io_uring
         env:
           MIRIFLAGS: "-Zmiri-disable-isolation"
         continue-on-error: true

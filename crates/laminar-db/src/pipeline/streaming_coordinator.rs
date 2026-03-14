@@ -25,7 +25,7 @@ use std::time::{Duration, Instant};
 use arrow_array::RecordBatch;
 use laminar_connectors::checkpoint::SourceCheckpoint;
 use laminar_connectors::connector::DeliveryGuarantee;
-use laminar_core::checkpoint::CheckpointBarrier;
+use laminar_core::checkpoint::{CheckpointBarrier, CheckpointBarrierInjector};
 use rustc_hash::{FxHashMap, FxHashSet};
 use tokio::sync::mpsc;
 
@@ -34,7 +34,6 @@ use super::config::PipelineConfig;
 use crate::error::DbError;
 
 /// Message sent from a source task to the coordinator.
-#[allow(dead_code)] // Barrier variant used when barrier injection is wired
 enum SourceMsg {
     /// A batch of records from a source.
     Batch {
@@ -54,6 +53,8 @@ struct SourceHandle {
     shutdown: Arc<AtomicBool>,
     join: tokio::task::JoinHandle<()>,
     checkpoint_rx: tokio::sync::watch::Receiver<SourceCheckpoint>,
+    /// Injector for Chandy-Lamport checkpoint barriers.
+    barrier_injector: CheckpointBarrierInjector,
 }
 
 /// Simplified pipeline coordinator — single tokio task, no core threads.
@@ -72,8 +73,7 @@ pub struct StreamingCoordinator {
     shutdown: Arc<tokio::sync::Notify>,
     /// Pending barrier alignment.
     pending_barrier: PendingBarrier,
-    /// Next checkpoint ID (used when barrier injection is wired).
-    #[allow(dead_code)]
+    /// Next checkpoint ID for barrier injection.
     next_checkpoint_id: u64,
     /// Last checkpoint time.
     last_checkpoint: Instant,
@@ -105,7 +105,6 @@ impl PendingBarrier {
         }
     }
 
-    #[allow(dead_code)] // Used when barrier injection is wired
     fn reset(&mut self, checkpoint_id: u64, sources_total: usize) {
         self.checkpoint_id = checkpoint_id;
         self.sources_total = sources_total;
@@ -131,6 +130,7 @@ impl StreamingCoordinator {
     /// # Errors
     ///
     /// Returns an error if delivery guarantee constraints are violated.
+    #[allow(clippy::too_many_lines)]
     pub fn new(
         sources: Vec<SourceRegistration>,
         config: PipelineConfig,
@@ -176,7 +176,12 @@ impl StreamingCoordinator {
             let mut connector = src.connector;
             let connector_config = src.config;
 
+            // Barrier injection: coordinator triggers → source polls → sends SourceMsg::Barrier
+            let barrier_injector = CheckpointBarrierInjector::new();
+            let barrier_handle = barrier_injector.handle();
+
             let join = tokio::spawn(async move {
+                let mut epoch: u64 = 0;
                 // Open the connector.
                 if let Err(e) = connector.open(&connector_config).await {
                     tracing::error!(source = %src_name, error = %e, "source open failed");
@@ -221,6 +226,20 @@ impl StreamingCoordinator {
 
                     // Publish checkpoint offset.
                     let _ = cp_tx.send(connector.checkpoint());
+
+                    // Poll for pending checkpoint barrier.
+                    if let Some(barrier) = barrier_handle.poll(epoch) {
+                        epoch += 1;
+                        // Capture offset at barrier point (consistent cut).
+                        let _ = cp_tx.send(connector.checkpoint());
+                        let msg = SourceMsg::Barrier {
+                            source_idx: idx,
+                            barrier,
+                        };
+                        if task_tx.send(msg).await.is_err() {
+                            break;
+                        }
+                    }
                 }
 
                 // Close connector.
@@ -234,6 +253,7 @@ impl StreamingCoordinator {
                 shutdown: task_shutdown,
                 join,
                 checkpoint_rx: cp_rx,
+                barrier_injector,
             });
             source_names.push(src.name);
         }
@@ -418,6 +438,10 @@ impl StreamingCoordinator {
     }
 
     /// Check if a periodic checkpoint should be triggered.
+    ///
+    /// When barriers are supported (sources present), injects barriers for
+    /// Chandy-Lamport consistent snapshots. When no sources are present,
+    /// falls back to timer-based offset-only checkpoints.
     async fn maybe_checkpoint(&mut self, callback: &mut dyn PipelineCallback) {
         if self.pending_barrier.active {
             return; // Already tracking a barrier.
@@ -436,14 +460,23 @@ impl StreamingCoordinator {
             return;
         }
 
-        // Collect current source offsets.
-        let mut offsets = FxHashMap::default();
-        for handle in &self.source_handles {
-            offsets.insert(handle.name.clone(), handle.checkpoint_rx.borrow().clone());
+        if self.source_handles.is_empty() {
+            // No sources — timer-based checkpoint only.
+            let offsets = FxHashMap::default();
+            if callback.maybe_checkpoint(false, offsets).await {
+                self.last_checkpoint = Instant::now();
+            }
+            return;
         }
 
-        if callback.maybe_checkpoint(false, offsets).await {
-            self.last_checkpoint = Instant::now();
+        // Inject barriers into all source tasks for Chandy-Lamport alignment.
+        let checkpoint_id = self.next_checkpoint_id;
+        self.next_checkpoint_id += 1;
+        self.pending_barrier
+            .reset(checkpoint_id, self.source_handles.len());
+
+        for handle in &self.source_handles {
+            handle.barrier_injector.trigger(checkpoint_id, 0);
         }
     }
 }
