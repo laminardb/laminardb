@@ -50,6 +50,8 @@ pub(crate) enum LoweredQuery {
         pre_agg_sql: String,
         /// Optional HAVING filter SQL applied after emission.
         having_sql: Option<String>,
+        /// Source tables referenced by this query.
+        source_tables: Vec<String>,
     },
     /// Query was lowered to a windowed aggregate operator.
     WindowedAggregate {
@@ -59,6 +61,8 @@ pub(crate) enum LoweredQuery {
         output_schema: Arc<Schema>,
         /// Pre-aggregation SQL for column extraction.
         pre_agg_sql: String,
+        /// Source tables referenced by this query.
+        source_tables: Vec<String>,
     },
     /// Query cannot be lowered — use `StreamExecutor` fallback.
     ///
@@ -91,6 +95,7 @@ pub(crate) async fn try_lower_query(
     ctx: &SessionContext,
     query_name: &str,
     sql: &str,
+    source_tables: Vec<String>,
     window_config: Option<&WindowOperatorConfig>,
     emit_clause: Option<&EmitClause>,
 ) -> Result<LoweredQuery, DbError> {
@@ -105,6 +110,7 @@ pub(crate) async fn try_lower_query(
                         operator: Box::new(WindowAggAdapter::new(state, query_name.to_string())),
                         output_schema,
                         pre_agg_sql,
+                        source_tables: source_tables.clone(),
                     });
                 }
                 Ok(None) => {
@@ -133,6 +139,7 @@ pub(crate) async fn try_lower_query(
                 output_schema,
                 pre_agg_sql,
                 having_sql,
+                source_tables,
             })
         }
         Ok(None) => {
@@ -185,51 +192,64 @@ pub(crate) fn build_query_dag(
     }
 
     let mut operators_to_register: Vec<(String, Box<dyn Operator>)> = Vec::new();
+    // Track (op_name, source_tables) for wiring edges after all nodes are added.
+    let mut op_sources: Vec<(String, Vec<String>)> = Vec::new();
+
+    // Build a lookup of available source names for validation.
+    let available_sources: rustc_hash::FxHashSet<&str> =
+        source_schemas.iter().map(|&(name, _)| name).collect();
 
     // Add operator and sink nodes for each lowered query.
     for (query_name, lowered_query) in lowered.iter_mut() {
-        match lowered_query {
+        let (operator, output_schema, source_tables) = match lowered_query {
             LoweredQuery::Aggregate {
                 operator,
                 output_schema,
+                source_tables,
                 ..
             }
             | LoweredQuery::WindowedAggregate {
                 operator,
                 output_schema,
+                source_tables,
                 ..
-            } => {
-                let op_name = format!("op_{query_name}");
-                let sink_name = format!("sink_{query_name}");
+            } => (operator, output_schema.clone(), source_tables.clone()),
+            LoweredQuery::Fallback => continue,
+        };
 
-                // Use a dummy operator that we'll swap out after build.
-                builder = builder.operator(&op_name, output_schema.clone()).sink_for(
-                    &op_name,
-                    &sink_name,
-                    output_schema.clone(),
-                );
+        let op_name = format!("op_{query_name}");
+        let sink_name = format!("sink_{query_name}");
 
-                // We need to take the operator out — use a placeholder.
-                let op = std::mem::replace(
-                    operator,
-                    Box::new(crate::sql_operators::ProjectionAdapter::new(
-                        vec![],
-                        Arc::new(Schema::empty()),
-                        String::new(),
-                    )),
-                );
-                operators_to_register.push((op_name, op));
-            }
-            LoweredQuery::Fallback => {}
-        }
+        builder = builder.operator(&op_name, output_schema.clone()).sink_for(
+            &op_name,
+            &sink_name,
+            output_schema,
+        );
+
+        let op = std::mem::replace(
+            operator,
+            Box::new(crate::sql_operators::ProjectionAdapter::new(
+                vec![],
+                Arc::new(Schema::empty()),
+                String::new(),
+            )),
+        );
+        operators_to_register.push((op_name.clone(), op));
+        op_sources.push((op_name, source_tables));
     }
 
-    // Connect source nodes to operator nodes.
-    // For now, connect the first source to all operators.
-    // Phase D will handle multi-source routing.
-    if let Some(&(source_name, _)) = source_schemas.first() {
-        for (op_name, _) in &operators_to_register {
-            builder = builder.connect(source_name, op_name);
+    // Connect each operator to its source tables.
+    for (op_name, source_tables) in &op_sources {
+        for table in source_tables {
+            if available_sources.contains(table.as_str()) {
+                builder = builder.connect(table, op_name);
+            } else {
+                tracing::warn!(
+                    operator = %op_name,
+                    source = %table,
+                    "source not found in DAG — skipping edge"
+                );
+            }
         }
     }
 
@@ -282,6 +302,7 @@ mod tests {
             &ctx,
             "trade_summary",
             "SELECT symbol, SUM(volume) AS total_volume FROM trades GROUP BY symbol",
+            vec!["trades".to_string()],
             None,
             None,
         )
@@ -316,6 +337,7 @@ mod tests {
             &ctx,
             "passthrough",
             "SELECT symbol, price FROM trades WHERE price > 100",
+            vec!["trades".to_string()],
             None,
             None,
         )
@@ -335,6 +357,7 @@ mod tests {
             &ctx,
             "filtered_agg",
             "SELECT symbol, SUM(volume) AS tv FROM trades GROUP BY symbol HAVING SUM(volume) > 1000",
+            vec!["trades".to_string()],
             None,
             None,
         )
@@ -359,6 +382,7 @@ mod tests {
             &ctx,
             "agg1",
             "SELECT symbol, COUNT(*) AS cnt FROM trades GROUP BY symbol",
+            vec!["trades".to_string()],
             None,
             None,
         )
@@ -392,9 +416,16 @@ mod tests {
         let schema = trades_schema();
 
         // Lower a non-aggregate query (returns Fallback).
-        let lowered = try_lower_query(&ctx, "passthrough", "SELECT * FROM trades", None, None)
-            .await
-            .unwrap();
+        let lowered = try_lower_query(
+            &ctx,
+            "passthrough",
+            "SELECT * FROM trades",
+            vec!["trades".to_string()],
+            None,
+            None,
+        )
+        .await
+        .unwrap();
 
         let mut queries = vec![("passthrough".to_string(), lowered)];
         let sources = vec![("trades", schema)];
