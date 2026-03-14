@@ -6,11 +6,10 @@
 //!
 //! This module provides unified detection of system capabilities including:
 //!
-//! - **Kernel Version**: Linux kernel features (`io_uring`, XDP requirements)
+//! - **Kernel Version**: Linux/macOS kernel version detection
 //! - **CPU Features**: SIMD capabilities (AVX2, AVX-512, NEON), cache configuration
-//! - **I/O Capabilities**: `io_uring` support levels, storage type detection
-//! - **Network**: XDP/eBPF availability
-//! - **Memory**: NUMA topology, huge pages, total memory
+//! - **Storage**: Storage type detection (SSD vs HDD)
+//! - **Memory**: Huge pages, total memory
 //!
 //! ## Usage
 //!
@@ -28,34 +27,12 @@
 //! println!("Recommended cores: {}", config.num_cores);
 //! ```
 //!
-//! ## Auto-Configuration
-//!
-//! Use [`SystemCapabilities::recommended_config()`] to get an optimized configuration
-//! based on detected hardware:
-//!
-//! ```rust,ignore
-//! use laminar_core::detect::SystemCapabilities;
-//! use laminar_core::tpc::TpcConfig;
-//!
-//! let caps = SystemCapabilities::detect();
-//! let recommended = caps.recommended_config();
-//!
-//! // Apply to TPC runtime
-//! let tpc_config = TpcConfig::builder()
-//!     .num_cores(recommended.num_cores)
-//!     .cpu_pinning(recommended.cpu_pinning)
-//!     .build()?;
-//! ```
-//!
 //! ## Platform Support
 //!
 //! | Feature | Linux | Windows | macOS |
 //! |---------|-------|---------|-------|
 //! | Kernel version | Full | N/A | Darwin |
 //! | CPU features | Full | Full | Full |
-//! | NUMA nodes | Full | Single | Single |
-//! | io_uring | Full | N/A | N/A |
-//! | XDP | Full | N/A | N/A |
 //! | Storage detection | Full | Limited | Limited |
 //! | Huge pages | Full | Limited | Limited |
 
@@ -201,7 +178,7 @@ impl SystemCapabilities {
     /// Check if all advanced features are available.
     #[must_use]
     pub fn is_fully_optimized(&self) -> bool {
-        self.cpu_count > 1
+        self.cpu_count > 1 && self.missing_features().is_empty()
     }
 
     /// Check if the system meets minimum requirements for `LaminarDB`.
