@@ -22,8 +22,6 @@
 // Allow unsafe in alloc module for zero-copy optimizations
 #![allow(unsafe_code)]
 
-/// Cross-partition aggregation.
-pub mod aggregation;
 pub mod alloc;
 /// Distributed checkpoint barrier protocol.
 pub mod checkpoint;
