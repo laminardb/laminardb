@@ -200,7 +200,7 @@ impl Reactor {
     /// Separated from [`poll`] so that [`run`] and [`shutdown`] can access
     /// `self.output_buffer` directly without allocating.
     fn process_events(&mut self) {
-        // Hot path guard - will panic on allocation when allocation-tracking is enabled
+        // Hot path guard — marks this section for profiling
         let _guard = HotPathGuard::enter("Reactor::poll");
 
         // Task budget tracking - records metrics on drop

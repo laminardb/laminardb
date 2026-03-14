@@ -44,18 +44,14 @@ pub mod dag;
 pub mod detect;
 /// Structured error code registry (`LDB-NNNN`) and Ring 0 hot path error type.
 pub mod error_codes;
-pub mod io_uring;
 /// Lookup table types and predicate pushdown.
 pub mod lookup;
 pub mod mv;
-pub mod numa;
 pub mod operator;
 pub mod reactor;
 /// Shared Arrow IPC serialization for `RecordBatch` ↔ bytes.
 pub mod serialization;
 pub mod state;
-/// Platform-abstracted non-blocking storage I/O for Ring 0.
-pub mod storage_io;
 pub mod streaming;
 pub mod subscription;
 pub mod time;
@@ -93,14 +89,6 @@ pub enum Error {
     /// Thread-per-core runtime errors
     #[error("TPC error: {0}")]
     Tpc(#[from] tpc::TpcError),
-
-    /// `io_uring` errors
-    #[error("io_uring error: {0}")]
-    IoUring(#[from] io_uring::IoUringError),
-
-    /// NUMA errors
-    #[error("NUMA error: {0}")]
-    Numa(#[from] numa::NumaError),
 
     /// Materialized view errors
     #[error("MV error: {0}")]

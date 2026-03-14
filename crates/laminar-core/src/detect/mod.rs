@@ -26,7 +26,6 @@
 //! // Get recommended configuration
 //! let config = caps.recommended_config();
 //! println!("Recommended cores: {}", config.num_cores);
-//! println!("Use io_uring: {}", config.use_io_uring);
 //! ```
 //!
 //! ## Auto-Configuration
@@ -37,7 +36,6 @@
 //! ```rust,ignore
 //! use laminar_core::detect::SystemCapabilities;
 //! use laminar_core::tpc::TpcConfig;
-//! use laminar_core::io_uring::IoUringConfig;
 //!
 //! let caps = SystemCapabilities::detect();
 //! let recommended = caps.recommended_config();
@@ -46,7 +44,6 @@
 //! let tpc_config = TpcConfig::builder()
 //!     .num_cores(recommended.num_cores)
 //!     .cpu_pinning(recommended.cpu_pinning)
-//!     .numa_aware(recommended.numa_aware)
 //!     .build()?;
 //! ```
 //!
@@ -71,10 +68,9 @@ pub use config::{PerformanceTier, RecommendedConfig};
 pub use cpu::{
     cache_line_size, is_smt_enabled, logical_cpu_count, physical_cpu_count, CpuFeatures, SimdLevel,
 };
-pub use io::{IoUringCapabilities, MemoryInfo, StorageInfo, StorageType, XdpCapabilities};
+pub use io::{MemoryInfo, StorageInfo, StorageType};
 pub use kernel::KernelVersion;
 
-use crate::numa::NumaTopology;
 use std::path::Path;
 use std::sync::OnceLock;
 
@@ -97,18 +93,12 @@ pub struct SystemCapabilities {
     pub cpu_count: usize,
     /// Number of physical CPU cores.
     pub physical_cores: usize,
-    /// Number of NUMA nodes.
-    pub numa_nodes: usize,
     /// Cache line size in bytes.
     pub cache_line_size: usize,
     /// CPU feature flags.
     pub cpu_features: CpuFeatures,
 
     // ===== I/O =====
-    /// `io_uring` capabilities.
-    pub io_uring: IoUringCapabilities,
-    /// XDP capabilities.
-    pub xdp: XdpCapabilities,
     /// Storage information (for data directory).
     pub storage: StorageInfo,
 
@@ -137,7 +127,6 @@ impl SystemCapabilities {
     pub fn detect_uncached() -> Self {
         let kernel_version = KernelVersion::detect();
         let cpu_features = CpuFeatures::detect();
-        let numa_topology = NumaTopology::detect();
 
         Self {
             platform: Platform::detect(),
@@ -145,12 +134,9 @@ impl SystemCapabilities {
 
             cpu_count: logical_cpu_count(),
             physical_cores: physical_cpu_count(),
-            numa_nodes: numa_topology.num_nodes(),
             cache_line_size: cache_line_size(),
             cpu_features,
 
-            io_uring: IoUringCapabilities::from_kernel_version(kernel_version.as_ref()),
-            xdp: XdpCapabilities::from_kernel_version(kernel_version.as_ref()),
             storage: StorageInfo::default(), // Detect lazily with detect_storage()
 
             memory: MemoryInfo::detect(),
@@ -193,15 +179,12 @@ impl SystemCapabilities {
         let _ = writeln!(s, "CPU:");
         let _ = writeln!(s, "  Logical CPUs: {}", self.cpu_count);
         let _ = writeln!(s, "  Physical cores: {}", self.physical_cores);
-        let _ = writeln!(s, "  NUMA nodes: {}", self.numa_nodes);
         let _ = writeln!(s, "  Cache line: {} bytes", self.cache_line_size);
         let _ = writeln!(s, "  SIMD: {}", self.cpu_features.simd_level());
         let _ = writeln!(s, "  Features: {}", self.cpu_features.summary());
 
         let _ = writeln!(s);
         let _ = writeln!(s, "I/O:");
-        let _ = writeln!(s, "  {}", self.io_uring.summary());
-        let _ = writeln!(s, "  {}", self.xdp.summary());
         let _ = writeln!(s, "  Storage: {}", self.storage.summary());
 
         let _ = writeln!(s);
@@ -218,7 +201,7 @@ impl SystemCapabilities {
     /// Check if all advanced features are available.
     #[must_use]
     pub fn is_fully_optimized(&self) -> bool {
-        self.io_uring.is_usable() && self.io_uring.sqpoll_supported && self.cpu_count > 1
+        self.cpu_count > 1
     }
 
     /// Check if the system meets minimum requirements for `LaminarDB`.
@@ -232,28 +215,6 @@ impl SystemCapabilities {
     #[must_use]
     pub fn missing_features(&self) -> Vec<&'static str> {
         let mut missing = Vec::new();
-
-        if !self.io_uring.feature_enabled {
-            missing.push("io_uring feature not enabled (compile with --features io-uring)");
-        } else if !self.io_uring.available {
-            missing.push("io_uring not available (requires Linux 5.1+)");
-        }
-
-        if !self.io_uring.sqpoll_supported && self.io_uring.available {
-            missing.push("io_uring SQPOLL not supported (requires Linux 5.11+)");
-        }
-
-        if !self.io_uring.iopoll_supported && self.io_uring.available {
-            missing.push("io_uring IOPOLL not supported (requires Linux 5.19+ and NVMe)");
-        }
-
-        if !self.xdp.feature_enabled {
-            missing.push("XDP feature not enabled (compile with --features xdp)");
-        }
-
-        if self.numa_nodes <= 1 && self.cpu_count > 8 {
-            missing.push("NUMA topology not detected (may need hwloc feature)");
-        }
 
         if !self.memory.huge_pages_available {
             missing.push("Huge pages not available");
@@ -269,14 +230,11 @@ impl SystemCapabilities {
             tracing::info!("Kernel: {kv}");
         }
         tracing::info!(
-            "CPU: {} logical, {} physical, {} NUMA nodes",
+            "CPU: {} logical, {} physical",
             self.cpu_count,
             self.physical_cores,
-            self.numa_nodes
         );
         tracing::info!("SIMD: {}", self.cpu_features.simd_level());
-        tracing::info!("io_uring: {}", self.io_uring.summary());
-        tracing::info!("XDP: {}", self.xdp.summary());
         tracing::info!("Memory: {:.1} GB", self.memory.total_memory_gb());
         tracing::info!(
             "Performance tier: {}",
@@ -336,18 +294,6 @@ impl Platform {
     pub const fn is_unix(&self) -> bool {
         matches!(self, Self::Linux | Self::MacOS | Self::FreeBSD)
     }
-
-    /// Check if `io_uring` is potentially available.
-    #[must_use]
-    pub const fn supports_io_uring(&self) -> bool {
-        matches!(self, Self::Linux)
-    }
-
-    /// Check if XDP is potentially available.
-    #[must_use]
-    pub const fn supports_xdp(&self) -> bool {
-        matches!(self, Self::Linux)
-    }
 }
 
 impl std::fmt::Display for Platform {
@@ -372,7 +318,6 @@ mod tests {
 
         assert!(caps.cpu_count >= 1);
         assert!(caps.physical_cores >= 1);
-        assert!(caps.numa_nodes >= 1);
         assert!(caps.cache_line_size >= 32);
         assert!(caps.memory.total_memory > 0);
     }
@@ -384,7 +329,6 @@ mod tests {
         let caps2 = SystemCapabilities::detect();
 
         assert_eq!(caps1.cpu_count, caps2.cpu_count);
-        assert_eq!(caps1.numa_nodes, caps2.numa_nodes);
     }
 
     #[test]
@@ -443,13 +387,6 @@ mod tests {
         assert!(Platform::Linux.is_unix());
         assert!(Platform::MacOS.is_unix());
         assert!(!Platform::Windows.is_unix());
-    }
-
-    #[test]
-    fn test_platform_supports_io_uring() {
-        assert!(Platform::Linux.supports_io_uring());
-        assert!(!Platform::MacOS.supports_io_uring());
-        assert!(!Platform::Windows.supports_io_uring());
     }
 
     #[test]

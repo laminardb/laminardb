@@ -7,10 +7,9 @@
 //! Each `CoreHandle` spawns a dedicated thread that:
 //! 1. Sets CPU affinity to pin to a specific core
 //! 2. Creates a `Reactor` with its own state partition
-//! 3. Optionally initializes an `io_uring` ring for async I/O (Linux only)
-//! 4. Drains the inbox SPSC queue for incoming events
-//! 5. Processes events through the reactor
-//! 6. Pushes outputs to the outbox SPSC queue
+//! 3. Drains the inbox SPSC queue for incoming events
+//! 4. Processes events through the reactor
+//! 5. Pushes outputs to the outbox SPSC queue
 //!
 //! ## Communication
 //!
@@ -19,13 +18,6 @@
 //!
 //! Both use lock-free SPSC queues for minimal latency.
 //!
-//! ## `io_uring` Integration
-//!
-//! On Linux with the `io-uring` feature enabled, each core thread can have its own
-//! `io_uring` ring for high-performance async I/O. This enables:
-//! - SQPOLL mode for syscall-free submission
-//! - Registered buffers for zero-copy I/O
-//! - Per-core I/O isolation for thread-per-core architecture
 
 use std::panic::{catch_unwind, AssertUnwindSafe};
 use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
@@ -34,16 +26,11 @@ use std::thread::{self, JoinHandle};
 
 use tokio::sync::Notify;
 
-#[cfg(all(target_os = "linux", feature = "io-uring"))]
-use crate::io_uring::IoUringConfig;
-
 use crate::alloc::HotPathGuard;
 use crate::budget::TaskBudget;
 use crate::checkpoint::CheckpointBarrier;
-use crate::numa::NumaTopology;
 use crate::operator::{CheckpointCompleteData, Event, Operator, OperatorState, Output};
 use crate::reactor::{Reactor, ReactorConfig};
-use crate::storage_io::{IoCompletion, StorageIo, SyncStorageIo};
 
 use super::backpressure::{
     BackpressureConfig, CreditAcquireResult, CreditGate, CreditMetrics, OverflowStrategy,
@@ -106,17 +93,6 @@ pub struct CoreConfig {
     pub reactor_config: ReactorConfig,
     /// Backpressure configuration
     pub backpressure: BackpressureConfig,
-    /// Enable NUMA-aware memory allocation
-    pub numa_aware: bool,
-    /// Enable per-core storage I/O backend.
-    ///
-    /// When true, creates a [`StorageIo`] instance for this core. On Linux
-    /// with the `io-uring` feature and a supported kernel, this uses
-    /// `io_uring` with SQPOLL. Otherwise falls back to synchronous I/O.
-    pub enable_storage_io: bool,
-    /// `io_uring` configuration (Linux only, requires `io-uring` feature)
-    #[cfg(all(target_os = "linux", feature = "io-uring"))]
-    pub io_uring_config: Option<IoUringConfig>,
 }
 
 impl Default for CoreConfig {
@@ -128,10 +104,6 @@ impl Default for CoreConfig {
             outbox_capacity: 8192,
             reactor_config: ReactorConfig::default(),
             backpressure: BackpressureConfig::default(),
-            numa_aware: false,
-            enable_storage_io: false,
-            #[cfg(all(target_os = "linux", feature = "io-uring"))]
-            io_uring_config: None,
         }
     }
 }
@@ -143,16 +115,10 @@ impl Default for CoreConfig {
 pub struct CoreHandle {
     /// Core ID
     core_id: usize,
-    /// NUMA node for this core
-    numa_node: usize,
     /// Inbox queue (main thread writes, core reads)
     inbox: Arc<SpscQueue<CoreMessage>>,
     /// Outbox queue (core writes, main thread reads)
     outbox: Arc<SpscQueue<TaggedOutput>>,
-    /// Storage I/O completion queue (Ring 0 writes, Ring 2 reads).
-    /// Ring 0 pushes completions from `StorageIo::poll_completions`.
-    /// Ring 2 drains during checkpoint to feed `PerCoreWalManager::check_all_completions`.
-    io_completion_outbox: Arc<SpscQueue<IoCompletion>>,
     /// Credit gate for backpressure (sender acquires, receiver releases)
     credit_gate: Arc<CreditGate>,
     /// Thread handle (None if thread hasn't started or has been joined)
@@ -217,64 +183,18 @@ impl CoreHandle {
         let cpu_affinity = config.cpu_affinity;
         let reactor_config = config.reactor_config.clone();
 
-        // Detect NUMA topology for NUMA-aware allocation
-        let topology = NumaTopology::detect();
-        let numa_node =
-            cpu_affinity.map_or_else(|| topology.current_node(), |cpu| topology.node_for_cpu(cpu));
-
         let inbox = Arc::new(SpscQueue::new(config.inbox_capacity));
         let outbox: Arc<SpscQueue<TaggedOutput>> = Arc::new(SpscQueue::new(config.outbox_capacity));
-        // I/O completion queue: Ring 0 produces, Ring 2 consumes during checkpoint.
-        // Capacity 256 matches default io_uring ring_entries.
-        let io_completion_outbox: Arc<SpscQueue<IoCompletion>> = Arc::new(SpscQueue::new(256));
         let credit_gate = Arc::new(CreditGate::new(config.backpressure.clone()));
         let shutdown = Arc::new(AtomicBool::new(false));
         let events_processed = Arc::new(AtomicU64::new(0));
         let outputs_dropped = Arc::new(AtomicU64::new(0));
         let is_running = Arc::new(AtomicBool::new(false));
 
-        // Create per-core storage I/O backend (cold path — allocation is fine here).
-        let storage_io: Option<Box<dyn StorageIo>> = if config.enable_storage_io {
-            // On Linux with io-uring feature, try io_uring first.
-            #[cfg(all(target_os = "linux", feature = "io-uring"))]
-            {
-                if let Some(ref uring_cfg) = config.io_uring_config {
-                    match crate::storage_io::UringStorageIo::new(core_id, uring_cfg) {
-                        Ok(backend) => {
-                            tracing::info!(
-                                "Core {core_id}: using io_uring storage I/O (SQPOLL={})",
-                                backend.uses_sqpoll()
-                            );
-                            Some(Box::new(backend))
-                        }
-                        Err(e) => {
-                            tracing::warn!(
-                                "Core {core_id}: io_uring init failed ({e}), falling back to sync"
-                            );
-                            Some(Box::new(SyncStorageIo::new()))
-                        }
-                    }
-                } else {
-                    Some(Box::new(SyncStorageIo::new()))
-                }
-            }
-            // On non-Linux or without io-uring feature, use sync backend.
-            #[cfg(not(all(target_os = "linux", feature = "io-uring")))]
-            {
-                Some(Box::new(SyncStorageIo::new()))
-            }
-        } else {
-            None
-        };
-
         let thread_context = CoreThreadContext {
             core_id,
             cpu_affinity,
             reactor_config,
-            numa_aware: config.numa_aware,
-            numa_node,
-            #[cfg(target_os = "linux")]
-            numa_topology: topology,
             inbox: Arc::clone(&inbox),
             outbox: Arc::clone(&outbox),
             credit_gate: Arc::clone(&credit_gate),
@@ -288,10 +208,7 @@ impl CoreHandle {
 
         let thread = thread::Builder::new()
             .name(format!("laminar-core-{core_id}"))
-            .spawn({
-                let io_cq = Arc::clone(&io_completion_outbox);
-                move || core_thread_main(&thread_context, operators, storage_io, io_cq)
-            })
+            .spawn(move || core_thread_main(&thread_context, operators))
             .map_err(|e| TpcError::SpawnFailed {
                 core_id,
                 message: e.to_string(),
@@ -308,10 +225,8 @@ impl CoreHandle {
 
         Ok(Self {
             core_id,
-            numa_node,
             inbox,
             outbox,
-            io_completion_outbox,
             credit_gate,
             thread: Some(thread),
             core_thread_handle,
@@ -326,12 +241,6 @@ impl CoreHandle {
     #[must_use]
     pub fn core_id(&self) -> usize {
         self.core_id
-    }
-
-    /// Returns the NUMA node for this core.
-    #[must_use]
-    pub fn numa_node(&self) -> usize {
-        self.numa_node
     }
 
     /// Returns true if the core thread is running.
@@ -509,18 +418,6 @@ impl CoreHandle {
         self.outbox.pop()
     }
 
-    /// Drain storage I/O completions from this core.
-    ///
-    /// Ring 0 pushes completions from `StorageIo::poll_completions` into a
-    /// per-core SPSC queue. Ring 2 (checkpoint coordinator) calls this to
-    /// retrieve them and pass to `PerCoreWalManager::check_all_completions`.
-    pub fn drain_io_completions(&self, out: &mut Vec<IoCompletion>) {
-        self.io_completion_outbox.pop_each(256, |c| {
-            out.push(c);
-            true
-        });
-    }
-
     /// Returns the number of pending messages in the inbox.
     #[must_use]
     pub fn inbox_len(&self) -> usize {
@@ -613,7 +510,6 @@ impl std::fmt::Debug for CoreHandle {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         f.debug_struct("CoreHandle")
             .field("core_id", &self.core_id)
-            .field("numa_node", &self.numa_node)
             .field("is_running", &self.is_running())
             .field("events_processed", &self.events_processed())
             .field("outputs_dropped", &self.outputs_dropped())
@@ -630,10 +526,6 @@ pub(super) struct CoreThreadContext {
     pub(super) core_id: usize,
     cpu_affinity: Option<usize>,
     reactor_config: ReactorConfig,
-    numa_aware: bool,
-    numa_node: usize,
-    #[cfg(target_os = "linux")]
-    numa_topology: NumaTopology,
     pub(super) inbox: Arc<SpscQueue<CoreMessage>>,
     pub(super) outbox: Arc<SpscQueue<TaggedOutput>>,
     pub(super) credit_gate: Arc<CreditGate>,
@@ -645,7 +537,7 @@ pub(super) struct CoreThreadContext {
     pub(super) output_notify: Arc<Notify>,
 }
 
-/// Initializes the core thread: sets CPU affinity, NUMA allocator, `io_uring`, and creates the reactor.
+/// Initializes the core thread: sets CPU affinity and creates the reactor.
 fn init_core_thread(
     ctx: &CoreThreadContext,
     operators: Vec<Box<dyn Operator>>,
@@ -653,23 +545,6 @@ fn init_core_thread(
     // Set CPU affinity if requested
     if let Some(cpu_id) = ctx.cpu_affinity {
         set_cpu_affinity(ctx.core_id, cpu_id)?;
-    }
-
-    // Bind memory allocations to local NUMA node (Linux only, after CPU affinity)
-    #[cfg(target_os = "linux")]
-    if ctx.numa_aware {
-        if let Err(e) = ctx.numa_topology.bind_local_memory() {
-            tracing::warn!(core_id = ctx.core_id, ?e, "NUMA memory bind failed");
-        }
-    }
-
-    // Log NUMA information if NUMA-aware mode is enabled
-    if ctx.numa_aware {
-        tracing::info!(
-            "Core {} starting on NUMA node {}",
-            ctx.core_id,
-            ctx.numa_node
-        );
     }
 
     // Create the reactor with configured settings
@@ -694,8 +569,6 @@ fn init_core_thread(
 fn core_thread_main(
     ctx: &CoreThreadContext,
     operators: Vec<Box<dyn Operator>>,
-    mut storage_io: Option<Box<dyn StorageIo>>,
-    io_completion_outbox: Arc<SpscQueue<IoCompletion>>,
 ) -> Result<(), TpcError> {
     let mut reactor = init_core_thread(ctx, operators)?;
 
@@ -704,9 +577,6 @@ fn core_thread_main(
 
     // Reusable buffer for reactor outputs (avoids per-poll Vec allocation)
     let mut poll_buffer: Vec<Output> = Vec::with_capacity(256);
-
-    // Reusable buffer for storage I/O completions (zero-alloc across iterations)
-    let mut io_completions: Vec<IoCompletion> = Vec::with_capacity(64);
 
     // Pre-allocated checkpoint Box reused across checkpoint cycles.
     // Taken when a CheckpointRequest arrives, replenished after the inbox drain.
@@ -877,35 +747,6 @@ fn core_thread_main(
             // This signals to senders that we have capacity for more
             if messages_processed > 0 {
                 ctx.credit_gate.release(messages_processed);
-            }
-
-            // Poll storage I/O completions (non-blocking, zero-alloc).
-            // Push completions to the SPSC outbox for Ring 2 (checkpoint coordinator)
-            // to drain and feed to PerCoreWalManager::check_all_completions().
-            if let Some(ref mut sio) = storage_io {
-                io_completions.clear();
-                sio.poll_completions(&mut io_completions);
-                for completion in &io_completions {
-                    // Spin-wait on push failure. A dropped completion
-                    // permanently stalls the WAL writer (pending_sync
-                    // never clears, blocking all future syncs).
-                    let mut c = *completion;
-                    loop {
-                        match io_completion_outbox.push(c) {
-                            Ok(()) => break,
-                            Err(returned) => {
-                                if ctx.shutdown.load(Ordering::Acquire) {
-                                    break;
-                                }
-                                c = returned;
-                                std::hint::spin_loop();
-                            }
-                        }
-                    }
-                }
-                if !io_completions.is_empty() {
-                    had_work = true;
-                }
             }
 
             // Replenish checkpoint slot if it was consumed (infrequent — once per checkpoint).
@@ -1130,10 +971,6 @@ mod tests {
             outbox_capacity: 1024,
             reactor_config: ReactorConfig::default(),
             backpressure: super::BackpressureConfig::default(),
-            numa_aware: false,
-            enable_storage_io: false,
-            #[cfg(all(target_os = "linux", feature = "io-uring"))]
-            io_uring_config: None,
         };
 
         let handle = CoreHandle::spawn(config).unwrap();
@@ -1152,10 +989,6 @@ mod tests {
             outbox_capacity: 1024,
             reactor_config: ReactorConfig::default(),
             backpressure: super::BackpressureConfig::default(),
-            numa_aware: false,
-            enable_storage_io: false,
-            #[cfg(all(target_os = "linux", feature = "io-uring"))]
-            io_uring_config: None,
         };
 
         let handle =
@@ -1186,10 +1019,6 @@ mod tests {
             outbox_capacity: 1024,
             reactor_config: ReactorConfig::default(),
             backpressure: super::BackpressureConfig::default(),
-            numa_aware: false,
-            enable_storage_io: false,
-            #[cfg(all(target_os = "linux", feature = "io-uring"))]
-            io_uring_config: None,
         };
 
         let handle =
@@ -1257,23 +1086,6 @@ mod tests {
         assert!(config.cpu_affinity.is_none());
         assert_eq!(config.inbox_capacity, 8192);
         assert_eq!(config.outbox_capacity, 8192);
-        assert!(!config.numa_aware);
-    }
-
-    #[test]
-    fn test_core_handle_numa_node() {
-        let config = CoreConfig {
-            core_id: 0,
-            cpu_affinity: None,
-            numa_aware: true,
-            ..Default::default()
-        };
-
-        let handle = CoreHandle::spawn(config).unwrap();
-        // On any system, numa_node should be a valid value (0 on non-NUMA systems)
-        assert!(handle.numa_node() < 64);
-
-        handle.shutdown_and_join().unwrap();
     }
 
     #[test]
@@ -1285,10 +1097,6 @@ mod tests {
             outbox_capacity: 1024,
             reactor_config: ReactorConfig::default(),
             backpressure: super::BackpressureConfig::default(),
-            numa_aware: false,
-            enable_storage_io: false,
-            #[cfg(all(target_os = "linux", feature = "io-uring"))]
-            io_uring_config: None,
         };
 
         let handle =
@@ -1327,10 +1135,6 @@ mod tests {
             outbox_capacity: 1024,
             reactor_config: ReactorConfig::default(),
             backpressure: super::BackpressureConfig::default(),
-            numa_aware: false,
-            enable_storage_io: false,
-            #[cfg(all(target_os = "linux", feature = "io-uring"))]
-            io_uring_config: None,
         };
 
         let handle =
@@ -1368,10 +1172,6 @@ mod tests {
             outbox_capacity: 1024,
             reactor_config: ReactorConfig::default(),
             backpressure: super::BackpressureConfig::default(),
-            numa_aware: false,
-            enable_storage_io: false,
-            #[cfg(all(target_os = "linux", feature = "io-uring"))]
-            io_uring_config: None,
         };
 
         let handle =
@@ -1411,10 +1211,6 @@ mod tests {
             outbox_capacity: 1024,
             reactor_config: ReactorConfig::default(),
             backpressure: super::BackpressureConfig::default(),
-            numa_aware: false,
-            enable_storage_io: false,
-            #[cfg(all(target_os = "linux", feature = "io-uring"))]
-            io_uring_config: None,
         };
 
         let handle =
@@ -1448,10 +1244,6 @@ mod tests {
             outbox_capacity: 1024,
             reactor_config: ReactorConfig::default(),
             backpressure: super::BackpressureConfig::default(),
-            numa_aware: false,
-            enable_storage_io: false,
-            #[cfg(all(target_os = "linux", feature = "io-uring"))]
-            io_uring_config: None,
         };
 
         let handle =
@@ -1493,10 +1285,6 @@ mod tests {
             outbox_capacity: 4, // Very small outbox to force drops
             reactor_config: ReactorConfig::default(),
             backpressure: super::BackpressureConfig::default(),
-            numa_aware: false,
-            enable_storage_io: false,
-            #[cfg(all(target_os = "linux", feature = "io-uring"))]
-            io_uring_config: None,
         };
 
         let handle =
@@ -1529,10 +1317,6 @@ mod tests {
             outbox_capacity: 1024,
             reactor_config: ReactorConfig::default(),
             backpressure: super::BackpressureConfig::default(),
-            numa_aware: false,
-            enable_storage_io: false,
-            #[cfg(all(target_os = "linux", feature = "io-uring"))]
-            io_uring_config: None,
         };
 
         let handle =

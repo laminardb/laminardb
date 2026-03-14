@@ -923,7 +923,6 @@ impl LaminarDB {
                 num_cores,
                 cpu_pinning: tpc_cfg.cpu_pinning,
                 cpu_start: tpc_cfg.cpu_start,
-                numa_aware: tpc_cfg.numa_aware,
                 ..Default::default()
             };
 

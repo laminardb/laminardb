@@ -11,7 +11,6 @@ use laminar_connectors::checkpoint::SourceCheckpoint;
 use laminar_connectors::config::ConnectorConfig;
 use laminar_connectors::connector::SourceConnector;
 use laminar_core::checkpoint::CheckpointBarrierInjector;
-use laminar_core::storage_io::IoCompletion;
 use laminar_core::tpc::TaggedOutput;
 use laminar_core::tpc::{CoreConfig, CoreHandle, TpcConfig, TpcError};
 
@@ -60,10 +59,6 @@ impl TpcRuntime {
                 outbox_capacity: config.outbox_capacity,
                 reactor_config: config.reactor_config.clone(),
                 backpressure: laminar_core::tpc::BackpressureConfig::default(),
-                numa_aware: config.numa_aware,
-                enable_storage_io: config.enable_storage_io,
-                #[cfg(all(target_os = "linux", feature = "io-uring"))]
-                io_uring_config: config.io_uring_config.clone(),
             };
             cores.push(CoreHandle::spawn_with_notify(
                 core_config,
@@ -233,17 +228,6 @@ impl TpcRuntime {
     #[must_use]
     pub fn num_sources(&self) -> usize {
         self.source_threads.len()
-    }
-
-    /// Drain storage I/O completions from all cores into `out`.
-    ///
-    /// Called by the checkpoint coordinator (Ring 2) before checking WAL
-    /// sync status. Collects completions that Ring 0 pushed after polling
-    /// its `StorageIo` backend.
-    pub fn drain_all_io_completions(&self, out: &mut Vec<IoCompletion>) {
-        for core in &self.cores {
-            core.drain_io_completions(out);
-        }
     }
 
     /// Returns the shared output signaling handles.

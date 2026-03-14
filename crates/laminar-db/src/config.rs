@@ -64,9 +64,8 @@ impl Default for TieringConfig {
 
 /// Thread-per-core runtime configuration.
 ///
-/// Controls CPU pinning, core count, and NUMA settings for the TPC
-/// pipeline. When `None` on [`LaminarConfig`], auto-detected defaults
-/// are used.
+/// Controls CPU pinning and core count for the TPC pipeline. When
+/// `None` on [`LaminarConfig`], auto-detected defaults are used.
 #[derive(Debug, Clone)]
 pub struct TpcRuntimeConfig {
     /// Number of cores (`None` = auto-detect via `available_parallelism`).
@@ -75,8 +74,6 @@ pub struct TpcRuntimeConfig {
     pub cpu_pinning: bool,
     /// First CPU ID for pinning.
     pub cpu_start: usize,
-    /// Enable NUMA-aware memory allocation.
-    pub numa_aware: bool,
 }
 
 impl TpcRuntimeConfig {
@@ -87,7 +84,6 @@ impl TpcRuntimeConfig {
             num_cores: None,
             cpu_pinning: cfg!(target_os = "linux"),
             cpu_start: 0,
-            numa_aware: cfg!(target_os = "linux"),
         }
     }
 }

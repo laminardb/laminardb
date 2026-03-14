@@ -11,34 +11,18 @@
 //! let config = caps.recommended_config();
 //!
 //! println!("Recommended cores: {}", config.num_cores);
-//! println!("Use io_uring: {}", config.use_io_uring);
 //! ```
 
 use super::{logical_cpu_count, physical_cpu_count};
 
 /// Recommended configuration based on detected capabilities.
 #[derive(Debug, Clone)]
-#[allow(clippy::struct_excessive_bools)]
 pub struct RecommendedConfig {
     // ===== Thread-Per-Core =====
     /// Recommended number of cores to use.
     pub num_cores: usize,
     /// Whether to enable CPU pinning.
     pub cpu_pinning: bool,
-    /// Whether NUMA-aware allocation should be enabled.
-    pub numa_aware: bool,
-
-    // ===== I/O =====
-    /// Whether to use `io_uring` for I/O.
-    pub use_io_uring: bool,
-    /// Whether to use SQPOLL mode.
-    pub io_uring_sqpoll: bool,
-    /// Whether to use IOPOLL mode (for `NVMe`).
-    pub io_uring_iopoll: bool,
-
-    // ===== Network =====
-    /// Whether to use XDP for network processing.
-    pub use_xdp: bool,
 
     // ===== Memory =====
     /// Whether to use huge pages.
@@ -63,16 +47,6 @@ impl RecommendedConfig {
             // Thread-per-core
             num_cores: Self::calculate_num_cores(caps),
             cpu_pinning: caps.cpu_count > 1,
-            numa_aware: caps.numa_nodes > 1,
-
-            // I/O
-            use_io_uring: caps.io_uring.is_usable(),
-            io_uring_sqpoll: caps.io_uring.sqpoll_supported,
-            io_uring_iopoll: caps.io_uring.iopoll_supported
-                && caps.storage.device_type.supports_iopoll(),
-
-            // Network
-            use_xdp: caps.xdp.is_usable(),
 
             // Memory
             use_huge_pages: caps.memory.huge_pages_available && caps.memory.huge_pages_free > 0,
@@ -147,14 +121,6 @@ impl RecommendedConfig {
             "  Cores: {} (pinned: {})",
             self.num_cores, self.cpu_pinning
         );
-        let _ = writeln!(s, "  NUMA-aware: {}", self.numa_aware);
-
-        let _ = writeln!(
-            s,
-            "  io_uring: {} (SQPOLL: {}, IOPOLL: {})",
-            self.use_io_uring, self.io_uring_sqpoll, self.io_uring_iopoll
-        );
-        let _ = writeln!(s, "  XDP: {}", self.use_xdp);
 
         let _ = writeln!(s, "  Huge pages: {}", self.use_huge_pages);
         let _ = writeln!(s, "  Arena size: {} MB", self.arena_size / (1024 * 1024));
@@ -172,17 +138,15 @@ impl RecommendedConfig {
     /// Check if this configuration uses all advanced features.
     #[must_use]
     pub fn is_optimal(&self) -> bool {
-        self.use_io_uring && self.io_uring_sqpoll && self.cpu_pinning
+        self.cpu_pinning
     }
 
     /// Get a performance tier based on capabilities.
     #[must_use]
     pub fn performance_tier(&self) -> PerformanceTier {
-        if self.use_io_uring && self.io_uring_sqpoll && self.io_uring_iopoll && self.numa_aware {
-            PerformanceTier::Maximum
-        } else if self.use_io_uring && self.io_uring_sqpoll {
+        if self.cpu_pinning && self.num_cores > 4 {
             PerformanceTier::High
-        } else if self.use_io_uring {
+        } else if self.cpu_pinning {
             PerformanceTier::Good
         } else {
             PerformanceTier::Basic
@@ -195,11 +159,6 @@ impl Default for RecommendedConfig {
         Self {
             num_cores: logical_cpu_count(),
             cpu_pinning: false,
-            numa_aware: false,
-            use_io_uring: false,
-            io_uring_sqpoll: false,
-            io_uring_iopoll: false,
-            use_xdp: false,
             use_huge_pages: false,
             arena_size: 16 * 1024 * 1024,
             state_store_size: 256 * 1024 * 1024,
@@ -212,13 +171,13 @@ impl Default for RecommendedConfig {
 /// Performance tier based on available features.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord)]
 pub enum PerformanceTier {
-    /// Standard syscall-based I/O
+    /// Standard I/O, no CPU pinning
     Basic,
-    /// `io_uring` basic mode
+    /// CPU pinning enabled
     Good,
-    /// `io_uring` with SQPOLL
+    /// CPU pinning with multiple cores
     High,
-    /// Full optimization (`io_uring` SQPOLL+IOPOLL, NUMA, XDP)
+    /// Full optimization
     Maximum,
 }
 
@@ -244,7 +203,6 @@ mod tests {
         let config = RecommendedConfig::default();
         assert!(config.num_cores >= 1);
         assert!(!config.cpu_pinning);
-        assert!(!config.use_io_uring);
     }
 
     #[test]
@@ -264,8 +222,6 @@ mod tests {
         let summary = config.summary();
 
         assert!(summary.contains("Cores:"));
-        assert!(summary.contains("io_uring:"));
-        assert!(summary.contains("NUMA-aware:"));
     }
 
     #[test]
@@ -286,8 +242,6 @@ mod tests {
         let mut config = RecommendedConfig::default();
         assert!(!config.is_optimal());
 
-        config.use_io_uring = true;
-        config.io_uring_sqpoll = true;
         config.cpu_pinning = true;
         assert!(config.is_optimal());
     }
@@ -301,25 +255,16 @@ mod tests {
     #[test]
     fn test_performance_tier_good() {
         let mut config = RecommendedConfig::default();
-        config.use_io_uring = true;
+        config.cpu_pinning = true;
+        config.num_cores = 2;
         assert_eq!(config.performance_tier(), PerformanceTier::Good);
     }
 
     #[test]
     fn test_performance_tier_high() {
         let mut config = RecommendedConfig::default();
-        config.use_io_uring = true;
-        config.io_uring_sqpoll = true;
+        config.cpu_pinning = true;
+        config.num_cores = 8;
         assert_eq!(config.performance_tier(), PerformanceTier::High);
-    }
-
-    #[test]
-    fn test_performance_tier_maximum() {
-        let mut config = RecommendedConfig::default();
-        config.use_io_uring = true;
-        config.io_uring_sqpoll = true;
-        config.io_uring_iopoll = true;
-        config.numa_aware = true;
-        assert_eq!(config.performance_tier(), PerformanceTier::Maximum);
     }
 }
