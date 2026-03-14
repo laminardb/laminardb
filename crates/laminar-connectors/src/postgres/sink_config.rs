@@ -453,8 +453,8 @@ mod tests {
 
     #[test]
     fn test_delivery_guarantee_display() {
-        assert_eq!(DeliveryGuarantee::AtLeastOnce.to_string(), "at_least_once");
-        assert_eq!(DeliveryGuarantee::ExactlyOnce.to_string(), "exactly_once");
+        assert_eq!(DeliveryGuarantee::AtLeastOnce.to_string(), "at-least-once");
+        assert_eq!(DeliveryGuarantee::ExactlyOnce.to_string(), "exactly-once");
     }
 
     #[test]
