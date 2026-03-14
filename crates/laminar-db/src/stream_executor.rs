@@ -71,6 +71,9 @@ pub(crate) fn emit_clause_to_core(
 ///
 /// Parses the SQL and walks the AST to find `TableFactor::Table` references,
 /// recursing into subqueries, nested joins, and set operations (UNION, etc.).
+///
+/// Returns a **deduplicated** set. For self-join detection use
+/// [`is_single_source_query`] instead.
 pub(crate) fn extract_table_references(sql: &str) -> FxHashSet<String> {
     let mut tables = FxHashSet::default();
     let dialect = GenericDialect {};
@@ -83,6 +86,74 @@ pub(crate) fn extract_table_references(sql: &str) -> FxHashSet<String> {
         }
     }
     tables
+}
+
+/// Check whether `sql` references exactly one logical table occurrence.
+///
+/// Unlike [`extract_table_references`] (which deduplicates), this counts every
+/// FROM/JOIN table occurrence. A self-join like `events e1 JOIN events e2`
+/// returns `false` because there are two occurrences even though the base table
+/// name is the same.
+///
+/// Returns `Some(table_name)` when there is exactly one occurrence, `None`
+/// otherwise.
+pub(crate) fn single_source_table(sql: &str) -> Option<String> {
+    let dialect = GenericDialect {};
+    let statements = Parser::parse_sql(&dialect, sql).ok()?;
+    let mut tables = Vec::new();
+    for stmt in &statements {
+        if let Statement::Query(query) = stmt {
+            collect_tables_counting(query.body.as_ref(), &mut tables);
+        }
+    }
+    if tables.len() == 1 {
+        tables.into_iter().next()
+    } else {
+        None
+    }
+}
+
+/// Like [`collect_tables_from_set_expr`] but collects every occurrence (not deduplicated).
+fn collect_tables_counting(set_expr: &SetExpr, tables: &mut Vec<String>) {
+    match set_expr {
+        SetExpr::Select(select) => {
+            for table_with_joins in &select.from {
+                collect_factor_counting(&table_with_joins.relation, tables);
+                for join in &table_with_joins.joins {
+                    collect_factor_counting(&join.relation, tables);
+                }
+            }
+        }
+        SetExpr::SetOperation { left, right, .. } => {
+            collect_tables_counting(left.as_ref(), tables);
+            collect_tables_counting(right.as_ref(), tables);
+        }
+        SetExpr::Query(query) => {
+            collect_tables_counting(query.body.as_ref(), tables);
+        }
+        _ => {}
+    }
+}
+
+/// Collect a single table occurrence from a `TableFactor`.
+fn collect_factor_counting(factor: &TableFactor, tables: &mut Vec<String>) {
+    match factor {
+        TableFactor::Table { name, .. } => {
+            tables.push(name.to_string());
+        }
+        TableFactor::Derived { subquery, .. } => {
+            collect_tables_counting(subquery.body.as_ref(), tables);
+        }
+        TableFactor::NestedJoin {
+            table_with_joins, ..
+        } => {
+            collect_factor_counting(&table_with_joins.relation, tables);
+            for join in &table_with_joins.joins {
+                collect_factor_counting(&join.relation, tables);
+            }
+        }
+        _ => {}
+    }
 }
 
 /// Recursively collect table names from a `SetExpr`.
@@ -875,10 +946,10 @@ impl StreamExecutor {
     ) -> Result<Vec<RecordBatch>, DbError> {
         let query_sql = self.queries[idx].sql.clone();
         let query_name = self.queries[idx].name.clone();
-        let table_refs = &self.queries[idx].table_refs;
 
-        // Only attempt compiled projection for single-source queries
-        if table_refs.len() != 1 {
+        // Only attempt compiled projection for single-source queries.
+        // Use single_source_table (counts occurrences) to reject self-joins.
+        if single_source_table(&query_sql).is_none() {
             return self.execute_plain_query_with_caching(idx).await;
         }
 
@@ -902,6 +973,7 @@ impl StreamExecutor {
 
         // Could not compile — cache the logical plan instead
         let plan = df.logical_plan().clone();
+        let table_refs = &self.queries[idx].table_refs;
         let fingerprint = source_schemas_fingerprint(table_refs, &self.source_schemas);
         self.cached_logical_plans.insert(idx, plan);
         self.cached_plan_fingerprints.insert(idx, fingerprint);
@@ -2855,8 +2927,7 @@ mod tests {
         let r2 = executor.execute_cycle(&empty, i64::MAX).await.unwrap();
         let pass_rows: usize = r2
             .get("pass")
-            .map(|bs| bs.iter().map(|b| b.num_rows()).sum())
-            .unwrap_or(0);
+            .map_or(0, |bs| bs.iter().map(|b| b.num_rows()).sum());
         assert_eq!(pass_rows, 0, "no source data should produce no output");
     }
 

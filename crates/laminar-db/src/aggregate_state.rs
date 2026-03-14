@@ -529,12 +529,8 @@ impl IncrementalAggState {
         }
 
         // Determine if we should attempt to compile pre-agg expressions.
-        let table_refs = crate::stream_executor::extract_table_references(sql);
-        let compile_source = if table_refs.len() == 1 {
-            table_refs.into_iter().next()
-        } else {
-            None
-        };
+        // Use single_source_table (counts occurrences) to reject self-joins.
+        let compile_source = crate::stream_executor::single_source_table(sql);
         let state = ctx.state();
         let props = state.execution_props();
         let input_df_schema = &agg_info.input_df_schema;
@@ -1192,9 +1188,16 @@ fn find_aggregate_inner(
 }
 
 /// Extract the WHERE predicate from a plan tree below the Aggregate.
+///
+/// Walks through common unary wrapper nodes (Projection, Sort, Limit,
+/// `SubqueryAlias`) to find a `Filter` that the optimizer may have placed
+/// below intermediate nodes.
 fn extract_where_predicate(plan: &LogicalPlan) -> Option<datafusion_expr::Expr> {
     match plan {
         LogicalPlan::Filter(f) => Some(f.predicate.clone()),
+        LogicalPlan::Projection(p) => extract_where_predicate(&p.input),
+        LogicalPlan::Sort(s) => extract_where_predicate(&s.input),
+        LogicalPlan::Limit(l) => extract_where_predicate(&l.input),
         LogicalPlan::SubqueryAlias(a) => extract_where_predicate(&a.input),
         _ => None,
     }

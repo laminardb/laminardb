@@ -294,9 +294,9 @@ Three-ring model separating latency-critical event processing from background I/
 └──────────────────────────────────────────────────────────────┘
 ```
 
-- **Ring 0** — CPU-pinned reactor loop with thread-per-core execution. Minimal heap allocations. SPSC lock-free queues between cores. Target: sub-microsecond per-event latency.
-- **Ring 1** — Tokio async runtime handling WAL writes, checkpointing, connector I/O, and changelog draining. Communicates with Ring 0 via bounded channels.
-- **Ring 2** — HTTP admin API, metrics, configuration management. Auth and observability are planned (Phase 4/5).
+- **Streaming coordinator** — Single tokio task driving SQL execution cycles. Source connectors push batches via mpsc channels; the coordinator runs compiled projections / cached logical plans, routes results to sinks, and manages checkpoint barriers. Target: sub-microsecond per-event latency.
+- **Background I/O** — Tokio async runtime handling WAL writes, checkpointing, connector I/O, and changelog draining.
+- **Admin** — HTTP admin API, metrics, configuration management. Auth and observability are planned (Phase 4/5).
 
 See [docs/ARCHITECTURE.md](docs/ARCHITECTURE.md) for the full design.
 

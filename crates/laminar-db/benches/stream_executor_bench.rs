@@ -7,6 +7,7 @@
 //! Run with: `cargo bench --bench stream_executor_bench -p laminar-db`
 
 use std::sync::Arc;
+use std::time::Duration;
 
 use criterion::{criterion_group, criterion_main, BatchSize, Criterion};
 
@@ -55,11 +56,30 @@ fn synthetic_batch(rows: usize) -> RecordBatch {
     .unwrap()
 }
 
+/// A trivial type implementing `FromBatch` for subscription polling.
+struct RowCount(#[allow(dead_code)] usize);
+
+impl laminar_db::FromBatch for RowCount {
+    fn from_batch(_batch: &RecordBatch, _row: usize) -> Self {
+        Self(1)
+    }
+    fn from_batch_all(batch: &RecordBatch) -> Vec<Self> {
+        vec![Self(batch.num_rows())]
+    }
+}
+
+/// Wait for at least one output batch on the given stream (with timeout).
+fn wait_for_output(db: &LaminarDB, stream: &str, timeout: Duration) {
+    let sub = db.subscribe::<RowCount>(stream).unwrap();
+    let _ = sub.recv_timeout(timeout);
+}
+
 /// Benchmark: `SELECT id, region, price FROM t WHERE quantity > 10`
 ///
 /// Measures the compiled projection path for simple non-aggregate single-source queries.
 fn bench_plain_select(c: &mut Criterion) {
-    let rt = tokio::runtime::Builder::new_current_thread()
+    let rt = tokio::runtime::Builder::new_multi_thread()
+        .worker_threads(2)
         .enable_all()
         .build()
         .unwrap();
@@ -70,25 +90,21 @@ fn bench_plain_select(c: &mut Criterion) {
     group.bench_function("1024_rows", |b| {
         b.iter_batched(
             || {
-                // Setup: create DB, register source, add query
-                let db = LaminarDB::open().unwrap();
-                rt.block_on(async {
+                let db = rt.block_on(async {
+                    let db = LaminarDB::open().unwrap();
                     db.execute("CREATE SOURCE trades (id BIGINT, region VARCHAR, price DOUBLE, quantity BIGINT, ts BIGINT) WITH ('connector' = 'test')").await.unwrap();
                     db.execute("CREATE STREAM filtered AS SELECT id, region, price FROM trades WHERE quantity > 10").await.unwrap();
+                    db
                 });
                 let source = db.source_untyped("trades").unwrap();
-                // Warm up: first cycle to trigger compilation
+                // Warm up: first cycle triggers compilation
                 source.push_arrow(batch.clone()).unwrap();
-                rt.block_on(async {
-                    tokio::time::sleep(std::time::Duration::from_millis(50)).await;
-                });
+                wait_for_output(&db, "filtered", Duration::from_secs(2));
                 (db, source, batch.clone())
             },
             |(db, source, batch)| {
                 source.push_arrow(batch).unwrap();
-                rt.block_on(async {
-                    tokio::time::sleep(std::time::Duration::from_millis(10)).await;
-                });
+                wait_for_output(&db, "filtered", Duration::from_secs(2));
                 std::hint::black_box(&db);
             },
             BatchSize::SmallInput,
@@ -101,7 +117,8 @@ fn bench_plain_select(c: &mut Criterion) {
 ///
 /// Measures the incremental aggregation path (already compiled pre-agg).
 fn bench_agg_group_by(c: &mut Criterion) {
-    let rt = tokio::runtime::Builder::new_current_thread()
+    let rt = tokio::runtime::Builder::new_multi_thread()
+        .worker_threads(2)
         .enable_all()
         .build()
         .unwrap();
@@ -112,23 +129,20 @@ fn bench_agg_group_by(c: &mut Criterion) {
     group.bench_function("1024_rows_4_groups", |b| {
         b.iter_batched(
             || {
-                let db = LaminarDB::open().unwrap();
-                rt.block_on(async {
+                let db = rt.block_on(async {
+                    let db = LaminarDB::open().unwrap();
                     db.execute("CREATE SOURCE trades (id BIGINT, region VARCHAR, price DOUBLE, quantity BIGINT, ts BIGINT) WITH ('connector' = 'test')").await.unwrap();
                     db.execute("CREATE STREAM agg_result AS SELECT region, SUM(price) AS total_price FROM trades GROUP BY region").await.unwrap();
+                    db
                 });
                 let source = db.source_untyped("trades").unwrap();
                 source.push_arrow(batch.clone()).unwrap();
-                rt.block_on(async {
-                    tokio::time::sleep(std::time::Duration::from_millis(50)).await;
-                });
+                wait_for_output(&db, "agg_result", Duration::from_secs(2));
                 (db, source, batch.clone())
             },
             |(db, source, batch)| {
                 source.push_arrow(batch).unwrap();
-                rt.block_on(async {
-                    tokio::time::sleep(std::time::Duration::from_millis(10)).await;
-                });
+                wait_for_output(&db, "agg_result", Duration::from_secs(2));
                 std::hint::black_box(&db);
             },
             BatchSize::SmallInput,
@@ -141,7 +155,8 @@ fn bench_agg_group_by(c: &mut Criterion) {
 ///
 /// Measures the cached logical plan path for complex queries.
 fn bench_sort_limit(c: &mut Criterion) {
-    let rt = tokio::runtime::Builder::new_current_thread()
+    let rt = tokio::runtime::Builder::new_multi_thread()
+        .worker_threads(2)
         .enable_all()
         .build()
         .unwrap();
@@ -152,23 +167,20 @@ fn bench_sort_limit(c: &mut Criterion) {
     group.bench_function("1024_rows_top10", |b| {
         b.iter_batched(
             || {
-                let db = LaminarDB::open().unwrap();
-                rt.block_on(async {
+                let db = rt.block_on(async {
+                    let db = LaminarDB::open().unwrap();
                     db.execute("CREATE SOURCE trades (id BIGINT, region VARCHAR, price DOUBLE, quantity BIGINT, ts BIGINT) WITH ('connector' = 'test')").await.unwrap();
                     db.execute("CREATE STREAM sorted AS SELECT id, price FROM trades ORDER BY price DESC LIMIT 10").await.unwrap();
+                    db
                 });
                 let source = db.source_untyped("trades").unwrap();
                 source.push_arrow(batch.clone()).unwrap();
-                rt.block_on(async {
-                    tokio::time::sleep(std::time::Duration::from_millis(50)).await;
-                });
+                wait_for_output(&db, "sorted", Duration::from_secs(2));
                 (db, source, batch.clone())
             },
             |(db, source, batch)| {
                 source.push_arrow(batch).unwrap();
-                rt.block_on(async {
-                    tokio::time::sleep(std::time::Duration::from_millis(10)).await;
-                });
+                wait_for_output(&db, "sorted", Duration::from_secs(2));
                 std::hint::black_box(&db);
             },
             BatchSize::SmallInput,
@@ -181,7 +193,8 @@ fn bench_sort_limit(c: &mut Criterion) {
 ///
 /// Measures intermediate MemTable registration overhead across dependent queries.
 fn bench_query_chain(c: &mut Criterion) {
-    let rt = tokio::runtime::Builder::new_current_thread()
+    let rt = tokio::runtime::Builder::new_multi_thread()
+        .worker_threads(2)
         .enable_all()
         .build()
         .unwrap();
@@ -192,25 +205,23 @@ fn bench_query_chain(c: &mut Criterion) {
     group.bench_function("3_query_chain", |b| {
         b.iter_batched(
             || {
-                let db = LaminarDB::open().unwrap();
-                rt.block_on(async {
+                let db = rt.block_on(async {
+                    let db = LaminarDB::open().unwrap();
                     db.execute("CREATE SOURCE trades (id BIGINT, region VARCHAR, price DOUBLE, quantity BIGINT, ts BIGINT) WITH ('connector' = 'test')").await.unwrap();
                     db.execute("CREATE STREAM step_a AS SELECT id, region, price * quantity AS notional FROM trades WHERE quantity > 5").await.unwrap();
                     db.execute("CREATE STREAM step_b AS SELECT id, notional FROM step_a WHERE notional > 100.0").await.unwrap();
                     db.execute("CREATE STREAM step_c AS SELECT COUNT(*) AS cnt FROM step_b").await.unwrap();
+                    db
                 });
                 let source = db.source_untyped("trades").unwrap();
                 source.push_arrow(batch.clone()).unwrap();
-                rt.block_on(async {
-                    tokio::time::sleep(std::time::Duration::from_millis(50)).await;
-                });
+                // Wait for the terminal stream
+                wait_for_output(&db, "step_c", Duration::from_secs(2));
                 (db, source, batch.clone())
             },
             |(db, source, batch)| {
                 source.push_arrow(batch).unwrap();
-                rt.block_on(async {
-                    tokio::time::sleep(std::time::Duration::from_millis(10)).await;
-                });
+                wait_for_output(&db, "step_c", Duration::from_secs(2));
                 std::hint::black_box(&db);
             },
             BatchSize::SmallInput,

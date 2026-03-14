@@ -216,12 +216,8 @@ impl CoreWindowState {
         }
 
         // Determine if we should attempt to compile pre-agg expressions.
-        let table_refs = crate::stream_executor::extract_table_references(sql);
-        let compile_source = if table_refs.len() == 1 {
-            table_refs.into_iter().next()
-        } else {
-            None
-        };
+        // Use single_source_table (counts occurrences) to reject self-joins.
+        let compile_source = crate::stream_executor::single_source_table(sql);
         let state_ref = ctx.state();
         let compile_props = state_ref.execution_props();
         let input_df_schema = &agg_info.input_df_schema;
@@ -1258,8 +1254,15 @@ impl CoreWindowState {
     }
 
     /// Output schema for windowed aggregate results.
+    ///
+    /// Returns the post-projection schema when a post-aggregate projection
+    /// is present, otherwise the intermediate aggregate schema.
     pub(crate) fn output_schema(&self) -> Arc<arrow::datatypes::Schema> {
-        Arc::clone(&self.output_schema)
+        if let Some(proj) = &self.post_projection {
+            Arc::clone(&proj.final_schema)
+        } else {
+            Arc::clone(&self.output_schema)
+        }
     }
 
     /// Pre-aggregation SQL.
