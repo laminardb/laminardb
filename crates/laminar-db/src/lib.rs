@@ -67,6 +67,8 @@ mod sql_utils;
 /// explicit resource management, and Arrow RecordBatch at all boundaries.
 #[cfg(feature = "api")]
 pub mod api;
+#[allow(dead_code)] // Adapters constructed by SQL lowering (Phase C)
+mod sql_operators;
 mod stream_executor;
 mod table_backend;
 mod table_cache_mode;
