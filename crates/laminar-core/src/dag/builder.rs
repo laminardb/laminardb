@@ -1,7 +1,7 @@
 //! DAG builder API for programmatic topology construction.
 //!
-//! Provides `DagBuilder` for fluent DAG construction in Ring 2 and
-//! `FanOutBuilder` for creating fan-out branches from shared stages.
+//! Provides `DagBuilder` for fluent DAG construction at configuration time
+//! and `FanOutBuilder` for creating fan-out branches from shared stages.
 
 use arrow_schema::SchemaRef;
 use rustc_hash::FxHashMap;
@@ -11,8 +11,8 @@ use super::topology::{DagNodeType, StreamingDag};
 
 /// Fluent builder for constructing `StreamingDag` topologies.
 ///
-/// Constructed in Ring 2. Once `build()` is called, the topology is
-/// immutable and can be executed in Ring 0.
+/// Constructed at configuration time. Once `build()` is called, the topology
+/// is immutable and can be executed on the event processing path.
 ///
 /// # Example
 ///

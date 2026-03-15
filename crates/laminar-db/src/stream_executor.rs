@@ -356,6 +356,16 @@ pub(crate) struct StreamExecutor {
     compiled_post_projections: FxHashMap<usize, CompiledPostProjection>,
     /// Query indices for which post-projection compilation was attempted and failed.
     post_projection_compile_failed: FxHashSet<usize>,
+    /// Cached logical plans for HAVING filter fallback paths (keyed by query index).
+    /// On first call, `ctx.sql()` parses and optimizes; subsequent cycles use
+    /// `create_physical_plan()` directly, skipping SQL parsing.
+    cached_having_plans: FxHashMap<usize, LogicalPlan>,
+    /// Cached logical plans for post-projection SQL fallback paths (keyed by query
+    /// index). Same caching pattern as `cached_having_plans`.
+    cached_post_projection_plans: FxHashMap<usize, LogicalPlan>,
+    /// Query indices that were skipped last cycle due to budget exhaustion.
+    /// These are processed first (priority) on the next cycle.
+    skipped_last_cycle: FxHashSet<usize>,
 }
 
 impl StreamExecutor {
@@ -386,6 +396,9 @@ impl StreamExecutor {
             all_queries_compiled: None,
             compiled_post_projections: FxHashMap::default(),
             post_projection_compile_failed: FxHashSet::default(),
+            cached_having_plans: FxHashMap::default(),
+            cached_post_projection_plans: FxHashMap::default(),
+            skipped_last_cycle: FxHashSet::default(),
         }
     }
 
@@ -607,9 +620,30 @@ impl StreamExecutor {
         let mut intermediate_tables = std::mem::take(&mut self.cycle_intermediates);
         intermediate_tables.clear();
 
+        self.skipped_last_cycle.clear();
+        let cycle_start = std::time::Instant::now();
+
         let topo_len = self.topo_order.len();
         for i in 0..topo_len {
             let idx = self.topo_order[i];
+
+            // Budget check: stop if >8ms elapsed (leaves headroom for maintenance).
+            // Always execute at least one query per cycle for forward progress.
+            if i > 0 {
+                #[allow(clippy::cast_possible_truncation)]
+                let elapsed_ns = cycle_start.elapsed().as_nanos() as u64;
+                if elapsed_ns > 8_000_000 {
+                    for j in i..topo_len {
+                        self.skipped_last_cycle.insert(self.topo_order[j]);
+                    }
+                    tracing::debug!(
+                        skipped = topo_len - i,
+                        elapsed_ms = elapsed_ns / 1_000_000,
+                        "per-query budget exceeded — deferring remaining queries"
+                    );
+                    break;
+                }
+            }
 
             let is_eowc = self.queries[idx].suppresses_intermediate();
             let has_asof = self.queries[idx].asof_config.is_some();
@@ -1365,42 +1399,42 @@ impl StreamExecutor {
             batches = apply_compiled_having(&batches, filter)?;
         } else if let Some(having_sql) = having_sql {
             batches = self
-                .apply_having_filter(&query_name, &batches, &having_sql)
+                .apply_having_filter(idx, &query_name, &batches, &having_sql)
                 .await?;
         }
 
         Ok(batches)
     }
 
-    /// Apply a HAVING predicate to emitted aggregate batches using the
-    /// session context's SQL engine. This is a fallback for HAVING predicates
-    /// that could not be compiled to `PhysicalExpr`.
+    /// Apply a HAVING predicate to emitted aggregate batches.
+    ///
+    /// Caches the `LogicalPlan` on first call so subsequent cycles skip SQL
+    /// parsing and only run physical planning against the new `MemTable`.
     async fn apply_having_filter(
-        &self,
+        &mut self,
+        idx: usize,
         query_name: &str,
         batches: &[RecordBatch],
         having_sql: &str,
     ) -> Result<Vec<RecordBatch>, DbError> {
-        tracing::warn!(
-            query = %query_name,
-            "HAVING filter could not be compiled to PhysicalExpr — using DataFusion SQL fallback"
-        );
         if batches.is_empty() {
             return Ok(Vec::new());
         }
 
         let schema = batches[0].schema();
-        let col_list: Vec<String> = schema
-            .fields()
-            .iter()
-            .map(|f| format!("\"{}\"", f.name()))
-            .collect();
-        let filter_sql = format!(
-            "SELECT {} FROM \"__having_{}\" WHERE {having_sql}",
-            col_list.join(", "),
-            query_name
-        );
         let table_name = format!("__having_{query_name}");
+
+        let col_list: Option<Vec<String>> = if self.cached_having_plans.contains_key(&idx) {
+            None
+        } else {
+            Some(
+                schema
+                    .fields()
+                    .iter()
+                    .map(|f| format!("\"{}\"", f.name()))
+                    .collect(),
+            )
+        };
 
         let mem_table = datafusion::datasource::MemTable::try_new(schema, vec![batches.to_vec()])
             .map_err(|e| DbError::query_pipeline(query_name, &e))?;
@@ -1409,12 +1443,29 @@ impl StreamExecutor {
             .register_table(&table_name, Arc::new(mem_table))
             .map_err(|e| DbError::query_pipeline(query_name, &e))?;
 
-        let result = match self.ctx.sql(&filter_sql).await {
-            Ok(df) => df
-                .collect()
-                .await
-                .map_err(|e| DbError::query_pipeline(query_name, &e)),
-            Err(e) => Err(DbError::query_pipeline(query_name, &e)),
+        let result = if let Some(plan) = self.cached_having_plans.get(&idx) {
+            self.execute_cached_plan(query_name, plan).await
+        } else {
+            let col_list = col_list.expect("col_list built for uncached path");
+            let filter_sql = format!(
+                "SELECT {} FROM \"__having_{}\" WHERE {having_sql}",
+                col_list.join(", "),
+                query_name
+            );
+            tracing::warn!(
+                query = %query_name,
+                "HAVING filter compiled to PhysicalExpr failed — using cached SQL plan"
+            );
+            match self.ctx.sql(&filter_sql).await {
+                Ok(df) => {
+                    self.cached_having_plans
+                        .insert(idx, df.logical_plan().clone());
+                    df.collect()
+                        .await
+                        .map_err(|e| DbError::query_pipeline(query_name, &e))
+                }
+                Err(e) => Err(DbError::query_pipeline(query_name, &e)),
+            }
         };
 
         let _ = self.ctx.deregister_table(&table_name);
@@ -1469,7 +1520,7 @@ impl StreamExecutor {
             batches = apply_compiled_having(&batches, filter)?;
         } else if let Some(having_sql) = having_sql {
             batches = self
-                .apply_having_filter(query_name, &batches, &having_sql)
+                .apply_having_filter(idx, query_name, &batches, &having_sql)
                 .await?;
         }
 
@@ -1520,7 +1571,7 @@ impl StreamExecutor {
             batches = apply_compiled_having(&batches, filter)?;
         } else if let Some(having_sql) = having_sql {
             batches = self
-                .apply_having_filter(query_name, &batches, &having_sql)
+                .apply_having_filter(idx, query_name, &batches, &having_sql)
                 .await?;
         }
 
@@ -1982,7 +2033,7 @@ impl StreamExecutor {
                 );
             }
 
-            // SQL fallback
+            // SQL fallback with plan caching
             let schema = joined.schema();
             let mem_table = datafusion::datasource::MemTable::try_new(schema, vec![vec![joined]])
                 .map_err(|e| DbError::query_pipeline(query_name, &e))?;
@@ -1992,15 +2043,20 @@ impl StreamExecutor {
                 .register_table("__asof_tmp", Arc::new(mem_table))
                 .map_err(|e| DbError::query_pipeline(query_name, &e))?;
 
-            let df = self
-                .ctx
-                .sql(proj_sql)
-                .await
-                .map_err(|e| DbError::query_pipeline(query_name, &e))?;
-            let result = df
-                .collect()
-                .await
-                .map_err(|e| DbError::query_pipeline(query_name, &e))?;
+            let result = if let Some(plan) = self.cached_post_projection_plans.get(&idx) {
+                self.execute_cached_plan(query_name, plan).await?
+            } else {
+                let df = self
+                    .ctx
+                    .sql(proj_sql)
+                    .await
+                    .map_err(|e| DbError::query_pipeline(query_name, &e))?;
+                self.cached_post_projection_plans
+                    .insert(idx, df.logical_plan().clone());
+                df.collect()
+                    .await
+                    .map_err(|e| DbError::query_pipeline(query_name, &e))?
+            };
 
             let _ = self.ctx.deregister_table("__asof_tmp");
             Ok(result)
@@ -2199,7 +2255,7 @@ impl StreamExecutor {
                 );
             }
 
-            // SQL fallback
+            // SQL fallback with plan caching
             let schema = batches[0].schema();
             let mem_table = datafusion::datasource::MemTable::try_new(schema, vec![batches])
                 .map_err(|e| DbError::query_pipeline(query_name, &e))?;
@@ -2209,15 +2265,20 @@ impl StreamExecutor {
                 .register_table("__temporal_tmp", Arc::new(mem_table))
                 .map_err(|e| DbError::query_pipeline(query_name, &e))?;
 
-            let df = self
-                .ctx
-                .sql(proj_sql)
-                .await
-                .map_err(|e| DbError::query_pipeline(query_name, &e))?;
-            let result = df
-                .collect()
-                .await
-                .map_err(|e| DbError::query_pipeline(query_name, &e))?;
+            let result = if let Some(plan) = self.cached_post_projection_plans.get(&idx) {
+                self.execute_cached_plan(query_name, plan).await?
+            } else {
+                let df = self
+                    .ctx
+                    .sql(proj_sql)
+                    .await
+                    .map_err(|e| DbError::query_pipeline(query_name, &e))?;
+                self.cached_post_projection_plans
+                    .insert(idx, df.logical_plan().clone());
+                df.collect()
+                    .await
+                    .map_err(|e| DbError::query_pipeline(query_name, &e))?
+            };
 
             let _ = self.ctx.deregister_table("__temporal_tmp");
             Ok(result)
@@ -2290,11 +2351,11 @@ impl StreamExecutor {
         if let Some(batches) = intermediate_results.get(table_name) {
             return Ok(batches.clone());
         }
-        // Fall back to DataFusion context (e.g., static reference tables)
-        let sql = format!("SELECT * FROM {table_name}");
+        // Fall back to DataFusion context (e.g., static reference tables).
+        // Use ctx.table() instead of ctx.sql() to skip SQL parsing overhead.
         let df = self
             .ctx
-            .sql(&sql)
+            .table(table_name)
             .await
             .map_err(|e| DbError::query_pipeline(table_name, &e))?;
         df.collect()

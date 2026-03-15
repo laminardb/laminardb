@@ -50,6 +50,15 @@ pub struct PipelineConfig {
     /// replay, all sinks to support exactly-once, and checkpointing to be
     /// enabled. See [`DeliveryGuarantee`] for details.
     pub delivery_guarantee: DeliveryGuarantee,
+
+    /// Maximum wall-clock time for a single processing cycle (nanoseconds).
+    /// Logged at DEBUG when exceeded. Default: 10ms.
+    pub cycle_budget_ns: u64,
+
+    /// Maximum wall-clock time for the message drain phase (nanoseconds).
+    /// The drain loop terminates early when this budget is exhausted.
+    /// Default: 1ms.
+    pub drain_budget_ns: u64,
 }
 
 impl Default for PipelineConfig {
@@ -62,6 +71,8 @@ impl Default for PipelineConfig {
             batch_window: Duration::from_millis(5),
             barrier_alignment_timeout: Duration::from_secs(30),
             delivery_guarantee: DeliveryGuarantee::default(),
+            cycle_budget_ns: 10_000_000, // 10ms
+            drain_budget_ns: 1_000_000,  // 1ms
         }
     }
 }

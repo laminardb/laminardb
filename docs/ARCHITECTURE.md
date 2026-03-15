@@ -84,8 +84,8 @@ Admin and observability. No latency requirements.
 
 **Components:**
 - **Admin API** -- REST endpoints currently live in `laminar-server/src/http.rs`
-- **Metrics Export** -- Prometheus metrics and OpenTelemetry tracing (Phase 4/5 future work)
-- **Auth Engine** -- JWT authentication, RBAC/ABAC authorization (Phase 4/5 future work)
+- **Metrics Export** -- Prometheus metrics and OpenTelemetry tracing
+- **Auth Engine** -- JWT authentication, RBAC/ABAC authorization
 - **Config Manager** -- Dynamic configuration, connector registry
 
 ## Data Flow
@@ -343,6 +343,21 @@ The thread-per-core model described in earlier documentation was removed in PR #
 2. Executes SQL cycles via `StreamExecutor` (compiled projections, incremental aggregations, DataFusion fallback)
 3. Manages checkpoint barriers for exactly-once semantics
 4. Routes results to sink connectors
+
+### Two Execution Paths
+
+LaminarDB provides two execution paths for different use cases:
+
+| Aspect | SQL Path | DAG Path |
+|--------|----------|----------|
+| Entry | `StreamExecutor::execute_cycle()` | `DagExecutor::process_event()` |
+| Data unit | `RecordBatch` (micro-batch) | `Event` (per-event) |
+| State | `FxHashMap` in StreamExecutor fields | `Box<dyn StateStore>` in NodeRuntime |
+| Scheduling | Cycle budget (configurable) | Synchronous per-event |
+| Crate | `laminar-db` | `laminar-core` |
+| API | SQL (`CREATE STREAM AS SELECT ...`) | Rust (`DagBuilder::new().source()...build()`) |
+
+The SQL path is the production path for SQL users. The DAG path is a programmatic Rust API for custom operator pipelines, exercised by tests and benchmarks.
 
 ## Exactly-Once Semantics
 

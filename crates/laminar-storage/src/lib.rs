@@ -45,7 +45,7 @@ pub mod object_store_builder;
 
 // Re-export key types
 pub use changelog_drainer::ChangelogDrainer;
-pub use checkpoint::checkpointer::{verify_integrity, Checkpointer, CheckpointerError};
+pub use checkpoint::checkpointer::{verify_integrity, CheckpointerError, ObjectStoreCheckpointer};
 pub use checkpoint::layout::{
     CheckpointId, CheckpointManifestV2, CheckpointPaths, OperatorSnapshotEntry,
     PartitionSnapshotEntry, SourceOffsetEntry,

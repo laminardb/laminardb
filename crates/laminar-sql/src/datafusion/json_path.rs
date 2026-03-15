@@ -1,4 +1,4 @@
-//! SQL/JSON path query functions (F-SCHEMA-012).
+//! SQL/JSON path query functions.
 //!
 //! Implements a basic JSON path compiler and two scalar UDFs:
 //!

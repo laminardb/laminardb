@@ -40,7 +40,7 @@ pub(crate) enum EowcWindowType {
     Tumbling { size_ms: i64 },
     /// Hopping: overlapping windows with fixed size and slide.
     Hopping { size_ms: i64, slide_ms: i64 },
-    /// Session: gap-based windows (simplified — merge not yet implemented).
+    /// Session: gap-based windows (simplified, non-merging).
     Session { gap_ms: i64 },
 }
 

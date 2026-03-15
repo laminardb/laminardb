@@ -26,6 +26,7 @@ use std::time::{Duration, Instant};
 use arrow_array::RecordBatch;
 use laminar_connectors::checkpoint::SourceCheckpoint;
 use laminar_connectors::connector::DeliveryGuarantee;
+use laminar_core::alloc::{PriorityClass, PriorityGuard};
 use laminar_core::checkpoint::{CheckpointBarrier, CheckpointBarrierInjector};
 use rustc_hash::{FxHashMap, FxHashSet};
 use tokio::sync::mpsc;
@@ -351,6 +352,7 @@ impl StreamingCoordinator {
             };
 
             // Step: Drain messages and coalesce batches.
+            let event_priority = PriorityGuard::enter(PriorityClass::EventProcessing);
             self.source_batches_buf.clear();
             self.barrier_seen.clear();
             barriers_buf.clear();
@@ -380,8 +382,13 @@ impl StreamingCoordinator {
             }
 
             // Drain any additional buffered messages (batch coalescing).
+            // Terminates on count limit OR time budget, whichever comes first.
             let mut drain_count = 0;
-            while drain_count < MAX_DRAIN_PER_CYCLE {
+            let drain_budget_ns = self.config.drain_budget_ns;
+            #[allow(clippy::cast_possible_truncation)]
+            while drain_count < MAX_DRAIN_PER_CYCLE
+                && (cycle_start.elapsed().as_nanos() as u64) < drain_budget_ns
+            {
                 match self.rx.try_recv() {
                     Ok(msg) => {
                         self.process_msg(msg, &mut callback, &mut barriers_buf, &mut cycle_events);
@@ -407,7 +414,18 @@ impl StreamingCoordinator {
                 #[allow(clippy::cast_possible_truncation)]
                 let elapsed_ns = cycle_start.elapsed().as_nanos() as u64;
                 callback.record_cycle(cycle_events, 0, elapsed_ns);
+
+                if elapsed_ns >= self.config.cycle_budget_ns {
+                    tracing::debug!(
+                        elapsed_ms = elapsed_ns / 1_000_000,
+                        budget_ms = self.config.cycle_budget_ns / 1_000_000,
+                        "cycle budget exceeded — proceeding to maintenance"
+                    );
+                }
             }
+
+            drop(event_priority);
+            let _bg_priority = PriorityGuard::enter(PriorityClass::BackgroundIo);
 
             // Step: Handle barriers (after SQL cycle so checkpoint state
             // includes the effects of processed batches).
@@ -676,6 +694,8 @@ mod tests {
                 checkpoint_interval: None,
                 delivery_guarantee: DeliveryGuarantee::AtLeastOnce,
                 barrier_alignment_timeout: BARRIER_TIMEOUT,
+                cycle_budget_ns: 10_000_000,
+                drain_budget_ns: 1_000_000,
             },
             rx,
             source_handles: Vec::new(),
@@ -734,6 +754,8 @@ mod tests {
                 checkpoint_interval: None,
                 delivery_guarantee: DeliveryGuarantee::AtLeastOnce,
                 barrier_alignment_timeout: BARRIER_TIMEOUT,
+                cycle_budget_ns: 10_000_000,
+                drain_budget_ns: 1_000_000,
             },
             rx: mpsc::channel(64).1, // dummy, not used
             source_handles: Vec::new(),

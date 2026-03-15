@@ -61,7 +61,6 @@
 
 use super::{
     Event, Operator, OperatorContext, OperatorError, OperatorState, Output, OutputVec, Timer,
-    TimerKey,
 };
 use arrow_array::{Array, ArrayRef, Int64Array, RecordBatch, StringArray};
 use arrow_schema::{DataType, Field, Schema, SchemaRef};
@@ -930,16 +929,6 @@ impl TemporalJoinOperator {
         }
 
         None
-    }
-
-    /// Creates a timer key for cleanup.
-    /// Reserved for future use when timer-based cleanup is implemented.
-    #[allow(dead_code)]
-    fn make_cleanup_timer_key(key_suffix: &[u8]) -> TimerKey {
-        let mut key = TimerKey::new();
-        key.push(TEMPORAL_TIMER_PREFIX);
-        key.extend_from_slice(key_suffix);
-        key
     }
 
     /// Updates the output schema when both input schemas are known.

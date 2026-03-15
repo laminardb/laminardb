@@ -1,18 +1,13 @@
 //! Async checkpoint persistence via object stores.
 //!
-//! The `Checkpointer` trait abstracts checkpoint I/O so that the
-//! checkpoint coordinator doesn't need to know whether state is persisted
-//! to local disk, S3, GCS, or Azure Blob.
-//!
-//! `ObjectStoreCheckpointer` is the production implementation that
-//! writes to any `object_store::ObjectStore` backend with:
+//! `ObjectStoreCheckpointer` writes checkpoint artifacts to any
+//! `object_store::ObjectStore` backend with:
 //! - Concurrent partition uploads via `JoinSet`
 //! - SHA-256 integrity digests
 //! - Exponential backoff retry on transient errors
 
 use std::sync::Arc;
 
-use async_trait::async_trait;
 use bytes::Bytes;
 use futures::StreamExt;
 use object_store::path::Path;
@@ -49,62 +44,7 @@ pub enum CheckpointerError {
     JoinError(#[from] tokio::task::JoinError),
 }
 
-/// Async trait for checkpoint persistence operations.
-///
-/// Implementations handle writing/reading checkpoint artifacts to
-/// durable storage. The checkpoint coordinator calls these methods
-/// during the checkpoint commit protocol.
-#[async_trait]
-pub trait Checkpointer: Send + Sync {
-    /// Write a manifest to the checkpoint store.
-    async fn save_manifest(&self, manifest: &CheckpointManifestV2)
-        -> Result<(), CheckpointerError>;
-
-    /// Load a manifest by checkpoint ID.
-    async fn load_manifest(
-        &self,
-        id: &CheckpointId,
-    ) -> Result<CheckpointManifestV2, CheckpointerError>;
-
-    /// Write a state snapshot for a single operator partition.
-    ///
-    /// Returns the SHA-256 hex digest of the written data.
-    async fn save_snapshot(
-        &self,
-        id: &CheckpointId,
-        operator: &str,
-        partition: u32,
-        data: Bytes,
-    ) -> Result<String, CheckpointerError>;
-
-    /// Write an incremental delta for a single operator partition.
-    ///
-    /// Returns the SHA-256 hex digest of the written data.
-    async fn save_delta(
-        &self,
-        id: &CheckpointId,
-        operator: &str,
-        partition: u32,
-        data: Bytes,
-    ) -> Result<String, CheckpointerError>;
-
-    /// Load a snapshot or delta by path.
-    async fn load_artifact(&self, path: &str) -> Result<Bytes, CheckpointerError>;
-
-    /// Update the `_latest` pointer to the given checkpoint.
-    async fn update_latest(&self, id: &CheckpointId) -> Result<(), CheckpointerError>;
-
-    /// Read the `_latest` pointer to find the most recent checkpoint.
-    async fn read_latest(&self) -> Result<Option<CheckpointId>, CheckpointerError>;
-
-    /// List all checkpoint IDs (sorted chronologically, oldest first).
-    async fn list_checkpoints(&self) -> Result<Vec<CheckpointId>, CheckpointerError>;
-
-    /// Delete a checkpoint and all its artifacts.
-    async fn delete_checkpoint(&self, id: &CheckpointId) -> Result<(), CheckpointerError>;
-}
-
-/// Production [`Checkpointer`] backed by an [`ObjectStore`].
+/// Checkpoint persister backed by an [`ObjectStore`].
 ///
 /// Supports concurrent partition uploads and SHA-256 integrity verification.
 pub struct ObjectStoreCheckpointer {
@@ -240,11 +180,13 @@ impl ObjectStoreCheckpointer {
 
         Ok(entries)
     }
-}
 
-#[async_trait]
-impl Checkpointer for ObjectStoreCheckpointer {
-    async fn save_manifest(
+    /// Write a manifest to the checkpoint store.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`CheckpointerError`] on I/O or serialization failure.
+    pub async fn save_manifest(
         &self,
         manifest: &CheckpointManifestV2,
     ) -> Result<(), CheckpointerError> {
@@ -255,7 +197,12 @@ impl Checkpointer for ObjectStoreCheckpointer {
         Self::put_with_retry(self.store.as_ref(), &path, payload).await
     }
 
-    async fn load_manifest(
+    /// Load a manifest by checkpoint ID.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`CheckpointerError`] on I/O or deserialization failure.
+    pub async fn load_manifest(
         &self,
         id: &CheckpointId,
     ) -> Result<CheckpointManifestV2, CheckpointerError> {
@@ -267,7 +214,14 @@ impl Checkpointer for ObjectStoreCheckpointer {
         Ok(manifest)
     }
 
-    async fn save_snapshot(
+    /// Write a state snapshot for a single operator partition.
+    ///
+    /// Returns the SHA-256 hex digest of the written data.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`CheckpointerError`] on I/O failure.
+    pub async fn save_snapshot(
         &self,
         id: &CheckpointId,
         operator: &str,
@@ -278,7 +232,14 @@ impl Checkpointer for ObjectStoreCheckpointer {
         self.write_with_digest(&path_str, data).await
     }
 
-    async fn save_delta(
+    /// Write an incremental delta for a single operator partition.
+    ///
+    /// Returns the SHA-256 hex digest of the written data.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`CheckpointerError`] on I/O failure.
+    pub async fn save_delta(
         &self,
         id: &CheckpointId,
         operator: &str,
@@ -289,21 +250,36 @@ impl Checkpointer for ObjectStoreCheckpointer {
         self.write_with_digest(&path_str, data).await
     }
 
-    async fn load_artifact(&self, path_str: &str) -> Result<Bytes, CheckpointerError> {
+    /// Load a snapshot or delta by path.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`CheckpointerError`] on I/O failure.
+    pub async fn load_artifact(&self, path_str: &str) -> Result<Bytes, CheckpointerError> {
         let path = Path::from(path_str);
         let result = self.store.get_opts(&path, GetOptions::default()).await?;
         let data = result.bytes().await?;
         Ok(data)
     }
 
-    async fn update_latest(&self, id: &CheckpointId) -> Result<(), CheckpointerError> {
+    /// Update the `_latest` pointer to the given checkpoint.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`CheckpointerError`] on I/O failure.
+    pub async fn update_latest(&self, id: &CheckpointId) -> Result<(), CheckpointerError> {
         let path_str = self.paths.latest_pointer();
         let path = Path::from(path_str.as_str());
         let payload = PutPayload::from_bytes(Bytes::from(id.to_string_id()));
         Self::put_with_retry(self.store.as_ref(), &path, payload).await
     }
 
-    async fn read_latest(&self) -> Result<Option<CheckpointId>, CheckpointerError> {
+    /// Read the `_latest` pointer to find the most recent checkpoint.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`CheckpointerError`] on I/O failure.
+    pub async fn read_latest(&self) -> Result<Option<CheckpointId>, CheckpointerError> {
         let path_str = self.paths.latest_pointer();
         let path = Path::from(path_str.as_str());
         match self.store.get_opts(&path, GetOptions::default()).await {
@@ -326,7 +302,12 @@ impl Checkpointer for ObjectStoreCheckpointer {
         }
     }
 
-    async fn list_checkpoints(&self) -> Result<Vec<CheckpointId>, CheckpointerError> {
+    /// List all checkpoint IDs (sorted chronologically, oldest first).
+    ///
+    /// # Errors
+    ///
+    /// Returns [`CheckpointerError`] on I/O failure.
+    pub async fn list_checkpoints(&self) -> Result<Vec<CheckpointId>, CheckpointerError> {
         // List objects at the base prefix — each checkpoint is a directory.
         // We look for manifest.json files to identify checkpoints.
         //
@@ -363,7 +344,12 @@ impl Checkpointer for ObjectStoreCheckpointer {
         Ok(ids)
     }
 
-    async fn delete_checkpoint(&self, id: &CheckpointId) -> Result<(), CheckpointerError> {
+    /// Delete a checkpoint and all its artifacts.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`CheckpointerError`] on I/O failure.
+    pub async fn delete_checkpoint(&self, id: &CheckpointId) -> Result<(), CheckpointerError> {
         // List all objects under this checkpoint's directory and delete them
         let dir = self.paths.checkpoint_dir(id);
         let prefix = Path::from(dir.as_str());

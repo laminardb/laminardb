@@ -13,7 +13,5 @@ pub mod guard;
 /// Partition assignment algorithms.
 pub mod assignment;
 
-pub use assignment::{
-    AssignmentConstraints, AssignmentPlan, ConsistentHashAssigner, PartitionAssigner,
-};
+pub use assignment::{AssignmentConstraints, AssignmentPlan, ConsistentHashAssigner};
 pub use guard::{PartitionGuard, PartitionGuardSet};

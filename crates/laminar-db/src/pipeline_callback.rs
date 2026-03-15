@@ -14,6 +14,7 @@ use datafusion::physical_expr::{create_physical_expr, PhysicalExpr};
 use datafusion::prelude::SessionContext;
 use datafusion_common::DFSchema;
 use laminar_connectors::checkpoint::SourceCheckpoint;
+use laminar_core::alloc::{PriorityClass, PriorityGuard};
 use laminar_core::streaming;
 use rustc_hash::FxHashMap;
 
@@ -303,6 +304,7 @@ impl crate::pipeline::PipelineCallback for ConnectorPipelineCallback {
         source_offsets: FxHashMap<String, SourceCheckpoint>,
     ) -> bool {
         use crate::checkpoint_coordinator::source_to_connector_checkpoint;
+        let _priority = PriorityGuard::enter(PriorityClass::BackgroundIo);
 
         // Under exactly-once, only barrier-aligned checkpoints are consistent.
         // Timer-based checkpoints are skipped (barrier path handles exactly-once).
@@ -458,6 +460,7 @@ impl crate::pipeline::PipelineCallback for ConnectorPipelineCallback {
         source_checkpoints: FxHashMap<String, SourceCheckpoint>,
     ) -> bool {
         use crate::checkpoint_coordinator::source_to_connector_checkpoint;
+        let _priority = PriorityGuard::enter(PriorityClass::BackgroundIo);
 
         if self
             .counters
@@ -594,6 +597,7 @@ impl crate::pipeline::PipelineCallback for ConnectorPipelineCallback {
 
     async fn poll_tables(&mut self) {
         use laminar_connectors::reference::RefreshMode;
+        let _priority = PriorityGuard::enter(PriorityClass::BackgroundIo);
 
         for (name, source, mode) in &mut self.table_sources {
             if matches!(mode, RefreshMode::SnapshotOnly | RefreshMode::Manual) {

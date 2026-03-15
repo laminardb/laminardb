@@ -1,4 +1,4 @@
-//! Ring 0 DAG executor for event processing.
+//! DAG executor for per-event processing (programmatic Rust API).
 //!
 //! **Note:** The SQL pipeline uses `StreamingCoordinator` + `StreamExecutor`,
 //! not this executor. This module serves the programmatic Rust API for
@@ -12,7 +12,7 @@
 //!
 //! ```text
 //! ┌──────────────────────────────────────────────────────────────────┐
-//! │                      RING 0: HOT PATH                            │
+//! │                   EVENT PROCESSING PATH                          │
 //! │                                                                  │
 //! │  process_event(source, event)                                    │
 //! │       │                                                          │
@@ -30,7 +30,7 @@
 //! └──────────────────────────────────────────────────────────────────┘
 //! ```
 //!
-//! # Latency Budget
+//! # Latency Budget (per-event path)
 //!
 //! | Component | Budget |
 //! |-----------|--------|
@@ -44,7 +44,7 @@ use std::collections::VecDeque;
 
 use rustc_hash::FxHashMap;
 
-use crate::alloc::HotPathGuard;
+use crate::alloc::{HotPathGuard, PriorityClass, PriorityGuard};
 use crate::operator::{
     Event, Operator, OperatorContext, OperatorState, Output, OutputVec, SideOutputData, Timer,
 };
@@ -59,8 +59,8 @@ use super::watermark::{DagWatermarkCheckpoint, DagWatermarkTracker};
 
 /// Per-node runtime state (timer service, state store, watermark generator).
 ///
-/// Created during executor construction (Ring 2) and used during event
-/// processing (Ring 0). Temporarily moved out of the executor during
+/// Created during executor construction and used during event
+/// processing. Temporarily moved out of the executor during
 /// operator dispatch to satisfy Rust's borrow checker.
 struct NodeRuntime {
     /// Timer service for this node.
@@ -116,7 +116,7 @@ pub struct OperatorNodeMetrics {
     pub invocations: u64,
 }
 
-/// Ring 0 DAG executor for event processing.
+/// DAG executor for per-event processing.
 ///
 /// Processes events through a finalized [`StreamingDag`] in topological order
 /// using the pre-computed [`RoutingTable`] for O(1) dispatch.
@@ -522,7 +522,7 @@ impl DagExecutor {
 
     /// Snapshots all registered operators in topological order.
     ///
-    /// Takes the barrier for consistency (future use with epoch tracking).
+    /// Accepts a barrier for consistency with the Chandy-Lamport protocol.
     /// In the synchronous single-threaded executor, topological ordering
     /// guarantees upstream-first snapshots.
     #[must_use]
@@ -545,10 +545,10 @@ impl DagExecutor {
     /// Processes all nodes in topological order.
     ///
     /// Drains input queues, dispatches to operators, and routes outputs
-    /// to downstream nodes. Uses [`HotPathGuard`] for zero-allocation
-    /// enforcement in debug builds.
+    /// to downstream nodes.
     fn process_dag(&mut self) {
         let _guard = HotPathGuard::enter("dag_executor");
+        let _priority = PriorityGuard::enter(PriorityClass::EventProcessing);
 
         let order_len = self.execution_order.len();
         for i in 0..order_len {
