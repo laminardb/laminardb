@@ -736,10 +736,15 @@ impl LaminarDB {
                             }
                         }
                         // Restore DAG operator state (lowered queries).
-                        if let Some(op) = recovered.manifest.operator_states.get("dag_operators") {
-                            if let Some(bytes) = op.decode_inline() {
-                                if let Some(ref mut dag) = dag_executor {
-                                    match serde_json::from_slice::<
+                        // Only restore when DAG lowering is active — otherwise the
+                        // state would sit unused (execution gates on use_dag_lowering).
+                        if self.config.use_dag_lowering {
+                            if let Some(op) =
+                                recovered.manifest.operator_states.get("dag_operators")
+                            {
+                                if let Some(bytes) = op.decode_inline() {
+                                    if let Some(ref mut dag) = dag_executor {
+                                        match serde_json::from_slice::<
                                         std::collections::HashMap<
                                             String,
                                             laminar_core::dag::recovery::SerializableOperatorState,
@@ -780,9 +785,10 @@ impl LaminarDB {
                                             );
                                         }
                                     }
+                                    }
                                 }
                             }
-                        }
+                        } // use_dag_lowering gate
                         tracing::info!(
                             epoch = recovered.epoch(),
                             sources_restored = recovered.sources_restored,

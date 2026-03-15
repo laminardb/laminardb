@@ -16,7 +16,7 @@ LaminarDB is an embedded streaming database designed for sub-microsecond latency
 
 The system has a coordinator layer (SQL execution, compiled projections), a background I/O layer (WAL, checkpoints, connector I/O), and a control plane (admin API, metrics).
 
-```
+```text
 +------------------------------------------------------------------+
 |                     SOURCE CONNECTORS                             |
 |  Kafka, Postgres CDC, MySQL CDC, WebSocket, Files                |
@@ -92,8 +92,8 @@ Admin and observability. No latency requirements.
 
 How an event moves through the system:
 
-```
-                    Streaming Coordinator (< 1us per event for compiled queries)
+```text
+                    Streaming Coordinator (≈0.55–1.16µs per event for compiled queries)
                     +--------------------+
   Source --> mpsc --> Window/Join/Agg --> Emit --> Subscribers
     |                       |                           |
@@ -121,7 +121,7 @@ How an event moves through the system:
 
 ## Crate Map
 
-```
+```text
 laminar-core          Core: reactor, operators, state stores, time/watermarks,
                       streaming channels, DAG pipeline, subscriptions,
                       lookup tables, secondary indexes, cross-partition aggregation,

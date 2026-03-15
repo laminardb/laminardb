@@ -693,8 +693,9 @@ mod tests {
     }
 
     /// Test that post-barrier batches are excluded from the current cycle's
-    /// source_batches_buf and deferred to the next cycle.
+    /// `source_batches_buf` and deferred to the next cycle.
     #[tokio::test]
+    #[allow(clippy::too_many_lines, clippy::similar_names)]
     async fn test_barrier_excludes_post_barrier_data() {
         let shutdown = Arc::new(tokio::sync::Notify::new());
         let schema = Arc::new(Schema::new(vec![Field::new("ts", DataType::Int64, false)]));
@@ -751,7 +752,7 @@ mod tests {
         coordinator.process_msg(
             SourceMsg::Barrier {
                 source_idx: 0,
-                barrier: barrier.clone(),
+                barrier,
             },
             &mut callback,
             &mut barriers,

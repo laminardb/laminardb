@@ -23,12 +23,7 @@ fn config_for(dir: &std::path::Path) -> LaminarConfig {
 
 fn make_batch(symbols: &[&str], prices: &[f64], timestamps: &[i64]) -> RecordBatch {
     RecordBatch::try_from_iter(vec![
-        (
-            "symbol",
-            Arc::new(StringArray::from(
-                symbols.iter().copied().collect::<Vec<_>>(),
-            )) as _,
-        ),
+        ("symbol", Arc::new(StringArray::from(symbols.to_vec())) as _),
         ("price", Arc::new(Float64Array::from(prices.to_vec())) as _),
         ("ts", Arc::new(Int64Array::from(timestamps.to_vec())) as _),
     ])
@@ -109,7 +104,7 @@ async fn test_checkpoint_kill_restart_recovery() {
             "pipeline must have executed cycles after restart"
         );
 
-        db.close();
+        db.shutdown().await.unwrap();
     }
 }
 
@@ -189,5 +184,5 @@ async fn test_no_event_loss_during_checkpoint() {
         "no events should be dropped during checkpoint"
     );
 
-    db.close();
+    db.shutdown().await.unwrap();
 }
