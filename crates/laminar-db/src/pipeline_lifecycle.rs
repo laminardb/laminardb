@@ -272,159 +272,6 @@ impl LaminarDB {
             );
         }
 
-        // DAG lowering: attempt to lower aggregate queries into a DagExecutor.
-        // When use_dag_lowering is enabled, lowered queries are routed through
-        // the DAG at runtime; otherwise the DAG is built but not used.
-        #[allow(clippy::type_complexity)]
-        let (
-            mut dag_executor,
-            dag_query_names,
-            dag_source_node_ids,
-            dag_sink_to_query,
-            dag_pre_agg_sql,
-            dag_op_node_ids,
-            dag_compiled_projections,
-        ): (
-            Option<laminar_core::dag::DagExecutor>,
-            rustc_hash::FxHashSet<Arc<str>>,
-            FxHashMap<Arc<str>, laminar_core::dag::NodeId>,
-            FxHashMap<laminar_core::dag::NodeId, Arc<str>>,
-            FxHashMap<Arc<str>, String>,
-            FxHashMap<Arc<str>, laminar_core::dag::NodeId>,
-            FxHashMap<Arc<str>, crate::aggregate_state::CompiledProjection>,
-        ) = {
-            use crate::sql_lowering::{build_query_dag, try_lower_query, LoweredQuery};
-            use crate::stream_executor::extract_table_references;
-
-            let mut lowered = Vec::new();
-            for reg in stream_regs.values() {
-                let source_tables: Vec<String> = extract_table_references(&reg.query_sql)
-                    .into_iter()
-                    .collect();
-                match try_lower_query(
-                    executor.session_context(),
-                    &reg.name,
-                    &reg.query_sql,
-                    source_tables,
-                    reg.window_config.as_ref(),
-                    reg.emit_clause.as_ref(),
-                )
-                .await
-                {
-                    Ok(lq) => lowered.push((reg.name.clone(), lq)),
-                    Err(e) => {
-                        tracing::debug!(
-                            query = %reg.name,
-                            error = %e,
-                            "DAG lowering failed, query stays on StreamExecutor path"
-                        );
-                    }
-                }
-            }
-
-            // Build source schemas for the DAG
-            let source_schemas: Vec<(&str, Arc<arrow::datatypes::Schema>)> = source_regs
-                .keys()
-                .filter_map(|name| {
-                    self.catalog
-                        .get_source(name)
-                        .map(|entry| (name.as_str(), entry.schema.clone()))
-                })
-                .collect();
-
-            if let Some((dag, operators)) = build_query_dag(&source_schemas, &mut lowered) {
-                let mut exec = laminar_core::dag::DagExecutor::from_dag(&dag);
-                let mut names: rustc_hash::FxHashSet<Arc<str>> = rustc_hash::FxHashSet::default();
-                for (node_id, operator) in operators {
-                    exec.register_operator(node_id, operator);
-                }
-                // Track which queries were lowered, collect pre-agg SQL and
-                // compiled projections (taken out of LoweredQuery).
-                let mut pre_agg_sql: FxHashMap<Arc<str>, String> = FxHashMap::default();
-                let mut compiled_projections: FxHashMap<
-                    Arc<str>,
-                    crate::aggregate_state::CompiledProjection,
-                > = FxHashMap::default();
-                for (qname, lq) in &mut lowered {
-                    match lq {
-                        LoweredQuery::Aggregate {
-                            pre_agg_sql: sql,
-                            compiled_projection,
-                            ..
-                        }
-                        | LoweredQuery::WindowedAggregate {
-                            pre_agg_sql: sql,
-                            compiled_projection,
-                            ..
-                        } => {
-                            let arc_name = Arc::from(qname.as_str());
-                            names.insert(Arc::clone(&arc_name));
-                            pre_agg_sql.insert(Arc::clone(&arc_name), sql.clone());
-                            if let Some(proj) = compiled_projection.take() {
-                                compiled_projections.insert(arc_name, proj);
-                            }
-                        }
-                        LoweredQuery::Fallback => {}
-                    }
-                }
-                // Map source names to DAG node IDs
-                let mut source_nodes: FxHashMap<Arc<str>, laminar_core::dag::NodeId> =
-                    FxHashMap::default();
-                for (name, _) in &source_schemas {
-                    if let Some(node_id) = dag.node_id_by_name(name) {
-                        source_nodes.insert(Arc::from(*name), node_id);
-                    }
-                }
-                // Map sink node IDs to query names
-                let mut sink_map: FxHashMap<laminar_core::dag::NodeId, Arc<str>> =
-                    FxHashMap::default();
-                // Map query names to operator node IDs (for pre-agg routing)
-                let mut op_nodes: FxHashMap<Arc<str>, laminar_core::dag::NodeId> =
-                    FxHashMap::default();
-                for qname in &names {
-                    let sink_name = format!("sink_{qname}");
-                    if let Some(sink_id) = dag.node_id_by_name(&sink_name) {
-                        sink_map.insert(sink_id, Arc::clone(qname));
-                    }
-                    let op_name = format!("op_{qname}");
-                    if let Some(op_id) = dag.node_id_by_name(&op_name) {
-                        op_nodes.insert(Arc::clone(qname), op_id);
-                    }
-                }
-                tracing::info!(
-                    lowered_queries = names.len(),
-                    source_nodes = source_nodes.len(),
-                    "DAG lowering complete"
-                );
-                (
-                    Some(exec),
-                    names,
-                    source_nodes,
-                    sink_map,
-                    pre_agg_sql,
-                    op_nodes,
-                    compiled_projections,
-                )
-            } else {
-                tracing::debug!("No queries lowered to DAG");
-                (
-                    None,
-                    rustc_hash::FxHashSet::default(),
-                    FxHashMap::default(),
-                    FxHashMap::default(),
-                    FxHashMap::default(),
-                    FxHashMap::default(),
-                    FxHashMap::default(),
-                )
-            }
-        };
-
-        // When DAG lowering is active, mark lowered queries as skipped in
-        // the StreamExecutor so they are not double-processed.
-        if self.config.use_dag_lowering && !dag_query_names.is_empty() {
-            executor.skip_queries(&dag_query_names);
-        }
-
         // Register temporal join tables as Versioned in the lookup registry
         // so that execute_temporal_query() can use persistent versioned state.
         for tcfg in executor.temporal_join_configs() {
@@ -735,60 +582,6 @@ impl LaminarDB {
                                 }
                             }
                         }
-                        // Restore DAG operator state (lowered queries).
-                        // Only restore when DAG lowering is active — otherwise the
-                        // state would sit unused (execution gates on use_dag_lowering).
-                        if self.config.use_dag_lowering {
-                            if let Some(op) =
-                                recovered.manifest.operator_states.get("dag_operators")
-                            {
-                                if let Some(bytes) = op.decode_inline() {
-                                    if let Some(ref mut dag) = dag_executor {
-                                        match serde_json::from_slice::<
-                                        std::collections::HashMap<
-                                            String,
-                                            laminar_core::dag::recovery::SerializableOperatorState,
-                                        >,
-                                    >(&bytes)
-                                    {
-                                        Ok(dag_states) => {
-                                            let states: rustc_hash::FxHashMap<
-                                                laminar_core::dag::NodeId,
-                                                laminar_core::operator::OperatorState,
-                                            > = dag_states
-                                                .into_iter()
-                                                .filter_map(|(id_str, sos)| {
-                                                    id_str.parse::<u32>().ok().map(|id| {
-                                                        (laminar_core::dag::NodeId(id), sos.into())
-                                                    })
-                                                })
-                                                .collect();
-                                            match dag.restore(&states) {
-                                                Ok(()) => {
-                                                    tracing::info!(
-                                                        operators = states.len(),
-                                                        "Restored DAG operator state from checkpoint"
-                                                    );
-                                                }
-                                                Err(e) => {
-                                                    tracing::warn!(
-                                                        error = %e,
-                                                        "DAG operator state restore failed, starting fresh"
-                                                    );
-                                                }
-                                            }
-                                        }
-                                        Err(e) => {
-                                            tracing::warn!(
-                                                error = %e,
-                                                "DAG operator state deserialization failed"
-                                            );
-                                        }
-                                    }
-                                    }
-                                }
-                            }
-                        } // use_dag_lowering gate
                         tracing::info!(
                             epoch = recovered.epoch(),
                             sources_restored = recovered.sources_restored,
@@ -1094,19 +887,15 @@ impl LaminarDB {
                 .map(std::time::Duration::from_millis),
             pipeline_hash,
             delivery_guarantee: pipeline_config.delivery_guarantee,
-            dag_executor,
-            dag_source_node_ids,
-            dag_sink_to_query,
-            dag_pre_agg_sql,
-            dag_op_node_ids,
-            dag_compiled_projections,
-            use_dag_lowering: self.config.use_dag_lowering,
             cycle_histogram: std::cell::RefCell::new(
                 crate::checkpoint_coordinator::DurationHistogram::new(),
             ),
         };
 
-        // Start the streaming coordinator (sources push directly via mpsc).
+        // Start the streaming coordinator on a dedicated compute thread.
+        // Source tasks were already spawned on the main tokio runtime in
+        // StreamingCoordinator::new(). The coordinator communicates with
+        // them via tokio::sync::mpsc which works across runtimes.
         {
             let coordinator = crate::pipeline::StreamingCoordinator::new(
                 sources,
@@ -1115,8 +904,23 @@ impl LaminarDB {
             )
             .await?;
 
+            let (done_tx, done_rx) = tokio::sync::oneshot::channel::<()>();
+            std::thread::Builder::new()
+                .name("laminar-compute".into())
+                .spawn(move || {
+                    let rt = tokio::runtime::Builder::new_current_thread()
+                        .enable_all()
+                        .build()
+                        .expect("compute runtime");
+                    rt.block_on(async move {
+                        coordinator.run(callback).await;
+                    });
+                    let _ = done_tx.send(());
+                })
+                .expect("spawn compute thread");
+
             let handle = tokio::spawn(async move {
-                coordinator.run(Box::new(callback)).await;
+                let _ = done_rx.await;
             });
 
             *self.runtime_handle.lock() = Some(handle);

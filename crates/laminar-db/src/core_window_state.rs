@@ -1266,18 +1266,6 @@ impl CoreWindowState {
         Ok(result)
     }
 
-    /// Output schema for windowed aggregate results.
-    ///
-    /// Returns the post-projection schema when a post-aggregate projection
-    /// is present, otherwise the intermediate aggregate schema.
-    pub(crate) fn output_schema(&self) -> Arc<arrow::datatypes::Schema> {
-        if let Some(proj) = &self.post_projection {
-            Arc::clone(&proj.final_schema)
-        } else {
-            Arc::clone(&self.output_schema)
-        }
-    }
-
     /// Pre-aggregation SQL.
     pub fn pre_agg_sql(&self) -> &str {
         &self.pre_agg_sql
@@ -1296,14 +1284,6 @@ impl CoreWindowState {
     /// Compiled pre-aggregation projection, if available.
     pub fn compiled_projection(&self) -> Option<&CompiledProjection> {
         self.compiled_projection.as_ref()
-    }
-
-    /// Take the compiled projection out, leaving `None` in its place.
-    ///
-    /// Used by SQL lowering to extract the projection before wrapping the
-    /// state in a DAG adapter.
-    pub(crate) fn take_compiled_projection(&mut self) -> Option<CompiledProjection> {
-        self.compiled_projection.take()
     }
 
     /// Cached optimized logical plan for the pre-agg SQL.

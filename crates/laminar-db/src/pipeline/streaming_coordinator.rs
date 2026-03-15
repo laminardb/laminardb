@@ -1,17 +1,18 @@
-//! Simplified pipeline coordinator that replaces TPC core threads.
+//! Simplified pipeline coordinator.
 //!
-//! Sources push directly to the coordinator via `tokio::sync::mpsc`,
-//! eliminating the SPSC inbox → Ring 0 core thread → SPSC outbox relay
-//! that the TPC architecture imposed. The coordinator runs as a single
-//! tokio task and delegates SQL execution to [`PipelineCallback`].
+//! Sources push directly to the coordinator via `tokio::sync::mpsc`.
+//! The coordinator runs on a dedicated single-threaded tokio runtime
+//! (`laminar-compute` thread), isolating CPU-bound event processing
+//! from IO tasks (Kafka poll, S3 checkpoint writes, HTTP) on the main
+//! work-stealing runtime. SQL execution is delegated to [`PipelineCallback`].
 //!
 //! # Architecture
 //!
 //! ```text
-//! Source task (tokio::spawn)
+//! Source task (main tokio runtime)
 //!   │  connector.poll_batch().await
 //!   │
-//!   └──── mpsc::Sender ────► StreamingCoordinator (tokio task)
+//!   └──── mpsc::Sender ────► StreamingCoordinator (dedicated compute thread)
 //!                                 │  callback.execute_cycle()
 //!                                 │  callback.write_to_sinks()
 //!                                 ▼
@@ -313,11 +314,11 @@ impl StreamingCoordinator {
     /// the callback, and handles checkpoint barriers. Returns when
     /// shutdown is signaled.
     #[allow(clippy::too_many_lines)]
-    pub async fn run(mut self, mut callback: Box<dyn PipelineCallback>) {
+    pub async fn run<C: PipelineCallback>(mut self, mut callback: C) {
         let batch_window = self.config.batch_window;
 
         loop {
-            // Phase 1: Wait for data, shutdown, or idle timeout.
+            // Step: Wait for data, shutdown, or idle timeout.
             let msg = tokio::select! {
                 biased;
                 () = self.shutdown.notified() => break,
@@ -337,7 +338,7 @@ impl StreamingCoordinator {
                 () = tokio::time::sleep(IDLE_TIMEOUT) => None,
             };
 
-            // Phase 2: Process the message and drain any buffered messages.
+            // Step: Drain messages and coalesce batches.
             self.source_batches_buf.clear();
             self.barrier_seen.clear();
             let mut barriers = Vec::new();
@@ -351,22 +352,22 @@ impl StreamingCoordinator {
             for deferred_msg in deferred {
                 self.process_msg(
                     deferred_msg,
-                    &mut *callback,
+                    &mut callback,
                     &mut barriers,
                     &mut cycle_events,
                 );
             }
 
             if let Some(first_msg) = msg {
-                self.process_msg(first_msg, &mut *callback, &mut barriers, &mut cycle_events);
+                self.process_msg(first_msg, &mut callback, &mut barriers, &mut cycle_events);
             }
 
             // Drain any additional buffered messages (batch coalescing).
             while let Ok(msg) = self.rx.try_recv() {
-                self.process_msg(msg, &mut *callback, &mut barriers, &mut cycle_events);
+                self.process_msg(msg, &mut callback, &mut barriers, &mut cycle_events);
             }
 
-            // Phase 3: Execute SQL cycle (before committing barriers so that
+            // Step: Execute SQL cycle (before committing barriers so that
             // checkpoint state includes the processed batches).
             if !self.source_batches_buf.is_empty() {
                 let wm = callback.current_watermark();
@@ -384,20 +385,20 @@ impl StreamingCoordinator {
                 callback.record_cycle(cycle_events, 0, elapsed_ns);
             }
 
-            // Phase 4: Handle barriers (after SQL cycle so checkpoint state
+            // Step: Handle barriers (after SQL cycle so checkpoint state
             // includes the effects of processed batches).
             for (source_idx, barrier) in &barriers {
-                self.handle_barrier(*source_idx, barrier, &mut *callback)
+                self.handle_barrier(*source_idx, barrier, &mut callback)
                     .await;
             }
 
-            // Phase 5: Periodic checkpoint.
-            self.maybe_checkpoint(&mut *callback).await;
+            // Step: Periodic checkpoint.
+            self.maybe_checkpoint(&mut callback).await;
 
-            // Phase 6: Poll table sources.
+            // Step: Poll table sources.
             callback.poll_tables().await;
 
-            // Phase 7: Barrier timeout check.
+            // Step: Barrier timeout check.
             if self.pending_barrier.active
                 && self.pending_barrier.started_at.elapsed() > BARRIER_TIMEOUT
             {
@@ -428,7 +429,7 @@ impl StreamingCoordinator {
     fn process_msg(
         &mut self,
         msg: SourceMsg,
-        callback: &mut dyn PipelineCallback,
+        callback: &mut impl PipelineCallback,
         barriers: &mut Vec<(usize, CheckpointBarrier)>,
         cycle_events: &mut u64,
     ) {
@@ -471,7 +472,7 @@ impl StreamingCoordinator {
         &mut self,
         source_idx: usize,
         barrier: &CheckpointBarrier,
-        callback: &mut dyn PipelineCallback,
+        callback: &mut impl PipelineCallback,
     ) {
         if !self.pending_barrier.active
             || barrier.checkpoint_id != self.pending_barrier.checkpoint_id
@@ -517,7 +518,7 @@ impl StreamingCoordinator {
     /// When barriers are supported (sources present), injects barriers for
     /// Chandy-Lamport consistent snapshots. When no sources are present,
     /// falls back to timer-based offset-only checkpoints.
-    async fn maybe_checkpoint(&mut self, callback: &mut dyn PipelineCallback) {
+    async fn maybe_checkpoint(&mut self, callback: &mut impl PipelineCallback) {
         if self.pending_barrier.active {
             return; // Already tracking a barrier.
         }
@@ -665,7 +666,7 @@ mod tests {
             barrier_seen: FxHashSet::default(),
         };
 
-        let callback = Box::new(MockCallback::new());
+        let callback = MockCallback::new();
 
         // Send a batch.
         let schema = Arc::new(Schema::new(vec![Field::new("x", DataType::Int64, false)]));

@@ -154,7 +154,7 @@ async fn test_barrier_aligned_checkpoint_fires() {
         BarrierTrackingCallback::new(Arc::clone(&should_trigger), Arc::clone(&record_counter));
 
     let handle = tokio::spawn(async move {
-        coordinator.run(Box::new(callback)).await;
+        coordinator.run(callback).await;
     });
 
     // Let the pipeline run and process data + barriers.
@@ -300,7 +300,7 @@ async fn test_single_source_barrier_checkpoint() {
         BarrierTrackingCallback::new(Arc::clone(&should_trigger), Arc::clone(&record_counter));
 
     let handle = tokio::spawn(async move {
-        coordinator.run(Box::new(callback)).await;
+        coordinator.run(callback).await;
     });
 
     tokio::time::sleep(Duration::from_millis(300)).await;
@@ -359,7 +359,7 @@ async fn test_exhausted_sources_with_shutdown() {
         BarrierTrackingCallback::new(Arc::clone(&should_trigger), Arc::clone(&record_counter));
 
     let handle = tokio::spawn(async move {
-        coordinator.run(Box::new(callback)).await;
+        coordinator.run(callback).await;
     });
 
     // Let sources exhaust and barriers fire, then shut down.

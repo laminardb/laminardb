@@ -38,6 +38,17 @@ mod core_window_state;
 mod db;
 mod eowc_state;
 // Reopened `impl LaminarDB` modules — split from db.rs
+/// FFI-friendly API for language bindings.
+///
+/// Enable with the `api` feature flag:
+/// ```toml
+/// laminar-db = { version = "0.1", features = ["api"] }
+/// ```
+///
+/// This module provides thread-safe types with numeric error codes,
+/// explicit resource management, and Arrow RecordBatch at all boundaries.
+#[cfg(feature = "api")]
+pub mod api;
 mod ddl;
 mod error;
 mod handle;
@@ -54,23 +65,6 @@ pub mod recovery_manager;
 mod show_commands;
 mod sink_task;
 mod sql_utils;
-// Used in production by `ConnectorPipelineCallback` for SQL execution and
-// checkpoint state capture. Not dead code.
-/// FFI-friendly API for language bindings.
-///
-/// Enable with the `api` feature flag:
-/// ```toml
-/// laminar-db = { version = "0.1", features = ["api"] }
-/// ```
-///
-/// This module provides thread-safe types with numeric error codes,
-/// explicit resource management, and Arrow RecordBatch at all boundaries.
-#[cfg(feature = "api")]
-pub mod api;
-#[allow(dead_code)] // Adapters constructed by SQL lowering
-mod sql_lowering;
-#[allow(dead_code)] // Adapters constructed by SQL lowering
-mod sql_operators;
 mod stream_executor;
 mod table_backend;
 mod table_cache_mode;

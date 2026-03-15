@@ -324,9 +324,7 @@ pub(crate) struct StreamExecutor {
     cycle_results: FxHashMap<Arc<str>, Vec<RecordBatch>>,
     /// Reusable per-cycle intermediate table name list.
     cycle_intermediates: Vec<String>,
-    /// Query indices to skip in `execute_cycle` (handled by DAG executor).
-    skipped_queries: FxHashSet<usize>,
-    /// Lazily determined: `Some(true)` when all non-skipped queries are on
+    /// Lazily determined: `Some(true)` when all queries are on
     /// compiled paths (no `ctx.sql()` needed), allowing `register_source_tables()`
     /// to be skipped entirely. `None` = not yet determined.
     all_queries_compiled: Option<bool>,
@@ -357,22 +355,7 @@ impl StreamExecutor {
             max_state_bytes: None,
             cycle_results: FxHashMap::default(),
             cycle_intermediates: Vec::new(),
-            skipped_queries: FxHashSet::default(),
             all_queries_compiled: None,
-        }
-    }
-
-    /// Access the underlying `SessionContext` (for DAG lowering introspection).
-    pub(crate) fn session_context(&self) -> &SessionContext {
-        &self.ctx
-    }
-
-    /// Mark queries as DAG-handled so `execute_cycle()` skips them.
-    pub(crate) fn skip_queries(&mut self, names: &rustc_hash::FxHashSet<Arc<str>>) {
-        for (i, q) in self.queries.iter().enumerate() {
-            if names.contains(&q.name) {
-                self.skipped_queries.insert(i);
-            }
         }
     }
 
@@ -562,8 +545,7 @@ impl StreamExecutor {
         // cycle until it settles to true (states are lazily populated).
         if self.all_queries_compiled != Some(true) {
             let all_compiled = self.topo_order.iter().all(|&idx| {
-                self.skipped_queries.contains(&idx)
-                    || self.plain_compiled.contains_key(&idx)
+                self.plain_compiled.contains_key(&idx)
                     || self
                         .agg_states
                         .get(&idx)
@@ -598,11 +580,6 @@ impl StreamExecutor {
         let topo_len = self.topo_order.len();
         for i in 0..topo_len {
             let idx = self.topo_order[i];
-
-            // Skip queries handled by the DAG executor.
-            if self.skipped_queries.contains(&idx) {
-                continue;
-            }
 
             let is_eowc = self.queries[idx].suppresses_intermediate();
             let has_asof = self.queries[idx].asof_config.is_some();

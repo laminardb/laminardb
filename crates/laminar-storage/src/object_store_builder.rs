@@ -94,8 +94,26 @@ fn build_local_file_system(url: &str) -> Result<Arc<dyn ObjectStore>, ObjectStor
         ));
     }
 
+    // On Windows, file:///C:/path yields "/C:/path" after stripping the
+    // scheme. The leading slash before the drive letter is invalid — strip
+    // it so `LocalFileSystem::new_with_prefix` receives "C:/path".
+    let path = strip_windows_leading_slash(path);
+
     let fs = LocalFileSystem::new_with_prefix(path)?;
     Ok(Arc::new(fs))
+}
+
+/// Strip the leading `/` that precedes a Windows drive letter.
+///
+/// `"/C:/foo"` → `"C:/foo"`, `"/path/to"` (Unix) → `"/path/to"` (unchanged).
+fn strip_windows_leading_slash(path: &str) -> &str {
+    let bytes = path.as_bytes();
+    // Pattern: `/X:/...` where X is an ASCII letter
+    if bytes.len() >= 3 && bytes[0] == b'/' && bytes[1].is_ascii_alphabetic() && bytes[2] == b':' {
+        &path[1..]
+    } else {
+        path
+    }
 }
 
 // ---------------------------------------------------------------------------
@@ -273,5 +291,22 @@ mod tests {
             let err = result.unwrap_err().to_string();
             assert!(err.contains("azure"), "got: {err}");
         }
+    }
+
+    #[test]
+    fn test_strip_windows_leading_slash() {
+        // Windows drive letter patterns
+        assert_eq!(strip_windows_leading_slash("/C:/foo"), "C:/foo");
+        assert_eq!(strip_windows_leading_slash("/D:/"), "D:/");
+        assert_eq!(strip_windows_leading_slash("/c:/bar"), "c:/bar");
+
+        // Unix paths — no change
+        assert_eq!(strip_windows_leading_slash("/path/to"), "/path/to");
+        assert_eq!(strip_windows_leading_slash("/tmp"), "/tmp");
+
+        // Edge cases
+        assert_eq!(strip_windows_leading_slash("/"), "/");
+        assert_eq!(strip_windows_leading_slash(""), "");
+        assert_eq!(strip_windows_leading_slash("C:/foo"), "C:/foo");
     }
 }

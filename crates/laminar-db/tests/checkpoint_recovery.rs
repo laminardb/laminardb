@@ -144,39 +144,31 @@ fn test_operator_state_round_trip() {
     let dir = tempfile::tempdir().unwrap();
     let store = make_store(dir.path());
 
-    // Simulate DAG with accumulated window state
+    // Simulate operator state persistence
     let mut manifest = CheckpointManifest::new(1, 10);
-    let window_state = vec![1u8, 2, 3, 4, 5, 6, 7, 8]; // Serialized accumulator
+    let executor_state = vec![1u8, 2, 3, 4, 5, 6, 7, 8];
     let filter_state = vec![0xDE, 0xAD, 0xBE, 0xEF];
 
+    manifest.operator_states.insert(
+        "stream_executor".into(),
+        OperatorCheckpoint::inline(&executor_state),
+    );
     manifest
         .operator_states
-        .insert("0".into(), OperatorCheckpoint::inline(&window_state));
-    manifest
-        .operator_states
-        .insert("3".into(), OperatorCheckpoint::inline(&filter_state));
+        .insert("filter".into(), OperatorCheckpoint::inline(&filter_state));
     store.save(&manifest).unwrap();
 
     // Recover
     let mgr = RecoveryManager::new(&store);
     let manifest = mgr.load_latest().unwrap().unwrap();
 
-    // Convert to DAG format
-    let dag_states = laminar_db::checkpoint_coordinator::manifest_operators_to_dag_states(
-        &manifest.operator_states,
-    );
+    assert_eq!(manifest.operator_states.len(), 2);
 
-    assert_eq!(dag_states.len(), 2);
+    let w = manifest.operator_states.get("stream_executor").unwrap();
+    assert_eq!(w.decode_inline().unwrap(), executor_state);
 
-    let w = dag_states
-        .get(&laminar_core::dag::topology::NodeId(0))
-        .unwrap();
-    assert_eq!(w.data, window_state);
-
-    let f = dag_states
-        .get(&laminar_core::dag::topology::NodeId(3))
-        .unwrap();
-    assert_eq!(f.data, filter_state);
+    let f = manifest.operator_states.get("filter").unwrap();
+    assert_eq!(f.decode_inline().unwrap(), filter_state);
 }
 
 // ── Scenario 6: WAL positions recorded and recovered ──

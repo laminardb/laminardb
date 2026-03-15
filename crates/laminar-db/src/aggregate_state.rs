@@ -1045,11 +1045,6 @@ impl IncrementalAggState {
         Ok(vec![batch])
     }
 
-    /// Output schema (group columns + aggregate results).
-    pub(crate) fn output_schema(&self) -> Arc<Schema> {
-        Arc::clone(&self.output_schema)
-    }
-
     /// Pre-aggregation SQL.
     pub fn pre_agg_sql(&self) -> &str {
         &self.pre_agg_sql
@@ -1068,15 +1063,6 @@ impl IncrementalAggState {
     /// Compiled pre-agg projection (single-source queries only).
     pub fn compiled_projection(&self) -> Option<&CompiledProjection> {
         self.compiled_projection.as_ref()
-    }
-
-    /// Take the compiled projection out, leaving `None` in its place.
-    ///
-    /// Used by SQL lowering to extract the projection before wrapping the
-    /// state in a DAG adapter. The projection is then stored separately
-    /// for direct evaluation in the pipeline callback.
-    pub(crate) fn take_compiled_projection(&mut self) -> Option<CompiledProjection> {
-        self.compiled_projection.take()
     }
 
     /// Cached optimized logical plan for the pre-agg SQL.

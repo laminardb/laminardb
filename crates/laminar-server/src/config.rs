@@ -209,10 +209,6 @@ pub struct ServerSection {
     #[serde(default = "default_bind")]
     pub bind: String,
 
-    /// Bind address for Prometheus metrics endpoint.
-    #[serde(default = "default_metrics_bind")]
-    pub metrics_bind: String,
-
     /// Number of worker threads (0 = auto-detect CPU count).
     #[serde(default)]
     pub workers: usize,
@@ -227,7 +223,6 @@ impl Default for ServerSection {
         Self {
             mode: default_mode(),
             bind: default_bind(),
-            metrics_bind: default_metrics_bind(),
             workers: 0,
             log_level: default_log_level(),
         }
@@ -245,18 +240,6 @@ pub struct StateSection {
     /// Path for persistent state (mmap backend).
     #[serde(default = "default_state_path")]
     pub path: String,
-
-    /// Maximum state size in bytes (0 = unlimited for memory backend).
-    #[serde(default)]
-    pub max_size_bytes: u64,
-
-    /// Cache capacity for disaggregated backend (number of entries).
-    #[serde(default = "default_disaggregated_cache_capacity")]
-    pub cache_capacity: usize,
-
-    /// Cache shard count for disaggregated backend.
-    #[serde(default = "default_disaggregated_cache_shards")]
-    pub cache_shards: usize,
 }
 
 impl Default for StateSection {
@@ -264,9 +247,6 @@ impl Default for StateSection {
         Self {
             backend: default_state_backend(),
             path: default_state_path(),
-            max_size_bytes: 0,
-            cache_capacity: default_disaggregated_cache_capacity(),
-            cache_shards: default_disaggregated_cache_shards(),
         }
     }
 }
@@ -283,35 +263,6 @@ pub struct CheckpointSection {
     /// Checkpoint interval (e.g., "10s", "1m", "30s").
     #[serde(default = "default_checkpoint_interval", with = "humantime_serde")]
     pub interval: Duration,
-
-    /// Checkpoint mode: "aligned" or "unaligned".
-    #[serde(default = "default_checkpoint_mode")]
-    pub mode: String,
-
-    /// Snapshot strategy: "full", "incremental", "fork_cow".
-    #[serde(default = "default_snapshot_strategy")]
-    pub snapshot_strategy: String,
-
-    /// Enable adaptive checkpoint interval tuning.
-    ///
-    /// When `true`, the checkpoint interval is dynamically adjusted based on
-    /// observed checkpoint costs to keep estimated recovery time within
-    /// `target_recovery_time`.
-    #[serde(default)]
-    pub adaptive: bool,
-
-    /// Target upper bound for estimated recovery time (e.g., `"10s"`).
-    /// Only used when `adaptive = true`.
-    #[serde(default = "default_target_recovery_time", with = "humantime_serde")]
-    pub target_recovery_time: Duration,
-
-    /// Minimum checkpoint interval for adaptive mode (e.g., `"1s"`).
-    #[serde(default = "default_min_interval", with = "humantime_serde")]
-    pub min_interval: Duration,
-
-    /// Maximum checkpoint interval for adaptive mode (e.g., `"5m"`).
-    #[serde(default = "default_max_interval", with = "humantime_serde")]
-    pub max_interval: Duration,
 
     /// Explicit cloud storage credentials/config overrides.
     ///
@@ -330,12 +281,6 @@ impl Default for CheckpointSection {
         Self {
             url: default_checkpoint_url(),
             interval: default_checkpoint_interval(),
-            mode: default_checkpoint_mode(),
-            snapshot_strategy: default_snapshot_strategy(),
-            adaptive: false,
-            target_recovery_time: default_target_recovery_time(),
-            min_interval: default_min_interval(),
-            max_interval: default_max_interval(),
             storage: std::collections::HashMap::new(),
             tiering: None,
         }
@@ -606,9 +551,6 @@ fn default_mode() -> String {
 fn default_bind() -> String {
     "127.0.0.1:8080".to_string()
 }
-fn default_metrics_bind() -> String {
-    "127.0.0.1:9090".to_string()
-}
 fn default_log_level() -> String {
     "info".to_string()
 }
@@ -618,32 +560,11 @@ fn default_state_backend() -> String {
 fn default_state_path() -> String {
     "./data/state".to_string()
 }
-fn default_disaggregated_cache_capacity() -> usize {
-    1024
-}
-fn default_disaggregated_cache_shards() -> usize {
-    16
-}
 fn default_checkpoint_url() -> String {
     "file:///tmp/laminardb/checkpoints".to_string()
 }
 fn default_checkpoint_interval() -> Duration {
     Duration::from_secs(10)
-}
-fn default_checkpoint_mode() -> String {
-    "aligned".to_string()
-}
-fn default_snapshot_strategy() -> String {
-    "full".to_string()
-}
-fn default_target_recovery_time() -> Duration {
-    Duration::from_secs(10)
-}
-fn default_min_interval() -> Duration {
-    Duration::from_secs(1)
-}
-fn default_max_interval() -> Duration {
-    Duration::from_secs(300) // 5m
 }
 fn default_format() -> String {
     "json".to_string()
@@ -825,7 +746,6 @@ delivery = "exactly_once"
         assert_eq!(config.node_id.as_deref(), Some("star-1"));
         assert_eq!(config.server.mode, "delta");
         assert_eq!(config.state.backend, "mmap");
-        assert_eq!(config.state.max_size_bytes, 10_737_418_240);
         assert!(config.discovery.is_some());
         assert!(config.coordination.is_some());
 
@@ -974,12 +894,10 @@ bind = "not-a-socket-addr"
 
         assert_eq!(config.server.mode, "embedded");
         assert_eq!(config.server.bind, "127.0.0.1:8080");
-        assert_eq!(config.server.metrics_bind, "127.0.0.1:9090");
         assert_eq!(config.server.workers, 0);
         assert_eq!(config.server.log_level, "info");
         assert_eq!(config.state.backend, "memory");
         assert_eq!(config.checkpoint.interval, Duration::from_secs(10));
-        assert_eq!(config.checkpoint.mode, "aligned");
     }
 
     #[test]
