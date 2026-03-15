@@ -29,6 +29,12 @@ static FILTER_TABLE_COUNTER: AtomicUsize = AtomicUsize::new(0);
 /// Implements [`PipelineCallback`](crate::pipeline::PipelineCallback) to bridge
 /// the event-driven pipeline coordinator to the rest of the database (stream
 /// executor, sinks, watermarks, checkpoints, table sources).
+///
+/// `ConnectorPipelineCallback` runs on a dedicated single-threaded tokio runtime
+/// (laminar-compute thread). Serialization and checkpoint I/O run inline because:
+/// 1. `tokio::spawn` on `current_thread` has no parallelism benefit
+/// 2. `spawn_blocking` on `current_thread` has no dedicated blocking pool
+/// 3. The compute thread is dedicated — blocking is acceptable
 pub(crate) struct ConnectorPipelineCallback {
     pub(crate) executor: crate::stream_executor::StreamExecutor,
     pub(crate) stream_sources: Vec<(String, streaming::Source<crate::catalog::ArrowRecord>)>,
@@ -45,7 +51,6 @@ pub(crate) struct ConnectorPipelineCallback {
     pub(crate) tracker: Option<laminar_core::time::WatermarkTracker>,
     pub(crate) counters: Arc<crate::metrics::PipelineCounters>,
     pub(crate) pipeline_watermark: Arc<std::sync::atomic::AtomicI64>,
-    pub(crate) checkpoint_in_progress: Arc<std::sync::atomic::AtomicBool>,
     pub(crate) coordinator:
         Arc<tokio::sync::Mutex<Option<crate::checkpoint_coordinator::CheckpointCoordinator>>>,
     #[allow(clippy::type_complexity)]
@@ -318,30 +323,12 @@ impl crate::pipeline::PipelineCallback for ConnectorPipelineCallback {
             return false;
         }
 
-        if !force
-            && self
-                .checkpoint_in_progress
-                .load(std::sync::atomic::Ordering::Relaxed)
-        {
-            return false;
-        }
-
         if !force {
             let Some(interval) = self.checkpoint_interval else {
                 return false; // no auto-checkpointing configured
             };
             if self.last_checkpoint.elapsed() < interval {
                 return false;
-            }
-        }
-
-        if force {
-            // Wait for any in-flight checkpoint to complete.
-            while self
-                .checkpoint_in_progress
-                .load(std::sync::atomic::Ordering::Relaxed)
-            {
-                tokio::time::sleep(std::time::Duration::from_millis(50)).await;
             }
         }
 
@@ -360,28 +347,19 @@ impl crate::pipeline::PipelineCallback for ConnectorPipelineCallback {
             .map(|(name, cp)| (name.clone(), source_to_connector_checkpoint(cp)))
             .collect();
 
-        // Capture stream executor aggregate state: snapshot (sync), then
-        // offload serialization to spawn_blocking to free the tokio worker.
+        // Capture stream executor aggregate state and serialize inline.
         // Abort the checkpoint if serialization fails — persisting source
         // offsets without matching operator state would cause data loss on
         // recovery (offsets advance past unreplayable state).
         let mut operator_states = HashMap::with_capacity(2);
         match self.executor.snapshot_state() {
             Ok(Some(cp)) => {
-                match tokio::task::spawn_blocking(move || {
-                    crate::stream_executor::StreamExecutor::serialize_checkpoint(&cp)
-                })
-                .await
-                {
-                    Ok(Ok(bytes)) => {
+                match crate::stream_executor::StreamExecutor::serialize_checkpoint(&cp) {
+                    Ok(bytes) => {
                         operator_states.insert("stream_executor".to_string(), bytes);
                     }
-                    Ok(Err(e)) => {
-                        tracing::warn!(error = %e, "Stream executor checkpoint serialization failed — skipping checkpoint");
-                        return false;
-                    }
                     Err(e) => {
-                        tracing::warn!(error = %e, "Stream executor checkpoint spawn_blocking failed — skipping checkpoint");
+                        tracing::warn!(error = %e, "Stream executor checkpoint serialization failed — skipping checkpoint");
                         return false;
                     }
                 }
@@ -434,48 +412,41 @@ impl crate::pipeline::PipelineCallback for ConnectorPipelineCallback {
                 }
             }
         } else {
-            // Non-blocking periodic checkpoint.
-            let coord_clone = Arc::clone(&self.coordinator);
-            let in_progress = Arc::clone(&self.checkpoint_in_progress);
-            in_progress.store(true, std::sync::atomic::Ordering::Relaxed);
-            let pipeline_hash = self.pipeline_hash;
-
-            tokio::spawn(async move {
-                let mut guard = coord_clone.lock().await;
-                if let Some(ref mut coord) = *guard {
-                    match coord
-                        .checkpoint_with_offsets(
-                            operator_states,
-                            None,
-                            None,
-                            extra_tables,
-                            per_source_watermarks,
-                            pipeline_hash,
-                            source_overrides,
-                        )
-                        .await
-                    {
-                        Ok(result) if result.success => {
-                            tracing::info!(
-                                epoch = result.epoch,
-                                duration_ms = result.duration.as_millis(),
-                                "Pipeline checkpoint completed"
-                            );
-                        }
-                        Ok(result) => {
-                            tracing::warn!(
-                                epoch = result.epoch,
-                                error = ?result.error,
-                                "Pipeline checkpoint failed"
-                            );
-                        }
-                        Err(e) => {
-                            tracing::warn!(error = %e, "Checkpoint error");
-                        }
+            // Periodic checkpoint — run inline (single-threaded runtime, no
+            // parallelism to exploit with tokio::spawn).
+            let mut guard = self.coordinator.lock().await;
+            if let Some(ref mut coord) = *guard {
+                match coord
+                    .checkpoint_with_offsets(
+                        operator_states,
+                        None,
+                        None,
+                        extra_tables,
+                        per_source_watermarks,
+                        self.pipeline_hash,
+                        source_overrides,
+                    )
+                    .await
+                {
+                    Ok(result) if result.success => {
+                        tracing::info!(
+                            epoch = result.epoch,
+                            duration_ms = result.duration.as_millis(),
+                            "Pipeline checkpoint completed"
+                        );
+                    }
+                    Ok(result) => {
+                        tracing::warn!(
+                            epoch = result.epoch,
+                            error = ?result.error,
+                            "Pipeline checkpoint failed"
+                        );
+                    }
+                    Err(e) => {
+                        tracing::warn!(error = %e, "Checkpoint error");
                     }
                 }
-                in_progress.store(false, std::sync::atomic::Ordering::Relaxed);
-            });
+            }
         }
 
         self.last_checkpoint = std::time::Instant::now();
@@ -507,28 +478,18 @@ impl crate::pipeline::PipelineCallback for ConnectorPipelineCallback {
         }
 
         // Capture stream executor aggregate state — now consistent because
-        // all pre-barrier data has been executed. Offload serialization to
-        // spawn_blocking to free the tokio worker during JSON encoding.
-        // Abort the checkpoint if serialization fails — persisting source
-        // offsets without matching operator state would cause data loss on
-        // recovery.
+        // all pre-barrier data has been executed. Serialize inline (single-threaded
+        // runtime). Abort if serialization fails — persisting source offsets
+        // without matching operator state would cause data loss on recovery.
         let mut operator_states = HashMap::with_capacity(2);
         match self.executor.snapshot_state() {
             Ok(Some(cp)) => {
-                match tokio::task::spawn_blocking(move || {
-                    crate::stream_executor::StreamExecutor::serialize_checkpoint(&cp)
-                })
-                .await
-                {
-                    Ok(Ok(bytes)) => {
+                match crate::stream_executor::StreamExecutor::serialize_checkpoint(&cp) {
+                    Ok(bytes) => {
                         operator_states.insert("stream_executor".to_string(), bytes);
                     }
-                    Ok(Err(e)) => {
-                        tracing::warn!(error = %e, "Stream executor checkpoint serialization failed — skipping barrier checkpoint");
-                        return false;
-                    }
                     Err(e) => {
-                        tracing::warn!(error = %e, "Stream executor checkpoint spawn_blocking failed — skipping barrier checkpoint");
+                        tracing::warn!(error = %e, "Stream executor checkpoint serialization failed — skipping barrier checkpoint");
                         return false;
                     }
                 }

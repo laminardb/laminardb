@@ -313,9 +313,21 @@ impl StreamingCoordinator {
     /// Receives batches from sources via mpsc, executes SQL cycles via
     /// the callback, and handles checkpoint barriers. Returns when
     /// shutdown is signaled.
+    ///
+    /// Cycle priority ordering:
+    /// 1. Shutdown signal (biased select — checked first)
+    /// 2. Event drain + SQL execution (up to `MAX_DRAIN_PER_CYCLE` messages)
+    /// 3. Barrier alignment (after SQL so checkpoint state includes processed data)
+    /// 4. Periodic checkpoint (if interval elapsed)
+    /// 5. Table source polling (idle maintenance)
+    /// 6. Barrier timeout check
     #[allow(clippy::too_many_lines)]
     pub async fn run<C: PipelineCallback>(mut self, mut callback: C) {
+        /// Maximum messages to drain per cycle before yielding for maintenance work.
+        const MAX_DRAIN_PER_CYCLE: usize = 10_000;
+
         let batch_window = self.config.batch_window;
+        let mut barriers_buf: Vec<(usize, CheckpointBarrier)> = Vec::new();
 
         loop {
             // Step: Wait for data, shutdown, or idle timeout.
@@ -341,7 +353,7 @@ impl StreamingCoordinator {
             // Step: Drain messages and coalesce batches.
             self.source_batches_buf.clear();
             self.barrier_seen.clear();
-            let mut barriers = Vec::new();
+            barriers_buf.clear();
             let mut cycle_events: u64 = 0;
             let cycle_start = Instant::now();
 
@@ -353,18 +365,30 @@ impl StreamingCoordinator {
                 self.process_msg(
                     deferred_msg,
                     &mut callback,
-                    &mut barriers,
+                    &mut barriers_buf,
                     &mut cycle_events,
                 );
             }
 
             if let Some(first_msg) = msg {
-                self.process_msg(first_msg, &mut callback, &mut barriers, &mut cycle_events);
+                self.process_msg(
+                    first_msg,
+                    &mut callback,
+                    &mut barriers_buf,
+                    &mut cycle_events,
+                );
             }
 
             // Drain any additional buffered messages (batch coalescing).
-            while let Ok(msg) = self.rx.try_recv() {
-                self.process_msg(msg, &mut callback, &mut barriers, &mut cycle_events);
+            let mut drain_count = 0;
+            while drain_count < MAX_DRAIN_PER_CYCLE {
+                match self.rx.try_recv() {
+                    Ok(msg) => {
+                        self.process_msg(msg, &mut callback, &mut barriers_buf, &mut cycle_events);
+                        drain_count += 1;
+                    }
+                    Err(_) => break,
+                }
             }
 
             // Step: Execute SQL cycle (before committing barriers so that
@@ -387,7 +411,7 @@ impl StreamingCoordinator {
 
             // Step: Handle barriers (after SQL cycle so checkpoint state
             // includes the effects of processed batches).
-            for (source_idx, barrier) in &barriers {
+            for (source_idx, barrier) in &barriers_buf {
                 self.handle_barrier(*source_idx, barrier, &mut callback)
                     .await;
             }

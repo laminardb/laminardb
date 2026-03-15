@@ -906,22 +906,16 @@ where
         }
 
         // Try to deserialize as the new format (tuple of two vectors)
-        if let Ok(archived) =
-            rkyv::access::<rkyv::Archived<(Vec<WindowId>, Vec<WindowId>)>, RkyvError>(&state.data)
+        if let Ok((windows, periodic_windows)) =
+            rkyv::from_bytes::<(Vec<WindowId>, Vec<WindowId>), RkyvError>(&state.data)
         {
-            if let Ok((windows, periodic_windows)) =
-                rkyv::deserialize::<(Vec<WindowId>, Vec<WindowId>), RkyvError>(archived)
-            {
-                self.registered_windows = windows.into_iter().collect();
-                self.periodic_timer_windows = periodic_windows.into_iter().collect();
-                return Ok(());
-            }
+            self.registered_windows = windows.into_iter().collect();
+            self.periodic_timer_windows = periodic_windows.into_iter().collect();
+            return Ok(());
         }
 
         // Fall back to old format for backwards compatibility
-        let archived = rkyv::access::<rkyv::Archived<Vec<WindowId>>, RkyvError>(&state.data)
-            .map_err(|e| OperatorError::SerializationFailed(e.to_string()))?;
-        let windows: Vec<WindowId> = rkyv::deserialize::<Vec<WindowId>, RkyvError>(archived)
+        let windows: Vec<WindowId> = rkyv::from_bytes::<Vec<WindowId>, RkyvError>(&state.data)
             .map_err(|e| OperatorError::SerializationFailed(e.to_string()))?;
 
         self.registered_windows = windows.into_iter().collect();

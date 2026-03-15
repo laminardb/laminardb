@@ -841,7 +841,6 @@ impl LaminarDB {
                 .store(cap as u64, std::sync::atomic::Ordering::Relaxed);
         }
         let pipeline_watermark = Arc::clone(&self.pipeline_watermark);
-        let checkpoint_in_progress = Arc::new(std::sync::atomic::AtomicBool::new(false));
         let coordinator = Arc::clone(&self.coordinator);
         let table_store_for_loop = self.table_store.clone();
         // Compute a pipeline hash for change detection across checkpoints.
@@ -871,7 +870,6 @@ impl LaminarDB {
             tracker,
             counters,
             pipeline_watermark,
-            checkpoint_in_progress,
             coordinator,
             table_sources,
             table_store: table_store_for_loop,

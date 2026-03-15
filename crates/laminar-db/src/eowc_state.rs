@@ -761,6 +761,7 @@ impl IncrementalEowcState {
     }
 
     /// Pre-aggregation SQL.
+    #[allow(dead_code)] // Available for diagnostics.
     pub fn pre_agg_sql(&self) -> &str {
         &self.pre_agg_sql
     }

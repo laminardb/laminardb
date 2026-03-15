@@ -947,10 +947,8 @@ impl Operator for AsofJoinOperator {
             )));
         }
 
-        let archived = rkyv::access::<rkyv::Archived<CheckpointData>, RkyvError>(&state.data)
-            .map_err(|e| OperatorError::SerializationFailed(e.to_string()))?;
         let (watermark, left_events, right_events, matches, unmatched_left, state_entries) =
-            rkyv::deserialize::<CheckpointData, RkyvError>(archived)
+            rkyv::from_bytes::<CheckpointData, RkyvError>(&state.data)
                 .map_err(|e| OperatorError::SerializationFailed(e.to_string()))?;
 
         self.watermark = watermark;

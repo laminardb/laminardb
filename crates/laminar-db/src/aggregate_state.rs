@@ -307,17 +307,17 @@ pub(crate) struct EowcStateCheckpoint {
     pub windows: Vec<WindowCheckpoint>,
 }
 
-/// Serializable checkpoint for join state (e.g., future stateful joins).
+/// Serializable checkpoint for join state.
 ///
 /// Currently ASOF and temporal joins are stateless per-cycle, so this is
-/// empty. The struct provides the extension point for future stateful
-/// streaming joins (e.g., interval joins with buffer windows).
+/// empty. The struct provides the extension point for stateful streaming
+/// joins (e.g., interval joins with buffer windows).
 #[derive(Clone, serde::Serialize, serde::Deserialize, Default)]
 pub(crate) struct JoinStateCheckpoint {
-    /// Number of buffered left-side rows (for future stateful joins).
+    /// Number of buffered left-side rows.
     #[serde(default)]
     pub left_buffer_rows: u64,
-    /// Number of buffered right-side rows (for future stateful joins).
+    /// Number of buffered right-side rows.
     #[serde(default)]
     pub right_buffer_rows: u64,
     /// Serialized join buffer state (opaque bytes).
@@ -459,6 +459,10 @@ pub(crate) struct IncrementalAggState {
     /// Aggregate function specifications.
     agg_specs: Vec<AggFuncSpec>,
     /// Per-group accumulator state.
+    ///
+    /// `DataFusion` `Accumulator` is trait-object dispatched (~2ns vtable overhead).
+    /// Acceptable because each call processes a batch, not per-row. 50+
+    /// aggregate types preclude enum dispatch.
     groups: AHashMap<Vec<ScalarValue>, Vec<Box<dyn datafusion_expr::Accumulator>>>,
     /// Output schema (group columns + aggregate results).
     output_schema: SchemaRef,
@@ -1051,6 +1055,7 @@ impl IncrementalAggState {
     }
 
     /// Pre-aggregation SQL.
+    #[allow(dead_code)] // Accessed in tests and available for diagnostics.
     pub fn pre_agg_sql(&self) -> &str {
         &self.pre_agg_sql
     }

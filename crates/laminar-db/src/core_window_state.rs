@@ -22,9 +22,7 @@ use datafusion::prelude::SessionContext;
 use datafusion_common::ScalarValue;
 
 use laminar_core::operator::sliding_window::SlidingWindowAssigner;
-use laminar_core::operator::window::{
-    EmitStrategy as CoreEmitStrategy, TumblingWindowAssigner, WindowAssigner,
-};
+use laminar_core::operator::window::{TumblingWindowAssigner, WindowAssigner};
 use laminar_sql::parser::EmitClause;
 use laminar_sql::translator::{WindowOperatorConfig, WindowType};
 
@@ -120,9 +118,6 @@ pub(crate) struct CoreWindowState {
     pre_agg_sql: String,
     time_col_index: usize,
     output_schema: SchemaRef,
-    /// Converted emit strategy from SQL `EmitClause`.
-    #[allow(dead_code)]
-    emit_strategy: CoreEmitStrategy,
     having_sql: Option<String>,
     compiled_projection: Option<CompiledProjection>,
     /// Cached optimized logical plan for the pre-agg SQL (multi-source queries).
@@ -144,7 +139,7 @@ impl CoreWindowState {
         ctx: &SessionContext,
         sql: &str,
         window_config: &WindowOperatorConfig,
-        emit_clause: Option<&EmitClause>,
+        _emit_clause: Option<&EmitClause>,
     ) -> Result<Option<Self>, DbError> {
         let size_ms = i64::try_from(window_config.size.as_millis()).unwrap_or(i64::MAX);
 
@@ -598,13 +593,6 @@ impl CoreWindowState {
             None
         };
 
-        // Wire the SQL→Core emit strategy bridge
-        let emit_strategy = match emit_clause {
-            Some(ec) => crate::stream_executor::emit_clause_to_core(ec)
-                .unwrap_or(CoreEmitStrategy::OnWindowClose),
-            None => CoreEmitStrategy::OnWindowClose,
-        };
-
         // Cache the optimized logical plan for multi-source pre-agg queries.
         // Fail fast if the pre-agg SQL is invalid — it would fail every cycle.
         let cached_pre_agg_plan = if compiled_projection.is_none() {
@@ -631,7 +619,6 @@ impl CoreWindowState {
             pre_agg_sql,
             output_schema,
             time_col_index,
-            emit_strategy,
             having_sql,
             compiled_projection,
             cached_pre_agg_plan,
@@ -1272,6 +1259,7 @@ impl CoreWindowState {
     }
 
     /// Pre-aggregation SQL.
+    #[allow(dead_code)] // Accessed in tests and available for diagnostics.
     pub fn pre_agg_sql(&self) -> &str {
         &self.pre_agg_sql
     }
@@ -1609,7 +1597,6 @@ mod tests {
             pre_agg_sql: String::new(),
             output_schema,
             time_col_index: 2,
-            emit_strategy: CoreEmit::OnWindowClose,
             having_sql: None,
             compiled_projection: None,
             cached_pre_agg_plan: None,
@@ -1666,7 +1653,6 @@ mod tests {
             pre_agg_sql: String::new(),
             output_schema,
             time_col_index: 2,
-            emit_strategy: CoreEmit::OnWindowClose,
             having_sql: None,
             compiled_projection: None,
             cached_pre_agg_plan: None,
@@ -1712,7 +1698,6 @@ mod tests {
             pre_agg_sql: String::new(),
             output_schema,
             time_col_index: 2,
-            emit_strategy: CoreEmit::OnWindowClose,
             having_sql: None,
             compiled_projection: None,
             cached_pre_agg_plan: None,
@@ -1756,7 +1741,6 @@ mod tests {
             pre_agg_sql: String::new(),
             output_schema,
             time_col_index: 2,
-            emit_strategy: CoreEmit::OnWindowClose,
             having_sql: None,
             compiled_projection: None,
             cached_pre_agg_plan: None,

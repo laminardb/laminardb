@@ -15,6 +15,7 @@ use rustc_hash::{FxHashMap, FxHashSet};
 
 use arrow::array::RecordBatch;
 use arrow::datatypes::{DataType, SchemaRef};
+use datafusion::physical_plan::PhysicalExpr;
 use datafusion::prelude::SessionContext;
 use sqlparser::ast::{
     Expr, SelectItem, SetExpr, Statement, TableFactor, WildcardAdditionalOptions,
@@ -42,6 +43,7 @@ use crate::error::DbError;
 /// expect `EmitStrategy::Final`. This function maps all variants correctly.
 ///
 /// Cannot use a `From` impl due to the orphan rule (neither type is local).
+#[allow(dead_code)] // Used in tests and by emit_clause_to_core.
 pub(crate) fn sql_emit_to_core(
     s: &SqlEmitStrategy,
 ) -> laminar_core::operator::window::EmitStrategy {
@@ -60,6 +62,7 @@ pub(crate) fn sql_emit_to_core(
 ///
 /// Calls `EmitClause::to_emit_strategy()` to resolve the clause to a
 /// runtime strategy, then converts via [`sql_emit_to_core`].
+#[allow(dead_code)] // Used in tests.
 pub(crate) fn emit_clause_to_core(
     clause: &EmitClause,
 ) -> Result<laminar_core::operator::window::EmitStrategy, laminar_sql::parser::ParseError> {
@@ -200,6 +203,25 @@ fn collect_tables_from_factor(factor: &TableFactor, tables: &mut FxHashSet<Strin
     }
 }
 
+/// Lazily compiled post-join projection for ASOF/temporal queries.
+///
+/// Compiled from the projection SQL (e.g., `SELECT a, b AS alias FROM __asof_tmp`)
+/// on first execution when the join output schema is known.
+struct CompiledPostProjection {
+    /// Physical expressions to evaluate per output column.
+    exprs: Vec<Arc<dyn PhysicalExpr>>,
+    /// Output schema.
+    output_schema: SchemaRef,
+}
+
+impl std::fmt::Debug for CompiledPostProjection {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("CompiledPostProjection")
+            .field("output_schema", &self.output_schema)
+            .finish_non_exhaustive()
+    }
+}
+
 /// A registered stream query for execution.
 #[derive(Debug, Clone)]
 pub(crate) struct StreamQuery {
@@ -328,6 +350,12 @@ pub(crate) struct StreamExecutor {
     /// compiled paths (no `ctx.sql()` needed), allowing `register_source_tables()`
     /// to be skipped entirely. `None` = not yet determined.
     all_queries_compiled: Option<bool>,
+    /// Lazily compiled post-join projection expressions for ASOF/temporal joins.
+    /// Keyed by query index. Compiled on first execution when join output schema
+    /// is known.
+    compiled_post_projections: FxHashMap<usize, CompiledPostProjection>,
+    /// Query indices for which post-projection compilation was attempted and failed.
+    post_projection_compile_failed: FxHashSet<usize>,
 }
 
 impl StreamExecutor {
@@ -356,6 +384,8 @@ impl StreamExecutor {
             cycle_results: FxHashMap::default(),
             cycle_intermediates: Vec::new(),
             all_queries_compiled: None,
+            compiled_post_projections: FxHashMap::default(),
+            post_projection_compile_failed: FxHashSet::default(),
         }
     }
 
@@ -611,6 +641,7 @@ impl StreamExecutor {
                 );
                 let projection_sql = self.queries[idx].projection_sql.as_ref().map(Arc::clone);
                 self.execute_asof_query(
+                    idx,
                     &query_name,
                     &cfg,
                     projection_sql.as_deref(),
@@ -628,6 +659,7 @@ impl StreamExecutor {
                 );
                 let projection_sql = self.queries[idx].projection_sql.as_ref().map(Arc::clone);
                 self.execute_temporal_query(
+                    idx,
                     &query_name,
                     &cfg,
                     projection_sql.as_deref(),
@@ -941,6 +973,44 @@ fn extract_filter_or_scan(
     }
 }
 
+/// Extract projection expressions from a logical plan for post-join compilation.
+///
+/// Walks the plan to find the Projection node, compiles each expression to a
+/// `PhysicalExpr`, and returns the expressions with the output schema.
+fn extract_projection_exprs(
+    plan: &LogicalPlan,
+    input_schema: &SchemaRef,
+    ctx: &SessionContext,
+) -> Option<(Vec<Arc<dyn PhysicalExpr>>, SchemaRef)> {
+    let proj = match plan {
+        LogicalPlan::Projection(p) => p,
+        LogicalPlan::SubqueryAlias(a) => {
+            return extract_projection_exprs(&a.input, input_schema, ctx);
+        }
+        _ => return None,
+    };
+
+    let df_schema = datafusion_common::DFSchema::try_from(input_schema.as_ref().clone()).ok()?;
+    let state = ctx.state();
+    let exec_props = state.execution_props();
+
+    let mut exprs = Vec::with_capacity(proj.expr.len());
+    let mut fields = Vec::with_capacity(proj.expr.len());
+
+    for (i, expr) in proj.expr.iter().enumerate() {
+        let phys =
+            datafusion::physical_expr::create_physical_expr(expr, &df_schema, exec_props).ok()?;
+        let name = proj.schema.field(i).name().clone();
+        let dt = phys.data_type(input_schema).ok()?;
+        let nullable = phys.nullable(input_schema).unwrap_or(true);
+        fields.push(arrow::datatypes::Field::new(name, dt, nullable));
+        exprs.push(phys);
+    }
+
+    let output_schema = Arc::new(arrow::datatypes::Schema::new(fields));
+    Some((exprs, output_schema))
+}
+
 /// Compute a fast schema fingerprint from field names and types.
 fn schema_fingerprint(schema: &arrow::datatypes::Schema) -> u64 {
     use std::hash::{Hash, Hasher};
@@ -1224,6 +1294,11 @@ impl StreamExecutor {
     }
 
     /// Execute a cached logical plan (physical planning only, no SQL parse).
+    ///
+    /// Physical planning runs per cycle because `MemTable` contents change each cycle.
+    /// Cost: ~5-10μs for simple scans (measured). SQL parsing and logical optimization
+    /// are eliminated by caching the `LogicalPlan`. This is the best achievable for
+    /// multi-source (JOIN) queries without reimplementing `DataFusion`'s join operators.
     async fn execute_cached_plan(
         &self,
         query_name: &str,
@@ -1269,26 +1344,9 @@ impl StreamExecutor {
             let plan = plan.clone();
             self.execute_cached_plan(&query_name, &plan).await?
         } else {
-            let pre_agg_sql = agg_state.pre_agg_sql().to_string();
-            match self.ctx.sql(&pre_agg_sql).await {
-                Ok(df) => df
-                    .collect()
-                    .await
-                    .map_err(|e| DbError::query_pipeline(&*query_name, &e))?,
-                Err(e) => {
-                    tracing::trace!(
-                        query = %query_name,
-                        error = %e,
-                        "Pre-agg SQL failed, emitting current state"
-                    );
-                    let agg_state = self.agg_states.get_mut(&idx).ok_or_else(|| {
-                        DbError::Pipeline(format!(
-                            "internal: missing agg_state for query index {idx}"
-                        ))
-                    })?;
-                    return agg_state.emit();
-                }
-            }
+            return Err(DbError::Pipeline(format!(
+                "[LDB-8050] query '{query_name}': no compiled projection or cached plan"
+            )));
         };
 
         let agg_state = self.agg_states.get_mut(&idx).ok_or_else(|| {
@@ -1315,13 +1373,18 @@ impl StreamExecutor {
     }
 
     /// Apply a HAVING predicate to emitted aggregate batches using the
-    /// session context's SQL engine.
+    /// session context's SQL engine. This is a fallback for HAVING predicates
+    /// that could not be compiled to `PhysicalExpr`.
     async fn apply_having_filter(
         &self,
         query_name: &str,
         batches: &[RecordBatch],
         having_sql: &str,
     ) -> Result<Vec<RecordBatch>, DbError> {
+        tracing::warn!(
+            query = %query_name,
+            "HAVING filter could not be compiled to PhysicalExpr — using DataFusion SQL fallback"
+        );
         if batches.is_empty() {
             return Ok(Vec::new());
         }
@@ -1383,21 +1446,9 @@ impl StreamExecutor {
             let plan = plan.clone();
             self.execute_cached_plan(query_name, &plan).await?
         } else {
-            let pre_agg_sql = eowc_state.pre_agg_sql().to_string();
-            match self.ctx.sql(&pre_agg_sql).await {
-                Ok(df) => df
-                    .collect()
-                    .await
-                    .map_err(|e| DbError::query_pipeline(query_name, &e))?,
-                Err(e) => {
-                    tracing::trace!(
-                        query = %query_name,
-                        error = %e,
-                        "EOWC pre-agg SQL failed, skipping update"
-                    );
-                    Vec::new()
-                }
-            }
+            return Err(DbError::Pipeline(format!(
+                "[LDB-8050] query '{query_name}': no compiled projection or cached plan"
+            )));
         };
 
         let eowc_state = self.eowc_agg_states.get_mut(&idx).ok_or_else(|| {
@@ -1448,21 +1499,9 @@ impl StreamExecutor {
             let plan = plan.clone();
             self.execute_cached_plan(query_name, &plan).await?
         } else {
-            let pre_agg_sql = cw_state.pre_agg_sql().to_string();
-            match self.ctx.sql(&pre_agg_sql).await {
-                Ok(df) => df
-                    .collect()
-                    .await
-                    .map_err(|e| DbError::query_pipeline(query_name, &e))?,
-                Err(e) => {
-                    tracing::trace!(
-                        query = %query_name,
-                        error = %e,
-                        "core window pre-agg SQL failed, skipping update"
-                    );
-                    Vec::new()
-                }
-            }
+            return Err(DbError::Pipeline(format!(
+                "[LDB-8050] query '{query_name}': no compiled projection or cached plan"
+            )));
         };
 
         let cw_state = self.core_window_states.get_mut(&idx).ok_or_else(|| {
@@ -1837,10 +1876,11 @@ impl StreamExecutor {
         }
 
         // Execute the query
-        let query_sql = &self.queries[idx].sql;
-        let temporal_config = self.queries[idx].temporal_config.as_ref();
+        let query_sql = self.queries[idx].sql.clone();
+        let temporal_config = self.queries[idx].temporal_config.clone();
         let batches = if let Some(cfg) = asof_config {
             self.execute_asof_query(
+                idx,
                 query_name,
                 cfg,
                 projection_sql,
@@ -1848,12 +1888,13 @@ impl StreamExecutor {
                 intermediate_results,
             )
             .await?
-        } else if let Some(tcfg) = temporal_config {
-            let temporal_proj = self.queries[idx].projection_sql.as_deref();
+        } else if let Some(ref tcfg) = temporal_config {
+            let temporal_proj = self.queries[idx].projection_sql.as_ref().map(Arc::clone);
             self.execute_temporal_query(
+                idx,
                 query_name,
                 tcfg,
-                temporal_proj,
+                temporal_proj.as_deref(),
                 &filtered_sources,
                 intermediate_results,
             )
@@ -1861,7 +1902,7 @@ impl StreamExecutor {
         } else {
             let df = self
                 .ctx
-                .sql(query_sql)
+                .sql(&query_sql)
                 .await
                 .map_err(|e| DbError::query_pipeline(query_name, &e))?;
             df.collect()
@@ -1893,7 +1934,8 @@ impl StreamExecutor {
     /// the join in-process. Optionally applies a projection SQL for aliases and
     /// computed columns.
     async fn execute_asof_query(
-        &self,
+        &mut self,
+        idx: usize,
         query_name: &str,
         config: &AsofJoinTranslatorConfig,
         projection_sql: Option<&str>,
@@ -1917,6 +1959,30 @@ impl StreamExecutor {
 
         // Apply projection if present (handles aliases and computed columns)
         if let Some(proj_sql) = projection_sql {
+            // Try compiled post-projection (lazy compile on first call)
+            if let Some(compiled) = self.compiled_post_projections.get(&idx) {
+                let result = Self::apply_compiled_post_projection(compiled, &joined)?;
+                return Ok(vec![result]);
+            }
+
+            if !self.post_projection_compile_failed.contains(&idx) {
+                let schema = joined.schema();
+                if let Some(compiled) = self
+                    .try_compile_post_projection(proj_sql, "__asof_tmp", &schema)
+                    .await
+                {
+                    let result = Self::apply_compiled_post_projection(&compiled, &joined)?;
+                    self.compiled_post_projections.insert(idx, compiled);
+                    return Ok(vec![result]);
+                }
+                self.post_projection_compile_failed.insert(idx);
+                tracing::warn!(
+                    query = %query_name,
+                    "ASOF post-projection could not be compiled — using DataFusion SQL fallback"
+                );
+            }
+
+            // SQL fallback
             let schema = joined.schema();
             let mem_table = datafusion::datasource::MemTable::try_new(schema, vec![vec![joined]])
                 .map_err(|e| DbError::query_pipeline(query_name, &e))?;
@@ -1949,7 +2015,8 @@ impl StreamExecutor {
     /// the lookup registry. The pre-built `VersionedIndex` is reused
     /// across cycles (only rebuilt on CDC updates in `poll_tables`).
     async fn execute_temporal_query(
-        &self,
+        &mut self,
+        idx: usize,
         query_name: &str,
         config: &TemporalJoinTranslatorConfig,
         projection_sql: Option<&str>,
@@ -1972,6 +2039,7 @@ impl StreamExecutor {
         };
 
         self.execute_versioned_temporal_query(
+            idx,
             query_name,
             config,
             projection_sql,
@@ -1983,9 +2051,10 @@ impl StreamExecutor {
     }
 
     /// Execute a temporal join against a versioned lookup table from the registry.
-    #[allow(clippy::too_many_lines)]
+    #[allow(clippy::too_many_lines, clippy::too_many_arguments)]
     async fn execute_versioned_temporal_query(
-        &self,
+        &mut self,
+        idx: usize,
         query_name: &str,
         config: &TemporalJoinTranslatorConfig,
         projection_sql: Option<&str>,
@@ -2096,6 +2165,41 @@ impl StreamExecutor {
             if batches.is_empty() || batches.iter().all(|b| b.num_rows() == 0) {
                 return Ok(Vec::new());
             }
+
+            // Try compiled post-projection (lazy compile on first call)
+            if let Some(compiled) = self.compiled_post_projections.get(&idx) {
+                let mut result = Vec::with_capacity(batches.len());
+                for batch in &batches {
+                    if batch.num_rows() > 0 {
+                        result.push(Self::apply_compiled_post_projection(compiled, batch)?);
+                    }
+                }
+                return Ok(result);
+            }
+
+            if !self.post_projection_compile_failed.contains(&idx) {
+                let schema = batches[0].schema();
+                if let Some(compiled) = self
+                    .try_compile_post_projection(proj_sql, "__temporal_tmp", &schema)
+                    .await
+                {
+                    let mut result = Vec::with_capacity(batches.len());
+                    for batch in &batches {
+                        if batch.num_rows() > 0 {
+                            result.push(Self::apply_compiled_post_projection(&compiled, batch)?);
+                        }
+                    }
+                    self.compiled_post_projections.insert(idx, compiled);
+                    return Ok(result);
+                }
+                self.post_projection_compile_failed.insert(idx);
+                tracing::warn!(
+                    query = %query_name,
+                    "Temporal post-projection could not be compiled — using DataFusion SQL fallback"
+                );
+            }
+
+            // SQL fallback
             let schema = batches[0].schema();
             let mem_table = datafusion::datasource::MemTable::try_new(schema, vec![batches])
                 .map_err(|e| DbError::query_pipeline(query_name, &e))?;
@@ -2120,6 +2224,56 @@ impl StreamExecutor {
         } else {
             Ok(batches)
         }
+    }
+
+    /// Try to compile a post-join projection SQL to physical expressions.
+    ///
+    /// On success, returns `CompiledPostProjection` that can evaluate the
+    /// projection directly on a `RecordBatch` without SQL overhead.
+    async fn try_compile_post_projection(
+        &self,
+        proj_sql: &str,
+        tmp_table_name: &str,
+        batch_schema: &SchemaRef,
+    ) -> Option<CompiledPostProjection> {
+        let empty =
+            datafusion::datasource::MemTable::try_new(batch_schema.clone(), vec![vec![]]).ok()?;
+        let _ = self.ctx.deregister_table(tmp_table_name);
+        self.ctx
+            .register_table(tmp_table_name, Arc::new(empty))
+            .ok()?;
+
+        let df = self.ctx.sql(proj_sql).await.ok()?;
+        let plan = df.logical_plan().clone();
+        let _ = self.ctx.deregister_table(tmp_table_name);
+
+        // Extract projection expressions from the logical plan
+        let (exprs, output_schema) = extract_projection_exprs(&plan, batch_schema, &self.ctx)?;
+        Some(CompiledPostProjection {
+            exprs,
+            output_schema,
+        })
+    }
+
+    /// Apply a compiled post-projection to a batch.
+    fn apply_compiled_post_projection(
+        proj: &CompiledPostProjection,
+        batch: &RecordBatch,
+    ) -> Result<RecordBatch, DbError> {
+        if batch.num_rows() == 0 {
+            return Ok(RecordBatch::new_empty(Arc::clone(&proj.output_schema)));
+        }
+        let mut arrays = Vec::with_capacity(proj.exprs.len());
+        for expr in &proj.exprs {
+            let col = expr
+                .evaluate(batch)
+                .map_err(|e| DbError::Pipeline(format!("post-projection evaluate: {e}")))?
+                .into_array(batch.num_rows())
+                .map_err(|e| DbError::Pipeline(format!("post-projection to array: {e}")))?;
+            arrays.push(col);
+        }
+        RecordBatch::try_new(Arc::clone(&proj.output_schema), arrays)
+            .map_err(|e| DbError::Pipeline(format!("post-projection batch: {e}")))
     }
 
     /// Resolve batches for a table name by checking source batches first,

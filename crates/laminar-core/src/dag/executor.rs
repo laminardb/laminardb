@@ -1,5 +1,9 @@
 //! Ring 0 DAG executor for event processing.
 //!
+//! **Note:** The SQL pipeline uses `StreamingCoordinator` + `StreamExecutor`,
+//! not this executor. This module serves the programmatic Rust API for
+//! `DagBuilder`-defined pipelines.
+//!
 //! [`DagExecutor`] processes events through a finalized [`StreamingDag`] in
 //! topological order. It uses the pre-computed [`RoutingTable`] for O(1)
 //! dispatch and integrates with the [`Operator`] trait for operator invocation.

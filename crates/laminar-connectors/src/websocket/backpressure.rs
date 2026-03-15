@@ -16,7 +16,7 @@ use serde::{Deserialize, Serialize};
 /// - `Block`: fully implemented (TCP backpressure propagation)
 /// - `DropNewest`: implemented in `source.rs` via `try_send`
 /// - `DropOldest`, `Buffer`, `Sample`: parsed from SQL WITH, fall back to
-///   `DropNewest` behavior with a debug log. Full dispatch planned for Phase 6c.
+///   `DropNewest` behavior with a debug log. Full dispatch not yet implemented.
 #[derive(Debug, Clone, Default, Serialize, Deserialize)]
 pub enum WsBackpressure {
     /// Block WS read -- TCP backpressure propagates to sender.

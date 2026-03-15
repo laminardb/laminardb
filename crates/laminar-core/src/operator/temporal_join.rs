@@ -1089,8 +1089,6 @@ impl Operator for TemporalJoinOperator {
             )));
         }
 
-        let archived = rkyv::access::<rkyv::Archived<CheckpointData>, RkyvError>(&state.data)
-            .map_err(|e| OperatorError::SerializationFailed(e.to_string()))?;
         let (
             watermark,
             stream_events,
@@ -1100,7 +1098,7 @@ impl Operator for TemporalJoinOperator {
             retractions,
             table_entries,
             stream_entries,
-        ) = rkyv::deserialize::<CheckpointData, RkyvError>(archived)
+        ) = rkyv::from_bytes::<CheckpointData, RkyvError>(&state.data)
             .map_err(|e| OperatorError::SerializationFailed(e.to_string()))?;
 
         self.watermark = watermark;

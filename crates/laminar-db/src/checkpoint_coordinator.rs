@@ -5,6 +5,10 @@
 //! Lives in Ring 2 (control plane). Reuses the existing
 //! `DagCheckpointCoordinator` for barrier logic.
 //!
+//! The checkpoint manifest is the source of truth for source offsets.
+//! Kafka broker commits are advisory (for monitoring tools). On recovery,
+//! offsets restore from manifest, not consumer group state.
+//!
 //! ## Checkpoint Cycle
 //!
 //! 1. Barrier propagation — `dag_coordinator.trigger_checkpoint()`

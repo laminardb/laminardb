@@ -998,11 +998,8 @@ where
             return Ok(());
         }
 
-        let archived =
-            rkyv::access::<rkyv::Archived<(Vec<(u64, i64, u64)>, u64)>, RkyvError>(&state.data)
-                .map_err(|e| OperatorError::SerializationFailed(e.to_string()))?;
         let (timers, counter_val) =
-            rkyv::deserialize::<(Vec<(u64, i64, u64)>, u64), RkyvError>(archived)
+            rkyv::from_bytes::<(Vec<(u64, i64, u64)>, u64), RkyvError>(&state.data)
                 .map_err(|e| OperatorError::SerializationFailed(e.to_string()))?;
 
         self.pending_timers = timers
