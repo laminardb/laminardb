@@ -244,6 +244,10 @@ pub(crate) struct StreamQuery {
     /// Pre-computed table references (extracted once at registration).
     /// Avoids re-parsing SQL for dependency analysis every cycle.
     table_refs: FxHashSet<String>,
+    /// Tombstone flag: when `true`, the query is skipped during execution
+    /// and excluded from checkpoints. Used by the control channel to remove
+    /// queries without invalidating indices in state maps.
+    removed: bool,
 }
 
 impl StreamQuery {
@@ -366,6 +370,14 @@ pub(crate) struct StreamExecutor {
     /// Query indices that were skipped last cycle due to budget exhaustion.
     /// These are processed first (priority) on the next cycle.
     skipped_last_cycle: FxHashSet<usize>,
+    /// Per-query budget in nanoseconds. When elapsed time exceeds this,
+    /// remaining queries are deferred to the next cycle. Default: 8ms.
+    query_budget_ns: u64,
+    /// Shared pipeline counters for fallback monitoring.
+    counters: Option<Arc<crate::metrics::PipelineCounters>>,
+    /// Query indices for which the execution-tier has already been logged
+    /// (compiled vs cached-plan). Avoids per-cycle log spam.
+    fallback_logged: FxHashSet<usize>,
 }
 
 impl StreamExecutor {
@@ -399,6 +411,9 @@ impl StreamExecutor {
             cached_having_plans: FxHashMap::default(),
             cached_post_projection_plans: FxHashMap::default(),
             skipped_last_cycle: FxHashSet::default(),
+            query_budget_ns: 8_000_000,
+            counters: None,
+            fallback_logged: FxHashSet::default(),
         }
     }
 
@@ -408,6 +423,33 @@ impl StreamExecutor {
     /// aggregate/window operator's estimated memory after every cycle.
     pub fn set_max_state_bytes(&mut self, limit: Option<usize>) {
         self.max_state_bytes = limit;
+    }
+
+    /// Set the per-query execution budget in nanoseconds.
+    pub fn set_query_budget_ns(&mut self, ns: u64) {
+        self.query_budget_ns = ns;
+    }
+
+    /// Set shared pipeline counters for fallback monitoring.
+    pub fn set_counters(&mut self, c: Arc<crate::metrics::PipelineCounters>) {
+        self.counters = Some(c);
+    }
+
+    /// Record whether a query uses the compiled or cached-plan execution tier.
+    /// Increments counters once per query index and logs on first occurrence.
+    fn record_query_tier(&mut self, idx: usize, compiled: bool) {
+        if !self.fallback_logged.insert(idx) {
+            return; // already recorded
+        }
+        if let Some(ref c) = self.counters {
+            if compiled {
+                c.queries_compiled
+                    .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+            } else {
+                c.queries_cached_plan
+                    .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+            }
+        }
     }
 
     /// Set the lookup table registry for versioned temporal join lookups.
@@ -464,6 +506,7 @@ impl StreamExecutor {
             window_config: window_config.map(Arc::new),
             order_config,
             table_refs,
+            removed: false,
         };
         // Initialize EOWC state for queries that suppress intermediate results
         if query.suppresses_intermediate() {
@@ -478,6 +521,36 @@ impl StreamExecutor {
         }
         self.queries.push(query);
         self.topo_dirty = true;
+    }
+
+    /// Remove a query by name using a tombstone (sets `removed = true`).
+    ///
+    /// Tombstone approach avoids index invalidation that would break all
+    /// state map keys (`agg_states`, `eowc_states`, etc.). The query struct
+    /// remains in the `queries` Vec but is skipped during execution and
+    /// excluded from checkpoints.
+    pub fn remove_query(&mut self, name: &str) {
+        for (idx, q) in self.queries.iter_mut().enumerate() {
+            if &*q.name == name && !q.removed {
+                q.removed = true;
+                // Clean up associated state maps.
+                self.agg_states.remove(&idx);
+                self.eowc_states.remove(&idx);
+                self.eowc_agg_states.remove(&idx);
+                self.core_window_states.remove(&idx);
+                self.plain_compiled.remove(&idx);
+                self.cached_logical_plans.remove(&idx);
+                self.cached_plan_fingerprints.remove(&idx);
+                self.non_agg_queries.remove(&idx);
+                self.non_eowc_agg_queries.remove(&idx);
+                self.non_core_window_queries.remove(&idx);
+                self.fallback_logged.remove(&idx);
+                self.topo_dirty = true;
+                // Invalidate the compiled-path cache so it's re-evaluated.
+                self.all_queries_compiled = None;
+                break;
+            }
+        }
     }
 
     /// Register a static reference table (e.g., from `CREATE TABLE`).
@@ -627,12 +700,18 @@ impl StreamExecutor {
         for i in 0..topo_len {
             let idx = self.topo_order[i];
 
-            // Budget check: stop if >8ms elapsed (leaves headroom for maintenance).
-            // Always execute at least one query per cycle for forward progress.
+            // Skip tombstoned queries (removed via control channel).
+            if self.queries[idx].removed {
+                continue;
+            }
+
+            // Budget check: stop if elapsed time exceeds the per-query budget
+            // (leaves headroom for maintenance). Always execute at least one
+            // query per cycle for forward progress.
             if i > 0 {
                 #[allow(clippy::cast_possible_truncation)]
                 let elapsed_ns = cycle_start.elapsed().as_nanos() as u64;
-                if elapsed_ns > 8_000_000 {
+                if elapsed_ns > self.query_budget_ns {
                     for j in i..topo_len {
                         self.skipped_last_cycle.insert(self.topo_order[j]);
                     }
@@ -1096,6 +1175,7 @@ impl StreamExecutor {
     ) -> Result<Vec<RecordBatch>, DbError> {
         // Fast path: already have incremental agg state for this query
         if self.agg_states.contains_key(&idx) {
+            self.record_query_tier(idx, true);
             return self
                 .execute_incremental_agg(idx, source_batches, results)
                 .await;
@@ -1103,12 +1183,14 @@ impl StreamExecutor {
 
         // Fast path: already have compiled projection for this query
         if self.plain_compiled.contains_key(&idx) {
+            self.record_query_tier(idx, true);
             let proj = &self.plain_compiled[&idx];
             return Ok(evaluate_compiled_projection(proj, source_batches, results));
         }
 
         // Fast path: already have cached logical plan for this query
         if self.cached_logical_plans.contains_key(&idx) {
+            self.record_query_tier(idx, false);
             return self.execute_cached_plan_query(idx).await;
         }
 
@@ -1187,9 +1269,10 @@ impl StreamExecutor {
         let fingerprint = source_schemas_fingerprint(table_refs, &self.source_schemas);
         self.cached_logical_plans.insert(idx, plan);
         self.cached_plan_fingerprints.insert(idx, fingerprint);
-        tracing::debug!(
+        self.record_query_tier(idx, false);
+        tracing::info!(
             query = %query_name,
-            "Cached optimized logical plan for complex non-aggregate query"
+            "Query using DataFusion cached-plan path (physical planning per cycle)"
         );
         df.collect()
             .await

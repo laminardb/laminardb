@@ -252,6 +252,7 @@ impl LaminarDB {
         let mut executor = StreamExecutor::new(ctx);
         executor.set_max_state_bytes(self.config.max_state_bytes_per_operator);
         executor.set_lookup_registry(Arc::clone(&self.lookup_registry));
+        executor.set_counters(Arc::clone(&self.counters));
 
         // Register source schemas for ALL sources (both external connectors
         // and catalog-bridge sources) so the executor can create empty
@@ -783,8 +784,10 @@ impl LaminarDB {
             },
             barrier_alignment_timeout: std::time::Duration::from_secs(30),
             delivery_guarantee: self.config.delivery_guarantee,
-            cycle_budget_ns: 10_000_000, // 10ms
-            drain_budget_ns: 1_000_000,  // 1ms
+            cycle_budget_ns: 10_000_000,     // 10ms
+            drain_budget_ns: 1_000_000,      // 1ms
+            query_budget_ns: 8_000_000,      // 8ms
+            background_budget_ns: 5_000_000, // 5ms
         };
 
         // Validate delivery guarantee constraints.
@@ -862,6 +865,9 @@ impl LaminarDB {
             Some(hasher.finish())
         };
 
+        // Wire per-query budget from pipeline config.
+        executor.set_query_budget_ns(pipeline_config.query_budget_ns);
+
         let callback = crate::pipeline_callback::ConnectorPipelineCallback {
             executor,
             stream_sources,
@@ -897,10 +903,16 @@ impl LaminarDB {
         // StreamingCoordinator::new(). The coordinator communicates with
         // them via tokio::sync::mpsc which works across runtimes.
         {
+            // Control channel for live DDL (add/drop stream).
+            let (control_tx, control_rx) =
+                tokio::sync::mpsc::channel::<crate::pipeline::ControlMsg>(64);
+            *self.control_tx.lock() = Some(control_tx);
+
             let coordinator = crate::pipeline::StreamingCoordinator::new(
                 sources,
                 pipeline_config,
                 Arc::clone(&shutdown),
+                control_rx,
             )
             .await?;
 

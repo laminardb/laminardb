@@ -609,12 +609,26 @@ impl LaminarDB {
             }
         };
 
+        let query_sql = streaming_statement_to_sql(query);
+
         // Store the query SQL for stream execution at start()
         {
             let mut mgr = self.connector_manager.lock();
             mgr.register_stream(crate::connector_manager::StreamRegistration {
                 name: name_str.clone(),
-                query_sql: streaming_statement_to_sql(query),
+                query_sql: query_sql.clone(),
+                emit_clause: plan_emit.clone(),
+                window_config: plan_window.clone(),
+                order_config: plan_order.clone(),
+            });
+        }
+
+        // If the pipeline is already running, send via control channel
+        // so the coordinator picks up the new query on the next cycle.
+        if let Some(ref tx) = *self.control_tx.lock() {
+            let _ = tx.try_send(crate::pipeline::ControlMsg::AddStream {
+                name: name_str.clone(),
+                sql: query_sql,
                 emit_clause: plan_emit,
                 window_config: plan_window,
                 order_config: plan_order,
@@ -654,6 +668,14 @@ impl LaminarDB {
             return Err(DbError::StreamNotFound(name_str));
         }
         self.connector_manager.lock().unregister_stream(&name_str);
+
+        // Notify the running coordinator to remove the query.
+        if let Some(ref tx) = *self.control_tx.lock() {
+            let _ = tx.try_send(crate::pipeline::ControlMsg::DropStream {
+                name: name_str.clone(),
+            });
+        }
+
         Ok(ExecuteResult::Ddl(DdlInfo {
             statement_type: "DROP STREAM".to_string(),
             object_name: name_str,

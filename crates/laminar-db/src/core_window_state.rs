@@ -593,8 +593,10 @@ impl CoreWindowState {
             None
         };
 
-        // Cache the optimized logical plan for multi-source pre-agg queries.
-        // Fail fast if the pre-agg SQL is invalid — it would fail every cycle.
+        // ONE-TIME setup: cache the optimized logical plan for multi-source
+        // pre-agg queries. This ctx.sql() call runs ONLY at first-cycle
+        // initialization, never per-cycle. Fail fast if the pre-agg SQL is
+        // invalid — it would fail every cycle.
         let cached_pre_agg_plan = if compiled_projection.is_none() {
             match ctx.sql(&pre_agg_sql).await {
                 Ok(df) => Some(df.logical_plan().clone()),
