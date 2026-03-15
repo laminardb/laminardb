@@ -26,7 +26,7 @@ fn make_batch(symbols: &[&str], prices: &[f64], timestamps: &[i64]) -> RecordBat
         (
             "symbol",
             Arc::new(StringArray::from(
-                symbols.iter().map(|s| *s).collect::<Vec<_>>(),
+                symbols.iter().copied().collect::<Vec<_>>(),
             )) as _,
         ),
         (

@@ -69,7 +69,7 @@ LaminarDB development is organized into phases, each building on the previous. D
 - EMIT clause extension, changelog/retraction Z-sets (F011B, F063)
 - Per-partition, keyed, and alignment group watermarks (F064-F066)
 - io_uring optimization, NUMA-aware memory (F067-F068) (feature-gated, not enabled in default builds)
-- Three-ring I/O architecture, task budget enforcement (F069-F070)
+- StreamingCoordinator I/O architecture, task budget enforcement (F069-F070)
 - Zero-allocation enforcement, zero-allocation polling (F071, F073)
 - XDP/eBPF network optimization (F072)
 - Advanced DataFusion integration, composite aggregator (F005B, F074-F077)

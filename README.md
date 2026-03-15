@@ -90,7 +90,7 @@ Three deployment modes:
 |------|-----|--------|
 | **Embedded** | `cargo add laminar-db` — runs inside your Rust process | ✅ Implemented |
 | **Standalone** | `laminardb` binary with HTTP API, configurable via TOML | ✅ Implemented |
-| **Distributed** | Multi-node via gossip discovery, Raft consensus, gRPC — `--features delta` | 🔧 Discovery only; coordination not yet functional (Phase 6c) |
+| **Distributed** | Multi-node via gossip discovery, Raft consensus, gRPC — `--features delta` | 🔧 Implemented; production hardening pending (Phase 6c) |
 
 The embedded mode is the primary deployment target. You get a `LaminarDB` handle, register sources with SQL DDL, push `RecordBatch` data in, subscribe to output streams, and let the engine handle windowing, joins, checkpointing, and exactly-once delivery.
 
@@ -304,7 +304,7 @@ See [docs/ARCHITECTURE.md](docs/ARCHITECTURE.md) for the full design.
 ### Checkpointing and Recovery
 
 1. **WAL** — Write-ahead log segments with CRC32C checksums and torn write detection
-2. **Coordinated Snapshots** — Barrier-based checkpoint protocol: barriers align at source level between sources and the coordinator
+2. **Coordinated Snapshots** — Barrier-based checkpoint protocol: coordinator injects barriers into all sources; operators with multiple inputs align barriers before snapshotting
 3. **Two-Phase Commit** — Sinks participate in pre-commit/commit phases for exactly-once delivery
 4. **Recovery** — `RecoveryManager` restores from the latest checkpoint manifest, replays WAL, resumes connectors from committed offsets
 

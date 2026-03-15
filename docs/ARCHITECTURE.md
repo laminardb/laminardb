@@ -72,7 +72,7 @@ A single `StreamingCoordinator` tokio task receives batches from source connecto
 Durability and I/O, runs on Tokio async runtime.
 
 **Components:**
-- **Checkpoint Manager** -- Incremental checkpointing with directory-based snapshots. `CheckpointCoordinator` orchestrates two-phase commit across all operators and sinks (`laminar-db/src/checkpoint_coordinator.rs`).
+- **Checkpoint Manager** -- Incremental checkpointing with directory-based snapshots. `CheckpointCoordinator` orchestrates two-phase commit across exactly-once sinks (`laminar-db/src/checkpoint_coordinator.rs`).
 - **WAL Writer** -- Per-core write-ahead log segments with CRC32C checksums, torn write detection, and fdatasync durability (`laminar-storage/src/per_core_wal/`).
 - **Changelog Drainer** -- Consumes changelog entries and persists them (`laminar-storage/src/changelog_drainer.rs`).
 - **Recovery Manager** -- Loads the latest checkpoint manifest and restores all operator state, connector offsets, and watermarks on startup (`laminar-db/src/recovery_manager.rs`).
@@ -359,11 +359,11 @@ Exactly-once processing works through:
 
 With the `delta` feature enabled, multi-node operation:
 
-- **Discovery** -- Static configuration, gossip-based (chitchat), or Kafka group discovery. Discovery via chitchat gossip works.
+- **Discovery** -- Static configuration, gossip-based (chitchat), or Kafka group discovery. Discovery via chitchat gossip is implemented.
 - **Coordination** -- Raft-based metadata consensus via openraft
 - **Partition Ownership** -- Epoch-fenced partition guards with consistent assignment
 - **Distributed Checkpoints** -- Cross-node barrier coordination (planned; not yet implemented in checkpoint_coordinator)
 - **Cross-Node Aggregation** -- Gossip partial aggregates and gRPC fan-out
 - **Inter-Node RPC** -- gRPC service definitions for remote lookups, barrier forwarding, aggregate fan-out
 
-**Status**: Raft consensus, inter-node RPC, partition-scoped state transfer, and cross-node aggregation are not yet production-hardened (Phase 6c).
+**Status**: Discovery and coordination are implemented but not yet production-hardened. Production hardening is planned for Phase 6c.

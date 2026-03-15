@@ -277,17 +277,19 @@ impl LaminarDB {
         // the DAG at runtime; otherwise the DAG is built but not used.
         #[allow(clippy::type_complexity)]
         let (
-            dag_executor,
+            mut dag_executor,
             dag_query_names,
             dag_source_node_ids,
             dag_sink_to_query,
             dag_pre_agg_sql,
+            dag_op_node_ids,
         ): (
             Option<laminar_core::dag::DagExecutor>,
             rustc_hash::FxHashSet<Arc<str>>,
             FxHashMap<Arc<str>, laminar_core::dag::NodeId>,
             FxHashMap<laminar_core::dag::NodeId, Arc<str>>,
             FxHashMap<Arc<str>, String>,
+            FxHashMap<Arc<str>, laminar_core::dag::NodeId>,
         ) = {
             use crate::sql_lowering::{build_query_dag, try_lower_query, LoweredQuery};
             use crate::stream_executor::extract_table_references;
@@ -364,10 +366,17 @@ impl LaminarDB {
                 // Map sink node IDs to query names
                 let mut sink_map: FxHashMap<laminar_core::dag::NodeId, Arc<str>> =
                     FxHashMap::default();
+                // Map query names to operator node IDs (for pre-agg routing)
+                let mut op_nodes: FxHashMap<Arc<str>, laminar_core::dag::NodeId> =
+                    FxHashMap::default();
                 for qname in &names {
                     let sink_name = format!("sink_{qname}");
                     if let Some(sink_id) = dag.node_id_by_name(&sink_name) {
                         sink_map.insert(sink_id, Arc::clone(qname));
+                    }
+                    let op_name = format!("op_{qname}");
+                    if let Some(op_id) = dag.node_id_by_name(&op_name) {
+                        op_nodes.insert(Arc::clone(qname), op_id);
                     }
                 }
                 tracing::info!(
@@ -375,12 +384,13 @@ impl LaminarDB {
                     source_nodes = source_nodes.len(),
                     "DAG lowering complete"
                 );
-                (Some(exec), names, source_nodes, sink_map, pre_agg_sql)
+                (Some(exec), names, source_nodes, sink_map, pre_agg_sql, op_nodes)
             } else {
                 tracing::debug!("No queries lowered to DAG");
                 (
                     None,
                     rustc_hash::FxHashSet::default(),
+                    FxHashMap::default(),
                     FxHashMap::default(),
                     FxHashMap::default(),
                     FxHashMap::default(),
@@ -704,6 +714,48 @@ impl LaminarDB {
                                 }
                             }
                         }
+                        // Restore DAG operator state (lowered queries).
+                        if let Some(op) = recovered.manifest.operator_states.get("dag_operators") {
+                            if let Some(bytes) = op.decode_inline() {
+                                if let Some(ref mut dag) = dag_executor {
+                                    match serde_json::from_slice::<
+                                        std::collections::HashMap<String, laminar_core::dag::recovery::SerializableOperatorState>,
+                                    >(&bytes)
+                                    {
+                                        Ok(dag_states) => {
+                                            let states: rustc_hash::FxHashMap<laminar_core::dag::NodeId, laminar_core::operator::OperatorState> =
+                                                dag_states.into_iter()
+                                                    .filter_map(|(id_str, sos)| {
+                                                        id_str.parse::<u32>().ok().map(|id| {
+                                                            (laminar_core::dag::NodeId(id), sos.into())
+                                                        })
+                                                    })
+                                                    .collect();
+                                            match dag.restore(&states) {
+                                                Ok(()) => {
+                                                    tracing::info!(
+                                                        operators = states.len(),
+                                                        "Restored DAG operator state from checkpoint"
+                                                    );
+                                                }
+                                                Err(e) => {
+                                                    tracing::warn!(
+                                                        error = %e,
+                                                        "DAG operator state restore failed, starting fresh"
+                                                    );
+                                                }
+                                            }
+                                        }
+                                        Err(e) => {
+                                            tracing::warn!(
+                                                error = %e,
+                                                "DAG operator state deserialization failed"
+                                            );
+                                        }
+                                    }
+                                }
+                            }
+                        }
                         tracing::info!(
                             epoch = recovered.epoch(),
                             sources_restored = recovered.sources_restored,
@@ -954,6 +1006,14 @@ impl LaminarDB {
 
         // Build the PipelineCallback implementation that bridges to db.rs internals.
         let counters = Arc::clone(&self.counters);
+        // Mirror the configured per-operator state cap into the counters
+        // so the /metrics endpoint can report the enforced limit.
+        if let Some(cap) = self.config.max_state_bytes_per_operator {
+            #[allow(clippy::cast_possible_truncation)]
+            counters
+                .max_state_bytes
+                .store(cap as u64, std::sync::atomic::Ordering::Relaxed);
+        }
         let pipeline_watermark = Arc::clone(&self.pipeline_watermark);
         let checkpoint_in_progress = Arc::new(std::sync::atomic::AtomicBool::new(false));
         let coordinator = Arc::clone(&self.coordinator);
@@ -1006,6 +1066,7 @@ impl LaminarDB {
             dag_source_node_ids,
             dag_sink_to_query,
             dag_pre_agg_sql,
+            dag_op_node_ids,
             use_dag_lowering: self.config.use_dag_lowering,
             cycle_histogram: std::cell::RefCell::new(crate::checkpoint_coordinator::DurationHistogram::new()),
         };

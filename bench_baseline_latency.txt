@@ -1,0 +1,331 @@
+   Compiling proc-macro2 v1.0.106
+   Compiling unicode-ident v1.0.22
+   Compiling quote v1.0.45
+   Compiling cfg-if v1.0.4
+   Compiling getrandom v0.3.4
+   Compiling windows-link v0.2.1
+   Compiling autocfg v1.5.0
+   Compiling zerocopy v0.8.33
+   Compiling serde_core v1.0.228
+   Compiling libm v0.2.15
+   Compiling memchr v2.7.6
+   Compiling find-msvc-tools v0.1.8
+   Compiling shlex v1.3.0
+   Compiling serde v1.0.228
+   Compiling bytes v1.11.1
+   Compiling equivalent v1.0.2
+   Compiling once_cell v1.21.3
+   Compiling bitflags v2.10.0
+   Compiling allocator-api2 v0.2.21
+   Compiling parking_lot_core v0.9.12
+   Compiling scopeguard v1.2.0
+   Compiling zmij v1.0.16
+   Compiling smallvec v1.15.1
+   Compiling windows-sys v0.61.2
+   Compiling foldhash v0.2.0
+   Compiling serde_json v1.0.149
+   Compiling itoa v1.0.17
+   Compiling version_check v0.9.5
+   Compiling lock_api v0.4.14
+   Compiling siphasher v1.0.1
+   Compiling windows_x86_64_msvc v0.53.1
+   Compiling chrono-tz v0.10.4
+   Compiling winapi v0.3.9
+   Compiling pin-project-lite v0.2.16
+   Compiling either v1.15.0
+   Compiling ahash v0.8.12
+   Compiling pkg-config v0.3.32
+   Compiling hashbrown v0.16.1
+   Compiling phf_shared v0.12.1
+   Compiling libc v0.2.183
+   Compiling num-traits v0.2.19
+   Compiling phf v0.12.1
+   Compiling windows_x86_64_msvc v0.52.6
+   Compiling unicode-segmentation v1.12.0
+   Compiling lexical-util v1.0.7
+   Compiling semver v1.0.27
+   Compiling futures-core v0.3.32
+   Compiling slab v0.4.11
+   Compiling futures-sink v0.3.32
+   Compiling zstd-safe v7.2.1
+   Compiling futures-task v0.3.32
+   Compiling futures-io v0.3.32
+   Compiling anyhow v1.0.102
+   Compiling jobserver v0.1.34
+   Compiling rustc_version v0.4.1
+   Compiling parking_lot v0.12.5
+   Compiling convert_case v0.10.0
+   Compiling rand_core v0.9.5
+   Compiling windows-targets v0.53.5
+   Compiling futures-channel v0.3.32
+   Compiling litrs v1.0.0
+   Compiling getrandom v0.4.1
+   Compiling regex-syntax v0.8.8
+   Compiling rand_core v0.10.0
+   Compiling lexical-parse-integer v1.0.6
+   Compiling cc v1.2.53
+   Compiling windows-sys v0.60.2
+   Compiling windows-targets v0.52.6
+   Compiling lexical-write-integer v1.0.6
+   Compiling memoffset v0.9.1
+   Compiling itertools v0.14.0
+   Compiling windows-sys v0.59.0
+   Compiling object v0.32.2
+   Compiling aho-corasick v1.1.4
+   Compiling log v0.4.29
+   Compiling crossbeam-utils v0.8.21
+   Compiling lexical-parse-float v1.0.6
+   Compiling tracing-core v0.1.36
+   Compiling simdutf8 v0.1.5
+   Compiling paste v1.0.15
+   Compiling syn v2.0.117
+   Compiling lexical-write-float v1.0.6
+   Compiling unicode-width v0.2.0
+   Compiling document-features v0.2.12
+   Compiling ryu v1.0.22
+   Compiling flatbuffers v25.12.19
+   Compiling getrandom v0.2.17
+   Compiling anstyle v1.0.13
+   Compiling base64 v0.22.1
+   Compiling once_cell_polyfill v1.70.2
+   Compiling utf8parse v0.2.2
+   Compiling lexical-core v1.0.6
+   Compiling foyer-intrusive-collections v0.10.0-dev
+   Compiling rand_core v0.6.4
+   Compiling mea v0.6.3
+   Compiling csv-core v0.1.13
+   Compiling is_terminal_polyfill v1.70.2
+   Compiling anstyle-parse v1.0.0
+   Compiling cmsketch v0.2.4
+   Compiling small_ctor v0.1.2
+   Compiling foldhash v0.1.5
+   Compiling num-integer v0.1.46
+   Compiling num-complex v0.4.6
+   Compiling atoi v2.0.0
+   Compiling crossbeam-epoch v0.9.18
+   Compiling colorchoice v1.0.4
+   Compiling cpufeatures v0.3.0
+   Compiling web-time v1.1.0
+   Compiling zstd-sys v2.0.12+zstd.1.5.6
+   Compiling lz4-sys v1.11.1+lz4-1.10.0
+   Compiling stacker v0.1.22
+   Compiling mixtrics v0.2.3
+   Compiling rayon-core v1.13.0
+   Compiling csv v1.4.0
+   Compiling num-bigint v0.4.6
+   Compiling socket2 v0.6.1
+   Compiling fastant v0.1.11
+   Compiling crossbeam-deque v0.8.6
+   Compiling chacha20 v0.10.0
+   Compiling alloca v0.4.0
+   Compiling crossterm_winapi v0.9.1
+   Compiling regex-automata v0.4.13
+   Compiling hashbrown v0.15.5
+   Compiling fs4 v0.13.1
+   Compiling crc32c v0.6.8
+   Compiling indexmap v2.13.0
+   Compiling ciborium-io v0.2.2
+   Compiling heck v0.5.0
+   Compiling strsim v0.11.1
+   Compiling plotters-backend v0.3.7
+   Compiling clap_lex v1.0.0
+   Compiling foyer v0.22.3
+   Compiling thiserror v2.0.18
+   Compiling fastrand v2.3.0
+   Compiling lru v0.13.0
+   Compiling rand v0.10.0
+   Compiling itertools v0.13.0
+   Compiling bit-vec v0.8.0
+   Compiling plotters-svg v0.3.7
+   Compiling ar_archive_writer v0.2.0
+   Compiling wait-timeout v0.2.1
+   Compiling fnv v1.0.7
+   Compiling quick-error v1.2.3
+   Compiling laminar-core v0.18.5 (C:\Users\sujit\source\laminardb\crates\laminar-core)
+   Compiling cast v0.3.0
+   Compiling bit-set v0.8.0
+   Compiling rayon v1.11.0
+   Compiling plotters v0.3.7
+   Compiling page_size v0.6.0
+   Compiling rand_xorshift v0.4.0
+   Compiling oorandom v11.1.5
+   Compiling rustc-hash v2.1.1
+   Compiling anes v0.1.6
+   Compiling arrayvec v0.7.6
+   Compiling uuid v1.22.0
+   Compiling xxhash-rust v0.8.15
+   Compiling bumpalo v3.20.2
+   Compiling num_cpus v1.17.0
+   Compiling memmap2 v0.9.10
+   Compiling unarray v0.1.4
+   Compiling psm v0.1.28
+   Compiling mio v1.1.1
+   Compiling anstyle-query v1.1.5
+   Compiling anstyle-wincon v3.0.11
+   Compiling winapi-util v0.1.11
+   Compiling tempfile v3.27.0
+   Compiling seize v0.5.1
+   Compiling anstream v1.0.0
+   Compiling same-file v1.0.6
+   Compiling rusty-fork v0.3.1
+   Compiling criterion-plot v0.8.2
+   Compiling papaya v0.2.3
+   Compiling zerocopy-derive v0.8.33
+   Compiling serde_derive v1.0.228
+   Compiling tokio-macros v2.6.0
+   Compiling derive_more-impl v2.1.1
+   Compiling futures-macro v0.3.32
+   Compiling ptr_meta_derive v0.3.1
+   Compiling tracing-attributes v0.1.31
+   Compiling pin-project-internal v1.1.10
+   Compiling bytecheck_derive v0.8.2
+   Compiling munge_macro v0.4.7
+   Compiling recursive-proc-macro-impl v0.1.1
+   Compiling clap_builder v4.6.0
+   Compiling sqlparser_derive v0.3.0
+   Compiling ptr_meta v0.3.1
+   Compiling async-trait v0.1.89
+   Compiling rkyv_derive v0.8.15
+   Compiling rancor v0.1.1
+   Compiling regex v1.12.3
+   Compiling tokio v1.50.0
+   Compiling clap_derive v4.6.0
+   Compiling futures-util v0.3.32
+   Compiling recursive v0.1.1
+   Compiling derive_more v2.1.1
+   Compiling thiserror-impl v2.0.18
+   Compiling munge v0.4.7
+   Compiling bytecheck v0.8.2
+   Compiling crossterm v0.29.0
+   Compiling walkdir v2.5.0
+   Compiling sqlparser v0.59.0
+   Compiling rend v0.5.3
+   Compiling pin-project v1.1.10
+   Compiling tracing v0.1.44
+   Compiling comfy-table v7.2.2
+   Compiling clap v4.6.0
+   Compiling half v2.7.1
+   Compiling ppv-lite86 v0.2.21
+   Compiling chrono v0.4.44
+   Compiling arrow-schema v57.2.0
+   Compiling bincode v1.3.3
+   Compiling tinytemplate v1.2.1
+   Compiling arrow-buffer v57.2.0
+   Compiling rand_chacha v0.9.0
+   Compiling rand_chacha v0.3.1
+   Compiling ciborium-ll v0.2.2
+   Compiling ciborium v0.2.2
+   Compiling rand v0.9.2
+   Compiling rand v0.8.5
+   Compiling lz4 v1.28.1
+   Compiling criterion v0.8.2
+   Compiling twox-hash v2.1.2
+   Compiling proptest v1.10.0
+   Compiling arrow-data v57.2.0
+   Compiling xorf v0.12.0
+   Compiling lz4_flex v0.12.0
+   Compiling rkyv v0.8.15
+   Compiling foyer-tokio v0.22.3
+   Compiling tokio-util v0.7.18
+   Compiling foyer-common v0.22.3
+   Compiling foyer-memory v0.22.3
+   Compiling tokio-stream v0.1.18
+   Compiling zstd v0.13.3
+   Compiling foyer-storage v0.22.3
+   Compiling chitchat v0.10.0
+   Compiling arrow-array v57.2.0
+   Compiling arrow-select v57.2.0
+   Compiling arrow-arith v57.2.0
+   Compiling arrow-row v57.2.0
+   Compiling arrow-ord v57.2.0
+   Compiling arrow-string v57.2.0
+   Compiling arrow-ipc v57.2.0
+   Compiling arrow-cast v57.2.0
+   Compiling arrow-json v57.2.0
+   Compiling arrow-csv v57.2.0
+   Compiling arrow v57.2.0
+    Finished `bench` profile [optimized + debuginfo] target(s) in 2m 08s
+     Running benches\latency_bench.rs (target\release\deps\latency_bench-b2e0ac3cb1e15358.exe)
+Gnuplot not found, using plotters backend
+Benchmarking passthrough_latency/event_creation
+Benchmarking passthrough_latency/event_creation: Warming up for 3.0000 s
+Benchmarking passthrough_latency/event_creation: Collecting 100 samples in estimated 5.0013 s (17M iterations)
+Benchmarking passthrough_latency/event_creation: Analyzing
+passthrough_latency/event_creation
+                        time:   [297.31 ns 297.93 ns 298.80 ns]
+                        thrpt:  [3.3467 Melem/s 3.3565 Melem/s 3.3635 Melem/s]
+                 change:
+                        time:   [+1.6142% +2.4653% +3.3336%] (p = 0.00 < 0.05)
+                        thrpt:  [−3.2260% −2.4059% −1.5886%]
+                        Performance has regressed.
+Found 18 outliers among 100 measurements (18.00%)
+  13 (13.00%) high mild
+  5 (5.00%) high severe
+
+Benchmarking window_latency/count_window_cold
+Benchmarking window_latency/count_window_cold: Warming up for 3.0000 s
+Benchmarking window_latency/count_window_cold: Collecting 100 samples in estimated 5.0048 s (3.5M iterations)
+Benchmarking window_latency/count_window_cold: Analyzing
+window_latency/count_window_cold
+                        time:   [636.55 ns 640.68 ns 645.40 ns]
+                        thrpt:  [1.5494 Melem/s 1.5608 Melem/s 1.5710 Melem/s]
+                 change:
+                        time:   [−8.0262% −7.0570% −5.9627%] (p = 0.00 < 0.05)
+                        thrpt:  [+6.3408% +7.5928% +8.7266%]
+                        Performance has improved.
+Found 17 outliers among 100 measurements (17.00%)
+  10 (10.00%) low mild
+  3 (3.00%) high mild
+  4 (4.00%) high severe
+Benchmarking window_latency/count_window_hot
+Benchmarking window_latency/count_window_hot: Warming up for 3.0000 s
+Benchmarking window_latency/count_window_hot: Collecting 100 samples in estimated 5.0010 s (11M iterations)
+Benchmarking window_latency/count_window_hot: Analyzing
+window_latency/count_window_hot
+                        time:   [382.70 ns 383.66 ns 384.47 ns]
+                        thrpt:  [2.6010 Melem/s 2.6065 Melem/s 2.6130 Melem/s]
+                 change:
+                        time:   [−25.684% −20.633% −16.167%] (p = 0.00 < 0.05)
+                        thrpt:  [+19.285% +25.996% +34.560%]
+                        Performance has improved.
+Benchmarking window_latency/sum_window_hot
+Benchmarking window_latency/sum_window_hot: Warming up for 3.0000 s
+Benchmarking window_latency/sum_window_hot: Collecting 100 samples in estimated 5.0019 s (11M iterations)
+Benchmarking window_latency/sum_window_hot: Analyzing
+window_latency/sum_window_hot
+                        time:   [385.83 ns 387.56 ns 389.37 ns]
+                        thrpt:  [2.5682 Melem/s 2.5803 Melem/s 2.5918 Melem/s]
+                 change:
+                        time:   [−15.607% −14.079% −12.591%] (p = 0.00 < 0.05)
+                        thrpt:  [+14.404% +16.386% +18.494%]
+                        Performance has improved.
+Found 8 outliers among 100 measurements (8.00%)
+  3 (3.00%) low mild
+  2 (2.00%) high mild
+  3 (3.00%) high severe
+
+Benchmarking sustained_processing/count_window_1000_events
+Benchmarking sustained_processing/count_window_1000_events: Warming up for 3.0000 s
+Benchmarking sustained_processing/count_window_1000_events: Collecting 100 samples in estimated 5.6144 s (15k iterations)
+Benchmarking sustained_processing/count_window_1000_events: Analyzing
+sustained_processing/count_window_1000_events
+                        time:   [375.93 µs 377.20 µs 378.54 µs]
+                        thrpt:  [2.6417 Melem/s 2.6511 Melem/s 2.6601 Melem/s]
+                 change:
+                        time:   [−17.645% −15.094% −13.128%] (p = 0.00 < 0.05)
+                        thrpt:  [+15.112% +17.777% +21.426%]
+                        Performance has improved.
+Benchmarking sustained_processing/sum_window_1000_events
+Benchmarking sustained_processing/sum_window_1000_events: Warming up for 3.0000 s
+Benchmarking sustained_processing/sum_window_1000_events: Collecting 100 samples in estimated 5.8862 s (15k iterations)
+Benchmarking sustained_processing/sum_window_1000_events: Analyzing
+sustained_processing/sum_window_1000_events
+                        time:   [397.96 µs 399.44 µs 401.09 µs]
+                        thrpt:  [2.4932 Melem/s 2.5035 Melem/s 2.5128 Melem/s]
+                 change:
+                        time:   [−8.8067% −7.9266% −7.1296%] (p = 0.00 < 0.05)
+                        thrpt:  [+7.6769% +8.6091% +9.6572%]
+                        Performance has improved.
+Found 1 outliers among 100 measurements (1.00%)
+  1 (1.00%) high mild
+

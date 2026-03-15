@@ -940,6 +940,13 @@ impl Operator for AsofJoinOperator {
             )));
         }
 
+        if state.version != 1 {
+            return Err(OperatorError::ConfigError(format!(
+                "unsupported checkpoint version {} for AsofJoinOperator, expected 1",
+                state.version
+            )));
+        }
+
         let archived = rkyv::access::<rkyv::Archived<CheckpointData>, RkyvError>(&state.data)
             .map_err(|e| OperatorError::SerializationFailed(e.to_string()))?;
         let (watermark, left_events, right_events, matches, unmatched_left, state_entries) =
