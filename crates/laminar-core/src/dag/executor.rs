@@ -99,9 +99,7 @@ pub struct DagExecutorMetrics {
 
 /// Per-operator metrics tracked by the DAG executor.
 ///
-/// Only populated when the `dag-metrics` feature is enabled.
 /// Tracks event counts and cumulative processing time per operator node.
-#[cfg(feature = "dag-metrics")]
 #[derive(Debug, Clone, Default)]
 pub struct OperatorNodeMetrics {
     /// Total events received by this operator.
@@ -163,8 +161,7 @@ pub struct DagExecutor {
     metrics: DagExecutorMetrics,
     /// DAG-native watermark tracker for topology-aware propagation.
     watermark_tracker: DagWatermarkTracker,
-    /// Per-operator node metrics (feature-gated).
-    #[cfg(feature = "dag-metrics")]
+    /// Per-operator node metrics.
     node_metrics: Vec<OperatorNodeMetrics>,
 }
 
@@ -224,7 +221,6 @@ impl DagExecutor {
             temp_events: Vec::with_capacity(64),
             metrics: DagExecutorMetrics::default(),
             watermark_tracker,
-            #[cfg(feature = "dag-metrics")]
             node_metrics: (0..slot_count)
                 .map(|_| OperatorNodeMetrics::default())
                 .collect(),
@@ -316,10 +312,7 @@ impl DagExecutor {
         // Fire timers for any nodes whose watermark advanced
         self.fire_timers(watermark);
 
-        #[cfg(feature = "dag-metrics")]
-        {
-            self.metrics.watermarks_processed += 1;
-        }
+        self.metrics.watermarks_processed += 1;
         Ok(())
     }
 
@@ -411,8 +404,7 @@ impl DagExecutor {
         &self.metrics
     }
 
-    /// Returns per-operator node metrics (only available with `dag-metrics` feature).
-    #[cfg(feature = "dag-metrics")]
+    /// Returns per-operator node metrics.
     #[must_use]
     pub fn node_metrics(&self) -> &[OperatorNodeMetrics] {
         &self.node_metrics
@@ -421,11 +413,8 @@ impl DagExecutor {
     /// Resets all executor metrics to zero.
     pub fn reset_metrics(&mut self) {
         self.metrics = DagExecutorMetrics::default();
-        #[cfg(feature = "dag-metrics")]
-        {
-            for m in &mut self.node_metrics {
-                *m = OperatorNodeMetrics::default();
-            }
+        for m in &mut self.node_metrics {
+            *m = OperatorNodeMetrics::default();
         }
     }
 
@@ -570,10 +559,7 @@ impl DagExecutor {
         let idx = node_id.0 as usize;
 
         if self.input_queues[idx].is_empty() {
-            #[cfg(feature = "dag-metrics")]
-            {
-                self.metrics.nodes_skipped += 1;
-            }
+            self.metrics.nodes_skipped += 1;
             return;
         }
 
@@ -589,13 +575,9 @@ impl DagExecutor {
         let mut runtime = self.runtimes[idx].take();
 
         for event in events.drain(..) {
-            #[cfg(feature = "dag-metrics")]
-            {
-                self.metrics.events_processed += 1;
-                self.node_metrics[idx].events_in += 1;
-            }
+            self.metrics.events_processed += 1;
+            self.node_metrics[idx].events_in += 1;
 
-            #[cfg(feature = "dag-metrics")]
             let start = std::time::Instant::now();
 
             let outputs = if let Some(op) = &mut operator {
@@ -616,13 +598,10 @@ impl DagExecutor {
                 passthrough_output(event)
             };
 
-            #[cfg(feature = "dag-metrics")]
-            {
-                #[allow(clippy::cast_possible_truncation)]
-                let elapsed = start.elapsed().as_nanos() as u64;
-                self.node_metrics[idx].total_time_ns += elapsed;
-                self.node_metrics[idx].invocations += 1;
-            }
+            #[allow(clippy::cast_possible_truncation)]
+            let elapsed = start.elapsed().as_nanos() as u64;
+            self.node_metrics[idx].total_time_ns += elapsed;
+            self.node_metrics[idx].invocations += 1;
 
             // Route all output variants to downstream nodes.
             self.route_all_outputs(node_id, outputs);
@@ -649,12 +628,9 @@ impl DagExecutor {
         for output in outputs {
             match output {
                 Output::Event(out_event) => {
-                    #[cfg(feature = "dag-metrics")]
-                    {
-                        let sidx = source.0 as usize;
-                        if sidx < self.slot_count {
-                            self.node_metrics[sidx].events_out += 1;
-                        }
+                    let sidx = source.0 as usize;
+                    if sidx < self.slot_count {
+                        self.node_metrics[sidx].events_out += 1;
                     }
                     self.route_output(source, out_event);
                 }
@@ -699,16 +675,10 @@ impl DagExecutor {
             return;
         }
 
-        #[cfg(feature = "dag-metrics")]
-        {
-            self.metrics.events_routed += 1;
-        }
+        self.metrics.events_routed += 1;
 
         if entry.is_multicast {
-            #[cfg(feature = "dag-metrics")]
-            {
-                self.metrics.multicast_publishes += 1;
-            }
+            self.metrics.multicast_publishes += 1;
             let targets = entry.target_ids();
 
             // Clone to all targets except the last, which gets the moved value.

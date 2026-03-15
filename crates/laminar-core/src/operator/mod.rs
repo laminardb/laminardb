@@ -192,13 +192,6 @@ impl From<arrow_schema::ArrowError> for OperatorError {
     }
 }
 
-#[cfg(feature = "jit")]
-impl From<datafusion_common::DataFusionError> for OperatorError {
-    fn from(e: datafusion_common::DataFusionError) -> Self {
-        Self::ProcessingFailed(e.to_string())
-    }
-}
-
 pub mod asof_join;
 pub mod changelog;
 pub mod lag_lead;

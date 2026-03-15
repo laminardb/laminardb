@@ -259,34 +259,35 @@ Custom connectors can be built using the `SourceConnector` / `SinkConnector` tra
 
 ## Architecture
 
-Three-ring model separating latency-critical event processing from background I/O and the control plane:
-
 ```text
 ┌──────────────────────────────────────────────────────────────┐
-│                     RING 0: HOT PATH                         │
-│  CPU-pinned reactor, minimal allocations, SPSC queues        │
-│  ┌─────────┐  ┌──────────┐  ┌──────────┐  ┌──────────┐     │
-│  │ Reactor │→ │ Operators│→ │  State   │→ │   Emit   │     │
-│  │  Loop   │  │ (window, │  │  Store   │  │ (output) │     │
-│  │         │  │  join,   │  │ (ahash/  │  │          │     │
-│  │         │  │  filter) │  │  foyer)  │  │          │     │
-│  └─────────┘  └──────────┘  └──────────┘  └──────────┘     │
-│       │                                                      │
-│       │ SPSC queues (lock-free)                              │
-│       ▼                                                      │
+│                     SOURCE CONNECTORS                        │
+│  ┌──────────┐  ┌──────────┐  ┌──────────┐                  │
+│  │ Kafka    │  │ Postgres │  │  File    │  tokio tasks      │
+│  │ Source   │  │ CDC      │  │ Source   │                   │
+│  └────┬─────┘  └────┬─────┘  └────┬─────┘                  │
+│       │ mpsc         │ mpsc        │ mpsc                    │
+│       └──────┬───────┘─────────────┘                         │
+│              ▼                                                │
 ├──────────────────────────────────────────────────────────────┤
-│                    RING 1: BACKGROUND                        │
-│  Tokio async runtime, bounded latency impact                 │
+│                  STREAMING COORDINATOR                        │
+│  Single tokio task: SQL cycles, compiled projections,         │
+│  cached logical plans, checkpoint barriers                    │
+│  ┌──────────┐  ┌──────────┐  ┌──────────┐  ┌──────────┐    │
+│  │ Compiled │→ │ Operators│→ │  State   │→ │  Sink    │    │
+│  │Projection│  │ (window, │  │  Store   │  │ Writers  │    │
+│  │/ Cached  │  │  join,   │  │ (ahash/  │  │          │    │
+│  │  Plans   │  │  filter) │  │  foyer)  │  │          │    │
+│  └──────────┘  └──────────┘  └──────────┘  └──────────┘    │
+├──────────────────────────────────────────────────────────────┤
+│                     BACKGROUND I/O                            │
+│  Tokio async runtime, bounded latency impact                  │
 │  ┌──────────┐  ┌──────────┐  ┌──────────┐  ┌──────────┐    │
 │  │Checkpoint│  │   WAL    │  │Changelog │  │  Timer   │    │
 │  │ Manager  │  │  Writer  │  │ Drainer  │  │  Wheel   │    │
 │  └──────────┘  └──────────┘  └──────────┘  └──────────┘    │
-│       │                                                      │
-│       │ Bounded channels                                     │
-│       ▼                                                      │
 ├──────────────────────────────────────────────────────────────┤
-│                    RING 2: CONTROL PLANE                     │
-│  No latency requirements                                     │
+│                      CONTROL PLANE                            │
 │  ┌──────────┐  ┌──────────┐  ┌──────────┐                  │
 │  │  Admin   │  │ Metrics  │  │  Config  │                  │
 │  │   API    │  │  Export  │  │ Manager  │                  │
@@ -294,9 +295,9 @@ Three-ring model separating latency-critical event processing from background I/
 └──────────────────────────────────────────────────────────────┘
 ```
 
-- **Ring 0** — CPU-pinned reactor loop with thread-per-core execution. Minimal heap allocations. SPSC lock-free queues between cores. Optional Cranelift JIT compilation for query expressions (`--features jit`). Target: sub-microsecond per-event latency.
-- **Ring 1** — Tokio async runtime handling WAL writes, checkpointing, connector I/O, and changelog draining. Communicates with Ring 0 via bounded channels.
-- **Ring 2** — HTTP admin API, metrics, configuration management. Auth and observability are planned (Phase 4/5).
+- **Streaming coordinator** — Single tokio task driving SQL execution cycles. Source connectors push batches via mpsc channels; the coordinator runs compiled projections / cached logical plans, routes results to sinks, and manages checkpoint barriers. Target: sub-microsecond per-event latency.
+- **Background I/O** — Tokio async runtime handling WAL writes, checkpointing, connector I/O, and changelog draining.
+- **Admin** — HTTP admin API, metrics, configuration management. Auth and observability are planned (Phase 4/5).
 
 See [docs/ARCHITECTURE.md](docs/ARCHITECTURE.md) for the full design.
 
@@ -321,9 +322,9 @@ let db = LaminarDB::builder()
 
 On crash, events between the last completed checkpoint and the crash are lost. Checkpoint interval is configurable; shorter intervals reduce the data loss window at the cost of higher I/O overhead.
 
-### JIT Compilation
+### Compiled Query Execution
 
-Enable with `--features jit`. The `AdaptiveQueryRunner` runs queries interpreted first, compiles to native code via Cranelift in the background, and hot-swaps to compiled execution when ready.
+Non-aggregate single-source queries are compiled to `PhysicalExpr` projections on first execution, eliminating per-cycle SQL parsing overhead. Complex queries cache their optimized logical plans to skip repeated planning.
 
 ---
 
@@ -392,7 +393,7 @@ Additional benchmark suites: `window_bench`, `join_bench`, `lookup_join_bench`, 
 | Phase 1 | Core Engine | ✅ 12/12 |
 | Phase 1.5 | SQL Parser | ✅ 1/1 |
 | Phase 2 | Production Hardening | ✅ 38/38 |
-| Phase 2.5 | JIT Compiler | ✅ 12/12 |
+| Phase 2.5 | JIT Compiler | ❌ Removed |
 | Phase 3 | Connectors & Integration | 🔧 85/100 |
 | Phase 4 | Enterprise Security (Auth, RBAC) | 📋 Planned |
 | Phase 5 | Admin & Observability | 📋 Planned |
@@ -418,7 +419,6 @@ See [docs/ROADMAP.md](docs/ROADMAP.md) for the full phase timeline.
 | `delta-lake-s3` / `delta-lake-azure` / `delta-lake-gcs` | Cloud storage backends |
 | `websocket` | WebSocket source and sink connectors |
 | `files` | File source and sink (Parquet, CSV) |
-| `jit` | Cranelift JIT query compilation |
 | `ffi` | C FFI with Arrow C Data Interface |
 | `delta` | Distributed mode (gossip, Raft, gRPC) |
 | `parquet-lookup` | Parquet lookup source for reference tables |

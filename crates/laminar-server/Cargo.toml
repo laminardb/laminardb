@@ -77,7 +77,6 @@ tempfile = { workspace = true }
 # io_uring, NUMA topology, and XDP/eBPF optimizations.
 default = [
     "jemalloc",
-    "jit",
     "kafka",
     "websocket",
     "delta",
@@ -109,15 +108,13 @@ aws = ["laminar-db/aws"]
 gcs = ["laminar-db/gcs"]
 azure = ["laminar-db/azure"]
 # Performance features
-jit = ["laminar-db/jit"]                    # All platforms: Cranelift JIT for Ring 0
 # Linux-only performance features (cannot be default — crates won't compile on Windows/macOS)
 io-uring = ["laminar-storage/io-uring"]     # Linux 5.10+: async I/O for WAL/checkpoints
 hwloc = ["laminar-core/hwloc"]              # Linux/macOS: NUMA topology discovery
-xdp = ["laminar-core/xdp"]                  # Linux 4.15+: XDP/eBPF network optimization
 # Meta-feature: enable all Linux-specific performance optimizations.
 # Recommended for production Linux deployments:
 #   cargo build --release --features linux-perf
-linux-perf = ["io-uring", "hwloc", "xdp"]
+linux-perf = ["io-uring", "hwloc"]
 # Compile OpenSSL from source — required for musl cross-compilation where
 # system libssl-dev is not available for the target triple.
 vendored-openssl = ["dep:openssl"]

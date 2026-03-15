@@ -11,22 +11,10 @@ description = "Core streaming engine for LaminarDB - reactor, operators, and sta
 
 [features]
 default = []
-# Enable hot path allocation detection - panics on allocation in marked sections
-allocation-tracking = []
-# Enable DAG executor per-event metrics (adds ~5-10ns/event overhead)
-dag-metrics = []
 # Enable io_uring support (Linux 5.10+ only)
 io-uring = ["dep:io-uring"]
 # Enable hwlocality for enhanced NUMA topology discovery
 hwloc = ["dep:hwlocality"]
-# Enable XDP/eBPF network optimization (Linux 4.15+ only)
-xdp = ["dep:libbpf-rs"]
-# Enable Cranelift JIT compilation for Ring 0 expressions
-jit = [
-    "dep:cranelift-codegen", "dep:cranelift-frontend", "dep:cranelift-jit",
-    "dep:cranelift-module", "dep:cranelift-native",
-    "dep:datafusion-expr", "dep:datafusion-common",
-]
 # Enable distributed delta mode (multi-node) — heavy deps, server-only
 delta = [
     "dep:chitchat", "dep:tokio-util", "dep:xxhash-rust",
@@ -75,14 +63,6 @@ async-trait = { workspace = true }
 # SQL parsing (for filter compilation)
 sqlparser = { workspace = true }
 
-# JIT compilation (optional, Cranelift)
-cranelift-codegen = { workspace = true, optional = true }
-cranelift-frontend = { workspace = true, optional = true }
-cranelift-jit = { workspace = true, optional = true }
-cranelift-module = { workspace = true, optional = true }
-cranelift-native = { workspace = true, optional = true }
-datafusion-expr = { workspace = true, optional = true }
-datafusion-common = { workspace = true, optional = true }
 
 # Delta (optional, multi-node distributed mode — server-only)
 chitchat = { workspace = true, optional = true }
@@ -102,7 +82,6 @@ hwlocality = { version = "1.0.0-alpha.8", optional = true }
 [target.'cfg(target_os = "linux")'.dependencies]
 libc = { workspace = true }
 io-uring = { workspace = true, optional = true }
-libbpf-rs = { version = "0.26", optional = true }
 
 [target.'cfg(target_os = "macos")'.dependencies]
 libc = { workspace = true }
@@ -118,27 +97,11 @@ tokio = { workspace = true, features = ["test-util", "macros"] }
 tempfile = { workspace = true }
 
 [[bench]]
-name = "reactor_bench"
-harness = false
-
-[[bench]]
 name = "state_bench"
 harness = false
 
 [[bench]]
-name = "throughput_bench"
-harness = false
-
-[[bench]]
 name = "window_bench"
-harness = false
-
-[[bench]]
-name = "tpc_bench"
-harness = false
-
-[[bench]]
-name = "io_uring_bench"
 harness = false
 
 [[bench]]
@@ -164,11 +127,6 @@ harness = false
 [[bench]]
 name = "subscription_bench"
 harness = false
-
-[[bench]]
-name = "compiler_bench"
-harness = false
-required-features = ["jit"]
 
 [[bench]]
 name = "cache_bench"

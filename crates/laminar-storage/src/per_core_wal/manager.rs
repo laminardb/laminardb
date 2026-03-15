@@ -4,8 +4,6 @@ use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::Arc;
 
-use laminar_core::storage_io::IoCompletion;
-
 use super::entry::PerCoreWalEntry;
 use super::error::PerCoreWalError;
 use super::reader::PerCoreWalReader;
@@ -331,50 +329,6 @@ impl PerCoreWalManager {
             writer.append_epoch_barrier()?;
         }
         Ok(())
-    }
-
-    /// Check I/O completions against all writers' pending sync tokens.
-    ///
-    /// Call this after polling `StorageIo::poll_completions`. Each writer
-    /// that has a pending sync token matching a completion will update its
-    /// `synced_position`.
-    ///
-    /// Returns the number of writers whose syncs completed successfully.
-    ///
-    /// # Errors
-    ///
-    /// Returns the first `PerCoreWalError` encountered if any writer's
-    /// sync failed.
-    pub fn check_all_completions(
-        &mut self,
-        completions: &[IoCompletion],
-    ) -> Result<usize, PerCoreWalError> {
-        if completions.is_empty() {
-            return Ok(0);
-        }
-        let mut count = 0;
-        let mut first_err: Option<PerCoreWalError> = None;
-        for writer in &mut self.writers {
-            match writer.check_completions(completions) {
-                Ok(true) => count += 1,
-                Ok(false) => {}
-                Err(e) => {
-                    if first_err.is_none() {
-                        first_err = Some(e);
-                    }
-                }
-            }
-        }
-        match first_err {
-            Some(e) => Err(e),
-            None => Ok(count),
-        }
-    }
-
-    /// Returns `true` if any writer has a pending sync.
-    #[must_use]
-    pub fn any_sync_pending(&self) -> bool {
-        self.writers.iter().any(CoreWalWriter::is_sync_pending)
     }
 
     /// Returns total size of all segments.

@@ -9,7 +9,10 @@ use std::collections::HashMap;
 use std::sync::atomic::{AtomicUsize, Ordering};
 
 use arrow::array::RecordBatch;
+use arrow::datatypes::SchemaRef;
+use datafusion::physical_expr::{create_physical_expr, PhysicalExpr};
 use datafusion::prelude::SessionContext;
+use datafusion_common::DFSchema;
 use laminar_connectors::checkpoint::SourceCheckpoint;
 use laminar_core::streaming;
 use rustc_hash::FxHashMap;
@@ -55,11 +58,47 @@ pub(crate) struct ConnectorPipelineCallback {
     pub(crate) lookup_registry: Arc<laminar_sql::datafusion::LookupTableRegistry>,
     /// Cached `SessionContext` for sink WHERE filters (avoids per-batch allocation).
     pub(crate) filter_ctx: SessionContext,
+    /// Lazily-compiled sink filter expressions, indexed by sink position.
+    pub(crate) compiled_sink_filters: Vec<Option<Arc<dyn PhysicalExpr>>>,
     pub(crate) last_checkpoint: std::time::Instant,
     /// `None` = no automatic checkpointing (manual only via coordinator).
     pub(crate) checkpoint_interval: Option<std::time::Duration>,
     pub(crate) pipeline_hash: Option<u64>,
     pub(crate) delivery_guarantee: laminar_connectors::connector::DeliveryGuarantee,
+}
+
+impl ConnectorPipelineCallback {
+    /// Try to compile sink filter SQL to `PhysicalExpr` for sinks that haven't been compiled yet.
+    async fn compile_pending_sink_filters(
+        &mut self,
+        results: &FxHashMap<String, Vec<RecordBatch>>,
+    ) {
+        // Ensure the compiled_sink_filters vec has the right length.
+        while self.compiled_sink_filters.len() < self.sinks.len() {
+            self.compiled_sink_filters.push(None);
+        }
+
+        for (i, (_, _, filter_sql, sink_input)) in self.sinks.iter().enumerate() {
+            // Skip if no filter or already compiled.
+            if filter_sql.is_none() || self.compiled_sink_filters[i].is_some() {
+                continue;
+            }
+            // Need a batch to determine the schema.
+            let Some(batches) = results.get(sink_input.as_str()) else {
+                continue;
+            };
+            let Some(batch) = batches.first() else {
+                continue;
+            };
+            let schema = batch.schema();
+            if let Some(compiled) =
+                compile_sink_filter_sql(&self.filter_ctx, filter_sql.as_deref().unwrap(), &schema)
+                    .await
+            {
+                self.compiled_sink_filters[i] = Some(compiled);
+            }
+        }
+    }
 }
 
 #[async_trait::async_trait]
@@ -100,12 +139,16 @@ impl crate::pipeline::PipelineCallback for ConnectorPipelineCallback {
     }
 
     async fn write_to_sinks(&mut self, results: &FxHashMap<String, Vec<RecordBatch>>) {
+        // Lazy-compile any pending sink filters.
+        self.compile_pending_sink_filters(results).await;
+
         // Route results to sinks concurrently, filtered by FROM clause.
         let filter_ctx = self.filter_ctx.clone(); // Arc bump — cheap
         let sink_futures: Vec<_> = self
             .sinks
             .iter()
-            .filter_map(|(sink_name, handle, filter_expr, sink_input)| {
+            .enumerate()
+            .filter_map(|(sink_idx, (sink_name, handle, filter_expr, sink_input))| {
                 // Route by FROM clause: only send matching results.
                 let batches = results.get(sink_input.as_str())?;
                 if batches.is_empty() {
@@ -113,12 +156,31 @@ impl crate::pipeline::PipelineCallback for ConnectorPipelineCallback {
                 }
                 let sink_name = sink_name.clone();
                 let handle = handle.clone();
+                let compiled_filter = self
+                    .compiled_sink_filters
+                    .get(sink_idx)
+                    .and_then(Clone::clone);
                 let filter_expr = filter_expr.clone();
                 let batches = batches.clone();
                 let ctx = filter_ctx.clone();
                 Some(async move {
                     for batch in &batches {
-                        let filtered = if let Some(ref filter_sql) = filter_expr {
+                        let filtered = if let Some(ref phys) = compiled_filter {
+                            // Use compiled PhysicalExpr — no SQL overhead
+                            match apply_compiled_sink_filter(batch, phys) {
+                                Ok(Some(fb)) => fb,
+                                Ok(None) => continue,
+                                Err(e) => {
+                                    tracing::warn!(
+                                        sink = %sink_name,
+                                        error = %e,
+                                        "Compiled sink filter error"
+                                    );
+                                    continue;
+                                }
+                            }
+                        } else if let Some(ref filter_sql) = filter_expr {
+                            // Fallback to SQL-based filter
                             match apply_filter(&ctx, batch, filter_sql).await {
                                 Ok(Some(fb)) => fb,
                                 Ok(None) => continue,
@@ -773,4 +835,83 @@ async fn apply_filter(
     let _ = ctx.deregister_table(&*table_name);
 
     result
+}
+
+/// Apply a compiled `PhysicalExpr` filter to a batch.
+fn apply_compiled_sink_filter(
+    batch: &RecordBatch,
+    filter: &Arc<dyn PhysicalExpr>,
+) -> Result<Option<RecordBatch>, DbError> {
+    if batch.num_rows() == 0 {
+        return Ok(None);
+    }
+    let result = filter
+        .evaluate(batch)
+        .map_err(|e| DbError::Pipeline(format!("sink filter evaluate: {e}")))?;
+    let mask = result
+        .into_array(batch.num_rows())
+        .map_err(|e| DbError::Pipeline(format!("sink filter to array: {e}")))?;
+    let bool_arr = mask
+        .as_any()
+        .downcast_ref::<arrow::array::BooleanArray>()
+        .ok_or_else(|| DbError::Pipeline("sink filter not boolean".into()))?;
+    let filtered = arrow::compute::filter_record_batch(batch, bool_arr)
+        .map_err(|e| DbError::Pipeline(format!("sink filter: {e}")))?;
+    if filtered.num_rows() == 0 {
+        Ok(None)
+    } else {
+        Ok(Some(filtered))
+    }
+}
+
+/// Try to compile a sink filter SQL expression to a `PhysicalExpr`.
+///
+/// Plans the filter as a full SQL query against an empty table with the batch
+/// schema, then extracts the Filter predicate from the logical plan and
+/// compiles it. Returns `None` if compilation fails (caller falls back to
+/// SQL-based filter).
+async fn compile_sink_filter_sql(
+    ctx: &SessionContext,
+    filter_sql: &str,
+    batch_schema: &SchemaRef,
+) -> Option<Arc<dyn PhysicalExpr>> {
+    let table_name = "__compile_filter";
+    let empty =
+        datafusion::datasource::MemTable::try_new(batch_schema.clone(), vec![vec![]]).ok()?;
+    let _ = ctx.deregister_table(table_name);
+    ctx.register_table(table_name, Arc::new(empty)).ok()?;
+
+    let sql = format!("SELECT * FROM {table_name} WHERE {filter_sql}");
+    let plan = {
+        let df = ctx.sql(&sql).await.ok()?;
+        df.logical_plan().clone()
+    };
+    let _ = ctx.deregister_table(table_name);
+
+    // Walk plan to find Filter node
+    let filter_expr = find_filter_predicate(&plan)?;
+
+    // Compile against the batch schema
+    let df_schema = DFSchema::try_from(batch_schema.as_ref().clone()).ok()?;
+    let state = ctx.state();
+    let props = state.execution_props();
+    create_physical_expr(&filter_expr, &df_schema, props).ok()
+}
+
+/// Walk a logical plan to find the first Filter predicate.
+fn find_filter_predicate(plan: &datafusion_expr::LogicalPlan) -> Option<datafusion_expr::Expr> {
+    match plan {
+        datafusion_expr::LogicalPlan::Filter(f) => Some(f.predicate.clone()),
+        datafusion_expr::LogicalPlan::Projection(p) => find_filter_predicate(&p.input),
+        datafusion_expr::LogicalPlan::Sort(s) => find_filter_predicate(&s.input),
+        datafusion_expr::LogicalPlan::Limit(l) => find_filter_predicate(&l.input),
+        _ => {
+            for input in plan.inputs() {
+                if let Some(expr) = find_filter_predicate(input) {
+                    return Some(expr);
+                }
+            }
+            None
+        }
+    }
 }

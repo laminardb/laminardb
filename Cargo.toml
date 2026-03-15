@@ -97,13 +97,6 @@ base64 = "0.22"
 # Randomness
 rand = "0.10"
 
-# JIT compilation (Cranelift)
-cranelift-codegen = "0.128"
-cranelift-frontend = "0.128"
-cranelift-jit = "0.128"
-cranelift-module = "0.128"
-cranelift-native = "0.128"
-
 # Constellation (distributed mode)
 chitchat = "0.10"
 tokio-util = { version = "0.7", features = ["rt"] }
