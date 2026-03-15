@@ -32,6 +32,8 @@ pub struct SourceRegistration {
 
 /// Callback trait for the coordinator to interact with the rest of the DB.
 ///
+/// Trait exists for test seam; production impl is `ConnectorPipelineCallback`.
+///
 /// This decouples the pipeline module from db.rs internals.
 #[async_trait::async_trait]
 pub trait PipelineCallback: Send + 'static {

@@ -988,9 +988,10 @@ where
         }
 
         if state.version != 1 {
-            return Err(OperatorError::ConfigError(
-                format!("unsupported state version {}, expected 1", state.version)
-            ));
+            return Err(OperatorError::ConfigError(format!(
+                "unsupported state version {}, expected 1",
+                state.version
+            )));
         }
 
         if state.data.is_empty() {

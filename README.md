@@ -295,7 +295,7 @@ Custom connectors can be built using the `SourceConnector` / `SinkConnector` tra
 └──────────────────────────────────────────────────────────────┘
 ```
 
-- **Streaming coordinator** — Single tokio task driving SQL execution cycles. Source connectors push batches via mpsc channels; the coordinator runs compiled projections / cached logical plans, routes results to sinks, and manages checkpoint barriers. Sub-microsecond for compiled projections; 1-10us for incremental aggregations; higher for DataFusion fallback queries.
+- **Streaming coordinator** — Single tokio task driving SQL execution cycles. Source connectors push batches via mpsc channels; the coordinator runs compiled projections / cached logical plans, routes results to sinks, and manages checkpoint barriers. Sub-microsecond for compiled single-source projections; microseconds for incremental aggregations and cached-plan queries; DataFusion fallback for complex queries.
 - **Background I/O** — Tokio async runtime handling WAL writes, checkpointing, connector I/O, and changelog draining.
 - **Admin** — HTTP admin API, metrics, configuration management. Auth and observability are planned (Phase 4/5).
 

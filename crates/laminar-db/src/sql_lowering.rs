@@ -1,8 +1,8 @@
 //! SQL lowering pass: converts registered stream queries into a DAG operator
 //! graph using the existing `try_from_sql` constructors.
 //!
-//! This module bridges the gap between SQL query registration (Phase C) and
-//! the unified DAG execution substrate (Phase B). Each stream query is
+//! This module bridges the gap between SQL query registration and
+//! the unified DAG execution substrate. Each stream query is
 //! lowered to one or more DAG nodes with the appropriate SQL operator
 //! adapter.
 //!
@@ -28,7 +28,7 @@ use laminar_core::operator::Operator;
 /// A built DAG topology paired with its operators to register.
 pub(crate) type BuiltDag = (StreamingDag, Vec<(NodeId, Box<dyn Operator>)>);
 
-use crate::aggregate_state::IncrementalAggState;
+use crate::aggregate_state::{CompiledProjection, IncrementalAggState};
 use crate::core_window_state::CoreWindowState;
 use crate::error::DbError;
 use crate::sql_operators::{AggregateAdapter, WindowAggAdapter};
@@ -52,6 +52,8 @@ pub(crate) enum LoweredQuery {
         having_sql: Option<String>,
         /// Source tables referenced by this query.
         source_tables: Vec<String>,
+        /// Compiled projection for single-source queries (bypasses `ctx.sql()`).
+        compiled_projection: Option<CompiledProjection>,
     },
     /// Query was lowered to a windowed aggregate operator.
     WindowedAggregate {
@@ -63,6 +65,8 @@ pub(crate) enum LoweredQuery {
         pre_agg_sql: String,
         /// Source tables referenced by this query.
         source_tables: Vec<String>,
+        /// Compiled projection for single-source queries (bypasses `ctx.sql()`).
+        compiled_projection: Option<CompiledProjection>,
     },
     /// Query cannot be lowered — use `StreamExecutor` fallback.
     ///
@@ -103,14 +107,16 @@ pub(crate) async fn try_lower_query(
     if let Some(wc) = window_config {
         if let Some(ec) = emit_clause {
             match CoreWindowState::try_from_sql(ctx, sql, wc, Some(ec)).await {
-                Ok(Some(state)) => {
+                Ok(Some(mut state)) => {
                     let output_schema = state.output_schema();
                     let pre_agg_sql = state.pre_agg_sql().to_string();
+                    let compiled_projection = state.take_compiled_projection();
                     return Ok(LoweredQuery::WindowedAggregate {
                         operator: Box::new(WindowAggAdapter::new(state, query_name.to_string())),
                         output_schema,
                         pre_agg_sql,
                         source_tables: source_tables.clone(),
+                        compiled_projection,
                     });
                 }
                 Ok(None) => {
@@ -130,16 +136,18 @@ pub(crate) async fn try_lower_query(
 
     // Try incremental aggregate (non-windowed GROUP BY).
     match IncrementalAggState::try_from_sql(ctx, sql).await {
-        Ok(Some(state)) => {
+        Ok(Some(mut state)) => {
             let output_schema = state.output_schema();
             let pre_agg_sql = state.pre_agg_sql().to_string();
             let having_sql = state.having_sql().map(String::from);
+            let compiled_projection = state.take_compiled_projection();
             Ok(LoweredQuery::Aggregate {
                 operator: Box::new(AggregateAdapter::new(state, query_name.to_string())),
                 output_schema,
                 pre_agg_sql,
                 having_sql,
                 source_tables,
+                compiled_projection,
             })
         }
         Ok(None) => {

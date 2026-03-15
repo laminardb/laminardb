@@ -12,7 +12,7 @@
 //! followed by aggregate input columns). A stateless upstream operator
 //! (filter + projection) is responsible for extracting the correct columns
 //! from the raw source batch — that wiring is handled by the SQL lowering
-//! pass (Phase C).
+//! pass.
 //!
 //! # Checkpoint / Restore
 //!
@@ -102,13 +102,12 @@ impl Operator for AggregateAdapter {
         if state.data.is_empty() {
             return Ok(());
         }
-        let cp: crate::aggregate_state::AggStateCheckpoint =
-            serde_json::from_slice(&state.data).map_err(|e| {
-                OperatorError::SerializationFailed(format!("aggregate restore: {e}"))
-            })?;
-        self.state.restore_groups(&cp).map(|_| ()).map_err(|e| {
-            OperatorError::StateAccessFailed(format!("aggregate restore: {e}"))
-        })
+        let cp: crate::aggregate_state::AggStateCheckpoint = serde_json::from_slice(&state.data)
+            .map_err(|e| OperatorError::SerializationFailed(format!("aggregate restore: {e}")))?;
+        self.state
+            .restore_groups(&cp)
+            .map(|_| ())
+            .map_err(|e| OperatorError::StateAccessFailed(format!("aggregate restore: {e}")))
     }
 }
 
@@ -203,12 +202,12 @@ impl Operator for WindowAggAdapter {
             return Ok(());
         }
         let cp: crate::core_window_state::CoreWindowCheckpoint =
-            serde_json::from_slice(&state.data).map_err(|e| {
-                OperatorError::SerializationFailed(format!("window restore: {e}"))
-            })?;
-        self.state.restore_windows(&cp).map(|_| ()).map_err(|e| {
-            OperatorError::StateAccessFailed(format!("window restore: {e}"))
-        })
+            serde_json::from_slice(&state.data)
+                .map_err(|e| OperatorError::SerializationFailed(format!("window restore: {e}")))?;
+        self.state
+            .restore_windows(&cp)
+            .map(|_| ())
+            .map_err(|e| OperatorError::StateAccessFailed(format!("window restore: {e}")))
     }
 }
 

@@ -29,14 +29,8 @@ fn make_batch(symbols: &[&str], prices: &[f64], timestamps: &[i64]) -> RecordBat
                 symbols.iter().copied().collect::<Vec<_>>(),
             )) as _,
         ),
-        (
-            "price",
-            Arc::new(Float64Array::from(prices.to_vec())) as _,
-        ),
-        (
-            "ts",
-            Arc::new(Int64Array::from(timestamps.to_vec())) as _,
-        ),
+        ("price", Arc::new(Float64Array::from(prices.to_vec())) as _),
+        ("ts", Arc::new(Int64Array::from(timestamps.to_vec())) as _),
     ])
     .unwrap()
 }

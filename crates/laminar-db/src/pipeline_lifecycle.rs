@@ -283,6 +283,7 @@ impl LaminarDB {
             dag_sink_to_query,
             dag_pre_agg_sql,
             dag_op_node_ids,
+            dag_compiled_projections,
         ): (
             Option<laminar_core::dag::DagExecutor>,
             rustc_hash::FxHashSet<Arc<str>>,
@@ -290,16 +291,16 @@ impl LaminarDB {
             FxHashMap<laminar_core::dag::NodeId, Arc<str>>,
             FxHashMap<Arc<str>, String>,
             FxHashMap<Arc<str>, laminar_core::dag::NodeId>,
+            FxHashMap<Arc<str>, crate::aggregate_state::CompiledProjection>,
         ) = {
             use crate::sql_lowering::{build_query_dag, try_lower_query, LoweredQuery};
             use crate::stream_executor::extract_table_references;
 
             let mut lowered = Vec::new();
             for reg in stream_regs.values() {
-                let source_tables: Vec<String> =
-                    extract_table_references(&reg.query_sql)
-                        .into_iter()
-                        .collect();
+                let source_tables: Vec<String> = extract_table_references(&reg.query_sql)
+                    .into_iter()
+                    .collect();
                 match try_lower_query(
                     executor.session_context(),
                     &reg.name,
@@ -333,24 +334,35 @@ impl LaminarDB {
 
             if let Some((dag, operators)) = build_query_dag(&source_schemas, &mut lowered) {
                 let mut exec = laminar_core::dag::DagExecutor::from_dag(&dag);
-                let mut names: rustc_hash::FxHashSet<Arc<str>> =
-                    rustc_hash::FxHashSet::default();
+                let mut names: rustc_hash::FxHashSet<Arc<str>> = rustc_hash::FxHashSet::default();
                 for (node_id, operator) in operators {
                     exec.register_operator(node_id, operator);
                 }
-                // Track which queries were lowered, and collect pre-agg SQL
+                // Track which queries were lowered, collect pre-agg SQL and
+                // compiled projections (taken out of LoweredQuery).
                 let mut pre_agg_sql: FxHashMap<Arc<str>, String> = FxHashMap::default();
-                for (qname, lq) in &lowered {
+                let mut compiled_projections: FxHashMap<
+                    Arc<str>,
+                    crate::aggregate_state::CompiledProjection,
+                > = FxHashMap::default();
+                for (qname, lq) in &mut lowered {
                     match lq {
                         LoweredQuery::Aggregate {
-                            pre_agg_sql: sql, ..
+                            pre_agg_sql: sql,
+                            compiled_projection,
+                            ..
                         }
                         | LoweredQuery::WindowedAggregate {
-                            pre_agg_sql: sql, ..
+                            pre_agg_sql: sql,
+                            compiled_projection,
+                            ..
                         } => {
                             let arc_name = Arc::from(qname.as_str());
                             names.insert(Arc::clone(&arc_name));
-                            pre_agg_sql.insert(arc_name, sql.clone());
+                            pre_agg_sql.insert(Arc::clone(&arc_name), sql.clone());
+                            if let Some(proj) = compiled_projection.take() {
+                                compiled_projections.insert(arc_name, proj);
+                            }
                         }
                         LoweredQuery::Fallback => {}
                     }
@@ -384,12 +396,21 @@ impl LaminarDB {
                     source_nodes = source_nodes.len(),
                     "DAG lowering complete"
                 );
-                (Some(exec), names, source_nodes, sink_map, pre_agg_sql, op_nodes)
+                (
+                    Some(exec),
+                    names,
+                    source_nodes,
+                    sink_map,
+                    pre_agg_sql,
+                    op_nodes,
+                    compiled_projections,
+                )
             } else {
                 tracing::debug!("No queries lowered to DAG");
                 (
                     None,
                     rustc_hash::FxHashSet::default(),
+                    FxHashMap::default(),
                     FxHashMap::default(),
                     FxHashMap::default(),
                     FxHashMap::default(),
@@ -719,18 +740,24 @@ impl LaminarDB {
                             if let Some(bytes) = op.decode_inline() {
                                 if let Some(ref mut dag) = dag_executor {
                                     match serde_json::from_slice::<
-                                        std::collections::HashMap<String, laminar_core::dag::recovery::SerializableOperatorState>,
+                                        std::collections::HashMap<
+                                            String,
+                                            laminar_core::dag::recovery::SerializableOperatorState,
+                                        >,
                                     >(&bytes)
                                     {
                                         Ok(dag_states) => {
-                                            let states: rustc_hash::FxHashMap<laminar_core::dag::NodeId, laminar_core::operator::OperatorState> =
-                                                dag_states.into_iter()
-                                                    .filter_map(|(id_str, sos)| {
-                                                        id_str.parse::<u32>().ok().map(|id| {
-                                                            (laminar_core::dag::NodeId(id), sos.into())
-                                                        })
+                                            let states: rustc_hash::FxHashMap<
+                                                laminar_core::dag::NodeId,
+                                                laminar_core::operator::OperatorState,
+                                            > = dag_states
+                                                .into_iter()
+                                                .filter_map(|(id_str, sos)| {
+                                                    id_str.parse::<u32>().ok().map(|id| {
+                                                        (laminar_core::dag::NodeId(id), sos.into())
                                                     })
-                                                    .collect();
+                                                })
+                                                .collect();
                                             match dag.restore(&states) {
                                                 Ok(()) => {
                                                     tracing::info!(
@@ -1062,13 +1089,15 @@ impl LaminarDB {
             pipeline_hash,
             delivery_guarantee: pipeline_config.delivery_guarantee,
             dag_executor,
-            dag_query_names,
             dag_source_node_ids,
             dag_sink_to_query,
             dag_pre_agg_sql,
             dag_op_node_ids,
+            dag_compiled_projections,
             use_dag_lowering: self.config.use_dag_lowering,
-            cycle_histogram: std::cell::RefCell::new(crate::checkpoint_coordinator::DurationHistogram::new()),
+            cycle_histogram: std::cell::RefCell::new(
+                crate::checkpoint_coordinator::DurationHistogram::new(),
+            ),
         };
 
         // Start the streaming coordinator (sources push directly via mpsc).

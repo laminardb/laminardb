@@ -464,6 +464,9 @@ pub(crate) struct IncrementalAggState {
     output_schema: SchemaRef,
     /// Compiled pre-agg projection (single-source queries only).
     compiled_projection: Option<CompiledProjection>,
+    /// Cached optimized logical plan for the pre-agg SQL (multi-source queries).
+    /// Skips SQL parsing and logical optimization on subsequent cycles.
+    cached_pre_agg_plan: Option<LogicalPlan>,
     /// Compiled HAVING predicate.
     having_filter: Option<Arc<dyn PhysicalExpr>>,
     /// HAVING predicate SQL fallback (when compiled filter is not available).
@@ -817,6 +820,18 @@ impl IncrementalAggState {
             None
         };
 
+        // Cache the optimized logical plan for multi-source pre-agg queries
+        // (when compiled projection is not available). This skips SQL parsing
+        // and logical optimization on subsequent cycles.
+        let cached_pre_agg_plan = if compiled_projection.is_none() {
+            match ctx.sql(&pre_agg_sql).await {
+                Ok(df) => Some(df.logical_plan().clone()),
+                Err(_) => None,
+            }
+        } else {
+            None
+        };
+
         Ok(Some(Self {
             pre_agg_sql,
             num_group_cols,
@@ -826,6 +841,7 @@ impl IncrementalAggState {
             groups: AHashMap::new(),
             output_schema,
             compiled_projection,
+            cached_pre_agg_plan,
             having_filter,
             having_sql,
             max_groups: 1_000_000,
@@ -1052,6 +1068,23 @@ impl IncrementalAggState {
     /// Compiled pre-agg projection (single-source queries only).
     pub fn compiled_projection(&self) -> Option<&CompiledProjection> {
         self.compiled_projection.as_ref()
+    }
+
+    /// Take the compiled projection out, leaving `None` in its place.
+    ///
+    /// Used by SQL lowering to extract the projection before wrapping the
+    /// state in a DAG adapter. The projection is then stored separately
+    /// for direct evaluation in the pipeline callback.
+    pub(crate) fn take_compiled_projection(&mut self) -> Option<CompiledProjection> {
+        self.compiled_projection.take()
+    }
+
+    /// Cached optimized logical plan for the pre-agg SQL.
+    ///
+    /// Present only for multi-source queries (where `compiled_projection` is
+    /// `None`). Allows skipping SQL parsing and logical optimization per cycle.
+    pub fn cached_pre_agg_plan(&self) -> Option<&LogicalPlan> {
+        self.cached_pre_agg_plan.as_ref()
     }
 
     /// Compute a fingerprint for this query (SQL + schema).

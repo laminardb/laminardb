@@ -326,6 +326,10 @@ pub(crate) struct StreamExecutor {
     cycle_intermediates: Vec<String>,
     /// Query indices to skip in `execute_cycle` (handled by DAG executor).
     skipped_queries: FxHashSet<usize>,
+    /// Lazily determined: `Some(true)` when all non-skipped queries are on
+    /// compiled paths (no `ctx.sql()` needed), allowing `register_source_tables()`
+    /// to be skipped entirely. `None` = not yet determined.
+    all_queries_compiled: Option<bool>,
 }
 
 impl StreamExecutor {
@@ -354,6 +358,7 @@ impl StreamExecutor {
             cycle_results: FxHashMap::default(),
             cycle_intermediates: Vec::new(),
             skipped_queries: FxHashSet::default(),
+            all_queries_compiled: None,
         }
     }
 
@@ -551,7 +556,36 @@ impl StreamExecutor {
             self.compute_topo_order();
         }
 
-        self.register_source_tables(source_batches)?;
+        // Determine if all non-skipped queries use compiled paths.
+        // When true, we can skip MemTable registration entirely since compiled
+        // projections read from source_batches directly. Re-evaluate each
+        // cycle until it settles to true (states are lazily populated).
+        if self.all_queries_compiled != Some(true) {
+            let all_compiled = self.topo_order.iter().all(|&idx| {
+                self.skipped_queries.contains(&idx)
+                    || self.plain_compiled.contains_key(&idx)
+                    || self
+                        .agg_states
+                        .get(&idx)
+                        .is_some_and(|s| s.compiled_projection().is_some())
+                    || self
+                        .core_window_states
+                        .get(&idx)
+                        .is_some_and(|s| s.compiled_projection().is_some())
+                    || self
+                        .eowc_agg_states
+                        .get(&idx)
+                        .is_some_and(|s| s.compiled_projection().is_some())
+            });
+            self.all_queries_compiled = Some(all_compiled);
+        }
+
+        // Skip MemTable registration when all queries use compiled projections.
+        // Intermediate result registration (for downstream queries) still runs
+        // inside the loop — this only skips SOURCE table registration.
+        if self.all_queries_compiled != Some(true) {
+            self.register_source_tables(source_batches)?;
+        }
 
         // Reuse per-cycle allocations: take the pre-allocated maps out of
         // self so the borrow checker allows &mut self calls while results
@@ -736,7 +770,9 @@ impl StreamExecutor {
             }
         }
 
-        self.cleanup_source_tables();
+        if self.all_queries_compiled != Some(true) {
+            self.cleanup_source_tables();
+        }
         for name in &intermediate_tables {
             // Cleanup: deregister failures during teardown are benign
             let _ = self.ctx.deregister_table(name);
@@ -805,7 +841,7 @@ impl StreamExecutor {
 ///
 /// Looks up the source table in both `source_batches` and `results`,
 /// then evaluates the projection against each batch.
-fn evaluate_compiled_projection(
+pub(crate) fn evaluate_compiled_projection(
     proj: &CompiledProjection,
     source_batches: &FxHashMap<Arc<str>, Vec<RecordBatch>>,
     results: &FxHashMap<Arc<str>, Vec<RecordBatch>>,
@@ -1210,6 +1246,25 @@ impl StreamExecutor {
             .map_err(|e| DbError::query_pipeline(&*query_name, &e))
     }
 
+    /// Execute a cached logical plan (physical planning only, no SQL parse).
+    async fn execute_cached_plan(
+        &self,
+        query_name: &str,
+        plan: &LogicalPlan,
+    ) -> Result<Vec<RecordBatch>, DbError> {
+        let physical = self
+            .ctx
+            .state()
+            .create_physical_plan(plan)
+            .await
+            .map_err(|e| DbError::query_pipeline(query_name, &e))?;
+
+        let task_ctx = self.ctx.task_ctx();
+        datafusion::physical_plan::collect(physical, task_ctx)
+            .await
+            .map_err(|e| DbError::query_pipeline(query_name, &e))
+    }
+
     /// Execute an aggregation query using incremental accumulators.
     ///
     /// Runs the pre-aggregation SQL (projection only) through `DataFusion`,
@@ -1227,9 +1282,15 @@ impl StreamExecutor {
             DbError::Pipeline(format!("internal: missing agg_state for query index {idx}"))
         })?;
 
-        // Use compiled projection if available, otherwise fall back to SQL.
+        // Use compiled projection if available, then cached logical plan,
+        // then fall back to full SQL parsing.
         let pre_agg_batches = if let Some(proj) = agg_state.compiled_projection() {
             evaluate_compiled_projection(proj, source_batches, results)
+        } else if let Some(plan) = agg_state.cached_pre_agg_plan() {
+            // Cached path: skip SQL parsing + logical optimization, only
+            // physical planning runs per cycle.
+            let plan = plan.clone();
+            self.execute_cached_plan(&query_name, &plan).await?
         } else {
             let pre_agg_sql = agg_state.pre_agg_sql().to_string();
             match self.ctx.sql(&pre_agg_sql).await {
@@ -1341,6 +1402,9 @@ impl StreamExecutor {
 
         let pre_agg_batches = if let Some(proj) = eowc_state.compiled_projection() {
             evaluate_compiled_projection(proj, source_batches, results)
+        } else if let Some(plan) = eowc_state.cached_pre_agg_plan() {
+            let plan = plan.clone();
+            self.execute_cached_plan(query_name, &plan).await?
         } else {
             let pre_agg_sql = eowc_state.pre_agg_sql().to_string();
             match self.ctx.sql(&pre_agg_sql).await {
@@ -1403,6 +1467,9 @@ impl StreamExecutor {
 
         let pre_agg_batches = if let Some(proj) = cw_state.compiled_projection() {
             evaluate_compiled_projection(proj, source_batches, results)
+        } else if let Some(plan) = cw_state.cached_pre_agg_plan() {
+            let plan = plan.clone();
+            self.execute_cached_plan(query_name, &plan).await?
         } else {
             let pre_agg_sql = cw_state.pre_agg_sql().to_string();
             match self.ctx.sql(&pre_agg_sql).await {

@@ -14,7 +14,7 @@ LaminarDB is an embedded streaming database designed for sub-microsecond latency
 
 ## Architecture Overview
 
-The system has three layers with different latency budgets:
+The system has a coordinator layer (SQL execution, compiled projections), a background I/O layer (WAL, checkpoints, connector I/O), and a control plane (admin API, metrics).
 
 ```
 +------------------------------------------------------------------+

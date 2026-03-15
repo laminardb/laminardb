@@ -125,6 +125,8 @@ pub(crate) struct CoreWindowState {
     emit_strategy: CoreEmitStrategy,
     having_sql: Option<String>,
     compiled_projection: Option<CompiledProjection>,
+    /// Cached optimized logical plan for the pre-agg SQL (multi-source queries).
+    cached_pre_agg_plan: Option<datafusion_expr::LogicalPlan>,
     having_filter: Option<Arc<dyn PhysicalExpr>>,
     max_groups_per_window: usize,
     /// Grace period (ms) after window end before closing. Late events
@@ -603,6 +605,16 @@ impl CoreWindowState {
             None => CoreEmitStrategy::OnWindowClose,
         };
 
+        // Cache the optimized logical plan for multi-source pre-agg queries.
+        let cached_pre_agg_plan = if compiled_projection.is_none() {
+            match ctx.sql(&pre_agg_sql).await {
+                Ok(df) => Some(df.logical_plan().clone()),
+                Err(_) => None,
+            }
+        } else {
+            None
+        };
+
         Ok(Some(Self {
             assigner,
             windows: BTreeMap::new(),
@@ -617,6 +629,7 @@ impl CoreWindowState {
             emit_strategy,
             having_sql,
             compiled_projection,
+            cached_pre_agg_plan,
             having_filter,
             max_groups_per_window: 1_000_000,
             allowed_lateness_ms: i64::try_from(window_config.allowed_lateness.as_millis())
@@ -1285,6 +1298,19 @@ impl CoreWindowState {
         self.compiled_projection.as_ref()
     }
 
+    /// Take the compiled projection out, leaving `None` in its place.
+    ///
+    /// Used by SQL lowering to extract the projection before wrapping the
+    /// state in a DAG adapter.
+    pub(crate) fn take_compiled_projection(&mut self) -> Option<CompiledProjection> {
+        self.compiled_projection.take()
+    }
+
+    /// Cached optimized logical plan for the pre-agg SQL.
+    pub fn cached_pre_agg_plan(&self) -> Option<&datafusion_expr::LogicalPlan> {
+        self.cached_pre_agg_plan.as_ref()
+    }
+
     /// Compute a fingerprint for this query (SQL + schema).
     pub(crate) fn query_fingerprint(&self) -> u64 {
         query_fingerprint(&self.pre_agg_sql, &self.output_schema)
@@ -1601,6 +1627,7 @@ mod tests {
             emit_strategy: CoreEmit::OnWindowClose,
             having_sql: None,
             compiled_projection: None,
+            cached_pre_agg_plan: None,
             having_filter: None,
             max_groups_per_window: 1_000_000,
             allowed_lateness_ms: 0,
@@ -1657,6 +1684,7 @@ mod tests {
             emit_strategy: CoreEmit::OnWindowClose,
             having_sql: None,
             compiled_projection: None,
+            cached_pre_agg_plan: None,
             having_filter: None,
             max_groups_per_window: 1_000_000,
             allowed_lateness_ms: 0,
@@ -1702,6 +1730,7 @@ mod tests {
             emit_strategy: CoreEmit::OnWindowClose,
             having_sql: None,
             compiled_projection: None,
+            cached_pre_agg_plan: None,
             having_filter: None,
             max_groups_per_window: 1_000_000,
             allowed_lateness_ms: 0,
@@ -1745,6 +1774,7 @@ mod tests {
             emit_strategy: CoreEmit::OnWindowClose,
             having_sql: None,
             compiled_projection: None,
+            cached_pre_agg_plan: None,
             having_filter: None,
             max_groups_per_window: 1_000_000,
             allowed_lateness_ms: 0,

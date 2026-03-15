@@ -181,9 +181,13 @@ impl LaminarDB {
     ///
     /// Uses `try_lock()` on the coordinator mutex. Returns `None` if
     /// the coordinator is not initialized or the lock is contended.
-    pub fn checkpoint_stats_nonblocking(&self) -> Option<crate::checkpoint_coordinator::CheckpointStats> {
+    pub fn checkpoint_stats_nonblocking(
+        &self,
+    ) -> Option<crate::checkpoint_coordinator::CheckpointStats> {
         let guard = self.coordinator.try_lock().ok()?;
-        guard.as_ref().map(crate::checkpoint_coordinator::CheckpointCoordinator::stats)
+        guard
+            .as_ref()
+            .map(crate::checkpoint_coordinator::CheckpointCoordinator::stats)
     }
 
     /// Get the number of active queries.

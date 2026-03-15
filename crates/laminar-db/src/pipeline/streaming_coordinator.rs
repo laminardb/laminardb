@@ -81,6 +81,14 @@ pub struct StreamingCoordinator {
     checkpoint_request_flags: Vec<Arc<AtomicBool>>,
     /// Pre-allocated source batches buffer (cleared per cycle).
     source_batches_buf: FxHashMap<Arc<str>, Vec<RecordBatch>>,
+    /// Batches received after a barrier from the same source in the same
+    /// drain cycle. These belong to the NEXT checkpoint epoch and must not
+    /// be included in the current checkpoint state.
+    post_barrier_buf: Vec<SourceMsg>,
+    /// Source indices that have delivered a barrier during the current drain
+    /// cycle. Any subsequent batch from these sources goes to
+    /// `post_barrier_buf`.
+    barrier_seen: FxHashSet<usize>,
 }
 
 /// Tracks in-flight checkpoint barrier alignment.
@@ -294,6 +302,8 @@ impl StreamingCoordinator {
             last_checkpoint: Instant::now(),
             checkpoint_request_flags,
             source_batches_buf: FxHashMap::default(),
+            post_barrier_buf: Vec::new(),
+            barrier_seen: FxHashSet::default(),
         })
     }
 
@@ -329,9 +339,23 @@ impl StreamingCoordinator {
 
             // Phase 2: Process the message and drain any buffered messages.
             self.source_batches_buf.clear();
+            self.barrier_seen.clear();
             let mut barriers = Vec::new();
             let mut cycle_events: u64 = 0;
             let cycle_start = Instant::now();
+
+            // First, drain any post-barrier messages deferred from the
+            // previous cycle — these are pre-next-barrier data that should
+            // be processed in this cycle.
+            let deferred = std::mem::take(&mut self.post_barrier_buf);
+            for deferred_msg in deferred {
+                self.process_msg(
+                    deferred_msg,
+                    &mut *callback,
+                    &mut barriers,
+                    &mut cycle_events,
+                );
+            }
 
             if let Some(first_msg) = msg {
                 self.process_msg(first_msg, &mut *callback, &mut barriers, &mut cycle_events);
@@ -397,6 +421,10 @@ impl StreamingCoordinator {
     }
 
     /// Process a single source message.
+    ///
+    /// When a barrier is seen from a source, subsequent batches from that
+    /// source are diverted to `post_barrier_buf` to ensure they are not
+    /// included in the current checkpoint state.
     fn process_msg(
         &mut self,
         msg: SourceMsg,
@@ -406,6 +434,14 @@ impl StreamingCoordinator {
     ) {
         match msg {
             SourceMsg::Batch { source_idx, batch } => {
+                // If this source already delivered a barrier in this drain
+                // cycle, this batch is post-barrier data — defer it.
+                if self.barrier_seen.contains(&source_idx) {
+                    self.post_barrier_buf
+                        .push(SourceMsg::Batch { source_idx, batch });
+                    return;
+                }
+
                 if let Some(name) = self.source_names.get(source_idx) {
                     callback.extract_watermark(name, &batch);
                     #[allow(clippy::cast_possible_truncation)]
@@ -424,6 +460,7 @@ impl StreamingCoordinator {
                 source_idx,
                 barrier,
             } => {
+                self.barrier_seen.insert(source_idx);
                 barriers.push((source_idx, barrier));
             }
         }
@@ -624,6 +661,8 @@ mod tests {
             last_checkpoint: Instant::now(),
             checkpoint_request_flags: Vec::new(),
             source_batches_buf: FxHashMap::default(),
+            post_barrier_buf: Vec::new(),
+            barrier_seen: FxHashSet::default(),
         };
 
         let callback = Box::new(MockCallback::new());
@@ -651,5 +690,134 @@ mod tests {
 
         // The callback was consumed by run(), so we can't inspect it directly.
         // But the test proves: no panics, no deadlocks, clean shutdown.
+    }
+
+    /// Test that post-barrier batches are excluded from the current cycle's
+    /// source_batches_buf and deferred to the next cycle.
+    #[tokio::test]
+    async fn test_barrier_excludes_post_barrier_data() {
+        let shutdown = Arc::new(tokio::sync::Notify::new());
+        let schema = Arc::new(Schema::new(vec![Field::new("ts", DataType::Int64, false)]));
+
+        let mut coordinator = StreamingCoordinator {
+            config: PipelineConfig {
+                batch_window: Duration::ZERO,
+                max_poll_records: 1000,
+                channel_capacity: 64,
+                fallback_poll_interval: Duration::from_millis(10),
+                checkpoint_interval: None,
+                delivery_guarantee: DeliveryGuarantee::AtLeastOnce,
+                barrier_alignment_timeout: BARRIER_TIMEOUT,
+            },
+            rx: mpsc::channel(64).1, // dummy, not used
+            source_handles: Vec::new(),
+            source_names: vec![Arc::from("s0"), Arc::from("s1")],
+            shutdown: Arc::clone(&shutdown),
+            pending_barrier: PendingBarrier::new(),
+            next_checkpoint_id: 1,
+            last_checkpoint: Instant::now(),
+            checkpoint_request_flags: Vec::new(),
+            source_batches_buf: FxHashMap::default(),
+            post_barrier_buf: Vec::new(),
+            barrier_seen: FxHashSet::default(),
+        };
+
+        let mut callback = MockCallback::new();
+        let mut barriers = Vec::new();
+        let mut cycle_events: u64 = 0;
+
+        // Source 0: batch(ts=1), barrier, batch(ts=2)
+        let batch_1 = RecordBatch::try_new(
+            Arc::clone(&schema),
+            vec![Arc::new(Int64Array::from(vec![1]))],
+        )
+        .unwrap();
+        let batch_2 = RecordBatch::try_new(
+            Arc::clone(&schema),
+            vec![Arc::new(Int64Array::from(vec![2]))],
+        )
+        .unwrap();
+        let barrier = CheckpointBarrier::new(1, 0);
+
+        coordinator.process_msg(
+            SourceMsg::Batch {
+                source_idx: 0,
+                batch: batch_1,
+            },
+            &mut callback,
+            &mut barriers,
+            &mut cycle_events,
+        );
+        coordinator.process_msg(
+            SourceMsg::Barrier {
+                source_idx: 0,
+                barrier: barrier.clone(),
+            },
+            &mut callback,
+            &mut barriers,
+            &mut cycle_events,
+        );
+        coordinator.process_msg(
+            SourceMsg::Batch {
+                source_idx: 0,
+                batch: batch_2,
+            },
+            &mut callback,
+            &mut barriers,
+            &mut cycle_events,
+        );
+
+        // Source 1: batch(ts=1), barrier
+        let batch_s1 = RecordBatch::try_new(
+            Arc::clone(&schema),
+            vec![Arc::new(Int64Array::from(vec![1]))],
+        )
+        .unwrap();
+        coordinator.process_msg(
+            SourceMsg::Batch {
+                source_idx: 1,
+                batch: batch_s1,
+            },
+            &mut callback,
+            &mut barriers,
+            &mut cycle_events,
+        );
+        coordinator.process_msg(
+            SourceMsg::Barrier {
+                source_idx: 1,
+                barrier,
+            },
+            &mut callback,
+            &mut barriers,
+            &mut cycle_events,
+        );
+
+        // Verify: source_batches_buf should have ts=1 from both sources,
+        // but NOT ts=2 from source 0 (that's post-barrier).
+        let s0_batches = coordinator.source_batches_buf.get("s0").unwrap();
+        assert_eq!(
+            s0_batches.len(),
+            1,
+            "s0 should have exactly 1 pre-barrier batch"
+        );
+        let s0_col = s0_batches[0]
+            .column(0)
+            .as_any()
+            .downcast_ref::<Int64Array>()
+            .unwrap();
+        assert_eq!(s0_col.value(0), 1, "s0 batch should contain ts=1");
+
+        let s1_batches = coordinator.source_batches_buf.get("s1").unwrap();
+        assert_eq!(s1_batches.len(), 1, "s1 should have exactly 1 batch");
+
+        // Post-barrier buf should contain the ts=2 batch.
+        assert_eq!(
+            coordinator.post_barrier_buf.len(),
+            1,
+            "post_barrier_buf should have 1 deferred batch"
+        );
+
+        // Barriers should have both sources.
+        assert_eq!(barriers.len(), 2, "should have barriers from both sources");
     }
 }

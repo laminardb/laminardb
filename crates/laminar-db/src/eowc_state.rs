@@ -149,6 +149,8 @@ pub(crate) struct IncrementalEowcState {
     time_col_index: usize,
     /// Compiled pre-agg projection (single-source queries only).
     compiled_projection: Option<CompiledProjection>,
+    /// Cached optimized logical plan for the pre-agg SQL (multi-source queries).
+    cached_pre_agg_plan: Option<datafusion_expr::LogicalPlan>,
     /// Compiled HAVING predicate.
     having_filter: Option<Arc<dyn PhysicalExpr>>,
     /// HAVING predicate SQL fallback.
@@ -517,6 +519,16 @@ impl IncrementalEowcState {
 
         let window_type = EowcWindowType::from_config(window_config);
 
+        // Cache the optimized logical plan for multi-source pre-agg queries.
+        let cached_pre_agg_plan = if compiled_projection.is_none() {
+            match ctx.sql(&pre_agg_sql).await {
+                Ok(df) => Some(df.logical_plan().clone()),
+                Err(_) => None,
+            }
+        } else {
+            None
+        };
+
         Ok(Some(Self {
             window_type,
             windows: BTreeMap::new(),
@@ -528,6 +540,7 @@ impl IncrementalEowcState {
             output_schema,
             time_col_index,
             compiled_projection,
+            cached_pre_agg_plan,
             having_filter,
             having_sql,
             max_groups_per_window: 1_000_000,
@@ -765,6 +778,11 @@ impl IncrementalEowcState {
     /// Compiled pre-agg projection, if available.
     pub fn compiled_projection(&self) -> Option<&CompiledProjection> {
         self.compiled_projection.as_ref()
+    }
+
+    /// Cached optimized logical plan for the pre-agg SQL.
+    pub fn cached_pre_agg_plan(&self) -> Option<&datafusion_expr::LogicalPlan> {
+        self.cached_pre_agg_plan.as_ref()
     }
 
     /// Return the number of open windows.
@@ -1134,6 +1152,7 @@ mod tests {
             output_schema,
             time_col_index: 2,
             compiled_projection: None,
+            cached_pre_agg_plan: None,
             having_filter: None,
             having_sql: None,
             max_groups_per_window: 1_000_000,

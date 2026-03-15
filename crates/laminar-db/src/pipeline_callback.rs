@@ -66,23 +66,24 @@ pub(crate) struct ConnectorPipelineCallback {
     pub(crate) pipeline_hash: Option<u64>,
     pub(crate) delivery_guarantee: laminar_connectors::connector::DeliveryGuarantee,
     /// DAG executor for lowered queries (`None` if no queries were lowered or DAG lowering is disabled).
-    /// Used by Phase 7b when `use_dag_lowering` is enabled.
     pub(crate) dag_executor: Option<laminar_core::dag::DagExecutor>,
-    /// Query names that were successfully lowered to the DAG (used in checkpoint path).
-    #[allow(dead_code)]
-    pub(crate) dag_query_names: rustc_hash::FxHashSet<Arc<str>>,
     /// DAG source node IDs per source name.
     pub(crate) dag_source_node_ids: FxHashMap<Arc<str>, laminar_core::dag::NodeId>,
     /// DAG sink node ID → query name mapping (for output routing).
     pub(crate) dag_sink_to_query: FxHashMap<laminar_core::dag::NodeId, Arc<str>>,
-    /// Pre-aggregation SQL per DAG-handled query name.
+    /// Pre-aggregation SQL per DAG-handled query name (fallback for multi-source).
     pub(crate) dag_pre_agg_sql: FxHashMap<Arc<str>, String>,
     /// DAG operator node IDs per query name (for pre-agg routing).
     pub(crate) dag_op_node_ids: FxHashMap<Arc<str>, laminar_core::dag::NodeId>,
+    /// Compiled projections for DAG queries that have single-source pre-agg
+    /// (bypasses `ctx.sql()` on the hot path).
+    pub(crate) dag_compiled_projections:
+        FxHashMap<Arc<str>, crate::aggregate_state::CompiledProjection>,
     /// Whether DAG lowering is active for this pipeline.
     pub(crate) use_dag_lowering: bool,
     /// Cycle duration histogram for percentile tracking (single-threaded access).
-    pub(crate) cycle_histogram: std::cell::RefCell<crate::checkpoint_coordinator::DurationHistogram>,
+    pub(crate) cycle_histogram:
+        std::cell::RefCell<crate::checkpoint_coordinator::DurationHistogram>,
 }
 
 impl ConnectorPipelineCallback {
@@ -137,50 +138,59 @@ impl crate::pipeline::PipelineCallback for ConnectorPipelineCallback {
         // Route lowered queries through the DAG executor when enabled.
         if self.use_dag_lowering {
             if let Some(dag) = &mut self.dag_executor {
-                // For each lowered query, run its pre-agg SQL against the
-                // source tables (already registered by StreamExecutor) and
-                // feed the pre-agg'd batch to the DAG operator node.
-                // This is necessary because the DAG adapters (AggregateAdapter,
-                // WindowAggAdapter) expect pre-aggregated input (group columns
-                // + aggregate inputs), not raw source batches.
-                let ctx = self.executor.session_context();
+                // For each lowered query, evaluate the pre-agg projection and
+                // feed the result to the DAG operator node. Uses compiled
+                // projections for single-source queries (no DataFusion), falling
+                // back to ctx.sql() for multi-source queries.
                 for (query_name, pre_agg_sql) in &self.dag_pre_agg_sql {
                     let Some(&op_node_id) = self.dag_op_node_ids.get(query_name) else {
                         continue;
                     };
-                    match ctx.sql(pre_agg_sql).await {
-                        Ok(df) => match df.collect().await {
-                            Ok(batches) => {
-                                for batch in batches {
-                                    if batch.num_rows() > 0 {
-                                        let event = laminar_core::operator::Event::new(
-                                            watermark,
-                                            batch,
+
+                    // Fast path: compiled projection (no SQL parsing/planning).
+                    let pre_agg_batches =
+                        if let Some(proj) = self.dag_compiled_projections.get(query_name) {
+                            crate::stream_executor::evaluate_compiled_projection(
+                                proj,
+                                source_batches,
+                                &results,
+                            )
+                        } else {
+                            // Slow path: full DataFusion SQL for multi-source queries.
+                            let ctx = self.executor.session_context();
+                            match ctx.sql(pre_agg_sql).await {
+                                Ok(df) => match df.collect().await {
+                                    Ok(batches) => batches,
+                                    Err(e) => {
+                                        tracing::warn!(
+                                            query = %query_name,
+                                            error = %e,
+                                            "DAG pre-agg SQL execution failed"
                                         );
-                                        if let Err(e) = dag.process_event(op_node_id, event) {
-                                            tracing::warn!(
-                                                query = %query_name,
-                                                error = %e,
-                                                "DAG process_event failed"
-                                            );
-                                        }
+                                        continue;
                                     }
+                                },
+                                Err(e) => {
+                                    tracing::warn!(
+                                        query = %query_name,
+                                        error = %e,
+                                        "DAG pre-agg SQL planning failed"
+                                    );
+                                    continue;
                                 }
                             }
-                            Err(e) => {
+                        };
+
+                    for batch in pre_agg_batches {
+                        if batch.num_rows() > 0 {
+                            let event = laminar_core::operator::Event::new(watermark, batch);
+                            if let Err(e) = dag.process_event(op_node_id, event) {
                                 tracing::warn!(
                                     query = %query_name,
                                     error = %e,
-                                    "DAG pre-agg SQL execution failed"
+                                    "DAG process_event failed"
                                 );
                             }
-                        },
-                        Err(e) => {
-                            tracing::warn!(
-                                query = %query_name,
-                                error = %e,
-                                "DAG pre-agg SQL planning failed"
-                            );
                         }
                     }
                 }
@@ -199,7 +209,7 @@ impl crate::pipeline::PipelineCallback for ConnectorPipelineCallback {
                         let batches: Vec<RecordBatch> = events
                             .into_iter()
                             .filter(|e| e.data.num_rows() > 0)
-                            .map(|e| (*e.data).clone())
+                            .map(|e| Arc::try_unwrap(e.data).unwrap_or_else(|arc| (*arc).clone()))
                             .collect();
                         if !batches.is_empty() {
                             results.insert(Arc::clone(query_name), batches);
@@ -451,16 +461,24 @@ impl crate::pipeline::PipelineCallback for ConnectorPipelineCallback {
             .map(|(name, cp)| (name.clone(), source_to_connector_checkpoint(cp)))
             .collect();
 
-        // Capture stream executor aggregate state: snapshot (sync) + serialize.
+        // Capture stream executor aggregate state: snapshot (sync), then
+        // offload serialization to spawn_blocking to free the tokio worker.
         let mut operator_states = HashMap::with_capacity(2);
         match self.executor.snapshot_state() {
             Ok(Some(cp)) => {
-                match crate::stream_executor::StreamExecutor::serialize_checkpoint(&cp) {
-                    Ok(bytes) => {
+                match tokio::task::spawn_blocking(move || {
+                    crate::stream_executor::StreamExecutor::serialize_checkpoint(&cp)
+                })
+                .await
+                {
+                    Ok(Ok(bytes)) => {
                         operator_states.insert("stream_executor".to_string(), bytes);
                     }
-                    Err(e) => {
+                    Ok(Err(e)) => {
                         tracing::warn!(error = %e, "Stream executor checkpoint serialization failed");
+                    }
+                    Err(e) => {
+                        tracing::warn!(error = %e, "Stream executor checkpoint spawn_blocking failed");
                     }
                 }
             }
@@ -475,16 +493,24 @@ impl crate::pipeline::PipelineCallback for ConnectorPipelineCallback {
             if let Some(dag) = &mut self.dag_executor {
                 let dag_states = dag.checkpoint();
                 if !dag_states.is_empty() {
-                    let serializable: HashMap<String, laminar_core::dag::recovery::SerializableOperatorState> =
-                        dag_states.into_iter()
-                            .map(|(nid, os)| (nid.0.to_string(), os.into()))
-                            .collect();
-                    match serde_json::to_vec(&serializable) {
-                        Ok(bytes) => {
+                    let serializable: HashMap<
+                        String,
+                        laminar_core::dag::recovery::SerializableOperatorState,
+                    > = dag_states
+                        .into_iter()
+                        .map(|(nid, os)| (nid.0.to_string(), os.into()))
+                        .collect();
+                    match tokio::task::spawn_blocking(move || serde_json::to_vec(&serializable))
+                        .await
+                    {
+                        Ok(Ok(bytes)) => {
                             operator_states.insert("dag_operators".to_string(), bytes);
                         }
-                        Err(e) => {
+                        Ok(Err(e)) => {
                             tracing::warn!(error = %e, "DAG operator checkpoint serialization failed");
+                        }
+                        Err(e) => {
+                            tracing::warn!(error = %e, "DAG operator checkpoint spawn_blocking failed");
                         }
                     }
                 }
@@ -605,16 +631,24 @@ impl crate::pipeline::PipelineCallback for ConnectorPipelineCallback {
         }
 
         // Capture stream executor aggregate state — now consistent because
-        // all pre-barrier data has been executed.
+        // all pre-barrier data has been executed. Offload serialization to
+        // spawn_blocking to free the tokio worker during JSON encoding.
         let mut operator_states = HashMap::with_capacity(2);
         match self.executor.snapshot_state() {
             Ok(Some(cp)) => {
-                match crate::stream_executor::StreamExecutor::serialize_checkpoint(&cp) {
-                    Ok(bytes) => {
+                match tokio::task::spawn_blocking(move || {
+                    crate::stream_executor::StreamExecutor::serialize_checkpoint(&cp)
+                })
+                .await
+                {
+                    Ok(Ok(bytes)) => {
                         operator_states.insert("stream_executor".to_string(), bytes);
                     }
-                    Err(e) => {
+                    Ok(Err(e)) => {
                         tracing::warn!(error = %e, "Stream executor checkpoint serialization failed");
+                    }
+                    Err(e) => {
+                        tracing::warn!(error = %e, "Stream executor checkpoint spawn_blocking failed");
                     }
                 }
             }
@@ -629,16 +663,24 @@ impl crate::pipeline::PipelineCallback for ConnectorPipelineCallback {
             if let Some(dag) = &mut self.dag_executor {
                 let dag_states = dag.checkpoint();
                 if !dag_states.is_empty() {
-                    let serializable: HashMap<String, laminar_core::dag::recovery::SerializableOperatorState> =
-                        dag_states.into_iter()
-                            .map(|(nid, os)| (nid.0.to_string(), os.into()))
-                            .collect();
-                    match serde_json::to_vec(&serializable) {
-                        Ok(bytes) => {
+                    let serializable: HashMap<
+                        String,
+                        laminar_core::dag::recovery::SerializableOperatorState,
+                    > = dag_states
+                        .into_iter()
+                        .map(|(nid, os)| (nid.0.to_string(), os.into()))
+                        .collect();
+                    match tokio::task::spawn_blocking(move || serde_json::to_vec(&serializable))
+                        .await
+                    {
+                        Ok(Ok(bytes)) => {
                             operator_states.insert("dag_operators".to_string(), bytes);
                         }
-                        Err(e) => {
+                        Ok(Err(e)) => {
                             tracing::warn!(error = %e, "DAG operator checkpoint serialization failed");
+                        }
+                        Err(e) => {
+                            tracing::warn!(error = %e, "DAG operator checkpoint spawn_blocking failed");
                         }
                     }
                 }
