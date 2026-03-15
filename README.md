@@ -90,7 +90,7 @@ Three deployment modes:
 |------|-----|--------|
 | **Embedded** | `cargo add laminar-db` — runs inside your Rust process | ✅ Implemented |
 | **Standalone** | `laminardb` binary with HTTP API, configurable via TOML | ✅ Implemented |
-| **Distributed** | Multi-node via gossip discovery, Raft consensus, gRPC — `--features delta` | ✅ Implemented (not yet production-hardened; Phase 6c pending) |
+| **Distributed** | Multi-node via gossip discovery, Raft consensus, gRPC — `--features delta` | 🔧 Implemented; production hardening pending (Phase 6c) |
 
 The embedded mode is the primary deployment target. You get a `LaminarDB` handle, register sources with SQL DDL, push `RecordBatch` data in, subscribe to output streams, and let the engine handle windowing, joins, checkpointing, and exactly-once delivery.
 
@@ -295,7 +295,7 @@ Custom connectors can be built using the `SourceConnector` / `SinkConnector` tra
 └──────────────────────────────────────────────────────────────┘
 ```
 
-- **Streaming coordinator** — Single tokio task driving SQL execution cycles. Source connectors push batches via mpsc channels; the coordinator runs compiled projections / cached logical plans, routes results to sinks, and manages checkpoint barriers. Target: sub-microsecond per-event latency.
+- **Streaming coordinator** — Single tokio task driving SQL execution cycles. Source connectors push batches via mpsc channels; the coordinator runs compiled projections / cached logical plans, routes results to sinks, and manages checkpoint barriers. Sub-microsecond for compiled single-source projections; microseconds for incremental aggregations and cached-plan queries; DataFusion fallback for complex queries.
 - **Background I/O** — Tokio async runtime handling WAL writes, checkpointing, connector I/O, and changelog draining.
 - **Admin** — HTTP admin API, metrics, configuration management. Auth and observability are planned (Phase 4/5).
 
@@ -303,8 +303,8 @@ See [docs/ARCHITECTURE.md](docs/ARCHITECTURE.md) for the full design.
 
 ### Checkpointing and Recovery
 
-1. **Per-Core WAL** — Each CPU core writes to its own WAL segment with CRC32C checksums and torn write detection
-2. **Coordinated Snapshots** — Barrier-based checkpoint protocol across all operators and sinks
+1. **WAL** — Write-ahead log segments with CRC32C checksums and torn write detection
+2. **Coordinated Snapshots** — Barrier-based checkpoint protocol: coordinator injects barriers into all sources; operators with multiple inputs align barriers before snapshotting
 3. **Two-Phase Commit** — Sinks participate in pre-commit/commit phases for exactly-once delivery
 4. **Recovery** — `RecoveryManager` restores from the latest checkpoint manifest, replays WAL, resumes connectors from committed offsets
 
@@ -330,18 +330,18 @@ Non-aggregate single-source queries are compiled to `PhysicalExpr` projections o
 
 ## Benchmarks
 
-Benchmark suites are in `crates/laminar-core/benches/`, `crates/laminar-storage/benches/`, and `crates/laminar-db/benches/` (18 total, using Criterion):
+Benchmark suites are in `crates/laminar-core/benches/`, `crates/laminar-storage/benches/`, and `crates/laminar-db/benches/` (14 total, using Criterion):
 
 | Metric | Target | Measured (mean) | Benchmark File |
 |--------|--------|-----------------|----------------|
 | State lookup | < 500ns | 10–105ns | `state_bench.rs` |
-| Throughput/core | 500K events/sec | 1.1–1.46M events/sec | `throughput_bench.rs` |
+| Throughput/core | 500K events/sec | 1.1–1.46M events/sec | `streaming_bench.rs` |
 | Event latency | < 10us | 0.55–1.16us | `latency_bench.rs` |
 | Checkpoint recovery | < 10s | 1.39ms | `checkpoint_bench.rs` |
 
 These are Criterion mean latencies measured on development hardware (AMD Ryzen AI 7 350, see [BENCHMARKS.md](docs/BENCHMARKS.md)) against minimal operator chains (single tumbling window for latency, single state lookup for state bench). Real pipelines with multiple operators, joins, and state lookups will show higher latency. p99 under sustained load is not yet measured. Run `cargo bench` to measure on your own hardware.
 
-Additional benchmark suites: `window_bench`, `join_bench`, `lookup_join_bench`, `cache_bench`, `compiler_bench`, `streaming_bench`, `subscription_bench`, `reactor_bench`, `tpc_bench`, `dag_bench`, `dag_stress`, `wal_bench`, `io_uring_bench`, `recovery_bench`.
+Additional benchmark suites: `window_bench`, `join_bench`, `lookup_join_bench`, `cache_bench`, `streaming_bench`, `subscription_bench`, `dag_bench`, `dag_stress`, `wal_bench`, `recovery_bench`.
 
 ---
 
@@ -364,7 +364,7 @@ Additional benchmark suites: `window_bench`, `join_bench`, `lookup_join_bench`, 
 | Deployment | Library or binary | JVM cluster | JVM library | Distributed cluster | Proprietary binary |
 | Language | Rust (+ Python, C FFI) | Java/Scala/Python | Java | Rust/Python/SQL | Q/Python |
 | Embed in your process | Yes | No | Yes (JVM) | No | No |
-| Latency (per-event, microbench) | Sub-microsecond (Ring 0) | Milliseconds–seconds | Milliseconds | Milliseconds | Microseconds |
+| Latency (per-event, microbench) | Sub-microsecond (compiled queries, microbench) | Milliseconds–seconds | Milliseconds | Milliseconds | Microseconds |
 | Operational overhead | None (embedded) or single binary | K8s operator or YARN | Kafka cluster | etcd/K8s/S3 | Vendor support |
 | SQL | Full (DataFusion) | Flink SQL | None (DSL only) | Full (Postgres-compatible) | Q language |
 | Exactly-once | Yes (checkpoint + 2PC) | Yes | Yes | Yes | No |

@@ -1,11 +1,9 @@
 //! JSON format decoder, encoder, and JSONB binary format.
 //!
-//! Implements F-SCHEMA-004:
-//!
-//! - [`JsonDecoder`] — Ring 1 decoder: JSON bytes → Arrow `RecordBatch`
-//! - [`JsonEncoder`] — Ring 1 encoder: Arrow `RecordBatch` → JSON bytes
+//! - [`JsonDecoder`] — decoder: JSON bytes → Arrow `RecordBatch`
+//! - [`JsonEncoder`] — encoder: Arrow `RecordBatch` → JSON bytes
 //! - [`JsonbEncoder`] / [`JsonbAccessor`] — JSONB binary format for
-//!   O(log n) field access on Ring 0
+//!   O(log n) field access
 
 pub mod decoder;
 pub mod encoder;

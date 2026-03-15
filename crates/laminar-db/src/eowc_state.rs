@@ -40,7 +40,7 @@ pub(crate) enum EowcWindowType {
     Tumbling { size_ms: i64 },
     /// Hopping: overlapping windows with fixed size and slide.
     Hopping { size_ms: i64, slide_ms: i64 },
-    /// Session: gap-based windows (simplified — merge not yet implemented).
+    /// Session: gap-based windows (simplified, non-merging).
     Session { gap_ms: i64 },
 }
 
@@ -149,6 +149,8 @@ pub(crate) struct IncrementalEowcState {
     time_col_index: usize,
     /// Compiled pre-agg projection (single-source queries only).
     compiled_projection: Option<CompiledProjection>,
+    /// Cached optimized logical plan for the pre-agg SQL (multi-source queries).
+    cached_pre_agg_plan: Option<datafusion_expr::LogicalPlan>,
     /// Compiled HAVING predicate.
     having_filter: Option<Arc<dyn PhysicalExpr>>,
     /// HAVING predicate SQL fallback.
@@ -517,6 +519,18 @@ impl IncrementalEowcState {
 
         let window_type = EowcWindowType::from_config(window_config);
 
+        // ONE-TIME setup: cache the optimized logical plan for multi-source
+        // pre-agg queries. This ctx.sql() call runs ONLY at first-cycle
+        // initialization, never per-cycle.
+        let cached_pre_agg_plan = if compiled_projection.is_none() {
+            match ctx.sql(&pre_agg_sql).await {
+                Ok(df) => Some(df.logical_plan().clone()),
+                Err(_) => None,
+            }
+        } else {
+            None
+        };
+
         Ok(Some(Self {
             window_type,
             windows: BTreeMap::new(),
@@ -528,6 +542,7 @@ impl IncrementalEowcState {
             output_schema,
             time_col_index,
             compiled_projection,
+            cached_pre_agg_plan,
             having_filter,
             having_sql,
             max_groups_per_window: 1_000_000,
@@ -748,6 +763,7 @@ impl IncrementalEowcState {
     }
 
     /// Pre-aggregation SQL.
+    #[allow(dead_code)] // Available for diagnostics.
     pub fn pre_agg_sql(&self) -> &str {
         &self.pre_agg_sql
     }
@@ -767,6 +783,11 @@ impl IncrementalEowcState {
         self.compiled_projection.as_ref()
     }
 
+    /// Cached optimized logical plan for the pre-agg SQL.
+    pub fn cached_pre_agg_plan(&self) -> Option<&datafusion_expr::LogicalPlan> {
+        self.cached_pre_agg_plan.as_ref()
+    }
+
     /// Return the number of open windows.
     #[cfg(test)]
     pub fn open_window_count(&self) -> usize {
@@ -776,6 +797,31 @@ impl IncrementalEowcState {
     /// Compute a fingerprint for this query (SQL + schema).
     pub(crate) fn query_fingerprint(&self) -> u64 {
         crate::aggregate_state::query_fingerprint(&self.pre_agg_sql, &self.output_schema)
+    }
+
+    /// Estimated memory usage in bytes across all windows and groups.
+    ///
+    /// Iterates over every open window and its per-group accumulators, summing
+    /// `ScalarValue::size()` for keys and `Accumulator::size()` for state.
+    pub(crate) fn estimated_size_bytes(&self) -> usize {
+        let mut total = 0;
+        for groups in self.windows.values() {
+            for (key, accs) in groups {
+                for sv in key {
+                    total += sv.size();
+                }
+                for acc in accs {
+                    total += acc.size();
+                }
+            }
+        }
+        total
+    }
+
+    /// Total number of distinct groups across all open windows.
+    #[allow(dead_code)]
+    pub(crate) fn group_count(&self) -> usize {
+        self.windows.values().map(|g| g.len()).sum()
     }
 
     /// Checkpoint all per-window group states into a serializable struct.
@@ -1109,6 +1155,7 @@ mod tests {
             output_schema,
             time_col_index: 2,
             compiled_projection: None,
+            cached_pre_agg_plan: None,
             having_filter: None,
             having_sql: None,
             max_groups_per_window: 1_000_000,

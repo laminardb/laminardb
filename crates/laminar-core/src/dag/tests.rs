@@ -995,9 +995,10 @@ impl Operator for PassthroughOperator {
     fn on_timer(&mut self, _timer: Timer, _ctx: &mut OperatorContext) -> OutputVec {
         OutputVec::new()
     }
-    fn checkpoint(&self) -> OperatorState {
+    fn checkpoint(&mut self) -> OperatorState {
         OperatorState {
             operator_id: "passthrough".to_string(),
+            version: 1,
             data: Vec::new(),
         }
     }
@@ -1019,9 +1020,10 @@ impl Operator for DoublingOperator {
     fn on_timer(&mut self, _timer: Timer, _ctx: &mut OperatorContext) -> OutputVec {
         OutputVec::new()
     }
-    fn checkpoint(&self) -> OperatorState {
+    fn checkpoint(&mut self) -> OperatorState {
         OperatorState {
             operator_id: "doubling".to_string(),
+            version: 1,
             data: Vec::new(),
         }
     }
@@ -1047,9 +1049,10 @@ impl Operator for FilterOperator {
     fn on_timer(&mut self, _timer: Timer, _ctx: &mut OperatorContext) -> OutputVec {
         OutputVec::new()
     }
-    fn checkpoint(&self) -> OperatorState {
+    fn checkpoint(&mut self) -> OperatorState {
         OperatorState {
             operator_id: "filter".to_string(),
+            version: 1,
             data: self.threshold.to_le_bytes().to_vec(),
         }
     }
@@ -1079,9 +1082,10 @@ impl Operator for AddOperator {
     fn on_timer(&mut self, _timer: Timer, _ctx: &mut OperatorContext) -> OutputVec {
         OutputVec::new()
     }
-    fn checkpoint(&self) -> OperatorState {
+    fn checkpoint(&mut self) -> OperatorState {
         OperatorState {
             operator_id: "add".to_string(),
+            version: 1,
             data: self.addend.to_le_bytes().to_vec(),
         }
     }
@@ -1825,6 +1829,7 @@ fn test_coordinator_progress() {
     // Only one node reports — finalize should fail.
     let state = OperatorState {
         operator_id: "op0".to_string(),
+        version: 1,
         data: vec![],
     };
     let all_done = coordinator.on_node_snapshot_complete(NodeId(0), state);
@@ -1851,6 +1856,7 @@ fn test_coordinator_finalize() {
         NodeId(0),
         OperatorState {
             operator_id: "src".to_string(),
+            version: 1,
             data: vec![1, 2, 3],
         },
     );
@@ -1858,6 +1864,7 @@ fn test_coordinator_finalize() {
         NodeId(1),
         OperatorState {
             operator_id: "op".to_string(),
+            version: 1,
             data: vec![4, 5, 6],
         },
     );
@@ -1886,6 +1893,7 @@ fn test_coordinator_multiple_checkpoints() {
         NodeId(0),
         OperatorState {
             operator_id: "op".to_string(),
+            version: 1,
             data: vec![10],
         },
     );
@@ -1900,6 +1908,7 @@ fn test_coordinator_multiple_checkpoints() {
         NodeId(0),
         OperatorState {
             operator_id: "op".to_string(),
+            version: 1,
             data: vec![20],
         },
     );
@@ -1943,6 +1952,7 @@ fn test_recovery_restore_state() {
         1,
         SerializableOperatorState {
             operator_id: "double".to_string(),
+            version: 1,
             data: vec![42],
         },
     );
@@ -1981,6 +1991,7 @@ fn test_recovery_by_id() {
             0,
             SerializableOperatorState {
                 operator_id: format!("op_epoch{id}"),
+                version: 1,
                 data: vec![id as u8],
             },
         );
@@ -2191,6 +2202,7 @@ fn test_full_checkpoint_recovery_cycle() {
                 node_id,
                 OperatorState {
                     operator_id: String::new(),
+                    version: 1,
                     data: Vec::new(),
                 },
             );
@@ -3456,9 +3468,10 @@ impl Operator for ChangelogEmittingOperator {
     fn on_timer(&mut self, _timer: Timer, _ctx: &mut OperatorContext) -> OutputVec {
         OutputVec::new()
     }
-    fn checkpoint(&self) -> OperatorState {
+    fn checkpoint(&mut self) -> OperatorState {
         OperatorState {
             operator_id: "changelog_emitter".to_string(),
+            version: 1,
             data: Vec::new(),
         }
     }
@@ -3512,9 +3525,10 @@ impl Operator for SideOutputEmittingOperator {
     fn on_timer(&mut self, _timer: Timer, _ctx: &mut OperatorContext) -> OutputVec {
         OutputVec::new()
     }
-    fn checkpoint(&self) -> OperatorState {
+    fn checkpoint(&mut self) -> OperatorState {
         OperatorState {
             operator_id: "side_output_emitter".to_string(),
+            version: 1,
             data: Vec::new(),
         }
     }
@@ -3566,9 +3580,10 @@ impl Operator for WatermarkEmittingOperator {
     fn on_timer(&mut self, _timer: Timer, _ctx: &mut OperatorContext) -> OutputVec {
         OutputVec::new()
     }
-    fn checkpoint(&self) -> OperatorState {
+    fn checkpoint(&mut self) -> OperatorState {
         OperatorState {
             operator_id: "watermark_emitter".to_string(),
+            version: 1,
             data: Vec::new(),
         }
     }

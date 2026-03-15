@@ -1731,6 +1731,9 @@ impl StreamJoinOperator {
                         let timestamp = i64::from_be_bytes(ts_bytes);
                         if timestamp + time_bound < prune_threshold {
                             // Also verify via deserialization
+                            // SAFETY: StateStore.put_typed() serializes with AlignedVec (state/mod.rs:322).
+                            // The stored bytes preserve alignment through InMemoryStore/MmapStateStore.
+                            // bytecheck validates on access; misalignment returns Err, not UB.
                             if let Ok(row) =
                                 rkyv::access::<rkyv::Archived<JoinRow>, RkyvError>(&value)
                                     .and_then(rkyv::deserialize::<JoinRow, RkyvError>)
@@ -1925,6 +1928,9 @@ impl StreamJoinOperator {
         // Scan for matching keys
         for (state_key, value) in state.prefix_scan(&scan_prefix) {
             // Deserialize the join row
+            // SAFETY: StateStore.put_typed() serializes with AlignedVec (state/mod.rs:322).
+            // The stored bytes preserve alignment through InMemoryStore/MmapStateStore.
+            // bytecheck validates on access; misalignment returns Err, not UB.
             let Ok(row) = rkyv::access::<rkyv::Archived<JoinRow>, RkyvError>(&value)
                 .and_then(rkyv::deserialize::<JoinRow, RkyvError>)
             else {
@@ -2177,7 +2183,7 @@ impl Operator for StreamJoinOperator {
         }
     }
 
-    fn checkpoint(&self) -> OperatorState {
+    fn checkpoint(&mut self) -> OperatorState {
         // Checkpoint the metrics, configuration, and optimization state
         // Use nested tuples to stay within rkyv's tuple size limit (max 12)
         // Format: ((config), (core_metrics), (f057_metrics, side_stats))
@@ -2217,6 +2223,7 @@ impl Operator for StreamJoinOperator {
 
         OperatorState {
             operator_id: self.operator_id.clone(),
+            version: 1,
             data,
         }
     }
@@ -2240,44 +2247,39 @@ impl Operator for StreamJoinOperator {
         }
 
         // Try to restore full optimization checkpoint first
-        if let Ok(archived) = rkyv::access::<rkyv::Archived<CheckpointData>, RkyvError>(&state.data)
-        {
-            if let Ok(data) = rkyv::deserialize::<CheckpointData, RkyvError>(archived) {
-                let (
-                    _config,
-                    (left_events, right_events, matches),
-                    (
-                        cpu_friendly_encodes,
-                        compact_encodes,
-                        asymmetric_skips,
-                        idle_key_cleanups,
-                        build_side_prunes,
-                    ),
-                    (left_received, right_received, left_wm, right_wm),
-                ) = data;
+        if let Ok(data) = rkyv::from_bytes::<CheckpointData, RkyvError>(&state.data) {
+            let (
+                _config,
+                (left_events, right_events, matches),
+                (
+                    cpu_friendly_encodes,
+                    compact_encodes,
+                    asymmetric_skips,
+                    idle_key_cleanups,
+                    build_side_prunes,
+                ),
+                (left_received, right_received, left_wm, right_wm),
+            ) = data;
 
-                self.metrics.left_events = left_events;
-                self.metrics.right_events = right_events;
-                self.metrics.matches = matches;
-                self.metrics.cpu_friendly_encodes = cpu_friendly_encodes;
-                self.metrics.compact_encodes = compact_encodes;
-                self.metrics.asymmetric_skips = asymmetric_skips;
-                self.metrics.idle_key_cleanups = idle_key_cleanups;
-                self.metrics.build_side_prunes = build_side_prunes;
-                self.left_stats.events_received = left_received;
-                self.right_stats.events_received = right_received;
-                self.left_watermark = left_wm;
-                self.right_watermark = right_wm;
+            self.metrics.left_events = left_events;
+            self.metrics.right_events = right_events;
+            self.metrics.matches = matches;
+            self.metrics.cpu_friendly_encodes = cpu_friendly_encodes;
+            self.metrics.compact_encodes = compact_encodes;
+            self.metrics.asymmetric_skips = asymmetric_skips;
+            self.metrics.idle_key_cleanups = idle_key_cleanups;
+            self.metrics.build_side_prunes = build_side_prunes;
+            self.left_stats.events_received = left_received;
+            self.right_stats.events_received = right_received;
+            self.left_watermark = left_wm;
+            self.right_watermark = right_wm;
 
-                return Ok(());
-            }
+            return Ok(());
         }
 
         // Fall back to legacy checkpoint format
-        let archived = rkyv::access::<rkyv::Archived<LegacyCheckpointData>, RkyvError>(&state.data)
-            .map_err(|e| OperatorError::SerializationFailed(e.to_string()))?;
         let (_, _, _, left_events, right_events, matches) =
-            rkyv::deserialize::<LegacyCheckpointData, RkyvError>(archived)
+            rkyv::from_bytes::<LegacyCheckpointData, RkyvError>(&state.data)
                 .map_err(|e| OperatorError::SerializationFailed(e.to_string()))?;
 
         self.metrics.left_events = left_events;

@@ -19,6 +19,7 @@ fn test_snapshot_serialization() {
         1,
         SerializableOperatorState {
             operator_id: "test_op".to_string(),
+            version: 1,
             data: vec![1, 2, 3, 4],
         },
     );
@@ -66,6 +67,7 @@ fn test_snapshot_from_operator_states() {
         NodeId(1),
         OperatorState {
             operator_id: "op1".to_string(),
+            version: 1,
             data: vec![10],
         },
     );
@@ -73,6 +75,7 @@ fn test_snapshot_from_operator_states() {
         NodeId(2),
         OperatorState {
             operator_id: "op2".to_string(),
+            version: 1,
             data: vec![20],
         },
     );
@@ -97,6 +100,7 @@ fn test_snapshot_to_operator_states() {
         10,
         SerializableOperatorState {
             operator_id: "op10".to_string(),
+            version: 1,
             data: vec![0, 1],
         },
     );
@@ -259,6 +263,7 @@ fn test_recovered_dag_state_debug() {
 fn test_serializable_operator_state_conversion() {
     let op_state = OperatorState {
         operator_id: "test".to_string(),
+        version: 1,
         data: vec![1, 2, 3],
     };
 

@@ -51,9 +51,9 @@ impl BarrierTrackingCallback {
 impl PipelineCallback for BarrierTrackingCallback {
     async fn execute_cycle(
         &mut self,
-        source_batches: &FxHashMap<String, Vec<RecordBatch>>,
+        source_batches: &FxHashMap<Arc<str>, Vec<RecordBatch>>,
         _watermark: i64,
-    ) -> Result<FxHashMap<String, Vec<RecordBatch>>, String> {
+    ) -> Result<FxHashMap<Arc<str>, Vec<RecordBatch>>, String> {
         self.cycle_count += 1;
         let records: u64 = source_batches
             .values()
@@ -65,9 +65,9 @@ impl PipelineCallback for BarrierTrackingCallback {
         Ok(FxHashMap::default())
     }
 
-    fn push_to_streams(&self, _results: &FxHashMap<String, Vec<RecordBatch>>) {}
+    fn push_to_streams(&self, _results: &FxHashMap<Arc<str>, Vec<RecordBatch>>) {}
 
-    async fn write_to_sinks(&mut self, _results: &FxHashMap<String, Vec<RecordBatch>>) {}
+    async fn write_to_sinks(&mut self, _results: &FxHashMap<Arc<str>, Vec<RecordBatch>>) {}
 
     fn extract_watermark(&mut self, _source_name: &str, _batch: &RecordBatch) {}
 
@@ -105,6 +105,8 @@ impl PipelineCallback for BarrierTrackingCallback {
     fn record_cycle(&self, _events_ingested: u64, _batches: u64, _elapsed_ns: u64) {}
 
     async fn poll_tables(&mut self) {}
+
+    fn apply_control(&mut self, _msg: laminar_db::pipeline::ControlMsg) {}
 }
 
 /// Test that barriers are injected and aligned across multiple sources,
@@ -144,7 +146,8 @@ async fn test_barrier_aligned_checkpoint_fires() {
         ..PipelineConfig::default()
     };
 
-    let coordinator = StreamingCoordinator::new(sources, config, shutdown)
+    let (_control_tx, control_rx) = tokio::sync::mpsc::channel(64);
+    let coordinator = StreamingCoordinator::new(sources, config, shutdown, control_rx)
         .await
         .unwrap();
 
@@ -154,7 +157,7 @@ async fn test_barrier_aligned_checkpoint_fires() {
         BarrierTrackingCallback::new(Arc::clone(&should_trigger), Arc::clone(&record_counter));
 
     let handle = tokio::spawn(async move {
-        coordinator.run(Box::new(callback)).await;
+        coordinator.run(callback).await;
     });
 
     // Let the pipeline run and process data + barriers.
@@ -290,7 +293,8 @@ async fn test_single_source_barrier_checkpoint() {
         ..PipelineConfig::default()
     };
 
-    let coordinator = StreamingCoordinator::new(sources, config, shutdown)
+    let (_control_tx, control_rx) = tokio::sync::mpsc::channel(64);
+    let coordinator = StreamingCoordinator::new(sources, config, shutdown, control_rx)
         .await
         .unwrap();
 
@@ -300,7 +304,7 @@ async fn test_single_source_barrier_checkpoint() {
         BarrierTrackingCallback::new(Arc::clone(&should_trigger), Arc::clone(&record_counter));
 
     let handle = tokio::spawn(async move {
-        coordinator.run(Box::new(callback)).await;
+        coordinator.run(callback).await;
     });
 
     tokio::time::sleep(Duration::from_millis(300)).await;
@@ -349,7 +353,8 @@ async fn test_exhausted_sources_with_shutdown() {
         ..PipelineConfig::default()
     };
 
-    let coordinator = StreamingCoordinator::new(sources, config, shutdown)
+    let (_control_tx, control_rx) = tokio::sync::mpsc::channel(64);
+    let coordinator = StreamingCoordinator::new(sources, config, shutdown, control_rx)
         .await
         .unwrap();
 
@@ -359,7 +364,7 @@ async fn test_exhausted_sources_with_shutdown() {
         BarrierTrackingCallback::new(Arc::clone(&should_trigger), Arc::clone(&record_counter));
 
     let handle = tokio::spawn(async move {
-        coordinator.run(Box::new(callback)).await;
+        coordinator.run(callback).await;
     });
 
     // Let sources exhaust and barriers fire, then shut down.

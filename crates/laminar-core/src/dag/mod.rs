@@ -13,7 +13,7 @@
 //! - **`DagChannelType`**: Auto-derived channel types (SPSC/SPMC/MPSC)
 //! - **`MulticastBuffer`**: Zero-copy SPMC multicast for shared stages
 //! - **`RoutingTable`**: Pre-computed O(1) dispatch table
-//! - **`DagExecutor`**: Ring 0 event processing engine
+//! - **`DagExecutor`**: Per-event processing engine (programmatic Rust API)
 //!
 //! ## Key Design Principles
 //!
@@ -27,11 +27,11 @@
 //!
 //! ```text
 //! ┌─────────────────────────────────────────────────────────────────┐
-//! │                     RING 2: CONTROL PLANE                       │
+//! │                    CONSTRUCTION TIME                             │
 //! │  DagBuilder constructs StreamingDag topology                    │
 //! │  ┌──────────┐   ┌──────────────┐   ┌───────────────────┐       │
 //! │  │DagBuilder│──▶│ StreamingDag │──▶│ RoutingTable      │       │
-//! │  │ (Ring 2) │   │  (immutable) │   │ (cache-aligned)   │       │
+//! │  │          │   │  (immutable) │   │ (cache-aligned)   │       │
 //! │  └──────────┘   └──────────────┘   └───────────────────┘       │
 //! │                                                                 │
 //! │  MulticastBuffer<T> per shared stage (pre-allocated slots)      │

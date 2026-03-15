@@ -14,6 +14,7 @@ use datafusion::physical_expr::{create_physical_expr, PhysicalExpr};
 use datafusion::prelude::SessionContext;
 use datafusion_common::DFSchema;
 use laminar_connectors::checkpoint::SourceCheckpoint;
+use laminar_core::alloc::{PriorityClass, PriorityGuard};
 use laminar_core::streaming;
 use rustc_hash::FxHashMap;
 
@@ -29,6 +30,12 @@ static FILTER_TABLE_COUNTER: AtomicUsize = AtomicUsize::new(0);
 /// Implements [`PipelineCallback`](crate::pipeline::PipelineCallback) to bridge
 /// the event-driven pipeline coordinator to the rest of the database (stream
 /// executor, sinks, watermarks, checkpoints, table sources).
+///
+/// `ConnectorPipelineCallback` runs on a dedicated single-threaded tokio runtime
+/// (laminar-compute thread). Serialization and checkpoint I/O run inline because:
+/// 1. `tokio::spawn` on `current_thread` has no parallelism benefit
+/// 2. `spawn_blocking` on `current_thread` has no dedicated blocking pool
+/// 3. The compute thread is dedicated — blocking is acceptable
 pub(crate) struct ConnectorPipelineCallback {
     pub(crate) executor: crate::stream_executor::StreamExecutor,
     pub(crate) stream_sources: Vec<(String, streaming::Source<crate::catalog::ArrowRecord>)>,
@@ -45,7 +52,6 @@ pub(crate) struct ConnectorPipelineCallback {
     pub(crate) tracker: Option<laminar_core::time::WatermarkTracker>,
     pub(crate) counters: Arc<crate::metrics::PipelineCounters>,
     pub(crate) pipeline_watermark: Arc<std::sync::atomic::AtomicI64>,
-    pub(crate) checkpoint_in_progress: Arc<std::sync::atomic::AtomicBool>,
     pub(crate) coordinator:
         Arc<tokio::sync::Mutex<Option<crate::checkpoint_coordinator::CheckpointCoordinator>>>,
     #[allow(clippy::type_complexity)]
@@ -65,13 +71,39 @@ pub(crate) struct ConnectorPipelineCallback {
     pub(crate) checkpoint_interval: Option<std::time::Duration>,
     pub(crate) pipeline_hash: Option<u64>,
     pub(crate) delivery_guarantee: laminar_connectors::connector::DeliveryGuarantee,
+    /// Cycle duration histogram for percentile tracking (single-threaded access).
+    pub(crate) cycle_histogram:
+        std::cell::RefCell<crate::checkpoint_coordinator::DurationHistogram>,
 }
 
 impl ConnectorPipelineCallback {
+    /// Snapshot operator state inline, then offload `serde_json::to_vec()`
+    /// to `spawn_blocking` so the coordinator's I/O reactor is not blocked.
+    /// The coordinator still awaits the result (no concurrent event processing).
+    async fn capture_and_serialize_operator_state(
+        &mut self,
+    ) -> Result<std::collections::HashMap<String, Vec<u8>>, String> {
+        let mut operator_states = HashMap::with_capacity(2);
+        let cp = match self.executor.snapshot_state() {
+            Ok(Some(cp)) => cp,
+            Ok(None) => return Ok(operator_states),
+            Err(e) => return Err(format!("snapshot failed: {e}")),
+        };
+        // Offload CPU-bound serialization to blocking thread pool.
+        let bytes = tokio::task::spawn_blocking(move || {
+            crate::stream_executor::StreamExecutor::serialize_checkpoint(&cp)
+        })
+        .await
+        .map_err(|e| format!("serialize join error: {e}"))?
+        .map_err(|e| format!("serialize error: {e}"))?;
+        operator_states.insert("stream_executor".to_string(), bytes);
+        Ok(operator_states)
+    }
+
     /// Try to compile sink filter SQL to `PhysicalExpr` for sinks that haven't been compiled yet.
     async fn compile_pending_sink_filters(
         &mut self,
-        results: &FxHashMap<String, Vec<RecordBatch>>,
+        results: &FxHashMap<Arc<str>, Vec<RecordBatch>>,
     ) {
         // Ensure the compiled_sink_filters vec has the right length.
         while self.compiled_sink_filters.len() < self.sinks.len() {
@@ -106,18 +138,21 @@ impl ConnectorPipelineCallback {
 impl crate::pipeline::PipelineCallback for ConnectorPipelineCallback {
     async fn execute_cycle(
         &mut self,
-        source_batches: &FxHashMap<String, Vec<RecordBatch>>,
+        source_batches: &FxHashMap<Arc<str>, Vec<RecordBatch>>,
         watermark: i64,
-    ) -> Result<FxHashMap<String, Vec<RecordBatch>>, String> {
-        self.executor
+    ) -> Result<FxHashMap<Arc<str>, Vec<RecordBatch>>, String> {
+        let results = self
+            .executor
             .execute_cycle(source_batches, watermark)
             .await
-            .map_err(|e| format!("{e}"))
+            .map_err(|e| format!("{e}"))?;
+
+        Ok(results)
     }
 
-    fn push_to_streams(&self, results: &FxHashMap<String, Vec<RecordBatch>>) {
+    fn push_to_streams(&self, results: &FxHashMap<Arc<str>, Vec<RecordBatch>>) {
         for (stream_name, src) in &self.stream_sources {
-            if let Some(batches) = results.get(stream_name) {
+            if let Some(batches) = results.get(stream_name.as_str()) {
                 for batch in batches {
                     if batch.num_rows() > 0 {
                         #[allow(clippy::cast_possible_truncation)]
@@ -138,7 +173,7 @@ impl crate::pipeline::PipelineCallback for ConnectorPipelineCallback {
         }
     }
 
-    async fn write_to_sinks(&mut self, results: &FxHashMap<String, Vec<RecordBatch>>) {
+    async fn write_to_sinks(&mut self, results: &FxHashMap<Arc<str>, Vec<RecordBatch>>) {
         // Lazy-compile any pending sink filters.
         self.compile_pending_sink_filters(results).await;
 
@@ -292,6 +327,7 @@ impl crate::pipeline::PipelineCallback for ConnectorPipelineCallback {
         source_offsets: FxHashMap<String, SourceCheckpoint>,
     ) -> bool {
         use crate::checkpoint_coordinator::source_to_connector_checkpoint;
+        let _priority = PriorityGuard::enter(PriorityClass::BackgroundIo);
 
         // Under exactly-once, only barrier-aligned checkpoints are consistent.
         // Timer-based checkpoints are skipped (barrier path handles exactly-once).
@@ -312,30 +348,12 @@ impl crate::pipeline::PipelineCallback for ConnectorPipelineCallback {
             return false;
         }
 
-        if !force
-            && self
-                .checkpoint_in_progress
-                .load(std::sync::atomic::Ordering::Relaxed)
-        {
-            return false;
-        }
-
         if !force {
             let Some(interval) = self.checkpoint_interval else {
                 return false; // no auto-checkpointing configured
             };
             if self.last_checkpoint.elapsed() < interval {
                 return false;
-            }
-        }
-
-        if force {
-            // Wait for any in-flight checkpoint to complete.
-            while self
-                .checkpoint_in_progress
-                .load(std::sync::atomic::Ordering::Relaxed)
-            {
-                tokio::time::sleep(std::time::Duration::from_millis(50)).await;
             }
         }
 
@@ -354,17 +372,17 @@ impl crate::pipeline::PipelineCallback for ConnectorPipelineCallback {
             .map(|(name, cp)| (name.clone(), source_to_connector_checkpoint(cp)))
             .collect();
 
-        // Capture stream executor aggregate state.
-        let mut operator_states = HashMap::with_capacity(1);
-        match self.executor.checkpoint_state() {
-            Ok(Some(bytes)) => {
-                operator_states.insert("stream_executor".to_string(), bytes);
-            }
-            Ok(None) => {}
+        // Capture stream executor aggregate state and serialize on blocking thread.
+        // Abort the checkpoint if serialization fails — persisting source
+        // offsets without matching operator state would cause data loss on
+        // recovery (offsets advance past unreplayable state).
+        let operator_states = match self.capture_and_serialize_operator_state().await {
+            Ok(states) => states,
             Err(e) => {
-                tracing::warn!(error = %e, "Stream executor checkpoint capture failed");
+                tracing::warn!(error = %e, "Stream executor checkpoint failed — skipping checkpoint");
+                return false;
             }
-        }
+        };
 
         // Collect per-source watermarks from the watermark tracker.
         let mut per_source_watermarks = HashMap::with_capacity(self.watermark_states.len());
@@ -407,48 +425,41 @@ impl crate::pipeline::PipelineCallback for ConnectorPipelineCallback {
                 }
             }
         } else {
-            // Non-blocking periodic checkpoint.
-            let coord_clone = Arc::clone(&self.coordinator);
-            let in_progress = Arc::clone(&self.checkpoint_in_progress);
-            in_progress.store(true, std::sync::atomic::Ordering::Relaxed);
-            let pipeline_hash = self.pipeline_hash;
-
-            tokio::spawn(async move {
-                let mut guard = coord_clone.lock().await;
-                if let Some(ref mut coord) = *guard {
-                    match coord
-                        .checkpoint_with_offsets(
-                            operator_states,
-                            None,
-                            None,
-                            extra_tables,
-                            per_source_watermarks,
-                            pipeline_hash,
-                            source_overrides,
-                        )
-                        .await
-                    {
-                        Ok(result) if result.success => {
-                            tracing::info!(
-                                epoch = result.epoch,
-                                duration_ms = result.duration.as_millis(),
-                                "Pipeline checkpoint completed"
-                            );
-                        }
-                        Ok(result) => {
-                            tracing::warn!(
-                                epoch = result.epoch,
-                                error = ?result.error,
-                                "Pipeline checkpoint failed"
-                            );
-                        }
-                        Err(e) => {
-                            tracing::warn!(error = %e, "Checkpoint error");
-                        }
+            // Periodic checkpoint — run inline (single-threaded runtime, no
+            // parallelism to exploit with tokio::spawn).
+            let mut guard = self.coordinator.lock().await;
+            if let Some(ref mut coord) = *guard {
+                match coord
+                    .checkpoint_with_offsets(
+                        operator_states,
+                        None,
+                        None,
+                        extra_tables,
+                        per_source_watermarks,
+                        self.pipeline_hash,
+                        source_overrides,
+                    )
+                    .await
+                {
+                    Ok(result) if result.success => {
+                        tracing::info!(
+                            epoch = result.epoch,
+                            duration_ms = result.duration.as_millis(),
+                            "Pipeline checkpoint completed"
+                        );
+                    }
+                    Ok(result) => {
+                        tracing::warn!(
+                            epoch = result.epoch,
+                            error = ?result.error,
+                            "Pipeline checkpoint failed"
+                        );
+                    }
+                    Err(e) => {
+                        tracing::warn!(error = %e, "Checkpoint error");
                     }
                 }
-                in_progress.store(false, std::sync::atomic::Ordering::Relaxed);
-            });
+            }
         }
 
         self.last_checkpoint = std::time::Instant::now();
@@ -460,6 +471,7 @@ impl crate::pipeline::PipelineCallback for ConnectorPipelineCallback {
         source_checkpoints: FxHashMap<String, SourceCheckpoint>,
     ) -> bool {
         use crate::checkpoint_coordinator::source_to_connector_checkpoint;
+        let _priority = PriorityGuard::enter(PriorityClass::BackgroundIo);
 
         if self
             .counters
@@ -480,17 +492,16 @@ impl crate::pipeline::PipelineCallback for ConnectorPipelineCallback {
         }
 
         // Capture stream executor aggregate state — now consistent because
-        // all pre-barrier data has been executed.
-        let mut operator_states = HashMap::with_capacity(1);
-        match self.executor.checkpoint_state() {
-            Ok(Some(bytes)) => {
-                operator_states.insert("stream_executor".to_string(), bytes);
-            }
-            Ok(None) => {}
+        // all pre-barrier data has been executed. Serialize on blocking thread.
+        // Abort if serialization fails — persisting source offsets without
+        // matching operator state would cause data loss on recovery.
+        let operator_states = match self.capture_and_serialize_operator_state().await {
+            Ok(states) => states,
             Err(e) => {
-                tracing::warn!(error = %e, "Stream executor checkpoint capture failed");
+                tracing::warn!(error = %e, "Stream executor barrier checkpoint failed — skipping");
+                return false;
             }
-        }
+        };
 
         // Collect per-source watermarks.
         let mut per_source_watermarks = HashMap::with_capacity(self.watermark_states.len());
@@ -557,10 +568,63 @@ impl crate::pipeline::PipelineCallback for ConnectorPipelineCallback {
         self.counters
             .last_cycle_duration_ns
             .store(elapsed_ns, std::sync::atomic::Ordering::Relaxed);
+
+        // Record to histogram for percentile tracking.
+        self.cycle_histogram
+            .borrow_mut()
+            .record(std::time::Duration::from_nanos(elapsed_ns));
+
+        // Update percentile atomics every 100 cycles to amortize sort cost.
+        let cycle_count = self
+            .counters
+            .cycles
+            .load(std::sync::atomic::Ordering::Relaxed);
+        if cycle_count.is_multiple_of(100) {
+            let (p50, p95, p99) = self.cycle_histogram.borrow().percentiles();
+            // DurationHistogram records in milliseconds; convert to nanoseconds.
+            self.counters
+                .cycle_p50_ns
+                .store(p50 * 1_000_000, std::sync::atomic::Ordering::Relaxed);
+            self.counters
+                .cycle_p95_ns
+                .store(p95 * 1_000_000, std::sync::atomic::Ordering::Relaxed);
+            self.counters
+                .cycle_p99_ns
+                .store(p99 * 1_000_000, std::sync::atomic::Ordering::Relaxed);
+        }
+    }
+
+    fn apply_control(&mut self, msg: crate::pipeline::ControlMsg) {
+        match msg {
+            crate::pipeline::ControlMsg::AddStream {
+                name,
+                sql,
+                emit_clause,
+                window_config,
+                order_config,
+            } => {
+                self.executor.add_query(
+                    name.clone(),
+                    sql,
+                    emit_clause,
+                    window_config,
+                    order_config,
+                );
+                tracing::info!(stream = %name, "Stream added via control channel");
+            }
+            crate::pipeline::ControlMsg::DropStream { name } => {
+                self.executor.remove_query(&name);
+                tracing::info!(stream = %name, "Stream removed via control channel");
+            }
+            crate::pipeline::ControlMsg::AddSourceSchema { name, schema } => {
+                self.executor.register_source_schema(name, schema);
+            }
+        }
     }
 
     async fn poll_tables(&mut self) {
         use laminar_connectors::reference::RefreshMode;
+        let _priority = PriorityGuard::enter(PriorityClass::BackgroundIo);
 
         for (name, source, mode) in &mut self.table_sources {
             if matches!(mode, RefreshMode::SnapshotOnly | RefreshMode::Manual) {

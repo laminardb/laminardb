@@ -22,9 +22,7 @@ use datafusion::prelude::SessionContext;
 use datafusion_common::ScalarValue;
 
 use laminar_core::operator::sliding_window::SlidingWindowAssigner;
-use laminar_core::operator::window::{
-    EmitStrategy as CoreEmitStrategy, TumblingWindowAssigner, WindowAssigner,
-};
+use laminar_core::operator::window::{TumblingWindowAssigner, WindowAssigner};
 use laminar_sql::parser::EmitClause;
 use laminar_sql::translator::{WindowOperatorConfig, WindowType};
 
@@ -120,11 +118,10 @@ pub(crate) struct CoreWindowState {
     pre_agg_sql: String,
     time_col_index: usize,
     output_schema: SchemaRef,
-    /// Converted emit strategy from SQL `EmitClause`.
-    #[allow(dead_code)]
-    emit_strategy: CoreEmitStrategy,
     having_sql: Option<String>,
     compiled_projection: Option<CompiledProjection>,
+    /// Cached optimized logical plan for the pre-agg SQL (multi-source queries).
+    cached_pre_agg_plan: Option<datafusion_expr::LogicalPlan>,
     having_filter: Option<Arc<dyn PhysicalExpr>>,
     max_groups_per_window: usize,
     /// Grace period (ms) after window end before closing. Late events
@@ -142,7 +139,7 @@ impl CoreWindowState {
         ctx: &SessionContext,
         sql: &str,
         window_config: &WindowOperatorConfig,
-        emit_clause: Option<&EmitClause>,
+        _emit_clause: Option<&EmitClause>,
     ) -> Result<Option<Self>, DbError> {
         let size_ms = i64::try_from(window_config.size.as_millis()).unwrap_or(i64::MAX);
 
@@ -596,11 +593,21 @@ impl CoreWindowState {
             None
         };
 
-        // Wire the SQL→Core emit strategy bridge
-        let emit_strategy = match emit_clause {
-            Some(ec) => crate::stream_executor::emit_clause_to_core(ec)
-                .unwrap_or(CoreEmitStrategy::OnWindowClose),
-            None => CoreEmitStrategy::OnWindowClose,
+        // ONE-TIME setup: cache the optimized logical plan for multi-source
+        // pre-agg queries. This ctx.sql() call runs ONLY at first-cycle
+        // initialization, never per-cycle. Fail fast if the pre-agg SQL is
+        // invalid — it would fail every cycle.
+        let cached_pre_agg_plan = if compiled_projection.is_none() {
+            match ctx.sql(&pre_agg_sql).await {
+                Ok(df) => Some(df.logical_plan().clone()),
+                Err(e) => {
+                    return Err(DbError::Pipeline(format!(
+                        "pre-agg SQL planning failed for windowed aggregate: {e}"
+                    )));
+                }
+            }
+        } else {
+            None
         };
 
         Ok(Some(Self {
@@ -614,9 +621,9 @@ impl CoreWindowState {
             pre_agg_sql,
             output_schema,
             time_col_index,
-            emit_strategy,
             having_sql,
             compiled_projection,
+            cached_pre_agg_plan,
             having_filter,
             max_groups_per_window: 1_000_000,
             allowed_lateness_ms: i64::try_from(window_config.allowed_lateness.as_millis())
@@ -1253,19 +1260,8 @@ impl CoreWindowState {
         Ok(result)
     }
 
-    /// Output schema for windowed aggregate results.
-    ///
-    /// Returns the post-projection schema when a post-aggregate projection
-    /// is present, otherwise the intermediate aggregate schema.
-    pub(crate) fn output_schema(&self) -> Arc<arrow::datatypes::Schema> {
-        if let Some(proj) = &self.post_projection {
-            Arc::clone(&proj.final_schema)
-        } else {
-            Arc::clone(&self.output_schema)
-        }
-    }
-
     /// Pre-aggregation SQL.
+    #[allow(dead_code)] // Accessed in tests and available for diagnostics.
     pub fn pre_agg_sql(&self) -> &str {
         &self.pre_agg_sql
     }
@@ -1285,6 +1281,11 @@ impl CoreWindowState {
         self.compiled_projection.as_ref()
     }
 
+    /// Cached optimized logical plan for the pre-agg SQL.
+    pub fn cached_pre_agg_plan(&self) -> Option<&datafusion_expr::LogicalPlan> {
+        self.cached_pre_agg_plan.as_ref()
+    }
+
     /// Compute a fingerprint for this query (SQL + schema).
     pub(crate) fn query_fingerprint(&self) -> u64 {
         query_fingerprint(&self.pre_agg_sql, &self.output_schema)
@@ -1297,6 +1298,52 @@ impl CoreWindowState {
             CoreWindowAssigner::Hopping(_) => "hopping",
             CoreWindowAssigner::Session { .. } => "session",
         }
+    }
+
+    /// Estimated memory usage in bytes across all windows and groups.
+    ///
+    /// For tumbling/hopping windows, iterates over `windows` (`BTreeMap` of
+    /// window-start to per-group accumulators). For session windows, iterates
+    /// over `session_groups`. Uses `ScalarValue::size()` for keys and
+    /// `Accumulator::size()` for accumulator state.
+    pub(crate) fn estimated_size_bytes(&self) -> usize {
+        let mut total = 0;
+        // Tumbling/hopping windows
+        for groups in self.windows.values() {
+            for (key, accs) in groups {
+                for sv in key {
+                    total += sv.size();
+                }
+                for acc in accs {
+                    total += acc.size();
+                }
+            }
+        }
+        // Session windows
+        for (key, group_state) in &self.session_groups {
+            for sv in key {
+                total += sv.size();
+            }
+            for session in group_state.sessions.values() {
+                for acc in &session.accs {
+                    total += acc.size();
+                }
+                // start/end timestamps: 2 × 8 bytes
+                total += 16;
+            }
+        }
+        total
+    }
+
+    /// Total number of distinct groups across all windows.
+    ///
+    /// For tumbling/hopping: sums group counts across all open windows.
+    /// For session: counts groups in `session_groups`.
+    #[allow(dead_code)]
+    pub(crate) fn group_count(&self) -> usize {
+        let windowed: usize = self.windows.values().map(|g| g.len()).sum();
+        let session = self.session_groups.len();
+        windowed + session
     }
 
     /// Checkpoint all per-window group states into a serializable struct.
@@ -1552,9 +1599,9 @@ mod tests {
             pre_agg_sql: String::new(),
             output_schema,
             time_col_index: 2,
-            emit_strategy: CoreEmit::OnWindowClose,
             having_sql: None,
             compiled_projection: None,
+            cached_pre_agg_plan: None,
             having_filter: None,
             max_groups_per_window: 1_000_000,
             allowed_lateness_ms: 0,
@@ -1608,9 +1655,9 @@ mod tests {
             pre_agg_sql: String::new(),
             output_schema,
             time_col_index: 2,
-            emit_strategy: CoreEmit::OnWindowClose,
             having_sql: None,
             compiled_projection: None,
+            cached_pre_agg_plan: None,
             having_filter: None,
             max_groups_per_window: 1_000_000,
             allowed_lateness_ms: 0,
@@ -1653,9 +1700,9 @@ mod tests {
             pre_agg_sql: String::new(),
             output_schema,
             time_col_index: 2,
-            emit_strategy: CoreEmit::OnWindowClose,
             having_sql: None,
             compiled_projection: None,
+            cached_pre_agg_plan: None,
             having_filter: None,
             max_groups_per_window: 1_000_000,
             allowed_lateness_ms: 0,
@@ -1696,9 +1743,9 @@ mod tests {
             pre_agg_sql: String::new(),
             output_schema,
             time_col_index: 2,
-            emit_strategy: CoreEmit::OnWindowClose,
             having_sql: None,
             compiled_projection: None,
+            cached_pre_agg_plan: None,
             having_filter: None,
             max_groups_per_window: 1_000_000,
             allowed_lateness_ms: 0,

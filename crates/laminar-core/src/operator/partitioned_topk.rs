@@ -370,7 +370,7 @@ impl Operator for PartitionedTopKOperator {
         }
     }
 
-    fn checkpoint(&self) -> OperatorState {
+    fn checkpoint(&mut self) -> OperatorState {
         let mut data = Vec::new();
 
         // Write partition count
@@ -402,6 +402,7 @@ impl Operator for PartitionedTopKOperator {
 
         OperatorState {
             operator_id: self.operator_id.clone(),
+            version: 1,
             data,
         }
     }

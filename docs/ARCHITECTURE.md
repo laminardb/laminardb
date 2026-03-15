@@ -9,66 +9,53 @@ LaminarDB is an embedded streaming database designed for sub-microsecond latency
 1. **Embedded First** -- Single binary, no external dependencies
 2. **Sub-Microsecond Latency** -- Minimal allocations on hot path
 3. **SQL Native** -- Full SQL support via Apache DataFusion
-4. **Thread-Per-Core** -- Linear scaling with CPU cores
-5. **Exactly-Once** -- End-to-end exactly-once semantics
-6. **Arrow-Native** -- Apache Arrow RecordBatch at every boundary
+4. **Exactly-Once** -- End-to-end exactly-once semantics
+5. **Arrow-Native** -- Apache Arrow RecordBatch at every boundary
 
-## Three-Ring Architecture
+## Architecture Overview
 
-Three concentric rings, each with different latency budgets:
+The system has a coordinator layer (SQL execution, compiled projections), a background I/O layer (WAL, checkpoints, connector I/O), and a control plane (admin API, metrics).
 
-```
+```text
 +------------------------------------------------------------------+
-|                        RING 0: HOT PATH                          |
-|  Constraints: Zero allocations, no locks, < 1us latency         |
-|                                                                  |
-|  +---------+  +---------+  +---------+  +---------+             |
-|  | Reactor |->|Operators|->|  State  |->|  Emit   |             |
-|  |  Loop   |  | (map,   |  |  Store  |  | (output)|             |
-|  |         |  | filter, |  | (lookup)|  |         |             |
-|  |         |  | window) |  |         |  |         |             |
-|  +---------+  +---------+  +---------+  +---------+             |
-|       |                                                          |
-|       | SPSC Queues (lock-free)                                  |
-|       v                                                          |
+|                     SOURCE CONNECTORS                             |
+|  Kafka, Postgres CDC, MySQL CDC, WebSocket, Files                |
+|  (tokio tasks, push RecordBatches via mpsc channels)             |
 +------------------------------------------------------------------+
-|                     RING 1: BACKGROUND                           |
-|  Constraints: Can allocate, async I/O, bounded latency impact   |
-|                                                                  |
-|  +---------+  +---------+  +---------+  +---------+             |
-|  |Checkpoint  |   WAL   |  |Compaction  |  Timer  |             |
-|  | Manager |  |  Writer |  |  Thread |  |  Wheel  |             |
-|  +---------+  +---------+  +---------+  +---------+             |
-|       |                                                          |
-|       | Channels (bounded)                                       |
-|       v                                                          |
+|                  STREAMING COORDINATOR                             |
+|  Single tokio task: SQL cycles, compiled projections,             |
+|  cached logical plans, checkpoint barriers                        |
+|  +-----------+ +-----------+ +-----------+ +-----------+         |
+|  | Compiled  | | Operators | |   State   | |   Sink    |         |
+|  | Projection| | (window,  | | (FxHashMap| |  Writers  |         |
+|  | / Cached  | |  join,    | |  per-group| |           |         |
+|  |   Plans   | |  filter)  | |  accum.)  | |           |         |
+|  +-----------+ +-----------+ +-----------+ +-----------+         |
 +------------------------------------------------------------------+
-|                     RING 2: CONTROL PLANE                        |
-|  Constraints: No latency requirements, full flexibility         |
-|                                                                  |
-|  +---------+  +---------+  +---------+  +---------+             |
-|  |  Admin  |  | Metrics |  |  Auth   |  |  Config |             |
-|  |   API   |  | Export  |  | Engine  |  | Manager |             |
-|  +---------+  +---------+  +---------+  +---------+             |
+|                     BACKGROUND I/O                                |
+|  Tokio async runtime, bounded latency impact                      |
+|  +-----------+ +-----------+ +-----------+ +-----------+         |
+|  | Checkpoint| |    WAL    | | Changelog | |   Timer   |         |
+|  |  Manager  | |   Writer  | |  Drainer  | |   Wheel   |         |
+|  +-----------+ +-----------+ +-----------+ +-----------+         |
++------------------------------------------------------------------+
+|                      CONTROL PLANE                                |
+|  +-----------+ +-----------+ +-----------+                       |
+|  |   Admin   | |  Metrics  | |   Config  |                      |
+|  |    API    | |   Export   | |  Manager  |                      |
+|  +-----------+ +-----------+ +-----------+                       |
 +------------------------------------------------------------------+
 ```
 
-### Ring 0: Hot Path
+### Streaming Coordinator (Hot Path)
 
-All code here runs on a CPU-pinned reactor thread.
+A single `StreamingCoordinator` tokio task receives batches from source connectors via `tokio::sync::mpsc`, executes SQL cycles via `PipelineCallback`, and delegates checkpoint barriers.
 
 **Components:**
-- **Reactor Loop** -- Single-threaded event loop that pulls batches from sources, runs them through operators, and emits results. CPU-pinned via the thread-per-core runtime (`laminar-core/src/tpc/`).
+- **StreamExecutor** -- Drives DataFusion SQL execution per cycle. Three optimization tiers: `CompiledProjection` (single-source non-aggregate queries compiled to `PhysicalExpr`), `IncrementalAggState` (incremental GROUP BY with per-group accumulators), and `CoreWindowState` (tumbling/hopping/session windows via optimized `CoreWindowAssigner`). Queries that don't match these tiers fall back to full DataFusion execution.
 - **Operators** -- Stateless transforms (map, filter, project) and stateful operators (tumbling/sliding/hopping/session windows, stream-stream joins, ASOF joins, temporal joins, lookup joins, lag/lead, ranking).
-- **State Store** -- AHashMap/FxHashMap-based in-memory store wrapped in `ChangelogAwareStore` for zero-allocation changelog capture (~2-5ns per mutation). Supports mmap-backed persistence. Ring 0 SQL operator routing (`core_window_state.rs`) directs tumbling/hopping/session window aggregates through optimized `CoreWindowAssigner` state instead of the generic DataFusion path.
-- **Emit** -- Pushes output RecordBatches to downstream streams and sinks via SPSC queues.
-
-**Constraints:**
-- No heap allocations (use bump/arena allocators; enforced by `allocation-tracking` feature)
-- No locks (SPSC queues for inter-ring communication)
-- No system calls on the fast path (io_uring for async I/O on Linux)
-- Predictable branching (likely/unlikely hints)
-- Task budget enforcement prevents any single operator from exceeding its time slice
+- **State** -- Operators hold state in internal `FxHashMap`s (per-group accumulators, window buffers, join buffers). Checkpointed via JSON serialization of `StreamExecutorCheckpoint`.
+- **Emit** -- Pushes output RecordBatches to downstream streams and sinks via mpsc channels.
 
 **Compiled query execution**: Non-aggregate single-source queries are compiled to `PhysicalExpr` projections on first execution, eliminating per-cycle SQL overhead. Complex queries cache their optimized logical plans.
 
@@ -78,51 +65,46 @@ All code here runs on a CPU-pinned reactor thread.
 
 **Cooperative scheduling**: DataFusion's cooperative scheduling integration marks `StreamingScanExec` as `NonCooperative` so the engine wraps it with budget-aware `CooperativeExec` automatically.
 
-**Structured error codes**: Every error carries a stable `LDB-NNNN` code (8 code ranges from general through internal). Ring 0 uses a zero-alloc `HotPathError` enum (2 bytes, `Copy`).
+**Structured error codes**: Every error carries a stable `LDB-NNNN` code (8 code ranges from general through internal). Hot-path errors use a zero-alloc `HotPathError` enum (2 bytes, `Copy`).
 
-### Ring 1: Background
+### Background I/O
 
-Durability and I/O, never blocking the hot path. Runs on Tokio.
+Durability and I/O, runs on Tokio async runtime.
 
 **Components:**
-- **Checkpoint Manager** -- Incremental checkpointing with directory-based snapshots. Unified `CheckpointCoordinator` orchestrates two-phase commit across all operators and sinks (`laminar-db/src/checkpoint_coordinator.rs`).
+- **Checkpoint Manager** -- Incremental checkpointing with directory-based snapshots. `CheckpointCoordinator` orchestrates two-phase commit across exactly-once sinks (`laminar-db/src/checkpoint_coordinator.rs`).
 - **WAL Writer** -- Per-core write-ahead log segments with CRC32C checksums, torn write detection, and fdatasync durability (`laminar-storage/src/per_core_wal/`).
-- **Changelog Drainer** -- Consumes changelog entries from Ring 0's SPSC queues and persists them (`laminar-storage/src/changelog_drainer.rs`).
+- **Changelog Drainer** -- Consumes changelog entries and persists them (`laminar-storage/src/changelog_drainer.rs`).
 - **Recovery Manager** -- Loads the latest checkpoint manifest and restores all operator state, connector offsets, and watermarks on startup (`laminar-db/src/recovery_manager.rs`).
-- **Connectors** -- External source/sink connectors (Kafka, CDC, Delta Lake, WebSocket) run as Tokio tasks in Ring 1.
+- **Connectors** -- External source/sink connectors (Kafka, CDC, Delta Lake, WebSocket) run as Tokio tasks.
 
-**Communication with Ring 0:**
-- SPSC queues for changelog entries and checkpoint barriers
-- Never blocks Ring 0 operations
-
-### Ring 2: Control Plane
+### Control Plane
 
 Admin and observability. No latency requirements.
 
-**Components (planned):**
+**Components:**
 - **Admin API** -- REST endpoints currently live in `laminar-server/src/http.rs`
-- **Metrics Export** -- Prometheus metrics and OpenTelemetry tracing (future)
-- **Auth Engine** -- JWT authentication, RBAC/ABAC authorization (future)
+- **Metrics Export** -- Prometheus metrics and OpenTelemetry tracing
 - **Config Manager** -- Dynamic configuration, connector registry
 
 ## Data Flow
 
 How an event moves through the system:
 
-```
-                         Ring 0 (< 1us)
+```text
+                    Streaming Coordinator (≈0.55–1.16µs per event for compiled queries)
                     +--------------------+
-  Source --> Ingest --> Window/Join/Agg --> Emit --> Subscribers
+  Source --> mpsc --> Window/Join/Agg --> Emit --> Subscribers
     |                       |                           |
     |                       v                           |
     |               +--------------+                    |
-    |               | State Store  |                    |
-    |               |  (AHashMap)  |                    |
+    |               | State (per-  |                    |
+    |               | group accum.)|                    |
     |               +------+-------+                    |
     |                      |                            |
-    |            Ring 1    | SPSC changelog              |
+    |          Background  | checkpoint                 |
     |            +---------v--------+                   |
-    |            |  WAL + Delta     |                   |
+    |            |  WAL + Directory |                   |
     |            |  Checkpoints     |                   |
     |            +------------------+                   |
     |                                                   |
@@ -131,18 +113,18 @@ How an event moves through the system:
 
 1. **Source ingestion**: Data arrives as Arrow RecordBatches via `SourceHandle::push()` or from external connectors (Kafka, PostgreSQL CDC, MySQL CDC, WebSocket).
 2. **Watermark tracking**: Each source maintains an `EventTimeExtractor` + `BoundedOutOfOrdernessGenerator` for watermark computation. Late rows are filtered. Watermarks can be per-partition, per-key, or aligned across sources.
-3. **Operator processing**: The reactor loop runs batches through the operator DAG (windows, joins, aggregations, filters). State mutations are captured by `ChangelogAwareStore`.
+3. **Operator processing**: The coordinator runs batches through SQL execution cycles (windows, joins, aggregations, filters). State is held in per-group accumulators and window buffers.
 4. **Emit**: Results are published to named streams. Subscribers receive RecordBatches via typed `TypedSubscription<T>` or callback subscriptions.
-5. **Durability**: Changelog entries flow via SPSC queues to Ring 1, which writes to WAL and periodically takes incremental checkpoints.
+5. **Durability**: Changelog entries flow to background I/O, which writes to WAL and periodically takes directory-based checkpoints.
 6. **Sink output**: External sinks (Kafka, PostgreSQL, Delta Lake, WebSocket) receive batches with exactly-once semantics via two-phase commit.
 
 ## Crate Map
 
-```
-laminar-core          Ring 0: reactor, operators, state stores, time/watermarks,
+```text
+laminar-core          Core: reactor, operators, state stores, time/watermarks,
                       streaming channels, DAG pipeline, subscriptions,
                       lookup tables, secondary indexes, cross-partition aggregation,
-                      checkpoint barriers, NUMA allocation, io_uring, task budgets
+                      checkpoint barriers, task budgets
                       |
 laminar-sql           SQL parser (streaming extensions), query planner,
                       DataFusion integration, operator config translators,
@@ -150,9 +132,9 @@ laminar-sql           SQL parser (streaming extensions), query planner,
                       streaming physical optimizer, watermark filter pushdown,
                       cooperative scheduling, PROCTIME() UDF
                       |
-laminar-storage       Ring 1: WAL, incremental checkpointing, per-core WAL segments,
-                      checkpoint manifest, checkpoint store, changelog drainer,
-                      io_uring WAL (Linux only)
+laminar-storage       Background I/O: WAL, incremental checkpointing, per-core WAL
+                      segments, checkpoint manifest, checkpoint store,
+                      changelog drainer
                       |
 laminar-connectors    Kafka source/sink, PostgreSQL CDC/sink, MySQL CDC,
                       WebSocket source/sink, Delta Lake sink/source, Iceberg sink,
@@ -164,7 +146,7 @@ laminar-db            Unified facade: LaminarDB struct, LaminarDbBuilder,
                       SQL execution, checkpoint coordination, recovery manager,
                       connector manager, pipeline observability, deployment profiles,
                       FFI API (C bindings, Arrow C Data Interface),
-                      Ring 0 SQL operator routing (core_window_state),
+                      SQL operator routing (core_window_state),
                       EOWC incremental window accumulators (eowc_state)
                       |
 laminar-derive        Proc macros: #[derive(Record, FromRecordBatch, FromRow, ConnectorConfig)]
@@ -228,7 +210,7 @@ let db = LaminarDB::builder()
 
 ### State Store
 
-All operator state goes through the `StateStore` trait. Wrapping it in `ChangelogAwareStore` captures every mutation for checkpointing:
+The `StateStore` trait provides key-value storage for DAG operators:
 
 ```rust
 pub trait StateStore: Send {
@@ -240,9 +222,11 @@ pub trait StateStore: Send {
 ```
 
 Implementations:
-- `InMemoryStateStore` -- AHashMap-based, used for Ring 0
-- `ChangelogAwareStore<S>` -- Wraps any StateStore, captures mutations at ~2-5ns overhead
-- Mmap-backed store for persistent state
+- `InMemoryStore` -- BTreeMap-based, used by DAG operators
+- `AHashMapStore` -- AHashMap-based, for fast key lookups
+- `MmapStateStore` -- Memory-mapped file backing for persistent state
+
+The production SQL execution path (`StreamExecutor`) holds state in internal FxHashMaps (per-group accumulators, window buffers) and checkpoints via JSON serialization. DAG operators that use `StateStore` are: `stream_join`, `session_window`, `sliding_window`, `window`.
 
 ### Streaming Channels
 
@@ -311,7 +295,7 @@ Pre-configured deployment tiers:
 |---------|-------------|
 | `InMemory` | Default. All state in memory, no durability. |
 | `Durable` | Object-store checkpoints for recovery. Requires `durable` feature. |
-| `Delta` | Full distributed mode with gossip, Raft, gRPC. Requires `delta` feature. |
+| `Delta` | Distributed scaffolding (gossip, Raft, gRPC stubs). Not production-ready. Requires `delta` feature. |
 
 ## Streaming SQL
 
@@ -350,43 +334,50 @@ Queries are planned by `StreamingPlanner` and executed via DataFusion, with comp
 
 See [BENCHMARKS.md](BENCHMARKS.md) for full benchmark baselines with hardware details.
 
-## Thread-Per-Core Model
+## Execution Model
 
-Each CPU core runs an independent reactor with its own:
-- Event loop (CPU-pinned)
-- State store partition
-- WAL segment
-- SPSC queues to Ring 1
+The thread-per-core model described in earlier documentation was removed in PR #204. The current execution model is a single `StreamingCoordinator` tokio task that:
 
-Key-based routing ensures all events for a given key are processed on the same core, avoiding cross-core synchronization. NUMA-aware memory allocation keeps data local to the processing core's memory node.
+1. Receives batches from source connectors via `tokio::sync::mpsc` channels
+2. Executes SQL cycles via `StreamExecutor` (compiled projections, incremental aggregations, DataFusion fallback)
+3. Manages checkpoint barriers for exactly-once semantics
+4. Routes results to sink connectors
 
-```
-+---+---+-----+  +---+---+-----+  +---+---+-----+
-|  Core 0     |  |  Core 1     |  |  Core 2     |
-| +---------+ |  | +---------+ |  | +---------+ |
-| | Reactor | |  | | Reactor | |  | | Reactor | |
-| |  Loop   | |  | |  Loop   | |  | |  Loop   | |
-| +----+----+ |  | +----+----+ |  | +----+----+ |
-| +----+----+ |  | +----+----+ |  | +----+----+ |
-| |  State  | |  | |  State  | |  | |  State  | |
-| |  Store  | |  | |  Store  | |  | |  Store  | |
-| +----+----+ |  | +----+----+ |  | +----+----+ |
-| +----+----+ |  | +----+----+ |  | +----+----+ |
-| |   WAL   | |  | |   WAL   | |  | |   WAL   | |
-| +---------+ |  | +---------+ |  | +---------+ |
-+---+---+-----+  +---+---+-----+  +---+---+-----+
-      |                |                |
-      +---- Key-based routing ----------+
-```
+### Two Execution Paths
+
+LaminarDB provides two **intentionally separate** execution paths for different use cases:
+
+| Aspect | SQL Path | DAG Path |
+|--------|----------|----------|
+| Entry | `StreamExecutor::execute_cycle()` | `DagExecutor::process_event()` |
+| Data unit | `RecordBatch` (micro-batch) | `Event` (per-event) |
+| State | `FxHashMap` in StreamExecutor fields | `Box<dyn StateStore>` in NodeRuntime |
+| Scheduling | Cycle budget (configurable) | Synchronous per-event |
+| Crate | `laminar-db` | `laminar-core` |
+| API | SQL (`CREATE STREAM AS SELECT ...`) | Rust (`DagBuilder::new().source()...build()`) |
+
+The SQL path is the production path for SQL users. The DAG path is a programmatic Rust API for custom operator pipelines, exercised by tests and benchmarks.
+
+**Coordinator → Executor relationship (SQL path):** `StreamingCoordinator` is the
+single tokio task that owns the event loop. It calls `PipelineCallback::execute_cycle()`,
+which delegates to `StreamExecutor::execute_cycle()`. These are **not** three competing
+loops — the coordinator drives the executor through a callback interface.
+
+### Deployment Model
+
+LaminarDB is a **single-node** embedded database. All operator state is keyed by
+operator index (position in the query DAG). Multi-node partitioning
+(VNode-scoped state, distributed barriers, partition migration) is deferred to
+a future phase.
 
 ## Exactly-Once Semantics
 
 Exactly-once processing works through:
 
 1. **Source offsets** -- Tracked per-source, persisted in checkpoint manifests
-2. **Changelog capture** -- `ChangelogAwareStore` records every state mutation
+2. **Barrier-based snapshots** -- `StreamingCoordinator` injects checkpoint barriers at sources; all sources align on the barrier before operator state is captured. Barriers flow between sources and the coordinator (not through the operator graph) in the production path. The DAG path (`dag/checkpoint.rs`) has true operator-level barrier alignment but is not the default execution path yet
 3. **WAL** -- Per-core WAL segments with CRC32C checksums and torn write detection
-4. **Incremental checkpoints** -- Directory-based snapshots of operator state
+4. **Incremental checkpoints** -- Directory-based snapshots of operator state (JSON-serialized `StreamExecutorCheckpoint`)
 5. **Two-phase commit** -- Coordinated across exactly-once sinks via `CheckpointCoordinator` (at-most-once sinks receive no pre_commit/commit guarantees)
 6. **Recovery** -- `RecoveryManager` restores from the latest checkpoint manifest, replays WAL entries, and resumes from committed offsets
 
@@ -394,11 +385,11 @@ Exactly-once processing works through:
 
 With the `delta` feature enabled, multi-node operation:
 
-- **Discovery** -- Static configuration, gossip-based (chitchat), or Kafka group discovery
+- **Discovery** -- Static configuration, gossip-based (chitchat), or Kafka group discovery. Discovery via chitchat gossip is implemented.
 - **Coordination** -- Raft-based metadata consensus via openraft
 - **Partition Ownership** -- Epoch-fenced partition guards with consistent assignment
 - **Distributed Checkpoints** -- Cross-node barrier coordination (planned; not yet implemented in checkpoint_coordinator)
 - **Cross-Node Aggregation** -- Gossip partial aggregates and gRPC fan-out
 - **Inter-Node RPC** -- gRPC service definitions for remote lookups, barrier forwarding, aggregate fan-out
 
-Distributed coordination runs in Ring 1 and Ring 2 — Ring 0's sub-500ns hot path is not affected.
+**Status**: Discovery and coordination are implemented but not yet production-hardened. Production hardening is planned for Phase 6c.

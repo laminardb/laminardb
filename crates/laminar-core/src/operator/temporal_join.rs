@@ -61,7 +61,6 @@
 
 use super::{
     Event, Operator, OperatorContext, OperatorError, OperatorState, Output, OutputVec, Timer,
-    TimerKey,
 };
 use arrow_array::{Array, ArrayRef, Int64Array, RecordBatch, StringArray};
 use arrow_schema::{DataType, Field, Schema, SchemaRef};
@@ -932,16 +931,6 @@ impl TemporalJoinOperator {
         None
     }
 
-    /// Creates a timer key for cleanup.
-    /// Reserved for future use when timer-based cleanup is implemented.
-    #[allow(dead_code)]
-    fn make_cleanup_timer_key(key_suffix: &[u8]) -> TimerKey {
-        let mut key = TimerKey::new();
-        key.push(TEMPORAL_TIMER_PREFIX);
-        key.extend_from_slice(key_suffix);
-        key
-    }
-
     /// Updates the output schema when both input schemas are known.
     fn update_output_schema(&mut self) {
         if let (Some(stream), Some(table)) = (&self.stream_schema, &self.table_schema) {
@@ -1033,7 +1022,7 @@ impl Operator for TemporalJoinOperator {
         OutputVec::new()
     }
 
-    fn checkpoint(&self) -> OperatorState {
+    fn checkpoint(&mut self) -> OperatorState {
         // Serialize table state
         let table_entries: Vec<(Vec<u8>, SerializableVersionedKeyState)> = self
             .table_state
@@ -1065,6 +1054,7 @@ impl Operator for TemporalJoinOperator {
 
         OperatorState {
             operator_id: self.operator_id.clone(),
+            version: 1,
             data,
         }
     }
@@ -1088,8 +1078,6 @@ impl Operator for TemporalJoinOperator {
             )));
         }
 
-        let archived = rkyv::access::<rkyv::Archived<CheckpointData>, RkyvError>(&state.data)
-            .map_err(|e| OperatorError::SerializationFailed(e.to_string()))?;
         let (
             watermark,
             stream_events,
@@ -1099,7 +1087,7 @@ impl Operator for TemporalJoinOperator {
             retractions,
             table_entries,
             stream_entries,
-        ) = rkyv::deserialize::<CheckpointData, RkyvError>(archived)
+        ) = rkyv::from_bytes::<CheckpointData, RkyvError>(&state.data)
             .map_err(|e| OperatorError::SerializationFailed(e.to_string()))?;
 
         self.watermark = watermark;

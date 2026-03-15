@@ -1,12 +1,12 @@
 //! Backpressure strategies for WebSocket connectors.
 //!
-//! When the internal Ring 0 bounded channel is full and cannot accept more
+//! When the internal bounded channel is full and cannot accept more
 //! messages from a WebSocket source, a `WsBackpressure` strategy determines
 //! what happens to incoming data.
 
 use serde::{Deserialize, Serialize};
 
-/// Strategy applied when the Ring 0 channel is full and cannot accept more messages.
+/// Strategy applied when the bounded channel is full and cannot accept more messages.
 ///
 /// WebSocket sources produce data at the rate of the remote sender. When the
 /// downstream processing pipeline cannot keep up, one of these strategies
@@ -16,7 +16,7 @@ use serde::{Deserialize, Serialize};
 /// - `Block`: fully implemented (TCP backpressure propagation)
 /// - `DropNewest`: implemented in `source.rs` via `try_send`
 /// - `DropOldest`, `Buffer`, `Sample`: parsed from SQL WITH, fall back to
-///   `DropNewest` behavior with a debug log. Full dispatch planned for Phase 6c.
+///   `DropNewest` behavior with a debug log.
 #[derive(Debug, Clone, Default, Serialize, Deserialize)]
 pub enum WsBackpressure {
     /// Block WS read -- TCP backpressure propagates to sender.

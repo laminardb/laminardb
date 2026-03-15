@@ -278,6 +278,41 @@ async fn prometheus_metrics(State(state): State<Arc<AppState>>) -> impl IntoResp
     lines.push(format!("laminardb_stream_count {}", metrics.stream_count));
     lines.push(format!("laminardb_sink_count {}", metrics.sink_count));
 
+    // Checkpoint metrics
+    let snap = state.db.counters().snapshot();
+    lines.push(format!(
+        "laminardb_checkpoints_completed_total {}",
+        snap.checkpoints_completed
+    ));
+    lines.push(format!(
+        "laminardb_checkpoints_failed_total {}",
+        snap.checkpoints_failed
+    ));
+    lines.push(format!(
+        "laminardb_checkpoint_epoch {}",
+        snap.checkpoint_epoch
+    ));
+    if snap.last_checkpoint_duration_ms > 0 {
+        lines.push(format!(
+            "laminardb_checkpoint_last_duration_ms {}",
+            snap.last_checkpoint_duration_ms
+        ));
+    }
+
+    // Cycle duration percentiles
+    lines.push(format!(
+        "laminardb_cycle_duration_p50_ns {}",
+        snap.cycle_p50_ns
+    ));
+    lines.push(format!(
+        "laminardb_cycle_duration_p95_ns {}",
+        snap.cycle_p95_ns
+    ));
+    lines.push(format!(
+        "laminardb_cycle_duration_p99_ns {}",
+        snap.cycle_p99_ns
+    ));
+
     let reload_total = state.reload_total.load(Ordering::Relaxed);
     let reload_last_ts = state.reload_last_ts.load(Ordering::Relaxed);
     lines.push(format!("laminardb_reload_total {reload_total}"));

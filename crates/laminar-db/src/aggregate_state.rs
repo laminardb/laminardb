@@ -307,17 +307,17 @@ pub(crate) struct EowcStateCheckpoint {
     pub windows: Vec<WindowCheckpoint>,
 }
 
-/// Serializable checkpoint for join state (e.g., future stateful joins).
+/// Serializable checkpoint for join state.
 ///
 /// Currently ASOF and temporal joins are stateless per-cycle, so this is
-/// empty. The struct provides the extension point for future stateful
-/// streaming joins (e.g., interval joins with buffer windows).
+/// empty. The struct provides the extension point for stateful streaming
+/// joins (e.g., interval joins with buffer windows).
 #[derive(Clone, serde::Serialize, serde::Deserialize, Default)]
 pub(crate) struct JoinStateCheckpoint {
-    /// Number of buffered left-side rows (for future stateful joins).
+    /// Number of buffered left-side rows.
     #[serde(default)]
     pub left_buffer_rows: u64,
-    /// Number of buffered right-side rows (for future stateful joins).
+    /// Number of buffered right-side rows.
     #[serde(default)]
     pub right_buffer_rows: u64,
     /// Serialized join buffer state (opaque bytes).
@@ -356,6 +356,13 @@ pub(crate) struct StreamExecutorCheckpoint {
     #[serde(default)]
     pub raw_eowc_states: FxHashMap<String, RawEowcCheckpoint>,
 }
+
+// Compile-time assertion: StreamExecutorCheckpoint must be Send
+// so it can be offloaded to spawn_blocking for serialization.
+const _: () = {
+    const fn assert_send<T: Send>() {}
+    assert_send::<StreamExecutorCheckpoint>();
+};
 
 /// Checkpoint for raw-batch EOWC state (non-aggregate EOWC queries).
 ///
@@ -452,11 +459,18 @@ pub(crate) struct IncrementalAggState {
     /// Aggregate function specifications.
     agg_specs: Vec<AggFuncSpec>,
     /// Per-group accumulator state.
+    ///
+    /// `DataFusion` `Accumulator` is trait-object dispatched (~2ns vtable overhead).
+    /// Acceptable because each call processes a batch, not per-row. 50+
+    /// aggregate types preclude enum dispatch.
     groups: AHashMap<Vec<ScalarValue>, Vec<Box<dyn datafusion_expr::Accumulator>>>,
     /// Output schema (group columns + aggregate results).
     output_schema: SchemaRef,
     /// Compiled pre-agg projection (single-source queries only).
     compiled_projection: Option<CompiledProjection>,
+    /// Cached optimized logical plan for the pre-agg SQL (multi-source queries).
+    /// Skips SQL parsing and logical optimization on subsequent cycles.
+    cached_pre_agg_plan: Option<LogicalPlan>,
     /// Compiled HAVING predicate.
     having_filter: Option<Arc<dyn PhysicalExpr>>,
     /// HAVING predicate SQL fallback (when compiled filter is not available).
@@ -810,6 +824,24 @@ impl IncrementalAggState {
             None
         };
 
+        // ONE-TIME setup: cache the optimized logical plan for multi-source
+        // pre-agg queries (when compiled projection is not available). This
+        // ctx.sql() call runs ONLY at first-cycle initialization, never
+        // per-cycle. Subsequent cycles use the cached plan directly.
+        // Fail fast if the pre-agg SQL is invalid — it would fail every cycle.
+        let cached_pre_agg_plan = if compiled_projection.is_none() {
+            match ctx.sql(&pre_agg_sql).await {
+                Ok(df) => Some(df.logical_plan().clone()),
+                Err(e) => {
+                    return Err(DbError::Pipeline(format!(
+                        "pre-agg SQL planning failed for aggregate: {e}"
+                    )));
+                }
+            }
+        } else {
+            None
+        };
+
         Ok(Some(Self {
             pre_agg_sql,
             num_group_cols,
@@ -819,6 +851,7 @@ impl IncrementalAggState {
             groups: AHashMap::new(),
             output_schema,
             compiled_projection,
+            cached_pre_agg_plan,
             having_filter,
             having_sql,
             max_groups: 1_000_000,
@@ -1022,12 +1055,8 @@ impl IncrementalAggState {
         Ok(vec![batch])
     }
 
-    /// Output schema (group columns + aggregate results).
-    pub(crate) fn output_schema(&self) -> Arc<Schema> {
-        Arc::clone(&self.output_schema)
-    }
-
     /// Pre-aggregation SQL.
+    #[allow(dead_code)] // Accessed in tests and available for diagnostics.
     pub fn pre_agg_sql(&self) -> &str {
         &self.pre_agg_sql
     }
@@ -1047,9 +1076,40 @@ impl IncrementalAggState {
         self.compiled_projection.as_ref()
     }
 
+    /// Cached optimized logical plan for the pre-agg SQL.
+    ///
+    /// Present only for multi-source queries (where `compiled_projection` is
+    /// `None`). Allows skipping SQL parsing and logical optimization per cycle.
+    pub fn cached_pre_agg_plan(&self) -> Option<&LogicalPlan> {
+        self.cached_pre_agg_plan.as_ref()
+    }
+
     /// Compute a fingerprint for this query (SQL + schema).
     pub(crate) fn query_fingerprint(&self) -> u64 {
         query_fingerprint(&self.pre_agg_sql, &self.output_schema)
+    }
+
+    /// Estimated memory usage in bytes across all groups.
+    ///
+    /// Sums `ScalarValue::size()` for each group key element and
+    /// `Accumulator::size()` for each per-group accumulator.
+    pub(crate) fn estimated_size_bytes(&self) -> usize {
+        let mut total = 0;
+        for (key, accs) in &self.groups {
+            for sv in key {
+                total += sv.size();
+            }
+            for acc in accs {
+                total += acc.size();
+            }
+        }
+        total
+    }
+
+    /// Number of distinct groups currently tracked.
+    #[allow(dead_code)]
+    pub(crate) fn group_count(&self) -> usize {
+        self.groups.len()
     }
 
     /// Checkpoint all group states into a serializable struct.
@@ -2920,7 +2980,7 @@ mod tests {
         laminar_sql::register_streaming_functions(&ctx);
         let mut executor = StreamExecutor::new(ctx);
         // No queries registered = no state
-        let result = executor.checkpoint_state().unwrap();
+        let result = executor.snapshot_state().unwrap();
         assert!(result.is_none());
     }
 

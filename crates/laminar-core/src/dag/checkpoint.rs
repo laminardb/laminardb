@@ -62,7 +62,7 @@ pub struct DagCheckpointConfig {
     pub barrier_type: BarrierType,
     /// Maximum time to wait for barrier alignment at fan-in nodes.
     pub alignment_timeout: Duration,
-    /// Whether to use incremental checkpoints (future use).
+    /// Whether to use incremental checkpoints.
     pub incremental: bool,
     /// Maximum number of concurrent in-flight checkpoints.
     pub max_concurrent: usize,

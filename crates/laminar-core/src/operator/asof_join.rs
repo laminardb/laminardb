@@ -875,7 +875,7 @@ impl Operator for AsofJoinOperator {
         OutputVec::new()
     }
 
-    fn checkpoint(&self) -> OperatorState {
+    fn checkpoint(&mut self) -> OperatorState {
         let mut keys_dropped: u64 = 0;
         let mut state_entries: Vec<(Vec<u8>, SerializableKeyState)> =
             Vec::with_capacity(self.right_state.len());
@@ -918,6 +918,7 @@ impl Operator for AsofJoinOperator {
 
         OperatorState {
             operator_id: self.operator_id.clone(),
+            version: 1,
             data,
         }
     }
@@ -939,10 +940,15 @@ impl Operator for AsofJoinOperator {
             )));
         }
 
-        let archived = rkyv::access::<rkyv::Archived<CheckpointData>, RkyvError>(&state.data)
-            .map_err(|e| OperatorError::SerializationFailed(e.to_string()))?;
+        if state.version != 1 {
+            return Err(OperatorError::ConfigError(format!(
+                "unsupported checkpoint version {} for AsofJoinOperator, expected 1",
+                state.version
+            )));
+        }
+
         let (watermark, left_events, right_events, matches, unmatched_left, state_entries) =
-            rkyv::deserialize::<CheckpointData, RkyvError>(archived)
+            rkyv::from_bytes::<CheckpointData, RkyvError>(&state.data)
                 .map_err(|e| OperatorError::SerializationFailed(e.to_string()))?;
 
         self.watermark = watermark;

@@ -5,6 +5,10 @@
 //! Lives in Ring 2 (control plane). Reuses the existing
 //! `DagCheckpointCoordinator` for barrier logic.
 //!
+//! The checkpoint manifest is the source of truth for source offsets.
+//! Kafka broker commits are advisory (for monitoring tools). On recovery,
+//! offsets restore from manifest, not consumer group state.
+//!
 //! ## Checkpoint Cycle
 //!
 //! 1. Barrier propagation — `dag_coordinator.trigger_checkpoint()`
@@ -1298,12 +1302,18 @@ pub struct DurationHistogram {
     count: u64,
 }
 
+impl Default for DurationHistogram {
+    fn default() -> Self {
+        Self::new()
+    }
+}
+
 impl DurationHistogram {
     const CAPACITY: usize = 100;
 
     /// Creates an empty histogram.
     #[must_use]
-    fn new() -> Self {
+    pub fn new() -> Self {
         Self {
             samples: Box::new([0; Self::CAPACITY]),
             cursor: 0,
@@ -1312,7 +1322,7 @@ impl DurationHistogram {
     }
 
     /// Records a checkpoint duration.
-    fn record(&mut self, duration: Duration) {
+    pub fn record(&mut self, duration: Duration) {
         #[allow(clippy::cast_possible_truncation)]
         let ms = duration.as_millis() as u64;
         self.samples[self.cursor] = ms;
@@ -1320,9 +1330,15 @@ impl DurationHistogram {
         self.count += 1;
     }
 
+    /// Returns `true` if no samples have been recorded.
+    #[must_use]
+    pub fn is_empty(&self) -> bool {
+        self.count == 0
+    }
+
     /// Returns the number of recorded samples (up to `CAPACITY`).
     #[must_use]
-    fn len(&self) -> usize {
+    pub fn len(&self) -> usize {
         if self.count >= Self::CAPACITY as u64 {
             Self::CAPACITY
         } else {
@@ -1338,7 +1354,7 @@ impl DurationHistogram {
     ///
     /// Returns 0 if no samples have been recorded.
     #[must_use]
-    fn percentile(&self, p: f64) -> u64 {
+    pub fn percentile(&self, p: f64) -> u64 {
         let n = self.len();
         if n == 0 {
             return 0;
@@ -1356,7 +1372,7 @@ impl DurationHistogram {
 
     /// Returns (p50, p95, p99) in milliseconds.
     #[must_use]
-    fn percentiles(&self) -> (u64, u64, u64) {
+    pub fn percentiles(&self) -> (u64, u64, u64) {
         (
             self.percentile(0.50),
             self.percentile(0.95),
@@ -1424,56 +1440,6 @@ pub fn connector_to_source_checkpoint(cp: &ConnectorCheckpoint) -> SourceCheckpo
         source_cp.set_metadata(k.clone(), v.clone());
     }
     source_cp
-}
-
-// ── DAG operator state conversion helpers ──
-
-/// Converts DAG operator states (from `DagCheckpointSnapshot`) to manifest format.
-///
-/// Uses `"{node_id}"` as the key and base64-encodes the state data.
-#[must_use]
-pub fn dag_snapshot_to_manifest_operators<S: std::hash::BuildHasher>(
-    node_states: &std::collections::HashMap<
-        u32,
-        laminar_core::dag::recovery::SerializableOperatorState,
-        S,
-    >,
-) -> HashMap<String, laminar_storage::checkpoint_manifest::OperatorCheckpoint> {
-    node_states
-        .iter()
-        .map(|(id, state)| {
-            (
-                id.to_string(),
-                laminar_storage::checkpoint_manifest::OperatorCheckpoint::inline(&state.data),
-            )
-        })
-        .collect()
-}
-
-/// Converts manifest operator states back to DAG format for recovery.
-///
-/// Parses string keys as node IDs and decodes base64 state data.
-#[must_use]
-pub fn manifest_operators_to_dag_states<S: std::hash::BuildHasher>(
-    operators: &HashMap<String, laminar_storage::checkpoint_manifest::OperatorCheckpoint, S>,
-) -> rustc_hash::FxHashMap<laminar_core::dag::topology::NodeId, laminar_core::operator::OperatorState>
-{
-    let mut states =
-        rustc_hash::FxHashMap::with_capacity_and_hasher(operators.len(), rustc_hash::FxBuildHasher);
-    for (key, op_ckpt) in operators {
-        if let Ok(node_id) = key.parse::<u32>() {
-            if let Some(data) = op_ckpt.decode_inline() {
-                states.insert(
-                    laminar_core::dag::topology::NodeId(node_id),
-                    laminar_core::operator::OperatorState {
-                        operator_id: key.clone(),
-                        data,
-                    },
-                );
-            }
-        }
-    }
-    states
 }
 
 #[cfg(test)]
@@ -1664,103 +1630,6 @@ mod tests {
         let debug = format!("{coord:?}");
         assert!(debug.contains("CheckpointCoordinator"));
         assert!(debug.contains("epoch: 1"));
-    }
-
-    // ── Operator state persistence tests ──
-
-    #[test]
-    fn test_dag_snapshot_to_manifest_operators() {
-        use laminar_core::dag::recovery::SerializableOperatorState;
-
-        let mut node_states = HashMap::new();
-        node_states.insert(
-            0,
-            SerializableOperatorState {
-                operator_id: "window-agg".into(),
-                data: b"window-state".to_vec(),
-            },
-        );
-        node_states.insert(
-            3,
-            SerializableOperatorState {
-                operator_id: "filter".into(),
-                data: b"filter-state".to_vec(),
-            },
-        );
-
-        let manifest_ops = dag_snapshot_to_manifest_operators(&node_states);
-        assert_eq!(manifest_ops.len(), 2);
-
-        let w = manifest_ops.get("0").unwrap();
-        assert_eq!(w.decode_inline().unwrap(), b"window-state");
-        let f = manifest_ops.get("3").unwrap();
-        assert_eq!(f.decode_inline().unwrap(), b"filter-state");
-    }
-
-    #[test]
-    fn test_manifest_operators_to_dag_states() {
-        use laminar_storage::checkpoint_manifest::OperatorCheckpoint;
-
-        let mut operators = HashMap::new();
-        operators.insert("0".into(), OperatorCheckpoint::inline(b"state-0"));
-        operators.insert("5".into(), OperatorCheckpoint::inline(b"state-5"));
-
-        let dag_states = manifest_operators_to_dag_states(&operators);
-        assert_eq!(dag_states.len(), 2);
-
-        let s0 = dag_states
-            .get(&laminar_core::dag::topology::NodeId(0))
-            .unwrap();
-        assert_eq!(s0.data, b"state-0");
-
-        let s5 = dag_states
-            .get(&laminar_core::dag::topology::NodeId(5))
-            .unwrap();
-        assert_eq!(s5.data, b"state-5");
-    }
-
-    #[test]
-    fn test_operator_state_round_trip_through_manifest() {
-        use laminar_core::dag::recovery::SerializableOperatorState;
-
-        // Original DAG states
-        let mut node_states = HashMap::new();
-        node_states.insert(
-            7,
-            SerializableOperatorState {
-                operator_id: "join".into(),
-                data: vec![1, 2, 3, 4, 5],
-            },
-        );
-
-        // DAG → manifest
-        let manifest_ops = dag_snapshot_to_manifest_operators(&node_states);
-
-        // Persist and reload (simulate)
-        let json = serde_json::to_string(&manifest_ops).unwrap();
-        let reloaded: HashMap<String, laminar_storage::checkpoint_manifest::OperatorCheckpoint> =
-            serde_json::from_str(&json).unwrap();
-
-        // Manifest → DAG
-        let recovered = manifest_operators_to_dag_states(&reloaded);
-        let state = recovered
-            .get(&laminar_core::dag::topology::NodeId(7))
-            .unwrap();
-        assert_eq!(state.data, vec![1, 2, 3, 4, 5]);
-    }
-
-    #[test]
-    fn test_manifest_operators_skips_invalid_keys() {
-        use laminar_storage::checkpoint_manifest::OperatorCheckpoint;
-
-        let mut operators = HashMap::new();
-        operators.insert("not-a-number".into(), OperatorCheckpoint::inline(b"data"));
-        operators.insert("42".into(), OperatorCheckpoint::inline(b"good"));
-
-        let dag_states = manifest_operators_to_dag_states(&operators);
-        // Only the numeric key should survive
-        assert_eq!(dag_states.len(), 1);
-        assert!(dag_states.contains_key(&laminar_core::dag::topology::NodeId(42)));
     }
 
     // ── WAL checkpoint coordination tests ──

@@ -302,6 +302,9 @@ pub trait StateStoreExt: StateStore {
             return Ok(None);
         };
 
+        // SAFETY: put_typed() serializes with AlignedVec (line 322 below).
+        // Bytes::copy_from_slice preserves the aligned data. bytecheck validates
+        // on access; misalignment returns Err, not UB.
         let archived = rkyv::access::<T::Archived, RkyvError>(data)
             .map_err(|e| StateError::Serialization(e.to_string()))?;
         let value = rkyv::deserialize::<T, RkyvError>(archived)

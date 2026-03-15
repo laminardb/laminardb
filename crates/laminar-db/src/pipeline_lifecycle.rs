@@ -250,7 +250,9 @@ impl LaminarDB {
         let ctx = laminar_sql::create_session_context();
         laminar_sql::register_streaming_functions(&ctx);
         let mut executor = StreamExecutor::new(ctx);
+        executor.set_max_state_bytes(self.config.max_state_bytes_per_operator);
         executor.set_lookup_registry(Arc::clone(&self.lookup_registry));
+        executor.set_counters(Arc::clone(&self.counters));
 
         // Register source schemas for ALL sources (both external connectors
         // and catalog-bridge sources) so the executor can create empty
@@ -782,6 +784,10 @@ impl LaminarDB {
             },
             barrier_alignment_timeout: std::time::Duration::from_secs(30),
             delivery_guarantee: self.config.delivery_guarantee,
+            cycle_budget_ns: 10_000_000,     // 10ms
+            drain_budget_ns: 1_000_000,      // 1ms
+            query_budget_ns: 8_000_000,      // 8ms
+            background_budget_ns: 5_000_000, // 5ms
         };
 
         // Validate delivery guarantee constraints.
@@ -831,8 +837,15 @@ impl LaminarDB {
 
         // Build the PipelineCallback implementation that bridges to db.rs internals.
         let counters = Arc::clone(&self.counters);
+        // Mirror the configured per-operator state cap into the counters
+        // so the /metrics endpoint can report the enforced limit.
+        if let Some(cap) = self.config.max_state_bytes_per_operator {
+            #[allow(clippy::cast_possible_truncation)]
+            counters
+                .max_state_bytes
+                .store(cap as u64, std::sync::atomic::Ordering::Relaxed);
+        }
         let pipeline_watermark = Arc::clone(&self.pipeline_watermark);
-        let checkpoint_in_progress = Arc::new(std::sync::atomic::AtomicBool::new(false));
         let coordinator = Arc::clone(&self.coordinator);
         let table_store_for_loop = self.table_store.clone();
         // Compute a pipeline hash for change detection across checkpoints.
@@ -852,6 +865,9 @@ impl LaminarDB {
             Some(hasher.finish())
         };
 
+        // Wire per-query budget from pipeline config.
+        executor.set_query_budget_ns(pipeline_config.query_budget_ns);
+
         let callback = crate::pipeline_callback::ConnectorPipelineCallback {
             executor,
             stream_sources,
@@ -862,7 +878,6 @@ impl LaminarDB {
             tracker,
             counters,
             pipeline_watermark,
-            checkpoint_in_progress,
             coordinator,
             table_sources,
             table_store: table_store_for_loop,
@@ -878,19 +893,73 @@ impl LaminarDB {
                 .map(std::time::Duration::from_millis),
             pipeline_hash,
             delivery_guarantee: pipeline_config.delivery_guarantee,
+            cycle_histogram: std::cell::RefCell::new(
+                crate::checkpoint_coordinator::DurationHistogram::new(),
+            ),
         };
 
-        // Start the streaming coordinator (sources push directly via mpsc).
+        // Start the streaming coordinator on a dedicated compute thread.
+        // Source tasks were already spawned on the main tokio runtime in
+        // StreamingCoordinator::new(). The coordinator communicates with
+        // them via tokio::sync::mpsc which works across runtimes.
         {
+            // Control channel for live DDL (add/drop stream).
+            let (control_tx, control_rx) =
+                tokio::sync::mpsc::channel::<crate::pipeline::ControlMsg>(64);
+            *self.control_tx.lock() = Some(control_tx);
+
             let coordinator = crate::pipeline::StreamingCoordinator::new(
                 sources,
                 pipeline_config,
                 Arc::clone(&shutdown),
+                control_rx,
             )
             .await?;
 
+            let (done_tx, done_rx) = tokio::sync::oneshot::channel::<()>();
+            let (startup_tx, startup_rx) = tokio::sync::oneshot::channel::<Result<(), String>>();
+            match std::thread::Builder::new()
+                .name("laminar-compute".into())
+                .spawn(move || {
+                    let rt = match tokio::runtime::Builder::new_current_thread()
+                        .enable_all()
+                        .build()
+                    {
+                        Ok(rt) => {
+                            let _ = startup_tx.send(Ok(()));
+                            rt
+                        }
+                        Err(e) => {
+                            let _ = startup_tx.send(Err(format!("compute runtime: {e}")));
+                            return;
+                        }
+                    };
+                    rt.block_on(async move {
+                        coordinator.run(callback).await;
+                    });
+                    let _ = done_tx.send(());
+                }) {
+                Ok(_) => {}
+                Err(e) => {
+                    return Err(DbError::Config(format!(
+                        "failed to spawn compute thread: {e}"
+                    )));
+                }
+            }
+
+            // Wait for the thread to confirm the runtime started.
+            match startup_rx.await {
+                Ok(Ok(())) => {}
+                Ok(Err(e)) => return Err(DbError::Config(e)),
+                Err(_) => {
+                    return Err(DbError::Config(
+                        "compute thread exited before starting runtime".into(),
+                    ));
+                }
+            }
+
             let handle = tokio::spawn(async move {
-                coordinator.run(Box::new(callback)).await;
+                let _ = done_rx.await;
             });
 
             *self.runtime_handle.lock() = Some(handle);
