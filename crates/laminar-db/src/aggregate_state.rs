@@ -823,10 +823,15 @@ impl IncrementalAggState {
         // Cache the optimized logical plan for multi-source pre-agg queries
         // (when compiled projection is not available). This skips SQL parsing
         // and logical optimization on subsequent cycles.
+        // Fail fast if the pre-agg SQL is invalid — it would fail every cycle.
         let cached_pre_agg_plan = if compiled_projection.is_none() {
             match ctx.sql(&pre_agg_sql).await {
                 Ok(df) => Some(df.logical_plan().clone()),
-                Err(_) => None,
+                Err(e) => {
+                    return Err(DbError::Pipeline(format!(
+                        "pre-agg SQL planning failed for aggregate: {e}"
+                    )));
+                }
             }
         } else {
             None

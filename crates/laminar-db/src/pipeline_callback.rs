@@ -362,6 +362,9 @@ impl crate::pipeline::PipelineCallback for ConnectorPipelineCallback {
 
         // Capture stream executor aggregate state: snapshot (sync), then
         // offload serialization to spawn_blocking to free the tokio worker.
+        // Abort the checkpoint if serialization fails — persisting source
+        // offsets without matching operator state would cause data loss on
+        // recovery (offsets advance past unreplayable state).
         let mut operator_states = HashMap::with_capacity(2);
         match self.executor.snapshot_state() {
             Ok(Some(cp)) => {
@@ -374,16 +377,19 @@ impl crate::pipeline::PipelineCallback for ConnectorPipelineCallback {
                         operator_states.insert("stream_executor".to_string(), bytes);
                     }
                     Ok(Err(e)) => {
-                        tracing::warn!(error = %e, "Stream executor checkpoint serialization failed");
+                        tracing::warn!(error = %e, "Stream executor checkpoint serialization failed — skipping checkpoint");
+                        return false;
                     }
                     Err(e) => {
-                        tracing::warn!(error = %e, "Stream executor checkpoint spawn_blocking failed");
+                        tracing::warn!(error = %e, "Stream executor checkpoint spawn_blocking failed — skipping checkpoint");
+                        return false;
                     }
                 }
             }
             Ok(None) => {}
             Err(e) => {
-                tracing::warn!(error = %e, "Stream executor checkpoint capture failed");
+                tracing::warn!(error = %e, "Stream executor checkpoint capture failed — skipping checkpoint");
+                return false;
             }
         }
 
@@ -503,6 +509,9 @@ impl crate::pipeline::PipelineCallback for ConnectorPipelineCallback {
         // Capture stream executor aggregate state — now consistent because
         // all pre-barrier data has been executed. Offload serialization to
         // spawn_blocking to free the tokio worker during JSON encoding.
+        // Abort the checkpoint if serialization fails — persisting source
+        // offsets without matching operator state would cause data loss on
+        // recovery.
         let mut operator_states = HashMap::with_capacity(2);
         match self.executor.snapshot_state() {
             Ok(Some(cp)) => {
@@ -515,16 +524,19 @@ impl crate::pipeline::PipelineCallback for ConnectorPipelineCallback {
                         operator_states.insert("stream_executor".to_string(), bytes);
                     }
                     Ok(Err(e)) => {
-                        tracing::warn!(error = %e, "Stream executor checkpoint serialization failed");
+                        tracing::warn!(error = %e, "Stream executor checkpoint serialization failed — skipping barrier checkpoint");
+                        return false;
                     }
                     Err(e) => {
-                        tracing::warn!(error = %e, "Stream executor checkpoint spawn_blocking failed");
+                        tracing::warn!(error = %e, "Stream executor checkpoint spawn_blocking failed — skipping barrier checkpoint");
+                        return false;
                     }
                 }
             }
             Ok(None) => {}
             Err(e) => {
-                tracing::warn!(error = %e, "Stream executor checkpoint capture failed");
+                tracing::warn!(error = %e, "Stream executor checkpoint capture failed — skipping barrier checkpoint");
+                return false;
             }
         }
 

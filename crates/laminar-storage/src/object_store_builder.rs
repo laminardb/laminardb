@@ -105,7 +105,9 @@ fn build_local_file_system(url: &str) -> Result<Arc<dyn ObjectStore>, ObjectStor
 
 /// Strip the leading `/` that precedes a Windows drive letter.
 ///
-/// `"/C:/foo"` → `"C:/foo"`, `"/path/to"` (Unix) → `"/path/to"` (unchanged).
+/// `"/C:/foo"` → `"C:/foo"`. Only active on Windows; on other platforms
+/// the path is returned unchanged.
+#[cfg(windows)]
 fn strip_windows_leading_slash(path: &str) -> &str {
     let bytes = path.as_bytes();
     // Pattern: `/X:/...` where X is an ASCII letter
@@ -114,6 +116,12 @@ fn strip_windows_leading_slash(path: &str) -> &str {
     } else {
         path
     }
+}
+
+/// No-op on non-Windows platforms — the leading slash is the valid root.
+#[cfg(not(windows))]
+fn strip_windows_leading_slash(path: &str) -> &str {
+    path
 }
 
 // ---------------------------------------------------------------------------
@@ -294,13 +302,14 @@ mod tests {
     }
 
     #[test]
+    #[cfg(windows)]
     fn test_strip_windows_leading_slash() {
-        // Windows drive letter patterns
+        // Windows drive letter patterns — slash stripped
         assert_eq!(strip_windows_leading_slash("/C:/foo"), "C:/foo");
         assert_eq!(strip_windows_leading_slash("/D:/"), "D:/");
         assert_eq!(strip_windows_leading_slash("/c:/bar"), "c:/bar");
 
-        // Unix paths — no change
+        // Non-drive paths — no change
         assert_eq!(strip_windows_leading_slash("/path/to"), "/path/to");
         assert_eq!(strip_windows_leading_slash("/tmp"), "/tmp");
 
@@ -308,5 +317,14 @@ mod tests {
         assert_eq!(strip_windows_leading_slash("/"), "/");
         assert_eq!(strip_windows_leading_slash(""), "");
         assert_eq!(strip_windows_leading_slash("C:/foo"), "C:/foo");
+    }
+
+    #[test]
+    #[cfg(not(windows))]
+    fn test_strip_windows_leading_slash() {
+        // On non-Windows, all paths are returned unchanged
+        assert_eq!(strip_windows_leading_slash("/C:/foo"), "/C:/foo");
+        assert_eq!(strip_windows_leading_slash("/path/to"), "/path/to");
+        assert_eq!(strip_windows_leading_slash(""), "");
     }
 }

@@ -905,19 +905,46 @@ impl LaminarDB {
             .await?;
 
             let (done_tx, done_rx) = tokio::sync::oneshot::channel::<()>();
-            std::thread::Builder::new()
+            let (startup_tx, startup_rx) = tokio::sync::oneshot::channel::<Result<(), String>>();
+            match std::thread::Builder::new()
                 .name("laminar-compute".into())
                 .spawn(move || {
-                    let rt = tokio::runtime::Builder::new_current_thread()
+                    let rt = match tokio::runtime::Builder::new_current_thread()
                         .enable_all()
                         .build()
-                        .expect("compute runtime");
+                    {
+                        Ok(rt) => {
+                            let _ = startup_tx.send(Ok(()));
+                            rt
+                        }
+                        Err(e) => {
+                            let _ = startup_tx.send(Err(format!("compute runtime: {e}")));
+                            return;
+                        }
+                    };
                     rt.block_on(async move {
                         coordinator.run(callback).await;
                     });
                     let _ = done_tx.send(());
-                })
-                .expect("spawn compute thread");
+                }) {
+                Ok(_) => {}
+                Err(e) => {
+                    return Err(DbError::Config(format!(
+                        "failed to spawn compute thread: {e}"
+                    )));
+                }
+            }
+
+            // Wait for the thread to confirm the runtime started.
+            match startup_rx.await {
+                Ok(Ok(())) => {}
+                Ok(Err(e)) => return Err(DbError::Config(e)),
+                Err(_) => {
+                    return Err(DbError::Config(
+                        "compute thread exited before starting runtime".into(),
+                    ));
+                }
+            }
 
             let handle = tokio::spawn(async move {
                 let _ = done_rx.await;
