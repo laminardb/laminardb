@@ -956,7 +956,7 @@ where
         output
     }
 
-    fn checkpoint(&self) -> OperatorState {
+    fn checkpoint(&mut self) -> OperatorState {
         // Serialize pending timers: (session_id, timer_time, key_hash)
         let timer_entries: Vec<(u64, i64, u64)> = self
             .pending_timers
@@ -974,6 +974,7 @@ where
 
         OperatorState {
             operator_id: self.operator_id.clone(),
+            version: 1,
             data,
         }
     }
@@ -984,6 +985,12 @@ where
                 "Operator ID mismatch: expected {}, got {}",
                 self.operator_id, state.operator_id
             )));
+        }
+
+        if state.version != 1 {
+            return Err(OperatorError::ConfigError(
+                format!("unsupported state version {}, expected 1", state.version)
+            ));
         }
 
         if state.data.is_empty() {

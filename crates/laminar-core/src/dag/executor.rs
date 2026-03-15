@@ -446,9 +446,9 @@ impl DagExecutor {
     /// Returns a map of `NodeId` to `OperatorState` for all nodes
     /// that have registered operators.
     #[must_use]
-    pub fn checkpoint(&self) -> FxHashMap<NodeId, OperatorState> {
+    pub fn checkpoint(&mut self) -> FxHashMap<NodeId, OperatorState> {
         let mut states = FxHashMap::default();
-        for (idx, op) in self.operators.iter().enumerate() {
+        for (idx, op) in self.operators.iter_mut().enumerate() {
             if let Some(operator) = op {
                 #[allow(clippy::cast_possible_truncation)]
                 // DAG node count bounded by topology (< u32::MAX)
@@ -530,7 +530,7 @@ impl DagExecutor {
         for &node_id in &self.execution_order {
             let idx = node_id.0 as usize;
             if idx < self.slot_count {
-                if let Some(ref operator) = self.operators[idx] {
+                if let Some(ref mut operator) = self.operators[idx] {
                     states.insert(node_id, operator.checkpoint());
                 }
             }

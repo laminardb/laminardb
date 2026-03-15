@@ -250,6 +250,7 @@ impl LaminarDB {
         let ctx = laminar_sql::create_session_context();
         laminar_sql::register_streaming_functions(&ctx);
         let mut executor = StreamExecutor::new(ctx);
+        executor.set_max_state_bytes(self.config.max_state_bytes_per_operator);
         executor.set_lookup_registry(Arc::clone(&self.lookup_registry));
 
         // Register source schemas for ALL sources (both external connectors
@@ -269,6 +270,128 @@ impl LaminarDB {
                 reg.window_config.clone(),
                 reg.order_config.clone(),
             );
+        }
+
+        // DAG lowering: attempt to lower aggregate queries into a DagExecutor.
+        // When use_dag_lowering is enabled, lowered queries are routed through
+        // the DAG at runtime; otherwise the DAG is built but not used.
+        #[allow(clippy::type_complexity)]
+        let (
+            dag_executor,
+            dag_query_names,
+            dag_source_node_ids,
+            dag_sink_to_query,
+            dag_pre_agg_sql,
+        ): (
+            Option<laminar_core::dag::DagExecutor>,
+            rustc_hash::FxHashSet<Arc<str>>,
+            FxHashMap<Arc<str>, laminar_core::dag::NodeId>,
+            FxHashMap<laminar_core::dag::NodeId, Arc<str>>,
+            FxHashMap<Arc<str>, String>,
+        ) = {
+            use crate::sql_lowering::{build_query_dag, try_lower_query, LoweredQuery};
+            use crate::stream_executor::extract_table_references;
+
+            let mut lowered = Vec::new();
+            for reg in stream_regs.values() {
+                let source_tables: Vec<String> =
+                    extract_table_references(&reg.query_sql)
+                        .into_iter()
+                        .collect();
+                match try_lower_query(
+                    executor.session_context(),
+                    &reg.name,
+                    &reg.query_sql,
+                    source_tables,
+                    reg.window_config.as_ref(),
+                    reg.emit_clause.as_ref(),
+                )
+                .await
+                {
+                    Ok(lq) => lowered.push((reg.name.clone(), lq)),
+                    Err(e) => {
+                        tracing::debug!(
+                            query = %reg.name,
+                            error = %e,
+                            "DAG lowering failed, query stays on StreamExecutor path"
+                        );
+                    }
+                }
+            }
+
+            // Build source schemas for the DAG
+            let source_schemas: Vec<(&str, Arc<arrow::datatypes::Schema>)> = source_regs
+                .keys()
+                .filter_map(|name| {
+                    self.catalog
+                        .get_source(name)
+                        .map(|entry| (name.as_str(), entry.schema.clone()))
+                })
+                .collect();
+
+            if let Some((dag, operators)) = build_query_dag(&source_schemas, &mut lowered) {
+                let mut exec = laminar_core::dag::DagExecutor::from_dag(&dag);
+                let mut names: rustc_hash::FxHashSet<Arc<str>> =
+                    rustc_hash::FxHashSet::default();
+                for (node_id, operator) in operators {
+                    exec.register_operator(node_id, operator);
+                }
+                // Track which queries were lowered, and collect pre-agg SQL
+                let mut pre_agg_sql: FxHashMap<Arc<str>, String> = FxHashMap::default();
+                for (qname, lq) in &lowered {
+                    match lq {
+                        LoweredQuery::Aggregate {
+                            pre_agg_sql: sql, ..
+                        }
+                        | LoweredQuery::WindowedAggregate {
+                            pre_agg_sql: sql, ..
+                        } => {
+                            let arc_name = Arc::from(qname.as_str());
+                            names.insert(Arc::clone(&arc_name));
+                            pre_agg_sql.insert(arc_name, sql.clone());
+                        }
+                        LoweredQuery::Fallback => {}
+                    }
+                }
+                // Map source names to DAG node IDs
+                let mut source_nodes: FxHashMap<Arc<str>, laminar_core::dag::NodeId> =
+                    FxHashMap::default();
+                for (name, _) in &source_schemas {
+                    if let Some(node_id) = dag.node_id_by_name(name) {
+                        source_nodes.insert(Arc::from(*name), node_id);
+                    }
+                }
+                // Map sink node IDs to query names
+                let mut sink_map: FxHashMap<laminar_core::dag::NodeId, Arc<str>> =
+                    FxHashMap::default();
+                for qname in &names {
+                    let sink_name = format!("sink_{qname}");
+                    if let Some(sink_id) = dag.node_id_by_name(&sink_name) {
+                        sink_map.insert(sink_id, Arc::clone(qname));
+                    }
+                }
+                tracing::info!(
+                    lowered_queries = names.len(),
+                    source_nodes = source_nodes.len(),
+                    "DAG lowering complete"
+                );
+                (Some(exec), names, source_nodes, sink_map, pre_agg_sql)
+            } else {
+                tracing::debug!("No queries lowered to DAG");
+                (
+                    None,
+                    rustc_hash::FxHashSet::default(),
+                    FxHashMap::default(),
+                    FxHashMap::default(),
+                    FxHashMap::default(),
+                )
+            }
+        };
+
+        // When DAG lowering is active, mark lowered queries as skipped in
+        // the StreamExecutor so they are not double-processed.
+        if self.config.use_dag_lowering && !dag_query_names.is_empty() {
+            executor.skip_queries(&dag_query_names);
         }
 
         // Register temporal join tables as Versioned in the lookup registry
@@ -878,6 +1001,13 @@ impl LaminarDB {
                 .map(std::time::Duration::from_millis),
             pipeline_hash,
             delivery_guarantee: pipeline_config.delivery_guarantee,
+            dag_executor,
+            dag_query_names,
+            dag_source_node_ids,
+            dag_sink_to_query,
+            dag_pre_agg_sql,
+            use_dag_lowering: self.config.use_dag_lowering,
+            cycle_histogram: std::cell::RefCell::new(crate::checkpoint_coordinator::DurationHistogram::new()),
         };
 
         // Start the streaming coordinator (sources push directly via mpsc).

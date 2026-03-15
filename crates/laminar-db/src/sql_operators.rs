@@ -77,20 +77,38 @@ impl Operator for AggregateAdapter {
         OutputVec::new()
     }
 
-    fn checkpoint(&self) -> OperatorState {
-        // checkpoint_groups takes &mut self because Accumulator::state() is &mut.
-        // We need interior mutability or accept a clone cost here.
-        // For now, return empty state — the stream_executor checkpoint path
-        // handles the actual persistence. This will be wired fully in Phase D.
-        OperatorState {
-            operator_id: self.operator_id.clone(),
-            data: Vec::new(),
+    fn checkpoint(&mut self) -> OperatorState {
+        match self.state.checkpoint_groups() {
+            Ok(cp) => {
+                let data = serde_json::to_vec(&cp).unwrap_or_default();
+                OperatorState {
+                    operator_id: self.operator_id.clone(),
+                    version: 1,
+                    data,
+                }
+            }
+            Err(e) => {
+                tracing::warn!(op = %self.operator_id, error = %e, "aggregate checkpoint failed");
+                OperatorState {
+                    operator_id: self.operator_id.clone(),
+                    version: 1,
+                    data: Vec::new(),
+                }
+            }
         }
     }
 
-    fn restore(&mut self, _state: OperatorState) -> Result<(), OperatorError> {
-        // Restore is handled by the checkpoint coordinator in Phase D.
-        Ok(())
+    fn restore(&mut self, state: OperatorState) -> Result<(), OperatorError> {
+        if state.data.is_empty() {
+            return Ok(());
+        }
+        let cp: crate::aggregate_state::AggStateCheckpoint =
+            serde_json::from_slice(&state.data).map_err(|e| {
+                OperatorError::SerializationFailed(format!("aggregate restore: {e}"))
+            })?;
+        self.state.restore_groups(&cp).map(|_| ()).map_err(|e| {
+            OperatorError::StateAccessFailed(format!("aggregate restore: {e}"))
+        })
     }
 }
 
@@ -159,16 +177,38 @@ impl Operator for WindowAggAdapter {
         outputs
     }
 
-    fn checkpoint(&self) -> OperatorState {
-        // Same as AggregateAdapter — full checkpoint wiring in Phase D.
-        OperatorState {
-            operator_id: self.operator_id.clone(),
-            data: Vec::new(),
+    fn checkpoint(&mut self) -> OperatorState {
+        match self.state.checkpoint_windows() {
+            Ok(cp) => {
+                let data = serde_json::to_vec(&cp).unwrap_or_default();
+                OperatorState {
+                    operator_id: self.operator_id.clone(),
+                    version: 1,
+                    data,
+                }
+            }
+            Err(e) => {
+                tracing::warn!(op = %self.operator_id, error = %e, "window checkpoint failed");
+                OperatorState {
+                    operator_id: self.operator_id.clone(),
+                    version: 1,
+                    data: Vec::new(),
+                }
+            }
         }
     }
 
-    fn restore(&mut self, _state: OperatorState) -> Result<(), OperatorError> {
-        Ok(())
+    fn restore(&mut self, state: OperatorState) -> Result<(), OperatorError> {
+        if state.data.is_empty() {
+            return Ok(());
+        }
+        let cp: crate::core_window_state::CoreWindowCheckpoint =
+            serde_json::from_slice(&state.data).map_err(|e| {
+                OperatorError::SerializationFailed(format!("window restore: {e}"))
+            })?;
+        self.state.restore_windows(&cp).map(|_| ()).map_err(|e| {
+            OperatorError::StateAccessFailed(format!("window restore: {e}"))
+        })
     }
 }
 
@@ -227,9 +267,10 @@ impl Operator for ProjectionAdapter {
         OutputVec::new()
     }
 
-    fn checkpoint(&self) -> OperatorState {
+    fn checkpoint(&mut self) -> OperatorState {
         OperatorState {
             operator_id: self.operator_id.clone(),
+            version: 1,
             data: Vec::new(),
         }
     }

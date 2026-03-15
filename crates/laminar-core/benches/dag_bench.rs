@@ -52,9 +52,10 @@ impl Operator for PassthroughOperator {
         smallvec::smallvec![]
     }
 
-    fn checkpoint(&self) -> OperatorState {
+    fn checkpoint(&mut self) -> OperatorState {
         OperatorState {
             operator_id: self.id.clone(),
+            version: 1,
             data: vec![],
         }
     }
@@ -571,6 +572,7 @@ fn bench_recovery(c: &mut Criterion) {
                                 node_id.0,
                                 SerializableOperatorState {
                                     operator_id: name,
+                                    version: 1,
                                     data: vec![0xABu8; state_bytes_per_node],
                                 },
                             );

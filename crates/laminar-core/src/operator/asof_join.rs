@@ -875,7 +875,7 @@ impl Operator for AsofJoinOperator {
         OutputVec::new()
     }
 
-    fn checkpoint(&self) -> OperatorState {
+    fn checkpoint(&mut self) -> OperatorState {
         let mut keys_dropped: u64 = 0;
         let mut state_entries: Vec<(Vec<u8>, SerializableKeyState)> =
             Vec::with_capacity(self.right_state.len());
@@ -918,6 +918,7 @@ impl Operator for AsofJoinOperator {
 
         OperatorState {
             operator_id: self.operator_id.clone(),
+            version: 1,
             data,
         }
     }

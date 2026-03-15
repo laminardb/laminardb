@@ -83,6 +83,18 @@ pub struct LaminarConfig {
     pub tiering: Option<TieringConfig>,
     /// End-to-end delivery guarantee (default: at-least-once).
     pub delivery_guarantee: DeliveryGuarantee,
+    /// Route lowerable queries through the DAG executor (default: false).
+    ///
+    /// When enabled, aggregate and windowed-aggregate queries are lowered
+    /// to a `DagExecutor` at pipeline startup. Non-lowerable queries
+    /// (simple SELECT, ASOF JOIN, etc.) remain on the `StreamExecutor` path.
+    pub use_dag_lowering: bool,
+    /// Maximum state bytes per operator before the query fails (`None` = unlimited).
+    ///
+    /// When set, the executor checks each aggregate/window operator's estimated
+    /// memory usage after every processing cycle. At 80% of the limit a warning
+    /// is emitted; at 100% the query returns an error.
+    pub max_state_bytes_per_operator: Option<usize>,
 }
 
 impl Default for LaminarConfig {
@@ -97,6 +109,8 @@ impl Default for LaminarConfig {
             object_store_options: HashMap::new(),
             tiering: None,
             delivery_guarantee: DeliveryGuarantee::default(),
+            use_dag_lowering: false,
+            max_state_bytes_per_operator: None,
         }
     }
 }

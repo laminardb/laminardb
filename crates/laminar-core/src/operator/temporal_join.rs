@@ -1033,7 +1033,7 @@ impl Operator for TemporalJoinOperator {
         OutputVec::new()
     }
 
-    fn checkpoint(&self) -> OperatorState {
+    fn checkpoint(&mut self) -> OperatorState {
         // Serialize table state
         let table_entries: Vec<(Vec<u8>, SerializableVersionedKeyState)> = self
             .table_state
@@ -1065,6 +1065,7 @@ impl Operator for TemporalJoinOperator {
 
         OperatorState {
             operator_id: self.operator_id.clone(),
+            version: 1,
             data,
         }
     }

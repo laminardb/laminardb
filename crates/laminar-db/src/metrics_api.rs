@@ -168,6 +168,24 @@ impl LaminarDB {
         self.catalog.list_sinks().len()
     }
 
+    /// Returns cycle duration percentiles from atomic counters (non-blocking).
+    ///
+    /// Returns (`p50_ns`, `p95_ns`, `p99_ns`).
+    #[must_use]
+    pub fn cycle_duration_percentiles(&self) -> (u64, u64, u64) {
+        let snap = self.counters.snapshot();
+        (snap.cycle_p50_ns, snap.cycle_p95_ns, snap.cycle_p99_ns)
+    }
+
+    /// Returns checkpoint statistics if available (non-blocking).
+    ///
+    /// Uses `try_lock()` on the coordinator mutex. Returns `None` if
+    /// the coordinator is not initialized or the lock is contended.
+    pub fn checkpoint_stats_nonblocking(&self) -> Option<crate::checkpoint_coordinator::CheckpointStats> {
+        let guard = self.coordinator.try_lock().ok()?;
+        guard.as_ref().map(crate::checkpoint_coordinator::CheckpointCoordinator::stats)
+    }
+
     /// Get the number of active queries.
     pub fn active_query_count(&self) -> usize {
         self.catalog

@@ -2177,7 +2177,7 @@ impl Operator for StreamJoinOperator {
         }
     }
 
-    fn checkpoint(&self) -> OperatorState {
+    fn checkpoint(&mut self) -> OperatorState {
         // Checkpoint the metrics, configuration, and optimization state
         // Use nested tuples to stay within rkyv's tuple size limit (max 12)
         // Format: ((config), (core_metrics), (f057_metrics, side_stats))
@@ -2217,6 +2217,7 @@ impl Operator for StreamJoinOperator {
 
         OperatorState {
             operator_id: self.operator_id.clone(),
+            version: 1,
             data,
         }
     }

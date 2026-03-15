@@ -46,9 +46,10 @@ impl Operator for PassthroughOperator {
         smallvec::smallvec![]
     }
 
-    fn checkpoint(&self) -> OperatorState {
+    fn checkpoint(&mut self) -> OperatorState {
         OperatorState {
             operator_id: self.id.clone(),
+            version: 1,
             data: vec![],
         }
     }
@@ -76,9 +77,10 @@ impl Operator for StatefulCounterOperator {
         smallvec::smallvec![]
     }
 
-    fn checkpoint(&self) -> OperatorState {
+    fn checkpoint(&mut self) -> OperatorState {
         OperatorState {
             operator_id: self.id.clone(),
+            version: 1,
             data: self.count.to_le_bytes().to_vec(),
         }
     }

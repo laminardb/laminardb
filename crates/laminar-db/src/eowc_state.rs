@@ -778,6 +778,31 @@ impl IncrementalEowcState {
         crate::aggregate_state::query_fingerprint(&self.pre_agg_sql, &self.output_schema)
     }
 
+    /// Estimated memory usage in bytes across all windows and groups.
+    ///
+    /// Iterates over every open window and its per-group accumulators, summing
+    /// `ScalarValue::size()` for keys and `Accumulator::size()` for state.
+    pub(crate) fn estimated_size_bytes(&self) -> usize {
+        let mut total = 0;
+        for groups in self.windows.values() {
+            for (key, accs) in groups {
+                for sv in key {
+                    total += sv.size();
+                }
+                for acc in accs {
+                    total += acc.size();
+                }
+            }
+        }
+        total
+    }
+
+    /// Total number of distinct groups across all open windows.
+    #[allow(dead_code)]
+    pub(crate) fn group_count(&self) -> usize {
+        self.windows.values().map(|g| g.len()).sum()
+    }
+
     /// Checkpoint all per-window group states into a serializable struct.
     pub(crate) fn checkpoint_windows(&mut self) -> Result<EowcStateCheckpoint, DbError> {
         use crate::aggregate_state::{scalar_to_json, GroupCheckpoint, WindowCheckpoint};

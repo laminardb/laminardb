@@ -357,6 +357,13 @@ pub(crate) struct StreamExecutorCheckpoint {
     pub raw_eowc_states: FxHashMap<String, RawEowcCheckpoint>,
 }
 
+// Compile-time assertion: StreamExecutorCheckpoint must be Send
+// so it can be offloaded to spawn_blocking for serialization.
+const _: () = {
+    const fn assert_send<T: Send>() {}
+    assert_send::<StreamExecutorCheckpoint>();
+};
+
 /// Checkpoint for raw-batch EOWC state (non-aggregate EOWC queries).
 ///
 /// Stores accumulated `RecordBatch` data as Arrow IPC bytes plus
@@ -1050,6 +1057,29 @@ impl IncrementalAggState {
     /// Compute a fingerprint for this query (SQL + schema).
     pub(crate) fn query_fingerprint(&self) -> u64 {
         query_fingerprint(&self.pre_agg_sql, &self.output_schema)
+    }
+
+    /// Estimated memory usage in bytes across all groups.
+    ///
+    /// Sums `ScalarValue::size()` for each group key element and
+    /// `Accumulator::size()` for each per-group accumulator.
+    pub(crate) fn estimated_size_bytes(&self) -> usize {
+        let mut total = 0;
+        for (key, accs) in &self.groups {
+            for sv in key {
+                total += sv.size();
+            }
+            for acc in accs {
+                total += acc.size();
+            }
+        }
+        total
+    }
+
+    /// Number of distinct groups currently tracked.
+    #[allow(dead_code)]
+    pub(crate) fn group_count(&self) -> usize {
+        self.groups.len()
     }
 
     /// Checkpoint all group states into a serializable struct.
@@ -2920,7 +2950,7 @@ mod tests {
         laminar_sql::register_streaming_functions(&ctx);
         let mut executor = StreamExecutor::new(ctx);
         // No queries registered = no state
-        let result = executor.checkpoint_state().unwrap();
+        let result = executor.snapshot_state().unwrap();
         assert!(result.is_none());
     }
 

@@ -25,6 +25,8 @@ use super::topology::NodeId;
 pub struct SerializableOperatorState {
     /// Operator identifier.
     pub operator_id: String,
+    /// State format version.
+    pub version: u32,
     /// Serialized state data.
     pub data: Vec<u8>,
 }
@@ -33,6 +35,7 @@ impl From<OperatorState> for SerializableOperatorState {
     fn from(state: OperatorState) -> Self {
         Self {
             operator_id: state.operator_id,
+            version: state.version,
             data: state.data,
         }
     }
@@ -42,6 +45,7 @@ impl From<SerializableOperatorState> for OperatorState {
     fn from(state: SerializableOperatorState) -> Self {
         Self {
             operator_id: state.operator_id,
+            version: state.version,
             data: state.data,
         }
     }

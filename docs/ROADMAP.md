@@ -60,7 +60,7 @@ LaminarDB development is organized into phases, each building on the previous. D
 **Goal**: Harden the engine with advanced window types, joins, per-core WAL, exactly-once sinks, and performance infrastructure.
 
 **Completed Features (38/38):**
-- Thread-per-core architecture with CPU pinning (F013-F015)
+- Thread-per-core architecture with CPU pinning (F013-F015) (superseded by StreamingCoordinator, PR #204)
 - Sliding, hopping, and session windows with merge support (F016-F018)
 - Stream-stream, lookup, temporal, and ASOF joins (F019-F021, F056-F057)
 - Incremental checkpointing and per-core WAL (F022, F062)
@@ -68,7 +68,7 @@ LaminarDB development is organized into phases, each building on the previous. D
 - FIRST/LAST aggregates, cascading materialized views (F059-F060)
 - EMIT clause extension, changelog/retraction Z-sets (F011B, F063)
 - Per-partition, keyed, and alignment group watermarks (F064-F066)
-- io_uring optimization, NUMA-aware memory (F067-F068)
+- io_uring optimization, NUMA-aware memory (F067-F068) (feature-gated, not enabled in default builds)
 - Three-ring I/O architecture, task budget enforcement (F069-F070)
 - Zero-allocation enforcement, zero-allocation polling (F071, F073)
 - XDP/eBPF network optimization (F072)

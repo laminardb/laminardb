@@ -49,7 +49,7 @@ enum SourceMsg {
 
 /// Handle to a running source I/O task.
 struct SourceHandle {
-    name: String,
+    name: Arc<str>,
     shutdown: Arc<tokio::sync::Notify>,
     join: tokio::task::JoinHandle<()>,
     checkpoint_rx: tokio::sync::watch::Receiver<SourceCheckpoint>,
@@ -68,7 +68,7 @@ pub struct StreamingCoordinator {
     /// Handles to source tasks (for shutdown + checkpoint queries).
     source_handles: Vec<SourceHandle>,
     /// Source name cache indexed by `source_idx`.
-    source_names: Vec<String>,
+    source_names: Vec<Arc<str>>,
     /// Shutdown signal.
     shutdown: Arc<tokio::sync::Notify>,
     /// Pending barrier alignment.
@@ -80,7 +80,7 @@ pub struct StreamingCoordinator {
     /// Source-initiated checkpoint request flags.
     checkpoint_request_flags: Vec<Arc<AtomicBool>>,
     /// Pre-allocated source batches buffer (cleared per cycle).
-    source_batches_buf: FxHashMap<String, Vec<RecordBatch>>,
+    source_batches_buf: FxHashMap<Arc<str>, Vec<RecordBatch>>,
 }
 
 /// Tracks in-flight checkpoint barrier alignment.
@@ -272,14 +272,15 @@ impl StreamingCoordinator {
                 }
             });
 
+            let arc_name: Arc<str> = Arc::from(src.name.as_str());
             source_handles.push(SourceHandle {
-                name: src.name.clone(),
+                name: Arc::clone(&arc_name),
                 shutdown: task_shutdown,
                 join,
                 checkpoint_rx: cp_rx,
                 barrier_injector,
             });
-            source_names.push(src.name);
+            source_names.push(arc_name);
         }
 
         Ok(Self {
@@ -413,7 +414,7 @@ impl StreamingCoordinator {
                     }
                     if let Some(filtered) = callback.filter_late_rows(name, &batch) {
                         self.source_batches_buf
-                            .entry(name.clone())
+                            .entry(Arc::clone(name))
                             .or_default()
                             .push(filtered);
                     }
@@ -449,7 +450,7 @@ impl StreamingCoordinator {
                 .clone();
             self.pending_barrier
                 .source_checkpoints
-                .insert(name.clone(), cp);
+                .insert(name.to_string(), cp);
         }
 
         self.pending_barrier.sources_aligned.insert(source_idx);
@@ -528,7 +529,7 @@ mod tests {
     /// Minimal mock callback for testing the coordinator loop.
     struct MockCallback {
         cycle_count: u32,
-        results: Vec<FxHashMap<String, Vec<RecordBatch>>>,
+        results: Vec<FxHashMap<Arc<str>, Vec<RecordBatch>>>,
         watermark: i64,
     }
 
@@ -546,12 +547,12 @@ mod tests {
     impl PipelineCallback for MockCallback {
         async fn execute_cycle(
             &mut self,
-            source_batches: &FxHashMap<String, Vec<RecordBatch>>,
+            source_batches: &FxHashMap<Arc<str>, Vec<RecordBatch>>,
             _watermark: i64,
-        ) -> Result<FxHashMap<String, Vec<RecordBatch>>, String> {
+        ) -> Result<FxHashMap<Arc<str>, Vec<RecordBatch>>, String> {
             self.cycle_count += 1;
             // Pass through source batches as results.
-            let results: FxHashMap<String, Vec<RecordBatch>> = source_batches
+            let results: FxHashMap<Arc<str>, Vec<RecordBatch>> = source_batches
                 .iter()
                 .map(|(k, v)| (k.clone(), v.clone()))
                 .collect();
@@ -559,8 +560,8 @@ mod tests {
             Ok(results)
         }
 
-        fn push_to_streams(&self, _results: &FxHashMap<String, Vec<RecordBatch>>) {}
-        async fn write_to_sinks(&mut self, _results: &FxHashMap<String, Vec<RecordBatch>>) {}
+        fn push_to_streams(&self, _results: &FxHashMap<Arc<str>, Vec<RecordBatch>>) {}
+        async fn write_to_sinks(&mut self, _results: &FxHashMap<Arc<str>, Vec<RecordBatch>>) {}
 
         fn extract_watermark(&mut self, _source_name: &str, batch: &RecordBatch) {
             // Use row count as a simple watermark proxy.
@@ -616,7 +617,7 @@ mod tests {
             },
             rx,
             source_handles: Vec::new(),
-            source_names: vec!["test_source".to_string()],
+            source_names: vec![Arc::from("test_source")],
             shutdown: Arc::clone(&shutdown),
             pending_barrier: PendingBarrier::new(),
             next_checkpoint_id: 1,

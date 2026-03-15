@@ -65,13 +65,30 @@ pub(crate) struct ConnectorPipelineCallback {
     pub(crate) checkpoint_interval: Option<std::time::Duration>,
     pub(crate) pipeline_hash: Option<u64>,
     pub(crate) delivery_guarantee: laminar_connectors::connector::DeliveryGuarantee,
+    /// DAG executor for lowered queries (`None` if no queries were lowered or DAG lowering is disabled).
+    /// Used by Phase 7b when `use_dag_lowering` is enabled.
+    pub(crate) dag_executor: Option<laminar_core::dag::DagExecutor>,
+    /// Query names that were successfully lowered to the DAG (used in checkpoint path).
+    #[allow(dead_code)]
+    pub(crate) dag_query_names: rustc_hash::FxHashSet<Arc<str>>,
+    /// DAG source node IDs per source name.
+    pub(crate) dag_source_node_ids: FxHashMap<Arc<str>, laminar_core::dag::NodeId>,
+    /// DAG sink node ID → query name mapping (for output routing).
+    pub(crate) dag_sink_to_query: FxHashMap<laminar_core::dag::NodeId, Arc<str>>,
+    /// Pre-aggregation SQL per DAG-handled query name (reserved for future pre-agg routing).
+    #[allow(dead_code)]
+    pub(crate) dag_pre_agg_sql: FxHashMap<Arc<str>, String>,
+    /// Whether DAG lowering is active for this pipeline.
+    pub(crate) use_dag_lowering: bool,
+    /// Cycle duration histogram for percentile tracking (single-threaded access).
+    pub(crate) cycle_histogram: std::cell::RefCell<crate::checkpoint_coordinator::DurationHistogram>,
 }
 
 impl ConnectorPipelineCallback {
     /// Try to compile sink filter SQL to `PhysicalExpr` for sinks that haven't been compiled yet.
     async fn compile_pending_sink_filters(
         &mut self,
-        results: &FxHashMap<String, Vec<RecordBatch>>,
+        results: &FxHashMap<Arc<str>, Vec<RecordBatch>>,
     ) {
         // Ensure the compiled_sink_filters vec has the right length.
         while self.compiled_sink_filters.len() < self.sinks.len() {
@@ -106,18 +123,68 @@ impl ConnectorPipelineCallback {
 impl crate::pipeline::PipelineCallback for ConnectorPipelineCallback {
     async fn execute_cycle(
         &mut self,
-        source_batches: &FxHashMap<String, Vec<RecordBatch>>,
+        source_batches: &FxHashMap<Arc<str>, Vec<RecordBatch>>,
         watermark: i64,
-    ) -> Result<FxHashMap<String, Vec<RecordBatch>>, String> {
-        self.executor
+    ) -> Result<FxHashMap<Arc<str>, Vec<RecordBatch>>, String> {
+        // StreamExecutor processes non-DAG queries (DAG queries are skipped).
+        let mut results = self
+            .executor
             .execute_cycle(source_batches, watermark)
             .await
-            .map_err(|e| format!("{e}"))
+            .map_err(|e| format!("{e}"))?;
+
+        // Route lowered queries through the DAG executor when enabled.
+        if self.use_dag_lowering {
+            if let Some(dag) = &mut self.dag_executor {
+                // Feed source batches to DAG source nodes.
+                for (source_name, batches) in source_batches {
+                    if let Some(&node_id) = self.dag_source_node_ids.get(source_name) {
+                        for batch in batches {
+                            if batch.num_rows() > 0 {
+                                let event =
+                                    laminar_core::operator::Event::new(watermark, batch.clone());
+                                if let Err(e) = dag.process_event(node_id, event) {
+                                    tracing::warn!(
+                                        source = %source_name,
+                                        error = %e,
+                                        "DAG process_event failed"
+                                    );
+                                }
+                            }
+                        }
+                    }
+                }
+
+                // Propagate watermark to all DAG source nodes.
+                for &node_id in self.dag_source_node_ids.values() {
+                    if let Err(e) = dag.process_watermark(node_id, watermark) {
+                        tracing::debug!(error = %e, "DAG watermark propagation failed");
+                    }
+                }
+
+                // Collect DAG sink outputs and merge into results.
+                let dag_outputs = dag.take_all_sink_outputs();
+                for (sink_id, events) in dag_outputs {
+                    if let Some(query_name) = self.dag_sink_to_query.get(&sink_id) {
+                        let batches: Vec<RecordBatch> = events
+                            .into_iter()
+                            .filter(|e| e.data.num_rows() > 0)
+                            .map(|e| (*e.data).clone())
+                            .collect();
+                        if !batches.is_empty() {
+                            results.insert(Arc::clone(query_name), batches);
+                        }
+                    }
+                }
+            }
+        }
+
+        Ok(results)
     }
 
-    fn push_to_streams(&self, results: &FxHashMap<String, Vec<RecordBatch>>) {
+    fn push_to_streams(&self, results: &FxHashMap<Arc<str>, Vec<RecordBatch>>) {
         for (stream_name, src) in &self.stream_sources {
-            if let Some(batches) = results.get(stream_name) {
+            if let Some(batches) = results.get(stream_name.as_str()) {
                 for batch in batches {
                     if batch.num_rows() > 0 {
                         #[allow(clippy::cast_possible_truncation)]
@@ -138,7 +205,7 @@ impl crate::pipeline::PipelineCallback for ConnectorPipelineCallback {
         }
     }
 
-    async fn write_to_sinks(&mut self, results: &FxHashMap<String, Vec<RecordBatch>>) {
+    async fn write_to_sinks(&mut self, results: &FxHashMap<Arc<str>, Vec<RecordBatch>>) {
         // Lazy-compile any pending sink filters.
         self.compile_pending_sink_filters(results).await;
 
@@ -354,11 +421,18 @@ impl crate::pipeline::PipelineCallback for ConnectorPipelineCallback {
             .map(|(name, cp)| (name.clone(), source_to_connector_checkpoint(cp)))
             .collect();
 
-        // Capture stream executor aggregate state.
+        // Capture stream executor aggregate state: snapshot (sync) + serialize.
         let mut operator_states = HashMap::with_capacity(1);
-        match self.executor.checkpoint_state() {
-            Ok(Some(bytes)) => {
-                operator_states.insert("stream_executor".to_string(), bytes);
+        match self.executor.snapshot_state() {
+            Ok(Some(cp)) => {
+                match crate::stream_executor::StreamExecutor::serialize_checkpoint(&cp) {
+                    Ok(bytes) => {
+                        operator_states.insert("stream_executor".to_string(), bytes);
+                    }
+                    Err(e) => {
+                        tracing::warn!(error = %e, "Stream executor checkpoint serialization failed");
+                    }
+                }
             }
             Ok(None) => {}
             Err(e) => {
@@ -482,9 +556,16 @@ impl crate::pipeline::PipelineCallback for ConnectorPipelineCallback {
         // Capture stream executor aggregate state — now consistent because
         // all pre-barrier data has been executed.
         let mut operator_states = HashMap::with_capacity(1);
-        match self.executor.checkpoint_state() {
-            Ok(Some(bytes)) => {
-                operator_states.insert("stream_executor".to_string(), bytes);
+        match self.executor.snapshot_state() {
+            Ok(Some(cp)) => {
+                match crate::stream_executor::StreamExecutor::serialize_checkpoint(&cp) {
+                    Ok(bytes) => {
+                        operator_states.insert("stream_executor".to_string(), bytes);
+                    }
+                    Err(e) => {
+                        tracing::warn!(error = %e, "Stream executor checkpoint serialization failed");
+                    }
+                }
             }
             Ok(None) => {}
             Err(e) => {
@@ -557,6 +638,30 @@ impl crate::pipeline::PipelineCallback for ConnectorPipelineCallback {
         self.counters
             .last_cycle_duration_ns
             .store(elapsed_ns, std::sync::atomic::Ordering::Relaxed);
+
+        // Record to histogram for percentile tracking.
+        self.cycle_histogram
+            .borrow_mut()
+            .record(std::time::Duration::from_nanos(elapsed_ns));
+
+        // Update percentile atomics every 100 cycles to amortize sort cost.
+        let cycle_count = self
+            .counters
+            .cycles
+            .load(std::sync::atomic::Ordering::Relaxed);
+        if cycle_count.is_multiple_of(100) {
+            let (p50, p95, p99) = self.cycle_histogram.borrow().percentiles();
+            // DurationHistogram records in milliseconds; convert to nanoseconds.
+            self.counters
+                .cycle_p50_ns
+                .store(p50 * 1_000_000, std::sync::atomic::Ordering::Relaxed);
+            self.counters
+                .cycle_p95_ns
+                .store(p95 * 1_000_000, std::sync::atomic::Ordering::Relaxed);
+            self.counters
+                .cycle_p99_ns
+                .store(p99 * 1_000_000, std::sync::atomic::Ordering::Relaxed);
+        }
     }
 
     async fn poll_tables(&mut self) {

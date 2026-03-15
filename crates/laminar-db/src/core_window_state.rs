@@ -1299,6 +1299,52 @@ impl CoreWindowState {
         }
     }
 
+    /// Estimated memory usage in bytes across all windows and groups.
+    ///
+    /// For tumbling/hopping windows, iterates over `windows` (`BTreeMap` of
+    /// window-start to per-group accumulators). For session windows, iterates
+    /// over `session_groups`. Uses `ScalarValue::size()` for keys and
+    /// `Accumulator::size()` for accumulator state.
+    pub(crate) fn estimated_size_bytes(&self) -> usize {
+        let mut total = 0;
+        // Tumbling/hopping windows
+        for groups in self.windows.values() {
+            for (key, accs) in groups {
+                for sv in key {
+                    total += sv.size();
+                }
+                for acc in accs {
+                    total += acc.size();
+                }
+            }
+        }
+        // Session windows
+        for (key, group_state) in &self.session_groups {
+            for sv in key {
+                total += sv.size();
+            }
+            for session in group_state.sessions.values() {
+                for acc in &session.accs {
+                    total += acc.size();
+                }
+                // start/end timestamps: 2 × 8 bytes
+                total += 16;
+            }
+        }
+        total
+    }
+
+    /// Total number of distinct groups across all windows.
+    ///
+    /// For tumbling/hopping: sums group counts across all open windows.
+    /// For session: counts groups in `session_groups`.
+    #[allow(dead_code)]
+    pub(crate) fn group_count(&self) -> usize {
+        let windowed: usize = self.windows.values().map(|g| g.len()).sum();
+        let session = self.session_groups.len();
+        windowed + session
+    }
+
     /// Checkpoint all per-window group states into a serializable struct.
     pub(crate) fn checkpoint_windows(&mut self) -> Result<CoreWindowCheckpoint, DbError> {
         use crate::aggregate_state::scalar_to_json;

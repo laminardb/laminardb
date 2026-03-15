@@ -3947,7 +3947,7 @@ where
         output
     }
 
-    fn checkpoint(&self) -> OperatorState {
+    fn checkpoint(&mut self) -> OperatorState {
         // Serialize both registered windows and periodic timer windows using rkyv
         let windows: Vec<_> = self.registered_windows.iter().copied().collect();
         let periodic_windows: Vec<_> = self.periodic_timer_windows.iter().copied().collect();
@@ -3960,6 +3960,7 @@ where
 
         OperatorState {
             operator_id: self.operator_id.clone(),
+            version: 1,
             data,
         }
     }

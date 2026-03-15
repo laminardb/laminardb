@@ -1298,12 +1298,18 @@ pub struct DurationHistogram {
     count: u64,
 }
 
+impl Default for DurationHistogram {
+    fn default() -> Self {
+        Self::new()
+    }
+}
+
 impl DurationHistogram {
     const CAPACITY: usize = 100;
 
     /// Creates an empty histogram.
     #[must_use]
-    fn new() -> Self {
+    pub fn new() -> Self {
         Self {
             samples: Box::new([0; Self::CAPACITY]),
             cursor: 0,
@@ -1312,7 +1318,7 @@ impl DurationHistogram {
     }
 
     /// Records a checkpoint duration.
-    fn record(&mut self, duration: Duration) {
+    pub fn record(&mut self, duration: Duration) {
         #[allow(clippy::cast_possible_truncation)]
         let ms = duration.as_millis() as u64;
         self.samples[self.cursor] = ms;
@@ -1320,9 +1326,15 @@ impl DurationHistogram {
         self.count += 1;
     }
 
+    /// Returns `true` if no samples have been recorded.
+    #[must_use]
+    pub fn is_empty(&self) -> bool {
+        self.count == 0
+    }
+
     /// Returns the number of recorded samples (up to `CAPACITY`).
     #[must_use]
-    fn len(&self) -> usize {
+    pub fn len(&self) -> usize {
         if self.count >= Self::CAPACITY as u64 {
             Self::CAPACITY
         } else {
@@ -1338,7 +1350,7 @@ impl DurationHistogram {
     ///
     /// Returns 0 if no samples have been recorded.
     #[must_use]
-    fn percentile(&self, p: f64) -> u64 {
+    pub fn percentile(&self, p: f64) -> u64 {
         let n = self.len();
         if n == 0 {
             return 0;
@@ -1356,7 +1368,7 @@ impl DurationHistogram {
 
     /// Returns (p50, p95, p99) in milliseconds.
     #[must_use]
-    fn percentiles(&self) -> (u64, u64, u64) {
+    pub fn percentiles(&self) -> (u64, u64, u64) {
         (
             self.percentile(0.50),
             self.percentile(0.95),
@@ -1467,6 +1479,7 @@ pub fn manifest_operators_to_dag_states<S: std::hash::BuildHasher>(
                     laminar_core::dag::topology::NodeId(node_id),
                     laminar_core::operator::OperatorState {
                         operator_id: key.clone(),
+                        version: 1,
                         data,
                     },
                 );
@@ -1677,6 +1690,7 @@ mod tests {
             0,
             SerializableOperatorState {
                 operator_id: "window-agg".into(),
+                version: 1,
                 data: b"window-state".to_vec(),
             },
         );
@@ -1684,6 +1698,7 @@ mod tests {
             3,
             SerializableOperatorState {
                 operator_id: "filter".into(),
+                version: 1,
                 data: b"filter-state".to_vec(),
             },
         );
@@ -1729,6 +1744,7 @@ mod tests {
             7,
             SerializableOperatorState {
                 operator_id: "join".into(),
+                version: 1,
                 data: vec![1, 2, 3, 4, 5],
             },
         );

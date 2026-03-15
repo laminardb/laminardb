@@ -51,9 +51,9 @@ impl BarrierTrackingCallback {
 impl PipelineCallback for BarrierTrackingCallback {
     async fn execute_cycle(
         &mut self,
-        source_batches: &FxHashMap<String, Vec<RecordBatch>>,
+        source_batches: &FxHashMap<Arc<str>, Vec<RecordBatch>>,
         _watermark: i64,
-    ) -> Result<FxHashMap<String, Vec<RecordBatch>>, String> {
+    ) -> Result<FxHashMap<Arc<str>, Vec<RecordBatch>>, String> {
         self.cycle_count += 1;
         let records: u64 = source_batches
             .values()
@@ -65,9 +65,9 @@ impl PipelineCallback for BarrierTrackingCallback {
         Ok(FxHashMap::default())
     }
 
-    fn push_to_streams(&self, _results: &FxHashMap<String, Vec<RecordBatch>>) {}
+    fn push_to_streams(&self, _results: &FxHashMap<Arc<str>, Vec<RecordBatch>>) {}
 
-    async fn write_to_sinks(&mut self, _results: &FxHashMap<String, Vec<RecordBatch>>) {}
+    async fn write_to_sinks(&mut self, _results: &FxHashMap<Arc<str>, Vec<RecordBatch>>) {}
 
     fn extract_watermark(&mut self, _source_name: &str, _batch: &RecordBatch) {}
 

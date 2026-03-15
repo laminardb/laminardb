@@ -203,21 +203,20 @@ fn collect_tables_from_factor(factor: &TableFactor, tables: &mut FxHashSet<Strin
 /// A registered stream query for execution.
 #[derive(Debug, Clone)]
 pub(crate) struct StreamQuery {
-    /// Stream name.
-    pub name: String,
+    /// Stream name (Arc-shared to avoid cloning on hot path).
+    pub name: Arc<str>,
     /// SQL query text.
     pub sql: String,
-    /// ASOF join config (set when the query contains an ASOF JOIN).
-    pub asof_config: Option<AsofJoinTranslatorConfig>,
-    /// Rewritten projection SQL to apply aliases/expressions after the ASOF
-    /// join result is registered as `__asof_tmp`.
-    pub projection_sql: Option<String>,
-    /// Temporal join config (set when the query contains FOR `SYSTEM_TIME` AS OF).
-    pub temporal_config: Option<TemporalJoinTranslatorConfig>,
+    /// ASOF join config (Arc-shared to avoid cloning on hot path).
+    pub asof_config: Option<Arc<AsofJoinTranslatorConfig>>,
+    /// Rewritten projection SQL (Arc-shared to avoid cloning on hot path).
+    pub projection_sql: Option<Arc<str>>,
+    /// Temporal join config (Arc-shared to avoid cloning on hot path).
+    pub temporal_config: Option<Arc<TemporalJoinTranslatorConfig>>,
     /// EMIT clause from the planner (e.g., `OnWindowClose`, `Final`).
     pub emit_clause: Option<EmitClause>,
-    /// Window configuration from the planner (window type, size, gap, etc.).
-    pub window_config: Option<WindowOperatorConfig>,
+    /// Window configuration (Arc-shared to avoid cloning on hot path).
+    pub window_config: Option<Arc<WindowOperatorConfig>>,
     /// ORDER BY configuration (Top-K, `PerGroupTopK`, etc.).
     pub order_config: Option<OrderOperatorConfig>,
     /// Pre-computed table references (extracted once at registration).
@@ -257,7 +256,7 @@ const EOWC_COALESCE_BATCH_THRESHOLD: usize = 32;
 /// `EOWC_COALESCE_BATCH_THRESHOLD` to mitigate fragmentation.
 struct EowcState {
     /// Accumulated source batches keyed by source table name.
-    accumulated_sources: FxHashMap<String, Vec<RecordBatch>>,
+    accumulated_sources: FxHashMap<Arc<str>, Vec<RecordBatch>>,
     /// The last closed-window boundary that was emitted.
     last_closed_boundary: i64,
     /// Total rows currently accumulated (for diagnostics).
@@ -318,10 +317,15 @@ pub(crate) struct StreamExecutor {
     /// Pending checkpoint data for deferred restore. Held until agg states
     /// are lazily initialized, then applied and cleared.
     pending_restore: Option<crate::aggregate_state::StreamExecutorCheckpoint>,
+    /// Maximum state bytes per operator before the query returns an error.
+    /// `None` = unlimited (default).
+    max_state_bytes: Option<usize>,
     /// Reusable per-cycle results map (cleared each cycle to avoid reallocation).
-    cycle_results: FxHashMap<String, Vec<RecordBatch>>,
+    cycle_results: FxHashMap<Arc<str>, Vec<RecordBatch>>,
     /// Reusable per-cycle intermediate table name list.
     cycle_intermediates: Vec<String>,
+    /// Query indices to skip in `execute_cycle` (handled by DAG executor).
+    skipped_queries: FxHashSet<usize>,
 }
 
 impl StreamExecutor {
@@ -346,9 +350,33 @@ impl StreamExecutor {
             core_window_states: FxHashMap::default(),
             non_core_window_queries: FxHashSet::default(),
             pending_restore: None,
+            max_state_bytes: None,
             cycle_results: FxHashMap::default(),
             cycle_intermediates: Vec::new(),
+            skipped_queries: FxHashSet::default(),
         }
+    }
+
+    /// Access the underlying `SessionContext` (for DAG lowering introspection).
+    pub(crate) fn session_context(&self) -> &SessionContext {
+        &self.ctx
+    }
+
+    /// Mark queries as DAG-handled so `execute_cycle()` skips them.
+    pub(crate) fn skip_queries(&mut self, names: &rustc_hash::FxHashSet<Arc<str>>) {
+        for (i, q) in self.queries.iter().enumerate() {
+            if names.contains(&q.name) {
+                self.skipped_queries.insert(i);
+            }
+        }
+    }
+
+    /// Set the maximum state bytes per operator before the query fails.
+    ///
+    /// `None` = unlimited (default). When set, the executor checks each
+    /// aggregate/window operator's estimated memory after every cycle.
+    pub fn set_max_state_bytes(&mut self, limit: Option<usize>) {
+        self.max_state_bytes = limit;
     }
 
     /// Set the lookup table registry for versioned temporal join lookups.
@@ -365,7 +393,7 @@ impl StreamExecutor {
     pub fn temporal_join_configs(&self) -> Vec<TemporalJoinTranslatorConfig> {
         self.queries
             .iter()
-            .filter_map(|q| q.temporal_config.clone())
+            .filter_map(|q| q.temporal_config.as_ref().map(|c| (**c).clone()))
             .collect()
     }
 
@@ -396,13 +424,13 @@ impl StreamExecutor {
         let table_refs = extract_table_references(&sql);
         let idx = self.queries.len();
         let query = StreamQuery {
-            name,
+            name: Arc::from(name),
             sql,
-            asof_config,
-            projection_sql,
-            temporal_config,
+            asof_config: asof_config.map(Arc::new),
+            projection_sql: projection_sql.map(|s| Arc::from(s.as_str())),
+            temporal_config: temporal_config.map(Arc::new),
             emit_clause,
-            window_config,
+            window_config: window_config.map(Arc::new),
             order_config,
             table_refs,
         };
@@ -448,7 +476,7 @@ impl StreamExecutor {
             .queries
             .iter()
             .enumerate()
-            .map(|(i, q)| (q.name.as_str(), i))
+            .map(|(i, q)| (&*q.name, i))
             .collect();
 
         // Build in-degree counts (only count dependencies on other queries)
@@ -516,9 +544,9 @@ impl StreamExecutor {
     #[allow(clippy::too_many_lines)]
     pub async fn execute_cycle(
         &mut self,
-        source_batches: &FxHashMap<String, Vec<RecordBatch>>,
+        source_batches: &FxHashMap<Arc<str>, Vec<RecordBatch>>,
         current_watermark: i64,
-    ) -> Result<FxHashMap<String, Vec<RecordBatch>>, DbError> {
+    ) -> Result<FxHashMap<Arc<str>, Vec<RecordBatch>>, DbError> {
         if self.topo_dirty {
             self.compute_topo_order();
         }
@@ -536,20 +564,26 @@ impl StreamExecutor {
         let topo_len = self.topo_order.len();
         for i in 0..topo_len {
             let idx = self.topo_order[i];
+
+            // Skip queries handled by the DAG executor.
+            if self.skipped_queries.contains(&idx) {
+                continue;
+            }
+
             let is_eowc = self.queries[idx].suppresses_intermediate();
             let has_asof = self.queries[idx].asof_config.is_some();
             let has_temporal = self.queries[idx].temporal_config.is_some();
 
             let query_result = if is_eowc {
-                let query_name = self.queries[idx].name.clone();
-                let window_config = self.queries[idx].window_config.clone();
-                let asof_config = self.queries[idx].asof_config.clone();
-                let projection_sql = self.queries[idx].projection_sql.clone();
+                let query_name = Arc::clone(&self.queries[idx].name);
+                let window_config = self.queries[idx].window_config.as_ref().map(Arc::clone);
+                let asof_config = self.queries[idx].asof_config.as_ref().map(Arc::clone);
+                let projection_sql = self.queries[idx].projection_sql.as_ref().map(Arc::clone);
                 self.execute_eowc_query(
                     idx,
                     &query_name,
-                    window_config.as_ref(),
-                    asof_config.as_ref(),
+                    window_config.as_deref(),
+                    asof_config.as_deref(),
                     projection_sql.as_deref(),
                     source_batches,
                     &results,
@@ -557,12 +591,14 @@ impl StreamExecutor {
                 )
                 .await
             } else if has_asof {
-                let query_name = self.queries[idx].name.clone();
-                let cfg = self.queries[idx]
-                    .asof_config
-                    .clone()
-                    .expect("has_asof guard ensures asof_config is Some");
-                let projection_sql = self.queries[idx].projection_sql.clone();
+                let query_name = Arc::clone(&self.queries[idx].name);
+                let cfg = Arc::clone(
+                    self.queries[idx]
+                        .asof_config
+                        .as_ref()
+                        .expect("has_asof guard ensures asof_config is Some"),
+                );
+                let projection_sql = self.queries[idx].projection_sql.as_ref().map(Arc::clone);
                 self.execute_asof_query(
                     &query_name,
                     &cfg,
@@ -572,12 +608,14 @@ impl StreamExecutor {
                 )
                 .await
             } else if has_temporal {
-                let query_name = self.queries[idx].name.clone();
-                let cfg = self.queries[idx]
-                    .temporal_config
-                    .clone()
-                    .expect("has_temporal guard ensures temporal_config is Some");
-                let projection_sql = self.queries[idx].projection_sql.clone();
+                let query_name = Arc::clone(&self.queries[idx].name);
+                let cfg = Arc::clone(
+                    self.queries[idx]
+                        .temporal_config
+                        .as_ref()
+                        .expect("has_temporal guard ensures temporal_config is Some"),
+                );
+                let projection_sql = self.queries[idx].projection_sql.as_ref().map(Arc::clone);
                 self.execute_temporal_query(
                     &query_name,
                     &cfg,
@@ -601,7 +639,7 @@ impl StreamExecutor {
                     let depends_on_stream = self.queries[idx]
                         .table_refs
                         .iter()
-                        .any(|tr| self.queries.iter().any(|q| q.name == *tr));
+                        .any(|tr| self.queries.iter().any(|q| &*q.name == tr.as_str()));
                     if depends_on_stream {
                         tracing::debug!(
                             query = %self.queries[idx].name,
@@ -614,6 +652,61 @@ impl StreamExecutor {
                 }
             };
 
+            // ── State size bounds check ──
+            if let Some(limit) = self.max_state_bytes {
+                // Check incremental aggregate state
+                if let Some(state) = self.agg_states.get(&idx) {
+                    let size = state.estimated_size_bytes();
+                    if size >= limit {
+                        return Err(DbError::Pipeline(format!(
+                            "state size limit exceeded for query '{}' ({size} bytes > {limit} limit)",
+                            self.queries[idx].name
+                        )));
+                    } else if size >= limit * 4 / 5 {
+                        tracing::warn!(
+                            query = %self.queries[idx].name,
+                            size_bytes = size,
+                            limit_bytes = limit,
+                            "state size at 80% of limit"
+                        );
+                    }
+                }
+                // Check core window state
+                if let Some(state) = self.core_window_states.get(&idx) {
+                    let size = state.estimated_size_bytes();
+                    if size >= limit {
+                        return Err(DbError::Pipeline(format!(
+                            "state size limit exceeded for query '{}' ({size} bytes > {limit} limit)",
+                            self.queries[idx].name
+                        )));
+                    } else if size >= limit * 4 / 5 {
+                        tracing::warn!(
+                            query = %self.queries[idx].name,
+                            size_bytes = size,
+                            limit_bytes = limit,
+                            "state size at 80% of limit"
+                        );
+                    }
+                }
+                // Check EOWC aggregate state
+                if let Some(state) = self.eowc_agg_states.get(&idx) {
+                    let size = state.estimated_size_bytes();
+                    if size >= limit {
+                        return Err(DbError::Pipeline(format!(
+                            "state size limit exceeded for query '{}' ({size} bytes > {limit} limit)",
+                            self.queries[idx].name
+                        )));
+                    } else if size >= limit * 4 / 5 {
+                        tracing::warn!(
+                            query = %self.queries[idx].name,
+                            size_bytes = size,
+                            limit_bytes = limit,
+                            "state size at 80% of limit"
+                        );
+                    }
+                }
+            }
+
             // Apply Top-K post-filter if configured
             let batches = match &self.queries[idx].order_config {
                 Some(OrderOperatorConfig::TopK(config)) => apply_topk_filter(&batches, config.k),
@@ -623,21 +716,21 @@ impl StreamExecutor {
                 _ => batches,
             };
 
-            let query_name = self.queries[idx].name.clone();
+            let query_name = Arc::clone(&self.queries[idx].name);
             if !batches.is_empty() {
                 let schema = batches[0].schema();
                 if let Ok(mem_table) =
                     datafusion::datasource::MemTable::try_new(schema, vec![batches.clone()])
                 {
-                    let _ = self.ctx.deregister_table(&query_name);
-                    if let Err(e) = self.ctx.register_table(&query_name, Arc::new(mem_table)) {
+                    let _ = self.ctx.deregister_table(&*query_name);
+                    if let Err(e) = self.ctx.register_table(&*query_name, Arc::new(mem_table)) {
                         tracing::warn!(
                             query = %query_name,
                             error = %e,
                             "[LDB-3015] Failed to register intermediate table"
                         );
                     }
-                    intermediate_tables.push(query_name.clone());
+                    intermediate_tables.push(query_name.to_string());
                 }
                 results.insert(query_name, batches);
             }
@@ -661,7 +754,7 @@ impl StreamExecutor {
     /// `DataFusion` can still plan queries that reference them.
     fn register_source_tables(
         &mut self,
-        source_batches: &FxHashMap<String, Vec<RecordBatch>>,
+        source_batches: &FxHashMap<Arc<str>, Vec<RecordBatch>>,
     ) -> Result<(), DbError> {
         for (name, batches) in source_batches {
             if batches.is_empty() {
@@ -671,21 +764,21 @@ impl StreamExecutor {
             let schema = batches[0].schema();
             let mem_table =
                 datafusion::datasource::MemTable::try_new(schema, vec![batches.clone()])
-                    .map_err(|e| DbError::query_pipeline(name, &e))?;
+                    .map_err(|e| DbError::query_pipeline(&**name, &e))?;
 
             // Deregister first if it exists (from previous cycle)
-            let _ = self.ctx.deregister_table(name);
+            let _ = self.ctx.deregister_table(&**name);
 
             self.ctx
-                .register_table(name, Arc::new(mem_table))
-                .map_err(|e| DbError::query_pipeline(name, &e))?;
+                .register_table(&**name, Arc::new(mem_table))
+                .map_err(|e| DbError::query_pipeline(&**name, &e))?;
 
-            self.registered_sources.push(name.clone());
+            self.registered_sources.push(name.to_string());
         }
 
         // Register empty tables for known sources that had no data this cycle
         for (name, schema) in &self.source_schemas {
-            if source_batches.contains_key(name) {
+            if source_batches.contains_key(name.as_str()) {
                 continue;
             }
             let empty = datafusion::datasource::MemTable::try_new(schema.clone(), vec![vec![]])
@@ -714,8 +807,8 @@ impl StreamExecutor {
 /// then evaluates the projection against each batch.
 fn evaluate_compiled_projection(
     proj: &CompiledProjection,
-    source_batches: &FxHashMap<String, Vec<RecordBatch>>,
-    results: &FxHashMap<String, Vec<RecordBatch>>,
+    source_batches: &FxHashMap<Arc<str>, Vec<RecordBatch>>,
+    results: &FxHashMap<Arc<str>, Vec<RecordBatch>>,
 ) -> Vec<RecordBatch> {
     let batches = source_batches
         .get(proj.source_table())
@@ -881,8 +974,8 @@ impl StreamExecutor {
     async fn execute_standard_query(
         &mut self,
         idx: usize,
-        source_batches: &FxHashMap<String, Vec<RecordBatch>>,
-        results: &FxHashMap<String, Vec<RecordBatch>>,
+        source_batches: &FxHashMap<Arc<str>, Vec<RecordBatch>>,
+        results: &FxHashMap<Arc<str>, Vec<RecordBatch>>,
     ) -> Result<Vec<RecordBatch>, DbError> {
         // Fast path: already have incremental agg state for this query
         if self.agg_states.contains_key(&idx) {
@@ -941,8 +1034,8 @@ impl StreamExecutor {
     async fn try_compile_plain_query(
         &mut self,
         idx: usize,
-        source_batches: &FxHashMap<String, Vec<RecordBatch>>,
-        results: &FxHashMap<String, Vec<RecordBatch>>,
+        source_batches: &FxHashMap<Arc<str>, Vec<RecordBatch>>,
+        results: &FxHashMap<Arc<str>, Vec<RecordBatch>>,
     ) -> Result<Vec<RecordBatch>, DbError> {
         let query_sql = self.queries[idx].sql.clone();
         let query_name = self.queries[idx].name.clone();
@@ -958,7 +1051,7 @@ impl StreamExecutor {
             .ctx
             .sql(&query_sql)
             .await
-            .map_err(|e| DbError::query_pipeline(&query_name, &e))?;
+            .map_err(|e| DbError::query_pipeline(&*query_name, &e))?;
 
         let plan = df.logical_plan();
         if let Some(proj) = self.try_build_compiled_projection(plan) {
@@ -983,7 +1076,7 @@ impl StreamExecutor {
         );
         df.collect()
             .await
-            .map_err(|e| DbError::query_pipeline(&query_name, &e))
+            .map_err(|e| DbError::query_pipeline(&*query_name, &e))
     }
 
     /// Try to build a `CompiledProjection` from a logical plan.
@@ -1049,7 +1142,7 @@ impl StreamExecutor {
             .ctx
             .sql(&query_sql)
             .await
-            .map_err(|e| DbError::query_pipeline(&query_name, &e))?;
+            .map_err(|e| DbError::query_pipeline(&*query_name, &e))?;
 
         let plan = df.logical_plan().clone();
         let table_refs = &self.queries[idx].table_refs;
@@ -1059,7 +1152,7 @@ impl StreamExecutor {
 
         df.collect()
             .await
-            .map_err(|e| DbError::query_pipeline(&query_name, &e))
+            .map_err(|e| DbError::query_pipeline(&*query_name, &e))
     }
 
     /// Execute a query using a cached optimized logical plan.
@@ -1086,7 +1179,7 @@ impl StreamExecutor {
                     .ctx
                     .sql(&query_sql)
                     .await
-                    .map_err(|e| DbError::query_pipeline(&query_name, &e))?;
+                    .map_err(|e| DbError::query_pipeline(&*query_name, &e))?;
                 let plan = df.logical_plan().clone();
                 self.cached_logical_plans.insert(idx, plan);
                 self.cached_plan_fingerprints
@@ -1094,7 +1187,7 @@ impl StreamExecutor {
                 return df
                     .collect()
                     .await
-                    .map_err(|e| DbError::query_pipeline(&query_name, &e));
+                    .map_err(|e| DbError::query_pipeline(&*query_name, &e));
             }
         }
 
@@ -1109,12 +1202,12 @@ impl StreamExecutor {
             .state()
             .create_physical_plan(plan)
             .await
-            .map_err(|e| DbError::query_pipeline(&query_name, &e))?;
+            .map_err(|e| DbError::query_pipeline(&*query_name, &e))?;
 
         let task_ctx = self.ctx.task_ctx();
         datafusion::physical_plan::collect(physical, task_ctx)
             .await
-            .map_err(|e| DbError::query_pipeline(&query_name, &e))
+            .map_err(|e| DbError::query_pipeline(&*query_name, &e))
     }
 
     /// Execute an aggregation query using incremental accumulators.
@@ -1125,8 +1218,8 @@ impl StreamExecutor {
     async fn execute_incremental_agg(
         &mut self,
         idx: usize,
-        source_batches: &FxHashMap<String, Vec<RecordBatch>>,
-        results: &FxHashMap<String, Vec<RecordBatch>>,
+        source_batches: &FxHashMap<Arc<str>, Vec<RecordBatch>>,
+        results: &FxHashMap<Arc<str>, Vec<RecordBatch>>,
     ) -> Result<Vec<RecordBatch>, DbError> {
         let query_name = self.queries[idx].name.clone();
 
@@ -1143,7 +1236,7 @@ impl StreamExecutor {
                 Ok(df) => df
                     .collect()
                     .await
-                    .map_err(|e| DbError::query_pipeline(&query_name, &e))?,
+                    .map_err(|e| DbError::query_pipeline(&*query_name, &e))?,
                 Err(e) => {
                     tracing::trace!(
                         query = %query_name,
@@ -1237,8 +1330,8 @@ impl StreamExecutor {
         idx: usize,
         query_name: &str,
         current_watermark: i64,
-        source_batches: &FxHashMap<String, Vec<RecordBatch>>,
-        results: &FxHashMap<String, Vec<RecordBatch>>,
+        source_batches: &FxHashMap<Arc<str>, Vec<RecordBatch>>,
+        results: &FxHashMap<Arc<str>, Vec<RecordBatch>>,
     ) -> Result<Vec<RecordBatch>, DbError> {
         let eowc_state = self.eowc_agg_states.get(&idx).ok_or_else(|| {
             DbError::Pipeline(format!(
@@ -1301,8 +1394,8 @@ impl StreamExecutor {
         idx: usize,
         query_name: &str,
         current_watermark: i64,
-        source_batches: &FxHashMap<String, Vec<RecordBatch>>,
-        results: &FxHashMap<String, Vec<RecordBatch>>,
+        source_batches: &FxHashMap<Arc<str>, Vec<RecordBatch>>,
+        results: &FxHashMap<Arc<str>, Vec<RecordBatch>>,
     ) -> Result<Vec<RecordBatch>, DbError> {
         let cw_state = self.core_window_states.get(&idx).ok_or_else(|| {
             DbError::Pipeline(format!("internal: missing cw_state for query index {idx}"))
@@ -1364,8 +1457,8 @@ impl StreamExecutor {
         window_config: Option<&WindowOperatorConfig>,
         asof_config: Option<&AsofJoinTranslatorConfig>,
         projection_sql: Option<&str>,
-        source_batches: &FxHashMap<String, Vec<RecordBatch>>,
-        intermediate_results: &FxHashMap<String, Vec<RecordBatch>>,
+        source_batches: &FxHashMap<Arc<str>, Vec<RecordBatch>>,
+        intermediate_results: &FxHashMap<Arc<str>, Vec<RecordBatch>>,
         current_watermark: i64,
     ) -> Result<Vec<RecordBatch>, DbError> {
         // Try core-window and incremental EOWC paths for aggregate queries with
@@ -1505,23 +1598,26 @@ impl StreamExecutor {
         // Fall through to raw-batch EOWC path.
         // Collect table refs as owned strings to avoid borrowing self.queries
         // while mutating self.eowc_states.
-        let table_refs: Vec<String> = self.queries[idx].table_refs.iter().cloned().collect();
+        let table_refs: Vec<Arc<str>> = self.queries[idx]
+            .table_refs
+            .iter()
+            .map(|s| Arc::from(s.as_str()))
+            .collect();
 
         // Accumulate current source batches into EOWC state.
         if let Some(eowc) = self.eowc_states.get_mut(&idx) {
             for table_name in &table_refs {
                 // Check source_batches first, then intermediate_results
-                let batches_to_add = if let Some(batches) = source_batches.get(table_name.as_str())
-                {
+                let batches_to_add = if let Some(batches) = source_batches.get(&**table_name) {
                     Some(batches)
                 } else {
-                    intermediate_results.get(table_name.as_str())
+                    intermediate_results.get(&**table_name)
                 };
 
                 if let Some(batches) = batches_to_add {
                     let entry = eowc
                         .accumulated_sources
-                        .entry(table_name.clone())
+                        .entry(Arc::clone(table_name))
                         .or_default();
                     for batch in batches {
                         if batch.num_rows() > 0 {
@@ -1598,12 +1694,12 @@ impl StreamExecutor {
             return Ok(Vec::new());
         };
 
-        let mut filtered_sources: FxHashMap<String, Vec<RecordBatch>> =
+        let mut filtered_sources: FxHashMap<Arc<str>, Vec<RecordBatch>> =
             FxHashMap::with_capacity_and_hasher(
                 eowc.accumulated_sources.len(),
                 rustc_hash::FxBuildHasher,
             );
-        let mut retained_sources: FxHashMap<String, Vec<RecordBatch>> =
+        let mut retained_sources: FxHashMap<Arc<str>, Vec<RecordBatch>> =
             FxHashMap::with_capacity_and_hasher(
                 eowc.accumulated_sources.len(),
                 rustc_hash::FxBuildHasher,
@@ -1688,12 +1784,12 @@ impl StreamExecutor {
             let schema = batches[0].schema();
             let mem_table =
                 datafusion::datasource::MemTable::try_new(schema, vec![batches.clone()])
-                    .map_err(|e| DbError::query_pipeline(name, &e))?;
-            let _ = self.ctx.deregister_table(name);
+                    .map_err(|e| DbError::query_pipeline(&**name, &e))?;
+            let _ = self.ctx.deregister_table(&**name);
             self.ctx
-                .register_table(name, Arc::new(mem_table))
-                .map_err(|e| DbError::query_pipeline(name, &e))?;
-            eowc_temp_tables.push(name.clone());
+                .register_table(&**name, Arc::new(mem_table))
+                .map_err(|e| DbError::query_pipeline(&**name, &e))?;
+            eowc_temp_tables.push(name.to_string());
         }
 
         // Execute the query
@@ -1757,8 +1853,8 @@ impl StreamExecutor {
         query_name: &str,
         config: &AsofJoinTranslatorConfig,
         projection_sql: Option<&str>,
-        source_batches: &FxHashMap<String, Vec<RecordBatch>>,
-        intermediate_results: &FxHashMap<String, Vec<RecordBatch>>,
+        source_batches: &FxHashMap<Arc<str>, Vec<RecordBatch>>,
+        intermediate_results: &FxHashMap<Arc<str>, Vec<RecordBatch>>,
     ) -> Result<Vec<RecordBatch>, DbError> {
         // Resolve left batches: source_batches → intermediate → DataFusion
         let left_batches = self
@@ -1813,8 +1909,8 @@ impl StreamExecutor {
         query_name: &str,
         config: &TemporalJoinTranslatorConfig,
         projection_sql: Option<&str>,
-        source_batches: &FxHashMap<String, Vec<RecordBatch>>,
-        intermediate_results: &FxHashMap<String, Vec<RecordBatch>>,
+        source_batches: &FxHashMap<Arc<str>, Vec<RecordBatch>>,
+        intermediate_results: &FxHashMap<Arc<str>, Vec<RecordBatch>>,
     ) -> Result<Vec<RecordBatch>, DbError> {
         let registry = self.lookup_registry.as_ref().ok_or_else(|| {
             DbError::Pipeline(format!(
@@ -1850,8 +1946,8 @@ impl StreamExecutor {
         config: &TemporalJoinTranslatorConfig,
         projection_sql: Option<&str>,
         versioned: &laminar_sql::datafusion::VersionedLookupState,
-        source_batches: &FxHashMap<String, Vec<RecordBatch>>,
-        intermediate_results: &FxHashMap<String, Vec<RecordBatch>>,
+        source_batches: &FxHashMap<Arc<str>, Vec<RecordBatch>>,
+        intermediate_results: &FxHashMap<Arc<str>, Vec<RecordBatch>>,
     ) -> Result<Vec<RecordBatch>, DbError> {
         use datafusion::catalog::TableProvider;
         use datafusion::physical_plan::ExecutionPlan as _;
@@ -1987,8 +2083,8 @@ impl StreamExecutor {
     async fn resolve_table_batches(
         &self,
         table_name: &str,
-        source_batches: &FxHashMap<String, Vec<RecordBatch>>,
-        intermediate_results: &FxHashMap<String, Vec<RecordBatch>>,
+        source_batches: &FxHashMap<Arc<str>, Vec<RecordBatch>>,
+        intermediate_results: &FxHashMap<Arc<str>, Vec<RecordBatch>>,
     ) -> Result<Vec<RecordBatch>, DbError> {
         if let Some(batches) = source_batches.get(table_name) {
             return Ok(batches.clone());
@@ -2008,18 +2104,19 @@ impl StreamExecutor {
             .map_err(|e| DbError::query_pipeline(table_name, &e))
     }
 
-    /// Checkpoint all aggregate state (both running-total and EOWC).
+    /// Snapshot all aggregate state into a `StreamExecutorCheckpoint` struct.
     ///
-    /// Returns `Ok(None)` if there is no state to checkpoint (no aggregate
-    /// queries have accumulated any groups). Otherwise returns the serialized
-    /// JSON bytes.
-    pub fn checkpoint_state(&mut self) -> Result<Option<Vec<u8>>, DbError> {
+    /// This requires `&mut self` because `Accumulator::state()` is `&mut`.
+    /// Returns `Ok(None)` if there is no state to checkpoint.
+    pub fn snapshot_state(
+        &mut self,
+    ) -> Result<Option<crate::aggregate_state::StreamExecutorCheckpoint>, DbError> {
         use crate::aggregate_state::{RawEowcCheckpoint, StreamExecutorCheckpoint};
 
         let mut agg_checkpoints =
             FxHashMap::with_capacity_and_hasher(self.agg_states.len(), rustc_hash::FxBuildHasher);
         for (&idx, state) in &mut self.agg_states {
-            let name = self.queries[idx].name.clone();
+            let name = self.queries[idx].name.to_string();
             agg_checkpoints.insert(name, state.checkpoint_groups()?);
         }
 
@@ -2028,7 +2125,7 @@ impl StreamExecutor {
             rustc_hash::FxBuildHasher,
         );
         for (&idx, state) in &mut self.eowc_agg_states {
-            let name = self.queries[idx].name.clone();
+            let name = self.queries[idx].name.to_string();
             eowc_checkpoints.insert(name, state.checkpoint_windows()?);
         }
 
@@ -2037,7 +2134,7 @@ impl StreamExecutor {
             rustc_hash::FxBuildHasher,
         );
         for (&idx, state) in &mut self.core_window_states {
-            let name = self.queries[idx].name.clone();
+            let name = self.queries[idx].name.to_string();
             cw_checkpoints.insert(name, state.checkpoint_windows()?);
         }
 
@@ -2048,7 +2145,7 @@ impl StreamExecutor {
             if eowc.accumulated_rows == 0 {
                 continue;
             }
-            let name = self.queries[idx].name.clone();
+            let name = self.queries[idx].name.to_string();
             let mut sources = FxHashMap::with_capacity_and_hasher(
                 eowc.accumulated_sources.len(),
                 rustc_hash::FxBuildHasher,
@@ -2064,7 +2161,7 @@ impl StreamExecutor {
                     ipc_batches.push(ipc_bytes);
                 }
                 if !ipc_batches.is_empty() {
-                    sources.insert(src_name.clone(), ipc_batches);
+                    sources.insert(src_name.to_string(), ipc_batches);
                 }
             }
             raw_eowc_checkpoints.insert(
@@ -2090,7 +2187,7 @@ impl StreamExecutor {
             return Ok(None);
         }
 
-        let checkpoint = StreamExecutorCheckpoint {
+        Ok(Some(StreamExecutorCheckpoint {
             version: 2,
             vnode_count: laminar_core::state::VNODE_COUNT,
             agg_states: agg_checkpoints,
@@ -2098,13 +2195,20 @@ impl StreamExecutor {
             core_window_states: cw_checkpoints,
             join_states: join_checkpoints,
             raw_eowc_states: raw_eowc_checkpoints,
-        };
+        }))
+    }
 
-        let bytes = serde_json::to_vec(&checkpoint).map_err(|e| {
+    /// Serialize a `StreamExecutorCheckpoint` to JSON bytes.
+    ///
+    /// This is a standalone function that does not require `&self`, so it
+    /// can be offloaded to `spawn_blocking` to avoid blocking the
+    /// coordinator during serialization.
+    pub fn serialize_checkpoint(
+        cp: &crate::aggregate_state::StreamExecutorCheckpoint,
+    ) -> Result<Vec<u8>, DbError> {
+        serde_json::to_vec(&cp).map_err(|e| {
             DbError::Pipeline(format!("stream executor checkpoint serialization: {e}"))
-        })?;
-
-        Ok(Some(bytes))
+        })
     }
 
     /// Restore aggregate state from a previous checkpoint.
@@ -2130,7 +2234,7 @@ impl StreamExecutor {
             .queries
             .iter()
             .enumerate()
-            .map(|(i, q)| (q.name.as_str(), i))
+            .map(|(i, q)| (&*q.name, i))
             .collect();
 
         // Immediately restore any already-initialized states
@@ -2178,7 +2282,7 @@ impl StreamExecutor {
                         total_rows += batch.num_rows();
                         batches.push(batch);
                     }
-                    accumulated_sources.insert(src_name.clone(), batches);
+                    accumulated_sources.insert(Arc::from(src_name.as_str()), batches);
                 }
                 self.eowc_states.insert(
                     idx,
@@ -2225,15 +2329,15 @@ impl StreamExecutor {
     }
 
     fn try_restore_pending_agg(&mut self, idx: usize) {
-        let name = self.queries[idx].name.clone();
+        let name = &self.queries[idx].name;
         let cp = self
             .pending_restore
             .as_ref()
-            .and_then(|p| p.agg_states.get(&name))
+            .and_then(|p| p.agg_states.get(&**name))
             .cloned();
         if let (Some(cp), Some(state)) = (cp, self.agg_states.get_mut(&idx)) {
             Self::log_restore(
-                &name,
+                name,
                 &cp,
                 state,
                 IncrementalAggState::restore_groups,
@@ -2243,15 +2347,15 @@ impl StreamExecutor {
     }
 
     fn try_restore_pending_eowc(&mut self, idx: usize) {
-        let name = self.queries[idx].name.clone();
+        let name = &self.queries[idx].name;
         let cp = self
             .pending_restore
             .as_ref()
-            .and_then(|p| p.eowc_states.get(&name))
+            .and_then(|p| p.eowc_states.get(&**name))
             .cloned();
         if let (Some(cp), Some(state)) = (cp, self.eowc_agg_states.get_mut(&idx)) {
             Self::log_restore(
-                &name,
+                name,
                 &cp,
                 state,
                 IncrementalEowcState::restore_windows,
@@ -2261,15 +2365,15 @@ impl StreamExecutor {
     }
 
     fn try_restore_pending_core_window(&mut self, idx: usize) {
-        let name = self.queries[idx].name.clone();
+        let name = &self.queries[idx].name;
         let cp = self
             .pending_restore
             .as_ref()
-            .and_then(|p| p.core_window_states.get(&name))
+            .and_then(|p| p.core_window_states.get(&**name))
             .cloned();
         if let (Some(cp), Some(state)) = (cp, self.core_window_states.get_mut(&idx)) {
             Self::log_restore(
-                &name,
+                name,
                 &cp,
                 state,
                 CoreWindowState::restore_windows,
@@ -2800,7 +2904,7 @@ mod tests {
         );
 
         let mut source_batches = FxHashMap::default();
-        source_batches.insert("events".to_string(), vec![test_batch()]);
+        source_batches.insert(Arc::from("events"), vec![test_batch()]);
 
         let results = executor
             .execute_cycle(&source_batches, i64::MAX)
@@ -2862,7 +2966,7 @@ mod tests {
         );
 
         let mut source_batches = FxHashMap::default();
-        source_batches.insert("events".to_string(), vec![test_batch()]);
+        source_batches.insert(Arc::from("events"), vec![test_batch()]);
 
         let results = executor
             .execute_cycle(&source_batches, i64::MAX)
@@ -2887,7 +2991,7 @@ mod tests {
         );
 
         let mut source_batches = FxHashMap::default();
-        source_batches.insert("events".to_string(), vec![test_batch()]);
+        source_batches.insert(Arc::from("events"), vec![test_batch()]);
 
         let results = executor
             .execute_cycle(&source_batches, i64::MAX)
@@ -2914,7 +3018,7 @@ mod tests {
 
         // First cycle
         let mut source_batches = FxHashMap::default();
-        source_batches.insert("events".to_string(), vec![test_batch()]);
+        source_batches.insert(Arc::from("events"), vec![test_batch()]);
         let r1 = executor
             .execute_cycle(&source_batches, i64::MAX)
             .await
@@ -2961,7 +3065,7 @@ mod tests {
         );
 
         let mut source_batches = FxHashMap::default();
-        source_batches.insert("events".to_string(), vec![test_batch()]);
+        source_batches.insert(Arc::from("events"), vec![test_batch()]);
 
         let results = executor
             .execute_cycle(&source_batches, i64::MAX)
@@ -3024,7 +3128,7 @@ mod tests {
         );
 
         let mut source_batches = FxHashMap::default();
-        source_batches.insert("events".to_string(), vec![test_batch()]);
+        source_batches.insert(Arc::from("events"), vec![test_batch()]);
 
         let results = executor
             .execute_cycle(&source_batches, i64::MAX)
@@ -3076,7 +3180,7 @@ mod tests {
         );
 
         let mut source_batches = FxHashMap::default();
-        source_batches.insert("events".to_string(), vec![test_batch()]);
+        source_batches.insert(Arc::from("events"), vec![test_batch()]);
 
         let results = executor
             .execute_cycle(&source_batches, i64::MAX)
@@ -3132,7 +3236,7 @@ mod tests {
         );
 
         let mut source_batches = FxHashMap::default();
-        source_batches.insert("events".to_string(), vec![test_batch()]);
+        source_batches.insert(Arc::from("events"), vec![test_batch()]);
 
         let results = executor
             .execute_cycle(&source_batches, i64::MAX)
@@ -3171,7 +3275,7 @@ mod tests {
         );
 
         let mut source_batches = FxHashMap::default();
-        source_batches.insert("events".to_string(), vec![test_batch()]);
+        source_batches.insert(Arc::from("events"), vec![test_batch()]);
 
         let results = executor
             .execute_cycle(&source_batches, i64::MAX)
@@ -3235,7 +3339,7 @@ mod tests {
         );
 
         let mut source_batches = FxHashMap::default();
-        source_batches.insert("events".to_string(), vec![test_batch()]);
+        source_batches.insert(Arc::from("events"), vec![test_batch()]);
 
         let result = executor.execute_cycle(&source_batches, i64::MAX).await;
         assert!(result.is_err(), "invalid SQL should surface as error");
@@ -3262,7 +3366,7 @@ mod tests {
         );
 
         let mut source_batches = FxHashMap::default();
-        source_batches.insert("events".to_string(), vec![test_batch()]);
+        source_batches.insert(Arc::from("events"), vec![test_batch()]);
 
         let result = executor.execute_cycle(&source_batches, i64::MAX).await;
         assert!(result.is_err(), "missing column should surface as error");
@@ -3370,8 +3474,8 @@ mod tests {
         );
 
         let mut source_batches = FxHashMap::default();
-        source_batches.insert("trades".to_string(), vec![trades_batch_for_asof()]);
-        source_batches.insert("quotes".to_string(), vec![quotes_batch_for_asof()]);
+        source_batches.insert(Arc::from("trades"), vec![trades_batch_for_asof()]);
+        source_batches.insert(Arc::from("quotes"), vec![quotes_batch_for_asof()]);
 
         let results = executor
             .execute_cycle(&source_batches, i64::MAX)
@@ -3409,8 +3513,8 @@ mod tests {
         );
 
         let mut source_batches = FxHashMap::default();
-        source_batches.insert("trades".to_string(), vec![trades_batch_for_asof()]);
-        source_batches.insert("quotes".to_string(), vec![quotes_batch_for_asof()]);
+        source_batches.insert(Arc::from("trades"), vec![trades_batch_for_asof()]);
+        source_batches.insert(Arc::from("quotes"), vec![quotes_batch_for_asof()]);
 
         let results = executor
             .execute_cycle(&source_batches, i64::MAX)
@@ -3455,9 +3559,9 @@ mod tests {
 
         // Only trades, no quotes → should still work (left join with nulls)
         let mut source_batches = FxHashMap::default();
-        source_batches.insert("trades".to_string(), vec![trades_batch_for_asof()]);
+        source_batches.insert(Arc::from("trades"), vec![trades_batch_for_asof()]);
         source_batches.insert(
-            "quotes".to_string(),
+            Arc::from("quotes"),
             vec![RecordBatch::new_empty(quotes_schema())],
         );
 
@@ -3497,8 +3601,8 @@ mod tests {
         );
 
         let mut source_batches = FxHashMap::default();
-        source_batches.insert("trades".to_string(), vec![trades_batch_for_asof()]);
-        source_batches.insert("quotes".to_string(), vec![quotes_batch_for_asof()]);
+        source_batches.insert(Arc::from("trades"), vec![trades_batch_for_asof()]);
+        source_batches.insert(Arc::from("quotes"), vec![quotes_batch_for_asof()]);
 
         let results = executor
             .execute_cycle(&source_batches, i64::MAX)
@@ -3528,7 +3632,7 @@ mod tests {
         );
 
         let mut source_batches = FxHashMap::default();
-        source_batches.insert("events".to_string(), vec![test_batch()]);
+        source_batches.insert(Arc::from("events"), vec![test_batch()]);
 
         let results = executor
             .execute_cycle(&source_batches, i64::MAX)
@@ -3593,7 +3697,7 @@ mod tests {
 
         let mut source_batches = FxHashMap::default();
         source_batches.insert(
-            "trades".to_string(),
+            Arc::from("trades"),
             vec![eowc_batch(vec!["AAPL"], vec![150.0], vec![500])],
         );
 
@@ -3605,7 +3709,7 @@ mod tests {
         );
 
         // Advance watermark to 1000 → window [0, 1000) is now closed
-        let empty: FxHashMap<String, Vec<RecordBatch>> = FxHashMap::default();
+        let empty: FxHashMap<Arc<str>, Vec<RecordBatch>> = FxHashMap::default();
         let results = executor.execute_cycle(&empty, 1000).await.unwrap();
         assert!(
             results.contains_key("avg_price"),
@@ -3632,7 +3736,7 @@ mod tests {
         // Cycle 1: push data at ts=100
         let mut batches1 = FxHashMap::default();
         batches1.insert(
-            "trades".to_string(),
+            Arc::from("trades"),
             vec![eowc_batch(vec!["AAPL"], vec![100.0], vec![100])],
         );
         let r1 = executor.execute_cycle(&batches1, 200).await.unwrap();
@@ -3641,14 +3745,14 @@ mod tests {
         // Cycle 2: push more data at ts=400
         let mut batches2 = FxHashMap::default();
         batches2.insert(
-            "trades".to_string(),
+            Arc::from("trades"),
             vec![eowc_batch(vec!["AAPL"], vec![200.0], vec![400])],
         );
         let r2 = executor.execute_cycle(&batches2, 600).await.unwrap();
         assert!(!r2.contains_key("total"), "window not closed at wm=600");
 
         // Cycle 3: watermark crosses 1000 → emit accumulated
-        let empty: FxHashMap<String, Vec<RecordBatch>> = FxHashMap::default();
+        let empty: FxHashMap<Arc<str>, Vec<RecordBatch>> = FxHashMap::default();
         let r3 = executor.execute_cycle(&empty, 1000).await.unwrap();
         assert!(r3.contains_key("total"), "window closed at wm=1000");
         let batches = &r3["total"];
@@ -3682,7 +3786,7 @@ mod tests {
         // Push data spanning two windows: [0,1000) and [1000,2000)
         let mut batches = FxHashMap::default();
         batches.insert(
-            "trades".to_string(),
+            Arc::from("trades"),
             vec![eowc_batch(
                 vec!["AAPL", "AAPL", "AAPL"],
                 vec![100.0, 200.0, 300.0],
@@ -3703,7 +3807,7 @@ mod tests {
         assert_eq!(cnt, 2, "first window should have 2 rows");
 
         // Watermark at 2000 → window [1000,2000) closes, 1 row (ts=1500)
-        let empty: FxHashMap<String, Vec<RecordBatch>> = FxHashMap::default();
+        let empty: FxHashMap<Arc<str>, Vec<RecordBatch>> = FxHashMap::default();
         let r2 = executor.execute_cycle(&empty, 2000).await.unwrap();
         assert!(r2.contains_key("cnt"));
         let cnt2 = r2["cnt"][0]
@@ -3733,7 +3837,7 @@ mod tests {
 
         let mut source_batches = FxHashMap::default();
         source_batches.insert(
-            "trades".to_string(),
+            Arc::from("trades"),
             vec![eowc_batch(vec!["AAPL"], vec![150.0], vec![500])],
         );
 
@@ -3776,7 +3880,7 @@ mod tests {
 
         let mut source_batches = FxHashMap::default();
         source_batches.insert(
-            "trades".to_string(),
+            Arc::from("trades"),
             vec![eowc_batch(vec!["AAPL"], vec![150.0], vec![500])],
         );
 
@@ -3789,7 +3893,7 @@ mod tests {
         // Provide an empty batch so the "trades" table is still registered
         let mut empty_source = FxHashMap::default();
         empty_source.insert(
-            "trades".to_string(),
+            Arc::from("trades"),
             vec![RecordBatch::new_empty(eowc_test_schema())],
         );
         let results = executor.execute_cycle(&empty_source, 1000).await.unwrap();
@@ -3987,7 +4091,7 @@ mod tests {
         assert!(executor.queries[1].table_refs.contains("events"));
 
         let mut source_batches = FxHashMap::default();
-        source_batches.insert("events".to_string(), vec![test_batch()]);
+        source_batches.insert(Arc::from("events"), vec![test_batch()]);
 
         let results = executor
             .execute_cycle(&source_batches, i64::MAX)
@@ -4108,7 +4212,7 @@ mod tests {
         );
 
         let mut source_batches = FxHashMap::default();
-        source_batches.insert("events".to_string(), vec![test_batch()]); // 3 rows
+        source_batches.insert(Arc::from("events"), vec![test_batch()]); // 3 rows
 
         let results = executor
             .execute_cycle(&source_batches, i64::MAX)
@@ -4158,7 +4262,7 @@ mod tests {
         );
 
         let mut source_batches = FxHashMap::default();
-        source_batches.insert("trades".to_string(), vec![mixed_case_batch()]);
+        source_batches.insert(Arc::from("trades"), vec![mixed_case_batch()]);
 
         let results = executor
             .execute_cycle(&source_batches, i64::MAX)
@@ -4193,7 +4297,7 @@ mod tests {
         );
 
         let mut source_batches = FxHashMap::default();
-        source_batches.insert("trades".to_string(), vec![mixed_case_batch()]);
+        source_batches.insert(Arc::from("trades"), vec![mixed_case_batch()]);
 
         let results = executor
             .execute_cycle(&source_batches, i64::MAX)
@@ -4221,7 +4325,7 @@ mod tests {
         );
 
         let mut source_batches = FxHashMap::default();
-        source_batches.insert("trades".to_string(), vec![mixed_case_batch()]);
+        source_batches.insert(Arc::from("trades"), vec![mixed_case_batch()]);
 
         let results = executor
             .execute_cycle(&source_batches, i64::MAX)
@@ -4248,7 +4352,7 @@ mod tests {
         );
 
         let mut source_batches = FxHashMap::default();
-        source_batches.insert("trades".to_string(), vec![mixed_case_batch()]);
+        source_batches.insert(Arc::from("trades"), vec![mixed_case_batch()]);
 
         let results = executor
             .execute_cycle(&source_batches, i64::MAX)
@@ -4283,7 +4387,7 @@ mod tests {
         // Cycle 1: push data in window [0, 1000) with watermark at 500
         let mut batches1 = FxHashMap::default();
         batches1.insert(
-            "trades".to_string(),
+            Arc::from("trades"),
             vec![eowc_batch(vec!["AAPL"], vec![100.0], vec![500])],
         );
         let r1 = executor.execute_cycle(&batches1, 500).await.unwrap();
@@ -4294,7 +4398,7 @@ mod tests {
         // NOT emit open-window rows.
         let mut batches2 = FxHashMap::default();
         batches2.insert(
-            "trades".to_string(),
+            Arc::from("trades"),
             vec![eowc_batch(vec!["AAPL"], vec![200.0], vec![600])],
         );
         let r2 = executor.execute_cycle(&batches2, 500).await.unwrap();
@@ -4304,7 +4408,7 @@ mod tests {
         );
 
         // Cycle 3: watermark advances to 1000 → window closes
-        let empty: FxHashMap<String, Vec<RecordBatch>> = FxHashMap::default();
+        let empty: FxHashMap<Arc<str>, Vec<RecordBatch>> = FxHashMap::default();
         let r3 = executor.execute_cycle(&empty, 1000).await.unwrap();
         assert!(r3.contains_key("total"), "window closed at wm=1000");
 
@@ -4321,5 +4425,83 @@ mod tests {
             "expected 300 (100+200), got {} — data loss from force-emit!",
             total_col.value(0)
         );
+    }
+
+    #[tokio::test]
+    async fn test_state_size_limit_fails_query() {
+        let ctx = create_session_context();
+        register_streaming_functions(&ctx);
+        let mut executor = StreamExecutor::new(ctx);
+        executor.set_max_state_bytes(Some(100)); // very low limit
+
+        let schema = Arc::new(Schema::new(vec![
+            Field::new("key", DataType::Utf8, false),
+            Field::new("val", DataType::Int64, false),
+        ]));
+        executor.register_source_schema("t".to_string(), schema.clone());
+        executor.add_query(
+            "agg".to_string(),
+            "SELECT key, SUM(val) FROM t GROUP BY key".to_string(),
+            None,
+            None,
+            None,
+        );
+
+        // Push enough distinct groups to exceed the limit
+        let batch = RecordBatch::try_new(
+            schema,
+            vec![
+                Arc::new(StringArray::from(
+                    (0..200).map(|i| format!("key_{i}")).collect::<Vec<_>>(),
+                )),
+                Arc::new(Int64Array::from((0..200).collect::<Vec<i64>>())),
+            ],
+        )
+        .unwrap();
+        let mut source = FxHashMap::default();
+        source.insert(Arc::from("t"), vec![batch]);
+
+        let result = executor.execute_cycle(&source, i64::MIN).await;
+        assert!(result.is_err(), "should fail when state limit exceeded");
+        let err = result.unwrap_err().to_string();
+        assert!(err.contains("state size limit exceeded"), "error: {err}");
+    }
+
+    #[tokio::test]
+    async fn test_state_size_no_limit_succeeds() {
+        // Default (no limit) should succeed even with many groups
+        let ctx = create_session_context();
+        register_streaming_functions(&ctx);
+        let mut executor = StreamExecutor::new(ctx);
+        // max_state_bytes defaults to None
+
+        let schema = Arc::new(Schema::new(vec![
+            Field::new("key", DataType::Utf8, false),
+            Field::new("val", DataType::Int64, false),
+        ]));
+        executor.register_source_schema("t".to_string(), schema.clone());
+        executor.add_query(
+            "agg".to_string(),
+            "SELECT key, SUM(val) FROM t GROUP BY key".to_string(),
+            None,
+            None,
+            None,
+        );
+
+        let batch = RecordBatch::try_new(
+            schema,
+            vec![
+                Arc::new(StringArray::from(
+                    (0..200).map(|i| format!("key_{i}")).collect::<Vec<_>>(),
+                )),
+                Arc::new(Int64Array::from((0..200).collect::<Vec<i64>>())),
+            ],
+        )
+        .unwrap();
+        let mut source = FxHashMap::default();
+        source.insert(Arc::from("t"), vec![batch]);
+
+        let result = executor.execute_cycle(&source, i64::MIN).await;
+        assert!(result.is_ok(), "should succeed without limit");
     }
 }

@@ -90,7 +90,7 @@ Three deployment modes:
 |------|-----|--------|
 | **Embedded** | `cargo add laminar-db` — runs inside your Rust process | ✅ Implemented |
 | **Standalone** | `laminardb` binary with HTTP API, configurable via TOML | ✅ Implemented |
-| **Distributed** | Multi-node via gossip discovery, Raft consensus, gRPC — `--features delta` | ✅ Implemented (not yet production-hardened; Phase 6c pending) |
+| **Distributed** | Multi-node via gossip discovery, Raft consensus, gRPC — `--features delta` | 🔧 Discovery only; coordination not yet functional (Phase 6c) |
 
 The embedded mode is the primary deployment target. You get a `LaminarDB` handle, register sources with SQL DDL, push `RecordBatch` data in, subscribe to output streams, and let the engine handle windowing, joins, checkpointing, and exactly-once delivery.
 
@@ -295,7 +295,7 @@ Custom connectors can be built using the `SourceConnector` / `SinkConnector` tra
 └──────────────────────────────────────────────────────────────┘
 ```
 
-- **Streaming coordinator** — Single tokio task driving SQL execution cycles. Source connectors push batches via mpsc channels; the coordinator runs compiled projections / cached logical plans, routes results to sinks, and manages checkpoint barriers. Target: sub-microsecond per-event latency.
+- **Streaming coordinator** — Single tokio task driving SQL execution cycles. Source connectors push batches via mpsc channels; the coordinator runs compiled projections / cached logical plans, routes results to sinks, and manages checkpoint barriers. Sub-microsecond for compiled projections; 1-10us for incremental aggregations; higher for DataFusion fallback queries.
 - **Background I/O** — Tokio async runtime handling WAL writes, checkpointing, connector I/O, and changelog draining.
 - **Admin** — HTTP admin API, metrics, configuration management. Auth and observability are planned (Phase 4/5).
 
@@ -303,8 +303,8 @@ See [docs/ARCHITECTURE.md](docs/ARCHITECTURE.md) for the full design.
 
 ### Checkpointing and Recovery
 
-1. **Per-Core WAL** — Each CPU core writes to its own WAL segment with CRC32C checksums and torn write detection
-2. **Coordinated Snapshots** — Barrier-based checkpoint protocol across all operators and sinks
+1. **WAL** — Write-ahead log segments with CRC32C checksums and torn write detection
+2. **Coordinated Snapshots** — Barrier-based checkpoint protocol: barriers align at source level between sources and the coordinator
 3. **Two-Phase Commit** — Sinks participate in pre-commit/commit phases for exactly-once delivery
 4. **Recovery** — `RecoveryManager` restores from the latest checkpoint manifest, replays WAL, resumes connectors from committed offsets
 
@@ -364,7 +364,7 @@ Additional benchmark suites: `window_bench`, `join_bench`, `lookup_join_bench`, 
 | Deployment | Library or binary | JVM cluster | JVM library | Distributed cluster | Proprietary binary |
 | Language | Rust (+ Python, C FFI) | Java/Scala/Python | Java | Rust/Python/SQL | Q/Python |
 | Embed in your process | Yes | No | Yes (JVM) | No | No |
-| Latency (per-event, microbench) | Sub-microsecond (Ring 0) | Milliseconds–seconds | Milliseconds | Milliseconds | Microseconds |
+| Latency (per-event, microbench) | Sub-microsecond (compiled queries, microbench) | Milliseconds–seconds | Milliseconds | Milliseconds | Microseconds |
 | Operational overhead | None (embedded) or single binary | K8s operator or YARN | Kafka cluster | etcd/K8s/S3 | Vendor support |
 | SQL | Full (DataFusion) | Flink SQL | None (DSL only) | Full (Postgres-compatible) | Q language |
 | Exactly-once | Yes (checkpoint + 2PC) | Yes | Yes | Yes | No |

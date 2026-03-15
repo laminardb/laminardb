@@ -4,6 +4,8 @@
 //! TPC coordinator can drive SQL cycles, sink writes, and checkpoints
 //! through a narrow interface.
 
+use std::sync::Arc;
+
 use arrow_array::RecordBatch;
 use laminar_connectors::checkpoint::SourceCheckpoint;
 use laminar_connectors::config::ConnectorConfig;
@@ -36,15 +38,15 @@ pub trait PipelineCallback: Send + 'static {
     /// Called with accumulated source batches to execute a SQL cycle.
     async fn execute_cycle(
         &mut self,
-        source_batches: &FxHashMap<String, Vec<RecordBatch>>,
+        source_batches: &FxHashMap<Arc<str>, Vec<RecordBatch>>,
         watermark: i64,
-    ) -> Result<FxHashMap<String, Vec<RecordBatch>>, String>;
+    ) -> Result<FxHashMap<Arc<str>, Vec<RecordBatch>>, String>;
 
     /// Called with results to push to stream subscriptions.
-    fn push_to_streams(&self, results: &FxHashMap<String, Vec<RecordBatch>>);
+    fn push_to_streams(&self, results: &FxHashMap<Arc<str>, Vec<RecordBatch>>);
 
     /// Called with results to write to sinks.
-    async fn write_to_sinks(&mut self, results: &FxHashMap<String, Vec<RecordBatch>>);
+    async fn write_to_sinks(&mut self, results: &FxHashMap<Arc<str>, Vec<RecordBatch>>);
 
     /// Extract watermark from a batch for a given source.
     fn extract_watermark(&mut self, source_name: &str, batch: &RecordBatch);

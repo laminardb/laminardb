@@ -78,6 +78,14 @@ pub struct PipelineCounters {
     pub last_checkpoint_duration_ms: AtomicU64,
     /// Current checkpoint epoch.
     pub checkpoint_epoch: AtomicU64,
+    /// Maximum configured state bytes per operator (0 = unlimited).
+    pub max_state_bytes: AtomicU64,
+    /// Cycle duration p50 in nanoseconds (updated periodically).
+    pub cycle_p50_ns: AtomicU64,
+    /// Cycle duration p95 in nanoseconds (updated periodically).
+    pub cycle_p95_ns: AtomicU64,
+    /// Cycle duration p99 in nanoseconds (updated periodically).
+    pub cycle_p99_ns: AtomicU64,
 }
 
 impl PipelineCounters {
@@ -96,6 +104,10 @@ impl PipelineCounters {
             checkpoints_failed: AtomicU64::new(0),
             last_checkpoint_duration_ms: AtomicU64::new(0),
             checkpoint_epoch: AtomicU64::new(0),
+            max_state_bytes: AtomicU64::new(0),
+            cycle_p50_ns: AtomicU64::new(0),
+            cycle_p95_ns: AtomicU64::new(0),
+            cycle_p99_ns: AtomicU64::new(0),
         }
     }
 
@@ -113,6 +125,10 @@ impl PipelineCounters {
             checkpoints_failed: self.checkpoints_failed.load(Ordering::Relaxed),
             last_checkpoint_duration_ms: self.last_checkpoint_duration_ms.load(Ordering::Relaxed),
             checkpoint_epoch: self.checkpoint_epoch.load(Ordering::Relaxed),
+            max_state_bytes: self.max_state_bytes.load(Ordering::Relaxed),
+            cycle_p50_ns: self.cycle_p50_ns.load(Ordering::Relaxed),
+            cycle_p95_ns: self.cycle_p95_ns.load(Ordering::Relaxed),
+            cycle_p99_ns: self.cycle_p99_ns.load(Ordering::Relaxed),
         }
     }
 }
@@ -146,6 +162,14 @@ pub struct CounterSnapshot {
     pub last_checkpoint_duration_ms: u64,
     /// Current checkpoint epoch.
     pub checkpoint_epoch: u64,
+    /// Maximum configured state bytes per operator (0 = unlimited).
+    pub max_state_bytes: u64,
+    /// Cycle duration p50 in nanoseconds.
+    pub cycle_p50_ns: u64,
+    /// Cycle duration p95 in nanoseconds.
+    pub cycle_p95_ns: u64,
+    /// Cycle duration p99 in nanoseconds.
+    pub cycle_p99_ns: u64,
 }
 
 /// Pipeline-wide metrics snapshot.
