@@ -330,18 +330,18 @@ Non-aggregate single-source queries are compiled to `PhysicalExpr` projections o
 
 ## Benchmarks
 
-Benchmark suites are in `crates/laminar-core/benches/`, `crates/laminar-storage/benches/`, and `crates/laminar-db/benches/` (18 total, using Criterion):
+Benchmark suites are in `crates/laminar-core/benches/`, `crates/laminar-storage/benches/`, and `crates/laminar-db/benches/` (14 total, using Criterion):
 
 | Metric | Target | Measured (mean) | Benchmark File |
 |--------|--------|-----------------|----------------|
 | State lookup | < 500ns | 10–105ns | `state_bench.rs` |
-| Throughput/core | 500K events/sec | 1.1–1.46M events/sec | `throughput_bench.rs` |
+| Throughput/core | 500K events/sec | 1.1–1.46M events/sec | `streaming_bench.rs` |
 | Event latency | < 10us | 0.55–1.16us | `latency_bench.rs` |
 | Checkpoint recovery | < 10s | 1.39ms | `checkpoint_bench.rs` |
 
 These are Criterion mean latencies measured on development hardware (AMD Ryzen AI 7 350, see [BENCHMARKS.md](docs/BENCHMARKS.md)) against minimal operator chains (single tumbling window for latency, single state lookup for state bench). Real pipelines with multiple operators, joins, and state lookups will show higher latency. p99 under sustained load is not yet measured. Run `cargo bench` to measure on your own hardware.
 
-Additional benchmark suites: `window_bench`, `join_bench`, `lookup_join_bench`, `cache_bench`, `compiler_bench`, `streaming_bench`, `subscription_bench`, `reactor_bench`, `tpc_bench`, `dag_bench`, `dag_stress`, `wal_bench`, `io_uring_bench`, `recovery_bench`.
+Additional benchmark suites: `window_bench`, `join_bench`, `lookup_join_bench`, `cache_bench`, `streaming_bench`, `subscription_bench`, `dag_bench`, `dag_stress`, `wal_bench`, `recovery_bench`.
 
 ---
 

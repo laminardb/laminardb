@@ -105,6 +105,8 @@ impl PipelineCallback for BarrierTrackingCallback {
     fn record_cycle(&self, _events_ingested: u64, _batches: u64, _elapsed_ns: u64) {}
 
     async fn poll_tables(&mut self) {}
+
+    fn apply_control(&mut self, _msg: laminar_db::pipeline::ControlMsg) {}
 }
 
 /// Test that barriers are injected and aligned across multiple sources,
@@ -144,7 +146,8 @@ async fn test_barrier_aligned_checkpoint_fires() {
         ..PipelineConfig::default()
     };
 
-    let coordinator = StreamingCoordinator::new(sources, config, shutdown)
+    let (_control_tx, control_rx) = tokio::sync::mpsc::channel(64);
+    let coordinator = StreamingCoordinator::new(sources, config, shutdown, control_rx)
         .await
         .unwrap();
 
@@ -290,7 +293,8 @@ async fn test_single_source_barrier_checkpoint() {
         ..PipelineConfig::default()
     };
 
-    let coordinator = StreamingCoordinator::new(sources, config, shutdown)
+    let (_control_tx, control_rx) = tokio::sync::mpsc::channel(64);
+    let coordinator = StreamingCoordinator::new(sources, config, shutdown, control_rx)
         .await
         .unwrap();
 
@@ -349,7 +353,8 @@ async fn test_exhausted_sources_with_shutdown() {
         ..PipelineConfig::default()
     };
 
-    let coordinator = StreamingCoordinator::new(sources, config, shutdown)
+    let (_control_tx, control_rx) = tokio::sync::mpsc::channel(64);
+    let coordinator = StreamingCoordinator::new(sources, config, shutdown, control_rx)
         .await
         .unwrap();
 

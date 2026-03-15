@@ -85,7 +85,6 @@ Admin and observability. No latency requirements.
 **Components:**
 - **Admin API** -- REST endpoints currently live in `laminar-server/src/http.rs`
 - **Metrics Export** -- Prometheus metrics and OpenTelemetry tracing
-- **Auth Engine** -- JWT authentication, RBAC/ABAC authorization
 - **Config Manager** -- Dynamic configuration, connector registry
 
 ## Data Flow
@@ -296,7 +295,7 @@ Pre-configured deployment tiers:
 |---------|-------------|
 | `InMemory` | Default. All state in memory, no durability. |
 | `Durable` | Object-store checkpoints for recovery. Requires `durable` feature. |
-| `Delta` | Full distributed mode with gossip, Raft, gRPC. Requires `delta` feature. |
+| `Delta` | Distributed scaffolding (gossip, Raft, gRPC stubs). Not production-ready. Requires `delta` feature. |
 
 ## Streaming SQL
 
@@ -346,7 +345,7 @@ The thread-per-core model described in earlier documentation was removed in PR #
 
 ### Two Execution Paths
 
-LaminarDB provides two execution paths for different use cases:
+LaminarDB provides two **intentionally separate** execution paths for different use cases:
 
 | Aspect | SQL Path | DAG Path |
 |--------|----------|----------|
@@ -358,6 +357,18 @@ LaminarDB provides two execution paths for different use cases:
 | API | SQL (`CREATE STREAM AS SELECT ...`) | Rust (`DagBuilder::new().source()...build()`) |
 
 The SQL path is the production path for SQL users. The DAG path is a programmatic Rust API for custom operator pipelines, exercised by tests and benchmarks.
+
+**Coordinator → Executor relationship (SQL path):** `StreamingCoordinator` is the
+single tokio task that owns the event loop. It calls `PipelineCallback::execute_cycle()`,
+which delegates to `StreamExecutor::execute_cycle()`. These are **not** three competing
+loops — the coordinator drives the executor through a callback interface.
+
+### Deployment Model
+
+LaminarDB is a **single-node** embedded database. All operator state is keyed by
+operator index (position in the query DAG). Multi-node partitioning
+(VNode-scoped state, distributed barriers, partition migration) is deferred to
+a future phase.
 
 ## Exactly-Once Semantics
 

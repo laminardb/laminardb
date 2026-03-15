@@ -91,6 +91,8 @@ pub struct StreamingCoordinator {
     /// cycle. Any subsequent batch from these sources goes to
     /// `post_barrier_buf`.
     barrier_seen: FxHashSet<usize>,
+    /// Control channel for live DDL (add/drop stream) from `LaminarDB`.
+    control_rx: mpsc::Receiver<super::ControlMsg>,
 }
 
 /// Tracks in-flight checkpoint barrier alignment.
@@ -146,6 +148,7 @@ impl StreamingCoordinator {
         sources: Vec<SourceRegistration>,
         config: PipelineConfig,
         shutdown: Arc<tokio::sync::Notify>,
+        control_rx: mpsc::Receiver<super::ControlMsg>,
     ) -> Result<Self, DbError> {
         // Validate delivery guarantee constraints.
         if config.delivery_guarantee == DeliveryGuarantee::ExactlyOnce {
@@ -306,6 +309,7 @@ impl StreamingCoordinator {
             source_batches_buf: FxHashMap::default(),
             post_barrier_buf: Vec::new(),
             barrier_seen: FxHashSet::default(),
+            control_rx,
         })
     }
 
@@ -424,21 +428,45 @@ impl StreamingCoordinator {
                 }
             }
 
+            // Hoist elapsed_ns so the background phase can use it.
+            #[allow(clippy::cast_possible_truncation)]
+            let cycle_elapsed_ns = cycle_start.elapsed().as_nanos() as u64;
+
             drop(event_priority);
             let _bg_priority = PriorityGuard::enter(PriorityClass::BackgroundIo);
+            let bg_start = Instant::now();
+            let bg_budget = self.config.background_budget_ns;
 
-            // Step: Handle barriers (after SQL cycle so checkpoint state
-            // includes the effects of processed batches).
+            // Step: Handle barriers — always process (cheap, O(num_sources)
+            // hash lookups, must not be deferred for correctness).
             for (source_idx, barrier) in &barriers_buf {
                 self.handle_barrier(*source_idx, barrier, &mut callback)
                     .await;
             }
 
-            // Step: Periodic checkpoint.
-            self.maybe_checkpoint(&mut callback).await;
+            // Step: Periodic checkpoint — skip if background budget already
+            // exhausted (checkpoint is expensive I/O).
+            #[allow(clippy::cast_possible_truncation)]
+            if (bg_start.elapsed().as_nanos() as u64) < bg_budget {
+                self.maybe_checkpoint(&mut callback).await;
+            }
 
-            // Step: Poll table sources.
-            callback.poll_tables().await;
+            // Step: Poll table sources — skip if cycle OR background budget
+            // exceeded (lowest priority background work).
+            #[allow(clippy::cast_possible_truncation)]
+            let bg_elapsed = bg_start.elapsed().as_nanos() as u64;
+            if cycle_elapsed_ns < self.config.cycle_budget_ns && bg_elapsed < bg_budget {
+                callback.poll_tables().await;
+            } else {
+                tracing::debug!("skipping poll_tables (budget exhausted)");
+            }
+
+            // Step: Drain control messages (add/drop stream DDL).
+            // Processed AFTER checkpoint so newly added queries don't have
+            // inconsistent state in the checkpoint.
+            while let Ok(msg) = self.control_rx.try_recv() {
+                callback.apply_control(msg);
+            }
 
             // Step: Barrier timeout check.
             if self.pending_barrier.active
@@ -676,6 +704,7 @@ mod tests {
 
         fn record_cycle(&self, _events: u64, _batches: u64, _elapsed_ns: u64) {}
         async fn poll_tables(&mut self) {}
+        fn apply_control(&mut self, _msg: crate::pipeline::ControlMsg) {}
     }
 
     /// Test that the coordinator processes messages via direct mpsc channel.
@@ -685,6 +714,7 @@ mod tests {
         let (tx, rx) = mpsc::channel(64);
 
         // Create coordinator directly (bypassing source spawning).
+        let (_control_tx, control_rx) = mpsc::channel(64);
         let coordinator = StreamingCoordinator {
             config: PipelineConfig {
                 batch_window: Duration::ZERO,
@@ -696,6 +726,8 @@ mod tests {
                 barrier_alignment_timeout: BARRIER_TIMEOUT,
                 cycle_budget_ns: 10_000_000,
                 drain_budget_ns: 1_000_000,
+                query_budget_ns: 8_000_000,
+                background_budget_ns: 5_000_000,
             },
             rx,
             source_handles: Vec::new(),
@@ -708,6 +740,7 @@ mod tests {
             source_batches_buf: FxHashMap::default(),
             post_barrier_buf: Vec::new(),
             barrier_seen: FxHashSet::default(),
+            control_rx,
         };
 
         let callback = MockCallback::new();
@@ -745,6 +778,7 @@ mod tests {
         let shutdown = Arc::new(tokio::sync::Notify::new());
         let schema = Arc::new(Schema::new(vec![Field::new("ts", DataType::Int64, false)]));
 
+        let (_control_tx2, control_rx2) = mpsc::channel(64);
         let mut coordinator = StreamingCoordinator {
             config: PipelineConfig {
                 batch_window: Duration::ZERO,
@@ -756,6 +790,8 @@ mod tests {
                 barrier_alignment_timeout: BARRIER_TIMEOUT,
                 cycle_budget_ns: 10_000_000,
                 drain_budget_ns: 1_000_000,
+                query_budget_ns: 8_000_000,
+                background_budget_ns: 5_000_000,
             },
             rx: mpsc::channel(64).1, // dummy, not used
             source_handles: Vec::new(),
@@ -768,6 +804,7 @@ mod tests {
             source_batches_buf: FxHashMap::default(),
             post_barrier_buf: Vec::new(),
             barrier_seen: FxHashSet::default(),
+            control_rx: control_rx2,
         };
 
         let mut callback = MockCallback::new();

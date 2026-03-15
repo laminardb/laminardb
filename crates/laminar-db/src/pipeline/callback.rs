@@ -92,4 +92,7 @@ pub trait PipelineCallback: Send + 'static {
 
     /// Poll table sources for incremental CDC changes.
     async fn poll_tables(&mut self);
+
+    /// Apply a DDL control message (add/drop stream) to the running pipeline.
+    fn apply_control(&mut self, msg: super::ControlMsg);
 }

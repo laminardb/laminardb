@@ -59,6 +59,17 @@ pub struct PipelineConfig {
     /// The drain loop terminates early when this budget is exhausted.
     /// Default: 1ms.
     pub drain_budget_ns: u64,
+
+    /// Maximum wall-clock time for per-query execution within a cycle
+    /// (nanoseconds). When elapsed time exceeds this budget, remaining
+    /// queries are deferred to the next cycle. At least one query always
+    /// executes for forward progress. Default: 8ms.
+    pub query_budget_ns: u64,
+
+    /// Maximum wall-clock time for background work (barriers, checkpoint,
+    /// table polling) after SQL execution (nanoseconds). When exceeded,
+    /// low-priority tasks (table polling) are skipped. Default: 5ms.
+    pub background_budget_ns: u64,
 }
 
 impl Default for PipelineConfig {
@@ -71,8 +82,10 @@ impl Default for PipelineConfig {
             batch_window: Duration::from_millis(5),
             barrier_alignment_timeout: Duration::from_secs(30),
             delivery_guarantee: DeliveryGuarantee::default(),
-            cycle_budget_ns: 10_000_000, // 10ms
-            drain_budget_ns: 1_000_000,  // 1ms
+            cycle_budget_ns: 10_000_000,     // 10ms
+            drain_budget_ns: 1_000_000,      // 1ms
+            query_budget_ns: 8_000_000,      // 8ms
+            background_budget_ns: 5_000_000, // 5ms
         }
     }
 }

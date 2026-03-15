@@ -92,6 +92,10 @@ pub struct LaminarDB {
     pub(crate) pipeline_watermark: Arc<std::sync::atomic::AtomicI64>,
     /// Shared lookup table registry for physical planning of lookup joins.
     pub(crate) lookup_registry: Arc<laminar_sql::datafusion::LookupTableRegistry>,
+    /// Control channel sender for live DDL to the running coordinator.
+    /// `None` before `start()` or after `shutdown()`.
+    pub(crate) control_tx:
+        parking_lot::Mutex<Option<tokio::sync::mpsc::Sender<crate::pipeline::ControlMsg>>>,
 }
 
 /// Per-source watermark tracking state for the pipeline loop.
@@ -244,6 +248,7 @@ impl LaminarDB {
             session_properties: parking_lot::Mutex::new(HashMap::new()),
             pipeline_watermark: Arc::new(std::sync::atomic::AtomicI64::new(i64::MIN)),
             lookup_registry,
+            control_tx: parking_lot::Mutex::new(None),
         })
     }
 

@@ -64,10 +64,15 @@ pub struct PipelineCounters {
     /// Total batches processed.
     pub total_batches: AtomicU64,
 
+    /// Queries using compiled `PhysicalExpr` (zero-overhead per cycle).
+    pub queries_compiled: AtomicU64,
+    /// Queries using cached logical plan (physical planning per cycle).
+    pub queries_cached_plan: AtomicU64,
+
     // ── Cache line padding ──
-    // Ring 0 group is 6 × 8 = 48 bytes. Pad to a full cache line boundary
+    // Ring 0 group is 8 × 8 = 64 bytes. Pad to a full cache line boundary
     // so Ring 2 counters start on a separate cache line.
-    _pad: [u8; CACHE_LINE_SIZE - (6 * std::mem::size_of::<AtomicU64>()) % CACHE_LINE_SIZE],
+    _pad: [u8; CACHE_LINE_SIZE - (8 * std::mem::size_of::<AtomicU64>()) % CACHE_LINE_SIZE],
 
     // ── Ring 2 counters (checkpoint coordinator, async) ──
     /// Total checkpoints completed successfully.
@@ -99,7 +104,9 @@ impl PipelineCounters {
             cycles: AtomicU64::new(0),
             last_cycle_duration_ns: AtomicU64::new(0),
             total_batches: AtomicU64::new(0),
-            _pad: [0; CACHE_LINE_SIZE - (6 * std::mem::size_of::<AtomicU64>()) % CACHE_LINE_SIZE],
+            queries_compiled: AtomicU64::new(0),
+            queries_cached_plan: AtomicU64::new(0),
+            _pad: [0; CACHE_LINE_SIZE - (8 * std::mem::size_of::<AtomicU64>()) % CACHE_LINE_SIZE],
             checkpoints_completed: AtomicU64::new(0),
             checkpoints_failed: AtomicU64::new(0),
             last_checkpoint_duration_ms: AtomicU64::new(0),
@@ -121,6 +128,8 @@ impl PipelineCounters {
             cycles: self.cycles.load(Ordering::Relaxed),
             last_cycle_duration_ns: self.last_cycle_duration_ns.load(Ordering::Relaxed),
             total_batches: self.total_batches.load(Ordering::Relaxed),
+            queries_compiled: self.queries_compiled.load(Ordering::Relaxed),
+            queries_cached_plan: self.queries_cached_plan.load(Ordering::Relaxed),
             checkpoints_completed: self.checkpoints_completed.load(Ordering::Relaxed),
             checkpoints_failed: self.checkpoints_failed.load(Ordering::Relaxed),
             last_checkpoint_duration_ms: self.last_checkpoint_duration_ms.load(Ordering::Relaxed),
@@ -154,6 +163,10 @@ pub struct CounterSnapshot {
     pub last_cycle_duration_ns: u64,
     /// Total batches processed.
     pub total_batches: u64,
+    /// Queries using compiled `PhysicalExpr` (zero-overhead per cycle).
+    pub queries_compiled: u64,
+    /// Queries using cached logical plan (physical planning per cycle).
+    pub queries_cached_plan: u64,
     /// Total checkpoints completed.
     pub checkpoints_completed: u64,
     /// Total checkpoints failed.

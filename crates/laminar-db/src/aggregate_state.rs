@@ -824,9 +824,10 @@ impl IncrementalAggState {
             None
         };
 
-        // Cache the optimized logical plan for multi-source pre-agg queries
-        // (when compiled projection is not available). This skips SQL parsing
-        // and logical optimization on subsequent cycles.
+        // ONE-TIME setup: cache the optimized logical plan for multi-source
+        // pre-agg queries (when compiled projection is not available). This
+        // ctx.sql() call runs ONLY at first-cycle initialization, never
+        // per-cycle. Subsequent cycles use the cached plan directly.
         // Fail fast if the pre-agg SQL is invalid — it would fail every cycle.
         let cached_pre_agg_plan = if compiled_projection.is_none() {
             match ctx.sql(&pre_agg_sql).await {

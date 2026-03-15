@@ -77,6 +77,29 @@ pub(crate) struct ConnectorPipelineCallback {
 }
 
 impl ConnectorPipelineCallback {
+    /// Snapshot operator state inline, then offload `serde_json::to_vec()`
+    /// to `spawn_blocking` so the coordinator's I/O reactor is not blocked.
+    /// The coordinator still awaits the result (no concurrent event processing).
+    async fn capture_and_serialize_operator_state(
+        &mut self,
+    ) -> Result<std::collections::HashMap<String, Vec<u8>>, String> {
+        let mut operator_states = HashMap::with_capacity(2);
+        let cp = match self.executor.snapshot_state() {
+            Ok(Some(cp)) => cp,
+            Ok(None) => return Ok(operator_states),
+            Err(e) => return Err(format!("snapshot failed: {e}")),
+        };
+        // Offload CPU-bound serialization to blocking thread pool.
+        let bytes = tokio::task::spawn_blocking(move || {
+            crate::stream_executor::StreamExecutor::serialize_checkpoint(&cp)
+        })
+        .await
+        .map_err(|e| format!("serialize join error: {e}"))?
+        .map_err(|e| format!("serialize error: {e}"))?;
+        operator_states.insert("stream_executor".to_string(), bytes);
+        Ok(operator_states)
+    }
+
     /// Try to compile sink filter SQL to `PhysicalExpr` for sinks that haven't been compiled yet.
     async fn compile_pending_sink_filters(
         &mut self,
@@ -349,29 +372,17 @@ impl crate::pipeline::PipelineCallback for ConnectorPipelineCallback {
             .map(|(name, cp)| (name.clone(), source_to_connector_checkpoint(cp)))
             .collect();
 
-        // Capture stream executor aggregate state and serialize inline.
+        // Capture stream executor aggregate state and serialize on blocking thread.
         // Abort the checkpoint if serialization fails — persisting source
         // offsets without matching operator state would cause data loss on
         // recovery (offsets advance past unreplayable state).
-        let mut operator_states = HashMap::with_capacity(2);
-        match self.executor.snapshot_state() {
-            Ok(Some(cp)) => {
-                match crate::stream_executor::StreamExecutor::serialize_checkpoint(&cp) {
-                    Ok(bytes) => {
-                        operator_states.insert("stream_executor".to_string(), bytes);
-                    }
-                    Err(e) => {
-                        tracing::warn!(error = %e, "Stream executor checkpoint serialization failed — skipping checkpoint");
-                        return false;
-                    }
-                }
-            }
-            Ok(None) => {}
+        let operator_states = match self.capture_and_serialize_operator_state().await {
+            Ok(states) => states,
             Err(e) => {
-                tracing::warn!(error = %e, "Stream executor checkpoint capture failed — skipping checkpoint");
+                tracing::warn!(error = %e, "Stream executor checkpoint failed — skipping checkpoint");
                 return false;
             }
-        }
+        };
 
         // Collect per-source watermarks from the watermark tracker.
         let mut per_source_watermarks = HashMap::with_capacity(self.watermark_states.len());
@@ -481,28 +492,16 @@ impl crate::pipeline::PipelineCallback for ConnectorPipelineCallback {
         }
 
         // Capture stream executor aggregate state — now consistent because
-        // all pre-barrier data has been executed. Serialize inline (single-threaded
-        // runtime). Abort if serialization fails — persisting source offsets
-        // without matching operator state would cause data loss on recovery.
-        let mut operator_states = HashMap::with_capacity(2);
-        match self.executor.snapshot_state() {
-            Ok(Some(cp)) => {
-                match crate::stream_executor::StreamExecutor::serialize_checkpoint(&cp) {
-                    Ok(bytes) => {
-                        operator_states.insert("stream_executor".to_string(), bytes);
-                    }
-                    Err(e) => {
-                        tracing::warn!(error = %e, "Stream executor checkpoint serialization failed — skipping barrier checkpoint");
-                        return false;
-                    }
-                }
-            }
-            Ok(None) => {}
+        // all pre-barrier data has been executed. Serialize on blocking thread.
+        // Abort if serialization fails — persisting source offsets without
+        // matching operator state would cause data loss on recovery.
+        let operator_states = match self.capture_and_serialize_operator_state().await {
+            Ok(states) => states,
             Err(e) => {
-                tracing::warn!(error = %e, "Stream executor checkpoint capture failed — skipping barrier checkpoint");
+                tracing::warn!(error = %e, "Stream executor barrier checkpoint failed — skipping");
                 return false;
             }
-        }
+        };
 
         // Collect per-source watermarks.
         let mut per_source_watermarks = HashMap::with_capacity(self.watermark_states.len());
@@ -592,6 +591,34 @@ impl crate::pipeline::PipelineCallback for ConnectorPipelineCallback {
             self.counters
                 .cycle_p99_ns
                 .store(p99 * 1_000_000, std::sync::atomic::Ordering::Relaxed);
+        }
+    }
+
+    fn apply_control(&mut self, msg: crate::pipeline::ControlMsg) {
+        match msg {
+            crate::pipeline::ControlMsg::AddStream {
+                name,
+                sql,
+                emit_clause,
+                window_config,
+                order_config,
+            } => {
+                self.executor.add_query(
+                    name.clone(),
+                    sql,
+                    emit_clause,
+                    window_config,
+                    order_config,
+                );
+                tracing::info!(stream = %name, "Stream added via control channel");
+            }
+            crate::pipeline::ControlMsg::DropStream { name } => {
+                self.executor.remove_query(&name);
+                tracing::info!(stream = %name, "Stream removed via control channel");
+            }
+            crate::pipeline::ControlMsg::AddSourceSchema { name, schema } => {
+                self.executor.register_source_schema(name, schema);
+            }
         }
     }
 
