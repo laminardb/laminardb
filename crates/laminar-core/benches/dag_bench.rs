@@ -23,9 +23,8 @@ use arrow_schema::{DataType, Field, Schema, SchemaRef};
 use criterion::{criterion_group, criterion_main, BenchmarkId, Criterion, Throughput};
 
 use laminar_core::dag::{
-    DagBuilder, DagCheckpointConfig, DagCheckpointCoordinator, DagCheckpointSnapshot, DagExecutor,
-    DagRecoveryManager, MulticastBuffer, NodeId, RoutingTable, SerializableOperatorState,
-    StreamingDag,
+    DagBuilder, DagCheckpointConfig, DagCheckpointCoordinator, DagCheckpointResult, DagExecutor,
+    MulticastBuffer, NodeId, RoutingTable, StreamingDag,
 };
 use laminar_core::operator::{
     Event, Operator, OperatorContext, OperatorError, OperatorState, Output, OutputVec, Timer,
@@ -516,7 +515,7 @@ fn bench_checkpoint_overhead(c: &mut Criterion) {
                 let mut coordinator = DagCheckpointCoordinator::new(
                     source_nodes,
                     all_nodes.clone(),
-                    DagCheckpointConfig::default(),
+                    &DagCheckpointConfig::default(),
                 );
 
                 let start = Instant::now();
@@ -561,39 +560,26 @@ fn bench_recovery(c: &mut Criterion) {
 
                 b.iter_batched(
                     || {
-                        // Setup: create a snapshot with the target state size.
-                        let mut node_states = HashMap::new();
+                        // Setup: create a checkpoint result with the target state size.
+                        let mut operator_states = HashMap::new();
                         for i in 0..10u32 {
-                            // op_0 through op_9 — node IDs depend on DAG
-                            // Use the actual node IDs from the DAG
                             let name = format!("op_{i}");
-                            let node_id = dag.node_id_by_name(&name).unwrap();
-                            node_states.insert(
-                                node_id.0,
-                                SerializableOperatorState {
-                                    operator_id: name,
-                                    version: 1,
-                                    data: vec![0xABu8; state_bytes_per_node],
-                                },
-                            );
+                            operator_states.insert(name, vec![0xABu8; state_bytes_per_node]);
                         }
-                        let snapshot = DagCheckpointSnapshot {
+                        DagCheckpointResult {
                             checkpoint_id: 1,
                             epoch: 1,
-                            timestamp: 1_000_000,
-                            node_states,
-                            source_offsets: HashMap::new(),
-                            watermark: Some(999_999),
-                        };
-                        DagRecoveryManager::with_snapshots(vec![snapshot])
+                            timestamp_ms: 1_000_000,
+                            operator_states,
+                        }
                     },
-                    |recovery| {
-                        // Timed: recover + restore
-                        let recovered = recovery.recover_latest().unwrap();
+                    |result| {
+                        // Timed: convert + restore
+                        let states = result.to_operator_states_by_index();
                         let mut executor = DagExecutor::from_dag(&dag);
                         register_passthrough_operators(&mut executor, &dag);
-                        executor.restore(&recovered.operator_states).unwrap();
-                        black_box(recovered.snapshot.epoch);
+                        executor.restore(&states).unwrap();
+                        black_box(result.epoch);
                     },
                     criterion::BatchSize::PerIteration,
                 );

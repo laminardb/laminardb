@@ -1,7 +1,7 @@
 //! Unified checkpoint coordinator.
 //!
 //! Single orchestrator that replaces `StreamCheckpointManager`,
-//! `PipelineCheckpointManager`, and the persistence side of `DagRecoveryManager`.
+//! `PipelineCheckpointManager`, and the persistence side of `DagCheckpointResult`.
 //! Lives in Ring 2 (control plane). Reuses the existing
 //! `DagCheckpointCoordinator` for barrier logic.
 //!
