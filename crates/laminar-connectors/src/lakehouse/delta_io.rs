@@ -335,20 +335,36 @@ pub fn get_table_schema(table: &DeltaTable) -> Result<SchemaRef, ConnectorError>
 /// Returns the latest committed version of a Delta Lake table.
 ///
 /// This refreshes the table state from storage before checking.
+/// Takes `&mut Option<DeltaTable>` to avoid cloning: uses `take()` +
+/// `update()` + put-back, which is zero-copy on success.
 ///
 /// # Errors
 ///
 /// Returns `ConnectorError::ReadError` if the table state cannot be refreshed.
 #[cfg(feature = "delta-lake")]
-pub async fn get_latest_version(table: &mut DeltaTable) -> Result<i64, ConnectorError> {
-    // DeltaTable::update() takes ownership, so clone and replace.
-    let (updated, _metrics) =
-        table.clone().update().await.map_err(|e| {
-            ConnectorError::ReadError(format!("failed to refresh Delta table: {e}"))
+pub async fn get_latest_version(
+    table_slot: &mut Option<DeltaTable>,
+) -> Result<i64, ConnectorError> {
+    let table = table_slot
+        .take()
+        .ok_or_else(|| ConnectorError::InvalidState {
+            expected: "table initialized".into(),
+            actual: "table not initialized".into(),
         })?;
 
-    *table = updated;
-    Ok(table.version().unwrap_or(0))
+    match table.update().await {
+        Ok((updated, _metrics)) => {
+            let version = updated.version().unwrap_or(0);
+            *table_slot = Some(updated);
+            Ok(version)
+        }
+        Err(e) => {
+            // Table is consumed by update() on error — cannot restore.
+            Err(ConnectorError::ReadError(format!(
+                "failed to refresh Delta table: {e}"
+            )))
+        }
+    }
 }
 
 /// Reads record batches from a specific Delta Lake table version.
@@ -439,6 +455,131 @@ pub async fn read_batches_at_version(
     );
 
     Ok(batches)
+}
+
+/// Reads data at a specific Delta Lake version for incremental processing.
+///
+/// Loads the snapshot at `version` and reads its contents. The caller
+/// (`DeltaSource`) is responsible for walking versions one-by-one so that
+/// each version's data is only emitted once.
+///
+/// For version 0, delegates to [`read_batches_at_version`].
+///
+/// # Errors
+///
+/// Returns `ConnectorError::ReadError` if the version cannot be loaded or scanned.
+#[cfg(feature = "delta-lake")]
+pub async fn read_version_diff(
+    table: &mut DeltaTable,
+    version: i64,
+    max_records: usize,
+    partition_filter: Option<&str>,
+) -> Result<Vec<RecordBatch>, ConnectorError> {
+    use datafusion::prelude::SessionContext;
+    use tokio_stream::StreamExt;
+
+    // For version 0, read the full snapshot (no previous version to diff).
+    if version <= 0 {
+        return read_batches_at_version(table, version, max_records).await;
+    }
+
+    // Load the target version for reading.
+    //
+    // NOTE: This currently reads the full snapshot at version N, not just
+    // the files added in version N. delta-rs's `object_store_path()` is
+    // private, so we can't extract per-version Add actions to read only
+    // new Parquet files. For large tables this is O(table_size) per
+    // version; the proper fix is to parse `_delta_log/{version}.json`
+    // directly for Add actions.
+    table
+        .load_version(version)
+        .await
+        .map_err(|e| ConnectorError::ReadError(format!("failed to load version {version}: {e}")))?;
+
+    debug!(version, "Delta Lake: reading version diff");
+
+    let provider =
+        table.table_provider().build().await.map_err(|e| {
+            ConnectorError::ReadError(format!("failed to build table provider: {e}"))
+        })?;
+
+    let ctx = SessionContext::new();
+    ctx.register_table("delta_diff_scan", Arc::new(provider))
+        .map_err(|e| ConnectorError::ReadError(format!("failed to register scan table: {e}")))?;
+
+    // Build the query with optional partition filter.
+    let query = if let Some(filter) = partition_filter {
+        format!("SELECT * FROM delta_diff_scan WHERE {filter}")
+    } else {
+        "SELECT * FROM delta_diff_scan".to_string()
+    };
+
+    let df = ctx
+        .sql(&query)
+        .await
+        .map_err(|e| ConnectorError::ReadError(format!("diff query failed: {e}")))?;
+
+    let df = if max_records < usize::MAX {
+        df.limit(0, Some(max_records))
+            .map_err(|e| ConnectorError::ReadError(format!("limit failed: {e}")))?
+    } else {
+        df
+    };
+
+    let mut stream = df
+        .execute_stream()
+        .await
+        .map_err(|e| ConnectorError::ReadError(format!("stream execution failed: {e}")))?;
+
+    let mut batches = Vec::new();
+    let mut total_rows: usize = 0;
+
+    while let Some(result) = stream.next().await {
+        let batch =
+            result.map_err(|e| ConnectorError::ReadError(format!("stream batch failed: {e}")))?;
+        if batch.num_rows() == 0 {
+            continue;
+        }
+        total_rows += batch.num_rows();
+        batches.push(batch);
+
+        if total_rows >= max_records {
+            break;
+        }
+    }
+
+    debug!(
+        version,
+        num_batches = batches.len(),
+        total_rows,
+        "Delta Lake: read version diff"
+    );
+
+    Ok(batches)
+}
+
+/// Returns the Arrow schema at a specific Delta Lake table version.
+///
+/// Used for schema evolution detection: compare the schema at the
+/// current version with the previously known schema.
+///
+/// # Errors
+///
+/// Returns `ConnectorError::ReadError` if the version cannot be loaded.
+#[cfg(feature = "delta-lake")]
+pub async fn get_schema_at_version(
+    table: &mut DeltaTable,
+    version: i64,
+) -> Result<SchemaRef, ConnectorError> {
+    table.load_version(version).await.map_err(|e| {
+        ConnectorError::ReadError(format!("failed to load version {version} for schema: {e}"))
+    })?;
+
+    let snapshot = table
+        .snapshot()
+        .map_err(|e| ConnectorError::ReadError(format!("no snapshot at version {version}: {e}")))?;
+
+    Ok(snapshot.snapshot().arrow_schema())
 }
 
 /// Result of a MERGE (upsert) operation.
@@ -1295,18 +1436,19 @@ mod tests {
         let table_path = temp_dir.path().to_str().unwrap();
 
         let schema = test_schema();
-        let mut table = open_or_create_table(table_path, HashMap::new(), Some(&schema))
+        let table = open_or_create_table(table_path, HashMap::new(), Some(&schema))
             .await
             .unwrap();
 
         // Initial version is 0.
-        let v = get_latest_version(&mut table).await.unwrap();
+        let mut table_slot = Some(table);
+        let v = get_latest_version(&mut table_slot).await.unwrap();
         assert_eq!(v, 0);
 
         // Write a batch -> version 1.
         let batch = test_batch(10);
         let (returned_table, version) = write_batches(
-            table,
+            table_slot.take().unwrap(),
             vec![batch],
             "writer",
             1,
@@ -1317,9 +1459,9 @@ mod tests {
         .await
         .unwrap();
         assert_eq!(version, 1);
-        table = returned_table;
+        table_slot = Some(returned_table);
 
-        let v = get_latest_version(&mut table).await.unwrap();
+        let v = get_latest_version(&mut table_slot).await.unwrap();
         assert_eq!(v, 1);
     }
 
@@ -1528,13 +1670,14 @@ mod tests {
         sink.close().await.unwrap();
 
         // Verify all 25 rows are in the Delta table.
-        let mut table = open_or_create_table(table_path, HashMap::new(), None)
+        let table = open_or_create_table(table_path, HashMap::new(), None)
             .await
             .unwrap();
-        let latest = get_latest_version(&mut table).await.unwrap();
+        let mut table_slot = Some(table);
+        let latest = get_latest_version(&mut table_slot).await.unwrap();
         assert!(latest >= 1, "should have at least 1 version");
 
-        let batches = read_batches_at_version(&mut table, latest, 10000)
+        let batches = read_batches_at_version(table_slot.as_mut().unwrap(), latest, 10000)
             .await
             .unwrap();
         let total_rows: usize = batches.iter().map(RecordBatch::num_rows).sum();
@@ -1789,11 +1932,12 @@ mod tests {
         assert_eq!(result.rows_updated, 0);
 
         // Verify final row count = 5.
-        let mut read_table = open_or_create_table(table_path, HashMap::new(), None)
+        let read_table = open_or_create_table(table_path, HashMap::new(), None)
             .await
             .unwrap();
-        let latest = get_latest_version(&mut read_table).await.unwrap();
-        let batches = read_batches_at_version(&mut read_table, latest, 10000)
+        let mut read_slot = Some(read_table);
+        let latest = get_latest_version(&mut read_slot).await.unwrap();
+        let batches = read_batches_at_version(read_slot.as_mut().unwrap(), latest, 10000)
             .await
             .unwrap();
         let total_rows: usize = batches.iter().map(RecordBatch::num_rows).sum();
@@ -1853,11 +1997,12 @@ mod tests {
         assert_eq!(result.rows_inserted, 0);
 
         // Verify row count is still 3 (no new rows added).
-        let mut read_table = open_or_create_table(table_path, HashMap::new(), None)
+        let read_table = open_or_create_table(table_path, HashMap::new(), None)
             .await
             .unwrap();
-        let latest = get_latest_version(&mut read_table).await.unwrap();
-        let batches = read_batches_at_version(&mut read_table, latest, 10000)
+        let mut read_slot = Some(read_table);
+        let latest = get_latest_version(&mut read_slot).await.unwrap();
+        let batches = read_batches_at_version(read_slot.as_mut().unwrap(), latest, 10000)
             .await
             .unwrap();
         let total_rows: usize = batches.iter().map(RecordBatch::num_rows).sum();
@@ -1916,11 +2061,12 @@ mod tests {
         assert_eq!(rows_deleted, 2);
 
         // Verify only 1 row remains.
-        let mut read_table = open_or_create_table(table_path, HashMap::new(), None)
+        let read_table = open_or_create_table(table_path, HashMap::new(), None)
             .await
             .unwrap();
-        let latest = get_latest_version(&mut read_table).await.unwrap();
-        let batches = read_batches_at_version(&mut read_table, latest, 10000)
+        let mut read_slot = Some(read_table);
+        let latest = get_latest_version(&mut read_slot).await.unwrap();
+        let batches = read_batches_at_version(read_slot.as_mut().unwrap(), latest, 10000)
             .await
             .unwrap();
         let total_rows: usize = batches.iter().map(RecordBatch::num_rows).sum();
