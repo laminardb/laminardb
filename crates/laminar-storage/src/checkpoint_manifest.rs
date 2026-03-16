@@ -1,7 +1,7 @@
 //! Unified checkpoint manifest types.
 //!
 //! The [`CheckpointManifest`] is the single source of truth for checkpoint state,
-//! replacing the previously separate `PipelineCheckpoint`, `DagCheckpointSnapshot`,
+//! replacing the previously separate `PipelineCheckpoint`, `DagCheckpointResult`,
 //! and `CheckpointMetadata` types. One manifest captures ALL state at a point in
 //! time: source offsets, sink epochs, operator state, WAL positions, and watermarks.
 //!
@@ -41,7 +41,7 @@ pub enum SinkCommitStatus {
 /// This is the single source of truth for checkpoint persistence, replacing
 /// the three previously disconnected checkpoint systems:
 /// - `PipelineCheckpoint` (source offsets + sink epochs)
-/// - `DagCheckpointSnapshot` (operator state — in-memory only)
+/// - `DagCheckpointResult` (operator state — in-memory only)
 /// - `CheckpointMetadata` (WAL position + watermark)
 #[derive(Debug, Clone, serde::Serialize, serde::Deserialize, PartialEq)]
 pub struct CheckpointManifest {
@@ -131,6 +131,24 @@ pub struct CheckpointManifest {
     /// before resuming normal processing.
     #[serde(default)]
     pub inflight_data: HashMap<String, Vec<InFlightRecord>>,
+
+    // ── Vnode Assignment ──
+    /// Vnode assignment version at checkpoint start.
+    ///
+    /// Monotonically increasing counter incremented on each vnode reassignment.
+    /// Recovery compares this against the current assignment version to detect
+    /// ownership changes since the checkpoint. Required for safe cross-node
+    /// vnode recovery during rebalancing.
+    #[serde(default)]
+    pub assignment_version: u64,
+    /// Vnode-to-node mapping at checkpoint time (`vnode_id` → `node_id`).
+    ///
+    /// Records which node owned which vnode when the checkpoint was taken.
+    /// On recovery after a rebalance, new owners fetch vnode state from
+    /// object storage using this map to identify the original writer.
+    /// Empty for single-node deployments.
+    #[serde(default)]
+    pub vnode_map: HashMap<u16, u64>,
 
     // ── Metadata ──
     /// Virtual partition count used for state key distribution.
@@ -234,6 +252,20 @@ impl CheckpointManifest {
             });
         }
 
+        // vnode_map entries must reference valid vnode IDs (< vnode_count).
+        if self.vnode_count > 0 && !self.vnode_map.is_empty() {
+            for &vnode_id in self.vnode_map.keys() {
+                if vnode_id >= self.vnode_count {
+                    errors.push(ManifestValidationError {
+                        message: format!(
+                            "vnode_map contains vnode_id {vnode_id} >= vnode_count {}",
+                            self.vnode_count
+                        ),
+                    });
+                }
+            }
+        }
+
         // vnode_count must be set (non-zero) and match the runtime constant.
         // A mismatch means the checkpoint was created with a different partition
         // scheme and cannot be safely restored.
@@ -282,6 +314,8 @@ impl CheckpointManifest {
             sink_names: Vec::new(),
             pipeline_hash: None,
             inflight_data: HashMap::new(),
+            assignment_version: 0,
+            vnode_map: HashMap::new(),
             vnode_count: laminar_core::state::VNODE_COUNT,
             size_bytes: 0,
             is_incremental: false,

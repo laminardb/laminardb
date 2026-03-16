@@ -272,7 +272,12 @@ impl<'a> RecoveryManager<'a> {
     /// For any operator state marked as `external`, loads the corresponding
     /// bytes from `state.bin` and replaces it with an inline entry. This
     /// makes the rest of recovery code work uniformly with inline state.
-    fn resolve_external_states(&self, manifest: &mut CheckpointManifest) {
+    ///
+    /// Returns `true` if all external states were resolved successfully.
+    /// Returns `false` if any state could not be resolved (missing sidecar,
+    /// truncated sidecar, or I/O error). In strict mode, the caller should
+    /// treat a `false` return as a corrupt checkpoint and try fallback.
+    fn resolve_external_states(&self, manifest: &mut CheckpointManifest) -> bool {
         let external_ops: Vec<String> = manifest
             .operator_states
             .iter()
@@ -281,7 +286,7 @@ impl<'a> RecoveryManager<'a> {
             .collect();
 
         if external_ops.is_empty() {
-            return;
+            return true;
         }
 
         let state_data = match self.store.load_state_data(manifest.checkpoint_id) {
@@ -290,7 +295,7 @@ impl<'a> RecoveryManager<'a> {
                 error!(
                     checkpoint_id = manifest.checkpoint_id,
                     operators = ?external_ops,
-                    "sidecar state.bin missing — external operator states \
+                    "[LDB-6010] sidecar state.bin missing — external operator states \
                      cannot be resolved; operators will start with empty state"
                 );
                 // Clear external flag so recovery doesn't attempt to
@@ -300,14 +305,14 @@ impl<'a> RecoveryManager<'a> {
                         *op = laminar_storage::checkpoint_manifest::OperatorCheckpoint::inline(&[]);
                     }
                 }
-                return;
+                return false;
             }
             Err(e) => {
                 error!(
                     checkpoint_id = manifest.checkpoint_id,
                     error = %e,
                     operators = ?external_ops,
-                    "failed to load sidecar state.bin — external operator states \
+                    "[LDB-6010] failed to load sidecar state.bin — external operator states \
                      cannot be resolved; operators will start with empty state"
                 );
                 for name in &external_ops {
@@ -315,10 +320,11 @@ impl<'a> RecoveryManager<'a> {
                         *op = laminar_storage::checkpoint_manifest::OperatorCheckpoint::inline(&[]);
                     }
                 }
-                return;
+                return false;
             }
         };
 
+        let mut all_resolved = true;
         for (name, op) in &mut manifest.operator_states {
             if op.external {
                 #[allow(clippy::cast_possible_truncation)] // Sidecar files are always < 4 GB
@@ -342,13 +348,15 @@ impl<'a> RecoveryManager<'a> {
                         offset = start,
                         length = op.external_length,
                         sidecar_len = state_data.len(),
-                        "sidecar too small for external operator state — \
+                        "[LDB-6010] sidecar too small for external operator state — \
                          operator will start with empty state"
                     );
                     *op = laminar_storage::checkpoint_manifest::OperatorCheckpoint::inline(&[]);
+                    all_resolved = false;
                 }
             }
         }
+        all_resolved
     }
 
     /// Restores pipeline state from a loaded manifest.
@@ -364,7 +372,16 @@ impl<'a> RecoveryManager<'a> {
         table_sources: &[RegisteredSource],
     ) -> RecoveredState {
         // Resolve external operator states from sidecar before recovery.
-        self.resolve_external_states(&mut manifest);
+        // In strict mode, unresolved sidecar state is recorded as a source
+        // error so check_strict() will reject this checkpoint.
+        let sidecar_ok = self.resolve_external_states(&mut manifest);
+        if !sidecar_ok && self.strict {
+            warn!(
+                checkpoint_id = manifest.checkpoint_id,
+                "[LDB-6010] sidecar resolution failed in strict mode — \
+                 checkpoint will be rejected"
+            );
+        }
 
         // Validate manifest consistency before restoring state.
         let validation_errors = manifest.validate();
@@ -448,6 +465,16 @@ impl<'a> RecoveryManager<'a> {
             source_errors: HashMap::new(),
             sink_errors: HashMap::new(),
         };
+
+        // Record sidecar failure so check_strict() rejects this checkpoint.
+        if !sidecar_ok {
+            result.source_errors.insert(
+                "__sidecar__".into(),
+                "[LDB-6010] sidecar state.bin missing or truncated — \
+                 operator state cannot be fully restored"
+                    .into(),
+            );
+        }
 
         // Step 3: Restore source offsets
         for source in sources {
@@ -947,7 +974,10 @@ mod tests {
             .insert("orphan".into(), OperatorCheckpoint::external(0, 100));
         store.save(&manifest).unwrap();
 
-        let mgr = RecoveryManager::new(&store);
+        // Use lenient mode — graceful degradation replaces missing
+        // sidecar state with empty inline. Strict mode rejects this
+        // checkpoint entirely (see test_recover_missing_sidecar_strict).
+        let mgr = RecoveryManager::lenient(&store);
         let result = mgr.recover(&[], &[], &[]).await.unwrap().unwrap();
 
         // Should still recover (gracefully) — external state replaced with
@@ -984,5 +1014,28 @@ mod tests {
             sink_errors: HashMap::new(),
         };
         assert!(state_with_errors.has_errors());
+    }
+
+    #[tokio::test]
+    async fn test_recover_missing_sidecar_strict_rejects() {
+        let dir = tempfile::tempdir().unwrap();
+        let store = make_store(dir.path());
+
+        // Manifest references external state but sidecar is missing
+        let mut manifest = CheckpointManifest::new(1, 1);
+        manifest
+            .operator_states
+            .insert("orphan".into(), OperatorCheckpoint::external(0, 100));
+        store.save(&manifest).unwrap();
+
+        // Strict mode: missing sidecar causes the checkpoint to be rejected
+        // and recovery falls back. With only one checkpoint, this means
+        // fresh start.
+        let mgr = RecoveryManager::new(&store);
+        let result = mgr.recover(&[], &[], &[]).await.unwrap();
+        assert!(
+            result.is_none(),
+            "strict mode should reject checkpoint with missing sidecar"
+        );
     }
 }

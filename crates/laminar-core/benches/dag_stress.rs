@@ -415,7 +415,7 @@ fn stress_checkpoint_under_load(c: &mut Criterion) {
                 let mut coordinator = DagCheckpointCoordinator::new(
                     source_nodes,
                     all_nodes,
-                    DagCheckpointConfig::default(),
+                    &DagCheckpointConfig::default(),
                 );
 
                 latencies.clear();

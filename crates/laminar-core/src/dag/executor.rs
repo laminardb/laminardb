@@ -51,11 +51,11 @@ use crate::operator::{
 use crate::state::InMemoryStore;
 use crate::time::{BoundedOutOfOrdernessGenerator, TimerService};
 
-use super::checkpoint::CheckpointBarrier;
 use super::error::DagError;
 use super::routing::RoutingTable;
 use super::topology::{DagNodeType, NodeId, StreamingDag};
 use super::watermark::{DagWatermarkCheckpoint, DagWatermarkTracker};
+use crate::checkpoint::CheckpointBarrier;
 
 /// Per-node runtime state (timer service, state store, watermark generator).
 ///
