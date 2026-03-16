@@ -6,11 +6,21 @@
 //!
 //! Endpoint: `POST /api/2.1/unity-catalog/tables/`
 
+use std::time::Duration;
+
 use arrow_schema::{DataType, SchemaRef};
 use serde_json::json;
 use tracing::info;
 
 use crate::error::ConnectorError;
+
+/// Builds a shared `reqwest::Client` with a 30-second timeout.
+fn http_client() -> reqwest::Client {
+    reqwest::Client::builder()
+        .timeout(Duration::from_secs(30))
+        .build()
+        .expect("failed to build reqwest client")
+}
 
 /// Converts an Arrow `SchemaRef` into Unity Catalog `ColumnInfo` JSON objects.
 ///
@@ -113,7 +123,7 @@ pub(crate) async fn create_uc_table(
         "creating external Delta table in Unity Catalog"
     );
 
-    let client = reqwest::Client::new();
+    let client = http_client();
     let resp = client
         .post(&url)
         .bearer_auth(access_token)
@@ -188,7 +198,7 @@ pub(crate) async fn get_table_storage_location(
         full_table_name,
     );
 
-    let client = reqwest::Client::new();
+    let client = http_client();
     let resp = client
         .get(&url)
         .bearer_auth(access_token)
