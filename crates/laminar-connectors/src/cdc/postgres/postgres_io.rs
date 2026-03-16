@@ -185,7 +185,6 @@ fn validate_pg_identifier(value: &str, field: &str) -> Result<(), ConnectorError
 
 /// Builds the `START_REPLICATION` SQL command.
 ///
-/// This returns the query string to be sent via the `CopyBoth` protocol.
 /// Returns the query string to be sent via the `CopyBoth` protocol.
 ///
 /// # Errors
