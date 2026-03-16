@@ -76,8 +76,10 @@ pub struct DeltaLakeSinkConfig {
     /// Catalog schema name (required for Unity).
     pub catalog_schema: Option<String>,
 
-    /// Additional catalog-specific properties.
-    pub catalog_properties: HashMap<String, String>,
+    /// Storage location for auto-created Unity Catalog external tables.
+    /// When set and the `uc://` table doesn't exist, the sink creates it
+    /// via the Unity Catalog REST API at this storage location.
+    pub catalog_storage_location: Option<String>,
 }
 
 impl Default for DeltaLakeSinkConfig {
@@ -101,7 +103,7 @@ impl Default for DeltaLakeSinkConfig {
             catalog_database: None,
             catalog_name: None,
             catalog_schema: None,
-            catalog_properties: HashMap::new(),
+            catalog_storage_location: None,
         }
     }
 }
@@ -247,7 +249,9 @@ impl DeltaLakeSinkConfig {
                 *access_token = v.to_string();
             }
         }
-        cfg.catalog_properties = config.properties_with_prefix("catalog.prop.");
+        if let Some(v) = config.get("catalog.storage.location") {
+            cfg.catalog_storage_location = Some(v.to_string());
+        }
 
         // Resolve storage credentials: explicit options + environment variable fallbacks.
         let explicit_storage = config.properties_with_prefix("storage.");
@@ -888,7 +892,7 @@ mod tests {
         assert!(cfg.catalog_database.is_none());
         assert!(cfg.catalog_name.is_none());
         assert!(cfg.catalog_schema.is_none());
-        assert!(cfg.catalog_properties.is_empty());
+        assert!(cfg.catalog_storage_location.is_none());
     }
 
     #[test]
@@ -973,21 +977,21 @@ mod tests {
     }
 
     #[test]
-    fn test_catalog_properties_prefix() {
+    fn test_catalog_storage_location_default_none() {
+        let config = make_config(&required_pairs());
+        let cfg = DeltaLakeSinkConfig::from_config(&config).unwrap();
+        assert!(cfg.catalog_storage_location.is_none());
+    }
+
+    #[test]
+    fn test_catalog_storage_location_parsed() {
         let mut pairs = required_pairs();
-        pairs.extend_from_slice(&[
-            ("catalog.prop.token", "my_token"),
-            ("catalog.prop.warehouse", "my_wh"),
-        ]);
+        pairs.push(("catalog.storage.location", "s3://bucket/warehouse/table"));
         let config = make_config(&pairs);
         let cfg = DeltaLakeSinkConfig::from_config(&config).unwrap();
         assert_eq!(
-            cfg.catalog_properties.get("token"),
-            Some(&"my_token".to_string())
-        );
-        assert_eq!(
-            cfg.catalog_properties.get("warehouse"),
-            Some(&"my_wh".to_string())
+            cfg.catalog_storage_location.as_deref(),
+            Some("s3://bucket/warehouse/table")
         );
     }
 }
