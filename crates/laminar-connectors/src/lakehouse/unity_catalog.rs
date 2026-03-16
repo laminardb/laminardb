@@ -170,6 +170,70 @@ pub(crate) async fn create_uc_table(
     )))
 }
 
+/// Resolves a Unity Catalog table's storage location via the REST API.
+///
+/// Calls `GET /api/2.0/unity-catalog/tables/{full_name}` and extracts
+/// the `storage_location` field from the response. This bypasses
+/// delta-rs's built-in `uc://` handling which requires credential vending
+/// (denied outside Databricks compute).
+pub(crate) async fn get_table_storage_location(
+    workspace_url: &str,
+    access_token: &str,
+    full_table_name: &str,
+) -> Result<String, ConnectorError> {
+    let url = format!(
+        "{}/api/2.0/unity-catalog/tables/{}",
+        workspace_url.trim_end_matches('/'),
+        full_table_name,
+    );
+
+    let client = reqwest::Client::new();
+    let resp = client
+        .get(&url)
+        .bearer_auth(access_token)
+        .send()
+        .await
+        .map_err(|e| {
+            ConnectorError::ConnectionFailed(format!("Unity Catalog REST request failed: {e}"))
+        })?;
+
+    let status = resp.status();
+    if status.as_u16() == 401 || status.as_u16() == 403 {
+        let body = resp.text().await.unwrap_or_default();
+        return Err(ConnectorError::AuthenticationFailed(format!(
+            "Unity Catalog auth failed (HTTP {status}): {body}"
+        )));
+    }
+
+    if !status.is_success() {
+        let body = resp.text().await.unwrap_or_default();
+        return Err(ConnectorError::ConnectionFailed(format!(
+            "Unity Catalog get table failed (HTTP {status}): {body}"
+        )));
+    }
+
+    let body: serde_json::Value = resp.json().await.map_err(|e| {
+        ConnectorError::ConnectionFailed(format!("failed to parse UC response: {e}"))
+    })?;
+
+    let location = body["storage_location"]
+        .as_str()
+        .ok_or_else(|| {
+            ConnectorError::ConfigurationError(
+                "Unity Catalog table response missing 'storage_location' field".into(),
+            )
+        })?
+        .to_string();
+
+    info!(
+        table = full_table_name,
+        storage_location = %location,
+        "resolved storage location from Unity Catalog"
+    );
+
+    Ok(location)
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;

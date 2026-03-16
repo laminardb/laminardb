@@ -946,19 +946,21 @@ pub async fn resolve_catalog_options(
             workspace_url,
             access_token,
         } => {
-            // The deltalake-catalog-unity crate auto-registers a factory for
-            // uc:// URIs via #[ctor]. It reads `databricks_host` and
-            // `databricks_token` from storage options (or DATABRICKS_HOST /
-            // DATABRICKS_TOKEN env vars). We inject from config so users can
-            // specify credentials in TOML instead of env vars.
-            let mut opts = base_storage_options.clone();
-            if !workspace_url.is_empty() {
-                opts.insert("databricks_host".to_string(), workspace_url.clone());
-            }
-            if !access_token.is_empty() {
-                opts.insert("databricks_token".to_string(), access_token.clone());
-            }
-            Ok((table_path.to_string(), opts))
+            // Resolve the table's actual storage location from Unity Catalog
+            // via REST API, then return that direct path (s3://, az://, gs://)
+            // instead of the uc:// URI. This bypasses delta-rs's built-in
+            // uc:// handling which requires credential vending — a feature
+            // that is denied outside Databricks compute environments.
+            let full_name = table_path.strip_prefix("uc://").unwrap_or(table_path);
+
+            let storage_location = super::unity_catalog::get_table_storage_location(
+                workspace_url,
+                access_token,
+                full_name,
+            )
+            .await?;
+
+            Ok((storage_location, base_storage_options.clone()))
         }
         #[cfg(not(feature = "delta-lake-unity"))]
         DeltaCatalogType::Unity { .. } => Err(ConnectorError::ConfigurationError(
