@@ -20,12 +20,20 @@ use crate::operator::OperatorState;
 
 use super::topology::NodeId;
 
+/// Versioned operator state bytes stored in a [`DagCheckpointResult`].
+#[derive(Debug, Clone)]
+pub struct OperatorStateEntry {
+    /// State format version (from [`OperatorState::version`]).
+    pub version: u32,
+    /// Raw serialized bytes (from [`OperatorState::data`]).
+    pub data: Vec<u8>,
+}
+
 /// Result of a finalized DAG checkpoint.
 ///
-/// Stores operator states as `HashMap<String, Vec<u8>>` keyed by operator name
-/// — the same format consumed by `CheckpointCoordinator::checkpoint()`. This
-/// eliminates the need for a separate snapshot type and ensures
-/// DAG checkpoints can be persisted through the unified checkpoint path.
+/// Stores operator states keyed by operator name. The raw `data` bytes
+/// can be extracted via [`to_data_map()`](Self::to_data_map) for passing
+/// to `CheckpointCoordinator::checkpoint()`.
 #[derive(Debug, Clone)]
 pub struct DagCheckpointResult {
     /// Unique checkpoint identifier.
@@ -35,18 +43,15 @@ pub struct DagCheckpointResult {
     /// Timestamp when the checkpoint was triggered (millis since epoch).
     pub timestamp_ms: i64,
     /// Per-operator state keyed by `OperatorState::operator_id`.
-    ///
-    /// Values are the raw serialized bytes from `OperatorState::data`.
-    /// This map can be passed directly to `CheckpointCoordinator::checkpoint()`
-    /// for persistence.
-    pub operator_states: HashMap<String, Vec<u8>>,
+    pub operator_states: HashMap<String, OperatorStateEntry>,
 }
 
 impl DagCheckpointResult {
     /// Creates a checkpoint result from a collected map of operator states.
     ///
     /// Converts from the internal `FxHashMap<NodeId, OperatorState>` (keyed by
-    /// DAG node index) to `HashMap<String, Vec<u8>>` (keyed by operator name).
+    /// DAG node index) to `HashMap<String, OperatorStateEntry>` (keyed by
+    /// operator name). Preserves the original `OperatorState::version`.
     pub(crate) fn from_operator_states(
         checkpoint_id: u64,
         epoch: u64,
@@ -55,7 +60,15 @@ impl DagCheckpointResult {
     ) -> Self {
         let operator_states = states
             .values()
-            .map(|state| (state.operator_id.clone(), state.data.clone()))
+            .map(|state| {
+                (
+                    state.operator_id.clone(),
+                    OperatorStateEntry {
+                        version: state.version,
+                        data: state.data.clone(),
+                    },
+                )
+            })
             .collect();
 
         Self {
@@ -64,6 +77,16 @@ impl DagCheckpointResult {
             timestamp_ms,
             operator_states,
         }
+    }
+
+    /// Extracts a `HashMap<String, Vec<u8>>` for passing to
+    /// `CheckpointCoordinator::checkpoint()`.
+    #[must_use]
+    pub fn to_data_map(&self) -> HashMap<String, Vec<u8>> {
+        self.operator_states
+            .iter()
+            .map(|(name, entry)| (name.clone(), entry.data.clone()))
+            .collect()
     }
 
     /// Converts operator states back to `FxHashMap<NodeId, OperatorState>`.
@@ -81,15 +104,20 @@ impl DagCheckpointResult {
         name_to_node: &HashMap<String, NodeId>,
     ) -> FxHashMap<NodeId, OperatorState> {
         let mut result = FxHashMap::default();
-        for (name, data) in &self.operator_states {
+        for (name, entry) in &self.operator_states {
             if let Some(&node_id) = name_to_node.get(name) {
                 result.insert(
                     node_id,
                     OperatorState {
                         operator_id: name.clone(),
-                        version: 1,
-                        data: data.clone(),
+                        version: entry.version,
+                        data: entry.data.clone(),
                     },
+                );
+            } else {
+                tracing::debug!(
+                    operator = %name,
+                    "checkpoint operator not found in current DAG topology, skipping"
                 );
             }
         }
@@ -104,14 +132,14 @@ impl DagCheckpointResult {
     #[must_use]
     pub fn to_operator_states_by_index(&self) -> FxHashMap<NodeId, OperatorState> {
         let mut result = FxHashMap::default();
-        for (name, data) in &self.operator_states {
+        for (name, entry) in &self.operator_states {
             if let Ok(idx) = name.parse::<u32>() {
                 result.insert(
                     NodeId(idx),
                     OperatorState {
                         operator_id: name.clone(),
-                        version: 1,
-                        data: data.clone(),
+                        version: entry.version,
+                        data: entry.data.clone(),
                     },
                 );
             }

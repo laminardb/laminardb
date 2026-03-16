@@ -1908,8 +1908,16 @@ fn test_checkpoint_config_defaults() {
 
 #[test]
 fn test_recovery_result_to_operator_states() {
+    use super::recovery::OperatorStateEntry;
+
     let mut operator_states = std::collections::HashMap::new();
-    operator_states.insert("1".to_string(), vec![42]);
+    operator_states.insert(
+        "1".to_string(),
+        OperatorStateEntry {
+            version: 1,
+            data: vec![42],
+        },
+    );
 
     let result = DagCheckpointResult {
         checkpoint_id: 5,

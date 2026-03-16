@@ -24,7 +24,7 @@ use criterion::{criterion_group, criterion_main, BenchmarkId, Criterion, Through
 
 use laminar_core::dag::{
     DagBuilder, DagCheckpointConfig, DagCheckpointCoordinator, DagCheckpointResult, DagExecutor,
-    MulticastBuffer, NodeId, RoutingTable, StreamingDag,
+    MulticastBuffer, NodeId, OperatorStateEntry, RoutingTable, StreamingDag,
 };
 use laminar_core::operator::{
     Event, Operator, OperatorContext, OperatorError, OperatorState, Output, OutputVec, Timer,
@@ -564,7 +564,13 @@ fn bench_recovery(c: &mut Criterion) {
                         let mut operator_states = HashMap::new();
                         for i in 0..10u32 {
                             let name = format!("op_{i}");
-                            operator_states.insert(name, vec![0xABu8; state_bytes_per_node]);
+                            operator_states.insert(
+                                name,
+                                OperatorStateEntry {
+                                    version: 1,
+                                    data: vec![0xABu8; state_bytes_per_node],
+                                },
+                            );
                         }
                         DagCheckpointResult {
                             checkpoint_id: 1,

@@ -84,7 +84,7 @@ pub use checkpoint::{
 pub use error::DagError;
 pub use executor::{DagExecutor, DagExecutorMetrics, OperatorNodeMetrics};
 pub use multicast::MulticastBuffer;
-pub use recovery::DagCheckpointResult;
+pub use recovery::{DagCheckpointResult, OperatorStateEntry};
 pub use routing::{RoutingEntry, RoutingTable, MAX_PORTS};
 pub use topology::{
     DagChannelType, DagEdge, DagNode, DagNodeType, EdgeId, NodeId, PartitioningStrategy,
