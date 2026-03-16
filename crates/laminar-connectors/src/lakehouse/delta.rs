@@ -586,6 +586,10 @@ async fn ensure_uc_table_exists(
     };
 
     let Some(arrow_schema) = schema else {
+        warn!(
+            "catalog.storage.location is set but no schema available — \
+             skipping Unity Catalog auto-create"
+        );
         return Ok(());
     };
 

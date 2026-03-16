@@ -4,7 +4,7 @@
 //! Catalog, this module creates it via the Databricks REST API before
 //! delta-rs opens it.
 //!
-//! Endpoint: `POST /api/2.0/unity-catalog/tables/`
+//! Endpoint: `POST /api/2.1/unity-catalog/tables/`
 
 use arrow_schema::{DataType, SchemaRef};
 use serde_json::json;
@@ -24,11 +24,12 @@ pub(crate) fn arrow_to_uc_columns(schema: &SchemaRef) -> Vec<serde_json::Value> 
         .enumerate()
         .map(|(pos, field)| {
             let (type_name, type_text) = arrow_type_to_uc(field.data_type());
-            let (precision, scale) = match field.data_type() {
+            // Decimal needs precision/scale in type_text: "decimal(10,2)"
+            let (precision, scale, type_text) = match field.data_type() {
                 DataType::Decimal128(p, s) | DataType::Decimal256(p, s) => {
-                    (i64::from(*p), i64::from(*s))
+                    (i64::from(*p), i64::from(*s), format!("decimal({p},{s})"))
                 }
-                _ => (0, 0),
+                _ => (0, 0, type_text.to_string()),
             };
             json!({
                 "name": field.name(),
@@ -77,7 +78,7 @@ fn arrow_type_to_uc(dt: &DataType) -> (&'static str, &'static str) {
 
 /// Creates an external Delta table in Unity Catalog via the REST API.
 ///
-/// Sends `POST /api/2.0/unity-catalog/tables/` with the table metadata.
+/// Sends `POST /api/2.1/unity-catalog/tables/` with the table metadata.
 /// Treats HTTP 200 as success and HTTP 409 (already exists) as idempotent
 /// success. All other errors are propagated.
 pub(crate) async fn create_uc_table(
@@ -90,7 +91,7 @@ pub(crate) async fn create_uc_table(
     columns: &[serde_json::Value],
 ) -> Result<(), ConnectorError> {
     let url = format!(
-        "{}/api/2.0/unity-catalog/tables/",
+        "{}/api/2.1/unity-catalog/tables/",
         workspace_url.trim_end_matches('/')
     );
 
@@ -172,7 +173,7 @@ pub(crate) async fn create_uc_table(
 
 /// Resolves a Unity Catalog table's storage location via the REST API.
 ///
-/// Calls `GET /api/2.0/unity-catalog/tables/{full_name}` and extracts
+/// Calls `GET /api/2.1/unity-catalog/tables/{full_name}` and extracts
 /// the `storage_location` field from the response. This bypasses
 /// delta-rs's built-in `uc://` handling which requires credential vending
 /// (denied outside Databricks compute).
@@ -182,7 +183,7 @@ pub(crate) async fn get_table_storage_location(
     full_table_name: &str,
 ) -> Result<String, ConnectorError> {
     let url = format!(
-        "{}/api/2.0/unity-catalog/tables/{}",
+        "{}/api/2.1/unity-catalog/tables/{}",
         workspace_url.trim_end_matches('/'),
         full_table_name,
     );
@@ -291,7 +292,8 @@ mod tests {
         let cols = arrow_to_uc_columns(&schema);
 
         assert_eq!(cols[0]["type_name"], "DECIMAL");
-        assert_eq!(cols[0]["type_text"], "decimal");
+        assert_eq!(cols[0]["type_text"], "decimal(10,2)");
+        assert_eq!(cols[0]["type_json"], "\"decimal(10,2)\"");
         assert_eq!(cols[0]["type_precision"], 10);
         assert_eq!(cols[0]["type_scale"], 2);
     }
