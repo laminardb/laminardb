@@ -632,7 +632,13 @@ impl SinkConnector for DeltaLakeSink {
         {
             use super::delta_io;
 
-            // Merge catalog options (Unity/Glue) into storage options.
+            // For uc:// tables, pre-create in Unity Catalog if needed.
+            // Must run before resolve_catalog_options which calls GET on the table.
+            #[cfg(feature = "delta-lake-unity")]
+            ensure_uc_table_exists(&self.config, self.schema.as_ref()).await?;
+
+            // Resolve catalog path: for Unity this calls GET to get the
+            // storage_location, bypassing delta-rs credential vending.
             let (resolved_path, merged_options) = delta_io::resolve_catalog_options(
                 &self.config.catalog_type,
                 self.config.catalog_database.as_deref(),
@@ -642,10 +648,6 @@ impl SinkConnector for DeltaLakeSink {
                 &self.config.storage_options,
             )
             .await?;
-
-            // For uc:// tables, pre-create in Unity Catalog if needed.
-            #[cfg(feature = "delta-lake-unity")]
-            ensure_uc_table_exists(&self.config, self.schema.as_ref()).await?;
 
             let table = delta_io::open_or_create_table(
                 &resolved_path,
