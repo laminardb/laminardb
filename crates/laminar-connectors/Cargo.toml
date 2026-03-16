@@ -94,7 +94,7 @@ delta-lake = ["dep:deltalake", "dep:url", "dep:datafusion", "deltalake/datafusio
 delta-lake-s3 = ["delta-lake", "deltalake/s3"]
 delta-lake-azure = ["delta-lake", "deltalake/azure"]
 delta-lake-gcs = ["delta-lake", "deltalake/gcs"]
-delta-lake-unity = ["delta-lake", "deltalake/unity-experimental"]
+delta-lake-unity = ["delta-lake", "deltalake/unity-experimental", "dep:reqwest"]
 delta-lake-glue = ["delta-lake", "delta-lake-s3", "deltalake/glue", "dep:deltalake-catalog-glue"]
 # Parquet file lookup source
 parquet-lookup = ["dep:parquet", "dep:object_store"]

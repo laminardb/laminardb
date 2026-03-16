@@ -45,9 +45,6 @@ pub struct DeltaSourceConfig {
 
     /// Catalog schema name (required for Unity).
     pub catalog_schema: Option<String>,
-
-    /// Additional catalog-specific properties.
-    pub catalog_properties: HashMap<String, String>,
 }
 
 impl Default for DeltaSourceConfig {
@@ -61,7 +58,6 @@ impl Default for DeltaSourceConfig {
             catalog_database: None,
             catalog_name: None,
             catalog_schema: None,
-            catalog_properties: HashMap::new(),
         }
     }
 }
@@ -133,8 +129,6 @@ impl DeltaSourceConfig {
                 *access_token = v.to_string();
             }
         }
-        cfg.catalog_properties = config.properties_with_prefix("catalog.prop.");
-
         // Resolve storage credentials.
         let explicit_storage = config.properties_with_prefix("storage.");
         let resolved = StorageCredentialResolver::resolve(&cfg.table_path, &explicit_storage);

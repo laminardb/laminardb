@@ -45,6 +45,8 @@ pub mod delta_source;
 pub mod delta_source_config;
 #[cfg(feature = "delta-lake")]
 pub mod delta_table_provider;
+#[cfg(feature = "delta-lake-unity")]
+pub(crate) mod unity_catalog;
 
 // Common metrics
 pub mod metrics;
@@ -206,8 +208,8 @@ fn delta_lake_config_keys() -> Vec<ConfigKeySpec> {
             "",
         ),
         ConfigKeySpec::optional(
-            "catalog.prop.*",
-            "Catalog-specific properties (pass-through)",
+            "catalog.storage.location",
+            "Storage location for auto-created UC external tables (e.g. s3://bucket/path)",
             "",
         ),
         // ── Cloud storage credentials (resolved via StorageCredentialResolver) ──
@@ -313,11 +315,6 @@ fn delta_lake_source_config_keys() -> Vec<ConfigKeySpec> {
             "Databricks access token (required for Unity)",
             "",
         ),
-        ConfigKeySpec::optional(
-            "catalog.prop.*",
-            "Catalog-specific properties (pass-through)",
-            "",
-        ),
         // ── Cloud storage credentials ──
         ConfigKeySpec::optional("storage.aws_access_key_id", "AWS access key ID", ""),
         ConfigKeySpec::optional("storage.aws_secret_access_key", "AWS secret access key", ""),
@@ -407,7 +404,7 @@ mod tests {
         assert!(optional.contains(&"catalog.schema"));
         assert!(optional.contains(&"catalog.workspace_url"));
         assert!(optional.contains(&"catalog.access_token"));
-        assert!(optional.contains(&"catalog.prop.*"));
+        assert!(optional.contains(&"catalog.storage.location"));
     }
 
     #[test]

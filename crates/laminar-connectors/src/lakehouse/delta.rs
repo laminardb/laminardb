@@ -565,6 +565,55 @@ async fn compaction_loop(
     }
 }
 
+/// Pre-creates a Unity Catalog external Delta table via the REST API if
+/// `catalog.storage.location` is configured and a schema is available.
+/// Idempotent: treats "already exists" (HTTP 409 / `ALREADY_EXISTS`) as success.
+#[cfg(all(feature = "delta-lake", feature = "delta-lake-unity"))]
+async fn ensure_uc_table_exists(
+    config: &DeltaLakeSinkConfig,
+    schema: Option<&SchemaRef>,
+) -> Result<(), ConnectorError> {
+    let super::delta_config::DeltaCatalogType::Unity {
+        ref workspace_url,
+        ref access_token,
+    } = config.catalog_type
+    else {
+        return Ok(());
+    };
+
+    let Some(ref storage_location) = config.catalog_storage_location else {
+        return Ok(());
+    };
+
+    let Some(arrow_schema) = schema else {
+        warn!(
+            "catalog.storage.location is set but no schema available — \
+             skipping Unity Catalog auto-create"
+        );
+        return Ok(());
+    };
+
+    let catalog = config.catalog_name.as_deref().unwrap_or_default();
+    let schema_name = config.catalog_schema.as_deref().unwrap_or_default();
+    let table_name = config
+        .table_path
+        .strip_prefix("uc://")
+        .and_then(|s| s.rsplit('.').next())
+        .unwrap_or(&config.table_path);
+
+    let columns = super::unity_catalog::arrow_to_uc_columns(arrow_schema);
+    super::unity_catalog::create_uc_table(
+        workspace_url,
+        access_token,
+        catalog,
+        schema_name,
+        table_name,
+        storage_location,
+        &columns,
+    )
+    .await
+}
+
 #[async_trait]
 impl SinkConnector for DeltaLakeSink {
     async fn open(&mut self, config: &ConnectorConfig) -> Result<(), ConnectorError> {
@@ -587,7 +636,13 @@ impl SinkConnector for DeltaLakeSink {
         {
             use super::delta_io;
 
-            // Merge catalog options (Unity/Glue) into storage options.
+            // For uc:// tables, pre-create in Unity Catalog if needed.
+            // Must run before resolve_catalog_options which calls GET on the table.
+            #[cfg(feature = "delta-lake-unity")]
+            ensure_uc_table_exists(&self.config, self.schema.as_ref()).await?;
+
+            // Resolve catalog path: for Unity this calls GET to get the
+            // storage_location, bypassing delta-rs credential vending.
             let (resolved_path, merged_options) = delta_io::resolve_catalog_options(
                 &self.config.catalog_type,
                 self.config.catalog_database.as_deref(),
@@ -595,7 +650,6 @@ impl SinkConnector for DeltaLakeSink {
                 self.config.catalog_schema.as_deref(),
                 &self.config.table_path,
                 &self.config.storage_options,
-                &self.config.catalog_properties,
             )
             .await?;
 
