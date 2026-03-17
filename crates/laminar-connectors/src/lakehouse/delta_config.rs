@@ -209,6 +209,19 @@ impl DeltaLakeSinkConfig {
                 ConnectorError::ConfigurationError(format!("invalid compaction.min-files: '{v}'"))
             })?;
         }
+        if let Some(v) = config.get("compaction.check-interval.ms") {
+            let ms: u64 = v.parse().map_err(|_| {
+                ConnectorError::ConfigurationError(format!(
+                    "invalid compaction.check-interval.ms: '{v}'"
+                ))
+            })?;
+            if ms == 0 {
+                return Err(ConnectorError::ConfigurationError(
+                    "compaction.check-interval.ms must be > 0".into(),
+                ));
+            }
+            cfg.compaction.check_interval = Duration::from_millis(ms);
+        }
         if let Some(v) = config.get("vacuum.retention.hours") {
             let hours: u64 = v.parse().map_err(|_| {
                 ConnectorError::ConfigurationError(format!("invalid vacuum.retention.hours: '{v}'"))
@@ -308,11 +321,25 @@ impl DeltaLakeSinkConfig {
                 "checkpoint.interval must be > 0".into(),
             ));
         }
+        if self.compaction.check_interval.is_zero() {
+            return Err(ConnectorError::ConfigurationError(
+                "compaction.check-interval.ms must be > 0".into(),
+            ));
+        }
 
         // Validate catalog-specific requirements.
+        // Fail-fast if the required feature is not compiled in, rather than
+        // deferring the error to runtime when resolve_catalog_options is called.
         match &self.catalog_type {
             DeltaCatalogType::None => {}
             DeltaCatalogType::Glue => {
+                #[cfg(not(feature = "delta-lake-glue"))]
+                return Err(ConnectorError::ConfigurationError(
+                    "Glue catalog requires the 'delta-lake-glue' feature. \
+                     Build with: cargo build --features delta-lake-glue"
+                        .into(),
+                ));
+                #[cfg(feature = "delta-lake-glue")]
                 if self.catalog_database.is_none() {
                     return Err(ConnectorError::ConfigurationError(
                         "Glue catalog requires 'catalog.database' to be set".into(),
@@ -323,25 +350,45 @@ impl DeltaLakeSinkConfig {
                 workspace_url,
                 access_token,
             } => {
-                if workspace_url.is_empty() {
+                #[cfg(not(feature = "delta-lake-unity"))]
+                {
+                    // Suppress unused-variable warnings for the destructured fields.
+                    let _ = (workspace_url, access_token);
                     return Err(ConnectorError::ConfigurationError(
-                        "Unity catalog requires 'catalog.workspace_url' to be set".into(),
+                        "Unity catalog requires the 'delta-lake-unity' feature. \
+                         Build with: cargo build --features delta-lake-unity"
+                            .into(),
                     ));
                 }
-                if access_token.is_empty() {
-                    return Err(ConnectorError::ConfigurationError(
-                        "Unity catalog requires 'catalog.access_token' to be set".into(),
-                    ));
-                }
-                if self.catalog_name.is_none() {
-                    return Err(ConnectorError::ConfigurationError(
-                        "Unity catalog requires 'catalog.name' to be set".into(),
-                    ));
-                }
-                if self.catalog_schema.is_none() {
-                    return Err(ConnectorError::ConfigurationError(
-                        "Unity catalog requires 'catalog.schema' to be set".into(),
-                    ));
+                #[cfg(feature = "delta-lake-unity")]
+                {
+                    if workspace_url.is_empty() {
+                        return Err(ConnectorError::ConfigurationError(
+                            "Unity catalog requires 'catalog.workspace_url' to be set".into(),
+                        ));
+                    }
+                    if access_token.is_empty() {
+                        return Err(ConnectorError::ConfigurationError(
+                            "Unity catalog requires 'catalog.access_token' to be set".into(),
+                        ));
+                    }
+                    // catalog.name and catalog.schema are only required when
+                    // auto-create is enabled (catalog.storage.location is set).
+                    // Without auto-create, the table name is derived from table_path.
+                    if self.catalog_storage_location.is_some() {
+                        if self.catalog_name.is_none() {
+                            return Err(ConnectorError::ConfigurationError(
+                                "Unity catalog auto-create requires 'catalog.name' to be set"
+                                    .into(),
+                            ));
+                        }
+                        if self.catalog_schema.is_none() {
+                            return Err(ConnectorError::ConfigurationError(
+                                "Unity catalog auto-create requires 'catalog.schema' to be set"
+                                    .into(),
+                            ));
+                        }
+                    }
                 }
             }
         }
@@ -924,6 +971,7 @@ mod tests {
         assert!(cfg.catalog_storage_location.is_none());
     }
 
+    #[cfg(feature = "delta-lake-glue")]
     #[test]
     fn test_catalog_glue_valid() {
         let mut pairs = required_pairs();
@@ -937,6 +985,7 @@ mod tests {
         assert_eq!(cfg.catalog_database.as_deref(), Some("my_database"));
     }
 
+    #[cfg(feature = "delta-lake-glue")]
     #[test]
     fn test_catalog_glue_missing_database() {
         let mut pairs = required_pairs();

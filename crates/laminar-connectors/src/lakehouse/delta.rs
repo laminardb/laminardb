@@ -123,6 +123,11 @@ pub struct DeltaLakeSink {
     /// Handle for the background compaction task.
     #[cfg(feature = "delta-lake")]
     compaction_handle: Option<tokio::task::JoinHandle<()>>,
+    /// When true, Delta table init is deferred until the first `write_batch()`
+    /// provides a schema. This happens when Unity Catalog auto-create is
+    /// configured but the pipeline schema is not yet available at `open()` time.
+    #[cfg(feature = "delta-lake")]
+    needs_deferred_delta_init: bool,
 }
 
 impl DeltaLakeSink {
@@ -156,6 +161,8 @@ impl DeltaLakeSink {
             compaction_cancel: None,
             #[cfg(feature = "delta-lake")]
             compaction_handle: None,
+            #[cfg(feature = "delta-lake")]
+            needs_deferred_delta_init: false,
         }
     }
 
@@ -165,6 +172,100 @@ impl DeltaLakeSink {
         let mut sink = Self::new(config);
         sink.schema = Some(schema);
         sink
+    }
+
+    /// Initializes the Delta table: auto-creates in Unity Catalog if needed,
+    /// resolves the catalog path, opens or creates the Delta table, and spawns
+    /// the compaction loop. Called from `open()` or deferred to the first
+    /// `write_batch()` when the schema is not yet available at open time.
+    #[cfg(feature = "delta-lake")]
+    async fn init_delta_table(&mut self) -> Result<(), ConnectorError> {
+        use super::delta_io;
+
+        // For uc:// tables, pre-create in Unity Catalog if needed.
+        // Must run before resolve_catalog_options which calls GET on the table.
+        #[cfg(feature = "delta-lake-unity")]
+        ensure_uc_table_exists(&self.config, self.schema.as_ref()).await?;
+
+        // Resolve catalog path: for Unity this calls GET to get the
+        // storage_location, bypassing delta-rs credential vending.
+        let (resolved_path, merged_options) = delta_io::resolve_catalog_options(
+            &self.config.catalog_type,
+            self.config.catalog_database.as_deref(),
+            self.config.catalog_name.as_deref(),
+            self.config.catalog_schema.as_deref(),
+            &self.config.table_path,
+            &self.config.storage_options,
+        )
+        .await?;
+
+        // Inject default connection timeouts if not explicitly set.
+        // Azure load balancers close idle connections after ~4 minutes.
+        // Without these, a stale connection causes writes to hang forever.
+        let mut merged_options = merged_options;
+        merged_options
+            .entry("timeout".to_string())
+            .or_insert_with(|| "120s".to_string());
+        merged_options
+            .entry("connect_timeout".to_string())
+            .or_insert_with(|| "30s".to_string());
+        merged_options
+            .entry("pool_idle_timeout".to_string())
+            .or_insert_with(|| "60s".to_string());
+
+        // Persist resolved values for reopen_table() on conflict retry.
+        self.resolved_table_path.clone_from(&resolved_path);
+        self.resolved_storage_options.clone_from(&merged_options);
+
+        let table = delta_io::open_or_create_table(
+            &resolved_path,
+            merged_options.clone(),
+            self.schema.as_ref(),
+        )
+        .await?;
+
+        // Read schema from existing table if we don't have one.
+        if self.schema.is_none() {
+            if let Ok(schema) = delta_io::get_table_schema(&table) {
+                self.schema = Some(schema);
+            }
+        }
+
+        // Resolve last committed epoch for exactly-once recovery.
+        if self.config.delivery_guarantee == DeliveryGuarantee::ExactlyOnce {
+            self.last_committed_epoch =
+                delta_io::get_last_committed_epoch(&table, &self.config.writer_id).await;
+            if self.last_committed_epoch > 0 {
+                info!(
+                    writer_id = %self.config.writer_id,
+                    last_committed_epoch = self.last_committed_epoch,
+                    "recovered last committed epoch from Delta Lake txn metadata"
+                );
+            }
+        }
+
+        // Store the Delta version.
+        #[allow(clippy::cast_sign_loss)]
+        {
+            self.delta_version = table.version().unwrap_or(0) as u64;
+        }
+        self.table = Some(table);
+
+        // Spawn background compaction task if enabled.
+        if self.config.compaction.enabled {
+            let cancel = tokio_util::sync::CancellationToken::new();
+            let handle = tokio::spawn(compaction_loop(
+                resolved_path.clone(),
+                Arc::new(merged_options),
+                self.config.compaction.clone(),
+                self.config.vacuum_retention,
+                cancel.clone(),
+            ));
+            self.compaction_cancel = Some(cancel);
+            self.compaction_handle = Some(handle);
+        }
+
+        Ok(())
     }
 
     /// Returns the current connector state.
@@ -349,6 +450,11 @@ impl DeltaLakeSink {
                 Some(self.config.partition_columns.as_slice())
             };
 
+            // Create a Delta Lake checkpoint every N commits for read performance.
+            let should_checkpoint = self.config.checkpoint_interval > 0
+                && self.delta_version > 0
+                && (self.delta_version + 1).is_multiple_of(self.config.checkpoint_interval);
+
             super::delta_io::write_batches(
                 table,
                 batches,
@@ -357,6 +463,8 @@ impl DeltaLakeSink {
                 save_mode,
                 partition_cols,
                 self.config.schema_evolution,
+                Some(self.config.target_file_size),
+                should_checkpoint,
             )
             .await
             .map(|(t, _version)| t)
@@ -396,7 +504,25 @@ impl DeltaLakeSink {
                     actual: "table not initialized".into(),
                 })?;
 
-            match self.attempt_delta_write(table).await {
+            // Timeout the write to prevent hanging on stale connections.
+            // Azure LB drops idle connections after ~4 min; without this,
+            // a dead connection blocks the sink task forever.
+            let write_result = tokio::time::timeout(
+                std::time::Duration::from_secs(300),
+                self.attempt_delta_write(table),
+            )
+            .await;
+
+            // Convert timeout to a write error. The table handle was consumed
+            // by attempt_delta_write; the retry loop will reopen via reopen_table().
+            let write_result = match write_result {
+                Ok(inner) => inner,
+                Err(_elapsed) => Err(ConnectorError::WriteError(
+                    "Delta write timed out after 300s".into(),
+                )),
+            };
+
+            match write_result {
                 Ok(table) => {
                     // ── Success: commit state ──
                     #[allow(clippy::cast_sign_loss)]
@@ -500,7 +626,7 @@ impl DeltaLakeSink {
                 ConnectorError::ConfigurationError("'_op' column must be String (Utf8) type".into())
             })?;
 
-        // Build boolean masks (compact bit-buffers, no per-element heap allocation).
+        // Build boolean masks for insert vs delete rows.
         let len = op_array.len();
         let mut insert_mask = Vec::with_capacity(len);
         let mut delete_mask = Vec::with_capacity(len);
@@ -706,80 +832,28 @@ impl SinkConnector for DeltaLakeSink {
         );
 
         // When delta-lake feature is enabled, open/create the actual table.
+        // If Unity Catalog auto-create is configured but no schema is available
+        // yet, defer initialization to the first write_batch() call.
         #[cfg(feature = "delta-lake")]
         {
-            use super::delta_io;
+            let should_defer = matches!(
+                self.config.catalog_type,
+                super::delta_config::DeltaCatalogType::Unity { .. }
+            ) && self.config.catalog_storage_location.is_some()
+                && self.schema.is_none();
 
-            // For uc:// tables, pre-create in Unity Catalog if needed.
-            // Must run before resolve_catalog_options which calls GET on the table.
-            #[cfg(feature = "delta-lake-unity")]
-            ensure_uc_table_exists(&self.config, self.schema.as_ref()).await?;
-
-            // Resolve catalog path: for Unity this calls GET to get the
-            // storage_location, bypassing delta-rs credential vending.
-            let (resolved_path, merged_options) = delta_io::resolve_catalog_options(
-                &self.config.catalog_type,
-                self.config.catalog_database.as_deref(),
-                self.config.catalog_name.as_deref(),
-                self.config.catalog_schema.as_deref(),
-                &self.config.table_path,
-                &self.config.storage_options,
-            )
-            .await?;
-
-            // Persist resolved values for reopen_table() on conflict retry.
-            self.resolved_table_path.clone_from(&resolved_path);
-            self.resolved_storage_options.clone_from(&merged_options);
-
-            let table = delta_io::open_or_create_table(
-                &resolved_path,
-                merged_options.clone(),
-                self.schema.as_ref(),
-            )
-            .await?;
-
-            // Read schema from existing table if we don't have one.
-            if self.schema.is_none() {
-                if let Ok(schema) = delta_io::get_table_schema(&table) {
-                    self.schema = Some(schema);
-                }
+            if should_defer {
+                info!(
+                    "Unity Catalog auto-create configured but pipeline schema not yet \
+                     available — deferring Delta table init to first begin_epoch"
+                );
+                self.needs_deferred_delta_init = true;
+                // Stay in Initializing until init completes in begin_epoch().
+                self.state = ConnectorState::Initializing;
+                return Ok(());
             }
 
-            // Resolve last committed epoch for exactly-once recovery.
-            if self.config.delivery_guarantee == DeliveryGuarantee::ExactlyOnce {
-                self.last_committed_epoch =
-                    delta_io::get_last_committed_epoch(&table, &self.config.writer_id).await;
-                if self.last_committed_epoch > 0 {
-                    info!(
-                        writer_id = %self.config.writer_id,
-                        last_committed_epoch = self.last_committed_epoch,
-                        "recovered last committed epoch from Delta Lake txn metadata"
-                    );
-                }
-            }
-
-            // Store the Delta version.
-            // Note: Delta Lake uses i64 for version, but our version is u64.
-            // Versions are always non-negative, so this is safe.
-            #[allow(clippy::cast_sign_loss)]
-            {
-                self.delta_version = table.version().unwrap_or(0) as u64;
-            }
-            self.table = Some(table);
-
-            // Spawn background compaction task if enabled.
-            if self.config.compaction.enabled {
-                let cancel = tokio_util::sync::CancellationToken::new();
-                let handle = tokio::spawn(compaction_loop(
-                    resolved_path.clone(),
-                    Arc::new(merged_options),
-                    self.config.compaction.clone(),
-                    self.config.vacuum_retention,
-                    cancel.clone(),
-                ));
-                self.compaction_cancel = Some(cancel);
-                self.compaction_handle = Some(handle);
-            }
+            self.init_delta_table().await?;
         }
 
         #[cfg(not(feature = "delta-lake"))]
@@ -801,7 +875,8 @@ impl SinkConnector for DeltaLakeSink {
     }
 
     async fn write_batch(&mut self, batch: &RecordBatch) -> Result<WriteResult, ConnectorError> {
-        if self.state != ConnectorState::Running {
+        // Accept both Running and Initializing (deferred init in progress).
+        if self.state != ConnectorState::Running && self.state != ConnectorState::Initializing {
             return Err(ConnectorError::InvalidState {
                 expected: "Running".into(),
                 actual: self.state.to_string(),
@@ -820,6 +895,25 @@ impl SinkConnector for DeltaLakeSink {
         // (_op, _ts_ms) so the Delta table isn't created with changelog columns.
         if self.schema.is_none() {
             self.schema = Some(Self::target_schema(&batch.schema(), self.config.write_mode));
+        }
+
+        // Fallback for deferred init: if begin_epoch() couldn't complete
+        // init (schema was still None), complete it now that the first
+        // batch provides a schema.
+        #[cfg(feature = "delta-lake")]
+        if self.needs_deferred_delta_init {
+            info!("schema now available from first batch — completing deferred Delta table init");
+            match self.init_delta_table().await {
+                Ok(()) => {
+                    self.needs_deferred_delta_init = false;
+                    self.state = ConnectorState::Running;
+                    info!("Delta Lake sink connector opened successfully (deferred)");
+                }
+                Err(e) => {
+                    self.state = ConnectorState::Failed;
+                    return Err(e);
+                }
+            }
         }
 
         let num_rows = batch.num_rows();
@@ -845,6 +939,33 @@ impl SinkConnector for DeltaLakeSink {
     }
 
     async fn begin_epoch(&mut self, epoch: u64) -> Result<(), ConnectorError> {
+        // Complete deferred Delta table init on the first epoch.
+        // This must run BEFORE the epoch skip check so that
+        // last_committed_epoch is resolved from the Delta log.
+        // Without this, exactly-once recovery would miss already-committed
+        // epochs and produce duplicates.
+        #[cfg(feature = "delta-lake")]
+        if self.needs_deferred_delta_init {
+            // Schema may not be available yet on the very first epoch.
+            // If so, buffer the epoch — the write_batch will provide it.
+            // But if the pipeline provided a schema via with_schema() or a
+            // previous epoch's write_batch set it, complete init now.
+            if self.schema.is_some() {
+                info!("schema available — completing deferred Delta table init");
+                match self.init_delta_table().await {
+                    Ok(()) => {
+                        self.needs_deferred_delta_init = false;
+                        self.state = ConnectorState::Running;
+                        info!("Delta Lake sink connector opened successfully (deferred)");
+                    }
+                    Err(e) => {
+                        self.state = ConnectorState::Failed;
+                        return Err(e);
+                    }
+                }
+            }
+        }
+
         // For exactly-once, skip epochs already committed.
         if self.config.delivery_guarantee == DeliveryGuarantee::ExactlyOnce
             && epoch <= self.last_committed_epoch
@@ -988,8 +1109,38 @@ impl SinkConnector for DeltaLakeSink {
     }
 
     async fn flush(&mut self) -> Result<(), ConnectorError> {
-        // Coalesce buffered batches to reduce memory fragmentation.
-        // Actual Delta write is deferred to commit_epoch().
+        // For at-least-once delivery, flush() is the only commit trigger
+        // because the checkpoint coordinator skips begin_epoch/pre_commit/
+        // commit_epoch for non-exactly-once sinks. Write directly to Delta.
+        #[cfg(feature = "delta-lake")]
+        if self.config.delivery_guarantee != DeliveryGuarantee::ExactlyOnce {
+            // Retry any orphaned staged data from a prior failed flush
+            // before moving new data in, to prevent silent data loss.
+            // flush_staged_to_delta handles table == None via reopen_table().
+            if !self.staged_batches.is_empty() {
+                self.flush_staged_to_delta().await?;
+            }
+
+            // Stage new buffered data and flush to Delta.
+            if !self.buffer.is_empty() {
+                self.staged_batches = std::mem::take(&mut self.buffer);
+                self.staged_rows = self.buffered_rows;
+                self.staged_bytes = self.buffered_bytes;
+                self.buffered_rows = 0;
+                self.buffered_bytes = 0;
+                self.buffer_start_time = None;
+
+                self.flush_staged_to_delta().await?;
+            }
+            return Ok(());
+        }
+
+        if self.buffer.is_empty() {
+            return Ok(());
+        }
+
+        // For exactly-once, just coalesce in memory — the 2PC path
+        // (pre_commit + commit_epoch) handles the actual Delta write.
         if self.buffer.len() > 1 {
             let schema = self.buffer[0].schema();
             let combined = arrow_select::concat::concat_batches(&schema, &self.buffer)
@@ -1003,7 +1154,18 @@ impl SinkConnector for DeltaLakeSink {
     async fn close(&mut self) -> Result<(), ConnectorError> {
         info!("closing Delta Lake sink connector");
 
-        // Commit any remaining buffered data before closing.
+        // Commit any remaining data before closing.
+        // For at-least-once, use flush() which handles both orphaned
+        // staged data and buffered data. For exactly-once, use 2PC.
+        #[cfg(feature = "delta-lake")]
+        if self.config.delivery_guarantee != DeliveryGuarantee::ExactlyOnce {
+            self.flush().await?;
+        } else if !self.buffer.is_empty() {
+            self.pre_commit(self.current_epoch).await?;
+            self.commit_epoch(self.current_epoch).await?;
+        }
+
+        #[cfg(not(feature = "delta-lake"))]
         if !self.buffer.is_empty() {
             self.pre_commit(self.current_epoch).await?;
             self.commit_epoch(self.current_epoch).await?;
@@ -1084,6 +1246,7 @@ fn filter_and_project(
 #[allow(clippy::cast_precision_loss)]
 #[allow(clippy::float_cmp)]
 mod tests {
+    use super::super::delta_config::DeltaCatalogType;
     use super::*;
     use arrow_array::{Float64Array, Int64Array, StringArray};
     use arrow_schema::{DataType, Field, Schema};
@@ -1149,6 +1312,118 @@ mod tests {
         let sink = DeltaLakeSink::new(test_config());
         let schema = sink.schema();
         assert_eq!(schema.fields().len(), 0);
+    }
+
+    #[test]
+    fn test_deferred_init_flag_default_false() {
+        let sink = DeltaLakeSink::new(test_config());
+        assert!(!sink.needs_deferred_delta_init);
+    }
+
+    fn unity_config() -> DeltaLakeSinkConfig {
+        let mut config = test_config();
+        config.catalog_type = DeltaCatalogType::Unity {
+            workspace_url: "https://test.azuredatabricks.net".to_string(),
+            access_token: "dapi123".to_string(),
+        };
+        config.catalog_name = Some("main".to_string());
+        config.catalog_schema = Some("default".to_string());
+        config.catalog_storage_location = Some("abfss://c@acct.dfs.core.windows.net/t".to_string());
+        config
+    }
+
+    #[cfg(feature = "delta-lake")]
+    #[tokio::test]
+    async fn test_open_defers_init_for_unity_no_schema() {
+        use crate::config::ConnectorConfig;
+
+        let config = unity_config();
+        let mut sink = DeltaLakeSink::new(config);
+
+        // open() with empty ConnectorConfig (simulates factory path)
+        let connector_config = ConnectorConfig::new("delta-lake");
+        // open() will re-parse but table.path is "/tmp/delta_test" (local),
+        // so it won't actually reach UC REST. However from_config requires
+        // table.path, so we use the sink's existing config by passing empty.
+        // The sink skips re-parse when properties are empty.
+        let result = sink.open(&connector_config).await;
+        assert!(result.is_ok());
+
+        // Should be in Initializing state with deferred flag set.
+        assert!(sink.needs_deferred_delta_init);
+        assert_eq!(sink.state(), ConnectorState::Initializing);
+        assert!(sink.schema.is_none());
+    }
+
+    #[cfg(feature = "delta-lake")]
+    #[tokio::test]
+    async fn test_deferred_init_transitions_to_failed_on_error() {
+        // When deferred init fails, the sink must transition to Failed
+        // to prevent an unbounded retry storm.
+        let mut sink = DeltaLakeSink::new(test_config());
+        sink.state = ConnectorState::Initializing;
+        sink.needs_deferred_delta_init = true;
+        sink.schema = Some(test_schema());
+
+        // begin_epoch will try init_delta_table() which will fail
+        // (no real Delta table at /tmp/delta_test). The sink should
+        // transition to Failed.
+        let result = sink.begin_epoch(1).await;
+        assert!(result.is_err());
+        assert_eq!(sink.state(), ConnectorState::Failed);
+        // Flag may still be set, but Failed state prevents further usage.
+    }
+
+    #[cfg(feature = "delta-lake")]
+    #[tokio::test]
+    async fn test_write_batch_accepts_initializing_state() {
+        // During deferred init, write_batch must accept Initializing state
+        // so the first batch can provide the schema.
+        let mut sink = DeltaLakeSink::new(test_config());
+        sink.state = ConnectorState::Initializing;
+        sink.needs_deferred_delta_init = true;
+
+        let batch = test_batch(5);
+        // write_batch sets schema, then tries init_delta_table which fails.
+        // Sink transitions to Failed.
+        let result = sink.write_batch(&batch).await;
+        assert!(result.is_err());
+        assert_eq!(sink.state(), ConnectorState::Failed);
+        // Schema was set before init was attempted.
+        assert!(sink.schema.is_some());
+    }
+
+    #[test]
+    fn test_no_deferred_init_without_catalog_storage_location() {
+        // Unity catalog without catalog.storage.location should NOT defer.
+        let mut config = unity_config();
+        config.catalog_storage_location = None;
+        let sink = DeltaLakeSink::new(config);
+
+        let should_defer = matches!(sink.config.catalog_type, DeltaCatalogType::Unity { .. })
+            && sink.config.catalog_storage_location.is_some()
+            && sink.schema.is_none();
+        assert!(!should_defer);
+    }
+
+    #[test]
+    fn test_no_deferred_init_with_schema() {
+        // Unity catalog with schema already set should NOT defer.
+        let config = unity_config();
+        let sink = DeltaLakeSink::with_schema(config, test_schema());
+
+        let should_defer = matches!(sink.config.catalog_type, DeltaCatalogType::Unity { .. })
+            && sink.config.catalog_storage_location.is_some()
+            && sink.schema.is_none();
+        assert!(!should_defer);
+    }
+
+    #[test]
+    fn test_health_check_initializing_during_deferred() {
+        let mut sink = DeltaLakeSink::new(test_config());
+        sink.state = ConnectorState::Initializing;
+        // During deferred init, health should NOT report Healthy.
+        assert!(matches!(sink.health_check(), HealthStatus::Unknown));
     }
 
     // ── Batch size estimation ──
@@ -1476,7 +1751,10 @@ mod tests {
 
     #[tokio::test]
     async fn test_flush_coalesces_buffer() {
-        let mut sink = DeltaLakeSink::new(test_config());
+        let mut config = test_config();
+        config.delivery_guarantee = DeliveryGuarantee::ExactlyOnce;
+        config.writer_id = "test-writer".to_string();
+        let mut sink = DeltaLakeSink::new(config);
         sink.state = ConnectorState::Running;
 
         let batch = test_batch(10);
