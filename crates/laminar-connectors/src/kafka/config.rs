@@ -567,7 +567,7 @@ impl Default for KafkaSourceConfig {
             alignment_max_drift: None,
             alignment_mode: None,
             broker_commit_interval: Duration::from_secs(60),
-            reader_channel_capacity: 512,
+            reader_channel_capacity: 1024,
             backpressure_high_watermark: 0.8,
             backpressure_low_watermark: 0.5,
             kafka_properties: HashMap::new(),
@@ -736,7 +736,7 @@ impl KafkaSourceConfig {
 
         let reader_channel_capacity = config
             .get_parsed::<usize>("reader.channel.capacity")?
-            .unwrap_or(512);
+            .unwrap_or(1024);
 
         let backpressure_high_watermark = config
             .get_parsed::<f64>("backpressure.high.watermark")?
@@ -1102,7 +1102,7 @@ mod tests {
         assert_eq!(cfg.security_protocol, SecurityProtocol::Plaintext);
         assert!(cfg.sasl_mechanism.is_none());
         assert_eq!(cfg.broker_commit_interval, Duration::from_secs(60));
-        assert_eq!(cfg.reader_channel_capacity, 512);
+        assert_eq!(cfg.reader_channel_capacity, 1024);
     }
 
     #[test]

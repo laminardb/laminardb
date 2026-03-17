@@ -193,6 +193,11 @@ impl FileSinkConfig {
             })
             .transpose()?
             .unwrap_or(10_000);
+        if max_epoch_batches == 0 {
+            return Err(ConnectorError::ConfigurationError(
+                "max_epoch_batches must be > 0".into(),
+            ));
+        }
 
         Ok(Self {
             path,

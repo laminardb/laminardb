@@ -949,6 +949,9 @@ impl SinkConnector for DeltaLakeSink {
 
         #[cfg(feature = "delta-lake")]
         if self.config.delivery_guarantee != DeliveryGuarantee::ExactlyOnce && self.should_flush() {
+            if !self.staged_batches.is_empty() {
+                self.flush_staged_to_delta().await?;
+            }
             self.staged_batches = std::mem::take(&mut self.buffer);
             self.staged_rows = self.buffered_rows;
             self.staged_bytes = self.buffered_bytes;

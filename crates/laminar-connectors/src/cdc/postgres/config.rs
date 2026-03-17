@@ -219,6 +219,11 @@ impl PostgresCdcConfig {
                 "max.poll.records must be > 0".to_string(),
             ));
         }
+        if self.max_buffered_events == 0 {
+            return Err(ConnectorError::ConfigurationError(
+                "max.buffered.events must be > 0".to_string(),
+            ));
+        }
         // VerifyCa/VerifyFull require a CA certificate path
         if matches!(self.ssl_mode, SslMode::VerifyCa | SslMode::VerifyFull)
             && self.ca_cert_path.is_none()
