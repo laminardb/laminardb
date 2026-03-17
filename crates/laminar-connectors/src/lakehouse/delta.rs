@@ -261,15 +261,16 @@ impl DeltaLakeSink {
             .sum()
     }
 
-    /// Returns `true` if the error looks like a Delta Lake optimistic
-    /// concurrency conflict that can be retried.
+    /// Returns `true` if the error is a Delta Lake optimistic concurrency
+    /// conflict (retryable). Matches specific delta-rs conflict indicators
+    /// only — not generic "transaction" mentions.
     #[cfg(feature = "delta-lake")]
     fn is_conflict_error(err: &ConnectorError) -> bool {
         let msg = err.to_string().to_lowercase();
-        msg.contains("conflict")
-            || msg.contains("version mismatch")
-            || msg.contains("transaction")
+        msg.contains("conflicting commit")
+            || msg.contains("version already exists")
             || msg.contains("concurrent")
+            || (msg.contains("conflict") && !msg.contains("log") && !msg.contains("corrupt"))
     }
 
     /// Re-opens the Delta Lake table after a conflict error destroys the handle.

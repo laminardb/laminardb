@@ -502,7 +502,9 @@ pub async fn read_version_diff(
         .map_err(|e| ConnectorError::ReadError(format!("commit log is not valid UTF-8: {e}")))?;
 
     // Each line in the commit JSON is a separate action object.
+    // Collect both add and remove actions to compute the net-new files.
     let mut added_paths = Vec::new();
+    let mut removed_paths = std::collections::HashSet::new();
     for line in commit_str.lines() {
         let line = line.trim();
         if line.is_empty() {
@@ -511,16 +513,25 @@ pub async fn read_version_diff(
         if let Ok(obj) = serde_json::from_str::<serde_json::Value>(line) {
             if let Some(add) = obj.get("add") {
                 if let Some(path) = add.get("path").and_then(|p| p.as_str()) {
-                    added_paths.push(path.to_string());
+                    added_paths.push(decode_delta_path(path));
+                }
+            }
+            if let Some(remove) = obj.get("remove") {
+                if let Some(path) = remove.get("path").and_then(|p| p.as_str()) {
+                    removed_paths.insert(decode_delta_path(path));
                 }
             }
         }
     }
 
+    // Exclude any added file whose path also appears in a remove action.
+    added_paths.retain(|p| !removed_paths.contains(p));
+
     if added_paths.is_empty() {
         debug!(
             version,
-            "Delta Lake: no add actions in version (metadata-only commit)"
+            num_removed = removed_paths.len(),
+            "Delta Lake: no net-new add actions in version"
         );
         return Ok(Vec::new());
     }
@@ -528,6 +539,7 @@ pub async fn read_version_diff(
     debug!(
         version,
         num_added_files = added_paths.len(),
+        num_removed_files = removed_paths.len(),
         "Delta Lake: reading added files"
     );
 
@@ -542,12 +554,19 @@ pub async fn read_version_diff(
         .map(|s| s.snapshot().arrow_schema())
         .map_err(|e| ConnectorError::ReadError(format!("no snapshot at version {version}: {e}")))?;
 
+    // Filter file paths by partition predicate if provided.
+    // Supports simple Hive-style equality: "col = 'val'" matches "col=val/" in path.
+    let added_paths = if let Some(filter) = partition_filter {
+        filter_paths_by_partition(&added_paths, filter)
+    } else {
+        added_paths
+    };
+
     // Read each added Parquet file as raw bytes via delta-rs's object_store,
     // then parse with parquet's in-memory ArrowReaderBuilder (avoids the
     // object_store 0.12 vs 0.13 version mismatch).
     let mut batches = Vec::new();
     let mut total_rows: usize = 0;
-    let _ = partition_filter; // partition pruning deferred to a follow-up
 
     for file_path in &added_paths {
         if total_rows >= max_records {
@@ -608,6 +627,58 @@ pub async fn read_version_diff(
     Ok(batches)
 }
 
+/// Filters file paths by a Hive-style partition predicate.
+///
+/// Supports simple equality predicates: `col = 'val'` matches paths
+/// containing `col=val/`. Multiple predicates joined by `AND` are all
+/// required to match. Predicates that can't be parsed are ignored
+/// (all paths pass through).
+#[cfg(feature = "delta-lake")]
+fn filter_paths_by_partition(paths: &[String], filter: &str) -> Vec<String> {
+    // Parse simple "col = 'val'" or "col = val" predicates from AND-joined expressions.
+    let mut required_segments: Vec<String> = Vec::new();
+    for clause in filter
+        .split_whitespace()
+        .collect::<Vec<_>>()
+        .join(" ")
+        .split(" AND ")
+    {
+        let clause = clause.trim();
+        if let Some((col, val)) = clause.split_once('=') {
+            let col = col.trim();
+            let val = val.trim().trim_matches('\'').trim_matches('"');
+            if !col.is_empty() && !val.is_empty() {
+                required_segments.push(format!("{col}={val}"));
+            }
+        }
+    }
+
+    if required_segments.is_empty() {
+        return paths.to_vec();
+    }
+
+    paths
+        .iter()
+        .filter(|path| required_segments.iter().all(|seg| path.contains(seg)))
+        .cloned()
+        .collect()
+}
+
+/// Percent-decodes a file path from a Delta Lake commit JSON.
+///
+/// Delta Lake spec requires paths in `add`/`remove` actions to be
+/// percent-encoded (e.g., `part%3D1/file.parquet` for `part=1/file.parquet`).
+#[cfg(feature = "delta-lake")]
+fn decode_delta_path(encoded: &str) -> String {
+    url::Url::parse(&format!("file:///{encoded}")).map_or_else(
+        |_| encoded.to_string(),
+        |u| {
+            let p = u.path();
+            p.strip_prefix('/').unwrap_or(p).to_string()
+        },
+    )
+}
+
 /// Aligns a `RecordBatch` to a target schema by adding null columns for
 /// missing fields. Used when reading Parquet files that predate schema
 /// evolution (fewer columns than the current table schema).
@@ -630,30 +701,6 @@ fn align_batch_to_schema(
     RecordBatch::try_new(target_schema.clone(), columns).map_err(|e| {
         ConnectorError::ReadError(format!("failed to align batch to table schema: {e}"))
     })
-}
-
-/// Returns the Arrow schema at a specific Delta Lake table version.
-///
-/// Used for schema evolution detection: compare the schema at the
-/// current version with the previously known schema.
-///
-/// # Errors
-///
-/// Returns `ConnectorError::ReadError` if the version cannot be loaded.
-#[cfg(feature = "delta-lake")]
-pub async fn get_schema_at_version(
-    table: &mut DeltaTable,
-    version: i64,
-) -> Result<SchemaRef, ConnectorError> {
-    table.load_version(version).await.map_err(|e| {
-        ConnectorError::ReadError(format!("failed to load version {version} for schema: {e}"))
-    })?;
-
-    let snapshot = table
-        .snapshot()
-        .map_err(|e| ConnectorError::ReadError(format!("no snapshot at version {version}: {e}")))?;
-
-    Ok(snapshot.snapshot().arrow_schema())
 }
 
 /// Result of a MERGE (upsert) operation.
@@ -686,7 +733,7 @@ pub struct MergeResult {
 /// # Errors
 ///
 /// Returns `ConnectorError::WriteError` if the merge fails.
-#[cfg(feature = "delta-lake")]
+#[cfg(all(test, feature = "delta-lake"))]
 #[allow(clippy::too_many_lines)]
 pub async fn merge_batches(
     table: DeltaTable,
@@ -814,7 +861,7 @@ pub async fn merge_batches(
 /// # Errors
 ///
 /// Returns `ConnectorError::WriteError` if the operation fails.
-#[cfg(feature = "delta-lake")]
+#[cfg(all(test, feature = "delta-lake"))]
 pub async fn delete_by_merge(
     table: DeltaTable,
     delete_batch: RecordBatch,
