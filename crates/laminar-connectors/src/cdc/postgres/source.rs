@@ -1675,7 +1675,7 @@ mod tests {
                 before: None,
                 after: Some(format!("{{\"id\": {i}}}")),
                 ts_ms: i as i64,
-                lsn: Lsn::from_u64(i),
+                lsn: Lsn::new(i),
             });
         }
         assert_eq!(src.event_buffer.len(), 200);
@@ -1683,7 +1683,7 @@ mod tests {
         // poll_batch triggers the cap enforcement.
         let batch = src.poll_batch(50).await.unwrap().unwrap();
         // After cap enforcement (200 → 100), drain 50 → 50 remaining.
-        assert_eq!(batch.batch.num_rows(), 50);
+        assert_eq!(batch.records.num_rows(), 50);
         assert!(
             src.event_buffer.len() <= 100,
             "event_buffer should be capped at max_buffered_events, got {}",
