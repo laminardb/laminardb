@@ -85,6 +85,11 @@ pub struct DeltaLakeSinkConfig {
     /// (default: 3). After exhausting retries, the conflict error is
     /// propagated as fatal. Uses exponential backoff (100ms, 500ms, 2s).
     pub max_commit_retries: u32,
+
+    /// Timeout for individual Delta write operations (default: 30s).
+    /// Azure LB drops idle connections after ~4 min; this prevents a dead
+    /// connection from blocking the sink task indefinitely.
+    pub write_timeout: Duration,
 }
 
 impl Default for DeltaLakeSinkConfig {
@@ -110,6 +115,7 @@ impl Default for DeltaLakeSinkConfig {
             catalog_schema: None,
             catalog_storage_location: None,
             max_commit_retries: 3,
+            write_timeout: Duration::from_secs(30),
         }
     }
 }
@@ -276,6 +282,12 @@ impl DeltaLakeSinkConfig {
                 ConnectorError::ConfigurationError(format!("invalid max.commit.retries: '{v}'"))
             })?;
         }
+        if let Some(v) = config.get("write.timeout.ms") {
+            let ms: u64 = v.parse().map_err(|_| {
+                ConnectorError::ConfigurationError(format!("invalid write.timeout.ms: '{v}'"))
+            })?;
+            cfg.write_timeout = Duration::from_millis(ms);
+        }
 
         // Resolve storage credentials: explicit options + environment variable fallbacks.
         let explicit_storage = config.properties_with_prefix("storage.");
@@ -321,15 +333,39 @@ impl DeltaLakeSinkConfig {
                 "checkpoint.interval must be > 0".into(),
             ));
         }
+        if self.write_timeout < Duration::from_secs(5) {
+            return Err(ConnectorError::ConfigurationError(
+                "write.timeout.ms must be >= 5000 (5 seconds)".into(),
+            ));
+        }
         if self.compaction.check_interval.is_zero() {
             return Err(ConnectorError::ConfigurationError(
                 "compaction.check-interval.ms must be > 0".into(),
             ));
         }
 
-        // Validate catalog-specific requirements.
-        // Fail-fast if the required feature is not compiled in, rather than
-        // deferring the error to runtime when resolve_catalog_options is called.
+        self.validate_catalog()?;
+
+        // Validate cloud storage credentials (skip when catalog resolves the path).
+        if self.catalog_type == DeltaCatalogType::None {
+            let resolved = ResolvedStorageOptions {
+                provider: StorageProvider::detect(&self.table_path),
+                options: self.storage_options.clone(),
+                env_resolved_keys: Vec::new(),
+            };
+            let cloud_result = CloudConfigValidator::validate(&resolved);
+            if !cloud_result.is_valid() {
+                return Err(ConnectorError::ConfigurationError(
+                    cloud_result.error_message(),
+                ));
+            }
+        }
+
+        Ok(())
+    }
+
+    /// Validates catalog-specific requirements.
+    fn validate_catalog(&self) -> Result<(), ConnectorError> {
         match &self.catalog_type {
             DeltaCatalogType::None => {}
             DeltaCatalogType::Glue => {
@@ -352,7 +388,6 @@ impl DeltaLakeSinkConfig {
             } => {
                 #[cfg(not(feature = "delta-lake-unity"))]
                 {
-                    // Suppress unused-variable warnings for the destructured fields.
                     let _ = (workspace_url, access_token);
                     return Err(ConnectorError::ConfigurationError(
                         "Unity catalog requires the 'delta-lake-unity' feature. \
@@ -372,9 +407,6 @@ impl DeltaLakeSinkConfig {
                             "Unity catalog requires 'catalog.access_token' to be set".into(),
                         ));
                     }
-                    // catalog.name and catalog.schema are only required when
-                    // auto-create is enabled (catalog.storage.location is set).
-                    // Without auto-create, the table name is derived from table_path.
                     if self.catalog_storage_location.is_some() {
                         if self.catalog_name.is_none() {
                             return Err(ConnectorError::ConfigurationError(
@@ -392,22 +424,6 @@ impl DeltaLakeSinkConfig {
                 }
             }
         }
-
-        // Validate cloud storage credentials (skip when catalog resolves the path).
-        if self.catalog_type == DeltaCatalogType::None {
-            let resolved = ResolvedStorageOptions {
-                provider: StorageProvider::detect(&self.table_path),
-                options: self.storage_options.clone(),
-                env_resolved_keys: Vec::new(),
-            };
-            let cloud_result = CloudConfigValidator::validate(&resolved);
-            if !cloud_result.is_valid() {
-                return Err(ConnectorError::ConfigurationError(
-                    cloud_result.error_message(),
-                ));
-            }
-        }
-
         Ok(())
     }
 }

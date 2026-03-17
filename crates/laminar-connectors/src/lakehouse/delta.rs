@@ -507,8 +507,9 @@ impl DeltaLakeSink {
             // Timeout the write to prevent hanging on stale connections.
             // Azure LB drops idle connections after ~4 min; without this,
             // a dead connection blocks the sink task forever.
+            let write_timeout = self.config.write_timeout;
             let write_result = tokio::time::timeout(
-                std::time::Duration::from_secs(300),
+                write_timeout,
                 self.attempt_delta_write(table),
             )
             .await;
@@ -518,7 +519,7 @@ impl DeltaLakeSink {
             let write_result = match write_result {
                 Ok(inner) => inner,
                 Err(_elapsed) => Err(ConnectorError::WriteError(
-                    "Delta write timed out after 300s".into(),
+                    format!("Delta write timed out after {}s", write_timeout.as_secs()),
                 )),
             };
 
@@ -927,7 +928,20 @@ impl SinkConnector for DeltaLakeSink {
         self.buffered_rows += num_rows;
         self.buffered_bytes += estimated_bytes;
 
-        // Data stays in buffer until pre_commit(). No mid-epoch Delta writes.
+        // For at-least-once: mid-epoch flush when buffer thresholds are hit.
+        // Exactly-once relies on the 2PC path (pre_commit + commit_epoch).
+        #[cfg(feature = "delta-lake")]
+        if self.config.delivery_guarantee != DeliveryGuarantee::ExactlyOnce
+            && self.should_flush()
+        {
+            self.staged_batches = std::mem::take(&mut self.buffer);
+            self.staged_rows = self.buffered_rows;
+            self.staged_bytes = self.buffered_bytes;
+            self.buffered_rows = 0;
+            self.buffered_bytes = 0;
+            self.buffer_start_time = None;
+            self.flush_staged_to_delta().await?;
+        }
 
         Ok(WriteResult::new(0, 0))
     }
@@ -1314,6 +1328,7 @@ mod tests {
         assert_eq!(schema.fields().len(), 0);
     }
 
+    #[cfg(feature = "delta-lake")]
     #[test]
     fn test_deferred_init_flag_default_false() {
         let sink = DeltaLakeSink::new(test_config());
