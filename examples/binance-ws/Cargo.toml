@@ -1,6 +1,6 @@
 [package]
 name = "binance-ws"
-version = "0.18.7"
+version = "0.18.9"
 edition = "2021"
 publish = false
 description = "Binance VWAP signals: minimal LaminarDB streaming example"
@@ -10,8 +10,8 @@ name = "binance-ws"
 path = "src/main.rs"
 
 [dependencies]
-laminar-db = { path = "../../crates/laminar-db", version = "0.18.7", features = ["websocket"] }
-laminar-derive = { path = "../../crates/laminar-derive", version = "0.18.7" }
+laminar-db = { path = "../../crates/laminar-db", version = "0.18.9", features = ["websocket"] }
+laminar-derive = { path = "../../crates/laminar-derive", version = "0.18.9" }
 arrow = { workspace = true }
 tokio = { workspace = true, features = ["full"] }
 crossterm = "0.29"
