@@ -488,16 +488,9 @@ pub async fn read_version_diff(
     let store = log_store.object_store(None);
 
     let commit_path = deltalake::Path::from(format!("_delta_log/{version:020}.json"));
+    let commit_log_display = format!("_delta_log/{version:020}.json");
 
-    let commit_result = store.get(&commit_path).await.map_err(|e| {
-        ConnectorError::ReadError(format!(
-            "failed to read commit log for version {version}: {e}"
-        ))
-    })?;
-    let commit_data = commit_result
-        .bytes()
-        .await
-        .map_err(|e| ConnectorError::ReadError(format!("failed to read commit bytes: {e}")))?;
+    let commit_data = get_with_retry(&store, &commit_path, &commit_log_display).await?;
     let commit_str = std::str::from_utf8(&commit_data)
         .map_err(|e| ConnectorError::ReadError(format!("commit log is not valid UTF-8: {e}")))?;
 
@@ -574,12 +567,7 @@ pub async fn read_version_diff(
         }
 
         let obj_path = deltalake::Path::from(file_path.as_str());
-        let file_result = store.get(&obj_path).await.map_err(|e| {
-            ConnectorError::ReadError(format!("failed to read file '{file_path}': {e}"))
-        })?;
-        let file_bytes = file_result.bytes().await.map_err(|e| {
-            ConnectorError::ReadError(format!("failed to read bytes of '{file_path}': {e}"))
-        })?;
+        let file_bytes = get_with_retry(&store, &obj_path, file_path).await?;
 
         let parquet_reader = parquet::arrow::arrow_reader::ArrowReaderBuilder::try_new(file_bytes)
             .map_err(|e| {
@@ -625,6 +613,58 @@ pub async fn read_version_diff(
     );
 
     Ok(batches)
+}
+
+/// Reads a file from `object_store` with retry on transient failures.
+///
+/// Retries up to 3 times with exponential backoff (200ms, 1s, 4s).
+/// Only retries on I/O-like errors, not on 404 (file not found).
+#[cfg(feature = "delta-lake")]
+async fn get_with_retry(
+    store: &Arc<dyn deltalake::ObjectStore>,
+    path: &deltalake::Path,
+    display_path: &str,
+) -> Result<bytes::Bytes, ConnectorError> {
+    let backoff = [200u64, 1000, 4000];
+    let mut last_err = None;
+
+    for attempt in 0..=backoff.len() {
+        match store.get(path).await {
+            Ok(result) => {
+                return result.bytes().await.map_err(|e| {
+                    ConnectorError::ReadError(format!(
+                        "failed to read bytes of '{display_path}': {e}"
+                    ))
+                });
+            }
+            Err(e) => {
+                let msg = e.to_string();
+                // Don't retry 404 (file genuinely missing, e.g., after VACUUM).
+                if msg.contains("not found") || msg.contains("404") {
+                    return Err(ConnectorError::ReadError(format!(
+                        "file not found '{display_path}': {e}"
+                    )));
+                }
+                if let Some(&delay) = backoff.get(attempt) {
+                    warn!(
+                        attempt = attempt + 1,
+                        delay_ms = delay,
+                        error = %e,
+                        path = display_path,
+                        "object_store read failed, retrying"
+                    );
+                    tokio::time::sleep(std::time::Duration::from_millis(delay)).await;
+                }
+                last_err = Some(e);
+            }
+        }
+    }
+
+    Err(ConnectorError::ReadError(format!(
+        "failed to read file '{display_path}' after {} attempts: {}",
+        backoff.len() + 1,
+        last_err.map_or_else(|| "unknown".to_string(), |e| e.to_string())
+    )))
 }
 
 /// Filters file paths by a Hive-style partition predicate.
