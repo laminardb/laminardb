@@ -80,6 +80,10 @@ pub struct PostgresCdcConfig {
 
     /// Tables to exclude from replication.
     pub table_exclude: Vec<String>,
+
+    /// Maximum number of events to buffer in memory before dropping oldest
+    /// (default: 100,000). Prevents OOM when downstream stalls.
+    pub max_buffered_events: usize,
 }
 
 impl Default for PostgresCdcConfig {
@@ -106,6 +110,7 @@ impl Default for PostgresCdcConfig {
             wal_sender_timeout: Duration::from_secs(60),
             table_include: Vec::new(),
             table_exclude: Vec::new(),
+            max_buffered_events: 100_000,
         }
     }
 }
@@ -191,6 +196,9 @@ impl PostgresCdcConfig {
         }
         if let Some(tables) = config.get("table.exclude") {
             cfg.table_exclude = tables.split(',').map(|s| s.trim().to_string()).collect();
+        }
+        if let Some(max) = config.get_parsed::<usize>("max.buffered.events")? {
+            cfg.max_buffered_events = max;
         }
 
         cfg.validate()?;

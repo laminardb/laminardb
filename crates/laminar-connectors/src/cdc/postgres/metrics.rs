@@ -44,6 +44,9 @@ pub struct CdcMetrics {
 
     /// Total keepalive/heartbeat messages sent.
     pub keepalives_sent: AtomicU64,
+
+    /// Total events dropped due to buffer cap enforcement.
+    pub events_dropped: AtomicU64,
 }
 
 impl CdcMetrics {
@@ -62,6 +65,7 @@ impl CdcMetrics {
             confirmed_flush_lsn: AtomicU64::new(0),
             replication_lag_bytes: AtomicU64::new(0),
             keepalives_sent: AtomicU64::new(0),
+            events_dropped: AtomicU64::new(0),
         }
     }
 
@@ -116,6 +120,11 @@ impl CdcMetrics {
     /// Records a keepalive sent to `PostgreSQL`.
     pub fn record_keepalive(&self) {
         self.keepalives_sent.fetch_add(1, Ordering::Relaxed);
+    }
+
+    /// Records events dropped due to buffer cap enforcement.
+    pub fn record_dropped(&self, count: u64) {
+        self.events_dropped.fetch_add(count, Ordering::Relaxed);
     }
 
     /// Converts to the SDK's [`ConnectorMetrics`].

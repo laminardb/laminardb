@@ -746,6 +746,19 @@ impl SourceConnector for PostgresCdcSource {
         // Process any pending WAL messages (test injection path)
         self.process_pending_messages()?;
 
+        // Cap event buffer to prevent OOM when downstream stalls.
+        if self.event_buffer.len() > self.config.max_buffered_events {
+            let excess = self.event_buffer.len() - self.config.max_buffered_events;
+            tracing::warn!(
+                buffered = self.event_buffer.len(),
+                max = self.config.max_buffered_events,
+                dropped = excess,
+                "CDC event buffer exceeded max — dropping oldest events to prevent OOM"
+            );
+            self.event_buffer.drain(..excess);
+            self.metrics.record_dropped(excess as u64);
+        }
+
         // Drain buffered events into a RecordBatch.
         // Watermark advancement: the batch contains `_ts_ms` (commit timestamp)
         // which downstream pipeline watermark extractors should use. The LSN
@@ -1009,6 +1022,7 @@ mod tests {
     use super::*;
     use crate::cdc::postgres::types::{INT4_OID, INT8_OID, TEXT_OID};
     use arrow_array::cast::AsArray;
+    use std::sync::atomic::Ordering;
 
     fn default_source() -> PostgresCdcSource {
         PostgresCdcSource::new(PostgresCdcConfig::default())
@@ -1645,5 +1659,37 @@ mod tests {
         assert_eq!(src.confirmed_flush_lsn.as_u64(), 0x2_0000_FF00);
         assert_eq!(src.polled_lsn.as_u64(), 0x2_0000_FF00);
         assert_eq!(src.write_lsn.as_u64(), 0x2_0000_FF10);
+    }
+
+    // ── Buffer cap enforcement ──
+
+    #[tokio::test]
+    async fn test_event_buffer_cap_drops_oldest() {
+        let mut src = running_source();
+        src.config.max_buffered_events = 100;
+
+        // Inject 200 events directly into the event buffer.
+        for i in 0..200u64 {
+            src.inject_event(ChangeEvent {
+                table: "public.t".to_string(),
+                op: CdcOperation::Insert,
+                before: None,
+                after: Some(format!("{{\"id\": {i}}}")),
+                ts_ms: i as i64,
+                lsn: Lsn::from_u64(i),
+            });
+        }
+        assert_eq!(src.event_buffer.len(), 200);
+
+        // poll_batch triggers the cap enforcement.
+        let batch = src.poll_batch(50).await.unwrap().unwrap();
+        // After cap enforcement (200 → 100), drain 50 → 50 remaining.
+        assert_eq!(batch.batch.num_rows(), 50);
+        assert!(
+            src.event_buffer.len() <= 100,
+            "event_buffer should be capped at max_buffered_events, got {}",
+            src.event_buffer.len()
+        );
+        assert!(src.metrics.events_dropped.load(Ordering::Relaxed) >= 100);
     }
 }
