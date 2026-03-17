@@ -149,6 +149,10 @@ impl CdcMetrics {
             self.confirmed_flush_lsn.load(Ordering::Relaxed) as f64,
         );
         m.add_custom(
+            "events_dropped",
+            self.events_dropped.load(Ordering::Relaxed) as f64,
+        );
+        m.add_custom(
             "keepalives_sent",
             self.keepalives_sent.load(Ordering::Relaxed) as f64,
         );

@@ -217,7 +217,10 @@ impl DeltaLakeSink {
         self.resolved_table_path.clone_from(&resolved_path);
         self.resolved_storage_options.clone_from(&merged_options);
 
-        let init_timeout = self.config.write_timeout.max(std::time::Duration::from_secs(120));
+        let init_timeout = self
+            .config
+            .write_timeout
+            .max(std::time::Duration::from_secs(120));
         let table = tokio::time::timeout(
             init_timeout,
             delta_io::open_or_create_table(
@@ -526,19 +529,17 @@ impl DeltaLakeSink {
             // Azure LB drops idle connections after ~4 min; without this,
             // a dead connection blocks the sink task forever.
             let write_timeout = self.config.write_timeout;
-            let write_result = tokio::time::timeout(
-                write_timeout,
-                self.attempt_delta_write(table),
-            )
-            .await;
+            let write_result =
+                tokio::time::timeout(write_timeout, self.attempt_delta_write(table)).await;
 
             // Convert timeout to a write error. The table handle was consumed
             // by attempt_delta_write; the retry loop will reopen via reopen_table().
             let write_result = match write_result {
                 Ok(inner) => inner,
-                Err(_elapsed) => Err(ConnectorError::WriteError(
-                    format!("Delta write timed out after {}s", write_timeout.as_secs()),
-                )),
+                Err(_elapsed) => Err(ConnectorError::WriteError(format!(
+                    "Delta write timed out after {}s",
+                    write_timeout.as_secs()
+                ))),
             };
 
             match write_result {
@@ -947,9 +948,7 @@ impl SinkConnector for DeltaLakeSink {
         self.buffered_bytes += estimated_bytes;
 
         #[cfg(feature = "delta-lake")]
-        if self.config.delivery_guarantee != DeliveryGuarantee::ExactlyOnce
-            && self.should_flush()
-        {
+        if self.config.delivery_guarantee != DeliveryGuarantee::ExactlyOnce && self.should_flush() {
             self.staged_batches = std::mem::take(&mut self.buffer);
             self.staged_rows = self.buffered_rows;
             self.staged_bytes = self.buffered_bytes;

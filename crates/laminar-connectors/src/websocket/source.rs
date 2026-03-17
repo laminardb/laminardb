@@ -285,12 +285,10 @@ async fn send_with_backpressure(
         // TODO(F006): implement DropOldest, Buffer, Sample properly.
         WsBackpressure::DropOldest
         | WsBackpressure::Buffer { .. }
-        | WsBackpressure::Sample { .. } => {
-            match tx.try_send(msg) {
-                Ok(()) | Err(tokio::sync::mpsc::error::TrySendError::Full(_)) => Ok(()),
-                Err(tokio::sync::mpsc::error::TrySendError::Closed(_)) => Err(()),
-            }
-        }
+        | WsBackpressure::Sample { .. } => match tx.try_send(msg) {
+            Ok(()) | Err(tokio::sync::mpsc::error::TrySendError::Full(_)) => Ok(()),
+            Err(tokio::sync::mpsc::error::TrySendError::Closed(_)) => Err(()),
+        },
     };
     if result.is_ok() {
         data_ready.notify_one();
@@ -366,7 +364,9 @@ impl SourceConnector for WebSocketSource {
 
         if matches!(
             self.config.on_backpressure,
-            WsBackpressure::DropOldest | WsBackpressure::Buffer { .. } | WsBackpressure::Sample { .. }
+            WsBackpressure::DropOldest
+                | WsBackpressure::Buffer { .. }
+                | WsBackpressure::Sample { .. }
         ) {
             warn!(
                 strategy = ?self.config.on_backpressure,
