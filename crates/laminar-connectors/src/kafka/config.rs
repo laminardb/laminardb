@@ -494,6 +494,9 @@ pub struct KafkaSourceConfig {
     pub broker_commit_interval: Duration,
 
     // -- Backpressure --
+    /// Capacity of the bounded channel between the background Kafka reader
+    /// task and `poll_batch()` (default: 512). Must be >= `max_poll_records`.
+    pub reader_channel_capacity: usize,
     /// Channel fill ratio at which to pause consumption.
     pub backpressure_high_watermark: f64,
     /// Channel fill ratio at which to resume consumption.
@@ -564,6 +567,7 @@ impl Default for KafkaSourceConfig {
             alignment_max_drift: None,
             alignment_mode: None,
             broker_commit_interval: Duration::from_secs(60),
+            reader_channel_capacity: 512,
             backpressure_high_watermark: 0.8,
             backpressure_low_watermark: 0.5,
             kafka_properties: HashMap::new(),
@@ -730,6 +734,10 @@ impl KafkaSourceConfig {
             .get_parsed::<u64>("broker.commit.interval.ms")?
             .unwrap_or(60_000);
 
+        let reader_channel_capacity = config
+            .get_parsed::<usize>("reader.channel.capacity")?
+            .unwrap_or(512);
+
         let backpressure_high_watermark = config
             .get_parsed::<f64>("backpressure.high.watermark")?
             .unwrap_or(0.8);
@@ -778,6 +786,7 @@ impl KafkaSourceConfig {
             alignment_max_drift: alignment_max_drift_ms.map(Duration::from_millis),
             alignment_mode,
             broker_commit_interval: Duration::from_millis(broker_commit_interval_ms),
+            reader_channel_capacity,
             backpressure_high_watermark,
             backpressure_low_watermark,
             kafka_properties,
@@ -823,6 +832,12 @@ impl KafkaSourceConfig {
             return Err(ConnectorError::ConfigurationError(
                 "max.poll.records must be > 0".into(),
             ));
+        }
+        if self.reader_channel_capacity < self.max_poll_records {
+            return Err(ConnectorError::ConfigurationError(format!(
+                "reader.channel.capacity ({}) must be >= max.poll.records ({})",
+                self.reader_channel_capacity, self.max_poll_records
+            )));
         }
 
         if self.security_protocol.uses_sasl() && self.sasl_mechanism.is_none() {
@@ -1087,6 +1102,7 @@ mod tests {
         assert_eq!(cfg.security_protocol, SecurityProtocol::Plaintext);
         assert!(cfg.sasl_mechanism.is_none());
         assert_eq!(cfg.broker_commit_interval, Duration::from_secs(60));
+        assert_eq!(cfg.reader_channel_capacity, 512);
     }
 
     #[test]

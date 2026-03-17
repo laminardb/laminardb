@@ -105,7 +105,7 @@ impl KafkaSource {
         let backpressure = KafkaBackpressureController::new(
             config.backpressure_high_watermark,
             config.backpressure_low_watermark,
-            config.max_poll_records * 10, // rough channel capacity estimate
+            config.reader_channel_capacity,
             Arc::clone(&channel_len),
         );
 
@@ -167,7 +167,7 @@ impl KafkaSource {
         let backpressure = KafkaBackpressureController::new(
             config.backpressure_high_watermark,
             config.backpressure_low_watermark,
-            config.max_poll_records * 10,
+            config.reader_channel_capacity,
             Arc::clone(&channel_len),
         );
 
@@ -265,7 +265,7 @@ impl KafkaSource {
         }
 
         let consumer = self.consumer.take().unwrap();
-        let (msg_tx, msg_rx) = tokio::sync::mpsc::channel(4096);
+        let (msg_tx, msg_rx) = tokio::sync::mpsc::channel(self.config.reader_channel_capacity);
         let (shutdown_tx, mut shutdown_rx) = tokio::sync::watch::channel(false);
         let (offset_tx, offset_rx) = tokio::sync::watch::channel(TopicPartitionList::new());
         let data_ready = Arc::clone(&self.data_ready);
