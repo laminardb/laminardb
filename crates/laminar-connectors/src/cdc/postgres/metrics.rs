@@ -122,7 +122,7 @@ impl CdcMetrics {
         self.keepalives_sent.fetch_add(1, Ordering::Relaxed);
     }
 
-    /// Records events dropped due to buffer cap enforcement.
+    /// Records events dropped due to buffer cap.
     pub fn record_dropped(&self, count: u64) {
         self.events_dropped.fetch_add(count, Ordering::Relaxed);
     }

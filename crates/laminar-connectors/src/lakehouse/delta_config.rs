@@ -87,8 +87,6 @@ pub struct DeltaLakeSinkConfig {
     pub max_commit_retries: u32,
 
     /// Timeout for individual Delta write operations (default: 30s).
-    /// Azure LB drops idle connections after ~4 min; this prevents a dead
-    /// connection from blocking the sink task indefinitely.
     pub write_timeout: Duration,
 }
 

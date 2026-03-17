@@ -64,8 +64,7 @@ pub struct PostgresSinkConfig {
     /// Delivery guarantee level.
     pub delivery_guarantee: DeliveryGuarantee,
 
-    /// Per-query statement timeout (default: 30s). Set on each pool checkout
-    /// to prevent a stale connection or slow query from blocking indefinitely.
+    /// Per-query statement timeout (default: 30s).
     pub statement_timeout: Duration,
 
     /// Sink ID for offset tracking (auto-generated if empty).

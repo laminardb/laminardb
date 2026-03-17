@@ -746,14 +746,13 @@ impl SourceConnector for PostgresCdcSource {
         // Process any pending WAL messages (test injection path)
         self.process_pending_messages()?;
 
-        // Cap event buffer to prevent OOM when downstream stalls.
         if self.event_buffer.len() > self.config.max_buffered_events {
             let excess = self.event_buffer.len() - self.config.max_buffered_events;
             tracing::warn!(
                 buffered = self.event_buffer.len(),
                 max = self.config.max_buffered_events,
                 dropped = excess,
-                "CDC event buffer exceeded max — dropping oldest events to prevent OOM"
+                "CDC event buffer exceeded max, dropping oldest events"
             );
             self.event_buffer.drain(..excess);
             self.metrics.record_dropped(excess as u64);

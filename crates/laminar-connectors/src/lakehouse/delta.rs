@@ -928,8 +928,6 @@ impl SinkConnector for DeltaLakeSink {
         self.buffered_rows += num_rows;
         self.buffered_bytes += estimated_bytes;
 
-        // For at-least-once: mid-epoch flush when buffer thresholds are hit.
-        // Exactly-once relies on the 2PC path (pre_commit + commit_epoch).
         #[cfg(feature = "delta-lake")]
         if self.config.delivery_guarantee != DeliveryGuarantee::ExactlyOnce
             && self.should_flush()

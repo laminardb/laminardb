@@ -129,8 +129,7 @@ pub struct FileSinkConfig {
     /// Parquet compression codec.
     pub compression: String,
 
-    /// Maximum number of record batches to buffer per epoch for bulk formats
-    /// (Parquet). Prevents OOM under burst load (default: 10,000).
+    /// Maximum batches to buffer per epoch for Parquet (default: 10,000).
     pub max_epoch_batches: usize,
 }
 

@@ -81,8 +81,7 @@ pub struct PostgresCdcConfig {
     /// Tables to exclude from replication.
     pub table_exclude: Vec<String>,
 
-    /// Maximum number of events to buffer in memory before dropping oldest
-    /// (default: 100,000). Prevents OOM when downstream stalls.
+    /// Maximum events to buffer before dropping oldest (default: 100,000).
     pub max_buffered_events: usize,
 }
 

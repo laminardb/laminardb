@@ -613,8 +613,6 @@ impl PostgresSink {
         &mut self,
         client: &tokio_postgres::Client,
     ) -> Result<WriteResult, ConnectorError> {
-        // Set per-checkout statement timeout to prevent stale connections
-        // from blocking the sink task indefinitely.
         client
             .execute(
                 &format!(
@@ -711,7 +709,6 @@ impl SinkConnector for PostgresSink {
             ConnectorError::ConnectionFailed(format!("initial connection failed: {e}"))
         })?;
 
-        // Set statement timeout on the initial test connection.
         client
             .execute(
                 &format!(
