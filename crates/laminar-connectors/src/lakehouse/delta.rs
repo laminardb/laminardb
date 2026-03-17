@@ -109,6 +109,14 @@ pub struct DeltaLakeSink {
     staged_rows: usize,
     /// Estimated bytes staged for commit.
     staged_bytes: u64,
+    /// Resolved table path after catalog lookup (may differ from `config.table_path`
+    /// when using Unity/Glue catalogs). Used by `reopen_table()` so retries
+    /// target the same resolved path that `open()` connected to.
+    #[cfg(feature = "delta-lake")]
+    resolved_table_path: String,
+    /// Resolved storage options after catalog lookup.
+    #[cfg(feature = "delta-lake")]
+    resolved_storage_options: std::collections::HashMap<String, String>,
     /// Cancellation token for the background compaction task.
     #[cfg(feature = "delta-lake")]
     compaction_cancel: Option<tokio_util::sync::CancellationToken>,
@@ -140,6 +148,10 @@ impl DeltaLakeSink {
             staged_bytes: 0,
             #[cfg(feature = "delta-lake")]
             table: None,
+            #[cfg(feature = "delta-lake")]
+            resolved_table_path: String::new(),
+            #[cfg(feature = "delta-lake")]
+            resolved_storage_options: std::collections::HashMap::new(),
             #[cfg(feature = "delta-lake")]
             compaction_cancel: None,
             #[cfg(feature = "delta-lake")]
@@ -261,13 +273,15 @@ impl DeltaLakeSink {
     }
 
     /// Re-opens the Delta Lake table after a conflict error destroys the handle.
+    /// Uses the resolved path/options from `open()`, not `config.*`, so that
+    /// catalog-resolved paths (Unity/Glue) are used correctly.
     #[cfg(feature = "delta-lake")]
     async fn reopen_table(&mut self) -> Result<(), ConnectorError> {
         use super::delta_io;
 
         let table = delta_io::open_or_create_table(
-            &self.config.table_path,
-            self.config.storage_options.clone(),
+            &self.resolved_table_path,
+            self.resolved_storage_options.clone(),
             self.schema.as_ref(),
         )
         .await?;
@@ -363,7 +377,7 @@ impl DeltaLakeSink {
 
         // Retry loop with exponential backoff for optimistic concurrency conflicts.
         let backoff_ms = [100, 500, 2000];
-        let max_attempts = (self.config.max_commit_retries as usize).max(1);
+        let max_attempts = (self.config.max_commit_retries as usize).saturating_add(1);
         let mut last_error: Option<ConnectorError> = None;
 
         for attempt in 0..max_attempts {
@@ -711,6 +725,10 @@ impl SinkConnector for DeltaLakeSink {
                 &self.config.storage_options,
             )
             .await?;
+
+            // Persist resolved values for reopen_table() on conflict retry.
+            self.resolved_table_path.clone_from(&resolved_path);
+            self.resolved_storage_options.clone_from(&merged_options);
 
             let table = delta_io::open_or_create_table(
                 &resolved_path,

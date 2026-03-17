@@ -191,8 +191,9 @@ impl DeltaSourceConfig {
             })?;
         }
         if let Some(v) = config.get("partition.filter") {
-            if !v.is_empty() {
-                cfg.partition_filter = Some(v.to_string());
+            let trimmed = v.trim();
+            if !trimmed.is_empty() {
+                cfg.partition_filter = Some(trimmed.to_string());
             }
         }
         if let Some(v) = config.get("schema.evolution.action") {

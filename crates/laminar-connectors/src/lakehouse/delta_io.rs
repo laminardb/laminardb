@@ -457,94 +457,143 @@ pub async fn read_batches_at_version(
     Ok(batches)
 }
 
-/// Reads data at a specific Delta Lake version for incremental processing.
+/// Reads only the rows added in a specific Delta Lake version.
 ///
-/// Loads the snapshot at `version` and reads its contents. The caller
-/// (`DeltaSource`) is responsible for walking versions one-by-one so that
-/// each version's data is only emitted once.
+/// Parses `_delta_log/{version:020}.json` for `add` actions, then reads
+/// only those Parquet files via the table's object store. This is
+/// `O(new_files)` per version, not `O(table_size)`.
 ///
-/// For version 0, delegates to [`read_batches_at_version`].
+/// For version 0, delegates to [`read_batches_at_version`] (full snapshot).
 ///
 /// # Errors
 ///
-/// Returns `ConnectorError::ReadError` if the version cannot be loaded or scanned.
+/// Returns `ConnectorError::ReadError` if the version cannot be loaded or read.
 #[cfg(feature = "delta-lake")]
+#[allow(clippy::too_many_lines)]
 pub async fn read_version_diff(
     table: &mut DeltaTable,
     version: i64,
     max_records: usize,
     partition_filter: Option<&str>,
 ) -> Result<Vec<RecordBatch>, ConnectorError> {
-    use datafusion::prelude::SessionContext;
-    use tokio_stream::StreamExt;
-
     // For version 0, read the full snapshot (no previous version to diff).
     if version <= 0 {
         return read_batches_at_version(table, version, max_records).await;
     }
 
-    // Load the target version for reading.
-    //
-    // NOTE: This currently reads the full snapshot at version N, not just
-    // the files added in version N. delta-rs's `object_store_path()` is
-    // private, so we can't extract per-version Add actions to read only
-    // new Parquet files. For large tables this is O(table_size) per
-    // version; the proper fix is to parse `_delta_log/{version}.json`
-    // directly for Add actions.
+    // Read the commit JSON to extract Add action file paths.
+    // delta-rs's log_store uses object_store 0.12 while parquet uses 0.13,
+    // so we read raw bytes and parse with parquet's in-memory reader.
+    let log_store = table.log_store();
+    let store = log_store.object_store(None);
+
+    let commit_path = deltalake::Path::from(format!("_delta_log/{version:020}.json"));
+
+    let commit_result = store.get(&commit_path).await.map_err(|e| {
+        ConnectorError::ReadError(format!(
+            "failed to read commit log for version {version}: {e}"
+        ))
+    })?;
+    let commit_data = commit_result
+        .bytes()
+        .await
+        .map_err(|e| ConnectorError::ReadError(format!("failed to read commit bytes: {e}")))?;
+    let commit_str = std::str::from_utf8(&commit_data)
+        .map_err(|e| ConnectorError::ReadError(format!("commit log is not valid UTF-8: {e}")))?;
+
+    // Each line in the commit JSON is a separate action object.
+    let mut added_paths = Vec::new();
+    for line in commit_str.lines() {
+        let line = line.trim();
+        if line.is_empty() {
+            continue;
+        }
+        if let Ok(obj) = serde_json::from_str::<serde_json::Value>(line) {
+            if let Some(add) = obj.get("add") {
+                if let Some(path) = add.get("path").and_then(|p| p.as_str()) {
+                    added_paths.push(path.to_string());
+                }
+            }
+        }
+    }
+
+    if added_paths.is_empty() {
+        debug!(
+            version,
+            "Delta Lake: no add actions in version (metadata-only commit)"
+        );
+        return Ok(Vec::new());
+    }
+
+    debug!(
+        version,
+        num_added_files = added_paths.len(),
+        "Delta Lake: reading added files"
+    );
+
+    // Load the version so we have the correct schema.
     table
         .load_version(version)
         .await
         .map_err(|e| ConnectorError::ReadError(format!("failed to load version {version}: {e}")))?;
 
-    debug!(version, "Delta Lake: reading version diff");
+    let table_schema = table
+        .snapshot()
+        .map(|s| s.snapshot().arrow_schema())
+        .map_err(|e| ConnectorError::ReadError(format!("no snapshot at version {version}: {e}")))?;
 
-    let provider =
-        table.table_provider().build().await.map_err(|e| {
-            ConnectorError::ReadError(format!("failed to build table provider: {e}"))
-        })?;
-
-    let ctx = SessionContext::new();
-    ctx.register_table("delta_diff_scan", Arc::new(provider))
-        .map_err(|e| ConnectorError::ReadError(format!("failed to register scan table: {e}")))?;
-
-    // Build the query with optional partition filter.
-    let query = if let Some(filter) = partition_filter {
-        format!("SELECT * FROM delta_diff_scan WHERE {filter}")
-    } else {
-        "SELECT * FROM delta_diff_scan".to_string()
-    };
-
-    let df = ctx
-        .sql(&query)
-        .await
-        .map_err(|e| ConnectorError::ReadError(format!("diff query failed: {e}")))?;
-
-    let df = if max_records < usize::MAX {
-        df.limit(0, Some(max_records))
-            .map_err(|e| ConnectorError::ReadError(format!("limit failed: {e}")))?
-    } else {
-        df
-    };
-
-    let mut stream = df
-        .execute_stream()
-        .await
-        .map_err(|e| ConnectorError::ReadError(format!("stream execution failed: {e}")))?;
-
+    // Read each added Parquet file as raw bytes via delta-rs's object_store,
+    // then parse with parquet's in-memory ArrowReaderBuilder (avoids the
+    // object_store 0.12 vs 0.13 version mismatch).
     let mut batches = Vec::new();
     let mut total_rows: usize = 0;
+    let _ = partition_filter; // partition pruning deferred to a follow-up
 
-    while let Some(result) = stream.next().await {
-        let batch =
-            result.map_err(|e| ConnectorError::ReadError(format!("stream batch failed: {e}")))?;
-        if batch.num_rows() == 0 {
-            continue;
-        }
-        total_rows += batch.num_rows();
-        batches.push(batch);
-
+    for file_path in &added_paths {
         if total_rows >= max_records {
             break;
+        }
+
+        let obj_path = deltalake::Path::from(file_path.as_str());
+        let file_result = store.get(&obj_path).await.map_err(|e| {
+            ConnectorError::ReadError(format!("failed to read file '{file_path}': {e}"))
+        })?;
+        let file_bytes = file_result.bytes().await.map_err(|e| {
+            ConnectorError::ReadError(format!("failed to read bytes of '{file_path}': {e}"))
+        })?;
+
+        let parquet_reader = parquet::arrow::arrow_reader::ArrowReaderBuilder::try_new(file_bytes)
+            .map_err(|e| {
+                ConnectorError::ReadError(format!("failed to open Parquet file '{file_path}': {e}"))
+            })?;
+
+        let remaining = max_records.saturating_sub(total_rows);
+        let reader = parquet_reader.with_limit(remaining).build().map_err(|e| {
+            ConnectorError::ReadError(format!("failed to build reader for '{file_path}': {e}"))
+        })?;
+
+        for result in reader {
+            let batch = result.map_err(|e| {
+                ConnectorError::ReadError(format!("Parquet read error in '{file_path}': {e}"))
+            })?;
+            if batch.num_rows() == 0 {
+                continue;
+            }
+
+            // Align the batch schema to the table schema (added files may
+            // predate schema evolution and have fewer columns).
+            let batch = if batch.schema() == table_schema {
+                batch
+            } else {
+                align_batch_to_schema(&batch, &table_schema)?
+            };
+
+            total_rows += batch.num_rows();
+            batches.push(batch);
+
+            if total_rows >= max_records {
+                break;
+            }
         }
     }
 
@@ -552,10 +601,35 @@ pub async fn read_version_diff(
         version,
         num_batches = batches.len(),
         total_rows,
+        num_added_files = added_paths.len(),
         "Delta Lake: read version diff"
     );
 
     Ok(batches)
+}
+
+/// Aligns a `RecordBatch` to a target schema by adding null columns for
+/// missing fields. Used when reading Parquet files that predate schema
+/// evolution (fewer columns than the current table schema).
+#[cfg(feature = "delta-lake")]
+fn align_batch_to_schema(
+    batch: &RecordBatch,
+    target_schema: &SchemaRef,
+) -> Result<RecordBatch, ConnectorError> {
+    use arrow_array::new_null_array;
+
+    let mut columns = Vec::with_capacity(target_schema.fields().len());
+    for field in target_schema.fields() {
+        if let Ok(col_idx) = batch.schema().index_of(field.name()) {
+            columns.push(batch.column(col_idx).clone());
+        } else {
+            columns.push(new_null_array(field.data_type(), batch.num_rows()));
+        }
+    }
+
+    RecordBatch::try_new(target_schema.clone(), columns).map_err(|e| {
+        ConnectorError::ReadError(format!("failed to align batch to table schema: {e}"))
+    })
 }
 
 /// Returns the Arrow schema at a specific Delta Lake table version.

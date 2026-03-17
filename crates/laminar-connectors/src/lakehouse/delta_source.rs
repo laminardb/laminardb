@@ -266,7 +266,16 @@ impl SourceConnector for DeltaSource {
                 }
                 self.last_version_check = Some(Instant::now());
 
-                let latest_version = delta_io::get_latest_version(&mut self.table).await?;
+                let latest_version = match delta_io::get_latest_version(&mut self.table).await {
+                    Ok(v) => v,
+                    Err(e) => {
+                        // get_latest_version consumes the table on error
+                        // (delta-rs update() takes ownership). Log and
+                        // return None so the source adapter retries.
+                        warn!(error = %e, "Delta Lake source: version check failed, will retry");
+                        return Ok(None);
+                    }
+                };
                 self.known_latest_version = latest_version;
 
                 if latest_version <= self.current_version {
