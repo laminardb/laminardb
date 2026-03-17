@@ -187,7 +187,7 @@ impl SourceConnector for DeltaSource {
             use super::delta_io;
 
             // Open the existing table (source requires the table to exist).
-            let table = delta_io::open_or_create_table(
+            let mut table = delta_io::open_or_create_table(
                 &self.config.table_path,
                 self.config.storage_options.clone(),
                 None,
@@ -204,6 +204,36 @@ impl SourceConnector for DeltaSource {
             #[allow(clippy::cast_possible_wrap)]
             if let Some(start) = self.config.starting_version {
                 self.current_version = start;
+            } else if self.config.read_mode == DeltaReadMode::Incremental && table_version > 0 {
+                // No explicit starting_version in incremental mode: read a
+                // snapshot of the current table state first, then switch to
+                // incremental for subsequent versions. Without this, the
+                // source would start at current_version + 1 and silently
+                // skip all existing data.
+                // NOTE: For very large tables this buffers all rows in memory.
+                // Set `starting_version` explicitly to skip the initial snapshot
+                // if memory is a concern. Streaming backpressure is tracked as D007.
+                let batches =
+                    delta_io::read_batches_at_version(&mut table, table_version, usize::MAX)
+                        .await?;
+                for batch in batches {
+                    if batch.num_rows() > 0 {
+                        self.pending_batches.push_back(batch);
+                    }
+                }
+                if self.pending_batches.is_empty() {
+                    self.current_version = table_version;
+                } else {
+                    self.inflight_version = Some(table_version);
+                }
+                info!(
+                    table_version,
+                    batches_buffered = self.pending_batches.len(),
+                    "Delta Lake source: loaded initial snapshot"
+                );
+                // current_version is set to table_version once the
+                // snapshot batches are fully drained via poll_batch().
+                // Subsequent polls will read table_version + 1 onward.
             } else {
                 self.current_version = table_version;
             }

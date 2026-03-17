@@ -175,6 +175,11 @@ fn delta_lake_config_keys() -> Vec<ConfigKeySpec> {
             "10",
         ),
         ConfigKeySpec::optional(
+            "compaction.check-interval.ms",
+            "How often to check if compaction is needed (milliseconds)",
+            "3600000",
+        ),
+        ConfigKeySpec::optional(
             "vacuum.retention.hours",
             "Hours to retain old files during VACUUM",
             "168",

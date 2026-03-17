@@ -193,6 +193,7 @@ pub async fn open_or_create_table(
 ///
 /// Returns `ConnectorError::WriteError` if the write fails.
 #[cfg(feature = "delta-lake")]
+#[allow(clippy::too_many_arguments)]
 pub async fn write_batches(
     table: DeltaTable,
     batches: Vec<RecordBatch>,
@@ -201,6 +202,8 @@ pub async fn write_batches(
     save_mode: SaveMode,
     partition_columns: Option<&[String]>,
     schema_evolution: bool,
+    target_file_size: Option<usize>,
+    create_checkpoint: bool,
 ) -> Result<(DeltaTable, i64), ConnectorError> {
     if batches.is_empty() {
         debug!("no batches to write, skipping");
@@ -229,8 +232,15 @@ pub async fn write_batches(
         .with_save_mode(save_mode)
         .with_commit_properties(
             CommitProperties::default()
-                .with_application_transaction(Transaction::new(writer_id, epoch_i64)),
+                .with_application_transaction(Transaction::new(writer_id, epoch_i64))
+                .with_create_checkpoint(create_checkpoint),
         );
+
+    // Forward target file size to delta-rs so Parquet files match the
+    // user's configured size, not just the internal default.
+    if let Some(size) = target_file_size {
+        write_builder = write_builder.with_target_file_size(size);
+    }
 
     // Enable schema evolution (additive column merge) if requested.
     if schema_evolution {
@@ -1382,6 +1392,8 @@ mod tests {
             SaveMode::Append,
             None,
             false,
+            None,
+            false,
         )
         .await
         .unwrap();
@@ -1423,6 +1435,8 @@ mod tests {
             SaveMode::Append,
             None,
             false,
+            None,
+            false,
         )
         .await
         .unwrap();
@@ -1461,6 +1475,8 @@ mod tests {
                 writer_id,
                 epoch,
                 SaveMode::Append,
+                None,
+                false,
                 None,
                 false,
             )
@@ -1516,6 +1532,8 @@ mod tests {
             SaveMode::Append,
             None,
             false,
+            None,
+            false,
         )
         .await
         .unwrap();
@@ -1545,6 +1563,8 @@ mod tests {
             "multi-batch-writer",
             1,
             SaveMode::Append,
+            None,
+            false,
             None,
             false,
         )
@@ -1616,6 +1636,8 @@ mod tests {
             SaveMode::Append,
             None,
             false,
+            None,
+            false,
         )
         .await
         .unwrap();
@@ -1646,6 +1668,8 @@ mod tests {
             SaveMode::Append,
             None,
             false,
+            None,
+            false,
         )
         .await
         .unwrap();
@@ -1658,6 +1682,8 @@ mod tests {
             "writer",
             2,
             SaveMode::Append,
+            None,
+            false,
             None,
             false,
         )
@@ -1754,6 +1780,8 @@ mod tests {
             SaveMode::Append,
             None,
             false,
+            None,
+            false,
         )
         .await
         .unwrap();
@@ -1763,6 +1791,8 @@ mod tests {
             "writer",
             2,
             SaveMode::Append,
+            None,
+            false,
             None,
             false,
         )
@@ -1868,6 +1898,8 @@ mod tests {
             SaveMode::Append,
             None,
             false,
+            None,
+            false,
         )
         .await
         .unwrap();
@@ -1880,6 +1912,8 @@ mod tests {
             writer_id,
             2,
             SaveMode::Append,
+            None,
+            false,
             None,
             false,
         )
@@ -1933,6 +1967,8 @@ mod tests {
             SaveMode::Append,
             None,
             true, // schema_evolution enabled
+            None,
+            false,
         )
         .await
         .unwrap();
@@ -1960,6 +1996,8 @@ mod tests {
             SaveMode::Append,
             None,
             true,
+            None,
+            false,
         )
         .await
         .unwrap();
@@ -2001,6 +2039,8 @@ mod tests {
                 "compaction-writer",
                 epoch,
                 SaveMode::Append,
+                None,
+                false,
                 None,
                 false,
             )
@@ -2069,6 +2109,8 @@ mod tests {
             SaveMode::Append,
             None,
             false,
+            None,
+            false,
         )
         .await
         .unwrap();
@@ -2134,6 +2176,8 @@ mod tests {
             SaveMode::Append,
             None,
             false,
+            None,
+            false,
         )
         .await
         .unwrap();
@@ -2197,6 +2241,8 @@ mod tests {
             "merge-writer",
             1,
             SaveMode::Append,
+            None,
+            false,
             None,
             false,
         )
