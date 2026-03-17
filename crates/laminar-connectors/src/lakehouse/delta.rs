@@ -217,12 +217,22 @@ impl DeltaLakeSink {
         self.resolved_table_path.clone_from(&resolved_path);
         self.resolved_storage_options.clone_from(&merged_options);
 
-        let table = delta_io::open_or_create_table(
-            &resolved_path,
-            merged_options.clone(),
-            self.schema.as_ref(),
+        let init_timeout = self.config.write_timeout.max(std::time::Duration::from_secs(120));
+        let table = tokio::time::timeout(
+            init_timeout,
+            delta_io::open_or_create_table(
+                &resolved_path,
+                merged_options.clone(),
+                self.schema.as_ref(),
+            ),
         )
-        .await?;
+        .await
+        .map_err(|_| {
+            ConnectorError::ConnectionFailed(format!(
+                "Delta table init timed out after {}s",
+                init_timeout.as_secs()
+            ))
+        })??;
 
         // Read schema from existing table if we don't have one.
         if self.schema.is_none() {
@@ -493,7 +503,15 @@ impl DeltaLakeSink {
             // delta-rs write/merge APIs consume DeltaTable by value.
             // If self.table is None (from a previous failed attempt), re-open it.
             if self.table.is_none() {
-                self.reopen_table().await?;
+                let reopen_timeout = self.config.write_timeout;
+                tokio::time::timeout(reopen_timeout, self.reopen_table())
+                    .await
+                    .map_err(|_| {
+                        ConnectorError::ConnectionFailed(format!(
+                            "Delta table reopen timed out after {}s",
+                            reopen_timeout.as_secs()
+                        ))
+                    })??;
             }
 
             let table = self
