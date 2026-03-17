@@ -128,6 +128,10 @@ pub struct FileSinkConfig {
 
     /// Parquet compression codec.
     pub compression: String,
+
+    /// Maximum number of record batches to buffer per epoch for bulk formats
+    /// (Parquet). Prevents OOM under burst load (default: 10,000).
+    pub max_epoch_batches: usize,
 }
 
 impl FileSinkConfig {
@@ -181,6 +185,16 @@ impl FileSinkConfig {
             .cloned()
             .unwrap_or_else(|| "snappy".to_string());
 
+        let max_epoch_batches = props
+            .get("max_epoch_batches")
+            .map(|s| {
+                s.parse::<usize>().map_err(|e| {
+                    ConnectorError::ConfigurationError(format!("invalid max_epoch_batches: {e}"))
+                })
+            })
+            .transpose()?
+            .unwrap_or(10_000);
+
         Ok(Self {
             path,
             format,
@@ -188,6 +202,7 @@ impl FileSinkConfig {
             prefix,
             max_file_size,
             compression,
+            max_epoch_batches,
         })
     }
 }
