@@ -335,20 +335,36 @@ pub fn get_table_schema(table: &DeltaTable) -> Result<SchemaRef, ConnectorError>
 /// Returns the latest committed version of a Delta Lake table.
 ///
 /// This refreshes the table state from storage before checking.
+/// Takes `&mut Option<DeltaTable>` to avoid cloning: uses `take()` +
+/// `update()` + put-back, which is zero-copy on success.
 ///
 /// # Errors
 ///
 /// Returns `ConnectorError::ReadError` if the table state cannot be refreshed.
 #[cfg(feature = "delta-lake")]
-pub async fn get_latest_version(table: &mut DeltaTable) -> Result<i64, ConnectorError> {
-    // DeltaTable::update() takes ownership, so clone and replace.
-    let (updated, _metrics) =
-        table.clone().update().await.map_err(|e| {
-            ConnectorError::ReadError(format!("failed to refresh Delta table: {e}"))
+pub async fn get_latest_version(
+    table_slot: &mut Option<DeltaTable>,
+) -> Result<i64, ConnectorError> {
+    let table = table_slot
+        .take()
+        .ok_or_else(|| ConnectorError::InvalidState {
+            expected: "table initialized".into(),
+            actual: "table not initialized".into(),
         })?;
 
-    *table = updated;
-    Ok(table.version().unwrap_or(0))
+    match table.update().await {
+        Ok((updated, _metrics)) => {
+            let version = updated.version().unwrap_or(0);
+            *table_slot = Some(updated);
+            Ok(version)
+        }
+        Err(e) => {
+            // Table is consumed by update() on error — cannot restore.
+            Err(ConnectorError::ReadError(format!(
+                "failed to refresh Delta table: {e}"
+            )))
+        }
+    }
 }
 
 /// Reads record batches from a specific Delta Lake table version.
@@ -441,6 +457,292 @@ pub async fn read_batches_at_version(
     Ok(batches)
 }
 
+/// Reads only the rows added in a specific Delta Lake version.
+///
+/// Parses `_delta_log/{version:020}.json` for `add` actions, then reads
+/// only those Parquet files via the table's object store. This is
+/// `O(new_files)` per version, not `O(table_size)`.
+///
+/// For version 0, delegates to [`read_batches_at_version`] (full snapshot).
+///
+/// # Errors
+///
+/// Returns `ConnectorError::ReadError` if the version cannot be loaded or read.
+#[cfg(feature = "delta-lake")]
+#[allow(clippy::too_many_lines)]
+pub async fn read_version_diff(
+    table: &mut DeltaTable,
+    version: i64,
+    max_records: usize,
+    partition_filter: Option<&str>,
+) -> Result<Vec<RecordBatch>, ConnectorError> {
+    // For version 0, read the full snapshot (no previous version to diff).
+    if version <= 0 {
+        return read_batches_at_version(table, version, max_records).await;
+    }
+
+    // Read the commit JSON to extract Add action file paths.
+    // delta-rs's log_store uses object_store 0.12 while parquet uses 0.13,
+    // so we read raw bytes and parse with parquet's in-memory reader.
+    let log_store = table.log_store();
+    let store = log_store.object_store(None);
+
+    let commit_path = deltalake::Path::from(format!("_delta_log/{version:020}.json"));
+    let commit_log_display = format!("_delta_log/{version:020}.json");
+
+    let commit_data = get_with_retry(&store, &commit_path, &commit_log_display).await?;
+    let commit_str = std::str::from_utf8(&commit_data)
+        .map_err(|e| ConnectorError::ReadError(format!("commit log is not valid UTF-8: {e}")))?;
+
+    // Each line in the commit JSON is a separate action object.
+    // Collect both add and remove actions to compute the net-new files.
+    let mut added_paths = Vec::new();
+    let mut removed_paths = std::collections::HashSet::new();
+    for line in commit_str.lines() {
+        let line = line.trim();
+        if line.is_empty() {
+            continue;
+        }
+        if let Ok(obj) = serde_json::from_str::<serde_json::Value>(line) {
+            if let Some(add) = obj.get("add") {
+                if let Some(path) = add.get("path").and_then(|p| p.as_str()) {
+                    added_paths.push(decode_delta_path(path));
+                }
+            }
+            if let Some(remove) = obj.get("remove") {
+                if let Some(path) = remove.get("path").and_then(|p| p.as_str()) {
+                    removed_paths.insert(decode_delta_path(path));
+                }
+            }
+        }
+    }
+
+    // Exclude any added file whose path also appears in a remove action.
+    added_paths.retain(|p| !removed_paths.contains(p));
+
+    if added_paths.is_empty() {
+        debug!(
+            version,
+            num_removed = removed_paths.len(),
+            "Delta Lake: no net-new add actions in version"
+        );
+        return Ok(Vec::new());
+    }
+
+    debug!(
+        version,
+        num_added_files = added_paths.len(),
+        num_removed_files = removed_paths.len(),
+        "Delta Lake: reading added files"
+    );
+
+    // Load the version so we have the correct schema.
+    table
+        .load_version(version)
+        .await
+        .map_err(|e| ConnectorError::ReadError(format!("failed to load version {version}: {e}")))?;
+
+    let table_schema = table
+        .snapshot()
+        .map(|s| s.snapshot().arrow_schema())
+        .map_err(|e| ConnectorError::ReadError(format!("no snapshot at version {version}: {e}")))?;
+
+    // Filter file paths by partition predicate if provided.
+    // Supports simple Hive-style equality: "col = 'val'" matches "col=val/" in path.
+    let added_paths = if let Some(filter) = partition_filter {
+        filter_paths_by_partition(&added_paths, filter)
+    } else {
+        added_paths
+    };
+
+    // Read each added Parquet file as raw bytes via delta-rs's object_store,
+    // then parse with parquet's in-memory ArrowReaderBuilder (avoids the
+    // object_store 0.12 vs 0.13 version mismatch).
+    let mut batches = Vec::new();
+    let mut total_rows: usize = 0;
+
+    for file_path in &added_paths {
+        if total_rows >= max_records {
+            break;
+        }
+
+        let obj_path = deltalake::Path::from(file_path.as_str());
+        let file_bytes = get_with_retry(&store, &obj_path, file_path).await?;
+
+        let parquet_reader = parquet::arrow::arrow_reader::ArrowReaderBuilder::try_new(file_bytes)
+            .map_err(|e| {
+                ConnectorError::ReadError(format!("failed to open Parquet file '{file_path}': {e}"))
+            })?;
+
+        let remaining = max_records.saturating_sub(total_rows);
+        let reader = parquet_reader.with_limit(remaining).build().map_err(|e| {
+            ConnectorError::ReadError(format!("failed to build reader for '{file_path}': {e}"))
+        })?;
+
+        for result in reader {
+            let batch = result.map_err(|e| {
+                ConnectorError::ReadError(format!("Parquet read error in '{file_path}': {e}"))
+            })?;
+            if batch.num_rows() == 0 {
+                continue;
+            }
+
+            // Align the batch schema to the table schema (added files may
+            // predate schema evolution and have fewer columns).
+            let batch = if batch.schema() == table_schema {
+                batch
+            } else {
+                align_batch_to_schema(&batch, &table_schema)?
+            };
+
+            total_rows += batch.num_rows();
+            batches.push(batch);
+
+            if total_rows >= max_records {
+                break;
+            }
+        }
+    }
+
+    debug!(
+        version,
+        num_batches = batches.len(),
+        total_rows,
+        num_added_files = added_paths.len(),
+        "Delta Lake: read version diff"
+    );
+
+    Ok(batches)
+}
+
+/// Reads a file from `object_store` with retry on transient failures.
+///
+/// Retries up to 3 times with exponential backoff (200ms, 1s, 4s).
+/// Only retries on I/O-like errors, not on 404 (file not found).
+#[cfg(feature = "delta-lake")]
+async fn get_with_retry(
+    store: &Arc<dyn deltalake::ObjectStore>,
+    path: &deltalake::Path,
+    display_path: &str,
+) -> Result<bytes::Bytes, ConnectorError> {
+    let backoff = [200u64, 1000, 4000];
+    let mut last_err = None;
+
+    for attempt in 0..=backoff.len() {
+        match store.get(path).await {
+            Ok(result) => {
+                return result.bytes().await.map_err(|e| {
+                    ConnectorError::ReadError(format!(
+                        "failed to read bytes of '{display_path}': {e}"
+                    ))
+                });
+            }
+            Err(e) => {
+                let msg = e.to_string();
+                // Don't retry 404 (file genuinely missing, e.g., after VACUUM).
+                if msg.contains("not found") || msg.contains("404") {
+                    return Err(ConnectorError::ReadError(format!(
+                        "file not found '{display_path}': {e}"
+                    )));
+                }
+                if let Some(&delay) = backoff.get(attempt) {
+                    warn!(
+                        attempt = attempt + 1,
+                        delay_ms = delay,
+                        error = %e,
+                        path = display_path,
+                        "object_store read failed, retrying"
+                    );
+                    tokio::time::sleep(std::time::Duration::from_millis(delay)).await;
+                }
+                last_err = Some(e);
+            }
+        }
+    }
+
+    Err(ConnectorError::ReadError(format!(
+        "failed to read file '{display_path}' after {} attempts: {}",
+        backoff.len() + 1,
+        last_err.map_or_else(|| "unknown".to_string(), |e| e.to_string())
+    )))
+}
+
+/// Filters file paths by a Hive-style partition predicate.
+///
+/// Supports simple equality predicates: `col = 'val'` matches paths
+/// containing `col=val/`. Multiple predicates joined by `AND` are all
+/// required to match. Predicates that can't be parsed are ignored
+/// (all paths pass through).
+#[cfg(feature = "delta-lake")]
+fn filter_paths_by_partition(paths: &[String], filter: &str) -> Vec<String> {
+    // Parse simple "col = 'val'" or "col = val" predicates from AND-joined expressions.
+    let mut required_segments: Vec<String> = Vec::new();
+    for clause in filter
+        .split_whitespace()
+        .collect::<Vec<_>>()
+        .join(" ")
+        .split(" AND ")
+    {
+        let clause = clause.trim();
+        if let Some((col, val)) = clause.split_once('=') {
+            let col = col.trim();
+            let val = val.trim().trim_matches('\'').trim_matches('"');
+            if !col.is_empty() && !val.is_empty() {
+                required_segments.push(format!("{col}={val}"));
+            }
+        }
+    }
+
+    if required_segments.is_empty() {
+        return paths.to_vec();
+    }
+
+    paths
+        .iter()
+        .filter(|path| required_segments.iter().all(|seg| path.contains(seg)))
+        .cloned()
+        .collect()
+}
+
+/// Percent-decodes a file path from a Delta Lake commit JSON.
+///
+/// Delta Lake spec requires paths in `add`/`remove` actions to be
+/// percent-encoded (e.g., `part%3D1/file.parquet` for `part=1/file.parquet`).
+#[cfg(feature = "delta-lake")]
+fn decode_delta_path(encoded: &str) -> String {
+    url::Url::parse(&format!("file:///{encoded}")).map_or_else(
+        |_| encoded.to_string(),
+        |u| {
+            let p = u.path();
+            p.strip_prefix('/').unwrap_or(p).to_string()
+        },
+    )
+}
+
+/// Aligns a `RecordBatch` to a target schema by adding null columns for
+/// missing fields. Used when reading Parquet files that predate schema
+/// evolution (fewer columns than the current table schema).
+#[cfg(feature = "delta-lake")]
+fn align_batch_to_schema(
+    batch: &RecordBatch,
+    target_schema: &SchemaRef,
+) -> Result<RecordBatch, ConnectorError> {
+    use arrow_array::new_null_array;
+
+    let mut columns = Vec::with_capacity(target_schema.fields().len());
+    for field in target_schema.fields() {
+        if let Ok(col_idx) = batch.schema().index_of(field.name()) {
+            columns.push(batch.column(col_idx).clone());
+        } else {
+            columns.push(new_null_array(field.data_type(), batch.num_rows()));
+        }
+    }
+
+    RecordBatch::try_new(target_schema.clone(), columns).map_err(|e| {
+        ConnectorError::ReadError(format!("failed to align batch to table schema: {e}"))
+    })
+}
+
 /// Result of a MERGE (upsert) operation.
 #[cfg(feature = "delta-lake")]
 #[derive(Debug)]
@@ -471,7 +773,7 @@ pub struct MergeResult {
 /// # Errors
 ///
 /// Returns `ConnectorError::WriteError` if the merge fails.
-#[cfg(feature = "delta-lake")]
+#[cfg(all(test, feature = "delta-lake"))]
 #[allow(clippy::too_many_lines)]
 pub async fn merge_batches(
     table: DeltaTable,
@@ -599,7 +901,7 @@ pub async fn merge_batches(
 /// # Errors
 ///
 /// Returns `ConnectorError::WriteError` if the operation fails.
-#[cfg(feature = "delta-lake")]
+#[cfg(all(test, feature = "delta-lake"))]
 pub async fn delete_by_merge(
     table: DeltaTable,
     delete_batch: RecordBatch,
@@ -1295,18 +1597,19 @@ mod tests {
         let table_path = temp_dir.path().to_str().unwrap();
 
         let schema = test_schema();
-        let mut table = open_or_create_table(table_path, HashMap::new(), Some(&schema))
+        let table = open_or_create_table(table_path, HashMap::new(), Some(&schema))
             .await
             .unwrap();
 
         // Initial version is 0.
-        let v = get_latest_version(&mut table).await.unwrap();
+        let mut table_slot = Some(table);
+        let v = get_latest_version(&mut table_slot).await.unwrap();
         assert_eq!(v, 0);
 
         // Write a batch -> version 1.
         let batch = test_batch(10);
         let (returned_table, version) = write_batches(
-            table,
+            table_slot.take().unwrap(),
             vec![batch],
             "writer",
             1,
@@ -1317,9 +1620,9 @@ mod tests {
         .await
         .unwrap();
         assert_eq!(version, 1);
-        table = returned_table;
+        table_slot = Some(returned_table);
 
-        let v = get_latest_version(&mut table).await.unwrap();
+        let v = get_latest_version(&mut table_slot).await.unwrap();
         assert_eq!(v, 1);
     }
 
@@ -1528,13 +1831,14 @@ mod tests {
         sink.close().await.unwrap();
 
         // Verify all 25 rows are in the Delta table.
-        let mut table = open_or_create_table(table_path, HashMap::new(), None)
+        let table = open_or_create_table(table_path, HashMap::new(), None)
             .await
             .unwrap();
-        let latest = get_latest_version(&mut table).await.unwrap();
+        let mut table_slot = Some(table);
+        let latest = get_latest_version(&mut table_slot).await.unwrap();
         assert!(latest >= 1, "should have at least 1 version");
 
-        let batches = read_batches_at_version(&mut table, latest, 10000)
+        let batches = read_batches_at_version(table_slot.as_mut().unwrap(), latest, 10000)
             .await
             .unwrap();
         let total_rows: usize = batches.iter().map(RecordBatch::num_rows).sum();
@@ -1789,11 +2093,12 @@ mod tests {
         assert_eq!(result.rows_updated, 0);
 
         // Verify final row count = 5.
-        let mut read_table = open_or_create_table(table_path, HashMap::new(), None)
+        let read_table = open_or_create_table(table_path, HashMap::new(), None)
             .await
             .unwrap();
-        let latest = get_latest_version(&mut read_table).await.unwrap();
-        let batches = read_batches_at_version(&mut read_table, latest, 10000)
+        let mut read_slot = Some(read_table);
+        let latest = get_latest_version(&mut read_slot).await.unwrap();
+        let batches = read_batches_at_version(read_slot.as_mut().unwrap(), latest, 10000)
             .await
             .unwrap();
         let total_rows: usize = batches.iter().map(RecordBatch::num_rows).sum();
@@ -1853,11 +2158,12 @@ mod tests {
         assert_eq!(result.rows_inserted, 0);
 
         // Verify row count is still 3 (no new rows added).
-        let mut read_table = open_or_create_table(table_path, HashMap::new(), None)
+        let read_table = open_or_create_table(table_path, HashMap::new(), None)
             .await
             .unwrap();
-        let latest = get_latest_version(&mut read_table).await.unwrap();
-        let batches = read_batches_at_version(&mut read_table, latest, 10000)
+        let mut read_slot = Some(read_table);
+        let latest = get_latest_version(&mut read_slot).await.unwrap();
+        let batches = read_batches_at_version(read_slot.as_mut().unwrap(), latest, 10000)
             .await
             .unwrap();
         let total_rows: usize = batches.iter().map(RecordBatch::num_rows).sum();
@@ -1916,11 +2222,12 @@ mod tests {
         assert_eq!(rows_deleted, 2);
 
         // Verify only 1 row remains.
-        let mut read_table = open_or_create_table(table_path, HashMap::new(), None)
+        let read_table = open_or_create_table(table_path, HashMap::new(), None)
             .await
             .unwrap();
-        let latest = get_latest_version(&mut read_table).await.unwrap();
-        let batches = read_batches_at_version(&mut read_table, latest, 10000)
+        let mut read_slot = Some(read_table);
+        let latest = get_latest_version(&mut read_slot).await.unwrap();
+        let batches = read_batches_at_version(read_slot.as_mut().unwrap(), latest, 10000)
             .await
             .unwrap();
         let total_rows: usize = batches.iter().map(RecordBatch::num_rows).sum();

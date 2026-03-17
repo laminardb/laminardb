@@ -109,6 +109,14 @@ pub struct DeltaLakeSink {
     staged_rows: usize,
     /// Estimated bytes staged for commit.
     staged_bytes: u64,
+    /// Resolved table path after catalog lookup (may differ from `config.table_path`
+    /// when using Unity/Glue catalogs). Used by `reopen_table()` so retries
+    /// target the same resolved path that `open()` connected to.
+    #[cfg(feature = "delta-lake")]
+    resolved_table_path: String,
+    /// Resolved storage options after catalog lookup.
+    #[cfg(feature = "delta-lake")]
+    resolved_storage_options: std::collections::HashMap<String, String>,
     /// Cancellation token for the background compaction task.
     #[cfg(feature = "delta-lake")]
     compaction_cancel: Option<tokio_util::sync::CancellationToken>,
@@ -140,6 +148,10 @@ impl DeltaLakeSink {
             staged_bytes: 0,
             #[cfg(feature = "delta-lake")]
             table: None,
+            #[cfg(feature = "delta-lake")]
+            resolved_table_path: String::new(),
+            #[cfg(feature = "delta-lake")]
+            resolved_storage_options: std::collections::HashMap::new(),
             #[cfg(feature = "delta-lake")]
             compaction_cancel: None,
             #[cfg(feature = "delta-lake")]
@@ -249,39 +261,51 @@ impl DeltaLakeSink {
             .sum()
     }
 
-    /// Writes all staged data to Delta Lake as a single atomic transaction.
-    ///
-    /// Called from `commit_epoch()` only — after the checkpoint manifest is
-    /// persisted. This ensures `rollback_epoch()` can discard staged data
-    /// without leaving orphaned files in Delta.
-    ///
-    /// On write failure the table handle and staged state are preserved so
-    /// that subsequent retries or rollbacks can still operate.
+    /// Returns `true` if the error is a Delta Lake optimistic concurrency
+    /// conflict (retryable). Matches specific delta-rs conflict indicators
+    /// only — not generic "transaction" mentions.
     #[cfg(feature = "delta-lake")]
-    async fn flush_staged_to_delta(&mut self) -> Result<WriteResult, ConnectorError> {
-        if self.staged_batches.is_empty() {
-            return Ok(WriteResult::new(0, 0));
+    fn is_conflict_error(err: &ConnectorError) -> bool {
+        let msg = err.to_string().to_lowercase();
+        msg.contains("conflicting commit")
+            || msg.contains("version already exists")
+            || msg.contains("concurrent")
+            || (msg.contains("conflict") && !msg.contains("log") && !msg.contains("corrupt"))
+    }
+
+    /// Re-opens the Delta Lake table after a conflict error destroys the handle.
+    /// Uses the resolved path/options from `open()`, not `config.*`, so that
+    /// catalog-resolved paths (Unity/Glue) are used correctly.
+    #[cfg(feature = "delta-lake")]
+    async fn reopen_table(&mut self) -> Result<(), ConnectorError> {
+        use super::delta_io;
+
+        let table = delta_io::open_or_create_table(
+            &self.resolved_table_path,
+            self.resolved_storage_options.clone(),
+            self.schema.as_ref(),
+        )
+        .await?;
+
+        #[allow(clippy::cast_sign_loss)]
+        {
+            self.delta_version = table.version().unwrap_or(0) as u64;
         }
+        self.table = Some(table);
+        Ok(())
+    }
 
-        let total_rows = self.staged_rows;
-        let estimated_bytes = self.staged_bytes;
-
-        // delta-rs write/merge APIs consume DeltaTable by value and return
-        // a new handle on success. We must take() ownership to call them,
-        // but we must restore self.table on error so the sink stays usable.
-        let table = self
-            .table
-            .take()
-            .ok_or_else(|| ConnectorError::InvalidState {
-                expected: "table initialized".into(),
-                actual: "table not initialized".into(),
-            })?;
-
+    /// Attempts a single Delta write/merge and returns the updated table on success.
+    #[cfg(feature = "delta-lake")]
+    async fn attempt_delta_write(
+        &mut self,
+        table: DeltaTable,
+    ) -> Result<DeltaTable, ConnectorError> {
         // Clone batches for the write — staged_batches is only cleared on
         // success. RecordBatch::clone is Arc-bump only (~16-48ns per batch).
         let batches: Vec<RecordBatch> = self.staged_batches.clone();
 
-        let write_result = if self.config.write_mode == DeltaWriteMode::Upsert {
+        if self.config.write_mode == DeltaWriteMode::Upsert {
             // ── Upsert/Merge path ──
             let combined =
                 match arrow_select::concat::concat_batches(&batches[0].schema(), &batches) {
@@ -336,46 +360,96 @@ impl DeltaLakeSink {
             )
             .await
             .map(|(t, _version)| t)
-        };
-
-        // On error: delta-rs consumed the old table handle but the write
-        // failed. The table is unrecoverable from delta-rs's perspective,
-        // but staged_batches and staged_rows/bytes are intact so the
-        // caller can retry or rollback without data loss.
-        let table = match write_result {
-            Ok(t) => t,
-            Err(e) => {
-                // self.table is already None — the caller must handle this
-                // (rollback_epoch clears staged state; a retry re-opens).
-                return Err(e);
-            }
-        };
-
-        // ── Success: commit state ──
-        #[allow(clippy::cast_sign_loss)]
-        {
-            self.delta_version = table.version().unwrap_or(0) as u64;
         }
-        self.table = Some(table);
-        self.pending_files = 0;
+    }
 
-        // Clear staged state only after confirmed success.
-        self.staged_batches.clear();
-        self.staged_rows = 0;
-        self.staged_bytes = 0;
+    /// Writes all staged data to Delta Lake as a single atomic transaction.
+    ///
+    /// Retries on optimistic concurrency conflicts with exponential backoff.
+    /// On non-conflict errors or exhausted retries, propagates the error.
+    #[cfg(feature = "delta-lake")]
+    async fn flush_staged_to_delta(&mut self) -> Result<WriteResult, ConnectorError> {
+        if self.staged_batches.is_empty() {
+            return Ok(WriteResult::new(0, 0));
+        }
 
-        self.metrics
-            .record_flush(total_rows as u64, estimated_bytes);
-        self.metrics.record_commit(self.delta_version);
+        let total_rows = self.staged_rows;
+        let estimated_bytes = self.staged_bytes;
 
-        debug!(
-            rows = total_rows,
-            bytes = estimated_bytes,
-            delta_version = self.delta_version,
-            "Delta Lake: committed staged data to Delta"
-        );
+        // Retry loop with exponential backoff for optimistic concurrency conflicts.
+        let backoff_ms = [100, 500, 2000];
+        let max_attempts = (self.config.max_commit_retries as usize).saturating_add(1);
+        let mut last_error: Option<ConnectorError> = None;
 
-        Ok(WriteResult::new(total_rows, estimated_bytes))
+        for attempt in 0..max_attempts {
+            // delta-rs write/merge APIs consume DeltaTable by value.
+            // If self.table is None (from a previous failed attempt), re-open it.
+            if self.table.is_none() {
+                self.reopen_table().await?;
+            }
+
+            let table = self
+                .table
+                .take()
+                .ok_or_else(|| ConnectorError::InvalidState {
+                    expected: "table initialized".into(),
+                    actual: "table not initialized".into(),
+                })?;
+
+            match self.attempt_delta_write(table).await {
+                Ok(table) => {
+                    // ── Success: commit state ──
+                    #[allow(clippy::cast_sign_loss)]
+                    {
+                        self.delta_version = table.version().unwrap_or(0) as u64;
+                    }
+                    self.table = Some(table);
+                    self.pending_files = 0;
+
+                    // Clear staged state only after confirmed success.
+                    self.staged_batches.clear();
+                    self.staged_rows = 0;
+                    self.staged_bytes = 0;
+
+                    self.metrics
+                        .record_flush(total_rows as u64, estimated_bytes);
+                    self.metrics.record_commit(self.delta_version);
+
+                    debug!(
+                        rows = total_rows,
+                        bytes = estimated_bytes,
+                        delta_version = self.delta_version,
+                        attempt = attempt + 1,
+                        "Delta Lake: committed staged data to Delta"
+                    );
+
+                    return Ok(WriteResult::new(total_rows, estimated_bytes));
+                }
+                Err(e) => {
+                    if Self::is_conflict_error(&e) && attempt + 1 < max_attempts {
+                        let delay_ms = backoff_ms.get(attempt).copied().unwrap_or(2000);
+                        warn!(
+                            attempt = attempt + 1,
+                            max_attempts,
+                            delay_ms,
+                            error = %e,
+                            "Delta Lake: conflict error, retrying after backoff"
+                        );
+                        tokio::time::sleep(std::time::Duration::from_millis(delay_ms)).await;
+                        last_error = Some(e);
+                        // self.table is already None; loop will re-open.
+                        continue;
+                    }
+                    // Non-conflict error or exhausted retries — propagate.
+                    return Err(e);
+                }
+            }
+        }
+
+        // Should not reach here, but if it does, return the last error.
+        Err(last_error.unwrap_or_else(|| {
+            ConnectorError::Internal("flush_staged_to_delta: no attempts made".into())
+        }))
     }
 
     /// Commits pending files as a Delta Lake transaction (updates metrics).
@@ -652,6 +726,10 @@ impl SinkConnector for DeltaLakeSink {
                 &self.config.storage_options,
             )
             .await?;
+
+            // Persist resolved values for reopen_table() on conflict retry.
+            self.resolved_table_path.clone_from(&resolved_path);
+            self.resolved_storage_options.clone_from(&merged_options);
 
             let table = delta_io::open_or_create_table(
                 &resolved_path,

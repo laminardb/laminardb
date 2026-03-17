@@ -80,6 +80,11 @@ pub struct DeltaLakeSinkConfig {
     /// When set and the `uc://` table doesn't exist, the sink creates it
     /// via the Unity Catalog REST API at this storage location.
     pub catalog_storage_location: Option<String>,
+
+    /// Maximum number of retries on optimistic concurrency conflicts
+    /// (default: 3). After exhausting retries, the conflict error is
+    /// propagated as fatal. Uses exponential backoff (100ms, 500ms, 2s).
+    pub max_commit_retries: u32,
 }
 
 impl Default for DeltaLakeSinkConfig {
@@ -104,6 +109,7 @@ impl Default for DeltaLakeSinkConfig {
             catalog_name: None,
             catalog_schema: None,
             catalog_storage_location: None,
+            max_commit_retries: 3,
         }
     }
 }
@@ -251,6 +257,11 @@ impl DeltaLakeSinkConfig {
         }
         if let Some(v) = config.get("catalog.storage.location") {
             cfg.catalog_storage_location = Some(v.to_string());
+        }
+        if let Some(v) = config.get("max.commit.retries") {
+            cfg.max_commit_retries = v.parse().map_err(|_| {
+                ConnectorError::ConfigurationError(format!("invalid max.commit.retries: '{v}'"))
+            })?;
         }
 
         // Resolve storage credentials: explicit options + environment variable fallbacks.
@@ -665,6 +676,24 @@ mod tests {
         assert_eq!(cfg.write_mode, DeltaWriteMode::Append);
         assert_eq!(cfg.delivery_guarantee, DeliveryGuarantee::AtLeastOnce);
         assert!(!cfg.writer_id.is_empty());
+        assert_eq!(cfg.max_commit_retries, 3);
+    }
+
+    #[test]
+    fn test_max_commit_retries_from_config() {
+        let mut pairs = required_pairs();
+        pairs.push(("max.commit.retries", "5"));
+        let config = make_config(&pairs);
+        let cfg = DeltaLakeSinkConfig::from_config(&config).unwrap();
+        assert_eq!(cfg.max_commit_retries, 5);
+    }
+
+    #[test]
+    fn test_max_commit_retries_invalid() {
+        let mut pairs = required_pairs();
+        pairs.push(("max.commit.retries", "abc"));
+        let config = make_config(&pairs);
+        assert!(DeltaLakeSinkConfig::from_config(&config).is_err());
     }
 
     #[test]

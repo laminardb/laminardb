@@ -79,6 +79,36 @@ pub enum ConnectorError {
     Io(#[from] std::io::Error),
 }
 
+impl ConnectorError {
+    /// Returns `true` if this error is likely transient and the operation
+    /// may succeed on retry (e.g., network timeout, throttled request).
+    ///
+    /// Returns `false` for configuration, authentication, schema, and
+    /// state errors that will not resolve without user intervention.
+    #[must_use]
+    pub fn is_transient(&self) -> bool {
+        match self {
+            Self::ReadError(_)
+            | Self::WriteError(_)
+            | Self::Timeout(_)
+            | Self::Io(_)
+            | Self::ConnectionFailed(_) => true,
+
+            Self::AuthenticationFailed(_)
+            | Self::ConfigurationError(_)
+            | Self::MissingConfig(_)
+            | Self::SchemaMismatch(_)
+            | Self::InvalidState { .. }
+            | Self::CheckpointError(_)
+            | Self::TransactionError(_)
+            | Self::Serde(_)
+            | Self::Closed
+            | Self::UnsupportedOperation(_)
+            | Self::Internal(_) => false,
+        }
+    }
+}
+
 /// Errors that occur during record serialization or deserialization.
 #[derive(Debug, Error)]
 pub enum SerdeError {
