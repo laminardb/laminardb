@@ -285,11 +285,16 @@ async fn send_with_backpressure(
         WsBackpressure::DropOldest
         | WsBackpressure::Buffer { .. }
         | WsBackpressure::Sample { .. } => {
-            // These strategies are not yet differentiated from DropNewest.
-            // DropOldest would need drain-and-re-send, Buffer a secondary
-            // queue, and Sample a counter-based skip. All degrade to
-            // DropNewest (try_send, drop on full) for now.
-            tracing::debug!("backpressure strategy not fully implemented, using DropNewest");
+            // TODO F006-DEFER: DropOldest requires a ring-buffer channel or
+            // drain-and-re-send pattern. Buffer needs a secondary byte-bounded
+            // queue. Sample needs a counter-based skip. All degrade to
+            // DropNewest (try_send, drop on full) until properly implemented.
+            tracing::warn!(
+                strategy = ?strategy,
+                "backpressure strategy {strategy:?} not fully implemented \
+                 — falling back to DropNewest; configure 'on_backpressure = drop_newest' \
+                 to suppress this warning"
+            );
             match tx.try_send(msg) {
                 Ok(()) | Err(tokio::sync::mpsc::error::TrySendError::Full(_)) => Ok(()),
                 Err(tokio::sync::mpsc::error::TrySendError::Closed(_)) => Err(()),
