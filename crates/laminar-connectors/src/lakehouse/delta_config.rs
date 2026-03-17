@@ -1011,6 +1011,7 @@ mod tests {
         assert!(err.contains("catalog.database"), "error: {err}");
     }
 
+    #[cfg(feature = "delta-lake-unity")]
     #[test]
     fn test_catalog_unity_valid() {
         let mut pairs = required_pairs();
@@ -1036,6 +1037,7 @@ mod tests {
         assert_eq!(cfg.catalog_schema.as_deref(), Some("default"));
     }
 
+    #[cfg(feature = "delta-lake-unity")]
     #[test]
     fn test_catalog_unity_missing_workspace_url() {
         let mut pairs = required_pairs();
@@ -1052,6 +1054,7 @@ mod tests {
         assert!(err.contains("workspace_url"), "error: {err}");
     }
 
+    #[cfg(feature = "delta-lake-unity")]
     #[test]
     fn test_catalog_unity_missing_access_token() {
         let mut pairs = required_pairs();
