@@ -78,21 +78,24 @@ impl AuthProvider for MtlsAuthProvider {
             AuthError::AuthenticationFailed(format!("failed to parse client certificate: {e}"))
         })?;
 
-        // Extract CN from subject
-        let cn = cert
-            .subject()
-            .iter_common_name()
-            .next()
-            .and_then(|cn| cn.as_str().ok())
-            .ok_or_else(|| {
-                AuthError::AuthenticationFailed(
-                    "client certificate has no Common Name (CN)".to_string(),
-                )
-            })?;
+        let principal = select_principal(
+            san_principal(&cert),
+            cert.subject().iter_common_name().find_map(|cn| {
+                cn.as_str()
+                    .ok()
+                    .filter(|cn| !cn.is_empty())
+                    .map(str::to_string)
+            }),
+        )
+        .ok_or_else(|| {
+            AuthError::AuthenticationFailed(
+                "client certificate has no usable SAN or Common Name (CN)".to_string(),
+            )
+        })?;
 
-        debug!(cn = %cn, "mTLS: extracted identity from client certificate");
+        debug!(principal = %principal, "mTLS: extracted identity from client certificate");
 
-        let mut identity = Identity::new(cn, AuthMethod::MtlsCertificate);
+        let mut identity = Identity::new(principal, AuthMethod::MtlsCertificate);
 
         // Add default roles
         for role in &self.default_roles {
@@ -242,6 +245,42 @@ fn hex_encode(bytes: &[u8]) -> String {
     bytes.iter().map(|b| format!("{b:02x}")).collect()
 }
 
+fn select_principal(san: Option<String>, common_name: Option<String>) -> Option<String> {
+    san.or(common_name)
+}
+
+fn san_principal(cert: &x509_parser::certificate::X509Certificate<'_>) -> Option<String> {
+    let sans = cert.subject_alternative_name().ok().flatten()?;
+    for san in &sans.value.general_names {
+        match san {
+            x509_parser::extensions::GeneralName::RFC822Name(email) if !email.is_empty() => {
+                return Some(email.to_string());
+            }
+            x509_parser::extensions::GeneralName::URI(uri) if !uri.is_empty() => {
+                return Some(uri.to_string());
+            }
+            x509_parser::extensions::GeneralName::DNSName(dns) if !dns.is_empty() => {
+                return Some(dns.to_string());
+            }
+            x509_parser::extensions::GeneralName::IPAddress(bytes) => match bytes {
+                [a, b, c, d] => {
+                    return Some(std::net::Ipv4Addr::new(*a, *b, *c, *d).to_string());
+                }
+                octets if octets.len() == 16 => {
+                    let mut segments = [0u16; 8];
+                    for (segment, chunk) in segments.iter_mut().zip(octets.chunks_exact(2)) {
+                        *segment = u16::from_be_bytes([chunk[0], chunk[1]]);
+                    }
+                    return Some(std::net::Ipv6Addr::from(segments).to_string());
+                }
+                _ => {}
+            },
+            _ => {}
+        }
+    }
+    None
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -295,5 +334,24 @@ mod tests {
     #[test]
     fn test_hex_encode() {
         assert_eq!(hex_encode(&[0x00, 0xFF, 0x42]), "00ff42");
+    }
+
+    #[test]
+    fn test_select_principal_prefers_san_over_common_name() {
+        assert_eq!(
+            select_principal(
+                Some("spiffe://client".to_string()),
+                Some("legacy-cn".to_string())
+            ),
+            Some("spiffe://client".to_string())
+        );
+    }
+
+    #[test]
+    fn test_select_principal_falls_back_to_common_name() {
+        assert_eq!(
+            select_principal(None, Some("legacy-cn".to_string())),
+            Some("legacy-cn".to_string())
+        );
     }
 }

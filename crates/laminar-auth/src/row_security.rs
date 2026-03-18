@@ -88,9 +88,10 @@ impl RowSecurityPolicy {
                         identity.name, pred.user_attribute
                     ))
                 })?;
+            let column_name = validate_identifier(&pred.column_name)?;
             // Use parameterized-style quoting (single quotes, escape internal quotes)
             let escaped = value.replace('\'', "''");
-            clauses.push(format!("{} = '{}'", pred.column_name, escaped));
+            clauses.push(format!("{column_name} = '{escaped}'"));
         }
 
         if clauses.is_empty() {
@@ -99,6 +100,26 @@ impl RowSecurityPolicy {
             Ok(Some(clauses.join(" AND ")))
         }
     }
+}
+
+fn validate_identifier(identifier: &str) -> Result<&str, AuthError> {
+    let mut chars = identifier.chars();
+    match chars.next() {
+        Some(ch) if ch == '_' || ch.is_ascii_alphabetic() => {}
+        _ => {
+            return Err(AuthError::AccessDenied(format!(
+                "row-level security: invalid SQL identifier '{identifier}'"
+            )));
+        }
+    }
+
+    if !chars.all(|ch| ch == '_' || ch.is_ascii_alphanumeric()) {
+        return Err(AuthError::AccessDenied(format!(
+            "row-level security: invalid SQL identifier '{identifier}'"
+        )));
+    }
+
+    Ok(identifier)
 }
 
 /// Registry of row-level security policies, keyed by table name.
@@ -222,5 +243,15 @@ mod tests {
             .get_where_clause("other_table", &user)
             .unwrap()
             .is_none());
+    }
+
+    #[test]
+    fn test_invalid_column_identifier_is_rejected() {
+        let mut policy = RowSecurityPolicy::new("orders");
+        policy.add_predicate("tenant_id", "tenant_id OR 1=1");
+
+        let user = tenant_user("acme");
+        let err = policy.generate_where_clause(&user).unwrap_err();
+        assert!(err.to_string().contains("invalid SQL identifier"));
     }
 }

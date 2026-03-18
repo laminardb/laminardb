@@ -89,7 +89,9 @@ impl ColumnSecurityPolicy {
         }
 
         let mut masks: HashMap<String, &ColumnMask> = HashMap::new();
-        for role in &identity.roles {
+        let mut roles: Vec<&str> = identity.roles.iter().map(String::as_str).collect();
+        roles.sort_unstable();
+        for role in roles {
             if let Some(role_masks) = self.role_masks.get(role) {
                 for mask in role_masks {
                     // First mask wins for a given column
@@ -287,5 +289,40 @@ mod tests {
         assert!(registry
             .masked_projection("other", &analyst(), "email")
             .is_none());
+    }
+
+    #[test]
+    fn test_effective_masks_use_deterministic_role_order() {
+        let mut policy = ColumnSecurityPolicy::new("users");
+        policy.add_mask(
+            "alpha",
+            ColumnMask {
+                column_name: "ssn".to_string(),
+                strategy: MaskingStrategy::Redact("ALPHA".to_string()),
+            },
+        );
+        policy.add_mask(
+            "beta",
+            ColumnMask {
+                column_name: "ssn".to_string(),
+                strategy: MaskingStrategy::Redact("BETA".to_string()),
+            },
+        );
+
+        let first = Identity::new("alice", AuthMethod::Ldap)
+            .with_role("alpha")
+            .with_role("beta");
+        let second = Identity::new("alice", AuthMethod::Ldap)
+            .with_role("beta")
+            .with_role("alpha");
+
+        assert_eq!(
+            policy.masked_projection(&first, "ssn"),
+            Some("'ALPHA' AS ssn".to_string())
+        );
+        assert_eq!(
+            policy.masked_projection(&second, "ssn"),
+            Some("'ALPHA' AS ssn".to_string())
+        );
     }
 }

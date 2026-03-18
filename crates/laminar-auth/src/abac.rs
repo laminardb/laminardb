@@ -187,25 +187,20 @@ fn evaluate_condition(
         Operator::Eq => lhs == rhs,
         Operator::NotEq => lhs != rhs,
         Operator::Contains => lhs.contains(&rhs),
-        // Numeric comparisons: try parsing, fall back to string comparison
-        Operator::Lt => compare_numeric_or_string(&lhs, &rhs, |a, b| a < b, |a, b| a < b),
-        Operator::Gt => compare_numeric_or_string(&lhs, &rhs, |a, b| a > b, |a, b| a > b),
-        Operator::LtEq => compare_numeric_or_string(&lhs, &rhs, |a, b| a <= b, |a, b| a <= b),
-        Operator::GtEq => compare_numeric_or_string(&lhs, &rhs, |a, b| a >= b, |a, b| a >= b),
+        // Numeric comparisons fail closed unless both sides parse as numbers.
+        Operator::Lt => compare_numeric(&lhs, &rhs, |a, b| a < b),
+        Operator::Gt => compare_numeric(&lhs, &rhs, |a, b| a > b),
+        Operator::LtEq => compare_numeric(&lhs, &rhs, |a, b| a <= b),
+        Operator::GtEq => compare_numeric(&lhs, &rhs, |a, b| a >= b),
     }
 }
 
-/// Compare two values numerically if possible, otherwise as strings.
-fn compare_numeric_or_string(
-    lhs: &str,
-    rhs: &str,
-    num_cmp: fn(f64, f64) -> bool,
-    str_cmp: fn(&str, &str) -> bool,
-) -> bool {
+/// Compare two values numerically, failing closed if either side is non-numeric.
+fn compare_numeric(lhs: &str, rhs: &str, num_cmp: fn(f64, f64) -> bool) -> bool {
     if let (Ok(l), Ok(r)) = (lhs.parse::<f64>(), rhs.parse::<f64>()) {
         num_cmp(l, r)
     } else {
-        str_cmp(lhs, rhs)
+        false
     }
 }
 
@@ -342,5 +337,18 @@ mod tests {
         let attrs = HashMap::new();
         // Engineering matches first rule → allowed
         assert!(policy.evaluate(&eng, "SELECT", None, &attrs).is_ok());
+    }
+
+    #[test]
+    fn test_numeric_comparisons_fail_closed_for_non_numeric_values() {
+        let identity = engineer_identity();
+        let attrs = HashMap::new();
+        let condition = Condition {
+            lhs: AttributeSource::Literal("2foo".to_string()),
+            op: Operator::Gt,
+            rhs: AttributeSource::Literal("10".to_string()),
+        };
+
+        assert!(!evaluate_condition(&condition, &identity, &attrs));
     }
 }

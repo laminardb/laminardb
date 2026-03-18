@@ -17,7 +17,7 @@
 
 use std::collections::HashMap;
 
-use ldap3::{LdapConnAsync, Scope, SearchEntry};
+use ldap3::{LdapConnAsync, LdapConnSettings, Scope, SearchEntry};
 use tracing::{debug, warn};
 
 use crate::identity::{AuthError, AuthMethod, AuthProvider, Credentials, Identity};
@@ -92,8 +92,16 @@ impl AuthProvider for LdapAuthProvider {
         };
 
         // 1. Connect with service account
-        let (conn, mut ldap) = LdapConnAsync::new(&self.config.url)
+        let connect_result = if self.config.starttls {
+            LdapConnAsync::with_settings(
+                LdapConnSettings::new().set_starttls(true),
+                &self.config.url,
+            )
             .await
+        } else {
+            LdapConnAsync::new(&self.config.url).await
+        };
+        let (conn, mut ldap) = connect_result
             .map_err(|e| AuthError::ProviderUnavailable(format!("LDAP connect failed: {e}")))?;
 
         // Drive the connection in the background
@@ -111,7 +119,7 @@ impl AuthProvider for LdapAuthProvider {
         debug!(username = %username, "LDAP: searching for user");
 
         // 3. Search for the user DN
-        let filter = self.config.user_filter.replace("{username}", username);
+        let filter = build_user_filter(&self.config.user_filter, username);
         let (results, _) = ldap
             .search(
                 &self.config.search_base,
@@ -124,14 +132,23 @@ impl AuthProvider for LdapAuthProvider {
             .success()
             .map_err(|e| AuthError::ProviderUnavailable(format!("LDAP search error: {e}")))?;
 
-        if results.is_empty() {
-            return Err(AuthError::AuthenticationFailed(format!(
-                "user '{}' not found in LDAP",
-                username
-            )));
-        }
-
-        let entry = SearchEntry::construct(results.into_iter().next().unwrap());
+        let entry = match results.len() {
+            0 => {
+                let _ = ldap.unbind().await;
+                return Err(AuthError::AuthenticationFailed(format!(
+                    "user '{}' not found in LDAP",
+                    username
+                )));
+            }
+            1 => SearchEntry::construct(results.into_iter().next().unwrap()),
+            _ => {
+                let _ = ldap.unbind().await;
+                return Err(AuthError::AuthenticationFailed(format!(
+                    "multiple LDAP entries matched user '{}'",
+                    username
+                )));
+            }
+        };
         let user_dn = entry.dn;
 
         // 4. Bind as the user to verify password
@@ -191,6 +208,25 @@ fn extract_cn(dn: &str) -> Option<String> {
     None
 }
 
+fn build_user_filter(template: &str, username: &str) -> String {
+    template.replace("{username}", &escape_filter_value(username))
+}
+
+fn escape_filter_value(value: &str) -> String {
+    let mut escaped = String::with_capacity(value.len());
+    for ch in value.chars() {
+        match ch {
+            '*' => escaped.push_str("\\2a"),
+            '(' => escaped.push_str("\\28"),
+            ')' => escaped.push_str("\\29"),
+            '\\' => escaped.push_str("\\5c"),
+            '\0' => escaped.push_str("\\00"),
+            _ => escaped.push(ch),
+        }
+    }
+    escaped
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -234,5 +270,11 @@ mod tests {
             .unwrap_err()
             .to_string()
             .contains("username/password"));
+    }
+
+    #[test]
+    fn test_build_user_filter_escapes_special_characters() {
+        let filter = build_user_filter("(uid={username})", r"alice*)(uid=*)");
+        assert_eq!(filter, r"(uid=alice\2a\29\28uid=\2a\29)");
     }
 }

@@ -6,7 +6,9 @@
 //! - [`EnvKeyManager`]: reads key material from environment variables
 
 use std::collections::HashMap;
+use std::io::ErrorKind;
 use std::path::{Path, PathBuf};
+use std::sync::RwLock;
 
 use crate::identity::AuthError;
 
@@ -43,13 +45,19 @@ pub trait KeyManager: Send + Sync {
 
     /// List all available key IDs.
     async fn list_key_ids(&self) -> Result<Vec<String>, AuthError>;
+
+    /// Insert or update a key.
+    async fn insert(&self, _key: Key) -> Result<(), AuthError> {
+        Err(AuthError::Configuration(
+            "key manager backend is read-only".to_string(),
+        ))
+    }
 }
 
 /// Reads key material from files in a configured directory.
 ///
 /// Each file is named `{key_id}.key` and contains raw key bytes
-/// (binary) or base64-encoded key material (if the file ends with
-/// a newline, it is trimmed and decoded as base64).
+/// (binary) or `base64:<encoded>` text.
 ///
 /// The algorithm is read from a companion `{key_id}.algorithm` file
 /// if it exists, otherwise defaults to `"AES-256-GCM"`.
@@ -66,29 +74,40 @@ impl FileKeyManager {
         }
     }
 
-    fn key_path(&self, key_id: &str) -> PathBuf {
-        self.directory.join(format!("{key_id}.key"))
+    fn key_path(&self, key_id: &str) -> Result<PathBuf, AuthError> {
+        let key_id = validate_key_id(key_id)?;
+        Ok(self.directory.join(format!("{key_id}.key")))
     }
 
-    fn algorithm_path(&self, key_id: &str) -> PathBuf {
-        self.directory.join(format!("{key_id}.algorithm"))
+    fn algorithm_path(&self, key_id: &str) -> Result<PathBuf, AuthError> {
+        let key_id = validate_key_id(key_id)?;
+        Ok(self.directory.join(format!("{key_id}.algorithm")))
     }
 }
 
 #[async_trait::async_trait]
 impl KeyManager for FileKeyManager {
     async fn get_key(&self, key_id: &str) -> Result<Key, AuthError> {
-        let path = self.key_path(key_id);
+        let path = self.key_path(key_id)?;
         let raw = tokio::fs::read(&path).await.map_err(|e| {
             AuthError::Configuration(format!("failed to read key '{}': {}", path.display(), e))
         })?;
 
-        // Try base64 decode; fall back to raw bytes
-        let material = decode_key_material(&raw);
+        let material = decode_key_material(&raw).map_err(|e| {
+            AuthError::Configuration(format!("failed to decode key '{}': {e}", path.display()))
+        })?;
 
-        let algorithm = match tokio::fs::read_to_string(self.algorithm_path(key_id)).await {
+        let algorithm_path = self.algorithm_path(key_id)?;
+        let algorithm = match tokio::fs::read_to_string(&algorithm_path).await {
             Ok(alg) => alg.trim().to_string(),
-            Err(_) => "AES-256-GCM".to_string(),
+            Err(err) if err.kind() == ErrorKind::NotFound => "AES-256-GCM".to_string(),
+            Err(err) => {
+                return Err(AuthError::Configuration(format!(
+                    "failed to read key algorithm '{}': {}",
+                    algorithm_path.display(),
+                    err
+                )));
+            }
         };
 
         Ok(Key {
@@ -115,7 +134,9 @@ impl KeyManager for FileKeyManager {
         {
             let name = entry.file_name().to_string_lossy().to_string();
             if let Some(id) = name.strip_suffix(".key") {
-                ids.push(id.to_string());
+                if validate_key_id(id).is_ok() {
+                    ids.push(id.to_string());
+                }
             }
         }
 
@@ -164,6 +185,7 @@ impl EnvKeyManager {
 #[async_trait::async_trait]
 impl KeyManager for EnvKeyManager {
     async fn get_key(&self, key_id: &str) -> Result<Key, AuthError> {
+        validate_key_id(key_id)?;
         let var_name = self.env_var_name(key_id);
         let encoded = std::env::var(&var_name).map_err(|_| {
             AuthError::Configuration(format!(
@@ -186,14 +208,20 @@ impl KeyManager for EnvKeyManager {
     }
 
     async fn list_key_ids(&self) -> Result<Vec<String>, AuthError> {
-        Ok(self.known_ids.clone())
+        self.known_ids
+            .iter()
+            .map(|id| {
+                validate_key_id(id)?;
+                Ok(id.clone())
+            })
+            .collect()
     }
 }
 
 /// In-memory key manager for testing.
 #[derive(Debug, Default)]
 pub struct InMemoryKeyManager {
-    keys: HashMap<String, Key>,
+    keys: RwLock<HashMap<String, Key>>,
 }
 
 impl InMemoryKeyManager {
@@ -202,44 +230,57 @@ impl InMemoryKeyManager {
         Self::default()
     }
 
-    /// Insert a key.
-    pub fn insert(&mut self, key: Key) {
-        self.keys.insert(key.id.clone(), key);
+    fn insert_key(&self, key: Key) -> Result<(), AuthError> {
+        validate_key_id(&key.id)?;
+        self.keys
+            .write()
+            .expect("in-memory key manager poisoned")
+            .insert(key.id.clone(), key);
+        Ok(())
     }
 }
 
 #[async_trait::async_trait]
 impl KeyManager for InMemoryKeyManager {
     async fn get_key(&self, key_id: &str) -> Result<Key, AuthError> {
-        self.keys.get(key_id).cloned().ok_or_else(|| {
-            AuthError::Configuration(format!("key '{key_id}' not found in memory store"))
-        })
+        validate_key_id(key_id)?;
+        self.keys
+            .read()
+            .expect("in-memory key manager poisoned")
+            .get(key_id)
+            .cloned()
+            .ok_or_else(|| {
+                AuthError::Configuration(format!("key '{key_id}' not found in memory store"))
+            })
     }
 
     async fn list_key_ids(&self) -> Result<Vec<String>, AuthError> {
-        let mut ids: Vec<String> = self.keys.keys().cloned().collect();
+        let mut ids: Vec<String> = self
+            .keys
+            .read()
+            .expect("in-memory key manager poisoned")
+            .keys()
+            .cloned()
+            .collect();
         ids.sort();
         Ok(ids)
     }
+
+    async fn insert(&self, key: Key) -> Result<(), AuthError> {
+        self.insert_key(key)
+    }
 }
 
-/// Attempt base64 decode; if that fails, return raw bytes.
-fn decode_key_material(raw: &[u8]) -> Vec<u8> {
-    // Trim trailing newlines (common in files)
-    let trimmed = if raw.last() == Some(&b'\n') {
-        &raw[..raw.len() - 1]
-    } else {
-        raw
-    };
-
-    // Try UTF-8 + base64
-    if let Ok(text) = std::str::from_utf8(trimmed) {
-        if let Ok(decoded) = base64_decode(text) {
-            return decoded;
+/// Decode key material from `base64:<encoded>` text or return raw bytes unchanged.
+fn decode_key_material(raw: &[u8]) -> Result<Vec<u8>, String> {
+    if let Ok(text) = std::str::from_utf8(raw) {
+        if let Some(encoded) = text.trim().strip_prefix("base64:") {
+            return base64_decode(encoded)
+                .map_err(|e| format!("invalid base64-encoded key material: {e}"));
         }
     }
 
-    raw.to_vec()
+    Ok(raw.to_vec())
 }
 
 /// Decode base64 using the standard alphabet.
@@ -273,9 +314,52 @@ pub fn build_key_manager(
     }
 }
 
+fn validate_key_id(key_id: &str) -> Result<&str, AuthError> {
+    if key_id.is_empty()
+        || !key_id
+            .chars()
+            .all(|ch| ch.is_ascii_alphanumeric() || ch == '-' || ch == '_')
+    {
+        return Err(AuthError::Configuration(format!(
+            "invalid key id '{key_id}': only ASCII letters, digits, '-' and '_' are allowed"
+        )));
+    }
+
+    Ok(key_id)
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
+    use std::sync::{LazyLock, Mutex};
+
+    static ENV_LOCK: LazyLock<Mutex<()>> = LazyLock::new(|| Mutex::new(()));
+
+    struct EnvVarGuard {
+        _lock: std::sync::MutexGuard<'static, ()>,
+        vars: Vec<String>,
+    }
+
+    impl EnvVarGuard {
+        fn new(vars: &[(&str, &str)]) -> Self {
+            let lock = ENV_LOCK.lock().expect("env lock poisoned");
+            for (name, value) in vars {
+                unsafe { std::env::set_var(name, value) };
+            }
+            Self {
+                _lock: lock,
+                vars: vars.iter().map(|(name, _)| (*name).to_string()).collect(),
+            }
+        }
+    }
+
+    impl Drop for EnvVarGuard {
+        fn drop(&mut self) {
+            for name in &self.vars {
+                unsafe { std::env::remove_var(name) };
+            }
+        }
+    }
 
     #[tokio::test]
     async fn test_file_key_manager() {
@@ -287,7 +371,7 @@ mod tests {
             use base64::Engine;
             base64::engine::general_purpose::STANDARD.encode(key_bytes)
         };
-        std::fs::write(dir.path().join("primary.key"), &encoded).unwrap();
+        std::fs::write(dir.path().join("primary.key"), format!("base64:{encoded}")).unwrap();
         std::fs::write(dir.path().join("primary.algorithm"), "AES-256-GCM").unwrap();
 
         let mgr = FileKeyManager::new(dir.path());
@@ -331,11 +415,10 @@ mod tests {
             base64::engine::general_purpose::STANDARD.encode(key_bytes)
         };
 
-        // SAFETY: test isolation — unique prefix avoids collisions.
-        unsafe {
-            std::env::set_var(format!("{prefix}PRIMARY"), &encoded);
-            std::env::set_var(format!("{prefix}PRIMARY_ALGORITHM"), "ChaCha20Poly1305");
-        }
+        let _guard = EnvVarGuard::new(&[
+            (&format!("{prefix}PRIMARY"), encoded.as_str()),
+            (&format!("{prefix}PRIMARY_ALGORITHM"), "ChaCha20Poly1305"),
+        ]);
 
         let mgr = EnvKeyManager::new(prefix, &["primary"]);
         let key = mgr.get_key("primary").await.unwrap();
@@ -344,11 +427,6 @@ mod tests {
 
         let ids = mgr.list_key_ids().await.unwrap();
         assert_eq!(ids, vec!["primary"]);
-
-        unsafe {
-            std::env::remove_var(format!("{prefix}PRIMARY"));
-            std::env::remove_var(format!("{prefix}PRIMARY_ALGORITHM"));
-        }
     }
 
     #[tokio::test]
@@ -359,12 +437,14 @@ mod tests {
 
     #[tokio::test]
     async fn test_in_memory_key_manager() {
-        let mut mgr = InMemoryKeyManager::new();
+        let mgr = InMemoryKeyManager::new();
         mgr.insert(Key {
             id: "test".to_string(),
             material: vec![1, 2, 3],
             algorithm: "AES-256-GCM".to_string(),
-        });
+        })
+        .await
+        .unwrap();
 
         let key = mgr.get_key("test").await.unwrap();
         assert_eq!(key.material, vec![1, 2, 3]);
@@ -386,7 +466,19 @@ mod tests {
         assert_eq!(ids, vec!["a"]);
 
         let mem_mgr = build_key_manager("memory", None, None, &[]).unwrap();
-        assert!(mem_mgr.list_key_ids().await.unwrap().is_empty());
+        mem_mgr
+            .insert(Key {
+                id: "memory".to_string(),
+                material: vec![9, 9, 9],
+                algorithm: "AES-256-GCM".to_string(),
+            })
+            .await
+            .unwrap();
+        assert_eq!(
+            mem_mgr.get_key("memory").await.unwrap().material,
+            vec![9, 9, 9]
+        );
+        assert_eq!(mem_mgr.list_key_ids().await.unwrap(), vec!["memory"]);
 
         assert!(build_key_manager("unknown", None, None, &[]).is_err());
     }
@@ -401,5 +493,36 @@ mod tests {
         let debug = format!("{key:?}");
         assert!(debug.contains("[REDACTED]"));
         assert!(!debug.contains("[1, 2, 3]"));
+    }
+
+    #[tokio::test]
+    async fn test_file_key_manager_rejects_path_traversal_key_id() {
+        let dir = tempfile::tempdir().unwrap();
+        let mgr = FileKeyManager::new(dir.path());
+        assert!(mgr.get_key("../outside").await.is_err());
+    }
+
+    #[tokio::test]
+    async fn test_file_key_manager_does_not_guess_base64_without_marker() {
+        let dir = tempfile::tempdir().unwrap();
+        let encoded = {
+            use base64::Engine;
+            base64::engine::general_purpose::STANDARD.encode(b"super-secret-key-material-32byt")
+        };
+        std::fs::write(dir.path().join("plain.key"), &encoded).unwrap();
+
+        let mgr = FileKeyManager::new(dir.path());
+        let key = mgr.get_key("plain").await.unwrap();
+        assert_eq!(key.material, encoded.into_bytes());
+    }
+
+    #[tokio::test]
+    async fn test_file_key_manager_propagates_algorithm_read_errors() {
+        let dir = tempfile::tempdir().unwrap();
+        std::fs::write(dir.path().join("primary.key"), b"raw-key-material").unwrap();
+        std::fs::create_dir(dir.path().join("primary.algorithm")).unwrap();
+
+        let mgr = FileKeyManager::new(dir.path());
+        assert!(mgr.get_key("primary").await.is_err());
     }
 }

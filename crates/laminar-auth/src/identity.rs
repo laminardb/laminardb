@@ -100,7 +100,7 @@ pub trait AuthProvider: Send + Sync {
 }
 
 /// Credential material presented by a client.
-#[derive(Debug, Clone)]
+#[derive(Clone)]
 pub enum Credentials {
     /// Raw DER-encoded client certificate bytes.
     Certificate(Vec<u8>),
@@ -118,6 +118,27 @@ pub enum Credentials {
 
     /// No credentials (anonymous access).
     Anonymous,
+}
+
+impl std::fmt::Debug for Credentials {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            Self::Certificate(der) => f
+                .debug_struct("Certificate")
+                .field("certificate_len", &der.len())
+                .finish(),
+            Self::UsernamePassword { username, .. } => f
+                .debug_struct("UsernamePassword")
+                .field("username", username)
+                .field("password", &"[REDACTED]")
+                .finish(),
+            Self::BearerToken(token) => f
+                .debug_tuple("BearerToken")
+                .field(&format!("[REDACTED {} bytes]", token.len()))
+                .finish(),
+            Self::Anonymous => f.debug_tuple("Anonymous").finish(),
+        }
+    }
 }
 
 /// Authentication and authorization errors.
@@ -178,5 +199,22 @@ mod tests {
         assert_eq!(AuthMethod::Ldap.to_string(), "ldap");
         assert_eq!(AuthMethod::Jwt.to_string(), "jwt");
         assert_eq!(AuthMethod::Anonymous.to_string(), "anonymous");
+    }
+
+    #[test]
+    fn test_credentials_debug_redacts_secrets() {
+        let creds = Credentials::UsernamePassword {
+            username: "alice".to_string(),
+            password: "super-secret".to_string(),
+        };
+        let debug = format!("{creds:?}");
+        assert!(debug.contains("alice"));
+        assert!(debug.contains("[REDACTED]"));
+        assert!(!debug.contains("super-secret"));
+
+        let token = Credentials::BearerToken("top-secret-token".to_string());
+        let debug = format!("{token:?}");
+        assert!(debug.contains("REDACTED"));
+        assert!(!debug.contains("top-secret-token"));
     }
 }
