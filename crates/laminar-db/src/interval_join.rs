@@ -16,6 +16,7 @@ use std::sync::Arc;
 
 use arrow::array::{
     Array, ArrayRef, Float64Array, Int64Array, RecordBatch, StringArray, TimestampMillisecondArray,
+    UInt32Array,
 };
 use arrow::compute::concat_batches;
 use arrow::datatypes::{DataType, Field, Schema, SchemaRef, TimeUnit};
@@ -232,15 +233,14 @@ impl SideState {
         // Sort by (batch_idx, row_idx) for sequential access
         live_rows.sort_unstable();
 
-        // Slice each live row and collect
-        let mut slices: Vec<RecordBatch> = Vec::with_capacity(live_rows.len());
-        for &(batch_idx, row_idx) in &live_rows {
-            slices.push(self.batches[batch_idx].slice(row_idx, 1));
-        }
-
+        // Group rows by batch and use `take` per batch instead of per-row slicing
         let schema = self.batches[0].schema();
-        let compacted = concat_batches(&schema, &slices)
-            .map_err(|e| DbError::query_pipeline_arrow("interval join (compact)", &e))?;
+        let compacted = take_rows_from_batches(
+            &self.batches,
+            &live_rows,
+            &schema,
+            "interval join (compact)",
+        )?;
 
         // Replace batches and rebuild index
         self.batches = vec![compacted];
@@ -432,6 +432,78 @@ fn probe_index(
     results
 }
 
+/// Gather rows from multiple batches using `arrow::compute::take` per batch,
+/// then concatenate. Replaces the per-row `slice(row, 1)` + `concat` pattern
+/// with O(B) take operations where B is the number of distinct source batches.
+///
+/// `rows` must be sorted by `(batch_idx, row_idx)` for compaction callers,
+/// but works correctly for any ordering — output row order matches `rows` order.
+fn take_rows_from_batches(
+    batches: &[RecordBatch],
+    rows: &[(usize, usize)],
+    schema: &SchemaRef,
+    context: &str,
+) -> Result<RecordBatch, DbError> {
+    if rows.is_empty() {
+        return Ok(RecordBatch::new_empty(schema.clone()));
+    }
+
+    // If all rows come from one batch, fast-path: single take
+    let first_batch = rows[0].0;
+    let single_batch = rows.iter().all(|&(b, _)| b == first_batch);
+
+    if single_batch {
+        #[allow(clippy::cast_possible_truncation)]
+        let indices = UInt32Array::from(rows.iter().map(|&(_, r)| r as u32).collect::<Vec<_>>());
+        let columns: Vec<ArrayRef> = (0..batches[first_batch].num_columns())
+            .map(|col_idx| {
+                arrow::compute::take(batches[first_batch].column(col_idx), &indices, None)
+                    .map_err(|e| DbError::query_pipeline_arrow(context, &e))
+            })
+            .collect::<Result<_, _>>()?;
+        return RecordBatch::try_new(schema.clone(), columns)
+            .map_err(|e| DbError::query_pipeline_arrow(context, &e));
+    }
+
+    // Multi-batch: group consecutive runs by batch_idx, take per group, concat.
+    // We preserve output ordering by processing rows in their original order.
+    let mut segments: Vec<RecordBatch> = Vec::new();
+    let mut seg_start = 0;
+
+    while seg_start < rows.len() {
+        let batch_idx = rows[seg_start].0;
+        let mut seg_end = seg_start + 1;
+        while seg_end < rows.len() && rows[seg_end].0 == batch_idx {
+            seg_end += 1;
+        }
+
+        #[allow(clippy::cast_possible_truncation)]
+        let indices = UInt32Array::from(
+            rows[seg_start..seg_end]
+                .iter()
+                .map(|&(_, r)| r as u32)
+                .collect::<Vec<_>>(),
+        );
+        let columns: Vec<ArrayRef> = (0..batches[batch_idx].num_columns())
+            .map(|col_idx| {
+                arrow::compute::take(batches[batch_idx].column(col_idx), &indices, None)
+                    .map_err(|e| DbError::query_pipeline_arrow(context, &e))
+            })
+            .collect::<Result<_, _>>()?;
+        let segment = RecordBatch::try_new(schema.clone(), columns)
+            .map_err(|e| DbError::query_pipeline_arrow(context, &e))?;
+        segments.push(segment);
+
+        seg_start = seg_end;
+    }
+
+    if segments.len() == 1 {
+        return Ok(segments.into_iter().next().unwrap());
+    }
+
+    concat_batches(schema, &segments).map_err(|e| DbError::query_pipeline_arrow(context, &e))
+}
+
 /// Execute one cycle of an interval join (INNER only).
 ///
 /// Bounds are inclusive: `|left_ts - right_ts| <= bound_ms`. NULL keys are
@@ -566,36 +638,34 @@ pub(crate) fn execute_interval_join_cycle(
             .first()
             .map_or_else(|| Arc::new(Schema::empty()), RecordBatch::schema);
 
-        let num_rows = match_pairs.len();
+        // Extract left and right (batch_idx, row_idx) pairs from match_pairs
+        let left_pairs: Vec<(usize, usize)> =
+            match_pairs.iter().map(|&(lb, lr, _, _)| (lb, lr)).collect();
+        let right_pairs: Vec<(usize, usize)> =
+            match_pairs.iter().map(|&(_, _, rb, rr)| (rb, rr)).collect();
+
+        // Build output columns using take-based gathering
         let mut columns: Vec<ArrayRef> =
             Vec::with_capacity(left_schema.fields().len() + right_schema.fields().len());
 
-        // Build left columns by taking from the correct batches
+        let left_gathered = take_rows_from_batches(
+            &state.left.batches,
+            &left_pairs,
+            &left_schema,
+            "interval join (left)",
+        )?;
         for col_idx in 0..left_schema.fields().len() {
-            let mut builder = Vec::with_capacity(num_rows);
-            for &(l_batch, l_row, _, _) in &match_pairs {
-                let array = state.left.batches[l_batch].column(col_idx);
-                let sliced = array.slice(l_row, 1);
-                builder.push(sliced);
-            }
-            let refs: Vec<&dyn Array> = builder.iter().map(AsRef::as_ref).collect();
-            let concatenated = arrow::compute::concat(&refs)
-                .map_err(|e| DbError::query_pipeline_arrow("interval join (left concat)", &e))?;
-            columns.push(concatenated);
+            columns.push(left_gathered.column(col_idx).clone());
         }
 
-        // Build right columns
+        let right_gathered = take_rows_from_batches(
+            &state.right.batches,
+            &right_pairs,
+            &right_schema,
+            "interval join (right)",
+        )?;
         for col_idx in 0..right_schema.fields().len() {
-            let mut builder = Vec::with_capacity(num_rows);
-            for &(_, _, r_batch, r_row) in &match_pairs {
-                let array = state.right.batches[r_batch].column(col_idx);
-                let sliced = array.slice(r_row, 1);
-                builder.push(sliced);
-            }
-            let refs: Vec<&dyn Array> = builder.iter().map(AsRef::as_ref).collect();
-            let concatenated = arrow::compute::concat(&refs)
-                .map_err(|e| DbError::query_pipeline_arrow("interval join (right concat)", &e))?;
-            columns.push(concatenated);
+            columns.push(right_gathered.column(col_idx).clone());
         }
 
         let batch = RecordBatch::try_new(output_schema.clone(), columns)
