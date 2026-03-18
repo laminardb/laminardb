@@ -92,6 +92,18 @@ fn is_simd_numeric(dt: &DataType) -> bool {
     )
 }
 
+/// Check whether the return type is supported by the SIMD aggregation path
+/// for a given aggregate kind. Prevents enabling SIMD when the actual
+/// simd_sum/simd_min/simd_max would reject the return type at runtime.
+fn is_simd_supported_return_type(kind: SimdAggKind, dt: &DataType) -> bool {
+    match kind {
+        SimdAggKind::Count => matches!(dt, DataType::Int64),
+        SimdAggKind::Sum | SimdAggKind::Min | SimdAggKind::Max => {
+            matches!(dt, DataType::Float64 | DataType::Int64 | DataType::UInt64)
+        }
+    }
+}
+
 /// Compute SUM over an Arrow array using SIMD-optimized kernels.
 ///
 /// Casts to Float64 or Int64 depending on the return type, then calls
@@ -1111,6 +1123,12 @@ impl IncrementalAggState {
                     eligible = false;
                     break;
                 }
+                // Verify the return type is supported by the SIMD path to avoid
+                // enabling SIMD and then failing at runtime in process_batch_simd.
+                if !is_simd_supported_return_type(kind, &spec.return_type) {
+                    eligible = false;
+                    break;
+                }
                 // COUNT(*) has Boolean input — always eligible (O(1) count).
                 // Other aggs need a numeric input column.
                 if kind != SimdAggKind::Count
@@ -1564,8 +1582,12 @@ impl IncrementalAggState {
         }
 
         // SIMD fast path: restore running scalars from the single-group
-        // checkpoint.
+        // checkpoint. Clear existing state first to prevent stale values
+        // when restoring from an empty or partial checkpoint.
         if let Some(ref mut accums) = self.simd_accums {
+            for accum in accums.iter_mut() {
+                accum.state = None;
+            }
             if let Some(gc) = checkpoint.groups.first() {
                 for (i, accum) in accums.iter_mut().enumerate() {
                     if i < gc.acc_states.len() {
@@ -3840,6 +3862,54 @@ mod tests {
             (total.value(0) - 100.0).abs() < f64::EPSILON,
             "Expected 100.0 (60 restored + 40 new), got {}",
             total.value(0)
+        );
+    }
+
+    #[tokio::test]
+    async fn test_simd_sum_int64() {
+        let mut state = setup_global_agg("SELECT SUM(value) as total FROM events").await;
+        // Override schema to use Int64 input
+        let pre_agg_schema = Arc::new(Schema::new(vec![Field::new(
+            "__agg_input_0",
+            DataType::Int64,
+            true,
+        )]));
+        let batch = RecordBatch::try_new(
+            Arc::clone(&pre_agg_schema),
+            vec![Arc::new(arrow::array::Int64Array::from(vec![10, 20, 30]))],
+        )
+        .unwrap();
+        state.process_batch(&batch).unwrap();
+
+        let result = state.emit().unwrap();
+        assert!(
+            !result.is_empty(),
+            "expected non-empty result for Int64 SUM"
+        );
+    }
+
+    #[tokio::test]
+    async fn test_simd_min_max_int64() {
+        let mut state =
+            setup_global_agg("SELECT MIN(value) as lo, MAX(value) as hi FROM events").await;
+        let pre_agg_schema = Arc::new(Schema::new(vec![
+            Field::new("__agg_input_0", DataType::Int64, true),
+            Field::new("__agg_input_1", DataType::Int64, true),
+        ]));
+        let batch = RecordBatch::try_new(
+            Arc::clone(&pre_agg_schema),
+            vec![
+                Arc::new(arrow::array::Int64Array::from(vec![5, 15, 25])),
+                Arc::new(arrow::array::Int64Array::from(vec![5, 15, 25])),
+            ],
+        )
+        .unwrap();
+        state.process_batch(&batch).unwrap();
+
+        let result = state.emit().unwrap();
+        assert!(
+            !result.is_empty(),
+            "expected non-empty result for Int64 MIN/MAX"
         );
     }
 }
