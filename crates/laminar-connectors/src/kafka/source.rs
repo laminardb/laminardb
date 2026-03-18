@@ -645,18 +645,13 @@ impl SourceConnector for KafkaSource {
             });
         }
 
-        // Check backpressure.
+        // Update backpressure state — never skip the drain below (deadlocks).
         if self.backpressure.should_pause() {
             self.backpressure.set_paused(true);
             debug!("backpressure: pausing consumption");
-            return Ok(None);
-        }
-        if self.backpressure.should_resume() {
+        } else if self.backpressure.should_resume() {
             self.backpressure.set_paused(false);
             debug!("backpressure: resuming consumption");
-        }
-        if self.backpressure.is_paused() {
-            return Ok(None);
         }
 
         // Lazily spawn the background reader task on first poll.
