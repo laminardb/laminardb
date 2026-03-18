@@ -995,11 +995,11 @@ impl IncrementalAggState {
                 let arr = sv
                     .to_array()
                     .map_err(|e| DbError::Pipeline(format!("scalar→array: {e}")))?;
-                if arr.data_type() != &self.group_types[i] {
+                if arr.data_type() == &self.group_types[i] {
+                    Ok(arr)
+                } else {
                     arrow::compute::cast(&arr, &self.group_types[i])
                         .map_err(|e| DbError::Pipeline(format!("key cast: {e}")))
-                } else {
-                    Ok(arr)
                 }
             })
             .collect::<Result<_, _>>()?;
