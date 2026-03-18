@@ -1,0 +1,42 @@
+[package]
+name = "laminar-auth"
+version.workspace = true
+authors.workspace = true
+edition.workspace = true
+license.workspace = true
+repository.workspace = true
+homepage.workspace = true
+documentation = "https://laminardb.io/api/laminar_auth"
+description = "Authentication, authorization, and audit logging for LaminarDB"
+
+[features]
+default = []
+auth = ["dep:jsonwebtoken", "dep:aes-gcm"]
+
+[dependencies]
+# JWT authentication
+jsonwebtoken = { version = "9", optional = true }
+
+# Encryption at rest
+aes-gcm = { version = "0.10", optional = true }
+
+# Serialization
+serde = { workspace = true }
+serde_json = { workspace = true }
+
+# Error handling
+thiserror = { workspace = true }
+
+# Async
+async-trait = { workspace = true }
+tokio = { workspace = true, features = ["sync"] }
+
+# Observability
+tracing = { workspace = true }
+
+# Time handling
+chrono = { workspace = true }
+
+[dev-dependencies]
+tokio = { workspace = true, features = ["test-util", "macros"] }
+tempfile = { workspace = true }
