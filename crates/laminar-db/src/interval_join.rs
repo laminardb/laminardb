@@ -432,25 +432,12 @@ fn probe_index(
     results
 }
 
-/// Execute one cycle of an interval join.
+/// Execute one cycle of an interval join (INNER only).
 ///
-/// Only INNER JOIN is supported — LEFT/RIGHT/FULL are rejected at detection
-/// time in `detect_stream_join_query`.
-///
-/// Interval bounds are inclusive on both ends: `|left_ts - right_ts| <= bound_ms`.
-///
-/// Single watermark limitation: the caller provides one watermark for both sides.
-///
-/// NULL keys are skipped per SQL three-valued logic (they never match).
-///
-/// State is compacted on eviction when batch count exceeds `COMPACTION_THRESHOLD`.
-///
-/// Steps:
-/// 1. For each new left row, probe `right.index` for matches within `time_bound`
-/// 2. For each new right row, probe `left.index` for matches (only against
-///    previously-buffered left rows to avoid double-emit with step 1)
-/// 3. Buffer new rows into both sides' state
-/// 4. Evict expired rows where `ts < watermark - time_bound`
+/// Bounds are inclusive: `|left_ts - right_ts| <= bound_ms`. NULL keys are
+/// skipped. New left rows probe all right; new right rows probe only old left
+/// (avoids double-emit). State is compacted on eviction when batch count
+/// exceeds `COMPACTION_THRESHOLD`.
 #[allow(clippy::too_many_lines)]
 pub(crate) fn execute_interval_join_cycle(
     state: &mut IntervalJoinState,

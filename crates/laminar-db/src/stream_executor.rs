@@ -572,6 +572,8 @@ impl StreamExecutor {
                 self.non_eowc_agg_queries.remove(&idx);
                 self.non_core_window_queries.remove(&idx);
                 self.fallback_logged.remove(&idx);
+                self.interval_join_states.remove(&idx);
+                self.last_temporal_row_count.remove(&idx);
                 self.topo_dirty = true;
                 // Invalidate the compiled-path cache so it's re-evaluated.
                 self.all_queries_compiled = None;
@@ -3245,6 +3247,7 @@ fn build_stream_join_projection_sql(
     )
 }
 
+/// Rewrite table-qualified column refs for the `__interval_tmp` schema.
 fn rewrite_stream_join_expr(
     expr: &sqlparser::ast::Expr,
     left_alias: Option<&str>,
@@ -3255,12 +3258,10 @@ fn rewrite_stream_join_expr(
         Expr::CompoundIdentifier(parts) if parts.len() == 2 => {
             let table = &parts[0].value;
             let col = &parts[1].value;
-            // If the table qualifier matches left or right, strip it
             let is_left = table == &config.left_table || left_alias.is_some_and(|a| a == table);
             let is_right = table == &config.right_table || right_alias.is_some_and(|a| a == table);
             if is_left || is_right {
                 if is_right {
-                    // All right-side columns are suffixed in output schema
                     format!("{col}_{}", config.right_table)
                 } else {
                     col.clone()
@@ -3268,6 +3269,70 @@ fn rewrite_stream_join_expr(
             } else {
                 expr.to_string()
             }
+        }
+        Expr::BinaryOp { left, op, right } => {
+            let l = rewrite_stream_join_expr(left, left_alias, right_alias, config);
+            let r = rewrite_stream_join_expr(right, left_alias, right_alias, config);
+            format!("{l} {op} {r}")
+        }
+        Expr::UnaryOp { op, expr: inner } => {
+            let r = rewrite_stream_join_expr(inner, left_alias, right_alias, config);
+            format!("{op} {r}")
+        }
+        Expr::Nested(inner) => {
+            let r = rewrite_stream_join_expr(inner, left_alias, right_alias, config);
+            format!("({r})")
+        }
+        Expr::Cast {
+            expr: inner,
+            data_type,
+            ..
+        } => {
+            let r = rewrite_stream_join_expr(inner, left_alias, right_alias, config);
+            format!("CAST({r} AS {data_type})")
+        }
+        Expr::IsNull(inner) => {
+            let r = rewrite_stream_join_expr(inner, left_alias, right_alias, config);
+            format!("{r} IS NULL")
+        }
+        Expr::IsNotNull(inner) => {
+            let r = rewrite_stream_join_expr(inner, left_alias, right_alias, config);
+            format!("{r} IS NOT NULL")
+        }
+        Expr::Between {
+            expr: inner,
+            negated,
+            low,
+            high,
+        } => {
+            let e = rewrite_stream_join_expr(inner, left_alias, right_alias, config);
+            let l = rewrite_stream_join_expr(low, left_alias, right_alias, config);
+            let h = rewrite_stream_join_expr(high, left_alias, right_alias, config);
+            if *negated {
+                format!("{e} NOT BETWEEN {l} AND {h}")
+            } else {
+                format!("{e} BETWEEN {l} AND {h}")
+            }
+        }
+        Expr::Function(func) => {
+            let name = &func.name;
+            let args_str = match &func.args {
+                sqlparser::ast::FunctionArguments::List(arg_list) => {
+                    let rewritten_args: Vec<String> = arg_list
+                        .args
+                        .iter()
+                        .map(|arg| match arg {
+                            sqlparser::ast::FunctionArg::Unnamed(
+                                sqlparser::ast::FunctionArgExpr::Expr(e),
+                            ) => rewrite_stream_join_expr(e, left_alias, right_alias, config),
+                            other => other.to_string(),
+                        })
+                        .collect();
+                    rewritten_args.join(", ")
+                }
+                other => other.to_string(),
+            };
+            format!("{name}({args_str})")
         }
         _ => expr.to_string(),
     }
