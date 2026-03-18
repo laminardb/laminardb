@@ -221,7 +221,7 @@ pub async fn run_server(
 
     // 5. Spawn config file watcher (disabled via LAMINAR_DISABLE_FILE_WATCH=1)
     let watcher_disabled =
-        std::env::var("LAMINAR_DISABLE_FILE_WATCH").map_or(false, |v| v == "1" || v == "true");
+        std::env::var("LAMINAR_DISABLE_FILE_WATCH").is_ok_and(|v| v == "1" || v == "true");
     let watcher_handle = if watcher_disabled {
         info!("Config file watcher disabled via LAMINAR_DISABLE_FILE_WATCH");
         None
