@@ -368,12 +368,7 @@ impl SourceConnector for DeltaSource {
             };
 
             let (batches, fully_consumed) = if use_snapshot_fallback {
-                delta_io::read_batches_at_version(
-                    table,
-                    target_version,
-                    max_records,
-                )
-                .await?
+                delta_io::read_batches_at_version(table, target_version, max_records).await?
             } else if self.config.cdf_enabled
                 && self.config.read_mode == DeltaReadMode::Incremental
                 && target_version > 0

@@ -440,7 +440,14 @@ pub async fn read_batches_at_version(
         }
     }
 
-    let fully_consumed = total_rows < max_records;
+    // If we stopped due to max_records, probe whether the stream has more.
+    // Without this, a version with exactly max_records rows would be
+    // misclassified as truncated and re-read forever.
+    let fully_consumed = if total_rows >= max_records {
+        stream.next().await.is_none()
+    } else {
+        true
+    };
 
     debug!(
         version,
@@ -599,7 +606,8 @@ pub async fn read_version_diff(
                     ))
                 })?;
 
-        let remaining = max_records.saturating_sub(total_rows);
+        // Read one extra row to probe whether the version is fully consumed.
+        let remaining = max_records.saturating_sub(total_rows).saturating_add(1);
         let reader = parquet_reader.with_limit(remaining).build().map_err(|e| {
             ConnectorError::ReadError(format!("failed to build reader for '{file_path}': {e}"))
         })?;
@@ -629,12 +637,26 @@ pub async fn read_version_diff(
         }
     }
 
-    let fully_consumed = total_rows < max_records;
+    // We probed one extra row per file. If total_rows > max_records, there's
+    // more data — trim the excess and report not fully consumed.
+    let fully_consumed = total_rows <= max_records;
+    if !fully_consumed {
+        // Trim the last batch to remove the probe row(s).
+        let excess = total_rows - max_records;
+        let len = batches.len();
+        if len > 0 {
+            let last = &batches[len - 1];
+            if last.num_rows() > excess {
+                batches[len - 1] = last.slice(0, last.num_rows() - excess);
+            } else {
+                batches.pop();
+            }
+        }
+    }
 
     debug!(
         version,
         num_batches = batches.len(),
-        total_rows,
         fully_consumed,
         num_added_files = added_paths.len(),
         "Delta Lake: read version diff"
