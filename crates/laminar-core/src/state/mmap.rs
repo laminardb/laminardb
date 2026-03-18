@@ -508,6 +508,15 @@ impl MmapStateStore {
         // Truncate the backing file to the actual used size (persistent mode only).
         self.storage.truncate_to_used()?;
 
+        // Persist the updated index immediately so the .idx file matches
+        // the rewritten data file. Without this, a crash between compact()
+        // and the next flush() would leave stale pre-compaction offsets
+        // against the compacted data = data loss.
+        if self.is_persistent() {
+            self.storage.flush()?;
+            self.save_index()?;
+        }
+
         self.deletes_since_compact = 0;
         Ok(())
     }
@@ -1107,6 +1116,56 @@ mod tests {
 
         store.put(&key, Bytes::copy_from_slice(&value)).unwrap();
         assert_eq!(store.get(&key).unwrap().as_ref(), &value);
+    }
+
+    #[test]
+    fn test_compact_persists_index_immediately() {
+        let temp_dir = tempfile::tempdir().unwrap();
+        let db_path = temp_dir.path().join("compact_idx.db");
+
+        // Create persistent store, add data, delete some to create fragmentation.
+        {
+            let mut store = MmapStateStore::persistent(&db_path, 64 * 1024).unwrap();
+            for i in 0..20 {
+                let key = format!("k{i:03}");
+                let val = format!("v{i:03}");
+                store.put(key.as_bytes(), Bytes::from(val)).unwrap();
+            }
+            // Flush initial state so .idx exists.
+            store.flush().unwrap();
+
+            // Delete half the entries.
+            for i in 0..10 {
+                let key = format!("k{i:03}");
+                store.delete(key.as_bytes()).unwrap();
+            }
+
+            // Compact rewrites data + truncates file + persists index.
+            store.compact().unwrap();
+
+            // Drop WITHOUT calling flush() — simulates a crash after compact.
+        }
+
+        // Re-open: the .idx must match the compacted data file.
+        {
+            let store = MmapStateStore::persistent(&db_path, 64 * 1024).unwrap();
+            assert_eq!(store.len(), 10);
+            for i in 10..20 {
+                let key = format!("k{i:03}");
+                let expected = format!("v{i:03}");
+                let val = store.get(key.as_bytes());
+                assert!(val.is_some(), "key {key} missing after compact+reopen");
+                assert_eq!(val.unwrap().as_ref(), expected.as_bytes());
+            }
+            // Deleted keys must not be present.
+            for i in 0..10 {
+                let key = format!("k{i:03}");
+                assert!(
+                    store.get(key.as_bytes()).is_none(),
+                    "deleted key {key} present after compact+reopen"
+                );
+            }
+        }
     }
 
     #[test]
