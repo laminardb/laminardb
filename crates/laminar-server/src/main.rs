@@ -8,6 +8,7 @@
 
 #![allow(clippy::disallowed_types)] // cold path: server startup and config only
 
+mod cli;
 mod config;
 mod delta;
 mod delta_config;
@@ -23,7 +24,7 @@ static GLOBAL: tikv_jemallocator::Jemalloc = tikv_jemallocator::Jemalloc;
 use std::path::PathBuf;
 
 use anyhow::Result;
-use clap::Parser;
+use clap::{Parser, Subcommand};
 use tracing::info;
 use tracing_subscriber::{layer::SubscriberExt, util::SubscriberInitExt};
 
@@ -49,6 +50,41 @@ struct Args {
     /// checksums, and reports which are valid for recovery.
     #[arg(long)]
     validate_checkpoints: bool,
+
+    /// Subcommand to run instead of starting the server.
+    #[command(subcommand)]
+    command: Option<Command>,
+}
+
+/// CLI subcommands for interacting with a running LaminarDB server.
+#[derive(Subcommand, Debug)]
+pub enum Command {
+    /// Query server status and diagnostics.
+    Status {
+        /// Server URL (e.g., http://127.0.0.1:8080).
+        #[arg(short, long, default_value = "http://127.0.0.1:8080")]
+        server: String,
+    },
+    /// Execute ad-hoc SQL against a running server.
+    Sql {
+        /// Server URL.
+        #[arg(short, long, default_value = "http://127.0.0.1:8080")]
+        server: String,
+        /// SQL query to execute.
+        query: String,
+    },
+    /// Trigger a manual checkpoint.
+    Checkpoint {
+        /// Server URL.
+        #[arg(short, long, default_value = "http://127.0.0.1:8080")]
+        server: String,
+    },
+    /// Show cluster status (delta mode).
+    Cluster {
+        /// Server URL.
+        #[arg(short, long, default_value = "http://127.0.0.1:8080")]
+        server: String,
+    },
 }
 
 #[tokio::main]
@@ -66,6 +102,11 @@ async fn main() -> Result<()> {
     info!("Starting LaminarDB server");
     info!("Version: {}", env!("CARGO_PKG_VERSION"));
     info!("Config file: {}", args.config);
+
+    // If a subcommand was given, dispatch it and exit.
+    if let Some(cmd) = args.command {
+        return cli::run_command(cmd).await;
+    }
 
     let config_path = PathBuf::from(&args.config);
     let mut config = config::load_config(&config_path)?;
@@ -165,4 +206,30 @@ fn build_checkpoint_store(
             }
         }
     }
+}
+
+/// Initialize OpenTelemetry OTLP tracer (behind `otlp` feature).
+#[cfg(feature = "otlp")]
+fn init_otlp_tracer(
+    endpoint: &str,
+    service_name: &str,
+) -> Result<opentelemetry_sdk::trace::SdkTracerProvider> {
+    use opentelemetry::KeyValue;
+    use opentelemetry_otlp::WithExportConfig;
+    use opentelemetry_sdk::{trace::SdkTracerProvider, Resource};
+
+    let exporter = opentelemetry_otlp::SpanExporter::builder()
+        .with_tonic()
+        .with_endpoint(endpoint)
+        .build()?;
+
+    let provider = SdkTracerProvider::builder()
+        .with_batch_exporter(exporter)
+        .with_resource(Resource::new(vec![KeyValue::new(
+            "service.name",
+            service_name.to_string(),
+        )]))
+        .build();
+
+    Ok(provider)
 }

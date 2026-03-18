@@ -494,6 +494,7 @@ mod tests {
             discovery: None,
             coordination: None,
             node_id: None,
+            telemetry: None,
         }
     }
 

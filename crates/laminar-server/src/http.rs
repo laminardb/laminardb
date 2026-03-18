@@ -58,10 +58,13 @@ pub struct AppState {
 
 pub fn build_router(state: Arc<AppState>) -> Router {
     Router::new()
+        // Admin dashboard
+        .route("/", get(dashboard))
         // Health and observability
         .route("/health", get(health_check))
         .route("/ready", get(readiness_check))
         .route("/metrics", get(prometheus_metrics))
+        .route("/api/v1/diagnostics", get(diagnostics))
         // Pipeline introspection
         .route("/api/v1/sources", get(list_sources))
         .route("/api/v1/sinks", get(list_sinks))
@@ -157,6 +160,30 @@ struct SqlResponse {
     object_name: Option<String>,
     #[serde(skip_serializing_if = "Option::is_none")]
     rows_affected: Option<u64>,
+}
+
+/// Diagnostics response.
+#[derive(Debug, Serialize)]
+struct DiagnosticsResponse {
+    version: &'static str,
+    pipeline_state: &'static str,
+    uptime_seconds: u64,
+    active_queries: usize,
+    source_count: usize,
+    stream_count: usize,
+    sink_count: usize,
+    counters: DiagnosticsCounters,
+}
+
+/// Counter subset for diagnostics.
+#[derive(Debug, Serialize)]
+struct DiagnosticsCounters {
+    events_ingested: u64,
+    events_emitted: u64,
+    events_dropped: u64,
+    checkpoints_completed: u64,
+    checkpoints_failed: u64,
+    checkpoint_epoch: u64,
 }
 
 /// Error response body.
@@ -263,12 +290,45 @@ async fn prometheus_metrics(State(state): State<Arc<AppState>>) -> impl IntoResp
         metrics.total_events_dropped
     ));
 
+    // Per-source detailed metrics
     for sm in &source_metrics {
         lines.push(format!(
             "laminardb_source_events_total{{source=\"{}\"}} {}",
             sm.name, sm.total_events
         ));
+        lines.push(format!(
+            "laminardb_source_pending{{source=\"{}\"}} {}",
+            sm.name, sm.pending
+        ));
+        lines.push(format!(
+            "laminardb_source_utilization{{source=\"{}\"}} {:.4}",
+            sm.name, sm.utilization
+        ));
+        lines.push(format!(
+            "laminardb_source_backpressured{{source=\"{}\"}} {}",
+            sm.name,
+            if sm.is_backpressured { 1 } else { 0 }
+        ));
     }
+
+    // Per-stream metrics
+    let stream_metrics = state.db.all_stream_metrics();
+    for sm in &stream_metrics {
+        lines.push(format!(
+            "laminardb_stream_events_total{{stream=\"{}\"}} {}",
+            sm.name, sm.total_events
+        ));
+        lines.push(format!(
+            "laminardb_stream_pending{{stream=\"{}\"}} {}",
+            sm.name, sm.pending
+        ));
+    }
+
+    // Active queries
+    lines.push(format!(
+        "laminardb_active_queries {}",
+        state.db.active_query_count()
+    ));
 
     lines.push(format!(
         "laminardb_pipeline_state_info{{state=\"{pipeline_state}\"}} 1"
@@ -545,6 +605,120 @@ async fn cluster_status(State(state): State<Arc<AppState>>) -> impl IntoResponse
     .into_response()
 }
 
+/// `GET /` -- minimal HTML status dashboard.
+async fn dashboard(State(state): State<Arc<AppState>>) -> impl IntoResponse {
+    let metrics = state.db.metrics();
+    let pipeline_state = state.db.pipeline_state();
+    let source_metrics = state.db.all_source_metrics();
+    let stream_metrics = state.db.all_stream_metrics();
+    let snap = state.db.counters().snapshot();
+    let uptime = state.started_at.signed_duration_since(chrono::Utc::now());
+    #[allow(clippy::cast_sign_loss)]
+    let uptime_secs = uptime.num_seconds().unsigned_abs();
+
+    let mut source_rows = String::new();
+    for sm in &source_metrics {
+        source_rows.push_str(&format!(
+            "<tr><td>{}</td><td>{}</td><td>{}</td><td>{:.1}%</td></tr>",
+            sm.name,
+            sm.total_events,
+            sm.pending,
+            sm.utilization * 100.0
+        ));
+    }
+    let mut stream_rows = String::new();
+    for sm in &stream_metrics {
+        stream_rows.push_str(&format!(
+            "<tr><td>{}</td><td>{}</td><td>{}</td></tr>",
+            sm.name, sm.total_events, sm.pending
+        ));
+    }
+
+    let html = format!(
+        r#"<!DOCTYPE html>
+<html><head><title>LaminarDB</title>
+<meta http-equiv="refresh" content="5">
+<style>
+body {{ font-family: monospace; margin: 2em; background: #1a1a2e; color: #eee; }}
+table {{ border-collapse: collapse; margin: 1em 0; }}
+th, td {{ border: 1px solid #444; padding: 4px 12px; text-align: left; }}
+th {{ background: #16213e; }}
+.ok {{ color: #0f0; }} .warn {{ color: #ff0; }}
+h1 {{ color: #e94560; }}
+</style></head><body>
+<h1>LaminarDB v{version}</h1>
+<p>State: <span class="{state_class}">{pipeline_state}</span> | Uptime: {uptime_secs}s</p>
+<h2>Counters</h2>
+<table>
+<tr><th>Metric</th><th>Value</th></tr>
+<tr><td>Events ingested</td><td>{ingested}</td></tr>
+<tr><td>Events emitted</td><td>{emitted}</td></tr>
+<tr><td>Events dropped</td><td>{dropped}</td></tr>
+<tr><td>Checkpoints completed</td><td>{ckpt_ok}</td></tr>
+<tr><td>Checkpoints failed</td><td>{ckpt_fail}</td></tr>
+</table>
+<h2>Sources ({source_count})</h2>
+<table><tr><th>Name</th><th>Events</th><th>Pending</th><th>Utilization</th></tr>{source_rows}</table>
+<h2>Streams ({stream_count})</h2>
+<table><tr><th>Name</th><th>Events</th><th>Pending</th></tr>{stream_rows}</table>
+<h2>Sinks ({sink_count})</h2>
+<p>{sink_count} sink(s) registered</p>
+</body></html>"#,
+        version = env!("CARGO_PKG_VERSION"),
+        state_class = if pipeline_state == "Running" {
+            "ok"
+        } else {
+            "warn"
+        },
+        pipeline_state = pipeline_state,
+        uptime_secs = uptime_secs,
+        ingested = metrics.total_events_ingested,
+        emitted = metrics.total_events_emitted,
+        dropped = metrics.total_events_dropped,
+        ckpt_ok = snap.checkpoints_completed,
+        ckpt_fail = snap.checkpoints_failed,
+        source_count = metrics.source_count,
+        source_rows = source_rows,
+        stream_count = metrics.stream_count,
+        stream_rows = stream_rows,
+        sink_count = metrics.sink_count,
+    );
+
+    (
+        StatusCode::OK,
+        [("content-type", "text/html; charset=utf-8")],
+        html,
+    )
+}
+
+/// `GET /api/v1/diagnostics` -- server diagnostics snapshot.
+async fn diagnostics(State(state): State<Arc<AppState>>) -> impl IntoResponse {
+    let metrics = state.db.metrics();
+    let snap = state.db.counters().snapshot();
+    let pipeline_state = state.db.pipeline_state();
+    let uptime = state.started_at.signed_duration_since(chrono::Utc::now());
+    #[allow(clippy::cast_sign_loss)]
+    let uptime_secs = uptime.num_seconds().unsigned_abs();
+
+    Json(DiagnosticsResponse {
+        version: env!("CARGO_PKG_VERSION"),
+        pipeline_state,
+        uptime_seconds: uptime_secs,
+        active_queries: state.db.active_query_count(),
+        source_count: metrics.source_count,
+        stream_count: metrics.stream_count,
+        sink_count: metrics.sink_count,
+        counters: DiagnosticsCounters {
+            events_ingested: snap.events_ingested,
+            events_emitted: snap.events_emitted,
+            events_dropped: snap.events_dropped,
+            checkpoints_completed: snap.checkpoints_completed,
+            checkpoints_failed: snap.checkpoints_failed,
+            checkpoint_epoch: snap.checkpoint_epoch,
+        },
+    })
+}
+
 /// Stub handler for unimplemented endpoints.
 async fn not_implemented() -> impl IntoResponse {
     error_response(
@@ -580,6 +754,7 @@ mod tests {
                 discovery: None,
                 coordination: None,
                 node_id: None,
+                telemetry: None,
             }),
             reload_guard: ReloadGuard::new(),
             reload_total: AtomicU64::new(0),
@@ -815,6 +990,7 @@ mod tests {
                 discovery: None,
                 coordination: None,
                 node_id: None,
+                telemetry: None,
             }),
             reload_guard: ReloadGuard::new(),
             reload_total: AtomicU64::new(0),
@@ -855,5 +1031,62 @@ mod tests {
         let text = String::from_utf8(body.to_vec()).unwrap();
         assert!(text.contains("laminardb_reload_total 5"));
         assert!(text.contains("laminardb_reload_last_timestamp 1700000000"));
+    }
+
+    #[tokio::test]
+    async fn test_dashboard() {
+        let state = test_state();
+        let app = build_router(state);
+
+        let req = Request::builder().uri("/").body(Body::empty()).unwrap();
+        let resp = app.oneshot(req).await.unwrap();
+        assert_eq!(resp.status(), StatusCode::OK);
+
+        let body = axum::body::to_bytes(resp.into_body(), usize::MAX)
+            .await
+            .unwrap();
+        let text = String::from_utf8(body.to_vec()).unwrap();
+        assert!(text.contains("LaminarDB"));
+        assert!(text.contains("<!DOCTYPE html>"));
+    }
+
+    #[tokio::test]
+    async fn test_diagnostics() {
+        let state = test_state();
+        let app = build_router(state);
+
+        let req = Request::builder()
+            .uri("/api/v1/diagnostics")
+            .body(Body::empty())
+            .unwrap();
+        let resp = app.oneshot(req).await.unwrap();
+        assert_eq!(resp.status(), StatusCode::OK);
+
+        let body = axum::body::to_bytes(resp.into_body(), usize::MAX)
+            .await
+            .unwrap();
+        let json: serde_json::Value = serde_json::from_slice(&body).unwrap();
+        assert!(json["version"].is_string());
+        assert!(json["pipeline_state"].is_string());
+        assert!(json["counters"]["events_ingested"].is_number());
+    }
+
+    #[tokio::test]
+    async fn test_metrics_enhanced() {
+        let state = test_state();
+        let app = build_router(state);
+
+        let req = Request::builder()
+            .uri("/metrics")
+            .body(Body::empty())
+            .unwrap();
+        let resp = app.oneshot(req).await.unwrap();
+        let body = axum::body::to_bytes(resp.into_body(), usize::MAX)
+            .await
+            .unwrap();
+        let text = String::from_utf8(body.to_vec()).unwrap();
+        assert!(text.contains("laminardb_active_queries"));
+        assert!(text.contains("laminardb_checkpoints_completed_total"));
+        assert!(text.contains("laminardb_cycle_duration_p50_ns"));
     }
 }
