@@ -367,6 +367,11 @@ impl SourceConnector for DeltaSource {
                 target_version
             };
 
+            // Incremental reads (read_version_diff, CDF) always consume the
+            // full version — each version's diff is O(new_files), not
+            // O(table_size), so unbounded reads are safe. This avoids the
+            // re-read-from-start problem when max_records truncates a version.
+            // Snapshot reads stay bounded by max_records (can be table-sized).
             let (batches, fully_consumed) = if use_snapshot_fallback {
                 delta_io::read_batches_at_version(table, target_version, max_records).await?
             } else if self.config.cdf_enabled
@@ -395,7 +400,6 @@ impl SourceConnector for DeltaSource {
                         mapped.push(mapped_batch);
                     }
                 }
-                // CDF reads are version-bounded, always fully consumed.
                 (mapped, true)
             } else {
                 match self.config.read_mode {
@@ -404,13 +408,16 @@ impl SourceConnector for DeltaSource {
                             .await?
                     }
                     DeltaReadMode::Incremental => {
-                        delta_io::read_version_diff(
+                        // Read full version diff — each version is one
+                        // commit's worth of files, safe to read unbounded.
+                        let (b, _) = delta_io::read_version_diff(
                             table,
                             target_version,
-                            max_records,
+                            usize::MAX,
                             partition_filter.as_deref(),
                         )
-                        .await?
+                        .await?;
+                        (b, true)
                     }
                 }
             };
@@ -493,8 +500,10 @@ impl SourceConnector for DeltaSource {
             }
 
             if !fully_consumed {
-                // max_records truncated the version — don't advance.
-                // Next poll_batch will re-read the same version.
+                // Snapshot mode: max_records truncated the version.
+                // Don't advance — next poll re-reads the same version.
+                // (Incremental mode always reads full versions, so
+                // fully_consumed is always true there.)
             } else if self.pending_batches.is_empty() {
                 // Version fully consumed with no data rows (metadata-only).
                 self.current_version = target_version;
