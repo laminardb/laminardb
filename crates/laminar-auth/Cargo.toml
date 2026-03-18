@@ -1,0 +1,50 @@
+[package]
+name = "laminar-auth"
+version.workspace = true
+authors.workspace = true
+edition.workspace = true
+license.workspace = true
+repository.workspace = true
+homepage.workspace = true
+documentation = "https://laminardb.io/api/laminar_auth"
+description = "Authentication, authorization, and key management for LaminarDB"
+publish = false
+
+[dependencies]
+# Error handling
+thiserror = { workspace = true }
+anyhow = { workspace = true }
+
+# Async
+async-trait = { workspace = true }
+tokio = { workspace = true, features = ["fs"] }
+
+# Serialization
+serde = { workspace = true }
+serde_json = { workspace = true }
+
+# Logging
+tracing = { workspace = true }
+
+# Crypto
+sha2 = { workspace = true }
+base64 = { workspace = true }
+
+# mTLS: certificate parsing
+x509-parser = { version = "0.16", optional = true }
+rustls = { version = "0.23", optional = true, default-features = false, features = ["std", "tls12"] }
+rustls-pemfile = { version = "2", optional = true }
+tokio-rustls = { version = "0.26", optional = true }
+
+# LDAP
+ldap3 = { version = "0.11", optional = true }
+
+[dev-dependencies]
+tokio = { workspace = true, features = ["full", "test-util"] }
+tempfile = { workspace = true }
+
+[features]
+default = []
+mtls = ["dep:x509-parser", "dep:rustls", "dep:rustls-pemfile", "dep:tokio-rustls"]
+ldap = ["dep:ldap3"]
+security = ["mtls", "ldap"]
