@@ -29,6 +29,8 @@
 //! - `discovery`: Node discovery (static seeds, gossip, Kafka groups)
 //! - `coordination`: Raft-based metadata consensus
 //! - `partition`: Epoch-fenced partition ownership and migration
+//! - `remote_state`: Remote state access and cross-node lookup proxying
+//! - `routing`: Partition-aware data routing for cluster mode
 //! - `rpc`: gRPC services for inter-node communication
 
 /// Compute the owning partition for a key using xxhash.

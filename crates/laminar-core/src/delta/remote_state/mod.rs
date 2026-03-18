@@ -7,7 +7,7 @@
 //!
 //! ## Components
 //!
-//! - [`PartitionMap`]: Partition-to-node routing table
+//! - [`RemotePartitionMap`]: Partition-to-node routing table
 //! - [`RemoteStateProxy`]: [`StateStore`] that delegates to local or remote
 //! - [`RemoteLookupSource`]: [`LookupSourceDyn`] for cross-node enrichment
 //!
@@ -44,14 +44,14 @@ const DEFAULT_CACHE_CAPACITY: usize = 10_000;
 /// with the epoch at which ownership was established. Updated from
 /// the Raft state machine on membership changes.
 #[derive(Debug, Clone)]
-pub struct PartitionMap {
+pub struct RemotePartitionMap {
     /// Partition ID -> (owning node, epoch).
     assignments: HashMap<u32, (NodeId, u64)>,
     /// Total number of partitions (immutable after creation).
     num_partitions: u32,
 }
 
-impl PartitionMap {
+impl RemotePartitionMap {
     /// Create a new partition map with the given number of partitions.
     ///
     /// All partitions start as unassigned.
@@ -178,7 +178,7 @@ impl RemoteCache {
     }
 
     /// Flush all entries for partitions whose epoch has changed.
-    fn flush_stale(&mut self, partition_map: &PartitionMap, num_partitions: u32) {
+    fn flush_stale(&mut self, partition_map: &RemotePartitionMap, num_partitions: u32) {
         self.entries.retain(|key, entry| {
             let pid = partition_for_key(key, num_partitions);
             partition_map
@@ -209,7 +209,7 @@ pub struct RemoteStateProxy {
     /// Local state store for owned partitions.
     local: Box<dyn StateStore>,
     /// Partition -> node routing.
-    partition_map: Arc<RwLock<PartitionMap>>,
+    partition_map: Arc<RwLock<RemotePartitionMap>>,
     /// Local node ID.
     local_node: NodeId,
     /// Cache for hot remote data (LRU with epoch-based invalidation).
@@ -226,7 +226,7 @@ impl RemoteStateProxy {
     #[must_use]
     pub fn new(
         local: Box<dyn StateStore>,
-        partition_map: Arc<RwLock<PartitionMap>>,
+        partition_map: Arc<RwLock<RemotePartitionMap>>,
         local_node: NodeId,
         cache_capacity: usize,
     ) -> Self {
@@ -242,7 +242,7 @@ impl RemoteStateProxy {
     #[must_use]
     pub fn with_defaults(
         local: Box<dyn StateStore>,
-        partition_map: Arc<RwLock<PartitionMap>>,
+        partition_map: Arc<RwLock<RemotePartitionMap>>,
         local_node: NodeId,
     ) -> Self {
         Self::new(local, partition_map, local_node, DEFAULT_CACHE_CAPACITY)
@@ -515,8 +515,8 @@ mod tests {
     use super::*;
     use crate::state::InMemoryStore;
 
-    fn make_partition_map(num_partitions: u32, local_node: NodeId) -> PartitionMap {
-        let mut map = PartitionMap::new(num_partitions);
+    fn make_partition_map(num_partitions: u32, local_node: NodeId) -> RemotePartitionMap {
+        let mut map = RemotePartitionMap::new(num_partitions);
         for pid in 0..num_partitions {
             // Assign even partitions to local, odd to remote.
             let owner = if pid % 2 == 0 { local_node } else { NodeId(99) };
@@ -552,7 +552,7 @@ mod tests {
     fn test_partition_map_basics() {
         let local = NodeId(1);
         let remote = NodeId(2);
-        let mut map = PartitionMap::new(4);
+        let mut map = RemotePartitionMap::new(4);
         map.set_owner(0, local, 1);
         map.set_owner(1, remote, 1);
         map.set_owner(2, local, 1);

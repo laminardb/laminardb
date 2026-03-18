@@ -127,6 +127,7 @@ message StatusResponse {
         IN_PROGRESS = 2;
         COMPLETED = 3;
         FAILED = 4;
+        ABORTED = 5;
     }
     Phase phase = 1;
     // Partitions that have completed on this node.
