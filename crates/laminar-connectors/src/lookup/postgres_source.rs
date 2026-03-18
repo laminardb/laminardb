@@ -41,10 +41,73 @@ use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::Arc;
 
 use arrow_array::RecordBatch;
-use arrow_schema::SchemaRef;
+use arrow_schema::{DataType, SchemaRef, TimeUnit};
 
 use laminar_core::lookup::predicate::{predicate_to_sql, Predicate};
 use laminar_core::lookup::source::{ColumnId, LookupError, LookupSource, LookupSourceCapabilities};
+
+/// Convert a single `tokio_postgres::Row` into Arrow arrays matching the given schema.
+///
+/// For each field in the schema, extracts the value from the Postgres row using
+/// `try_get` with the appropriate Rust type and constructs a single-element Arrow
+/// array. NULL values are handled gracefully via `Option<T>`.
+///
+/// Unsupported data types fall back to a null array.
+#[allow(clippy::unnecessary_wraps)] // Result kept for forward-compat with fallible conversions
+fn pg_row_to_arrow_arrays(
+    row: &tokio_postgres::Row,
+    schema: &arrow_schema::Schema,
+) -> Result<Vec<Arc<dyn arrow_array::Array>>, LookupError> {
+    let mut cols: Vec<Arc<dyn arrow_array::Array>> = Vec::with_capacity(schema.fields().len());
+
+    for field in schema.fields() {
+        let col_name = field.name().as_str();
+        let array: Arc<dyn arrow_array::Array> = match field.data_type() {
+            DataType::Boolean => {
+                let v: Option<bool> = row.try_get(col_name).ok().flatten();
+                Arc::new(arrow_array::BooleanArray::from(vec![v]))
+            }
+            DataType::Int16 => {
+                let v: Option<i16> = row.try_get(col_name).ok().flatten();
+                Arc::new(arrow_array::Int16Array::from(vec![v]))
+            }
+            DataType::Int32 => {
+                let v: Option<i32> = row.try_get(col_name).ok().flatten();
+                Arc::new(arrow_array::Int32Array::from(vec![v]))
+            }
+            DataType::Int64 => {
+                let v: Option<i64> = row.try_get(col_name).ok().flatten();
+                Arc::new(arrow_array::Int64Array::from(vec![v]))
+            }
+            DataType::Float32 => {
+                let v: Option<f32> = row.try_get(col_name).ok().flatten();
+                Arc::new(arrow_array::Float32Array::from(vec![v]))
+            }
+            DataType::Float64 => {
+                let v: Option<f64> = row.try_get(col_name).ok().flatten();
+                Arc::new(arrow_array::Float64Array::from(vec![v]))
+            }
+            DataType::Utf8 | DataType::LargeUtf8 => {
+                let v: Option<String> = row.try_get(col_name).ok().flatten();
+                Arc::new(arrow_array::StringArray::from(vec![v.as_deref()]))
+            }
+            DataType::Timestamp(TimeUnit::Millisecond, tz) => {
+                let v: Option<chrono::NaiveDateTime> = row.try_get(col_name).ok().flatten();
+                let millis = v.map(|dt| dt.and_utc().timestamp_millis());
+                let arr = arrow_array::TimestampMillisecondArray::from(vec![millis]);
+                if let Some(tz) = tz {
+                    Arc::new(arr.with_timezone(tz.clone()))
+                } else {
+                    Arc::new(arr)
+                }
+            }
+            _ => arrow_array::new_null_array(field.data_type(), 1),
+        };
+        cols.push(array);
+    }
+
+    Ok(cols)
+}
 
 /// Configuration for the `PostgreSQL` lookup source.
 ///
@@ -251,19 +314,7 @@ impl LookupSource for PostgresLookupSource {
             let pk_val: Option<String> = row.try_get::<_, String>(pk_col.as_str()).ok();
             if let Some(pk) = pk_val {
                 if let Some(&idx) = key_index.get(pk.as_str()) {
-                    // Build a single-row RecordBatch with all columns from
-                    // the output schema. Columns beyond the PK are filled
-                    // with nulls since tokio-postgres row → Arrow column
-                    // conversion is not wired yet.
-                    let mut cols: Vec<Arc<dyn arrow_array::Array>> =
-                        Vec::with_capacity(self.output_schema.fields().len());
-                    for field in self.output_schema.fields() {
-                        if field.name() == pk_col {
-                            cols.push(Arc::new(arrow_array::StringArray::from(vec![pk.as_str()])));
-                        } else {
-                            cols.push(arrow_array::new_null_array(field.data_type(), 1));
-                        }
-                    }
+                    let cols = pg_row_to_arrow_arrays(row, &self.output_schema)?;
                     if let Ok(batch) = RecordBatch::try_new(Arc::clone(&self.output_schema), cols) {
                         result[idx] = Some(batch);
                     }

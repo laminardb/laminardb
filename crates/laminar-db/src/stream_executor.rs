@@ -26,7 +26,7 @@ use sqlparser::parser::Parser;
 use laminar_sql::parser::join_parser::analyze_joins;
 use laminar_sql::parser::{EmitClause, EmitStrategy as SqlEmitStrategy};
 use laminar_sql::translator::{
-    AsofJoinTranslatorConfig, JoinOperatorConfig, OrderOperatorConfig,
+    AsofJoinTranslatorConfig, JoinOperatorConfig, OrderOperatorConfig, StreamJoinConfig,
     TemporalJoinTranslatorConfig, WindowOperatorConfig, WindowType,
 };
 
@@ -235,6 +235,8 @@ pub(crate) struct StreamQuery {
     pub projection_sql: Option<Arc<str>>,
     /// Temporal join config (Arc-shared to avoid cloning on hot path).
     pub temporal_config: Option<Arc<TemporalJoinTranslatorConfig>>,
+    /// Stream-stream interval join config.
+    pub stream_join_config: Option<Arc<StreamJoinConfig>>,
     /// EMIT clause from the planner (e.g., `OnWindowClose`, `Final`).
     pub emit_clause: Option<EmitClause>,
     /// Window configuration (Arc-shared to avoid cloning on hot path).
@@ -378,6 +380,11 @@ pub(crate) struct StreamExecutor {
     /// Query indices for which the execution-tier has already been logged
     /// (compiled vs cached-plan). Avoids per-cycle log spam.
     fallback_logged: FxHashSet<usize>,
+    /// Per-query interval join state, keyed by query index.
+    interval_join_states: FxHashMap<usize, crate::interval_join::IntervalJoinState>,
+    /// Tracks the last-seen row count for temporal join tables, keyed by query index.
+    /// Used to detect table modifications and warn about missing retractions.
+    last_temporal_row_count: FxHashMap<usize, usize>,
 }
 
 impl StreamExecutor {
@@ -414,6 +421,8 @@ impl StreamExecutor {
             query_budget_ns: 8_000_000,
             counters: None,
             fallback_logged: FxHashSet::default(),
+            interval_join_states: FxHashMap::default(),
+            last_temporal_row_count: FxHashMap::default(),
         }
     }
 
@@ -491,8 +500,12 @@ impl StreamExecutor {
     ) {
         let (asof_config, mut projection_sql) = detect_asof_query(&sql);
         let (temporal_config, temporal_projection_sql) = detect_temporal_query(&sql);
+        let (stream_join_config, stream_join_projection_sql) = detect_stream_join_query(&sql);
         if projection_sql.is_none() {
             projection_sql = temporal_projection_sql;
+        }
+        if projection_sql.is_none() {
+            projection_sql = stream_join_projection_sql;
         }
         let table_refs = extract_table_references(&sql);
         let idx = self.queries.len();
@@ -502,6 +515,7 @@ impl StreamExecutor {
             asof_config: asof_config.map(Arc::new),
             projection_sql: projection_sql.map(|s| Arc::from(s.as_str())),
             temporal_config: temporal_config.map(Arc::new),
+            stream_join_config: stream_join_config.map(Arc::new),
             emit_clause,
             window_config: window_config.map(Arc::new),
             order_config,
@@ -727,6 +741,7 @@ impl StreamExecutor {
             let is_eowc = self.queries[idx].suppresses_intermediate();
             let has_asof = self.queries[idx].asof_config.is_some();
             let has_temporal = self.queries[idx].temporal_config.is_some();
+            let has_stream_join = self.queries[idx].stream_join_config.is_some();
 
             let query_result = if is_eowc {
                 let query_name = Arc::clone(&self.queries[idx].name);
@@ -778,6 +793,25 @@ impl StreamExecutor {
                     projection_sql.as_deref(),
                     source_batches,
                     &results,
+                )
+                .await
+            } else if has_stream_join {
+                let query_name = Arc::clone(&self.queries[idx].name);
+                let cfg = Arc::clone(
+                    self.queries[idx]
+                        .stream_join_config
+                        .as_ref()
+                        .expect("has_stream_join guard ensures stream_join_config is Some"),
+                );
+                let projection_sql = self.queries[idx].projection_sql.as_ref().map(Arc::clone);
+                self.execute_interval_join_query(
+                    idx,
+                    &query_name,
+                    &cfg,
+                    projection_sql.as_deref(),
+                    source_batches,
+                    &results,
+                    current_watermark,
                 )
                 .await
             } else {
@@ -858,6 +892,23 @@ impl StreamExecutor {
                             size_bytes = size,
                             limit_bytes = limit,
                             "state size at 80% of limit"
+                        );
+                    }
+                }
+                // Check interval join state
+                if let Some(state) = self.interval_join_states.get(&idx) {
+                    let size = state.estimated_size_bytes();
+                    if size >= limit {
+                        return Err(DbError::Pipeline(format!(
+                            "state size limit exceeded for query '{}' ({size} bytes > {limit} limit)",
+                            self.queries[idx].name
+                        )));
+                    } else if size >= limit * 4 / 5 {
+                        tracing::warn!(
+                            query = %self.queries[idx].name,
+                            size_bytes = size,
+                            limit_bytes = limit,
+                            "interval join state size at 80% of limit"
                         );
                     }
                 }
@@ -2207,6 +2258,22 @@ impl StreamExecutor {
         use laminar_sql::datafusion::lookup_join::LookupJoinType;
         use laminar_sql::datafusion::lookup_join_exec::VersionedLookupJoinExec;
 
+        // Warn once per query when the temporal table is modified
+        let current_rows = versioned.batch.num_rows();
+        let last_rows = self.last_temporal_row_count.get(&idx).copied().unwrap_or(0);
+        if current_rows != last_rows && last_rows > 0 {
+            tracing::warn!(
+                query = %query_name,
+                table = %config.table_name,
+                previous_rows = last_rows,
+                current_rows = current_rows,
+                "Temporal join table has been modified. \
+                 Retractions for previously-joined events are NOT emitted. \
+                 Use append-only tables for correct temporal join semantics."
+            );
+        }
+        self.last_temporal_row_count.insert(idx, current_rows);
+
         let stream_batches = self
             .resolve_table_batches(&config.stream_table, source_batches, intermediate_results)
             .await?;
@@ -2516,9 +2583,15 @@ impl StreamExecutor {
             );
         }
 
-        // Join states: currently ASOF/temporal joins are stateless per-cycle,
-        // so this map is empty. Future stateful joins will populate it.
-        let join_checkpoints = FxHashMap::default();
+        // Checkpoint interval join states
+        let mut join_checkpoints = FxHashMap::with_capacity_and_hasher(
+            self.interval_join_states.len(),
+            rustc_hash::FxBuildHasher,
+        );
+        for (&idx, state) in &self.interval_join_states {
+            let name = self.queries[idx].name.to_string();
+            join_checkpoints.insert(name, state.to_checkpoint()?);
+        }
 
         if agg_checkpoints.is_empty()
             && eowc_checkpoints.is_empty()
@@ -2703,6 +2776,140 @@ impl StreamExecutor {
                 IncrementalEowcState::restore_windows,
                 "EOWC state",
             );
+        }
+    }
+
+    /// Execute an interval join query for one cycle.
+    #[allow(clippy::too_many_arguments, clippy::too_many_lines)]
+    async fn execute_interval_join_query(
+        &mut self,
+        idx: usize,
+        query_name: &str,
+        config: &StreamJoinConfig,
+        projection_sql: Option<&str>,
+        source_batches: &FxHashMap<Arc<str>, Vec<RecordBatch>>,
+        intermediate_results: &FxHashMap<Arc<str>, Vec<RecordBatch>>,
+        current_watermark: i64,
+    ) -> Result<Vec<RecordBatch>, DbError> {
+        // Resolve left and right batches from source tables
+        let left_batches = self
+            .resolve_table_batches(&config.left_table, source_batches, intermediate_results)
+            .await?;
+        let right_batches = self
+            .resolve_table_batches(&config.right_table, source_batches, intermediate_results)
+            .await?;
+
+        // Get or create interval join state
+        if !self.interval_join_states.contains_key(&idx) {
+            let mut new_state = crate::interval_join::IntervalJoinState::new();
+            // Try restoring from checkpoint
+            if let Some(ref pending) = self.pending_restore {
+                if let Some(cp) = pending.join_states.get(&*self.queries[idx].name) {
+                    match crate::interval_join::IntervalJoinState::from_checkpoint(
+                        cp,
+                        &config.left_key,
+                        &config.left_time_column,
+                        &config.right_key,
+                        &config.right_time_column,
+                    ) {
+                        Ok(restored) => {
+                            tracing::info!(
+                                query = %query_name,
+                                left_rows = cp.left_buffer_rows,
+                                right_rows = cp.right_buffer_rows,
+                                "Restored interval join state from checkpoint"
+                            );
+                            new_state = restored;
+                        }
+                        Err(e) => {
+                            tracing::warn!(
+                                query = %query_name,
+                                error = %e,
+                                "Failed to restore interval join state from checkpoint"
+                            );
+                        }
+                    }
+                }
+            }
+            self.interval_join_states.insert(idx, new_state);
+        }
+
+        let state = self
+            .interval_join_states
+            .get_mut(&idx)
+            .expect("interval join state was just inserted");
+
+        let join_result = crate::interval_join::execute_interval_join_cycle(
+            state,
+            &left_batches,
+            &right_batches,
+            config,
+            current_watermark,
+        )?;
+
+        // Apply post-projection if needed
+        if join_result.is_empty() {
+            return Ok(join_result);
+        }
+
+        if let Some(proj_sql) = projection_sql {
+            // Concatenate all result batches for projection
+            let schema = join_result[0].schema();
+            let joined = arrow::compute::concat_batches(&schema, &join_result)
+                .map_err(|e| DbError::query_pipeline_arrow("interval join (concat)", &e))?;
+
+            // Try compiled post-projection (lazy compile on first call)
+            if let Some(compiled) = self.compiled_post_projections.get(&idx) {
+                let result = Self::apply_compiled_post_projection(compiled, &joined)?;
+                return Ok(vec![result]);
+            }
+
+            if !self.post_projection_compile_failed.contains(&idx) {
+                let schema = joined.schema();
+                if let Some(compiled) = self
+                    .try_compile_post_projection(proj_sql, "__interval_tmp", &schema)
+                    .await
+                {
+                    let result = Self::apply_compiled_post_projection(&compiled, &joined)?;
+                    self.compiled_post_projections.insert(idx, compiled);
+                    return Ok(vec![result]);
+                }
+                self.post_projection_compile_failed.insert(idx);
+                tracing::warn!(
+                    query = %query_name,
+                    "Interval join post-projection could not be compiled — using DataFusion SQL fallback"
+                );
+            }
+
+            // SQL fallback with plan caching
+            let schema = joined.schema();
+            let mem_table = datafusion::datasource::MemTable::try_new(schema, vec![vec![joined]])
+                .map_err(|e| DbError::query_pipeline(query_name, &e))?;
+
+            let _ = self.ctx.deregister_table("__interval_tmp");
+            self.ctx
+                .register_table("__interval_tmp", Arc::new(mem_table))
+                .map_err(|e| DbError::query_pipeline(query_name, &e))?;
+
+            let result = if let Some(plan) = self.cached_post_projection_plans.get(&idx) {
+                self.execute_cached_plan(query_name, plan).await?
+            } else {
+                let df = self
+                    .ctx
+                    .sql(proj_sql)
+                    .await
+                    .map_err(|e| DbError::query_pipeline(query_name, &e))?;
+                self.cached_post_projection_plans
+                    .insert(idx, df.logical_plan().clone());
+                df.collect()
+                    .await
+                    .map_err(|e| DbError::query_pipeline(query_name, &e))?
+            };
+
+            let _ = self.ctx.deregister_table("__interval_tmp");
+            Ok(result)
+        } else {
+            Ok(join_result)
         }
     }
 
@@ -2901,6 +3108,130 @@ fn detect_temporal_query(sql: &str) -> (Option<TemporalJoinTranslatorConfig>, Op
     let projection_sql = build_temporal_projection_sql(select, temporal_analysis, &config);
 
     (Some(config), Some(projection_sql))
+}
+
+fn detect_stream_join_query(sql: &str) -> (Option<StreamJoinConfig>, Option<String>) {
+    let Ok(statements) = laminar_sql::parse_streaming_sql(sql) else {
+        return (None, None);
+    };
+
+    let Some(laminar_sql::parser::StreamingStatement::Standard(stmt)) = statements.first() else {
+        return (None, None);
+    };
+
+    let Statement::Query(query) = stmt.as_ref() else {
+        return (None, None);
+    };
+
+    let SetExpr::Select(select) = query.body.as_ref() else {
+        return (None, None);
+    };
+
+    let Ok(Some(multi)) = analyze_joins(select) else {
+        return (None, None);
+    };
+
+    // Find the first stream-stream join step (has time_bound, not ASOF/temporal/lookup)
+    let Some(stream_analysis) = multi.joins.iter().find(|j| {
+        j.time_bound.is_some() && !j.is_asof_join && !j.is_temporal_join && !j.is_lookup_join
+    }) else {
+        return (None, None);
+    };
+
+    let JoinOperatorConfig::StreamStream(config) =
+        JoinOperatorConfig::from_analysis(stream_analysis)
+    else {
+        return (None, None);
+    };
+
+    // Only route to interval join if we have time columns
+    if config.left_time_column.is_empty() || config.right_time_column.is_empty() {
+        return (None, None);
+    }
+
+    let projection_sql = build_stream_join_projection_sql(select, stream_analysis, &config);
+
+    (Some(config), Some(projection_sql))
+}
+
+/// Build a `SELECT ... FROM __interval_tmp` projection query from the original
+/// SELECT items, rewriting table-qualified references to plain column names.
+fn build_stream_join_projection_sql(
+    select: &sqlparser::ast::Select,
+    analysis: &laminar_sql::parser::join_parser::JoinAnalysis,
+    config: &StreamJoinConfig,
+) -> String {
+    let left_alias = analysis.left_alias.as_deref();
+    let right_alias = analysis.right_alias.as_deref();
+
+    let items: Vec<String> = select
+        .projection
+        .iter()
+        .map(|item| match item {
+            SelectItem::UnnamedExpr(expr) => {
+                rewrite_stream_join_expr(expr, left_alias, right_alias, config)
+            }
+            SelectItem::ExprWithAlias { expr, alias } => {
+                let rewritten = rewrite_stream_join_expr(expr, left_alias, right_alias, config);
+                format!("{rewritten} AS {alias}")
+            }
+            SelectItem::Wildcard(_) => "*".to_string(),
+            SelectItem::QualifiedWildcard(name, _) => {
+                let table = name.to_string();
+                if table == config.left_table
+                    || left_alias.is_some_and(|a| a == table)
+                    || table == config.right_table
+                    || right_alias.is_some_and(|a| a == table)
+                {
+                    "*".to_string()
+                } else {
+                    format!("{table}.*")
+                }
+            }
+        })
+        .collect();
+
+    let where_clause = select
+        .selection
+        .as_ref()
+        .map(|expr| {
+            let rewritten = rewrite_stream_join_expr(expr, left_alias, right_alias, config);
+            format!(" WHERE {rewritten}")
+        })
+        .unwrap_or_default();
+
+    format!("SELECT {} FROM __interval_tmp{where_clause}", items.join(", "))
+}
+
+fn rewrite_stream_join_expr(
+    expr: &sqlparser::ast::Expr,
+    left_alias: Option<&str>,
+    right_alias: Option<&str>,
+    config: &StreamJoinConfig,
+) -> String {
+    match expr {
+        Expr::CompoundIdentifier(parts) if parts.len() == 2 => {
+            let table = &parts[0].value;
+            let col = &parts[1].value;
+            // If the table qualifier matches left or right, strip it
+            let is_left = table == &config.left_table
+                || left_alias.is_some_and(|a| a == table);
+            let is_right = table == &config.right_table
+                || right_alias.is_some_and(|a| a == table);
+            if is_left || is_right {
+                // If right-side col name clashes with left, use suffixed name
+                if is_right {
+                    // Check if there's a name collision (use suffixed name)
+                    format!("{col}_{}", config.right_table)
+                } else {
+                    col.clone()
+                }
+            } else {
+                expr.to_string()
+            }
+        }
+        _ => expr.to_string(),
+    }
 }
 
 /// Build a `SELECT ... FROM __temporal_tmp` projection query from the original

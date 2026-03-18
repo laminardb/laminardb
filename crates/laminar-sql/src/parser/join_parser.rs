@@ -312,7 +312,21 @@ pub fn analyze_join(select: &Select) -> Result<Option<JoinAnalysis>, ParseError>
 
     analysis.left_alias = left_alias;
     analysis.right_alias = right_alias;
-    analysis.additional_key_columns = additional;
+
+    // Extract time column names from the pseudo "__time_cols" pair injected
+    // by the BETWEEN handler, and strip it from the additional key columns.
+    let mut real_additional = Vec::new();
+    for (l, r) in &additional {
+        if l == "__time_cols" {
+            if let Some((lt, rt)) = r.split_once(',') {
+                analysis.left_time_column = Some(lt.to_string());
+                analysis.right_time_column = Some(rt.to_string());
+            }
+        } else {
+            real_additional.push((l.clone(), r.clone()));
+        }
+    }
+    analysis.additional_key_columns = real_additional;
 
     Ok(Some(analysis))
 }
@@ -505,14 +519,27 @@ fn analyze_on_expression(
         }
         // BETWEEN clause for time bound: p.ts BETWEEN o.ts AND o.ts + INTERVAL
         Expr::Between {
-            expr: _,
-            low: _,
+            expr,
+            low,
             high,
             ..
         } => {
             // Try to extract time bound from high expression
             let time_bound = extract_time_bound_from_expr(high).ok();
-            Ok((vec![], time_bound))
+            // Extract left and right time column references for stream-stream joins
+            let right_time_col = extract_column_ref(expr);
+            let left_time_col = extract_column_ref(low);
+            Ok((
+                // Store time column names as a pseudo key pair so the caller can
+                // retrieve them.  The tag "__time_cols" is stripped in
+                // `analyze_join` below.
+                if let (Some(lt), Some(rt)) = (left_time_col, right_time_col) {
+                    vec![("__time_cols".to_string(), format!("{lt},{rt}"))]
+                } else {
+                    vec![]
+                },
+                time_bound,
+            ))
         }
         // Comparison operators for time bounds
         Expr::BinaryOp {
@@ -942,7 +969,19 @@ pub fn analyze_joins(select: &Select) -> Result<Option<MultiJoinAnalysis>, Parse
             };
             analysis.left_alias.clone_from(&prev_left_alias);
             analysis.right_alias = right_alias;
-            analysis.additional_key_columns = additional;
+            // Extract time column names from the pseudo "__time_cols" pair
+            let mut real_additional = Vec::new();
+            for (l, r) in &additional {
+                if l == "__time_cols" {
+                    if let Some((lt, rt)) = r.split_once(',') {
+                        analysis.left_time_column = Some(lt.to_string());
+                        analysis.right_time_column = Some(rt.to_string());
+                    }
+                } else {
+                    real_additional.push((l.clone(), r.clone()));
+                }
+            }
+            analysis.additional_key_columns = real_additional;
             join_steps.push(analysis);
         }
 

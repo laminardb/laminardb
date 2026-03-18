@@ -14,6 +14,14 @@ pub struct StreamJoinConfig {
     pub left_key: String,
     /// Right side key column
     pub right_key: String,
+    /// Left side time column for interval matching
+    pub left_time_column: String,
+    /// Right side time column for interval matching
+    pub right_time_column: String,
+    /// Left side table name
+    pub left_table: String,
+    /// Right side table name
+    pub right_table: String,
     /// Time bound for joining (max time difference between events)
     pub time_bound: Duration,
     /// Join type
@@ -164,11 +172,15 @@ impl std::fmt::Display for StreamJoinConfig {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         write!(
             f,
-            "{} JOIN ON left.{} = right.{} (bound: {}s)",
+            "{} JOIN ON {}.{} = {}.{} (bound: {}s, time: {} ~ {})",
             self.join_type,
+            self.left_table,
             self.left_key,
+            self.right_table,
             self.right_key,
-            self.time_bound.as_secs()
+            self.time_bound.as_secs(),
+            self.left_time_column,
+            self.right_time_column,
         )
     }
 }
@@ -267,7 +279,11 @@ impl JoinOperatorConfig {
                     .asof_direction
                     .unwrap_or(AsofSqlDirection::Backward),
                 tolerance: analysis.asof_tolerance,
-                join_type: AsofSqlJoinType::Left, // ASOF is always left-style
+                join_type: if analysis.join_type == JoinType::Inner {
+                    AsofSqlJoinType::Inner
+                } else {
+                    AsofSqlJoinType::Left
+                },
             });
         }
 
@@ -285,6 +301,10 @@ impl JoinOperatorConfig {
             JoinOperatorConfig::StreamStream(StreamJoinConfig {
                 left_key: analysis.left_key_column.clone(),
                 right_key: analysis.right_key_column.clone(),
+                left_time_column: analysis.left_time_column.clone().unwrap_or_default(),
+                right_time_column: analysis.right_time_column.clone().unwrap_or_default(),
+                left_table: analysis.left_table.clone(),
+                right_table: analysis.right_table.clone(),
                 time_bound: analysis.time_bound.unwrap_or(Duration::from_secs(3600)),
                 join_type: match analysis.join_type {
                     JoinType::Inner => StreamJoinType::Inner,
@@ -365,6 +385,10 @@ impl StreamJoinConfig {
         Self {
             left_key,
             right_key,
+            left_time_column: String::new(),
+            right_time_column: String::new(),
+            left_table: String::new(),
+            right_table: String::new(),
             time_bound,
             join_type,
         }
@@ -790,14 +814,18 @@ mod tests {
 
     #[test]
     fn test_display_stream_join() {
-        let config = StreamJoinConfig::inner(
+        let mut config = StreamJoinConfig::inner(
             "order_id".to_string(),
             "order_id".to_string(),
             Duration::from_secs(3600),
         );
+        config.left_table = "orders".to_string();
+        config.right_table = "payments".to_string();
+        config.left_time_column = "ts".to_string();
+        config.right_time_column = "ts".to_string();
         assert_eq!(
             format!("{config}"),
-            "INNER JOIN ON left.order_id = right.order_id (bound: 3600s)"
+            "INNER JOIN ON orders.order_id = payments.order_id (bound: 3600s, time: ts ~ ts)"
         );
     }
 
