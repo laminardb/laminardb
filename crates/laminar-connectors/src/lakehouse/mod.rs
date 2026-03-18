@@ -170,6 +170,11 @@ fn delta_lake_config_keys() -> Vec<ConfigKeySpec> {
             "",
         ),
         ConfigKeySpec::optional(
+            "compaction.target-file-size",
+            "Target file size after compaction (bytes, defaults to target.file.size)",
+            "",
+        ),
+        ConfigKeySpec::optional(
             "compaction.min-files",
             "Minimum files before triggering compaction",
             "10",
@@ -221,6 +226,17 @@ fn delta_lake_config_keys() -> Vec<ConfigKeySpec> {
             "max.commit.retries",
             "Maximum retries on optimistic concurrency conflicts",
             "3",
+        ),
+        // ── LogStore configuration ──
+        ConfigKeySpec::optional(
+            "storage.s3_locking_provider",
+            "S3 locking provider: 'dynamodb' for DynamoDB-backed log store",
+            "",
+        ),
+        ConfigKeySpec::optional(
+            "storage.dynamodb_table_name",
+            "DynamoDB table name for S3 locking (default: delta_log)",
+            "",
         ),
         // ── Cloud storage credentials (resolved via StorageCredentialResolver) ──
         ConfigKeySpec::optional(
@@ -317,6 +333,11 @@ fn delta_lake_source_config_keys() -> Vec<ConfigKeySpec> {
             "Action on schema change: 'warn' or 'error'",
             "warn",
         ),
+        ConfigKeySpec::optional(
+            "cdf.enabled",
+            "Use Change Data Feed for incremental reads (requires CDF on table)",
+            "false",
+        ),
         // ── Catalog configuration ──
         ConfigKeySpec::optional("catalog.type", "Catalog type: none, glue, unity", "none"),
         ConfigKeySpec::optional(
@@ -338,6 +359,17 @@ fn delta_lake_source_config_keys() -> Vec<ConfigKeySpec> {
         ConfigKeySpec::optional(
             "catalog.access_token",
             "Databricks access token (required for Unity)",
+            "",
+        ),
+        // ── LogStore configuration ──
+        ConfigKeySpec::optional(
+            "storage.s3_locking_provider",
+            "S3 locking provider: 'dynamodb' for DynamoDB-backed log store",
+            "",
+        ),
+        ConfigKeySpec::optional(
+            "storage.dynamodb_table_name",
+            "DynamoDB table name for S3 locking (default: delta_log)",
             "",
         ),
         // ── Cloud storage credentials ──

@@ -342,39 +342,19 @@ pub fn get_table_schema(table: &DeltaTable) -> Result<SchemaRef, ConnectorError>
     Ok(state.snapshot().arrow_schema())
 }
 
-/// Returns the latest committed version of a Delta Lake table.
-///
-/// This refreshes the table state from storage before checking.
-/// Takes `&mut Option<DeltaTable>` to avoid cloning: uses `take()` +
-/// `update()` + put-back, which is zero-copy on success.
+/// Returns the latest committed version via the log store.
 ///
 /// # Errors
 ///
-/// Returns `ConnectorError::ReadError` if the table state cannot be refreshed.
+/// Returns `ConnectorError::ReadError` on failure.
 #[cfg(feature = "delta-lake")]
-pub async fn get_latest_version(
-    table_slot: &mut Option<DeltaTable>,
-) -> Result<i64, ConnectorError> {
-    let table = table_slot
-        .take()
-        .ok_or_else(|| ConnectorError::InvalidState {
-            expected: "table initialized".into(),
-            actual: "table not initialized".into(),
-        })?;
-
-    match table.update().await {
-        Ok((updated, _metrics)) => {
-            let version = updated.version().unwrap_or(0);
-            *table_slot = Some(updated);
-            Ok(version)
-        }
-        Err(e) => {
-            // Table is consumed by update() on error — cannot restore.
-            Err(ConnectorError::ReadError(format!(
-                "failed to refresh Delta table: {e}"
-            )))
-        }
-    }
+pub async fn get_latest_version(table: &mut DeltaTable) -> Result<i64, ConnectorError> {
+    let log_store = table.log_store();
+    let current = table.version().unwrap_or(0);
+    log_store
+        .get_latest_version(current)
+        .await
+        .map_err(|e| ConnectorError::ReadError(format!("failed to get latest version: {e}")))
 }
 
 /// Reads record batches from a specific Delta Lake table version.
@@ -486,21 +466,29 @@ pub async fn read_version_diff(
     max_records: usize,
     partition_filter: Option<&str>,
 ) -> Result<Vec<RecordBatch>, ConnectorError> {
+    // Maximum file size (256 MB) for direct in-memory Parquet reads.
+    // Files larger than this fall back to DataFusion's streaming scan.
+    const MAX_DIRECT_READ_BYTES: u64 = 256 * 1024 * 1024;
+
     // For version 0, read the full snapshot (no previous version to diff).
     if version <= 0 {
         return read_batches_at_version(table, version, max_records).await;
     }
 
-    // Read the commit JSON to extract Add action file paths.
-    // delta-rs's log_store uses object_store 0.12 while parquet uses 0.13,
-    // so we read raw bytes and parse with parquet's in-memory reader.
+    // Read the commit JSON via delta-rs's LogStore API (handles path
+    // resolution, checkpoints, and retries correctly).
     let log_store = table.log_store();
     let store = log_store.object_store(None);
 
-    let commit_path = deltalake::Path::from(format!("_delta_log/{version:020}.json"));
-    let commit_log_display = format!("_delta_log/{version:020}.json");
-
-    let commit_data = get_with_retry(&store, &commit_path, &commit_log_display).await?;
+    let commit_data = log_store
+        .read_commit_entry(version)
+        .await
+        .map_err(|e| ConnectorError::ReadError(format!("read commit {version}: {e}")))?
+        .ok_or_else(|| {
+            ConnectorError::ReadError(format!(
+                "version {version} not available (cleaned up or never existed)"
+            ))
+        })?;
     let commit_str = std::str::from_utf8(&commit_data)
         .map_err(|e| ConnectorError::ReadError(format!("commit log is not valid UTF-8: {e}")))?;
 
@@ -577,12 +565,30 @@ pub async fn read_version_diff(
         }
 
         let obj_path = deltalake::Path::from(file_path.as_str());
+
+        // Check file size before downloading. Large files fall back to
+        // DataFusion scan to avoid OOM on multi-GB Parquet files.
+        let file_meta = store.head(&obj_path).await.map_err(|e| {
+            ConnectorError::ReadError(format!("failed to stat '{file_path}': {e}"))
+        })?;
+        if file_meta.size as u64 > MAX_DIRECT_READ_BYTES {
+            warn!(
+                file_path,
+                file_size = file_meta.size,
+                "file too large for direct read, falling back to DataFusion scan"
+            );
+            return read_batches_at_version(table, version, max_records).await;
+        }
+
         let file_bytes = get_with_retry(&store, &obj_path, file_path).await?;
 
-        let parquet_reader = parquet::arrow::arrow_reader::ArrowReaderBuilder::try_new(file_bytes)
-            .map_err(|e| {
-                ConnectorError::ReadError(format!("failed to open Parquet file '{file_path}': {e}"))
-            })?;
+        let parquet_reader =
+            deltalake::parquet::arrow::arrow_reader::ArrowReaderBuilder::try_new(file_bytes)
+                .map_err(|e| {
+                    ConnectorError::ReadError(format!(
+                        "failed to open Parquet file '{file_path}': {e}"
+                    ))
+                })?;
 
         let remaining = max_records.saturating_sub(total_rows);
         let reader = parquet_reader.with_limit(remaining).build().map_err(|e| {
@@ -590,7 +596,7 @@ pub async fn read_version_diff(
         })?;
 
         for result in reader {
-            let batch = result.map_err(|e| {
+            let batch: RecordBatch = result.map_err(|e| {
                 ConnectorError::ReadError(format!("Parquet read error in '{file_path}': {e}"))
             })?;
             if batch.num_rows() == 0 {
@@ -625,10 +631,8 @@ pub async fn read_version_diff(
     Ok(batches)
 }
 
-/// Reads a file from `object_store` with retry on transient failures.
-///
-/// Retries up to 3 times with exponential backoff (200ms, 1s, 4s).
-/// Only retries on I/O-like errors, not on 404 (file not found).
+/// Reads a file from `object_store` with retry (3x, exponential backoff).
+/// Does not retry 404s.
 #[cfg(feature = "delta-lake")]
 async fn get_with_retry(
     store: &Arc<dyn deltalake::ObjectStore>,
@@ -649,7 +653,6 @@ async fn get_with_retry(
             }
             Err(e) => {
                 let msg = e.to_string();
-                // Don't retry 404 (file genuinely missing, e.g., after VACUUM).
                 if msg.contains("not found") || msg.contains("404") {
                     return Err(ConnectorError::ReadError(format!(
                         "file not found '{display_path}': {e}"
@@ -671,7 +674,7 @@ async fn get_with_retry(
     }
 
     Err(ConnectorError::ReadError(format!(
-        "failed to read file '{display_path}' after {} attempts: {}",
+        "failed to read '{display_path}' after {} attempts: {}",
         backoff.len() + 1,
         last_err.map_or_else(|| "unknown".to_string(), |e| e.to_string())
     )))
@@ -753,6 +756,124 @@ fn align_batch_to_schema(
     })
 }
 
+/// Reads CDF batches for a version range via `scan_cdf()`.
+///
+/// `scan_cdf(self)` consumes the `DeltaTable` — caller must re-open afterward.
+/// Output includes `_change_type`, `_commit_version`, `_commit_timestamp`.
+///
+/// # Errors
+///
+/// Returns `ConnectorError::ReadError` on scan failure.
+#[cfg(feature = "delta-lake")]
+pub async fn read_cdf_batches(
+    table: DeltaTable,
+    start_version: i64,
+    end_version: i64,
+) -> Result<Vec<RecordBatch>, ConnectorError> {
+    use datafusion::prelude::SessionContext;
+    use tokio_stream::StreamExt;
+
+    debug!(start_version, end_version, "reading CDF batches");
+
+    let ctx = SessionContext::new();
+
+    // Clone session state so the RwLockReadGuard is dropped before await.
+    let session_state = ctx.state();
+
+    let cdf_builder = table
+        .scan_cdf()
+        .with_starting_version(start_version)
+        .with_ending_version(end_version);
+
+    let plan = cdf_builder.build(&session_state, None).await.map_err(|e| {
+        ConnectorError::ReadError(format!("CDF scan build failed: {e}"))
+    })?;
+
+    // Execute the plan via DataFusion to get record batches.
+    let task_ctx = ctx.task_ctx();
+    let mut stream = datafusion::physical_plan::execute_stream(plan, task_ctx).map_err(|e| {
+        ConnectorError::ReadError(format!("CDF stream execution failed: {e}"))
+    })?;
+
+    let mut batches = Vec::new();
+    while let Some(result) = stream.next().await {
+        let batch: RecordBatch = result.map_err(|e| {
+            ConnectorError::ReadError(format!("CDF stream batch failed: {e}"))
+        })?;
+        if batch.num_rows() > 0 {
+            batches.push(batch);
+        }
+    }
+
+    debug!(
+        start_version,
+        end_version,
+        num_batches = batches.len(),
+        "CDF scan complete"
+    );
+
+    Ok(batches)
+}
+
+/// Maps CDF `_change_type` → `_op` (`I`/`U`/`D`), drops `update_preimage`
+/// rows and CDF metadata columns (`_change_type`, `_commit_version`,
+/// `_commit_timestamp`). Returns `None` if all rows were preimages.
+///
+/// # Errors
+///
+/// Returns `ConnectorError::ReadError` on Arrow operation failure.
+#[cfg(feature = "delta-lake")]
+pub fn map_cdf_to_changelog(batch: &RecordBatch) -> Result<Option<RecordBatch>, ConnectorError> {
+    use arrow_array::StringArray;
+
+    let schema = batch.schema();
+    let Ok(ct_idx) = schema.index_of("_change_type") else {
+        return Ok(Some(batch.clone()));
+    };
+
+    let change_type = batch.column(ct_idx).as_any().downcast_ref::<StringArray>()
+        .ok_or_else(|| ConnectorError::ReadError("_change_type is not Utf8".into()))?;
+
+    // Build filter (drop preimage rows) and mapped _op values in one pass.
+    let (keep, ops): (Vec<bool>, Vec<Option<&str>>) = (0..batch.num_rows())
+        .map(|i| match change_type.value(i) {
+            "update_postimage" => (true, Some("U")),
+            "delete" => (true, Some("D")),
+            "update_preimage" => (false, Some("")),
+            _ => (true, Some("I")), // insert + unknown → I
+        })
+        .unzip();
+
+    let filter = arrow_array::BooleanArray::from(keep);
+    let filtered = arrow_select::filter::filter_record_batch(batch, &filter)
+        .map_err(|e| ConnectorError::ReadError(format!("CDF filter failed: {e}")))?;
+    if filtered.num_rows() == 0 {
+        return Ok(None);
+    }
+
+    // Build _op column from filtered ops.
+    let op_arr: StringArray = ops.into_iter().collect();
+    let op_filtered = arrow_select::filter::filter(&op_arr, &filter)
+        .map_err(|e| ConnectorError::ReadError(format!("CDF op filter: {e}")))?;
+
+    // Rebuild batch: keep user columns, drop CDF metadata, append _op.
+    let cdf_meta = ["_change_type", "_commit_version", "_commit_timestamp"];
+    let mut fields = Vec::new();
+    let mut columns: Vec<Arc<dyn arrow_array::Array>> = Vec::new();
+    for (i, field) in filtered.schema().fields().iter().enumerate() {
+        if !cdf_meta.contains(&field.name().as_str()) {
+            fields.push(field.clone());
+            columns.push(filtered.column(i).clone());
+        }
+    }
+    fields.push(Arc::new(arrow_schema::Field::new("_op", arrow_schema::DataType::Utf8, false)));
+    columns.push(op_filtered);
+
+    RecordBatch::try_new(Arc::new(arrow_schema::Schema::new(fields)), columns)
+        .map(Some)
+        .map_err(|e| ConnectorError::ReadError(format!("CDF batch rebuild: {e}")))
+}
+
 /// Result of a MERGE (upsert) operation.
 #[cfg(feature = "delta-lake")]
 #[derive(Debug)]
@@ -763,208 +884,6 @@ pub struct MergeResult {
     pub rows_updated: usize,
     /// Number of rows deleted.
     pub rows_deleted: usize,
-}
-
-/// Performs a MERGE (upsert) of a source batch into a Delta Lake table.
-///
-/// Matches source rows to target rows by `key_columns`, then:
-/// - **Matched**: update all non-key columns from source
-/// - **Not matched**: insert all columns from source
-///
-/// # Arguments
-///
-/// * `table` - The Delta Lake table handle (consumed and returned)
-/// * `source_batch` - The source `RecordBatch` to merge
-/// * `key_columns` - Columns used to match source to target rows
-/// * `writer_id` - Unique writer identifier for exactly-once deduplication
-/// * `epoch` - The epoch number for this write
-/// * `schema_evolution` - If true, auto-merge new columns into the table schema
-///
-/// # Errors
-///
-/// Returns `ConnectorError::WriteError` if the merge fails.
-#[cfg(all(test, feature = "delta-lake"))]
-#[allow(clippy::too_many_lines)]
-pub async fn merge_batches(
-    table: DeltaTable,
-    source_batch: RecordBatch,
-    key_columns: &[String],
-    writer_id: &str,
-    epoch: u64,
-    schema_evolution: bool,
-) -> Result<(DeltaTable, MergeResult), ConnectorError> {
-    use datafusion::prelude::*;
-    use deltalake::kernel::transaction::CommitProperties;
-    use deltalake::kernel::Transaction;
-    if source_batch.num_rows() == 0 {
-        return Ok((
-            table,
-            MergeResult {
-                rows_inserted: 0,
-                rows_updated: 0,
-                rows_deleted: 0,
-            },
-        ));
-    }
-
-    debug!(
-        key_columns = ?key_columns,
-        source_rows = source_batch.num_rows(),
-        "performing Delta Lake MERGE"
-    );
-
-    // Register source batch as a DataFrame.
-    let ctx = SessionContext::new();
-    let source_df = ctx.read_batch(source_batch).map_err(|e| {
-        ConnectorError::WriteError(format!("failed to create source DataFrame: {e}"))
-    })?;
-
-    // Build the join predicate: target.k1 = source.k1 AND target.k2 = source.k2 ...
-    let predicate = key_columns
-        .iter()
-        .map(|k| col(format!("target.{k}")).eq(col(format!("source.{k}"))))
-        .reduce(Expr::and)
-        .ok_or_else(|| {
-            ConnectorError::ConfigurationError("merge requires at least one key column".into())
-        })?;
-
-    // Build the merge operation.
-    #[allow(clippy::cast_possible_wrap)]
-    let epoch_i64 = epoch as i64;
-
-    let source_schema = source_df.schema().clone();
-
-    // Use a HashSet for O(1) key lookups instead of O(k) linear scan.
-    let key_set: std::collections::HashSet<&str> = key_columns.iter().map(String::as_str).collect();
-
-    let all_columns: Vec<String> = source_schema
-        .fields()
-        .iter()
-        .map(|f| f.name().clone())
-        .collect();
-
-    let non_key_columns: Vec<String> = all_columns
-        .iter()
-        .filter(|c| !key_set.contains(c.as_str()))
-        .cloned()
-        .collect();
-
-    // Move into closures (no clone needed — originals are not used after).
-    let non_key_for_update = non_key_columns;
-    let all_for_insert = all_columns;
-
-    let mut merge_builder = table
-        .merge(source_df, predicate)
-        .with_source_alias("source")
-        .with_target_alias("target")
-        .with_commit_properties(
-            CommitProperties::default()
-                .with_application_transaction(Transaction::new(writer_id, epoch_i64)),
-        )
-        .when_matched_update(|update| {
-            let mut u = update;
-            for col_name in &non_key_for_update {
-                u = u.update(col_name.as_str(), col(format!("source.{col_name}")));
-            }
-            u
-        })
-        .map_err(|e| ConnectorError::WriteError(format!("merge matched-update failed: {e}")))?
-        .when_not_matched_insert(|insert| {
-            let mut ins = insert;
-            for col_name in &all_for_insert {
-                ins = ins.set(col_name.as_str(), col(format!("source.{col_name}")));
-            }
-            ins
-        })
-        .map_err(|e| ConnectorError::WriteError(format!("merge not-matched-insert failed: {e}")))?;
-
-    if schema_evolution {
-        merge_builder = merge_builder.with_merge_schema(true);
-    }
-
-    let (table, metrics) = merge_builder
-        .await
-        .map_err(|e| ConnectorError::WriteError(format!("Delta Lake MERGE failed: {e}")))?;
-
-    let result = MergeResult {
-        rows_inserted: metrics.num_target_rows_inserted,
-        rows_updated: metrics.num_target_rows_updated,
-        rows_deleted: metrics.num_target_rows_deleted,
-    };
-
-    info!(
-        writer_id,
-        epoch,
-        rows_inserted = result.rows_inserted,
-        rows_updated = result.rows_updated,
-        rows_deleted = result.rows_deleted,
-        "Delta Lake MERGE complete"
-    );
-
-    Ok((table, result))
-}
-
-/// Performs a DELETE-by-merge for rows to be removed from the target table.
-///
-/// Matches source (delete) rows by `key_columns` and deletes matching target rows.
-///
-/// # Errors
-///
-/// Returns `ConnectorError::WriteError` if the operation fails.
-#[cfg(all(test, feature = "delta-lake"))]
-pub async fn delete_by_merge(
-    table: DeltaTable,
-    delete_batch: RecordBatch,
-    key_columns: &[String],
-    writer_id: &str,
-    epoch: u64,
-) -> Result<(DeltaTable, usize), ConnectorError> {
-    use datafusion::prelude::*;
-    use deltalake::kernel::transaction::CommitProperties;
-    use deltalake::kernel::Transaction;
-
-    if delete_batch.num_rows() == 0 {
-        return Ok((table, 0));
-    }
-
-    debug!(
-        delete_rows = delete_batch.num_rows(),
-        "performing Delta Lake delete-by-merge"
-    );
-
-    let ctx = SessionContext::new();
-    let source_df = ctx.read_batch(delete_batch).map_err(|e| {
-        ConnectorError::WriteError(format!("failed to create delete DataFrame: {e}"))
-    })?;
-
-    let predicate = key_columns
-        .iter()
-        .map(|k| col(format!("target.{k}")).eq(col(format!("source.{k}"))))
-        .reduce(Expr::and)
-        .ok_or_else(|| {
-            ConnectorError::ConfigurationError("delete requires at least one key column".into())
-        })?;
-
-    #[allow(clippy::cast_possible_wrap)]
-    let epoch_i64 = epoch as i64;
-
-    let (table, metrics) = table
-        .merge(source_df, predicate)
-        .with_source_alias("source")
-        .with_target_alias("target")
-        .with_commit_properties(
-            CommitProperties::default()
-                .with_application_transaction(Transaction::new(writer_id, epoch_i64)),
-        )
-        .when_matched_delete(|delete| delete)
-        .map_err(|e| ConnectorError::WriteError(format!("delete-merge setup failed: {e}")))?
-        .await
-        .map_err(|e| ConnectorError::WriteError(format!("Delta Lake delete-merge failed: {e}")))?;
-
-    let rows_deleted = metrics.num_target_rows_deleted;
-    info!(rows_deleted, "Delta Lake delete-by-merge complete");
-
-    Ok((table, rows_deleted))
 }
 
 /// Atomic changelog MERGE: inserts, updates, and deletes in one Delta commit.
@@ -1184,7 +1103,6 @@ pub async fn run_vacuum(
     let (table, metrics) = table
         .vacuum()
         .with_retention_period(chrono_duration)
-        .with_enforce_retention_duration(false)
         .await
         .map_err(|e| ConnectorError::Internal(format!("vacuum failed: {e}")))?;
 
@@ -1617,19 +1535,18 @@ mod tests {
         let table_path = temp_dir.path().to_str().unwrap();
 
         let schema = test_schema();
-        let table = open_or_create_table(table_path, HashMap::new(), Some(&schema))
+        let mut table = open_or_create_table(table_path, HashMap::new(), Some(&schema))
             .await
             .unwrap();
 
         // Initial version is 0.
-        let mut table_slot = Some(table);
-        let v = get_latest_version(&mut table_slot).await.unwrap();
+        let v = get_latest_version(&mut table).await.unwrap();
         assert_eq!(v, 0);
 
         // Write a batch -> version 1.
         let batch = test_batch(10);
         let (returned_table, version) = write_batches(
-            table_slot.take().unwrap(),
+            table,
             vec![batch],
             "writer",
             1,
@@ -1642,9 +1559,9 @@ mod tests {
         .await
         .unwrap();
         assert_eq!(version, 1);
-        table_slot = Some(returned_table);
+        table = returned_table;
 
-        let v = get_latest_version(&mut table_slot).await.unwrap();
+        let v = get_latest_version(&mut table).await.unwrap();
         assert_eq!(v, 1);
     }
 
@@ -1861,14 +1778,13 @@ mod tests {
         sink.close().await.unwrap();
 
         // Verify all 25 rows are in the Delta table.
-        let table = open_or_create_table(table_path, HashMap::new(), None)
+        let mut table = open_or_create_table(table_path, HashMap::new(), None)
             .await
             .unwrap();
-        let mut table_slot = Some(table);
-        let latest = get_latest_version(&mut table_slot).await.unwrap();
+        let latest = get_latest_version(&mut table).await.unwrap();
         assert!(latest >= 1, "should have at least 1 version");
 
-        let batches = read_batches_at_version(table_slot.as_mut().unwrap(), latest, 10000)
+        let batches = read_batches_at_version(&mut table, latest, 10000)
             .await
             .unwrap();
         let total_rows: usize = batches.iter().map(RecordBatch::num_rows).sum();
@@ -2069,6 +1985,8 @@ mod tests {
         );
 
         // Run vacuum to physically delete old files.
+        // Use 0s retention in tests only (run_vacuum doesn't enforce the
+        // 24h minimum — that validation is in DeltaLakeSinkConfig::validate).
         let (_table, files_deleted) = run_vacuum(table, std::time::Duration::from_secs(0))
             .await
             .unwrap();
@@ -2086,227 +2004,5 @@ mod tests {
             parquet_after.len(),
             files_deleted
         );
-    }
-
-    // ── Merge (upsert) tests ──
-
-    #[tokio::test]
-    async fn test_merge_insert_only() {
-        let temp_dir = TempDir::new().unwrap();
-        let table_path = temp_dir.path().to_str().unwrap();
-
-        // Create table with initial rows.
-        let schema = test_schema();
-        let table = open_or_create_table(table_path, HashMap::new(), Some(&schema))
-            .await
-            .unwrap();
-        let initial = test_batch(3); // ids 0, 1, 2
-        let (table, _) = write_batches(
-            table,
-            vec![initial],
-            "merge-writer",
-            1,
-            SaveMode::Append,
-            None,
-            false,
-            None,
-            false,
-        )
-        .await
-        .unwrap();
-
-        // Merge new rows (ids 10, 11) — all inserts.
-        let source = RecordBatch::try_new(
-            test_schema(),
-            vec![
-                Arc::new(Int64Array::from(vec![10, 11])),
-                Arc::new(StringArray::from(vec!["x", "y"])),
-                Arc::new(Float64Array::from(vec![10.0, 11.0])),
-            ],
-        )
-        .unwrap();
-
-        let (table, result) =
-            merge_batches(table, source, &["id".to_string()], "merge-writer", 2, false)
-                .await
-                .unwrap();
-
-        assert_eq!(result.rows_inserted, 2);
-        assert_eq!(result.rows_updated, 0);
-
-        // Verify final row count = 5.
-        let read_table = open_or_create_table(table_path, HashMap::new(), None)
-            .await
-            .unwrap();
-        let mut read_slot = Some(read_table);
-        let latest = get_latest_version(&mut read_slot).await.unwrap();
-        let batches = read_batches_at_version(read_slot.as_mut().unwrap(), latest, 10000)
-            .await
-            .unwrap();
-        let total_rows: usize = batches.iter().map(RecordBatch::num_rows).sum();
-        assert_eq!(total_rows, 5);
-
-        drop(table);
-    }
-
-    #[tokio::test]
-    async fn test_merge_update() {
-        let temp_dir = TempDir::new().unwrap();
-        let table_path = temp_dir.path().to_str().unwrap();
-
-        // Create table with initial rows.
-        let schema = test_schema();
-        let table = open_or_create_table(table_path, HashMap::new(), Some(&schema))
-            .await
-            .unwrap();
-        let initial = RecordBatch::try_new(
-            test_schema(),
-            vec![
-                Arc::new(Int64Array::from(vec![1, 2, 3])),
-                Arc::new(StringArray::from(vec!["a", "b", "c"])),
-                Arc::new(Float64Array::from(vec![1.0, 2.0, 3.0])),
-            ],
-        )
-        .unwrap();
-        let (table, _) = write_batches(
-            table,
-            vec![initial],
-            "merge-writer",
-            1,
-            SaveMode::Append,
-            None,
-            false,
-            None,
-            false,
-        )
-        .await
-        .unwrap();
-
-        // Merge with updated values for existing keys.
-        let source = RecordBatch::try_new(
-            test_schema(),
-            vec![
-                Arc::new(Int64Array::from(vec![1, 2])),
-                Arc::new(StringArray::from(vec!["a_updated", "b_updated"])),
-                Arc::new(Float64Array::from(vec![100.0, 200.0])),
-            ],
-        )
-        .unwrap();
-
-        let (table, result) =
-            merge_batches(table, source, &["id".to_string()], "merge-writer", 2, false)
-                .await
-                .unwrap();
-
-        assert_eq!(result.rows_updated, 2);
-        assert_eq!(result.rows_inserted, 0);
-
-        // Verify row count is still 3 (no new rows added).
-        let read_table = open_or_create_table(table_path, HashMap::new(), None)
-            .await
-            .unwrap();
-        let mut read_slot = Some(read_table);
-        let latest = get_latest_version(&mut read_slot).await.unwrap();
-        let batches = read_batches_at_version(read_slot.as_mut().unwrap(), latest, 10000)
-            .await
-            .unwrap();
-        let total_rows: usize = batches.iter().map(RecordBatch::num_rows).sum();
-        assert_eq!(total_rows, 3);
-
-        drop(table);
-    }
-
-    #[tokio::test]
-    async fn test_merge_delete() {
-        let temp_dir = TempDir::new().unwrap();
-        let table_path = temp_dir.path().to_str().unwrap();
-
-        // Create table with initial rows.
-        let schema = test_schema();
-        let table = open_or_create_table(table_path, HashMap::new(), Some(&schema))
-            .await
-            .unwrap();
-        let initial = RecordBatch::try_new(
-            test_schema(),
-            vec![
-                Arc::new(Int64Array::from(vec![1, 2, 3])),
-                Arc::new(StringArray::from(vec!["a", "b", "c"])),
-                Arc::new(Float64Array::from(vec![1.0, 2.0, 3.0])),
-            ],
-        )
-        .unwrap();
-        let (table, _) = write_batches(
-            table,
-            vec![initial],
-            "merge-writer",
-            1,
-            SaveMode::Append,
-            None,
-            false,
-            None,
-            false,
-        )
-        .await
-        .unwrap();
-
-        // Delete rows with id=1 and id=3.
-        let delete_batch = RecordBatch::try_new(
-            test_schema(),
-            vec![
-                Arc::new(Int64Array::from(vec![1, 3])),
-                Arc::new(StringArray::from(vec!["a", "c"])),
-                Arc::new(Float64Array::from(vec![1.0, 3.0])),
-            ],
-        )
-        .unwrap();
-
-        let (table, rows_deleted) =
-            delete_by_merge(table, delete_batch, &["id".to_string()], "merge-writer", 2)
-                .await
-                .unwrap();
-
-        assert_eq!(rows_deleted, 2);
-
-        // Verify only 1 row remains.
-        let read_table = open_or_create_table(table_path, HashMap::new(), None)
-            .await
-            .unwrap();
-        let mut read_slot = Some(read_table);
-        let latest = get_latest_version(&mut read_slot).await.unwrap();
-        let batches = read_batches_at_version(read_slot.as_mut().unwrap(), latest, 10000)
-            .await
-            .unwrap();
-        let total_rows: usize = batches.iter().map(RecordBatch::num_rows).sum();
-        assert_eq!(total_rows, 1);
-
-        drop(table);
-    }
-
-    #[tokio::test]
-    async fn test_merge_empty_batch_noop() {
-        let temp_dir = TempDir::new().unwrap();
-        let table_path = temp_dir.path().to_str().unwrap();
-
-        let schema = test_schema();
-        let table = open_or_create_table(table_path, HashMap::new(), Some(&schema))
-            .await
-            .unwrap();
-
-        // Merge with empty batch should be a no-op.
-        let empty = RecordBatch::new_empty(test_schema());
-        let (table, result) =
-            merge_batches(table, empty, &["id".to_string()], "merge-writer", 1, false)
-                .await
-                .unwrap();
-        assert_eq!(result.rows_inserted, 0);
-        assert_eq!(result.rows_updated, 0);
-
-        // Delete with empty batch should also be a no-op.
-        let empty_del = RecordBatch::new_empty(test_schema());
-        let (_table, deleted) =
-            delete_by_merge(table, empty_del, &["id".to_string()], "merge-writer", 2)
-                .await
-                .unwrap();
-        assert_eq!(deleted, 0);
     }
 }

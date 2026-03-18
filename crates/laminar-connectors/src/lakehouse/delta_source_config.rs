@@ -112,6 +112,9 @@ pub struct DeltaSourceConfig {
     /// Action to take on schema evolution between versions.
     pub schema_evolution_action: SchemaEvolutionAction,
 
+    /// Use Change Data Feed for incremental reads (requires CDF on table).
+    pub cdf_enabled: bool,
+
     /// Storage options (S3 credentials, Azure keys, etc.).
     pub storage_options: HashMap<String, String>,
 
@@ -137,6 +140,7 @@ impl Default for DeltaSourceConfig {
             read_mode: DeltaReadMode::default(),
             partition_filter: None,
             schema_evolution_action: SchemaEvolutionAction::default(),
+            cdf_enabled: false,
             storage_options: HashMap::new(),
             catalog_type: DeltaCatalogType::None,
             catalog_database: None,
@@ -196,6 +200,9 @@ impl DeltaSourceConfig {
                 cfg.partition_filter = Some(trimmed.to_string());
             }
         }
+        if let Some(v) = config.get("cdf.enabled") {
+            cfg.cdf_enabled = v.eq_ignore_ascii_case("true");
+        }
         if let Some(v) = config.get("schema.evolution.action") {
             cfg.schema_evolution_action = v.parse().map_err(|_| {
                 ConnectorError::ConfigurationError(format!(
@@ -237,6 +244,16 @@ impl DeltaSourceConfig {
         let explicit_storage = config.properties_with_prefix("storage.");
         let resolved = StorageCredentialResolver::resolve(&cfg.table_path, &explicit_storage);
         cfg.storage_options = resolved.options;
+
+        // Map LogStore configuration keys to delta-rs storage options.
+        if let Some(v) = config.get("storage.s3_locking_provider") {
+            cfg.storage_options
+                .insert("AWS_S3_LOCKING_PROVIDER".to_string(), v.to_string());
+        }
+        if let Some(v) = config.get("storage.dynamodb_table_name") {
+            cfg.storage_options
+                .insert("DELTA_DYNAMO_TABLE_NAME".to_string(), v.to_string());
+        }
 
         cfg.validate()?;
         Ok(cfg)

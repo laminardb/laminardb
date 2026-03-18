@@ -208,6 +208,16 @@ impl DeltaLakeSinkConfig {
                 .filter(|c| !c.is_empty())
                 .collect();
         }
+        if let Some(v) = config.get("compaction.target-file-size") {
+            cfg.compaction.target_file_size = v.parse().map_err(|_| {
+                ConnectorError::ConfigurationError(format!(
+                    "invalid compaction.target-file-size: '{v}'"
+                ))
+            })?;
+        } else {
+            // Default compaction target file size to the sink's target_file_size.
+            cfg.compaction.target_file_size = cfg.target_file_size;
+        }
         if let Some(v) = config.get("compaction.min-files") {
             cfg.compaction.min_files_for_compaction = v.parse().map_err(|_| {
                 ConnectorError::ConfigurationError(format!("invalid compaction.min-files: '{v}'"))
@@ -292,6 +302,16 @@ impl DeltaLakeSinkConfig {
         let resolved = StorageCredentialResolver::resolve(&cfg.table_path, &explicit_storage);
         cfg.storage_options = resolved.options;
 
+        // Map LogStore configuration keys to delta-rs storage options.
+        if let Some(v) = config.get("storage.s3_locking_provider") {
+            cfg.storage_options
+                .insert("AWS_S3_LOCKING_PROVIDER".to_string(), v.to_string());
+        }
+        if let Some(v) = config.get("storage.dynamodb_table_name") {
+            cfg.storage_options
+                .insert("DELTA_DYNAMO_TABLE_NAME".to_string(), v.to_string());
+        }
+
         cfg.validate()?;
         Ok(cfg)
     }
@@ -339,6 +359,11 @@ impl DeltaLakeSinkConfig {
         if self.compaction.check_interval.is_zero() {
             return Err(ConnectorError::ConfigurationError(
                 "compaction.check-interval.ms must be > 0".into(),
+            ));
+        }
+        if self.vacuum_retention < Duration::from_secs(24 * 3600) {
+            return Err(ConnectorError::ConfigurationError(
+                "vacuum.retention.hours must be >= 24 (Delta Lake safety minimum)".into(),
             ));
         }
 
@@ -671,6 +696,43 @@ mod tests {
         pairs.push(("checkpoint.interval", "0"));
         let config = make_config(&pairs);
         assert!(DeltaLakeSinkConfig::from_config(&config).is_err());
+    }
+
+    #[test]
+    fn test_vacuum_retention_below_24h_rejected() {
+        let mut pairs = required_pairs();
+        pairs.push(("vacuum.retention.hours", "12"));
+        let config = make_config(&pairs);
+        let result = DeltaLakeSinkConfig::from_config(&config);
+        assert!(result.is_err());
+        let err = result.unwrap_err().to_string();
+        assert!(err.contains("24"), "error: {err}");
+    }
+
+    #[test]
+    fn test_vacuum_retention_24h_accepted() {
+        let mut pairs = required_pairs();
+        pairs.push(("vacuum.retention.hours", "24"));
+        let config = make_config(&pairs);
+        assert!(DeltaLakeSinkConfig::from_config(&config).is_ok());
+    }
+
+    #[test]
+    fn test_compaction_target_file_size_from_config() {
+        let mut pairs = required_pairs();
+        pairs.push(("compaction.target-file-size", "67108864"));
+        let config = make_config(&pairs);
+        let cfg = DeltaLakeSinkConfig::from_config(&config).unwrap();
+        assert_eq!(cfg.compaction.target_file_size, 67_108_864);
+    }
+
+    #[test]
+    fn test_compaction_target_file_size_defaults_to_sink() {
+        let mut pairs = required_pairs();
+        pairs.push(("target.file.size", "33554432"));
+        let config = make_config(&pairs);
+        let cfg = DeltaLakeSinkConfig::from_config(&config).unwrap();
+        assert_eq!(cfg.compaction.target_file_size, 33_554_432);
     }
 
     #[test]
