@@ -206,6 +206,10 @@ pub enum DeltaStartupError {
     /// Failed to start HTTP API.
     #[error("HTTP startup failed: {0}")]
     HttpStartup(String),
+
+    /// Failed to register OS signal handler.
+    #[error("signal handler failed: {0}")]
+    SignalHandler(String),
 }
 
 /// Handle to a running delta-mode LaminarDB server.
@@ -247,7 +251,7 @@ impl DeltaHandle {
     pub async fn wait_for_shutdown(mut self) -> Result<(), DeltaStartupError> {
         let sig = crate::server::wait_for_termination_signal()
             .await
-            .map_err(|e| DeltaStartupError::Discovery(format!("signal handler: {e}")))?;
+            .map_err(|e| DeltaStartupError::SignalHandler(e.to_string()))?;
 
         info!(
             "Received {sig}, starting graceful delta shutdown (timeout: {:?})",
