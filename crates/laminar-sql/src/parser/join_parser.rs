@@ -60,6 +60,42 @@ impl std::fmt::Display for AsofSqlDirection {
     }
 }
 
+/// Unresolved time column refs from a BETWEEN clause.
+#[derive(Debug, Clone)]
+struct RawTimeCols {
+    expr_qualifier: Option<String>,
+    expr_col: String,
+    low_qualifier: Option<String>,
+    low_col: String,
+}
+
+/// Resolve BETWEEN time columns to `(left_time_col, right_time_col)` using
+/// table qualifiers. Falls back to positional (low=left, expr=right).
+fn resolve_time_cols(
+    raw: &RawTimeCols,
+    left_table: &str,
+    right_table: &str,
+    left_alias: Option<&str>,
+    right_alias: Option<&str>,
+) -> (String, String) {
+    let matches_left = |q: &Option<String>| -> bool {
+        q.as_ref()
+            .is_some_and(|t| t == left_table || left_alias.is_some_and(|a| a == t))
+    };
+    let matches_right = |q: &Option<String>| -> bool {
+        q.as_ref()
+            .is_some_and(|t| t == right_table || right_alias.is_some_and(|a| a == t))
+    };
+
+    if matches_right(&raw.expr_qualifier) && matches_left(&raw.low_qualifier) {
+        (raw.low_col.clone(), raw.expr_col.clone())
+    } else if matches_left(&raw.expr_qualifier) && matches_right(&raw.low_qualifier) {
+        (raw.expr_col.clone(), raw.low_col.clone())
+    } else {
+        (raw.low_col.clone(), raw.expr_col.clone())
+    }
+}
+
 /// Analysis result for a JOIN clause
 #[derive(Debug, Clone)]
 pub struct JoinAnalysis {
@@ -285,7 +321,7 @@ pub fn analyze_join(select: &Select) -> Result<Option<JoinAnalysis>, ParseError>
 
     // Check for temporal join (FOR SYSTEM_TIME AS OF)
     if let Some(version_col) = extract_temporal_version(&join.relation) {
-        let (left_key, right_key, additional, _) = analyze_join_constraint(&join.join_operator)?;
+        let (left_key, right_key, additional, _, _) = analyze_join_constraint(&join.join_operator)?;
         let mut analysis = JoinAnalysis::temporal(
             left_table,
             right_table,
@@ -301,7 +337,7 @@ pub fn analyze_join(select: &Select) -> Result<Option<JoinAnalysis>, ParseError>
     }
 
     // Analyze the join constraint
-    let (left_key, right_key, additional, time_bound) =
+    let (left_key, right_key, additional, time_bound, time_cols) =
         analyze_join_constraint(&join.join_operator)?;
 
     let mut analysis = if let Some(tb) = time_bound {
@@ -310,9 +346,21 @@ pub fn analyze_join(select: &Select) -> Result<Option<JoinAnalysis>, ParseError>
         JoinAnalysis::lookup(left_table, right_table, left_key, right_key, join_type)
     };
 
-    analysis.left_alias = left_alias;
-    analysis.right_alias = right_alias;
+    analysis.left_alias.clone_from(&left_alias);
+    analysis.right_alias.clone_from(&right_alias);
     analysis.additional_key_columns = additional;
+
+    if let Some(ref raw) = time_cols {
+        let (lt, rt) = resolve_time_cols(
+            raw,
+            &analysis.left_table,
+            &analysis.right_table,
+            left_alias.as_deref(),
+            right_alias.as_deref(),
+        );
+        analysis.left_time_column = Some(lt);
+        analysis.right_time_column = Some(rt);
+    }
 
     Ok(Some(analysis))
 }
@@ -393,22 +441,32 @@ fn map_join_operator(op: &JoinOperator) -> JoinType {
     }
 }
 
-/// Analyze join constraint to extract key columns, additional key columns, and time bound.
+/// Analyze join constraint to extract key columns, additional key columns,
+/// time bound, and optional time column pair.
 #[allow(clippy::type_complexity)]
 fn analyze_join_constraint(
     op: &JoinOperator,
-) -> Result<(String, String, Vec<(String, String)>, Option<Duration>), ParseError> {
+) -> Result<
+    (
+        String,
+        String,
+        Vec<(String, String)>,
+        Option<Duration>,
+        Option<RawTimeCols>,
+    ),
+    ParseError,
+> {
     let constraint = get_join_constraint(op)?;
 
     match constraint {
         JoinConstraint::On(expr) => {
-            let (key_pairs, time_bound) = analyze_on_expression(expr)?;
+            let (key_pairs, time_bound, time_cols) = analyze_on_expression(expr)?;
             if key_pairs.is_empty() {
-                return Ok((String::new(), String::new(), vec![], time_bound));
+                return Ok((String::new(), String::new(), vec![], time_bound, time_cols));
             }
             let (first_left, first_right) = key_pairs[0].clone();
             let additional = key_pairs[1..].to_vec();
-            Ok((first_left, first_right, additional, time_bound))
+            Ok((first_left, first_right, additional, time_bound, time_cols))
         }
         JoinConstraint::Using(cols) => {
             if cols.is_empty() {
@@ -426,7 +484,7 @@ fn analyze_join_constraint(
                     (col.clone(), col)
                 })
                 .collect();
-            Ok((first_col.clone(), first_col, additional, None))
+            Ok((first_col.clone(), first_col, additional, None, None))
         }
         JoinConstraint::Natural => Err(ParseError::StreamingError(
             "NATURAL JOIN not supported for streaming".to_string(),
@@ -461,11 +519,12 @@ fn get_join_constraint(op: &JoinOperator) -> Result<&JoinConstraint, ParseError>
     }
 }
 
-/// Analyze ON expression to extract all key column pairs and time bound.
+/// Analyze ON expression to extract all key column pairs, time bound,
+/// and optional time column pair for stream-stream joins.
 #[allow(clippy::type_complexity)]
 fn analyze_on_expression(
     expr: &Expr,
-) -> Result<(Vec<(String, String)>, Option<Duration>), ParseError> {
+) -> Result<(Vec<(String, String)>, Option<Duration>, Option<RawTimeCols>), ParseError> {
     // Handle compound expressions (AND)
     match expr {
         Expr::BinaryOp {
@@ -479,9 +538,9 @@ fn analyze_on_expression(
 
             // Combine results - collect all key pairs and time bounds
             match (left_result, right_result) {
-                (Ok((mut lk, lt)), Ok((rk, rt))) => {
+                (Ok((mut lk, lt, ltc)), Ok((rk, rt, rtc))) => {
                     lk.extend(rk);
-                    Ok((lk, lt.or(rt)))
+                    Ok((lk, lt.or(rt), ltc.or(rtc)))
                 }
                 (Ok(result), Err(_)) | (Err(_), Ok(result)) => Ok(result),
                 (Err(e), Err(_)) => Err(e),
@@ -497,7 +556,7 @@ fn analyze_on_expression(
             let right_col = extract_column_ref(right);
 
             match (left_col, right_col) {
-                (Some(l), Some(r)) => Ok((vec![(l, r)], None)),
+                (Some(l), Some(r)) => Ok((vec![(l, r)], None, None)),
                 _ => Err(ParseError::StreamingError(
                     "Cannot extract column references from equality condition".to_string(),
                 )),
@@ -505,14 +564,32 @@ fn analyze_on_expression(
         }
         // BETWEEN clause for time bound: p.ts BETWEEN o.ts AND o.ts + INTERVAL
         Expr::Between {
-            expr: _,
-            low: _,
+            expr: between_expr,
+            low,
             high,
             ..
         } => {
             // Try to extract time bound from high expression
             let time_bound = extract_time_bound_from_expr(high).ok();
-            Ok((vec![], time_bound))
+            let between_col = extract_qualified_column_ref(between_expr);
+            let low_col = extract_qualified_column_ref(low);
+            let time_cols = if let (Some((bt, bc)), Some((lt, lc))) = (between_col, low_col) {
+                Some(RawTimeCols {
+                    expr_qualifier: bt,
+                    expr_col: bc,
+                    low_qualifier: lt,
+                    low_col: lc,
+                })
+            } else {
+                if time_bound.is_some() {
+                    tracing::warn!(
+                        "BETWEEN clause has time bound but time column references \
+                         could not be extracted (expressions must be simple column refs)"
+                    );
+                }
+                None
+            };
+            Ok((vec![], time_bound, time_cols))
         }
         // Comparison operators for time bounds
         Expr::BinaryOp {
@@ -523,7 +600,7 @@ fn analyze_on_expression(
         } => {
             // Try to extract time bound from right side
             let time_bound = extract_time_bound_from_expr(right).ok();
-            Ok((vec![], time_bound))
+            Ok((vec![], time_bound, None))
         }
         _ => Err(ParseError::StreamingError(format!(
             "Unsupported join condition expression: {expr:?}"
@@ -553,6 +630,17 @@ fn extract_column_ref(expr: &Expr) -> Option<String> {
     match expr {
         Expr::Identifier(ident) => Some(ident.value.clone()),
         Expr::CompoundIdentifier(parts) => parts.last().map(|p| p.value.clone()),
+        _ => None,
+    }
+}
+
+fn extract_qualified_column_ref(expr: &Expr) -> Option<(Option<String>, String)> {
+    match expr {
+        Expr::Identifier(ident) => Some((None, ident.value.clone())),
+        Expr::CompoundIdentifier(parts) if parts.len() == 2 => {
+            Some((Some(parts[0].value.clone()), parts[1].value.clone()))
+        }
+        Expr::CompoundIdentifier(parts) => parts.last().map(|p| (None, p.value.clone())),
         _ => None,
     }
 }
@@ -902,7 +990,7 @@ pub fn analyze_joins(select: &Select) -> Result<Option<MultiJoinAnalysis>, Parse
             join_steps.push(analysis);
         } else if let Some(version_col) = extract_temporal_version(&join.relation) {
             // Temporal join: right side has FOR SYSTEM_TIME AS OF
-            let (left_key, right_key, additional, _) =
+            let (left_key, right_key, additional, _, _) =
                 analyze_join_constraint(&join.join_operator)?;
 
             let mut analysis = JoinAnalysis::temporal(
@@ -919,7 +1007,7 @@ pub fn analyze_joins(select: &Select) -> Result<Option<MultiJoinAnalysis>, Parse
             join_steps.push(analysis);
         } else {
             // Regular join (inner, left, right, full)
-            let (left_key, right_key, additional, time_bound) =
+            let (left_key, right_key, additional, time_bound, time_cols) =
                 analyze_join_constraint(&join.join_operator)?;
 
             let mut analysis = if let Some(tb) = time_bound {
@@ -941,8 +1029,20 @@ pub fn analyze_joins(select: &Select) -> Result<Option<MultiJoinAnalysis>, Parse
                 )
             };
             analysis.left_alias.clone_from(&prev_left_alias);
-            analysis.right_alias = right_alias;
+            analysis.right_alias.clone_from(&right_alias);
             analysis.additional_key_columns = additional;
+
+            if let Some(ref raw) = time_cols {
+                let (lt, rt) = resolve_time_cols(
+                    raw,
+                    &analysis.left_table,
+                    &analysis.right_table,
+                    prev_left_alias.as_deref(),
+                    right_alias.as_deref(),
+                );
+                analysis.left_time_column = Some(lt);
+                analysis.right_time_column = Some(rt);
+            }
             join_steps.push(analysis);
         }
 

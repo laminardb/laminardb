@@ -52,6 +52,7 @@ pub mod api;
 mod ddl;
 mod error;
 mod handle;
+mod interval_join;
 mod metrics;
 mod metrics_api;
 /// Thread-per-core connector pipeline.

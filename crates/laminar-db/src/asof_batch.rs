@@ -30,18 +30,33 @@ enum KeyColumn<'a> {
 }
 
 impl KeyColumn<'_> {
-    /// Computes a hash for the key at row `i`.
-    fn hash_at(&self, i: usize) -> u64 {
+    /// Returns true if the key at row `i` is null.
+    fn is_null(&self, i: usize) -> bool {
+        match self {
+            KeyColumn::Utf8(a) => a.is_null(i),
+            KeyColumn::Int64(a) => a.is_null(i),
+        }
+    }
+
+    /// Computes a hash for the key at row `i`. Returns `None` for null keys.
+    fn hash_at(&self, i: usize) -> Option<u64> {
+        if self.is_null(i) {
+            return None;
+        }
         let mut hasher = DefaultHasher::new();
         match self {
             KeyColumn::Utf8(a) => a.value(i).hash(&mut hasher),
             KeyColumn::Int64(a) => a.value(i).hash(&mut hasher),
         }
-        hasher.finish()
+        Some(hasher.finish())
     }
 
     /// Returns true if the keys at the given indices in two `KeyColumn`s are equal.
+    /// Returns false if either key is null (SQL three-valued logic).
     fn keys_equal(&self, i: usize, other: &KeyColumn<'_>, j: usize) -> bool {
+        if self.is_null(i) || other.is_null(j) {
+            return false;
+        }
         match (self, other) {
             (KeyColumn::Utf8(a), KeyColumn::Utf8(b)) => a.value(i) == b.value(j),
             (KeyColumn::Int64(a), KeyColumn::Int64(b)) => a.value(i) == b.value(j),
@@ -130,7 +145,7 @@ pub(crate) fn execute_asof_join_batch(
 
     // Build right-side index: key_hash -> BTreeMap<timestamp, row_index>
     // Keyed by hash to avoid per-row String allocations.
-    let mut right_index: FxHashMap<u64, BTreeMap<i64, usize>> =
+    let mut right_index: FxHashMap<u64, BTreeMap<i64, Vec<usize>>> =
         FxHashMap::with_capacity_and_hasher(right.num_rows(), rustc_hash::FxBuildHasher);
     let right_keys_col;
     if right.num_rows() > 0 {
@@ -139,8 +154,15 @@ pub(crate) fn execute_asof_join_batch(
         let rk = right_keys_col.as_ref().unwrap();
 
         for (i, &ts) in right_timestamps.iter().enumerate() {
-            let key_hash = rk.hash_at(i);
-            right_index.entry(key_hash).or_default().insert(ts, i);
+            if let Some(key_hash) = rk.hash_at(i) {
+                right_index
+                    .entry(key_hash)
+                    .or_default()
+                    .entry(ts)
+                    .or_default()
+                    .push(i);
+            }
+            // Null keys are skipped — they can never match per SQL three-valued logic
         }
     } else {
         right_keys_col = None;
@@ -159,15 +181,24 @@ pub(crate) fn execute_asof_join_batch(
     let mut right_indices: Vec<Option<usize>> = Vec::with_capacity(left.num_rows());
 
     for (left_idx, &left_ts) in left_timestamps.iter().enumerate() {
-        let left_hash = left_keys_col.hash_at(left_idx);
+        let Some(left_hash) = left_keys_col.hash_at(left_idx) else {
+            // Null left key: Left join emits with null right, Inner join skips
+            if config.join_type == AsofSqlJoinType::Left {
+                left_indices.push(left_idx);
+                right_indices.push(None);
+            }
+            continue;
+        };
 
         // Look up by hash, then verify key equality on candidates to handle collisions
         let matched_right = right_index.get(&left_hash).and_then(|btree| {
-            let candidate = find_match(btree, left_ts, config.direction, tolerance_ms)?;
-            // Verify key equality (collision check)
+            let candidates = find_match(btree, left_ts, config.direction, tolerance_ms)?;
+            // Iterate candidates at the best timestamp and take the first with matching key
             if let Some(ref rk) = right_keys_col {
-                if left_keys_col.keys_equal(left_idx, rk, candidate) {
-                    return Some(candidate);
+                for &candidate in &candidates {
+                    if left_keys_col.keys_equal(left_idx, rk, candidate) {
+                        return Some(candidate);
+                    }
                 }
             }
             None
@@ -199,40 +230,47 @@ pub(crate) fn execute_asof_join_batch(
     )
 }
 
-/// Find the best matching right row given direction and tolerance.
+/// Find all candidate right row indices at the best matching timestamp,
+/// given direction and tolerance.
 fn find_match(
-    btree: &BTreeMap<i64, usize>,
+    btree: &BTreeMap<i64, Vec<usize>>,
     left_ts: i64,
     direction: AsofSqlDirection,
     tolerance_ms: Option<i64>,
-) -> Option<usize> {
+) -> Option<Vec<usize>> {
     let candidate = match direction {
         AsofSqlDirection::Backward => {
             // Find most recent right row <= left_ts
             btree
                 .range(..=left_ts)
                 .next_back()
-                .map(|(&ts, &idx)| (ts, idx))
+                .map(|(&ts, indices)| (ts, indices.clone()))
         }
         AsofSqlDirection::Forward => {
             // Find earliest right row >= left_ts
-            btree.range(left_ts..).next().map(|(&ts, &idx)| (ts, idx))
+            btree
+                .range(left_ts..)
+                .next()
+                .map(|(&ts, indices)| (ts, indices.clone()))
         }
         AsofSqlDirection::Nearest => {
             // Check both backward and forward, return whichever is closer
             let backward = btree
                 .range(..=left_ts)
                 .next_back()
-                .map(|(&ts, &idx)| (ts, idx));
-            let forward = btree.range(left_ts..).next().map(|(&ts, &idx)| (ts, idx));
+                .map(|(&ts, indices)| (ts, indices.clone()));
+            let forward = btree
+                .range(left_ts..)
+                .next()
+                .map(|(&ts, indices)| (ts, indices.clone()));
             match (backward, forward) {
-                (Some((b_ts, b_idx)), Some((f_ts, f_idx))) => {
+                (Some((b_ts, b_indices)), Some((f_ts, f_indices))) => {
                     let b_diff = (left_ts - b_ts).abs();
                     let f_diff = (f_ts - left_ts).abs();
                     if b_diff <= f_diff {
-                        Some((b_ts, b_idx))
+                        Some((b_ts, b_indices))
                     } else {
-                        Some((f_ts, f_idx))
+                        Some((f_ts, f_indices))
                     }
                 }
                 (Some(b), None) => Some(b),
@@ -242,15 +280,15 @@ fn find_match(
         }
     };
 
-    candidate.and_then(|(right_ts, right_idx)| {
+    candidate.and_then(|(right_ts, indices)| {
         if let Some(tol) = tolerance_ms {
             if (left_ts - right_ts).abs() <= tol {
-                Some(right_idx)
+                Some(indices)
             } else {
                 None
             }
         } else {
-            Some(right_idx)
+            Some(indices)
         }
     })
 }
@@ -661,5 +699,132 @@ mod tests {
         assert_eq!(quote_ts.value(1), 180); // AAPL@200 → nearest is 180
         assert_eq!(quote_ts.value(2), 140); // GOOG@150 → tie, backward wins
         assert_eq!(quote_ts.value(3), 250); // AAPL@300 → only 250 nearby
+    }
+
+    #[test]
+    fn test_hash_collision_different_keys() {
+        // Two different keys at the same timestamp should both match correctly,
+        // even if they happen to share the same hash bucket.
+        let trades_schema = Arc::new(Schema::new(vec![
+            Field::new("symbol", DataType::Utf8, false),
+            Field::new("trade_ts", DataType::Int64, false),
+            Field::new("price", DataType::Float64, false),
+        ]));
+        let trades = RecordBatch::try_new(
+            trades_schema,
+            vec![
+                Arc::new(StringArray::from(vec!["AAPL", "GOOG"])),
+                Arc::new(Int64Array::from(vec![100, 100])), // same timestamp
+                Arc::new(Float64Array::from(vec![150.0, 2800.0])),
+            ],
+        )
+        .unwrap();
+
+        let quotes_schema = Arc::new(Schema::new(vec![
+            Field::new("symbol", DataType::Utf8, false),
+            Field::new("quote_ts", DataType::Int64, false),
+            Field::new("bid", DataType::Float64, false),
+        ]));
+        let quotes = RecordBatch::try_new(
+            quotes_schema,
+            vec![
+                Arc::new(StringArray::from(vec!["AAPL", "GOOG"])),
+                Arc::new(Int64Array::from(vec![100, 100])), // same timestamp as trades
+                Arc::new(Float64Array::from(vec![149.0, 2790.0])),
+            ],
+        )
+        .unwrap();
+
+        let config = backward_config();
+        let result = execute_asof_join_batch(&[trades], &[quotes], &config).unwrap();
+
+        // Both rows should match their respective keys
+        assert_eq!(result.num_rows(), 2);
+
+        let symbols = result
+            .column(0)
+            .as_any()
+            .downcast_ref::<StringArray>()
+            .unwrap();
+        let bids = result
+            .column(4)
+            .as_any()
+            .downcast_ref::<Float64Array>()
+            .unwrap();
+
+        // AAPL trade should match AAPL quote (bid=149.0)
+        assert_eq!(symbols.value(0), "AAPL");
+        assert!((bids.value(0) - 149.0).abs() < f64::EPSILON);
+
+        // GOOG trade should match GOOG quote (bid=2790.0), not be lost
+        assert_eq!(symbols.value(1), "GOOG");
+        assert!((bids.value(1) - 2790.0).abs() < f64::EPSILON);
+    }
+
+    #[test]
+    fn test_null_key_no_match() {
+        // Null-keyed rows should produce no matches
+        let trades_schema = Arc::new(Schema::new(vec![
+            Field::new("symbol", DataType::Utf8, true),
+            Field::new("trade_ts", DataType::Int64, false),
+            Field::new("price", DataType::Float64, false),
+        ]));
+        let trades = RecordBatch::try_new(
+            trades_schema,
+            vec![
+                Arc::new(StringArray::from(vec![Some("AAPL"), None])),
+                Arc::new(Int64Array::from(vec![100, 100])),
+                Arc::new(Float64Array::from(vec![150.0, 200.0])),
+            ],
+        )
+        .unwrap();
+
+        let mut config = backward_config();
+        config.join_type = AsofSqlJoinType::Inner;
+
+        let result = execute_asof_join_batch(&[trades], &[quotes_batch()], &config).unwrap();
+
+        // Only AAPL matches; null key row is skipped for inner join
+        assert_eq!(result.num_rows(), 1);
+        let symbols = result
+            .column(0)
+            .as_any()
+            .downcast_ref::<StringArray>()
+            .unwrap();
+        assert_eq!(symbols.value(0), "AAPL");
+    }
+
+    #[test]
+    fn test_null_key_left_join_emits_nulls() {
+        // Left join: null-key rows emit with null right columns
+        let trades_schema = Arc::new(Schema::new(vec![
+            Field::new("symbol", DataType::Utf8, true),
+            Field::new("trade_ts", DataType::Int64, false),
+            Field::new("price", DataType::Float64, false),
+        ]));
+        let trades = RecordBatch::try_new(
+            trades_schema,
+            vec![
+                Arc::new(StringArray::from(vec![Some("AAPL"), None])),
+                Arc::new(Int64Array::from(vec![100, 100])),
+                Arc::new(Float64Array::from(vec![150.0, 200.0])),
+            ],
+        )
+        .unwrap();
+
+        let config = backward_config(); // Left join by default
+
+        let result = execute_asof_join_batch(&[trades], &[quotes_batch()], &config).unwrap();
+
+        // Both rows emitted: AAPL matched, null-key row with null right cols
+        assert_eq!(result.num_rows(), 2);
+        let symbols = result
+            .column(0)
+            .as_any()
+            .downcast_ref::<StringArray>()
+            .unwrap();
+        assert_eq!(symbols.value(0), "AAPL");
+        assert!(result.column(0).is_null(1)); // null key row
+        assert!(result.column(3).is_null(1)); // right-side quote_ts is null
     }
 }

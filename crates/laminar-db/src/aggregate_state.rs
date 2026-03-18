@@ -307,11 +307,7 @@ pub(crate) struct EowcStateCheckpoint {
     pub windows: Vec<WindowCheckpoint>,
 }
 
-/// Serializable checkpoint for join state.
-///
-/// Currently ASOF and temporal joins are stateless per-cycle, so this is
-/// empty. The struct provides the extension point for stateful streaming
-/// joins (e.g., interval joins with buffer windows).
+/// Serializable checkpoint for join state (interval joins).
 #[derive(Clone, serde::Serialize, serde::Deserialize, Default)]
 pub(crate) struct JoinStateCheckpoint {
     /// Number of buffered left-side rows.
@@ -320,9 +316,15 @@ pub(crate) struct JoinStateCheckpoint {
     /// Number of buffered right-side rows.
     #[serde(default)]
     pub right_buffer_rows: u64,
-    /// Serialized join buffer state (opaque bytes).
+    /// Serialized left-side batches (Arrow IPC).
     #[serde(default)]
-    pub buffer_state: Option<Vec<u8>>,
+    pub left_batches: Vec<Vec<u8>>,
+    /// Serialized right-side batches (Arrow IPC).
+    #[serde(default)]
+    pub right_batches: Vec<Vec<u8>>,
+    /// Last watermark used for eviction.
+    #[serde(default)]
+    pub last_evicted_watermark: i64,
 }
 
 /// Top-level checkpoint for the entire `StreamExecutor`.
@@ -3052,7 +3054,9 @@ mod tests {
             JoinStateCheckpoint {
                 left_buffer_rows: 100,
                 right_buffer_rows: 50,
-                buffer_state: Some(vec![1, 2, 3]),
+                left_batches: vec![vec![1, 2, 3]],
+                right_batches: vec![vec![4, 5, 6]],
+                last_evicted_watermark: 42,
             },
         );
 
@@ -3073,6 +3077,8 @@ mod tests {
         let js = restored.join_states.get("enriched").unwrap();
         assert_eq!(js.left_buffer_rows, 100);
         assert_eq!(js.right_buffer_rows, 50);
-        assert_eq!(js.buffer_state, Some(vec![1, 2, 3]));
+        assert_eq!(js.left_batches, vec![vec![1, 2, 3]]);
+        assert_eq!(js.right_batches, vec![vec![4, 5, 6]]);
+        assert_eq!(js.last_evicted_watermark, 42);
     }
 }

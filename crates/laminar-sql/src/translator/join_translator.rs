@@ -14,6 +14,14 @@ pub struct StreamJoinConfig {
     pub left_key: String,
     /// Right side key column
     pub right_key: String,
+    /// Left side time column for interval matching
+    pub left_time_column: String,
+    /// Right side time column for interval matching
+    pub right_time_column: String,
+    /// Left side table name
+    pub left_table: String,
+    /// Right side table name
+    pub right_table: String,
     /// Time bound for joining (max time difference between events)
     pub time_bound: Duration,
     /// Join type
@@ -44,14 +52,6 @@ pub enum StreamJoinType {
     Right,
     /// Both sides always emitted
     Full,
-    /// Left rows with at least one match (left columns only)
-    LeftSemi,
-    /// Left rows with no match (left columns only)
-    LeftAnti,
-    /// Right rows with at least one match (right columns only)
-    RightSemi,
-    /// Right rows with no match (right columns only)
-    RightAnti,
 }
 
 /// Lookup join types
@@ -134,10 +134,6 @@ impl std::fmt::Display for StreamJoinType {
             StreamJoinType::Left => write!(f, "LEFT"),
             StreamJoinType::Right => write!(f, "RIGHT"),
             StreamJoinType::Full => write!(f, "FULL"),
-            StreamJoinType::LeftSemi => write!(f, "LEFT SEMI"),
-            StreamJoinType::LeftAnti => write!(f, "LEFT ANTI"),
-            StreamJoinType::RightSemi => write!(f, "RIGHT SEMI"),
-            StreamJoinType::RightAnti => write!(f, "RIGHT ANTI"),
         }
     }
 }
@@ -164,11 +160,15 @@ impl std::fmt::Display for StreamJoinConfig {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         write!(
             f,
-            "{} JOIN ON left.{} = right.{} (bound: {}s)",
+            "{} JOIN ON {}.{} = {}.{} (bound: {}s, time: {} ~ {})",
             self.join_type,
+            self.left_table,
             self.left_key,
+            self.right_table,
             self.right_key,
-            self.time_bound.as_secs()
+            self.time_bound.as_secs(),
+            self.left_time_column,
+            self.right_time_column,
         )
     }
 }
@@ -267,7 +267,11 @@ impl JoinOperatorConfig {
                     .asof_direction
                     .unwrap_or(AsofSqlDirection::Backward),
                 tolerance: analysis.asof_tolerance,
-                join_type: AsofSqlJoinType::Left, // ASOF is always left-style
+                join_type: if analysis.join_type == JoinType::Inner {
+                    AsofSqlJoinType::Inner
+                } else {
+                    AsofSqlJoinType::Left
+                },
             });
         }
 
@@ -285,16 +289,20 @@ impl JoinOperatorConfig {
             JoinOperatorConfig::StreamStream(StreamJoinConfig {
                 left_key: analysis.left_key_column.clone(),
                 right_key: analysis.right_key_column.clone(),
+                left_time_column: analysis.left_time_column.clone().unwrap_or_default(),
+                right_time_column: analysis.right_time_column.clone().unwrap_or_default(),
+                left_table: analysis.left_table.clone(),
+                right_table: analysis.right_table.clone(),
                 time_bound: analysis.time_bound.unwrap_or(Duration::from_secs(3600)),
                 join_type: match analysis.join_type {
-                    JoinType::Inner => StreamJoinType::Inner,
+                    JoinType::Inner
+                    | JoinType::LeftSemi
+                    | JoinType::LeftAnti
+                    | JoinType::RightSemi
+                    | JoinType::RightAnti => StreamJoinType::Inner,
                     JoinType::Left | JoinType::AsOf => StreamJoinType::Left,
                     JoinType::Right => StreamJoinType::Right,
                     JoinType::Full => StreamJoinType::Full,
-                    JoinType::LeftSemi => StreamJoinType::LeftSemi,
-                    JoinType::LeftAnti => StreamJoinType::LeftAnti,
-                    JoinType::RightSemi => StreamJoinType::RightSemi,
-                    JoinType::RightAnti => StreamJoinType::RightAnti,
                 },
             })
         }
@@ -365,6 +373,10 @@ impl StreamJoinConfig {
         Self {
             left_key,
             right_key,
+            left_time_column: String::new(),
+            right_time_column: String::new(),
+            left_table: String::new(),
+            right_table: String::new(),
             time_bound,
             join_type,
         }
@@ -790,14 +802,18 @@ mod tests {
 
     #[test]
     fn test_display_stream_join() {
-        let config = StreamJoinConfig::inner(
+        let mut config = StreamJoinConfig::inner(
             "order_id".to_string(),
             "order_id".to_string(),
             Duration::from_secs(3600),
         );
+        config.left_table = "orders".to_string();
+        config.right_table = "payments".to_string();
+        config.left_time_column = "ts".to_string();
+        config.right_time_column = "ts".to_string();
         assert_eq!(
             format!("{config}"),
-            "INNER JOIN ON left.order_id = right.order_id (bound: 3600s)"
+            "INNER JOIN ON orders.order_id = payments.order_id (bound: 3600s, time: ts ~ ts)"
         );
     }
 
@@ -835,10 +851,6 @@ mod tests {
         assert_eq!(format!("{}", StreamJoinType::Left), "LEFT");
         assert_eq!(format!("{}", StreamJoinType::Right), "RIGHT");
         assert_eq!(format!("{}", StreamJoinType::Full), "FULL");
-        assert_eq!(format!("{}", StreamJoinType::LeftSemi), "LEFT SEMI");
-        assert_eq!(format!("{}", StreamJoinType::LeftAnti), "LEFT ANTI");
-        assert_eq!(format!("{}", StreamJoinType::RightSemi), "RIGHT SEMI");
-        assert_eq!(format!("{}", StreamJoinType::RightAnti), "RIGHT ANTI");
         assert_eq!(format!("{}", LookupJoinType::Inner), "INNER");
         assert_eq!(format!("{}", LookupJoinType::Left), "LEFT");
         assert_eq!(format!("{}", AsofSqlJoinType::Inner), "INNER");
@@ -846,7 +858,10 @@ mod tests {
     }
 
     #[test]
-    fn test_from_analysis_semi_anti() {
+    fn test_from_analysis_semi_anti_maps_to_inner() {
+        // Semi/anti join types map to Inner for stream-stream joins
+        // (semi/anti semantics require per-key state tracking which is
+        // architecturally different from interval joins)
         let semi = JoinAnalysis::stream_stream(
             "a".to_string(),
             "b".to_string(),
@@ -856,7 +871,7 @@ mod tests {
             JoinType::LeftSemi,
         );
         if let JoinOperatorConfig::StreamStream(config) = JoinOperatorConfig::from_analysis(&semi) {
-            assert_eq!(config.join_type, StreamJoinType::LeftSemi);
+            assert_eq!(config.join_type, StreamJoinType::Inner);
         } else {
             panic!("Expected StreamStream config");
         }
@@ -870,7 +885,7 @@ mod tests {
             JoinType::RightAnti,
         );
         if let JoinOperatorConfig::StreamStream(config) = JoinOperatorConfig::from_analysis(&anti) {
-            assert_eq!(config.join_type, StreamJoinType::RightAnti);
+            assert_eq!(config.join_type, StreamJoinType::Inner);
         } else {
             panic!("Expected StreamStream config");
         }
