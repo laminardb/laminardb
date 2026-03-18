@@ -102,6 +102,11 @@ chitchat = "0.10"
 tokio-util = { version = "0.7", features = ["rt"] }
 xxhash-rust = { version = "0.8", features = ["xxh3"] }
 
+# gRPC (distributed RPC)
+tonic = "0.13"
+prost = "0.13"
+tonic-build = "0.13"
+
 # Testing
 criterion = { version = "0.8", features = ["html_reports"] }
 proptest = "1.10"

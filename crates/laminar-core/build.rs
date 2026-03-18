@@ -1,5 +1,7 @@
-fn main() {
-    // Proto compilation removed — delta.proto deleted in audit cleanup.
-    // If distributed gRPC services are added in the future, re-add proto
-    // compilation here with the `delta` feature gate.
+fn main() -> Result<(), Box<dyn std::error::Error>> {
+    tonic_build::configure()
+        .build_server(true)
+        .build_client(true)
+        .compile_protos(&["proto/laminar.proto"], &["proto"])?;
+    Ok(())
 }

@@ -39,3 +39,12 @@ pub mod coordination;
 
 /// Epoch-fenced partition ownership, assignment, and migration.
 pub mod partition;
+
+/// Remote state access and cross-node lookup proxying.
+pub mod remote_state;
+
+/// Partition-aware data routing for cluster mode.
+pub mod routing;
+
+/// gRPC services for inter-node communication.
+pub mod rpc;

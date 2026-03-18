@@ -72,6 +72,18 @@ mod table_cache_mode;
 mod table_provider;
 mod table_store;
 
+/// Distributed query execution for cluster mode.
+///
+/// Enable with the `delta` feature flag:
+/// ```toml
+/// laminar-db = { version = "0.1", features = ["delta"] }
+/// ```
+///
+/// This module provides fan-out query coordination, partial aggregate
+/// merging, and partition-to-node mapping for multi-node deployments.
+#[cfg(feature = "delta")]
+pub mod distributed;
+
 /// C FFI layer for LaminarDB.
 ///
 /// Enable with the `ffi` feature flag:
