@@ -164,7 +164,7 @@ mod tests {
     #[test]
     fn test_lag_computation() {
         // Simulates 3 partitions: high_watermark - (offset + 1) for each.
-        let partitions = vec![
+        let partitions = [
             (1000_i64, 900_i64), // lag = 1000 - (900 + 1) = 99
             (500, 499),          // lag = 500 - (499 + 1) = 0
             (2000, 1500),        // lag = 2000 - (1500 + 1) = 499
@@ -180,7 +180,7 @@ mod tests {
                 }
             })
             .sum();
-        assert_eq!(total_lag, 99 + 0 + 499);
+        assert_eq!(total_lag, 598);
 
         let m = KafkaSourceMetrics::new();
         m.set_lag(total_lag);
