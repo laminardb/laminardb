@@ -282,19 +282,13 @@ async fn send_with_backpressure(
             Ok(()) | Err(tokio::sync::mpsc::error::TrySendError::Full(_)) => Ok(()),
             Err(tokio::sync::mpsc::error::TrySendError::Closed(_)) => Err(()),
         },
+        // TODO(F006): implement DropOldest, Buffer, Sample properly.
         WsBackpressure::DropOldest
         | WsBackpressure::Buffer { .. }
-        | WsBackpressure::Sample { .. } => {
-            // These strategies are not yet differentiated from DropNewest.
-            // DropOldest would need drain-and-re-send, Buffer a secondary
-            // queue, and Sample a counter-based skip. All degrade to
-            // DropNewest (try_send, drop on full) for now.
-            tracing::debug!("backpressure strategy not fully implemented, using DropNewest");
-            match tx.try_send(msg) {
-                Ok(()) | Err(tokio::sync::mpsc::error::TrySendError::Full(_)) => Ok(()),
-                Err(tokio::sync::mpsc::error::TrySendError::Closed(_)) => Err(()),
-            }
-        }
+        | WsBackpressure::Sample { .. } => match tx.try_send(msg) {
+            Ok(()) | Err(tokio::sync::mpsc::error::TrySendError::Full(_)) => Ok(()),
+            Err(tokio::sync::mpsc::error::TrySendError::Closed(_)) => Err(()),
+        },
     };
     if result.is_ok() {
         data_ready.notify_one();
@@ -367,6 +361,18 @@ impl SourceConnector for WebSocketSource {
             backpressure = ?self.config.on_backpressure,
             "opening WebSocket source connector (client mode)"
         );
+
+        if matches!(
+            self.config.on_backpressure,
+            WsBackpressure::DropOldest
+                | WsBackpressure::Buffer { .. }
+                | WsBackpressure::Sample { .. }
+        ) {
+            warn!(
+                strategy = ?self.config.on_backpressure,
+                "backpressure strategy not implemented, falling back to DropNewest"
+            );
+        }
 
         // Create bounded channel between reader task and poll_batch().
         let channel_capacity = 10_000;

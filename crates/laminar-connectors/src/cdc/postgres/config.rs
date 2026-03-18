@@ -80,6 +80,9 @@ pub struct PostgresCdcConfig {
 
     /// Tables to exclude from replication.
     pub table_exclude: Vec<String>,
+
+    /// Maximum events to buffer before dropping oldest (default: 100,000).
+    pub max_buffered_events: usize,
 }
 
 impl Default for PostgresCdcConfig {
@@ -106,6 +109,7 @@ impl Default for PostgresCdcConfig {
             wal_sender_timeout: Duration::from_secs(60),
             table_include: Vec::new(),
             table_exclude: Vec::new(),
+            max_buffered_events: 100_000,
         }
     }
 }
@@ -192,6 +196,9 @@ impl PostgresCdcConfig {
         if let Some(tables) = config.get("table.exclude") {
             cfg.table_exclude = tables.split(',').map(|s| s.trim().to_string()).collect();
         }
+        if let Some(max) = config.get_parsed::<usize>("max.buffered.events")? {
+            cfg.max_buffered_events = max;
+        }
 
         cfg.validate()?;
         Ok(cfg)
@@ -210,6 +217,11 @@ impl PostgresCdcConfig {
         if self.max_poll_records == 0 {
             return Err(ConnectorError::ConfigurationError(
                 "max.poll.records must be > 0".to_string(),
+            ));
+        }
+        if self.max_buffered_events == 0 {
+            return Err(ConnectorError::ConfigurationError(
+                "max.buffered.events must be > 0".to_string(),
             ));
         }
         // VerifyCa/VerifyFull require a CA certificate path
