@@ -123,12 +123,27 @@ pub(crate) fn execute_asof_join_batch(
         return Ok(RecordBatch::new_empty(schema));
     }
 
+    // No-key fast path: both sides are timestamp-sorted, use O(n+m) merge-scan
+    // instead of building a `FxHashMap`+`BTreeMap` index.
+    if config.key_column.is_empty() {
+        return execute_asof_merge_scan(left_batches, right_batches, config);
+    }
+
+    execute_asof_keyed(left_batches, right_batches, config)
+}
+
+/// Keyed ASOF join: builds a `FxHashMap`+`BTreeMap` index on the right side,
+/// then does per-row `BTreeMap` lookups for each left row.
+fn execute_asof_keyed(
+    left_batches: &[RecordBatch],
+    right_batches: &[RecordBatch],
+    config: &AsofJoinTranslatorConfig,
+) -> Result<RecordBatch, DbError> {
     let left_schema = left_batches[0].schema();
     let left = concat_batches(&left_schema, left_batches)
         .map_err(|e| DbError::query_pipeline_arrow("ASOF join (left)", &e))?;
 
     let right_schema = if right_batches.is_empty() {
-        // Build a schema with the same structure but no rows
         Arc::new(Schema::empty())
     } else {
         right_batches[0].schema()
@@ -144,7 +159,6 @@ pub(crate) fn execute_asof_join_batch(
     let output_schema = build_output_schema(&left_schema, &right_schema, config);
 
     // Build right-side index: key_hash -> BTreeMap<timestamp, row_index>
-    // Keyed by hash to avoid per-row String allocations.
     let mut right_index: FxHashMap<u64, BTreeMap<i64, Vec<usize>>> =
         FxHashMap::with_capacity_and_hasher(right.num_rows(), rustc_hash::FxBuildHasher);
     let right_keys_col;
@@ -162,13 +176,11 @@ pub(crate) fn execute_asof_join_batch(
                     .or_default()
                     .push(i);
             }
-            // Null keys are skipped — they can never match per SQL three-valued logic
         }
     } else {
         right_keys_col = None;
     }
 
-    // Extract left key and timestamp columns (zero-alloc borrow)
     let left_keys_col = extract_key_column(&left, &config.key_column)?;
     let left_timestamps = extract_column_as_timestamps(&left, &config.left_time_column)?;
 
@@ -176,13 +188,11 @@ pub(crate) fn execute_asof_join_batch(
         .tolerance
         .map(|d| i64::try_from(d.as_millis()).unwrap_or(i64::MAX));
 
-    // For each left row, find matching right row
     let mut left_indices: Vec<usize> = Vec::with_capacity(left.num_rows());
     let mut right_indices: Vec<Option<usize>> = Vec::with_capacity(left.num_rows());
 
     for (left_idx, &left_ts) in left_timestamps.iter().enumerate() {
         let Some(left_hash) = left_keys_col.hash_at(left_idx) else {
-            // Null left key: Left join emits with null right, Inner join skips
             if config.join_type == AsofSqlJoinType::Left {
                 left_indices.push(left_idx);
                 right_indices.push(None);
@@ -190,10 +200,8 @@ pub(crate) fn execute_asof_join_batch(
             continue;
         };
 
-        // Look up by hash, then verify key equality on candidates to handle collisions
         let matched_right = right_index.get(&left_hash).and_then(|btree| {
             let candidates = find_match(btree, left_ts, config.direction, tolerance_ms)?;
-            // Iterate candidates at the best timestamp and take the first with matching key
             if let Some(ref rk) = right_keys_col {
                 for &candidate in &candidates {
                     if left_keys_col.keys_equal(left_idx, rk, candidate) {
@@ -204,22 +212,15 @@ pub(crate) fn execute_asof_join_batch(
             None
         });
 
-        match (&config.join_type, matched_right) {
-            (_, Some(right_idx)) => {
-                left_indices.push(left_idx);
-                right_indices.push(Some(right_idx));
-            }
-            (AsofSqlJoinType::Left, None) => {
-                left_indices.push(left_idx);
-                right_indices.push(None);
-            }
-            (AsofSqlJoinType::Inner, None) => {
-                // Skip unmatched rows for inner join
-            }
-        }
+        push_match(
+            left_idx,
+            matched_right,
+            config.join_type,
+            &mut left_indices,
+            &mut right_indices,
+        );
     }
 
-    // Build output columns
     build_output_batch(
         &left,
         &right,
@@ -228,6 +229,180 @@ pub(crate) fn execute_asof_join_batch(
         &output_schema,
         config,
     )
+}
+
+/// No-key ASOF join via merge-scan.
+///
+/// Both sides are assumed timestamp-sorted (guaranteed by watermark ordering).
+/// Performs a single O(n+m) pass with two cursors instead of building an index.
+/// Avoids `FxHashMap`, `BTreeMap`, and per-row hash computation entirely.
+fn execute_asof_merge_scan(
+    left_batches: &[RecordBatch],
+    right_batches: &[RecordBatch],
+    config: &AsofJoinTranslatorConfig,
+) -> Result<RecordBatch, DbError> {
+    let left_schema = left_batches[0].schema();
+    let left = concat_batches(&left_schema, left_batches)
+        .map_err(|e| DbError::query_pipeline_arrow("ASOF merge-scan (left)", &e))?;
+
+    let right_schema = if right_batches.is_empty() {
+        Arc::new(Schema::empty())
+    } else {
+        right_batches[0].schema()
+    };
+
+    let right = if right_batches.is_empty() {
+        RecordBatch::new_empty(right_schema.clone())
+    } else {
+        concat_batches(&right_schema, right_batches)
+            .map_err(|e| DbError::query_pipeline_arrow("ASOF merge-scan (right)", &e))?
+    };
+
+    let output_schema = build_output_schema(&left_schema, &right_schema, config);
+
+    let left_timestamps = extract_column_as_timestamps(&left, &config.left_time_column)?;
+    let right_timestamps = if right.num_rows() > 0 {
+        extract_column_as_timestamps(&right, &config.right_time_column)?
+    } else {
+        Vec::new()
+    };
+
+    let tolerance_ms = config
+        .tolerance
+        .map(|d| i64::try_from(d.as_millis()).unwrap_or(i64::MAX));
+
+    let left_len = left.num_rows();
+
+    let (left_indices, right_indices) = merge_scan_indices(
+        &left_timestamps,
+        &right_timestamps,
+        left_len,
+        right.num_rows(),
+        config.direction,
+        config.join_type,
+        tolerance_ms,
+    );
+
+    build_output_batch(
+        &left,
+        &right,
+        &left_indices,
+        &right_indices,
+        &output_schema,
+        config,
+    )
+}
+
+/// Run the merge-scan cursor over sorted left/right timestamps, producing matched indices.
+#[allow(clippy::too_many_arguments)]
+fn merge_scan_indices(
+    left_timestamps: &[i64],
+    right_timestamps: &[i64],
+    left_len: usize,
+    right_len: usize,
+    direction: AsofSqlDirection,
+    join_type: AsofSqlJoinType,
+    tolerance_ms: Option<i64>,
+) -> (Vec<usize>, Vec<Option<usize>>) {
+    let mut left_indices: Vec<usize> = Vec::with_capacity(left_len);
+    let mut right_indices: Vec<Option<usize>> = Vec::with_capacity(left_len);
+    let mut right_cursor: usize = 0;
+
+    for (left_idx, &left_ts) in left_timestamps.iter().enumerate() {
+        // Advance cursor so that right_cursor points to the first right row > left_ts.
+        // For Forward direction, advance only past rows strictly < left_ts.
+        let stop_inclusive = direction != AsofSqlDirection::Forward;
+        while right_cursor < right_len
+            && if stop_inclusive {
+                right_timestamps[right_cursor] <= left_ts
+            } else {
+                right_timestamps[right_cursor] < left_ts
+            }
+        {
+            right_cursor += 1;
+        }
+
+        let matched = match direction {
+            AsofSqlDirection::Backward => {
+                // Last right row with ts <= left_ts is at right_cursor - 1.
+                (right_cursor > 0)
+                    .then(|| right_cursor - 1)
+                    .filter(|&c| apply_tolerance(left_ts, right_timestamps[c], tolerance_ms))
+            }
+            AsofSqlDirection::Forward => {
+                // First right row with ts >= left_ts is at right_cursor.
+                (right_cursor < right_len)
+                    .then_some(right_cursor)
+                    .filter(|&c| apply_tolerance(left_ts, right_timestamps[c], tolerance_ms))
+            }
+            AsofSqlDirection::Nearest => {
+                let backward = (right_cursor > 0).then(|| {
+                    (
+                        right_cursor - 1,
+                        (left_ts - right_timestamps[right_cursor - 1]).abs(),
+                    )
+                });
+                let forward = (right_cursor < right_len).then(|| {
+                    (
+                        right_cursor,
+                        (right_timestamps[right_cursor] - left_ts).abs(),
+                    )
+                });
+                let nearest = match (backward, forward) {
+                    (Some((bi, bd)), Some((fi, fd))) => {
+                        if bd <= fd {
+                            Some(bi)
+                        } else {
+                            Some(fi)
+                        }
+                    }
+                    (Some((bi, _)), None) => Some(bi),
+                    (None, Some((fi, _))) => Some(fi),
+                    (None, None) => None,
+                };
+                nearest.filter(|&idx| apply_tolerance(left_ts, right_timestamps[idx], tolerance_ms))
+            }
+        };
+
+        push_match(
+            left_idx,
+            matched,
+            join_type,
+            &mut left_indices,
+            &mut right_indices,
+        );
+    }
+
+    (left_indices, right_indices)
+}
+
+/// Check if a candidate right timestamp is within the tolerance of the left timestamp.
+fn apply_tolerance(left_ts: i64, right_ts: i64, tolerance_ms: Option<i64>) -> bool {
+    match tolerance_ms {
+        Some(tol) => (left_ts - right_ts).abs() <= tol,
+        None => true,
+    }
+}
+
+/// Push a left/right index pair into the output vectors, respecting join type.
+fn push_match(
+    left_idx: usize,
+    matched_right: Option<usize>,
+    join_type: AsofSqlJoinType,
+    left_indices: &mut Vec<usize>,
+    right_indices: &mut Vec<Option<usize>>,
+) {
+    match (join_type, matched_right) {
+        (_, Some(right_idx)) => {
+            left_indices.push(left_idx);
+            right_indices.push(Some(right_idx));
+        }
+        (AsofSqlJoinType::Left, None) => {
+            left_indices.push(left_idx);
+            right_indices.push(None);
+        }
+        (AsofSqlJoinType::Inner, None) => {}
+    }
 }
 
 /// Find all candidate right row indices at the best matching timestamp,
@@ -826,5 +1001,221 @@ mod tests {
         assert_eq!(symbols.value(0), "AAPL");
         assert!(result.column(0).is_null(1)); // null key row
         assert!(result.column(3).is_null(1)); // right-side quote_ts is null
+    }
+
+    // --- No-key merge-scan tests ---
+
+    /// Helper: build a no-key config (empty key_column triggers merge-scan path).
+    fn no_key_backward_config() -> AsofJoinTranslatorConfig {
+        AsofJoinTranslatorConfig {
+            left_table: "events".to_string(),
+            right_table: "metrics".to_string(),
+            key_column: String::new(),
+            left_time_column: "event_ts".to_string(),
+            right_time_column: "metric_ts".to_string(),
+            direction: AsofSqlDirection::Backward,
+            tolerance: None,
+            join_type: AsofSqlJoinType::Left,
+        }
+    }
+
+    fn events_batch() -> RecordBatch {
+        let schema = Arc::new(Schema::new(vec![
+            Field::new("event_ts", DataType::Int64, false),
+            Field::new("value", DataType::Float64, false),
+        ]));
+        RecordBatch::try_new(
+            schema,
+            vec![
+                Arc::new(Int64Array::from(vec![100, 200, 300, 400])),
+                Arc::new(Float64Array::from(vec![1.0, 2.0, 3.0, 4.0])),
+            ],
+        )
+        .unwrap()
+    }
+
+    fn metrics_batch() -> RecordBatch {
+        let schema = Arc::new(Schema::new(vec![
+            Field::new("metric_ts", DataType::Int64, false),
+            Field::new("cpu", DataType::Float64, false),
+        ]));
+        RecordBatch::try_new(
+            schema,
+            vec![
+                Arc::new(Int64Array::from(vec![90, 150, 250, 350])),
+                Arc::new(Float64Array::from(vec![10.0, 20.0, 30.0, 40.0])),
+            ],
+        )
+        .unwrap()
+    }
+
+    #[test]
+    fn test_merge_scan_backward_basic() {
+        let config = no_key_backward_config();
+        let result =
+            execute_asof_join_batch(&[events_batch()], &[metrics_batch()], &config).unwrap();
+
+        // 4 left rows, 4 output rows (Left join)
+        assert_eq!(result.num_rows(), 4);
+        // Output: event_ts, value, metric_ts, cpu
+        assert_eq!(result.num_columns(), 4);
+
+        let metric_ts = result
+            .column(2)
+            .as_any()
+            .downcast_ref::<Int64Array>()
+            .unwrap();
+        // event@100: backward match is metric@90 (90 <= 100)
+        assert_eq!(metric_ts.value(0), 90);
+        // event@200: backward match is metric@150 (150 <= 200)
+        assert_eq!(metric_ts.value(1), 150);
+        // event@300: backward match is metric@250 (250 <= 300)
+        assert_eq!(metric_ts.value(2), 250);
+        // event@400: backward match is metric@350 (350 <= 400)
+        assert_eq!(metric_ts.value(3), 350);
+    }
+
+    #[test]
+    fn test_merge_scan_forward() {
+        let mut config = no_key_backward_config();
+        config.direction = AsofSqlDirection::Forward;
+
+        let result =
+            execute_asof_join_batch(&[events_batch()], &[metrics_batch()], &config).unwrap();
+
+        assert_eq!(result.num_rows(), 4);
+
+        let metric_ts = result
+            .column(2)
+            .as_any()
+            .downcast_ref::<Int64Array>()
+            .unwrap();
+        // right = [90, 150, 250, 350]
+        // event@100: forward = first right with ts >= 100 -> 150
+        assert_eq!(metric_ts.value(0), 150);
+        // event@200: forward = first right with ts >= 200 -> 250
+        assert_eq!(metric_ts.value(1), 250);
+        // event@300: forward = first right with ts >= 300 -> 350
+        assert_eq!(metric_ts.value(2), 350);
+        // event@400: no right ts >= 400 -> null (Left join)
+        assert!(result.column(2).is_null(3));
+    }
+
+    #[test]
+    fn test_merge_scan_nearest() {
+        let mut config = no_key_backward_config();
+        config.direction = AsofSqlDirection::Nearest;
+
+        let result =
+            execute_asof_join_batch(&[events_batch()], &[metrics_batch()], &config).unwrap();
+
+        assert_eq!(result.num_rows(), 4);
+
+        let metric_ts = result
+            .column(2)
+            .as_any()
+            .downcast_ref::<Int64Array>()
+            .unwrap();
+        // event@100: backward=90(d=10) forward=150(d=50) -> 90
+        assert_eq!(metric_ts.value(0), 90);
+        // event@200: backward=150(d=50) forward=250(d=50) -> tie, backward wins -> 150
+        assert_eq!(metric_ts.value(1), 150);
+        // event@300: backward=250(d=50) forward=350(d=50) -> tie, backward wins -> 250
+        assert_eq!(metric_ts.value(2), 250);
+        // event@400: backward=350(d=50) forward=none -> 350
+        assert_eq!(metric_ts.value(3), 350);
+    }
+
+    #[test]
+    fn test_merge_scan_with_tolerance() {
+        let mut config = no_key_backward_config();
+        config.tolerance = Some(Duration::from_millis(15));
+
+        let result =
+            execute_asof_join_batch(&[events_batch()], &[metrics_batch()], &config).unwrap();
+
+        assert_eq!(result.num_rows(), 4);
+        // event@100 -> metric@90 (diff=10, within 15ms)
+        let metric_ts = result
+            .column(2)
+            .as_any()
+            .downcast_ref::<Int64Array>()
+            .unwrap();
+        assert_eq!(metric_ts.value(0), 90);
+        // event@200 -> metric@150 (diff=50, exceeds 15ms) -> null
+        assert!(result.column(2).is_null(1));
+        // event@300 -> metric@250 (diff=50, exceeds 15ms) -> null
+        assert!(result.column(2).is_null(2));
+        // event@400 -> metric@350 (diff=50, exceeds 15ms) -> null
+        assert!(result.column(2).is_null(3));
+    }
+
+    #[test]
+    fn test_merge_scan_inner_join() {
+        let mut config = no_key_backward_config();
+        config.join_type = AsofSqlJoinType::Inner;
+        config.tolerance = Some(Duration::from_millis(15));
+
+        let result =
+            execute_asof_join_batch(&[events_batch()], &[metrics_batch()], &config).unwrap();
+
+        // Only event@100 matches (diff=10 within tolerance=15)
+        assert_eq!(result.num_rows(), 1);
+        let event_ts = result
+            .column(0)
+            .as_any()
+            .downcast_ref::<Int64Array>()
+            .unwrap();
+        assert_eq!(event_ts.value(0), 100);
+    }
+
+    #[test]
+    fn test_merge_scan_empty_right() {
+        let config = no_key_backward_config();
+        let result = execute_asof_join_batch(&[events_batch()], &[], &config).unwrap();
+
+        // Left join: all left rows emitted; right side is empty schema so
+        // output only has left columns (event_ts, value).
+        assert_eq!(result.num_rows(), 4);
+        assert_eq!(result.num_columns(), 2);
+    }
+
+    #[test]
+    fn test_merge_scan_multiple_batches() {
+        // Verify merge-scan works across multiple input batches
+        let schema = Arc::new(Schema::new(vec![
+            Field::new("event_ts", DataType::Int64, false),
+            Field::new("value", DataType::Float64, false),
+        ]));
+        let left1 = RecordBatch::try_new(
+            schema.clone(),
+            vec![
+                Arc::new(Int64Array::from(vec![100, 200])),
+                Arc::new(Float64Array::from(vec![1.0, 2.0])),
+            ],
+        )
+        .unwrap();
+        let left2 = RecordBatch::try_new(
+            schema,
+            vec![
+                Arc::new(Int64Array::from(vec![300, 400])),
+                Arc::new(Float64Array::from(vec![3.0, 4.0])),
+            ],
+        )
+        .unwrap();
+
+        let config = no_key_backward_config();
+        let result = execute_asof_join_batch(&[left1, left2], &[metrics_batch()], &config).unwrap();
+
+        assert_eq!(result.num_rows(), 4);
+        let metric_ts = result
+            .column(2)
+            .as_any()
+            .downcast_ref::<Int64Array>()
+            .unwrap();
+        assert_eq!(metric_ts.value(0), 90);
+        assert_eq!(metric_ts.value(1), 150);
+        assert_eq!(metric_ts.value(2), 250);
+        assert_eq!(metric_ts.value(3), 350);
     }
 }
