@@ -373,12 +373,15 @@ pub async fn get_latest_version(table: &mut DeltaTable) -> Result<i64, Connector
 /// # Errors
 ///
 /// Returns `ConnectorError::ReadError` if the version cannot be loaded or scanned.
+///
+/// Returns `(batches, fully_consumed)` — `fully_consumed` is `false` when
+/// `max_records` truncated the result and more rows remain.
 #[cfg(feature = "delta-lake")]
 pub async fn read_batches_at_version(
     table: &mut DeltaTable,
     version: i64,
     max_records: usize,
-) -> Result<Vec<RecordBatch>, ConnectorError> {
+) -> Result<(Vec<RecordBatch>, bool), ConnectorError> {
     use datafusion::prelude::SessionContext;
     use tokio_stream::StreamExt;
 
@@ -437,14 +440,17 @@ pub async fn read_batches_at_version(
         }
     }
 
+    let fully_consumed = total_rows < max_records;
+
     debug!(
         version,
         num_batches = batches.len(),
         total_rows,
+        fully_consumed,
         "Delta Lake: scanned version"
     );
 
-    Ok(batches)
+    Ok((batches, fully_consumed))
 }
 
 /// Reads only the rows added in a specific Delta Lake version.
@@ -458,6 +464,8 @@ pub async fn read_batches_at_version(
 /// # Errors
 ///
 /// Returns `ConnectorError::ReadError` if the version cannot be loaded or read.
+///
+/// Returns `(batches, fully_consumed)` — see [`read_batches_at_version`].
 #[cfg(feature = "delta-lake")]
 #[allow(clippy::too_many_lines)]
 pub async fn read_version_diff(
@@ -465,7 +473,7 @@ pub async fn read_version_diff(
     version: i64,
     max_records: usize,
     partition_filter: Option<&str>,
-) -> Result<Vec<RecordBatch>, ConnectorError> {
+) -> Result<(Vec<RecordBatch>, bool), ConnectorError> {
     // Maximum file size (256 MB) for direct in-memory Parquet reads.
     // Files larger than this fall back to DataFusion's streaming scan.
     const MAX_DIRECT_READ_BYTES: u64 = 256 * 1024 * 1024;
@@ -524,7 +532,7 @@ pub async fn read_version_diff(
             num_removed = removed_paths.len(),
             "Delta Lake: no net-new add actions in version"
         );
-        return Ok(Vec::new());
+        return Ok((Vec::new(), true));
     }
 
     debug!(
@@ -621,15 +629,18 @@ pub async fn read_version_diff(
         }
     }
 
+    let fully_consumed = total_rows < max_records;
+
     debug!(
         version,
         num_batches = batches.len(),
         total_rows,
+        fully_consumed,
         num_added_files = added_paths.len(),
         "Delta Lake: read version diff"
     );
 
-    Ok(batches)
+    Ok((batches, fully_consumed))
 }
 
 /// Reads a file from `object_store` with retry (3x, exponential backoff).
@@ -1618,14 +1629,14 @@ mod tests {
         let mut read_table = open_or_create_table(table_path, HashMap::new(), None)
             .await
             .unwrap();
-        let batches = read_batches_at_version(&mut read_table, 1, 10000)
+        let (batches, _) = read_batches_at_version(&mut read_table, 1, 10000)
             .await
             .unwrap();
         let total_rows: usize = batches.iter().map(RecordBatch::num_rows).sum();
         assert_eq!(total_rows, 50);
 
         // Read version 2 — should get 80 rows (cumulative).
-        let batches = read_batches_at_version(&mut read_table, 2, 10000)
+        let (batches, _) = read_batches_at_version(&mut read_table, 2, 10000)
             .await
             .unwrap();
         let total_rows: usize = batches.iter().map(RecordBatch::num_rows).sum();
@@ -1791,7 +1802,7 @@ mod tests {
         let latest = get_latest_version(&mut table).await.unwrap();
         assert!(latest >= 1, "should have at least 1 version");
 
-        let batches = read_batches_at_version(&mut table, latest, 10000)
+        let (batches, _) = read_batches_at_version(&mut table, latest, 10000)
             .await
             .unwrap();
         let total_rows: usize = batches.iter().map(RecordBatch::num_rows).sum();
@@ -1852,7 +1863,7 @@ mod tests {
         let mut read_table = open_or_create_table(table_path, HashMap::new(), None)
             .await
             .unwrap();
-        let batches = read_batches_at_version(&mut read_table, 2, 10000)
+        let (batches, _) = read_batches_at_version(&mut read_table, 2, 10000)
             .await
             .unwrap();
         let total_rows: usize = batches.iter().map(RecordBatch::num_rows).sum();
@@ -1936,7 +1947,7 @@ mod tests {
         let mut read_table = open_or_create_table(table_path, HashMap::new(), None)
             .await
             .unwrap();
-        let batches = read_batches_at_version(&mut read_table, 2, 10000)
+        let (batches, _) = read_batches_at_version(&mut read_table, 2, 10000)
             .await
             .unwrap();
         let total_rows: usize = batches.iter().map(RecordBatch::num_rows).sum();

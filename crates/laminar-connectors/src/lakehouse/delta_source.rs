@@ -105,9 +105,10 @@ pub struct DeltaSource {
     /// hammering every source-adapter tick (10ms).
     #[cfg(feature = "delta-lake")]
     last_version_check: Option<Instant>,
-    /// Projection indices for schema-evolution "warn" mode. `None` = no projection.
+    /// Per-field projection: `Some(idx)` = take column idx from new batch,
+    /// `None` = emit null column. Aligned with `self.schema.fields()`.
     #[cfg(feature = "delta-lake")]
-    projection_indices: Option<Vec<usize>>,
+    projection_indices: Option<Vec<Option<usize>>>,
 }
 
 impl DeltaSource {
@@ -358,16 +359,21 @@ impl SourceConnector for DeltaSource {
                 }
             }
 
-            let batches = if use_snapshot_fallback {
-                let b = delta_io::read_batches_at_version(
+            // On gap fallback, override target_version so inflight_version
+            // tracks the snapshot version, not the missing one.
+            let target_version = if use_snapshot_fallback {
+                self.known_latest_version
+            } else {
+                target_version
+            };
+
+            let (batches, fully_consumed) = if use_snapshot_fallback {
+                delta_io::read_batches_at_version(
                     table,
-                    self.known_latest_version,
+                    target_version,
                     max_records,
                 )
-                .await?;
-                // Jump current_version so we don't re-attempt missing versions.
-                self.current_version = self.known_latest_version;
-                b
+                .await?
             } else if self.config.cdf_enabled
                 && self.config.read_mode == DeltaReadMode::Incremental
                 && target_version > 0
@@ -394,7 +400,8 @@ impl SourceConnector for DeltaSource {
                         mapped.push(mapped_batch);
                     }
                 }
-                mapped
+                // CDF reads are version-bounded, always fully consumed.
+                (mapped, true)
             } else {
                 match self.config.read_mode {
                     DeltaReadMode::Snapshot => {
@@ -436,15 +443,13 @@ impl SourceConnector for DeltaSource {
                                         new_fields = ?new_schema.fields().iter().map(|f| f.name().as_str()).collect::<Vec<_>>(),
                                         "Delta Lake source: schema evolved, projecting to original"
                                     );
-                                    // Compute projection indices: map original fields
-                                    // to their positions in the new schema. New columns
-                                    // are silently dropped until pipeline restart.
-                                    let mut indices = Vec::with_capacity(existing.fields().len());
-                                    for field in existing.fields() {
-                                        if let Ok(idx) = new_schema.index_of(field.name()) {
-                                            indices.push(idx);
-                                        }
-                                    }
+                                    // Map each original field to its index in the new
+                                    // schema, or None if the field was removed.
+                                    let indices: Vec<Option<usize>> = existing
+                                        .fields()
+                                        .iter()
+                                        .map(|f| new_schema.index_of(f.name()).ok())
+                                        .collect();
                                     self.projection_indices = Some(indices);
                                     // Do NOT update self.schema — keep the original
                                     // for downstream stability.
@@ -471,7 +476,17 @@ impl SourceConnector for DeltaSource {
                 }
                 // Apply schema projection if schema evolution was detected.
                 let batch = if let Some(ref indices) = self.projection_indices {
-                    batch.project(indices).map_err(|e| {
+                    let original_schema = self.schema.as_ref().unwrap();
+                    let num_rows = batch.num_rows();
+                    let columns: Vec<Arc<dyn arrow_array::Array>> = indices
+                        .iter()
+                        .zip(original_schema.fields())
+                        .map(|(idx, field)| match idx {
+                            Some(i) => batch.column(*i).clone(),
+                            None => arrow_array::new_null_array(field.data_type(), num_rows),
+                        })
+                        .collect();
+                    RecordBatch::try_new(original_schema.clone(), columns).map_err(|e| {
                         ConnectorError::ReadError(format!(
                             "failed to project batch to original schema: {e}"
                         ))
@@ -482,11 +497,14 @@ impl SourceConnector for DeltaSource {
                 self.pending_batches.push_back(batch);
             }
 
-            if self.pending_batches.is_empty() {
-                // Version had no data rows (e.g. metadata-only commit).
-                // Safe to advance immediately.
+            if !fully_consumed {
+                // max_records truncated the version — don't advance.
+                // Next poll_batch will re-read the same version.
+            } else if self.pending_batches.is_empty() {
+                // Version fully consumed with no data rows (metadata-only).
                 self.current_version = target_version;
             } else {
+                // Version fully consumed, batches buffered. Advance after drain.
                 self.inflight_version = Some(target_version);
             }
 
