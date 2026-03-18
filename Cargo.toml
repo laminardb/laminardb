@@ -7,9 +7,9 @@ members = [
     "crates/laminar-server",
     "crates/laminar-derive",
     "crates/laminar-db",
-    "examples/demo",
-    "examples/binance-ws",
-    "examples/microstructure",
+]
+exclude = [
+    "examples/*",
 ]
 resolver = "2"
 
