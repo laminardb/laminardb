@@ -350,25 +350,24 @@ JOIN rates FOR SYSTEM_TIME AS OF o.order_time AS r
             </div>
 
             <div class="tab-panel" id="qs-server">
-              <pre><code class="language-bash"># Install the standalone server
+              <pre><code class="language-bash"># Option 1: Download pre-compiled binary (fastest)
+# Linux x86_64
+curl -LO https://github.com/laminardb/laminardb/releases/latest/download/laminardb-server-x86_64-unknown-linux-gnu-v0.18.8.tar.gz
+tar xzf laminardb-server-*.tar.gz
+
+# macOS Apple Silicon
+curl -LO https://github.com/laminardb/laminardb/releases/latest/download/laminardb-server-aarch64-apple-darwin-v0.18.8.tar.gz
+
+# All platforms: github.com/laminardb/laminardb/releases
+
+# Option 2: Build from source
 cargo install laminar-server
 
-# Run with a config file (see examples/ directory)
-laminardb --config laminardb.toml
-
-# Or run with Docker
+# Option 3: Docker
 docker compose up
 
-# Docker Compose includes:
-#   - laminardb (port 8080)
-#   - Redpanda/Kafka (port 19092)
-#   - Schema Registry (port 18081)
-#   - Prometheus + Grafana (optional)
-
-# Example configs in the repo:
-#   examples/laminardb.toml          — full config
-#   examples/laminardb-minimal.toml  — minimal
-#   examples/laminardb-delta.toml    — Delta Lake</code></pre>
+# Run
+./laminardb --config laminardb.toml</code></pre>
             </div>
 
             <div class="tab-panel" id="qs-kafka">
@@ -527,9 +526,9 @@ CREATE SINK lake INTO DELTA_LAKE (
           <div class="deploy-card">
             <h3>Standalone Server</h3>
             <p>
-              Run the <code>laminardb</code> binary with a TOML config.
-              REST API on port 8080. Connects to Kafka, databases, Delta Lake.
-              Docker image and Helm chart available.
+              <a href="https://github.com/laminardb/laminardb/releases/latest" target="_blank" rel="noopener">Download pre-compiled binaries</a>
+              for Linux (x86_64, aarch64, musl), macOS (x86_64, Apple Silicon), and Windows.
+              Or <code>cargo install laminar-server</code>. Docker image and Helm chart available.
             </p>
             <p>Use for: CDC pipelines, stream-to-lakehouse, event routing.</p>
           </div>
