@@ -270,7 +270,9 @@ impl KafkaSource {
             return;
         }
 
-        let consumer = self.consumer.take().unwrap();
+        // Wrap in Arc so the blocking watermark task can share the consumer
+        // with the async reader loop. librdkafka handles are thread-safe.
+        let consumer = Arc::new(self.consumer.take().unwrap());
         let (msg_tx, msg_rx) = tokio::sync::mpsc::channel(self.config.reader_channel_capacity);
         let (shutdown_tx, mut shutdown_rx) = tokio::sync::watch::channel(false);
         let (offset_tx, offset_rx) = tokio::sync::watch::channel(TopicPartitionList::new());
@@ -327,29 +329,32 @@ impl KafkaSource {
                         continue;
                     },
                     _ = hwm_timer.tick() => {
-                        // Query high watermarks for seen partitions.
-                        let mut watermarks = Vec::with_capacity(seen_partitions.len());
-                        for (topic, partition) in &seen_partitions {
-                            match consumer.fetch_watermarks(
-                                topic,
-                                *partition,
-                                std::time::Duration::from_secs(5),
-                            ) {
-                                Ok((_low, high)) => {
-                                    watermarks.push((Arc::clone(topic), *partition, high));
+                        // fetch_watermarks is a blocking FFI call — run on the
+                        // blocking pool to avoid stalling the async reader.
+                        if !seen_partitions.is_empty() {
+                            let partitions: Vec<_> = seen_partitions.iter().cloned().collect();
+                            let c = Arc::clone(&consumer);
+                            let watermarks = tokio::task::spawn_blocking(move || {
+                                let mut results = Vec::with_capacity(partitions.len());
+                                for (topic, partition) in &partitions {
+                                    match c.fetch_watermarks(
+                                        topic,
+                                        *partition,
+                                        std::time::Duration::from_secs(5),
+                                    ) {
+                                        Ok((_low, high)) => {
+                                            results.push((Arc::clone(topic), *partition, high));
+                                        }
+                                        Err(_) => {}
+                                    }
                                 }
-                                Err(e) => {
-                                    debug!(
-                                        topic = %topic,
-                                        partition,
-                                        error = %e,
-                                        "failed to fetch watermarks"
-                                    );
-                                }
+                                results
+                            })
+                            .await
+                            .unwrap_or_default();
+                            if !watermarks.is_empty() {
+                                let _ = hwm_tx.send(watermarks);
                             }
-                        }
-                        if !watermarks.is_empty() {
-                            let _ = hwm_tx.send(watermarks);
                         }
                         continue;
                     },
@@ -976,22 +981,22 @@ impl SourceConnector for KafkaSource {
     }
 
     fn metrics(&self) -> ConnectorMetrics {
-        // Compute consumer lag from high watermarks and current offsets.
+        // Compute consumer lag from high watermarks, filtered to currently
+        // assigned partitions so revoked partitions don't contribute stale lag.
         if let Some(ref hwm_rx) = self.high_watermarks_rx {
             let watermarks = hwm_rx.borrow();
-            if !watermarks.is_empty() {
-                let mut total_lag: u64 = 0;
-                for (topic, partition, high_watermark) in watermarks.iter() {
-                    let current_offset = self.offsets.get(topic, *partition).unwrap_or(-1);
-                    // lag = high_watermark - (current_offset + 1), clamped to 0
+            let mut total_lag: u64 = 0;
+            for (topic, partition, high_watermark) in watermarks.iter() {
+                // Only count partitions we still track offsets for (assigned).
+                if let Some(current_offset) = self.offsets.get(topic, *partition) {
                     let lag = high_watermark.saturating_sub(current_offset + 1);
                     #[allow(clippy::cast_sign_loss)]
                     if lag > 0 {
                         total_lag += lag as u64;
                     }
                 }
-                self.metrics.set_lag(total_lag);
             }
+            self.metrics.set_lag(total_lag);
         }
         self.metrics.to_connector_metrics()
     }
