@@ -612,19 +612,14 @@ impl CheckpointCoordinator {
                     }
                     Err(e) => {
                         // Rollback all sinks that already pre-committed.
+                        // rollback_epoch is fire-and-forget (channel send), so we
+                        // log each rollback attempt for operator visibility.
                         for s in &pre_committed {
-                            if let Err(rollback_err) = s.handle.rollback_epoch(epoch).await {
-                                error!(
-                                    sink = %s.name, epoch,
-                                    error = %rollback_err,
-                                    "sink rollback failed during pre-commit rollback —                                      sink may be in an inconsistent state"
-                                );
-                            } else {
-                                debug!(
-                                    sink = %s.name, epoch,
-                                    "rolled back pre-committed sink after peer failure"
-                                );
-                            }
+                            s.handle.rollback_epoch(epoch).await;
+                            warn!(
+                                sink = %s.name, epoch,
+                                "rolling back pre-committed sink after peer failure"
+                            );
                         }
                         return Err(DbError::Checkpoint(format!(
                             "sink '{}' pre-commit failed: {e}",
