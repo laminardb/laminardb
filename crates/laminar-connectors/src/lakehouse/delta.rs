@@ -248,7 +248,7 @@ impl DeltaLakeSink {
                 if self.config.delivery_guarantee == DeliveryGuarantee::ExactlyOnce {
                     self.last_committed_epoch = recovery.last_committed_epoch;
                 }
-                if recovery.had_incomplete_transactions {
+                if recovery.orphans_detected > 0 {
                     warn!(
                         orphans_detected = recovery.orphans_detected,
                         orphans_deleted = recovery.orphans_deleted,
@@ -950,15 +950,20 @@ impl SinkConnector for DeltaLakeSink {
         // is enabled; breaking changes (type changes, removals) always error.
         if let Some(ref table_schema) = self.schema {
             let batch_target = Self::target_schema(&batch.schema(), self.config.write_mode);
-            if table_schema.fields() != batch_target.fields() {
+            // Short-circuit: successive batches from the same source share the
+            // same Arc<Schema>, so ptr_eq avoids per-batch field comparison.
+            if !Arc::ptr_eq(table_schema, &batch_target)
+                && table_schema.fields() != batch_target.fields()
+            {
                 super::delta_schema_evolution::check_schema_compatibility(
                     table_schema,
                     &batch_target,
                     self.config.schema_evolution,
                 )?;
                 // If we get here, the change is additive and evolution is enabled.
-                // Update our schema to the merged superset so subsequent batches
-                // are validated against the new schema.
+                // Update our schema to the batch's target schema (which is a
+                // superset for additive-only changes) so subsequent batches are
+                // validated against the new schema.
                 if self.config.schema_evolution {
                     self.schema = Some(batch_target);
                 }

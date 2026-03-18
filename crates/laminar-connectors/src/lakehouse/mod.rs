@@ -41,6 +41,7 @@ pub mod delta_config;
 #[cfg(feature = "delta-lake")]
 pub mod delta_io;
 pub mod delta_metrics;
+#[cfg(feature = "delta-lake")]
 pub mod delta_recovery;
 pub mod delta_schema_evolution;
 pub mod delta_source;
@@ -59,6 +60,7 @@ pub use delta_config::{
     CompactionConfig, DeliveryGuarantee, DeltaCatalogType, DeltaLakeSinkConfig, DeltaWriteMode,
 };
 pub use delta_metrics::DeltaLakeSinkMetrics;
+#[cfg(feature = "delta-lake")]
 pub use delta_recovery::RecoveryResult;
 pub use delta_schema_evolution::{check_schema_compatibility, validate_schema_evolution};
 pub use delta_source::DeltaSource;

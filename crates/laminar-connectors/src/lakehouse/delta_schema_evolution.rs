@@ -78,14 +78,10 @@ pub fn validate_schema_evolution(
     let mut changes = Vec::new();
     let mut breaking_reasons = Vec::new();
 
-    // Build lookup maps.
+    // Build lookup for table fields only. For the "column removed" check we
+    // use batch_schema.field_with_name() inline — a linear scan on <50 fields
+    // is faster than building a second HashMap.
     let table_fields: std::collections::HashMap<&str, &arrow_schema::Field> = table_schema
-        .fields()
-        .iter()
-        .map(|f| (f.name().as_str(), f.as_ref()))
-        .collect();
-
-    let batch_fields: std::collections::HashMap<&str, &arrow_schema::Field> = batch_schema
         .fields()
         .iter()
         .map(|f| (f.name().as_str(), f.as_ref()))
@@ -112,7 +108,7 @@ pub fn validate_schema_evolution(
 
     // Detect removed columns (in table but not in batch).
     for field in table_schema.fields() {
-        if !batch_fields.contains_key(field.name().as_str()) {
+        if batch_schema.field_with_name(field.name()).is_err() {
             changes.push(DeltaSchemaChange::ColumnRemoved {
                 name: field.name().clone(),
             });
