@@ -461,6 +461,7 @@ impl MmapStateStore {
     pub fn compact(&mut self) -> Result<(), StateError> {
         if self.index.is_empty() {
             self.storage.reset();
+            self.storage.truncate_to_used()?;
             self.deletes_since_compact = 0;
             return Ok(());
         }
