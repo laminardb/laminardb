@@ -3,6 +3,7 @@
 use std::time::Duration;
 
 use laminar_connectors::connector::DeliveryGuarantee;
+use laminar_core::checkpoint::UnalignedCheckpointConfig;
 
 /// Configuration for the event-driven connector pipeline.
 #[derive(Debug, Clone)]
@@ -70,6 +71,14 @@ pub struct PipelineConfig {
     /// table polling) after SQL execution (nanoseconds). When exceeded,
     /// low-priority tasks (table polling) are skipped. Default: 5ms.
     pub background_budget_ns: u64,
+
+    /// Unaligned checkpoint configuration.
+    ///
+    /// When `Some`, the streaming coordinator can fall back to unaligned
+    /// checkpoints when barrier alignment times out, instead of cancelling
+    /// the checkpoint entirely. Requires [`checkpoint_interval`](Self::checkpoint_interval)
+    /// to be set.
+    pub unaligned_checkpoint: Option<UnalignedCheckpointConfig>,
 }
 
 impl Default for PipelineConfig {
@@ -86,6 +95,7 @@ impl Default for PipelineConfig {
             drain_budget_ns: 1_000_000,      // 1ms
             query_budget_ns: 8_000_000,      // 8ms
             background_budget_ns: 5_000_000, // 5ms
+            unaligned_checkpoint: None,
         }
     }
 }
