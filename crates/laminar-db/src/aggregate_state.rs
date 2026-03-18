@@ -985,9 +985,6 @@ impl IncrementalAggState {
         &mut self,
         sv_key: &[ScalarValue],
     ) -> Result<arrow::row::OwnedRow, DbError> {
-        if sv_key.is_empty() {
-            return Ok(self.empty_row_sentinel.clone());
-        }
         if sv_key.len() != self.group_types.len() {
             return Err(DbError::Pipeline(format!(
                 "group key width mismatch in checkpoint: expected {}, got {}",
@@ -995,17 +992,20 @@ impl IncrementalAggState {
                 sv_key.len()
             )));
         }
+        if sv_key.is_empty() {
+            return Ok(self.empty_row_sentinel.clone());
+        }
         let arrays: Vec<ArrayRef> = sv_key
             .iter()
-            .enumerate()
-            .map(|(i, sv)| {
+            .zip(self.group_types.iter())
+            .map(|(sv, group_type)| {
                 let arr = sv
                     .to_array()
                     .map_err(|e| DbError::Pipeline(format!("scalar→array: {e}")))?;
-                if arr.data_type() == &self.group_types[i] {
+                if arr.data_type() == group_type {
                     Ok(arr)
                 } else {
-                    arrow::compute::cast(&arr, &self.group_types[i])
+                    arrow::compute::cast(&arr, group_type)
                         .map_err(|e| DbError::Pipeline(format!("key cast: {e}")))
                 }
             })
