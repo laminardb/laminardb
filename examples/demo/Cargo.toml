@@ -28,16 +28,16 @@ laminar-derive = { path = "../../crates/laminar-derive", version = "0.18.9" }
 laminar-core = { path = "../../crates/laminar-core", version = "0.18.9" }
 
 # Arrow
-arrow = { workspace = true }
-arrow-array = { workspace = true }
-arrow-schema = { workspace = true }
+arrow = "57.2"
+arrow-array = "57.2"
+arrow-schema = "57.2"
 
 # Async
-tokio = { workspace = true, features = ["full"] }
+tokio = { version = "1.50", features = ["full"] }
 
 # Utilities
-chrono = { workspace = true }
-rand = { workspace = true }
+chrono = "0.4"
+rand = "0.10"
 
 # TUI
 ratatui = { version = "0.30", features = ["all-widgets"] }

@@ -91,4 +91,47 @@ document.addEventListener('DOMContentLoaded', () => {
     });
   });
 
+  // --- Dynamic version badge ---
+  // Fetches latest release tag from GitHub API, caches in sessionStorage.
+  // Elements with data-version="tag" get "vX.Y.Z", data-version="bare" get "X.Y.Z".
+  const CACHE_KEY = 'laminardb_latest_version';
+  const CACHE_TTL = 3600000; // 1 hour
+
+  function applyVersion(tag) {
+    const bare = tag.replace(/^v/, '');
+    document.querySelectorAll('[data-version]').forEach((el) => {
+      const fmt = el.getAttribute('data-version');
+      el.textContent = fmt === 'bare' ? bare : tag;
+    });
+    // Update structured data if present
+    const ld = document.querySelector('script[type="application/ld+json"]');
+    if (ld) {
+      try {
+        const data = JSON.parse(ld.textContent);
+        data.softwareVersion = bare;
+        ld.textContent = JSON.stringify(data, null, 2);
+      } catch (_) { /* ignore */ }
+    }
+  }
+
+  const cached = sessionStorage.getItem(CACHE_KEY);
+  if (cached) {
+    try {
+      const { tag, ts } = JSON.parse(cached);
+      if (Date.now() - ts < CACHE_TTL) {
+        applyVersion(tag);
+      }
+    } catch (_) { /* ignore stale cache */ }
+  }
+
+  fetch('https://api.github.com/repos/laminardb/laminardb/releases/latest')
+    .then((r) => r.ok ? r.json() : Promise.reject())
+    .then((data) => {
+      if (data.tag_name) {
+        applyVersion(data.tag_name);
+        sessionStorage.setItem(CACHE_KEY, JSON.stringify({ tag: data.tag_name, ts: Date.now() }));
+      }
+    })
+    .catch(() => { /* keep hardcoded fallback */ });
+
 });

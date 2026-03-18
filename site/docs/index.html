@@ -1,0 +1,1498 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+  <meta charset="UTF-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1.0">
+  <title>LaminarDB Docs — Configuration Reference</title>
+  <meta name="description" content="Complete configuration reference for LaminarDB server, connectors, checkpoints, and deployment. Every field verified against source code.">
+  <meta name="robots" content="index, follow">
+  <meta name="theme-color" content="#0a0a0a">
+  <link rel="canonical" href="https://laminardb.io/docs/">
+
+  <link rel="icon" type="image/svg+xml" href="../favicon.svg">
+  <link rel="preconnect" href="https://fonts.googleapis.com">
+  <link rel="preconnect" href="https://fonts.gstatic.com" crossorigin>
+  <link href="https://fonts.googleapis.com/css2?family=JetBrains+Mono:wght@400;500;700&display=swap" rel="stylesheet">
+  <link href="https://cdnjs.cloudflare.com/ajax/libs/prism/1.29.0/themes/prism-tomorrow.min.css" rel="stylesheet">
+  <link rel="stylesheet" href="../css/style.css">
+
+  <style>
+    /* --- Docs-specific layout --- */
+    .docs-layout {
+      display: grid;
+      grid-template-columns: 220px 1fr;
+      gap: 3rem;
+      max-width: 1120px;
+      margin: 0 auto;
+      padding: 2rem 24px 5rem;
+    }
+
+    .docs-sidebar {
+      position: sticky;
+      top: 72px;
+      max-height: calc(100vh - 88px);
+      overflow-y: auto;
+      font-size: 0.8rem;
+      padding-right: 1rem;
+      scrollbar-width: thin;
+      scrollbar-color: var(--border-bright) transparent;
+    }
+
+    .docs-sidebar::-webkit-scrollbar { width: 4px; }
+    .docs-sidebar::-webkit-scrollbar-thumb { background: var(--border-bright); border-radius: 2px; }
+
+    .docs-sidebar h4 {
+      font-family: var(--font-mono);
+      font-size: 0.65rem;
+      text-transform: uppercase;
+      letter-spacing: 0.08em;
+      color: var(--text-dim);
+      margin: 1.25rem 0 0.4rem;
+    }
+
+    .docs-sidebar h4:first-child { margin-top: 0; }
+
+    .docs-sidebar a {
+      display: block;
+      padding: 3px 0 3px 10px;
+      color: var(--text-secondary);
+      border-left: 2px solid transparent;
+      text-decoration: none;
+      transition: color 0.12s, border-color 0.12s;
+      line-height: 1.5;
+    }
+
+    .docs-sidebar a:hover {
+      color: var(--text);
+      border-left-color: var(--border-bright);
+    }
+
+    .docs-sidebar a.active {
+      color: var(--accent-bright);
+      border-left-color: var(--accent);
+    }
+
+    .docs-content {
+      min-width: 0;
+    }
+
+    .docs-content h2 {
+      font-size: 1.35rem;
+      margin: 3.5rem 0 1rem;
+      padding-top: 1rem;
+      border-top: 1px solid var(--border);
+    }
+
+    .docs-content h2:first-child {
+      margin-top: 0;
+      border-top: none;
+      padding-top: 0;
+    }
+
+    .docs-content h3 {
+      font-size: 1rem;
+      margin: 2rem 0 0.75rem;
+      color: var(--text);
+    }
+
+    .docs-content h4 {
+      font-size: 0.85rem;
+      margin: 1.5rem 0 0.5rem;
+      color: var(--text-secondary);
+    }
+
+    .docs-content p {
+      font-size: 0.88rem;
+      line-height: 1.7;
+      max-width: 680px;
+    }
+
+    /* --- Config tables --- */
+    .config-table {
+      width: 100%;
+      border-collapse: collapse;
+      font-size: 0.8rem;
+      margin: 1rem 0 1.75rem;
+    }
+
+    .config-table th {
+      text-align: left;
+      font-family: var(--font-mono);
+      font-weight: 500;
+      font-size: 0.7rem;
+      color: var(--text-dim);
+      text-transform: uppercase;
+      letter-spacing: 0.05em;
+      padding: 6px 10px;
+      border-bottom: 1px solid var(--border-bright);
+      white-space: nowrap;
+    }
+
+    .config-table td {
+      padding: 7px 10px;
+      border-bottom: 1px solid var(--border);
+      vertical-align: top;
+      line-height: 1.5;
+    }
+
+    .config-table tr:last-child td { border-bottom: none; }
+
+    .config-table .field-name {
+      font-family: var(--font-mono);
+      font-size: 0.78rem;
+      color: var(--accent-bright);
+      white-space: nowrap;
+    }
+
+    .config-table .field-type {
+      font-family: var(--font-mono);
+      font-size: 0.72rem;
+      color: var(--text-dim);
+      white-space: nowrap;
+    }
+
+    .config-table .field-default {
+      font-family: var(--font-mono);
+      font-size: 0.72rem;
+      color: var(--green);
+    }
+
+    .config-table .field-required {
+      font-family: var(--font-mono);
+      font-size: 0.68rem;
+      color: var(--yellow);
+      border: 1px solid rgba(234, 179, 8, 0.3);
+      padding: 0 4px;
+      border-radius: 2px;
+    }
+
+    /* --- TOML code blocks --- */
+    .toml-block {
+      background: var(--bg-code);
+      border: 1px solid var(--border);
+      border-radius: 6px;
+      overflow: hidden;
+      margin: 1rem 0 1.75rem;
+    }
+
+    .toml-header {
+      display: flex;
+      align-items: center;
+      justify-content: space-between;
+      padding: 0 12px;
+      height: 32px;
+      border-bottom: 1px solid var(--border);
+      background: rgba(17, 17, 17, 0.5);
+      font-family: var(--font-mono);
+      font-size: 0.7rem;
+      color: var(--text-dim);
+    }
+
+    .toml-block pre {
+      margin: 0;
+      padding: 14px 16px;
+      overflow-x: auto;
+    }
+
+    .toml-block code {
+      font-size: 0.78rem;
+      line-height: 1.55;
+      color: var(--text-secondary);
+    }
+
+    /* --- Source file badges --- */
+    .source-ref {
+      display: inline-flex;
+      align-items: center;
+      gap: 4px;
+      font-family: var(--font-mono);
+      font-size: 0.68rem;
+      color: var(--text-dim);
+      background: var(--bg-surface);
+      border: 1px solid var(--border);
+      padding: 2px 8px;
+      border-radius: 3px;
+      margin: 0.25rem 0 1rem;
+    }
+
+    .source-ref a {
+      color: var(--text-dim);
+      text-decoration: underline;
+      text-underline-offset: 2px;
+    }
+
+    /* --- Connector cards --- */
+    .connector-grid {
+      display: grid;
+      grid-template-columns: repeat(auto-fill, minmax(220px, 1fr));
+      gap: 1rem;
+      margin: 1.5rem 0;
+    }
+
+    .connector-card {
+      border: 1px solid var(--border);
+      border-radius: 6px;
+      padding: 1rem;
+      transition: border-color 0.15s;
+    }
+
+    .connector-card:hover {
+      border-color: var(--border-bright);
+    }
+
+    .connector-card h4 {
+      margin: 0 0 0.25rem;
+      font-size: 0.9rem;
+    }
+
+    .connector-card a {
+      text-decoration: none;
+      color: inherit;
+    }
+
+    .connector-card .direction {
+      font-family: var(--font-mono);
+      font-size: 0.7rem;
+      color: var(--text-dim);
+    }
+
+    .connector-card .feature {
+      font-family: var(--font-mono);
+      font-size: 0.7rem;
+      color: var(--accent);
+      background: var(--accent-dim);
+      padding: 1px 6px;
+      border-radius: 3px;
+      margin-top: 0.5rem;
+      display: inline-block;
+    }
+
+    /* --- REST endpoint rows --- */
+    .endpoint-row {
+      display: flex;
+      align-items: baseline;
+      gap: 10px;
+      padding: 6px 0;
+      border-bottom: 1px solid var(--border);
+      font-size: 0.82rem;
+    }
+
+    .endpoint-row:last-child { border-bottom: none; }
+
+    .endpoint-method {
+      font-family: var(--font-mono);
+      font-size: 0.72rem;
+      font-weight: 500;
+      padding: 1px 6px;
+      border-radius: 3px;
+      min-width: 48px;
+      text-align: center;
+    }
+
+    .method-get {
+      color: var(--green);
+      background: var(--green-dim);
+    }
+
+    .method-post {
+      color: var(--accent-bright);
+      background: var(--accent-dim);
+    }
+
+    .endpoint-path {
+      font-family: var(--font-mono);
+      font-size: 0.78rem;
+      color: var(--text);
+    }
+
+    .endpoint-desc {
+      color: var(--text-dim);
+      font-size: 0.78rem;
+    }
+
+    /* --- Responsive --- */
+    @media (max-width: 768px) {
+      .docs-layout {
+        grid-template-columns: 1fr;
+        padding: 1.5rem 16px 3rem;
+      }
+
+      .docs-sidebar {
+        position: static;
+        max-height: none;
+        border-bottom: 1px solid var(--border);
+        padding-bottom: 1rem;
+        margin-bottom: 1rem;
+      }
+
+      .config-table { font-size: 0.75rem; }
+    }
+  </style>
+</head>
+<body>
+
+  <!-- Nav -->
+  <header class="nav" role="banner">
+    <div class="nav-inner">
+      <a href="../" class="nav-brand" aria-label="LaminarDB home">
+        <svg viewBox="0 0 40 40" width="28" height="28" aria-hidden="true">
+          <defs><linearGradient id="logo-g" x1="0" y1="0" x2="1" y2="1"><stop offset="0%" stop-color="#00b4d8"/><stop offset="100%" stop-color="#38cbeb"/></linearGradient></defs>
+          <path d="M4 8 C12 8,14 6,22 6 C30 6,32 10,36 10" stroke="url(#logo-g)" stroke-width="2.5" fill="none" stroke-linecap="round" opacity=".4"/>
+          <path d="M2 14 C10 14,14 11,22 11 C30 11,32 15,38 15" stroke="url(#logo-g)" stroke-width="2.5" fill="none" stroke-linecap="round" opacity=".6"/>
+          <path d="M0 20 C8 20,14 17,22 17 C30 17,32 21,40 21" stroke="url(#logo-g)" stroke-width="3" fill="none" stroke-linecap="round"/>
+          <path d="M2 26 C10 26,14 23,22 23 C30 23,32 27,38 27" stroke="url(#logo-g)" stroke-width="2.5" fill="none" stroke-linecap="round" opacity=".6"/>
+          <path d="M4 32 C12 32,14 30,22 30 C30 30,32 34,36 34" stroke="url(#logo-g)" stroke-width="2.5" fill="none" stroke-linecap="round" opacity=".4"/>
+        </svg>
+        <span>LaminarDB</span>
+        <span class="version-badge" data-version="tag">v0.18.9</span>
+      </a>
+
+      <nav class="nav-links" aria-label="Main navigation">
+        <a href="../#quick-start">Quick Start</a>
+        <a href="./">Docs</a>
+        <a href="https://laminardb.io/api/laminar_db/" target="_blank" rel="noopener">API</a>
+        <a href="https://github.com/laminardb/laminardb" class="github-link" target="_blank" rel="noopener">
+          <svg viewBox="0 0 16 16"><path d="M8 0C3.58 0 0 3.58 0 8c0 3.54 2.29 6.53 5.47 7.59.4.07.55-.17.55-.38 0-.19-.01-.82-.01-1.49-2.01.37-2.53-.49-2.69-.94-.09-.23-.48-.94-.82-1.13-.28-.15-.68-.52-.01-.53.63-.01 1.08.58 1.23.82.72 1.21 1.87.87 2.33.66.07-.52.28-.87.51-1.07-1.78-.2-3.64-.89-3.64-3.95 0-.87.31-1.59.82-2.15-.08-.2-.36-1.02.08-2.12 0 0 .67-.21 2.2.82.64-.18 1.32-.27 2-.27.68 0 1.36.09 2 .27 1.53-1.04 2.2-.82 2.2-.82.44 1.1.16 1.92.08 2.12.51.56.82 1.27.82 2.15 0 3.07-1.87 3.75-3.65 3.95.29.25.54.73.54 1.48 0 1.07-.01 1.93-.01 2.2 0 .21.15.46.55.38A8.013 8.013 0 0016 8c0-4.42-3.58-8-8-8z"/></svg>
+          GitHub
+        </a>
+      </nav>
+    </div>
+  </header>
+
+  <div class="docs-layout">
+
+    <!-- Sidebar -->
+    <aside class="docs-sidebar" aria-label="Documentation navigation">
+      <h4>Server</h4>
+      <a href="#server-config">Server Config</a>
+      <a href="#state-config">State Store</a>
+      <a href="#checkpoint-config">Checkpoints</a>
+      <a href="#rest-api">REST API</a>
+
+      <h4>Pipelines</h4>
+      <a href="#sources">Sources</a>
+      <a href="#pipelines">Pipelines</a>
+      <a href="#sinks">Sinks</a>
+      <a href="#lookups">Lookup Tables</a>
+
+      <h4>Connectors</h4>
+      <a href="#kafka-source">Kafka Source</a>
+      <a href="#kafka-sink">Kafka Sink</a>
+      <a href="#postgres-cdc">PostgreSQL CDC</a>
+      <a href="#mysql-cdc">MySQL CDC</a>
+      <a href="#postgres-sink">PostgreSQL Sink</a>
+      <a href="#delta-source">Delta Lake Source</a>
+      <a href="#delta-sink">Delta Lake Sink</a>
+      <a href="#websocket-source">WebSocket Source</a>
+      <a href="#websocket-sink">WebSocket Sink</a>
+      <a href="#file-source">File Source</a>
+      <a href="#file-sink">File Sink</a>
+
+      <h4>Joins</h4>
+      <a href="#join-interval">Interval Join</a>
+      <a href="#join-asof">ASOF Join</a>
+      <a href="#join-temporal">Temporal Join</a>
+      <a href="#join-lookup">Lookup Join</a>
+
+      <h4>Advanced</h4>
+      <a href="#env-vars">Environment Variables</a>
+      <a href="#tiering">S3 Tiering</a>
+      <a href="#delivery">Delivery Guarantees</a>
+    </aside>
+
+    <!-- Content -->
+    <main class="docs-content">
+
+      <h1 style="font-size: 1.75rem; margin-bottom: 0.5rem;">Configuration Reference</h1>
+      <p style="color: var(--text-dim); margin-bottom: 2rem;">
+        Every field on this page is verified against
+        <a href="https://github.com/laminardb/laminardb/blob/main/crates/laminar-server/src/config.rs" target="_blank" rel="noopener">config.rs</a>.
+        TOML examples use exact field names from the Rust structs.
+      </p>
+
+      <!-- ============================================================ -->
+      <!-- SERVER CONFIG -->
+      <!-- ============================================================ -->
+
+      <h2 id="server-config">[server]</h2>
+      <div class="source-ref">Source: <a href="https://github.com/laminardb/laminardb/blob/main/crates/laminar-server/src/config.rs" target="_blank" rel="noopener">crates/laminar-server/src/config.rs:201</a></div>
+
+      <table class="config-table">
+        <thead><tr><th>Field</th><th>Type</th><th>Default</th><th>Description</th></tr></thead>
+        <tbody>
+          <tr>
+            <td class="field-name">mode</td>
+            <td class="field-type">String</td>
+            <td class="field-default">"embedded"</td>
+            <td>"embedded" (single-node) or "delta" (multi-node, coming soon)</td>
+          </tr>
+          <tr>
+            <td class="field-name">bind</td>
+            <td class="field-type">String</td>
+            <td class="field-default">"127.0.0.1:8080"</td>
+            <td>HTTP API bind address</td>
+          </tr>
+          <tr>
+            <td class="field-name">workers</td>
+            <td class="field-type">usize</td>
+            <td class="field-default">0</td>
+            <td>Worker threads. 0 = auto-detect CPU count.</td>
+          </tr>
+          <tr>
+            <td class="field-name">log_level</td>
+            <td class="field-type">String</td>
+            <td class="field-default">"info"</td>
+            <td>trace, debug, info, warn, error</td>
+          </tr>
+        </tbody>
+      </table>
+
+      <div class="toml-block">
+        <div class="toml-header">laminardb.toml</div>
+        <pre><code class="language-toml">[server]
+mode = "embedded"
+bind = "0.0.0.0:8080"
+workers = 4
+log_level = "info"</code></pre>
+      </div>
+
+      <!-- STATE -->
+      <h2 id="state-config">[state]</h2>
+      <div class="source-ref">Source: <a href="https://github.com/laminardb/laminardb/blob/main/crates/laminar-server/src/config.rs" target="_blank" rel="noopener">config.rs:233</a></div>
+
+      <table class="config-table">
+        <thead><tr><th>Field</th><th>Type</th><th>Default</th><th>Description</th></tr></thead>
+        <tbody>
+          <tr>
+            <td class="field-name">backend</td>
+            <td class="field-type">String</td>
+            <td class="field-default">"memory"</td>
+            <td>"memory", "mmap", or "disaggregated"</td>
+          </tr>
+          <tr>
+            <td class="field-name">path</td>
+            <td class="field-type">String</td>
+            <td class="field-default">"./data/state"</td>
+            <td>Persistent state directory (mmap backend)</td>
+          </tr>
+        </tbody>
+      </table>
+
+      <!-- CHECKPOINT -->
+      <h2 id="checkpoint-config">[checkpoint]</h2>
+      <div class="source-ref">Source: <a href="https://github.com/laminardb/laminardb/blob/main/crates/laminar-server/src/config.rs" target="_blank" rel="noopener">config.rs:255</a></div>
+
+      <table class="config-table">
+        <thead><tr><th>Field</th><th>Type</th><th>Default</th><th>Description</th></tr></thead>
+        <tbody>
+          <tr>
+            <td class="field-name">url</td>
+            <td class="field-type">String</td>
+            <td class="field-default">"file:///tmp/laminardb/checkpoints"</td>
+            <td>Storage URL. file:///, s3://, gs://</td>
+          </tr>
+          <tr>
+            <td class="field-name">interval</td>
+            <td class="field-type">Duration</td>
+            <td class="field-default">"10s"</td>
+            <td>Checkpoint interval. Supports humantime: "10s", "1m", "500ms"</td>
+          </tr>
+          <tr>
+            <td class="field-name">storage</td>
+            <td class="field-type">Map</td>
+            <td class="field-default">{}</td>
+            <td>Cloud storage credentials. Keys: aws_access_key_id, aws_region, etc.</td>
+          </tr>
+          <tr>
+            <td class="field-name">tiering</td>
+            <td class="field-type">Section</td>
+            <td class="field-default">none</td>
+            <td>Optional S3 storage class tiering. See <a href="#tiering">Tiering</a>.</td>
+          </tr>
+        </tbody>
+      </table>
+
+      <div class="toml-block">
+        <div class="toml-header">S3 checkpoint example</div>
+        <pre><code class="language-toml">[checkpoint]
+url = "s3://my-bucket/laminardb/checkpoints"
+interval = "30s"
+
+[checkpoint.storage]
+aws_region = "us-east-1"
+aws_access_key_id = "${AWS_ACCESS_KEY_ID}"
+aws_secret_access_key = "${AWS_SECRET_ACCESS_KEY}"</code></pre>
+      </div>
+
+      <!-- REST API -->
+      <h2 id="rest-api">REST API</h2>
+      <div class="source-ref">Source: <a href="https://github.com/laminardb/laminardb/blob/main/crates/laminar-server/src/http.rs" target="_blank" rel="noopener">crates/laminar-server/src/http.rs</a></div>
+
+      <p>The server exposes an HTTP API on the configured bind address. All responses are JSON except <code>/metrics</code> (Prometheus text format).</p>
+
+      <div style="margin: 1rem 0 1.75rem;">
+        <div class="endpoint-row">
+          <span class="endpoint-method method-get">GET</span>
+          <span class="endpoint-path">/health</span>
+          <span class="endpoint-desc">Liveness probe</span>
+        </div>
+        <div class="endpoint-row">
+          <span class="endpoint-method method-get">GET</span>
+          <span class="endpoint-path">/ready</span>
+          <span class="endpoint-desc">Readiness probe (pipelines started)</span>
+        </div>
+        <div class="endpoint-row">
+          <span class="endpoint-method method-get">GET</span>
+          <span class="endpoint-path">/metrics</span>
+          <span class="endpoint-desc">Prometheus text metrics</span>
+        </div>
+        <div class="endpoint-row">
+          <span class="endpoint-method method-get">GET</span>
+          <span class="endpoint-path">/api/v1/sources</span>
+          <span class="endpoint-desc">List configured sources</span>
+        </div>
+        <div class="endpoint-row">
+          <span class="endpoint-method method-get">GET</span>
+          <span class="endpoint-path">/api/v1/sinks</span>
+          <span class="endpoint-desc">List configured sinks</span>
+        </div>
+        <div class="endpoint-row">
+          <span class="endpoint-method method-get">GET</span>
+          <span class="endpoint-path">/api/v1/streams</span>
+          <span class="endpoint-desc">List running streams</span>
+        </div>
+        <div class="endpoint-row">
+          <span class="endpoint-method method-get">GET</span>
+          <span class="endpoint-path">/api/v1/streams/{name}</span>
+          <span class="endpoint-desc">Stream detail by name</span>
+        </div>
+        <div class="endpoint-row">
+          <span class="endpoint-method method-post">POST</span>
+          <span class="endpoint-path">/api/v1/checkpoint</span>
+          <span class="endpoint-desc">Trigger an immediate checkpoint</span>
+        </div>
+        <div class="endpoint-row">
+          <span class="endpoint-method method-post">POST</span>
+          <span class="endpoint-path">/api/v1/sql</span>
+          <span class="endpoint-desc">Execute ad-hoc SQL query</span>
+        </div>
+        <div class="endpoint-row">
+          <span class="endpoint-method method-post">POST</span>
+          <span class="endpoint-path">/api/v1/reload</span>
+          <span class="endpoint-desc">Hot-reload configuration</span>
+        </div>
+        <div class="endpoint-row">
+          <span class="endpoint-method method-get">GET</span>
+          <span class="endpoint-path">/api/v1/cluster</span>
+          <span class="endpoint-desc">Cluster status (delta mode only)</span>
+        </div>
+      </div>
+
+      <!-- ============================================================ -->
+      <!-- PIPELINES -->
+      <!-- ============================================================ -->
+
+      <h2 id="sources">[[source]]</h2>
+      <div class="source-ref">Source: <a href="https://github.com/laminardb/laminardb/blob/main/crates/laminar-server/src/config.rs" target="_blank" rel="noopener">config.rs:320</a></div>
+
+      <table class="config-table">
+        <thead><tr><th>Field</th><th>Type</th><th>Default</th><th>Description</th></tr></thead>
+        <tbody>
+          <tr>
+            <td class="field-name">name</td>
+            <td class="field-type">String</td>
+            <td><span class="field-required">required</span></td>
+            <td>Unique source name. Referenced in SQL and sinks.</td>
+          </tr>
+          <tr>
+            <td class="field-name">connector</td>
+            <td class="field-type">String</td>
+            <td><span class="field-required">required</span></td>
+            <td>"kafka", "postgres_cdc", "mysql_cdc", "websocket", "files", "delta-lake", "generator"</td>
+          </tr>
+          <tr>
+            <td class="field-name">format</td>
+            <td class="field-type">String</td>
+            <td class="field-default">"json"</td>
+            <td>"json", "avro", "protobuf", "csv"</td>
+          </tr>
+          <tr>
+            <td class="field-name">properties</td>
+            <td class="field-type">Table</td>
+            <td class="field-default">{}</td>
+            <td>Connector-specific properties. See connector sections below.</td>
+          </tr>
+          <tr>
+            <td class="field-name">schema</td>
+            <td class="field-type">Array</td>
+            <td class="field-default">[]</td>
+            <td>Column definitions: {name, type, nullable}</td>
+          </tr>
+          <tr>
+            <td class="field-name">watermark</td>
+            <td class="field-type">Section</td>
+            <td class="field-default">none</td>
+            <td>Event-time watermark: {column, max_out_of_orderness}</td>
+          </tr>
+        </tbody>
+      </table>
+
+      <div class="toml-block">
+        <div class="toml-header">Source with schema and watermark</div>
+        <pre><code class="language-toml">[[source]]
+name = "trades"
+connector = "kafka"
+format = "json"
+
+[source.properties]
+bootstrap.servers = "localhost:9092"
+topic = "market-trades"
+group.id = "laminar-analytics"
+
+[[source.schema]]
+name = "symbol"
+type = "VARCHAR"
+nullable = false
+
+[[source.schema]]
+name = "price"
+type = "DOUBLE"
+
+[[source.schema]]
+name = "ts"
+type = "BIGINT"
+
+[source.watermark]
+column = "ts"
+max_out_of_orderness = "5s"</code></pre>
+      </div>
+
+      <h2 id="pipelines">[[pipeline]]</h2>
+      <div class="source-ref">Source: <a href="https://github.com/laminardb/laminardb/blob/main/crates/laminar-server/src/config.rs" target="_blank" rel="noopener">config.rs:432</a></div>
+
+      <table class="config-table">
+        <thead><tr><th>Field</th><th>Type</th><th>Default</th><th>Description</th></tr></thead>
+        <tbody>
+          <tr>
+            <td class="field-name">name</td>
+            <td class="field-type">String</td>
+            <td><span class="field-required">required</span></td>
+            <td>Unique pipeline name</td>
+          </tr>
+          <tr>
+            <td class="field-name">sql</td>
+            <td class="field-type">String</td>
+            <td><span class="field-required">required</span></td>
+            <td>SQL query. Multi-line supported with triple-quoted strings.</td>
+          </tr>
+          <tr>
+            <td class="field-name">parallelism</td>
+            <td class="field-type">usize</td>
+            <td class="field-default">none</td>
+            <td>Optional parallelism override (default: server worker count)</td>
+          </tr>
+        </tbody>
+      </table>
+
+      <h2 id="sinks">[[sink]]</h2>
+      <div class="source-ref">Source: <a href="https://github.com/laminardb/laminardb/blob/main/crates/laminar-server/src/config.rs" target="_blank" rel="noopener">config.rs:446</a></div>
+
+      <table class="config-table">
+        <thead><tr><th>Field</th><th>Type</th><th>Default</th><th>Description</th></tr></thead>
+        <tbody>
+          <tr>
+            <td class="field-name">name</td>
+            <td class="field-type">String</td>
+            <td><span class="field-required">required</span></td>
+            <td>Unique sink name</td>
+          </tr>
+          <tr>
+            <td class="field-name">pipeline</td>
+            <td class="field-type">String</td>
+            <td><span class="field-required">required</span></td>
+            <td>Pipeline name this sink reads from. Must exist.</td>
+          </tr>
+          <tr>
+            <td class="field-name">connector</td>
+            <td class="field-type">String</td>
+            <td><span class="field-required">required</span></td>
+            <td>"kafka", "postgres", "delta-lake", "websocket", "files", "stdout"</td>
+          </tr>
+          <tr>
+            <td class="field-name">delivery</td>
+            <td class="field-type">String</td>
+            <td class="field-default">"at_least_once"</td>
+            <td>"at_least_once" or "exactly_once"</td>
+          </tr>
+          <tr>
+            <td class="field-name">properties</td>
+            <td class="field-type">Table</td>
+            <td class="field-default">{}</td>
+            <td>Connector-specific properties</td>
+          </tr>
+        </tbody>
+      </table>
+
+      <h2 id="lookups">[[lookup]]</h2>
+      <div class="source-ref">Source: <a href="https://github.com/laminardb/laminardb/blob/main/crates/laminar-server/src/config.rs" target="_blank" rel="noopener">config.rs:373</a></div>
+
+      <table class="config-table">
+        <thead><tr><th>Field</th><th>Type</th><th>Default</th><th>Description</th></tr></thead>
+        <tbody>
+          <tr>
+            <td class="field-name">name</td>
+            <td class="field-type">String</td>
+            <td><span class="field-required">required</span></td>
+            <td>Unique lookup table name. Used in SQL JOINs.</td>
+          </tr>
+          <tr>
+            <td class="field-name">connector</td>
+            <td class="field-type">String</td>
+            <td><span class="field-required">required</span></td>
+            <td>"postgres", "mysql", "redis", "csv"</td>
+          </tr>
+          <tr>
+            <td class="field-name">strategy</td>
+            <td class="field-type">String</td>
+            <td class="field-default">"poll"</td>
+            <td>"poll", "cdc", "manual"</td>
+          </tr>
+          <tr>
+            <td class="field-name">pushdown</td>
+            <td class="field-type">bool</td>
+            <td class="field-default">true</td>
+            <td>Push predicates to source for filtered lookups</td>
+          </tr>
+          <tr>
+            <td class="field-name">cache.size_bytes</td>
+            <td class="field-type">u64</td>
+            <td class="field-default">104857600</td>
+            <td>Cache size in bytes (100 MB)</td>
+          </tr>
+          <tr>
+            <td class="field-name">cache.ttl</td>
+            <td class="field-type">Duration</td>
+            <td class="field-default">"300s"</td>
+            <td>Cache entry TTL</td>
+          </tr>
+          <tr>
+            <td class="field-name">cache.hybrid</td>
+            <td class="field-type">bool</td>
+            <td class="field-default">false</td>
+            <td>Enable memory + disk caching via foyer</td>
+          </tr>
+        </tbody>
+      </table>
+
+      <!-- ============================================================ -->
+      <!-- CONNECTORS -->
+      <!-- ============================================================ -->
+
+      <h2 id="connectors" style="font-size: 1.5rem;">Connectors</h2>
+      <p>All connectors are feature-gated. Enable via <code>cargo add laminar-db --features kafka,delta-lake</code>.</p>
+
+      <div class="connector-grid">
+        <div class="connector-card"><a href="#kafka-source"><h4>Kafka</h4></a><div class="direction">Source + Sink</div><div class="feature">kafka</div></div>
+        <div class="connector-card"><a href="#postgres-cdc"><h4>PostgreSQL CDC</h4></a><div class="direction">Source</div><div class="feature">postgres-cdc</div></div>
+        <div class="connector-card"><a href="#mysql-cdc"><h4>MySQL CDC</h4></a><div class="direction">Source</div><div class="feature">mysql-cdc</div></div>
+        <div class="connector-card"><a href="#postgres-sink"><h4>PostgreSQL Sink</h4></a><div class="direction">Sink</div><div class="feature">postgres-sink</div></div>
+        <div class="connector-card"><a href="#delta-source"><h4>Delta Lake</h4></a><div class="direction">Source + Sink</div><div class="feature">delta-lake</div></div>
+        <div class="connector-card"><a href="#websocket-source"><h4>WebSocket</h4></a><div class="direction">Source + Sink</div><div class="feature">websocket</div></div>
+        <div class="connector-card"><a href="#file-source"><h4>File Auto-Loader</h4></a><div class="direction">Source + Sink</div><div class="feature">files</div></div>
+      </div>
+
+      <!-- KAFKA SOURCE -->
+      <h3 id="kafka-source">Kafka Source</h3>
+      <div class="source-ref">Source: <a href="https://github.com/laminardb/laminardb/blob/main/crates/laminar-connectors/src/kafka/source.rs" target="_blank" rel="noopener">kafka/source.rs</a></div>
+
+      <h4>Required</h4>
+      <table class="config-table">
+        <thead><tr><th>Property</th><th>Description</th></tr></thead>
+        <tbody>
+          <tr><td class="field-name">bootstrap.servers</td><td>Kafka broker addresses (comma-separated)</td></tr>
+          <tr><td class="field-name">group.id</td><td>Consumer group ID</td></tr>
+          <tr><td class="field-name">topic <em>or</em> topic.pattern</td><td>Topic names (comma-separated) or regex pattern. Mutually exclusive.</td></tr>
+        </tbody>
+      </table>
+
+      <h4>Format &amp; Schema</h4>
+      <table class="config-table">
+        <thead><tr><th>Property</th><th>Default</th><th>Description</th></tr></thead>
+        <tbody>
+          <tr><td class="field-name">format</td><td class="field-default">json</td><td>json, avro, protobuf</td></tr>
+          <tr><td class="field-name">schema.registry.url</td><td></td><td>Confluent Schema Registry URL</td></tr>
+          <tr><td class="field-name">schema.registry.username</td><td></td><td>Schema Registry auth</td></tr>
+          <tr><td class="field-name">schema.registry.password</td><td></td><td>Schema Registry auth</td></tr>
+        </tbody>
+      </table>
+
+      <h4>Security</h4>
+      <table class="config-table">
+        <thead><tr><th>Property</th><th>Default</th><th>Description</th></tr></thead>
+        <tbody>
+          <tr><td class="field-name">security.protocol</td><td class="field-default">PLAINTEXT</td><td>PLAINTEXT, SSL, SASL_PLAINTEXT, SASL_SSL</td></tr>
+          <tr><td class="field-name">sasl.mechanism</td><td></td><td>PLAIN, SCRAM-SHA-256, SCRAM-SHA-512</td></tr>
+          <tr><td class="field-name">sasl.username</td><td></td><td>SASL username</td></tr>
+          <tr><td class="field-name">sasl.password</td><td></td><td>SASL password</td></tr>
+          <tr><td class="field-name">ssl.ca.location</td><td></td><td>CA certificate path</td></tr>
+        </tbody>
+      </table>
+
+      <h4>Consumer Tuning</h4>
+      <table class="config-table">
+        <thead><tr><th>Property</th><th>Default</th><th>Description</th></tr></thead>
+        <tbody>
+          <tr><td class="field-name">startup.mode</td><td class="field-default">earliest</td><td>earliest, latest, none</td></tr>
+          <tr><td class="field-name">max.poll.records</td><td class="field-default">1000</td><td>Records per poll batch</td></tr>
+          <tr><td class="field-name">isolation.level</td><td class="field-default">read_committed</td><td>read_uncommitted, read_committed</td></tr>
+          <tr><td class="field-name">partition.assignment.strategy</td><td class="field-default">range</td><td>range, roundrobin, sticky, cooperative-sticky</td></tr>
+          <tr><td class="field-name">max.out.of.orderness.ms</td><td class="field-default">5000</td><td>Watermark out-of-order tolerance</td></tr>
+          <tr><td class="field-name">idle.timeout.ms</td><td class="field-default">30000</td><td>Idle watermark advancement timeout</td></tr>
+        </tbody>
+      </table>
+
+      <p style="font-size: 0.8rem; color: var(--text-dim);">Any property prefixed with <code>kafka.</code> is passed through to the underlying rdkafka consumer.</p>
+
+      <!-- KAFKA SINK -->
+      <h3 id="kafka-sink">Kafka Sink</h3>
+      <div class="source-ref">Source: <a href="https://github.com/laminardb/laminardb/blob/main/crates/laminar-connectors/src/kafka/sink.rs" target="_blank" rel="noopener">kafka/sink.rs</a></div>
+
+      <table class="config-table">
+        <thead><tr><th>Property</th><th>Default</th><th>Description</th></tr></thead>
+        <tbody>
+          <tr><td class="field-name">bootstrap.servers</td><td><span class="field-required">required</span></td><td>Kafka broker addresses</td></tr>
+          <tr><td class="field-name">topic</td><td><span class="field-required">required</span></td><td>Target topic</td></tr>
+          <tr><td class="field-name">format</td><td class="field-default">json</td><td>json, avro, protobuf</td></tr>
+          <tr><td class="field-name">delivery.guarantee</td><td class="field-default">at-least-once</td><td>at-least-once, exactly-once</td></tr>
+          <tr><td class="field-name">key.column</td><td></td><td>Column for partition key</td></tr>
+          <tr><td class="field-name">partitioner</td><td class="field-default">key-hash</td><td>key-hash, round-robin, sticky</td></tr>
+          <tr><td class="field-name">compression.type</td><td class="field-default">none</td><td>none, gzip, snappy, lz4, zstd</td></tr>
+          <tr><td class="field-name">acks</td><td class="field-default">all</td><td>all, 1, 0</td></tr>
+          <tr><td class="field-name">linger.ms</td><td class="field-default">5</td><td>Batch linger time</td></tr>
+          <tr><td class="field-name">batch.size</td><td class="field-default">16384</td><td>Max batch bytes</td></tr>
+          <tr><td class="field-name">transactional.id</td><td></td><td>For exactly-once producer</td></tr>
+        </tbody>
+      </table>
+
+      <!-- POSTGRES CDC -->
+      <h3 id="postgres-cdc">PostgreSQL CDC Source</h3>
+      <div class="source-ref">Source: <a href="https://github.com/laminardb/laminardb/blob/main/crates/laminar-connectors/src/cdc/postgres/source.rs" target="_blank" rel="noopener">cdc/postgres/source.rs</a></div>
+
+      <table class="config-table">
+        <thead><tr><th>Property</th><th>Default</th><th>Description</th></tr></thead>
+        <tbody>
+          <tr><td class="field-name">host</td><td><span class="field-required">required</span></td><td>PostgreSQL hostname</td></tr>
+          <tr><td class="field-name">port</td><td class="field-default">5432</td><td>Port</td></tr>
+          <tr><td class="field-name">database</td><td><span class="field-required">required</span></td><td>Database name</td></tr>
+          <tr><td class="field-name">username</td><td class="field-default">postgres</td><td>Auth username</td></tr>
+          <tr><td class="field-name">password</td><td></td><td>Auth password</td></tr>
+          <tr><td class="field-name">slot.name</td><td><span class="field-required">required</span></td><td>Logical replication slot</td></tr>
+          <tr><td class="field-name">publication</td><td><span class="field-required">required</span></td><td>Publication name</td></tr>
+          <tr><td class="field-name">ssl.mode</td><td class="field-default">prefer</td><td>disable, allow, prefer, require, verify-ca, verify-full</td></tr>
+          <tr><td class="field-name">snapshot.mode</td><td class="field-default">initial</td><td>initial, never, always</td></tr>
+          <tr><td class="field-name">table.include</td><td></td><td>Comma-separated table filter</td></tr>
+          <tr><td class="field-name">table.exclude</td><td></td><td>Comma-separated table exclusions</td></tr>
+          <tr><td class="field-name">max.poll.records</td><td class="field-default">1000</td><td>Records per poll</td></tr>
+        </tbody>
+      </table>
+
+      <!-- MYSQL CDC -->
+      <h3 id="mysql-cdc">MySQL CDC Source</h3>
+      <div class="source-ref">Source: <a href="https://github.com/laminardb/laminardb/blob/main/crates/laminar-connectors/src/cdc/mysql/source.rs" target="_blank" rel="noopener">cdc/mysql/source.rs</a></div>
+
+      <table class="config-table">
+        <thead><tr><th>Property</th><th>Default</th><th>Description</th></tr></thead>
+        <tbody>
+          <tr><td class="field-name">host</td><td><span class="field-required">required</span></td><td>MySQL hostname</td></tr>
+          <tr><td class="field-name">port</td><td class="field-default">3306</td><td>Port</td></tr>
+          <tr><td class="field-name">username</td><td><span class="field-required">required</span></td><td>Auth username</td></tr>
+          <tr><td class="field-name">password</td><td></td><td>Auth password</td></tr>
+          <tr><td class="field-name">database</td><td></td><td>Database filter</td></tr>
+          <tr><td class="field-name">server.id</td><td class="field-default">1001</td><td>Unique replica server ID</td></tr>
+          <tr><td class="field-name">use.gtid</td><td class="field-default">true</td><td>GTID-based replication</td></tr>
+          <tr><td class="field-name">gtid.set</td><td></td><td>Starting GTID set</td></tr>
+          <tr><td class="field-name">snapshot.mode</td><td class="field-default">initial</td><td>initial, never, always</td></tr>
+          <tr><td class="field-name">table.include</td><td></td><td>Comma-separated tables (db.table format)</td></tr>
+        </tbody>
+      </table>
+
+      <!-- POSTGRES SINK -->
+      <h3 id="postgres-sink">PostgreSQL Sink</h3>
+      <div class="source-ref">Source: <a href="https://github.com/laminardb/laminardb/blob/main/crates/laminar-connectors/src/postgres/sink.rs" target="_blank" rel="noopener">postgres/sink.rs</a></div>
+
+      <table class="config-table">
+        <thead><tr><th>Property</th><th>Default</th><th>Description</th></tr></thead>
+        <tbody>
+          <tr><td class="field-name">hostname</td><td><span class="field-required">required</span></td><td>PostgreSQL hostname</td></tr>
+          <tr><td class="field-name">port</td><td class="field-default">5432</td><td>Port</td></tr>
+          <tr><td class="field-name">database</td><td><span class="field-required">required</span></td><td>Database name</td></tr>
+          <tr><td class="field-name">username</td><td><span class="field-required">required</span></td><td>Auth username</td></tr>
+          <tr><td class="field-name">password</td><td></td><td>Auth password</td></tr>
+          <tr><td class="field-name">table.name</td><td><span class="field-required">required</span></td><td>Target table</td></tr>
+          <tr><td class="field-name">schema.name</td><td class="field-default">public</td><td>PostgreSQL schema</td></tr>
+          <tr><td class="field-name">write.mode</td><td class="field-default">append</td><td>append (COPY BINARY) or upsert (INSERT ON CONFLICT)</td></tr>
+          <tr><td class="field-name">primary.key</td><td></td><td>PK columns for upsert (comma-separated). Required if write.mode=upsert.</td></tr>
+          <tr><td class="field-name">batch.size</td><td class="field-default">4096</td><td>Records per flush</td></tr>
+          <tr><td class="field-name">pool.size</td><td class="field-default">4</td><td>Connection pool size</td></tr>
+          <tr><td class="field-name">delivery.guarantee</td><td class="field-default">at_least_once</td><td>at_least_once, exactly_once (2PC)</td></tr>
+          <tr><td class="field-name">auto.create.table</td><td class="field-default">false</td><td>Create table if missing</td></tr>
+        </tbody>
+      </table>
+
+      <!-- DELTA LAKE SOURCE -->
+      <h3 id="delta-source">Delta Lake Source</h3>
+      <div class="source-ref">Source: <a href="https://github.com/laminardb/laminardb/blob/main/crates/laminar-connectors/src/lakehouse/delta_source.rs" target="_blank" rel="noopener">lakehouse/delta_source.rs</a></div>
+
+      <table class="config-table">
+        <thead><tr><th>Property</th><th>Default</th><th>Description</th></tr></thead>
+        <tbody>
+          <tr><td class="field-name">table.path</td><td><span class="field-required">required</span></td><td>Delta table path (local, s3://, az://, gs://)</td></tr>
+          <tr><td class="field-name">read.mode</td><td class="field-default">incremental</td><td>snapshot (full read) or incremental (change feed)</td></tr>
+          <tr><td class="field-name">starting.version</td><td></td><td>Version to start from</td></tr>
+          <tr><td class="field-name">poll.interval.ms</td><td class="field-default">1000</td><td>Version poll interval</td></tr>
+          <tr><td class="field-name">partition.filter</td><td></td><td>Partition filter (SQL expression)</td></tr>
+          <tr><td class="field-name">catalog.type</td><td class="field-default">none</td><td>none, glue, unity</td></tr>
+        </tbody>
+      </table>
+
+      <!-- DELTA LAKE SINK -->
+      <h3 id="delta-sink">Delta Lake Sink</h3>
+      <div class="source-ref">Source: <a href="https://github.com/laminardb/laminardb/blob/main/crates/laminar-connectors/src/lakehouse/delta_sink.rs" target="_blank" rel="noopener">lakehouse/delta_sink.rs</a></div>
+
+      <table class="config-table">
+        <thead><tr><th>Property</th><th>Default</th><th>Description</th></tr></thead>
+        <tbody>
+          <tr><td class="field-name">table.path</td><td><span class="field-required">required</span></td><td>Delta table path</td></tr>
+          <tr><td class="field-name">write.mode</td><td class="field-default">append</td><td>append, overwrite, upsert</td></tr>
+          <tr><td class="field-name">merge.key.columns</td><td></td><td>Key columns for upsert (comma-separated)</td></tr>
+          <tr><td class="field-name">partition.columns</td><td></td><td>Partition columns (comma-separated)</td></tr>
+          <tr><td class="field-name">target.file.size</td><td class="field-default">134217728</td><td>Target Parquet file size (128 MB)</td></tr>
+          <tr><td class="field-name">max.buffer.records</td><td class="field-default">100000</td><td>Records before flush</td></tr>
+          <tr><td class="field-name">max.buffer.duration.ms</td><td class="field-default">60000</td><td>Time before flush</td></tr>
+          <tr><td class="field-name">delivery.guarantee</td><td class="field-default">at-least-once</td><td>at-least-once, exactly-once</td></tr>
+          <tr><td class="field-name">writer.id</td><td></td><td>Writer ID (required for exactly-once)</td></tr>
+          <tr><td class="field-name">schema.evolution</td><td class="field-default">false</td><td>Auto-merge new columns</td></tr>
+          <tr><td class="field-name">compaction.enabled</td><td class="field-default">false</td><td>Enable automatic compaction</td></tr>
+          <tr><td class="field-name">vacuum.retention.hours</td><td class="field-default">168</td><td>Retention hours (7 days)</td></tr>
+          <tr><td class="field-name">catalog.type</td><td class="field-default">none</td><td>none, glue, unity</td></tr>
+        </tbody>
+      </table>
+
+      <p style="font-size: 0.8rem; color: var(--text-dim);">Cloud storage credentials: use <code>storage.aws_access_key_id</code>, <code>storage.aws_secret_access_key</code>, <code>storage.aws_region</code>, etc.</p>
+
+      <!-- WEBSOCKET SOURCE -->
+      <h3 id="websocket-source">WebSocket Source</h3>
+      <div class="source-ref">Source: <a href="https://github.com/laminardb/laminardb/blob/main/crates/laminar-connectors/src/websocket/source.rs" target="_blank" rel="noopener">websocket/source.rs</a></div>
+
+      <p><strong>Note:</strong> WebSocket is non-replayable. At-most-once delivery on recovery.</p>
+
+      <table class="config-table">
+        <thead><tr><th>Property</th><th>Default</th><th>Description</th></tr></thead>
+        <tbody>
+          <tr><td class="field-name">mode</td><td class="field-default">client</td><td>client (connect out) or server (accept connections)</td></tr>
+          <tr><td class="field-name">url</td><td></td><td>WebSocket URL (client mode, comma-separated for multi)</td></tr>
+          <tr><td class="field-name">bind.address</td><td></td><td>Bind address (server mode)</td></tr>
+          <tr><td class="field-name">format</td><td class="field-default">json</td><td>json, jsonlines, binary, csv</td></tr>
+          <tr><td class="field-name">subscribe.message</td><td></td><td>Message sent after handshake (client mode)</td></tr>
+          <tr><td class="field-name">reconnect.enabled</td><td class="field-default">true</td><td>Auto-reconnect (client mode)</td></tr>
+          <tr><td class="field-name">reconnect.max.delay.ms</td><td class="field-default">30000</td><td>Max backoff delay</td></tr>
+          <tr><td class="field-name">ping.interval.ms</td><td class="field-default">30000</td><td>Keepalive ping interval</td></tr>
+          <tr><td class="field-name">auth.type</td><td></td><td>bearer, basic, hmac</td></tr>
+        </tbody>
+      </table>
+
+      <!-- WEBSOCKET SINK -->
+      <h3 id="websocket-sink">WebSocket Sink</h3>
+      <div class="source-ref">Source: <a href="https://github.com/laminardb/laminardb/blob/main/crates/laminar-connectors/src/websocket/sink.rs" target="_blank" rel="noopener">websocket/sink.rs</a></div>
+
+      <table class="config-table">
+        <thead><tr><th>Property</th><th>Default</th><th>Description</th></tr></thead>
+        <tbody>
+          <tr><td class="field-name">mode</td><td class="field-default">server</td><td>server (accept clients) or client (push to remote)</td></tr>
+          <tr><td class="field-name">bind.address</td><td></td><td>Bind address (server mode)</td></tr>
+          <tr><td class="field-name">url</td><td></td><td>Remote URL (client mode)</td></tr>
+          <tr><td class="field-name">format</td><td class="field-default">json</td><td>json, jsonlines, arrow_ipc, binary</td></tr>
+          <tr><td class="field-name">max.connections</td><td class="field-default">10000</td><td>Max concurrent clients (server mode)</td></tr>
+          <tr><td class="field-name">slow.client.policy</td><td class="field-default">drop_oldest</td><td>drop_oldest, drop_newest, disconnect</td></tr>
+          <tr><td class="field-name">replay.buffer.size</td><td></td><td>Messages replayed to new clients</td></tr>
+        </tbody>
+      </table>
+
+      <!-- FILE SOURCE -->
+      <h3 id="file-source">File Source (Auto-Loader)</h3>
+      <div class="source-ref">Source: <a href="https://github.com/laminardb/laminardb/blob/main/crates/laminar-connectors/src/files/source.rs" target="_blank" rel="noopener">files/source.rs</a></div>
+
+      <table class="config-table">
+        <thead><tr><th>Property</th><th>Default</th><th>Description</th></tr></thead>
+        <tbody>
+          <tr><td class="field-name">path</td><td><span class="field-required">required</span></td><td>Directory, glob, or cloud URL</td></tr>
+          <tr><td class="field-name">format</td><td></td><td>csv, json, text, parquet (auto-detected if omitted)</td></tr>
+          <tr><td class="field-name">poll_interval</td><td class="field-default">10000</td><td>Directory poll interval (ms)</td></tr>
+          <tr><td class="field-name">max_files_per_poll</td><td class="field-default">100</td><td>Files per poll cycle</td></tr>
+          <tr><td class="field-name">csv.delimiter</td><td></td><td>CSV delimiter character</td></tr>
+          <tr><td class="field-name">csv.has.header</td><td class="field-default">true</td><td>CSV has header row</td></tr>
+          <tr><td class="field-name">include_metadata</td><td class="field-default">false</td><td>Include _metadata column</td></tr>
+        </tbody>
+      </table>
+
+      <!-- FILE SINK -->
+      <h3 id="file-sink">File Sink</h3>
+      <div class="source-ref">Source: <a href="https://github.com/laminardb/laminardb/blob/main/crates/laminar-connectors/src/files/sink.rs" target="_blank" rel="noopener">files/sink.rs</a></div>
+
+      <table class="config-table">
+        <thead><tr><th>Property</th><th>Default</th><th>Description</th></tr></thead>
+        <tbody>
+          <tr><td class="field-name">path</td><td><span class="field-required">required</span></td><td>Output directory</td></tr>
+          <tr><td class="field-name">format</td><td><span class="field-required">required</span></td><td>csv, json, text, parquet</td></tr>
+          <tr><td class="field-name">mode</td><td class="field-default">rolling</td><td>append (single file) or rolling (rotate)</td></tr>
+          <tr><td class="field-name">prefix</td><td class="field-default">part</td><td>File name prefix (rolling mode)</td></tr>
+          <tr><td class="field-name">compression</td><td class="field-default">snappy</td><td>Parquet: snappy, gzip, brotli, lz4, zstd, uncompressed</td></tr>
+        </tbody>
+      </table>
+
+      <!-- ============================================================ -->
+      <!-- ADVANCED -->
+      <!-- ============================================================ -->
+
+      <!-- ============================================================ -->
+      <!-- JOINS -->
+      <!-- ============================================================ -->
+
+      <h2 id="joins" style="font-size: 1.5rem;">Join Semantics</h2>
+      <p>
+        LaminarDB supports four join types. All are stateful and operate on
+        streaming data. Join types are detected from SQL syntax automatically.
+      </p>
+
+      <table class="config-table">
+        <thead><tr><th>Join Type</th><th>Time Bound</th><th>Match</th><th>Use Case</th></tr></thead>
+        <tbody>
+          <tr>
+            <td class="field-name" style="color: var(--text);">Interval</td>
+            <td>Required</td>
+            <td>All pairs within window</td>
+            <td>Stream-stream correlation</td>
+          </tr>
+          <tr>
+            <td class="field-name" style="color: var(--text);">ASOF</td>
+            <td>Optional tolerance</td>
+            <td>One closest per key</td>
+            <td>Trade/quote enrichment</td>
+          </tr>
+          <tr>
+            <td class="field-name" style="color: var(--text);">Temporal</td>
+            <td>Implicit (version time)</td>
+            <td>Point-in-time lookup</td>
+            <td>Versioned dimension tables</td>
+          </tr>
+          <tr>
+            <td class="field-name" style="color: var(--text);">Lookup</td>
+            <td>None</td>
+            <td>Key equality</td>
+            <td>Static reference enrichment</td>
+          </tr>
+        </tbody>
+      </table>
+
+      <!-- INTERVAL JOIN -->
+      <h3 id="join-interval">Interval Join (Stream-Stream)</h3>
+      <div class="source-ref">Source: <a href="https://github.com/laminardb/laminardb/blob/main/crates/laminar-db/src/interval_join.rs" target="_blank" rel="noopener">interval_join.rs</a></div>
+
+      <p>
+        Matches all pairs of rows from two streams where timestamps fall within a
+        time bound: <code>|left_ts - right_ts| &lt;= time_bound</code>.
+        Both sides are buffered in state. Expired rows are evicted when the
+        watermark advances past the bound.
+      </p>
+
+      <p><strong>Supported types:</strong> INNER, LEFT, RIGHT, FULL, LEFT SEMI, LEFT ANTI, RIGHT SEMI, RIGHT ANTI</p>
+
+      <div class="toml-block">
+        <div class="toml-header">Interval join — match orders to payments within 1 hour</div>
+        <pre><code class="language-sql">CREATE STREAM matched AS
+SELECT o.order_id, o.amount, p.status
+FROM orders o
+INNER JOIN payments p
+    ON o.order_id = p.order_id
+    AND p.ts BETWEEN o.ts AND o.ts + 3600000;</code></pre>
+      </div>
+
+      <div class="toml-block">
+        <div class="toml-header">Semi join — orders that have at least one payment</div>
+        <pre><code class="language-sql">SELECT o.order_id, o.amount
+FROM orders o
+LEFT SEMI JOIN payments p
+    ON o.order_id = p.order_id
+    AND p.ts BETWEEN o.ts AND o.ts + 3600000;</code></pre>
+      </div>
+
+      <p style="font-size: 0.82rem;">
+        <strong>State:</strong> Both sides buffered as Arrow batches with per-key
+        <code>BTreeMap&lt;timestamp&gt;</code> indices. Time columns are extracted
+        automatically from the <code>BETWEEN</code> clause. New left rows probe all
+        right state; new right rows probe only old left state (avoids double-emit).
+        Checkpointed via Arrow IPC serialization.
+      </p>
+
+      <!-- ASOF JOIN -->
+      <h3 id="join-asof">ASOF Join</h3>
+      <div class="source-ref">Source: <a href="https://github.com/laminardb/laminardb/blob/main/crates/laminar-db/src/asof_batch.rs" target="_blank" rel="noopener">asof_batch.rs</a>, <a href="https://github.com/laminardb/laminardb/blob/main/crates/laminar-sql/src/parser/join_parser.rs" target="_blank" rel="noopener">join_parser.rs</a></div>
+
+      <p>
+        For each left row, finds the <strong>one</strong> closest right row by timestamp
+        within the same key partition. Uses Snowflake-compatible <code>MATCH_CONDITION</code> syntax.
+      </p>
+
+      <p><strong>Supported types:</strong> INNER, LEFT</p>
+
+      <h4>Three directions</h4>
+      <table class="config-table">
+        <thead><tr><th>Direction</th><th>Syntax</th><th>Behavior</th></tr></thead>
+        <tbody>
+          <tr>
+            <td class="field-name">Backward</td>
+            <td><code>t.ts &gt;= q.ts</code></td>
+            <td>Most recent prior right event</td>
+          </tr>
+          <tr>
+            <td class="field-name">Forward</td>
+            <td><code>t.ts &lt;= q.ts</code></td>
+            <td>Next future right event</td>
+          </tr>
+          <tr>
+            <td class="field-name">Nearest</td>
+            <td><code>NEAREST(t.ts, q.ts)</code></td>
+            <td>Closest by absolute time difference</td>
+          </tr>
+        </tbody>
+      </table>
+
+      <div class="toml-block">
+        <div class="toml-header">ASOF backward — enrich trades with most recent quote</div>
+        <pre><code class="language-sql">SELECT t.symbol, t.price, q.bid, q.ask
+FROM trades t
+ASOF JOIN quotes q
+    MATCH_CONDITION(t.ts >= q.ts)
+    ON t.symbol = q.symbol;</code></pre>
+      </div>
+
+      <div class="toml-block">
+        <div class="toml-header">ASOF with tolerance — max 5 second gap</div>
+        <pre><code class="language-sql">SELECT t.symbol, t.price, q.bid, q.ask
+FROM trades t
+ASOF JOIN quotes q
+    MATCH_CONDITION(t.ts >= q.ts AND t.ts - q.ts <= INTERVAL '5' SECOND)
+    ON t.symbol = q.symbol;</code></pre>
+      </div>
+
+      <div class="toml-block">
+        <div class="toml-header">ASOF nearest — closest event by absolute time</div>
+        <pre><code class="language-sql">SELECT s.sensor_id, s.reading, c.calibration
+FROM sensor_data s
+ASOF JOIN calibrations c
+    MATCH_CONDITION(NEAREST(s.ts, c.ts))
+    ON s.sensor_id = c.sensor_id;</code></pre>
+      </div>
+
+      <p style="font-size: 0.82rem;">
+        <strong>State:</strong> Right-side events stored in per-key
+        <code>BTreeMap&lt;timestamp, Vec&lt;row_index&gt;&gt;</code> for O(log n) temporal lookups.
+        Multiple rows at the same timestamp are handled correctly.
+        Key columns support <code>VARCHAR</code> and <code>BIGINT</code> types.
+      </p>
+
+      <!-- TEMPORAL JOIN -->
+      <h3 id="join-temporal">Temporal Join (FOR SYSTEM_TIME AS OF)</h3>
+      <div class="source-ref">Source: <a href="https://github.com/laminardb/laminardb/blob/main/crates/laminar-db/src/stream_executor.rs" target="_blank" rel="noopener">stream_executor.rs</a></div>
+
+      <p>
+        Point-in-time lookup against a versioned table. For each stream event,
+        looks up the table row valid at the event's timestamp. Uses SQL:2011
+        <code>FOR SYSTEM_TIME AS OF</code> syntax.
+      </p>
+
+      <p><strong>Supported types:</strong> INNER, LEFT</p>
+
+      <div class="toml-block">
+        <div class="toml-header">Temporal join — currency rate valid at order time</div>
+        <pre><code class="language-sql">SELECT o.order_id, o.amount, r.rate,
+       o.amount * r.rate AS converted
+FROM orders o
+JOIN currency_rates FOR SYSTEM_TIME AS OF o.order_time AS r
+    ON o.currency = r.currency;</code></pre>
+      </div>
+
+      <p style="font-size: 0.82rem;">
+        <strong>Versioned tables:</strong> The right-side table must have a timestamp
+        column marking version validity. Event-time semantics are deterministic;
+        process-time (<code>PROCTIME()</code>) is non-deterministic.
+      </p>
+
+      <!-- LOOKUP JOIN -->
+      <h3 id="join-lookup">Lookup Join</h3>
+      <div class="source-ref">Source: <a href="https://github.com/laminardb/laminardb/blob/main/crates/laminar-sql/src/datafusion/lookup_join.rs" target="_blank" rel="noopener">lookup_join.rs</a></div>
+
+      <p>
+        Enriches stream events against a static or slowly-changing reference table.
+        No time bound &mdash; matches by key equality only. Results are cached with
+        configurable TTL.
+      </p>
+
+      <p><strong>Supported types:</strong> INNER, LEFT</p>
+
+      <div class="toml-block">
+        <div class="toml-header">Lookup join — enrich orders with product info</div>
+        <pre><code class="language-sql">SELECT o.order_id, o.amount, p.name, p.category
+FROM orders o
+LEFT JOIN products p
+    ON o.product_id = p.id;</code></pre>
+      </div>
+
+      <p style="font-size: 0.82rem;">
+        <strong>Cache:</strong> Foyer-backed memory/hybrid cache. Configure via
+        <code>[[lookup]]</code> section: <code>cache.size_bytes</code>,
+        <code>cache.ttl</code>, <code>cache.hybrid</code>.
+        Supports predicate pushdown to the lookup connector.
+      </p>
+
+      <!-- ============================================================ -->
+      <!-- ADVANCED -->
+      <!-- ============================================================ -->
+
+      <h2 id="env-vars">Environment Variables</h2>
+
+      <p>
+        All string values in TOML support <code>${VAR}</code> substitution.
+        Use <code>${VAR:-default}</code> for optional variables with fallbacks.
+        Missing variables without defaults cause a startup error.
+      </p>
+
+      <div class="toml-block">
+        <div class="toml-header">Environment variable examples</div>
+        <pre><code class="language-toml">[source.properties]
+bootstrap.servers = "${KAFKA_BROKERS:-localhost:9092}"
+sasl.username = "${KAFKA_USER}"
+sasl.password = "${KAFKA_PASSWORD}"
+
+[checkpoint]
+url = "s3://${S3_BUCKET}/checkpoints"
+
+[checkpoint.storage]
+aws_access_key_id = "${AWS_ACCESS_KEY_ID}"
+aws_secret_access_key = "${AWS_SECRET_ACCESS_KEY}"</code></pre>
+      </div>
+
+      <h2 id="tiering">S3 Storage Class Tiering</h2>
+      <div class="source-ref">Source: <a href="https://github.com/laminardb/laminardb/blob/main/crates/laminar-server/src/config.rs" target="_blank" rel="noopener">config.rs:295</a></div>
+
+      <p>Active checkpoints use the hot tier. Older checkpoints automatically tier down via S3 Lifecycle rules.</p>
+
+      <table class="config-table">
+        <thead><tr><th>Field</th><th>Default</th><th>Description</th></tr></thead>
+        <tbody>
+          <tr><td class="field-name">hot_class</td><td class="field-default">"STANDARD"</td><td>Storage class for active checkpoints (e.g. "EXPRESS_ONE_ZONE")</td></tr>
+          <tr><td class="field-name">warm_class</td><td class="field-default">"STANDARD"</td><td>Storage class for older checkpoints</td></tr>
+          <tr><td class="field-name">cold_class</td><td class="field-default">""</td><td>Archive class (e.g. "GLACIER_IR"). Empty = no cold tier.</td></tr>
+          <tr><td class="field-name">hot_retention</td><td class="field-default">"24h"</td><td>Time before hot &rarr; warm</td></tr>
+          <tr><td class="field-name">warm_retention</td><td class="field-default">"7d"</td><td>Time before warm &rarr; cold</td></tr>
+        </tbody>
+      </table>
+
+      <h2 id="delivery">Delivery Guarantees</h2>
+      <div class="source-ref">Source: <a href="https://github.com/laminardb/laminardb/blob/main/crates/laminar-connectors/src/connector.rs" target="_blank" rel="noopener">connector.rs:DeliveryGuarantee</a></div>
+
+      <table class="config-table">
+        <thead><tr><th>Guarantee</th><th>How it works</th><th>Requirements</th></tr></thead>
+        <tbody>
+          <tr>
+            <td class="field-name" style="color: var(--text);">at_least_once</td>
+            <td>Default. On recovery, sources replay from last checkpoint offset. Some records may be reprocessed.</td>
+            <td>Checkpointing enabled. Works with all connectors.</td>
+          </tr>
+          <tr>
+            <td class="field-name" style="color: var(--text);">exactly_once</td>
+            <td>Barrier-aligned checkpoints with two-phase commit to sinks. No duplicates in output.</td>
+            <td>All sources must support replay. Sinks must support 2PC. Currently: Kafka sink and PostgreSQL sink.</td>
+          </tr>
+        </tbody>
+      </table>
+
+      <p>
+        WebSocket sources are <strong>non-replayable</strong>. Under exactly-once mode,
+        they degrade to at-most-once delivery with a warning.
+      </p>
+
+      <!-- Full example -->
+      <h2 id="full-example" style="font-size: 1.35rem;">Full Config Example</h2>
+
+      <div class="toml-block">
+        <div class="toml-header">laminardb.toml</div>
+        <pre><code class="language-toml">[server]
+mode = "embedded"
+bind = "0.0.0.0:8080"
+workers = 4
+log_level = "info"
+
+[state]
+backend = "memory"
+
+[checkpoint]
+url = "s3://my-bucket/laminardb/checkpoints"
+interval = "30s"
+
+[checkpoint.storage]
+aws_region = "us-east-1"
+
+# --- Sources ---
+
+[[source]]
+name = "trades"
+connector = "kafka"
+format = "avro"
+
+[source.properties]
+bootstrap.servers = "${KAFKA_BROKERS}"
+topic = "market-trades"
+group.id = "laminar-vwap"
+schema.registry.url = "${SCHEMA_REGISTRY_URL}"
+startup.mode = "earliest"
+
+[[source.schema]]
+name = "symbol"
+type = "VARCHAR"
+nullable = false
+
+[[source.schema]]
+name = "price"
+type = "DOUBLE"
+
+[[source.schema]]
+name = "volume"
+type = "BIGINT"
+
+[[source.schema]]
+name = "ts"
+type = "BIGINT"
+
+[source.watermark]
+column = "ts"
+max_out_of_orderness = "5s"
+
+# --- Lookups ---
+
+[[lookup]]
+name = "instruments"
+connector = "postgres"
+strategy = "poll"
+pushdown = true
+
+[lookup.properties]
+hostname = "db.internal"
+database = "reference_data"
+username = "reader"
+table.name = "instruments"
+
+[lookup.cache]
+size_bytes = 104857600
+ttl = "5m"
+
+# --- Pipelines ---
+
+[[pipeline]]
+name = "vwap"
+sql = """
+SELECT t.symbol,
+       SUM(t.price * CAST(t.volume AS DOUBLE))
+         / SUM(CAST(t.volume AS DOUBLE)) AS vwap,
+       i.exchange
+FROM trades t
+JOIN instruments i ON t.symbol = i.symbol
+GROUP BY t.symbol, i.exchange, tumble(t.ts, INTERVAL '1' MINUTE)
+EMIT ON WINDOW CLOSE
+"""
+
+# --- Sinks ---
+
+[[sink]]
+name = "kafka_output"
+pipeline = "vwap"
+connector = "kafka"
+delivery = "exactly_once"
+
+[sink.properties]
+bootstrap.servers = "${KAFKA_BROKERS}"
+topic = "vwap-1m"
+format = "json"
+key.column = "symbol"
+compression.type = "lz4"
+
+[[sink]]
+name = "lake"
+pipeline = "vwap"
+connector = "delta-lake"
+delivery = "exactly_once"
+
+[sink.properties]
+table.path = "s3://my-bucket/delta/vwap"
+partition.columns = "exchange"
+writer.id = "vwap-writer"</code></pre>
+      </div>
+
+    </main>
+  </div>
+
+  <!-- Footer -->
+  <footer class="footer">
+    <div class="container">
+      <div class="footer-inner">
+        <div class="footer-left">
+          LaminarDB &middot;
+          <a href="https://github.com/laminardb/laminardb/blob/main/LICENSE" target="_blank" rel="noopener">Apache 2.0</a> &middot;
+          <span data-version="tag">v0.18.9</span>
+        </div>
+        <div class="footer-links">
+          <a href="https://github.com/laminardb/laminardb" target="_blank" rel="noopener">GitHub</a>
+          <a href="https://crates.io/crates/laminar-db" target="_blank" rel="noopener">Crates.io</a>
+          <a href="https://laminardb.io/api/laminar_db/" target="_blank" rel="noopener">API Docs</a>
+        </div>
+      </div>
+    </div>
+  </footer>
+
+  <script defer src="https://cdnjs.cloudflare.com/ajax/libs/prism/1.29.0/prism.min.js"></script>
+  <script defer src="https://cdnjs.cloudflare.com/ajax/libs/prism/1.29.0/components/prism-sql.min.js"></script>
+  <script defer src="https://cdnjs.cloudflare.com/ajax/libs/prism/1.29.0/components/prism-rust.min.js"></script>
+  <script defer src="https://cdnjs.cloudflare.com/ajax/libs/prism/1.29.0/components/prism-bash.min.js"></script>
+  <script defer src="https://cdnjs.cloudflare.com/ajax/libs/prism/1.29.0/components/prism-toml.min.js"></script>
+  <script defer src="../js/main.js"></script>
+
+  <script>
+    // Sidebar active state on scroll
+    document.addEventListener('DOMContentLoaded', () => {
+      const links = document.querySelectorAll('.docs-sidebar a');
+      const sections = [];
+
+      links.forEach(link => {
+        const href = link.getAttribute('href');
+        if (href && href.startsWith('#')) {
+          const el = document.getElementById(href.slice(1));
+          if (el) sections.push({ el, link });
+        }
+      });
+
+      const observer = new IntersectionObserver(entries => {
+        entries.forEach(entry => {
+          if (entry.isIntersecting) {
+            links.forEach(l => l.classList.remove('active'));
+            const match = sections.find(s => s.el === entry.target);
+            if (match) match.link.classList.add('active');
+          }
+        });
+      }, { rootMargin: '-80px 0px -70% 0px' });
+
+      sections.forEach(s => observer.observe(s.el));
+    });
+  </script>
+
+</body>
+</html>
