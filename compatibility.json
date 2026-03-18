@@ -1,7 +1,7 @@
 {
-  "latest_version": "0.18.8",
+  "latest_version": "0.18.9",
   "abi_version": 1,
-  "released_at": "2026-03-17T17:36:48Z",
+  "released_at": "2026-03-18T16:34:42Z",
   "minimum_supported": "0.1.0",
   "platforms": [
     "x86_64-unknown-linux-gnu",
@@ -10,5 +10,5 @@
     "aarch64-apple-darwin",
     "x86_64-pc-windows-msvc"
   ],
-  "download_base_url": "https://github.com/laminardb/laminardb/releases/download/v0.18.8"
+  "download_base_url": "https://github.com/laminardb/laminardb/releases/download/v0.18.9"
 }
