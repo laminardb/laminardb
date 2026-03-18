@@ -65,7 +65,7 @@ globset = "0.4"
 # DataFusion and Arrow - using latest versions
 arrow = { version = "57.2", default-features = true }
 arrow-array = "57.2"
-arrow-schema = "57.2"
+arrow-schema = "58.0"
 arrow-cast = "57.2"
 arrow-ipc = "57.2"
 arrow-select = "57.2"
