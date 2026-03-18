@@ -495,7 +495,7 @@ pub struct KafkaSourceConfig {
 
     // -- Backpressure --
     /// Capacity of the bounded channel between the background Kafka reader
-    /// task and `poll_batch()` (default: 512). Must be >= `max_poll_records`.
+    /// task and `poll_batch()` (default: 1024). Must be >= `max_poll_records`.
     pub reader_channel_capacity: usize,
     /// Channel fill ratio at which to pause consumption.
     pub backpressure_high_watermark: f64,

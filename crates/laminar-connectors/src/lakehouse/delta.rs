@@ -1525,6 +1525,7 @@ mod tests {
         assert!(sink.buffered_bytes() > 0);
     }
 
+    #[cfg(not(feature = "delta-lake"))]
     #[tokio::test]
     async fn test_write_batch_buffers_without_commit() {
         let mut config = test_config();
@@ -1532,7 +1533,7 @@ mod tests {
         let mut sink = DeltaLakeSink::new(config);
         sink.state = ConnectorState::Running;
 
-        // Write batches that exceed the threshold — no mid-epoch commit.
+        // Without the delta-lake feature, mid-epoch flush is compiled out.
         let batch = test_batch(6);
         sink.write_batch(&batch).await.unwrap();
         sink.write_batch(&batch).await.unwrap();
