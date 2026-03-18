@@ -1,6 +1,6 @@
 //! AHashMap-backed state store with dual-structure design.
 //!
-//! [`AHashMapStore`] uses `AHashMap<Vec<u8>, Vec<u8>>` for O(1) point lookups
+//! [`AHashMapStore`] uses `AHashMap<Bytes, Bytes>` for O(1) point lookups
 //! and an optional `BTreeSet<Bytes>` index for efficient prefix/range scans.
 //! This is the first backend that supports zero-copy `get_ref`.
 //!
@@ -156,6 +156,10 @@ impl StateStore for AHashMapStore {
         &'a self,
         prefix: &'a [u8],
     ) -> Box<dyn Iterator<Item = (Bytes, Bytes)> + 'a> {
+        debug_assert!(
+            self.index.is_some(),
+            "prefix_scan called on hash-only store — use AHashMapStore::new() to enable scans"
+        );
         let Some(ref index) = self.index else {
             return Box::new(std::iter::empty());
         };
@@ -191,6 +195,10 @@ impl StateStore for AHashMapStore {
         &'a self,
         range: Range<&'a [u8]>,
     ) -> Box<dyn Iterator<Item = (Bytes, Bytes)> + 'a> {
+        debug_assert!(
+            self.index.is_some(),
+            "range_scan called on hash-only store — use AHashMapStore::new() to enable scans"
+        );
         let Some(ref index) = self.index else {
             return Box::new(std::iter::empty());
         };
@@ -228,11 +236,14 @@ impl StateStore for AHashMapStore {
                 })
                 .collect()
         } else {
-            // No ordered index — iterate the hash map directly
-            self.data
+            // No ordered index — iterate the hash map and sort for deterministic output
+            let mut data: Vec<(Vec<u8>, Vec<u8>)> = self
+                .data
                 .iter()
                 .map(|(k, v)| (k.to_vec(), v.to_vec()))
-                .collect()
+                .collect();
+            data.sort_unstable_by(|(a, _), (b, _)| a.cmp(b));
+            data
         };
         StateSnapshot::new(data)
     }
@@ -455,21 +466,21 @@ mod tests {
     }
 
     #[test]
-    fn test_hash_only_scans_return_empty() {
+    #[should_panic(expected = "prefix_scan called on hash-only store")]
+    fn test_hash_only_prefix_scan_debug_asserts() {
         let mut store = AHashMapStore::hash_only();
         store.put(b"key1", Bytes::from_static(b"value1")).unwrap();
-        store.put(b"key2", Bytes::from_static(b"value2")).unwrap();
+        // debug_assert fires — calling prefix_scan on hash-only store is a bug
+        let _: Vec<_> = store.prefix_scan(b"key").collect();
+    }
 
-        // prefix_scan returns empty when no ordered index
-        let results: Vec<_> = store.prefix_scan(b"key").collect();
-        assert!(results.is_empty());
-
-        let results: Vec<_> = store.prefix_scan(b"").collect();
-        assert!(results.is_empty());
-
-        // range_scan returns empty when no ordered index
-        let results: Vec<_> = store.range_scan(b"a".as_slice()..b"z".as_slice()).collect();
-        assert!(results.is_empty());
+    #[test]
+    #[should_panic(expected = "range_scan called on hash-only store")]
+    fn test_hash_only_range_scan_debug_asserts() {
+        let mut store = AHashMapStore::hash_only();
+        store.put(b"key1", Bytes::from_static(b"value1")).unwrap();
+        // debug_assert fires — calling range_scan on hash-only store is a bug
+        let _: Vec<_> = store.range_scan(b"a".as_slice()..b"z".as_slice()).collect();
     }
 
     #[test]
