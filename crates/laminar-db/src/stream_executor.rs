@@ -27,7 +27,7 @@ use laminar_sql::parser::join_parser::analyze_joins;
 use laminar_sql::parser::{EmitClause, EmitStrategy as SqlEmitStrategy};
 use laminar_sql::translator::{
     AsofJoinTranslatorConfig, JoinOperatorConfig, OrderOperatorConfig, StreamJoinConfig,
-    TemporalJoinTranslatorConfig, WindowOperatorConfig, WindowType,
+    StreamJoinType, TemporalJoinTranslatorConfig, WindowOperatorConfig, WindowType,
 };
 
 use datafusion_expr::LogicalPlan;
@@ -507,6 +507,19 @@ impl StreamExecutor {
         if projection_sql.is_none() {
             projection_sql = stream_join_projection_sql;
         }
+        // Warn when a JOIN+BETWEEN query was not detected as an interval join
+        if stream_join_config.is_none() && asof_config.is_none() && temporal_config.is_none() {
+            let sql_upper = sql.to_uppercase();
+            if sql_upper.contains("JOIN") && sql_upper.contains("BETWEEN") {
+                tracing::warn!(
+                    query = %name,
+                    "Query contains JOIN with BETWEEN but was not detected as an interval join. \
+                     It will execute as a batch join (matches within one cycle only). \
+                     Ensure time columns in the BETWEEN clause are simple column references."
+                );
+            }
+        }
+
         let table_refs = extract_table_references(&sql);
         let idx = self.queries.len();
         let query = StreamQuery {
@@ -2261,7 +2274,7 @@ impl StreamExecutor {
         // Warn once per query when the temporal table is modified
         let current_rows = versioned.batch.num_rows();
         let last_rows = self.last_temporal_row_count.get(&idx).copied().unwrap_or(0);
-        if current_rows != last_rows && last_rows > 0 {
+        if current_rows < last_rows {
             tracing::warn!(
                 query = %query_name,
                 table = %config.table_name,
@@ -2583,14 +2596,27 @@ impl StreamExecutor {
             );
         }
 
-        // Checkpoint interval join states
+        // Checkpoint interval join states (compact before serializing)
         let mut join_checkpoints = FxHashMap::with_capacity_and_hasher(
             self.interval_join_states.len(),
             rustc_hash::FxBuildHasher,
         );
-        for (&idx, state) in &self.interval_join_states {
+        for (&idx, state) in &mut self.interval_join_states {
             let name = self.queries[idx].name.to_string();
-            join_checkpoints.insert(name, state.to_checkpoint()?);
+            if let Some(ref cfg) = self.queries[idx].stream_join_config {
+                join_checkpoints.insert(
+                    name,
+                    state.snapshot_checkpoint(
+                        &cfg.left_key,
+                        &cfg.left_time_column,
+                        &cfg.right_key,
+                        &cfg.right_time_column,
+                    )?,
+                );
+            } else {
+                // Fallback: checkpoint without column names (shouldn't happen)
+                join_checkpoints.insert(name, state.snapshot_checkpoint("", "", "", "")?);
+            }
         }
 
         if agg_checkpoints.is_empty()
@@ -3149,6 +3175,19 @@ fn detect_stream_join_query(sql: &str) -> (Option<StreamJoinConfig>, Option<Stri
         return (None, None);
     }
 
+    // Only INNER JOIN is supported by the interval join engine. LEFT/RIGHT/FULL
+    // would silently produce inner-join behavior (missing unmatched rows).
+    if !matches!(config.join_type, StreamJoinType::Inner) {
+        tracing::warn!(
+            join_type = %config.join_type,
+            "Stream-stream interval join only supports INNER JOIN. \
+             {} JOIN would produce incorrect results. Query will use \
+             DataFusion batch join instead.",
+            config.join_type
+        );
+        return (None, None);
+    }
+
     let projection_sql = build_stream_join_projection_sql(select, stream_analysis, &config);
 
     (Some(config), Some(projection_sql))
@@ -3200,7 +3239,10 @@ fn build_stream_join_projection_sql(
         })
         .unwrap_or_default();
 
-    format!("SELECT {} FROM __interval_tmp{where_clause}", items.join(", "))
+    format!(
+        "SELECT {} FROM __interval_tmp{where_clause}",
+        items.join(", ")
+    )
 }
 
 fn rewrite_stream_join_expr(
@@ -3214,14 +3256,11 @@ fn rewrite_stream_join_expr(
             let table = &parts[0].value;
             let col = &parts[1].value;
             // If the table qualifier matches left or right, strip it
-            let is_left = table == &config.left_table
-                || left_alias.is_some_and(|a| a == table);
-            let is_right = table == &config.right_table
-                || right_alias.is_some_and(|a| a == table);
+            let is_left = table == &config.left_table || left_alias.is_some_and(|a| a == table);
+            let is_right = table == &config.right_table || right_alias.is_some_and(|a| a == table);
             if is_left || is_right {
-                // If right-side col name clashes with left, use suffixed name
                 if is_right {
-                    // Check if there's a name collision (use suffixed name)
+                    // All right-side columns are suffixed in output schema
                     format!("{col}_{}", config.right_table)
                 } else {
                     col.clone()
@@ -5176,5 +5215,243 @@ mod tests {
 
         let result = executor.execute_cycle(&source, i64::MIN).await;
         assert!(result.is_ok(), "should succeed without limit");
+    }
+
+    // ── Interval Join Integration Tests ───────────────────────────────────
+
+    fn orders_schema() -> Arc<Schema> {
+        Arc::new(Schema::new(vec![
+            Field::new("order_id", DataType::Utf8, false),
+            Field::new("ts", DataType::Int64, false),
+            Field::new("amount", DataType::Float64, false),
+        ]))
+    }
+
+    fn payments_schema() -> Arc<Schema> {
+        Arc::new(Schema::new(vec![
+            Field::new("order_id", DataType::Utf8, false),
+            Field::new("ts", DataType::Int64, false),
+            Field::new("paid", DataType::Float64, false),
+        ]))
+    }
+
+    fn make_orders(ids: &[&str], timestamps: &[i64], amounts: &[f64]) -> RecordBatch {
+        RecordBatch::try_new(
+            orders_schema(),
+            vec![
+                Arc::new(StringArray::from(ids.to_vec())),
+                Arc::new(Int64Array::from(timestamps.to_vec())),
+                Arc::new(Float64Array::from(amounts.to_vec())),
+            ],
+        )
+        .unwrap()
+    }
+
+    fn make_payments(ids: &[&str], timestamps: &[i64], amounts: &[f64]) -> RecordBatch {
+        RecordBatch::try_new(
+            payments_schema(),
+            vec![
+                Arc::new(StringArray::from(ids.to_vec())),
+                Arc::new(Int64Array::from(timestamps.to_vec())),
+                Arc::new(Float64Array::from(amounts.to_vec())),
+            ],
+        )
+        .unwrap()
+    }
+
+    #[tokio::test]
+    async fn test_interval_join_cross_cycle_via_sql() {
+        let ctx = create_session_context();
+        register_streaming_functions(&ctx);
+        let mut executor = StreamExecutor::new(ctx);
+
+        executor.add_query(
+            "joined".to_string(),
+            "SELECT o.order_id, o.amount, p.paid \
+             FROM orders o \
+             JOIN payments p ON o.order_id = p.order_id \
+             AND p.ts BETWEEN o.ts AND o.ts + INTERVAL '1' HOUR"
+                .to_string(),
+            None,
+            None,
+            None,
+        );
+
+        // Verify interval join was detected
+        assert!(
+            executor.queries[0].stream_join_config.is_some(),
+            "Should detect interval join"
+        );
+
+        // Cycle 1: only orders
+        let mut sources = FxHashMap::default();
+        sources.insert(
+            Arc::from("orders"),
+            vec![make_orders(&["A"], &[1000], &[100.0])],
+        );
+        sources.insert(Arc::from("payments"), vec![]);
+
+        let r1 = executor.execute_cycle(&sources, 0).await.unwrap();
+        let c1_rows: usize = r1
+            .get("joined")
+            .map_or(0, |bs| bs.iter().map(|b| b.num_rows()).sum());
+        assert_eq!(c1_rows, 0, "No payments yet, no matches");
+
+        // Cycle 2: payment arrives within time bound
+        sources.clear();
+        sources.insert(Arc::from("orders"), vec![]);
+        sources.insert(
+            Arc::from("payments"),
+            vec![make_payments(&["A"], &[2000], &[100.0])],
+        );
+
+        let r2 = executor.execute_cycle(&sources, 0).await.unwrap();
+        let c2_rows: usize = r2
+            .get("joined")
+            .map_or(0, |bs| bs.iter().map(|b| b.num_rows()).sum());
+        assert_eq!(c2_rows, 1, "Cross-cycle match: order@1000 ~ payment@2000");
+    }
+
+    #[tokio::test]
+    async fn test_interval_join_null_keys_via_sql() {
+        let ctx = create_session_context();
+        register_streaming_functions(&ctx);
+        let mut executor = StreamExecutor::new(ctx);
+
+        executor.add_query(
+            "joined".to_string(),
+            "SELECT o.order_id, o.amount, p.paid \
+             FROM orders o \
+             JOIN payments p ON o.order_id = p.order_id \
+             AND p.ts BETWEEN o.ts AND o.ts + INTERVAL '1' HOUR"
+                .to_string(),
+            None,
+            None,
+            None,
+        );
+
+        // Both sides include null keys
+        let orders_schema_nullable = Arc::new(Schema::new(vec![
+            Field::new("order_id", DataType::Utf8, true),
+            Field::new("ts", DataType::Int64, false),
+            Field::new("amount", DataType::Float64, false),
+        ]));
+        let orders = RecordBatch::try_new(
+            orders_schema_nullable,
+            vec![
+                Arc::new(StringArray::from(vec![Some("A"), None])),
+                Arc::new(Int64Array::from(vec![1000, 1000])),
+                Arc::new(Float64Array::from(vec![100.0, 200.0])),
+            ],
+        )
+        .unwrap();
+
+        let payments_schema_nullable = Arc::new(Schema::new(vec![
+            Field::new("order_id", DataType::Utf8, true),
+            Field::new("ts", DataType::Int64, false),
+            Field::new("paid", DataType::Float64, false),
+        ]));
+        let payments = RecordBatch::try_new(
+            payments_schema_nullable,
+            vec![
+                Arc::new(StringArray::from(vec![Some("A"), None])),
+                Arc::new(Int64Array::from(vec![1500, 1500])),
+                Arc::new(Float64Array::from(vec![100.0, 200.0])),
+            ],
+        )
+        .unwrap();
+
+        let mut sources = FxHashMap::default();
+        sources.insert(Arc::from("orders"), vec![orders]);
+        sources.insert(Arc::from("payments"), vec![payments]);
+
+        let results = executor.execute_cycle(&sources, 0).await.unwrap();
+        let rows: usize = results
+            .get("joined")
+            .map_or(0, |bs| bs.iter().map(|b| b.num_rows()).sum());
+        // Only "A" matches "A"; null keys produce no matches
+        assert_eq!(rows, 1, "Null keys should not match");
+    }
+
+    #[test]
+    fn test_left_join_not_routed_to_interval() {
+        // LEFT JOIN with BETWEEN should NOT route to interval join engine
+        let (config, _) = detect_stream_join_query(
+            "SELECT * FROM orders o \
+             LEFT JOIN payments p ON o.order_id = p.order_id \
+             AND p.ts BETWEEN o.ts AND o.ts + INTERVAL '1' HOUR",
+        );
+        assert!(
+            config.is_none(),
+            "LEFT JOIN should not route to interval join engine"
+        );
+    }
+
+    #[tokio::test]
+    async fn test_interval_join_checkpoint_roundtrip() {
+        let ctx = create_session_context();
+        register_streaming_functions(&ctx);
+        let mut executor = StreamExecutor::new(ctx);
+
+        executor.add_query(
+            "joined".to_string(),
+            "SELECT o.order_id, o.amount, p.paid \
+             FROM orders o \
+             JOIN payments p ON o.order_id = p.order_id \
+             AND p.ts BETWEEN o.ts AND o.ts + INTERVAL '1' HOUR"
+                .to_string(),
+            None,
+            None,
+            None,
+        );
+
+        // Cycle 1: buffer orders
+        let mut sources = FxHashMap::default();
+        sources.insert(
+            Arc::from("orders"),
+            vec![make_orders(&["A"], &[1000], &[100.0])],
+        );
+        sources.insert(Arc::from("payments"), vec![]);
+        let _ = executor.execute_cycle(&sources, 0).await.unwrap();
+
+        // Checkpoint
+        let checkpoint = executor.snapshot_state().unwrap();
+        assert!(checkpoint.is_some(), "Should have join state to checkpoint");
+        let cp = checkpoint.unwrap();
+        assert!(
+            !cp.join_states.is_empty(),
+            "Should have interval join state"
+        );
+
+        // Serialize then restore into new executor
+        let cp_bytes = serde_json::to_vec(&cp).unwrap();
+        let ctx2 = create_session_context();
+        register_streaming_functions(&ctx2);
+        let mut executor2 = StreamExecutor::new(ctx2);
+        executor2.add_query(
+            "joined".to_string(),
+            "SELECT o.order_id, o.amount, p.paid \
+             FROM orders o \
+             JOIN payments p ON o.order_id = p.order_id \
+             AND p.ts BETWEEN o.ts AND o.ts + INTERVAL '1' HOUR"
+                .to_string(),
+            None,
+            None,
+            None,
+        );
+        executor2.restore_state(&cp_bytes).unwrap();
+
+        // Cycle 2 on restored executor: payment matches buffered order
+        sources.clear();
+        sources.insert(Arc::from("orders"), vec![]);
+        sources.insert(
+            Arc::from("payments"),
+            vec![make_payments(&["A"], &[2000], &[100.0])],
+        );
+        let results = executor2.execute_cycle(&sources, 0).await.unwrap();
+        let rows: usize = results
+            .get("joined")
+            .map_or(0, |bs| bs.iter().map(|b| b.num_rows()).sum());
+        assert_eq!(rows, 1, "Restored state should match cross-cycle");
     }
 }

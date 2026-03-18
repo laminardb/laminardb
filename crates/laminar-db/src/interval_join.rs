@@ -15,15 +15,13 @@ use std::hash::{Hash, Hasher};
 use std::sync::Arc;
 
 use arrow::array::{
-    Array, ArrayRef, Float64Array, Int64Array, RecordBatch, StringArray,
-    TimestampMillisecondArray,
+    Array, ArrayRef, Float64Array, Int64Array, RecordBatch, StringArray, TimestampMillisecondArray,
 };
 use arrow::compute::concat_batches;
 use arrow::datatypes::{DataType, Field, Schema, SchemaRef, TimeUnit};
-use rustc_hash::{FxHashMap, FxHashSet};
+use rustc_hash::FxHashMap;
 
 use laminar_sql::translator::StreamJoinConfig;
-use laminar_sql::translator::StreamJoinType;
 
 use crate::aggregate_state::JoinStateCheckpoint;
 use crate::error::DbError;
@@ -37,16 +35,29 @@ enum KeyColumn<'a> {
 }
 
 impl KeyColumn<'_> {
-    fn hash_at(&self, i: usize) -> u64 {
+    fn is_null(&self, i: usize) -> bool {
+        match self {
+            KeyColumn::Utf8(a) => a.is_null(i),
+            KeyColumn::Int64(a) => a.is_null(i),
+        }
+    }
+
+    fn hash_at(&self, i: usize) -> Option<u64> {
+        if self.is_null(i) {
+            return None;
+        }
         let mut hasher = DefaultHasher::new();
         match self {
             KeyColumn::Utf8(a) => a.value(i).hash(&mut hasher),
             KeyColumn::Int64(a) => a.value(i).hash(&mut hasher),
         }
-        hasher.finish()
+        Some(hasher.finish())
     }
 
     fn keys_equal(&self, i: usize, other: &KeyColumn<'_>, j: usize) -> bool {
+        if self.is_null(i) || other.is_null(j) {
+            return false;
+        }
         match (self, other) {
             (KeyColumn::Utf8(a), KeyColumn::Utf8(b)) => a.value(i) == b.value(j),
             (KeyColumn::Int64(a), KeyColumn::Int64(b)) => a.value(i) == b.value(j),
@@ -55,7 +66,10 @@ impl KeyColumn<'_> {
     }
 }
 
-fn extract_key_column<'a>(batch: &'a RecordBatch, col_name: &str) -> Result<KeyColumn<'a>, DbError> {
+fn extract_key_column<'a>(
+    batch: &'a RecordBatch,
+    col_name: &str,
+) -> Result<KeyColumn<'a>, DbError> {
     let col_idx = batch
         .schema()
         .index_of(col_name)
@@ -63,16 +77,22 @@ fn extract_key_column<'a>(batch: &'a RecordBatch, col_name: &str) -> Result<KeyC
     let array = batch.column(col_idx);
     match array.data_type() {
         DataType::Utf8 => {
-            let a = array.as_any().downcast_ref::<StringArray>()
+            let a = array
+                .as_any()
+                .downcast_ref::<StringArray>()
                 .ok_or_else(|| DbError::Pipeline(format!("Column '{col_name}' is not Utf8")))?;
             Ok(KeyColumn::Utf8(a))
         }
         DataType::Int64 => {
-            let a = array.as_any().downcast_ref::<Int64Array>()
+            let a = array
+                .as_any()
+                .downcast_ref::<Int64Array>()
                 .ok_or_else(|| DbError::Pipeline(format!("Column '{col_name}' is not Int64")))?;
             Ok(KeyColumn::Int64(a))
         }
-        other => Err(DbError::Pipeline(format!("Unsupported key column type: {other}"))),
+        other => Err(DbError::Pipeline(format!(
+            "Unsupported key column type: {other}"
+        ))),
     }
 }
 
@@ -84,17 +104,25 @@ fn extract_column_as_timestamps(batch: &RecordBatch, col_name: &str) -> Result<V
     let array = batch.column(col_idx);
     match array.data_type() {
         DataType::Int64 => {
-            let a = array.as_any().downcast_ref::<Int64Array>()
+            let a = array
+                .as_any()
+                .downcast_ref::<Int64Array>()
                 .ok_or_else(|| DbError::Pipeline(format!("Column '{col_name}' is not Int64")))?;
             Ok(a.values().to_vec())
         }
         DataType::Timestamp(TimeUnit::Millisecond, _) => {
-            let a = array.as_any().downcast_ref::<TimestampMillisecondArray>()
-                .ok_or_else(|| DbError::Pipeline(format!("Column '{col_name}' is not TimestampMillisecond")))?;
+            let a = array
+                .as_any()
+                .downcast_ref::<TimestampMillisecondArray>()
+                .ok_or_else(|| {
+                    DbError::Pipeline(format!("Column '{col_name}' is not TimestampMillisecond"))
+                })?;
             Ok(a.values().to_vec())
         }
         DataType::Float64 => {
-            let a = array.as_any().downcast_ref::<Float64Array>()
+            let a = array
+                .as_any()
+                .downcast_ref::<Float64Array>()
                 .ok_or_else(|| DbError::Pipeline(format!("Column '{col_name}' is not Float64")))?;
             #[allow(clippy::cast_possible_truncation)]
             Ok(a.values().iter().map(|v| *v as i64).collect())
@@ -106,6 +134,9 @@ fn extract_column_as_timestamps(batch: &RecordBatch, col_name: &str) -> Result<V
 }
 
 // ── Per-side state ─────────────────────────────────────────────────────────
+
+/// Compact when accumulated batch count exceeds this threshold.
+const COMPACTION_THRESHOLD: usize = 32;
 
 /// Index type: `key_hash` → sorted `timestamp` → list of `(batch_idx, row_idx)`.
 type SideIndex = FxHashMap<u64, BTreeMap<i64, Vec<(usize, usize)>>>;
@@ -143,22 +174,26 @@ impl SideState {
         let keys = extract_key_column(batch, key_col_name)?;
         let timestamps = extract_column_as_timestamps(batch, time_col_name)?;
 
+        let mut indexed_rows = 0usize;
         for (row_idx, &ts) in timestamps.iter().enumerate() {
-            let key_hash = keys.hash_at(row_idx);
-            self.index
-                .entry(key_hash)
-                .or_default()
-                .entry(ts)
-                .or_default()
-                .push((batch_idx, row_idx));
+            if let Some(key_hash) = keys.hash_at(row_idx) {
+                self.index
+                    .entry(key_hash)
+                    .or_default()
+                    .entry(ts)
+                    .or_default()
+                    .push((batch_idx, row_idx));
+                indexed_rows += 1;
+            }
+            // Null keys are skipped per SQL three-valued logic
         }
-        self.row_count += batch.num_rows();
+        self.row_count += indexed_rows;
         self.batches.push(batch.clone());
         Ok(())
     }
 
-    /// Evict all rows with `ts < cutoff`.
-    fn evict_before(&mut self, cutoff: i64) {
+    /// Evict all rows with `ts < cutoff`, then compact if batch count exceeds threshold.
+    fn evict_before(&mut self, cutoff: i64, key_col: &str, time_col: &str) -> Result<(), DbError> {
         // Collect entries to remove from each btree
         for btree in self.index.values_mut() {
             // BTreeMap::split_off returns entries >= cutoff; we keep those.
@@ -171,6 +206,60 @@ impl SideState {
         }
         // Remove empty btrees
         self.index.retain(|_, btree| !btree.is_empty());
+
+        // Compact when too many batches have accumulated (dead rows waste memory)
+        if self.batches.len() > COMPACTION_THRESHOLD {
+            self.compact(key_col, time_col)?;
+        }
+        Ok(())
+    }
+
+    /// Compact all live rows into a single batch, freeing dead batch memory.
+    fn compact(&mut self, key_col: &str, time_col: &str) -> Result<(), DbError> {
+        // Collect all live (batch_idx, row_idx) from the index
+        let mut live_rows: Vec<(usize, usize)> = Vec::with_capacity(self.row_count);
+        for btree in self.index.values() {
+            for entries in btree.values() {
+                live_rows.extend_from_slice(entries);
+            }
+        }
+
+        if live_rows.is_empty() {
+            self.batches.clear();
+            return Ok(());
+        }
+
+        // Sort by (batch_idx, row_idx) for sequential access
+        live_rows.sort_unstable();
+
+        // Slice each live row and collect
+        let mut slices: Vec<RecordBatch> = Vec::with_capacity(live_rows.len());
+        for &(batch_idx, row_idx) in &live_rows {
+            slices.push(self.batches[batch_idx].slice(row_idx, 1));
+        }
+
+        let schema = self.batches[0].schema();
+        let compacted = concat_batches(&schema, &slices)
+            .map_err(|e| DbError::query_pipeline_arrow("interval join (compact)", &e))?;
+
+        // Replace batches and rebuild index
+        self.batches = vec![compacted];
+        self.index.clear();
+
+        let keys = extract_key_column(&self.batches[0], key_col)?;
+        let timestamps = extract_column_as_timestamps(&self.batches[0], time_col)?;
+        for (row_idx, &ts) in timestamps.iter().enumerate() {
+            if let Some(key_hash) = keys.hash_at(row_idx) {
+                self.index
+                    .entry(key_hash)
+                    .or_default()
+                    .entry(ts)
+                    .or_default()
+                    .push((0, row_idx));
+            }
+        }
+        self.row_count = self.batches[0].num_rows();
+        Ok(())
     }
 }
 
@@ -213,15 +302,31 @@ impl IntervalJoinState {
         size
     }
 
-    /// Serialize to checkpoint.
-    pub(crate) fn to_checkpoint(&self) -> Result<JoinStateCheckpoint, DbError> {
+    /// Serialize to checkpoint. Compacts both sides first so that only live
+    /// rows are serialized (dead/evicted rows in old batches are discarded).
+    pub(crate) fn snapshot_checkpoint(
+        &mut self,
+        left_key: &str,
+        left_time: &str,
+        right_key: &str,
+        right_time: &str,
+    ) -> Result<JoinStateCheckpoint, DbError> {
+        // Compact before serialization to avoid checkpointing dead rows
+        if !self.left.batches.is_empty() {
+            self.left.compact(left_key, left_time)?;
+        }
+        if !self.right.batches.is_empty() {
+            self.right.compact(right_key, right_time)?;
+        }
+
         let mut left_batches_ipc = Vec::with_capacity(self.left.batches.len());
         for batch in &self.left.batches {
             if batch.num_rows() == 0 {
                 continue;
             }
-            let ipc = laminar_core::serialization::serialize_batch_stream(batch)
-                .map_err(|e| DbError::Pipeline(format!("interval join left batch serialization: {e}")))?;
+            let ipc = laminar_core::serialization::serialize_batch_stream(batch).map_err(|e| {
+                DbError::Pipeline(format!("interval join left batch serialization: {e}"))
+            })?;
             left_batches_ipc.push(ipc);
         }
 
@@ -230,8 +335,9 @@ impl IntervalJoinState {
             if batch.num_rows() == 0 {
                 continue;
             }
-            let ipc = laminar_core::serialization::serialize_batch_stream(batch)
-                .map_err(|e| DbError::Pipeline(format!("interval join right batch serialization: {e}")))?;
+            let ipc = laminar_core::serialization::serialize_batch_stream(batch).map_err(|e| {
+                DbError::Pipeline(format!("interval join right batch serialization: {e}"))
+            })?;
             right_batches_ipc.push(ipc);
         }
 
@@ -257,15 +363,21 @@ impl IntervalJoinState {
         state.evicted_watermark = cp.last_evicted_watermark;
 
         for ipc_bytes in &cp.left_batches {
-            let batch = laminar_core::serialization::deserialize_batch_stream(ipc_bytes)
-                .map_err(|e| DbError::Pipeline(format!("interval join left batch deserialization: {e}")))?;
+            let batch =
+                laminar_core::serialization::deserialize_batch_stream(ipc_bytes).map_err(|e| {
+                    DbError::Pipeline(format!("interval join left batch deserialization: {e}"))
+                })?;
             state.left.add_batch(&batch, left_key_col, left_time_col)?;
         }
 
         for ipc_bytes in &cp.right_batches {
-            let batch = laminar_core::serialization::deserialize_batch_stream(ipc_bytes)
-                .map_err(|e| DbError::Pipeline(format!("interval join right batch deserialization: {e}")))?;
-            state.right.add_batch(&batch, right_key_col, right_time_col)?;
+            let batch =
+                laminar_core::serialization::deserialize_batch_stream(ipc_bytes).map_err(|e| {
+                    DbError::Pipeline(format!("interval join right batch deserialization: {e}"))
+                })?;
+            state
+                .right
+                .add_batch(&batch, right_key_col, right_time_col)?;
         }
 
         Ok(state)
@@ -276,31 +388,24 @@ impl IntervalJoinState {
 
 /// Build the merged output schema from left and right schemas.
 ///
-/// Duplicate column names are disambiguated by appending `_{table}` to the
-/// right-side field.
+/// All right-side columns are suffixed with `_{right_table}` to avoid
+/// ambiguity. Only INNER JOIN is supported (LEFT/RIGHT/FULL are rejected
+/// at detection time).
 fn build_output_schema(
     left_schema: &SchemaRef,
     right_schema: &SchemaRef,
     config: &StreamJoinConfig,
 ) -> SchemaRef {
-    let mut fields: Vec<Field> = left_schema.fields().iter().map(|f| f.as_ref().clone()).collect();
-
-    let left_names: FxHashSet<&str> = left_schema.fields().iter().map(|f| f.name().as_str()).collect();
-    let make_nullable = matches!(
-        config.join_type,
-        StreamJoinType::Left | StreamJoinType::Right | StreamJoinType::Full
-    );
+    let mut fields: Vec<Field> = left_schema
+        .fields()
+        .iter()
+        .map(|f| f.as_ref().clone())
+        .collect();
 
     for field in right_schema.fields() {
-        let mut f = field.as_ref().clone();
-        if make_nullable {
-            f = f.with_nullable(true);
-        }
-        if left_names.contains(f.name().as_str()) {
-            let suffixed = format!("{}_{}", f.name(), config.right_table);
-            f = f.with_name(suffixed);
-        }
-        fields.push(f);
+        let f = field.as_ref().clone();
+        let suffixed = format!("{}_{}", f.name(), config.right_table);
+        fields.push(f.with_name(suffixed));
     }
 
     Arc::new(Schema::new(fields))
@@ -329,6 +434,18 @@ fn probe_index(
 
 /// Execute one cycle of an interval join.
 ///
+/// Only INNER JOIN is supported — LEFT/RIGHT/FULL are rejected at detection
+/// time in `detect_stream_join_query`.
+///
+/// Interval bounds are inclusive on both ends: `|left_ts - right_ts| <= bound_ms`.
+///
+/// Single watermark limitation: the caller provides one watermark for both sides.
+///
+/// NULL keys are skipped per SQL three-valued logic (they never match).
+///
+/// State is compacted on eviction when batch count exceeds `COMPACTION_THRESHOLD`.
+///
+/// Steps:
 /// 1. For each new left row, probe `right.index` for matches within `time_bound`
 /// 2. For each new right row, probe `left.index` for matches (only against
 ///    previously-buffered left rows to avoid double-emit with step 1)
@@ -349,16 +466,20 @@ pub(crate) fn execute_interval_join_cycle(
         None
     } else {
         let schema = left_batches[0].schema();
-        Some(concat_batches(&schema, left_batches)
-            .map_err(|e| DbError::query_pipeline_arrow("interval join (left concat)", &e))?)
+        Some(
+            concat_batches(&schema, left_batches)
+                .map_err(|e| DbError::query_pipeline_arrow("interval join (left concat)", &e))?,
+        )
     };
 
     let new_right = if right_batches.is_empty() {
         None
     } else {
         let schema = right_batches[0].schema();
-        Some(concat_batches(&schema, right_batches)
-            .map_err(|e| DbError::query_pipeline_arrow("interval join (right concat)", &e))?)
+        Some(
+            concat_batches(&schema, right_batches)
+                .map_err(|e| DbError::query_pipeline_arrow("interval join (right concat)", &e))?,
+        )
     };
 
     // Record the boundary between old and new batches on each side
@@ -367,7 +488,9 @@ pub(crate) fn execute_interval_join_cycle(
 
     // Step 1: Buffer new right into state first (so new left can probe it)
     if let Some(ref rb) = new_right {
-        state.right.add_batch(rb, &config.right_key, &config.right_time_column)?;
+        state
+            .right
+            .add_batch(rb, &config.right_key, &config.right_time_column)?;
     }
 
     // Collect match pairs: (left_batch_idx, left_row_idx, right_batch_idx, right_row_idx)
@@ -382,11 +505,14 @@ pub(crate) fn execute_interval_join_cycle(
         let new_left_batch_idx = left_old_count;
 
         for (row_idx, &left_ts) in left_timestamps.iter().enumerate() {
-            let key_hash = left_keys.hash_at(row_idx);
+            let Some(key_hash) = left_keys.hash_at(row_idx) else {
+                continue; // Skip null keys
+            };
             let candidates = probe_index(&state.right.index, key_hash, left_ts, bound_ms);
 
             for (r_batch, r_row) in candidates {
-                let r_key_col = extract_key_column(&state.right.batches[r_batch], &config.right_key)?;
+                let r_key_col =
+                    extract_key_column(&state.right.batches[r_batch], &config.right_key)?;
                 if left_keys.keys_equal(row_idx, &r_key_col, r_row) {
                     match_pairs.push((new_left_batch_idx, row_idx, r_batch, r_row));
                 }
@@ -402,12 +528,15 @@ pub(crate) fn execute_interval_join_cycle(
         let new_right_batch_idx = right_old_count;
 
         for (row_idx, &right_ts) in right_timestamps.iter().enumerate() {
-            let key_hash = right_keys.hash_at(row_idx);
+            let Some(key_hash) = right_keys.hash_at(row_idx) else {
+                continue; // Skip null keys
+            };
             let candidates = probe_index(&state.left.index, key_hash, right_ts, bound_ms);
 
             for (l_batch, l_row) in candidates {
                 if l_batch < left_old_count {
-                    let l_key_col = extract_key_column(&state.left.batches[l_batch], &config.left_key)?;
+                    let l_key_col =
+                        extract_key_column(&state.left.batches[l_batch], &config.left_key)?;
                     if right_keys.keys_equal(row_idx, &l_key_col, l_row) {
                         match_pairs.push((l_batch, l_row, new_right_batch_idx, row_idx));
                     }
@@ -418,7 +547,9 @@ pub(crate) fn execute_interval_join_cycle(
 
     // Step 4: Buffer new left rows into state (after probing to get correct indices)
     if let Some(ref lb) = new_left {
-        state.left.add_batch(lb, &config.left_key, &config.left_time_column)?;
+        state
+            .left
+            .add_batch(lb, &config.left_key, &config.left_time_column)?;
     }
 
     // Determine or cache output schema (now both sides are buffered)
@@ -434,21 +565,23 @@ pub(crate) fn execute_interval_join_cycle(
     let result = if match_pairs.is_empty() {
         Vec::new()
     } else {
-        let output_schema = state.output_schema.as_ref()
-            .ok_or_else(|| DbError::Pipeline("interval join: output schema not available".to_string()))?;
-        let left_schema = state.left.batches.first().map_or_else(
-            || Arc::new(Schema::empty()),
-            RecordBatch::schema,
-        );
-        let right_schema = state.right.batches.first().map_or_else(
-            || Arc::new(Schema::empty()),
-            RecordBatch::schema,
-        );
+        let output_schema = state.output_schema.as_ref().ok_or_else(|| {
+            DbError::Pipeline("interval join: output schema not available".to_string())
+        })?;
+        let left_schema = state
+            .left
+            .batches
+            .first()
+            .map_or_else(|| Arc::new(Schema::empty()), RecordBatch::schema);
+        let right_schema = state
+            .right
+            .batches
+            .first()
+            .map_or_else(|| Arc::new(Schema::empty()), RecordBatch::schema);
 
         let num_rows = match_pairs.len();
-        let mut columns: Vec<ArrayRef> = Vec::with_capacity(
-            left_schema.fields().len() + right_schema.fields().len(),
-        );
+        let mut columns: Vec<ArrayRef> =
+            Vec::with_capacity(left_schema.fields().len() + right_schema.fields().len());
 
         // Build left columns by taking from the correct batches
         for col_idx in 0..left_schema.fields().len() {
@@ -480,14 +613,22 @@ pub(crate) fn execute_interval_join_cycle(
 
         let batch = RecordBatch::try_new(output_schema.clone(), columns)
             .map_err(|e| DbError::query_pipeline_arrow("interval join (result)", &e))?;
-        if batch.num_rows() > 0 { vec![batch] } else { Vec::new() }
+        if batch.num_rows() > 0 {
+            vec![batch]
+        } else {
+            Vec::new()
+        }
     };
 
-    // Step 6: Evict expired rows
+    // Step 6: Evict expired rows (and compact if batch count exceeds threshold)
     let cutoff = watermark.saturating_sub(bound_ms);
     if cutoff > state.evicted_watermark {
-        state.left.evict_before(cutoff);
-        state.right.evict_before(cutoff);
+        state
+            .left
+            .evict_before(cutoff, &config.left_key, &config.left_time_column)?;
+        state
+            .right
+            .evict_before(cutoff, &config.right_key, &config.right_time_column)?;
         state.evicted_watermark = cutoff;
     }
 
@@ -497,6 +638,7 @@ pub(crate) fn execute_interval_join_cycle(
 #[cfg(test)]
 mod tests {
     use super::*;
+    use laminar_sql::translator::StreamJoinType;
     use std::time::Duration;
 
     fn make_config() -> StreamJoinConfig {
@@ -662,8 +804,15 @@ mod tests {
         let right = right_batch(&["A"], &[110], &[1.0]);
         let _ = execute_interval_join_cycle(&mut state, &[left], &[right], &config, 50).unwrap();
 
-        // Checkpoint
-        let cp = state.to_checkpoint().unwrap();
+        // Checkpoint (compacts before serializing)
+        let cp = state
+            .snapshot_checkpoint(
+                &config.left_key,
+                &config.left_time_column,
+                &config.right_key,
+                &config.right_time_column,
+            )
+            .unwrap();
         assert!(cp.left_buffer_rows > 0);
         assert!(cp.right_buffer_rows > 0);
 
@@ -679,8 +828,97 @@ mod tests {
 
         // New right data should still match the restored left
         let right2 = right_batch(&["A"], &[120], &[2.0]);
-        let result = execute_interval_join_cycle(&mut restored, &[], &[right2], &config, 50).unwrap();
+        let result =
+            execute_interval_join_cycle(&mut restored, &[], &[right2], &config, 50).unwrap();
         assert_eq!(result.len(), 1);
         assert_eq!(result[0].num_rows(), 1); // Matches restored A@100
+    }
+
+    fn left_batch_nullable(
+        ids: &[Option<&str>],
+        timestamps: &[i64],
+        values: &[f64],
+    ) -> RecordBatch {
+        let schema = Arc::new(Schema::new(vec![
+            Field::new("id", DataType::Utf8, true),
+            Field::new("ts", DataType::Int64, false),
+            Field::new("price", DataType::Float64, false),
+        ]));
+        RecordBatch::try_new(
+            schema,
+            vec![
+                Arc::new(StringArray::from(ids.to_vec())),
+                Arc::new(Int64Array::from(timestamps.to_vec())),
+                Arc::new(Float64Array::from(values.to_vec())),
+            ],
+        )
+        .unwrap()
+    }
+
+    fn right_batch_nullable(
+        ids: &[Option<&str>],
+        timestamps: &[i64],
+        amounts: &[f64],
+    ) -> RecordBatch {
+        let schema = Arc::new(Schema::new(vec![
+            Field::new("id", DataType::Utf8, true),
+            Field::new("ts", DataType::Int64, false),
+            Field::new("amount", DataType::Float64, false),
+        ]));
+        RecordBatch::try_new(
+            schema,
+            vec![
+                Arc::new(StringArray::from(ids.to_vec())),
+                Arc::new(Int64Array::from(timestamps.to_vec())),
+                Arc::new(Float64Array::from(amounts.to_vec())),
+            ],
+        )
+        .unwrap()
+    }
+
+    #[test]
+    fn test_null_key_no_match() {
+        let config = make_config();
+        let mut state = IntervalJoinState::new();
+
+        // Left has a null key row, right has a matching timestamp
+        let left = left_batch_nullable(&[Some("A"), None], &[100, 100], &[10.0, 20.0]);
+        let right = right_batch_nullable(&[Some("A"), None], &[110, 110], &[1.0, 2.0]);
+
+        let result =
+            execute_interval_join_cycle(&mut state, &[left], &[right], &config, 0).unwrap();
+
+        // Only A matches A — null keys never match (SQL three-valued logic)
+        assert_eq!(result.len(), 1);
+        assert_eq!(result[0].num_rows(), 1);
+    }
+
+    #[test]
+    fn test_compaction_frees_batches() {
+        let config = make_config(); // time_bound = 100ms
+        let mut state = IntervalJoinState::new();
+
+        // Add 40+ single-row batches to left side
+        for i in 0i64..40 {
+            let ts = i * 10 + 1000;
+            #[allow(clippy::cast_precision_loss)]
+            let left = left_batch(&["A"], &[ts], &[i as f64]);
+            let _ = execute_interval_join_cycle(&mut state, &[left], &[], &config, 0).unwrap();
+        }
+        assert!(state.left.batches.len() >= 40);
+
+        // Evict the first half (ts < 1200). Watermark = 1300 → cutoff = 1300 - 100 = 1200
+        let _ = execute_interval_join_cycle(&mut state, &[], &[], &config, 1300).unwrap();
+
+        // After compaction (triggered because batch count > COMPACTION_THRESHOLD),
+        // should have exactly 1 batch with only live rows
+        assert_eq!(state.left.batches.len(), 1);
+        assert!(state.left.row_count > 0);
+
+        // Verify live rows are still accessible by probing with a right-side match
+        let right = right_batch(&["A"], &[1350], &[99.0]);
+        let result = execute_interval_join_cycle(&mut state, &[], &[right], &config, 1300).unwrap();
+        // Should match rows within [1250, 1450] — rows at ts=1300..1390 should be live
+        assert!(!result.is_empty());
     }
 }
