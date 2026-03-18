@@ -366,6 +366,11 @@ const _: () = {
     assert_send::<StreamExecutorCheckpoint>();
 };
 
+/// Checkpoint format: JSON text (legacy, for backward compatibility).
+pub(crate) const CHECKPOINT_FORMAT_JSON: u8 = 0x00;
+/// Checkpoint format: postcard binary (compact, fast).
+pub(crate) const CHECKPOINT_FORMAT_POSTCARD: u8 = 0x01;
+
 /// Checkpoint for raw-batch EOWC state (non-aggregate EOWC queries).
 ///
 /// Stores accumulated `RecordBatch` data as Arrow IPC bytes plus
@@ -460,12 +465,23 @@ pub(crate) struct IncrementalAggState {
     group_types: Vec<DataType>,
     /// Aggregate function specifications.
     agg_specs: Vec<AggFuncSpec>,
-    /// Per-group accumulator state.
+    /// Per-group accumulator state keyed by compact binary row keys.
     ///
+    /// Uses Arrow's `OwnedRow` for 3-5x faster hashing than `Vec<ScalarValue>`:
+    /// a single contiguous byte-slice hash vs N enum-discriminant hashes.
     /// `DataFusion` `Accumulator` is trait-object dispatched (~2ns vtable overhead).
     /// Acceptable because each call processes a batch, not per-row. 50+
     /// aggregate types preclude enum dispatch.
-    groups: AHashMap<Vec<ScalarValue>, Vec<Box<dyn datafusion_expr::Accumulator>>>,
+    groups: AHashMap<arrow::row::OwnedRow, Vec<Box<dyn datafusion_expr::Accumulator>>>,
+    /// Arrow `RowConverter` for encoding/decoding group keys.
+    ///
+    /// Created once at construction time from group-by column data types.
+    /// Reused across all `process_batch` and `emit` calls to amortize setup.
+    row_converter: arrow::row::RowConverter,
+    /// Sentinel `OwnedRow` for global aggregates (no GROUP BY).
+    ///
+    /// Created once from an empty `RowConverter` to avoid per-batch allocation.
+    empty_row_sentinel: arrow::row::OwnedRow,
     /// Output schema (group columns + aggregate results).
     output_schema: SchemaRef,
     /// Compiled pre-agg projection (single-source queries only).
@@ -844,6 +860,22 @@ impl IncrementalAggState {
             None
         };
 
+        // Build the RowConverter once from group-by column types.
+        let sort_fields: Vec<arrow::row::SortField> = group_types
+            .iter()
+            .map(|dt| arrow::row::SortField::new(dt.clone()))
+            .collect();
+        let row_converter = arrow::row::RowConverter::new(sort_fields)
+            .map_err(|e| DbError::Pipeline(format!("row converter init: {e}")))?;
+
+        // Build a sentinel OwnedRow for global aggregates (empty key).
+        let empty_converter = arrow::row::RowConverter::new(vec![])
+            .map_err(|e| DbError::Pipeline(format!("empty row converter: {e}")))?;
+        let empty_rows = empty_converter
+            .convert_columns(&[])
+            .map_err(|e| DbError::Pipeline(format!("empty row convert: {e}")))?;
+        let empty_row_sentinel = empty_rows.row(0).owned();
+
         Ok(Some(Self {
             pre_agg_sql,
             num_group_cols,
@@ -851,6 +883,8 @@ impl IncrementalAggState {
             group_types,
             agg_specs,
             groups: AHashMap::new(),
+            row_converter,
+            empty_row_sentinel,
             output_schema,
             compiled_projection,
             cached_pre_agg_plan,
@@ -877,20 +911,13 @@ impl IncrementalAggState {
             return self.process_batch_no_groups(batch);
         }
 
-        // Vectorized group key extraction using Arrow row format.
+        // Vectorized group key extraction using the struct-level RowConverter.
         let group_cols: Vec<ArrayRef> = (0..self.num_group_cols)
             .map(|i| Arc::clone(batch.column(i)))
             .collect();
 
-        let sort_fields: Vec<arrow::row::SortField> = group_cols
-            .iter()
-            .map(|c| arrow::row::SortField::new(c.data_type().clone()))
-            .collect();
-
-        let converter = arrow::row::RowConverter::new(sort_fields)
-            .map_err(|e| DbError::Pipeline(format!("row converter: {e}")))?;
-
-        let rows = converter
+        let rows = self
+            .row_converter
             .convert_columns(&group_cols)
             .map_err(|e| DbError::Pipeline(format!("row conversion: {e}")))?;
 
@@ -906,9 +933,7 @@ impl IncrementalAggState {
         }
 
         for (row_key, indices) in &group_indices {
-            let sv_key = self.row_to_scalar_key(&converter, row_key)?;
-
-            if !self.groups.contains_key(&sv_key) {
+            if !self.groups.contains_key(row_key) {
                 if self.groups.len() >= self.max_groups {
                     tracing::warn!(
                         max_groups = self.max_groups,
@@ -921,9 +946,9 @@ impl IncrementalAggState {
                 for spec in &self.agg_specs {
                     accs.push(spec.create_accumulator()?);
                 }
-                self.groups.insert(sv_key.clone(), accs);
+                self.groups.insert(row_key.clone(), accs);
             }
-            let Some(accs) = self.groups.get_mut(&sv_key) else {
+            let Some(accs) = self.groups.get_mut(row_key) else {
                 continue;
             };
 
@@ -935,27 +960,51 @@ impl IncrementalAggState {
 
     /// Fast path for global aggregates (COUNT(*), SUM(x), etc. with no GROUP BY).
     fn process_batch_no_groups(&mut self, batch: &RecordBatch) -> Result<(), DbError> {
-        let empty_key: Vec<ScalarValue> = Vec::new();
-        if !self.groups.contains_key(&empty_key) {
+        let sentinel = self.empty_row_sentinel.clone();
+        if !self.groups.contains_key(&sentinel) {
             let mut accs = Vec::with_capacity(self.agg_specs.len());
             for spec in &self.agg_specs {
                 accs.push(spec.create_accumulator()?);
             }
-            self.groups.insert(empty_key.clone(), accs);
+            self.groups.insert(sentinel.clone(), accs);
         }
-        let accs = self.groups.get_mut(&empty_key).unwrap();
+        let accs = self.groups.get_mut(&sentinel).unwrap();
         #[allow(clippy::cast_possible_truncation)]
         let all_indices: Vec<u32> = (0..batch.num_rows() as u32).collect();
         Self::update_group_accumulators(accs, batch, &all_indices, &self.agg_specs)
     }
 
-    /// Convert an `OwnedRow` back to a `Vec<ScalarValue>` group key.
-    fn row_to_scalar_key(
-        &self,
-        converter: &arrow::row::RowConverter,
-        row_key: &arrow::row::OwnedRow,
-    ) -> Result<Vec<ScalarValue>, DbError> {
-        row_to_scalar_key_with_types(converter, row_key, &self.group_types)
+    /// Convert a `Vec<ScalarValue>` group key to an `OwnedRow`.
+    ///
+    /// Used on the cold checkpoint-restore path to convert deserialized
+    /// JSON keys back into the compact binary row format.
+    fn scalar_key_to_row(
+        &mut self,
+        sv_key: &[ScalarValue],
+    ) -> Result<arrow::row::OwnedRow, DbError> {
+        if sv_key.is_empty() {
+            return Ok(self.empty_row_sentinel.clone());
+        }
+        let arrays: Vec<ArrayRef> = sv_key
+            .iter()
+            .enumerate()
+            .map(|(i, sv)| {
+                let arr = sv
+                    .to_array()
+                    .map_err(|e| DbError::Pipeline(format!("scalar→array: {e}")))?;
+                if arr.data_type() != &self.group_types[i] {
+                    arrow::compute::cast(&arr, &self.group_types[i])
+                        .map_err(|e| DbError::Pipeline(format!("key cast: {e}")))
+                } else {
+                    Ok(arr)
+                }
+            })
+            .collect::<Result<_, _>>()?;
+        let rows = self
+            .row_converter
+            .convert_columns(&arrays)
+            .map_err(|e| DbError::Pipeline(format!("key→row: {e}")))?;
+        Ok(rows.row(0).owned())
     }
 
     /// Update accumulators for a single group given the row indices.
@@ -1015,19 +1064,27 @@ impl IncrementalAggState {
 
         let num_rows = self.groups.len();
 
-        let mut group_arrays: Vec<ArrayRef> = Vec::with_capacity(self.num_group_cols);
-        for (col_idx, dt) in self.group_types.iter().enumerate() {
-            let scalars: Vec<ScalarValue> =
-                self.groups.keys().map(|key| key[col_idx].clone()).collect();
-            let array = ScalarValue::iter_to_array(scalars)
-                .map_err(|e| DbError::Pipeline(format!("group key array build: {e}")))?;
-            if array.data_type() == dt {
-                group_arrays.push(array);
-            } else {
-                let casted = arrow::compute::cast(&array, dt).unwrap_or(array);
-                group_arrays.push(casted);
-            }
-        }
+        // Batch-convert all OwnedRow keys back to columnar arrays.
+        let group_arrays: Vec<ArrayRef> = if self.num_group_cols > 0 {
+            let cols = self
+                .row_converter
+                .convert_rows(self.groups.keys().map(|k| k.row()))
+                .map_err(|e| DbError::Pipeline(format!("row→col emit: {e}")))?;
+            // Cast if needed to match declared group types.
+            cols.into_iter()
+                .zip(self.group_types.iter())
+                .map(|(arr, dt)| {
+                    if arr.data_type() == dt {
+                        Ok(arr)
+                    } else {
+                        arrow::compute::cast(&arr, dt)
+                            .map_err(|e| DbError::Pipeline(format!("group cast: {e}")))
+                    }
+                })
+                .collect::<Result<Vec<_>, _>>()?
+        } else {
+            Vec::new()
+        };
 
         let mut agg_arrays: Vec<ArrayRef> = Vec::with_capacity(self.agg_specs.len());
         for (agg_idx, spec) in self.agg_specs.iter().enumerate() {
@@ -1093,14 +1150,12 @@ impl IncrementalAggState {
 
     /// Estimated memory usage in bytes across all groups.
     ///
-    /// Sums `ScalarValue::size()` for each group key element and
-    /// `Accumulator::size()` for each per-group accumulator.
+    /// Uses `OwnedRow::as_ref().len()` for key size (compact byte slice)
+    /// and `Accumulator::size()` for each per-group accumulator.
     pub(crate) fn estimated_size_bytes(&self) -> usize {
         let mut total = 0;
         for (key, accs) in &self.groups {
-            for sv in key {
-                total += sv.size();
-            }
+            total += key.as_ref().len();
             for acc in accs {
                 total += acc.size();
             }
@@ -1118,8 +1173,11 @@ impl IncrementalAggState {
     pub(crate) fn checkpoint_groups(&mut self) -> Result<AggStateCheckpoint, DbError> {
         let fingerprint = self.query_fingerprint();
         let mut groups = Vec::with_capacity(self.groups.len());
-        for (key, accs) in &mut self.groups {
-            let key_json: Vec<serde_json::Value> = key.iter().map(scalar_to_json).collect();
+        for (row_key, accs) in &mut self.groups {
+            // Cold path: convert OwnedRow back to Vec<ScalarValue> for JSON.
+            let sv_key =
+                row_to_scalar_key_with_types(&self.row_converter, row_key, &self.group_types)?;
+            let key_json: Vec<serde_json::Value> = sv_key.iter().map(scalar_to_json).collect();
             let mut acc_states = Vec::with_capacity(accs.len());
             for acc in accs {
                 let state = acc
@@ -1156,8 +1214,10 @@ impl IncrementalAggState {
         }
         self.groups.clear();
         for gc in &checkpoint.groups {
-            let key: Result<Vec<ScalarValue>, _> = gc.key.iter().map(json_to_scalar).collect();
-            let key = key?;
+            // Cold path: convert Vec<ScalarValue> from JSON to OwnedRow.
+            let sv_key: Result<Vec<ScalarValue>, _> = gc.key.iter().map(json_to_scalar).collect();
+            let sv_key = sv_key?;
+            let row_key = self.scalar_key_to_row(&sv_key)?;
             let mut accs = Vec::with_capacity(self.agg_specs.len());
             for (i, spec) in self.agg_specs.iter().enumerate() {
                 let mut acc = spec.create_accumulator()?;
@@ -1177,7 +1237,7 @@ impl IncrementalAggState {
                 }
                 accs.push(acc);
             }
-            self.groups.insert(key, accs);
+            self.groups.insert(row_key, accs);
         }
         Ok(checkpoint.groups.len())
     }
@@ -3080,5 +3140,85 @@ mod tests {
         assert_eq!(js.left_batches, vec![vec![1, 2, 3]]);
         assert_eq!(js.right_batches, vec![vec![4, 5, 6]]);
         assert_eq!(js.last_evicted_watermark, 42);
+    }
+
+    #[test]
+    fn test_checkpoint_postcard_round_trip() {
+        let mut join_states = FxHashMap::default();
+        join_states.insert(
+            "enriched".to_string(),
+            JoinStateCheckpoint {
+                left_buffer_rows: 100,
+                right_buffer_rows: 50,
+                left_batches: vec![vec![1, 2, 3]],
+                right_batches: vec![vec![4, 5, 6]],
+                last_evicted_watermark: 42,
+            },
+        );
+
+        let cp = StreamExecutorCheckpoint {
+            version: 2,
+            vnode_count: laminar_core::state::VNODE_COUNT,
+            agg_states: FxHashMap::default(),
+            eowc_states: FxHashMap::default(),
+            core_window_states: FxHashMap::default(),
+            join_states,
+            raw_eowc_states: FxHashMap::default(),
+        };
+
+        // Postcard round-trip
+        let payload = postcard::to_allocvec(&cp).unwrap();
+        let restored: StreamExecutorCheckpoint = postcard::from_bytes(&payload).unwrap();
+        assert_eq!(restored.version, 2);
+        assert_eq!(restored.join_states.len(), 1);
+        let js = restored.join_states.get("enriched").unwrap();
+        assert_eq!(js.left_buffer_rows, 100);
+        assert_eq!(js.right_buffer_rows, 50);
+        assert_eq!(js.left_batches, vec![vec![1, 2, 3]]);
+        assert_eq!(js.right_batches, vec![vec![4, 5, 6]]);
+        assert_eq!(js.last_evicted_watermark, 42);
+    }
+
+    #[test]
+    fn test_checkpoint_tagged_format_backward_compat() {
+        let cp = StreamExecutorCheckpoint {
+            version: 2,
+            vnode_count: laminar_core::state::VNODE_COUNT,
+            agg_states: FxHashMap::default(),
+            eowc_states: FxHashMap::default(),
+            core_window_states: FxHashMap::default(),
+            join_states: FxHashMap::default(),
+            raw_eowc_states: FxHashMap::default(),
+        };
+
+        // Tagged postcard: 0x01 prefix + postcard payload
+        let payload = postcard::to_allocvec(&cp).unwrap();
+        let mut tagged_postcard = Vec::with_capacity(1 + payload.len());
+        tagged_postcard.push(CHECKPOINT_FORMAT_POSTCARD);
+        tagged_postcard.extend_from_slice(&payload);
+        assert_eq!(tagged_postcard[0], 0x01);
+
+        // Tagged JSON: 0x00 prefix + JSON payload
+        let json_payload = serde_json::to_vec(&cp).unwrap();
+        let mut tagged_json = Vec::with_capacity(1 + json_payload.len());
+        tagged_json.push(CHECKPOINT_FORMAT_JSON);
+        tagged_json.extend_from_slice(&json_payload);
+        assert_eq!(tagged_json[0], 0x00);
+
+        // Legacy untagged JSON starts with '{'
+        let legacy_json = serde_json::to_vec(&cp).unwrap();
+        assert_eq!(legacy_json[0], b'{');
+
+        // All three formats deserialize correctly
+        let from_postcard: StreamExecutorCheckpoint =
+            postcard::from_bytes(&tagged_postcard[1..]).unwrap();
+        assert_eq!(from_postcard.version, 2);
+
+        let from_tagged_json: StreamExecutorCheckpoint =
+            serde_json::from_slice(&tagged_json[1..]).unwrap();
+        assert_eq!(from_tagged_json.version, 2);
+
+        let from_legacy: StreamExecutorCheckpoint = serde_json::from_slice(&legacy_json).unwrap();
+        assert_eq!(from_legacy.version, 2);
     }
 }
