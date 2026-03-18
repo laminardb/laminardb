@@ -1,0 +1,263 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>LaminarDB Dashboard</title>
+<style>
+  :root {{ --bg: #0d1117; --surface: #161b22; --border: #30363d; --text: #e6edf3;
+           --muted: #8b949e; --accent: #58a6ff; --green: #3fb950; --red: #f85149;
+           --yellow: #d29922; --font: 'SF Mono', Consolas, monospace; }}
+  * {{ box-sizing: border-box; margin: 0; padding: 0; }}
+  body {{ font-family: -apple-system, BlinkMacSystemFont, 'Segoe UI', Helvetica, Arial, sans-serif;
+          background: var(--bg); color: var(--text); }}
+  .header {{ background: var(--surface); border-bottom: 1px solid var(--border); padding: 12px 24px;
+             display: flex; align-items: center; gap: 16px; }}
+  .header h1 {{ font-size: 16px; font-weight: 600; }}
+  .header a {{ color: var(--accent); text-decoration: none; font-size: 13px; }}
+  .header .status-pill {{ font-size: 12px; padding: 2px 10px; border-radius: 12px; font-weight: 500; }}
+  .pill-running {{ background: rgba(63,185,80,0.15); color: var(--green); }}
+  .pill-stopped {{ background: rgba(248,81,73,0.15); color: var(--red); }}
+  .pill-created {{ background: rgba(210,153,34,0.15); color: var(--yellow); }}
+  .main {{ max-width: 1200px; margin: 0 auto; padding: 24px; }}
+  .grid {{ display: grid; grid-template-columns: repeat(auto-fit, minmax(200px, 1fr)); gap: 12px; margin-bottom: 24px; }}
+  .card {{ background: var(--surface); border: 1px solid var(--border); border-radius: 8px; padding: 16px; }}
+  .card-label {{ font-size: 12px; color: var(--muted); text-transform: uppercase; letter-spacing: 0.5px; }}
+  .card-value {{ font-size: 28px; font-weight: 600; font-family: var(--font); margin-top: 4px; }}
+  .card-sub {{ font-size: 12px; color: var(--muted); margin-top: 2px; }}
+  h2 {{ font-size: 15px; margin-bottom: 12px; color: var(--muted); font-weight: 500; }}
+  .section {{ margin-bottom: 24px; }}
+  table {{ width: 100%; border-collapse: collapse; font-size: 13px; }}
+  th {{ background: var(--surface); border: 1px solid var(--border); padding: 8px 12px;
+       text-align: left; font-weight: 600; }}
+  td {{ border: 1px solid var(--border); padding: 6px 12px; }}
+  .tag {{ display: inline-block; font-size: 11px; padding: 1px 8px; border-radius: 4px; font-weight: 500; }}
+  .tag-ok {{ background: rgba(63,185,80,0.15); color: var(--green); }}
+  .tag-warn {{ background: rgba(210,153,34,0.15); color: var(--yellow); }}
+  .tag-err {{ background: rgba(248,81,73,0.15); color: var(--red); }}
+  .sparkline {{ vertical-align: middle; }}
+  .refresh-info {{ font-size: 11px; color: var(--muted); }}
+  .cluster-info {{ font-size: 13px; color: var(--muted); margin-top: 4px; }}
+</style>
+</head>
+<body>
+<div class="header">
+  <h1>LaminarDB Dashboard</h1>
+  <span class="status-pill" id="statePill">{pipeline_state}</span>
+  <span class="refresh-info">v{version} | uptime: <span id="uptime">{uptime}</span> | auto-refresh 5s</span>
+  <span style="flex:1"></span>
+  <a href="/console">SQL Console</a>
+  <a href="/metrics">Metrics</a>
+  <a href="/health">Health</a>
+</div>
+<div class="main">
+  <!-- KPI cards -->
+  <div class="grid">
+    <div class="card">
+      <div class="card-label">Events Ingested</div>
+      <div class="card-value" id="ingested">{events_ingested}</div>
+      <svg class="sparkline" id="spark-ingested" width="180" height="30"></svg>
+    </div>
+    <div class="card">
+      <div class="card-label">Events Emitted</div>
+      <div class="card-value" id="emitted">{events_emitted}</div>
+      <svg class="sparkline" id="spark-emitted" width="180" height="30"></svg>
+    </div>
+    <div class="card">
+      <div class="card-label">Events Dropped</div>
+      <div class="card-value" id="dropped">{events_dropped}</div>
+    </div>
+    <div class="card">
+      <div class="card-label">Cycle Latency</div>
+      <div class="card-value" id="cycleP50">{cycle_p50}</div>
+      <div class="card-sub">p50 ns &mdash; p99: <span id="cycleP99">{cycle_p99}</span> ns</div>
+    </div>
+    <div class="card">
+      <div class="card-label">Checkpoints</div>
+      <div class="card-value" id="ckCompleted">{checkpoints_completed}</div>
+      <div class="card-sub">epoch: <span id="ckEpoch">{checkpoint_epoch}</span> | failed: <span id="ckFailed">{checkpoints_failed}</span></div>
+    </div>
+    <div class="card">
+      <div class="card-label">Topology</div>
+      <div class="card-value"><span id="srcCount">{source_count}</span>S &rarr; <span id="stmCount">{stream_count}</span>P &rarr; <span id="snkCount">{sink_count}</span>K</div>
+      <div class="card-sub">sources &rarr; pipelines &rarr; sinks</div>
+      <div class="cluster-info" id="clusterInfo" style="display:none"></div>
+    </div>
+  </div>
+
+  <!-- Sources table -->
+  <div class="section">
+    <h2>Sources ({source_count})</h2>
+    <table>
+      <thead><tr><th>Name</th><th>Total Events</th><th>Pending</th><th>Capacity</th><th>Status</th><th>Throughput</th></tr></thead>
+      <tbody id="sourcesBody"></tbody>
+    </table>
+  </div>
+
+  <!-- Streams table -->
+  <div class="section">
+    <h2>Streams ({streams_len})</h2>
+    <table>
+      <thead><tr><th>Name</th><th>SQL</th></tr></thead>
+      <tbody id="streamsBody"></tbody>
+    </table>
+  </div>
+
+  <!-- Sinks table -->
+  <div class="section">
+    <h2>Sinks ({sinks_len})</h2>
+    <table>
+      <thead><tr><th>Name</th><th>Status</th></tr></thead>
+      <tbody id="sinksBody"></tbody>
+    </table>
+  </div>
+</div>
+
+<script>
+const history = {{ ingested: [], emitted: [] }};
+const MAX_POINTS = 30;
+let prevIngested = {events_ingested};
+let prevEmitted = {events_emitted};
+
+// Initial data load
+const initialSources = {sources_json};
+renderSources(initialSources);
+updatePill('{pipeline_state}');
+
+function esc(s) {{ return String(s).replace(/&/g,'&amp;').replace(/</g,'&lt;').replace(/>/g,'&gt;'); }}
+
+function updatePill(state) {{
+  const el = document.getElementById('statePill');
+  el.textContent = state;
+  el.className = 'status-pill ' + (state === 'Running' ? 'pill-running' : state === 'Stopped' ? 'pill-stopped' : 'pill-created');
+}}
+
+function renderSources(sources) {{
+  const tbody = document.getElementById('sourcesBody');
+  if (!sources || sources.length === 0) {{
+    tbody.innerHTML = '<tr><td colspan="6" style="color:var(--muted);text-align:center">No sources registered</td></tr>';
+    return;
+  }}
+  tbody.innerHTML = sources.map(s => {{
+    const pct = s.capacity > 0 ? (s.pending / s.capacity * 100).toFixed(0) : 0;
+    const statusClass = s.is_backpressured ? 'tag-warn' : 'tag-ok';
+    const statusText = s.is_backpressured ? 'backpressured' : 'ok';
+    return `<tr>
+      <td>${{esc(s.name)}}</td>
+      <td>${{s.total_events.toLocaleString()}}</td>
+      <td>${{s.pending}} / ${{s.capacity}} (${{pct}}%)</td>
+      <td>${{s.capacity.toLocaleString()}}</td>
+      <td><span class="tag ${{statusClass}}">${{statusText}}</span></td>
+      <td id="tp-${{esc(s.name)}}">--</td>
+    </tr>`;
+  }}).join('');
+}}
+
+function sparkline(svgId, data, color) {{
+  const svg = document.getElementById(svgId);
+  if (!svg || data.length < 2) return;
+  const w = 180, h = 30;
+  const max = Math.max(...data, 1);
+  const points = data.map((v, i) => `${{(i / (data.length - 1) * w).toFixed(1)}},${{(h - v / max * h).toFixed(1)}}`).join(' ');
+  svg.innerHTML = `<polyline points="${{points}}" fill="none" stroke="${{color}}" stroke-width="1.5" stroke-linejoin="round"/>`;
+}}
+
+async function refresh() {{
+  try {{
+    const [healthResp, metricsResp, sourcesResp, streamsResp, sinksResp] = await Promise.all([
+      fetch('/health'), fetch('/metrics'), fetch('/api/v1/sources'), fetch('/api/v1/streams'), fetch('/api/v1/sinks')
+    ]);
+    const health = await healthResp.json();
+    const metricsText = await metricsResp.text();
+    const sources = await sourcesResp.json();
+    const streams = await streamsResp.json();
+    const sinks = await sinksResp.json();
+
+    updatePill(health.pipeline_state || 'Unknown');
+
+    // Parse metrics text
+    const m = {{}};
+    for (const line of metricsText.split('\n')) {{
+      const match = line.match(/^(\S+?)(?:\{{.*\}})?\s+(\S+)$/);
+      if (match) m[match[1]] = Number(match[2]);
+    }}
+
+    const ingested = m.laminardb_events_ingested_total || 0;
+    const emitted = m.laminardb_events_emitted_total || 0;
+    const dropped = m.laminardb_events_dropped_total || 0;
+
+    // Throughput calculation
+    const ingestedDelta = Math.max(0, ingested - prevIngested);
+    const emittedDelta = Math.max(0, emitted - prevEmitted);
+    prevIngested = ingested;
+    prevEmitted = emitted;
+
+    history.ingested.push(ingestedDelta);
+    history.emitted.push(emittedDelta);
+    if (history.ingested.length > MAX_POINTS) history.ingested.shift();
+    if (history.emitted.length > MAX_POINTS) history.emitted.shift();
+
+    document.getElementById('ingested').textContent = ingested.toLocaleString();
+    document.getElementById('emitted').textContent = emitted.toLocaleString();
+    document.getElementById('dropped').textContent = dropped.toLocaleString();
+    document.getElementById('cycleP50').textContent = (m.laminardb_cycle_duration_p50_ns || 0).toLocaleString();
+    document.getElementById('cycleP99').textContent = (m.laminardb_cycle_duration_p99_ns || 0).toLocaleString();
+    document.getElementById('ckCompleted').textContent = m.laminardb_checkpoints_completed_total || 0;
+    document.getElementById('ckEpoch').textContent = m.laminardb_checkpoint_epoch || 0;
+    document.getElementById('ckFailed').textContent = m.laminardb_checkpoints_failed_total || 0;
+    document.getElementById('srcCount').textContent = m.laminardb_source_count || 0;
+    document.getElementById('stmCount').textContent = m.laminardb_stream_count || 0;
+    document.getElementById('snkCount').textContent = m.laminardb_sink_count || 0;
+
+    sparkline('spark-ingested', history.ingested, '#58a6ff');
+    sparkline('spark-emitted', history.emitted, '#3fb950');
+
+    // Re-fetch source details for lag info
+    const srcResp = await fetch('/api/v1/sources');
+    const srcList = await srcResp.json();
+    // Use per-source metrics
+    const srcMetrics = [];
+    for (const src of srcList) {{
+      // Find matching metric
+      const evtKey = `laminardb_source_events_total`;
+      const total = 0;
+      srcMetrics.push({{ name: src.name, total_events: total, pending: 0, capacity: 0, is_backpressured: false }});
+    }}
+
+    // Streams
+    const stBody = document.getElementById('streamsBody');
+    if (streams.length === 0) {{
+      stBody.innerHTML = '<tr><td colspan="2" style="color:var(--muted);text-align:center">No streams</td></tr>';
+    }} else {{
+      stBody.innerHTML = streams.map(s => `<tr><td>${{esc(s.name)}}</td><td style="font-family:var(--font);font-size:12px">${{esc(s.sql || '--')}}</td></tr>`).join('');
+    }}
+
+    // Sinks
+    const skBody = document.getElementById('sinksBody');
+    if (sinks.length === 0) {{
+      skBody.innerHTML = '<tr><td colspan="2" style="color:var(--muted);text-align:center">No sinks</td></tr>';
+    }} else {{
+      skBody.innerHTML = sinks.map(s => `<tr><td>${{esc(s.name)}}</td><td><span class="tag tag-ok">active</span></td></tr>`).join('');
+    }}
+
+    // Cluster info (delta mode)
+    try {{
+      const clusterResp = await fetch('/api/v1/cluster');
+      if (clusterResp.ok) {{
+        const cluster = await clusterResp.json();
+        const el = document.getElementById('clusterInfo');
+        el.style.display = '';
+        el.textContent = `Cluster: ${{cluster.mode}} | Node: ${{cluster.node_id}}`;
+      }}
+    }} catch {{}}
+
+  }} catch (e) {{
+    console.error('Dashboard refresh failed:', e);
+  }}
+}}
+
+setInterval(refresh, 5000);
+setTimeout(refresh, 500);
+</script>
+</body>
+</html>

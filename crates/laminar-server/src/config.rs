@@ -75,6 +75,11 @@ fn substitute_env_vars(input: &str) -> Result<String, ConfigError> {
     Ok(result.into_owned())
 }
 
+/// Public wrapper for config validation (used by the HTTP config/validate endpoint).
+pub fn validate_config_public(config: &ServerConfig) -> Result<(), ConfigError> {
+    validate_config(config)
+}
+
 /// Validate referential integrity and semantic constraints.
 fn validate_config(config: &ServerConfig) -> Result<(), ConfigError> {
     let mut errors = Vec::new();

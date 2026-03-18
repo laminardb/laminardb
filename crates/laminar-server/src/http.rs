@@ -16,6 +16,11 @@
 //! | `GET` | `/api/v1/streams/{name}` | Stream detail |
 //! | `POST` | `/api/v1/checkpoint` | Trigger checkpoint |
 //! | `POST` | `/api/v1/sql` | Execute ad-hoc SQL |
+//! | `GET` | `/console` | SQL query console (web UI) |
+//! | `GET` | `/dashboard` | Observability dashboard (web UI) |
+//! | `GET` | `/api/v1/config` | Current running config (secrets masked) |
+//! | `PUT` | `/api/v1/config` | Update config values at runtime |
+//! | `POST` | `/api/v1/config/validate` | Validate config without applying |
 
 use std::path::PathBuf;
 use std::sync::atomic::{AtomicU64, Ordering};
@@ -24,7 +29,7 @@ use std::time::Instant;
 
 use axum::extract::{Path, State};
 use axum::http::StatusCode;
-use axum::response::IntoResponse;
+use axum::response::{Html, IntoResponse};
 use axum::routing::{get, post};
 use axum::{Json, Router};
 use serde::{Deserialize, Serialize};
@@ -62,6 +67,9 @@ pub fn build_router(state: Arc<AppState>) -> Router {
         .route("/health", get(health_check))
         .route("/ready", get(readiness_check))
         .route("/metrics", get(prometheus_metrics))
+        // Web UIs
+        .route("/console", get(sql_console_page))
+        .route("/dashboard", get(dashboard_page))
         // Pipeline introspection
         .route("/api/v1/sources", get(list_sources))
         .route("/api/v1/sinks", get(list_sinks))
@@ -71,6 +79,9 @@ pub fn build_router(state: Arc<AppState>) -> Router {
         .route("/api/v1/checkpoint", post(trigger_checkpoint))
         .route("/api/v1/sql", post(execute_sql))
         .route("/api/v1/reload", post(handle_reload))
+        // Configuration management
+        .route("/api/v1/config", get(get_config).put(update_config))
+        .route("/api/v1/config/validate", post(validate_config_endpoint))
         // Cluster (delta mode)
         .route("/api/v1/cluster", get(cluster_status))
         // Stubs (501 Not Implemented)
@@ -147,16 +158,6 @@ struct CheckpointResponse {
 #[derive(Debug, Deserialize)]
 struct SqlRequest {
     sql: String,
-}
-
-/// SQL execution response.
-#[derive(Debug, Serialize)]
-struct SqlResponse {
-    result_type: String,
-    #[serde(skip_serializing_if = "Option::is_none")]
-    object_name: Option<String>,
-    #[serde(skip_serializing_if = "Option::is_none")]
-    rows_affected: Option<u64>,
 }
 
 /// Error response body.
@@ -411,6 +412,8 @@ async fn trigger_checkpoint(State(state): State<Arc<AppState>>) -> impl IntoResp
 }
 
 /// `POST /api/v1/sql` — execute ad-hoc SQL.
+///
+/// Returns tabular results (columns + rows) for Metadata queries (SHOW, DESCRIBE).
 async fn execute_sql(
     State(state): State<Arc<AppState>>,
     Json(req): Json<SqlRequest>,
@@ -418,29 +421,25 @@ async fn execute_sql(
     match state.db.execute(&req.sql).await {
         Ok(result) => {
             use laminar_db::ExecuteResult;
-            let resp = match result {
-                ExecuteResult::Ddl(info) => SqlResponse {
-                    result_type: info.statement_type,
-                    object_name: Some(info.object_name),
-                    rows_affected: None,
-                },
-                ExecuteResult::RowsAffected(n) => SqlResponse {
-                    result_type: "rows_affected".to_string(),
-                    object_name: None,
-                    rows_affected: Some(n),
-                },
-                ExecuteResult::Query(_) => SqlResponse {
-                    result_type: "query".to_string(),
-                    object_name: None,
-                    rows_affected: None,
-                },
-                ExecuteResult::Metadata(_) => SqlResponse {
-                    result_type: "metadata".to_string(),
-                    object_name: None,
-                    rows_affected: None,
-                },
-            };
-            Json(resp).into_response()
+            match result {
+                ExecuteResult::Ddl(info) => Json(serde_json::json!({
+                    "result_type": info.statement_type,
+                    "object_name": info.object_name,
+                }))
+                .into_response(),
+                ExecuteResult::RowsAffected(n) => Json(serde_json::json!({
+                    "result_type": "rows_affected",
+                    "rows_affected": n,
+                }))
+                .into_response(),
+                ExecuteResult::Query(_) => Json(serde_json::json!({
+                    "result_type": "query",
+                }))
+                .into_response(),
+                ExecuteResult::Metadata(batch) => {
+                    Json(record_batch_to_json(&batch)).into_response()
+                }
+            }
         }
         Err(e) => error_response(StatusCode::BAD_REQUEST, e.to_string()).into_response(),
     }
@@ -543,6 +542,320 @@ async fn cluster_status(State(state): State<Arc<AppState>>) -> impl IntoResponse
         pipeline_state,
     })
     .into_response()
+}
+
+// ---------------------------------------------------------------------------
+// RecordBatch → JSON helper
+// ---------------------------------------------------------------------------
+
+/// Convert an Arrow `RecordBatch` to a JSON object with `columns` and `rows`.
+fn record_batch_to_json(batch: &arrow_array::RecordBatch) -> serde_json::Value {
+    let schema = batch.schema();
+    let columns: Vec<&str> = schema.fields().iter().map(|f| f.name().as_str()).collect();
+    let opts = arrow_cast::display::FormatOptions::default();
+
+    // Pre-build formatters for each column
+    let formatters: Vec<Option<arrow_cast::display::ArrayFormatter>> = (0..batch.num_columns())
+        .map(|i| {
+            let col: &dyn arrow_array::Array = batch.column(i).as_ref();
+            arrow_cast::display::ArrayFormatter::try_new(col, &opts).ok()
+        })
+        .collect();
+
+    let mut rows = Vec::with_capacity(batch.num_rows());
+    for row in 0..batch.num_rows() {
+        let mut row_values = Vec::with_capacity(columns.len());
+        for (col_idx, fmt) in formatters.iter().enumerate() {
+            let col = batch.column(col_idx);
+            if col.is_null(row) {
+                row_values.push(serde_json::Value::Null);
+            } else if let Some(f) = fmt {
+                row_values.push(serde_json::Value::String(f.value(row).to_string()));
+            } else {
+                row_values.push(serde_json::Value::String("?".to_string()));
+            }
+        }
+        rows.push(serde_json::Value::Array(row_values));
+    }
+    serde_json::json!({ "columns": columns, "rows": rows })
+}
+
+// ---------------------------------------------------------------------------
+// Web UIs (embedded HTML)
+// ---------------------------------------------------------------------------
+
+/// `GET /console` — SQL query console web UI.
+async fn sql_console_page() -> impl IntoResponse {
+    Html(include_str!("console.html"))
+}
+
+/// `GET /dashboard` — observability dashboard web UI.
+async fn dashboard_page(State(state): State<Arc<AppState>>) -> impl IntoResponse {
+    Html(build_dashboard_html(&state).await)
+}
+
+/// Build the dashboard HTML with current server data embedded for initial render.
+async fn build_dashboard_html(state: &AppState) -> String {
+    let metrics = state.db.metrics();
+    let source_metrics = state.db.all_source_metrics();
+    let pipeline_state = state.db.pipeline_state();
+    let uptime_secs = (chrono::Utc::now() - state.started_at).num_seconds().max(0);
+    let snap = state.db.counters().snapshot();
+    let sources_json_arr: Vec<serde_json::Value> = source_metrics
+        .iter()
+        .map(|s| {
+            serde_json::json!({
+                "name": s.name,
+                "total_events": s.total_events,
+                "pending": s.pending,
+                "capacity": s.capacity,
+                "is_backpressured": s.is_backpressured,
+            })
+        })
+        .collect();
+    let sources_json = serde_json::to_string(&sources_json_arr).unwrap_or_else(|_| "[]".into());
+    let streams = state.db.streams();
+    let sinks = state.db.sinks();
+
+    format!(
+        include_str!("dashboard.html"),
+        version = env!("CARGO_PKG_VERSION"),
+        pipeline_state = pipeline_state,
+        uptime = format_duration(uptime_secs as u64),
+        events_ingested = metrics.total_events_ingested,
+        events_emitted = metrics.total_events_emitted,
+        events_dropped = metrics.total_events_dropped,
+        source_count = metrics.source_count,
+        stream_count = metrics.stream_count,
+        sink_count = metrics.sink_count,
+        checkpoints_completed = snap.checkpoints_completed,
+        checkpoints_failed = snap.checkpoints_failed,
+        checkpoint_epoch = snap.checkpoint_epoch,
+        cycle_p50 = snap.cycle_p50_ns,
+        cycle_p99 = snap.cycle_p99_ns,
+        sources_json = sources_json,
+        streams_len = streams.len(),
+        sinks_len = sinks.len(),
+    )
+}
+
+/// Format seconds into a human-friendly duration string.
+fn format_duration(secs: u64) -> String {
+    if secs < 60 {
+        return format!("{secs}s");
+    }
+    if secs < 3600 {
+        return format!("{}m {}s", secs / 60, secs % 60);
+    }
+    let hours = secs / 3600;
+    let mins = (secs % 3600) / 60;
+    format!("{hours}h {mins}m")
+}
+
+// ---------------------------------------------------------------------------
+// Configuration management
+// ---------------------------------------------------------------------------
+
+/// `GET /api/v1/config` — return current running configuration with secrets masked.
+async fn get_config(State(state): State<Arc<AppState>>) -> impl IntoResponse {
+    let config = state.current_config.read().await;
+    let masked = mask_config_secrets(&config);
+    Json(masked)
+}
+
+/// `PUT /api/v1/config` — update specific config values at runtime.
+async fn update_config(
+    State(state): State<Arc<AppState>>,
+    Json(body): Json<serde_json::Value>,
+) -> impl IntoResponse {
+    let current = state.current_config.read().await;
+    let current_toml = toml::to_string(&mask_config_secrets(&current)).unwrap_or_default();
+    drop(current);
+
+    let mut merged: serde_json::Value =
+        serde_json::from_str(&current_toml).unwrap_or(serde_json::json!({}));
+    merge_json(&mut merged, &body);
+
+    let merged_toml = match toml::to_string(&merged) {
+        Ok(t) => t,
+        Err(e) => {
+            return error_response(
+                StatusCode::BAD_REQUEST,
+                format!("invalid config update: {e}"),
+            )
+            .into_response();
+        }
+    };
+
+    let new_config: crate::config::ServerConfig = match toml::from_str(&merged_toml) {
+        Ok(c) => c,
+        Err(e) => {
+            return error_response(StatusCode::BAD_REQUEST, format!("config parse error: {e}"))
+                .into_response();
+        }
+    };
+
+    let current = state.current_config.read().await;
+    let diff = crate::reload::diff_configs(&current, &new_config);
+    drop(current);
+
+    if diff.is_empty() && diff.warnings.is_empty() {
+        return Json(serde_json::json!({
+            "success": true,
+            "message": "no changes detected",
+        }))
+        .into_response();
+    }
+
+    let result = crate::reload::apply_reload(&state.db, &diff).await;
+
+    if result.success {
+        let mut current = state.current_config.write().await;
+        *current = new_config;
+    }
+
+    let status = if result.success {
+        StatusCode::OK
+    } else {
+        StatusCode::MULTI_STATUS
+    };
+
+    (status, Json(result)).into_response()
+}
+
+/// `POST /api/v1/config/validate` — validate a configuration without applying it.
+async fn validate_config_endpoint(Json(body): Json<ConfigValidateRequest>) -> impl IntoResponse {
+    let config: Result<crate::config::ServerConfig, _> = toml::from_str(&body.config);
+    match config {
+        Ok(cfg) => match crate::config::validate_config_public(&cfg) {
+            Ok(()) => Json(serde_json::json!({ "valid": true, "errors": [] })).into_response(),
+            Err(e) => Json(serde_json::json!({ "valid": false, "errors": [e.to_string()] }))
+                .into_response(),
+        },
+        Err(e) => Json(
+            serde_json::json!({ "valid": false, "errors": [format!("TOML parse error: {e}")] }),
+        )
+        .into_response(),
+    }
+}
+
+/// Request body for config validation.
+#[derive(Debug, Deserialize)]
+struct ConfigValidateRequest {
+    config: String,
+}
+
+/// Mask sensitive values in config for safe display.
+fn mask_config_secrets(config: &crate::config::ServerConfig) -> serde_json::Value {
+    let mut obj = serde_json::json!({
+        "server": {
+            "mode": config.server.mode,
+            "bind": config.server.bind,
+            "workers": config.server.workers,
+            "log_level": config.server.log_level,
+        },
+        "state": {
+            "backend": config.state.backend,
+            "path": config.state.path,
+        },
+        "checkpoint": {
+            "url": config.checkpoint.url,
+            "interval": humantime::format_duration(config.checkpoint.interval).to_string(),
+        },
+    });
+
+    let sources: Vec<serde_json::Value> = config
+        .sources
+        .iter()
+        .map(|s| {
+            let mut props = serde_json::Map::new();
+            for (k, v) in &s.properties {
+                if is_sensitive_key(k) {
+                    props.insert(k.clone(), serde_json::Value::String("***".to_string()));
+                } else {
+                    props.insert(k.clone(), serde_json::Value::String(v.to_string()));
+                }
+            }
+            serde_json::json!({
+                "name": s.name, "connector": s.connector,
+                "format": s.format, "properties": props,
+            })
+        })
+        .collect();
+    obj["sources"] = serde_json::Value::Array(sources);
+
+    let pipelines: Vec<serde_json::Value> = config
+        .pipelines
+        .iter()
+        .map(|p| serde_json::json!({ "name": p.name, "sql": p.sql, "parallelism": p.parallelism }))
+        .collect();
+    obj["pipelines"] = serde_json::Value::Array(pipelines);
+
+    let sinks: Vec<serde_json::Value> = config
+        .sinks
+        .iter()
+        .map(|s| {
+            let mut props = serde_json::Map::new();
+            for (k, v) in &s.properties {
+                if is_sensitive_key(k) {
+                    props.insert(k.clone(), serde_json::Value::String("***".to_string()));
+                } else {
+                    props.insert(k.clone(), serde_json::Value::String(v.to_string()));
+                }
+            }
+            serde_json::json!({
+                "name": s.name, "pipeline": s.pipeline,
+                "connector": s.connector, "delivery": s.delivery,
+                "properties": props,
+            })
+        })
+        .collect();
+    obj["sinks"] = serde_json::Value::Array(sinks);
+
+    let lookups: Vec<serde_json::Value> = config
+        .lookups
+        .iter()
+        .map(|l| serde_json::json!({ "name": l.name, "connector": l.connector, "strategy": l.strategy }))
+        .collect();
+    obj["lookups"] = serde_json::Value::Array(lookups);
+
+    if let Some(ref node_id) = config.node_id {
+        obj["node_id"] = serde_json::Value::String(node_id.clone());
+    }
+
+    obj
+}
+
+/// Returns `true` if a config key name looks like it contains credentials.
+fn is_sensitive_key(key: &str) -> bool {
+    let lower = key.to_lowercase();
+    lower.contains("password")
+        || lower.contains("secret")
+        || lower.contains("token")
+        || lower.contains("credential")
+        || lower.contains("api_key")
+        || lower.contains("apikey")
+        || lower.contains("access_key")
+}
+
+/// Deep-merge `patch` into `target` (JSON merge-patch semantics).
+fn merge_json(target: &mut serde_json::Value, patch: &serde_json::Value) {
+    if let (Some(target_obj), Some(patch_obj)) = (target.as_object_mut(), patch.as_object()) {
+        for (key, value) in patch_obj {
+            if value.is_null() {
+                target_obj.remove(key);
+            } else if value.is_object() {
+                let entry = target_obj
+                    .entry(key.clone())
+                    .or_insert(serde_json::json!({}));
+                merge_json(entry, value);
+            } else {
+                target_obj.insert(key.clone(), value.clone());
+            }
+        }
+    } else {
+        *target = patch.clone();
+    }
 }
 
 /// Stub handler for unimplemented endpoints.
@@ -855,5 +1168,282 @@ mod tests {
         let text = String::from_utf8(body.to_vec()).unwrap();
         assert!(text.contains("laminardb_reload_total 5"));
         assert!(text.contains("laminardb_reload_last_timestamp 1700000000"));
+    }
+
+    #[tokio::test]
+    async fn test_sql_console_page() {
+        let state = test_state();
+        let app = build_router(state);
+
+        let req = Request::builder()
+            .uri("/console")
+            .body(Body::empty())
+            .unwrap();
+        let resp = app.oneshot(req).await.unwrap();
+        assert_eq!(resp.status(), StatusCode::OK);
+
+        let body = axum::body::to_bytes(resp.into_body(), usize::MAX)
+            .await
+            .unwrap();
+        let text = String::from_utf8(body.to_vec()).unwrap();
+        assert!(text.contains("SQL Console"));
+        assert!(text.contains("/api/v1/sql"));
+    }
+
+    #[tokio::test]
+    async fn test_dashboard_page() {
+        let state = test_state();
+        let app = build_router(state);
+
+        let req = Request::builder()
+            .uri("/dashboard")
+            .body(Body::empty())
+            .unwrap();
+        let resp = app.oneshot(req).await.unwrap();
+        assert_eq!(resp.status(), StatusCode::OK);
+
+        let body = axum::body::to_bytes(resp.into_body(), usize::MAX)
+            .await
+            .unwrap();
+        let text = String::from_utf8(body.to_vec()).unwrap();
+        assert!(text.contains("LaminarDB Dashboard"));
+        assert!(text.contains("auto-refresh"));
+    }
+
+    #[tokio::test]
+    async fn test_get_config() {
+        let state = test_state();
+        let app = build_router(state);
+
+        let req = Request::builder()
+            .uri("/api/v1/config")
+            .body(Body::empty())
+            .unwrap();
+        let resp = app.oneshot(req).await.unwrap();
+        assert_eq!(resp.status(), StatusCode::OK);
+
+        let body = axum::body::to_bytes(resp.into_body(), usize::MAX)
+            .await
+            .unwrap();
+        let json: serde_json::Value = serde_json::from_slice(&body).unwrap();
+        assert_eq!(json["server"]["mode"], "embedded");
+        assert_eq!(json["server"]["bind"], "127.0.0.1:8080");
+    }
+
+    #[tokio::test]
+    async fn test_config_masks_secrets() {
+        let config = crate::config::ServerConfig {
+            server: crate::config::ServerSection::default(),
+            state: crate::config::StateSection::default(),
+            checkpoint: crate::config::CheckpointSection::default(),
+            sources: vec![crate::config::SourceConfig {
+                name: "src1".to_string(),
+                connector: "kafka".to_string(),
+                format: "json".to_string(),
+                properties: {
+                    let mut t = toml::Table::new();
+                    t.insert(
+                        "password".to_string(),
+                        toml::Value::String("hunter2".to_string()),
+                    );
+                    t.insert(
+                        "topic".to_string(),
+                        toml::Value::String("events".to_string()),
+                    );
+                    t
+                },
+                schema: vec![],
+                watermark: None,
+            }],
+            lookups: vec![],
+            pipelines: vec![],
+            sinks: vec![],
+            discovery: None,
+            coordination: None,
+            node_id: None,
+        };
+
+        let masked = mask_config_secrets(&config);
+        let sources = masked["sources"].as_array().unwrap();
+        let props = &sources[0]["properties"];
+        assert_eq!(props["password"], "***");
+        assert_ne!(props["topic"], "***");
+    }
+
+    #[tokio::test]
+    async fn test_validate_config_valid() {
+        let state = test_state();
+        let app = build_router(state);
+
+        let req = Request::builder()
+            .method("POST")
+            .uri("/api/v1/config/validate")
+            .header("content-type", "application/json")
+            .body(Body::from(
+                serde_json::to_string(&serde_json::json!({
+                    "config": "[server]\nbind = \"127.0.0.1:8080\"\n"
+                }))
+                .unwrap(),
+            ))
+            .unwrap();
+        let resp = app.oneshot(req).await.unwrap();
+        assert_eq!(resp.status(), StatusCode::OK);
+
+        let body = axum::body::to_bytes(resp.into_body(), usize::MAX)
+            .await
+            .unwrap();
+        let json: serde_json::Value = serde_json::from_slice(&body).unwrap();
+        assert_eq!(json["valid"], true);
+    }
+
+    #[tokio::test]
+    async fn test_validate_config_invalid_toml() {
+        let state = test_state();
+        let app = build_router(state);
+
+        let req = Request::builder()
+            .method("POST")
+            .uri("/api/v1/config/validate")
+            .header("content-type", "application/json")
+            .body(Body::from(
+                serde_json::to_string(&serde_json::json!({
+                    "config": "this is not valid toml {{{"
+                }))
+                .unwrap(),
+            ))
+            .unwrap();
+        let resp = app.oneshot(req).await.unwrap();
+        assert_eq!(resp.status(), StatusCode::OK);
+
+        let body = axum::body::to_bytes(resp.into_body(), usize::MAX)
+            .await
+            .unwrap();
+        let json: serde_json::Value = serde_json::from_slice(&body).unwrap();
+        assert_eq!(json["valid"], false);
+        assert!(!json["errors"].as_array().unwrap().is_empty());
+    }
+
+    #[tokio::test]
+    async fn test_validate_config_semantic_error() {
+        let state = test_state();
+        let app = build_router(state);
+
+        let req = Request::builder()
+            .method("POST")
+            .uri("/api/v1/config/validate")
+            .header("content-type", "application/json")
+            .body(Body::from(
+                serde_json::to_string(&serde_json::json!({
+                    "config": "[server]\nbind = \"not-a-socket-addr\"\n"
+                }))
+                .unwrap(),
+            ))
+            .unwrap();
+        let resp = app.oneshot(req).await.unwrap();
+        let body = axum::body::to_bytes(resp.into_body(), usize::MAX)
+            .await
+            .unwrap();
+        let json: serde_json::Value = serde_json::from_slice(&body).unwrap();
+        assert_eq!(json["valid"], false);
+    }
+
+    #[tokio::test]
+    async fn test_execute_sql_show_sources() {
+        let state = test_state();
+        state
+            .db
+            .execute("CREATE SOURCE test_show (id BIGINT)")
+            .await
+            .unwrap();
+        let app = build_router(state);
+
+        let req = Request::builder()
+            .method("POST")
+            .uri("/api/v1/sql")
+            .header("content-type", "application/json")
+            .body(Body::from(
+                serde_json::to_string(&serde_json::json!({
+                    "sql": "SHOW SOURCES"
+                }))
+                .unwrap(),
+            ))
+            .unwrap();
+        let resp = app.oneshot(req).await.unwrap();
+        assert_eq!(resp.status(), StatusCode::OK);
+
+        let body = axum::body::to_bytes(resp.into_body(), usize::MAX)
+            .await
+            .unwrap();
+        let json: serde_json::Value = serde_json::from_slice(&body).unwrap();
+        assert!(json["columns"].is_array());
+        assert!(json["rows"].is_array());
+    }
+
+    #[test]
+    fn test_is_sensitive_key() {
+        assert!(is_sensitive_key("password"));
+        assert!(is_sensitive_key("kafka_password"));
+        assert!(is_sensitive_key("secret_key"));
+        assert!(is_sensitive_key("api_key"));
+        assert!(is_sensitive_key("access_key_id"));
+        assert!(is_sensitive_key("TOKEN"));
+        assert!(!is_sensitive_key("topic"));
+        assert!(!is_sensitive_key("brokers"));
+        assert!(!is_sensitive_key("format"));
+    }
+
+    #[test]
+    fn test_merge_json() {
+        let mut target = serde_json::json!({"a": 1, "b": {"c": 2}});
+        let patch = serde_json::json!({"b": {"d": 3}, "e": 4});
+        merge_json(&mut target, &patch);
+        assert_eq!(target["a"], 1);
+        assert_eq!(target["b"]["c"], 2);
+        assert_eq!(target["b"]["d"], 3);
+        assert_eq!(target["e"], 4);
+    }
+
+    #[test]
+    fn test_merge_json_null_removes() {
+        let mut target = serde_json::json!({"a": 1, "b": 2});
+        let patch = serde_json::json!({"b": null});
+        merge_json(&mut target, &patch);
+        assert_eq!(target["a"], 1);
+        assert!(target.get("b").is_none());
+    }
+
+    #[test]
+    fn test_format_duration() {
+        assert_eq!(format_duration(45), "45s");
+        assert_eq!(format_duration(90), "1m 30s");
+        assert_eq!(format_duration(3661), "1h 1m");
+    }
+
+    #[test]
+    fn test_record_batch_to_json() {
+        use arrow_array::{Int64Array, RecordBatch, StringArray};
+        use arrow_schema::{DataType, Field, Schema};
+        use std::sync::Arc as StdArc;
+
+        let schema = StdArc::new(Schema::new(vec![
+            Field::new("id", DataType::Int64, false),
+            Field::new("name", DataType::Utf8, true),
+        ]));
+        let batch = RecordBatch::try_new(
+            schema,
+            vec![
+                StdArc::new(Int64Array::from(vec![1, 2])),
+                StdArc::new(StringArray::from(vec![Some("alice"), None])),
+            ],
+        )
+        .unwrap();
+
+        let json = record_batch_to_json(&batch);
+        assert_eq!(json["columns"], serde_json::json!(["id", "name"]));
+        let rows = json["rows"].as_array().unwrap();
+        assert_eq!(rows.len(), 2);
+        assert_eq!(rows[0][0], "1");
+        assert_eq!(rows[0][1], "alice");
+        assert!(rows[1][1].is_null());
     }
 }

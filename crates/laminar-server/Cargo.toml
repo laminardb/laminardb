@@ -43,6 +43,11 @@ serde = { workspace = true }
 serde_json = { workspace = true }
 toml = "1.0"
 
+# Arrow (RecordBatch to JSON for SQL console)
+arrow-cast = { workspace = true }
+arrow-array = { workspace = true }
+arrow-schema = { workspace = true }
+
 # Web framework
 axum = "0.8"
 tower = "0.5"
@@ -50,6 +55,7 @@ tower-http = { version = "0.6", features = ["cors"] }
 
 # Config helpers
 regex = { workspace = true }
+humantime = "2.1"
 humantime-serde = { workspace = true }
 chrono = { workspace = true }
 
