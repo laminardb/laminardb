@@ -255,16 +255,6 @@ pub(crate) struct StreamQuery {
     execution_path: QueryExecutionPath,
 }
 
-impl StreamQuery {
-    /// Returns `true` if this query suppresses intermediate results
-    /// (i.e., uses `EMIT ON WINDOW CLOSE` or `EMIT FINAL`).
-    fn suppresses_intermediate(&self) -> bool {
-        self.emit_clause
-            .as_ref()
-            .is_some_and(|ec| matches!(ec, EmitClause::OnWindowClose | EmitClause::Final))
-    }
-}
-
 /// Top-level execution path for a query, determined once at registration time.
 ///
 /// Replaces the per-cycle `if/else` chain that tested `is_eowc`, `has_asof`,
@@ -378,6 +368,10 @@ pub(crate) struct StreamExecutor {
     /// compiled paths (no `ctx.sql()` needed), allowing `register_source_tables()`
     /// to be skipped entirely. `None` = not yet determined.
     all_queries_compiled: Option<bool>,
+    /// Pre-computed set of source table names that non-compiled queries need.
+    /// Rebuilt when queries are added/removed or when `all_queries_compiled`
+    /// is invalidated. Avoids recomputing per cycle.
+    cached_required_tables: FxHashSet<String>,
     /// Lazily compiled post-join projection expressions for ASOF/temporal joins.
     /// Keyed by query index. Compiled on first execution when join output schema
     /// is known.
@@ -435,6 +429,7 @@ impl StreamExecutor {
             cycle_results: FxHashMap::default(),
             cycle_intermediates: Vec::new(),
             all_queries_compiled: None,
+            cached_required_tables: FxHashSet::default(),
             compiled_post_projections: FxHashMap::default(),
             post_projection_compile_failed: FxHashSet::default(),
             cached_having_plans: FxHashMap::default(),
@@ -581,8 +576,8 @@ impl StreamExecutor {
             removed: false,
             execution_path,
         };
-        // Initialize EOWC state for queries that suppress intermediate results
-        if query.suppresses_intermediate() {
+        // Initialize EOWC state for queries on the EOWC execution path.
+        if execution_path == QueryExecutionPath::Eowc {
             self.eowc_states.insert(
                 idx,
                 EowcState {
@@ -594,6 +589,8 @@ impl StreamExecutor {
         }
         self.queries.push(query);
         self.topo_dirty = true;
+        // Invalidate compiled-path and required-tables caches.
+        self.all_queries_compiled = None;
     }
 
     /// Remove a query by name using a tombstone (sets `removed = true`).
@@ -750,26 +747,23 @@ impl StreamExecutor {
                         .get(&idx)
                         .is_some_and(|s| s.compiled_projection().is_some())
             });
+            let prev = self.all_queries_compiled;
             self.all_queries_compiled = Some(all_compiled);
+            // Rebuild cached required tables when the compiled status changes.
+            if prev != Some(all_compiled) {
+                self.cached_required_tables = self.collect_required_source_tables();
+            }
         }
 
         // Skip MemTable registration when all queries use compiled projections.
         // Intermediate result registration (for downstream queries) still runs
         // inside the loop — this only skips SOURCE table registration.
         //
-        // When only SOME queries are compiled, build a set of table names that
-        // non-compiled queries actually reference and skip registration for the
-        // rest. This avoids per-cycle DataFusion catalog overhead for tables
-        // that only compiled-path queries use.
-        if self.all_queries_compiled != Some(true) {
-            let required_tables = self.collect_required_source_tables();
-            if required_tables.is_empty() {
-                // All queries that need DataFusion tables are actually compiled
-                // or use non-standard paths that register their own tables.
-                // Skip registration entirely.
-            } else {
-                self.register_source_tables(source_batches, &required_tables)?;
-            }
+        // When only SOME queries are compiled, use the pre-computed required
+        // tables set to skip registration for tables that only compiled-path
+        // queries reference.
+        if self.all_queries_compiled != Some(true) && !self.cached_required_tables.is_empty() {
+            self.register_source_tables(source_batches, &self.cached_required_tables.clone())?;
         }
 
         // Reuse per-cycle allocations: take the pre-allocated maps out of
@@ -1046,15 +1040,25 @@ impl StreamExecutor {
             if self.queries[idx].removed {
                 continue;
             }
-            // Only Standard-path queries use register_source_tables.
-            // EOWC, ASOF, Temporal, and StreamJoin manage their own tables.
-            if self.queries[idx].execution_path != QueryExecutionPath::Standard {
-                continue;
+            // ASOF, Temporal, and StreamJoin manage their own table registration.
+            // Standard and EOWC paths need DataFusion tables (EOWC falls through
+            // to ctx.sql() for non-aggregate queries).
+            match self.queries[idx].execution_path {
+                QueryExecutionPath::Standard | QueryExecutionPath::Eowc => {}
+                _ => continue,
             }
             // Skip queries that are fully compiled (no DataFusion needed).
             let is_compiled = self.plain_compiled.contains_key(&idx)
                 || self
                     .agg_states
+                    .get(&idx)
+                    .is_some_and(|s| s.compiled_projection().is_some())
+                || self
+                    .eowc_agg_states
+                    .get(&idx)
+                    .is_some_and(|s| s.compiled_projection().is_some())
+                || self
+                    .core_window_states
                     .get(&idx)
                     .is_some_and(|s| s.compiled_projection().is_some());
             if is_compiled {
@@ -2017,16 +2021,7 @@ impl StreamExecutor {
                     // Coalesce when batch count exceeds threshold to reduce
                     // per-batch overhead and memory fragmentation.
                     if entry.len() > EOWC_COALESCE_BATCH_THRESHOLD {
-                        let schema = entry[0].schema();
-                        match arrow::compute::concat_batches(&schema, entry.as_slice()) {
-                            Ok(coalesced) => *entry = vec![coalesced],
-                            Err(e) => tracing::warn!(
-                                table = %table_name,
-                                batches = entry.len(),
-                                "EOWC batch coalescing failed, \
-                                 keeping fragmented batches: {e}"
-                            ),
-                        }
+                        coalesce_batches(entry, "EOWC batch");
                     }
                 }
             }
@@ -2061,13 +2056,7 @@ impl StreamExecutor {
                 // Coalesce to reduce fragmentation without changing semantics
                 if let Some(eowc) = self.eowc_states.get_mut(&idx) {
                     for batches in eowc.accumulated_sources.values_mut() {
-                        if batches.len() > 1 {
-                            let schema = batches[0].schema();
-                            match arrow::compute::concat_batches(&schema, batches.as_slice()) {
-                                Ok(coalesced) => *batches = vec![coalesced],
-                                Err(e) => tracing::warn!("EOWC pressure coalescing failed: {e}"),
-                            }
-                        }
+                        coalesce_batches(batches, "EOWC pressure");
                     }
                 }
             }
@@ -2129,21 +2118,8 @@ impl StreamExecutor {
                     }
                 }
                 if !filtered_batches.is_empty() {
-                    let schema = filtered_batches[0].schema();
-                    match arrow::compute::concat_batches(&schema, &filtered_batches) {
-                        Ok(coalesced) => {
-                            filtered_sources.insert(table_name.clone(), vec![coalesced]);
-                        }
-                        Err(e) => {
-                            tracing::warn!(
-                                table = %table_name,
-                                batches = filtered_batches.len(),
-                                "EOWC filtered batch coalescing failed, \
-                                 keeping fragmented: {e}"
-                            );
-                            filtered_sources.insert(table_name.clone(), filtered_batches);
-                        }
-                    }
+                    coalesce_batches(&mut filtered_batches, "EOWC filtered batch");
+                    filtered_sources.insert(table_name.clone(), filtered_batches);
                 }
                 if !retained_batches.is_empty() {
                     retained_sources.insert(table_name.clone(), retained_batches);
@@ -3069,6 +3045,20 @@ impl StreamExecutor {
 /// `AsofJoinTranslatorConfig` and build a projection SQL string.
 ///
 /// Returns `(None, None)` for non-ASOF queries.
+/// Coalesce multiple `RecordBatch`es into a single batch, replacing the input
+/// `Vec` in-place. On failure, logs a warning and leaves the original batches
+/// untouched to avoid data loss.
+fn coalesce_batches(batches: &mut Vec<RecordBatch>, context: &str) {
+    if batches.len() <= 1 {
+        return;
+    }
+    let schema = batches[0].schema();
+    match arrow::compute::concat_batches(&schema, batches.as_slice()) {
+        Ok(coalesced) => *batches = vec![coalesced],
+        Err(e) => tracing::warn!("{context} coalescing failed, keeping fragmented: {e}"),
+    }
+}
+
 /// Compute the closed-window boundary from the current watermark and window config.
 ///
 /// All input data with `ts < boundary` belongs to **only** closed windows.

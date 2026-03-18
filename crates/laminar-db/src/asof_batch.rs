@@ -193,6 +193,7 @@ fn execute_asof_keyed(
     let mut right_indices: Vec<Option<usize>> = Vec::with_capacity(left.num_rows());
 
     for (left_idx, &left_ts) in left_timestamps.iter().enumerate() {
+        // Null keys never match — emit as unmatched for LEFT joins.
         let Some(left_hash) = left_keys_col.hash_at(left_idx) else {
             if config.join_type == AsofSqlJoinType::Left {
                 left_indices.push(left_idx);
@@ -201,6 +202,9 @@ fn execute_asof_keyed(
             continue;
         };
 
+        // Look up the right-side BTreeMap for this key hash, then find the
+        // best timestamp match with key-equality filtering to avoid
+        // hash-collision false positives.
         let matched_right = right_index.get(&left_hash).and_then(|btree| {
             find_match_keyed(
                 btree,
@@ -272,13 +276,9 @@ fn execute_asof_merge_scan(
         .tolerance
         .map(|d| i64::try_from(d.as_millis()).unwrap_or(i64::MAX));
 
-    let left_len = left.num_rows();
-
     let (left_indices, right_indices) = merge_scan_indices(
         &left_timestamps,
         &right_timestamps,
-        left_len,
-        right.num_rows(),
         config.direction,
         config.join_type,
         tolerance_ms,
@@ -295,16 +295,15 @@ fn execute_asof_merge_scan(
 }
 
 /// Run the merge-scan cursor over sorted left/right timestamps, producing matched indices.
-#[allow(clippy::too_many_arguments)]
 fn merge_scan_indices(
     left_timestamps: &[i64],
     right_timestamps: &[i64],
-    left_len: usize,
-    right_len: usize,
     direction: AsofSqlDirection,
     join_type: AsofSqlJoinType,
     tolerance_ms: Option<i64>,
 ) -> (Vec<usize>, Vec<Option<usize>>) {
+    let left_len = left_timestamps.len();
+    let right_len = right_timestamps.len();
     let mut left_indices: Vec<usize> = Vec::with_capacity(left_len);
     let mut right_indices: Vec<Option<usize>> = Vec::with_capacity(left_len);
     let mut right_cursor: usize = 0;
@@ -406,69 +405,6 @@ fn push_match(
     }
 }
 
-/// Find all candidate right row indices at the best matching timestamp,
-/// given direction and tolerance.
-fn find_match(
-    btree: &BTreeMap<i64, Vec<usize>>,
-    left_ts: i64,
-    direction: AsofSqlDirection,
-    tolerance_ms: Option<i64>,
-) -> Option<Vec<usize>> {
-    let candidate = match direction {
-        AsofSqlDirection::Backward => {
-            // Find most recent right row <= left_ts
-            btree
-                .range(..=left_ts)
-                .next_back()
-                .map(|(&ts, indices)| (ts, indices.clone()))
-        }
-        AsofSqlDirection::Forward => {
-            // Find earliest right row >= left_ts
-            btree
-                .range(left_ts..)
-                .next()
-                .map(|(&ts, indices)| (ts, indices.clone()))
-        }
-        AsofSqlDirection::Nearest => {
-            // Check both backward and forward, return whichever is closer
-            let backward = btree
-                .range(..=left_ts)
-                .next_back()
-                .map(|(&ts, indices)| (ts, indices.clone()));
-            let forward = btree
-                .range(left_ts..)
-                .next()
-                .map(|(&ts, indices)| (ts, indices.clone()));
-            match (backward, forward) {
-                (Some((b_ts, b_indices)), Some((f_ts, f_indices))) => {
-                    let b_diff = (left_ts - b_ts).abs();
-                    let f_diff = (f_ts - left_ts).abs();
-                    if b_diff <= f_diff {
-                        Some((b_ts, b_indices))
-                    } else {
-                        Some((f_ts, f_indices))
-                    }
-                }
-                (Some(b), None) => Some(b),
-                (None, Some(f)) => Some(f),
-                (None, None) => None,
-            }
-        }
-    };
-
-    candidate.and_then(|(right_ts, indices)| {
-        if let Some(tol) = tolerance_ms {
-            if (left_ts - right_ts).abs() <= tol {
-                Some(indices)
-            } else {
-                None
-            }
-        } else {
-            Some(indices)
-        }
-    })
-}
-
 /// Find the best matching right row index, filtering by key equality FIRST
 /// before selecting by timestamp. This avoids the hash-collision bug where
 /// `find_match` would select a timestamp for the whole hash bucket before
@@ -482,8 +418,6 @@ fn find_match_keyed(
     left_keys: &KeyColumn<'_>,
     right_keys: Option<&KeyColumn<'_>>,
 ) -> Option<usize> {
-    let tol = tolerance_ms.unwrap_or(i64::MAX);
-
     // Helper: check if a candidate passes key equality.
     let key_matches = |candidate: usize| -> bool {
         match right_keys {
@@ -492,8 +426,8 @@ fn find_match_keyed(
         }
     };
 
-    // Helper: check tolerance.
-    let within_tolerance = |ts: i64| -> bool { (left_ts - ts).abs() <= tol };
+    // Reuse the shared tolerance check.
+    let within_tolerance = |ts: i64| -> bool { apply_tolerance(left_ts, ts, tolerance_ms) };
 
     match direction {
         AsofSqlDirection::Backward => {
@@ -534,12 +468,10 @@ fn find_match_keyed(
             loop {
                 let b_dist = back_iter
                     .peek()
-                    .map(|(&ts, _)| (left_ts - ts).abs())
-                    .unwrap_or(i64::MAX);
+                    .map_or(i64::MAX, |(&ts, _)| (left_ts - ts).abs());
                 let f_dist = fwd_iter
                     .peek()
-                    .map(|(&ts, _)| (ts - left_ts).abs())
-                    .unwrap_or(i64::MAX);
+                    .map_or(i64::MAX, |(&ts, _)| (ts - left_ts).abs());
 
                 if b_dist == i64::MAX && f_dist == i64::MAX {
                     return None;
@@ -547,36 +479,33 @@ fn find_match_keyed(
 
                 if b_dist <= f_dist {
                     let (ts, indices) = back_iter.next().unwrap();
-                    if !within_tolerance(*ts) {
-                        // If backward exceeds tolerance, only forward remains viable.
-                        // Check forward side.
-                    } else {
+                    if within_tolerance(*ts) {
                         for &candidate in indices {
                             if key_matches(candidate) {
                                 return Some(candidate);
                             }
                         }
                     }
+                    // If backward exceeds tolerance, only forward remains viable.
                 } else {
                     let (ts, indices) = fwd_iter.next().unwrap();
-                    if !within_tolerance(*ts) {
-                        // Forward exceeds tolerance; backward may still be valid.
-                    } else {
+                    if within_tolerance(*ts) {
                         for &candidate in indices {
                             if key_matches(candidate) {
                                 return Some(candidate);
                             }
                         }
                     }
+                    // Forward exceeds tolerance; backward may still be valid.
                 }
 
                 // If both sides exceed tolerance, stop.
                 let b_exceeds = back_iter
                     .peek()
-                    .map_or(true, |(&ts, _)| !within_tolerance(ts));
+                    .is_none_or(|(&ts, _)| !within_tolerance(ts));
                 let f_exceeds = fwd_iter
                     .peek()
-                    .map_or(true, |(&ts, _)| !within_tolerance(ts));
+                    .is_none_or(|(&ts, _)| !within_tolerance(ts));
                 if b_exceeds && f_exceeds {
                     return None;
                 }

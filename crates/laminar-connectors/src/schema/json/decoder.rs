@@ -8,7 +8,9 @@
 
 use std::collections::HashMap;
 use std::sync::atomic::{AtomicU64, Ordering};
-use std::sync::{Arc, Mutex};
+use std::sync::Arc;
+
+use parking_lot::Mutex;
 
 use arrow_array::builder::{
     BooleanBuilder, Float32Builder, Float64Builder, Int16Builder, Int32Builder, Int64Builder,
@@ -282,8 +284,7 @@ impl FormatDecoder for JsonDecoder {
         let mut builders = self
             .builder_pool
             .lock()
-            .ok()
-            .and_then(|mut pool| pool.take())
+            .take()
             .unwrap_or_else(|| create_builders(&self.schema, capacity));
 
         // Optional _extra JSONB column for CollectExtra strategy.
@@ -492,9 +493,7 @@ impl FormatDecoder for JsonDecoder {
         let mut columns: Vec<ArrayRef> = builders.iter_mut().map(|b| b.finish()).collect();
 
         // Return empty builders to pool for reuse on next decode_batch call.
-        if let Ok(mut pool) = self.builder_pool.lock() {
-            *pool = Some(builders);
-        }
+        *self.builder_pool.lock() = Some(builders);
 
         // Append _extra column if present.
         let final_schema = if let Some(mut eb) = extra_builder {
