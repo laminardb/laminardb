@@ -57,6 +57,10 @@ impl RemotePartitionMap {
     /// All partitions start as unassigned.
     #[must_use]
     pub fn new(num_partitions: u32) -> Self {
+        assert!(
+            num_partitions > 0,
+            "num_partitions must be greater than zero"
+        );
         Self {
             assignments: HashMap::with_capacity(num_partitions as usize),
             num_partitions,
@@ -66,6 +70,10 @@ impl RemotePartitionMap {
     /// Create a partition map from an existing assignment.
     #[must_use]
     pub fn from_assignments(num_partitions: u32, assignments: HashMap<u32, (NodeId, u64)>) -> Self {
+        assert!(
+            num_partitions > 0,
+            "num_partitions must be greater than zero"
+        );
         Self {
             assignments,
             num_partitions,
@@ -163,6 +171,9 @@ impl RemoteCache {
 
     /// Insert a value into the cache, evicting the LRU entry if full.
     fn insert(&mut self, key: Vec<u8>, value: Bytes, epoch: u64) {
+        if self.capacity == 0 {
+            return;
+        }
         if self.entries.contains_key(&key) {
             self.order.retain(|k| k != &key);
         } else if self.entries.len() >= self.capacity {
@@ -471,6 +482,7 @@ impl RemoteLookupSource {
     /// Panics if the cached data lock is poisoned.
     pub fn invalidate(&self) {
         *self.cached_data.write().unwrap() = None;
+        self.last_epoch.store(0, Ordering::Release);
     }
 
     /// Get the last cached epoch.
@@ -695,6 +707,14 @@ mod tests {
     }
 
     #[test]
+    fn test_zero_capacity_cache_stays_empty() {
+        let mut cache = RemoteCache::new(0);
+        cache.insert(b"k1".to_vec(), Bytes::from_static(b"v1"), 1);
+        assert_eq!(cache.len(), 0);
+        assert!(cache.get(b"k1", 1).is_none());
+    }
+
+    #[test]
     fn test_remote_lookup_source_no_cache() {
         let schema = Arc::new(arrow_schema::Schema::new(vec![arrow_schema::Field::new(
             "id",
@@ -731,6 +751,8 @@ mod tests {
         // Invalidate.
         source.invalidate();
         assert!(source.cached_data.read().unwrap().is_none());
+        assert!(source.needs_refresh(5));
+        assert_eq!(source.last_epoch(), 0);
     }
 
     #[test]

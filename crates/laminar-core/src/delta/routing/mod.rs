@@ -31,9 +31,17 @@ pub struct RoutingResult {
 /// Errors that can occur during routing.
 #[derive(Debug, thiserror::Error)]
 pub enum RoutingError {
+    /// The router was configured with zero partitions.
+    #[error("num_partitions must be greater than zero")]
+    InvalidPartitionCount,
+
     /// The partition key column was not found in the batch.
     #[error("partition key column '{0}' not found in batch")]
     PartitionKeyNotFound(String),
+
+    /// The partition key column contains a null value.
+    #[error("partition key column '{0}' contains null values")]
+    NullPartitionKey(String),
 
     /// The batch has no rows.
     #[error("empty batch")]
@@ -123,15 +131,18 @@ impl PartitionRouter {
         assignments: HashMap<u32, NodeId>,
         partition_key: String,
         num_partitions: u32,
-    ) -> Self {
-        Self {
+    ) -> Result<Self, RoutingError> {
+        if num_partitions == 0 {
+            return Err(RoutingError::InvalidPartitionCount);
+        }
+        Ok(Self {
             local_node,
             assigner,
             assignments: Arc::new(RwLock::new(assignments)),
             peers: Arc::new(RwLock::new(HashMap::new())),
             partition_key,
             num_partitions,
-        }
+        })
     }
 
     /// Update the partition-to-node assignment map (e.g., after rebalance).
@@ -203,7 +214,7 @@ impl PartitionRouter {
 
         for row_idx in 0..batch.num_rows() {
             // Get the key bytes for this row
-            let key_bytes = Self::extract_key_bytes(key_col, row_idx)?;
+            let key_bytes = Self::extract_key_bytes(key_col, row_idx, &self.partition_key)?;
             let partition_id = partition_for_key(&key_bytes, self.num_partitions);
 
             // 3. Look up partition → node assignment
@@ -250,7 +261,14 @@ impl PartitionRouter {
     ///
     /// Returns `RoutingError::UnsupportedKeyType` if the array's data type
     /// cannot be converted to key bytes.
-    fn extract_key_bytes(array: &dyn Array, row_idx: usize) -> Result<Vec<u8>, RoutingError> {
+    fn extract_key_bytes(
+        array: &dyn Array,
+        row_idx: usize,
+        key_name: &str,
+    ) -> Result<Vec<u8>, RoutingError> {
+        if array.is_null(row_idx) {
+            return Err(RoutingError::NullPartitionKey(key_name.to_string()));
+        }
         use arrow::array as aa;
 
         // Fast paths for common partition key types
@@ -380,6 +398,7 @@ mod tests {
             "key".to_string(),
             num_partitions,
         )
+        .unwrap()
     }
 
     #[test]
@@ -590,7 +609,8 @@ mod tests {
             assignments,
             "id".to_string(),
             num_partitions,
-        );
+        )
+        .unwrap();
 
         let result = router.route_batch(&batch, 1).unwrap();
         let total: usize = result.local_batches.iter().map(|b| b.num_rows()).sum();
@@ -621,7 +641,8 @@ mod tests {
             plan.assignments,
             "key".to_string(),
             num_partitions,
-        );
+        )
+        .unwrap();
 
         let result = router.route_batch(&batch, 1).unwrap();
 
@@ -646,6 +667,44 @@ mod tests {
 
         assert!(router.is_local_partition(0));
         assert!(!router.is_local_partition(1));
+    }
+
+    #[test]
+    fn test_new_rejects_zero_partitions() {
+        let err = PartitionRouter::new(
+            NodeId(1),
+            Arc::new(ConsistentHashAssigner::new()),
+            HashMap::new(),
+            "key".to_string(),
+            0,
+        )
+        .unwrap_err();
+        assert!(matches!(err, RoutingError::InvalidPartitionCount));
+    }
+
+    #[test]
+    fn test_route_batch_rejects_null_partition_key() {
+        let schema = Arc::new(Schema::new(vec![
+            Field::new("key", DataType::Utf8, true),
+            Field::new("value", DataType::Int64, false),
+        ]));
+        let batch = RecordBatch::try_new(
+            schema,
+            vec![
+                Arc::new(StringArray::from(vec![Some("a"), None, Some("c")])),
+                Arc::new(Int64Array::from(vec![1, 2, 3])),
+            ],
+        )
+        .unwrap();
+
+        let mut assignments = HashMap::new();
+        for pid in 0..4 {
+            assignments.insert(pid, NodeId(1));
+        }
+        let router = make_router_with_assignments(1, assignments, 4);
+
+        let err = router.route_batch(&batch, 1).unwrap_err();
+        assert!(matches!(err, RoutingError::NullPartitionKey(ref name) if name == "key"));
     }
 
     #[test]
