@@ -8,6 +8,7 @@
 use std::collections::hash_map::DefaultHasher;
 use std::collections::BTreeMap;
 use std::hash::{Hash, Hasher};
+use std::ops::Bound;
 use std::sync::Arc;
 
 use rustc_hash::{FxHashMap, FxHashSet};
@@ -201,15 +202,15 @@ fn execute_asof_keyed(
         };
 
         let matched_right = right_index.get(&left_hash).and_then(|btree| {
-            let candidates = find_match(btree, left_ts, config.direction, tolerance_ms)?;
-            if let Some(ref rk) = right_keys_col {
-                for &candidate in &candidates {
-                    if left_keys_col.keys_equal(left_idx, rk, candidate) {
-                        return Some(candidate);
-                    }
-                }
-            }
-            None
+            find_match_keyed(
+                btree,
+                left_ts,
+                config.direction,
+                tolerance_ms,
+                left_idx,
+                &left_keys_col,
+                right_keys_col.as_ref(),
+            )
         });
 
         push_match(
@@ -466,6 +467,122 @@ fn find_match(
             Some(indices)
         }
     })
+}
+
+/// Find the best matching right row index, filtering by key equality FIRST
+/// before selecting by timestamp. This avoids the hash-collision bug where
+/// `find_match` would select a timestamp for the whole hash bucket before
+/// checking key equality, causing missed matches at other timestamps.
+fn find_match_keyed(
+    btree: &BTreeMap<i64, Vec<usize>>,
+    left_ts: i64,
+    direction: AsofSqlDirection,
+    tolerance_ms: Option<i64>,
+    left_idx: usize,
+    left_keys: &KeyColumn<'_>,
+    right_keys: Option<&KeyColumn<'_>>,
+) -> Option<usize> {
+    let tol = tolerance_ms.unwrap_or(i64::MAX);
+
+    // Helper: check if a candidate passes key equality.
+    let key_matches = |candidate: usize| -> bool {
+        match right_keys {
+            Some(rk) => left_keys.keys_equal(left_idx, rk, candidate),
+            None => true,
+        }
+    };
+
+    // Helper: check tolerance.
+    let within_tolerance = |ts: i64| -> bool { (left_ts - ts).abs() <= tol };
+
+    match direction {
+        AsofSqlDirection::Backward => {
+            // Iterate timestamps descending from left_ts, find first key-equal match.
+            for (&ts, indices) in btree.range(..=left_ts).rev() {
+                if !within_tolerance(ts) {
+                    break;
+                }
+                for &candidate in indices {
+                    if key_matches(candidate) {
+                        return Some(candidate);
+                    }
+                }
+            }
+            None
+        }
+        AsofSqlDirection::Forward => {
+            // Iterate timestamps ascending from left_ts, find first key-equal match.
+            for (&ts, indices) in btree.range(left_ts..) {
+                if !within_tolerance(ts) {
+                    break;
+                }
+                for &candidate in indices {
+                    if key_matches(candidate) {
+                        return Some(candidate);
+                    }
+                }
+            }
+            None
+        }
+        AsofSqlDirection::Nearest => {
+            // Interleave backward and forward iterators, picking closest first.
+            let mut back_iter = btree.range(..=left_ts).rev().peekable();
+            let mut fwd_iter = btree
+                .range((Bound::Excluded(left_ts), Bound::Unbounded))
+                .peekable();
+
+            loop {
+                let b_dist = back_iter
+                    .peek()
+                    .map(|(&ts, _)| (left_ts - ts).abs())
+                    .unwrap_or(i64::MAX);
+                let f_dist = fwd_iter
+                    .peek()
+                    .map(|(&ts, _)| (ts - left_ts).abs())
+                    .unwrap_or(i64::MAX);
+
+                if b_dist == i64::MAX && f_dist == i64::MAX {
+                    return None;
+                }
+
+                if b_dist <= f_dist {
+                    let (ts, indices) = back_iter.next().unwrap();
+                    if !within_tolerance(*ts) {
+                        // If backward exceeds tolerance, only forward remains viable.
+                        // Check forward side.
+                    } else {
+                        for &candidate in indices {
+                            if key_matches(candidate) {
+                                return Some(candidate);
+                            }
+                        }
+                    }
+                } else {
+                    let (ts, indices) = fwd_iter.next().unwrap();
+                    if !within_tolerance(*ts) {
+                        // Forward exceeds tolerance; backward may still be valid.
+                    } else {
+                        for &candidate in indices {
+                            if key_matches(candidate) {
+                                return Some(candidate);
+                            }
+                        }
+                    }
+                }
+
+                // If both sides exceed tolerance, stop.
+                let b_exceeds = back_iter
+                    .peek()
+                    .map_or(true, |(&ts, _)| !within_tolerance(ts));
+                let f_exceeds = fwd_iter
+                    .peek()
+                    .map_or(true, |(&ts, _)| !within_tolerance(ts));
+                if b_exceeds && f_exceeds {
+                    return None;
+                }
+            }
+        }
+    }
 }
 
 /// Extract a column's values as `i64` timestamps (epoch millis).
