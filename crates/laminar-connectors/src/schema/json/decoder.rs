@@ -8,7 +8,7 @@
 
 use std::collections::HashMap;
 use std::sync::atomic::{AtomicU64, Ordering};
-use std::sync::Arc;
+use std::sync::{Arc, Mutex};
 
 use arrow_array::builder::{
     BooleanBuilder, Float32Builder, Float64Builder, Int16Builder, Int32Builder, Int64Builder,
@@ -183,6 +183,10 @@ pub struct JsonDecoder {
     /// explode position to the schema column index (or `None` if
     /// the explode name doesn't match any schema column).
     explode_col_indices: Option<Vec<Option<usize>>>,
+    /// Pooled builders: reused across `decode_batch` calls to avoid
+    /// re-allocating internal Arrow buffers. After `.finish()` builders
+    /// are empty and ready for reuse.
+    builder_pool: Mutex<Option<Vec<Box<dyn ColumnBuilder>>>>,
 }
 
 #[allow(clippy::missing_fields_in_debug)]
@@ -250,6 +254,7 @@ impl JsonDecoder {
             mismatch_count: AtomicU64::new(0),
             column_extractions,
             explode_col_indices,
+            builder_pool: Mutex::new(None),
         }
     }
 
@@ -273,8 +278,13 @@ impl FormatDecoder for JsonDecoder {
         let num_fields = self.schema.fields().len();
         let capacity = records.len();
 
-        // Initialise one builder per schema column.
-        let mut builders = create_builders(&self.schema, capacity);
+        // Reuse pooled builders when available; create fresh otherwise.
+        let mut builders = self
+            .builder_pool
+            .lock()
+            .ok()
+            .and_then(|mut pool| pool.take())
+            .unwrap_or_else(|| create_builders(&self.schema, capacity));
 
         // Optional _extra JSONB column for CollectExtra strategy.
         let collect_extra = matches!(
@@ -478,8 +488,13 @@ impl FormatDecoder for JsonDecoder {
             }
         }
 
-        // Finish all builders into arrays.
-        let mut columns: Vec<ArrayRef> = builders.into_iter().map(|mut b| b.finish()).collect();
+        // Finish all builders into arrays; builders are now empty and reusable.
+        let mut columns: Vec<ArrayRef> = builders.iter_mut().map(|b| b.finish()).collect();
+
+        // Return empty builders to pool for reuse on next decode_batch call.
+        if let Ok(mut pool) = self.builder_pool.lock() {
+            *pool = Some(builders);
+        }
 
         // Append _extra column if present.
         let final_schema = if let Some(mut eb) = extra_builder {
