@@ -322,3 +322,22 @@ jobs:
             exit 1
           fi
           echo "All CI checks passed!"
+
+  # ============================================
+  # Note: Branch Protection Configuration
+  # ============================================
+  # The following branch protection rules must be configured in
+  # GitHub repo Settings > Branches > main:
+  #
+  # Required status checks:
+  #   - CI Success (this workflow)
+  #   - Human Review Attestation (pr-review-gate.yml)
+  #
+  # Required reviews:
+  #   - Require at least 1 approving review
+  #   - Require review from CODEOWNERS
+  #   - Dismiss stale reviews on new pushes
+  #
+  # Other:
+  #   - Require branches to be up to date before merging
+  #   - Do not allow bypassing the above settings

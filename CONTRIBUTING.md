@@ -154,6 +154,12 @@ Many features are optional to keep compile times manageable:
 - [ ] Ring 0 code verified (no allocations/locks) if applicable
 - [ ] Benchmarks run if performance-sensitive code changed
 
+### Review Policy
+
+- **Human-engaged reviews required.** AI-generated code is welcome, but every review response must be written or verified by a human. Rubber-stamping ("LGTM", "will fix") without explanation is not accepted.
+- **Explain your reasoning.** When approving or requesting changes, state *why* you agree or disagree — don't just list what you'll change. A review that says "I'll update the tests" without explaining the concern is incomplete.
+- **PRs without meaningful human review will not be merged.**
+
 ### Commit Messages
 
 We use [Conventional Commits](https://www.conventionalcommits.org/):
