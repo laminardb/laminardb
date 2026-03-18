@@ -587,7 +587,7 @@ pub async fn read_version_diff(
             .head(&obj_path)
             .await
             .map_err(|e| ConnectorError::ReadError(format!("failed to stat '{file_path}': {e}")))?;
-        if file_meta.size as u64 > MAX_DIRECT_READ_BYTES {
+        if file_meta.size > MAX_DIRECT_READ_BYTES {
             warn!(
                 file_path,
                 file_size = file_meta.size,
