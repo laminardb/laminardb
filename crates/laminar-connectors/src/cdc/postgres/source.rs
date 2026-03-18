@@ -413,11 +413,8 @@ impl PostgresCdcSource {
     }
 
     fn push_event(&mut self, event: ChangeEvent) {
-        let total = self.event_buffer.len()
-            + self
-                .current_txn
-                .as_ref()
-                .map_or(0, |t| t.events.len());
+        let total =
+            self.event_buffer.len() + self.current_txn.as_ref().map_or(0, |t| t.events.len());
         if total >= self.config.max_buffered_events {
             self.metrics.record_dropped(1);
             return;
