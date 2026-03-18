@@ -133,6 +133,53 @@ const IDLE_TIMEOUT: Duration = Duration::from_millis(100);
 /// Barrier alignment timeout.
 const BARRIER_TIMEOUT: Duration = Duration::from_secs(60);
 
+/// Adaptive wait strategy for the `try_recv` drain loop.
+///
+/// Escalates through three phases to balance latency vs CPU:
+/// - **Spin**: busy-loop `try_recv` — sub-µs wake latency for burst traffic.
+/// - **Yield**: `hint::spin_loop()` between attempts — still fast, backs off slightly.
+/// - **Done**: stop draining, hand off to the `tokio::select!` park for the next cycle.
+struct AdaptiveWaiter {
+    /// Remaining spin iterations before escalating to yield.
+    spin_remaining: u32,
+    /// Remaining yield iterations before declaring the drain done.
+    yield_remaining: u32,
+}
+
+impl AdaptiveWaiter {
+    const SPIN_ITERS: u32 = 100;
+    const YIELD_ITERS: u32 = 10;
+
+    fn new() -> Self {
+        Self {
+            spin_remaining: Self::SPIN_ITERS,
+            yield_remaining: Self::YIELD_ITERS,
+        }
+    }
+
+    /// Reset to spin phase — call after a successful `try_recv`.
+    fn reset(&mut self) {
+        self.spin_remaining = Self::SPIN_ITERS;
+        self.yield_remaining = Self::YIELD_ITERS;
+    }
+
+    /// Called when `try_recv` returns empty. Returns `true` if the drain
+    /// loop should continue (still in spin/yield phase), `false` when all
+    /// patience is exhausted.
+    fn wait_empty(&mut self) -> bool {
+        if self.spin_remaining > 0 {
+            self.spin_remaining -= 1;
+            return true;
+        }
+        if self.yield_remaining > 0 {
+            self.yield_remaining -= 1;
+            std::hint::spin_loop();
+            return true;
+        }
+        false
+    }
+}
+
 impl StreamingCoordinator {
     /// Create a new streaming coordinator.
     ///
@@ -386,9 +433,12 @@ impl StreamingCoordinator {
             }
 
             // Drain any additional buffered messages (batch coalescing).
-            // Terminates on count limit OR time budget, whichever comes first.
+            // Uses AdaptiveWaiter: spins while data flows (sub-µs latency),
+            // escalates through yield → break when idle (zero CPU when cold).
+            // Also bounded by count limit and time budget.
             let mut drain_count = 0;
             let drain_budget_ns = self.config.drain_budget_ns;
+            let mut waiter = AdaptiveWaiter::new();
             #[allow(clippy::cast_possible_truncation)]
             while drain_count < MAX_DRAIN_PER_CYCLE
                 && (cycle_start.elapsed().as_nanos() as u64) < drain_budget_ns
@@ -397,8 +447,13 @@ impl StreamingCoordinator {
                     Ok(msg) => {
                         self.process_msg(msg, &mut callback, &mut barriers_buf, &mut cycle_events);
                         drain_count += 1;
+                        waiter.reset();
                     }
-                    Err(_) => break,
+                    Err(_) => {
+                        if !waiter.wait_empty() {
+                            break;
+                        }
+                    }
                 }
             }
 
