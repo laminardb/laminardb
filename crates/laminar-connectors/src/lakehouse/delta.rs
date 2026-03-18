@@ -88,8 +88,6 @@ pub struct DeltaLakeSink {
     buffered_rows: usize,
     /// Total bytes buffered (estimated) in current epoch.
     buffered_bytes: u64,
-    /// Number of Parquet files pending commit in current epoch.
-    pending_files: usize,
     /// Current Delta Lake table version.
     delta_version: u64,
     /// Time when the current buffer started accumulating.
@@ -143,7 +141,6 @@ impl DeltaLakeSink {
             buffer: Vec::with_capacity(16),
             buffered_rows: 0,
             buffered_bytes: 0,
-            pending_files: 0,
             delta_version: 0,
             buffer_start_time: None,
             metrics: DeltaLakeSinkMetrics::new(),
@@ -550,7 +547,6 @@ impl DeltaLakeSink {
                         self.delta_version = table.version().unwrap_or(0) as u64;
                     }
                     self.table = Some(table);
-                    self.pending_files = 0;
 
                     // Clear staged state only after confirmed success.
                     self.staged_batches.clear();
@@ -596,25 +592,6 @@ impl DeltaLakeSink {
         Err(last_error.unwrap_or_else(|| {
             ConnectorError::Internal("flush_staged_to_delta: no attempts made".into())
         }))
-    }
-
-    /// Commits pending files as a Delta Lake transaction (updates metrics).
-    /// Only used when the delta-lake feature is NOT enabled (local simulation).
-    #[cfg(not(feature = "delta-lake"))]
-    fn commit_local(&mut self, epoch: u64) {
-        self.delta_version += 1;
-        self.pending_files = 0;
-
-        // Record flush metrics for staged data.
-        self.metrics
-            .record_flush(self.staged_rows as u64, self.staged_bytes);
-        self.metrics.record_commit(self.delta_version);
-
-        debug!(
-            epoch,
-            delta_version = self.delta_version,
-            "Delta Lake: committed transaction"
-        );
     }
 
     /// Splits a changelog `RecordBatch` into insert and delete batches.
@@ -1016,7 +993,6 @@ impl SinkConnector for DeltaLakeSink {
         self.buffer.clear();
         self.buffered_rows = 0;
         self.buffered_bytes = 0;
-        self.pending_files = 0;
         self.buffer_start_time = None;
 
         debug!(epoch, "Delta Lake: began epoch");
@@ -1043,11 +1019,6 @@ impl SinkConnector for DeltaLakeSink {
             self.buffer_start_time = None;
         }
 
-        #[cfg(not(feature = "delta-lake"))]
-        {
-            self.pending_files += 1;
-        }
-
         debug!(epoch, "Delta Lake: pre-committed (batches staged)");
         Ok(())
     }
@@ -1065,15 +1036,6 @@ impl SinkConnector for DeltaLakeSink {
         {
             if !self.staged_batches.is_empty() {
                 self.flush_staged_to_delta().await?;
-            }
-        }
-        #[cfg(not(feature = "delta-lake"))]
-        {
-            if self.pending_files > 0 || !self.staged_batches.is_empty() {
-                self.commit_local(epoch);
-                self.staged_batches.clear();
-                self.staged_rows = 0;
-                self.staged_bytes = 0;
             }
         }
 
@@ -1094,7 +1056,6 @@ impl SinkConnector for DeltaLakeSink {
         self.buffer.clear();
         self.buffered_rows = 0;
         self.buffered_bytes = 0;
-        self.pending_files = 0;
         self.buffer_start_time = None;
         self.staged_batches.clear();
         self.staged_rows = 0;
@@ -1193,12 +1154,6 @@ impl SinkConnector for DeltaLakeSink {
         if self.config.delivery_guarantee != DeliveryGuarantee::ExactlyOnce {
             self.flush().await?;
         } else if !self.buffer.is_empty() {
-            self.pre_commit(self.current_epoch).await?;
-            self.commit_epoch(self.current_epoch).await?;
-        }
-
-        #[cfg(not(feature = "delta-lake"))]
-        if !self.buffer.is_empty() {
             self.pre_commit(self.current_epoch).await?;
             self.commit_epoch(self.current_epoch).await?;
         }
@@ -1525,24 +1480,6 @@ mod tests {
         assert!(sink.buffered_bytes() > 0);
     }
 
-    #[cfg(not(feature = "delta-lake"))]
-    #[tokio::test]
-    async fn test_write_batch_buffers_without_commit() {
-        let mut config = test_config();
-        config.max_buffer_records = 10;
-        let mut sink = DeltaLakeSink::new(config);
-        sink.state = ConnectorState::Running;
-
-        // Without the delta-lake feature, mid-epoch flush is compiled out.
-        let batch = test_batch(6);
-        sink.write_batch(&batch).await.unwrap();
-        sink.write_batch(&batch).await.unwrap();
-
-        assert_eq!(sink.buffered_rows(), 12);
-        assert_eq!(sink.buffer.len(), 2);
-        assert_eq!(sink.pending_files, 0);
-    }
-
     #[tokio::test]
     async fn test_write_batch_empty() {
         let mut sink = DeltaLakeSink::new(test_config());
@@ -1592,84 +1529,7 @@ mod tests {
     }
 
     // ── Epoch lifecycle tests ──
-    // Note: These tests bypass open() and test business logic only.
-    // With the delta-lake feature, commit_epoch() does real I/O which fails without a table.
-    // See delta_io.rs for integration tests with real I/O.
-
-    #[cfg(not(feature = "delta-lake"))]
-    #[tokio::test]
-    async fn test_epoch_lifecycle() {
-        let mut sink = DeltaLakeSink::new(test_config());
-        sink.state = ConnectorState::Running;
-
-        // Begin epoch
-        sink.begin_epoch(1).await.unwrap();
-        assert_eq!(sink.current_epoch(), 1);
-
-        // Write some data
-        let batch = test_batch(10);
-        sink.write_batch(&batch).await.unwrap();
-
-        // Two-phase commit: pre_commit flushes buffer, commit_epoch commits
-        sink.pre_commit(1).await.unwrap();
-        assert_eq!(sink.buffered_rows(), 0);
-        sink.commit_epoch(1).await.unwrap();
-        assert_eq!(sink.last_committed_epoch(), 1);
-        assert_eq!(sink.delta_version(), 1);
-
-        // Metrics should show 1 commit
-        let m = sink.metrics();
-        let commits = m.custom.iter().find(|(k, _)| k == "delta.commits");
-        assert_eq!(commits.unwrap().1, 1.0);
-    }
-
-    #[cfg(not(feature = "delta-lake"))]
-    #[tokio::test]
-    async fn test_epoch_skip_already_committed() {
-        let mut config = test_config();
-        config.delivery_guarantee = DeliveryGuarantee::ExactlyOnce;
-        let mut sink = DeltaLakeSink::new(config);
-        sink.state = ConnectorState::Running;
-
-        // Commit epoch 1
-        sink.begin_epoch(1).await.unwrap();
-        let batch = test_batch(5);
-        sink.write_batch(&batch).await.unwrap();
-        sink.pre_commit(1).await.unwrap();
-        sink.commit_epoch(1).await.unwrap();
-        assert_eq!(sink.last_committed_epoch(), 1);
-
-        // Try to begin epoch 1 again (should skip)
-        sink.begin_epoch(1).await.unwrap();
-        // Should not have cleared the state for a new epoch
-        // (skipped because already committed)
-
-        // Commit epoch 1 again (should be no-op due to idempotency)
-        sink.pre_commit(1).await.unwrap();
-        sink.commit_epoch(1).await.unwrap();
-        assert_eq!(sink.last_committed_epoch(), 1);
-        assert_eq!(sink.delta_version(), 1); // No new version
-    }
-
-    #[cfg(not(feature = "delta-lake"))]
-    #[tokio::test]
-    async fn test_epoch_at_least_once_no_skip() {
-        let mut config = test_config();
-        config.delivery_guarantee = DeliveryGuarantee::AtLeastOnce;
-        let mut sink = DeltaLakeSink::new(config);
-        sink.state = ConnectorState::Running;
-
-        sink.begin_epoch(1).await.unwrap();
-        let batch = test_batch(5);
-        sink.write_batch(&batch).await.unwrap();
-        sink.pre_commit(1).await.unwrap();
-        sink.commit_epoch(1).await.unwrap();
-
-        // Begin epoch 1 again (at-least-once doesn't skip)
-        sink.begin_epoch(1).await.unwrap();
-        assert_eq!(sink.current_epoch(), 1);
-        assert_eq!(sink.buffered_rows(), 0); // Buffer was cleared
-    }
+    // Note: Epoch lifecycle with real I/O is tested in delta_io.rs integration tests.
 
     #[tokio::test]
     async fn test_rollback_clears_buffer() {
@@ -1685,7 +1545,6 @@ mod tests {
         sink.rollback_epoch(0).await.unwrap();
         assert_eq!(sink.buffered_rows(), 0);
         assert_eq!(sink.buffered_bytes(), 0);
-        assert_eq!(sink.pending_files, 0);
     }
 
     /// D001: Rollback after `pre_commit` must discard staged data.
@@ -1762,24 +1621,6 @@ mod tests {
         assert_eq!(sink.delta_version(), 0); // No version bump (no files)
     }
 
-    #[cfg(not(feature = "delta-lake"))]
-    #[tokio::test]
-    async fn test_sequential_epochs() {
-        let mut sink = DeltaLakeSink::new(test_config());
-        sink.state = ConnectorState::Running;
-
-        for epoch in 1..=5 {
-            sink.begin_epoch(epoch).await.unwrap();
-            let batch = test_batch(10);
-            sink.write_batch(&batch).await.unwrap();
-            sink.pre_commit(epoch).await.unwrap();
-            sink.commit_epoch(epoch).await.unwrap();
-        }
-
-        assert_eq!(sink.last_committed_epoch(), 5);
-        assert_eq!(sink.delta_version(), 5);
-    }
-
     // ── Flush tests ──
     // Note: These tests bypass open() and test business logic only.
 
@@ -1807,19 +1648,6 @@ mod tests {
     // With the delta-lake feature, open() tries to actually access the path.
     // See delta_io.rs for integration tests with real I/O.
 
-    #[cfg(not(feature = "delta-lake"))]
-    #[tokio::test]
-    async fn test_open_requires_feature() {
-        let mut sink = DeltaLakeSink::new(test_config());
-
-        let connector_config = ConnectorConfig::new("delta-lake");
-        let result = sink.open(&connector_config).await;
-
-        assert!(result.is_err());
-        let err = result.unwrap_err().to_string();
-        assert!(err.contains("delta-lake"), "error: {err}");
-    }
-
     #[tokio::test]
     async fn test_close() {
         let mut sink = DeltaLakeSink::new(test_config());
@@ -1827,25 +1655,6 @@ mod tests {
 
         sink.close().await.unwrap();
         assert_eq!(sink.state(), ConnectorState::Closed);
-    }
-
-    #[cfg(not(feature = "delta-lake"))]
-    #[tokio::test]
-    async fn test_close_flushes_remaining() {
-        let mut config = test_config();
-        config.max_buffer_records = 1000;
-        let mut sink = DeltaLakeSink::new(config);
-        sink.state = ConnectorState::Running;
-
-        let batch = test_batch(30);
-        sink.write_batch(&batch).await.unwrap();
-        assert_eq!(sink.buffered_rows(), 30);
-
-        sink.close().await.unwrap();
-        assert_eq!(sink.buffered_rows(), 0);
-
-        let m = sink.metrics();
-        assert_eq!(m.records_total, 30);
     }
 
     // ── Health check tests ──
@@ -1946,26 +1755,6 @@ mod tests {
         assert_eq!(m.records_total, 0);
         assert_eq!(m.bytes_total, 0);
         assert_eq!(m.errors_total, 0);
-    }
-
-    // When delta-lake feature is enabled, this triggers auto-flush which
-    // needs a real table. See delta_io::tests for integration coverage.
-    #[cfg(not(feature = "delta-lake"))]
-    #[tokio::test]
-    async fn test_metrics_after_commit() {
-        let mut sink = DeltaLakeSink::new(test_config());
-        sink.state = ConnectorState::Running;
-
-        let batch = test_batch(10);
-        sink.write_batch(&batch).await.unwrap();
-        assert_eq!(sink.buffered_rows(), 10);
-
-        // Metrics are recorded on commit_epoch, not on pre_commit.
-        sink.pre_commit(0).await.unwrap();
-        sink.commit_epoch(0).await.unwrap();
-        let m = sink.metrics();
-        assert_eq!(m.records_total, 10);
-        assert!(m.bytes_total > 0);
     }
 
     // ── Changelog splitting tests ──
