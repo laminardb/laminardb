@@ -85,13 +85,21 @@ impl ColumnFileConfig {
     }
 }
 
+/// Size of the write-position header at the start of each column file.
+const HEADER_SIZE: usize = 8;
+
 /// A single mmap'd column file.
+///
+/// The first 8 bytes of the file store the current `write_pos` as a
+/// little-endian u64. This allows the file to be reopened without data
+/// loss — the write position is recovered from the header rather than
+/// being reset to zero.
 struct ColumnFile {
     /// Memory-mapped region.
     mmap: MmapMut,
     /// Backing file.
     _file: File,
-    /// Current write position.
+    /// Current write position (offset past the header).
     write_pos: usize,
     /// Total capacity.
     capacity: usize,
@@ -107,13 +115,15 @@ impl ColumnFile {
             .truncate(false)
             .open(path)?;
 
-        let metadata = file.metadata()?;
-        let capacity = if metadata.len() == 0 {
-            file.set_len(initial_size as u64)?;
-            initial_size
+        let file_meta = file.metadata()?;
+        let is_new = file_meta.len() == 0;
+        let capacity = if is_new {
+            let total = initial_size + HEADER_SIZE;
+            file.set_len(total as u64)?;
+            total
         } else {
             #[allow(clippy::cast_possible_truncation)]
-            let cap = metadata.len() as usize;
+            let cap = file_meta.len() as usize;
             cap
         };
 
@@ -122,12 +132,36 @@ impl ColumnFile {
         #[allow(unsafe_code)]
         let mmap = unsafe { MmapMut::map_mut(&file)? };
 
+        let write_pos = if is_new {
+            // Initialize header to zero (data starts right after header).
+            HEADER_SIZE
+        } else if capacity >= HEADER_SIZE {
+            // Read persisted write_pos from header.
+            let stored = u64::from_le_bytes(
+                mmap[..HEADER_SIZE]
+                    .try_into()
+                    .map_err(|_| StateError::Corruption("invalid column file header".into()))?,
+            );
+            #[allow(clippy::cast_possible_truncation)]
+            let pos = stored as usize;
+            // Sanity: clamp to capacity, minimum is HEADER_SIZE.
+            pos.max(HEADER_SIZE).min(capacity)
+        } else {
+            HEADER_SIZE
+        };
+
         Ok(Self {
             mmap,
             _file: file,
-            write_pos: 0,
+            write_pos,
             capacity,
         })
+    }
+
+    /// Persist the current write_pos to the 8-byte file header.
+    fn persist_header(&mut self) {
+        let bytes = (self.write_pos as u64).to_le_bytes();
+        self.mmap[..HEADER_SIZE].copy_from_slice(&bytes);
     }
 
     /// Write data at the current position, growing if needed.
@@ -136,7 +170,6 @@ impl ColumnFile {
         let end = offset + data.len();
 
         if end > self.capacity {
-            // For simplicity, return error — caller should create a new partition.
             return Err(StateError::Io(std::io::Error::other(
                 "column file full — rotate partition",
             )));
@@ -144,6 +177,7 @@ impl ColumnFile {
 
         self.mmap[offset..end].copy_from_slice(data);
         self.write_pos = end;
+        self.persist_header();
         Ok(offset)
     }
 
@@ -155,14 +189,16 @@ impl ColumnFile {
 
     /// Flush to disk.
     fn flush(&mut self) -> Result<(), StateError> {
+        self.persist_header();
         self.mmap.flush()?;
         Ok(())
     }
 
-    /// Reset write position.
+    /// Reset write position to just after the header.
     #[allow(dead_code)]
     fn reset(&mut self) {
-        self.write_pos = 0;
+        self.write_pos = HEADER_SIZE;
+        self.persist_header();
     }
 }
 

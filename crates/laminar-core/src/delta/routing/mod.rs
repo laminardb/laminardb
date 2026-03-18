@@ -21,7 +21,8 @@
 #![allow(clippy::disallowed_types)] // cold path: routing coordination
 use std::collections::HashMap;
 
-use arrow_array::RecordBatch;
+use arrow::compute;
+use arrow_array::{RecordBatch, UInt32Array};
 
 use crate::delta::discovery::NodeId;
 use crate::delta::partition::assignment::AssignmentPlan;
@@ -74,12 +75,12 @@ impl PartitionRouter {
     /// Route a `RecordBatch` to local and remote destinations.
     ///
     /// If no partition key is configured, the entire batch is routed based
-    /// on partition 0's owner. When a partition key is configured, rows are
-    /// hashed and split across partitions.
+    /// on partition 0's owner. When a partition key is configured, each row's
+    /// key value is hashed to determine its partition, and the batch is split
+    /// by destination node using `arrow::compute::take`.
     #[must_use]
     pub fn route_batch(&self, batch: &RecordBatch) -> RoutingResult {
         if self.num_partitions == 0 || self.assignments.is_empty() {
-            // No partitions configured — everything stays local.
             return RoutingResult {
                 local_batches: vec![batch.clone()],
                 remote_batches: HashMap::new(),
@@ -103,26 +104,59 @@ impl PartitionRouter {
             };
         }
 
-        // With a partition key: compute the partition for each row by hashing
-        // the key column value. For simplicity, we hash the first row to
-        // determine the batch's partition (assuming batches are pre-partitioned
-        // or small enough that splitting is unnecessary).
-        let partition_id = self.compute_partition(batch);
-        let owner = self.owner_of(partition_id);
-
-        if owner == self.local_node {
-            RoutingResult {
-                local_batches: vec![batch.clone()],
-                remote_batches: HashMap::new(),
+        let key_col_name = self.partition_key.as_ref().unwrap();
+        let key_col = match batch.column_by_name(key_col_name) {
+            Some(col) => col,
+            None => {
+                // Missing key column — route everything local as fallback.
+                return RoutingResult {
+                    local_batches: vec![batch.clone()],
+                    remote_batches: HashMap::new(),
+                };
             }
-        } else {
-            let mut remote = HashMap::new();
-            remote.insert(owner, vec![batch.clone()]);
-            RoutingResult {
-                local_batches: Vec::new(),
-                remote_batches: remote,
+        };
+
+        // Hash each row's key value and group row indices by destination node.
+        let mut node_indices: HashMap<NodeId, Vec<u32>> = HashMap::new();
+        let num_rows = batch.num_rows();
+
+        for row_idx in 0..num_rows {
+            let partition_id = partition_for_key(key_col, row_idx, self.num_partitions);
+            let owner = self.owner_of(partition_id);
+            #[allow(clippy::cast_possible_truncation)]
+            node_indices.entry(owner).or_default().push(row_idx as u32);
+        }
+
+        let mut result = RoutingResult::default();
+
+        for (node_id, indices) in node_indices {
+            let indices_array = UInt32Array::from(indices);
+            let columns: Vec<_> = batch
+                .columns()
+                .iter()
+                .filter_map(|col| compute::take(col, &indices_array, None).ok())
+                .collect();
+
+            if columns.len() != batch.num_columns() {
+                // take() failed for some column — fall back to local.
+                result.local_batches.push(batch.clone());
+                return result;
+            }
+
+            if let Ok(sub_batch) = RecordBatch::try_new(batch.schema(), columns) {
+                if node_id == self.local_node {
+                    result.local_batches.push(sub_batch);
+                } else {
+                    result
+                        .remote_batches
+                        .entry(node_id)
+                        .or_default()
+                        .push(sub_batch);
+                }
             }
         }
+
+        result
     }
 
     /// Check if a partition is owned by the local node.
@@ -145,32 +179,65 @@ impl PartitionRouter {
     pub fn num_partitions(&self) -> u32 {
         self.num_partitions
     }
+}
 
-    /// Compute the target partition ID for a batch using a simple hash of
-    /// the batch row count (placeholder — real implementation would hash
-    /// the partition key column values).
-    fn compute_partition(&self, batch: &RecordBatch) -> u32 {
-        if self.num_partitions == 0 {
-            return 0;
-        }
-        // Use a simple hash of the number of rows as a deterministic
-        // partition selector. A production implementation would hash
-        // actual column values.
-        #[allow(clippy::cast_possible_truncation)]
-        let hash = {
-            let n = batch.num_rows() as u64;
-            // FNV-1a hash of row count bytes
-            let mut h: u64 = 0xcbf2_9ce4_8422_2325;
-            for &byte in &n.to_le_bytes() {
-                h ^= u64::from(byte);
-                h = h.wrapping_mul(0x0100_0000_01b3);
-            }
-            h
-        };
-        #[allow(clippy::cast_possible_truncation)]
-        let partition = (hash % u64::from(self.num_partitions)) as u32;
-        partition
+/// Hash a single row's key value from an Arrow array to determine its partition.
+///
+/// Uses FNV-1a on the raw byte representation of the value.
+#[allow(clippy::cast_possible_truncation)]
+fn partition_for_key(key_col: &dyn arrow_array::Array, row_idx: usize, num_partitions: u32) -> u32 {
+    if num_partitions == 0 {
+        return 0;
     }
+
+    // Extract raw bytes for the row depending on data type.
+    let bytes: &[u8] =
+        if let Some(arr) = key_col.as_any().downcast_ref::<arrow_array::StringArray>() {
+            arr.value(row_idx).as_bytes()
+        } else if let Some(arr) = key_col.as_any().downcast_ref::<arrow_array::Int64Array>() {
+            // Use the value's le bytes via a stack buffer — but we need a &[u8]
+            // that lives long enough, so use the hash inline instead.
+            let val = arr.value(row_idx);
+            let hash = fnv1a(&val.to_le_bytes());
+            return (hash % u64::from(num_partitions)) as u32;
+        } else if let Some(arr) = key_col.as_any().downcast_ref::<arrow_array::Int32Array>() {
+            let val = arr.value(row_idx);
+            let hash = fnv1a(&val.to_le_bytes());
+            return (hash % u64::from(num_partitions)) as u32;
+        } else if let Some(arr) = key_col.as_any().downcast_ref::<arrow_array::UInt64Array>() {
+            let val = arr.value(row_idx);
+            let hash = fnv1a(&val.to_le_bytes());
+            return (hash % u64::from(num_partitions)) as u32;
+        } else if let Some(arr) = key_col.as_any().downcast_ref::<arrow_array::BinaryArray>() {
+            arr.value(row_idx)
+        } else if let Some(arr) = key_col
+            .as_any()
+            .downcast_ref::<arrow_array::LargeBinaryArray>()
+        {
+            arr.value(row_idx)
+        } else if let Some(arr) = key_col
+            .as_any()
+            .downcast_ref::<arrow_array::LargeStringArray>()
+        {
+            arr.value(row_idx).as_bytes()
+        } else {
+            // Fallback: use row index as partition key.
+            let hash = fnv1a(&(row_idx as u64).to_le_bytes());
+            return (hash % u64::from(num_partitions)) as u32;
+        };
+
+    let hash = fnv1a(bytes);
+    (hash % u64::from(num_partitions)) as u32
+}
+
+/// FNV-1a hash of a byte slice.
+fn fnv1a(data: &[u8]) -> u64 {
+    let mut h: u64 = 0xcbf2_9ce4_8422_2325;
+    for &byte in data {
+        h ^= u64::from(byte);
+        h = h.wrapping_mul(0x0100_0000_01b3);
+    }
+    h
 }
 
 impl std::fmt::Debug for PartitionRouter {
@@ -277,6 +344,8 @@ impl Default for RemoteBatchSender {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use std::sync::Arc;
+
     use crate::delta::discovery::{NodeInfo, NodeMetadata, NodeState};
     use crate::delta::partition::assignment::{AssignmentConstraints, ConsistentHashAssigner};
     use arrow::array::Int64Array;

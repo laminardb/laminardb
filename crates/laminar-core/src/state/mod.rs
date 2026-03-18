@@ -627,6 +627,9 @@ mod mmap;
 /// AHashMap-backed state store with O(1) lookups and zero-copy reads.
 pub mod ahash_store;
 
+/// Column-file window state store (QuestDB-inspired).
+pub mod column_file;
+
 // Re-export main types
 pub use self::StateError as Error;
 pub use ahash_store::AHashMapStore;

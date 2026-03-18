@@ -178,6 +178,54 @@ impl SegmentReorderBuffer {
     pub fn total_reordered(&self) -> u64 {
         self.total_reordered
     }
+
+    /// Abort a sequence ID, marking it as a tombstone so the buffer can
+    /// retire the gap and continue processing higher IDs.
+    ///
+    /// Returns any contiguous segments that became ready after the gap
+    /// was filled.
+    pub fn abort_id(&mut self, id: u64) -> Vec<SequencedSegment> {
+        if id < self.next_expected {
+            // Already past this ID — nothing to do.
+            return Vec::new();
+        }
+
+        if id > self.next_expected {
+            // Not the next expected — just remove it from pending if buffered
+            // (it hasn't been assigned yet, so it won't be there, but be safe).
+            self.pending.remove(&id);
+            // Insert a tombstone marker: we store nothing, but we need to
+            // advance past this ID when it becomes next_expected. Mark it
+            // by inserting a zero-length sentinel segment.
+            self.pending.insert(
+                id,
+                SequencedSegment {
+                    sequence_id: id,
+                    writer_id: usize::MAX, // sentinel
+                    data: Vec::new(),
+                    entry_count: 0,
+                },
+            );
+            return Vec::new();
+        }
+
+        // id == next_expected: skip this ID and drain contiguous segments.
+        self.next_expected += 1;
+
+        let mut ready = Vec::new();
+        while let Some(entry) = self.pending.remove(&self.next_expected) {
+            if entry.entry_count == 0 && entry.writer_id == usize::MAX {
+                // Another tombstone — skip it too.
+                self.next_expected += 1;
+                continue;
+            }
+            ready.push(entry);
+            self.next_expected += 1;
+            self.total_applied += 1;
+        }
+
+        ready
+    }
 }
 
 impl Default for SegmentReorderBuffer {
