@@ -29,6 +29,7 @@ use arrow_schema::SchemaRef;
 use bytes::Bytes;
 
 use crate::delta::discovery::NodeId;
+use crate::delta::partition_for_key;
 use crate::lookup::predicate::Predicate;
 use crate::lookup::source::ColumnId;
 use crate::lookup::source::{LookupError, LookupSourceDyn};
@@ -110,16 +111,6 @@ impl PartitionMap {
             .filter_map(|(pid, (owner, _))| if owner == node { Some(*pid) } else { None })
             .collect()
     }
-}
-
-/// Compute the owning partition for a key using xxhash.
-///
-/// Uses `xxhash-rust`'s xxh3 for fast, high-quality hashing.
-#[must_use]
-#[allow(clippy::cast_possible_truncation)] // modulo guarantees result fits in u32
-pub fn partition_for_key(key: &[u8], num_partitions: u32) -> u32 {
-    let hash = xxhash_rust::xxh3::xxh3_64(key);
-    (hash % u64::from(num_partitions)) as u32
 }
 
 /// LRU cache entry with TTL support.
@@ -401,8 +392,9 @@ impl StateStore for RemoteStateProxy {
 
     fn clear(&mut self) {
         self.local.clear();
-        self.cache.lock().unwrap().entries.clear();
-        self.cache.lock().unwrap().order.clear();
+        let mut cache = self.cache.lock().unwrap();
+        cache.entries.clear();
+        cache.order.clear();
     }
 
     fn flush(&mut self) -> Result<(), StateError> {
@@ -570,7 +562,9 @@ mod tests {
         assert!(!map.is_local(1, &local));
         assert_eq!(map.owner_of(0), Some((local, 1)));
         assert_eq!(map.epoch_of(1), Some(1));
-        assert_eq!(map.partitions_for_node(&local), vec![0, 2]);
+        let mut local_parts = map.partitions_for_node(&local);
+        local_parts.sort_unstable();
+        assert_eq!(local_parts, vec![0, 2]);
     }
 
     #[test]

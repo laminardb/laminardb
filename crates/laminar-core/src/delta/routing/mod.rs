@@ -17,6 +17,7 @@ use arrow::compute::take;
 use crate::delta::discovery::NodeId;
 use crate::delta::partition::assignment::ConsistentHashAssigner;
 use crate::delta::partition::guard::EpochError;
+use crate::delta::partition_for_key;
 
 /// Result of routing a batch through the partition router.
 #[derive(Debug)]
@@ -49,6 +50,10 @@ pub enum RoutingError {
     /// Epoch fencing error.
     #[error("epoch error: {0}")]
     Epoch(#[from] EpochError),
+
+    /// The partition key column has an unsupported data type.
+    #[error("unsupported partition key type: {0}")]
+    UnsupportedKeyType(String),
 }
 
 /// State of a connection to a peer node.
@@ -107,15 +112,6 @@ pub struct PartitionRouter {
     partition_key: String,
     /// Total number of partitions in the cluster.
     num_partitions: u32,
-}
-
-/// Hash a key's bytes to a partition ID using xxhash3.
-#[must_use]
-fn partition_for_key(key: &[u8], num_partitions: u32) -> u32 {
-    let hash = xxhash_rust::xxh3::xxh3_64(key);
-    #[allow(clippy::cast_possible_truncation)] // safe: modulo guarantees result fits in u32
-    let pid = (hash % u64::from(num_partitions)) as u32;
-    pid
 }
 
 impl PartitionRouter {
@@ -206,8 +202,8 @@ impl PartitionRouter {
         let mut node_indices: HashMap<NodeId, Vec<u32>> = HashMap::new();
 
         for row_idx in 0..batch.num_rows() {
-            // Get the key bytes for this row by converting to string repr
-            let key_bytes = Self::extract_key_bytes(key_col, row_idx);
+            // Get the key bytes for this row
+            let key_bytes = Self::extract_key_bytes(key_col, row_idx)?;
             let partition_id = partition_for_key(&key_bytes, self.num_partitions);
 
             // 3. Look up partition → node assignment
@@ -248,44 +244,45 @@ impl PartitionRouter {
 
     /// Extract key bytes from an array at the given row index.
     ///
-    /// Converts the value to its string representation for hashing.
-    /// This handles any Arrow data type uniformly.
-    fn extract_key_bytes(array: &dyn Array, row_idx: usize) -> Vec<u8> {
+    /// Converts the value to its byte representation for hashing.
+    ///
+    /// # Errors
+    ///
+    /// Returns `RoutingError::UnsupportedKeyType` if the array's data type
+    /// cannot be converted to key bytes.
+    fn extract_key_bytes(array: &dyn Array, row_idx: usize) -> Result<Vec<u8>, RoutingError> {
         use arrow::array as aa;
 
         // Fast paths for common partition key types
         if let Some(arr) = array.as_any().downcast_ref::<aa::StringArray>() {
-            return arr.value(row_idx).as_bytes().to_vec();
+            return Ok(arr.value(row_idx).as_bytes().to_vec());
         }
         if let Some(arr) = array.as_any().downcast_ref::<aa::LargeStringArray>() {
-            return arr.value(row_idx).as_bytes().to_vec();
+            return Ok(arr.value(row_idx).as_bytes().to_vec());
         }
         if let Some(arr) = array.as_any().downcast_ref::<aa::Int64Array>() {
-            return arr.value(row_idx).to_le_bytes().to_vec();
+            return Ok(arr.value(row_idx).to_le_bytes().to_vec());
         }
         if let Some(arr) = array.as_any().downcast_ref::<aa::Int32Array>() {
-            return arr.value(row_idx).to_le_bytes().to_vec();
+            return Ok(arr.value(row_idx).to_le_bytes().to_vec());
         }
         if let Some(arr) = array.as_any().downcast_ref::<aa::UInt64Array>() {
-            return arr.value(row_idx).to_le_bytes().to_vec();
+            return Ok(arr.value(row_idx).to_le_bytes().to_vec());
         }
         if let Some(arr) = array.as_any().downcast_ref::<aa::UInt32Array>() {
-            return arr.value(row_idx).to_le_bytes().to_vec();
+            return Ok(arr.value(row_idx).to_le_bytes().to_vec());
         }
         if let Some(arr) = array.as_any().downcast_ref::<aa::BinaryArray>() {
-            return arr.value(row_idx).to_vec();
+            return Ok(arr.value(row_idx).to_vec());
         }
         if let Some(arr) = array.as_any().downcast_ref::<aa::LargeBinaryArray>() {
-            return arr.value(row_idx).to_vec();
+            return Ok(arr.value(row_idx).to_vec());
         }
 
-        // Fallback: cast to string and use the text representation
-        if let Ok(casted) = arrow::compute::cast(array, &arrow::datatypes::DataType::Utf8) {
-            if let Some(str_arr) = casted.as_any().downcast_ref::<aa::StringArray>() {
-                return str_arr.value(row_idx).as_bytes().to_vec();
-            }
-        }
-        Vec::new()
+        Err(RoutingError::UnsupportedKeyType(format!(
+            "{:?}",
+            array.data_type()
+        )))
     }
 
     /// Take rows from a batch at the given indices using `arrow::compute::take`.

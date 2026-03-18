@@ -31,6 +31,16 @@
 //! - `partition`: Epoch-fenced partition ownership and migration
 //! - `rpc`: gRPC services for inter-node communication
 
+/// Compute the owning partition for a key using xxhash.
+///
+/// Uses `xxhash-rust`'s xxh3 for fast, high-quality hashing.
+#[must_use]
+#[allow(clippy::cast_possible_truncation)] // modulo guarantees result fits in u32
+pub fn partition_for_key(key: &[u8], num_partitions: u32) -> u32 {
+    let hash = xxhash_rust::xxh3::xxh3_64(key);
+    (hash % u64::from(num_partitions)) as u32
+}
+
 /// Node discovery and membership.
 pub mod discovery;
 
