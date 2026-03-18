@@ -350,13 +350,15 @@ JOIN rates FOR SYSTEM_TIME AS OF o.order_time AS r
             </div>
 
             <div class="tab-panel" id="qs-server">
-              <pre><code class="language-bash"># Option 1: Download pre-compiled binary (fastest)
+              <pre><code class="language-bash"># Option 1: Download pre-compiled binary (latest release)
+VERSION=$(curl -s https://api.github.com/repos/laminardb/laminardb/releases/latest | grep tag_name | cut -d '"' -f4)
+
 # Linux x86_64
-curl -LO https://github.com/laminardb/laminardb/releases/latest/download/laminardb-server-x86_64-unknown-linux-gnu-v0.18.8.tar.gz
+curl -LO "https://github.com/laminardb/laminardb/releases/download/${VERSION}/laminardb-server-x86_64-unknown-linux-gnu-${VERSION}.tar.gz"
 tar xzf laminardb-server-*.tar.gz
 
 # macOS Apple Silicon
-curl -LO https://github.com/laminardb/laminardb/releases/latest/download/laminardb-server-aarch64-apple-darwin-v0.18.8.tar.gz
+curl -LO "https://github.com/laminardb/laminardb/releases/download/${VERSION}/laminardb-server-aarch64-apple-darwin-${VERSION}.tar.gz"
 
 # All platforms: github.com/laminardb/laminardb/releases
 
