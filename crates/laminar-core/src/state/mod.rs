@@ -460,8 +460,8 @@ impl StateSnapshot {
 /// Keys and values are stored as owned `Vec<u8>` and `Bytes` respectively.
 /// Use `size_bytes()` to monitor memory usage.
 pub struct InMemoryStore {
-    /// The underlying sorted map
-    data: BTreeMap<Vec<u8>, Bytes>,
+    /// The underlying sorted map (Bytes keys for zero-copy prefix/range scans)
+    data: BTreeMap<Bytes, Bytes>,
     /// Track total size for monitoring
     size_bytes: usize,
 }
@@ -505,15 +505,15 @@ impl StateStore for InMemoryStore {
 
     #[inline]
     fn put(&mut self, key: &[u8], value: Bytes) -> Result<(), StateError> {
-        // Check-then-insert: avoids key.to_vec() allocation on the
-        // update path, which is the common case for accumulator state.
+        // Check-then-insert: avoids key allocation on the update path,
+        // which is the common case for accumulator state.
         if let Some(existing) = self.data.get_mut(key) {
             self.size_bytes -= existing.len();
             self.size_bytes += value.len();
             *existing = value;
         } else {
             self.size_bytes += key.len() + value.len();
-            self.data.insert(key.to_vec(), value);
+            self.data.insert(Bytes::copy_from_slice(key), value);
         }
         Ok(())
     }
@@ -530,25 +530,21 @@ impl StateStore for InMemoryStore {
         prefix: &'a [u8],
     ) -> Box<dyn Iterator<Item = (Bytes, Bytes)> + 'a> {
         if prefix.is_empty() {
-            // Empty prefix matches everything
-            return Box::new(
-                self.data
-                    .iter()
-                    .map(|(k, v)| (Bytes::copy_from_slice(k), v.clone())),
-            );
+            // Empty prefix matches everything — both clone() are Arc bumps
+            return Box::new(self.data.iter().map(|(k, v)| (k.clone(), v.clone())));
         }
         if let Some(end) = prefix_successor(prefix) {
             Box::new(
                 self.data
                     .range::<[u8], _>((Bound::Included(prefix), Bound::Excluded(end.as_slice())))
-                    .map(|(k, v)| (Bytes::copy_from_slice(k), v.clone())),
+                    .map(|(k, v)| (k.clone(), v.clone())),
             )
         } else {
             // All-0xFF prefix: scan from prefix to end
             Box::new(
                 self.data
                     .range::<[u8], _>((Bound::Included(prefix), Bound::Unbounded))
-                    .map(|(k, v)| (Bytes::copy_from_slice(k), v.clone())),
+                    .map(|(k, v)| (k.clone(), v.clone())),
             )
         }
     }
@@ -560,7 +556,7 @@ impl StateStore for InMemoryStore {
         Box::new(
             self.data
                 .range::<[u8], _>((Bound::Included(range.start), Bound::Excluded(range.end)))
-                .map(|(k, v)| (Bytes::copy_from_slice(k), v.clone())),
+                .map(|(k, v)| (k.clone(), v.clone())),
         )
     }
 
@@ -581,7 +577,7 @@ impl StateStore for InMemoryStore {
         let data: Vec<(Vec<u8>, Vec<u8>)> = self
             .data
             .iter()
-            .map(|(k, v)| (k.clone(), v.to_vec()))
+            .map(|(k, v)| (k.to_vec(), v.to_vec()))
             .collect();
         StateSnapshot::new(data)
     }
@@ -592,7 +588,7 @@ impl StateStore for InMemoryStore {
 
         for (key, value) in snapshot.data {
             self.size_bytes += key.len() + value.len();
-            self.data.insert(key, Bytes::from(value));
+            self.data.insert(Bytes::from(key), Bytes::from(value));
         }
     }
 
