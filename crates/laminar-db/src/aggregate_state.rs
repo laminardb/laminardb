@@ -21,7 +21,7 @@ use std::sync::Arc;
 use ahash::AHashMap;
 use rustc_hash::FxHashMap;
 
-use arrow::array::ArrayRef;
+use arrow::array::{ArrayRef, Float64Array, Int64Array};
 use arrow::compute;
 use arrow::datatypes::{DataType, Field, Schema, SchemaRef};
 use arrow::record_batch::RecordBatch;
@@ -33,6 +33,252 @@ use datafusion_expr::{AggregateUDF, LogicalPlan};
 use serde_json::json;
 
 use crate::error::DbError;
+
+// ── SIMD fast-path types ────────────────────────────────────────────
+
+/// Aggregate operation kind for the SIMD fast path.
+///
+/// When a global (no GROUP BY) query uses only SUM/COUNT/MIN/MAX on numeric
+/// columns, we bypass `DataFusion`'s `Accumulator` trait and use Arrow's
+/// SIMD-optimized compute kernels directly.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum SimdAggKind {
+    Sum,
+    Count,
+    Min,
+    Max,
+}
+
+/// Running state for one SIMD-accelerated aggregate.
+#[derive(Debug, Clone)]
+pub(crate) struct SimdAggAccum {
+    pub(crate) kind: SimdAggKind,
+    /// Column index in the pre-agg batch that feeds this aggregate.
+    input_col_idx: usize,
+    /// Input data type (Int64 or Float64).
+    #[allow(dead_code)]
+    input_type: DataType,
+    /// Output data type (matches the Accumulator's return type).
+    return_type: DataType,
+    /// Running state — `None` means no data has been seen yet.
+    pub(crate) state: Option<ScalarValue>,
+}
+
+/// Try to classify a UDF name as a SIMD-eligible aggregate.
+fn classify_simd_agg(udf_name: &str) -> Option<SimdAggKind> {
+    match udf_name.to_ascii_lowercase().as_str() {
+        "sum" => Some(SimdAggKind::Sum),
+        "count" => Some(SimdAggKind::Count),
+        "min" => Some(SimdAggKind::Min),
+        "max" => Some(SimdAggKind::Max),
+        _ => None,
+    }
+}
+
+/// Check whether a data type is eligible for SIMD aggregation.
+fn is_simd_numeric(dt: &DataType) -> bool {
+    matches!(
+        dt,
+        DataType::Int8
+            | DataType::Int16
+            | DataType::Int32
+            | DataType::Int64
+            | DataType::UInt8
+            | DataType::UInt16
+            | DataType::UInt32
+            | DataType::UInt64
+            | DataType::Float32
+            | DataType::Float64
+    )
+}
+
+/// Compute SUM over an Arrow array using SIMD-optimized kernels.
+///
+/// Casts to Float64 or Int64 depending on the return type, then calls
+/// `arrow::compute::kernels::aggregate::sum` which auto-vectorizes via LLVM
+/// SIMD.
+fn simd_sum(array: &ArrayRef, return_type: &DataType) -> Result<Option<ScalarValue>, DbError> {
+    use arrow::array::Array;
+    if array.null_count() == array.len() {
+        return Ok(None);
+    }
+    match return_type {
+        DataType::Float64 => {
+            let arr = arrow::compute::cast(array, &DataType::Float64)
+                .map_err(|e| DbError::Pipeline(format!("simd sum cast: {e}")))?;
+            let prim = arr
+                .as_any()
+                .downcast_ref::<Float64Array>()
+                .ok_or_else(|| DbError::Pipeline("simd sum: expected Float64Array".into()))?;
+            Ok(
+                arrow::compute::kernels::aggregate::sum(prim)
+                    .map(|v| ScalarValue::Float64(Some(v))),
+            )
+        }
+        DataType::Int64 => {
+            let arr = arrow::compute::cast(array, &DataType::Int64)
+                .map_err(|e| DbError::Pipeline(format!("simd sum cast: {e}")))?;
+            let prim = arr
+                .as_any()
+                .downcast_ref::<Int64Array>()
+                .ok_or_else(|| DbError::Pipeline("simd sum: expected Int64Array".into()))?;
+            Ok(arrow::compute::kernels::aggregate::sum(prim).map(|v| ScalarValue::Int64(Some(v))))
+        }
+        DataType::UInt64 => {
+            let arr = arrow::compute::cast(array, &DataType::UInt64)
+                .map_err(|e| DbError::Pipeline(format!("simd sum cast: {e}")))?;
+            let prim = arr
+                .as_any()
+                .downcast_ref::<arrow::array::UInt64Array>()
+                .ok_or_else(|| DbError::Pipeline("simd sum: expected UInt64Array".into()))?;
+            Ok(arrow::compute::kernels::aggregate::sum(prim).map(|v| ScalarValue::UInt64(Some(v))))
+        }
+        other => Err(DbError::Pipeline(format!(
+            "simd sum: unsupported return type {other:?}"
+        ))),
+    }
+}
+
+/// Compute MIN over an Arrow array using SIMD-optimized kernels.
+fn simd_min(array: &ArrayRef, return_type: &DataType) -> Result<Option<ScalarValue>, DbError> {
+    use arrow::array::Array;
+    if array.null_count() == array.len() {
+        return Ok(None);
+    }
+    match return_type {
+        DataType::Float64 => {
+            let arr = arrow::compute::cast(array, &DataType::Float64)
+                .map_err(|e| DbError::Pipeline(format!("simd min cast: {e}")))?;
+            let prim = arr
+                .as_any()
+                .downcast_ref::<Float64Array>()
+                .ok_or_else(|| DbError::Pipeline("simd min: expected Float64Array".into()))?;
+            Ok(
+                arrow::compute::kernels::aggregate::min(prim)
+                    .map(|v| ScalarValue::Float64(Some(v))),
+            )
+        }
+        DataType::Int64 => {
+            let arr = arrow::compute::cast(array, &DataType::Int64)
+                .map_err(|e| DbError::Pipeline(format!("simd min cast: {e}")))?;
+            let prim = arr
+                .as_any()
+                .downcast_ref::<Int64Array>()
+                .ok_or_else(|| DbError::Pipeline("simd min: expected Int64Array".into()))?;
+            Ok(arrow::compute::kernels::aggregate::min(prim).map(|v| ScalarValue::Int64(Some(v))))
+        }
+        DataType::UInt64 => {
+            let arr = arrow::compute::cast(array, &DataType::UInt64)
+                .map_err(|e| DbError::Pipeline(format!("simd min cast: {e}")))?;
+            let prim = arr
+                .as_any()
+                .downcast_ref::<arrow::array::UInt64Array>()
+                .ok_or_else(|| DbError::Pipeline("simd min: expected UInt64Array".into()))?;
+            Ok(arrow::compute::kernels::aggregate::min(prim).map(|v| ScalarValue::UInt64(Some(v))))
+        }
+        other => Err(DbError::Pipeline(format!(
+            "simd min: unsupported return type {other:?}"
+        ))),
+    }
+}
+
+/// Compute MAX over an Arrow array using SIMD-optimized kernels.
+fn simd_max(array: &ArrayRef, return_type: &DataType) -> Result<Option<ScalarValue>, DbError> {
+    use arrow::array::Array;
+    if array.null_count() == array.len() {
+        return Ok(None);
+    }
+    match return_type {
+        DataType::Float64 => {
+            let arr = arrow::compute::cast(array, &DataType::Float64)
+                .map_err(|e| DbError::Pipeline(format!("simd max cast: {e}")))?;
+            let prim = arr
+                .as_any()
+                .downcast_ref::<Float64Array>()
+                .ok_or_else(|| DbError::Pipeline("simd max: expected Float64Array".into()))?;
+            Ok(
+                arrow::compute::kernels::aggregate::max(prim)
+                    .map(|v| ScalarValue::Float64(Some(v))),
+            )
+        }
+        DataType::Int64 => {
+            let arr = arrow::compute::cast(array, &DataType::Int64)
+                .map_err(|e| DbError::Pipeline(format!("simd max cast: {e}")))?;
+            let prim = arr
+                .as_any()
+                .downcast_ref::<Int64Array>()
+                .ok_or_else(|| DbError::Pipeline("simd max: expected Int64Array".into()))?;
+            Ok(arrow::compute::kernels::aggregate::max(prim).map(|v| ScalarValue::Int64(Some(v))))
+        }
+        DataType::UInt64 => {
+            let arr = arrow::compute::cast(array, &DataType::UInt64)
+                .map_err(|e| DbError::Pipeline(format!("simd max cast: {e}")))?;
+            let prim = arr
+                .as_any()
+                .downcast_ref::<arrow::array::UInt64Array>()
+                .ok_or_else(|| DbError::Pipeline("simd max: expected UInt64Array".into()))?;
+            Ok(arrow::compute::kernels::aggregate::max(prim).map(|v| ScalarValue::UInt64(Some(v))))
+        }
+        other => Err(DbError::Pipeline(format!(
+            "simd max: unsupported return type {other:?}"
+        ))),
+    }
+}
+
+/// Merge two scalar values for a running aggregate.
+fn merge_scalar(
+    kind: SimdAggKind,
+    existing: &ScalarValue,
+    new_val: &ScalarValue,
+) -> Result<ScalarValue, DbError> {
+    match kind {
+        SimdAggKind::Count | SimdAggKind::Sum => {
+            // Additive merge: existing + new_val
+            match (existing, new_val) {
+                (ScalarValue::Int64(Some(a)), ScalarValue::Int64(Some(b))) => {
+                    Ok(ScalarValue::Int64(Some(a + b)))
+                }
+                (ScalarValue::Float64(Some(a)), ScalarValue::Float64(Some(b))) => {
+                    Ok(ScalarValue::Float64(Some(a + b)))
+                }
+                (ScalarValue::UInt64(Some(a)), ScalarValue::UInt64(Some(b))) => {
+                    Ok(ScalarValue::UInt64(Some(a + b)))
+                }
+                _ => Err(DbError::Pipeline(format!(
+                    "simd merge_scalar: type mismatch for {kind:?}"
+                ))),
+            }
+        }
+        SimdAggKind::Min => match (existing, new_val) {
+            (ScalarValue::Int64(Some(a)), ScalarValue::Int64(Some(b))) => {
+                Ok(ScalarValue::Int64(Some(*a.min(b))))
+            }
+            (ScalarValue::Float64(Some(a)), ScalarValue::Float64(Some(b))) => {
+                Ok(ScalarValue::Float64(Some(a.min(*b))))
+            }
+            (ScalarValue::UInt64(Some(a)), ScalarValue::UInt64(Some(b))) => {
+                Ok(ScalarValue::UInt64(Some(*a.min(b))))
+            }
+            _ => Err(DbError::Pipeline(format!(
+                "simd merge_scalar: type mismatch for {kind:?}"
+            ))),
+        },
+        SimdAggKind::Max => match (existing, new_val) {
+            (ScalarValue::Int64(Some(a)), ScalarValue::Int64(Some(b))) => {
+                Ok(ScalarValue::Int64(Some(*a.max(b))))
+            }
+            (ScalarValue::Float64(Some(a)), ScalarValue::Float64(Some(b))) => {
+                Ok(ScalarValue::Float64(Some(a.max(*b))))
+            }
+            (ScalarValue::UInt64(Some(a)), ScalarValue::UInt64(Some(b))) => {
+                Ok(ScalarValue::UInt64(Some(*a.max(b))))
+            }
+            _ => Err(DbError::Pipeline(format!(
+                "simd merge_scalar: type mismatch for {kind:?}"
+            ))),
+        },
+    }
+}
 
 // ── Shared group-key helpers ─────────────────────────────────────────
 
@@ -479,6 +725,13 @@ pub(crate) struct IncrementalAggState {
     having_sql: Option<String>,
     /// Maximum number of distinct groups before new groups are dropped.
     max_groups: usize,
+    /// SIMD fast-path state for non-keyed numeric aggregations.
+    ///
+    /// Present when `num_group_cols == 0` AND every aggregate is SUM/COUNT/
+    /// MIN/MAX on a numeric column with no DISTINCT and no FILTER. Uses
+    /// Arrow's SIMD-optimized compute kernels directly, bypassing the
+    /// `Accumulator` trait.
+    pub(crate) simd_accums: Option<Vec<SimdAggAccum>>,
 }
 
 impl IncrementalAggState {
@@ -844,6 +1097,51 @@ impl IncrementalAggState {
             None
         };
 
+        // Detect SIMD fast-path eligibility: non-keyed, all SUM/COUNT/MIN/MAX
+        // on numeric inputs, no DISTINCT, no FILTER.
+        let simd_accums = if num_group_cols == 0 {
+            let mut accums = Vec::with_capacity(agg_specs.len());
+            let mut eligible = true;
+            for spec in &agg_specs {
+                let Some(kind) = classify_simd_agg(spec.udf.name()) else {
+                    eligible = false;
+                    break;
+                };
+                if spec.distinct || spec.filter_col_index.is_some() {
+                    eligible = false;
+                    break;
+                }
+                // COUNT(*) has Boolean input — always eligible (O(1) count).
+                // Other aggs need a numeric input column.
+                if kind != SimdAggKind::Count
+                    && (spec.input_types.is_empty() || !is_simd_numeric(&spec.input_types[0]))
+                {
+                    eligible = false;
+                    break;
+                }
+                let input_col_idx = spec.input_col_indices.first().copied().unwrap_or(0);
+                let input_type = spec
+                    .input_types
+                    .first()
+                    .cloned()
+                    .unwrap_or(DataType::Boolean);
+                accums.push(SimdAggAccum {
+                    kind,
+                    input_col_idx,
+                    input_type,
+                    return_type: spec.return_type.clone(),
+                    state: None,
+                });
+            }
+            if eligible {
+                Some(accums)
+            } else {
+                None
+            }
+        } else {
+            None
+        };
+
         Ok(Some(Self {
             pre_agg_sql,
             num_group_cols,
@@ -857,6 +1155,7 @@ impl IncrementalAggState {
             having_filter,
             having_sql,
             max_groups: 1_000_000,
+            simd_accums,
         }))
     }
 
@@ -935,6 +1234,12 @@ impl IncrementalAggState {
 
     /// Fast path for global aggregates (COUNT(*), SUM(x), etc. with no GROUP BY).
     fn process_batch_no_groups(&mut self, batch: &RecordBatch) -> Result<(), DbError> {
+        // SIMD fast path: use Arrow compute kernels directly.
+        if let Some(ref mut accums) = self.simd_accums {
+            return Self::process_batch_simd(accums, batch);
+        }
+
+        // Fallback: standard accumulator path.
         let empty_key: Vec<ScalarValue> = Vec::new();
         if !self.groups.contains_key(&empty_key) {
             let mut accs = Vec::with_capacity(self.agg_specs.len());
@@ -947,6 +1252,44 @@ impl IncrementalAggState {
         #[allow(clippy::cast_possible_truncation)]
         let all_indices: Vec<u32> = (0..batch.num_rows() as u32).collect();
         Self::update_group_accumulators(accs, batch, &all_indices, &self.agg_specs)
+    }
+
+    /// SIMD fast path: update running aggregates using Arrow compute kernels.
+    ///
+    /// Arrow's `sum`, `min`, `max` use SIMD intrinsics internally (auto-vectorized
+    /// or explicit AVX2/NEON depending on the target). COUNT is O(1) via
+    /// `len() - null_count()`. This bypasses the Accumulator trait entirely.
+    fn process_batch_simd(accums: &mut [SimdAggAccum], batch: &RecordBatch) -> Result<(), DbError> {
+        for accum in accums.iter_mut() {
+            let batch_result = match accum.kind {
+                SimdAggKind::Count => {
+                    // COUNT: O(1), no column scan needed.
+                    let col = batch.column(accum.input_col_idx);
+                    #[allow(clippy::cast_possible_wrap)]
+                    let count = (col.len() - col.null_count()) as i64;
+                    Some(ScalarValue::Int64(Some(count)))
+                }
+                SimdAggKind::Sum => {
+                    simd_sum(batch.column(accum.input_col_idx), &accum.return_type)?
+                }
+                SimdAggKind::Min => {
+                    simd_min(batch.column(accum.input_col_idx), &accum.return_type)?
+                }
+                SimdAggKind::Max => {
+                    simd_max(batch.column(accum.input_col_idx), &accum.return_type)?
+                }
+            };
+
+            // Merge batch result into running state.
+            accum.state = match (&accum.state, batch_result) {
+                (_, None) => accum.state.take(), // all-null batch, keep existing
+                (None, Some(v)) => Some(v),
+                (Some(existing), Some(new_val)) => {
+                    Some(merge_scalar(accum.kind, existing, &new_val)?)
+                }
+            };
+        }
+        Ok(())
     }
 
     /// Convert an `OwnedRow` back to a `Vec<ScalarValue>` group key.
@@ -1009,6 +1352,38 @@ impl IncrementalAggState {
     /// Does NOT reset the accumulators — they continue accumulating for the
     /// next cycle (running totals).
     pub fn emit(&mut self) -> Result<Vec<RecordBatch>, DbError> {
+        // SIMD fast path: emit from running scalar state.
+        if let Some(ref accums) = self.simd_accums {
+            let has_data = accums.iter().any(|a| a.state.is_some());
+            if !has_data {
+                return Ok(Vec::new());
+            }
+            let mut agg_arrays: Vec<ArrayRef> = Vec::with_capacity(accums.len());
+            for (i, accum) in accums.iter().enumerate() {
+                let sv = accum.state.clone().unwrap_or_else(|| {
+                    // No data seen for this agg — emit typed null.
+                    match &accum.return_type {
+                        DataType::Float64 => ScalarValue::Float64(None),
+                        DataType::UInt64 => ScalarValue::UInt64(None),
+                        _ => ScalarValue::Int64(None),
+                    }
+                });
+                let array = sv
+                    .to_array()
+                    .map_err(|e| DbError::Pipeline(format!("simd emit array {i}: {e}")))?;
+                if array.data_type() == &self.agg_specs[i].return_type {
+                    agg_arrays.push(array);
+                } else {
+                    let casted = arrow::compute::cast(&array, &self.agg_specs[i].return_type)
+                        .unwrap_or(array);
+                    agg_arrays.push(casted);
+                }
+            }
+            let batch = RecordBatch::try_new(Arc::clone(&self.output_schema), agg_arrays)
+                .map_err(|e| DbError::Pipeline(format!("simd result batch: {e}")))?;
+            return Ok(vec![batch]);
+        }
+
         if self.groups.is_empty() {
             return Ok(Vec::new());
         }
@@ -1096,6 +1471,12 @@ impl IncrementalAggState {
     /// Sums `ScalarValue::size()` for each group key element and
     /// `Accumulator::size()` for each per-group accumulator.
     pub(crate) fn estimated_size_bytes(&self) -> usize {
+        if let Some(ref accums) = self.simd_accums {
+            return accums
+                .iter()
+                .map(|a| a.state.as_ref().map_or(0, ScalarValue::size))
+                .sum();
+        }
         let mut total = 0;
         for (key, accs) in &self.groups {
             for sv in key {
@@ -1111,12 +1492,39 @@ impl IncrementalAggState {
     /// Number of distinct groups currently tracked.
     #[allow(dead_code)]
     pub(crate) fn group_count(&self) -> usize {
+        if self.simd_accums.is_some() {
+            return 1; // global aggregate = 1 implicit group
+        }
         self.groups.len()
     }
 
     /// Checkpoint all group states into a serializable struct.
     pub(crate) fn checkpoint_groups(&mut self) -> Result<AggStateCheckpoint, DbError> {
         let fingerprint = self.query_fingerprint();
+
+        // SIMD fast path: store running scalars as a single-group checkpoint.
+        if let Some(ref accums) = self.simd_accums {
+            let has_data = accums.iter().any(|a| a.state.is_some());
+            if !has_data {
+                return Ok(AggStateCheckpoint {
+                    fingerprint,
+                    groups: Vec::new(),
+                });
+            }
+            let mut acc_states = Vec::with_capacity(accums.len());
+            for accum in accums {
+                let sv = accum.state.clone().unwrap_or(ScalarValue::Null);
+                acc_states.push(vec![scalar_to_json(&sv)]);
+            }
+            return Ok(AggStateCheckpoint {
+                fingerprint,
+                groups: vec![GroupCheckpoint {
+                    key: Vec::new(), // empty key = global aggregate
+                    acc_states,
+                }],
+            });
+        }
+
         let mut groups = Vec::with_capacity(self.groups.len());
         for (key, accs) in &mut self.groups {
             let key_json: Vec<serde_json::Value> = key.iter().map(scalar_to_json).collect();
@@ -1154,6 +1562,23 @@ impl IncrementalAggState {
                 checkpoint.fingerprint, current_fp
             )));
         }
+
+        // SIMD fast path: restore running scalars from the single-group
+        // checkpoint.
+        if let Some(ref mut accums) = self.simd_accums {
+            if let Some(gc) = checkpoint.groups.first() {
+                for (i, accum) in accums.iter_mut().enumerate() {
+                    if i < gc.acc_states.len() {
+                        if let Some(json_val) = gc.acc_states[i].first() {
+                            let sv = json_to_scalar(json_val)?;
+                            accum.state = if sv.is_null() { None } else { Some(sv) };
+                        }
+                    }
+                }
+            }
+            return Ok(checkpoint.groups.len());
+        }
+
         self.groups.clear();
         for gc in &checkpoint.groups {
             let key: Result<Vec<ScalarValue>, _> = gc.key.iter().map(json_to_scalar).collect();
@@ -3080,5 +3505,341 @@ mod tests {
         assert_eq!(js.left_batches, vec![vec![1, 2, 3]]);
         assert_eq!(js.right_batches, vec![vec![4, 5, 6]]);
         assert_eq!(js.last_evicted_watermark, 42);
+    }
+
+    // ── SIMD fast-path tests ─────────────────────────────────────────
+
+    /// Helper: register a table and build an `IncrementalAggState` for a
+    /// global (no GROUP BY) query.
+    async fn setup_global_agg(sql: &str) -> IncrementalAggState {
+        let ctx = laminar_sql::create_session_context();
+        let schema = Arc::new(Schema::new(vec![
+            Field::new("value", DataType::Float64, false),
+            Field::new("count_col", DataType::Int64, false),
+        ]));
+        let dummy = RecordBatch::try_new(
+            Arc::clone(&schema),
+            vec![
+                Arc::new(arrow::array::Float64Array::from(vec![0.0])),
+                Arc::new(arrow::array::Int64Array::from(vec![0i64])),
+            ],
+        )
+        .unwrap();
+        let mem_table =
+            datafusion::datasource::MemTable::try_new(Arc::clone(&schema), vec![vec![dummy]])
+                .unwrap();
+        ctx.register_table("events", Arc::new(mem_table)).unwrap();
+        IncrementalAggState::try_from_sql(&ctx, sql)
+            .await
+            .unwrap()
+            .expect("expected aggregate state")
+    }
+
+    #[tokio::test]
+    async fn test_simd_fast_path_enabled_for_global_sum() {
+        let state = setup_global_agg("SELECT SUM(value) as total FROM events").await;
+        assert!(
+            state.simd_accums.is_some(),
+            "SIMD fast path should be enabled for global SUM"
+        );
+        let accums = state.simd_accums.as_ref().unwrap();
+        assert_eq!(accums.len(), 1);
+        assert_eq!(accums[0].kind, SimdAggKind::Sum);
+    }
+
+    #[tokio::test]
+    async fn test_simd_fast_path_enabled_for_multiple_aggs() {
+        let state = setup_global_agg(
+            "SELECT SUM(value) as total, COUNT(value) as cnt, \
+             MIN(value) as lo, MAX(value) as hi FROM events",
+        )
+        .await;
+        assert!(
+            state.simd_accums.is_some(),
+            "SIMD fast path should be enabled for SUM/COUNT/MIN/MAX"
+        );
+        let accums = state.simd_accums.as_ref().unwrap();
+        assert_eq!(accums.len(), 4);
+        assert_eq!(accums[0].kind, SimdAggKind::Sum);
+        assert_eq!(accums[1].kind, SimdAggKind::Count);
+        assert_eq!(accums[2].kind, SimdAggKind::Min);
+        assert_eq!(accums[3].kind, SimdAggKind::Max);
+    }
+
+    #[tokio::test]
+    async fn test_simd_fast_path_disabled_for_grouped_query() {
+        let (_, state) =
+            setup_agg_state("SELECT name, SUM(value) as total FROM events GROUP BY name").await;
+        assert!(
+            state.simd_accums.is_none(),
+            "SIMD fast path should not be enabled when GROUP BY is present"
+        );
+    }
+
+    #[tokio::test]
+    async fn test_simd_fast_path_disabled_for_distinct() {
+        let ctx = laminar_sql::create_session_context();
+        let schema = Arc::new(Schema::new(vec![Field::new(
+            "value",
+            DataType::Float64,
+            false,
+        )]));
+        let dummy = RecordBatch::try_new(
+            Arc::clone(&schema),
+            vec![Arc::new(arrow::array::Float64Array::from(vec![0.0]))],
+        )
+        .unwrap();
+        let mem_table =
+            datafusion::datasource::MemTable::try_new(Arc::clone(&schema), vec![vec![dummy]])
+                .unwrap();
+        ctx.register_table("events", Arc::new(mem_table)).unwrap();
+        let state = IncrementalAggState::try_from_sql(
+            &ctx,
+            "SELECT COUNT(DISTINCT value) as cnt FROM events",
+        )
+        .await
+        .unwrap()
+        .expect("expected aggregate state");
+        assert!(
+            state.simd_accums.is_none(),
+            "SIMD fast path should not be enabled for DISTINCT aggregates"
+        );
+    }
+
+    #[tokio::test]
+    async fn test_simd_sum_produces_correct_result() {
+        let mut state = setup_global_agg("SELECT SUM(value) as total FROM events").await;
+
+        let pre_agg_schema = Arc::new(Schema::new(vec![Field::new(
+            "__agg_input_0",
+            DataType::Float64,
+            true,
+        )]));
+        let batch = RecordBatch::try_new(
+            Arc::clone(&pre_agg_schema),
+            vec![Arc::new(arrow::array::Float64Array::from(vec![
+                10.0, 20.0, 30.0,
+            ]))],
+        )
+        .unwrap();
+        state.process_batch(&batch).unwrap();
+
+        let result = state.emit().unwrap();
+        assert_eq!(result.len(), 1);
+        assert_eq!(result[0].num_rows(), 1);
+        let total = result[0]
+            .column(0)
+            .as_any()
+            .downcast_ref::<arrow::array::Float64Array>()
+            .expect("expected Float64Array");
+        assert!(
+            (total.value(0) - 60.0).abs() < f64::EPSILON,
+            "Expected 60.0, got {}",
+            total.value(0)
+        );
+    }
+
+    #[tokio::test]
+    async fn test_simd_sum_accumulates_across_batches() {
+        let mut state = setup_global_agg("SELECT SUM(value) as total FROM events").await;
+
+        let pre_agg_schema = Arc::new(Schema::new(vec![Field::new(
+            "__agg_input_0",
+            DataType::Float64,
+            true,
+        )]));
+
+        // Batch 1
+        let batch1 = RecordBatch::try_new(
+            Arc::clone(&pre_agg_schema),
+            vec![Arc::new(arrow::array::Float64Array::from(vec![10.0, 20.0]))],
+        )
+        .unwrap();
+        state.process_batch(&batch1).unwrap();
+
+        // Batch 2
+        let batch2 = RecordBatch::try_new(
+            Arc::clone(&pre_agg_schema),
+            vec![Arc::new(arrow::array::Float64Array::from(vec![30.0, 40.0]))],
+        )
+        .unwrap();
+        state.process_batch(&batch2).unwrap();
+
+        let result = state.emit().unwrap();
+        assert_eq!(result.len(), 1);
+        let total = result[0]
+            .column(0)
+            .as_any()
+            .downcast_ref::<arrow::array::Float64Array>()
+            .expect("expected Float64Array");
+        assert!(
+            (total.value(0) - 100.0).abs() < f64::EPSILON,
+            "Expected 100.0 (10+20+30+40), got {}",
+            total.value(0)
+        );
+    }
+
+    #[tokio::test]
+    async fn test_simd_count_min_max() {
+        let mut state = setup_global_agg(
+            "SELECT COUNT(value) as cnt, MIN(value) as lo, MAX(value) as hi FROM events",
+        )
+        .await;
+
+        let pre_agg_schema = Arc::new(Schema::new(vec![
+            Field::new("__agg_input_0", DataType::Float64, true),
+            Field::new("__agg_input_1", DataType::Float64, true),
+            Field::new("__agg_input_2", DataType::Float64, true),
+        ]));
+        let vals = vec![5.0, 1.0, 9.0, 3.0, 7.0];
+        let batch = RecordBatch::try_new(
+            Arc::clone(&pre_agg_schema),
+            vec![
+                Arc::new(arrow::array::Float64Array::from(vals.clone())),
+                Arc::new(arrow::array::Float64Array::from(vals.clone())),
+                Arc::new(arrow::array::Float64Array::from(vals)),
+            ],
+        )
+        .unwrap();
+        state.process_batch(&batch).unwrap();
+
+        let result = state.emit().unwrap();
+        assert_eq!(result.len(), 1);
+        assert_eq!(result[0].num_rows(), 1);
+
+        // COUNT
+        let cnt = result[0]
+            .column(0)
+            .as_any()
+            .downcast_ref::<arrow::array::Int64Array>()
+            .expect("count should be Int64");
+        assert_eq!(cnt.value(0), 5, "COUNT should be 5");
+
+        // MIN
+        let lo = result[0]
+            .column(1)
+            .as_any()
+            .downcast_ref::<arrow::array::Float64Array>()
+            .expect("min should be Float64");
+        assert!(
+            (lo.value(0) - 1.0).abs() < f64::EPSILON,
+            "MIN should be 1.0, got {}",
+            lo.value(0)
+        );
+
+        // MAX
+        let hi = result[0]
+            .column(2)
+            .as_any()
+            .downcast_ref::<arrow::array::Float64Array>()
+            .expect("max should be Float64");
+        assert!(
+            (hi.value(0) - 9.0).abs() < f64::EPSILON,
+            "MAX should be 9.0, got {}",
+            hi.value(0)
+        );
+    }
+
+    #[tokio::test]
+    async fn test_simd_min_max_across_batches() {
+        let mut state =
+            setup_global_agg("SELECT MIN(value) as lo, MAX(value) as hi FROM events").await;
+
+        let pre_agg_schema = Arc::new(Schema::new(vec![
+            Field::new("__agg_input_0", DataType::Float64, true),
+            Field::new("__agg_input_1", DataType::Float64, true),
+        ]));
+
+        // Batch 1: min=2.0, max=8.0
+        let b1 = RecordBatch::try_new(
+            Arc::clone(&pre_agg_schema),
+            vec![
+                Arc::new(arrow::array::Float64Array::from(vec![2.0, 5.0, 8.0])),
+                Arc::new(arrow::array::Float64Array::from(vec![2.0, 5.0, 8.0])),
+            ],
+        )
+        .unwrap();
+        state.process_batch(&b1).unwrap();
+
+        // Batch 2: min=1.0, max=6.0 -- global min should update to 1.0
+        let b2 = RecordBatch::try_new(
+            Arc::clone(&pre_agg_schema),
+            vec![
+                Arc::new(arrow::array::Float64Array::from(vec![1.0, 4.0, 6.0])),
+                Arc::new(arrow::array::Float64Array::from(vec![1.0, 4.0, 6.0])),
+            ],
+        )
+        .unwrap();
+        state.process_batch(&b2).unwrap();
+
+        let result = state.emit().unwrap();
+        let lo = result[0]
+            .column(0)
+            .as_any()
+            .downcast_ref::<arrow::array::Float64Array>()
+            .unwrap();
+        let hi = result[0]
+            .column(1)
+            .as_any()
+            .downcast_ref::<arrow::array::Float64Array>()
+            .unwrap();
+
+        assert!(
+            (lo.value(0) - 1.0).abs() < f64::EPSILON,
+            "Global MIN should be 1.0, got {}",
+            lo.value(0)
+        );
+        assert!(
+            (hi.value(0) - 8.0).abs() < f64::EPSILON,
+            "Global MAX should be 8.0, got {}",
+            hi.value(0)
+        );
+    }
+
+    #[tokio::test]
+    async fn test_simd_checkpoint_and_restore() {
+        let mut state = setup_global_agg("SELECT SUM(value) as total FROM events").await;
+
+        let pre_agg_schema = Arc::new(Schema::new(vec![Field::new(
+            "__agg_input_0",
+            DataType::Float64,
+            true,
+        )]));
+        let batch = RecordBatch::try_new(
+            Arc::clone(&pre_agg_schema),
+            vec![Arc::new(arrow::array::Float64Array::from(vec![
+                10.0, 20.0, 30.0,
+            ]))],
+        )
+        .unwrap();
+        state.process_batch(&batch).unwrap();
+
+        // Checkpoint
+        let cp = state.checkpoint_groups().unwrap();
+        assert_eq!(cp.groups.len(), 1);
+
+        // Create a fresh state and restore
+        let mut state2 = setup_global_agg("SELECT SUM(value) as total FROM events").await;
+        state2.restore_groups(&cp).unwrap();
+
+        // Feed more data
+        let batch2 = RecordBatch::try_new(
+            Arc::clone(&pre_agg_schema),
+            vec![Arc::new(arrow::array::Float64Array::from(vec![40.0]))],
+        )
+        .unwrap();
+        state2.process_batch(&batch2).unwrap();
+
+        let result = state2.emit().unwrap();
+        let total = result[0]
+            .column(0)
+            .as_any()
+            .downcast_ref::<arrow::array::Float64Array>()
+            .unwrap();
+        assert!(
+            (total.value(0) - 100.0).abs() < f64::EPSILON,
+            "Expected 100.0 (60 restored + 40 new), got {}",
+            total.value(0)
+        );
     }
 }
