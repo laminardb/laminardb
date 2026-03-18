@@ -337,15 +337,12 @@ impl KafkaSource {
                             let watermarks = tokio::task::spawn_blocking(move || {
                                 let mut results = Vec::with_capacity(partitions.len());
                                 for (topic, partition) in &partitions {
-                                    match c.fetch_watermarks(
+                                    if let Ok((_low, high)) = c.fetch_watermarks(
                                         topic,
                                         *partition,
                                         std::time::Duration::from_secs(5),
                                     ) {
-                                        Ok((_low, high)) => {
-                                            results.push((Arc::clone(topic), *partition, high));
-                                        }
-                                        Err(_) => {}
+                                        results.push((Arc::clone(topic), *partition, high));
                                     }
                                 }
                                 results
