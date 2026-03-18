@@ -297,7 +297,7 @@ impl FormatDecoder for JsonDecoder {
         let mut populated = vec![false; num_fields];
 
         for record in records {
-            let value: serde_json::Value = serde_json::from_slice(&record.value)
+            let value: serde_json::Value = sonic_rs::from_slice(&record.value)
                 .map_err(|e| SchemaError::DecodeError(format!("JSON parse error: {e}")))?;
 
             // Navigate json.path → default target (borrowed, ZERO alloc).
@@ -765,7 +765,7 @@ fn append_value(
                 b.append_value(&bytes);
             } else {
                 // Fallback: serialize as JSON bytes.
-                let bytes = serde_json::to_vec(value).unwrap_or_default();
+                let bytes = sonic_rs::to_vec(value).unwrap_or_default();
                 b.append_value(&bytes);
             }
         }
