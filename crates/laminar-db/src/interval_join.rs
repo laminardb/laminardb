@@ -436,8 +436,9 @@ fn probe_index(
 /// then concatenate. Replaces the per-row `slice(row, 1)` + `concat` pattern
 /// with O(B) take operations where B is the number of distinct source batches.
 ///
-/// `rows` must be sorted by `(batch_idx, row_idx)` for compaction callers,
-/// but works correctly for any ordering — output row order matches `rows` order.
+/// Works correctly for any ordering — output row order matches `rows` order.
+/// Most effective when rows are batch-sorted (consecutive runs from the same
+/// batch are gathered in a single `take` call).
 fn take_rows_from_batches(
     batches: &[RecordBatch],
     rows: &[(usize, usize)],
@@ -639,10 +640,10 @@ pub(crate) fn execute_interval_join_cycle(
             .map_or_else(|| Arc::new(Schema::empty()), RecordBatch::schema);
 
         // Extract left and right (batch_idx, row_idx) pairs from match_pairs
-        let left_pairs: Vec<(usize, usize)> =
-            match_pairs.iter().map(|&(lb, lr, _, _)| (lb, lr)).collect();
-        let right_pairs: Vec<(usize, usize)> =
-            match_pairs.iter().map(|&(_, _, rb, rr)| (rb, rr)).collect();
+        let (left_pairs, right_pairs): (Vec<_>, Vec<_>) = match_pairs
+            .iter()
+            .map(|&(lb, lr, rb, rr)| ((lb, lr), (rb, rr)))
+            .unzip();
 
         // Build output columns using take-based gathering
         let mut columns: Vec<ArrayRef> =

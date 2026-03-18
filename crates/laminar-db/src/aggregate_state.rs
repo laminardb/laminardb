@@ -462,7 +462,7 @@ pub(crate) struct IncrementalAggState {
     agg_specs: Vec<AggFuncSpec>,
     /// Per-group accumulator state.
     ///
-    /// `DataFusion` `Accumulator` is trait-object dispatched (~2ns vtable overhead).
+    /// `DataFusion` `Accumulator` is trait-object dispatched (vtable overhead).
     /// Acceptable because each call processes a batch, not per-row. 50+
     /// aggregate types preclude enum dispatch.
     groups: AHashMap<Vec<ScalarValue>, Vec<Box<dyn datafusion_expr::Accumulator>>>,

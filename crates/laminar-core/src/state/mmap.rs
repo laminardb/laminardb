@@ -235,14 +235,24 @@ impl Storage {
                 if *capacity > min_capacity && new_capacity < *capacity * 3 / 4 {
                     // Clamp to at least the minimum
                     let target = new_capacity.max(min_capacity);
+                    let old_capacity = *capacity;
                     file.set_len(target as u64)?;
                     // SAFETY: We just resized the file and hold exclusive &mut self.
+                    // On remap failure, restore the original file length so the
+                    // existing mmap remains valid.
                     #[allow(unsafe_code)]
-                    {
-                        *mmap = unsafe { MmapMut::map_mut(&*file)? };
+                    match unsafe { MmapMut::map_mut(&*file) } {
+                        Ok(new_mmap) => {
+                            *mmap = new_mmap;
+                            advise_hugepages(mmap);
+                            *capacity = target;
+                        }
+                        Err(e) => {
+                            // Restore original file length to keep current mmap valid
+                            let _ = file.set_len(old_capacity as u64);
+                            return Err(e.into());
+                        }
                     }
-                    advise_hugepages(mmap);
-                    *capacity = target;
                 }
                 Ok(())
             }
@@ -467,7 +477,7 @@ impl MmapStateStore {
         }
 
         // Collect only values (keys stay in the BTreeMap, avoiding reallocation).
-        // Ordered by current offset so the read is sequential.
+        // Iteration follows BTreeMap key order, not offset order.
         let entries: Vec<(Vec<u8>, Vec<u8>)> = self
             .index
             .iter()

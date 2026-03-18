@@ -33,7 +33,7 @@ use super::{prefix_successor, StateError, StateSnapshot, StateStore};
 /// slower writes due to dual-map maintenance.
 pub struct AHashMapStore {
     /// Primary data store for O(1) point lookups.
-    /// Both keys and values are `Bytes` — clone is a cheap Arc bump (~2ns),
+    /// Both keys and values are `Bytes` — clone is a cheap Arc bump,
     /// enabling zero-copy prefix/range scans.
     data: AHashMap<Bytes, Bytes>,
     /// Sorted index for prefix/range scans (keys only, Bytes for zero-copy iteration).
@@ -73,7 +73,7 @@ impl Default for AHashMapStore {
 impl StateStore for AHashMapStore {
     #[inline]
     fn get(&self, key: &[u8]) -> Option<Bytes> {
-        self.data.get(key).cloned() // Arc bump ~2ns, not copy
+        self.data.get(key).cloned() // Arc bump, not copy
     }
 
     #[inline]
