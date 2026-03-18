@@ -366,11 +366,6 @@ const _: () = {
     assert_send::<StreamExecutorCheckpoint>();
 };
 
-/// Checkpoint format: JSON text (legacy, for backward compatibility).
-pub(crate) const CHECKPOINT_FORMAT_JSON: u8 = 0x00;
-/// Checkpoint format: postcard binary (compact, fast).
-pub(crate) const CHECKPOINT_FORMAT_POSTCARD: u8 = 0x01;
-
 /// Checkpoint for raw-batch EOWC state (non-aggregate EOWC queries).
 ///
 /// Stores accumulated `RecordBatch` data as Arrow IPC bytes plus
@@ -481,6 +476,11 @@ pub(crate) struct IncrementalAggState {
     /// Sentinel `OwnedRow` for global aggregates (no GROUP BY).
     ///
     /// Created once from an empty `RowConverter` to avoid per-batch allocation.
+    ///
+    // INVARIANT: The sentinel is produced by a separate RowConverter with a single
+    // Boolean column. Arrow's row format prefixes each column's encoding with a
+    // 1-byte validity tag, so the sentinel bytes will never collide with keys from
+    // the main RowConverter which encodes different column types/counts.
     empty_row_sentinel: arrow::row::OwnedRow,
     /// Output schema (group columns + aggregate results).
     output_schema: SchemaRef,
@@ -963,15 +963,16 @@ impl IncrementalAggState {
 
     /// Fast path for global aggregates (COUNT(*), SUM(x), etc. with no GROUP BY).
     fn process_batch_no_groups(&mut self, batch: &RecordBatch) -> Result<(), DbError> {
-        let sentinel = self.empty_row_sentinel.clone();
-        if !self.groups.contains_key(&sentinel) {
-            let mut accs = Vec::with_capacity(self.agg_specs.len());
-            for spec in &self.agg_specs {
-                accs.push(spec.create_accumulator()?);
-            }
-            self.groups.insert(sentinel.clone(), accs);
-        }
-        let accs = self.groups.get_mut(&sentinel).unwrap();
+        let specs = &self.agg_specs;
+        let accs = self
+            .groups
+            .entry(self.empty_row_sentinel.clone())
+            .or_insert_with(|| {
+                specs
+                    .iter()
+                    .map(|spec| spec.create_accumulator().expect("accumulator creation"))
+                    .collect()
+            });
         #[allow(clippy::cast_possible_truncation)]
         let all_indices: Vec<u32> = (0..batch.num_rows() as u32).collect();
         Self::update_group_accumulators(accs, batch, &all_indices, &self.agg_specs)
@@ -3156,85 +3157,5 @@ mod tests {
         assert_eq!(js.left_batches, vec![vec![1, 2, 3]]);
         assert_eq!(js.right_batches, vec![vec![4, 5, 6]]);
         assert_eq!(js.last_evicted_watermark, 42);
-    }
-
-    #[test]
-    fn test_checkpoint_postcard_round_trip() {
-        let mut join_states = FxHashMap::default();
-        join_states.insert(
-            "enriched".to_string(),
-            JoinStateCheckpoint {
-                left_buffer_rows: 100,
-                right_buffer_rows: 50,
-                left_batches: vec![vec![1, 2, 3]],
-                right_batches: vec![vec![4, 5, 6]],
-                last_evicted_watermark: 42,
-            },
-        );
-
-        let cp = StreamExecutorCheckpoint {
-            version: 2,
-            vnode_count: laminar_core::state::VNODE_COUNT,
-            agg_states: FxHashMap::default(),
-            eowc_states: FxHashMap::default(),
-            core_window_states: FxHashMap::default(),
-            join_states,
-            raw_eowc_states: FxHashMap::default(),
-        };
-
-        // Postcard round-trip
-        let payload = postcard::to_allocvec(&cp).unwrap();
-        let restored: StreamExecutorCheckpoint = postcard::from_bytes(&payload).unwrap();
-        assert_eq!(restored.version, 2);
-        assert_eq!(restored.join_states.len(), 1);
-        let js = restored.join_states.get("enriched").unwrap();
-        assert_eq!(js.left_buffer_rows, 100);
-        assert_eq!(js.right_buffer_rows, 50);
-        assert_eq!(js.left_batches, vec![vec![1, 2, 3]]);
-        assert_eq!(js.right_batches, vec![vec![4, 5, 6]]);
-        assert_eq!(js.last_evicted_watermark, 42);
-    }
-
-    #[test]
-    fn test_checkpoint_tagged_format_backward_compat() {
-        let cp = StreamExecutorCheckpoint {
-            version: 2,
-            vnode_count: laminar_core::state::VNODE_COUNT,
-            agg_states: FxHashMap::default(),
-            eowc_states: FxHashMap::default(),
-            core_window_states: FxHashMap::default(),
-            join_states: FxHashMap::default(),
-            raw_eowc_states: FxHashMap::default(),
-        };
-
-        // Tagged postcard: 0x01 prefix + postcard payload
-        let payload = postcard::to_allocvec(&cp).unwrap();
-        let mut tagged_postcard = Vec::with_capacity(1 + payload.len());
-        tagged_postcard.push(CHECKPOINT_FORMAT_POSTCARD);
-        tagged_postcard.extend_from_slice(&payload);
-        assert_eq!(tagged_postcard[0], 0x01);
-
-        // Tagged JSON: 0x00 prefix + JSON payload
-        let json_payload = serde_json::to_vec(&cp).unwrap();
-        let mut tagged_json = Vec::with_capacity(1 + json_payload.len());
-        tagged_json.push(CHECKPOINT_FORMAT_JSON);
-        tagged_json.extend_from_slice(&json_payload);
-        assert_eq!(tagged_json[0], 0x00);
-
-        // Legacy untagged JSON starts with '{'
-        let legacy_json = serde_json::to_vec(&cp).unwrap();
-        assert_eq!(legacy_json[0], b'{');
-
-        // All three formats deserialize correctly
-        let from_postcard: StreamExecutorCheckpoint =
-            postcard::from_bytes(&tagged_postcard[1..]).unwrap();
-        assert_eq!(from_postcard.version, 2);
-
-        let from_tagged_json: StreamExecutorCheckpoint =
-            serde_json::from_slice(&tagged_json[1..]).unwrap();
-        assert_eq!(from_tagged_json.version, 2);
-
-        let from_legacy: StreamExecutorCheckpoint = serde_json::from_slice(&legacy_json).unwrap();
-        assert_eq!(from_legacy.version, 2);
     }
 }

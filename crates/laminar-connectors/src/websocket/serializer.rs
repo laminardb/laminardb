@@ -104,7 +104,7 @@ impl BatchSerializer {
                     serde_json::Value::Array(rows) => rows
                         .into_iter()
                         .map(|v| {
-                            sonic_rs::to_string(&v).map_err(|e| {
+                            serde_json::to_string(&v).map_err(|e| {
                                 ConnectorError::Serde(crate::error::SerdeError::Json(e.to_string()))
                             })
                         })
@@ -117,7 +117,7 @@ impl BatchSerializer {
             SinkFormat::ArrowIpc | SinkFormat::Binary => {
                 // For binary formats, serialize the entire batch as one message
                 let json_val = self.serialize_to_json(batch)?;
-                let s = sonic_rs::to_string(&json_val).map_err(|e| {
+                let s = serde_json::to_string(&json_val).map_err(|e| {
                     ConnectorError::Serde(crate::error::SerdeError::Json(e.to_string()))
                 })?;
                 Ok(vec![s])

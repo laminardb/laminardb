@@ -29,6 +29,10 @@ pub(crate) struct WatermarkContext {
     pub(crate) name: String,
     pub(crate) state: SourceWatermarkState,
     pub(crate) entry: Arc<crate::catalog::SourceEntry>,
+    /// Dense index into the `WatermarkTracker` array. Because not every
+    /// source has a watermark, the sparse `source_idx` (position in the
+    /// connector list) is mapped to a dense `tracker_id` that only covers
+    /// watermark-enabled sources. This avoids gaps in the tracker array.
     pub(crate) tracker_id: usize,
 }
 
@@ -260,7 +264,8 @@ impl crate::pipeline::PipelineCallback for ConnectorPipelineCallback {
         futures::future::join_all(sink_futures).await;
     }
 
-    fn extract_watermark(&mut self, _source_name: &str, source_idx: usize, batch: &RecordBatch) {
+    fn extract_watermark(&mut self, source_name: &str, source_idx: usize, batch: &RecordBatch) {
+        let _ = source_name; // reserved for per-source logging
         if let Some(Some(ctx)) = self.watermark_contexts.get_mut(source_idx) {
             // Check external watermarks from Source::watermark() calls.
             let external_wm = ctx.entry.source.current_watermark();
@@ -300,10 +305,11 @@ impl crate::pipeline::PipelineCallback for ConnectorPipelineCallback {
 
     fn filter_late_rows(
         &self,
-        _source_name: &str,
+        source_name: &str,
         source_idx: usize,
         batch: &RecordBatch,
     ) -> Option<RecordBatch> {
+        let _ = source_name; // reserved for per-source logging
         if let Some(Some(ctx)) = self.watermark_contexts.get(source_idx) {
             let current_wm = ctx.state.generator.current_watermark();
             if current_wm > i64::MIN {
