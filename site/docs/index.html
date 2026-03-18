@@ -1128,8 +1128,9 @@ LEFT SEMI JOIN payments p
 
       <p style="font-size: 0.82rem;">
         <strong>State:</strong> Both sides buffered as Arrow batches with per-key
-        <code>BTreeMap&lt;timestamp&gt;</code> indices. New left rows probe all right state;
-        new right rows probe only old left state (avoids double-emit).
+        <code>BTreeMap&lt;timestamp&gt;</code> indices. Time columns are extracted
+        automatically from the <code>BETWEEN</code> clause. New left rows probe all
+        right state; new right rows probe only old left state (avoids double-emit).
         Checkpointed via Arrow IPC serialization.
       </p>
 
@@ -1142,7 +1143,7 @@ LEFT SEMI JOIN payments p
         within the same key partition. Uses Snowflake-compatible <code>MATCH_CONDITION</code> syntax.
       </p>
 
-      <p><strong>Supported types:</strong> INNER (default), LEFT</p>
+      <p><strong>Supported types:</strong> INNER, LEFT</p>
 
       <h4>Three directions</h4>
       <table class="config-table">
@@ -1195,7 +1196,8 @@ ASOF JOIN calibrations c
 
       <p style="font-size: 0.82rem;">
         <strong>State:</strong> Right-side events stored in per-key
-        <code>BTreeMap&lt;timestamp, row_index&gt;</code> for O(log n) temporal lookups.
+        <code>BTreeMap&lt;timestamp, Vec&lt;row_index&gt;&gt;</code> for O(log n) temporal lookups.
+        Multiple rows at the same timestamp are handled correctly.
         Key columns support <code>VARCHAR</code> and <code>BIGINT</code> types.
       </p>
 
