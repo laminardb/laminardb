@@ -9,8 +9,8 @@ use std::collections::HashMap;
 use std::path::PathBuf;
 use std::sync::atomic::AtomicU64;
 use std::sync::Arc;
+use std::time::Duration;
 
-use tokio::signal;
 use tokio::sync::watch;
 use tracing::{info, warn};
 
@@ -227,39 +227,109 @@ pub struct DeltaHandle {
     watcher_handle: Option<tokio::task::JoinHandle<()>>,
     /// Membership change watcher task.
     membership_handle: tokio::task::JoinHandle<()>,
+    /// Graceful shutdown deadline.
+    shutdown_timeout: Duration,
 }
 
 impl DeltaHandle {
-    /// Block until ctrl-c, then gracefully shut down all subsystems.
+    /// Block until a termination signal is received, then gracefully shut down.
+    ///
+    /// The graceful shutdown sequence for delta mode:
+    /// 1. Transition to `Draining` phase (signals peers to reassign partitions)
+    /// 2. Announce draining state via discovery layer
+    /// 3. Stop membership watcher and config watcher
+    /// 4. Best-effort final checkpoint
+    /// 5. Shut down engine
+    /// 6. Stop discovery layer
+    /// 7. Abort HTTP server
+    ///
+    /// If the sequence does not complete within `shutdown_timeout`, force-exits.
     pub async fn wait_for_shutdown(mut self) -> Result<(), DeltaStartupError> {
-        signal::ctrl_c()
+        let sig = crate::server::wait_for_termination_signal()
             .await
             .map_err(|e| DeltaStartupError::Discovery(format!("signal handler: {e}")))?;
 
-        info!("Received shutdown signal, shutting down delta node...");
+        info!(
+            "Received {sig}, starting graceful delta shutdown (timeout: {:?})",
+            self.shutdown_timeout
+        );
 
-        // Stop membership watcher
-        self.membership_handle.abort();
+        let timeout = self.shutdown_timeout;
+        match tokio::time::timeout(timeout, self.graceful_shutdown()).await {
+            Ok(result) => {
+                info!("Delta node shutdown complete");
+                result
+            }
+            Err(_) => {
+                warn!("Graceful delta shutdown did not complete within {timeout:?}, force-exiting");
+                std::process::exit(1);
+            }
+        }
+    }
 
-        // Stop discovery
-        if let Err(e) = self.discovery.stop().await {
-            warn!("Discovery stop error: {e}");
+    /// Execute the graceful shutdown sequence.
+    async fn graceful_shutdown(&mut self) -> Result<(), DeltaStartupError> {
+        // 1. Transition to Draining — signals this node is leaving
+        if self.manager.transition(NodeLifecyclePhase::Draining) {
+            info!(
+                "Delta node '{}' transitioning to draining (releasing {} partitions)",
+                self.node_id,
+                self.manager.guards().len()
+            );
         }
 
-        // Abort config watcher
+        // 2. Announce draining state so peers can begin partition reassignment
+        let drain_info = NodeInfo {
+            id: NodeId(xxhash_rust::xxh3::xxh3_64(self.node_id.as_bytes()).max(1)),
+            name: self.node_id.clone(),
+            rpc_address: String::new(),
+            raft_address: String::new(),
+            state: NodeState::Draining,
+            metadata: NodeMetadata::default(),
+            last_heartbeat_ms: 0,
+        };
+        if let Err(e) = self.discovery.announce(drain_info).await {
+            warn!("Failed to announce draining state: {e}");
+        }
+
+        // 3. Stop membership watcher and config watcher
+        self.membership_handle.abort();
         if let Some(wh) = &self.watcher_handle {
             wh.abort();
         }
 
-        // Shutdown engine
-        if let Err(e) = self.db.shutdown().await {
-            tracing::warn!("Engine shutdown error: {e}");
+        // 4. Best-effort final checkpoint
+        match self.db.checkpoint().await {
+            Ok(result) if result.success => {
+                info!("Pre-shutdown checkpoint completed (epoch {})", result.epoch);
+            }
+            Ok(result) => {
+                warn!(
+                    "Pre-shutdown checkpoint failed: {}",
+                    result.error.as_deref().unwrap_or("unknown")
+                );
+            }
+            Err(e) => {
+                warn!("Pre-shutdown checkpoint error: {e}");
+            }
         }
 
-        // Abort HTTP
+        // 5. Shut down engine (stops accepting data, flushes pending batches)
+        if let Err(e) = self.db.shutdown().await {
+            warn!("Engine shutdown error: {e}");
+        }
+
+        // 6. Transition to Shutdown
+        self.manager.transition(NodeLifecyclePhase::Shutdown);
+
+        // 7. Stop discovery
+        if let Err(e) = self.discovery.stop().await {
+            warn!("Discovery stop error: {e}");
+        }
+
+        // 8. Abort HTTP server
         self.api_handle.abort();
 
-        info!("Delta node shutdown complete");
         Ok(())
     }
 }
@@ -522,6 +592,7 @@ pub async fn start_delta(
 
     // 10. Start HTTP API
     let bind = config.server.bind.clone();
+    let shutdown_timeout = config.server.shutdown_timeout;
     let app_state = Arc::new(http::AppState {
         db: Arc::clone(&db),
         config_path: config_path.clone(),
@@ -571,6 +642,7 @@ pub async fn start_delta(
         api_handle,
         watcher_handle,
         membership_handle,
+        shutdown_timeout,
     })
 }
 

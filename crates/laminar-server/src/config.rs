@@ -216,6 +216,11 @@ pub struct ServerSection {
     /// Log level: trace, debug, info, warn, error.
     #[serde(default = "default_log_level")]
     pub log_level: String,
+
+    /// Graceful shutdown timeout (e.g., "30s", "2m"). After this deadline,
+    /// the server force-exits even if drain/checkpoint is incomplete.
+    #[serde(default = "default_shutdown_timeout", with = "humantime_serde")]
+    pub shutdown_timeout: Duration,
 }
 
 impl Default for ServerSection {
@@ -225,6 +230,7 @@ impl Default for ServerSection {
             bind: default_bind(),
             workers: 0,
             log_level: default_log_level(),
+            shutdown_timeout: default_shutdown_timeout(),
         }
     }
 }
@@ -599,6 +605,9 @@ fn default_hot_retention() -> Duration {
 fn default_warm_retention() -> Duration {
     Duration::from_secs(604_800) // 7d
 }
+fn default_shutdown_timeout() -> Duration {
+    Duration::from_secs(30)
+}
 fn default_gossip_port() -> u16 {
     7946
 }
@@ -896,6 +905,7 @@ bind = "not-a-socket-addr"
         assert_eq!(config.server.bind, "127.0.0.1:8080");
         assert_eq!(config.server.workers, 0);
         assert_eq!(config.server.log_level, "info");
+        assert_eq!(config.server.shutdown_timeout, Duration::from_secs(30));
         assert_eq!(config.state.backend, "memory");
         assert_eq!(config.checkpoint.interval, Duration::from_secs(10));
     }
@@ -938,6 +948,21 @@ max_out_of_orderness = "10s"
         let wm = config.sources[0].watermark.as_ref().unwrap();
         assert_eq!(wm.column, "event_time");
         assert_eq!(wm.max_out_of_orderness, Duration::from_secs(10));
+    }
+
+    #[test]
+    fn test_shutdown_timeout_parsing() {
+        let toml = r#"
+[server]
+shutdown_timeout = "2m"
+"#;
+        let config: ServerConfig = toml::from_str(toml).unwrap();
+        assert_eq!(config.server.shutdown_timeout, Duration::from_secs(120));
+
+        // Default when not specified
+        let toml2 = "[server]\n";
+        let config2: ServerConfig = toml::from_str(toml2).unwrap();
+        assert_eq!(config2.server.shutdown_timeout, Duration::from_secs(30));
     }
 
     #[test]

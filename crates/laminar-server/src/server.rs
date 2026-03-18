@@ -7,9 +7,10 @@
 use std::path::PathBuf;
 use std::sync::atomic::AtomicU64;
 use std::sync::Arc;
+use std::time::Duration;
 
 use tokio::signal;
-use tracing::info;
+use tracing::{info, warn};
 
 use laminar_core::streaming::checkpoint::StreamCheckpointConfig;
 use laminar_db::{DbError, LaminarDB, Profile};
@@ -21,10 +22,36 @@ use crate::delta_config::{DeltaConfig, DeltaConfigError};
 use crate::http;
 use crate::reload::ReloadGuard;
 
+/// Wait for a termination signal (SIGINT or SIGTERM on Unix, ctrl_c on all platforms).
+///
+/// Returns the signal name as soon as either signal arrives.
+pub(crate) async fn wait_for_termination_signal() -> Result<&'static str, std::io::Error> {
+    #[cfg(unix)]
+    {
+        use tokio::signal::unix::{signal, SignalKind};
+        let mut sigterm =
+            signal(SignalKind::terminate()).map_err(|e| std::io::Error::other(e.to_string()))?;
+        tokio::select! {
+            result = signal::ctrl_c() => {
+                result?;
+                Ok("SIGINT")
+            }
+            _ = sigterm.recv() => {
+                Ok("SIGTERM")
+            }
+        }
+    }
+    #[cfg(not(unix))]
+    {
+        signal::ctrl_c().await?;
+        Ok("ctrl_c")
+    }
+}
+
 /// Handle to a running LaminarDB server (embedded or delta mode).
 ///
 /// Call [`wait_for_shutdown`](ServerHandle::wait_for_shutdown) to block until
-/// the server receives a shutdown signal (Ctrl-C).
+/// the server receives a shutdown signal (SIGINT/SIGTERM).
 pub enum ServerHandle {
     /// Embedded (single-node) mode.
     Embedded {
@@ -34,36 +61,51 @@ pub enum ServerHandle {
         api_handle: tokio::task::JoinHandle<()>,
         /// Config file watcher task.
         watcher_handle: Option<tokio::task::JoinHandle<()>>,
+        /// Graceful shutdown deadline.
+        shutdown_timeout: Duration,
     },
     /// Delta (multi-node) mode.
     Delta(Box<crate::delta::DeltaHandle>),
 }
 
 impl ServerHandle {
-    /// Block until `ctrl_c` is received, then gracefully shut down.
+    /// Block until a termination signal is received, then gracefully shut down.
+    ///
+    /// The shutdown sequence:
+    /// 1. Stop config file watcher
+    /// 2. Trigger a final checkpoint (best-effort)
+    /// 3. Shut down the engine (flushes pending batches)
+    /// 4. Abort the HTTP server
+    ///
+    /// If the graceful phase does not complete within `shutdown_timeout`,
+    /// the process force-exits with code 1.
     pub async fn wait_for_shutdown(self) -> Result<(), ServerError> {
         match self {
             Self::Embedded {
                 db,
                 api_handle,
                 watcher_handle,
+                shutdown_timeout,
             } => {
-                signal::ctrl_c()
+                let sig = wait_for_termination_signal()
                     .await
                     .map_err(|e| ServerError::Shutdown(format!("signal handler failed: {e}")))?;
 
-                info!("Received shutdown signal, shutting down...");
+                info!("Received {sig}, starting graceful shutdown (timeout: {shutdown_timeout:?})");
 
-                if let Some(wh) = &watcher_handle {
-                    wh.abort();
+                let graceful = graceful_shutdown_embedded(db, api_handle, watcher_handle);
+                match tokio::time::timeout(shutdown_timeout, graceful).await {
+                    Ok(result) => {
+                        info!("Shutdown complete");
+                        result
+                    }
+                    Err(_) => {
+                        warn!(
+                            "Graceful shutdown did not complete within {shutdown_timeout:?}, force-exiting"
+                        );
+                        std::process::exit(1);
+                    }
                 }
-                db.shutdown()
-                    .await
-                    .map_err(|e| ServerError::Shutdown(e.to_string()))?;
-                api_handle.abort();
-
-                info!("Shutdown complete");
-                Ok(())
             }
             Self::Delta(handle) => (*handle)
                 .wait_for_shutdown()
@@ -71,6 +113,44 @@ impl ServerHandle {
                 .map_err(|e| ServerError::Delta(e.to_string())),
         }
     }
+}
+
+/// Execute the graceful shutdown sequence for embedded mode.
+async fn graceful_shutdown_embedded(
+    db: Arc<LaminarDB>,
+    api_handle: tokio::task::JoinHandle<()>,
+    watcher_handle: Option<tokio::task::JoinHandle<()>>,
+) -> Result<(), ServerError> {
+    // 1. Stop config file watcher
+    if let Some(wh) = &watcher_handle {
+        wh.abort();
+    }
+
+    // 2. Best-effort final checkpoint before shutdown
+    match db.checkpoint().await {
+        Ok(result) if result.success => {
+            info!("Pre-shutdown checkpoint completed (epoch {})", result.epoch);
+        }
+        Ok(result) => {
+            warn!(
+                "Pre-shutdown checkpoint failed: {}",
+                result.error.as_deref().unwrap_or("unknown")
+            );
+        }
+        Err(e) => {
+            warn!("Pre-shutdown checkpoint error: {e}");
+        }
+    }
+
+    // 3. Shut down engine (stops accepting data, flushes pending batches)
+    db.shutdown()
+        .await
+        .map_err(|e| ServerError::Shutdown(e.to_string()))?;
+
+    // 4. Abort HTTP server
+    api_handle.abort();
+
+    Ok(())
 }
 
 /// Build and start a LaminarDB server from the given configuration.
@@ -206,6 +286,7 @@ pub async fn run_server(
 
     // 4. Start HTTP API
     let bind = config.server.bind.clone();
+    let shutdown_timeout = config.server.shutdown_timeout;
     let app_state = Arc::new(http::AppState {
         db: Arc::clone(&db),
         config_path: config_path.clone(),
@@ -244,6 +325,7 @@ pub async fn run_server(
         db,
         api_handle,
         watcher_handle,
+        shutdown_timeout,
     })
 }
 
