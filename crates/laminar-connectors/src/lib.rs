@@ -81,6 +81,9 @@ pub mod schema;
 /// Connector registry with factory pattern.
 pub mod registry;
 
+/// Idempotent sink wrapper for exactly-once delivery without transactions.
+pub mod idempotent;
+
 /// Testing utilities (mock connectors, helpers).
 #[cfg(any(test, feature = "testing"))]
 pub mod testing;

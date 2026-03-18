@@ -602,12 +602,29 @@ impl CheckpointCoordinator {
     /// At-most-once sinks are skipped — they receive no `pre_commit`/`commit`
     /// calls and provide no transactional guarantees.
     async fn pre_commit_sinks_inner(&self, epoch: u64) -> Result<(), DbError> {
+        let mut pre_committed: Vec<&RegisteredSink> = Vec::new();
         for sink in &self.sinks {
             if sink.exactly_once {
-                sink.handle.pre_commit(epoch).await.map_err(|e| {
-                    DbError::Checkpoint(format!("sink '{}' pre-commit failed: {e}", sink.name))
-                })?;
-                debug!(sink = %sink.name, epoch, "sink pre-committed");
+                match sink.handle.pre_commit(epoch).await {
+                    Ok(()) => {
+                        pre_committed.push(sink);
+                        debug!(sink = %sink.name, epoch, "sink pre-committed");
+                    }
+                    Err(e) => {
+                        // Rollback all sinks that already pre-committed.
+                        for s in &pre_committed {
+                            s.handle.rollback_epoch(epoch).await;
+                            debug!(
+                                sink = %s.name, epoch,
+                                "rolled back pre-committed sink after peer failure"
+                            );
+                        }
+                        return Err(DbError::Checkpoint(format!(
+                            "sink '{}' pre-commit failed: {e}",
+                            sink.name
+                        )));
+                    }
+                }
             }
         }
         Ok(())

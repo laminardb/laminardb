@@ -788,6 +788,7 @@ impl LaminarDB {
             drain_budget_ns: 1_000_000,      // 1ms
             query_budget_ns: 8_000_000,      // 8ms
             background_budget_ns: 5_000_000, // 5ms
+            unaligned_checkpoint: None,
         };
 
         // Validate delivery guarantee constraints.
