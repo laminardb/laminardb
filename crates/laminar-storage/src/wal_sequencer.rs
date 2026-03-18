@@ -20,7 +20,7 @@
 //! N+1 arrives before segment N, it is held in a reorder buffer until N
 //! is applied first.
 
-use std::collections::BTreeMap;
+use std::collections::{btree_map::Entry, BTreeMap};
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::Arc;
 
@@ -135,8 +135,28 @@ impl SegmentReorderBuffer {
 
         if seq > self.next_expected {
             // Out of order — buffer it.
-            self.total_reordered += 1;
-            self.pending.insert(seq, segment);
+            match self.pending.entry(seq) {
+                Entry::Vacant(entry) => {
+                    self.total_reordered += 1;
+                    entry.insert(segment);
+                }
+                Entry::Occupied(entry) => {
+                    let existing = entry.get();
+                    if Self::is_tombstone(existing) {
+                        tracing::warn!(
+                            sequence_id = seq,
+                            next_expected = self.next_expected,
+                            "WAL sequencer: segment arrived after abort, skipping"
+                        );
+                    } else {
+                        tracing::warn!(
+                            sequence_id = seq,
+                            next_expected = self.next_expected,
+                            "WAL sequencer: duplicate buffered segment received, skipping"
+                        );
+                    }
+                }
+            }
             return Vec::new();
         }
 
@@ -153,6 +173,10 @@ impl SegmentReorderBuffer {
         }
 
         ready
+    }
+
+    fn is_tombstone(segment: &SequencedSegment) -> bool {
+        segment.entry_count == 0 && segment.writer_id == usize::MAX && segment.data.is_empty()
     }
 
     /// Get the next expected sequence ID.
@@ -214,7 +238,7 @@ impl SegmentReorderBuffer {
 
         let mut ready = Vec::new();
         while let Some(entry) = self.pending.remove(&self.next_expected) {
-            if entry.entry_count == 0 && entry.writer_id == usize::MAX {
+            if Self::is_tombstone(&entry) {
                 // Another tombstone — skip it too.
                 self.next_expected += 1;
                 continue;
@@ -358,6 +382,41 @@ mod tests {
         // Duplicate of 0 — should be skipped.
         let ready = buf.insert(make_segment(0, 0));
         assert!(ready.is_empty());
+    }
+
+    #[test]
+    fn test_reorder_buffer_duplicate_future_segment_keeps_original() {
+        let mut buf = SegmentReorderBuffer::new();
+
+        let mut first = make_segment(2, 0);
+        first.data = vec![1; 4];
+        let mut duplicate = make_segment(2, 1);
+        duplicate.data = vec![9; 4];
+
+        assert!(buf.insert(first).is_empty());
+        assert!(buf.insert(duplicate).is_empty());
+
+        let ready = buf.insert(make_segment(0, 0));
+        assert_eq!(ready.len(), 1);
+
+        let ready = buf.insert(make_segment(1, 0));
+        assert_eq!(ready.len(), 2);
+        assert_eq!(ready[1].sequence_id, 2);
+        assert_eq!(ready[1].data, vec![1; 4]);
+    }
+
+    #[test]
+    fn test_reorder_buffer_abort_gap_drains_buffered_segments() {
+        let mut buf = SegmentReorderBuffer::new();
+
+        let ready = buf.insert(make_segment(0, 0));
+        assert_eq!(ready.len(), 1);
+
+        assert!(buf.insert(make_segment(2, 0)).is_empty());
+        let ready = buf.abort_id(1);
+        assert_eq!(ready.len(), 1);
+        assert_eq!(ready[0].sequence_id, 2);
+        assert_eq!(buf.next_expected(), 3);
     }
 
     #[test]
