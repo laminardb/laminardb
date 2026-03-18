@@ -219,20 +219,26 @@ pub async fn run_server(
     let api_handle = http::serve(router, &bind).await?;
     info!("HTTP API listening on {bind}");
 
-    // 5. Spawn config file watcher
-    let watcher_handle = {
+    // 5. Spawn config file watcher (disabled via LAMINAR_DISABLE_FILE_WATCH=1)
+    let watcher_disabled =
+        std::env::var("LAMINAR_DISABLE_FILE_WATCH").map_or(false, |v| v == "1" || v == "true");
+    let watcher_handle = if watcher_disabled {
+        info!("Config file watcher disabled via LAMINAR_DISABLE_FILE_WATCH");
+        None
+    } else {
         let watcher_state = Arc::clone(&app_state);
         let watcher_path = config_path;
-        Some(tokio::spawn(async move {
+        let handle = tokio::spawn(async move {
             crate::watcher::watch_config(
                 watcher_path,
                 watcher_state,
                 std::time::Duration::from_millis(500),
             )
             .await;
-        }))
+        });
+        info!("Config file watcher started");
+        Some(handle)
     };
-    info!("Config file watcher started");
 
     Ok(ServerHandle::Embedded {
         db,
