@@ -89,6 +89,9 @@ pub struct KafkaSource {
     reader_shutdown: Option<tokio::sync::watch::Sender<bool>>,
     offset_commit_tx: Option<tokio::sync::watch::Sender<TopicPartitionList>>,
     watermark_tracker: Option<KafkaWatermarkTracker>,
+    /// Receiver for high watermark data from the background reader task.
+    /// Maps `(topic, partition)` to high watermark offsets for lag computation.
+    high_watermarks_rx: Option<tokio::sync::watch::Receiver<Vec<(Arc<str>, i32, i64)>>>,
 }
 
 impl KafkaSource {
@@ -140,6 +143,7 @@ impl KafkaSource {
             reader_shutdown: None,
             offset_commit_tx: None,
             watermark_tracker,
+            high_watermarks_rx: None,
         }
     }
 
@@ -202,6 +206,7 @@ impl KafkaSource {
             reader_shutdown: None,
             offset_commit_tx: None,
             watermark_tracker,
+            high_watermarks_rx: None,
         }
     }
 
@@ -268,6 +273,7 @@ impl KafkaSource {
         let (msg_tx, msg_rx) = tokio::sync::mpsc::channel(self.config.reader_channel_capacity);
         let (shutdown_tx, mut shutdown_rx) = tokio::sync::watch::channel(false);
         let (offset_tx, offset_rx) = tokio::sync::watch::channel(TopicPartitionList::new());
+        let (hwm_tx, hwm_rx) = tokio::sync::watch::channel(Vec::new());
         let data_ready = Arc::clone(&self.data_ready);
         let channel_len = Arc::clone(&self.channel_len);
         let capture_headers = self.config.include_headers;
@@ -277,6 +283,10 @@ impl KafkaSource {
         // offsets received via the offset_rx watch channel, then unsubscribes.
         let reader_handle = tokio::spawn(async move {
             let mut cached_topic: Arc<str> = Arc::from("");
+
+            // Track seen topic-partitions for high watermark queries.
+            let mut seen_partitions: std::collections::HashSet<(Arc<str>, i32)> =
+                std::collections::HashSet::new();
 
             // Periodic broker commit timer. Advisory — keeps kafka-consumer-groups
             // lag monitoring accurate. Zero interval disables periodic commits.
@@ -290,6 +300,10 @@ impl KafkaSource {
             });
             // Skip the first tick (fires immediately).
             commit_timer.tick().await;
+
+            // Periodic high watermark query timer (30s).
+            let mut hwm_timer = tokio::time::interval(std::time::Duration::from_secs(30));
+            hwm_timer.tick().await; // Skip the first tick.
 
             loop {
                 let msg_result = tokio::select! {
@@ -311,6 +325,33 @@ impl KafkaSource {
                         }
                         continue;
                     },
+                    _ = hwm_timer.tick() => {
+                        // Query high watermarks for seen partitions.
+                        let mut watermarks = Vec::with_capacity(seen_partitions.len());
+                        for (topic, partition) in &seen_partitions {
+                            match consumer.fetch_watermarks(
+                                topic,
+                                *partition,
+                                std::time::Duration::from_secs(5),
+                            ) {
+                                Ok((_low, high)) => {
+                                    watermarks.push((Arc::clone(topic), *partition, high));
+                                }
+                                Err(e) => {
+                                    debug!(
+                                        topic = %topic,
+                                        partition,
+                                        error = %e,
+                                        "failed to fetch watermarks"
+                                    );
+                                }
+                            }
+                        }
+                        if !watermarks.is_empty() {
+                            let _ = hwm_tx.send(watermarks);
+                        }
+                        continue;
+                    },
                     msg = consumer.recv() => msg,
                 };
                 match msg_result {
@@ -320,6 +361,8 @@ impl KafkaSource {
                             if &*cached_topic != topic {
                                 cached_topic = Arc::from(topic);
                             }
+                            // Track partition for watermark queries.
+                            seen_partitions.insert((Arc::clone(&cached_topic), msg.partition()));
                             let timestamp_ms = match msg.timestamp() {
                                 rdkafka::Timestamp::CreateTime(ts)
                                 | rdkafka::Timestamp::LogAppendTime(ts) => Some(ts),
@@ -390,6 +433,7 @@ impl KafkaSource {
         self.reader_handle = Some(reader_handle);
         self.reader_shutdown = Some(shutdown_tx);
         self.offset_commit_tx = Some(offset_tx);
+        self.high_watermarks_rx = Some(hwm_rx);
     }
 }
 
@@ -883,6 +927,14 @@ impl SourceConnector for KafkaSource {
         self.offsets.to_checkpoint_filtered(&assigned)
     }
 
+    /// Restores the consumer to checkpointed offsets.
+    ///
+    /// **Single-instance limitation**: This implementation assumes a single
+    /// consumer instance per `group.id`. Checkpoint offsets are stored in
+    /// LaminarDB's manifest and restored via `consumer.assign()`, bypassing
+    /// the Kafka consumer group protocol. Running multiple instances with
+    /// the same `group.id` will cause offset conflicts between the manifest
+    /// and broker-managed group offsets.
     async fn restore(&mut self, checkpoint: &SourceCheckpoint) -> Result<(), ConnectorError> {
         info!(
             epoch = checkpoint.epoch(),
@@ -923,6 +975,23 @@ impl SourceConnector for KafkaSource {
     }
 
     fn metrics(&self) -> ConnectorMetrics {
+        // Compute consumer lag from high watermarks and current offsets.
+        if let Some(ref hwm_rx) = self.high_watermarks_rx {
+            let watermarks = hwm_rx.borrow();
+            if !watermarks.is_empty() {
+                let mut total_lag: u64 = 0;
+                for (topic, partition, high_watermark) in watermarks.iter() {
+                    let current_offset = self.offsets.get(topic, *partition).unwrap_or(-1);
+                    // lag = high_watermark - (current_offset + 1), clamped to 0
+                    let lag = high_watermark.saturating_sub(current_offset + 1);
+                    #[allow(clippy::cast_sign_loss)]
+                    if lag > 0 {
+                        total_lag += lag as u64;
+                    }
+                }
+                self.metrics.set_lag(total_lag);
+            }
+        }
         self.metrics.to_connector_metrics()
     }
 

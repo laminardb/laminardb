@@ -480,6 +480,22 @@ impl StreamingCoordinator {
             }
         }
 
+        // Trigger final checkpoint before shutdown to minimize replay on restart.
+        // Sources are about to be shut down — we cannot inject barriers. The latest
+        // offsets from checkpoint_rx are consistent because after the loop exits, no
+        // more batches are being processed.
+        if self.config.checkpoint_interval.is_some() {
+            let mut source_offsets = FxHashMap::default();
+            for (idx, handle) in self.source_handles.iter().enumerate() {
+                if let Some(name) = self.source_names.get(idx) {
+                    source_offsets.insert(name.to_string(), handle.checkpoint_rx.borrow().clone());
+                }
+            }
+            if callback.maybe_checkpoint(true, source_offsets).await {
+                tracing::info!("final checkpoint completed before shutdown");
+            }
+        }
+
         // Shutdown: signal all source tasks and wait.
         for handle in &self.source_handles {
             handle.shutdown.notify_one();
@@ -639,6 +655,8 @@ mod tests {
         cycle_count: u32,
         results: Vec<FxHashMap<Arc<str>, Vec<RecordBatch>>>,
         watermark: i64,
+        /// Optional shared flag set when `maybe_checkpoint(force=true)` fires.
+        force_checkpoint_flag: Option<Arc<std::sync::atomic::AtomicBool>>,
     }
 
     impl MockCallback {
@@ -647,6 +665,7 @@ mod tests {
                 cycle_count: 0,
                 results: Vec::new(),
                 watermark: 0,
+                force_checkpoint_flag: None,
             }
         }
     }
@@ -689,10 +708,15 @@ mod tests {
 
         async fn maybe_checkpoint(
             &mut self,
-            _force: bool,
+            force: bool,
             _source_offsets: FxHashMap<String, SourceCheckpoint>,
         ) -> bool {
-            false
+            if force {
+                if let Some(ref flag) = self.force_checkpoint_flag {
+                    flag.store(true, std::sync::atomic::Ordering::SeqCst);
+                }
+            }
+            force
         }
 
         async fn checkpoint_with_barrier(
@@ -768,6 +792,70 @@ mod tests {
 
         // The callback was consumed by run(), so we can't inspect it directly.
         // But the test proves: no panics, no deadlocks, clean shutdown.
+    }
+
+    /// Test that a final checkpoint is triggered on shutdown when checkpointing
+    /// is enabled.
+    #[tokio::test]
+    async fn test_final_checkpoint_on_shutdown() {
+        let shutdown = Arc::new(tokio::sync::Notify::new());
+        let (tx, rx) = mpsc::channel(64);
+        let (_control_tx, control_rx) = mpsc::channel(64);
+
+        let coordinator = StreamingCoordinator {
+            config: PipelineConfig {
+                batch_window: Duration::ZERO,
+                max_poll_records: 1000,
+                channel_capacity: 64,
+                fallback_poll_interval: Duration::from_millis(10),
+                checkpoint_interval: Some(Duration::from_secs(60)),
+                delivery_guarantee: DeliveryGuarantee::AtLeastOnce,
+                barrier_alignment_timeout: BARRIER_TIMEOUT,
+                cycle_budget_ns: 10_000_000,
+                drain_budget_ns: 1_000_000,
+                query_budget_ns: 8_000_000,
+                background_budget_ns: 5_000_000,
+            },
+            rx,
+            source_handles: Vec::new(),
+            source_names: vec![Arc::from("test_source")],
+            shutdown: Arc::clone(&shutdown),
+            pending_barrier: PendingBarrier::new(),
+            next_checkpoint_id: 1,
+            last_checkpoint: Instant::now(),
+            checkpoint_request_flags: Vec::new(),
+            source_batches_buf: FxHashMap::default(),
+            post_barrier_buf: Vec::new(),
+            barrier_seen: FxHashSet::default(),
+            control_rx,
+        };
+
+        let force_flag = Arc::new(std::sync::atomic::AtomicBool::new(false));
+        let mut callback = MockCallback::new();
+        callback.force_checkpoint_flag = Some(Arc::clone(&force_flag));
+
+        let schema = Arc::new(Schema::new(vec![Field::new("x", DataType::Int64, false)]));
+        let batch =
+            RecordBatch::try_new(schema, vec![Arc::new(Int64Array::from(vec![1]))]).unwrap();
+        tx.send(SourceMsg::Batch {
+            source_idx: 0,
+            batch,
+        })
+        .await
+        .unwrap();
+
+        let shutdown_clone = Arc::clone(&shutdown);
+        tokio::spawn(async move {
+            tokio::time::sleep(Duration::from_millis(50)).await;
+            shutdown_clone.notify_one();
+        });
+
+        coordinator.run(callback).await;
+
+        assert!(
+            force_flag.load(std::sync::atomic::Ordering::SeqCst),
+            "final checkpoint with force=true should have been called"
+        );
     }
 
     /// Test that post-barrier batches are excluded from the current cycle's

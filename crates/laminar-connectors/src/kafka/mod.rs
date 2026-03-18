@@ -224,6 +224,22 @@ fn kafka_source_config_keys() -> Vec<ConfigKeySpec> {
             "Partition assignment (range/roundrobin/cooperative-sticky)",
             "range",
         ),
+        // Consumer group timing
+        ConfigKeySpec::optional(
+            "session.timeout.ms",
+            "Consumer session timeout in milliseconds (production-safe default)",
+            "45000",
+        ),
+        ConfigKeySpec::optional(
+            "heartbeat.interval.ms",
+            "Consumer heartbeat interval in milliseconds",
+            "10000",
+        ),
+        ConfigKeySpec::optional(
+            "queued.max.messages.kbytes",
+            "Max per-partition pre-fetch queue size in kbytes",
+            "16384",
+        ),
         // Fetch tuning
         ConfigKeySpec::optional("fetch.min.bytes", "Minimum bytes per fetch request", "1"),
         ConfigKeySpec::optional(

@@ -23,6 +23,8 @@ pub struct KafkaSourceMetrics {
     pub commits: AtomicU64,
     /// Total consumer group rebalances.
     pub rebalances: AtomicU64,
+    /// Consumer lag (sum across all partitions of high_watermark - current_offset).
+    pub lag: AtomicU64,
 }
 
 impl KafkaSourceMetrics {
@@ -36,6 +38,7 @@ impl KafkaSourceMetrics {
             batches_polled: AtomicU64::new(0),
             commits: AtomicU64::new(0),
             rebalances: AtomicU64::new(0),
+            lag: AtomicU64::new(0),
         }
     }
 
@@ -61,6 +64,11 @@ impl KafkaSourceMetrics {
         self.rebalances.fetch_add(1, Ordering::Relaxed);
     }
 
+    /// Updates the consumer lag value.
+    pub fn set_lag(&self, lag: u64) {
+        self.lag.store(lag, Ordering::Relaxed);
+    }
+
     /// Converts to the SDK's [`ConnectorMetrics`].
     #[must_use]
     #[allow(clippy::cast_precision_loss)]
@@ -69,7 +77,7 @@ impl KafkaSourceMetrics {
             records_total: self.records_polled.load(Ordering::Relaxed),
             bytes_total: self.bytes_polled.load(Ordering::Relaxed),
             errors_total: self.errors.load(Ordering::Relaxed),
-            lag: 0,
+            lag: self.lag.load(Ordering::Relaxed),
             custom: Vec::new(),
         };
         m.add_custom(
@@ -139,5 +147,43 @@ mod tests {
         let cm = m.to_connector_metrics();
         let rebalances = cm.custom.iter().find(|(k, _)| k == "kafka.rebalances");
         assert_eq!(rebalances.unwrap().1, 2.0);
+    }
+
+    #[test]
+    fn test_set_lag() {
+        let m = KafkaSourceMetrics::new();
+        assert_eq!(m.to_connector_metrics().lag, 0);
+
+        m.set_lag(42);
+        assert_eq!(m.to_connector_metrics().lag, 42);
+
+        m.set_lag(100);
+        assert_eq!(m.to_connector_metrics().lag, 100);
+    }
+
+    #[test]
+    fn test_lag_computation() {
+        // Simulates 3 partitions: high_watermark - (offset + 1) for each.
+        let partitions = vec![
+            (1000_i64, 900_i64), // lag = 1000 - (900 + 1) = 99
+            (500, 499),          // lag = 500 - (499 + 1) = 0
+            (2000, 1500),        // lag = 2000 - (1500 + 1) = 499
+        ];
+        let total_lag: u64 = partitions
+            .iter()
+            .map(|(hw, off)| {
+                let lag = hw - (off + 1);
+                if lag > 0 {
+                    lag as u64
+                } else {
+                    0
+                }
+            })
+            .sum();
+        assert_eq!(total_lag, 99 + 0 + 499);
+
+        let m = KafkaSourceMetrics::new();
+        m.set_lag(total_lag);
+        assert_eq!(m.to_connector_metrics().lag, 598);
     }
 }
