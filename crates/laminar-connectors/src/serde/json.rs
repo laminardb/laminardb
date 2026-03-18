@@ -159,8 +159,7 @@ impl RecordSerializer for JsonSerializer {
                 obj.insert(field.name().clone(), value);
             }
 
-            let json_bytes =
-                serde_json::to_vec(&obj).map_err(|e| SerdeError::Json(e.to_string()))?;
+            let json_bytes = sonic_rs::to_vec(&obj).map_err(|e| SerdeError::Json(e.to_string()))?;
             records.push(json_bytes);
         }
 
@@ -191,8 +190,7 @@ impl RecordSerializer for JsonSerializer {
             }
 
             row_buf.clear();
-            serde_json::to_writer(&mut row_buf, &obj)
-                .map_err(|e| SerdeError::Json(e.to_string()))?;
+            sonic_rs::to_writer(&mut row_buf, &obj).map_err(|e| SerdeError::Json(e.to_string()))?;
             buf.extend_from_slice(&row_buf);
             buf.push(b'\n');
         }

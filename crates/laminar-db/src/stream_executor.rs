@@ -2641,7 +2641,10 @@ impl StreamExecutor {
         }))
     }
 
-    /// Serialize a `StreamExecutorCheckpoint` to JSON bytes.
+    /// Serialize a `StreamExecutorCheckpoint` to postcard binary bytes.
+    ///
+    /// The output is prefixed with a one-byte format tag so that
+    /// `restore_state` can auto-detect the format on deserialization.
     ///
     /// This is a standalone function that does not require `&self`, so it
     /// can be offloaded to `spawn_blocking` to avoid blocking the
@@ -2649,9 +2652,15 @@ impl StreamExecutor {
     pub fn serialize_checkpoint(
         cp: &crate::aggregate_state::StreamExecutorCheckpoint,
     ) -> Result<Vec<u8>, DbError> {
-        serde_json::to_vec(&cp).map_err(|e| {
+        use crate::aggregate_state::CHECKPOINT_FORMAT_POSTCARD;
+
+        let payload = postcard::to_allocvec(cp).map_err(|e| {
             DbError::Pipeline(format!("stream executor checkpoint serialization: {e}"))
-        })
+        })?;
+        let mut result = Vec::with_capacity(1 + payload.len());
+        result.push(CHECKPOINT_FORMAT_POSTCARD);
+        result.extend_from_slice(&payload);
+        Ok(result)
     }
 
     /// Restore aggregate state from a previous checkpoint.
@@ -2664,11 +2673,31 @@ impl StreamExecutor {
     ///
     /// Returns an error if the checkpoint is corrupt.
     pub fn restore_state(&mut self, bytes: &[u8]) -> Result<usize, DbError> {
-        use crate::aggregate_state::StreamExecutorCheckpoint;
+        use crate::aggregate_state::{
+            StreamExecutorCheckpoint, CHECKPOINT_FORMAT_JSON, CHECKPOINT_FORMAT_POSTCARD,
+        };
 
-        let checkpoint: StreamExecutorCheckpoint = serde_json::from_slice(bytes).map_err(|e| {
-            DbError::Pipeline(format!("stream executor checkpoint deserialization: {e}"))
-        })?;
+        // Auto-detect checkpoint format
+        let checkpoint: StreamExecutorCheckpoint =
+            if bytes.first() == Some(&CHECKPOINT_FORMAT_POSTCARD) {
+                postcard::from_bytes(&bytes[1..]).map_err(|e| {
+                    DbError::Pipeline(format!("postcard checkpoint deserialization: {e}"))
+                })?
+            } else if bytes.first() == Some(&CHECKPOINT_FORMAT_JSON) {
+                serde_json::from_slice(&bytes[1..]).map_err(|e| {
+                    DbError::Pipeline(format!("tagged JSON checkpoint deserialization: {e}"))
+                })?
+            } else if bytes.first() == Some(&b'{') {
+                // Legacy untagged JSON
+                serde_json::from_slice(bytes).map_err(|e| {
+                    DbError::Pipeline(format!("legacy JSON checkpoint deserialization: {e}"))
+                })?
+            } else {
+                return Err(DbError::Pipeline(format!(
+                    "unknown checkpoint format tag: {:02x}",
+                    bytes.first().copied().unwrap_or(0)
+                )));
+            };
 
         let mut restored = 0usize;
 
@@ -5489,7 +5518,7 @@ mod tests {
         );
 
         // Serialize then restore into new executor
-        let cp_bytes = serde_json::to_vec(&cp).unwrap();
+        let cp_bytes = StreamExecutor::serialize_checkpoint(&cp).unwrap();
         let ctx2 = create_session_context();
         register_streaming_functions(&ctx2);
         let mut executor2 = StreamExecutor::new(ctx2);

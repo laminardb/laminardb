@@ -57,6 +57,8 @@ bumpalo = { workspace = true }
 # Serialization
 serde = { workspace = true }
 serde_json = { workspace = true }
+sonic-rs = { workspace = true }
+postcard = { workspace = true }
 
 # Error handling
 thiserror = { workspace = true }

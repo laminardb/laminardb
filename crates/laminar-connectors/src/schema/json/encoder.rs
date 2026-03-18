@@ -50,7 +50,7 @@ impl FormatEncoder for JsonEncoder {
                 obj.insert(field.name().clone(), value);
             }
 
-            let bytes = serde_json::to_vec(&serde_json::Value::Object(obj))
+            let bytes = sonic_rs::to_vec(&serde_json::Value::Object(obj))
                 .map_err(|e| SchemaError::DecodeError(format!("JSON encode error: {e}")))?;
             output.push(bytes);
         }
@@ -102,7 +102,7 @@ fn column_value_to_json(
         DataType::LargeBinary => {
             // Attempt to parse as JSON; fallback to opaque binary string.
             let bytes = col.as_binary::<i64>().value(row);
-            match serde_json::from_slice::<serde_json::Value>(bytes) {
+            match sonic_rs::from_slice::<serde_json::Value>(bytes) {
                 Ok(v) => v,
                 Err(_) => serde_json::Value::String(format!("<binary:{} bytes>", bytes.len())),
             }

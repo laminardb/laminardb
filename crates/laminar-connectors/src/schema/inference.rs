@@ -164,7 +164,7 @@ impl FormatInference for JsonFormatInference {
         let mut warnings = Vec::new();
 
         for (i, record) in samples.iter().enumerate() {
-            let value: serde_json::Value = serde_json::from_slice(&record.value).map_err(|e| {
+            let value: serde_json::Value = sonic_rs::from_slice(&record.value).map_err(|e| {
                 SchemaError::InferenceFailed(format!("JSON parse error in sample {i}: {e}"))
             })?;
 
