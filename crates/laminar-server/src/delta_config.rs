@@ -182,6 +182,7 @@ mod tests {
             lookups: vec![],
             pipelines: vec![],
             sinks: vec![],
+            alerts: vec![],
             discovery: None,
             coordination: None,
             node_id: None,

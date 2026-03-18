@@ -8,6 +8,7 @@
 
 #![allow(clippy::disallowed_types)] // cold path: server startup and config only
 
+mod alerting;
 mod config;
 mod delta;
 mod delta_config;
