@@ -332,14 +332,21 @@ SELECT t.symbol, t.price, q.bid, q.ask,
        t.price - q.bid AS spread
 FROM trades t
 ASOF JOIN quotes q
-    ON t.symbol = q.symbol AND t.ts &gt;= q.ts;
+    MATCH_CONDITION(t.ts &gt;= q.ts)
+    ON t.symbol = q.symbol;
 
--- Stream-stream join with time bounds
+-- Interval join: match orders to payments within 1 hour
 CREATE STREAM matched AS
-SELECT t.symbol, t.price, o.order_id
-FROM trades t
-INNER JOIN orders o ON t.symbol = o.symbol
-    AND o.ts BETWEEN t.ts - 10000 AND t.ts + 10000;</code></pre>
+SELECT o.order_id, o.amount, p.status
+FROM orders o
+INNER JOIN payments p ON o.order_id = p.order_id
+    AND p.ts BETWEEN o.ts AND o.ts + 3600000;
+
+-- Temporal join: point-in-time lookup
+SELECT o.*, r.rate
+FROM orders o
+JOIN rates FOR SYSTEM_TIME AS OF o.order_time AS r
+    ON o.currency = r.currency;</code></pre>
             </div>
 
             <div class="tab-panel" id="qs-server">
@@ -761,7 +768,7 @@ CREATE SINK lake INTO DELTA_LAKE (
             <ul>
               <li>Core engine (reactor, state stores, DAG executor)</li>
               <li>Window functions (tumbling, sliding, hopping, session)</li>
-              <li>Joins (stream-stream, ASOF, temporal, lookup)</li>
+              <li>Joins (interval, ASOF, temporal, lookup, semi/anti)</li>
               <li>All 8 connectors (Kafka, CDC, Delta, WS, files)</li>
               <li>Barrier-based checkpointing with 2PC exactly-once</li>
               <li>Per-core WAL for durability</li>

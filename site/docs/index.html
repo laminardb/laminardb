@@ -388,6 +388,12 @@
       <a href="#file-source">File Source</a>
       <a href="#file-sink">File Sink</a>
 
+      <h4>Joins</h4>
+      <a href="#join-interval">Interval Join</a>
+      <a href="#join-asof">ASOF Join</a>
+      <a href="#join-temporal">Temporal Join</a>
+      <a href="#join-lookup">Lookup Join</a>
+
       <h4>Advanced</h4>
       <a href="#env-vars">Environment Variables</a>
       <a href="#tiering">S3 Tiering</a>
@@ -1043,6 +1049,209 @@ max_out_of_orderness = "5s"</code></pre>
           <tr><td class="field-name">compression</td><td class="field-default">snappy</td><td>Parquet: snappy, gzip, brotli, lz4, zstd, uncompressed</td></tr>
         </tbody>
       </table>
+
+      <!-- ============================================================ -->
+      <!-- ADVANCED -->
+      <!-- ============================================================ -->
+
+      <!-- ============================================================ -->
+      <!-- JOINS -->
+      <!-- ============================================================ -->
+
+      <h2 id="joins" style="font-size: 1.5rem;">Join Semantics</h2>
+      <p>
+        LaminarDB supports four join types. All are stateful and operate on
+        streaming data. Join types are detected from SQL syntax automatically.
+      </p>
+
+      <table class="config-table">
+        <thead><tr><th>Join Type</th><th>Time Bound</th><th>Match</th><th>Use Case</th></tr></thead>
+        <tbody>
+          <tr>
+            <td class="field-name" style="color: var(--text);">Interval</td>
+            <td>Required</td>
+            <td>All pairs within window</td>
+            <td>Stream-stream correlation</td>
+          </tr>
+          <tr>
+            <td class="field-name" style="color: var(--text);">ASOF</td>
+            <td>Optional tolerance</td>
+            <td>One closest per key</td>
+            <td>Trade/quote enrichment</td>
+          </tr>
+          <tr>
+            <td class="field-name" style="color: var(--text);">Temporal</td>
+            <td>Implicit (version time)</td>
+            <td>Point-in-time lookup</td>
+            <td>Versioned dimension tables</td>
+          </tr>
+          <tr>
+            <td class="field-name" style="color: var(--text);">Lookup</td>
+            <td>None</td>
+            <td>Key equality</td>
+            <td>Static reference enrichment</td>
+          </tr>
+        </tbody>
+      </table>
+
+      <!-- INTERVAL JOIN -->
+      <h3 id="join-interval">Interval Join (Stream-Stream)</h3>
+      <div class="source-ref">Source: <a href="https://github.com/laminardb/laminardb/blob/main/crates/laminar-db/src/interval_join.rs" target="_blank" rel="noopener">interval_join.rs</a></div>
+
+      <p>
+        Matches all pairs of rows from two streams where timestamps fall within a
+        time bound: <code>|left_ts - right_ts| &lt;= time_bound</code>.
+        Both sides are buffered in state. Expired rows are evicted when the
+        watermark advances past the bound.
+      </p>
+
+      <p><strong>Supported types:</strong> INNER, LEFT, RIGHT, FULL, LEFT SEMI, LEFT ANTI, RIGHT SEMI, RIGHT ANTI</p>
+
+      <div class="toml-block">
+        <div class="toml-header">Interval join — match orders to payments within 1 hour</div>
+        <pre><code class="language-sql">CREATE STREAM matched AS
+SELECT o.order_id, o.amount, p.status
+FROM orders o
+INNER JOIN payments p
+    ON o.order_id = p.order_id
+    AND p.ts BETWEEN o.ts AND o.ts + 3600000;</code></pre>
+      </div>
+
+      <div class="toml-block">
+        <div class="toml-header">Semi join — orders that have at least one payment</div>
+        <pre><code class="language-sql">SELECT o.order_id, o.amount
+FROM orders o
+LEFT SEMI JOIN payments p
+    ON o.order_id = p.order_id
+    AND p.ts BETWEEN o.ts AND o.ts + 3600000;</code></pre>
+      </div>
+
+      <p style="font-size: 0.82rem;">
+        <strong>State:</strong> Both sides buffered as Arrow batches with per-key
+        <code>BTreeMap&lt;timestamp&gt;</code> indices. New left rows probe all right state;
+        new right rows probe only old left state (avoids double-emit).
+        Checkpointed via Arrow IPC serialization.
+      </p>
+
+      <!-- ASOF JOIN -->
+      <h3 id="join-asof">ASOF Join</h3>
+      <div class="source-ref">Source: <a href="https://github.com/laminardb/laminardb/blob/main/crates/laminar-db/src/asof_batch.rs" target="_blank" rel="noopener">asof_batch.rs</a>, <a href="https://github.com/laminardb/laminardb/blob/main/crates/laminar-sql/src/parser/join_parser.rs" target="_blank" rel="noopener">join_parser.rs</a></div>
+
+      <p>
+        For each left row, finds the <strong>one</strong> closest right row by timestamp
+        within the same key partition. Uses Snowflake-compatible <code>MATCH_CONDITION</code> syntax.
+      </p>
+
+      <p><strong>Supported types:</strong> INNER (default), LEFT</p>
+
+      <h4>Three directions</h4>
+      <table class="config-table">
+        <thead><tr><th>Direction</th><th>Syntax</th><th>Behavior</th></tr></thead>
+        <tbody>
+          <tr>
+            <td class="field-name">Backward</td>
+            <td><code>t.ts &gt;= q.ts</code></td>
+            <td>Most recent prior right event</td>
+          </tr>
+          <tr>
+            <td class="field-name">Forward</td>
+            <td><code>t.ts &lt;= q.ts</code></td>
+            <td>Next future right event</td>
+          </tr>
+          <tr>
+            <td class="field-name">Nearest</td>
+            <td><code>NEAREST(t.ts, q.ts)</code></td>
+            <td>Closest by absolute time difference</td>
+          </tr>
+        </tbody>
+      </table>
+
+      <div class="toml-block">
+        <div class="toml-header">ASOF backward — enrich trades with most recent quote</div>
+        <pre><code class="language-sql">SELECT t.symbol, t.price, q.bid, q.ask
+FROM trades t
+ASOF JOIN quotes q
+    MATCH_CONDITION(t.ts >= q.ts)
+    ON t.symbol = q.symbol;</code></pre>
+      </div>
+
+      <div class="toml-block">
+        <div class="toml-header">ASOF with tolerance — max 5 second gap</div>
+        <pre><code class="language-sql">SELECT t.symbol, t.price, q.bid, q.ask
+FROM trades t
+ASOF JOIN quotes q
+    MATCH_CONDITION(t.ts >= q.ts AND t.ts - q.ts <= INTERVAL '5' SECOND)
+    ON t.symbol = q.symbol;</code></pre>
+      </div>
+
+      <div class="toml-block">
+        <div class="toml-header">ASOF nearest — closest event by absolute time</div>
+        <pre><code class="language-sql">SELECT s.sensor_id, s.reading, c.calibration
+FROM sensor_data s
+ASOF JOIN calibrations c
+    MATCH_CONDITION(NEAREST(s.ts, c.ts))
+    ON s.sensor_id = c.sensor_id;</code></pre>
+      </div>
+
+      <p style="font-size: 0.82rem;">
+        <strong>State:</strong> Right-side events stored in per-key
+        <code>BTreeMap&lt;timestamp, row_index&gt;</code> for O(log n) temporal lookups.
+        Key columns support <code>VARCHAR</code> and <code>BIGINT</code> types.
+      </p>
+
+      <!-- TEMPORAL JOIN -->
+      <h3 id="join-temporal">Temporal Join (FOR SYSTEM_TIME AS OF)</h3>
+      <div class="source-ref">Source: <a href="https://github.com/laminardb/laminardb/blob/main/crates/laminar-db/src/stream_executor.rs" target="_blank" rel="noopener">stream_executor.rs</a></div>
+
+      <p>
+        Point-in-time lookup against a versioned table. For each stream event,
+        looks up the table row valid at the event's timestamp. Uses SQL:2011
+        <code>FOR SYSTEM_TIME AS OF</code> syntax.
+      </p>
+
+      <p><strong>Supported types:</strong> INNER, LEFT</p>
+
+      <div class="toml-block">
+        <div class="toml-header">Temporal join — currency rate valid at order time</div>
+        <pre><code class="language-sql">SELECT o.order_id, o.amount, r.rate,
+       o.amount * r.rate AS converted
+FROM orders o
+JOIN currency_rates FOR SYSTEM_TIME AS OF o.order_time AS r
+    ON o.currency = r.currency;</code></pre>
+      </div>
+
+      <p style="font-size: 0.82rem;">
+        <strong>Versioned tables:</strong> The right-side table must have a timestamp
+        column marking version validity. Event-time semantics are deterministic;
+        process-time (<code>PROCTIME()</code>) is non-deterministic.
+      </p>
+
+      <!-- LOOKUP JOIN -->
+      <h3 id="join-lookup">Lookup Join</h3>
+      <div class="source-ref">Source: <a href="https://github.com/laminardb/laminardb/blob/main/crates/laminar-sql/src/datafusion/lookup_join.rs" target="_blank" rel="noopener">lookup_join.rs</a></div>
+
+      <p>
+        Enriches stream events against a static or slowly-changing reference table.
+        No time bound &mdash; matches by key equality only. Results are cached with
+        configurable TTL.
+      </p>
+
+      <p><strong>Supported types:</strong> INNER, LEFT</p>
+
+      <div class="toml-block">
+        <div class="toml-header">Lookup join — enrich orders with product info</div>
+        <pre><code class="language-sql">SELECT o.order_id, o.amount, p.name, p.category
+FROM orders o
+LEFT JOIN products p
+    ON o.product_id = p.id;</code></pre>
+      </div>
+
+      <p style="font-size: 0.82rem;">
+        <strong>Cache:</strong> Foyer-backed memory/hybrid cache. Configure via
+        <code>[[lookup]]</code> section: <code>cache.size_bytes</code>,
+        <code>cache.ttl</code>, <code>cache.hybrid</code>.
+        Supports predicate pushdown to the lookup connector.
+      </p>
 
       <!-- ============================================================ -->
       <!-- ADVANCED -->
