@@ -360,8 +360,11 @@ impl SourceConnector for DeltaSource {
 
             let batches = if use_snapshot_fallback {
                 let b = delta_io::read_batches_at_version(
-                    table, self.known_latest_version, max_records,
-                ).await?;
+                    table,
+                    self.known_latest_version,
+                    max_records,
+                )
+                .await?;
                 // Jump current_version so we don't re-attempt missing versions.
                 self.current_version = self.known_latest_version;
                 b
@@ -371,15 +374,15 @@ impl SourceConnector for DeltaSource {
             {
                 // CDF mode: scan_cdf() consumes the DeltaTable. Take it,
                 // read CDF batches, then re-open the table handle.
-                let taken_table = self.table.take().ok_or_else(|| {
-                    ConnectorError::InvalidState {
-                        expected: "table initialized".into(),
-                        actual: "table not initialized".into(),
-                    }
-                })?;
+                let taken_table =
+                    self.table
+                        .take()
+                        .ok_or_else(|| ConnectorError::InvalidState {
+                            expected: "table initialized".into(),
+                            actual: "table not initialized".into(),
+                        })?;
                 let cdf_batches =
-                    delta_io::read_cdf_batches(taken_table, target_version, target_version)
-                        .await?;
+                    delta_io::read_cdf_batches(taken_table, target_version, target_version).await?;
 
                 // Re-open table since scan_cdf consumed it.
                 self.reopen_table().await?;

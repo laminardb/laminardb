@@ -568,9 +568,10 @@ pub async fn read_version_diff(
 
         // Check file size before downloading. Large files fall back to
         // DataFusion scan to avoid OOM on multi-GB Parquet files.
-        let file_meta = store.head(&obj_path).await.map_err(|e| {
-            ConnectorError::ReadError(format!("failed to stat '{file_path}': {e}"))
-        })?;
+        let file_meta = store
+            .head(&obj_path)
+            .await
+            .map_err(|e| ConnectorError::ReadError(format!("failed to stat '{file_path}': {e}")))?;
         if file_meta.size as u64 > MAX_DIRECT_READ_BYTES {
             warn!(
                 file_path,
@@ -785,21 +786,20 @@ pub async fn read_cdf_batches(
         .with_starting_version(start_version)
         .with_ending_version(end_version);
 
-    let plan = cdf_builder.build(&session_state, None).await.map_err(|e| {
-        ConnectorError::ReadError(format!("CDF scan build failed: {e}"))
-    })?;
+    let plan = cdf_builder
+        .build(&session_state, None)
+        .await
+        .map_err(|e| ConnectorError::ReadError(format!("CDF scan build failed: {e}")))?;
 
     // Execute the plan via DataFusion to get record batches.
     let task_ctx = ctx.task_ctx();
-    let mut stream = datafusion::physical_plan::execute_stream(plan, task_ctx).map_err(|e| {
-        ConnectorError::ReadError(format!("CDF stream execution failed: {e}"))
-    })?;
+    let mut stream = datafusion::physical_plan::execute_stream(plan, task_ctx)
+        .map_err(|e| ConnectorError::ReadError(format!("CDF stream execution failed: {e}")))?;
 
     let mut batches = Vec::new();
     while let Some(result) = stream.next().await {
-        let batch: RecordBatch = result.map_err(|e| {
-            ConnectorError::ReadError(format!("CDF stream batch failed: {e}"))
-        })?;
+        let batch: RecordBatch = result
+            .map_err(|e| ConnectorError::ReadError(format!("CDF stream batch failed: {e}")))?;
         if batch.num_rows() > 0 {
             batches.push(batch);
         }
@@ -831,7 +831,10 @@ pub fn map_cdf_to_changelog(batch: &RecordBatch) -> Result<Option<RecordBatch>, 
         return Ok(Some(batch.clone()));
     };
 
-    let change_type = batch.column(ct_idx).as_any().downcast_ref::<StringArray>()
+    let change_type = batch
+        .column(ct_idx)
+        .as_any()
+        .downcast_ref::<StringArray>()
         .ok_or_else(|| ConnectorError::ReadError("_change_type is not Utf8".into()))?;
 
     // Build filter (drop preimage rows) and mapped _op values in one pass.
@@ -866,7 +869,11 @@ pub fn map_cdf_to_changelog(batch: &RecordBatch) -> Result<Option<RecordBatch>, 
             columns.push(filtered.column(i).clone());
         }
     }
-    fields.push(Arc::new(arrow_schema::Field::new("_op", arrow_schema::DataType::Utf8, false)));
+    fields.push(Arc::new(arrow_schema::Field::new(
+        "_op",
+        arrow_schema::DataType::Utf8,
+        false,
+    )));
     columns.push(op_filtered);
 
     RecordBatch::try_new(Arc::new(arrow_schema::Schema::new(fields)), columns)
