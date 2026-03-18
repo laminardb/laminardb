@@ -67,7 +67,7 @@ arrow = { version = "57.2", default-features = true }
 arrow-array = "57.2"
 arrow-schema = "57.2"
 arrow-cast = "57.2"
-arrow-ipc = "57.2"
+arrow-ipc = "58.0"
 arrow-select = "57.2"
 datafusion = "52.3"
 datafusion-common = "52.0"
