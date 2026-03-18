@@ -480,30 +480,31 @@ impl StreamingCoordinator {
             }
         }
 
-        // Trigger final checkpoint before shutdown to minimize replay on restart.
-        // Sources are about to be shut down — we cannot inject barriers. The latest
-        // offsets from checkpoint_rx are consistent because after the loop exits, no
-        // more batches are being processed.
-        if self.config.checkpoint_interval.is_some() {
-            let mut source_offsets = FxHashMap::default();
-            for (idx, handle) in self.source_handles.iter().enumerate() {
+        // Shutdown: signal all source tasks to stop producing, then await
+        // completion so checkpoint_rx stops advancing before we read it.
+        for handle in &self.source_handles {
+            handle.shutdown.notify_one();
+        }
+
+        // Await each source task, then read its final (now-stable) checkpoint.
+        let checkpoint_enabled = self.config.checkpoint_interval.is_some();
+        let mut source_offsets = FxHashMap::default();
+        for (idx, handle) in std::mem::take(&mut self.source_handles)
+            .into_iter()
+            .enumerate()
+        {
+            if let Err(e) = handle.join.await {
+                tracing::warn!(source = %handle.name, error = ?e, "source task panicked");
+            }
+            if checkpoint_enabled {
                 if let Some(name) = self.source_names.get(idx) {
                     source_offsets.insert(name.to_string(), handle.checkpoint_rx.borrow().clone());
                 }
             }
-            if callback.maybe_checkpoint(true, source_offsets).await {
-                tracing::info!("final checkpoint completed before shutdown");
-            }
         }
 
-        // Shutdown: signal all source tasks and wait.
-        for handle in &self.source_handles {
-            handle.shutdown.notify_one();
-        }
-        for handle in self.source_handles {
-            if let Err(e) = handle.join.await {
-                tracing::warn!(source = %handle.name, error = ?e, "source task panicked");
-            }
+        if checkpoint_enabled && callback.maybe_checkpoint(true, source_offsets).await {
+            tracing::info!("final checkpoint completed before shutdown");
         }
     }
 

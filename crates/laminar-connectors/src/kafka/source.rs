@@ -90,7 +90,8 @@ pub struct KafkaSource {
     offset_commit_tx: Option<tokio::sync::watch::Sender<TopicPartitionList>>,
     watermark_tracker: Option<KafkaWatermarkTracker>,
     /// Receiver for high watermark data from the background reader task.
-    /// Maps `(topic, partition)` to high watermark offsets for lag computation.
+    /// Each entry is `(topic, partition, high_watermark)` for lag computation.
+    #[allow(clippy::type_complexity)]
     high_watermarks_rx: Option<tokio::sync::watch::Receiver<Vec<(Arc<str>, i32, i64)>>>,
 }
 
@@ -931,7 +932,7 @@ impl SourceConnector for KafkaSource {
     ///
     /// **Single-instance limitation**: This implementation assumes a single
     /// consumer instance per `group.id`. Checkpoint offsets are stored in
-    /// LaminarDB's manifest and restored via `consumer.assign()`, bypassing
+    /// `LaminarDB`'s manifest and restored via `consumer.assign()`, bypassing
     /// the Kafka consumer group protocol. Running multiple instances with
     /// the same `group.id` will cause offset conflicts between the manifest
     /// and broker-managed group offsets.

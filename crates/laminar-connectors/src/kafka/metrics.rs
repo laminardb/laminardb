@@ -23,7 +23,7 @@ pub struct KafkaSourceMetrics {
     pub commits: AtomicU64,
     /// Total consumer group rebalances.
     pub rebalances: AtomicU64,
-    /// Consumer lag (sum across all partitions of high_watermark - current_offset).
+    /// Consumer lag (sum across all partitions of `high_watermark - current_offset`).
     pub lag: AtomicU64,
 }
 
