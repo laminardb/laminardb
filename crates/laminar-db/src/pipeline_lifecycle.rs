@@ -8,7 +8,6 @@ use std::sync::Arc;
 
 use arrow_array::RecordBatch;
 use laminar_core::streaming;
-use rustc_hash::FxHashMap;
 
 use crate::db::{
     infer_timestamp_format, LaminarDB, SourceWatermarkState, STATE_RUNNING, STATE_SHUTTING_DOWN,
@@ -658,16 +657,17 @@ impl LaminarDB {
             }
         }
 
-        // Build per-source watermark tracking state (connector pipeline)
-        let source_names = self.catalog.list_sources();
-        let mut watermark_states: FxHashMap<String, SourceWatermarkState> =
-            FxHashMap::with_capacity_and_hasher(source_names.len(), rustc_hash::FxBuildHasher);
-        let mut source_entries_for_wm: FxHashMap<String, Arc<crate::catalog::SourceEntry>> =
-            FxHashMap::with_capacity_and_hasher(source_names.len(), rustc_hash::FxBuildHasher);
-        let mut source_ids: FxHashMap<String, usize> =
-            FxHashMap::with_capacity_and_hasher(source_names.len(), rustc_hash::FxBuildHasher);
-        for name in source_names {
-            if let Some(entry) = self.catalog.get_source(&name) {
+        // Build per-source watermark contexts indexed by source position
+        // (same order as `sources` Vec, which becomes `source_idx` in the
+        // coordinator). Each slot is `Some(WatermarkContext)` when the source
+        // has watermark configuration, `None` otherwise.
+        let mut watermark_contexts: Vec<Option<crate::pipeline_callback::WatermarkContext>> =
+            Vec::with_capacity(sources.len());
+        let mut tracker_count: usize = 0;
+        for src in &sources {
+            let name = &src.name;
+            let ctx = self.catalog.get_source(name).and_then(|entry| {
+                // First try SQL WATERMARK definition.
                 if let (Some(col), Some(dur)) =
                     (&entry.watermark_column, entry.max_out_of_orderness)
                 {
@@ -685,29 +685,21 @@ impl LaminarDB {
                             laminar_core::time::BoundedOutOfOrdernessGenerator::from_duration(dur),
                         )
                     };
-                    let id = source_ids.len();
-                    source_ids.insert(name.clone(), id);
-                    watermark_states.insert(
-                        name.clone(),
-                        SourceWatermarkState {
+                    let id = tracker_count;
+                    tracker_count += 1;
+                    return Some(crate::pipeline_callback::WatermarkContext {
+                        name: name.clone(),
+                        state: SourceWatermarkState {
                             extractor,
                             generator,
                             column: col.clone(),
                             format,
                         },
-                    );
+                        entry,
+                        tracker_id: id,
+                    });
                 }
-                source_entries_for_wm.insert(name, entry);
-            }
-        }
-
-        // Also create watermark state for sources that declared event_time_column
-        // programmatically (via source.set_event_time_column()) but have no SQL WATERMARK
-        for name in self.catalog.list_sources() {
-            if watermark_states.contains_key(&name) {
-                continue;
-            }
-            if let Some(entry) = self.catalog.get_source(&name) {
+                // Fallback: programmatic event_time_column (no SQL WATERMARK).
                 if let Some(col) = entry.source.event_time_column() {
                     let format = infer_timestamp_format(&entry.schema, &col);
                     let extractor =
@@ -725,25 +717,29 @@ impl LaminarDB {
                             ),
                         )
                     };
-                    let id = source_ids.len();
-                    source_ids.insert(name.clone(), id);
-                    watermark_states.insert(
-                        name.clone(),
-                        SourceWatermarkState {
+                    let id = tracker_count;
+                    tracker_count += 1;
+                    return Some(crate::pipeline_callback::WatermarkContext {
+                        name: name.clone(),
+                        state: SourceWatermarkState {
                             extractor,
                             generator,
                             column: col,
                             format,
                         },
-                    );
+                        entry,
+                        tracker_id: id,
+                    });
                 }
-            }
+                None
+            });
+            watermark_contexts.push(ctx);
         }
 
-        let tracker = if source_ids.is_empty() {
+        let tracker = if tracker_count == 0 {
             None
         } else {
-            Some(laminar_core::time::WatermarkTracker::new(source_ids.len()))
+            Some(laminar_core::time::WatermarkTracker::new(tracker_count))
         };
 
         let max_poll = self.config.default_buffer_size.min(1024);
@@ -759,7 +755,7 @@ impl LaminarDB {
             sinks = sinks.len(),
             streams = stream_regs.len(),
             subscriptions = stream_sources.len(),
-            watermark_sources = source_ids.len(),
+            watermark_sources = tracker_count,
             "Starting event-driven connector pipeline"
         );
 
@@ -872,9 +868,7 @@ impl LaminarDB {
             executor,
             stream_sources,
             sinks,
-            watermark_states,
-            source_entries_for_wm,
-            source_ids,
+            watermark_contexts,
             tracker,
             counters,
             pipeline_watermark,

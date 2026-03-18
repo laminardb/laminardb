@@ -531,12 +531,12 @@ impl StreamingCoordinator {
                 }
 
                 if let Some(name) = self.source_names.get(source_idx) {
-                    callback.extract_watermark(name, &batch);
+                    callback.extract_watermark(name, source_idx, &batch);
                     #[allow(clippy::cast_possible_truncation)]
                     {
                         *cycle_events += batch.num_rows() as u64;
                     }
-                    if let Some(filtered) = callback.filter_late_rows(name, &batch) {
+                    if let Some(filtered) = callback.filter_late_rows(name, source_idx, &batch) {
                         self.source_batches_buf
                             .entry(Arc::clone(name))
                             .or_default()
@@ -691,7 +691,12 @@ mod tests {
         fn push_to_streams(&self, _results: &FxHashMap<Arc<str>, Vec<RecordBatch>>) {}
         async fn write_to_sinks(&mut self, _results: &FxHashMap<Arc<str>, Vec<RecordBatch>>) {}
 
-        fn extract_watermark(&mut self, _source_name: &str, batch: &RecordBatch) {
+        fn extract_watermark(
+            &mut self,
+            _source_name: &str,
+            _source_idx: usize,
+            batch: &RecordBatch,
+        ) {
             // Use row count as a simple watermark proxy.
             #[allow(clippy::cast_possible_wrap)]
             {
@@ -699,7 +704,12 @@ mod tests {
             }
         }
 
-        fn filter_late_rows(&self, _source_name: &str, batch: &RecordBatch) -> Option<RecordBatch> {
+        fn filter_late_rows(
+            &self,
+            _source_name: &str,
+            _source_idx: usize,
+            batch: &RecordBatch,
+        ) -> Option<RecordBatch> {
             Some(batch.clone())
         }
 

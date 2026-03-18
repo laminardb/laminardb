@@ -21,6 +21,17 @@ use rustc_hash::FxHashMap;
 use crate::db::{filter_late_rows, SourceWatermarkState};
 use crate::error::DbError;
 
+/// Per-source watermark context consolidating state, catalog entry, and tracker id.
+///
+/// Replaces three separate `FxHashMap<String, _>` lookups with a single
+/// `Vec<Option<WatermarkContext>>` indexed by `source_idx`.
+pub(crate) struct WatermarkContext {
+    pub(crate) name: String,
+    pub(crate) state: SourceWatermarkState,
+    pub(crate) entry: Arc<crate::catalog::SourceEntry>,
+    pub(crate) tracker_id: usize,
+}
+
 /// Base prefix for the temporary table used by sink WHERE filters.
 const FILTER_INPUT_TABLE: &str = "__laminar_filter_input";
 
@@ -46,9 +57,9 @@ pub(crate) struct ConnectorPipelineCallback {
         Option<String>,
         String, // input stream name (FROM clause target)
     )>,
-    pub(crate) watermark_states: FxHashMap<String, SourceWatermarkState>,
-    pub(crate) source_entries_for_wm: FxHashMap<String, Arc<crate::catalog::SourceEntry>>,
-    pub(crate) source_ids: FxHashMap<String, usize>,
+    /// Per-source watermark context indexed by `source_idx` (from `SourceMsg`).
+    /// `None` for sources without watermark configuration.
+    pub(crate) watermark_contexts: Vec<Option<WatermarkContext>>,
     pub(crate) tracker: Option<laminar_core::time::WatermarkTracker>,
     pub(crate) counters: Arc<crate::metrics::PipelineCounters>,
     pub(crate) pipeline_watermark: Arc<std::sync::atomic::AtomicI64>,
@@ -249,39 +260,27 @@ impl crate::pipeline::PipelineCallback for ConnectorPipelineCallback {
         futures::future::join_all(sink_futures).await;
     }
 
-    fn extract_watermark(&mut self, source_name: &str, batch: &RecordBatch) {
-        if let Some(wm_state) = self.watermark_states.get_mut(source_name) {
+    fn extract_watermark(&mut self, _source_name: &str, source_idx: usize, batch: &RecordBatch) {
+        if let Some(Some(ctx)) = self.watermark_contexts.get_mut(source_idx) {
             // Check external watermarks from Source::watermark() calls.
-            if let Some(entry) = self.source_entries_for_wm.get(source_name) {
-                let external_wm = entry.source.current_watermark();
-                if let Some(wm) = wm_state.generator.advance_watermark(external_wm) {
-                    if let Some(ref mut trk) = self.tracker {
-                        if let Some(sid) = self.source_ids.get(source_name) {
-                            if let Some(global_wm) = trk.update_source(*sid, wm.timestamp()) {
-                                self.pipeline_watermark.store(
-                                    global_wm.timestamp(),
-                                    std::sync::atomic::Ordering::Relaxed,
-                                );
-                            }
-                        }
+            let external_wm = ctx.entry.source.current_watermark();
+            if let Some(wm) = ctx.state.generator.advance_watermark(external_wm) {
+                if let Some(ref mut trk) = self.tracker {
+                    if let Some(global_wm) = trk.update_source(ctx.tracker_id, wm.timestamp()) {
+                        self.pipeline_watermark
+                            .store(global_wm.timestamp(), std::sync::atomic::Ordering::Relaxed);
                     }
                 }
             }
 
             // Extract watermark from batch data.
-            if let Ok(max_ts) = wm_state.extractor.extract(batch) {
-                if let Some(wm) = wm_state.generator.on_event(max_ts) {
-                    if let Some(entry) = self.source_entries_for_wm.get(source_name) {
-                        entry.source.watermark(wm.timestamp());
-                    }
+            if let Ok(max_ts) = ctx.state.extractor.extract(batch) {
+                if let Some(wm) = ctx.state.generator.on_event(max_ts) {
+                    ctx.entry.source.watermark(wm.timestamp());
                     if let Some(ref mut trk) = self.tracker {
-                        if let Some(sid) = self.source_ids.get(source_name) {
-                            if let Some(global_wm) = trk.update_source(*sid, wm.timestamp()) {
-                                self.pipeline_watermark.store(
-                                    global_wm.timestamp(),
-                                    std::sync::atomic::Ordering::Relaxed,
-                                );
-                            }
+                        if let Some(global_wm) = trk.update_source(ctx.tracker_id, wm.timestamp()) {
+                            self.pipeline_watermark
+                                .store(global_wm.timestamp(), std::sync::atomic::Ordering::Relaxed);
                         }
                     }
                 }
@@ -299,11 +298,16 @@ impl crate::pipeline::PipelineCallback for ConnectorPipelineCallback {
             .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
     }
 
-    fn filter_late_rows(&self, source_name: &str, batch: &RecordBatch) -> Option<RecordBatch> {
-        if let Some(wm_state) = self.watermark_states.get(source_name) {
-            let current_wm = wm_state.generator.current_watermark();
+    fn filter_late_rows(
+        &self,
+        _source_name: &str,
+        source_idx: usize,
+        batch: &RecordBatch,
+    ) -> Option<RecordBatch> {
+        if let Some(Some(ctx)) = self.watermark_contexts.get(source_idx) {
+            let current_wm = ctx.state.generator.current_watermark();
             if current_wm > i64::MIN {
-                return filter_late_rows(batch, &wm_state.column, current_wm, wm_state.format);
+                return filter_late_rows(batch, &ctx.state.column, current_wm, ctx.state.format);
             }
         }
         // No watermark configured → pass through all rows.
@@ -384,12 +388,12 @@ impl crate::pipeline::PipelineCallback for ConnectorPipelineCallback {
             }
         };
 
-        // Collect per-source watermarks from the watermark tracker.
-        let mut per_source_watermarks = HashMap::with_capacity(self.watermark_states.len());
-        for (name, wm_state) in &self.watermark_states {
-            let wm = wm_state.generator.current_watermark();
+        // Collect per-source watermarks from the watermark contexts.
+        let mut per_source_watermarks = HashMap::with_capacity(self.watermark_contexts.len());
+        for ctx in self.watermark_contexts.iter().flatten() {
+            let wm = ctx.state.generator.current_watermark();
             if wm > i64::MIN {
-                per_source_watermarks.insert(name.clone(), wm);
+                per_source_watermarks.insert(ctx.name.clone(), wm);
             }
         }
 
@@ -504,11 +508,11 @@ impl crate::pipeline::PipelineCallback for ConnectorPipelineCallback {
         };
 
         // Collect per-source watermarks.
-        let mut per_source_watermarks = HashMap::with_capacity(self.watermark_states.len());
-        for (name, wm_state) in &self.watermark_states {
-            let wm = wm_state.generator.current_watermark();
+        let mut per_source_watermarks = HashMap::with_capacity(self.watermark_contexts.len());
+        for ctx in self.watermark_contexts.iter().flatten() {
+            let wm = ctx.state.generator.current_watermark();
             if wm > i64::MIN {
-                per_source_watermarks.insert(name.clone(), wm);
+                per_source_watermarks.insert(ctx.name.clone(), wm);
             }
         }
 

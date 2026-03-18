@@ -51,10 +51,15 @@ pub trait PipelineCallback: Send + 'static {
     async fn write_to_sinks(&mut self, results: &FxHashMap<Arc<str>, Vec<RecordBatch>>);
 
     /// Extract watermark from a batch for a given source.
-    fn extract_watermark(&mut self, source_name: &str, batch: &RecordBatch);
+    fn extract_watermark(&mut self, source_name: &str, source_idx: usize, batch: &RecordBatch);
 
     /// Filter late rows from a batch. Returns the filtered batch (or None if all late).
-    fn filter_late_rows(&self, source_name: &str, batch: &RecordBatch) -> Option<RecordBatch>;
+    fn filter_late_rows(
+        &self,
+        source_name: &str,
+        source_idx: usize,
+        batch: &RecordBatch,
+    ) -> Option<RecordBatch>;
 
     /// Get the current pipeline watermark.
     fn current_watermark(&self) -> i64;
