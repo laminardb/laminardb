@@ -869,12 +869,15 @@ impl IncrementalAggState {
             .map_err(|e| DbError::Pipeline(format!("row converter init: {e}")))?;
 
         // Build a sentinel OwnedRow for global aggregates (empty key).
-        let empty_converter = arrow::row::RowConverter::new(vec![])
-            .map_err(|e| DbError::Pipeline(format!("empty row converter: {e}")))?;
-        let empty_rows = empty_converter
-            .convert_columns(&[])
-            .map_err(|e| DbError::Pipeline(format!("empty row convert: {e}")))?;
-        let empty_row_sentinel = empty_rows.row(0).owned();
+        // Use a single boolean column with one row as a stable sentinel value.
+        let sentinel_converter =
+            arrow::row::RowConverter::new(vec![arrow::row::SortField::new(DataType::Boolean)])
+                .map_err(|e| DbError::Pipeline(format!("sentinel row converter: {e}")))?;
+        let sentinel_col: ArrayRef = Arc::new(arrow::array::BooleanArray::from(vec![true]));
+        let sentinel_rows = sentinel_converter
+            .convert_columns(&[sentinel_col])
+            .map_err(|e| DbError::Pipeline(format!("sentinel row convert: {e}")))?;
+        let empty_row_sentinel = sentinel_rows.row(0).owned();
 
         Ok(Some(Self {
             pre_agg_sql,
@@ -1175,9 +1178,15 @@ impl IncrementalAggState {
         let mut groups = Vec::with_capacity(self.groups.len());
         for (row_key, accs) in &mut self.groups {
             // Cold path: convert OwnedRow back to Vec<ScalarValue> for JSON.
-            let sv_key =
-                row_to_scalar_key_with_types(&self.row_converter, row_key, &self.group_types)?;
-            let key_json: Vec<serde_json::Value> = sv_key.iter().map(scalar_to_json).collect();
+            // For global aggregates (no GROUP BY), the key is the sentinel —
+            // emit an empty JSON array to match the original checkpoint format.
+            let key_json: Vec<serde_json::Value> = if self.num_group_cols == 0 {
+                Vec::new()
+            } else {
+                let sv_key =
+                    row_to_scalar_key_with_types(&self.row_converter, row_key, &self.group_types)?;
+                sv_key.iter().map(scalar_to_json).collect()
+            };
             let mut acc_states = Vec::with_capacity(accs.len());
             for acc in accs {
                 let state = acc
