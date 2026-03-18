@@ -988,6 +988,13 @@ impl IncrementalAggState {
         if sv_key.is_empty() {
             return Ok(self.empty_row_sentinel.clone());
         }
+        if sv_key.len() != self.group_types.len() {
+            return Err(DbError::Pipeline(format!(
+                "group key width mismatch in checkpoint: expected {}, got {}",
+                self.group_types.len(),
+                sv_key.len()
+            )));
+        }
         let arrays: Vec<ArrayRef> = sv_key
             .iter()
             .enumerate()

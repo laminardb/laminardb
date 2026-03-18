@@ -765,7 +765,11 @@ fn append_value(
                 b.append_value(&bytes);
             } else {
                 // Fallback: serialize as JSON bytes.
-                let bytes = sonic_rs::to_vec(value).unwrap_or_default();
+                let bytes = sonic_rs::to_vec(value).map_err(|e| {
+                    SchemaError::DecodeError(format!(
+                        "LargeBinary JSON fallback serialization failed: {e}"
+                    ))
+                })?;
                 b.append_value(&bytes);
             }
         }
