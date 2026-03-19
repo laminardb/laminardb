@@ -503,9 +503,7 @@ fn find_match_keyed(
                 let b_exceeds = back_iter
                     .peek()
                     .is_none_or(|(&ts, _)| !within_tolerance(ts));
-                let f_exceeds = fwd_iter
-                    .peek()
-                    .is_none_or(|(&ts, _)| !within_tolerance(ts));
+                let f_exceeds = fwd_iter.peek().is_none_or(|(&ts, _)| !within_tolerance(ts));
                 if b_exceeds && f_exceeds {
                     return None;
                 }
