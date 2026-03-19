@@ -71,7 +71,8 @@ pub fn build_router(state: Arc<AppState>) -> Router {
         .route("/api/v1/config", get(get_config).put(update_config))
         .route("/api/v1/config/validate", post(validate_config_endpoint))
         .route("/api/v1/pause", post(not_implemented))
-        .route("/api/v1/resume", post(not_implemented));
+        .route("/api/v1/resume", post(not_implemented))
+        .layer(CorsLayer::new()); // restrictive: no allow_origin = deny cross-origin
 
     // Read-only/public routes: permissive CORS for dashboards and monitoring.
     let public_routes = Router::new()
