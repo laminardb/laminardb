@@ -102,7 +102,7 @@ delta-lake-glue = ["delta-lake", "delta-lake-s3", "deltalake/glue", "dep:deltala
 # Parquet file lookup source
 parquet-lookup = ["dep:parquet", "dep:object_store"]
 # Redis lookup source
-redis-lookup = ["dep:redis"]
+redis-lookup = ["dep:redis", "dep:url"]
 # Kafka-based discovery for delta
 kafka-discovery = ["kafka", "laminar-core/delta", "dep:tokio-util"]
 # WebSocket source and sink

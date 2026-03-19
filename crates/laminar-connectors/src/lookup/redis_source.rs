@@ -72,7 +72,7 @@ impl RedisValueType {
 }
 
 /// Configuration for [`RedisLookupSource`].
-#[derive(Debug, Clone)]
+#[derive(Clone)]
 pub struct RedisLookupSourceConfig {
     /// Redis connection URL (e.g., `redis://127.0.0.1:6379/0`).
     pub url: String,
@@ -96,6 +96,30 @@ pub struct RedisLookupSourceConfig {
 
     /// Database number (default: 0).
     pub db: u16,
+}
+
+impl fmt::Debug for RedisLookupSourceConfig {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        // Redact password from URL to prevent credential leaks in logs.
+        let redacted_url = match url::Url::parse(&self.url) {
+            Ok(mut parsed) => {
+                if parsed.password().is_some() {
+                    let _ = parsed.set_password(Some("***"));
+                }
+                parsed.to_string()
+            }
+            Err(_) => "***".to_string(),
+        };
+        f.debug_struct("RedisLookupSourceConfig")
+            .field("url", &redacted_url)
+            .field("key_pattern", &self.key_pattern)
+            .field("key_column", &self.key_column)
+            .field("value_type", &self.value_type)
+            .field("scan_count", &self.scan_count)
+            .field("max_batch_size", &self.max_batch_size)
+            .field("db", &self.db)
+            .finish()
+    }
 }
 
 impl Default for RedisLookupSourceConfig {
@@ -245,6 +269,17 @@ impl RedisLookupSource {
             .await
             .map_err(|e| LookupError::Connection(format!("redis connect: {e}")))?;
 
+        // SELECT the configured database if non-zero.
+        if config.db != 0 {
+            redis::cmd("SELECT")
+                .arg(config.db)
+                .query_async::<()>(&mut con)
+                .await
+                .map_err(|e| {
+                    LookupError::Connection(format!("SELECT db {} failed: {e}", config.db))
+                })?;
+        }
+
         let mut data = HashMap::new();
         let mut row_count = 0u64;
 
@@ -278,7 +313,31 @@ impl RedisLookupSource {
                             .map_err(|e| LookupError::Query(format!("GET {key} failed: {e}")))?;
 
                         match val {
-                            Some(json_str) => serde_json::from_str(&json_str).unwrap_or_default(),
+                            Some(json_str) => {
+                                match serde_json::from_str::<HashMap<String, serde_json::Value>>(
+                                    &json_str,
+                                ) {
+                                    Ok(json_map) => json_map
+                                        .into_iter()
+                                        .filter_map(|(k, v)| {
+                                            let s = match v {
+                                                serde_json::Value::String(s) => s,
+                                                serde_json::Value::Null => return None,
+                                                other => other.to_string(),
+                                            };
+                                            Some((k, s))
+                                        })
+                                        .collect(),
+                                    Err(e) => {
+                                        tracing::warn!(
+                                            key = %key,
+                                            error = %e,
+                                            "Failed to parse Redis JSON value, skipping key"
+                                        );
+                                        continue;
+                                    }
+                                }
+                            }
                             None => HashMap::new(),
                         }
                     }
@@ -579,7 +638,41 @@ mod tests {
     }
 
     #[test]
-    fn test_debug_impl() {
+    fn test_debug_impl_redacts_password() {
+        let config = RedisLookupSourceConfig {
+            url: "redis://admin:s3cret@myhost:6379/0".into(),
+            key_pattern: "user:*".into(),
+            key_column: "user_id".into(),
+            ..Default::default()
+        };
+        let debug = format!("{config:?}");
+        assert!(debug.contains("RedisLookupSourceConfig"));
+        assert!(debug.contains("user:*"));
+        // Password must be redacted
+        assert!(
+            !debug.contains("s3cret"),
+            "password must be redacted in Debug output"
+        );
+        assert!(
+            debug.contains("***"),
+            "redacted placeholder must appear in Debug output"
+        );
+    }
+
+    #[test]
+    fn test_debug_impl_no_password_unchanged() {
+        let config = RedisLookupSourceConfig {
+            url: "redis://myhost:6379".into(),
+            key_pattern: "key:*".into(),
+            key_column: "id".into(),
+            ..Default::default()
+        };
+        let debug = format!("{config:?}");
+        assert!(debug.contains("myhost:6379"));
+    }
+
+    #[test]
+    fn test_debug_impl_source() {
         let schema = test_schema();
         let config = RedisLookupSourceConfig {
             url: "redis://localhost".into(),
@@ -591,5 +684,101 @@ mod tests {
         let debug = format!("{source:?}");
         assert!(debug.contains("RedisLookupSource"));
         assert!(debug.contains("user:*"));
+    }
+
+    /// Test JSON value type parsing path: numbers, booleans, nested objects
+    /// are converted to their string representation for Arrow columns.
+    #[test]
+    fn test_fields_to_record_batch_json_value_types() {
+        use arrow_array::{BooleanArray, Float64Array};
+
+        let schema = Arc::new(Schema::new(vec![
+            Field::new("id", DataType::Utf8, false),
+            Field::new("count", DataType::Int64, true),
+            Field::new("rate", DataType::Float64, true),
+            Field::new("active", DataType::Boolean, true),
+            Field::new("meta", DataType::Utf8, true),
+        ]));
+
+        // Simulate what the JSON parsing path produces: numbers and booleans
+        // are converted to string via serde_json::Value::to_string(), nested
+        // objects become their JSON representation.
+        let mut fields = HashMap::new();
+        fields.insert("count".to_string(), "42".to_string());
+        fields.insert("rate".to_string(), "3.14".to_string());
+        fields.insert("active".to_string(), "true".to_string());
+        // Nested object comes through as its JSON string
+        fields.insert("meta".to_string(), r#"{"nested":"value"}"#.to_string());
+
+        let batch = fields_to_record_batch(&schema, "id", "k1", &fields).unwrap();
+        assert_eq!(batch.num_rows(), 1);
+        assert_eq!(batch.num_columns(), 5);
+
+        // Verify key column
+        let id_col = batch
+            .column(0)
+            .as_any()
+            .downcast_ref::<StringArray>()
+            .unwrap();
+        assert_eq!(id_col.value(0), "k1");
+
+        // Verify integer parsing
+        let count_col = batch
+            .column(1)
+            .as_any()
+            .downcast_ref::<Int64Array>()
+            .unwrap();
+        assert_eq!(count_col.value(0), 42);
+        assert!(!count_col.is_null(0));
+
+        // Verify float parsing
+        let rate_col = batch
+            .column(2)
+            .as_any()
+            .downcast_ref::<Float64Array>()
+            .unwrap();
+        assert!((rate_col.value(0) - 3.14).abs() < f64::EPSILON);
+        assert!(!rate_col.is_null(0));
+
+        // Verify boolean parsing
+        let active_col = batch
+            .column(3)
+            .as_any()
+            .downcast_ref::<BooleanArray>()
+            .unwrap();
+        assert_eq!(active_col.value(0), true);
+        assert!(!active_col.is_null(0));
+
+        // Verify nested object stored as string
+        let meta_col = batch
+            .column(4)
+            .as_any()
+            .downcast_ref::<StringArray>()
+            .unwrap();
+        assert_eq!(meta_col.value(0), r#"{"nested":"value"}"#);
+        assert!(!meta_col.is_null(0));
+    }
+
+    /// Test that unparseable numeric values become null.
+    #[test]
+    fn test_fields_to_record_batch_unparseable_number() {
+        let schema = Arc::new(Schema::new(vec![
+            Field::new("id", DataType::Utf8, false),
+            Field::new("score", DataType::Int64, true),
+        ]));
+
+        let mut fields = HashMap::new();
+        fields.insert("score".to_string(), "not_a_number".to_string());
+
+        let batch = fields_to_record_batch(&schema, "id", "k1", &fields).unwrap();
+        let score_col = batch
+            .column(1)
+            .as_any()
+            .downcast_ref::<Int64Array>()
+            .unwrap();
+        assert!(
+            score_col.is_null(0),
+            "unparseable number should produce null"
+        );
     }
 }
