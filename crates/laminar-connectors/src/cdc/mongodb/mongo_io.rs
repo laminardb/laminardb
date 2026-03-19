@@ -176,25 +176,12 @@ pub fn decode_change_event(
         .as_ref()
         .map(|doc| serde_json::to_string(doc).unwrap_or_default());
 
-    // Extract update description (include truncatedArrays when present)
-    let update_description = event.update_description.as_ref().map(|ud| {
-        let mut obj = serde_json::Map::new();
-        obj.insert(
-            "updatedFields".to_string(),
-            serde_json::to_value(&ud.updated_fields).unwrap_or_default(),
-        );
-        obj.insert(
-            "removedFields".to_string(),
-            serde_json::to_value(&ud.removed_fields).unwrap_or_default(),
-        );
-        if let Some(ref truncated) = ud.truncated_arrays {
-            obj.insert(
-                "truncatedArrays".to_string(),
-                serde_json::to_value(truncated).unwrap_or_default(),
-            );
-        }
-        serde_json::to_string(&obj).unwrap_or_default()
-    });
+    // Serialize the full UpdateDescription (includes updatedFields,
+    // removedFields, truncatedArrays, and disambiguatedPaths).
+    let update_description = event
+        .update_description
+        .as_ref()
+        .map(|ud| serde_json::to_string(ud).unwrap_or_default());
 
     // Extract resume token as JSON for checkpointing
     let resume_token = serde_json::to_string(&event.id).unwrap_or_default();

@@ -209,7 +209,7 @@ pub enum FullDocumentMode {
 }
 
 str_enum!(FullDocumentMode, lowercase_nodash, String, "unknown full document mode",
-    Off => "off", "default";
+    Off => "off";
     UpdateLookup => "updatelookup", "update_lookup", "update-lookup";
     WhenAvailable => "whenavailable", "when_available", "when-available";
     Required => "required"

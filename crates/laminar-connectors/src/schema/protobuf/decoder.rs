@@ -55,7 +55,7 @@ struct ResolvedField {
     /// Protobuf wire type.
     proto_type: Type,
     /// Whether the field is repeated (reserved for future array support).
-    _is_repeated: bool,
+    is_repeated: bool,
 }
 
 /// Decodes binary protobuf messages into Arrow `RecordBatch`es.
@@ -143,7 +143,7 @@ impl ProtobufDecoder {
                 field_number,
                 column_index: idx,
                 proto_type,
-                _is_repeated: false,
+                is_repeated: false,
             })
             .collect();
 
@@ -185,6 +185,11 @@ impl FormatDecoder for ProtobufDecoder {
             for (field_number, wire_value) in &parsed {
                 if let Some(resolved) = self.fields.iter().find(|f| f.field_number == *field_number)
                 {
+                    if resolved.is_repeated && columns[resolved.column_index][row_idx].is_some() {
+                        return Err(SchemaError::DecodeError(
+                            "protobuf: repeated fields are not yet supported".into(),
+                        ));
+                    }
                     let typed = coerce_wire_value(wire_value, resolved.proto_type)?;
                     columns[resolved.column_index][row_idx] = Some(typed);
                 }
@@ -286,7 +291,7 @@ fn build_schema_and_fields(
             field_number,
             column_index: arrow_fields.len() - 1,
             proto_type,
-            _is_repeated: is_repeated,
+            is_repeated,
         });
     }
 
