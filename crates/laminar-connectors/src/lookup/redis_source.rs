@@ -352,8 +352,9 @@ impl RedisLookupSource {
                 let batch =
                     fields_to_record_batch(&schema, &config.key_column, &key_suffix, &fields_map)?;
 
-                data.insert(key_suffix.as_bytes().to_vec(), batch);
-                row_count += 1;
+                if data.insert(key_suffix.as_bytes().to_vec(), batch).is_none() {
+                    row_count += 1;
+                }
             }
 
             cursor = next_cursor;
@@ -440,6 +441,18 @@ impl LookupSource for RedisLookupSource {
             .get_multiplexed_async_connection()
             .await
             .map_err(|e| LookupError::Connection(format!("health check connect: {e}")))?;
+        if self.config.db != 0 {
+            redis::cmd("SELECT")
+                .arg(self.config.db)
+                .query_async::<()>(&mut con)
+                .await
+                .map_err(|e| {
+                    LookupError::Connection(format!(
+                        "health check SELECT db {} failed: {e}",
+                        self.config.db
+                    ))
+                })?;
+        }
         redis::cmd("PING")
             .query_async::<String>(&mut con)
             .await
