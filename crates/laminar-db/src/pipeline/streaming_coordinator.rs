@@ -27,7 +27,9 @@ use arrow_array::RecordBatch;
 use laminar_connectors::checkpoint::SourceCheckpoint;
 use laminar_connectors::connector::DeliveryGuarantee;
 use laminar_core::alloc::{PriorityClass, PriorityGuard};
-use laminar_core::checkpoint::{CheckpointBarrier, CheckpointBarrierInjector};
+use laminar_core::checkpoint::{
+    CheckpointBarrier, CheckpointBarrierInjector, TrackerEvent, UnalignedBarrierTracker,
+};
 use rustc_hash::{FxHashMap, FxHashSet};
 use tokio::sync::mpsc;
 
@@ -93,6 +95,8 @@ pub struct StreamingCoordinator {
     barrier_seen: FxHashSet<usize>,
     /// Control channel for live DDL (add/drop stream) from `LaminarDB`.
     control_rx: mpsc::Receiver<super::ControlMsg>,
+    /// Unaligned checkpoint barrier tracker (when configured).
+    unaligned_tracker: Option<UnalignedBarrierTracker>,
 }
 
 /// Tracks in-flight checkpoint barrier alignment.
@@ -296,6 +300,12 @@ impl StreamingCoordinator {
             source_names.push(arc_name);
         }
 
+        let unaligned_tracker = config
+            .unaligned_checkpoint
+            .as_ref()
+            .filter(|c| c.enabled)
+            .map(|c| UnalignedBarrierTracker::new(c.clone()));
+
         Ok(Self {
             config,
             rx,
@@ -310,6 +320,7 @@ impl StreamingCoordinator {
             post_barrier_buf: Vec::new(),
             barrier_seen: FxHashSet::default(),
             control_rx,
+            unaligned_tracker,
         })
     }
 
@@ -468,7 +479,10 @@ impl StreamingCoordinator {
                 callback.apply_control(msg);
             }
 
-            // Step: Barrier timeout check.
+            // Step: Check unaligned checkpoint timeout (may switch to unaligned mode).
+            self.check_unaligned_timeout(&mut callback).await;
+
+            // Step: Barrier timeout check (hard cancel).
             if self.pending_barrier.active
                 && self.pending_barrier.started_at.elapsed() > BARRIER_TIMEOUT
             {
@@ -477,6 +491,9 @@ impl StreamingCoordinator {
                     "Barrier alignment timeout — cancelling checkpoint"
                 );
                 self.pending_barrier.active = false;
+                if let Some(ref mut tracker) = self.unaligned_tracker {
+                    tracker.cancel();
+                }
             }
         }
 
@@ -580,23 +597,78 @@ impl StreamingCoordinator {
 
         self.pending_barrier.sources_aligned.insert(source_idx);
 
-        // Check if all sources aligned.
-        if self.pending_barrier.sources_aligned.len() >= self.pending_barrier.sources_total {
-            let checkpoints = std::mem::take(&mut self.pending_barrier.source_checkpoints);
-            let ok = callback.checkpoint_with_barrier(checkpoints).await;
-            if ok {
-                self.pending_barrier.active = false;
-                self.last_checkpoint = Instant::now();
-            } else {
-                tracing::warn!(
-                    checkpoint_id = self.pending_barrier.checkpoint_id,
-                    "barrier checkpoint failed, will retry on next interval"
-                );
-                // Keep active=true so next periodic trigger retries.
-                // Source checkpoints were consumed; sources will re-checkpoint
-                // on the next barrier injection.
-                self.pending_barrier.active = false;
+        // Delegate to unaligned tracker if present.
+        if let Some(ref mut tracker) = self.unaligned_tracker {
+            let events = tracker.barrier_received(source_idx);
+            for event in events {
+                match event {
+                    TrackerEvent::Aligned => {
+                        self.complete_barrier_checkpoint(callback).await;
+                        return;
+                    }
+                    TrackerEvent::LateBarrier(idx) => {
+                        tracing::debug!(
+                            checkpoint_id = self.pending_barrier.checkpoint_id,
+                            source_idx = idx,
+                            "late barrier arrived (unaligned mode)"
+                        );
+                    }
+                    TrackerEvent::UnalignedComplete => {
+                        tracing::debug!(
+                            checkpoint_id = self.pending_barrier.checkpoint_id,
+                            "all late barriers arrived after unaligned switch"
+                        );
+                        self.complete_barrier_checkpoint(callback).await;
+                        return;
+                    }
+                    _ => {}
+                }
             }
+            return;
+        }
+
+        // Default aligned-only path.
+        if self.pending_barrier.sources_aligned.len() >= self.pending_barrier.sources_total {
+            self.complete_barrier_checkpoint(callback).await;
+        }
+    }
+
+    /// Complete a barrier checkpoint (all sources aligned).
+    async fn complete_barrier_checkpoint(&mut self, callback: &mut impl PipelineCallback) {
+        let checkpoints = std::mem::take(&mut self.pending_barrier.source_checkpoints);
+        let ok = callback.checkpoint_with_barrier(checkpoints).await;
+        if ok {
+            self.pending_barrier.active = false;
+            self.last_checkpoint = Instant::now();
+        } else {
+            tracing::warn!(
+                checkpoint_id = self.pending_barrier.checkpoint_id,
+                "barrier checkpoint failed, will retry on next interval"
+            );
+            self.pending_barrier.active = false;
+        }
+    }
+
+    /// Check unaligned checkpoint timeout and trigger fallback if needed.
+    async fn check_unaligned_timeout(&mut self, callback: &mut impl PipelineCallback) {
+        let missing_sources =
+            self.unaligned_tracker
+                .as_mut()
+                .and_then(|tracker| match tracker.check_timeout() {
+                    Some(TrackerEvent::SwitchedToUnaligned { missing_sources }) => {
+                        tracker.cancel();
+                        Some(missing_sources)
+                    }
+                    _ => None,
+                });
+
+        if let Some(missing_sources) = missing_sources {
+            tracing::warn!(
+                checkpoint_id = self.pending_barrier.checkpoint_id,
+                missing = ?missing_sources,
+                "barrier alignment timed out, switching to unaligned checkpoint"
+            );
+            self.complete_barrier_checkpoint(callback).await;
         }
     }
 
@@ -635,11 +707,25 @@ impl StreamingCoordinator {
         // Inject barriers into all source tasks for Chandy-Lamport alignment.
         let checkpoint_id = self.next_checkpoint_id;
         self.next_checkpoint_id += 1;
-        self.pending_barrier
-            .reset(checkpoint_id, self.source_handles.len());
+        let num_sources = self.source_handles.len();
+        self.pending_barrier.reset(checkpoint_id, num_sources);
+
+        // Begin tracking with the unaligned tracker (if configured).
+        let mut barrier_flags: u64 = 0;
+        if let Some(ref mut tracker) = self.unaligned_tracker {
+            let events = tracker.begin(checkpoint_id, num_sources);
+            for event in &events {
+                if matches!(event, TrackerEvent::SwitchedToUnaligned { .. }) {
+                    // force_unaligned — set the flag on the barrier.
+                    barrier_flags |= laminar_core::checkpoint::flags::UNALIGNED;
+                }
+            }
+        }
 
         for handle in &self.source_handles {
-            handle.barrier_injector.trigger(checkpoint_id, 0);
+            handle
+                .barrier_injector
+                .trigger(checkpoint_id, barrier_flags);
         }
     }
 }
@@ -656,6 +742,7 @@ mod tests {
         cycle_count: u32,
         results: Vec<FxHashMap<Arc<str>, Vec<RecordBatch>>>,
         watermark: i64,
+        barrier_checkpoint_count: u32,
         /// Optional shared flag set when `maybe_checkpoint(force=true)` fires.
         force_checkpoint_flag: Option<Arc<std::sync::atomic::AtomicBool>>,
     }
@@ -666,6 +753,7 @@ mod tests {
                 cycle_count: 0,
                 results: Vec::new(),
                 watermark: 0,
+                barrier_checkpoint_count: 0,
                 force_checkpoint_flag: None,
             }
         }
@@ -724,6 +812,7 @@ mod tests {
             &mut self,
             _source_checkpoints: FxHashMap<String, SourceCheckpoint>,
         ) -> bool {
+            self.barrier_checkpoint_count += 1;
             true
         }
 
@@ -753,6 +842,7 @@ mod tests {
                 drain_budget_ns: 1_000_000,
                 query_budget_ns: 8_000_000,
                 background_budget_ns: 5_000_000,
+                unaligned_checkpoint: None,
             },
             rx,
             source_handles: Vec::new(),
@@ -766,6 +856,7 @@ mod tests {
             post_barrier_buf: Vec::new(),
             barrier_seen: FxHashSet::default(),
             control_rx,
+            unaligned_tracker: None,
         };
 
         let callback = MockCallback::new();
@@ -816,6 +907,7 @@ mod tests {
                 drain_budget_ns: 1_000_000,
                 query_budget_ns: 8_000_000,
                 background_budget_ns: 5_000_000,
+                unaligned_checkpoint: None,
             },
             rx,
             source_handles: Vec::new(),
@@ -829,6 +921,7 @@ mod tests {
             post_barrier_buf: Vec::new(),
             barrier_seen: FxHashSet::default(),
             control_rx,
+            unaligned_tracker: None,
         };
 
         let force_flag = Arc::new(std::sync::atomic::AtomicBool::new(false));
@@ -881,6 +974,7 @@ mod tests {
                 drain_budget_ns: 1_000_000,
                 query_budget_ns: 8_000_000,
                 background_budget_ns: 5_000_000,
+                unaligned_checkpoint: None,
             },
             rx: mpsc::channel(64).1, // dummy, not used
             source_handles: Vec::new(),
@@ -894,6 +988,7 @@ mod tests {
             post_barrier_buf: Vec::new(),
             barrier_seen: FxHashSet::default(),
             control_rx: control_rx2,
+            unaligned_tracker: None,
         };
 
         let mut callback = MockCallback::new();
@@ -993,5 +1088,71 @@ mod tests {
 
         // Barriers should have both sources.
         assert_eq!(barriers.len(), 2, "should have barriers from both sources");
+    }
+
+    #[tokio::test]
+    async fn test_unaligned_timeout_commits_checkpoint() {
+        let shutdown = Arc::new(tokio::sync::Notify::new());
+        let (_control_tx, control_rx) = mpsc::channel(64);
+        let mut coordinator = StreamingCoordinator {
+            config: PipelineConfig {
+                batch_window: Duration::ZERO,
+                max_poll_records: 1000,
+                channel_capacity: 64,
+                fallback_poll_interval: Duration::from_millis(10),
+                checkpoint_interval: Some(Duration::from_secs(60)),
+                delivery_guarantee: DeliveryGuarantee::AtLeastOnce,
+                barrier_alignment_timeout: BARRIER_TIMEOUT,
+                cycle_budget_ns: 10_000_000,
+                drain_budget_ns: 1_000_000,
+                query_budget_ns: 8_000_000,
+                background_budget_ns: 5_000_000,
+                unaligned_checkpoint: Some(laminar_core::checkpoint::UnalignedCheckpointConfig {
+                    enabled: true,
+                    alignment_timeout_threshold: Duration::ZERO,
+                    max_inflight_buffer_bytes: 1024,
+                    force_unaligned: false,
+                }),
+            },
+            rx: mpsc::channel(64).1,
+            source_handles: Vec::new(),
+            source_names: vec![Arc::from("s0"), Arc::from("s1")],
+            shutdown: Arc::clone(&shutdown),
+            pending_barrier: PendingBarrier::new(),
+            next_checkpoint_id: 2,
+            last_checkpoint: Instant::now(),
+            checkpoint_request_flags: Vec::new(),
+            source_batches_buf: FxHashMap::default(),
+            post_barrier_buf: Vec::new(),
+            barrier_seen: FxHashSet::default(),
+            control_rx,
+            unaligned_tracker: Some(UnalignedBarrierTracker::new(
+                laminar_core::checkpoint::UnalignedCheckpointConfig {
+                    enabled: true,
+                    alignment_timeout_threshold: Duration::ZERO,
+                    max_inflight_buffer_bytes: 1024,
+                    force_unaligned: false,
+                },
+            )),
+        };
+
+        coordinator.pending_barrier.reset(1, 2);
+        coordinator
+            .pending_barrier
+            .source_checkpoints
+            .insert("s0".to_string(), SourceCheckpoint::new(10));
+        coordinator.pending_barrier.sources_aligned.insert(0);
+        coordinator.unaligned_tracker.as_mut().unwrap().begin(1, 2);
+        coordinator
+            .unaligned_tracker
+            .as_mut()
+            .unwrap()
+            .barrier_received(0);
+
+        let mut callback = MockCallback::new();
+        coordinator.check_unaligned_timeout(&mut callback).await;
+
+        assert_eq!(callback.barrier_checkpoint_count, 1);
+        assert!(!coordinator.pending_barrier.active);
     }
 }

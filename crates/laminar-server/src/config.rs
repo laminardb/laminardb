@@ -195,6 +195,9 @@ pub struct ServerConfig {
 
     /// Node identity for delta mode.
     pub node_id: Option<String>,
+
+    /// OpenTelemetry tracing configuration (optional).
+    pub telemetry: Option<TelemetrySection>,
 }
 
 /// `[server]` section: server-level settings.
@@ -499,6 +502,20 @@ pub struct CoordinationSection {
     /// Raft heartbeat interval.
     #[serde(default = "default_heartbeat_interval", with = "humantime_serde")]
     pub heartbeat_interval: Duration,
+}
+
+/// `[telemetry]` section: OpenTelemetry configuration.
+#[derive(Debug, Clone, PartialEq, Deserialize)]
+pub struct TelemetrySection {
+    /// OTLP endpoint (e.g., `"http://localhost:4317"`).
+    pub otlp_endpoint: String,
+    /// Service name reported in traces.
+    #[serde(default = "default_service_name")]
+    pub service_name: String,
+}
+
+fn default_service_name() -> String {
+    "laminardb".to_string()
 }
 
 // ---------------------------------------------------------------------------
@@ -890,6 +907,7 @@ bind = "not-a-socket-addr"
             discovery: None,
             coordination: None,
             node_id: None,
+            telemetry: None,
         };
 
         assert_eq!(config.server.mode, "embedded");

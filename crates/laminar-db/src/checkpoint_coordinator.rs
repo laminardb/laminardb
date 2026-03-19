@@ -589,10 +589,15 @@ impl CheckpointCoordinator {
 
         match tokio::time::timeout(timeout_dur, self.pre_commit_sinks_inner(epoch)).await {
             Ok(result) => result,
-            Err(_elapsed) => Err(DbError::Checkpoint(format!(
-                "pre-commit timed out after {}s",
-                timeout_dur.as_secs()
-            ))),
+            Err(_elapsed) => {
+                // Rollback all sinks that may have pre-committed before the
+                // timeout fired, matching the error path in pre_commit_sinks_inner.
+                self.rollback_sinks(epoch).await;
+                Err(DbError::Checkpoint(format!(
+                    "pre-commit timed out after {}s",
+                    timeout_dur.as_secs()
+                )))
+            }
         }
     }
 
@@ -602,12 +607,31 @@ impl CheckpointCoordinator {
     /// At-most-once sinks are skipped — they receive no `pre_commit`/`commit`
     /// calls and provide no transactional guarantees.
     async fn pre_commit_sinks_inner(&self, epoch: u64) -> Result<(), DbError> {
+        let mut pre_committed: Vec<&RegisteredSink> = Vec::new();
         for sink in &self.sinks {
             if sink.exactly_once {
-                sink.handle.pre_commit(epoch).await.map_err(|e| {
-                    DbError::Checkpoint(format!("sink '{}' pre-commit failed: {e}", sink.name))
-                })?;
-                debug!(sink = %sink.name, epoch, "sink pre-committed");
+                match sink.handle.pre_commit(epoch).await {
+                    Ok(()) => {
+                        pre_committed.push(sink);
+                        debug!(sink = %sink.name, epoch, "sink pre-committed");
+                    }
+                    Err(e) => {
+                        // Rollback all sinks that already pre-committed.
+                        // rollback_epoch is fire-and-forget (channel send), so we
+                        // log each rollback attempt for operator visibility.
+                        for s in &pre_committed {
+                            s.handle.rollback_epoch(epoch).await;
+                            warn!(
+                                sink = %s.name, epoch,
+                                "rolling back pre-committed sink after peer failure"
+                            );
+                        }
+                        return Err(DbError::Checkpoint(format!(
+                            "sink '{}' pre-commit failed: {e}",
+                            sink.name
+                        )));
+                    }
+                }
             }
         }
         Ok(())
@@ -773,13 +797,12 @@ impl CheckpointCoordinator {
     }
 
     /// Rolls back all exactly-once sinks.
-    async fn rollback_sinks(&self, epoch: u64) -> Result<(), DbError> {
+    async fn rollback_sinks(&self, epoch: u64) {
         for sink in &self.sinks {
             if sink.exactly_once {
                 sink.handle.rollback_epoch(epoch).await;
             }
         }
-        Ok(())
     }
 
     /// Collects the last committed epoch from each sink.
@@ -1077,6 +1100,8 @@ impl CheckpointCoordinator {
         // ── Step 4b: Checkpoint size check ──
         if let Some(cap) = self.config.max_checkpoint_bytes {
             if sidecar_bytes > cap {
+                // Rollback sinks that already pre-committed before aborting.
+                self.rollback_sinks(epoch).await;
                 self.phase = CheckpointPhase::Idle;
                 self.checkpoints_failed += 1;
                 self.maybe_cap_drainers();
@@ -1114,15 +1139,7 @@ impl CheckpointCoordinator {
             self.maybe_cap_drainers();
             let duration = start.elapsed();
             self.emit_checkpoint_metrics(false, epoch, duration);
-            if let Err(rollback_err) = self.rollback_sinks(epoch).await {
-                error!(
-                    checkpoint_id,
-                    epoch,
-                    error = %rollback_err,
-                    "[LDB-6004] sink rollback failed after manifest persist failure — \
-                     sinks may be in an inconsistent state"
-                );
-            }
+            self.rollback_sinks(epoch).await;
             error!(checkpoint_id, epoch, error = %e, "[LDB-6008] manifest persist failed");
             return Ok(CheckpointResult {
                 success: false,

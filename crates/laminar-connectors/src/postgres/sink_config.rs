@@ -195,7 +195,7 @@ impl PostgresSinkConfig {
             cfg.delivery_guarantee = v.parse().map_err(|_| {
                 ConnectorError::ConfigurationError(format!(
                     "invalid delivery.guarantee: '{v}' \
-                     (expected 'at_least_once' or 'exactly_once')"
+                     (expected 'at_least_once', 'idempotent', or 'exactly_once')"
                 ))
             })?;
         }

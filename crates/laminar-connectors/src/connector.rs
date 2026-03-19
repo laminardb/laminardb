@@ -35,6 +35,10 @@ pub enum DeliveryGuarantee {
     /// checkpointing but tolerates non-replayable sources (with degradation).
     #[default]
     AtLeastOnce,
+    /// Idempotent: at-least-once delivery with epoch-based deduplication via
+    /// [`IdempotentSinkWrapper`](crate::idempotent::IdempotentSinkWrapper).
+    /// Automatically wraps the underlying sink to skip replayed epochs.
+    Idempotent,
     /// Exactly-once: no duplicates or losses. Requires all sources to
     /// support replay, all sinks to support exactly-once, and checkpoint
     /// to be enabled.
@@ -45,6 +49,7 @@ impl std::fmt::Display for DeliveryGuarantee {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         match self {
             DeliveryGuarantee::AtLeastOnce => write!(f, "at-least-once"),
+            DeliveryGuarantee::Idempotent => write!(f, "idempotent"),
             DeliveryGuarantee::ExactlyOnce => write!(f, "exactly-once"),
         }
     }
@@ -56,6 +61,7 @@ impl FromStr for DeliveryGuarantee {
     fn from_str(s: &str) -> Result<Self, Self::Err> {
         match s.to_lowercase().replace('-', "_").as_str() {
             "at_least_once" | "atleastonce" => Ok(Self::AtLeastOnce),
+            "idempotent" => Ok(Self::Idempotent),
             "exactly_once" | "exactlyonce" => Ok(Self::ExactlyOnce),
             other => Err(format!("unknown delivery guarantee: '{other}'")),
         }

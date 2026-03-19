@@ -8,6 +8,7 @@
 
 #![allow(clippy::disallowed_types)] // cold path: server startup and config only
 
+mod cli;
 mod config;
 mod delta;
 mod delta_config;
@@ -23,7 +24,7 @@ static GLOBAL: tikv_jemallocator::Jemalloc = tikv_jemallocator::Jemalloc;
 use std::path::PathBuf;
 
 use anyhow::Result;
-use clap::Parser;
+use clap::{Parser, Subcommand};
 use tracing::info;
 use tracing_subscriber::{layer::SubscriberExt, util::SubscriberInitExt};
 
@@ -49,27 +50,74 @@ struct Args {
     /// checksums, and reports which are valid for recovery.
     #[arg(long)]
     validate_checkpoints: bool,
+
+    /// Subcommand to run instead of starting the server.
+    #[command(subcommand)]
+    command: Option<Command>,
+}
+
+/// CLI subcommands for interacting with a running LaminarDB server.
+#[derive(Subcommand, Debug)]
+pub enum Command {
+    /// Query server status and diagnostics.
+    Status {
+        /// Server URL (e.g., http://127.0.0.1:8080).
+        #[arg(short, long, default_value = "http://127.0.0.1:8080")]
+        server: String,
+    },
+    /// Execute ad-hoc SQL against a running server.
+    Sql {
+        /// Server URL.
+        #[arg(short, long, default_value = "http://127.0.0.1:8080")]
+        server: String,
+        /// SQL query to execute.
+        query: String,
+    },
+    /// Trigger a manual checkpoint.
+    Checkpoint {
+        /// Server URL.
+        #[arg(short, long, default_value = "http://127.0.0.1:8080")]
+        server: String,
+    },
+    /// Show cluster status (delta mode).
+    Cluster {
+        /// Server URL.
+        #[arg(short, long, default_value = "http://127.0.0.1:8080")]
+        server: String,
+    },
 }
 
 #[tokio::main]
 async fn main() -> Result<()> {
     let args = Args::parse();
 
-    tracing_subscriber::registry()
-        .with(
-            tracing_subscriber::EnvFilter::try_from_default_env()
-                .unwrap_or_else(|_| format!("laminardb={}", args.log_level).into()),
-        )
-        .with(tracing_subscriber::fmt::layer())
-        .init();
+    let env_filter = tracing_subscriber::EnvFilter::try_from_default_env()
+        .unwrap_or_else(|_| format!("laminardb={}", args.log_level).into());
+
+    // CLI subcommands don't need config-based telemetry.
+    if let Some(cmd) = args.command {
+        tracing_subscriber::registry()
+            .with(env_filter)
+            .with(tracing_subscriber::fmt::layer())
+            .init();
+        return cli::run_command(cmd).await;
+    }
+
+    let config_path = PathBuf::from(&args.config);
+    let config = config::load_config(&config_path)?;
+
+    // Wire up OTLP tracing if configured and the feature is enabled.
+    // Hold the provider so we can flush pending spans on shutdown.
+    #[cfg(feature = "otlp")]
+    let _tracer_provider = init_tracing(env_filter, config.telemetry.as_ref())?;
+    #[cfg(not(feature = "otlp"))]
+    init_tracing(env_filter, config.telemetry.as_ref())?;
 
     info!("Starting LaminarDB server");
     info!("Version: {}", env!("CARGO_PKG_VERSION"));
     info!("Config file: {}", args.config);
 
-    let config_path = PathBuf::from(&args.config);
-    let mut config = config::load_config(&config_path)?;
-
+    let mut config = config;
     if let Some(bind) = args.admin_bind {
         config.server.bind = bind;
     }
@@ -80,6 +128,14 @@ async fn main() -> Result<()> {
 
     let handle = server::run_server(config, config_path).await?;
     handle.wait_for_shutdown().await?;
+
+    // Flush any pending OTLP spans before exit.
+    #[cfg(feature = "otlp")]
+    if let Some(provider) = _tracer_provider {
+        if let Err(e) = provider.shutdown() {
+            tracing::warn!(error = %e, "OTLP tracer shutdown failed");
+        }
+    }
 
     Ok(())
 }
@@ -165,4 +221,79 @@ fn build_checkpoint_store(
             }
         }
     }
+}
+
+/// Initialize the tracing subscriber, optionally composing an OTLP layer.
+///
+/// When the `otlp` feature is enabled and telemetry is configured, the
+/// returned provider must be kept alive for the duration of the program
+/// and shut down before exit to flush pending spans.
+#[cfg(feature = "otlp")]
+fn init_tracing(
+    env_filter: tracing_subscriber::EnvFilter,
+    _telemetry: Option<&config::TelemetrySection>,
+) -> Result<Option<opentelemetry_sdk::trace::SdkTracerProvider>> {
+    if let Some(tel) = _telemetry {
+        use opentelemetry::trace::TracerProvider;
+        let provider = init_otlp_tracer(&tel.otlp_endpoint, &tel.service_name)?;
+        let otlp_layer = tracing_opentelemetry::layer().with_tracer(provider.tracer("laminardb"));
+        tracing_subscriber::registry()
+            .with(env_filter)
+            .with(tracing_subscriber::fmt::layer())
+            .with(otlp_layer)
+            .init();
+        return Ok(Some(provider));
+    }
+
+    tracing_subscriber::registry()
+        .with(env_filter)
+        .with(tracing_subscriber::fmt::layer())
+        .init();
+    Ok(None)
+}
+
+/// Initialize the tracing subscriber (non-OTLP build).
+#[cfg(not(feature = "otlp"))]
+fn init_tracing(
+    env_filter: tracing_subscriber::EnvFilter,
+    _telemetry: Option<&config::TelemetrySection>,
+) -> Result<()> {
+    if _telemetry.is_some() {
+        anyhow::bail!(
+            "[telemetry] section found in config but the `otlp` feature is not enabled. \
+             Rebuild with `--features otlp` to enable OpenTelemetry export."
+        );
+    }
+
+    tracing_subscriber::registry()
+        .with(env_filter)
+        .with(tracing_subscriber::fmt::layer())
+        .init();
+    Ok(())
+}
+
+/// Initialize OpenTelemetry OTLP tracer (behind `otlp` feature).
+#[cfg(feature = "otlp")]
+fn init_otlp_tracer(
+    endpoint: &str,
+    service_name: &str,
+) -> Result<opentelemetry_sdk::trace::SdkTracerProvider> {
+    use opentelemetry::KeyValue;
+    use opentelemetry_otlp::WithExportConfig;
+    use opentelemetry_sdk::{trace::SdkTracerProvider, Resource};
+
+    let exporter = opentelemetry_otlp::SpanExporter::builder()
+        .with_tonic()
+        .with_endpoint(endpoint)
+        .build()?;
+
+    let provider = SdkTracerProvider::builder()
+        .with_batch_exporter(exporter)
+        .with_resource(Resource::new(vec![KeyValue::new(
+            "service.name",
+            service_name.to_string(),
+        )]))
+        .build();
+
+    Ok(provider)
 }
