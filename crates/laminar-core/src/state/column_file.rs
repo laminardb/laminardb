@@ -198,13 +198,6 @@ impl ColumnFile {
         self.mmap.flush()?;
         Ok(())
     }
-
-    /// Reset write position to just after the header.
-    #[allow(dead_code)]
-    fn reset(&mut self) {
-        self.write_pos = HEADER_SIZE;
-        self.persist_header();
-    }
 }
 
 /// Tier classification for a partition.

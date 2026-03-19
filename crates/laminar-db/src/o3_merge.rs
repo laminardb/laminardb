@@ -4,7 +4,7 @@
 //! that accumulates late-arriving rows (events with timestamps behind
 //! the watermark) and merges them back into the pipeline when triggered.
 //!
-//! Not yet wired into the pipeline — API is `pub(crate)` for integration.
+//! Out-of-order merge engine for late-arriving data in streaming windows.
 //!
 //! # Strategy
 //!
@@ -125,8 +125,7 @@ impl SourceLateBuffer {
 /// Accumulates late-arriving rows and merges them back into the
 /// pipeline's normal processing flow. Each source has its own buffer
 /// keyed by source name.
-#[allow(dead_code)] // Not yet wired into pipeline callback — next step
-pub(crate) struct O3MergeEngine {
+pub struct O3MergeEngine {
     /// Configuration.
     config: O3MergeConfig,
     /// Per-source late-row buffers.
@@ -136,11 +135,10 @@ pub(crate) struct O3MergeEngine {
     /// Total late rows merged back.
     total_merged_rows: u64,
 }
-
-#[allow(dead_code)] // Not yet wired into pipeline callback — next step
 impl O3MergeEngine {
     /// Create a new O3 merge engine with the given configuration.
-    pub(crate) fn new(config: O3MergeConfig) -> Self {
+    #[must_use]
+    pub fn new(config: O3MergeConfig) -> Self {
         Self {
             config,
             buffers: FxHashMap::default(),
@@ -150,14 +148,15 @@ impl O3MergeEngine {
     }
 
     /// Returns the configured late data strategy.
-    pub(crate) fn strategy(&self) -> &LateDataStrategy {
+    #[must_use]
+    pub fn strategy(&self) -> &LateDataStrategy {
         &self.config.strategy
     }
 
     /// Buffer a batch of late rows for a given source.
     ///
     /// The `time_column` is the event-time column used for sort-merge.
-    pub(crate) fn buffer_late(&mut self, source_name: &str, batch: RecordBatch, time_column: &str) {
+    pub fn buffer_late(&mut self, source_name: &str, batch: RecordBatch, time_column: &str) {
         #[allow(clippy::cast_possible_truncation)]
         {
             self.total_late_rows += batch.num_rows() as u64;
@@ -176,7 +175,7 @@ impl O3MergeEngine {
     /// sorts the result by the event-time column.
     ///
     /// Returns the (potentially merged and sorted) batches.
-    pub(crate) fn merge_into(
+    pub fn merge_into(
         &mut self,
         source_name: &str,
         on_time_batches: Vec<RecordBatch>,
@@ -239,7 +238,7 @@ impl O3MergeEngine {
     }
 
     /// Flush all buffers for all sources (e.g., at shutdown).
-    pub(crate) fn flush_all(&mut self) -> FxHashMap<String, Vec<RecordBatch>> {
+    pub fn flush_all(&mut self) -> FxHashMap<String, Vec<RecordBatch>> {
         let mut result = FxHashMap::default();
         for (source, buf) in &mut self.buffers {
             if !buf.is_empty() {
@@ -250,20 +249,20 @@ impl O3MergeEngine {
     }
 
     /// Get the total number of late rows received.
-    #[allow(dead_code)]
-    pub(crate) fn total_late_rows(&self) -> u64 {
+    #[must_use]
+    pub fn total_late_rows(&self) -> u64 {
         self.total_late_rows
     }
 
     /// Get the total number of late rows merged back.
-    #[allow(dead_code)]
-    pub(crate) fn total_merged_rows(&self) -> u64 {
+    #[must_use]
+    pub fn total_merged_rows(&self) -> u64 {
         self.total_merged_rows
     }
 
     /// Get the current number of buffered rows across all sources.
-    #[allow(dead_code)]
-    pub(crate) fn buffered_rows(&self) -> usize {
+    #[must_use]
+    pub fn buffered_rows(&self) -> usize {
         self.buffers.values().map(|b| b.row_count).sum()
     }
 }
