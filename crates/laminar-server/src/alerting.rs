@@ -321,10 +321,12 @@ pub struct AlertManager {
     history: RwLock<Vec<AlertEvent>>,
     /// Maximum history size.
     history_capacity: usize,
-    /// HTTP client for webhook delivery.
+    /// HTTP client for webhook delivery (with connect/read timeouts).
     http_client: reqwest::Client,
     /// Previous metrics snapshot for delta comparisons.
     prev_snapshot: RwLock<Option<(Instant, MetricsSnapshot)>>,
+    /// Per-rule accumulated idle time for SourceLagAbove threshold enforcement.
+    idle_since: RwLock<HashMap<String, Instant>>,
 }
 
 impl AlertManager {
@@ -345,14 +347,21 @@ impl AlertManager {
             }
         }
 
+        let http_client = reqwest::Client::builder()
+            .connect_timeout(Duration::from_secs(10))
+            .timeout(Duration::from_secs(30))
+            .build()
+            .unwrap_or_else(|_| reqwest::Client::new());
+
         Self {
             rules,
             interval,
             last_fired: RwLock::new(HashMap::new()),
             history: RwLock::new(Vec::new()),
             history_capacity: 100,
-            http_client: reqwest::Client::new(),
+            http_client,
             prev_snapshot: RwLock::new(None),
+            idle_since: RwLock::new(HashMap::new()),
         }
     }
 
@@ -443,7 +452,9 @@ impl AlertManager {
                 }
             }
 
-            let triggered = self.check_condition(&rule.condition, &snapshot, now).await;
+            let triggered = self
+                .check_condition(&rule.name, &rule.condition, &snapshot, now)
+                .await;
 
             if triggered {
                 let message = self.format_message(&rule.condition, &snapshot);
@@ -484,24 +495,34 @@ impl AlertManager {
     /// Check whether a condition is currently triggered.
     async fn check_condition(
         &self,
+        rule_name: &str,
         condition: &AlertCondition,
         snapshot: &MetricsSnapshot,
         now: Instant,
     ) -> bool {
         match condition {
-            AlertCondition::SourceLagAbove(_threshold) => {
-                // Source lag requires per-source lag tracking which isn't exposed
-                // in the public metrics API yet. For now, estimate from throughput
-                // stalls: if ingestion has been zero for the threshold seconds, fire.
-                // This is a conservative approximation.
+            AlertCondition::SourceLagAbove(threshold) => {
+                // Track accumulated idle time: fire only when no events have been
+                // ingested for longer than `threshold` seconds (not on a single
+                // zero-delta evaluation window).
                 let prev = self.prev_snapshot.read().await;
-                if let Some((prev_time, prev_snap)) = prev.as_ref() {
-                    let elapsed = now.duration_since(*prev_time).as_secs_f64();
+                if let Some((_, prev_snap)) = prev.as_ref() {
                     let delta = snapshot
                         .events_ingested
                         .saturating_sub(prev_snap.events_ingested);
-                    // If no events ingested in the evaluation window, consider it "lagging"
-                    elapsed > 0.0 && delta == 0
+                    drop(prev);
+
+                    let mut idle_map = self.idle_since.write().await;
+                    if delta == 0 {
+                        // No events — start or continue idle tracking.
+                        let idle_start = idle_map.entry(rule_name.to_string()).or_insert(now);
+                        let idle_secs = now.duration_since(*idle_start).as_secs_f64();
+                        idle_secs >= *threshold
+                    } else {
+                        // Events flowing — reset idle tracker.
+                        idle_map.remove(rule_name);
+                        false
+                    }
                 } else {
                     false
                 }
