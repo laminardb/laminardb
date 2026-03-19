@@ -192,6 +192,13 @@ impl<'a> RecoveryManager<'a> {
                         checkpoint_id = manifest.checkpoint_id,
                         "[LDB-6010] latest checkpoint corrupt, trying fallback"
                     );
+                } else if Self::has_pending_sinks(&manifest) {
+                    warn!(
+                        checkpoint_id = manifest.checkpoint_id,
+                        epoch = manifest.epoch,
+                        "[LDB-6015] checkpoint has uncommitted sinks — source offsets \
+                         may be past uncommitted data, falling back to previous checkpoint"
+                    );
                 } else {
                     let state = self
                         .restore_from(manifest, sources, sinks, table_sources)
@@ -233,6 +240,13 @@ impl<'a> RecoveryManager<'a> {
                         warn!(
                             checkpoint_id,
                             "[LDB-6010] fallback checkpoint corrupt, skipping"
+                        );
+                        continue;
+                    }
+                    if Self::has_pending_sinks(&manifest) {
+                        warn!(
+                            checkpoint_id,
+                            "[LDB-6015] fallback checkpoint has uncommitted sinks, skipping"
                         );
                         continue;
                     }
@@ -623,6 +637,18 @@ impl<'a> RecoveryManager<'a> {
     }
 
     /// In strict mode, returns an error if any source or sink had restore failures.
+    /// Returns true if any exactly-once sink has Pending commit status.
+    ///
+    /// A checkpoint with Pending sinks was persisted before sink commit
+    /// completed. Recovering from it would advance source offsets past
+    /// data the sinks never received — causing silent data loss.
+    fn has_pending_sinks(manifest: &CheckpointManifest) -> bool {
+        manifest
+            .sink_commit_statuses
+            .values()
+            .any(|s| matches!(s, SinkCommitStatus::Pending))
+    }
+
     fn check_strict(&self, state: &RecoveredState) -> Result<(), DbError> {
         if !self.strict || !state.has_errors() {
             return Ok(());
@@ -1036,6 +1062,55 @@ mod tests {
         assert!(
             result.is_none(),
             "strict mode should reject checkpoint with missing sidecar"
+        );
+    }
+
+    #[tokio::test]
+    async fn test_recover_skips_pending_sinks_falls_back() {
+        let dir = tempfile::tempdir().unwrap();
+        let store = make_store(dir.path());
+
+        // Epoch 1: fully committed checkpoint (good).
+        let mut m1 = CheckpointManifest::new(1, 1);
+        m1.sink_commit_statuses
+            .insert("delta_sink".into(), SinkCommitStatus::Committed);
+        store.save(&m1).unwrap();
+
+        // Epoch 2: crashed between manifest persist and sink commit (Pending).
+        let mut m2 = CheckpointManifest::new(2, 2);
+        m2.sink_commit_statuses
+            .insert("delta_sink".into(), SinkCommitStatus::Pending);
+        store.save(&m2).unwrap();
+
+        let mgr = RecoveryManager::new(&store);
+        let result = mgr.recover(&[], &[], &[]).await.unwrap();
+        let state = result.expect("should recover from epoch 1 fallback");
+
+        // Must fall back to epoch 1 (the last fully committed checkpoint),
+        // not epoch 2 (which has uncommitted sink data).
+        assert_eq!(
+            state.epoch(),
+            1,
+            "recovery must skip checkpoint with Pending sinks"
+        );
+    }
+
+    #[tokio::test]
+    async fn test_recover_all_pending_starts_fresh() {
+        let dir = tempfile::tempdir().unwrap();
+        let store = make_store(dir.path());
+
+        // Only checkpoint has Pending sinks — no safe fallback.
+        let mut m = CheckpointManifest::new(1, 1);
+        m.sink_commit_statuses
+            .insert("sink".into(), SinkCommitStatus::Pending);
+        store.save(&m).unwrap();
+
+        let mgr = RecoveryManager::new(&store);
+        let result = mgr.recover(&[], &[], &[]).await.unwrap();
+        assert!(
+            result.is_none(),
+            "should start fresh when all checkpoints have pending sinks"
         );
     }
 }

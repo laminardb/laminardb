@@ -552,8 +552,17 @@ impl SourceConnector for KafkaSource {
                 };
                 for topic in &topics {
                     for (&partition, &offset) in offsets {
-                        tpl.add_partition_offset(topic, partition, rdkafka::Offset::Offset(offset))
-                            .ok();
+                        if let Err(e) = tpl.add_partition_offset(
+                            topic,
+                            partition,
+                            rdkafka::Offset::Offset(offset),
+                        ) {
+                            tracing::warn!(
+                                %topic, partition, offset,
+                                error = %e,
+                                "failed to add specific offset to partition list"
+                            );
+                        }
                     }
                 }
                 if tpl.count() > 0 {
@@ -584,12 +593,18 @@ impl SourceConnector for KafkaSource {
                 ) {
                     for topic_meta in metadata.topics() {
                         for partition_meta in topic_meta.partitions() {
-                            tpl.add_partition_offset(
+                            if let Err(e) = tpl.add_partition_offset(
                                 topic_meta.name(),
                                 partition_meta.id(),
                                 rdkafka::Offset::Offset(*ts_ms),
-                            )
-                            .ok();
+                            ) {
+                                tracing::warn!(
+                                    topic = topic_meta.name(),
+                                    partition = partition_meta.id(),
+                                    error = %e,
+                                    "failed to add timestamp offset to partition list"
+                                );
+                            }
                         }
                     }
                 }

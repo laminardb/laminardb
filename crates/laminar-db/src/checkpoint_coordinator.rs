@@ -586,14 +586,26 @@ impl CheckpointCoordinator {
     /// is configured via [`CheckpointConfig::pre_commit_timeout`].
     async fn pre_commit_sinks(&self, epoch: u64) -> Result<(), DbError> {
         let timeout_dur = self.config.pre_commit_timeout;
+        let start = std::time::Instant::now();
 
-        match tokio::time::timeout(timeout_dur, self.pre_commit_sinks_inner(epoch)).await {
-            Ok(result) => result,
-            Err(_elapsed) => Err(DbError::Checkpoint(format!(
-                "pre-commit timed out after {}s",
-                timeout_dur.as_secs()
-            ))),
+        let result =
+            match tokio::time::timeout(timeout_dur, self.pre_commit_sinks_inner(epoch)).await {
+                Ok(result) => result,
+                Err(_elapsed) => Err(DbError::Checkpoint(format!(
+                    "pre-commit timed out after {}s",
+                    timeout_dur.as_secs()
+                ))),
+            };
+
+        // Record pre-commit duration regardless of success/failure.
+        if let Some(ref counters) = self.counters {
+            #[allow(clippy::cast_possible_truncation)]
+            counters
+                .sink_precommit_duration_us
+                .store(start.elapsed().as_micros() as u64, Ordering::Relaxed);
         }
+
+        result
     }
 
     /// Inner pre-commit loop (no timeout).
@@ -623,8 +635,10 @@ impl CheckpointCoordinator {
     /// sink from blocking checkpoint completion indefinitely.
     async fn commit_sinks_tracked(&self, epoch: u64) -> HashMap<String, SinkCommitStatus> {
         let timeout_dur = self.config.commit_timeout;
+        let start = std::time::Instant::now();
 
-        match tokio::time::timeout(timeout_dur, self.commit_sinks_inner(epoch)).await {
+        let statuses = match tokio::time::timeout(timeout_dur, self.commit_sinks_inner(epoch)).await
+        {
             Ok(statuses) => statuses,
             Err(_elapsed) => {
                 error!(
@@ -647,7 +661,17 @@ impl CheckpointCoordinator {
                     })
                     .collect()
             }
+        };
+
+        // Record commit duration regardless of success/failure.
+        if let Some(ref counters) = self.counters {
+            #[allow(clippy::cast_possible_truncation)]
+            counters
+                .sink_commit_duration_us
+                .store(start.elapsed().as_micros() as u64, Ordering::Relaxed);
         }
+
+        statuses
     }
 
     /// Inner commit loop (no timeout).
@@ -1103,8 +1127,12 @@ impl CheckpointCoordinator {
                 );
             }
         }
-        // Track cumulative bytes written (updated after successful persist below).
-        let checkpoint_bytes = sidecar_bytes as u64;
+        // Track cumulative bytes written (manifest + sidecar).
+        // Serialize the manifest once to measure its size. This happens on the
+        // checkpoint path (not hot), and the actual persist re-serializes inside
+        // save_manifest via spawn_blocking.
+        let manifest_bytes = serde_json::to_string(&manifest).map_or(0, |s| s.len());
+        let checkpoint_bytes = (manifest_bytes + sidecar_bytes) as u64;
 
         // ── Step 5: Persist manifest (decision record — sinks are Pending) ──
         self.phase = CheckpointPhase::Persisting;
@@ -1189,6 +1217,22 @@ impl CheckpointCoordinator {
         self.last_checkpoint_duration = Some(duration);
         self.duration_histogram.record(duration);
         self.emit_checkpoint_metrics(true, epoch, duration);
+
+        // Emit checkpoint size and lag metrics.
+        if let Some(ref counters) = self.counters {
+            counters
+                .last_checkpoint_size_bytes
+                .store(checkpoint_bytes, Ordering::Relaxed);
+            #[allow(clippy::cast_possible_truncation)]
+            counters.last_checkpoint_timestamp_ms.store(
+                std::time::SystemTime::now()
+                    .duration_since(std::time::UNIX_EPOCH)
+                    .unwrap_or_default()
+                    .as_millis() as u64,
+                Ordering::Relaxed,
+            );
+        }
+
         self.adjust_interval();
 
         // ── Step 8: Begin next epoch on exactly-once sinks ──
