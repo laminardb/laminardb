@@ -683,6 +683,14 @@ async fn update_config(
     State(state): State<Arc<AppState>>,
     Json(body): Json<serde_json::Value>,
 ) -> impl IntoResponse {
+    let _guard = match state.reload_guard.try_acquire() {
+        Some(g) => g,
+        None => {
+            return error_response(StatusCode::CONFLICT, "a reload is already in progress")
+                .into_response();
+        }
+    };
+
     let current = state.current_config.read().await;
     // Merge against the REAL config (not masked) to preserve secrets.
     let mut merged = config_to_merge_json(&current);
@@ -711,6 +719,14 @@ async fn update_config(
                 .into_response();
         }
     };
+
+    if let Err(e) = crate::config::validate_config_public(&new_config) {
+        return error_response(
+            StatusCode::BAD_REQUEST,
+            format!("config validation error: {e}"),
+        )
+        .into_response();
+    }
 
     let current = state.current_config.read().await;
     let diff = crate::reload::diff_configs(&current, &new_config);
@@ -858,7 +874,20 @@ fn config_to_json_inner(
     let lookups: Vec<serde_json::Value> = config
         .lookups
         .iter()
-        .map(|l| serde_json::json!({ "name": l.name, "connector": l.connector, "strategy": l.strategy }))
+        .map(|l| {
+            let mut props = serde_json::Map::new();
+            for (k, v) in &l.properties {
+                if mask_secrets && is_sensitive_key(k) {
+                    props.insert(k.clone(), serde_json::Value::String("***".to_string()));
+                } else {
+                    props.insert(k.clone(), serde_json::Value::String(v.to_string()));
+                }
+            }
+            serde_json::json!({
+                "name": l.name, "connector": l.connector,
+                "strategy": l.strategy, "properties": props,
+            })
+        })
         .collect();
     let lookup_key = if use_serde_keys { "lookup" } else { "lookups" };
     obj[lookup_key] = serde_json::Value::Array(lookups);
@@ -1555,7 +1584,12 @@ mod tests {
                 .unwrap(),
             ))
             .unwrap();
-        let _resp = app.oneshot(req).await.unwrap();
+        let resp = app.oneshot(req).await.unwrap();
+        assert!(
+            resp.status().is_success(),
+            "PUT /api/v1/config should succeed, got {}",
+            resp.status()
+        );
 
         // Verify the real config still has the original password, not "***".
         let cfg = state.current_config.read().await;

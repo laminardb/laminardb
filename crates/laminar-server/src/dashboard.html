@@ -215,14 +215,13 @@ async function refresh() {{
     // Re-fetch source details for lag info
     const srcResp = await fetch('/api/v1/sources');
     const srcList = await srcResp.json();
-    // Use per-source metrics
-    const srcMetrics = [];
-    for (const src of srcList) {{
-      // Find matching metric
-      const evtKey = `laminardb_source_events_total`;
-      const total = 0;
-      srcMetrics.push({{ name: src.name, total_events: total, pending: 0, capacity: 0, is_backpressured: false }});
-    }}
+    // Use per-source metrics from the metrics endpoint
+    const srcMetrics = srcList.map(src => {{
+      const evtKey = `laminardb_source_events_total_${{src.name}}`;
+      const total = m[evtKey] || 0;
+      return {{ name: src.name, total_events: total, pending: 0, capacity: 0, is_backpressured: false }};
+    }});
+    renderSources(srcMetrics);
 
     // Streams
     const stBody = document.getElementById('streamsBody');
