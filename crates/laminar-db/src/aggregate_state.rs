@@ -58,7 +58,13 @@ pub(crate) fn row_to_scalar_key_with_types(
         if sv.data_type() == group_types[col_idx] {
             sv_key.push(sv);
         } else {
-            sv_key.push(sv.cast_to(&group_types[col_idx]).unwrap_or(sv));
+            sv_key.push(sv.cast_to(&group_types[col_idx]).map_err(|e| {
+                DbError::Pipeline(format!(
+                    "group key cast from {:?} to {:?}: {e}",
+                    sv.data_type(),
+                    group_types[col_idx]
+                ))
+            })?);
         }
     }
     Ok(sv_key)
@@ -191,8 +197,10 @@ pub(crate) fn scalar_to_json(sv: &ScalarValue) -> serde_json::Value {
                     let values = list.value(0);
                     let mut items = Vec::with_capacity(values.len());
                     for i in 0..values.len() {
-                        let sv =
-                            ScalarValue::try_from_array(&values, i).unwrap_or(ScalarValue::Null);
+                        let sv = match ScalarValue::try_from_array(&values, i) {
+                            Ok(sv) => sv,
+                            Err(_) => ScalarValue::Null,
+                        };
                         items.push(scalar_to_json(&sv));
                     }
                     json!({"t": "L", "v": items})
@@ -915,8 +923,17 @@ impl IncrementalAggState {
         }
 
         // Vectorized group key extraction using the struct-level RowConverter.
+        // Cast columns to match the RowConverter's expected types if needed
+        // (e.g., Int32 vs Int64 after upstream casts).
         let group_cols: Vec<ArrayRef> = (0..self.num_group_cols)
-            .map(|i| Arc::clone(batch.column(i)))
+            .map(|i| {
+                let col = batch.column(i);
+                if col.data_type() == &self.group_types[i] {
+                    Arc::clone(col)
+                } else {
+                    arrow::compute::cast(col, &self.group_types[i]).unwrap_or(Arc::clone(col))
+                }
+            })
             .collect();
 
         let rows = self
@@ -1236,23 +1253,28 @@ impl IncrementalAggState {
             let sv_key: Result<Vec<ScalarValue>, _> = gc.key.iter().map(json_to_scalar).collect();
             let sv_key = sv_key?;
             let row_key = self.scalar_key_to_row(&sv_key)?;
+            if gc.acc_states.len() != self.agg_specs.len() {
+                return Err(DbError::Pipeline(format!(
+                    "checkpoint accumulator count mismatch: expected {}, got {}",
+                    self.agg_specs.len(),
+                    gc.acc_states.len()
+                )));
+            }
             let mut accs = Vec::with_capacity(self.agg_specs.len());
             for (i, spec) in self.agg_specs.iter().enumerate() {
                 let mut acc = spec.create_accumulator()?;
-                if i < gc.acc_states.len() {
-                    let state_scalars: Result<Vec<ScalarValue>, _> =
-                        gc.acc_states[i].iter().map(json_to_scalar).collect();
-                    let state_scalars = state_scalars?;
-                    let arrays: Vec<ArrayRef> = state_scalars
-                        .iter()
-                        .map(|sv| {
-                            sv.to_array()
-                                .map_err(|e| DbError::Pipeline(format!("scalar to array: {e}")))
-                        })
-                        .collect::<Result<_, _>>()?;
-                    acc.merge_batch(&arrays)
-                        .map_err(|e| DbError::Pipeline(format!("accumulator merge: {e}")))?;
-                }
+                let state_scalars: Result<Vec<ScalarValue>, _> =
+                    gc.acc_states[i].iter().map(json_to_scalar).collect();
+                let state_scalars = state_scalars?;
+                let arrays: Vec<ArrayRef> = state_scalars
+                    .iter()
+                    .map(|sv| {
+                        sv.to_array()
+                            .map_err(|e| DbError::Pipeline(format!("scalar to array: {e}")))
+                    })
+                    .collect::<Result<_, _>>()?;
+                acc.merge_batch(&arrays)
+                    .map_err(|e| DbError::Pipeline(format!("accumulator merge: {e}")))?;
                 accs.push(acc);
             }
             self.groups.insert(row_key, accs);
@@ -3051,6 +3073,114 @@ mod tests {
 
         let result = state2.emit().unwrap();
         assert_eq!(result[0].num_rows(), 3);
+
+        // Verify actual SUM values per group after restore
+        let names = result[0]
+            .column(0)
+            .as_any()
+            .downcast_ref::<arrow::array::StringArray>()
+            .unwrap();
+        let totals = result[0]
+            .column(1)
+            .as_any()
+            .downcast_ref::<arrow::array::Float64Array>()
+            .unwrap();
+        for i in 0..result[0].num_rows() {
+            match names.value(i) {
+                "a" => assert!(
+                    (totals.value(i) - 40.0).abs() < f64::EPSILON,
+                    "Expected 40.0 for group 'a', got {}",
+                    totals.value(i)
+                ),
+                "b" => assert!(
+                    (totals.value(i) - 60.0).abs() < f64::EPSILON,
+                    "Expected 60.0 for group 'b', got {}",
+                    totals.value(i)
+                ),
+                "c" => assert!(
+                    (totals.value(i) - 50.0).abs() < f64::EPSILON,
+                    "Expected 50.0 for group 'c', got {}",
+                    totals.value(i)
+                ),
+                other => panic!("Unexpected group: {other}"),
+            }
+        }
+    }
+
+    #[tokio::test]
+    async fn test_checkpoint_roundtrip_no_group_by_sentinel() {
+        // Test the no-GROUP-BY (global aggregate) sentinel path.
+        let ctx = laminar_sql::create_session_context();
+        let schema = Arc::new(Schema::new(vec![Field::new(
+            "value",
+            DataType::Float64,
+            false,
+        )]));
+        let dummy = RecordBatch::try_new(
+            Arc::clone(&schema),
+            vec![Arc::new(arrow::array::Float64Array::from(vec![0.0]))],
+        )
+        .unwrap();
+        let mem_table =
+            datafusion::datasource::MemTable::try_new(Arc::clone(&schema), vec![vec![dummy]])
+                .unwrap();
+        ctx.register_table("events", Arc::new(mem_table)).unwrap();
+
+        let mut state =
+            IncrementalAggState::try_from_sql(&ctx, "SELECT SUM(value) as total FROM events")
+                .await
+                .unwrap()
+                .expect("expected aggregate state");
+
+        // Feed batches
+        let pre_agg_schema = Arc::new(Schema::new(vec![Field::new(
+            "__agg_input_1",
+            DataType::Float64,
+            true,
+        )]));
+        let batch1 = RecordBatch::try_new(
+            Arc::clone(&pre_agg_schema),
+            vec![Arc::new(arrow::array::Float64Array::from(vec![
+                10.0, 20.0, 30.0,
+            ]))],
+        )
+        .unwrap();
+        state.process_batch(&batch1).unwrap();
+
+        let batch2 = RecordBatch::try_new(
+            Arc::clone(&pre_agg_schema),
+            vec![Arc::new(arrow::array::Float64Array::from(vec![40.0]))],
+        )
+        .unwrap();
+        state.process_batch(&batch2).unwrap();
+
+        // Checkpoint
+        let cp = state.checkpoint_groups().unwrap();
+        assert_eq!(cp.groups.len(), 1);
+
+        // Restore into fresh state
+        let mut state2 =
+            IncrementalAggState::try_from_sql(&ctx, "SELECT SUM(value) as total FROM events")
+                .await
+                .unwrap()
+                .expect("expected aggregate state");
+        let restored = state2.restore_groups(&cp).unwrap();
+        assert_eq!(restored, 1);
+
+        // Verify global aggregate value
+        let result = state2.emit().unwrap();
+        assert_eq!(result.len(), 1);
+        assert_eq!(result[0].num_rows(), 1);
+        let total = result[0]
+            .column(0)
+            .as_any()
+            .downcast_ref::<arrow::array::Float64Array>()
+            .unwrap();
+        assert!(
+            (total.value(0) - 100.0).abs() < f64::EPSILON,
+            "Restored global SUM should be 100, got {}",
+            total.value(0)
+        );
     }
 
     #[tokio::test]
