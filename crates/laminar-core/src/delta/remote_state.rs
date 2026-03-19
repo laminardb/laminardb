@@ -172,8 +172,13 @@ impl<T: RemoteStateTransport> RemoteStateProxy<T> {
     }
 
     /// Update partition assignments, invalidating cache for changed partitions.
+    ///
+    /// Holds the write lock through both the assignment swap and cache
+    /// invalidation so that concurrent `get()` calls cannot read new
+    /// assignments while stale cache entries still exist.
     pub fn update_assignments(&self, new_assignments: HashMap<u32, NodeId>) {
-        let old = self.assignments.read().clone();
+        let mut guard = self.assignments.write();
+        let old = guard.clone();
         // Find partitions whose owner changed or were removed.
         let mut changed = Vec::new();
         for (pid, old_owner) in &old {
@@ -183,7 +188,6 @@ impl<T: RemoteStateTransport> RemoteStateProxy<T> {
                 _ => {}
             }
         }
-        *self.assignments.write() = new_assignments;
 
         if !changed.is_empty() {
             let mut cache = self.cache.lock();
@@ -191,6 +195,8 @@ impl<T: RemoteStateTransport> RemoteStateProxy<T> {
                 cache.invalidate_partition(pid);
             }
         }
+
+        *guard = new_assignments;
     }
 
     /// Update known node addresses.
