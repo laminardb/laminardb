@@ -669,11 +669,10 @@ async fn update_config(
     Json(body): Json<serde_json::Value>,
 ) -> impl IntoResponse {
     let current = state.current_config.read().await;
-    let current_toml = toml::to_string(&mask_config_secrets(&current)).unwrap_or_default();
+    // Merge against the REAL config (not masked) to preserve secrets.
+    let mut merged = config_to_merge_json(&current);
     drop(current);
 
-    let mut merged: serde_json::Value =
-        serde_json::from_str(&current_toml).unwrap_or(serde_json::json!({}));
     merge_json(&mut merged, &body);
 
     let merged_toml = match toml::to_string(&merged) {
@@ -745,8 +744,27 @@ struct ConfigValidateRequest {
     config: String,
 }
 
+/// Convert a `ServerConfig` to a JSON value, optionally masking secrets.
 /// Mask sensitive values in config for safe display.
 fn mask_config_secrets(config: &crate::config::ServerConfig) -> serde_json::Value {
+    config_to_json_inner(config, true, false)
+}
+
+/// Serialize config to JSON for merge operations (uses serde-renamed keys).
+fn config_to_merge_json(config: &crate::config::ServerConfig) -> serde_json::Value {
+    config_to_json_inner(config, false, true)
+}
+
+/// Inner helper: convert config to JSON.
+///
+/// `mask_secrets`: replace sensitive property values with `"***"`.
+/// `use_serde_keys`: use serde-renamed keys (e.g., `"source"` instead of `"sources"`)
+///                    for round-tripping through TOML deserialization.
+fn config_to_json_inner(
+    config: &crate::config::ServerConfig,
+    mask_secrets: bool,
+    use_serde_keys: bool,
+) -> serde_json::Value {
     let mut obj = serde_json::json!({
         "server": {
             "mode": config.server.mode,
@@ -770,7 +788,7 @@ fn mask_config_secrets(config: &crate::config::ServerConfig) -> serde_json::Valu
         .map(|s| {
             let mut props = serde_json::Map::new();
             for (k, v) in &s.properties {
-                if is_sensitive_key(k) {
+                if mask_secrets && is_sensitive_key(k) {
                     props.insert(k.clone(), serde_json::Value::String("***".to_string()));
                 } else {
                     props.insert(k.clone(), serde_json::Value::String(v.to_string()));
@@ -782,14 +800,20 @@ fn mask_config_secrets(config: &crate::config::ServerConfig) -> serde_json::Valu
             })
         })
         .collect();
-    obj["sources"] = serde_json::Value::Array(sources);
+    let source_key = if use_serde_keys { "source" } else { "sources" };
+    obj[source_key] = serde_json::Value::Array(sources);
 
     let pipelines: Vec<serde_json::Value> = config
         .pipelines
         .iter()
         .map(|p| serde_json::json!({ "name": p.name, "sql": p.sql, "parallelism": p.parallelism }))
         .collect();
-    obj["pipelines"] = serde_json::Value::Array(pipelines);
+    let pipeline_key = if use_serde_keys {
+        "pipeline"
+    } else {
+        "pipelines"
+    };
+    obj[pipeline_key] = serde_json::Value::Array(pipelines);
 
     let sinks: Vec<serde_json::Value> = config
         .sinks
@@ -797,7 +821,7 @@ fn mask_config_secrets(config: &crate::config::ServerConfig) -> serde_json::Valu
         .map(|s| {
             let mut props = serde_json::Map::new();
             for (k, v) in &s.properties {
-                if is_sensitive_key(k) {
+                if mask_secrets && is_sensitive_key(k) {
                     props.insert(k.clone(), serde_json::Value::String("***".to_string()));
                 } else {
                     props.insert(k.clone(), serde_json::Value::String(v.to_string()));
@@ -810,14 +834,16 @@ fn mask_config_secrets(config: &crate::config::ServerConfig) -> serde_json::Valu
             })
         })
         .collect();
-    obj["sinks"] = serde_json::Value::Array(sinks);
+    let sink_key = if use_serde_keys { "sink" } else { "sinks" };
+    obj[sink_key] = serde_json::Value::Array(sinks);
 
     let lookups: Vec<serde_json::Value> = config
         .lookups
         .iter()
         .map(|l| serde_json::json!({ "name": l.name, "connector": l.connector, "strategy": l.strategy }))
         .collect();
-    obj["lookups"] = serde_json::Value::Array(lookups);
+    let lookup_key = if use_serde_keys { "lookup" } else { "lookups" };
+    obj[lookup_key] = serde_json::Value::Array(lookups);
 
     if let Some(ref node_id) = config.node_id {
         obj["node_id"] = serde_json::Value::String(node_id.clone());
@@ -1410,6 +1436,77 @@ mod tests {
         merge_json(&mut target, &patch);
         assert_eq!(target["a"], 1);
         assert!(target.get("b").is_none());
+    }
+
+    #[tokio::test]
+    async fn test_update_config_preserves_secrets() {
+        // Regression: PUT /api/v1/config must merge against the real config,
+        // not the masked one, otherwise secrets get replaced with "***".
+        let state = Arc::new(AppState {
+            db: Arc::new(LaminarDB::open().unwrap()),
+            config_path: PathBuf::from("test.toml"),
+            started_at: chrono::Utc::now(),
+            current_config: tokio::sync::RwLock::new(crate::config::ServerConfig {
+                server: crate::config::ServerSection::default(),
+                state: crate::config::StateSection::default(),
+                checkpoint: crate::config::CheckpointSection::default(),
+                sources: vec![crate::config::SourceConfig {
+                    name: "kafka_src".to_string(),
+                    connector: "kafka".to_string(),
+                    format: "json".to_string(),
+                    properties: {
+                        let mut t = toml::Table::new();
+                        t.insert(
+                            "password".to_string(),
+                            toml::Value::String("super_secret_123".to_string()),
+                        );
+                        t.insert(
+                            "topic".to_string(),
+                            toml::Value::String("events".to_string()),
+                        );
+                        t
+                    },
+                    schema: vec![],
+                    watermark: None,
+                }],
+                lookups: vec![],
+                pipelines: vec![],
+                sinks: vec![],
+                discovery: None,
+                coordination: None,
+                node_id: None,
+            }),
+            reload_guard: ReloadGuard::new(),
+            reload_total: AtomicU64::new(0),
+            reload_last_ts: AtomicU64::new(0),
+        });
+
+        // PUT that changes only the server log level — should not touch source passwords.
+        let app = build_router(Arc::clone(&state));
+        let req = Request::builder()
+            .method("PUT")
+            .uri("/api/v1/config")
+            .header("content-type", "application/json")
+            .body(Body::from(
+                serde_json::to_string(&serde_json::json!({
+                    "server": { "log_level": "debug" }
+                }))
+                .unwrap(),
+            ))
+            .unwrap();
+        let _resp = app.oneshot(req).await.unwrap();
+
+        // Verify the real config still has the original password, not "***".
+        let cfg = state.current_config.read().await;
+        let pw = cfg.sources[0]
+            .properties
+            .get("password")
+            .and_then(|v| v.as_str());
+        assert_eq!(
+            pw,
+            Some("super_secret_123"),
+            "PUT must not destroy secrets — password should survive config merge"
+        );
     }
 
     #[test]
