@@ -55,6 +55,8 @@ mod handle;
 mod interval_join;
 mod metrics;
 mod metrics_api;
+/// Out-of-order merge engine for late-arriving data.
+pub mod o3_merge;
 /// Thread-per-core connector pipeline.
 pub mod pipeline;
 mod pipeline_callback;
@@ -99,6 +101,7 @@ pub use handle::{
     TypedSubscription, UntypedSourceHandle,
 };
 pub use metrics::{PipelineCounters, PipelineMetrics, PipelineState, SourceMetrics, StreamMetrics};
+pub use o3_merge::{LateDataStrategy, O3MergeConfig, O3MergeEngine};
 pub use profile::{Profile, ProfileError};
 pub use recovery_manager::{RecoveredState, RecoveryManager};
 

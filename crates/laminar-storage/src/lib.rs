@@ -40,6 +40,9 @@ pub mod incremental;
 /// Per-core WAL segments - Thread-per-core WAL for lock-free writes
 pub mod per_core_wal;
 
+/// WAL sequencer for parallel ingestion (QuestDB-inspired).
+pub mod wal_sequencer;
+
 /// Object store factory — builds S3, GCS, Azure, or local backends from URL schemes.
 pub mod object_store_builder;
 
