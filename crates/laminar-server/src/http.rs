@@ -62,44 +62,38 @@ pub struct AppState {
 }
 
 pub fn build_router(state: Arc<AppState>) -> Router {
-    Router::new()
-        // Health and observability
+    // Admin/write routes: no permissive CORS (same-origin only by default).
+    // Browser JS from other origins cannot call these endpoints.
+    let admin_routes = Router::new()
+        .route("/api/v1/checkpoint", post(trigger_checkpoint))
+        .route("/api/v1/sql", post(execute_sql))
+        .route("/api/v1/reload", post(handle_reload))
+        .route("/api/v1/config", get(get_config).put(update_config))
+        .route("/api/v1/config/validate", post(validate_config_endpoint))
+        .route("/api/v1/pause", post(not_implemented))
+        .route("/api/v1/resume", post(not_implemented));
+
+    // Read-only/public routes: permissive CORS for dashboards and monitoring.
+    let public_routes = Router::new()
         .route("/health", get(health_check))
         .route("/ready", get(readiness_check))
         .route("/metrics", get(prometheus_metrics))
-        // Web UIs
         .route("/console", get(sql_console_page))
         .route("/dashboard", get(dashboard_page))
-        // Pipeline introspection
         .route("/api/v1/sources", get(list_sources))
         .route("/api/v1/sinks", get(list_sinks))
         .route("/api/v1/streams", get(list_streams))
         .route("/api/v1/streams/{name}", get(get_stream))
-        // Actions
-        .route("/api/v1/checkpoint", post(trigger_checkpoint))
-        .route("/api/v1/sql", post(execute_sql))
-        .route("/api/v1/reload", post(handle_reload))
-        // Configuration management
-        .route("/api/v1/config", get(get_config).put(update_config))
-        .route("/api/v1/config/validate", post(validate_config_endpoint))
-        // Cluster (delta mode)
         .route("/api/v1/cluster", get(cluster_status))
-        // Stubs (501 Not Implemented)
-        .route("/api/v1/pause", post(not_implemented))
-        .route("/api/v1/resume", post(not_implemented))
-        // CORS: allow any origin with explicit methods/headers. In production
-        // deployments this should be restricted to trusted origins.
         .layer(
             CorsLayer::new()
                 .allow_origin(tower_http::cors::Any)
-                .allow_methods([
-                    axum::http::Method::GET,
-                    axum::http::Method::POST,
-                    axum::http::Method::PUT,
-                    axum::http::Method::OPTIONS,
-                ])
+                .allow_methods([axum::http::Method::GET, axum::http::Method::OPTIONS])
                 .allow_headers([axum::http::header::CONTENT_TYPE]),
-        )
+        );
+
+    public_routes
+        .merge(admin_routes)
         .layer(axum::middleware::from_fn(request_logging))
         .with_state(state)
 }
@@ -501,10 +495,13 @@ async fn handle_reload(State(state): State<Arc<AppState>>) -> impl IntoResponse 
     let now = chrono::Utc::now().timestamp() as u64;
     state.reload_last_ts.store(now, Ordering::Relaxed);
 
-    // Update current config on success
-    if result.success {
+    // Always update current_config to reflect the file on disk. Even on
+    // partial apply, the next diff should be computed from what the file says.
+    {
         let mut current = state.current_config.write().await;
         *current = new_config;
+    }
+    if result.success {
         info!(
             "Configuration reloaded successfully ({} ops)",
             result.applied.len()
@@ -692,14 +689,48 @@ async fn update_config(
     };
 
     let current = state.current_config.read().await;
-    // Merge against the REAL config (not masked) to preserve secrets.
-    let mut merged = config_to_merge_json(&current);
+    // Serialize the REAL config to TOML string (round-trip safe).
+    let base_toml_str = match toml::to_string(&config_to_merge_toml(&current)) {
+        Ok(s) => s,
+        Err(e) => {
+            drop(current);
+            return error_response(
+                StatusCode::BAD_REQUEST,
+                format!("internal config serialization error: {e}"),
+            )
+            .into_response();
+        }
+    };
     drop(current);
+
+    // Parse base TOML string back as a generic TOML value for merging.
+    let mut merged: toml::Value = match toml::from_str(&base_toml_str) {
+        Ok(v) => v,
+        Err(e) => {
+            return error_response(
+                StatusCode::BAD_REQUEST,
+                format!("internal config parse error: {e}"),
+            )
+            .into_response();
+        }
+    };
 
     // Filter out "***" masked placeholders before merging, so that values
     // copied from GET /config don't overwrite real secrets with the mask.
     let filtered_body = filter_masked_values(&body);
-    merge_json(&mut merged, &filtered_body);
+
+    // Convert the JSON patch to a TOML value and merge.
+    let patch_toml: toml::Value = match serde_json::from_value(filtered_body) {
+        Ok(v) => v,
+        Err(e) => {
+            return error_response(
+                StatusCode::BAD_REQUEST,
+                format!("invalid config update: {e}"),
+            )
+            .into_response();
+        }
+    };
+    merge_toml(&mut merged, &patch_toml);
 
     let merged_toml = match toml::to_string(&merged) {
         Ok(t) => t,
@@ -742,7 +773,10 @@ async fn update_config(
 
     let result = crate::reload::apply_reload(&state.db, &diff).await;
 
-    if result.success {
+    // Always update current_config to reflect the desired state. Even on
+    // partial apply (207), the config represents what the user intended.
+    // A subsequent reload or PUT will re-diff from the correct base.
+    {
         let mut current = state.current_config.write().await;
         *current = new_config;
     }
@@ -778,125 +812,63 @@ struct ConfigValidateRequest {
     config: String,
 }
 
-/// Convert a `ServerConfig` to a JSON value, optionally masking secrets.
-/// Mask sensitive values in config for safe display.
-fn mask_config_secrets(config: &crate::config::ServerConfig) -> serde_json::Value {
-    config_to_json_inner(config, true, false)
-}
-
-/// Serialize config to JSON for merge operations (uses serde-renamed keys).
-fn config_to_merge_json(config: &crate::config::ServerConfig) -> serde_json::Value {
-    config_to_json_inner(config, false, true)
-}
-
-/// Inner helper: convert config to JSON.
+/// Serialize config to a TOML value for merge operations.
 ///
-/// `mask_secrets`: replace sensitive property values with `"***"`.
-/// `use_serde_keys`: use serde-renamed keys (e.g., `"source"` instead of `"sources"`)
-///                    for round-tripping through TOML deserialization.
-fn config_to_json_inner(
-    config: &crate::config::ServerConfig,
-    mask_secrets: bool,
-    use_serde_keys: bool,
-) -> serde_json::Value {
-    let mut obj = serde_json::json!({
-        "server": {
-            "mode": config.server.mode,
-            "bind": config.server.bind,
-            "workers": config.server.workers,
-            "log_level": config.server.log_level,
-        },
-        "state": {
-            "backend": config.state.backend,
-            "path": config.state.path,
-        },
-        "checkpoint": {
-            "url": config.checkpoint.url,
-            "interval": humantime::format_duration(config.checkpoint.interval).to_string(),
-        },
-    });
+/// Uses serde serialization to produce a complete, round-trip-safe TOML
+/// representation including all fields (schema, watermark, discovery, etc.).
+fn config_to_merge_toml(config: &crate::config::ServerConfig) -> toml::Value {
+    toml::Value::try_from(config).unwrap_or_else(|_| toml::Value::Table(toml::Table::new()))
+}
 
-    let sources: Vec<serde_json::Value> = config
-        .sources
-        .iter()
-        .map(|s| {
-            let mut props = serde_json::Map::new();
-            for (k, v) in &s.properties {
-                if mask_secrets && is_sensitive_key(k) {
-                    props.insert(k.clone(), serde_json::Value::String("***".to_string()));
-                } else {
-                    props.insert(k.clone(), serde_json::Value::String(v.to_string()));
-                }
-            }
-            serde_json::json!({
-                "name": s.name, "connector": s.connector,
-                "format": s.format, "properties": props,
-            })
-        })
-        .collect();
-    let source_key = if use_serde_keys { "source" } else { "sources" };
-    obj[source_key] = serde_json::Value::Array(sources);
-
-    let pipelines: Vec<serde_json::Value> = config
-        .pipelines
-        .iter()
-        .map(|p| serde_json::json!({ "name": p.name, "sql": p.sql, "parallelism": p.parallelism }))
-        .collect();
-    let pipeline_key = if use_serde_keys {
-        "pipeline"
-    } else {
-        "pipelines"
-    };
-    obj[pipeline_key] = serde_json::Value::Array(pipelines);
-
-    let sinks: Vec<serde_json::Value> = config
-        .sinks
-        .iter()
-        .map(|s| {
-            let mut props = serde_json::Map::new();
-            for (k, v) in &s.properties {
-                if mask_secrets && is_sensitive_key(k) {
-                    props.insert(k.clone(), serde_json::Value::String("***".to_string()));
-                } else {
-                    props.insert(k.clone(), serde_json::Value::String(v.to_string()));
-                }
-            }
-            serde_json::json!({
-                "name": s.name, "pipeline": s.pipeline,
-                "connector": s.connector, "delivery": s.delivery,
-                "properties": props,
-            })
-        })
-        .collect();
-    let sink_key = if use_serde_keys { "sink" } else { "sinks" };
-    obj[sink_key] = serde_json::Value::Array(sinks);
-
-    let lookups: Vec<serde_json::Value> = config
-        .lookups
-        .iter()
-        .map(|l| {
-            let mut props = serde_json::Map::new();
-            for (k, v) in &l.properties {
-                if mask_secrets && is_sensitive_key(k) {
-                    props.insert(k.clone(), serde_json::Value::String("***".to_string()));
-                } else {
-                    props.insert(k.clone(), serde_json::Value::String(v.to_string()));
-                }
-            }
-            serde_json::json!({
-                "name": l.name, "connector": l.connector,
-                "strategy": l.strategy, "properties": props,
-            })
-        })
-        .collect();
-    let lookup_key = if use_serde_keys { "lookup" } else { "lookups" };
-    obj[lookup_key] = serde_json::Value::Array(lookups);
-
-    if let Some(ref node_id) = config.node_id {
-        obj["node_id"] = serde_json::Value::String(node_id.clone());
+/// Convert a TOML value to a JSON value for merge operations.
+fn toml_to_json(value: &toml::Value) -> serde_json::Value {
+    match value {
+        toml::Value::String(s) => serde_json::Value::String(s.clone()),
+        toml::Value::Integer(i) => serde_json::json!(*i),
+        toml::Value::Float(f) => serde_json::json!(*f),
+        toml::Value::Boolean(b) => serde_json::json!(*b),
+        toml::Value::Datetime(dt) => serde_json::Value::String(dt.to_string()),
+        toml::Value::Array(arr) => serde_json::Value::Array(arr.iter().map(toml_to_json).collect()),
+        toml::Value::Table(t) => {
+            let obj: serde_json::Map<String, serde_json::Value> = t
+                .iter()
+                .map(|(k, v)| (k.clone(), toml_to_json(v)))
+                .collect();
+            serde_json::Value::Object(obj)
+        }
     }
+}
 
-    obj
+/// Mask sensitive values in config for safe display.
+///
+/// Serializes the full config via serde, then walks the JSON tree to replace
+/// any property value whose key looks sensitive with `"***"`.
+fn mask_config_secrets(config: &crate::config::ServerConfig) -> serde_json::Value {
+    let toml_val = config_to_merge_toml(config);
+    let mut json = toml_to_json(&toml_val);
+    mask_sensitive_values(&mut json);
+    json
+}
+
+/// Recursively walk a JSON value and replace sensitive property values with `"***"`.
+fn mask_sensitive_values(value: &mut serde_json::Value) {
+    match value {
+        serde_json::Value::Object(obj) => {
+            for (key, val) in obj.iter_mut() {
+                if is_sensitive_key(key) && val.is_string() {
+                    *val = serde_json::Value::String("***".to_string());
+                } else {
+                    mask_sensitive_values(val);
+                }
+            }
+        }
+        serde_json::Value::Array(arr) => {
+            for item in arr.iter_mut() {
+                mask_sensitive_values(item);
+            }
+        }
+        _ => {}
+    }
 }
 
 /// Returns `true` if a config key name looks like it contains credentials.
@@ -909,26 +881,6 @@ fn is_sensitive_key(key: &str) -> bool {
         || lower.contains("api_key")
         || lower.contains("apikey")
         || lower.contains("access_key")
-}
-
-/// Deep-merge `patch` into `target` (JSON merge-patch semantics).
-fn merge_json(target: &mut serde_json::Value, patch: &serde_json::Value) {
-    if let (Some(target_obj), Some(patch_obj)) = (target.as_object_mut(), patch.as_object()) {
-        for (key, value) in patch_obj {
-            if value.is_null() {
-                target_obj.remove(key);
-            } else if value.is_object() {
-                let entry = target_obj
-                    .entry(key.clone())
-                    .or_insert(serde_json::json!({}));
-                merge_json(entry, value);
-            } else {
-                target_obj.insert(key.clone(), value.clone());
-            }
-        }
-    } else {
-        *target = patch.clone();
-    }
 }
 
 /// Recursively strip any JSON string values equal to `"***"` from the object.
@@ -954,6 +906,103 @@ fn filter_masked_values(value: &serde_json::Value) -> serde_json::Value {
     }
 }
 
+/// Deep-merge `patch` into `target` in TOML value space.
+///
+/// Arrays of tables with a `"name"` key are merged by matching name.
+fn merge_toml(target: &mut toml::Value, patch: &toml::Value) {
+    if let (Some(target_tbl), Some(patch_tbl)) = (target.as_table_mut(), patch.as_table()) {
+        for (key, value) in patch_tbl {
+            if value.is_table() {
+                let entry = target_tbl
+                    .entry(key)
+                    .or_insert_with(|| toml::Value::Table(toml::Table::new()));
+                merge_toml(entry, value);
+            } else if let Some(patch_arr) = value.as_array() {
+                // Merge arrays of tables by matching on "name" key
+                if let Some(target_val) = target_tbl.get(key) {
+                    if let Some(target_arr) = target_val.as_array() {
+                        let merged = merge_named_toml_arrays(target_arr, patch_arr);
+                        target_tbl.insert(key.clone(), toml::Value::Array(merged));
+                        continue;
+                    }
+                }
+                target_tbl.insert(key.clone(), value.clone());
+            } else {
+                target_tbl.insert(key.clone(), value.clone());
+            }
+        }
+    }
+}
+
+/// Merge two TOML arrays of tables by matching on the `"name"` field.
+///
+/// Patch items are merged into matching target items. Target items not
+/// present in the patch are preserved (not dropped).
+fn merge_named_toml_arrays(target: &[toml::Value], patch: &[toml::Value]) -> Vec<toml::Value> {
+    let patch_has_names = patch.iter().all(|v| {
+        v.as_table()
+            .and_then(|t| t.get("name"))
+            .and_then(|n| n.as_str())
+            .is_some()
+    });
+
+    if !patch_has_names || patch.is_empty() {
+        return patch.to_vec();
+    }
+
+    // Collect patch names for lookup.
+    let patch_names: Vec<Option<&str>> = patch
+        .iter()
+        .map(|v| {
+            v.as_table()
+                .and_then(|t| t.get("name"))
+                .and_then(|n| n.as_str())
+        })
+        .collect();
+
+    let mut result = Vec::with_capacity(target.len().max(patch.len()));
+
+    // Start with all target items, merging in patches where names match.
+    for target_item in target {
+        let target_name = target_item
+            .as_table()
+            .and_then(|t| t.get("name"))
+            .and_then(|n| n.as_str());
+
+        if let Some(name) = target_name {
+            if let Some(idx) = patch_names.iter().position(|pn| *pn == Some(name)) {
+                // Merge patch into target item
+                let mut merged = target_item.clone();
+                merge_toml(&mut merged, &patch[idx]);
+                result.push(merged);
+                continue;
+            }
+        }
+        // Target item not in patch: preserve it
+        result.push(target_item.clone());
+    }
+
+    // Append patch items that don't match any target item (new entries).
+    for (i, patch_item) in patch.iter().enumerate() {
+        let patch_name = patch_names[i];
+        if let Some(name) = patch_name {
+            let already_merged = target.iter().any(|t| {
+                t.as_table()
+                    .and_then(|tbl| tbl.get("name"))
+                    .and_then(|n| n.as_str())
+                    == Some(name)
+            });
+            if !already_merged {
+                result.push(patch_item.clone());
+            }
+        } else {
+            result.push(patch_item.clone());
+        }
+    }
+
+    result
+}
+
 /// Stub handler for unimplemented endpoints.
 async fn not_implemented() -> impl IntoResponse {
     error_response(
@@ -970,6 +1019,26 @@ async fn not_implemented() -> impl IntoResponse {
 mod tests {
     use super::*;
     use axum::body::Body;
+
+    /// Deep-merge `patch` into `target` (JSON merge-patch semantics, test helper).
+    fn merge_json(target: &mut serde_json::Value, patch: &serde_json::Value) {
+        if let (Some(target_obj), Some(patch_obj)) = (target.as_object_mut(), patch.as_object()) {
+            for (key, value) in patch_obj {
+                if value.is_null() {
+                    target_obj.remove(key);
+                } else if value.is_object() {
+                    let entry = target_obj
+                        .entry(key.clone())
+                        .or_insert(serde_json::json!({}));
+                    merge_json(entry, value);
+                } else {
+                    target_obj.insert(key.clone(), value.clone());
+                }
+            }
+        } else {
+            *target = patch.clone();
+        }
+    }
     use axum::http::Request;
     use tower::ServiceExt;
 
@@ -1360,7 +1429,7 @@ mod tests {
         };
 
         let masked = mask_config_secrets(&config);
-        let sources = masked["sources"].as_array().unwrap();
+        let sources = masked["source"].as_array().unwrap();
         let props = &sources[0]["properties"];
         assert_eq!(props["password"], "***");
         assert_ne!(props["topic"], "***");
