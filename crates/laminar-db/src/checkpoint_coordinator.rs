@@ -589,10 +589,21 @@ impl CheckpointCoordinator {
 
         match tokio::time::timeout(timeout_dur, self.pre_commit_sinks_inner(epoch)).await {
             Ok(result) => result,
-            Err(_elapsed) => Err(DbError::Checkpoint(format!(
-                "pre-commit timed out after {}s",
-                timeout_dur.as_secs()
-            ))),
+            Err(_elapsed) => {
+                // Rollback all sinks that may have pre-committed before the
+                // timeout fired, matching the error path in pre_commit_sinks_inner.
+                if let Err(rollback_err) = self.rollback_sinks(epoch).await {
+                    error!(
+                        epoch,
+                        error = %rollback_err,
+                        "[LDB-6004] sink rollback failed after pre-commit timeout"
+                    );
+                }
+                Err(DbError::Checkpoint(format!(
+                    "pre-commit timed out after {}s",
+                    timeout_dur.as_secs()
+                )))
+            }
         }
     }
 

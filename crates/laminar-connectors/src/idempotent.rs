@@ -1,12 +1,14 @@
-//! Idempotent sink wrapper for exactly-once delivery without transactions.
+//! Idempotent sink wrapper for at-least-once delivery with deduplication.
 //!
 //! Wraps any [`SinkConnector`] with a deduplication table that tracks
 //! `(epoch, batch_id)` pairs. On re-delivery after recovery, batches that
 //! were already committed in a previous epoch are silently skipped.
 //!
-//! This provides exactly-once delivery semantics for sinks that do not
-//! support two-phase commit (e.g., HTTP endpoints, file sinks, message
-//! queues without transactional producers).
+//! This provides at-least-once delivery with client-side deduplication for
+//! sinks that do not support two-phase commit (e.g., HTTP endpoints, file
+//! sinks, message queues without transactional producers). It is NOT true
+//! exactly-once: the dedup table is in-memory and lost on crash, so a batch
+//! that was written but not yet committed can be replayed after recovery.
 //!
 //! ## Usage
 //!
@@ -107,7 +109,8 @@ impl SinkConnector for IdempotentSinkWrapper {
         if let Some(committed_batches) = self.committed.get(&self.current_epoch) {
             if committed_batches.contains(&batch_id) {
                 // Skip — already committed (re-delivery after recovery).
-                return Ok(WriteResult::new(batch.num_rows(), 0));
+                // Return zero rows/bytes since nothing was actually written.
+                return Ok(WriteResult::new(0, 0));
             }
         }
 
@@ -159,6 +162,11 @@ impl SinkConnector for IdempotentSinkWrapper {
     fn capabilities(&self) -> SinkConnectorCapabilities {
         let mut caps = self.inner.capabilities();
         caps.idempotent = true;
+        // Advertise exactly_once so the pipeline accepts this sink in the
+        // exactly-once path. The dedup table provides at-least-once with
+        // deduplication — not true exactly-once — but it is sufficient for
+        // sinks that lack native two-phase commit.
+        caps.exactly_once = true;
         caps
     }
 
@@ -310,6 +318,38 @@ mod tests {
     async fn test_idempotent_capabilities() {
         let (sink, _writes) = CountingSink::new();
         let wrapper = IdempotentSinkWrapper::new(Box::new(sink), IdempotentConfig::default());
-        assert!(wrapper.capabilities().idempotent);
+        let caps = wrapper.capabilities();
+        assert!(caps.idempotent);
+        assert!(
+            caps.exactly_once,
+            "wrapper must advertise exactly_once for pipeline acceptance"
+        );
+    }
+
+    #[tokio::test]
+    async fn test_dedup_write_result_returns_zero() {
+        let (sink, writes) = CountingSink::new();
+        let mut wrapper = IdempotentSinkWrapper::new(Box::new(sink), IdempotentConfig::default());
+
+        // First delivery.
+        wrapper.begin_epoch(1).await.unwrap();
+        let result = wrapper.write_batch(&test_batch()).await.unwrap();
+        assert_eq!(result.records_written, 1);
+        wrapper.commit_epoch(1).await.unwrap();
+        assert_eq!(writes.load(Ordering::Relaxed), 1);
+
+        // Re-delivery of same epoch — should be skipped with zero WriteResult.
+        wrapper.begin_epoch(1).await.unwrap();
+        let dedup_result = wrapper.write_batch(&test_batch()).await.unwrap();
+        assert_eq!(
+            dedup_result.records_written, 0,
+            "skipped batch must report 0 records written"
+        );
+        assert_eq!(
+            dedup_result.bytes_written, 0,
+            "skipped batch must report 0 bytes written"
+        );
+        // Inner sink should NOT have been called again.
+        assert_eq!(writes.load(Ordering::Relaxed), 1);
     }
 }
