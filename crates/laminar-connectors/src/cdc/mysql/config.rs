@@ -80,6 +80,14 @@ pub struct MySqlCdcConfig {
 
     /// Database filter (if set, only replicate from this database).
     pub database_filter: Option<String>,
+
+    /// Maximum events to buffer (default: 100,000).
+    pub max_buffered_events: usize,
+
+    /// High watermark ratio (0.0–1.0) of `max_buffered_events`. When the
+    /// buffer reaches this level, stop draining the binlog reader channel
+    /// to apply backpressure (default: 0.8).
+    pub backpressure_high_watermark: f64,
 }
 
 impl Default for MySqlCdcConfig {
@@ -105,11 +113,24 @@ impl Default for MySqlCdcConfig {
             table_include: Vec::new(),
             table_exclude: Vec::new(),
             database_filter: None,
+            max_buffered_events: 100_000,
+            backpressure_high_watermark: 0.8,
         }
     }
 }
 
 impl MySqlCdcConfig {
+    /// Returns the high watermark as an absolute event count.
+    #[must_use]
+    #[allow(
+        clippy::cast_precision_loss,
+        clippy::cast_possible_truncation,
+        clippy::cast_sign_loss
+    )]
+    pub fn backpressure_high_watermark(&self) -> usize {
+        (self.max_buffered_events as f64 * self.backpressure_high_watermark) as usize
+    }
+
     /// Creates a new config with required fields.
     #[must_use]
     pub fn new(host: &str, username: &str) -> Self {
@@ -210,6 +231,13 @@ impl MySqlCdcConfig {
             cfg.table_exclude = tables.split(',').map(|s| s.trim().to_string()).collect();
         }
         cfg.database_filter = config.get("database.filter").map(String::from);
+
+        if let Some(max) = config.get_parsed::<usize>("max.buffered.events")? {
+            cfg.max_buffered_events = max;
+        }
+        if let Some(hw) = config.get_parsed::<f64>("backpressure.high.watermark")? {
+            cfg.backpressure_high_watermark = hw;
+        }
 
         cfg.validate()?;
         Ok(cfg)
