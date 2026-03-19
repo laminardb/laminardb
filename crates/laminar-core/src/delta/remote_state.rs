@@ -129,6 +129,10 @@ impl LruCache {
     }
 
     fn insert(&mut self, partition_id: u32, key: Vec<u8>, value: RemoteValue) {
+        // capacity == 0 means "no caching" — don't insert anything.
+        if self.capacity == 0 {
+            return;
+        }
         self.counter += 1;
         let cache_key = (partition_id, key);
         // Update in-place if key already exists (no eviction needed).
@@ -333,11 +337,15 @@ mod tests {
             &self,
             _target_node: NodeId,
             _target_address: &str,
-            _partition_id: u32,
+            partition_id: u32,
             _key: &[u8],
         ) -> Result<Option<RemoteValue>, RemoteStateError> {
             self.call_count.fetch_add(1, Ordering::Relaxed);
-            Ok(self.value.clone())
+            // Echo back the requested partition_id so validation passes.
+            Ok(self.value.as_ref().map(|v| RemoteValue {
+                partition_id,
+                ..v.clone()
+            }))
         }
     }
 

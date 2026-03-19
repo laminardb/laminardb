@@ -200,8 +200,8 @@ impl PartitionRouter {
             let columns: Vec<arrow_array::ArrayRef> = batch
                 .columns()
                 .iter()
-                .map(|col| arrow::compute::take(col.as_ref(), &indices, None).unwrap())
-                .collect();
+                .map(|col| arrow::compute::take(col.as_ref(), &indices, None))
+                .collect::<Result<Vec<_>, arrow_schema::ArrowError>>()?;
             let sub_batch = RecordBatch::try_new(schema.clone(), columns)?;
             if node_id == self.local_node {
                 local.push(sub_batch);
