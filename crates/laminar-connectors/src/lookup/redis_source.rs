@@ -173,10 +173,14 @@ impl fmt::Debug for RedisLookupSource {
 /// For pattern `user:*`, key `user:123` -> `123`.
 /// For pattern `*`, key `foo` -> `foo`.
 fn extract_key_suffix(key: &str, pattern: &str) -> String {
-    // Find the position of '*' in the pattern and strip the prefix.
+    // Strip the prefix before '*' and the suffix after '*' from the key.
+    // e.g., pattern "user:*:profile" + key "user:123:profile" → "123"
     if let Some(star_pos) = pattern.find('*') {
         let prefix = &pattern[..star_pos];
-        key.strip_prefix(prefix).unwrap_or(key).to_string()
+        let suffix = &pattern[star_pos + 1..];
+        let stripped = key.strip_prefix(prefix).unwrap_or(key);
+        let stripped = stripped.strip_suffix(suffix).unwrap_or(stripped);
+        stripped.to_string()
     } else {
         key.to_string()
     }
@@ -479,6 +483,17 @@ mod tests {
         );
         assert_eq!(extract_key_suffix("foo", "*"), "foo");
         assert_eq!(extract_key_suffix("unknown", "prefix:*"), "unknown");
+        // Non-prefix patterns: strip both prefix and suffix around '*'
+        assert_eq!(
+            extract_key_suffix("user:123:profile", "user:*:profile"),
+            "123"
+        );
+        assert_eq!(extract_key_suffix("cache:abc:v2", "cache:*:v2"), "abc");
+        // Suffix doesn't match — keep what's after prefix
+        assert_eq!(
+            extract_key_suffix("user:123:other", "user:*:profile"),
+            "123:other"
+        );
     }
 
     #[test]
