@@ -35,7 +35,7 @@ pub enum LateDataStrategy {
     Drop,
     /// Buffer late rows and merge them back into the pipeline.
     Merge,
-    /// Redirect late rows to a side output stream.
+    /// Redirect late rows to a side output stream (not yet implemented).
     Redirect,
 }
 
@@ -194,6 +194,7 @@ impl O3MergeEngine {
         }
 
         let late_batches = buf.drain();
+        let late_row_count: usize = late_batches.iter().map(RecordBatch::num_rows).sum();
         let time_column = buf.time_column.clone();
 
         // Merge late + on-time batches.
@@ -220,7 +221,7 @@ impl O3MergeEngine {
 
         #[allow(clippy::cast_possible_truncation)]
         {
-            self.total_merged_rows += concatenated.num_rows() as u64;
+            self.total_merged_rows += late_row_count as u64;
         }
 
         // Sort by event-time column.

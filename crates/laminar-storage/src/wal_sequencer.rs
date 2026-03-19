@@ -161,6 +161,23 @@ impl SegmentReorderBuffer {
         }
 
         // seq == next_expected: this segment is next in line.
+        // Skip tombstones that arrive directly (not buffered).
+        if Self::is_tombstone(&segment) {
+            self.next_expected += 1;
+            // Still drain contiguous buffered segments after the tombstone.
+            let mut ready = Vec::new();
+            while let Some(entry) = self.pending.remove(&self.next_expected) {
+                if Self::is_tombstone(&entry) {
+                    self.next_expected += 1;
+                    continue;
+                }
+                ready.push(entry);
+                self.next_expected += 1;
+                self.total_applied += 1;
+            }
+            return ready;
+        }
+
         let mut ready = vec![segment];
         self.next_expected += 1;
         self.total_applied += 1;
@@ -219,9 +236,17 @@ impl SegmentReorderBuffer {
         }
 
         if id > self.next_expected {
-            // Not the next expected — just remove it from pending if buffered
-            // (it hasn't been assigned yet, so it won't be there, but be safe).
-            self.pending.remove(&id);
+            // Remove any existing buffered segment for this ID. If a legitimate
+            // segment was already buffered, it will be discarded by the abort.
+            if let Some(existing) = self.pending.remove(&id) {
+                if !Self::is_tombstone(&existing) {
+                    tracing::warn!(
+                        seq = id,
+                        entry_count = existing.entry_count,
+                        "WAL sequencer: abort_id discarding buffered segment with data"
+                    );
+                }
+            }
             // Insert a tombstone marker: we store nothing, but we need to
             // advance past this ID when it becomes next_expected. Mark it
             // by inserting a zero-length sentinel segment.

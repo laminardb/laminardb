@@ -243,6 +243,7 @@ const INDEX_FILE_NAME: &str = "index.bin";
 
 impl Partition {
     fn new(id: i64, dir: &Path, config: &ColumnFileConfig) -> Result<Self, StateError> {
+        let is_reopen = dir.exists();
         fs::create_dir_all(dir)?;
 
         let mut columns = Vec::with_capacity(config.column_names.len());
@@ -250,6 +251,13 @@ impl Partition {
 
         for (idx, name) in config.column_names.iter().enumerate() {
             let col_path = dir.join(format!("{name}.col"));
+            if is_reopen && !col_path.exists() {
+                return Err(StateError::Corruption(format!(
+                    "partition {} is missing column file: {}",
+                    id,
+                    col_path.display()
+                )));
+            }
             let col = ColumnFile::open(&col_path, config.column_file_size)?;
             columns.push(col);
             column_indices.insert(name.clone(), idx);
