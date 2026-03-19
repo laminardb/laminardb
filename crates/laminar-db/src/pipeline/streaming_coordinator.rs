@@ -99,9 +99,6 @@ pub struct StreamingCoordinator {
     /// Partition router for distributed mode (delta feature).
     #[cfg(feature = "delta")]
     partition_router: Option<PartitionRouter>,
-    /// Queue of batches destined for remote nodes.
-    #[cfg(feature = "delta")]
-    remote_batch_queue: Vec<(laminar_core::delta::discovery::NodeId, RecordBatch)>,
 }
 
 /// Tracks in-flight checkpoint barrier alignment.
@@ -321,8 +318,6 @@ impl StreamingCoordinator {
             control_rx,
             #[cfg(feature = "delta")]
             partition_router: None,
-            #[cfg(feature = "delta")]
-            remote_batch_queue: Vec::new(),
         })
     }
 
@@ -330,56 +325,6 @@ impl StreamingCoordinator {
     #[cfg(feature = "delta")]
     pub fn set_partition_router(&mut self, router: PartitionRouter) {
         self.partition_router = Some(router);
-    }
-
-    /// Route batches through the partition router (delta mode).
-    #[cfg(feature = "delta")]
-    fn route_batches(&mut self) {
-        let Some(ref router) = self.partition_router else {
-            return;
-        };
-        let mut routed_local: FxHashMap<Arc<str>, Vec<RecordBatch>> = FxHashMap::default();
-        for (source_name, batches) in self.source_batches_buf.drain() {
-            for batch in batches {
-                let split = router.route_batch(&batch);
-                if !split.local.is_empty() {
-                    routed_local
-                        .entry(Arc::clone(&source_name))
-                        .or_default()
-                        .extend(split.local);
-                }
-                for (node_id, remote_batches) in split.remote {
-                    for rb in remote_batches {
-                        self.remote_batch_queue.push((node_id, rb));
-                    }
-                }
-            }
-        }
-        self.source_batches_buf = routed_local;
-    }
-
-    /// Drain the remote batch queue.
-    ///
-    /// TODO(cluster): Wire actual gRPC transport. Until then, batches are
-    /// logged as dropped so the data loss is visible in observability.
-    #[cfg(feature = "delta")]
-    fn drain_remote_batches(&mut self) {
-        if self.remote_batch_queue.is_empty() {
-            return;
-        }
-        let count = self.remote_batch_queue.len();
-        let total_rows: usize = self
-            .remote_batch_queue
-            .iter()
-            .map(|(_, b)| b.num_rows())
-            .sum();
-        tracing::warn!(
-            batches = count,
-            rows = total_rows,
-            "remote batches dropped — gRPC forwarding not yet implemented \
-             (distributed queries will return incomplete results)"
-        );
-        self.remote_batch_queue.clear();
     }
 
     /// Run the coordinator loop.
@@ -471,10 +416,6 @@ impl StreamingCoordinator {
                 }
             }
 
-            // Step: Route batches through partition router (delta mode).
-            #[cfg(feature = "delta")]
-            self.route_batches();
-
             // Step: Execute SQL cycle (before committing barriers so that
             // checkpoint state includes the processed batches).
             if !self.source_batches_buf.is_empty() {
@@ -533,10 +474,6 @@ impl StreamingCoordinator {
             } else {
                 tracing::debug!("skipping poll_tables (budget exhausted)");
             }
-
-            // Step: Drain remote batch queue (delta mode).
-            #[cfg(feature = "delta")]
-            self.drain_remote_batches();
 
             // Step: Drain control messages (add/drop stream DDL).
             // Processed AFTER checkpoint so newly added queries don't have
@@ -845,8 +782,6 @@ mod tests {
             control_rx,
             #[cfg(feature = "delta")]
             partition_router: None,
-            #[cfg(feature = "delta")]
-            remote_batch_queue: Vec::new(),
         };
 
         let callback = MockCallback::new();
@@ -912,8 +847,6 @@ mod tests {
             control_rx,
             #[cfg(feature = "delta")]
             partition_router: None,
-            #[cfg(feature = "delta")]
-            remote_batch_queue: Vec::new(),
         };
 
         let force_flag = Arc::new(std::sync::atomic::AtomicBool::new(false));
@@ -981,8 +914,6 @@ mod tests {
             control_rx: control_rx2,
             #[cfg(feature = "delta")]
             partition_router: None,
-            #[cfg(feature = "delta")]
-            remote_batch_queue: Vec::new(),
         };
 
         let mut callback = MockCallback::new();

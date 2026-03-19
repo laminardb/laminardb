@@ -144,6 +144,11 @@ impl PartitionRouter {
         for row in 0..num_rows {
             let Some(hash) = Self::hash_column_value(column, row) else {
                 // Unsupported partition key type — route entire batch locally.
+                tracing::warn!(
+                    column = %self.config.partition_key_column,
+                    data_type = ?column.data_type(),
+                    "unsupported partition key column type, routing entire batch locally"
+                );
                 drop(assignments);
                 return RoutedBatches {
                     local: vec![batch.clone()],
