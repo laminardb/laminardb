@@ -1127,8 +1127,12 @@ impl CheckpointCoordinator {
                 );
             }
         }
-        // Track cumulative bytes written (updated after successful persist below).
-        let checkpoint_bytes = sidecar_bytes as u64;
+        // Track cumulative bytes written (manifest + sidecar).
+        // Serialize the manifest once to measure its size. This happens on the
+        // checkpoint path (not hot), and the actual persist re-serializes inside
+        // save_manifest via spawn_blocking.
+        let manifest_bytes = serde_json::to_string(&manifest).map_or(0, |s| s.len());
+        let checkpoint_bytes = (manifest_bytes + sidecar_bytes) as u64;
 
         // ── Step 5: Persist manifest (decision record — sinks are Pending) ──
         self.phase = CheckpointPhase::Persisting;
