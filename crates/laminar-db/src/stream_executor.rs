@@ -733,7 +733,11 @@ impl StreamExecutor {
         // cycle until it settles to true (states are lazily populated).
         if self.all_queries_compiled != Some(true) {
             let all_compiled = self.topo_order.iter().all(|&idx| {
-                self.plain_compiled.contains_key(&idx)
+                // Skip tombstoned queries — they have no state maps and would
+                // always evaluate as non-compiled, preventing the flag from
+                // ever becoming true after a remove_query().
+                self.queries[idx].removed
+                    || self.plain_compiled.contains_key(&idx)
                     || self
                         .agg_states
                         .get(&idx)
@@ -749,8 +753,10 @@ impl StreamExecutor {
             });
             let prev = self.all_queries_compiled;
             self.all_queries_compiled = Some(all_compiled);
-            // Rebuild cached required tables when the compiled status changes.
-            if prev != Some(all_compiled) {
+            // Rebuild cached required tables when the compiled status changes,
+            // or while not all queries are compiled (per-query tier transitions
+            // can change which tables are needed even if the global flag stays false).
+            if prev != Some(all_compiled) || !all_compiled {
                 self.cached_required_tables = self.collect_required_source_tables();
             }
         }
