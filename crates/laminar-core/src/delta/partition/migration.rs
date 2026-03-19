@@ -114,6 +114,10 @@ pub enum MigrationError {
         /// Attempted phase.
         to: MigrationPhase,
     },
+
+    /// Target tried to complete migration without receiving the snapshot.
+    #[error("snapshot not received for partition {0}")]
+    SnapshotNotReceived(u32),
 }
 
 /// Tracks the state of an in-progress partition migration.
@@ -127,6 +131,9 @@ pub struct MigrationState {
     pub new_epoch: u64,
     /// Snapshot taken from the old owner (populated during Pausing phase).
     pub snapshot: Option<PartitionSnapshot>,
+    /// Whether the target node has received the snapshot data.
+    /// Must be `true` before `complete_migration` succeeds on the target side.
+    pub snapshot_received: bool,
 }
 
 impl MigrationState {
@@ -138,6 +145,7 @@ impl MigrationState {
             phase: MigrationPhase::Planned,
             new_epoch,
             snapshot: None,
+            snapshot_received: false,
         }
     }
 
@@ -184,29 +192,30 @@ pub struct MigrationCoordinator {
     node_id: NodeId,
     /// In-flight migrations keyed by partition ID.
     active_migrations: HashMap<u32, MigrationState>,
-    /// Next epoch to assign for migrations.
-    next_epoch: u64,
 }
 
 impl MigrationCoordinator {
     /// Create a new migration coordinator.
     #[must_use]
-    pub fn new(node_id: NodeId, initial_epoch: u64) -> Self {
+    pub fn new(node_id: NodeId) -> Self {
         Self {
             node_id,
             active_migrations: HashMap::new(),
-            next_epoch: initial_epoch,
         }
     }
 
-    /// Plan migrations from a set of partition moves.
+    /// Plan migrations from a set of partition moves with globally assigned epochs.
     ///
-    /// Only moves that involve this node (as source or target) are tracked.
-    pub fn plan_migrations(&mut self, moves: &[PartitionMove]) {
+    /// The `epochs` map provides the epoch for each partition move, assigned by the
+    /// Raft leader to ensure global consistency. Only moves that involve this node
+    /// (as source or target) are tracked.
+    pub fn plan_migrations(&mut self, moves: &[PartitionMove], epochs: &HashMap<u32, u64>) {
         for mv in moves {
             if mv.from == Some(self.node_id) || mv.to == self.node_id {
-                let epoch = self.next_epoch;
-                self.next_epoch += 1;
+                let epoch = epochs
+                    .get(&mv.partition_id)
+                    .copied()
+                    .expect("epoch must be assigned for every partition move");
                 self.active_migrations
                     .insert(mv.partition_id, MigrationState::new(mv.clone(), epoch));
             }
@@ -276,9 +285,14 @@ impl MigrationCoordinator {
 
     /// Complete a migration, applying the epoch change to guards.
     ///
+    /// On the target side (`partition_move.to == self.node_id`), the snapshot
+    /// must have been received (`snapshot_received == true`) before completion
+    /// is allowed. This prevents completing a migration without actual data transfer.
+    ///
     /// # Errors
     ///
-    /// Returns an error if the migration is not in the Restoring phase.
+    /// Returns an error if the migration is not in the Restoring phase or
+    /// if the target has not received the snapshot.
     pub fn complete_migration(
         &mut self,
         partition_id: u32,
@@ -288,6 +302,11 @@ impl MigrationCoordinator {
             .active_migrations
             .get_mut(&partition_id)
             .ok_or(MigrationError::NotOwned(partition_id))?;
+
+        // Target must have received the snapshot before completing.
+        if state.partition_move.to == self.node_id && !state.snapshot_received {
+            return Err(MigrationError::SnapshotNotReceived(partition_id));
+        }
 
         state.transition(MigrationPhase::Completed)?;
         let new_epoch = state.new_epoch;
@@ -396,7 +415,7 @@ mod tests {
 
     #[test]
     fn test_coordinator_plan_migrations() {
-        let mut coord = MigrationCoordinator::new(NodeId(1), 10);
+        let mut coord = MigrationCoordinator::new(NodeId(1));
         let moves = vec![
             PartitionMove {
                 partition_id: 0,
@@ -414,17 +433,24 @@ mod tests {
                 to: NodeId(1),
             },
         ];
-        coord.plan_migrations(&moves);
+        let mut epochs = HashMap::new();
+        epochs.insert(0, 10);
+        epochs.insert(1, 11);
+        epochs.insert(2, 12);
+        coord.plan_migrations(&moves, &epochs);
         // Only partitions 0 (source) and 2 (target) involve node 1.
         assert_eq!(coord.active_count(), 2);
         assert!(coord.migration_state(0).is_some());
         assert!(coord.migration_state(1).is_none());
         assert!(coord.migration_state(2).is_some());
+        // Verify epochs come from the map, not generated locally.
+        assert_eq!(coord.migration_state(0).unwrap().new_epoch, 10);
+        assert_eq!(coord.migration_state(2).unwrap().new_epoch, 12);
     }
 
     #[test]
     fn test_coordinator_full_lifecycle_source() {
-        let mut coord = MigrationCoordinator::new(NodeId(1), 10);
+        let mut coord = MigrationCoordinator::new(NodeId(1));
         let mut guards = PartitionGuardSet::new(NodeId(1));
         guards.insert(5, 9); // we own partition 5 at epoch 9
 
@@ -433,7 +459,9 @@ mod tests {
             from: Some(NodeId(1)),
             to: NodeId(2),
         }];
-        coord.plan_migrations(&moves);
+        let mut epochs = HashMap::new();
+        epochs.insert(5, 10);
+        coord.plan_migrations(&moves, &epochs);
 
         // Begin pause
         assert!(coord.begin_pause(5, &guards).is_ok());
@@ -451,7 +479,7 @@ mod tests {
         // Begin restore (would be on target, but we simulate locally)
         assert!(coord.begin_restore(5).is_ok());
 
-        // Complete
+        // Complete (source side — snapshot_received not required)
         let new_epoch = coord.complete_migration(5, &mut guards).unwrap();
         assert_eq!(new_epoch, 10);
         assert!(guards.get(5).is_none()); // guard removed
@@ -460,7 +488,7 @@ mod tests {
 
     #[test]
     fn test_coordinator_full_lifecycle_target() {
-        let mut coord = MigrationCoordinator::new(NodeId(2), 10);
+        let mut coord = MigrationCoordinator::new(NodeId(2));
         let mut guards = PartitionGuardSet::new(NodeId(2));
 
         let moves = vec![PartitionMove {
@@ -468,14 +496,17 @@ mod tests {
             from: Some(NodeId(1)),
             to: NodeId(2),
         }];
-        coord.plan_migrations(&moves);
+        let mut epochs = HashMap::new();
+        epochs.insert(5, 10);
+        coord.plan_migrations(&moves, &epochs);
 
-        // Skip pause/snapshot (that happens on source node).
-        // On target, we start from Planned, but we need to walk through phases.
+        // Walk target through phases.
         let state = coord.active_migrations.get_mut(&5).unwrap();
         state.transition(MigrationPhase::Pausing).unwrap();
         state.transition(MigrationPhase::Transferring).unwrap();
         state.transition(MigrationPhase::Restoring).unwrap();
+        // Mark snapshot as received (required for target completion).
+        state.snapshot_received = true;
 
         let new_epoch = coord.complete_migration(5, &mut guards).unwrap();
         assert_eq!(new_epoch, 10);
@@ -484,14 +515,44 @@ mod tests {
     }
 
     #[test]
+    fn test_target_complete_without_snapshot_fails() {
+        let mut coord = MigrationCoordinator::new(NodeId(2));
+        let mut guards = PartitionGuardSet::new(NodeId(2));
+
+        let moves = vec![PartitionMove {
+            partition_id: 5,
+            from: Some(NodeId(1)),
+            to: NodeId(2),
+        }];
+        let mut epochs = HashMap::new();
+        epochs.insert(5, 10);
+        coord.plan_migrations(&moves, &epochs);
+
+        let state = coord.active_migrations.get_mut(&5).unwrap();
+        state.transition(MigrationPhase::Pausing).unwrap();
+        state.transition(MigrationPhase::Transferring).unwrap();
+        state.transition(MigrationPhase::Restoring).unwrap();
+        // Do NOT set snapshot_received
+
+        let result = coord.complete_migration(5, &mut guards);
+        assert!(result.is_err());
+        match result.unwrap_err() {
+            MigrationError::SnapshotNotReceived(pid) => assert_eq!(pid, 5),
+            other => panic!("expected SnapshotNotReceived, got: {other}"),
+        }
+    }
+
+    #[test]
     fn test_coordinator_fail_migration() {
-        let mut coord = MigrationCoordinator::new(NodeId(1), 10);
+        let mut coord = MigrationCoordinator::new(NodeId(1));
         let moves = vec![PartitionMove {
             partition_id: 3,
             from: Some(NodeId(1)),
             to: NodeId(2),
         }];
-        coord.plan_migrations(&moves);
+        let mut epochs = HashMap::new();
+        epochs.insert(3, 10);
+        coord.plan_migrations(&moves, &epochs);
         coord.fail_migration(3);
         assert!(coord.is_idle());
     }

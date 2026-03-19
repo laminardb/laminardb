@@ -162,13 +162,15 @@ fn test_migration_lifecycle() {
     source_guards.insert(5, 9);
 
     // Source coordinator
-    let mut source_coord = MigrationCoordinator::new(NodeId(1), 10);
+    let mut source_coord = MigrationCoordinator::new(NodeId(1));
     let moves = vec![PartitionMove {
         partition_id: 5,
         from: Some(NodeId(1)),
         to: NodeId(2),
     }];
-    source_coord.plan_migrations(&moves);
+    let mut epochs = HashMap::new();
+    epochs.insert(5, 10);
+    source_coord.plan_migrations(&moves, &epochs);
 
     // Step 1: Pause on source
     assert!(source_coord.begin_pause(5, &source_guards).is_ok());
@@ -206,14 +208,15 @@ fn test_migration_lifecycle() {
 
     // Target side: separate coordinator for node 2
     let mut target_guards = PartitionGuardSet::new(NodeId(2));
-    let mut target_coord = MigrationCoordinator::new(NodeId(2), 10);
-    target_coord.plan_migrations(&moves);
+    let mut target_coord = MigrationCoordinator::new(NodeId(2));
+    target_coord.plan_migrations(&moves, &epochs);
 
     // Walk target through phases using public API
     let state = target_coord.migration_state_mut(5).unwrap();
     state.transition(MigrationPhase::Pausing).unwrap();
     state.transition(MigrationPhase::Transferring).unwrap();
     state.transition(MigrationPhase::Restoring).unwrap();
+    state.snapshot_received = true; // target received the snapshot
 
     let target_epoch = target_coord
         .complete_migration(5, &mut target_guards)
@@ -236,13 +239,15 @@ fn test_epoch_fencing_prevents_stale_migration() {
     guards.update_epoch(5, 10);
 
     // Now try to start a migration at epoch 9 -- guard check should fail.
-    let mut coord = MigrationCoordinator::new(NodeId(1), 11);
+    let mut coord = MigrationCoordinator::new(NodeId(1));
     let moves = vec![PartitionMove {
         partition_id: 5,
         from: Some(NodeId(1)),
         to: NodeId(2),
     }];
-    coord.plan_migrations(&moves);
+    let mut epochs = HashMap::new();
+    epochs.insert(5, 11);
+    coord.plan_migrations(&moves, &epochs);
 
     let result = coord.begin_pause(5, &guards);
     assert!(

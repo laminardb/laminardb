@@ -95,10 +95,10 @@ pub struct RemoteStateProxy<T: RemoteStateTransport> {
     cache: Arc<Mutex<LruCache>>,
 }
 
-/// Simple bounded LRU cache.
+/// Simple bounded LRU cache keyed by `(partition_id, key_bytes)`.
 #[derive(Debug)]
 struct LruCache {
-    entries: HashMap<Vec<u8>, CacheEntry>,
+    entries: HashMap<(u32, Vec<u8>), CacheEntry>,
     capacity: usize,
     counter: u64,
 }
@@ -112,10 +112,11 @@ impl LruCache {
         }
     }
 
-    fn get(&mut self, key: &[u8]) -> Option<&RemoteValue> {
+    fn get(&mut self, partition_id: u32, key: &[u8]) -> Option<&RemoteValue> {
         self.counter += 1;
         let counter = self.counter;
-        if let Some(entry) = self.entries.get_mut(key) {
+        let cache_key = (partition_id, key.to_vec());
+        if let Some(entry) = self.entries.get_mut(&cache_key) {
             entry.access_counter = counter;
             Some(&entry.value)
         } else {
@@ -123,13 +124,13 @@ impl LruCache {
         }
     }
 
-    fn insert(&mut self, key: Vec<u8>, value: RemoteValue) {
+    fn insert(&mut self, partition_id: u32, key: Vec<u8>, value: RemoteValue) {
         self.counter += 1;
         if self.entries.len() >= self.capacity {
             self.evict_lru();
         }
         self.entries.insert(
-            key,
+            (partition_id, key),
             CacheEntry {
                 value,
                 access_counter: self.counter,
@@ -148,10 +149,8 @@ impl LruCache {
         }
     }
 
-    fn invalidate_partition(&mut self, _partition_id: u32) {
-        // For simplicity, clear the entire cache on partition changes.
-        // A production implementation would index entries by partition.
-        self.entries.clear();
+    fn invalidate_partition(&mut self, partition_id: u32) {
+        self.entries.retain(|(pid, _), _| *pid != partition_id);
     }
 }
 
@@ -168,9 +167,26 @@ impl<T: RemoteStateTransport> RemoteStateProxy<T> {
         }
     }
 
-    /// Update partition assignments.
+    /// Update partition assignments, invalidating cache for changed partitions.
     pub fn update_assignments(&self, new_assignments: HashMap<u32, NodeId>) {
+        let old = self.assignments.read().clone();
+        // Find partitions whose owner changed or were removed.
+        let mut changed = Vec::new();
+        for (pid, old_owner) in &old {
+            match new_assignments.get(pid) {
+                Some(new_owner) if *new_owner != *old_owner => changed.push(*pid),
+                None => changed.push(*pid),
+                _ => {}
+            }
+        }
         *self.assignments.write() = new_assignments;
+
+        if !changed.is_empty() {
+            let mut cache = self.cache.lock();
+            for pid in changed {
+                cache.invalidate_partition(pid);
+            }
+        }
     }
 
     /// Update known node addresses.
@@ -212,7 +228,7 @@ impl<T: RemoteStateTransport> RemoteStateProxy<T> {
         // Check LRU cache.
         {
             let mut cache = self.cache.lock();
-            if let Some(cached) = cache.get(key) {
+            if let Some(cached) = cache.get(partition_id, key) {
                 return Ok(Some(cached.clone()));
             }
         }
@@ -237,7 +253,7 @@ impl<T: RemoteStateTransport> RemoteStateProxy<T> {
         // Cache the result if found.
         if let Some(ref value) = result {
             let mut cache = self.cache.lock();
-            cache.insert(key.to_vec(), value.clone());
+            cache.insert(partition_id, key.to_vec(), value.clone());
         }
 
         Ok(result)
@@ -430,6 +446,80 @@ mod tests {
 
         let _ = proxy.get(0, b"key1").await.unwrap();
         assert_eq!(transport.calls(), 4); // had to fetch again
+    }
+
+    #[tokio::test]
+    async fn test_assignment_change_invalidates_cache() {
+        let value = RemoteValue {
+            data: vec![42],
+            partition_id: 0,
+            source_node: NodeId(2),
+        };
+        let transport = Arc::new(MockTransport::new(Some(value)));
+        let proxy = RemoteStateProxy::new(transport.clone(), NodeId(1), 100);
+
+        let mut assignments = HashMap::new();
+        assignments.insert(0, NodeId(2));
+        assignments.insert(1, NodeId(3));
+        proxy.update_assignments(assignments);
+
+        let mut addresses = HashMap::new();
+        addresses.insert(NodeId(2), "127.0.0.1:9000".into());
+        addresses.insert(NodeId(3), "127.0.0.1:9001".into());
+        proxy.update_node_addresses(addresses);
+
+        // Populate cache for partition 0
+        let _ = proxy.get(0, b"key").await.unwrap();
+        assert_eq!(transport.calls(), 1);
+
+        // Cache hit
+        let _ = proxy.get(0, b"key").await.unwrap();
+        assert_eq!(transport.calls(), 1);
+
+        // Change owner of partition 0 from NodeId(2) to NodeId(3).
+        // Partition 1 stays the same.
+        let mut new_assignments = HashMap::new();
+        new_assignments.insert(0, NodeId(3));
+        new_assignments.insert(1, NodeId(3));
+        proxy.update_assignments(new_assignments);
+
+        // Partition 0 cache should be invalidated, requiring a new RPC.
+        let _ = proxy.get(0, b"key").await.unwrap();
+        assert_eq!(transport.calls(), 2);
+    }
+
+    #[tokio::test]
+    async fn test_cache_key_includes_partition_id() {
+        let value = RemoteValue {
+            data: vec![42],
+            partition_id: 0,
+            source_node: NodeId(2),
+        };
+        let transport = Arc::new(MockTransport::new(Some(value)));
+        let proxy = RemoteStateProxy::new(transport.clone(), NodeId(1), 100);
+
+        let mut assignments = HashMap::new();
+        assignments.insert(0, NodeId(2));
+        assignments.insert(1, NodeId(2));
+        proxy.update_assignments(assignments);
+
+        let mut addresses = HashMap::new();
+        addresses.insert(NodeId(2), "127.0.0.1:9000".into());
+        proxy.update_node_addresses(addresses);
+
+        // Same key bytes, different partitions — should be separate cache entries.
+        let _ = proxy.get(0, b"key").await.unwrap();
+        assert_eq!(transport.calls(), 1);
+
+        let _ = proxy.get(1, b"key").await.unwrap();
+        assert_eq!(transport.calls(), 2); // not a cache hit — different partition
+
+        // Re-fetch both — should be cached now.
+        let _ = proxy.get(0, b"key").await.unwrap();
+        assert_eq!(transport.calls(), 2);
+
+        let _ = proxy.get(1, b"key").await.unwrap();
+        assert_eq!(transport.calls(), 2);
     }
 
     #[test]
