@@ -235,10 +235,10 @@ pub fn parse_condition(input: &str) -> Result<AlertCondition, AlertError> {
 pub fn build_rule(config: &AlertConfig) -> Result<AlertRule, AlertError> {
     let condition = parse_condition(&config.condition)?;
 
-    let mut channels = Vec::new();
+    let mut channels = vec![AlertChannel::Log];
     for ch_name in &config.channels {
         match ch_name.as_str() {
-            "log" => channels.push(AlertChannel::Log),
+            "log" => {} // already included
             "webhook" => {
                 let wh = config
                     .webhook
@@ -273,11 +273,6 @@ pub fn build_rule(config: &AlertConfig) -> Result<AlertRule, AlertError> {
                 });
             }
         }
-    }
-
-    // Always include log channel if no channels specified
-    if channels.is_empty() {
-        channels.push(AlertChannel::Log);
     }
 
     Ok(AlertRule {
@@ -507,16 +502,19 @@ impl AlertManager {
                 // ingested for longer than `threshold` seconds (not on a single
                 // zero-delta evaluation window).
                 let prev = self.prev_snapshot.read().await;
-                if let Some((_, prev_snap)) = prev.as_ref() {
+                if let Some((prev_time, prev_snap)) = prev.as_ref() {
                     let delta = snapshot
                         .events_ingested
                         .saturating_sub(prev_snap.events_ingested);
+                    let prev_ts = *prev_time;
                     drop(prev);
 
                     let mut idle_map = self.idle_since.write().await;
                     if delta == 0 {
                         // No events — start or continue idle tracking.
-                        let idle_start = idle_map.entry(rule_name.to_string()).or_insert(now);
+                        // Seed with the previous snapshot time so the first
+                        // quiet window counts toward the threshold.
+                        let idle_start = idle_map.entry(rule_name.to_string()).or_insert(prev_ts);
                         let idle_secs = now.duration_since(*idle_start).as_secs_f64();
                         idle_secs >= *threshold
                     } else {
@@ -619,8 +617,19 @@ impl AlertManager {
                 };
 
                 let mut req = match method.to_uppercase().as_str() {
+                    "GET" => self.http_client.get(url),
+                    "POST" => self.http_client.post(url),
                     "PUT" => self.http_client.put(url),
-                    _ => self.http_client.post(url),
+                    "PATCH" => self.http_client.patch(url),
+                    "DELETE" => self.http_client.delete(url),
+                    other => {
+                        warn!(
+                            alert_name = %event.name,
+                            method = %other,
+                            "unsupported webhook HTTP method, skipping delivery"
+                        );
+                        return;
+                    }
                 };
 
                 for (k, v) in headers {
@@ -901,8 +910,9 @@ mod tests {
             file: None,
         };
         let rule = build_rule(&config).unwrap();
+        assert!(matches!(&rule.channels[0], AlertChannel::Log));
         assert!(
-            matches!(&rule.channels[0], AlertChannel::Webhook { url, .. } if url == "https://example.com/hook")
+            matches!(&rule.channels[1], AlertChannel::Webhook { url, .. } if url == "https://example.com/hook")
         );
     }
 
@@ -933,8 +943,9 @@ mod tests {
             }),
         };
         let rule = build_rule(&config).unwrap();
+        assert!(matches!(&rule.channels[0], AlertChannel::Log));
         assert!(
-            matches!(&rule.channels[0], AlertChannel::File { path } if path == std::path::Path::new("/tmp/alerts.log"))
+            matches!(&rule.channels[1], AlertChannel::File { path } if path == std::path::Path::new("/tmp/alerts.log"))
         );
     }
 
