@@ -67,7 +67,7 @@ fn test_two_node_routing_split() {
         partition_key_column: "partition_key".into(),
         num_partitions: 8,
     };
-    let router = PartitionRouter::new(config, NodeId(1));
+    let router = PartitionRouter::new(config, NodeId(1)).unwrap();
     router.update_assignments(plan.assignments.clone());
 
     // Create a batch with diverse keys
@@ -76,7 +76,7 @@ fn test_two_node_routing_split() {
         vec![1, 2, 3, 4, 5, 6],
     );
 
-    let routed = router.route_batch(&batch);
+    let routed = router.route_batch(&batch).unwrap();
 
     // Total rows should be preserved
     let local_rows: usize = routed.local.iter().map(RecordBatch::num_rows).sum();
@@ -105,13 +105,13 @@ fn test_routing_determinism() {
         partition_key_column: "partition_key".into(),
         num_partitions: 8,
     };
-    let router = PartitionRouter::new(config, NodeId(1));
+    let router = PartitionRouter::new(config, NodeId(1)).unwrap();
     router.update_assignments(plan.assignments);
 
     let batch = make_batch(vec!["a", "b", "c"], vec![1, 2, 3]);
 
-    let routed1 = router.route_batch(&batch);
-    let routed2 = router.route_batch(&batch);
+    let routed1 = router.route_batch(&batch).unwrap();
+    let routed2 = router.route_batch(&batch).unwrap();
 
     let local1: usize = routed1.local.iter().map(RecordBatch::num_rows).sum();
     let local2: usize = routed2.local.iter().map(RecordBatch::num_rows).sum();
@@ -340,7 +340,8 @@ fn test_end_to_end_cross_node_query() {
             num_partitions: 4,
         },
         NodeId(1),
-    );
+    )
+    .unwrap();
     router1.update_assignments(plan.assignments.clone());
 
     // Node 2's router
@@ -350,14 +351,15 @@ fn test_end_to_end_cross_node_query() {
             num_partitions: 4,
         },
         NodeId(2),
-    );
+    )
+    .unwrap();
     router2.update_assignments(plan.assignments.clone());
 
     // Push data to node 1
     let batch = make_batch(vec!["k1", "k2", "k3", "k4", "k5"], vec![10, 20, 30, 40, 50]);
 
-    let routed1 = router1.route_batch(&batch);
-    let routed2 = router2.route_batch(&batch);
+    let routed1 = router1.route_batch(&batch).unwrap();
+    let routed2 = router2.route_batch(&batch).unwrap();
 
     // What node 1 routes as "local" should be what node 2 routes as "remote to node 1"
     // and vice versa. Total coverage should be the same.

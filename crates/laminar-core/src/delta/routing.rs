@@ -45,24 +45,38 @@ pub struct PartitionRouter {
     assignments: Arc<RwLock<HashMap<u32, NodeId>>>,
 }
 
+/// Error returned when constructing a [`PartitionRouter`] with invalid config.
+#[derive(Debug, thiserror::Error)]
+pub enum RoutingError {
+    /// `num_partitions` was zero, which would cause division-by-zero.
+    #[error("num_partitions must be > 0")]
+    ZeroPartitions,
+
+    /// The partition key column has an unsupported data type.
+    #[error("unsupported partition key type in column '{column}': {data_type}")]
+    UnsupportedKeyType {
+        /// Name of the column.
+        column: String,
+        /// Arrow data type name.
+        data_type: String,
+    },
+}
+
 impl PartitionRouter {
     /// Create a new router.
     ///
-    /// # Panics
+    /// # Errors
     ///
-    /// Panics if `config.num_partitions` is zero (would cause division-by-zero
-    /// in `partition_for_hash`).
-    #[must_use]
-    pub fn new(config: RoutingConfig, local_node: NodeId) -> Self {
-        assert!(
-            config.num_partitions > 0,
-            "RoutingConfig::num_partitions must be greater than zero"
-        );
-        Self {
+    /// Returns [`RoutingError::ZeroPartitions`] if `config.num_partitions` is zero.
+    pub fn new(config: RoutingConfig, local_node: NodeId) -> Result<Self, RoutingError> {
+        if config.num_partitions == 0 {
+            return Err(RoutingError::ZeroPartitions);
+        }
+        Ok(Self {
             config,
             local_node,
             assignments: Arc::new(RwLock::new(HashMap::new())),
-        }
+        })
     }
 
     /// Update the partition assignment map (called after rebalance).
@@ -108,12 +122,16 @@ impl PartitionRouter {
     /// If the partition key column is not found, the entire batch is
     /// treated as local (graceful fallback for unpartitioned sources).
     ///
+    /// # Errors
+    ///
+    /// Returns [`RoutingError::UnsupportedKeyType`] if the partition key
+    /// column has an unsupported Arrow data type.
+    ///
     /// # Panics
     ///
     /// Panics if `arrow::compute::take` fails on a valid column (should
     /// not happen with well-formed Arrow arrays).
-    #[must_use]
-    pub fn route_batch(&self, batch: &RecordBatch) -> RoutedBatches {
+    pub fn route_batch(&self, batch: &RecordBatch) -> Result<RoutedBatches, RoutingError> {
         let schema = batch.schema();
         let Some(col_idx) = schema
             .fields()
@@ -121,19 +139,19 @@ impl PartitionRouter {
             .position(|f| f.name() == &self.config.partition_key_column)
         else {
             // No partition key column — treat entire batch as local.
-            return RoutedBatches {
+            return Ok(RoutedBatches {
                 local: vec![batch.clone()],
                 remote: HashMap::new(),
-            };
+            });
         };
 
         let assignments = self.assignments.read();
         if assignments.is_empty() {
             // No assignments yet — treat as local.
-            return RoutedBatches {
+            return Ok(RoutedBatches {
                 local: vec![batch.clone()],
                 remote: HashMap::new(),
-            };
+            });
         }
 
         // Build per-node row indices.
@@ -143,12 +161,12 @@ impl PartitionRouter {
 
         for row in 0..num_rows {
             let Some(hash) = Self::hash_column_value(column, row) else {
-                // Unsupported partition key type — route entire batch locally.
                 drop(assignments);
-                return RoutedBatches {
-                    local: vec![batch.clone()],
-                    remote: HashMap::new(),
-                };
+                let field = &schema.fields()[col_idx];
+                return Err(RoutingError::UnsupportedKeyType {
+                    column: field.name().clone(),
+                    data_type: format!("{}", field.data_type()),
+                });
             };
             let partition_id = self.partition_for_hash(hash);
             let owner = assignments
@@ -189,7 +207,7 @@ impl PartitionRouter {
             }
         }
 
-        RoutedBatches { local, remote }
+        Ok(RoutedBatches { local, remote })
     }
 
     /// Hash a single column value for partition assignment.
@@ -252,7 +270,7 @@ mod tests {
             partition_key_column: "key".into(),
             num_partitions,
         };
-        PartitionRouter::new(config, NodeId(1))
+        PartitionRouter::new(config, NodeId(1)).unwrap()
     }
 
     fn make_batch(keys: Vec<&str>) -> RecordBatch {
@@ -269,7 +287,7 @@ mod tests {
     fn test_route_batch_no_assignments() {
         let router = make_router(4);
         let batch = make_batch(vec!["a", "b", "c"]);
-        let routed = router.route_batch(&batch);
+        let routed = router.route_batch(&batch).unwrap();
         assert_eq!(routed.local.len(), 1);
         assert!(routed.remote.is_empty());
         assert_eq!(routed.local[0].num_rows(), 3);
@@ -285,7 +303,7 @@ mod tests {
         router.update_assignments(assignments);
 
         let batch = make_batch(vec!["a", "b", "c", "d"]);
-        let routed = router.route_batch(&batch);
+        let routed = router.route_batch(&batch).unwrap();
         assert!(routed.remote.is_empty());
         let total_rows: usize = routed.local.iter().map(RecordBatch::num_rows).sum();
         assert_eq!(total_rows, 4);
@@ -303,7 +321,7 @@ mod tests {
         router.update_assignments(assignments);
 
         let batch = make_batch(vec!["a", "b", "c", "d", "e", "f"]);
-        let routed = router.route_batch(&batch);
+        let routed = router.route_batch(&batch).unwrap();
 
         let local_rows: usize = routed.local.iter().map(RecordBatch::num_rows).sum();
         let remote_rows: usize = routed
@@ -334,10 +352,45 @@ mod tests {
         )
         .unwrap();
 
-        let routed = router.route_batch(&batch);
+        let routed = router.route_batch(&batch).unwrap();
         // Falls back to local
         assert_eq!(routed.local.len(), 1);
         assert!(routed.remote.is_empty());
+    }
+
+    #[test]
+    fn test_zero_partitions_returns_error() {
+        let config = RoutingConfig {
+            partition_key_column: "key".into(),
+            num_partitions: 0,
+        };
+        let err = PartitionRouter::new(config, NodeId(1)).unwrap_err();
+        assert!(matches!(err, RoutingError::ZeroPartitions));
+    }
+
+    #[test]
+    fn test_unsupported_key_type_returns_error() {
+        let router = make_router(4);
+        let mut assignments = HashMap::new();
+        assignments.insert(0, NodeId(1));
+        router.update_assignments(assignments);
+
+        // Boolean key type is unsupported
+        let schema = Arc::new(Schema::new(vec![
+            Field::new("key", DataType::Boolean, false),
+            Field::new("value", DataType::Int64, false),
+        ]));
+        let batch = RecordBatch::try_new(
+            schema,
+            vec![
+                Arc::new(arrow_array::BooleanArray::from(vec![true, false])),
+                Arc::new(arrow_array::Int64Array::from(vec![1, 2])),
+            ],
+        )
+        .unwrap();
+
+        let err = router.route_batch(&batch).unwrap_err();
+        assert!(matches!(err, RoutingError::UnsupportedKeyType { .. }));
     }
 
     #[test]

@@ -102,6 +102,9 @@ pub struct StreamingCoordinator {
     /// Queue of batches destined for remote nodes.
     #[cfg(feature = "delta")]
     remote_batch_queue: Vec<(laminar_core::delta::discovery::NodeId, RecordBatch)>,
+    /// Counter for remote batches dropped (no gRPC transport yet).
+    #[cfg(feature = "delta")]
+    remote_batches_dropped: u64,
 }
 
 /// Tracks in-flight checkpoint barrier alignment.
@@ -323,6 +326,8 @@ impl StreamingCoordinator {
             partition_router: None,
             #[cfg(feature = "delta")]
             remote_batch_queue: Vec::new(),
+            #[cfg(feature = "delta")]
+            remote_batches_dropped: 0,
         })
     }
 
@@ -341,7 +346,17 @@ impl StreamingCoordinator {
         let mut routed_local: FxHashMap<Arc<str>, Vec<RecordBatch>> = FxHashMap::default();
         for (source_name, batches) in self.source_batches_buf.drain() {
             for batch in batches {
-                let split = router.route_batch(&batch);
+                let split = match router.route_batch(&batch) {
+                    Ok(s) => s,
+                    Err(e) => {
+                        tracing::warn!(error = %e, "routing failed, treating batch as local");
+                        routed_local
+                            .entry(Arc::clone(&source_name))
+                            .or_default()
+                            .push(batch);
+                        continue;
+                    }
+                };
                 if !split.local.is_empty() {
                     routed_local
                         .entry(Arc::clone(&source_name))
@@ -358,10 +373,12 @@ impl StreamingCoordinator {
         self.source_batches_buf = routed_local;
     }
 
-    /// Drain the remote batch queue.
+    /// Drain the remote batch queue via best-effort gRPC forwarding.
     ///
-    /// TODO(cluster): Wire actual gRPC transport. Until then, batches are
-    /// logged as dropped so the data loss is visible in observability.
+    /// TODO(cluster): Wire actual gRPC transport via an RPC connection pool.
+    /// Until the transport layer is implemented, batches are buffered, logged
+    /// as dropped with structured fields, and the drop counter is incremented
+    /// for metric exposition.
     #[cfg(feature = "delta")]
     fn drain_remote_batches(&mut self) {
         if self.remote_batch_queue.is_empty() {
@@ -373,9 +390,18 @@ impl StreamingCoordinator {
             .iter()
             .map(|(_, b)| b.num_rows())
             .sum();
+
+        // TODO(cluster): Attempt gRPC send per target node here.
+        // On send failure, fall through to the drop path below.
+
+        #[allow(clippy::cast_possible_truncation)]
+        {
+            self.remote_batches_dropped += count as u64;
+        }
         tracing::warn!(
             batches = count,
             rows = total_rows,
+            total_dropped = self.remote_batches_dropped,
             "remote batches dropped — gRPC forwarding not yet implemented \
              (distributed queries will return incomplete results)"
         );
@@ -847,6 +873,8 @@ mod tests {
             partition_router: None,
             #[cfg(feature = "delta")]
             remote_batch_queue: Vec::new(),
+            #[cfg(feature = "delta")]
+            remote_batches_dropped: 0,
         };
 
         let callback = MockCallback::new();
@@ -914,6 +942,8 @@ mod tests {
             partition_router: None,
             #[cfg(feature = "delta")]
             remote_batch_queue: Vec::new(),
+            #[cfg(feature = "delta")]
+            remote_batches_dropped: 0,
         };
 
         let force_flag = Arc::new(std::sync::atomic::AtomicBool::new(false));
@@ -983,6 +1013,8 @@ mod tests {
             partition_router: None,
             #[cfg(feature = "delta")]
             remote_batch_queue: Vec::new(),
+            #[cfg(feature = "delta")]
+            remote_batches_dropped: 0,
         };
 
         let mut callback = MockCallback::new();
