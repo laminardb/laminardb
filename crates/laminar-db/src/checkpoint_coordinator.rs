@@ -1107,6 +1107,15 @@ impl CheckpointCoordinator {
         // ── Step 4b: Checkpoint size check ──
         if let Some(cap) = self.config.max_checkpoint_bytes {
             if sidecar_bytes > cap {
+                // Rollback sinks that already pre-committed before aborting.
+                if let Err(rollback_err) = self.rollback_sinks(epoch).await {
+                    error!(
+                        checkpoint_id,
+                        epoch,
+                        error = %rollback_err,
+                        "[LDB-6004] sink rollback failed after checkpoint size cap exceeded"
+                    );
+                }
                 self.phase = CheckpointPhase::Idle;
                 self.checkpoints_failed += 1;
                 self.maybe_cap_drainers();

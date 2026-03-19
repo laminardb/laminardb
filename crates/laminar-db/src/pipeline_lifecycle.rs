@@ -479,6 +479,18 @@ impl LaminarDB {
             sink.open(&config)
                 .await
                 .map_err(|e| DbError::Connector(format!("Failed to open sink '{name}': {e}")))?;
+            // Wrap with IdempotentSinkWrapper when delivery guarantee is idempotent.
+            let sink: Box<dyn laminar_connectors::connector::SinkConnector> =
+                if self.config.delivery_guarantee
+                    == laminar_connectors::connector::DeliveryGuarantee::Idempotent
+                {
+                    Box::new(laminar_connectors::idempotent::IdempotentSinkWrapper::new(
+                        sink,
+                        laminar_connectors::idempotent::IdempotentConfig::default(),
+                    ))
+                } else {
+                    sink
+                };
             let exactly_once = sink.capabilities().exactly_once;
             let handle = crate::sink_task::SinkTaskHandle::spawn(name.clone(), sink, exactly_once);
             sinks.push((
