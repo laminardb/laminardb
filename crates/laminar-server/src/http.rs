@@ -272,9 +272,11 @@ async fn prometheus_metrics(State(state): State<Arc<AppState>>) -> impl IntoResp
     ));
 
     for sm in &source_metrics {
+        // Escape backslash and double-quote in Prometheus label values (OpenMetrics spec).
+        let safe_name = sm.name.replace('\\', "\\\\").replace('"', "\\\"");
         lines.push(format!(
-            "laminardb_source_events_total{{source=\"{}\"}} {}",
-            sm.name, sm.total_events
+            "laminardb_source_events_total{{source=\"{safe_name}\"}} {}",
+            sm.total_events
         ));
     }
 
