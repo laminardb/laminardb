@@ -1667,14 +1667,17 @@ mod tests {
         assert_eq!(src.write_lsn.as_u64(), 0x2_0000_FF10);
     }
 
-    // ── Buffer cap enforcement ──
+    // ── Backpressure (no event dropping) ──
 
     #[tokio::test]
-    async fn test_event_buffer_cap_drops_oldest() {
+    async fn test_backpressure_does_not_drop_buffered_events() {
         let mut src = running_source();
         src.config.max_buffered_events = 100;
 
         // Inject 200 events directly into the event buffer.
+        // With backpressure, existing buffered events are never dropped —
+        // only channel draining is paused when the buffer exceeds the
+        // high watermark. Direct-injected events are already in the buffer.
         for i in 0..200u64 {
             src.inject_event(ChangeEvent {
                 table: "public.t".to_string(),
@@ -1687,15 +1690,11 @@ mod tests {
         }
         assert_eq!(src.event_buffer.len(), 200);
 
-        // poll_batch triggers the cap enforcement.
+        // poll_batch drains events from the buffer — no dropping.
         let batch = src.poll_batch(50).await.unwrap().unwrap();
-        // After cap enforcement (200 → 100), drain 50 → 50 remaining.
         assert_eq!(batch.records.num_rows(), 50);
-        assert!(
-            src.event_buffer.len() <= 100,
-            "event_buffer should be capped at max_buffered_events, got {}",
-            src.event_buffer.len()
-        );
-        assert!(src.metrics.events_dropped.load(Ordering::Relaxed) >= 100);
+        // 200 - 50 drained = 150 remaining. No events dropped.
+        assert_eq!(src.event_buffer.len(), 150);
+        assert_eq!(src.metrics.events_dropped.load(Ordering::Relaxed), 0);
     }
 }
