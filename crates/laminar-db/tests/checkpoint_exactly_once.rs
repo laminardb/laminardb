@@ -69,9 +69,9 @@ impl PipelineCallback for BarrierTrackingCallback {
 
     async fn write_to_sinks(&mut self, _results: &FxHashMap<Arc<str>, Vec<RecordBatch>>) {}
 
-    fn extract_watermark(&mut self, _source_name: &str, _batch: &RecordBatch) {}
+    fn extract_watermark(&mut self, _source_idx: usize, _batch: &RecordBatch) {}
 
-    fn filter_late_rows(&self, _source_name: &str, batch: &RecordBatch) -> Option<RecordBatch> {
+    fn filter_late_rows(&self, _source_idx: usize, batch: &RecordBatch) -> Option<RecordBatch> {
         Some(batch.clone())
     }
 
