@@ -87,7 +87,19 @@ pub fn build_router(state: Arc<AppState>) -> Router {
         // Stubs (501 Not Implemented)
         .route("/api/v1/pause", post(not_implemented))
         .route("/api/v1/resume", post(not_implemented))
-        .layer(CorsLayer::permissive())
+        // CORS: allow any origin with explicit methods/headers. In production
+        // deployments this should be restricted to trusted origins.
+        .layer(
+            CorsLayer::new()
+                .allow_origin(tower_http::cors::Any)
+                .allow_methods([
+                    axum::http::Method::GET,
+                    axum::http::Method::POST,
+                    axum::http::Method::PUT,
+                    axum::http::Method::OPTIONS,
+                ])
+                .allow_headers([axum::http::header::CONTENT_TYPE]),
+        )
         .layer(axum::middleware::from_fn(request_logging))
         .with_state(state)
 }
@@ -613,7 +625,10 @@ async fn build_dashboard_html(state: &AppState) -> String {
             })
         })
         .collect();
-    let sources_json = serde_json::to_string(&sources_json_arr).unwrap_or_else(|_| "[]".into());
+    // Escape "</script>" in JSON to prevent XSS when injected into HTML <script> tags.
+    let sources_json = serde_json::to_string(&sources_json_arr)
+        .unwrap_or_else(|_| "[]".into())
+        .replace("</", "<\\/");
     let streams = state.db.streams();
     let sinks = state.db.sinks();
 
@@ -673,7 +688,10 @@ async fn update_config(
     let mut merged = config_to_merge_json(&current);
     drop(current);
 
-    merge_json(&mut merged, &body);
+    // Filter out "***" masked placeholders before merging, so that values
+    // copied from GET /config don't overwrite real secrets with the mask.
+    let filtered_body = filter_masked_values(&body);
+    merge_json(&mut merged, &filtered_body);
 
     let merged_toml = match toml::to_string(&merged) {
         Ok(t) => t,
@@ -881,6 +899,29 @@ fn merge_json(target: &mut serde_json::Value, patch: &serde_json::Value) {
         }
     } else {
         *target = patch.clone();
+    }
+}
+
+/// Recursively strip any JSON string values equal to `"***"` from the object.
+///
+/// When a client PUTs config data that was previously read from GET /config,
+/// masked placeholders (`"***"`) would overwrite real secrets. This filter
+/// removes those entries so the merge only touches values the client intended
+/// to change.
+fn filter_masked_values(value: &serde_json::Value) -> serde_json::Value {
+    match value {
+        serde_json::Value::Object(obj) => {
+            let filtered: serde_json::Map<String, serde_json::Value> = obj
+                .iter()
+                .filter(|(_, v)| v.as_str() != Some("***"))
+                .map(|(k, v)| (k.clone(), filter_masked_values(v)))
+                .collect();
+            serde_json::Value::Object(filtered)
+        }
+        serde_json::Value::Array(arr) => {
+            serde_json::Value::Array(arr.iter().map(filter_masked_values).collect())
+        }
+        other => other.clone(),
     }
 }
 
@@ -1436,6 +1477,26 @@ mod tests {
         merge_json(&mut target, &patch);
         assert_eq!(target["a"], 1);
         assert!(target.get("b").is_none());
+    }
+
+    #[test]
+    fn test_filter_masked_values_strips_stars() {
+        let input = serde_json::json!({
+            "name": "kafka_src",
+            "password": "***",
+            "nested": {
+                "secret": "***",
+                "keep": "value"
+            }
+        });
+        let filtered = filter_masked_values(&input);
+        assert!(
+            filtered.get("password").is_none(),
+            "masked placeholder must be removed"
+        );
+        assert_eq!(filtered["name"], "kafka_src");
+        assert!(filtered["nested"].get("secret").is_none());
+        assert_eq!(filtered["nested"]["keep"], "value");
     }
 
     #[tokio::test]
