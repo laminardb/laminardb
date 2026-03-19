@@ -122,17 +122,44 @@ impl AbacPolicy {
 
             // Check resource pattern match
             if let Some(pattern) = &rule.resource_pattern {
-                match resource {
-                    Some(r) if r == pattern || pattern == "*" => {}
-                    _ => continue,
+                if pattern == "*" {
+                    // Wildcard matches everything, including None (global actions).
+                } else {
+                    match resource {
+                        Some(r) if r == pattern => {}
+                        _ => continue,
+                    }
                 }
             }
 
-            // Evaluate all conditions
-            let all_match = rule
-                .conditions
-                .iter()
-                .all(|c| evaluate_condition(c, identity, resource_attrs));
+            // Evaluate all conditions.
+            // On error (missing/malformed attribute), fail closed:
+            //   Deny rules trigger (deny when uncertain).
+            //   Allow rules do not match (don't allow when uncertain).
+            let mut all_match = true;
+            let mut eval_error = false;
+            for c in &rule.conditions {
+                match evaluate_condition(c, identity, resource_attrs) {
+                    Ok(true) => {}
+                    Ok(false) => {
+                        all_match = false;
+                        break;
+                    }
+                    Err(_) => {
+                        eval_error = true;
+                        all_match = false;
+                        break;
+                    }
+                }
+            }
+
+            // Fail closed: errors during Deny evaluation trigger the deny.
+            if eval_error && rule.effect == Effect::Deny {
+                return Err(AuthError::AccessDenied(format!(
+                    "denied by ABAC rule '{}' for user '{}' (fail-closed on missing/malformed attribute)",
+                    rule.name, identity.name
+                )));
+            }
 
             if all_match {
                 return match rule.effect {
@@ -169,39 +196,45 @@ fn resolve_attribute(
 }
 
 /// Evaluate a single condition.
+///
+/// Returns `Ok(true)` if the condition holds, `Ok(false)` if it does not,
+/// or `Err` if an attribute is missing or a numeric comparison fails to parse.
+/// The caller uses the error to implement fail-closed semantics on Deny rules.
 fn evaluate_condition(
     condition: &Condition,
     identity: &Identity,
     resource_attrs: &HashMap<String, String>,
-) -> bool {
-    let lhs = match resolve_attribute(&condition.lhs, identity, resource_attrs) {
-        Some(v) => v,
-        None => return false,
-    };
-    let rhs = match resolve_attribute(&condition.rhs, identity, resource_attrs) {
-        Some(v) => v,
-        None => return false,
-    };
+) -> Result<bool, AuthError> {
+    let lhs = resolve_attribute(&condition.lhs, identity, resource_attrs).ok_or_else(|| {
+        AuthError::AccessDenied(format!("missing attribute: {:?}", condition.lhs))
+    })?;
+    let rhs = resolve_attribute(&condition.rhs, identity, resource_attrs).ok_or_else(|| {
+        AuthError::AccessDenied(format!("missing attribute: {:?}", condition.rhs))
+    })?;
 
-    match condition.op {
+    let result = match condition.op {
         Operator::Eq => lhs == rhs,
         Operator::NotEq => lhs != rhs,
         Operator::Contains => lhs.contains(&rhs),
-        // Numeric comparisons fail closed unless both sides parse as numbers.
-        Operator::Lt => compare_numeric(&lhs, &rhs, |a, b| a < b),
-        Operator::Gt => compare_numeric(&lhs, &rhs, |a, b| a > b),
-        Operator::LtEq => compare_numeric(&lhs, &rhs, |a, b| a <= b),
-        Operator::GtEq => compare_numeric(&lhs, &rhs, |a, b| a >= b),
-    }
+        Operator::Lt => compare_numeric(&lhs, &rhs, |a, b| a < b)?,
+        Operator::Gt => compare_numeric(&lhs, &rhs, |a, b| a > b)?,
+        Operator::LtEq => compare_numeric(&lhs, &rhs, |a, b| a <= b)?,
+        Operator::GtEq => compare_numeric(&lhs, &rhs, |a, b| a >= b)?,
+    };
+    Ok(result)
 }
 
-/// Compare two values numerically, failing closed if either side is non-numeric.
-fn compare_numeric(lhs: &str, rhs: &str, num_cmp: fn(f64, f64) -> bool) -> bool {
-    if let (Ok(l), Ok(r)) = (lhs.parse::<f64>(), rhs.parse::<f64>()) {
-        num_cmp(l, r)
-    } else {
-        false
-    }
+/// Compare two values numerically.
+///
+/// Returns `Err` if either side is non-numeric, so the caller can fail closed.
+fn compare_numeric(lhs: &str, rhs: &str, num_cmp: fn(f64, f64) -> bool) -> Result<bool, AuthError> {
+    let l = lhs
+        .parse::<f64>()
+        .map_err(|_| AuthError::AccessDenied(format!("non-numeric attribute value: {lhs:?}")))?;
+    let r = rhs
+        .parse::<f64>()
+        .map_err(|_| AuthError::AccessDenied(format!("non-numeric attribute value: {rhs:?}")))?;
+    Ok(num_cmp(l, r))
 }
 
 #[cfg(test)]
@@ -340,7 +373,7 @@ mod tests {
     }
 
     #[test]
-    fn test_numeric_comparisons_fail_closed_for_non_numeric_values() {
+    fn test_numeric_comparisons_return_error_for_non_numeric_values() {
         let identity = engineer_identity();
         let attrs = HashMap::new();
         let condition = Condition {
@@ -349,6 +382,153 @@ mod tests {
             rhs: AttributeSource::Literal("10".to_string()),
         };
 
-        assert!(!evaluate_condition(&condition, &identity, &attrs));
+        let result = evaluate_condition(&condition, &identity, &attrs);
+        assert!(result.is_err());
+        assert!(result.unwrap_err().to_string().contains("non-numeric"));
+    }
+
+    #[test]
+    fn test_missing_attribute_returns_error() {
+        let identity = engineer_identity();
+        let attrs = HashMap::new();
+        // User attribute "nonexistent" does not exist.
+        let condition = Condition {
+            lhs: AttributeSource::User("nonexistent".to_string()),
+            op: Operator::Eq,
+            rhs: AttributeSource::Literal("value".to_string()),
+        };
+
+        let result = evaluate_condition(&condition, &identity, &attrs);
+        assert!(result.is_err());
+        assert!(result
+            .unwrap_err()
+            .to_string()
+            .contains("missing attribute"));
+    }
+
+    #[test]
+    fn test_deny_rule_fail_closed_on_missing_attribute() {
+        let mut policy = AbacPolicy::new();
+        // Deny rule that checks an attribute that won't exist.
+        policy.add_rule(AbacRule {
+            name: "deny-missing-attr".to_string(),
+            action: "*".to_string(),
+            resource_pattern: None,
+            conditions: vec![Condition {
+                lhs: AttributeSource::User("security_level".to_string()),
+                op: Operator::Lt,
+                rhs: AttributeSource::Literal("5".to_string()),
+            }],
+            effect: Effect::Deny,
+        });
+
+        let identity = engineer_identity(); // no "security_level" attribute
+        let attrs = HashMap::new();
+
+        // Missing attribute on a Deny rule must fail closed (deny).
+        let result = policy.evaluate(&identity, "SELECT", None, &attrs);
+        assert!(result.is_err());
+        assert!(result.unwrap_err().to_string().contains("fail-closed"));
+    }
+
+    #[test]
+    fn test_allow_rule_does_not_match_on_missing_attribute() {
+        let mut policy = AbacPolicy::new();
+        // Allow rule that checks an attribute that won't exist.
+        policy.add_rule(AbacRule {
+            name: "allow-missing-attr".to_string(),
+            action: "*".to_string(),
+            resource_pattern: None,
+            conditions: vec![Condition {
+                lhs: AttributeSource::User("security_level".to_string()),
+                op: Operator::GtEq,
+                rhs: AttributeSource::Literal("5".to_string()),
+            }],
+            effect: Effect::Allow,
+        });
+
+        let identity = engineer_identity(); // no "security_level" attribute
+        let attrs = HashMap::new();
+
+        // Missing attribute on an Allow rule must not match (falls through to default deny).
+        let result = policy.evaluate(&identity, "SELECT", None, &attrs);
+        assert!(result.is_err());
+        assert!(result
+            .unwrap_err()
+            .to_string()
+            .contains("no ABAC rule matched"));
+    }
+
+    #[test]
+    fn test_deny_rule_fail_closed_on_malformed_numeric() {
+        let mut policy = AbacPolicy::new();
+        // Deny rule with numeric comparison where user attribute is non-numeric.
+        policy.add_rule(AbacRule {
+            name: "deny-malformed".to_string(),
+            action: "*".to_string(),
+            resource_pattern: None,
+            conditions: vec![Condition {
+                lhs: AttributeSource::User("department".to_string()), // "engineering" — not a number
+                op: Operator::Lt,
+                rhs: AttributeSource::Literal("5".to_string()),
+            }],
+            effect: Effect::Deny,
+        });
+
+        let identity = engineer_identity();
+        let attrs = HashMap::new();
+
+        // Malformed numeric on a Deny rule must fail closed (deny).
+        let result = policy.evaluate(&identity, "SELECT", None, &attrs);
+        assert!(result.is_err());
+        assert!(result.unwrap_err().to_string().contains("fail-closed"));
+    }
+
+    #[test]
+    fn test_wildcard_resource_matches_none() {
+        let mut policy = AbacPolicy::new();
+        policy.add_rule(AbacRule {
+            name: "deny-all-wildcard".to_string(),
+            action: "*".to_string(),
+            resource_pattern: Some("*".to_string()),
+            conditions: vec![Condition {
+                lhs: AttributeSource::User("department".to_string()),
+                op: Operator::Eq,
+                rhs: AttributeSource::Literal("sales".to_string()),
+            }],
+            effect: Effect::Deny,
+        });
+
+        let sales = sales_identity();
+        let attrs = HashMap::new();
+
+        // resource: None with pattern "*" must match (global actions).
+        let result = policy.evaluate(&sales, "SELECT", None, &attrs);
+        assert!(result.is_err());
+        assert!(result.unwrap_err().to_string().contains("denied by ABAC"));
+    }
+
+    #[test]
+    fn test_wildcard_resource_matches_specific_resource() {
+        let mut policy = AbacPolicy::new();
+        policy.add_rule(AbacRule {
+            name: "allow-wildcard".to_string(),
+            action: "SELECT".to_string(),
+            resource_pattern: Some("*".to_string()),
+            conditions: vec![Condition {
+                lhs: AttributeSource::User("department".to_string()),
+                op: Operator::Eq,
+                rhs: AttributeSource::Literal("engineering".to_string()),
+            }],
+            effect: Effect::Allow,
+        });
+
+        let eng = engineer_identity();
+        let attrs = HashMap::new();
+
+        // Wildcard should also match specific resource names.
+        assert!(policy
+            .evaluate(&eng, "SELECT", Some("trades"), &attrs)
+            .is_ok());
     }
 }
