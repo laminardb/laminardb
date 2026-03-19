@@ -338,6 +338,7 @@ impl Partition {
     #[allow(clippy::cast_possible_truncation)] // Column file sizes are << 4 GiB.
     fn save_index(&self, dir: &Path) -> Result<(), StateError> {
         let path = dir.join(INDEX_FILE_NAME);
+        let tmp_path = dir.join(format!("{INDEX_FILE_NAME}.tmp"));
         let mut buf = Vec::new();
 
         for (key, entries) in &self.index {
@@ -350,9 +351,12 @@ impl Partition {
             }
         }
 
-        let mut file = File::create(&path)?;
+        // Write to temp file, sync, then atomically rename.
+        let mut file = File::create(&tmp_path)?;
         file.write_all(&buf)?;
         file.sync_all()?;
+        drop(file);
+        fs::rename(&tmp_path, &path)?;
         Ok(())
     }
 
@@ -455,13 +459,15 @@ impl ColumnFileStateStore {
 
         let active_partition = partitions.keys().next_back().copied();
 
-        Ok(Self {
+        let mut store = Self {
             config,
             partitions,
             active_partition,
             total_entries,
             total_size_bytes,
-        })
+        };
+        store.enforce_hot_limit();
+        Ok(store)
     }
 
     /// Get or create a partition for the given window timestamp.
@@ -598,16 +604,21 @@ impl ColumnFileStateStore {
     pub fn remove_partition(&mut self, partition_id: i64) -> Result<(), StateError> {
         if let Some(partition) = self.partitions.remove(&partition_id) {
             let entry_count: usize = partition.index.values().map(Vec::len).sum();
-            self.total_entries = self.total_entries.saturating_sub(entry_count);
-            self.total_size_bytes = self.total_size_bytes.saturating_sub(partition.size_bytes);
-
+            let size_bytes = partition.size_bytes;
             let dir = self
                 .config
                 .base_dir
                 .join(format!("partition_{partition_id}"));
+
+            // Drop mmap/file handles before deleting the directory.
+            drop(partition);
+
             if dir.exists() {
                 fs::remove_dir_all(&dir)?;
             }
+
+            self.total_entries = self.total_entries.saturating_sub(entry_count);
+            self.total_size_bytes = self.total_size_bytes.saturating_sub(size_bytes);
         }
         Ok(())
     }
