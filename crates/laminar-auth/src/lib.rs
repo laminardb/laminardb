@@ -21,6 +21,7 @@
 pub mod abac;
 pub mod column_security;
 pub mod identity;
+pub mod jwt;
 pub mod key_management;
 #[cfg(feature = "ldap")]
 pub mod ldap_auth;

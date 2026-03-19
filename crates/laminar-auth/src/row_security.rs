@@ -102,7 +102,11 @@ impl RowSecurityPolicy {
     }
 }
 
-fn validate_identifier(identifier: &str) -> Result<&str, AuthError> {
+/// Validate that a string is a safe SQL identifier (letters, digits, underscores).
+///
+/// Returns the identifier unchanged on success. Used by both row-level and
+/// column-level security to prevent SQL injection through column names.
+pub fn validate_identifier(identifier: &str) -> Result<&str, AuthError> {
     let mut chars = identifier.chars();
     match chars.next() {
         Some(ch) if ch == '_' || ch.is_ascii_alphabetic() => {}

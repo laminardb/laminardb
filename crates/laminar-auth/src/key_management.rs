@@ -89,6 +89,35 @@ impl FileKeyManager {
 impl KeyManager for FileKeyManager {
     async fn get_key(&self, key_id: &str) -> Result<Key, AuthError> {
         let path = self.key_path(key_id)?;
+
+        // Reject symlinks that resolve outside the configured key directory
+        // to prevent directory traversal via crafted symlinks.
+        let meta = std::fs::symlink_metadata(&path).map_err(|e| {
+            AuthError::Configuration(format!("failed to stat key '{}': {}", path.display(), e))
+        })?;
+        if meta.file_type().is_symlink() {
+            let resolved = std::fs::canonicalize(&path).map_err(|e| {
+                AuthError::Configuration(format!(
+                    "failed to resolve symlink '{}': {}",
+                    path.display(),
+                    e
+                ))
+            })?;
+            let canonical_dir = std::fs::canonicalize(&self.directory).map_err(|e| {
+                AuthError::Configuration(format!(
+                    "failed to canonicalize key directory '{}': {}",
+                    self.directory.display(),
+                    e
+                ))
+            })?;
+            if !resolved.starts_with(&canonical_dir) {
+                return Err(AuthError::Configuration(format!(
+                    "key '{}' is a symlink that resolves outside the configured directory",
+                    path.display()
+                )));
+            }
+        }
+
         let raw = tokio::fs::read(&path).await.map_err(|e| {
             AuthError::Configuration(format!("failed to read key '{}': {}", path.display(), e))
         })?;
@@ -524,5 +553,50 @@ mod tests {
 
         let mgr = FileKeyManager::new(dir.path());
         assert!(mgr.get_key("primary").await.is_err());
+    }
+
+    #[tokio::test]
+    async fn test_file_key_manager_rejects_symlink_outside_directory() {
+        let key_dir = tempfile::tempdir().unwrap();
+        let outside_dir = tempfile::tempdir().unwrap();
+
+        // Create a key file outside the key directory.
+        let outside_key = outside_dir.path().join("stolen.key");
+        std::fs::write(&outside_key, b"stolen-key-material").unwrap();
+
+        // Create a symlink inside the key directory pointing outside.
+        let symlink_path = key_dir.path().join("escape.key");
+        #[cfg(unix)]
+        std::os::unix::fs::symlink(&outside_key, &symlink_path).unwrap();
+
+        let mgr = FileKeyManager::new(key_dir.path());
+        let result = mgr.get_key("escape").await;
+        assert!(
+            result.is_err(),
+            "symlink resolving outside the key directory must be rejected"
+        );
+        let err = result.unwrap_err().to_string();
+        assert!(
+            err.contains("resolves outside"),
+            "error must mention resolving outside, got: {err}"
+        );
+    }
+
+    #[tokio::test]
+    async fn test_file_key_manager_allows_symlink_inside_directory() {
+        let key_dir = tempfile::tempdir().unwrap();
+
+        // Create a real key file.
+        let real_key = key_dir.path().join("real.key");
+        std::fs::write(&real_key, b"real-key-material").unwrap();
+
+        // Create a symlink within the same directory.
+        let symlink_path = key_dir.path().join("alias.key");
+        #[cfg(unix)]
+        std::os::unix::fs::symlink(&real_key, &symlink_path).unwrap();
+
+        let mgr = FileKeyManager::new(key_dir.path());
+        let key = mgr.get_key("alias").await.unwrap();
+        assert_eq!(key.material, b"real-key-material");
     }
 }

@@ -4332,16 +4332,12 @@ name = "laminar-server"
 version = "0.18.9"
 dependencies = [
  "anyhow",
- "arrow-array",
- "arrow-cast",
- "arrow-schema",
  "axum",
  "chrono",
  "clap",
  "config",
  "directories",
  "gethostname",
- "humantime",
  "humantime-serde",
  "laminar-connectors",
  "laminar-core",

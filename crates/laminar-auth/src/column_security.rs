@@ -13,7 +13,8 @@
 
 use std::collections::HashMap;
 
-use crate::identity::Identity;
+use crate::identity::{AuthError, Identity};
+use crate::row_security::validate_identifier;
 
 /// How a column should be masked.
 #[derive(Debug, Clone)]
@@ -104,12 +105,26 @@ impl ColumnSecurityPolicy {
 
     /// Generate a SQL projection expression for a column, applying masking if needed.
     ///
-    /// Returns `None` if no masking is needed (column passes through unchanged).
-    pub fn masked_projection(&self, identity: &Identity, column: &str) -> Option<String> {
+    /// Returns `Ok(None)` if no masking is needed (column passes through unchanged).
+    ///
+    /// # Errors
+    ///
+    /// Returns [`AuthError::AccessDenied`] if the column name is not a valid SQL identifier.
+    pub fn masked_projection(
+        &self,
+        identity: &Identity,
+        column: &str,
+    ) -> Result<Option<String>, AuthError> {
         let masks = self.effective_masks(identity);
-        let mask = masks.get(column)?;
+        let mask = match masks.get(column) {
+            Some(m) => m,
+            None => return Ok(None),
+        };
 
-        Some(match &mask.strategy {
+        // Validate column name before interpolating into SQL.
+        let column = validate_identifier(column)?;
+
+        Ok(Some(match &mask.strategy {
             MaskingStrategy::Redact(replacement) => {
                 format!("'{}' AS {}", replacement.replace('\'', "''"), column)
             }
@@ -124,7 +139,7 @@ impl ColumnSecurityPolicy {
                 format!("CONCAT(LEFT({col}, {n}), '****') AS {col}", col = column)
             }
             MaskingStrategy::Expression(expr) => format!("({expr}) AS {column}"),
-        })
+        }))
     }
 }
 
@@ -147,16 +162,21 @@ impl ColumnSecurityRegistry {
 
     /// Get the masked projection for a column on a table.
     ///
-    /// Returns `None` if no masking is needed.
+    /// Returns `Ok(None)` if no masking is needed.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`AuthError::AccessDenied`] if the column name is not a valid SQL identifier.
     pub fn masked_projection(
         &self,
         table: &str,
         identity: &Identity,
         column: &str,
-    ) -> Option<String> {
-        self.policies
-            .get(table)
-            .and_then(|p| p.masked_projection(identity, column))
+    ) -> Result<Option<String>, AuthError> {
+        match self.policies.get(table) {
+            Some(p) => p.masked_projection(identity, column),
+            None => Ok(None),
+        }
     }
 }
 
@@ -184,7 +204,7 @@ mod tests {
             },
         );
 
-        let proj = policy.masked_projection(&analyst(), "ssn");
+        let proj = policy.masked_projection(&analyst(), "ssn").unwrap();
         assert_eq!(proj, Some("'***-**-****' AS ssn".to_string()));
     }
 
@@ -199,7 +219,7 @@ mod tests {
             },
         );
 
-        let proj = policy.masked_projection(&analyst(), "email");
+        let proj = policy.masked_projection(&analyst(), "email").unwrap();
         assert!(proj.unwrap().contains("***@"));
     }
 
@@ -214,7 +234,7 @@ mod tests {
             },
         );
 
-        let proj = policy.masked_projection(&analyst(), "phone");
+        let proj = policy.masked_projection(&analyst(), "phone").unwrap();
         assert_eq!(proj, Some("NULL AS phone".to_string()));
     }
 
@@ -229,7 +249,7 @@ mod tests {
             },
         );
 
-        let proj = policy.masked_projection(&analyst(), "name");
+        let proj = policy.masked_projection(&analyst(), "name").unwrap();
         assert_eq!(
             proj,
             Some("CONCAT(LEFT(name, 2), '****') AS name".to_string())
@@ -247,7 +267,7 @@ mod tests {
             },
         );
 
-        let proj = policy.masked_projection(&admin(), "ssn");
+        let proj = policy.masked_projection(&admin(), "ssn").unwrap();
         assert_eq!(proj, None);
     }
 
@@ -263,7 +283,7 @@ mod tests {
         );
 
         // "name" column has no mask
-        let proj = policy.masked_projection(&analyst(), "name");
+        let proj = policy.masked_projection(&analyst(), "name").unwrap();
         assert_eq!(proj, None);
     }
 
@@ -282,12 +302,15 @@ mod tests {
 
         assert!(registry
             .masked_projection("users", &analyst(), "email")
+            .unwrap()
             .is_some());
         assert!(registry
             .masked_projection("users", &analyst(), "name")
+            .unwrap()
             .is_none());
         assert!(registry
             .masked_projection("other", &analyst(), "email")
+            .unwrap()
             .is_none());
     }
 
@@ -317,12 +340,30 @@ mod tests {
             .with_role("alpha");
 
         assert_eq!(
-            policy.masked_projection(&first, "ssn"),
+            policy.masked_projection(&first, "ssn").unwrap(),
             Some("'ALPHA' AS ssn".to_string())
         );
         assert_eq!(
-            policy.masked_projection(&second, "ssn"),
+            policy.masked_projection(&second, "ssn").unwrap(),
             Some("'ALPHA' AS ssn".to_string())
+        );
+    }
+
+    #[test]
+    fn test_column_name_injection_rejected() {
+        let mut policy = ColumnSecurityPolicy::new("users");
+        policy.add_mask(
+            "analyst",
+            ColumnMask {
+                column_name: "ssn; DROP TABLE users".to_string(),
+                strategy: MaskingStrategy::Redact("***".to_string()),
+            },
+        );
+
+        let result = policy.masked_projection(&analyst(), "ssn; DROP TABLE users");
+        assert!(
+            result.is_err(),
+            "column names with SQL injection must be rejected"
         );
     }
 }
