@@ -107,7 +107,10 @@ impl MongoCdcConfig {
             ..Self::default()
         };
 
-        cfg.collection = config.get("collection").map(String::from);
+        cfg.collection = config
+            .get("collection")
+            .map(|s| s.trim().to_string())
+            .filter(|s| !s.is_empty());
 
         if let Some(pipeline) = config.get("pipeline") {
             cfg.pipeline = pipeline
@@ -142,12 +145,14 @@ impl MongoCdcConfig {
             cfg.collection_include = collections
                 .split(',')
                 .map(|s| s.trim().to_string())
+                .filter(|s| !s.is_empty())
                 .collect();
         }
         if let Some(collections) = config.get("collection.exclude") {
             cfg.collection_exclude = collections
                 .split(',')
                 .map(|s| s.trim().to_string())
+                .filter(|s| !s.is_empty())
                 .collect();
         }
 

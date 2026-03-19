@@ -28,9 +28,10 @@ pub async fn connect(config: &MongoCdcConfig) -> Result<Client, ConnectorError> 
     let client = Client::with_options(client_options)
         .map_err(|e| ConnectorError::ConnectionFailed(e.to_string()))?;
 
-    // Verify connectivity by listing database names
+    // Verify connectivity with a lightweight ping (does not require listDatabases privilege)
     client
-        .list_database_names()
+        .database("admin")
+        .run_command(mongodb::bson::doc! { "ping": 1 })
         .await
         .map_err(|e| ConnectorError::ConnectionFailed(format!("ping failed: {e}")))?;
 
@@ -175,7 +176,7 @@ pub fn decode_change_event(
         .as_ref()
         .map(|doc| serde_json::to_string(doc).unwrap_or_default());
 
-    // Extract update description
+    // Extract update description (include truncatedArrays when present)
     let update_description = event.update_description.as_ref().map(|ud| {
         let mut obj = serde_json::Map::new();
         obj.insert(
@@ -186,6 +187,12 @@ pub fn decode_change_event(
             "removedFields".to_string(),
             serde_json::to_value(&ud.removed_fields).unwrap_or_default(),
         );
+        if let Some(ref truncated) = ud.truncated_arrays {
+            obj.insert(
+                "truncatedArrays".to_string(),
+                serde_json::to_value(truncated).unwrap_or_default(),
+            );
+        }
         serde_json::to_string(&obj).unwrap_or_default()
     });
 

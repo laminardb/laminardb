@@ -34,9 +34,6 @@ pub struct ProtobufDecoderConfig {
     /// Fully-qualified message type name (e.g., `"mypackage.MyMessage"`).
     /// If `None`, uses the first message in the first file.
     pub message_type: Option<String>,
-
-    /// Whether to decode unknown fields as binary columns (default: false).
-    pub include_unknown_fields: bool,
 }
 
 impl ProtobufDecoderConfig {
@@ -260,9 +257,16 @@ fn build_schema_and_fields(
     let mut resolved_fields = Vec::new();
 
     for proto_field in &descriptor.field {
+        let Some(number) = proto_field.number else {
+            // Skip fields without valid field numbers (field 0 is reserved in protobuf)
+            continue;
+        };
+        if number <= 0 {
+            continue;
+        }
         let name = proto_field.name.clone().unwrap_or_default();
         #[allow(clippy::cast_sign_loss)]
-        let field_number = proto_field.number.unwrap_or(0) as u32;
+        let field_number = number as u32;
         let proto_type = proto_field.r#type();
         let is_repeated = proto_field.label() == Label::Repeated;
         let is_optional =

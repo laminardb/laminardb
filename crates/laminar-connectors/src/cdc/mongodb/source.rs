@@ -81,8 +81,10 @@ pub struct MongoCdcSource {
 #[cfg(feature = "mongodb-cdc")]
 #[derive(Debug)]
 pub enum ChangeStreamMessage {
-    /// A change event from the stream.
-    Event(ChangeEvent),
+    /// A change event from the stream, with its serialized byte size.
+    Event(ChangeEvent, u64),
+    /// A stream error (non-fatal; reader may continue or break).
+    Error(String),
 }
 
 impl std::fmt::Debug for MongoCdcSource {
@@ -219,8 +221,10 @@ impl SourceConnector for MongoCdcSource {
         // Validate configuration
         self.config.validate()?;
 
-        // Restore resume token from config
-        self.resume_token.clone_from(&self.config.resume_token);
+        // Use restored checkpoint token if present, else fall back to config token
+        if self.resume_token.is_none() {
+            self.resume_token.clone_from(&self.config.resume_token);
+        }
 
         // Without mongodb-cdc feature, open() must fail loudly to prevent
         // silent data loss (poll_batch would return Ok(None) forever).
@@ -245,7 +249,8 @@ impl SourceConnector for MongoCdcSource {
             )
             .await?;
 
-            let (msg_tx, msg_rx) = tokio::sync::mpsc::channel(4096);
+            let (msg_tx, msg_rx) =
+                tokio::sync::mpsc::channel(self.config.max_buffered_events);
             let (shutdown_tx, mut shutdown_rx) = tokio::sync::watch::channel(false);
             let data_ready = Arc::clone(&self.data_ready);
             let collection_filter = self.config.collection_include.clone();
@@ -262,13 +267,21 @@ impl SourceConnector for MongoCdcSource {
                     };
                     match event {
                         Some(Ok(change_event)) => {
+                            // Estimate byte size from the BSON document
+                            let byte_size = serde_json::to_vec(&change_event)
+                                .map(|v| v.len() as u64)
+                                .unwrap_or(0);
                             let parsed = super::mongo_io::decode_change_event(
                                 &change_event,
                                 &collection_filter,
                                 &collection_exclude,
                             );
                             if let Some(evt) = parsed {
-                                if msg_tx.send(ChangeStreamMessage::Event(evt)).await.is_err() {
+                                if msg_tx
+                                    .send(ChangeStreamMessage::Event(evt, byte_size))
+                                    .await
+                                    .is_err()
+                                {
                                     break;
                                 }
                                 data_ready.notify_one();
@@ -276,6 +289,9 @@ impl SourceConnector for MongoCdcSource {
                         }
                         Some(Err(e)) => {
                             tracing::warn!(error = %e, "change stream error");
+                            let _ = msg_tx
+                                .send(ChangeStreamMessage::Error(e.to_string()))
+                                .await;
                             break;
                         }
                         None => break,
@@ -311,8 +327,9 @@ impl SourceConnector for MongoCdcSource {
                 let mut reader_closed = false;
                 while self.event_buffer.len() < max_records {
                     match rx.try_recv() {
-                        Ok(ChangeStreamMessage::Event(event)) => {
+                        Ok(ChangeStreamMessage::Event(event, byte_size)) => {
                             self.metrics.inc_events_received();
+                            self.metrics.add_bytes_received(byte_size);
                             match event.operation {
                                 CdcOperation::Insert => self.metrics.inc_inserts(1),
                                 CdcOperation::Update => self.metrics.inc_updates(1),
@@ -320,6 +337,11 @@ impl SourceConnector for MongoCdcSource {
                                 CdcOperation::Delete => self.metrics.inc_deletes(1),
                             }
                             self.event_buffer.push(event);
+                        }
+                        Ok(ChangeStreamMessage::Error(_)) => {
+                            self.metrics.inc_errors();
+                            reader_closed = true;
+                            break;
                         }
                         Err(tokio::sync::mpsc::error::TryRecvError::Empty) => break,
                         Err(tokio::sync::mpsc::error::TryRecvError::Disconnected) => {

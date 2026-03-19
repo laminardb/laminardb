@@ -105,15 +105,31 @@ impl MongoCdcMetrics {
         }
     }
 
-    /// Converts to generic connector metrics.
+    /// Converts to generic connector metrics, including per-operation CDC counters.
     #[must_use]
     pub fn to_connector_metrics(&self) -> ConnectorMetrics {
-        ConnectorMetrics {
+        let mut m = ConnectorMetrics {
             records_total: self.total_row_events(),
             bytes_total: self.bytes_received.load(Ordering::Relaxed),
             errors_total: self.errors.load(Ordering::Relaxed),
             ..ConnectorMetrics::default()
-        }
+        };
+        m.add_custom(
+            "cdc.events_received",
+            self.events_received.load(Ordering::Relaxed) as f64,
+        );
+        m.add_custom("cdc.inserts", self.inserts.load(Ordering::Relaxed) as f64);
+        m.add_custom("cdc.updates", self.updates.load(Ordering::Relaxed) as f64);
+        m.add_custom(
+            "cdc.replaces",
+            self.replaces.load(Ordering::Relaxed) as f64,
+        );
+        m.add_custom("cdc.deletes", self.deletes.load(Ordering::Relaxed) as f64);
+        m.add_custom(
+            "cdc.resume_token_updates",
+            self.resume_token_updates.load(Ordering::Relaxed) as f64,
+        );
+        m
     }
 
     /// Resets all counters to zero.

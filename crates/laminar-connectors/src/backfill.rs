@@ -108,6 +108,9 @@ impl BackfillProgress {
     /// Returns 0.0 if the end offset is unknown (zero).
     #[must_use]
     pub fn percent_complete(&self) -> f64 {
+        if self.is_complete() {
+            return 100.0;
+        }
         let end = self.end();
         if end == 0 {
             return 0.0;
@@ -309,6 +312,11 @@ impl SourceConnector for BackfillSource {
         self.inner.open(config).await?;
 
         if self.config.enabled {
+            if !self.inner.supports_replay() {
+                return Err(ConnectorError::ConfigurationError(
+                    "backfill enabled but inner source does not support replay".to_string(),
+                ));
+            }
             self.phase = BackfillPhase::Backfilling;
             tracing::info!("backfill mode enabled, starting historical replay");
         } else {
