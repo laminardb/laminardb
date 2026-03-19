@@ -55,6 +55,8 @@ mod handle;
 mod interval_join;
 mod metrics;
 mod metrics_api;
+#[allow(dead_code)] // Not yet wired into the pipeline.
+mod o3_merge;
 /// Thread-per-core connector pipeline.
 pub mod pipeline;
 mod pipeline_callback;
