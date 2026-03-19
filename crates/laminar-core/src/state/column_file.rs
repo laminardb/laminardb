@@ -180,6 +180,14 @@ impl ColumnFile {
             )));
         }
 
+        // Guard against u32 overflow in the index sidecar (offset and len are
+        // stored as u32). Reject writes that would exceed the u32 address space.
+        if end > u32::MAX as usize {
+            return Err(StateError::Corruption(
+                "column file offset would exceed u32::MAX — partition too large".into(),
+            ));
+        }
+
         self.mmap[offset..end].copy_from_slice(data);
         self.write_pos = end;
         self.persist_header();
@@ -265,6 +273,21 @@ impl Partition {
 
         // Restore the key-to-offset index from the sidecar file if it exists.
         let (index, size_bytes) = Self::load_index(dir)?;
+
+        // Validate that all col_idx values in the restored index are within
+        // the current column schema bounds (guards against schema changes
+        // between runs).
+        let num_columns = columns.len();
+        for entries in index.values() {
+            for entry in entries {
+                if entry.column_idx >= num_columns {
+                    return Err(StateError::Corruption(format!(
+                        "partition {}: index.bin contains col_idx {} but only {} columns configured",
+                        id, entry.column_idx, num_columns
+                    )));
+                }
+            }
+        }
 
         Ok(Self {
             id,
@@ -365,6 +388,12 @@ impl Partition {
         file.sync_all()?;
         drop(file);
         fs::rename(&tmp_path, &path)?;
+
+        // Sync the directory to ensure the rename is durable across crashes.
+        if let Ok(dir_file) = File::open(dir) {
+            let _ = dir_file.sync_all();
+        }
+
         Ok(())
     }
 
