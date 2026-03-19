@@ -199,7 +199,14 @@ pub(crate) fn scalar_to_json(sv: &ScalarValue) -> serde_json::Value {
                     for i in 0..values.len() {
                         let sv = match ScalarValue::try_from_array(&values, i) {
                             Ok(sv) => sv,
-                            Err(_) => ScalarValue::Null,
+                            Err(e) => {
+                                tracing::warn!(
+                                    index = i,
+                                    error = %e,
+                                    "scalar_to_json: List element decode failed, substituting Null"
+                                );
+                                ScalarValue::Null
+                            }
                         };
                         items.push(scalar_to_json(&sv));
                     }
@@ -929,12 +936,13 @@ impl IncrementalAggState {
             .map(|i| {
                 let col = batch.column(i);
                 if col.data_type() == &self.group_types[i] {
-                    Arc::clone(col)
+                    Ok(Arc::clone(col))
                 } else {
-                    arrow::compute::cast(col, &self.group_types[i]).unwrap_or(Arc::clone(col))
+                    arrow::compute::cast(col, &self.group_types[i])
+                        .map_err(|e| DbError::Pipeline(format!("group column cast failed: {e}")))
                 }
             })
-            .collect();
+            .collect::<Result<_, _>>()?;
 
         let rows = self
             .row_converter
