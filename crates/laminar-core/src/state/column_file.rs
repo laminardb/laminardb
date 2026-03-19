@@ -33,6 +33,7 @@
 
 use std::collections::BTreeMap;
 use std::fs::{self, File, OpenOptions};
+use std::io::{Read as _, Write as _};
 use std::path::{Path, PathBuf};
 
 use memmap2::MmapMut;
@@ -219,6 +220,8 @@ pub enum PartitionTier {
 struct Partition {
     /// Partition ID (typically a window start timestamp).
     id: i64,
+    /// Directory containing this partition's files.
+    dir: PathBuf,
     /// Column files, one per accumulator field.
     columns: Vec<ColumnFile>,
     /// Column name to index mapping.
@@ -242,6 +245,9 @@ struct ValueEntry {
     len: usize,
 }
 
+/// Name of the index sidecar file inside each partition directory.
+const INDEX_FILE_NAME: &str = "index.bin";
+
 impl Partition {
     fn new(id: i64, dir: &Path, config: &ColumnFileConfig) -> Result<Self, StateError> {
         fs::create_dir_all(dir)?;
@@ -256,14 +262,105 @@ impl Partition {
             column_indices.insert(name.clone(), idx);
         }
 
+        // Restore the key-to-offset index from the sidecar file if it exists.
+        let (index, size_bytes) = Self::load_index(dir)?;
+
         Ok(Self {
             id,
+            dir: dir.to_path_buf(),
             columns,
             column_indices,
             tier: PartitionTier::Hot,
-            index: BTreeMap::new(),
-            size_bytes: 0,
+            index,
+            size_bytes,
         })
+    }
+
+    /// Load the persisted index from the sidecar file.
+    ///
+    /// Format (repeated): `[key_len: u32][key][col_idx: u32][offset: u32][len: u32]`
+    #[allow(clippy::type_complexity)]
+    fn load_index(dir: &Path) -> Result<(BTreeMap<Vec<u8>, Vec<ValueEntry>>, usize), StateError> {
+        let path = dir.join(INDEX_FILE_NAME);
+        if !path.exists() {
+            return Ok((BTreeMap::new(), 0));
+        }
+
+        let mut data = Vec::new();
+        File::open(&path)?.read_to_end(&mut data)?;
+
+        let mut index: BTreeMap<Vec<u8>, Vec<ValueEntry>> = BTreeMap::new();
+        let mut size_bytes: usize = 0;
+        let mut pos = 0;
+
+        while pos + 4 <= data.len() {
+            // key_len
+            let key_len = u32::from_le_bytes(
+                data[pos..pos + 4]
+                    .try_into()
+                    .map_err(|_| StateError::Corruption("index: bad key_len".into()))?,
+            ) as usize;
+            pos += 4;
+
+            if pos + key_len + 12 > data.len() {
+                return Err(StateError::Corruption("index: truncated entry".into()));
+            }
+
+            let key = data[pos..pos + key_len].to_vec();
+            pos += key_len;
+
+            let col_idx = u32::from_le_bytes(
+                data[pos..pos + 4]
+                    .try_into()
+                    .map_err(|_| StateError::Corruption("index: bad col_idx".into()))?,
+            ) as usize;
+            pos += 4;
+
+            let offset = u32::from_le_bytes(
+                data[pos..pos + 4]
+                    .try_into()
+                    .map_err(|_| StateError::Corruption("index: bad offset".into()))?,
+            ) as usize;
+            pos += 4;
+
+            let len = u32::from_le_bytes(
+                data[pos..pos + 4]
+                    .try_into()
+                    .map_err(|_| StateError::Corruption("index: bad len".into()))?,
+            ) as usize;
+            pos += 4;
+
+            size_bytes += key.len() + len;
+            index.entry(key).or_default().push(ValueEntry {
+                column_idx: col_idx,
+                offset,
+                len,
+            });
+        }
+
+        Ok((index, size_bytes))
+    }
+
+    /// Persist the in-memory index to the sidecar file.
+    #[allow(clippy::cast_possible_truncation)] // Column file sizes are << 4 GiB.
+    fn save_index(&self, dir: &Path) -> Result<(), StateError> {
+        let path = dir.join(INDEX_FILE_NAME);
+        let mut buf = Vec::new();
+
+        for (key, entries) in &self.index {
+            for entry in entries {
+                buf.extend_from_slice(&(key.len() as u32).to_le_bytes());
+                buf.extend_from_slice(key);
+                buf.extend_from_slice(&(entry.column_idx as u32).to_le_bytes());
+                buf.extend_from_slice(&(entry.offset as u32).to_le_bytes());
+                buf.extend_from_slice(&(entry.len as u32).to_le_bytes());
+            }
+        }
+
+        let mut file = File::create(&path)?;
+        file.write_all(&buf)?;
+        file.sync_all()?;
+        Ok(())
     }
 
     /// Write a key-value pair to a specific column.
@@ -303,6 +400,7 @@ impl Partition {
         for col in &mut self.columns {
             col.flush()?;
         }
+        self.save_index(&self.dir.clone())?;
         Ok(())
     }
 }
@@ -326,19 +424,50 @@ pub struct ColumnFileStateStore {
 }
 
 impl ColumnFileStateStore {
-    /// Create a new column-file state store.
+    /// Create or reopen a column-file state store.
+    ///
+    /// If the base directory already contains partition sub-directories
+    /// (from a previous run), they are reopened and their indexes are
+    /// restored from sidecar files. This makes the store restart-safe.
     ///
     /// # Errors
     ///
-    /// Returns `StateError::Io` if the base directory cannot be created.
+    /// Returns `StateError::Io` if the base directory cannot be created
+    /// or if an existing partition is corrupted.
     pub fn new(config: ColumnFileConfig) -> Result<Self, StateError> {
         fs::create_dir_all(&config.base_dir)?;
+
+        let mut partitions = BTreeMap::new();
+        let mut total_entries: usize = 0;
+        let mut total_size_bytes: usize = 0;
+
+        // Scan for existing partition directories and reopen them.
+        for entry in fs::read_dir(&config.base_dir)? {
+            let entry = entry?;
+            let name = entry.file_name();
+            let name_str = name.to_string_lossy();
+            if entry.file_type()?.is_dir() {
+                if let Some(id_str) = name_str.strip_prefix("partition_") {
+                    if let Ok(id) = id_str.parse::<i64>() {
+                        let dir = entry.path();
+                        let partition = Partition::new(id, &dir, &config)?;
+                        let entry_count: usize = partition.index.values().map(Vec::len).sum();
+                        total_entries += entry_count;
+                        total_size_bytes += partition.size_bytes;
+                        partitions.insert(id, partition);
+                    }
+                }
+            }
+        }
+
+        let active_partition = partitions.keys().next_back().copied();
+
         Ok(Self {
             config,
-            partitions: BTreeMap::new(),
-            active_partition: None,
-            total_entries: 0,
-            total_size_bytes: 0,
+            partitions,
+            active_partition,
+            total_entries,
+            total_size_bytes,
         })
     }
 
@@ -646,5 +775,61 @@ mod tests {
         assert_eq!(u64::from_le_bytes(v2.try_into().unwrap()), 20);
 
         assert_eq!(store.total_entries(), 2);
+    }
+
+    #[test]
+    fn test_reopen_restores_data() {
+        let dir = TempDir::new().unwrap();
+
+        // Phase 1: write data and flush.
+        {
+            let config = test_config(dir.path());
+            let mut store = ColumnFileStateStore::new(config).unwrap();
+            store.ensure_partition(1000).unwrap();
+            store.ensure_partition(2000).unwrap();
+
+            store
+                .put_column(1000, b"key_a", "sum", &100u64.to_le_bytes())
+                .unwrap();
+            store
+                .put_column(1000, b"key_a", "count", &7u64.to_le_bytes())
+                .unwrap();
+            store
+                .put_column(1000, b"key_b", "sum", &200u64.to_le_bytes())
+                .unwrap();
+            store
+                .put_column(2000, b"key_x", "min", &5u64.to_le_bytes())
+                .unwrap();
+
+            store.flush_all().unwrap();
+            // store is dropped here — simulates process exit.
+        }
+
+        // Phase 2: reopen from the same directory and verify all data.
+        {
+            let config = test_config(dir.path());
+            let store = ColumnFileStateStore::new(config).unwrap();
+
+            // Both partitions should be recovered.
+            assert_eq!(store.partition_count(), 2);
+            assert_eq!(store.partition_ids(), vec![1000, 2000]);
+
+            // Verify values in partition 1000.
+            let sum_a = store.get_column(1000, b"key_a", "sum").unwrap();
+            assert_eq!(u64::from_le_bytes(sum_a.try_into().unwrap()), 100);
+
+            let count_a = store.get_column(1000, b"key_a", "count").unwrap();
+            assert_eq!(u64::from_le_bytes(count_a.try_into().unwrap()), 7);
+
+            let sum_b = store.get_column(1000, b"key_b", "sum").unwrap();
+            assert_eq!(u64::from_le_bytes(sum_b.try_into().unwrap()), 200);
+
+            // Verify value in partition 2000.
+            let min_x = store.get_column(2000, b"key_x", "min").unwrap();
+            assert_eq!(u64::from_le_bytes(min_x.try_into().unwrap()), 5);
+
+            // Entry count should match.
+            assert_eq!(store.total_entries(), 4);
+        }
     }
 }
