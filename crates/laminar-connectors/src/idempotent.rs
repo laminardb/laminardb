@@ -56,8 +56,10 @@ impl Default for IdempotentConfig {
 /// Wraps a [`SinkConnector`] with idempotent write semantics.
 ///
 /// Tracks `(epoch, batch_id)` pairs and skips writes for batches that
-/// have already been committed. This provides exactly-once delivery for
-/// sinks without native transaction support.
+/// have already been committed. This provides at-least-once delivery with
+/// client-side deduplication for sinks without native transaction support.
+/// Note: the dedup table is in-memory, so a crash before commit can result
+/// in replay — this is NOT true exactly-once.
 pub struct IdempotentSinkWrapper {
     inner: Box<dyn SinkConnector>,
     config: IdempotentConfig,

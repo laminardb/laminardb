@@ -18,6 +18,8 @@ async fn cmd_status(server: &str) -> Result<()> {
     let resp: serde_json::Value = reqwest::get(&url)
         .await
         .context("failed to connect to server")?
+        .error_for_status()
+        .context("server returned an error")?
         .json()
         .await
         .context("invalid response")?;
@@ -34,6 +36,8 @@ async fn cmd_sql(server: &str, query: &str) -> Result<()> {
         .send()
         .await
         .context("failed to connect to server")?
+        .error_for_status()
+        .context("server returned an error")?
         .json()
         .await
         .context("invalid response")?;
@@ -49,6 +53,8 @@ async fn cmd_checkpoint(server: &str) -> Result<()> {
         .send()
         .await
         .context("failed to connect to server")?
+        .error_for_status()
+        .context("server returned an error")?
         .json()
         .await
         .context("invalid response")?;
@@ -61,6 +67,8 @@ async fn cmd_cluster(server: &str) -> Result<()> {
     let resp: serde_json::Value = reqwest::get(&url)
         .await
         .context("failed to connect to server")?
+        .error_for_status()
+        .context("server returned an error")?
         .json()
         .await
         .context("invalid response")?;

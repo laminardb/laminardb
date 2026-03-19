@@ -192,6 +192,24 @@ struct ErrorBody {
     error: String,
 }
 
+/// Escape a string for use as a Prometheus label value.
+fn prom_label_value(value: &str) -> String {
+    value
+        .replace('\\', r"\\")
+        .replace('\n', r"\n")
+        .replace('"', r#"\""#)
+}
+
+/// Escape a string for safe embedding in HTML.
+fn escape_html(value: &str) -> String {
+    value
+        .replace('&', "&amp;")
+        .replace('<', "&lt;")
+        .replace('>', "&gt;")
+        .replace('"', "&quot;")
+        .replace('\'', "&#39;")
+}
+
 fn error_response(status: StatusCode, msg: impl Into<String>) -> impl IntoResponse {
     (status, Json(ErrorBody { error: msg.into() }))
 }
@@ -292,21 +310,21 @@ async fn prometheus_metrics(State(state): State<Arc<AppState>>) -> impl IntoResp
 
     // Per-source detailed metrics
     for sm in &source_metrics {
+        let label = prom_label_value(&sm.name);
         lines.push(format!(
-            "laminardb_source_events_total{{source=\"{}\"}} {}",
-            sm.name, sm.total_events
+            "laminardb_source_events_total{{source=\"{label}\"}} {}",
+            sm.total_events
         ));
         lines.push(format!(
-            "laminardb_source_pending{{source=\"{}\"}} {}",
-            sm.name, sm.pending
+            "laminardb_source_pending{{source=\"{label}\"}} {}",
+            sm.pending
         ));
         lines.push(format!(
-            "laminardb_source_utilization{{source=\"{}\"}} {:.4}",
-            sm.name, sm.utilization
+            "laminardb_source_utilization{{source=\"{label}\"}} {:.4}",
+            sm.utilization
         ));
         lines.push(format!(
-            "laminardb_source_backpressured{{source=\"{}\"}} {}",
-            sm.name,
+            "laminardb_source_backpressured{{source=\"{label}\"}} {}",
             if sm.is_backpressured { 1 } else { 0 }
         ));
     }
@@ -314,13 +332,14 @@ async fn prometheus_metrics(State(state): State<Arc<AppState>>) -> impl IntoResp
     // Per-stream metrics
     let stream_metrics = state.db.all_stream_metrics();
     for sm in &stream_metrics {
+        let label = prom_label_value(&sm.name);
         lines.push(format!(
-            "laminardb_stream_events_total{{stream=\"{}\"}} {}",
-            sm.name, sm.total_events
+            "laminardb_stream_events_total{{stream=\"{label}\"}} {}",
+            sm.total_events
         ));
         lines.push(format!(
-            "laminardb_stream_pending{{stream=\"{}\"}} {}",
-            sm.name, sm.pending
+            "laminardb_stream_pending{{stream=\"{label}\"}} {}",
+            sm.pending
         ));
     }
 
@@ -620,7 +639,7 @@ async fn dashboard(State(state): State<Arc<AppState>>) -> impl IntoResponse {
     for sm in &source_metrics {
         source_rows.push_str(&format!(
             "<tr><td>{}</td><td>{}</td><td>{}</td><td>{:.1}%</td></tr>",
-            sm.name,
+            escape_html(&sm.name),
             sm.total_events,
             sm.pending,
             sm.utilization * 100.0
@@ -630,7 +649,9 @@ async fn dashboard(State(state): State<Arc<AppState>>) -> impl IntoResponse {
     for sm in &stream_metrics {
         stream_rows.push_str(&format!(
             "<tr><td>{}</td><td>{}</td><td>{}</td></tr>",
-            sm.name, sm.total_events, sm.pending
+            escape_html(&sm.name),
+            sm.total_events,
+            sm.pending
         ));
     }
 
