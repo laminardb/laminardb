@@ -947,8 +947,16 @@ fn merge_named_toml_arrays(target: &[toml::Value], patch: &[toml::Value]) -> Vec
             .is_some()
     });
 
-    if !patch_has_names || patch.is_empty() {
+    if patch.is_empty() {
         return patch.to_vec();
+    }
+
+    // If patch items lack "name" fields, we cannot match them against
+    // target items. Preserve the existing target to avoid silently
+    // dropping sensitive values (secrets would be lost on wholesale
+    // replacement since filter_masked_values strips "***" placeholders).
+    if !patch_has_names {
+        return target.to_vec();
     }
 
     // Collect patch names for lookup.
@@ -1671,6 +1679,36 @@ mod tests {
             pw,
             Some("super_secret_123"),
             "PUT must not destroy secrets — password should survive config merge"
+        );
+    }
+
+    #[test]
+    fn test_merge_named_toml_arrays_preserves_target_on_nameless_patch() {
+        // Regression: a patch with items lacking "name" should NOT wholesale
+        // replace the target array, as this would lose secrets that
+        // filter_masked_values already stripped from the patch.
+        let target = vec![toml::Value::Table({
+            let mut t = toml::Table::new();
+            t.insert("name".into(), toml::Value::String("src1".into()));
+            t.insert("password".into(), toml::Value::String("real_secret".into()));
+            t
+        })];
+        let nameless_patch = vec![toml::Value::Table({
+            let mut t = toml::Table::new();
+            t.insert("connector".into(), toml::Value::String("kafka".into()));
+            t
+        })];
+        let result = merge_named_toml_arrays(&target, &nameless_patch);
+        // Target must be preserved since patch items lack names.
+        assert_eq!(result.len(), 1);
+        assert_eq!(
+            result[0]
+                .as_table()
+                .unwrap()
+                .get("password")
+                .unwrap()
+                .as_str(),
+            Some("real_secret"),
         );
     }
 
