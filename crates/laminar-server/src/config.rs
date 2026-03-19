@@ -506,7 +506,6 @@ pub struct CoordinationSection {
 
 /// `[telemetry]` section: OpenTelemetry configuration.
 #[derive(Debug, Clone, PartialEq, Deserialize)]
-#[allow(dead_code)]
 pub struct TelemetrySection {
     /// OTLP endpoint (e.g., `"http://localhost:4317"`).
     pub otlp_endpoint: String,

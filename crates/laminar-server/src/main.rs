@@ -91,26 +91,29 @@ pub enum Command {
 async fn main() -> Result<()> {
     let args = Args::parse();
 
-    tracing_subscriber::registry()
-        .with(
-            tracing_subscriber::EnvFilter::try_from_default_env()
-                .unwrap_or_else(|_| format!("laminardb={}", args.log_level).into()),
-        )
-        .with(tracing_subscriber::fmt::layer())
-        .init();
+    let env_filter = tracing_subscriber::EnvFilter::try_from_default_env()
+        .unwrap_or_else(|_| format!("laminardb={}", args.log_level).into());
+
+    // CLI subcommands don't need config-based telemetry.
+    if let Some(cmd) = args.command {
+        tracing_subscriber::registry()
+            .with(env_filter)
+            .with(tracing_subscriber::fmt::layer())
+            .init();
+        return cli::run_command(cmd).await;
+    }
+
+    let config_path = PathBuf::from(&args.config);
+    let config = config::load_config(&config_path)?;
+
+    // Wire up OTLP tracing if configured and the feature is enabled.
+    init_tracing(env_filter, config.telemetry.as_ref())?;
 
     info!("Starting LaminarDB server");
     info!("Version: {}", env!("CARGO_PKG_VERSION"));
     info!("Config file: {}", args.config);
 
-    // If a subcommand was given, dispatch it and exit.
-    if let Some(cmd) = args.command {
-        return cli::run_command(cmd).await;
-    }
-
-    let config_path = PathBuf::from(&args.config);
-    let mut config = config::load_config(&config_path)?;
-
+    let mut config = config;
     if let Some(bind) = args.admin_bind {
         config.server.bind = bind;
     }
@@ -206,6 +209,39 @@ fn build_checkpoint_store(
             }
         }
     }
+}
+
+/// Initialize the tracing subscriber, optionally composing an OTLP layer.
+fn init_tracing(
+    env_filter: tracing_subscriber::EnvFilter,
+    _telemetry: Option<&config::TelemetrySection>,
+) -> Result<()> {
+    #[cfg(feature = "otlp")]
+    if let Some(tel) = _telemetry {
+        use opentelemetry::trace::TracerProvider;
+        let provider = init_otlp_tracer(&tel.otlp_endpoint, &tel.service_name)?;
+        let otlp_layer = tracing_opentelemetry::layer().with_tracer(provider.tracer("laminardb"));
+        tracing_subscriber::registry()
+            .with(env_filter)
+            .with(tracing_subscriber::fmt::layer())
+            .with(otlp_layer)
+            .init();
+        return Ok(());
+    }
+
+    #[cfg(not(feature = "otlp"))]
+    if _telemetry.is_some() {
+        anyhow::bail!(
+            "[telemetry] section found in config but the `otlp` feature is not enabled. \
+             Rebuild with `--features otlp` to enable OpenTelemetry export."
+        );
+    }
+
+    tracing_subscriber::registry()
+        .with(env_filter)
+        .with(tracing_subscriber::fmt::layer())
+        .init();
+    Ok(())
 }
 
 /// Initialize OpenTelemetry OTLP tracer (behind `otlp` feature).

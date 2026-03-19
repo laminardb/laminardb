@@ -592,13 +592,7 @@ impl CheckpointCoordinator {
             Err(_elapsed) => {
                 // Rollback all sinks that may have pre-committed before the
                 // timeout fired, matching the error path in pre_commit_sinks_inner.
-                if let Err(rollback_err) = self.rollback_sinks(epoch).await {
-                    error!(
-                        epoch,
-                        error = %rollback_err,
-                        "[LDB-6004] sink rollback failed after pre-commit timeout"
-                    );
-                }
+                self.rollback_sinks(epoch).await;
                 Err(DbError::Checkpoint(format!(
                     "pre-commit timed out after {}s",
                     timeout_dur.as_secs()
@@ -803,13 +797,12 @@ impl CheckpointCoordinator {
     }
 
     /// Rolls back all exactly-once sinks.
-    async fn rollback_sinks(&self, epoch: u64) -> Result<(), DbError> {
+    async fn rollback_sinks(&self, epoch: u64) {
         for sink in &self.sinks {
             if sink.exactly_once {
                 sink.handle.rollback_epoch(epoch).await;
             }
         }
-        Ok(())
     }
 
     /// Collects the last committed epoch from each sink.
@@ -1108,14 +1101,7 @@ impl CheckpointCoordinator {
         if let Some(cap) = self.config.max_checkpoint_bytes {
             if sidecar_bytes > cap {
                 // Rollback sinks that already pre-committed before aborting.
-                if let Err(rollback_err) = self.rollback_sinks(epoch).await {
-                    error!(
-                        checkpoint_id,
-                        epoch,
-                        error = %rollback_err,
-                        "[LDB-6004] sink rollback failed after checkpoint size cap exceeded"
-                    );
-                }
+                self.rollback_sinks(epoch).await;
                 self.phase = CheckpointPhase::Idle;
                 self.checkpoints_failed += 1;
                 self.maybe_cap_drainers();
@@ -1153,15 +1139,7 @@ impl CheckpointCoordinator {
             self.maybe_cap_drainers();
             let duration = start.elapsed();
             self.emit_checkpoint_metrics(false, epoch, duration);
-            if let Err(rollback_err) = self.rollback_sinks(epoch).await {
-                error!(
-                    checkpoint_id,
-                    epoch,
-                    error = %rollback_err,
-                    "[LDB-6004] sink rollback failed after manifest persist failure — \
-                     sinks may be in an inconsistent state"
-                );
-            }
+            self.rollback_sinks(epoch).await;
             error!(checkpoint_id, epoch, error = %e, "[LDB-6008] manifest persist failed");
             return Ok(CheckpointResult {
                 success: false,
