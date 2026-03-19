@@ -130,11 +130,19 @@ impl LruCache {
 
     fn insert(&mut self, partition_id: u32, key: Vec<u8>, value: RemoteValue) {
         self.counter += 1;
-        if self.entries.len() >= self.capacity {
+        let cache_key = (partition_id, key);
+        // Update in-place if key already exists (no eviction needed).
+        if let Some(entry) = self.entries.get_mut(&cache_key) {
+            entry.value = value;
+            entry.access_counter = self.counter;
+            return;
+        }
+        // Only evict when at capacity and inserting a new key.
+        if self.capacity > 0 && self.entries.len() >= self.capacity {
             self.evict_lru();
         }
         self.entries.insert(
-            (partition_id, key),
+            cache_key,
             CacheEntry {
                 value,
                 access_counter: self.counter,
@@ -258,19 +266,22 @@ impl<T: RemoteStateTransport> RemoteStateProxy<T> {
         let result = self
             .transport
             .lookup(owner, &address, partition_id, key)
-            .await?;
+            .await;
 
-        // Re-check ownership after the async RPC — if the partition was
-        // reassigned while we were waiting, the response is stale.
-        {
-            let current_owner = self.assignments.read().get(&partition_id).copied();
-            if current_owner != Some(owner) {
-                return Err(RemoteStateError::OwnershipChanged(partition_id));
-            }
+        // Hold the assignments read-guard through cache insertion so the
+        // assignment cannot change between the ownership check and cache write.
+        let assignments_guard = self.assignments.read();
+        if assignments_guard.get(&partition_id).copied() != Some(owner) {
+            return Err(RemoteStateError::OwnershipChanged(partition_id));
         }
 
-        // Cache the result if found.
+        let result = result?;
+
+        // Validate the response partition matches what we requested.
         if let Some(ref value) = result {
+            if value.partition_id != partition_id {
+                return Ok(None);
+            }
             let mut cache = self.cache.lock();
             cache.insert(partition_id, key.to_vec(), value.clone());
         }

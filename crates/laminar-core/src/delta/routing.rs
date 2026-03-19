@@ -60,6 +60,10 @@ pub enum RoutingError {
         /// Arrow data type name.
         data_type: String,
     },
+
+    /// Failed to construct a sub-batch during routing.
+    #[error("failed to construct routed sub-batch: {0}")]
+    BatchConstruction(#[from] arrow_schema::ArrowError),
 }
 
 impl PartitionRouter {
@@ -198,12 +202,11 @@ impl PartitionRouter {
                 .iter()
                 .map(|col| arrow::compute::take(col.as_ref(), &indices, None).unwrap())
                 .collect();
-            if let Ok(sub_batch) = RecordBatch::try_new(schema.clone(), columns) {
-                if node_id == self.local_node {
-                    local.push(sub_batch);
-                } else {
-                    remote.entry(node_id).or_default().push(sub_batch);
-                }
+            let sub_batch = RecordBatch::try_new(schema.clone(), columns)?;
+            if node_id == self.local_node {
+                local.push(sub_batch);
+            } else {
+                remote.entry(node_id).or_default().push(sub_batch);
             }
         }
 
