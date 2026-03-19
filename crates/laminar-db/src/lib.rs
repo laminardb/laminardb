@@ -101,6 +101,7 @@ pub use handle::{
     TypedSubscription, UntypedSourceHandle,
 };
 pub use metrics::{PipelineCounters, PipelineMetrics, PipelineState, SourceMetrics, StreamMetrics};
+pub use o3_merge::{LateDataStrategy, O3MergeConfig, O3MergeEngine};
 pub use profile::{Profile, ProfileError};
 pub use recovery_manager::{RecoveredState, RecoveryManager};
 
