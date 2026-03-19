@@ -37,7 +37,7 @@ static FILTER_TABLE_COUNTER: AtomicUsize = AtomicUsize::new(0);
 /// 2. `spawn_blocking` on `current_thread` has no dedicated blocking pool
 /// 3. The compute thread is dedicated — blocking is acceptable
 pub(crate) struct ConnectorPipelineCallback {
-    pub(crate) executor: crate::stream_executor::StreamExecutor,
+    pub(crate) graph: crate::operator_graph::OperatorGraph,
     pub(crate) stream_sources: Vec<(String, streaming::Source<crate::catalog::ArrowRecord>)>,
     #[allow(clippy::type_complexity)]
     pub(crate) sinks: Vec<(
@@ -84,19 +84,19 @@ impl ConnectorPipelineCallback {
         &mut self,
     ) -> Result<std::collections::HashMap<String, Vec<u8>>, String> {
         let mut operator_states = HashMap::with_capacity(2);
-        let cp = match self.executor.snapshot_state() {
+        let cp = match self.graph.snapshot_state() {
             Ok(Some(cp)) => cp,
             Ok(None) => return Ok(operator_states),
             Err(e) => return Err(format!("snapshot failed: {e}")),
         };
         // Offload CPU-bound serialization to blocking thread pool.
         let bytes = tokio::task::spawn_blocking(move || {
-            crate::stream_executor::StreamExecutor::serialize_checkpoint(&cp)
+            crate::operator_graph::OperatorGraph::serialize_checkpoint(&cp)
         })
         .await
         .map_err(|e| format!("serialize join error: {e}"))?
         .map_err(|e| format!("serialize error: {e}"))?;
-        operator_states.insert("stream_executor".to_string(), bytes);
+        operator_states.insert("operator_graph".to_string(), bytes);
         Ok(operator_states)
     }
 
@@ -142,7 +142,7 @@ impl crate::pipeline::PipelineCallback for ConnectorPipelineCallback {
         watermark: i64,
     ) -> Result<FxHashMap<Arc<str>, Vec<RecordBatch>>, String> {
         let results = self
-            .executor
+            .graph
             .execute_cycle(source_batches, watermark)
             .await
             .map_err(|e| format!("{e}"))?;
@@ -603,21 +603,16 @@ impl crate::pipeline::PipelineCallback for ConnectorPipelineCallback {
                 window_config,
                 order_config,
             } => {
-                self.executor.add_query(
-                    name.clone(),
-                    sql,
-                    emit_clause,
-                    window_config,
-                    order_config,
-                );
+                self.graph
+                    .add_query(name.clone(), sql, emit_clause, window_config, order_config);
                 tracing::info!(stream = %name, "Stream added via control channel");
             }
             crate::pipeline::ControlMsg::DropStream { name } => {
-                self.executor.remove_query(&name);
+                self.graph.remove_query(&name);
                 tracing::info!(stream = %name, "Stream removed via control channel");
             }
             crate::pipeline::ControlMsg::AddSourceSchema { name, schema } => {
-                self.executor.register_source_schema(name, schema);
+                self.graph.register_source_schema(name, schema);
             }
         }
     }
