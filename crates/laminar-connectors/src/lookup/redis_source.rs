@@ -100,10 +100,11 @@ pub struct RedisLookupSourceConfig {
 
 impl fmt::Debug for RedisLookupSourceConfig {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
-        // Redact password from URL to prevent credential leaks in logs.
+        // Redact the full userinfo component (username + password) to prevent credential leaks.
         let redacted_url = match url::Url::parse(&self.url) {
             Ok(mut parsed) => {
-                if parsed.password().is_some() {
+                if !parsed.username().is_empty() || parsed.password().is_some() {
+                    let _ = parsed.set_username("***");
                     let _ = parsed.set_password(Some("***"));
                 }
                 parsed.to_string()
@@ -206,9 +207,10 @@ fn fields_to_record_batch(
         };
 
         let array: Arc<dyn arrow_array::Array> = match (field.data_type(), &raw_value) {
-            (DataType::Utf8 | DataType::LargeUtf8, _) => {
-                Arc::new(StringArray::from(vec![raw_value.as_deref()]))
-            }
+            (DataType::Utf8, _) => Arc::new(StringArray::from(vec![raw_value.as_deref()])),
+            (DataType::LargeUtf8, _) => Arc::new(arrow_array::LargeStringArray::from(vec![
+                raw_value.as_deref(),
+            ])),
             (DataType::Int16, Some(v)) => {
                 let parsed: Option<i16> = v.parse().ok();
                 Arc::new(Int16Array::from(vec![parsed]))
@@ -638,7 +640,7 @@ mod tests {
     }
 
     #[test]
-    fn test_debug_impl_redacts_password() {
+    fn test_debug_impl_redacts_userinfo() {
         let config = RedisLookupSourceConfig {
             url: "redis://admin:s3cret@myhost:6379/0".into(),
             key_pattern: "user:*".into(),
@@ -648,15 +650,21 @@ mod tests {
         let debug = format!("{config:?}");
         assert!(debug.contains("RedisLookupSourceConfig"));
         assert!(debug.contains("user:*"));
-        // Password must be redacted
+        // Both username and password must be redacted
         assert!(
             !debug.contains("s3cret"),
             "password must be redacted in Debug output"
         );
         assert!(
+            !debug.contains("admin"),
+            "username must be redacted in Debug output"
+        );
+        assert!(
             debug.contains("***"),
             "redacted placeholder must appear in Debug output"
         );
+        // Host should still be visible
+        assert!(debug.contains("myhost"));
     }
 
     #[test]
@@ -757,6 +765,39 @@ mod tests {
             .unwrap();
         assert_eq!(meta_col.value(0), r#"{"nested":"value"}"#);
         assert!(!meta_col.is_null(0));
+    }
+
+    /// LargeUtf8 columns must use LargeStringArray, not StringArray.
+    #[test]
+    fn test_fields_to_record_batch_large_utf8() {
+        use arrow_array::LargeStringArray;
+
+        let schema = Arc::new(Schema::new(vec![
+            Field::new("id", DataType::Utf8, false),
+            Field::new("description", DataType::LargeUtf8, true),
+        ]));
+
+        let mut fields = HashMap::new();
+        fields.insert("description".to_string(), "a long description".to_string());
+
+        let batch = fields_to_record_batch(&schema, "id", "k1", &fields).unwrap();
+        assert_eq!(batch.num_rows(), 1);
+
+        // Key column is Utf8
+        let id_col = batch
+            .column(0)
+            .as_any()
+            .downcast_ref::<StringArray>()
+            .unwrap();
+        assert_eq!(id_col.value(0), "k1");
+
+        // Description column is LargeUtf8 — must downcast as LargeStringArray
+        let desc_col = batch
+            .column(1)
+            .as_any()
+            .downcast_ref::<LargeStringArray>()
+            .unwrap();
+        assert_eq!(desc_col.value(0), "a long description");
     }
 
     /// Test that unparseable numeric values become null.
