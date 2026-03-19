@@ -359,6 +359,9 @@ impl StreamingCoordinator {
     }
 
     /// Drain the remote batch queue.
+    ///
+    /// TODO(cluster): Wire actual gRPC transport. Until then, batches are
+    /// logged as dropped so the data loss is visible in observability.
     #[cfg(feature = "delta")]
     fn drain_remote_batches(&mut self) {
         if self.remote_batch_queue.is_empty() {
@@ -370,10 +373,11 @@ impl StreamingCoordinator {
             .iter()
             .map(|(_, b)| b.num_rows())
             .sum();
-        tracing::debug!(
+        tracing::warn!(
             batches = count,
             rows = total_rows,
-            "draining remote batch queue for gRPC send"
+            "remote batches dropped — gRPC forwarding not yet implemented \
+             (distributed queries will return incomplete results)"
         );
         self.remote_batch_queue.clear();
     }

@@ -118,6 +118,14 @@ pub enum MigrationError {
     /// Target tried to complete migration without receiving the snapshot.
     #[error("snapshot not received for partition {0}")]
     SnapshotNotReceived(u32),
+
+    /// Epoch not assigned for a partition move.
+    #[error("no epoch assigned for partition {0}")]
+    MissingEpoch(u32),
+
+    /// Source tried to complete before target confirmed restore.
+    #[error("target has not confirmed restore for partition {0}")]
+    NotRestoredOnTarget(u32),
 }
 
 /// Tracks the state of an in-progress partition migration.
@@ -134,6 +142,9 @@ pub struct MigrationState {
     /// Whether the target node has received the snapshot data.
     /// Must be `true` before `complete_migration` succeeds on the target side.
     pub snapshot_received: bool,
+    /// Whether the target node has confirmed state restoration.
+    /// Must be `true` before the *source* can complete the migration.
+    pub target_restore_acked: bool,
 }
 
 impl MigrationState {
@@ -146,6 +157,7 @@ impl MigrationState {
             new_epoch,
             snapshot: None,
             snapshot_received: false,
+            target_restore_acked: false,
         }
     }
 
@@ -209,17 +221,27 @@ impl MigrationCoordinator {
     /// The `epochs` map provides the epoch for each partition move, assigned by the
     /// Raft leader to ensure global consistency. Only moves that involve this node
     /// (as source or target) are tracked.
-    pub fn plan_migrations(&mut self, moves: &[PartitionMove], epochs: &HashMap<u32, u64>) {
+    ///
+    /// # Errors
+    ///
+    /// Returns [`MigrationError::MissingEpoch`] if any relevant partition move
+    /// lacks an epoch in the provided map.
+    pub fn plan_migrations(
+        &mut self,
+        moves: &[PartitionMove],
+        epochs: &HashMap<u32, u64>,
+    ) -> Result<(), MigrationError> {
         for mv in moves {
             if mv.from == Some(self.node_id) || mv.to == self.node_id {
                 let epoch = epochs
                     .get(&mv.partition_id)
                     .copied()
-                    .expect("epoch must be assigned for every partition move");
+                    .ok_or(MigrationError::MissingEpoch(mv.partition_id))?;
                 self.active_migrations
                     .insert(mv.partition_id, MigrationState::new(mv.clone(), epoch));
             }
         }
+        Ok(())
     }
 
     /// Begin the pause phase for a partition this node is giving up.
@@ -283,16 +305,38 @@ impl MigrationCoordinator {
         Ok(())
     }
 
+    /// Record that the target has successfully restored partition state.
+    ///
+    /// This must be called (typically via an RPC ack from the target node)
+    /// before the source can complete its side of the migration.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error if the migration is not being tracked.
+    pub fn ack_target_restore(&mut self, partition_id: u32) -> Result<(), MigrationError> {
+        let state = self
+            .active_migrations
+            .get_mut(&partition_id)
+            .ok_or(MigrationError::NotOwned(partition_id))?;
+        state.target_restore_acked = true;
+        Ok(())
+    }
+
     /// Complete a migration, applying the epoch change to guards.
     ///
     /// On the target side (`partition_move.to == self.node_id`), the snapshot
     /// must have been received (`snapshot_received == true`) before completion
-    /// is allowed. This prevents completing a migration without actual data transfer.
+    /// is allowed.
+    ///
+    /// On the source side (`partition_move.from == Some(self.node_id)`), the
+    /// target must have acknowledged restore (`target_restore_acked == true`)
+    /// before the source gives up the partition.
     ///
     /// # Errors
     ///
-    /// Returns an error if the migration is not in the Restoring phase or
-    /// if the target has not received the snapshot.
+    /// Returns an error if the migration is not in the Restoring phase,
+    /// the target has not received the snapshot, or the target has not
+    /// confirmed restore (source side).
     pub fn complete_migration(
         &mut self,
         partition_id: u32,
@@ -306,6 +350,11 @@ impl MigrationCoordinator {
         // Target must have received the snapshot before completing.
         if state.partition_move.to == self.node_id && !state.snapshot_received {
             return Err(MigrationError::SnapshotNotReceived(partition_id));
+        }
+
+        // Source must have received target restore ack before giving up ownership.
+        if state.partition_move.from == Some(self.node_id) && !state.target_restore_acked {
+            return Err(MigrationError::NotRestoredOnTarget(partition_id));
         }
 
         state.transition(MigrationPhase::Completed)?;
@@ -437,7 +486,7 @@ mod tests {
         epochs.insert(0, 10);
         epochs.insert(1, 11);
         epochs.insert(2, 12);
-        coord.plan_migrations(&moves, &epochs);
+        coord.plan_migrations(&moves, &epochs).unwrap();
         // Only partitions 0 (source) and 2 (target) involve node 1.
         assert_eq!(coord.active_count(), 2);
         assert!(coord.migration_state(0).is_some());
@@ -461,7 +510,7 @@ mod tests {
         }];
         let mut epochs = HashMap::new();
         epochs.insert(5, 10);
-        coord.plan_migrations(&moves, &epochs);
+        coord.plan_migrations(&moves, &epochs).unwrap();
 
         // Begin pause
         assert!(coord.begin_pause(5, &guards).is_ok());
@@ -479,7 +528,10 @@ mod tests {
         // Begin restore (would be on target, but we simulate locally)
         assert!(coord.begin_restore(5).is_ok());
 
-        // Complete (source side — snapshot_received not required)
+        // Ack target restore (simulates RPC ack from target node)
+        assert!(coord.ack_target_restore(5).is_ok());
+
+        // Complete (source side — snapshot_received not required, but target ack is)
         let new_epoch = coord.complete_migration(5, &mut guards).unwrap();
         assert_eq!(new_epoch, 10);
         assert!(guards.get(5).is_none()); // guard removed
@@ -498,7 +550,7 @@ mod tests {
         }];
         let mut epochs = HashMap::new();
         epochs.insert(5, 10);
-        coord.plan_migrations(&moves, &epochs);
+        coord.plan_migrations(&moves, &epochs).unwrap();
 
         // Walk target through phases.
         let state = coord.active_migrations.get_mut(&5).unwrap();
@@ -526,7 +578,7 @@ mod tests {
         }];
         let mut epochs = HashMap::new();
         epochs.insert(5, 10);
-        coord.plan_migrations(&moves, &epochs);
+        coord.plan_migrations(&moves, &epochs).unwrap();
 
         let state = coord.active_migrations.get_mut(&5).unwrap();
         state.transition(MigrationPhase::Pausing).unwrap();
@@ -552,7 +604,7 @@ mod tests {
         }];
         let mut epochs = HashMap::new();
         epochs.insert(3, 10);
-        coord.plan_migrations(&moves, &epochs);
+        coord.plan_migrations(&moves, &epochs).unwrap();
         coord.fail_migration(3);
         assert!(coord.is_idle());
     }

@@ -51,6 +51,10 @@ pub enum RemoteStateError {
     /// Transport-level error.
     #[error("transport error: {0}")]
     Transport(String),
+
+    /// Partition ownership changed during the remote lookup.
+    #[error("ownership changed for partition {0} during remote lookup")]
+    OwnershipChanged(u32),
 }
 
 /// Trait for the transport layer that performs remote state lookups.
@@ -249,6 +253,15 @@ impl<T: RemoteStateTransport> RemoteStateProxy<T> {
             .transport
             .lookup(owner, &address, partition_id, key)
             .await?;
+
+        // Re-check ownership after the async RPC — if the partition was
+        // reassigned while we were waiting, the response is stale.
+        {
+            let current_owner = self.assignments.read().get(&partition_id).copied();
+            if current_owner != Some(owner) {
+                return Err(RemoteStateError::OwnershipChanged(partition_id));
+            }
+        }
 
         // Cache the result if found.
         if let Some(ref value) = result {

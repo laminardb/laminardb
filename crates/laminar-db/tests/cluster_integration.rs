@@ -170,7 +170,7 @@ fn test_migration_lifecycle() {
     }];
     let mut epochs = HashMap::new();
     epochs.insert(5, 10);
-    source_coord.plan_migrations(&moves, &epochs);
+    source_coord.plan_migrations(&moves, &epochs).unwrap();
 
     // Step 1: Pause on source
     assert!(source_coord.begin_pause(5, &source_guards).is_ok());
@@ -196,7 +196,8 @@ fn test_migration_lifecycle() {
     // Step 3: Transfer complete, begin restore
     assert!(source_coord.begin_restore(5).is_ok());
 
-    // Step 4: Complete on source side (removes guard)
+    // Step 4: Ack target restore + complete on source side (removes guard)
+    assert!(source_coord.ack_target_restore(5).is_ok());
     let new_epoch = source_coord
         .complete_migration(5, &mut source_guards)
         .unwrap();
@@ -209,7 +210,7 @@ fn test_migration_lifecycle() {
     // Target side: separate coordinator for node 2
     let mut target_guards = PartitionGuardSet::new(NodeId(2));
     let mut target_coord = MigrationCoordinator::new(NodeId(2));
-    target_coord.plan_migrations(&moves, &epochs);
+    target_coord.plan_migrations(&moves, &epochs).unwrap();
 
     // Walk target through phases using public API
     let state = target_coord.migration_state_mut(5).unwrap();
@@ -247,7 +248,7 @@ fn test_epoch_fencing_prevents_stale_migration() {
     }];
     let mut epochs = HashMap::new();
     epochs.insert(5, 11);
-    coord.plan_migrations(&moves, &epochs);
+    coord.plan_migrations(&moves, &epochs).unwrap();
 
     let result = coord.begin_pause(5, &guards);
     assert!(

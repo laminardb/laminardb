@@ -47,8 +47,17 @@ pub struct PartitionRouter {
 
 impl PartitionRouter {
     /// Create a new router.
+    ///
+    /// # Panics
+    ///
+    /// Panics if `config.num_partitions` is zero (would cause division-by-zero
+    /// in `partition_for_hash`).
     #[must_use]
     pub fn new(config: RoutingConfig, local_node: NodeId) -> Self {
+        assert!(
+            config.num_partitions > 0,
+            "RoutingConfig::num_partitions must be greater than zero"
+        );
         Self {
             config,
             local_node,
@@ -133,7 +142,14 @@ impl PartitionRouter {
         let column = batch.column(col_idx);
 
         for row in 0..num_rows {
-            let hash = Self::hash_column_value(column, row);
+            let Some(hash) = Self::hash_column_value(column, row) else {
+                // Unsupported partition key type — route entire batch locally.
+                drop(assignments);
+                return RoutedBatches {
+                    local: vec![batch.clone()],
+                    remote: HashMap::new(),
+                };
+            };
             let partition_id = self.partition_for_hash(hash);
             let owner = assignments
                 .get(&partition_id)
@@ -179,43 +195,38 @@ impl PartitionRouter {
     /// Hash a single column value for partition assignment.
     ///
     /// Uses a simple but deterministic hash. Supports string, integer,
-    /// and binary column types. Falls back to row index for unsupported types.
-    fn hash_column_value(column: &dyn arrow_array::Array, row: usize) -> u64 {
+    /// and binary column types. Returns `None` for unsupported types.
+    fn hash_column_value(column: &dyn arrow_array::Array, row: usize) -> Option<u64> {
         use arrow_array::types::UInt64Type;
 
         if column.is_null(row) {
-            return 0;
+            return Some(0);
         }
 
         // Try common types in order of likelihood.
         if let Some(arr) = column.as_any().downcast_ref::<arrow_array::StringArray>() {
-            return Self::fnv1a(arr.value(row).as_bytes());
+            return Some(Self::fnv1a(arr.value(row).as_bytes()));
         }
         if let Some(arr) = column.as_any().downcast_ref::<arrow_array::Int64Array>() {
-            return Self::fnv1a(&arr.value(row).to_le_bytes());
+            return Some(Self::fnv1a(&arr.value(row).to_le_bytes()));
         }
         if let Some(arr) = column.as_any().downcast_ref::<arrow_array::Int32Array>() {
-            return Self::fnv1a(&arr.value(row).to_le_bytes());
+            return Some(Self::fnv1a(&arr.value(row).to_le_bytes()));
         }
         if let Some(arr) = column
             .as_any()
             .downcast_ref::<arrow_array::GenericByteArray<arrow_array::types::Utf8Type>>()
         {
-            return Self::fnv1a(arr.value(row).as_bytes());
+            return Some(Self::fnv1a(arr.value(row).as_bytes()));
         }
         if let Some(arr) = column
             .as_any()
             .downcast_ref::<arrow_array::PrimitiveArray<UInt64Type>>()
         {
-            return Self::fnv1a(&arr.value(row).to_le_bytes());
+            return Some(Self::fnv1a(&arr.value(row).to_le_bytes()));
         }
 
-        // Fallback: use row index as hash (all rows go to same partition
-        // per-batch, which is acceptable for unsupported types).
-        #[allow(clippy::cast_possible_truncation)]
-        {
-            row as u64
-        }
+        None
     }
 
     /// FNV-1a hash (same algorithm used in partition assignment).
