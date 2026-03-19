@@ -351,7 +351,7 @@ impl AlertManager {
             .connect_timeout(Duration::from_secs(10))
             .timeout(Duration::from_secs(30))
             .build()
-            .unwrap_or_else(|_| reqwest::Client::new());
+            .expect("failed to build HTTP client with timeouts — TLS backend unavailable");
 
         Self {
             rules,
@@ -442,21 +442,22 @@ impl AlertManager {
         let now = Instant::now();
 
         for rule in &self.rules {
-            // Check cooldown
-            {
-                let last_fired = self.last_fired.read().await;
-                if let Some(last) = last_fired.get(&rule.name) {
-                    if now.duration_since(*last) < rule.cooldown {
-                        continue;
-                    }
-                }
-            }
-
+            // Always evaluate condition (even during cooldown) so that
+            // stateful trackers like idle_since stay up to date.
             let triggered = self
                 .check_condition(&rule.name, &rule.condition, &snapshot, now)
                 .await;
 
             if triggered {
+                // Block dispatch if still in cooldown.
+                {
+                    let last_fired = self.last_fired.read().await;
+                    if let Some(last) = last_fired.get(&rule.name) {
+                        if now.duration_since(*last) < rule.cooldown {
+                            continue;
+                        }
+                    }
+                }
                 let message = self.format_message(&rule.condition, &snapshot);
                 let event = AlertEvent {
                     name: rule.name.clone(),
@@ -535,7 +536,17 @@ impl AlertManager {
                     snapshot.checkpoints_failed > 0
                 }
             }
-            AlertCondition::SinkErrorAbove(threshold) => snapshot.events_dropped > *threshold,
+            AlertCondition::SinkErrorAbove(threshold) => {
+                let prev = self.prev_snapshot.read().await;
+                let delta = if let Some((_, prev_snap)) = prev.as_ref() {
+                    snapshot
+                        .events_dropped
+                        .saturating_sub(prev_snap.events_dropped)
+                } else {
+                    snapshot.events_dropped
+                };
+                delta > *threshold
+            }
             AlertCondition::ThroughputBelow(threshold) => {
                 let prev = self.prev_snapshot.read().await;
                 if let Some((prev_time, prev_snap)) = prev.as_ref() {
@@ -571,8 +582,8 @@ impl AlertManager {
             }
             AlertCondition::SinkErrorAbove(threshold) => {
                 format!(
-                    "Sink error count {} exceeds threshold {}",
-                    snapshot.events_dropped, threshold
+                    "Sink errors in evaluation window exceed threshold {} (total dropped: {})",
+                    threshold, snapshot.events_dropped
                 )
             }
             AlertCondition::ThroughputBelow(threshold) => {
@@ -653,12 +664,26 @@ impl AlertManager {
 }
 
 /// Render a template string with `{{name}}` and `{{message}}` placeholders.
+///
+/// Values are JSON-escaped before substitution to prevent injection
+/// when the template is a JSON body (e.g., Slack webhook payloads).
 pub fn render_template(template: &str, event: &AlertEvent) -> String {
+    // serde_json::to_string wraps in quotes — strip them for clean substitution.
+    let escape = |s: &str| -> String {
+        let quoted = serde_json::to_string(s).unwrap_or_else(|_| s.to_string());
+        // Strip surrounding quotes added by serde_json
+        quoted
+            .strip_prefix('"')
+            .and_then(|s| s.strip_suffix('"'))
+            .unwrap_or(&quoted)
+            .to_string()
+    };
+
     template
-        .replace("{{name}}", &event.name)
-        .replace("{{message}}", &event.message)
-        .replace("{{severity}}", event.severity)
-        .replace("{{fired_at}}", &event.fired_at)
+        .replace("{{name}}", &escape(&event.name))
+        .replace("{{message}}", &escape(&event.message))
+        .replace("{{severity}}", &escape(event.severity))
+        .replace("{{fired_at}}", &escape(&event.fired_at))
 }
 
 /// Append a line to a file (async via tokio::fs).
@@ -821,6 +846,25 @@ mod tests {
         };
         let rendered = render_template("static text", &event);
         assert_eq!(rendered, "static text");
+    }
+
+    #[test]
+    fn test_render_template_escapes_json_special_chars() {
+        let event = AlertEvent {
+            name: "test".to_string(),
+            message: "value with \"quotes\" and \\backslash".to_string(),
+            fired_at: "2026-01-01T00:00:00Z".to_string(),
+            severity: "warning",
+        };
+        let template = r#"{"text": "{{message}}"}"#;
+        let rendered = render_template(template, &event);
+        // Verify the rendered output is valid JSON
+        let parsed: serde_json::Value =
+            serde_json::from_str(&rendered).expect("rendered template should be valid JSON");
+        assert_eq!(
+            parsed["text"].as_str().unwrap(),
+            "value with \"quotes\" and \\backslash"
+        );
     }
 
     // -- build_rule tests --
