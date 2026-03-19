@@ -68,9 +68,6 @@ impl Connection {
     ///
     /// Returns `ApiError` if SQL parsing, planning, or execution fails.
     ///
-    /// # Panics
-    ///
-    /// Panics if the internal thread used for async execution panics.
     pub fn execute(&self, sql: &str) -> Result<ExecuteResult, ApiError> {
         if self.inner.is_closed() {
             return Err(ApiError::shutdown());
@@ -78,7 +75,8 @@ impl Connection {
 
         // Create or use existing runtime for blocking
         let result = if let Ok(handle) = tokio::runtime::Handle::try_current() {
-            // Already in async context - use spawn_blocking to avoid nesting
+            // Already in async context — spawn a scoped thread to call block_on
+            // without nesting runtimes.
             std::thread::scope(|s| {
                 s.spawn(|| {
                     let inner = Arc::clone(&self.inner);
@@ -86,7 +84,7 @@ impl Connection {
                     handle.block_on(async move { inner.execute(&sql).await })
                 })
                 .join()
-                .unwrap()
+                .map_err(|_| ApiError::internal("execute thread panicked".to_string()))?
             })
         } else {
             // No runtime - create one
@@ -209,9 +207,6 @@ impl Connection {
     ///
     /// Returns `ApiError` if the pipeline cannot be started.
     ///
-    /// # Panics
-    ///
-    /// Panics if the internal thread used for async execution panics.
     pub fn start(&self) -> Result<(), ApiError> {
         let result = if let Ok(handle) = tokio::runtime::Handle::try_current() {
             std::thread::scope(|s| {
@@ -220,7 +215,7 @@ impl Connection {
                     handle.block_on(async move { inner.start().await })
                 })
                 .join()
-                .unwrap()
+                .map_err(|_| ApiError::internal("start thread panicked".to_string()))?
             })
         } else {
             let rt = tokio::runtime::Builder::new_current_thread()
@@ -273,9 +268,6 @@ impl Connection {
     ///
     /// Returns `ApiError` if checkpointing fails or is not enabled.
     ///
-    /// # Panics
-    ///
-    /// Panics if the internal thread used for async execution panics.
     pub fn checkpoint(&self) -> Result<u64, ApiError> {
         let result = if let Ok(handle) = tokio::runtime::Handle::try_current() {
             std::thread::scope(|s| {
@@ -284,7 +276,7 @@ impl Connection {
                     handle.block_on(async move { inner.checkpoint().await })
                 })
                 .join()
-                .unwrap()
+                .map_err(|_| ApiError::internal("checkpoint thread panicked".to_string()))?
             })
         } else {
             let rt = tokio::runtime::Builder::new_current_thread()
@@ -426,9 +418,6 @@ impl Connection {
     ///
     /// Returns `ApiError` if the shutdown fails.
     ///
-    /// # Panics
-    ///
-    /// Panics if the internal thread used for async execution panics.
     pub fn shutdown(&self) -> Result<(), ApiError> {
         let result = if let Ok(handle) = tokio::runtime::Handle::try_current() {
             std::thread::scope(|s| {
@@ -437,7 +426,7 @@ impl Connection {
                     handle.block_on(async move { inner.shutdown().await })
                 })
                 .join()
-                .unwrap()
+                .map_err(|_| ApiError::internal("shutdown thread panicked".to_string()))?
             })
         } else {
             let rt = tokio::runtime::Builder::new_current_thread()

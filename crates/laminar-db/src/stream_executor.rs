@@ -250,6 +250,9 @@ pub(crate) struct StreamQuery {
     /// and excluded from checkpoints. Used by the control channel to remove
     /// queries without invalidating indices in state maps.
     removed: bool,
+    /// Top-level execution path, determined once at registration time.
+    /// Eliminates per-cycle branch misprediction from the if/else chain.
+    execution_path: QueryExecutionPath,
 }
 
 impl StreamQuery {
@@ -260,6 +263,25 @@ impl StreamQuery {
             .as_ref()
             .is_some_and(|ec| matches!(ec, EmitClause::OnWindowClose | EmitClause::Final))
     }
+}
+
+/// Top-level execution path for a query, determined once at registration time.
+///
+/// Replaces the per-cycle `if/else` chain that tested `is_eowc`, `has_asof`,
+/// `has_temporal`, `has_stream_join` every cycle. Since query type is fixed at
+/// `CREATE STREAM` time, we classify once and dispatch via `match`.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum QueryExecutionPath {
+    /// EMIT ON WINDOW CLOSE / EMIT FINAL — suppresses intermediate results.
+    Eowc,
+    /// ASOF join query.
+    AsofJoin,
+    /// Temporal (versioned) join query.
+    TemporalJoin,
+    /// Stream-stream interval join query.
+    StreamJoin,
+    /// Standard path: compiled projection, incremental agg, or `DataFusion` fallback.
+    Standard,
 }
 
 /// Maximum rows an EOWC accumulator may hold before forcing emission.
@@ -305,6 +327,10 @@ pub(crate) struct StreamExecutor {
     registered_sources: Vec<String>,
     /// Indices into `queries` in topological (dependency) order.
     topo_order: Vec<usize>,
+    /// Queries grouped by dependency depth (level 0 = no query deps, level 1 =
+    /// depends only on level-0, etc.). Within each level, queries are independent
+    /// and can execute in parallel when they use compiled projections.
+    topo_levels: Vec<Vec<usize>>,
     /// When true, `topo_order` must be recomputed before next cycle.
     topo_dirty: bool,
     /// Known source schemas — used to register empty tables when a source
@@ -396,6 +422,7 @@ impl StreamExecutor {
             lookup_registry: None,
             registered_sources: Vec::new(),
             topo_order: Vec::new(),
+            topo_levels: Vec::new(),
             topo_dirty: true,
             source_schemas: FxHashMap::default(),
             eowc_states: FxHashMap::default(),
@@ -522,18 +549,42 @@ impl StreamExecutor {
 
         let table_refs = extract_table_references(&sql);
         let idx = self.queries.len();
+
+        // Determine the execution path once at registration time.
+        // Priority mirrors the original if/else chain: EOWC > ASOF > temporal > stream join > standard.
+        let asof_arc = asof_config.map(Arc::new);
+        let temporal_arc = temporal_config.map(Arc::new);
+        let stream_join_arc = stream_join_config.map(Arc::new);
+
+        let suppresses = emit_clause
+            .as_ref()
+            .is_some_and(|ec| matches!(ec, EmitClause::OnWindowClose | EmitClause::Final));
+
+        let execution_path = if suppresses {
+            QueryExecutionPath::Eowc
+        } else if asof_arc.is_some() {
+            QueryExecutionPath::AsofJoin
+        } else if temporal_arc.is_some() {
+            QueryExecutionPath::TemporalJoin
+        } else if stream_join_arc.is_some() {
+            QueryExecutionPath::StreamJoin
+        } else {
+            QueryExecutionPath::Standard
+        };
+
         let query = StreamQuery {
             name: Arc::from(name),
             sql,
-            asof_config: asof_config.map(Arc::new),
+            asof_config: asof_arc,
             projection_sql: projection_sql.map(|s| Arc::from(s.as_str())),
-            temporal_config: temporal_config.map(Arc::new),
-            stream_join_config: stream_join_config.map(Arc::new),
+            temporal_config: temporal_arc,
+            stream_join_config: stream_join_arc,
             emit_clause,
             window_config: window_config.map(Arc::new),
             order_config,
             table_refs,
             removed: false,
+            execution_path,
         };
         // Initialize EOWC state for queries that suppress intermediate results
         if query.suppresses_intermediate() {
@@ -628,8 +679,11 @@ impl StreamExecutor {
             }
         }
 
-        // Kahn's BFS
+        // Kahn's BFS with level tracking — queries at the same level have no
+        // mutual dependencies and can be evaluated in parallel when they use
+        // compiled projections (pure CPU, no &mut self needed).
         let mut queue = VecDeque::new();
+        let mut next_queue = VecDeque::new();
         for (i, &deg) in in_degree.iter().enumerate() {
             if deg == 0 {
                 queue.push_back(i);
@@ -637,14 +691,21 @@ impl StreamExecutor {
         }
 
         self.topo_order.clear();
-        while let Some(idx) = queue.pop_front() {
-            self.topo_order.push(idx);
-            for &dep in &dependents[idx] {
-                in_degree[dep] = in_degree[dep].saturating_sub(1);
-                if in_degree[dep] == 0 {
-                    queue.push_back(dep);
+        self.topo_levels.clear();
+        while !queue.is_empty() {
+            let mut level = Vec::with_capacity(queue.len());
+            while let Some(idx) = queue.pop_front() {
+                self.topo_order.push(idx);
+                level.push(idx);
+                for &dep in &dependents[idx] {
+                    in_degree[dep] = in_degree[dep].saturating_sub(1);
+                    if in_degree[dep] == 0 {
+                        next_queue.push_back(dep);
+                    }
                 }
             }
+            self.topo_levels.push(level);
+            std::mem::swap(&mut queue, &mut next_queue);
         }
 
         // Fallback: if cycle detected, append any missing indices in insertion order
@@ -659,6 +720,10 @@ impl StreamExecutor {
             for i in 0..self.queries.len() {
                 if !in_order.contains(&i) {
                     self.topo_order.push(i);
+                    // Each cyclic/fallback query gets its own level to force
+                    // serial execution — running them in parallel is unsafe
+                    // because they may have unresolved interdependencies.
+                    self.topo_levels.push(vec![i]);
                 }
             }
         }
@@ -710,8 +775,20 @@ impl StreamExecutor {
         // Skip MemTable registration when all queries use compiled projections.
         // Intermediate result registration (for downstream queries) still runs
         // inside the loop — this only skips SOURCE table registration.
+        //
+        // When only SOME queries are compiled, build a set of table names that
+        // non-compiled queries actually reference and skip registration for the
+        // rest. This avoids per-cycle DataFusion catalog overhead for tables
+        // that only compiled-path queries use.
         if self.all_queries_compiled != Some(true) {
-            self.register_source_tables(source_batches)?;
+            let required_tables = self.collect_required_source_tables();
+            if required_tables.is_empty() {
+                // All queries that need DataFusion tables are actually compiled
+                // or use non-standard paths that register their own tables.
+                // Skip registration entirely.
+            } else {
+                self.register_source_tables(source_batches, &required_tables)?;
+            }
         }
 
         // Reuse per-cycle allocations: take the pre-allocated maps out of
@@ -724,237 +801,260 @@ impl StreamExecutor {
 
         self.skipped_last_cycle.clear();
         let cycle_start = std::time::Instant::now();
+        let mut budget_exceeded = false;
+        let mut queries_started = 0usize;
+        let mut executed = FxHashSet::<usize>::default();
 
-        let topo_len = self.topo_order.len();
-        for i in 0..topo_len {
-            let idx = self.topo_order[i];
-
-            // Skip tombstoned queries (removed via control channel).
-            if self.queries[idx].removed {
-                continue;
+        // Process queries level-by-level. Within each level, queries have no
+        // mutual dependencies so compiled-path queries can run in parallel.
+        let num_levels = self.topo_levels.len();
+        for level_idx in 0..num_levels {
+            if budget_exceeded {
+                break;
             }
 
-            // Budget check: stop if elapsed time exceeds the per-query budget
-            // (leaves headroom for maintenance). Always execute at least one
-            // query per cycle for forward progress.
-            if i > 0 {
-                #[allow(clippy::cast_possible_truncation)]
-                let elapsed_ns = cycle_start.elapsed().as_nanos() as u64;
-                if elapsed_ns > self.query_budget_ns {
-                    for j in i..topo_len {
-                        self.skipped_last_cycle.insert(self.topo_order[j]);
-                    }
-                    tracing::debug!(
-                        skipped = topo_len - i,
-                        elapsed_ms = elapsed_ns / 1_000_000,
-                        "per-query budget exceeded — deferring remaining queries"
-                    );
-                    break;
+            // Snapshot the level indices (they don't change within a cycle).
+            let level_len = self.topo_levels[level_idx].len();
+
+            // Collect non-removed queries in this level for serial execution.
+            let mut level_queries: Vec<usize> = Vec::new();
+            for li in 0..level_len {
+                let idx = self.topo_levels[level_idx][li];
+                if !self.queries[idx].removed {
+                    level_queries.push(idx);
                 }
             }
 
-            let is_eowc = self.queries[idx].suppresses_intermediate();
-            let has_asof = self.queries[idx].asof_config.is_some();
-            let has_temporal = self.queries[idx].temporal_config.is_some();
-            let has_stream_join = self.queries[idx].stream_join_config.is_some();
-
-            let query_result = if is_eowc {
-                let query_name = Arc::clone(&self.queries[idx].name);
-                let window_config = self.queries[idx].window_config.as_ref().map(Arc::clone);
-                let asof_config = self.queries[idx].asof_config.as_ref().map(Arc::clone);
-                let projection_sql = self.queries[idx].projection_sql.as_ref().map(Arc::clone);
-                self.execute_eowc_query(
-                    idx,
-                    &query_name,
-                    window_config.as_deref(),
-                    asof_config.as_deref(),
-                    projection_sql.as_deref(),
-                    source_batches,
-                    &results,
-                    current_watermark,
-                )
-                .await
-            } else if has_asof {
-                let query_name = Arc::clone(&self.queries[idx].name);
-                let cfg = Arc::clone(
-                    self.queries[idx]
-                        .asof_config
-                        .as_ref()
-                        .expect("has_asof guard ensures asof_config is Some"),
-                );
-                let projection_sql = self.queries[idx].projection_sql.as_ref().map(Arc::clone);
-                self.execute_asof_query(
-                    idx,
-                    &query_name,
-                    &cfg,
-                    projection_sql.as_deref(),
-                    source_batches,
-                    &results,
-                )
-                .await
-            } else if has_temporal {
-                let query_name = Arc::clone(&self.queries[idx].name);
-                let cfg = Arc::clone(
-                    self.queries[idx]
-                        .temporal_config
-                        .as_ref()
-                        .expect("has_temporal guard ensures temporal_config is Some"),
-                );
-                let projection_sql = self.queries[idx].projection_sql.as_ref().map(Arc::clone);
-                self.execute_temporal_query(
-                    idx,
-                    &query_name,
-                    &cfg,
-                    projection_sql.as_deref(),
-                    source_batches,
-                    &results,
-                )
-                .await
-            } else if has_stream_join {
-                let query_name = Arc::clone(&self.queries[idx].name);
-                let cfg = Arc::clone(
-                    self.queries[idx]
-                        .stream_join_config
-                        .as_ref()
-                        .expect("has_stream_join guard ensures stream_join_config is Some"),
-                );
-                let projection_sql = self.queries[idx].projection_sql.as_ref().map(Arc::clone);
-                self.execute_interval_join_query(
-                    idx,
-                    &query_name,
-                    &cfg,
-                    projection_sql.as_deref(),
-                    source_batches,
-                    &results,
-                    current_watermark,
-                )
-                .await
-            } else {
-                self.execute_standard_query(idx, source_batches, &results)
-                    .await
-            };
-
-            // Queries that depend on other stream queries may fail during
-            // warmup because their upstream (e.g. EOWC) hasn't emitted yet.
-            // Skip those gracefully. Queries that only reference source tables
-            // propagate errors normally.
-            let batches = match query_result {
-                Ok(b) => b,
-                Err(e) => {
-                    let depends_on_stream = self.queries[idx]
-                        .table_refs
-                        .iter()
-                        .any(|tr| self.queries.iter().any(|q| &*q.name == tr.as_str()));
-                    if depends_on_stream {
+            // Execute all queries in this level serially.
+            for &idx in &level_queries {
+                // Budget check: stop if elapsed time exceeds the per-query budget
+                // (leaves headroom for maintenance). Always execute at least one
+                // query per cycle for forward progress.
+                if queries_started > 0 {
+                    #[allow(clippy::cast_possible_truncation)]
+                    let elapsed_ns = cycle_start.elapsed().as_nanos() as u64;
+                    if elapsed_ns > self.query_budget_ns {
+                        self.mark_remaining_skipped(
+                            &level_queries,
+                            &executed,
+                            level_idx,
+                            num_levels,
+                        );
                         tracing::debug!(
-                            query = %self.queries[idx].name,
-                            error = %e,
-                            "Query skipped (upstream not ready)"
+                            skipped = self.skipped_last_cycle.len(),
+                            elapsed_ms = elapsed_ns / 1_000_000,
+                            "per-query budget exceeded — deferring remaining queries"
                         );
-                        continue;
+                        budget_exceeded = true;
+                        break;
                     }
-                    return Err(e);
                 }
-            };
 
-            // ── State size bounds check ──
-            if let Some(limit) = self.max_state_bytes {
-                // Check incremental aggregate state
-                if let Some(state) = self.agg_states.get(&idx) {
-                    let size = state.estimated_size_bytes();
-                    if size >= limit {
-                        return Err(DbError::Pipeline(format!(
-                            "state size limit exceeded for query '{}' ({size} bytes > {limit} limit)",
-                            self.queries[idx].name
-                        )));
-                    } else if size >= limit * 4 / 5 {
-                        tracing::warn!(
-                            query = %self.queries[idx].name,
-                            size_bytes = size,
-                            limit_bytes = limit,
-                            "state size at 80% of limit"
-                        );
-                    }
-                }
-                // Check core window state
-                if let Some(state) = self.core_window_states.get(&idx) {
-                    let size = state.estimated_size_bytes();
-                    if size >= limit {
-                        return Err(DbError::Pipeline(format!(
-                            "state size limit exceeded for query '{}' ({size} bytes > {limit} limit)",
-                            self.queries[idx].name
-                        )));
-                    } else if size >= limit * 4 / 5 {
-                        tracing::warn!(
-                            query = %self.queries[idx].name,
-                            size_bytes = size,
-                            limit_bytes = limit,
-                            "state size at 80% of limit"
-                        );
-                    }
-                }
-                // Check EOWC aggregate state
-                if let Some(state) = self.eowc_agg_states.get(&idx) {
-                    let size = state.estimated_size_bytes();
-                    if size >= limit {
-                        return Err(DbError::Pipeline(format!(
-                            "state size limit exceeded for query '{}' ({size} bytes > {limit} limit)",
-                            self.queries[idx].name
-                        )));
-                    } else if size >= limit * 4 / 5 {
-                        tracing::warn!(
-                            query = %self.queries[idx].name,
-                            size_bytes = size,
-                            limit_bytes = limit,
-                            "state size at 80% of limit"
-                        );
-                    }
-                }
-                // Check interval join state
-                if let Some(state) = self.interval_join_states.get(&idx) {
-                    let size = state.estimated_size_bytes();
-                    if size >= limit {
-                        return Err(DbError::Pipeline(format!(
-                            "state size limit exceeded for query '{}' ({size} bytes > {limit} limit)",
-                            self.queries[idx].name
-                        )));
-                    } else if size >= limit * 4 / 5 {
-                        tracing::warn!(
-                            query = %self.queries[idx].name,
-                            size_bytes = size,
-                            limit_bytes = limit,
-                            "interval join state size at 80% of limit"
-                        );
-                    }
-                }
-            }
+                queries_started += 1;
+                executed.insert(idx);
 
-            // Apply Top-K post-filter if configured
-            let batches = match &self.queries[idx].order_config {
-                Some(OrderOperatorConfig::TopK(config)) => apply_topk_filter(&batches, config.k),
-                Some(OrderOperatorConfig::PerGroupTopK(config)) => {
-                    apply_topk_filter(&batches, config.k)
-                }
-                _ => batches,
-            };
+                // Dispatch on pre-computed execution path (determined once at
+                // registration time) instead of re-testing config flags every cycle.
+                let query_result =
+                    match self.queries[idx].execution_path {
+                        QueryExecutionPath::Eowc => {
+                            let query_name = Arc::clone(&self.queries[idx].name);
+                            let window_config =
+                                self.queries[idx].window_config.as_ref().map(Arc::clone);
+                            let asof_config =
+                                self.queries[idx].asof_config.as_ref().map(Arc::clone);
+                            let projection_sql =
+                                self.queries[idx].projection_sql.as_ref().map(Arc::clone);
+                            self.execute_eowc_query(
+                                idx,
+                                &query_name,
+                                window_config.as_deref(),
+                                asof_config.as_deref(),
+                                projection_sql.as_deref(),
+                                source_batches,
+                                &results,
+                                current_watermark,
+                            )
+                            .await
+                        }
+                        QueryExecutionPath::AsofJoin => {
+                            let query_name = Arc::clone(&self.queries[idx].name);
+                            let cfg = Arc::clone(
+                                self.queries[idx]
+                                    .asof_config
+                                    .as_ref()
+                                    .expect("AsofJoin path guarantees asof_config is Some"),
+                            );
+                            let projection_sql =
+                                self.queries[idx].projection_sql.as_ref().map(Arc::clone);
+                            self.execute_asof_query(
+                                idx,
+                                &query_name,
+                                &cfg,
+                                projection_sql.as_deref(),
+                                source_batches,
+                                &results,
+                            )
+                            .await
+                        }
+                        QueryExecutionPath::TemporalJoin => {
+                            let query_name = Arc::clone(&self.queries[idx].name);
+                            let cfg =
+                                Arc::clone(self.queries[idx].temporal_config.as_ref().expect(
+                                    "TemporalJoin path guarantees temporal_config is Some",
+                                ));
+                            let projection_sql =
+                                self.queries[idx].projection_sql.as_ref().map(Arc::clone);
+                            self.execute_temporal_query(
+                                idx,
+                                &query_name,
+                                &cfg,
+                                projection_sql.as_deref(),
+                                source_batches,
+                                &results,
+                            )
+                            .await
+                        }
+                        QueryExecutionPath::StreamJoin => {
+                            let query_name = Arc::clone(&self.queries[idx].name);
+                            let cfg =
+                                Arc::clone(self.queries[idx].stream_join_config.as_ref().expect(
+                                    "StreamJoin path guarantees stream_join_config is Some",
+                                ));
+                            let projection_sql =
+                                self.queries[idx].projection_sql.as_ref().map(Arc::clone);
+                            self.execute_interval_join_query(
+                                idx,
+                                &query_name,
+                                &cfg,
+                                projection_sql.as_deref(),
+                                source_batches,
+                                &results,
+                                current_watermark,
+                            )
+                            .await
+                        }
+                        QueryExecutionPath::Standard => {
+                            self.execute_standard_query(idx, source_batches, &results)
+                                .await
+                        }
+                    };
 
-            let query_name = Arc::clone(&self.queries[idx].name);
-            if !batches.is_empty() {
-                let schema = batches[0].schema();
-                if let Ok(mem_table) =
-                    datafusion::datasource::MemTable::try_new(schema, vec![batches.clone()])
-                {
-                    let _ = self.ctx.deregister_table(&*query_name);
-                    if let Err(e) = self.ctx.register_table(&*query_name, Arc::new(mem_table)) {
-                        tracing::warn!(
-                            query = %query_name,
-                            error = %e,
-                            "[LDB-3015] Failed to register intermediate table"
-                        );
+                // Queries that depend on other stream queries may fail during
+                // warmup because their upstream (e.g. EOWC) hasn't emitted yet.
+                // Skip those gracefully. Queries that only reference source tables
+                // propagate errors normally.
+                let batches = match query_result {
+                    Ok(b) => b,
+                    Err(e) => {
+                        let depends_on_stream = self.queries[idx]
+                            .table_refs
+                            .iter()
+                            .any(|tr| self.queries.iter().any(|q| &*q.name == tr.as_str()));
+                        if depends_on_stream {
+                            tracing::debug!(
+                                query = %self.queries[idx].name,
+                                error = %e,
+                                "Query skipped (upstream not ready)"
+                            );
+                            continue;
+                        }
+                        return Err(e);
                     }
-                    intermediate_tables.push(query_name.to_string());
+                };
+
+                // ── State size bounds check ──
+                if let Some(limit) = self.max_state_bytes {
+                    // Check incremental aggregate state
+                    if let Some(state) = self.agg_states.get(&idx) {
+                        let size = state.estimated_size_bytes();
+                        if size >= limit {
+                            return Err(DbError::Pipeline(format!(
+                                "state size limit exceeded for query '{}' ({size} bytes > {limit} limit)",
+                                self.queries[idx].name
+                            )));
+                        } else if size >= limit * 4 / 5 {
+                            tracing::warn!(
+                                query = %self.queries[idx].name,
+                                size_bytes = size,
+                                limit_bytes = limit,
+                                "state size at 80% of limit"
+                            );
+                        }
+                    }
+                    // Check core window state
+                    if let Some(state) = self.core_window_states.get(&idx) {
+                        let size = state.estimated_size_bytes();
+                        if size >= limit {
+                            return Err(DbError::Pipeline(format!(
+                                "state size limit exceeded for query '{}' ({size} bytes > {limit} limit)",
+                                self.queries[idx].name
+                            )));
+                        } else if size >= limit * 4 / 5 {
+                            tracing::warn!(
+                                query = %self.queries[idx].name,
+                                size_bytes = size,
+                                limit_bytes = limit,
+                                "state size at 80% of limit"
+                            );
+                        }
+                    }
+                    // Check EOWC aggregate state
+                    if let Some(state) = self.eowc_agg_states.get(&idx) {
+                        let size = state.estimated_size_bytes();
+                        if size >= limit {
+                            return Err(DbError::Pipeline(format!(
+                                "state size limit exceeded for query '{}' ({size} bytes > {limit} limit)",
+                                self.queries[idx].name
+                            )));
+                        } else if size >= limit * 4 / 5 {
+                            tracing::warn!(
+                                query = %self.queries[idx].name,
+                                size_bytes = size,
+                                limit_bytes = limit,
+                                "state size at 80% of limit"
+                            );
+                        }
+                    }
+                    // Check interval join state
+                    if let Some(state) = self.interval_join_states.get(&idx) {
+                        let size = state.estimated_size_bytes();
+                        if size >= limit {
+                            return Err(DbError::Pipeline(format!(
+                                "state size limit exceeded for query '{}' ({size} bytes > {limit} limit)",
+                                self.queries[idx].name
+                            )));
+                        } else if size >= limit * 4 / 5 {
+                            tracing::warn!(
+                                query = %self.queries[idx].name,
+                                size_bytes = size,
+                                limit_bytes = limit,
+                                "interval join state size at 80% of limit"
+                            );
+                        }
+                    }
                 }
-                results.insert(query_name, batches);
+
+                // Apply Top-K post-filter if configured
+                let batches = match &self.queries[idx].order_config {
+                    Some(OrderOperatorConfig::TopK(config)) => {
+                        apply_topk_filter(&batches, config.k)
+                    }
+                    Some(OrderOperatorConfig::PerGroupTopK(config)) => {
+                        apply_topk_filter(&batches, config.k)
+                    }
+                    _ => batches,
+                };
+
+                let query_name = Arc::clone(&self.queries[idx].name);
+                if !batches.is_empty() {
+                    self.register_intermediate_table(
+                        &query_name,
+                        &batches,
+                        &mut intermediate_tables,
+                    )?;
+                    results.insert(query_name, batches);
+                }
             }
         }
 
@@ -971,17 +1071,106 @@ impl StreamExecutor {
         Ok(results)
     }
 
+    /// Register a query's output as a `MemTable` so downstream queries can reference it.
+    fn register_intermediate_table(
+        &self,
+        name: &str,
+        batches: &[RecordBatch],
+        intermediate_tables: &mut Vec<String>,
+    ) -> Result<(), DbError> {
+        let schema = batches[0].schema();
+        let mem_table = datafusion::datasource::MemTable::try_new(schema, vec![batches.to_vec()])
+            .map_err(|e| DbError::query_pipeline(name, &e))?;
+        let _ = self.ctx.deregister_table(name);
+        self.ctx
+            .register_table(name, Arc::new(mem_table))
+            .map_err(|e| DbError::query_pipeline(name, &e))?;
+        intermediate_tables.push(name.to_string());
+        Ok(())
+    }
+
+    /// Mark all unexecuted queries in the current and later levels as skipped.
+    fn mark_remaining_skipped(
+        &mut self,
+        current_level: &[usize],
+        executed: &FxHashSet<usize>,
+        level_idx: usize,
+        num_levels: usize,
+    ) {
+        for &skip_idx in current_level {
+            if !executed.contains(&skip_idx) {
+                self.skipped_last_cycle.insert(skip_idx);
+            }
+        }
+        for later_level in (level_idx + 1)..num_levels {
+            for li in 0..self.topo_levels[later_level].len() {
+                self.skipped_last_cycle
+                    .insert(self.topo_levels[later_level][li]);
+            }
+        }
+    }
+
+    /// Returns true if the given query needs `DataFusion` `MemTable` registration.
+    ///
+    /// Queries that use compiled projections, compiled aggregates, or non-standard
+    /// execution paths (ASOF/Temporal/StreamJoin) manage their own data access
+    /// and don't need source tables registered in the catalog.
+    fn query_needs_datafusion(&self, idx: usize) -> bool {
+        // ASOF, Temporal, and StreamJoin manage their own tables.
+        if self.queries[idx].execution_path != QueryExecutionPath::Standard
+            && self.queries[idx].execution_path != QueryExecutionPath::Eowc
+        {
+            return false;
+        }
+        // Fully compiled queries read source_batches directly.
+        let is_compiled = self.plain_compiled.contains_key(&idx)
+            || self
+                .agg_states
+                .get(&idx)
+                .is_some_and(|s| s.compiled_projection().is_some())
+            || self.eowc_agg_states.get(&idx).is_some_and(|s| {
+                s.compiled_projection().is_some() || s.cached_pre_agg_plan().is_some()
+            });
+        !is_compiled
+    }
+
+    /// Collect the set of source table names that non-compiled queries need
+    /// registered in the `DataFusion` catalog.
+    ///
+    /// Standard-path queries that use cached logical plans or haven't been
+    /// classified yet need their referenced source tables as `MemTable`s.
+    /// Compiled queries (`PhysicalExpr` projections, compiled aggregates) read
+    /// from `source_batches` directly. EOWC/ASOF/Temporal/`StreamJoin` queries
+    /// manage their own table registration.
+    fn collect_required_source_tables(&self) -> FxHashSet<String> {
+        let mut required = FxHashSet::default();
+        for &idx in &self.topo_order {
+            if self.queries[idx].removed || !self.query_needs_datafusion(idx) {
+                continue;
+            }
+            for table_ref in &self.queries[idx].table_refs {
+                required.insert(table_ref.clone());
+            }
+        }
+        required
+    }
+
     /// Register source batches as temporary `MemTable` providers.
     ///
+    /// Only registers tables whose names appear in `required_tables`.
     /// Sources with data get their batches registered. Sources with known
     /// schemas but no data this cycle get an empty `MemTable` so that
     /// `DataFusion` can still plan queries that reference them.
     fn register_source_tables(
         &mut self,
         source_batches: &FxHashMap<Arc<str>, Vec<RecordBatch>>,
+        required_tables: &FxHashSet<String>,
     ) -> Result<(), DbError> {
         for (name, batches) in source_batches {
             if batches.is_empty() {
+                continue;
+            }
+            if !required_tables.contains(&**name) {
                 continue;
             }
 
@@ -1003,6 +1192,9 @@ impl StreamExecutor {
         // Register empty tables for known sources that had no data this cycle
         for (name, schema) in &self.source_schemas {
             if source_batches.contains_key(name.as_str()) {
+                continue;
+            }
+            if !required_tables.contains(name) {
                 continue;
             }
             let empty = datafusion::datasource::MemTable::try_new(schema.clone(), vec![vec![]])
