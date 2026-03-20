@@ -463,7 +463,15 @@ impl MmapStateStore {
     ///
     /// The implementation copies live values into a temporary buffer, resets
     /// storage, then writes them back contiguously. Index offsets are updated
-    /// in-place — no keys are re-allocated.
+    /// in-place -- no keys are re-allocated.
+    ///
+    /// # Thread safety
+    ///
+    /// Requires `&mut self` (exclusive access). Concurrent calls from two
+    /// threads are prevented at compile time by the borrow checker. Callers
+    /// must ensure no concurrent reads or writes are in progress -- the index
+    /// is cleared and rebuilt during compaction, so a concurrent `get()` would
+    /// see inconsistent offsets.
     ///
     /// # Errors
     ///

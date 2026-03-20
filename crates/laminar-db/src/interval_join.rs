@@ -137,6 +137,17 @@ fn extract_column_as_timestamps(batch: &RecordBatch, col_name: &str) -> Result<V
 // ── Per-side state ─────────────────────────────────────────────────────────
 
 /// Compact when accumulated batch count exceeds this threshold.
+///
+/// Compaction is triggered after `evict_before()` when the batch count exceeds
+/// this value. Each pipeline cycle appends 1 batch per side, so compaction fires
+/// roughly every 32 cycles. The 32-batch threshold balances between:
+/// - Too low (frequent compaction): overhead of copying all live rows every few cycles
+/// - Too high (rare compaction): many small batches with fragmented Arrow buffers,
+///   increasing memory overhead and slowing `take_rows_from_batches` which must
+///   group rows by source batch
+///
+/// Compaction is also forced before checkpoint serialization to ensure the
+/// serialized state is compact.
 const COMPACTION_THRESHOLD: usize = 32;
 
 /// Index type: `key_hash` → sorted `timestamp` → list of `(batch_idx, row_idx)`.
@@ -436,9 +447,16 @@ fn probe_index(
 /// then concatenate. Replaces the per-row `slice(row, 1)` + `concat` pattern
 /// with O(B) take operations where B is the number of distinct source batches.
 ///
-/// Works correctly for any ordering — output row order matches `rows` order.
+/// Works correctly for any ordering -- output row order matches `rows` order.
 /// Most effective when rows are batch-sorted (consecutive runs from the same
 /// batch are gathered in a single `take` call).
+///
+/// # Duplicate entries
+///
+/// If `rows` contains duplicate `(batch_idx, row_idx)` pairs, each duplicate
+/// produces a separate output row. This is correct for interval joins where
+/// one left row may match multiple right rows (and vice versa), resulting in
+/// the same source row appearing in multiple output positions.
 fn take_rows_from_batches(
     batches: &[RecordBatch],
     rows: &[(usize, usize)],

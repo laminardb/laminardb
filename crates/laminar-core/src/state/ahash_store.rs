@@ -31,6 +31,15 @@ use super::{prefix_successor, StateError, StateSnapshot, StateStore};
 ///
 /// Trade-off: ~2x memory for keys (stored in both maps) and slightly
 /// slower writes due to dual-map maintenance.
+///
+/// # Expected key sizes
+///
+/// Keys are `Bytes` (reference-counted byte slices). The `BTreeSet` comparison
+/// is `O(key_length)` for each tree operation. Keys up to ~256 bytes are typical
+/// (e.g., serialized `(vnode, stream, group_key)` tuples). Keys > 64 KB are
+/// technically supported but will make `BTreeSet` comparisons expensive and
+/// degrade prefix-scan performance. If large keys are needed, consider hashing
+/// them and storing the full key in the value.
 pub struct AHashMapStore {
     /// Primary data store for O(1) point lookups.
     /// Both keys and values are `Bytes` — clone is a cheap Arc bump,
