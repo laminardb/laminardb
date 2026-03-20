@@ -508,6 +508,79 @@ mod tests {
         assert!(result.unwrap_err().to_string().contains("denied by ABAC"));
     }
 
+    /// Regression test for the "empty string bypass" attack:
+    /// If both user.dept and resource.dept are missing, a naive implementation
+    /// might default both to "" making them equal, granting access.
+    /// Our implementation returns Err from resolve_attribute when either side
+    /// is missing, so the Allow rule is skipped (fail-closed).
+    #[test]
+    fn test_both_attributes_missing_on_allow_does_not_grant_access() {
+        let mut policy = AbacPolicy::new();
+        policy.add_rule(AbacRule {
+            name: "dept-match".to_string(),
+            action: "SELECT".to_string(),
+            resource_pattern: None,
+            conditions: vec![Condition {
+                // Compare user.dept == resource.dept
+                // Both will be missing → must NOT match.
+                lhs: AttributeSource::User("dept".to_string()),
+                op: Operator::Eq,
+                rhs: AttributeSource::Resource("dept".to_string()),
+            }],
+            effect: Effect::Allow,
+        });
+
+        // User has NO "dept" attribute, resource has NO "dept" attribute.
+        let identity = Identity::new("eve", AuthMethod::Anonymous);
+        let resource_attrs: HashMap<String, String> = HashMap::new();
+
+        // Must be denied — the Allow rule must not match when attributes are missing.
+        let result = policy.evaluate(&identity, "SELECT", None, &resource_attrs);
+        assert!(
+            result.is_err(),
+            "both attributes missing must not grant access"
+        );
+        assert!(
+            result
+                .unwrap_err()
+                .to_string()
+                .contains("no ABAC rule matched"),
+            "should fall through to default deny, not match the Allow rule"
+        );
+    }
+
+    /// Same scenario but with a Deny rule: both attributes missing should
+    /// trigger the deny (fail-closed on Deny).
+    #[test]
+    fn test_both_attributes_missing_on_deny_triggers_deny() {
+        let mut policy = AbacPolicy::new();
+        // First: an Allow-all rule so we can see if the Deny fires.
+        policy.add_rule(AbacRule {
+            name: "deny-dept-match".to_string(),
+            action: "SELECT".to_string(),
+            resource_pattern: None,
+            conditions: vec![Condition {
+                lhs: AttributeSource::User("dept".to_string()),
+                op: Operator::Eq,
+                rhs: AttributeSource::Resource("dept".to_string()),
+            }],
+            effect: Effect::Deny,
+        });
+
+        let identity = Identity::new("eve", AuthMethod::Anonymous);
+        let resource_attrs: HashMap<String, String> = HashMap::new();
+
+        let result = policy.evaluate(&identity, "SELECT", None, &resource_attrs);
+        assert!(
+            result.is_err(),
+            "both attributes missing on Deny must trigger deny"
+        );
+        assert!(
+            result.unwrap_err().to_string().contains("fail-closed"),
+            "must report fail-closed semantics"
+        );
+    }
+
     #[test]
     fn test_wildcard_resource_matches_specific_resource() {
         let mut policy = AbacPolicy::new();

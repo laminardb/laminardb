@@ -17,13 +17,39 @@ use crate::identity::{AuthError, Identity};
 use crate::row_security::validate_identifier;
 
 /// How a column should be masked.
+///
+/// # Type Safety
+///
+/// Most strategies produce string-typed SQL expressions (`'***'`, `CONCAT(...)`, etc.).
+/// When masking a non-string column (INTEGER, FLOAT, TIMESTAMP, etc.), the masked
+/// expression will have a different SQL type than the original column. This is
+/// intentional — it prevents silent type coercion from leaking the original value.
+///
+/// For numeric or non-string columns, prefer [`MaskingStrategy::Nullify`] which
+/// produces `NULL` (type-compatible with any column) or
+/// [`MaskingStrategy::RedactNumeric`] which produces a `CAST('0' AS ...)` expression.
+/// Using [`MaskingStrategy::Redact`] on a numeric column generates a string literal
+/// which DataFusion (ANSI SQL) will reject at query time if the downstream expects
+/// a numeric type — this is the correct fail-closed behavior.
 #[derive(Debug, Clone)]
 pub enum MaskingStrategy {
     /// Replace the entire value with a fixed string (e.g., "***").
+    ///
+    /// **Warning:** For non-string columns, this produces a string literal that
+    /// will cause a type error at query time. Use [`Nullify`](Self::Nullify) or
+    /// [`RedactNumeric`](Self::RedactNumeric) for numeric columns.
     Redact(String),
+    /// Replace a numeric column with a fixed sentinel value (default: 0).
+    ///
+    /// Generates `CAST(0 AS BIGINT)` or similar, preserving numeric type
+    /// compatibility.
+    RedactNumeric(i64),
     /// Keep only the domain part of an email: `user@domain` → `***@domain`.
     EmailDomain,
     /// Replace with NULL.
+    ///
+    /// This is the safest option for non-string columns since `NULL` is
+    /// type-compatible with every SQL type.
     Nullify,
     /// Truncate to first N characters, pad with `*`.
     Truncate(usize),
@@ -127,6 +153,9 @@ impl ColumnSecurityPolicy {
         Ok(Some(match &mask.strategy {
             MaskingStrategy::Redact(replacement) => {
                 format!("'{}' AS {}", replacement.replace('\'', "''"), column)
+            }
+            MaskingStrategy::RedactNumeric(sentinel) => {
+                format!("CAST({sentinel} AS BIGINT) AS {column}")
             }
             MaskingStrategy::EmailDomain => {
                 format!(
@@ -347,6 +376,74 @@ mod tests {
             policy.masked_projection(&second, "ssn").unwrap(),
             Some("'ALPHA' AS ssn".to_string())
         );
+    }
+
+    #[test]
+    fn test_redact_on_integer_column_produces_string_literal() {
+        // Redact("***") on a numeric column produces a string literal '***'.
+        // In ANSI SQL / DataFusion, this will cause a type error if the
+        // consumer expects an integer — which is the correct fail-closed
+        // behavior. You should NOT silently coerce the original value.
+        let mut policy = ColumnSecurityPolicy::new("accounts");
+        policy.add_mask(
+            "analyst",
+            ColumnMask {
+                column_name: "balance".to_string(),
+                strategy: MaskingStrategy::Redact("***".to_string()),
+            },
+        );
+
+        let proj = policy.masked_projection(&analyst(), "balance").unwrap();
+        // The SQL expression is a string literal — intentionally NOT numeric.
+        assert_eq!(proj, Some("'***' AS balance".to_string()));
+    }
+
+    #[test]
+    fn test_redact_numeric_produces_type_safe_integer() {
+        // RedactNumeric(0) produces CAST(0 AS BIGINT), which is type-safe
+        // for integer columns.
+        let mut policy = ColumnSecurityPolicy::new("accounts");
+        policy.add_mask(
+            "analyst",
+            ColumnMask {
+                column_name: "balance".to_string(),
+                strategy: MaskingStrategy::RedactNumeric(0),
+            },
+        );
+
+        let proj = policy.masked_projection(&analyst(), "balance").unwrap();
+        assert_eq!(proj, Some("CAST(0 AS BIGINT) AS balance".to_string()));
+    }
+
+    #[test]
+    fn test_redact_numeric_with_custom_sentinel() {
+        let mut policy = ColumnSecurityPolicy::new("accounts");
+        policy.add_mask(
+            "analyst",
+            ColumnMask {
+                column_name: "account_id".to_string(),
+                strategy: MaskingStrategy::RedactNumeric(-1),
+            },
+        );
+
+        let proj = policy.masked_projection(&analyst(), "account_id").unwrap();
+        assert_eq!(proj, Some("CAST(-1 AS BIGINT) AS account_id".to_string()));
+    }
+
+    #[test]
+    fn test_nullify_is_type_safe_for_any_column() {
+        // NULL is type-compatible with any SQL column type.
+        let mut policy = ColumnSecurityPolicy::new("accounts");
+        policy.add_mask(
+            "analyst",
+            ColumnMask {
+                column_name: "balance".to_string(),
+                strategy: MaskingStrategy::Nullify,
+            },
+        );
+
+        let proj = policy.masked_projection(&analyst(), "balance").unwrap();
+        assert_eq!(proj, Some("NULL AS balance".to_string()));
     }
 
     #[test]

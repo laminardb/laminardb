@@ -14,6 +14,20 @@
 //! ```sql
 //! WHERE tenant_id = 'acme'
 //! ```
+//!
+//! # SQL Dialect Compatibility
+//!
+//! String escaping uses the ANSI SQL standard: single quotes are escaped
+//! by doubling them (`'` → `''`). This is correct for:
+//! - **DataFusion** (LaminarDB's query engine) — uses ANSI SQL.
+//! - **PostgreSQL**, **SQLite**, **SQL Server** — all use `''` escaping.
+//!
+//! **Known limitation:** MySQL's `NO_BACKSLASH_ESCAPES` mode is off by
+//! default, meaning MySQL treats `\'` as an escape sequence. An attacker
+//! could craft a value like `\' OR 1=1 --` to break out of the string
+//! literal on MySQL. Since LaminarDB uses DataFusion (ANSI SQL), this is
+//! NOT a vulnerability in our deployment. However, if these predicates are
+//! ever forwarded to a MySQL backend, the escaping must be adapted.
 
 use std::collections::HashMap;
 
