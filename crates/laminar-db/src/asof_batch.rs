@@ -295,6 +295,16 @@ fn execute_asof_merge_scan(
 }
 
 /// Run the merge-scan cursor over sorted left/right timestamps, producing matched indices.
+///
+/// # Tie-breaking when left and right timestamps are equal
+///
+/// - **Backward**: equal timestamps are included (cursor advances past `<=`),
+///   so the right row at the exact same timestamp is the match. Right wins.
+/// - **Forward**: cursor stops at `<`, so equal timestamps are the first
+///   candidate at `right_cursor`. Left's timestamp matches the right exactly.
+/// - **Nearest**: when backward and forward distances are both 0 (or equal),
+///   the `bd <= fd` comparison means backward is preferred. On an exact
+///   tie, the backward (earlier-or-equal) right row wins.
 fn merge_scan_indices(
     left_timestamps: &[i64],
     right_timestamps: &[i64],
@@ -409,6 +419,17 @@ fn push_match(
 /// before selecting by timestamp. This avoids the hash-collision bug where
 /// `find_match` would select a timestamp for the whole hash bucket before
 /// checking key equality, causing missed matches at other timestamps.
+///
+/// # Worst-case performance
+///
+/// The `BTreeMap<i64, Vec<usize>>` groups right-side row indices by timestamp.
+/// For each candidate timestamp, we scan the `Vec<usize>` linearly to find a
+/// key-equal row. In the pathological case where ALL right-side entries share
+/// the same timestamp (or all key hashes collide into one bucket), the scan
+/// degrades to O(n) per left row. The scan is bounded by the total right-side
+/// row count within the tolerance window -- not unbounded. For typical
+/// time-series data with distinct timestamps, the Vec per timestamp entry
+/// holds 1-2 rows and the total scan is O(log n) `BTreeMap` lookups.
 fn find_match_keyed(
     btree: &BTreeMap<i64, Vec<usize>>,
     left_ts: i64,
@@ -1261,5 +1282,106 @@ mod tests {
         assert_eq!(metric_ts.value(1), 150);
         assert_eq!(metric_ts.value(2), 250);
         assert_eq!(metric_ts.value(3), 350);
+    }
+
+    /// `tolerance=0` should match only exact timestamps (diff == 0).
+    #[test]
+    fn test_merge_scan_tolerance_zero_exact_only() {
+        let left_schema = Arc::new(Schema::new(vec![
+            Field::new("event_ts", DataType::Int64, false),
+            Field::new("value", DataType::Float64, false),
+        ]));
+        let right_schema = Arc::new(Schema::new(vec![
+            Field::new("metric_ts", DataType::Int64, false),
+            Field::new("cpu", DataType::Float64, false),
+        ]));
+
+        let left = RecordBatch::try_new(
+            left_schema,
+            vec![
+                Arc::new(Int64Array::from(vec![100, 200, 300])),
+                Arc::new(Float64Array::from(vec![1.0, 2.0, 3.0])),
+            ],
+        )
+        .unwrap();
+        let right = RecordBatch::try_new(
+            right_schema,
+            vec![
+                // Only 200 matches exactly; 101 and 299 are off by 1.
+                Arc::new(Int64Array::from(vec![101, 200, 299])),
+                Arc::new(Float64Array::from(vec![10.0, 20.0, 30.0])),
+            ],
+        )
+        .unwrap();
+
+        let mut config = no_key_backward_config();
+        config.tolerance = Some(Duration::from_millis(0));
+
+        let result = execute_asof_join_batch(&[left], &[right], &config).unwrap();
+
+        // Left join: all 3 left rows present.
+        assert_eq!(result.num_rows(), 3);
+
+        let metric_ts = result
+            .column(2)
+            .as_any()
+            .downcast_ref::<Int64Array>()
+            .unwrap();
+        // event@100: nearest backward is 101 (diff=1 > 0) -> null
+        assert!(
+            result.column(2).is_null(0),
+            "event@100 should have no match"
+        );
+        // event@200: exact match at 200
+        assert_eq!(metric_ts.value(1), 200);
+        // event@300: nearest backward is 299 (diff=1 > 0) -> null
+        assert!(
+            result.column(2).is_null(2),
+            "event@300 should have no match"
+        );
+    }
+
+    /// Merge-scan with equal timestamps: backward match finds the exact match.
+    #[test]
+    fn test_merge_scan_equal_timestamps_backward() {
+        let left_schema = Arc::new(Schema::new(vec![
+            Field::new("event_ts", DataType::Int64, false),
+            Field::new("value", DataType::Float64, false),
+        ]));
+        let right_schema = Arc::new(Schema::new(vec![
+            Field::new("metric_ts", DataType::Int64, false),
+            Field::new("cpu", DataType::Float64, false),
+        ]));
+
+        let left = RecordBatch::try_new(
+            left_schema,
+            vec![
+                Arc::new(Int64Array::from(vec![100, 200])),
+                Arc::new(Float64Array::from(vec![1.0, 2.0])),
+            ],
+        )
+        .unwrap();
+        let right = RecordBatch::try_new(
+            right_schema,
+            vec![
+                // Exact same timestamps as left.
+                Arc::new(Int64Array::from(vec![100, 200])),
+                Arc::new(Float64Array::from(vec![10.0, 20.0])),
+            ],
+        )
+        .unwrap();
+
+        let config = no_key_backward_config();
+        let result = execute_asof_join_batch(&[left], &[right], &config).unwrap();
+
+        assert_eq!(result.num_rows(), 2);
+        let metric_ts = result
+            .column(2)
+            .as_any()
+            .downcast_ref::<Int64Array>()
+            .unwrap();
+        // Backward: equal timestamp is matched.
+        assert_eq!(metric_ts.value(0), 100);
+        assert_eq!(metric_ts.value(1), 200);
     }
 }
