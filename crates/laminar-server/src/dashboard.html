@@ -251,7 +251,14 @@ async function refresh() {{
     }} catch {{}}
 
   }} catch (e) {{
+    // Show the error inline so operators see it immediately rather than
+    // having to open the browser console.  The dashboard remains usable
+    // (stale data) and will automatically recover on the next successful
+    // refresh cycle.
     console.error('Dashboard refresh failed:', e);
+    const pill = document.getElementById('statePill');
+    pill.textContent = 'Error refreshing: ' + e.message;
+    pill.className = 'status-pill pill-stopped';
   }}
 }}
 

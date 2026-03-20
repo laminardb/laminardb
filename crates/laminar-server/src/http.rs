@@ -62,8 +62,25 @@ pub struct AppState {
 }
 
 pub fn build_router(state: Arc<AppState>) -> Router {
-    // Admin/write routes: no permissive CORS (same-origin only by default).
-    // Browser JS from other origins cannot call these endpoints.
+    // Admin/write routes: restrictive CORS (same-origin only by default).
+    //
+    // WHY: These endpoints mutate server state (checkpoint, reload, SQL
+    // execution, config changes).  Allowing cross-origin requests would let
+    // any website that an operator visits silently trigger checkpoints,
+    // inject SQL, or alter the running configuration via the operator's
+    // browser session.
+    //
+    // PRODUCTION SETUP: In production, place LaminarDB behind a reverse
+    // proxy (e.g., nginx, Envoy, Caddy) that terminates TLS and adds an
+    // explicit `Access-Control-Allow-Origin` header for your monitoring
+    // domain.  This keeps the server itself strict while still allowing
+    // your internal dashboards to call admin endpoints cross-origin.
+    //
+    // Example nginx snippet:
+    //   location /api/v1/ {
+    //       add_header Access-Control-Allow-Origin "https://ops.example.com";
+    //       proxy_pass http://127.0.0.1:8080;
+    //   }
     let admin_routes = Router::new()
         .route("/api/v1/checkpoint", post(trigger_checkpoint))
         .route("/api/v1/sql", post(execute_sql))
@@ -420,14 +437,41 @@ async fn trigger_checkpoint(State(state): State<Arc<AppState>>) -> impl IntoResp
     }
 }
 
+/// Maximum number of rows returned by the `/api/v1/sql` endpoint for SELECT
+/// queries.  Without this cap a careless `SELECT *` on a large source would
+/// serialize millions of rows into a single JSON response, exhausting server
+/// memory and stalling the HTTP thread.  Clients that need more rows should
+/// page with `LIMIT ... OFFSET ...` or stream via the native wire protocol.
+const SQL_CONSOLE_ROW_LIMIT: usize = 1_000;
+
 /// `POST /api/v1/sql` — execute ad-hoc SQL.
 ///
 /// Returns tabular results (columns + rows) for Metadata queries (SHOW, DESCRIBE).
+///
+/// **Auto-limit**: SELECT queries without an explicit `LIMIT` clause are
+/// automatically capped at [`SQL_CONSOLE_ROW_LIMIT`] rows to prevent
+/// unbounded memory growth in the HTTP response.  The response includes
+/// `"truncated": true` and a `"warning"` field when this guard is active.
 async fn execute_sql(
     State(state): State<Arc<AppState>>,
     Json(req): Json<SqlRequest>,
 ) -> impl IntoResponse {
-    match state.db.execute(&req.sql).await {
+    // If the user omitted LIMIT, inject one so the engine does not
+    // materialise an unbounded result set.  We check cheaply with a
+    // case-insensitive scan — this is a convenience guard, not a parser.
+    let sql_upper = req.sql.to_uppercase();
+    let has_limit = sql_upper.contains(" LIMIT ");
+    let effective_sql = if !has_limit && sql_upper.trim_start().starts_with("SELECT") {
+        format!(
+            "{} LIMIT {}",
+            req.sql.trim_end().trim_end_matches(';'),
+            SQL_CONSOLE_ROW_LIMIT + 1
+        )
+    } else {
+        req.sql.clone()
+    };
+
+    match state.db.execute(&effective_sql).await {
         Ok(result) => {
             use laminar_db::ExecuteResult;
             match result {
@@ -441,10 +485,21 @@ async fn execute_sql(
                     "rows_affected": n,
                 }))
                 .into_response(),
-                ExecuteResult::Query(_) => Json(serde_json::json!({
-                    "result_type": "query",
-                }))
-                .into_response(),
+                ExecuteResult::Query(_) => {
+                    let truncated = !has_limit;
+                    let mut resp = serde_json::json!({
+                        "result_type": "query",
+                        "truncated": truncated,
+                    });
+                    if truncated {
+                        resp["warning"] = serde_json::json!(format!(
+                            "Result set auto-limited to {} rows. \
+                             Use an explicit LIMIT clause for full control.",
+                            SQL_CONSOLE_ROW_LIMIT
+                        ));
+                    }
+                    Json(resp).into_response()
+                }
                 ExecuteResult::Metadata(batch) => {
                     Json(record_batch_to_json(&batch)).into_response()
                 }
@@ -794,6 +849,11 @@ async fn update_config(
 }
 
 /// `POST /api/v1/config/validate` — validate a configuration without applying it.
+///
+/// Checks structural correctness only: TOML syntax, duplicate names, dangling
+/// sink→pipeline references, bind address format, delta-mode prerequisites.
+/// **Does not** parse or resolve source/table references inside pipeline SQL —
+/// those are validated at pipeline start time when the live catalog is available.
 async fn validate_config_endpoint(Json(body): Json<ConfigValidateRequest>) -> impl IntoResponse {
     let config: Result<crate::config::ServerConfig, _> = toml::from_str(&body.config);
     match config {

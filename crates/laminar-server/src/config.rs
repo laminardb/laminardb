@@ -81,6 +81,17 @@ pub fn validate_config_public(config: &ServerConfig) -> Result<(), ConfigError> 
 }
 
 /// Validate referential integrity and semantic constraints.
+///
+/// **Scope of validation**: This function checks *structural* correctness of
+/// the TOML configuration — duplicate names, dangling sink→pipeline references,
+/// bind address format, delta-mode prerequisites, etc.
+///
+/// It does **not** validate semantic references inside pipeline SQL.  For
+/// example, `SELECT * FROM nonexistent_source` will pass config validation
+/// because the SQL text is opaque at this stage; it is only compiled (and
+/// source references resolved) when the pipeline is actually started.
+/// This is by design: the config validator runs without a live LaminarDB
+/// instance, so it cannot know which sources are registered at runtime.
 fn validate_config(config: &ServerConfig) -> Result<(), ConfigError> {
     let mut errors = Vec::new();
 
