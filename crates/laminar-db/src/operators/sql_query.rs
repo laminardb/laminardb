@@ -94,12 +94,11 @@ impl SqlQueryOperator {
                 // Not an aggregate query -- fall through to non-agg paths.
             }
             Err(e) => {
-                tracing::warn!(
+                tracing::debug!(
                     query = %self.op_name,
                     error = %e,
-                    "Failed to introspect SQL for aggregate detection, falling back to cached plan"
+                    "Could not introspect query plan for aggregate detection, using cached plan"
                 );
-                // Fall through to cached plan path.
             }
         }
 
