@@ -88,6 +88,9 @@ pub struct DeltaLakeSinkConfig {
 
     /// Timeout for individual Delta write operations (default: 30s).
     pub write_timeout: Duration,
+
+    /// Parquet writer properties (compression, bloom filters, statistics, etc.).
+    pub parquet: ParquetWriteConfig,
 }
 
 impl Default for DeltaLakeSinkConfig {
@@ -114,6 +117,7 @@ impl Default for DeltaLakeSinkConfig {
             catalog_storage_location: None,
             max_commit_retries: 3,
             write_timeout: Duration::from_secs(30),
+            parquet: ParquetWriteConfig::default(),
         }
     }
 }
@@ -297,6 +301,59 @@ impl DeltaLakeSinkConfig {
             cfg.write_timeout = Duration::from_millis(ms);
         }
 
+        // ── Parquet writer configuration ──
+        if let Some(v) = config.get("parquet.compression") {
+            cfg.parquet.compression = v.to_string();
+        }
+        if let Some(v) = config.get("parquet.compression.level") {
+            cfg.parquet.compression_level = v.parse().map_err(|_| {
+                ConnectorError::ConfigurationError(format!(
+                    "invalid parquet.compression.level: '{v}'"
+                ))
+            })?;
+        }
+        if let Some(v) = config.get("parquet.compaction.compression.level") {
+            cfg.parquet.compaction_compression_level = Some(v.parse().map_err(|_| {
+                ConnectorError::ConfigurationError(format!(
+                    "invalid parquet.compaction.compression.level: '{v}'"
+                ))
+            })?);
+        }
+        if let Some(v) = config.get("parquet.dictionary.enabled") {
+            cfg.parquet.dictionary_enabled = v.eq_ignore_ascii_case("true");
+        }
+        if let Some(v) = config.get("parquet.statistics") {
+            cfg.parquet.statistics = v.to_string();
+        }
+        if let Some(v) = config.get("parquet.bloom.filter.columns") {
+            cfg.parquet.bloom_filter_columns = v
+                .split(',')
+                .map(|c| c.trim().to_string())
+                .filter(|c| !c.is_empty())
+                .collect();
+        }
+        if let Some(v) = config.get("parquet.bloom.filter.fpp") {
+            cfg.parquet.bloom_filter_fpp = v.parse().map_err(|_| {
+                ConnectorError::ConfigurationError(format!(
+                    "invalid parquet.bloom.filter.fpp: '{v}'"
+                ))
+            })?;
+        }
+        if let Some(v) = config.get("parquet.bloom.filter.ndv") {
+            cfg.parquet.bloom_filter_ndv = v.parse().map_err(|_| {
+                ConnectorError::ConfigurationError(format!(
+                    "invalid parquet.bloom.filter.ndv: '{v}'"
+                ))
+            })?;
+        }
+        if let Some(v) = config.get("parquet.max.row.group.size") {
+            cfg.parquet.max_row_group_size = v.parse().map_err(|_| {
+                ConnectorError::ConfigurationError(format!(
+                    "invalid parquet.max.row.group.size: '{v}'"
+                ))
+            })?;
+        }
+
         // Resolve storage credentials: explicit options + environment variable fallbacks.
         let explicit_storage = config.properties_with_prefix("storage.");
         let resolved = StorageCredentialResolver::resolve(&cfg.table_path, &explicit_storage);
@@ -365,6 +422,41 @@ impl DeltaLakeSinkConfig {
             return Err(ConnectorError::ConfigurationError(
                 "vacuum.retention.hours must be >= 24 (Delta Lake safety minimum)".into(),
             ));
+        }
+
+        match self.parquet.compression.to_lowercase().as_str() {
+            "zstd" | "snappy" | "lz4" | "gzip" | "none" | "uncompressed" => {}
+            other => {
+                return Err(ConnectorError::ConfigurationError(format!(
+                    "unknown parquet.compression: '{other}' \
+                     (expected 'zstd', 'snappy', 'lz4', 'gzip', or 'none')"
+                )));
+            }
+        }
+        match self.parquet.statistics.to_lowercase().as_str() {
+            "none" | "chunk" | "page" => {}
+            other => {
+                return Err(ConnectorError::ConfigurationError(format!(
+                    "unknown parquet.statistics: '{other}' (expected 'none', 'chunk', or 'page')"
+                )));
+            }
+        }
+        if self.parquet.bloom_filter_fpp <= 0.0 || self.parquet.bloom_filter_fpp >= 1.0 {
+            return Err(ConnectorError::ConfigurationError(
+                "parquet.bloom.filter.fpp must be in (0.0, 1.0)".into(),
+            ));
+        }
+        if self.parquet.max_row_group_size == 0 {
+            return Err(ConnectorError::ConfigurationError(
+                "parquet.max.row.group.size must be > 0".into(),
+            ));
+        }
+        // Eagerly validate that WriterProperties can be built so invalid
+        // codec/level combos are caught at config time, not first write.
+        #[cfg(feature = "delta-lake")]
+        {
+            self.parquet.to_writer_properties()?;
+            self.parquet.compaction_writer_properties()?;
         }
 
         self.validate_catalog()?;
@@ -561,6 +653,142 @@ impl Default for CompactionConfig {
             z_order_columns: Vec::new(),
             check_interval: Duration::from_secs(3600), // 60 minutes
         }
+    }
+}
+
+/// Configuration for Parquet writer properties (compression, dictionary
+/// encoding, statistics, bloom filters, row group sizing).
+#[derive(Debug, Clone)]
+pub struct ParquetWriteConfig {
+    /// Compression codec: `"zstd"`, `"snappy"`, `"lz4"`, `"gzip"`, or `"none"`.
+    pub compression: String,
+    /// Compression level (default: 1 — ZSTD L1 for hot writes).
+    pub compression_level: i32,
+    /// Optional higher compression level used during compaction (default: 3).
+    pub compaction_compression_level: Option<i32>,
+    /// Whether to enable dictionary encoding (default: true).
+    pub dictionary_enabled: bool,
+    /// Statistics granularity: `"none"`, `"chunk"`, or `"page"` (default: `"page"`).
+    pub statistics: String,
+    /// Columns to build bloom filters for (default: empty).
+    pub bloom_filter_columns: Vec<String>,
+    /// Bloom filter false-positive probability (default: 0.01).
+    pub bloom_filter_fpp: f64,
+    /// Bloom filter expected number of distinct values (0 = parquet default).
+    pub bloom_filter_ndv: u64,
+    /// Maximum rows per row group (default: 1,000,000).
+    pub max_row_group_size: usize,
+}
+
+impl Default for ParquetWriteConfig {
+    fn default() -> Self {
+        Self {
+            compression: "zstd".to_string(),
+            compression_level: 1,
+            compaction_compression_level: Some(3),
+            dictionary_enabled: true,
+            statistics: "page".to_string(),
+            bloom_filter_columns: Vec::new(),
+            bloom_filter_fpp: 0.01,
+            bloom_filter_ndv: 0,
+            max_row_group_size: 1_000_000,
+        }
+    }
+}
+
+#[cfg(feature = "delta-lake")]
+impl ParquetWriteConfig {
+    /// Builds `WriterProperties` for hot-path writes (uses `compression_level`).
+    ///
+    /// # Errors
+    ///
+    /// Returns `ConnectorError::ConfigurationError` on invalid codec/level.
+    pub fn to_writer_properties(
+        &self,
+    ) -> Result<deltalake::parquet::file::properties::WriterProperties, ConnectorError> {
+        self.build_properties(self.compression_level)
+    }
+
+    /// Builds `WriterProperties` for compaction (uses `compaction_compression_level`
+    /// if set, otherwise falls back to `compression_level`).
+    ///
+    /// # Errors
+    ///
+    /// Returns `ConnectorError::ConfigurationError` on invalid codec/level.
+    pub fn compaction_writer_properties(
+        &self,
+    ) -> Result<deltalake::parquet::file::properties::WriterProperties, ConnectorError> {
+        let level = self.compaction_compression_level.unwrap_or(self.compression_level);
+        self.build_properties(level)
+    }
+
+    /// Shared builder: maps string codec → `Compression`, sets dictionary,
+    /// statistics, bloom filters, and row group size.
+    fn build_properties(
+        &self,
+        level: i32,
+    ) -> Result<deltalake::parquet::file::properties::WriterProperties, ConnectorError> {
+        use deltalake::parquet::basic::{Compression, GzipLevel, ZstdLevel};
+        use deltalake::parquet::file::properties::{EnabledStatistics, WriterProperties};
+        use deltalake::parquet::schema::types::ColumnPath;
+
+        let compression = match self.compression.to_lowercase().as_str() {
+            "zstd" => {
+                let zstd_level = ZstdLevel::try_new(level).map_err(|e| {
+                    ConnectorError::ConfigurationError(format!("invalid ZSTD level {level}: {e}"))
+                })?;
+                Compression::ZSTD(zstd_level)
+            }
+            "snappy" => Compression::SNAPPY,
+            "lz4" => Compression::LZ4_RAW,
+            "gzip" => {
+                let level_u32: u32 = level.try_into().map_err(|_| {
+                    ConnectorError::ConfigurationError(format!(
+                        "invalid GZIP level {level}: must be non-negative"
+                    ))
+                })?;
+                let gzip_level = GzipLevel::try_new(level_u32).map_err(|e| {
+                    ConnectorError::ConfigurationError(format!("invalid GZIP level {level}: {e}"))
+                })?;
+                Compression::GZIP(gzip_level)
+            }
+            "none" | "uncompressed" => Compression::UNCOMPRESSED,
+            other => {
+                return Err(ConnectorError::ConfigurationError(format!(
+                    "unknown parquet.compression: '{other}' \
+                     (expected 'zstd', 'snappy', 'lz4', 'gzip', or 'none')"
+                )));
+            }
+        };
+
+        let statistics = match self.statistics.to_lowercase().as_str() {
+            "none" => EnabledStatistics::None,
+            "chunk" => EnabledStatistics::Chunk,
+            "page" => EnabledStatistics::Page,
+            other => {
+                return Err(ConnectorError::ConfigurationError(format!(
+                    "unknown parquet.statistics: '{other}' (expected 'none', 'chunk', or 'page')"
+                )));
+            }
+        };
+
+        let mut builder = WriterProperties::builder()
+            .set_compression(compression)
+            .set_dictionary_enabled(self.dictionary_enabled)
+            .set_statistics_enabled(statistics)
+            .set_max_row_group_size(self.max_row_group_size);
+
+        for col_name in &self.bloom_filter_columns {
+            let col_path = ColumnPath::from(col_name.as_str());
+            builder = builder
+                .set_column_bloom_filter_enabled(col_path.clone(), true)
+                .set_column_bloom_filter_fpp(col_path.clone(), self.bloom_filter_fpp);
+            if self.bloom_filter_ndv > 0 {
+                builder = builder.set_column_bloom_filter_ndv(col_path, self.bloom_filter_ndv);
+            }
+        }
+
+        Ok(builder.build())
     }
 }
 
@@ -1150,5 +1378,151 @@ mod tests {
             cfg.catalog_storage_location.as_deref(),
             Some("s3://bucket/warehouse/table")
         );
+    }
+
+    // ── Parquet config tests ──
+
+    #[test]
+    fn test_parquet_config_defaults() {
+        let cfg = ParquetWriteConfig::default();
+        assert_eq!(cfg.compression, "zstd");
+        assert_eq!(cfg.compression_level, 1);
+        assert_eq!(cfg.compaction_compression_level, Some(3));
+        assert!(cfg.dictionary_enabled);
+        assert_eq!(cfg.statistics, "page");
+        assert!(cfg.bloom_filter_columns.is_empty());
+        assert!((cfg.bloom_filter_fpp - 0.01).abs() < f64::EPSILON);
+        assert_eq!(cfg.bloom_filter_ndv, 0);
+        assert_eq!(cfg.max_row_group_size, 1_000_000);
+    }
+
+    #[test]
+    fn test_parquet_compression_parsing() {
+        for codec in &["zstd", "snappy", "lz4", "gzip", "none"] {
+            let mut pairs = required_pairs();
+            pairs.push(("parquet.compression", codec));
+            let config = make_config(&pairs);
+            let cfg = DeltaLakeSinkConfig::from_config(&config).unwrap();
+            assert_eq!(cfg.parquet.compression, *codec);
+        }
+    }
+
+    #[test]
+    fn test_parquet_compression_level_parsing() {
+        let mut pairs = required_pairs();
+        pairs.push(("parquet.compression.level", "5"));
+        let config = make_config(&pairs);
+        let cfg = DeltaLakeSinkConfig::from_config(&config).unwrap();
+        assert_eq!(cfg.parquet.compression_level, 5);
+    }
+
+    #[test]
+    fn test_parquet_compression_level_invalid() {
+        let mut pairs = required_pairs();
+        pairs.push(("parquet.compression.level", "abc"));
+        let config = make_config(&pairs);
+        assert!(DeltaLakeSinkConfig::from_config(&config).is_err());
+    }
+
+    #[test]
+    fn test_parquet_compaction_compression_level() {
+        let mut pairs = required_pairs();
+        pairs.push(("parquet.compaction.compression.level", "7"));
+        let config = make_config(&pairs);
+        let cfg = DeltaLakeSinkConfig::from_config(&config).unwrap();
+        assert_eq!(cfg.parquet.compaction_compression_level, Some(7));
+    }
+
+    #[test]
+    fn test_parquet_bloom_filter_columns_parsing() {
+        let mut pairs = required_pairs();
+        pairs.push(("parquet.bloom.filter.columns", " user_id , event_type , ts "));
+        let config = make_config(&pairs);
+        let cfg = DeltaLakeSinkConfig::from_config(&config).unwrap();
+        assert_eq!(
+            cfg.parquet.bloom_filter_columns,
+            vec!["user_id", "event_type", "ts"]
+        );
+    }
+
+    #[test]
+    fn test_parquet_bloom_filter_fpp_validation() {
+        // fpp = 0.0 should be rejected
+        let mut pairs = required_pairs();
+        pairs.push(("parquet.bloom.filter.fpp", "0.0"));
+        let config = make_config(&pairs);
+        assert!(DeltaLakeSinkConfig::from_config(&config).is_err());
+
+        // fpp = 1.0 should be rejected
+        let mut pairs = required_pairs();
+        pairs.push(("parquet.bloom.filter.fpp", "1.0"));
+        let config = make_config(&pairs);
+        assert!(DeltaLakeSinkConfig::from_config(&config).is_err());
+    }
+
+    #[test]
+    fn test_parquet_max_row_group_size_zero_rejected() {
+        let mut pairs = required_pairs();
+        pairs.push(("parquet.max.row.group.size", "0"));
+        let config = make_config(&pairs);
+        assert!(DeltaLakeSinkConfig::from_config(&config).is_err());
+    }
+
+    #[test]
+    fn test_parquet_statistics_parsing() {
+        for stat in &["none", "chunk", "page"] {
+            let mut pairs = required_pairs();
+            pairs.push(("parquet.statistics", stat));
+            let config = make_config(&pairs);
+            let cfg = DeltaLakeSinkConfig::from_config(&config).unwrap();
+            assert_eq!(cfg.parquet.statistics, *stat);
+        }
+    }
+
+    #[test]
+    fn test_parquet_invalid_statistics_rejected() {
+        let mut pairs = required_pairs();
+        pairs.push(("parquet.statistics", "full"));
+        let config = make_config(&pairs);
+        assert!(DeltaLakeSinkConfig::from_config(&config).is_err());
+    }
+
+    #[test]
+    fn test_parquet_invalid_compression_rejected() {
+        let mut pairs = required_pairs();
+        pairs.push(("parquet.compression", "brotli"));
+        let config = make_config(&pairs);
+        assert!(DeltaLakeSinkConfig::from_config(&config).is_err());
+    }
+
+    #[cfg(feature = "delta-lake")]
+    #[test]
+    fn test_writer_properties_default_zstd() {
+        let cfg = ParquetWriteConfig::default();
+        assert!(cfg.to_writer_properties().is_ok());
+    }
+
+    #[cfg(feature = "delta-lake")]
+    #[test]
+    fn test_compaction_writer_properties_higher_level() {
+        let cfg = ParquetWriteConfig::default();
+        // Should succeed and use level 3 for compaction.
+        assert!(cfg.compaction_writer_properties().is_ok());
+    }
+
+    #[cfg(feature = "delta-lake")]
+    #[test]
+    fn test_writer_properties_invalid_codec() {
+        let mut cfg = ParquetWriteConfig::default();
+        cfg.compression = "brotli".to_string();
+        assert!(cfg.to_writer_properties().is_err());
+    }
+
+    #[cfg(feature = "delta-lake")]
+    #[test]
+    fn test_writer_properties_with_bloom_filters() {
+        let mut cfg = ParquetWriteConfig::default();
+        cfg.bloom_filter_columns = vec!["user_id".to_string(), "event_type".to_string()];
+        assert!(cfg.to_writer_properties().is_ok());
     }
 }

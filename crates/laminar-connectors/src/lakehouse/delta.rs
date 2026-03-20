@@ -269,6 +269,7 @@ impl DeltaLakeSink {
                 Arc::new(merged_options),
                 self.config.compaction.clone(),
                 self.config.vacuum_retention,
+                self.config.parquet.clone(),
                 cancel.clone(),
             ));
             self.compaction_cancel = Some(cancel);
@@ -437,6 +438,7 @@ impl DeltaLakeSink {
                 &self.config.writer_id,
                 self.current_epoch,
                 self.config.schema_evolution,
+                self.config.parquet.to_writer_properties().ok(),
             )
             .await
             .map(|(t, result)| {
@@ -475,6 +477,7 @@ impl DeltaLakeSink {
                 self.config.schema_evolution,
                 Some(self.config.target_file_size),
                 should_checkpoint,
+                self.config.parquet.to_writer_properties().ok(),
             )
             .await
             .map(|(t, _version)| t)
@@ -667,97 +670,139 @@ impl DeltaLakeSink {
     }
 }
 
-/// Background compaction loop that periodically runs OPTIMIZE and VACUUM.
+/// Background compaction loop: OPTIMIZE + VACUUM with adaptive intervals.
 ///
 /// Opens its own `DeltaTable` handle (no shared state with the sink).
 #[cfg(feature = "delta-lake")]
+#[allow(clippy::too_many_lines)]
 async fn compaction_loop(
     table_path: String,
     storage_options: Arc<std::collections::HashMap<String, String>>,
     config: super::delta_config::CompactionConfig,
     vacuum_retention: std::time::Duration,
+    parquet_config: super::delta_config::ParquetWriteConfig,
     cancel: tokio_util::sync::CancellationToken,
 ) {
     use super::delta_io;
 
+    /// Minimum adaptive compaction interval (floor).
+    const MIN_COMPACTION_INTERVAL: std::time::Duration = std::time::Duration::from_secs(60);
+
+    let base_interval = config.check_interval;
+    let mut current_interval = base_interval;
+    let mut consecutive_skips: u32 = 0;
+
     info!(
         table_path = %table_path,
-        check_interval_secs = config.check_interval.as_secs(),
-        "compaction background task started"
+        check_interval_secs = base_interval.as_secs(),
+        "compaction background task started (adaptive interval)"
     );
 
-    let mut interval = tokio::time::interval(config.check_interval);
-    // Skip the first immediate tick.
-    interval.tick().await;
+    // Initial delay before the first check.
+    tokio::select! {
+        () = cancel.cancelled() => {
+            info!("compaction background task cancelled");
+            return;
+        }
+        () = tokio::time::sleep(current_interval) => {}
+    }
 
     loop {
+        // Open a fresh table handle for compaction (no shared state).
+        let table = match delta_io::open_or_create_table(
+            &table_path,
+            (*storage_options).clone(),
+            None,
+        )
+        .await
+        {
+            Ok(t) => t,
+            Err(e) => {
+                warn!(error = %e, "compaction: failed to open table, will retry");
+                tokio::select! {
+                    () = cancel.cancelled() => {
+                        info!("compaction background task cancelled");
+                        return;
+                    }
+                    () = tokio::time::sleep(current_interval) => {}
+                }
+                continue;
+            }
+        };
+
+        // Check if compaction is needed.
+        let should_compact = match table.snapshot() {
+            Ok(snapshot) => {
+                let file_count = snapshot.log_data().num_files();
+                if file_count < config.min_files_for_compaction {
+                    debug!(
+                        file_count,
+                        min = config.min_files_for_compaction,
+                        "compaction: skipping, not enough files"
+                    );
+                    false
+                } else {
+                    true
+                }
+            }
+            Err(e) => {
+                warn!(error = %e, "compaction: snapshot failed, skipping tick");
+                false
+            }
+        };
+
+        if should_compact {
+            consecutive_skips = 0;
+            // Speed up: halve the interval (floor at MIN_COMPACTION_INTERVAL).
+            current_interval = (current_interval / 2).max(MIN_COMPACTION_INTERVAL);
+
+            let target_size = config.target_file_size as u64;
+            let compaction_props = parquet_config.compaction_writer_properties().ok();
+            match delta_io::run_compaction(
+                table,
+                target_size,
+                &config.z_order_columns,
+                compaction_props,
+            )
+            .await
+            {
+                Ok((table, result)) => {
+                    debug!(
+                        files_added = result.files_added,
+                        files_removed = result.files_removed,
+                        interval_secs = current_interval.as_secs(),
+                        "compaction: OPTIMIZE complete"
+                    );
+
+                    // Run VACUUM after compaction.
+                    match delta_io::run_vacuum(table, vacuum_retention).await {
+                        Ok((_table, files_deleted)) => {
+                            debug!(files_deleted, "compaction: VACUUM complete");
+                        }
+                        Err(e) => {
+                            warn!(error = %e, "compaction: VACUUM failed");
+                        }
+                    }
+                }
+                Err(e) => {
+                    warn!(error = %e, "compaction: OPTIMIZE failed");
+                }
+            }
+        } else {
+            consecutive_skips = consecutive_skips.saturating_add(1);
+            // Slow down: double the interval after 2 consecutive idle ticks.
+            if consecutive_skips >= 2 {
+                current_interval = (current_interval * 2).min(base_interval);
+            }
+        }
+
+        // Adaptive sleep: wait current_interval or cancel.
         tokio::select! {
             () = cancel.cancelled() => {
                 info!("compaction background task cancelled");
                 return;
             }
-            _ = interval.tick() => {
-                // Open a fresh table handle for compaction (no shared state).
-                // Clone the HashMap only here (once per tick, not avoidable
-                // since open_or_create_table takes owned HashMap).
-                let table = match delta_io::open_or_create_table(
-                    &table_path,
-                    (*storage_options).clone(),
-                    None,
-                )
-                .await
-                {
-                    Ok(t) => t,
-                    Err(e) => {
-                        warn!(error = %e, "compaction: failed to open table, will retry");
-                        continue;
-                    }
-                };
-
-                // Skip compaction if not enough files.
-                match table.snapshot() {
-                    Ok(snapshot) => {
-                        let file_count = snapshot.log_data().num_files();
-                        if file_count < config.min_files_for_compaction {
-                            debug!(
-                                file_count,
-                                min = config.min_files_for_compaction,
-                                "compaction: skipping, not enough files"
-                            );
-                            continue;
-                        }
-                    }
-                    Err(e) => {
-                        warn!(error = %e, "compaction: snapshot failed, skipping tick");
-                        continue;
-                    }
-                }
-
-                // Run OPTIMIZE.
-                let target_size = config.target_file_size as u64;
-                match delta_io::run_compaction(table, target_size, &config.z_order_columns).await {
-                    Ok((table, result)) => {
-                        debug!(
-                            files_added = result.files_added,
-                            files_removed = result.files_removed,
-                            "compaction: OPTIMIZE complete"
-                        );
-
-                        // Run VACUUM after compaction.
-                        match delta_io::run_vacuum(table, vacuum_retention).await {
-                            Ok((_table, files_deleted)) => {
-                                debug!(files_deleted, "compaction: VACUUM complete");
-                            }
-                            Err(e) => {
-                                warn!(error = %e, "compaction: VACUUM failed");
-                            }
-                        }
-                    }
-                    Err(e) => {
-                        warn!(error = %e, "compaction: OPTIMIZE failed");
-                    }
-                }
-            }
+            () = tokio::time::sleep(current_interval) => {}
         }
     }
 }
