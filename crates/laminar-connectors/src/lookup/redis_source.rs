@@ -5,6 +5,50 @@
 //! (for hashes) or `SCAN` + `GET` (for strings) and stored in an
 //! in-memory `HashMap` for fast lookups.
 //!
+//! # Known Limitations
+//!
+//! ## Connection Lifecycle
+//!
+//! The current implementation creates a single multiplexed Redis connection
+//! at `connect()` time and holds it for the lifetime of the source. If the
+//! connection drops (e.g., Redis restart, network partition), the initial
+//! load will have already completed and lookups are served from the
+//! in-memory `HashMap`, so reads remain available. However, `health_check()`
+//! will fail and any future `connect()` / refresh will need a new instance.
+//! There is no automatic reconnection or connection pooling. For production
+//! deployments requiring connection resilience, consider wrapping this
+//! source with a retry/reconnection layer or using a Redis proxy (e.g.,
+//! Envoy, Twemproxy).
+//!
+//! ## Key Patterns with Redis Glob Metacharacters
+//!
+//! The `key_pattern` is passed directly to `SCAN MATCH`. Redis SCAN uses
+//! glob-style matching where `?` matches a single character, `[` and `]`
+//! define character classes (e.g., `[abc]`), and `*` matches any sequence.
+//! If your keys literally contain `?`, `[`, or `]`, you must escape them
+//! with a backslash in the pattern (e.g., `user:\[admin\]:*`). This is a
+//! Redis protocol behavior, not a connector limitation.
+//!
+//! ## TTL Race Condition
+//!
+//! When loading data, there is an inherent race between `SCAN` (which
+//! discovers keys) and the subsequent `HGETALL`/`GET` (which reads values).
+//! If a key has a TTL and expires between the SCAN and the read, the read
+//! returns an empty hash or `None`. For hashes, this produces a row with
+//! only the key column populated (all other columns null). For strings,
+//! the key is skipped. This is acceptable for lookup tables but means the
+//! loaded snapshot may be slightly inconsistent with the live Redis state.
+//!
+//! ## Initial Load Performance
+//!
+//! The initial `SCAN` + `HGETALL`/`GET` load is O(N) in the number of
+//! matching keys. For large datasets (millions of keys), this can take
+//! significant time and memory. The `scan_count` config (default: 1000)
+//! controls the `COUNT` hint to SCAN, which affects how many keys Redis
+//! returns per iteration. Increasing it reduces round trips but increases
+//! per-iteration latency. All loaded data is held in memory as Arrow
+//! `RecordBatch` rows, so ensure the process has sufficient RAM.
+//!
 //! ## Usage
 //!
 //! ```rust,no_run
@@ -88,7 +132,11 @@ pub struct RedisLookupSourceConfig {
     /// How values are stored in Redis.
     pub value_type: RedisValueType,
 
-    /// Number of keys per `SCAN` iteration (default: 1000).
+    /// Hint for the `COUNT` parameter in `SCAN` (default: 1000).
+    /// This is a suggestion to Redis, not a hard limit — Redis may return
+    /// more or fewer keys per iteration. Higher values reduce the number
+    /// of round trips but increase per-iteration latency. For datasets
+    /// with millions of keys, consider increasing this to 10000+.
     pub scan_count: usize,
 
     /// Maximum batch size for lookups (default: 1000).
@@ -507,6 +555,71 @@ mod tests {
             extract_key_suffix("user:123:other", "user:*:profile"),
             "123:other"
         );
+    }
+
+    /// Patterns containing Redis glob metacharacters (?, [, ]) are passed
+    /// directly to SCAN MATCH. The extract_key_suffix function only splits
+    /// on '*', so patterns with '?' or '[' are treated as literal prefix
+    /// text for extraction purposes.
+    ///
+    /// WARNING: This means patterns like `user:?:*` will NOT correctly
+    /// extract keys because the prefix `user:?:` is compared literally
+    /// against the actual key (e.g., `user:a:`). The extraction only works
+    /// when the characters before `*` in the pattern literally appear in
+    /// the key. For complex patterns with `?` or `[]`, use a prefix-only
+    /// pattern for SCAN and handle additional filtering in application code.
+    #[test]
+    fn test_extract_key_suffix_with_glob_metacharacters() {
+        // Pattern with '?' in prefix — the literal "?" does NOT match "a" in
+        // the key, so strip_prefix fails and the full key is returned.
+        // This documents a known limitation: extract_key_suffix treats the
+        // pattern prefix literally, not as a glob.
+        assert_eq!(
+            extract_key_suffix("user:a:data", "user:?:*"),
+            "user:a:data"
+        );
+        // Pattern with no '*' — returns full key (no splitting possible).
+        assert_eq!(extract_key_suffix("user:abc", "user:???"), "user:abc");
+        // Pattern with character class — literal "[abc]:" won't match "x:".
+        assert_eq!(
+            extract_key_suffix("item:x:val", "item:[abc]:*"),
+            "item:x:val"
+        );
+        // When the literal prefix DOES match, extraction works normally.
+        assert_eq!(extract_key_suffix("user:?:data", "user:?:*"), "data");
+    }
+
+    /// Keys with TTL can expire between SCAN and HGETALL. When this happens
+    /// for hash-typed keys, HGETALL returns an empty map and the batch has
+    /// only the key column populated (other columns null). Verify this
+    /// produces a valid RecordBatch.
+    #[test]
+    fn test_expired_key_produces_null_columns() {
+        let schema = test_schema();
+        // Empty fields map simulates an expired/empty hash key.
+        let fields = HashMap::new();
+
+        let batch = fields_to_record_batch(&schema, "user_id", "expired_key", &fields).unwrap();
+        assert_eq!(batch.num_rows(), 1);
+
+        // Key column populated
+        let id_col = batch
+            .column(0)
+            .as_any()
+            .downcast_ref::<StringArray>()
+            .unwrap();
+        assert_eq!(id_col.value(0), "expired_key");
+
+        // Name column is null
+        let name_col = batch
+            .column(1)
+            .as_any()
+            .downcast_ref::<StringArray>()
+            .unwrap();
+        assert!(name_col.is_null(0));
+
+        // Score column is null (null array for Int64)
+        assert!(batch.column(2).is_null(0));
     }
 
     #[test]
