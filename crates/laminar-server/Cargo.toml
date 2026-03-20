@@ -69,6 +69,10 @@ openssl = { version = "0.10", features = ["vendored"], optional = true }
 [target.'cfg(not(target_env = "msvc"))'.dependencies]
 tikv-jemallocator = { workspace = true, optional = true }
 
+# Allocator: mimalloc for Windows MSVC where jemalloc is unavailable.
+[target.'cfg(target_env = "msvc")'.dependencies]
+mimalloc = { workspace = true, optional = true }
+
 [dev-dependencies]
 tempfile = { workspace = true }
 
@@ -77,6 +81,7 @@ tempfile = { workspace = true }
 # io_uring, NUMA topology, and XDP/eBPF optimizations.
 default = [
     "jemalloc",
+    "mimalloc",
     "kafka",
     "websocket",
     "delta",
@@ -87,6 +92,7 @@ default = [
     "parquet-lookup",
 ]
 jemalloc = ["dep:tikv-jemallocator"]
+mimalloc = ["dep:mimalloc"]
 # Connector features (forwarded to laminar-db → laminar-connectors)
 kafka = ["laminar-db/kafka"]
 websocket = ["laminar-db/websocket"]

@@ -16,9 +16,16 @@ mod reload;
 mod server;
 mod watcher;
 
+// Platform-dependent allocator selection:
+// - Unix / non-MSVC: jemalloc (excellent fragmentation control, NUMA-aware)
+// - Windows MSVC: mimalloc (only high-perf allocator supporting MSVC)
 #[cfg(all(feature = "jemalloc", not(target_env = "msvc")))]
 #[global_allocator]
 static GLOBAL: tikv_jemallocator::Jemalloc = tikv_jemallocator::Jemalloc;
+
+#[cfg(all(feature = "mimalloc", target_env = "msvc"))]
+#[global_allocator]
+static GLOBAL: mimalloc::MiMalloc = mimalloc::MiMalloc;
 
 use std::path::PathBuf;
 
