@@ -50,6 +50,13 @@ pub mod parquet_source;
 #[cfg(feature = "parquet-lookup")]
 pub use parquet_source::{ParquetLookupSource, ParquetLookupSourceConfig};
 
+/// Redis lookup source for dimension tables backed by Redis hashes or JSON strings.
+#[cfg(feature = "redis-lookup")]
+pub mod redis_source;
+
+#[cfg(feature = "redis-lookup")]
+pub use redis_source::{RedisLookupSource, RedisLookupSourceConfig, RedisValueType};
+
 use async_trait::async_trait;
 
 // Re-export the canonical lookup types from laminar-core.
