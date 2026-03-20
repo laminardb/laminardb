@@ -32,6 +32,7 @@ tokio = { version = "1.50", features = ["full"] }
 async-trait = "0.1"
 serde = { version = "1.0", features = ["derive"] }
 serde_json = "1.0"
+sonic-rs = "0.3"
 rkyv = { version = "0.8", features = ["std", "alloc", "bytecheck"] }
 bytes = "1.11"
 thiserror = "2.0"

@@ -2654,7 +2654,7 @@ impl StreamExecutor {
     pub fn serialize_checkpoint(
         cp: &crate::aggregate_state::StreamExecutorCheckpoint,
     ) -> Result<Vec<u8>, DbError> {
-        serde_json::to_vec(&cp).map_err(|e| {
+        serde_json::to_vec(cp).map_err(|e| {
             DbError::Pipeline(format!("stream executor checkpoint serialization: {e}"))
         })
     }
@@ -2671,9 +2671,8 @@ impl StreamExecutor {
     pub fn restore_state(&mut self, bytes: &[u8]) -> Result<usize, DbError> {
         use crate::aggregate_state::StreamExecutorCheckpoint;
 
-        let checkpoint: StreamExecutorCheckpoint = serde_json::from_slice(bytes).map_err(|e| {
-            DbError::Pipeline(format!("stream executor checkpoint deserialization: {e}"))
-        })?;
+        let checkpoint: StreamExecutorCheckpoint = serde_json::from_slice(bytes)
+            .map_err(|e| DbError::Pipeline(format!("checkpoint deserialization: {e}")))?;
 
         let mut restored = 0usize;
 
@@ -5498,7 +5497,7 @@ mod tests {
         );
 
         // Serialize then restore into new executor
-        let cp_bytes = serde_json::to_vec(&cp).unwrap();
+        let cp_bytes = StreamExecutor::serialize_checkpoint(&cp).unwrap();
         let ctx2 = create_session_context();
         register_streaming_functions(&ctx2);
         let mut executor2 = StreamExecutor::new(ctx2);

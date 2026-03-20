@@ -4,6 +4,17 @@
 //! Constructed once at `CREATE SOURCE` time with a frozen Arrow schema;
 //! the decoder is stateless after construction so the Ring 1 hot path
 //! has zero schema lookups.
+//!
+//! # JSON parser: `sonic-rs`
+//!
+//! The decode hot path uses [`sonic_rs`] for JSON deserialization instead of
+//! `serde_json`. `sonic-rs` leverages SIMD instructions (SSE2/AVX2 on x86-64,
+//! NEON on `AArch64`) for significantly faster parsing of large JSON payloads.
+//!
+//! On ARM targets **without** NEON support (e.g., `ARMv6` Raspberry Pi Zero/1),
+//! `sonic-rs` falls back to a scalar code path. There is no regression versus
+//! `serde_json` in this case, but also no SIMD benefit. The encoder, schema
+//! inference, and WebSocket paths remain on `serde_json`.
 #![allow(clippy::disallowed_types)] // cold path: schema management
 
 use std::collections::HashMap;
@@ -297,7 +308,7 @@ impl FormatDecoder for JsonDecoder {
         let mut populated = vec![false; num_fields];
 
         for record in records {
-            let value: serde_json::Value = serde_json::from_slice(&record.value)
+            let value: serde_json::Value = sonic_rs::from_slice(&record.value)
                 .map_err(|e| SchemaError::DecodeError(format!("JSON parse error: {e}")))?;
 
             // Navigate json.path → default target (borrowed, ZERO alloc).
@@ -765,7 +776,11 @@ fn append_value(
                 b.append_value(&bytes);
             } else {
                 // Fallback: serialize as JSON bytes.
-                let bytes = serde_json::to_vec(value).unwrap_or_default();
+                let bytes = sonic_rs::to_vec(value).map_err(|e| {
+                    SchemaError::DecodeError(format!(
+                        "LargeBinary JSON fallback serialization failed: {e}"
+                    ))
+                })?;
                 b.append_value(&bytes);
             }
         }

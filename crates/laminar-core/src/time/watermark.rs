@@ -414,6 +414,16 @@ where
 /// watermark is the minimum across all sources. This ensures no late events
 /// from any source are missed.
 ///
+/// # Fixed-size Vec invariant
+///
+/// The internal `source_watermarks` Vec is sized at construction time from
+/// the number of registered sources and **never resized**. Source IDs are
+/// dense indices (`0..num_sources`) assigned at pipeline start. If sources
+/// are added or removed at runtime (e.g., via `ALTER PIPELINE ADD SOURCE`),
+/// the pipeline must be restarted — the tracker does not support dynamic
+/// resizing. Calls to `update_source` with an out-of-range `source_id`
+/// are silently ignored (return `None`).
+///
 /// # Example
 ///
 /// ```rust
