@@ -10,7 +10,7 @@ use std::sync::LazyLock;
 use std::time::Duration;
 
 use regex::Regex;
-use serde::Deserialize;
+use serde::{Deserialize, Serialize};
 
 /// Regex for `${VAR}` and `${VAR:-default}` patterns.
 static ENV_VAR_RE: LazyLock<Regex> = LazyLock::new(|| {
@@ -75,7 +75,23 @@ fn substitute_env_vars(input: &str) -> Result<String, ConfigError> {
     Ok(result.into_owned())
 }
 
+/// Public wrapper for config validation (used by the HTTP config/validate endpoint).
+pub fn validate_config_public(config: &ServerConfig) -> Result<(), ConfigError> {
+    validate_config(config)
+}
+
 /// Validate referential integrity and semantic constraints.
+///
+/// **Scope of validation**: This function checks *structural* correctness of
+/// the TOML configuration — duplicate names, dangling sink→pipeline references,
+/// bind address format, delta-mode prerequisites, etc.
+///
+/// It does **not** validate semantic references inside pipeline SQL.  For
+/// example, `SELECT * FROM nonexistent_source` will pass config validation
+/// because the SQL text is opaque at this stage; it is only compiled (and
+/// source references resolved) when the pipeline is actually started.
+/// This is by design: the config validator runs without a live LaminarDB
+/// instance, so it cannot know which sources are registered at runtime.
 fn validate_config(config: &ServerConfig) -> Result<(), ConfigError> {
     let mut errors = Vec::new();
 
@@ -157,7 +173,7 @@ fn validate_config(config: &ServerConfig) -> Result<(), ConfigError> {
 ///
 /// Deserialized from `laminardb.toml`. All sections except `[server]`
 /// are optional (an empty config starts a server with no pipelines).
-#[derive(Debug, Clone, PartialEq, Deserialize)]
+#[derive(Debug, Clone, PartialEq, Deserialize, Serialize)]
 pub struct ServerConfig {
     /// Server-level settings.
     #[serde(default)]
@@ -198,7 +214,7 @@ pub struct ServerConfig {
 }
 
 /// `[server]` section: server-level settings.
-#[derive(Debug, Clone, PartialEq, Deserialize)]
+#[derive(Debug, Clone, PartialEq, Deserialize, Serialize)]
 #[allow(dead_code)]
 pub struct ServerSection {
     /// Operating mode: "embedded" (single-node) or "delta" (multi-node).
@@ -230,7 +246,7 @@ impl Default for ServerSection {
 }
 
 /// `[state]` section: state store backend configuration.
-#[derive(Debug, Clone, PartialEq, Deserialize)]
+#[derive(Debug, Clone, PartialEq, Deserialize, Serialize)]
 #[allow(dead_code)]
 pub struct StateSection {
     /// Backend type: "memory", "mmap", or "disaggregated".
@@ -252,7 +268,7 @@ impl Default for StateSection {
 }
 
 /// `[checkpoint]` section: checkpointing configuration.
-#[derive(Debug, Clone, PartialEq, Deserialize)]
+#[derive(Debug, Clone, PartialEq, Deserialize, Serialize)]
 #[allow(dead_code)]
 pub struct CheckpointSection {
     /// Storage URL for checkpoint data.
@@ -292,7 +308,7 @@ impl Default for CheckpointSection {
 /// Controls how checkpoint objects are assigned to S3 storage classes
 /// for cost optimization. Active checkpoints use the hot tier,
 /// older checkpoints are moved to warm/cold tiers via S3 Lifecycle rules.
-#[derive(Debug, Clone, PartialEq, Deserialize)]
+#[derive(Debug, Clone, PartialEq, Deserialize, Serialize)]
 #[allow(dead_code)]
 pub struct TieringSection {
     /// Storage class for active checkpoints (e.g., `"EXPRESS_ONE_ZONE"`, `"STANDARD"`).
@@ -317,7 +333,7 @@ pub struct TieringSection {
 }
 
 /// `[[source]]` section: streaming source definition.
-#[derive(Debug, Clone, PartialEq, Deserialize)]
+#[derive(Debug, Clone, PartialEq, Deserialize, Serialize)]
 #[allow(dead_code)]
 pub struct SourceConfig {
     /// Unique name for this source (referenced by SQL and sinks).
@@ -343,7 +359,7 @@ pub struct SourceConfig {
 }
 
 /// Column definition within a source or lookup schema.
-#[derive(Debug, Clone, PartialEq, Deserialize)]
+#[derive(Debug, Clone, PartialEq, Deserialize, Serialize)]
 #[allow(dead_code)]
 pub struct ColumnDef {
     /// Column name.
@@ -359,7 +375,7 @@ pub struct ColumnDef {
 }
 
 /// Watermark configuration for a source.
-#[derive(Debug, Clone, PartialEq, Deserialize)]
+#[derive(Debug, Clone, PartialEq, Deserialize, Serialize)]
 #[allow(dead_code)]
 pub struct WatermarkConfig {
     /// Column containing event timestamps.
@@ -371,7 +387,7 @@ pub struct WatermarkConfig {
 }
 
 /// `[[lookup]]` section: lookup table for enrichment joins.
-#[derive(Debug, Clone, PartialEq, Deserialize)]
+#[derive(Debug, Clone, PartialEq, Deserialize, Serialize)]
 #[allow(dead_code)]
 pub struct LookupConfig {
     /// Unique name for this lookup table.
@@ -402,7 +418,7 @@ pub struct LookupConfig {
 }
 
 /// Cache configuration for lookup tables.
-#[derive(Debug, Clone, PartialEq, Deserialize)]
+#[derive(Debug, Clone, PartialEq, Deserialize, Serialize)]
 #[allow(dead_code)]
 pub struct LookupCacheConfig {
     /// Cache size in bytes.
@@ -429,7 +445,7 @@ impl Default for LookupCacheConfig {
 }
 
 /// `[[pipeline]]` section: SQL pipeline definition.
-#[derive(Debug, Clone, PartialEq, Deserialize)]
+#[derive(Debug, Clone, PartialEq, Deserialize, Serialize)]
 #[allow(dead_code)]
 pub struct PipelineConfig {
     /// Unique name for this pipeline.
@@ -443,7 +459,7 @@ pub struct PipelineConfig {
 }
 
 /// `[[sink]]` section: output sink definition.
-#[derive(Debug, Clone, PartialEq, Deserialize)]
+#[derive(Debug, Clone, PartialEq, Deserialize, Serialize)]
 #[allow(dead_code)]
 pub struct SinkConfig {
     /// Unique name for this sink.
@@ -465,7 +481,7 @@ pub struct SinkConfig {
 }
 
 /// `[discovery]` section: delta node discovery.
-#[derive(Debug, Clone, PartialEq, Deserialize)]
+#[derive(Debug, Clone, PartialEq, Deserialize, Serialize)]
 #[allow(dead_code)]
 pub struct DiscoverySection {
     /// Discovery strategy: "static", "dns", "gossip".
@@ -481,7 +497,7 @@ pub struct DiscoverySection {
 }
 
 /// `[coordination]` section: delta coordination.
-#[derive(Debug, Clone, PartialEq, Deserialize)]
+#[derive(Debug, Clone, PartialEq, Deserialize, Serialize)]
 #[allow(dead_code)]
 pub struct CoordinationSection {
     /// Coordination strategy: "raft".

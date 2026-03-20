@@ -1,0 +1,204 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>LaminarDB SQL Console</title>
+<style>
+  :root { --bg: #0d1117; --surface: #161b22; --border: #30363d; --text: #e6edf3;
+          --muted: #8b949e; --accent: #58a6ff; --accent-hover: #79c0ff;
+          --green: #3fb950; --red: #f85149; --font: 'SF Mono', 'Cascadia Code', Consolas, monospace; }
+  * { box-sizing: border-box; margin: 0; padding: 0; }
+  body { font-family: -apple-system, BlinkMacSystemFont, 'Segoe UI', Helvetica, Arial, sans-serif;
+         background: var(--bg); color: var(--text); min-height: 100vh; }
+  .header { background: var(--surface); border-bottom: 1px solid var(--border); padding: 12px 24px;
+            display: flex; align-items: center; gap: 16px; }
+  .header h1 { font-size: 16px; font-weight: 600; }
+  .header a { color: var(--accent); text-decoration: none; font-size: 13px; }
+  .main { max-width: 1200px; margin: 0 auto; padding: 24px; }
+  .editor { position: relative; }
+  textarea { width: 100%; height: 140px; background: var(--surface); color: var(--text);
+             border: 1px solid var(--border); border-radius: 6px; padding: 12px;
+             font-family: var(--font); font-size: 14px; resize: vertical; outline: none;
+             line-height: 1.5; }
+  textarea:focus { border-color: var(--accent); }
+  .toolbar { display: flex; align-items: center; gap: 12px; margin-top: 8px; }
+  button { background: var(--accent); color: #fff; border: none; border-radius: 6px;
+           padding: 8px 20px; font-size: 14px; font-weight: 500; cursor: pointer; }
+  button:hover { background: var(--accent-hover); }
+  button:disabled { opacity: 0.5; cursor: not-allowed; }
+  .btn-secondary { background: var(--surface); border: 1px solid var(--border); color: var(--text); }
+  .btn-secondary:hover { background: var(--border); }
+  .status { font-size: 13px; color: var(--muted); }
+  .status.error { color: var(--red); }
+  .status.ok { color: var(--green); }
+  .results { margin-top: 16px; }
+  .result-info { font-size: 13px; color: var(--muted); margin-bottom: 8px; }
+  table { width: 100%; border-collapse: collapse; font-size: 13px; font-family: var(--font); }
+  th { background: var(--surface); border: 1px solid var(--border); padding: 8px 12px;
+       text-align: left; font-weight: 600; position: sticky; top: 0; }
+  td { border: 1px solid var(--border); padding: 6px 12px; white-space: nowrap;
+       max-width: 400px; overflow: hidden; text-overflow: ellipsis; }
+  tr:hover td { background: rgba(88,166,255,0.05); }
+  .table-wrap { max-height: 500px; overflow: auto; border-radius: 6px;
+                border: 1px solid var(--border); }
+  .error-box { background: rgba(248,81,73,0.1); border: 1px solid var(--red); border-radius: 6px;
+               padding: 12px; font-family: var(--font); font-size: 13px; color: var(--red);
+               white-space: pre-wrap; }
+  .ddl-box { background: rgba(63,185,80,0.1); border: 1px solid var(--green); border-radius: 6px;
+             padding: 12px; font-size: 14px; color: var(--green); }
+  .history { margin-top: 24px; }
+  .history h3 { font-size: 14px; color: var(--muted); margin-bottom: 8px; }
+  .history-item { display: flex; justify-content: space-between; align-items: center;
+                  padding: 6px 10px; border-radius: 4px; font-family: var(--font);
+                  font-size: 12px; cursor: pointer; color: var(--muted); }
+  .history-item:hover { background: var(--surface); color: var(--text); }
+  .history-item .ts { font-size: 11px; white-space: nowrap; margin-left: 16px; }
+  .null-val { color: var(--muted); font-style: italic; }
+  kbd { background: var(--surface); border: 1px solid var(--border); border-radius: 3px;
+        padding: 1px 5px; font-size: 12px; }
+</style>
+</head>
+<body>
+<div class="header">
+  <h1>LaminarDB SQL Console</h1>
+  <a href="/dashboard">Dashboard</a>
+  <a href="/health">Health</a>
+  <a href="/metrics">Metrics</a>
+</div>
+<div class="main">
+  <div class="editor">
+    <textarea id="sql" placeholder="Enter SQL... (Ctrl+Enter to execute)"
+      spellcheck="false">SHOW SOURCES</textarea>
+  </div>
+  <div class="toolbar">
+    <button id="run" onclick="execute()">Execute</button>
+    <button class="btn-secondary" onclick="clearResults()">Clear</button>
+    <button class="btn-secondary" onclick="clearHistory()">Clear History</button>
+    <span class="status" id="status"></span>
+    <span style="margin-left:auto; font-size:12px; color:var(--muted)"><kbd>Ctrl</kbd>+<kbd>Enter</kbd> to run</span>
+  </div>
+  <div class="results" id="results"></div>
+  <div class="history" id="historySection" style="display:none">
+    <h3>Query History</h3>
+    <div id="history"></div>
+  </div>
+</div>
+<script>
+const HISTORY_KEY = 'laminardb_sql_history';
+const MAX_HISTORY = 50;
+
+document.getElementById('sql').addEventListener('keydown', function(e) {
+  if ((e.ctrlKey || e.metaKey) && e.key === 'Enter') { e.preventDefault(); execute(); }
+});
+
+function getHistory() {
+  try { return JSON.parse(localStorage.getItem(HISTORY_KEY) || '[]'); }
+  catch { return []; }
+}
+
+function saveToHistory(sql) {
+  const h = getHistory().filter(e => e.sql !== sql);
+  h.unshift({ sql: sql, ts: new Date().toISOString() });
+  if (h.length > MAX_HISTORY) h.length = MAX_HISTORY;
+  localStorage.setItem(HISTORY_KEY, JSON.stringify(h));
+  renderHistory();
+}
+
+function renderHistory() {
+  const h = getHistory();
+  const sec = document.getElementById('historySection');
+  const el = document.getElementById('history');
+  if (h.length === 0) { sec.style.display = 'none'; return; }
+  sec.style.display = '';
+  el.innerHTML = h.map(e =>
+    `<div class="history-item" onclick="loadQuery(this)" data-sql="${esc(e.sql)}">
+       <span>${esc(e.sql.substring(0, 120))}${e.sql.length > 120 ? '...' : ''}</span>
+       <span class="ts">${new Date(e.ts).toLocaleTimeString()}</span>
+     </div>`
+  ).join('');
+}
+
+function loadQuery(el) {
+  document.getElementById('sql').value = el.dataset.sql;
+}
+
+function clearHistory() {
+  localStorage.removeItem(HISTORY_KEY);
+  renderHistory();
+}
+
+function clearResults() {
+  document.getElementById('results').innerHTML = '';
+  document.getElementById('status').textContent = '';
+}
+
+function esc(s) { return s.replace(/&/g,'&amp;').replace(/</g,'&lt;').replace(/>/g,'&gt;').replace(/"/g,'&quot;'); }
+
+async function execute() {
+  const sql = document.getElementById('sql').value.trim();
+  if (!sql) return;
+  const btn = document.getElementById('run');
+  const status = document.getElementById('status');
+  const results = document.getElementById('results');
+
+  btn.disabled = true;
+  status.className = 'status';
+  status.textContent = 'Executing...';
+  results.innerHTML = '';
+
+  const t0 = performance.now();
+  try {
+    const resp = await fetch('/api/v1/sql', {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify({ sql: sql })
+    });
+    const elapsed = ((performance.now() - t0) / 1000).toFixed(3);
+    const data = await resp.json();
+
+    if (!resp.ok) {
+      status.className = 'status error';
+      status.textContent = `Error (${elapsed}s)`;
+      results.innerHTML = `<div class="error-box">${esc(data.error || JSON.stringify(data))}</div>`;
+    } else if (data.columns && data.rows) {
+      // Tabular result (Metadata/Query)
+      const rowCount = data.rows.length;
+      status.className = 'status ok';
+      status.textContent = `${rowCount} row${rowCount !== 1 ? 's' : ''} (${elapsed}s)`;
+      let html = '<div class="table-wrap"><table><thead><tr>';
+      for (const col of data.columns) html += `<th>${esc(col)}</th>`;
+      html += '</tr></thead><tbody>';
+      for (const row of data.rows) {
+        html += '<tr>';
+        for (const val of row) {
+          if (val === null) html += '<td class="null-val">NULL</td>';
+          else html += `<td>${esc(String(val))}</td>`;
+        }
+        html += '</tr>';
+      }
+      html += '</tbody></table></div>';
+      results.innerHTML = html;
+    } else if (data.result_type) {
+      status.className = 'status ok';
+      status.textContent = `OK (${elapsed}s)`;
+      let msg = data.result_type;
+      if (data.object_name) msg += `: ${data.object_name}`;
+      if (data.rows_affected !== undefined && data.rows_affected !== null) msg += ` (${data.rows_affected} rows affected)`;
+      results.innerHTML = `<div class="ddl-box">${esc(msg)}</div>`;
+    }
+    saveToHistory(sql);
+  } catch (err) {
+    const elapsed = ((performance.now() - t0) / 1000).toFixed(3);
+    status.className = 'status error';
+    status.textContent = `Network error (${elapsed}s)`;
+    results.innerHTML = `<div class="error-box">${esc(err.message)}</div>`;
+  } finally {
+    btn.disabled = false;
+  }
+}
+
+renderHistory();
+</script>
+</body>
+</html>
