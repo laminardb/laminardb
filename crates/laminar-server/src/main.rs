@@ -64,8 +64,14 @@ async fn main() -> Result<()> {
 
     tracing_subscriber::registry()
         .with(
-            tracing_subscriber::EnvFilter::try_from_default_env()
-                .unwrap_or_else(|_| format!("laminardb={}", args.log_level).into()),
+            tracing_subscriber::EnvFilter::try_from_default_env().unwrap_or_else(|_| {
+                format!(
+                    "laminar_server={l},laminar_db={l},laminar_core={l},\
+                     laminar_sql={l},laminar_connectors={l},laminar_storage={l}",
+                    l = args.log_level
+                )
+                .into()
+            }),
         )
         .with(tracing_subscriber::fmt::layer())
         .init();
