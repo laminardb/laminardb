@@ -14,6 +14,7 @@ use tracing::info;
 use laminar_core::streaming::checkpoint::StreamCheckpointConfig;
 use laminar_db::{DbError, LaminarDB, Profile};
 
+use crate::alerting::AlertManager;
 use crate::config::{
     ConfigError, LookupConfig, PipelineConfig, ServerConfig, SinkConfig, SourceConfig,
 };
@@ -204,7 +205,22 @@ pub async fn run_server(
         .map_err(|e| ServerError::Start(e.to_string()))?;
     info!("Pipeline started");
 
-    // 4. Start HTTP API
+    // 4. Start alert manager (if [[alert]] rules are configured)
+    let alert_manager = if !config.alerts.is_empty() {
+        let interval = std::time::Duration::from_secs(10);
+        let mgr = Arc::new(AlertManager::new(&config.alerts, interval));
+        let mgr_clone = Arc::clone(&mgr);
+        let db_clone = Arc::clone(&db);
+        tokio::spawn(async move {
+            mgr_clone.run_loop(db_clone).await;
+        });
+        info!("Alert manager started ({} rules)", config.alerts.len());
+        Some(mgr)
+    } else {
+        None
+    };
+
+    // 5. Start HTTP API
     let bind = config.server.bind.clone();
     let app_state = Arc::new(http::AppState {
         db: Arc::clone(&db),
@@ -214,12 +230,13 @@ pub async fn run_server(
         reload_guard: ReloadGuard::new(),
         reload_total: AtomicU64::new(0),
         reload_last_ts: AtomicU64::new(0),
+        alert_manager,
     });
     let router = http::build_router(Arc::clone(&app_state));
     let api_handle = http::serve(router, &bind).await?;
     info!("HTTP API listening on {bind}");
 
-    // 5. Spawn config file watcher (disabled via LAMINAR_DISABLE_FILE_WATCH=1)
+    // 6. Spawn config file watcher (disabled via LAMINAR_DISABLE_FILE_WATCH=1)
     let watcher_disabled =
         std::env::var("LAMINAR_DISABLE_FILE_WATCH").is_ok_and(|v| v == "1" || v == "true");
     let watcher_handle = if watcher_disabled {

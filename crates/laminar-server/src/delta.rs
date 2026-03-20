@@ -522,6 +522,23 @@ pub async fn start_delta(
 
     // 10. Start HTTP API
     let bind = config.server.bind.clone();
+    // Start alert manager for delta mode (if configured)
+    let alert_manager = {
+        let cfg = &config;
+        if !cfg.alerts.is_empty() {
+            let interval = std::time::Duration::from_secs(10);
+            let mgr = Arc::new(crate::alerting::AlertManager::new(&cfg.alerts, interval));
+            let mgr_clone = Arc::clone(&mgr);
+            let db_clone = Arc::clone(&db);
+            tokio::spawn(async move {
+                mgr_clone.run_loop(db_clone).await;
+            });
+            info!("Alert manager started ({} rules)", cfg.alerts.len());
+            Some(mgr)
+        } else {
+            None
+        }
+    };
     let app_state = Arc::new(http::AppState {
         db: Arc::clone(&db),
         config_path: config_path.clone(),
@@ -530,6 +547,7 @@ pub async fn start_delta(
         reload_guard: ReloadGuard::new(),
         reload_total: AtomicU64::new(0),
         reload_last_ts: AtomicU64::new(0),
+        alert_manager,
     });
     let router = http::build_router(Arc::clone(&app_state));
     let api_handle = http::serve(router, &bind)

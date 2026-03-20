@@ -33,6 +33,7 @@ use tracing::{info, warn};
 
 use laminar_db::LaminarDB;
 
+use crate::alerting::AlertManager;
 use crate::config::ServerConfig;
 use crate::reload::{self, ReloadGuard};
 use crate::server::ServerError;
@@ -54,6 +55,8 @@ pub struct AppState {
     pub reload_total: AtomicU64,
     /// Unix timestamp (seconds) of last reload attempt.
     pub reload_last_ts: AtomicU64,
+    /// Alert manager (present when [[alert]] rules are configured).
+    pub alert_manager: Option<Arc<AlertManager>>,
 }
 
 pub fn build_router(state: Arc<AppState>) -> Router {
@@ -71,6 +74,10 @@ pub fn build_router(state: Arc<AppState>) -> Router {
         .route("/api/v1/checkpoint", post(trigger_checkpoint))
         .route("/api/v1/sql", post(execute_sql))
         .route("/api/v1/reload", post(handle_reload))
+        // Alerting
+        .route("/api/v1/alerts", get(list_alerts))
+        .route("/api/v1/alerts/rules", get(list_alert_rules))
+        .route("/api/v1/alerts/test", post(test_alert))
         // Cluster (delta mode)
         .route("/api/v1/cluster", get(cluster_status))
         // Stubs (501 Not Implemented)
@@ -545,6 +552,37 @@ async fn cluster_status(State(state): State<Arc<AppState>>) -> impl IntoResponse
     .into_response()
 }
 
+/// `GET /api/v1/alerts` -- list recent/active alerts.
+async fn list_alerts(State(state): State<Arc<AppState>>) -> impl IntoResponse {
+    match &state.alert_manager {
+        Some(mgr) => {
+            let alerts = mgr.recent_alerts().await;
+            Json(alerts).into_response()
+        }
+        None => Json(Vec::<crate::alerting::AlertEvent>::new()).into_response(),
+    }
+}
+
+/// `GET /api/v1/alerts/rules` -- list configured alert rules.
+async fn list_alert_rules(State(state): State<Arc<AppState>>) -> impl IntoResponse {
+    match &state.alert_manager {
+        Some(mgr) => Json(mgr.rules_summary()).into_response(),
+        None => Json(Vec::<crate::alerting::AlertRuleSummary>::new()).into_response(),
+    }
+}
+
+/// `POST /api/v1/alerts/test` -- fire a test alert through all channels.
+async fn test_alert(State(state): State<Arc<AppState>>) -> impl IntoResponse {
+    match &state.alert_manager {
+        Some(mgr) => {
+            mgr.fire_test_alert().await;
+            Json(serde_json::json!({"success": true, "message": "test alert fired"}))
+                .into_response()
+        }
+        None => error_response(StatusCode::NOT_FOUND, "no alert rules configured").into_response(),
+    }
+}
+
 /// Stub handler for unimplemented endpoints.
 async fn not_implemented() -> impl IntoResponse {
     error_response(
@@ -577,6 +615,7 @@ mod tests {
                 lookups: vec![],
                 pipelines: vec![],
                 sinks: vec![],
+                alerts: vec![],
                 discovery: None,
                 coordination: None,
                 node_id: None,
@@ -584,6 +623,7 @@ mod tests {
             reload_guard: ReloadGuard::new(),
             reload_total: AtomicU64::new(0),
             reload_last_ts: AtomicU64::new(0),
+            alert_manager: None,
         })
     }
 
@@ -812,6 +852,7 @@ mod tests {
                 lookups: vec![],
                 pipelines: vec![],
                 sinks: vec![],
+                alerts: vec![],
                 discovery: None,
                 coordination: None,
                 node_id: None,
@@ -819,6 +860,7 @@ mod tests {
             reload_guard: ReloadGuard::new(),
             reload_total: AtomicU64::new(0),
             reload_last_ts: AtomicU64::new(0),
+            alert_manager: None,
         });
 
         let app = build_router(state.clone());

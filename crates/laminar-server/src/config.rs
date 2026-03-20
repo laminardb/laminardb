@@ -12,6 +12,8 @@ use std::time::Duration;
 use regex::Regex;
 use serde::Deserialize;
 
+use crate::alerting::AlertConfig;
+
 /// Regex for `${VAR}` and `${VAR:-default}` patterns.
 static ENV_VAR_RE: LazyLock<Regex> = LazyLock::new(|| {
     Regex::new(r"\$\{([A-Za-z_][A-Za-z0-9_]*)(?::-([^}]*))?\}").expect("valid regex")
@@ -186,6 +188,10 @@ pub struct ServerConfig {
     /// Output sinks (Kafka, Postgres, Delta Lake, etc.).
     #[serde(default, rename = "sink")]
     pub sinks: Vec<SinkConfig>,
+
+    /// Alert rules for monitoring and notification.
+    #[serde(default, rename = "alert")]
+    pub alerts: Vec<AlertConfig>,
 
     /// Delta mode discovery settings (optional; absent = embedded mode).
     pub discovery: Option<DiscoverySection>,
@@ -887,6 +893,7 @@ bind = "not-a-socket-addr"
             lookups: vec![],
             pipelines: vec![],
             sinks: vec![],
+            alerts: vec![],
             discovery: None,
             coordination: None,
             node_id: None,
