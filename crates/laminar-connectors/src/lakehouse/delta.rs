@@ -92,8 +92,8 @@ pub struct DeltaLakeSink {
     delta_version: u64,
     /// Time when the current buffer started accumulating.
     buffer_start_time: Option<Instant>,
-    /// Sink metrics.
-    metrics: DeltaLakeSinkMetrics,
+    /// Sink metrics (shared with compaction loop for cross-task reporting).
+    metrics: Arc<DeltaLakeSinkMetrics>,
     /// Delta Lake table handle (present when `delta-lake` feature is enabled).
     #[cfg(feature = "delta-lake")]
     table: Option<DeltaTable>,
@@ -143,7 +143,7 @@ impl DeltaLakeSink {
             buffered_bytes: 0,
             delta_version: 0,
             buffer_start_time: None,
-            metrics: DeltaLakeSinkMetrics::new(),
+            metrics: Arc::new(DeltaLakeSinkMetrics::new()),
             epoch_skipped: false,
             staged_batches: Vec::new(),
             staged_rows: 0,
@@ -241,17 +241,36 @@ impl DeltaLakeSink {
             }
         }
 
-        // Resolve last committed epoch for exactly-once recovery.
-        if self.config.delivery_guarantee == DeliveryGuarantee::ExactlyOnce {
-            self.last_committed_epoch =
-                delta_io::get_last_committed_epoch(&table, &self.config.writer_id).await;
-            if self.last_committed_epoch > 0 {
-                info!(
-                    writer_id = %self.config.writer_id,
-                    last_committed_epoch = self.last_committed_epoch,
-                    "recovered last committed epoch from Delta Lake txn metadata"
-                );
+        // Crash recovery: scan for orphan files and resolve last committed epoch.
+        // This replaces the old txn-only recovery with a full orphan scan (F031B).
+        match super::delta_recovery::recover_delta_table(&table, &self.config.writer_id).await {
+            Ok(recovery) => {
+                if self.config.delivery_guarantee == DeliveryGuarantee::ExactlyOnce {
+                    self.last_committed_epoch = recovery.last_committed_epoch;
+                }
+                if recovery.orphans_detected > 0 {
+                    warn!(
+                        orphans_detected = recovery.orphans_detected,
+                        orphans_deleted = recovery.orphans_deleted,
+                        "recovered from incomplete transactions"
+                    );
+                }
             }
+            Err(e) => {
+                // Recovery scan failure is non-fatal: fall back to txn-only recovery.
+                warn!(error = %e, "crash recovery scan failed, falling back to txn metadata");
+                if self.config.delivery_guarantee == DeliveryGuarantee::ExactlyOnce {
+                    self.last_committed_epoch =
+                        delta_io::get_last_committed_epoch(&table, &self.config.writer_id).await;
+                }
+            }
+        }
+        if self.last_committed_epoch > 0 {
+            info!(
+                writer_id = %self.config.writer_id,
+                last_committed_epoch = self.last_committed_epoch,
+                "recovered last committed epoch from Delta Lake"
+            );
         }
 
         // Store the Delta version.
@@ -261,7 +280,7 @@ impl DeltaLakeSink {
         }
         self.table = Some(table);
 
-        // Spawn background compaction task if enabled.
+        // Spawn background compaction task if enabled (F031C).
         if self.config.compaction.enabled {
             let cancel = tokio_util::sync::CancellationToken::new();
             let handle = tokio::spawn(compaction_loop(
@@ -269,6 +288,7 @@ impl DeltaLakeSink {
                 Arc::new(merged_options),
                 self.config.compaction.clone(),
                 self.config.vacuum_retention,
+                Arc::clone(&self.metrics),
                 cancel.clone(),
             ));
             self.compaction_cancel = Some(cancel);
@@ -667,15 +687,17 @@ impl DeltaLakeSink {
     }
 }
 
-/// Background compaction loop that periodically runs OPTIMIZE and VACUUM.
+/// Background compaction loop that periodically runs OPTIMIZE and VACUUM (F031C).
 ///
 /// Opens its own `DeltaTable` handle (no shared state with the sink).
+/// Reports compaction and vacuum metrics via the shared `DeltaLakeSinkMetrics`.
 #[cfg(feature = "delta-lake")]
 async fn compaction_loop(
     table_path: String,
     storage_options: Arc<std::collections::HashMap<String, String>>,
     config: super::delta_config::CompactionConfig,
     vacuum_retention: std::time::Duration,
+    metrics: Arc<DeltaLakeSinkMetrics>,
     cancel: tokio_util::sync::CancellationToken,
 ) {
     use super::delta_io;
@@ -683,6 +705,7 @@ async fn compaction_loop(
     info!(
         table_path = %table_path,
         check_interval_secs = config.check_interval.as_secs(),
+        min_files = config.min_files_for_compaction,
         "compaction background task started"
     );
 
@@ -726,6 +749,11 @@ async fn compaction_loop(
                             );
                             continue;
                         }
+                        info!(
+                            file_count,
+                            min = config.min_files_for_compaction,
+                            "compaction: threshold exceeded, running OPTIMIZE"
+                        );
                     }
                     Err(e) => {
                         warn!(error = %e, "compaction: snapshot failed, skipping tick");
@@ -737,16 +765,19 @@ async fn compaction_loop(
                 let target_size = config.target_file_size as u64;
                 match delta_io::run_compaction(table, target_size, &config.z_order_columns).await {
                     Ok((table, result)) => {
-                        debug!(
+                        info!(
                             files_added = result.files_added,
                             files_removed = result.files_removed,
+                            partitions_optimized = result.partitions_optimized,
                             "compaction: OPTIMIZE complete"
                         );
+                        metrics.record_compaction(result.files_added, result.files_removed);
 
-                        // Run VACUUM after compaction.
+                        // Run VACUUM after compaction to clean up old files.
                         match delta_io::run_vacuum(table, vacuum_retention).await {
                             Ok((_table, files_deleted)) => {
-                                debug!(files_deleted, "compaction: VACUUM complete");
+                                info!(files_deleted, "compaction: VACUUM complete");
+                                metrics.record_vacuum(files_deleted as u64);
                             }
                             Err(e) => {
                                 warn!(error = %e, "compaction: VACUUM failed");
@@ -909,6 +940,32 @@ impl SinkConnector for DeltaLakeSink {
                 Err(e) => {
                     self.state = ConnectorState::Failed;
                     return Err(e);
+                }
+            }
+        }
+
+        // F031D: Validate schema evolution before accepting the batch.
+        // Check that the incoming batch schema is compatible with the table schema.
+        // Additive changes (new nullable columns) are allowed when schema_evolution
+        // is enabled; breaking changes (type changes, removals) always error.
+        if let Some(ref table_schema) = self.schema {
+            let batch_target = Self::target_schema(&batch.schema(), self.config.write_mode);
+            // Short-circuit: successive batches from the same source share the
+            // same Arc<Schema>, so ptr_eq avoids per-batch field comparison.
+            if !Arc::ptr_eq(table_schema, &batch_target)
+                && table_schema.fields() != batch_target.fields()
+            {
+                super::delta_schema_evolution::check_schema_compatibility(
+                    table_schema,
+                    &batch_target,
+                    self.config.schema_evolution,
+                )?;
+                // If we get here, the change is additive and evolution is enabled.
+                // Update our schema to the batch's target schema (which is a
+                // superset for additive-only changes) so subsequent batches are
+                // validated against the new schema.
+                if self.config.schema_evolution {
+                    self.schema = Some(batch_target);
                 }
             }
         }
