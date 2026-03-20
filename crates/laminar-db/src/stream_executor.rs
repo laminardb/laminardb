@@ -1,12 +1,17 @@
-//! `DataFusion` micro-batch stream executor.
+//! `DataFusion` micro-batch stream executor (legacy).
 //!
-//! Executes registered streaming queries against source data using `DataFusion`'s
-//! SQL engine. Each processing cycle:
+//! Replaced by `OperatorGraph` for production execution. Retained for its
+//! comprehensive test suite and reusable detection functions.
 //!
-//! 1. Source batches are registered as temporary `MemTable` tables
-//! 2. Each stream query is executed via `ctx.sql()`
-//! 3. Results are collected as `RecordBatch` vectors
-//! 4. Temporary tables are cleared for the next cycle
+//! # Reusable functions (used by `OperatorGraph`)
+//! - [`extract_table_references`] — SQL table ref extraction
+//! - [`single_source_table`] — single-source detection
+//! - [`detect_asof_query`] — ASOF join detection
+//! - [`detect_temporal_query`] — temporal join detection
+//! - [`detect_stream_join_query`] — interval join detection
+//! - [`compute_closed_boundary`] — EOWC window boundary computation
+//! - [`apply_topk_filter`] — Top-K post-filtering
+#![allow(dead_code)]
 
 use std::collections::VecDeque;
 use std::sync::Arc;
@@ -207,11 +212,11 @@ fn collect_tables_from_factor(factor: &TableFactor, tables: &mut FxHashSet<Strin
 ///
 /// Compiled from the projection SQL (e.g., `SELECT a, b AS alias FROM __asof_tmp`)
 /// on first execution when the join output schema is known.
-struct CompiledPostProjection {
+pub(crate) struct CompiledPostProjection {
     /// Physical expressions to evaluate per output column.
-    exprs: Vec<Arc<dyn PhysicalExpr>>,
+    pub(crate) exprs: Vec<Arc<dyn PhysicalExpr>>,
     /// Output schema.
-    output_schema: SchemaRef,
+    pub(crate) output_schema: SchemaRef,
 }
 
 impl std::fmt::Debug for CompiledPostProjection {
@@ -1058,15 +1063,15 @@ pub(crate) fn evaluate_compiled_projection(
 }
 
 /// Information extracted from a simple Projection + Filter logical plan.
-struct ProjectionFilterInfo {
+pub(crate) struct ProjectionFilterInfo {
     /// Projection expressions from the top-level Projection node.
-    proj_exprs: Vec<datafusion_expr::Expr>,
+    pub(crate) proj_exprs: Vec<datafusion_expr::Expr>,
     /// Optional WHERE predicate from a Filter node below the Projection.
-    filter_predicate: Option<datafusion_expr::Expr>,
+    pub(crate) filter_predicate: Option<datafusion_expr::Expr>,
     /// `DFSchema` of the scan input (for compiling expressions).
-    input_df_schema: Arc<datafusion_common::DFSchema>,
+    pub(crate) input_df_schema: Arc<datafusion_common::DFSchema>,
     /// Source table name from the `TableScan`.
-    source_table: String,
+    pub(crate) source_table: String,
 }
 
 /// Walk an optimized `LogicalPlan` to extract a simple Projection + Filter shape.
@@ -1077,7 +1082,7 @@ struct ProjectionFilterInfo {
 ///
 /// Returns `None` if the plan has Sort, Limit, Distinct, Join, Aggregate,
 /// or any other node that `CompiledProjection` cannot handle.
-fn extract_projection_filter(plan: &LogicalPlan) -> Option<ProjectionFilterInfo> {
+pub(crate) fn extract_projection_filter(plan: &LogicalPlan) -> Option<ProjectionFilterInfo> {
     match plan {
         LogicalPlan::Projection(proj) => {
             let proj_exprs = proj.expr.clone();
@@ -1156,7 +1161,7 @@ fn extract_filter_or_scan(
 ///
 /// Walks the plan to find the Projection node, compiles each expression to a
 /// `PhysicalExpr`, and returns the expressions with the output schema.
-fn extract_projection_exprs(
+pub(crate) fn extract_projection_exprs(
     plan: &LogicalPlan,
     input_schema: &SchemaRef,
     ctx: &SessionContext,
@@ -2973,7 +2978,7 @@ impl StreamExecutor {
 /// - **Sliding**: align to slide interval — the earliest open window starts at
 ///   `((watermark - size) / slide + 1) * slide`, so data below that threshold
 ///   belongs only to closed windows.
-fn compute_closed_boundary(watermark_ms: i64, config: &WindowOperatorConfig) -> i64 {
+pub(crate) fn compute_closed_boundary(watermark_ms: i64, config: &WindowOperatorConfig) -> i64 {
     match config.window_type {
         WindowType::Tumbling => {
             #[allow(clippy::cast_possible_truncation)]
@@ -3050,7 +3055,7 @@ fn compute_closed_boundary(watermark_ms: i64, config: &WindowOperatorConfig) -> 
 }
 
 /// Infer the `TimestampFormat` from a `RecordBatch` column's `DataType`.
-fn infer_ts_format_from_batch(
+pub(crate) fn infer_ts_format_from_batch(
     batch: &RecordBatch,
     column: &str,
 ) -> laminar_core::time::TimestampFormat {
@@ -3064,7 +3069,7 @@ fn infer_ts_format_from_batch(
     }
 }
 
-fn detect_asof_query(sql: &str) -> (Option<AsofJoinTranslatorConfig>, Option<String>) {
+pub(crate) fn detect_asof_query(sql: &str) -> (Option<AsofJoinTranslatorConfig>, Option<String>) {
     // Parse using the streaming parser which understands ASOF syntax
     let Ok(statements) = laminar_sql::parse_streaming_sql(sql) else {
         return (None, None);
@@ -3103,7 +3108,9 @@ fn detect_asof_query(sql: &str) -> (Option<AsofJoinTranslatorConfig>, Option<Str
     (Some(config), Some(projection_sql))
 }
 
-fn detect_temporal_query(sql: &str) -> (Option<TemporalJoinTranslatorConfig>, Option<String>) {
+pub(crate) fn detect_temporal_query(
+    sql: &str,
+) -> (Option<TemporalJoinTranslatorConfig>, Option<String>) {
     let Ok(statements) = laminar_sql::parse_streaming_sql(sql) else {
         return (None, None);
     };
@@ -3138,7 +3145,7 @@ fn detect_temporal_query(sql: &str) -> (Option<TemporalJoinTranslatorConfig>, Op
     (Some(config), Some(projection_sql))
 }
 
-fn detect_stream_join_query(sql: &str) -> (Option<StreamJoinConfig>, Option<String>) {
+pub(crate) fn detect_stream_join_query(sql: &str) -> (Option<StreamJoinConfig>, Option<String>) {
     let Ok(statements) = laminar_sql::parse_streaming_sql(sql) else {
         return (None, None);
     };
@@ -3612,7 +3619,7 @@ fn rewrite_expr(
 /// `DataFusion` applies `LIMIT N` per micro-batch, but streaming Top-K
 /// needs a global limit across the combined result. This function
 /// concatenates all batches and slices to the first `k` rows.
-fn apply_topk_filter(batches: &[RecordBatch], k: usize) -> Vec<RecordBatch> {
+pub(crate) fn apply_topk_filter(batches: &[RecordBatch], k: usize) -> Vec<RecordBatch> {
     if batches.is_empty() || k == 0 {
         return Vec::new();
     }
@@ -3930,6 +3937,8 @@ mod tests {
         let ctx = create_session_context();
         register_streaming_functions(&ctx);
         let mut executor = StreamExecutor::new(ctx);
+        // Debug builds on Windows can be slow — use a generous budget for 3-level cascade.
+        executor.set_query_budget_ns(5_000_000_000);
 
         // level1: pass through
         executor.add_query(

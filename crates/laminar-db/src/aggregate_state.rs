@@ -1452,6 +1452,7 @@ pub(crate) fn expr_to_sql(expr: &datafusion_expr::Expr) -> String {
 /// Replaces the `ctx.sql(pre_agg_sql).await.collect().await` hot-path call
 /// with direct `PhysicalExpr::evaluate()` on the source batch, eliminating
 /// SQL parsing, logical planning, physical planning, and `MemTable` overhead.
+#[allow(dead_code)] // source_table used by legacy evaluate_compiled_projection path
 pub(crate) struct CompiledProjection {
     /// Source table name (for looking up raw batches instead of querying `MemTable`).
     pub(crate) source_table: String,
