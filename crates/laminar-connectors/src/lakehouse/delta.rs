@@ -709,26 +709,23 @@ async fn compaction_loop(
 
     loop {
         // Open a fresh table handle for compaction (no shared state).
-        let table = match delta_io::open_or_create_table(
-            &table_path,
-            (*storage_options).clone(),
-            None,
-        )
-        .await
-        {
-            Ok(t) => t,
-            Err(e) => {
-                warn!(error = %e, "compaction: failed to open table, will retry");
-                tokio::select! {
-                    () = cancel.cancelled() => {
-                        info!("compaction background task cancelled");
-                        return;
+        let table =
+            match delta_io::open_or_create_table(&table_path, (*storage_options).clone(), None)
+                .await
+            {
+                Ok(t) => t,
+                Err(e) => {
+                    warn!(error = %e, "compaction: failed to open table, will retry");
+                    tokio::select! {
+                        () = cancel.cancelled() => {
+                            info!("compaction background task cancelled");
+                            return;
+                        }
+                        () = tokio::time::sleep(current_interval) => {}
                     }
-                    () = tokio::time::sleep(current_interval) => {}
+                    continue;
                 }
-                continue;
-            }
-        };
+            };
 
         // Check if compaction is needed.
         let should_compact = match table.snapshot() {

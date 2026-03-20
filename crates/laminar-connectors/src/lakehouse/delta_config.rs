@@ -718,7 +718,9 @@ impl ParquetWriteConfig {
     pub fn compaction_writer_properties(
         &self,
     ) -> Result<deltalake::parquet::file::properties::WriterProperties, ConnectorError> {
-        let level = self.compaction_compression_level.unwrap_or(self.compression_level);
+        let level = self
+            .compaction_compression_level
+            .unwrap_or(self.compression_level);
         self.build_properties(level)
     }
 
@@ -1436,7 +1438,10 @@ mod tests {
     #[test]
     fn test_parquet_bloom_filter_columns_parsing() {
         let mut pairs = required_pairs();
-        pairs.push(("parquet.bloom.filter.columns", " user_id , event_type , ts "));
+        pairs.push((
+            "parquet.bloom.filter.columns",
+            " user_id , event_type , ts ",
+        ));
         let config = make_config(&pairs);
         let cfg = DeltaLakeSinkConfig::from_config(&config).unwrap();
         assert_eq!(
