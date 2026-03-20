@@ -81,6 +81,15 @@ impl AHashMapStore {
     /// This saves ~2x key memory and O(log n) per insert, but `prefix_scan`
     /// and `range_scan` will return empty iterators. Use this for pure-aggregation
     /// workloads that only need point lookups.
+    ///
+    /// # Mode is immutable
+    ///
+    /// The indexed/hash-only mode is set at construction and cannot be changed.
+    /// There is no `enable_index()` or `disable_index()` method. If a pipeline
+    /// initially uses hash-only mode and later needs prefix scans (e.g., a new
+    /// query is registered that requires range iteration), the store must be
+    /// replaced with a new `AHashMapStore::new()` instance and restored from
+    /// a snapshot.
     #[must_use]
     pub fn hash_only() -> Self {
         Self {
@@ -225,9 +234,21 @@ impl StateStore for AHashMapStore {
         self.data.len()
     }
 
+    /// Produce a deterministic snapshot of all key-value pairs.
+    ///
+    /// # Snapshot determinism tradeoff
+    ///
+    /// - **Indexed mode**: iterates the `BTreeSet` in O(n), already sorted.
+    /// - **Hash-only mode**: iterates the `AHashMap` in O(n), then sorts the
+    ///   collected `Vec` in O(n log n) to guarantee deterministic ordering.
+    ///
+    /// The O(n log n) sort in hash-only mode is the price of skipping the
+    /// `BTreeSet` on every insert. For typical checkpoint frequencies (every
+    /// 5-30s) and state sizes (< 1M keys), the one-time sort cost is
+    /// negligible compared to the per-insert savings over thousands of cycles.
     fn snapshot(&self) -> StateSnapshot {
         let data: Vec<(Vec<u8>, Vec<u8>)> = if let Some(ref index) = self.index {
-            // Use the ordered index for deterministic snapshot ordering
+            // Use the ordered index for deterministic snapshot ordering — O(n)
             index
                 .iter()
                 .map(|k| {
@@ -236,7 +257,7 @@ impl StateStore for AHashMapStore {
                 })
                 .collect()
         } else {
-            // No ordered index — iterate the hash map and sort for deterministic output
+            // No ordered index — iterate hash map O(n) + sort O(n log n)
             let mut data: Vec<(Vec<u8>, Vec<u8>)> = self
                 .data
                 .iter()
@@ -532,5 +553,58 @@ mod tests {
         assert!(AHashMapStore::with_capacity(10).has_ordered_index());
         assert!(!AHashMapStore::hash_only().has_ordered_index());
         assert!(!AHashMapStore::hash_only_with_capacity(10).has_ordered_index());
+    }
+
+    /// Stress test: insert 10K keys in hash-only mode, snapshot, restore,
+    /// verify all keys present with correct values.
+    #[test]
+    fn test_hash_only_stress_snapshot_restore_10k() {
+        let mut store = AHashMapStore::hash_only();
+        let n = 10_000;
+
+        // Insert 10K keys with deterministic values.
+        for i in 0..n {
+            let key = format!("key_{i:06}");
+            let value = format!("value_{i}");
+            store.put(key.as_bytes(), Bytes::from(value)).unwrap();
+        }
+        assert_eq!(store.len(), n);
+
+        // Snapshot.
+        let snapshot = store.snapshot();
+        assert_eq!(snapshot.len(), n);
+
+        // Verify snapshot is deterministically sorted.
+        let snap_data = snapshot.data();
+        for i in 1..snap_data.len() {
+            assert!(
+                snap_data[i - 1].0 < snap_data[i].0,
+                "snapshot should be sorted: {:?} >= {:?}",
+                String::from_utf8_lossy(&snap_data[i - 1].0),
+                String::from_utf8_lossy(&snap_data[i].0),
+            );
+        }
+
+        // Clear and restore.
+        store.clear();
+        assert_eq!(store.len(), 0);
+
+        store.restore(snapshot);
+        assert_eq!(store.len(), n);
+
+        // Verify all keys present with correct values.
+        for i in 0..n {
+            let key = format!("key_{i:06}");
+            let expected_value = format!("value_{i}");
+            let actual = store.get(key.as_bytes()).unwrap_or_else(|| {
+                panic!("key '{key}' missing after restore");
+            });
+            assert_eq!(
+                actual,
+                Bytes::from(expected_value.clone()),
+                "value mismatch for key '{key}': got {:?}",
+                String::from_utf8_lossy(&actual),
+            );
+        }
     }
 }
