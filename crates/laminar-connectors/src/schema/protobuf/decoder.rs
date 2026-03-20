@@ -9,6 +9,17 @@
 //! decoder operates at the wire-format level: it parses protobuf field tags
 //! and values directly, mapping them to Arrow columns via the descriptor
 //! metadata. This enables schema-driven decoding without `build.rs`.
+//!
+//! # Known Limitation: Repeated Fields
+//!
+//! Protobuf `repeated` fields (arrays) are not fully supported. When a
+//! repeated field is encountered during decoding, the decoder returns an
+//! explicit `SchemaError::DecodeError` with the message "repeated fields
+//! are not yet supported". In the schema, repeated fields are mapped to
+//! `DataType::Utf8` (intended for future JSON-encoded array representation)
+//! but the decoding path rejects them at runtime. If your proto schema
+//! contains repeated fields, either remove them from the descriptor or
+//! pre-process messages to flatten arrays before decoding.
 
 use std::fmt::Write;
 use std::sync::Arc;
@@ -930,5 +941,100 @@ mod tests {
 
         assert_eq!(decoder.output_schema().fields().len(), 2);
         assert_eq!(decoder.fields.len(), 2);
+    }
+
+    /// Repeated fields produce an explicit error rather than silently
+    /// overwriting earlier values. This test verifies the error message
+    /// so callers know what to expect.
+    #[test]
+    fn test_repeated_field_produces_error() {
+        // Create a descriptor with a repeated field.
+        let fds = FileDescriptorSet {
+            file: vec![FileDescriptorProto {
+                name: Some("test.proto".into()),
+                package: Some("test".into()),
+                message_type: vec![DescriptorProto {
+                    name: Some("WithRepeated".into()),
+                    field: vec![
+                        FieldDescriptorProto {
+                            name: Some("id".into()),
+                            number: Some(1),
+                            r#type: Some(Type::Int64 as i32),
+                            label: Some(Label::Optional as i32),
+                            ..Default::default()
+                        },
+                        FieldDescriptorProto {
+                            name: Some("tags".into()),
+                            number: Some(2),
+                            r#type: Some(Type::String as i32),
+                            label: Some(Label::Repeated as i32),
+                            ..Default::default()
+                        },
+                    ],
+                    ..Default::default()
+                }],
+                ..Default::default()
+            }],
+        };
+
+        let config = ProtobufDecoderConfig::default();
+        let decoder = ProtobufDecoder::from_descriptor_set(&fds, config).unwrap();
+
+        // Build a message with two occurrences of field 2 (repeated).
+        let mut msg = Vec::new();
+        encode_varint_field(&mut msg, 1, 42);
+        encode_bytes_field(&mut msg, 2, b"tag1");
+        encode_bytes_field(&mut msg, 2, b"tag2"); // second occurrence
+
+        let record = RawRecord::new(msg);
+        let result = decoder.decode_batch(&[record]);
+        assert!(result.is_err(), "repeated field should produce an error");
+        let err_msg = result.unwrap_err().to_string();
+        assert!(
+            err_msg.contains("repeated fields are not yet supported"),
+            "unexpected error: {err_msg}"
+        );
+    }
+
+    /// Schema construction maps repeated fields to Utf8 (for future JSON
+    /// array support). Verify the field metadata is correct.
+    #[test]
+    fn test_repeated_field_schema_mapping() {
+        let fds = FileDescriptorSet {
+            file: vec![FileDescriptorProto {
+                name: Some("test.proto".into()),
+                package: Some("test".into()),
+                message_type: vec![DescriptorProto {
+                    name: Some("WithRepeated".into()),
+                    field: vec![
+                        FieldDescriptorProto {
+                            name: Some("id".into()),
+                            number: Some(1),
+                            r#type: Some(Type::Int64 as i32),
+                            label: Some(Label::Optional as i32),
+                            ..Default::default()
+                        },
+                        FieldDescriptorProto {
+                            name: Some("tags".into()),
+                            number: Some(2),
+                            r#type: Some(Type::String as i32),
+                            label: Some(Label::Repeated as i32),
+                            ..Default::default()
+                        },
+                    ],
+                    ..Default::default()
+                }],
+                ..Default::default()
+            }],
+        };
+
+        let config = ProtobufDecoderConfig::default();
+        let decoder = ProtobufDecoder::from_descriptor_set(&fds, config).unwrap();
+        let schema = decoder.output_schema();
+
+        // Repeated field mapped to Utf8 and nullable
+        let tags_field = schema.field_with_name("tags").unwrap();
+        assert_eq!(tags_field.data_type(), &DataType::Utf8);
+        assert!(tags_field.is_nullable());
     }
 }

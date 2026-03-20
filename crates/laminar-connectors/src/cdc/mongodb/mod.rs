@@ -4,6 +4,22 @@
 //! database-level and collection-level watching with optional pipeline
 //! filtering and resume token-based checkpointing.
 //!
+//! # Production Readiness
+//!
+//! This is a basic implementation suitable for development and testing.
+//! For production deployments, the maintainer's PR #255 provides a
+//! production-ready version with:
+//! - Automatic reconnection with exponential backoff
+//! - Resume token lifecycle management (persistence, invalidation)
+//! - Graceful handling of `ChangeStreamError` and `InvalidResumeToken`
+//! - Connection pool management with configurable pool sizes
+//! - Detailed operational metrics (lag, throughput, error rates)
+//!
+//! Until PR #255 is merged, operators should be aware that this
+//! implementation does not automatically recover from connection drops
+//! or resume token invalidation. A process restart with a fresh
+//! checkpoint is required in those cases.
+//!
 //! # Architecture
 //!
 //! ```text

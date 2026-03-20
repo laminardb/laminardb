@@ -6,6 +6,23 @@
 //! - "Snapshot all MongoDB documents, then stream changes"
 //! - "Read all existing CDC events, then follow the live replication stream"
 //!
+//! # Important: Manual Backfill Completion
+//!
+//! The `BackfillSource` does NOT automatically detect when backfill ends.
+//! The caller MUST call `complete_backfill()` explicitly when it determines
+//! that historical replay is finished (e.g., by comparing the current offset
+//! to a known end offset, or by detecting that the source has caught up to
+//! the live tail). Until `complete_backfill()` is called, the source remains
+//! in `BackfillPhase::Backfilling` and backfill metrics continue to accumulate.
+//!
+//! # Replay Support Requirement
+//!
+//! When `BackfillConfig::enabled` is `true`, the inner source MUST support
+//! replay (`supports_replay()` returns `true`). If it does not, `open()`
+//! returns `ConnectorError::ConfigurationError`. Most durable sources
+//! (Kafka, CDC, files) support replay by default. In-memory or
+//! push-only sources typically do not.
+//!
 //! # Architecture
 //!
 //! ```text
@@ -632,5 +649,73 @@ mod tests {
         // Schema should delegate to inner
         let schema = source.schema();
         assert!(schema.fields().len() > 0);
+    }
+
+    /// A mock source that does NOT support replay, for testing the
+    /// backfill replay-support guard.
+    struct NoReplaySource(MockSourceConnector);
+
+    #[async_trait]
+    impl SourceConnector for NoReplaySource {
+        async fn open(&mut self, config: &ConnectorConfig) -> Result<(), ConnectorError> {
+            self.0.open(config).await
+        }
+        async fn poll_batch(
+            &mut self,
+            max_records: usize,
+        ) -> Result<Option<SourceBatch>, ConnectorError> {
+            self.0.poll_batch(max_records).await
+        }
+        fn schema(&self) -> SchemaRef {
+            self.0.schema()
+        }
+        fn checkpoint(&self) -> SourceCheckpoint {
+            self.0.checkpoint()
+        }
+        async fn restore(&mut self, cp: &SourceCheckpoint) -> Result<(), ConnectorError> {
+            self.0.restore(cp).await
+        }
+        fn health_check(&self) -> HealthStatus {
+            self.0.health_check()
+        }
+        fn metrics(&self) -> ConnectorMetrics {
+            self.0.metrics()
+        }
+        fn data_ready_notify(&self) -> Option<Arc<Notify>> {
+            self.0.data_ready_notify()
+        }
+        async fn close(&mut self) -> Result<(), ConnectorError> {
+            self.0.close().await
+        }
+        fn supports_replay(&self) -> bool {
+            false
+        }
+    }
+
+    /// When backfill is enabled but the inner source doesn't support replay,
+    /// open() must return a ConfigurationError.
+    #[tokio::test]
+    async fn test_backfill_rejects_non_replay_source() {
+        let inner = Box::new(NoReplaySource(MockSourceConnector::new()));
+        let mut source = BackfillSource::new(inner, BackfillConfig::enabled());
+
+        let result = source.open(&ConnectorConfig::new("test")).await;
+        assert!(result.is_err());
+        let err = result.unwrap_err();
+        assert!(
+            err.to_string().contains("does not support replay"),
+            "expected replay error, got: {err}"
+        );
+    }
+
+    /// When backfill is disabled, a non-replay source should open normally.
+    #[tokio::test]
+    async fn test_backfill_disabled_accepts_non_replay_source() {
+        let inner = Box::new(NoReplaySource(MockSourceConnector::new()));
+        let mut source = BackfillSource::new(inner, BackfillConfig::default());
+
+        let result = source.open(&ConnectorConfig::new("test")).await;
+        assert!(result.is_ok());
+        assert!(source.is_live());
     }
 }

@@ -110,6 +110,14 @@ pub mod storage;
 /// Reference table source trait and refresh modes.
 pub mod reference;
 
+/// Historical backfill support for source connectors.
+#[allow(
+    clippy::cast_precision_loss,
+    clippy::derivable_impls,
+    clippy::map_unwrap_or
+)]
+pub mod backfill;
+
 /// WebSocket source and sink connectors.
 #[cfg(feature = "websocket")]
 pub mod websocket;
