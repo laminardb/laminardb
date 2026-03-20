@@ -242,29 +242,29 @@ impl LaminarDB {
         use crate::connector_manager::{
             build_sink_config, build_source_config, build_table_config,
         };
+        use crate::operator_graph::OperatorGraph;
         use crate::pipeline::{PipelineConfig, SourceRegistration};
-        use crate::stream_executor::StreamExecutor;
         use laminar_connectors::reference::{ReferenceTableSource, RefreshMode};
 
-        // Build StreamExecutor
+        // Build OperatorGraph
         let ctx = laminar_sql::create_session_context();
         laminar_sql::register_streaming_functions(&ctx);
-        let mut executor = StreamExecutor::new(ctx);
-        executor.set_max_state_bytes(self.config.max_state_bytes_per_operator);
-        executor.set_lookup_registry(Arc::clone(&self.lookup_registry));
-        executor.set_counters(Arc::clone(&self.counters));
+        let mut graph = OperatorGraph::new(ctx);
+        graph.set_max_state_bytes(self.config.max_state_bytes_per_operator);
+        graph.set_lookup_registry(Arc::clone(&self.lookup_registry));
+        graph.set_counters(Arc::clone(&self.counters));
 
         // Register source schemas for ALL sources (both external connectors
-        // and catalog-bridge sources) so the executor can create empty
+        // and catalog-bridge sources) so the graph can create empty
         // placeholder tables when no data arrives in a given cycle.
         for name in source_regs.keys() {
             if let Some(entry) = self.catalog.get_source(name) {
-                executor.register_source_schema(name.clone(), entry.schema.clone());
+                graph.register_source_schema(name.clone(), entry.schema.clone());
             }
         }
 
         for reg in stream_regs.values() {
-            executor.add_query(
+            graph.add_query(
                 reg.name.clone(),
                 reg.query_sql.clone(),
                 reg.emit_clause.clone(),
@@ -274,8 +274,8 @@ impl LaminarDB {
         }
 
         // Register temporal join tables as Versioned in the lookup registry
-        // so that execute_temporal_query() can use persistent versioned state.
-        for tcfg in executor.temporal_join_configs() {
+        // so that temporal join operators can use persistent versioned state.
+        for tcfg in graph.temporal_join_configs() {
             if self.lookup_registry.get_entry(&tcfg.table_name).is_none() {
                 // Get initial data. If none exists yet, use an empty batch
                 // with the correct schema from the catalog (not Schema::empty).
@@ -435,7 +435,7 @@ impl LaminarDB {
                 continue;
             }
             if let Some(entry) = self.catalog.get_source(&name) {
-                executor.register_source_schema(name.clone(), entry.schema.clone());
+                graph.register_source_schema(name.clone(), entry.schema.clone());
                 let subscription = entry.sink.subscribe();
                 let connector = crate::catalog_connector::CatalogSourceConnector::new(
                     subscription,
@@ -563,25 +563,33 @@ impl LaminarDB {
                                 src.restore_checkpoint = Some(restored);
                             }
                         }
-                        // Restore stream executor aggregate state
-                        if let Some(op) = recovered.manifest.operator_states.get("stream_executor")
-                        {
+                        // Restore operator graph state (new format)
+                        if let Some(op) = recovered.manifest.operator_states.get("operator_graph") {
                             if let Some(bytes) = op.decode_inline() {
-                                match executor.restore_state(&bytes) {
+                                match graph.restore_from_bytes(&bytes) {
                                     Ok(n) => {
                                         tracing::info!(
                                             queries = n,
-                                            "Restored stream executor state from checkpoint"
+                                            "Restored operator graph state from checkpoint"
                                         );
                                     }
                                     Err(e) => {
                                         tracing::warn!(
                                             error = %e,
-                                            "Stream executor state restore failed, starting fresh"
+                                            "Operator graph state restore failed, starting fresh"
                                         );
                                     }
                                 }
                             }
+                        } else if recovered
+                            .manifest
+                            .operator_states
+                            .contains_key("stream_executor")
+                        {
+                            tracing::warn!(
+                                "Found old stream_executor checkpoint format; \
+                                 skipping restore (clean break). Starting fresh."
+                            );
                         }
                         tracing::info!(
                             epoch = recovered.epoch(),
@@ -866,10 +874,10 @@ impl LaminarDB {
         };
 
         // Wire per-query budget from pipeline config.
-        executor.set_query_budget_ns(pipeline_config.query_budget_ns);
+        graph.set_query_budget_ns(pipeline_config.query_budget_ns);
 
         let callback = crate::pipeline_callback::ConnectorPipelineCallback {
-            executor,
+            graph,
             stream_sources,
             sinks,
             watermark_states,
