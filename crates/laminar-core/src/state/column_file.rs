@@ -95,6 +95,16 @@ const HEADER_SIZE: usize = 8;
 /// little-endian u64. This allows the file to be reopened without data
 /// loss — the write position is recovered from the header rather than
 /// being reset to zero.
+///
+/// # Size limitation
+///
+/// The index sidecar (`index.bin`) stores offsets and lengths as **u32**
+/// values, which limits each column file to a maximum of **~4 GiB**
+/// (`u32::MAX` = 4,294,967,295 bytes).  Writes that would push the
+/// write position past this limit are rejected with an error rather
+/// than silently truncating the offset.  In practice, partitions are
+/// time-bucketed (e.g., 1-hour windows) and rotated long before
+/// reaching this limit.
 struct ColumnFile {
     /// Memory-mapped region.
     mmap: MmapMut,
@@ -108,13 +118,23 @@ struct ColumnFile {
 
 impl ColumnFile {
     /// Create or open a column file.
+    ///
+    /// Returns `StateError::Io` if the file cannot be created or opened
+    /// (e.g., read-only filesystem, permission denied, disk full).  All
+    /// I/O errors are propagated cleanly — this function never panics.
     fn open(path: &Path, initial_size: usize) -> Result<Self, StateError> {
         let file = OpenOptions::new()
             .read(true)
             .write(true)
             .create(true)
             .truncate(false)
-            .open(path)?;
+            .open(path)
+            .map_err(|e| {
+                StateError::Io(std::io::Error::new(
+                    e.kind(),
+                    format!("failed to open column file '{}': {e}", path.display()),
+                ))
+            })?;
 
         let file_meta = file.metadata()?;
         let is_new = file_meta.len() == 0;

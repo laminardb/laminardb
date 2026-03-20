@@ -42,9 +42,19 @@ pub struct SequencedSegment {
 /// Thread-safe: multiple writers can call `next_id()` concurrently.
 /// The `AtomicU64` counter ensures unique, strictly increasing IDs
 /// without locks.
+///
+/// # Overflow
+///
+/// The counter is a `u64` which can hold 2^64 (≈ 1.8 * 10^19) IDs.
+/// At a sustained rate of **1 billion IDs per second**, the counter
+/// would wrap after approximately **584 years**.  This is not a
+/// practical concern for any deployment, but is documented here for
+/// completeness.  If wrap-around were ever observed, it would manifest
+/// as the `SegmentReorderBuffer` seeing "stale" sequence IDs and
+/// silently dropping the wrapped segments.
 #[derive(Debug)]
 pub struct WalSequencer {
-    /// Monotonic counter for sequence IDs.
+    /// Monotonic counter for sequence IDs (wraps after ~584 years at 1B/s).
     next_id: AtomicU64,
     /// Number of registered writers.
     num_writers: usize,

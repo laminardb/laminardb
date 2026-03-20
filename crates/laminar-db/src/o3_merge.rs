@@ -156,7 +156,35 @@ impl O3MergeEngine {
     /// Buffer a batch of late rows for a given source.
     ///
     /// The `time_column` is the event-time column used for sort-merge.
-    pub fn buffer_late(&mut self, source_name: &str, batch: RecordBatch, time_column: &str) {
+    ///
+    /// # Errors
+    ///
+    /// Returns an error if the batch's schema does not contain `time_column`.
+    /// This catches misconfigured pipelines early rather than deferring the
+    /// failure to merge time (where the unsorted fallback path would silently
+    /// produce incorrect results).
+    pub fn buffer_late(
+        &mut self,
+        source_name: &str,
+        batch: RecordBatch,
+        time_column: &str,
+    ) -> Result<(), String> {
+        // Validate that the time column exists in the batch schema.
+        if batch.schema().index_of(time_column).is_err() {
+            return Err(format!(
+                "O3 merge: time column '{}' not found in batch schema for source '{}'. \
+                 Available columns: {:?}",
+                time_column,
+                source_name,
+                batch
+                    .schema()
+                    .fields()
+                    .iter()
+                    .map(|f| f.name().as_str())
+                    .collect::<Vec<_>>()
+            ));
+        }
+
         #[allow(clippy::cast_possible_truncation)]
         {
             self.total_late_rows += batch.num_rows() as u64;
@@ -166,6 +194,7 @@ impl O3MergeEngine {
             .entry(source_name.to_string())
             .or_insert_with(|| SourceLateBuffer::new(time_column.to_string()));
         buf.push(batch);
+        Ok(())
     }
 
     /// Merge buffered late rows into on-time batches for a source.
@@ -330,7 +359,7 @@ mod tests {
 
         // Buffer some late data.
         let late = make_batch(&[100, 200], &["a", "b"]);
-        engine.buffer_late("source1", late, "event_time");
+        engine.buffer_late("source1", late, "event_time").unwrap();
         assert_eq!(engine.buffered_rows(), 2);
 
         // On-time data arrives.
@@ -364,8 +393,12 @@ mod tests {
     fn test_flush_all() {
         let mut engine = O3MergeEngine::new(O3MergeConfig::merge());
 
-        engine.buffer_late("s1", make_batch(&[1], &["x"]), "event_time");
-        engine.buffer_late("s2", make_batch(&[2], &["y"]), "event_time");
+        engine
+            .buffer_late("s1", make_batch(&[1], &["x"]), "event_time")
+            .unwrap();
+        engine
+            .buffer_late("s2", make_batch(&[2], &["y"]), "event_time")
+            .unwrap();
 
         let flushed = engine.flush_all();
         assert_eq!(flushed.len(), 2);
@@ -384,7 +417,9 @@ mod tests {
         let mut engine = O3MergeEngine::new(config);
 
         // Buffer 2 rows — under threshold.
-        engine.buffer_late("s1", make_batch(&[1, 2], &["a", "b"]), "event_time");
+        engine
+            .buffer_late("s1", make_batch(&[1, 2], &["a", "b"]), "event_time")
+            .unwrap();
 
         let on_time = make_batch(&[10], &["c"]);
         // Should NOT merge (under threshold, not forced).
@@ -393,12 +428,27 @@ mod tests {
         assert_eq!(result[0].num_rows(), 1); // only on-time
 
         // Buffer 2 more — now at 4, over threshold of 3.
-        engine.buffer_late("s1", make_batch(&[3, 4], &["d", "e"]), "event_time");
+        engine
+            .buffer_late("s1", make_batch(&[3, 4], &["d", "e"]), "event_time")
+            .unwrap();
 
         let on_time2 = make_batch(&[20], &["f"]);
         // Should merge now.
         let result = engine.merge_into("s1", vec![on_time2], false);
         assert_eq!(result.len(), 1);
         assert_eq!(result[0].num_rows(), 5); // 4 late + 1 on-time
+    }
+
+    #[test]
+    fn test_buffer_late_rejects_missing_time_column() {
+        let mut engine = O3MergeEngine::new(O3MergeConfig::merge());
+        let batch = make_batch(&[1, 2], &["a", "b"]);
+        let err = engine
+            .buffer_late("s1", batch, "nonexistent_column")
+            .unwrap_err();
+        assert!(
+            err.contains("not found in batch schema"),
+            "unexpected error: {err}"
+        );
     }
 }
