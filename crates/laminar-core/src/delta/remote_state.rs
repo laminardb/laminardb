@@ -5,6 +5,17 @@
 //! and fetches the value via a pluggable transport (gRPC in production).
 //!
 //! An LRU cache reduces repeated remote lookups for hot keys.
+//!
+//! # Cache Coherency
+//!
+//! Cache entries are partition-keyed and invalidated when
+//! [`update_assignments`](RemoteStateProxy::update_assignments) detects
+//! an ownership change. However, invalidation is eventually consistent:
+//! a read between ownership transfer and the next `update_assignments`
+//! call may return data from the old owner. Callers that require
+//! linearizable reads after partition migration should call
+//! [`invalidate_partition`](RemoteStateProxy::invalidate_partition)
+//! explicitly.
 
 #![allow(clippy::disallowed_types)] // cold path: remote state configuration
 use std::collections::HashMap;

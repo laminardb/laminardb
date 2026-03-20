@@ -4,7 +4,8 @@
 //! orchestrates the transfer of partition state from the old owner
 //! to the new owner:
 //!
-//! 1. **Pause**: Old owner pauses processing for the partition
+//! 1. **Pause**: Old owner pauses processing for the partition and waits
+//!    up to `drain_timeout` for in-flight batches to finish processing.
 //! 2. **Snapshot**: Old owner serializes partition state to bytes
 //! 3. **Transfer**: State is sent to the new owner (via gRPC)
 //! 4. **Restore**: New owner deserializes and resumes processing
@@ -12,14 +13,29 @@
 //!
 //! The protocol is coordinated by the `DeltaManager` and uses
 //! `EpochGuard` fencing to ensure exactly-once ownership transitions.
+//!
+//! # Data Loss Window
+//!
+//! Batches in the coordinator pipeline at pause time may be lost if
+//! they have not been checkpointed. The `drain_timeout` on
+//! [`MigrationState`] bounds how long the pause phase waits for
+//! in-flight batches to drain before taking the snapshot. If the
+//! timeout expires, the snapshot proceeds and any uncheckpointed
+//! batches are silently dropped (at-most-once delivery).
 
 #![allow(clippy::disallowed_types)] // cold path: migration coordination
 use std::collections::HashMap;
 use std::fmt;
+use std::time::Duration;
 
 use super::assignment::PartitionMove;
 use super::guard::{EpochError, PartitionGuardSet};
 use crate::delta::discovery::NodeId;
+
+/// Default time to wait for in-flight batches to drain during the pause
+/// phase before taking the partition snapshot. 5 seconds is a conservative
+/// default; latency-sensitive deployments should tune this down.
+const DEFAULT_DRAIN_TIMEOUT: Duration = Duration::from_secs(5);
 
 /// Current phase of a partition migration.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -126,9 +142,23 @@ pub enum MigrationError {
     /// Source tried to complete before target confirmed restore.
     #[error("target has not confirmed restore for partition {0}")]
     NotRestoredOnTarget(u32),
+
+    /// The drain timeout expired before in-flight batches finished processing.
+    /// The snapshot proceeds, but uncheckpointed batches may be lost.
+    #[error(
+        "drain timeout expired for partition {0} — proceeding with snapshot (at-most-once gap)"
+    )]
+    DrainTimeout(u32),
 }
 
 /// Tracks the state of an in-progress partition migration.
+///
+/// The `drain_timeout` field controls how long the pause phase should
+/// wait for in-flight batches in the coordinator pipeline to finish
+/// before the snapshot is taken. If the timeout expires, the snapshot
+/// proceeds anyway and any uncheckpointed batches are silently
+/// dropped. See the [module-level docs](self) for the full data-loss
+/// window description.
 #[derive(Debug)]
 pub struct MigrationState {
     /// The partition move being executed.
@@ -137,6 +167,11 @@ pub struct MigrationState {
     pub phase: MigrationPhase,
     /// New epoch assigned for this migration.
     pub new_epoch: u64,
+    /// Maximum time to wait for in-flight batches to drain during the
+    /// Pausing phase before taking the snapshot. The runtime migration
+    /// driver should respect this timeout; if it elapses, the snapshot
+    /// proceeds with a [`MigrationError::DrainTimeout`] warning logged.
+    pub drain_timeout: Duration,
     /// Snapshot taken from the old owner (populated during Pausing phase).
     pub snapshot: Option<PartitionSnapshot>,
     /// Whether the target node has received the snapshot data.
@@ -148,13 +183,30 @@ pub struct MigrationState {
 }
 
 impl MigrationState {
-    /// Create a new migration state from a planned move.
+    /// Create a new migration state from a planned move with the
+    /// default drain timeout ([`DEFAULT_DRAIN_TIMEOUT`]).
     #[must_use]
     pub fn new(partition_move: PartitionMove, new_epoch: u64) -> Self {
+        Self::with_drain_timeout(partition_move, new_epoch, DEFAULT_DRAIN_TIMEOUT)
+    }
+
+    /// Create a new migration state with a custom drain timeout.
+    ///
+    /// The drain timeout controls how long the pause phase waits for
+    /// in-flight batches before taking the snapshot. Set to
+    /// [`Duration::ZERO`] to skip the drain wait entirely (at the cost
+    /// of a larger data-loss window).
+    #[must_use]
+    pub fn with_drain_timeout(
+        partition_move: PartitionMove,
+        new_epoch: u64,
+        drain_timeout: Duration,
+    ) -> Self {
         Self {
             partition_move,
             phase: MigrationPhase::Planned,
             new_epoch,
+            drain_timeout,
             snapshot: None,
             snapshot_received: false,
             target_restore_acked: false,
@@ -222,6 +274,17 @@ impl MigrationCoordinator {
     /// Raft leader to ensure global consistency. Only moves that involve this node
     /// (as source or target) are tracked.
     ///
+    /// # Epoch Source Requirement
+    ///
+    /// The `epochs` map **must** originate from the Raft leader's
+    /// monotonic epoch allocator. Standalone nodes (those not
+    /// participating in a Raft group) cannot safely call this method
+    /// because they lack distributed epoch consensus — two nodes could
+    /// independently assign the same epoch to different migrations,
+    /// breaking the fence invariant. If you are running a single-node
+    /// cluster, ensure the node is also the Raft leader before planning
+    /// migrations.
+    ///
     /// # Errors
     ///
     /// Returns [`MigrationError::MissingEpoch`] if any relevant partition move
@@ -245,6 +308,13 @@ impl MigrationCoordinator {
     }
 
     /// Begin the pause phase for a partition this node is giving up.
+    ///
+    /// After transitioning to `Pausing`, the caller should wait up to
+    /// `MigrationState::drain_timeout` for in-flight batches to drain
+    /// before calling [`record_snapshot`](Self::record_snapshot). If
+    /// the timeout elapses, the caller should log a
+    /// [`MigrationError::DrainTimeout`] warning and proceed — any
+    /// uncheckpointed batches are lost (at-most-once delivery).
     ///
     /// # Errors
     ///
@@ -411,6 +481,8 @@ impl MigrationCoordinator {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use std::time::Duration;
+
     use crate::delta::partition::assignment::PartitionMove;
 
     #[test]
@@ -619,5 +691,48 @@ mod tests {
             entry_count: 10,
         };
         assert_eq!(snapshot.data_size(), 1024);
+    }
+
+    #[test]
+    fn test_default_drain_timeout() {
+        let mv = PartitionMove {
+            partition_id: 0,
+            from: Some(NodeId(1)),
+            to: NodeId(2),
+        };
+        let state = MigrationState::new(mv, 5);
+        assert_eq!(state.drain_timeout, DEFAULT_DRAIN_TIMEOUT);
+        assert_eq!(state.drain_timeout, Duration::from_secs(5));
+    }
+
+    #[test]
+    fn test_custom_drain_timeout() {
+        let mv = PartitionMove {
+            partition_id: 0,
+            from: Some(NodeId(1)),
+            to: NodeId(2),
+        };
+        let custom = Duration::from_millis(500);
+        let state = MigrationState::with_drain_timeout(mv, 5, custom);
+        assert_eq!(state.drain_timeout, custom);
+    }
+
+    #[test]
+    fn test_zero_drain_timeout() {
+        let mv = PartitionMove {
+            partition_id: 0,
+            from: Some(NodeId(1)),
+            to: NodeId(2),
+        };
+        let state = MigrationState::with_drain_timeout(mv, 5, Duration::ZERO);
+        assert_eq!(state.drain_timeout, Duration::ZERO);
+    }
+
+    #[test]
+    fn test_drain_timeout_error_display() {
+        let err = MigrationError::DrainTimeout(7);
+        let msg = err.to_string();
+        assert!(msg.contains("partition 7"), "got: {msg}");
+        assert!(msg.contains("at-most-once"), "got: {msg}");
     }
 }
