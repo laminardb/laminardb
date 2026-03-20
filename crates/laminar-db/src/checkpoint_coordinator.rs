@@ -916,13 +916,14 @@ impl CheckpointCoordinator {
     #[must_use]
     pub fn stats(&self) -> CheckpointStats {
         let (p50, p95, p99) = self.duration_histogram.percentiles();
+        // Histogram stores microseconds; stats fields are milliseconds.
         CheckpointStats {
             completed: self.checkpoints_completed,
             failed: self.checkpoints_failed,
             last_duration: self.last_checkpoint_duration,
-            duration_p50_ms: p50,
-            duration_p95_ms: p95,
-            duration_p99_ms: p99,
+            duration_p50_ms: p50 / 1_000,
+            duration_p95_ms: p95 / 1_000,
+            duration_p99_ms: p99 / 1_000,
             total_bytes_written: self.total_bytes_written,
             current_phase: self.phase,
             current_epoch: self.epoch,
@@ -1332,13 +1333,13 @@ impl std::fmt::Debug for CheckpointCoordinator {
     }
 }
 
-/// Fixed-size ring buffer for checkpoint duration percentile tracking.
+/// Fixed-size ring buffer for duration percentile tracking.
 ///
-/// Stores the last `CAPACITY` checkpoint durations and computes p50/p95/p99
-/// via sorted extraction. No heap allocation after construction.
+/// Stores the last `CAPACITY` durations in **microseconds** and computes
+/// p50/p95/p99 via sorted extraction. No heap allocation after construction.
 #[derive(Clone)]
 pub struct DurationHistogram {
-    /// Ring buffer of durations in milliseconds.
+    /// Ring buffer of durations in microseconds.
     samples: Box<[u64; Self::CAPACITY]>,
     /// Write cursor (wraps at `CAPACITY`).
     cursor: usize,
@@ -1365,11 +1366,11 @@ impl DurationHistogram {
         }
     }
 
-    /// Records a checkpoint duration.
+    /// Records a duration sample (stored in microseconds).
     pub fn record(&mut self, duration: Duration) {
         #[allow(clippy::cast_possible_truncation)]
-        let ms = duration.as_millis() as u64;
-        self.samples[self.cursor] = ms;
+        let us = duration.as_micros() as u64;
+        self.samples[self.cursor] = us;
         self.cursor = (self.cursor + 1) % Self::CAPACITY;
         self.count += 1;
     }
@@ -1414,7 +1415,7 @@ impl DurationHistogram {
         sorted[idx]
     }
 
-    /// Returns (p50, p95, p99) in milliseconds.
+    /// Returns (p50, p95, p99) in microseconds.
     #[must_use]
     pub fn percentiles(&self) -> (u64, u64, u64) {
         (
@@ -1432,9 +1433,9 @@ impl std::fmt::Debug for DurationHistogram {
             .field("samples_len", &self.samples.len())
             .field("cursor", &self.cursor)
             .field("count", &self.count)
-            .field("p50_ms", &p50)
-            .field("p95_ms", &p95)
-            .field("p99_ms", &p99)
+            .field("p50_us", &p50)
+            .field("p95_us", &p95)
+            .field("p99_us", &p99)
             .finish()
     }
 }
@@ -1968,14 +1969,24 @@ mod tests {
         let mut h = DurationHistogram::new();
         h.record(Duration::from_millis(42));
         assert_eq!(h.len(), 1);
-        assert_eq!(h.percentile(0.50), 42);
-        assert_eq!(h.percentile(0.99), 42);
+        // 42ms = 42_000μs
+        assert_eq!(h.percentile(0.50), 42_000);
+        assert_eq!(h.percentile(0.99), 42_000);
+    }
+
+    #[test]
+    fn test_histogram_sub_millisecond() {
+        let mut h = DurationHistogram::new();
+        // 500μs — previously truncated to 0 with as_millis()
+        h.record(Duration::from_micros(500));
+        assert_eq!(h.percentile(0.50), 500);
+        assert_eq!(h.percentile(0.99), 500);
     }
 
     #[test]
     fn test_histogram_percentiles() {
         let mut h = DurationHistogram::new();
-        // Record 1..=100ms in order.
+        // Record 1..=100ms in order → 1000..=100_000 μs.
         for i in 1..=100 {
             h.record(Duration::from_millis(i));
         }
@@ -1985,11 +1996,11 @@ mod tests {
         let p95 = h.percentile(0.95);
         let p99 = h.percentile(0.99);
 
-        // With values 1..=100:
-        //   p50 ≈ 50, p95 ≈ 95, p99 ≈ 99
-        assert!((49..=51).contains(&p50), "p50={p50}");
-        assert!((94..=96).contains(&p95), "p95={p95}");
-        assert!((98..=100).contains(&p99), "p99={p99}");
+        // Values in μs: 1000..=100_000
+        //   p50 ≈ 50_000, p95 ≈ 95_000, p99 ≈ 99_000
+        assert!((49_000..=51_000).contains(&p50), "p50={p50}");
+        assert!((94_000..=96_000).contains(&p95), "p95={p95}");
+        assert!((98_000..=100_000).contains(&p99), "p99={p99}");
     }
 
     #[test]
@@ -2002,9 +2013,9 @@ mod tests {
         assert_eq!(h.len(), 100);
         assert_eq!(h.count, 150);
 
-        // Only samples 51..=150 remain in the buffer.
+        // Only samples 51..=150 remain in the buffer (51_000..=150_000 μs).
         let p50 = h.percentile(0.50);
-        assert!((99..=101).contains(&p50), "p50={p50}");
+        assert!((99_000..=101_000).contains(&p50), "p50={p50}");
     }
 
     // ── Sidecar threshold tests ──

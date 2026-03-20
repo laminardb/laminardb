@@ -93,6 +93,10 @@ pub struct KafkaSource {
     /// Each entry is `(topic, partition, high_watermark)` for lag computation.
     #[allow(clippy::type_complexity)]
     high_watermarks_rx: Option<tokio::sync::watch::Receiver<Vec<(Arc<str>, i32, i64)>>>,
+    /// Shared flag: `true` when the reader task has paused Kafka partitions
+    /// due to downstream backpressure. Used to re-pause newly assigned
+    /// partitions during rebalance.
+    reader_paused: Arc<AtomicBool>,
 }
 
 impl KafkaSource {
@@ -145,6 +149,7 @@ impl KafkaSource {
             offset_commit_tx: None,
             watermark_tracker,
             high_watermarks_rx: None,
+            reader_paused: Arc::new(AtomicBool::new(false)),
         }
     }
 
@@ -208,6 +213,7 @@ impl KafkaSource {
             offset_commit_tx: None,
             watermark_tracker,
             high_watermarks_rx: None,
+            reader_paused: Arc::new(AtomicBool::new(false)),
         }
     }
 
@@ -281,6 +287,10 @@ impl KafkaSource {
         let channel_len = Arc::clone(&self.channel_len);
         let capture_headers = self.config.include_headers;
         let broker_commit_interval = self.config.broker_commit_interval;
+        let reader_channel_capacity = self.config.reader_channel_capacity;
+        let reader_paused = Arc::clone(&self.reader_paused);
+        let pause_threshold = self.config.backpressure_high_watermark;
+        let resume_threshold = self.config.backpressure_low_watermark;
 
         // The reader task owns the consumer. On shutdown it commits the latest
         // offsets received via the offset_rx watch channel, then unsubscribes.
@@ -308,7 +318,40 @@ impl KafkaSource {
             let mut hwm_timer = tokio::time::interval(std::time::Duration::from_secs(30));
             hwm_timer.tick().await; // Skip the first tick.
 
+            let mut is_paused = false;
+
             loop {
+                // Check channel fill ratio for pause/resume of Kafka partitions.
+                // This keeps consumer.recv() calling rd_kafka_consumer_poll()
+                // even when paused, preventing max.poll.interval.ms violations.
+                #[allow(clippy::cast_precision_loss)]
+                let fill = if reader_channel_capacity > 0 {
+                    channel_len.load(Ordering::Relaxed) as f64 / reader_channel_capacity as f64
+                } else {
+                    0.0
+                };
+                if fill >= pause_threshold && !is_paused {
+                    if let Ok(assignment) = consumer.assignment() {
+                        if let Err(e) = consumer.pause(&assignment) {
+                            warn!(error = %e, "failed to pause Kafka partitions");
+                        } else {
+                            is_paused = true;
+                            reader_paused.store(true, Ordering::Relaxed);
+                            debug!("reader: paused Kafka partitions (fill={fill:.2})");
+                        }
+                    }
+                } else if fill <= resume_threshold && is_paused {
+                    if let Ok(assignment) = consumer.assignment() {
+                        if let Err(e) = consumer.resume(&assignment) {
+                            warn!(error = %e, "failed to resume Kafka partitions");
+                        } else {
+                            is_paused = false;
+                            reader_paused.store(false, Ordering::Relaxed);
+                            debug!("reader: resumed Kafka partitions (fill={fill:.2})");
+                        }
+                    }
+                }
+
                 let msg_result = tokio::select! {
                     biased;
                     _ = shutdown_rx.changed() => break,
@@ -355,7 +398,15 @@ impl KafkaSource {
                         }
                         continue;
                     },
-                    msg = consumer.recv() => msg,
+                    // Timeout ensures we re-check backpressure and timers even
+                    // when paused partitions yield no messages.
+                    msg = tokio::time::timeout(
+                        std::time::Duration::from_millis(200),
+                        consumer.recv(),
+                    ) => match msg {
+                        Ok(result) => result,
+                        Err(_timeout) => continue,
+                    },
                 };
                 match msg_result {
                     Ok(msg) => {
@@ -513,6 +564,7 @@ impl SourceConnector for KafkaSource {
             Arc::clone(&self.rebalance_state),
             Arc::clone(&self.rebalance_counter),
             Arc::clone(&self.revoke_generation),
+            Arc::clone(&self.reader_paused),
         );
         let consumer: StreamConsumer<LaminarConsumerContext> =
             rdkafka_config.create_with_context(context).map_err(|e| {

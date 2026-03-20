@@ -796,6 +796,7 @@ impl LaminarDB {
             drain_budget_ns: 1_000_000,      // 1ms
             query_budget_ns: 8_000_000,      // 8ms
             background_budget_ns: 5_000_000, // 5ms
+            sink_write_timeout: std::time::Duration::from_secs(30),
         };
 
         // Validate delivery guarantee constraints.
@@ -901,6 +902,8 @@ impl LaminarDB {
                 .map(std::time::Duration::from_millis),
             pipeline_hash,
             delivery_guarantee: pipeline_config.delivery_guarantee,
+            sink_write_timeout: pipeline_config.sink_write_timeout,
+            sink_timed_out: false,
             cycle_histogram: std::cell::RefCell::new(
                 crate::checkpoint_coordinator::DurationHistogram::new(),
             ),
