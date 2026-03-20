@@ -40,8 +40,9 @@ tracing = "0.1"
 tracing-subscriber = { version = "0.3", features = ["env-filter"] }
 chrono = "0.4"
 
-# Allocator
-tikv-jemallocator = "0.6"  # jemalloc for reduced fragmentation in Ring 1/2
+# Allocators
+tikv-jemallocator = "0.6"  # jemalloc for reduced fragmentation in Ring 1/2 (Unix)
+mimalloc = { version = "0.1", default-features = false }  # mimalloc for Windows MSVC
 
 # Performance-critical
 rustc-hash = "2.1"  # Faster than std HashMap (replaces unmaintained fxhash)
