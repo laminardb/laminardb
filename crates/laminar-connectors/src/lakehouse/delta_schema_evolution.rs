@@ -15,6 +15,27 @@
 //! additive changes (new nullable columns) pass through to delta-rs's
 //! `SchemaMode::Merge`. Breaking changes always produce errors regardless of
 //! the configuration.
+//!
+//! # Known Limitation: Concurrent Schema Evolution
+//!
+//! If two writers evolve the schema concurrently (e.g., writer A adds column
+//! `foo` while writer B adds column `bar`), the outcome depends on Delta Lake's
+//! log-level conflict resolution, not this connector. Delta Lake uses optimistic
+//! concurrency control at the transaction log level: whichever writer commits
+//! second will see the first writer's schema changes in the log and must
+//! reconcile. In practice, both additive columns will be merged by delta-rs's
+//! `SchemaMode::Merge`. However, if both writers try to add the same column
+//! with different types, the second writer's commit will fail with a conflict.
+//! This connector does NOT detect or prevent cross-writer schema races — that
+//! responsibility belongs to the Delta Lake protocol layer.
+//!
+//! # Known Limitation: Column Type Widening
+//!
+//! Type changes (e.g., Int32 -> Int64) are always rejected as breaking changes.
+//! While Parquet/Arrow support safe numeric widening, Delta Lake's schema
+//! evolution protocol does not distinguish safe widenings from arbitrary type
+//! changes. If type widening is needed, the table schema should be pre-created
+//! with the wider type, or the source should cast before writing.
 
 use arrow_schema::{DataType, SchemaRef};
 use tracing::info;
@@ -379,5 +400,67 @@ mod tests {
         let msg = err.unwrap_err().to_string();
         assert!(msg.contains("incompatible schema change"));
         assert!(msg.contains("name"));
+    }
+
+    // ── Type widening edge case tests ──
+
+    /// Int32 -> Int64 is a safe numeric widening in Parquet/Arrow, but Delta Lake
+    /// schema evolution treats ALL type changes as breaking. This test documents
+    /// that behavior: even "safe" widenings are rejected. If type widening is
+    /// needed, the table should be pre-created with the wider type.
+    #[test]
+    fn test_type_widening_int32_to_int64_rejected() {
+        let table = schema(&[
+            ("id", DataType::Int32, false),
+            ("value", DataType::Int32, true),
+        ]);
+        let batch = schema(&[
+            ("id", DataType::Int32, false),
+            ("value", DataType::Int64, true), // widened
+        ]);
+
+        // validate_schema_evolution should detect the type change.
+        let result = validate_schema_evolution(&table, &batch);
+        assert_eq!(result.changes.len(), 1);
+        assert!(!result.is_additive_only);
+        assert_eq!(result.breaking_reasons.len(), 1);
+        assert!(result.breaking_reasons[0].contains("type changed"));
+        assert!(result.breaking_reasons[0].contains("value"));
+
+        // Verify the change captures the correct types.
+        match &result.changes[0] {
+            DeltaSchemaChange::TypeChanged {
+                name,
+                table_type,
+                batch_type,
+            } => {
+                assert_eq!(name, "value");
+                assert_eq!(*table_type, DataType::Int32);
+                assert_eq!(*batch_type, DataType::Int64);
+            }
+            other => panic!("expected TypeChanged, got {other:?}"),
+        }
+
+        // check_schema_compatibility should reject even with evolution enabled.
+        let err = check_schema_compatibility(&table, &batch, true);
+        assert!(err.is_err());
+        let msg = err.unwrap_err().to_string();
+        assert!(msg.contains("incompatible schema change"));
+        assert!(msg.contains("type changed"));
+    }
+
+    /// Float32 -> Float64 is another common widening that must be rejected.
+    #[test]
+    fn test_type_widening_float32_to_float64_rejected() {
+        let table = schema(&[("price", DataType::Float32, true)]);
+        let batch = schema(&[("price", DataType::Float64, true)]);
+
+        let result = validate_schema_evolution(&table, &batch);
+        assert!(!result.is_additive_only);
+        assert_eq!(result.breaking_reasons.len(), 1);
+        assert!(result.breaking_reasons[0].contains("type changed"));
+
+        let err = check_schema_compatibility(&table, &batch, true);
+        assert!(err.is_err());
     }
 }

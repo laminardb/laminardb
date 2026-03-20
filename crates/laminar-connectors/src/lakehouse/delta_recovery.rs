@@ -23,6 +23,16 @@
 //!
 //! The age threshold prevents deleting files from an in-flight concurrent writer
 //! that hasn't committed yet.
+//!
+//! # Edge Case: Corrupted Delta Log
+//!
+//! If the Delta log itself is corrupted (missing/truncated checkpoint files,
+//! invalid JSON entries in `_delta_log/`), `snapshot()` will fail and we cannot
+//! determine which Parquet files are referenced. In this case, recovery skips
+//! orphan cleanup entirely and returns a degraded result rather than crashing
+//! the sink. The operator should repair the Delta log (e.g., via
+//! `FSCK REPAIR TABLE` in Spark, or by restoring from a backup) and then
+//! restart the sink to complete orphan cleanup.
 
 use std::collections::HashSet;
 use std::time::Duration;
@@ -100,7 +110,27 @@ pub async fn recover_delta_table(
     let last_committed_epoch = delta_io::get_last_committed_epoch(table, writer_id).await;
 
     // Step 2: Collect all Parquet files referenced in the current snapshot.
-    let referenced_files = collect_referenced_files(table)?;
+    // Guard: if the Delta log is corrupted and snapshot() fails, skip orphan
+    // cleanup entirely rather than crashing the sink. The epoch metadata is
+    // already resolved above (it uses a separate code path), so the sink can
+    // still resume writes — it just won't clean up orphan files this time.
+    let referenced_files = match collect_referenced_files(table) {
+        Ok(files) => files,
+        Err(e) => {
+            warn!(
+                writer_id,
+                error = %e,
+                "Delta log snapshot failed during recovery — skipping orphan cleanup. \
+                 The Delta log may be corrupted. Repair it (e.g., FSCK REPAIR TABLE) \
+                 and restart the sink to complete orphan cleanup."
+            );
+            return Ok(RecoveryResult {
+                orphans_detected: 0,
+                orphans_deleted: 0,
+                last_committed_epoch,
+            });
+        }
+    };
 
     // Step 3: List all Parquet files in the table directory.
     let all_files = list_parquet_files(table).await?;

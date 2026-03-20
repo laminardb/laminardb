@@ -691,6 +691,21 @@ impl DeltaLakeSink {
 ///
 /// Opens its own `DeltaTable` handle (no shared state with the sink).
 /// Reports compaction and vacuum metrics via the shared `DeltaLakeSinkMetrics`.
+///
+/// # Interaction with 2PC
+///
+/// Compaction must NOT run during a 2PC epoch commit. Because compaction uses
+/// its own independent `DeltaTable` handle, it commits its own Delta log
+/// entries (OPTIMIZE, VACUUM) independently of the sink's epoch commits.
+/// If compaction rewrites files that the sink is about to reference in a
+/// `commit_epoch()`, the sink's commit will fail with an optimistic
+/// concurrency conflict and retry (see `max_commit_retries` in config).
+///
+/// In practice, the `check_interval` (default: 1 hour) makes collisions
+/// rare. If they do occur, the retry logic in `commit_epoch()` handles
+/// them transparently. However, operators running very frequent compaction
+/// (e.g., every few seconds for testing) should be aware that this
+/// increases the retry rate during epoch commits.
 #[cfg(feature = "delta-lake")]
 async fn compaction_loop(
     table_path: String,
