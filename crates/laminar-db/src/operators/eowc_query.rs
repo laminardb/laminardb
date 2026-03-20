@@ -23,7 +23,7 @@ use crate::core_window_state::{CoreWindowCheckpoint, CoreWindowState};
 use crate::eowc_state::IncrementalEowcState;
 use crate::error::DbError;
 use crate::metrics::PipelineCounters;
-use crate::operator_graph::{evaluate_compiled_on_batches, GraphOperator, OperatorCheckpoint};
+use crate::operator_graph::{try_evaluate_compiled, GraphOperator, OperatorCheckpoint};
 use crate::stream_executor::compute_closed_boundary;
 use laminar_sql::parser::EmitClause;
 use laminar_sql::translator::WindowOperatorConfig;
@@ -32,8 +32,6 @@ use laminar_sql::translator::WindowOperatorConfig;
 /// Prevents unbounded memory growth when windows fail to close or late
 /// data keeps arriving. Matches `StreamExecutor::MAX_EOWC_ACCUMULATED_ROWS`.
 const MAX_EOWC_ACCUMULATED_ROWS: usize = 1_000_000;
-
-// ── Checkpoint envelope ─────────────────────────────────────────────────
 
 /// Wrapper for checkpoint data that discriminates between state variants.
 #[derive(serde::Serialize, serde::Deserialize)]
@@ -47,67 +45,41 @@ enum EowcCheckpointEnvelope {
     Raw,
 }
 
-// ── State enum ──────────────────────────────────────────────────────────
-
 /// Lazy-initialized EOWC state. The variant is chosen on the first
 /// `process()` call by probing the SQL plan.
 enum EowcInnerState {
-    /// Not yet initialized.
     Uninit,
-    /// Routed through the core engine's canonical window assigners.
     CoreWindow(CoreWindowState),
-    /// Incremental per-window accumulators (hopping/tumbling aggregate).
     EowcAgg(IncrementalEowcState),
     /// Non-aggregate EOWC: accumulate batches and replay via SQL when
-    /// windows close. Single `Vec` (not per-source) — multi-source raw
-    /// EOWC is rare; aggregate paths handle it correctly.
+    /// windows close.
     Raw {
-        /// Accumulated input batches (not yet emitted).
         accumulated: Vec<RecordBatch>,
-        /// The last closed-window boundary that was emitted.
         last_closed_boundary: i64,
-        /// Total accumulated rows (for diagnostics).
         accumulated_rows: usize,
     },
 }
 
-// ── Operator ────────────────────────────────────────────────────────────
-
 /// EOWC query operator: suppresses intermediate results and emits only
 /// when windows close.
 pub(crate) struct EowcQueryOperator {
-    /// Operator name (query name).
     op_name: Arc<str>,
-    /// Original SQL text.
     sql: Arc<str>,
-    /// Emit clause (`OnWindowClose` or `Final`).
     emit_clause: Option<EmitClause>,
-    /// Window configuration (size, slide, gap, time column).
     window_config: Option<WindowOperatorConfig>,
-    /// Shared `DataFusion` session context.
     ctx: SessionContext,
-    /// Pipeline counters for monitoring.
-    #[allow(dead_code)]
-    counters: Option<Arc<PipelineCounters>>,
-    /// Inner state (lazy-initialized on first process call).
     state: EowcInnerState,
-    /// Deferred checkpoint to apply after `initialize()` creates the state.
     pending_restore: Option<EowcCheckpointEnvelope>,
 }
 
 impl EowcQueryOperator {
-    /// Create a new EOWC query operator.
-    ///
-    /// State initialization is deferred to the first `process()` call
-    /// because `try_from_sql` is async and requires source tables to be
-    /// registered in the session context.
     pub fn new(
         name: &str,
         sql: &str,
         emit_clause: Option<EmitClause>,
         window_config: Option<WindowOperatorConfig>,
         ctx: SessionContext,
-        counters: Option<Arc<PipelineCounters>>,
+        _counters: Option<Arc<PipelineCounters>>,
     ) -> Self {
         Self {
             op_name: Arc::from(name),
@@ -115,7 +87,6 @@ impl EowcQueryOperator {
             emit_clause,
             window_config,
             ctx,
-            counters,
             state: EowcInnerState::Uninit,
             pending_restore: None,
         }
@@ -248,9 +219,26 @@ impl EowcQueryOperator {
         op_name: &str,
         ctx: &SessionContext,
     ) -> Result<Vec<RecordBatch>, DbError> {
-        // Pre-aggregation
+        // Pre-aggregation — use try_evaluate_compiled to detect errors instead
+        // of silently dropping failing batches, which would corrupt window aggregates.
         let pre_agg_batches = if let Some(proj) = cw.compiled_projection() {
-            evaluate_compiled_on_batches(proj, inputs)
+            match try_evaluate_compiled(proj, inputs) {
+                Ok(result) => result,
+                Err(e) => {
+                    tracing::debug!(
+                        query = %op_name,
+                        error = %e,
+                        "EOWC compiled pre-agg failed, falling back to cached plan"
+                    );
+                    if let Some(plan) = cw.cached_pre_agg_plan() {
+                        execute_cached_plan(ctx, op_name, plan).await?
+                    } else {
+                        return Err(DbError::Pipeline(format!(
+                            "[LDB-8051] EOWC query '{op_name}': compiled pre-agg failed and no cached plan: {e}"
+                        )));
+                    }
+                }
+            }
         } else if let Some(plan) = cw.cached_pre_agg_plan() {
             execute_cached_plan(ctx, op_name, plan).await?
         } else {
@@ -286,9 +274,25 @@ impl EowcQueryOperator {
         op_name: &str,
         ctx: &SessionContext,
     ) -> Result<Vec<RecordBatch>, DbError> {
-        // Pre-aggregation
+        // Pre-aggregation — same try+fallback pattern as CoreWindow path.
         let pre_agg_batches = if let Some(proj) = eowc.compiled_projection() {
-            evaluate_compiled_on_batches(proj, inputs)
+            match try_evaluate_compiled(proj, inputs) {
+                Ok(result) => result,
+                Err(e) => {
+                    tracing::debug!(
+                        query = %op_name,
+                        error = %e,
+                        "EOWC-agg compiled pre-agg failed, falling back to cached plan"
+                    );
+                    if let Some(plan) = eowc.cached_pre_agg_plan() {
+                        execute_cached_plan(ctx, op_name, plan).await?
+                    } else {
+                        return Err(DbError::Pipeline(format!(
+                            "[LDB-8051] EOWC query '{op_name}': compiled pre-agg failed and no cached plan: {e}"
+                        )));
+                    }
+                }
+            }
         } else if let Some(plan) = eowc.cached_pre_agg_plan() {
             execute_cached_plan(ctx, op_name, plan).await?
         } else {
@@ -472,7 +476,20 @@ impl GraphOperator for EowcQueryOperator {
 
     fn checkpoint(&mut self) -> Result<Option<OperatorCheckpoint>, DbError> {
         let envelope = match &mut self.state {
-            EowcInnerState::Uninit => return Ok(None),
+            EowcInnerState::Uninit => {
+                // If we have a pending restore, re-serialize it so a
+                // restore->checkpoint cycle before first process() preserves data.
+                if let Some(ref env) = self.pending_restore {
+                    let data = serde_json::to_vec(env).map_err(|e| {
+                        DbError::Pipeline(format!(
+                            "EOWC checkpoint serialization of pending restore for '{}': {e}",
+                            self.op_name
+                        ))
+                    })?;
+                    return Ok(Some(OperatorCheckpoint { data }));
+                }
+                return Ok(None);
+            }
             EowcInnerState::CoreWindow(ref mut cw) => {
                 let cp = cw.checkpoint_windows()?;
                 EowcCheckpointEnvelope::CoreWindow(cp)
@@ -495,7 +512,7 @@ impl GraphOperator for EowcQueryOperator {
             ))
         })?;
 
-        Ok(Some(OperatorCheckpoint { version: 1, data }))
+        Ok(Some(OperatorCheckpoint { data }))
     }
 
     fn restore(&mut self, checkpoint: OperatorCheckpoint) -> Result<(), DbError> {
@@ -543,21 +560,7 @@ impl GraphOperator for EowcQueryOperator {
             }
         }
     }
-
-    fn is_compiled(&self) -> bool {
-        match &self.state {
-            EowcInnerState::CoreWindow(cw) => cw.compiled_projection().is_some(),
-            EowcInnerState::EowcAgg(eowc) => eowc.compiled_projection().is_some(),
-            _ => false,
-        }
-    }
-
-    fn name(&self) -> &str {
-        &self.op_name
-    }
 }
-
-// ── Helpers ─────────────────────────────────────────────────────────────
 
 /// Execute a cached logical plan via `DataFusion`.
 async fn execute_cached_plan(
@@ -600,13 +603,13 @@ async fn apply_having_via_sql(
         .map_err(|e| DbError::query_pipeline(query_name, &e))?;
 
     let having_query = format!("SELECT * FROM \"{temp_name}\" WHERE {having_sql}");
-    let result = ctx
-        .sql(&having_query)
-        .await
-        .map_err(|e| DbError::query_pipeline(query_name, &e))?
-        .collect()
-        .await
-        .map_err(|e| DbError::query_pipeline(query_name, &e));
+    let result = match ctx.sql(&having_query).await {
+        Ok(df) => df
+            .collect()
+            .await
+            .map_err(|e| DbError::query_pipeline(query_name, &e)),
+        Err(e) => Err(DbError::query_pipeline(query_name, &e)),
+    };
 
     let _ = ctx.deregister_table(&temp_name);
     result
@@ -695,7 +698,7 @@ mod tests {
             ctx,
             None,
         );
-        assert_eq!(op.name(), "test_eowc");
+        assert_eq!(&*op.op_name, "test_eowc");
         assert!(matches!(op.state, EowcInnerState::Uninit));
     }
 
@@ -752,7 +755,7 @@ mod tests {
             accumulated_rows: 0,
         };
         let cp = op.checkpoint().unwrap().unwrap();
-        assert_eq!(cp.version, 1);
+        assert!(!cp.data.is_empty());
 
         // Restore should succeed (Raw checkpoint is a no-op)
         op.restore(cp).unwrap();

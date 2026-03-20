@@ -34,106 +34,47 @@ use laminar_sql::translator::{
     OrderOperatorConfig, TemporalJoinTranslatorConfig, WindowOperatorConfig,
 };
 
-// ── Core Trait ──────────────────────────────────────────────────────────
-
-/// Operator trait — each node in the graph implements this.
-///
-/// `async` because some operators (`DataFusion` fallback, temporal join lookup)
-/// need await. Sync operators pay near-zero overhead (immediately-resolved futures).
-/// Hot-path operators (`CompiledProjection`, `IncrementalAgg`) resolve immediately.
 #[async_trait]
 pub(crate) trait GraphOperator: Send {
-    /// Process input batches, produce output batches.
-    ///
-    /// `inputs[i]` = batches from i-th input edge.
-    /// Single-input operators: `inputs.len() == 1`
-    /// Join operators: `inputs.len() == 2` (left=0, right=1)
     async fn process(
         &mut self,
         inputs: &[Vec<RecordBatch>],
         watermark: i64,
     ) -> Result<Vec<RecordBatch>, DbError>;
 
-    /// Checkpoint operator state. Returns `None` if stateless.
     fn checkpoint(&mut self) -> Result<Option<OperatorCheckpoint>, DbError>;
-
-    /// Restore operator state from checkpoint.
     fn restore(&mut self, checkpoint: OperatorCheckpoint) -> Result<(), DbError>;
 
-    /// Estimated state size in bytes (for monitoring/limits).
     fn estimated_state_bytes(&self) -> usize {
         0
     }
-
-    /// Whether this operator uses a fully compiled path (no SQL/MemTable needed).
-    ///
-    /// When all operators return `true`, the graph can skip `register_source_tables()`.
-    fn is_compiled(&self) -> bool {
-        false
-    }
-
-    /// Operator name for diagnostics.
-    #[allow(dead_code)]
-    fn name(&self) -> &str;
 }
 
-// ── Checkpoint Types ────────────────────────────────────────────────────
-
-/// Serialized operator state.
 pub(crate) struct OperatorCheckpoint {
-    /// Format version.
-    #[allow(dead_code)]
-    pub version: u32,
-    /// Serialized state bytes (operator-specific format).
     pub data: Vec<u8>,
 }
 
-/// Graph-level checkpoint: map of `operator_name` → serialized state.
 #[derive(Serialize, Deserialize)]
 pub(crate) struct GraphCheckpoint {
-    /// Format version.
     pub version: u32,
-    /// Per-operator state, keyed by operator name.
     pub operators: FxHashMap<String, Vec<u8>>,
 }
 
-// Compile-time assertion: GraphCheckpoint must be Send.
-const _: () = {
-    const fn assert_send<T: Send>() {}
-    assert_send::<GraphCheckpoint>();
-};
-
-// ── Graph Types ─────────────────────────────────────────────────────────
-
-/// A node in the operator graph.
 struct GraphNode {
-    /// Node name (query name or source name).
     name: Arc<str>,
-    /// The operator implementation.
     operator: Box<dyn GraphOperator>,
-    /// Number of input ports.
     input_port_count: usize,
-    /// For output port 0: list of `(target_node, target_port)`.
     output_routes: Vec<(usize, u8)>,
-    /// Whether this node has been removed (tombstone).
     removed: bool,
 }
 
-/// An edge in the operator graph.
-#[allow(dead_code)] // Fields used for graph construction; routing via output_routes.
 struct GraphEdge {
     source: usize,
-    source_port: u8,
     target: usize,
-    target_port: u8,
 }
-
-// ── SourcePassthrough ───────────────────────────────────────────────────
 
 /// Passes input batches through unchanged. Used for source injection nodes.
-struct SourcePassthrough {
-    op_name: Arc<str>,
-}
+struct SourcePassthrough;
 
 #[async_trait]
 impl GraphOperator for SourcePassthrough {
@@ -152,20 +93,9 @@ impl GraphOperator for SourcePassthrough {
     fn restore(&mut self, _checkpoint: OperatorCheckpoint) -> Result<(), DbError> {
         Ok(())
     }
-
-    fn is_compiled(&self) -> bool {
-        true // Passthrough doesn't need MemTables.
-    }
-
-    fn name(&self) -> &str {
-        &self.op_name
-    }
 }
 
-/// Placeholder for removed query nodes.
-struct TombstonedOperator {
-    op_name: Arc<str>,
-}
+struct TombstonedOperator;
 
 #[async_trait]
 impl GraphOperator for TombstonedOperator {
@@ -184,70 +114,30 @@ impl GraphOperator for TombstonedOperator {
     fn restore(&mut self, _checkpoint: OperatorCheckpoint) -> Result<(), DbError> {
         Ok(())
     }
-
-    fn is_compiled(&self) -> bool {
-        true // Tombstoned nodes are removed; don't block the optimization.
-    }
-
-    fn name(&self) -> &str {
-        &self.op_name
-    }
 }
 
-// ── OperatorGraph ───────────────────────────────────────────────────────
-
-/// Execution graph for streaming SQL queries.
-///
-/// Replaces `StreamExecutor` with a graph of independent operator nodes.
-/// Each operator owns its state and execution logic. The graph manages
-/// topology and data routing between operators.
 pub(crate) struct OperatorGraph {
-    /// All nodes in the graph.
     nodes: Vec<GraphNode>,
-    /// All edges.
     edges: Vec<GraphEdge>,
-    /// Topological execution order (node indices).
     topo_order: Vec<usize>,
-    /// When true, `topo_order` must be recomputed.
     topo_dirty: bool,
-    /// `source_name` → `node_id` (for injecting external batches).
     source_map: FxHashMap<Arc<str>, usize>,
-    /// `stream_name` → `node_id` (for collecting output results).
     output_map: FxHashMap<Arc<str>, usize>,
-    /// Per-node input buffers: `input_bufs[node_id][port]` = batches.
     input_bufs: Vec<Vec<Vec<RecordBatch>>>,
-    /// Per-query budget in nanoseconds.
     query_budget_ns: u64,
-    /// Node IDs skipped last cycle (priority next cycle).
-    skipped_last_cycle: FxHashSet<usize>,
-    /// Max state bytes per operator (`None` = unlimited).
     max_state_bytes: Option<usize>,
-    /// Shared `SessionContext` for operator initialization and `MemTable`.
     ctx: SessionContext,
-    /// Shared pipeline counters.
     counters: Option<Arc<PipelineCounters>>,
-    /// Shared lookup registry for temporal joins.
     lookup_registry: Option<Arc<laminar_sql::datafusion::LookupTableRegistry>>,
-    /// Known source schemas (for empty table placeholders).
     source_schemas: FxHashMap<String, SchemaRef>,
-    /// Temporal join configs (for `temporal_join_configs()` method).
     temporal_configs: Vec<TemporalJoinTranslatorConfig>,
-    /// Node IDs that depend on other queries (for graceful error skipping).
     depends_on_stream: FxHashSet<usize>,
-    /// Order configs per `node_id` (for Top-K post-filtering).
     order_configs: FxHashMap<usize, OrderOperatorConfig>,
-    /// Tracks which temporary source tables are registered (for cleanup).
     registered_sources: Vec<String>,
-    /// Reusable per-cycle intermediate table name list.
     cycle_intermediates: Vec<String>,
-    /// Lazily determined: `Some(true)` when all operators use compiled paths,
-    /// allowing `register_source_tables()` to be skipped. `None` = not yet
-    /// determined.
-    all_queries_compiled: Option<bool>,
 }
 
 impl OperatorGraph {
-    /// Create a new operator graph with the given `SessionContext`.
     pub fn new(ctx: SessionContext) -> Self {
         Self {
             nodes: Vec::new(),
@@ -258,7 +148,6 @@ impl OperatorGraph {
             output_map: FxHashMap::default(),
             input_bufs: Vec::new(),
             query_budget_ns: 8_000_000,
-            skipped_last_cycle: FxHashSet::default(),
             max_state_bytes: None,
             ctx,
             counters: None,
@@ -269,26 +158,21 @@ impl OperatorGraph {
             order_configs: FxHashMap::default(),
             registered_sources: Vec::new(),
             cycle_intermediates: Vec::new(),
-            all_queries_compiled: None,
         }
     }
 
-    /// Set the maximum state bytes per operator before the query fails.
     pub fn set_max_state_bytes(&mut self, limit: Option<usize>) {
         self.max_state_bytes = limit;
     }
 
-    /// Set the per-query execution budget in nanoseconds.
     pub fn set_query_budget_ns(&mut self, ns: u64) {
         self.query_budget_ns = ns;
     }
 
-    /// Set shared pipeline counters for fallback monitoring.
     pub fn set_counters(&mut self, c: Arc<PipelineCounters>) {
         self.counters = Some(c);
     }
 
-    /// Set the lookup table registry for versioned temporal join lookups.
     pub fn set_lookup_registry(
         &mut self,
         registry: Arc<laminar_sql::datafusion::LookupTableRegistry>,
@@ -308,9 +192,6 @@ impl OperatorGraph {
         self.temporal_configs.clone()
     }
 
-    // ── Graph Construction ──────────────────────────────────────────────
-
-    /// Find a non-removed node by name.
     fn find_node(&self, name: &str) -> Option<usize> {
         self.nodes
             .iter()
@@ -327,9 +208,7 @@ impl OperatorGraph {
         let name: Arc<str> = Arc::from(table_name);
         self.nodes.push(GraphNode {
             name: Arc::clone(&name),
-            operator: Box::new(SourcePassthrough {
-                op_name: Arc::clone(&name),
-            }),
+            operator: Box::new(SourcePassthrough),
             input_port_count: 1,
             output_routes: Vec::new(),
             removed: false,
@@ -339,14 +218,8 @@ impl OperatorGraph {
         node_id
     }
 
-    /// Add an edge between two nodes.
-    fn add_edge(&mut self, source: usize, source_port: u8, target: usize, target_port: u8) {
-        self.edges.push(GraphEdge {
-            source,
-            source_port,
-            target,
-            target_port,
-        });
+    fn add_edge(&mut self, source: usize, target: usize, target_port: u8) {
+        self.edges.push(GraphEdge { source, target });
         self.nodes[source].output_routes.push((target, target_port));
     }
 
@@ -454,13 +327,13 @@ impl OperatorGraph {
                 let right_id = self
                     .find_node(&asof_cfg.right_table)
                     .expect("source ensured");
-                self.add_edge(left_id, 0, node_id, 0);
-                self.add_edge(right_id, 0, node_id, 1);
+                self.add_edge(left_id, node_id, 0);
+                self.add_edge(right_id, node_id, 1);
             } else if let Some(ref sjc) = stream_join_config {
                 let left_id = self.find_node(&sjc.left_table).expect("source ensured");
                 let right_id = self.find_node(&sjc.right_table).expect("source ensured");
-                self.add_edge(left_id, 0, node_id, 0);
-                self.add_edge(right_id, 0, node_id, 1);
+                self.add_edge(left_id, node_id, 0);
+                self.add_edge(right_id, node_id, 1);
             } else {
                 for table_ref in &table_refs {
                     let upstream_id = self.find_node(table_ref).expect("source ensured");
@@ -469,7 +342,7 @@ impl OperatorGraph {
                         .iter()
                         .any(|&(t, p)| t == node_id && p == 0);
                     if !already_connected {
-                        self.add_edge(upstream_id, 0, node_id, 0);
+                        self.add_edge(upstream_id, node_id, 0);
                     }
                 }
             }
@@ -533,8 +406,8 @@ impl OperatorGraph {
             let right_id = self
                 .find_node(&asof_cfg.right_table)
                 .expect("source node ensured above");
-            self.add_edge(left_id, 0, node_id, 0);
-            self.add_edge(right_id, 0, node_id, 1);
+            self.add_edge(left_id, node_id, 0);
+            self.add_edge(right_id, node_id, 1);
         } else if let Some(ref sjc) = stream_join_config {
             let left_id = self
                 .find_node(&sjc.left_table)
@@ -542,14 +415,14 @@ impl OperatorGraph {
             let right_id = self
                 .find_node(&sjc.right_table)
                 .expect("source node ensured above");
-            self.add_edge(left_id, 0, node_id, 0);
-            self.add_edge(right_id, 0, node_id, 1);
+            self.add_edge(left_id, node_id, 0);
+            self.add_edge(right_id, node_id, 1);
         } else if let Some(ref tc) = temporal_config {
             // Temporal join: only wire stream table to port 0.
             let stream_id = self
                 .find_node(&tc.stream_table)
                 .expect("source node ensured above");
-            self.add_edge(stream_id, 0, node_id, 0);
+            self.add_edge(stream_id, node_id, 0);
             if self.output_map.contains_key(tc.stream_table.as_str()) {
                 self.depends_on_stream.insert(node_id);
             }
@@ -565,7 +438,7 @@ impl OperatorGraph {
                     .iter()
                     .any(|&(t, p)| t == node_id && p == 0);
                 if !already_connected {
-                    self.add_edge(upstream_id, 0, node_id, 0);
+                    self.add_edge(upstream_id, node_id, 0);
                 }
                 if self.output_map.contains_key(table_ref.as_str()) {
                     depends_on_query = true;
@@ -659,9 +532,7 @@ impl OperatorGraph {
 
         // Tombstone the node
         self.nodes[node_id].removed = true;
-        self.nodes[node_id].operator = Box::new(TombstonedOperator {
-            op_name: Arc::from(name),
-        });
+        self.nodes[node_id].operator = Box::new(TombstonedOperator);
 
         // Remove from output map
         self.output_map.remove(name);
@@ -678,8 +549,6 @@ impl OperatorGraph {
 
         self.topo_dirty = true;
     }
-
-    // ── Topological Order ───────────────────────────────────────────────
 
     /// Recompute topological order using Kahn's algorithm.
     fn compute_topo_order(&mut self) {
@@ -746,8 +615,6 @@ impl OperatorGraph {
         self.topo_dirty = false;
     }
 
-    // ── Execute Cycle ───────────────────────────────────────────────────
-
     /// Register source batches as temporary `MemTable` providers.
     fn register_source_tables(
         &mut self,
@@ -804,23 +671,7 @@ impl OperatorGraph {
             self.compute_topo_order();
         }
 
-        // Determine if all operators use compiled paths. When true, skip
-        // MemTable registration since compiled projections read from input
-        // buffers directly. Re-evaluated every cycle because operators can
-        // transition from Compiled → CachedPlan at runtime (e.g., type mismatch
-        // fallback), which would require MemTable registration again.
-        {
-            let all_compiled = self
-                .nodes
-                .iter()
-                .all(|n| n.removed || n.operator.is_compiled());
-            self.all_queries_compiled = Some(all_compiled);
-        }
-
-        // Register source tables as MemTables for DataFusion operators
-        if self.all_queries_compiled != Some(true) {
-            self.register_source_tables(source_batches)?;
-        }
+        self.register_source_tables(source_batches)?;
 
         // Inject source batches into source node input buffers
         for (name, batches) in source_batches {
@@ -833,7 +684,6 @@ impl OperatorGraph {
         let mut intermediate_tables = std::mem::take(&mut self.cycle_intermediates);
         intermediate_tables.clear();
 
-        self.skipped_last_cycle.clear();
         let cycle_start = std::time::Instant::now();
         let topo_len = self.topo_order.len();
 
@@ -850,9 +700,6 @@ impl OperatorGraph {
                 #[allow(clippy::cast_possible_truncation)]
                 let elapsed_ns = cycle_start.elapsed().as_nanos() as u64;
                 if elapsed_ns > self.query_budget_ns {
-                    for j in i..topo_len {
-                        self.skipped_last_cycle.insert(self.topo_order[j]);
-                    }
                     tracing::debug!(
                         skipped = topo_len - i,
                         elapsed_ms = elapsed_ns / 1_000_000,
@@ -907,7 +754,7 @@ impl OperatorGraph {
                     }
                     self.cycle_intermediates = intermediate_tables;
                     return Err(DbError::Pipeline(format!(
-                        "state size limit exceeded for query '{}' ({size} bytes > {limit} limit)",
+                        "state size limit exceeded for query '{}' ({size} bytes >= {limit} limit)",
                         self.nodes[node_id].name
                     )));
                 }
@@ -977,9 +824,7 @@ impl OperatorGraph {
         }
 
         // Cleanup
-        if self.all_queries_compiled != Some(true) {
-            self.cleanup_source_tables();
-        }
+        self.cleanup_source_tables();
         for name in &intermediate_tables {
             let _ = self.ctx.deregister_table(name);
         }
@@ -987,8 +832,6 @@ impl OperatorGraph {
 
         Ok(results)
     }
-
-    // ── Checkpoint ──────────────────────────────────────────────────────
 
     /// Snapshot all operator state into a `GraphCheckpoint`.
     ///
@@ -1021,7 +864,6 @@ impl OperatorGraph {
             }
             if let Some(bytes) = checkpoint.operators.get(&*node.name) {
                 node.operator.restore(OperatorCheckpoint {
-                    version: checkpoint.version,
                     data: bytes.clone(),
                 })?;
                 restored += 1;
@@ -1043,48 +885,12 @@ impl OperatorGraph {
         })?;
         self.restore_state(&checkpoint)
     }
-
-    /// Register a static table in the underlying `SessionContext` (for tests).
-    #[cfg(test)]
-    pub fn register_table(&self, name: &str, batch: RecordBatch) -> Result<(), DbError> {
-        let schema = batch.schema();
-        let mem_table = datafusion::datasource::MemTable::try_new(schema, vec![vec![batch]])
-            .map_err(|e| DbError::query_pipeline(name, &e))?;
-        self.ctx
-            .register_table(name, Arc::new(mem_table))
-            .map_err(|e| DbError::query_pipeline(name, &e))?;
-        Ok(())
-    }
-}
-
-// ── Helpers ─────────────────────────────────────────────────────────────
-
-/// Evaluate a `CompiledProjection` directly on input batches (no `MemTable`).
-///
-/// Errors are silently skipped — appropriate for pre-agg paths where partial
-/// failures are tolerable.
-pub(crate) fn evaluate_compiled_on_batches(
-    proj: &crate::aggregate_state::CompiledProjection,
-    batches: &[RecordBatch],
-) -> Vec<RecordBatch> {
-    let mut result = Vec::with_capacity(batches.len());
-    for batch in batches {
-        match proj.evaluate(batch) {
-            Ok(b) if b.num_rows() > 0 => result.push(b),
-            Ok(_) => {}
-            Err(e) => {
-                tracing::trace!(error = %e, "Compiled projection failed, skipping batch");
-            }
-        }
-    }
-    result
 }
 
 /// Evaluate a `CompiledProjection` on input batches, propagating the first error.
 ///
-/// Unlike [`evaluate_compiled_on_batches`], this function distinguishes between
-/// "evaluation error" (returns `Err`) and "legitimate empty result after filtering"
-/// (returns `Ok(empty vec)`). Used by `SqlQueryOperator::Compiled` to decide
+/// Distinguishes between "evaluation error" (returns `Err`) and "legitimate empty
+/// result after filtering" (returns `Ok(empty vec)`). Used by operators to decide
 /// whether to fall back to `CachedPlan`.
 pub(crate) fn try_evaluate_compiled(
     proj: &crate::aggregate_state::CompiledProjection,
@@ -1133,9 +939,7 @@ mod tests {
             .build()
             .unwrap();
         rt.block_on(async {
-            let mut op = SourcePassthrough {
-                op_name: Arc::from("test"),
-            };
+            let mut op = SourcePassthrough;
             let batch = test_batch();
             let result = op.process(&[vec![batch.clone()]], 0).await.unwrap();
             assert_eq!(result.len(), 1);
@@ -1356,8 +1160,6 @@ mod tests {
         assert!(cp.is_none());
     }
 
-    // ── Integration tests: exercise execute_cycle with real SQL ──────────
-
     /// Helper: total row count from result batches.
     fn total_rows(results: &FxHashMap<Arc<str>, Vec<RecordBatch>>, key: &str) -> usize {
         results
@@ -1394,13 +1196,6 @@ mod tests {
         // First cycle triggers lazy init
         let r = graph.execute_cycle(&source, i64::MAX).await.unwrap();
         assert_eq!(total_rows(&r, "projected"), 2); // Both rows projected
-
-        // Verify the operator settled to the compiled path
-        let q_node = graph.find_node("projected").unwrap();
-        assert!(
-            graph.nodes[q_node].operator.is_compiled(),
-            "single-source SELECT (no agg) should compile to PhysicalExpr"
-        );
 
         // Second cycle reuses compiled path (no SQL overhead)
         let r2 = graph.execute_cycle(&source, i64::MAX).await.unwrap();
@@ -1567,10 +1362,11 @@ mod tests {
 
         let r = graph.execute_cycle(&source, i64::MAX).await.unwrap();
 
-        // At least one operator should have been skipped
+        // With 1ns budget, not all queries should produce output
+        let produced = r.len();
         assert!(
-            !graph.skipped_last_cycle.is_empty(),
-            "with 1ns budget, some operators should be deferred"
+            produced < 2,
+            "with 1ns budget, at most one query should run"
         );
     }
 
@@ -1644,38 +1440,6 @@ mod tests {
         // cycle in graph2 plus the restored state from graph1
         let r = graph2.execute_cycle(&source, i64::MAX).await.unwrap();
         assert_eq!(total_rows(&r, "agg"), 2);
-    }
-
-    #[tokio::test]
-    async fn test_og_all_queries_compiled_skip_registration() {
-        // When all queries use compiled paths, source table registration is skipped
-        let mut graph = test_graph();
-        graph.add_query(
-            "simple".to_string(),
-            "SELECT symbol, price FROM trades WHERE price > 0".to_string(),
-            None,
-            None,
-            None,
-        );
-
-        let mut source = FxHashMap::default();
-        source.insert(Arc::from("trades"), vec![test_batch()]);
-
-        // First cycle: lazy init, may or may not compile
-        let _ = graph.execute_cycle(&source, i64::MAX).await.unwrap();
-
-        // Second cycle: should have settled
-        let _ = graph.execute_cycle(&source, i64::MAX).await.unwrap();
-
-        // If compiled, all_queries_compiled should be true
-        let q_node = graph.find_node("simple").unwrap();
-        if graph.nodes[q_node].operator.is_compiled() {
-            assert_eq!(
-                graph.all_queries_compiled,
-                Some(true),
-                "all_queries_compiled should be true when single compiled query"
-            );
-        }
     }
 
     #[tokio::test]

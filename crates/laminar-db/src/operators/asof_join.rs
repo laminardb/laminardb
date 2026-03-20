@@ -17,28 +17,16 @@ use crate::error::DbError;
 use crate::operator_graph::{GraphOperator, OperatorCheckpoint};
 use crate::stream_executor::CompiledPostProjection;
 
-/// ASOF join operator.
-///
-/// Two input ports: `inputs[0]` = left, `inputs[1]` = right.
-/// Delegates to the batch-level `execute_asof_join_batch` and optionally
-/// applies a post-join projection SQL via `DataFusion`.
 pub(crate) struct AsofJoinOperator {
-    /// Operator name (query name).
     op_name: Arc<str>,
-    /// ASOF join configuration (key, time columns, direction, tolerance).
     config: AsofJoinTranslatorConfig,
-    /// Optional post-join projection SQL (rewrites column aliases/expressions).
     projection_sql: Option<Arc<str>>,
-    /// `SessionContext` for post-projection SQL execution.
     ctx: SessionContext,
-    /// Lazily compiled post-projection (replaces SQL fallback on success).
     compiled_post_proj: Option<CompiledPostProjection>,
-    /// Whether compilation was attempted and failed (skip further attempts).
     post_proj_compile_failed: bool,
 }
 
 impl AsofJoinOperator {
-    /// Create a new ASOF join operator.
     pub(crate) fn new(
         name: &str,
         config: AsofJoinTranslatorConfig,
@@ -103,10 +91,6 @@ impl GraphOperator for AsofJoinOperator {
     fn restore(&mut self, _checkpoint: OperatorCheckpoint) -> Result<(), DbError> {
         // Stateless — nothing to restore.
         Ok(())
-    }
-
-    fn name(&self) -> &str {
-        &self.op_name
     }
 }
 
@@ -211,6 +195,6 @@ mod tests {
     fn test_name() {
         let ctx = laminar_sql::create_session_context();
         let op = AsofJoinOperator::new("my_asof_query", test_config(), None, ctx);
-        assert_eq!(op.name(), "my_asof_query");
+        assert_eq!(&*op.op_name, "my_asof_query");
     }
 }

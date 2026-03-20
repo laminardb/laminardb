@@ -18,17 +18,8 @@ use crate::aggregate_state::{
 };
 use crate::error::DbError;
 use crate::metrics::PipelineCounters;
-use crate::operator_graph::{
-    evaluate_compiled_on_batches, try_evaluate_compiled, GraphOperator, OperatorCheckpoint,
-};
+use crate::operator_graph::{try_evaluate_compiled, GraphOperator, OperatorCheckpoint};
 use crate::stream_executor::{extract_projection_filter, single_source_table};
-
-// ── Checkpoint version ──────────────────────────────────────────────────
-
-/// Current checkpoint format version for `SqlQueryOperator`.
-const CHECKPOINT_VERSION: u32 = 1;
-
-// ── Internal State ──────────────────────────────────────────────────────
 
 /// Internal state for the query operator (lazy initialization).
 enum QueryState {
@@ -44,19 +35,14 @@ enum QueryState {
     CachedPlan(Box<LogicalPlan>),
 }
 
-// ── SqlQueryOperator ────────────────────────────────────────────────────
-
 pub(crate) struct SqlQueryOperator {
     op_name: Arc<str>,
     sql: String,
     ctx: SessionContext,
     state: QueryState,
     counters: Option<Arc<PipelineCounters>>,
-    /// Pending checkpoint to restore on first init (deferred until state is built).
     pending_restore: Option<AggStateCheckpoint>,
-    /// Whether we have logged the execution tier for this query.
     tier_logged: bool,
-    /// Cached logical plan for HAVING SQL fallback.
     cached_having_plan: Option<LogicalPlan>,
 }
 
@@ -221,7 +207,27 @@ impl SqlQueryOperator {
         // Step 1: Pre-aggregation -- project input batches to group-keys + agg-inputs.
         let pre_agg_batches = if let Some(proj) = agg_state.compiled_projection() {
             // Compiled path: direct PhysicalExpr evaluation, no MemTable.
-            evaluate_compiled_on_batches(proj, inputs)
+            // Use try_evaluate_compiled to detect errors — silently dropping
+            // failing batches would corrupt aggregate totals.
+            match try_evaluate_compiled(proj, inputs) {
+                Ok(result) => result,
+                Err(e) => {
+                    tracing::debug!(
+                        query = %self.op_name,
+                        error = %e,
+                        "Compiled pre-agg projection failed, falling back to cached plan"
+                    );
+                    if let Some(plan) = agg_state.cached_pre_agg_plan() {
+                        let plan = plan.clone();
+                        Self::execute_plan(&self.ctx, &self.op_name, &plan).await?
+                    } else {
+                        return Err(DbError::Pipeline(format!(
+                            "[LDB-8051] query '{}': compiled pre-agg failed and no cached plan: {e}",
+                            self.op_name
+                        )));
+                    }
+                }
+            }
         } else if let Some(plan) = agg_state.cached_pre_agg_plan() {
             // Cached plan path: MemTable already registered by the graph.
             let plan = plan.clone();
@@ -464,6 +470,21 @@ impl GraphOperator for SqlQueryOperator {
     }
 
     fn checkpoint(&mut self) -> Result<Option<OperatorCheckpoint>, DbError> {
+        // If we have a pending restore (Uninit, not yet processed), preserve it
+        // so a restore->checkpoint cycle before first process() doesn't lose data.
+        if matches!(self.state, QueryState::Uninit) {
+            if let Some(ref cp) = self.pending_restore {
+                let data = serde_json::to_vec(cp).map_err(|e| {
+                    DbError::Pipeline(format!(
+                        "checkpoint serialization of pending restore for '{}': {e}",
+                        self.op_name
+                    ))
+                })?;
+                return Ok(Some(OperatorCheckpoint { data }));
+            }
+            return Ok(None);
+        }
+
         let QueryState::Agg(ref mut agg_state) = self.state else {
             // Non-aggregate queries are stateless.
             return Ok(None);
@@ -477,10 +498,7 @@ impl GraphOperator for SqlQueryOperator {
             ))
         })?;
 
-        Ok(Some(OperatorCheckpoint {
-            version: CHECKPOINT_VERSION,
-            data,
-        }))
+        Ok(Some(OperatorCheckpoint { data }))
     }
 
     fn restore(&mut self, checkpoint: OperatorCheckpoint) -> Result<(), DbError> {
@@ -518,17 +536,5 @@ impl GraphOperator for SqlQueryOperator {
             QueryState::Agg(ref agg_state) => agg_state.estimated_size_bytes(),
             _ => 0,
         }
-    }
-
-    fn is_compiled(&self) -> bool {
-        match &self.state {
-            QueryState::Compiled(_, _) => true,
-            QueryState::Agg(ref agg_state) => agg_state.compiled_projection().is_some(),
-            _ => false,
-        }
-    }
-
-    fn name(&self) -> &str {
-        &self.op_name
     }
 }

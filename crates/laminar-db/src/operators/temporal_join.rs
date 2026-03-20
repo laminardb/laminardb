@@ -22,32 +22,18 @@ use crate::error::DbError;
 use crate::operator_graph::{GraphOperator, OperatorCheckpoint};
 use crate::stream_executor::CompiledPostProjection;
 
-/// Temporal join operator.
-///
-/// Single input port: `inputs[0]` = stream side. The lookup (right) side
-/// comes from the `LookupTableRegistry`, which holds a versioned snapshot
-/// with a pre-built `VersionedIndex`.
 pub(crate) struct TemporalJoinOperator {
-    /// Operator name (query name).
     op_name: Arc<str>,
-    /// Temporal join configuration.
     config: TemporalJoinTranslatorConfig,
-    /// Optional post-join projection SQL.
     projection_sql: Option<Arc<str>>,
-    /// `SessionContext` for building physical plans and post-projection.
     ctx: SessionContext,
-    /// Lookup table registry (holds versioned tables).
     lookup_registry: Option<Arc<LookupTableRegistry>>,
-    /// Last observed row count for change detection warnings.
     last_temporal_row_count: usize,
-    /// Lazily compiled post-projection (replaces SQL fallback on success).
     compiled_post_proj: Option<CompiledPostProjection>,
-    /// Whether compilation was attempted and failed (skip further attempts).
     post_proj_compile_failed: bool,
 }
 
 impl TemporalJoinOperator {
-    /// Create a new temporal join operator.
     pub(crate) fn new(
         name: &str,
         config: TemporalJoinTranslatorConfig,
@@ -255,10 +241,6 @@ impl GraphOperator for TemporalJoinOperator {
         // Stateless — nothing to restore.
         Ok(())
     }
-
-    fn name(&self) -> &str {
-        &self.op_name
-    }
 }
 
 #[cfg(test)]
@@ -327,6 +309,6 @@ mod tests {
     fn test_name() {
         let ctx = laminar_sql::create_session_context();
         let op = TemporalJoinOperator::new("my_temporal_query", test_config(), None, ctx, None);
-        assert_eq!(op.name(), "my_temporal_query");
+        assert_eq!(&*op.op_name, "my_temporal_query");
     }
 }

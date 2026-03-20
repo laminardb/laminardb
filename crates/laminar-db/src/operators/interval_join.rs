@@ -21,33 +21,17 @@ use crate::operator_graph::{GraphOperator, OperatorCheckpoint};
 use crate::stream_executor::CompiledPostProjection;
 
 /// Checkpoint format version for interval join state.
-const CHECKPOINT_VERSION: u32 = 1;
-
-/// Interval join operator.
-///
-/// Two input ports: `inputs[0]` = left, `inputs[1]` = right.
-/// Stateful: buffers rows from both sides and matches pairs within
-/// the configured time bound. Supports checkpoint/restore via
-/// Arrow IPC serialization.
 pub(crate) struct IntervalJoinOperator {
-    /// Operator name (query name).
     op_name: Arc<str>,
-    /// Stream-stream join configuration (keys, time columns, bound).
     config: StreamJoinConfig,
-    /// Stateful join state (buffers, index, eviction watermark).
     state: IntervalJoinState,
-    /// Optional post-join projection SQL.
     projection_sql: Option<Arc<str>>,
-    /// `SessionContext` for post-projection SQL execution.
     ctx: SessionContext,
-    /// Lazily compiled post-projection (replaces SQL fallback on success).
     compiled_post_proj: Option<CompiledPostProjection>,
-    /// Whether compilation was attempted and failed (skip further attempts).
     post_proj_compile_failed: bool,
 }
 
 impl IntervalJoinOperator {
-    /// Create a new interval join operator with empty state.
     pub(crate) fn new(
         name: &str,
         config: StreamJoinConfig,
@@ -118,10 +102,7 @@ impl GraphOperator for IntervalJoinOperator {
             ))
         })?;
 
-        Ok(Some(OperatorCheckpoint {
-            version: CHECKPOINT_VERSION,
-            data,
-        }))
+        Ok(Some(OperatorCheckpoint { data }))
     }
 
     fn restore(&mut self, checkpoint: OperatorCheckpoint) -> Result<(), DbError> {
@@ -145,10 +126,6 @@ impl GraphOperator for IntervalJoinOperator {
 
     fn estimated_state_bytes(&self) -> usize {
         self.state.estimated_size_bytes()
-    }
-
-    fn name(&self) -> &str {
-        &self.op_name
     }
 }
 
@@ -261,7 +238,6 @@ mod tests {
 
         // Checkpoint
         let cp = op.checkpoint().unwrap().expect("should have state");
-        assert_eq!(cp.version, CHECKPOINT_VERSION);
         assert!(!cp.data.is_empty());
 
         // Restore into a new operator
@@ -287,6 +263,6 @@ mod tests {
     fn test_name() {
         let ctx = laminar_sql::create_session_context();
         let op = IntervalJoinOperator::new("my_interval_join", test_config(), None, ctx);
-        assert_eq!(op.name(), "my_interval_join");
+        assert_eq!(&*op.op_name, "my_interval_join");
     }
 }
